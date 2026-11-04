@@ -72,6 +72,7 @@ define_error_codes! {
     CallDeadlineExceeded = 715,
     UnsupportedCallMode = 716,
     CallCapacityExceeded = 717,
+    CallCancelled = 718,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -249,7 +250,7 @@ mod tests {
     fn error_code_registry_matches_canonical_wire_values() {
         use ErrorCode::*;
 
-        let expected: [(ErrorCode, u16, &str); 26] = [
+        let expected: [(ErrorCode, u16, &str); 27] = [
             (Unknown, 0, "Unknown"),
             (ResourceInputDeserializing, 1, "ResourceInputDeserializing"),
             (ResourceOutputSerializing, 2, "ResourceOutputSerializing"),
@@ -276,6 +277,7 @@ mod tests {
             (CallDeadlineExceeded, 715, "CallDeadlineExceeded"),
             (UnsupportedCallMode, 716, "UnsupportedCallMode"),
             (CallCapacityExceeded, 717, "CallCapacityExceeded"),
+            (CallCancelled, 718, "CallCancelled"),
         ];
         let registry = ErrorCode::registry();
         assert_eq!(registry.len(), expected.len());
@@ -286,7 +288,7 @@ mod tests {
             assert_eq!(variant.name(), name);
             assert_eq!(ErrorCode::try_from(value), Ok(variant));
         }
-        for value in [9, 700, 718, 9999, u16::MAX] {
+        for value in [9, 700, 719, 9999, u16::MAX] {
             assert_eq!(ErrorCode::try_from(value), Err(()));
         }
     }
@@ -304,6 +306,17 @@ mod tests {
             err.to_wire_bytes(),
             br#"C2E1{"version":1,"code":703,"name":"ResourceAlreadyRegistered","message":"grid exists","details":{}}"#
         );
+    }
+
+    #[test]
+    fn call_cancelled_round_trips_with_canonical_code_and_details() {
+        let error = C2Error::new(ErrorCode::CallCancelled, "stream closed")
+            .with_details(BTreeMap::from([("reason".into(), "client_close".into())]));
+        let decoded = C2Error::from_wire_bytes(&error.to_wire_bytes())
+            .unwrap()
+            .unwrap();
+        assert_eq!(decoded, error);
+        assert_eq!(decoded.code as u16, 718);
     }
 
     #[test]

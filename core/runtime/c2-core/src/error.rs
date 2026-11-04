@@ -287,6 +287,7 @@ pub fn normalize_ipc_error(error: IpcError, phase: TransportPhase) -> Error {
                 IpcError::Chunk(ChunkError::Capacity(message)) => {
                     Some(response_capacity_error(message))
                 }
+                IpcError::LocalCallRejected(error) => Some(error.clone()),
                 _ => None,
             };
             let mut transport = TransportError::new(
@@ -622,9 +623,9 @@ mod native_boundary_tests {
     use c2_mem::{MemPool, MemoryBudget, PoolConfig};
     use c2_wire::chunk::{config::ChunkConfig, registry::ChunkRegistry};
     use c2_wire::connection::calls::ValueReceive;
-    use c2_wire::flags::{FLAG_FIRST_FRAGMENT, FLAG_FRAGMENTED, FLAG_RESPONSE, FLAG_RPC_RECORD};
+    use c2_wire::flags::{FLAG_CHUNKED, FLAG_FIRST_CHUNK, FLAG_RESPONSE, FLAG_RPC_RECORD};
     use c2_wire::frame::{decode_frame, encode_frame};
-    use c2_wire::rpc::{CallMode, FragmentPosition, RpcRecord, decode_rpc_record};
+    use c2_wire::rpc::{CallMode, ChunkPosition, RpcRecord, decode_rpc_record};
     use parking_lot::RwLock;
     use std::sync::Arc;
 
@@ -653,7 +654,7 @@ mod native_boundary_tests {
         payload.resize(payload.len() + data_len, 0x42);
         let bytes = encode_frame(
             9,
-            FLAG_RPC_RECORD | FLAG_RESPONSE | FLAG_FRAGMENTED | FLAG_FIRST_FRAGMENT,
+            FLAG_RPC_RECORD | FLAG_RESPONSE | FLAG_CHUNKED | FLAG_FIRST_CHUNK,
             &payload,
         );
         let (header, payload) = decode_frame(&bytes).unwrap();
@@ -662,8 +663,8 @@ mod native_boundary_tests {
             Err(error) => return (IpcError::Decode(error), budget),
             other => panic!("expected CALL_END: {other:?}"),
         };
-        let FragmentPosition::First { total_bytes } = value.fragment else {
-            panic!("first fragment");
+        let ChunkPosition::First { total_bytes } = value.chunk else {
+            panic!("first chunk");
         };
         let receive = ValueReceive::first(total_bytes, value.storage.len()).unwrap();
         let (chunks, part_bytes) = receive.geometry().unwrap();
@@ -815,5 +816,33 @@ mod native_boundary_tests {
                 other => panic!("local IPC rejection became a transport failure: {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn cancelled_crm_error_preserves_canonical_semantic_projection() {
+        let source = C2Error::new(ErrorCode::CallCancelled, "stream closed")
+            .with_details(BTreeMap::from([("reason".into(), "client_close".into())]));
+        let Error::Semantic(actual) = normalize_ipc_error(
+            IpcError::CrmError(source.to_wire_bytes()),
+            TransportPhase::DispatchUncertain,
+        ) else {
+            panic!("cancelled CRM error must remain semantic");
+        };
+        assert_eq!(actual, source);
+    }
+
+    #[test]
+    fn stream_receive_capacity_remains_uncertain_with_the_original_semantic_error() {
+        let source = C2Error::new(ErrorCode::CallCapacityExceeded, "item exceeds B").with_details(
+            BTreeMap::from([("stage".into(), "payload_buffer_admission".into())]),
+        );
+        let Error::Transport(actual) = normalize_ipc_error(
+            IpcError::ResponseFailure(Box::new(IpcError::LocalCallRejected(source.clone()))),
+            TransportPhase::PreDispatch,
+        ) else {
+            panic!("a produced item cannot be pre-dispatch");
+        };
+        assert_eq!(actual.phase, TransportPhase::DispatchUncertain);
+        assert_eq!(actual.semantic_error, Some(source));
     }
 }

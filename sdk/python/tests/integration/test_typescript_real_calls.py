@@ -675,7 +675,7 @@ def test_typescript_real_connector_version_mismatch(
 def test_generated_typescript_late_open_continuation_after_capacity_refusal(
     typescript_artifacts: TypeScriptArtifacts,
 ) -> None:
-    """A refused fragmented call keeps one terminal across GC and late input."""
+    """A refused chunked call keeps one terminal across GC and late input."""
     script = typescript_artifacts.node_root / "late-open-continuation.mjs"
     script.write_text(dedent("""\
         import assert from 'node:assert/strict';

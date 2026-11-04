@@ -28,6 +28,7 @@ static RESPONSE_POOL_GEN: AtomicU64 = AtomicU64::new(0);
 use c2_error::{C2Error, ErrorCode};
 #[cfg(test)]
 use c2_mem::config::PoolConfig;
+use c2_mem::retention::PayloadBufferBudget;
 use c2_mem::{MemPool, MemoryBudget};
 use c2_wire::buddy::BuddyPayload;
 use c2_wire::chunk::{ChunkAdmissionError, ChunkRequest};
@@ -55,7 +56,7 @@ use c2_wire::route_catalog_control::{
 };
 use c2_wire::rpc::RouteCallIdentity;
 use c2_wire::rpc::{
-    self, CallMode, CallStatus, FragmentPosition, RpcRecord, RpcRecordKind, ValuePart, ValueStorage,
+    self, CallMode, CallStatus, ChunkPosition, RpcRecord, RpcRecordKind, ValuePart, ValueStorage,
 };
 use c2_wire::shutdown_control::{decode_shutdown_initiate, encode_shutdown_ack};
 use parking_lot::Mutex as CallMutex;
@@ -64,8 +65,8 @@ use crate::admission::AdmissionGate;
 use crate::config::ServerIpcConfig;
 use crate::connection::Connection;
 use crate::dispatcher::{
-    BuiltRoute, CrmCallback, CrmError, CrmRoute, Dispatcher, PeerShmRequest, PreparedShmResponse,
-    RequestData, ResponseMeta, RouteBuildSpec,
+    BuiltRoute, CrmCallback, CrmError, CrmRoute, CrmStreamCallback, Dispatcher, PeerShmRequest,
+    PreparedShmResponse, RequestData, ResponseMeta, RouteBuildSpec,
 };
 use crate::response::try_prepare_shm_response;
 use crate::scheduler::{
@@ -302,6 +303,7 @@ pub struct Server {
     /// server direction, one budget; it owns only accounting counters and is
     /// never reset by shutdown.
     memory_budget: MemoryBudget,
+    stream_payload_budget: PayloadBufferBudget,
     admission: Arc<AdmissionGate>,
     pending_requests: Arc<Semaphore>,
     control_reply_budget: Arc<Semaphore>,
@@ -538,6 +540,9 @@ impl Server {
             chunk_registry,
             response_pool: Arc::new(crate::ResponsePool::new(response_pool)),
             memory_budget,
+            stream_payload_budget: PayloadBufferBudget::new(
+                c2_config::DEFAULT_PAYLOAD_BUFFER_BUDGET_BYTES,
+            ),
             admission,
             pending_requests,
             control_reply_budget,
@@ -701,6 +706,72 @@ impl Server {
         );
         let route = CrmRoute::new(spec, scheduler, callback);
         BuiltRoute::new(route)
+    }
+
+    pub fn build_stream_route(
+        &self,
+        mut spec: RouteBuildSpec,
+        callback: Arc<dyn CrmStreamCallback>,
+        descriptor: &c2_contract::ValidatedContractDescriptor,
+    ) -> Result<BuiltRoute, ServerError> {
+        if spec.crm_ns != descriptor.crm_namespace()
+            || spec.crm_name != descriptor.crm_name()
+            || spec.crm_ver != descriptor.crm_version()
+            || spec.abi_hash != descriptor.abi_hash()
+            || spec.signature_hash != descriptor.signature_hash()
+            || spec.method_names.len() != descriptor.methods().len()
+            || spec
+                .method_names
+                .iter()
+                .zip(descriptor.methods())
+                .any(|(name, method)| name != method.name())
+        {
+            return Err(ServerError::Protocol(
+                "route spec differs from validated stream descriptor".into(),
+            ));
+        }
+        let mut access_map = HashMap::with_capacity(descriptor.methods().len());
+        let method_modes = descriptor
+            .methods()
+            .iter()
+            .enumerate()
+            .map(|(index, method)| {
+                let index = u16::try_from(index).map_err(|_| {
+                    ServerError::Protocol("stream method index exceeds wire range".into())
+                })?;
+                let access = match method.access() {
+                    c2_contract::MethodAccess::Read => crate::scheduler::AccessLevel::Read,
+                    c2_contract::MethodAccess::Write => crate::scheduler::AccessLevel::Write,
+                };
+                access_map.insert(index, access);
+                Ok(match method.mode() {
+                    c2_contract::MethodMode::Unary => CallMode::Unary,
+                    c2_contract::MethodMode::ServerStream => CallMode::ServerStream,
+                })
+            })
+            .collect::<Result<Vec<_>, ServerError>>()?;
+        if spec
+            .access_map
+            .iter()
+            .any(|(index, access)| access_map.get(index) != Some(access))
+        {
+            return Err(ServerError::Protocol(
+                "route access map differs from validated stream descriptor".into(),
+            ));
+        }
+        spec.access_map = access_map;
+        let scheduler = Scheduler::with_admission(
+            spec.concurrency_mode,
+            spec.access_map.clone(),
+            spec.limits,
+            Arc::clone(&self.admission),
+        );
+        BuiltRoute::new(CrmRoute::new_stream(
+            spec,
+            scheduler,
+            callback,
+            method_modes,
+        ))
     }
 
     pub async fn reserve_route(
@@ -2672,6 +2743,7 @@ struct RouteExecutionAdmission {
 pub(crate) struct ServerCall {
     input: CallMutex<Option<ServerInput>>,
     admission: CallMutex<Option<ChunkRouteAdmission>>,
+    start_gate: CallMutex<()>,
 }
 struct ServerInput {
     receive: ValueReceive,
@@ -2698,7 +2770,8 @@ pub(crate) fn retire_connection_calls(conn: &Connection) {
         }
         std::mem::take(&mut *calls)
     };
-    for (_, call) in calls.active() {
+    for (id, call) in calls.active() {
+        conn.core.stream_retire(id);
         let input = call.data.input.lock().take();
         if let Some(input) = input {
             input.registry.settle(&input.request);
@@ -2729,8 +2802,8 @@ async fn handle_rpc_record(
 ) {
     let id = header.request_id;
     let new_open = payload.first() == Some(&(RpcRecordKind::Open as u8))
-        && (header.flags & c2_wire::flags::FLAG_FRAGMENTED == 0
-            || header.flags & c2_wire::flags::FLAG_FIRST_FRAGMENT != 0);
+        && (header.flags & c2_wire::flags::FLAG_CHUNKED == 0
+            || header.flags & c2_wire::flags::FLAG_FIRST_CHUNK != 0);
     // Identity history is advanced before any route, capacity or storage refusal.
     let (new_call, duplicate) = if new_open {
         match conn.calls.lock().open(id, ServerCall::default()) {
@@ -2789,6 +2862,51 @@ async fn handle_rpc_record(
         return;
     }
     match record {
+        RpcRecord::Credit {
+            storage_bytes,
+            item_demand,
+        } => match conn.calls.lock().continuation(id) {
+            CallLookup::Retired => return,
+            CallLookup::Future => {
+                conn.end(ConnectionEndReason::ProtocolError, "future_stream_credit")
+            }
+            CallLookup::Active(_) => {
+                if let Err(error) = conn.core.stream_credit(id, storage_bytes, item_demand) {
+                    warn!(request_id=id, %error, "invalid stream credit");
+                    conn.end(ConnectionEndReason::ProtocolError, "stream_credit");
+                }
+            }
+        },
+        RpcRecord::Cancel => {
+            let lookup = conn.calls.lock().continuation(id);
+            match lookup {
+                CallLookup::Retired => return,
+                CallLookup::Future => {
+                    conn.end(ConnectionEndReason::ProtocolError, "future_stream_cancel")
+                }
+                CallLookup::Active(call) => {
+                    let _start = call.data.start_gate.lock();
+                    if let Err(error) = conn.core.stream_cancel(id) {
+                        warn!(request_id=id, %error, "invalid stream cancel");
+                        conn.end(ConnectionEndReason::ProtocolError, "stream_cancel");
+                    } else if let Some(status) = claim_terminal(writer, id, CallStatus::NotExecuted)
+                    {
+                        let error = error_wire(ErrorCode::CallCancelled, "server stream cancelled");
+                        let frame = rpc::encode_call_end_frame(
+                            id,
+                            CallMode::Unary,
+                            status,
+                            0,
+                            ValuePart::whole(ValueStorage::Inline(&error)),
+                        )
+                        .expect("canonical cancellation error");
+                        if let Err(error) = writer.queue_call_end(frame) {
+                            warn!(request_id=id, %error, "failed to queue cancelled CALL_END");
+                        }
+                    }
+                }
+            }
+        }
         RpcRecord::Open {
             identity,
             method_idx,
@@ -2818,10 +2936,10 @@ async fn handle_rpc_record(
                     return;
                 }
             };
-            let input_size = match value.fragment {
-                FragmentPosition::Whole => value.storage.len(),
-                FragmentPosition::First { total_bytes } => total_bytes,
-                FragmentPosition::Continuation => unreachable!("OPEN first record"),
+            let input_size = match value.chunk {
+                ChunkPosition::Whole => value.storage.len(),
+                ChunkPosition::First { total_bytes } => total_bytes,
+                ChunkPosition::Continuation => unreachable!("OPEN first record"),
             };
             if input_size > server.config.max_payload_size {
                 drop(data);
@@ -2856,8 +2974,23 @@ async fn handle_rpc_record(
                 _pending_permit: pending,
                 _flight: flight,
             };
-            match value.fragment {
-                FragmentPosition::Whole => {
+            let stream_mode =
+                admission.route.method_modes[method_idx as usize] == CallMode::ServerStream;
+            if stream_mode {
+                if let Err(error) = conn.core.stream_open(id) {
+                    drop(data);
+                    drop(admission);
+                    queue_rejection(
+                        writer,
+                        id,
+                        &error_wire(ErrorCode::ResourceUnavailable, error.to_string()),
+                    )
+                    .await;
+                    return;
+                }
+            }
+            match value.chunk {
+                ChunkPosition::Whole => {
                     let request = match data {
                         Ok(request) => request,
                         Err(error) => {
@@ -2874,7 +3007,7 @@ async fn handle_rpc_record(
                             .await;
                     });
                 }
-                FragmentPosition::First { total_bytes } => {
+                ChunkPosition::First { total_bytes } => {
                     let mut receive = ValueReceive::first(total_bytes, value.storage.len())
                         .expect("checked first value length");
                     let geometry = match receive.geometry() {
@@ -2925,7 +3058,7 @@ async fn handle_rpc_record(
                         request,
                     );
                 }
-                FragmentPosition::Continuation => unreachable!("OPEN first record"),
+                ChunkPosition::Continuation => unreachable!("OPEN first record"),
             }
         }
         RpcRecord::OpenContinuation { value } => {
@@ -3358,6 +3491,10 @@ async fn dispatch_complete_call(
     request: RequestData,
     admission: ChunkRouteAdmission,
 ) {
+    if admission.route.method_modes[admission.method_idx as usize] == CallMode::ServerStream {
+        stream::dispatch_stream_call(server, conn, writer, request_id, request, admission).await;
+        return;
+    }
     let callback = admission.route.callback.clone();
     let name = admission.route.name.clone();
     let method_idx = admission.method_idx;
@@ -3757,6 +3894,7 @@ fn claim_terminal(writer: &ConnectionWriter, id: u64, status: CallStatus) -> Opt
         input.registry.settle(&input.request);
     }
     drop(retired);
+    writer.conn.core.stream_retire(id);
     Some(status)
 }
 
@@ -3903,7 +4041,7 @@ async fn write_chunked_reply(
             incomplete_reply_error(
                 writer,
                 index > 0,
-                response_write_error("CALL_END fragment write failed", error),
+                response_write_error("CALL_END chunk write failed", error),
             )
         })?;
     }
@@ -4033,3 +4171,10 @@ async fn smart_reply_with_data(
 #[cfg(test)]
 #[path = "server_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "stream_tests.rs"]
+mod stream_tests;
+
+#[path = "stream.rs"]
+mod stream;

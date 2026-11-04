@@ -15,7 +15,8 @@ pub use c2_local::{
 pub use config::ServerIpcConfig;
 pub use connection::Connection;
 pub use dispatcher::{
-    BuiltRoute, CrmCallback, CrmError, PreparedShmResponse, ResponseMeta, RouteBuildSpec,
+    BuiltRoute, CrmCallback, CrmError, CrmStream, CrmStreamCallback, PreparedShmResponse,
+    ResponseMeta, RouteBuildSpec,
 };
 pub use runtime::{ServerRuntimeBuilder, ServerRuntimeOptions};
 pub use scheduler::{

@@ -144,7 +144,7 @@ pub struct ValueReceive {
 impl ValueReceive {
     pub fn first(total_bytes: u64, first_bytes: u64) -> Result<Self, &'static str> {
         if first_bytes == 0 || first_bytes >= total_bytes {
-            return Err("invalid fragmented value length");
+            return Err("invalid chunked value length");
         }
         Ok(Self {
             total_bytes,

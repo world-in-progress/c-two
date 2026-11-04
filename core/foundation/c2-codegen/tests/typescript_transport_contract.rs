@@ -771,7 +771,7 @@ function server() {
     connections: [], lookups: [], lists: [], calls: [], callFlags: [], businessFrames: [], replyFrames: [], controlIds: [], failCall: false,
     failRead: false, responseData: Buffer.alloc(0), chunkedReply: false, shmReply: false,
     ackShmRequest: false, ackShmResponse: false, clientHellos: [], clientHandshakes: [], clientCaps: 0,
-    nextControl: undefined, corrupt: undefined, writesAfterClose: 0, inputFragments: new Map(),
+    nextControl: undefined, corrupt: undefined, writesAfterClose: 0, inputChunks: new Map(),
   };
   // The ACK models the native session intersection: a direction is
   // acknowledged only when this server enables it and the client offered it.
@@ -854,19 +854,19 @@ function server() {
           s.callFlags.push(flags);
           s.calls.push(payload);
           const first = (flags & 8192) !== 0;
-          const fragment = (flags & 512) !== 0;
-          let isLast = !fragment;
+          const chunk = (flags & 512) !== 0;
+          let isLast = !chunk;
           if (first) {
             const storage = openStorageOffset(payload);
             const total = payload.readBigUInt64LE(storage);
             const piece = BigInt(payload.length - storage - 8);
-            s.inputFragments.set(id, {total, copied: piece});
-          } else if (fragment) {
-            const state = s.inputFragments.get(id);
-            assert.ok(state, 'continuation has an OPEN first fragment');
+            s.inputChunks.set(id, {total, copied: piece});
+          } else if (chunk) {
+            const state = s.inputChunks.get(id);
+            assert.ok(state, 'continuation has an OPEN first chunk');
             state.copied += BigInt(payload.length - 1);
             isLast = state.copied === state.total;
-            if (isLast) s.inputFragments.delete(id);
+            if (isLast) s.inputChunks.delete(id);
           }
           if ((flags & 64) !== 0) {
             const storage = openStorageOffset(payload);
@@ -1306,7 +1306,31 @@ test('CALL_END rejects a C2E1 known code with a mismatched name', async () => {
   } finally { await t.close(); }
 });
 
-test('CALL_END fragments infer fixed piece lengths and release SHM at its new storage offset', async () => {
+test('CALL_END recognizes CallCancelled as canonical code 718', async () => {
+  const s = server(), t = transport(s);
+  const canonical = Buffer.from('C2E1' + JSON.stringify({version: 1, code: 718, name: 'CallCancelled', message: 'stream closed', details: {reason: 'client_close'}}));
+  s.onCall = ({id, feed}) => feed(frame(id, 2 | 4096, Buffer.concat([Buffer.from([0x06, 2]), canonical])));
+  try {
+    await assert.rejects(() => call(t), (error) => {
+      assert.equal(error.name, 'C2IpcCallRejectedError');
+      assert.equal(error.code, 718);
+      assert.equal(error.canonicalName, 'CallCancelled');
+      assert.deepEqual(error.details, {reason: 'client_close'});
+      return true;
+    });
+  } finally { await t.close(); }
+});
+
+test('CALL_END rejects code 718 with a mismatched name', async () => {
+  const s = server(), t = transport(s);
+  const malformed = Buffer.from('C2E1' + JSON.stringify({version: 1, code: 718, name: 'FutureCancellation', message: 'wrong name', details: {}}));
+  s.onCall = ({id, feed}) => feed(frame(id, 2 | 4096, Buffer.concat([Buffer.from([0x06, 1]), malformed])));
+  try {
+    await assert.rejects(() => call(t), /C2E1 envelope is invalid/);
+  } finally { await t.close(); }
+});
+
+test('CALL_END chunks infer fixed piece lengths and release SHM at its new storage offset', async () => {
   const s = server(), events = []; s.memory = memory(s, events); s.ackShmResponse = true;
   s.responseData = Buffer.from([43, 44]);
   const t = transport(s);
@@ -1340,7 +1364,7 @@ test('malformed SHM CALL_END releases its carrier before the connection is retir
   } finally { await t.close(); }
 });
 
-test('failed fragment leaves late pieces to the retired id and the next unary succeeds on the same connection', async () => {
+test('failed chunk leaves late pieces to the retired id and the next unary succeeds on the same connection', async () => {
   const s = server(), events = []; s.memory = memory(s, events); s.ackShmResponse = true;
   const t = transport(s);
   let feedLate;
@@ -1367,7 +1391,7 @@ test('failed fragment leaves late pieces to the retired id and the next unary su
   } finally { await t.close(); }
 });
 
-test('local allocation failure reads the IPC16 first-fragment SHM descriptor at its metadata offset', async () => {
+test('local allocation failure reads the IPC16 first-chunk SHM descriptor at its metadata offset', async () => {
   const s = server(), events = []; s.memory = memory(s, events); s.ackShmResponse = true;
   const t = transport(s);
   let feedLate;

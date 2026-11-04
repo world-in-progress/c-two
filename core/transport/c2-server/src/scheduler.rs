@@ -1,5 +1,6 @@
 use std::collections::{HashMap, VecDeque};
 use std::num::NonZeroUsize;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::admission::{AdmissionGate, AdmissionState};
@@ -151,6 +152,8 @@ pub struct SchedulerGuard {
     access: HeldAccess,
     admission_generation: u64,
     committed: bool,
+    slot: Option<SchedulerCallSlot>,
+    continuation: bool,
 }
 
 pub(crate) struct SchedulerPendingPermit {
@@ -159,6 +162,58 @@ pub(crate) struct SchedulerPendingPermit {
     ticket: u64,
     admission_generation: u64,
     completed: bool,
+    slot: Option<SchedulerCallSlot>,
+    continuation: bool,
+}
+
+/// A stream's counted call slot. Every step ticket and guard retains this
+/// owner, so dropping the driver cannot refund capacity during resource code.
+#[derive(Clone)]
+pub(crate) struct SchedulerCallSlot(Arc<CallSlotInner>);
+
+struct CallSlotInner {
+    inner: Arc<SchedulerInner>,
+    access: HeldAccess,
+    admission_generation: u64,
+    entered_resource: AtomicBool,
+}
+
+impl Drop for CallSlotInner {
+    fn drop(&mut self) {
+        let mut state = self.inner.state.lock().unwrap();
+        state.pending -= 1;
+        self.inner.notify_all();
+    }
+}
+
+impl SchedulerCallSlot {
+    pub(crate) fn mark_resource_entry(&self) {
+        self.0.entered_resource.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn reserve_step(&self) -> Result<SchedulerPendingPermit, SchedulerAcquireError> {
+        if !self.0.entered_resource.load(Ordering::Acquire) {
+            return Err(SchedulerAcquireError::Closed);
+        }
+        let admission = self.0.inner.admission.lock();
+        admission.check_continuation(self.0.admission_generation)?;
+        let mut state = self.0.inner.state.lock().unwrap();
+        let ticket = state.next_ticket;
+        state.next_ticket = state.next_ticket.wrapping_add(1);
+        state.queue.push_back(QueuedPermit {
+            ticket,
+            access: self.0.access,
+        });
+        Ok(SchedulerPendingPermit {
+            inner: Arc::clone(&self.0.inner),
+            access: self.0.access,
+            ticket,
+            admission_generation: self.0.admission_generation,
+            completed: false,
+            slot: Some(self.clone()),
+            continuation: true,
+        })
+    }
 }
 
 impl std::fmt::Debug for SchedulerPendingPermit {
@@ -206,8 +261,14 @@ impl SchedulerInner {
         }
     }
 
-    fn can_activate(&self, state: &SchedulerState, ticket: u64, access: HeldAccess) -> bool {
-        if state.route_admission != RouteAdmissionState::Opened {
+    fn can_activate(
+        &self,
+        state: &SchedulerState,
+        ticket: u64,
+        access: HeldAccess,
+        continuation: bool,
+    ) -> bool {
+        if state.route_admission != RouteAdmissionState::Opened && !continuation {
             return false;
         }
         let worker_slots = self.worker_slots_available(state);
@@ -392,6 +453,40 @@ impl Scheduler {
             .await
     }
 
+    /// A later stream step uses a route-owned call slot as proof of its
+    /// original Host admission; this scheduler charges only this step's work.
+    pub(crate) async fn async_acquire_continuation(
+        &self,
+        method_idx: u16,
+        slot: &SchedulerCallSlot,
+    ) -> Result<SchedulerGuard, SchedulerAcquireError> {
+        if !Arc::ptr_eq(&self.inner.admission, &slot.0.inner.admission)
+            || !slot.0.entered_resource.load(Ordering::Acquire)
+        {
+            return Err(SchedulerAcquireError::Unavailable);
+        }
+        let pending = {
+            let access = self.held_access(method_idx);
+            let admission = self.inner.admission.lock();
+            admission.check_continuation(slot.0.admission_generation)?;
+            let mut state = self.inner.state.lock().unwrap();
+            state.pending += 1;
+            let ticket = state.next_ticket;
+            state.next_ticket = state.next_ticket.wrapping_add(1);
+            state.queue.push_back(QueuedPermit { ticket, access });
+            SchedulerPendingPermit {
+                inner: Arc::clone(&self.inner),
+                access,
+                ticket,
+                admission_generation: slot.0.admission_generation,
+                completed: false,
+                slot: None,
+                continuation: true,
+            }
+        };
+        pending.async_activate().await
+    }
+
     pub(crate) fn reserve_pending(
         &self,
         method_idx: u16,
@@ -444,6 +539,8 @@ impl Scheduler {
             ticket,
             admission_generation: admission.generation,
             completed: false,
+            slot: None,
+            continuation: false,
         })
     }
 
@@ -507,6 +604,18 @@ impl RouteConcurrencyHandle {
 }
 
 impl SchedulerPendingPermit {
+    pub(crate) fn retain_call_slot(&mut self) -> SchedulerCallSlot {
+        assert!(self.slot.is_none() && !self.continuation);
+        let slot = SchedulerCallSlot(Arc::new(CallSlotInner {
+            inner: Arc::clone(&self.inner),
+            access: self.access,
+            admission_generation: self.admission_generation,
+            entered_resource: AtomicBool::new(false),
+        }));
+        self.slot = Some(slot.clone());
+        slot
+    }
+
     #[cfg(test)]
     pub(crate) fn try_activate(mut self) -> Result<SchedulerGuard, SchedulerAcquireError> {
         if let Some(guard) = self.activate_ready()? {
@@ -544,9 +653,16 @@ impl SchedulerPendingPermit {
     fn activate_ready(&mut self) -> Result<Option<SchedulerGuard>, SchedulerAcquireError> {
         let admission = self.inner.admission.lock();
         let mut state = self.inner.state.lock().unwrap();
-        self.inner
-            .check_accepted_admission(&admission, &state, self.admission_generation)?;
-        if !self.inner.can_activate(&state, self.ticket, self.access) {
+        if self.continuation {
+            admission.check_continuation(self.admission_generation)?;
+        } else {
+            self.inner
+                .check_accepted_admission(&admission, &state, self.admission_generation)?;
+        }
+        if !self
+            .inner
+            .can_activate(&state, self.ticket, self.access, self.continuation)
+        {
             return Ok(None);
         }
         self.inner.remove_queued(&mut state, self.ticket);
@@ -562,6 +678,8 @@ impl SchedulerPendingPermit {
             access: self.access,
             admission_generation: self.admission_generation,
             committed: false,
+            slot: self.slot.clone(),
+            continuation: self.continuation,
         }))
     }
 }
@@ -573,7 +691,9 @@ impl Drop for SchedulerPendingPermit {
         }
         let inner = Arc::clone(&self.inner);
         let mut state = inner.state.lock().unwrap();
-        state.pending -= 1;
+        if self.slot.is_none() {
+            state.pending -= 1;
+        }
         inner.remove_queued(&mut state, self.ticket);
         self.completed = true;
         inner.notify_all();
@@ -594,8 +714,12 @@ impl SchedulerGuard {
         }
         let admission = self.inner.admission.lock();
         let state = self.inner.state.lock().unwrap();
-        self.inner
-            .check_accepted_admission(&admission, &state, self.admission_generation)?;
+        if self.continuation {
+            admission.check_continuation(self.admission_generation)?;
+        } else {
+            self.inner
+                .check_accepted_admission(&admission, &state, self.admission_generation)?;
+        }
         self.committed = true;
         Ok(())
     }
@@ -603,8 +727,12 @@ impl SchedulerGuard {
     pub(crate) fn check_admission(&self) -> Result<(), SchedulerAcquireError> {
         let admission = self.inner.admission.lock();
         let state = self.inner.state.lock().unwrap();
-        self.inner
-            .check_accepted_admission(&admission, &state, self.admission_generation)
+        if self.continuation {
+            admission.check_continuation(self.admission_generation)
+        } else {
+            self.inner
+                .check_accepted_admission(&admission, &state, self.admission_generation)
+        }
     }
 
     pub(crate) async fn wait_rejected(&self) -> SchedulerAcquireError {
@@ -623,7 +751,9 @@ impl SchedulerGuard {
 impl Drop for SchedulerGuard {
     fn drop(&mut self) {
         let mut state = self.inner.state.lock().unwrap();
-        state.pending -= 1;
+        if self.slot.is_none() {
+            state.pending -= 1;
+        }
         state.active_workers -= 1;
         match self.access {
             HeldAccess::Parallel => {}
@@ -642,6 +772,104 @@ mod tests {
 
     fn empty_map() -> HashMap<u16, AccessLevel> {
         HashMap::new()
+    }
+
+    #[tokio::test]
+    async fn stream_slot_outlives_its_step_and_survives_route_drain() {
+        let scheduler = Scheduler::new(ConcurrencyMode::Exclusive, empty_map());
+        let mut first = scheduler.reserve_pending(0).unwrap();
+        let slot = first.retain_call_slot();
+        let mut guard = first.async_activate().await.unwrap();
+        guard.commit().unwrap();
+        slot.mark_resource_entry();
+        drop(slot);
+        assert_eq!(scheduler.snapshot().pending, 1);
+        drop(guard);
+        assert_eq!(scheduler.snapshot().pending, 0);
+
+        let mut first = scheduler.reserve_pending(0).unwrap();
+        let slot = first.retain_call_slot();
+        let mut guard = first.async_activate().await.unwrap();
+        guard.commit().unwrap();
+        slot.mark_resource_entry();
+        drop(guard);
+        assert_eq!(scheduler.snapshot().active_workers, 0);
+        assert_eq!(scheduler.snapshot().pending, 1);
+        let unary = scheduler
+            .reserve_pending(0)
+            .unwrap()
+            .async_activate()
+            .await
+            .unwrap();
+        drop(unary);
+        scheduler.close();
+        let mut cleanup = slot.reserve_step().unwrap().async_activate().await.unwrap();
+        cleanup.commit().unwrap();
+        drop(slot);
+        assert_eq!(scheduler.snapshot().pending, 1);
+        drop(cleanup);
+        assert_eq!(scheduler.snapshot().pending, 0);
+    }
+
+    #[tokio::test]
+    async fn terminal_host_close_allows_original_stream_but_new_generation_fences_it() {
+        let admission = Arc::new(AdmissionGate::new());
+        let route = Scheduler::with_admission(
+            ConcurrencyMode::Exclusive,
+            empty_map(),
+            SchedulerLimits::default(),
+            admission.clone(),
+        );
+        let global = Scheduler::with_admission(
+            ConcurrencyMode::Parallel,
+            empty_map(),
+            SchedulerLimits::default(),
+            admission.clone(),
+        );
+        let mut first = route.reserve_pending(0).unwrap();
+        let slot = first.retain_call_slot();
+        let mut first_guard = first.async_activate().await.unwrap();
+        first_guard.commit().unwrap();
+        assert_eq!(
+            slot.reserve_step().unwrap_err(),
+            SchedulerAcquireError::Closed
+        );
+        slot.mark_resource_entry();
+        drop(first_guard);
+
+        admission.lock().terminate();
+        route.close();
+        assert_eq!(
+            route.reserve_pending(0).unwrap_err(),
+            SchedulerAcquireError::Closed
+        );
+        let mut continuation = slot.reserve_step().unwrap().async_activate().await.unwrap();
+        continuation.commit().unwrap();
+        let mut global_step = global.async_acquire_continuation(0, &slot).await.unwrap();
+        global_step.commit().unwrap();
+        drop(global_step);
+        drop(continuation);
+
+        let queued = slot.reserve_step().unwrap();
+        admission.lock().begin_start();
+        admission.notify.notify_waiters();
+        assert_eq!(
+            queued.async_activate().await.unwrap_err(),
+            SchedulerAcquireError::Unavailable
+        );
+        assert_eq!(
+            slot.reserve_step().unwrap_err(),
+            SchedulerAcquireError::Unavailable
+        );
+        assert_eq!(
+            global
+                .async_acquire_continuation(0, &slot)
+                .await
+                .unwrap_err(),
+            SchedulerAcquireError::Unavailable
+        );
+        drop(slot);
+        assert_eq!(route.snapshot().pending, 0);
     }
 
     fn read_write_map() -> HashMap<u16, AccessLevel> {

@@ -50,6 +50,20 @@ impl AdmissionState {
         }
     }
 
+    /// An executing stream keeps its original admission through this Host
+    /// generation's terminal close. A later start advances generation again,
+    /// fencing that old stream out of the new Host lifetime.
+    pub(crate) fn check_continuation(&self, generation: u64) -> Result<(), SchedulerAcquireError> {
+        if self.generation == generation && self.phase != AdmissionPhase::Terminal
+            || self.phase == AdmissionPhase::Terminal
+                && self.generation.checked_sub(1) == Some(generation)
+        {
+            Ok(())
+        } else {
+            Err(SchedulerAcquireError::Unavailable)
+        }
+    }
+
     pub(crate) fn begin_drain(&mut self) {
         if self.phase == AdmissionPhase::Open {
             self.phase = AdmissionPhase::Draining;

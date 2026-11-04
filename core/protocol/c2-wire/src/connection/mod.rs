@@ -91,6 +91,18 @@ enum WriterState {
     Broken,
 }
 
+/// Snapshot of one server stream's demand, admitted item and granted storage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StreamState {
+    pub demand: u64,
+    pub storage_bytes: u64,
+    pub total_bytes: Option<u64>,
+    pub admitted_bytes: u64,
+    pub complete_items: u64,
+    pub cancelled: bool,
+    pub producing: bool,
+}
+
 #[derive(Default)]
 struct State {
     handshake_done: bool,
@@ -108,6 +120,8 @@ struct State {
     pending_controls: usize,
     pending_records: usize,
     writer: WriterState,
+    streams: HashMap<u64, StreamState>,
+    stream_storage_bytes: u64,
 }
 
 struct Shared {
@@ -148,6 +162,211 @@ impl ConnectionCore {
         check_live(&state)?;
         state.handshake_done = true;
         Ok(())
+    }
+
+    /// Register a call admitted after handshake. The first item has demand.
+    pub fn stream_open(&self, id: u64) -> Result<(), ConnectionError> {
+        let mut state = self.shared.state.lock();
+        check_business(&state)?;
+        if id == 0 || state.streams.contains_key(&id) {
+            return Err(stream_violation("zero or duplicate stream ID"));
+        }
+        state
+            .streams
+            .try_reserve(1)
+            .map_err(|_| ConnectionError::Capacity("stream book"))?;
+        state.streams.insert(
+            id,
+            StreamState {
+                demand: 1,
+                storage_bytes: 0,
+                total_bytes: None,
+                admitted_bytes: 0,
+                complete_items: 0,
+                cancelled: false,
+                producing: false,
+            },
+        );
+        Ok(())
+    }
+
+    /// Consume one item demand before entering resource code.
+    pub fn stream_start_step(&self, id: u64) -> Result<bool, ConnectionError> {
+        if self.shared.side != ConnectionSide::Server {
+            return Err(stream_violation("resource steps require server side"));
+        }
+        let mut state = self.shared.state.lock();
+        let stream = stream_mut(&mut state, id)?;
+        if stream.cancelled
+            || stream.producing
+            || stream.total_bytes.is_some()
+            || stream.demand == 0
+        {
+            return Ok(false);
+        }
+        stream.demand = 0;
+        stream.producing = true;
+        Ok(true)
+    }
+
+    /// Admit an item; zero length completes immediately without an ITEM_DATA.
+    pub fn stream_begin_item(&self, id: u64, total_bytes: u64) -> Result<(), ConnectionError> {
+        let mut state = self.shared.state.lock();
+        let stream = stream_mut(&mut state, id)?;
+        if stream.total_bytes.is_some() {
+            return Err(stream_violation("item already active"));
+        }
+        match self.shared.side {
+            ConnectionSide::Server if !stream.producing => {
+                return Err(stream_violation("item without resource step"));
+            }
+            ConnectionSide::Client if stream.demand == 0 => {
+                return Err(stream_violation("item without demand"));
+            }
+            _ => {}
+        }
+        let next_count = if total_bytes == 0 {
+            Some(
+                stream
+                    .complete_items
+                    .checked_add(1)
+                    .ok_or(ConnectionError::Capacity("item count"))?,
+            )
+        } else {
+            None
+        };
+        if self.shared.side == ConnectionSide::Client {
+            stream.demand = 0;
+        } else {
+            stream.producing = false;
+        }
+        if let Some(count) = next_count {
+            stream.complete_items = count;
+        } else {
+            stream.total_bytes = Some(total_bytes);
+            stream.admitted_bytes = 0;
+        }
+        Ok(())
+    }
+
+    /// Grant bytes backed by a real receiver reservation and at most one item demand.
+    pub fn stream_credit(
+        &self,
+        id: u64,
+        storage_bytes: u64,
+        item_demand: u64,
+    ) -> Result<(), ConnectionError> {
+        let mut state = self.shared.state.lock();
+        if state
+            .streams
+            .get(&id)
+            .ok_or_else(|| stream_violation("unknown stream ID"))?
+            .cancelled
+        {
+            return Ok(());
+        }
+        let new_total = state
+            .stream_storage_bytes
+            .checked_add(storage_bytes)
+            .ok_or(ConnectionError::Capacity("connection stream storage"))?;
+        let stream = stream_mut(&mut state, id)?;
+        let total = stream.total_bytes.unwrap_or(0);
+        let remaining = total
+            .checked_sub(stream.admitted_bytes)
+            .and_then(|n| n.checked_sub(stream.storage_bytes))
+            .ok_or_else(|| stream_violation("invalid stream storage balance"))?;
+        if storage_bytes > remaining {
+            return Err(stream_violation("credit exceeds remaining item"));
+        }
+        let new_demand = stream
+            .demand
+            .checked_add(item_demand)
+            .ok_or(ConnectionError::Capacity("item demand"))?;
+        if new_demand > 1 {
+            return Err(stream_violation("item demand exceeds one"));
+        }
+        stream.storage_bytes = stream
+            .storage_bytes
+            .checked_add(storage_bytes)
+            .ok_or(ConnectionError::Capacity("stream storage"))?;
+        stream.demand = new_demand;
+        state.stream_storage_bytes = new_total;
+        drop(state);
+        (self.shared.wake)();
+        Ok(())
+    }
+
+    /// Admit a positive data chunk and return its implicit item offset.
+    pub fn stream_data(&self, id: u64, bytes: u64) -> Result<u64, ConnectionError> {
+        let mut state = self.shared.state.lock();
+        let stream = stream_mut(&mut state, id)?;
+        let total = stream
+            .total_bytes
+            .ok_or_else(|| stream_violation("data without item"))?;
+        let next = stream
+            .admitted_bytes
+            .checked_add(bytes)
+            .ok_or(ConnectionError::Capacity("item progress"))?;
+        if bytes == 0 || bytes > stream.storage_bytes || next > total {
+            return Err(stream_violation("data exceeds granted item storage"));
+        }
+        let connection_remaining = state
+            .stream_storage_bytes
+            .checked_sub(bytes)
+            .ok_or_else(|| stream_violation("connection stream storage underflow"))?;
+        let stream = stream_mut(&mut state, id)?;
+        let offset = stream.admitted_bytes;
+        stream.storage_bytes -= bytes;
+        stream.admitted_bytes = next;
+        state.stream_storage_bytes = connection_remaining;
+        Ok(offset)
+    }
+
+    /// Record complete local copy or write of the already admitted item.
+    pub fn stream_finish_item(&self, id: u64) -> Result<(), ConnectionError> {
+        let mut state = self.shared.state.lock();
+        let stream = stream_mut(&mut state, id)?;
+        if stream.total_bytes.is_none() || stream.total_bytes != Some(stream.admitted_bytes) {
+            return Err(stream_violation("item is incomplete"));
+        }
+        let next_count = stream
+            .complete_items
+            .checked_add(1)
+            .ok_or(ConnectionError::Capacity("item count"))?;
+        stream.total_bytes = None;
+        stream.admitted_bytes = 0;
+        stream.complete_items = next_count;
+        Ok(())
+    }
+
+    /// Submit cancellation intent once. Current carrier and storage remain owned.
+    pub fn stream_cancel(&self, id: u64) -> Result<bool, ConnectionError> {
+        let mut state = self.shared.state.lock();
+        let stream = stream_mut(&mut state, id)?;
+        if stream.cancelled {
+            return Ok(false);
+        }
+        stream.cancelled = true;
+        drop(state);
+        (self.shared.wake)();
+        Ok(true)
+    }
+
+    pub fn stream_state(&self, id: u64) -> Option<StreamState> {
+        self.shared.state.lock().streams.get(&id).copied()
+    }
+
+    /// Retire a completed call record and settle only its unused byte grants.
+    pub fn stream_retire(&self, id: u64) -> Option<StreamState> {
+        let mut state = self.shared.state.lock();
+        let stream = state.streams.remove(&id)?;
+        state.stream_storage_bytes = state
+            .stream_storage_bytes
+            .checked_sub(stream.storage_bytes)
+            .expect("stream grants are in connection total");
+        drop(state);
+        (self.shared.wake)();
+        Some(stream)
     }
 
     /// Register the real owner before its descriptor can reach the writer.
@@ -466,12 +685,24 @@ impl ConnectionCore {
             && state.prepared.is_empty()
             && state.published.is_empty()
             && state.settling == 0
+            && state.streams.is_empty()
         {
             state.closed = true;
             state.releases.clear();
         }
         state.closed
     }
+}
+
+fn stream_violation(message: &str) -> ConnectionError {
+    ConnectionError::ProtocolViolation(message.into())
+}
+
+fn stream_mut(state: &mut State, id: u64) -> Result<&mut StreamState, ConnectionError> {
+    state
+        .streams
+        .get_mut(&id)
+        .ok_or_else(|| stream_violation("unknown stream ID"))
 }
 
 fn check_writable(state: &State) -> Result<(), ConnectionError> {

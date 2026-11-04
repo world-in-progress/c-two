@@ -133,11 +133,14 @@ use c2_wire::route_catalog_control::{
 };
 use c2_wire::rpc::RouteCallIdentity;
 use c2_wire::rpc::{
-    self, CallMode, CallStatus, FragmentPosition, RpcRecord, RpcRecordKind, ValuePart, ValueStorage,
+    self, CallMode, CallStatus, ChunkPosition, RpcRecord, RpcRecordKind, ValuePart, ValueStorage,
 };
 
 use c2_mem::config::PoolConfig;
 use c2_mem::retention::{BudgetedBuffer, PayloadBufferBudget};
+
+#[path = "stream.rs"]
+pub mod stream;
 use c2_mem::{MemHandle, MemPool, PeerMappingCache, PeerMappingError, PeerRead, PoolAllocation};
 
 use crate::response::{ResponseData, ServerShmResponse};
@@ -751,14 +754,35 @@ pub(crate) struct PendingResponse {
     reply_chunks: Option<ValueReceive>,
     pub(crate) kind: PendingKind,
     upload_stop: Option<watch::Sender<bool>>,
+    pub(crate) stream: Option<Arc<stream::StreamReceive>>,
 }
 impl PendingResponse {
     pub(crate) fn complete(self, result: Result<ResponseData, IpcError>) {
+        if let Some(stream) = self.stream {
+            stream.transport_failed(
+                result.err().unwrap_or_else(|| {
+                    IpcError::Protocol("unary response for server stream".into())
+                }),
+            );
+            // The upload waiter needs only a wakeup here; the stream retains
+            // the concrete transport failure for completion().
+            if let Some(tx) = self.tx {
+                let _ = tx.send(Err(IpcError::Closed));
+            }
+        } else if let Some(tx) = self.tx {
+            let _ = tx.send(result);
+        }
         if let Some(stop) = self.upload_stop {
             stop.send_replace(true);
         }
+    }
+
+    pub(crate) fn finish_stream_upload(self, response: Result<ResponseData, IpcError>) {
         if let Some(tx) = self.tx {
-            let _ = tx.send(result);
+            let _ = tx.send(response);
+        }
+        if let Some(stop) = self.upload_stop {
+            stop.send_replace(true);
         }
     }
 }
@@ -850,7 +874,9 @@ impl Drop for SendGuard {
                 None
             }
         };
-        drop(detached);
+        if let Some(entry) = detached {
+            entry.complete(Err(IpcError::Closed));
+        }
         self.conn.wake.notify_one();
         if unpublished {
             if let Some(producer) = &self.producer {
@@ -1236,6 +1262,7 @@ impl IpcClient {
             reply_chunks: None,
             kind,
             upload_stop: None,
+            stream: None,
         });
         Ok((
             SendGuard {
@@ -2449,9 +2476,9 @@ impl IpcClient {
         policy: Option<IpcCallControl>,
     ) -> Result<(), IpcError> {
         let record_flags = flags::FLAG_RPC_RECORD
-            | flags::FLAG_FRAGMENTED
+            | flags::FLAG_CHUNKED
             | if chunk_idx == 0 {
-                flags::FLAG_FIRST_FRAGMENT
+                flags::FLAG_FIRST_CHUNK
             } else {
                 0
             };
@@ -3117,6 +3144,7 @@ pub(crate) fn recv_loop(
                 registry.abort(conn_id, hdr.request_id);
                 let mut remaining = hdr.payload_len();
                 let mut scratch = [0u8; 4096];
+                let mut record_kind = None;
                 // A readable frame still has a precise end. Settle an admitted
                 // SHM descriptor even when allocating its whole frame failed.
                 // Every valid unary SHM record fits this fixed metadata reserve.
@@ -3127,40 +3155,49 @@ pub(crate) fn recv_loop(
                         conn.end_io("discard_descriptor", &error, true);
                         break 'frames;
                     }
+                    record_kind = prefix.first().copied();
                     remaining = 0;
-                    let descriptor = match rpc::decode_rpc_record_with_carrier(
-                        &hdr,
-                        prefix,
-                        Some(CallMode::Unary),
-                    ) {
-                        Ok(
-                            RpcRecord::CallEnd {
-                                value:
-                                    ValuePart {
-                                        storage: ValueStorage::Shm(descriptor),
-                                        ..
-                                    },
-                                ..
-                            }
-                            | RpcRecord::CallEndContinuation {
-                                value:
-                                    ValuePart {
-                                        storage: ValueStorage::Shm(descriptor),
-                                        ..
-                                    },
-                            },
-                        ) => Some(descriptor),
-                        Err(failure) => {
-                            if failure.error == DecodeError::ZeroLoanId {
-                                conn.end(
-                                    ConnectionEndReason::ProtocolError,
-                                    "response_loan_admission",
-                                );
-                            }
-                            failure.carrier
-                        }
-                        _ => None,
+                    let mode = match pending.lock().get(&hdr.request_id).map(|entry| entry.kind) {
+                        Some(PendingKind::Call(mode)) => mode,
+                        _ => CallMode::Unary,
                     };
+                    let descriptor =
+                        match rpc::decode_rpc_record_with_carrier(&hdr, prefix, Some(mode)) {
+                            Ok(
+                                RpcRecord::CallEnd {
+                                    value:
+                                        ValuePart {
+                                            storage: ValueStorage::Shm(descriptor),
+                                            ..
+                                        },
+                                    ..
+                                }
+                                | RpcRecord::CallEndContinuation {
+                                    value:
+                                        ValuePart {
+                                            storage: ValueStorage::Shm(descriptor),
+                                            ..
+                                        },
+                                }
+                                | RpcRecord::ItemData {
+                                    value:
+                                        ValuePart {
+                                            storage: ValueStorage::Shm(descriptor),
+                                            ..
+                                        },
+                                },
+                            ) => Some(descriptor),
+                            Err(failure) => {
+                                if failure.error == DecodeError::ZeroLoanId {
+                                    conn.end(
+                                        ConnectionEndReason::ProtocolError,
+                                        "response_loan_admission",
+                                    );
+                                }
+                                failure.carrier
+                            }
+                            _ => None,
+                        };
                     if let Some(descriptor) = descriptor {
                         discard_response_storage(
                             ValueStorage::Shm(descriptor),
@@ -3177,12 +3214,20 @@ pub(crate) fn recv_loop(
                         conn.end_io("discard_payload", &error, true);
                         break 'frames;
                     }
+                    if record_kind.is_none() {
+                        record_kind = scratch.first().copied();
+                    }
                     remaining -= count;
                 }
-                conn.response_failed(
-                    hdr.request_id,
-                    IpcError::Io(std::io::Error::new(std::io::ErrorKind::OutOfMemory, error)),
-                );
+                let error =
+                    IpcError::Io(std::io::Error::new(std::io::ErrorKind::OutOfMemory, error));
+                if hdr.flags & flags::FLAG_RPC_RECORD != 0
+                    && record_kind == Some(RpcRecordKind::CallEnd as u8)
+                {
+                    conn.terminal_response_failed(hdr.request_id, error);
+                } else {
+                    conn.response_failed(hdr.request_id, error);
+                }
                 continue;
             }
             payload.resize(hdr.payload_len(), 0);
@@ -3268,13 +3313,102 @@ pub(crate) fn recv_loop(
                     }
                     if kind.is_some() {
                         registry.abort(conn_id, rid);
-                        conn.response_failed(rid, IpcError::Decode(failure.error));
+                        if matches!(kind, Some(PendingKind::Call(CallMode::ServerStream)))
+                            && payload.first() == Some(&(RpcRecordKind::CallEnd as u8))
+                        {
+                            conn.terminal_response_failed(rid, IpcError::Decode(failure.error));
+                        } else {
+                            conn.response_failed(rid, IpcError::Decode(failure.error));
+                        }
                     } else if !historical {
                         conn.end(ConnectionEndReason::ProtocolError, "future_reply");
                     }
                     continue;
                 }
             };
+            if kind.is_none() && historical {
+                match record {
+                    RpcRecord::ItemData { value } => {
+                        discard_response_storage(
+                            value.storage,
+                            server_pool,
+                            shm_allowed,
+                            conn,
+                            retirement.clone(),
+                        );
+                        continue;
+                    }
+                    RpcRecord::ItemBegin { .. } => continue,
+                    _ => {}
+                }
+            }
+            let stream = pending
+                .lock()
+                .get(&rid)
+                .and_then(|entry| entry.stream.clone());
+            if let Some(stream) = stream {
+                let result = match record {
+                    RpcRecord::ItemBegin { total_bytes } => stream.begin(total_bytes),
+                    RpcRecord::ItemData { value } => {
+                        stream.data(value.storage, server_pool, shm_allowed, retirement.clone())
+                    }
+                    RpcRecord::CallEnd {
+                        status,
+                        complete_items,
+                        error,
+                        value,
+                    } => {
+                        discard_response_storage(
+                            value.storage,
+                            server_pool,
+                            shm_allowed,
+                            conn,
+                            retirement.clone(),
+                        );
+                        let terminal = stream::StreamTerminal {
+                            status,
+                            complete_items: complete_items.unwrap_or(0),
+                            error,
+                        };
+                        let upload_response = match terminal.status {
+                            // A resource terminal still belongs to the stream:
+                            // already-delivered items and local failures must
+                            // be read from that original receiver.
+                            CallStatus::Success | CallStatus::Failed => {
+                                Ok(ResponseData::Inline(Vec::new()))
+                            }
+                            CallStatus::NotExecuted => Err(IpcError::CallRejected(
+                                terminal
+                                    .error
+                                    .as_ref()
+                                    .expect("checked C2E1 refusal")
+                                    .clone(),
+                            )),
+                        };
+                        let result = stream.finish(terminal);
+                        if let Some(entry) = pending.lock().remove(&rid) {
+                            entry.finish_stream_upload(if result.is_ok() {
+                                upload_response
+                            } else {
+                                Err(IpcError::Closed)
+                            });
+                        }
+                        if let Err(error) = result {
+                            stream.transport_failed(error.response_failure());
+                        }
+                        Ok(())
+                    }
+                    _ => Err(IpcError::Protocol("unexpected server-stream record".into())),
+                };
+                if let Err(error) = result {
+                    stream.fail_local(C2Error::new(
+                        c2_error::ErrorCode::ProtocolViolation,
+                        error.to_string(),
+                    ));
+                }
+                conn.wake.notify_one();
+                continue;
+            }
             let value = match record {
                 RpcRecord::CallEnd {
                     status,
@@ -3395,8 +3529,8 @@ pub(crate) fn recv_loop(
                     continue;
                 }
             };
-            let result = match value.fragment {
-                FragmentPosition::Whole => admit_response_storage(
+            let result = match value.chunk {
+                ChunkPosition::Whole => admit_response_storage(
                     value.storage,
                     &server_pool,
                     shm_allowed,
@@ -3472,7 +3606,7 @@ fn receive_rpc_chunk(
         None
     };
     let bytes = value.storage.len();
-    let geometry = if let FragmentPosition::First { total_bytes } = value.fragment {
+    let geometry = if let ChunkPosition::First { total_bytes } = value.chunk {
         let receive =
             ValueReceive::first(total_bytes, bytes).map_err(|e| IpcError::Protocol(e.into()))?;
         let geometry = receive
@@ -3481,9 +3615,7 @@ fn receive_rpc_chunk(
         let mut calls = pending.lock();
         let call = calls.get_mut(&rid).ok_or(IpcError::Closed)?;
         if call.reply_chunks.is_some() {
-            return Err(IpcError::Protocol(
-                "duplicate CALL_END first fragment".into(),
-            ));
+            return Err(IpcError::Protocol("duplicate CALL_END first chunk".into()));
         }
         call.reply_chunks = Some(receive);
         Some((total_bytes, geometry))

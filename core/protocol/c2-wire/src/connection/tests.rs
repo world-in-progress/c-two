@@ -11,6 +11,94 @@ fn established(side: ConnectionSide) -> ConnectionCore {
     core
 }
 
+#[test]
+fn stream_zero_item_and_variable_data_sizes_track_one_position() {
+    let core = established(ConnectionSide::Server);
+    core.stream_open(7).unwrap();
+    assert!(core.stream_start_step(7).unwrap());
+    core.stream_begin_item(7, 0).unwrap();
+    assert_eq!(core.stream_state(7).unwrap().complete_items, 1);
+    assert!(!core.stream_start_step(7).unwrap());
+    core.stream_credit(7, 0, 1).unwrap();
+    assert!(core.stream_start_step(7).unwrap());
+    core.stream_begin_item(7, 7).unwrap();
+    core.stream_credit(7, 7, 0).unwrap();
+    assert_eq!(core.stream_data(7, 2).unwrap(), 0);
+    assert_eq!(core.stream_data(7, 5).unwrap(), 2);
+    core.stream_finish_item(7).unwrap();
+    let state = core.stream_state(7).unwrap();
+    assert_eq!(state.complete_items, 2);
+    assert_eq!(state.total_bytes, None);
+    assert_eq!(state.admitted_bytes, 0);
+}
+
+#[test]
+fn stream_demand_and_storage_reject_overgrant_without_changing_connection_book() {
+    let core = established(ConnectionSide::Client);
+    core.stream_open(1).unwrap();
+    core.stream_open(2).unwrap();
+    assert!(core.stream_credit(1, 0, 1).is_err());
+    core.stream_begin_item(1, 4).unwrap();
+    core.stream_begin_item(2, 3).unwrap();
+    core.stream_credit(1, 3, 0).unwrap();
+    core.stream_credit(2, 2, 0).unwrap();
+    assert!(core.stream_credit(1, 2, 0).is_err());
+    assert!(core.stream_data(1, 4).is_err());
+    assert!(core.stream_data(1, 0).is_err());
+    assert_eq!(core.shared.state.lock().stream_storage_bytes, 5);
+    assert_eq!(core.stream_data(1, 2).unwrap(), 0);
+    assert_eq!(core.shared.state.lock().stream_storage_bytes, 3);
+    assert_eq!(core.stream_data(2, 2).unwrap(), 0);
+    assert_eq!(core.shared.state.lock().stream_storage_bytes, 1);
+    assert_eq!(core.stream_retire(1).unwrap().storage_bytes, 1);
+    assert_eq!(core.shared.state.lock().stream_storage_bytes, 0);
+    assert_eq!(core.stream_state(2).unwrap().admitted_bytes, 2);
+}
+
+#[test]
+fn stream_cancel_is_idempotent_and_late_credit_does_not_revive_it() {
+    let core = established(ConnectionSide::Server);
+    core.stream_open(8).unwrap();
+    assert!(core.stream_start_step(8).unwrap());
+    core.stream_begin_item(8, 5).unwrap();
+    core.stream_credit(8, 5, 0).unwrap();
+    assert!(core.stream_cancel(8).unwrap());
+    assert!(!core.stream_cancel(8).unwrap());
+    core.stream_credit(8, 10, 1).unwrap();
+    assert_eq!(core.stream_state(8).unwrap().storage_bytes, 5);
+    assert_eq!(core.stream_data(8, 5).unwrap(), 0);
+    core.stream_finish_item(8).unwrap();
+    assert!(!core.stream_start_step(8).unwrap());
+}
+
+#[test]
+fn live_stream_blocks_close_even_after_peer_end_until_driver_retires_it() {
+    let core = established(ConnectionSide::Server);
+    core.stream_open(9).unwrap();
+    drop(core.peer_end());
+    assert!(!core.try_close());
+    assert!(core.stream_state(9).is_some());
+    core.stream_retire(9).unwrap();
+    assert!(core.try_close());
+}
+
+#[test]
+fn stream_registration_requires_handshake_and_live_admission() {
+    let core = ConnectionCore::new(ConnectionSide::Client, || {});
+    assert_eq!(core.stream_open(1), Err(ConnectionError::BeforeHandshake));
+    core.finish_handshake().unwrap();
+    assert!(core.stream_open(0).is_err());
+    core.stream_open(1).unwrap();
+    assert!(core.stream_open(1).is_err());
+    assert!(core.stream_start_step(1).is_err());
+    assert!(core.stream_finish_item(1).is_err());
+    drop(core.deactivate());
+    assert_eq!(core.stream_open(2), Err(ConnectionError::Deactivated));
+    assert!(!core.try_close());
+    core.stream_retire(1).unwrap();
+    assert!(core.try_close());
+}
+
 // File-backed move-only handles let the control-plane algorithm exercise real
 // allocation ownership without requiring OS SHM. SHM integration is separate.
 fn allocation() -> (Arc<RwLock<MemPool>>, MemoryBudget, MemHandle) {

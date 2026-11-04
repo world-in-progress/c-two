@@ -633,7 +633,7 @@ export function createIpcEncodedTransport<Payload extends C2ResponsePayload = C2
         const receive = async (): Promise<C2IpcCallResponse> => {
           try {
             const first = await readIpcResponseFrame(open, requestId);
-            if ((first.flags & C2_IPC_FLAG_FRAGMENTED) === 0) stopChunkUpload = true;
+            if ((first.flags & C2_IPC_FLAG_CHUNKED) === 0) stopChunkUpload = true;
             const result = await readIpcCallEnd(open, first, requestId);
             stopChunkUpload = true;
             return result;
@@ -684,7 +684,7 @@ export function createIpcEncodedTransport<Payload extends C2ResponsePayload = C2
               } else if (chunked) {
                 let offset = 0;
                 const firstData = requestPayload.subarray(0, requestChunkSize);
-                await writeIpcFrame(open, () => firstFrame(C2_IPC_FLAG_RPC_RECORD | C2_IPC_FLAG_FRAGMENTED | C2_IPC_FLAG_FIRST_FRAGMENT,
+                await writeIpcFrame(open, () => firstFrame(C2_IPC_FLAG_RPC_RECORD | C2_IPC_FLAG_CHUNKED | C2_IPC_FLAG_FIRST_CHUNK,
                   concatUint8Arrays([writeU64LEBigInt(BigInt(requestPayload.byteLength), "total_bytes"), firstData])));
                 offset = firstData.byteLength;
                 while (offset < requestPayload.byteLength) {
@@ -692,7 +692,7 @@ export function createIpcEncodedTransport<Payload extends C2ResponsePayload = C2
                   // complete frame; the stream remains usable for the next call.
                   if (stopChunkUpload) break;
                   const chunk = requestPayload.subarray(offset, Math.min(offset + firstData.byteLength, requestPayload.byteLength));
-                  await writeIpcFrame(open, encodeIpcFrame(requestId, C2_IPC_FLAG_RPC_RECORD | C2_IPC_FLAG_FRAGMENTED,
+                  await writeIpcFrame(open, encodeIpcFrame(requestId, C2_IPC_FLAG_RPC_RECORD | C2_IPC_FLAG_CHUNKED,
                     concatUint8Arrays([new Uint8Array([C2_IPC_OPEN]), chunk])), undefined, true);
                   offset += chunk.byteLength;
                 }
@@ -1084,9 +1084,9 @@ const C2_IPC_FLAG_RESPONSE = 1 << 1;
 const C2_IPC_FLAG_HANDSHAKE = 1 << 2;
 const C2_IPC_FLAG_CTRL = 1 << 4;
 const C2_IPC_FLAG_BUDDY = 0x40;
-const C2_IPC_FLAG_FRAGMENTED = 0x200;
+const C2_IPC_FLAG_CHUNKED = 0x200;
 const C2_IPC_FLAG_RPC_RECORD = 0x1000;
-const C2_IPC_FLAG_FIRST_FRAGMENT = 0x2000;
+const C2_IPC_FLAG_FIRST_CHUNK = 0x2000;
 const C2_IPC_OPEN = 0x01;
 const C2_IPC_CALL_END = 0x06;
 const C2_IPC_RELEASE = 0x07;
@@ -1106,7 +1106,7 @@ const C2_IPC_ERROR_NAMES: Readonly<Record<number, string>> = {
   708: "ResourceRemoved", 709: "ContractMismatch", 710: "IdentityMismatch",
   711: "RouteCatalogCompacted", 712: "RouteWatchUnavailable", 713: "ProtocolViolation",
   714: "FallbackDenied", 715: "CallDeadlineExceeded", 716: "UnsupportedCallMode",
-  717: "CallCapacityExceeded",
+  717: "CallCapacityExceeded", 718: "CallCancelled",
 };
 const C2_TEXT_ENCODER = new TextEncoder();
 const C2_TEXT_DECODER = new TextDecoder("utf-8", { fatal: true });
@@ -1486,7 +1486,7 @@ async function readIpcResponseFrame(open: C2IpcOpenConnection, expectedRequestId
       catch (error) {
         if (error instanceof C2IpcLocalPayloadFailure) {
           const retired = error.requestId > 0n && error.requestId < open.nextRequestId && !open.activeCalls.has(error.requestId);
-          const lateFlags = C2_IPC_FLAG_RESPONSE | C2_IPC_FLAG_RPC_RECORD | C2_IPC_FLAG_FRAGMENTED;
+          const lateFlags = C2_IPC_FLAG_RESPONSE | C2_IPC_FLAG_RPC_RECORD | C2_IPC_FLAG_CHUNKED;
           if (retired && (error.flags === lateFlags || error.flags === (lateFlags | C2_IPC_FLAG_BUDDY))
             && error.prefix?.[0] === C2_IPC_CALL_END && error.payloadLength > 1) {
             if ((error.flags & C2_IPC_FLAG_BUDDY) !== 0) {
@@ -1562,19 +1562,19 @@ async function discardIpcShmFrame(open: C2IpcOpenConnection, frame: C2IpcFrame, 
 
 function ipcResponseStorageOffset(frame: C2IpcFrame): number | undefined {
   if ((frame.flags & C2_IPC_FLAG_RESPONSE) === 0 || (frame.flags & C2_IPC_FLAG_RPC_RECORD) === 0 || frame.payload[0] !== C2_IPC_CALL_END) return undefined;
-  const first = (frame.flags & C2_IPC_FLAG_FIRST_FRAGMENT) !== 0;
-  if ((frame.flags & C2_IPC_FLAG_FRAGMENTED) !== 0 && !first) return 1;
+  const first = (frame.flags & C2_IPC_FLAG_FIRST_CHUNK) !== 0;
+  if ((frame.flags & C2_IPC_FLAG_CHUNKED) !== 0 && !first) return 1;
   return first ? 10 : 2;
 }
 
 async function discardRetiredIpcCallEnd(open: C2IpcOpenConnection, frame: C2IpcFrame): Promise<void> {
   const base = C2_IPC_FLAG_RESPONSE | C2_IPC_FLAG_RPC_RECORD;
-  const allowed = base | C2_IPC_FLAG_BUDDY | C2_IPC_FLAG_FRAGMENTED | C2_IPC_FLAG_FIRST_FRAGMENT;
+  const allowed = base | C2_IPC_FLAG_BUDDY | C2_IPC_FLAG_CHUNKED | C2_IPC_FLAG_FIRST_CHUNK;
   if ((frame.flags & base) !== base || (frame.flags & ~allowed) !== 0 || frame.payload[0] !== C2_IPC_CALL_END
-    || ((frame.flags & C2_IPC_FLAG_FIRST_FRAGMENT) !== 0 && (frame.flags & C2_IPC_FLAG_FRAGMENTED) === 0)) {
+    || ((frame.flags & C2_IPC_FLAG_FIRST_CHUNK) !== 0 && (frame.flags & C2_IPC_FLAG_CHUNKED) === 0)) {
     throw new C2IpcConnectionFailure("Retired IPC 16 CALL_END has invalid flags or kind.");
   }
-  const continuation = (frame.flags & C2_IPC_FLAG_FRAGMENTED) !== 0 && (frame.flags & C2_IPC_FLAG_FIRST_FRAGMENT) === 0;
+  const continuation = (frame.flags & C2_IPC_FLAG_CHUNKED) !== 0 && (frame.flags & C2_IPC_FLAG_FIRST_CHUNK) === 0;
   let offset = 1;
   if (!continuation) {
     if (frame.payload.byteLength < 2) throw new C2IpcConnectionFailure("Retired IPC 16 CALL_END status is missing.");
@@ -1586,24 +1586,24 @@ async function discardRetiredIpcCallEnd(open: C2IpcOpenConnection, frame: C2IpcF
     }
     if (status !== C2_IPC_REPLY_STATUS_SUCCESS) throw new C2IpcConnectionFailure("Retired IPC 16 CALL_END status is invalid.");
     offset = 2;
-    if ((frame.flags & C2_IPC_FLAG_FIRST_FRAGMENT) !== 0) {
-      if (frame.payload.byteLength < 11) throw new C2IpcConnectionFailure("Retired IPC 16 CALL_END first fragment is truncated.");
+    if ((frame.flags & C2_IPC_FLAG_FIRST_CHUNK) !== 0) {
+      if (frame.payload.byteLength < 11) throw new C2IpcConnectionFailure("Retired IPC 16 CALL_END first chunk is truncated.");
       offset = 10;
     }
   }
-  const fragmented = (frame.flags & C2_IPC_FLAG_FRAGMENTED) !== 0;
+  const chunked = (frame.flags & C2_IPC_FLAG_CHUNKED) !== 0;
   if ((frame.flags & C2_IPC_FLAG_BUDDY) !== 0) {
     await discardIpcShmFrame(open, frame);
-    if ((frame.flags & C2_IPC_FLAG_FIRST_FRAGMENT) !== 0) {
+    if ((frame.flags & C2_IPC_FLAG_FIRST_CHUNK) !== 0) {
       const total = readU64LEBigInt(frame.payload, 2);
       const size = BigInt(readU32LE(frame.payload, offset + 10));
-      if (size >= total) throw new C2IpcConnectionFailure("Retired IPC 16 CALL_END first fragment is not multi-part.");
+      if (size >= total) throw new C2IpcConnectionFailure("Retired IPC 16 CALL_END first chunk is not multi-part.");
     }
   } else {
     const size = frame.payload.byteLength - offset;
-    if (fragmented && size <= 0) throw new C2IpcConnectionFailure("Retired IPC 16 CALL_END fragment is empty.");
-    if ((frame.flags & C2_IPC_FLAG_FIRST_FRAGMENT) !== 0 && BigInt(size) >= readU64LEBigInt(frame.payload, 2)) {
-      throw new C2IpcConnectionFailure("Retired IPC 16 CALL_END first fragment is not multi-part.");
+    if (chunked && size <= 0) throw new C2IpcConnectionFailure("Retired IPC 16 CALL_END chunk is empty.");
+    if ((frame.flags & C2_IPC_FLAG_FIRST_CHUNK) !== 0 && BigInt(size) >= readU64LEBigInt(frame.payload, 2)) {
+      throw new C2IpcConnectionFailure("Retired IPC 16 CALL_END first chunk is not multi-part.");
     }
   }
 }
@@ -1986,14 +1986,14 @@ async function readIpcShmSuccessPayload<Payload extends C2ResponsePayload>(
 
 async function readIpcCallEnd(open: C2IpcOpenConnection, first: C2IpcFrame, requestId: bigint): Promise<C2IpcCallResponse> {
   const baseFlags = C2_IPC_FLAG_RESPONSE | C2_IPC_FLAG_RPC_RECORD;
-  const allowedFlags = baseFlags | C2_IPC_FLAG_BUDDY | C2_IPC_FLAG_FRAGMENTED | C2_IPC_FLAG_FIRST_FRAGMENT;
+  const allowedFlags = baseFlags | C2_IPC_FLAG_BUDDY | C2_IPC_FLAG_CHUNKED | C2_IPC_FLAG_FIRST_CHUNK;
   if (first.requestId !== requestId || (first.flags & baseFlags) !== baseFlags || (first.flags & ~allowedFlags) !== 0 || first.payload[0] !== C2_IPC_CALL_END) {
     if ((first.flags & C2_IPC_FLAG_BUDDY) !== 0) await discardIpcShmFrame(open, first);
     throw new C2IpcConnectionFailure("C-Two IPC response is not an IPC 16 CALL_END record.");
   }
-  if ((first.flags & C2_IPC_FLAG_FIRST_FRAGMENT) !== 0 && (first.flags & C2_IPC_FLAG_FRAGMENTED) === 0) {
+  if ((first.flags & C2_IPC_FLAG_FIRST_CHUNK) !== 0 && (first.flags & C2_IPC_FLAG_CHUNKED) === 0) {
     if ((first.flags & C2_IPC_FLAG_BUDDY) !== 0) await discardIpcShmFrame(open, first);
-    throw new C2IpcConnectionFailure("C-Two IPC FIRST_FRAGMENT requires FRAGMENTED.");
+    throw new C2IpcConnectionFailure("C-Two IPC FIRST_CHUNK requires CHUNKED.");
   }
   if (first.payload.byteLength < 2) throw new C2IpcConnectionFailure("C-Two IPC CALL_END status is missing.");
   const status = first.payload[1];
@@ -2011,20 +2011,20 @@ async function readIpcCallEnd(open: C2IpcOpenConnection, first: C2IpcFrame, requ
     if (status === C2_IPC_REPLY_STATUS_NOT_EXECUTED) throw new C2IpcCallRejectedError(payload.slice(), canonical);
     throw new C2CrmMethodError(payload.slice());
   }
-  if ((first.flags & C2_IPC_FLAG_FRAGMENTED) === 0) {
+  if ((first.flags & C2_IPC_FLAG_CHUNKED) === 0) {
     if ((first.flags & C2_IPC_FLAG_BUDDY) !== 0) {
       const value = await admitIpcResponseShm(open, first.payload.subarray(2));
       return { kind: "shm", block: value.block, response: value.response };
     }
     return { kind: "inline", payload: first.payload.subarray(2) };
   }
-  if ((first.flags & C2_IPC_FLAG_FIRST_FRAGMENT) === 0 || first.payload.byteLength < 11) {
-    throw new C2IpcConnectionFailure("C-Two IPC CALL_END is missing its first fragment metadata.");
+  if ((first.flags & C2_IPC_FLAG_FIRST_CHUNK) === 0 || first.payload.byteLength < 11) {
+    throw new C2IpcConnectionFailure("C-Two IPC CALL_END is missing its first chunk metadata.");
   }
   const totalBytes = readU64LEBigInt(first.payload, 2);
   const firstPart = await copyIpcResponsePart(open, first, 10);
   const pieceBytes = BigInt(firstPart.byteLength);
-  if (pieceBytes === 0n || pieceBytes >= totalBytes) throw new C2IpcConnectionFailure("C-Two IPC first fragment must start a multi-part value.");
+  if (pieceBytes === 0n || pieceBytes >= totalBytes) throw new C2IpcConnectionFailure("C-Two IPC first chunk must start a multi-part value.");
   if (totalBytes > BigInt(Number.MAX_SAFE_INTEGER)) throw new C2IpcTransportError("C-Two IPC response exceeds local allocation range.");
   let assembled: Uint8Array;
   try { assembled = new Uint8Array(Number(totalBytes)); }
@@ -2033,8 +2033,8 @@ async function readIpcCallEnd(open: C2IpcOpenConnection, first: C2IpcFrame, requ
   let copied = pieceBytes;
   while (copied < totalBytes) {
     const next = await readIpcResponseFrame(open, requestId);
-    if (next.requestId !== requestId || (next.flags & ~(baseFlags | C2_IPC_FLAG_FRAGMENTED | C2_IPC_FLAG_BUDDY)) !== 0
-      || (next.flags & (baseFlags | C2_IPC_FLAG_FRAGMENTED)) !== (baseFlags | C2_IPC_FLAG_FRAGMENTED)
+    if (next.requestId !== requestId || (next.flags & ~(baseFlags | C2_IPC_FLAG_CHUNKED | C2_IPC_FLAG_BUDDY)) !== 0
+      || (next.flags & (baseFlags | C2_IPC_FLAG_CHUNKED)) !== (baseFlags | C2_IPC_FLAG_CHUNKED)
       || next.payload[0] !== C2_IPC_CALL_END) {
       if ((next.flags & C2_IPC_FLAG_BUDDY) !== 0) await discardIpcShmFrame(open, next);
       throw new C2IpcConnectionFailure("C-Two IPC CALL_END continuation has invalid flags or kind.");
@@ -2069,7 +2069,7 @@ async function admitIpcResponseShm(open: C2IpcOpenConnection, storage: Uint8Arra
 async function copyIpcResponsePart(open: C2IpcOpenConnection, frame: C2IpcFrame, offset: number): Promise<Uint8Array> {
   if ((frame.flags & C2_IPC_FLAG_BUDDY) === 0) {
     const part = frame.payload.subarray(offset);
-    if (part.byteLength === 0) throw new C2IpcConnectionFailure("C-Two IPC fragment is empty.");
+    if (part.byteLength === 0) throw new C2IpcConnectionFailure("C-Two IPC chunk is empty.");
     return part;
   }
   const { block, response } = await admitIpcResponseShm(open, frame.payload.subarray(offset));

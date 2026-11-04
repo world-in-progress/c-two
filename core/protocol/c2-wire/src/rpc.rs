@@ -3,9 +3,7 @@
 use c2_error::C2Error;
 
 use crate::buddy::{BUDDY_PAYLOAD_SIZE, BuddyPayload, decode_buddy_payload, encode_buddy_payload};
-use crate::flags::{
-    FLAG_BUDDY, FLAG_FIRST_FRAGMENT, FLAG_FRAGMENTED, FLAG_RESPONSE, FLAG_RPC_RECORD,
-};
+use crate::flags::{FLAG_BUDDY, FLAG_CHUNKED, FLAG_FIRST_CHUNK, FLAG_RESPONSE, FLAG_RPC_RECORD};
 use crate::frame::{DecodeError, FrameHeader, encode_frame};
 use crate::release::{ReleaseBatch, decode_release_frame};
 
@@ -279,7 +277,7 @@ impl ValueStorage<'_> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FragmentPosition {
+pub enum ChunkPosition {
     Whole,
     First { total_bytes: u64 },
     Continuation,
@@ -287,28 +285,28 @@ pub enum FragmentPosition {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ValuePart<'a> {
-    pub fragment: FragmentPosition,
+    pub chunk: ChunkPosition,
     pub storage: ValueStorage<'a>,
 }
 
 impl<'a> ValuePart<'a> {
     pub fn whole(storage: ValueStorage<'a>) -> Self {
         Self {
-            fragment: FragmentPosition::Whole,
+            chunk: ChunkPosition::Whole,
             storage,
         }
     }
 
     pub fn first(total_bytes: u64, storage: ValueStorage<'a>) -> Self {
         Self {
-            fragment: FragmentPosition::First { total_bytes },
+            chunk: ChunkPosition::First { total_bytes },
             storage,
         }
     }
 
     pub fn continuation(storage: ValueStorage<'a>) -> Self {
         Self {
-            fragment: FragmentPosition::Continuation,
+            chunk: ChunkPosition::Continuation,
             storage,
         }
     }
@@ -385,8 +383,8 @@ fn inspect_carrier(
     ) {
         return None;
     }
-    let first = header.flags & FLAG_FIRST_FRAGMENT != 0;
-    let continuation = header.flags & FLAG_FRAGMENTED != 0 && !first;
+    let first = header.flags & FLAG_FIRST_CHUNK != 0;
+    let continuation = header.flags & FLAG_CHUNKED != 0 && !first;
     let mut offset = 1usize;
     if !continuation {
         match kind {
@@ -401,9 +399,14 @@ fn inspect_carrier(
                 offset = offset.checked_add(2)?;
             }
             RpcRecordKind::CallEnd => {
+                let status = CallStatus::try_from(*payload.get(offset)?).ok()?;
                 offset = offset.checked_add(1)?;
-                if mode == Some(CallMode::ServerStream) {
-                    offset = offset.checked_add(8)?;
+                match status {
+                    CallStatus::NotExecuted => {}
+                    CallStatus::Success | CallStatus::Failed => match mode? {
+                        CallMode::Unary => {}
+                        CallMode::ServerStream => offset = offset.checked_add(8)?,
+                    },
                 }
             }
             RpcRecordKind::ItemData => {}
@@ -435,8 +438,7 @@ pub fn decode_rpc_record<'a>(
         return Err(DecodeError::BufferTooShort { need: 1, have: 0 });
     }
     let kind = RpcRecordKind::try_from(payload[0])?;
-    let allowed =
-        FLAG_RPC_RECORD | FLAG_RESPONSE | FLAG_BUDDY | FLAG_FRAGMENTED | FLAG_FIRST_FRAGMENT;
+    let allowed = FLAG_RPC_RECORD | FLAG_RESPONSE | FLAG_BUDDY | FLAG_CHUNKED | FLAG_FIRST_CHUNK;
     if header.flags & !allowed != 0 || header.flags & FLAG_RPC_RECORD == 0 {
         return Err(DecodeError::InvalidRpcEnvelope {
             field: "flags",
@@ -460,13 +462,12 @@ pub fn decode_rpc_record<'a>(
             value: header.request_id,
         });
     }
-    let fragmented = header.flags & FLAG_FRAGMENTED != 0;
-    let first = header.flags & FLAG_FIRST_FRAGMENT != 0;
+    let chunked = header.flags & FLAG_CHUNKED != 0;
+    let first = header.flags & FLAG_FIRST_CHUNK != 0;
     let shm = header.flags & FLAG_BUDDY != 0;
-    if first && !fragmented
-        || fragmented && !matches!(kind, RpcRecordKind::Open | RpcRecordKind::CallEnd)
+    if first && !chunked || chunked && !matches!(kind, RpcRecordKind::Open | RpcRecordKind::CallEnd)
     {
-        return Err(invalid("RPC fragment flags", header.flags.into()));
+        return Err(invalid("RPC chunk flags", header.flags.into()));
     }
     if shm
         && !matches!(
@@ -480,12 +481,12 @@ pub fn decode_rpc_record<'a>(
         return decode_release_frame(header, payload, response, true).map(RpcRecord::Release);
     }
     let body = &payload[1..];
-    let no_storage = !shm && !fragmented && !first;
+    let no_storage = !shm && !chunked && !first;
     match kind {
         RpcRecordKind::Open => {
-            if fragmented && !first {
+            if chunked && !first {
                 return Ok(RpcRecord::OpenContinuation {
-                    value: decode_value(body, shm, FragmentPosition::Continuation)?,
+                    value: decode_value(body, shm, ChunkPosition::Continuation)?,
                 });
             }
             let (identity, method_idx, used) = decode_open_metadata(payload)?;
@@ -506,7 +507,7 @@ pub fn decode_rpc_record<'a>(
             })
         }
         RpcRecordKind::ItemData => {
-            let value = decode_value(body, shm, FragmentPosition::Whole)?;
+            let value = decode_value(body, shm, ChunkPosition::Whole)?;
             if value.storage.len() == 0 {
                 return Err(invalid("ITEM_DATA length", 0));
             }
@@ -535,26 +536,30 @@ pub fn decode_rpc_record<'a>(
             Ok(RpcRecord::Cancel)
         }
         RpcRecordKind::CallEnd => {
-            if fragmented && !first {
+            if chunked && !first {
                 return Ok(RpcRecord::CallEndContinuation {
-                    value: decode_value(body, shm, FragmentPosition::Continuation)?,
+                    value: decode_value(body, shm, ChunkPosition::Continuation)?,
                 });
             }
-            let mode = mode.ok_or_else(|| invalid("CALL_END mode", 0))?;
             if body.is_empty() {
                 return Err(DecodeError::BufferTooShort { need: 1, have: 0 });
             }
             let status = CallStatus::try_from(body[0])?;
-            let (complete_items, offset) = match mode {
-                CallMode::Unary => (None, 1),
-                CallMode::ServerStream => {
-                    if body.len() < 9 {
-                        return Err(DecodeError::BufferTooShort {
-                            need: 9,
-                            have: body.len(),
-                        });
+            let (complete_items, offset) = match status {
+                CallStatus::NotExecuted => (None, 1),
+                CallStatus::Success | CallStatus::Failed => {
+                    match mode.ok_or_else(|| invalid("CALL_END mode", 0))? {
+                        CallMode::Unary => (None, 1),
+                        CallMode::ServerStream => {
+                            if body.len() < 9 {
+                                return Err(DecodeError::BufferTooShort {
+                                    need: 9,
+                                    have: body.len(),
+                                });
+                            }
+                            (Some(u64::from_le_bytes(body[1..9].try_into().unwrap())), 9)
+                        }
                     }
-                    (Some(u64::from_le_bytes(body[1..9].try_into().unwrap())), 9)
                 }
             };
             let value = decode_value_at(body, offset, shm, first)?;
@@ -597,17 +602,17 @@ fn decode_value_at<'a>(
         decode_value(
             &body[offset + 8..],
             shm,
-            FragmentPosition::First { total_bytes },
+            ChunkPosition::First { total_bytes },
         )
     } else {
-        decode_value(&body[offset..], shm, FragmentPosition::Whole)
+        decode_value(&body[offset..], shm, ChunkPosition::Whole)
     }
 }
 
 fn decode_value<'a>(
     body: &'a [u8],
     shm: bool,
-    fragment: FragmentPosition,
+    chunk: ChunkPosition,
 ) -> Result<ValuePart<'a>, DecodeError> {
     let storage = if shm {
         require_exact(body, BUDDY_PAYLOAD_SIZE, "SHM descriptor")?;
@@ -620,27 +625,35 @@ fn decode_value<'a>(
         ValueStorage::Inline(body)
     };
     let len = storage.len();
-    match fragment {
-        FragmentPosition::Whole => {}
-        FragmentPosition::First { total_bytes } if len > 0 && len < total_bytes => {}
-        FragmentPosition::Continuation if len > 0 => {}
-        _ => return Err(invalid("RPC fragment length", len)),
+    match chunk {
+        ChunkPosition::Whole => {}
+        ChunkPosition::First { total_bytes } if len > 0 && len < total_bytes => {}
+        ChunkPosition::Continuation if len > 0 => {}
+        _ => return Err(invalid("RPC chunk length", len)),
     }
-    Ok(ValuePart { fragment, storage })
+    Ok(ValuePart { chunk, storage })
 }
 
 fn validate_call_end(
     status: CallStatus,
-    mode: CallMode,
+    mode: Option<CallMode>,
     complete_items: u64,
     value: ValuePart<'_>,
 ) -> Result<Option<C2Error>, String> {
-    if status != CallStatus::Success {
-        if status == CallStatus::NotExecuted && complete_items != 0 {
-            return Err("NotExecuted has completed items".into());
+    if status == CallStatus::NotExecuted && complete_items != 0 {
+        return Err("NotExecuted has completed items".into());
+    }
+    if status != CallStatus::NotExecuted {
+        match mode.ok_or_else(|| "CALL_END mode is unknown".to_string())? {
+            CallMode::Unary if complete_items != 0 => {
+                return Err("unary call has completed items".into());
+            }
+            _ => {}
         }
+    }
+    if status != CallStatus::Success {
         let ValuePart {
-            fragment: FragmentPosition::Whole,
+            chunk: ChunkPosition::Whole,
             storage: ValueStorage::Inline(bytes),
         } = value
         else {
@@ -653,7 +666,8 @@ fn validate_call_end(
             .map_err(|err| err.to_string())?
             .ok_or_else(|| "error is empty".into())
             .map(Some);
-    } else if mode == CallMode::ServerStream && value != ValuePart::whole(ValueStorage::Inline(&[]))
+    } else if mode == Some(CallMode::ServerStream)
+        && value != ValuePart::whole(ValueStorage::Inline(&[]))
     {
         return Err("successful server stream has no result value".into());
     }
@@ -674,19 +688,19 @@ fn invalid(field: &'static str, value: u64) -> DecodeError {
 
 fn encode_value(out: &mut Vec<u8>, value: ValuePart<'_>) -> Result<u32, EncodeError> {
     let mut flags = 0;
-    match value.fragment {
-        FragmentPosition::Whole => {}
-        FragmentPosition::First { total_bytes }
+    match value.chunk {
+        ChunkPosition::Whole => {}
+        ChunkPosition::First { total_bytes }
             if value.storage.len() > 0 && value.storage.len() < total_bytes =>
         {
-            flags |= FLAG_FRAGMENTED | FLAG_FIRST_FRAGMENT;
+            flags |= FLAG_CHUNKED | FLAG_FIRST_CHUNK;
             out.extend_from_slice(&total_bytes.to_le_bytes());
         }
-        FragmentPosition::Continuation if value.storage.len() > 0 => flags |= FLAG_FRAGMENTED,
+        ChunkPosition::Continuation if value.storage.len() > 0 => flags |= FLAG_CHUNKED,
         _ => {
             return Err(encode_invalid(
-                "RPC fragment length",
-                "first/continuation requires a nonempty strict fragment",
+                "RPC chunk length",
+                "first/continuation requires a nonempty strict chunk",
             ));
         }
     }
@@ -728,7 +742,7 @@ pub fn encode_open_frame<S: AsRef<str>>(
     method_idx: u16,
     value: ValuePart<'_>,
 ) -> Result<Vec<u8>, EncodeError> {
-    if request_id == 0 || value.fragment == FragmentPosition::Continuation {
+    if request_id == 0 || value.chunk == ChunkPosition::Continuation {
         return Err(encode_invalid("OPEN", "invalid request id or continuation"));
     }
     let mut payload = encode_open_metadata(identity, method_idx)?;
@@ -737,7 +751,7 @@ pub fn encode_open_frame<S: AsRef<str>>(
 }
 
 /// Encode the kind, route identity and method prefix for a first OPEN
-/// fragment. The caller appends total_bytes and the first value segment.
+/// chunk. The caller appends total_bytes and the first value segment.
 pub fn encode_open_metadata<S: AsRef<str>>(
     identity: &RouteCallIdentity<S>,
     method_idx: u16,
@@ -756,20 +770,20 @@ pub fn encode_call_end_frame(
     complete_items: u64,
     value: ValuePart<'_>,
 ) -> Result<Vec<u8>, EncodeError> {
-    if request_id == 0 || value.fragment == FragmentPosition::Continuation {
+    if request_id == 0 || value.chunk == ChunkPosition::Continuation {
         return Err(encode_invalid(
             "CALL_END",
             "invalid request id or continuation",
         ));
     }
-    validate_call_end(status, mode, complete_items, value).map_err(|reason| {
+    validate_call_end(status, Some(mode), complete_items, value).map_err(|reason| {
         EncodeError::InvalidText {
             field: "CALL_END",
             reason,
         }
     })?;
     let mut payload = vec![RpcRecordKind::CallEnd as u8, status as u8];
-    if mode == CallMode::ServerStream {
+    if status != CallStatus::NotExecuted && mode == CallMode::ServerStream {
         payload.extend_from_slice(&complete_items.to_le_bytes());
     }
     let flags = encode_value(&mut payload, value)?;
@@ -780,7 +794,7 @@ pub fn encode_call_end_frame(
     )
 }
 
-/// Encode a subsequent OPEN or CALL_END value fragment without repeating metadata.
+/// Encode a subsequent OPEN or CALL_END value chunk without repeating metadata.
 pub fn encode_value_continuation_frame(
     request_id: u64,
     kind: RpcRecordKind,

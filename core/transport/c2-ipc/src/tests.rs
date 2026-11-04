@@ -175,7 +175,7 @@ mod client_tests {
     }
 
     #[test]
-    fn fragmented_open_has_one_metadata_record_then_continuation() {
+    fn chunked_open_has_one_metadata_record_then_continuation() {
         let first = encode_open_frame(
             42,
             &call_identity("grid"),
@@ -193,11 +193,11 @@ mod client_tests {
         let (next_header, next_payload) = frame::decode_frame(&continuation).unwrap();
         assert_eq!(
             first_header.flags,
-            flags::FLAG_RPC_RECORD | flags::FLAG_FRAGMENTED | flags::FLAG_FIRST_FRAGMENT
+            flags::FLAG_RPC_RECORD | flags::FLAG_CHUNKED | flags::FLAG_FIRST_CHUNK
         );
         assert_eq!(
             next_header.flags,
-            flags::FLAG_RPC_RECORD | flags::FLAG_FRAGMENTED
+            flags::FLAG_RPC_RECORD | flags::FLAG_CHUNKED
         );
         assert!(matches!(
             decode_rpc_record(&first_header, first_payload, None).unwrap(),

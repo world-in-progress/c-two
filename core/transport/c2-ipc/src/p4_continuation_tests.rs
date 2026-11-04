@@ -723,7 +723,7 @@ async fn source_error_after_first_chunk_is_uncertain_and_records_request_source(
     let peer = tokio::spawn(async move {
         let mut stream = accept(&mut listener).await;
         let (header, _) = read_frame(&mut stream).await;
-        assert_ne!(header.flags & flags::FLAG_FRAGMENTED, 0);
+        assert_ne!(header.flags & flags::FLAG_CHUNKED, 0);
         first_frame.send(()).unwrap();
         assert_eq!(
             timeout(WAIT, stream.read(&mut [0])).await.unwrap().unwrap(),

@@ -117,7 +117,7 @@ mod ipc16_tests {
     use crate::msg_type::MsgType;
     use crate::route_catalog_control::*;
     use crate::rpc::{
-        CallMode, CallStatus, EncodeError, FragmentPosition, RouteCallIdentity, RpcRecord,
+        CallMode, CallStatus, ChunkPosition, EncodeError, RouteCallIdentity, RpcRecord,
         RpcRecordKind, ValuePart, ValueStorage, decode_rpc_record, encode_call_end_frame,
         encode_open_frame, encode_open_metadata, encode_value_continuation_frame,
     };
@@ -410,7 +410,7 @@ mod ipc16_tests {
     }
 
     #[test]
-    fn fragments_have_metadata_only_on_first_record() {
+    fn chunks_have_metadata_only_on_first_record() {
         let first = encode_open_frame(
             8,
             &identity("grid"),
@@ -425,9 +425,9 @@ mod ipc16_tests {
         let (next_header, next_payload) = decode_frame(&continuation).unwrap();
         assert_eq!(
             first_header.flags,
-            FLAG_RPC_RECORD | FLAG_FRAGMENTED | FLAG_FIRST_FRAGMENT
+            FLAG_RPC_RECORD | FLAG_CHUNKED | FLAG_FIRST_CHUNK
         );
-        assert_eq!(next_header.flags, FLAG_RPC_RECORD | FLAG_FRAGMENTED);
+        assert_eq!(next_header.flags, FLAG_RPC_RECORD | FLAG_CHUNKED);
         assert_eq!(
             first_payload,
             [
@@ -443,7 +443,7 @@ mod ipc16_tests {
             decode_rpc_record(&first_header, first_payload, None).unwrap(),
             RpcRecord::Open {
                 value: ValuePart {
-                    fragment: FragmentPosition::First { total_bytes: 5 },
+                    chunk: ChunkPosition::First { total_bytes: 5 },
                     ..
                 },
                 ..

@@ -6,6 +6,7 @@ use c2_wire::buddy::BuddyPayload;
 use c2_wire::chunk::ReassemblyBacking;
 use c2_wire::connection::{ConnectionCore, ConnectionError, PreparedLoan, RemoteLoan};
 use c2_wire::handshake::MAX_METHODS;
+use c2_wire::rpc::CallMode;
 
 use crate::server::ServerError;
 
@@ -248,6 +249,37 @@ pub trait CrmCallback: Send + Sync + 'static {
     ) -> Result<ResponseMeta, CrmError>;
 }
 
+/// One server stream's resource state, advanced only while holding its route permit.
+pub trait CrmStream: Send + 'static {
+    fn step(&mut self) -> Result<Option<ResponseMeta>, CrmError>;
+    fn finish(self: Box<Self>) -> Result<(), CrmError>;
+}
+
+pub trait CrmStreamCallback: CrmCallback {
+    fn open_stream(
+        &self,
+        route_name: &str,
+        method_idx: u16,
+        request: Vec<u8>,
+        response_pool: Arc<crate::ResponsePool>,
+    ) -> Result<Box<dyn CrmStream>, CrmError>;
+}
+
+struct StreamUnaryCallback(Arc<dyn CrmStreamCallback>);
+
+impl CrmCallback for StreamUnaryCallback {
+    fn invoke(
+        &self,
+        route_name: &str,
+        method_idx: u16,
+        request: Vec<u8>,
+        response_pool: Arc<crate::ResponsePool>,
+    ) -> Result<ResponseMeta, CrmError> {
+        self.0
+            .invoke(route_name, method_idx, request, response_pool)
+    }
+}
+
 #[derive(Debug)]
 pub struct RouteBuildSpec {
     pub name: String,
@@ -364,6 +396,8 @@ pub(crate) struct CrmRoute {
     pub(crate) scheduler: Arc<Scheduler>,
     /// Callback to invoke CRM methods
     pub(crate) callback: Arc<dyn CrmCallback>,
+    pub(crate) stream_callback: Option<Arc<dyn CrmStreamCallback>>,
+    pub(crate) method_modes: Vec<CallMode>,
     /// Method names indexed by method_idx
     pub(crate) method_names: Vec<String>,
 }
@@ -384,8 +418,23 @@ impl CrmRoute {
             signature_hash: spec.signature_hash,
             scheduler: Arc::new(scheduler),
             callback,
+            stream_callback: None,
+            method_modes: vec![CallMode::Unary; spec.method_names.len()],
             method_names: spec.method_names,
         }
+    }
+
+    pub(crate) fn new_stream(
+        spec: RouteBuildSpec,
+        scheduler: Scheduler,
+        callback: Arc<dyn CrmStreamCallback>,
+        method_modes: Vec<CallMode>,
+    ) -> Self {
+        let unary: Arc<dyn CrmCallback> = Arc::new(StreamUnaryCallback(callback.clone()));
+        let mut route = Self::new(spec, scheduler, unary);
+        route.stream_callback = Some(callback);
+        route.method_modes = method_modes;
+        route
     }
 
     /// Return true when `method_idx` points at a registered CRM method.
@@ -544,6 +593,8 @@ mod tests {
                 HashMap::new(),
             )),
             callback: Arc::new(MockCallback),
+            stream_callback: None,
+            method_modes: vec![CallMode::Unary; 2],
             method_names: vec!["method_a".into(), "method_b".into()],
         }
     }

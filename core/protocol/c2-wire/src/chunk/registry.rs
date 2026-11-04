@@ -1083,7 +1083,7 @@ impl<C> ChunkRegistry<C> {
 }
 
 impl ChunkRegistry<()> {
-    /// Admit response storage from the first value fragment's derived geometry.
+    /// Admit response storage from the first value chunk's derived geometry.
     /// Decoding alone accepts zero fields; validate them here before any
     /// reservation, then use the same atomic registry admission authority.
     pub fn insert_reply(

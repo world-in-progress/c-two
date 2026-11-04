@@ -1245,10 +1245,10 @@ async fn cancelled_chunk_sender_finishes_its_stream_and_preserves_other_calls() 
         let (first, body) = read_frame(&mut stream).await;
         assert_eq!(
             first.flags,
-            flags::FLAG_RPC_RECORD | flags::FLAG_FRAGMENTED | flags::FLAG_FIRST_FRAGMENT
+            flags::FLAG_RPC_RECORD | flags::FLAG_CHUNKED | flags::FLAG_FIRST_CHUNK
         );
         assert!(
-            matches!(decode_rpc_record(&first, &body, None).unwrap(), RpcRecord::Open { value: ValuePart { fragment: c2_wire::rpc::FragmentPosition::First { total_bytes }, .. }, .. } if total_bytes == 3 * 4096)
+            matches!(decode_rpc_record(&first, &body, None).unwrap(), RpcRecord::Open { value: ValuePart { chunk: c2_wire::rpc::ChunkPosition::First { total_bytes }, .. }, .. } if total_bytes == 3 * 4096)
         );
         first_sent.send(()).unwrap();
         let (other, _) = read_frame(&mut stream).await;
@@ -1358,8 +1358,8 @@ fn reply_chunk(rid: u64, count: u32, index: u32, data: &[u8]) -> Vec<u8> {
             rid,
             flags::FLAG_RPC_RECORD
                 | flags::FLAG_RESPONSE
-                | flags::FLAG_FRAGMENTED
-                | flags::FLAG_FIRST_FRAGMENT,
+                | flags::FLAG_CHUNKED
+                | flags::FLAG_FIRST_CHUNK,
             &[6, 0, 0],
         );
     }
@@ -1674,6 +1674,9 @@ mod fixes;
 
 #[path = "g1_tests.rs"]
 mod g1;
+
+#[path = "stream_receive_tests.rs"]
+mod stream_receive;
 
 #[tokio::test]
 async fn inline_unary_has_one_rpc_record_in_each_direction() {

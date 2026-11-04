@@ -649,10 +649,10 @@ fn wait_until_responsive_only_returns_after_ping_round_trip() {
 }
 
 #[tokio::test]
-async fn false_shutdown_updates_cannot_truncate_fragmented_handshake() {
+async fn false_shutdown_updates_cannot_truncate_chunked_handshake() {
     let server = Arc::new(
         test_server_new(
-            &unique_readiness_address("fragmented_start"),
+            &unique_readiness_address("chunked_start"),
             ServerIpcConfig {
                 ..ServerIpcConfig::default()
             },
@@ -1070,6 +1070,8 @@ fn make_route(name: &str) -> CrmRoute {
             HashMap::new(),
         )),
         callback: Arc::new(Echo),
+        stream_callback: None,
+        method_modes: vec![CallMode::Unary; 2],
         method_names: vec!["step".into(), "query".into()],
     }
 }
@@ -1331,16 +1333,16 @@ fn assert_call_end_status(payload: &[u8], expected: c2_wire::rpc::CallStatus) {
 }
 
 fn inline_success_part(flags: u32, payload: &[u8]) -> (Option<u64>, &[u8]) {
-    use c2_wire::flags::{FLAG_FIRST_FRAGMENT, FLAG_FRAGMENTED, FLAG_RPC_RECORD};
+    use c2_wire::flags::{FLAG_CHUNKED, FLAG_FIRST_CHUNK, FLAG_RPC_RECORD};
     assert_eq!(
         flags & (FLAG_RPC_RECORD | FLAG_RESPONSE | FLAG_BUDDY),
         FLAG_RPC_RECORD | FLAG_RESPONSE
     );
-    if flags & FLAG_FRAGMENTED == 0 {
+    if flags & FLAG_CHUNKED == 0 {
         assert_call_end_status(payload, c2_wire::rpc::CallStatus::Success);
         return (Some((payload.len() - 2) as u64), &payload[2..]);
     }
-    if flags & FLAG_FIRST_FRAGMENT != 0 {
+    if flags & FLAG_FIRST_CHUNK != 0 {
         assert_call_end_status(payload, c2_wire::rpc::CallStatus::Success);
         assert!(payload.len() >= 11);
         let total = u64::from_le_bytes(payload[2..10].try_into().unwrap());
@@ -3303,12 +3305,12 @@ async fn negotiate_test_version(client: &mut LocalStream) {
 }
 
 /// Ordinary raw business fixtures use the same complete two-stage handshake.
-async fn handshake_test_client(client: &mut LocalStream) {
+pub(super) async fn handshake_test_client(client: &mut LocalStream) {
     let ack = handshake_test_client_with(client, 0, "").await;
     assert!(ack.server_identity.is_some());
 }
 
-async fn handshake_test_client_with(
+pub(super) async fn handshake_test_client_with(
     client: &mut LocalStream,
     capability_flags: u16,
     prefix: &str,
@@ -4366,7 +4368,7 @@ fn chunked_call_frame(
     data: &[u8],
     identity: &str,
 ) -> Vec<u8> {
-    fragmented_call_frame(
+    value_chunk_call_frame(
         request_id,
         chunk_idx,
         u64::from(total_chunks) * data.len() as u64,
@@ -4375,7 +4377,7 @@ fn chunked_call_frame(
     )
 }
 
-fn fragmented_call_frame(
+fn value_chunk_call_frame(
     request_id: u64,
     chunk_idx: u16,
     total_bytes: u64,
@@ -4404,14 +4406,14 @@ fn chunk_test_server(address: &str, max_inflight_chunk_frames: u32) -> Arc<Serve
     Arc::new(test_server_new(address, config).unwrap())
 }
 
-async fn assert_early_fragment_refusal_preserves_connection(processing_capacity: bool) {
+async fn assert_early_chunk_refusal_preserves_connection(processing_capacity: bool) {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     let mut config = ServerIpcConfig::default();
     config.base.max_inflight_chunk_frames = 2;
     config.base.max_reassembly_bytes = if processing_capacity { 1024 } else { 64 };
     config.base.chunk_assembler_timeout_secs = 0.02;
-    let server = Arc::new(test_server_new("ipc://early_fragment_refusal", config).unwrap());
+    let server = Arc::new(test_server_new("ipc://early_chunk_refusal", config).unwrap());
     let calls = Arc::new(AtomicUsize::new(0));
     let mut route = make_host_route(&server, "grid");
     route.callback = Arc::new(EchoRequestBytes {
@@ -4445,7 +4447,7 @@ async fn assert_early_fragment_refusal_preserves_connection(processing_capacity:
     drop(occupied);
 
     // The refused record has no retained tombstone. High-water rejects its
-    // later fragments even after the old assembler timeout and GC pass.
+    // later chunks even after the old assembler timeout and GC pass.
     tokio::time::sleep(Duration::from_millis(50)).await;
     server.chunk_registry.gc_sweep();
     let mut frames = chunked_call_frame(61, 1, 6, &[0x22; 32], "grid");
@@ -4476,12 +4478,12 @@ async fn assert_early_fragment_refusal_preserves_connection(processing_capacity:
 
 #[tokio::test]
 async fn reassembly_size_refusal_discards_late_chunks_and_preserves_connection() {
-    assert_early_fragment_refusal_preserves_connection(false).await;
+    assert_early_chunk_refusal_preserves_connection(false).await;
 }
 
 #[tokio::test]
 async fn chunk_processing_refusal_discards_late_chunks_and_preserves_connection() {
-    assert_early_fragment_refusal_preserves_connection(true).await;
+    assert_early_chunk_refusal_preserves_connection(true).await;
 }
 
 #[tokio::test]
@@ -4516,7 +4518,7 @@ async fn gc_late_chunk_still_reports_to_the_waiting_call() {
         .write_all(&chunked_call_frame(61, 0, 4, &[7; 32], "grid"))
         .await
         .unwrap();
-    wait_until("first fragment registered", || {
+    wait_until("first chunk registered", || {
         server.chunk_registry.active_count() == 1
     })
     .await;
@@ -4557,7 +4559,7 @@ async fn gc_late_chunk_still_reports_to_the_waiting_call() {
 #[tokio::test]
 async fn future_continuation_is_rejected_at_protocol_boundary() {
     use c2_wire::rpc::{RpcRecordKind, ValueStorage, encode_value_continuation_frame};
-    let server = chunk_test_server("ipc://future_fragment_refuse", 2);
+    let server = chunk_test_server("ipc://future_chunk_refuse", 2);
     let (mut client, stream) = isolated_pair().await;
     let handler = tokio::spawn(handle_connection(Arc::clone(&server), stream));
     handshake_test_client(&mut client).await;
@@ -4668,7 +4670,7 @@ async fn chunked_request_payload_limit_reports_size_before_callback() {
     handshake_test_client(&mut client).await;
     for (chunk, data) in [b"abcd".as_slice(), b"efgh", b"i"].into_iter().enumerate() {
         client
-            .write_all(&fragmented_call_frame(42, chunk as u16, 9, data, "grid"))
+            .write_all(&value_chunk_call_frame(42, chunk as u16, 9, data, "grid"))
             .await
             .unwrap();
     }
@@ -4733,7 +4735,7 @@ async fn first_chunk_write_precedes_later_unary_on_same_connection() {
         let pool = server.chunk_registry.pool();
         let backing = pool.write();
         client
-            .write_all(&fragmented_call_frame(1, 0, 11, b"first-", "grid"))
+            .write_all(&value_chunk_call_frame(1, 0, 11, b"first-", "grid"))
             .await
             .unwrap();
         let mut unary = c2_wire::rpc::encode_open_metadata(&call_identity("grid"), 1).unwrap();
@@ -5334,7 +5336,7 @@ async fn unnegotiated_buddy_chunk_frame_is_refused_with_correlated_error() {
     let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let (mut client, handler) = unnegotiated_shm_connection(&server, Arc::clone(&calls)).await;
 
-    // A first OPEN fragment carries metadata, total value length, then SHM storage.
+    // A first OPEN chunk carries metadata, total value length, then SHM storage.
     let descriptor = BuddyPayload {
         seg_idx: 1,
         generation: 3,
@@ -5910,9 +5912,9 @@ async fn ping_is_served_while_chunk_processing_capacity_is_exhausted() {
     let backing = pool.write();
     let data: Vec<u8> = (0..96u8).map(|i| i.wrapping_mul(7)).collect();
     client
-        .write_all(&fragmented_call_frame(71, 0, 96, &data[..48], "grid"))
+        .write_all(&value_chunk_call_frame(71, 0, 96, &data[..48], "grid"))
         .await
-        .expect("write first input fragment");
+        .expect("write first input chunk");
     wait_until("the only chunk-processing permit is held", || {
         server.chunk_processing_permits.available_permits() == 0
     })
@@ -5936,12 +5938,12 @@ async fn ping_is_served_while_chunk_processing_capacity_is_exhausted() {
 
     // Release backing allocation: the same request completes with its bytes.
     drop(backing);
-    wait_until("first input fragment finishes copying", || {
+    wait_until("first input chunk finishes copying", || {
         server.chunk_processing_permits.available_permits() == 1
     })
     .await;
     client
-        .write_all(&fragmented_call_frame(71, 1, 96, &data[48..], "grid"))
+        .write_all(&value_chunk_call_frame(71, 1, 96, &data[48..], "grid"))
         .await
         .unwrap();
     let (reply_rid, _flags, reply_payload) = read_reply_frame(&mut client).await;
@@ -7146,6 +7148,43 @@ async fn shutdown_keeps_listener_until_timed_out_response_writer_finishes() {
     f.runner.take().unwrap().await.unwrap().unwrap();
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn write_timeout_preserves_remaining_unary_call_end_chunks() {
+    const SIZE: usize = 8 * 1024 * 1024;
+    let mut config = ServerIpcConfig::default();
+    config.base.write_timeout_secs = 0.01;
+    config.shm_threshold = 1024;
+    config.base.chunk_size = 256 * 1024;
+    let mut f =
+        ShutdownReplyFixture::start_with_config(vec![0x46; SIZE], false, false, config).await;
+    f.server.request_shutdown_signal();
+    f.release();
+    // Withhold all reads until a submitted chunk exceeds the write deadline.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !f.conn.is_deactivated() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(!f.conn.is_work_cancelled());
+    let mut received = 0;
+    let mut total = None;
+    while received < SIZE {
+        let (id, flags, payload) = read_reply_frame(&mut f.peer).await;
+        assert_eq!(id, 1);
+        let (part_total, data) = inline_success_part(flags, &payload);
+        if let Some(part_total) = part_total {
+            total = Some(part_total);
+        }
+        assert!(data.iter().all(|byte| *byte == 0x46));
+        received += data.len();
+    }
+    assert_eq!(received, SIZE);
+    assert_eq!(total, Some(SIZE as u64));
+    f.runner.take().unwrap().await.unwrap().unwrap();
+}
+
 #[tokio::test]
 async fn deactivated_connection_returns_unpublished_shm_response_as_owned_reply() {
     for len in [8192, 65537] {
@@ -8063,7 +8102,7 @@ async fn incomplete_call_end_preserves_running_queued_calls_and_releases() {
     peer.read_exact(&mut body).await.unwrap();
     assert_eq!(&body[..2], &[6, 0]);
     assert_ne!(
-        u32::from_le_bytes(header[12..].try_into().unwrap()) & c2_wire::flags::FLAG_FIRST_FRAGMENT,
+        u32::from_le_bytes(header[12..].try_into().unwrap()) & c2_wire::flags::FLAG_FIRST_CHUNK,
         0
     );
     conn.fail_next_write_allocation

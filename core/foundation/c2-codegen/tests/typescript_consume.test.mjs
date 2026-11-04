@@ -66,7 +66,7 @@ const contract = {schema: 'c-two.contract.v2', namespace: 'test.p8a', name: 'Ech
 function peer({memory, reply, controlReply, failRelease = false} = {}) {
   let buffered = Buffer.alloc(0), metadata = false, controlReplies = 0;
   const ids = [], calls = [], closed = [], releaseFrames = [];
-  const fragments = new Map();
+  const chunks = new Map();
   const feed = bytes => { buffered = Buffer.concat([buffered, bytes]); };
   const connection = {
     memory,
@@ -99,16 +99,16 @@ function peer({memory, reply, controlReply, failRelease = false} = {}) {
             const total = payload.readBigUInt64LE(offset);
             const copied = BigInt(payload.length - offset - 8);
             assert.ok(copied > 0n && copied < total);
-            fragments.set(id, {total, copied});
+            chunks.set(id, {total, copied});
             complete = false;
           }
         } else {
-          const fragment = fragments.get(id);
-          assert.ok(fragment, 'continuation belongs to an OPEN first fragment');
-          fragment.copied += BigInt(payload.length - 1);
-          complete = fragment.copied === fragment.total;
-          assert.ok(fragment.copied <= fragment.total);
-          if (complete) fragments.delete(id);
+          const chunk = chunks.get(id);
+          assert.ok(chunk, 'continuation belongs to an OPEN first chunk');
+          chunk.copied += BigInt(payload.length - 1);
+          complete = chunk.copied === chunk.total;
+          assert.ok(chunk.copied <= chunk.total);
+          if (complete) chunks.delete(id);
         }
         if (!complete) return;
         const selected = Array.isArray(reply) ? reply[calls.length - 1] : reply;
@@ -206,7 +206,7 @@ for (const [label, payload, flags, expectedAdmissions, expectedReleases, retires
   ['empty span', rpc(0, blockBytes({byteLength: 0})), 4162, 0, 0, true],
   ['invalid generation', rpc(0, blockBytes({generation: 0})), 4162, 1, 1, false],
   ['dedicated offset', rpc(0, blockBytes({dedicated: true, offset: 1})), 4162, 1, 1, false],
-  ['first fragment without fragmented', rpc(0, blockBytes()), 4162 | 8192, 0, 0, true],
+  ['first chunk without chunked', rpc(0, blockBytes()), 4162 | 8192, 0, 0, true],
 ]) {
   test(`invalid IPC 16 SHM reply settles its owner: ${label}`, async () => {
     const {createIpcEncodedTransport} = await transportModule();
@@ -249,12 +249,12 @@ for (const [label, flags, status] of [
     await transport.close();
   });
 }
-test('malformed IPC 16 first fragment retires the connection', async () => {
+test('malformed IPC 16 first chunk retires the connection', async () => {
   const {createIpcEncodedTransport} = await transportModule();
   const p = peer({reply: {flags: 4098 | 512, payload: Buffer.from([0x06, 0, 42])}}), next = peer();
   let connects = 0;
   const transport = createIpcEncodedTransport('ipc://p8a', {connect: () => connects++ === 0 ? p.connection : next.connection});
-  await assert.rejects(() => transport.call('echo', contract, 'echo', new Uint8Array()), /first fragment/);
+  await assert.rejects(() => transport.call('echo', contract, 'echo', new Uint8Array()), /first chunk/);
   assert.equal(p.closed.length, 1);
   assert.deepEqual(Array.from(await transport.call('echo', contract, 'echo', new Uint8Array())), [42]);
   assert.equal(connects, 2); await transport.close();
@@ -294,6 +294,30 @@ test('a queued call completes after an earlier complete reply fails', async () =
   assert.deepEqual(Array.from(await queued), [42]);
   assert.equal(p.closed.length, 0); assert.equal(p.calls.length, 2);
   await transport.close();
+});
+test('CallCancelled code 718 keeps its canonical name and details', async () => {
+  const {createIpcEncodedTransport} = await transportModule();
+  const canonical = Buffer.from('C2E1' + JSON.stringify({version: 1, code: 718, name: 'CallCancelled', message: 'stream closed', details: {reason: 'client_close'}}));
+  const p = peer({reply: {flags: 4098, payload: rpc(2, canonical)}});
+  const transport = createIpcEncodedTransport('ipc://p8a', {connect: () => p.connection});
+  try {
+    await assert.rejects(() => transport.call('echo', contract, 'echo', new Uint8Array()), (error) => {
+      assert.equal(error.name, 'C2IpcCallRejectedError');
+      assert.equal(error.code, 718);
+      assert.equal(error.canonicalName, 'CallCancelled');
+      assert.deepEqual(error.details, {reason: 'client_close'});
+      return true;
+    });
+  } finally { await transport.close(); }
+});
+test('CallCancelled code 718 rejects a mismatched canonical name', async () => {
+  const {createIpcEncodedTransport} = await transportModule();
+  const malformed = Buffer.from('C2E1' + JSON.stringify({version: 1, code: 718, name: 'FutureCancellation', message: 'wrong name', details: {}}));
+  const p = peer({reply: {flags: 4098, payload: rpc(1, malformed)}});
+  const transport = createIpcEncodedTransport('ipc://p8a', {connect: () => p.connection});
+  try {
+    await assert.rejects(() => transport.call('echo', contract, 'echo', new Uint8Array()), /C2E1 envelope is invalid/);
+  } finally { await transport.close(); }
 });
 test('invalid complete route reply fails only its lookup', async () => {
   const {createIpcEncodedTransport} = await transportModule();

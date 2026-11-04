@@ -10,7 +10,7 @@ async fn close_preserves_started_chunked_upload_and_reply() {
         let (first, payload) = read_frame(&mut stream).await;
         assert_eq!(
             first.flags,
-            flags::FLAG_RPC_RECORD | flags::FLAG_FRAGMENTED | flags::FLAG_FIRST_FRAGMENT
+            flags::FLAG_RPC_RECORD | flags::FLAG_CHUNKED | flags::FLAG_FIRST_CHUNK
         );
         assert!(matches!(
             decode_rpc_record(&first, &payload, None).unwrap(),
@@ -20,7 +20,7 @@ async fn close_preserves_started_chunked_upload_and_reply() {
         for expected in 1..3 {
             let (next, payload) = read_frame(&mut stream).await;
             assert_eq!(next.request_id, first.request_id);
-            assert_eq!(next.flags, flags::FLAG_RPC_RECORD | flags::FLAG_FRAGMENTED);
+            assert_eq!(next.flags, flags::FLAG_RPC_RECORD | flags::FLAG_CHUNKED);
             assert!(
                 matches!(decode_rpc_record(&next, &payload, None).unwrap(), RpcRecord::OpenContinuation { value: ValuePart { storage: ValueStorage::Inline(bytes), .. } } if bytes.iter().all(|byte| *byte == expected as u8 + 1))
             );

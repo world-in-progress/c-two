@@ -25,6 +25,7 @@ pub mod sync_client;
 mod tests;
 
 pub use c2_local::{ConnectionClosed, ConnectionEndReason, ConnectionObservation};
+pub use client::stream::{IpcResponseStream, StreamTerminal};
 pub use client::{
     ClientIpcConfig, IpcCallControl, IpcClient, IpcError, MethodTable, RouteBinding,
     ServerPoolState,

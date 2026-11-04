@@ -195,6 +195,7 @@ pub(crate) struct ClientConnection {
     end: Arc<EndState>,
     pending: Arc<Mutex<PendingMap>>,
     pub(crate) sequence: std::sync::atomic::AtomicU64,
+    stream_control_cursor: std::sync::atomic::AtomicU64,
     queue: mpsc::Sender<Submission>,
     abort: AbortHandle,
     read_stopped: AtomicBool,
@@ -209,6 +210,43 @@ pub(crate) struct ClientConnection {
     pub prefix_pause: Mutex<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>,
 }
 impl ClientConnection {
+    fn take_stream_control(&self) -> Option<Submission> {
+        // Each active call owns one coalesced control slot. The reader only
+        // updates that slot; it never queues an unbounded task or waits here.
+        let cursor = self.stream_control_cursor.load(Ordering::Relaxed);
+        let next = self
+            .pending
+            .lock()
+            .active
+            .iter()
+            .filter_map(|(&id, call)| {
+                let stream = call.stream.as_ref()?;
+                stream
+                    .has_control()
+                    .then(|| ((id <= cursor, id), stream.clone(), call.state.clone()))
+            })
+            .min_by_key(|entry| entry.0);
+        if let Some(((_, id), stream, state)) = next {
+            self.stream_control_cursor.store(id, Ordering::Relaxed);
+            if let Some(bytes) = stream.take_control() {
+                let frame = match self.core.prepare_call_record() {
+                    Ok(frame) => frame,
+                    Err(error) => {
+                        stream.transport_failed(core_error(error));
+                        return None;
+                    }
+                };
+                return Some(Submission {
+                    bytes,
+                    request: Arc::new(Mutex::new(Some(WriteRequest::CallContinuation(frame)))),
+                    state,
+                    policy: None,
+                    reply: None,
+                });
+            }
+        }
+        None
+    }
     pub fn spawn(
         stream: LocalWriteHalf,
         pending: Arc<Mutex<PendingMap>>,
@@ -232,6 +270,7 @@ impl ClientConnection {
             end: retirement.end.clone(),
             pending,
             sequence: std::sync::atomic::AtomicU64::new(0),
+            stream_control_cursor: std::sync::atomic::AtomicU64::new(0),
             queue,
             abort,
             read_stopped: AtomicBool::new(false),
@@ -314,6 +353,22 @@ impl ClientConnection {
     /// Readable framing preserves every other call's outcome, including while
     /// admission is stopped for a release violation or local bookkeeping error.
     pub fn response_failed(&self, rid: u64, error: IpcError) {
+        let stream = self
+            .pending
+            .lock()
+            .get(&rid)
+            .and_then(|entry| entry.stream.clone());
+        if let Some(stream) = stream {
+            stream.fail_response(error);
+            self.wake.notify_one();
+            return;
+        }
+        self.terminal_response_failed(rid, error);
+    }
+
+    /// An invalid but fully framed terminal record ends this call's local
+    /// observation. Waiting for another CALL_END would retain it forever.
+    pub(crate) fn terminal_response_failed(&self, rid: u64, error: IpcError) {
         let target = self.pending.lock().remove(&rid);
         if let Some(entry) = target {
             entry.complete(Err(error.response_failure()));
@@ -503,6 +558,10 @@ fn run(
             if conn.close_ready() || conn.read_stopped.load(Ordering::Acquire) {
                 break;
             }
+            if let Some(submission) = conn.take_stream_control() {
+                process(stream, &conn, submission).await;
+                continue;
+            }
             if let Some(control) = conn.take_disconnect() {
                 if let Ok(Some(batch)) = conn.core.begin_write(WriteRequest::Control(control)) {
                     let frame = driver
@@ -589,6 +648,14 @@ async fn process(stream: &mut LocalWriteHalf, conn: &ClientConnection, mut submi
                             let rid = previous + 1;
                             conn.pending.lock().publish(&submission.state, rid)?;
                             state.request_id = Some(rid);
+                            let receiver = conn
+                                .pending
+                                .lock()
+                                .get(&rid)
+                                .and_then(|call| call.stream.clone());
+                            if let Some(receiver) = receiver {
+                                receiver.publish(rid)?;
+                            }
                             rid
                         }
                     };

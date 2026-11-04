@@ -66,6 +66,12 @@ impl ServerShmResponse {
         drop(self);
         result
     }
+
+    pub(crate) fn copy_into(self, destination: &mut [u8]) -> Result<(), String> {
+        // SAFETY: the admitted carrier pins this immutable peer span until
+        // copy returns; dropping it then ends the read and queues RELEASE.
+        unsafe { self.read.copy_into(destination) }
+    }
 }
 
 impl ResponseData {

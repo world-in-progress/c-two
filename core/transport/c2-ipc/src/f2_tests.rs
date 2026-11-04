@@ -10,8 +10,8 @@ enum ReplyFault {
     ShortContinuation,
     Oversized,
     LocalOpen,
-    WholeShmDuringFragments,
-    RejectedDuringFragments,
+    WholeShmDuringChunks,
+    RejectedDuringChunks,
     MissingFirst,
 }
 
@@ -32,8 +32,8 @@ fn chunk(rid: u64, size: u64, count: u32, index: u32, data: &[u8]) -> Vec<u8> {
             rid,
             flags::FLAG_RPC_RECORD
                 | flags::FLAG_RESPONSE
-                | flags::FLAG_FRAGMENTED
-                | flags::FLAG_FIRST_FRAGMENT,
+                | flags::FLAG_CHUNKED
+                | flags::FLAG_FIRST_CHUNK,
             &[&[6, 0], &total.to_le_bytes(), data],
         );
     }
@@ -73,19 +73,19 @@ async fn isolated_reply_failure(fault: ReplyFault) {
             }
             ReplyFault::EmptyContinuation => frame::encode_frame(
                 target.request_id,
-                flags::FLAG_RESPONSE | flags::FLAG_RPC_RECORD | flags::FLAG_FRAGMENTED,
+                flags::FLAG_RESPONSE | flags::FLAG_RPC_RECORD | flags::FLAG_CHUNKED,
                 &[6],
             ),
             ReplyFault::UnexpectedFirstFlag => frame::encode_frame(
                 target.request_id,
-                flags::FLAG_RPC_RECORD | flags::FLAG_RESPONSE | flags::FLAG_FIRST_FRAGMENT,
+                flags::FLAG_RPC_RECORD | flags::FLAG_RESPONSE | flags::FLAG_FIRST_CHUNK,
                 &[6, 0],
             ),
             ReplyFault::DuplicateFirst => chunk(target.request_id, 1536, 3, 0, &[2; 512]),
             ReplyFault::ShortContinuation => chunk(target.request_id, 1536, 3, 1, &[2; 1]),
             ReplyFault::Oversized => chunk(target.request_id, 1536, 3, 1, &[2; 1024]),
             ReplyFault::MissingFirst => chunk(target.request_id, 1536, 3, 1, &[2; 512]),
-            ReplyFault::RejectedDuringFragments => {
+            ReplyFault::RejectedDuringChunks => {
                 let error = c2_error::C2Error::new(
                     c2_error::ErrorCode::RouteStale,
                     "not executed after a success value began",
@@ -100,23 +100,21 @@ async fn isolated_reply_failure(fault: ReplyFault) {
                 )
                 .unwrap()
             }
-            ReplyFault::LocalOpen | ReplyFault::WholeShmDuringFragments => {
-                frame::encode_frame_parts(
-                    target.request_id,
-                    flags::FLAG_RESPONSE | flags::FLAG_RPC_RECORD | flags::FLAG_BUDDY,
-                    &[
-                        &[6, 0],
-                        &encode_buddy_payload(&BuddyPayload {
-                            seg_idx: 0,
-                            generation: 1,
-                            offset: 0,
-                            data_size: 512,
-                            is_dedicated: false,
-                            loan_id: 77,
-                        }),
-                    ],
-                )
-            }
+            ReplyFault::LocalOpen | ReplyFault::WholeShmDuringChunks => frame::encode_frame_parts(
+                target.request_id,
+                flags::FLAG_RESPONSE | flags::FLAG_RPC_RECORD | flags::FLAG_BUDDY,
+                &[
+                    &[6, 0],
+                    &encode_buddy_payload(&BuddyPayload {
+                        seg_idx: 0,
+                        generation: 1,
+                        offset: 0,
+                        data_size: 512,
+                        is_dedicated: false,
+                        loan_id: 77,
+                    }),
+                ],
+            ),
         };
         stream.write_all(&bad).await.unwrap();
         other_requested.await.unwrap();
@@ -149,7 +147,7 @@ async fn isolated_reply_failure(fault: ReplyFault) {
             released,
             if matches!(
                 fault,
-                ReplyFault::LocalOpen | ReplyFault::WholeShmDuringFragments
+                ReplyFault::LocalOpen | ReplyFault::WholeShmDuringChunks
             ) {
                 vec![77]
             } else {
@@ -171,7 +169,7 @@ async fn isolated_reply_failure(fault: ReplyFault) {
     client.connect().await.unwrap();
     if matches!(
         fault,
-        ReplyFault::LocalOpen | ReplyFault::WholeShmDuringFragments
+        ReplyFault::LocalOpen | ReplyFault::WholeShmDuringChunks
     ) {
         client
             .server_pool
@@ -268,7 +266,7 @@ async fn isolated_reply_failure(fault: ReplyFault) {
 }
 
 #[tokio::test]
-async fn invalid_fragment_lengths_are_protocol_and_ping_stays_usable() {
+async fn invalid_chunk_lengths_are_protocol_and_ping_stays_usable() {
     for (size, count, len) in [(128, 0, 64), (0, 2, 64), (128, 2, 0), (128, 2, 129)] {
         isolated_reply_failure(ReplyFault::Geometry(size, count, len)).await;
     }
@@ -778,7 +776,7 @@ async fn early_chunk_rejection_stops_at_the_frame_boundary_and_preserves_the_con
             let (first, _) = read_frame(&mut stream).await;
             assert_eq!(
                 first.flags,
-                flags::FLAG_RPC_RECORD | flags::FLAG_FRAGMENTED | flags::FLAG_FIRST_FRAGMENT
+                flags::FLAG_RPC_RECORD | flags::FLAG_CHUNKED | flags::FLAG_FIRST_CHUNK
             );
             seen.send(()).unwrap();
             let mut header = [0; HEADER_SIZE];
@@ -882,6 +880,6 @@ async fn early_chunk_rejection_stops_at_the_frame_boundary_and_preserves_the_con
 
 #[tokio::test]
 async fn second_call_end_preserves_phase_and_releases_its_shm() {
-    isolated_reply_failure(ReplyFault::RejectedDuringFragments).await;
-    isolated_reply_failure(ReplyFault::WholeShmDuringFragments).await;
+    isolated_reply_failure(ReplyFault::RejectedDuringChunks).await;
+    isolated_reply_failure(ReplyFault::WholeShmDuringChunks).await;
 }
