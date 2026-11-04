@@ -154,7 +154,7 @@ pub struct RelayConfigOverrides {
 #[derive(Debug, Clone, Default)]
 pub struct CallExecutionLimitsOverrides {
     pub max_outstanding_calls: Option<u64>,
-    pub retained_input_budget_bytes: Option<u64>,
+    pub payload_buffer_budget_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -303,15 +303,15 @@ impl ConfigResolver {
             None => call_execution_limit_from_env(&catalog, "C2_CALL_MAX_OUTSTANDING")?
                 .unwrap_or(crate::DEFAULT_MAX_OUTSTANDING_CALLS),
         };
-        let retained_input_budget_bytes = match overrides.retained_input_budget_bytes {
+        let payload_buffer_budget_bytes = match overrides.payload_buffer_budget_bytes {
             Some(value) => value,
-            None => call_execution_limit_from_env(&catalog, "C2_CALL_RETAINED_INPUT_BUDGET_BYTES")?
-                .unwrap_or(crate::DEFAULT_RETAINED_INPUT_BUDGET_BYTES),
+            None => call_execution_limit_from_env(&catalog, "C2_CALL_PAYLOAD_BUFFER_BUDGET_BYTES")?
+                .unwrap_or(crate::DEFAULT_PAYLOAD_BUFFER_BUDGET_BYTES),
         };
 
         Ok(CallExecutionLimits {
             max_outstanding_calls,
-            retained_input_budget_bytes,
+            payload_buffer_budget_bytes,
         })
     }
 
@@ -1326,7 +1326,23 @@ mod tests {
 
         assert_eq!(limits, CallExecutionLimits::default());
         assert_eq!(limits.max_outstanding_calls, 1024);
-        assert_eq!(limits.retained_input_budget_bytes, 16 * 1024 * 1024 * 1024);
+        assert_eq!(limits.payload_buffer_budget_bytes, 16 * 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn retired_retained_input_environment_does_not_set_payload_budget() {
+        let limits = ConfigResolver::resolve_call_execution_limits(
+            CallExecutionLimitsOverrides::default(),
+            ConfigSources {
+                env_file: EnvFilePolicy::Disabled,
+                process_env: env(&[("C2_CALL_RETAINED_INPUT_BUDGET_BYTES", "7")]),
+            },
+        )
+        .expect("unrecognized environment keys are ignored by the scoped resolver");
+        assert_eq!(
+            limits.payload_buffer_budget_bytes,
+            crate::DEFAULT_PAYLOAD_BUFFER_BUDGET_BYTES
+        );
     }
 
     #[test]
@@ -1337,7 +1353,7 @@ mod tests {
             &env_file,
             [
                 "C2_CALL_MAX_OUTSTANDING=64",
-                "C2_CALL_RETAINED_INPUT_BUDGET_BYTES=1073741824",
+                "C2_CALL_PAYLOAD_BUFFER_BUDGET_BYTES=1073741824",
             ]
             .join("\n"),
         )
@@ -1353,7 +1369,7 @@ mod tests {
         .expect("env-file limits should resolve");
 
         assert_eq!(limits.max_outstanding_calls, 64);
-        assert_eq!(limits.retained_input_budget_bytes, 1_073_741_824);
+        assert_eq!(limits.payload_buffer_budget_bytes, 1_073_741_824);
     }
 
     #[test]
@@ -1364,7 +1380,7 @@ mod tests {
             &env_file,
             [
                 "C2_CALL_MAX_OUTSTANDING=64",
-                "C2_CALL_RETAINED_INPUT_BUDGET_BYTES=1073741824",
+                "C2_CALL_PAYLOAD_BUFFER_BUDGET_BYTES=1073741824",
             ]
             .join("\n"),
         )
@@ -1376,14 +1392,14 @@ mod tests {
                 env_file: EnvFilePolicy::Path(env_file),
                 process_env: env(&[
                     ("C2_CALL_MAX_OUTSTANDING", "128"),
-                    ("C2_CALL_RETAINED_INPUT_BUDGET_BYTES", "2147483648"),
+                    ("C2_CALL_PAYLOAD_BUFFER_BUDGET_BYTES", "2147483648"),
                 ]),
             },
         )
         .expect("process env should win over the env file");
 
         assert_eq!(limits.max_outstanding_calls, 128);
-        assert_eq!(limits.retained_input_budget_bytes, 2_147_483_648);
+        assert_eq!(limits.payload_buffer_budget_bytes, 2_147_483_648);
     }
 
     #[test]
@@ -1392,21 +1408,21 @@ mod tests {
             env_file: EnvFilePolicy::Disabled,
             process_env: env(&[
                 ("C2_CALL_MAX_OUTSTANDING", "64"),
-                ("C2_CALL_RETAINED_INPUT_BUDGET_BYTES", "1073741824"),
+                ("C2_CALL_PAYLOAD_BUFFER_BUDGET_BYTES", "1073741824"),
             ]),
         };
 
         let limits = ConfigResolver::resolve_call_execution_limits(
             CallExecutionLimitsOverrides {
                 max_outstanding_calls: Some(7),
-                retained_input_budget_bytes: Some(4096),
+                payload_buffer_budget_bytes: Some(4096),
             },
             sources,
         )
         .expect("explicit limits should beat env");
 
         assert_eq!(limits.max_outstanding_calls, 7);
-        assert_eq!(limits.retained_input_budget_bytes, 4096);
+        assert_eq!(limits.payload_buffer_budget_bytes, 4096);
     }
 
     #[test]
@@ -1416,20 +1432,20 @@ mod tests {
         let limits = ConfigResolver::resolve_call_execution_limits(
             CallExecutionLimitsOverrides {
                 max_outstanding_calls: Some(7),
-                retained_input_budget_bytes: Some(4096),
+                payload_buffer_budget_bytes: Some(4096),
             },
             ConfigSources {
                 env_file: EnvFilePolicy::Disabled,
                 process_env: env(&[
                     ("C2_CALL_MAX_OUTSTANDING", "not-a-number"),
-                    ("C2_CALL_RETAINED_INPUT_BUDGET_BYTES", "-1"),
+                    ("C2_CALL_PAYLOAD_BUFFER_BUDGET_BYTES", "-1"),
                 ]),
             },
         )
         .expect("explicit limits should bypass env parsing entirely");
 
         assert_eq!(limits.max_outstanding_calls, 7);
-        assert_eq!(limits.retained_input_budget_bytes, 4096);
+        assert_eq!(limits.payload_buffer_budget_bytes, 4096);
     }
 
     #[test]
@@ -1439,15 +1455,15 @@ mod tests {
         let zeroed_max = ConfigResolver::resolve_call_execution_limits(
             CallExecutionLimitsOverrides {
                 max_outstanding_calls: Some(0),
-                retained_input_budget_bytes: None,
+                payload_buffer_budget_bytes: None,
             },
             ConfigSources::empty(),
         )
         .expect("explicit zero outstanding calls should resolve");
         assert_eq!(zeroed_max.max_outstanding_calls, 0);
         assert_eq!(
-            zeroed_max.retained_input_budget_bytes,
-            crate::DEFAULT_RETAINED_INPUT_BUDGET_BYTES
+            zeroed_max.payload_buffer_budget_bytes,
+            crate::DEFAULT_PAYLOAD_BUFFER_BUDGET_BYTES
         );
 
         // An environmental zero is a present value in exactly the same way:
@@ -1456,7 +1472,7 @@ mod tests {
             CallExecutionLimitsOverrides::default(),
             ConfigSources {
                 env_file: EnvFilePolicy::Disabled,
-                process_env: env(&[("C2_CALL_RETAINED_INPUT_BUDGET_BYTES", "0")]),
+                process_env: env(&[("C2_CALL_PAYLOAD_BUFFER_BUDGET_BYTES", "0")]),
             },
         )
         .expect("zero retained budget should resolve as finite and rejecting");
@@ -1464,7 +1480,7 @@ mod tests {
             zero_env.max_outstanding_calls,
             crate::DEFAULT_MAX_OUTSTANDING_CALLS
         );
-        assert_eq!(zero_env.retained_input_budget_bytes, 0);
+        assert_eq!(zero_env.payload_buffer_budget_bytes, 0);
     }
 
     #[test]
@@ -1476,7 +1492,7 @@ mod tests {
                 process_env: env(&[
                     ("C2_CALL_MAX_OUTSTANDING", "18446744073709551615"),
                     (
-                        "C2_CALL_RETAINED_INPUT_BUDGET_BYTES",
+                        "C2_CALL_PAYLOAD_BUFFER_BUDGET_BYTES",
                         "18446744073709551615",
                     ),
                 ]),
@@ -1484,18 +1500,18 @@ mod tests {
         )
         .expect("u64::MAX is a legal finite limit");
         assert_eq!(from_env.max_outstanding_calls, u64::MAX);
-        assert_eq!(from_env.retained_input_budget_bytes, u64::MAX);
+        assert_eq!(from_env.payload_buffer_budget_bytes, u64::MAX);
 
         let from_override = ConfigResolver::resolve_call_execution_limits(
             CallExecutionLimitsOverrides {
                 max_outstanding_calls: Some(u64::MAX),
-                retained_input_budget_bytes: Some(u64::MAX),
+                payload_buffer_budget_bytes: Some(u64::MAX),
             },
             ConfigSources::empty(),
         )
         .expect("u64::MAX overrides are legal");
         assert_eq!(from_override.max_outstanding_calls, u64::MAX);
-        assert_eq!(from_override.retained_input_budget_bytes, u64::MAX);
+        assert_eq!(from_override.payload_buffer_budget_bytes, u64::MAX);
     }
 
     #[test]
@@ -1506,12 +1522,12 @@ mod tests {
             ("C2_CALL_MAX_OUTSTANDING", "   "),
             ("C2_CALL_MAX_OUTSTANDING", "not-a-number"),
             ("C2_CALL_MAX_OUTSTANDING", "18446744073709551616"),
-            ("C2_CALL_RETAINED_INPUT_BUDGET_BYTES", "-1"),
-            ("C2_CALL_RETAINED_INPUT_BUDGET_BYTES", ""),
-            ("C2_CALL_RETAINED_INPUT_BUDGET_BYTES", "   "),
-            ("C2_CALL_RETAINED_INPUT_BUDGET_BYTES", "not-a-number"),
+            ("C2_CALL_PAYLOAD_BUFFER_BUDGET_BYTES", "-1"),
+            ("C2_CALL_PAYLOAD_BUFFER_BUDGET_BYTES", ""),
+            ("C2_CALL_PAYLOAD_BUFFER_BUDGET_BYTES", "   "),
+            ("C2_CALL_PAYLOAD_BUFFER_BUDGET_BYTES", "not-a-number"),
             (
-                "C2_CALL_RETAINED_INPUT_BUDGET_BYTES",
+                "C2_CALL_PAYLOAD_BUFFER_BUDGET_BYTES",
                 "18446744073709551616",
             ),
         ] {
@@ -1539,7 +1555,7 @@ mod tests {
             env_file: EnvFilePolicy::Disabled,
             process_env: env(&[
                 ("C2_CALL_MAX_OUTSTANDING", "32"),
-                ("C2_CALL_RETAINED_INPUT_BUDGET_BYTES", "65536"),
+                ("C2_CALL_PAYLOAD_BUFFER_BUDGET_BYTES", "65536"),
                 ("C2_IPC_MAX_FRAME_SIZE", "not-a-number"),
                 ("C2_IPC_POOL_SEGMENT_SIZE", "-1"),
                 ("C2_RELAY_IDLE_TIMEOUT", "not-a-number"),
@@ -1555,7 +1571,7 @@ mod tests {
         .expect("call limit resolution must not parse other scopes");
 
         assert_eq!(limits.max_outstanding_calls, 32);
-        assert_eq!(limits.retained_input_budget_bytes, 65_536);
+        assert_eq!(limits.payload_buffer_budget_bytes, 65_536);
     }
 
     #[test]

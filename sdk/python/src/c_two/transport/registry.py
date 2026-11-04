@@ -203,13 +203,13 @@ class Runtime:
         self,
         *,
         max_outstanding_calls: int | None = None,
-        retained_input_budget_bytes: int | None = None,
+        payload_buffer_budget_bytes: int | None = None,
     ) -> None:
-        """Set native finite call limits before their first business call."""
+        """Set native call limits before business calls or HTTP acquisition."""
         with self._lock:
             self._runtime_session.set_call_execution_limits(
                 max_outstanding_calls=max_outstanding_calls,
-                retained_input_budget_bytes=retained_input_budget_bytes,
+                payload_buffer_budget_bytes=payload_buffer_budget_bytes,
             )
 
     def set_relay_anchor(self, address: str) -> None:
@@ -1149,18 +1149,18 @@ def serve(
 def set_call_execution_limits(
     *,
     max_outstanding_calls: int | None = None,
-    retained_input_budget_bytes: int | None = None,
+    payload_buffer_budget_bytes: int | None = None,
 ) -> None:
-    """Set Core finite call admission limits before the first business call.
+    """Set Core call limits before the first business call or HTTP acquisition.
 
     Each ``None`` inherits native environment and default policy. Zero rejects
-    that dimension. Connections and snapshot observations do not freeze it;
-    the first business call does. Limits are per Runtime/domain and shared by
-    its call views.
+    positive byte admission. Snapshot observations and direct IPC connections
+    do not freeze it; HTTP acquisition starts the shared payload domain.
+    Limits are per Runtime/domain and shared by its call views.
     """
     _get_default_runtime().set_call_execution_limits(
         max_outstanding_calls=max_outstanding_calls,
-        retained_input_budget_bytes=retained_input_budget_bytes,
+        payload_buffer_budget_bytes=payload_buffer_budget_bytes,
     )
 
 

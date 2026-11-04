@@ -136,6 +136,7 @@ use c2_wire::route_catalog_control::{
 };
 
 use c2_mem::config::PoolConfig;
+use c2_mem::retention::{BudgetedBuffer, PayloadBufferBudget};
 use c2_mem::{MemHandle, MemPool, PeerMappingCache, PeerMappingError, PeerRead, PoolAllocation};
 
 use crate::response::{ResponseData, ServerShmResponse};
@@ -1709,6 +1710,69 @@ impl IpcClient {
             .await
     }
 
+    /// Consume an input owner instead of borrowing it through the reply wait.
+    /// SHM fallback is decided while this owner can still be read; received
+    /// replies never cause a second request using the same input.
+    pub async fn call_bound_owned_controlled_phased<B>(
+        &self,
+        binding: &RouteBinding,
+        method_name: &str,
+        data: B,
+        control: &IpcCallControl,
+    ) -> Result<ResponseData, crate::IpcCallError>
+    where
+        B: AsRef<[u8]> + Send + 'static,
+    {
+        let (method_idx, identity, max_payload_size) = binding
+            .call_target_for(method_name)
+            .map_err(pre_dispatch_call_error)?;
+        let data_len = data.as_ref().len();
+        if u64::try_from(data_len).unwrap_or(u64::MAX) > max_payload_size {
+            return Err(pre_dispatch_call_error(IpcError::Config(format!(
+                "request payload size {data_len} exceeds route '{}' max_payload_size {max_payload_size}",
+                binding.route_name()
+            ))));
+        }
+        IpcCallControl::check_preparation(Some(control)).map_err(pre_dispatch_call_error)?;
+        if choose_request_transport(&self.config, self.shm_request_available(), data_len)
+            == RequestTransportKind::Buddy
+        {
+            let prepared = self.try_alloc_request_block(data_len).and_then(|block| {
+                if let Some(block) = &block {
+                    block.write_at(0, data.as_ref())?;
+                }
+                Ok(block)
+            });
+            match prepared {
+                Ok(Some(block)) => {
+                    drop(data);
+                    return self
+                        .call_with_prealloc_controlled(&identity, method_idx, &block, Some(control))
+                        .await;
+                }
+                // Only unpublished SHM preparation can select another carrier.
+                Ok(None) | Err(IpcError::Shm(_)) => {}
+                Err(error) => return Err(pre_dispatch_call_error(error)),
+            }
+        }
+        match choose_request_transport(&self.config, false, data_len) {
+            RequestTransportKind::Chunked => {
+                self.call_chunked_stream_controlled(
+                    &identity,
+                    method_idx,
+                    data_len,
+                    futures_util::stream::iter([Ok::<_, std::io::Error>(data)]),
+                    Some(control.clone()),
+                )
+                .await
+            }
+            RequestTransportKind::Inline | RequestTransportKind::Buddy => {
+                self.call_inline_controlled(&identity, method_idx, data, Some(control))
+                    .await
+            }
+        }
+    }
+
     /// Send a CRM call from an owned known-size stream. After first publication
     /// the send task retains the stream through completion, even if the caller
     /// cancels its response wait.
@@ -1724,7 +1788,7 @@ impl IpcClient {
         B: AsRef<[u8]> + Send + 'static,
         E: Display + Send + 'static,
     {
-        self.call_bound_sized_stream_phased(binding, method_name, data_len, chunks)
+        self.call_bound_sized_stream_phased(binding, method_name, data_len, chunks, None)
             .await
             .map_err(crate::sync_client::IpcCallError::into_source)
     }
@@ -1737,6 +1801,7 @@ impl IpcClient {
         method_name: &str,
         data_len: u64,
         chunks: S,
+        payload_budget: Option<&PayloadBufferBudget>,
     ) -> Result<ResponseData, crate::sync_client::IpcCallError>
     where
         S: Stream<Item = Result<B, E>> + Send + 'static,
@@ -1752,8 +1817,14 @@ impl IpcClient {
                 binding.route_name()
             ))));
         }
-        self.call_sized_stream_resolved_target_phased(method_idx, identity, data_len, chunks)
-            .await
+        self.call_sized_stream_resolved_target_phased(
+            method_idx,
+            identity,
+            data_len,
+            chunks,
+            payload_budget,
+        )
+        .await
     }
 
     async fn call_sized_stream_resolved_target_phased<S, B, E>(
@@ -1762,6 +1833,7 @@ impl IpcClient {
         identity: RouteCallIdentity,
         data_len: u64,
         chunks: S,
+        payload_budget: Option<&PayloadBufferBudget>,
     ) -> Result<ResponseData, crate::sync_client::IpcCallError>
     where
         S: Stream<Item = Result<B, E>> + Send + 'static,
@@ -1789,10 +1861,14 @@ impl IpcClient {
                             .await
                     }
                     RequestTransportKind::Inline | RequestTransportKind::Buddy => {
-                        let data = collect_exact_stream(data_len, chunks)
-                            .await
-                            .map_err(pre_dispatch_call_error)?;
-                        self.call_inline(&identity, method_idx, &data).await
+                        self.call_collected_inline(
+                            &identity,
+                            method_idx,
+                            data_len,
+                            chunks,
+                            payload_budget,
+                        )
+                        .await
                     }
                 }
             }
@@ -1801,10 +1877,56 @@ impl IpcClient {
                     .await
             }
             RequestTransportKind::Inline => {
-                let data = collect_exact_stream(data_len, chunks)
+                self.call_collected_inline(&identity, method_idx, data_len, chunks, payload_budget)
                     .await
-                    .map_err(pre_dispatch_call_error)?;
-                self.call_inline(&identity, method_idx, &data).await
+            }
+        }
+    }
+
+    async fn call_collected_inline<S, B, E>(
+        &self,
+        identity: &RouteCallIdentity,
+        method_idx: u16,
+        data_len: usize,
+        chunks: S,
+        payload_budget: Option<&PayloadBufferBudget>,
+    ) -> Result<ResponseData, crate::IpcCallError>
+    where
+        S: Stream<Item = Result<B, E>> + Send + 'static,
+        B: AsRef<[u8]> + Send + 'static,
+        E: Display + Send + 'static,
+    {
+        // The source already owns B. Reserve its sending copy before either
+        // allocation or polling the source, without waiting on our own input.
+        let reservation = payload_budget
+            .map(|budget| budget.try_reserve(data_len as u64))
+            .transpose()
+            .map_err(|error| {
+                pre_dispatch_call_error(IpcError::LocalCallRejected(
+                    C2Error::new(ErrorCode::CallCapacityExceeded, error.to_string()).with_details(
+                        std::collections::BTreeMap::from([(
+                            "dispatch_phase".into(),
+                            "pre_dispatch".into(),
+                        )]),
+                    ),
+                ))
+            })?;
+        let data = collect_exact_stream(data_len, chunks)
+            .await
+            .map_err(pre_dispatch_call_error)?;
+        match reservation {
+            Some(reservation) => {
+                self.call_inline_controlled(
+                    identity,
+                    method_idx,
+                    BudgetedBuffer::new(data, reservation),
+                    None,
+                )
+                .await
+            }
+            None => {
+                self.call_inline_controlled(identity, method_idx, data, None)
+                    .await
             }
         }
     }
@@ -1820,18 +1942,19 @@ impl IpcClient {
             .await
     }
 
-    async fn call_inline_controlled(
+    async fn call_inline_controlled<B: AsRef<[u8]>>(
         &self,
         identity: &RouteCallIdentity,
         method_idx: u16,
-        data: &[u8],
+        data: B,
         control: Option<&IpcCallControl>,
     ) -> Result<ResponseData, crate::IpcCallError> {
         IpcCallControl::check_preparation(control).map_err(pre_dispatch_call_error)?;
         let (send, mut rx) = self.begin_call().map_err(pre_dispatch_call_error)?;
         let ctrl = encode_call_control(identity, method_idx)
             .map_err(|error| pre_dispatch_call_error(IpcError::Protocol(error.to_string())))?;
-        let bytes = frame::encode_frame_parts(send.rid, flags::FLAG_CALL_V2, &[&ctrl, data]);
+        let bytes =
+            frame::encode_frame_parts(send.rid, flags::FLAG_CALL_V2, &[&ctrl, data.as_ref()]);
         send.conn
             .submit(
                 bytes,
@@ -1843,6 +1966,8 @@ impl IpcClient {
             .map_err(|error| {
                 dispatch_call_error(prefer_response_failure(error, &mut rx), send.started())
             })?;
+        // Sending has finished. Keep only response ownership while awaiting rx.
+        drop(data);
         owned_response(
             rx.await
                 .map_err(|_| dispatch_call_error(IpcError::Closed, send.started()))?,

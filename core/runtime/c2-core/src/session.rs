@@ -678,8 +678,8 @@ impl Runtime {
         })
     }
 
-    /// Configure the independent finite-call domain before its first business
-    /// call. Connect does not freeze this policy. Clones and every Client share
+    /// Configure the call domain before its first payload use: a business call
+    /// or HTTP acquisition. Clones and every Client share
     /// the one domain; teardown never replaces it or launders live charges.
     pub fn set_call_execution_limits(
         &self,
@@ -707,7 +707,7 @@ impl Runtime {
         if let Some(context) = &state.call_execution {
             let snapshot = context.snapshot();
             return if snapshot.max_operations == limits.max_outstanding_calls
-                && snapshot.max_retained_bytes == limits.retained_input_budget_bytes
+                && snapshot.max_retained_bytes == limits.payload_buffer_budget_bytes
             {
                 // Record accepted optional code inputs, even for an idempotent
                 // setter. The frozen budget and its live charges stay intact.
@@ -735,6 +735,24 @@ impl Runtime {
         Ok(self.resolve_call_execution_context(false)?.snapshot())
     }
 
+    /// Observe the frozen B domain without creating one or retaining producer
+    /// authority. A retired session may still have live storage owners.
+    pub fn payload_buffer_observer(&self) -> Option<c2_mem::retention::PayloadBufferObserverWeak> {
+        self.state
+            .lock()
+            .call_execution
+            .as_ref()
+            .map(|context| context.payload_budget().downgrade())
+    }
+
+    pub fn payload_buffer_stats(&self) -> Option<crate::MemoryCellStats> {
+        self.state
+            .lock()
+            .call_execution
+            .as_ref()
+            .map(|context| crate::MemoryCellStats::from_payload_buffer(context.payload_snapshot()))
+    }
+
     /// Capture pure metadata for this Runtime's independent domain, including
     /// future first-call initialization. This neither resolves nor freezes policy.
     pub fn call_execution_observer(&self) -> CallExecutionObserver {
@@ -755,9 +773,17 @@ impl Runtime {
         &self,
         freeze: bool,
     ) -> Result<CallExecutionContext, LifecycleError> {
+        self.resolve_call_execution_context_with_lock(freeze, || Ok(self.state.lock()))
+    }
+
+    fn resolve_call_execution_context_with_lock<'a, E: From<LifecycleError>>(
+        &'a self,
+        freeze: bool,
+        lock: impl Fn() -> Result<parking_lot::MutexGuard<'a, RuntimeState>, E>,
+    ) -> Result<CallExecutionContext, E> {
         loop {
             let (overrides, sources, revision) = {
-                let state = self.state.lock();
+                let state = lock()?;
                 if let Some(context) = &state.call_execution {
                     return Ok(context.clone());
                 }
@@ -770,14 +796,14 @@ impl Runtime {
             // Environment/.env I/O outside runtime metadata, just as for the
             // existing configuration domains. A racing setter wins by revision.
             let resolved = resolve_call_execution_limits(overrides, sources);
-            let mut state = self.state.lock();
+            let mut state = lock()?;
             if let Some(context) = &state.call_execution {
                 return Ok(context.clone());
             }
             if state.call_execution_revision != revision {
                 continue;
             }
-            let context = CallExecutionContext::new(&resolved?);
+            let context = CallExecutionContext::new(&resolved.map_err(E::from)?);
             if state.call_execution_observer.is_closed() {
                 context.close();
             }
@@ -1116,6 +1142,7 @@ impl Runtime {
         crate::RuntimeMemoryStats {
             runtime_outgoing: self.outgoing_memory_stats(),
             server: None,
+            payload_buffer: self.payload_buffer_stats(),
         }
     }
 
@@ -2470,6 +2497,12 @@ impl Runtime {
         prefer_local_ipc: bool,
         deadline: ConnectDeadline,
     ) -> Result<RelayAwareHttpClient, crate::Error> {
+        // HTTP acquisition can receive an error body before a business call.
+        // It starts the same frozen B domain, with the original connect budget.
+        let payload = self.resolve_call_execution_context_with_lock(true, || {
+            connect_state_lock(&self.state, deadline, "runtime_payload_budget_wait")
+        })?;
+        let client = client.with_payload_buffer_budget(payload.payload_budget());
         let frozen = connect_state_lock(&self.state, deadline, "runtime_relay_wait")?
             .frozen_local_endpoint
             .clone();
@@ -2815,7 +2848,7 @@ mod tests {
             .set_call_execution_limits_with_sources(
                 c2_config::CallExecutionLimitsOverrides {
                     max_outstanding_calls: Some(8),
-                    retained_input_budget_bytes: Some(256),
+                    payload_buffer_budget_bytes: Some(256),
                 },
                 c2_config::ConfigSources::empty(),
             )
@@ -2907,7 +2940,7 @@ mod tests {
         assert!(counters.closed);
         assert_eq!(
             (counters.used_operations, counters.used_retained_bytes),
-            (1, 32)
+            (0, 32)
         );
         assert!(observer.is_live());
         drop(input);
@@ -2981,7 +3014,7 @@ mod tests {
             .set_call_execution_limits_with_sources(
                 c2_config::CallExecutionLimitsOverrides {
                     max_outstanding_calls: Some(3),
-                    retained_input_budget_bytes: Some(64),
+                    payload_buffer_budget_bytes: Some(64),
                 },
                 c2_config::ConfigSources::empty(),
             )
@@ -3008,7 +3041,7 @@ mod tests {
             env_file: c2_config::EnvFilePolicy::Disabled,
             process_env: c2_config::EnvMap::from([
                 ("C2_CALL_MAX_OUTSTANDING".into(), "8".into()),
-                ("C2_CALL_RETAINED_INPUT_BUDGET_BYTES".into(), "256".into()),
+                ("C2_CALL_PAYLOAD_BUFFER_BUDGET_BYTES".into(), "256".into()),
             ]),
         };
         runtime
@@ -3016,7 +3049,7 @@ mod tests {
             .unwrap();
         let accepted = runtime.call_execution_limits_overrides();
         assert_eq!(accepted.max_outstanding_calls, None);
-        assert_eq!(accepted.retained_input_budget_bytes, None);
+        assert_eq!(accepted.payload_buffer_budget_bytes, None);
         assert_eq!(observer.snapshot().counters.unwrap().max_operations, 8);
         assert_eq!(
             observer.snapshot().counters.unwrap().used_retained_bytes,
@@ -3027,7 +3060,7 @@ mod tests {
                 .set_call_execution_limits_with_sources(
                     c2_config::CallExecutionLimitsOverrides {
                         max_outstanding_calls: Some(9),
-                        retained_input_budget_bytes: None,
+                        payload_buffer_budget_bytes: None,
                     },
                     c2_config::ConfigSources::empty(),
                 )
@@ -3343,7 +3376,7 @@ mod tests {
                     env_file: c2_config::EnvFilePolicy::Disabled,
                     process_env: EnvMap::from([
                         ("C2_CALL_MAX_OUTSTANDING".into(), "3".into()),
-                        ("C2_CALL_RETAINED_INPUT_BUDGET_BYTES".into(), "17".into()),
+                        ("C2_CALL_PAYLOAD_BUFFER_BUDGET_BYTES".into(), "17".into()),
                     ]),
                 },
             )
@@ -3362,7 +3395,7 @@ mod tests {
             .set_call_execution_limits_with_sources(
                 CallExecutionLimitsOverrides {
                     max_outstanding_calls: Some(1),
-                    retained_input_budget_bytes: Some(32),
+                    payload_buffer_budget_bytes: Some(32),
                 },
                 ConfigSources::empty(),
             )
@@ -3376,7 +3409,7 @@ mod tests {
         let runtime = Runtime::new(RuntimeOptions::default()).unwrap();
         let overrides = CallExecutionLimitsOverrides {
             max_outstanding_calls: Some(1),
-            retained_input_budget_bytes: Some(32),
+            payload_buffer_budget_bytes: Some(32),
         };
         runtime
             .set_call_execution_limits_with_sources(overrides.clone(), ConfigSources::empty())
@@ -3402,7 +3435,7 @@ mod tests {
             clone.set_call_execution_limits_with_sources(
                 CallExecutionLimitsOverrides {
                     max_outstanding_calls: Some(2),
-                    retained_input_budget_bytes: Some(64)
+                    payload_buffer_budget_bytes: Some(64)
                 },
                 ConfigSources::empty(),
             ),
@@ -3430,7 +3463,7 @@ mod tests {
             .set_call_execution_limits_with_sources(
                 CallExecutionLimitsOverrides {
                     max_outstanding_calls: Some(1),
-                    retained_input_budget_bytes: Some(32),
+                    payload_buffer_budget_bytes: Some(32),
                 },
                 ConfigSources::empty(),
             )

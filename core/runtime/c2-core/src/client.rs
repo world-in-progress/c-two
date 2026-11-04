@@ -8,12 +8,13 @@ use c2_config::{CallOptions, ConnectDeadline, ConnectOptions};
 use c2_http::client::HttpCallControl;
 use c2_ipc::IpcCallControl;
 
-use crate::call_execution::{PreparingCall, RetainedCallInput, guard_error, scope_error};
+use crate::call_execution::{PreparingCall, guard_error, scope_error};
 use crate::{CallScope, CallScopeError, CallState};
 
 use c2_contract::{ExpectedRouteContract, validate_expected_route_contract};
 use c2_http::client::{HttpCallPhase, RelayAwareHttpClient, RelayLocalIpcCandidate};
 use c2_ipc::{IpcCallError, RouteBinding};
+use c2_mem::retention::{BudgetedBuffer, PayloadBufferBudget};
 
 use crate::session::RelayResolvedConnection;
 use crate::{
@@ -208,9 +209,9 @@ impl PreparedCall {
     }
 
     /// Hand off ALREADY PREPARED native-owned data, not a user serializer.
-    /// The factory must produce exactly nbytes bytes. Finite execution owns
-    /// materialization, input and transport until real completion; Unlimited
-    /// drives the same async transport inline without a task/budget charge.
+    /// The factory must produce exactly nbytes bytes. Finite execution keeps
+    /// its native task through real completion; Unlimited drives the same
+    /// transport inline. Both retain B for the actual input owner.
     pub fn encode<M>(mut self, nbytes: usize, materialize: M) -> Result<EncodedCall, Error>
     where
         M: FnOnce() -> Result<Vec<u8>, Error> + Send + 'static,
@@ -231,7 +232,7 @@ impl PreparedCall {
         self.encode(request.len(), move || Ok(request))
     }
 
-    /// Borrowed compatibility entry: charge before making the owned native copy.
+    /// Borrowed entry: charge before making the owned native copy.
     /// Rust cannot hand a borrowed slice to a detached continuation.
     pub fn encode_slice(mut self, request: &[u8]) -> Result<EncodedCall, Error> {
         self.charge_input(
@@ -258,6 +259,7 @@ impl EncodedCall {
             inner,
             method,
         } = self.prepared;
+        let payload_budget = preparing.payload_budget();
         preparing
             .execute(
                 self.nbytes,
@@ -271,7 +273,9 @@ impl EncodedCall {
                                 .map_err(|error| LifecycleError::ResponseCopy(error).into())
                         }
                         ClientInner::Http(client, _) => {
-                            call_http(client, &method, input, scope).await
+                            call_http(client, &method, input, scope, payload_budget)
+                                .await
+                                .map(BudgetedBuffer::into_vec)
                         }
                     }
                 },
@@ -285,6 +289,7 @@ impl EncodedCall {
             inner,
             method,
         } = self.prepared;
+        let payload_budget = preparing.payload_budget();
         preparing
             .execute(
                 self.nbytes,
@@ -294,8 +299,8 @@ impl EncodedCall {
                         ClientInner::Ipc(connection) => HeldResponse::from_response_data(
                             call_ipc(connection, &method, input, scope).await?,
                         )?,
-                        ClientInner::Http(client, _) => HeldResponse::from_owned_bytes(
-                            call_http(client, &method, input, scope).await?,
+                        ClientInner::Http(client, _) => HeldResponse::from_budgeted_bytes(
+                            call_http(client, &method, input, scope, payload_budget).await?,
                         ),
                     };
                     Ok(response)
@@ -308,7 +313,7 @@ impl EncodedCall {
 async fn call_ipc(
     connection: &PooledIpcClient,
     method: &str,
-    input: Arc<RetainedCallInput>,
+    input: BudgetedBuffer,
     scope: CallScope,
 ) -> Result<c2_ipc::ResponseData, Error> {
     let preparation = scope.clone();
@@ -316,12 +321,7 @@ async fn call_ipc(
         .with_before_prepare(move || preparation.check_pre_dispatch().map_err(guard_error));
     connection
         .client
-        .call_bound_controlled_async_phased(
-            &connection.binding,
-            method,
-            input.as_ref().as_ref(),
-            &control,
-        )
+        .call_bound_owned_controlled_async_phased(&connection.binding, method, input, &control)
         .await
         .map_err(normalize_ipc_call_error)
 }
@@ -329,14 +329,15 @@ async fn call_ipc(
 async fn call_http(
     client: &RelayAwareHttpClient,
     method: &str,
-    input: Arc<RetainedCallInput>,
+    input: BudgetedBuffer,
     scope: CallScope,
-) -> Result<Vec<u8>, Error> {
+    payload_budget: PayloadBufferBudget,
+) -> Result<BudgetedBuffer, Error> {
     let active = scope.clone();
+    let deadline = scope.deadline();
     let control = HttpCallControl::new(
-        // A preceding business POST can be authoritatively refused as stale.
-        // Resolution/probe waits keep Dispatched sticky and the original D;
-        // they grant no dispatch/retry permission themselves.
+        // Resolution and probe waits share the original deadline and do not
+        // grant business dispatch permission.
         move || match active.observe_deadline() {
             CallState::PreDispatch | CallState::Dispatched => Ok(()),
             CallState::ExpiredPreDispatch => Err(guard_error(CallScopeError::DeadlineExceeded {
@@ -349,23 +350,13 @@ async fn call_http(
             }
             state => Err(guard_error(CallScopeError::InvalidState { state })),
         },
-        move |previous| {
-            match previous {
-                None => scope.try_begin_dispatch(),
-                Some(HttpCallPhase::PreDispatch) => {
-                    scope.try_begin_retry_dispatch(TransportPhase::PreDispatch)
-                }
-                Some(HttpCallPhase::DispatchUncertain) => {
-                    scope.try_begin_retry_dispatch(TransportPhase::DispatchUncertain)
-                }
-            }
-            .map_err(guard_error)
-        },
-    );
+        move || scope.try_begin_dispatch().map_err(guard_error),
+    )
+    .with_payload_budget(payload_budget, deadline);
     // The controlled channel has no reqwest total/upload timer for ALL policy
     // modes, including inherited defaults and explicit Unlimited/600 seconds.
     client
-        .call_controlled_async(method, input, &control)
+        .call_controlled_async(method, Arc::new(input), &control)
         .await
         .map_err(|error| {
             let phase = match error.phase() {

@@ -77,5 +77,5 @@ pub use c2_config::{
     CallExecutionLimits, CallExecutionLimitsOverrides, CallOptions, CallTimeout, ConfigSources,
     EnvFilePolicy, EnvMap, LocalEndpointContext, LocalEndpointNamespace, LocalEndpointOptions,
 };
-/// Read-only counters for the Runtime finite-call input retention domain.
+/// Read-only operation-slot and payload-buffer counters for one Runtime.
 pub use c2_mem::RetentionSnapshot as CallExecutionSnapshot;

@@ -201,3 +201,39 @@ fn assert_semantic_eq(actual: Error, expected: &C2Error) {
     };
     assert_eq!(&actual, expected);
 }
+
+#[test]
+fn relay_payload_capacity_refusal_projects_pre_dispatch_without_retrying() {
+    let refusal = C2Error::new(
+        ErrorCode::CallCapacityExceeded,
+        "unknown payload growth refused",
+    )
+    .with_details(BTreeMap::from([(
+        "dispatch_phase".into(),
+        "pre_dispatch".into(),
+    )]));
+    let body = serde_json::to_string(&refusal.envelope()).unwrap();
+    let Error::Semantic(error) = normalize_http_error(
+        HttpError::ServerError(502, body),
+        TransportPhase::PreDispatch,
+    ) else {
+        panic!("canonical capacity refusal required")
+    };
+    assert_eq!(error.code, ErrorCode::CallCapacityExceeded);
+    assert_eq!(error.details["transport_phase"], "pre_dispatch");
+}
+
+#[test]
+fn non_utf8_http_error_refunds_its_received_buffer_after_canonical_refusal() {
+    use c2_mem::retention::{BudgetedBuffer, PayloadBufferBudget};
+    let budget = PayloadBufferBudget::new(1);
+    let body = BudgetedBuffer::new(vec![0xff], budget.reserve_blocking(1, None).unwrap());
+    let Error::Semantic(error) = normalize_http_error(
+        HttpError::ResponseError(502, body),
+        TransportPhase::DispatchUncertain,
+    ) else {
+        panic!("canonical malformed-envelope error required")
+    };
+    assert_eq!(error.code, ErrorCode::ProtocolViolation);
+    assert_eq!(budget.snapshot().used_bytes, 0);
+}

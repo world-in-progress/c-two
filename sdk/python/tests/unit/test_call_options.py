@@ -205,9 +205,9 @@ snapshot = session.call_execution_snapshot()
 assert snapshot['max_operations'] == 3
 assert snapshot['max_retained_bytes'] == 4321
 assert session.call_execution_limits_overrides == {
-    'max_outstanding_calls': 3, 'retained_input_budget_bytes': None,
+    'max_outstanding_calls': 3, 'payload_buffer_budget_bytes': None,
 }
-session.set_call_execution_limits(retained_input_budget_bytes=99)
+session.set_call_execution_limits(payload_buffer_budget_bytes=99)
 snapshot = session.call_execution_snapshot()
 assert snapshot['max_operations'] == 7
 assert snapshot['max_retained_bytes'] == 99
@@ -217,11 +217,65 @@ print(json.dumps(snapshot))
 '''
     environment = dict(os.environ)
     environment.update(C2_ENV_FILE='', C2_CALL_MAX_OUTSTANDING='7',
-                       C2_CALL_RETAINED_INPUT_BUDGET_BYTES='4321')
+                       C2_CALL_PAYLOAD_BUFFER_BUDGET_BYTES='4321')
     result = subprocess.run([sys.executable, '-c', code], env=environment,
                             capture_output=True, text=True, timeout=15)
     assert result.returncode == 0, result.stdout + result.stderr
     assert json.loads(result.stdout)['max_retained_bytes'] == 99
+
+
+def test_retired_retained_input_keyword_is_not_accepted():
+    from c_two._native import RuntimeSession
+
+    with pytest.raises(TypeError):
+        RuntimeSession(retained_input_budget_bytes=7)
+    session = RuntimeSession()
+    with pytest.raises(TypeError):
+        session.set_call_execution_limits(retained_input_budget_bytes=7)
+    with pytest.raises(TypeError):
+        cc.set_call_execution_limits(retained_input_budget_bytes=7)
+
+
+@pytest.mark.parametrize('limit', [0, 2**64 - 1])
+def test_payload_buffer_budget_accepts_u64_boundaries(limit):
+    from c_two._native import RuntimeSession
+
+    session = RuntimeSession(payload_buffer_budget_bytes=limit)
+    assert session.call_execution_limits_overrides['payload_buffer_budget_bytes'] == limit
+    assert session.call_execution_snapshot()['max_retained_bytes'] == limit
+    session.set_call_execution_limits(payload_buffer_budget_bytes=limit)
+    assert session.call_execution_snapshot()['max_retained_bytes'] == limit
+
+
+@pytest.mark.parametrize('limit', [-1, 2**64])
+def test_payload_buffer_budget_rejects_outside_u64(limit):
+    from c_two._native import RuntimeSession
+
+    with pytest.raises((OverflowError, ValueError)):
+        RuntimeSession(payload_buffer_budget_bytes=limit)
+    session = RuntimeSession()
+    with pytest.raises((OverflowError, ValueError)):
+        session.set_call_execution_limits(payload_buffer_budget_bytes=limit)
+
+
+def test_retired_budget_environment_name_has_no_effect():
+    import os
+    import subprocess
+    import sys
+
+    environment = dict(os.environ)
+    environment.update(C2_ENV_FILE='', C2_CALL_MAX_OUTSTANDING='7')
+    environment.pop('C2_CALL_PAYLOAD_BUFFER_BUDGET_BYTES', None)
+    environment.pop('C2_CALL_RETAINED_INPUT_BUDGET_BYTES', None)
+    command = [sys.executable, '-c',
+               'from c_two._native import RuntimeSession; '
+               'print(RuntimeSession().call_execution_snapshot()["max_retained_bytes"])']
+    baseline = subprocess.run(command, env=environment, capture_output=True,
+                              text=True, timeout=15, check=True).stdout
+    environment['C2_CALL_RETAINED_INPUT_BUDGET_BYTES'] = '1'
+    retired = subprocess.run(command, env=environment, capture_output=True,
+                             text=True, timeout=15, check=True).stdout
+    assert retired == baseline
 
 
 def test_retired_uninitialized_observer_does_not_resolve_or_retain_runtime_in_child():
@@ -236,7 +290,7 @@ import json
 from c_two._native import RuntimeSession
 old = RuntimeSession()
 handoff = old.retire_memory_observation()
-replacement = RuntimeSession(max_outstanding_calls=5, retained_input_budget_bytes=99)
+replacement = RuntimeSession(max_outstanding_calls=5, payload_buffer_budget_bytes=99)
 replacement.adopt_retired_memory_observation(handoff)
 replacement.adopt_retired_memory_observation(handoff)
 rows = replacement.call_execution_snapshot()['retired']
@@ -258,7 +312,7 @@ print(json.dumps({'retired': [], 'metadata_only': True}))
 '''
     environment = dict(os.environ)
     environment.update(C2_ENV_FILE='', C2_CALL_MAX_OUTSTANDING='invalid',
-                       C2_CALL_RETAINED_INPUT_BUDGET_BYTES='invalid')
+                       C2_CALL_PAYLOAD_BUFFER_BUDGET_BYTES='invalid')
     result = subprocess.run([sys.executable, '-c', code], env=environment,
                             capture_output=True, text=True, timeout=15)
     assert result.returncode == 0, result.stdout + result.stderr

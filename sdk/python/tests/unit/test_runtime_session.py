@@ -919,7 +919,7 @@ def test_shutdown_warns_when_native_cleanup_barrier_is_unconfirmed(caplog) -> No
             outcome: dict | None = None,
             *,
             max_outstanding_calls: int | None = None,
-            retained_input_budget_bytes: int | None = None,
+            payload_buffer_budget_bytes: int | None = None,
             **_kwargs,
         ) -> None:
             self._outcome = outcome if outcome is not None else {'relay_errors': []}
@@ -929,7 +929,7 @@ def test_shutdown_warns_when_native_cleanup_barrier_is_unconfirmed(caplog) -> No
             self._limits = {
                 key: value for key, value in (
                     ('max_outstanding_calls', max_outstanding_calls),
-                    ('retained_input_budget_bytes', retained_input_budget_bytes),
+                    ('payload_buffer_budget_bytes', payload_buffer_budget_bytes),
                 ) if value is not None
             }
 

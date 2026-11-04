@@ -1,5 +1,6 @@
 //! Relay-aware HTTP client with route failover.
 
+use c2_mem::retention::{BudgetedBuffer, PayloadBufferBudget};
 use std::collections::HashSet;
 use std::net::IpAddr;
 use std::sync::{Arc, OnceLock};
@@ -115,6 +116,7 @@ impl RelayResolvedTarget {
 }
 
 pub struct RelayAwareHttpClient {
+    payload_budget: PayloadBufferBudget,
     control: Arc<RelayControlClient>,
     pool: &'static HttpClientPool,
     expected: ExpectedRouteContract,
@@ -149,6 +151,9 @@ impl RelayAwareHttpClient {
         // HTTP construction must not require a local logon SID or resolve an IPC
         // root. Local selection derives the platform default lazily.
         Ok(Self {
+            payload_budget: PayloadBufferBudget::new(
+                c2_config::DEFAULT_PAYLOAD_BUFFER_BUDGET_BYTES,
+            ),
             local_endpoint_context: None,
             default_local_endpoint_context: OnceLock::new(),
             http_only: false,
@@ -160,6 +165,12 @@ impl RelayAwareHttpClient {
             config,
             current: Mutex::new(None),
         })
+    }
+
+    /// Use the Runtime's one payload domain for calls and HTTP probe errors.
+    pub fn with_payload_buffer_budget(mut self, budget: PayloadBufferBudget) -> Self {
+        self.payload_budget = budget;
+        self
     }
 
     /// Project the context whose endpoints the caller can open. Namespace agreement
@@ -224,7 +235,7 @@ impl RelayAwareHttpClient {
         method_name: &str,
         data: HttpInputOwner,
         control: &HttpCallControl,
-    ) -> Result<Vec<u8>, HttpCallError> {
+    ) -> Result<BudgetedBuffer, HttpCallError> {
         self.call_inner_async(method_name, HttpCallInput::Owned(data), Some(control))
             .await
             .map_err(|source| HttpCallError::new(http_call_error_phase(&source), source))
@@ -373,6 +384,9 @@ impl RelayAwareHttpClient {
                         }
                     };
 
+                // A selected next attempt replaces the previous error. Its
+                // received bytes must not occupy B while the new probe waits.
+                drop(last_error.take());
                 let probe = super::connect_deadline::run(
                     deadline,
                     "relay_probe",
@@ -380,6 +394,7 @@ impl RelayAwareHttpClient {
                         &self.expected,
                         &route.route_token(),
                         route.max_payload_size,
+                        &self.payload_budget,
                     ),
                 )
                 .await;
@@ -428,6 +443,7 @@ impl RelayAwareHttpClient {
     ) -> Result<Vec<u8>, HttpError> {
         self.call_inner_async(method_name, HttpCallInput::Borrowed(data), None)
             .await
+            .map(BudgetedBuffer::into_vec)
     }
 
     async fn call_inner_async(
@@ -435,11 +451,14 @@ impl RelayAwareHttpClient {
         method_name: &str,
         data: HttpCallInput<'_>,
         control: Option<&HttpCallControl>,
-    ) -> Result<Vec<u8>, HttpError> {
+    ) -> Result<BudgetedBuffer, HttpError> {
+        let budget = control
+            .and_then(HttpCallControl::payload_budget)
+            .unwrap_or(&self.payload_budget);
+        let mut data = Some(data);
         let attempts = self.config.max_attempts.max(1);
         let mut last_error = None;
-        let mut excluded_routes = HashSet::new();
-        let mut previous_dispatch = None;
+        let excluded_routes = HashSet::new();
 
         for attempt in 0..attempts {
             let routes = match self
@@ -491,9 +510,10 @@ impl RelayAwareHttpClient {
                         &route.route_token(),
                         route.max_payload_size,
                         method_name,
-                        &data,
+                        data.take()
+                            .expect("the request owner is consumed at its sole business POST"),
+                        budget,
                         control,
-                        previous_dispatch,
                     )
                     .await
                 {
@@ -503,13 +523,11 @@ impl RelayAwareHttpClient {
                     }
                     Err(HttpError::CrmError(err)) => return Err(HttpError::CrmError(err)),
                     Err(err) if route_is_stale(&err) => {
-                        check_active(control)?;
-                        previous_dispatch = Some(HttpCallPhase::PreDispatch);
                         self.control.invalidate(self.route_name());
                         *self.current.lock() = None;
-                        excluded_routes.insert(relay_url);
-                        last_error = Some(err);
-                        break;
+                        // No input is retained solely for a possible replay.
+                        // The next logical call acquires the fresh route.
+                        return Err(err);
                     }
                     Err(err) => return Err(err),
                 }
@@ -690,24 +708,53 @@ impl RelayAwareHttpClient {
 type RelayPoolGuard = super::pool::HttpPoolLease;
 
 fn route_is_stale(err: &HttpError) -> bool {
-    match err {
-        HttpError::ServerError(404, body) => {
-            relay_error_code_is(body, c2_error::ErrorCode::ResourceNotFound)
-        }
-        HttpError::ServerError(409, body) => {
-            relay_error_code_is(body, c2_error::ErrorCode::RouteStale)
-        }
-        // ResourceUnavailable + pre_dispatch also covers local request capacity
-        // rejection. It proves no business dispatch, but not a stale route, so
-        // it must not trigger withdrawal or authorize another business POST.
+    let (status, body) = match err {
+        HttpError::ServerError(status, body) => (*status, body.as_bytes()),
+        HttpError::ResponseError(status, body) => (*status, body.as_ref()),
+        _ => return false,
+    };
+    let Ok(body) = std::str::from_utf8(body) else {
+        return false;
+    };
+    match status {
+        404 => relay_error_code_is(body, c2_error::ErrorCode::ResourceNotFound),
+        409 => relay_error_code_is(body, c2_error::ErrorCode::RouteStale),
         _ => false,
     }
 }
 
+fn relay_capacity_is_pre_dispatch(error: &HttpError) -> bool {
+    let body = match error {
+        HttpError::ResponseError(429 | 502, body) => body.as_ref(),
+        HttpError::ServerError(429 | 502, body) => body.as_bytes(),
+        _ => return false,
+    };
+    let Ok(envelope) = serde_json::from_slice::<c2_error::C2ErrorEnvelope>(body) else {
+        return false;
+    };
+    c2_error::C2Error::from_envelope(envelope).is_ok_and(|error| {
+        error.code == c2_error::ErrorCode::CallCapacityExceeded
+            && error
+                .details
+                .get("dispatch_phase")
+                .is_some_and(|phase| phase == "pre_dispatch")
+    })
+}
+
 fn http_call_error_phase(error: &HttpError) -> HttpCallPhase {
     match error {
+        HttpError::LocalCallRejected(error)
+            if error
+                .details
+                .get("transport_phase")
+                .is_some_and(|phase| phase == "dispatch_uncertain") =>
+        {
+            HttpCallPhase::DispatchUncertain
+        }
         HttpError::InvalidInput(_) | HttpError::LocalCallRejected(_) => HttpCallPhase::PreDispatch,
-        error if route_is_stale(error) => HttpCallPhase::PreDispatch,
+        error if route_is_stale(error) || relay_capacity_is_pre_dispatch(error) => {
+            HttpCallPhase::PreDispatch
+        }
         _ => HttpCallPhase::DispatchUncertain,
     }
 }
@@ -1176,11 +1223,16 @@ mod tests {
             HttpError::ServerError(502, capacity.to_string()),
             HttpError::ServerError(429, capacity.to_string()),
             HttpError::ServerError(404, "ResourceNotFound in an untrusted body".into()),
-            HttpError::CrmError(
-                canonical_error_json(704, "RouteStale", "user error", "grid")
+            HttpError::CrmError({
+                let bytes = canonical_error_json(704, "RouteStale", "user error", "grid")
                     .to_string()
-                    .into_bytes(),
-            ),
+                    .into_bytes();
+                let budget = PayloadBufferBudget::new(bytes.capacity() as u64);
+                let reservation = budget
+                    .reserve_blocking(bytes.capacity() as u64, None)
+                    .unwrap();
+                BudgetedBuffer::new(bytes, reservation)
+            }),
             HttpError::Transport("connection lost after POST".into()),
         ] {
             assert!(!route_is_stale(&error));
@@ -1414,7 +1466,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn call_re_resolves_and_tries_next_route_after_stale_route() {
+    async fn stale_post_is_not_replayed_and_the_next_call_resolves_again() {
         let (stale_url, stale_handle) =
             spawn_app(Router::new().route("/{route}/{method}", post(stale_call))).await;
         let (live_url, live_handle) =
@@ -1443,11 +1495,20 @@ mod tests {
         )
         .unwrap();
 
-        let bytes = client.call_async("step", b"payload").await.unwrap();
-        assert_eq!(bytes, b"ok:payload");
-        assert!(
-            resolve_count.load(Ordering::SeqCst) >= 2,
-            "stale route should invalidate cache and re-resolve"
+        let error = client.call_async("step", b"payload").await.unwrap_err();
+        assert!(route_is_stale(&error));
+        assert_eq!(
+            resolve_count.load(Ordering::SeqCst),
+            1,
+            "one logical call does not replay its POST"
+        );
+        drop(error);
+        let next = client.call_async("step", b"payload").await.unwrap_err();
+        assert!(route_is_stale(&next));
+        assert_eq!(
+            resolve_count.load(Ordering::SeqCst),
+            2,
+            "a new logical call performs a fresh resolution"
         );
 
         registry_handle.abort();
@@ -2115,7 +2176,7 @@ mod tests {
         .unwrap();
 
         let err = client.call_async("step", b"payload").await.unwrap_err();
-        assert!(matches!(err, HttpError::ServerError(502, _)));
+        assert!(matches!(err, HttpError::ResponseError(502, _)));
         assert_eq!(resolve_count.load(Ordering::SeqCst), 1);
 
         registry_handle.abort();
@@ -2154,7 +2215,7 @@ mod tests {
         .unwrap();
 
         let err = client.call_async("step", b"payload").await.unwrap_err();
-        assert!(matches!(err, HttpError::ServerError(502, _)));
+        assert!(matches!(err, HttpError::ResponseError(502, _)));
         assert_eq!(resolve_count.load(Ordering::SeqCst), 1);
 
         registry_handle.abort();
@@ -2163,7 +2224,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn structured_404_is_treated_as_stale_route() {
+    async fn structured_404_invalidates_route_without_retaining_replay_input() {
         let (stale_url, stale_handle) =
             spawn_app(Router::new().route("/{route}/{method}", post(stale_not_found))).await;
         let (live_url, live_handle) =
@@ -2192,9 +2253,21 @@ mod tests {
         )
         .unwrap();
 
-        let bytes = client.call_async("step", b"payload").await.unwrap();
-        assert_eq!(bytes, b"ok:payload");
-        assert!(resolve_count.load(Ordering::SeqCst) >= 2);
+        let error = client.call_async("step", b"payload").await.unwrap_err();
+        assert!(route_is_stale(&error));
+        assert_eq!(
+            resolve_count.load(Ordering::SeqCst),
+            1,
+            "one logical call does not replay its POST"
+        );
+        drop(error);
+        let next = client.call_async("step", b"payload").await.unwrap_err();
+        assert!(route_is_stale(&next));
+        assert_eq!(
+            resolve_count.load(Ordering::SeqCst),
+            2,
+            "a new logical call performs a fresh resolution"
+        );
 
         registry_handle.abort();
         stale_handle.abort();
@@ -2232,7 +2305,7 @@ mod tests {
         .unwrap();
 
         let err = client.call_async("step", b"payload").await.unwrap_err();
-        assert!(matches!(err, HttpError::ServerError(404, _)));
+        assert!(matches!(err, HttpError::ResponseError(404, _)));
         assert_eq!(resolve_count.load(Ordering::SeqCst), 1);
 
         registry_handle.abort();
@@ -2271,7 +2344,7 @@ mod tests {
         .unwrap();
 
         let err = client.call_async("step", b"payload").await.unwrap_err();
-        assert!(matches!(err, HttpError::ServerError(503, _)));
+        assert!(matches!(err, HttpError::ResponseError(503, _)));
         assert_eq!(
             resolve_count.load(Ordering::SeqCst),
             1,
@@ -2319,7 +2392,7 @@ mod tests {
             .call_controlled_async(
                 "step",
                 Arc::new(b"payload".to_vec()),
-                &HttpCallControl::new(|| Ok(()), |_| Ok(())),
+                &HttpCallControl::new(|| Ok(()), || Ok(())),
             )
             .await
             .expect_err("dispatch-uncertain relay failure");

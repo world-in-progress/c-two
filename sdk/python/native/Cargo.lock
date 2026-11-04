@@ -126,6 +126,7 @@ dependencies = [
  "c2-config",
  "c2-contract",
  "c2-error",
+ "c2-mem",
  "futures",
  "parking_lot",
  "percent-encoding",

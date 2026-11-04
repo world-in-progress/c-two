@@ -420,6 +420,9 @@ impl PyRuntimeSession {
         if let Some(observer) = self.inner.outgoing_memory_observer() {
             pending.push_scope(c2_core::scope::RUNTIME_OUTGOING, observer);
         }
+        if let Some(observer) = self.inner.payload_buffer_observer() {
+            pending.push_payload_buffer(observer);
+        }
         if let Some(host) = self.host.lock().host.as_ref() {
             pending.push_scope(c2_core::scope::SERVER, host.server_memory_observer());
         }
@@ -509,7 +512,7 @@ impl PyRuntimeSession {
     }
 
     #[new]
-    #[pyo3(signature = (server_id=None, server_ipc_overrides=None, client_ipc_overrides=None, shm_threshold=None, remote_payload_chunk_size=None, use_process_relay_anchor=true, max_outstanding_calls=None, retained_input_budget_bytes=None, startup_timeout=None))]
+    #[pyo3(signature = (server_id=None, server_ipc_overrides=None, client_ipc_overrides=None, shm_threshold=None, remote_payload_chunk_size=None, use_process_relay_anchor=true, max_outstanding_calls=None, payload_buffer_budget_bytes=None, startup_timeout=None))]
     #[allow(clippy::too_many_arguments)] // PyO3 signature is the existing Python call boundary.
     fn new(
         server_id: Option<String>,
@@ -519,7 +522,7 @@ impl PyRuntimeSession {
         remote_payload_chunk_size: Option<u64>,
         use_process_relay_anchor: bool,
         max_outstanding_calls: Option<u64>,
-        retained_input_budget_bytes: Option<u64>,
+        payload_buffer_budget_bytes: Option<u64>,
         startup_timeout: Option<f64>,
     ) -> PyResult<Self> {
         let server_ipc_overrides = server_ipc_overrides
@@ -545,9 +548,9 @@ impl PyRuntimeSession {
         .map_err(runtime_configuration_error_to_py)?;
         let call_execution_overrides = c2_config::CallExecutionLimitsOverrides {
             max_outstanding_calls,
-            retained_input_budget_bytes,
+            payload_buffer_budget_bytes,
         };
-        if max_outstanding_calls.is_some() || retained_input_budget_bytes.is_some() {
+        if max_outstanding_calls.is_some() || payload_buffer_budget_bytes.is_some() {
             inner
                 .set_call_execution_limits(call_execution_overrides.clone())
                 .map_err(lifecycle_error_to_py)?;
@@ -665,15 +668,15 @@ impl PyRuntimeSession {
         local_copy_stats_dict(py, &self.merged_local_copy_stats())
     }
 
-    #[pyo3(signature = (*, max_outstanding_calls=None, retained_input_budget_bytes=None))]
+    #[pyo3(signature = (*, max_outstanding_calls=None, payload_buffer_budget_bytes=None))]
     fn set_call_execution_limits(
         &self,
         max_outstanding_calls: Option<u64>,
-        retained_input_budget_bytes: Option<u64>,
+        payload_buffer_budget_bytes: Option<u64>,
     ) -> PyResult<()> {
         let overrides = c2_config::CallExecutionLimitsOverrides {
             max_outstanding_calls,
-            retained_input_budget_bytes,
+            payload_buffer_budget_bytes,
         };
         self.inner
             .set_call_execution_limits(overrides)
@@ -689,8 +692,8 @@ impl PyRuntimeSession {
         let dict = PyDict::new(py);
         dict.set_item("max_outstanding_calls", overrides.max_outstanding_calls)?;
         dict.set_item(
-            "retained_input_budget_bytes",
-            overrides.retained_input_budget_bytes,
+            "payload_buffer_budget_bytes",
+            overrides.payload_buffer_budget_bytes,
         )?;
         Ok(dict)
     }
@@ -749,7 +752,7 @@ impl PyRuntimeSession {
     /// until that scope exists (a scope that was never frozen stays
     /// ``None``).
     ///
-    /// The three budget cells are independent accounting scopes, not process
+    /// The budget cells are independent accounting scopes, not process
     /// RSS; their sum must never be read as physical memory usage.
     fn memory_stats<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
         let stats = match self.host.lock().host.as_ref() {
@@ -782,6 +785,23 @@ impl PyRuntimeSession {
                 .collect::<PyResult<Vec<_>>>()?,
         )?;
         dict.set_item("retired", retired_list)?;
+        dict.set_item(
+            "payload_buffer",
+            match stats.payload_buffer.as_ref() {
+                Some(cell) => memory_cell_dict(py, cell)?.into_any(),
+                None => py.None().into_bound(py),
+            },
+        )?;
+        dict.set_item(
+            "retired_payload_buffers",
+            PyList::new(
+                py,
+                RetiredMemoryObservation::compose_payload_buffer_reports(&retired)
+                    .iter()
+                    .map(|cell| memory_cell_dict(py, cell))
+                    .collect::<PyResult<Vec<_>>>()?,
+            )?,
+        )?;
         dict.set_item(
             "holds",
             local_copy_stats_dict(py, &self.merged_local_copy_stats())?,

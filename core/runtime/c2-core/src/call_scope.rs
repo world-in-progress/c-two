@@ -317,6 +317,7 @@ impl CallScope {
 mod tests {
     use super::*;
     use c2_config::{CallExecutionLimits, CallTimeout};
+    use c2_mem::retention::PayloadBufferReservation;
     use c2_mem::{RetentionBudget, RetentionPermit};
     use std::sync::Barrier;
     use std::sync::atomic::AtomicUsize;
@@ -1057,6 +1058,7 @@ mod tests {
     struct FakePayloadOwner {
         releases: Arc<AtomicUsize>,
         _permit: RetentionPermit,
+        _reservation: PayloadBufferReservation,
     }
 
     impl Drop for FakePayloadOwner {
@@ -1071,12 +1073,13 @@ mod tests {
         for (dispatched, expire) in [(false, false), (true, false), (false, true), (true, true)] {
             let budget = RetentionBudget::from_call_limits(&CallExecutionLimits {
                 max_outstanding_calls: 1,
-                retained_input_budget_bytes: 64,
+                payload_buffer_budget_bytes: 64,
             });
             let releases = Arc::new(AtomicUsize::new(0));
             let owner = FakePayloadOwner {
                 releases: releases.clone(),
-                _permit: budget.reserve(64).unwrap(),
+                _permit: budget.reserve().unwrap(),
+                _reservation: budget.payload_budget().reserve_blocking(64, None).unwrap(),
             };
             let scope = bounded(start, Duration::from_secs(1));
             let guard = scope.clone();
@@ -1116,7 +1119,8 @@ mod tests {
         let budget = RetentionBudget::new(1, 64);
         let owner = FakePayloadOwner {
             releases: releases.clone(),
-            _permit: budget.reserve(64).unwrap(),
+            _permit: budget.reserve().unwrap(),
+            _reservation: budget.payload_budget().reserve_blocking(64, None).unwrap(),
         };
         apply(&scope, Operation::BeginDispatch, start).unwrap();
         apply(&scope, Operation::CompleteSuccess, start).unwrap();

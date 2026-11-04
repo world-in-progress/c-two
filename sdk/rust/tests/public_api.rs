@@ -637,7 +637,7 @@ fn finite_call_configuration_is_consumed_through_the_sdk_facade() {
                 env_file: EnvFilePolicy::Disabled,
                 process_env: EnvMap::from([
                     ("C2_CALL_MAX_OUTSTANDING".into(), "3".into()),
-                    ("C2_CALL_RETAINED_INPUT_BUDGET_BYTES".into(), "17".into()),
+                    ("C2_CALL_PAYLOAD_BUFFER_BUDGET_BYTES".into(), "17".into()),
                 ]),
             },
         )
@@ -658,7 +658,7 @@ fn finite_call_configuration_is_consumed_through_the_sdk_facade() {
         .set_call_execution_limits_with_sources(
             CallExecutionLimitsOverrides {
                 max_outstanding_calls: Some(limits.max_outstanding_calls),
-                retained_input_budget_bytes: Some(limits.retained_input_budget_bytes),
+                payload_buffer_budget_bytes: Some(limits.payload_buffer_budget_bytes),
             },
             ConfigSources::empty(),
         )
@@ -803,7 +803,7 @@ fn preparation_fixture(
         .set_call_execution_limits_with_sources(
             CallExecutionLimitsOverrides {
                 max_outstanding_calls: Some(slots),
-                retained_input_budget_bytes: Some(bytes),
+                payload_buffer_budget_bytes: Some(bytes),
             },
             ConfigSources::empty(),
         )
@@ -891,11 +891,11 @@ fn sdk_preparation_rejects_zero_deadline_and_capacity_before_factories_and_busin
             .with_call_options(CallOptions::with_timeout(CallTimeout::Unlimited))
             .begin_call("echo")
             .unwrap()
-            .encode_vec(vec![42])
+            .encode_vec(Vec::new())
             .unwrap()
             .call_owned()
             .unwrap(),
-        vec![42]
+        Vec::<u8>::new()
     );
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     assert_eq!(
@@ -959,7 +959,7 @@ fn sdk_preparation_charges_before_copy_and_keeps_the_original_serialization_dead
         runtime.set_call_execution_limits_with_sources(
             CallExecutionLimitsOverrides {
                 max_outstanding_calls: Some(2),
-                retained_input_budget_bytes: Some(8)
+                payload_buffer_budget_bytes: Some(8)
             },
             ConfigSources::empty(),
         ),

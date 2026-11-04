@@ -430,10 +430,35 @@ fn semantic_route_error<const N: usize>(
 pub fn normalize_http_error(error: HttpError, phase: TransportPhase) -> Error {
     match error {
         HttpError::LocalCallRejected(error) => Error::Semantic(error),
-        HttpError::CrmError(bytes) => normalize_ipc_semantic_bytes(&bytes),
-        HttpError::ServerError(_, body) => normalize_http_semantic_body(&body),
+        HttpError::CrmError(bytes) => normalize_ipc_semantic_bytes(bytes.as_ref()),
+        HttpError::ResponseError(_, bytes) => match std::str::from_utf8(bytes.as_ref()) {
+            Ok(body) => normalize_http_call_semantic_body(body, phase),
+            Err(error) => Error::Semantic(protocol_violation(
+                "HTTP semantic error envelope is malformed",
+                "http",
+                &error.to_string(),
+            )),
+        },
+        HttpError::ServerError(_, body) => normalize_http_call_semantic_body(&body, phase),
         transport => Error::Transport(TransportError::new(phase, TransportKind::Http, transport)),
     }
+}
+
+fn normalize_http_call_semantic_body(body: &str, phase: TransportPhase) -> Error {
+    let mut error = normalize_http_semantic_body(body);
+    if let Error::Semantic(semantic) = &mut error
+        && semantic.code == ErrorCode::CallCapacityExceeded
+        && phase == TransportPhase::PreDispatch
+        && semantic
+            .details
+            .get("dispatch_phase")
+            .is_some_and(|phase| phase == "pre_dispatch")
+    {
+        semantic
+            .details
+            .insert("transport_phase".into(), "pre_dispatch".into());
+    }
+    error
 }
 
 /// Decode canonical C2E1 bytes into the semantic error authority.

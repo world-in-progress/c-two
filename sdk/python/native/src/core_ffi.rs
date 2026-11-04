@@ -122,35 +122,51 @@ impl PyNativePreparedCall {
 
 #[pymethods]
 impl PyNativePreparedCall {
-    fn charge_input(&self, nbytes: u64) -> PyResult<()> {
-        let mut inner = self.inner.lock();
-        inner
-            .as_mut()
+    fn charge_input(&self, py: Python<'_>, nbytes: u64) -> PyResult<()> {
+        // Reattach only after dropping the preparation lock, including errors.
+        let result = py.detach(|| {
+            self.inner
+                .lock()
+                .as_mut()
+                .map(|prepared| prepared.charge_input(nbytes))
+        });
+        result
             .ok_or_else(|| {
                 PyValueError::new_err("prepared call has already been consumed or closed")
             })?
-            .charge_input(nbytes)
             .map_err(core_error_to_py)
     }
 
     fn call(&self, py: Python<'_>, data: &Bound<'_, PyAny>) -> PyResult<PyCoreResponse> {
-        let mut prepared = self.take()?;
-        if let Ok(bytes) = data.cast_exact::<PyBytes>() {
-            let nbytes = bytes.as_bytes().len();
+        let mut prepared = py.detach(|| self.take())?;
+        let bytes_input = data
+            .cast_exact::<PyBytes>()
+            .ok()
+            .map(|bytes| (bytes.as_bytes().len(), bytes.clone().unbind()));
+        if let Some((nbytes, owner)) = bytes_input {
+            // Budget admission can wait. Keep no Python borrow or buffer export
+            // across that wait, and do not copy until the reservation succeeds.
+            prepared = py
+                .detach(move || {
+                    prepared.charge_input(nbytes as u64)?;
+                    Ok::<_, c2_core::Error>(prepared)
+                })
+                .map_err(core_error_to_py)?;
             // Exact built-in bytes have no user finalizer; their storage is immutable; the strong Py owner is Send and pins its
             // storage until the Core-owned factory finishes. The owner is
             // accessed under the GIL, the native copy detaches, and no Python
             // callback runs on the Core execution worker.
-            let owner = bytes.clone().unbind();
-            let encoded = prepared
-                .encode(nbytes, move || {
-                    Ok(Python::attach(|py| {
-                        let bytes = owner.bind(py).as_bytes();
-                        // Immutable bytes remain pinned by owner while the native
-                        // copy releases the GIL. The expired waiter can reacquire
-                        // Python independently of a still-running native copy.
-                        py.detach(|| bytes.to_vec())
-                    }))
+            let encoded = py
+                .detach(move || {
+                    prepared.encode(nbytes, move || {
+                        Ok(Python::attach(|py| {
+                            let bytes = owner.bind(py).as_bytes();
+                            // Immutable bytes remain pinned by owner while the native
+                            // copy releases the GIL. The expired waiter can reacquire
+                            // Python independently of a still-running native copy.
+                            py.detach(|| bytes.to_vec())
+                        }))
+                    })
                 })
                 .map_err(core_error_to_py)?;
             return Self::finish(py, encoded);
@@ -158,18 +174,31 @@ impl PyNativePreparedCall {
         // A read-only memoryview can still alias mutable backing. Snapshot all
         // non-bytes buffers on the caller under the GIL after native charging;
         // no raw borrowed pointer or mutable exporter crosses the handoff.
-        let buffer = PyBuffer::<u8>::get(data)?;
-        prepared
-            .charge_input(buffer.len_bytes() as u64)
+        let nbytes = PyBuffer::<u8>::get(data)?.len_bytes();
+        prepared = py
+            .detach(move || {
+                prepared.charge_input(nbytes as u64)?;
+                Ok::<_, c2_core::Error>(prepared)
+            })
             .map_err(core_error_to_py)?;
+        let buffer = PyBuffer::<u8>::get(data)?;
+        if buffer.len_bytes() != nbytes {
+            return Err(PyValueError::new_err(
+                "buffer size changed during payload-budget admission",
+            ));
+        }
         let request = snapshot_python_buffer(py, &buffer)?;
-        let encoded = prepared.encode_vec(request).map_err(core_error_to_py)?;
+        let encoded = py
+            .detach(move || prepared.encode_vec(request))
+            .map_err(core_error_to_py)?;
         Self::finish(py, encoded)
     }
 
-    fn close(&self) {
-        let closed = self.inner.lock().take();
-        drop(closed);
+    fn close(&self, py: Python<'_>) {
+        py.detach(|| {
+            let closed = self.inner.lock().take();
+            drop(closed);
+        });
     }
 }
 

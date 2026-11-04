@@ -735,6 +735,7 @@ impl Host {
             server: Some(crate::MemoryScopeStats::from_server(
                 self.inner.server.memory_budget_snapshot(),
             )),
+            payload_buffer: self.inner.runtime.payload_buffer_stats(),
         }
     }
 

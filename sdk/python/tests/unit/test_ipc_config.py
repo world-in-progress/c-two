@@ -671,7 +671,7 @@ class _FakeRuntimeSession:
         self,
         *,
         max_outstanding_calls: int | None = None,
-        retained_input_budget_bytes: int | None = None,
+        payload_buffer_budget_bytes: int | None = None,
         **_kwargs,
     ) -> None:
         from c_two._native import resolve_local_endpoint_context
@@ -680,7 +680,7 @@ class _FakeRuntimeSession:
         self._limits = {
             key: value for key, value in (
                 ('max_outstanding_calls', max_outstanding_calls),
-                ('retained_input_budget_bytes', retained_input_budget_bytes),
+                ('payload_buffer_budget_bytes', payload_buffer_budget_bytes),
             ) if value is not None
         }
         self.adopted_observations: list[_FakeRetiredObservation] = []
@@ -776,7 +776,7 @@ def test_relay_resolved_connect_delegates_route_validation_to_runtime_session(mo
 def test_route_spy_shutdown_preserves_native_context_and_accepted_limits(monkeypatch):
     registry = _get_default_runtime()
     installed = _FakeRuntimeSession(
-        max_outstanding_calls=7, retained_input_budget_bytes=8192,
+        max_outstanding_calls=7, payload_buffer_budget_bytes=8192,
     )
     captured = installed.local_endpoint_context()
 
@@ -787,7 +787,7 @@ def test_route_spy_shutdown_preserves_native_context_and_accepted_limits(monkeyp
         assert replacement is not installed
         assert replacement.local_endpoint_context() is captured
         assert replacement.call_execution_limits_overrides == {
-            'max_outstanding_calls': 7, 'retained_input_budget_bytes': 8192,
+            'max_outstanding_calls': 7, 'payload_buffer_budget_bytes': 8192,
         }
         assert len(replacement.adopted_observations) == 1
         assert isinstance(replacement.adopted_observations[0], _FakeRetiredObservation)

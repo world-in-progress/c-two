@@ -76,15 +76,15 @@ fn assert_local_source(error: &HttpError) {
 }
 
 fn allowed() -> HttpCallControl {
-    HttpCallControl::new(|| Ok(()), |_| Ok(()))
+    HttpCallControl::new(|| Ok(()), || Ok(()))
 }
 
 fn record_dispatches(phases: &Arc<Mutex<Vec<Option<HttpCallPhase>>>>) -> HttpCallControl {
     let phases = Arc::clone(phases);
     HttpCallControl::new(
         || Ok(()),
-        move |phase| {
-            phases.lock().push(phase);
+        move || {
+            phases.lock().push(None);
             Ok(())
         },
     )
@@ -262,7 +262,7 @@ async fn initial_active_guard_preserves_error_without_resolve_or_post() {
     let dispatch_count = Arc::clone(&dispatches);
     let control = HttpCallControl::new(
         || Err(rejected()),
-        move |_| {
+        move || {
             dispatch_count.fetch_add(1, Ordering::SeqCst);
             Ok(())
         },
@@ -284,13 +284,7 @@ async fn dispatch_guard_rejection_keeps_resolved_route_for_later_call() {
     let server = data_server(&data).await;
     let (registry, resolves) = registry(&[&server.url], None).await;
     let client = client(&registry);
-    let control = HttpCallControl::new(
-        || Ok(()),
-        |phase| {
-            assert_eq!(phase, None);
-            Err(rejected())
-        },
-    );
+    let control = HttpCallControl::new(|| Ok(()), || Err(rejected()));
     let error = client
         .call_controlled_async("step", Arc::new(b"rejected".to_vec()), &control)
         .await
@@ -302,7 +296,7 @@ async fn dispatch_guard_rejection_keeps_resolved_route_for_later_call() {
         .call_controlled_async("step", Arc::new(b"allowed".to_vec()), &allowed())
         .await
         .unwrap();
-    assert_eq!(output, b"allowed");
+    assert_eq!(output.as_ref(), b"allowed");
     assert_eq!(resolves.load(Ordering::SeqCst), 1);
     assert_eq!(data.calls.load(Ordering::SeqCst), 1);
 }
@@ -328,7 +322,7 @@ async fn owner_deadline_rejection_after_route_wait_never_dispatches() {
                 Ok(())
             }
         },
-        move |_| {
+        move || {
             dispatch_count.fetch_add(1, Ordering::SeqCst);
             Ok(())
         },
@@ -348,7 +342,7 @@ async fn owner_deadline_rejection_after_route_wait_never_dispatches() {
 }
 
 #[tokio::test]
-async fn authoritative_stale_post_retries_with_predispatch_proof() {
+async fn authoritative_stale_post_reports_predispatch_without_retaining_replay_input() {
     let stale = Data::new(Reply::Stale);
     let live = Data::new(Reply::Echo);
     let stale_server = data_server(&stale).await;
@@ -357,20 +351,20 @@ async fn authoritative_stale_post_retries_with_predispatch_proof() {
     let phases = Arc::new(Mutex::new(Vec::new()));
     let control = record_dispatches(&phases);
     let client = client(&registry);
-    let output = client
+    let error = client
         .call_controlled_async("step", Arc::new(b"same-input".to_vec()), &control)
         .await
-        .unwrap();
+        .unwrap_err();
 
-    assert_eq!(output, b"same-input");
-    assert_eq!(*phases.lock(), vec![None, Some(HttpCallPhase::PreDispatch)]);
+    assert_eq!(error.phase(), HttpCallPhase::PreDispatch);
+    assert_eq!(*phases.lock(), vec![None]);
     assert_eq!(stale.calls.load(Ordering::SeqCst), 1);
-    assert_eq!(live.calls.load(Ordering::SeqCst), 1);
-    assert_eq!(resolves.load(Ordering::SeqCst), 2);
+    assert_eq!(live.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(resolves.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
-async fn retry_dispatch_guard_can_reject_without_sending_next_post() {
+async fn consumed_input_does_not_enter_a_second_dispatch_guard() {
     let stale = Data::new(Reply::Stale);
     let live = Data::new(Reply::Echo);
     let stale_server = data_server(&stale).await;
@@ -380,13 +374,9 @@ async fn retry_dispatch_guard_can_reject_without_sending_next_post() {
     let observed = Arc::clone(&phases);
     let control = HttpCallControl::new(
         || Ok(()),
-        move |phase| {
-            observed.lock().push(phase);
-            if phase.is_some() {
-                Err(rejected())
-            } else {
-                Ok(())
-            }
+        move || {
+            observed.lock().push(None::<HttpCallPhase>);
+            Ok(())
         },
     );
     let error = client(&registry)
@@ -394,8 +384,8 @@ async fn retry_dispatch_guard_can_reject_without_sending_next_post() {
         .await
         .unwrap_err();
 
-    assert_local(&error);
-    assert_eq!(*phases.lock(), vec![None, Some(HttpCallPhase::PreDispatch)]);
+    assert_eq!(error.phase(), HttpCallPhase::PreDispatch);
+    assert_eq!(*phases.lock(), vec![None]);
     assert_eq!(stale.calls.load(Ordering::SeqCst), 1);
     assert_eq!(live.calls.load(Ordering::SeqCst), 0);
 }
@@ -418,12 +408,12 @@ async fn uncertain_and_crm_failures_never_retry_or_forge_proof() {
         match reply {
             Reply::Crm => {
                 assert!(
-                    matches!(error.source_error(), HttpError::CrmError(bytes) if bytes == b"crm-failure")
+                    matches!(error.source_error(), HttpError::CrmError(bytes) if bytes.as_ref() == b"crm-failure")
                 );
             }
             _ => assert!(matches!(
                 error.source_error(),
-                HttpError::ServerError(502, _)
+                HttpError::ResponseError(502, _)
             )),
         }
         assert_eq!(*phases.lock(), vec![None]);
@@ -495,7 +485,7 @@ async fn assert_capacity_preserves_route(reply: Reply, status: u16) {
         .await
         .unwrap_err();
 
-    assert!(matches!(error.source_error(), HttpError::ServerError(code, _) if *code == status));
+    assert!(matches!(error.source_error(), HttpError::ResponseError(code, _) if *code == status));
     assert_eq!(error.phase(), HttpCallPhase::DispatchUncertain);
     assert_eq!(data.calls.load(Ordering::SeqCst), 1);
     *data.reply.lock() = Reply::Echo;
@@ -503,7 +493,8 @@ async fn assert_capacity_preserves_route(reply: Reply, status: u16) {
         client
             .call_controlled_async("step", Arc::new(vec![2]), &control)
             .await
-            .unwrap(),
+            .unwrap()
+            .as_ref(),
         vec![2]
     );
     assert_eq!(*phases.lock(), vec![None, None]);
@@ -535,8 +526,8 @@ async fn concurrent_calls_keep_their_control_hooks_independent() {
     let observed = Arc::clone(&bad_phases);
     let bad = HttpCallControl::new(
         || Ok(()),
-        move |phase| {
-            observed.lock().push(phase);
+        move || {
+            observed.lock().push(None::<HttpCallPhase>);
             Err(rejected())
         },
     );
@@ -551,7 +542,7 @@ async fn concurrent_calls_keep_their_control_hooks_independent() {
     };
     let (good_result, bad_result) = tokio::join!(good_call, reject_other_call);
 
-    assert_eq!(good_result.unwrap(), b"good");
+    assert_eq!(good_result.unwrap().as_ref(), b"good");
     assert_local(&bad_result.unwrap_err());
     assert_eq!(*good_phases.lock(), vec![None]);
     assert_eq!(*bad_phases.lock(), vec![None]);
@@ -605,7 +596,7 @@ async fn owned_payloads_preserve_content_length_contract_headers_and_contents() 
             .call_controlled_async("step", input, &allowed())
             .await
             .unwrap();
-        assert_eq!(result, expected);
+        assert_eq!(result.as_ref(), expected);
         let received = data.received.lock();
         let (headers, body) = received.last().unwrap();
         assert_headers(headers, len);
@@ -634,14 +625,10 @@ async fn test_owned_driver_finishes_after_application_waiter_leaves() {
                 Ok(())
             }
         },
-        |phase| {
-            assert_eq!(phase, None);
-            Ok(())
-        },
+        || Ok(()),
     );
     let len = 64 * 1024 + 7;
     let input = Arc::new(vec![9; len]);
-    let pointer = input.as_ptr();
     let weak = Arc::downgrade(&input);
     let (application_sender, application_waiter) = tokio::sync::oneshot::channel();
     // Only this test supplies an owned driver, as the future Core caller will.
@@ -657,11 +644,10 @@ async fn test_owned_driver_finishes_after_application_waiter_leaves() {
     gate.entered.notified().await;
     drop(application_waiter);
     expired.store(true, Ordering::SeqCst);
-    {
-        let retained = weak.upgrade().expect("dispatched task retains its input");
-        assert_eq!(retained.as_ptr(), pointer);
-        assert_eq!(retained.len(), len);
-    }
+    assert!(
+        weak.strong_count() <= 1,
+        "there is no second owner retained for a replay"
+    );
     gate.resume.notify_one();
 
     assert!(
@@ -805,7 +791,8 @@ async fn response_message_limit_covers_success_crm_and_other_errors_before_eof()
                     client
                         .call_controlled_async("good", Arc::new(vec![2]), &allowed())
                         .await
-                        .unwrap(),
+                        .unwrap()
+                        .as_ref(),
                     b"12345678"
                 );
                 assert_eq!(calls.load(Ordering::SeqCst), 2);
@@ -838,7 +825,7 @@ async fn response_message_limit_also_covers_borrowed_legacy_calls() {
 
 struct ReservedResponseInput {
     bytes: Vec<u8>,
-    _permit: c2_mem::RetentionPermit,
+    _permit: c2_mem::retention::PayloadBufferReservation,
 }
 
 impl AsRef<[u8]> for ReservedResponseInput {
@@ -848,7 +835,7 @@ impl AsRef<[u8]> for ReservedResponseInput {
 }
 
 #[tokio::test]
-async fn late_response_limit_keeps_owned_input_until_real_driver_completion() {
+async fn late_response_limit_keeps_only_actual_request_reader_and_native_driver() {
     for status in [
         StatusCode::OK,
         StatusCode::INTERNAL_SERVER_ERROR,
@@ -865,10 +852,10 @@ async fn late_response_limit_keeps_owned_input_until_real_driver_completion() {
         })
         .await;
         let client = Arc::new(client);
-        let budget = c2_mem::RetentionBudget::new(1, 4);
+        let budget = c2_mem::retention::PayloadBufferBudget::new(4);
         let input = Arc::new(ReservedResponseInput {
             bytes: vec![1; 4],
-            _permit: budget.reserve(4).unwrap(),
+            _permit: budget.reserve(4).await.unwrap(),
         });
         let weak = Arc::downgrade(&input);
         let expired = Arc::new(AtomicBool::new(false));
@@ -884,7 +871,7 @@ async fn late_response_limit_keeps_owned_input_until_real_driver_completion() {
                     Ok(())
                 }
             },
-            |_| Ok(()),
+            || Ok(()),
         );
         let driver_client = client.clone();
         let (delivery, waiter) = tokio::sync::oneshot::channel();
@@ -904,14 +891,25 @@ async fn late_response_limit_keeps_owned_input_until_real_driver_completion() {
         );
         expired.store(true, Ordering::SeqCst);
         let checks_at_expiry = active_checks.load(Ordering::SeqCst);
-        assert!(weak.upgrade().is_some());
-        assert_eq!(budget.snapshot().used_operations, 1);
-        assert_eq!(budget.snapshot().used_retained_bytes, 4);
+        let actual_reader = weak.upgrade();
+        assert!(
+            weak.strong_count() <= if actual_reader.is_some() { 2 } else { 0 },
+            "only the transport reader and this observation may retain input"
+        );
+        if actual_reader.is_some() {
+            assert_eq!(
+                budget.snapshot().used_bytes,
+                4,
+                "live transport storage remains billed"
+            );
+        }
+        drop(actual_reader);
         assert_eq!(
             client
                 .call_controlled_async("good", Arc::new(vec![2]), &allowed())
                 .await
-                .unwrap(),
+                .unwrap()
+                .as_ref(),
             b"12345678"
         );
         late.resume.notify_one();
@@ -931,8 +929,7 @@ async fn late_response_limit_keeps_owned_input_until_real_driver_completion() {
             "dispatched response must not recheck caller deadline"
         );
         assert!(weak.upgrade().is_none());
-        assert_eq!(budget.snapshot().used_operations, 0);
-        assert_eq!(budget.snapshot().used_retained_bytes, 0);
+        assert_eq!(budget.snapshot().used_bytes, 0);
         assert_eq!(
             calls.load(Ordering::SeqCst),
             2,
@@ -976,7 +973,7 @@ async fn check_response_reader(status: u16, known_length: bool) {
     let polls = Arc::new(AtomicUsize::new(0));
     let result = tokio::time::timeout(
         std::time::Duration::from_millis(100),
-        crate::payload::read_http_response(
+        read_response(
             response_from_chunks(status, known_length, polls.clone()),
             RESPONSE_LIMIT,
         ),
@@ -1044,12 +1041,12 @@ async fn response_reader_preserves_compliant_bodies_and_uses_actual_body_hint() 
                     .body(body)
                     .unwrap()
                     .into();
-                let result = crate::payload::read_http_response(response, RESPONSE_LIMIT).await;
+                let result = read_response(response, RESPONSE_LIMIT).await;
                 match (status, result) {
-                    (200, Ok(bytes)) => assert_eq!(bytes, expected),
-                    (500, Err(HttpError::CrmError(bytes))) => assert_eq!(bytes, expected),
-                    (502, Err(HttpError::ServerError(502, text))) => {
-                        assert_eq!(text.as_bytes(), expected)
+                    (200, Ok(bytes)) => assert_eq!(bytes.as_ref(), expected),
+                    (500, Err(HttpError::CrmError(bytes))) => assert_eq!(bytes.as_ref(), expected),
+                    (502, Err(HttpError::ResponseError(502, text))) => {
+                        assert_eq!(text.as_ref(), expected)
                     }
                     (_, other) => panic!("unexpected compliant result: {other:?}"),
                 }
@@ -1067,15 +1064,13 @@ async fn response_reader_preserves_compliant_bodies_and_uses_actual_body_hint() 
         .into();
     assert_eq!(response.content_length(), Some(0));
     assert!(
-        matches!(crate::payload::read_http_response(response, RESPONSE_LIMIT).await, Err(HttpError::ServerError(304, text)) if text.is_empty())
+        matches!(read_response(response, RESPONSE_LIMIT).await, Err(HttpError::ResponseError(304, text)) if text.is_empty())
     );
 
     for len in [0, 1] {
         let response: reqwest::Response =
             axum::http::Response::new(reqwest::Body::from(vec![0; len])).into();
-        let bytes = crate::payload::read_http_response(response, u64::MAX)
-            .await
-            .unwrap();
+        let bytes = read_response(response, u64::MAX).await.unwrap();
         assert_eq!(bytes.len(), len);
         assert!(
             bytes.capacity() < 1024,
@@ -1116,7 +1111,51 @@ async fn response_content_length_metadata_can_exceed_limit_for_legal_empty_body(
     assert_eq!(response.headers()["content-length"], "999999");
     assert_eq!(response.content_length(), Some(0));
     assert!(
-        matches!(crate::payload::read_http_response(response, RESPONSE_LIMIT).await, Err(HttpError::ServerError(304, text)) if text.is_empty())
+        matches!(read_response(response, RESPONSE_LIMIT).await, Err(HttpError::ResponseError(304, text)) if text.is_empty())
     );
     server.await.unwrap();
+}
+
+async fn read_response(
+    response: reqwest::Response,
+    max: u64,
+) -> Result<c2_mem::retention::BudgetedBuffer, HttpError> {
+    let budget =
+        c2_mem::retention::PayloadBufferBudget::new(c2_config::DEFAULT_PAYLOAD_BUFFER_BUDGET_BYTES);
+    crate::payload::read_http_response(response, max, &budget, None).await
+}
+
+#[tokio::test]
+async fn completed_request_budget_is_reused_by_its_known_length_response() {
+    let data = Data::new(Reply::Echo);
+    let server = data_server(&data).await;
+    let (registry, _) = registry(&[&server.url], None).await;
+    let budget = c2_mem::retention::PayloadBufferBudget::new(7);
+    let input = Arc::new(ReservedResponseInput {
+        bytes: vec![7; 7],
+        _permit: budget.reserve(7).await.unwrap(),
+    });
+    let control = allowed().with_payload_budget(budget.clone(), None);
+    let client = RelayAwareHttpClient::new(
+        &registry.url,
+        expected(),
+        false,
+        RelayAwareClientConfig {
+            remote_payload_chunk_size: 3,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        client.call_controlled_async("step", input, &control),
+    )
+    .await
+    .expect("the request's ended reader must not block response admission")
+    .unwrap();
+    assert_eq!(output.as_ref(), &[7; 7]);
+    assert_eq!(budget.snapshot().used_bytes, 7);
+    assert_eq!(budget.snapshot().peak_bytes, 7);
+    drop(output);
+    assert_eq!(budget.snapshot().used_bytes, 0);
 }

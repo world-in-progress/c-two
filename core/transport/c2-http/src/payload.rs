@@ -1,4 +1,8 @@
+use c2_mem::retention::{
+    BudgetedBuffer, PayloadBufferBudget, PayloadBufferError, PayloadBufferReservation,
+};
 use std::convert::Infallible;
+use std::time::Instant;
 
 use bytes::Bytes;
 use futures::stream;
@@ -55,43 +59,123 @@ fn checked_response_length(
     Ok(length)
 }
 
-// Called only after required length has passed the message-boundary check.
-// Grow from existing capacity, never from Content-Length or the whole limit.
-fn response_growth_capacity(current: usize, required: usize, max_payload_size: u64) -> usize {
-    let ceiling = usize::try_from(max_payload_size).unwrap_or(usize::MAX);
-    current
-        .checked_mul(2)
-        .unwrap_or(ceiling)
-        .max(required)
-        .min(ceiling)
+pub(crate) fn payload_budget_error(error: PayloadBufferError, phase: &str) -> HttpError {
+    let deadline = matches!(error, PayloadBufferError::DeadlineExceeded);
+    HttpError::LocalCallRejected(
+        c2_error::C2Error::new(
+            if deadline {
+                c2_error::ErrorCode::CallDeadlineExceeded
+            } else {
+                c2_error::ErrorCode::CallCapacityExceeded
+            },
+            error.to_string(),
+        )
+        .with_details(std::collections::BTreeMap::from([
+            ("transport".into(), "http".into()),
+            ("transport_phase".into(), phase.into()),
+            ("stage".into(), "payload_buffer_admission".into()),
+            ("fallback_eligible".into(), "false".into()),
+        ])),
+    )
 }
 
-fn append_response_chunk(
-    body: &mut Vec<u8>,
-    chunk: &[u8],
-    max_payload_size: u64,
-) -> Result<(), c2_error::C2Error> {
-    let length = checked_response_length(body.len(), chunk.len(), max_payload_size)?;
-    if length > body.capacity() {
-        let capacity = response_growth_capacity(body.capacity(), length, max_payload_size);
-        // Request the capped geometric target exactly; Vec's own growth policy
-        // must not add another doubling beyond the native message ceiling.
-        body.try_reserve_exact(capacity - body.len()).map_err(|_| {
-            response_protocol_error(
-                "response_payload_allocation_failed",
-                max_payload_size,
-                length.to_string(),
-            )
-        })?;
+pub(crate) async fn reserve_payload(
+    budget: &PayloadBufferBudget,
+    bytes: u64,
+    deadline: Option<Instant>,
+    phase: &str,
+) -> Result<PayloadBufferReservation, HttpError> {
+    if let Some(deadline) = deadline {
+        tokio::time::timeout_at(
+            tokio::time::Instant::from_std(deadline),
+            budget.reserve(bytes),
+        )
+        .await
+        .map_err(|_| payload_budget_error(PayloadBufferError::DeadlineExceeded, phase))?
+        .map_err(|error| payload_budget_error(error, phase))
+    } else {
+        budget
+            .reserve(bytes)
+            .await
+            .map_err(|error| payload_budget_error(error, phase))
     }
-    body.extend_from_slice(chunk);
-    Ok(())
+}
+
+/// Unknown-length C-Two buffers stay segmented while they grow. Only their
+/// first positive reservation may wait; growth never waits on stored parts.
+#[derive(Default)]
+pub(crate) struct SegmentedPayload {
+    parts: Vec<BudgetedBuffer>,
+    len: usize,
+}
+
+impl SegmentedPayload {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+    pub(crate) fn len(&self) -> usize {
+        self.len
+    }
+
+    pub(crate) async fn push_chunk(
+        &mut self,
+        chunk: &[u8],
+        budget: &PayloadBufferBudget,
+        deadline: Option<Instant>,
+        phase: &str,
+    ) -> Result<(), HttpError> {
+        if chunk.is_empty() {
+            return Ok(());
+        }
+        let reservation = if self.parts.is_empty() {
+            reserve_payload(budget, chunk.len() as u64, deadline, phase).await?
+        } else {
+            budget
+                .try_reserve(chunk.len() as u64)
+                .map_err(|error| payload_budget_error(error, phase))?
+        };
+        self.parts
+            .push(BudgetedBuffer::new(chunk.to_vec(), reservation));
+        self.len += chunk.len();
+        Ok(())
+    }
+
+    #[cfg(feature = "relay")]
+    pub(crate) fn into_segments(self) -> Vec<BudgetedBuffer> {
+        self.parts
+    }
+
+    fn into_contiguous(
+        mut self,
+        budget: &PayloadBufferBudget,
+        phase: &str,
+    ) -> Result<BudgetedBuffer, HttpError> {
+        if self.parts.len() == 1 {
+            return Ok(self.parts.pop().expect("one stored part"));
+        }
+        // A continuous consumer needs a second allocation. Existing parts
+        // remain billed through the copy; insufficient overlap is a rejection.
+        let reservation = budget
+            .try_reserve(self.len as u64)
+            .map_err(|error| payload_budget_error(error, phase))?;
+        let mut bytes = Vec::new();
+        bytes.try_reserve_exact(self.len).map_err(|error| {
+            HttpError::Transport(format!("HTTP response allocation failed: {error}"))
+        })?;
+        for part in self.parts {
+            bytes.extend_from_slice(part.as_ref());
+        }
+        Ok(BudgetedBuffer::new(bytes, reservation))
+    }
 }
 
 pub(crate) async fn read_http_response_body(
     mut response: reqwest::Response,
     max_payload_size: u64,
-) -> Result<Vec<u8>, HttpError> {
+    budget: &PayloadBufferBudget,
+    deadline: Option<Instant>,
+    phase: &str,
+) -> Result<BudgetedBuffer, HttpError> {
     let status = response.status().as_u16();
     let protocol_error = |error: c2_error::C2Error| {
         HttpError::ServerError(
@@ -100,43 +184,89 @@ pub(crate) async fn read_http_response_body(
                 .expect("canonical error envelope is serializable"),
         )
     };
-    // reqwest's content_length is the *body* size hint, not the raw header.
-    // HEAD/304 metadata (and decoded bodies) can legitimately differ from the
-    // header. Never allocate from either hint or the entire configured limit.
-    if let Some(length) = response.content_length()
-        && length > max_payload_size
-    {
-        return Err(protocol_error(response_protocol_error(
-            "response_payload_too_large",
-            max_payload_size,
-            length.to_string(),
-        )));
+    if let Some(length) = response.content_length() {
+        if length > max_payload_size {
+            return Err(protocol_error(response_protocol_error(
+                "response_payload_too_large",
+                max_payload_size,
+                length.to_string(),
+            )));
+        }
+        // Known length is reserved and allocated once, before receiving bytes.
+        let reservation = reserve_payload(budget, length, deadline, phase).await?;
+        let capacity = usize::try_from(length).map_err(|_| {
+            protocol_error(response_protocol_error(
+                "response_payload_length_overflow",
+                max_payload_size,
+                length.to_string(),
+            ))
+        })?;
+        let mut body = Vec::new();
+        body.try_reserve_exact(capacity).map_err(|_| {
+            protocol_error(response_protocol_error(
+                "response_payload_allocation_failed",
+                max_payload_size,
+                length.to_string(),
+            ))
+        })?;
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|error| HttpError::Transport(error.to_string()))?
+        {
+            let next_len = checked_response_length(body.len(), chunk.len(), max_payload_size)
+                .map_err(&protocol_error)?;
+            if next_len > capacity {
+                return Err(protocol_error(response_protocol_error(
+                    "response_content_length_mismatch",
+                    max_payload_size,
+                    next_len.to_string(),
+                )));
+            }
+            body.extend_from_slice(&chunk);
+        }
+        if body.len() != capacity {
+            return Err(protocol_error(response_protocol_error(
+                "response_content_length_mismatch",
+                max_payload_size,
+                body.len().to_string(),
+            )));
+        }
+        return Ok(BudgetedBuffer::new(body, reservation));
     }
-    let mut body = Vec::new();
+    let mut segments = SegmentedPayload::new();
     while let Some(chunk) = response
         .chunk()
         .await
         .map_err(|error| HttpError::Transport(error.to_string()))?
     {
-        append_response_chunk(&mut body, &chunk, max_payload_size).map_err(&protocol_error)?;
+        checked_response_length(segments.len(), chunk.len(), max_payload_size)
+            .map_err(&protocol_error)?;
+        segments.push_chunk(&chunk, budget, deadline, phase).await?;
     }
-    Ok(body)
+    segments.into_contiguous(budget, phase)
 }
 
-// One response reader for every status and both owned/borrowed call paths.
+// Every status retains its received storage until its last actual reader ends.
 pub(crate) async fn read_http_response(
     response: reqwest::Response,
     max_payload_size: u64,
-) -> Result<Vec<u8>, HttpError> {
+    budget: &PayloadBufferBudget,
+    deadline: Option<Instant>,
+) -> Result<BudgetedBuffer, HttpError> {
     let status = response.status().as_u16();
-    let body = read_http_response_body(response, max_payload_size).await?;
+    let body = read_http_response_body(
+        response,
+        max_payload_size,
+        budget,
+        deadline,
+        "dispatch_uncertain",
+    )
+    .await?;
     match status {
         200 => Ok(body),
         500 => Err(HttpError::CrmError(body)),
-        code => Err(HttpError::ServerError(
-            code,
-            String::from_utf8_lossy(&body).into_owned(),
-        )),
+        code => Err(HttpError::ResponseError(code, body)),
     }
 }
 
@@ -161,17 +291,20 @@ pub(crate) fn payload_chunk_ranges(
     })
 }
 
-pub(crate) fn reqwest_body_from_payload(
+pub(crate) async fn reqwest_body_from_payload(
     data: &[u8],
     chunk_size: u64,
+    budget: &PayloadBufferBudget,
+    deadline: Option<Instant>,
 ) -> Result<reqwest::Body, HttpError> {
     let chunk_size = validate_remote_payload_chunk_size(chunk_size)?;
-    if data.len() <= chunk_size {
-        return Ok(reqwest::Body::from(data.to_vec()));
+    let reservation = reserve_payload(budget, data.len() as u64, deadline, "pre_dispatch").await?;
+    let bytes = Bytes::from_owner(BudgetedBuffer::new(data.to_vec(), reservation));
+    if bytes.len() <= chunk_size {
+        return Ok(reqwest::Body::from(bytes));
     }
     Ok(reqwest::Body::wrap_stream(payload_chunks(
-        Bytes::copy_from_slice(data),
-        chunk_size,
+        bytes, chunk_size,
     )))
 }
 
@@ -210,7 +343,10 @@ fn payload_chunks(
         }
         let end = offset.saturating_add(chunk_size).min(len);
         let chunk = bytes.slice(offset..end);
-        Some((Ok::<Bytes, Infallible>(chunk), (bytes, end)))
+        // A declared-length writer need not poll EOF after its final bytes.
+        // Only emitted slices, not an exhausted stream state, retain storage.
+        let remaining = if end == len { Bytes::new() } else { bytes };
+        Some((Ok::<Bytes, Infallible>(chunk), (remaining, end)))
     })
 }
 
@@ -245,6 +381,104 @@ mod tests {
         atomic::{AtomicUsize, Ordering},
     };
 
+    #[cfg(feature = "relay")]
+    #[tokio::test]
+    async fn unknown_response_contiguous_copy_rejects_instead_of_waiting_for_own_storage() {
+        let budget = PayloadBufferBudget::new(8);
+        let chunks = stream::iter([
+            Ok::<_, Infallible>(Bytes::from_static(b"12345")),
+            Ok::<_, Infallible>(Bytes::from_static(b"6")),
+        ]);
+        let response: reqwest::Response =
+            axum::http::Response::new(reqwest::Body::wrap_stream(chunks)).into();
+        let mut read = Box::pin(read_http_response(response, 8, &budget, None));
+        let result = futures::poll!(&mut read);
+        assert!(
+            matches!(result, std::task::Poll::Ready(Err(HttpError::LocalCallRejected(ref error)))
+            if error.code == c2_error::ErrorCode::CallCapacityExceeded)
+        );
+        drop(read);
+        assert_eq!(budget.snapshot().used_bytes, 0);
+        assert_eq!(budget.snapshot().rejected_allocations, 1);
+    }
+
+    #[cfg(feature = "relay")]
+    #[tokio::test]
+    async fn response_budget_waits_before_reading_and_tracks_success_and_errors() {
+        use c2_mem::retention::PayloadBufferBudget;
+        for status in [200, 500, 502] {
+            let budget = PayloadBufferBudget::new(8);
+            let occupied = budget.reserve(8).await.unwrap();
+            let polls = Arc::new(AtomicUsize::new(0));
+            let reads = polls.clone();
+            let stream = stream::once(async move {
+                reads.fetch_add(1, Ordering::SeqCst);
+                Ok::<_, Infallible>(Bytes::from_static(b"response"))
+            });
+            let response: reqwest::Response = axum::http::Response::builder()
+                .status(status)
+                .body(reqwest::Body::wrap_stream(stream))
+                .unwrap()
+                .into();
+            // Unknown length can read a library frame, but cannot copy it before admission.
+            let mut read = Box::pin(read_http_response(response, 8, &budget, None));
+            assert!(futures::poll!(&mut read).is_pending());
+            assert_eq!(budget.snapshot().used_bytes, 8);
+            assert_eq!(budget.snapshot().rejected_allocations, 0);
+            drop(occupied);
+            let result = read.await;
+            assert_eq!(budget.snapshot().used_bytes, 8);
+            match &result {
+                Ok(bytes)
+                | Err(HttpError::CrmError(bytes))
+                | Err(HttpError::ResponseError(_, bytes)) => {
+                    assert_eq!(bytes.as_ref(), b"response")
+                }
+                other => panic!("unexpected response: {other:?}"),
+            }
+            drop(result);
+            assert_eq!(budget.snapshot().used_bytes, 0);
+        }
+    }
+
+    #[cfg(feature = "relay")]
+    #[tokio::test]
+    async fn known_response_wait_is_cancel_safe_and_does_not_poll_body() {
+        use c2_mem::retention::PayloadBufferBudget;
+        let budget = PayloadBufferBudget::new(4);
+        let occupied = budget.reserve(4).await.unwrap();
+        let response: reqwest::Response =
+            axum::http::Response::new(reqwest::Body::from(b"data".to_vec())).into();
+        let mut read = Box::pin(read_http_response(response, 4, &budget, None));
+        assert!(futures::poll!(&mut read).is_pending());
+        drop(read);
+        drop(occupied);
+        assert_eq!(budget.snapshot().used_bytes, 0);
+        assert_eq!(budget.snapshot().rejected_allocations, 0);
+        let reservation = budget.reserve(4).await.unwrap();
+        drop(reservation);
+    }
+
+    #[cfg(feature = "relay")]
+    #[tokio::test]
+    async fn response_slices_and_clones_refund_only_after_last_reader() {
+        use c2_mem::retention::PayloadBufferBudget;
+        let budget = PayloadBufferBudget::new(4);
+        let response: reqwest::Response =
+            axum::http::Response::new(reqwest::Body::from(b"data".to_vec())).into();
+        let owned = read_http_response(response, 4, &budget, None)
+            .await
+            .unwrap();
+        let bytes = Bytes::from_owner(owned);
+        let slice = bytes.slice(1..3);
+        let clone = slice.clone();
+        drop((bytes, slice));
+        assert_eq!(budget.snapshot().used_bytes, 4);
+        assert_eq!(clone.as_ref(), b"at");
+        drop(clone);
+        assert_eq!(budget.snapshot().used_bytes, 0);
+    }
+
     #[test]
     fn response_length_checks_exact_limit_and_platform_overflow() {
         assert_eq!(checked_response_length(3, 5, 8).unwrap(), 8);
@@ -259,61 +493,50 @@ mod tests {
         }
     }
 
-    #[test]
-    fn tiny_response_chunks_have_bounded_capacity_growth_and_reject_before_reserve() {
-        const LIMIT: usize = 8192;
-        let mut body = Vec::new();
-        let mut growths = 0;
-        for index in 0..LIMIT {
-            let previous_capacity = body.capacity();
-            append_response_chunk(&mut body, &[(index % 251) as u8], LIMIT as u64).unwrap();
-            growths += usize::from(body.capacity() != previous_capacity);
-            assert!(body.capacity() <= LIMIT);
-        }
-        assert_eq!(
-            body,
-            (0..LIMIT)
-                .map(|index| (index % 251) as u8)
-                .collect::<Vec<_>>()
-        );
-        let capacity = body.capacity();
-        let error = append_response_chunk(&mut body, &[0], LIMIT as u64).unwrap_err();
-        assert_eq!(error.code, c2_error::ErrorCode::ProtocolViolation);
-        assert_eq!(error.details["reason"], "response_payload_too_large");
-        assert_eq!(body.len(), LIMIT);
-        assert_eq!(
-            body.capacity(),
-            capacity,
-            "rejection must precede allocation"
-        );
-        println!("8192 one-byte chunks: {growths} capacity changes");
-        assert!(
-            growths <= 14,
-            "8192 one-byte chunks caused {growths} capacity growths"
-        );
+    #[tokio::test]
+    async fn unknown_segments_grow_without_moving_existing_storage_or_waiting() {
+        let budget = PayloadBufferBudget::new(8);
+        let mut segments = SegmentedPayload::new();
+        segments
+            .push_chunk(b"12345", &budget, None, "dispatch_uncertain")
+            .await
+            .unwrap();
+        let pointer = segments.parts[0].as_ptr();
+        segments
+            .push_chunk(b"6", &budget, None, "dispatch_uncertain")
+            .await
+            .unwrap();
+        assert_eq!(segments.parts[0].as_ptr(), pointer);
+        assert_eq!(segments.len(), 6);
+        let sibling = budget.reserve(2).await.unwrap();
+        let mut next = Box::pin(segments.push_chunk(b"7", &budget, None, "dispatch_uncertain"));
+        assert!(matches!(
+            futures::poll!(&mut next),
+            std::task::Poll::Ready(Err(HttpError::LocalCallRejected(_)))
+        ));
+        drop(next);
+        assert_eq!(budget.snapshot().used_bytes, 8);
+        drop(segments);
+        assert_eq!(budget.snapshot().used_bytes, 2);
+        drop(sibling);
+        assert_eq!(budget.snapshot().used_bytes, 0);
     }
 
-    #[test]
-    fn response_capacity_growth_clamps_message_and_platform_limits_without_allocation() {
-        assert_eq!(response_growth_capacity(0, 0, u64::MAX), 0);
-        assert_eq!(response_growth_capacity(0, 1, u64::MAX), 1);
-        assert_eq!(response_growth_capacity(4, 5, 7), 7);
-        assert_eq!(response_growth_capacity(4, 10, 11), 10);
-        let above_half = usize::MAX / 2 + 1;
-        assert_eq!(
-            response_growth_capacity(above_half, above_half + 1, u64::MAX),
-            usize::MAX
-        );
-    }
-
-    #[test]
-    fn oversized_first_response_chunk_does_not_allocate() {
-        let mut body = Vec::new();
-        let error = append_response_chunk(&mut body, &[0; 9], 8).unwrap_err();
-        assert_eq!(error.code, c2_error::ErrorCode::ProtocolViolation);
-        assert_eq!(error.details["reason"], "response_payload_too_large");
-        assert!(body.is_empty());
-        assert_eq!(body.capacity(), 0);
+    #[cfg(feature = "relay")]
+    #[tokio::test]
+    async fn oversized_first_response_chunk_does_not_allocate() {
+        let budget = PayloadBufferBudget::new(100);
+        let response: reqwest::Response =
+            axum::http::Response::new(reqwest::Body::wrap_stream(stream::once(async {
+                Ok::<_, Infallible>(Bytes::from_static(b"123456789"))
+            })))
+            .into();
+        let error = read_http_response_body(response, 8, &budget, None, "dispatch_uncertain")
+            .await
+            .unwrap_err();
+        assert!(matches!(error, HttpError::ServerError(_, _)));
+        assert_eq!(budget.snapshot().used_bytes, 0);
+        assert_eq!(budget.snapshot().peak_bytes, 0);
     }
 
     #[cfg(feature = "relay")]
@@ -324,10 +547,21 @@ mod tests {
         ));
         let response: reqwest::Response = axum::http::Response::new(body).into();
         assert_eq!(response.content_length(), None);
-        let body = read_http_response_body(response, u64::MAX).await.unwrap();
+        let budget = PayloadBufferBudget::new(c2_config::DEFAULT_PAYLOAD_BUFFER_BUDGET_BYTES);
+        let body = read_http_response_body(response, u64::MAX, &budget, None, "dispatch_uncertain")
+            .await
+            .unwrap();
         assert_eq!(body.len(), 8192);
         assert!(body.iter().all(|byte| *byte == b'x'));
         assert_eq!(body.capacity(), 8192);
+        assert_eq!(budget.snapshot().used_bytes, 8192);
+        assert_eq!(
+            budget.snapshot().peak_bytes,
+            16384,
+            "old and replacement storage are simultaneously charged"
+        );
+        drop(body);
+        assert_eq!(budget.snapshot().used_bytes, 0);
     }
 
     struct CountedInput {
@@ -413,6 +647,25 @@ mod tests {
         drop(first_alias);
         assert!(weak.upgrade().is_none());
         assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn final_request_chunk_does_not_keep_storage_in_exhausted_stream_state() {
+        let budget = PayloadBufferBudget::new(6);
+        let owner = BudgetedBuffer::new(vec![7; 6], budget.reserve(6).await.unwrap());
+        let chunks = payload_chunks(Bytes::from_owner(owner), 3);
+        futures::pin_mut!(chunks);
+        let first = chunks.next().await.unwrap().unwrap();
+        let last = chunks.next().await.unwrap().unwrap();
+        let slice = last.slice(1..);
+        drop((first, last));
+        assert_eq!(budget.snapshot().used_bytes, 6);
+        drop(slice);
+        assert_eq!(
+            budget.snapshot().used_bytes,
+            0,
+            "no EOF poll or stream drop is required after the last reader"
+        );
     }
 
     #[test]

@@ -282,15 +282,20 @@ impl SyncClient {
             .await
     }
 
-    pub async fn call_bound_controlled_async_phased(
+    /// Transfer the request owner to IPC. Its storage is released after
+    /// preparation/send, independently of the continuing response wait.
+    pub async fn call_bound_owned_controlled_async_phased<B>(
         &self,
         binding: &RouteBinding,
         method_name: &str,
-        data: &[u8],
+        data: B,
         control: &IpcCallControl,
-    ) -> Result<ResponseData, IpcCallError> {
+    ) -> Result<ResponseData, IpcCallError>
+    where
+        B: AsRef<[u8]> + Send + 'static,
+    {
         self.inner
-            .call_bound_controlled_phased(binding, method_name, data, control)
+            .call_bound_owned_controlled_phased(binding, method_name, data, control)
             .await
     }
 

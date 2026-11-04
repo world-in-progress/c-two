@@ -55,7 +55,7 @@ impl PoolReferences {
         self.released_tick.fetch_max(self.tick(), Ordering::AcqRel);
         let _ = self
             .count
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |count| {
                 count.checked_sub(1)
             });
     }

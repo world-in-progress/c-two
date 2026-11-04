@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::future::Future;
+use std::io::Write;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -19,6 +20,7 @@ use axum::{
 use futures::StreamExt;
 
 use crate::client::{LOCAL_ENDPOINT_NAMESPACE_HEADER, validate_local_endpoint_namespace};
+use crate::payload::SegmentedPayload;
 use crate::relay::authority::{
     ClaimedRouteContract, ControlError, LocalRegistration, LocalRouteOwner, RegisterPreparation,
     RegistrationWithdrawal, RouteAttestationError, RouteAuthority,
@@ -32,6 +34,8 @@ use crate::relay::server::connect_register_attestation_client;
 use crate::relay::state::{RegisterCommitResult, RelayState, UpstreamAcquireError};
 use crate::relay::types::{RouteEntry, UpstreamEndpointKey};
 use c2_ipc::IpcClient;
+use c2_mem::retention::{BudgetedBuffer, PayloadBufferBudget, PayloadBufferReservation};
+use tokio_util::sync::CancellationToken;
 
 const CONTROL_BODY_LIMIT_BYTES: usize = 64 * 1024;
 const EXPECTED_CRM_NS_HEADER: &str = "x-c2-expected-crm-ns";
@@ -64,6 +68,7 @@ struct ExpectedRouteToken {
     route_uid: String,
 }
 
+#[derive(Debug)]
 struct ResponseFailure(Box<Response>);
 
 impl ResponseFailure {
@@ -127,6 +132,19 @@ fn resource_not_found_response(route_name: &str) -> Response {
     )
 }
 
+fn resource_not_found_response_budgeted(
+    route_name: &str,
+    budget: &PayloadBufferBudget,
+) -> Response {
+    c2_error_response_with_budget(
+        StatusCode::NOT_FOUND,
+        c2_error::ErrorCode::ResourceNotFound,
+        format!("route not found: {route_name}"),
+        [("route", route_name.to_string())],
+        budget,
+    )
+}
+
 fn resource_unavailable_response(route_name: &str, message: impl Into<String>) -> Response {
     resource_unavailable_response_with_phase(route_name, message, "pre_dispatch")
 }
@@ -147,12 +165,44 @@ fn resource_unavailable_response_with_phase(
     )
 }
 
+fn resource_unavailable_response_budgeted(
+    route_name: &str,
+    message: impl Into<String>,
+    dispatch_phase: &str,
+    budget: &PayloadBufferBudget,
+) -> Response {
+    c2_error_response_with_budget(
+        StatusCode::BAD_GATEWAY,
+        c2_error::ErrorCode::ResourceUnavailable,
+        message,
+        [
+            ("route", route_name.to_string()),
+            ("dispatch_phase", dispatch_phase.to_string()),
+        ],
+        budget,
+    )
+}
+
 fn route_watch_unavailable_response(route_name: &str, reason: impl Into<String>) -> Response {
     c2_error_response(
         StatusCode::SERVICE_UNAVAILABLE,
         c2_error::ErrorCode::RouteWatchUnavailable,
         format!("route watch unavailable for {route_name}"),
         [("route", route_name.to_string()), ("reason", reason.into())],
+    )
+}
+
+fn route_watch_unavailable_response_budgeted(
+    route_name: &str,
+    reason: impl Into<String>,
+    budget: &PayloadBufferBudget,
+) -> Response {
+    c2_error_response_with_budget(
+        StatusCode::SERVICE_UNAVAILABLE,
+        c2_error::ErrorCode::RouteWatchUnavailable,
+        format!("route watch unavailable for {route_name}"),
+        [("route", route_name.to_string()), ("reason", reason.into())],
+        budget,
     )
 }
 
@@ -182,45 +232,147 @@ where
         .into_response()
 }
 
-fn semantic_error_response(status: StatusCode, error: c2_error::C2Error) -> Response {
-    (status, Json(error.envelope())).into_response()
+struct JsonSize(u64);
+
+impl Write for JsonSize {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0 = self
+            .0
+            .checked_add(bytes.len() as u64)
+            .ok_or_else(|| std::io::Error::other("JSON response length overflow"))?;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
-fn content_length_from_headers(headers: &HeaderMap) -> ResponseResult<Option<u64>> {
+/// Reserve the exact serialized body before creating its owned Vec. The Body
+/// carries the reservation through `Bytes` slices and clones until their last
+/// real reference is released.
+fn budgeted_json_response<T>(
+    status: StatusCode,
+    payload: T,
+    budget: &PayloadBufferBudget,
+    dispatch_uncertain: bool,
+) -> Response
+where
+    T: serde::Serialize + Send + 'static,
+{
+    let mut size = JsonSize(0);
+    if serde_json::to_writer(&mut size, &payload).is_err()
+        || size.0 > budget.snapshot().limit_bytes
+        || usize::try_from(size.0).is_err()
+    {
+        return if dispatch_uncertain {
+            uncertain_error_control_response()
+        } else {
+            forwarding_capacity_response("", "error response exceeds payload budget")
+        };
+    }
+    let budget = budget.clone();
+    let body = Body::from_stream(futures::stream::once(async move {
+        let reservation = budget
+            .reserve(size.0)
+            .await
+            .map_err(std::io::Error::other)?;
+        let mut data = Vec::with_capacity(size.0 as usize);
+        serde_json::to_writer(&mut data, &payload).map_err(std::io::Error::other)?;
+        Ok::<Bytes, std::io::Error>(Bytes::from_owner(BudgetedBuffer::new(data, reservation)))
+    }));
+    (
+        status,
+        [
+            (header::CONTENT_TYPE, "application/json".to_string()),
+            (header::CONTENT_LENGTH, size.0.to_string()),
+        ],
+        body,
+    )
+        .into_response()
+}
+
+fn json_error_response<T>(
+    status: StatusCode,
+    payload: T,
+    budget: Option<&PayloadBufferBudget>,
+) -> Response
+where
+    T: serde::Serialize + Send + 'static,
+{
+    match budget {
+        Some(budget) => budgeted_json_response(status, payload, budget, false),
+        None => (status, Json(payload)).into_response(),
+    }
+}
+
+fn c2_error_response_with_budget<I, K, V>(
+    status: StatusCode,
+    code: c2_error::ErrorCode,
+    message: impl Into<String>,
+    details: I,
+    budget: &PayloadBufferBudget,
+) -> Response
+where
+    I: IntoIterator<Item = (K, V)>,
+    K: Into<String>,
+    V: Into<String>,
+{
+    let details = details
+        .into_iter()
+        .map(|(key, value)| (key.into(), value.into()))
+        .collect::<BTreeMap<_, _>>();
+    let dispatch_uncertain = details
+        .get("dispatch_phase")
+        .is_some_and(|phase| phase == "dispatch_uncertain");
+    budgeted_json_response(
+        status,
+        c2_error::C2Error::new(code, message)
+            .with_details(details)
+            .envelope(),
+        budget,
+        dispatch_uncertain,
+    )
+}
+
+fn content_length_from_headers(
+    headers: &HeaderMap,
+    budget: &PayloadBufferBudget,
+) -> ResponseResult<Option<u64>> {
     let mut values = headers.get_all(header::CONTENT_LENGTH).iter();
     let Some(value) = values.next() else {
         return Ok(None);
     };
     if values.next().is_some() {
-        return Err((
+        return Err(json_error_response(
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
+            serde_json::json!({
                 "error": "InvalidContentLength",
                 "message": "Content-Length must appear at most once",
-            })),
+            }),
+            Some(budget),
         )
-            .into_response()
-            .into());
+        .into());
     }
     let raw = value.to_str().map_err(|_| {
-        (
+        json_error_response(
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
+            serde_json::json!({
                 "error": "InvalidContentLength",
                 "message": "Content-Length must be an ASCII unsigned integer",
-            })),
+            }),
+            Some(budget),
         )
-            .into_response()
     })?;
     let content_length = raw.parse::<u64>().map_err(|_| {
-        (
+        json_error_response(
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
+            serde_json::json!({
                 "error": "InvalidContentLength",
                 "message": "Content-Length must be an unsigned integer",
-            })),
+            }),
+            Some(budget),
         )
-            .into_response()
     })?;
     Ok(Some(content_length))
 }
@@ -229,29 +381,34 @@ fn payload_too_large_response(
     route_name: &str,
     content_length: u64,
     max_payload_size: u64,
+    budget: &PayloadBufferBudget,
 ) -> Response {
-    (
+    json_error_response(
         StatusCode::PAYLOAD_TOO_LARGE,
-        Json(serde_json::json!({
+        serde_json::json!({
             "error": "PayloadTooLarge",
             "route": route_name,
             "content_length": content_length,
             "max_payload_size": max_payload_size,
-        })),
+        }),
+        Some(budget),
     )
-        .into_response()
 }
 
-fn unknown_length_too_large_response(route_name: &str, limit: u64) -> Response {
-    (
+fn unknown_length_too_large_response(
+    route_name: &str,
+    limit: u64,
+    budget: &PayloadBufferBudget,
+) -> Response {
+    json_error_response(
         StatusCode::LENGTH_REQUIRED,
-        Json(serde_json::json!({
+        serde_json::json!({
             "error": "ContentLengthRequired",
             "route": route_name,
             "message": format!("streaming relay calls larger than {limit} bytes require Content-Length"),
-        })),
+        }),
+        Some(budget),
     )
-        .into_response()
 }
 
 #[derive(Debug, Default, serde::Deserialize)]
@@ -301,6 +458,7 @@ fn run_data_plane_after_precheck_hook(route_name: &str) {
 fn expected_crm_from_headers(
     route_name: &str,
     headers: &HeaderMap,
+    budget: Option<&PayloadBufferBudget>,
 ) -> ResponseResult<c2_contract::ExpectedRouteContract> {
     let crm_ns = headers
         .get(EXPECTED_CRM_NS_HEADER)
@@ -319,15 +477,15 @@ fn expected_crm_from_headers(
         .map(|value| value.to_str().map(str::to_string));
 
     match (crm_ns, crm_name, crm_ver, abi_hash, signature_hash) {
-        (None, None, None, None, None) => Err((
+        (None, None, None, None, None) => Err(json_error_response(
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
+            serde_json::json!({
                 "error": "InvalidCrmTag",
                 "message": "expected CRM headers and hash headers are required",
-            })),
+            }),
+            budget,
         )
-            .into_response()
-            .into()),
+        .into()),
         (
             Some(Ok(crm_ns)),
             Some(Ok(crm_name)),
@@ -344,15 +502,15 @@ fn expected_crm_from_headers(
                 signature_hash,
             };
             if let Err(err) = c2_contract::validate_expected_route_contract(&expected) {
-                return Err((
+                return Err(json_error_response(
                     StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({
+                    serde_json::json!({
                         "error": "InvalidCrmTag",
                         "message": err.to_string(),
-                    })),
+                    }),
+                    budget,
                 )
-                    .into_response()
-                    .into());
+                .into());
             }
             Ok(expected)
         }
@@ -360,24 +518,24 @@ fn expected_crm_from_headers(
         | (_, Some(Err(_)), _, _, _)
         | (_, _, Some(Err(_)), _, _)
         | (_, _, _, Some(Err(_)), _)
-        | (_, _, _, _, Some(Err(_))) => Err((
+        | (_, _, _, _, Some(Err(_))) => Err(json_error_response(
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
+            serde_json::json!({
                 "error": "InvalidCrmTag",
                 "message": "expected CRM headers must be valid UTF-8",
-            })),
+            }),
+            budget,
         )
-            .into_response()
-            .into()),
-        _ => Err((
+        .into()),
+        _ => Err(json_error_response(
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
+            serde_json::json!({
                 "error": "InvalidCrmTag",
                 "message": "expected CRM headers and hash headers must be supplied together",
-            })),
+            }),
+            budget,
         )
-            .into_response()
-            .into()),
+        .into()),
     }
 }
 
@@ -390,12 +548,39 @@ fn crm_contract_mismatch_response(route_name: &str) -> Response {
     )
 }
 
+fn crm_contract_mismatch_response_budgeted(
+    route_name: &str,
+    budget: &PayloadBufferBudget,
+) -> Response {
+    c2_error_response_with_budget(
+        StatusCode::CONFLICT,
+        c2_error::ErrorCode::ContractMismatch,
+        format!("CRM contract mismatch for route {route_name}"),
+        [("route", route_name.to_string())],
+        budget,
+    )
+}
+
 fn protocol_violation_response(route_name: &str, message: impl Into<String>) -> Response {
     c2_error_response(
         StatusCode::BAD_REQUEST,
         c2_error::ErrorCode::ProtocolViolation,
         message,
         [("route", route_name.to_string())],
+    )
+}
+
+fn protocol_violation_response_budgeted(
+    route_name: &str,
+    message: impl Into<String>,
+    budget: &PayloadBufferBudget,
+) -> Response {
+    c2_error_response_with_budget(
+        StatusCode::BAD_REQUEST,
+        c2_error::ErrorCode::ProtocolViolation,
+        message,
+        [("route", route_name.to_string())],
+        budget,
     )
 }
 
@@ -414,14 +599,23 @@ fn route_matches_expected_crm(
 fn route_token_from_headers(
     route_name: &str,
     headers: &HeaderMap,
+    budget: Option<&PayloadBufferBudget>,
 ) -> ResponseResult<ExpectedRouteToken> {
-    let route_uid = single_route_token_header(route_name, headers, ROUTE_UID_HEADER)?
-        .ok_or_else(|| protocol_violation_response(route_name, "route token header is required"))?;
+    let route_uid = single_route_token_header(route_name, headers, ROUTE_UID_HEADER, budget)?
+        .ok_or_else(|| match budget {
+            Some(budget) => protocol_violation_response_budgeted(
+                route_name,
+                "route token header is required",
+                budget,
+            ),
+            None => protocol_violation_response(route_name, "route token header is required"),
+        })?;
     c2_contract::validate_call_route_key("route_uid", &route_uid).map_err(|err| {
-        protocol_violation_response(
-            route_name,
-            format!("invalid route token header {ROUTE_UID_HEADER}: {err}"),
-        )
+        let message = format!("invalid route token header {ROUTE_UID_HEADER}: {err}");
+        match budget {
+            Some(budget) => protocol_violation_response_budgeted(route_name, message, budget),
+            None => protocol_violation_response(route_name, message),
+        }
     })?;
     Ok(ExpectedRouteToken { route_uid })
 }
@@ -430,31 +624,48 @@ fn single_route_token_header(
     route_name: &str,
     headers: &HeaderMap,
     header_name: &'static str,
+    budget: Option<&PayloadBufferBudget>,
 ) -> ResponseResult<Option<String>> {
     let mut values = headers.get_all(header_name).iter();
     let Some(value) = values.next() else {
         return Ok(None);
     };
     if values.next().is_some() {
-        return Err(protocol_violation_response(
-            route_name,
-            format!("route token header {header_name} must not be repeated"),
-        )
+        let message = format!("route token header {header_name} must not be repeated");
+        return Err(match budget {
+            Some(budget) => protocol_violation_response_budgeted(route_name, message, budget),
+            None => protocol_violation_response(route_name, message),
+        }
         .into());
     }
     value.to_str().map(str::to_string).map(Some).map_err(|_| {
-        protocol_violation_response(route_name, "route token headers must be valid UTF-8").into()
+        match budget {
+            Some(budget) => protocol_violation_response_budgeted(
+                route_name,
+                "route token headers must be valid UTF-8",
+                budget,
+            ),
+            None => {
+                protocol_violation_response(route_name, "route token headers must be valid UTF-8")
+            }
+        }
+        .into()
     })
 }
 
 fn validate_route_token_for_route(
     route: &RouteEntry,
     expected: &ExpectedRouteToken,
+    budget: Option<&PayloadBufferBudget>,
 ) -> ResponseResult<()> {
     if route.route_uid == expected.route_uid {
         Ok(())
     } else {
-        Err(route_stale_response(route).into())
+        Err(match budget {
+            Some(budget) => route_stale_response_budgeted(route, budget),
+            None => route_stale_response(route),
+        }
+        .into())
     }
 }
 
@@ -597,14 +808,23 @@ fn validate_expected_crm_for_route(
     state: &RelayState,
     route_name: &str,
     expected: &c2_contract::ExpectedRouteContract,
+    budget: Option<&PayloadBufferBudget>,
 ) -> ResponseResult<RouteEntry> {
     let Some(route) = state.local_route(route_name) else {
-        return Err(resource_not_found_response(route_name).into());
+        return Err(match budget {
+            Some(budget) => resource_not_found_response_budgeted(route_name, budget),
+            None => resource_not_found_response(route_name),
+        }
+        .into());
     };
     if route_matches_expected_crm(&route, expected) {
         Ok(route)
     } else {
-        Err(crm_contract_mismatch_response(route_name).into())
+        Err(match budget {
+            Some(budget) => crm_contract_mismatch_response_budgeted(route_name, budget),
+            None => crm_contract_mismatch_response(route_name),
+        }
+        .into())
     }
 }
 
@@ -1397,50 +1617,103 @@ async fn read_unknown_length_body(
     route_name: &str,
     body: Body,
     max_payload_size: u64,
-    permit: &mut c2_mem::RetentionPermit,
-) -> ResponseResult<Vec<u8>> {
+    budget: &PayloadBufferBudget,
+    cancelled: &CancellationToken,
+) -> ResponseResult<Option<SegmentedPayload>> {
     let limit = UNKNOWN_LENGTH_BODY_LIMIT_BYTES.min(max_payload_size);
     let limit_usize = usize::try_from(limit).unwrap_or(usize::MAX);
-    let mut data = Vec::new();
+    let mut segments = SegmentedPayload::new();
     let mut stream = body.into_data_stream();
 
-    while let Some(next) = stream.next().await {
+    while let Some(next) = tokio::select! {
+        biased;
+        _ = cancelled.cancelled() => return Ok(None),
+        next = stream.next() => next,
+    } {
         let chunk = next.map_err(|err| {
-            (
+            json_error_response(
                 StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
+                serde_json::json!({
                     "error": "RequestBodyReadError",
                     "route": route_name,
                     "message": err.to_string(),
-                })),
+                }),
+                Some(budget),
             )
-                .into_response()
         })?;
         if chunk.is_empty() {
             continue;
         }
-        let next_len = data
-            .len()
-            .checked_add(chunk.len())
-            .ok_or_else(|| payload_too_large_response(route_name, u64::MAX, max_payload_size))?;
+        let next_len = segments.len().checked_add(chunk.len()).ok_or_else(|| {
+            payload_too_large_response(route_name, u64::MAX, max_payload_size, budget)
+        })?;
         let next_len_u64 = u64::try_from(next_len).unwrap_or(u64::MAX);
         if next_len_u64 > max_payload_size {
-            return Err(
-                payload_too_large_response(route_name, next_len_u64, max_payload_size).into(),
-            );
+            return Err(payload_too_large_response(
+                route_name,
+                next_len_u64,
+                max_payload_size,
+                budget,
+            )
+            .into());
         }
         if next_len > limit_usize {
-            return Err(unknown_length_too_large_response(route_name, limit).into());
+            return Err(unknown_length_too_large_response(route_name, limit, budget).into());
         }
-        permit
-            .try_grow(u64::try_from(chunk.len()).map_err(|_| {
-                forwarding_capacity_response(route_name, "input byte count overflow")
-            })?)
-            .map_err(|err| forwarding_capacity_response(route_name, err.to_string()))?;
-        data.extend_from_slice(&chunk);
+        let appended = tokio::select! {
+            biased;
+            _ = cancelled.cancelled() => return Ok(None),
+            appended = segments.push_chunk(&chunk, budget, None, "pre_dispatch") => appended,
+        };
+        appended.map_err(|err| forwarding_capacity_response(route_name, err.to_string()))?;
     }
+    Ok(Some(segments))
+}
 
-    Ok(data)
+// The declared N bytes have one reservation. Each yielded Bytes owns a share
+// of it so IPC may stop polling at exactly N without retaining the charge in
+// the stream closure for the entire response wait.
+struct ReservedIncomingChunk {
+    bytes: Bytes,
+    _reservation: Arc<PayloadBufferReservation>,
+}
+
+impl AsRef<[u8]> for ReservedIncomingChunk {
+    fn as_ref(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+fn known_length_body_stream(
+    body: Body,
+    content_length: u64,
+    reservation: PayloadBufferReservation,
+) -> impl futures::Stream<Item = Result<Bytes, axum::Error>> + Send {
+    let mut remaining = content_length;
+    let mut reservation = (content_length != 0).then(|| Arc::new(reservation));
+    body.into_data_stream().map(move |chunk| {
+        let bytes = chunk?;
+        let size = u64::try_from(bytes.len()).map_err(|_| {
+            axum::Error::new(std::io::Error::other("request chunk length overflow"))
+        })?;
+        if size > remaining {
+            return Err(axum::Error::new(std::io::Error::other(
+                "request body exceeds Content-Length",
+            )));
+        }
+        remaining -= size;
+        let Some(owner) = reservation.as_ref().cloned() else {
+            return Ok(bytes);
+        };
+        let bytes = Bytes::from_owner(ReservedIncomingChunk {
+            bytes,
+            _reservation: owner,
+        });
+        if remaining == 0 {
+            reservation.take();
+        }
+        Ok(bytes)
+    })
 }
 
 /// `GET /_probe/{name}` — verify that a route's local upstream is reachable.
@@ -1458,20 +1731,20 @@ async fn handle_probe_in_context(
     state: Arc<RelayState>,
     headers: HeaderMap,
 ) -> Response {
-    let expected_crm = match expected_crm_from_headers(&route_name, &headers) {
+    let expected_crm = match expected_crm_from_headers(&route_name, &headers, None) {
         Ok(expected) => expected,
         Err(response) => return response.into_response(),
     };
-    let advertised_route = match validate_expected_crm_for_route(&state, &route_name, &expected_crm)
-    {
-        Ok(route) => route,
-        Err(response) => return response.into_response(),
-    };
-    let route_token = match route_token_from_headers(&route_name, &headers) {
+    let advertised_route =
+        match validate_expected_crm_for_route(&state, &route_name, &expected_crm, None) {
+            Ok(route) => route,
+            Err(response) => return response.into_response(),
+        };
+    let route_token = match route_token_from_headers(&route_name, &headers, None) {
         Ok(token) => token,
         Err(response) => return response.into_response(),
     };
-    if let Err(response) = validate_route_token_for_route(&advertised_route, &route_token) {
+    if let Err(response) = validate_route_token_for_route(&advertised_route, &route_token, None) {
         return response.into_response();
     }
     #[cfg(test)]
@@ -1487,7 +1760,7 @@ async fn handle_probe_in_context(
             route_watch_unavailable_response(&route.name, reason)
         }
         RequestClient::NotFound => resource_not_found_response(&route_name),
-        RequestClient::RouteError(error) => ipc_route_error_response(&route_name, &error),
+        RequestClient::RouteError(error) => ipc_route_error_response(&route_name, &error, None),
         RequestClient::Unreachable => resource_unavailable_response(
             &route_name,
             format!("relay upstream unavailable: {route_name}"),
@@ -1505,23 +1778,26 @@ async fn call_handler(
     headers: HeaderMap,
     body: Body,
 ) -> Response {
-    let expected_crm = match expected_crm_from_headers(&route_name, &headers) {
+    let budget = state.forwarding.payload_budget();
+    let expected_crm = match expected_crm_from_headers(&route_name, &headers, Some(&budget)) {
         Ok(expected) => expected,
         Err(response) => return response.into_response(),
     };
-    let advertised_route = match validate_expected_crm_for_route(&state, &route_name, &expected_crm)
-    {
-        Ok(route) => route,
-        Err(response) => return response.into_response(),
-    };
-    let route_token = match route_token_from_headers(&route_name, &headers) {
+    let advertised_route =
+        match validate_expected_crm_for_route(&state, &route_name, &expected_crm, Some(&budget)) {
+            Ok(route) => route,
+            Err(response) => return response.into_response(),
+        };
+    let route_token = match route_token_from_headers(&route_name, &headers, Some(&budget)) {
         Ok(token) => token,
         Err(response) => return response.into_response(),
     };
-    if let Err(response) = validate_route_token_for_route(&advertised_route, &route_token) {
+    if let Err(response) =
+        validate_route_token_for_route(&advertised_route, &route_token, Some(&budget))
+    {
         return response.into_response();
     }
-    let content_length = match content_length_from_headers(&headers) {
+    let content_length = match content_length_from_headers(&headers, &budget) {
         Ok(value) => value,
         Err(response) => return response.into_response(),
     };
@@ -1532,6 +1808,7 @@ async fn call_handler(
             &route_name,
             content_length,
             advertised_route.max_payload_size,
+            &budget,
         );
     }
     #[cfg(test)]
@@ -1541,7 +1818,7 @@ async fn call_handler(
     // Keep the transport body in the HTTP handler until admission succeeds.
     // A rejected spawn drops its closure without dropping the unread body.
     let (body_tx, body_rx) = tokio::sync::oneshot::channel();
-    let work = move |permit| async move {
+    let work = move |permit, cancelled| async move {
         let body = body_rx
             .await
             .expect("admitted forwarding input is sent before waiting");
@@ -1553,10 +1830,11 @@ async fn call_handler(
             content_length,
             body,
             permit,
+            cancelled,
         )
         .await
     };
-    let waiter = match state.forwarding.spawn(content_length.unwrap_or(0), work) {
+    let waiter = match state.forwarding.spawn(work) {
         Ok(waiter) => waiter,
         Err(error) => {
             let response = forwarding_capacity_response(&route_name, error.to_string());
@@ -1569,10 +1847,11 @@ async fn call_handler(
         .expect("admitted forwarding task retains its input receiver");
     match waiter.await {
         Ok(response) => response,
-        Err(_) => resource_unavailable_response_with_phase(
+        Err(_) => resource_unavailable_response_budgeted(
             &route_name,
             "relay forwarding transaction failed",
             "dispatch_uncertain",
+            &budget,
         ),
     }
 }
@@ -1621,16 +1900,26 @@ async fn finish_capacity_rejection(
     response
 }
 
-fn forwarding_capacity_response(route_name: &str, message: impl Into<String>) -> Response {
-    c2_error_response(
+fn forwarding_capacity_response(_route_name: &str, _message: impl Into<String>) -> Response {
+    // This fixed control reply has no owned payload buffer. It must remain
+    // deliverable even when B is zero or a legitimate call holds all of B.
+    const BODY: &[u8] = br#"{"version":1,"code":717,"name":"CallCapacityExceeded","message":"relay forwarding capacity exceeded","details":{"dispatch_phase":"pre_dispatch"}}"#;
+    (
         StatusCode::BAD_GATEWAY,
-        c2_error::ErrorCode::CallCapacityExceeded,
-        format!("relay forwarding capacity: {}", message.into()),
-        [
-            ("route", route_name.to_owned()),
-            ("dispatch_phase", "pre_dispatch".to_owned()),
-        ],
+        [(header::CONTENT_TYPE, "application/json")],
+        Body::from(Bytes::from_static(BODY)),
     )
+        .into_response()
+}
+
+fn uncertain_error_control_response() -> Response {
+    const BODY: &[u8] = br#"{"version":1,"code":702,"name":"ResourceUnavailable","message":"relay error response exceeds payload budget","details":{"dispatch_phase":"dispatch_uncertain"}}"#;
+    (
+        StatusCode::BAD_GATEWAY,
+        [(header::CONTENT_TYPE, "application/json")],
+        Body::from(Bytes::from_static(BODY)),
+    )
+        .into_response()
 }
 
 // This future belongs to the bounded native domain, never to the HTTP handler.
@@ -1641,26 +1930,32 @@ async fn forward_call(
     advertised_route: RouteEntry,
     content_length: Option<u64>,
     body: Body,
-    mut permit: c2_mem::RetentionPermit,
+    _permit: c2_mem::RetentionPermit,
+    cancelled: CancellationToken,
 ) -> Response {
+    let budget = state.forwarding.payload_budget();
     let (lease, binding) =
         match acquire_request_client_for_route(state.clone(), &advertised_route).await {
             RequestClient::Ready(ready) => {
                 let ReadyRequestClient { lease, binding } = *ready;
                 (lease, binding)
             }
-            RequestClient::Stale(route) => return route_stale_response(&route),
+            RequestClient::Stale(route) => return route_stale_response_budgeted(&route, &budget),
             RequestClient::WatchUnavailable { route, reason } => {
-                return route_watch_unavailable_response(&route.name, reason);
+                return route_watch_unavailable_response_budgeted(&route.name, reason, &budget);
             }
-            RequestClient::NotFound => return resource_not_found_response(&route_name),
+            RequestClient::NotFound => {
+                return resource_not_found_response_budgeted(&route_name, &budget);
+            }
             RequestClient::RouteError(error) => {
-                return ipc_route_error_response(&route_name, &error);
+                return ipc_route_error_response(&route_name, &error, Some(&budget));
             }
             RequestClient::Unreachable => {
-                return resource_unavailable_response(
+                return resource_unavailable_response_budgeted(
                     &route_name,
                     format!("relay upstream unavailable: {route_name}"),
+                    "pre_dispatch",
+                    &budget,
                 );
             }
         };
@@ -1668,12 +1963,26 @@ async fn forward_call(
 
     let call_result = match content_length {
         Some(content_length) => {
+            let reservation = tokio::select! {
+                biased;
+                _ = cancelled.cancelled() => return StatusCode::NO_CONTENT.into_response(),
+                reservation = budget.reserve(content_length) => reservation,
+            };
+            let reservation = match reservation {
+                Ok(reservation) => reservation,
+                Err(error) => return forwarding_capacity_response(&route_name, error.to_string()),
+            };
+            if cancelled.is_cancelled() {
+                return StatusCode::NO_CONTENT.into_response();
+            }
+            let stream = known_length_body_stream(body, content_length, reservation);
             client
                 .call_bound_sized_stream_phased(
                     &binding,
                     &method_name,
                     content_length,
-                    body.into_data_stream(),
+                    stream,
+                    Some(&budget),
                 )
                 .await
         }
@@ -1682,11 +1991,13 @@ async fn forward_call(
                 &route_name,
                 body,
                 advertised_route.max_payload_size,
-                &mut permit,
+                &budget,
+                &cancelled,
             )
             .await
             {
-                Ok(body) => body,
+                Ok(Some(body)) => body,
+                Ok(None) => return StatusCode::NO_CONTENT.into_response(),
                 Err(response) => {
                     // Only actual Body stream failures produce BAD_REQUEST
                     // here; payload/capacity rejection has a different status.
@@ -1698,8 +2009,23 @@ async fn forward_call(
                     return response.into_response();
                 }
             };
+            if cancelled.is_cancelled() {
+                return StatusCode::NO_CONTENT.into_response();
+            }
+            let body_len = u64::try_from(body.len()).expect("bounded request length fits u64");
+            let stream = futures::stream::iter(
+                body.into_segments()
+                    .into_iter()
+                    .map(Ok::<_, std::io::Error>),
+            );
             client
-                .call_bound_phased(&binding, &method_name, &body)
+                .call_bound_sized_stream_phased(
+                    &binding,
+                    &method_name,
+                    body_len,
+                    stream,
+                    Some(&budget),
+                )
                 .await
         }
     };
@@ -1709,6 +2035,7 @@ async fn forward_call(
             &route_name,
             result.into_owned_bytes(),
             state.config().remote_payload_chunk_size,
+            &budget,
         ),
         Err(error) => {
             let phase = error.phase();
@@ -1726,6 +2053,12 @@ async fn forward_call(
                 }
             }
             match error {
+                c2_ipc::IpcError::LocalCallRejected(error)
+                    if matches!(phase, c2_ipc::TransportPhase::PreDispatch)
+                        && error.code == c2_error::ErrorCode::CallCapacityExceeded =>
+                {
+                    forwarding_capacity_response(&route_name, error.message)
+                }
                 c2_ipc::IpcError::CrmError(err_bytes) => (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     [("content-type", "application/octet-stream")],
@@ -1734,7 +2067,7 @@ async fn forward_call(
                     .into_response(),
                 c2_ipc::IpcError::RouteStale { .. } => {
                     drop(lease);
-                    route_stale_response(&advertised_route)
+                    route_stale_response_budgeted(&advertised_route, &budget)
                 }
                 error if matches!(phase, c2_ipc::TransportPhase::PreDispatch) => {
                     if let Some(reason) = semantic_withdrawal_reason(&error) {
@@ -1746,7 +2079,7 @@ async fn forward_call(
                             reason,
                         );
                     }
-                    ipc_route_error_response(&route_name, &error)
+                    ipc_route_error_response(&route_name, &error, Some(&budget))
                 }
                 error
                     if matches!(
@@ -1758,10 +2091,11 @@ async fn forward_call(
                     // Reply admission rejects only this RID; the receiver
                     // keeps serving other calls on the healthy connection.
                     // Dispatch already happened, so replay is still unsafe.
-                    resource_unavailable_response_with_phase(
+                    resource_unavailable_response_budgeted(
                         &route_name,
                         format!("relay error after possible dispatch: {error}"),
                         "dispatch_uncertain",
+                        &budget,
                     )
                 }
                 error => {
@@ -1773,10 +2107,11 @@ async fn forward_call(
                         // observes confirmed cleanup beyond transaction completion.
                         state.clients.close(&old_client);
                     }
-                    resource_unavailable_response_with_phase(
+                    resource_unavailable_response_budgeted(
                         &route_name,
                         format!("relay error after possible dispatch: {error}"),
                         "dispatch_uncertain",
+                        &budget,
                     )
                 }
             }
@@ -1788,26 +2123,34 @@ fn materialized_response_or_error(
     route_name: &str,
     result: Result<Vec<u8>, String>,
     remote_payload_chunk_size: u64,
+    budget: &PayloadBufferBudget,
 ) -> Response {
     match result {
-        Ok(bytes) => match crate::payload::axum_body_from_payload(bytes, remote_payload_chunk_size)
-        {
-            Ok(body) => (
-                StatusCode::OK,
-                [("content-type", "application/octet-stream")],
-                body,
-            )
-                .into_response(),
-            Err(err) => resource_unavailable_response_with_phase(
-                route_name,
-                format!("failed to construct relay response body: {err}"),
-                "dispatch_uncertain",
-            ),
-        },
-        Err(err) => resource_unavailable_response_with_phase(
+        Ok(bytes) => {
+            let content_length = bytes.len().to_string();
+            match crate::payload::axum_body_from_payload(bytes, remote_payload_chunk_size) {
+                Ok(body) => (
+                    StatusCode::OK,
+                    [
+                        (header::CONTENT_TYPE, "application/octet-stream".to_string()),
+                        (header::CONTENT_LENGTH, content_length),
+                    ],
+                    body,
+                )
+                    .into_response(),
+                Err(err) => resource_unavailable_response_budgeted(
+                    route_name,
+                    format!("failed to construct relay response body: {err}"),
+                    "dispatch_uncertain",
+                    budget,
+                ),
+            }
+        }
+        Err(err) => resource_unavailable_response_budgeted(
             route_name,
             format!("failed to materialize upstream response: {err}"),
             "dispatch_uncertain",
+            budget,
         ),
     }
 }
@@ -1871,8 +2214,30 @@ fn route_stale_response(route: &RouteEntry) -> Response {
     )
 }
 
-fn ipc_route_error_response(route_name: &str, error: &c2_ipc::IpcError) -> Response {
+fn route_stale_response_budgeted(route: &RouteEntry, budget: &PayloadBufferBudget) -> Response {
+    c2_error_response_with_budget(
+        StatusCode::CONFLICT,
+        c2_error::ErrorCode::RouteStale,
+        format!(
+            "stale relay route token for {} uid={}",
+            route.name, route.route_uid
+        ),
+        [
+            ("route", route.name.clone()),
+            ("route_uid", route.route_uid.clone()),
+        ],
+        budget,
+    )
+}
+
+fn ipc_route_error_response(
+    route_name: &str,
+    error: &c2_ipc::IpcError,
+    budget: Option<&PayloadBufferBudget>,
+) -> Response {
     use c2_error::{C2Error, ErrorCode};
+    let semantic_error_response =
+        |status, error: C2Error| json_error_response(status, error.envelope(), budget);
 
     match error {
         c2_ipc::IpcError::LocalCallRejected(error) => {
@@ -2002,10 +2367,18 @@ fn ipc_route_error_response(route_name: &str, error: &c2_ipc::IpcError) -> Respo
                 ("transport".to_string(), "ipc".to_string()),
             ])),
         ),
-        error => resource_unavailable_response(
-            route_name,
-            format!("relay upstream unavailable before dispatch: {error}"),
-        ),
+        error => match budget {
+            Some(budget) => resource_unavailable_response_budgeted(
+                route_name,
+                format!("relay upstream unavailable before dispatch: {error}"),
+                "pre_dispatch",
+                budget,
+            ),
+            None => resource_unavailable_response(
+                route_name,
+                format!("relay upstream unavailable before dispatch: {error}"),
+            ),
+        },
     }
 }
 
@@ -2128,13 +2501,13 @@ mod tests {
     fn route_token_uses_uid_and_ignores_unknown_headers() {
         let mut headers = HeaderMap::new();
         headers.insert(ROUTE_UID_HEADER, "route-uid-0001".parse().unwrap());
-        let token = route_token_from_headers("grid", &headers)
+        let token = route_token_from_headers("grid", &headers, None)
             .unwrap_or_else(|_| panic!("UID is a complete route token"));
         assert_eq!(token.route_uid, "route-uid-0001");
         headers.append("x-c2-route-revision", "invalid".parse().unwrap());
         headers.append("x-c2-route-revision", "0".parse().unwrap());
         headers.append("x-another-unknown-header", "ignored".parse().unwrap());
-        let token = route_token_from_headers("grid", &headers)
+        let token = route_token_from_headers("grid", &headers, None)
             .unwrap_or_else(|_| panic!("unknown headers must be ignored"));
         assert_eq!(token.route_uid, "route-uid-0001");
     }
@@ -2390,7 +2763,7 @@ mod tests {
         ];
 
         for (error, expected_status, expected_code) in cases {
-            let response = ipc_route_error_response("grid", &error);
+            let response = ipc_route_error_response("grid", &error, None);
             assert_eq!(response.status(), expected_status, "error={error}");
             let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
             let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
@@ -2411,7 +2784,7 @@ mod tests {
         }
 
         let response =
-            ipc_route_error_response("grid", &c2_ipc::IpcError::Config("offline".into()));
+            ipc_route_error_response("grid", &c2_ipc::IpcError::Config("offline".into()), None);
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
@@ -3262,8 +3635,8 @@ mod tests {
             "relay data-plane must use phased route-bound sized streaming for Content-Length requests"
         );
         assert!(
-            body.contains(".call_bound_phased("),
-            "relay data-plane must use phased route-bound call for bounded unknown-length fallback"
+            body.matches(".call_bound_sized_stream_phased(").count() >= 2,
+            "known and bounded unknown requests must both use the phased route-bound sized stream"
         );
     }
 
@@ -3286,7 +3659,12 @@ mod tests {
                 "remote_payload_chunk_size",
             ),
         ] {
-            let response = materialized_response_or_error("grid", result, chunk_size);
+            let response = materialized_response_or_error(
+                "grid",
+                result,
+                chunk_size,
+                &PayloadBufferBudget::new(4096),
+            );
             assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
             let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
             let envelope: c2_error::C2ErrorEnvelope = serde_json::from_slice(&body)
@@ -5146,8 +5524,14 @@ mod tests {
 
     #[tokio::test]
     async fn materialized_relay_response_uses_remote_payload_chunk_size() {
-        let response = materialized_response_or_error("grid", Ok(b"abcdefg".to_vec()), 3);
+        let response = materialized_response_or_error(
+            "grid",
+            Ok(b"abcdefg".to_vec()),
+            3,
+            &PayloadBufferBudget::new(4096),
+        );
         assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CONTENT_LENGTH], "7");
 
         let mut stream = response.into_body().into_data_stream();
         let mut chunks = Vec::new();
@@ -6491,7 +6875,6 @@ mod tests {
 #[cfg(test)]
 mod forwarding_admission_tests {
     use super::*;
-    use c2_mem::RetentionBudget;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     struct BodyDrop(Arc<AtomicBool>);
@@ -6510,10 +6893,7 @@ mod forwarding_admission_tests {
         let error: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(error["code"], 717);
         assert_eq!(error["details"]["dispatch_phase"], "pre_dispatch");
-        assert_eq!(
-            error["message"],
-            "relay forwarding capacity: original refusal"
-        );
+        assert_eq!(error["message"], "relay forwarding capacity exceeded");
     }
 
     #[tokio::test]
@@ -6622,16 +7002,17 @@ mod forwarding_admission_tests {
     }
 
     #[tokio::test]
-    async fn unknown_length_charges_before_growth_and_rejects_without_dispatch() {
-        let budget = RetentionBudget::new(1, 5);
-        let mut permit = budget.reserve(0).unwrap();
+    async fn unknown_length_growth_above_b_rejects_and_refunds() {
+        let budget = PayloadBufferBudget::new(5);
+        let cancelled = CancellationToken::new();
         let body = Body::from_stream(futures::stream::iter([
             Ok::<_, std::io::Error>(Bytes::from_static(b"abc")),
             Ok(Bytes::from_static(b"def")),
         ]));
-        let response = read_unknown_length_body("grid", body, 100, &mut permit)
+        let response = read_unknown_length_body("grid", body, 100, &budget, &cancelled)
             .await
-            .unwrap_err()
+            .err()
+            .expect("growth must reject")
             .into_response();
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
         let response = axum::body::to_bytes(response.into_body(), 4096)
@@ -6639,17 +7020,14 @@ mod forwarding_admission_tests {
             .unwrap();
         let error: serde_json::Value = serde_json::from_slice(&response).unwrap();
         assert_eq!(error["details"]["dispatch_phase"], "pre_dispatch");
-        assert_eq!(permit.bytes(), 3);
-        assert_eq!(budget.snapshot().used_retained_bytes, 3);
-        drop(permit);
-        assert_eq!(budget.snapshot().used_operations, 0);
-        assert_eq!(budget.snapshot().used_retained_bytes, 0);
+        assert_eq!(budget.snapshot().peak_bytes, 3);
+        assert_eq!(budget.snapshot().used_bytes, 0);
     }
 
     #[tokio::test]
     async fn unknown_length_source_fault_stays_body_error_and_refunds_owner() {
-        let budget = RetentionBudget::new(1, 100);
-        let mut permit = budget.reserve(0).unwrap();
+        let budget = PayloadBufferBudget::new(1024);
+        let cancelled = CancellationToken::new();
         let body = Body::from_stream(futures::stream::iter([
             Ok(Bytes::from_static(b"abc")),
             Err(std::io::Error::new(
@@ -6657,45 +7035,201 @@ mod forwarding_admission_tests {
                 "real source failure",
             )),
         ]));
-        let response = read_unknown_length_body("grid", body, 100, &mut permit)
+        let response = read_unknown_length_body("grid", body, 100, &budget, &cancelled)
             .await
-            .unwrap_err()
+            .err()
+            .expect("source fault must reject")
             .into_response();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(budget.snapshot().peak_bytes, 3);
         let response = axum::body::to_bytes(response.into_body(), 4096)
             .await
             .unwrap();
         let error: serde_json::Value = serde_json::from_slice(&response).unwrap();
         assert_eq!(error["error"], "RequestBodyReadError");
-        assert_eq!(permit.bytes(), 3);
-        drop(permit);
-        assert_eq!(budget.snapshot().used_retained_bytes, 0);
+        drop(response);
+        assert_eq!(budget.snapshot().used_bytes, 0);
     }
 
     #[tokio::test]
-    async fn unknown_length_success_and_payload_limit_keep_exact_charges() {
-        let budget = RetentionBudget::new(2, 100);
-        let mut permit = budget.reserve(0).unwrap();
+    async fn unknown_length_segments_fit_single_copy_budget() {
+        let budget = PayloadBufferBudget::new(5);
+        let cancelled = CancellationToken::new();
         let body = Body::from_stream(futures::stream::iter([
             Ok::<_, std::io::Error>(Bytes::new()),
             Ok(Bytes::from_static(b"abc")),
             Ok(Bytes::from_static(b"de")),
         ]));
-        assert_eq!(
-            read_unknown_length_body("grid", body, 5, &mut permit)
+        let input = tokio::time::timeout(
+            Duration::from_secs(1),
+            read_unknown_length_body("grid", body, 5, &budget, &cancelled),
+        )
+        .await
+        .expect("segments must not wait for a second full-size allocation")
+        .unwrap()
+        .unwrap();
+        assert_eq!(input.len(), 5);
+        let segments = input.into_segments();
+        assert_eq!(segments.len(), 2);
+        assert_eq!(segments[0].as_ref(), b"abc");
+        assert_eq!(segments[1].as_ref(), b"de");
+        assert_eq!(budget.snapshot().peak_bytes, 5);
+        assert_eq!(budget.snapshot().used_bytes, 5);
+        drop(segments);
+        assert_eq!(budget.snapshot().used_bytes, 0);
+
+        let error_budget = PayloadBufferBudget::new(1024);
+        let response =
+            read_unknown_length_body("grid", Body::from("abcdef"), 5, &error_budget, &cancelled)
                 .await
-                .unwrap_or_else(|_| panic!("bounded body should succeed")),
-            b"abcde"
-        );
-        assert_eq!(permit.bytes(), 5);
-        let mut rejected = budget.reserve(0).unwrap();
-        let response = read_unknown_length_body("grid", Body::from("abcdef"), 5, &mut rejected)
-            .await
-            .unwrap_err()
-            .into_response();
+                .err()
+                .expect("payload limit must reject")
+                .into_response();
         assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
-        assert_eq!(rejected.bytes(), 0);
-        drop((permit, rejected));
-        assert_eq!(budget.snapshot().used_retained_bytes, 0);
+        assert_eq!(error_budget.snapshot().used_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn unknown_length_first_segment_wait_cancels_without_dispatch() {
+        let budget = PayloadBufferBudget::new(5);
+        let held = budget.try_reserve(5).unwrap();
+        let cancelled = CancellationToken::new();
+        let mut read = Box::pin(read_unknown_length_body(
+            "grid",
+            Body::from("abc"),
+            5,
+            &budget,
+            &cancelled,
+        ));
+        assert!(futures::poll!(&mut read).is_pending());
+        assert_eq!(budget.snapshot().used_bytes, 5);
+        cancelled.cancel();
+        assert!(read.await.unwrap().is_none());
+        assert_eq!(budget.snapshot().used_bytes, 5);
+        assert_eq!(budget.snapshot().rejected_allocations, 0);
+        drop(held);
+        assert_eq!(budget.snapshot().used_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn concurrent_partial_unknown_uploads_do_not_wait_on_each_others_growth() {
+        let budget = PayloadBufferBudget::new(6);
+        let cancelled = CancellationToken::new();
+        let (resume_a, paused_a) = tokio::sync::oneshot::channel::<()>();
+        let (resume_b, paused_b) = tokio::sync::oneshot::channel::<()>();
+        let body_a = Body::from_stream(
+            futures::stream::once(async { Ok::<_, std::io::Error>(Bytes::from_static(b"abc")) })
+                .chain(futures::stream::once(async move {
+                    paused_a.await.unwrap();
+                    Ok(Bytes::from_static(b"d"))
+                })),
+        );
+        let body_b = Body::from_stream(
+            futures::stream::once(async { Ok::<_, std::io::Error>(Bytes::from_static(b"abc")) })
+                .chain(futures::stream::once(async move {
+                    paused_b.await.unwrap();
+                    Ok(Bytes::from_static(b"d"))
+                })),
+        );
+        let mut read_a = Box::pin(read_unknown_length_body(
+            "grid", body_a, 6, &budget, &cancelled,
+        ));
+        let mut read_b = Box::pin(read_unknown_length_body(
+            "grid", body_b, 6, &budget, &cancelled,
+        ));
+        assert!(futures::poll!(&mut read_a).is_pending());
+        assert!(futures::poll!(&mut read_b).is_pending());
+        assert_eq!(budget.snapshot().used_bytes, 6);
+
+        resume_a.send(()).unwrap();
+        let rejected = tokio::time::timeout(Duration::from_secs(1), &mut read_a)
+            .await
+            .expect("later segment must reject immediately when both partials fill B")
+            .err()
+            .expect("later segment must reject")
+            .into_response();
+        assert_eq!(rejected.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(budget.snapshot().used_bytes, 3);
+
+        resume_b.send(()).unwrap();
+        let accepted = read_b.await.unwrap().unwrap();
+        assert_eq!(accepted.len(), 4);
+        assert_eq!(budget.snapshot().used_bytes, 4);
+        drop(accepted);
+        assert_eq!(budget.snapshot().used_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn known_length_releases_reservation_after_final_real_chunk_owner() {
+        let budget = PayloadBufferBudget::new(5);
+        let reservation = budget.reserve(5).await.unwrap();
+        let body = Body::from_stream(futures::stream::iter([
+            Ok::<_, std::io::Error>(Bytes::from_static(b"abc")),
+            Ok(Bytes::from_static(b"de")),
+        ]));
+        let mut stream = Box::pin(known_length_body_stream(body, 5, reservation));
+        let first = stream.next().await.unwrap().unwrap();
+        let second = stream.next().await.unwrap().unwrap();
+        assert_eq!(budget.snapshot().used_bytes, 5);
+        drop(first);
+        assert_eq!(budget.snapshot().used_bytes, 5);
+        let alias = second.slice(..1);
+        drop(second);
+        assert_eq!(budget.snapshot().used_bytes, 5);
+        drop(alias);
+        assert_eq!(budget.snapshot().used_bytes, 0);
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn generated_error_bytes_refund_after_last_slice() {
+        use axum::body::HttpBody;
+
+        let budget = PayloadBufferBudget::new(1024);
+        let response = budgeted_json_response(
+            StatusCode::BAD_REQUEST,
+            serde_json::json!({"error": "InvalidContentLength"}),
+            &budget,
+            false,
+        );
+        let advertised_length = response.headers()[header::CONTENT_LENGTH]
+            .to_str()
+            .unwrap()
+            .parse::<u64>()
+            .unwrap();
+        assert_eq!(budget.snapshot().used_bytes, 0);
+        let mut body = response.into_body();
+        let frame = std::future::poll_fn(|cx| std::pin::Pin::new(&mut body).poll_frame(cx))
+            .await
+            .unwrap()
+            .unwrap();
+        let bytes = frame.into_data().unwrap();
+        let length = bytes.len() as u64;
+        assert_eq!(advertised_length, length);
+        assert_eq!(budget.snapshot().used_bytes, length);
+        let alias = bytes.slice(..1);
+        drop((body, bytes));
+        assert_eq!(budget.snapshot().used_bytes, length);
+        drop(alias);
+        assert_eq!(budget.snapshot().used_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn generated_error_that_cannot_fit_preserves_dispatch_uncertainty() {
+        let budget = PayloadBufferBudget::new(0);
+        let response = resource_unavailable_response_budgeted(
+            "grid",
+            "upstream failed after dispatch",
+            "dispatch_uncertain",
+            &budget,
+        );
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let bytes = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let envelope: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(envelope["code"], 702);
+        assert_eq!(envelope["details"]["dispatch_phase"], "dispatch_uncertain");
+        assert_eq!(budget.snapshot().used_bytes, 0);
     }
 }

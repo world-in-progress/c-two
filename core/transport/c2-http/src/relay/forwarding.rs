@@ -1,9 +1,9 @@
 //! Relay-owned bounded forwarding transactions. HTTP handlers own only waiters.
 //!
 //! The tracker and admission lock fence shutdown against task publication. The
-//! permit remains with the actual task until upstream completion and response
-//! materialization, including when its HTTP waiter has disappeared. This is an
-//! input retention policy, independent of the existing SHM/file/reassembly budget.
+//! operation permit remains with the actual task until upstream completion,
+//! including when its HTTP waiter has disappeared. Payload reservations belong
+//! to the actual request and response storage, not the operation permit.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -15,9 +15,11 @@ use std::sync::{
 use std::task::{Context, Poll};
 
 use c2_config::CallExecutionLimits;
+use c2_mem::retention::PayloadBufferBudget;
 use c2_mem::{RetentionBudget, RetentionError, RetentionPermit, RetentionSnapshot};
 use parking_lot::Mutex;
 use tokio::sync::oneshot;
+use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
 pub(crate) struct ForwardingDomain {
@@ -33,6 +35,7 @@ pub(crate) struct ForwardingDomain {
 #[derive(Debug)]
 pub(crate) struct ForwardingWaiter<T> {
     result: oneshot::Receiver<T>,
+    cancelled: CancellationToken,
     #[cfg(test)]
     completed: bool,
     #[cfg(test)]
@@ -53,9 +56,10 @@ impl<T> Future for ForwardingWaiter<T> {
     }
 }
 
-#[cfg(test)]
 impl<T> Drop for ForwardingWaiter<T> {
     fn drop(&mut self) {
+        self.cancelled.cancel();
+        #[cfg(test)]
         if !self.completed {
             self.detached_waiters.fetch_add(1, Ordering::SeqCst);
         }
@@ -75,28 +79,27 @@ impl ForwardingDomain {
         }
     }
 
-    /// No queue: reject before transferring input or publishing a native task.
-    pub(crate) fn spawn<T, F, Fut>(
-        &self,
-        input_bytes: u64,
-        work: F,
-    ) -> Result<ForwardingWaiter<T>, RetentionError>
+    /// No queue for operation slots: reject before publishing a native task.
+    pub(crate) fn spawn<T, F, Fut>(&self, work: F) -> Result<ForwardingWaiter<T>, RetentionError>
     where
         T: Send + 'static,
-        F: FnOnce(RetentionPermit) -> Fut + Send + 'static,
+        F: FnOnce(RetentionPermit, CancellationToken) -> Fut + Send + 'static,
         Fut: Future<Output = T> + Send + 'static,
     {
         let _admission = self.admission.lock();
-        let permit = self.budget.reserve(input_bytes)?;
+        let permit = self.budget.reserve()?;
         let (tx, rx) = oneshot::channel();
+        let cancelled = CancellationToken::new();
+        let task_cancelled = cancelled.clone();
         self.tasks.spawn(async move {
-            let result = work(permit).await;
+            let result = work(permit, task_cancelled).await;
             // A disconnected waiter drops the response here, invoking its
             // normal carrier/bytes owner release; it never aborts upstream.
             let _ = tx.send(result);
         });
         Ok(ForwardingWaiter {
             result: rx,
+            cancelled,
             #[cfg(test)]
             completed: false,
             #[cfg(test)]
@@ -121,6 +124,10 @@ impl ForwardingDomain {
 
     pub(crate) fn snapshot(&self) -> RetentionSnapshot {
         self.budget.snapshot()
+    }
+
+    pub(crate) fn payload_budget(&self) -> PayloadBufferBudget {
+        self.budget.payload_budget()
     }
 
     #[cfg(test)]
@@ -160,26 +167,24 @@ mod tests {
     async fn detached_waiter_keeps_permit_and_drain_observes_actual_task() {
         let domain = Arc::new(ForwardingDomain::new(&CallExecutionLimits {
             max_outstanding_calls: 1,
-            retained_input_budget_bytes: 32,
+            payload_buffer_budget_bytes: 32,
         }));
         let (release, wait) = oneshot::channel();
         let result = domain
-            .spawn(32, |permit| async move {
+            .spawn(|permit, _| async move {
                 wait.await.unwrap();
-                assert_eq!(permit.bytes(), 32);
                 drop(permit);
             })
             .unwrap();
         drop(result);
         assert_eq!(domain.snapshot().used_operations, 1);
-        assert_eq!(domain.snapshot().used_retained_bytes, 32);
         assert_eq!(
-            domain.spawn(0, |_| async {}).unwrap_err().reason,
+            domain.spawn(|_, _| async {}).unwrap_err().reason,
             RetentionRejectReason::OperationsExhausted
         );
         domain.close();
         assert_eq!(
-            domain.spawn(0, |_| async {}).unwrap_err().reason,
+            domain.spawn(|_, _| async {}).unwrap_err().reason,
             RetentionRejectReason::Closed
         );
         assert!(
@@ -187,7 +192,6 @@ mod tests {
                 .await
                 .is_err()
         );
-        assert_eq!(domain.snapshot().used_retained_bytes, 32);
         release.send(()).unwrap();
         tokio::time::timeout(Duration::from_secs(1), domain.drain())
             .await
@@ -197,42 +201,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bytes_zero_and_overflow_reject_without_publishing_work() {
+    async fn zero_payload_budget_still_admits_an_operation_slot() {
         let domain = ForwardingDomain::new(&CallExecutionLimits {
             max_outstanding_calls: 2,
-            retained_input_budget_bytes: 0,
+            payload_buffer_budget_bytes: 0,
         });
-        assert_eq!(
-            domain
-                .spawn(1, |_| async { panic!("must not execute") })
-                .unwrap_err()
-                .reason,
-            RetentionRejectReason::RetainedBytesExhausted
-        );
-        domain.spawn(0, |_| async {}).unwrap().await.unwrap();
+        let waiter = domain.spawn(|_, _| async {}).unwrap();
+        waiter.await.unwrap();
+        assert!(matches!(
+            domain.payload_budget().reserve(1).await,
+            Err(c2_mem::retention::PayloadBufferError::TooLarge { .. })
+        ));
         domain.close();
         domain.drain().await;
         assert_eq!(domain.snapshot().used_operations, 0);
-
-        let domain = ForwardingDomain::new(&CallExecutionLimits {
-            max_outstanding_calls: 2,
-            retained_input_budget_bytes: u64::MAX,
-        });
-        let (release, wait) = oneshot::channel();
-        let result = domain
-            .spawn(u64::MAX, |permit| async move {
-                let _ = wait.await;
-                drop(permit);
-            })
-            .unwrap();
-        assert_eq!(
-            domain.spawn(1, |_| async {}).unwrap_err().reason,
-            RetentionRejectReason::RetainedBytesExhausted
-        );
-        assert_eq!(domain.snapshot().used_operations, 1);
-        domain.close();
-        release.send(()).unwrap();
-        result.await.unwrap();
-        domain.drain().await;
     }
 }

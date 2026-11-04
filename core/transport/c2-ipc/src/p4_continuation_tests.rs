@@ -525,6 +525,7 @@ async fn source_failures_before_publication_leave_unrelated_calls_healthy() {
                 "echo",
                 8193,
                 futures_util::stream::iter(items),
+                None,
             )
             .await
             .unwrap_err();
@@ -586,7 +587,7 @@ async fn source_error_after_first_chunk_is_uncertain_and_records_request_source(
     });
     let call = tokio::spawn(async move {
         let error = client
-            .call_bound_sized_stream_phased(&binding, "echo", 8193, source)
+            .call_bound_sized_stream_phased(&binding, "echo", 8193, source, None)
             .await
             .unwrap_err();
         (client, error)
@@ -799,5 +800,88 @@ async fn sync_client_controlled_async_call_uses_caller_runtime_without_nested_bl
     tokio::task::spawn_blocking(move || assert!(client.close_shared(WAIT)))
         .await
         .unwrap();
+    stop(server, runner).await;
+}
+
+#[tokio::test]
+async fn inline_stream_copy_reserves_before_polling_its_charged_source() {
+    use c2_mem::retention::{BudgetedBuffer, PayloadBufferBudget};
+
+    let endpoint = Endpoint::new();
+    let calls = Arc::new(CountEcho(AtomicU64::new(0)));
+    let (server, runner) = start(&endpoint, calls.clone(), ServerIpcConfig::default()).await;
+    let mut cfg = config();
+    cfg.shm_threshold = u64::MAX;
+    let mut client = IpcClient::with_endpoint(endpoint.endpoint.clone(), cfg).unwrap();
+    client.connect().await.unwrap();
+    let binding = client.acquire_route(&contract()).await.unwrap();
+    let budget = PayloadBufferBudget::new(4);
+    let source = BudgetedBuffer::new(vec![3; 4], budget.try_reserve(4).unwrap());
+    let polls = Arc::new(AtomicU64::new(0));
+    let polled = polls.clone();
+    let source = futures_util::stream::iter([Ok::<_, std::io::Error>(source)]).inspect(move |_| {
+        polled.fetch_add(1, Ordering::SeqCst);
+    });
+    let error = client
+        .call_bound_sized_stream_phased(&binding, "echo", 4, source, Some(&budget))
+        .await
+        .unwrap_err();
+    assert_eq!(error.phase(), crate::TransportPhase::PreDispatch);
+    assert!(
+        matches!(error.into_source(), IpcError::LocalCallRejected(error)
+        if error.code == c2_error::ErrorCode::CallCapacityExceeded)
+    );
+    assert_eq!(polls.load(Ordering::SeqCst), 0);
+    assert_eq!(calls.0.load(Ordering::SeqCst), 0);
+    assert_eq!(budget.snapshot().used_bytes, 0);
+    assert_eq!(budget.snapshot().peak_bytes, 4);
+    assert_eq!(budget.snapshot().rejected_allocations, 1);
+    assert_eq!(budget.snapshot().rejected_bytes, 4);
+    assert!(client.is_connected());
+    assert_eq!(
+        client
+            .call_bound(&binding, "echo", b"healthy")
+            .await
+            .unwrap()
+            .into_owned_bytes()
+            .unwrap(),
+        b"healthy"
+    );
+    assert!(client.close_shared_bounded(WAIT).await);
+    stop(server, runner).await;
+}
+
+#[tokio::test]
+async fn owned_input_survives_unpublished_shm_fallback_without_an_extra_copy() {
+    use c2_mem::retention::{BudgetedBuffer, PayloadBufferBudget};
+
+    let endpoint = Endpoint::new();
+    let calls = Arc::new(CountEcho(AtomicU64::new(0)));
+    let (server, runner) = start(&endpoint, calls.clone(), ServerIpcConfig::default()).await;
+    let mut cfg = config();
+    cfg.base.shm_backing_budget_bytes = 0;
+    let mut client = IpcClient::with_endpoint(endpoint.endpoint.clone(), cfg).unwrap();
+    client.connect().await.unwrap();
+    let binding = client.acquire_route(&contract()).await.unwrap();
+    let budget = PayloadBufferBudget::new(8193);
+    let input = BudgetedBuffer::new(vec![7; 8193], budget.try_reserve(8193).unwrap());
+    let dispatches = Arc::new(AtomicU64::new(0));
+    let counted = dispatches.clone();
+    let control = IpcCallControl::new(move || {
+        counted.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    });
+    let reply = client
+        .call_bound_owned_controlled_phased(&binding, "echo", input, &control)
+        .await
+        .unwrap();
+    assert_eq!(reply.into_owned_bytes().unwrap(), vec![7; 8193]);
+    assert_eq!(dispatches.load(Ordering::SeqCst), 1);
+    assert_eq!(calls.0.load(Ordering::SeqCst), 1);
+    assert_eq!(budget.snapshot().used_bytes, 0);
+    assert_eq!(budget.snapshot().peak_bytes, 8193);
+    assert_eq!(budget.snapshot().rejected_allocations, 0);
+    assert_eq!(client.memory_budget.snapshot().shm.used_bytes, 0);
+    assert!(client.close_shared_bounded(WAIT).await);
     stop(server, runner).await;
 }
