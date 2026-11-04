@@ -218,7 +218,7 @@ The exact candidate `787d4205b5e9a23505c22b8155cf18a5a92dcad2` passed [Source Va
 
 ## IPC 16 call records (breaking)
 
-Calls now travel as IPC 16 call records; the [IPC handshake and call records](../reference/ipc-handshake.md#call-records-version-16) page gives the layout, and section 7 of the [streaming design](../design/2026-11-03-streaming-rpc-design.md) the reasons. SHM 4, C/FFI ABI 7 and relay mesh 7 are unchanged. Server streams are still not available: their records are defined but not yet sent.
+Calls now travel as IPC 16 call records; the [IPC handshake and call records](../reference/ipc-handshake.md#call-records-version-16) page gives the layout, and section 7 of the [streaming design](../design/2026-11-03-streaming-rpc-design.md) the reasons. SHM 4, C/FFI ABI 7 and relay mesh 7 are unchanged. The transport also carries server streams ([below](#server-streams-in-the-ipc-transport)), but the SDKs cannot use them yet.
 
 ### Upgrade together
 
@@ -246,3 +246,17 @@ IPC 16 replaces 15. A version 15 peer and a version 16 endpoint receive a typed 
 ### Validation
 
 On macOS with the FastDB sibling, the Rust Core workspace (1732 tests), c3 (81), the Rust SDK (27) and the CI Python gates, including the TypeScript and portable phases and the direct/relay matrix, passed on the integrated tree. An independent review's four findings were reproduced and fixed first. The exact candidate `b5b4853cc52a2747380db9824b500903655cf8db` (the IPC 16 code of `ea20ea0c` plus its documentation) passed [Source Validation 41911808218](https://github.com/Dsssyc/c-two/actions/runs/41911808218) on every lane on the first attempt: Linux x64 with Python 3.12 and 3.14t, macOS arm64, and Windows x64 and ARM64.
+
+## Server streams in the IPC transport
+
+The IPC transport now carries server streams. The server sends each item as ITEM_BEGIN followed by ITEM_DATA, and the client grants storage and demand with CREDIT and stops a stream with CANCEL; the [server streams](../reference/ipc-handshake.md#server-streams) section gives the rules. The SDKs cannot declare or call server streams yet, and generated TypeScript, Node and the relay do not carry them. IPC 16, SHM 4, C/FFI ABI 7 and relay mesh 7 are unchanged.
+
+### Behavior
+
+- The canonical error registry adds `CallCancelled` (718), with the Python class `CallCancelled` and `ERROR_Code.ERROR_CALL_CANCELLED`. It reports a server stream whose cancellation has finished.
+- A frame write that exceeds `write_timeout` still deactivates the connection, but a call record that the writer has already accepted keeps writing, and the call's later chunks and its reply follow that frame's real result. A chunked unary reply is therefore no longer cut off by a write that was slow but finished.
+- Rust Core names chunked values with chunk instead of fragment: `FLAG_CHUNKED`, `FLAG_FIRST_CHUNK`, `ChunkPosition` and the `ValuePart::chunk` field replace `FLAG_FRAGMENTED`, `FLAG_FIRST_FRAGMENT`, `FragmentPosition` and `ValuePart::fragment`. The wire bits are unchanged.
+
+### Validation
+
+On macOS with the FastDB sibling, the Rust Core workspace (1791 tests), c3 and the Rust SDK (108 together) and the CI Python gates, including the TypeScript and portable phases, passed on the integrated tree. The three findings of an independent review were confirmed in the code and fixed first: a call record whose write timed out could leave a stream without CALL_END, a receiver could report the end of a stream ahead of an item already queued, and a chunked stream OPEN ignored an early CALL_END. Full-platform CI of the exact candidate is pending.

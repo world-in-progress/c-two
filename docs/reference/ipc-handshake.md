@@ -46,22 +46,38 @@ Any other bit is rejected; IPC 15 used `0x0400` for its last chunk, and version 
 | Kind | Record | Body after the kind byte | Direction and `request_id` |
 | --- | --- | --- | --- |
 | 1 | OPEN | identity, method index (u16), input value | Client to server, non-zero |
-| 2 | ITEM_BEGIN | item length (u64) | Server to client; defined for server streams, not sent yet |
-| 3 | ITEM_DATA | one part of an item | Server to client; defined for server streams, not sent yet |
-| 4 | CREDIT | storage bytes (u64), item demand (u64) | Client to server; defined for server streams, not sent yet |
-| 5 | CANCEL | nothing | Client to server; defined for server streams, not sent yet |
-| 6 | CALL_END | status (u8), result or error | Server to client, non-zero; a server-stream call also carries its count of complete items (u64) after the status |
+| 2 | ITEM_BEGIN | item length (u64) | Server to client, non-zero; server streams only |
+| 3 | ITEM_DATA | one part of an item, inline or one SHM descriptor | Server to client, non-zero; server streams only |
+| 4 | CREDIT | storage bytes (u64), item demand (u64) | Client to server, non-zero; server streams only |
+| 5 | CANCEL | nothing | Client to server, non-zero; server streams only |
+| 6 | CALL_END | status (u8), result or error | Server to client, non-zero; Success and Failed of a server-stream call also carry its count of complete items (u64) after the status |
 | 7 | RELEASE | count (u8, 1 to 64), loan IDs (u64 each) | Both directions, `request_id` 0 |
 
 The identity in OPEN is the seven route and contract fields `route_name`, `route_uid`, `crm_ns`, `crm_name`, `crm_ver`, `abi_hash` and `signature_hash`, each a u8 byte length followed by UTF-8 text, validated as before. OPEN carries no mode and no initial demand: the mode comes from the validated contract, and a server stream starts with demand for one item.
 
-CALL_END has one status: Success (0), Failed (1) or NotExecuted (2). Failed and NotExecuted carry a non-empty inline C2E1 error. NotExecuted means the call never entered the resource: the server sends it only while the call is still being prepared or queued, so a client can report it as pre-dispatch even though OPEN was written. Failed means the resource ran.
+CALL_END has one status: Success (0), Failed (1) or NotExecuted (2). Failed and NotExecuted carry a non-empty inline C2E1 error. NotExecuted means the call never entered the resource: the server sends it only while the call is still being prepared or queued, so a client can report it as pre-dispatch even though OPEN was written. Failed means the resource ran. NotExecuted never carries an item count, so a receiver reads the count only when the status is Success or Failed and the call's validated mode is a server stream.
 
 A value is sent whole when it fits: inline values run to the end of the frame, and an SHM value is exactly one descriptor. A value too large for one frame is chunked: the first chunk carries the record metadata, the total length (u64) and the first part, which must be shorter than the total; every later chunk carries only the kind byte and its part, and is exactly as long as the first part or the remainder. Chunks carry no index or count. The receive loop assigns each chunk's offset from one running count when it admits the chunk, so copies may finish in any order; the value is complete when every byte has been copied. Small unary calls use one OPEN and one CALL_END frame.
 
 Request IDs are assigned by the connection's single writer when it first commits a call or a control that expects a reply, so OPEN records reach the peer in strictly increasing order; IDs never repeat or wrap, and gaps are allowed. ID 0 is for RELEASE and controls without a reply. The server keeps the largest OPEN ID it has seen, the request-ID high-water mark, and a table of active calls. A new OPEN must exceed the mark. A chunk for an ID at or below the mark that is no longer active is accepted at the frame boundary, its SHM descriptor is released to the original connection, and it is discarded without a new call or another reply; a chunk for an ID above the mark is a protocol error. The client dispatches records by its own table of active calls, so a late reply can never be taken for a later call's response. Loans are settled by RELEASE independently of call outcomes, and a late RELEASE still settles on its original connection.
 
 Protocol errors in well-framed records, such as a repeated OPEN, deactivate the connection: it takes no new calls, and calls already sent finish and reply. If the server cannot send the rest of a chunked CALL_END after its first chunk has been written, it deactivates the connection without sending a second CALL_END; the other calls on the connection still finish, and the client reports the incomplete call as dispatch-uncertain when the connection ends.
+
+A frame write that exceeds `write_timeout` deactivates the connection, but a call record the writer has already accepted keeps writing, and the call's next chunk, item and CALL_END follow that frame's real result.
+
+## Server streams
+
+A server stream opens with one OPEN, and the validated contract gives its mode. Once the server admits it, the stream has demand for one item. The server runs a resource step only while the stream has demand, and each step yields one item, finishes or raises. A call has at most one unfinished item.
+
+Each item starts with ITEM_BEGIN, which carries the item's length; an item of length zero is complete at ITEM_BEGIN and has no ITEM_DATA. On ITEM_BEGIN the client reserves the whole length in its payload buffer budget and only then sends CREDIT for that many storage bytes; while the budget is short only this call waits, and the receive loop goes on with other frames. An item longer than the whole budget fails at once: the consumer receives `CallCapacityExceeded` and the client sends CANCEL, keeping the call's record until CALL_END. The server sends the item as ITEM_DATA records, each one inline part or one SHM descriptor and never longer than the storage still granted; inline parts are at most `chunk_size` long, so other calls' frames pass between them. ITEM_DATA carries no chunk flags and no offset: each part continues where the item's received bytes end.
+
+When the client places a complete item in its local consumer interface, which holds one item, it grants demand for the next item. A client therefore holds at most one delivered item that has not been taken and one more it has granted. Storage and demand waiting to be sent travel together in one CREDIT. CREDIT may not grant more storage than the rest of the current item or raise demand above one; such a CREDIT, an ITEM_BEGIN without demand and ITEM_DATA beyond the granted storage are protocol errors.
+
+A stream ends with one CALL_END after its cleanup has run. A stream that runs out sends Success with its count of complete items. An error from a step comes after the items already sent, as Failed with the count, and a cleanup error replaces the outcome it follows. CANCEL is a request to stop: a step that has not started does not start, a running step runs to its end, and then the cleanup runs without waiting for demand or storage. A cancelled stream ends with `CallCancelled` (718) after its cleanup, as NotExecuted when it never entered the resource and otherwise as Failed with the count. A second CANCEL changes nothing, a CANCEL after a natural end does not change that outcome, and the server ignores CREDIT after CANCEL. An item abandoned partway is not delivered; its late ITEM_DATA records still settle on the original connection, which releases their SHM descriptors and drops their data.
+
+A stream that has entered the resource, and an item waiting for demand or storage, is never collected for being silent. Deactivation stops new calls; admitted streams continue, and the connection closes physically only after its call records, admitted writes, remote read ranges and loans have ended. If the peer ends, the server runs the cleanup after the current step and sends no CALL_END; the client reports a stream without CALL_END as dispatch-uncertain, and the items it already delivered remain valid.
+
+The connection's single writer sends RELEASE, CREDIT and CANCEL between complete frames, takes turns among writable calls one chunk or item part at a time, so one large item cannot hold the connection, and never sends a call's CALL_END ahead of that call's data.
 
 ## Malformed records versus VersionMismatch
 

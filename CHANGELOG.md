@@ -20,10 +20,12 @@ See the [unreleased notes](docs/releases/unreleased.md).
 - Breaking: `max_total_chunks` / `C2_IPC_MAX_TOTAL_CHUNKS` is renamed `max_inflight_chunk_frames` / `C2_IPC_MAX_INFLIGHT_CHUNK_FRAMES`.
 - A relay-aware call no longer re-sends after the relay reports a stale route, and chunked IPC calls reserve their route in frame order like unchunked calls.
 - Breaking: IPC 16 call records replace the IPC 15 business frames, so upgrade the SDKs, c3 and generated TypeScript clients together and regenerate the clients. A call the server refused before it entered the resource is now reported as pre-dispatch (NotExecuted) instead of as a resource error.
+- A frame write that exceeds `write_timeout` deactivates the connection without cutting off the call record being written; the call follows that frame's real result.
 
 ### Added
 
 - `ipc_overrides` keys `write_timeout`, `max_dedicated_segments` and `spill_threshold`, with their `C2_IPC_*` environment variables.
+- Error code `CallCancelled` (718) for a server stream whose cancellation has finished. The IPC transport carries server-stream items, grants and cancellation; the SDKs cannot use server streams yet.
 
 ### Removed
 

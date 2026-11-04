@@ -4,7 +4,7 @@
 
 ## 进行中
 
-- **流式 RPC**（[设计](2026-11-03-streaming-rpc-design.md)于 2026-11-04 批准，[ADR 0003](../decisions/0003-server-streams.md)；执行计划是设计第十节）：第一阶段（块 1 至 4）已于 2026-11-04 验收：确切候选 `787d4205` 的全平台 CI 通过，见[验收记录](../acceptance/2026-11-04-streaming-phase-1-acceptance.md)；分支 `socu/streaming` 在 fork 上，尚未合入上游 main。块 5a（IPC 16 调用记录）已于 2026-11-05 合入整合分支，确切候选 `b5b4853c` 的全平台 CI（run 41911808218）通过；块 5b 正在实施。块 5 分两步的理由见设计第十节表格后的补记。
+- **流式 RPC**（[设计](2026-11-03-streaming-rpc-design.md)于 2026-11-04 批准，[ADR 0003](../decisions/0003-server-streams.md)；执行计划是设计第十节）：第一阶段（块 1 至 4）已于 2026-11-04 验收：确切候选 `787d4205` 的全平台 CI 通过，见[验收记录](../acceptance/2026-11-04-streaming-phase-1-acceptance.md)；分支 `socu/streaming` 在 fork 上，尚未合入上游 main。块 5a（IPC 16 调用记录）已于 2026-11-05 合入整合分支，确切候选 `b5b4853c` 的全平台 CI（run 41911808218）通过；块 5b（服务端流的传输）同日合入（`02b4c008`），全平台 CI 待跑。块 6 也分两步：6a 做 Rust Core 与 Rust SDK，6b 做 Python。块 5 与块 6 分步的理由见设计第十节表格后的补记。
 
 ## 接下来（建议的顺序，待维护者确认）
 
