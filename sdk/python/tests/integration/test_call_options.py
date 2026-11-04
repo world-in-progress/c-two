@@ -379,6 +379,12 @@ def test_retired_domain_and_shutdown_report_unfinished_charges_honestly(ipc_conn
             assert outcome['ipc_clients_drained'], outcome
             assert resource.completed == ['active']
 
+        # Shutdown completes when the connections drain. The dispatched
+        # call's native task frees its operation slot only after it has
+        # published the late reply, which may come a moment later.
+        deadline = time.monotonic() + 2
+        while session.call_execution_snapshot()['used_operations'] and time.monotonic() < deadline:
+            time.sleep(0.01)
         actual = session.call_execution_snapshot()
         assert actual['closed']
         assert actual['used_operations'] == 0
