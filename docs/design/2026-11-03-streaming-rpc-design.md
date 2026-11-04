@@ -285,7 +285,7 @@ exact implementation candidate 必须通过 GitHub Actions 的 Linux、macOS、W
 | 6 资源与 SDK | 第二节、3.3 至 3.6、第六节的 Python 与 Rust | c2-core 的 host、client、session；Python 的 native、proxy、server、transfer 与 CRM 元数据；sdk/rust；c2-codegen 的 Rust 与 Python 目标 | 2、3、5 | Python 与 Rust 资源按步推进，路由许可只在步内；contextvars；hold；句柄回收发 CANCEL；显式 close；shutdown 与注销在步之间结束流；同进程对象直传，拒绝有限截止时间。 |
 | 7 Node | 第六节的 Node 部分、第四节第 7 条 | c2-mem-ffi 的 endpoint 与 C 头文件、TypeScript 绑定、c2-codegen 的 TypeScript 目标与 transport | 5，可与块 6 并行 | ABI 8；每条物理连接一个持续 reader；去掉 callChain；`C2ResponseStream`；fetch 增量读取；公开错误区分 pre_dispatch 与派发不确定。 |
 | 8 relay | 3.4 末段、3.8 | c2-http 的 client、relay 与 payload；c2-ipc 的逐片响应读取入口；cli | 3、5，与块 6、7 协同 | 请求一次发完，响应逐条发送；不组成完整响应 Vec，上游响应每片先取得 B 的预约再复制；whole SHM 按片复制；取消只影响本调用；mesh 7 的消息不变；真实慢读测出预产步数的上限。 |
-| 9 交叉验收 | 第九节 | 三语言测试、CI、参考文档、验收记录 | 全部 | 同一候选在 Linux、macOS、Windows x64 与 ARM64 的 CI 全绿；直接 IPC 与 relay 矩阵通过；配对基准对照实施前的 main，过第十二节第 7 项的门槛。 |
+| 9 交叉验收 | 第九节 | 三语言测试、CI、参考文档、验收记录 | 全部 | 同一候选在 Linux、macOS、Windows x64 与 ARM64 的 CI 全绿；直接 IPC 与 relay 矩阵通过；[闲置驱逐审查](../acceptance/2026-10-10-idle-eviction-regression-audit.md)的六道门禁在 Python、Rust SDK 与生成的 Node 客户端上补齐，包括持久直连、relay-local 与 HTTP 全链和真实断流；配对基准对照实施前的 main，过第十二节第 7 项的门槛。 |
 
 关键路径为块 1、3 → 4 → 5 → 6、7 → 8 → 9，块 1、2、3 可以同时开始。第一阶段是块 1 至 4，仍为 IPC 15，对外只有两项设置改名；第二阶段是块 5 至 8，IPC 16 与 ABI 8 同批切换；第三阶段是块 9。每个阶段结束时，整合分支跑一次全平台 CI。块 6 与块 7 都改 `c2-codegen/src/targets.rs`，各自只动本目标的生成函数，共用的方法遍历与 mode 处理由块 2 定下。
 
@@ -296,8 +296,8 @@ exact implementation candidate 必须通过 GitHub Actions 的 Linux、macOS、W
 - 块 4：删掉 c2-server 构造时多余的一次响应池预热。
 - 块 5：c2-ipc 判定零借出 ID 改用 c2-wire 的专用错误类型，不再匹配字段名 `"loan id"`；给已接纳调用的回复不再借用 `WriteRequest::Control` 的名字；资源进程在执行前的路由准入拒绝（例如路由过期）要报成派发前失败，现在它经资源错误的路径报成 HTTP 500（`core/transport/c2-server/src/server.rs:3179`、`:3338`）。
 - 块 6：Python `register` 的 `input_lifetime` 写成 `Literal['materialized', 'borrowed']`，与服务端桥的私有别名 `_InputLifetime` 合成一处；服务端桥 `shutdown()` 的 5 秒缺省只在注册失败的回滚路径上用到（`sdk/python/src/c_two/transport/registry.py:529`），统一为 30 秒。
-- 块 7：c2-mem-ffi 连接入口的 Rust 文档注释与 C 头文件对身份校验失败状态码的写法统一。
-- 块 8：`LocalEndpointNamespaceRequired` 的消息改为资源一方的本地端点命名空间。
+- 块 7：c2-mem-ffi 连接入口的 Rust 文档注释与 C 头文件对身份校验失败状态码的写法统一。Node 的 relay-aware 客户端与 Rust 一致，只发一次业务 POST，遇到过期路由报派发前错误、不再自动重发（现在仍会排除该 relay 后重发，`core/foundation/c2-codegen/assets/typescript_transport.ts:1074`）；FallbackDenied 保留首个 IPC 失败的类型化原因（`:1007`、`:2960` 仍丢失）。
+- 块 8：`LocalEndpointNamespaceRequired` 的消息改为资源一方的本地端点命名空间。relay 现在先取得上游连接的租约、再等 B（`core/transport/c2-http/src/relay/router.rs:1937`、`:1966`），等待期间闲置回收不会收走这条连接；补上 B 等待与闲置驱逐、取消、续连交错的测试，必要时把预约移到租约之前，并在等待之后重新核对路由。
 
 ## 十一、与设计要求不一致之处
 
