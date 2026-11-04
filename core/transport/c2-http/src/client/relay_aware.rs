@@ -723,21 +723,20 @@ fn route_is_stale(err: &HttpError) -> bool {
     }
 }
 
-fn relay_capacity_is_pre_dispatch(error: &HttpError) -> bool {
+fn relay_rejection_is_pre_dispatch(error: &HttpError) -> bool {
     let body = match error {
-        HttpError::ResponseError(429 | 502, body) => body.as_ref(),
-        HttpError::ServerError(429 | 502, body) => body.as_bytes(),
+        HttpError::ResponseError(404 | 409 | 410 | 429 | 502 | 503, body) => body.as_ref(),
+        HttpError::ServerError(404 | 409 | 410 | 429 | 502 | 503, body) => body.as_bytes(),
         _ => return false,
     };
     let Ok(envelope) = serde_json::from_slice::<c2_error::C2ErrorEnvelope>(body) else {
         return false;
     };
     c2_error::C2Error::from_envelope(envelope).is_ok_and(|error| {
-        error.code == c2_error::ErrorCode::CallCapacityExceeded
-            && error
-                .details
-                .get("dispatch_phase")
-                .is_some_and(|phase| phase == "pre_dispatch")
+        error
+            .details
+            .get("dispatch_phase")
+            .is_some_and(|phase| phase == "pre_dispatch")
     })
 }
 
@@ -752,7 +751,7 @@ fn http_call_error_phase(error: &HttpError) -> HttpCallPhase {
             HttpCallPhase::DispatchUncertain
         }
         HttpError::InvalidInput(_) | HttpError::LocalCallRejected(_) => HttpCallPhase::PreDispatch,
-        error if route_is_stale(error) || relay_capacity_is_pre_dispatch(error) => {
+        error if route_is_stale(error) || relay_rejection_is_pre_dispatch(error) => {
             HttpCallPhase::PreDispatch
         }
         _ => HttpCallPhase::DispatchUncertain,
@@ -1217,8 +1216,39 @@ mod tests {
         assert!(route_is_stale(&stale));
         assert_eq!(http_call_error_phase(&stale), HttpCallPhase::PreDispatch);
 
-        let mut capacity = canonical_error_json(702, "ResourceUnavailable", "capacity", "grid");
-        capacity["details"]["dispatch_phase"] = json!("pre_dispatch");
+        let mut rejected = canonical_error_json(701, "ResourceNotFound", "not executed", "grid");
+        rejected["details"]["dispatch_phase"] = json!("pre_dispatch");
+        assert_eq!(
+            http_call_error_phase(&HttpError::ServerError(404, rejected.to_string())),
+            HttpCallPhase::PreDispatch
+        );
+        let mut unavailable =
+            canonical_error_json(702, "ResourceUnavailable", "not executed", "grid");
+        unavailable["details"]["dispatch_phase"] = json!("pre_dispatch");
+        assert_eq!(
+            http_call_error_phase(&HttpError::ServerError(503, unavailable.to_string())),
+            HttpCallPhase::PreDispatch
+        );
+
+        let mut capacity_rejected =
+            canonical_error_json(717, "CallCapacityExceeded", "not executed", "grid");
+        capacity_rejected["details"]["dispatch_phase"] = json!("pre_dispatch");
+        assert_eq!(
+            http_call_error_phase(&HttpError::ServerError(502, capacity_rejected.to_string())),
+            HttpCallPhase::PreDispatch
+        );
+
+        let mut failed_after_callback = rejected.clone();
+        failed_after_callback["details"]["dispatch_phase"] = json!("dispatch_uncertain");
+        assert_eq!(
+            http_call_error_phase(&HttpError::ServerError(
+                500,
+                failed_after_callback.to_string()
+            )),
+            HttpCallPhase::DispatchUncertain
+        );
+
+        let capacity = canonical_error_json(702, "ResourceUnavailable", "capacity", "grid");
         for error in [
             HttpError::ServerError(502, capacity.to_string()),
             HttpError::ServerError(429, capacity.to_string()),

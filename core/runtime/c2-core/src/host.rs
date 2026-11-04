@@ -1299,7 +1299,7 @@ mod lifecycle_tests {
             .await
             .unwrap();
             read_raw_frame(&mut peer).await;
-            let identity = c2_wire::control::RouteCallIdentity {
+            let identity = c2_wire::rpc::RouteCallIdentity {
                 route_name: expected.route_name,
                 route_uid: registration.outcome().route_uid.clone(),
                 crm_ns: expected.crm_ns,
@@ -1308,9 +1308,9 @@ mod lifecycle_tests {
                 abi_hash: expected.abi_hash,
                 signature_hash: expected.signature_hash,
             };
-            let mut call = c2_wire::control::encode_call_control(&identity, 1).unwrap();
+            let mut call = c2_wire::rpc::encode_open_metadata(&identity, 1).unwrap();
             call.extend_from_slice(&vec![0x5a; 32 * 1024]);
-            peer.write_all(&encode_frame(1, FLAG_CALL_V2, &call))
+            peer.write_all(&encode_frame(1, FLAG_RPC_RECORD, &call))
                 .await
                 .unwrap();
             read_raw_frame(&mut peer).await
@@ -1320,7 +1320,18 @@ mod lifecycle_tests {
             header.is_buddy(),
             "test must retain an actual response loan"
         );
-        let (descriptor, _) = c2_wire::buddy::decode_buddy_payload(payload).unwrap();
+        let c2_wire::rpc::RpcRecord::CallEnd {
+            value:
+                c2_wire::rpc::ValuePart {
+                    storage: c2_wire::rpc::ValueStorage::Shm(descriptor),
+                    ..
+                },
+            ..
+        } = c2_wire::rpc::decode_rpc_record(&header, payload, Some(c2_wire::rpc::CallMode::Unary))
+            .unwrap()
+        else {
+            panic!("expected whole SHM CALL_END");
+        };
         assert_eq!(
             host.inner
                 .server

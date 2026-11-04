@@ -24,6 +24,7 @@ from tests.fixtures.portable_interop import FASTDB_REPOSITORY, logical_result_sh
 from tests.fixtures.portable_matrix import (
     CRM_CLASSES,
     DESCRIPTOR_PATHS,
+    IPC_OVERRIDES,
     MatrixArtifacts,
     MatrixRelay,
     RustHost,
@@ -656,19 +657,206 @@ def test_typescript_real_connector_version_mismatch(
           await assert.rejects(transport.prepare('version', contract.CONTRACT), (error) => {
             assert.ok(error instanceof contract.C2IpcTransportError);
             assert.equal(error.category, 'protocol_version_mismatch');
-            assert.equal(error.localProtocolVersion, 15);
-            assert.equal(error.peerProtocolVersion, 16);
+            assert.equal(error.localProtocolVersion, 16);
+            assert.equal(error.peerProtocolVersion, 17);
             return true;
           });
           assert.equal(connects, 1);
         } finally { await transport.close(); await runtime.close(); }
         """), encoding="utf-8")
-    with running_version_peer(ipc_version_peer_binary, "mismatch16") as (address, context):
+    with running_version_peer(ipc_version_peer_binary, "mismatch17") as (address, context):
         _run_checked(
             [typescript_artifacts.node_binary, str(script),
              str(typescript_artifacts.contract_modules["no-payload"]), address, context.root or ""],
             cwd=typescript_artifacts.node_root, timeout=10,
         )
+
+
+def test_generated_typescript_late_open_continuation_after_capacity_refusal(
+    typescript_artifacts: TypeScriptArtifacts,
+) -> None:
+    """A refused fragmented call keeps one terminal across GC and late input."""
+    script = typescript_artifacts.node_root / "late-open-continuation.mjs"
+    script.write_text(dedent("""\
+        import assert from 'node:assert/strict';
+        import { pathToFileURL } from 'node:url';
+        import { createBundledC2MemFfiNodeRuntime } from '@c-two/c2-mem-ffi';
+
+        const [modulePath, address, routeName] = process.argv.slice(2);
+        const contract = await import(pathToFileURL(modulePath).href);
+        const runtime = createBundledC2MemFfiNodeRuntime();
+        const terminalCounts = new Map();
+        let trace = false;
+        let connects = 0;
+        let firstRequestId;
+        let firstStatus;
+        let continuationForwarded = false;
+        let releaseContinuation;
+        let continuationHeldResolve;
+        let terminalSeenResolve;
+        const continuationHeld = new Promise(resolve => { continuationHeldResolve = resolve; });
+        const terminalSeen = new Promise(resolve => { terminalSeenResolve = resolve; });
+
+        function frames(bytes) {
+          const result = [];
+          for (let offset = 0; offset < bytes.byteLength;) {
+            assert.ok(bytes.byteLength - offset >= 16, 'complete IPC frame header');
+            const view = new DataView(bytes.buffer, bytes.byteOffset + offset);
+            const length = view.getUint32(0, true) + 4;
+            assert.ok(length >= 16 && offset + length <= bytes.byteLength, 'complete IPC frame');
+            result.push({
+              requestId: view.getBigUint64(4, true),
+              flags: view.getUint32(12, true),
+              kind: bytes[offset + 16],
+            });
+            offset += length;
+          }
+          return result;
+        }
+
+        const transport = contract.createIpcEncodedTransport(address, {
+          requestChunkSize: 1024,
+          requestShmThreshold: 8192,
+          connect: async (target, timeoutMs) => {
+            connects += 1;
+            const connection = await runtime.connect(target, timeoutMs);
+            let pendingResponse;
+            return {
+              memory: connection.memory,
+              get deactivated() { return connection.deactivated; },
+              get deactivation() { return connection.deactivation; },
+              close: () => connection.close(),
+              async write(bytes) {
+                if (trace) {
+                  for (const frame of frames(bytes)) {
+                    if (frame.kind !== 1 || (frame.flags & 0x1000) === 0) continue;
+                    if ((frame.flags & 0x2000) !== 0) {
+                      assert.equal(firstRequestId, undefined);
+                      firstRequestId = frame.requestId;
+                    } else if ((frame.flags & 0x200) !== 0 && frame.requestId === firstRequestId) {
+                      assert.equal(releaseContinuation, undefined);
+                      await new Promise(resolve => {
+                        releaseContinuation = resolve;
+                        continuationHeldResolve();
+                      });
+                      continuationForwarded = true;
+                    }
+                  }
+                }
+                return await connection.write(bytes);
+              },
+              async readExactly(length) {
+                const bytes = await connection.readExactly(length);
+                if (!trace) return bytes;
+                if (pendingResponse === undefined) {
+                  assert.equal(length, 16, 'IPC response header boundary');
+                  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+                  pendingResponse = {
+                    length: view.getUint32(0, true) - 12,
+                    requestId: view.getBigUint64(4, true),
+                    flags: view.getUint32(12, true),
+                  };
+                  if (pendingResponse.length === 0) pendingResponse = undefined;
+                  // Let the writer reach its held continuation before the
+                  // generated reader can observe the refusal and stop upload.
+                  if (pendingResponse?.requestId === firstRequestId) {
+                    await continuationHeld;
+                  }
+                } else {
+                  assert.equal(length, pendingResponse.length, 'IPC response payload boundary');
+                  if ((pendingResponse.flags & 0x1002) === 0x1002 && bytes[0] === 6) {
+                    const id = pendingResponse.requestId;
+                    terminalCounts.set(id, (terminalCounts.get(id) ?? 0) + 1);
+                    if (id === firstRequestId) {
+                      firstStatus = bytes[1];
+                      terminalSeenResolve();
+                    }
+                  }
+                  pendingResponse = undefined;
+                }
+                return bytes;
+              },
+            };
+          },
+        });
+
+        async function barrier(promise, name) {
+          let timer;
+          try {
+            await Promise.race([
+              promise,
+              new Promise((_, reject) => {
+                timer = setTimeout(() => reject(new Error(`${name} did not occur`)), 5000);
+              }),
+            ]);
+          } finally {
+            clearTimeout(timer);
+          }
+        }
+
+        try {
+          await transport.prepare(routeName, contract.CONTRACT);
+          trace = true;
+          const rejected = assert.rejects(
+            transport.call(routeName, contract.CONTRACT, 'ping', new Uint8Array(4096)),
+            error => {
+              assert.ok(error instanceof contract.C2IpcCallRejectedError);
+              assert.equal(error.transportPhase, 'pre_dispatch');
+              assert.equal(error.retrySafe, true);
+              assert.equal(error.code, 702);
+              assert.equal(error.canonicalName, 'ResourceUnavailable');
+              assert.match(error.message, /reassembly admission failed/);
+              const canonical = JSON.parse(new TextDecoder().decode(error.payload.subarray(4)));
+              assert.deepEqual(error.details, canonical.details);
+              assert.equal(canonical.code, error.code);
+              assert.equal(canonical.name, error.canonicalName);
+              return true;
+            },
+          );
+          void rejected.catch(() => undefined);
+          await barrier(Promise.all([continuationHeld, terminalSeen]), 'refusal and held continuation');
+          assert.equal(firstStatus, 2, 'NotExecuted CALL_END');
+          // The server owns both timings. This wait crosses its configured
+          // assembler timeout and several periodic GC ticks before late input.
+          await new Promise(resolve => setTimeout(resolve, 200));
+          releaseContinuation();
+          await rejected;
+          assert.equal(continuationForwarded, true);
+          const client = new contract.ContractClient(transport, routeName);
+          assert.equal(await client.method_0_ping(), undefined);
+          assert.equal(connects, 1, 'both calls use the original physical connection');
+          assert.equal(terminalCounts.get(firstRequestId), 1);
+          assert.equal(terminalCounts.size, 2);
+          for (const count of terminalCounts.values()) assert.equal(count, 1);
+        } finally {
+          releaseContinuation?.();
+          await transport.close();
+          await runtime.close();
+        }
+        """), encoding="utf-8")
+    resource = resource_for("no-payload")
+    cc.set_server(ipc_overrides={
+        **IPC_OVERRIDES,
+        "max_reassembly_bytes": 2048,
+        "chunk_assembler_timeout": 0.06,
+        "chunk_gc_interval": 0.01,
+    })
+    route_name = _route_name("late-open-continuation")
+    cc.register(CRM_CLASSES["no-payload"], resource, name=route_name)
+    address = cc.server_address()
+    assert address is not None
+    try:
+        _run_checked(
+            [typescript_artifacts.node_binary, str(script),
+             str(typescript_artifacts.contract_modules["no-payload"]),
+             address, route_name],
+            cwd=typescript_artifacts.node_root,
+            environment=_process_environment(),
+            timeout=20,
+        )
+        assert resource.calls == 1
+    finally:
+        _reset_default_runtime()
 
 
 def test_typescript_real_calls_write_strict_development_receipt(

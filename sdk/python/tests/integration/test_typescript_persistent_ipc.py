@@ -259,7 +259,7 @@ def test_generated_node_early_chunk_rejection_stops_upload_and_reuses_connection
 
             rejected = node.request("large")
             _reject(rejected)
-            assert rejected["error"]["name"] == "C2CrmMethodError", rejected
+            assert rejected["error"]["name"] == "C2IpcCallRejectedError", rejected
             # The first-chunk size check and the global chunk-processing
             # permit check can race to reply. Both are native capacity
             # refusals; client preflight and close-induced I/O cannot replace them.

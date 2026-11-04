@@ -1,9 +1,8 @@
 //! Sharded chunk registry.
 //!
 //! [`ChunkRegistry`] is a thread-safe, sharded manager for in-flight chunked
-//! reassemblies and settled requests. It wraps [`ChunkAssembler`] instances
-//! with tracking metadata and provides frame admission, one error-reply claim,
-//! reassembly and connection/GC cleanup through the same sharded table.
+//! reassemblies. It wraps [`ChunkAssembler`] instances with tracking metadata
+//! and provides storage admission, reassembly and connection/GC cleanup.
 //!
 //! Admission is finite: `insert` reserves the checked assembly capacity from
 //! the pool's canonical reassembly budget before any storage is allocated,
@@ -18,7 +17,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
 
-use crate::assembler::ChunkAssembler;
+use crate::assembler::{ChunkAssembler, CopiedChunk, PreparedChunk};
 use c2_mem::MemPool;
 use tracing::warn;
 
@@ -32,6 +31,8 @@ const SHARD_COUNT: usize = 16;
 pub struct GcStats {
     pub expired: usize,
     pub remaining: usize,
+    /// Bytes detached from registry accounting. Copy tokens can retain the
+    /// actual allocation and budget charge after this value is reported.
     pub freed_bytes: u64,
 }
 
@@ -46,7 +47,7 @@ enum StorageState {
 
 struct RequestState {
     settled: AtomicBool,
-    last_received: AtomicBool,
+    expired: AtomicBool,
     // Storage admission ends at take, GC, abort or settlement. Frame tokens
     // retain this exact fact even after removal from the shard.
     storage: AtomicU8,
@@ -57,15 +58,15 @@ impl Default for RequestState {
     fn default() -> Self {
         Self {
             settled: AtomicBool::new(false),
-            last_received: AtomicBool::new(false),
+            expired: AtomicBool::new(false),
             storage: AtomicU8::new(StorageState::Pending as u8),
             waiters: Mutex::new(Vec::new()),
         }
     }
 }
 
-/// One request's shared error-reply claim. Dispatched frames retain this exact
-/// claim even after its last frame removes the registry entry.
+/// Original assembly storage and work-cancellation token. Frame tasks retain
+/// this owner after shard removal; the connection call table owns CALL_END.
 pub struct ChunkRequest<C = ()> {
     conn_id: u64,
     request_id: u64,
@@ -87,6 +88,16 @@ impl<C> Clone for ChunkRequest<C> {
 impl<C> ChunkRequest<C> {
     pub fn is_settled(&self) -> bool {
         self.state.settled.load(Ordering::Acquire)
+    }
+
+    /// A timeout sweep retired this original input, rather than take/abort.
+    /// The connection call table decides its terminal outcome exactly once.
+    pub fn storage_expired(&self) -> bool {
+        self.state.expired.load(Ordering::Acquire)
+    }
+
+    pub fn storage_retired(&self) -> bool {
+        self.state.storage.load(Ordering::Acquire) == StorageState::Retired as u8
     }
 
     /// Wait only for this call's storage publication, using its actual progress.
@@ -152,6 +163,9 @@ struct RequestContents<C> {
     inner: Option<ChunkAssembler>,
     context: Option<C>,
     last_activity: Instant,
+    // Only input preparation has an assembler deadline. An active reply waits
+    // for its real terminal delivery or connection end, even under pressure.
+    can_expire: bool,
     total_bytes: u64,
     accounting: Arc<RegistryAccounting>,
 }
@@ -179,21 +193,18 @@ struct TrackedRequest<C> {
 }
 
 impl<C> TrackedRequest<C> {
-    fn pending(accounting: Arc<RegistryAccounting>) -> Self {
+    fn pending(accounting: Arc<RegistryAccounting>, can_expire: bool) -> Self {
         Self {
             contents: Mutex::new(RequestContents {
                 inner: None,
                 context: None,
                 last_activity: Instant::now(),
+                can_expire,
                 total_bytes: 0,
                 accounting,
             }),
             request: Arc::new(RequestState::default()),
         }
-    }
-
-    fn has_unsettled_frames(&self) -> bool {
-        !self.request.settled.load(Ordering::Acquire) && Arc::strong_count(&self.request) > 1
     }
 }
 
@@ -245,6 +256,7 @@ impl<C> ChunkRegistry<C> {
         conn_id: u64,
         request_id: u64,
         request: Option<&ChunkRequest<C>>,
+        can_expire: bool,
     ) -> Option<Arc<TrackedRequest<C>>> {
         let mut shard = self.shard(conn_id).lock();
         if let Some(request) = request {
@@ -263,7 +275,9 @@ impl<C> ChunkRegistry<C> {
             Some(
                 shard
                     .entry((conn_id, request_id))
-                    .or_insert_with(|| Arc::new(TrackedRequest::pending(self.accounting.clone())))
+                    .or_insert_with(|| {
+                        Arc::new(TrackedRequest::pending(self.accounting.clone(), can_expire))
+                    })
                     .clone(),
             )
         }
@@ -281,15 +295,13 @@ impl<C> ChunkRegistry<C> {
         }
     }
 
-    // Frame-token publication and this decision share the same short shard
-    // lock. A rejected admission without a token leaves no uncounted marker;
-    // dispatched frames keep their original one-error claim through GC.
+    // Rejected admission removes only the original entry. Already dispatched
+    // frames keep their Arc owner without a historical shard marker.
     fn remove_if_unobserved(&self, key: (u64, u64), entry: &Arc<TrackedRequest<C>>) {
         let mut shard = self.shard(key.0).lock();
-        if !entry.has_unsettled_frames()
-            && shard
-                .get(&key)
-                .is_some_and(|current| Arc::ptr_eq(current, entry))
+        if shard
+            .get(&key)
+            .is_some_and(|current| Arc::ptr_eq(current, entry))
         {
             entry
                 .request
@@ -348,18 +360,15 @@ impl<C> ChunkRegistry<C> {
         })
     }
 
-    /// Observe a frame before dispatch. A last settled frame retires only its
-    /// marker; already dispatched tasks retain the same error-reply claim.
-    pub fn begin_frame(&self, conn_id: u64, request_id: u64, last: bool) -> ChunkRequest<C> {
+    /// Observe a frame before dispatch. The connection call table owns the
+    /// request's terminal outcome; this token pins only original storage.
+    pub fn begin_frame(&self, conn_id: u64, request_id: u64) -> ChunkRequest<C> {
         let (entry, request) = {
             let mut shard = self.shard(conn_id).lock();
             let entry = shard
                 .entry((conn_id, request_id))
-                .or_insert_with(|| Arc::new(TrackedRequest::pending(self.accounting.clone())))
+                .or_insert_with(|| Arc::new(TrackedRequest::pending(self.accounting.clone(), true)))
                 .clone();
-            if last {
-                entry.request.last_received.store(true, Ordering::Release);
-            }
             let request = ChunkRequest {
                 conn_id,
                 request_id,
@@ -368,9 +377,7 @@ impl<C> ChunkRegistry<C> {
             };
             (entry, request)
         };
-        if request.is_settled() && last {
-            self.remove((conn_id, request_id), &entry);
-        }
+        let _ = entry;
         request
     }
 
@@ -379,8 +386,8 @@ impl<C> ChunkRegistry<C> {
             .is_some_and(|entry| entry.request.settled.load(Ordering::Acquire))
     }
 
-    /// Claim this call's one error reply without waiting for allocation/copy.
-    /// Active tasks keep the original record's storage and admission alive.
+    /// Stop work on this original assembly without waiting for allocation/copy.
+    /// Active tasks retain its real storage; CALL_END is claimed separately.
     pub fn settle(&self, request: &ChunkRequest<C>) -> bool {
         if request
             .state
@@ -390,11 +397,11 @@ impl<C> ChunkRegistry<C> {
         {
             return false;
         }
-        self.retire_request(request, true);
+        self.retire_request(request);
         true
     }
 
-    fn retire_request(&self, request: &ChunkRequest<C>, keep_marker: bool) {
+    fn retire_request(&self, request: &ChunkRequest<C>) {
         request
             .state
             .storage
@@ -407,13 +414,7 @@ impl<C> ChunkRegistry<C> {
                 .get(&key)
                 .is_some_and(|entry| Arc::ptr_eq(&entry.request, &request.state))
             {
-                if keep_marker && !request.state.last_received.load(Ordering::Acquire) {
-                    let mut marker = TrackedRequest::pending(self.accounting.clone());
-                    marker.request = request.state.clone();
-                    shard.insert(key, Arc::new(marker))
-                } else {
-                    shard.remove(&key)
-                }
+                shard.remove(&key)
             } else {
                 None
             }
@@ -485,6 +486,7 @@ impl<C> ChunkRegistry<C> {
             total_chunks,
             chunk_size,
             None,
+            true,
         )
         .map_err(|(error, _)| error)
     }
@@ -507,6 +509,7 @@ impl<C> ChunkRegistry<C> {
             total_chunks,
             chunk_size,
             Some(context),
+            true,
         )
         .map_err(|(error, context)| (error, context.unwrap()))
     }
@@ -526,10 +529,12 @@ impl<C> ChunkRegistry<C> {
             total_chunks,
             chunk_size,
             Some(context),
+            true,
         )
         .map_err(|(error, context)| (error, context.unwrap()))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn insert_tracked(
         &self,
         conn_id: u64,
@@ -538,6 +543,7 @@ impl<C> ChunkRegistry<C> {
         total_chunks: usize,
         chunk_size: usize,
         mut context: Option<C>,
+        can_expire: bool,
     ) -> Result<(), (ChunkAdmissionError, Option<C>)> {
         let expected = if context.is_some() {
             StorageState::Pending
@@ -560,7 +566,7 @@ impl<C> ChunkRegistry<C> {
         }
         let mut geometry = None;
         loop {
-            let Some(entry) = self.admission_entry(conn_id, request_id, request) else {
+            let Some(entry) = self.admission_entry(conn_id, request_id, request, can_expire) else {
                 return Err((
                     ChunkAdmissionError::Duplicate {
                         conn_id,
@@ -686,9 +692,16 @@ impl<C> ChunkRegistry<C> {
         chunk_idx: usize,
         data: &[u8],
     ) -> Result<bool, String> {
-        self.with_assembly(conn_id, request_id, |inner| {
-            inner.feed_chunk(chunk_idx, data)
-        })
+        let entry = self
+            .lookup(conn_id, request_id)
+            .ok_or_else(|| format!("no assembly for ({conn_id}, {request_id})"))?;
+        let request = ChunkRequest {
+            conn_id,
+            request_id,
+            state: entry.request.clone(),
+            entry,
+        };
+        self.feed_request(&request, chunk_idx, data)
     }
 
     /// Borrow the original call's reassembly while obtaining/copying a frame's
@@ -713,14 +726,42 @@ impl<C> ChunkRegistry<C> {
         chunk_idx: usize,
         data: &[u8],
     ) -> Result<bool, String> {
+        let prepared = self.prepare_chunk(request, chunk_idx, data.len())?;
+        let copied = prepared.copy_from(data)?;
+        self.commit_chunk(request, copied)
+    }
+
+    /// Mint a range token under the original entry lock, then copy outside it.
+    pub fn prepare_chunk(
+        &self,
+        request: &ChunkRequest<C>,
+        chunk_idx: usize,
+        len: usize,
+    ) -> Result<PreparedChunk, String> {
         self.with_entry(
             &request.entry,
             request.conn_id,
             request.request_id,
-            |inner| inner.feed_chunk(chunk_idx, data),
+            |inner| inner.prepare_chunk(chunk_idx, len),
         )
     }
 
+    /// Commit a completed copy to the original entry. GC may already have
+    /// retired it; the copied token still pinned backing until this call.
+    pub fn commit_chunk(
+        &self,
+        request: &ChunkRequest<C>,
+        copied: CopiedChunk,
+    ) -> Result<bool, String> {
+        self.with_entry(
+            &request.entry,
+            request.conn_id,
+            request.request_id,
+            |inner| inner.commit_chunk(copied),
+        )
+    }
+
+    #[cfg(test)]
     fn with_assembly<R>(
         &self,
         conn_id: u64,
@@ -773,7 +814,7 @@ impl<C> ChunkRegistry<C> {
         entry: &Arc<TrackedRequest<C>>,
         conn_id: u64,
         request_id: u64,
-        claim_reply: bool,
+        stop_work: bool,
     ) -> Result<(ChunkAssembler, C), String> {
         let missing = || format!("no assembly for ({conn_id}, {request_id})");
         let mut contents = entry.contents.lock();
@@ -783,7 +824,7 @@ impl<C> ChunkRegistry<C> {
         {
             return Err(missing());
         }
-        if claim_reply
+        if stop_work
             && entry
                 .request
                 .settled
@@ -821,14 +862,20 @@ impl<C> ChunkRegistry<C> {
                 state: entry.request.clone(),
                 entry,
             };
-            self.retire_request(&request, false);
+            self.retire_request(&request);
         }
     }
 
     /// Sweep expired storage without waiting for payload borrows. Frame tasks
-    /// retain their original error claim; skipped borrows invalidate the expiry proof.
+    /// retain original storage; skipped borrows invalidate the expiry proof.
     pub fn gc_sweep(&self) -> GcStats {
+        self.gc_sweep_expired().0
+    }
+
+    /// Sweep storage and return its exact original expired assembly tokens.
+    pub fn gc_sweep_expired(&self) -> (GcStats, Vec<ChunkRequest<C>>) {
         let mut stats = GcStats::default();
+        let mut expired = Vec::new();
         let now = Instant::now();
         let mut oldest_live = now;
         let mut skipped_borrow = false;
@@ -844,11 +891,17 @@ impl<C> ChunkRegistry<C> {
                         skipped_borrow = true;
                         continue;
                     };
+                    if !contents.can_expire {
+                        continue;
+                    }
                     if now.saturating_duration_since(contents.last_activity)
                         < self.config.assembler_timeout
                     {
                         oldest_live = oldest_live.min(contents.last_activity);
                         continue;
+                    }
+                    if contents.inner.is_some() || contents.context.is_some() {
+                        entry.request.expired.store(true, Ordering::Release);
                     }
                     entry
                         .request
@@ -859,6 +912,12 @@ impl<C> ChunkRegistry<C> {
                     if removed.0.is_some() {
                         stats.expired += 1;
                         stats.freed_bytes += removed.2;
+                        expired.push(ChunkRequest {
+                            conn_id: key.0,
+                            request_id: key.1,
+                            state: entry.request.clone(),
+                            entry: entry.clone(),
+                        });
                     }
                     self.remove_if_unobserved(key, &entry);
                     removed
@@ -874,10 +933,10 @@ impl<C> ChunkRegistry<C> {
         } else {
             oldest_live.checked_add(self.config.assembler_timeout)
         };
-        stats
+        (stats, expired)
     }
 
-    /// Connection cancellation uses each original call's terminal claim.
+    /// Retire the original assembly tokens for this connection.
     pub fn cleanup_connection(&self, conn_id: u64) {
         let entries: Vec<_> = self
             .shard(conn_id)
@@ -894,7 +953,7 @@ impl<C> ChunkRegistry<C> {
                 entry,
             };
             request.state.settled.store(true, Ordering::Release);
-            self.retire_request(&request, false);
+            self.retire_request(&request);
         }
     }
 
@@ -943,8 +1002,9 @@ impl<C> ChunkRegistry<C> {
                 shard,
                 |_| true,
                 |contents| {
-                    now.saturating_duration_since(contents.last_activity)
-                        >= self.config.assembler_timeout
+                    contents.can_expire
+                        && now.saturating_duration_since(contents.last_activity)
+                            >= self.config.assembler_timeout
                 },
                 None,
                 true,
@@ -962,7 +1022,7 @@ impl<C> ChunkRegistry<C> {
         matches_key: impl Fn(&(u64, u64)) -> bool,
         matches_contents: impl Fn(&RequestContents<C>) -> bool,
         deadline: Option<Instant>,
-        keep_frames: bool,
+        expire: bool,
     ) -> (bool, GcStats) {
         let entries: Vec<_> = {
             let Some(shard) = shard.try_lock() else {
@@ -994,6 +1054,9 @@ impl<C> ChunkRegistry<C> {
                 complete = false;
                 continue;
             };
+            if expire && (contents.inner.is_some() || contents.context.is_some()) {
+                entry.request.expired.store(true, Ordering::Release);
+            }
             entry
                 .request
                 .storage
@@ -1004,10 +1067,9 @@ impl<C> ChunkRegistry<C> {
                 stats.expired += 1;
                 stats.freed_bytes += removed.2;
             }
-            if (!keep_frames || !entry.has_unsettled_frames())
-                && shard
-                    .get(&key)
-                    .is_some_and(|current| Arc::ptr_eq(current, &entry))
+            if shard
+                .get(&key)
+                .is_some_and(|current| Arc::ptr_eq(current, &entry))
             {
                 shard.remove(&key);
             }
@@ -1021,7 +1083,7 @@ impl<C> ChunkRegistry<C> {
 }
 
 impl ChunkRegistry<()> {
-    /// Admit the first reply chunk using its decoded wire metadata.
+    /// Admit response storage from the first value fragment's derived geometry.
     /// Decoding alone accepts zero fields; validate them here before any
     /// reservation, then use the same atomic registry admission authority.
     pub fn insert_reply(
@@ -1054,8 +1116,16 @@ impl ChunkRegistry<()> {
                 ChunkAdmissionError::Protocol("total_size exceeds addressable capacity".to_string())
             })?
         };
-        self.insert(conn_id, request_id, total_chunks, chunk_size, ())
-            .map_err(|(error, ())| error)
+        self.insert_tracked(
+            conn_id,
+            request_id,
+            None,
+            total_chunks,
+            chunk_size,
+            Some(()),
+            false,
+        )
+        .map_err(|(error, _)| error)
     }
 }
 
@@ -1128,7 +1198,7 @@ mod tests {
         for retire in [false, true] {
             let (pool, _) = budgeted_pool(4096);
             let registry = ChunkRegistry::new(pool, ChunkConfig::default());
-            let request = registry.begin_frame(1, 11, false);
+            let request = registry.begin_frame(1, 11);
             registry.prepare_request(&request, ()).unwrap();
             let wake = Arc::new(WakeCount(AtomicUsize::new(0)));
             let waker = Waker::from(wake.clone());
@@ -1159,7 +1229,7 @@ mod tests {
         for dispatched in [false, true] {
             let (pool, budget) = budgeted_pool(4096);
             let registry = ChunkRegistry::new(pool, ChunkConfig::default());
-            let old = registry.begin_frame(1, 11, true);
+            let old = registry.begin_frame(1, 11);
             registry.prepare_request(&old, 41).unwrap();
             registry.allocate_request(&old, 1, 64).unwrap();
             assert!(registry.feed_request(&old, 0, &[7; 64]).unwrap());
@@ -1169,7 +1239,7 @@ mod tests {
                 registry.abort(1, 11);
                 None
             };
-            let current = registry.begin_frame(1, 11, true);
+            let current = registry.begin_frame(1, 11);
             registry.prepare_request(&current, 42).unwrap();
             registry.allocate_request(&current, 1, 32).unwrap();
             assert_eq!(registry.settle(&old), !dispatched);
@@ -1190,7 +1260,7 @@ mod tests {
     fn concurrent_refusals_claim_one_terminal_reply_and_release_one_admission() {
         let (pool, budget) = budgeted_pool(4096);
         let registry = Arc::new(ChunkRegistry::new(pool, ChunkConfig::default()));
-        let request = registry.begin_frame(1, 11, false);
+        let request = registry.begin_frame(1, 11);
         let admission = Arc::new(());
         registry
             .prepare_request(&request, admission.clone())
@@ -1230,7 +1300,7 @@ mod tests {
         let (pool, budget) = budgeted_pool(4096);
         let registry = Arc::new(ChunkRegistry::new(pool, ChunkConfig::default()));
         let slots = Arc::new(AtomicUsize::new(2));
-        let request = registry.begin_frame(1, 11, true);
+        let request = registry.begin_frame(1, 11);
         registry
             .insert_request(&request, 1, 64, CallSlot(slots.clone()))
             .unwrap_or_else(|(error, _)| panic!("{error}"));
@@ -1272,7 +1342,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_admission_retains_only_existing_frame_tokens() {
+    fn failed_admission_retires_original_storage_without_a_marker() {
         for (reassembly_limit, file_limit) in [(0, 4096), (1024, 0)] {
             let (reg, pool, budget) = typed_file_registry(reassembly_limit, file_limit);
             for request_id in 1..=32 {
@@ -1287,12 +1357,13 @@ mod tests {
                     "bad geometry left uncounted metadata"
                 );
             }
-            let request = reg.begin_frame(1, 99, false);
+            let request = reg.begin_frame(1, 99);
             assert!(reg.insert_request(&request, 2, 64, ()).is_err());
-            let continuation = reg.begin_frame(1, 99, true);
-            assert!(Arc::ptr_eq(&request.state, &continuation.state));
+            let continuation = reg.begin_frame(1, 99);
+            assert!(!Arc::ptr_eq(&request.state, &continuation.state));
+            assert!(request.storage_retired());
             assert!(reg.settle(&request));
-            assert!(!reg.settle(&continuation));
+            assert!(reg.settle(&continuation));
             assert!(reg.shard(1).lock().is_empty());
             assert_eq!(reg.active_count(), 0);
             assert_eq!(budget.snapshot().reassembly.used_bytes, 0);
@@ -1305,7 +1376,7 @@ mod tests {
         for settled in [true, false] {
             let (pool, budget) = budgeted_pool(128);
             let reg = Arc::new(ChunkRegistry::new(pool.clone(), ChunkConfig::default()));
-            let first = reg.begin_frame(1, 11, false);
+            let first = reg.begin_frame(1, 11);
             let entered = Arc::new(std::sync::Barrier::new(2));
             let resume = Arc::new(std::sync::Barrier::new(2));
             let inserting = reg.clone();
@@ -1318,7 +1389,7 @@ mod tests {
             });
             entered.wait();
             if settled {
-                let last = reg.begin_frame(1, 11, true);
+                let last = reg.begin_frame(1, 11);
                 assert!(reg.settle(&last));
             } else {
                 reg.abort(1, 11);
@@ -1451,7 +1522,7 @@ mod tests {
                 assert!(advancing.shard(1).try_lock().is_some());
                 assert!(advancing.pool.try_write().is_some());
                 assert!(advancing.contains(1, 11));
-                let request = advancing.begin_frame(1, 22, true);
+                let request = advancing.begin_frame(1, 22);
                 advancing.insert_request(&request, 1, 4096, ()).unwrap();
                 advancing.feed(1, 22, 0, &[0x22; 4096]).unwrap();
                 assert!(advancing.settle(&request));
@@ -1510,7 +1581,7 @@ mod tests {
                         ..ChunkConfig::default()
                     },
                 ));
-                let request = reg.begin_frame(1, 11, true);
+                let request = reg.begin_frame(1, 11);
                 let drops = Arc::new(Mutex::new(Vec::new()));
                 let context = |request_id| Context {
                     request_id,
@@ -1583,7 +1654,7 @@ mod tests {
                 let (progressed, progress_observed) = std::sync::mpsc::channel();
                 let checking = reg.clone();
                 let progress = thread::spawn(move || {
-                    let other = checking.begin_frame(1, 33, true);
+                    let other = checking.begin_frame(1, 33);
                     assert!(checking.settle(&other));
                     progressed.send(()).unwrap();
                 });
@@ -1644,72 +1715,31 @@ mod tests {
     }
 
     #[test]
-    fn settled_request_releases_backing_and_last_frame_preserves_old_reply_claims() {
+    fn settled_request_releases_backing_and_original_claim() {
         let (pool, budget) = budgeted_pool(128);
         let reg = ChunkRegistry::new(pool, ChunkConfig::default());
-        let first = reg.begin_frame(1, 7, false);
-        let competing = reg.begin_frame(1, 7, false);
+        let first = reg.begin_frame(1, 7);
+        let competing = reg.begin_frame(1, 7);
         reg.insert(1, 7, 2, 32, ()).unwrap();
         assert!(reassembly_used(&budget) > 0);
         assert!(reg.settle(&first));
         assert_eq!(reassembly_used(&budget), 0);
         assert_eq!(reg.active_count(), 0);
         assert_eq!(reg.total_bytes(), 0);
-        assert!(reg.is_settled(1, 7));
-        assert!(reg.begin_frame(1, 7, true).is_settled());
+        assert!(first.storage_retired());
+        assert!(!reg.is_settled(1, 7));
         assert!(!reg.shard(1).lock().contains_key(&(1, 7)));
         assert!(
             !reg.settle(&competing),
-            "a delayed task cannot reply again after last-frame cleanup"
+            "a delayed task cannot stop the original assembly twice"
         );
     }
 
     #[test]
-    fn settled_records_use_no_chunk_budget_and_gc_does_not_refresh_their_age() {
-        for nonblocking in [false, true] {
-            let (pool, budget) = budgeted_pool(128);
-            let reg = ChunkRegistry::new(
-                pool,
-                ChunkConfig {
-                    soft_limit: 1,
-                    ..Default::default()
-                },
-            );
-            for id in 1..=100 {
-                let request = reg.begin_frame(1, id, false);
-                assert!(reg.settle(&request));
-            }
-            assert_eq!(reassembly_used(&budget), 0);
-            assert_eq!(reg.active_count(), 0);
-            reg.insert(2, 1, 2, 32, ()).unwrap();
-            reg.abort(2, 1);
-            let expired = Instant::now() - reg.config.assembler_timeout;
-            for entry in reg.shard(1).lock().values_mut() {
-                entry.contents.lock().last_activity = expired;
-            }
-            assert!(reg.begin_frame(1, 1, false).is_settled());
-            assert_eq!(
-                reg.shard(1).lock()[&(1, 1)].contents.lock().last_activity,
-                expired
-            );
-            let swept = if nonblocking {
-                reg.try_gc_sweep()
-            } else {
-                reg.gc_sweep()
-            };
-            assert_eq!(swept.expired, 0, "settled entries own no assemblies");
-            assert_eq!(swept.freed_bytes, 0);
-            assert_eq!(swept.remaining, 0);
-            assert!(reg.shard(1).lock().is_empty());
-            assert_eq!(reassembly_used(&budget), 0);
-        }
-    }
-
-    #[test]
-    fn gc_releases_assembly_but_keeps_inflight_frames_on_one_error_claim() {
+    fn gc_releases_assembly_and_reports_original_token() {
         let (pool, budget) = budgeted_pool(128);
         let reg = ChunkRegistry::new(pool, ChunkConfig::default());
-        let queued = reg.begin_frame(1, 9, false);
+        let queued = reg.begin_frame(1, 9);
         reg.insert(1, 9, 2, 32, ()).unwrap();
         reg.shard(1)
             .lock()
@@ -1718,16 +1748,40 @@ mod tests {
             .contents
             .lock()
             .last_activity = Instant::now() - reg.config.assembler_timeout;
-        assert_eq!(reg.gc_sweep().expired, 1);
+        let (stats, expired) = reg.gc_sweep_expired();
+        assert_eq!(stats.expired, 1);
+        assert_eq!(expired.len(), 1);
+        assert!(Arc::ptr_eq(&queued.state, &expired[0].state));
+        assert!(queued.storage_retired());
         assert!(!reg.contains(1, 9));
         assert_eq!(reassembly_used(&budget), 0);
-        let late = reg.begin_frame(1, 9, false);
-        assert!(Arc::ptr_eq(&queued.state, &late.state));
+        let late = reg.begin_frame(1, 9);
+        assert!(!Arc::ptr_eq(&queued.state, &late.state));
         assert!(reg.settle(&queued));
-        assert!(!reg.settle(&late));
+        assert!(reg.settle(&late));
         reg.cleanup_connection(1);
         assert!(reg.shard(1).lock().is_empty());
         assert!(!reg.settle(&queued));
+    }
+
+    #[test]
+    fn gc_keeps_original_backing_while_prepared_copy_is_in_flight() {
+        let (pool, budget) = budgeted_pool(128);
+        let reg = ChunkRegistry::new(pool, ChunkConfig::default());
+        let request = reg.begin_frame(3, 17);
+        reg.insert_request(&request, 2, 32, ()).unwrap();
+        let token = reg.prepare_chunk(&request, 0, 32).unwrap();
+        reg.lookup(3, 17).unwrap().contents.lock().last_activity =
+            Instant::now() - reg.config.assembler_timeout;
+        let (stats, expired) = reg.gc_sweep_expired();
+        assert_eq!(stats.expired, 1);
+        assert_eq!(expired.len(), 1);
+        assert!(Arc::ptr_eq(&request.state, &expired[0].state));
+        assert!(request.storage_retired());
+        assert_eq!(reassembly_used(&budget), 66);
+        let copied = token.copy_from(&[5; 32]).unwrap();
+        assert!(reg.commit_chunk(&request, copied).is_err());
+        assert_eq!(reassembly_used(&budget), 0);
     }
 
     #[test]
@@ -2913,12 +2967,7 @@ mod tests {
         chunks: u32,
         data_len: usize,
     ) -> Result<(), ChunkAdmissionError> {
-        use crate::chunk::header::{decode_reply_chunk_meta, encode_reply_chunk_meta};
-        let mut bytes = encode_reply_chunk_meta(size, chunks, 0).to_vec();
-        bytes.resize(bytes.len() + data_len, 0x42);
-        let (size, chunks, index, consumed) = decode_reply_chunk_meta(&bytes, 0).unwrap();
-        assert_eq!(index, 0);
-        reg.insert_reply(1, rid, size, chunks as usize, bytes.len() - consumed)
+        reg.insert_reply(1, rid, size, chunks as usize, data_len)
     }
 
     #[test]
@@ -3084,10 +3133,38 @@ mod tests {
     }
 
     #[test]
+    fn active_reply_survives_timeout_timer_and_pressure_gc() {
+        let (mut reg, pool, budget) = typed_file_registry(128 + 2, 4096);
+        Arc::get_mut(&mut reg).unwrap().config.soft_limit = 1;
+        reg.insert_reply(1, 11, 128, 2, 64).unwrap();
+        reg.feed(1, 11, 0, &[0x11; 64]).unwrap();
+        reg.lookup(1, 11).unwrap().contents.lock().last_activity =
+            Instant::now() - Duration::from_secs(61);
+        assert_eq!(reg.try_gc_sweep().expired, 0);
+        assert_eq!(reg.gc_sweep().expired, 0);
+        *reg.gc_not_before.lock() = None;
+        assert!(matches!(
+            reg.insert_reply(1, 22, 128, 2, 64),
+            Err(ChunkAdmissionError::Capacity(_))
+        ));
+        assert!(reg.contains(1, 11));
+        assert_eq!(reassembly_used(&budget), 130);
+        assert!(reg.feed(1, 11, 1, &[0x22; 64]).unwrap());
+        let (assembly, ()) = reg.take(1, 11).unwrap();
+        let mut backing = assembly.finish().unwrap();
+        let bytes = backing.copy_bytes().unwrap();
+        assert_eq!(&bytes[..64], &[0x11; 64]);
+        assert_eq!(&bytes[64..], &[0x22; 64]);
+        backing.release();
+        assert_eq!(reassembly_used(&budget), 0);
+        assert_no_shm_mappings(&pool);
+    }
+
+    #[test]
     fn typed_gc_removal_makes_same_key_a_fresh_capacity_decision() {
         let (reg, pool, budget) = typed_file_registry(2 * (64 + 1), 4096);
-        raw_reply(&reg, 11, 64, 1, 64).unwrap();
-        raw_reply(&reg, 22, 64, 1, 64).unwrap();
+        reg.insert(1, 11, 1, 64, ()).unwrap();
+        reg.insert(1, 22, 1, 64, ()).unwrap();
         assert!(reg.contains(1, 11)); // A caller's old snapshot is now deliberately stale.
         reg.shard(1)
             .lock()
@@ -3116,8 +3193,8 @@ mod tests {
     #[test]
     fn typed_gc_and_duplicate_are_rechecked_after_pool_contention() {
         let (reg, pool, budget) = typed_file_registry(2 * (64 + 1), 4096);
-        raw_reply(&reg, 11, 64, 1, 64).unwrap();
-        raw_reply(&reg, 22, 64, 1, 64).unwrap();
+        reg.insert(1, 11, 1, 64, ()).unwrap();
+        reg.insert(1, 22, 1, 64, ()).unwrap();
         reg.shard(1)
             .lock()
             .get_mut(&(1, 11))

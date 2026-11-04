@@ -1,6 +1,6 @@
 use super::*;
-use crate::flags::{FLAG_CTRL, FLAG_RESPONSE};
-use crate::frame::{decode_frame, encode_frame};
+use crate::flags::{FLAG_CTRL, FLAG_RESPONSE, FLAG_RPC_RECORD};
+use crate::frame::decode_frame;
 use crate::release::{ReleaseBatch, encode_release_frame};
 use c2_mem::{MemoryBudget, config::PoolConfig};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -107,7 +107,7 @@ fn remote_read_drop_queues_release_and_wakes_idle_writer() {
     assert!(wakes.load(Ordering::SeqCst) > 0);
     let mut write = core.begin_write(WriteRequest::Releases).unwrap().unwrap();
     let (header, payload) = decode_frame(write.release_bytes()).unwrap();
-    assert_eq!(header.flags, FLAG_CTRL | FLAG_RESPONSE);
+    assert_eq!(header.flags, FLAG_RPC_RECORD | FLAG_RESPONSE);
     assert_eq!(
         crate::release::decode_release_frame(&header, payload, true, true)
             .unwrap()
@@ -314,10 +314,17 @@ fn release_queue_batches_and_cosubmits_with_one_business_frame() {
     assert!(write.has_business_frame());
     // The driver performs one write with these bytes; core never receives the
     // business payload or its byte-budget guard.
-    let business = encode_frame(99, crate::flags::FLAG_REPLY_V2 | FLAG_RESPONSE, b"business");
+    let business = crate::rpc::encode_call_end_frame(
+        99,
+        crate::rpc::CallMode::Unary,
+        crate::rpc::CallStatus::Success,
+        0,
+        crate::rpc::ValuePart::whole(crate::rpc::ValueStorage::Inline(b"business")),
+    )
+    .unwrap();
     let submission = [write.release_bytes(), &business].concat();
     let tail = &submission[write.release_bytes().len()..];
-    assert_eq!(decode_frame(tail).unwrap().1, b"business");
+    assert_eq!(&decode_frame(tail).unwrap().1[2..], b"business");
     write.begin_io().unwrap();
     for _ in 0..4 {
         write.frame_completed();

@@ -32,14 +32,22 @@ type Receipt = oneshot::Sender<Result<(), IpcError>>;
 pub(crate) struct SendState {
     started: bool,
     cancelled: bool,
+    request_id: Option<u64>,
+    upload_failed: bool,
 }
 impl SendState {
+    pub(crate) fn request_id(&self) -> Option<u64> {
+        self.request_id
+    }
     pub fn started(&self) -> bool {
         self.started
     }
+    pub(crate) fn fail_upload(&mut self) {
+        self.upload_failed = true;
+    }
     pub fn cancel(&mut self) -> bool {
         self.cancelled = true;
-        !self.started
+        !self.started || self.upload_failed
     }
 }
 
@@ -186,6 +194,7 @@ pub(crate) struct ClientConnection {
     pub publisher: ConnectionPublisher,
     end: Arc<EndState>,
     pending: Arc<Mutex<PendingMap>>,
+    pub(crate) sequence: std::sync::atomic::AtomicU64,
     queue: mpsc::Sender<Submission>,
     abort: AbortHandle,
     read_stopped: AtomicBool,
@@ -222,6 +231,7 @@ impl ClientConnection {
             publisher: retirement.end.publisher.clone(),
             end: retirement.end.clone(),
             pending,
+            sequence: std::sync::atomic::AtomicU64::new(0),
             queue,
             abort,
             read_stopped: AtomicBool::new(false),
@@ -250,15 +260,11 @@ impl ClientConnection {
         // A queued future need not be polled again to stop retaining a pending
         // entry. Sent waiters remain until their own reply or a framing failure.
         let mut pending = self.pending.lock();
-        for (_, entry) in pending.extract_if(|_, entry| {
-            // The writer holds this lock while publication linearizes. It
-            // may itself report a preparation failure here, so never wait on
-            // that lock; its own receipt resolves the in-progress submission.
-            entry.state.try_lock().is_some_and(|state| !state.started())
-        }) {
+        let unpublished = std::mem::take(&mut pending.queued);
+        drop(pending);
+        for entry in unpublished {
             entry.complete(Err(IpcError::Closed));
         }
-        drop(pending);
         self.deactivated.send_replace(true);
     }
     /// Stop admission and drain sent calls and loans before physical close.
@@ -320,7 +326,7 @@ impl ClientConnection {
     }
     fn fail_pending(&self) {
         let pending = std::mem::take(&mut *self.pending.lock());
-        for (_, entry) in pending {
+        for entry in pending.active.into_values().chain(pending.queued) {
             entry.complete(Err(IpcError::Closed));
         }
     }
@@ -393,7 +399,6 @@ impl ClientConnection {
                     biased;
                     changed = stop.changed() => { if changed.is_err() || *stop.borrow() { break; } }
                     _ = tick.tick() => {
-                        driver.registry.try_gc_sweep();
                         if let Some(mut pool) = driver.pool.try_write() { pool.gc_buddy(); }
                         if let Some(mut pool) = driver.registry.pool().try_write() { pool.gc_buddy(); }
                         if let Some(peer) = driver.peer.try_read() {
@@ -560,6 +565,34 @@ async fn process(stream: &mut LocalWriteHalf, conn: &ClientConnection, mut submi
                         .begin_write(request)
                         .map_err(core_error)?
                         .expect("one submitted frame");
+                    // This unique writer owns the first-submission sequence.
+                    // Publish the receiver before any byte can reach the peer.
+                    let rid = match state.request_id {
+                        Some(rid) => rid,
+                        None => {
+                            let previous = match conn.sequence.try_update(
+                                Ordering::Relaxed,
+                                Ordering::Relaxed,
+                                |n| n.checked_add(1),
+                            ) {
+                                Ok(previous) => previous,
+                                Err(_) => {
+                                    conn.end(
+                                        ConnectionEndReason::ProtocolError,
+                                        "request_id_exhausted",
+                                    );
+                                    return Err(IpcError::Protocol(
+                                        "request ID space exhausted".into(),
+                                    ));
+                                }
+                            };
+                            let rid = previous + 1;
+                            conn.pending.lock().publish(&submission.state, rid)?;
+                            state.request_id = Some(rid);
+                            rid
+                        }
+                    };
+                    submission.bytes[4..12].copy_from_slice(&rid.to_le_bytes());
                     let batch = prepare(batch, submission.bytes, conn)?;
                     state.started = true;
                     Ok(batch)

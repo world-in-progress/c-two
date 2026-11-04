@@ -7,7 +7,7 @@ use std::time::Duration;
 /// Typically derived from [`c2_config::BaseIpcConfig`] chunk-related fields.
 #[derive(Debug, Clone)]
 pub struct ChunkConfig {
-    /// Timeout for incomplete assemblies (default 60s).
+    /// Timeout for incomplete input assemblies (default 60s). Active replies do not expire.
     pub assembler_timeout: Duration,
     /// GC sweep interval (default 5s). Callers use this to drive their timer.
     pub gc_interval: Duration,

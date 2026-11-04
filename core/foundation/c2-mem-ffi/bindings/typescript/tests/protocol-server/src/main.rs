@@ -1,4 +1,4 @@
-//! Real c2-server peer for the Node IPC 15 / ABI 7 gate. No Python or FastDB.
+//! Real c2-server peer for the Node IPC 16 / ABI 7 gate. No Python or FastDB.
 use c2_config::{ConfigResolver, ConfigSources, LocalEndpointOptions};
 use c2_server::{
     ConcurrencyMode, CrmCallback, CrmError, ResponseMeta, RouteBuildSpec, SchedulerLimits, Server,

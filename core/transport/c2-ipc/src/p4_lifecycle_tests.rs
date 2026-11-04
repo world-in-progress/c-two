@@ -157,7 +157,7 @@ async fn dropped_receive_task_preserves_first_cause_and_waits_only_for_remote_re
     let retirement = PhysicalRetirement::new(stream.retain_for_remote_read(), end);
     let abort = stream.abort_handle();
     let (reader, writer) = stream.into_split();
-    let pending = Arc::new(StdMutex::new(HashMap::new()));
+    let pending = Arc::new(StdMutex::new(PendingMap::default()));
     let conn = ClientConnection::spawn(
         writer,
         pending.clone(),
@@ -318,8 +318,9 @@ async fn bounded_close_is_honest_while_peer_stops_reading_a_started_frame() {
         resumed.await.unwrap();
         let mut payload = vec![0; header.payload_len()];
         stream.read_exact(&mut payload).await.unwrap();
-        let (_, control_len) = c2_wire::control::decode_call_control(&payload, 0).unwrap();
-        assert!(payload[control_len..].iter().all(|byte| *byte == 0x5b));
+        assert!(
+            matches!(decode_rpc_record(&header, &payload, None).unwrap(), RpcRecord::Open { value: ValuePart { storage: ValueStorage::Inline(bytes), .. }, .. } if bytes.iter().all(|byte| *byte == 0x5b))
+        );
         reply(&mut stream, header.request_id, b"finished").await;
         expect_disconnect_or_eof(&mut stream).await;
         crate::tests::close_listener(listener).await;
@@ -410,7 +411,17 @@ async fn published_shm_loan_and_budget_survive_cancellation_close_and_client_dro
                 let mut stream = accept(&mut listener).await;
                 let (header, bytes) = read_frame(&mut stream).await;
                 assert!(header.is_buddy());
-                let descriptor = decode_buddy_payload(&bytes).unwrap().0;
+                let descriptor = match decode_rpc_record(&header, &bytes, None).unwrap() {
+                    RpcRecord::Open {
+                        value:
+                            ValuePart {
+                                storage: ValueStorage::Shm(descriptor),
+                                ..
+                            },
+                        ..
+                    } => descriptor,
+                    _ => panic!("SHM OPEN"),
+                };
                 assert_eq!(descriptor.is_dedicated, dedicated);
                 entered.send(()).unwrap();
                 finished.await.unwrap();
@@ -422,6 +433,7 @@ async fn published_shm_loan_and_budget_survive_cancellation_close_and_client_dro
                         ))
                         .await
                         .unwrap();
+                    reply(&mut stream, header.request_id, b"finished").await;
                     expect_disconnect_or_eof(&mut stream).await;
                 }
                 drop(stream);
@@ -587,7 +599,7 @@ async fn owned_response_copies_reach_peer_segment_index_16_without_held_transpor
         for handle in handles {
             let request = loop {
                 let (header, bytes) = read_frame(&mut stream).await;
-                if header.is_ctrl() {
+                if header.flags & flags::FLAG_RPC_RECORD != 0 && bytes.first() == Some(&7) {
                     let release = core.receive_release(&header, &bytes);
                     assert!(release.error.is_none());
                     drop(release.reclaims);
@@ -613,8 +625,8 @@ async fn owned_response_copies_reach_peer_segment_index_16_without_held_transpor
             stream
                 .write_all(&frame::encode_frame_parts(
                     request.request_id,
-                    flags::FLAG_RESPONSE | flags::FLAG_REPLY_V2 | flags::FLAG_BUDDY,
-                    &[&descriptor, &[0]],
+                    flags::FLAG_RESPONSE | flags::FLAG_RPC_RECORD | flags::FLAG_BUDDY,
+                    &[&[6, 0], &descriptor],
                 ))
                 .await
                 .unwrap();
@@ -623,7 +635,10 @@ async fn owned_response_copies_reach_peer_segment_index_16_without_held_transpor
         }
         while peer_pool.read().stats().alloc_count > 0 {
             let (header, bytes) = read_frame(&mut stream).await;
-            assert!(header.is_ctrl(), "one response per call; never replay");
+            assert!(
+                header.flags & flags::FLAG_RPC_RECORD != 0 && bytes.first() == Some(&7),
+                "one response per call; never replay"
+            );
             let release = core.receive_release(&header, &bytes);
             assert!(release.error.is_none());
             drop(release.reclaims);
@@ -658,7 +673,17 @@ async fn admitted_response_error_never_enters_the_buddy_request_fallback() {
         let mut stream = accept(&mut listener).await;
         let (request, bytes) = read_frame(&mut stream).await;
         assert!(request.is_buddy());
-        let request_loan = decode_buddy_payload(&bytes).unwrap().0.loan_id;
+        let request_loan = match decode_rpc_record(&request, &bytes, None).unwrap() {
+            RpcRecord::Open {
+                value:
+                    ValuePart {
+                        storage: ValueStorage::Shm(descriptor),
+                        ..
+                    },
+                ..
+            } => descriptor.loan_id,
+            _ => panic!("SHM OPEN"),
+        };
         let invalid = encode_buddy_payload(&BuddyPayload {
             seg_idx: 0,
             generation: 1,
@@ -670,8 +695,8 @@ async fn admitted_response_error_never_enters_the_buddy_request_fallback() {
         stream
             .write_all(&frame::encode_frame_parts(
                 request.request_id,
-                flags::FLAG_RESPONSE | flags::FLAG_REPLY_V2 | flags::FLAG_BUDDY,
-                &[&invalid, &[0]],
+                flags::FLAG_RESPONSE | flags::FLAG_RPC_RECORD | flags::FLAG_BUDDY,
+                &[&[6, 0], &invalid],
             ))
             .await
             .unwrap();
@@ -699,7 +724,7 @@ async fn admitted_response_error_never_enters_the_buddy_request_fallback() {
                 break;
             }
             assert!(
-                header.is_ctrl(),
+                header.flags & flags::FLAG_RPC_RECORD != 0 && payload.first() == Some(&7),
                 "response admission error must never replay the call as chunks"
             );
         }
@@ -921,13 +946,11 @@ async fn exhausted_request_reassembly_budget_returns_correlated_error_and_keeps_
     .await
     .unwrap()
     .unwrap_err();
-    let IpcError::CrmError(bytes) = error.source_error() else {
-        panic!("expected correlated budget error: {error:?}");
+    assert_eq!(error.phase(), crate::TransportPhase::PreDispatch);
+    let IpcError::CallRejected(rejection) = error.source_error() else {
+        panic!("expected correlated admission rejection: {error:?}");
     };
-    assert_eq!(
-        C2Error::from_wire_bytes(bytes).unwrap().unwrap().code,
-        ErrorCode::ResourceUnavailable
-    );
+    assert_eq!(rejection.code, ErrorCode::ResourceUnavailable);
     assert_eq!(client.pending_len_for_test(), 0);
     assert!(client.is_connected());
     client.acquire_route(&contract()).await.unwrap();

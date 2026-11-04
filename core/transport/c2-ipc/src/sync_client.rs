@@ -71,7 +71,8 @@ impl std::error::Error for IpcCallError {
 
 pub(crate) fn call_error_phase(error: &IpcError) -> TransportPhase {
     match error {
-        IpcError::LocalCallRejected(_)
+        IpcError::CallRejected(_)
+        | IpcError::LocalCallRejected(_)
         | IpcError::Config(_)
         | IpcError::Protocol(_)
         | IpcError::ProtocolVersionMismatch { .. }

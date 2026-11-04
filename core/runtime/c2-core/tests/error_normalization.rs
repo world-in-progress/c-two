@@ -45,6 +45,126 @@ fn ipc_and_http_semantic_envelopes_normalize_identically() {
 }
 
 #[test]
+fn confirmed_ipc_rejection_retains_semantics_and_explicit_pre_dispatch_phase() {
+    let rejection = C2Error::new(ErrorCode::CallCapacityExceeded, "route is full").with_details(
+        BTreeMap::from([
+            ("admission_reason".into(), "PendingLimit".into()),
+            ("dispatch_phase".into(), "pre_dispatch".into()),
+            ("transport_phase".into(), "pre_dispatch".into()),
+        ]),
+    );
+    let Error::Semantic(error) = normalize_ipc_error(
+        IpcError::CallRejected(rejection.clone()),
+        TransportPhase::DispatchUncertain,
+    ) else {
+        panic!("confirmed rejection must remain semantic");
+    };
+    assert_eq!(error.code, rejection.code);
+    assert_eq!(error.message, rejection.message);
+    assert_eq!(error.details["admission_reason"], "PendingLimit");
+    assert_eq!(error.details["transport_phase"], "pre_dispatch");
+    assert_eq!(error.details["dispatch_phase"], "pre_dispatch");
+
+    let Error::Semantic(resource_failure) = normalize_ipc_error(
+        IpcError::CrmError(rejection.to_wire_bytes()),
+        TransportPhase::DispatchUncertain,
+    ) else {
+        panic!("resource callback failure must remain semantic");
+    };
+    assert_eq!(resource_failure.code, rejection.code);
+    assert_eq!(resource_failure.message, rejection.message);
+    assert_eq!(resource_failure.details["admission_reason"], "PendingLimit");
+    assert!(!resource_failure.details.contains_key("transport_phase"));
+    assert!(!resource_failure.details.contains_key("dispatch_phase"));
+}
+
+#[test]
+fn relay_rejection_projects_pre_dispatch_for_any_canonical_code() {
+    let rejection =
+        C2Error::new(ErrorCode::ResourceNotFound, "gone").with_details(BTreeMap::from([
+            ("route".into(), "grid".into()),
+            ("dispatch_phase".into(), "pre_dispatch".into()),
+            ("transport_phase".into(), "pre_dispatch".into()),
+        ]));
+    let Error::Semantic(error) = normalize_http_error(
+        HttpError::ServerError(404, serde_json::to_string(&rejection.envelope()).unwrap()),
+        TransportPhase::PreDispatch,
+    ) else {
+        panic!("relay rejection must remain semantic");
+    };
+    assert_eq!(error.details["dispatch_phase"], "pre_dispatch");
+    assert_eq!(error.details["route"], "grid");
+    assert_eq!(error.details["transport_phase"], "pre_dispatch");
+
+    let Error::Semantic(resource_failure) = normalize_http_error(
+        HttpError::ServerError(500, serde_json::to_string(&rejection.envelope()).unwrap()),
+        TransportPhase::PreDispatch,
+    ) else {
+        panic!("resource callback failure must remain semantic");
+    };
+    assert_eq!(resource_failure.code, rejection.code);
+    assert_eq!(resource_failure.message, rejection.message);
+    assert_eq!(resource_failure.details["route"], "grid");
+    assert!(!resource_failure.details.contains_key("transport_phase"));
+    assert!(!resource_failure.details.contains_key("dispatch_phase"));
+}
+
+#[test]
+fn resource_failure_phase_is_hop_local_for_ipc_and_http_binary_and_json() {
+    use c2_mem::retention::{BudgetedBuffer, PayloadBufferBudget};
+
+    let nested = C2Error::new(ErrorCode::ResourceRemoved, "B refused the call").with_details(
+        BTreeMap::from([
+            ("route".into(), "B".into()),
+            ("route_uid".into(), "old-B".into()),
+            ("dispatch_phase".into(), "pre_dispatch".into()),
+            ("transport_phase".into(), "pre_dispatch".into()),
+        ]),
+    );
+    let wire = nested.to_wire_bytes();
+    let budget = PayloadBufferBudget::new(wire.capacity() as u64);
+    let reservation = budget
+        .reserve_blocking(wire.capacity() as u64, None)
+        .unwrap();
+    let http_binary = BudgetedBuffer::new(wire.clone(), reservation);
+    let body = serde_json::to_string(&nested.envelope()).unwrap();
+    let json_bytes = body.clone().into_bytes();
+    let json_budget = PayloadBufferBudget::new(json_bytes.capacity() as u64);
+    let reservation = json_budget
+        .reserve_blocking(json_bytes.capacity() as u64, None)
+        .unwrap();
+    let http_json = BudgetedBuffer::new(json_bytes, reservation);
+
+    for actual in [
+        normalize_ipc_error(IpcError::CrmError(wire), TransportPhase::DispatchUncertain),
+        normalize_http_error(
+            HttpError::CrmError(http_binary),
+            TransportPhase::DispatchUncertain,
+        ),
+        normalize_http_error(
+            HttpError::ServerError(500, body.clone()),
+            TransportPhase::PreDispatch,
+        ),
+        normalize_http_error(
+            HttpError::ResponseError(500, http_json),
+            TransportPhase::PreDispatch,
+        ),
+    ] {
+        let Error::Semantic(actual) = actual else {
+            panic!("resource callback failure must stay semantic");
+        };
+        assert_eq!(actual.code, nested.code);
+        assert_eq!(actual.message, nested.message);
+        assert_eq!(actual.details["route"], "B");
+        assert_eq!(actual.details["route_uid"], "old-B");
+        assert!(!actual.details.contains_key("dispatch_phase"));
+        assert!(!actual.details.contains_key("transport_phase"));
+    }
+    assert_eq!(budget.snapshot().used_bytes, 0);
+    assert_eq!(json_budget.snapshot().used_bytes, 0);
+}
+
+#[test]
 fn malformed_semantic_payloads_become_protocol_violations() {
     for error in [
         normalize_ipc_error(

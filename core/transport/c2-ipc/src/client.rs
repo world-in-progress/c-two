@@ -109,13 +109,10 @@ pub(crate) async fn with_connect_deadline<T>(
 use crate::connection::{
     ClientConnection, EndState, PhysicalRetirement, ReadDriver, SendState, core_error,
 };
-use c2_wire::buddy::{BuddyPayload, decode_buddy_payload, encode_buddy_payload};
-use c2_wire::chunk::header::encode_chunk_header;
+use c2_wire::buddy::{BuddyPayload, encode_buddy_payload};
 use c2_wire::chunk::{ChunkAdmissionError, ChunkConfig, ChunkRegistry};
+use c2_wire::connection::calls::ValueReceive;
 use c2_wire::connection::{PreparedLoan, WriteRequest};
-use c2_wire::control::{
-    ReplyControl, RouteCallIdentity, decode_reply_control, encode_call_control,
-};
 use c2_wire::flags;
 use c2_wire::frame::{self, DecodeError, FrameHeader, HEADER_SIZE};
 use c2_wire::handshake::{
@@ -133,6 +130,10 @@ use c2_wire::route_catalog_control::{
     RouteLookupResponse, RouteRecordWire, RouteSelector, RouteStateReasonWire, RouteStateWire,
     decode_route_list_response, decode_route_lookup_response, decode_route_nack,
     encode_route_list_request, encode_route_lookup_request,
+};
+use c2_wire::rpc::RouteCallIdentity;
+use c2_wire::rpc::{
+    self, CallMode, CallStatus, FragmentPosition, RpcRecord, RpcRecordKind, ValuePart, ValueStorage,
 };
 
 use c2_mem::config::PoolConfig;
@@ -326,6 +327,8 @@ pub enum IpcError {
     /// Call-site policy rejected this unpublished call. Retains the canonical
     /// code, message, and details; it is not a connection or route failure.
     LocalCallRejected(C2Error),
+    /// The peer proved that resource callback execution never began.
+    CallRejected(C2Error),
     /// I/O error on the local connection.
     Io(std::io::Error),
     /// The native local connection attempt failed before any handshake I/O.
@@ -390,6 +393,7 @@ impl std::fmt::Display for IpcError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::LocalCallRejected(error) => write!(f, "IPC local call rejected: {error}"),
+            Self::CallRejected(error) => write!(f, "IPC call not executed: {error}"),
             Self::Io(e) | Self::Connect(e) => write!(f, "IPC I/O error: {e}"),
             Self::Config(msg) => write!(f, "IPC config error: {msg}"),
             Self::Decode(e) => write!(f, "IPC decode error: {e}"),
@@ -485,8 +489,8 @@ impl From<DecodeError> for IpcError {
     }
 }
 
-impl From<c2_wire::control::EncodeError> for IpcError {
-    fn from(e: c2_wire::control::EncodeError) -> Self {
+impl From<c2_wire::rpc::EncodeError> for IpcError {
+    fn from(e: c2_wire::rpc::EncodeError) -> Self {
         Self::Protocol(e.to_string())
     }
 }
@@ -734,11 +738,18 @@ impl MethodTable {
     }
 }
 
-// Pending correlates calls only. The connection loan book owns publication.
+#[derive(Clone, Copy)]
+pub(crate) enum PendingKind {
+    Call(CallMode),
+    Control,
+}
+
+// Active calls retain their original physical connection until terminal delivery.
 pub(crate) struct PendingResponse {
-    pub(crate) tx: oneshot::Sender<Result<ResponseData, IpcError>>,
+    pub(crate) tx: Option<oneshot::Sender<Result<ResponseData, IpcError>>>,
     pub(crate) state: Arc<StdMutex<SendState>>,
-    reply_chunks: Option<(u64, u32)>,
+    reply_chunks: Option<ValueReceive>,
+    pub(crate) kind: PendingKind,
     upload_stop: Option<watch::Sender<bool>>,
 }
 impl PendingResponse {
@@ -746,15 +757,65 @@ impl PendingResponse {
         if let Some(stop) = self.upload_stop {
             stop.send_replace(true);
         }
-        let _ = self.tx.send(result);
+        if let Some(tx) = self.tx {
+            let _ = tx.send(result);
+        }
     }
 }
-pub(crate) type PendingMap = HashMap<u64, PendingResponse>;
+/// One physical connection's active calls and unpublished submissions.
+/// Wire numbers are assigned only by its writer, never by a waiting caller.
+#[derive(Default)]
+pub(crate) struct PendingMap {
+    pub(crate) active: HashMap<u64, PendingResponse>,
+    pub(crate) queued: Vec<PendingResponse>,
+    pub(crate) high_submitted: u64,
+}
+impl PendingMap {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.active.is_empty() && self.queued.is_empty()
+    }
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn len(&self) -> usize {
+        self.active.len() + self.queued.len()
+    }
+    pub(crate) fn remove(&mut self, rid: &u64) -> Option<PendingResponse> {
+        self.active.remove(rid)
+    }
+    pub(crate) fn get(&self, rid: &u64) -> Option<&PendingResponse> {
+        self.active.get(rid)
+    }
+    pub(crate) fn get_mut(&mut self, rid: &u64) -> Option<&mut PendingResponse> {
+        self.active.get_mut(rid)
+    }
+
+    pub(crate) fn publish(
+        &mut self,
+        state: &Arc<StdMutex<SendState>>,
+        rid: u64,
+    ) -> Result<(), IpcError> {
+        let index = self
+            .queued
+            .iter()
+            .position(|entry| Arc::ptr_eq(&entry.state, state))
+            .ok_or(IpcError::Closed)?;
+        let entry = self.queued.swap_remove(index);
+        self.high_submitted = rid;
+        self.active.insert(rid, entry);
+        Ok(())
+    }
+    fn unpublished_mut(
+        &mut self,
+        state: &Arc<StdMutex<SendState>>,
+    ) -> Option<&mut PendingResponse> {
+        self.queued
+            .iter_mut()
+            .find(|entry| Arc::ptr_eq(&entry.state, state))
+    }
+}
 
 struct SendGuard {
     pending: Arc<StdMutex<PendingMap>>,
     conn: Arc<ClientConnection>,
-    rid: u64,
     state: Arc<StdMutex<SendState>>,
     producer: Option<tokio::task::AbortHandle>,
 }
@@ -765,8 +826,31 @@ impl SendGuard {
 }
 impl Drop for SendGuard {
     fn drop(&mut self) {
-        let unpublished = self.state.lock().cancel();
-        self.pending.lock().remove(&self.rid);
+        let (unpublished, rid) = {
+            let mut state = self.state.lock();
+            (state.cancel(), state.request_id())
+        };
+        let detached = {
+            let mut calls = self.pending.lock();
+            if unpublished {
+                if let Some(rid) = rid {
+                    calls.active.remove(&rid)
+                } else {
+                    calls
+                        .queued
+                        .iter()
+                        .position(|entry| Arc::ptr_eq(&entry.state, &self.state))
+                        .map(|index| calls.queued.swap_remove(index))
+                }
+            } else {
+                // A deadline detaches this waiter; the sent call keeps draining.
+                if let Some(entry) = rid.and_then(|rid| calls.active.get_mut(&rid)) {
+                    entry.tx.take();
+                }
+                None
+            }
+        };
+        drop(detached);
         self.conn.wake.notify_one();
         if unpublished {
             if let Some(producer) = &self.producer {
@@ -820,12 +904,6 @@ pub(crate) fn request_chunk_count(data_len: usize, chunk_size: usize) -> Result<
         return Ok(0);
     }
     let total_chunks = data_len.div_ceil(chunk_size);
-    if total_chunks > usize::from(u16::MAX) {
-        return Err(IpcError::Config(format!(
-            "request chunk count {total_chunks} exceeds wire limit {}",
-            u16::MAX
-        )));
-    }
     Ok(total_chunks)
 }
 
@@ -854,7 +932,9 @@ fn dispatch_call_error(
     source: IpcError,
     sent_or_attempted: bool,
 ) -> crate::sync_client::IpcCallError {
-    if sent_or_attempted || matches!(source, IpcError::ResponseFailure(_)) {
+    if matches!(source, IpcError::CallRejected(_)) {
+        pre_dispatch_call_error(source)
+    } else if sent_or_attempted || matches!(source, IpcError::ResponseFailure(_)) {
         dispatch_uncertain_call_error(source)
     } else {
         pre_dispatch_call_error(source)
@@ -900,7 +980,6 @@ pub struct IpcClient {
     endpoint: Result<LocalEndpoint, String>,
     driver: RwLock<Option<Arc<ClientConnection>>>,
     pending: Arc<StdMutex<PendingMap>>,
-    rid_counter: Arc<AtomicU64>,
     pub(crate) route_directory: Arc<RwLock<RouteDirectory>>,
     pub(crate) server_identity: Option<c2_wire::handshake::ServerIdentity>,
     pub(crate) server_pool: StdMutex<Option<Arc<RwLock<ServerPoolState>>>>,
@@ -947,8 +1026,7 @@ impl IpcClient {
         Self {
             endpoint,
             driver: RwLock::new(None),
-            pending: Arc::new(StdMutex::new(HashMap::new())),
-            rid_counter: Arc::new(AtomicU64::new(0)),
+            pending: Arc::new(StdMutex::new(PendingMap::default())),
             route_directory: Arc::new(RwLock::new(RouteDirectory::new())),
             server_identity: None,
             server_pool: StdMutex::new(None),
@@ -1132,50 +1210,37 @@ impl IpcClient {
     fn begin_call(
         &self,
     ) -> Result<(SendGuard, oneshot::Receiver<Result<ResponseData, IpcError>>), IpcError> {
-        self.begin_pending()
+        self.begin_pending(PendingKind::Call(CallMode::Unary))
     }
 
     fn begin_control(
         &self,
     ) -> Result<(SendGuard, oneshot::Receiver<Result<ResponseData, IpcError>>), IpcError> {
-        self.begin_pending()
+        self.begin_pending(PendingKind::Control)
     }
 
     fn begin_pending(
         &self,
+        kind: PendingKind,
     ) -> Result<(SendGuard, oneshot::Receiver<Result<ResponseData, IpcError>>), IpcError> {
         let conn = self.driver.read().clone().ok_or(IpcError::Closed)?;
         let mut pending = self.pending.lock();
         if conn.core.is_deactivated() {
             return Err(IpcError::Closed);
         }
-        let rid = match self
-            .rid_counter
-            .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
-        {
-            Ok(previous) => previous + 1,
-            Err(_) => {
-                drop(pending);
-                conn.end(ConnectionEndReason::ProtocolError, "request_id_exhausted");
-                return Err(IpcError::Protocol("request ID space exhausted".into()));
-            }
-        };
         let (tx, rx) = oneshot::channel();
         let state = Arc::new(StdMutex::new(SendState::default()));
-        pending.insert(
-            rid,
-            PendingResponse {
-                tx,
-                state: state.clone(),
-                reply_chunks: None,
-                upload_stop: None,
-            },
-        );
+        pending.queued.push(PendingResponse {
+            tx: Some(tx),
+            state: state.clone(),
+            reply_chunks: None,
+            kind,
+            upload_stop: None,
+        });
         Ok((
             SendGuard {
                 pending: self.pending.clone(),
                 conn,
-                rid,
                 state,
                 producer: None,
             },
@@ -1212,8 +1277,7 @@ impl IpcClient {
         }
         // Never reuse a prior physical connection's book, IDs or peer mappings.
         self.driver.get_mut().take();
-        self.pending = Arc::new(StdMutex::new(HashMap::new()));
-        self.rid_counter = Arc::new(AtomicU64::new(0));
+        self.pending = Arc::new(StdMutex::new(PendingMap::default()));
         self.negotiated_shm_request.store(false, Ordering::Release);
         let endpoint = self.local_endpoint()?;
         let stream = with_connect_deadline(deadline, "os_connect", async {
@@ -1931,7 +1995,7 @@ impl IpcClient {
         }
     }
 
-    /// Inline call path — sends call control + data in a single frame.
+    /// Inline call path: OPEN metadata and input share one frame.
     pub(crate) async fn call_inline(
         &self,
         identity: &RouteCallIdentity,
@@ -1951,28 +2015,29 @@ impl IpcClient {
     ) -> Result<ResponseData, crate::IpcCallError> {
         IpcCallControl::check_preparation(control).map_err(pre_dispatch_call_error)?;
         let (send, mut rx) = self.begin_call().map_err(pre_dispatch_call_error)?;
-        let ctrl = encode_call_control(identity, method_idx)
+        let metadata = rpc::encode_open_metadata(identity, method_idx)
             .map_err(|error| pre_dispatch_call_error(IpcError::Protocol(error.to_string())))?;
+        // The draft has no wire identity until the unique writer submits it.
         let bytes =
-            frame::encode_frame_parts(send.rid, flags::FLAG_CALL_V2, &[&ctrl, data.as_ref()]);
-        send.conn
+            frame::encode_frame_parts(0, flags::FLAG_RPC_RECORD, &[&metadata, data.as_ref()]);
+        let written = send
+            .conn
             .submit(
                 bytes,
                 WriteRequest::Business(Vec::new()),
                 send.state.clone(),
                 control.cloned(),
             )
-            .await
-            .map_err(|error| {
-                dispatch_call_error(prefer_response_failure(error, &mut rx), send.started())
-            })?;
+            .await;
         // Sending has finished. Keep only response ownership while awaiting rx.
         drop(data);
-        owned_response(
-            rx.await
+        let response = match written {
+            Ok(()) => rx
+                .await
                 .map_err(|_| dispatch_call_error(IpcError::Closed, send.started()))?,
-        )
-        .map_err(classified_call_error)
+            Err(error) => prefer_ready_response(error, &mut rx),
+        };
+        owned_response(response).map_err(|error| dispatch_call_error(error, send.started()))
     }
 
     async fn call_buddy(
@@ -2096,29 +2161,29 @@ impl IpcClient {
             is_dedicated: alloc.is_dedicated,
             loan_id: loan.id(),
         });
-        let ctrl = encode_call_control(identity, method_idx)
+        let metadata = rpc::encode_open_metadata(identity, method_idx)
             .map_err(|error| pre_dispatch_call_error(IpcError::Protocol(error.to_string())))?;
         let bytes = frame::encode_frame_parts(
-            send.rid,
-            flags::FLAG_CALL_V2 | flags::FLAG_BUDDY,
-            &[&descriptor, &ctrl],
+            0,
+            flags::FLAG_RPC_RECORD | flags::FLAG_BUDDY,
+            &[&metadata, &descriptor],
         );
-        send.conn
+        let written = send
+            .conn
             .submit(
                 bytes,
                 WriteRequest::Business(vec![loan]),
                 send.state.clone(),
                 control.cloned(),
             )
-            .await
-            .map_err(|error| {
-                dispatch_call_error(prefer_response_failure(error, &mut rx), send.started())
-            })?;
-        owned_response(
-            rx.await
+            .await;
+        let response = match written {
+            Ok(()) => rx
+                .await
                 .map_err(|_| dispatch_call_error(IpcError::Closed, send.started()))?,
-        )
-        .map_err(classified_call_error)
+            Err(error) => prefer_ready_response(error, &mut rx),
+        };
+        owned_response(response).map_err(|error| dispatch_call_error(error, send.started()))
     }
 
     async fn call_chunked(
@@ -2179,11 +2244,11 @@ impl IpcClient {
         let (mut send, mut rx) = self.begin_call().map_err(pre_dispatch_call_error)?;
         let conn = send.conn.clone();
         let state = send.state.clone();
-        let rid = send.rid;
-        let ctrl = encode_call_control(identity, method_idx)
+        let rid = 0;
+        let ctrl = rpc::encode_open_metadata(identity, method_idx)
             .map_err(|error| pre_dispatch_call_error(IpcError::Protocol(error.to_string())))?;
         let (upload_stop, stop_upload) = watch::channel(false);
-        if let Some(entry) = self.pending.lock().get_mut(&rid) {
+        if let Some(entry) = self.pending.lock().unpublished_mut(&send.state) {
             entry.upload_stop = Some(upload_stop);
         }
         let producer = send.conn.spawn_send(async move {
@@ -2206,13 +2271,13 @@ impl IpcClient {
             Ok(Ok(())) => {}
             Ok(Err(error)) => {
                 let phase = error.phase();
-                let source = prefer_response_failure(error.into_source(), &mut rx);
-                let phase = if matches!(source, IpcError::ResponseFailure(_)) {
-                    crate::TransportPhase::DispatchUncertain
-                } else {
-                    phase
-                };
-                return Err(crate::IpcCallError::new(phase, source));
+                return owned_response(prefer_ready_response(error.into_source(), &mut rx))
+                    .map_err(|source| {
+                        dispatch_call_error(
+                            source,
+                            phase == crate::TransportPhase::DispatchUncertain,
+                        )
+                    });
             }
             Err(error) => {
                 let source = IpcError::Io(std::io::Error::other(error.to_string()));
@@ -2223,7 +2288,8 @@ impl IpcClient {
                         false,
                     );
                 }
-                return Err(dispatch_call_error(source, send.started()));
+                return owned_response(prefer_ready_response(source, &mut rx))
+                    .map_err(|source| dispatch_call_error(source, send.started()));
             }
         }
         match rx.await {
@@ -2302,10 +2368,9 @@ impl IpcClient {
                         &state,
                         rid,
                         index,
-                        total_chunks,
+                        data_size,
                         (index == 0).then_some(ctrl.as_slice()),
                         &buffered,
-                        index + 1 == total_chunks,
                         if index == 0 { policy.clone() } else { None },
                     )
                     .await
@@ -2334,10 +2399,9 @@ impl IpcClient {
                 &state,
                 rid,
                 index,
-                total_chunks,
+                data_size,
                 (index == 0).then_some(ctrl.as_slice()),
                 &buffered,
-                index + 1 == total_chunks,
                 if index == 0 { policy } else { None },
             )
             .await
@@ -2359,7 +2423,11 @@ impl IpcClient {
         state: &StdMutex<SendState>,
         error: IpcError,
     ) -> crate::IpcCallError {
-        let started = state.lock().started();
+        let started = {
+            let mut state = state.lock();
+            state.fail_upload();
+            state.started()
+        };
         if started {
             conn.end_io(
                 "request_source",
@@ -2375,22 +2443,35 @@ impl IpcClient {
         state: &Arc<StdMutex<SendState>>,
         rid: u64,
         chunk_idx: usize,
-        total_chunks: usize,
+        total_bytes: usize,
         ctrl: Option<&[u8]>,
         chunk_data: &[u8],
-        is_last: bool,
         policy: Option<IpcCallControl>,
     ) -> Result<(), IpcError> {
-        let flags = flags::FLAG_CALL_V2
-            | flags::FLAG_CHUNKED
-            | if is_last { flags::FLAG_CHUNK_LAST } else { 0 };
-        let header = encode_chunk_header(chunk_idx as u16, total_chunks as u16);
-        let bytes =
-            frame::encode_frame_parts(rid, flags, &[&header, ctrl.unwrap_or(&[]), chunk_data]);
+        let record_flags = flags::FLAG_RPC_RECORD
+            | flags::FLAG_FRAGMENTED
+            | if chunk_idx == 0 {
+                flags::FLAG_FIRST_FRAGMENT
+            } else {
+                0
+            };
+        let bytes = if let Some(metadata) = ctrl {
+            frame::encode_frame_parts(
+                rid,
+                record_flags,
+                &[metadata, &(total_bytes as u64).to_le_bytes(), chunk_data],
+            )
+        } else {
+            frame::encode_frame_parts(
+                rid,
+                record_flags,
+                &[&[RpcRecordKind::Open as u8], chunk_data],
+            )
+        };
         let request = if chunk_idx == 0 {
             WriteRequest::Business(Vec::new())
         } else {
-            WriteRequest::Control(conn.core.prepare_control_frame().map_err(core_error)?)
+            WriteRequest::CallContinuation(conn.core.prepare_call_record().map_err(core_error)?)
         };
         conn.submit(bytes, request, state.clone(), policy).await
     }
@@ -2476,17 +2557,21 @@ impl IpcClient {
     ) -> Result<Vec<u8>, IpcError> {
         let (send, mut rx) = self.begin_control()?;
         let control = send.conn.core.prepare_control_frame().map_err(core_error)?;
-        let bytes = frame::encode_frame(send.rid, flags::FLAG_CTRL, &payload);
-        send.conn
+        let bytes = frame::encode_frame(0, flags::FLAG_CTRL, &payload);
+        let written = send
+            .conn
             .submit(
                 bytes,
                 WriteRequest::Control(control),
                 send.state.clone(),
                 None,
             )
-            .await
-            .map_err(|error| prefer_response_failure(error, &mut rx))?;
-        match rx.await.map_err(|_| IpcError::Closed)?? {
+            .await;
+        let response = match written {
+            Ok(()) => rx.await.map_err(|_| IpcError::Closed)?,
+            Err(error) => prefer_ready_response(error, &mut rx),
+        };
+        match response? {
             ResponseData::Inline(payload) => Ok(payload),
             _ => Err(IpcError::Protocol(format!(
                 "{description} returned non-inline response"
@@ -2934,13 +3019,16 @@ impl Drop for IpcClient {
     }
 }
 
-fn prefer_response_failure(
+fn prefer_ready_response(
     error: IpcError,
     receiver: &mut oneshot::Receiver<Result<ResponseData, IpcError>>,
-) -> IpcError {
+) -> Result<ResponseData, IpcError> {
     match receiver.try_recv() {
-        Ok(Err(response @ IpcError::ResponseFailure(_))) => response,
-        _ => error,
+        // Local teardown can settle an unpublished entry without any reply.
+        // It must not replace the writer's concrete pre-dispatch failure.
+        Ok(Err(IpcError::Closed)) => Err(error),
+        Ok(response) => response,
+        Err(_) => Err(error),
     }
 }
 
@@ -3031,25 +3119,56 @@ pub(crate) fn recv_loop(
                 let mut scratch = [0u8; 4096];
                 // A readable frame still has a precise end. Settle an admitted
                 // SHM descriptor even when allocating its whole frame failed.
-                if hdr.is_buddy() && shm_allowed && remaining >= c2_wire::buddy::BUDDY_PAYLOAD_SIZE
-                {
-                    let descriptor = &mut scratch[..c2_wire::buddy::BUDDY_PAYLOAD_SIZE];
-                    if let Err(error) = reader.read_exact(descriptor).await {
+                // Every valid unary SHM record fits this fixed metadata reserve.
+                // It includes kind/status/first total before the descriptor.
+                if hdr.is_buddy() && shm_allowed && remaining <= 64 {
+                    let prefix = &mut scratch[..remaining];
+                    if let Err(error) = reader.read_exact(prefix).await {
                         conn.end_io("discard_descriptor", &error, true);
                         break 'frames;
                     }
-                    remaining -= descriptor.len();
-                    if let Ok((descriptor, _)) = decode_response_descriptor(descriptor, &conn) {
-                        match conn
-                            .core
-                            .admit_remote_loan(descriptor.loan_id, Box::new(retirement.clone()))
-                        {
-                            Ok(loan) => loan.finish(),
-                            Err(_) => conn.end(
-                                ConnectionEndReason::ProtocolError,
-                                "response_loan_admission",
-                            ),
+                    remaining = 0;
+                    let descriptor = match rpc::decode_rpc_record_with_carrier(
+                        &hdr,
+                        prefix,
+                        Some(CallMode::Unary),
+                    ) {
+                        Ok(
+                            RpcRecord::CallEnd {
+                                value:
+                                    ValuePart {
+                                        storage: ValueStorage::Shm(descriptor),
+                                        ..
+                                    },
+                                ..
+                            }
+                            | RpcRecord::CallEndContinuation {
+                                value:
+                                    ValuePart {
+                                        storage: ValueStorage::Shm(descriptor),
+                                        ..
+                                    },
+                            },
+                        ) => Some(descriptor),
+                        Err(failure) => {
+                            if failure.error == DecodeError::ZeroLoanId {
+                                conn.end(
+                                    ConnectionEndReason::ProtocolError,
+                                    "response_loan_admission",
+                                );
+                            }
+                            failure.carrier
                         }
+                        _ => None,
+                    };
+                    if let Some(descriptor) = descriptor {
+                        discard_response_storage(
+                            ValueStorage::Shm(descriptor),
+                            &server_pool,
+                            shm_allowed,
+                            conn,
+                            retirement.clone(),
+                        );
                     }
                 }
                 while remaining > 0 {
@@ -3071,7 +3190,9 @@ pub(crate) fn recv_loop(
                 conn.end_io("read_payload", &error, true);
                 break;
             }
-            if payload.first() == Some(&(MsgType::Release as u8)) && hdr.is_ctrl() {
+            if hdr.flags & flags::FLAG_RPC_RECORD != 0
+                && payload.first() == Some(&(RpcRecordKind::Release as u8))
+            {
                 let outcome = conn.core.receive_release(&hdr, &payload);
                 drop(outcome.reclaims);
                 if outcome.error.is_some() {
@@ -3079,7 +3200,7 @@ pub(crate) fn recv_loop(
                 }
                 continue;
             }
-            if hdr.is_signal() {
+            if hdr.is_signal() && hdr.flags & flags::FLAG_RPC_RECORD == 0 {
                 match payload.as_slice() {
                     [0x02] => {}
                     [0x09] => conn.end(ConnectionEndReason::LocalClose, "disconnect_ack"),
@@ -3088,50 +3209,220 @@ pub(crate) fn recv_loop(
                 continue;
             }
             let rid = hdr.request_id;
-            if !hdr.is_response() {
-                conn.response_failed(rid, IpcError::Protocol("invalid response direction".into()));
-                continue;
+            if hdr.is_buddy() && !shm_allowed {
+                conn.end(
+                    ConnectionEndReason::ProtocolError,
+                    "unnegotiated_shm_response",
+                );
             }
-            if hdr.is_ctrl() {
-                complete_pending(&pending, rid, Ok(ResponseData::Inline(payload.clone())));
+            let (kind, historical) = {
+                let calls = pending.lock();
+                (
+                    calls.get(&rid).map(|entry| entry.kind),
+                    rid != 0 && rid <= calls.high_submitted,
+                )
+            };
+            if hdr.is_ctrl() && hdr.flags & flags::FLAG_RPC_RECORD == 0 {
+                if matches!(kind, Some(PendingKind::Control))
+                    && hdr.flags == flags::FLAG_CTRL | flags::FLAG_RESPONSE
+                {
+                    complete_pending(
+                        &pending,
+                        rid,
+                        Ok(ResponseData::Inline(std::mem::take(&mut payload))),
+                    );
+                } else if kind.is_some() {
+                    conn.response_failed(
+                        rid,
+                        IpcError::Protocol("unexpected control reply for call".into()),
+                    );
+                } else if !historical {
+                    conn.end(ConnectionEndReason::ProtocolError, "future_control_reply");
+                }
                 conn.wake.notify_one();
                 continue;
             }
-            if flags::is_chunked(hdr.flags) {
-                if !pending.lock().contains_key(&rid) {
-                    // Failed/cancelled waiters cannot admit a fresh assembly
-                    // from late chunks. Request IDs are never reused.
-                    registry.abort(conn_id, rid);
+            let mode = match kind {
+                Some(PendingKind::Call(mode)) => mode,
+                _ => CallMode::Unary,
+            };
+            let record = match rpc::decode_rpc_record_with_carrier(&hdr, &payload, Some(mode)) {
+                Ok(record) => record,
+                Err(failure) => {
+                    if let Some(descriptor) = failure.carrier {
+                        discard_response_storage(
+                            ValueStorage::Shm(descriptor),
+                            &server_pool,
+                            shm_allowed,
+                            conn,
+                            retirement.clone(),
+                        );
+                    }
+                    if failure.error == DecodeError::ZeroLoanId
+                        || (hdr.is_buddy() && failure.carrier.is_none())
+                    {
+                        conn.end(
+                            ConnectionEndReason::ProtocolError,
+                            "response_loan_admission",
+                        );
+                    }
+                    if kind.is_some() {
+                        registry.abort(conn_id, rid);
+                        conn.response_failed(rid, IpcError::Decode(failure.error));
+                    } else if !historical {
+                        conn.end(ConnectionEndReason::ProtocolError, "future_reply");
+                    }
                     continue;
                 }
-                let result = receive_chunk(&hdr, &payload, &registry, conn_id, &pending);
-                match result {
-                    Ok(Some(response)) => complete_pending(&pending, rid, Ok(response)),
-                    Ok(None) => {}
-                    Err(error @ IpcError::Chunk(ChunkError::Capacity(_))) => {
-                        complete_pending(&pending, rid, Err(error.response_failure()));
+            };
+            let value = match record {
+                RpcRecord::CallEnd {
+                    status,
+                    value,
+                    error,
+                    ..
+                } => {
+                    if kind.is_none() {
+                        discard_response_storage(
+                            value.storage,
+                            &server_pool,
+                            shm_allowed,
+                            conn,
+                            retirement.clone(),
+                        );
+                        if !historical {
+                            conn.end(ConnectionEndReason::ProtocolError, "future_reply");
+                        }
+                        continue;
                     }
-                    Err(error) => {
+                    if pending
+                        .lock()
+                        .get(&rid)
+                        .is_some_and(|entry| entry.reply_chunks.is_some())
+                    {
+                        discard_response_storage(
+                            value.storage,
+                            &server_pool,
+                            shm_allowed,
+                            conn,
+                            retirement.clone(),
+                        );
                         registry.abort(conn_id, rid);
-                        conn.response_failed(rid, error);
+                        conn.response_failed(
+                            rid,
+                            IpcError::Protocol(
+                                "duplicate CALL_END while its value is incomplete".into(),
+                            ),
+                        );
+                        continue;
+                    }
+                    if !matches!(kind, Some(PendingKind::Call(_))) {
+                        discard_response_storage(
+                            value.storage,
+                            &server_pool,
+                            shm_allowed,
+                            conn,
+                            retirement.clone(),
+                        );
+                        conn.response_failed(
+                            rid,
+                            IpcError::Protocol("CALL_END for control".into()),
+                        );
+                        continue;
+                    }
+                    match status {
+                        CallStatus::NotExecuted => {
+                            complete_pending(
+                                &pending,
+                                rid,
+                                Err(IpcError::CallRejected(error.expect("checked C2E1 refusal"))),
+                            );
+                            conn.wake.notify_one();
+                            continue;
+                        }
+                        CallStatus::Failed => {
+                            let ValueStorage::Inline(bytes) = value.storage else {
+                                unreachable!("checked C2E1 storage")
+                            };
+                            complete_pending(
+                                &pending,
+                                rid,
+                                Err(IpcError::CrmError(bytes.to_vec())),
+                            );
+                            conn.wake.notify_one();
+                            continue;
+                        }
+                        CallStatus::Success => value,
                     }
                 }
-                conn.wake.notify_one();
-                continue;
-            }
-            let result = decode_response(
-                &hdr,
-                &payload,
-                &server_pool,
-                shm_allowed,
-                &conn,
-                retirement.clone(),
-            );
-            match result {
-                Err(error @ (IpcError::Decode(_) | IpcError::Protocol(_) | IpcError::Shm(_))) => {
-                    conn.response_failed(rid, error)
+                RpcRecord::CallEndContinuation { value } => {
+                    if kind.is_none() {
+                        discard_response_storage(
+                            value.storage,
+                            &server_pool,
+                            shm_allowed,
+                            conn,
+                            retirement.clone(),
+                        );
+                        if !historical {
+                            conn.end(ConnectionEndReason::ProtocolError, "future_reply");
+                        }
+                        continue;
+                    }
+                    value
                 }
-                result => complete_pending(&pending, rid, result),
+                other => {
+                    if let RpcRecord::ItemData { value } = other {
+                        discard_response_storage(
+                            value.storage,
+                            &server_pool,
+                            shm_allowed,
+                            conn,
+                            retirement.clone(),
+                        );
+                    }
+                    registry.abort(conn_id, rid);
+                    if kind.is_some() {
+                        conn.response_failed(
+                            rid,
+                            IpcError::Protocol("unsupported response record for unary call".into()),
+                        );
+                    }
+                    conn.end(
+                        ConnectionEndReason::ProtocolError,
+                        "unsupported_response_record",
+                    );
+                    continue;
+                }
+            };
+            let result = match value.fragment {
+                FragmentPosition::Whole => admit_response_storage(
+                    value.storage,
+                    &server_pool,
+                    shm_allowed,
+                    conn,
+                    retirement.clone(),
+                )
+                .map(Some),
+                _ => receive_rpc_chunk(
+                    &hdr,
+                    value,
+                    &registry,
+                    conn_id,
+                    &pending,
+                    &server_pool,
+                    shm_allowed,
+                    conn,
+                    retirement.clone(),
+                ),
+            };
+            match result {
+                Ok(Some(response)) => complete_pending(&pending, rid, Ok(response)),
+                Ok(None) => {}
+                Err(error) => {
+                    registry.abort(conn_id, rid);
+                    conn.response_failed(rid, error);
+                }
             }
             conn.wake.notify_one();
         }
@@ -3156,52 +3447,85 @@ pub(crate) fn recv_loop(
     }
 }
 
-fn receive_chunk(
+#[allow(clippy::too_many_arguments)]
+fn receive_rpc_chunk(
     hdr: &FrameHeader,
-    payload: &[u8],
+    value: ValuePart<'_>,
     registry: &ChunkRegistry<()>,
     conn_id: u64,
     pending: &StdMutex<PendingMap>,
+    pool: &Arc<RwLock<ServerPoolState>>,
+    shm_allowed: bool,
+    conn: &ClientConnection,
+    guard: Arc<PhysicalRetirement>,
 ) -> Result<Option<ResponseData>, IpcError> {
-    let (total_size, total_chunks, index, consumed) =
-        c2_wire::chunk::header::decode_reply_chunk_meta(payload, 0).map_err(|error| {
-            IpcError::Chunk(ChunkError::Protocol(format!(
-                "reply chunk metadata: {error}"
-            )))
-        })?;
     let rid = hdr.request_id;
-    let data = &payload[consumed..];
-    if index == 0 {
-        registry
-            .insert_reply(conn_id, rid, total_size, total_chunks as usize, data.len())
-            .map_err(|error| IpcError::Chunk(error.into()))?;
-        if let Some(entry) = pending.lock().get_mut(&rid) {
-            entry.reply_chunks = Some((total_size, total_chunks));
+    let carrier = if let ValueStorage::Shm(descriptor) = value.storage {
+        Some(admit_response_storage(
+            ValueStorage::Shm(descriptor),
+            pool,
+            shm_allowed,
+            conn,
+            guard,
+        )?)
+    } else {
+        None
+    };
+    let bytes = value.storage.len();
+    let geometry = if let FragmentPosition::First { total_bytes } = value.fragment {
+        let receive =
+            ValueReceive::first(total_bytes, bytes).map_err(|e| IpcError::Protocol(e.into()))?;
+        let geometry = receive
+            .geometry()
+            .map_err(|e| IpcError::Protocol(e.into()))?;
+        let mut calls = pending.lock();
+        let call = calls.get_mut(&rid).ok_or(IpcError::Closed)?;
+        if call.reply_chunks.is_some() {
+            return Err(IpcError::Protocol(
+                "duplicate CALL_END first fragment".into(),
+            ));
         }
-    } else if pending
-        .lock()
-        .get(&rid)
-        .and_then(|entry| entry.reply_chunks)
-        != Some((total_size, total_chunks))
-    {
-        return Err(IpcError::Chunk(ChunkError::Protocol(
-            "reply chunk metadata changed after the first chunk".into(),
-        )));
+        call.reply_chunks = Some(receive);
+        Some((total_bytes, geometry))
+    } else {
+        None
+    };
+    let index = {
+        let mut calls = pending.lock();
+        let receive = calls
+            .get_mut(&rid)
+            .and_then(|call| call.reply_chunks.as_mut())
+            .ok_or_else(|| {
+                IpcError::Protocol("CALL_END continuation has no started value".into())
+            })?;
+        receive
+            .admit(bytes)
+            .map_err(|e| IpcError::Protocol(e.into()))?
+    };
+    if let Some((total, (count, size))) = geometry {
+        registry
+            .insert_reply(conn_id, rid, total, count, size)
+            .map_err(|error| IpcError::Chunk(error.into()))?;
     }
+    let data = match (value.storage, carrier) {
+        (ValueStorage::Inline(bytes), None) => std::borrow::Cow::Borrowed(bytes),
+        (_, Some(carrier)) => {
+            std::borrow::Cow::Owned(carrier.into_owned_bytes().map_err(IpcError::Shm)?)
+        }
+        _ => unreachable!("SHM carrier admitted before sequence validation"),
+    };
     if !registry
-        .feed(conn_id, rid, index as usize, data)
-        .map_err(|error| IpcError::Chunk(ChunkError::Protocol(error)))?
+        .feed(conn_id, rid, index, &data)
+        .map_err(|e| IpcError::Protocol(e))?
     {
         return Ok(None);
     }
-    let (assembler, ()) = registry
-        .take(conn_id, rid)
-        .map_err(|error| IpcError::Chunk(ChunkError::Protocol(error)))?;
+    let (assembler, ()) = registry.take(conn_id, rid).map_err(IpcError::Protocol)?;
     assembler
         .finish()
         .map(ResponseData::Handle)
         .map(Some)
-        .map_err(|error| IpcError::Chunk(ChunkError::Protocol(error)))
+        .map_err(IpcError::Protocol)
 }
 
 fn complete_pending(
@@ -3217,81 +3541,57 @@ fn complete_pending(
     // node queues release without waiting for a pool lock or any network I/O.
 }
 
-fn decode_response(
-    hdr: &FrameHeader,
-    payload: &[u8],
+fn discard_response_storage(
+    storage: ValueStorage<'_>,
+    pool: &Arc<RwLock<ServerPoolState>>,
+    shm_allowed: bool,
+    conn: &ClientConnection,
+    guard: Arc<PhysicalRetirement>,
+) {
+    if let ValueStorage::Shm(descriptor) = storage {
+        drop(admit_response_storage(
+            ValueStorage::Shm(descriptor),
+            pool,
+            shm_allowed,
+            conn,
+            guard,
+        ));
+    }
+}
+
+fn admit_response_storage(
+    storage: ValueStorage<'_>,
     pool: &Arc<RwLock<ServerPoolState>>,
     shm_allowed: bool,
     conn: &ClientConnection,
     guard: Arc<PhysicalRetirement>,
 ) -> Result<ResponseData, IpcError> {
-    if !hdr.is_reply_v2() {
-        return Err(IpcError::Protocol("response missing reply control".into()));
-    }
-    if hdr.is_buddy() {
-        if !shm_allowed {
-            return Err(IpcError::Protocol(
-                "SHM response direction was not negotiated".into(),
-            ));
-        }
-        let (descriptor, consumed) = decode_response_descriptor(payload, conn)?;
-        // Admit before mapping/control decoding so every failure ends the read
-        // interval and queues this descriptor's release.
-        let loan = conn
-            .core
-            .admit_remote_loan(descriptor.loan_id, Box::new((guard, pool.clone())))
-            .map_err(|error| {
-                conn.end(
-                    ConnectionEndReason::ProtocolError,
-                    "response_loan_admission",
-                );
-                core_error(error)
-            })?;
-        let carrier = ServerShmResponse::admit(pool.clone(), descriptor, loan).map_err(
-            |error| match error {
-                PeerMappingError::InvalidDescriptor(message) => IpcError::Protocol(message),
-                PeerMappingError::Open(message) => IpcError::Shm(message),
-            },
-        )?;
-        let (control, _) = decode_reply_control(payload, consumed)?;
-        match control {
-            ReplyControl::Success => Ok(ResponseData::Shm(carrier)),
-            ReplyControl::RouteNotFound(route) => Err(IpcError::RouteNotFound(route)),
-            ReplyControl::Error(error) => Err(IpcError::CrmError(error)),
-        }
-    } else {
-        let (control, consumed) = decode_reply_control(payload, 0)?;
-        match control {
-            ReplyControl::Success => Ok(ResponseData::Inline(payload[consumed..].to_vec())),
-            ReplyControl::RouteNotFound(route) => Err(IpcError::RouteNotFound(route)),
-            ReplyControl::Error(error) => Err(IpcError::CrmError(error)),
-        }
-    }
-}
-
-fn decode_response_descriptor(
-    payload: &[u8],
-    conn: &ClientConnection,
-) -> Result<(BuddyPayload, usize), IpcError> {
-    decode_buddy_payload(payload)
-        .inspect_err(|error| {
-            // The wire boundary rejects zero before a RemoteLoan can be
-            // admitted. It is still a loan-channel violation, independent of
-            // local SHM budgets or whether opening the mapping would succeed.
-            if matches!(
-                error,
-                DecodeError::InvalidValue {
-                    field: "loan id",
-                    ..
-                }
-            ) {
-                conn.end(
-                    ConnectionEndReason::ProtocolError,
-                    "response_loan_admission",
-                );
+    match storage {
+        ValueStorage::Inline(bytes) => Ok(ResponseData::Inline(bytes.to_vec())),
+        ValueStorage::Shm(descriptor) => {
+            if !shm_allowed {
+                return Err(IpcError::Protocol(
+                    "SHM response direction was not negotiated".into(),
+                ));
             }
-        })
-        .map_err(IpcError::from)
+            let loan = conn
+                .core
+                .admit_remote_loan(descriptor.loan_id, Box::new((guard, pool.clone())))
+                .map_err(|error| {
+                    conn.end(
+                        ConnectionEndReason::ProtocolError,
+                        "response_loan_admission",
+                    );
+                    core_error(error)
+                })?;
+            ServerShmResponse::admit(pool.clone(), descriptor, loan)
+                .map(ResponseData::Shm)
+                .map_err(|error| match error {
+                    PeerMappingError::InvalidDescriptor(message) => IpcError::Protocol(message),
+                    PeerMappingError::Open(message) => IpcError::Shm(message),
+                })
+        }
+    }
 }
 
 #[cfg(test)]

@@ -9,22 +9,21 @@ async fn close_preserves_started_chunked_upload_and_reply() {
         let mut stream = accept(&mut listener).await;
         let (first, payload) = read_frame(&mut stream).await;
         assert_eq!(
-            c2_wire::chunk::header::decode_chunk_header(&payload, 0)
-                .unwrap()
-                .0,
-            0
+            first.flags,
+            flags::FLAG_RPC_RECORD | flags::FLAG_FRAGMENTED | flags::FLAG_FIRST_FRAGMENT
         );
+        assert!(matches!(
+            decode_rpc_record(&first, &payload, None).unwrap(),
+            RpcRecord::Open { .. }
+        ));
         first_sent.send(()).unwrap();
         for expected in 1..3 {
             let (next, payload) = read_frame(&mut stream).await;
             assert_eq!(next.request_id, first.request_id);
-            assert_eq!(
-                c2_wire::chunk::header::decode_chunk_header(&payload, 0)
-                    .unwrap()
-                    .0,
-                expected
+            assert_eq!(next.flags, flags::FLAG_RPC_RECORD | flags::FLAG_FRAGMENTED);
+            assert!(
+                matches!(decode_rpc_record(&next, &payload, None).unwrap(), RpcRecord::OpenContinuation { value: ValuePart { storage: ValueStorage::Inline(bytes), .. } } if bytes.iter().all(|byte| *byte == expected as u8 + 1))
             );
-            assert!(payload[4..].iter().all(|byte| *byte == expected as u8 + 1));
         }
         reply(&mut stream, first.request_id, b"all chunks executed").await;
         expect_disconnect_or_eof(&mut stream).await;

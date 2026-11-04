@@ -2934,6 +2934,16 @@ mod tests {
         // alive by the observer. Its budget metadata still sees the real Vec.
         assert!(weak_session.upgrade().is_none());
         assert_eq!(input.as_ref().as_ref(), &[7; 32]);
+        // Outcome publication wakes wait() before the native task drops its
+        // operation owner. Observe that real cleanup before checking its refund.
+        let until = Instant::now() + Duration::from_secs(10);
+        while observer.snapshot().counters.unwrap().used_operations != 0 {
+            assert!(
+                Instant::now() < until,
+                "native operation owner did not finish"
+            );
+            std::thread::yield_now();
+        }
         let observation = observer.snapshot();
         assert!(observation.closed);
         let counters = observation.counters.unwrap();

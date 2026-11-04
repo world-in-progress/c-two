@@ -1,8 +1,74 @@
 use super::*;
 
 #[tokio::test]
+async fn incomplete_call_end_waits_for_peer_end_while_other_calls_finish() {
+    let endpoint = Endpoint::new();
+    let mut listener = LocalListener::bind(&endpoint.endpoint).unwrap();
+    let (first_seen, first_received) = oneshot::channel();
+    let (end_peer, peer_can_end) = oneshot::channel();
+    let peer = tokio::spawn(async move {
+        let mut stream = accept(&mut listener).await;
+        let (incomplete, _) = read_frame(&mut stream).await;
+        first_seen.send(()).unwrap();
+        let (running, _) = read_frame(&mut stream).await;
+        let (queued, _) = read_frame(&mut stream).await;
+        stream
+            .write_all(&reply_chunk(incomplete.request_id, 2, 0, &[42; 4096]))
+            .await
+            .unwrap();
+        reply(&mut stream, running.request_id, b"running result").await;
+        reply(&mut stream, queued.request_id, b"queued result").await;
+        // No second CALL_END for the incomplete value. The other responses are
+        // complete records, so their outcomes are known before this real EOF.
+        peer_can_end.await.unwrap();
+        drop(stream);
+        crate::tests::close_listener(listener).await;
+    });
+    let mut cfg = config();
+    cfg.shm_threshold = u64::MAX;
+    let mut client = IpcClient::with_endpoint(endpoint.endpoint.clone(), cfg).unwrap();
+    client.connect().await.unwrap();
+    let client = Arc::new(client);
+    let incomplete = tokio::spawn({
+        let client = client.clone();
+        async move { client.call_inline(&identity(), 0, b"incomplete").await }
+    });
+    first_received.await.unwrap();
+    let call_identity = identity();
+    let (running, queued) = timeout(WAIT, async {
+        tokio::join!(
+            client.call_inline(&call_identity, 0, b"running"),
+            client.call_inline(&call_identity, 0, b"queued"),
+        )
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        running.unwrap().into_owned_bytes().unwrap(),
+        b"running result"
+    );
+    assert_eq!(
+        queued.unwrap().into_owned_bytes().unwrap(),
+        b"queued result"
+    );
+    assert!(!incomplete.is_finished());
+    assert_eq!(client.pending_len_for_test(), 1);
+    end_peer.send(()).unwrap();
+    let error = timeout(WAIT, incomplete)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(error.phase(), crate::TransportPhase::DispatchUncertain);
+    assert!(!error.is_retry_safe());
+    assert_eq!(client.pending_len_for_test(), 0);
+    assert!(!client.is_connected());
+    peer.await.unwrap();
+}
+
+#[tokio::test]
 async fn rejected_reply_discards_late_chunks_and_preserves_other_calls() {
-    for count in [1, 2] {
+    for count in [2] {
         let endpoint = Endpoint::new();
         let mut listener = LocalListener::bind(&endpoint.endpoint).unwrap();
         let (first_seen, first_received) = oneshot::channel();
@@ -17,16 +83,7 @@ async fn rejected_reply_discards_late_chunks_and_preserves_other_calls() {
                 .write_all(&reply_chunk(rejected.request_id, count, 0, &data))
                 .await
                 .unwrap();
-            let mut reply_bytes = encode_reply_control(&ReplyControl::Success);
-            reply_bytes.extend_from_slice(b"other");
-            stream
-                .write_all(&frame::encode_frame(
-                    other.request_id,
-                    flags::FLAG_RESPONSE | flags::FLAG_REPLY_V2,
-                    &reply_bytes,
-                ))
-                .await
-                .unwrap();
+            reply(&mut stream, other.request_id, b"other").await;
             for index in 1..count {
                 stream
                     .write_all(&reply_chunk(rejected.request_id, count, index, &data))
@@ -34,16 +91,7 @@ async fn rejected_reply_discards_late_chunks_and_preserves_other_calls() {
                     .unwrap();
             }
             let (after, _) = read_frame(&mut stream).await;
-            let mut reply_bytes = encode_reply_control(&ReplyControl::Success);
-            reply_bytes.extend_from_slice(b"after");
-            stream
-                .write_all(&frame::encode_frame(
-                    after.request_id,
-                    flags::FLAG_RESPONSE | flags::FLAG_REPLY_V2,
-                    &reply_bytes,
-                ))
-                .await
-                .unwrap();
+            reply(&mut stream, after.request_id, b"after").await;
             unknown_requested.await.unwrap();
             stream
                 .write_all(&reply_chunk(rejected.request_id, count, 1, &data))
@@ -122,6 +170,114 @@ fn cached_binding(client: &IpcClient) -> RouteBinding {
         ),
     );
     client.bind_cached_route(&contract()).unwrap()
+}
+
+#[tokio::test]
+async fn writer_assigns_monotonic_ids_after_input_preparation() {
+    let endpoint = Endpoint::new();
+    let mut listener = LocalListener::bind(&endpoint.endpoint).unwrap();
+    let (source_polled, source_waiting) = oneshot::channel();
+    let (resume_source, source_resumed) = oneshot::channel();
+    let (b_seen, b_received) = oneshot::channel();
+    let (control_seen, control_received) = oneshot::channel();
+    let peer = tokio::spawn(async move {
+        let mut stream = accept(&mut listener).await;
+        let (b, body) = read_frame(&mut stream).await;
+        assert_eq!(b.flags, flags::FLAG_RPC_RECORD);
+        assert!(matches!(
+            decode_rpc_record(&b, &body, None).unwrap(),
+            RpcRecord::Open {
+                value: ValuePart {
+                    storage: ValueStorage::Inline(b"B"),
+                    ..
+                },
+                ..
+            }
+        ));
+        reply(&mut stream, b.request_id, b"b done").await;
+        b_seen.send(b.request_id).unwrap();
+
+        let (control, body) = read_frame(&mut stream).await;
+        assert_eq!(control.flags, flags::FLAG_CTRL);
+        assert_eq!(body, b"order control");
+        stream
+            .write_all(&frame::encode_frame(
+                control.request_id,
+                flags::FLAG_CTRL | flags::FLAG_RESPONSE,
+                b"control done",
+            ))
+            .await
+            .unwrap();
+        control_seen.send(control.request_id).unwrap();
+
+        let (a, body) = read_frame(&mut stream).await;
+        assert_eq!(a.flags, flags::FLAG_RPC_RECORD);
+        assert!(matches!(
+            decode_rpc_record(&a, &body, None).unwrap(),
+            RpcRecord::Open {
+                value: ValuePart {
+                    storage: ValueStorage::Inline(b"A"),
+                    ..
+                },
+                ..
+            }
+        ));
+        assert!(b.request_id < control.request_id && control.request_id < a.request_id);
+        reply(&mut stream, a.request_id, b"a done").await;
+        expect_disconnect_or_eof(&mut stream).await;
+        crate::tests::close_listener(listener).await;
+        (b.request_id, control.request_id, a.request_id)
+    });
+
+    let mut cfg = config();
+    cfg.shm_threshold = 1024;
+    cfg.base.chunk_size = 1024;
+    let mut client = IpcClient::with_endpoint(endpoint.endpoint.clone(), cfg).unwrap();
+    client.connect().await.unwrap();
+    let binding = cached_binding(&client);
+    let client = Arc::new(client);
+    let a = tokio::spawn({
+        let client = client.clone();
+        async move {
+            let source = futures_util::stream::once(async move {
+                source_polled.send(()).unwrap();
+                source_resumed.await.unwrap();
+                Ok::<Vec<u8>, std::io::Error>(b"A".to_vec())
+            });
+            client
+                .call_bound_sized_stream_phased(&binding, "echo", 1, source, None)
+                .await
+        }
+    });
+    timeout(WAIT, source_waiting).await.unwrap().unwrap();
+    let b = tokio::spawn({
+        let client = client.clone();
+        async move { client.call_inline(&identity(), 0, b"B").await }
+    });
+    let b_id = timeout(WAIT, b_received).await.unwrap().unwrap();
+    assert_eq!(
+        b.await.unwrap().unwrap().into_owned_bytes().unwrap(),
+        b"b done"
+    );
+    let control = tokio::spawn({
+        let client = client.clone();
+        async move {
+            client
+                .send_control_inline(b"order control".to_vec(), "ordering")
+                .await
+        }
+    });
+    let control_id = timeout(WAIT, control_received).await.unwrap().unwrap();
+    assert_eq!(control.await.unwrap().unwrap(), b"control done");
+    resume_source.send(()).unwrap();
+    assert_eq!(
+        a.await.unwrap().unwrap().into_owned_bytes().unwrap(),
+        b"a done"
+    );
+    assert!(client.close_shared_bounded(WAIT).await);
+    let (observed_b, observed_control, observed_a) = peer.await.unwrap();
+    assert_eq!((observed_b, observed_control), (b_id, control_id));
+    assert!(observed_b < observed_control && observed_control < observed_a);
 }
 
 struct CountEcho(AtomicU64);
@@ -203,8 +359,16 @@ async fn deactivation_distinguishes_unpublished_calls_from_started_dispatch() {
             let mut stream = accept(&mut listener).await;
             let (request, payload) = read_frame(&mut stream).await;
             assert!(!request.is_buddy());
-            let (_, consumed) = c2_wire::control::decode_call_control(&payload, 0).unwrap();
-            assert_eq!(&payload[consumed..], b"first");
+            assert!(matches!(
+                decode_rpc_record(&request, &payload, None).unwrap(),
+                RpcRecord::Open {
+                    value: ValuePart {
+                        storage: ValueStorage::Inline(b"first"),
+                        ..
+                    },
+                    ..
+                }
+            ));
             reply(&mut stream, request.request_id, b"first").await;
             expect_disconnect_or_eof(&mut stream).await;
             crate::tests::close_listener(listener).await;
@@ -559,7 +723,7 @@ async fn source_error_after_first_chunk_is_uncertain_and_records_request_source(
     let peer = tokio::spawn(async move {
         let mut stream = accept(&mut listener).await;
         let (header, _) = read_frame(&mut stream).await;
-        assert_ne!(header.flags & flags::FLAG_CHUNKED, 0);
+        assert_ne!(header.flags & flags::FLAG_FRAGMENTED, 0);
         first_frame.send(()).unwrap();
         assert_eq!(
             timeout(WAIT, stream.read(&mut [0])).await.unwrap().unwrap(),
@@ -663,11 +827,14 @@ async fn repeated_response_wait_cancellation_never_accumulates_pending_entries()
     let endpoint = Endpoint::new();
     let mut listener = LocalListener::bind(&endpoint.endpoint).unwrap();
     let (frames, mut seen) = tokio::sync::mpsc::unbounded_channel();
+    let (reply_ready, mut may_reply) = tokio::sync::mpsc::unbounded_channel();
     let peer = tokio::spawn(async move {
         let mut stream = accept(&mut listener).await;
         for _ in 0..8 {
             let (header, _) = read_frame(&mut stream).await;
             frames.send(header.request_id).unwrap();
+            may_reply.recv().await.unwrap();
+            reply(&mut stream, header.request_id, b"late").await;
         }
         let (healthy, _) = read_frame(&mut stream).await;
         reply(&mut stream, healthy.request_id, b"healthy").await;
@@ -685,6 +852,8 @@ async fn repeated_response_wait_cancellation_never_accumulates_pending_entries()
         timeout(WAIT, seen.recv()).await.unwrap().unwrap();
         waiting.abort();
         assert!(waiting.await.unwrap_err().is_cancelled());
+        assert_eq!(client.pending_len_for_test(), 1);
+        reply_ready.send(()).unwrap();
         eventually(|| client.pending_len_for_test() == 0).await;
         assert!(client.is_connected());
     }
@@ -884,4 +1053,134 @@ async fn owned_input_survives_unpublished_shm_fallback_without_an_extra_copy() {
     assert_eq!(client.memory_budget.snapshot().shm.used_bytes, 0);
     assert!(client.close_shared_bounded(WAIT).await);
     stop(server, runner).await;
+}
+
+async fn source_error_terminal_receipt_race(rejected: bool) {
+    struct SourceError {
+        taken: std::sync::Mutex<Option<oneshot::Sender<()>>>,
+        resume: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+    impl std::fmt::Display for SourceError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            if let Some(taken) = self.taken.lock().unwrap().take() {
+                let _ = taken.send(());
+            }
+            let _ = self.resume.lock().unwrap().recv();
+            f.write_str("upload source error already taken")
+        }
+    }
+    let endpoint = Endpoint::new();
+    let mut listener = LocalListener::bind(&endpoint.endpoint).unwrap();
+    let (take_error, error_taken) = oneshot::channel();
+    let (resume_error, resumed_error) = std::sync::mpsc::channel();
+    let (send_terminal, terminal_requested) = oneshot::channel();
+    let peer = tokio::spawn(async move {
+        let mut stream = accept(&mut listener).await;
+        let (request, _) = read_frame(&mut stream).await;
+        if !rejected {
+            let (continuation, _) = read_frame(&mut stream).await;
+            assert_eq!(continuation.request_id, request.request_id);
+        }
+        terminal_requested.await.unwrap();
+        if rejected {
+            let error =
+                c2_error::C2Error::new(c2_error::ErrorCode::ResourceUnavailable, "not executed")
+                    .to_wire_bytes();
+            stream
+                .write_all(
+                    &encode_call_end_frame(
+                        request.request_id,
+                        CallMode::Unary,
+                        CallStatus::NotExecuted,
+                        0,
+                        ValuePart::whole(ValueStorage::Inline(&error)),
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+        } else {
+            reply(&mut stream, request.request_id, b"known result").await;
+        }
+        // A control response on this physical reader proves the earlier terminal
+        // was placed in its response channel before the upload can resume.
+        let (barrier, _) = read_frame(&mut stream).await;
+        assert_eq!(barrier.flags, flags::FLAG_CTRL);
+        let payload = c2_wire::route_catalog_control::encode_route_list_response(
+            &c2_wire::route_catalog_control::RouteListResponse { routes: vec![] },
+        )
+        .unwrap();
+        stream
+            .write_all(&frame::encode_frame(
+                barrier.request_id,
+                flags::FLAG_CTRL | flags::FLAG_RESPONSE,
+                &payload,
+            ))
+            .await
+            .unwrap();
+        expect_disconnect_or_eof(&mut stream).await;
+        crate::tests::close_listener(listener).await;
+    });
+    let mut cfg = config();
+    cfg.base.shm_backing_budget_bytes = 0;
+    let mut client = IpcClient::with_endpoint(endpoint.endpoint.clone(), cfg).unwrap();
+    client.connect().await.unwrap();
+    let binding = cached_binding(&client);
+    let client = Arc::new(client);
+    let source_error = SourceError {
+        taken: std::sync::Mutex::new(Some(take_error)),
+        resume: std::sync::Mutex::new(resumed_error),
+    };
+    let sent_parts = if rejected { 1 } else { 2 };
+    let source =
+        futures_util::stream::unfold((0, Some(source_error)), move |(step, error)| async move {
+            if step < sent_parts {
+                Some((Ok(vec![1; 4096]), (step + 1, error)))
+            } else {
+                error.map(|error| (Err(error), (step + 1, None)))
+            }
+        });
+    let call = tokio::spawn({
+        let client = client.clone();
+        async move {
+            client
+                .call_bound_sized_stream_phased(&binding, "echo", 8192, source, None)
+                .await
+        }
+    });
+    error_taken.await.unwrap();
+    send_terminal.send(()).unwrap();
+    timeout(
+        WAIT,
+        client.list_routes_raw(c2_wire::route_catalog_control::RouteSelector::All),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    resume_error.send(()).unwrap();
+    let outcome = timeout(WAIT, call).await.unwrap().unwrap();
+    if rejected {
+        let error = outcome.unwrap_err();
+        assert_eq!(error.phase(), crate::TransportPhase::PreDispatch);
+        assert!(
+            matches!(error.source_error(), IpcError::CallRejected(error) if error.code == c2_error::ErrorCode::ResourceUnavailable)
+        );
+    } else {
+        assert_eq!(
+            outcome.unwrap().into_owned_bytes().unwrap(),
+            b"known result"
+        );
+    }
+    assert!(client.close_shared_bounded(WAIT).await);
+    peer.await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn received_not_executed_proof_overrides_an_upload_error_already_taken() {
+    source_error_terminal_receipt_race(true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn received_success_overrides_an_upload_error_already_taken() {
+    source_error_terminal_receipt_race(false).await;
 }

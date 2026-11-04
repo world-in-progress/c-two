@@ -2053,6 +2053,19 @@ async fn forward_call(
                 }
             }
             match error {
+                c2_ipc::IpcError::CallRejected(error) => {
+                    let error = c2_ipc::IpcError::CallRejected(error);
+                    if let Some(reason) = semantic_withdrawal_reason(&error) {
+                        drop(lease);
+                        remove_unreachable_route_for_error(
+                            &state,
+                            &advertised_route,
+                            &error,
+                            reason,
+                        );
+                    }
+                    ipc_route_error_response(&route_name, &error, Some(&budget))
+                }
                 c2_ipc::IpcError::LocalCallRejected(error)
                     if matches!(phase, c2_ipc::TransportPhase::PreDispatch)
                         && error.code == c2_error::ErrorCode::CallCapacityExceeded =>
@@ -2240,6 +2253,24 @@ fn ipc_route_error_response(
         |status, error: C2Error| json_error_response(status, error.envelope(), budget);
 
     match error {
+        c2_ipc::IpcError::CallRejected(error) => {
+            let status = match error.code {
+                ErrorCode::ResourceNotFound => StatusCode::NOT_FOUND,
+                ErrorCode::ResourceRemoved => StatusCode::GONE,
+                ErrorCode::RouteStale
+                | ErrorCode::ContractMismatch
+                | ErrorCode::IdentityMismatch => StatusCode::CONFLICT,
+                ErrorCode::ResourceClosed
+                | ErrorCode::ResourceUnavailable
+                | ErrorCode::CallCapacityExceeded => StatusCode::SERVICE_UNAVAILABLE,
+                _ => StatusCode::BAD_GATEWAY,
+            };
+            let mut projected = error.clone();
+            projected
+                .details
+                .insert("dispatch_phase".into(), "pre_dispatch".into());
+            semantic_error_response(status, projected)
+        }
         c2_ipc::IpcError::LocalCallRejected(error) => {
             semantic_error_response(StatusCode::SERVICE_UNAVAILABLE, error.clone())
         }
@@ -2399,6 +2430,7 @@ fn upstream_acquire_error_kind(error: &c2_ipc::IpcError) -> &'static str {
         c2_ipc::IpcError::Shm(_) => "shm",
         c2_ipc::IpcError::Chunk(_) => "chunk",
         c2_ipc::IpcError::CrmError(_) => "crm-error",
+        c2_ipc::IpcError::CallRejected(_) => "call-rejected",
         c2_ipc::IpcError::LocalCallRejected(_) => "local-call-rejected",
         c2_ipc::IpcError::Closed => "closed",
         c2_ipc::IpcError::Pool(_) => "pool",
@@ -2409,6 +2441,14 @@ fn upstream_acquire_error_kind(error: &c2_ipc::IpcError) -> &'static str {
 
 fn semantic_withdrawal_reason(error: &c2_ipc::IpcError) -> Option<&'static str> {
     match error {
+        c2_ipc::IpcError::CallRejected(error) => match error.code {
+            c2_error::ErrorCode::IdentityMismatch => Some("identity-mismatch"),
+            c2_error::ErrorCode::ContractMismatch => Some("contract-mismatch"),
+            c2_error::ErrorCode::ResourceNotFound => Some("route-missing"),
+            c2_error::ErrorCode::ResourceRemoved => Some("route-removed"),
+            c2_error::ErrorCode::ResourceClosed => Some("route-closed"),
+            _ => None,
+        },
         c2_ipc::IpcError::IdentityMismatch { .. } => Some("identity-mismatch"),
         c2_ipc::IpcError::ContractMismatch(_) => Some("contract-mismatch"),
         c2_ipc::IpcError::RouteNotFound(_) => Some("route-missing"),
@@ -2424,7 +2464,10 @@ fn remove_unreachable_route_for_error(
     error: &c2_ipc::IpcError,
     reason: &'static str,
 ) {
-    if matches!(error, c2_ipc::IpcError::IdentityMismatch { .. }) {
+    if matches!(error, c2_ipc::IpcError::IdentityMismatch { .. })
+        || matches!(error, c2_ipc::IpcError::CallRejected(rejection)
+            if rejection.code == c2_error::ErrorCode::IdentityMismatch)
+    {
         remove_unreachable_owner_endpoint_routes(state, route, reason);
     } else {
         remove_unreachable_route(state, route, reason);
@@ -2687,6 +2730,13 @@ mod tests {
             }),
             None
         );
+        assert_eq!(
+            semantic_withdrawal_reason(&c2_ipc::IpcError::CallRejected(c2_error::C2Error::new(
+                c2_error::ErrorCode::ResourceRemoved,
+                "removed before callback",
+            ))),
+            Some("route-removed")
+        );
     }
 
     #[tokio::test]
@@ -2790,6 +2840,45 @@ mod tests {
         let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(body["name"], "ResourceUnavailable");
         assert_eq!(body["details"]["dispatch_phase"], "pre_dispatch");
+    }
+
+    #[tokio::test]
+    async fn confirmed_ipc_rejection_retains_canonical_error_and_phase() {
+        use c2_error::{C2Error, ErrorCode};
+
+        for (code, status) in [
+            (ErrorCode::ResourceNotFound, StatusCode::NOT_FOUND),
+            (ErrorCode::ResourceRemoved, StatusCode::GONE),
+            (ErrorCode::RouteStale, StatusCode::CONFLICT),
+            (ErrorCode::ContractMismatch, StatusCode::CONFLICT),
+            (ErrorCode::IdentityMismatch, StatusCode::CONFLICT),
+            (ErrorCode::ResourceClosed, StatusCode::SERVICE_UNAVAILABLE),
+            (
+                ErrorCode::ResourceUnavailable,
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                ErrorCode::CallCapacityExceeded,
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (ErrorCode::ProtocolViolation, StatusCode::BAD_GATEWAY),
+        ] {
+            let original = C2Error::new(code, format!("rejected: {}", code.name()))
+                .with_details(BTreeMap::from([("source".into(), "server".into())]));
+            let response = ipc_route_error_response(
+                "grid",
+                &c2_ipc::IpcError::CallRejected(original.clone()),
+                None,
+            );
+            assert_eq!(response.status(), status, "code={code:?}");
+            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let envelope: c2_error::C2ErrorEnvelope = serde_json::from_slice(&body).unwrap();
+            let projected = C2Error::from_envelope(envelope).unwrap();
+            assert_eq!(projected.code, original.code);
+            assert_eq!(projected.message, original.message);
+            assert_eq!(projected.details["source"], "server");
+            assert_eq!(projected.details["dispatch_phase"], "pre_dispatch");
+        }
     }
 
     #[test]

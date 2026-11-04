@@ -22,7 +22,7 @@ typedef enum C2MemFfiStatus {
     C2_MEM_FFI_STATUS_IDENTITY_MISMATCH = 7,
 } C2MemFfiStatus;
 
-/* IPC 15 descriptor. Both kinds have nonzero generation and loan_id. */
+/* IPC 16 descriptor. Both kinds have nonzero generation and loan_id. */
 typedef struct C2MemFfiBlock {
     uint16_t segment_index;
     uint8_t is_dedicated;

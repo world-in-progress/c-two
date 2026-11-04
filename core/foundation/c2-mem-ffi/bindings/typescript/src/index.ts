@@ -739,7 +739,7 @@ function memoryFromNative(native: C2MemFfiNativeMemoryContext): C2MemFfiMemoryCo
 
 class NodeIpcConnection implements C2NodeIpcConnection {
   private readonly chunks: Uint8Array[] = [];
-  // IPC 15 release batches contain at most 64 u64 IDs plus tag/count. This
+  // IPC 16 release batches contain at most 64 u64 IDs plus tag/count. This
   // reserve also holds a frame header or SHM response descriptor, preserving
   // loan settlement if the complete local read target cannot be allocated.
   private readonly readFailurePrefix = new Uint8Array(2 + 64 * 8);

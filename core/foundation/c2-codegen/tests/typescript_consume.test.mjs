@@ -12,7 +12,7 @@ async function transportModule(start = 1n) {
   const directory = mkdtempSync(join(tmpdir(), 'c2-consume-'));
   try {
     const source = readFileSync(new URL('../assets/typescript_transport.ts', import.meta.url), 'utf8')
-      .replace('let nextRequestId = 1n;', `let nextRequestId = ${start}n;`);
+      .replace('nextRequestId: 1n, activeCalls: new Map()', `nextRequestId: ${start}n, activeCalls: new Map()`);
     const code = ts.transpileModule(`${source}\nexport { readIpcShmSuccessPayload, writeIpcFrame };\n`, {
       compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ES2022 },
     }).outputText;
@@ -59,31 +59,61 @@ const u32 = n => { const b = Buffer.alloc(4); b.writeUInt32LE(n); return b; };
 const u64 = n => { const b = Buffer.alloc(8); b.writeBigUInt64LE(n); return b; };
 const text = s => Buffer.concat([Buffer.from([Buffer.byteLength(s)]), Buffer.from(s)]);
 const frame = (id, flags, data) => Buffer.concat([u32(12 + data.length), u64(id), u32(flags), data]);
+const rpc = (status, payload = Buffer.alloc(0)) => Buffer.concat([Buffer.from([0x06, status]), payload]);
+const success = (payload = Buffer.from([42])) => ({flags: 4098, payload: rpc(0, payload)});
+const shmSuccess = (block = blockBytes()) => ({flags: 4162, payload: rpc(0, block)});
 const contract = {schema: 'c-two.contract.v2', namespace: 'test.p8a', name: 'Echo', version: '0.1.0', descriptorSha256: 'd'.repeat(64), abiHash: 'a'.repeat(64), signatureHash: 'b'.repeat(64)};
 function peer({memory, reply, controlReply, failRelease = false} = {}) {
   let buffered = Buffer.alloc(0), metadata = false, controlReplies = 0;
   const ids = [], calls = [], closed = [], releaseFrames = [];
+  const fragments = new Map();
   const feed = bytes => { buffered = Buffer.concat([buffered, bytes]); };
   const connection = {
     memory,
     write(data) {
       const b = Buffer.from(data), id = b.readBigUInt64LE(4), flags = b.readUInt32LE(12), payload = b.subarray(16);
       if (flags === 4) {
-        if (!metadata) { metadata = true; feed(Buffer.from('1500000000000000000000000600000043324950020f000000', 'hex')); }
+        if (!metadata) { metadata = true; feed(Buffer.from('15000000000000000000000006000000433249500210000000', 'hex')); }
         else feed(frame(0n, 6, Buffer.concat([text(memory === undefined ? '' : '/peer'), u16(memory === undefined ? 0 : 16), text('server'), text('instance'), u16(0)])));
       } else if (flags === 16) {
-        if (payload[0] === 0x17) { if (failRelease) throw new Error('release write failed'); releaseFrames.push(b); return; }
         ids.push(id);
         const request = JSON.parse(payload.subarray(1).toString());
         const current = {route_name: 'echo', route_uid: 'uid', owner_server_id: 'server', owner_server_instance_id: 'instance', contract: request.expected, methods: [{name: 'echo', index: 0}], max_payload_size: 1048576, state: 'ready', state_reason: 'register_committed'};
         const selected = Array.isArray(controlReply) ? controlReply[controlReplies] : controlReply;
         controlReplies++;
         feed(frame(id, selected?.flags ?? 18, selected?.payload ?? Buffer.from([0x11, ...Buffer.from(JSON.stringify({status: 'ready', current}))])));
+      } else if (flags === 4096 && payload[0] === 0x07) {
+        assert.equal(id, 0n);
+        if (failRelease) throw new Error('release write failed');
+        releaseFrames.push(b);
       } else {
-        ids.push(id); calls.push(id);
+        assert.equal(payload[0], 0x01, 'business frames carry IPC 16 OPEN');
+        assert.ok((flags & 4096) !== 0, 'business frames carry RPC_RECORD');
+        let complete = (flags & 512) === 0;
+        if ((flags & 512) === 0 || (flags & 8192) !== 0) {
+          ids.push(id); calls.push(id);
+          if ((flags & 512) !== 0) {
+            let offset = 1;
+            for (let field = 0; field < 7; field++) offset += 1 + payload[offset];
+            offset += 2;
+            const total = payload.readBigUInt64LE(offset);
+            const copied = BigInt(payload.length - offset - 8);
+            assert.ok(copied > 0n && copied < total);
+            fragments.set(id, {total, copied});
+            complete = false;
+          }
+        } else {
+          const fragment = fragments.get(id);
+          assert.ok(fragment, 'continuation belongs to an OPEN first fragment');
+          fragment.copied += BigInt(payload.length - 1);
+          complete = fragment.copied === fragment.total;
+          assert.ok(fragment.copied <= fragment.total);
+          if (complete) fragments.delete(id);
+        }
+        if (!complete) return;
         const selected = Array.isArray(reply) ? reply[calls.length - 1] : reply;
-        for (const part of selected?.frames ?? [selected ?? {}]) {
-          feed(frame(id, part.flags ?? 258, part.payload ?? Buffer.from([0, 42])));
+        for (const part of selected?.frames ?? [selected ?? success()]) {
+          feed(frame(part.id ?? id, part.flags, part.payload));
         }
       }
     },
@@ -155,14 +185,14 @@ function memoryPeer() {
     beginWrite(kind) {
       if (kind === 0 && deactivated) throw new Error('new business after deactivation');
       if (kind === 2 && !release) return undefined;
-      return {prefix: release ? frame(0n, 16, Buffer.concat([Buffer.from([0x17, 1]), u64(1n)])) : new Uint8Array(),
+      return {prefix: release ? frame(0n, 4096, Buffer.concat([Buffer.from([0x07, 1]), u64(1n)])) : new Uint8Array(),
         start() {}, discard() {}, complete(success) { if (success) release = false; else deactivated = true; }};
     },
   };
 }
 test('release write failure delivers the successful call and discards only its connection', async () => {
   const {createIpcEncodedTransport} = await transportModule();
-  const memory = memoryPeer(), first = peer({memory, failRelease: true, reply: {flags: 322, payload: Buffer.concat([blockBytes(), Buffer.from([0])])}}), next = peer();
+  const memory = memoryPeer(), first = peer({memory, failRelease: true, reply: shmSuccess()}), next = peer();
   let connects = 0;
   const transport = createIpcEncodedTransport('ipc://p8a', {connect: () => connects++ === 0 ? first.connection : next.connection});
   assert.deepEqual(Array.from(await transport.call('echo', contract, 'echo', new Uint8Array())), Array(8).fill(42));
@@ -171,30 +201,30 @@ test('release write failure delivers the successful call and discards only its c
   assert.deepEqual(Array.from(await transport.call('echo', contract, 'echo', new Uint8Array())), [42]);
   assert.equal(connects, 2); await transport.close();
 });
-for (const [label, payload, flags, expectedAdmissions, expectedReleases] of [
-  ['truncated descriptor', new Uint8Array(22), 322, 0, 0],
-  ['empty span', Buffer.concat([blockBytes({byteLength: 0}), Buffer.from([0])]), 322, 1, 1],
-  ['invalid generation', Buffer.concat([blockBytes({generation: 0}), Buffer.from([0])]), 322, 1, 1],
-  ['dedicated offset', Buffer.concat([blockBytes({dedicated: true, offset: 1}), Buffer.from([0])]), 322, 1, 1],
-  ['chunked SHM', Buffer.concat([blockBytes(), Buffer.from([0])]), 322 | 512, 1, 1],
+for (const [label, payload, flags, expectedAdmissions, expectedReleases, retires] of [
+  ['truncated descriptor', rpc(0, new Uint8Array(22)), 4162, 0, 0, true],
+  ['empty span', rpc(0, blockBytes({byteLength: 0})), 4162, 0, 0, true],
+  ['invalid generation', rpc(0, blockBytes({generation: 0})), 4162, 1, 1, false],
+  ['dedicated offset', rpc(0, blockBytes({dedicated: true, offset: 1})), 4162, 1, 1, false],
+  ['first fragment without fragmented', rpc(0, blockBytes()), 4162 | 8192, 0, 0, true],
 ]) {
-  test(`invalid SHM reply fails its call and preserves the connection: ${label}`, async () => {
+  test(`invalid IPC 16 SHM reply settles its owner: ${label}`, async () => {
     const {createIpcEncodedTransport} = await transportModule();
-    const memory = memoryPeer(), first = peer({memory, reply: [{payload, flags}, undefined]});
+    const memory = memoryPeer(), first = peer({memory, reply: [{payload, flags}, success()]}), next = peer();
     let connects = 0;
-    const transport = createIpcEncodedTransport('ipc://p8a', {connect: () => { connects++; return first.connection; }});
+    const transport = createIpcEncodedTransport('ipc://p8a', {connect: () => connects++ === 0 ? first.connection : next.connection});
     await assert.rejects(() => transport.call('echo', contract, 'echo', new Uint8Array()));
-    assert.equal(first.closed.length, 0); assert.equal(memory.deactivated, false);
+    assert.equal(first.closed.length, retires ? 1 : 0); assert.equal(memory.deactivated, retires);
     assert.equal(memory.admissions, expectedAdmissions); assert.equal(memory.consumptions, 0);
     assert.equal(first.releaseFrames.length, expectedReleases);
     assert.deepEqual(Array.from(await transport.call('echo', contract, 'echo', new Uint8Array())), [42]);
-    assert.equal(connects, 1); await transport.close();
+    assert.equal(connects, retires ? 2 : 1); await transport.close();
   });
 }
 test('native SHM admission failure queues release and preserves the original connection', async () => {
   const {createIpcEncodedTransport} = await transportModule();
   const memory = memoryPeer(); memory.admitResponse = () => { memory.queueRelease(); throw new Error('span outside mapping'); };
-  const p = peer({memory, reply: [{flags: 322, payload: Buffer.concat([blockBytes(), Buffer.from([0])])}, undefined]});
+  const p = peer({memory, reply: [shmSuccess(), success()]});
   const transport = createIpcEncodedTransport('ipc://p8a', {connect: () => p.connection});
   await assert.rejects(() => transport.call('echo', contract, 'echo', new Uint8Array()), /span outside mapping/);
   assert.equal(p.closed.length, 0); assert.equal(memory.deactivated, false);
@@ -202,59 +232,65 @@ test('native SHM admission failure queues release and preserves the original con
   assert.deepEqual(Array.from(await transport.call('echo', contract, 'echo', new Uint8Array())), [42]);
   await transport.close();
 });
-for (const [label, flags, control] of [
-  ['invalid flags', 66, 0],
-  ['invalid reply control', 322, 255],
+for (const [label, flags, status] of [
+  ['invalid flags', 4162 | 16, 0],
+  ['invalid status', 4162, 255],
 ]) {
-  test(`decodable SHM descriptor is released after ${label}`, async () => {
+  test(`decodable SHM descriptor is released before retiring after ${label}`, async () => {
     const {createIpcEncodedTransport} = await transportModule();
-    const memory = memoryPeer(), p = peer({memory, reply: [{flags, payload: Buffer.concat([blockBytes(), Buffer.from([control])])}, undefined]});
-    const transport = createIpcEncodedTransport('ipc://p8a', {connect: () => p.connection});
+    const memory = memoryPeer(), p = peer({memory, reply: {flags, payload: rpc(status, blockBytes())}}), next = peer();
+    let connects = 0;
+    const transport = createIpcEncodedTransport('ipc://p8a', {connect: () => connects++ === 0 ? p.connection : next.connection});
     await assert.rejects(() => transport.call('echo', contract, 'echo', new Uint8Array()));
     assert.equal(memory.admissions, 1); assert.equal(memory.discards, 1);
-    assert.equal(p.releaseFrames.length, 1); assert.equal(p.closed.length, 0);
+    assert.equal(p.releaseFrames.length, 1); assert.equal(p.closed.length, 1);
     assert.deepEqual(Array.from(await transport.call('echo', contract, 'echo', new Uint8Array())), [42]);
+    assert.equal(connects, 2);
     await transport.close();
   });
 }
-test('malformed chunked reply fails one call and skips its remaining frames', async () => {
+test('malformed IPC 16 first fragment retires the connection', async () => {
   const {createIpcEncodedTransport} = await transportModule();
-  const chunk = (index, last = false) => ({flags: 258 | 512 | (last ? 1024 : 0), payload: Buffer.concat([u64(2n), u32(2), u32(index), Buffer.from([index + 1])])});
-  const p = peer({reply: [{frames: [chunk(1), chunk(1, true)]}, undefined]});
-  const transport = createIpcEncodedTransport('ipc://p8a', {connect: () => p.connection});
-  await assert.rejects(() => transport.call('echo', contract, 'echo', new Uint8Array()), /first chunked response/);
-  assert.equal(p.closed.length, 0);
+  const p = peer({reply: {flags: 4098 | 512, payload: Buffer.from([0x06, 0, 42])}}), next = peer();
+  let connects = 0;
+  const transport = createIpcEncodedTransport('ipc://p8a', {connect: () => connects++ === 0 ? p.connection : next.connection});
+  await assert.rejects(() => transport.call('echo', contract, 'echo', new Uint8Array()), /first fragment/);
+  assert.equal(p.closed.length, 1);
   assert.deepEqual(Array.from(await transport.call('echo', contract, 'echo', new Uint8Array())), [42]);
-  assert.equal(p.calls.length, 2); await transport.close();
+  assert.equal(connects, 2); await transport.close();
 });
 test('late failed-call chunks are skipped after another call has completed', async () => {
   const {createIpcEncodedTransport} = await transportModule();
-  const chunk = (index, last = false) => ({flags: 258 | 512 | (last ? 1024 : 0), payload: Buffer.concat([u64(2n), u32(2), u32(index), Buffer.from([index + 1])])});
-  const p = peer({reply: [{frames: [chunk(1)]}, undefined, undefined]});
+  const first = {flags: 4098 | 512 | 8192, payload: Buffer.concat([rpc(0), u64(5n), Buffer.from([41, 42])])};
+  const short = {flags: 4098 | 512, payload: Buffer.from([0x06, 43])};
+  const late = {flags: 4098 | 512, payload: Buffer.from([0x06, 44, 45])};
+  const p = peer({reply: [{frames: [first, short]}, success(), success()]});
   const transport = createIpcEncodedTransport('ipc://p8a', {connect: () => p.connection});
-  await assert.rejects(() => transport.call('echo', contract, 'echo', new Uint8Array()), /first chunked response/);
+  await assert.rejects(() => transport.call('echo', contract, 'echo', new Uint8Array()), /invalid fixed piece length/);
   assert.deepEqual(Array.from(await transport.call('echo', contract, 'echo', new Uint8Array())), [42]);
-  p.feed(frame(p.calls[0], chunk(1, true).flags, chunk(1, true).payload));
+  p.feed(frame(p.calls[0], late.flags, late.payload));
   assert.deepEqual(Array.from(await transport.call('echo', contract, 'echo', new Uint8Array())), [42]);
   assert.equal(p.closed.length, 0); assert.equal(p.calls.length, 3);
   await transport.close();
 });
-test('invalid complete inline reply fails one call and preserves the connection', async () => {
+test('invalid IPC 16 CALL_END status retires the connection before reconnecting', async () => {
   const {createIpcEncodedTransport} = await transportModule();
-  const p = peer({reply: [{flags: 258, payload: Buffer.from([255])}, undefined]});
-  const transport = createIpcEncodedTransport('ipc://p8a', {connect: () => p.connection});
-  await assert.rejects(() => transport.call('echo', contract, 'echo', new Uint8Array()), /reply status/);
-  assert.equal(p.closed.length, 0);
+  const p = peer({reply: {flags: 4098, payload: rpc(255)}}), next = peer();
+  let connects = 0;
+  const transport = createIpcEncodedTransport('ipc://p8a', {connect: () => connects++ === 0 ? p.connection : next.connection});
+  await assert.rejects(() => transport.call('echo', contract, 'echo', new Uint8Array()), /CALL_END status/);
+  assert.equal(p.closed.length, 1);
   assert.deepEqual(Array.from(await transport.call('echo', contract, 'echo', new Uint8Array())), [42]);
-  assert.equal(p.calls.length, 2); await transport.close();
+  assert.equal(connects, 2); await transport.close();
 });
 test('a queued call completes after an earlier complete reply fails', async () => {
   const {createIpcEncodedTransport} = await transportModule();
-  const p = peer({reply: [{flags: 258, payload: Buffer.from([255])}, undefined]});
+  const malformed = Buffer.from('C2E1' + JSON.stringify({version: 1, code: 702, name: 'ResourceUnavailable', message: 'server refused', details: {}}));
+  const p = peer({reply: [{flags: 4098, payload: rpc(2, malformed)}, success()]});
   const transport = createIpcEncodedTransport('ipc://p8a', {connect: () => p.connection});
   const failed = transport.call('echo', contract, 'echo', new Uint8Array());
   const queued = transport.call('echo', contract, 'echo', new Uint8Array());
-  await assert.rejects(failed, /reply status/);
+  await assert.rejects(failed, /server refused/);
   assert.deepEqual(Array.from(await queued), [42]);
   assert.equal(p.closed.length, 0); assert.equal(p.calls.length, 2);
   await transport.close();
@@ -268,15 +304,17 @@ test('invalid complete route reply fails only its lookup', async () => {
   assert.deepEqual(Array.from(await transport.call('echo', contract, 'echo', new Uint8Array())), [42]);
   await transport.close();
 });
-test('SHM descriptor in invalid complete route reply is released', async () => {
+test('SHM descriptor in route control reply violates the IPC 16 frame shape', async () => {
   const {createIpcEncodedTransport} = await transportModule();
   const memory = memoryPeer();
-  const p = peer({memory, controlReply: [{flags: 82, payload: Buffer.concat([blockBytes(), Buffer.from([0x11])])}, undefined]});
-  const transport = createIpcEncodedTransport('ipc://p8a', {connect: () => p.connection});
-  await assert.rejects(() => transport.prepare('echo', contract), /invalid request id or flags/);
-  assert.equal(memory.admissions, 1); assert.equal(memory.discards, 1);
-  assert.equal(p.releaseFrames.length, 1); assert.equal(p.closed.length, 0);
+  const p = peer({memory, controlReply: {flags: 82, payload: Buffer.concat([blockBytes(), Buffer.from([0x11])])}}), next = peer();
+  let connects = 0;
+  const transport = createIpcEncodedTransport('ipc://p8a', {connect: () => connects++ === 0 ? p.connection : next.connection});
+  await assert.rejects(() => transport.prepare('echo', contract), /no valid storage position/);
+  assert.equal(memory.admissions, 0); assert.equal(memory.discards, 0);
+  assert.equal(p.releaseFrames.length, 0); assert.equal(p.closed.length, 1);
   assert.deepEqual(Array.from(await transport.call('echo', contract, 'echo', new Uint8Array())), [42]);
+  assert.equal(connects, 2);
   await transport.close();
 });
 test('local control write preparation failure preserves the connection', async () => {
@@ -304,7 +342,7 @@ test('local release preparation failure retains the connection and pending relea
     }
     return beginWrite(kind, request);
   };
-  const p = peer({memory, reply: [{flags: 322, payload: Buffer.concat([blockBytes(), Buffer.from([0])])}, undefined]});
+  const p = peer({memory, reply: [shmSuccess(), success()]});
   const write = p.connection.write.bind(p.connection);
   p.connection.write = bytes => {
     const data = Buffer.from(bytes);
@@ -331,7 +369,7 @@ test('SHM copy failure releases its loan and preserves the connection', async ()
     if (failCopy) { failCopy = false; memory.queueRelease(); throw new Error('copy failed'); }
     consume(response, dst);
   };
-  const p = peer({memory, reply: [{flags: 322, payload: Buffer.concat([blockBytes(), Buffer.from([0])])}, undefined]});
+  const p = peer({memory, reply: [shmSuccess(), success()]});
   const transport = createIpcEncodedTransport('ipc://p8a', {connect: () => p.connection});
   await assert.rejects(() => transport.call('echo', contract, 'echo', new Uint8Array()), /copy failed/);
   assert.equal(p.releaseFrames.length, 1); assert.equal(p.closed.length, 0);
@@ -359,12 +397,12 @@ test('local frame payload copy allocation failure fails only its call after the 
   const write = p.connection.write.bind(p.connection);
   p.connection.write = bytes => {
     const flags = Buffer.from(bytes).readUInt32LE(12);
-    if ((flags & 128) !== 0) afterBusinessWrite = true;
+    if ((flags & 4096) !== 0) afterBusinessWrite = true;
     write(bytes);
   };
   p.connection.readExactly = length => {
     const bytes = read(length);
-    if (afterBusinessWrite && length === 2 && failNextReplyPayload) {
+    if (afterBusinessWrite && length === 3 && failNextReplyPayload) {
       failNextReplyPayload = false;
       const failure = new Error('injected local copy target allocation failure');
       failure.c2LocalAllocationFailure = true;
@@ -382,15 +420,15 @@ test('local frame payload copy allocation failure fails only its call after the 
 test('local SHM descriptor copy allocation failure settles its loan and preserves the stream', async () => {
   const {createIpcEncodedTransport} = await transportModule();
   const memory = memoryPeer();
-  const p = peer({memory, reply: [{flags: 322, payload: Buffer.concat([blockBytes(), Buffer.from([0])])}, undefined]});
+  const p = peer({memory, reply: [shmSuccess(), success()]});
   const read = p.connection.readExactly.bind(p.connection);
   let failed = false;
   p.connection.readExactly = length => {
     const bytes = read(length);
-    if (p.calls.length === 1 && length === 24 && !failed) {
+    if (p.calls.length === 1 && length === 25 && !failed) {
       failed = true;
       throw Object.assign(new Error('injected descriptor copy allocation failure'), {
-        c2LocalAllocationFailure: true, c2ReadPrefix: bytes.subarray(0, 23),
+        c2LocalAllocationFailure: true, c2ReadPrefix: bytes,
       });
     }
     return bytes;
@@ -434,8 +472,8 @@ test(invalidRelease ? 'release channel violation seals new work and preserves th
   };
   const ids = Array.from({length: 64}, (_, index) => BigInt(index + 1));
   const p = peer({memory, reply: [{frames: [
-    {flags: 18, payload: Buffer.concat([Buffer.from([0x17, 64]), ...ids.map(u64)])},
-    {flags: 258, payload: Buffer.from([0, 42])},
+    {id: 0n, flags: 4098, payload: Buffer.concat([Buffer.from([0x07, 64]), ...ids.map(u64)])},
+    success(),
   ]}, undefined]});
   const read = p.connection.readExactly.bind(p.connection);
   let failed = false;
@@ -482,18 +520,19 @@ test(nativeTimeout ? 'native write timeout wakes queued calls before the dispatc
   };
   let releaseFirstChunk;
   let firstChunkSeen;
-  const chunkIndices = [];
+  const chunkFlags = [];
   const firstChunk = new Promise(resolve => { firstChunkSeen = resolve; });
   p.connection.write = async bytes => {
     const data = Buffer.from(bytes);
     if ((data.readUInt32LE(12) & 512) !== 0) {
-      const index = data.readUInt16LE(16);
-      chunkIndices.push(index);
-      if (index === 0) {
+      const flags = data.readUInt32LE(12);
+      chunkFlags.push(flags);
+      original(bytes);
+      if ((flags & 8192) !== 0) {
         firstChunkSeen();
         await new Promise(resolve => { releaseFirstChunk = resolve; });
       }
-      if ((data.readUInt32LE(12) & 1024) === 0) return;
+      return;
     }
     original(bytes);
   };
@@ -512,7 +551,7 @@ test(nativeTimeout ? 'native write timeout wakes queued calls before the dispatc
   memory.deactivate();
   releaseFirstChunk();
   assert.deepEqual(Array.from(await running), [42]);
-  assert.deepEqual(chunkIndices, [0, 1, 2]);
+  assert.deepEqual(chunkFlags, [4096 | 512 | 8192, 4096 | 512, 4096 | 512]);
   await queuedResult;
   await (closing ?? transport.close());
   assert.equal(p.closed.length, 1);
@@ -536,7 +575,7 @@ test('close during connection initialization prevents a route query', async () =
 test('zero loan ID deactivates connection without changing an earlier call result', async () => {
   const {createIpcEncodedTransport} = await transportModule();
   const memory = memoryPeer();
-  const p = peer({memory, reply: [undefined, {flags: 322, payload: Buffer.concat([blockBytes({loanId: 0n}), Buffer.from([0])])}]});
+  const p = peer({memory, reply: [success(), shmSuccess(blockBytes({loanId: 0n}))]});
   const transport = createIpcEncodedTransport('ipc://p8a', {connect: () => p.connection});
   assert.deepEqual(Array.from(await transport.call('echo', contract, 'echo', new Uint8Array())), [42]);
   await assert.rejects(() => transport.call('echo', contract, 'echo', new Uint8Array()), /loan ID/);

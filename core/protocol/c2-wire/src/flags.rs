@@ -15,17 +15,14 @@ pub const FLAG_CTRL: u32 = 1 << 4;
 /// Payload references a buddy-allocated SHM block.
 pub const FLAG_BUDDY: u32 = 1 << 6;
 
-/// V2 call frame — carries control-plane routing in the frame payload.
-pub const FLAG_CALL_V2: u32 = 1 << 7;
+/// IPC 16 value is split across records.
+pub const FLAG_FRAGMENTED: u32 = 1 << 9;
 
-/// V2 reply frame — carries control-plane status in the frame payload.
-pub const FLAG_REPLY_V2: u32 = 1 << 8;
+/// IPC 16 first fragment carries metadata and total value length.
+pub const FLAG_FIRST_FRAGMENT: u32 = 1 << 13;
 
-/// Frame is part of a chunked transfer sequence.
-pub const FLAG_CHUNKED: u32 = 1 << 9;
-
-/// Last frame in a chunked transfer sequence.
-pub const FLAG_CHUNK_LAST: u32 = 1 << 10;
+/// IPC 16 RPC record envelope.
+pub const FLAG_RPC_RECORD: u32 = 1 << 12;
 
 /// Frame carries a 1-byte signal (PING, PONG, SHUTDOWN, DISCONNECT, etc.).
 pub const FLAG_SIGNAL: u32 = 1 << 11;
@@ -53,26 +50,6 @@ pub const fn is_buddy(flags: u32) -> bool {
 }
 
 #[inline]
-pub const fn is_call_v2(flags: u32) -> bool {
-    flags & FLAG_CALL_V2 != 0
-}
-
-#[inline]
-pub const fn is_reply_v2(flags: u32) -> bool {
-    flags & FLAG_REPLY_V2 != 0
-}
-
-#[inline]
 pub const fn is_signal(flags: u32) -> bool {
     flags & FLAG_SIGNAL != 0
-}
-
-#[inline]
-pub const fn is_chunked(flags: u32) -> bool {
-    flags & FLAG_CHUNKED != 0
-}
-
-#[inline]
-pub const fn is_chunk_last(flags: u32) -> bool {
-    flags & FLAG_CHUNK_LAST != 0
 }

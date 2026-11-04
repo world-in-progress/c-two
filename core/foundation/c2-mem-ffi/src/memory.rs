@@ -864,7 +864,7 @@ mod tests {
             return Vec::new();
         }
         let (header, payload) = decode_frame(bytes).unwrap();
-        assert_eq!(header.flags, flags::FLAG_CTRL);
+        assert_eq!(header.flags, flags::FLAG_RPC_RECORD);
         decode_release_frame(&header, payload, false, true)
             .unwrap()
             .ids()

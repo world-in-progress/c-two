@@ -431,7 +431,7 @@ fn prewarmed_handshake_timeout_settles_budget_and_recovers_without_pool_drain() 
 }
 
 #[test]
-fn cached_client_route_timeout_removes_pending_and_preserves_healthy_stream() {
+fn cached_client_route_timeout_keeps_pending_until_late_reply_and_preserves_healthy_stream() {
     let (resume, resumed) = oneshot::channel();
     let (lookup_tx, lookup_rx) = mpsc::channel();
     let (late_tx, late_rx) = mpsc::channel();
@@ -465,7 +465,7 @@ fn cached_client_route_timeout_removes_pending_and_preserves_healthy_stream() {
     lookup_rx.recv_timeout(Duration::from_secs(2)).unwrap();
     assert_deadline(error, "route_acquire");
     #[cfg(feature = "test-support")]
-    assert_eq!(cached.pending_len_for_test(), 0);
+    assert_eq!(cached.pending_len_for_test(), 1);
     assert!(
         cached.is_connected(),
         "cancelling an awaiting reply must preserve the complete stream"
@@ -492,12 +492,19 @@ fn cached_client_route_timeout_removes_pending_and_preserves_healthy_stream() {
 
 #[test]
 fn handshake_and_route_lookup_consume_one_absolute_budget() {
+    let (resume, resumed) = oneshot::channel();
+    let (late_tx, late_rx) = mpsc::channel();
     let peer = Peer::spawn(move |mut listener| async move {
         let mut stream = listener.accept().await.unwrap();
         read_handshake(&mut stream).await;
         tokio::time::sleep(Duration::from_millis(160)).await;
         stream.write_all(&handshake()).await.unwrap();
-        read_lookup(&mut stream).await;
+        let first = read_lookup(&mut stream).await;
+        let _ = resumed.await;
+        reply(&mut stream, first, &ready_reply()).await;
+        late_tx.send(()).unwrap();
+        let second = read_lookup(&mut stream).await;
+        reply(&mut stream, second, &ready_reply()).await;
         std::future::pending::<()>().await;
     });
     let pool = test_pool(&peer);
@@ -517,7 +524,17 @@ fn handshake_and_route_lookup_consume_one_absolute_budget() {
     );
     assert!(budget.remaining("test").is_err());
     #[cfg(feature = "test-support")]
+    assert_eq!(client.pending_len_for_test(), 1);
+    assert!(client.is_connected());
+    resume.send(()).unwrap();
+    late_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    let binding = client
+        .acquire_route_with_deadline(&expected(), deadline(Duration::from_secs(2)))
+        .unwrap();
+    assert_eq!(binding.route_uid(), ROUTE_UID);
+    #[cfg(feature = "test-support")]
     assert_eq!(client.pending_len_for_test(), 0);
+    assert!(client.is_connected());
     assert!(pool.release_if_same(&peer.address, &client));
     assert_eq!(pool.refcount(&peer.address), 0);
     pool.close_all(Duration::from_secs(2));
@@ -570,6 +587,8 @@ fn route_acquisition_respects_deadlines_and_last_lookup_result() {
         ] {
             let lookups = Arc::new(AtomicUsize::new(0));
             let observed = Arc::clone(&lookups);
+            let (resume, resumed) = oneshot::channel();
+            let (late_tx, late_rx) = mpsc::channel();
             let peer = Peer::spawn(move |mut listener| async move {
                 let mut stream = listener.accept().await.unwrap();
                 read_handshake(&mut stream).await;
@@ -588,16 +607,26 @@ fn route_acquisition_respects_deadlines_and_last_lookup_result() {
                     }
                     _ => not_found.clone(),
                 };
+                let mut resumed = Some(resumed);
+                let recovered_reply = ready_reply();
+                let mut recovered = false;
                 loop {
                     let header = read_lookup(&mut stream).await;
                     let attempt = observed.fetch_add(1, Ordering::SeqCst) + 1;
                     // Hold the retried lookup at an awaited reply so expiry
                     // cannot race a directory update and report its stage.
-                    if state == "paused" || (state == "retrying" && attempt == 2) {
-                        std::future::pending::<()>().await;
+                    if (state == "paused" && attempt == 1) || (state == "retrying" && attempt == 2)
+                    {
+                        let _ = resumed.take().unwrap().await;
+                        reply(&mut stream, header, &not_found).await;
+                        late_tx.send(()).unwrap();
+                        recovered = true;
+                        continue;
                     }
                     // Five configured delays allow a sixth and final lookup.
-                    let response = if attempt < 6 {
+                    let response = if recovered {
+                        &recovered_reply
+                    } else if attempt < 6 {
                         &not_found
                     } else {
                         &final_reply
@@ -623,6 +652,15 @@ fn route_acquisition_respects_deadlines_and_last_lookup_result() {
                 } else {
                     assert_eq!(queries, 2, "fixture must reach the paused retry");
                 }
+                #[cfg(feature = "test-support")]
+                assert_eq!(client.pending_len_for_test(), 1);
+                assert!(client.is_connected());
+                resume.send(()).unwrap();
+                late_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+                let binding = client
+                    .acquire_route_with_deadline(&expected(), deadline(Duration::from_secs(3)))
+                    .unwrap();
+                assert_eq!(binding.route_uid(), ROUTE_UID);
             } else {
                 assert_eq!(queries, 6, "{state}, exact={exact_token}");
                 match state {
@@ -637,6 +675,7 @@ fn route_acquisition_respects_deadlines_and_last_lookup_result() {
             }
             #[cfg(feature = "test-support")]
             assert_eq!(client.pending_len_for_test(), 0);
+            assert!(client.is_connected());
             assert!(pool.release_if_same(&peer.address, &client));
             assert_eq!(pool.refcount(&peer.address), 0);
             peer.finish();

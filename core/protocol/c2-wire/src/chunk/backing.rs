@@ -45,7 +45,7 @@ pub fn checked_capacity(total_chunks: usize, chunk_size: usize) -> Result<usize,
 /// Kept together so every release path drops storage before the charge; the
 /// pair is never handed out separately.
 struct BackingState {
-    received_flags: Vec<bool>,
+    received_flags: Vec<u8>,
     handle: OwnedAllocation,
     reservation: BudgetReservation,
 }
@@ -100,7 +100,7 @@ impl ReassemblyBacking {
             return Err("reassembly admission guard belongs to a different pool".to_string());
         }
         let capacity = checked_capacity(total_chunks, chunk_size)?;
-        let metadata_bytes = tracked_chunks * std::mem::size_of::<bool>();
+        let metadata_bytes = tracked_chunks * std::mem::size_of::<u8>();
         let charged_capacity = capacity.checked_add(metadata_bytes).ok_or_else(|| {
             "reassembly capacity including metadata exceeds the addressable range".to_string()
         })?;
@@ -124,7 +124,7 @@ impl ReassemblyBacking {
             received_flags
                 .try_reserve_exact(tracked_chunks)
                 .map_err(|error| format!("reassembly chunk tracking allocation failed: {error}"))?;
-            received_flags.resize(tracked_chunks, false);
+            received_flags.resize(tracked_chunks, 0);
             match guard.alloc_owned(capacity) {
                 Ok(handle) => (received_flags, handle, reservation),
                 // The reservation guard drops with this error return and
@@ -154,13 +154,21 @@ impl ReassemblyBacking {
             .ok_or_else(|| "reassembly backing already released".to_string())
     }
 
-    pub(crate) fn chunk_received(&self, index: usize) -> Result<bool, String> {
-        Ok(self.live_state()?.received_flags[index])
+    /// Transfer the charged tracking allocation to the assembler while this
+    /// backing is still uniquely owned. Its reservation continues charging it.
+    pub(crate) fn take_received_flags(&mut self) -> Result<Vec<u8>, String> {
+        Ok(std::mem::take(&mut self.live_state_mut()?.received_flags))
     }
 
-    pub(crate) fn mark_chunk_received(&mut self, index: usize) -> Result<(), String> {
-        self.live_state_mut()?.received_flags[index] = true;
+    pub(crate) fn restore_received_flags(&mut self, states: Vec<u8>) -> Result<(), String> {
+        self.live_state_mut()?.received_flags = states;
         Ok(())
+    }
+
+    /// Obtain the stable allocation address before any parallel copy token
+    /// exists. Only checked, disjoint token ranges may use this address.
+    pub(crate) fn allocation_address(&mut self) -> Result<usize, String> {
+        Ok(self.live_state_mut()?.handle.as_mut_slice().as_mut_ptr() as usize)
     }
 
     /// Logical data length (may be trimmed below allocated capacity).

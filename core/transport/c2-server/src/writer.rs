@@ -47,19 +47,19 @@ pub(crate) struct ConnectionWriter {
     queue: mpsc::Sender<Submission>,
     controls: mpsc::UnboundedSender<Submission>,
     control_budget: Arc<Semaphore>,
-    conn: Arc<Connection>,
+    pub(crate) conn: Arc<Connection>,
 }
 
 /// Receive-loop replies reserve their pending slot before any async work.
 /// The bounded control backlog is independent of business queue occupancy.
-pub(crate) struct ControlReplyPermit {
+pub(crate) struct QueuedReplyPermit {
     queue: mpsc::UnboundedSender<Submission>,
     pending: OwnedSemaphorePermit,
     request: WriteRequest,
     flight: WriteGuard,
 }
 
-impl ControlReplyPermit {
+impl QueuedReplyPermit {
     pub(crate) fn send(self, bytes: Vec<u8>) {
         let _ = self.queue.send(Submission {
             bytes,
@@ -73,6 +73,32 @@ impl ControlReplyPermit {
 }
 
 impl ConnectionWriter {
+    #[cfg(test)]
+    pub(crate) fn spawn_test_stream<W: AsyncWrite + Unpin + Send + 'static>(
+        mut stream: W,
+        conn: Arc<Connection>,
+    ) -> (Arc<Self>, JoinHandle<()>) {
+        let (queue, receiver) = mpsc::channel(QUEUE_CAPACITY);
+        let (controls, control_receiver) = mpsc::unbounded_channel();
+        let writer = Arc::new(Self {
+            queue,
+            controls,
+            control_budget: Arc::new(Semaphore::new(1024)),
+            conn: conn.clone(),
+        });
+        let task = tokio::spawn(async move {
+            run(
+                &mut stream,
+                conn,
+                receiver,
+                control_receiver,
+                Duration::from_secs(30),
+            )
+            .await;
+        });
+        (writer, task)
+    }
+
     pub(crate) fn spawn(
         write_half: LocalWriteHalf,
         conn: Arc<Connection>,
@@ -111,7 +137,11 @@ impl ConnectionWriter {
     }
 
     pub(crate) async fn write_all(&self, bytes: &[u8]) -> io::Result<()> {
-        self.submit(bytes.to_vec(), None).await.map(|_| ())
+        self.submit(bytes.to_vec(), None, false).await.map(|_| ())
+    }
+
+    pub(crate) async fn write_call_end(&self, bytes: &[u8]) -> io::Result<()> {
+        self.submit(bytes.to_vec(), None, true).await.map(|_| ())
     }
 
     /// Keep the local response owner until the sole writer can publish it.
@@ -122,19 +152,27 @@ impl ConnectionWriter {
         request_id: u64,
         prepared: PreparedShmResponse,
     ) -> io::Result<Option<PreparedShmResponse>> {
-        self.submit(Vec::new(), Some((request_id, prepared))).await
+        self.submit(Vec::new(), Some((request_id, prepared)), true)
+            .await
     }
 
     async fn submit(
         &self,
         bytes: Vec<u8>,
         prepared: Option<(u64, PreparedShmResponse)>,
+        call_end: bool,
     ) -> io::Result<Option<PreparedShmResponse>> {
         let (reply, receipt) = oneshot::channel();
         // Every queued response retains write access through deactivation;
         // only publication of a new SHM loan requires business admission.
-        let request =
-            WriteRequest::Control(self.conn.core.prepare_control_frame().map_err(core_error)?);
+        let request = if call_end {
+            WriteRequest::CallEnd {
+                frame: self.conn.core.prepare_call_record().map_err(core_error)?,
+                loans: Vec::new(),
+            }
+        } else {
+            WriteRequest::Control(self.conn.core.prepare_control_frame().map_err(core_error)?)
+        };
         self.queue
             .send(Submission {
                 bytes,
@@ -150,8 +188,12 @@ impl ConnectionWriter {
     }
 
     /// The receive loop only enqueues; it never waits for a blocked OS write.
-    pub(crate) fn reserve_control(&self) -> io::Result<ControlReplyPermit> {
+    pub(crate) fn reserve_control(&self) -> io::Result<QueuedReplyPermit> {
         let control = self.conn.core.prepare_control_frame().map_err(core_error)?;
+        self.reserve_reply(WriteRequest::Control(control))
+    }
+
+    fn reserve_reply(&self, request: WriteRequest) -> io::Result<QueuedReplyPermit> {
         let pending = self
             .control_budget
             .clone()
@@ -166,12 +208,22 @@ impl ConnectionWriter {
                 );
                 io::Error::new(io::ErrorKind::OutOfMemory, "pending reply budget exhausted")
             })?;
-        Ok(ControlReplyPermit {
+        Ok(QueuedReplyPermit {
             queue: self.controls.clone(),
             pending,
-            request: WriteRequest::Control(control),
+            request,
             flight: WriteGuard::new(&self.conn),
         })
+    }
+
+    pub(crate) fn queue_call_end(&self, bytes: Vec<u8>) -> io::Result<()> {
+        let frame = self.conn.core.prepare_call_record().map_err(core_error)?;
+        self.reserve_reply(WriteRequest::CallEnd {
+            frame,
+            loans: Vec::new(),
+        })?
+        .send(bytes);
+        Ok(())
     }
 
     pub(crate) fn queue_control(&self, bytes: Vec<u8>) -> io::Result<()> {
@@ -180,8 +232,8 @@ impl ConnectionWriter {
     }
 }
 
-async fn run(
-    stream: &mut LocalWriteHalf,
+async fn run<W: AsyncWrite + Unpin>(
+    stream: &mut W,
     conn: Arc<Connection>,
     mut receiver: mpsc::Receiver<Submission>,
     mut controls: mpsc::UnboundedReceiver<Submission>,
@@ -259,8 +311,8 @@ async fn run(
     }
 }
 
-async fn process_submission(
-    stream: &mut LocalWriteHalf,
+async fn process_submission<W: AsyncWrite + Unpin>(
+    stream: &mut W,
     conn: &Connection,
     mut submission: Submission,
     write_timeout: Duration,
@@ -382,8 +434,8 @@ fn prepare_response_write(
     request_id: u64,
     prepared: PreparedShmResponse,
 ) -> io::Result<PreparedResponseWrite> {
-    use c2_wire::buddy::{BuddyPayload, encode_buddy_payload};
-    use c2_wire::flags::{FLAG_BUDDY, FLAG_REPLY_V2, FLAG_RESPONSE};
+    use c2_wire::buddy::BuddyPayload;
+    use c2_wire::rpc::{CallMode, CallStatus, ValuePart, ValueStorage, encode_call_end_frame};
     let _publication = conn.publication_gate.lock();
     if conn.core.is_deactivated() {
         return Ok(PreparedResponseWrite::Owned(prepared));
@@ -399,17 +451,21 @@ fn prepare_response_write(
         is_dedicated: allocation.is_dedicated,
         loan_id: loan.id(),
     };
-    let frame = c2_wire::frame::encode_frame_parts(
+    let frame = encode_call_end_frame(
         request_id,
-        FLAG_REPLY_V2 | FLAG_RESPONSE | FLAG_BUDDY,
-        &[
-            &encode_buddy_payload(&descriptor),
-            &[c2_wire::control::STATUS_SUCCESS],
-        ],
-    );
+        CallMode::Unary,
+        CallStatus::Success,
+        0,
+        ValuePart::whole(ValueStorage::Shm(descriptor)),
+    )
+    .map_err(|error| io::Error::other(error.to_string()))?;
+    let frame_permit = conn.core.prepare_call_record().map_err(core_error)?;
     let batch = conn
         .core
-        .begin_write(WriteRequest::Business(vec![loan]))
+        .begin_write(WriteRequest::CallEnd {
+            frame: frame_permit,
+            loans: vec![loan],
+        })
         .map_err(core_error)?
         .expect("response frame");
     let mut write = assemble_write(conn, batch, Some(&frame))?;

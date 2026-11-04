@@ -29,7 +29,47 @@ pub struct ChunkAssembler {
     received: usize,
     /// High-water mark: one past the last byte written.
     written_end: usize,
-    backing: ReassemblyBacking,
+    backing: Arc<ReassemblyBacking>,
+    /// 0 unseen, 1 reserved for a copy token, 2 committed.
+    chunk_state: Vec<u8>,
+    allocation_address: usize,
+}
+
+/// One move-only, checked write range. It pins the original backing and its
+/// reservation even if the registry removes the assembly during the copy.
+pub struct PreparedChunk {
+    backing: Arc<ReassemblyBacking>,
+    allocation_address: usize,
+    chunk_idx: usize,
+    offset: usize,
+    len: usize,
+}
+
+/// A completed write awaiting the assembler's short metadata commit.
+pub struct CopiedChunk(PreparedChunk);
+
+impl PreparedChunk {
+    pub fn copy_from(self, data: &[u8]) -> Result<CopiedChunk, String> {
+        if data.len() != self.len {
+            return Err(format!(
+                "prepared chunk length {} differs from {}",
+                data.len(),
+                self.len
+            ));
+        }
+        // SAFETY: prepare_chunk uniquely reserves this chunk index under the
+        // assembler's exclusive borrow. Checked geometry yields disjoint spans;
+        // the Arc pins the exact allocation, mapping and budget until commit or
+        // drop. No safe reader of the unfinished backing is exposed.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                data.as_ptr(),
+                (self.allocation_address as *mut u8).add(self.offset),
+                data.len(),
+            );
+        }
+        Ok(CopiedChunk(self))
+    }
 }
 
 /// Checked immutable geometry. Only the canonical checks can create this token.
@@ -95,10 +135,10 @@ impl ChunkAssembler {
             total_chunks,
             chunk_size,
         } = geometry;
-        // Vec<bool> stores one byte per flag. Reserve those bytes together with
+        // Each tracking state occupies one byte. Reserve those bytes together with
         // the payload before allocating either storage, using the same owner
         // reservation throughout the backing's lifetime.
-        let backing = ReassemblyBacking::admit_with_guard(
+        let mut backing = ReassemblyBacking::admit_with_guard(
             pool,
             guard,
             total_chunks,
@@ -106,12 +146,20 @@ impl ChunkAssembler {
             total_chunks,
         )
         .map_err(ChunkAdmissionError::Capacity)?;
+        let chunk_state = backing
+            .take_received_flags()
+            .map_err(ChunkAdmissionError::Capacity)?;
+        let allocation_address = backing
+            .allocation_address()
+            .map_err(ChunkAdmissionError::Capacity)?;
         Ok(Self {
             total_chunks,
             chunk_size,
             received: 0,
             written_end: 0,
-            backing,
+            backing: Arc::new(backing),
+            chunk_state,
+            allocation_address,
         })
     }
 
@@ -119,27 +167,58 @@ impl ChunkAssembler {
     ///
     /// Returns `true` when all chunks have been received.
     pub fn feed_chunk(&mut self, chunk_idx: usize, data: &[u8]) -> Result<bool, String> {
+        let token = self.prepare_chunk(chunk_idx, data.len())?;
+        let copied = token.copy_from(data)?;
+        self.commit_chunk(copied)
+    }
+
+    /// Reserve one nonoverlapping copy span while the assembler is locked.
+    pub fn prepare_chunk(&mut self, chunk_idx: usize, len: usize) -> Result<PreparedChunk, String> {
         if chunk_idx >= self.total_chunks {
             return Err(format!(
                 "chunk_idx {chunk_idx} >= total_chunks {}",
                 self.total_chunks
             ));
         }
-        if self.backing.chunk_received(chunk_idx)? {
+        if self.chunk_state[chunk_idx] != 0 {
             return Err(format!("duplicate chunk_idx {chunk_idx}"));
         }
-        if data.len() > self.chunk_size {
+        if len > self.chunk_size {
             return Err(format!(
                 "data length {} exceeds chunk_size {}",
-                data.len(),
-                self.chunk_size
+                len, self.chunk_size
             ));
         }
-        let offset = chunk_idx * self.chunk_size;
-        self.backing.write_at(offset, data)?;
-        self.backing.mark_chunk_received(chunk_idx)?;
+        let offset = chunk_idx
+            .checked_mul(self.chunk_size)
+            .ok_or_else(|| "chunk offset overflow".to_string())?;
+        let end = offset
+            .checked_add(len)
+            .ok_or_else(|| "chunk end overflow".to_string())?;
+        if end > self.backing.len() {
+            return Err("chunk span exceeds backing".into());
+        }
+        self.chunk_state[chunk_idx] = 1;
+        Ok(PreparedChunk {
+            backing: Arc::clone(&self.backing),
+            allocation_address: self.allocation_address,
+            chunk_idx,
+            offset,
+            len,
+        })
+    }
+
+    /// Publish a completed copy. All bytes are in place before completion.
+    pub fn commit_chunk(&mut self, copied: CopiedChunk) -> Result<bool, String> {
+        let token = copied.0;
+        if !Arc::ptr_eq(&self.backing, &token.backing)
+            || self.chunk_state.get(token.chunk_idx) != Some(&1)
+        {
+            return Err("chunk token belongs to another or retired assembly".into());
+        }
+        self.chunk_state[token.chunk_idx] = 2;
         self.received += 1;
-        let end = offset + data.len();
+        let end = token.offset + token.len;
         if end > self.written_end {
             self.written_end = end;
         }
@@ -179,7 +258,14 @@ impl ChunkAssembler {
             ));
         }
         let written_end = self.written_end;
-        let ChunkAssembler { mut backing, .. } = self;
+        let ChunkAssembler {
+            backing,
+            chunk_state,
+            ..
+        } = self;
+        let mut backing = Arc::try_unwrap(backing)
+            .map_err(|_| "in-flight chunk copy still owns backing".to_string())?;
+        backing.restore_received_flags(chunk_state)?;
         backing.trim_to(written_end)?;
         Ok(backing)
     }
@@ -301,6 +387,52 @@ mod tests {
         // Trim happened but the full capacity stays charged until release.
         assert_eq!(backing.capacity_bytes(), 27);
         backing.release();
+    }
+
+    #[test]
+    fn prepared_ranges_copy_concurrently_and_commit_out_of_order() {
+        use std::sync::Barrier;
+
+        let pool = test_pool_arc();
+        let mut asm = ChunkAssembler::new(pool, 2, 4096, 8192).unwrap();
+        let first = asm.prepare_chunk(0, 4096).unwrap();
+        let second = asm.prepare_chunk(1, 4096).unwrap();
+        assert!(asm.prepare_chunk(0, 4096).is_err());
+        let barrier = Arc::new(Barrier::new(3));
+        let handles: Vec<_> = [(first, 0x11), (second, 0x22)]
+            .into_iter()
+            .map(|(token, byte)| {
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    token.copy_from(&vec![byte; 4096]).unwrap()
+                })
+            })
+            .collect();
+        barrier.wait();
+        let mut copies: Vec<_> = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect();
+        assert!(!asm.commit_chunk(copies.pop().unwrap()).unwrap());
+        assert!(asm.commit_chunk(copies.pop().unwrap()).unwrap());
+        let backing = asm.finish().unwrap();
+        let bytes = backing.copy_bytes().unwrap();
+        assert_eq!(&bytes[..4096], &[0x11; 4096]);
+        assert_eq!(&bytes[4096..], &[0x22; 4096]);
+    }
+
+    #[test]
+    fn prepared_copy_keeps_original_charge_after_assembly_abort() {
+        let (pool, budget) = budgeted_pool_arc(8194);
+        let mut asm = ChunkAssembler::new(pool, 2, 4096, 8192).unwrap();
+        let token = asm.prepare_chunk(0, 4096).unwrap();
+        asm.abort();
+        assert_eq!(budget.snapshot().reassembly.used_bytes, 8194);
+        let copied = token.copy_from(&[7; 4096]).unwrap();
+        assert_eq!(budget.snapshot().reassembly.used_bytes, 8194);
+        drop(copied);
+        assert_eq!(budget.snapshot().reassembly.used_bytes, 0);
     }
 
     #[test]

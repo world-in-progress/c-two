@@ -16,7 +16,7 @@ pub const MAX_EXECUTION_WORKERS: u32 = 64;
 /// Maximum number of loan IDs carried by one IPC release frame.
 pub const IPC_RELEASE_BATCH_CAPACITY: usize = 64;
 
-// total_len excludes its own u32: request_id + flags + type + count + loan IDs.
+// total_len excludes its own u32: request_id + flags + kind + count + loan IDs.
 const MIN_IPC_FRAME_SIZE: u64 = 8 + 4 + 1 + 1 + 8 * IPC_RELEASE_BATCH_CAPACITY as u64;
 
 /// Canonical upper bound on configured buddy pool segments

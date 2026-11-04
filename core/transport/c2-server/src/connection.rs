@@ -140,6 +140,8 @@ impl Drop for WriteGuard {
 
 /// Per-client connection state.
 pub struct Connection {
+    pub(crate) calls: Mutex<c2_wire::connection::calls::CallTable<crate::server::ServerCall>>,
+    pub(crate) rpc_writer: Mutex<Option<std::sync::Weak<crate::writer::ConnectionWriter>>>,
     pub(crate) core: ConnectionCore,
     /// Serialize response-loan publication with local deactivation. The writer
     /// holds this only through preparation and begin_io, never through I/O.
@@ -225,6 +227,8 @@ impl Connection {
         let writer_wake = Arc::new(Notify::new());
         let notify = writer_wake.clone();
         Self {
+            calls: Mutex::new(c2_wire::connection::calls::CallTable::default()),
+            rpc_writer: Mutex::new(None),
             core: ConnectionCore::new(ConnectionSide::Server, move || {
                 notify.notify_waiters();
                 notify.notify_one();
@@ -500,6 +504,7 @@ impl Connection {
 
     pub(crate) fn cancel_queued_work(&self) {
         self.work_cancelled.store(true, Ordering::Release);
+        crate::server::retire_connection_calls(self);
         self.end(ConnectionEndReason::LocalClose, "connection_cancel");
     }
 

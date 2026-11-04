@@ -87,10 +87,7 @@ pub fn decode_buddy_payload(buf: &[u8]) -> Result<(BuddyPayload, usize), DecodeE
     }
     let loan_id = u64::from_le_bytes(buf[15..23].try_into().unwrap());
     if loan_id == 0 {
-        return Err(DecodeError::InvalidValue {
-            field: "loan id",
-            value: loan_id,
-        });
+        return Err(DecodeError::ZeroLoanId);
     }
     Ok((
         BuddyPayload {

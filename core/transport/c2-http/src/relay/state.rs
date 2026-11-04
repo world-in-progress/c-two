@@ -1283,8 +1283,7 @@ mod tests {
                 }
             }
             let error = acquire_step(exact.call_bound(&old, "ping", &[])).await.unwrap_err();
-            let c2_ipc::IpcError::CrmError(bytes) = error else { panic!("old call: {error}"); };
-            let error = c2_error::C2Error::from_wire_bytes(&bytes).unwrap().unwrap();
+            let c2_ipc::IpcError::CallRejected(error) = error else { panic!("old call: {error}"); };
             assert_eq!(error.code, match transition {
                 AcquireTransition::Closed => c2_error::ErrorCode::ResourceClosed,
                 AcquireTransition::Removed => c2_error::ErrorCode::ResourceRemoved,
@@ -1441,10 +1440,9 @@ mod tests {
             let error = acquire_step(client.call_bound(&old_b, "ping", &[]))
                 .await
                 .unwrap_err();
-            let c2_ipc::IpcError::CrmError(bytes) = error else {
+            let c2_ipc::IpcError::CallRejected(error) = error else {
                 panic!("old B call: {error}");
             };
-            let error = c2_error::C2Error::from_wire_bytes(&bytes).unwrap().unwrap();
             assert_eq!(
                 error.code,
                 match transition {

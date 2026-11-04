@@ -473,7 +473,7 @@ async fn network_loss_after_post_does_not_send_again() {
     assert_eq!(live.calls.load(Ordering::SeqCst), 0);
 }
 
-async fn assert_capacity_preserves_route(reply: Reply, status: u16) {
+async fn assert_capacity_preserves_route(reply: Reply, status: u16, phase: HttpCallPhase) {
     let data = Data::new(reply);
     let server = data_server(&data).await;
     let (registry, resolves) = registry(&[&server.url], None).await;
@@ -486,7 +486,7 @@ async fn assert_capacity_preserves_route(reply: Reply, status: u16) {
         .unwrap_err();
 
     assert!(matches!(error.source_error(), HttpError::ResponseError(code, _) if *code == status));
-    assert_eq!(error.phase(), HttpCallPhase::DispatchUncertain);
+    assert_eq!(error.phase(), phase);
     assert_eq!(data.calls.load(Ordering::SeqCst), 1);
     *data.reply.lock() = Reply::Echo;
     assert_eq!(
@@ -504,12 +504,13 @@ async fn assert_capacity_preserves_route(reply: Reply, status: u16) {
 
 #[tokio::test]
 async fn capacity_refusal_preserves_cache_and_never_provides_retry_proof() {
-    assert_capacity_preserves_route(Reply::Capacity, 429).await;
+    assert_capacity_preserves_route(Reply::Capacity, 429, HttpCallPhase::DispatchUncertain).await;
 }
 
 #[tokio::test]
 async fn predispatched_capacity_refusal_is_not_a_stale_route_proof() {
-    assert_capacity_preserves_route(Reply::CapacityPreDispatch, 502).await;
+    assert_capacity_preserves_route(Reply::CapacityPreDispatch, 502, HttpCallPhase::PreDispatch)
+        .await;
 }
 
 #[tokio::test]

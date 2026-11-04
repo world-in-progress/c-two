@@ -74,12 +74,12 @@ const connect: C2IpcConnect = async () => ({
 // @ts-expect-error A connection must be able to terminate pending reads/writes.
 const missingClose: C2IpcConnect = () => ({ write() {}, readExactly(n: number) { return new Uint8Array(n); } });
 createIpcEncodedTransport("ipc://typed-custom", { connect });
-const mismatch = new C2IpcTransportError("version mismatch", { localProtocolVersion: 15, peerProtocolVersion: 16 });
+const mismatch = new C2IpcTransportError("version mismatch", { localProtocolVersion: 16, peerProtocolVersion: 15 });
 const category: "protocol_version_mismatch" | null = mismatch.category;
 const localVersion: number | null = mismatch.localProtocolVersion;
 const peerVersion: number | null = mismatch.peerProtocolVersion;
 // @ts-expect-error Version facts are supplied as one complete pair.
-new C2IpcTransportError("incomplete version facts", { localProtocolVersion: 15 });
+new C2IpcTransportError("incomplete version facts", { localProtocolVersion: 16 });
 // @ts-expect-error Node factories belong to @c-two/c2-mem-ffi.
 import { createNodeIpcConnect } from "./c_two_contract.js";
 // @ts-expect-error Generated modules expose the generic connection contract.
@@ -456,11 +456,11 @@ import {
   CONTRACT, C2IpcTransportError, createIpcEncodedTransport, createRelayAwareHttpEncodedTransport,
 } from './dist/typescript/c_two_contract.js';
 
-// Handwritten IPC15 records, independent of every production frame/handshake encoder.
+// Handwritten IPC16 records, independent of every production frame/handshake encoder.
 // Each is LE bodylen=21, RID=0, exact direction flags, C2IP, kind, LE u32 version.
-const HELLO15 = Buffer.from('1500000000000000000000000400000043324950010f000000', 'hex');
-const ACCEPTED15 = Buffer.from('1500000000000000000000000600000043324950020f000000', 'hex');
-const MISMATCH16 = Buffer.from('15000000000000000000000006000000433249500310000000', 'hex');
+const HELLO16 = Buffer.from('15000000000000000000000004000000433249500110000000', 'hex');
+const ACCEPTED16 = Buffer.from('15000000000000000000000006000000433249500210000000', 'hex');
+const MISMATCH15 = Buffer.from('1500000000000000000000000600000043324950030f000000', 'hex');
 const CLIENT_METADATA = Buffer.from('0f000000000000000000000004000000000000', 'hex');
 const ADDRESS = 'ipc://version_preamble';
 
@@ -492,7 +492,7 @@ const captureError = (promise) => promise.then(() => undefined, (error) => error
 function assertMismatch(error, peerVersion) {
   assert.ok(error instanceof C2IpcTransportError, 'keep the existing IPC error class');
   assert.equal(error.category, 'protocol_version_mismatch');
-  assert.equal(error.localProtocolVersion, 15);
+  assert.equal(error.localProtocolVersion, 16);
   assert.equal(error.peerProtocolVersion, peerVersion);
 }
 
@@ -506,17 +506,17 @@ test('ordinary IPC errors initialize null version facts', () => {
 for (const [version, hex] of [
   [1, '15000000000000000000000006000000433249500301000000'],
   [13, '1500000000000000000000000600000043324950030d000000'],
-  [16, '15000000000000000000000006000000433249500310000000'],
+  [15, '1500000000000000000000000600000043324950030f000000'],
   [256, '15000000000000000000000006000000433249500300010000'],
   [4294967295, '150000000000000000000000060000004332495003ffffffff'],
 ]) {
-  test(`fixed rejection reports local 15 and peer ${version} without remote EOF`, {timeout: 1000}, async () => {
+  test(`fixed rejection reports local 16 and peer ${version} without remote EOF`, {timeout: 1000}, async () => {
     const peer = fixedPeer(Buffer.from(hex, 'hex'));
     const transport = createIpcEncodedTransport(ADDRESS, {connect: peer.connect});
     try {
       const error = await captureError(prepare(transport));
       assertMismatch(error, version);
-      assert.deepEqual(peer.writes, [HELLO15]);
+      assert.deepEqual(peer.writes, [HELLO16]);
       assert.deepEqual(peer.reads, [16, 9], 'read the fixed envelope before the fixed body');
       assert.equal(peer.closes, 1, 'reject and close locally after the complete record');
       assert.equal(peer.connects, 1, 'a rejection must not reconnect');
@@ -525,7 +525,7 @@ for (const [version, hex] of [
 }
 
 test('Hello is the only write while acceptance is pending, including with a private SHM pool', {timeout: 1000}, async () => {
-  const peer = fixedPeer(MISMATCH16);
+  const peer = fixedPeer(MISMATCH15);
   const connect = peer.connect;
   let signalRead, releaseReply;
   const reading = new Promise((resolve) => { signalRead = resolve; });
@@ -548,7 +548,7 @@ test('Hello is the only write while acceptance is pending, including with a priv
   const result = captureError(prepare(transport));
   try {
     await reading;
-    assert.deepEqual(peer.writes, [HELLO15], 'SHM names and variable metadata wait for Accepted15');
+    assert.deepEqual(peer.writes, [HELLO16], 'SHM names and variable metadata wait for Accepted16');
   } finally {
     releaseReply();
     await result;
@@ -557,7 +557,7 @@ test('Hello is the only write while acceptance is pending, including with a priv
 });
 
 test('local metadata encoding errors precede Hello and cannot be hidden by a peer rejection', async () => {
-  const peer = fixedPeer(MISMATCH16);
+  const peer = fixedPeer(MISMATCH15);
   const connect = peer.connect;
   const transport = createIpcEncodedTransport(ADDRESS, {
     connect: async () => ({ ...await connect(), memory: { prefix: '/invalid\0prefix' } }),
@@ -581,8 +581,8 @@ for (const [label, hex] of [
   ['missing handshake flag', '0c000000000000000000000002000000'],
   ['extra flags', '0c00000000000000000000000e000000'],
 ]) {
-  test(`Accepted15 releases version-free metadata, then rejects metadata ACK ${label}`, async () => {
-    const peer = fixedPeer(Buffer.concat([ACCEPTED15, Buffer.from(hex, 'hex')]));
+  test(`Accepted16 releases version-free metadata, then rejects metadata ACK ${label}`, async () => {
+    const peer = fixedPeer(Buffer.concat([ACCEPTED16, Buffer.from(hex, 'hex')]));
     const transport = createIpcEncodedTransport(ADDRESS, {connect: peer.connect});
     try {
       const error = await captureError(prepare(transport));
@@ -591,7 +591,7 @@ for (const [label, hex] of [
       assert.equal(error.category, null);
       assert.equal(error.localProtocolVersion, null);
       assert.equal(error.peerProtocolVersion, null);
-      assert.deepEqual(peer.writes, [HELLO15, CLIENT_METADATA]);
+      assert.deepEqual(peer.writes, [HELLO16, CLIENT_METADATA]);
       assert.deepEqual(peer.reads, [16, 9, 16]);
       assert.equal(peer.closes, 1);
     } finally { await transport.close(); }
@@ -612,7 +612,7 @@ for (const [label, hex, expectedReads] of [
   ['unknown kind', '1500000000000000000000000600000043324950040f000000', [16, 9]],
   ['zero version', '15000000000000000000000006000000433249500300000000', [16, 9]],
   ['Accepted with different version', '1500000000000000000000000600000043324950020e000000', [16, 9]],
-  ['VersionMismatch with equal version', '1500000000000000000000000600000043324950030f000000', [16, 9]],
+  ['VersionMismatch with equal version', '15000000000000000000000006000000433249500310000000', [16, 9]],
 ]) {
   test(`malformed preamble ${label} has no version facts`, async () => {
     const peer = fixedPeer(Buffer.from(hex, 'hex'));
@@ -624,7 +624,7 @@ for (const [label, hex, expectedReads] of [
       assert.equal(error.localProtocolVersion, null);
       assert.equal(error.peerProtocolVersion, null);
       assert.deepEqual(peer.reads, expectedReads, 'invalid envelopes must not drive a body allocation/read');
-      assert.deepEqual(peer.writes, [HELLO15], 'malformed responses cannot admit metadata');
+      assert.deepEqual(peer.writes, [HELLO16], 'malformed responses cannot admit metadata');
       assert.equal(peer.closes, 1);
     } finally { await transport.close(); }
   });
@@ -632,11 +632,11 @@ for (const [label, hex, expectedReads] of [
 
 test('fixed rejection survives a failed handshake close with the cleanup error as cause', async () => {
   const cleanup = new Error('local connection close failed');
-  const peer = fixedPeer(MISMATCH16, cleanup);
+  const peer = fixedPeer(MISMATCH15, cleanup);
   const transport = createIpcEncodedTransport(ADDRESS, {connect: peer.connect});
   try {
     const error = await captureError(prepare(transport));
-    assertMismatch(error, 16);
+    assertMismatch(error, 15);
     assert.equal(error.cause, cleanup);
     assert.equal(peer.closes, 1);
   } finally { await transport.close(); }
@@ -668,7 +668,7 @@ for (const withAlternative of [false, true]) {
   for (const failClose of [false, true]) {
     test(`relay local prepare keeps rejection terminal (alternative=${withAlternative}, close failure=${failClose})`, async () => {
       const cleanup = failClose ? new Error('relay local connection close failed') : undefined;
-      const peer = fixedPeer(MISMATCH16, cleanup);
+      const peer = fixedPeer(MISMATCH15, cleanup);
       const anchor = 'http://127.0.0.1:7357';
       const local = {
         name: 'manager', relay_url: anchor, ipc_address: ADDRESS,
@@ -702,11 +702,11 @@ for (const withAlternative of [false, true]) {
         const error = await captureError(transport.call('manager', CONTRACT, 'ping', new Uint8Array()));
         assert.deepEqual(http, [], 'no HTTP probe or business fallback, even to a distinct route');
         assert.equal(resolutions, 1, 'do not exclude the local token and resolve/retry');
-        assertMismatch(error, 16);
+        assertMismatch(error, 15);
         assert.equal(error.cause, cleanup, 'relay prepare must preserve handshake cleanup cause');
         assert.equal(peer.connects, 1);
         assert.equal(peer.closes, 1);
-        assert.deepEqual(peer.writes, [HELLO15]);
+        assert.deepEqual(peer.writes, [HELLO16]);
         assert.deepEqual(observations, [], 'no business call completed');
       } finally { await transport.close(); }
     });
@@ -749,8 +749,8 @@ const u32 = (n) => { const b = Buffer.alloc(4); b.writeUInt32LE(n); return b; };
 const u64 = (n) => { const b = Buffer.alloc(8); b.writeBigUInt64LE(BigInt(n)); return b; };
 const text = (s) => Buffer.concat([Buffer.from([Buffer.byteLength(s)]), Buffer.from(s)]);
 const frame = (id, flags, payload) => Buffer.concat([u32(12 + payload.length), u64(id), u32(flags), payload]);
-const HELLO15 = Buffer.from('1500000000000000000000000400000043324950010f000000', 'hex');
-const ACCEPTED15 = Buffer.from('1500000000000000000000000600000043324950020f000000', 'hex');
+const HELLO16 = Buffer.from('15000000000000000000000004000000433249500110000000', 'hex');
+const ACCEPTED16 = Buffer.from('15000000000000000000000006000000433249500210000000', 'hex');
 const handshake = (routes, instance, caps = 0) => Buffer.concat([
   text('/serverpool'), u16(caps), text('server'), text(instance), u16(routes.length),
   ...routes.map((r) => Buffer.concat([
@@ -760,13 +760,18 @@ const handshake = (routes, instance, caps = 0) => Buffer.concat([
     u16(r.methods.length), ...r.methods.map((m) => Buffer.concat([text(m.name), u16(m.index)])),
   ])),
 ]);
+const openStorageOffset = (payload) => {
+  let offset = 1;
+  for (let i = 0; i < 7; i++) offset += 1 + payload[offset];
+  return offset + 2;
+};
 function server() {
   const s = {
     routes: new Map([['manager', record('manager')]]), instance: 'instance',
-    connections: [], lookups: [], lists: [], calls: [], callFlags: [], failCall: false,
+    connections: [], lookups: [], lists: [], calls: [], callFlags: [], businessFrames: [], replyFrames: [], controlIds: [], failCall: false,
     failRead: false, responseData: Buffer.alloc(0), chunkedReply: false, shmReply: false,
     ackShmRequest: false, ackShmResponse: false, clientHellos: [], clientHandshakes: [], clientCaps: 0,
-    nextControl: undefined, corrupt: undefined, writesAfterClose: 0,
+    nextControl: undefined, corrupt: undefined, writesAfterClose: 0, inputFragments: new Map(),
   };
   // The ACK models the native session intersection: a direction is
   // acknowledged only when this server enables it and the client offered it.
@@ -795,14 +800,14 @@ function server() {
         if (flags === 4) {
           assert.equal(id, 0n);
           if (handshakeStage === 0) {
-            assert.deepEqual(b, HELLO15);
+            assert.deepEqual(b, HELLO16);
             s.clientHellos.push(Buffer.from(b));
             handshakeStage = 1;
-            feed(ACCEPTED15);
+            feed(ACCEPTED16);
             return;
           }
           assert.equal(handshakeStage, 1, 'metadata follows exactly one Hello');
-          assert.notDeepEqual(b, HELLO15, 'a repeated Hello is not metadata');
+          assert.notDeepEqual(b, HELLO16, 'a repeated Hello is not metadata');
           s.clientHandshakes.push(Buffer.from(payload));
           s.clientCaps = payload.subarray(payload.length - 2).readUInt16LE(0);
           handshakeStage = 2;
@@ -810,13 +815,14 @@ function server() {
           return;
         }
         assert.equal(handshakeStage, 2, 'business and route control require both handshake stages');
-        if (flags === 16 && payload[0] === 0x17) {
+        if (flags === 4096 && payload[0] === 0x07) {
           if (s.failRelease) throw new Error('release write failed');
           s.responseReleases ??= [];
           for (let i = 0; i < payload[1]; i++) s.responseReleases.push(payload.readBigUInt64LE(2 + i * 8));
           return;
         }
         if (flags === 16) {
+          s.controlIds.push(id);
           const request = JSON.parse(payload.subarray(1).toString());
           if (payload[0] === 0x0e) {
             assert.deepEqual(request, { selector: {type: 'contract', expected: wireContract(request.selector.expected.route_name)} });
@@ -842,25 +848,48 @@ function server() {
             status: request.observed_route_uid !== null && (request.observed_route_uid !== current.route_uid) ? 'stale' : 'ready', current,
           } : {status: 'not_found', route_name: request.expected.route_name});
         } else {
-          assert.ok((flags & 128) !== 0);
+          assert.ok((flags & 4096) !== 0);
+          assert.equal(payload[0], 0x01);
+          s.businessFrames.push(b);
           s.callFlags.push(flags);
           s.calls.push(payload);
-          if ((flags & 64) !== 0) feed(frame(0n, 18, Buffer.concat([Buffer.from([0x17, 1]), u64(payload.readBigUInt64LE(15))])));
+          const first = (flags & 8192) !== 0;
+          const fragment = (flags & 512) !== 0;
+          let isLast = !fragment;
+          if (first) {
+            const storage = openStorageOffset(payload);
+            const total = payload.readBigUInt64LE(storage);
+            const piece = BigInt(payload.length - storage - 8);
+            s.inputFragments.set(id, {total, copied: piece});
+          } else if (fragment) {
+            const state = s.inputFragments.get(id);
+            assert.ok(state, 'continuation has an OPEN first fragment');
+            state.copied += BigInt(payload.length - 1);
+            isLast = state.copied === state.total;
+            if (isLast) s.inputFragments.delete(id);
+          }
+          if ((flags & 64) !== 0) {
+            const storage = openStorageOffset(payload);
+            feed(frame(0n, 4096 | 2, Buffer.concat([Buffer.from([0x07, 1]), u64(payload.readBigUInt64LE(storage + 15))])));
+          }
           if (s.failCall) { s.failCall = false; throw new Error('uncertain write'); }
-          if (s.onCall) return await s.onCall({id, flags, feed, block: () => new Promise((resolve, reject) => { finishWrite = s.completeWriteOnClose ? resolve : () => reject(new Error('write interrupted by close')); })});
-          if ((flags & 512) !== 0 && (flags & 1024) === 0) return;
+          if (s.onCall) return await s.onCall({id, flags, feed, isLast, block: () => new Promise((resolve, reject) => { finishWrite = s.completeWriteOnClose ? resolve : () => reject(new Error('write interrupted by close')); })});
+          if (!isLast) return;
           businessReply = true;
-          const body = Buffer.concat([Buffer.from([0]), s.responseData]);
+          const body = Buffer.concat([Buffer.from([0x06, 0]), s.responseData]);
           if (s.chunkedReply) {
             for (let index = 0; index < 2; index += 1) {
               const data = s.responseData.subarray(index * 2, (index + 1) * 2);
-              feed(frame(id, 2 | 256 | 512 | (index === 1 ? 1024 : 0), Buffer.concat([u64(s.responseData.length), u32(2), u32(index), data])));
+              feed(frame(id, 2 | 4096 | 512 | (index === 0 ? 8192 : 0),
+                index === 0 ? Buffer.concat([Buffer.from([0x06, 0]), u64(s.responseData.length), data]) : Buffer.concat([Buffer.from([0x06]), data])));
             }
           } else if (s.shmReply) {
             const buddy = Buffer.concat([u16(0), u32(1), u32(0), u32(s.responseData.length), Buffer.from([0]), u64(s.responseAllocationId ?? 1n)]);
-            feed(frame(id, 2 | 256 | 64, Buffer.concat([buddy, Buffer.from([0])])));
+            feed(frame(id, 2 | 4096 | 64, Buffer.concat([Buffer.from([0x06, 0]), buddy])));
           } else {
-            feed(frame(id, 2 | 256, body));
+            const encoded = frame(id, 2 | 4096, body);
+            s.replyFrames.push(encoded);
+            feed(encoded);
           }
         }
       },
@@ -869,6 +898,11 @@ function server() {
           if (s.readFailure) { const error = s.readFailure; s.readFailure = undefined; throw error; }
           if (this.closed) throw new Error('connection closed');
           await new Promise((resolve) => { wakeRead = resolve; });
+        }
+        if (s.failLocalPayloadRead && n > 16 && buffered[0] === 0x06) {
+          s.failLocalPayloadRead = false;
+          const prefix = buffered.subarray(0, n); buffered = buffered.subarray(n);
+          throw Object.assign(new Error('local response allocation refused'), {c2LocalAllocationFailure: true, c2ReadPrefix: prefix});
         }
         const b = buffered.subarray(0, n); buffered = buffered.subarray(n);
         if (businessReply) {
@@ -892,6 +926,28 @@ function server() {
 }
 const transport = (s, extra = {}) => createIpcEncodedTransport('ipc://persistent', {connect: s.connect, ...extra});
 const call = (t, name = 'manager') => t.call(name, CONTRACT, 'ping', new Uint8Array());
+
+test('handwritten IPC16 unary OPEN and CALL_END bytes match both wire directions', async () => {
+  const s = server(), t = transport(s);
+  s.responseData = Buffer.from([42]);
+  try {
+    assert.deepEqual(Buffer.from(await call(t)), Buffer.from([42]));
+    const openGolden = Buffer.from(
+      'c600000002000000000000000010000001076d616e616765720b6d616e616765722d7569640f746573742e70657273697374656e740a50657273697374656e7405302e312e30406161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616140626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262620000', 'hex');
+    const endGolden = Buffer.from('0f00000002000000000000000210000006002a', 'hex');
+    assert.deepEqual(s.businessFrames, [openGolden]);
+    assert.deepEqual(s.replyFrames, [endGolden]);
+  } finally { await t.close(); }
+});
+
+test('concurrent submissions assign shared control and OPEN ids in writer order', async () => {
+  const s = server(), t = transport(s);
+  try {
+    await Promise.all([call(t), call(t), call(t)]);
+    assert.deepEqual(s.controlIds, [1n, 3n, 5n]);
+    assert.deepEqual(s.businessFrames.map(bytes => bytes.readBigUInt64LE(4)), [2n, 4n, 6n]);
+  } finally { await t.close(); }
+});
 
 test('Node IPC connection deadline accepts only positive safe milliseconds', () => {
   const s = server();
@@ -1065,20 +1121,20 @@ test('NACK decoding still rejects malformed error fields', async () => {
 });
 
 test('invalid complete control replies fail lookup and preserve the stream', async () => {
-  for (const corrupt of [
+  for (const [index, corrupt] of [
     (id) => frame(id + 1n, 18, Buffer.from([0x11, 123, 125])),
     (id) => frame(id, 2, Buffer.from([0x11, 123, 125])),
     (id) => frame(id, 18, Buffer.from([0x13, 123, 125])),
     (id) => frame(id, 18, Buffer.from([0x11, 123])),
     (id) => frame(id, 18, Buffer.from([0x11, ...Buffer.from(JSON.stringify({status: 'ready', current: record('manager', {route_revision: 9007199254740992})}))])),
-  ]) {
+  ].entries()) {
     const s = server(), t = transport(s);
     s.corrupt = corrupt;
     await assert.rejects(() => call(t));
     assert.equal(s.calls.length, 0);
-    assert.equal(s.connections[0].closed, 0);
+    assert.equal(s.connections[0].closed, index <= 1 ? 1 : 0);
     await call(t);
-    assert.equal(s.connections.length, 1);
+    assert.equal(s.connections.length, index <= 1 ? 2 : 1);
     await t.close();
   }
 });
@@ -1209,8 +1265,128 @@ test('failed initial acquisition leaves server binding unset until successful ac
 });
 
 const refusalPayload = Buffer.from('C2E1' + JSON.stringify({version: 1, code: 702, name: 'ResourceUnavailable', message: 'reassembly budget exhausted', details: {}}));
-const refusal = (id) => frame(id, 2 | 256, Buffer.concat([Buffer.from([1]), u32(refusalPayload.length), refusalPayload]));
+const refusal = (id, status = 2) => frame(id, 2 | 4096, Buffer.concat([Buffer.from([0x06, status]), refusalPayload]));
 const nextTurn = () => new Promise((resolve) => setImmediate(resolve));
+
+test('NotExecuted keeps canonical facts and Failed with the same code stays a method error', async () => {
+  const s = server(), t = transport(s);
+  const canonical = Buffer.from('C2E1' + JSON.stringify({version: 1, code: 702, name: 'ResourceUnavailable', message: 'route is closed', details: {route: 'manager', reason: 'closed'}}));
+  let status = 2;
+  s.onCall = ({id, feed}) => feed(frame(id, 2 | 4096, Buffer.concat([Buffer.from([0x06, status]), canonical])));
+  try {
+    await assert.rejects(() => call(t), (error) => {
+      assert.equal(error.name, 'C2IpcCallRejectedError');
+      assert.equal(error.transportPhase, 'pre_dispatch');
+      assert.equal(error.retrySafe, true);
+      assert.equal(error.code, 702);
+      assert.equal(error.canonicalName, 'ResourceUnavailable');
+      assert.equal(error.message, 'route is closed');
+      assert.deepEqual(error.details, {route: 'manager', reason: 'closed'});
+      assert.deepEqual(Buffer.from(error.payload), canonical);
+      return true;
+    });
+    status = 1;
+    await assert.rejects(() => call(t), (error) => {
+      assert.equal(error.name, 'C2CrmMethodError');
+      assert.equal(error.transportPhase, undefined);
+      assert.deepEqual(Buffer.from(error.payload), canonical);
+      return true;
+    });
+    assert.equal(s.calls.length, 2, 'one OPEN per application call');
+  } finally { await t.close(); }
+});
+
+test('CALL_END rejects a C2E1 known code with a mismatched name', async () => {
+  const s = server(), t = transport(s);
+  const malformed = Buffer.from('C2E1' + JSON.stringify({version: 1, code: 702, name: 'ResourceNotFound', message: 'wrong name', details: {}}));
+  s.onCall = ({id, feed}) => feed(frame(id, 2 | 4096, Buffer.concat([Buffer.from([0x06, 1]), malformed])));
+  try {
+    await assert.rejects(() => call(t), /C2E1 envelope is invalid/);
+    assert.equal(s.connections[0].closed, 1);
+  } finally { await t.close(); }
+});
+
+test('CALL_END fragments infer fixed piece lengths and release SHM at its new storage offset', async () => {
+  const s = server(), events = []; s.memory = memory(s, events); s.ackShmResponse = true;
+  s.responseData = Buffer.from([43, 44]);
+  const t = transport(s);
+  s.onCall = ({id, feed}) => {
+    const descriptor = Buffer.concat([u16(0), u32(1), u32(0), u32(2), Buffer.from([0]), u64(9007199254740993n)]);
+    feed(Buffer.concat([
+      frame(id, 2 | 4096 | 512 | 8192, Buffer.concat([Buffer.from([0x06, 0]), u64(5), Buffer.from([41, 42])])),
+      frame(id, 2 | 4096 | 512 | 64, Buffer.concat([Buffer.from([0x06]), descriptor])),
+      frame(id, 2 | 4096 | 512, Buffer.from([0x06, 45])),
+    ]));
+  };
+  try {
+    assert.deepEqual(Array.from(await call(t)), [41, 42, 43, 44, 45]);
+    assert.deepEqual(events.filter(([kind]) => kind === 'admit' || kind === 'consume'), [['admit', 9007199254740993n], ['consume', 9007199254740993n]]);
+    assert.deepEqual(s.responseReleases, [9007199254740993n]);
+  } finally { await t.close(); }
+});
+
+test('malformed SHM CALL_END releases its carrier before the connection is retired', async () => {
+  const s = server(), events = []; s.memory = memory(s, events); s.ackShmResponse = true;
+  const t = transport(s);
+  s.onCall = ({id, feed}) => {
+    const descriptor = Buffer.concat([u16(0), u32(1), u32(0), u32(2), Buffer.from([0]), u64(17)]);
+    feed(frame(id, 2 | 4096 | 64 | 1024, Buffer.concat([Buffer.from([0x06, 0]), descriptor])));
+  };
+  try {
+    await assert.rejects(() => call(t), /IPC 16 CALL_END/);
+    assert.deepEqual(events.filter(([kind]) => kind === 'admit' || kind === 'discard'), [['admit', 17n], ['discard', 17n]]);
+    assert.deepEqual(s.responseReleases, [17n]);
+    assert.equal(s.connections[0].closed, 1);
+  } finally { await t.close(); }
+});
+
+test('failed fragment leaves late pieces to the retired id and the next unary succeeds on the same connection', async () => {
+  const s = server(), events = []; s.memory = memory(s, events); s.ackShmResponse = true;
+  const t = transport(s);
+  let feedLate;
+  s.onCall = ({id, feed}) => {
+    feed(Buffer.concat([
+      frame(id, 2 | 4096 | 512 | 8192, Buffer.concat([Buffer.from([0x06, 0]), u64(5), Buffer.from([41, 42])])),
+      frame(id, 2 | 4096 | 512, Buffer.from([0x06, 43])),
+    ]));
+    const descriptor = Buffer.concat([u16(0), u32(1), u32(0), u32(2), Buffer.from([0]), u64(19)]);
+    feedLate = () => feed(Buffer.concat([
+      frame(id, 2 | 4096 | 512 | 64, Buffer.concat([Buffer.from([0x06]), descriptor])),
+      frame(id, 2 | 4096 | 512, Buffer.from([0x06, 46])),
+    ]));
+  };
+  try {
+    await assert.rejects(() => call(t), /invalid fixed piece length/);
+    assert.equal(s.connections[0].closed, 0);
+    feedLate();
+    s.onCall = undefined;
+    assert.deepEqual(Array.from(await call(t)), []);
+    assert.equal(s.connections.length, 1);
+    assert.deepEqual(events.filter(([kind]) => kind === 'admit' || kind === 'discard'), [['admit', 19n], ['discard', 19n]]);
+    assert.deepEqual(s.responseReleases, [19n]);
+  } finally { await t.close(); }
+});
+
+test('local allocation failure reads the IPC16 first-fragment SHM descriptor at its metadata offset', async () => {
+  const s = server(), events = []; s.memory = memory(s, events); s.ackShmResponse = true;
+  const t = transport(s);
+  let feedLate;
+  s.onCall = ({id, feed}) => {
+    const descriptor = Buffer.concat([u16(0), u32(1), u32(0), u32(2), Buffer.from([0]), u64(23)]);
+    s.failLocalPayloadRead = true;
+    feed(frame(id, 2 | 4096 | 512 | 8192 | 64, Buffer.concat([Buffer.from([0x06, 0]), u64(5), descriptor])));
+    feedLate = () => feed(frame(id, 2 | 4096 | 512, Buffer.from([0x06, 44, 45])));
+  };
+  try {
+    await assert.rejects(() => call(t), /local response payload allocation failed/);
+    assert.deepEqual(events.filter(([kind]) => kind === 'admit' || kind === 'discard'), [['admit', 23n], ['discard', 23n]]);
+    assert.deepEqual(s.responseReleases, [23n]);
+    feedLate();
+    s.onCall = undefined;
+    assert.deepEqual(Array.from(await call(t)), []);
+    assert.equal(s.connections.length, 1);
+  } finally { await t.close(); }
+});
 
 test('an early complete success ends chunk upload after a whole frame and keeps the stream', async () => {
   const s = server(), t = transport(s, {requestChunkSize: 2});
@@ -1218,7 +1394,7 @@ test('an early complete success ends chunk upload after a whole frame and keeps 
   s.onCall = ({id, feed}) => {
     if (!replied) {
       replied = true;
-      feed(frame(id, 2 | 256, Buffer.from([0])));
+      feed(frame(id, 2 | 4096, Buffer.from([0x06, 0])));
     }
   };
   try {
@@ -1251,22 +1427,22 @@ for (const failure of ['refusal', 'refusal-with-successful-write', 'wrong-id', '
     const result = t.call('manager', CONTRACT, 'ping', new Uint8Array(8)).catch((error) => error);
     try {
       const error = await result;
-      assert.equal(s.connections[0].closed, failure === 'read-loss' ? 1 : 0);
+      assert.equal(s.connections[0].closed, ['read-loss', 'wrong-id', 'bad-flags'].includes(failure) ? 1 : 0);
       if (failure.startsWith('refusal')) {
-        assert.equal(error.name, 'C2CrmMethodError');
+        assert.equal(error.name, 'C2IpcCallRejectedError');
+        assert.equal(error.transportPhase, 'pre_dispatch');
+        assert.equal(error.retrySafe, true);
         assert.deepEqual(Buffer.from(error.payload), refusalPayload);
       } else {
-        assert.match(error.message, failure === 'wrong-id' ? /did not match/ : failure === 'bad-flags' ? /v2 reply/ : /independent read failure/);
+        assert.match(error.message, failure === 'wrong-id' ? /future request id/ : failure === 'bad-flags' ? /IPC 16 CALL_END/ : /independent read failure/);
       }
       if (failure.startsWith('refusal')) {
         assert.ok(s.calls.length > 0 && s.calls.length < 4, 'a complete service refusal stops later chunks');
-      } else {
-        assert.equal(s.calls.length, failure === 'read-loss' ? 1 : 4, 'completed frames are not replayed');
-      }
+      } else assert.ok(s.calls.length >= 1 && s.calls.length <= 4, 'completed frames are not replayed');
       assert.equal(s.writesAfterClose, 0);
       s.onCall = undefined;
       await call(t); await call(t);
-      assert.equal(s.connections.length, failure === 'read-loss' ? 2 : 1);
+      assert.equal(s.connections.length, ['read-loss', 'wrong-id', 'bad-flags'].includes(failure) ? 2 : 1);
       assert.equal(s.lookups.at(-1).observed_route_uid, 'manager-uid');
     } finally {
       await t.close();
@@ -1275,14 +1451,14 @@ for (const failure of ['refusal', 'refusal-with-successful-write', 'wrong-id', '
   });
 }
 
-test('a refusal after the last chunk skips duplicate older replies on the same stream', async () => {
+test('a duplicate retired whole reply is validated and skipped on the same stream', async () => {
   const s = server(), t = transport(s, {requestChunkSize: 2});
   s.onCall = ({id, flags, feed}) => {
-    if (flags & 1024) feed(Buffer.concat([refusal(id), refusal(id)]));
+    if (s.calls.length === 4) feed(Buffer.concat([refusal(id), refusal(id)]));
   };
   try {
     await assert.rejects(t.call('manager', CONTRACT, 'ping', new Uint8Array(8)), (error) => {
-      assert.equal(error.name, 'C2CrmMethodError');
+      assert.equal(error.name, 'C2IpcCallRejectedError');
       assert.deepEqual(Buffer.from(error.payload), refusalPayload);
       return true;
     });
@@ -1305,7 +1481,7 @@ function memory(s, events = []) {
     consumeResponse(block, dst) { events.push(['consume', block.loanId]); dst.set(s.responseData); releases.push(block.loanId); },
     discardResponse(block) { events.push(['discard', block.loanId]); releases.push(block.loanId); },
     beginWrite(kind) {
-      const prefix = releases.length ? frame(0n, 16, Buffer.concat([Buffer.from([0x17, releases.length]), ...releases.map(u64)])) : Buffer.alloc(0);
+      const prefix = releases.length ? frame(0n, 4096, Buffer.concat([Buffer.from([0x07, releases.length]), ...releases.map(u64)])) : Buffer.alloc(0);
       releases = [];
       return kind === 2 && prefix.length === 0 ? undefined : { prefix, start() {}, complete() {} };
     },
@@ -1315,7 +1491,7 @@ function memory(s, events = []) {
   };
 }
 
-test('IPC15 metadata uses directional flags and no segment list', async () => {
+test('IPC16 metadata uses directional flags and no segment list', async () => {
   const s = server(), t = transport(s);
   await call(t);
   assert.equal(s.clientHandshakes[0].toString('hex'), '000000');
@@ -1337,8 +1513,8 @@ test('request SHM requires the ACK and preserves a full u64 loan ID', async () =
   s.ackShmRequest = true; await t.close();
   const acknowledged = transport(s, {requestShmThreshold: 0});
   await acknowledged.call('manager', CONTRACT, 'ping', new Uint8Array(7));
-  assert.equal(s.callFlags.at(-1), 128 | 64);
-  assert.equal(s.calls.at(-1).subarray(0, 23).toString('hex'), '000001000000000000000700000000ffffffffffffffff');
+  assert.equal(s.callFlags.at(-1), 4096 | 64);
+  assert.equal(s.calls.at(-1).subarray(openStorageOffset(s.calls.at(-1))).toString('hex'), '000001000000000000000700000000ffffffffffffffff');
   assert.deepEqual(events.filter(([event]) => event === 'release'), [['release', 0xffffffffffffffffn]]);
   await acknowledged.close();
 });
@@ -1355,19 +1531,19 @@ test('response copy sends release before the next call and keeps provider memory
   await t.close();
 });
 
-test('SHM replies without the response ACK settle the loan and keep the stream', async () => {
+test('SHM replies without the response ACK are rejected before mapping', async () => {
   const s = server(), events = []; s.memory = memory(s, events); s.shmReply = true; s.responseData = Buffer.from([42]);
   const t = transport(s, {responsePayloadAllocator(size) {
     if (s.shmReply) assert.fail('unacknowledged response allocated');
     const view = new Uint8Array(size); return {payload: view, view};
   }});
   await assert.rejects(() => call(t), /without the acknowledged SHM response capability/);
-  assert.deepEqual(events.filter(([event]) => ['admit', 'discard'].includes(event)), [['admit', 1n], ['discard', 1n]]);
-  assert.deepEqual(s.responseReleases, [1n]);
-  assert.equal(s.connections[0].closed, 0);
+  assert.deepEqual(events.filter(([event]) => ['admit', 'discard'].includes(event)), []);
+  assert.deepEqual(s.responseReleases ?? [], []);
+  assert.equal(s.connections[0].closed, 1);
   s.shmReply = false;
   assert.deepEqual(Array.from(await call(t)), [42]);
-  assert.equal(s.connections.length, 1);
+  assert.equal(s.connections.length, 2);
   await t.close();
 });
 test('provider allocator handles inline and chunked responses on the shared stream', async () => {
@@ -1388,10 +1564,10 @@ for (const dedicated of [false, true]) {
   test(`failed chunked write discards an admitted response once (${dedicated})`, async () => {
     const s = server(), events = []; s.memory = memory(s, events); s.ackShmResponse = true;
     const t = transport(s, {requestChunkSize: 2, responsePayloadAllocator() { assert.fail('failed exchange allocated'); }});
-    s.onCall = ({id, flags, feed}) => {
-      if (!(flags & 1024)) return;
+    s.onCall = ({id, isLast, feed}) => {
+      if (!isLast) return;
       const buddy = Buffer.concat([u16(0), u32(1), u32(0), u32(3), Buffer.from([Number(dedicated)]), u64(0xfffffffffffffff1n)]);
-      feed(frame(id, 2 | 256 | 64, Buffer.concat([buddy, Buffer.from([0])])));
+      feed(frame(id, 2 | 4096 | 64, Buffer.concat([Buffer.from([0x06, 0]), buddy])));
       return new Promise((_, reject) => setImmediate(() => reject(new Error('write acknowledgement lost'))));
     };
     await assert.rejects(() => t.call('manager', CONTRACT, 'ping', new Uint8Array(8)), /write acknowledgement lost/);

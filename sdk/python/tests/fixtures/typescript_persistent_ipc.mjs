@@ -18,7 +18,8 @@ function stateFor(id, command) {
   state = {
     connects: 0, businessWrites: 0, observations: [], loseReply: false,
     chunkWrites: 0, completedChunkWrites: 0, chunkRequests: 0, activeWrites: 0, writesAfterClose: 0, closes: 0,
-    pauseFirstChunk: undefined,
+    pauseFirstChunk: undefined, lostReplyRequestId: undefined,
+    failResponseCopy: false, responseCopyLength: undefined, copyFailureInjected: false,
   };
   const transport = manager.createIpcEncodedTransport(config.address, {
     requestChunkSize: 4096,
@@ -29,7 +30,6 @@ function stateFor(id, command) {
       }
       const connection = await runtime.connect(address, timeoutMs);
       state.connects += 1;
-      let loseBusinessReply = false;
       let closed = false;
       return {
         get deactivated() { return connection.deactivated; },
@@ -38,36 +38,53 @@ function stateFor(id, command) {
           const header = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
           const flags = header.getUint32(12, true);
           if (closed) state.writesAfterClose += 1;
-          if ((flags & (1 << 7)) !== 0) {
+          if ((flags & (1 << 12)) !== 0 && bytes[16] === 0x01
+              && ((flags & (1 << 9)) === 0 || (flags & (1 << 13)) !== 0)) {
             state.businessWrites += 1;
             if ((flags & (1 << 9)) !== 0) {
               state.chunkWrites += 1;
-              if (header.getUint16(16, true) === 0) state.chunkRequests += 1;
+              state.chunkRequests += 1;
             }
-            loseBusinessReply = state.loseReply;
+            if (state.loseReply) state.lostReplyRequestId = header.getBigUint64(4, true);
             state.loseReply = false;
+          } else if ((flags & (1 << 12)) !== 0 && bytes[16] === 0x01 && (flags & (1 << 9)) !== 0) {
+            state.chunkWrites += 1;
           }
           state.activeWrites += 1;
           try {
             await connection.write(bytes);
-            if ((flags & (1 << 7)) !== 0 && (flags & (1 << 9)) !== 0
-                && header.getUint16(16, true) === 0 && state.pauseFirstChunk !== undefined) {
+            if ((flags & (1 << 12)) !== 0 && (flags & (1 << 9)) !== 0
+                && (flags & (1 << 13)) !== 0 && state.pauseFirstChunk !== undefined) {
               state.pauseFirstChunk.written();
               await state.pauseFirstChunk.resume;
               state.pauseFirstChunk = undefined;
             }
-            if ((flags & (1 << 7)) !== 0 && (flags & (1 << 9)) !== 0) state.completedChunkWrites += 1;
+            if ((flags & (1 << 12)) !== 0 && (flags & (1 << 9)) !== 0) state.completedChunkWrites += 1;
           } finally {
             state.activeWrites -= 1;
           }
         },
         async readExactly(size) {
           const bytes = await connection.readExactly(size);
-          // Read the real business response header first: the callback has
-          // executed, but this client observes a lost reply and must not replay.
-          if (loseBusinessReply) {
-            loseBusinessReply = false;
-            throw new Error('injected loss after actual business reply header');
+          if (state.responseCopyLength !== undefined && size === state.responseCopyLength) {
+            state.responseCopyLength = undefined;
+            state.copyFailureInjected = true;
+            throw Object.assign(new Error('injected local response copy allocation failure'), {
+              c2LocalAllocationFailure: true,
+            });
+          }
+          if (size === 16) {
+            const header = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+            const flags = header.getUint32(12, true);
+            const requestId = header.getBigUint64(4, true);
+            if (flags === ((1 << 12) | (1 << 1)) && requestId === state.lostReplyRequestId) {
+              state.lostReplyRequestId = undefined;
+              throw new Error('injected loss after actual business reply header');
+            }
+            if (state.failResponseCopy && flags === ((1 << 12) | (1 << 1)) && requestId > 0n) {
+              state.failResponseCopy = false;
+              state.responseCopyLength = header.getUint32(0, true) - 12;
+            }
           }
           return bytes;
         },
@@ -133,31 +150,15 @@ try {
         try {
           await dispatched;
         } catch (caught) {
-          // A complete service refusal still belongs to the dispatched call.
+          // Python input decoding runs after the resource execution boundary.
           assert.equal(caught.name, 'C2CrmMethodError');
         }
         await closing;
         assert.equal(state.writesAfterClose, 0);
       } else if (command.op === 'copyFail') {
-        const original = globalThis.Uint8Array;
-        let injected = false;
-        globalThis.Uint8Array = new Proxy(original, {
-          construct(target, argumentsList, newTarget) {
-            if (!injected && state.businessWrites > 0 && Number.isInteger(argumentsList[0])
-                && argumentsList[0] > 0 && argumentsList[0] !== 16
-                && new Error().stack?.includes('NodeIpcConnection.take')) {
-              injected = true;
-              throw new Error('injected Node local response copy allocation failure');
-            }
-            return Reflect.construct(target, argumentsList, newTarget);
-          },
-        });
-        try {
-          await assert.rejects(state.clients.manager.method_0_ping(), /local response payload allocation failed/);
-          assert.equal(injected, true, 'Node take() local allocation failure was not reached');
-        } finally {
-          globalThis.Uint8Array = original;
-        }
+        state.failResponseCopy = true;
+        await assert.rejects(state.clients.manager.method_0_ping(), /local response payload allocation failed/);
+        assert.equal(state.copyFailureInjected, true, 'a complete IPC 16 CALL_END body was consumed');
       } else {
         assert.equal(command.op, 'call');
         state.loseReply = command.uncertain === true;

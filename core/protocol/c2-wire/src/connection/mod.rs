@@ -4,6 +4,8 @@
 //! returns control bytes and allocation-reclamation actions; it performs no
 //! transport I/O and invokes the injected notification only outside its lock.
 
+pub mod calls;
+
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -104,6 +106,7 @@ struct State {
     releases: VecDeque<u64>,
     inflight_releases: usize,
     pending_controls: usize,
+    pending_records: usize,
     writer: WriterState,
 }
 
@@ -269,6 +272,19 @@ impl ConnectionCore {
         })
     }
 
+    /// Retain one already admitted call record through deactivation and flush.
+    pub fn prepare_call_record(&self) -> Result<CallRecordFrame, ConnectionError> {
+        let mut state = self.shared.state.lock();
+        check_writable(&state)?;
+        if !state.handshake_done {
+            return Err(ConnectionError::BeforeHandshake);
+        }
+        state.pending_records += 1;
+        Ok(CallRecordFrame {
+            shared: self.shared.clone(),
+        })
+    }
+
     /// Reserve the unique writer for queued releases and at most one supplied
     /// frame (one chunk or one control frame). Frame bytes and budget guards
     /// stay with the driver. Business writes require a live completed handshake;
@@ -278,12 +294,17 @@ impl ConnectionCore {
         &self,
         request: WriteRequest,
     ) -> Result<Option<WriteBatch>, ConnectionError> {
-        let (loans, control, business) = match request {
-            WriteRequest::Business(loans) => (loans, None, true),
-            WriteRequest::Control(control) => (Vec::new(), Some(control), false),
-            WriteRequest::Releases => (Vec::new(), None, false),
+        let (loans, control, record, business) = match request {
+            WriteRequest::Business(loans) => (loans, None, None, true),
+            WriteRequest::Control(control) => (Vec::new(), Some(control), None, false),
+            WriteRequest::CallEnd { frame, loans } => {
+                let publication = !loans.is_empty();
+                (loans, None, Some(frame), publication)
+            }
+            WriteRequest::CallContinuation(frame) => (Vec::new(), None, Some(frame), false),
+            WriteRequest::Releases => (Vec::new(), None, None, false),
         };
-        let has_frame = business || control.is_some();
+        let has_frame = business || control.is_some() || record.is_some();
         let result = (|| {
             let mut state = self.shared.state.lock();
             check_writable(&state)?;
@@ -299,6 +320,9 @@ impl ConnectionCore {
             if control
                 .as_ref()
                 .is_some_and(|control| !Arc::ptr_eq(&control.shared, &self.shared))
+                || record
+                    .as_ref()
+                    .is_some_and(|record| !Arc::ptr_eq(&record.shared, &self.shared))
                 || loans
                     .iter()
                     .any(|loan| !Arc::ptr_eq(&loan.shared, &self.shared))
@@ -342,6 +366,7 @@ impl ConnectionCore {
                 frames_remaining: frames + usize::from(has_frame),
                 business,
                 control,
+                record,
                 attempted: false,
                 finished: false,
             }))
@@ -436,6 +461,7 @@ impl ConnectionCore {
         if state.deactivated
             && matches!(state.writer, WriterState::Idle | WriterState::Broken)
             && state.pending_controls == 0
+            && state.pending_records == 0
             && state.remote_reads == 0
             && state.prepared.is_empty()
             && state.published.is_empty()
@@ -465,6 +491,11 @@ fn check_writable(state: &State) -> Result<(), ConnectionError> {
 pub enum WriteRequest {
     Business(Vec<PreparedLoan>),
     Control(ControlFrame),
+    CallEnd {
+        frame: CallRecordFrame,
+        loans: Vec<PreparedLoan>,
+    },
+    CallContinuation(CallRecordFrame),
     Releases,
 }
 
@@ -477,6 +508,17 @@ pub struct ControlFrame {
 impl Drop for ControlFrame {
     fn drop(&mut self) {
         self.shared.state.lock().pending_controls -= 1;
+        (self.shared.wake)();
+    }
+}
+
+/// A queued CALL_END or continuation, bound to its original connection.
+pub struct CallRecordFrame {
+    shared: Arc<Shared>,
+}
+impl Drop for CallRecordFrame {
+    fn drop(&mut self) {
+        self.shared.state.lock().pending_records -= 1;
         (self.shared.wake)();
     }
 }
@@ -582,6 +624,7 @@ pub struct WriteBatch {
     frames_remaining: usize,
     business: bool,
     control: Option<ControlFrame>,
+    record: Option<CallRecordFrame>,
     attempted: bool,
     finished: bool,
 }
@@ -678,6 +721,7 @@ impl WriteBatch {
         // Failure ends this control submission immediately; retaining the
         // failed batch object must not retain a queued-frame close reservation.
         self.control.take();
+        self.record.take();
         (self.shared.wake)();
     }
 }
