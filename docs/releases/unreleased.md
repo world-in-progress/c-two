@@ -215,3 +215,34 @@ There are no aliases. The old Python keyword, override key and c3 flag are rejec
 ### Validation
 
 The exact candidate `787d4205b5e9a23505c22b8155cf18a5a92dcad2` passed [Source Validation 41857452303](https://github.com/Dsssyc/c-two/actions/runs/41857452303) on every lane: Linux x64 with Python 3.12 and 3.14t, macOS arm64, and Windows x64 and ARM64. The two full runs before it exposed three races in tests, which were fixed in the tests only. Each block was checked on macOS before it was merged, and the findings of independent reviews of the reassembly, budget and chunked-call changes were reproduced and fixed first; the [phase 1 acceptance record](../acceptance/2026-11-04-streaming-phase-1-acceptance.md) has the details.
+
+## IPC 16 call records (breaking)
+
+Calls now travel as IPC 16 call records; the [IPC handshake and call records](../reference/ipc-handshake.md#call-records-version-16) page gives the layout, and section 7 of the [streaming design](../design/2026-11-03-streaming-rpc-design.md) the reasons. SHM 4, C/FFI ABI 7 and relay mesh 7 are unchanged. Server streams are still not available: their records are defined but not yet sent.
+
+### Upgrade together
+
+IPC 16 replaces 15. A version 15 peer and a version 16 endpoint receive a typed version mismatch from each other through the unchanged fixed preamble. Upgrade the Python and Rust SDKs, c3 and generated TypeScript clients on one host together; generated TypeScript clients embed the transport and must be regenerated.
+
+### Behavior
+
+- A call that the server refused before it entered the resource now ends with the status NotExecuted and is reported as pre-dispatch with its canonical code and details. This covers a closed, removed or stale route, a contract or identity mismatch, server capacity and chunked input that timed out. IPC 15 reported these refusals as resource errors, which a relay turned into HTTP 500. Rust reports `IpcError::CallRejected`; Core and Python errors carry `transport_phase=pre_dispatch`; a relay answers with an HTTP status that follows the code and adds `dispatch_phase=pre_dispatch`; generated TypeScript raises `C2IpcCallRejectedError` with `retrySafe` true. C-Two still does not retry or replay the call itself.
+- A resource error no longer carries the phase of a call the resource made: the client removes `transport_phase` and `dispatch_phase` from it, so a Rust resource that returns a nested call's refusal is not reported as not executed.
+- The relay withdraws a route when the upstream resource reports, before execution, that the route is missing, removed or closed or that the contract or identity does not match, as it already did for the same facts at route acquisition. A stale route token withdraws nothing.
+- Each connection's writer assigns a call's request ID when it first writes the call, so calls reach the server in request-ID order.
+- Late chunks of a refused or finished request are discarded by the connection's request-ID high-water mark and never draw another reply, however late they arrive; IPC 15 kept a marker per request and answered a chunk delayed past `chunk_assembler_timeout` with a second error. An incomplete chunked input is refused when the GC sweep finds it timed out, without waiting for another chunk.
+- A client keeps a sent call's record after the caller's deadline until its reply arrives, so a late reply and its SHM loan are settled on the original connection.
+- If a server cannot finish a chunked reply after its first chunk, it deactivates the connection without a second reply; the other calls on that connection finish, and the client reports that call as dispatch-uncertain when the connection ends.
+- A small unary call uses one frame in each direction.
+
+### Removed
+
+| Removed | Instead |
+| --- | --- |
+| IPC 15 business frames: call and reply controls, `FLAG_CALL_V2`, `FLAG_REPLY_V2`, `FLAG_CHUNK_LAST`, indexed chunk headers and the CTRL release frame | IPC 16 call records: OPEN, CALL_END, RELEASE and the server-stream records |
+| Rust Core `c2_wire::control` (`CallControl`, `ReplyControl` and their codecs) and `c2_wire::chunk` headers | `c2_wire::rpc`, which also owns `RouteCallIdentity` and `EncodeError` |
+| Settled-request markers in the chunk registry | The request-ID high-water mark |
+
+### Validation
+
+On macOS with the FastDB sibling, the Rust Core workspace (1732 tests), c3 (81), the Rust SDK (27) and the CI Python gates, including the TypeScript and portable phases and the direct/relay matrix, passed on the integrated tree. An independent review's four findings were reproduced and fixed first. The full-platform CI run on the exact candidate is still to come.

@@ -1,8 +1,8 @@
-# IPC RPC handshake and fixed version preamble
+# IPC RPC handshake, version preamble and call records
 
-This page specifies RPC IPC handshake version 15 and the boundary for future protocol changes. The fixed preamble is unchanged since version 14 (C-Two 0.10.0).
+This page specifies RPC IPC version 16: the fixed version preamble, the handshake and the call records that carry calls. The fixed preamble is unchanged since version 14 (C-Two 0.10.0).
 
-Handshake 14 (C-Two 0.10.x) and the preamble-free handshake 13 (0.9.x) are incompatible. [ADR 0001](../decisions/0001-single-owner-release.md) records what version 15 changed; see the [design plan](../acceptance/2026-10-25-ipc-version-mismatch.md), [0.10.0 release notes](../releases/0.10.0.md), and [acceptance record](../acceptance/2026-10-26-ipc14-version-diagnostics-acceptance.md) for the preamble's implementation background, three-platform gates, mixed-version boundary, and latency evidence.
+Handshake 15 (the single-owner release), 14 (C-Two 0.10.x) and the preamble-free handshake 13 (0.9.x) are incompatible. [ADR 0001](../decisions/0001-single-owner-release.md) records what version 15 changed, and the [streaming design](../design/2026-11-03-streaming-rpc-design.md) (section 7 and [ADR 0003](../decisions/0003-server-streams.md)) what version 16 changed; see the [design plan](../acceptance/2026-10-25-ipc-version-mismatch.md), [0.10.0 release notes](../releases/0.10.0.md), and [acceptance record](../acceptance/2026-10-26-ipc14-version-diagnostics-acceptance.md) for the preamble's implementation background, three-platform gates, mixed-version boundary, and latency evidence.
 
 ## Scope
 
@@ -27,7 +27,41 @@ Each side first reads the fixed 16-byte envelope and checks `total_len=21`, `RID
 
 After the existing OS connection and native identity checks, the client sends only the Hello preamble and waits for a fixed response; it sends no SHM names, route requests, or business data yet. On a version mismatch, the server writes VersionMismatch carrying the server version; on equality, it writes Accepted. Only after receiving Accepted with an equal version does the client send its metadata: only its pool prefix and real directional SHM capability, with no segment list. The server then performs the full validation and produces the identity/route/capability ACK with its own prefix; identity and route fields belong to this server ACK. The one-byte version field in the old metadata is removed; the fixed preamble alone owns the version boundary.
 
-Initial negotiation exclusively reads Hello and metadata in one handshake call stack. Each stage checks RID, direction, and exact flags. It does not return to the ordinary dispatch loop while waiting for metadata and does not add a second persistent state machine. Only after the final metadata ACK is written does the server publish `handshake_done` and `ordinary_protocol`, opening business calls and release frames. Before handshake completion, CALL and ordinary CTRL frames other than independent SIGNAL control terminate the connection with `frame_before_handshake`; a second HANDSHAKE on an established connection terminates it with `duplicate_handshake`. No RPC channel bypasses version negotiation.
+Initial negotiation exclusively reads Hello and metadata in one handshake call stack. Each stage checks RID, direction, and exact flags. It does not return to the ordinary dispatch loop while waiting for metadata and does not add a second persistent state machine. Only after the final metadata ACK is written does the server publish `handshake_done` and `ordinary_protocol`, opening call records. Before handshake completion, call records and ordinary CTRL frames other than independent SIGNAL control terminate the connection with `frame_before_handshake`; a second HANDSHAKE on an established connection terminates it with `duplicate_handshake`. No RPC channel bypasses version negotiation.
+
+## Call records (version 16)
+
+After the handshake, every call travels as call records. A record frame is the existing 16-byte envelope, all little-endian: `total_len` (u32, excluding itself), `request_id` (u64) and `flags` (u32), followed by one record-kind byte and the record body.
+
+| Flag | Value | Meaning |
+| --- | --- | --- |
+| Call record | `0x1000` | Set on every call record; never combined with HANDSHAKE, CTRL or SIGNAL |
+| Response | `0x0002` | Server to client |
+| SHM | `0x0040` | The value in this frame is one 23-byte SHM 4 descriptor |
+| Chunked | `0x0200` | This frame carries one chunk of a value |
+| First chunk | `0x2000` | Only with Chunked: the first chunk, which carries the record metadata and the total length |
+
+Any other bit is rejected; IPC 15 used `0x0400` for its last chunk, and version 16 does not reuse it.
+
+| Kind | Record | Body after the kind byte | Direction and `request_id` |
+| --- | --- | --- | --- |
+| 1 | OPEN | identity, method index (u16), input value | Client to server, non-zero |
+| 2 | ITEM_BEGIN | item length (u64) | Server to client; defined for server streams, not sent yet |
+| 3 | ITEM_DATA | one part of an item | Server to client; defined for server streams, not sent yet |
+| 4 | CREDIT | storage bytes (u64), item demand (u64) | Client to server; defined for server streams, not sent yet |
+| 5 | CANCEL | nothing | Client to server; defined for server streams, not sent yet |
+| 6 | CALL_END | status (u8), result or error | Server to client, non-zero; a server-stream call also carries its count of complete items (u64) after the status |
+| 7 | RELEASE | count (u8, 1 to 64), loan IDs (u64 each) | Both directions, `request_id` 0 |
+
+The identity in OPEN is the seven route and contract fields `route_name`, `route_uid`, `crm_ns`, `crm_name`, `crm_ver`, `abi_hash` and `signature_hash`, each a u8 byte length followed by UTF-8 text, validated as before. OPEN carries no mode and no initial demand: the mode comes from the validated contract, and a server stream starts with demand for one item.
+
+CALL_END has one status: Success (0), Failed (1) or NotExecuted (2). Failed and NotExecuted carry a non-empty inline C2E1 error. NotExecuted means the call never entered the resource: the server sends it only while the call is still being prepared or queued, so a client can report it as pre-dispatch even though OPEN was written. Failed means the resource ran.
+
+A value is sent whole when it fits: inline values run to the end of the frame, and an SHM value is exactly one descriptor. A value too large for one frame is chunked: the first chunk carries the record metadata, the total length (u64) and the first part, which must be shorter than the total; every later chunk carries only the kind byte and its part, and is exactly as long as the first part or the remainder. Chunks carry no index or count. The receive loop assigns each chunk's offset from one running count when it admits the chunk, so copies may finish in any order; the value is complete when every byte has been copied. Small unary calls use one OPEN and one CALL_END frame.
+
+Request IDs are assigned by the connection's single writer when it first commits a call or a control that expects a reply, so OPEN records reach the peer in strictly increasing order; IDs never repeat or wrap, and gaps are allowed. ID 0 is for RELEASE and controls without a reply. The server keeps the largest OPEN ID it has seen, the request-ID high-water mark, and a table of active calls. A new OPEN must exceed the mark. A chunk for an ID at or below the mark that is no longer active is accepted at the frame boundary, its SHM descriptor is released to the original connection, and it is discarded without a new call or another reply; a chunk for an ID above the mark is a protocol error. The client dispatches records by its own table of active calls, so a late reply can never be taken for a later call's response. Loans are settled by RELEASE independently of call outcomes, and a late RELEASE still settles on its original connection.
+
+Protocol errors in well-framed records, such as a repeated OPEN, deactivate the connection: it takes no new calls, and calls already sent finish and reply. If the server cannot send the rest of a chunked CALL_END after its first chunk has been written, it deactivates the connection without sending a second CALL_END; the other calls on the connection still finish, and the client reports the incomplete call as dispatch-uncertain when the connection ends.
 
 ## Malformed records versus VersionMismatch
 
@@ -45,7 +79,7 @@ Unix directory/lease identity, Windows pipe-object ownership, process TokenUser 
 
 ## Public error surface
 
-Python continues to catch only `c_two.error.CoreError`. The class declares `local_protocol_version: int | None` and `peer_protocol_version: int | None`, initialized to `None` on every instance, and adds `category='protocol_version_mismatch'`. Only that category has two values in 1–4294967295; every other error has `None` for both (for example, local 15 and peer 14). The mismatch has `transport_kind='ipc'`, `transport_phase='pre_dispatch'`, and `fallback_eligible=False`; `code`, `name`, `error_bytes`, and all three OS-cause fields are `None`. It adds no CRM semantic error code or business error wire.
+Python continues to catch only `c_two.error.CoreError`. The class declares `local_protocol_version: int | None` and `peer_protocol_version: int | None`, initialized to `None` on every instance, and adds `category='protocol_version_mismatch'`. Only that category has two values in 1–4294967295; every other error has `None` for both (for example, local 16 and peer 15). The mismatch has `transport_kind='ipc'`, `transport_phase='pre_dispatch'`, and `fallback_eligible=False`; `code`, `name`, `error_bytes`, and all three OS-cause fields are `None`. It adds no CRM semantic error code or business error wire.
 
 Rust wire decoding produces only a checked preamble. `c2_ipc::IpcError::ProtocolVersionMismatch { local: u32, peer: u32 }` and Core `Error::ProtocolVersionMismatch { local: u32, peer: u32 }` are the only typed version-mismatch branches; Core normalization maps directly, and the Rust SDK reuses Core Error without a wrapper. Exhaustive matches must include them. Malformed records retain `DecodeError` / `Protocol` classification and the pre-dispatch phase. Generated TypeScript retains `C2IpcTransportError`, adding read-only `category: "protocol_version_mismatch" | null` and nullable `localProtocolVersion` / `peerProtocolVersion`. If local close fails, retain the primary error and version fields and attach the close exception to standard `Error.cause`. `C2IpcConnection` write/readExactly/close and HTTP-only loading are unchanged. See the [error reference](errors.md) for the surrounding error families.
 
@@ -55,7 +89,7 @@ For relay-selected local routes, Core treats a typed version mismatch as termina
 
 ## Compatibility
 
-RPC handshakes before version 14 lack this format. A new endpoint does not parse an old payload, try an old pipe name, or infer a version from EOF or error code 2. Mixed connections with an old endpoint, including 0.9.x and earlier wheels, remain connection/protocol failures; the old wheel can observe only a generic connection failure, without typed projection. Low-level manual handshake callers must use the new sequence, and the old single-frame RPC handshake entry point is not retained. Version 15 keeps the preamble, the frame envelope and CRM hashes. It removes the metadata segment lists and route revisions, gives SHM descriptors a `loan_id`, and adds the release frame (`0x17`); it moves together with SHM 4 and C/FFI ABI 7. A version 14 peer receives a typed VersionMismatch from a version 15 endpoint and the reverse.
+RPC handshakes before version 14 lack this format. A new endpoint does not parse an old payload, try an old pipe name, or infer a version from EOF or error code 2. Mixed connections with an old endpoint, including 0.9.x and earlier wheels, remain connection/protocol failures; the old wheel can observe only a generic connection failure, without typed projection. Low-level manual handshake callers must use the new sequence, and the old single-frame RPC handshake entry point is not retained. Version 15 keeps the preamble, the frame envelope and CRM hashes. It removes the metadata segment lists and route revisions, gives SHM descriptors a `loan_id`, and adds the release frame (`0x17`); it moves together with SHM 4 and C/FFI ABI 7. A version 14 peer receives a typed VersionMismatch from a version 15 endpoint and the reverse. Version 16 keeps the preamble, the 16-byte frame envelope, SHM 4 descriptors and C/FFI ABI 7, and replaces the business frames, their call and reply controls, the chunk headers and the release control frame with the call records below; a version 15 peer and a version 16 endpoint receive a typed VersionMismatch from each other. Generated TypeScript clients embed the transport and must be regenerated.
 
 ## Fixed Windows naming
 

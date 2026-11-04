@@ -19,6 +19,7 @@ See the [unreleased notes](docs/releases/unreleased.md).
 - Breaking: one payload buffer budget per Runtime and relay (`payload_buffer_budget_bytes`, `C2_CALL_PAYLOAD_BUFFER_BUDGET_BYTES`, `--call-payload-buffer-budget-bytes`) replaces the retained-input budget. It also charges HTTP bodies and calls without a deadline, releases input once the transport has copied it, and makes a call wait within its deadline when the budget is short.
 - Breaking: `max_total_chunks` / `C2_IPC_MAX_TOTAL_CHUNKS` is renamed `max_inflight_chunk_frames` / `C2_IPC_MAX_INFLIGHT_CHUNK_FRAMES`.
 - A relay-aware call no longer re-sends after the relay reports a stale route, and chunked IPC calls reserve their route in frame order like unchunked calls.
+- Breaking: IPC 16 call records replace the IPC 15 business frames, so upgrade the SDKs, c3 and generated TypeScript clients together and regenerate the clients. A call the server refused before it entered the resource is now reported as pre-dispatch (NotExecuted) instead of as a resource error.
 
 ### Added
 

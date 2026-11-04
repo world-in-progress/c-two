@@ -78,6 +78,14 @@ _Avoid_: iteration (for the server side), tick
 The single state of one call inside C-Two: its admission, progress, values awaiting delivery, terminal outcome and cleanup.
 _Avoid_: request state, call context
 
+**未执行 / not executed**:
+The call-end status a server sends when it refused a call before the call entered the resource. The client reports such a call as pre-dispatch, so retrying it is safe.
+_Avoid_: rejected (for the status)
+
+**请求号高水位 / request-ID high-water mark**:
+The largest request ID a connection has opened. A later chunk for a smaller ID whose call has ended is discarded without a new call or another reply.
+_Avoid_: tombstone, settled marker
+
 **准入凭证 / admission token**:
 The proof that a call was admitted to a route. Later steps and the cleanup of the same call continue under it while the route drains.
 _Avoid_: lease, permit (for the admission)

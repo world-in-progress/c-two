@@ -211,12 +211,12 @@ Node IPC 每个物理连接只有一个持续 reader，按请求号分派到有�
 
 | 记录 | 本期内容及边界 |
 | --- | --- |
-| OPEN | 完整 RouteCallIdentity、method index、一次输入的存储表示和内容；流的初始需求。mode 从已验证契约取得。 |
+| OPEN | 完整 RouteCallIdentity、method index、一次输入的存储表示和内容。mode 从已验证契约取得，流开始时隐含一条需求，不在线上传。 |
 | ITEM_BEGIN | 流输出的 total_bytes；完整接收方异步预约整条并授予整条，转发方授予真实有限复制窗口。拒绝只生成一次 CALL_END。 |
 | ITEM_DATA | 本条目的 inline 数据或 SHM carrier；位置、已收字节及条目次序由调用记录推导。每方向仅一个未完成条目。 |
 | CREDIT | IPC 接收方对真实预约的授予/返还及下一条需求；连接核心原子更新本流和连接账。HTTP 不传此记录。 |
 | CANCEL | 对现有调用记录提交取消意图，不能表示资源已经结束或副作用未发生。 |
-| CALL_END | 唯一 status、最终完整条目数；unary 同帧带结果。资源执行和清理已结束，必要数据仍按 writer 顺序先交付。 |
+| CALL_END | 唯一 status（Success、Failed、NotExecuted）；服务端流另带最终完整条目数，unary 不带，同帧带结果。资源执行和清理已结束，必要数据仍按 writer 顺序先交付。 |
 | RELEASE | 既有连接级 loan_id 释放，独立于调用终态，仍可迟到。 |
 
 业务 record kind 由 c2-wire 的单一 codec 定义，存储标志只在载荷记录有效，错误沿规范 C2E1。inline/unary 的长度直接来自帧，分片首部声明总长；分片隐含位置只有一份计数。接收边界一次验证组合、长度、连续接收状态及真实预约，内部信任受检对象。Node 的 u64 保持 bigint，到实际 Buffer/TypedArray 分配边界再检查转换；不加整个流累计 4 GiB 上限。
@@ -297,6 +297,7 @@ exact implementation candidate 必须通过 GitHub Actions 的 Linux、macOS、W
 - 块 3：c2-http 连接池里的同一处 `fetch_update`。
 - 块 4：删掉 c2-server 构造时多余的一次响应池预热。
 - 块 5：c2-ipc 判定零借出 ID 改用 c2-wire 的专用错误类型，不再匹配字段名 `"loan id"`；给已接纳调用的回复不再借用 `WriteRequest::Control` 的名字；资源进程在执行前的路由准入拒绝（例如路由过期）要报成派发前失败，现在它经资源错误的路径报成 HTTP 500（`core/transport/c2-server/src/server.rs:3179`、`:3338`）。
+- 块 5b：5a 的代码、注释、生成的 TypeScript 传输与测试名把分片叫作 fragment（`FLAG_FRAGMENTED`、`FLAG_FIRST_FRAGMENT`、`FragmentPosition` 等），术语表定的是 chunk，并明确要求避免 fragment；统一改为 chunk 的说法，线上的位值不变。
 - 块 6：Python `register` 的 `input_lifetime` 写成 `Literal['materialized', 'borrowed']`，与服务端桥的私有别名 `_InputLifetime` 合成一处；服务端桥 `shutdown()` 的 5 秒缺省只在注册失败的回滚路径上用到（`sdk/python/src/c_two/transport/registry.py:529`），统一为 30 秒。建议一并处理：块 3 之后 `call_execution_snapshot()` 的 `max_retained_bytes`、`used_retained_bytes`、`peak_retained_bytes` 描述整份载荷缓冲预算，与 `memory_stats()['payload_buffer']` 重复，名字还是旧的 retained input（`core/foundation/c2-mem/src/retention.rs:416` 的注释承认了这一点）；字节只留在 `memory_stats()`，`call_execution_snapshot()` 只报有限调用的数量，`rejected_reservations` 先核实计的是哪一种拒绝，`registry.py` 里 `call_execution_snapshot` 的 docstring 同改。有限调用的名额在原生任务发布结果、唤醒调用方之后才释放（`core/runtime/c2-core/src/call_execution.rs` 的 `guard.finish(result)` 之后，0.7.1 起如此）：调用方一返回就发下一次调用时，在 `max_outstanding_calls` 用满的情况下可能被误拒，返回后立刻读快照也可能还看到这个名额；CI 上已有两次测试因此偶发失败（0.10.0 的 codegen 消费测试与第一阶段的 shutdown 测试，都只改了测试）。改为传输结束、发布结果之前先释放名额。
 - 块 7：c2-mem-ffi 连接入口的 Rust 文档注释与 C 头文件对身份校验失败状态码的写法统一。Node 的 relay-aware 客户端与 Rust 一致，只发一次业务 POST，遇到过期路由报派发前错误、不再自动重发（现在仍会排除该 relay 后重发，`core/foundation/c2-codegen/assets/typescript_transport.ts:1074`）；FallbackDenied 保留首个 IPC 失败的类型化原因（`:1007`、`:2960` 仍丢失）。
 - 块 8：`LocalEndpointNamespaceRequired` 的消息改为资源一方的本地端点命名空间。relay 现在先取得上游连接的租约、再等 B（`core/transport/c2-http/src/relay/router.rs:1937`、`:1966`），等待期间闲置回收不会收走这条连接；补上 B 等待与闲置驱逐、取消、续连交错的测试，必要时把预约移到租约之前，并在等待之后重新核对路由。
@@ -308,6 +309,8 @@ exact implementation candidate 必须通过 GitHub Actions 的 Linux、macOS、W
 dispatcher 异步读锁不是 B2 才引入的隐患：现有 unary 接收循环已经在 `core/transport/c2-server/src/server.rs:2462`、`:2520` 等它，函数体在 `:3142`。第五节短发布修复同时覆盖现有 unary 和分片；只缩重组池锁不能证明控制持续推进。
 
 维护者确认第一期 Node 只做客户端；现有 Node 只有客户端生成路径（`core/foundation/c2-codegen/src/targets.rs:761`、`:927`）。v2 保留不要求 unary 契约重发，但 Node 内嵌 transport 仍须随 IPC/ABI 更新，这是第六节给出代码证据的独立迁移代价。
+
+块 5a 冻结线上布局时与本节原表有两处不同（2026-11-05 补记）：OPEN 不再带流的初始需求，因为第一期每条流固定从一条需求开始，mode 又来自已验证契约，这个字段能推导出来，unary 还恒为 0；unary 的 CALL_END 不带完整条目数，它对 unary 恒为 0，接收方按活动调用记录里的 mode 选布局。字节布局、标志位与请求号规则见 [IPC 握手与调用记录](../reference/ipc-handshake.md#call-records-version-16)。
 
 ## 十二、维护者的决定
 
