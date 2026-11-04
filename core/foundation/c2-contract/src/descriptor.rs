@@ -20,6 +20,14 @@ pub enum MethodAccess {
     Write,
 }
 
+/// The call shape validated at the descriptor boundary. Unary methods omit
+/// `mode` in JSON; only server streams carry an explicit mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MethodMode {
+    Unary,
+    ServerStream,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BindingDirection {
     Input,
@@ -53,6 +61,7 @@ impl NestedFastDbSpec {
 pub struct ValidatedMethodDescriptor {
     name: String,
     access: MethodAccess,
+    mode: MethodMode,
     input: Option<NestedFastDbSpec>,
     output: Option<NestedFastDbSpec>,
 }
@@ -64,6 +73,10 @@ impl ValidatedMethodDescriptor {
 
     pub fn access(&self) -> MethodAccess {
         self.access
+    }
+
+    pub fn mode(&self) -> MethodMode {
+        self.mode
     }
 
     pub fn input(&self) -> Option<&NestedFastDbSpec> {
@@ -279,7 +292,7 @@ fn parse_method_descriptor(
     ensure_keys(
         object,
         path,
-        &["access", "name", "parameters", "return", "bindings"],
+        &["access", "name", "mode", "parameters", "return", "bindings"],
     )?;
 
     let name_path = format!("{path}.name");
@@ -295,6 +308,20 @@ fn parse_method_descriptor(
         _ => {
             return Err(invalid(access_path, "access must be \"read\" or \"write\""));
         }
+    };
+
+    let mode_path = format!("{path}.mode");
+    let mode = match object.get("mode") {
+        None => MethodMode::Unary,
+        Some(value) => match string_at(value, &mode_path)? {
+            "server_stream" => MethodMode::ServerStream,
+            _ => {
+                return Err(invalid(
+                    mode_path,
+                    "mode must be \"server_stream\"; omit mode for unary methods",
+                ));
+            }
+        },
     };
 
     let parameters_path = format!("{path}.parameters");
@@ -359,9 +386,17 @@ fn parse_method_descriptor(
         _ => {}
     }
 
+    if mode == MethodMode::ServerStream && return_kind != ReturnKind::Payload {
+        return Err(invalid(
+            return_path,
+            "server_stream requires return kind \"payload\" describing one item",
+        ));
+    }
+
     Ok(ValidatedMethodDescriptor {
         name,
         access,
+        mode,
         input,
         output,
     })
@@ -489,28 +524,38 @@ fn derive_contract_fingerprints_value(
 
     let abi_methods = methods
         .iter()
+        .zip(&parsed.methods)
         .enumerate()
-        .map(|(index, method)| {
+        .map(|(index, (method, validated))| {
             let path = format!("$.methods[{index}]");
             let object = object_at(method, &path)?;
-            Ok(serde_json::json!({
+            let mut projection = serde_json::json!({
                 "name": required(object, &path, "name")?.clone(),
                 "bindings": required(object, &path, "bindings")?.clone(),
-            }))
+            });
+            if validated.mode() == MethodMode::ServerStream {
+                projection["mode"] = Value::String("server_stream".to_string());
+            }
+            Ok(projection)
         })
         .collect::<Result<Vec<_>, ContractError>>()?;
     let signature_methods = methods
         .iter()
+        .zip(&parsed.methods)
         .enumerate()
-        .map(|(index, method)| {
+        .map(|(index, (method, validated))| {
             let path = format!("$.methods[{index}]");
             let object = object_at(method, &path)?;
-            Ok(serde_json::json!({
+            let mut projection = serde_json::json!({
                 "name": required(object, &path, "name")?.clone(),
                 "access": required(object, &path, "access")?.clone(),
                 "parameters": required(object, &path, "parameters")?.clone(),
                 "return": required(object, &path, "return")?.clone(),
-            }))
+            });
+            if validated.mode() == MethodMode::ServerStream {
+                projection["mode"] = Value::String("server_stream".to_string());
+            }
+            Ok(projection)
         })
         .collect::<Result<Vec<_>, ContractError>>()?;
 
@@ -524,11 +569,6 @@ fn derive_contract_fingerprints_value(
         "crm": crm,
         "methods": signature_methods,
     });
-
-    // Parsing already validated the complete outer shape. Reading a field from
-    // `parsed` here makes that ordering explicit and prevents this function
-    // from becoming a second, weaker descriptor parser.
-    debug_assert_eq!(parsed.methods.len(), methods.len());
 
     Ok(ContractFingerprints {
         abi_hash: sha256_hex(canonical_json(&abi_projection).as_bytes()),
@@ -683,4 +723,29 @@ pub fn lower_hex(bytes: &[u8]) -> String {
         out.push(HEX[(byte & 0x0f) as usize] as char);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pre_stream_method_key_guard_rejects_server_stream() {
+        // Freeze the method key set used before server streams. The old parser
+        // rejects the new field instead of silently treating the call as unary.
+        let value: Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/server-stream.contract.json"
+        ))
+        .unwrap();
+        let method = value["methods"][1].as_object().unwrap();
+        assert!(matches!(
+            ensure_keys(
+                method,
+                "$.methods[1]",
+                &["access", "name", "parameters", "return", "bindings"],
+            ),
+            Err(ContractError::InvalidDescriptor { path, message })
+                if path == "$.methods[1].mode" && message == "unknown field \"mode\""
+        ));
+    }
 }

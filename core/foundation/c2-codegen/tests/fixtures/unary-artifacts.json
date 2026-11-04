@@ -1,0 +1,359 @@
+[
+  {
+    "artifacts": [
+      {
+        "bytes": 2298,
+        "path": "metadata/composition-manifest.json",
+        "sha256": "7b3e7022042d318ce7cbf1c671794f262a6c1e113206d701805954008c27ce81"
+      },
+      {
+        "bytes": 247,
+        "path": "metadata/contract-release-ref.json",
+        "sha256": "d9aeb20ab2ae9bd86053c7187c3e0ff66e665949ec45fa5449319d5b9689c25f"
+      },
+      {
+        "bytes": 983,
+        "path": "metadata/contract.json",
+        "sha256": "d25a8e308c803acd08df897279827384fc0de97ea1cacd3323554b94c6b560a3"
+      },
+      {
+        "bytes": 15391,
+        "path": "rust/c_two_contract.rs",
+        "sha256": "3256349dac12583ad7796ffb9e1abb69bc7a3e465b4e7b3608481a864bc2682e"
+      },
+      {
+        "bytes": 2840,
+        "path": "rust/payloads/6009a42188e449071b61e30f59753fe6ece7a52c2bdb54d68dd565534c20ec9d/fastdb_payload_6009a42188e449071b61e30f59753fe6ece7a52c2bdb54d68dd565534c20ec9d.rs",
+        "sha256": "9a0d8667ce16ff6ff310e61654f220cc73bc849e49631d16a24d5d5decaf80fc"
+      }
+    ],
+    "fixture": "portable-release",
+    "target": "rust"
+  },
+  {
+    "artifacts": [
+      {
+        "bytes": 2302,
+        "path": "metadata/composition-manifest.json",
+        "sha256": "df4fcf328faff3b72f83af885924f2a3048778d28601a392413c9ca4056828db"
+      },
+      {
+        "bytes": 247,
+        "path": "metadata/contract-release-ref.json",
+        "sha256": "d9aeb20ab2ae9bd86053c7187c3e0ff66e665949ec45fa5449319d5b9689c25f"
+      },
+      {
+        "bytes": 983,
+        "path": "metadata/contract.json",
+        "sha256": "d25a8e308c803acd08df897279827384fc0de97ea1cacd3323554b94c6b560a3"
+      },
+      {
+        "bytes": 5496,
+        "path": "python/c_two_contract.py",
+        "sha256": "38a29d531c93ffb1a9daae9561b8f1e948c3c5f27e540b4e9c82c56b47d0377e"
+      },
+      {
+        "bytes": 2700,
+        "path": "python/payloads/6009a42188e449071b61e30f59753fe6ece7a52c2bdb54d68dd565534c20ec9d/fastdb_payload_6009a42188e449071b61e30f59753fe6ece7a52c2bdb54d68dd565534c20ec9d.py",
+        "sha256": "af35c20c80542403c8754d1a5243feb74c84c862e4f425fd511d8949d20925be"
+      }
+    ],
+    "fixture": "portable-release",
+    "target": "python"
+  },
+  {
+    "artifacts": [
+      {
+        "bytes": 2310,
+        "path": "metadata/composition-manifest.json",
+        "sha256": "638d7f50d6203114eeaa6033acc06e721c4f069415c63d7da780d4adb589a5c8"
+      },
+      {
+        "bytes": 247,
+        "path": "metadata/contract-release-ref.json",
+        "sha256": "d9aeb20ab2ae9bd86053c7187c3e0ff66e665949ec45fa5449319d5b9689c25f"
+      },
+      {
+        "bytes": 983,
+        "path": "metadata/contract.json",
+        "sha256": "d25a8e308c803acd08df897279827384fc0de97ea1cacd3323554b94c6b560a3"
+      },
+      {
+        "bytes": 144439,
+        "path": "typescript/c_two_contract.ts",
+        "sha256": "d03cea0bfff8368ccc6f164ab9a8267c807e672afdf8e6f56149c8577d46f1e9"
+      },
+      {
+        "bytes": 2885,
+        "path": "typescript/payloads/6009a42188e449071b61e30f59753fe6ece7a52c2bdb54d68dd565534c20ec9d/fastdb_payload_6009a42188e449071b61e30f59753fe6ece7a52c2bdb54d68dd565534c20ec9d.ts",
+        "sha256": "61fdc4fd91280521a8bfa2e0350401df3065383eef5140ad88dbbaf03855004e"
+      }
+    ],
+    "fixture": "portable-release",
+    "target": "typescript"
+  },
+  {
+    "artifacts": [
+      {
+        "bytes": 372,
+        "path": "metadata/composition-manifest.json",
+        "sha256": "b172a13a6b483e589f38be534251b5402ac123c3afb1d8d4537bc762c9d13bd7"
+      },
+      {
+        "bytes": 266,
+        "path": "metadata/contract-release-ref.json",
+        "sha256": "c5abd5d6b73ea25bbfb96eac8736aee9b50aa706c9689635dd347406874020ff"
+      },
+      {
+        "bytes": 433,
+        "path": "metadata/contract.json",
+        "sha256": "a1e05b1f83b46bbe1aec46b91e953fdd12daea6067279e3cf3735d919d59987e"
+      },
+      {
+        "bytes": 8502,
+        "path": "rust/c_two_contract.rs",
+        "sha256": "36afd17255af19570570fb1c19b2ba2b95b0a739545995213a2c0066e9e8964a"
+      }
+    ],
+    "fixture": "portable-no-payload",
+    "target": "rust"
+  },
+  {
+    "artifacts": [
+      {
+        "bytes": 374,
+        "path": "metadata/composition-manifest.json",
+        "sha256": "e4830f0ece485709a54854fa0f1fc12668b214e67743a0acb960a9d486c517a8"
+      },
+      {
+        "bytes": 266,
+        "path": "metadata/contract-release-ref.json",
+        "sha256": "c5abd5d6b73ea25bbfb96eac8736aee9b50aa706c9689635dd347406874020ff"
+      },
+      {
+        "bytes": 433,
+        "path": "metadata/contract.json",
+        "sha256": "a1e05b1f83b46bbe1aec46b91e953fdd12daea6067279e3cf3735d919d59987e"
+      },
+      {
+        "bytes": 3338,
+        "path": "python/c_two_contract.py",
+        "sha256": "c82fef3b2ef787cd2311d6a382338ac2dc1e5e4c7c30cf84e34f4fc3b5f60a66"
+      }
+    ],
+    "fixture": "portable-no-payload",
+    "target": "python"
+  },
+  {
+    "artifacts": [
+      {
+        "bytes": 378,
+        "path": "metadata/composition-manifest.json",
+        "sha256": "d3fa4241653fb00eacfe95e7a71d83302abb8b4c876d169baab9ade41d66f042"
+      },
+      {
+        "bytes": 266,
+        "path": "metadata/contract-release-ref.json",
+        "sha256": "c5abd5d6b73ea25bbfb96eac8736aee9b50aa706c9689635dd347406874020ff"
+      },
+      {
+        "bytes": 433,
+        "path": "metadata/contract.json",
+        "sha256": "a1e05b1f83b46bbe1aec46b91e953fdd12daea6067279e3cf3735d919d59987e"
+      },
+      {
+        "bytes": 141228,
+        "path": "typescript/c_two_contract.ts",
+        "sha256": "11c2e08eabafc8a7e3d75600f604da305d1a2f0412e2084df13dc638ec53c242"
+      }
+    ],
+    "fixture": "portable-no-payload",
+    "target": "typescript"
+  },
+  {
+    "artifacts": [
+      {
+        "bytes": 4928,
+        "path": "metadata/composition-manifest.json",
+        "sha256": "23e10b37be66d8b7616e518e9c7f84e77785a00f6ead5065064486a4a1bc364f"
+      },
+      {
+        "bytes": 262,
+        "path": "metadata/contract-release-ref.json",
+        "sha256": "748a4c0eb46703855a3b333d4415aff311a977d27b71d0a98231eb7077ec9f26"
+      },
+      {
+        "bytes": 3260,
+        "path": "metadata/contract.json",
+        "sha256": "0eeab1f5cdc6bac8ae7880794dd1b2c1f8eaac34e8e63c9139d6c40a266ce10c"
+      },
+      {
+        "bytes": 13817,
+        "path": "rust/c_two_contract.rs",
+        "sha256": "868f10e09fa7124e7c7a2dc4f2253638a4be16bf9497887ae2d49a7986cab49a"
+      },
+      {
+        "bytes": 14049,
+        "path": "rust/payloads/95100cd0926d9da453919b68bcee70d3cbfe78a4b3e899d60b04efa96e5745b5/fastdb_payload_95100cd0926d9da453919b68bcee70d3cbfe78a4b3e899d60b04efa96e5745b5.rs",
+        "sha256": "aaf0617b11c1c763f958ac229dd3e69823c1251090efb9178b88325869520a90"
+      }
+    ],
+    "fixture": "portable-record-v1",
+    "target": "rust"
+  },
+  {
+    "artifacts": [
+      {
+        "bytes": 4932,
+        "path": "metadata/composition-manifest.json",
+        "sha256": "026a83ec8dfb20931a2b6359c3ba710c2a1696d247ceb5beef757a22e481783f"
+      },
+      {
+        "bytes": 262,
+        "path": "metadata/contract-release-ref.json",
+        "sha256": "748a4c0eb46703855a3b333d4415aff311a977d27b71d0a98231eb7077ec9f26"
+      },
+      {
+        "bytes": 3260,
+        "path": "metadata/contract.json",
+        "sha256": "0eeab1f5cdc6bac8ae7880794dd1b2c1f8eaac34e8e63c9139d6c40a266ce10c"
+      },
+      {
+        "bytes": 4951,
+        "path": "python/c_two_contract.py",
+        "sha256": "aeee59bfb7c4bf506b3a57eb534d4e19e96828c4397bd33bd5535d9d0d107838"
+      },
+      {
+        "bytes": 12918,
+        "path": "python/payloads/95100cd0926d9da453919b68bcee70d3cbfe78a4b3e899d60b04efa96e5745b5/fastdb_payload_95100cd0926d9da453919b68bcee70d3cbfe78a4b3e899d60b04efa96e5745b5.py",
+        "sha256": "26441e8f466f863c09a25e7088bb15f09eabff2c8298130884002a7d9a768f31"
+      }
+    ],
+    "fixture": "portable-record-v1",
+    "target": "python"
+  },
+  {
+    "artifacts": [
+      {
+        "bytes": 4940,
+        "path": "metadata/composition-manifest.json",
+        "sha256": "41e17adf20e6e397ec10b1b6511f75c30ff3a52de7ff2b4d36b3f704f9b216d3"
+      },
+      {
+        "bytes": 262,
+        "path": "metadata/contract-release-ref.json",
+        "sha256": "748a4c0eb46703855a3b333d4415aff311a977d27b71d0a98231eb7077ec9f26"
+      },
+      {
+        "bytes": 3260,
+        "path": "metadata/contract.json",
+        "sha256": "0eeab1f5cdc6bac8ae7880794dd1b2c1f8eaac34e8e63c9139d6c40a266ce10c"
+      },
+      {
+        "bytes": 143576,
+        "path": "typescript/c_two_contract.ts",
+        "sha256": "ecfde8038add6563fd04dfe2931a4cd553dc54f6fe6ee48dbc3281b9625f8a45"
+      },
+      {
+        "bytes": 14160,
+        "path": "typescript/payloads/95100cd0926d9da453919b68bcee70d3cbfe78a4b3e899d60b04efa96e5745b5/fastdb_payload_95100cd0926d9da453919b68bcee70d3cbfe78a4b3e899d60b04efa96e5745b5.ts",
+        "sha256": "31cc6ae96c1e38b88151f1d343c619d0a63d481fb46db242777f4d9952907d05"
+      }
+    ],
+    "fixture": "portable-record-v1",
+    "target": "typescript"
+  },
+  {
+    "artifacts": [
+      {
+        "bytes": 6368,
+        "path": "metadata/composition-manifest.json",
+        "sha256": "de378698350ed5bf133aaf5b7a97031e92d878c219f012e8cd29c61e6dab1e2b"
+      },
+      {
+        "bytes": 273,
+        "path": "metadata/contract-release-ref.json",
+        "sha256": "1853dda341a01bd9f1d1e382e59b9705412d12b9fb0f5204cd4ea7fd268c0653"
+      },
+      {
+        "bytes": 4423,
+        "path": "metadata/contract.json",
+        "sha256": "a60647161cc12058cc829fdbaa30f999ffad40888ef24172fe3d4dd86bb4c98d"
+      },
+      {
+        "bytes": 13828,
+        "path": "rust/c_two_contract.rs",
+        "sha256": "78cca57c3da1dc89e8af78f16ebbd8f2ae54a56988cee8e93ac8138f209f97c4"
+      },
+      {
+        "bytes": 23176,
+        "path": "rust/payloads/661e2e5fef945b44c4111e72fe4321a9d1659eca7849b170b6996dccc3acd35a/fastdb_payload_661e2e5fef945b44c4111e72fe4321a9d1659eca7849b170b6996dccc3acd35a.rs",
+        "sha256": "55ecb47e9c1353aa0a25596979ae531f254dbf60b40306f2cd45a5a2f62edf4e"
+      }
+    ],
+    "fixture": "portable-object-graph-v1",
+    "target": "rust"
+  },
+  {
+    "artifacts": [
+      {
+        "bytes": 6372,
+        "path": "metadata/composition-manifest.json",
+        "sha256": "04a0986d7b532120a26bd7410c2ada5aff40e5789529ebae11363496a322a120"
+      },
+      {
+        "bytes": 273,
+        "path": "metadata/contract-release-ref.json",
+        "sha256": "1853dda341a01bd9f1d1e382e59b9705412d12b9fb0f5204cd4ea7fd268c0653"
+      },
+      {
+        "bytes": 4423,
+        "path": "metadata/contract.json",
+        "sha256": "a60647161cc12058cc829fdbaa30f999ffad40888ef24172fe3d4dd86bb4c98d"
+      },
+      {
+        "bytes": 4962,
+        "path": "python/c_two_contract.py",
+        "sha256": "9ebbe91a3c5de6ea5a141c499a87325eb050e0bcedff8084a16c8a72a15b7cf5"
+      },
+      {
+        "bytes": 21249,
+        "path": "python/payloads/661e2e5fef945b44c4111e72fe4321a9d1659eca7849b170b6996dccc3acd35a/fastdb_payload_661e2e5fef945b44c4111e72fe4321a9d1659eca7849b170b6996dccc3acd35a.py",
+        "sha256": "da12e3b7ee03e8351ce9f189d5b50f798266ce8cfbd17fb9f47626823f1514cf"
+      }
+    ],
+    "fixture": "portable-object-graph-v1",
+    "target": "python"
+  },
+  {
+    "artifacts": [
+      {
+        "bytes": 6380,
+        "path": "metadata/composition-manifest.json",
+        "sha256": "affec7aea6e2ede8e89f90a2af33aabc8104185e57f1fbdda54729434f75ff97"
+      },
+      {
+        "bytes": 273,
+        "path": "metadata/contract-release-ref.json",
+        "sha256": "1853dda341a01bd9f1d1e382e59b9705412d12b9fb0f5204cd4ea7fd268c0653"
+      },
+      {
+        "bytes": 4423,
+        "path": "metadata/contract.json",
+        "sha256": "a60647161cc12058cc829fdbaa30f999ffad40888ef24172fe3d4dd86bb4c98d"
+      },
+      {
+        "bytes": 143587,
+        "path": "typescript/c_two_contract.ts",
+        "sha256": "9f1beaa08d68607db876348d528a87bc7e7ed431f9527be057155ace3feee26c"
+      },
+      {
+        "bytes": 22705,
+        "path": "typescript/payloads/661e2e5fef945b44c4111e72fe4321a9d1659eca7849b170b6996dccc3acd35a/fastdb_payload_661e2e5fef945b44c4111e72fe4321a9d1659eca7849b170b6996dccc3acd35a.ts",
+        "sha256": "e0f42c3fa0a09b190a26afa3d255af685d54b05667b7596e29c9608b54a3398d"
+      }
+    ],
+    "fixture": "portable-object-graph-v1",
+    "target": "typescript"
+  }
+]

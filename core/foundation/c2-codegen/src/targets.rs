@@ -1,7 +1,7 @@
 use crate::{
     ArtifactKind, ArtifactProvenance, CodegenError, ContractArtifact, ContractCodegenTarget,
 };
-use c2_contract::{MethodAccess, ValidatedContractDescriptor};
+use c2_contract::{MethodAccess, MethodMode, ValidatedContractDescriptor};
 use serde_json::Value;
 use std::collections::BTreeSet;
 
@@ -11,6 +11,7 @@ pub(crate) struct TargetMethod<'a> {
     pub(crate) index: usize,
     pub(crate) name: &'a str,
     pub(crate) access: MethodAccess,
+    pub(crate) mode: MethodMode,
     pub(crate) input_sha256: Option<&'a str>,
     pub(crate) output_sha256: Option<&'a str>,
 }
@@ -20,6 +21,16 @@ pub(crate) fn render_target_artifacts(
     descriptor: &ValidatedContractDescriptor,
     methods: &[TargetMethod<'_>],
 ) -> Result<Vec<ContractArtifact>, CodegenError> {
+    if let Some(method) = methods
+        .iter()
+        .find(|method| method.mode == MethodMode::ServerStream)
+    {
+        return Err(CodegenError::UnsupportedServerStream {
+            target,
+            method_index: method.index,
+            method_name: method.name.to_string(),
+        });
+    }
     let (path, source) = match target {
         ContractCodegenTarget::Rust => ("rust/c_two_contract.rs", render_rust(descriptor, methods)),
         ContractCodegenTarget::Python => (
