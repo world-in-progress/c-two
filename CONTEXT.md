@@ -221,3 +221,9 @@ _Avoid_: 期限
 **超时 / timeout**:
 A configured or caller-passed duration after which something expires, such as `timeout=`, `startup_timeout` or `C2_RELAY_CALL_TIMEOUT`; a bounded operation computes its deadline from it.
 _Avoid_: 期限
+
+### Project
+
+**维护者 / maintainer**:
+The people who decide C-Two's direction; the backlog, designs and ADRs record their decisions and approvals.
+_Avoid_: 用户 and 开发者 for a maintainer (both name the people and applications that use C-Two)

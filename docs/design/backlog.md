@@ -1,27 +1,27 @@
 # 待办
 
-尚未完成的工作与待用户决定的事项都列在这里，细节写在各自的文档里。做完的条目从这里删掉，并在验收或发行记录里注明。顺序由用户定；建议都标明是建议。
+尚未完成的工作与待维护者决定的事项都列在这里，细节写在各自的文档里。做完的条目从这里删掉，并在验收或发行记录里注明。顺序由维护者定；建议都标明是建议。
 
 ## 进行中
 
 - **流式 RPC**（[设计](2026-11-03-streaming-rpc-design.md)于 2026-11-04 批准，[ADR 0003](../decisions/0003-server-streams.md)；执行计划是设计第十节）：第一阶段：块 2 已合入（2026-11-04）；块 1、3 实施中，块 4 等它们合入后开始。
 
-## 接下来（建议的顺序，待用户确认）
+## 接下来（建议的顺序，待维护者确认）
 
 同一块代码里的事合成一批做，免得先做的被后面的批次推翻。
 
-1. **派发后的结果查询与去重**（用户 2026-11-02 认为值得做）：事发那一刻进程内兜不住，结果未知时如实报派发不确定；这一项让调用方事后能查清一个派发不确定的调用是否执行过，或带同一个调用标识安全重试而不重复执行。业界有数据库的事务结果查询（例如 Oracle 的逻辑事务 ID）与 HTTP 幂等键，待一手来源调研。协议批之后先写设计与 ADR：调用标识跨重连与进程的稳定性、服务端结果的保留期限与存储、与有状态调用顺序的关系、与流式 RPC 的交叉。
+1. **派发后的结果查询与去重**（维护者 2026-11-02 认为值得做）：事发那一刻进程内兜不住，结果未知时如实报派发不确定；这一项让调用方事后能查清一个派发不确定的调用是否执行过，或带同一个调用标识安全重试而不重复执行。业界有数据库的事务结果查询（例如 Oracle 的逻辑事务 ID）与 HTTP 幂等键，待一手来源调研。协议批之后先写设计与 ADR：调用标识跨重连与进程的稳定性、服务端结果的保留期限与存储、与有状态调用顺序的关系、与流式 RPC 的交叉。
 2. **按区域的结构调整与重复校验。** 不碰协议，各区先出方案：
    - **Core 与 Python：** E1、E2、E4、E13；C5、C6；G5、G9；R06 回调重入导致自锁的风险。
    - **本地端点：** tmpfiles（D-tmp）先在 Linux 上复现 systemd-tmpfiles 清掉 gate 与 marker 的情形，再实施目录 flock（本机与 Windows 测试机都不是 Linux）；之后 D1、D2、D5、D6、D10 的复查只留在所有权、发布与 unlink 边界；R17 剩下的 gate/context 与目录 pin 的错误分类。顺带：c2-local 的 Drop 在门锁短暂争用后由后台线程完成退役，`managed_drop_after_gate_contention_settles_ownership` 两种终态都接受，要有一个能观察后台重试的点才能确定地守住。
-   - **relay：** F2（删 watch 闸门，轮询降到秒级）、F3、F6；F4、F8、F10；relay-aware 调用没有每次调用的路由回执，`observed_route` 仍是连接时的值；F7 剩下的 `/_admin/unregister` 与注销 202/204/404 的区分，等用户答复。`relay/conn_pool.rs` 为替代 P4 删掉的 `force_connected`，在生产代码里加了只在测试构建生效的连通状态覆盖（`test_assume_connected` 等），看能否改用真实连接，移出生产路径。`c3 relay --upstream` 只在 relay 启动时登记一次：路由那时还没开放就报 "does not export route"，`c3 relay` 直接退出；登记成功之后，上游重启（身份改变）或路由被注销时，relay 会把它撤下，也不会再自己重新接手，只能重启 relay 或手工 `POST /_register` 补上。用户 2026-11-01 要求记入：改为启动后持续重试、路由开放后接手、上游重启后重新接手；待定的是重试的节奏与上限、启动时登记失败是否仍让 `c3 relay` 退出、以及与资源进程经 relay anchor 自行登记同一路由时谁优先。
+   - **relay：** F2（删 watch 闸门，轮询降到秒级）、F3、F6；F4、F8、F10；relay-aware 调用没有每次调用的路由回执，`observed_route` 仍是连接时的值；F7 剩下的 `/_admin/unregister` 与注销 202/204/404 的区分，等维护者答复。`relay/conn_pool.rs` 为替代 P4 删掉的 `force_connected`，在生产代码里加了只在测试构建生效的连通状态覆盖（`test_assume_connected` 等），看能否改用真实连接，移出生产路径。`c3 relay --upstream` 只在 relay 启动时登记一次：路由那时还没开放就报 "does not export route"，`c3 relay` 直接退出；登记成功之后，上游重启（身份改变）或路由被注销时，relay 会把它撤下，也不会再自己重新接手，只能重启 relay 或手工 `POST /_register` 补上。维护者 2026-11-01 要求记入：改为启动后持续重试、路由开放后接手、上游重启后重新接手；待定的是重试的节奏与上限、启动时登记失败是否仍让 `c3 relay` 退出、以及与资源进程经 relay anchor 自行登记同一路由时谁优先。
    - **契约、代码生成与 CLI：** H1、H4、H6、H8（用校验过的构造器加私有字段，取代 C01）、H9；R29 等剩下的 codegen 同次缓存与 typed projection。
 3. **配置收敛**（[接口审查](2026-10-31-api-surface-review.md)第三节）：逐项表定下之后进行。与 B8、H3、H7、H12、C4 交叉，R09、R10 的 EnvCatalog 多次加载一并处理。`chunk_threshold_ratio`（`C2_IPC_CHUNK_THRESHOLD_RATIO`）已证实没有作用：只在 c2-config 里解析与校验，c2-ipc 只在比较两份客户端池配置时用到它，分片判断不读它；连同环境变量、Python 字段与测试一起删除。
-4. **错误类型**（接口审查第四节）：协议批之后。一并：删除从没产生过的错误码 706 `WriteConflict`，连同 Python 的错误类、映射与相关测试（用户 2026-10-31 同意；704 是还在使用的 `RouteStale`，不动）；711 `RouteCatalogCompacted` 在协议批删掉 IPC 路由目录之后也没有生产者了（2026-11-03 核实，只剩注册表、Python 错误类、映射与 `__all__`），建议一并删除；`sdk/python/src/c_two/error.py` 里重复注册错误的 docstring 写成 resource name，改为 route name；R32、R33 等剩下的结构化错误内部序列化、Python 错误常量与孤立的 `wrap_error`。
+4. **错误类型**（接口审查第四节）：协议批之后。一并：删除从没产生过的错误码 706 `WriteConflict`，连同 Python 的错误类、映射与相关测试（维护者 2026-10-31 同意；704 是还在使用的 `RouteStale`，不动）；711 `RouteCatalogCompacted` 在协议批删掉 IPC 路由目录之后也没有生产者了（2026-11-03 核实，只剩注册表、Python 错误类、映射与 `__all__`），建议一并删除；`sdk/python/src/c_two/error.py` 里重复注册错误的 docstring 写成 resource name，改为 route name；R32、R33 等剩下的结构化错误内部序列化、Python 错误常量与孤立的 `wrap_error`。
 5. **TypeScript 与 Node：** R16 剩下的完整 Node→Core 投影迁移；解码不透明的响应 allocator。
 6. **发版工具，方案 B**（[发版敏捷性审查](2026-10-30-release-agility-review.md)第三、四节）：与产品代码无关，可以随时插入。B1 候选重整、B2 删除约 8 千行（`tools/local_rc` 与 `local-endpoint-validation.yml` 仍在）、B3 FastDB 版本只写一处、B5 精简各条线的 gate、B6 修 `PROBE_BUDGET` 的偶发失败。
-7. **路线图上的其余产品能力**（完成标准见[路线图](roadmap.zh-CN.md#产品能力)）：官方不可变的包分发、契约兼容、调用元数据与准入钩子、dry-run、async unary、遥测与背压、可发布的 TypeScript SDK、发现与命名空间治理。顺序待用户定。
-8. **文档里的协作流程用词**（2026-11-04 用户同意）：设计文档里用 Host、Worker、微任务、看板、委派块、任务书指协作流程，约 60 处，分布在 9 份设计文档里；仓库外的读者不知道它们指谁，Host 还与术语表里的 Host 撞名，worker 与执行 worker 撞名。改为不写角色，例如“Host 建议”只写“建议”；冻结的验收记录不改。
+7. **路线图上的其余产品能力**（完成标准见[路线图](roadmap.zh-CN.md#产品能力)）：官方不可变的包分发、契约兼容、调用元数据与准入钩子、dry-run、async unary、遥测与背压、可发布的 TypeScript SDK、发现与命名空间治理。顺序待维护者定。
+8. **文档里的协作流程用词**（2026-11-04 维护者同意）：设计文档里用 Host、Worker、微任务、看板、委派块、任务书指协作流程，约 60 处，分布在 9 份设计文档里；仓库外的读者不知道它们指谁，Host 还与术语表里的 Host 撞名，worker 与执行 worker 撞名。改为不写角色，例如“Host 建议”只写“建议”。指拍板者的“用户”改为“维护者”，约 120 处；“开发者”在这里指 C-Two 的使用者，不用来指维护者。冻结的验收记录不改。
 9. **下一次发版时：** 根 README、SDK README 与 `cli/README.md` 里的版本说明（IPC 14、SHM 3、ABI 6）改为 IPC 15、SHM 4、ABI 7、mesh 7。
 
 各批一并删除只钉源码文本或已删名字的测试（复审第六节）；复审附录里各区未裁决的待议项，实施到对应区域时再定。[瘦身账本](2026-10-13-local-slimming-batches.md)暂缓表与条目边界表里的其余各项仍按账本写明的条件。
@@ -42,9 +42,9 @@
 ## 将来
 
 - **批量只读的无序并发原语。** 给 `@cc.read` 方法提供一次提交多组参数、按完成先后返回结果的客户端原语，让逐元素遍历（例如逐像素读 DEM）的往返互相重叠；文档里同时说明细粒度逐元素调用的代价，推荐批量读或在资源方法里就地计算。来源：协议批的配对基准显示，小调用在 CI runner 上每次约要 0.2–0.4 ms，本批又多了 40–70 μs；写路径快速通道实验只能收回其中约 9%（见[实验记录](../research/2026-11-02-ipc-write-fast-path-experiment.md)）。
-- **多副本一致性**（relay mesh 原先设想的第二、三阶段）：2026-07 的草稿设想过同一资源在多个节点上的副本：路由带版本号，写成功后经 gossip 通知其他副本过期，写之前广播意图做跨节点写锁，读到过期副本时按策略处理，并提供内置的刷新方式与一致性级别。这些从没实现，现在不同节点上的同名路由彼此不知道对方。用户 2026-10-31 认为那套做法不一定是最佳策略，留作蓝图：协议批与流式 RPC 落地之后，或者有下游需要同一资源的多个副本时，再从头讨论设计。原文见上游的[固定版本](https://github.com/world-in-progress/c-two/blob/606b8f13290c15ebff3a04a02e2ac5c6463afa7c/docs/superpowers/specs/2026-07-20-relay-mesh-resource-discovery-design.md)第二、三阶段。
+- **多副本一致性**（relay mesh 原先设想的第二、三阶段）：2026-07 的草稿设想过同一资源在多个节点上的副本：路由带版本号，写成功后经 gossip 通知其他副本过期，写之前广播意图做跨节点写锁，读到过期副本时按策略处理，并提供内置的刷新方式与一致性级别。这些从没实现，现在不同节点上的同名路由彼此不知道对方。维护者 2026-10-31 认为那套做法不一定是最佳策略，留作蓝图：协议批与流式 RPC 落地之后，或者有下游需要同一资源的多个副本时，再从头讨论设计。原文见上游的[固定版本](https://github.com/world-in-progress/c-two/blob/606b8f13290c15ebff3a04a02e2ac5c6463afa7c/docs/superpowers/specs/2026-07-20-relay-mesh-resource-discovery-design.md)第二、三阶段。
 
-## 待用户决定
+## 待维护者决定
 
 - 配置项的逐项表。
 - relay 轮询的间隔（复审建议秒级，不做成配置）。
@@ -62,7 +62,7 @@
 - `tests/repo/test_python_test_runner.py::test_parent_exit_with_live_descendant_is_not_success` 在 2026-11-01 P0 验收的本机全量里失败过一次：期望"进程组仍存活"，实际得到 `[Errno 1] Operation not permitted`，单独重跑通过。进程组退出与发信号之间可能有竞态，碰到运行器时核实。
 - 直接用 pytest 跑 Python 套件时，`test_typescript_persistent_ipc.py` 依赖别的测试先构建好 fastdb4ts；运行顺序不同就会报"尚未构建"。CI 的运行器会预先构建，所以只在本地出现。
 
-## 下游跟进（由用户决定）
+## 下游跟进（由维护者决定）
 
 - **hey-my-buddy：** 导入改到新的子模块，`ConcurrencyMode` 改为字符串。配置收敛之后，它设的 9 个 IPC 覆盖键大多会消失；流式 RPC 的块 4 把其中的 `max_total_chunks` 改名为 `max_inflight_chunk_frames`，不留别名。
 - **toodle 与一个水文模拟后端：** 升级时核对导入；后者用到了 `ConcurrencyMode`，要改为字符串。

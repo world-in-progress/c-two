@@ -12,6 +12,6 @@
 
 依据：[单一属主评估](../design/2026-10-31-single-owner-release-evaluation.md)、[协议批详细设计](../design/2026-11-01-protocol-batch-design.md)、[跨进程释放调研](../research/2026-10-31-cross-process-release-survey.md)、[共享内存借出调研](../research/2026-11-01-shared-memory-lending-survey.md)。
 
-2026-11-02 补记：每条连接经独立写任务写出，使小调用变慢。最终候选 `d646fc12` 的配对基准（四个 CI 平台各五组）里，1 字节调用的中位延迟是本批之前的 1.13–1.28 倍，每次多 40–60 μs；走 buddy 的 64 KiB 基本持平，4 MiB 在 Linux 与 Windows 上快 6%–14%。设计定的小调用门槛因此没有达成，用户接受这一回退。让提交者在写端空闲时直接写的快速通道评估后没有采纳，见[实验记录](../research/2026-11-02-ipc-write-fast-path-experiment.md)。
+2026-11-02 补记：每条连接经独立写任务写出，使小调用变慢。最终候选 `d646fc12` 的配对基准（四个 CI 平台各五组）里，1 字节调用的中位延迟是本批之前的 1.13–1.28 倍，每次多 40–60 μs；走 buddy 的 64 KiB 基本持平，4 MiB 在 Linux 与 Windows 上快 6%–14%。设计定的小调用门槛因此没有达成，维护者接受这一回退。让提交者在写端空闲时直接写的快速通道评估后没有采纳，见[实验记录](../research/2026-11-02-ipc-write-fast-path-experiment.md)。
 
 2026-11-04 补记：流式 RPC 定下的做法见 [ADR 0003](0003-server-streams.md)：收完整值的一方按整条预约，只有边收边转发的一跳用有限窗口；仍不加按连接的借出额度。

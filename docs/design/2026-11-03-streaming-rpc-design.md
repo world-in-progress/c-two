@@ -1,6 +1,6 @@
 # 流式 RPC 设计
 
-状态：已批准（2026-11-04），未实施。用户按推荐裁定第十二节的七项，服务端结束流选 (b)，决定记在 [ADR 0003](../decisions/0003-server-streams.md)；执行计划在第十节，进度只记在[待办](backlog.md)。源码依据为 `645f06631450a5aa71a4d241757e98406c16c410`；源码推论与待运行验证分别标明，不把设计视为已有能力。
+状态：已批准（2026-11-04），未实施。维护者按推荐裁定第十二节的七项，服务端结束流选 (b)，决定记在 [ADR 0003](../decisions/0003-server-streams.md)；执行计划在第十节，进度只记在[待办](backlog.md)。源码依据为 `645f06631450a5aa71a4d241757e98406c16c410`；源码推论与待运行验证分别标明，不把设计视为已有能力。
 
 第一期做服务端流：一次输入、零到多个输出条目；同步生成器由 Rust 按步推进，等需求、额度或 I/O 时不占执行线程，每步结束释放路由许可。async unary 不作前置。unary 与流共用调用记录和传输实现；完整值接收方按整条预约，只有边收边转发的一跳使用有限滚动窗口。直接 IPC、同进程及 relay 的端到端证明完成后，才接受本期能力。
 
@@ -89,7 +89,7 @@ Python finalizer、Rust Drop、Node 最后流句柄回收或 iterator return 都
 
 ### 3.6 服务端结束流与关闭
 
-Runtime shutdown 与路由注销都向本路由开着的流的调用记录提交同一个 CANCEL，复用 CANCEL → 清理 → CallCancelled，不设第二套强杀状态机，也不新增运维取消接口（用户 2026-11-04 选定 (b)）。注销也这样做，是因为它和 shutdown 一样要等路由上的工作排空（`core/transport/c2-server/src/server.rs:1027`、`:1038`）；只对 shutdown 生效的话，开着无限流的路由永远注销不掉。注销这一条由 (b) 推出，用户 2026-11-04 确认。这里作用于 Host 作为资源方的流；Runtime 作为客户端持有的流句柄仍按 3.5 回收或显式关闭。
+Runtime shutdown 与路由注销都向本路由开着的流的调用记录提交同一个 CANCEL，复用 CANCEL → 清理 → CallCancelled，不设第二套强杀状态机，也不新增运维取消接口（维护者 2026-11-04 选定 (b)）。注销也这样做，是因为它和 shutdown 一样要等路由上的工作排空（`core/transport/c2-server/src/server.rs:1027`、`:1038`）；只对 shutdown 生效的话，开着无限流的路由永远注销不掉。注销这一条由 (b) 推出，维护者 2026-11-04 确认。这里作用于 Host 作为资源方的流；Runtime 作为客户端持有的流句柄仍按 3.5 回收或显式关闭。
 
 停在 yield 或等需求、预算的流直接开始清理；正在运行的步照常完成，不再推进下一步。已产出结果和当前步结果先交付，再发送 CallCancelled，错误消息写明起因是 shutdown 还是注销；客户端没有自己取消却收到 CallCancelled，就是服务端结束了流。这改变了现行“shutdown 只停新调用、已派发的调用都跑完”对流的承诺，unary 不受影响；块 6 合入时同步 AGENTS.md、生命周期文档与发行说明。
 
@@ -117,9 +117,9 @@ B 覆盖请求保留、成功/错误响应、HTTP 暂存及流本地副本，长
 
 专项静态核对：当前 `core/Cargo.lock:637` 锁定 hyper 1.8.1。[HTTP/1 写循环](https://github.com/hyperium/hyper/blob/v1.8.1/src/proto/h1/dispatch.rs#L328-L373)先检查 can_buffer_body，不能缓冲就 poll_flush；只有恢复后才 poll_frame。[缓冲实现](https://github.com/hyperium/hyper/blob/v1.8.1/src/proto/h1/io.rs#L575-L581)按已有字节/队列容量判断，默认 flush_pipeline=false（同文件第 67 行）。这证明默认路径有发送缓冲门，未证明“每拉一次 Body 就是客户端已消费一次”：一次 frame 仍可越过软水位，已写入库/OS 的字节还能继续积压。本次只读源码，未运行慢读实验。
 
-推论与代价：经 relay 的生成器可比最终消费者多推进几步，受各跳有限 Body/HTTP/TCP 缓冲及本期一条本地未交付结果限制，不承诺恰好一步。空条目也编码非零长度的条目头，不能绕过字节缓冲。可注入 fetch、外部代理若全量缓冲就会破坏此承诺；支持的连接器/部署路径须验证其有限缓冲行为。该提前执行的副作用边界交用户确认，不能把 TCP 背压当成精确的应用需求确认。逐跳背压事实见流式调研第 8 节。
+推论与代价：经 relay 的生成器可比最终消费者多推进几步，受各跳有限 Body/HTTP/TCP 缓冲及本期一条本地未交付结果限制，不承诺恰好一步。空条目也编码非零长度的条目头，不能绕过字节缓冲。可注入 fetch、外部代理若全量缓冲就会破坏此承诺；支持的连接器/部署路径须验证其有限缓冲行为。该提前执行的副作用边界交维护者确认，不能把 TCP 背压当成精确的应用需求确认。逐跳背压事实见流式调研第 8 节。
 
-## 四、提交用户确认的顺序契约
+## 四、提交维护者确认的顺序契约
 
 1. 同一物理连接的开始顺序，是 OPEN/首片在接收循环完成路由预约的顺序；预约不等待资源、重组复制或执行容量。输入未齐的早到写保留其位置。
 2. 同一路由 exclusive 按预约开始；read_parallel 允许读并行，但后到读不越过已排队写；parallel 可重叠，不保证开始/完成序。不同连接没有“谁先发送”的全局顺序。
@@ -127,7 +127,7 @@ B 覆盖请求保留、成功/错误响应、HTTP 暂存及流本地副本，长
 4. 同流条目按生产顺序交付，片按序写入；未来双向各方向独立，跨方向因果由领域协议定义。额度及交付不等于领域提交回执。
 5. 完成序独立于开始序，每个调用唯一终态；长流不挡其他调用完成，后来的错误不能撤回先前完整条目或确定终态。
 6. 跨路由没有连接级写屏障。应用先等前一调用确定完成，或等 CRM 明确声明“已提交”的条目，再发依赖调用；收到中间结果不表示整条流已完成。
-7. Node IPC 去除 callChain 后，不等待就连续调用会由原来的整次串行变为并发；unary 用户也受影响。依据为 `core/foundation/c2-codegen/assets/typescript_transport.ts:532`。本期选择与 Rust 相同的路由预约契约，不另保一条 unary 串行通道；用户须确认，发行说明必须写明，依赖原行为的应用用 await 表达顺序。
+7. Node IPC 去除 callChain 后，不等待就连续调用会由原来的整次串行变为并发；unary 用户也受影响。依据为 `core/foundation/c2-codegen/assets/typescript_transport.ts:532`。本期选择与 Rust 相同的路由预约契约，不另保一条 unary 串行通道；维护者须确认，发行说明必须写明，依赖原行为的应用用 await 表达顺序。
 
 ## 五、B2 与分片遗留
 
@@ -195,7 +195,7 @@ finally:
 
 Rust/TypeScript 保留 `method_{index}_{name}` 和 hold_ 命名（`core/foundation/c2-codegen/src/targets.rs:1076`）。Rust 客户端调用 `client.method_0_steps(&parameters)?`，得到 `Result<ResponseStream<fastdb::Payload>, c_two::Error>` 的成功值，再逐项处理 Iterator 中的 Result。资源实现生成的 Service trait，方法返回 `Result<Box<dyn Iterator<Item=Result<fastdb::Payload, c_two::Error>> + Send>, c_two::Error>`，工厂用 Box::new 包装独立拥有的领域迭代器；允许捕获领域 Arc，不能借用工厂参数/&self 越过返回。hold_method_0_steps 返回逐项 Held。native 调用记录只在清理步骤中析构资源迭代器，Rust Drop 的流外壳只提交 CANCEL，显式 close 才观察完成。
 
-Node 的 `method_0_steps(input)` 返回实现 AsyncIterable 的 C2ResponseStream；hold_method_0_steps 逐项返回 C2HeldResult。`for await` 提前退出的 return 只提交取消，`await results.close()` 才等实际清理。资源侧本期只有 Python/Rust；Node 尚无 Host 注册桥（`core/foundation/c2-codegen/src/targets.rs:761`、`:927`），不生成不能注册的资源类型。若用户要求 Node 也提供资源，须先扩充 Host callback/清理/注册范围及 Node 资源验收。
+Node 的 `method_0_steps(input)` 返回实现 AsyncIterable 的 C2ResponseStream；hold_method_0_steps 逐项返回 C2HeldResult。`for await` 提前退出的 return 只提交取消，`await results.close()` 才等实际清理。资源侧本期只有 Python/Rust；Node 尚无 Host 注册桥（`core/foundation/c2-codegen/src/targets.rs:761`、`:927`），不生成不能注册的资源类型。若维护者要求 Node 也提供资源，须先扩充 Host callback/清理/注册范围及 Node 资源验收。
 
 Node IPC 每个物理连接只有一个持续 reader，按请求号分派到有界调用记录；native endpoint context 复用 Rust 的额度、借出和终态。传输工厂的原生预算域跨连接、重连共享，不能每建连接重置 B。HTTP 继续 fetch，按响应 Body 增量解码；框架不增加第二套 TypeScript 状态机。
 
@@ -260,7 +260,7 @@ B2 测试暂停一次复制，同时使首片预约、unary、释放和取消推
 
 HTTP 验收须真实慢读而非只看源码：响应远大于 F，relay 的本地复制峰值按窗口/库缓冲增长，不构造完整结果 Vec；whole SHM 的源 backing/借出保留 N 单列，不冒充 F。逐跳记录 Body 拉取、源生成步数和消费者交付数，证明最大提前量及所有缓冲确有边界。未知长度、错误 Body、Content-Length 矛盾、B 临时不足、单条大于 B、源实际结束、bytes 跨 Body 析构均覆盖；默认 pure unary 保持单次 OPEN/CALL_END，无新 CREDIT 往返。
 
-配对基准对照本次源提交的整份 unary、多次 unary 批次及同内容服务端流：首条延迟、逐条 p50/p95/p99、终态延迟、吞吐、CPU、复制及预算/RSS，另测大流与短 unary 混合的尾延迟。负载沿现有代表类，再加 B/F/SHM 边界、空条目、大于窗口条目、FastDB 连续数组/混合字段与 Python-only codec；不以某种通常大小作产品上限。现有 unary 中位延迟、p95 或吞吐若退化超过 5% 且超出噪声，先定位并交用户裁决；更深预取须有测量依据。
+配对基准对照本次源提交的整份 unary、多次 unary 批次及同内容服务端流：首条延迟、逐条 p50/p95/p99、终态延迟、吞吐、CPU、复制及预算/RSS，另测大流与短 unary 混合的尾延迟。负载沿现有代表类，再加 B/F/SHM 边界、空条目、大于窗口条目、FastDB 连续数组/混合字段与 Python-only codec；不以某种通常大小作产品上限。现有 unary 中位延迟、p95 或吞吐若退化超过 5% 且超出噪声，先定位并交维护者裁决；更深预取须有测量依据。
 
 exact implementation candidate 必须通过 GitHub Actions 的 Linux、macOS、Windows x64 及现有 Windows ARM64 原生 gate：Rust core/公开 SDK、Python 全套和现有 Python/Node portable 门禁、代表 relay 与文档检查。保留 3.10/3.14t 的适用矩阵；记录提交、run URL、OS/架构、工具链、配置、二进制 SHA-256 和原始基准。focused green、文档提交或只读审查都不等于跨平台接受。
 
@@ -301,23 +301,23 @@ exact implementation candidate 必须通过 GitHub Actions 的 Linux、macOS、W
 
 ## 十一、与设计要求不一致之处
 
-早期八问要求关闭预算内主动结束流，现行 AGENTS/Runtime 则要求 shutdown 只停新调用。用户选定 (b)：shutdown 与注销让开着的流在步之间结束，当前步照常完成并交付，实际清理之后才报终态；预算超时仍不当作完成，也不强行中断当前步。AGENTS.md 的相应一句随块 6 改写。调研第 7 节的强停先例不足以代替这一产品裁决。
+早期八问要求关闭预算内主动结束流，现行 AGENTS/Runtime 则要求 shutdown 只停新调用。维护者选定 (b)：shutdown 与注销让开着的流在步之间结束，当前步照常完成并交付，实际清理之后才报终态；预算超时仍不当作完成，也不强行中断当前步。AGENTS.md 的相应一句随块 6 改写。调研第 7 节的强停先例不足以代替这一产品裁决。
 
 dispatcher 异步读锁不是 B2 才引入的隐患：现有 unary 接收循环已经在 `core/transport/c2-server/src/server.rs:2462`、`:2520` 等它，函数体在 `:3142`。第五节短发布修复同时覆盖现有 unary 和分片；只缩重组池锁不能证明控制持续推进。
 
-用户确认第一期 Node 只做客户端；现有 Node 只有客户端生成路径（`core/foundation/c2-codegen/src/targets.rs:761`、`:927`）。v2 保留不要求 unary 契约重发，但 Node 内嵌 transport 仍须随 IPC/ABI 更新，这是第六节给出代码证据的独立迁移代价。
+维护者确认第一期 Node 只做客户端；现有 Node 只有客户端生成路径（`core/foundation/c2-codegen/src/targets.rs:761`、`:927`）。v2 保留不要求 unary 契约重发，但 Node 内嵌 transport 仍须随 IPC/ABI 更新，这是第六节给出代码证据的独立迁移代价。
 
-## 十二、用户的决定
+## 十二、维护者的决定
 
-2026-11-04 用户按推荐批准：
+2026-11-04 维护者按推荐批准：
 
 1. 第一期只做服务端流，按步推进；async unary、客户端流与双向流随后；Node 只做客户端。
 2. 第四节的顺序条文，包括 Node 去掉 callChain 后、不等待就连发的 unary 会并发；发行说明写明。
-3. 服务端结束流选 (b)，不新增 `cancel_streams()`：shutdown 与注销让开着的流在步之间结束，见 3.6。注销的部分由 (b) 推出，用户同日确认。
+3. 服务端结束流选 (b)，不新增 `cancel_streams()`：shutdown 与注销让开着的流在步之间结束，见 3.6。注销的部分由 (b) 推出，维护者同日确认。
 4. B 只有一项，缺省 16 GiB，沿原范围并扩到 HTTP 缓冲与流的本地副本；临时不足时等待；调用方的多个 hold 用满 B 时，下一条一直等到释放、截止时间或取消。
 5. relay 靠逐跳的有限缓冲背压，经 relay 的生成器可能多推进几步；以真实慢读测出上限，不承诺成最终消费者的精确确认。
 6. IPC 16、ABI 8，SHM 4、mesh 7 与契约 v2 不变；Node 生成的传输产物要随之重新生成；同进程的流暂不接受有限截止时间。
-7. 现有 unary 的中位延迟、p95 或吞吐退化超过 5% 且超出噪声，先定位再交用户裁决；exact candidate 过第九节的全平台门禁。更深的预取、公开的窗口遥测与持久查询，另有证据后再定。
+7. 现有 unary 的中位延迟、p95 或吞吐退化超过 5% 且超出噪声，先定位再交维护者裁决；exact candidate 过第九节的全平台门禁。更深的预取、公开的窗口遥测与持久查询，另有证据后再定。
 
 另外统一了 `close` 的缺省观察预算（3.5）。新术语已写进 [CONTEXT.md](../../CONTEXT.md)；全文既有 Runtime、Host、hold、借出、租约、停用、对端结束、预算和截止时间沿原义。
 
