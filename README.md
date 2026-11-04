@@ -20,23 +20,31 @@
 
 ## What is C-Two?
 
-C-Two is a resource-oriented RPC runtime for distributed scientific computation. It exposes stateful objects—simulations, spatial indexes and data processors—across processes and machines. Clients use the same method interface for local and remote resources.
+C-Two is an RPC framework for stateful resources, built for distributed scientific computation. It sits between message libraries such as ZeroMQ and service frameworks such as gRPC. Your objects keep their usual form, and C-Two carries calls to them across processes and machines; it also handles what a message library leaves to the application, including the resource's state, concurrent access to it and the outcome of each call. Clients use the same method interface for local and remote resources.
 
-A **CRM contract** declares the callable methods and their namespace/version. A **resource** is a plain class that implements those methods and holds state. A **client** uses `cc.connect(...)` to obtain a typed proxy. A process can host several resources and connect to other resources at the same time.
+A **CRM contract** declares the callable methods and their namespace/version. A **resource** is a plain class that implements those methods and holds state. A **client** uses `cc.connect(...)` to obtain a typed proxy. A process can host several resources and connect to other resources at the same time. The name stands for *CRM to Call* (Core Resource Model to Call): a stateful resource is called from other processes and machines through its CRM.
 
 **C-Two 0.10.1** supports Python 3.10+. Ordinary calls have no Python runtime dependencies; FastDB payloads use `c-two[fastdb]` (`fastdb4py==0.2.4`). IPC handshake 14 reports a version mismatch as a typed error, Unix endpoint namespaces use format 3 with versioned default directories, and Python adds independent `cc.Runtime()` instances and `cc.endpoint.server_credential()`. A failed memory release stays with its owner for retry, or is abandoned conservatively and counted when it can no longer be returned. See the [0.10.0 release notes](docs/releases/0.10.0.md); 0.10.1 keeps `cc.serve()` running when stdout cannot encode its messages ([notes](docs/releases/0.10.1.md)).
 
+## Why stateful RPC is different
+
+A stateless service can hand each request to any instance and keeps its state in an external store. A C-Two call always reaches the same resource object and may change its state. The table compares the two.
+
+| | Stateless RPC services | C-Two resources |
+| --- | --- | --- |
+| Where a call goes | Any instance of the service; state is usually kept in an external store | The same resource object, which keeps the state |
+| Concurrency | Requests are independent of each other | Methods are writes by default and run one at a time on a resource; methods marked `@cc.read` can run in parallel |
+| After a failure | Calls can be configured to be retried or hedged automatically | A call that may already have run is not retried or replayed automatically; Python and Rust errors report whether it may have run |
+| Shutdown | Usually a grace period, after which in-flight requests are cancelled | New calls are refused; calls already sent run to completion and deliver their results |
+| Large data | Each message is encoded whole in memory; large data is usually split by the application | A single call can carry arrays of several gigabytes; on one host they travel through shared memory, with chunking or file spill when needed, and the limits are configurable |
+
 ## Features
 
-- **Local and remote calls:** same-process calls pass Python objects directly; same-host IPC uses Unix domain sockets or Windows Named Pipes; cross-machine calls use HTTP relay. Explicit IPC connections work independently of relay discovery.
+- **Local and remote calls:** same-process calls pass Python objects directly; same-host IPC uses Unix domain sockets or Windows Named Pipes; cross-machine calls go through the HTTP relay. Relay discovery selects a verified local IPC path or an HTTP target, and explicit IPC connections work independently of relay discovery.
 - **State and concurrency:** resources keep their state between calls. `@cc.read` and `@cc.write` declare access semantics, with writes as the default. Native route scheduling enforces concurrency and pending-work limits across local and remote invocation.
-- **Portable contracts and payloads:** `@cc.transfer(...)` binds FastDB `Payload` specifications. Contract tooling validates descriptors and generates Python, Rust and TypeScript bindings; ordinary Python values also support Python-to-Python calls.
-- **Contract-scoped routing:** clients match the route name, CRM identity and contract hashes. Relay discovery selects a verified local IPC path or an HTTP target; `c3` runs the relay and supports relay meshes.
-- **Native memory transport:** IPC uses lazy buddy pools, dedicated shared memory, checked chunk transfer and file spill. Budgets and idle reclamation control memory and file usage for large payloads. See [memory policy](docs/reference/memory-policy.md).
-- **Explicit payload lifetimes:** `cc.hold()` retains a response's local copy, while registration can select borrowed inputs for methods. Holds and borrowed inputs keep only local copies; release invalidates payload owners and checked views before freeing the local copy. See [Python payload usage](docs/reference/python-usage.md).
-- **Connection observations:** `cc.observe.connection_events()` aggregates outgoing and accepted physical IPC connections; one cancellable consumer replaces per-connection blocking waits. Reasons describe transport facts, not proof of process death.
-- **Resource lifecycle management:** Native shutdown drains work, and scoped endpoint maintenance cleans up confirmed exits. See [lifecycle integration](docs/reference/local-endpoint-lifecycle.md).
-- **Shared Rust core:** Python and Rust use the same routing, transport, memory, error and lifecycle mechanisms. The native c3 CLI handles relay, contract tools and endpoint maintenance on Linux, macOS and Windows x64 and ARM64.
+- **Payloads and memory:** `@cc.transfer(...)` binds FastDB `Payload` specifications, and ordinary Python values also work between Python peers. IPC moves large payloads through lazy buddy pools, dedicated shared memory, checked chunk transfer and file spill, within memory budgets. `cc.hold()` retains a response's local copy, and registration can select borrowed inputs; both keep only local copies, and release invalidates payload owners and checked views first. See [memory policy](docs/reference/memory-policy.md) and [Python payload usage](docs/reference/python-usage.md).
+- **Contracts across languages:** contract tooling validates portable descriptors and generates Python, Rust and TypeScript bindings. Clients match the route name, CRM identity and contract hashes. Python and Rust use the same Rust core for routing, transport, memory, errors and lifecycle.
+- **Relay, tools and lifecycle:** the native c3 CLI runs the relay and relay meshes, contract tools and endpoint maintenance on Linux, macOS and Windows x64 and ARM64. `cc.observe.connection_events()` aggregates outgoing and accepted physical IPC connections for one cancellable consumer; its reasons describe transport facts, not proof of process death. Native shutdown drains work, and scoped endpoint maintenance cleans up confirmed exits; see [lifecycle integration](docs/reference/local-endpoint-lifecycle.md).
 
 ## Install
 
@@ -85,7 +93,7 @@ finally:
     cc.shutdown()
 ```
 
-Run with `python counter.py`. This example uses the same-process path; keep `C2_RELAY_ANCHOR_ADDRESS` unset for local registration.
+Run with `python counter.py`. The counter's `value` is kept in the resource between calls. This example uses the same-process path; keep `C2_RELAY_ANCHOR_ADDRESS` unset for local registration.
 
 For another process on the same host, pass the resource process's `cc.server_address()` as the client's `address`; the [IPC example](examples/python/ipc_resource.py) shows this connection. The resource process can also capture `credential = cc.endpoint.server_credential()` after registration and pass it to its controller for later exact cleanup, as described in the [lifecycle guide](docs/reference/local-endpoint-lifecycle.md#exact-cleanup-and-bounded-sweeps).
 
