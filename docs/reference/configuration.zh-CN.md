@@ -116,14 +116,14 @@ C2_RELAY_IDLE_TIMEOUT=60
 | 用途 | 命令行参数 | 环境变量 | 默认值 |
 | --- | --- | --- | --- |
 | HTTP 监听地址 | `--bind` | `C2_RELAY_BIND` | `0.0.0.0:8080` |
-| Relay 标识 | `--relay-id` | `C2_RELAY_ID` | UUID |
+| Relay 标识 | `--relay-id` | `C2_RELAY_ID` | 生成的 `<hostname>_<pid>_<UUID 前 8 位>` |
 | 对外公布地址 | `--advertise-url` | `C2_RELAY_ADVERTISE_URL` | 从 bind 派生 |
 | Mesh seeds | `--seeds` | `C2_RELAY_SEEDS` | 空 |
 | 上游 IPC 空闲断连 | `--idle-timeout` | `C2_RELAY_IDLE_TIMEOUT` | 60 秒，`0` 关闭时间驱逐 |
 | 转发事务数量 | `--call-max-outstanding` | `C2_CALL_MAX_OUTSTANDING` | 1,024 / Relay |
 | 转发保留输入 | `--call-retained-input-budget-bytes` | `C2_CALL_RETAINED_INPUT_BUDGET_BYTES` | 16 GiB / Relay |
 | 系统 HTTP proxy | — | `C2_RELAY_USE_PROXY` | `false` |
-| 反熵交换间隔 | — | `C2_RELAY_ANTI_ENTROPY_INTERVAL` | 60 秒 |
+| 反熵交换间隔 | — | `C2_RELAY_ANTI_ENTROPY_INTERVAL` | 60 秒，`0` 关闭反熵 |
 
 `remote_payload_chunk_size` 是唯一的远程 body 分批策略，由 Rust 从传输策略覆盖值或 `C2_REMOTE_PAYLOAD_CHUNK_SIZE` 解析；默认 1 MiB，允许大于零且不超过 128 MiB。Relay HTTP 将其用于发出的请求 body 及已物化响应 body 的流式发送；`C2_IPC_CHUNK_SIZE` 独立控制 IPC 线格式分片与重组。远程配置值不指定 TCP packet 或 HTTP frame 的边界。
 
@@ -188,7 +188,7 @@ cc.endpoint.set_local_endpoint(root=str(ipc_dir))
 
 服务端 `max_pending_requests` 是所有连接共用的一个信号量，计算等待或使用执行容量的完整远程调用，不随连接数倍增。`max_execution_workers` 单独限制正在执行的远程回调。路由自己的 `max_pending` 和 `max_workers` 也约束同进程调用。机制见[执行准入](runtime-lifecycle.md#execution-admission)。
 
-`cc.shutdown(timeout=...)` 在取得 Python 实例锁后，用一个截止时间约束 Native Host、Core 与 pool 的锁等待和本次关闭观察；Python 实例锁等待不计入该截止时间，已启动的原生收尾不会被等待超时取消；监听关闭、工作排空和 held lease 释放分别报告。完整接入方式见[生命周期指南](local-endpoint-lifecycle.md)。
+`cc.shutdown(timeout=...)` 在取得 Python 实例锁后，用一个截止时间约束 Native Host、Core 与 pool 的锁等待和本次关闭观察；Python 实例锁等待不计入该截止时间，已启动的原生收尾不会被等待超时取消；监听关闭与工作排空是两项独立观察，hold 保留的本地副本由 `cc.observe.memory_stats()` 计数。完整接入方式见[生命周期指南](local-endpoint-lifecycle.md)。
 
 ## 原生配置权威
 
@@ -207,6 +207,6 @@ IPC 覆盖键的校验属于 Rust/原生配置解析。Python `ipc.py` 可以暴
 
 调度配置遵循相同边界。Python 可以暴露 `ConcurrencyConfig` 和 SDK 级枚举，但 Rust 拥有解析后的路由并发 handle，包括 mode、`max_pending`、`max_workers` 和关闭状态。Python 必须把完整的类型化配置传给 Rust，并将原生 handle 作为同进程直调和远程派发共同的事实来源。注册后不得保留第二份 Python 调度状态或隐藏的默认策略。
 
-不要为能够从既有规范设置推导的值增加环境变量。池内存限额应由段大小和段数量推导。
+不要为能够从既有规范设置推导的值增加环境变量。
 
 Runtime 身份、池和事务投影遵循 [Runtime 权威](runtime-lifecycle.md#runtime-authority-and-python-bindings)。

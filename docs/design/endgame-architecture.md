@@ -92,7 +92,7 @@ C-Two 是一个**资源运行时协议**。这里的 runtime Resource 是实现 
 | **TypeScript SDK** | 生成 transport/codec 基础持续演进，完整发布与浏览器边界仍未收敛 | Web/Node 消费同一 CRM contract 与 payload ABI |
 | **Async、streaming、backpressure** | 属于后续 runtime workstream，不能以 chunking 冒充 streaming | 长任务与多语言调用的可取消、有界执行 |
 
-这些能力按 [`docs/roadmap.md`](roadmap.md) 推进；ContractRelease 相关延后边界见 [`contract-release-deferred-capabilities.md`](contract-release-deferred-capabilities.md)。Toodle 可以先消费稳定的 exact release identity，但不得以私有 transport、Python sidecar 或自定义 FastDB parser 填补上游缺口。
+这些能力的完成标准见[路线图](roadmap.zh-CN.md)，顺序记在[待办](backlog.md)；ContractRelease 相关延后边界见 [`contract-release-deferred-capabilities.md`](contract-release-deferred-capabilities.md)。Toodle 可以先消费稳定的 exact release identity，但不得以私有 transport、Python sidecar 或自定义 FastDB parser 填补上游缺口。
 
 ## 3. 计算模型：无状态客户端 · 有状态资源 · 复合服务
 
@@ -440,11 +440,11 @@ Toodle 可以在自己的声明中表达“需要某类 Resource Service/CRM con
 
 ## 10. 演进路线（非日程，仅相对顺序）
 
-本节只表达跨仓库依赖方向；C-Two 的可执行顺序以 [`docs/roadmap.md`](roadmap.md) 为准，Toodle 与 FastDB 分别在自己的仓库维护计划。里程碑按相对依赖而非时间点刻画。
+本节只表达跨仓库依赖方向；C-Two 的执行顺序记在[待办](backlog.md)，Toodle 与 FastDB 分别在自己的仓库维护计划。里程碑按相对依赖而非时间点刻画。
 
 ### Milestone M1 · c-two 自立（当前）
 - canonical `c-two.contract.v2`、exact `ContractReleaseRef`、opaque nested FastDB delegation、artifact composition、contract-scoped route、transport 与 runtime lifecycle 构成稳定地基
-- 后续按 roadmap 补齐 compatibility、call metadata/auth hook、dry-run、async、backpressure 与 streaming，不以私有 SDK 旁路替代
+- 后续补齐路线图上的 compatibility、call metadata/auth hook、dry-run、async、backpressure 与 streaming，不以私有 SDK 旁路替代
 
 ### Milestone M2 · 完整 Rust SDK 与不可变依赖分发
 - 统一 Rust 用户包 `c-two` / `c_two` 已实现，并通过公共 facade、生成代码与可运行示例复用 `c2-core`，详见 [Rust SDK](../../sdk/rust/README.md)。

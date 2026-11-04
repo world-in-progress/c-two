@@ -871,10 +871,10 @@ class Runtime:
         if not blocking:
             return
 
-        # The native lifecycle is the truth: the host can stop
-        # itself when its controller closes, without any signal, so serve()
-        # must also watch the native terminal outcome instead of polling
-        # only for a stop request.
+        # The native lifecycle is the truth: the Host can stop itself,
+        # for example after a direct IPC shutdown request, without any signal,
+        # so serve() must also watch the native terminal outcome instead of
+        # polling only for a stop request.
         while not serve_stop.wait(timeout=0.1):
             if self._native_host_terminated():
                 break

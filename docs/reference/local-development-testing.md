@@ -6,7 +6,7 @@ This guide owns shared macOS/Unix and Windows development test preparation, exec
 
 ## Tools and platform preparation
 
-Use an installed Python 3.12 interpreter, uv, Git and a Rust 1.95 or newer toolchain for the target. Windows builds need an MSVC Developer PowerShell (or the environment from `vcvars64.bat`); macOS builds need the Xcode command-line tools. Repository installer checks also require PowerShell (`pwsh` on macOS/Unix, or Windows PowerShell). The official FastDB SDK preparation script chooses a published host target and checks pinned manifests and archives. An unsupported host target fails with its available-target list.
+Use an installed Python 3.12 interpreter, uv, Git and a Rust 1.95 or newer toolchain for the target. The full Python suite also requires `hey` v0.1.4 on PATH (`go install github.com/rakyll/hey@v0.1.4`). Windows builds need an MSVC Developer PowerShell (or the environment from `vcvars64.bat`); macOS builds need the Xcode command-line tools. Repository installer checks also require PowerShell (`pwsh` on macOS/Unix, or Windows PowerShell). The official FastDB SDK preparation script chooses a published host target and checks pinned manifests and archives. An unsupported host target fails with its available-target list.
 
 The Windows commands below show x64 tools. For ARM64, follow the [native Windows prerequisites](windows-native-usage.md): use ARM64 Python, Rust, MSVC and Node. The x64 Emscripten build tool does not substitute for native ARM64 test consumers.
 

@@ -116,14 +116,14 @@ C2_RELAY_IDLE_TIMEOUT=60
 | Purpose | CLI | Environment | Default |
 | --- | --- | --- | --- |
 | HTTP listener | `--bind` | `C2_RELAY_BIND` | `0.0.0.0:8080` |
-| Relay identity | `--relay-id` | `C2_RELAY_ID` | UUID |
+| Relay identity | `--relay-id` | `C2_RELAY_ID` | Generated `<hostname>_<pid>_<first 8 UUID characters>` |
 | Advertised URL | `--advertise-url` | `C2_RELAY_ADVERTISE_URL` | Derived from bind |
 | Mesh seeds | `--seeds` | `C2_RELAY_SEEDS` | Empty |
 | Upstream IPC idle disconnect | `--idle-timeout` | `C2_RELAY_IDLE_TIMEOUT` | 60 seconds; `0` disables timed eviction |
 | Forwarding transaction count | `--call-max-outstanding` | `C2_CALL_MAX_OUTSTANDING` | 1,024 per relay |
 | Retained forwarding input | `--call-retained-input-budget-bytes` | `C2_CALL_RETAINED_INPUT_BUDGET_BYTES` | 16 GiB per relay |
 | System HTTP proxy | — | `C2_RELAY_USE_PROXY` | `false` |
-| Anti-entropy interval | — | `C2_RELAY_ANTI_ENTROPY_INTERVAL` | 60 seconds |
+| Anti-entropy interval | — | `C2_RELAY_ANTI_ENTROPY_INTERVAL` | 60 seconds; `0` disables anti-entropy |
 
 `remote_payload_chunk_size` is the single remote-body batching policy, resolved by Rust from the typed transport override or `C2_REMOTE_PAYLOAD_CHUNK_SIZE`. It defaults to 1 MiB and accepts positive values up to 128 MiB. Relay HTTP uses it for outbound request bodies and materialized response-body streaming; `C2_IPC_CHUNK_SIZE` independently controls IPC wire chunks and reassembly. The remote value does not specify TCP packets or HTTP frame boundaries.
 
@@ -188,7 +188,7 @@ A zero finite-call count rejects finite calls; a zero byte budget rejects positi
 
 Server `max_pending_requests` uses one semaphore for all connections, counting complete remote calls awaiting or using execution capacity; it is not multiplied by the connection count. `max_execution_workers` caps active remote callbacks separately. The route's own `max_pending` and `max_workers` limits are shared with same-process calls. See [execution admission](runtime-lifecycle.md#execution-admission).
 
-After acquiring the Python instance lock, `cc.shutdown(timeout=...)` uses one deadline for Native Host, Core and pool lock waits and drain observation. The instance-lock wait is outside that deadline; expiry does not cancel an already-started native drain. Listener closure, work drain and held leases are separate observations; see the [lifecycle guide](local-endpoint-lifecycle.md).
+After acquiring the Python instance lock, `cc.shutdown(timeout=...)` uses one deadline for Native Host, Core and pool lock waits and drain observation. The instance-lock wait is outside that deadline; expiry does not cancel an already-started native drain. Listener closure and work drain are separate observations; `cc.observe.memory_stats()` counts the local copies retained by holds. See the [lifecycle guide](local-endpoint-lifecycle.md).
 
 ## Native configuration authority
 
@@ -207,6 +207,6 @@ Do not reintroduce Python-side default validation for IPC or relay internals. SD
 
 Scheduler-related config follows the same boundary. Python may expose `ConcurrencyConfig` and SDK-level enums, but Rust now owns the resolved route concurrency handle, including mode, `max_pending`, `max_workers`, and close state. Python must pass the full typed config into Rust, then treat the native handle as the source of truth for both same-process direct calls and remote dispatch. Do not keep a second Python-owned scheduler state or hidden default policy alive after registration.
 
-Do not add environment variables for values that can be derived from existing canonical settings. Pool memory limits should be derived from segment size and segment count.
+Do not add environment variables for values that can be derived from existing canonical settings.
 
 Runtime identity, pools, and transaction projections follow the [Runtime authority](runtime-lifecycle.md#runtime-authority-and-python-bindings).

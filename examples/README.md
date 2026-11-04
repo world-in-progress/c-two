@@ -83,6 +83,6 @@ uv run python examples/python/relay_resource.py
 uv run python examples/python/relay_client.py
 ```
 
-### Relay Mesh
+### Resource Discovery via Relay
 
-`examples/python/relay_mesh/` is the advanced relay mesh example. Use the single-relay example above as the basic relay smoke test, then move to the mesh example when validating multi-relay route propagation.
+`examples/python/relay_mesh/` demonstrates resource discovery by name through one standalone relay started without seeds.

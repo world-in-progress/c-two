@@ -3,7 +3,7 @@
 Reuses the pure-Python ``GridPython`` contract and ``NestedGrid`` resource from
 ``examples/python/grid/``.
 
-Run (after starting relay.py):
+Run (after starting c3 relay):
     uv run python examples/python/relay_mesh/resource.py
 """
 import sys

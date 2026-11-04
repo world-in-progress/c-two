@@ -1,12 +1,10 @@
-# Relay Mesh Resource Discovery Example
+# Resource Discovery by Name via Relay
 
-Demonstrates C-Two's **relay mesh** for automatic resource discovery.
-Clients connect to CRM resources **by name** — no IPC addresses needed.
+Demonstrates resource discovery by name through one standalone relay started without seeds. Clients connect to CRM resources **by name**, with no IPC addresses needed.
 
-Reuses the `Grid` contract and `NestedGrid` resource from `examples/python/grid/`.
+Reuses the `GridPython` contract and `NestedGrid` resource from `examples/python/grid/`.
 
-This is the advanced multi-relay example. For the basic relay smoke test, use
-`examples/python/relay_resource.py` and `examples/python/relay_client.py`.
+For another relay example, use `examples/python/relay_resource.py` and `examples/python/relay_client.py`.
 
 ## Prerequisites
 
@@ -57,8 +55,7 @@ uv run python examples/python/relay_mesh/client.py
 
 ## What this demonstrates
 
-- **Name-based discovery**: client uses `cc.connect(Grid, name='grid')` without
-  knowing the CRM process's IPC address
+- **Name-based discovery**: client uses `cc.connect(GridPython, name='grid')` without knowing the CRM process's IPC address
 - **Relay registration**: CRM process calls `cc.set_relay_anchor()` so `cc.register()`
   automatically announces the resource to the relay
 - **Transparent transport**: the same CRM contract works identically across

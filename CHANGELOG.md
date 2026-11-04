@@ -10,11 +10,20 @@ See the [unreleased notes](docs/releases/unreleased.md).
 
 ### Changed
 
-- Breaking: the Python `c_two` root and the Rust `c_two` crate root keep only the everyday API. Owner control, endpoint maintenance, diagnostics and contract tooling move to the `owner`, `endpoint`, `observe` and `contract` modules, and several of their names lose redundant prefixes. Snapshot and endpoint results are typed.
+- Breaking: single-owner shared-memory release. IPC handshake 15, SHM 4, C/FFI ABI 7 and relay mesh 7 replace 14, 3, 6 and 6, so upgrade the Python and Rust SDKs, c3 and Node consumers on one host together. Each direction copies a payload and releases its loan right after the copy, so holds and borrowed inputs keep only local copies. Deactivation, eviction and shutdown stop new calls but let dispatched calls finish.
+- Breaking: the Python `c_two` root and the Rust `c_two` crate root keep only the everyday API. Endpoint maintenance, diagnostics and contract tooling move to the `endpoint`, `observe` and `contract` modules, and several of their names lose redundant prefixes. Snapshot and endpoint results are typed.
+- Breaking: direct IPC `shutdown()` returns `'initiated'`, `'absent'` or `'unconfirmed'`; lifecycle snapshots report `finished`, `listener_closed` and `work_drained`; `cc.serve(shutdown_timeout=...)` returns the shutdown outcome.
 - Breaking: Rust `direct_ipc_endpoint`, `ping_direct_ipc` and `shutdown_direct_ipc` take an optional endpoint context and replace the `*_with_context` functions.
+- `cc.connect(timeout=...)` also bounds the OS connection, the namespace gate wait and the handshake.
+- Small IPC calls are slower: a 1-byte call takes about 40–70 µs more. See the [unreleased notes](docs/releases/unreleased.md).
+
+### Added
+
+- `ipc_overrides` keys `write_timeout`, `max_dedicated_segments` and `spill_threshold`, with their `C2_IPC_*` environment variables.
 
 ### Removed
 
+- The owner subsystem ([ADR 0002](docs/decisions/0002-remove-owner-subsystem.md)), the automatic IPC heartbeat and its settings, route revisions, and the ABI 6 request and response pools.
 - `C2_RELAY_ROUTE_MAX_ATTEMPTS`, the sweep and relay owner caps, duplicate lease counters, two shutdown-outcome fields, and dead Rust surface: `FreeResult`, the `SyncClient` preallocation API, IPC route-watch recovery, the relay route event history, configurable contract limits, and never-constructed errors.
 - `cc.Held`, `cc.hold_stats()`, the public `ConcurrencyMode` and `InputLifetime` enums (use string values), and the default namespace and version of `@cc.crm`.
 - Contract inference (`infer_crm_from_resource`, `c3 contract infer`) and the resource bridge (`cc.bridge`, `cc.ResourceBridge`, `register(bridge=...)`).

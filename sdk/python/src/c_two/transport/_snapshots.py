@@ -57,4 +57,4 @@ class CallExecutionSnapshot(CallExecutionCounters):
 class LifecycleSnapshot(TypedDict):
     finished: bool
     listener_closed: bool
-    work_drained: bool
+    work_drained: bool | None
