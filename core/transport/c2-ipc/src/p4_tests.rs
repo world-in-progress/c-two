@@ -1224,8 +1224,14 @@ async fn unnegotiated_shm_reply_is_rejected_before_mapping_or_loan_admission() {
     assert!(
         matches!(error.source_error(), IpcError::ResponseFailure(error) if error.to_string().contains("not negotiated"))
     );
+    // The protocol error ends the connection at once, and its retirement may
+    // already have dropped the peer cache together with any mapping.
     assert_eq!(
-        peer_pool.read().cache.as_ref().unwrap().mapped_segments(),
+        peer_pool
+            .read()
+            .cache
+            .as_ref()
+            .map_or(0, |cache| cache.mapped_segments()),
         0
     );
     assert!(client.close_shared_bounded(WAIT).await);
