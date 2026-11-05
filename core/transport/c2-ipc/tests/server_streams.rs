@@ -11,8 +11,8 @@ use c2_error::ErrorCode;
 use c2_ipc::{ClientIpcConfig, IpcClient, IpcResponseStream, RouteBinding, StreamTerminal};
 use c2_mem::retention::PayloadBufferBudget;
 use c2_server::{
-    ConcurrencyMode, CrmCallback, CrmError, CrmStream, CrmStreamCallback, ResponseMeta,
-    ResponsePool, RouteBuildSpec, SchedulerLimits, Server, ServerIpcConfig,
+    ConcurrencyMode, CrmCallback, CrmError, CrmStream, CrmStreamCallback, CrmStreamItem,
+    ResponseMeta, ResponsePool, RouteBuildSpec, SchedulerLimits, Server, ServerIpcConfig,
 };
 use c2_wire::rpc::CallStatus;
 
@@ -98,7 +98,7 @@ impl CrmStreamCallback for ScriptedCallback {
 }
 
 impl CrmStream for ScriptedStream {
-    fn step(&mut self) -> Result<Option<ResponseMeta>, CrmError> {
+    fn step(&mut self) -> Result<Option<Box<dyn CrmStreamItem>>, CrmError> {
         self.observed.steps.fetch_add(1, Ordering::SeqCst);
         self.observed.step_changed.notify_waiters();
         if let Some(entered) = self.observed.step_entered.lock().unwrap().take() {
@@ -116,7 +116,7 @@ impl CrmStream for ScriptedStream {
         }
         let byte = self.produced as u8;
         self.produced += 1;
-        Ok(Some(ResponseMeta::Inline(vec![byte; self.item_bytes])))
+        Ok(Some(Box::new(vec![byte; self.item_bytes])))
     }
 
     fn finish(self: Box<Self>) -> Result<(), CrmError> {
@@ -588,15 +588,13 @@ async fn item_larger_than_entire_budget_fails_locally_and_keeps_call_until_clean
     wait_for_signal(entered_rx).await;
     assert_eq!(fixture.client.pending_len_for_test(), 1);
     release_tx.send(()).unwrap();
-    let completion_error = stream
+    let terminal = stream
         .completion()
         .await
-        .expect_err("local capacity failure survives CALL_END");
-    assert!(
-        format!("{completion_error:?}").contains("CallCapacityExceeded"),
-        "{completion_error:?}"
-    );
-    assert!(stream.recv().await.unwrap().is_none());
+        .expect("close observes the server cleanup terminal after local capacity failure");
+    assert_eq!(terminal.status, CallStatus::Failed);
+    assert_eq!(terminal.error.unwrap().code, ErrorCode::CallCancelled);
+    assert!(format!("{:?}", stream.recv().await.unwrap_err()).contains("CallCapacityExceeded"));
     assert_eq!(fixture.client.pending_len_for_test(), 0);
     fixture.unary().await;
     fixture.stop().await;

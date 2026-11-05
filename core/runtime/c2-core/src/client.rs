@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::error::Error as _;
 use std::fmt;
 use std::io::ErrorKind;
@@ -9,6 +10,7 @@ use c2_http::client::HttpCallControl;
 use c2_ipc::IpcCallControl;
 
 use crate::call_execution::{PreparingCall, guard_error, scope_error};
+use crate::client_stream::CoreResponseStream;
 use crate::{CallScope, CallScopeError, CallState};
 
 use c2_contract::{ExpectedRouteContract, validate_expected_route_contract};
@@ -186,6 +188,37 @@ impl Client {
             preparing,
             inner: self.inner.clone(),
             method: method.to_string(),
+            stream: false,
+        })
+    }
+
+    /// Establish one server-stream call before input encoding. Stream calls
+    /// have no inherited HTTP unary timeout and every stream reserves a call
+    /// slot, including calls with an unlimited deadline.
+    #[doc(hidden)]
+    pub fn begin_stream(&self, method: &str) -> Result<PreparedCall, Error> {
+        if matches!(&self.inner.transport, ClientInner::Http(..)) {
+            return Err(c2_error::C2Error::new(
+                c2_error::ErrorCode::UnsupportedCallMode,
+                "server streams over HTTP relay are not supported",
+            )
+            .with_details(BTreeMap::from([(
+                "transport_phase".into(),
+                "pre_dispatch".into(),
+            )]))
+            .into());
+        }
+        let scope = CallScope::new(self.options, None).map_err(scope_error)?;
+        let preparing = self
+            .inner
+            .runtime
+            .call_execution_context()?
+            .prepare_stream_scope(scope)?;
+        Ok(PreparedCall {
+            preparing,
+            inner: self.inner.clone(),
+            method: method.to_string(),
+            stream: true,
         })
     }
 }
@@ -197,6 +230,7 @@ pub struct PreparedCall {
     preparing: PreparingCall,
     inner: Arc<ClientConnection>,
     method: String,
+    stream: bool,
 }
 
 impl PreparedCall {
@@ -253,12 +287,70 @@ pub struct EncodedCall {
 }
 
 impl EncodedCall {
+    pub fn stream(self) -> Result<CoreResponseStream, Error> {
+        let PreparedCall {
+            mut preparing,
+            inner,
+            method,
+            stream,
+        } = self.prepared;
+        if !stream {
+            return Err(LifecycleError::Configuration(
+                "stream handoff requires begin_stream".into(),
+            )
+            .into());
+        }
+        let scope = preparing.scope_clone();
+        let payload_budget = preparing.payload_budget();
+        let permit = preparing.take_stream_permit();
+        let cancellation = c2_ipc::IpcStreamCancellation::new();
+        let transport_cancellation = cancellation.clone();
+        let response = preparing
+            .execute_stream(
+                self.nbytes,
+                self.materialize,
+                move |input, scope| async move {
+                    match &inner.transport {
+                        ClientInner::Ipc(connection) => {
+                            call_ipc_stream(
+                                connection,
+                                &method,
+                                input,
+                                scope,
+                                payload_budget,
+                                Box::new(permit),
+                                transport_cancellation,
+                            )
+                            .await
+                        }
+                        ClientInner::Http(..) => Err(c2_error::C2Error::new(
+                            c2_error::ErrorCode::UnsupportedCallMode,
+                            "server streams over HTTP relay are not supported",
+                        )
+                        .into()),
+                    }
+                },
+                |stream: &c2_ipc::IpcResponseStream| {
+                    let _ = stream.cancel();
+                },
+                move || cancellation.cancel(),
+            )?
+            .wait()?;
+        Ok(CoreResponseStream::new(response, scope))
+    }
+
     pub fn call_owned(self) -> Result<Vec<u8>, Error> {
         let PreparedCall {
             preparing,
             inner,
             method,
+            stream,
         } = self.prepared;
+        if stream {
+            return Err(
+                LifecycleError::Configuration("unary handoff requires begin_call".into()).into(),
+            );
+        }
         let payload_budget = preparing.payload_budget();
         preparing
             .execute(
@@ -288,7 +380,13 @@ impl EncodedCall {
             preparing,
             inner,
             method,
+            stream,
         } = self.prepared;
+        if stream {
+            return Err(
+                LifecycleError::Configuration("unary handoff requires begin_call".into()).into(),
+            );
+        }
         let payload_budget = preparing.payload_budget();
         preparing
             .execute(
@@ -322,6 +420,33 @@ async fn call_ipc(
     connection
         .client
         .call_bound_owned_controlled_async_phased(&connection.binding, method, input, &control)
+        .await
+        .map_err(normalize_ipc_call_error)
+}
+
+async fn call_ipc_stream(
+    connection: &PooledIpcClient,
+    method: &str,
+    input: BudgetedBuffer,
+    scope: CallScope,
+    payload_budget: PayloadBufferBudget,
+    completion_owner: Box<dyn Send>,
+    cancellation: c2_ipc::IpcStreamCancellation,
+) -> Result<c2_ipc::IpcResponseStream, Error> {
+    let preparation = scope.clone();
+    let control = IpcCallControl::new(move || scope.try_begin_dispatch().map_err(guard_error))
+        .with_before_prepare(move || preparation.check_pre_dispatch().map_err(guard_error));
+    connection
+        .client
+        .stream_bound_owned_controlled_async_phased(
+            &connection.binding,
+            method,
+            input,
+            payload_budget,
+            completion_owner,
+            cancellation,
+            &control,
+        )
         .await
         .map_err(normalize_ipc_call_error)
 }
@@ -676,7 +801,7 @@ fn is_stale_pooled_session_error(error: &c2_ipc::IpcError) -> bool {
     }
 }
 
-fn normalize_ipc_call_error(error: IpcCallError) -> Error {
+pub(crate) fn normalize_ipc_call_error(error: IpcCallError) -> Error {
     let phase = match error.phase() {
         c2_ipc::TransportPhase::PreDispatch => TransportPhase::PreDispatch,
         c2_ipc::TransportPhase::DispatchUncertain => TransportPhase::DispatchUncertain,

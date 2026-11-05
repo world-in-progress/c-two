@@ -28,7 +28,6 @@ static RESPONSE_POOL_GEN: AtomicU64 = AtomicU64::new(0);
 use c2_error::{C2Error, ErrorCode};
 #[cfg(test)]
 use c2_mem::config::PoolConfig;
-use c2_mem::retention::PayloadBufferBudget;
 use c2_mem::{MemPool, MemoryBudget};
 use c2_wire::buddy::BuddyPayload;
 use c2_wire::chunk::{ChunkAdmissionError, ChunkRequest};
@@ -303,7 +302,6 @@ pub struct Server {
     /// server direction, one budget; it owns only accounting counters and is
     /// never reset by shutdown.
     memory_budget: MemoryBudget,
-    stream_payload_budget: PayloadBufferBudget,
     admission: Arc<AdmissionGate>,
     pending_requests: Arc<Semaphore>,
     control_reply_budget: Arc<Semaphore>,
@@ -540,9 +538,6 @@ impl Server {
             chunk_registry,
             response_pool: Arc::new(crate::ResponsePool::new(response_pool)),
             memory_budget,
-            stream_payload_budget: PayloadBufferBudget::new(
-                c2_config::DEFAULT_PAYLOAD_BUFFER_BUDGET_BYTES,
-            ),
             admission,
             pending_requests,
             control_reply_budget,
@@ -1015,9 +1010,10 @@ impl Server {
     pub async fn unregister_route(&self, name: &str) -> bool {
         let route = {
             let _guard = self.route_registration.lock().await;
-            let dispatcher = self.dispatcher.read();
+            let dispatcher = self.dispatcher.write();
             let route = dispatcher.resolve(name);
             if let Some(route) = &route {
+                self.cancel_route_streams(Some(&route.route_uid), StreamCancelCause::Unregister);
                 route.scheduler.close();
             }
             route
@@ -1047,13 +1043,16 @@ impl Server {
     ) -> Vec<ServerRouteCloseOutcome> {
         let routes = {
             let _guard = self.route_registration.lock().await;
-            let dispatcher = self.dispatcher.read();
+            let dispatcher = self.dispatcher.write();
             let mut seen = HashSet::new();
             names
                 .iter()
                 .filter(|name| seen.insert(name.as_str()))
                 .filter_map(|name| dispatcher.resolve(name))
-                .inspect(|route| route.scheduler.close())
+                .inspect(|route| {
+                    self.cancel_route_streams(Some(&route.route_uid), StreamCancelCause::Shutdown);
+                    route.scheduler.close();
+                })
                 .collect::<Vec<_>>()
         };
         let outcomes = Self::wait_routes_drained(routes.clone(), closed_reason).await;
@@ -1733,6 +1732,13 @@ impl Server {
         let mut registration = self.admission.lock();
         registration.begin_drain();
         self.admission.notify.notify_waiters();
+        drop(registration);
+        // Stream publication holds the read side of this same boundary. A
+        // cancellation cannot miss an admitted stream or enter its resource.
+        {
+            let _publication = self.dispatcher.write();
+            self.cancel_route_streams(None, StreamCancelCause::Shutdown);
+        }
         match self.lifecycle_state() {
             ServerLifecycleState::Starting | ServerLifecycleState::Ready => {
                 self.set_lifecycle_state(ServerLifecycleState::Stopping);
@@ -1753,6 +1759,29 @@ impl Server {
                 conn.begin_shutdown();
             }
             self.shutdown_tx.send_replace(true);
+        }
+    }
+
+    fn cancel_route_streams(&self, route_uid: Option<&str>, cause: StreamCancelCause) {
+        let connections = self
+            .active_connections
+            .lock()
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        for conn in connections {
+            let calls = conn.calls.lock().active().collect::<Vec<_>>();
+            for (id, call) in calls {
+                let matches = call
+                    .data
+                    .stream
+                    .lock()
+                    .as_ref()
+                    .is_some_and(|stream| route_uid.is_none_or(|uid| stream.route_uid == uid));
+                if matches {
+                    submit_stream_cancel(&conn, id, &call, cause);
+                }
+            }
         }
     }
 }
@@ -2744,6 +2773,76 @@ pub(crate) struct ServerCall {
     input: CallMutex<Option<ServerInput>>,
     admission: CallMutex<Option<ChunkRouteAdmission>>,
     start_gate: CallMutex<()>,
+    stream: CallMutex<Option<StreamCallControl>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StreamCancelCause {
+    Consumer,
+    Shutdown,
+    Unregister,
+}
+
+impl StreamCancelCause {
+    fn message(self) -> &'static str {
+        match self {
+            Self::Consumer => "server stream cancelled by consumer",
+            Self::Shutdown => "server stream cancelled by Runtime shutdown",
+            Self::Unregister => "server stream cancelled by route unregister",
+        }
+    }
+}
+
+struct StreamCallControl {
+    route_uid: String,
+    cancellation: Option<StreamCancelCause>,
+}
+
+fn submit_stream_cancel(
+    conn: &Connection,
+    id: u64,
+    call: &c2_wire::connection::calls::CallRecord<ServerCall>,
+    cause: StreamCancelCause,
+) {
+    let _start = call.data.start_gate.lock();
+    {
+        let mut stream = call.data.stream.lock();
+        let Some(stream) = stream.as_mut() else {
+            return;
+        };
+        stream.cancellation.get_or_insert(cause);
+    }
+    // Only a consumer's CANCEL discards its pending item. Host lifecycle
+    // cancellation keeps CREDIT live until the current item has been sent.
+    if cause == StreamCancelCause::Consumer {
+        if let Err(error) = conn.core.stream_cancel(id) {
+            warn!(request_id=id, %error, "invalid stream cancel");
+            conn.end(ConnectionEndReason::ProtocolError, "stream_cancel");
+            return;
+        }
+    }
+    let writer = conn
+        .rpc_writer
+        .lock()
+        .as_ref()
+        .and_then(std::sync::Weak::upgrade);
+    if let Some(writer) = writer {
+        if let Some(status) = claim_terminal(&writer, id, CallStatus::NotExecuted) {
+            let error = error_wire(ErrorCode::CallCancelled, cause.message());
+            let frame = rpc::encode_call_end_frame(
+                id,
+                CallMode::ServerStream,
+                status,
+                0,
+                ValuePart::whole(ValueStorage::Inline(&error)),
+            )
+            .expect("canonical cancellation error");
+            if let Err(error) = writer.queue_call_end(frame) {
+                warn!(request_id=id, %error, "failed to queue cancelled CALL_END");
+            }
+        }
+    }
+    conn.writer_wake.notify_waiters();
 }
 struct ServerInput {
     receive: ValueReceive,
@@ -2885,24 +2984,10 @@ async fn handle_rpc_record(
                     conn.end(ConnectionEndReason::ProtocolError, "future_stream_cancel")
                 }
                 CallLookup::Active(call) => {
-                    let _start = call.data.start_gate.lock();
-                    if let Err(error) = conn.core.stream_cancel(id) {
-                        warn!(request_id=id, %error, "invalid stream cancel");
-                        conn.end(ConnectionEndReason::ProtocolError, "stream_cancel");
-                    } else if let Some(status) = claim_terminal(writer, id, CallStatus::NotExecuted)
-                    {
-                        let error = error_wire(ErrorCode::CallCancelled, "server stream cancelled");
-                        let frame = rpc::encode_call_end_frame(
-                            id,
-                            CallMode::Unary,
-                            status,
-                            0,
-                            ValuePart::whole(ValueStorage::Inline(&error)),
-                        )
-                        .expect("canonical cancellation error");
-                        if let Err(error) = writer.queue_call_end(frame) {
-                            warn!(request_id=id, %error, "failed to queue cancelled CALL_END");
-                        }
+                    if call.data.stream.lock().is_none() {
+                        conn.end(ConnectionEndReason::ProtocolError, "cancel_for_unary");
+                    } else {
+                        submit_stream_cancel(conn, id, &call, StreamCancelCause::Consumer);
                     }
                 }
             }
@@ -2977,15 +3062,31 @@ async fn handle_rpc_record(
             let stream_mode =
                 admission.route.method_modes[method_idx as usize] == CallMode::ServerStream;
             if stream_mode {
-                if let Err(error) = conn.core.stream_open(id) {
+                let admitted = {
+                    let _publication = server.dispatcher.read();
+                    if admission.route.scheduler.route_admission_state()
+                        == RouteAdmissionState::Closed
+                        || conn.shutdown_requested()
+                        || server.admission.lock().is_closed()
+                    {
+                        Err("stream route closed before publication".to_string())
+                    } else {
+                        conn.core
+                            .stream_open(id)
+                            .map_err(|error| error.to_string())
+                            .map(|()| {
+                                *call.data.stream.lock() = Some(StreamCallControl {
+                                    route_uid: admission.route.route_uid.clone(),
+                                    cancellation: None,
+                                });
+                            })
+                    }
+                };
+                if let Err(error) = admitted {
                     drop(data);
                     drop(admission);
-                    queue_rejection(
-                        writer,
-                        id,
-                        &error_wire(ErrorCode::ResourceUnavailable, error.to_string()),
-                    )
-                    .await;
+                    queue_rejection(writer, id, &error_wire(ErrorCode::ResourceClosed, error))
+                        .await;
                     return;
                 }
             }

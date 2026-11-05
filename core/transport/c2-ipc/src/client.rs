@@ -3370,41 +3370,23 @@ pub(crate) fn recv_loop(
                             complete_items: complete_items.unwrap_or(0),
                             error,
                         };
-                        let upload_response = match terminal.status {
-                            // A resource terminal still belongs to the stream:
-                            // already-delivered items and local failures must
-                            // be read from that original receiver.
-                            CallStatus::Success | CallStatus::Failed => {
-                                Ok(ResponseData::Inline(Vec::new()))
-                            }
-                            CallStatus::NotExecuted => Err(IpcError::CallRejected(
-                                terminal
-                                    .error
-                                    .as_ref()
-                                    .expect("checked C2E1 refusal")
-                                    .clone(),
-                            )),
-                        };
-                        let result = stream.finish(terminal);
-                        if let Some(entry) = pending.lock().remove(&rid) {
-                            entry.finish_stream_upload(if result.is_ok() {
-                                upload_response
-                            } else {
-                                Err(IpcError::Closed)
-                            });
-                        }
-                        if let Err(error) = result {
-                            stream.transport_failed(error.response_failure());
-                        }
+                        // The call leaves the table at its decoded terminal.
+                        // If its SHM item is still copying, that original
+                        // entry moves with the copy and settles afterward.
+                        let entry = pending.lock().remove(&rid).expect("active stream reply");
+                        stream.finish(terminal, entry);
                         Ok(())
                     }
                     _ => Err(IpcError::Protocol("unexpected server-stream record".into())),
                 };
                 if let Err(error) = result {
-                    stream.fail_local(C2Error::new(
-                        c2_error::ErrorCode::ProtocolViolation,
-                        error.to_string(),
-                    ));
+                    if matches!(&error, IpcError::Protocol(_)) {
+                        conn.end(
+                            ConnectionEndReason::ProtocolError,
+                            "stream_record_admission",
+                        );
+                    }
+                    stream.fail_response(error);
                 }
                 conn.wake.notify_one();
                 continue;

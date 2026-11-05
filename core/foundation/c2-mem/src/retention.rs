@@ -1,4 +1,4 @@
-//! One Runtime or relay payload-buffer budget and finite-call operation slots.
+//! One Runtime or relay payload-buffer budget and call-operation slots.
 //!
 //! A reservation charges C-Two-owned buffer storage until the last real owner
 //! drops it. Byte waits never hold an operation lock while copying payloads,
@@ -517,7 +517,7 @@ impl RetentionBudget {
         })
     }
 
-    /// Stop new finite calls; keep B open for already dispatched work.
+    /// Stop new operation slots; keep B open for already dispatched work.
     pub fn close(&self) {
         locked(&self.shared).operations_closed = true;
     }
@@ -539,7 +539,7 @@ impl RetentionBudget {
     }
 }
 
-#[must_use = "keep the slot until the finite call actually finishes"]
+#[must_use = "keep the slot until the call actually finishes"]
 #[derive(Debug)]
 pub struct RetentionPermit {
     shared: Arc<Shared>,

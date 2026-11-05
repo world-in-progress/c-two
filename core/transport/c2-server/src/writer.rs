@@ -1,11 +1,9 @@
 //! The one writer for a physical server IPC stream.
 
 use std::io;
-use std::ops::Range;
 use std::sync::Arc;
 
 use c2_local::LocalWriteHalf;
-use c2_mem::retention::BudgetedBuffer;
 use c2_wire::connection::{ConnectionError, WriteBatch, WriteRequest};
 use std::time::Duration;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
@@ -51,8 +49,7 @@ struct Submission {
 
 struct ItemFrame {
     request_id: u64,
-    owner: Arc<BudgetedBuffer>,
-    range: Range<usize>,
+    bytes: Vec<u8>,
 }
 
 #[derive(Clone, Copy)]
@@ -169,31 +166,18 @@ impl ConnectionWriter {
             .map(|_| ())
     }
 
-    pub(crate) async fn write_item_slice(
-        &self,
-        request_id: u64,
-        owner: Arc<BudgetedBuffer>,
-        range: Range<usize>,
-    ) -> io::Result<()> {
-        if request_id == 0
-            || range.is_empty()
-            || range.end > owner.len()
-            || range.len() > u32::MAX as usize - 13
-        {
+    pub(crate) async fn write_item(&self, request_id: u64, bytes: Vec<u8>) -> io::Result<()> {
+        if request_id == 0 || bytes.is_empty() || bytes.len() > u32::MAX as usize - 13 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "invalid ITEM_DATA slice",
+                "invalid ITEM_DATA frame",
             ));
         }
         self.submit(
             Vec::new(),
             None,
             true,
-            Some(ItemFrame {
-                request_id,
-                owner,
-                range,
-            }),
+            Some(ItemFrame { request_id, bytes }),
         )
         .await
         .map(|_| ())
@@ -576,7 +560,7 @@ fn prepare_response_write(
     Ok(PreparedResponseWrite::Published(write))
 }
 
-/// Write one ITEM_DATA frame directly from its budgeted owner. The single
+/// Write one ITEM_DATA frame without another payload copy. The single
 /// WriteBatch covers releases, fixed header and payload through the flush.
 async fn write_item_batch<W: AsyncWrite + Unpin>(
     stream: &mut W,
@@ -595,7 +579,7 @@ async fn write_item_batch<W: AsyncWrite + Unpin>(
         .map_err(|error| io::Error::new(io::ErrorKind::OutOfMemory, error))?;
     prefix.extend_from_slice(batch.release_bytes());
     let mut header = [0u8; 17];
-    let total_len = 13 + item.range.len() as u32;
+    let total_len = 13 + item.bytes.len() as u32;
     header[..4].copy_from_slice(&total_len.to_le_bytes());
     header[4..12].copy_from_slice(&item.request_id.to_le_bytes());
     header[12..16].copy_from_slice(&(FLAG_RPC_RECORD | FLAG_RESPONSE).to_le_bytes());
@@ -622,15 +606,7 @@ async fn write_item_batch<W: AsyncWrite + Unpin>(
             offset = end;
         }
         write_segment(stream, conn, &header, receipt, deadline, &mut timed_out).await?;
-        write_segment(
-            stream,
-            conn,
-            &item.owner[item.range],
-            receipt,
-            deadline,
-            &mut timed_out,
-        )
-        .await?;
+        write_segment(stream, conn, &item.bytes, receipt, deadline, &mut timed_out).await?;
         batch.frame_completed();
         let mut flush = Box::pin(AsyncWriteExt::flush(stream));
         if timed_out {
@@ -822,7 +798,6 @@ fn broken_pipe() -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use c2_mem::retention::PayloadBufferBudget;
     use c2_wire::frame::encode_frame;
     use c2_wire::rpc::{self, CallMode, CallStatus, ValuePart, ValueStorage};
     use std::future::Future;
@@ -891,10 +866,6 @@ mod tests {
         let conn = Arc::new(Connection::new(41));
         conn.set_handshake_done(true).unwrap();
         let (writer, driver) = ConnectionWriter::spawn_test_stream(sink, conn.clone());
-        let owner = Arc::new(BudgetedBuffer::new(
-            b"ab".to_vec(),
-            PayloadBufferBudget::new(2).try_reserve(2).unwrap(),
-        ));
         let unary = rpc::encode_call_end_frame(
             2,
             CallMode::Unary,
@@ -905,13 +876,9 @@ mod tests {
         .unwrap();
         let stream = tokio::spawn({
             let writer = writer.clone();
-            let owner = owner.clone();
             async move {
-                writer
-                    .write_item_slice(1, owner.clone(), 0..1)
-                    .await
-                    .unwrap();
-                writer.write_item_slice(1, owner, 1..2).await.unwrap();
+                writer.write_item(1, b"a".to_vec()).await.unwrap();
+                writer.write_item(1, b"b".to_vec()).await.unwrap();
             }
         });
         entered_rx.await.unwrap();
@@ -946,44 +913,47 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn item_budget_owner_survives_caller_cancellation_until_flush() {
+    async fn item_frame_survives_caller_cancellation_until_flush() {
         let bytes = Arc::new(std::sync::Mutex::new(Vec::new()));
         let (entered_tx, entered_rx) = oneshot::channel();
         let (release_tx, release_rx) = oneshot::channel();
         let sink = FirstFlushGate {
-            bytes,
+            bytes: bytes.clone(),
             entered: Some(entered_tx),
             release: release_rx,
             first_flush: false,
             released: false,
         };
-        let budget = PayloadBufferBudget::new(2);
-        let owner = Arc::new(BudgetedBuffer::new(
-            b"ab".to_vec(),
-            budget.try_reserve(2).unwrap(),
-        ));
         let conn = Arc::new(Connection::new(42));
         conn.set_handshake_done(true).unwrap();
         let (writer, driver) = ConnectionWriter::spawn_test_stream(sink, conn.clone());
         let caller = tokio::spawn({
             let writer = writer.clone();
-            let owner = owner.clone();
-            async move { writer.write_item_slice(1, owner, 0..2).await }
+            async move { writer.write_item(1, b"ab".to_vec()).await }
         });
         entered_rx.await.unwrap();
         caller.abort();
-        drop(owner);
-        assert_eq!(budget.snapshot().used_bytes, 2);
+        assert!(caller.await.unwrap_err().is_cancelled());
+        let mut idle = Box::pin(conn.wait_idle());
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(idle.as_mut().poll(&mut context).is_pending());
         release_tx.send(()).unwrap();
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while budget.snapshot().used_bytes != 0 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), idle)
+            .await
+            .unwrap();
         conn.end(c2_local::ConnectionEndReason::LocalClose, "test_done");
         driver.await.unwrap();
+        let encoded = bytes.lock().unwrap();
+        let (header, data) = c2_wire::frame::decode_frame(&encoded).unwrap();
+        assert!(matches!(
+            rpc::decode_rpc_record(&header, data, Some(CallMode::ServerStream)).unwrap(),
+            rpc::RpcRecord::ItemData {
+                value: ValuePart {
+                    storage: ValueStorage::Inline(b"ab"),
+                    ..
+                }
+            }
+        ));
     }
 
     #[tokio::test]
@@ -1086,13 +1056,7 @@ mod tests {
             let (writer, driver) = ConnectionWriter::spawn_test_stream(sink, conn.clone());
             let mut send = Box::pin(async {
                 match kind {
-                    rpc::RpcRecordKind::ItemData => {
-                        let owner = Arc::new(BudgetedBuffer::new(
-                            b"ab".to_vec(),
-                            PayloadBufferBudget::new(2).try_reserve(2).unwrap(),
-                        ));
-                        writer.write_item_slice(1, owner, 0..2).await
-                    }
+                    rpc::RpcRecordKind::ItemData => writer.write_item(1, b"ab".to_vec()).await,
                     rpc::RpcRecordKind::ItemBegin => {
                         writer
                             .write_call_end(&rpc::encode_item_begin_frame(1, 2).unwrap())

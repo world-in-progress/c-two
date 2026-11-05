@@ -251,8 +251,30 @@ pub trait CrmCallback: Send + Sync + 'static {
 
 /// One server stream's resource state, advanced only while holding its route permit.
 pub trait CrmStream: Send + 'static {
-    fn step(&mut self) -> Result<Option<ResponseMeta>, CrmError>;
+    fn step(&mut self) -> Result<Option<Box<dyn CrmStreamItem>>, CrmError>;
     fn finish(self: Box<Self>) -> Result<(), CrmError>;
+}
+
+/// An independently owned domain item. Encoding starts only after the receiver
+/// grants storage and the selected local backing has been admitted.
+pub trait CrmStreamItem: Send + 'static {
+    fn len(&self) -> usize;
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+    /// Encode just this range, directly into a SHM allocation or one frame.
+    fn write_range(&self, offset: usize, destination: &mut [u8]) -> Result<(), CrmError>;
+}
+
+impl CrmStreamItem for Vec<u8> {
+    fn len(&self) -> usize {
+        Vec::len(self)
+    }
+
+    fn write_range(&self, offset: usize, destination: &mut [u8]) -> Result<(), CrmError> {
+        destination.copy_from_slice(&self[offset..offset + destination.len()]);
+        Ok(())
+    }
 }
 
 pub trait CrmStreamCallback: CrmCallback {

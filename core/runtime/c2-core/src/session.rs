@@ -729,7 +729,7 @@ impl Runtime {
 
     /// Consistent read-only input retention counters. Before first call this
     /// resolves policy without freezing or constructing an executor. It counts
-    /// actual finite owners, including continuations after caller timeout;
+    /// finite-unary and stream owners, including continuations after caller timeout;
     /// response-storage observations stay in outgoing_memory_observer().
     pub fn call_execution_snapshot(&self) -> Result<crate::CallExecutionSnapshot, LifecycleError> {
         Ok(self.resolve_call_execution_context(false)?.snapshot())

@@ -7,14 +7,15 @@ use parking_lot::Mutex;
 
 use c2_contract::{
     ContractError, ContractRelease, ContractReleaseRef, ExpectedRouteContract,
-    MAX_CONTRACT_METHODS, MethodAccess, PORTABLE_CONTRACT_SCHEMA, validate_contract_text_field,
-    validate_expected_route_contract,
+    MAX_CONTRACT_METHODS, MethodAccess, MethodMode, PORTABLE_CONTRACT_SCHEMA,
+    ValidatedContractDescriptor, validate_contract_text_field, validate_expected_route_contract,
 };
 use c2_error::C2Error;
 use c2_server::{
-    AccessLevel, ConcurrencyMode, CrmCallback, CrmError, ResponseMeta, RouteBuildSpec,
-    RouteConcurrencyHandle, SchedulerAcquireError, SchedulerGuard, SchedulerLimits,
-    SchedulerSnapshot, Server, ServerFailure, ServerIdentity, ServerRuntimeBuilder,
+    AccessLevel, ConcurrencyMode, CrmCallback, CrmError, CrmStream, CrmStreamCallback,
+    CrmStreamItem, ResponseMeta, RouteBuildSpec, RouteConcurrencyHandle, SchedulerAcquireError,
+    SchedulerGuard, SchedulerLimits, SchedulerSnapshot, Server, ServerFailure, ServerIdentity,
+    ServerRuntimeBuilder,
 };
 
 use crate::{
@@ -37,6 +38,31 @@ pub struct MethodDefinition {
 /// invalidate callback-scoped payload owners before dropping the local bytes.
 pub trait EncodedService: Send + Sync + 'static {
     fn invoke(&self, method_index: u16, request: Vec<u8>) -> Result<Vec<u8>, C2Error>;
+}
+
+/// A resource-owned item whose encoding is deferred until storage admission.
+pub trait EncodedStreamItem: Send + 'static {
+    fn len(&self) -> usize;
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+    /// Encode the requested range directly into the selected transport storage.
+    fn write_range(&self, offset: usize, destination: &mut [u8]) -> Result<(), C2Error>;
+}
+
+/// The resource continuation. Establishment, steps and finish run serially
+/// under the original route admission; only finish destroys its iterator.
+pub trait EncodedStream: Send + 'static {
+    fn step(&mut self) -> Result<Option<Box<dyn EncodedStreamItem>>, C2Error>;
+    fn finish(self: Box<Self>) -> Result<(), C2Error>;
+}
+
+pub trait EncodedStreamService: EncodedService {
+    fn open_stream(
+        &self,
+        method_index: u16,
+        request: Vec<u8>,
+    ) -> Result<Box<dyn EncodedStream>, C2Error>;
 }
 
 /// Language-neutral execution policy shared by remote dispatch and any
@@ -199,6 +225,8 @@ pub struct ServiceDefinition {
     expected: ExpectedRouteContract,
     methods: Arc<[MethodDefinition]>,
     service: Arc<dyn EncodedService>,
+    stream_service: Option<Arc<dyn EncodedStreamService>>,
+    stream_descriptor: Option<ValidatedContractDescriptor>,
     concurrency_mode: ServiceConcurrencyMode,
     max_pending: Option<usize>,
     max_workers: Option<usize>,
@@ -229,10 +257,61 @@ impl ServiceDefinition {
     where
         I: IntoIterator<Item = MethodDefinition>,
     {
+        Self::from_release(
+            release,
+            release_ref,
+            route_name.into(),
+            methods,
+            service,
+            None,
+        )
+    }
+
+    pub fn new_stream<I>(
+        release: &ContractRelease,
+        release_ref: ContractReleaseRef,
+        route_name: impl Into<String>,
+        methods: I,
+        service: Arc<dyn EncodedStreamService>,
+    ) -> Result<Self, Error>
+    where
+        I: IntoIterator<Item = MethodDefinition>,
+    {
+        Self::from_release(
+            release,
+            release_ref,
+            route_name.into(),
+            methods,
+            service.clone(),
+            Some(service),
+        )
+    }
+
+    fn from_release<I>(
+        release: &ContractRelease,
+        release_ref: ContractReleaseRef,
+        route_name: String,
+        methods: I,
+        service: Arc<dyn EncodedService>,
+        stream_service: Option<Arc<dyn EncodedStreamService>>,
+    ) -> Result<Self, Error>
+    where
+        I: IntoIterator<Item = MethodDefinition>,
+    {
         release_ref.verify_release(release)?;
         let expected = release.expected_route(route_name)?;
         let methods = methods.into_iter().collect::<Vec<_>>();
         let descriptor_methods = release.descriptor().methods();
+        if stream_service.is_none()
+            && descriptor_methods
+                .iter()
+                .any(|method| method.mode() == MethodMode::ServerStream)
+        {
+            return Err(method_contract_error(
+                "$.methods",
+                "server-stream methods require a stream service".into(),
+            ));
+        }
         if methods.len() != descriptor_methods.len() {
             return Err(method_contract_error(
                 "$.methods",
@@ -288,6 +367,10 @@ impl ServiceDefinition {
             expected,
             methods: methods.into(),
             service,
+            stream_descriptor: stream_service
+                .as_ref()
+                .map(|_| release.descriptor().clone()),
+            stream_service,
             concurrency_mode: ServiceConcurrencyMode::default(),
             max_pending: None,
             max_workers: None,
@@ -352,6 +435,8 @@ impl ServiceDefinition {
             expected,
             methods: methods.into(),
             service,
+            stream_service: None,
+            stream_descriptor: None,
             concurrency_mode: ServiceConcurrencyMode::default(),
             max_pending: None,
             max_workers: None,
@@ -752,14 +837,25 @@ impl Host {
         self.inner.runtime.ensure_active()?;
         let route_name = definition.expected.route_name.clone();
         let route_spec = route_spec(&definition)?;
-        let callback: Arc<dyn CrmCallback> = Arc::new(CoreCallback {
-            service: Arc::clone(&definition.service),
-        });
-        let route = self
-            .inner
-            .server
-            .build_route(route_spec, callback)
-            .map_err(LifecycleError::from)?;
+        let route = match &definition.stream_service {
+            Some(service) => self.inner.server.build_stream_route(
+                route_spec,
+                Arc::new(CoreStreamCallback {
+                    service: service.clone(),
+                }),
+                definition
+                    .stream_descriptor
+                    .as_ref()
+                    .expect("validated stream definition"),
+            ),
+            None => self.inner.server.build_route(
+                route_spec,
+                Arc::new(CoreCallback {
+                    service: Arc::clone(&definition.service),
+                }),
+            ),
+        }
+        .map_err(LifecycleError::from)?;
         let route_concurrency = RouteConcurrency {
             inner: route.route_handle(),
         };
@@ -1088,6 +1184,70 @@ impl CrmCallback for CoreCallback {
         self.service
             .invoke(method_idx, request)
             .map(ResponseMeta::Inline)
+            .map_err(|error| CrmError::UserError(error.to_wire_bytes()))
+    }
+}
+
+struct CoreStreamCallback {
+    service: Arc<dyn EncodedStreamService>,
+}
+
+impl CrmCallback for CoreStreamCallback {
+    fn invoke(
+        &self,
+        _: &str,
+        index: u16,
+        request: Vec<u8>,
+        _: Arc<c2_server::ResponsePool>,
+    ) -> Result<ResponseMeta, CrmError> {
+        self.service
+            .invoke(index, request)
+            .map(ResponseMeta::Inline)
+            .map_err(|error| CrmError::UserError(error.to_wire_bytes()))
+    }
+}
+
+impl CrmStreamCallback for CoreStreamCallback {
+    fn open_stream(
+        &self,
+        _: &str,
+        index: u16,
+        request: Vec<u8>,
+        _: Arc<c2_server::ResponsePool>,
+    ) -> Result<Box<dyn CrmStream>, CrmError> {
+        self.service
+            .open_stream(index, request)
+            .map(|stream| Box::new(CoreStream(stream)) as Box<dyn CrmStream>)
+            .map_err(|error| CrmError::UserError(error.to_wire_bytes()))
+    }
+}
+
+struct CoreStream(Box<dyn EncodedStream>);
+
+impl CrmStream for CoreStream {
+    fn step(&mut self) -> Result<Option<Box<dyn CrmStreamItem>>, CrmError> {
+        self.0
+            .step()
+            .map(|item| item.map(|item| Box::new(CoreStreamItem(item)) as Box<dyn CrmStreamItem>))
+            .map_err(|error| CrmError::UserError(error.to_wire_bytes()))
+    }
+
+    fn finish(self: Box<Self>) -> Result<(), CrmError> {
+        self.0
+            .finish()
+            .map_err(|error| CrmError::UserError(error.to_wire_bytes()))
+    }
+}
+
+struct CoreStreamItem(Box<dyn EncodedStreamItem>);
+
+impl CrmStreamItem for CoreStreamItem {
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+    fn write_range(&self, offset: usize, destination: &mut [u8]) -> Result<(), CrmError> {
+        self.0
+            .write_range(offset, destination)
             .map_err(|error| CrmError::UserError(error.to_wire_bytes()))
     }
 }

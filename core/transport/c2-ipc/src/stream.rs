@@ -6,7 +6,49 @@
 
 use super::*;
 use c2_mem::retention::PayloadBufferReservation;
+use std::sync::Weak;
 use tokio::sync::{Notify, mpsc};
+
+/// Shared intent for an opening caller that expires before the stream handle
+/// can be returned. The original call accepts the intent once it is published.
+#[derive(Clone, Default)]
+pub struct IpcStreamCancellation {
+    state: Arc<StdMutex<CancellationIntent>>,
+}
+
+#[derive(Default)]
+struct CancellationIntent {
+    requested: bool,
+    call: Weak<StreamReceive>,
+}
+
+impl IpcStreamCancellation {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn cancel(&self) {
+        let call = {
+            let mut state = self.state.lock();
+            state.requested = true;
+            state.call.upgrade()
+        };
+        if let Some(call) = call {
+            let _ = call.cancel();
+        }
+    }
+
+    fn attach(&self, call: &Arc<StreamReceive>) {
+        let requested = {
+            let mut state = self.state.lock();
+            state.call = Arc::downgrade(call);
+            state.requested
+        };
+        if requested {
+            let _ = call.cancel();
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StreamTerminal {
@@ -24,6 +66,9 @@ struct ItemBuffer {
 struct ReceiveState {
     id: Option<u64>,
     item: Option<ItemBuffer>,
+    copying: bool,
+    deferred_terminal: Option<(StreamTerminal, PendingResponse)>,
+    deferred_failure: Option<IpcError>,
     discarded: bool,
     ended: bool,
     terminal: Option<StreamTerminal>,
@@ -37,11 +82,17 @@ struct ReceiveState {
 
 pub(crate) struct StreamReceive {
     state: StdMutex<ReceiveState>,
+    cancel_requested: AtomicBool,
+    // The caller's operation slot stays with the original receive record.
+    // It is released before the terminal is made observable.
+    completion_owner: StdMutex<Option<Box<dyn Send>>>,
     budget: PayloadBufferBudget,
     conn: Arc<ClientConnection>,
     output: mpsc::Sender<BudgetedBuffer>,
     changed: Notify,
     max_item_bytes: u64,
+    #[cfg(test)]
+    shm_copy_gate: StdMutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
 }
 
 struct DeliveryOwner(Arc<StreamReceive>);
@@ -57,10 +108,14 @@ impl Drop for DeliveryOwner {
 pub struct IpcResponseStream {
     call: Arc<StreamReceive>,
     input: mpsc::Receiver<BudgetedBuffer>,
-    error_delivered: bool,
 }
 
 impl IpcResponseStream {
+    #[cfg(test)]
+    pub(crate) fn receive_call_for_test(&self) -> Arc<StreamReceive> {
+        self.call.clone()
+    }
+
     pub async fn recv(&mut self) -> Result<Option<BudgetedBuffer>, crate::IpcCallError> {
         loop {
             let changed = self.call.changed.notified();
@@ -69,12 +124,8 @@ impl IpcResponseStream {
             if let Ok(item) = self.input.try_recv() {
                 return Ok(Some(item));
             }
-            if self.error_delivered {
-                return Ok(None);
-            }
-            let result = receive_after_empty(&mut self.call.state.lock(), &mut self.input);
-            if let Some(result) = result {
-                self.error_delivered = result.is_err();
+            if let Some(result) = receive_after_empty(&mut self.call.state.lock(), &mut self.input)
+            {
                 return result;
             }
             tokio::select! {
@@ -96,22 +147,122 @@ impl IpcResponseStream {
             let changed = self.call.changed.notified();
             tokio::pin!(changed);
             changed.as_mut().enable();
-            {
-                let mut state = self.call.state.lock();
-                if state.ended {
-                    if let Some(error) = &state.local_error {
-                        return Err(local_failure(error.clone()));
-                    }
-                    if let Some(terminal) = &state.terminal {
-                        return Ok(terminal.clone());
-                    }
-                    return Err(dispatch_uncertain_call_error(
-                        state.io_error.take().unwrap_or(IpcError::Closed),
-                    ));
-                }
+            let observed = {
+                let state = self.call.state.lock();
+                completion_from_state(&state)
+            };
+            match observed {
+                Some(result) => return result,
+                None => changed.await,
             }
-            changed.await;
         }
+    }
+
+    /// Observe without waiting. A cleanup terminal wins over an earlier local
+    /// receive failure so close can report the original server outcome. A
+    /// contended state lock returns None for a zero-budget observation.
+    pub fn try_completion(&self) -> Option<Result<StreamTerminal, crate::IpcCallError>> {
+        self.call
+            .state
+            .try_lock()
+            .and_then(|state| completion_from_state(&state))
+    }
+}
+
+fn completion_from_state(
+    state: &ReceiveState,
+) -> Option<Result<StreamTerminal, crate::IpcCallError>> {
+    if !state.ended {
+        return None;
+    }
+    if let Some(terminal) = &state.terminal {
+        return Some(Ok(terminal.clone()));
+    }
+    if let Some(error) = &state.local_error {
+        return Some(Err(local_failure(error.clone())));
+    }
+    Some(Err(dispatch_uncertain_call_error(
+        state
+            .io_error
+            .as_ref()
+            .map_or(IpcError::Closed, clone_observation_error),
+    )))
+}
+
+// Completion and recv can both inspect the same physical failure. Preserve
+// the typed IPC variant and OS error kind when building each owned result.
+fn clone_observation_error(error: &IpcError) -> IpcError {
+    match error {
+        IpcError::LocalCallRejected(error) => IpcError::LocalCallRejected(error.clone()),
+        IpcError::CallRejected(error) => IpcError::CallRejected(error.clone()),
+        IpcError::Io(error) => IpcError::Io(std::io::Error::new(error.kind(), error.to_string())),
+        IpcError::Connect(error) => {
+            IpcError::Connect(std::io::Error::new(error.kind(), error.to_string()))
+        }
+        IpcError::Config(message) => IpcError::Config(message.clone()),
+        IpcError::Decode(error) => IpcError::Decode(error.clone()),
+        IpcError::Protocol(message) => IpcError::Protocol(message.clone()),
+        IpcError::ProtocolVersionMismatch { local, peer } => IpcError::ProtocolVersionMismatch {
+            local: *local,
+            peer: *peer,
+        },
+        IpcError::IdentityMismatch {
+            expected_server_id,
+            expected_server_instance_id,
+            actual_server_id,
+            actual_server_instance_id,
+        } => IpcError::IdentityMismatch {
+            expected_server_id: expected_server_id.clone(),
+            expected_server_instance_id: expected_server_instance_id.clone(),
+            actual_server_id: actual_server_id.clone(),
+            actual_server_instance_id: actual_server_instance_id.clone(),
+        },
+        IpcError::ContractMismatch(message) => IpcError::ContractMismatch(message.clone()),
+        IpcError::RouteNotFound(name) => IpcError::RouteNotFound(name.clone()),
+        IpcError::RouteRemoved {
+            route_name,
+            route_uid,
+        } => IpcError::RouteRemoved {
+            route_name: route_name.clone(),
+            route_uid: route_uid.clone(),
+        },
+        IpcError::RouteClosed {
+            route_name,
+            route_uid,
+            reason,
+        } => IpcError::RouteClosed {
+            route_name: route_name.clone(),
+            route_uid: route_uid.clone(),
+            reason: reason.clone(),
+        },
+        IpcError::RouteStale {
+            route_name,
+            current_route_uid,
+        } => IpcError::RouteStale {
+            route_name: route_name.clone(),
+            current_route_uid: current_route_uid.clone(),
+        },
+        IpcError::MethodNotFound {
+            route_name,
+            method_name,
+        } => IpcError::MethodNotFound {
+            route_name: route_name.clone(),
+            method_name: method_name.clone(),
+        },
+        IpcError::Shm(message) => IpcError::Shm(message.clone()),
+        IpcError::ResponseFailure(source) => {
+            IpcError::ResponseFailure(Box::new(clone_observation_error(source)))
+        }
+        IpcError::Chunk(ChunkError::Protocol(message)) => {
+            IpcError::Chunk(ChunkError::Protocol(message.clone()))
+        }
+        IpcError::Chunk(ChunkError::Capacity(message)) => {
+            IpcError::Chunk(ChunkError::Capacity(message.clone()))
+        }
+        IpcError::CrmError(bytes) => IpcError::CrmError(bytes.clone()),
+        IpcError::Closed => IpcError::Closed,
+        IpcError::Pool(message) => IpcError::Pool(message.clone()),
+        IpcError::PoolRetired => IpcError::PoolRetired,
     }
 }
 
@@ -126,14 +277,19 @@ fn receive_after_empty(
     if let Ok(item) = input.try_recv() {
         return Some(Ok(Some(item)));
     }
-    if let Some(error) = &state.local_error {
+    if let Some(error) = &state.local_error
+        && state.deliveries == 0
+    {
         Some(Err(local_failure(error.clone())))
     } else if state.ended && state.deliveries == 0 {
         match &state.terminal {
             Some(terminal) if terminal.status == CallStatus::Success => Some(Ok(None)),
             Some(terminal) => Some(Err(terminal_failure(terminal))),
             None => Some(Err(dispatch_uncertain_call_error(
-                state.io_error.take().unwrap_or(IpcError::Closed),
+                state
+                    .io_error
+                    .as_ref()
+                    .map_or(IpcError::Closed, clone_observation_error),
             ))),
         }
     } else {
@@ -157,31 +313,56 @@ fn local_failure(error: C2Error) -> crate::IpcCallError {
 }
 
 impl StreamReceive {
+    #[cfg(test)]
+    pub(crate) fn hold_state_for_test(&self) -> impl Drop + '_ {
+        self.state.lock()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_shm_copy_gate_for_test(
+        &self,
+        entered: std::sync::mpsc::Sender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+    ) {
+        *self.shm_copy_gate.lock() = Some((entered, release));
+    }
+
     fn new(
         conn: Arc<ClientConnection>,
         budget: PayloadBufferBudget,
         max_item_bytes: u64,
+        completion_owner: Box<dyn Send>,
+        opening_cancellation: Option<IpcStreamCancellation>,
     ) -> (Arc<Self>, IpcResponseStream) {
         let (output, input) = mpsc::channel(1);
         let call = Arc::new(Self {
             state: StdMutex::new(ReceiveState::default()),
+            cancel_requested: AtomicBool::new(false),
+            completion_owner: StdMutex::new(Some(completion_owner)),
             budget,
             conn,
             output,
             changed: Notify::new(),
             max_item_bytes,
+            #[cfg(test)]
+            shm_copy_gate: StdMutex::new(None),
         });
         let stream = IpcResponseStream {
             call: call.clone(),
             input,
-            error_delivered: false,
         };
+        if let Some(cancellation) = &opening_cancellation {
+            cancellation.attach(&call);
+        }
         (call, stream)
     }
 
     pub(crate) fn publish(&self, id: u64) -> Result<(), IpcError> {
         self.conn.core.stream_open(id).map_err(core_error)?;
         self.state.lock().id = Some(id);
+        if self.cancel_requested.load(Ordering::Acquire) {
+            self.conn.wake.notify_one();
+        }
         Ok(())
     }
 
@@ -191,42 +372,56 @@ impl StreamReceive {
             return None;
         }
         let id = state.id?;
-        if std::mem::take(&mut state.pending_cancel) {
-            return Some(rpc::encode_cancel_frame(id).expect("nonzero stream ID"));
-        }
+        self.apply_cancel_locked(&mut state, id);
+        // An already backed grant for the current item must precede CANCEL;
+        // the peer may still need it to settle that carrier.
         let storage = std::mem::take(&mut state.pending_storage);
         let demand = std::mem::take(&mut state.pending_demand);
-        if storage == 0 && demand == 0 {
-            return None;
+        if storage > 0 || demand > 0 {
+            return Some(
+                rpc::encode_credit_frame(id, storage, demand).expect("nonzero checked grant"),
+            );
         }
-        Some(rpc::encode_credit_frame(id, storage, demand).expect("nonzero checked grant"))
+        std::mem::take(&mut state.pending_cancel)
+            .then(|| rpc::encode_cancel_frame(id).expect("nonzero stream ID"))
     }
 
     pub(crate) fn has_control(&self) -> bool {
         let state = self.state.lock();
         !state.ended
             && state.id.is_some()
-            && (state.pending_cancel || state.pending_storage > 0 || state.pending_demand > 0)
+            && (self.cancel_requested.load(Ordering::Acquire)
+                || state.pending_cancel
+                || state.pending_storage > 0
+                || state.pending_demand > 0)
     }
 
     fn cancel(&self) -> Result<(), IpcError> {
-        let mut state = self.state.lock();
-        if state.ended {
-            return Ok(());
-        }
-        let id = state.id.ok_or(IpcError::Closed)?;
-        if self.conn.core.stream_cancel(id).map_err(core_error)? {
-            state.discarded = true;
-            state.item.take();
-            state.pending_storage = 0;
-            state.pending_demand = 0;
-            state.pending_cancel = true;
-        }
-        drop(state);
+        // Facade Drop and close(0) submit intent without waiting for any
+        // in-progress receive work.
+        self.cancel_requested.store(true, Ordering::Release);
         self.changed.notify_waiters();
         self.conn.wake.notify_waiters();
         self.conn.wake.notify_one();
         Ok(())
+    }
+
+    fn apply_cancel_locked(&self, state: &mut ReceiveState, id: u64) {
+        if !self.cancel_requested.swap(false, Ordering::AcqRel) || state.ended {
+            return;
+        }
+        if self
+            .conn
+            .core
+            .stream_cancel(id)
+            .expect("published stream remains in connection core")
+        {
+            state.discarded = true;
+            state.item.take();
+            state.pending_demand = 0;
+            state.pending_cancel = true;
+        }
+        self.changed.notify_waiters();
     }
 
     pub(crate) fn fail_local(&self, error: C2Error) {
@@ -284,7 +479,7 @@ impl StreamReceive {
                 changed.as_mut().enable();
                 if {
                     let s = call.state.lock();
-                    s.ended || s.discarded
+                    s.ended || s.discarded || call.cancel_requested.load(Ordering::Acquire)
                 } {
                     return;
                 }
@@ -326,7 +521,7 @@ impl StreamReceive {
             }
             bytes.resize(size, 0);
             let mut state = call.state.lock();
-            if state.ended || state.discarded {
+            if state.ended || state.discarded || call.cancel_requested.load(Ordering::Acquire) {
                 return;
             }
             state.item = Some(ItemBuffer { bytes, reservation });
@@ -365,51 +560,130 @@ impl StreamReceive {
         } else {
             None
         };
-        let mut state = self.state.lock();
-        let id = state.id.ok_or(IpcError::Closed)?;
-        let offset = self
-            .conn
-            .core
-            .stream_data(id, storage.len())
-            .map_err(core_error)?;
-        if !state.discarded {
-            let item = state
-                .item
-                .as_mut()
-                .expect("storage CREDIT follows buffer allocation");
+        let (id, offset, complete, mut item) = {
+            let mut state = self.state.lock();
+            let id = state.id.ok_or(IpcError::Closed)?;
+            if carrier.is_some() {
+                let flow = self.conn.core.stream_state(id).ok_or(IpcError::Closed)?;
+                if flow.admitted_bytes != 0 || flow.total_bytes != Some(storage.len()) {
+                    return Err(IpcError::Protocol(
+                        "SHM ITEM_DATA must carry one whole item".into(),
+                    ));
+                }
+            }
+            let offset = self
+                .conn
+                .core
+                .stream_data(id, storage.len())
+                .map_err(core_error)?;
+            let flow = self
+                .conn
+                .core
+                .stream_state(id)
+                .expect("original stream flow");
+            let complete = flow.total_bytes == Some(flow.admitted_bytes);
+            let item = state.item.take();
+            if carrier.is_some() && item.is_some() {
+                state.copying = true;
+                state.deliveries += 1;
+            }
+            (id, offset, complete, item)
+        };
+        if let Some(buffer) = item.as_mut() {
             let start = usize::try_from(offset).expect("admitted item offset");
             let end = start + usize::try_from(storage.len()).expect("admitted item bytes");
             match (storage, carrier) {
                 (ValueStorage::Inline(bytes), None) => {
-                    item.bytes[start..end].copy_from_slice(bytes)
+                    buffer.bytes[start..end].copy_from_slice(bytes);
                 }
-                (_, Some(ResponseData::Shm(carrier))) => carrier
-                    .copy_into(&mut item.bytes[start..end])
-                    .map_err(IpcError::Shm)?,
+                (_, Some(ResponseData::Shm(carrier))) => {
+                    // One SHM descriptor carries the whole item. Move its
+                    // owned buffer and read guard to one blocking job so the
+                    // socket reader can process other calls immediately.
+                    let call = self.clone();
+                    let mut item = item.take().expect("admitted item buffer");
+                    let delivery = DeliveryOwner(self.clone());
+                    #[cfg(test)]
+                    let gate = self.shm_copy_gate.lock().take();
+                    tokio::task::spawn_blocking(move || {
+                        #[cfg(test)]
+                        if let Some((entered, release)) = gate {
+                            let _ = entered.send(());
+                            let _ = release.recv();
+                        }
+                        let copied = carrier
+                            .copy_into(&mut item.bytes[start..end])
+                            .map_err(IpcError::Shm);
+                        call.settle_data(id, complete, Some(item), copied);
+                        drop(delivery);
+                    });
+                    return Ok(());
+                }
                 _ => unreachable!("admitted stream carrier"),
             }
         } else {
             drop(carrier);
         }
-        let flow = self
-            .conn
-            .core
-            .stream_state(id)
-            .expect("original stream flow");
-        if flow.total_bytes != Some(flow.admitted_bytes) {
-            return Ok(());
-        }
-        self.conn.core.stream_finish_item(id).map_err(core_error)?;
-        let item = state.item.take();
-        drop(state);
-        if let Some(item) = item {
-            self.start_delivery(BudgetedBuffer::new(item.bytes, item.reservation));
-        }
+        self.settle_data(id, complete, item, Ok(()));
         Ok(())
+    }
+
+    fn settle_data(
+        self: &Arc<Self>,
+        id: u64,
+        complete: bool,
+        mut item: Option<ItemBuffer>,
+        copied: Result<(), IpcError>,
+    ) {
+        let mut state = self.state.lock();
+        state.copying = false;
+        if state.ended {
+            drop(state);
+            self.changed.notify_waiters();
+            return;
+        }
+        let mut failure = copied.err();
+        if failure.is_none() && complete {
+            failure = self.conn.core.stream_finish_item(id).err().map(core_error);
+        }
+        if let Some(error) = &failure {
+            state.local_error.get_or_insert_with(|| {
+                C2Error::new(c2_error::ErrorCode::ProtocolViolation, error.to_string())
+            });
+            self.cancel_requested.store(true, Ordering::Release);
+        }
+        if state.discarded || self.cancel_requested.load(Ordering::Acquire) || failure.is_some() {
+            item.take();
+        } else if !complete {
+            state.item = item.take();
+        } else if item.is_some() {
+            // CALL_END may already be in the reader. Account for delivery
+            // before exposing an empty queue beside that terminal.
+            state.deliveries += 1;
+        }
+        let deferred = state.deferred_terminal.take();
+        let failed = state.deferred_failure.take();
+        drop(state);
+        self.changed.notify_waiters();
+        if failure.is_some() {
+            self.conn.wake.notify_one();
+        }
+        if complete && let Some(item) = item {
+            self.spawn_delivery(BudgetedBuffer::new(item.bytes, item.reservation));
+        }
+        if let Some((terminal, entry)) = deferred {
+            self.finish(terminal, entry);
+        } else if let Some(error) = failed {
+            self.transport_failed(error);
+        }
     }
 
     fn start_delivery(self: &Arc<Self>, bytes: BudgetedBuffer) {
         self.state.lock().deliveries += 1;
+        self.spawn_delivery(bytes);
+    }
+
+    fn spawn_delivery(self: &Arc<Self>, bytes: BudgetedBuffer) {
         let owner = DeliveryOwner(self.clone());
         let call = self.clone();
         tokio::spawn(async move {
@@ -423,7 +697,7 @@ impl StreamReceive {
             let changed = self.changed.notified();
             tokio::pin!(changed);
             changed.as_mut().enable();
-            if self.state.lock().discarded {
+            if self.cancel_requested.load(Ordering::Acquire) || self.state.lock().discarded {
                 return;
             }
             let permit = tokio::select! {
@@ -431,7 +705,7 @@ impl StreamReceive {
                 _ = &mut changed => continue,
             };
             let mut state = self.state.lock();
-            if state.discarded {
+            if self.cancel_requested.load(Ordering::Acquire) || state.discarded {
                 return;
             }
             let id = state.id.expect("published stream");
@@ -459,8 +733,37 @@ impl StreamReceive {
         }
     }
 
-    pub(crate) fn finish(&self, terminal: StreamTerminal) -> Result<(), IpcError> {
+    pub(crate) fn finish(&self, terminal: StreamTerminal, entry: PendingResponse) {
         let mut state = self.state.lock();
+        if state.copying {
+            state.deferred_terminal = Some((terminal, entry));
+            return;
+        }
+        let result = self.finish_locked(&mut state, &terminal);
+        drop(state);
+        match result {
+            Ok(()) => {
+                let upload_response = match terminal.status {
+                    CallStatus::Success | CallStatus::Failed => {
+                        Ok(ResponseData::Inline(Vec::new()))
+                    }
+                    CallStatus::NotExecuted => Err(IpcError::CallRejected(
+                        terminal.error.expect("checked C2E1 refusal"),
+                    )),
+                };
+                entry.finish_stream_upload(upload_response);
+            }
+            Err(error) => entry.complete(Err(error.response_failure())),
+        }
+        self.changed.notify_waiters();
+        self.conn.wake.notify_one();
+    }
+
+    fn finish_locked(
+        &self,
+        state: &mut ReceiveState,
+        terminal: &StreamTerminal,
+    ) -> Result<(), IpcError> {
         let id = state.id.ok_or(IpcError::Closed)?;
         let flow = self.conn.core.stream_state(id).ok_or(IpcError::Closed)?;
         if state.local_error.is_none()
@@ -475,12 +778,10 @@ impl StreamReceive {
             ));
         }
         state.item.take();
-        state.terminal = Some(terminal);
+        state.terminal = Some(terminal.clone());
+        drop(self.completion_owner.lock().take());
         state.ended = true;
         self.conn.core.stream_retire(id);
-        drop(state);
-        self.changed.notify_waiters();
-        self.conn.wake.notify_one();
         Ok(())
     }
 
@@ -489,8 +790,18 @@ impl StreamReceive {
         if state.ended {
             return;
         }
+        if state.copying {
+            // EOF can reach the reader while an admitted SHM carrier is still
+            // being copied. Keep the completed item and the actual failure in
+            // their original order; the read guard remains live until then.
+            if state.deferred_terminal.is_none() {
+                state.deferred_failure.get_or_insert(error);
+            }
+            return;
+        }
         state.item.take();
         state.io_error = Some(error);
+        drop(self.completion_owner.lock().take());
         state.ended = true;
         if let Some(id) = state.id {
             self.conn.core.stream_retire(id);
@@ -504,6 +815,45 @@ impl StreamReceive {
 mod receive_boundary_tests {
     use super::*;
     use c2_error::ErrorCode;
+
+    #[test]
+    fn close_observer_prefers_actual_cleanup_terminal_over_local_receive_failure() {
+        let state = ReceiveState {
+            ended: true,
+            local_error: Some(C2Error::new(
+                ErrorCode::CallCapacityExceeded,
+                "local B limit",
+            )),
+            terminal: Some(StreamTerminal {
+                status: CallStatus::Failed,
+                complete_items: 2,
+                error: Some(C2Error::new(ErrorCode::CallCancelled, "cleanup completed")),
+            }),
+            ..ReceiveState::default()
+        };
+        let terminal = completion_from_state(&state).unwrap().unwrap();
+        assert_eq!(terminal.complete_items, 2);
+        assert_eq!(terminal.error.unwrap().code, ErrorCode::CallCancelled);
+    }
+
+    #[test]
+    fn repeated_transport_observation_preserves_typed_capacity_failure() {
+        let state = ReceiveState {
+            ended: true,
+            io_error: Some(IpcError::ResponseFailure(Box::new(IpcError::Chunk(
+                ChunkError::Capacity("reassembly limit".into()),
+            )))),
+            ..ReceiveState::default()
+        };
+        for _ in 0..2 {
+            let error = completion_from_state(&state).unwrap().unwrap_err();
+            assert!(matches!(
+                error.source_error(),
+                IpcError::ResponseFailure(source)
+                    if matches!(source.as_ref(), IpcError::Chunk(ChunkError::Capacity(_)))
+            ));
+        }
+    }
 
     #[test]
     fn item_arriving_after_empty_observation_precedes_terminal() {
@@ -627,14 +977,59 @@ impl IpcClient {
         data: &[u8],
         budget: PayloadBufferBudget,
     ) -> Result<IpcResponseStream, crate::IpcCallError> {
+        self.stream_bound_inner(binding, method_name, data, budget, Box::new(()), None, None)
+            .await
+    }
+
+    /// Transfer an owned request and an operation-slot owner to the original
+    /// stream record. The owner survives a caller deadline or dropped facade.
+    pub async fn stream_bound_owned_controlled_phased<B>(
+        &self,
+        binding: &RouteBinding,
+        method_name: &str,
+        data: B,
+        budget: PayloadBufferBudget,
+        completion_owner: Box<dyn Send>,
+        cancellation: IpcStreamCancellation,
+        control: &IpcCallControl,
+    ) -> Result<IpcResponseStream, crate::IpcCallError>
+    where
+        B: AsRef<[u8]> + Send + 'static,
+    {
+        self.stream_bound_inner(
+            binding,
+            method_name,
+            data,
+            budget,
+            completion_owner,
+            Some(cancellation),
+            Some(control),
+        )
+        .await
+    }
+
+    async fn stream_bound_inner<B>(
+        &self,
+        binding: &RouteBinding,
+        method_name: &str,
+        data: B,
+        budget: PayloadBufferBudget,
+        completion_owner: Box<dyn Send>,
+        cancellation: Option<IpcStreamCancellation>,
+        control: Option<&IpcCallControl>,
+    ) -> Result<IpcResponseStream, crate::IpcCallError>
+    where
+        B: AsRef<[u8]> + Send,
+    {
         let (index, identity, limit) = binding
             .call_target_for(method_name)
             .map_err(pre_dispatch_call_error)?;
-        if data.len() as u64 > limit {
+        if data.as_ref().len() as u64 > limit {
             return Err(pre_dispatch_call_error(IpcError::Config(
                 "request exceeds route payload limit".into(),
             )));
         }
+        IpcCallControl::check_preparation(control).map_err(pre_dispatch_call_error)?;
         let (send, mut rx) = self
             .begin_pending(PendingKind::Call(CallMode::ServerStream))
             .map_err(pre_dispatch_call_error)?;
@@ -642,7 +1037,10 @@ impl IpcClient {
             send.conn.clone(),
             budget,
             limit.min(self.config.max_reassembly_bytes),
+            completion_owner,
+            cancellation,
         );
+        let cancellation = call.clone();
         let (upload_stop, stop_upload) = tokio::sync::watch::channel(false);
         {
             let mut pending = self.pending.lock();
@@ -653,11 +1051,14 @@ impl IpcClient {
             entry.stream = Some(call);
         }
         let result = async {
-            if choose_request_transport(&self.config, self.shm_request_available(), data.len())
-                == RequestTransportKind::Buddy
+            if choose_request_transport(
+                &self.config,
+                self.shm_request_available(),
+                data.as_ref().len(),
+            ) == RequestTransportKind::Buddy
             {
-                if let Some(block) = self.try_alloc_request_block(data.len())? {
-                    block.write_at(0, data)?;
+                if let Some(block) = self.try_alloc_request_block(data.as_ref().len())? {
+                    block.write_at(0, data.as_ref())?;
                     let loan = block.prepare(&send.conn)?;
                     let alloc = block.allocation();
                     let descriptor = encode_buddy_payload(&BuddyPayload {
@@ -681,16 +1082,16 @@ impl IpcClient {
                             bytes,
                             WriteRequest::Business(vec![loan]),
                             send.state.clone(),
-                            None,
+                            control.cloned(),
                         )
                         .await;
                 }
             }
             let size = self.config.chunk_size as usize;
-            if data.len() > size {
+            if data.as_ref().len() > size {
                 let metadata = rpc::encode_open_metadata(&identity, index)
                     .map_err(|error| IpcError::Protocol(error.to_string()))?;
-                for (part, bytes) in data.chunks(size).enumerate() {
+                for (part, bytes) in data.as_ref().chunks(size).enumerate() {
                     if *stop_upload.borrow() {
                         return Ok(());
                     }
@@ -699,10 +1100,10 @@ impl IpcClient {
                         &send.state,
                         0,
                         part,
-                        data.len(),
+                        data.as_ref().len(),
                         (part == 0).then_some(metadata.as_slice()),
                         bytes,
-                        None,
+                        if part == 0 { control.cloned() } else { None },
                     )
                     .await?;
                 }
@@ -712,16 +1113,20 @@ impl IpcClient {
                     .map_err(|error| IpcError::Protocol(error.to_string()))?;
                 send.conn
                     .submit(
-                        frame::encode_frame_parts(0, flags::FLAG_RPC_RECORD, &[&metadata, data]),
+                        frame::encode_frame_parts(
+                            0,
+                            flags::FLAG_RPC_RECORD,
+                            &[&metadata, data.as_ref()],
+                        ),
                         WriteRequest::Business(Vec::new()),
                         send.state.clone(),
-                        None,
+                        control.cloned(),
                     )
                     .await
             }
         }
         .await;
-        match result {
+        let opening = match result {
             Err(error) => prefer_ready_response(error, &mut rx)
                 .map(|_| stream)
                 .map_err(|source| dispatch_call_error(source, send.started())),
@@ -731,6 +1136,13 @@ impl IpcClient {
                 Err(oneshot::error::TryRecvError::Empty) => Ok(stream),
                 Err(oneshot::error::TryRecvError::Closed) => Ok(stream),
             },
+        };
+        if opening.is_err() && send.started() {
+            // Opening failed after publication. The caller has no handle to
+            // drop, so submit cancellation while the original record and its
+            // slot continue to the real terminal.
+            let _ = cancellation.cancel();
         }
+        opening
     }
 }

@@ -7,6 +7,7 @@
 mod call_execution;
 mod call_scope;
 mod client;
+mod client_stream;
 mod connect_deadline;
 mod connection_observation;
 mod control;
@@ -27,6 +28,7 @@ pub use client::{
     Client, Connect, EncodedCall, EncodedClient, HeldResponse, ObservedPath, ObservedRoute,
     PathCounters, PreparedCall,
 };
+pub use client_stream::{CoreResponseStream, CoreStreamCloseReceipt};
 pub use connect_deadline::{ConnectAttempt, connect_deadline_error};
 pub use control::{direct_ipc_endpoint, ping_direct_ipc, shutdown_direct_ipc};
 pub use error::{
@@ -37,9 +39,9 @@ pub use error::{
     semantic_error_from_ipc_bytes,
 };
 pub use host::{
-    EncodedService, Host, HostOptions, MethodDefinition, Registration, RouteConcurrency,
-    RouteConcurrencyError, RouteConcurrencyGuard, RouteConcurrencySnapshot, ServiceConcurrencyMode,
-    ServiceDefinition,
+    EncodedService, EncodedStream, EncodedStreamItem, EncodedStreamService, Host, HostOptions,
+    MethodDefinition, Registration, RouteConcurrency, RouteConcurrencyError, RouteConcurrencyGuard,
+    RouteConcurrencySnapshot, ServiceConcurrencyMode, ServiceDefinition,
 };
 pub use identity::{
     auto_server_id, auto_server_instance_id, ipc_address_for_server_id, validate_server_id,

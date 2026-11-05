@@ -1,5 +1,5 @@
 use super::*;
-use crate::dispatcher::CrmStream;
+use crate::dispatcher::{CrmStream, CrmStreamItem};
 use crate::test_support::isolated_pair;
 use c2_contract::ValidatedContractDescriptor;
 use c2_error::ErrorCode;
@@ -23,14 +23,16 @@ struct Observed {
     steps: AtomicUsize,
     finished: AtomicUsize,
     item_bytes: AtomicUsize,
+    encoded_ranges: std::sync::Mutex<Vec<(usize, usize)>>,
     step_entered: std::sync::Mutex<Option<oneshot::Sender<()>>>,
     release_step: std::sync::Mutex<Option<mpsc::Receiver<()>>>,
     unary_entered: std::sync::Mutex<Option<oneshot::Sender<()>>>,
     release_unary: std::sync::Mutex<Option<mpsc::Receiver<()>>>,
+    finish_entered: std::sync::Mutex<Option<oneshot::Sender<()>>>,
 }
 
 impl CrmStream for CounterStream {
-    fn step(&mut self) -> Result<Option<ResponseMeta>, CrmError> {
+    fn step(&mut self) -> Result<Option<Box<dyn CrmStreamItem>>, CrmError> {
         self.observed.steps.fetch_add(1, Ordering::SeqCst);
         if self.next == self.total {
             return if self.failure == 1 {
@@ -57,17 +59,141 @@ impl CrmStream for CounterStream {
         } else {
             vec![value; self.observed.item_bytes.load(Ordering::SeqCst).max(4)]
         };
-        Ok(Some(ResponseMeta::Inline(data)))
+        Ok(Some(Box::new(CounterItem {
+            data,
+            observed: self.observed.clone(),
+        })))
     }
 
     fn finish(self: Box<Self>) -> Result<(), CrmError> {
         self.observed.finished.fetch_add(1, Ordering::SeqCst);
+        if let Some(entered) = self.observed.finish_entered.lock().unwrap().take() {
+            let _ = entered.send(());
+        }
         if self.failure == 2 {
             Err(CrmError::InternalError("finish failed".into()))
         } else {
             Ok(())
         }
     }
+}
+
+struct CounterItem {
+    data: Vec<u8>,
+    observed: Arc<Observed>,
+}
+
+impl CrmStreamItem for CounterItem {
+    fn len(&self) -> usize {
+        self.data.len()
+    }
+
+    fn write_range(&self, offset: usize, destination: &mut [u8]) -> Result<(), CrmError> {
+        self.observed
+            .encoded_ranges
+            .lock()
+            .unwrap()
+            .push((offset, destination.len()));
+        destination.copy_from_slice(&self.data[offset..offset + destination.len()]);
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn inline_encodes_each_granted_chunk_directly_from_the_domain_item() {
+    let observed = Arc::new(Observed::default());
+    let mut config = ServerIpcConfig::default();
+    config.base.chunk_size = 2;
+    let mut harness = Harness::start(observed.clone(), config, 0).await;
+    harness.open(1, &[1]).await;
+    assert!(matches!(
+        read_record(&mut harness.peer, CallMode::ServerStream).await,
+        SeenRecord::Begin(4)
+    ));
+    assert!(observed.encoded_ranges.lock().unwrap().is_empty());
+    harness
+        .peer
+        .write_all(&rpc::encode_credit_frame(1, 4, 0).unwrap())
+        .await
+        .unwrap();
+    for _ in 0..2 {
+        assert!(matches!(
+            read_record(&mut harness.peer, CallMode::ServerStream).await,
+            SeenRecord::Data(data) if data == [0; 2]
+        ));
+    }
+    assert_eq!(*observed.encoded_ranges.lock().unwrap(), [(0, 2), (2, 2)]);
+    harness
+        .peer
+        .write_all(&rpc::encode_credit_frame(1, 0, 1).unwrap())
+        .await
+        .unwrap();
+    assert!(matches!(
+        read_record(&mut harness.peer, CallMode::ServerStream).await,
+        SeenRecord::End(CallStatus::Success, Some(1), None)
+    ));
+    harness.stop().await;
+}
+
+#[tokio::test]
+async fn item_begin_does_not_allocate_a_copy_before_storage_credit() {
+    let observed = Arc::new(Observed::default());
+    let mut harness = Harness::start(observed.clone(), ServerIpcConfig::default(), 0).await;
+    harness.open(1, &[1]).await;
+    assert!(matches!(
+        read_record(&mut harness.peer, CallMode::ServerStream).await,
+        SeenRecord::Begin(4)
+    ));
+    assert!(observed.encoded_ranges.lock().unwrap().is_empty());
+    harness
+        .peer
+        .write_all(&rpc::encode_cancel_frame(1).unwrap())
+        .await
+        .unwrap();
+    assert!(matches!(
+        read_record(&mut harness.peer, CallMode::ServerStream).await,
+        SeenRecord::End(CallStatus::Failed, Some(0), Some(ErrorCode::CallCancelled))
+    ));
+    assert_eq!(observed.finished.load(Ordering::SeqCst), 1);
+    harness.stop().await;
+}
+
+#[tokio::test]
+async fn unregister_cleans_while_current_item_waits_for_storage_then_delivers_it() {
+    let observed = Arc::new(Observed::default());
+    let (finished, cleanup) = oneshot::channel();
+    *observed.finish_entered.lock().unwrap() = Some(finished);
+    let mut harness = Harness::start(observed, ServerIpcConfig::default(), 0).await;
+    harness.open(1, &[2]).await;
+    assert!(matches!(
+        read_record(&mut harness.peer, CallMode::ServerStream).await,
+        SeenRecord::Begin(4)
+    ));
+    let server = harness.server.clone();
+    let unregister = tokio::spawn(async move { server.unregister_route("portable").await });
+    tokio::time::timeout(Duration::from_secs(5), cleanup)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        !unregister.is_finished(),
+        "pending item still belongs to original call"
+    );
+    harness
+        .peer
+        .write_all(&rpc::encode_credit_frame(1, 4, 0).unwrap())
+        .await
+        .unwrap();
+    assert!(matches!(
+        read_record(&mut harness.peer, CallMode::ServerStream).await,
+        SeenRecord::Data(data) if data == [0; 4]
+    ));
+    assert!(matches!(
+        read_record(&mut harness.peer, CallMode::ServerStream).await,
+        SeenRecord::End(CallStatus::Failed, Some(1), Some(ErrorCode::CallCancelled))
+    ));
+    assert!(unregister.await.unwrap());
+    harness.stop().await;
 }
 
 #[test]
@@ -249,17 +375,8 @@ struct Harness {
 
 impl Harness {
     async fn start(observed: Arc<Observed>, config: ServerIpcConfig, capabilities: u16) -> Self {
-        Self::start_with_budget(observed, config, capabilities, None).await
-    }
-
-    async fn start_with_budget(
-        observed: Arc<Observed>,
-        config: ServerIpcConfig,
-        capabilities: u16,
-        budget: Option<u64>,
-    ) -> Self {
         let descriptor = ValidatedContractDescriptor::from_json(STREAM_DESCRIPTOR).unwrap();
-        let mut server = Server::new_with_endpoint(
+        let server = Server::new_with_endpoint(
             c2_config::LocalEndpointContext::default_for_platform()
                 .unwrap()
                 .endpoint(&format!(
@@ -270,9 +387,6 @@ impl Harness {
             config,
         )
         .unwrap();
-        if let Some(bytes) = budget {
-            server.stream_payload_budget = PayloadBufferBudget::new(bytes);
-        }
         let server = Arc::new(server);
         let built = server
             .build_stream_route(
@@ -517,9 +631,9 @@ async fn paused_stream_keeps_call_slot_but_releases_worker_for_unary() {
 }
 
 #[tokio::test]
-async fn registered_stream_continues_under_original_route_after_unregister_starts() {
-    let mut harness =
-        Harness::start(Arc::new(Observed::default()), ServerIpcConfig::default(), 0).await;
+async fn unregister_cancels_between_steps_under_original_route_admission() {
+    let observed = Arc::new(Observed::default());
+    let mut harness = Harness::start(observed.clone(), ServerIpcConfig::default(), 0).await;
     harness.open(1, &[2]).await;
     assert!(matches!(
         read_record(&mut harness.peer, CallMode::ServerStream).await,
@@ -536,45 +650,66 @@ async fn registered_stream_continues_under_original_route_after_unregister_start
     ));
     let server = harness.server.clone();
     let unregister = tokio::spawn(async move { server.unregister_route("portable").await });
+    assert!(matches!(
+        read_record(&mut harness.peer, CallMode::ServerStream).await,
+        SeenRecord::End(CallStatus::Failed, Some(1), Some(ErrorCode::CallCancelled))
+    ));
+    assert!(unregister.await.unwrap());
+    assert_eq!(observed.steps.load(Ordering::SeqCst), 1);
+    assert_eq!(observed.finished.load(Ordering::SeqCst), 1);
+    harness.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unregister_cancels_published_stream_waiting_for_its_first_route_permit() {
+    let observed = Arc::new(Observed::default());
+    let (entered, unary_entered) = oneshot::channel();
+    let (release, unary_release) = mpsc::channel();
+    *observed.unary_entered.lock().unwrap() = Some(entered);
+    *observed.release_unary.lock().unwrap() = Some(unary_release);
+    let mut harness = Harness::start(observed.clone(), ServerIpcConfig::default(), 0).await;
+    harness
+        .peer
+        .write_all(
+            &rpc::encode_open_frame(
+                1,
+                &harness.identity,
+                0,
+                ValuePart::whole(ValueStorage::Inline(&[])),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    unary_entered.await.unwrap();
+    harness.open(2, &[2]).await;
+    let conn = harness
+        .server
+        .active_connection(harness.server.active_connection_ids()[0])
+        .unwrap();
     tokio::time::timeout(Duration::from_secs(5), async {
-        while !harness
-            .server
-            .route_scheduler_snapshot("portable")
-            .await
-            .unwrap()
-            .closed
-        {
+        while conn.core.stream_state(2).is_none() {
             tokio::task::yield_now().await;
         }
     })
     .await
     .unwrap();
-    harness
-        .peer
-        .write_all(&rpc::encode_credit_frame(1, 0, 1).unwrap())
-        .await
-        .unwrap();
+    let server = harness.server.clone();
+    let unregister = tokio::spawn(async move { server.unregister_route("portable").await });
     assert!(matches!(
         read_record(&mut harness.peer, CallMode::ServerStream).await,
-        SeenRecord::Begin(4)
+        SeenRecord::End(
+            CallStatus::NotExecuted,
+            None,
+            Some(ErrorCode::CallCancelled)
+        )
     ));
-    harness
-        .peer
-        .write_all(&rpc::encode_credit_frame(1, 4, 0).unwrap())
-        .await
-        .unwrap();
+    assert_eq!(observed.steps.load(Ordering::SeqCst), 0);
+    assert_eq!(observed.finished.load(Ordering::SeqCst), 0);
+    release.send(()).unwrap();
     assert!(matches!(
-        read_record(&mut harness.peer, CallMode::ServerStream).await,
-        SeenRecord::Data(_)
-    ));
-    harness
-        .peer
-        .write_all(&rpc::encode_credit_frame(1, 0, 1).unwrap())
-        .await
-        .unwrap();
-    assert!(matches!(
-        read_record(&mut harness.peer, CallMode::ServerStream).await,
-        SeenRecord::End(CallStatus::Success, Some(2), None)
+        read_record(&mut harness.peer, CallMode::Unary).await,
+        SeenRecord::End(CallStatus::Success, None, None)
     ));
     assert!(unregister.await.unwrap());
     harness.stop().await;
@@ -1011,69 +1146,9 @@ async fn stream_item_can_use_real_shm_carrier() {
 }
 
 #[tokio::test]
-async fn own_transport_copy_capacity_error_is_failed_717_after_resource_entry() {
-    let mut harness = Harness::start_with_budget(
-        Arc::new(Observed::default()),
-        ServerIpcConfig::default(),
-        0,
-        Some(3),
-    )
-    .await;
-    harness.open(1, &[1]).await;
-    assert!(matches!(
-        read_record(&mut harness.peer, CallMode::ServerStream).await,
-        SeenRecord::End(
-            CallStatus::Failed,
-            Some(0),
-            Some(ErrorCode::CallCapacityExceeded)
-        )
-    ));
-    harness.stop().await;
-}
-
-#[tokio::test]
-async fn inline_item_can_use_the_entire_host_byte_budget() {
-    let mut harness = Harness::start_with_budget(
-        Arc::new(Observed::default()),
-        ServerIpcConfig::default(),
-        0,
-        Some(4),
-    )
-    .await;
-    harness.open(1, &[1]).await;
-    assert!(matches!(
-        read_record(&mut harness.peer, CallMode::ServerStream).await,
-        SeenRecord::Begin(4)
-    ));
-    harness
-        .peer
-        .write_all(&rpc::encode_credit_frame(1, 4, 0).unwrap())
-        .await
-        .unwrap();
-    assert!(
-        matches!(read_record(&mut harness.peer, CallMode::ServerStream).await, SeenRecord::Data(data) if data == [0; 4])
-    );
-    harness
-        .peer
-        .write_all(&rpc::encode_credit_frame(1, 0, 1).unwrap())
-        .await
-        .unwrap();
-    assert!(matches!(
-        read_record(&mut harness.peer, CallMode::ServerStream).await,
-        SeenRecord::End(CallStatus::Success, Some(1), None)
-    ));
-    harness.stop().await;
-}
-
-#[tokio::test]
-async fn inline_vec_capacity_is_charged_and_refunded_after_item_write() {
-    let mut harness = Harness::start_with_budget(
-        Arc::new(Observed::default()),
-        ServerIpcConfig::default(),
-        0,
-        Some(64),
-    )
-    .await;
+async fn domain_item_capacity_does_not_expand_the_transmitted_value() {
+    let mut harness =
+        Harness::start(Arc::new(Observed::default()), ServerIpcConfig::default(), 0).await;
     harness.open(1, &[1, 0, 1]).await;
     assert!(matches!(
         read_record(&mut harness.peer, CallMode::ServerStream).await,
@@ -1096,9 +1171,6 @@ async fn inline_vec_capacity_is_charged_and_refunded_after_item_write() {
         read_record(&mut harness.peer, CallMode::ServerStream).await,
         SeenRecord::End(CallStatus::Success, Some(1), None)
     ));
-    let budget = harness.server.stream_payload_budget.snapshot();
-    assert_eq!(budget.peak_bytes, 64);
-    assert_eq!(budget.used_bytes, 0);
     harness.stop().await;
 }
 
