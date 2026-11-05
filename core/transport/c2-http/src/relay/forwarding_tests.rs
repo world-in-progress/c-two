@@ -1821,15 +1821,19 @@ async fn h1_admitted_unknown_upload_can_finish_after_operation_admission_closes(
             .unwrap();
         bounded(upload.write_all(b"\r\n0\r\n\r\n")).await.unwrap();
         bounded(fixture.probe.entered[1].notified()).await;
-        assert_eq!(
+        // The upstream write releases its copy asynchronously; the callback can
+        // enter first. The callback is still held, so reaching zero here still
+        // proves the input is released before the reply.
+        eventually(|| {
             fixture
                 .state
                 .forwarding
                 .payload_budget()
                 .snapshot()
-                .used_bytes,
-            0
-        );
+                .used_bytes
+                == 0
+        })
+        .await;
         fixture.release(1);
         let reply = bounded(read_framed_reply(&mut upload)).await.unwrap();
         assert!(

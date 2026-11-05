@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import multiprocessing
 import threading
+import time
 import uuid
 from collections.abc import Iterator
 from itertools import product
@@ -283,6 +284,7 @@ def test_server_end_preserves_current_step_then_cancels_with_cause(direct_values
 
     advancing = threading.Thread(target=advance, daemon=True)
     ending = threading.Thread(target=end_route, daemon=True)
+    _, scheduler, _ = server._ensure_server_bridge().get_local_slot_info("stream-values")
     advancing.start()
     try:
         assert resource.step_entered.wait(5)
@@ -292,6 +294,15 @@ def test_server_end_preserves_current_step_then_cancels_with_cause(direct_values
             assert not ending.is_alive()
             assert "error" not in close
             assert close["receipt"]["completed"] is False
+        # The server records the cancellation asynchronously: shutdown(timeout=0)
+        # returns after initiating it, and unregister blocks until the stream
+        # ends. Both cancel the route's streams before closing its scheduler, so
+        # release the running step only after the route has closed; otherwise
+        # the generator may finish on its own first, which is a natural end.
+        deadline = time.monotonic() + 5
+        while not scheduler.snapshot().closed:
+            assert time.monotonic() < deadline, f"{end} did not close the route"
+            time.sleep(0.001)
         resource.release_step.set()
         advancing.join(5)
         assert not advancing.is_alive()
