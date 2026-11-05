@@ -58,6 +58,7 @@
 - `c_two.config.settings` 的直接写入是否受支持（G8）。
 - R21：Resource 模板生成器输出的仍是装饰并继承 CRM 的旧模型，c2-codegen 没有等价的 Resource 骨架；修好这个工具，还是退役这项功能（约 613 行）。
 - 发版方案 B 的决定 3、7。
+- IPC 客户端收内联帧没有可配置的长度上限：`recv_loop` 只检查帧长不小于帧头，随后照帧头的 u32 `total_len` 分配；服务端有 `max_frame_size`，客户端没有对应的设置。对端是经身份校验的同一用户进程，2026-11-05 块 8 计划阶段才发现。要不要给客户端对称的上限，或者由握手告知，待定。
 - TypeScript 的浏览器端：[终局架构](endgame-architecture.md)设想 Web 与 Node 消费同一契约，维护者 2026-11-05 认为 Web 端的做法存疑，需要讨论。若要支持，可以把 Rust 里不碰 I/O 的部分（编解码、调用终态与截止时间、路由解析）编成 wasm，fastdb4ts 已经带一个 wasm 模块；IPC 做不进 wasm。
 
 ## 顺带项
