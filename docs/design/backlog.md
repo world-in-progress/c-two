@@ -34,7 +34,6 @@
 
 - Windows x64 上 c2-server 的 `shutdown_preserves_active_reply_refuses_new_calls_and_fences_lifecycle_hook` 偶发失败一次：run 41936786846 第一次运行（job 126947267484）读回复等了 5 秒超时，日志看不出是哪一次读；重跑失败的任务即通过。macOS 上单独跑 60 次、整套 c2-server 测试跑 15 次都没有复现。块 5b 没有改到 unary 的写端、调度与连接关闭，这个测试从 ABI 7 起就有。它守的是 shutdown 时进行中的调用照样回复，如果回复真的丢了就是产品缺陷，要在 Windows 测试机上循环复现、查清是哪一次读没等到回复。协议批修过同类的 Windows 管道问题（服务端在客户端读到确认之前就放掉管道，见[协议批验收记录](../acceptance/2026-11-03-protocol-batch-acceptance.md)）。2026-11-05 派 Worker 在 Windows 11 x64 测试机上基于 `ae4b0647` 循环复现：单独跑、与整套 c2-server 测试并行跑、再加 12 个忙循环线程，共 1,796 次（7,184 次迭代），0 次失败；加了收帧、写出与 flush 的临时观察也没有超时现场，macOS 上 201 次同样通过。CI 那次卡在哪一次读仍不确定，Windows Server 2025 上没有直接验证。同日修 DISCONNECT 的 Worker 在带修复的候选上循环 3217 次，这个超时仍出现 2 次（约 0.06%），与 DISCONNECT 不是同一个根因。
 - Windows 上出现过一次堆损坏退出：修 DISCONNECT 的 Worker 在修复前的候选（基于 `ca405b34`）上循环 c2-server 测试时，一次进程以 0xC0000374（STATUS_HEAP_CORRUPTION）结束，没有归因。这可能是 unsafe 或 FFI 代码里的内存安全问题，要在 Windows 上复现，并用页堆（gflags 的 page heap）或 Application Verifier 定位。
-- Windows 上 c2-server 的 `normal_disconnect_before_eof_preserves_peer_close_message_as_first_cause` 偶发失败：上面那次复现里，与整套测试并行的第 14 轮把 DISCONNECT 之后的第一个关闭原因记成了 `IoError`，不是 `PeerCloseMessage`（`server_tests.rs:3437`，负载约 7%）。协议批的 `f83f35e8` 为同一个测试修过一次（先送达再关闭、先记关闭原因），看来还有路径没有兜住。待定位：是测试的假设，还是服务端在 Windows 上仍会先记下写失败。
 
 ## 不排期
 
