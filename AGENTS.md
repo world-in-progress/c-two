@@ -120,6 +120,7 @@ The language-neutral Cargo workspace is `core/`; the Python SDK owns its PyO3/ma
 | foundation | `c2-codegen` | FastDB Core delegation plus deterministic multi-owner artifact composition and new-tree publication |
 | foundation | `c2-config` | Unified IPC and relay configuration structs/resolvers |
 | foundation | `c2-error` | Canonical error registry and versioned `C2E1` wire codec |
+| foundation | `c2-local-security` | User-scoped security for local OS objects: Windows TokenUser identity, ACLs, pipe-owner checks and native peer identity failures |
 | foundation | `c2-mem` | Buddy allocator, SHM regions, unified memory pool |
 | foundation | `c2-mem-ffi` | Native memory and endpoint ABI, including verified Windows connection transfer |
 | protocol | `c2-wire` | Wire protocol codec, frames, chunk assembler, chunk registry |
@@ -194,7 +195,7 @@ Retired surfaces have no compatibility aliases; names of still-supported interna
 | Path or mechanism | Owning documents to read before changing |
 | --- | --- |
 | `core/foundation/c2-mem/`, `core/foundation/c2-mem-ffi/` | [Memory policy](docs/reference/memory-policy.md), [C ABI](docs/reference/c-abi.md), [payload lifetimes](docs/reference/payload-lifetime.md) |
-| `core/transport/c2-local/`, endpoint parts of `core/foundation/c2-config/` | [Local endpoint lifecycle](docs/reference/local-endpoint-lifecycle.md), [Windows native implementation](docs/reference/windows-native-implementation.md), [configuration](docs/reference/configuration.md) |
+| `core/transport/c2-local/`, `core/foundation/c2-local-security/`, endpoint parts of `core/foundation/c2-config/` | [Local endpoint lifecycle](docs/reference/local-endpoint-lifecycle.md), [Windows native implementation](docs/reference/windows-native-implementation.md), [configuration](docs/reference/configuration.md) |
 | `core/protocol/c2-wire/`, `core/transport/c2-ipc/`, `core/transport/c2-server/` | [IPC handshake](docs/reference/ipc-handshake.md), [memory policy](docs/reference/memory-policy.md), [payload lifetimes](docs/reference/payload-lifetime.md), [Runtime lifecycle](docs/reference/runtime-lifecycle.md) |
 | Relay in `core/transport/c2-http/` | [Contracts and routing](docs/reference/contracts-and-routing.md), [configuration](docs/reference/configuration.md), [c3](cli/README.md) |
 | `core/runtime/c2-core/` | [Runtime lifecycle](docs/reference/runtime-lifecycle.md), [contracts and routing](docs/reference/contracts-and-routing.md), [errors](docs/reference/errors.md) |

@@ -17,7 +17,7 @@ This page routes each subject to the document that owns it. It states no behavio
 
 | Path | Contents |
 | --- | --- |
-| `core/` | The language-neutral Rust workspace: foundation crates (contract, codegen, config, error, memory and the C ABI), the wire protocol, transports (local endpoints, IPC client and server, HTTP and relay) and the `c2-core` runtime |
+| `core/` | The language-neutral Rust workspace: foundation crates (contract, codegen, config, error, local OS-object security, memory and the C ABI), the wire protocol, transports (local endpoints, IPC client and server, HTTP and relay) and the `c2-core` runtime |
 | `sdk/python/` | The Python SDK, `c_two`, with its PyO3 extension in `native/` |
 | `sdk/rust/` | The user-facing Rust SDK, the `c-two` crate imported as `c_two` |
 | `cli/` | The `c3` command, including `c3 relay` |
