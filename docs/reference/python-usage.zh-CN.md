@@ -269,7 +269,7 @@ cc.shutdown()
 
 调用 `runtime.shutdown(timeout=...)` 会为该 SDK 会话启动 Core Runtime 唯一且永久的退役作用域；模块级 `cc.shutdown()` 对默认 Runtime 执行相同操作。该作用域封闭 Core 客户端池，并停止接受新的注册、启动和远程连接任务。待定观察保留旧会话及其槽位；Core 此后自行完成也不会替换它们。应再次调用 SDK shutdown，消费已完成的回执并进行会话交接。零或较短的等待预算只限制当前调用方的观察，不取消驱动任务。如果交接退役之前截止时间到期，shutdown 抛出 `CoreError`，包含 `lifecycle_kind='shutdown_wait_timeout'`、`details.stage` 和 `timeout_seconds`；这不是待定回执。Python 的数值转换在取得 SDK 实例锁前发生。等待取得该锁不计入 shutdown 截止时间；取得锁后，Native Host、Core 与连接池等待共用一个绝对截止时间。关闭错误投影和关闭回调在 Python 绑定锁外运行。回调在会话替换后运行；如果构造替换会话失败，原始槽位及日志仍可用。
 
-关闭从不让已发出的调用失败：其他线程上的在途调用照常完成并拿到结果，它们还在执行时，关闭报告 `completed=False`。一个没设调用期限、在等一个停住的服务端的线程会继续等下去，而 Python 退出前会等所有非守护线程；这类调用请用 `cc.with_call_options(timeout=...)` 设期限。
+关闭从不让已发出的一元调用失败：其他线程上的在途调用照常完成并拿到结果，它们还在执行时，关闭报告 `completed=False`。这个 Runtime 作为资源方的服务端流是例外：关闭在两步之间结束它，先交付已产出的条目，再执行清理，最后以写明 shutdown 的 `CallCancelled` 结束；关闭要等这次清理结束才算完成。这个 Runtime 作为客户端消费的流不会被它自己的关闭结束，要显式关闭或丢弃。一个没设调用期限、在等一个停住的服务端的线程会继续等下去，而 Python 退出前会等所有非守护线程；这类调用请用 `cc.with_call_options(timeout=...)` 设期限。
 
 `cc.serve(shutdown_timeout=30.0)` 在开始服务之前就拒绝无效的预算，之后阻塞到 Unix 上收到 SIGINT 或 SIGTERM、Windows 上收到 SIGINT 或 SIGBREAK，或原生 Host 自己停止（例如收到直接 IPC 关停请求），再以 `shutdown(timeout=shutdown_timeout)` 调用一次关闭并返回其结果。结果为待定时，清理在后台继续，之后再调用 `cc.shutdown()` 可以观察到它完成。`blocking=False` 时立即返回 `None`。
 
