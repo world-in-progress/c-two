@@ -19,15 +19,6 @@ pub enum CodegenError {
     #[error(transparent)]
     Contract(#[from] c2_contract::ContractError),
     #[error(
-        "{target} code generation does not support server_stream method {method_name:?} at $.methods[{method_index}].mode",
-        target = .target.as_str()
-    )]
-    UnsupportedServerStream {
-        target: ContractCodegenTarget,
-        method_index: usize,
-        method_name: String,
-    },
-    #[error(
         "FastDB failed for nested binding {binding_path}: {symbol} ({code}) at {path}: {message}"
     )]
     FastDb {

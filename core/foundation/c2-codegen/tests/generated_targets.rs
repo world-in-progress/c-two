@@ -83,13 +83,16 @@ fn every_target_contains_a_c_two_owned_contract_module() {
                 "createIpcEncodedTransport",
                 "createHttpRelayEncodedTransport",
                 "createRelayAwareHttpEncodedTransport",
-                "C2IpcMemoryContext",
+                "C2NativeEndpointContext",
+                "C2NativeCall",
+                "C2ResponseStream",
             ] {
                 assert!(
                     source.contains(transport_symbol),
                     "missing preserved TypeScript transport symbol {transport_symbol}",
                 );
             }
+            assert!(!source.contains("C2IpcMemoryContext"));
             assert!(source.contains("hold_method_1_echo"));
             assert!(source.contains("releasable.invalidate.call(value)"));
         }
@@ -354,6 +357,7 @@ fn generated_typescript_project_typechecks_against_fastdb_source() {
             "moduleResolution": "Bundler",
             "lib": ["ES2022", "DOM"],
             "strict": true,
+            "typeRoots": [tempdir.path().join("node_modules/@types")],
             "skipLibCheck": true,
             "noEmit": true,
             "noUnusedLocals": true,
@@ -489,16 +493,12 @@ fn generated_typescript_payload_lifecycle_is_failure_safe() {
         .ancestors()
         .nth(3)
         .unwrap();
-    let fastdb_typescript = repository.parent().unwrap().join("fastdb/ts/fastdb4ts");
-    // See the typecheck test: Windows cannot execute the POSIX `.bin/tsc` shim.
-    let tsc = fastdb_typescript.join("node_modules/typescript/bin/tsc");
-    let node = Command::new("node").arg("--version").output();
-    if !tsc.is_file() || node.is_err() {
-        eprintln!(
-            "skipping generated TypeScript lifecycle check because TypeScript/Node tooling is unavailable"
-        );
-        return;
-    }
+    let tsc = repository
+        .join("core/foundation/c2-mem-ffi/bindings/typescript/node_modules/typescript/bin/tsc");
+    assert!(
+        tsc.is_file(),
+        "install the pinned TypeScript compiler before this gate"
+    );
 
     let tempdir = tempfile::tempdir().unwrap();
     let generated = tempdir.path().join("generated");
@@ -651,7 +651,8 @@ console.warn = (...args: unknown[]): void => { warnings.push(args.map(String).jo
 let responseReleaseThrows = false;
 const transportReleaseError = new Error("transport release failed");
 const transport: C2EncodedClientTransport = {
-  async call(_routeName, _contract, _method, _payload) {
+  async call(_routeName: string, _contract: unknown, _method: string, request: unknown) {
+    if (typeof request === "function") request();
     events.push("transport:call");
     const response = new Uint8Array([7]) as Uint8Array & { release(): void };
     response.release = (): void => {
@@ -829,6 +830,38 @@ if (!String(firstReleaseError).includes("response invalidate failed") || warning
   throw new Error(`lost secondary held cleanup errors: ${JSON.stringify(warnings)}`);
 }
 requireEvents(["response:invalidate", "response:dispose", "transport:release"]);
+
+for (const hold of [false, true]) {
+  let clock = 0;
+  let dispatched = 0;
+  const timedTransport: C2EncodedClientTransport = {
+    async call(_route: string, _contract: unknown, _method: string, request: unknown) {
+      const deadline = clock + 10;
+      if (typeof request === "function") request();
+      if (clock >= deadline) {
+        throw Object.assign(new Error("input encoding expired"), {
+          nativeDetails: { code: 715, transportPhase: "pre_dispatch" },
+        });
+      }
+      dispatched++;
+      return new Uint8Array([7]);
+    },
+  };
+  class SlowInput extends Payload {
+    override binaryBytes(): Uint8Array { clock += 11; return super.binaryBytes(); }
+  }
+  const timedClient = new ContractClient(timedTransport, "payload-route");
+  let failure: unknown;
+  try {
+    if (hold) await timedClient.hold_method_1_echo(new SlowInput());
+    else await timedClient.method_1_echo(new SlowInput());
+  } catch (error) { failure = error; }
+  const details = (failure as {nativeDetails?: {code: number; transportPhase: string}} | undefined)?.nativeDetails;
+  if (details?.code !== 715 || details.transportPhase !== "pre_dispatch" || dispatched !== 0) {
+    throw new Error(`unary encoded before its original deadline (hold=${hold}, dispatched=${dispatched})`);
+  }
+}
+
 "#,
     )
     .unwrap();
@@ -839,6 +872,7 @@ requireEvents(["response:invalidate", "response:dispose", "transport:release"]);
             "moduleResolution": "NodeNext",
             "lib": ["ES2022", "DOM"],
             "strict": true,
+            "typeRoots": [tempdir.path().join("node_modules/@types")],
             "skipLibCheck": true,
             "noUnusedLocals": true,
             "noUnusedParameters": true,

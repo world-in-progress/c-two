@@ -1,551 +1,262 @@
 import assert from 'node:assert/strict';
-import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 
 import {
   C2_MEM_FFI_ABI_VERSION,
-  C2_MEM_FFI_STATUS_INVALID_ARGUMENT,
-  C2NodeIpcConnectionError,
-  createBundledC2MemFfiNodeRuntime,
-  createNodeIpcConnect,
+  captureLocalIpcEndpointContext,
+  createNodeIpcConnector,
   loadBundledC2MemFfiNodeNativeSymbols,
   loadC2MemFfiNodeNativeSymbols,
   resolveBundledC2MemFfiNodeNativeLibraryPath,
   resolveLocalIpcEndpoint,
 } from '../dist/index.js';
 
-function libraryPath() {
-  return resolveBundledC2MemFfiNodeNativeLibraryPath();
-}
+const bundled = () => resolveBundledC2MemFfiNodeNativeLibraryPath();
 
-function localTestDirectory(prefix) {
-  const parent = new URL('../target/node-loader-tests/', import.meta.url);
-  mkdirSync(parent, { recursive: true });
-  return mkdtempSync(resolve(fileURLToPath(parent), prefix));
-}
-
-function compileContextFixture(directory, omittedSymbol, connectStatus = 1) {
-  const source = readFileSync(new URL('../native/node_c2_mem_ffi_loader.c', import.meta.url), 'utf8');
-  const required = [...source.matchAll(/LOAD_REQUIRED\(\w+, "([^"]+)"\)/g)].map((match) => match[1]);
-  const body = required.filter((name) => ![
-    'c2_mem_ffi_abi_version', 'c2_mem_ffi_local_endpoint_context_capture',
-    'c2_mem_ffi_local_endpoint_context_free', 'c2_mem_ffi_local_endpoint_context_name_len',
-    'c2_mem_ffi_local_endpoint_context_name_copy', 'c2_mem_ffi_local_endpoint_context_namespace_id_len',
-    'c2_mem_ffi_local_endpoint_context_namespace_id_copy', omittedSymbol,
-  ].includes(name)).map((name) => {
-    // A real failed native attempt freezes the snapshot without creating a
-    // socket. The reference-count tests do not need an injected JS connector.
-    if (name === 'c2_mem_ffi_local_endpoint_context_connect_unix') return `
-      #[unsafe(no_mangle)] pub unsafe extern "C" fn ${name}(
-        _ctx: *const Context, _address: *const u8, _timeout: *const u64, fd: *mut i32, os: *mut i32) -> u32 {
-        unsafe { *fd = -1; *os = 0; } ${connectStatus}
-      }`;
-    if (name === 'c2_mem_ffi_local_endpoint_context_connect_windows') return `
-      #[unsafe(no_mangle)] pub unsafe extern "C" fn ${name}(
-        _ctx: *const Context, _address: *const u8, _timeout: *const u64, pipe: *mut usize, process: *mut usize, os: *mut i32) -> u32 {
-        unsafe { *pipe = 0; *process = 0; *os = 0; } ${connectStatus}
-      }`;
-    return `#[unsafe(no_mangle)] pub extern "C" fn ${name}() { std::process::abort(); }`;
-  }).join('\n');
-  const fixture = resolve(directory, 'context.rs');
-  writeFileSync(fixture, `
-    const NAME: &str = "/tmp/c2-context-fixture.sock";
-    #[unsafe(no_mangle)] pub extern "C" fn c2_mem_ffi_abi_version() -> u32 { 7 }
-    ${body}
-      use std::sync::atomic::{AtomicUsize, Ordering};
-      static FREES: AtomicUsize = AtomicUsize::new(0);
-      pub struct Context(u8);
-      unsafe fn copy(value: &str, dst: *mut u8, len: usize, out: *mut usize) -> u32 {
-        if dst.is_null() || out.is_null() { return 1; }
-        unsafe { *out = 0; }
-        if len < value.len() + 1 { return 4; }
-        unsafe { std::ptr::copy_nonoverlapping(value.as_ptr(), dst, value.len());
-          *dst.add(value.len()) = 0; *out = value.len(); } 0
-      }
-      #[unsafe(no_mangle)] pub unsafe extern "C" fn c2_mem_ffi_local_endpoint_context_capture(
-          _root: *const u8, out: *mut *mut Context) -> u32 {
-        if out.is_null() { return 1; }
-        unsafe { *out = Box::into_raw(Box::new(Context(1))); } 0
-      }
-      #[unsafe(no_mangle)] pub unsafe extern "C" fn c2_mem_ffi_local_endpoint_context_free(ptr: *mut Context) {
-        if !ptr.is_null() { let owner = unsafe { Box::from_raw(ptr) }; assert_eq!(owner.0, 1);
-          FREES.fetch_add(1, Ordering::SeqCst); }
-      }
-      #[unsafe(no_mangle)] pub unsafe extern "C" fn c2_mem_ffi_local_endpoint_context_name_len(
-          ctx: *const Context, address: *const u8, out: *mut usize) -> u32 {
-        if ctx.is_null() || address.is_null() || out.is_null() { return 1; }
-        unsafe { *out = NAME.len(); } 0
-      }
-      #[unsafe(no_mangle)] pub unsafe extern "C" fn c2_mem_ffi_local_endpoint_context_name_copy(
-          ctx: *const Context, address: *const u8, dst: *mut u8, len: usize, out: *mut usize) -> u32 {
-        if ctx.is_null() || address.is_null() { return 1; }
-        unsafe { copy(NAME, dst, len, out) }
-      }
-      #[unsafe(no_mangle)] pub unsafe extern "C" fn c2_mem_ffi_local_endpoint_context_namespace_id_len(
-          ctx: *const Context, out: *mut usize) -> u32 {
-        if ctx.is_null() || out.is_null() { return 1; }
-        unsafe { *out = FREES.load(Ordering::SeqCst).to_string().len(); } 0
-      }
-      #[unsafe(no_mangle)] pub unsafe extern "C" fn c2_mem_ffi_local_endpoint_context_namespace_id_copy(
-          ctx: *const Context, dst: *mut u8, len: usize, out: *mut usize) -> u32 {
-        if ctx.is_null() { return 1; }
-        unsafe { copy(&FREES.load(Ordering::SeqCst).to_string(), dst, len, out) }
-      }
-  `);
-  const library = resolve(directory, process.platform === 'win32' ? 'context.dll' : process.platform === 'darwin' ? 'context.dylib' : 'context.so');
-  const output = spawnSync(process.env.RUSTC ?? 'rustc',
-    ['--edition=2024', '--crate-type=cdylib', fixture, '-o', library],
-    { cwd: directory, encoding: 'utf8' });
-  assert.equal(output.status, 0, `${output.error ?? ''} ${output.stdout} ${output.stderr}`);
+function compileVersionOnly(directory, version) {
+  const source = resolve(directory, 'version.rs');
+  const library = resolve(directory, process.platform === 'win32' ? 'version.dll' :
+    process.platform === 'darwin' ? 'version.dylib' : 'version.so');
+  writeFileSync(source, `#[unsafe(no_mangle)] pub extern "C" fn c2_mem_ffi_abi_version() -> u32 { ${version} }`);
+  const result = spawnSync(process.env.RUSTC ?? 'rustc',
+    ['--edition=2024', '--crate-type=cdylib', source, '-o', library], { encoding: 'utf8' });
+  assert.equal(result.status, 0, result.stderr);
   return library;
 }
 
-test('native endpoint resolution rejects NUL and non-object options first', () => {
+test('native endpoint resolution validates arguments and derives one OS endpoint', () => {
   assert.throws(() => resolveLocalIpcEndpoint('ipc://bad\0name'), /NUL/);
   assert.throws(() => resolveLocalIpcEndpoint('ipc://invalid-options', null), /options must be an object/);
-});
-test('logical addresses resolve to one deterministic native OS endpoint', () => {
   const address = `ipc://native-strict-${process.pid}`;
-  const endpoint = resolveLocalIpcEndpoint(address);
-  if (process.platform === 'win32') {
-    assert.ok(endpoint.startsWith('\\\\.\\pipe\\c_two-'));
-  } else {
-    assert.match(endpoint, /^\/tmp\/c2-v3-[0-9a-f]+\/[0-9a-f]{32}$/);
-  }
-  assert.equal(endpoint, resolveLocalIpcEndpoint(address));
-  const runtime = createBundledC2MemFfiNodeRuntime();
-  assert.equal(runtime.resolveEndpoint(address), endpoint);
-});
-
-test('c2-mem-ffi bundled Node native loader resolves packaged runtime artifacts', () => {
-  const bundled = resolveBundledC2MemFfiNodeNativeLibraryPath();
-  assert.equal(existsSync(bundled), true, `${bundled} must exist; run npm run build:node-addon`);
-  assert.match(bundled, /dist[\\/]native[\\/](?:libc2_mem_ffi\.(?:dylib|so)|c2_mem_ffi\.dll)$/);
-  const { symbols } = loadBundledC2MemFfiNodeNativeSymbols();
-  assert.equal(symbols.c2_mem_ffi_abi_version(), C2_MEM_FFI_ABI_VERSION);
-});
-
-test('native context snapshots resolver roots and env files without creating endpoint directories', {
-  skip: process.platform === 'win32' && 'Unix roots are explicitly unsupported on Windows',
-}, () => {
-  const { symbols } = loadBundledC2MemFfiNodeNativeSymbols();
-  assert.equal(typeof symbols.c2_mem_ffi_local_endpoint_context_capture, 'function');
-  const directory = localTestDirectory('snapshot-');
-  const envFile = resolve(directory, 'endpoint.env');
-  const savedRoot = process.env.C2_IPC_ROOT;
-  const savedEnvFile = process.env.C2_ENV_FILE;
-  const suffix = `${process.pid.toString(16)}${Date.now().toString(16).slice(-4)}`;
-  const rootA = `/tmp/cna${suffix}`;
-  const rootB = `/tmp/cnb${suffix}`;
-  const address = 'ipc://node-context-snapshot';
-  let captured, explicit, fromFile;
-  try {
-    assert.equal(existsSync(rootA), false);
-    assert.equal(existsSync(rootB), false);
-    process.env.C2_ENV_FILE = '';
-    process.env.C2_IPC_ROOT = rootA;
-    const result = symbols.c2_mem_ffi_local_endpoint_context_capture(null);
-    assert.equal(result.status, 0);
-    captured = result.value;
-    const endpointA = captured.endpointName(address).value;
-    const namespaceA = captured.namespaceId().value;
-    assert.ok(endpointA.startsWith(`${rootA}/`));
-
-    process.env.C2_IPC_ROOT = rootB;
-    assert.equal(captured.endpointName(address).value, endpointA);
-    assert.equal(captured.namespaceId().value, namespaceA);
-    assert.ok(symbols.c2_mem_ffi_local_endpoint(address).value.startsWith(`${rootB}/`));
-    explicit = symbols.c2_mem_ffi_local_endpoint_context_capture(rootA).value;
-    assert.equal(explicit.endpointName(address).value, endpointA);
-    assert.equal(explicit.namespaceId().value, namespaceA);
-
-    process.env.C2_ENV_FILE = directory; // An unreadable-as-file env source.
-    const explicitWithoutFile = symbols.c2_mem_ffi_local_endpoint_context_capture(rootA);
-    assert.equal(explicitWithoutFile.status, 0);
-    try {
-      assert.equal(explicitWithoutFile.value.endpointName(address).value, endpointA);
-    } finally {
-      explicitWithoutFile.value.close();
-    }
-    assert.deepEqual(symbols.c2_mem_ffi_local_endpoint_context_capture(null), {
-      status: C2_MEM_FFI_STATUS_INVALID_ARGUMENT,
-    });
-
-    delete process.env.C2_IPC_ROOT;
-    process.env.C2_ENV_FILE = envFile;
-    writeFileSync(envFile, `C2_IPC_ROOT=${rootA}\n`);
-    fromFile = symbols.c2_mem_ffi_local_endpoint_context_capture(null).value;
-    writeFileSync(envFile, `C2_IPC_ROOT=${rootB}\n`);
-    assert.equal(fromFile.endpointName(address).value, endpointA);
-    assert.ok(symbols.c2_mem_ffi_local_endpoint(address).value.startsWith(`${rootB}/`));
-    for (const invalid of ['', 'relative', '/tmp/../bad']) {
-      assert.deepEqual(symbols.c2_mem_ffi_local_endpoint_context_capture(invalid), {
-        status: C2_MEM_FFI_STATUS_INVALID_ARGUMENT,
-      });
-    }
-    const longRoot = '/tmp/' + 'x'.repeat(200);
-    const overlong = symbols.c2_mem_ffi_local_endpoint_context_capture(longRoot);
-    assert.equal(overlong.status, 0, 'root parsing is pure');
-    try {
-      const derived = overlong.value.endpointName(address);
-      assert.equal(derived.status, 0);
-      assert.ok(derived.value.startsWith(`${longRoot}/`));
-      assert.equal(derived.value.slice(longRoot.length + 1).length, 32);
-      assert.equal(existsSync(longRoot), false);
-    } finally {
-      overlong.value.close();
-    }
-    assert.equal(existsSync(rootA), false);
-    assert.equal(existsSync(rootB), false);
-  } finally {
-    captured?.close(); explicit?.close(); fromFile?.close();
-    if (savedRoot === undefined) delete process.env.C2_IPC_ROOT;
-    else process.env.C2_IPC_ROOT = savedRoot;
-    if (savedEnvFile === undefined) delete process.env.C2_ENV_FILE;
-    else process.env.C2_ENV_FILE = savedEnvFile;
-    rmSync(directory, { recursive: true, force: true });
-  }
-});
-
-test('native context is opaque, validates receivers and closes idempotently', () => {
-  const { symbols } = loadBundledC2MemFfiNodeNativeSymbols();
-  const result = symbols.c2_mem_ffi_local_endpoint_context_capture(null);
-  assert.equal(result.status, 0);
-  const context = result.value;
-  try {
-    assert.deepEqual(Object.keys(context), []);
-    assert.deepEqual(context.endpointName('/tmp/absolute.sock'), { status: C2_MEM_FFI_STATUS_INVALID_ARGUMENT });
-    assert.throws(() => context.endpointName('ipc://bad\0name'), /NUL/);
-    assert.throws(() => context.endpointName.call({}, 'ipc://borrowed'), /context receiver/);
-    assert.throws(() => context.namespaceId.call({}), /context receiver/);
-    assert.throws(() => context.close.call({}), /context receiver/);
-    assert.equal(Reflect.deleteProperty(context, 'close'), false);
-    assert.throws(() => symbols.c2_mem_ffi_local_endpoint_context_capture('bad\0root'), /NUL/);
-    assert.throws(() => symbols.c2_mem_ffi_local_endpoint_context_capture(123), /string or null/);
-  } finally {
-    context.close();
-    context.close();
-  }
-  assert.throws(() => context.endpointName('ipc://closed'), /context is closed/);
-  assert.throws(() => context.namespaceId(), /context is closed/);
-});
-
-test('Runtime shares its first-attempt native snapshot with queries and reconnects in an isolated environment', {
-  skip: process.platform === 'win32' && 'Unix env-root freeze; Windows root rejection remains separately covered',
-}, () => {
-  const moduleUrl = new URL('../dist/index.js', import.meta.url).href;
-  const script = `
-    import assert from 'node:assert/strict';
-    import net from 'node:net';
-    import { EventEmitter } from 'node:events';
-    import { existsSync } from 'node:fs';
-    import { createBundledC2MemFfiNodeRuntime } from ${JSON.stringify(moduleUrl)};
-    const rootA = '/tmp/c2ra' + process.pid;
-    const rootB = '/tmp/c2rb' + process.pid;
-    assert.equal(existsSync(rootA), false); assert.equal(existsSync(rootB), false);
-    process.env.C2_ENV_FILE = '';
-    process.env.C2_IPC_ROOT = rootA;
-    const paths = [], writes = [];
-    let fail = false;
-    class Socket extends EventEmitter {
-      destroyed = false;
-      pause() { return this; }
-      resume() { return this; }
-      write(bytes, callback) { writes.push(bytes); callback?.(); return true; }
-      end() { this.emit('end'); return this; }
-      destroy() { if (!this.destroyed) { this.destroyed = true; this.emit('close'); } return this; }
-    }
-    // Actual native derivation, mocked sockets only; this is not transport evidence.
-    const mockConnect = (path) => {
-      paths.push(path);
-      const socket = new Socket();
-      const failing = fail;
-      queueMicrotask(() => socket.emit(failing ? 'error' : 'connect', new Error('first attempt failed')));
-      return socket;
-    };
-    const runtime = createBundledC2MemFfiNodeRuntime({ createConnection: mockConnect });
-    const queryA = runtime.resolveEndpoint('ipc://same');
-    process.env.C2_IPC_ROOT = rootB;
-    const queryB = runtime.resolveEndpoint('ipc://same');
-    assert.notEqual(queryA, queryB, 'pure queries must not freeze');
-    process.env.C2_IPC_ROOT = rootA;
-    const first = await runtime.connect('ipc://same');
-    process.env.C2_IPC_ROOT = rootB;
-    assert.equal(runtime.resolveEndpoint('ipc://same'), queryA);
-    const second = await runtime.connect('ipc://other');
-    assert.ok(paths.at(-1).startsWith(rootA + '/'));
-    first.close();
-    const retry = await runtime.connect('ipc://same');
-    assert.equal(paths.at(-1), queryA);
-    const fresh = createBundledC2MemFfiNodeRuntime({ createConnection: mockConnect });
-    const fromB = await fresh.connect('ipc://same');
-    assert.equal(paths.at(-1), queryB);
-    runtime.close(); runtime.close();
-    const payload = new Uint8Array([1, 2, 3]);
-    await second.write(payload);
-    assert.equal(writes.at(-1), payload, 'snapshot disposal must not alter payload writes');
-    second.close(); retry.close(); fromB.close(); fresh.close();
-    assert.throws(() => runtime.resolveEndpoint('ipc://same'), /connector is closed/);
-
-    process.env.C2_IPC_ROOT = rootA;
-    const failed = createBundledC2MemFfiNodeRuntime({ createConnection: mockConnect });
-    fail = true;
-    await assert.rejects(() => failed.connect('ipc://same'), /first attempt failed/);
-    process.env.C2_IPC_ROOT = rootB;
-    assert.equal(failed.resolveEndpoint('ipc://same'), queryA);
-    fail = false;
-    const afterFailure = await failed.connect('ipc://same');
-    assert.equal(paths.at(-1), queryA);
-    afterFailure.close();
-    const again = await failed.connect('ipc://different');
-    assert.ok(paths.at(-1).startsWith(rootA + '/'));
-    again.close(); failed.close();
-    assert.equal(existsSync(rootA), false); assert.equal(existsSync(rootB), false);
-  `;
-  const output = spawnSync(process.execPath, ['--input-type=module', '-e', script], { encoding: 'utf8' });
-  assert.equal(output.status, 0, output.stdout + output.stderr);
-});
-
-test('Windows context keeps current-SID pipe defaults and rejects Unix roots natively', {
-  skip: process.platform !== 'win32' && 'Requires the real Windows platform',
-}, () => {
-  const { symbols } = loadBundledC2MemFfiNodeNativeSymbols();
-  const savedRoot = process.env.C2_IPC_ROOT;
-  const savedEnvFile = process.env.C2_ENV_FILE;
-  let context;
-  try {
-    delete process.env.C2_IPC_ROOT;
-    process.env.C2_ENV_FILE = '';
-    const result = symbols.c2_mem_ffi_local_endpoint_context_capture(null);
-    assert.equal(result.status, 0);
-    context = result.value;
-    const endpoint = context.endpointName('ipc://windows-context').value;
-    assert.ok(endpoint.startsWith('\\\\.\\pipe\\c_two-'));
-    assert.equal(endpoint, symbols.c2_mem_ffi_local_endpoint('ipc://windows-context').value);
-    for (const root of ['C:\\endpoint-root', '\\\\.\\pipe\\arbitrary', '/tmp/root']) {
-      assert.deepEqual(symbols.c2_mem_ffi_local_endpoint_context_capture(root), {
-        status: C2_MEM_FFI_STATUS_INVALID_ARGUMENT,
-      });
-    }
-    process.env.C2_IPC_ROOT = 'C:\\endpoint-root';
-    assert.deepEqual(symbols.c2_mem_ffi_local_endpoint_context_capture(null), {
-      status: C2_MEM_FFI_STATUS_INVALID_ARGUMENT,
-    });
-    assert.equal(context.endpointName('ipc://windows-context').value, endpoint);
-  } finally {
-    context?.close();
-    if (savedRoot === undefined) delete process.env.C2_IPC_ROOT;
-    else process.env.C2_IPC_ROOT = savedRoot;
-    if (savedEnvFile === undefined) delete process.env.C2_ENV_FILE;
-    else process.env.C2_ENV_FILE = savedEnvFile;
-  }
-});
-
-test('native addon rejects ABI 7 without the complete context symbol group', () => {
-  const directory = localTestDirectory('incomplete-abi7-');
-  try {
-    const library = compileContextFixture(directory, 'c2_mem_ffi_local_endpoint_context_connect_unix');
-    assert.throws(() => loadC2MemFfiNodeNativeSymbols(library), /Failed to load.*c2_mem_ffi_local_endpoint_context_connect_unix/);
-  } finally {
-    rmSync(directory, { recursive: true, force: true });
-  }
-});
-
-test('native connect preserves identity refusal separately from OS access failure', () => {
-  const directory = localTestDirectory('connect-error-kind-');
-  try {
-    const cases = [[5, 'IO_ERROR'], [6, 'PERMISSION_DENIED'], [7, 'IDENTITY_MISMATCH']];
-    const libraries = cases.map(([status, name]) => {
-      const child = resolve(directory, name);
-      mkdirSync(child);
-      return [compileContextFixture(child, undefined, status), status, name];
-    });
-    const moduleUrl = new URL('../dist/index.js', import.meta.url).href;
-    // Only exercise result projection through the real addon; these native
-    // fixtures return errors without opening any socket or pipe.
-    const script = `
-      import assert from 'node:assert/strict';
-      import { loadC2MemFfiNodeNativeSymbols, captureLocalIpcEndpointContextFromSymbols,
-        createNodeIpcConnect, C2NodeIpcConnectionError } from ${JSON.stringify(moduleUrl)};
-      for (const [library, status, name] of JSON.parse(process.argv[1])) {
-        const { symbols } = loadC2MemFfiNodeNativeSymbols(library);
-        const raw = symbols.c2_mem_ffi_local_endpoint_context_capture(null).value;
-        try {
-          assert.deepEqual(await symbols.c2_mem_ffi_endpoint_context_connect_windows(raw, 'ipc://classification'), {status});
-        } finally { raw.close(); }
-        const context = captureLocalIpcEndpointContextFromSymbols(symbols);
-        const connect = createNodeIpcConnect({endpointContext: context});
-        try {
-          await assert.rejects(connect('ipc://classification'), error => {
-            assert.ok(error instanceof C2NodeIpcConnectionError);
-            assert.ok(error.message.includes(name), error.message);
-            return true;
-          });
-        } finally { connect.close(); context.close(); }
-      }
-    `;
-    const output = spawnSync(process.execPath, ['--input-type=module', '-e', script, JSON.stringify(libraries)], { encoding: 'utf8' });
-    assert.equal(output.status, 0, `${output.signal ?? ''} ${output.stdout}${output.stderr}`);
-  } finally {
-    rmSync(directory, { recursive: true, force: true });
-  }
-});
-
-test('opaque native context frees exactly once on close or GC and detached methods cannot retain a dangling pointer', () => {
-  const directory = localTestDirectory('context-ownership-');
-  try {
-    // This instrumented library measures addon ownership, not transport behavior.
-    const library = compileContextFixture(directory);
-    const moduleUrl = new URL('../dist/index.js', import.meta.url).href;
-    const script = `
-      import assert from 'node:assert/strict';
-      import { loadC2MemFfiNodeNativeSymbols } from ${JSON.stringify(moduleUrl)};
-      const { symbols } = loadC2MemFfiNodeNativeSymbols(process.argv[1]);
-      const capture = () => symbols.c2_mem_ffi_local_endpoint_context_capture(null).value;
-      const counter = capture();
-      let owner = capture();
-      assert.equal(counter.namespaceId().value, '0');
-      owner.close(); owner.close();
-      assert.equal(counter.namespaceId().value, '1');
-      const detached = owner.endpointName;
-      owner = null;
-      let abandoned = capture();
-      const detachedAbandoned = abandoned.endpointName;
-      abandoned = null;
-      for (let attempt = 0; attempt < 100 && counter.namespaceId().value !== '2'; attempt += 1) {
-        global.gc();
-        await new Promise((resolve) => setTimeout(resolve, 5));
-      }
-      assert.equal(counter.namespaceId().value, '2', 'closed context GC must not free twice; abandoned context GC must free');
-      assert.throws(() => detached.call({}, 'ipc://closed'), /context receiver/);
-      assert.throws(() => detachedAbandoned.call({}, 'ipc://collected'), /context receiver/);
-      counter.close();
-    `;
-    const output = spawnSync(process.execPath, ['--expose-gc', '--input-type=module', '-e', script, library], { encoding: 'utf8' });
-    assert.equal(output.status, 0, `${output.signal ?? ''} ${output.stdout}${output.stderr}`);
-  } finally {
-    rmSync(directory, { recursive: true, force: true });
-  }
-});
-
-test('typed shared snapshot frees after its last factory or accessor owner, including GC fallback', () => {
-  const directory = localTestDirectory('shared-context-ownership-');
-  try {
-    const library = compileContextFixture(directory);
-    const moduleUrl = new URL('../dist/index.js', import.meta.url).href;
-    const script = `
-      import assert from 'node:assert/strict';
-      import { loadC2MemFfiNodeNativeSymbols, captureLocalIpcEndpointContextFromSymbols, createNodeIpcConnect } from ${JSON.stringify(moduleUrl)};
-      const { symbols } = loadC2MemFfiNodeNativeSymbols(process.argv[1]);
-      const counter = symbols.c2_mem_ffi_local_endpoint_context_capture(null).value;
-      const context = captureLocalIpcEndpointContextFromSymbols(symbols);
-      const a = createNodeIpcConnect({endpointContext: context});
-      const b = createNodeIpcConnect({endpointContext: context});
-      await assert.rejects(a('ipc://first'), /connect failed/);
-      await assert.rejects(b('ipc://second'), /connect failed/);
-      context.close(); context.close(); a.close(); a.close();
-      assert.equal(counter.namespaceId().value, '0');
-      assert.equal(b.resolveEndpoint('ipc://third'), '/tmp/c2-context-fixture.sock');
-      b.close(); b.close();
-      assert.equal(counter.namespaceId().value, '1');
-
-      let handle = captureLocalIpcEndpointContextFromSymbols(symbols);
-      const weakHandle = new WeakRef(handle);
-      const retained = createNodeIpcConnect({endpointContext: handle});
-      await assert.rejects(retained('ipc://retained'), /connect failed/);
-      handle = null;
-      for (let attempt = 0; attempt < 10; attempt += 1) {
-        await new Promise(r => setTimeout(r, 5)); global.gc();
-      }
-      assert.equal(weakHandle.deref(), undefined, 'factory retains the snapshot, not the disposable caller handle');
-      assert.equal(counter.namespaceId().value, '1');
-      retained.close();
-      assert.equal(counter.namespaceId().value, '2', 'last explicit factory close releases an abandoned caller reference');
-
-      const finalContext = captureLocalIpcEndpointContextFromSymbols(symbols);
-      let abandoned = createNodeIpcConnect({endpointContext: finalContext});
-      await assert.rejects(abandoned('ipc://gc'), /connect failed/);
-      finalContext.close();
-      let query = abandoned.resolveEndpoint;
-      abandoned = null;
-      for (let attempt = 0; attempt < 3; attempt += 1) { global.gc(); await new Promise(r => setTimeout(r, 5)); }
-      assert.equal(counter.namespaceId().value, '2', 'detached query must retain a live snapshot');
-      assert.equal(query('ipc://live'), '/tmp/c2-context-fixture.sock');
-      query = null;
-      for (let attempt = 0; attempt < 100 && counter.namespaceId().value !== '3'; attempt += 1) {
-        global.gc(); await new Promise(r => setTimeout(r, 5));
-      }
-      assert.equal(counter.namespaceId().value, '3', 'unreachable factory snapshot must free once');
-      counter.close();
-    `;
-    const output = spawnSync(process.execPath, ['--expose-gc', '--input-type=module', '-e', script, library], { encoding: 'utf8' });
-    assert.equal(output.status, 0, `${output.signal ?? ''} ${output.stdout}${output.stderr}`);
-  } finally {
-    rmSync(directory, { recursive: true, force: true });
-  }
-});
-
-test('native endpoint resolution preserves logical identity and rejects path input', () => {
-  const address = `ipc://node-native-${process.pid}`;
-  const endpoint = resolveLocalIpcEndpoint(address);
-  assert.equal(endpoint, resolveLocalIpcEndpoint(address));
-  if (process.platform === 'win32') {
-    assert.match(endpoint, /^\\\\\.\\pipe\\c_two-/);
-  } else {
-    assert.match(endpoint, /^\/tmp\/c2-v3-[0-9a-f]+\/[0-9a-f]{32}$/);
-  }
-  for (const invalid of ['/tmp/node.sock', 'ipc://../bad', 'ipc://bad\0name']) {
+  const name = resolveLocalIpcEndpoint(address);
+  assert.equal(name, resolveLocalIpcEndpoint(address));
+  if (process.platform === 'win32') assert.match(name, /^\\\\\.\\pipe\\c_two-/);
+  else assert.match(name, /^\/tmp\/c2-v3-[0-9a-f]+\/[0-9a-f]{32}$/);
+  for (const invalid of ['/tmp/node.sock', 'ipc://../bad']) {
     assert.throws(() => resolveLocalIpcEndpoint(invalid));
   }
 });
 
-test('native loader accepts a library in a Unicode directory with spaces', () => {
+test('bundled ABI 8 loader resolves the packaged native library', () => {
+  const path = bundled();
+  assert.equal(existsSync(path), true, `${path} must exist; run npm run build:node-addon`);
+  assert.match(path, /dist[\\/]native[\\/](?:libc2_mem_ffi\.(?:dylib|so)|c2_mem_ffi\.dll)$/);
+  const { symbols } = loadBundledC2MemFfiNodeNativeSymbols();
+  assert.equal(symbols.c2_mem_ffi_abi_version(), C2_MEM_FFI_ABI_VERSION);
+  assert.equal(typeof symbols.captureEndpointContext, 'function');
+  assert.equal(typeof symbols.createClientDomain, 'function');
+});
+
+test('native client domains validate factory policy before any endpoint exists', () => {
+  const {symbols} = loadBundledC2MemFfiNodeNativeSymbols();
+  const context = symbols.captureEndpointContext(null);
+  try {
+    for (const policy of [{requestChunkSize: '64'}, {requestShmThreshold: -1}, {requestChunkSize: 64, unknown: 1}]) {
+      let domain;
+      try {
+        assert.throws(() => { domain = symbols.createClientDomain(context, policy); }, /requestChunkSize|requestShmThreshold|unknown/);
+      } finally { domain?.close(); }
+    }
+  } finally { context.close(); }
+});
+
+test('native endpoints reject transport policy that belongs to their client domain', () => {
+  const {symbols} = loadBundledC2MemFfiNodeNativeSymbols();
+  const context = symbols.captureEndpointContext(null);
+  const domain = symbols.createClientDomain(context, {requestChunkSize: 64, requestShmThreshold: 1024});
+  try {
+    for (const options of [{requestChunkSize: 128}, {requestShmThreshold: 2048}]) {
+      assert.throws(() => domain.createEndpoint('ipc://factory-policy', options), /unknown option request/);
+    }
+  } finally { domain.close(); context.close(); }
+});
+
+test('captured native context freezes roots and env files without creating endpoint directories', {
+  skip: process.platform === 'win32' && 'Unix roots are unsupported on Windows',
+}, () => {
+  const { symbols } = loadBundledC2MemFfiNodeNativeSymbols();
+  const directory = mkdtempSync(resolve(tmpdir(), 'c2-abi8-snapshot-'));
+  const envFile = resolve(directory, 'endpoint.env');
+  const oldRoot = process.env.C2_IPC_ROOT;
+  const oldFile = process.env.C2_ENV_FILE;
+  const suffix = `${process.pid.toString(16)}${Date.now().toString(16).slice(-4)}`;
+  const rootA = `/tmp/cna${suffix}`;
+  const rootB = `/tmp/cnb${suffix}`;
+  const address = 'ipc://node-context-snapshot';
+  let context, explicit, fromFile;
+  try {
+    assert.equal(existsSync(rootA), false);
+    assert.equal(existsSync(rootB), false);
+    process.env.C2_ENV_FILE = '';
+    process.env.C2_IPC_ROOT = rootA;
+    context = symbols.captureEndpointContext(null);
+    const nameA = context.endpointName(address);
+    const namespaceA = context.namespaceId();
+    assert.ok(nameA.startsWith(`${rootA}/`));
+    process.env.C2_IPC_ROOT = rootB;
+    assert.equal(context.endpointName(address), nameA);
+    assert.equal(context.namespaceId(), namespaceA);
+    assert.ok(resolveLocalIpcEndpoint(address).startsWith(`${rootB}/`));
+    explicit = symbols.captureEndpointContext(rootA);
+    assert.equal(explicit.endpointName(address), nameA);
+    assert.equal(explicit.namespaceId(), namespaceA);
+
+    process.env.C2_ENV_FILE = directory;
+    const override = symbols.captureEndpointContext(rootA);
+    try { assert.equal(override.endpointName(address), nameA); }
+    finally { override.close(); }
+    assert.throws(() => symbols.captureEndpointContext(null));
+
+    delete process.env.C2_IPC_ROOT;
+    process.env.C2_ENV_FILE = envFile;
+    writeFileSync(envFile, `C2_IPC_ROOT=${rootA}\n`);
+    fromFile = symbols.captureEndpointContext(null);
+    writeFileSync(envFile, `C2_IPC_ROOT=${rootB}\n`);
+    assert.equal(fromFile.endpointName(address), nameA);
+    assert.ok(resolveLocalIpcEndpoint(address).startsWith(`${rootB}/`));
+    for (const invalid of ['', 'relative', '/tmp/../bad']) {
+      assert.throws(() => symbols.captureEndpointContext(invalid));
+    }
+    const longRoot = '/tmp/' + 'x'.repeat(200);
+    const longContext = symbols.captureEndpointContext(longRoot);
+    try {
+      const derived = longContext.endpointName(address);
+      assert.ok(derived.startsWith(`${longRoot}/`));
+      assert.equal(derived.slice(longRoot.length + 1).length, 32);
+      assert.equal(existsSync(longRoot), false);
+    } finally { longContext.close(); }
+    assert.equal(existsSync(rootA), false);
+    assert.equal(existsSync(rootB), false);
+  } finally {
+    context?.close(); explicit?.close(); fromFile?.close();
+    if (oldRoot === undefined) delete process.env.C2_IPC_ROOT;
+    else process.env.C2_IPC_ROOT = oldRoot;
+    if (oldFile === undefined) delete process.env.C2_ENV_FILE;
+    else process.env.C2_ENV_FILE = oldFile;
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('native context rejects borrowed receivers and closes idempotently', () => {
+  const { symbols } = loadBundledC2MemFfiNodeNativeSymbols();
+  const context = symbols.captureEndpointContext(null);
+  try {
+    assert.throws(() => context.endpointName('/tmp/absolute.sock'));
+    assert.throws(() => context.endpointName('ipc://bad\0name'), /NUL/);
+    for (const method of ['endpointName', 'namespaceId', 'close']) {
+      assert.throws(() => context[method].call({}, 'ipc://borrowed'), /Invalid native receiver/);
+    }
+    assert.throws(() => symbols.captureEndpointContext('bad\0root'), /NUL/);
+    assert.throws(() => symbols.captureEndpointContext(123), /string or null/);
+  } finally { context.close(); context.close(); }
+  assert.throws(() => context.endpointName('ipc://closed'), /closed/);
+  assert.throws(() => context.namespaceId(), /closed/);
+});
+
+test('one connector keeps its native context snapshot across endpoints and reconnects', {
+  skip: process.platform === 'win32' && 'Unix env-root freeze; Windows capture is separately covered',
+}, async () => {
+  const oldRoot = process.env.C2_IPC_ROOT;
+  const oldFile = process.env.C2_ENV_FILE;
+  const rootA = `/tmp/c2a${process.pid.toString(16)}`;
+  const rootB = `/tmp/c2b${process.pid.toString(16)}`;
+  const address = 'ipc://same';
+  let first, second;
+  try {
+    process.env.C2_ENV_FILE = '';
+    process.env.C2_IPC_ROOT = rootA;
+    const connect = createNodeIpcConnector();
+    const before = connect.resolveEndpoint(address);
+    process.env.C2_IPC_ROOT = rootB;
+    assert.notEqual(connect.resolveEndpoint(address), before, 'queries before first connect are fresh');
+    process.env.C2_IPC_ROOT = rootA;
+    first = await connect(address);
+    process.env.C2_IPC_ROOT = rootB;
+    assert.equal(connect.resolveEndpoint(address), before);
+    second = await connect('ipc://other');
+    assert.ok(connect.resolveEndpoint('ipc://other').startsWith(`${rootA}/`));
+    const fresh = createNodeIpcConnector();
+    assert.ok(fresh.resolveEndpoint(address).startsWith(`${rootB}/`));
+    await first.close(); await second.close();
+    connect.close(); connect.close(); fresh.close();
+    assert.throws(() => connect.resolveEndpoint(address), /closed/);
+    assert.equal(existsSync(rootA), false);
+    assert.equal(existsSync(rootB), false);
+  } finally {
+    if (oldRoot === undefined) delete process.env.C2_IPC_ROOT;
+    else process.env.C2_IPC_ROOT = oldRoot;
+    if (oldFile === undefined) delete process.env.C2_ENV_FILE;
+    else process.env.C2_ENV_FILE = oldFile;
+  }
+});
+
+test('captured public context remains usable by a connector after caller close', async () => {
+  const context = captureLocalIpcEndpointContext();
+  const connect = createNodeIpcConnector({ endpointContext: context });
+  const address = 'ipc://retained-context';
+  const name = context.endpointName(address);
+  const endpoint = await connect(address);
+  context.close();
+  assert.equal(connect.resolveEndpoint(address), name);
+  await endpoint.close();
+  connect.close();
+  assert.throws(() => connect.resolveEndpoint(address), /closed/);
+});
+
+test('Windows context retains current-SID pipe defaults and rejects Unix root overrides', {
+  skip: process.platform !== 'win32' && 'Requires Windows',
+}, () => {
+  const { symbols } = loadBundledC2MemFfiNodeNativeSymbols();
+  const context = symbols.captureEndpointContext(null);
+  try {
+    const name = context.endpointName('ipc://windows-context');
+    assert.match(name, /^\\\\\.\\pipe\\c_two-/);
+    assert.equal(name, resolveLocalIpcEndpoint('ipc://windows-context'));
+    for (const root of ['C:\\endpoint-root', '\\\\.\\pipe\\arbitrary', '/tmp/root']) {
+      assert.throws(() => symbols.captureEndpointContext(root));
+    }
+  } finally { context.close(); }
+});
+
+test('ABI 8 refuses an incomplete library after checking its version', () => {
+  const directory = mkdtempSync(resolve(tmpdir(), 'c2-incomplete-abi8-'));
+  try {
+    const library = compileVersionOnly(directory, 8);
+    assert.throws(() => loadC2MemFfiNodeNativeSymbols(library),
+      /Failed to load c2-mem-ffi symbol c2_mem_ffi_local_endpoint_context_capture/);
+  } finally { rmSync(directory, { recursive: true, force: true }); }
+});
+
+test('ABI 7 is refused before loading any ABI 8 symbol', () => {
+  const directory = mkdtempSync(resolve(tmpdir(), 'c2-stale-abi7-'));
+  try {
+    const library = compileVersionOnly(directory, 7);
+    assert.throws(() => loadC2MemFfiNodeNativeSymbols(library), /ABI version 7.*expected version 8/);
+  } finally { rmSync(directory, { recursive: true, force: true }); }
+});
+
+test('loader accepts a native library in a Unicode directory with spaces', () => {
   const directory = mkdtempSync(resolve(tmpdir(), 'c2-内存 loader-'));
   const library = resolve(directory, process.platform === 'win32' ? 'memory.dll' : 'memory-library');
-  copyFileSync(libraryPath(), library);
+  copyFileSync(bundled(), library);
   try {
-    const moduleUrl = new URL('../dist/index.js', import.meta.url).href;
-    const script = `import { C2_MEM_FFI_ABI_VERSION, loadC2MemFfiNodeNativeSymbols } from ${JSON.stringify(moduleUrl)};
-      const { symbols } = loadC2MemFfiNodeNativeSymbols(process.argv[1]);
-      if (symbols.c2_mem_ffi_abi_version() !== C2_MEM_FFI_ABI_VERSION) process.exit(1);`;
-    const result = spawnSync(process.execPath, ['--input-type=module', '-e', script, library], { encoding: 'utf8' });
-    assert.equal(result.status, 0, result.stdout + result.stderr);
-  } finally {
-    // A child process owns the loaded DLL so Windows can delete it after exit.
-    rmSync(directory, { recursive: true, force: true });
-  }
+    const { symbols } = loadC2MemFfiNodeNativeSymbols(library);
+    assert.equal(symbols.c2_mem_ffi_abi_version(), C2_MEM_FFI_ABI_VERSION);
+  } finally { rmSync(directory, { recursive: true, force: true }); }
 });
 
-
-test('bundled runtime defers native loading until an IPC operation', () => {
-  const runtime = createBundledC2MemFfiNodeRuntime({ addonPath: '/missing-c2-addon.node' });
-  assert.equal(typeof runtime.connect, 'function');
-  assert.throws(() => runtime.resolveEndpoint('ipc://lazy-native'), /Cannot find module|missing-c2-addon/);
-});
-
-
-test('native addon rejects ABI 6 before loading endpoint or memory symbols', () => {
-  const directory = mkdtempSync(resolve(tmpdir(), 'c2-stale-abi-'));
-  try {
-    const fixture = resolve(directory, 'stale.rs');
-    writeFileSync(fixture, '#[unsafe(no_mangle)] pub extern "C" fn c2_mem_ffi_abi_version() -> u32 { 6 }');
-    const library = resolve(directory, process.platform === 'win32' ? 'stale.dll' : process.platform === 'darwin' ? 'stale.dylib' : 'stale.so');
-    const output = spawnSync(process.env.RUSTC ?? 'rustc',
-      ['--edition=2024', '--crate-type=cdylib', fixture, '-o', library],
-      { cwd: directory, encoding: 'utf8' });
-    assert.equal(output.status, 0, `${output.error ?? ''} ${output.stdout} ${output.stderr}`);
-    assert.throws(() => loadC2MemFfiNodeNativeSymbols(library), /ABI version 6.*expected version 7/);
-  } finally {
-    rmSync(directory, { recursive: true, force: true });
-  }
-});
-test('bundled runtime supplies the verified connector lazily', () => {
-  const runtime = createBundledC2MemFfiNodeRuntime();
-  assert.equal(typeof runtime.connect, 'function');
-  assert.equal(typeof runtime.resolveEndpoint, 'function');
-  runtime.close();
+test('connector exposes a shared native domain and endpoint resolver', async () => {
+  const connector = createNodeIpcConnector();
+  const address = 'ipc://runtime-abi8';
+  assert.equal(typeof connector, 'function');
+  assert.equal(typeof connector.stats, 'function');
+  assert.equal(connector.resolveEndpoint(address), resolveLocalIpcEndpoint(address));
+  const endpoint = await connector(address);
+  await endpoint.close();
+  connector.close(); connector.close();
+  assert.throws(() => connector.resolveEndpoint(address), /closed/);
 });

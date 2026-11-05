@@ -357,3 +357,21 @@ fn non_utf8_http_error_refunds_its_received_buffer_after_canonical_refusal() {
     assert_eq!(error.code, ErrorCode::ProtocolViolation);
     assert_eq!(budget.snapshot().used_bytes, 0);
 }
+
+#[test]
+fn a_local_ipc_protocol_failure_keeps_the_call_dispatch_phase() {
+    for (phase, expected) in [
+        (TransportPhase::PreDispatch, "pre_dispatch"),
+        (TransportPhase::DispatchUncertain, "dispatch_uncertain"),
+    ] {
+        let error = normalize_ipc_error(IpcError::Protocol("invalid call record".into()), phase);
+        let Error::Semantic(error) = error else {
+            panic!("canonical protocol error expected")
+        };
+        assert_eq!(error.code, ErrorCode::ProtocolViolation);
+        assert_eq!(
+            error.details.get("transport_phase").map(String::as_str),
+            Some(expected)
+        );
+    }
+}

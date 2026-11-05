@@ -410,6 +410,26 @@ mod ipc16_tests {
     }
 
     #[test]
+    fn call_end_receive_rejects_a_wrong_name_for_call_cancelled() {
+        // Peer bytes bypass the local encoder so this checks the receive boundary.
+        for status in [CallStatus::Failed, CallStatus::NotExecuted] {
+            let good = br#"C2E1{"version":1,"code":718,"name":"CallCancelled","message":"cancelled","details":{}}"#;
+            let bad = br#"C2E1{"version":1,"code":718,"name":"ProtocolViolation","message":"cancelled","details":{}}"#;
+            for (error, accepted) in [(good.as_slice(), true), (bad.as_slice(), false)] {
+                let mut payload = vec![RpcRecordKind::CallEnd as u8, status as u8];
+                payload.extend_from_slice(error);
+                let frame = encode_frame(9, FLAG_RPC_RECORD | FLAG_RESPONSE, &payload);
+                let (header, body) = decode_frame(&frame).unwrap();
+                assert_eq!(
+                    decode_rpc_record(&header, body, Some(CallMode::Unary)).is_ok(),
+                    accepted,
+                    "status={status:?}, accepted={accepted}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn chunks_have_metadata_only_on_first_record() {
         let first = encode_open_frame(
             8,

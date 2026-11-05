@@ -1,11 +1,11 @@
-use c2_codegen::{CodegenError, ContractCodegenTarget, compile_contract_artifacts};
+use c2_codegen::{ContractCodegenTarget, compile_contract_artifacts};
 use c2_contract::ContractRelease;
 
 const SERVER_STREAM: &str =
     include_str!("../../c2-contract/tests/fixtures/server-stream.contract.json");
 
 #[test]
-fn rust_and_python_generate_server_stream_while_typescript_rejects_it() {
+fn all_targets_generate_server_stream() {
     let release = ContractRelease::from_descriptor_json(SERVER_STREAM.as_bytes()).unwrap();
     let rust =
         compile_contract_artifacts(&release, ContractCodegenTarget::Rust, &Default::default())
@@ -43,21 +43,28 @@ fn rust_and_python_generate_server_stream_while_typescript_rejects_it() {
     }
     assert!(source.contains("def method_0_ping(self) -> None:"));
 
-    let target = ContractCodegenTarget::TypeScript;
-    let error = compile_contract_artifacts(&release, target, &Default::default())
-        .err()
-        .expect("TypeScript server stream generation remains unsupported");
-    assert!(matches!(
-        &error,
-        CodegenError::UnsupportedServerStream {
-            target: actual_target,
-            method_index: 1,
-            method_name,
-        } if *actual_target == target && method_name == "echo"
-    ));
-    let message = error.to_string();
-    assert!(message.contains(target.as_str()), "{message}");
-    assert!(message.contains("server_stream"), "{message}");
-    assert!(message.contains("echo"), "{message}");
-    assert!(message.contains("$.methods[1].mode"), "{message}");
+    let typescript = compile_contract_artifacts(
+        &release,
+        ContractCodegenTarget::TypeScript,
+        &Default::default(),
+    )
+    .expect("TypeScript server stream generation");
+    let source = std::str::from_utf8(
+        typescript
+            .get("typescript/c_two_contract.ts")
+            .unwrap()
+            .bytes(),
+    )
+    .unwrap();
+    for required in [
+        "method_1_echo(payload: Payload): C2ResponseStream<Payload>",
+        "hold_method_1_echo(payload: Payload): C2ResponseStream<C2HeldResult<Payload>>",
+        "this.transport.stream(this.routeName, CONTRACT, \"echo\"",
+        "encode_method_1_echo_input(payload)",
+        "decode_method_1_echo_output",
+        "mode: 'server_stream'",
+    ] {
+        assert!(source.contains(required), "missing {required:?}");
+    }
+    assert!(source.contains("async method_0_ping(): Promise<void>"));
 }

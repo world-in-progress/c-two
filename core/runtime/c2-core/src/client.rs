@@ -123,6 +123,14 @@ impl fmt::Debug for Client {
 }
 
 impl Client {
+    #[doc(hidden)]
+    pub fn ipc_server_identity(&self) -> Option<c2_wire::handshake::ServerIdentity> {
+        match &self.inner.transport {
+            ClientInner::Ipc(client) => client.client.server_identity().cloned(),
+            ClientInner::Http(..) => None,
+        }
+    }
+
     /// Observe this physical IPC connection without connecting or reconnecting.
     /// Other logical views may share it; closing one view need not end it.
     pub fn connection_observation(&self) -> Result<c2_local::ConnectionObservation, Error> {
@@ -234,6 +242,16 @@ pub struct PreparedCall {
 }
 
 impl PreparedCall {
+    #[doc(hidden)]
+    pub fn scope(&self) -> CallScope {
+        self.preparing.scope_clone()
+    }
+
+    #[doc(hidden)]
+    pub async fn charge_input_async(&mut self, nbytes: u64) -> Result<(), Error> {
+        self.preparing.charge_input_async(nbytes).await
+    }
+
     /// Reserve known prepared input bytes before native allocation/copy. For
     /// unknown pickle length, serialize on the caller after begin_call, then
     /// charge the resulting length; this checks the original deadline. It is
@@ -288,6 +306,42 @@ pub struct EncodedCall {
 
 impl EncodedCall {
     pub fn stream(self) -> Result<CoreResponseStream, Error> {
+        let (started, scope, cancellation) =
+            self.start_stream(false, c2_ipc::IpcStreamCancellation::new())?;
+        Ok(CoreResponseStream::new(
+            started.wait()?,
+            scope,
+            cancellation,
+        ))
+    }
+
+    /// Keep the original opening record available to a native facade whose
+    /// caller may stop waiting independently of the transport.
+    #[doc(hidden)]
+    pub async fn stream_record_async(
+        self,
+        cancellation: c2_ipc::IpcStreamCancellation,
+    ) -> Result<CoreResponseStream, Error> {
+        let (started, scope, cancellation) = self.start_stream(true, cancellation)?;
+        Ok(CoreResponseStream::new(
+            started.wait_original().await?,
+            scope,
+            cancellation,
+        ))
+    }
+
+    fn start_stream(
+        self,
+        original: bool,
+        cancellation: c2_ipc::IpcStreamCancellation,
+    ) -> Result<
+        (
+            crate::call_execution::ExecutingCall<c2_ipc::IpcResponseStream>,
+            CallScope,
+            c2_ipc::IpcStreamCancellation,
+        ),
+        Error,
+    > {
         let PreparedCall {
             mut preparing,
             inner,
@@ -303,45 +357,51 @@ impl EncodedCall {
         let scope = preparing.scope_clone();
         let payload_budget = preparing.payload_budget();
         let permit = preparing.take_stream_permit();
-        let cancellation = c2_ipc::IpcStreamCancellation::new();
         let transport_cancellation = cancellation.clone();
         let handle_cancellation = cancellation.clone();
-        let response = preparing
-            .execute_stream(
+        let transport = move |input, scope| async move {
+            match &inner.transport {
+                ClientInner::Ipc(connection) => {
+                    call_ipc_stream(
+                        connection,
+                        &method,
+                        input,
+                        scope,
+                        payload_budget,
+                        Box::new(permit),
+                        transport_cancellation,
+                    )
+                    .await
+                }
+                ClientInner::Http(..) => Err(c2_error::C2Error::new(
+                    c2_error::ErrorCode::UnsupportedCallMode,
+                    "server streams over HTTP relay are not supported",
+                )
+                .into()),
+            }
+        };
+        let abandon = |stream: &c2_ipc::IpcResponseStream| {
+            let _ = stream.cancel();
+        };
+        let on_abandon = move || cancellation.cancel();
+        let started = if original {
+            preparing.execute_stream_record(
                 self.nbytes,
                 self.materialize,
-                move |input, scope| async move {
-                    match &inner.transport {
-                        ClientInner::Ipc(connection) => {
-                            call_ipc_stream(
-                                connection,
-                                &method,
-                                input,
-                                scope,
-                                payload_budget,
-                                Box::new(permit),
-                                transport_cancellation,
-                            )
-                            .await
-                        }
-                        ClientInner::Http(..) => Err(c2_error::C2Error::new(
-                            c2_error::ErrorCode::UnsupportedCallMode,
-                            "server streams over HTTP relay are not supported",
-                        )
-                        .into()),
-                    }
-                },
-                |stream: &c2_ipc::IpcResponseStream| {
-                    let _ = stream.cancel();
-                },
-                move || cancellation.cancel(),
+                transport,
+                abandon,
+                on_abandon,
             )?
-            .wait()?;
-        Ok(CoreResponseStream::new(
-            response,
-            scope,
-            handle_cancellation,
-        ))
+        } else {
+            preparing.execute_stream(
+                self.nbytes,
+                self.materialize,
+                transport,
+                abandon,
+                on_abandon,
+            )?
+        };
+        Ok((started, scope, handle_cancellation))
     }
 
     pub fn call_owned(self) -> Result<Vec<u8>, Error> {
@@ -381,6 +441,18 @@ impl EncodedCall {
     }
 
     pub fn call_held(self) -> Result<HeldResponse, Error> {
+        self.start_held(false)?.wait()
+    }
+
+    #[doc(hidden)]
+    pub async fn call_held_record_async(self) -> Result<HeldResponse, Error> {
+        self.start_held(true)?.wait_original().await
+    }
+
+    fn start_held(
+        self,
+        original: bool,
+    ) -> Result<crate::call_execution::ExecutingCall<HeldResponse>, Error> {
         let PreparedCall {
             preparing,
             inner,
@@ -393,23 +465,22 @@ impl EncodedCall {
             );
         }
         let payload_budget = preparing.payload_budget();
-        preparing
-            .execute(
-                self.nbytes,
-                self.materialize,
-                move |input, scope| async move {
-                    let response = match &inner.transport {
-                        ClientInner::Ipc(connection) => HeldResponse::from_response_data(
-                            call_ipc(connection, &method, input, scope).await?,
-                        )?,
-                        ClientInner::Http(client, _) => HeldResponse::from_budgeted_bytes(
-                            call_http(client, &method, input, scope, payload_budget).await?,
-                        ),
-                    };
-                    Ok(response)
-                },
-            )?
-            .wait()
+        let transport = move |input, scope| async move {
+            let response = match &inner.transport {
+                ClientInner::Ipc(connection) => HeldResponse::from_response_data(
+                    call_ipc(connection, &method, input, scope).await?,
+                )?,
+                ClientInner::Http(client, _) => HeldResponse::from_budgeted_bytes(
+                    call_http(client, &method, input, scope, payload_budget).await?,
+                ),
+            };
+            Ok(response)
+        };
+        if original {
+            preparing.execute_whole_record(self.nbytes, self.materialize, transport)
+        } else {
+            preparing.execute(self.nbytes, self.materialize, transport)
+        }
     }
 }
 
@@ -523,6 +594,93 @@ impl EncodedClient for Client {
 
     fn call_held(&self, method: &str, request: &[u8]) -> Result<HeldResponse, Error> {
         self.begin_call(method)?.encode_slice(request)?.call_held()
+    }
+}
+
+/// Native endpoint connection ownership. Configuration and all accounting are
+/// shared with the Runtime; only the physical client cache belongs to this endpoint.
+#[doc(hidden)]
+pub struct NativeEndpointContext {
+    runtime: Runtime,
+    address: String,
+    config: c2_config::ClientIpcConfig,
+    pool: c2_ipc::ClientPool,
+}
+
+impl NativeEndpointContext {
+    pub fn deactivate(&self) {
+        self.pool.deactivate_endpoint_scope();
+    }
+
+    pub async fn close(&self) {
+        self.pool.close_endpoint_scope().await;
+    }
+
+    pub fn config(&self) -> &c2_config::ClientIpcConfig {
+        &self.config
+    }
+
+    pub fn prepare(
+        &self,
+        expected: ExpectedRouteContract,
+        attempt: &crate::ConnectAttempt,
+    ) -> Result<Client, Error> {
+        let deadline = attempt.deadline();
+        validate_expected_route_contract(&expected)?;
+        self.runtime.ensure_active_with_attempt(attempt)?;
+        let mut acquired = None;
+        for index in 0..STALE_POOL_RECONNECT_ATTEMPTS {
+            let client = self
+                .pool
+                .acquire_lease_with_deadline(&self.address, Some(&self.config), deadline)
+                .map_err(|error| normalize_ipc_error(error, TransportPhase::PreDispatch))?;
+            match client.acquire_route_with_deadline(&expected, deadline) {
+                Ok(binding) => {
+                    acquired = Some(PooledIpcClient { client, binding });
+                    break;
+                }
+                Err(error)
+                    if index + 1 < STALE_POOL_RECONNECT_ATTEMPTS
+                        && is_stale_pooled_session_error(&error) =>
+                {
+                    self.pool
+                        .discard_if_same_with_deadline(&self.address, client.client(), deadline)
+                        .map_err(|error| normalize_ipc_error(error, TransportPhase::PreDispatch))?;
+                }
+                Err(error) => return Err(normalize_ipc_error(error, TransportPhase::PreDispatch)),
+            }
+        }
+        let connection = acquired.expect("acquire loop returned or bound a route");
+        let observed = observed_ipc_route(&connection);
+        self.runtime.finish_client(
+            expected,
+            ObservedPath::DirectIpc,
+            observed,
+            ClientInner::Ipc(connection),
+            deadline,
+        )
+    }
+}
+
+impl Runtime {
+    #[doc(hidden)]
+    pub fn native_endpoint_context(
+        &self,
+        address: &str,
+        attempt: &crate::ConnectAttempt,
+    ) -> Result<NativeEndpointContext, Error> {
+        let (config, domain) = self
+            .ipc_client_domain(attempt.deadline())
+            .map_err(|error| normalize_ipc_error(error, TransportPhase::PreDispatch))?;
+        let pool = domain
+            .fork_endpoint_scope(&config, attempt.deadline())
+            .map_err(|error| normalize_ipc_error(error, TransportPhase::PreDispatch))?;
+        Ok(NativeEndpointContext {
+            runtime: self.clone(),
+            address: address.to_owned(),
+            config,
+            pool,
+        })
     }
 }
 

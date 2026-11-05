@@ -395,11 +395,18 @@ pub fn normalize_ipc_error(error: IpcError, phase: TransportPhase) -> Error {
                 ]),
             ),
         ),
-        IpcError::Protocol(message) => Error::Semantic(protocol_violation(
-            "IPC protocol validation failed",
-            "ipc",
-            &message,
-        )),
+        IpcError::Protocol(message) => {
+            let mut error = protocol_violation("IPC protocol validation failed", "ipc", &message);
+            error.details.insert(
+                "transport_phase".into(),
+                match phase {
+                    TransportPhase::PreDispatch => "pre_dispatch",
+                    TransportPhase::DispatchUncertain => "dispatch_uncertain",
+                }
+                .into(),
+            );
+            Error::Semantic(error)
+        }
         IpcError::MethodNotFound {
             route_name,
             method_name,

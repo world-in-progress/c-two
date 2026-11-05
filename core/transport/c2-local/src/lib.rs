@@ -370,32 +370,7 @@ mod platform;
 #[path = "windows.rs"]
 mod platform;
 
-#[cfg(windows)]
-pub use platform::WindowsPipeConnection;
-
-/// Connect and verify Windows object/process identity before any application
-/// bytes or IOCP registration. Pipe-busy retries share this one total timeout.
-/// The returned owners are suitable for a foreign event loop; same SID does
-/// not imply equal trust or prevent denial of service.
-#[cfg(windows)]
-pub async fn connect_windows_pipe(
-    endpoint: &LocalEndpoint,
-    timeout: Duration,
-) -> io::Result<WindowsPipeConnection> {
-    connect_windows_pipe_until(endpoint, Some(Instant::now() + timeout)).await
-}
-
 pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// Native pipe connection under the caller's absolute connection deadline.
-/// Omission selects the default phase guard; a supplied deadline replaces it.
-#[cfg(windows)]
-pub async fn connect_windows_pipe_until(
-    endpoint: &LocalEndpoint,
-    deadline: Option<Instant>,
-) -> io::Result<WindowsPipeConnection> {
-    within_connect_deadline(deadline, platform::connect_raw(endpoint)).await
-}
 
 struct AbortState {
     closed: AtomicBool,
@@ -482,27 +457,6 @@ async fn within_connect_deadline<T>(
         return Err(expired());
     }
     Ok(connected)
-}
-
-/// Connect using the native directory authority, then transfer an owned Unix
-/// socket to a foreign event loop. The returned descriptor is nonblocking and
-/// close-on-exec; callers must either adopt it exactly once or close it.
-#[cfg(unix)]
-pub async fn connect_unix_stream(
-    endpoint: &LocalEndpoint,
-    timeout: Duration,
-) -> io::Result<std::os::unix::net::UnixStream> {
-    connect_unix_stream_until(endpoint, Some(Instant::now() + timeout)).await
-}
-
-#[cfg(unix)]
-pub async fn connect_unix_stream_until(
-    endpoint: &LocalEndpoint,
-    deadline: Option<Instant>,
-) -> io::Result<std::os::unix::net::UnixStream> {
-    within_connect_deadline(deadline, platform::connect(endpoint))
-        .await?
-        .into_std()
 }
 
 impl LocalStream {

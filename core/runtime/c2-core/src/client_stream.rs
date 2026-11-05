@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 use c2_ipc::{IpcError, IpcResponseStream, IpcStreamCancellation, StreamTerminal};
 use c2_mem::retention::BudgetedBuffer;
 use c2_wire::rpc::CallStatus;
-use parking_lot::Mutex;
+use tokio::sync::Mutex;
 
 use crate::call_execution::{scope_error, shared_executor};
 use crate::client::normalize_ipc_call_error;
@@ -46,23 +46,27 @@ impl CoreResponseStream {
     /// deadline. Expiry does not submit CANCEL; the handle remains usable for
     /// terminal observation and its Drop submits cancellation separately.
     pub fn next_item(&self) -> Result<Option<HeldResponse>, Error> {
+        self.runtime.block_on(self.next_item_async())
+    }
+
+    /// Async projection of the original receiver; it owns no second read loop.
+    #[doc(hidden)]
+    pub async fn next_item_async(&self) -> Result<Option<HeldResponse>, Error> {
         self.check_deadline()?;
-        let mut stream = self.stream.lock();
-        let received = self.runtime.block_on(async {
-            match self.scope.deadline() {
-                Some(deadline) => {
-                    tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), stream.recv())
-                        .await
-                        .map_err(|_| {
-                            scope_error(crate::CallScopeError::DeadlineExceeded {
-                                phase: TransportPhase::DispatchUncertain,
-                            })
-                        })?
-                        .map_err(normalize_ipc_call_error)
-                }
-                None => stream.recv().await.map_err(normalize_ipc_call_error),
+        let mut stream = self.stream.lock().await;
+        let received = match self.scope.deadline() {
+            Some(deadline) => {
+                tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), stream.recv())
+                    .await
+                    .map_err(|_| {
+                        scope_error(crate::CallScopeError::DeadlineExceeded {
+                            phase: TransportPhase::DispatchUncertain,
+                        })
+                    })?
+                    .map_err(normalize_ipc_call_error)
             }
-        });
+            None => stream.recv().await.map_err(normalize_ipc_call_error),
+        };
         publish_received(&self.scope, received)
     }
 
@@ -97,14 +101,21 @@ impl CoreResponseStream {
     /// `None` waits indefinitely. Zero submits cancellation then observes the
     /// current state once. A timed-out receipt can be observed again later.
     pub fn close_with_timeout(&self, timeout: Option<Duration>) -> CoreStreamCloseReceipt {
+        self.runtime
+            .block_on(self.close_with_timeout_async(timeout))
+    }
+
+    #[doc(hidden)]
+    pub async fn close_with_timeout_async(
+        &self,
+        timeout: Option<Duration>,
+    ) -> CoreStreamCloseReceipt {
         let started = Instant::now();
         let _ = self.cancel();
-        // Cancellation is independent of the single iterator receiver. The
-        // observation budget also covers contention with an executing next.
         let stream = match timeout {
-            Some(Duration::ZERO) => self.stream.try_lock(),
-            Some(timeout) => self.stream.try_lock_for(timeout),
-            None => Some(self.stream.lock()),
+            Some(Duration::ZERO) => self.stream.try_lock().ok(),
+            Some(timeout) => tokio::time::timeout(timeout, self.stream.lock()).await.ok(),
+            None => Some(self.stream.lock().await),
         };
         let Some(stream) = stream else {
             return CoreStreamCloseReceipt {
@@ -116,12 +127,10 @@ impl CoreResponseStream {
         let timeout = timeout.map(|timeout| timeout.saturating_sub(started.elapsed()));
         let terminal = match timeout {
             Some(Duration::ZERO) => stream.try_completion(),
-            Some(timeout) => self.runtime.block_on(async {
-                tokio::time::timeout(timeout, stream.completion())
-                    .await
-                    .ok()
-            }),
-            None => Some(self.runtime.block_on(stream.completion())),
+            Some(timeout) => tokio::time::timeout(timeout, stream.completion())
+                .await
+                .ok(),
+            None => Some(stream.completion().await),
         };
         match terminal {
             Some(Ok(terminal)) => {

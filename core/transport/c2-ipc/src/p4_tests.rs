@@ -5,7 +5,10 @@ use c2_server::{
     ConcurrencyMode, CrmCallback, CrmError, ResponseMeta, RouteBuildSpec, SchedulerLimits, Server,
     ServerIpcConfig,
 };
-use c2_wire::handshake::{ServerIdentity, encode_server_handshake};
+use c2_wire::handshake::{
+    HANDSHAKE_VERSION, ServerIdentity, VersionPreambleKind, encode_server_handshake,
+    encode_version_preamble,
+};
 use c2_wire::rpc::{
     CallMode, CallStatus, RpcRecord, RpcRecordKind, ValuePart, ValueStorage, decode_rpc_record,
     encode_call_end_frame, encode_value_continuation_frame,
@@ -164,6 +167,93 @@ async fn accept(listener: &mut LocalListener) -> LocalStream {
         .unwrap();
     stream
 }
+
+async fn expect_fake_peer_handshake_error(
+    preamble: [u8; 25],
+    metadata_ack: Option<Vec<u8>>,
+    expected_peer_version: Option<u32>,
+) {
+    let endpoint = Endpoint::new();
+    let mut listener = LocalListener::bind(&endpoint.endpoint).unwrap();
+    let (finish, finished) = oneshot::channel();
+    let peer = tokio::spawn(async move {
+        let mut stream = timeout(WAIT, listener.accept()).await.unwrap().unwrap();
+        let mut hello = [0; 25];
+        stream.read_exact(&mut hello).await.unwrap();
+        assert_eq!(hello, encode_version_preamble(VersionPreambleKind::Hello));
+        stream.write_all(&preamble).await.unwrap();
+        if let Some(ack) = metadata_ack {
+            let (header, _) = read_frame(&mut stream).await;
+            assert_eq!(header.flags, flags::FLAG_HANDSHAKE);
+            stream.write_all(&ack).await.unwrap();
+        }
+        // Keep the peer open until connect has returned. An EOF must not be
+        // needed to classify a complete malformed reply.
+        finished.await.unwrap();
+        drop(stream);
+        crate::tests::close_listener(listener).await;
+    });
+    let mut client = endpoint.client();
+    let error = timeout(WAIT, client.connect())
+        .await
+        .expect("a complete rejection must return while the peer stays open")
+        .unwrap_err();
+    match expected_peer_version {
+        Some(peer_version) => assert!(
+            matches!(error, IpcError::ProtocolVersionMismatch { local, peer }
+                if local == HANDSHAKE_VERSION && peer == peer_version),
+            "unexpected rejection: {error:?}"
+        ),
+        None => assert!(
+            matches!(error, IpcError::Protocol(_) | IpcError::Decode(_)),
+            "malformed handshake was misclassified: {error:?}"
+        ),
+    }
+    finish.send(()).unwrap();
+    peer.await.unwrap();
+}
+
+#[tokio::test]
+async fn fixed_version_rejections_are_typed_only_after_a_trusted_preamble() {
+    for peer_version in [1, 13, 15, 256, u32::MAX] {
+        let mut response = encode_version_preamble(VersionPreambleKind::VersionMismatch);
+        response[21..].copy_from_slice(&peer_version.to_le_bytes());
+        expect_fake_peer_handshake_error(response, None, Some(peer_version)).await;
+    }
+
+    let mut malformed = encode_version_preamble(VersionPreambleKind::VersionMismatch);
+    malformed[21..].copy_from_slice(&13u32.to_le_bytes());
+    for byte in [0, 12, 16, 20, 21] {
+        let mut response = malformed;
+        response[byte] = 0;
+        expect_fake_peer_handshake_error(response, None, None).await;
+    }
+    let mut wrong_request_id = malformed;
+    wrong_request_id[4] = 1;
+    expect_fake_peer_handshake_error(wrong_request_id, None, None).await;
+    let mut contradictory = encode_version_preamble(VersionPreambleKind::Accepted);
+    contradictory[21..].copy_from_slice(&13u32.to_le_bytes());
+    expect_fake_peer_handshake_error(contradictory, None, None).await;
+    expect_fake_peer_handshake_error(
+        encode_version_preamble(VersionPreambleKind::VersionMismatch),
+        None,
+        None,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn malformed_metadata_ack_returns_before_peer_eof() {
+    let valid_preamble = encode_version_preamble(VersionPreambleKind::Accepted);
+    for ack in [
+        frame::encode_frame(1, flags::FLAG_HANDSHAKE | flags::FLAG_RESPONSE, b"bad"),
+        frame::encode_frame(0, flags::FLAG_HANDSHAKE, b"bad"),
+        frame::encode_frame(0, flags::FLAG_HANDSHAKE | flags::FLAG_RESPONSE, b"bad"),
+    ] {
+        expect_fake_peer_handshake_error(valid_preamble, Some(ack), None).await;
+    }
+}
+
 async fn reply(stream: &mut LocalStream, rid: u64, data: &[u8]) {
     let frame = encode_call_end_frame(
         rid,
@@ -232,56 +322,49 @@ async fn response_does_not_release_a_request_loan_and_peer_end_does() {
 async fn high_request_bits_are_preserved_through_pending_and_delivery() {
     let endpoint = Endpoint::new();
     let mut listener = LocalListener::bind(&endpoint.endpoint).unwrap();
-    let (received, first) = oneshot::channel();
+    let ids = [7, (1u64 << 32) | 7, (1u64 << 53) | 7, u64::MAX - 1];
+    let (sent, reads): (Vec<_>, Vec<_>) = ids.iter().map(|_| oneshot::channel()).unzip();
     let peer = tokio::spawn(async move {
         let mut stream = accept(&mut listener).await;
-        let (low, _) = read_frame(&mut stream).await;
-        assert_eq!(low.request_id, 7);
-        received.send(()).unwrap();
-        let (high, _) = read_frame(&mut stream).await;
-        assert_eq!(high.request_id, (1 << 32) | 7);
-        reply(&mut stream, high.request_id, b"high").await;
-        reply(&mut stream, low.request_id, b"low").await;
+        for (id, received) in ids.into_iter().zip(sent) {
+            let (header, _) = read_frame(&mut stream).await;
+            assert_eq!(header.request_id, id);
+            received.send(()).unwrap();
+        }
+        for id in ids.into_iter().rev() {
+            reply(&mut stream, id, &id.to_le_bytes()).await;
+        }
         expect_disconnect_or_eof(&mut stream).await;
         crate::tests::close_listener(listener).await;
     });
     let mut client = endpoint.client();
     client.connect().await.unwrap();
-    client
-        .driver
-        .read()
-        .as_ref()
-        .unwrap()
-        .sequence
-        .store(6, Ordering::Relaxed);
     let client = Arc::new(client);
-    let low = tokio::spawn({
-        let client = client.clone();
-        async move {
-            client
-                .call_inline(&identity(), 0, b"low")
-                .await
-                .unwrap()
-                .into_owned_bytes()
-                .unwrap()
-        }
-    });
-    first.await.unwrap();
-    client
-        .driver
-        .read()
-        .as_ref()
-        .unwrap()
-        .sequence
-        .store((1 << 32) | 6, Ordering::Relaxed);
-    let high = client
-        .call_inline(&identity(), 0, b"high")
-        .await
-        .unwrap()
-        .into_owned_bytes()
-        .unwrap();
-    assert_eq!(high, b"high");
-    assert_eq!(low.await.unwrap(), b"low");
+    let mut callers = Vec::new();
+    for (id, read) in ids.into_iter().zip(reads) {
+        client
+            .driver
+            .read()
+            .as_ref()
+            .unwrap()
+            .sequence
+            .store(id - 1, Ordering::Relaxed);
+        callers.push(tokio::spawn({
+            let client = client.clone();
+            async move {
+                client
+                    .call_inline(&identity(), 0, b"pending")
+                    .await
+                    .unwrap()
+                    .into_owned_bytes()
+                    .unwrap()
+            }
+        }));
+        timeout(WAIT, read).await.unwrap().unwrap();
+    }
+    for (id, caller) in ids.into_iter().zip(callers) {
+        assert_eq!(caller.await.unwrap(), id.to_le_bytes());
+    }
     assert!(client.close_shared_bounded(WAIT).await);
     peer.await.unwrap();
 }

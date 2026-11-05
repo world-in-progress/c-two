@@ -275,6 +275,87 @@ impl PreparingCall {
         Ok(())
     }
 
+    /// Async foreign-runtime admission uses the same budget without parking a worker.
+    pub(crate) async fn charge_input_async(&mut self, nbytes: u64) -> Result<(), Error> {
+        self.scope.check_pre_dispatch().map_err(scope_error)?;
+        if self
+            .input_reservation
+            .as_ref()
+            .is_some_and(|r| r.bytes() == 0)
+        {
+            self.input_reservation = None;
+        }
+        if self.input_reservation.is_some() {
+            return self.charge_input(nbytes);
+        }
+        let reservation = match self.scope.deadline() {
+            Some(deadline) => tokio::time::timeout_at(
+                tokio::time::Instant::from_std(deadline),
+                self.payload_budget.reserve(nbytes),
+            )
+            .await
+            .unwrap_or(Err(PayloadBufferError::DeadlineExceeded)),
+            None => self.payload_budget.reserve(nbytes).await,
+        }
+        .map_err(|error| settle_failure(&self.scope, payload_admission_error(error)))?;
+        self.input_reservation = Some(reservation);
+        self.scope.check_pre_dispatch().map_err(scope_error)
+    }
+
+    /// Native async facades keep the original record even after their own wait
+    /// deadline. This observation is separate from dispatch and cancellation.
+    pub(crate) fn execute_stream_record<R, M, T, F>(
+        self,
+        nbytes: usize,
+        materialize: M,
+        transport: T,
+        abandon: fn(&R),
+        on_waiter_abandon: impl Fn() + Send + Sync + 'static,
+    ) -> Result<ExecutingCall<R>, Error>
+    where
+        R: Send + 'static,
+        M: FnOnce() -> Result<Vec<u8>, Error> + Send + 'static,
+        T: FnOnce(BudgetedBuffer, CallScope) -> F + Send + 'static,
+        F: Future<Output = Result<R, Error>> + Send + 'static,
+    {
+        let scope = self.scope.clone();
+        self.start_on(
+            nbytes,
+            materialize,
+            transport,
+            shared_executor,
+            CompletionMode::OriginalRecord { stream: true },
+            Some(abandon),
+            Some(Arc::new(on_waiter_abandon)),
+        )
+        .map_err(|error| settle_failure(&scope, error))
+    }
+
+    pub(crate) fn execute_whole_record<R, M, T, F>(
+        self,
+        nbytes: usize,
+        materialize: M,
+        transport: T,
+    ) -> Result<ExecutingCall<R>, Error>
+    where
+        R: Send + 'static,
+        M: FnOnce() -> Result<Vec<u8>, Error> + Send + 'static,
+        T: FnOnce(BudgetedBuffer, CallScope) -> F + Send + 'static,
+        F: Future<Output = Result<R, Error>> + Send + 'static,
+    {
+        let scope = self.scope.clone();
+        self.start_on(
+            nbytes,
+            materialize,
+            transport,
+            shared_executor,
+            CompletionMode::OriginalRecord { stream: false },
+            None,
+            None,
+        )
+        .map_err(|error| settle_failure(&scope, error))
+    }
+
     /// `materialize` must return exactly `nbytes` bytes. This trusted internal
     /// seam permits SDK prepared-payload materialization without allocating a
     /// second owned copy. An adapter must report its size before allocation;
@@ -382,6 +463,7 @@ impl PreparingCall {
                 caller: true,
             }),
             changed: Condvar::new(),
+            async_changed: tokio::sync::Notify::new(),
         });
         // Construct BEFORE spawn: even a stopped runtime dropping an unpolled
         // task owns the completion guard and wakes the caller through Drop.
@@ -442,7 +524,9 @@ impl PreparingCall {
             guard.finish(result);
         };
         let started = catch_unwind(AssertUnwindSafe(|| {
-            if shared.scope.deadline().is_some() {
+            if matches!(shared.mode, CompletionMode::OriginalRecord { .. })
+                || shared.scope.deadline().is_some()
+            {
                 // Dropping a Tokio JoinHandle detaches; never abort on timeout.
                 drop(handle.spawn(task));
             } else {
@@ -471,6 +555,7 @@ struct Outcome<R> {
 enum CompletionMode {
     WholeCall,
     StreamOpen,
+    OriginalRecord { stream: bool },
 }
 
 struct Completion<R> {
@@ -480,6 +565,7 @@ struct Completion<R> {
     on_waiter_abandon: Option<Arc<dyn Fn() + Send + Sync>>,
     state: Mutex<Outcome<R>>,
     changed: Condvar,
+    async_changed: tokio::sync::Notify,
 }
 
 impl<R> Completion<R> {
@@ -490,6 +576,28 @@ impl<R> Completion<R> {
         {
             let mut state = self.state.lock();
             let confirmation = match (self.mode, pending.as_ref().unwrap().is_ok()) {
+                (CompletionMode::OriginalRecord { stream: true }, true) => {
+                    if matches!(
+                        self.scope.state(),
+                        CallState::Dispatched | CallState::ExpiredDispatchUncertain
+                    ) {
+                        Ok(())
+                    } else {
+                        Err(CallScopeError::InvalidState {
+                            state: self.scope.state(),
+                        })
+                    }
+                }
+                (CompletionMode::OriginalRecord { .. }, success) => {
+                    // A caller's expired observation cannot erase a real native
+                    // outcome. Its phase still prevents retry of that caller.
+                    if success {
+                        let _ = self.scope.complete_success();
+                    } else {
+                        let _ = self.scope.complete_failure();
+                    }
+                    Ok(())
+                }
                 (CompletionMode::StreamOpen, true) => match self.scope.observe_deadline() {
                     CallState::Dispatched => Ok(()),
                     CallState::ExpiredPreDispatch => Err(CallScopeError::DeadlineExceeded {
@@ -516,6 +624,7 @@ impl<R> Completion<R> {
                 _ => {}
             }
             self.changed.notify_all();
+            self.async_changed.notify_waiters();
         }
         if let (Some(abandon), Some(Ok(value))) = (self.abandon, pending.as_ref()) {
             abandon(value);
@@ -556,6 +665,22 @@ pub(crate) struct ExecutingCall<R> {
 }
 
 impl<R> ExecutingCall<R> {
+    pub(crate) async fn wait_original(self) -> Result<R, Error> {
+        loop {
+            let changed = self.shared.async_changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            {
+                let mut state = self.shared.state.lock();
+                if let Some(result) = state.result.take() {
+                    state.caller = false;
+                    return result;
+                }
+            }
+            changed.await;
+        }
+    }
+
     pub(crate) fn wait(self) -> Result<R, Error> {
         let mut state = self.shared.state.lock();
         loop {
@@ -1752,5 +1877,72 @@ mod tests {
         ));
         assert_eq!(scope.state(), CallState::FailedPreDispatch);
         eventually(|| context.snapshot().used_operations == 0);
+    }
+}
+
+#[cfg(test)]
+mod native_record_tests {
+    use super::*;
+    use c2_config::{CallOptions, CallTimeout};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn original_stream_record_is_observable_after_the_callers_deadline() {
+        let context = CallExecutionContext::new(&CallExecutionLimits::default());
+        let preparing = context
+            .prepare_stream(
+                CallOptions::with_timeout(CallTimeout::After(Duration::from_millis(100))),
+                None,
+            )
+            .unwrap();
+        let scope = preparing.scope_clone();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let cancelled = Arc::new(AtomicUsize::new(0));
+        let cancellation = cancelled.clone();
+        let record = preparing
+            .execute_stream_record(
+                0,
+                || Ok(Vec::new()),
+                move |_, scope| async move {
+                    scope.try_begin_dispatch().map_err(scope_error)?;
+                    started_tx.send(()).unwrap();
+                    release_rx.await.unwrap();
+                    Ok(19u64)
+                },
+                |_| {},
+                move || {
+                    cancellation.fetch_add(1, Ordering::SeqCst);
+                },
+            )
+            .unwrap();
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let _ = tokio::time::timeout_at(
+                tokio::time::Instant::from_std(scope.deadline().unwrap()),
+                std::future::pending::<()>(),
+            )
+            .await;
+        });
+        assert_eq!(
+            scope.observe_deadline(),
+            CallState::ExpiredDispatchUncertain
+        );
+        assert_eq!(
+            cancelled.load(Ordering::SeqCst),
+            0,
+            "deadline is not cancellation"
+        );
+        release_tx.send(()).unwrap();
+        assert_eq!(runtime.block_on(record.wait_original()).unwrap(), 19);
+        assert_eq!(
+            cancelled.load(Ordering::SeqCst),
+            0,
+            "observing the real record does not abandon it"
+        );
     }
 }

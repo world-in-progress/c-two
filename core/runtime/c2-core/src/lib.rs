@@ -26,8 +26,8 @@ pub use c2_ipc::DirectIpcShutdownOutcome;
 pub use c2_server::{ServerFailure, ServerStartupStage, ServerStartupTimeout};
 pub use call_scope::{CallScope, CallScopeError, CallState};
 pub use client::{
-    Client, Connect, EncodedCall, EncodedClient, HeldResponse, ObservedPath, ObservedRoute,
-    PathCounters, PreparedCall,
+    Client, Connect, EncodedCall, EncodedClient, HeldResponse, NativeEndpointContext, ObservedPath,
+    ObservedRoute, PathCounters, PreparedCall,
 };
 pub use client_stream::{CoreResponseStream, CoreStreamCloseReceipt};
 pub use connect_deadline::{ConnectAttempt, connect_deadline_error};
@@ -83,3 +83,9 @@ pub use c2_config::{
 };
 /// Read-only operation-slot and payload-buffer counters for one Runtime.
 pub use c2_mem::RetentionSnapshot as CallExecutionSnapshot;
+
+/// Shared asynchronous executor for native client projections.
+#[doc(hidden)]
+pub fn native_client_executor() -> Result<tokio::runtime::Handle, Error> {
+    call_execution::shared_executor()
+}

@@ -856,6 +856,25 @@ impl Runtime {
         Ok(())
     }
 
+    /// Install an already captured native endpoint configuration without resolving again.
+    #[doc(hidden)]
+    pub fn set_captured_local_endpoint(
+        &self,
+        context: c2_config::LocalEndpointContext,
+    ) -> Result<(), LifecycleError> {
+        let mut state = self.state.lock();
+        if let Some(frozen) = &state.frozen_local_endpoint {
+            return if frozen == &context {
+                Ok(())
+            } else {
+                Err(LifecycleError::ConfigFrozen)
+            };
+        }
+        state.inherited_local_endpoint = Some(context);
+        state.local_endpoint_revision += 1;
+        Ok(())
+    }
+
     /// Inherit endpoint selection without resolving sources or platform scope.
     /// Unused policies remain lazy; a used domain survives environment changes.
     /// The replacement remains configurable until its own first local I/O.
@@ -1160,6 +1179,14 @@ impl Runtime {
         address: &str,
         deadline: ConnectDeadline,
     ) -> Result<c2_ipc::pool::ClientLease, c2_ipc::IpcError> {
+        let (config, pool) = self.ipc_client_domain(deadline)?;
+        pool.acquire_lease_with_deadline(address, Some(&config), deadline)
+    }
+
+    pub(crate) fn ipc_client_domain(
+        &self,
+        deadline: ConnectDeadline,
+    ) -> Result<(c2_config::ClientIpcConfig, Arc<c2_ipc::ClientPool>), c2_ipc::IpcError> {
         let context = self
             .resolve_local_endpoint_context_with_deadline(true, None, deadline)
             .map_err(connect_error_to_ipc)?
@@ -1222,8 +1249,7 @@ impl Runtime {
                 .clone();
             break (config, pool);
         };
-        // Connect outside the RuntimeState lock.
-        pool.acquire_lease_with_deadline(address, Some(&config), deadline)
+        Ok((config, pool))
     }
 
     pub(crate) fn discard_ipc_client_with_deadline(

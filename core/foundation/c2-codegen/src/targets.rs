@@ -21,15 +21,6 @@ pub(crate) fn render_target_artifacts(
     descriptor: &ValidatedContractDescriptor,
     methods: &[TargetMethod<'_>],
 ) -> Result<Vec<ContractArtifact>, CodegenError> {
-    if let Some(method) = methods.iter().find(|method| {
-        method.mode == MethodMode::ServerStream && target == ContractCodegenTarget::TypeScript
-    }) {
-        return Err(CodegenError::UnsupportedServerStream {
-            target,
-            method_index: method.index,
-            method_name: method.name.to_string(),
-        });
-    }
     let (path, source) = match target {
         ContractCodegenTarget::Rust => ("rust/c_two_contract.rs", render_rust(descriptor, methods)),
         ContractCodegenTarget::Python => (
@@ -1121,30 +1112,47 @@ function normalizeFastDbPayloadError(error: unknown): unknown {
         "export interface MethodBinding {\n\
          \x20 readonly index: number;\n\
          \x20 readonly name: string;\n\
-         \x20 readonly access: 'read' | 'write';\n\
-         \x20 readonly inputSha256?: string;\n\
+         \x20 readonly access: 'read' | 'write';\n",
+    );
+    if methods
+        .iter()
+        .any(|method| method.mode == MethodMode::ServerStream)
+    {
+        output.push_str("  readonly mode?: 'server_stream';\n");
+    }
+    output.push_str(
+        "  readonly inputSha256?: string;\n\
          \x20 readonly outputSha256?: string;\n\
          }\n\n\
          export const METHODS: readonly MethodBinding[] = Object.freeze([\n",
     );
     for method in methods {
         output.push_str(&format!(
-            "  {{ index: {}, name: {}, access: {}{}{} }},\n",
+            "  {{ index: {}, name: {}, access: {}{}{}{} }},\n",
             method.index,
             quoted(method.name),
             quoted(access_name(method.access)),
+            if method.mode == MethodMode::ServerStream {
+                ", mode: 'server_stream'"
+            } else {
+                ""
+            },
             typescript_optional_field("inputSha256", method.input_sha256),
             typescript_optional_field("outputSha256", method.output_sha256),
         ));
     }
+    output.push_str("]);\n\nexport class ContractClient {\n  constructor(\n");
     output.push_str(
-        "]);\n\n\
-         export class ContractClient {\n\
-         \x20 constructor(\n\
-         \x20   private readonly transport: C2EncodedClientTransport,\n\
-         \x20   private readonly routeName: string,\n\
-         \x20 ) {}\n",
+        if methods
+            .iter()
+            .any(|method| method.mode == MethodMode::ServerStream)
+        {
+            "    private readonly transport: C2StreamEncodedClientTransport,\n"
+        } else {
+            "    private readonly transport: C2EncodedClientTransport,\n"
+        },
     );
+    output.push_str("    private readonly routeName: string,\n  ) {}\n");
     for method in methods {
         render_typescript_client_method(&mut output, method);
     }
@@ -1219,11 +1227,23 @@ fn render_typescript_client_method(output: &mut String, method: &TargetMethod<'_
     } else {
         format!("encode_{symbol}_input()")
     };
+    if method.mode == MethodMode::ServerStream {
+        output.push_str(&format!(
+            "\n  {symbol}({parameter}): C2ResponseStream<Payload> {{\n\
+             \x20   return this.transport.stream(this.routeName, CONTRACT, {}, () => {request}, decode_{symbol}_output);\n\
+             \x20 }}\n\n\
+             \x20 hold_{symbol}({parameter}): C2ResponseStream<C2HeldResult<Payload>> {{\n\
+             \x20   return this.transport.stream(this.routeName, CONTRACT, {}, () => {request}, decode_{symbol}_output, true);\n\
+             \x20 }}\n",
+            quoted(method.name),
+            quoted(method.name),
+        ));
+        return;
+    }
     output.push_str(&format!(
         "\n  async {symbol}({parameter}): Promise<{return_type}> {{\n\
-         \x20   const request = {request};\n\
          \x20   const response = requireResponsePayload(\n\
-         \x20     await this.transport.call(this.routeName, CONTRACT, {}, request),\n\
+         \x20     await this.transport.call(this.routeName, CONTRACT, {}, () => {request}),\n\
          \x20     \"encoded transport response\",\n\
          \x20   );\n\
          \x20   return decodeAndReleaseResponse(response, decode_{symbol}_output);\n\
@@ -1233,9 +1253,8 @@ fn render_typescript_client_method(output: &mut String, method: &TargetMethod<'_
     if method.output_sha256.is_some() {
         output.push_str(&format!(
             "\n  async hold_{symbol}({parameter}): Promise<C2HeldResult<{return_type}>> {{\n\
-             \x20   const request = {request};\n\
              \x20   const response = requireResponsePayload(\n\
-             \x20     await this.transport.call(this.routeName, CONTRACT, {}, request),\n\
+             \x20     await this.transport.call(this.routeName, CONTRACT, {}, () => {request}),\n\
              \x20     \"encoded transport response\",\n\
              \x20   );\n\
              \x20   try {{\n\

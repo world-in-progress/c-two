@@ -1,23 +1,648 @@
+#ifndef _WIN32
+#define _POSIX_C_SOURCE 200809L
+#endif
 #include <node_api.h>
-
 #ifdef _WIN32
-/* Types only: every uv_* function this addon uses is resolved at runtime from
- * the process module (node.exe's bundled libuv) so descriptor tables always
- * belong to the Node CRT. No uv symbol is linked directly. */
-#include <uv.h>
 #include <windows.h>
 #else
 #include <dlfcn.h>
-#include <unistd.h>
+#include <pthread.h>
 #endif
 #include <stdbool.h>
-#include <assert.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-
 #include "c2_mem_ffi.h"
+
+/* Successful loads stay pinned for the lifetime of the Node environment. Native
+ * callbacks and external ArrayBuffers may outlive the JS symbols object. */
+typedef struct Symbols {
+    void *library;
+    uint32_t (*abi_version)(void);
+    C2MemFfiStatus (*capture)(const char *, C2MemFfiLocalEndpointContext **);
+    void (*context_free)(C2MemFfiLocalEndpointContext *);
+    C2MemFfiStatus (*name_len)(const C2MemFfiLocalEndpointContext *, const char *, size_t *);
+    C2MemFfiStatus (*name_copy)(const C2MemFfiLocalEndpointContext *, const char *, char *, size_t, size_t *);
+    C2MemFfiStatus (*namespace_len)(const C2MemFfiLocalEndpointContext *, size_t *);
+    C2MemFfiStatus (*namespace_copy)(const C2MemFfiLocalEndpointContext *, char *, size_t, size_t *);
+    C2MemFfiStatus (*domain_new)(const C2MemFfiLocalEndpointContext *, const char *, C2MemFfiClientDomain **, C2MemFfiError **);
+    void (*domain_free)(C2MemFfiClientDomain *);
+    C2MemFfiStatus (*domain_stats)(const C2MemFfiClientDomain *, C2MemFfiResult **);
+    C2MemFfiStatus (*endpoint_new)(const C2MemFfiClientDomain *, const char *, const char *, C2MemFfiEndpointContext **, C2MemFfiError **);
+    C2MemFfiStatus (*endpoint_prepare)(const C2MemFfiEndpointContext *, const char *, const char *, C2MemFfiComplete, void *);
+    C2MemFfiStatus (*endpoint_deactivate)(const C2MemFfiEndpointContext *);
+    C2MemFfiStatus (*endpoint_close)(const C2MemFfiEndpointContext *, C2MemFfiComplete, void *);
+    void (*endpoint_free)(C2MemFfiEndpointContext *);
+    C2MemFfiStatus (*call_begin)(const C2MemFfiEndpointContext *, const char *, const char *, uint8_t, const uint64_t *, C2MemFfiCall **, C2MemFfiError **);
+    C2MemFfiStatus (*call_charge)(const C2MemFfiCall *, uint64_t, C2MemFfiComplete, void *);
+    C2MemFfiStatus (*call_dispatch)(const C2MemFfiCall *, const uint8_t *, size_t, C2MemFfiComplete, void *);
+    C2MemFfiStatus (*call_next)(const C2MemFfiCall *, C2MemFfiComplete, void *);
+    C2MemFfiStatus (*call_cancel)(const C2MemFfiCall *);
+    C2MemFfiStatus (*call_observe)(const C2MemFfiCall *, const uint64_t *, C2MemFfiComplete, void *);
+    C2MemFfiStatus (*call_check_deadline)(const C2MemFfiCall *, C2MemFfiError **);
+    void (*call_free)(C2MemFfiCall *);
+    C2MemFfiStatus (*buffer_data)(const C2MemFfiBuffer *, const uint8_t **, size_t *);
+    void (*buffer_release)(C2MemFfiBuffer *);
+    const char *(*error_parts)(const C2MemFfiError *);
+    void (*error_free)(C2MemFfiError *);
+    void (*result_free)(C2MemFfiResult *);
+} Symbols;
+
+static napi_value fail(napi_env env, const char *message) { napi_throw_error(env, NULL, message); return NULL; }
+static napi_value bad(napi_env env, const char *message) { napi_throw_type_error(env, NULL, message); return NULL; }
+static bool ok(napi_status status) { return status == napi_ok; }
+static bool put(napi_env env, napi_value obj, const char *name, napi_value value) {
+    return ok(napi_set_named_property(env, obj, name, value));
+}
+static bool method(napi_env env, napi_value obj, const char *name, napi_callback fn, void *data) {
+    napi_value value;
+    return ok(napi_create_function(env, name, NAPI_AUTO_LENGTH, fn, data, &value)) && put(env, obj, name, value);
+}
+static bool args(napi_env env, napi_callback_info info, size_t *count, napi_value *values, napi_value *receiver, void **data) {
+    return ok(napi_get_cb_info(env, info, count, values, receiver, data));
+}
+static char *string(napi_env env, napi_value value, const char *message) {
+    size_t len = 0, written = 0;
+    if (!ok(napi_get_value_string_utf8(env, value, NULL, 0, &len))) { bad(env, message); return NULL; }
+    char *out = malloc(len + 1);
+    if (out == NULL) { fail(env, "Out of memory."); return NULL; }
+    if (!ok(napi_get_value_string_utf8(env, value, out, len + 1, &written)) || memchr(out, 0, written) != NULL) {
+        free(out); bad(env, "Native string arguments cannot contain NUL characters."); return NULL;
+    }
+    out[written] = 0;
+    return out;
+}
+static napi_value js_string(napi_env env, const char *value) {
+    napi_value out;
+    return ok(napi_create_string_utf8(env, value, NAPI_AUTO_LENGTH, &out)) ? out : NULL;
+}
+static napi_value json_call(napi_env env, const char *name, napi_value input) {
+    napi_value global, json, fn, out;
+    if (!ok(napi_get_global(env, &global)) || !ok(napi_get_named_property(env, global, "JSON", &json)) ||
+        !ok(napi_get_named_property(env, json, name, &fn)) ||
+        !ok(napi_call_function(env, json, fn, 1, &input, &out))) return NULL;
+    return out;
+}
+static char *json_string(napi_env env, napi_value object, const char *label) {
+    napi_valuetype type;
+    if (!ok(napi_typeof(env, object, &type)) || type != napi_object) { bad(env, label); return NULL; }
+    napi_value encoded = json_call(env, "stringify", object);
+    return encoded == NULL ? NULL : string(env, encoded, label);
+}
+static napi_value json_parse(napi_env env, const char *json) {
+    napi_value source = js_string(env, json);
+    return source == NULL ? NULL : json_call(env, "parse", source);
+}
+static bool nullish(napi_env env, napi_value value) {
+    napi_valuetype type;
+    return ok(napi_typeof(env, value, &type)) && (type == napi_null || type == napi_undefined);
+}
+static bool uint64(napi_env env, napi_value value, uint64_t *out, const char *label) {
+    napi_valuetype type;
+    if (!ok(napi_typeof(env, value, &type))) return false;
+    if (type == napi_bigint) {
+        bool lossless = false;
+        if (ok(napi_get_value_bigint_uint64(env, value, out, &lossless)) && lossless) return true;
+    } else if (type == napi_number) {
+        double d;
+        if (ok(napi_get_value_double(env, value, &d)) && d >= 0 && d <= 9007199254740991.0 && (double)(uint64_t)d == d) {
+            *out = (uint64_t)d; return true;
+        }
+    }
+    bad(env, label); return false;
+}
+static bool timeout(napi_env env, napi_value value, uint64_t *storage, const uint64_t **out) {
+    if (nullish(env, value)) { *out = NULL; return true; }
+    if (!uint64(env, value, storage, "Timeout must be a nonnegative safe integer or bigint, or null.")) return false;
+    *out = storage; return true;
+}
+static napi_value error_from_details(napi_env env, napi_value details) {
+    napi_value msg, error, fallback;
+    bool has = false;
+    if (!ok(napi_has_named_property(env, details, "message", &has))) return NULL;
+    if (!has || !ok(napi_get_named_property(env, details, "message", &msg))) {
+        msg = js_string(env, "C-Two native error.");
+    }
+    if (msg == NULL || !ok(napi_create_error(env, NULL, msg, &error))) return NULL;
+    if (!put(env, error, "nativeDetails", details)) return NULL;
+    /* Native error JSON is authoritative; keep every structured field. */
+    const char *fields[] = { "code", "canonicalName", "details", "transportPhase", "category", "localProtocolVersion", "peerProtocolVersion", "ioOperation", "ioKind", "rawOsError" };
+    for (size_t i = 0; i < sizeof(fields) / sizeof(fields[0]); i++) {
+        if (!ok(napi_has_named_property(env, details, fields[i], &has))) return NULL;
+        if (has) {
+            if (!ok(napi_get_named_property(env, details, fields[i], &fallback)) || !put(env, error, fields[i], fallback)) return NULL;
+        }
+    }
+    return error;
+}
+static napi_value native_error(napi_env env, Symbols *s, C2MemFfiError *err, C2MemFfiStatus status) {
+    napi_value result = NULL;
+    if (err != NULL) {
+        const char *parts = s->error_parts(err);
+        if (parts != NULL) {
+            napi_value details = json_parse(env, parts);
+            if (details != NULL) result = error_from_details(env, details);
+        }
+        s->error_free(err);
+    }
+    if (result == NULL) {
+        char message[96];
+        snprintf(message, sizeof(message), "C-Two native operation failed with status %u.", (unsigned)status);
+        napi_value details, msg, code;
+        if (ok(napi_create_object(env, &details)) && (msg = js_string(env, message)) != NULL &&
+            ok(napi_create_uint32(env, status, &code)) && put(env, details, "message", msg) &&
+            put(env, details, "code", code)) result = error_from_details(env, details);
+    }
+    return result;
+}
+static napi_value throw_native(napi_env env, Symbols *s, C2MemFfiError *err, C2MemFfiStatus status) {
+    napi_value value = native_error(env, s, err, status);
+    if (value != NULL) napi_throw(env, value);
+    return NULL;
+}
+static napi_value throw_status(napi_env env, C2MemFfiStatus status) {
+    char message[96];
+    snprintf(message, sizeof(message), "C-Two native operation failed with status %u.", (unsigned)status);
+    napi_value details, msg, code, error;
+    if (!ok(napi_create_object(env, &details)) || (msg = js_string(env, message)) == NULL ||
+        !ok(napi_create_uint32(env, status, &code)) || !put(env, details, "message", msg) ||
+        !put(env, details, "code", code) || (error = error_from_details(env, details)) == NULL) return NULL;
+    napi_throw(env, error); return NULL;
+}
+
+typedef enum { OWNER_CONTEXT, OWNER_DOMAIN, OWNER_ENDPOINT, OWNER_CALL } OwnerKind;
+typedef struct Owner { Symbols *s; void *ptr; OwnerKind kind; } Owner;
+static const napi_type_tag tags[] = {
+    { UINT64_C(0x150d476eea241c11), UINT64_C(0x8d9ac802c572b2a1) },
+    { UINT64_C(0x150d476eea241c12), UINT64_C(0x8d9ac802c572b2a2) },
+    { UINT64_C(0x150d476eea241c13), UINT64_C(0x8d9ac802c572b2a3) },
+    { UINT64_C(0x150d476eea241c14), UINT64_C(0x8d9ac802c572b2a4) },
+};
+static void owner_release(Owner *owner) {
+    if (owner == NULL || owner->ptr == NULL) return;
+    void *ptr = owner->ptr; owner->ptr = NULL;
+    switch (owner->kind) {
+    case OWNER_CONTEXT: owner->s->context_free(ptr); break;
+    case OWNER_DOMAIN: owner->s->domain_free(ptr); break;
+    case OWNER_ENDPOINT: owner->s->endpoint_free(ptr); break;
+    case OWNER_CALL: owner->s->call_free(ptr); break;
+    }
+}
+static void owner_finalizer(napi_env env, void *data, void *hint) {
+    (void)env; (void)hint;
+    owner_release(data); free(data);
+}
+static Owner *owner_get(napi_env env, napi_value object, OwnerKind kind, bool live) {
+    bool tagged = false; void *data = NULL;
+    if (!ok(napi_check_object_type_tag(env, object, &tags[kind], &tagged)) || !tagged ||
+        !ok(napi_unwrap(env, object, &data)) || data == NULL) { bad(env, "Invalid native receiver."); return NULL; }
+    Owner *owner = data;
+    if (owner->kind != kind || (live && owner->ptr == NULL)) { bad(env, "Native object is closed."); return NULL; }
+    return owner;
+}
+static napi_value owner_wrap(napi_env env, Symbols *s, OwnerKind kind, void *ptr) {
+    Owner *owner = calloc(1, sizeof(*owner));
+    if (owner == NULL) { Owner temp = { s, ptr, kind }; owner_release(&temp); return fail(env, "Out of memory."); }
+    *owner = (Owner){ s, ptr, kind };
+    napi_value obj;
+    if (!ok(napi_create_object(env, &obj)) || !ok(napi_type_tag_object(env, obj, &tags[kind])) ||
+        !ok(napi_wrap(env, obj, owner, owner_finalizer, NULL, NULL))) {
+        owner_finalizer(env, owner, NULL); return NULL;
+    }
+    return obj;
+}
+
+static napi_value version_cb(napi_env env, napi_callback_info info) {
+    Symbols *s = NULL;
+    if (!args(env, info, NULL, NULL, NULL, (void **)&s)) return NULL;
+    napi_value out;
+    return ok(napi_create_uint32(env, s->abi_version(), &out)) ? out : NULL;
+}
+static napi_value context_method(napi_env env, napi_callback_info info) {
+    size_t argc = 1; napi_value argv[1], self; void *data = NULL;
+    if (!args(env, info, &argc, argv, &self, &data)) return NULL;
+    Owner *owner = owner_get(env, self, OWNER_CONTEXT, data != (void *)3);
+    if (owner == NULL) return NULL;
+    if (data == (void *)3) { owner_release(owner); napi_value out; napi_get_undefined(env, &out); return out; }
+    char *address = NULL;
+    if (data == (void *)1) {
+        if (argc != 1 || (address = string(env, argv[0], "Address must be a string.")) == NULL) return NULL;
+    }
+    size_t len = 0, written = 0;
+    C2MemFfiStatus st = address == NULL ? owner->s->namespace_len(owner->ptr, &len) : owner->s->name_len(owner->ptr, address, &len);
+    if (st != C2_MEM_FFI_STATUS_OK || len == SIZE_MAX) { free(address); return throw_status(env, st); }
+    char *buffer = malloc(len + 1);
+    if (buffer == NULL) { free(address); return fail(env, "Out of memory."); }
+    st = address == NULL ? owner->s->namespace_copy(owner->ptr, buffer, len + 1, &written) :
+        owner->s->name_copy(owner->ptr, address, buffer, len + 1, &written);
+    free(address);
+    napi_value out = st == C2_MEM_FFI_STATUS_OK ? js_string(env, buffer) : throw_status(env, st);
+    free(buffer); return out;
+}
+static napi_value capture_cb(napi_env env, napi_callback_info info) {
+    size_t argc = 1; napi_value argv[1]; Symbols *s = NULL;
+    if (!args(env, info, &argc, argv, NULL, (void **)&s)) return NULL;
+    char *root = NULL;
+    if (argc > 0 && !nullish(env, argv[0]) && (root = string(env, argv[0], "IPC root must be a string or null.")) == NULL) return NULL;
+    C2MemFfiLocalEndpointContext *ptr = NULL;
+    C2MemFfiStatus st = s->capture(root, &ptr); free(root);
+    if (st != C2_MEM_FFI_STATUS_OK || ptr == NULL) return throw_status(env, st);
+    napi_value object = owner_wrap(env, s, OWNER_CONTEXT, ptr);
+    if (object == NULL || !method(env, object, "endpointName", context_method, (void *)1) ||
+        !method(env, object, "namespaceId", context_method, (void *)2) ||
+        !method(env, object, "close", context_method, (void *)3)) return NULL;
+    return object;
+}
+
+/* The external ArrayBuffer and its typed view can finalize independently.
+ * Either may outlive the other, including after explicit detachment. */
+typedef struct BufferOwner { Symbols *s; C2MemFfiBuffer *ptr; unsigned references; } BufferOwner;
+static const napi_type_tag buffer_tag = { UINT64_C(0x150d476eea241c15), UINT64_C(0x8d9ac802c572b2a5) };
+static void buffer_owner_drop(BufferOwner *owner) {
+    if (--owner->references != 0) return;
+    if (owner->ptr != NULL) owner->s->buffer_release(owner->ptr);
+    free(owner);
+}
+static void buffer_finalizer(napi_env env, void *data, void *hint) {
+    (void)env; (void)data;
+    buffer_owner_drop(hint);
+}
+static void buffer_view_finalizer(napi_env env, void *data, void *hint) {
+    (void)env; (void)hint;
+    buffer_owner_drop(data);
+}
+static napi_value buffer_release_cb(napi_env env, napi_callback_info info) {
+    napi_value self, arraybuffer; size_t argc = 0; void *raw = NULL; bool tagged = false;
+    if (!args(env, info, &argc, NULL, &self, NULL) ||
+        !ok(napi_check_object_type_tag(env, self, &buffer_tag, &tagged)) || !tagged ||
+        !ok(napi_unwrap(env, self, &raw)) || raw == NULL)
+        return bad(env, "Invalid native buffer receiver.");
+    BufferOwner *owner = raw;
+    if (owner->ptr != NULL) {
+        if (!ok(napi_get_typedarray_info(env, self, NULL, NULL, NULL, &arraybuffer, NULL))) return NULL;
+        C2MemFfiBuffer *ptr = owner->ptr;
+        owner->ptr = NULL;
+        if (!ok(napi_detach_arraybuffer(env, arraybuffer))) { owner->ptr = ptr; return fail(env, "Failed to detach native buffer."); }
+        owner->s->buffer_release(ptr);
+    }
+    napi_value out; napi_get_undefined(env, &out); return out;
+}
+static napi_value buffer_view(napi_env env, Symbols *s, C2MemFfiBuffer *buffer) {
+    const uint8_t *data = NULL; size_t len = 0;
+    C2MemFfiStatus st = s->buffer_data(buffer, &data, &len);
+    if (st != C2_MEM_FFI_STATUS_OK || (data == NULL && len != 0)) {
+        s->buffer_release(buffer); return throw_status(env, st);
+    }
+    BufferOwner *owner = calloc(1, sizeof(*owner));
+    if (owner == NULL) { s->buffer_release(buffer); return fail(env, "Out of memory."); }
+    *owner = (BufferOwner){ s, buffer, 1 };
+    napi_value ab, view;
+    if (!ok(napi_create_external_arraybuffer(env, (void *)data, len, buffer_finalizer, owner, &ab))) {
+        buffer_owner_drop(owner); return NULL;
+    }
+    if (!ok(napi_create_typedarray(env, napi_uint8_array, len, ab, 0, &view)) ||
+        !ok(napi_type_tag_object(env, view, &buffer_tag))) return NULL;
+    owner->references++;
+    if (!ok(napi_wrap(env, view, owner, buffer_view_finalizer, NULL, NULL))) {
+        buffer_owner_drop(owner); return NULL;
+    }
+    if (!method(env, view, "release", buffer_release_cb, NULL)) return NULL;
+    return view;
+}
+
+typedef enum { ASYNC_JSON, ASYNC_VOID, ASYNC_NEXT, ASYNC_OBSERVE } AsyncKind;
+#ifdef _WIN32
+typedef CRITICAL_SECTION AsyncMutex;
+static bool async_mutex_init(AsyncMutex *mutex) { return InitializeCriticalSectionAndSpinCount(mutex, 0) != 0; }
+static void async_mutex_lock(AsyncMutex *mutex) { EnterCriticalSection(mutex); }
+static void async_mutex_unlock(AsyncMutex *mutex) { LeaveCriticalSection(mutex); }
+static void async_mutex_destroy(AsyncMutex *mutex) { DeleteCriticalSection(mutex); }
+#else
+typedef pthread_mutex_t AsyncMutex;
+static bool async_mutex_init(AsyncMutex *mutex) {
+    pthread_mutexattr_t attributes;
+    if (pthread_mutexattr_init(&attributes) != 0) return false;
+    int status = pthread_mutexattr_settype(&attributes, PTHREAD_MUTEX_RECURSIVE);
+    if (status == 0) status = pthread_mutex_init(mutex, &attributes);
+    pthread_mutexattr_destroy(&attributes);
+    return status == 0;
+}
+static void async_mutex_lock(AsyncMutex *mutex) { pthread_mutex_lock(mutex); }
+static void async_mutex_unlock(AsyncMutex *mutex) { pthread_mutex_unlock(mutex); }
+static void async_mutex_destroy(AsyncMutex *mutex) { pthread_mutex_destroy(mutex); }
+#endif
+typedef struct Async {
+    Symbols *s;
+    napi_deferred deferred;
+    napi_threadsafe_function tsfn;
+    AsyncKind kind;
+    AsyncMutex mutex;
+    unsigned references;
+    bool cleanup_registered;
+} Async;
+static void async_drop(Async *operation) {
+    async_mutex_lock(&operation->mutex);
+    bool last = --operation->references == 0;
+    async_mutex_unlock(&operation->mutex);
+    if (last) { async_mutex_destroy(&operation->mutex); free(operation); }
+}
+static void async_cleanup(void *data) {
+    Async *operation = data;
+    async_mutex_lock(&operation->mutex);
+    /* Env cleanup hooks run before TSFN finalizers. Close the handle path
+     * before Worker teardown can invalidate the TSFN. */
+    operation->tsfn = NULL;
+    operation->cleanup_registered = false;
+    async_mutex_unlock(&operation->mutex);
+    async_drop(operation);
+}
+static void async_finalizer(napi_env env, void *data, void *hint) {
+    (void)hint;
+    Async *operation = data;
+    async_mutex_lock(&operation->mutex);
+    operation->tsfn = NULL;
+    bool remove_cleanup = operation->cleanup_registered;
+    operation->cleanup_registered = false;
+    async_mutex_unlock(&operation->mutex);
+    if (remove_cleanup) {
+        napi_remove_env_cleanup_hook(env, async_cleanup, operation);
+        async_drop(operation);
+    }
+    async_drop(operation);
+}
+static napi_value result_value(napi_env env, Async *operation, C2MemFfiResult *result) {
+    if (operation->kind == ASYNC_NEXT) {
+        if (result->buffer == NULL) { napi_value none; napi_get_null(env, &none); return none; }
+        C2MemFfiBuffer *buffer = result->buffer; result->buffer = NULL;
+        return buffer_view(env, operation->s, buffer);
+    }
+    if (operation->kind == ASYNC_VOID) { napi_value out; napi_get_undefined(env, &out); return out; }
+    if (result->json == NULL) { napi_value none; napi_get_null(env, &none); return none; }
+    napi_value out = json_parse(env, result->json);
+    if (out == NULL || operation->kind != ASYNC_OBSERVE) return out;
+    napi_value error; bool has = false;
+    if (ok(napi_has_named_property(env, out, "error", &has)) && has && ok(napi_get_named_property(env, out, "error", &error)) && !nullish(env, error)) {
+        napi_value typed = error_from_details(env, error);
+        if (typed != NULL) put(env, out, "error", typed);
+    }
+    if (ok(napi_has_named_property(env, out, "completeItems", &has)) && has) {
+        napi_value count;
+        if (ok(napi_get_named_property(env, out, "completeItems", &count)) && !nullish(env, count)) {
+            char *decimal = string(env, count, "Invalid native completeItems count.");
+            if (decimal != NULL) {
+                char *end = NULL; unsigned long long n = strtoull(decimal, &end, 10);
+                if (*decimal != 0 && *end == 0) {
+                    napi_value bigint; if (ok(napi_create_bigint_uint64(env, (uint64_t)n, &bigint))) put(env, out, "completeItems", bigint);
+                }
+                free(decimal);
+            }
+        }
+    }
+    return out;
+}
+static void deliver(napi_env env, napi_value js_cb, void *context, void *data) {
+    (void)js_cb;
+    Async *operation = context; C2MemFfiResult *result = data;
+    if (env != NULL) {
+        napi_value value = NULL;
+        bool failure = false;
+        if (result == NULL) { value = js_string(env, "Native callback returned no result."); failure = true; }
+        else if (result->error != NULL) {
+            C2MemFfiError *error = result->error; result->error = NULL;
+            value = native_error(env, operation->s, error, C2_MEM_FFI_STATUS_IO_ERROR); failure = true;
+        } else value = result_value(env, operation, result);
+        if (value == NULL) {
+            napi_value exception;
+            if (ok(napi_get_and_clear_last_exception(env, &exception))) value = exception;
+            else value = js_string(env, "Failed to project native result.");
+            failure = true;
+        }
+        if (failure) napi_reject_deferred(env, operation->deferred, value);
+        else napi_resolve_deferred(env, operation->deferred, value);
+    }
+    if (result != NULL) operation->s->result_free(result);
+}
+static void native_complete(void *user, C2MemFfiResult *result) {
+    Async *operation = user;
+    /* The native callback and TSFN finalizer share the context. Worker teardown
+     * may finalize the TSFN before this callback arrives. Serialize handle use
+     * with finalization and never touch it after N-API reports napi_closing. */
+    async_mutex_lock(&operation->mutex);
+    napi_threadsafe_function tsfn = operation->tsfn;
+    napi_status status = tsfn == NULL ? napi_closing :
+        napi_call_threadsafe_function(tsfn, result, napi_tsfn_nonblocking);
+    if (tsfn != NULL) {
+        operation->tsfn = NULL;
+        if (status != napi_closing) napi_release_threadsafe_function(tsfn, napi_tsfn_release);
+    }
+    async_mutex_unlock(&operation->mutex);
+    if (status != napi_ok && result != NULL) operation->s->result_free(result);
+    async_drop(operation);
+}
+static Async *async_new(napi_env env, Symbols *s, AsyncKind kind, napi_value *promise) {
+    Async *operation = calloc(1, sizeof(*operation));
+    if (operation == NULL) { fail(env, "Out of memory."); return NULL; }
+    if (!async_mutex_init(&operation->mutex)) { free(operation); fail(env, "Out of memory."); return NULL; }
+    operation->s = s; operation->kind = kind;
+    /* Caller, Rust completion, TSFN finalizer, and env cleanup hook each own
+     * one reference. The latter two may finish before the Rust callback. */
+    operation->references = 4;
+    napi_value name = js_string(env, "C-Two native completion");
+    if (name == NULL || !ok(napi_create_promise(env, &operation->deferred, promise)) ||
+        !ok(napi_create_threadsafe_function(env, NULL, NULL, name, 0, 1, operation, async_finalizer, operation, deliver, &operation->tsfn))) {
+        async_mutex_destroy(&operation->mutex); free(operation);
+        fail(env, "Failed to create native completion."); return NULL;
+    }
+    if (!ok(napi_add_env_cleanup_hook(env, async_cleanup, operation))) {
+        async_mutex_lock(&operation->mutex);
+        napi_threadsafe_function tsfn = operation->tsfn;
+        operation->tsfn = NULL;
+        napi_release_threadsafe_function(tsfn, napi_tsfn_abort);
+        async_mutex_unlock(&operation->mutex);
+        /* The hook was never installed, and no native callback was launched. */
+        async_drop(operation);
+        async_drop(operation);
+        async_drop(operation);
+        fail(env, "Failed to register native completion cleanup."); return NULL;
+    }
+    operation->cleanup_registered = true;
+    return operation;
+}
+static napi_value async_status(napi_env env, Async *operation, C2MemFfiStatus status, napi_value promise) {
+    if (status != C2_MEM_FFI_STATUS_OK) {
+        napi_value reason = native_error(env, operation->s, NULL, status);
+        if (reason != NULL) napi_reject_deferred(env, operation->deferred, reason);
+        /* A failed launch has no native completion; return its reference here. */
+        async_mutex_lock(&operation->mutex);
+        napi_threadsafe_function tsfn = operation->tsfn;
+        operation->tsfn = NULL;
+        if (tsfn != NULL) napi_release_threadsafe_function(tsfn, napi_tsfn_abort);
+        async_mutex_unlock(&operation->mutex);
+        async_drop(operation);
+    }
+    async_drop(operation);
+    return promise;
+}
+
+static napi_value endpoint_method(napi_env env, napi_callback_info info);
+static napi_value call_method(napi_env env, napi_callback_info info);
+static napi_value domain_method(napi_env env, napi_callback_info info) {
+    size_t argc = 2; napi_value argv[2], self; void *data = NULL;
+    if (!args(env, info, &argc, argv, &self, &data)) return NULL;
+    Owner *owner = owner_get(env, self, OWNER_DOMAIN, data != (void *)3);
+    if (owner == NULL) return NULL;
+    Symbols *s = owner->s;
+    if (data == (void *)3) { owner_release(owner); napi_value out; napi_get_undefined(env, &out); return out; }
+    if (data == (void *)2) {
+        C2MemFfiResult *result = NULL; C2MemFfiStatus st = s->domain_stats(owner->ptr, &result);
+        if (st != C2_MEM_FFI_STATUS_OK || result == NULL) {
+            napi_value out = result != NULL && result->error != NULL ? throw_native(env, s, result->error, st) : throw_status(env, st);
+            if (result != NULL) { result->error = NULL; s->result_free(result); }
+            return out;
+        }
+        napi_value out = result->error != NULL ? throw_native(env, s, result->error, st) :
+            result->json != NULL ? json_parse(env, result->json) : NULL;
+        result->error = NULL; s->result_free(result); return out;
+    }
+    if (argc != 2) return bad(env, "createEndpoint expects address and options.");
+    char *address = string(env, argv[0], "Address must be a string.");
+    if (address == NULL) return NULL;
+    char *options = json_string(env, argv[1], "Endpoint options must be an object.");
+    if (options == NULL) { free(address); return NULL; }
+    C2MemFfiEndpointContext *endpoint = NULL; C2MemFfiError *error = NULL;
+    C2MemFfiStatus st = s->endpoint_new(owner->ptr, address, options, &endpoint, &error);
+    free(address); free(options);
+    if (st != C2_MEM_FFI_STATUS_OK || endpoint == NULL) return throw_native(env, s, error, st);
+    napi_value object = owner_wrap(env, s, OWNER_ENDPOINT, endpoint);
+    if (object == NULL || !method(env, object, "prepare", endpoint_method, (void *)1) ||
+        !method(env, object, "beginCall", endpoint_method, (void *)2) ||
+        !method(env, object, "deactivate", endpoint_method, (void *)3) ||
+        !method(env, object, "close", endpoint_method, (void *)4)) return NULL;
+    return object;
+}
+static napi_value endpoint_method(napi_env env, napi_callback_info info) {
+    size_t argc = 4; napi_value argv[4], self; void *data = NULL;
+    if (!args(env, info, &argc, argv, &self, &data)) return NULL;
+    Owner *owner = owner_get(env, self, OWNER_ENDPOINT, true);
+    if (owner == NULL) return NULL;
+    Symbols *s = owner->s; C2MemFfiStatus st;
+    if (data == (void *)3) {
+        st = s->endpoint_deactivate(owner->ptr);
+        if (st != C2_MEM_FFI_STATUS_OK) return throw_status(env, st);
+        napi_value out; napi_get_undefined(env, &out); return out;
+    }
+    if (data == (void *)4) {
+        napi_value promise; Async *operation = async_new(env, s, ASYNC_VOID, &promise);
+        if (operation == NULL) return NULL;
+        st = s->endpoint_close(owner->ptr, native_complete, operation);
+        return async_status(env, operation, st, promise);
+    }
+    if (data == (void *)1) {
+        if (argc != 2) return bad(env, "prepare expects route name and contract.");
+        char *route = string(env, argv[0], "Route name must be a string.");
+        if (route == NULL) return NULL;
+        char *contract = json_string(env, argv[1], "Contract must be an object.");
+        if (contract == NULL) { free(route); return NULL; }
+        napi_value promise; Async *operation = async_new(env, s, ASYNC_JSON, &promise);
+        if (operation == NULL) { free(route); free(contract); return NULL; }
+        st = s->endpoint_prepare(owner->ptr, route, contract, native_complete, operation);
+        free(route); free(contract);
+        return async_status(env, operation, st, promise);
+    }
+    if (argc != 4) return bad(env, "beginCall expects route, method, stream flag and timeout.");
+    char *route = string(env, argv[0], "Route name must be a string.");
+    if (route == NULL) return NULL;
+    char *name = string(env, argv[1], "Method name must be a string.");
+    if (name == NULL) { free(route); return NULL; }
+    bool stream = false;
+    if (!ok(napi_get_value_bool(env, argv[2], &stream))) { free(route); free(name); return bad(env, "Stream flag must be a boolean."); }
+    uint64_t millis = 0; const uint64_t *limit = NULL;
+    if (!timeout(env, argv[3], &millis, &limit)) { free(route); free(name); return NULL; }
+    C2MemFfiCall *call = NULL; C2MemFfiError *error = NULL;
+    st = s->call_begin(owner->ptr, route, name, stream ? 1 : 0, limit, &call, &error);
+    free(route); free(name);
+    if (st != C2_MEM_FFI_STATUS_OK || call == NULL) return throw_native(env, s, error, st);
+    napi_value object = owner_wrap(env, s, OWNER_CALL, call);
+    if (object == NULL || !method(env, object, "chargeInput", call_method, (void *)1) ||
+        !method(env, object, "dispatch", call_method, (void *)2) ||
+        !method(env, object, "next", call_method, (void *)3) ||
+        !method(env, object, "cancel", call_method, (void *)4) ||
+        !method(env, object, "observe", call_method, (void *)5) ||
+        !method(env, object, "checkDeadline", call_method, (void *)6) ||
+        !method(env, object, "close", call_method, (void *)7)) return NULL;
+    return object;
+}
+static napi_value call_method(napi_env env, napi_callback_info info) {
+    size_t argc = 1; napi_value argv[1], self; void *data = NULL;
+    if (!args(env, info, &argc, argv, &self, &data)) return NULL;
+    bool closing = data == (void *)7;
+    Owner *owner = owner_get(env, self, OWNER_CALL, !closing);
+    if (owner == NULL) return NULL;
+    Symbols *s = owner->s; C2MemFfiStatus st;
+    if (closing) { owner_release(owner); napi_value out; napi_get_undefined(env, &out); return out; }
+    if (data == (void *)4 || data == (void *)6) {
+        if (data == (void *)4) {
+            st = s->call_cancel(owner->ptr);
+            if (st != C2_MEM_FFI_STATUS_OK) return throw_status(env, st);
+        } else {
+            C2MemFfiError *error = NULL;
+            st = s->call_check_deadline(owner->ptr, &error);
+            if (st != C2_MEM_FFI_STATUS_OK || error != NULL) return throw_native(env, s, error, st);
+        }
+        napi_value out; napi_get_undefined(env, &out); return out;
+    }
+    AsyncKind kind = data == (void *)3 ? ASYNC_NEXT : data == (void *)5 ? ASYNC_OBSERVE : ASYNC_VOID;
+    napi_value promise; Async *operation;
+    if (data == (void *)1) {
+        uint64_t len = 0;
+        if (argc != 1 || !uint64(env, argv[0], &len, "Input byte length must be a nonnegative integer.")) return NULL;
+        operation = async_new(env, s, kind, &promise); if (operation == NULL) return NULL;
+        st = s->call_charge(owner->ptr, len, native_complete, operation);
+    } else if (data == (void *)2) {
+        if (argc != 1) return bad(env, "dispatch expects a Uint8Array.");
+        bool typed = false; napi_typedarray_type type; size_t len = 0, offset = 0;
+        void *bytes = NULL; napi_value arraybuffer;
+        if (!ok(napi_is_typedarray(env, argv[0], &typed)) || !typed ||
+            !ok(napi_get_typedarray_info(env, argv[0], &type, &len, &bytes, &arraybuffer, &offset)) ||
+            type != napi_uint8_array || (bytes == NULL && len != 0)) return bad(env, "dispatch expects a Uint8Array.");
+        operation = async_new(env, s, kind, &promise); if (operation == NULL) return NULL;
+        /* ABI 8 copies borrowed bytes before this function returns. */
+        st = s->call_dispatch(owner->ptr, bytes, len, native_complete, operation);
+    } else if (data == (void *)3) {
+        operation = async_new(env, s, kind, &promise); if (operation == NULL) return NULL;
+        st = s->call_next(owner->ptr, native_complete, operation);
+    } else {
+        uint64_t millis = 0; const uint64_t *limit = NULL;
+        if (argc != 1 || !timeout(env, argv[0], &millis, &limit)) return NULL;
+        operation = async_new(env, s, kind, &promise); if (operation == NULL) return NULL;
+        st = s->call_observe(owner->ptr, limit, native_complete, operation);
+    }
+    return async_status(env, operation, st, promise);
+}
+static napi_value domain_cb(napi_env env, napi_callback_info info) {
+    size_t argc = 2; napi_value argv[2]; Symbols *s = NULL;
+    if (!args(env, info, &argc, argv, NULL, (void **)&s)) return NULL;
+    if (argc != 2) return bad(env, "createClientDomain expects a context and factory options.");
+    C2MemFfiLocalEndpointContext *context = NULL;
+    if (argc > 0 && !nullish(env, argv[0])) {
+        Owner *owner = owner_get(env, argv[0], OWNER_CONTEXT, true);
+        if (owner == NULL) return NULL;
+        if (owner->s != s) return bad(env, "Context belongs to another native library.");
+        context = owner->ptr;
+    }
+    char *options = json_string(env, argv[1], "Factory options must be an object.");
+    if (options == NULL) return NULL;
+    C2MemFfiClientDomain *domain = NULL; C2MemFfiError *error = NULL;
+    C2MemFfiStatus st = s->domain_new(context, options, &domain, &error);
+    free(options);
+    if (st != C2_MEM_FFI_STATUS_OK || domain == NULL) return throw_native(env, s, error, st);
+    napi_value object = owner_wrap(env, s, OWNER_DOMAIN, domain);
+    if (object == NULL || !method(env, object, "createEndpoint", domain_method, (void *)1) ||
+        !method(env, object, "stats", domain_method, (void *)2) ||
+        !method(env, object, "close", domain_method, (void *)3)) return NULL;
+    return object;
+}
 
 static void close_library(void *library) {
 #ifdef _WIN32
@@ -26,1523 +651,102 @@ static void close_library(void *library) {
     dlclose(library);
 #endif
 }
-
-static void *open_library(const char *path, char *error, size_t error_size) {
+static void *open_library(const char *path, char *message, size_t size) {
 #ifdef _WIN32
     int length = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, NULL, 0);
-    if (length == 0) {
-        snprintf(error, error_size, "Invalid UTF-8 library path (Windows error %lu)", GetLastError());
-        return NULL;
-    }
-    wchar_t *wide = (wchar_t *)calloc((size_t)length, sizeof(wchar_t));
-    if (wide == NULL) {
-        snprintf(error, error_size, "Out of memory.");
-        return NULL;
-    }
+    if (length == 0) { snprintf(message, size, "Invalid UTF-8 library path (Windows error %lu)", GetLastError()); return NULL; }
+    wchar_t *wide = calloc((size_t)length, sizeof(wchar_t));
+    if (wide == NULL) { snprintf(message, size, "Out of memory."); return NULL; }
     if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, wide, length) == 0) {
-        snprintf(error, error_size, "Invalid UTF-8 library path (Windows error %lu)", GetLastError());
-        free(wide);
-        return NULL;
+        snprintf(message, size, "Invalid UTF-8 library path (Windows error %lu)", GetLastError()); free(wide); return NULL;
     }
     DWORD capacity = GetFullPathNameW(wide, 0, NULL, NULL);
-    wchar_t *absolute = capacity == 0 ? NULL : (wchar_t *)calloc(capacity, sizeof(wchar_t));
-    if (absolute == NULL) {
-        snprintf(error, error_size, "Cannot resolve library path (Windows error %lu)", GetLastError());
-        free(wide);
-        return NULL;
-    }
+    wchar_t *absolute = capacity == 0 ? NULL : calloc(capacity, sizeof(wchar_t));
+    if (absolute == NULL) { snprintf(message, size, "Cannot resolve library path (Windows error %lu)", GetLastError()); free(wide); return NULL; }
     DWORD written = GetFullPathNameW(wide, capacity, absolute, NULL);
     free(wide);
-    if (written == 0 || written >= capacity) {
-        snprintf(error, error_size, "Cannot resolve library path (Windows error %lu)", GetLastError());
-        free(absolute);
-        return NULL;
-    }
-    // Restrict dependency lookup to this library's directory and system defaults.
-    HMODULE library = LoadLibraryExW(absolute, NULL,
-        LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
-    DWORD code = library == NULL ? GetLastError() : 0;
-    free(absolute);
-    if (library == NULL) {
-        snprintf(error, error_size, "Windows error %lu", code);
-    }
-    return (void *)library;
+    if (written == 0 || written >= capacity) { snprintf(message, size, "Cannot resolve library path (Windows error %lu)", GetLastError()); free(absolute); return NULL; }
+    HMODULE library = LoadLibraryExW(absolute, NULL, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+    DWORD code = library == NULL ? GetLastError() : 0; free(absolute);
+    if (library == NULL) snprintf(message, size, "Windows error %lu", code);
+    return library;
 #else
     void *library = dlopen(path, RTLD_NOW | RTLD_LOCAL);
-    if (library == NULL) {
-        snprintf(error, error_size, "%s", dlerror());
-    }
+    if (library == NULL) snprintf(message, size, "%s", dlerror());
     return library;
 #endif
 }
-
-typedef C2MemFfiStatus (*memory_context_new_fn)(uintptr_t connection, uintptr_t process, C2MemFfiMemoryContext **out);
-typedef void (*memory_context_free_fn)(C2MemFfiMemoryContext *context);
-typedef C2MemFfiStatus (*memory_context_gc_fn)(const C2MemFfiMemoryContext *context, uint32_t *out_delay_millis);
-typedef C2MemFfiStatus (*memory_context_write_timeout_fn)(const C2MemFfiMemoryContext *context, double *out_seconds);
-typedef C2MemFfiStatus (*memory_context_prefix_len_fn)(const C2MemFfiMemoryContext *context, size_t *out);
-typedef C2MemFfiStatus (*memory_context_prefix_copy_fn)(const C2MemFfiMemoryContext *context, char *dst, size_t len, size_t *out);
-typedef C2MemFfiStatus (*memory_context_finish_handshake_fn)(const C2MemFfiMemoryContext *context, const char *prefix);
-typedef C2MemFfiStatus (*request_prepare_fn)(const C2MemFfiMemoryContext *context, const uint8_t *data, size_t len, C2MemFfiRequest **out, C2MemFfiBlock *block);
-typedef void (*request_discard_fn)(C2MemFfiRequest *request);
-typedef C2MemFfiStatus (*response_admit_fn)(const C2MemFfiMemoryContext *context, C2MemFfiBlock block, C2MemFfiResponse **out);
-typedef C2MemFfiStatus (*response_consume_fn)(C2MemFfiResponse *response, uint8_t *dst, size_t len, size_t *out);
-typedef void (*response_discard_fn)(C2MemFfiResponse *response);
-typedef C2MemFfiStatus (*memory_context_receive_release_fn)(const C2MemFfiMemoryContext *context, const uint8_t *bytes, size_t len);
-typedef C2MemFfiStatus (*write_begin_fn)(const C2MemFfiMemoryContext *context, C2MemFfiRequest *request, uint8_t kind, C2MemFfiWrite **out);
-typedef C2MemFfiStatus (*write_prefix_len_fn)(const C2MemFfiWrite *write, size_t *out);
-typedef C2MemFfiStatus (*write_prefix_copy_fn)(const C2MemFfiWrite *write, uint8_t *dst, size_t len);
-typedef C2MemFfiStatus (*write_start_fn)(C2MemFfiWrite *write);
-typedef C2MemFfiStatus (*write_complete_fn)(C2MemFfiWrite *write, uint8_t success);
-typedef void (*write_discard_fn)(C2MemFfiWrite *write);
-typedef C2MemFfiStatus (*memory_context_deactivate_fn)(const C2MemFfiMemoryContext *context);
-typedef C2MemFfiStatus (*memory_context_peer_end_fn)(const C2MemFfiMemoryContext *context);
-typedef C2MemFfiStatus (*memory_context_try_close_fn)(const C2MemFfiMemoryContext *context, uint8_t *out);
-typedef uint32_t (*abi_version_fn)(void);
-typedef C2MemFfiStatus (*endpoint_context_capture_fn)(const char *, C2MemFfiLocalEndpointContext **);
-typedef void (*endpoint_context_free_fn)(C2MemFfiLocalEndpointContext *);
-typedef C2MemFfiStatus (*endpoint_context_name_len_fn)(const C2MemFfiLocalEndpointContext *, const char *, size_t *);
-typedef C2MemFfiStatus (*endpoint_context_name_copy_fn)(const C2MemFfiLocalEndpointContext *, const char *, char *, size_t, size_t *);
-typedef C2MemFfiStatus (*endpoint_context_namespace_id_len_fn)(const C2MemFfiLocalEndpointContext *, size_t *);
-typedef C2MemFfiStatus (*endpoint_context_namespace_id_copy_fn)(const C2MemFfiLocalEndpointContext *, char *, size_t, size_t *);
-typedef C2MemFfiStatus (*endpoint_context_connect_unix_fn)(const C2MemFfiLocalEndpointContext *, const char *, const uint64_t *, int32_t *, int32_t *);
-typedef C2MemFfiStatus (*endpoint_context_connect_windows_fn)(const C2MemFfiLocalEndpointContext *, const char *, const uint64_t *, uintptr_t *, uintptr_t *, int32_t *);
-
-typedef struct C2MemFfiNodeSymbols {
-    void *library;
-    abi_version_fn abi_version;
-    endpoint_context_capture_fn endpoint_context_capture;
-    endpoint_context_free_fn endpoint_context_free;
-    endpoint_context_name_len_fn endpoint_context_name_len;
-    endpoint_context_name_copy_fn endpoint_context_name_copy;
-    endpoint_context_namespace_id_len_fn endpoint_context_namespace_id_len;
-    endpoint_context_namespace_id_copy_fn endpoint_context_namespace_id_copy;
-    endpoint_context_connect_unix_fn endpoint_context_connect_unix;
-    endpoint_context_connect_windows_fn endpoint_context_connect_windows;
-    memory_context_new_fn memory_context_new;
-    memory_context_free_fn memory_context_free;
-    memory_context_gc_fn memory_context_gc;
-    memory_context_write_timeout_fn memory_context_write_timeout;
-    memory_context_prefix_len_fn memory_context_prefix_len;
-    memory_context_prefix_copy_fn memory_context_prefix_copy;
-    memory_context_finish_handshake_fn memory_context_finish_handshake;
-    request_prepare_fn request_prepare;
-    request_discard_fn request_discard;
-    response_admit_fn response_admit;
-    response_consume_fn response_consume;
-    response_discard_fn response_discard;
-    memory_context_receive_release_fn memory_context_receive_release;
-    write_begin_fn write_begin;
-    write_prefix_len_fn write_prefix_len;
-    write_prefix_copy_fn write_prefix_copy;
-    write_start_fn write_start;
-    write_complete_fn write_complete;
-    write_discard_fn write_discard;
-    memory_context_deactivate_fn memory_context_deactivate;
-    memory_context_peer_end_fn memory_context_peer_end;
-    memory_context_try_close_fn memory_context_try_close;
-} C2MemFfiNodeSymbols;
-
-typedef struct C2MemFfiNodeEndpointContext {
-    C2MemFfiNodeSymbols *symbols;
-    C2MemFfiLocalEndpointContext *ptr;
-    size_t active_connects;
-    bool closed;
-    bool finalized;
-} C2MemFfiNodeEndpointContext;
-
-/* Only wrapped objects created by this addon can carry a context owner.
- * ABI 7 rotates the tag: a stale addon's
- * endpoint contexts must fail the tag check instead of being unwrapped. */
-static const napi_type_tag endpoint_context_tag = {
-    UINT64_C(0x5a71e0c3f28b94d7), UINT64_C(0xd6340f81b9e57c2a)
-};
-
-static napi_value throw_error(napi_env env, const char *message) {
-    napi_throw_error(env, NULL, message);
-    return NULL;
-}
-
-static napi_value throw_type_error(napi_env env, const char *message) {
-    napi_throw_type_error(env, NULL, message);
-    return NULL;
-}
-
-static bool check_napi(napi_status status) {
-    return status == napi_ok;
-}
-
-static bool set_named_value(napi_env env, napi_value object, const char *name, napi_value value) {
-    return check_napi(napi_set_named_property(env, object, name, value));
-}
-
-static bool set_named_uint32(napi_env env, napi_value object, const char *name, uint32_t value) {
-    napi_value js_value;
-    if (!check_napi(napi_create_uint32(env, value, &js_value))) {
-        return false;
-    }
-    return set_named_value(env, object, name, js_value);
-}
-
-static bool set_named_uint64_bigint(napi_env env, napi_value object, const char *name, uint64_t value) {
-    napi_value js_value;
-    return check_napi(napi_create_bigint_uint64(env, value, &js_value)) &&
-        set_named_value(env, object, name, js_value);
-}
-
-static bool set_named_bool(napi_env env, napi_value object, const char *name, bool value) {
-    napi_value js_value;
-    if (!check_napi(napi_get_boolean(env, value, &js_value))) {
-        return false;
-    }
-    return set_named_value(env, object, name, js_value);
-}
-
-static napi_value make_status_result(napi_env env, C2MemFfiStatus status, napi_value value) {
-    napi_value result;
-    if (!check_napi(napi_create_object(env, &result))) {
-        return NULL;
-    }
-    if (!set_named_uint32(env, result, "status", (uint32_t)status)) {
-        return NULL;
-    }
-    if (value != NULL && status == C2_MEM_FFI_STATUS_OK) {
-        if (!set_named_value(env, result, "value", value)) {
-            return NULL;
-        }
-    }
-    return result;
-}
-
-static napi_value make_status_number_result(napi_env env, C2MemFfiStatus status, double value) {
-    napi_value js_value = NULL;
-    if (status == C2_MEM_FFI_STATUS_OK && !check_napi(napi_create_double(env, value, &js_value))) {
-        return NULL;
-    }
-    return make_status_result(env, status, js_value);
-}
-
-static char *read_string_arg(napi_env env, napi_value value, const char *label) {
-    size_t length = 0;
-    if (!check_napi(napi_get_value_string_utf8(env, value, NULL, 0, &length))) {
-        throw_type_error(env, label);
-        return NULL;
-    }
-    char *buffer = (char *)malloc(length + 1);
-    if (buffer == NULL) {
-        throw_error(env, "Out of memory.");
-        return NULL;
-    }
-    size_t written = 0;
-    if (!check_napi(napi_get_value_string_utf8(env, value, buffer, length + 1, &written))) {
-        free(buffer);
-        throw_type_error(env, label);
-        return NULL;
-    }
-    buffer[written] = '\0';
-    if (memchr(buffer, '\0', written) != NULL) {
-        free(buffer);
-        throw_type_error(env, "Native string arguments cannot contain NUL characters.");
-        return NULL;
-    }
-    return buffer;
-}
-
-static bool read_uint32_arg(napi_env env, napi_value value, const char *label, uint32_t *out) {
-    double numeric = 0.0;
-    if (!check_napi(napi_get_value_double(env, value, &numeric))) {
-        throw_type_error(env, label);
-        return false;
-    }
-    if (numeric != numeric ||
-        numeric < 0.0 ||
-        numeric > (double)UINT32_MAX) {
-        throw_type_error(env, label);
-        return false;
-    }
-    uint32_t narrowed = (uint32_t)numeric;
-    if ((double)narrowed != numeric) {
-        throw_type_error(env, label);
-        return false;
-    }
-    *out = narrowed;
-    return true;
-}
-
-static bool get_named_property(napi_env env, napi_value object, const char *name, napi_value *out) {
-    if (!check_napi(napi_get_named_property(env, object, name, out))) {
-        char message[160];
-        snprintf(message, sizeof(message), "Expected c2-mem-ffi block property %s.", name);
-        throw_type_error(env, message);
-        return false;
-    }
-    return true;
-}
-
-static bool read_block_common(
-    napi_env env,
-    napi_value value,
-    uint16_t *segment_index,
-    uint8_t *is_dedicated,
-    uint32_t *generation,
-    uint32_t *offset,
-    uint32_t *byte_length,
-    uint64_t *loan_id) {
-    napi_value property;
-    uint32_t temp_u32 = 0;
-    bool temp_bool = false;
-    if (!get_named_property(env, value, "segmentIndex", &property) ||
-        !read_uint32_arg(env, property, "block.segmentIndex must be a u32 integer.", &temp_u32)) {
-        return false;
-    }
-    if (temp_u32 > UINT16_MAX) {
-        throw_type_error(env, "block.segmentIndex must fit in u16.");
-        return false;
-    }
-    *segment_index = (uint16_t)temp_u32;
-    if (!get_named_property(env, value, "dedicated", &property) ||
-        !check_napi(napi_get_value_bool(env, property, &temp_bool))) {
-        throw_type_error(env, "block.dedicated must be a boolean.");
-        return false;
-    }
-    *is_dedicated = temp_bool ? 1 : 0;
-    if (!get_named_property(env, value, "generation", &property) ||
-        !read_uint32_arg(env, property, "block.generation must be a u32 integer.", generation)) {
-        return false;
-    }
-    if (!get_named_property(env, value, "offset", &property) ||
-        !read_uint32_arg(env, property, "block.offset must be a u32 integer.", offset)) {
-        return false;
-    }
-    if (!get_named_property(env, value, "byteLength", &property) ||
-        !read_uint32_arg(env, property, "block.byteLength must be a u32 integer.", byte_length)) {
-        return false;
-    }
-    bool lossless = false;
-    if (!get_named_property(env, value, "loanId", &property) ||
-        !check_napi(napi_get_value_bigint_uint64(env, property, loan_id, &lossless)) ||
-        !lossless) {
-        throw_type_error(env, "block.loanId must be a lossless u64 bigint.");
-        return false;
-    }
-    return true;
-}
-
-static bool read_block(napi_env env, napi_value value, C2MemFfiBlock *block) {
-    memset(block, 0, sizeof(*block));
-    const char *fields[] = { "segmentIndex", "generation", "offset", "byteLength", "loanId", "dedicated" };
-    napi_value keys;
-    uint32_t length = 0;
-    if (!check_napi(napi_get_all_property_names(env, value, napi_key_own_only,
-            napi_key_all_properties, napi_key_numbers_to_strings, &keys)) ||
-        !check_napi(napi_get_array_length(env, keys, &length))) return false;
-    for (uint32_t i = 0; i < length; i++) {
-        napi_value key;
-        napi_valuetype type;
-        char name[32];
-        size_t written = 0;
-        bool known = false;
-        if (!check_napi(napi_get_element(env, keys, i, &key)) ||
-            !check_napi(napi_typeof(env, key, &type))) return false;
-        if (type == napi_string && check_napi(napi_get_value_string_utf8(env, key, name, sizeof(name), &written))) {
-            for (size_t j = 0; j < sizeof(fields) / sizeof(fields[0]); j++) {
-                if (written == strlen(fields[j]) && memcmp(name, fields[j], written) == 0) { known = true; break; }
-            }
-        }
-        if (!known) { throw_type_error(env, "Unknown block fields."); return false; }
-    }
-    return read_block_common(env, value, &block->segment_index, &block->is_dedicated,
-        &block->generation, &block->offset, &block->byte_length, &block->loan_id);
-}
-static napi_value make_block(napi_env env, C2MemFfiBlock block) {
-    napi_value object;
-    if (!check_napi(napi_create_object(env, &object)) ||
-        !set_named_uint32(env, object, "segmentIndex", block.segment_index) ||
-        !set_named_uint32(env, object, "generation", block.generation) ||
-        !set_named_uint32(env, object, "offset", block.offset) ||
-        !set_named_uint32(env, object, "byteLength", block.byte_length) ||
-        !set_named_uint64_bigint(env, object, "loanId", block.loan_id) ||
-        !set_named_bool(env, object, "dedicated", block.is_dedicated != 0)) return NULL;
-    return object;
-}
-
-static bool get_uint8_array(
-    napi_env env,
-    napi_value value,
-    const char *label,
-    uint8_t **out_data,
-    size_t *out_length) {
-    bool is_typed_array = false;
-    if (!check_napi(napi_is_typedarray(env, value, &is_typed_array)) || !is_typed_array) {
-        throw_type_error(env, label);
-        return false;
-    }
-    napi_typedarray_type type;
-    size_t length = 0;
-    void *data = NULL;
-    napi_value arraybuffer;
-    size_t byte_offset = 0;
-    if (!check_napi(napi_get_typedarray_info(env, value, &type, &length, &data, &arraybuffer, &byte_offset)) ||
-        type != napi_uint8_array ||
-        (data == NULL && length != 0)) {
-        throw_type_error(env, label);
-        return false;
-    }
-    *out_data = (uint8_t *)data;
-    *out_length = length;
-    return true;
-}
-
-static napi_value abi_version_callback(napi_env env, napi_callback_info info) {
-    C2MemFfiNodeSymbols *symbols = NULL;
-    if (!check_napi(napi_get_cb_info(env, info, NULL, NULL, NULL, (void **)&symbols))) return NULL;
-    napi_value value;
-    if (!check_napi(napi_create_uint32(env, symbols->abi_version(), &value))) return NULL;
-    return value;
-}
-
-enum MemoryKind { MEMORY_CONTEXT, MEMORY_REQUEST, MEMORY_RESPONSE, MEMORY_WRITE };
-typedef struct MemoryOwner {
-    C2MemFfiNodeSymbols *symbols;
-    enum MemoryKind kind;
-    void *ptr;
-} MemoryOwner;
-static const napi_type_tag memory_tag = { UINT64_C(0xb178382913ac77af), UINT64_C(0x17d088f27bcb0700) };
-static void memory_release(MemoryOwner *owner) {
-    if (owner->ptr == NULL) return;
-    switch (owner->kind) {
-    case MEMORY_CONTEXT: owner->symbols->memory_context_free(owner->ptr); break;
-    case MEMORY_REQUEST: owner->symbols->request_discard(owner->ptr); break;
-    case MEMORY_RESPONSE: owner->symbols->response_discard(owner->ptr); break;
-    case MEMORY_WRITE: owner->symbols->write_discard(owner->ptr); break;
-    }
-    owner->ptr = NULL;
-}
-static void memory_finalize(napi_env env, void *data, void *hint) {
-    (void)env; (void)hint;
-    MemoryOwner *owner = data;
-    memory_release(owner);
-    free(owner);
-}
-static MemoryOwner *memory_owner(napi_env env, napi_value value, enum MemoryKind kind, bool live) {
-    bool tagged = false;
-    void *raw = NULL;
-    if (!check_napi(napi_check_object_type_tag(env, value, &memory_tag, &tagged)) || !tagged ||
-        !check_napi(napi_unwrap(env, value, &raw)) || raw == NULL) {
-        throw_type_error(env, "Expected an opaque ABI 7 memory owner."); return NULL;
-    }
-    MemoryOwner *owner = raw;
-    if (owner->kind != kind || (live && owner->ptr == NULL)) {
-        throw_type_error(env, "ABI 7 memory owner is consumed or has a different kind."); return NULL;
-    }
-    return owner;
-}
-static napi_value memory_wrap(napi_env env, C2MemFfiNodeSymbols *symbols, enum MemoryKind kind, void *ptr) {
-    MemoryOwner *owner = malloc(sizeof(*owner));
-    if (owner == NULL) {
-        MemoryOwner temporary = { symbols, kind, ptr }; memory_release(&temporary);
-        return throw_error(env, "Out of memory.");
-    }
-    *owner = (MemoryOwner){ symbols, kind, ptr };
-    napi_value object;
-    if (!check_napi(napi_create_object(env, &object)) || !check_napi(napi_type_tag_object(env, object, &memory_tag)) ||
-        !check_napi(napi_wrap(env, object, owner, memory_finalize, NULL, NULL))) {
-        memory_finalize(env, owner, NULL); return NULL;
-    }
-    return object;
-}
-static napi_value memory_bytes(napi_env env, size_t len, uint8_t **data) {
-    napi_value buffer, view;
-    if (!check_napi(napi_create_arraybuffer(env, len, (void **)data, &buffer)) ||
-        !check_napi(napi_create_typedarray(env, napi_uint8_array, len, buffer, 0, &view))) return NULL;
-    return view;
-}
-enum MemoryOp { M_PREFIX, M_HANDSHAKE, M_PREPARE, M_ADMIT, M_CONSUME, M_DISCARD_RESPONSE,
-    M_GC, M_WRITE_TIMEOUT, M_BEGIN, M_START, M_COMPLETE, M_RECEIVE, M_DEACTIVATE, M_PEER_END, M_TRY_CLOSE, M_CLOSE, M_DISCARD_REQUEST, M_DISCARD_WRITE };
-static napi_value memory_call(napi_env env, napi_callback_info info) {
-    size_t argc = 2;
-    napi_value args[2], receiver;
-    void *operation = NULL;
-    if (!check_napi(napi_get_cb_info(env, info, &argc, args, &receiver, &operation))) return NULL;
-    enum MemoryOp op = (enum MemoryOp)(uintptr_t)operation;
-    bool needs_context = op != M_CLOSE && op != M_CONSUME && op != M_DISCARD_RESPONSE &&
-        op != M_DISCARD_REQUEST && op != M_COMPLETE && op != M_DISCARD_WRITE;
-    MemoryOwner *owner = memory_owner(env, receiver, MEMORY_CONTEXT, needs_context);
-    if (owner == NULL) return NULL;
-    C2MemFfiNodeSymbols *s = owner->symbols;
-    C2MemFfiMemoryContext *ctx = owner->ptr;
-    C2MemFfiStatus status = C2_MEM_FFI_STATUS_OK;
-    napi_value value = NULL;
-    MemoryOwner *created = NULL;
-    switch (op) {
-    case M_PREFIX: {
-        size_t len = 0, written = 0;
-        status = s->memory_context_prefix_len(ctx, &len);
-        if (status != C2_MEM_FFI_STATUS_OK) break;
-        char *buffer = malloc(len + 1);
-        if (buffer == NULL) return throw_error(env, "Out of memory.");
-        status = s->memory_context_prefix_copy(ctx, buffer, len + 1, &written);
-        if (status == C2_MEM_FFI_STATUS_OK && !check_napi(napi_create_string_utf8(env, buffer, written, &value))) value = NULL;
-        free(buffer); break;
-    }
-    case M_HANDSHAKE: {
-        if (argc != 1) return throw_type_error(env, "finishHandshake expects a prefix or null.");
-        napi_valuetype type;
-        if (!check_napi(napi_typeof(env, args[0], &type))) return NULL;
-        char *prefix = type == napi_null ? NULL : read_string_arg(env, args[0], "Expected response prefix.");
-        if (type != napi_null && prefix == NULL) return NULL;
-        status = s->memory_context_finish_handshake(ctx, prefix);
-        free(prefix); break;
-    }
-    case M_PREPARE: {
-        uint8_t *data = NULL; size_t len = 0; C2MemFfiRequest *request = NULL; C2MemFfiBlock block;
-        if (argc != 1 || !get_uint8_array(env, args[0], "Expected request bytes.", &data, &len)) return NULL;
-        status = s->request_prepare(ctx, data, len, &request, &block);
-        if (status == C2_MEM_FFI_STATUS_OK) {
-            value = memory_wrap(env, s, MEMORY_REQUEST, request);
-            if (value == NULL) return NULL;
-            created = memory_owner(env, value, MEMORY_REQUEST, true);
-            napi_value descriptor = make_block(env, block);
-            if (descriptor == NULL || !set_named_value(env, value, "block", descriptor)) { memory_release(created); return NULL; }
-        }
-        break;
-    }
-    case M_ADMIT: {
-        C2MemFfiBlock block; C2MemFfiResponse *response = NULL;
-        if (argc != 1 || !read_block(env, args[0], &block)) {
-            return NULL;
-        }
-        status = s->response_admit(ctx, block, &response);
-        if (status == C2_MEM_FFI_STATUS_OK) {
-            value = memory_wrap(env, s, MEMORY_RESPONSE, response);
-            if (value == NULL) return NULL;
-            created = memory_owner(env, value, MEMORY_RESPONSE, true);
-        }
-        break;
-    }
-    case M_CONSUME: {
-        if (argc != 2) return throw_type_error(env, "Expected owner and destination.");
-        MemoryOwner *item = memory_owner(env, args[0], MEMORY_RESPONSE, true);
-        if (item == NULL || item->symbols != s) return NULL;
-        uint8_t *dst = NULL; size_t len = 0, written = 0;
-        if (!get_uint8_array(env, args[1], "Expected destination bytes.", &dst, &len)) {
-            memory_release(item);
-            return NULL;
-        }
-        C2MemFfiResponse *response = item->ptr; item->ptr = NULL;
-        status = s->response_consume(response, dst, len, &written);
-        return make_status_number_result(env, status, (double)written);
-    }
-    case M_DISCARD_RESPONSE: case M_DISCARD_REQUEST: case M_DISCARD_WRITE: {
-        if (argc != 1) return throw_type_error(env, "Expected memory owner.");
-        MemoryOwner *item = memory_owner(env, args[0], op == M_DISCARD_RESPONSE ? MEMORY_RESPONSE : op == M_DISCARD_WRITE ? MEMORY_WRITE : MEMORY_REQUEST, false);
-        if (item == NULL || item->symbols != s) return NULL;
-        memory_release(item); break;
-    }
-    case M_BEGIN: {
-        if (argc < 1) return throw_type_error(env, "beginWrite expects kind and optional request.");
-        uint32_t kind = 0;
-        if (!read_uint32_arg(env, args[0], "Expected write kind.", &kind) || kind > 2) return NULL;
-        C2MemFfiRequest *request = NULL;
-        if (argc == 2) {
-            MemoryOwner *item = memory_owner(env, args[1], MEMORY_REQUEST, true);
-            if (item == NULL || item->symbols != s) return NULL;
-            request = item->ptr; item->ptr = NULL;
-        }
-        C2MemFfiWrite *write = NULL;
-        status = s->write_begin(ctx, request, (uint8_t)kind, &write);
-        if (status == C2_MEM_FFI_STATUS_OK && write != NULL) {
-            value = memory_wrap(env, s, MEMORY_WRITE, write);
-            if (value == NULL) return NULL;
-            created = memory_owner(env, value, MEMORY_WRITE, true);
-            size_t len = 0; uint8_t *data = NULL;
-            status = s->write_prefix_len(write, &len);
-            napi_value prefix = status == C2_MEM_FFI_STATUS_OK ? memory_bytes(env, len, &data) : NULL;
-            if (prefix == NULL) { memory_release(created); return NULL; }
-            status = s->write_prefix_copy(write, data, len);
-            if (!set_named_value(env, value, "prefix", prefix)) { memory_release(created); return NULL; }
-        }
-        break;
-    }
-    case M_START: case M_COMPLETE: {
-        if (argc < 1) return throw_type_error(env, "Expected write owner.");
-        MemoryOwner *item = memory_owner(env, args[0], MEMORY_WRITE, true);
-        if (item == NULL || item->symbols != s) return NULL;
-        if (op == M_START) status = s->write_start(item->ptr);
-        else {
-            bool success = false;
-            if (argc != 2 || !check_napi(napi_get_value_bool(env, args[1], &success))) return throw_type_error(env, "Expected write outcome.");
-            C2MemFfiWrite *write = item->ptr; item->ptr = NULL;
-            status = s->write_complete(write, success ? 1 : 0);
-        }
-        break;
-    }
-    case M_RECEIVE: {
-        uint8_t *data = NULL; size_t len = 0;
-        if (argc != 1 || !get_uint8_array(env, args[0], "Expected release frame.", &data, &len)) return NULL;
-        status = s->memory_context_receive_release(ctx, data, len); break;
-    }
-    case M_GC: {
-        uint32_t delay = 0;
-        status = s->memory_context_gc(ctx, &delay);
-        if (!check_napi(napi_create_uint32(env, delay, &value))) return NULL;
-        break;
-    }
-    case M_WRITE_TIMEOUT: {
-        double seconds = 0;
-        status = s->memory_context_write_timeout(ctx, &seconds);
-        if (status == C2_MEM_FFI_STATUS_OK && !check_napi(napi_create_double(env, seconds, &value))) return NULL;
-        break;
-    }
-    case M_DEACTIVATE: status = s->memory_context_deactivate(ctx); break;
-    case M_PEER_END: status = s->memory_context_peer_end(ctx); break;
-    case M_TRY_CLOSE: {
-        uint8_t closed = 0;
-        status = s->memory_context_try_close(ctx, &closed);
-        if (!check_napi(napi_get_boolean(env, closed != 0, &value))) return NULL;
-        break;
-    }
-    case M_CLOSE: memory_release(owner); break;
-    }
-    napi_value result = make_status_result(env, status, value);
-    if (created != NULL && (result == NULL || status != C2_MEM_FFI_STATUS_OK)) memory_release(created);
-    return result;
-}
-static napi_value make_memory(napi_env env, C2MemFfiNodeSymbols *symbols, uintptr_t connection, uintptr_t process) {
-    C2MemFfiMemoryContext *ctx = NULL;
-    C2MemFfiStatus status = symbols->memory_context_new(connection, process, &ctx);
-    if (status != C2_MEM_FFI_STATUS_OK) return throw_error(env, "Failed to bind memory to the verified connection.");
-    napi_value object = memory_wrap(env, symbols, MEMORY_CONTEXT, ctx);
-    if (object == NULL) return NULL;
-#define METHOD(name, op) { name, NULL, memory_call, NULL, NULL, NULL, napi_default, (void *)(uintptr_t)op }
-    napi_property_descriptor methods[] = {
-        METHOD("gc", M_GC), METHOD("writeTimeout", M_WRITE_TIMEOUT), METHOD("prefix", M_PREFIX), METHOD("finishHandshake", M_HANDSHAKE), METHOD("prepareRequest", M_PREPARE),
-        METHOD("admitResponse", M_ADMIT), METHOD("consumeResponse", M_CONSUME), METHOD("discardResponse", M_DISCARD_RESPONSE),
-        METHOD("beginWrite", M_BEGIN), METHOD("startWrite", M_START), METHOD("completeWrite", M_COMPLETE),
-        METHOD("receiveRelease", M_RECEIVE), METHOD("deactivate", M_DEACTIVATE), METHOD("peerEnd", M_PEER_END),
-        METHOD("tryClose", M_TRY_CLOSE), METHOD("close", M_CLOSE), METHOD("discardRequest", M_DISCARD_REQUEST), METHOD("discardWrite", M_DISCARD_WRITE),
-    };
-#undef METHOD
-    if (!check_napi(napi_define_properties(env, object, sizeof(methods) / sizeof(methods[0]), methods))) {
-        memory_release(memory_owner(env, object, MEMORY_CONTEXT, true)); return NULL;
-    }
-    return object;
-}
-
-/* A null address selects the namespace id query on the same captured context. */
-static napi_value endpoint_string_result(
-    napi_env env,
-    C2MemFfiNodeSymbols *symbols,
-    const C2MemFfiLocalEndpointContext *context,
-    const char *address) {
-    size_t length = 0;
-    C2MemFfiStatus status;
-    if (address != NULL) {
-        status = symbols->endpoint_context_name_len(context, address, &length);
-    } else {
-        status = symbols->endpoint_context_namespace_id_len(context, &length);
-    }
-    if (status != C2_MEM_FFI_STATUS_OK) {
-        return make_status_result(env, status, NULL);
-    }
-    if (length == SIZE_MAX) {
-        return throw_error(env, "IPC endpoint name is too large.");
-    }
-    char *buffer = (char *)malloc(length + 1);
-    if (buffer == NULL) {
-        return throw_error(env, "Out of memory.");
-    }
-    size_t written = 0;
-    if (address != NULL) {
-        status = symbols->endpoint_context_name_copy(context, address, buffer, length + 1, &written);
-    } else {
-        status = symbols->endpoint_context_namespace_id_copy(context, buffer, length + 1, &written);
-    }
-    napi_value value = NULL;
-    if (status == C2_MEM_FFI_STATUS_OK && (written > length || buffer[written] != '\0')) {
-        free(buffer);
-        return throw_error(env, "Invalid native IPC endpoint string result.");
-    }
-    if (status == C2_MEM_FFI_STATUS_OK && !check_napi(napi_create_string_utf8(env, buffer, written, &value))) {
-        free(buffer);
-        return NULL;
-    }
-    free(buffer);
-    return make_status_result(env, status, value);
-}
-
-static napi_value local_endpoint(napi_env env, napi_callback_info info) {
-    size_t argc = 1;
-    napi_value args[1];
-    C2MemFfiNodeSymbols *symbols = NULL;
-    if (!check_napi(napi_get_cb_info(env, info, &argc, args, NULL, (void **)&symbols)) || argc < 1) {
-        return throw_type_error(env, "c2_mem_ffi_local_endpoint expects an ipc:// address.");
-    }
-    char *address = read_string_arg(env, args[0], "IPC address must be a string.");
-    if (address == NULL) {
-        return NULL;
-    }
-    C2MemFfiLocalEndpointContext *context = NULL;
-    C2MemFfiStatus status = symbols->endpoint_context_capture(NULL, &context);
-    if (status != C2_MEM_FFI_STATUS_OK || context == NULL) {
-        free(address);
-        if (context != NULL) symbols->endpoint_context_free(context);
-        if (status == C2_MEM_FFI_STATUS_OK) {
-            return throw_error(env, "Native IPC endpoint capture returned no context.");
-        }
-        return make_status_result(env, status, NULL);
-    }
-    napi_value result = endpoint_string_result(env, symbols, context, address);
-    symbols->endpoint_context_free(context);
-    free(address);
-    return result;
-}
-
-static void endpoint_context_release_closed(C2MemFfiNodeEndpointContext *context) {
-    if (!context->closed || context->active_connects != 0) return;
-    if (context->ptr != NULL) {
-        context->symbols->endpoint_context_free(context->ptr);
-        context->ptr = NULL;
-    }
-    if (context->finalized) free(context);
-}
-
-static void endpoint_context_finalize(napi_env env, void *data, void *hint) {
-    (void)env;
-    (void)hint;
-    C2MemFfiNodeEndpointContext *context = (C2MemFfiNodeEndpointContext *)data;
-    context->closed = true;
-    context->finalized = true;
-    endpoint_context_release_closed(context);
-}
-
-static C2MemFfiNodeEndpointContext *endpoint_context_receiver(
-    napi_env env, napi_value receiver, bool require_open) {
-    bool tagged = false;
-    void *raw = NULL;
-    if (!check_napi(napi_check_object_type_tag(env, receiver, &endpoint_context_tag, &tagged)) ||
-        !tagged || !check_napi(napi_unwrap(env, receiver, &raw)) || raw == NULL) {
-        throw_type_error(env, "Expected a c2-mem-ffi native endpoint context receiver.");
-        return NULL;
-    }
-    C2MemFfiNodeEndpointContext *context = (C2MemFfiNodeEndpointContext *)raw;
-    if (require_open && (context->closed || context->ptr == NULL)) {
-        throw_type_error(env, "c2-mem-ffi native endpoint context is closed.");
-        return NULL;
-    }
-    return context;
-}
-
-static napi_value endpoint_context_name(napi_env env, napi_callback_info info) {
-    size_t argc = 1;
-    napi_value args[1], receiver;
-    if (!check_napi(napi_get_cb_info(env, info, &argc, args, &receiver, NULL)) || argc < 1) {
-        return throw_type_error(env, "endpointName expects an ipc:// address.");
-    }
-    C2MemFfiNodeEndpointContext *context = endpoint_context_receiver(env, receiver, true);
-    if (context == NULL) return NULL;
-    char *address = read_string_arg(env, args[0], "IPC address must be a string.");
-    if (address == NULL) return NULL;
-    napi_value result = endpoint_string_result(env, context->symbols, context->ptr, address);
-    free(address);
-    return result;
-}
-
-static napi_value endpoint_context_namespace_id(napi_env env, napi_callback_info info) {
-    napi_value receiver;
-    if (!check_napi(napi_get_cb_info(env, info, NULL, NULL, &receiver, NULL))) return NULL;
-    C2MemFfiNodeEndpointContext *context = endpoint_context_receiver(env, receiver, true);
-    if (context == NULL) return NULL;
-    return endpoint_string_result(env, context->symbols, context->ptr, NULL);
-}
-
-static napi_value endpoint_context_close(napi_env env, napi_callback_info info) {
-    napi_value receiver;
-    if (!check_napi(napi_get_cb_info(env, info, NULL, NULL, &receiver, NULL))) return NULL;
-    C2MemFfiNodeEndpointContext *context = endpoint_context_receiver(env, receiver, false);
-    if (context == NULL) return NULL;
-    context->closed = true;
-    endpoint_context_release_closed(context);
-    napi_value result;
-    if (!check_napi(napi_get_undefined(env, &result))) return NULL;
-    return result;
-}
-
-/* A descriptor remains owned until explicitly taken by Node's Socket. An
- * ignored async result is closed by GC; every failed handoff closes it here. */
-typedef struct NativeSocketFd { int32_t fd; C2MemFfiNodeSymbols *symbols; bool memory_taken; } NativeSocketFd;
-static const napi_type_tag socket_fd_tag = {
-    UINT64_C(0xb82cd6be1d234b9a), UINT64_C(0x9b4e465211132206)
-};
-
-#ifdef _WIN32
-/* Descriptors handed to Node must live in the Node CRT's descriptor table.
- * node.exe exports its bundled libuv's wrappers (uv_open_osfhandle and
- * friends), so this addon resolves them from the process module instead of
- * calling _open_osfhandle from another DLL's CRT or treating a HANDLE as an
- * fd. Verified against official Node v22.23.4 win-x64 exports and the vendored
- * libuv sources (win/handle.c, win/fs.c, win/pipe.c). */
-typedef int (*c2_uv_open_osfhandle_fn)(uv_os_fd_t);
-typedef int (*c2_uv_fs_close_fn)(uv_loop_t *, uv_fs_t *, uv_file, uv_fs_cb);
-typedef void (*c2_uv_fs_req_cleanup_fn)(uv_fs_t *);
-
-static c2_uv_open_osfhandle_fn c2_uv_open_osfhandle;
-static c2_uv_fs_close_fn c2_uv_fs_close;
-static c2_uv_fs_req_cleanup_fn c2_uv_fs_req_cleanup;
-static INIT_ONCE process_libuv_once = INIT_ONCE_STATIC_INIT;
-
-static BOOL CALLBACK initialize_process_libuv(PINIT_ONCE once, PVOID parameter, PVOID *context) {
-    (void)once; (void)parameter; (void)context;
-    HMODULE process_module = GetModuleHandleW(NULL);
-    if (process_module == NULL) {
-        return TRUE;
-    }
-    c2_uv_open_osfhandle = (c2_uv_open_osfhandle_fn)(void *)GetProcAddress(process_module, "uv_open_osfhandle");
-    c2_uv_fs_close = (c2_uv_fs_close_fn)(void *)GetProcAddress(process_module, "uv_fs_close");
-    c2_uv_fs_req_cleanup = (c2_uv_fs_req_cleanup_fn)(void *)GetProcAddress(process_module, "uv_fs_req_cleanup");
-    if (c2_uv_open_osfhandle == NULL || c2_uv_fs_close == NULL ||
-        c2_uv_fs_req_cleanup == NULL) {
-        c2_uv_open_osfhandle = NULL;
-        c2_uv_fs_close = NULL;
-        c2_uv_fs_req_cleanup = NULL;
-    }
-    return TRUE;
-}
-
-static bool resolve_process_libuv(void) {
-    /* Worker environments share this addon. Publish the complete immutable
-     * function group once before any worker can mint a Node-owned descriptor. */
-    InitOnceExecuteOnce(&process_libuv_once, initialize_process_libuv, NULL, NULL);
-    return c2_uv_open_osfhandle != NULL;
-}
-
-/* Release through the Node CRT that minted the descriptor. The supported
- * Node process initializes stdio slots 0-2 and libuv preserves them. */
-static void close_windows_pipe_fd(int32_t fd) {
-    if (fd < 0) {
-        return;
-    }
-    assert(fd >= 3);
-    assert(c2_uv_fs_close != NULL && c2_uv_fs_req_cleanup != NULL);
-    uv_fs_t request;
-    memset(&request, 0, sizeof(request));
-    c2_uv_fs_close(NULL, &request, fd, NULL);
-    c2_uv_fs_req_cleanup(&request);
-}
-#endif
-
-static void close_socket_fd(int32_t fd) {
-#ifndef _WIN32
-    if (fd >= 0) close(fd);
-#else
-    close_windows_pipe_fd(fd);
-#endif
-}
-
-static void socket_fd_finalize(napi_env env, void *data, void *hint) {
-    (void)env; (void)hint;
-    NativeSocketFd *owner = (NativeSocketFd *)data;
-    close_socket_fd(owner->fd);
-    free(owner);
-}
-
-static NativeSocketFd *socket_fd_receiver(napi_env env, napi_callback_info info) {
-    napi_value receiver;
-    bool tagged = false;
-    void *raw = NULL;
-    if (!check_napi(napi_get_cb_info(env, info, NULL, NULL, &receiver, NULL)) ||
-        !check_napi(napi_check_object_type_tag(env, receiver, &socket_fd_tag, &tagged)) ||
-        !tagged || !check_napi(napi_unwrap(env, receiver, &raw)) || raw == NULL) {
-        throw_type_error(env, "Expected a native connected Unix socket owner.");
-        return NULL;
-    }
-    return (NativeSocketFd *)raw;
-}
-
-static napi_value socket_fd_take_memory(napi_env env, napi_callback_info info) {
-    NativeSocketFd *owner = socket_fd_receiver(env, info);
-    if (owner == NULL) return NULL;
-    if (owner->fd < 0 || owner->memory_taken) return throw_type_error(env, "Native memory context was already transferred or socket closed.");
-    napi_value memory = make_memory(env, owner->symbols, (uintptr_t)owner->fd, 0);
-    if (memory != NULL) owner->memory_taken = true;
-    return memory;
-}
-
-static napi_value socket_fd_take(napi_env env, napi_callback_info info) {
-    NativeSocketFd *owner = socket_fd_receiver(env, info);
-    if (owner == NULL) return NULL;
-    if (owner->fd < 0) return throw_type_error(env, "Native socket was already closed or transferred.");
-    napi_value value;
-    if (!check_napi(napi_create_int32(env, owner->fd, &value))) return NULL;
-    owner->fd = -1;
-    return value;
-}
-
-static napi_value socket_fd_close(napi_env env, napi_callback_info info) {
-    NativeSocketFd *owner = socket_fd_receiver(env, info);
-    if (owner == NULL) return NULL;
-    close_socket_fd(owner->fd);
-    owner->fd = -1;
-    napi_value value;
-    if (!check_napi(napi_get_undefined(env, &value))) return NULL;
-    return value;
-}
-
-static napi_value socket_fd_object(napi_env env, C2MemFfiNodeSymbols *symbols, int32_t fd, NativeSocketFd **out_owner) {
-    NativeSocketFd *owner = (NativeSocketFd *)malloc(sizeof(*owner));
-    if (owner == NULL) { close_socket_fd(fd); return throw_error(env, "Out of memory."); }
-    owner->fd = fd;
-    owner->symbols = symbols;
-    owner->memory_taken = false;
-    napi_value object;
-    napi_property_descriptor methods[] = {
-        { "takeMemory", NULL, socket_fd_take_memory, NULL, NULL, NULL, napi_default, NULL },
-        { "takeFd", NULL, socket_fd_take, NULL, NULL, NULL, napi_default, NULL },
-        { "close", NULL, socket_fd_close, NULL, NULL, NULL, napi_default, NULL },
-    };
-    if (!check_napi(napi_create_object(env, &object)) ||
-        !check_napi(napi_define_properties(env, object, 3, methods)) ||
-        !check_napi(napi_type_tag_object(env, object, &socket_fd_tag)) ||
-        !check_napi(napi_wrap(env, object, owner, socket_fd_finalize, NULL, NULL))) {
-        socket_fd_finalize(env, owner, NULL);
-        return NULL;
-    }
-    *out_owner = owner;
-    return object;
-}
-
-typedef struct EndpointConnectWork {
-    C2MemFfiNodeEndpointContext *context;
-    char *address;
-    napi_ref receiver;
-    napi_async_work work;
-    napi_deferred deferred;
-    C2MemFfiStatus status;
-    int32_t fd;
-    int32_t os_error;
-    bool has_deadline;
-    uint64_t deadline_millis;
-} EndpointConnectWork;
-
-/* Capture a native monotonic deadline before queueing N-API work. The worker
- * passes only its remaining duration to Rust, so queue time is not lost. */
-static bool monotonic_millis(uint64_t *out) {
-    /* Use Node's nanosecond clock on every platform. Resolve it as the other
-     * bundled libuv APIs are resolved on Windows; Unix needs no uv.h (whose
-     * pthread types also depend on POSIX feature macros under strict C11). */
-    typedef uint64_t (*hrtime_fn)(void);
-#ifdef _WIN32
-    HMODULE process_module = GetModuleHandleW(NULL);
-    hrtime_fn hrtime = process_module == NULL ? NULL :
-        (hrtime_fn)(void *)GetProcAddress(process_module, "uv_hrtime");
-#else
-    hrtime_fn hrtime = (hrtime_fn)dlsym(RTLD_DEFAULT, "uv_hrtime");
-#endif
-    if (hrtime == NULL) return false;
-    *out = hrtime() / UINT64_C(1000000);
-    return true;
-}
-
-static bool read_connect_deadline(napi_env env, napi_value value, bool *has_deadline, uint64_t *deadline_millis) {
-    napi_valuetype type;
-    if (!check_napi(napi_typeof(env, value, &type))) return false;
-    if (type == napi_null || type == napi_undefined) {
-        *has_deadline = false;
-        return true;
-    }
-    double number;
-    if (type != napi_number || !check_napi(napi_get_value_double(env, value, &number)) ||
-        !(number > 0 && number <= 9007199254740991.0) || (double)(uint64_t)number != number) {
-        throw_type_error(env, "connect timeout must be a positive safe integer in milliseconds or null.");
-        return false;
-    }
-    uint64_t now;
-    if (!monotonic_millis(&now) || UINT64_MAX - now < (uint64_t)number) {
-        throw_error(env, "Cannot establish a native monotonic connection deadline.");
-        return false;
-    }
-    *has_deadline = true;
-    *deadline_millis = now + (uint64_t)number;
-    return true;
-}
-
-static bool remaining_connect_millis(bool has_deadline, uint64_t deadline_millis, uint64_t *remaining) {
-    if (!has_deadline) return true;
-    uint64_t now;
-    if (!monotonic_millis(&now)) return false;
-    *remaining = deadline_millis > now ? deadline_millis - now : 0;
-    return true;
-}
-
-static void endpoint_connect_execute(napi_env env, void *data) {
-    (void)env;
-    EndpointConnectWork *work = (EndpointConnectWork *)data;
-    uint64_t remaining = 0;
-    if (!remaining_connect_millis(work->has_deadline, work->deadline_millis, &remaining)) {
-        work->status = C2_MEM_FFI_STATUS_IO_ERROR;
-        return;
-    }
-    work->status = work->context->symbols->endpoint_context_connect_unix(
-        work->context->ptr, work->address, work->has_deadline ? &remaining : NULL, &work->fd, &work->os_error);
-}
-
-static void endpoint_connect_dispose(napi_env env, EndpointConnectWork *work) {
-    close_socket_fd(work->fd);
-    work->context->active_connects -= 1;
-    endpoint_context_release_closed(work->context);
-    if (work->receiver != NULL) napi_delete_reference(env, work->receiver);
-    if (work->work != NULL) napi_delete_async_work(env, work->work);
-    free(work->address);
-    free(work);
-}
-
-static void endpoint_connect_complete(napi_env env, napi_status status, void *data) {
-    EndpointConnectWork *work = (EndpointConnectWork *)data;
-    if (status != napi_ok || work->context->closed) work->status = C2_MEM_FFI_STATUS_IO_ERROR;
-    NativeSocketFd *owner = NULL;
-    napi_value value = NULL;
-    if (work->status == C2_MEM_FFI_STATUS_OK) {
-        int32_t fd = work->fd;
-        work->fd = -1;
-        value = socket_fd_object(env, work->context->symbols, fd, &owner);
-    }
-    napi_value result = make_status_result(env, work->status, value);
-    if (result == NULL || !check_napi(napi_resolve_deferred(env, work->deferred, result))) {
-        if (owner != NULL) { close_socket_fd(owner->fd); owner->fd = -1; }
-    }
-    endpoint_connect_dispose(env, work);
-}
-
-static napi_value endpoint_context_connect(napi_env env, napi_callback_info info) {
-    size_t argc = 2;
-    napi_value args[2], receiver;
-    if (!check_napi(napi_get_cb_info(env, info, &argc, args, &receiver, NULL)) || argc < 1) {
-        return throw_type_error(env, "connectUnix expects an ipc:// address and optional timeout.");
-    }
-    C2MemFfiNodeEndpointContext *context = endpoint_context_receiver(env, receiver, true);
-    if (context == NULL) return NULL;
-    char *address = read_string_arg(env, args[0], "IPC address must be a string.");
-    if (address == NULL) return NULL;
-    bool has_deadline = false;
-    uint64_t deadline_millis = 0;
-    if (argc > 1 && !read_connect_deadline(env, args[1], &has_deadline, &deadline_millis)) {
-        free(address);
-        return NULL;
-    }
-    EndpointConnectWork *work = (EndpointConnectWork *)calloc(1, sizeof(*work));
-    if (work == NULL) { free(address); return throw_error(env, "Out of memory."); }
-    work->context = context;
-    work->address = address;
-    work->fd = -1;
-    work->has_deadline = has_deadline;
-    work->deadline_millis = deadline_millis;
-    context->active_connects += 1;
-    napi_value promise, name;
-    if (!check_napi(napi_create_promise(env, &work->deferred, &promise)) ||
-        !check_napi(napi_create_string_utf8(env, "c2-local-connect", NAPI_AUTO_LENGTH, &name)) ||
-        !check_napi(napi_create_reference(env, receiver, 1, &work->receiver)) ||
-        !check_napi(napi_create_async_work(env, NULL, name, endpoint_connect_execute,
-            endpoint_connect_complete, work, &work->work)) ||
-        !check_napi(napi_queue_async_work(env, work->work))) {
-        endpoint_connect_dispose(env, work);
-        return throw_error(env, "Failed to queue a native Unix connection.");
-    }
-    return promise;
-}
-
-/* A Windows pipe owner keeps the pinned server process handle until the
- * descriptor is taken by Node's Socket and the resulting connection closes,
- * including GC of an ignored result. */
-typedef struct NativeWindowsSocket {
-    int32_t fd;        /* -1 once transferred to Node or closed */
-    uintptr_t process; /* server process pin; 0 once released */
-    uintptr_t pipe; /* borrowed from fd, only before transfer */
-    C2MemFfiNodeSymbols *symbols;
-    bool memory_taken;
-} NativeWindowsSocket;
-static const napi_type_tag windows_socket_tag = {
-    UINT64_C(0x2f6b97d84c0a51e3), UINT64_C(0x6a1c40fe93b7d209)
-};
-
-static void windows_socket_release(NativeWindowsSocket *owner) {
-    close_socket_fd(owner->fd);
-    owner->fd = -1;
-#ifdef _WIN32
-    if (owner->process != 0) {
-        CloseHandle((HANDLE)owner->process);
-    }
-#endif
-    owner->process = 0;
-}
-
-static void windows_socket_finalize(napi_env env, void *data, void *hint) {
-    (void)env;
-    (void)hint;
-    NativeWindowsSocket *owner = (NativeWindowsSocket *)data;
-    if (owner == NULL) {
-        return;
-    }
-    windows_socket_release(owner);
-    free(owner);
-}
-
-static NativeWindowsSocket *windows_socket_receiver(napi_env env, napi_callback_info info) {
-    napi_value receiver;
-    bool tagged = false;
-    void *raw = NULL;
-    if (!check_napi(napi_get_cb_info(env, info, NULL, NULL, &receiver, NULL)) ||
-        !check_napi(napi_check_object_type_tag(env, receiver, &windows_socket_tag, &tagged)) ||
-        !tagged || !check_napi(napi_unwrap(env, receiver, &raw)) || raw == NULL) {
-        throw_type_error(env, "Expected a native connected Windows pipe owner.");
-        return NULL;
-    }
-    return (NativeWindowsSocket *)raw;
-}
-
-static napi_value windows_socket_take_memory(napi_env env, napi_callback_info info) {
-    NativeWindowsSocket *owner = windows_socket_receiver(env, info);
-    if (owner == NULL) return NULL;
-    if (owner->fd < 0 || owner->memory_taken) return throw_type_error(env, "Native memory context was already transferred or pipe closed.");
-    napi_value memory = make_memory(env, owner->symbols, owner->pipe, owner->process);
-    if (memory != NULL) owner->memory_taken = true;
-    return memory;
-}
-
-static napi_value windows_socket_take(napi_env env, napi_callback_info info) {
-    NativeWindowsSocket *owner = windows_socket_receiver(env, info);
-    if (owner == NULL) return NULL;
-    if (owner->fd < 0) return throw_type_error(env, "Native Windows pipe was already closed or transferred.");
-    napi_value value;
-    if (!check_napi(napi_create_int32(env, owner->fd, &value))) return NULL;
-    owner->fd = -1;
-    return value;
-}
-
-static napi_value windows_socket_close(napi_env env, napi_callback_info info) {
-    NativeWindowsSocket *owner = windows_socket_receiver(env, info);
-    if (owner == NULL) return NULL;
-    windows_socket_release(owner);
-    napi_value value;
-    if (!check_napi(napi_get_undefined(env, &value))) return NULL;
-    return value;
-}
-
-static napi_value windows_socket_object(napi_env env, C2MemFfiNodeSymbols *symbols, uintptr_t pipe, int32_t fd, uintptr_t process, NativeWindowsSocket **out_owner) {
-    NativeWindowsSocket *owner = (NativeWindowsSocket *)malloc(sizeof(*owner));
-    if (owner == NULL) {
-        close_socket_fd(fd);
-#ifdef _WIN32
-        if (process != 0) CloseHandle((HANDLE)process);
-#endif
-        return throw_error(env, "Out of memory.");
-    }
-    owner->fd = fd;
-    owner->process = process;
-    owner->pipe = pipe;
-    owner->symbols = symbols;
-    owner->memory_taken = false;
-    napi_value object;
-    napi_property_descriptor methods[] = {
-        { "takeMemory", NULL, windows_socket_take_memory, NULL, NULL, NULL, napi_default, NULL },
-        { "takeFd", NULL, windows_socket_take, NULL, NULL, NULL, napi_default, NULL },
-        { "close", NULL, windows_socket_close, NULL, NULL, NULL, napi_default, NULL },
-    };
-    if (!check_napi(napi_create_object(env, &object)) ||
-        !check_napi(napi_define_properties(env, object, 3, methods)) ||
-        !check_napi(napi_type_tag_object(env, object, &windows_socket_tag)) ||
-        !check_napi(napi_wrap(env, object, owner, windows_socket_finalize, NULL, NULL))) {
-        windows_socket_finalize(env, owner, NULL);
-        return NULL;
-    }
-    *out_owner = owner;
-    return object;
-}
-
-typedef struct WindowsConnectWork {
-    C2MemFfiNodeEndpointContext *context;
-    char *address;
-    napi_ref receiver;
-    napi_async_work work;
-    napi_deferred deferred;
-    C2MemFfiStatus status;
-    int32_t os_error;
-    uintptr_t pipe;
-    uintptr_t process;
-    bool has_deadline;
-    uint64_t deadline_millis;
-} WindowsConnectWork;
-
-static void windows_connect_execute(napi_env env, void *data) {
-    (void)env;
-    WindowsConnectWork *work = (WindowsConnectWork *)data;
-    uint64_t remaining = 0;
-    if (!remaining_connect_millis(work->has_deadline, work->deadline_millis, &remaining)) {
-        work->status = C2_MEM_FFI_STATUS_IO_ERROR;
-        return;
-    }
-    work->status = work->context->symbols->endpoint_context_connect_windows(
-        work->context->ptr, work->address, work->has_deadline ? &remaining : NULL,
-        &work->pipe, &work->process, &work->os_error);
-}
-
-static void windows_connect_discard_handles(WindowsConnectWork *work) {
-#ifdef _WIN32
-    if (work->pipe != 0) {
-        CloseHandle((HANDLE)work->pipe);
-    }
-    if (work->process != 0) {
-        CloseHandle((HANDLE)work->process);
-    }
-#endif
-    work->pipe = 0;
-    work->process = 0;
-}
-
-static void windows_connect_dispose(napi_env env, WindowsConnectWork *work) {
-    windows_connect_discard_handles(work);
-    work->context->active_connects -= 1;
-    endpoint_context_release_closed(work->context);
-    if (work->receiver != NULL) napi_delete_reference(env, work->receiver);
-    if (work->work != NULL) napi_delete_async_work(env, work->work);
-    free(work->address);
-    free(work);
-}
-
-#ifdef _WIN32
-static void windows_connect_reject_with_message(napi_env env, WindowsConnectWork *work, const char *message) {
-    napi_value text, error;
-    if (check_napi(napi_create_string_utf8(env, message, NAPI_AUTO_LENGTH, &text)) &&
-        check_napi(napi_create_error(env, NULL, text, &error))) {
-        napi_reject_deferred(env, work->deferred, error);
-    } else {
-        throw_error(env, message);
-    }
-}
-#endif
-
-static void windows_connect_complete(napi_env env, napi_status status, void *data) {
-    WindowsConnectWork *work = (WindowsConnectWork *)data;
-    if (status != napi_ok || work->context->closed) {
-        work->status = C2_MEM_FFI_STATUS_IO_ERROR;
-        windows_connect_discard_handles(work);
-    }
-    NativeWindowsSocket *owner = NULL;
-    uintptr_t verified_pipe = 0;
-    napi_value value = NULL;
-    if (work->status == C2_MEM_FFI_STATUS_OK) {
-        int32_t fd = -1;
-#ifdef _WIN32
-        /* Convert on the JS thread before anything can register the handle
-         * with an event loop: the descriptor is minted in the Node CRT and
-         * handed straight to net.Socket's fd adoption path. */
-        if (!resolve_process_libuv()) {
-            windows_connect_discard_handles(work);
-            windows_connect_reject_with_message(env, work,
-                "This Node process does not export the libuv descriptor transfer API (uv_open_osfhandle).");
-            windows_connect_dispose(env, work);
-            return;
-        }
-        fd = (int32_t)c2_uv_open_osfhandle((HANDLE)work->pipe);
-        if (fd < 0) {
-            /* The Node CRT did not adopt the handle, so the work entry is
-             * still the single owner of both raw handles and releases them. */
-            char message[160];
-            snprintf(message, sizeof(message),
-                "Node libuv descriptor transfer failed for the native Windows pipe (returned %d).", fd);
-            windows_connect_discard_handles(work);
-            windows_connect_reject_with_message(env, work, message);
-            windows_connect_dispose(env, work);
-            return;
-        }
-        /* Ownership handoff: only after a successful conversion does the CRT
-         * descriptor own the pipe handle; the work entry keeps the process
-         * pin until the socket owner below takes it over. */
-        verified_pipe = work->pipe;
-        work->pipe = 0;
-        /* Node PlatformInit occupies stdio slots; Windows libuv never closes
-         * them. A native embedder that bypasses that initialization is outside
-         * this Node connector's ownership contract (Node v22.23.4 node.cc). */
-        assert(fd >= 3);
-#else
-        /* The native entry never succeeds outside Windows. */
-        windows_connect_discard_handles(work);
-        work->status = C2_MEM_FFI_STATUS_IO_ERROR;
-#endif
-        if (work->status == C2_MEM_FFI_STATUS_OK) {
-            uintptr_t process = work->process;
-            work->process = 0; /* The socket owner now pins the server process. */
-            value = windows_socket_object(env, work->context->symbols, verified_pipe, fd, process, &owner);
-            if (value == NULL) {
-                /* windows_socket_object released the descriptor and process pin. */
-                windows_connect_dispose(env, work);
-                return;
-            }
-        }
-    }
-    napi_value result = make_status_result(env, work->status, value);
-    if (result == NULL || !check_napi(napi_resolve_deferred(env, work->deferred, result))) {
-        if (owner != NULL) windows_socket_release(owner);
-    }
-    windows_connect_dispose(env, work);
-}
-
-static napi_value queue_windows_connect(napi_env env, C2MemFfiNodeEndpointContext *context, napi_value receiver, char *address, bool has_deadline, uint64_t deadline_millis) {
-    WindowsConnectWork *work = (WindowsConnectWork *)calloc(1, sizeof(*work));
-    if (work == NULL) {
-        free(address);
-        return throw_error(env, "Out of memory.");
-    }
-    work->context = context;
-    work->address = address;
-    work->has_deadline = has_deadline;
-    work->deadline_millis = deadline_millis;
-    context->active_connects += 1;
-    napi_value promise, name;
-    if (!check_napi(napi_create_promise(env, &work->deferred, &promise)) ||
-        !check_napi(napi_create_string_utf8(env, "c2-local-connect-windows", NAPI_AUTO_LENGTH, &name)) ||
-        !check_napi(napi_create_reference(env, receiver, 1, &work->receiver)) ||
-        !check_napi(napi_create_async_work(env, NULL, name, windows_connect_execute,
-            windows_connect_complete, work, &work->work)) ||
-        !check_napi(napi_queue_async_work(env, work->work))) {
-        windows_connect_dispose(env, work);
-        return throw_error(env, "Failed to queue a native Windows connection.");
-    }
-    return promise;
-}
-
-static napi_value endpoint_context_connect_windows_method(napi_env env, napi_callback_info info) {
-    size_t argc = 2;
-    napi_value args[2], receiver;
-    if (!check_napi(napi_get_cb_info(env, info, &argc, args, &receiver, NULL)) || argc < 1) {
-        return throw_type_error(env, "connectWindows expects an ipc:// address and optional timeout.");
-    }
-    C2MemFfiNodeEndpointContext *context = endpoint_context_receiver(env, receiver, true);
-    if (context == NULL) return NULL;
-    char *address = read_string_arg(env, args[0], "IPC address must be a string.");
-    if (address == NULL) return NULL;
-    bool has_deadline = false;
-    uint64_t deadline_millis = 0;
-    if (argc > 1 && !read_connect_deadline(env, args[1], &has_deadline, &deadline_millis)) {
-        free(address);
-        return NULL;
-    }
-    return queue_windows_connect(env, context, receiver, address, has_deadline, deadline_millis);
-}
-
-/* Module-level verified Windows connect: the receiver argument must be a real
- * addon-tagged endpoint context. Forged endpoint objects carrying arbitrary
- * connectUnix/connectWindows functions cannot pass the native type-tag check
- * performed here, so unverified sockets cannot enter official Windows flows. */
-static napi_value endpoint_context_connect_windows_verified(napi_env env, napi_callback_info info) {
-    size_t argc = 3;
-    napi_value args[3];
-    C2MemFfiNodeSymbols *symbols = NULL;
-    if (!check_napi(napi_get_cb_info(env, info, &argc, args, NULL, (void **)&symbols)) || argc < 2) {
-        return throw_type_error(env, "verified Windows connect expects a context object, an ipc:// address and optional timeout.");
-    }
-    C2MemFfiNodeEndpointContext *context = endpoint_context_receiver(env, args[0], true);
-    if (context == NULL) return NULL;
-    char *address = read_string_arg(env, args[1], "IPC address must be a string.");
-    if (address == NULL) return NULL;
-    bool has_deadline = false;
-    uint64_t deadline_millis = 0;
-    if (argc > 2 && !read_connect_deadline(env, args[2], &has_deadline, &deadline_millis)) {
-        free(address);
-        return NULL;
-    }
-    return queue_windows_connect(env, context, args[0], address, has_deadline, deadline_millis);
-}
-
-static napi_value endpoint_context_capture(napi_env env, napi_callback_info info) {
-    size_t argc = 1;
-    napi_value args[1];
-    C2MemFfiNodeSymbols *symbols = NULL;
-    if (!check_napi(napi_get_cb_info(env, info, &argc, args, NULL, (void **)&symbols))) return NULL;
-    char *root = NULL;
-    if (argc > 0) {
-        napi_valuetype type;
-        if (!check_napi(napi_typeof(env, args[0], &type))) return NULL;
-        if (type != napi_null && type != napi_undefined) {
-            root = read_string_arg(env, args[0], "IPC root must be a string or null.");
-            if (root == NULL) return NULL;
-        }
-    }
-    C2MemFfiLocalEndpointContext *ptr = NULL;
-    C2MemFfiStatus status = symbols->endpoint_context_capture(root, &ptr);
-    free(root);
-    if (status != C2_MEM_FFI_STATUS_OK || ptr == NULL) {
-        if (ptr != NULL) symbols->endpoint_context_free(ptr);
-        if (status == C2_MEM_FFI_STATUS_OK) {
-            return throw_error(env, "Native IPC endpoint capture returned no context.");
-        }
-        return make_status_result(env, status, NULL);
-    }
-    C2MemFfiNodeEndpointContext *context = (C2MemFfiNodeEndpointContext *)calloc(1, sizeof(*context));
-    if (context == NULL) {
-        symbols->endpoint_context_free(ptr);
-        return throw_error(env, "Out of memory.");
-    }
-    context->symbols = symbols;
-    context->ptr = ptr;
-    napi_value object;
-    napi_property_descriptor methods[] = {
-        { "endpointName", NULL, endpoint_context_name, NULL, NULL, NULL, napi_default, NULL },
-        { "namespaceId", NULL, endpoint_context_namespace_id, NULL, NULL, NULL, napi_default, NULL },
-        { "connectUnix", NULL, endpoint_context_connect, NULL, NULL, NULL, napi_default, NULL },
-        { "connectWindows", NULL, endpoint_context_connect_windows_method, NULL, NULL, NULL, napi_default, NULL },
-        { "close", NULL, endpoint_context_close, NULL, NULL, NULL, napi_default, NULL },
-    };
-    if (!check_napi(napi_create_object(env, &object)) ||
-        !check_napi(napi_define_properties(env, object, sizeof(methods) / sizeof(methods[0]), methods)) ||
-        !check_napi(napi_type_tag_object(env, object, &endpoint_context_tag)) ||
-        !check_napi(napi_wrap(env, object, context, endpoint_context_finalize, NULL, NULL))) {
-        endpoint_context_finalize(env, context, NULL);
-        return NULL;
-    }
-    napi_value result = make_status_result(env, status, object);
-    if (result == NULL) {
-        /* The wrapped object still owns its small shell; close native ownership now. */
-        symbols->endpoint_context_free(context->ptr);
-        context->ptr = NULL;
-    }
-    return result;
-}
-
 static bool load_symbol(napi_env env, void *library, const char *name, void **out) {
 #ifdef _WIN32
-    void *symbol = (void *)GetProcAddress((HMODULE)library, name);
-    if (symbol == NULL) {
-        char message[512];
-        snprintf(message, sizeof(message), "Failed to load c2-mem-ffi symbol %s (Windows error %lu)", name, GetLastError());
-        throw_error(env, message);
-        return false;
-    }
+    *out = (void *)GetProcAddress((HMODULE)library, name);
 #else
-    dlerror();
-    void *symbol = dlsym(library, name);
-    const char *error = dlerror();
-    if (error != NULL || symbol == NULL) {
-        char message[512];
-        snprintf(message, sizeof(message), "Failed to load c2-mem-ffi symbol %s: %s", name, error == NULL ? "not found" : error);
-        throw_error(env, message);
-        return false;
-    }
+    dlerror(); *out = dlsym(library, name);
 #endif
-    *out = symbol;
-    return true;
+    if (*out != NULL) return true;
+    char message[512]; snprintf(message, sizeof(message), "Failed to load c2-mem-ffi symbol %s.", name);
+    fail(env, message); return false;
 }
-
-static bool load_all_symbols(napi_env env, C2MemFfiNodeSymbols *symbols) {
-#define LOAD_REQUIRED(field, exported) \
-    do { \
-        if (!load_symbol(env, symbols->library, exported, (void **)&symbols->field)) { \
-            return false; \
-        } \
-    } while (0)
+static bool load_all(napi_env env, Symbols *s) {
+#define LOAD_REQUIRED(field, name) if (!load_symbol(env, s->library, name, (void **)&s->field)) return false
     LOAD_REQUIRED(abi_version, "c2_mem_ffi_abi_version");
-    uint32_t loaded_abi_version = symbols->abi_version();
-    if (loaded_abi_version != C2_MEM_FFI_ABI_VERSION) {
-        char message[256];
-        snprintf(message, sizeof(message), "c2_mem_ffi ABI version %u is incompatible with expected version %u.", loaded_abi_version, C2_MEM_FFI_ABI_VERSION);
-        throw_error(env, message);
-        return false;
+    uint32_t version = s->abi_version();
+    if (version != C2_MEM_FFI_ABI_VERSION) {
+        char message[128]; snprintf(message, sizeof(message), "c2_mem_ffi ABI version %u is incompatible with expected version %u.", version, C2_MEM_FFI_ABI_VERSION);
+        fail(env, message); return false;
     }
-    LOAD_REQUIRED(endpoint_context_capture, "c2_mem_ffi_local_endpoint_context_capture");
-    LOAD_REQUIRED(endpoint_context_free, "c2_mem_ffi_local_endpoint_context_free");
-    LOAD_REQUIRED(endpoint_context_name_len, "c2_mem_ffi_local_endpoint_context_name_len");
-    LOAD_REQUIRED(endpoint_context_name_copy, "c2_mem_ffi_local_endpoint_context_name_copy");
-    LOAD_REQUIRED(endpoint_context_namespace_id_len, "c2_mem_ffi_local_endpoint_context_namespace_id_len");
-    LOAD_REQUIRED(endpoint_context_namespace_id_copy, "c2_mem_ffi_local_endpoint_context_namespace_id_copy");
-    LOAD_REQUIRED(endpoint_context_connect_unix, "c2_mem_ffi_local_endpoint_context_connect_unix");
-    LOAD_REQUIRED(endpoint_context_connect_windows, "c2_mem_ffi_local_endpoint_context_connect_windows");
-    LOAD_REQUIRED(memory_context_new, "c2_mem_ffi_memory_context_new");
-    LOAD_REQUIRED(memory_context_free, "c2_mem_ffi_memory_context_free");
-    LOAD_REQUIRED(memory_context_gc, "c2_mem_ffi_memory_context_gc");
-    LOAD_REQUIRED(memory_context_write_timeout, "c2_mem_ffi_memory_context_write_timeout");
-    LOAD_REQUIRED(memory_context_prefix_len, "c2_mem_ffi_memory_context_prefix_len");
-    LOAD_REQUIRED(memory_context_prefix_copy, "c2_mem_ffi_memory_context_prefix_copy");
-    LOAD_REQUIRED(memory_context_finish_handshake, "c2_mem_ffi_memory_context_finish_handshake");
-    LOAD_REQUIRED(request_prepare, "c2_mem_ffi_request_prepare");
-    LOAD_REQUIRED(request_discard, "c2_mem_ffi_request_discard");
-    LOAD_REQUIRED(response_admit, "c2_mem_ffi_response_admit");
-    LOAD_REQUIRED(response_consume, "c2_mem_ffi_response_consume");
-    LOAD_REQUIRED(response_discard, "c2_mem_ffi_response_discard");
-    LOAD_REQUIRED(memory_context_receive_release, "c2_mem_ffi_memory_context_receive_release");
-    LOAD_REQUIRED(write_begin, "c2_mem_ffi_write_begin");
-    LOAD_REQUIRED(write_prefix_len, "c2_mem_ffi_write_prefix_len");
-    LOAD_REQUIRED(write_prefix_copy, "c2_mem_ffi_write_prefix_copy");
-    LOAD_REQUIRED(write_start, "c2_mem_ffi_write_start");
-    LOAD_REQUIRED(write_complete, "c2_mem_ffi_write_complete");
-    LOAD_REQUIRED(write_discard, "c2_mem_ffi_write_discard");
-    LOAD_REQUIRED(memory_context_deactivate, "c2_mem_ffi_memory_context_deactivate");
-    LOAD_REQUIRED(memory_context_peer_end, "c2_mem_ffi_memory_context_peer_end");
-    LOAD_REQUIRED(memory_context_try_close, "c2_mem_ffi_memory_context_try_close");
+    LOAD_REQUIRED(capture, "c2_mem_ffi_local_endpoint_context_capture");
+    LOAD_REQUIRED(context_free, "c2_mem_ffi_local_endpoint_context_free");
+    LOAD_REQUIRED(name_len, "c2_mem_ffi_local_endpoint_context_name_len");
+    LOAD_REQUIRED(name_copy, "c2_mem_ffi_local_endpoint_context_name_copy");
+    LOAD_REQUIRED(namespace_len, "c2_mem_ffi_local_endpoint_context_namespace_id_len");
+    LOAD_REQUIRED(namespace_copy, "c2_mem_ffi_local_endpoint_context_namespace_id_copy");
+    LOAD_REQUIRED(domain_new, "c2_mem_ffi_client_domain_new");
+    LOAD_REQUIRED(domain_free, "c2_mem_ffi_client_domain_free");
+    LOAD_REQUIRED(domain_stats, "c2_mem_ffi_client_domain_stats");
+    LOAD_REQUIRED(endpoint_new, "c2_mem_ffi_endpoint_context_new");
+    LOAD_REQUIRED(endpoint_prepare, "c2_mem_ffi_endpoint_context_prepare");
+    LOAD_REQUIRED(endpoint_deactivate, "c2_mem_ffi_endpoint_context_deactivate");
+    LOAD_REQUIRED(endpoint_close, "c2_mem_ffi_endpoint_context_close");
+    LOAD_REQUIRED(endpoint_free, "c2_mem_ffi_endpoint_context_free");
+    LOAD_REQUIRED(call_begin, "c2_mem_ffi_call_begin");
+    LOAD_REQUIRED(call_charge, "c2_mem_ffi_call_charge_input");
+    LOAD_REQUIRED(call_dispatch, "c2_mem_ffi_call_dispatch");
+    LOAD_REQUIRED(call_next, "c2_mem_ffi_call_next");
+    LOAD_REQUIRED(call_cancel, "c2_mem_ffi_call_cancel");
+    LOAD_REQUIRED(call_observe, "c2_mem_ffi_call_observe");
+    LOAD_REQUIRED(call_check_deadline, "c2_mem_ffi_call_check_deadline");
+    LOAD_REQUIRED(call_free, "c2_mem_ffi_call_free");
+    LOAD_REQUIRED(buffer_data, "c2_mem_ffi_buffer_data");
+    LOAD_REQUIRED(buffer_release, "c2_mem_ffi_buffer_release");
+    LOAD_REQUIRED(error_parts, "c2_mem_ffi_error_parts");
+    LOAD_REQUIRED(error_free, "c2_mem_ffi_error_free");
+    LOAD_REQUIRED(result_free, "c2_mem_ffi_result_free");
 #undef LOAD_REQUIRED
     return true;
 }
-
-static bool set_function(napi_env env, napi_value object, const char *name, napi_callback callback, C2MemFfiNodeSymbols *symbols) {
-    napi_value function;
-    if (!check_napi(napi_create_function(env, name, NAPI_AUTO_LENGTH, callback, symbols, &function))) {
-        return false;
-    }
-    return set_named_value(env, object, name, function);
-}
-
 static napi_value load(napi_env env, napi_callback_info info) {
-    size_t argc = 1;
-    napi_value args[1];
-    if (!check_napi(napi_get_cb_info(env, info, &argc, args, NULL, NULL)) || argc < 1) {
-        return throw_type_error(env, "load expects a c2_mem_ffi shared library path.");
-    }
-    char *library_path = read_string_arg(env, args[0], "libraryPath must be a string.");
-    if (library_path == NULL) {
-        return NULL;
-    }
-    char loader_error[384] = {0};
-    void *library = open_library(library_path, loader_error, sizeof(loader_error));
-    if (library == NULL) {
-        char message[512];
-        snprintf(message, sizeof(message), "Failed to load c2_mem_ffi shared library: %s", loader_error);
-        free(library_path);
-        return throw_error(env, message);
-    }
-    free(library_path);
-    C2MemFfiNodeSymbols *symbols = (C2MemFfiNodeSymbols *)calloc(1, sizeof(C2MemFfiNodeSymbols));
-    if (symbols == NULL) {
-        close_library(library);
-        return throw_error(env, "Out of memory.");
-    }
-    symbols->library = library;
-    if (!load_all_symbols(env, symbols)) {
-        close_library(library);
-        free(symbols);
-        return NULL;
-    }
+    size_t argc = 1; napi_value argv[1];
+    if (!args(env, info, &argc, argv, NULL, NULL) || argc != 1) return bad(env, "load expects a native library path.");
+    char *path = string(env, argv[0], "Library path must be a string.");
+    if (path == NULL) return NULL;
+    char message[384] = {0}; void *library = open_library(path, message, sizeof(message)); free(path);
+    if (library == NULL) { char full[512]; snprintf(full, sizeof(full), "Failed to load c2_mem_ffi shared library: %s", message); return fail(env, full); }
+    Symbols *s = calloc(1, sizeof(*s));
+    if (s == NULL) { close_library(library); return fail(env, "Out of memory."); }
+    s->library = library;
+    if (!load_all(env, s)) { close_library(library); free(s); return NULL; }
     napi_value object;
-    if (!check_napi(napi_create_object(env, &object))) {
-        close_library(library);
-        free(symbols);
-        return NULL;
-    }
-    if (!set_function(env, object, "c2_mem_ffi_abi_version", abi_version_callback, symbols) ||
-        !set_function(env, object, "c2_mem_ffi_local_endpoint", local_endpoint, symbols) ||
-        !set_function(env, object, "c2_mem_ffi_local_endpoint_context_capture", endpoint_context_capture, symbols) ||
-        !set_function(env, object, "c2_mem_ffi_endpoint_context_connect_windows", endpoint_context_connect_windows_verified, symbols)) {
-        close_library(library);
-        free(symbols);
+    if (!ok(napi_create_object(env, &object)) ||
+        !method(env, object, "c2_mem_ffi_abi_version", version_cb, s) ||
+        !method(env, object, "captureEndpointContext", capture_cb, s) ||
+        !method(env, object, "createClientDomain", domain_cb, s)) {
+        /* Keep the library pinned if an already-created JS method escaped. */
         return NULL;
     }
     return object;
 }
-
 static napi_value Init(napi_env env, napi_value exports) {
-    napi_value load_function;
-    if (!check_napi(napi_create_function(env, "load", NAPI_AUTO_LENGTH, load, NULL, &load_function))) {
-        return NULL;
-    }
-    napi_set_named_property(env, exports, "load", load_function);
+    if (!method(env, exports, "load", load, NULL)) return NULL;
     return exports;
 }
-
 NAPI_MODULE(c2_mem_ffi_node, Init)

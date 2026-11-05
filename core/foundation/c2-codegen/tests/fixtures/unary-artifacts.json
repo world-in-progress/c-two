@@ -79,9 +79,9 @@
         "sha256": "d25a8e308c803acd08df897279827384fc0de97ea1cacd3323554b94c6b560a3"
       },
       {
-        "bytes": 146253,
+        "bytes": 88659,
         "path": "typescript/c_two_contract.ts",
-        "sha256": "ab049cd231515f7b506e6442da6dfeea334323710b692257cbb7124136103d2e"
+        "sha256": "fde8230cf4077363246640111ce50857249e6097826ec3d0340ebc4f8ae1219d"
       },
       {
         "bytes": 2885,
@@ -162,9 +162,9 @@
         "sha256": "a1e05b1f83b46bbe1aec46b91e953fdd12daea6067279e3cf3735d919d59987e"
       },
       {
-        "bytes": 143042,
+        "bytes": 85494,
         "path": "typescript/c_two_contract.ts",
-        "sha256": "fb74d72f24591ab34b4b4bfc3c91ab0d2c74045ab515f456f58eaaf3320126d8"
+        "sha256": "673c451f70a21cc3d442378ee8350ad641506e2c77a5a49c9101e937dda76dab"
       }
     ],
     "fixture": "portable-no-payload",
@@ -250,9 +250,9 @@
         "sha256": "0eeab1f5cdc6bac8ae7880794dd1b2c1f8eaac34e8e63c9139d6c40a266ce10c"
       },
       {
-        "bytes": 145390,
+        "bytes": 87819,
         "path": "typescript/c_two_contract.ts",
-        "sha256": "a6f8c90a88b197a49c3418f54735f92e985712694be938c77332543eb1d3a495"
+        "sha256": "dd666e6f0521f3d6933122c59be3bc35cac50af0f71336dc5f6ba2d4d8058a1b"
       },
       {
         "bytes": 14160,
@@ -343,9 +343,9 @@
         "sha256": "a60647161cc12058cc829fdbaa30f999ffad40888ef24172fe3d4dd86bb4c98d"
       },
       {
-        "bytes": 145401,
+        "bytes": 87830,
         "path": "typescript/c_two_contract.ts",
-        "sha256": "8d72e268d2098b1a2b4b7dc4f4924976e0e66794ac448cdb2d6a8e204587c894"
+        "sha256": "35fd6e3c253fee1a3ca805f2219f3cdd0c9e9c62dfb7c104e125dcfa9e111b0f"
       },
       {
         "bytes": 22705,

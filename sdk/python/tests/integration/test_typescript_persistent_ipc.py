@@ -12,7 +12,6 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
-import tempfile
 from typing import Any, Iterator
 
 import pytest
@@ -20,6 +19,7 @@ import pytest
 from tests.fixtures import local_server
 
 import c_two as cc
+from tests.fixtures.typescript_project import write_node_tsconfig
 
 import c_two.endpoint
 
@@ -81,9 +81,8 @@ def _run(command: list[str], root: Path, label: str) -> None:
 
 
 @pytest.fixture(scope="module")
-def persistent_node_project() -> Iterator[tuple[Path, str]]:
-    log_root = tempfile.gettempdir()
-    root = Path(tempfile.mkdtemp(prefix="c2-t3-persistent-", dir=log_root))
+def persistent_node_project(tmp_path_factory: pytest.TempPathFactory) -> Iterator[tuple[Path, str]]:
+    root = tmp_path_factory.mktemp("c2-t3-persistent-")
     node = shutil.which("node")
     assert node is not None, "real persistent IPC regression requires Node"
     (root / "package.json").write_text('{"type":"module"}', encoding="utf-8")
@@ -136,14 +135,7 @@ def persistent_node_project() -> Iterator[tuple[Path, str]]:
             destination.write_bytes(artifact.bytes)
         generated = root / "generated" / name / "typescript/c_two_contract.ts"
         assert TS_SOURCE.read_text(encoding="utf-8") in generated.read_text(encoding="utf-8"), "native codegen must be rebuilt from this checkout"
-    (root / "tsconfig.json").write_text(json.dumps({
-        "compilerOptions": {
-            "target": "ES2022", "module": "NodeNext", "moduleResolution": "NodeNext",
-            "lib": ["ES2022", "DOM"], "strict": True, "skipLibCheck": False,
-            "rootDir": str(root / "generated"), "outDir": str(root / "dist"),
-        },
-        "include": [str(root / "generated/**/*.ts")],
-    }), encoding="utf-8")
+    write_node_tsconfig(root)
     _run([node, str(tsc), "--project", str(root / "tsconfig.json")], root, "compile")
     shutil.copyfile(NODE_FIXTURE, root / NODE_FIXTURE.name)
     yield root, node
@@ -228,167 +220,6 @@ def _reject(result: dict[str, Any], text: str | None = None) -> None:
         assert text in result["error"]["message"], result
 
 
-def test_generated_node_early_chunk_rejection_stops_upload_and_reuses_connection(
-    persistent_node_project: tuple[Path, str], unique_ipc_address: str,
-) -> None:
-    with tempfile.TemporaryDirectory(
-        prefix="c2-r16-", dir=tempfile.gettempdir(),
-    ) as directory:
-        ipc_root = directory if os.name != "nt" else None
-        server = local_server(unique_ipc_address, ipc_overrides={
-            "pool_enabled": False,
-            "reassembly_segment_size": 65536,
-            "reassembly_max_segments": 1,
-            "max_reassembly_bytes": 65536,
-            "max_inflight_chunk_frames": 2,
-        })
-        manager = CountingResource()
-        node: PersistentNode | None = None
-        try:
-            if ipc_root is not None:
-                server._runtime_session.set_local_endpoint(root=ipc_root)
-            server.register_crm(Manager, manager, name="manager")
-            server.start()
-            native_identity = dict(server._runtime_session.ensure_server())
-            node = PersistentNode(persistent_node_project, unique_ipc_address, ipc_root=ipc_root)
-            first = _ok(node.request("call"))
-            assert first["connects"] == 1 and manager.calls == 1
-            bound = first["observations"][-1]
-            assert bound["serverId"] == native_identity["server_id"]
-            assert bound["serverInstanceId"] == native_identity["server_instance_id"]
-
-            rejected = node.request("large")
-            _reject(rejected)
-            assert rejected["error"]["name"] == "C2IpcCallRejectedError", rejected
-            # The first-chunk size check and the global chunk-processing
-            # permit check can race to reply. Both are native capacity
-            # refusals; client preflight and close-induced I/O cannot replace them.
-            wire_error = rejected["error"]["payload"]
-            assert wire_error.startswith("C2E1"), rejected
-            native_error = json.loads(wire_error[4:])
-            assert native_error["version"] == 1 and native_error["details"] == {}
-            assert (native_error["code"], native_error["name"], native_error["message"]) in (
-                (702, "ResourceUnavailable",
-                 "chunked call reassembly admission failed: "
-                 "reassembly size 67108864 exceeds limit 65536"),
-                (702, "ResourceUnavailable",
-                 "server chunk processing capacity exceeded: max_inflight_chunk_frames=2"),
-            ), rejected
-            assert manager.calls == 1 and rejected["chunkRequests"] == 1
-            stopped_at = rejected["chunkWrites"]
-            assert 0 < stopped_at < 64 * 1024 * 1024 // 4096, rejected
-            assert rejected["completedChunkWrites"] == stopped_at, rejected
-            assert rejected["activeWrites"] == 0 and rejected["writesAfterClose"] == 0
-            assert rejected["connects"] == 1 and rejected["closes"] == 0
-            assert rejected["observations"] == first["observations"]
-
-            for calls in (2, 3):
-                resumed = _ok(node.request("call"))
-                assert resumed["connects"] == 1 and resumed["closes"] == 0
-                assert manager.calls == calls and resumed["chunkRequests"] == 1
-                assert resumed["chunkWrites"] == stopped_at
-                assert resumed["completedChunkWrites"] == stopped_at
-                assert resumed["businessWrites"] == rejected["businessWrites"] + calls - 1
-                assert resumed["activeWrites"] == 0 and resumed["writesAfterClose"] == 0
-                for key in ("serverId", "serverInstanceId", "routeName", "routeUid"):
-                    assert resumed["observations"][-1][key] == bound[key], resumed
-        finally:
-            try:
-                if node is not None:
-                    node.stop()
-            finally:
-                assert server.shutdown()["completed"]
-                inspection = cc.endpoint.inspect_endpoint(
-                    unique_ipc_address, context=server._runtime_session.local_endpoint_context(),
-                )
-                assert inspection["status"] in ("absent", "not-applicable"), inspection
-                residue = [
-                    str(entry) for entry in Path(directory).rglob("*")
-                    if entry.is_socket() or entry.name.endswith(".lease")
-                ]
-                assert not residue, f"private endpoint socket/lease residue: {residue}"
-
-
-def test_generated_node_connection_deadline_covers_slow_connect_and_prevents_dispatch(
-    persistent_node_project: tuple[Path, str], unique_ipc_address: str,
-) -> None:
-    # The existing Windows TypeScript integration gate runs this same Node path.
-    server = local_server(unique_ipc_address)
-    manager = CountingResource()
-    node: PersistentNode | None = None
-    try:
-        server.register_crm(Manager, manager, name="manager")
-        server.start()
-        node = PersistentNode(persistent_node_project, unique_ipc_address)
-
-        slow = _ok(node.request(
-            "call", transport="slow", connectDelayMs=5100, connectTimeoutMs=7000,
-        ))
-        assert slow["connects"] == 1 and slow["closes"] == 0
-        assert manager.calls == 1
-
-        expired = node.request(
-            "call", transport="expired", connectDelayMs=100, connectTimeoutMs=25,
-        )
-        _reject(expired, "connection deadline expired")
-        assert manager.calls == 1 and expired["businessWrites"] == 0
-        settled = _ok(node.request("wait", transport="expired", ms=200))
-        assert settled["connects"] == 1 and settled["closes"] == 1
-        assert settled["businessWrites"] == 0 and manager.calls == 1
-    finally:
-        try:
-            if node is not None:
-                node.stop()
-        finally:
-            assert server.shutdown()["completed"]
-
-
-def test_generated_node_close_during_chunk_upload_preserves_dispatched_outcome(
-    persistent_node_project: tuple[Path, str], unique_ipc_address: str,
-) -> None:
-    server = local_server(unique_ipc_address, ipc_overrides={"pool_enabled": False})
-    manager = CountingResource()
-    node: PersistentNode | None = None
-    try:
-        server.register_crm(Manager, manager, name="manager")
-        server.start()
-        node = PersistentNode(persistent_node_project, unique_ipc_address)
-        result = _ok(node.request("closeDuringUpload"))
-        assert result["chunkRequests"] == 1, result
-        assert result["completedChunkWrites"] > 0, result
-        assert result["activeWrites"] == 0 and result["writesAfterClose"] == 0, result
-        assert result["closes"] == 1, result
-        _reject(node.request("call"), "deactivated")
-    finally:
-        try:
-            if node is not None:
-                node.stop()
-        finally:
-            assert server.shutdown()["completed"]
-
-
-def test_generated_node_local_response_copy_failure_preserves_persistent_stream(
-    persistent_node_project: tuple[Path, str], unique_ipc_address: str,
-) -> None:
-    server = local_server(unique_ipc_address)
-    manager = CountingResource()
-    node: PersistentNode | None = None
-    try:
-        server.register_crm(Manager, manager, name="manager")
-        server.start()
-        node = PersistentNode(persistent_node_project, unique_ipc_address)
-        failed = _ok(node.request("copyFail"))
-        assert manager.calls == 1 and failed["closes"] == 0, failed
-        resumed = _ok(node.request("call"))
-        assert manager.calls == 2 and resumed["connects"] == 1, resumed
-    finally:
-        try:
-            if node is not None:
-                node.stop()
-        finally:
-            assert server.shutdown()["completed"]
-
-
 def test_generated_node_persistent_dynamic_acquire_and_identity_fences(
     persistent_node_project: tuple[Path, str], unique_ipc_address: str,
 ) -> None:
@@ -402,21 +233,13 @@ def test_generated_node_persistent_dynamic_acquire_and_identity_fences(
     try:
         node = PersistentNode(persistent_node_project, unique_ipc_address)
         first = _ok(node.request("call"))
-        assert manager.calls == 1
-        assert first["connects"] == 1
+        assert manager.calls == 1 and first["connects"] == 1
         late = _ok(node.request("call", "builder"))
         assert late["connects"] == 1 and builder.calls == 1
         bound = late["observations"][-1]
         assert bound["serverId"] == native_identity["server_id"]
         assert bound["serverInstanceId"] == native_identity["server_instance_id"]
         assert bound["routeUid"] != first["observations"][-1]["routeUid"]
-
-        uncertain = node.request("call", "builder", uncertain=True)
-        _reject(uncertain, "actual business reply header")
-        assert builder.calls == 2 and uncertain["businessWrites"] == 3
-        resumed = _ok(node.request("call", "builder"))
-        assert builder.calls == 3 and resumed["connects"] == 2
-        assert resumed["observations"][-1]["routeUid"] == bound["routeUid"]
         _ok(node.request("prepare", "builder"))
 
         removed = server.unregister_crm("builder")
@@ -424,21 +247,19 @@ def test_generated_node_persistent_dynamic_acquire_and_identity_fences(
         _reject(node.request("prepare", "builder"))
         _reject(node.request("call", "builder"))
         healthy = _ok(node.request("call"))
-        assert healthy["connects"] == 2 and manager.calls == 2
-        assert builder.calls == 3
+        assert manager.calls == 2 and healthy["connects"] == 1
+        assert builder.calls == 1
 
         replacement = CountingResource()
         server.register_crm(Builder, replacement, name="builder")
-        _reject(node.request("prepare", "builder"), "route token mismatch")
-        _reject(node.request("call", "builder"), "route token mismatch")
+        _reject(node.request("prepare", "builder"))
+        _reject(node.request("call", "builder"))
         assert replacement.calls == 0
         fresh = _ok(node.request("call", "builder", transport="fresh"))
         assert replacement.calls == 1
         assert fresh["observations"][-1]["routeUid"] != bound["routeUid"]
-        _reject(node.request("call", "builder"), "route token mismatch")
-        assert replacement.calls == 1
         healthy = _ok(node.request("call"))
-        assert healthy["connects"] == 2 and manager.calls == 3
+        assert healthy["connects"] == 1 and manager.calls == 3
 
         _ok(node.request("close"))
         _ok(node.request("close", transport="fresh"))

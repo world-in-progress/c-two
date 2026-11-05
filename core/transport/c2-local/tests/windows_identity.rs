@@ -5,15 +5,13 @@ use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, IntoRawHandle, OwnedHandle};
 use std::time::Duration;
 
-use c2_local::{LocalEndpoint, LocalListener, LocalStream, connect_windows_pipe};
+use c2_local::{LocalEndpoint, LocalListener, LocalStream};
 use c2_local_security::{
     LocalSecurityAttributes, current_user_sid, verify_current_user_pipe_owner,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::windows::named_pipe::{NamedPipeClient, NamedPipeServer};
-use windows_sys::Win32::Foundation::{
-    GetHandleInformation, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, LocalFree,
-};
+use tokio::net::windows::named_pipe::NamedPipeServer;
+use windows_sys::Win32::Foundation::{GetHandleInformation, INVALID_HANDLE_VALUE, LocalFree};
 use windows_sys::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
 use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
 use windows_sys::Win32::Storage::FileSystem::{
@@ -22,7 +20,6 @@ use windows_sys::Win32::Storage::FileSystem::{
 use windows_sys::Win32::System::Pipes::{
     CreateNamedPipeW, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_WAIT,
 };
-use windows_sys::Win32::System::Threading::GetProcessId;
 
 fn runtime() -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_current_thread()
@@ -140,43 +137,23 @@ fn client_impersonation_level(server: &NamedPipeServer) -> io::Result<i32> {
 }
 
 #[test]
-fn raw_transfer_remains_unregistered_and_moves_both_handle_owners() {
+fn local_stream_preserves_verified_identity_and_bidirectional_io() {
     let endpoint = endpoint();
     let mut security = LocalSecurityAttributes::new().unwrap();
     let server = raw_server(&endpoint, security.as_mut_ptr());
-    let first_runtime = runtime();
-    let connection = first_runtime
-        .block_on(connect_windows_pipe(&endpoint, Duration::from_secs(2)))
-        .unwrap();
-    let (pipe, process) = connection.into_parts();
-    assert_eq!(
-        unsafe { GetProcessId(process.as_raw_handle()) },
-        std::process::id()
-    );
-    for handle in [&pipe, &process] {
-        let mut flags = 0;
-        assert_ne!(
-            unsafe { GetHandleInformation(handle.as_raw_handle(), &mut flags) },
-            0
-        );
-        assert_eq!(flags & HANDLE_FLAG_INHERIT, 0);
-    }
-    // Registration on a different IOCP after the first runtime is gone proves
-    // the returned file object was not registered by the connect helper.
-    drop(first_runtime);
     runtime().block_on(async move {
-        let _process_pin = process;
-        // SAFETY: each owned, overlapped file object is transferred exactly once.
-        let mut client =
-            unsafe { NamedPipeClient::from_raw_handle(pipe.into_raw_handle()) }.unwrap();
+        // SAFETY: the owned, overlapped server handle is registered once.
         let mut server =
             unsafe { NamedPipeServer::from_raw_handle(server.into_raw_handle()) }.unwrap();
+        let mut client = LocalStream::connect(&endpoint, Duration::from_secs(2))
+            .await
+            .unwrap();
         tokio::time::timeout(Duration::from_secs(2), async {
             server.connect().await.unwrap();
-            client.write_all(b"raw transfer").await.unwrap();
+            client.write_all(b"local stream").await.unwrap();
             let mut received = [0; 12];
             server.read_exact(&mut received).await.unwrap();
-            assert_eq!(&received, b"raw transfer");
+            assert_eq!(&received, b"local stream");
             assert_eq!(
                 client_impersonation_level(&server).unwrap(),
                 windows_sys::Win32::Security::SecurityIdentification
@@ -187,7 +164,7 @@ fn raw_transfer_remains_unregistered_and_moves_both_handle_owners() {
             assert_eq!(&reply, b"reply");
         })
         .await
-        .expect("transferred handles must perform real IO on the second runtime");
+        .expect("verified LocalStream must perform bidirectional IO");
     });
 }
 
@@ -195,17 +172,17 @@ fn raw_transfer_remains_unregistered_and_moves_both_handle_owners() {
 async fn pipe_busy_obeys_one_deadline_and_an_available_pipe_is_the_control() {
     let endpoint = endpoint();
     let mut listener = LocalListener::bind(&endpoint).unwrap();
-    let occupied = connect_windows_pipe(&endpoint, Duration::from_secs(2))
+    let occupied = LocalStream::connect(&endpoint, Duration::from_secs(2))
         .await
         .unwrap();
-    let error = connect_windows_pipe(&endpoint, Duration::from_millis(30))
+    let error = LocalStream::connect(&endpoint, Duration::from_millis(30))
         .await
         .err()
         .unwrap();
     assert_eq!(error.kind(), io::ErrorKind::TimedOut);
     // Accepting creates the next instance, so the identical endpoint connects.
     let _accepted = listener.accept().await.unwrap();
-    let _next = connect_windows_pipe(&endpoint, Duration::from_secs(2))
+    let _next = LocalStream::connect(&endpoint, Duration::from_secs(2))
         .await
         .unwrap();
     drop(occupied);
@@ -232,7 +209,7 @@ async fn foreign_object_owner_rejects_connect_and_listener_join() {
         .encode_utf16()
         .chain(Some(0))
         .collect();
-    for mode in ["raw", "stream", "listener"] {
+    for mode in ["stream", "listener"] {
         let endpoint = endpoint();
         let mut descriptor = std::ptr::null_mut();
         assert_ne!(
@@ -258,10 +235,6 @@ async fn foreign_object_owner_rejects_connect_and_listener_join() {
         assert_eq!(mismatch.raw_os_error(), None);
         assert!(c2_local::is_peer_identity_mismatch(&mismatch));
         let error = match mode {
-            "raw" => connect_windows_pipe(&endpoint, Duration::from_secs(2))
-                .await
-                .err()
-                .unwrap(),
             "stream" => LocalStream::connect(&endpoint, Duration::from_secs(2))
                 .await
                 .err()

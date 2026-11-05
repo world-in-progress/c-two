@@ -1408,3 +1408,43 @@ fn http_refuses_only_stream_calls_and_verified_relay_local_ipc_still_streams() {
     assert!(stream.next_item().unwrap().is_none());
     assert!(stream.close().terminal.unwrap().is_ok());
 }
+
+#[test]
+fn async_native_client_projection_shares_the_original_stream_and_unary_driver() {
+    let fixture = Fixture::new(true, 2, ServiceConcurrencyMode::ReadParallel, None, None);
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let mut prepared = fixture.client.begin_stream("echo").unwrap();
+        prepared.charge_input_async(2).await.unwrap();
+        let stream = prepared
+            .encode_vec(vec![3, 0])
+            .unwrap()
+            .stream_record_async(c2_ipc::IpcStreamCancellation::new())
+            .await
+            .unwrap();
+        let unary = fixture
+            .client
+            .begin_call("ping")
+            .unwrap()
+            .encode_vec(vec![])
+            .unwrap()
+            .call_held_record_async()
+            .await
+            .unwrap();
+        assert_eq!(unary.bytes(), b"pong");
+        for expected in 1..=3 {
+            assert_eq!(
+                stream.next_item_async().await.unwrap().unwrap().bytes(),
+                &[expected; 4]
+            );
+        }
+        assert!(stream.next_item_async().await.unwrap().is_none());
+        let receipt = stream.close_with_timeout_async(Some(Duration::ZERO)).await;
+        assert!(receipt.completed);
+        assert!(receipt.terminal.unwrap().is_ok());
+        assert_eq!(receipt.complete_items, Some(3));
+    });
+}

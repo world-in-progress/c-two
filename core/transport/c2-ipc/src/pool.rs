@@ -237,6 +237,7 @@ struct CloseRecord {
     address: String,
     state: Mutex<CloseState>,
     changed: Condvar,
+    async_changed: tokio::sync::Notify,
 }
 impl CloseRecord {
     fn preparing(address: &str) -> Self {
@@ -244,11 +245,13 @@ impl CloseRecord {
             address: address.into(),
             state: Mutex::new(CloseState::Preparing),
             changed: Condvar::new(),
+            async_changed: tokio::sync::Notify::new(),
         }
     }
     fn finish(&self) {
         *self.state.lock() = CloseState::Finished;
         self.changed.notify_all();
+        self.async_changed.notify_waiters();
     }
     fn deactivate(&self, client: Arc<SyncClient>) {
         // Install the observation and retain the business Arc before changing
@@ -259,7 +262,35 @@ impl CloseRecord {
         };
         client.deactivate();
         self.changed.notify_all();
+        self.async_changed.notify_waiters();
     }
+    async fn wait_async(&self) {
+        loop {
+            let changed = self.async_changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            let observation = {
+                let state = self.state.lock();
+                match &*state {
+                    CloseState::Preparing => None,
+                    CloseState::Closing {
+                        observation: Some(observation),
+                        ..
+                    } => Some(Some(observation.clone())),
+                    _ => Some(None),
+                }
+            };
+            match observation {
+                Some(Some(observation)) => {
+                    observation.wait_closed(None).await;
+                    return;
+                }
+                Some(None) => return,
+                None => changed.await,
+            }
+        }
+    }
+
     fn complete(&self) -> bool {
         match &*self.state.lock() {
             CloseState::Preparing => false,
@@ -480,6 +511,76 @@ impl ClientPool {
             drain_gate: Mutex::new(()),
         }
     }
+    /// A foreign endpoint owns its own physical connections while sharing this
+    /// factory's backing budget. Its retirement cannot seal another endpoint.
+    #[doc(hidden)]
+    pub fn fork_endpoint_scope(
+        &self,
+        config: &ClientIpcConfig,
+        deadline: ConnectDeadline,
+    ) -> Result<Self, IpcError> {
+        let budget = {
+            let mut state = connect_lock(&self.state, deadline, "pool_scope_wait")?;
+            if state.epoch.is_none() {
+                return Err(IpcError::PoolRetired);
+            }
+            let requested = config.memory_budget_limits();
+            let budget = state
+                .budget
+                .get_or_insert_with(|| c2_mem::MemoryBudget::from_limits(&requested))
+                .clone();
+            if budget.limits() != requested {
+                return Err(budget_limits_mismatch(
+                    &budget.limits(),
+                    &requested,
+                    "cache domain",
+                ));
+            }
+            budget
+        };
+        let mut scoped =
+            Self::with_endpoint_context(self.grace_period, self.endpoint_context()?.clone());
+        scoped.connection_event_source = self.connection_event_source.clone();
+        scoped.state.lock().budget = Some(budget);
+        *scoped.default_config.lock() = Some(config.clone());
+        Ok(scoped)
+    }
+
+    /// Seal a native endpoint's whole cache, including unsuccessful route preparations.
+    #[doc(hidden)]
+    pub fn deactivate_endpoint_scope(&self) {
+        let detached = {
+            let mut state = self.state.lock();
+            state.epoch = None;
+            std::mem::take(&mut state.entries)
+                .into_iter()
+                .map(|(address, entry)| (state.record(&address), entry.client))
+                .collect::<Vec<_>>()
+        };
+        for (record, client) in detached {
+            record.deactivate(client);
+        }
+    }
+
+    #[doc(hidden)]
+    pub async fn close_endpoint_scope(&self) {
+        self.deactivate_endpoint_scope();
+        let records = self
+            .state
+            .lock()
+            .records
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        for record in records {
+            record.wait_async().await;
+        }
+        self.state
+            .lock()
+            .records
+            .retain(|_, record| !record.complete());
+    }
+
     pub fn endpoint_context(&self) -> Result<&LocalEndpointContext, IpcError> {
         self.endpoint_context
             .as_ref()

@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { pathToFileURL } from 'node:url';
 
-import { createBundledC2MemFfiNodeRuntime } from '@c-two/c2-mem-ffi';
+import { createNodeIpcConnector } from '@c-two/c2-mem-ffi';
 import {
   BuildPolicy,
   Builder,
@@ -24,14 +24,13 @@ const payloadApi = config.payloadModule === null
   ? undefined
   : await import(pathToFileURL(config.payloadModule).href);
 const observations = [];
-let nodeRuntime;
-let nodeRuntimeClosed = false;
+let nodeConnector;
+let nodeConnectorClosed = false;
 
 function localIpcOptions(responsePayloadAllocator) {
-  nodeRuntime ??= createBundledC2MemFfiNodeRuntime();
+  nodeConnector ??= createNodeIpcConnector({requestChunkSize: 64 * 1024});
   return {
-    connect: nodeRuntime.connect,
-    requestChunkSize: 64 * 1024,
+    connect: nodeConnector,
     responsePayloadAllocator,
   };
 }
@@ -456,11 +455,11 @@ try {
     opaqueAllocator = await proveOpaqueAllocatorRelease();
   }
 } finally {
-  if (nodeRuntime !== undefined) {
-    await nodeRuntime.close();
-    await nodeRuntime.close();
-    assert.throws(() => nodeRuntime.resolveEndpoint('ipc://closed-runtime'), /closed/);
-    nodeRuntimeClosed = true;
+  if (nodeConnector !== undefined) {
+    await nodeConnector.close();
+    await nodeConnector.close();
+    assert.throws(() => nodeConnector.resolveEndpoint('ipc://closed-runtime'), /closed/);
+    nodeConnectorClosed = true;
   }
 }
 
@@ -476,8 +475,8 @@ assert.ok(observations.every((observation) => observation.routeUid));
 
 process.stdout.write(`NODE_RECEIPT ${JSON.stringify({
   cleanup: {
-    nodeRuntimeCreated: nodeRuntime !== undefined,
-    nodeRuntimeClosed,
+    nodeConnectorCreated: nodeConnector !== undefined,
+    nodeConnectorClosed,
     transportClosedIdempotently: true,
   },
   lifecycle,
