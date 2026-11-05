@@ -16,6 +16,7 @@ mod host;
 mod identity;
 mod lifecycle;
 mod lifetime;
+mod local_stream;
 pub mod memory;
 mod outcome;
 mod session;
@@ -46,6 +47,7 @@ pub use host::{
 pub use identity::{
     auto_server_id, auto_server_instance_id, ipc_address_for_server_id, validate_server_id,
 };
+pub use local_stream::{CoreLocalResponseStream, CoreLocalStreamCloseReceipt, LocalObjectStream};
 // The native local-endpoint lifecycle surface is owned by `c2-local`. Core
 // re-exports it so SDKs and the CLI share one implementation instead of
 // writing their own paths, parsers, or management loops.

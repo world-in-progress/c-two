@@ -216,7 +216,7 @@ fn connect(runtime: &Runtime, route: &str) -> contract::ContractClient {
 fn assert_idle(runtime: &Runtime) {
     let snapshot = runtime.call_execution_snapshot().unwrap();
     assert_eq!(snapshot.used_operations, 0);
-    assert_eq!(snapshot.used_retained_bytes, 0);
+    assert_eq!(runtime.memory_stats().payload_buffer.unwrap().used_bytes, 0);
 }
 fn wait_for_idle(runtime: &Runtime) {
     let deadline = std::time::Instant::now() + Duration::from_secs(5);

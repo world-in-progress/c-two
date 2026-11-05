@@ -1,4 +1,5 @@
-from .meta import CRMMeta, MethodAccess, get_method_access, read, write
+from .meta import CRMMeta, MethodAccess, get_method_access, read, write, stream
+from .stream import Stream, StreamCloseReceipt
 from .contract import CRMContract, crm_contract, crm_contract_identity
 from .descriptor import (
     build_contract_descriptor,

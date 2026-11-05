@@ -1,10 +1,13 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use c2_contract::{ContractRelease, ContractReleaseRef, ExpectedRouteContract, MethodAccess};
+use c2_contract::{
+    ContractRelease, ContractReleaseRef, ExpectedRouteContract, MethodAccess, MethodMode,
+};
 use c2_core::{
-    Connect, EncodedClient, EncodedService, Error, HostOptions, MethodDefinition, Runtime,
-    RuntimeOptions, ServiceConcurrencyMode, ServiceDefinition,
+    Connect, EncodedClient, EncodedService, EncodedStream, EncodedStreamItem, EncodedStreamService,
+    Error, HostOptions, MethodDefinition, Runtime, RuntimeOptions, ServiceConcurrencyMode,
+    ServiceDefinition,
 };
 use c2_error::{C2Error, ErrorCode};
 use c2_http::relay::{RelayConfig, RelayServer};
@@ -15,6 +18,53 @@ const DESCRIPTOR: &str =
 static TEST_ID: AtomicU64 = AtomicU64::new(0);
 
 struct Echo;
+
+struct NonportableStream;
+
+impl EncodedService for NonportableStream {
+    fn invoke(&self, method_index: u16, request: Vec<u8>) -> Result<Vec<u8>, C2Error> {
+        Echo.invoke(method_index, request)
+    }
+}
+
+impl EncodedStreamService for NonportableStream {
+    fn open_stream(
+        &self,
+        method_index: u16,
+        request: Vec<u8>,
+    ) -> Result<Box<dyn EncodedStream>, C2Error> {
+        assert_eq!(method_index, 1);
+        Ok(Box::new(OneItem(Some(request))))
+    }
+}
+
+struct OneItem(Option<Vec<u8>>);
+
+impl EncodedStream for OneItem {
+    fn step(&mut self) -> Result<Option<Box<dyn EncodedStreamItem>>, C2Error> {
+        Ok(self
+            .0
+            .take()
+            .map(|value| Box::new(ByteItem(value)) as Box<dyn EncodedStreamItem>))
+    }
+
+    fn finish(self: Box<Self>) -> Result<(), C2Error> {
+        Ok(())
+    }
+}
+
+struct ByteItem(Vec<u8>);
+
+impl EncodedStreamItem for ByteItem {
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    fn write_range(&self, offset: usize, destination: &mut [u8]) -> Result<(), C2Error> {
+        destination.copy_from_slice(&self.0[offset..offset + destination.len()]);
+        Ok(())
+    }
+}
 
 impl EncodedService for Echo {
     fn invoke(&self, method_index: u16, request: Vec<u8>) -> Result<Vec<u8>, C2Error> {
@@ -292,6 +342,58 @@ fn explicitly_nonportable_service_keeps_its_schema_marker_and_uses_the_same_core
         client.call_owned("echo", b"pickle-bytes").expect("call"),
         b"pickle-bytes"
     );
+}
+
+#[test]
+fn nonportable_stream_definition_routes_validated_modes_through_server() {
+    let route_name = unique_name("python-stream");
+    let (release_ref, expected) = nonportable_identity(&route_name);
+    let bad = ServiceDefinition::new_nonportable_stream(
+        release_ref.clone(),
+        expected.clone(),
+        methods(),
+        [MethodMode::ServerStream],
+        Arc::new(NonportableStream),
+    )
+    .expect_err("all positional modes are required");
+    assert!(matches!(bad, Error::Contract(_)));
+
+    let definition = ServiceDefinition::new_nonportable_stream(
+        release_ref,
+        expected.clone(),
+        methods(),
+        [MethodMode::Unary, MethodMode::ServerStream],
+        Arc::new(NonportableStream),
+    )
+    .unwrap();
+    let runtime = Runtime::new(RuntimeOptions {
+        server_id: Some(unique_name("python-stream-server")),
+        use_process_relay_anchor: false,
+        ..RuntimeOptions::default()
+    })
+    .unwrap();
+    let host = runtime
+        .host(HostOptions::default().without_relay())
+        .unwrap();
+    let _registration = host.register(definition).unwrap();
+    let client = runtime
+        .connect(
+            expected,
+            Connect::DirectIpc {
+                address: host.local_endpoint().address().into(),
+            },
+        )
+        .unwrap();
+    let mut stream = client
+        .begin_stream("echo")
+        .unwrap()
+        .encode_vec(vec![7, 8])
+        .unwrap()
+        .stream()
+        .unwrap();
+    assert_eq!(stream.next_item().unwrap().unwrap().bytes(), &[7, 8]);
+    assert!(stream.next_item().unwrap().is_none());
+    assert!(stream.close().terminal.unwrap().is_ok());
 }
 
 #[test]

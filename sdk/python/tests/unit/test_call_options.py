@@ -191,29 +191,57 @@ def test_fastdb_known_length_gate_precedes_binary_materialization(monkeypatch, i
         source.close()
 
 
+_BUDGET_PROBE_SOURCE = '''
+import c_two as cc
+from c_two.crm.contract import crm_contract
+from c_two._native import RuntimeSession
+def payload_budget_probe(session):
+    @cc.crm(namespace='test.call_options.budget_probe', version='0.1.0')
+    class Empty:
+        def empty(self) -> None: ...
+    class Resource:
+        def empty(self): pass
+    host = cc.Runtime()
+    host.register(Empty, Resource(), name='budget-probe')
+    client = session.acquire_ipc_client(host.server_address(), 'budget-probe',
+                                        *crm_contract(Empty).native_args())
+    try:
+        prepared = client.begin_call('empty')
+        prepared.close()
+        return session.memory_stats()['payload_buffer']
+    finally:
+        client.close()
+        assert host.shutdown()['completed']
+'''
+
+
 def test_runtime_optional_limits_use_native_environment_resolution_in_child():
     import json
     import os
     import subprocess
     import sys
 
-    code = '''
+    code = _BUDGET_PROBE_SOURCE + '''
 import json
 from c_two._native import RuntimeSession
+initial = RuntimeSession(max_outstanding_calls=3)
+assert payload_budget_probe(initial)['limit_bytes'] == 4321
+assert initial.begin_shutdown().observe()['completed']
 session = RuntimeSession(max_outstanding_calls=3)
 snapshot = session.call_execution_snapshot()
 assert snapshot['max_operations'] == 3
-assert snapshot['max_retained_bytes'] == 4321
+assert session.memory_stats()['payload_buffer'] is None
 assert session.call_execution_limits_overrides == {
     'max_outstanding_calls': 3, 'payload_buffer_budget_bytes': None,
 }
 session.set_call_execution_limits(payload_buffer_budget_bytes=99)
 snapshot = session.call_execution_snapshot()
 assert snapshot['max_operations'] == 7
-assert snapshot['max_retained_bytes'] == 99
+payload_budget_probe(session)
+assert session.memory_stats()['payload_buffer']['limit_bytes'] == 99
 assert snapshot['used_operations'] == 0
-assert snapshot['used_retained_bytes'] == 0
-print(json.dumps(snapshot))
+assert session.memory_stats()['payload_buffer']['used_bytes'] == 0
+print(json.dumps({'snapshot': snapshot, 'payload_buffer': session.memory_stats()['payload_buffer']}))
 '''
     environment = dict(os.environ)
     environment.update(C2_ENV_FILE='', C2_CALL_MAX_OUTSTANDING='7',
@@ -221,7 +249,7 @@ print(json.dumps(snapshot))
     result = subprocess.run([sys.executable, '-c', code], env=environment,
                             capture_output=True, text=True, timeout=15)
     assert result.returncode == 0, result.stdout + result.stderr
-    assert json.loads(result.stdout)['max_retained_bytes'] == 99
+    assert json.loads(result.stdout)['payload_buffer']['limit_bytes'] == 99
 
 
 def test_retired_retained_input_keyword_is_not_accepted():
@@ -242,9 +270,13 @@ def test_payload_buffer_budget_accepts_u64_boundaries(limit):
 
     session = RuntimeSession(payload_buffer_budget_bytes=limit)
     assert session.call_execution_limits_overrides['payload_buffer_budget_bytes'] == limit
-    assert session.call_execution_snapshot()['max_retained_bytes'] == limit
+    session.call_execution_snapshot()
+    assert session.memory_stats()['payload_buffer'] is None
     session.set_call_execution_limits(payload_buffer_budget_bytes=limit)
-    assert session.call_execution_snapshot()['max_retained_bytes'] == limit
+    session.call_execution_snapshot()
+    probe = {}
+    exec(_BUDGET_PROBE_SOURCE, probe)
+    assert probe['payload_budget_probe'](session)['limit_bytes'] == limit
 
 
 @pytest.mark.parametrize('limit', [-1, 2**64])
@@ -267,9 +299,8 @@ def test_retired_budget_environment_name_has_no_effect():
     environment.update(C2_ENV_FILE='', C2_CALL_MAX_OUTSTANDING='7')
     environment.pop('C2_CALL_PAYLOAD_BUFFER_BUDGET_BYTES', None)
     environment.pop('C2_CALL_RETAINED_INPUT_BUDGET_BYTES', None)
-    command = [sys.executable, '-c',
-               'from c_two._native import RuntimeSession; '
-               'print(RuntimeSession().call_execution_snapshot()["max_retained_bytes"])']
+    command = [sys.executable, '-c', _BUDGET_PROBE_SOURCE +
+               '\nprint(payload_budget_probe(RuntimeSession())["limit_bytes"])']
     baseline = subprocess.run(command, env=environment, capture_output=True,
                               text=True, timeout=15, check=True).stdout
     environment['C2_CALL_RETAINED_INPUT_BUDGET_BYTES'] = '1'
@@ -298,9 +329,8 @@ assert len(rows) == 1
 assert rows[0]['initialized'] is False
 assert rows[0]['closed'] is False
 assert rows[0]['max_operations'] is None
-assert rows[0]['max_retained_bytes'] is None
 assert rows[0]['used_operations'] == 0
-assert rows[0]['used_retained_bytes'] == 0
+assert replacement.memory_stats()['retired_payload_buffers'] == []
 # The captured observer must not read invalid environment values, instantiate
 # the finite domain, or retain old Runtime authority through its handoff.
 del old

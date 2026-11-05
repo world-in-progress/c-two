@@ -5,7 +5,7 @@ const SERVER_STREAM: &str =
     include_str!("../../c2-contract/tests/fixtures/server-stream.contract.json");
 
 #[test]
-fn rust_generates_server_stream_while_python_and_typescript_reject_it() {
+fn rust_and_python_generate_server_stream_while_typescript_rejects_it() {
     let release = ContractRelease::from_descriptor_json(SERVER_STREAM.as_bytes()).unwrap();
     let rust =
         compile_contract_artifacts(&release, ContractCodegenTarget::Rust, &Default::default())
@@ -25,25 +25,39 @@ fn rust_generates_server_stream_while_python_and_typescript_reject_it() {
     assert!(!source.contains("fn encode_method_1_echo_output("));
     assert!(source.contains("fn method_0_ping(&self) -> Result<(), c_two::Error>"));
 
-    for target in [
-        ContractCodegenTarget::Python,
-        ContractCodegenTarget::TypeScript,
+    let python =
+        compile_contract_artifacts(&release, ContractCodegenTarget::Python, &Default::default())
+            .expect("Python server stream generation");
+    let source =
+        std::str::from_utf8(python.get("python/c_two_contract.py").unwrap().bytes()).unwrap();
+    for required in [
+        "def method_1_echo(self, payload: Payload) -> Stream[Payload]:",
+        "def hold_method_1_echo(self, payload: Payload) -> Stream[HeldResult[Payload]]:",
+        "self._bound_client.begin_stream(\"echo\")",
+        "prepared.charge_input(payload.execution_report().used_bytes)",
+        "prepared.stream(request)",
+        "Stream._from_encoded(",
+        "decode_method_1_echo_output",
     ] {
-        let error = compile_contract_artifacts(&release, target, &Default::default())
-            .err()
-            .expect("server stream generation is implemented in later blocks");
-        assert!(matches!(
-            &error,
-            CodegenError::UnsupportedServerStream {
-                target: actual_target,
-                method_index: 1,
-                method_name,
-            } if *actual_target == target && method_name == "echo"
-        ));
-        let message = error.to_string();
-        assert!(message.contains(target.as_str()), "{message}");
-        assert!(message.contains("server_stream"), "{message}");
-        assert!(message.contains("echo"), "{message}");
-        assert!(message.contains("$.methods[1].mode"), "{message}");
+        assert!(source.contains(required), "missing {required:?}");
     }
+    assert!(source.contains("def method_0_ping(self) -> None:"));
+
+    let target = ContractCodegenTarget::TypeScript;
+    let error = compile_contract_artifacts(&release, target, &Default::default())
+        .err()
+        .expect("TypeScript server stream generation remains unsupported");
+    assert!(matches!(
+        &error,
+        CodegenError::UnsupportedServerStream {
+            target: actual_target,
+            method_index: 1,
+            method_name,
+        } if *actual_target == target && method_name == "echo"
+    ));
+    let message = error.to_string();
+    assert!(message.contains(target.as_str()), "{message}");
+    assert!(message.contains("server_stream"), "{message}");
+    assert!(message.contains("echo"), "{message}");
+    assert!(message.contains("$.methods[1].mode"), "{message}");
 }

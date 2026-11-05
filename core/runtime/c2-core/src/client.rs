@@ -305,6 +305,7 @@ impl EncodedCall {
         let permit = preparing.take_stream_permit();
         let cancellation = c2_ipc::IpcStreamCancellation::new();
         let transport_cancellation = cancellation.clone();
+        let handle_cancellation = cancellation.clone();
         let response = preparing
             .execute_stream(
                 self.nbytes,
@@ -336,7 +337,11 @@ impl EncodedCall {
                 move || cancellation.cancel(),
             )?
             .wait()?;
-        Ok(CoreResponseStream::new(response, scope))
+        Ok(CoreResponseStream::new(
+            response,
+            scope,
+            handle_cancellation,
+        ))
     }
 
     pub fn call_owned(self) -> Result<Vec<u8>, Error> {

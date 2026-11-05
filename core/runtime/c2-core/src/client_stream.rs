@@ -1,10 +1,11 @@
 //! Synchronous facade over one original IPC server-stream call record.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use c2_ipc::{IpcError, IpcResponseStream, StreamTerminal};
+use c2_ipc::{IpcError, IpcResponseStream, IpcStreamCancellation, StreamTerminal};
 use c2_mem::retention::BudgetedBuffer;
 use c2_wire::rpc::CallStatus;
+use parking_lot::Mutex;
 
 use crate::call_execution::{scope_error, shared_executor};
 use crate::client::normalize_ipc_call_error;
@@ -13,7 +14,8 @@ use crate::{CallScope, CallState, Error, HeldResponse, TransportPhase, normalize
 /// One client-owned view of a server stream. The transport record keeps its
 /// operation slot until the actual terminal, independently of this facade.
 pub struct CoreResponseStream {
-    stream: IpcResponseStream,
+    stream: Mutex<IpcResponseStream>,
+    cancellation: IpcStreamCancellation,
     scope: CallScope,
     runtime: tokio::runtime::Handle,
 }
@@ -27,9 +29,14 @@ pub struct CoreStreamCloseReceipt {
 }
 
 impl CoreResponseStream {
-    pub(crate) fn new(stream: IpcResponseStream, scope: CallScope) -> Self {
+    pub(crate) fn new(
+        stream: IpcResponseStream,
+        scope: CallScope,
+        cancellation: IpcStreamCancellation,
+    ) -> Self {
         Self {
-            stream,
+            stream: Mutex::new(stream),
+            cancellation,
             scope,
             runtime: shared_executor().expect("stream execution already started on shared runtime"),
         }
@@ -38,22 +45,22 @@ impl CoreResponseStream {
     /// Wait for the next complete item under the call's original absolute
     /// deadline. Expiry does not submit CANCEL; the handle remains usable for
     /// terminal observation and its Drop submits cancellation separately.
-    pub fn next_item(&mut self) -> Result<Option<HeldResponse>, Error> {
+    pub fn next_item(&self) -> Result<Option<HeldResponse>, Error> {
         self.check_deadline()?;
+        let mut stream = self.stream.lock();
         let received = self.runtime.block_on(async {
             match self.scope.deadline() {
-                Some(deadline) => tokio::time::timeout_at(
-                    tokio::time::Instant::from_std(deadline),
-                    self.stream.recv(),
-                )
-                .await
-                .map_err(|_| {
-                    scope_error(crate::CallScopeError::DeadlineExceeded {
-                        phase: TransportPhase::DispatchUncertain,
-                    })
-                })?
-                .map_err(normalize_ipc_call_error),
-                None => self.stream.recv().await.map_err(normalize_ipc_call_error),
+                Some(deadline) => {
+                    tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), stream.recv())
+                        .await
+                        .map_err(|_| {
+                            scope_error(crate::CallScopeError::DeadlineExceeded {
+                                phase: TransportPhase::DispatchUncertain,
+                            })
+                        })?
+                        .map_err(normalize_ipc_call_error)
+                }
+                None => stream.recv().await.map_err(normalize_ipc_call_error),
             }
         });
         publish_received(&self.scope, received)
@@ -79,9 +86,8 @@ impl CoreResponseStream {
 
     /// Submit cancellation intent without waiting for cleanup.
     pub fn cancel(&self) -> Result<(), Error> {
-        self.stream
-            .cancel()
-            .map_err(|error| normalize_ipc_error(error, TransportPhase::DispatchUncertain))
+        self.cancellation.cancel();
+        Ok(())
     }
 
     pub fn close(&self) -> CoreStreamCloseReceipt {
@@ -91,15 +97,31 @@ impl CoreResponseStream {
     /// `None` waits indefinitely. Zero submits cancellation then observes the
     /// current state once. A timed-out receipt can be observed again later.
     pub fn close_with_timeout(&self, timeout: Option<Duration>) -> CoreStreamCloseReceipt {
+        let started = Instant::now();
         let _ = self.cancel();
+        // Cancellation is independent of the single iterator receiver. The
+        // observation budget also covers contention with an executing next.
+        let stream = match timeout {
+            Some(Duration::ZERO) => self.stream.try_lock(),
+            Some(timeout) => self.stream.try_lock_for(timeout),
+            None => Some(self.stream.lock()),
+        };
+        let Some(stream) = stream else {
+            return CoreStreamCloseReceipt {
+                completed: false,
+                terminal: None,
+                complete_items: None,
+            };
+        };
+        let timeout = timeout.map(|timeout| timeout.saturating_sub(started.elapsed()));
         let terminal = match timeout {
-            Some(Duration::ZERO) => self.stream.try_completion(),
+            Some(Duration::ZERO) => stream.try_completion(),
             Some(timeout) => self.runtime.block_on(async {
-                tokio::time::timeout(timeout, self.stream.completion())
+                tokio::time::timeout(timeout, stream.completion())
                     .await
                     .ok()
             }),
-            None => Some(self.runtime.block_on(self.stream.completion())),
+            None => Some(self.runtime.block_on(stream.completion())),
         };
         match terminal {
             Some(Ok(terminal)) => {
@@ -167,7 +189,7 @@ fn publish_received(
 
 impl Drop for CoreResponseStream {
     fn drop(&mut self) {
-        let _ = self.stream.cancel();
+        self.cancellation.cancel();
     }
 }
 

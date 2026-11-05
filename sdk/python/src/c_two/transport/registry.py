@@ -1165,14 +1165,13 @@ def set_call_execution_limits(
 
 
 def call_execution_snapshot() -> CallExecutionSnapshot:
-    """Observe Core finite input charges without freezing admission policy.
+    """Observe native call slots without freezing admission policy.
 
-    Includes unfinished continuations after caller expiry. ``retired`` reports
-    earlier sessions separately while native operations still own charges;
-    shutdown closes admission and never refunds unfinished input ownership.
-    Each Runtime has its own admission domain; these rows do not imply a
-    shared process-wide limit across replacement sessions. Counters measure
-    retained input, not process memory usage.
+    Counts finite unary calls and all server streams through their real terminal,
+    including work continuing after caller expiry. ``retired`` reports earlier
+    sessions while their native operations or payload owners remain alive.
+    Each Runtime has its own admission domain; payload byte accounting and
+    allocation rejection counters live in ``memory_stats()['payload_buffer']``.
     """
     return _get_default_runtime().call_execution_snapshot()
 

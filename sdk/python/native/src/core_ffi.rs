@@ -10,8 +10,8 @@ use pyo3::types::{PyBytes, PyDict, PyList};
 
 use c2_core::memory::LocalCopyGuard;
 use c2_core::{
-    CallOptions, CallTimeout, Client, EncodedService, HeldResponse, LifecycleError, ObservedPath,
-    ObservedRoute, PreparedCall, ServerFailure,
+    CallOptions, CallTimeout, Client, EncodedService, EncodedStreamService, HeldResponse,
+    LifecycleError, ObservedPath, ObservedRoute, PreparedCall, ServerFailure,
 };
 use c2_error::{C2Error, ErrorCode};
 
@@ -24,10 +24,11 @@ pub(crate) struct PyCoreClient {
     route_name: String,
     observed_path: ObservedPath,
     observed_route: ObservedRoute,
+    local_copy_tracker: PyLocalCopyTracker,
 }
 
 impl PyCoreClient {
-    pub(crate) fn new(client: Client) -> Self {
+    pub(crate) fn new(client: Client, local_copy_tracker: PyLocalCopyTracker) -> Self {
         let route_name = client.expected_route().route_name.clone();
         let observed_path = client.observed_path();
         let observed_route = client.observed_route().clone();
@@ -36,6 +37,7 @@ impl PyCoreClient {
             route_name,
             observed_path,
             observed_route,
+            local_copy_tracker,
         }
     }
 
@@ -113,31 +115,7 @@ impl PyNativePreparedCall {
         })
     }
 
-    fn finish(py: Python<'_>, encoded: c2_core::EncodedCall) -> PyResult<PyCoreResponse> {
-        py.detach(move || encoded.call_held())
-            .map(PyCoreResponse::new)
-            .map_err(core_error_to_py)
-    }
-}
-
-#[pymethods]
-impl PyNativePreparedCall {
-    fn charge_input(&self, py: Python<'_>, nbytes: u64) -> PyResult<()> {
-        // Reattach only after dropping the preparation lock, including errors.
-        let result = py.detach(|| {
-            self.inner
-                .lock()
-                .as_mut()
-                .map(|prepared| prepared.charge_input(nbytes))
-        });
-        result
-            .ok_or_else(|| {
-                PyValueError::new_err("prepared call has already been consumed or closed")
-            })?
-            .map_err(core_error_to_py)
-    }
-
-    fn call(&self, py: Python<'_>, data: &Bound<'_, PyAny>) -> PyResult<PyCoreResponse> {
+    fn encode(&self, py: Python<'_>, data: &Bound<'_, PyAny>) -> PyResult<c2_core::EncodedCall> {
         let mut prepared = py.detach(|| self.take())?;
         let bytes_input = data
             .cast_exact::<PyBytes>()
@@ -169,7 +147,7 @@ impl PyNativePreparedCall {
                     })
                 })
                 .map_err(core_error_to_py)?;
-            return Self::finish(py, encoded);
+            return Ok(encoded);
         }
         // A read-only memoryview can still alias mutable backing. Snapshot all
         // non-bytes buffers on the caller under the GIL after native charging;
@@ -191,7 +169,46 @@ impl PyNativePreparedCall {
         let encoded = py
             .detach(move || prepared.encode_vec(request))
             .map_err(core_error_to_py)?;
-        Self::finish(py, encoded)
+        Ok(encoded)
+    }
+
+    fn finish(py: Python<'_>, encoded: c2_core::EncodedCall) -> PyResult<PyCoreResponse> {
+        py.detach(move || encoded.call_held())
+            .map(PyCoreResponse::new)
+            .map_err(core_error_to_py)
+    }
+}
+
+#[pymethods]
+impl PyNativePreparedCall {
+    fn charge_input(&self, py: Python<'_>, nbytes: u64) -> PyResult<()> {
+        // Reattach only after dropping the preparation lock, including errors.
+        let result = py.detach(|| {
+            self.inner
+                .lock()
+                .as_mut()
+                .map(|prepared| prepared.charge_input(nbytes))
+        });
+        result
+            .ok_or_else(|| {
+                PyValueError::new_err("prepared call has already been consumed or closed")
+            })?
+            .map_err(core_error_to_py)
+    }
+
+    fn call(&self, py: Python<'_>, data: &Bound<'_, PyAny>) -> PyResult<PyCoreResponse> {
+        Self::finish(py, self.encode(py, data)?)
+    }
+
+    fn stream(
+        &self,
+        py: Python<'_>,
+        data: &Bound<'_, PyAny>,
+    ) -> PyResult<crate::stream_ffi::PyCoreResponseStream> {
+        let encoded = self.encode(py, data)?;
+        py.detach(move || encoded.stream())
+            .map(crate::stream_ffi::PyCoreResponseStream::new)
+            .map_err(core_error_to_py)
     }
 
     fn close(&self, py: Python<'_>) {
@@ -225,6 +242,11 @@ impl PyCoreClient {
     }
 
     #[getter]
+    fn local_copy_tracker(&self) -> PyLocalCopyTracker {
+        self.local_copy_tracker.clone()
+    }
+
+    #[getter]
     fn observed_path(&self) -> &'static str {
         match self.observed_path {
             ObservedPath::DirectIpc => "direct_ipc",
@@ -244,6 +266,7 @@ impl PyCoreClient {
         let client = self.client()?;
         Ok(Self::new(
             client.with_call_options(call_options(py, &timeout)?),
+            self.local_copy_tracker.clone(),
         ))
     }
 
@@ -251,6 +274,16 @@ impl PyCoreClient {
         let client = self.client()?;
         let prepared = py
             .detach(move || client.begin_call(method_name))
+            .map_err(core_error_to_py)?;
+        Ok(PyNativePreparedCall {
+            inner: Mutex::new(Some(prepared)),
+        })
+    }
+
+    fn begin_stream(&self, py: Python<'_>, method_name: &str) -> PyResult<PyNativePreparedCall> {
+        let client = self.client()?;
+        let prepared = py
+            .detach(move || client.begin_stream(method_name))
             .map_err(core_error_to_py)?;
         Ok(PyNativePreparedCall {
             inner: Mutex::new(Some(prepared)),
@@ -288,7 +321,7 @@ pub(crate) struct PyCoreResponse {
 }
 
 impl PyCoreResponse {
-    fn new(held: HeldResponse) -> Self {
+    pub(crate) fn new(held: HeldResponse) -> Self {
         let data_len = held.bytes().len();
         Self {
             inner: Mutex::new(Some(held)),
@@ -607,6 +640,25 @@ impl EncodedService for PyCoreService {
     }
 }
 
+impl EncodedStreamService for PyCoreService {
+    fn open_stream(
+        &self,
+        method_index: u16,
+        request: Vec<u8>,
+    ) -> Result<Box<dyn c2_core::EncodedStream>, C2Error> {
+        Python::attach(|py| {
+            let request = Py::new(py, PyCoreRequestBuffer::new(request))
+                .map_err(|error| python_error_to_c2(py, error))?;
+            let iterator = self
+                .dispatcher
+                .call1(py, (self.route_name.as_str(), method_index, request))
+                .map_err(|error| python_error_to_c2(py, error))?;
+            Ok(Box::new(crate::stream_ffi::PyEncodedStream { iterator })
+                as Box<dyn c2_core::EncodedStream>)
+        })
+    }
+}
+
 // Caller/GIL snapshot for mutable exporters, read-only aliases and bytes
 // subclasses. Only the returned native Vec crosses execution handoff.
 fn snapshot_python_buffer(py: Python<'_>, buffer: &PyBuffer<u8>) -> PyResult<Vec<u8>> {
@@ -630,7 +682,7 @@ fn materialize_python_bytes(py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResul
     ))
 }
 
-fn python_error_to_c2(py: Python<'_>, error: PyErr) -> C2Error {
+pub(crate) fn python_error_to_c2(py: Python<'_>, error: PyErr) -> C2Error {
     if let Ok(error_bytes) = error.value(py).getattr("error_bytes")
         && let Ok(buffer) = PyBuffer::<u8>::get(&error_bytes)
     {

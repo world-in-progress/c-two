@@ -1,7 +1,9 @@
 use std::collections::{HashMap, VecDeque};
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
+
+use tokio::sync::Notify;
 
 use crate::admission::{AdmissionGate, AdmissionState};
 
@@ -109,6 +111,113 @@ struct SchedulerState {
     writer_active: bool,
     next_ticket: u64,
     queue: VecDeque<QueuedPermit>,
+    local_streams: Vec<Weak<LocalStreamCancellationInner>>,
+}
+
+/// The first cancellation source wins. Host lifecycle cancellation still
+/// delivers an item produced by the current step before cleanup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamCancelCause {
+    Consumer,
+    Shutdown,
+    Unregister,
+}
+
+impl StreamCancelCause {
+    pub const fn message(self) -> &'static str {
+        match self {
+            Self::Consumer => "server stream cancelled by consumer",
+            Self::Shutdown => "server stream cancelled by Runtime shutdown",
+            Self::Unregister => "server stream cancelled by route unregister",
+        }
+    }
+}
+
+struct LocalStreamCancellationInner {
+    state: Mutex<LocalStreamCancellationState>,
+    changed: Notify,
+}
+
+#[derive(Default)]
+struct LocalStreamCancellationState {
+    cause: Option<StreamCancelCause>,
+    consumer_abandoned: bool,
+    terminal_decided: bool,
+}
+
+/// Cancellation shared by a local object stream and its original route.
+#[derive(Clone)]
+pub struct LocalStreamCancellation(Arc<LocalStreamCancellationInner>);
+
+impl LocalStreamCancellation {
+    fn new() -> Self {
+        Self(Arc::new(LocalStreamCancellationInner {
+            state: Mutex::new(LocalStreamCancellationState::default()),
+            changed: Notify::new(),
+        }))
+    }
+
+    pub fn cancel_consumer(&self) {
+        let mut state = self.0.state.lock().unwrap();
+        state.consumer_abandoned = true;
+        if state.cause.is_none() && !state.terminal_decided {
+            state.cause = Some(StreamCancelCause::Consumer);
+        }
+        self.0.changed.notify_waiters();
+    }
+
+    fn cancel(&self, cause: StreamCancelCause) {
+        let mut state = self.0.state.lock().unwrap();
+        if state.cause.is_none() && !state.terminal_decided {
+            state.cause = Some(cause);
+            self.0.changed.notify_waiters();
+        }
+    }
+
+    pub fn cause(&self) -> Option<StreamCancelCause> {
+        self.0.state.lock().unwrap().cause
+    }
+
+    pub fn consumer_abandoned(&self) -> bool {
+        self.0.state.lock().unwrap().consumer_abandoned
+    }
+
+    /// Serializes callback entry with cancellation, without retaining the
+    /// lock while user code runs.
+    pub fn start_step(&self) -> bool {
+        self.0.state.lock().unwrap().cause.is_none()
+    }
+
+    /// Freeze the natural terminal decision immediately after the last step.
+    pub fn decide_terminal(&self) -> Option<StreamCancelCause> {
+        let mut state = self.0.state.lock().unwrap();
+        state.terminal_decided = true;
+        state.cause
+    }
+
+    pub async fn cancelled(&self) -> StreamCancelCause {
+        loop {
+            let notified = self.0.changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if let Some(cause) = self.cause() {
+                return cause;
+            }
+            notified.await;
+        }
+    }
+
+    pub async fn abandoned(&self) {
+        loop {
+            let notified = self.0.changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.consumer_abandoned() {
+                return;
+            }
+            notified.await;
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -145,6 +254,14 @@ pub struct Scheduler {
 #[derive(Clone)]
 pub struct RouteConcurrencyHandle {
     scheduler: Scheduler,
+}
+
+/// One local stream retains its first admission across yielded items. Only
+/// each resource step and cleanup occupy a route execution permit.
+pub struct LocalStreamCall {
+    first: Option<SchedulerPendingPermit>,
+    slot: SchedulerCallSlot,
+    cancellation: LocalStreamCancellation,
 }
 
 pub struct SchedulerGuard {
@@ -380,6 +497,29 @@ impl Scheduler {
         self.inner.notify_all();
     }
 
+    /// Called by the same route lifecycle transition that cancels IPC calls.
+    /// Dead local handles are pruned without owning their resource callbacks.
+    pub(crate) fn cancel_local_streams(&self, cause: StreamCancelCause) {
+        let mut state = self.inner.state.lock().unwrap();
+        Self::cancel_local_streams_locked(&mut state, cause);
+    }
+
+    pub(crate) fn close_and_cancel_local_streams(&self, cause: StreamCancelCause) {
+        let mut state = self.inner.state.lock().unwrap();
+        state.route_admission = RouteAdmissionState::Closed;
+        Self::cancel_local_streams_locked(&mut state, cause);
+        self.inner.notify_all();
+    }
+
+    fn cancel_local_streams_locked(state: &mut SchedulerState, cause: StreamCancelCause) {
+        state
+            .local_streams
+            .retain(|stream| stream.strong_count() > 0);
+        for stream in state.local_streams.iter().filter_map(Weak::upgrade) {
+            LocalStreamCancellation(stream).cancel(cause);
+        }
+    }
+
     pub(crate) async fn wait_drained_async(&self) {
         loop {
             let notified = self.inner.admission.notify.notified();
@@ -491,7 +631,7 @@ impl Scheduler {
         &self,
         method_idx: u16,
     ) -> Result<SchedulerPendingPermit, SchedulerAcquireError> {
-        self.reserve_pending_with_generation(method_idx, None)
+        self.reserve_pending_with_generation(method_idx, None, None)
     }
 
     pub(crate) fn reserve_pending_in_generation(
@@ -499,13 +639,22 @@ impl Scheduler {
         method_idx: u16,
         generation: u64,
     ) -> Result<SchedulerPendingPermit, SchedulerAcquireError> {
-        self.reserve_pending_with_generation(method_idx, Some(generation))
+        self.reserve_pending_with_generation(method_idx, Some(generation), None)
+    }
+
+    fn reserve_local_stream(
+        &self,
+        method_idx: u16,
+        cancellation: &LocalStreamCancellation,
+    ) -> Result<SchedulerPendingPermit, SchedulerAcquireError> {
+        self.reserve_pending_with_generation(method_idx, None, Some(cancellation))
     }
 
     fn reserve_pending_with_generation(
         &self,
         method_idx: u16,
         generation: Option<u64>,
+        local_cancellation: Option<&LocalStreamCancellation>,
     ) -> Result<SchedulerPendingPermit, SchedulerAcquireError> {
         let access = self.held_access(method_idx);
         let admission = self.inner.admission.lock();
@@ -529,6 +678,12 @@ impl Scheduler {
         }
 
         state.pending += 1;
+        if let Some(cancellation) = local_cancellation {
+            state
+                .local_streams
+                .retain(|stream| stream.strong_count() > 0);
+            state.local_streams.push(Arc::downgrade(&cancellation.0));
+        }
         let ticket = state.next_ticket;
         state.next_ticket = state.next_ticket.wrapping_add(1);
         state.queue.push_back(QueuedPermit { ticket, access });
@@ -600,6 +755,59 @@ impl RouteConcurrencyHandle {
 
     pub fn is_unconstrained(&self) -> bool {
         self.scheduler.is_unconstrained()
+    }
+
+    /// Reserve the original counted call slot and publish its cancellation
+    /// handle atomically with route admission.
+    #[doc(hidden)]
+    pub fn begin_local_stream_call(
+        &self,
+        method_idx: u16,
+    ) -> Result<LocalStreamCall, SchedulerAcquireError> {
+        let cancellation = LocalStreamCancellation::new();
+        let mut first = self
+            .scheduler
+            .reserve_local_stream(method_idx, &cancellation)?;
+        let slot = first.retain_call_slot();
+        Ok(LocalStreamCall {
+            first: Some(first),
+            slot,
+            cancellation,
+        })
+    }
+}
+
+impl LocalStreamCall {
+    pub fn cancellation(&self) -> LocalStreamCancellation {
+        self.cancellation.clone()
+    }
+
+    /// First admission can be interrupted before resource entry.
+    pub async fn first_step(&mut self) -> Result<SchedulerGuard, SchedulerAcquireError> {
+        let pending = self.first.take().expect("first stream step is unique");
+        tokio::select! {
+            result = pending.async_activate() => result,
+            _ = self.cancellation.cancelled() => Err(SchedulerAcquireError::Closed),
+        }
+    }
+
+    pub fn mark_resource_entry(&self) {
+        self.slot.mark_resource_entry();
+    }
+
+    /// A continuation enters at the route queue tail and is interruptible
+    /// until the resource callback starts.
+    pub async fn next_step(&self) -> Result<SchedulerGuard, SchedulerAcquireError> {
+        let pending = self.slot.reserve_step()?;
+        tokio::select! {
+            result = pending.async_activate() => result,
+            _ = self.cancellation.cancelled() => Err(SchedulerAcquireError::Closed),
+        }
+    }
+
+    /// Cleanup uses the same call slot, independent of demand or cancellation.
+    pub async fn cleanup_step(&self) -> Result<SchedulerGuard, SchedulerAcquireError> {
+        self.slot.reserve_step()?.async_activate().await
     }
 }
 

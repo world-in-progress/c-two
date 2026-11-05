@@ -97,10 +97,11 @@ impl CallExecutionObserver {
     /// Retired metadata may be discarded only after closure and real release
     /// of every operation and payload byte. Open, uninitialized domains are live.
     pub fn is_live(&self) -> bool {
-        let observation = self.snapshot();
-        !observation.closed
-            || observation.counters.is_some_and(|counters| {
-                counters.used_operations != 0 || counters.used_retained_bytes != 0
+        let state = self.state.lock();
+        !state.closed
+            || state.budget.as_ref().is_some_and(|budget| {
+                budget.snapshot().used_operations != 0
+                    || budget.payload_budget().snapshot().used_bytes != 0
             })
     }
 
@@ -914,7 +915,7 @@ mod tests {
         let snap = context.snapshot();
         assert_eq!(snap.peak_operations, 0);
         assert_eq!(snap.rejected_reservations, 0);
-        assert_eq!(snap.used_retained_bytes, 0);
+        assert_eq!(context.payload_snapshot().used_bytes, 0);
     }
 
     #[test]
@@ -922,7 +923,7 @@ mod tests {
         let context = context(1, 4);
         let mut first = prepare(&context);
         assert_eq!(context.snapshot().used_operations, 1);
-        assert_eq!(context.snapshot().used_retained_bytes, 0);
+        assert_eq!(context.payload_snapshot().used_bytes, 0);
         let slot = context
             .prepare(CallOptions::new(), Some(FINITE))
             .err()
@@ -934,7 +935,7 @@ mod tests {
             "call_execution_admission",
         );
         first.charge_input(2).unwrap();
-        assert_eq!(context.snapshot().used_retained_bytes, 2);
+        assert_eq!(context.payload_snapshot().used_bytes, 2);
         let first_scope = first.scope().clone();
         let error = first
             .execute::<(), _, _, _>(
@@ -952,6 +953,8 @@ mod tests {
         );
         assert_eq!(first_scope.state(), CallState::FailedPreDispatch);
         assert_eq!(context.snapshot().used_operations, 0);
+        assert_eq!(context.snapshot().rejected_reservations, 1);
+        assert_eq!(context.payload_snapshot().rejected_allocations, 1);
         let prepared = prepare(&context);
         context.close();
         let call = prepared
@@ -977,7 +980,8 @@ mod tests {
             "call_execution_admission",
         );
         assert_eq!(context.snapshot().used_operations, 0);
-        assert_eq!(context.snapshot().peak_retained_bytes, 2);
+        assert_eq!(context.snapshot().rejected_reservations, 2);
+        assert_eq!(context.payload_snapshot().peak_bytes, 2);
     }
 
     #[test]
@@ -1002,7 +1006,7 @@ mod tests {
         drop(second);
         assert_eq!(context.snapshot().used_operations, 1);
         drop(first);
-        assert_eq!(context.snapshot().used_retained_bytes, 0);
+        assert_eq!(context.payload_snapshot().used_bytes, 0);
     }
 
     #[test]
@@ -1023,7 +1027,7 @@ mod tests {
         assert_eq!(context.payload_snapshot().rejected_bytes, 5);
         drop(first);
         second.charge_input(5).unwrap();
-        assert_eq!(context.snapshot().used_retained_bytes, 5);
+        assert_eq!(context.payload_snapshot().used_bytes, 5);
     }
 
     #[test]
@@ -1052,7 +1056,7 @@ mod tests {
         );
         assert_eq!(context.payload_snapshot().rejected_allocations, 1);
         assert_eq!(context.payload_snapshot().rejected_bytes, 8);
-        eventually(|| context.snapshot().used_retained_bytes == 0);
+        eventually(|| context.payload_snapshot().used_bytes == 0);
     }
 
     #[test]
@@ -1088,7 +1092,7 @@ mod tests {
             .execute(
                 7,
                 move || {
-                    assert_eq!(seen.snapshot().used_retained_bytes, 7);
+                    assert_eq!(seen.payload_snapshot().used_bytes, 7);
                     assert_eq!(seen.snapshot().used_operations, 1);
                     Ok(vec![1; 7])
                 },
@@ -1107,14 +1111,14 @@ mod tests {
         assert_eq!(body.as_ref().as_ref(), &[1; 7]);
         assert_eq!(response.bytes(), &[2; 3]);
         // Outcome has completed; HTTP-like body still owns the full charge.
-        assert_eq!(context.snapshot().used_retained_bytes, 7);
+        assert_eq!(context.payload_snapshot().used_bytes, 7);
         assert_eq!(context.snapshot().used_operations, 0);
         context.close();
         drop(response);
         assert_eq!(context.snapshot().used_operations, 0);
         drop(body);
         eventually(|| context.snapshot().used_operations == 0);
-        assert_eq!(context.snapshot().used_retained_bytes, 0);
+        assert_eq!(context.payload_snapshot().used_bytes, 0);
     }
 
     #[test]
@@ -1212,7 +1216,7 @@ mod tests {
         release.send(()).unwrap();
         eventually(|| drops.load(Ordering::SeqCst) == 1 && input.upgrade().is_none());
         eventually(|| context.snapshot().used_operations == 0);
-        assert_eq!(context.snapshot().used_retained_bytes, 0);
+        assert_eq!(context.payload_snapshot().used_bytes, 0);
         assert_eq!(
             scope.observe_deadline(),
             CallState::ExpiredDispatchUncertain
@@ -1332,7 +1336,7 @@ mod tests {
         drop(call);
         context.close();
         assert!(weak.upgrade().is_some());
-        assert_eq!(context.snapshot().used_retained_bytes, 4);
+        assert_eq!(context.payload_snapshot().used_bytes, 4);
         assert_eq!(context.snapshot().used_operations, 1);
         release.send(()).unwrap();
         eventually(|| drops.load(Ordering::SeqCst) == 1 && weak.upgrade().is_none());
@@ -1401,7 +1405,7 @@ mod tests {
                 let scope = preparing.scope().clone();
                 assert_eq!(scope.deadline(), None);
                 preparing.charge_input(4).unwrap();
-                assert_eq!(context.snapshot().used_retained_bytes, 4);
+                assert_eq!(context.payload_snapshot().used_bytes, 4);
                 assert_eq!(context.snapshot().used_operations, 0);
                 let handle = runtime.handle().clone();
                 let call = preparing
@@ -1429,12 +1433,12 @@ mod tests {
                     CallState::Succeeded,
                     "background continuation was created"
                 );
-                assert_eq!(context.snapshot().used_retained_bytes, 4);
+                assert_eq!(context.payload_snapshot().used_bytes, 4);
                 let body = call.wait().unwrap();
                 assert_eq!(body.as_ref().as_ref(), &[8; 4]);
-                assert_eq!(context.snapshot().used_retained_bytes, 4);
+                assert_eq!(context.payload_snapshot().used_bytes, 4);
                 drop(body);
-                assert_eq!(context.snapshot().used_retained_bytes, 0);
+                assert_eq!(context.payload_snapshot().used_bytes, 0);
             }
         }
     }
@@ -1455,7 +1459,7 @@ mod tests {
         let before = context.snapshot();
         assert_eq!(before.rejected_reservations, 1);
         assert_eq!(before.peak_operations, 0);
-        assert_eq!(before.peak_retained_bytes, 0);
+        assert_eq!(context.payload_snapshot().peak_bytes, 0);
         // Closed and zero-slot budget must not mask After(ZERO)'s first expiry.
         context.close();
         let before = context.snapshot();
@@ -1522,7 +1526,7 @@ mod tests {
             "call_deadline",
         );
         assert_eq!(context.snapshot().used_operations, 1);
-        assert_eq!(context.snapshot().used_retained_bytes, 4);
+        assert_eq!(context.payload_snapshot().used_bytes, 4);
         release.send(()).unwrap();
         transport_rx.recv_timeout(TEST_WAIT).unwrap();
         eventually(|| weak.upgrade().is_none());
@@ -1556,7 +1560,7 @@ mod tests {
         });
         assert!(weak.upgrade().is_none());
         assert_eq!(context.snapshot().used_operations, 0);
-        assert_eq!(context.snapshot().used_retained_bytes, 0);
+        assert_eq!(context.payload_snapshot().used_bytes, 0);
     }
 
     struct PanicFuture {
@@ -1641,7 +1645,7 @@ mod tests {
                 drop_rx.recv_timeout(TEST_WAIT).unwrap();
             }
             eventually(|| context.snapshot().used_operations == 0);
-            assert_eq!(context.snapshot().used_retained_bytes, 0);
+            assert_eq!(context.payload_snapshot().used_bytes, 0);
             assert_eq!(
                 scope.state(),
                 if boundary < 2 {

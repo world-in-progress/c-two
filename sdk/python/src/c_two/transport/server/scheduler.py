@@ -48,3 +48,6 @@ class Scheduler:
 
     def execution_guard(self, method_idx: int):
         return self._native.execution_guard(method_idx)
+
+    def open_stream(self, method_idx: int, factory):
+        return self._native.open_stream(method_idx, factory)

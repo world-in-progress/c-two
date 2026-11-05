@@ -20,8 +20,8 @@ pub use dispatcher::{
 };
 pub use runtime::{ServerRuntimeBuilder, ServerRuntimeOptions};
 pub use scheduler::{
-    AccessLevel, ConcurrencyMode, RouteConcurrencyHandle, SchedulerAcquireError, SchedulerGuard,
-    SchedulerLimits, SchedulerSnapshot,
+    AccessLevel, ConcurrencyMode, LocalStreamCall, LocalStreamCancellation, RouteConcurrencyHandle,
+    SchedulerAcquireError, SchedulerGuard, SchedulerLimits, SchedulerSnapshot, StreamCancelCause,
 };
 pub use server::{
     DIRECT_IPC_SHUTDOWN_REASON, Server, ServerError, ServerFailure, ServerIdentity,

@@ -707,7 +707,7 @@ impl Runtime {
         if let Some(context) = &state.call_execution {
             let snapshot = context.snapshot();
             return if snapshot.max_operations == limits.max_outstanding_calls
-                && snapshot.max_retained_bytes == limits.payload_buffer_budget_bytes
+                && context.payload_snapshot().limit_bytes == limits.payload_buffer_budget_bytes
             {
                 // Record accepted optional code inputs, even for an idempotent
                 // setter. The frozen budget and its live charges stay intact.
@@ -727,7 +727,7 @@ impl Runtime {
         Ok(())
     }
 
-    /// Consistent read-only input retention counters. Before first call this
+    /// Consistent read-only operation-slot counters. Before first call this
     /// resolves policy without freezing or constructing an executor. It counts
     /// finite-unary and stream owners, including continuations after caller timeout;
     /// response-storage observations stay in outgoing_memory_observer().
@@ -2890,9 +2890,15 @@ mod tests {
         assert!(observed.initialized);
         assert!(!observed.closed);
         let counters = observed.counters.unwrap();
+        assert_eq!(counters.used_operations, 8);
         assert_eq!(
-            (counters.used_operations, counters.used_retained_bytes),
-            (8, 256)
+            runtime
+                .payload_buffer_observer()
+                .unwrap()
+                .snapshot()
+                .unwrap()
+                .used_bytes,
+            256
         );
         assert_eq!(counters, runtime.call_execution_snapshot().unwrap());
         assert!(observer.same_domain(&runtime.clone().call_execution_observer()));
@@ -2909,6 +2915,7 @@ mod tests {
         let weak_session = Arc::downgrade(&runtime.state);
         let observer = runtime.call_execution_observer();
         let context = runtime.call_execution_context().unwrap();
+        let payload_observer = runtime.payload_buffer_observer().unwrap();
         let input = context
             .prepare(
                 CallOptions::with_timeout(CallTimeout::After(Duration::from_secs(10))),
@@ -2948,10 +2955,8 @@ mod tests {
         assert!(observation.closed);
         let counters = observation.counters.unwrap();
         assert!(counters.closed);
-        assert_eq!(
-            (counters.used_operations, counters.used_retained_bytes),
-            (0, 32)
-        );
+        assert_eq!(counters.used_operations, 0);
+        assert_eq!(payload_observer.snapshot().unwrap().used_bytes, 32);
         assert!(observer.is_live());
         drop(input);
         let until = Instant::now() + Duration::from_secs(10);
@@ -2963,10 +2968,8 @@ mod tests {
             std::thread::yield_now();
         }
         let counters = observer.snapshot().counters.unwrap();
-        assert_eq!(
-            (counters.used_operations, counters.used_retained_bytes),
-            (0, 0)
-        );
+        assert_eq!(counters.used_operations, 0);
+        assert_eq!(payload_observer.snapshot().unwrap().used_bytes, 0);
         assert!(counters.closed);
     }
 
@@ -3062,7 +3065,12 @@ mod tests {
         assert_eq!(accepted.payload_buffer_budget_bytes, None);
         assert_eq!(observer.snapshot().counters.unwrap().max_operations, 8);
         assert_eq!(
-            observer.snapshot().counters.unwrap().used_retained_bytes,
+            runtime
+                .payload_buffer_observer()
+                .unwrap()
+                .snapshot()
+                .unwrap()
+                .used_bytes,
             32
         );
         assert!(
@@ -3392,14 +3400,13 @@ mod tests {
             )
             .unwrap();
         let snapshot = runtime.call_execution_snapshot().unwrap();
-        assert_eq!(
-            (snapshot.max_operations, snapshot.max_retained_bytes),
-            (3, 17)
-        );
-        assert_eq!(
-            (snapshot.used_operations, snapshot.used_retained_bytes),
-            (0, 0)
-        );
+        assert_eq!(snapshot.max_operations, 3);
+        let payload = runtime
+            .resolve_call_execution_context(false)
+            .unwrap()
+            .payload_snapshot();
+        assert_eq!((payload.limit_bytes, payload.used_bytes), (17, 0));
+        assert_eq!(snapshot.used_operations, 0);
         // Observation did not freeze: a later typed override wins.
         runtime
             .set_call_execution_limits_with_sources(
@@ -3434,7 +3441,12 @@ mod tests {
             .unwrap();
         call.charge_input(32).unwrap();
         assert_eq!(
-            clone.call_execution_snapshot().unwrap().used_retained_bytes,
+            clone
+                .payload_buffer_observer()
+                .unwrap()
+                .snapshot()
+                .unwrap()
+                .used_bytes,
             32
         );
         clone
@@ -3498,9 +3510,15 @@ mod tests {
         assert!(retirement_completed, "{retirement_outcome:?}");
         let snapshot = runtime.call_execution_snapshot().unwrap();
         assert!(snapshot.closed);
+        assert_eq!(snapshot.used_operations, 1);
         assert_eq!(
-            (snapshot.used_operations, snapshot.used_retained_bytes),
-            (1, 32)
+            runtime
+                .payload_buffer_observer()
+                .unwrap()
+                .snapshot()
+                .unwrap()
+                .used_bytes,
+            32
         );
         assert_eq!(observer.snapshot().counters, Some(snapshot));
         assert!(observer.is_live());
@@ -3522,17 +3540,21 @@ mod tests {
         drop(unlimited);
         assert_eq!(
             runtime
-                .call_execution_snapshot()
+                .payload_buffer_observer()
                 .unwrap()
-                .used_retained_bytes,
+                .snapshot()
+                .unwrap()
+                .used_bytes,
             32
         );
         drop(call);
         assert_eq!(
             runtime
-                .call_execution_snapshot()
+                .payload_buffer_observer()
                 .unwrap()
-                .used_retained_bytes,
+                .snapshot()
+                .unwrap()
+                .used_bytes,
             0
         );
         assert!(!observer.is_live());

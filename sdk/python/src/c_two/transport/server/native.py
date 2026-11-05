@@ -356,7 +356,7 @@ class NativeServerBridge:
     def start(self) -> None:
         self._runtime_session.ensure_host_started()
 
-    def shutdown(self, *, timeout: float = 5.0) -> ShutdownOutcome:
+    def shutdown(self, *, timeout: float = 30.0) -> ShutdownOutcome:
         outcome = dict(self._runtime_session.shutdown(
             timeout_seconds=float(timeout),
         ))
@@ -470,12 +470,15 @@ class NativeServerBridge:
             def release_fn():
                 nonlocal released
                 if not released:
-                    released = True
                     mv.release()
-                    try:
-                        request_buf.release()
-                    except Exception:
-                        pass
+                    request_buf.release()
+                    released = True
+
+            if getattr(method, '__cc_stream__', False):
+                if buffer_mode == 'borrowed' and local_copy_tracker is not None:
+                    request_buf.track_retained(local_copy_tracker, route_name,
+                                               method_name, 'resource_input')
+                return method(mv, _release_fn=release_fn, _c2_input_buffer_mode=buffer_mode)
 
             if buffer_mode == 'view':
                 # Pass memoryview; _release_fn releases the input buffer after deserialize.

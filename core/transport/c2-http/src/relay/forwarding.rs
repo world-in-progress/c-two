@@ -197,7 +197,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(domain.snapshot().used_operations, 0);
-        assert_eq!(domain.snapshot().used_retained_bytes, 0);
+        assert_eq!(domain.payload_budget().snapshot().used_bytes, 0);
     }
 
     #[tokio::test]

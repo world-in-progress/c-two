@@ -70,7 +70,7 @@ use crate::dispatcher::{
 use crate::response::try_prepare_shm_response;
 use crate::scheduler::{
     RouteAdmissionState, Scheduler, SchedulerAcquireError, SchedulerLimits, SchedulerPendingPermit,
-    SchedulerSnapshot,
+    SchedulerSnapshot, StreamCancelCause,
 };
 use crate::writer::ConnectionWriter;
 
@@ -769,6 +769,41 @@ impl Server {
         ))
     }
 
+    /// Build a language-local stream route from modes already validated by
+    /// its nonportable service definition. Portable routes use the descriptor
+    /// checking entry point above.
+    #[doc(hidden)]
+    pub fn build_nonportable_stream_route(
+        &self,
+        spec: RouteBuildSpec,
+        callback: Arc<dyn CrmStreamCallback>,
+        method_modes: &[c2_contract::MethodMode],
+    ) -> Result<BuiltRoute, ServerError> {
+        if method_modes.len() != spec.method_names.len()
+            || !method_modes
+                .iter()
+                .any(|mode| *mode == c2_contract::MethodMode::ServerStream)
+        {
+            return Err(ServerError::Protocol(
+                "nonportable stream modes must cover the route and include a stream".into(),
+            ));
+        }
+        let modes = method_modes
+            .iter()
+            .map(|mode| match mode {
+                c2_contract::MethodMode::Unary => CallMode::Unary,
+                c2_contract::MethodMode::ServerStream => CallMode::ServerStream,
+            })
+            .collect();
+        let scheduler = Scheduler::with_admission(
+            spec.concurrency_mode,
+            spec.access_map.clone(),
+            spec.limits,
+            Arc::clone(&self.admission),
+        );
+        BuiltRoute::new(CrmRoute::new_stream(spec, scheduler, callback, modes))
+    }
+
     pub async fn reserve_route(
         &self,
         route: BuiltRoute,
@@ -1014,7 +1049,9 @@ impl Server {
             let route = dispatcher.resolve(name);
             if let Some(route) = &route {
                 self.cancel_route_streams(Some(&route.route_uid), StreamCancelCause::Unregister);
-                route.scheduler.close();
+                route
+                    .scheduler
+                    .close_and_cancel_local_streams(StreamCancelCause::Unregister);
             }
             route
         };
@@ -1051,7 +1088,9 @@ impl Server {
                 .filter_map(|name| dispatcher.resolve(name))
                 .inspect(|route| {
                     self.cancel_route_streams(Some(&route.route_uid), StreamCancelCause::Shutdown);
-                    route.scheduler.close();
+                    route
+                        .scheduler
+                        .close_and_cancel_local_streams(StreamCancelCause::Shutdown);
                 })
                 .collect::<Vec<_>>()
         };
@@ -1729,16 +1768,21 @@ impl Server {
     }
 
     fn request_shutdown_signal(&self) {
+        // The publication boundary and admission lock exclude a new local
+        // stream between cancellation and the host drain transition.
+        let publication = self.dispatcher.write();
         let mut registration = self.admission.lock();
+        for route in publication.routes_snapshot() {
+            route
+                .scheduler
+                .cancel_local_streams(StreamCancelCause::Shutdown);
+        }
         registration.begin_drain();
         self.admission.notify.notify_waiters();
         drop(registration);
-        // Stream publication holds the read side of this same boundary. A
-        // cancellation cannot miss an admitted stream or enter its resource.
-        {
-            let _publication = self.dispatcher.write();
-            self.cancel_route_streams(None, StreamCancelCause::Shutdown);
-        }
+        // IPC stream publication holds the read side of this same boundary.
+        self.cancel_route_streams(None, StreamCancelCause::Shutdown);
+        drop(publication);
         match self.lifecycle_state() {
             ServerLifecycleState::Starting | ServerLifecycleState::Ready => {
                 self.set_lifecycle_state(ServerLifecycleState::Stopping);
@@ -2774,23 +2818,6 @@ pub(crate) struct ServerCall {
     admission: CallMutex<Option<ChunkRouteAdmission>>,
     start_gate: CallMutex<()>,
     stream: CallMutex<Option<StreamCallControl>>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum StreamCancelCause {
-    Consumer,
-    Shutdown,
-    Unregister,
-}
-
-impl StreamCancelCause {
-    fn message(self) -> &'static str {
-        match self {
-            Self::Consumer => "server stream cancelled by consumer",
-            Self::Shutdown => "server stream cancelled by Runtime shutdown",
-            Self::Unregister => "server stream cancelled by route unregister",
-        }
-    }
 }
 
 struct StreamCallControl {

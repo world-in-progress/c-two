@@ -413,17 +413,13 @@ impl Deref for BudgetedBuffer {
     }
 }
 
-/// Read-only call-domain counters. The retained-byte field names are the
-/// established call-execution observation shape; they now describe all B
-/// storage in the Runtime or relay, including HTTP buffers.
+/// Read-only call operation-slot counters. Payload storage is observed through
+/// the separate payload buffer budget.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RetentionSnapshot {
     pub max_operations: u64,
-    pub max_retained_bytes: u64,
     pub used_operations: u64,
-    pub used_retained_bytes: u64,
     pub peak_operations: u64,
-    pub peak_retained_bytes: u64,
     pub rejected_reservations: u64,
     pub closed: bool,
 }
@@ -526,14 +522,9 @@ impl RetentionBudget {
         let inner = locked(&self.shared);
         RetentionSnapshot {
             max_operations: inner.max_operations,
-            max_retained_bytes: inner.limit_bytes,
             used_operations: inner.used_operations,
-            used_retained_bytes: inner.used_bytes,
             peak_operations: inner.peak_operations,
-            peak_retained_bytes: inner.peak_bytes,
-            rejected_reservations: inner
-                .rejected_operations
-                .saturating_add(inner.rejected_allocations),
+            rejected_reservations: inner.rejected_operations,
             closed: inner.operations_closed,
         }
     }
@@ -681,10 +672,10 @@ mod tests {
         drop(bytes);
         let later = budget.payload_budget().reserve_blocking(8, None).unwrap();
         assert_eq!(budget.snapshot().used_operations, 1);
-        assert_eq!(budget.snapshot().used_retained_bytes, 8);
+        assert_eq!(budget.payload_budget().snapshot().used_bytes, 8);
         drop((first, later));
         assert_eq!(budget.snapshot().used_operations, 0);
-        assert_eq!(budget.snapshot().used_retained_bytes, 0);
+        assert_eq!(budget.payload_budget().snapshot().used_bytes, 0);
     }
 
     #[test]
@@ -714,12 +705,12 @@ mod tests {
         let slot = clone.reserve().unwrap();
         assert_eq!(budget.snapshot().used_operations, 1);
         let charge = budget.payload_budget().reserve_blocking(8, None).unwrap();
-        assert_eq!(clone.snapshot().used_retained_bytes, 8);
+        assert_eq!(clone.payload_budget().snapshot().used_bytes, 8);
         drop(budget);
         drop(slot);
         assert_eq!(clone.snapshot().used_operations, 0);
         drop(charge);
-        assert_eq!(clone.snapshot().used_retained_bytes, 0);
+        assert_eq!(clone.payload_budget().snapshot().used_bytes, 0);
     }
 
     #[test]
@@ -754,6 +745,30 @@ mod tests {
         assert_eq!(budget.snapshot().rejected_allocations, 1);
         drop(held);
         assert_eq!(budget.snapshot().used_bytes, 0);
+    }
+
+    #[test]
+    fn call_rejections_exclude_payload_buffer_rejections() {
+        let budget = RetentionBudget::new(1, 4);
+        let slot = budget.reserve().unwrap();
+        let payload = budget.payload_budget();
+        assert!(matches!(
+            payload.try_reserve(5),
+            Err(PayloadBufferError::TooLarge { .. })
+        ));
+        assert_eq!(payload.snapshot().rejected_allocations, 1);
+        assert_eq!(budget.snapshot().rejected_reservations, 0);
+        assert_eq!(
+            budget.reserve().unwrap_err().reason,
+            RetentionRejectReason::OperationsExhausted
+        );
+        budget.close();
+        assert_eq!(
+            budget.reserve().unwrap_err().reason,
+            RetentionRejectReason::Closed
+        );
+        assert_eq!(budget.snapshot().rejected_reservations, 2);
+        drop(slot);
     }
 
     #[test]
@@ -822,12 +837,13 @@ mod tests {
         };
         let budget = RetentionBudget::from_call_limits(&limits);
         let before = budget.snapshot();
-        assert_eq!((before.max_operations, before.max_retained_bytes), (3, 7));
+        assert_eq!(before.max_operations, 3);
+        assert_eq!(budget.payload_budget().snapshot().limit_bytes, 7);
         assert_eq!(budget.snapshot(), before);
         let reservation = budget.payload_budget().reserve_blocking(7, None).unwrap();
-        assert_eq!(budget.snapshot().used_retained_bytes, 7);
+        assert_eq!(budget.payload_budget().snapshot().used_bytes, 7);
         drop(reservation);
-        assert_eq!(budget.snapshot().used_retained_bytes, 0);
+        assert_eq!(budget.payload_budget().snapshot().used_bytes, 0);
     }
 
     #[test]

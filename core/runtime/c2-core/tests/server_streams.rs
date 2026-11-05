@@ -8,7 +8,7 @@ use c2_contract::{ContractRelease, MethodAccess};
 use c2_core::{
     CallExecutionLimitsOverrides, CallOptions, CallTimeout, Client, Connect, CoreResponseStream,
     EncodedClient, EncodedService, EncodedStream, EncodedStreamItem, EncodedStreamService, Error,
-    Host, HostOptions, MethodDefinition, Registration, Runtime, RuntimeOptions,
+    Host, HostOptions, LocalObjectStream, MethodDefinition, Registration, Runtime, RuntimeOptions,
     RuntimeShutdownTarget, ServiceConcurrencyMode, ServiceDefinition,
 };
 use c2_error::{C2Error, ErrorCode};
@@ -20,6 +20,319 @@ const DESCRIPTOR: &[u8] =
 
 fn unique(prefix: &str) -> String {
     format!("{prefix}-{}", uuid::Uuid::new_v4().simple())
+}
+
+struct LocalObjects {
+    values: Vec<Arc<Vec<u8>>>,
+    cursor: usize,
+    steps: mpsc::Sender<usize>,
+    finished: mpsc::Sender<()>,
+    step_gate: Option<Arc<Gate>>,
+    finish_gate: Option<Arc<Gate>>,
+}
+
+impl LocalObjectStream<Arc<Vec<u8>>> for LocalObjects {
+    fn step(&mut self) -> Result<Option<Arc<Vec<u8>>>, C2Error> {
+        self.steps.send(self.cursor).unwrap();
+        if let Some(gate) = self.step_gate.take() {
+            gate.wait();
+        }
+        let item = self.values.get(self.cursor).cloned();
+        self.cursor += 1;
+        Ok(item)
+    }
+
+    fn finish(self: Box<Self>) -> Result<(), C2Error> {
+        self.finished.send(()).unwrap();
+        if let Some(gate) = self.finish_gate.as_ref() {
+            gate.wait();
+        }
+        Ok(())
+    }
+}
+
+#[test]
+fn local_object_stream_preserves_identity_and_releases_per_step_permit() {
+    let fixture = Fixture::new(false, 1, ServiceConcurrencyMode::ReadParallel, None, None);
+    let route = fixture.registration.as_ref().unwrap().route_concurrency();
+    let values = vec![Arc::new(vec![1]), Arc::new(vec![2]), Arc::new(vec![3])];
+    let (steps_tx, steps_rx) = mpsc::channel();
+    let (finished_tx, finished_rx) = mpsc::channel();
+    let factory_values = values.clone();
+    let stream = route
+        .open_local_stream(1, move || {
+            Ok(Box::new(LocalObjects {
+                values: factory_values,
+                cursor: 0,
+                steps: steps_tx,
+                finished: finished_tx,
+                step_gate: None,
+                finish_gate: None,
+            }))
+        })
+        .unwrap();
+
+    assert_eq!(steps_rx.recv_timeout(WAIT).unwrap(), 0);
+    assert_eq!(steps_rx.recv_timeout(WAIT).unwrap(), 1);
+    observe_until(|| route.snapshot().active_workers == 0);
+    assert!(
+        steps_rx.try_recv().is_err(),
+        "one queued item grants only one further step"
+    );
+    assert!(Arc::ptr_eq(
+        &stream.next_item().unwrap().unwrap(),
+        &values[0]
+    ));
+    assert_eq!(steps_rx.recv_timeout(WAIT).unwrap(), 2);
+    let snapshot = route.snapshot();
+    assert_eq!(snapshot.pending, 1, "original call slot remains");
+    assert_eq!(snapshot.active_workers, 0, "yield releases route permit");
+    let mut unary = route.blocking_acquire(0).unwrap();
+    unary.commit().unwrap();
+    drop(unary);
+
+    assert!(Arc::ptr_eq(
+        &stream.next_item().unwrap().unwrap(),
+        &values[1]
+    ));
+    assert!(Arc::ptr_eq(
+        &stream.next_item().unwrap().unwrap(),
+        &values[2]
+    ));
+    assert!(stream.next_item().unwrap().is_none());
+    assert_eq!(steps_rx.recv_timeout(WAIT).unwrap(), 3);
+    finished_rx.recv_timeout(WAIT).unwrap();
+    let receipt = stream.close();
+    assert!(receipt.completed);
+    assert!(receipt.terminal.unwrap().is_ok());
+    assert_eq!(receipt.complete_items, Some(3));
+    assert_eq!(route.snapshot().pending, 0);
+}
+
+#[test]
+fn local_callback_panics_keep_a_truthful_terminal_and_run_cleanup() {
+    struct Panics {
+        phase: u8,
+        emitted: bool,
+        finished: Arc<AtomicUsize>,
+    }
+    impl LocalObjectStream<u8> for Panics {
+        fn step(&mut self) -> Result<Option<u8>, C2Error> {
+            assert_ne!(self.phase, 1, "step panic");
+            Ok((!std::mem::replace(&mut self.emitted, true)).then_some(7))
+        }
+        fn finish(self: Box<Self>) -> Result<(), C2Error> {
+            self.finished.fetch_add(1, Ordering::SeqCst);
+            assert_ne!(self.phase, 2, "finish panic");
+            Ok(())
+        }
+    }
+    for phase in 0..3 {
+        let fixture = Fixture::new(false, 1, ServiceConcurrencyMode::ReadParallel, None, None);
+        let route = fixture.registration.as_ref().unwrap().route_concurrency();
+        let finished = Arc::new(AtomicUsize::new(0));
+        let finish_count = finished.clone();
+        let stream = route
+            .open_local_stream(1, move || {
+                assert_ne!(phase, 0, "factory panic");
+                Ok(Box::new(Panics {
+                    phase,
+                    emitted: false,
+                    finished: finish_count,
+                }))
+            })
+            .unwrap();
+        if phase == 2 {
+            assert_eq!(stream.next_item().unwrap(), Some(7));
+        }
+        assert_semantic(
+            stream.next_item().expect_err("resource panic"),
+            ErrorCode::ResourceFunctionExecuting,
+            "panicked",
+        );
+        let receipt = stream.close();
+        assert!(receipt.completed);
+        assert_eq!(receipt.complete_items, Some(u64::from(phase == 2)));
+        assert_semantic(
+            receipt
+                .terminal
+                .unwrap()
+                .expect_err("original error retained"),
+            ErrorCode::ResourceFunctionExecuting,
+            "panicked",
+        );
+        assert_eq!(finished.load(Ordering::SeqCst), usize::from(phase != 0));
+        assert_eq!(route.snapshot().pending, 0);
+    }
+}
+
+#[test]
+fn local_close_is_nonwaiting_and_receipt_tracks_blocked_cleanup() {
+    let fixture = Fixture::new(false, 1, ServiceConcurrencyMode::ReadParallel, None, None);
+    let route = fixture.registration.as_ref().unwrap().route_concurrency();
+    let (steps_tx, steps_rx) = mpsc::channel();
+    let (finished_tx, finished_rx) = mpsc::channel();
+    let finish_gate = Arc::new(Gate::default());
+    let gate = finish_gate.clone();
+    let stream = route
+        .open_local_stream(1, move || {
+            Ok(Box::new(LocalObjects {
+                values: vec![Arc::new(vec![1]), Arc::new(vec![2]), Arc::new(vec![3])],
+                cursor: 0,
+                steps: steps_tx,
+                finished: finished_tx,
+                step_gate: None,
+                finish_gate: Some(gate),
+            }))
+        })
+        .unwrap();
+    assert_eq!(steps_rx.recv_timeout(WAIT).unwrap(), 0);
+    assert!(stream.next_item().unwrap().is_some());
+    let pending = stream.close_with_timeout(Some(Duration::ZERO));
+    assert!(!pending.completed);
+    finished_rx.recv_timeout(WAIT).unwrap();
+    assert_eq!(route.snapshot().pending, 1);
+    finish_gate.release();
+    let receipt = stream.close_with_timeout(None);
+    assert!(receipt.completed);
+    assert!(matches!(receipt.complete_items, Some(1 | 2)));
+    assert_semantic(
+        receipt
+            .terminal
+            .unwrap()
+            .expect_err("consumer cancellation"),
+        ErrorCode::CallCancelled,
+        "consumer",
+    );
+}
+
+#[test]
+fn local_cleanup_error_replaces_cancelled_terminal() {
+    struct BadFinish(bool);
+    impl LocalObjectStream<u8> for BadFinish {
+        fn step(&mut self) -> Result<Option<u8>, C2Error> {
+            if std::mem::replace(&mut self.0, false) {
+                Ok(Some(4))
+            } else {
+                Ok(None)
+            }
+        }
+
+        fn finish(self: Box<Self>) -> Result<(), C2Error> {
+            Err(C2Error::new(
+                ErrorCode::ResourceFunctionExecuting,
+                "local generator cleanup failed",
+            ))
+        }
+    }
+
+    let fixture = Fixture::new(false, 1, ServiceConcurrencyMode::ReadParallel, None, None);
+    let route = fixture.registration.as_ref().unwrap().route_concurrency();
+    let stream = route
+        .open_local_stream(1, || Ok(Box::new(BadFinish(true))))
+        .unwrap();
+    assert_eq!(stream.next_item().unwrap(), Some(4));
+    let receipt = stream.close();
+    assert_eq!(receipt.complete_items, Some(1));
+    assert_semantic(
+        receipt.terminal.unwrap().expect_err("cleanup error wins"),
+        ErrorCode::ResourceFunctionExecuting,
+        "cleanup failed",
+    );
+}
+
+#[test]
+fn local_unregistration_delivers_running_item_before_cancelled_terminal() {
+    let mut fixture = Fixture::new(false, 1, ServiceConcurrencyMode::ReadParallel, None, None);
+    let route = fixture.registration.as_ref().unwrap().route_concurrency();
+    let (steps_tx, steps_rx) = mpsc::channel();
+    let (finished_tx, finished_rx) = mpsc::channel();
+    let step_gate = Arc::new(Gate::default());
+    let gate = step_gate.clone();
+    let value = Arc::new(vec![7]);
+    let expected = value.clone();
+    let stream = route
+        .open_local_stream(1, move || {
+            Ok(Box::new(LocalObjects {
+                values: vec![value],
+                cursor: 0,
+                steps: steps_tx,
+                finished: finished_tx,
+                step_gate: Some(gate),
+                finish_gate: None,
+            }))
+        })
+        .unwrap();
+    assert_eq!(steps_rx.recv_timeout(WAIT).unwrap(), 0);
+    let mut registration = fixture.registration.take().unwrap();
+    let close = std::thread::spawn(move || registration.close().unwrap());
+    observe_until(|| route.snapshot().closed);
+    step_gate.release();
+
+    assert!(Arc::ptr_eq(
+        &stream.next_item().unwrap().unwrap(),
+        &expected
+    ));
+    assert_semantic(
+        stream.next_item().expect_err("unregistration ends stream"),
+        ErrorCode::CallCancelled,
+        "unregister",
+    );
+    finished_rx.recv_timeout(WAIT).unwrap();
+    assert!(close.join().unwrap().local_removed);
+    let receipt = stream.close();
+    assert_eq!(receipt.complete_items, Some(1));
+    assert_semantic(
+        receipt
+            .terminal
+            .unwrap()
+            .expect_err("unregistration terminal"),
+        ErrorCode::CallCancelled,
+        "unregister",
+    );
+}
+
+#[test]
+fn local_shutdown_delivers_running_item_then_drains_original_call_slot() {
+    let fixture = Fixture::new(false, 1, ServiceConcurrencyMode::ReadParallel, None, None);
+    let route = fixture.registration.as_ref().unwrap().route_concurrency();
+    let (steps_tx, steps_rx) = mpsc::channel();
+    let (finished_tx, finished_rx) = mpsc::channel();
+    let step_gate = Arc::new(Gate::default());
+    let gate = step_gate.clone();
+    let stream = route
+        .open_local_stream(1, move || {
+            Ok(Box::new(LocalObjects {
+                values: vec![Arc::new(vec![9])],
+                cursor: 0,
+                steps: steps_tx,
+                finished: finished_tx,
+                step_gate: Some(gate),
+                finish_gate: None,
+            }))
+        })
+        .unwrap();
+    assert_eq!(steps_rx.recv_timeout(WAIT).unwrap(), 0);
+    let receipt = fixture
+        .server
+        .begin_session_retirement(
+            RuntimeShutdownTarget::Host(&fixture.host),
+            Instant::now() + WAIT,
+        )
+        .unwrap();
+    observe_until(|| route.snapshot().closed);
+    step_gate.release();
+    assert_eq!(stream.next_item().unwrap().unwrap().as_slice(), &[9]);
+    assert_semantic(
+        stream.next_item().expect_err("shutdown ends stream"),
+        ErrorCode::CallCancelled,
+        "shutdown",
+    );
+    finished_rx.recv_timeout(WAIT).unwrap();
+    let (outcome, completed) = receipt.observe_until(Instant::now() + WAIT);
+    assert!(completed, "{outcome:?}");
+    assert!(outcome.runtime_barrier_error.is_none(), "{outcome:?}");
+    assert_eq!(route.snapshot().pending, 0);
 }
 
 fn observe_until(mut condition: impl FnMut() -> bool) {

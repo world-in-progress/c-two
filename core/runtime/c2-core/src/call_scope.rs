@@ -1103,11 +1103,11 @@ mod tests {
             drop(guard);
             assert_eq!(releases.load(Ordering::SeqCst), 0);
             assert_eq!(budget.snapshot().used_operations, 1);
-            assert_eq!(budget.snapshot().used_retained_bytes, 64);
+            assert_eq!(budget.payload_budget().snapshot().used_bytes, 64);
             drop(owner); // Only the true continuation owner releases its payload/charge.
             assert_eq!(releases.load(Ordering::SeqCst), 1);
             assert_eq!(budget.snapshot().used_operations, 0);
-            assert_eq!(budget.snapshot().used_retained_bytes, 0);
+            assert_eq!(budget.payload_budget().snapshot().used_bytes, 0);
         }
     }
 
@@ -1130,10 +1130,10 @@ mod tests {
         );
         drop(scope);
         assert_eq!(releases.load(Ordering::SeqCst), 0);
-        assert_eq!(budget.snapshot().used_retained_bytes, 64);
+        assert_eq!(budget.payload_budget().snapshot().used_bytes, 64);
         drop(owner);
         assert_eq!(releases.load(Ordering::SeqCst), 1);
-        assert_eq!(budget.snapshot().used_retained_bytes, 0);
+        assert_eq!(budget.payload_budget().snapshot().used_bytes, 0);
     }
 
     #[test]

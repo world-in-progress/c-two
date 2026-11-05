@@ -11,7 +11,7 @@ use pyo3::types::{PyAny, PyDict, PyList};
 
 use c2_contract::{
     ContractError, ContractRelease, ContractReleaseRef, ExpectedRouteContract, MethodAccess,
-    PORTABLE_CONTRACT_SCHEMA, contract_descriptor_sha256_hex,
+    MethodMode, PORTABLE_CONTRACT_SCHEMA, contract_descriptor_sha256_hex,
 };
 use c2_core::memory::{LocalCopyStats, LocalCopyTracker};
 use c2_core::{
@@ -492,7 +492,7 @@ impl PyRuntimeSession {
             }
         };
         py.detach(|| self.inner.connect_with_attempt(expected, mode, &attempt))
-            .map(PyCoreClient::new)
+            .map(|client| PyCoreClient::new(client, self.local_copy_tracker()))
             .map_err(core_error_to_py)
     }
 }
@@ -698,8 +698,8 @@ impl PyRuntimeSession {
         Ok(dict)
     }
 
-    /// Actual Core-owned finite input charges, including unfinished native
-    /// continuations after a Python caller times out or a session is replaced.
+    /// Operation slots, including every stream and finite calls that continue
+    /// after caller expiry or session replacement; byte statistics are separate.
     fn call_execution_snapshot<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
         let snapshot = self
             .inner
@@ -719,11 +719,8 @@ impl PyRuntimeSession {
                 None => {
                     let report = PyDict::new(py);
                     report.set_item("max_operations", py.None())?;
-                    report.set_item("max_retained_bytes", py.None())?;
                     report.set_item("used_operations", 0)?;
-                    report.set_item("used_retained_bytes", 0)?;
                     report.set_item("peak_operations", 0)?;
-                    report.set_item("peak_retained_bytes", 0)?;
                     report.set_item("rejected_reservations", 0)?;
                     report.set_item("closed", observation.closed)?;
                     report
@@ -1143,8 +1140,7 @@ impl PyRuntimeSession {
         let methods = method_definitions(&method_names, access_map)?;
         let expected =
             expected_route_contract(name, crm_ns, crm_name, crm_ver, abi_hash, signature_hash)?;
-        let service: Arc<dyn c2_core::EncodedService> =
-            Arc::new(PyCoreService::new(name.to_string(), dispatcher));
+        let service = Arc::new(PyCoreService::new(name.to_string(), dispatcher));
         let definition = service_definition(descriptor_json, expected, methods, service)?
             .with_concurrency(
                 parse_concurrency_mode(concurrency_mode)?,
@@ -1502,7 +1498,7 @@ fn service_definition(
     descriptor_json: &[u8],
     expected: ExpectedRouteContract,
     methods: Vec<MethodDefinition>,
-    service: Arc<dyn c2_core::EncodedService>,
+    service: Arc<PyCoreService>,
 ) -> PyResult<ServiceDefinition> {
     let descriptor: serde_json::Value = serde_json::from_slice(descriptor_json)
         .map_err(|error| PyValueError::new_err(format!("invalid contract descriptor: {error}")))?;
@@ -1525,6 +1521,21 @@ fn service_definition(
                 }
                 .into(),
             ));
+        }
+        if release
+            .descriptor()
+            .methods()
+            .iter()
+            .any(|method| method.mode() == MethodMode::ServerStream)
+        {
+            return ServiceDefinition::new_stream(
+                &release,
+                release.reference(),
+                expected.route_name,
+                methods,
+                service,
+            )
+            .map_err(core_error_to_py);
         }
         return ServiceDefinition::new(
             &release,
@@ -1551,8 +1562,40 @@ fn service_definition(
     .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
     let release_ref = ContractReleaseRef::from_json(&release_ref_json)
         .map_err(|error| core_error_to_py(c2_core::Error::from(error)))?;
-    ServiceDefinition::new_nonportable(release_ref, expected, methods, service)
-        .map_err(core_error_to_py)
+    let descriptor_methods = descriptor
+        .get("methods")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| PyValueError::new_err("Python descriptor is missing methods"))?;
+    if descriptor_methods.len() != methods.len() {
+        return Err(PyValueError::new_err(
+            "Python descriptor method count differs from route",
+        ));
+    }
+    let modes = descriptor_methods
+        .iter()
+        .zip(&methods)
+        .map(|(value, method)| {
+            if value.get("name").and_then(serde_json::Value::as_str) != Some(method.name.as_str()) {
+                return Err(PyValueError::new_err(
+                    "Python descriptor method differs from route",
+                ));
+            }
+            match value.get("mode") {
+                None => Ok(MethodMode::Unary),
+                Some(value) if value.as_str() == Some("server_stream") => {
+                    Ok(MethodMode::ServerStream)
+                }
+                _ => Err(PyValueError::new_err("unsupported Python method mode")),
+            }
+        })
+        .collect::<PyResult<Vec<_>>>()?;
+    if modes.contains(&MethodMode::ServerStream) {
+        ServiceDefinition::new_nonportable_stream(release_ref, expected, methods, modes, service)
+            .map_err(core_error_to_py)
+    } else {
+        ServiceDefinition::new_nonportable(release_ref, expected, methods, service)
+            .map_err(core_error_to_py)
+    }
 }
 
 fn expected_route_contract(
@@ -1596,11 +1639,8 @@ fn call_execution_snapshot_dict<'py>(
 ) -> PyResult<Bound<'py, PyDict>> {
     let dict = PyDict::new(py);
     dict.set_item("max_operations", snapshot.max_operations)?;
-    dict.set_item("max_retained_bytes", snapshot.max_retained_bytes)?;
     dict.set_item("used_operations", snapshot.used_operations)?;
-    dict.set_item("used_retained_bytes", snapshot.used_retained_bytes)?;
     dict.set_item("peak_operations", snapshot.peak_operations)?;
-    dict.set_item("peak_retained_bytes", snapshot.peak_retained_bytes)?;
     dict.set_item("rejected_reservations", snapshot.rejected_reservations)?;
     dict.set_item("closed", snapshot.closed)?;
     Ok(dict)

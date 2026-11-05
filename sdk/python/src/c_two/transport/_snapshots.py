@@ -36,11 +36,8 @@ class ShutdownOutcome(TypedDict):
 
 class CallExecutionCounters(TypedDict):
     max_operations: int | None
-    max_retained_bytes: int | None
     used_operations: int
-    used_retained_bytes: int
     peak_operations: int
-    peak_retained_bytes: int
     rejected_reservations: int
     closed: bool
 

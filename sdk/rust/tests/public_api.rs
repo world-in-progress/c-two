@@ -643,14 +643,8 @@ fn finite_call_configuration_is_consumed_through_the_sdk_facade() {
         )
         .unwrap();
     let snapshot: CallExecutionSnapshot = runtime.call_execution_snapshot().unwrap();
-    assert_eq!(
-        (snapshot.max_operations, snapshot.max_retained_bytes),
-        (3, 17)
-    );
-    assert_eq!(
-        (snapshot.used_operations, snapshot.used_retained_bytes),
-        (0, 0)
-    );
+    assert_eq!(snapshot.max_operations, 3);
+    assert_eq!(snapshot.used_operations, 0);
     // Observation leaves configuration mutable; the Runtime clone sees the same policy.
     let limits = CallExecutionLimits::zeroed();
     runtime
@@ -971,13 +965,7 @@ fn sdk_preparation_charges_before_copy_and_keeps_the_original_serialization_dead
         runtime.call_execution_snapshot().unwrap().used_operations,
         0
     );
-    assert_eq!(
-        runtime
-            .call_execution_snapshot()
-            .unwrap()
-            .used_retained_bytes,
-        0
-    );
+    assert_eq!(runtime.payload_buffer_stats().unwrap().used_bytes, 0);
     assert_eq!(calls.load(Ordering::SeqCst), 0);
     assert_eq!(
         runtime.set_call_execution_limits_with_sources(

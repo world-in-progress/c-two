@@ -22,7 +22,7 @@ pub(crate) fn render_target_artifacts(
     methods: &[TargetMethod<'_>],
 ) -> Result<Vec<ContractArtifact>, CodegenError> {
     if let Some(method) = methods.iter().find(|method| {
-        method.mode == MethodMode::ServerStream && target != ContractCodegenTarget::Rust
+        method.mode == MethodMode::ServerStream && target == ContractCodegenTarget::TypeScript
     }) {
         return Err(CodegenError::UnsupportedServerStream {
             target,
@@ -768,6 +768,9 @@ fn render_rust_payload_adapters(output: &mut String, method: &TargetMethod<'_>) 
 }
 
 fn render_python(descriptor: &ValidatedContractDescriptor, methods: &[TargetMethod<'_>]) -> String {
+    let has_stream = methods
+        .iter()
+        .any(|method| method.mode == MethodMode::ServerStream);
     let mut output = String::from(
         "# generated-by: c-two.contract.codegen.v2\n\
          # payload-semantics-owner: fastdb-core\n\
@@ -780,6 +783,9 @@ fn render_python(descriptor: &ValidatedContractDescriptor, methods: &[TargetMeth
          from typing import Any, Protocol\n\n\
          from fastdb4py.payload import Payload\n\n",
     );
+    if has_stream {
+        output.push_str("from c_two import HeldResult, Stream\n\n");
+    }
     output.push_str(&format!(
         "CONTRACT_SCHEMA = {}\n\
          CRM_NAMESPACE = {}\n\
@@ -803,12 +809,27 @@ fn render_python(descriptor: &ValidatedContractDescriptor, methods: &[TargetMeth
          \x20   name: str\n\
          \x20   access: str\n\
          \x20   input_sha256: str | None\n\
-         \x20   output_sha256: str | None\n\n\
-         METHODS = (\n",
+         \x20   output_sha256: str | None\n",
     );
+    if has_stream {
+        output.push_str("    mode: str\n");
+    }
+    output.push_str("\nMETHODS = (\n");
     for method in methods {
+        let mode = if has_stream {
+            format!(
+                ", {}",
+                quoted(if method.mode == MethodMode::ServerStream {
+                    "server_stream"
+                } else {
+                    "unary"
+                })
+            )
+        } else {
+            String::new()
+        };
         output.push_str(&format!(
-            "    MethodBinding({}, {}, {}, {}, {}),\n",
+            "    MethodBinding({}, {}, {}, {}, {}{mode}),\n",
             method.index,
             quoted(method.name),
             quoted(access_name(method.access)),
@@ -854,9 +875,16 @@ fn render_python(descriptor: &ValidatedContractDescriptor, methods: &[TargetMeth
     {
         output.push('\n');
     }
+    output.push_str("class BoundClient(Protocol):\n    def call(self, method_name: str, data: bytes) -> Any: ...\n");
+    if has_stream {
+        output.push_str(
+            "    @property\n    def local_copy_tracker(self) -> Any: ...\n\
+             \x20   @property\n    def route_name(self) -> str: ...\n\
+             \x20   def begin_stream(self, method_name: str) -> Any: ...\n",
+        );
+    }
     output.push_str(
-        "class BoundClient(Protocol):\n\
-         \x20   def call(self, method_name: str, data: bytes) -> Any: ...\n\n\
+        "\n\
          def _copy_and_release_response(response: Any) -> bytes:\n\
          \x20   try:\n\
          \x20       data = bytes(response)\n\
@@ -895,6 +923,10 @@ fn render_python(descriptor: &ValidatedContractDescriptor, methods: &[TargetMeth
 }
 
 fn render_python_client_method(output: &mut String, method: &TargetMethod<'_>) {
+    if method.mode == MethodMode::ServerStream {
+        render_python_stream_client_method(output, method);
+        return;
+    }
     let symbol = method_symbol(method.index, method.name);
     let parameter = if method.input_sha256.is_some() {
         ", payload: Payload"
@@ -918,6 +950,55 @@ fn render_python_client_method(output: &mut String, method: &TargetMethod<'_>) {
          \x20       return decode_{symbol}_output(_copy_and_release_response(response))\n",
         quoted(method.name),
     ));
+}
+
+fn render_python_stream_client_method(output: &mut String, method: &TargetMethod<'_>) {
+    let symbol = method_symbol(method.index, method.name);
+    let parameter = if method.input_sha256.is_some() {
+        ", payload: Payload"
+    } else {
+        ""
+    };
+    let request = if method.input_sha256.is_some() {
+        format!("encode_{symbol}_input(payload)")
+    } else {
+        format!("encode_{symbol}_input()")
+    };
+    for held in [false, true] {
+        let name = if held {
+            format!("hold_{symbol}")
+        } else {
+            symbol.clone()
+        };
+        let return_type = if held {
+            "Stream[HeldResult[Payload]]"
+        } else {
+            "Stream[Payload]"
+        };
+        let charge = if method.input_sha256.is_some() {
+            "            prepared.charge_input(payload.execution_report().used_bytes)\n"
+        } else {
+            ""
+        };
+        let invalidator = if held {
+            ", invalidator=Payload.invalidate"
+        } else {
+            ""
+        };
+        let held_literal = if held { "True" } else { "False" };
+        let method_name = quoted(method.name);
+        output.push_str(&format!(
+            "\n    def {name}(self{parameter}) -> {return_type}:\n\
+             \x20       prepared = self._bound_client.begin_stream({method_name})\n\
+             \x20       try:\n\
+             {charge}\
+             \x20           request = {request}\n\
+             \x20           native = prepared.stream(request)\n\
+             \x20           return Stream._from_encoded(native, decode_{symbol}_output, held={held_literal}{invalidator}, tracker=self._bound_client.local_copy_tracker, route_name=self._bound_client.route_name, method_name={method_name})\n\
+             \x20       finally:\n\
+             \x20           prepared.close()\n",
+        ));
+    }
 }
 
 fn render_python_direction(
