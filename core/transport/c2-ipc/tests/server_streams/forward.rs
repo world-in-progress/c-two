@@ -735,6 +735,8 @@ async fn check_unpublished_forward_shm(unary: bool, cancel: bool) {
     assert_eq!(error.phase(), c2_ipc::TransportPhase::PreDispatch);
     assert_eq!(pool.read().stats().alloc_count, 0);
     assert_eq!(budget.snapshot().used_bytes, 0);
+    // The forwarding driver drops its send guard before reporting the
+    // pre-OPEN failure, so the pending record is already released here.
     assert_eq!(fixture.client.pending_len_for_test(), 0);
     fixture.unary().await;
     fixture.stop().await;
@@ -794,6 +796,8 @@ async fn forward_request_shm_checks_source_eof_and_declared_length_before_open()
             // SAFETY: this handle is used only to inspect allocation counts.
             let pool = unsafe { fixture.client.request_pool_for_test() }.unwrap();
             assert_eq!(pool.read().stats().alloc_count, 0);
+            // The driver drops its send guard before reporting the pre-OPEN
+            // length failure, so this holds by happens-before, not timing.
             assert_eq!(fixture.client.pending_len_for_test(), 0);
             assert_eq!(fixture.observed.opened.load(Ordering::SeqCst), 0);
             assert_eq!(budget.snapshot().used_bytes, 0);

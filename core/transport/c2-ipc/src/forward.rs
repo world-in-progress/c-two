@@ -850,8 +850,11 @@ impl IpcClient {
                     }
                 },
             };
-            let _ = opening_tx.send(opening);
+            // Release the pending record before reporting: a caller that
+            // observes the opening outcome must also observe the guard's
+            // cleanup of the unpublished draft.
             drop(send);
+            let _ = opening_tx.send(opening);
         });
         stream.opening = Some(opening_rx);
         Ok(stream)
@@ -920,8 +923,11 @@ impl IpcClient {
                     .map_err(|_| dispatch_uncertain_call_error(IpcError::Closed))
                     .and_then(|response| response.map_err(classified_call_error))
             };
-            let _ = result_tx.send(result);
+            // Release the pending record before reporting, mirroring the
+            // phased stream driver: the caller must observe the guard's
+            // cleanup together with the outcome it reports.
             drop(send);
+            let _ = result_tx.send(result);
         });
         result_rx
             .await
