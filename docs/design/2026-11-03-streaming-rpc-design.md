@@ -109,7 +109,7 @@ Runtime shutdown 与路由注销都向本路由开着的流的调用记录提交
 
 ### 3.8 relay、HTTP 及 Body 背压
 
-沿现有栈：请求体一次发完，响应体逐条流式发送；“一次”指一次业务输入，不要求物化整份请求，已知长度仍可经现有 sized-stream 传输。Node 继续用可注入 fetch（`core/foundation/c2-codegen/assets/typescript_transport.ts:178`、`:810`），Rust 继续 reqwest/axum；HTTP 不发送 CREDIT。取消由客户端中止该 HTTP 请求/响应，relay 观察下游结束后向上游 IPC 提交 CANCEL；其他共享上游调用不随之取消。经 relay 的调用只发一次业务 POST，不为重发保留输入：relay 在读请求体之前按请求头核对契约与路由 token，路由已过期就报派发前错误，由调用方决定是否重试，下一次调用重新解析路由。过期路由通常意味着资源换了实例，新实例没有原来的状态，应用应先从检查点恢复再继续按顺序调用（维护者 2026-11-04 确认）。
+沿现有栈：请求体一次发完，响应体逐条流式发送；“一次”指一次业务输入，不要求物化整份请求，已知长度仍可经现有 sized-stream 传输。Node 继续用可注入 fetch（`core/foundation/c2-codegen/assets/typescript_transport.ts:178`、`:810`），Rust 继续 reqwest/axum；HTTP 不发送 CREDIT。取消用业务响应开头给出的调用令牌发 `DELETE /_calls/{token}`，relay 向上游 IPC 提交 CANCEL，原响应继续可读到终态；客户端中止 HTTP 请求/响应时，relay 观察到下游结束也向上游提交 CANCEL，只是客户端读不到终态（第十二节第 9 条）。其他共享上游调用不随之取消。经 relay 的调用只发一次业务 POST，不为重发保留输入：relay 在读请求体之前按请求头核对契约与路由 token，路由已过期就报派发前错误，由调用方决定是否重试，下一次调用重新解析路由。过期路由通常意味着资源换了实例，新实例没有原来的状态，应用应先从检查点恢复再继续按顺序调用（维护者 2026-11-04 确认）。
 
 relay 只有在下游 Body 被拉取且取得本地缓冲预约时才从上游取下一片；多跳同样逐跳拉取。原生 IPC 响应必须提供绑定实际 carrier 的增量读接口，relay 不先调用 into_owned_bytes，不先组成完整条目 Vec。whole SHM 沿 3.4 保留真实 owner，逐片复制后交给 HTTP；Bytes clone/slice 保留同一 reservation，到最后实际引用结束退款，Body 自身 Drop 不是所有字节已经释放的证明。unary HTTP 调用的资源语义不变，只把响应转发改成这个 Body。
 
@@ -314,6 +314,8 @@ exact implementation candidate 必须通过 GitHub Actions 的 Linux、macOS、W
 
 块 7 的几处调整（2026-11-05 补记）。其一，ABI 8 没有照第七节的设想给 native endpoint context 加持续读与流事件，而是把 c2-core 的客户端整体投影给 Node：客户端域、端点、调用、本地缓冲与错误，共 28 个入口。连接、握手、唯一的 reader 与 writer、调用记录与借出都在 Rust 里，Node 不再读写帧；把验证过的连接转交给外部事件循环的入口与不带捕获上下文的端点解析随之删除。其二，“按请求号分派到有界调用记录”里的“有界”，按每条记录缓存的东西有界理解：交付槽一条，加最多一条已授权、尚未交付的条目，不限制记录的数量；没有截止时间的 unary 仍不占 `max_outstanding_calls`。其三，`requestShmThreshold` 与 `requestChunkSize` 属于客户端域那一个 Runtime，只在创建连接器时设定。其四，生成 transport 的 unary `call` 改收编码闭包，调用截止时间从编码之前算起，与流一致。其五，表格里块 7 的“fetch 增量读取”移到块 8：块 7 经 HTTP 调用流方法时在派发前报 `UnsupportedCallMode`，不预先做 HTTP 流的解码。
 
+块 8 计划阶段的更正（2026-11-05 补记）。3.8 写了“多跳同样逐跳拉取”，但 relay 只把调用转给自己的本地路由（`core/transport/c2-http/src/relay/router.rs` 的 `validate_expected_crm_for_route` 只查本地路由），没有 relay 到 relay 的转发；客户端经 mesh 解析后直接找拥有路由的 relay。块 8 不新造多跳转发，那一句作废。另外，3.4 末段要求转发一跳把 whole SHM 的 carrier 保留到最后一片复制结束，这需要转发用的 IPC 客户端只有正窗口时就能收到 whole SHM 的 ITEM_DATA；复制只占窗口，SHM backing 仍计在服务端的 SHM 预算上。最终消费者的路径不变，仍先为整条预约 B、再授予整条的存储额度。
+
 dispatcher 异步读锁不是 B2 才引入的隐患：现有 unary 接收循环已经在 `core/transport/c2-server/src/server.rs:2462`、`:2520` 等它，函数体在 `:3142`。第五节短发布修复同时覆盖现有 unary 和分片；只缩重组池锁不能证明控制持续推进。
 
 维护者确认第一期 Node 只做客户端；现有 Node 只有客户端生成路径（`core/foundation/c2-codegen/src/targets.rs:761`、`:927`）。v2 保留不要求 unary 契约重发，但 Node 内嵌 transport 仍须随 IPC/ABI 更新，这是第六节给出代码证据的独立迁移代价。
@@ -331,6 +333,11 @@ dispatcher 异步读锁不是 B2 才引入的隐患：现有 unary 接收循环�
 5. relay 靠逐跳的有限缓冲背压，经 relay 的生成器可能多推进几步；以真实慢读测出上限，不承诺成最终消费者的精确确认。
 6. IPC 16、ABI 8，SHM 4、mesh 7 与契约 v2 不变；Node 生成的传输产物要随之重新生成；同进程的流暂不接受有限截止时间。
 7. 现有 unary 的中位延迟、p95 或吞吐退化超过 5% 且超出噪声，先定位再交维护者裁决；exact candidate 过第九节的全平台门禁。更深的预取、公开的窗口遥测与持久查询，另有证据后再定。
+
+2026-11-05 维护者为块 8 另定两项：
+
+8. relay 关闭时照 Runtime shutdown 的规则结束经它转发、还开着的流：正在运行的那一步照常完成，已产出的条目照常转发，清理之后以写明 relay 关闭的 `CallCancelled` 结束；unary 照旧等它完成。IPC 16 的 CANCEL 记录因此带上取消起因，区分客户端放弃与生命周期结束。
+9. 经 relay 的取消用按调用的令牌：业务 POST 的响应在正文之前给出随机、不可猜的令牌，`DELETE /_calls/{token}` 只提交 CANCEL，原响应继续可读，`close` 读到真实终态与完整条目数；令牌只在这次转发存在期间有效，不提供查询、恢复或重放。
 
 另外统一了 `close` 的缺省观察预算（3.5）。新术语已写进 [CONTEXT.md](../../CONTEXT.md)；全文既有 Runtime、Host、hold、借出、租约、停用、对端结束、预算和截止时间沿原义。
 
