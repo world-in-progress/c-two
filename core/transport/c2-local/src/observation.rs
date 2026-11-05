@@ -15,6 +15,30 @@ use tokio_util::sync::CancellationToken;
 const EVENT_CAPACITY: usize = 1024;
 static NEXT_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
 
+#[cfg(test)]
+#[path = "peer_closed_tests.rs"]
+mod peer_closed_tests;
+
+/// Whether a native I/O error reports that the peer has closed its stream.
+/// A write-side report does not prove that incoming data was drained and must
+/// never authorize reclaiming loans; only the reader supplies that proof.
+pub fn is_peer_closed_error(error: &io::Error) -> bool {
+    if error.kind() == io::ErrorKind::UnexpectedEof {
+        return true;
+    }
+    #[cfg(unix)]
+    if matches!(error.raw_os_error(), Some(libc::EPIPE | libc::ECONNRESET)) {
+        return true;
+    }
+    // Mio normalizes 109 to EOF; byte-mode pipes can also return 232.
+    // ERROR_PIPE_NOT_CONNECTED (233) is not proof of peer closure.
+    #[cfg(windows)]
+    if matches!(error.raw_os_error(), Some(109 | 232)) {
+        return true;
+    }
+    false
+}
+
 /// Which local endpoint established this physical connection.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ConnectionSide {
@@ -87,33 +111,21 @@ impl ConnectionEnd {
     }
 
     pub(crate) fn io(operation: &'static str, error: &io::Error) -> Self {
-        Self::new(
-            match error.kind() {
+        Self {
+            reason: match error.kind() {
                 io::ErrorKind::ConnectionReset => ConnectionEndReason::ConnectionReset,
+                _ if is_peer_closed_error(error) => ConnectionEndReason::PeerEof,
                 _ => ConnectionEndReason::IoError,
             },
             operation,
-            error.raw_os_error(),
-        )
+            os_error: error.raw_os_error(),
+            peer_end: false,
+        }
     }
 
     pub(crate) fn read_error(operation: &'static str, error: &io::Error) -> Self {
         let mut end = Self::io(operation, error);
-        if error.kind() == io::ErrorKind::UnexpectedEof {
-            end.reason = ConnectionEndReason::PeerEof;
-            end.peer_end = true;
-        }
-        #[cfg(unix)]
-        if error.raw_os_error() == Some(libc::ECONNRESET) {
-            end.peer_end = true;
-        }
-        // Mio normalizes 109 to EOF; byte-mode pipes can also return 232.
-        // ERROR_PIPE_NOT_CONNECTED (233) is not proof of peer end.
-        #[cfg(windows)]
-        if matches!(error.raw_os_error(), Some(109 | 232)) {
-            end.reason = ConnectionEndReason::PeerEof;
-            end.peer_end = true;
-        }
+        end.peer_end = is_peer_closed_error(error);
         end
     }
 
@@ -602,7 +614,7 @@ mod tests {
         let writer = ConnectionPublisher::new(ConnectionSide::Server);
         writer.close_io("write", &error);
         let closed = writer.observation().snapshot().unwrap();
-        assert_eq!(closed.reason(), ConnectionEndReason::IoError);
+        assert_eq!(closed.reason(), ConnectionEndReason::PeerEof);
         assert!(!closed.is_peer_end());
 
         let control = ConnectionPublisher::new(ConnectionSide::Server);

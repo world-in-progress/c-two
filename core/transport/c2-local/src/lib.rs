@@ -23,7 +23,7 @@ mod observation;
 pub use observation::{
     ConnectionClosed, ConnectionEndReason, ConnectionEvent, ConnectionEventSource,
     ConnectionEvents, ConnectionEventsError, ConnectionObservation, ConnectionPublisher,
-    ConnectionSide,
+    ConnectionSide, is_peer_closed_error,
 };
 
 mod credential;

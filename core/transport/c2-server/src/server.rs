@@ -2161,235 +2161,15 @@ fn handle_connection(
 
         debug!(conn_id, "connection accepted");
 
-        let max_frame = server.config.max_frame_size;
-        let mut read_failed = false;
-
-        loop {
-            let mut len_buf = [0u8; 4];
-            match read_connection_exact(&mut reader, &mut len_buf, &conn, &mut shutdown_rx).await {
-                Ok(true) => {}
-                Ok(false) => break,
-                Err(error) => {
-                    record_read_error(&conn, &abort, "read_length", &error);
-                    read_failed = true;
-                    break;
-                }
-            }
-            let total_len = u32::from_le_bytes(len_buf);
-
-            let variable_frame_over_limit = u64::from(total_len) > max_frame;
-            // Only the fixed-size preamble can reach header inspection outside
-            // the variable-frame budget; its exact flags and bytes are checked below.
-            if total_len < 12
-                || (variable_frame_over_limit && total_len != VERSION_PREAMBLE_BODY_LEN)
-            {
-                warn!(conn_id, total_len, "invalid frame length");
-                conn.end(ConnectionEndReason::ProtocolError, "frame_length");
-                break;
-            }
-
-            // Inspect the fixed header before reading any payload byte or
-            // allocating. Even a header-only invalid preamble must be rejected
-            // before reading the body.
-            let mut prefix = [0u8; FRAME_FIXED_BODY_LEN as usize];
-            let prefix_len = FRAME_FIXED_BODY_LEN as usize;
-            match read_connection_exact(
-                &mut reader,
-                &mut prefix[..prefix_len],
-                &conn,
-                &mut shutdown_rx,
-            )
-            .await
-            {
-                Ok(true) => {}
-                Ok(false) => break,
-                Err(error) => {
-                    record_read_error(&conn, &abort, "read_frame_prefix", &error);
-                    read_failed = true;
-                    break;
-                }
-            }
-            let (header, _) = decode_frame_body(&prefix[..prefix_len], total_len)
-                .expect("validated fixed frame header");
-            if header.flags == FLAG_HANDSHAKE {
-                if conn.handshake_done() || conn.ordinary_protocol() {
-                    conn.end(ConnectionEndReason::ProtocolError, "duplicate_handshake");
-                    break;
-                }
-                let mut version_header = [0u8; 16];
-                version_header[..4].copy_from_slice(&len_buf);
-                version_header[4..].copy_from_slice(&prefix[..prefix_len]);
-                let result =
-                    negotiate_handshake(&server, &conn, &version_header, &mut reader, &writer)
-                        .await;
-                if let Err(error) = result {
-                    warn!(conn_id, %error, "handshake failed");
-                    match &error {
-                        ServerError::Io(error) => conn.end_io("handshake", error),
-                        _ => conn.end(ConnectionEndReason::ProtocolError, "handshake"),
-                    }
-                    break;
-                }
-                continue;
-            }
-            if variable_frame_over_limit {
-                conn.end(ConnectionEndReason::ProtocolError, "frame_length");
-                break;
-            }
-            if !conn.handshake_done() && !header.is_signal() {
-                conn.end(ConnectionEndReason::ProtocolError, "frame_before_handshake");
-                break;
-            }
-
-            // 2. Read the remaining body (request_id + flags + payload).
-            let mut body = vec![0u8; total_len as usize];
-            body[..prefix_len].copy_from_slice(&prefix[..prefix_len]);
-            match read_connection_exact(
-                &mut reader,
-                &mut body[prefix_len..],
-                &conn,
-                &mut shutdown_rx,
-            )
-            .await
-            {
-                Ok(true) => {}
-                Ok(false) => break,
-                Err(error) => {
-                    record_read_error(&conn, &abort, "read_body", &error);
-                    read_failed = true;
-                    break;
-                }
-            }
-
-            // 3. Decode header + payload.
-            let (header, payload) = match decode_frame_body(&body, total_len) {
-                Ok(v) => v,
-                Err(e) => {
-                    warn!(conn_id, ?e, "frame decode error");
-                    conn.end(ConnectionEndReason::ProtocolError, "frame_decode");
-                    break;
-                }
-            };
-
-            let flags = header.flags;
-            let request_id = header.request_id;
-
-            if header.flags & c2_wire::flags::FLAG_RPC_RECORD != 0
-                && payload.first() == Some(&(RpcRecordKind::Release as u8))
-            {
-                let outcome = {
-                    let _publication = conn.publication_gate.lock();
-                    conn.core.receive_release(&header, payload)
-                };
-                drop(outcome.reclaims);
-                if let Some(error) = outcome.error {
-                    warn!(conn_id, %error, "invalid release record");
-                    conn.end(ConnectionEndReason::ProtocolError, "release");
-                }
-                continue;
-            }
-
-            // 4. Dispatch by frame type.
-            if flags & c2_wire::flags::FLAG_RPC_RECORD == 0
-                && flags != FLAG_SIGNAL
-                && flags != FLAG_CTRL
-            {
-                conn.end(ConnectionEndReason::ProtocolError, "request_flags");
-                continue;
-            }
-            if header.is_signal() && header.flags & c2_wire::flags::FLAG_RPC_RECORD == 0 {
-                // A standalone control exchange still commits the ordinary role.
-                conn.select_ordinary_protocol();
-                if matches!(
-                    payload.first().and_then(|&b| MsgType::from_byte(b)),
-                    Some(MsgType::ShutdownClient)
-                ) {
-                    let deadline = tokio::time::Instant::now() + server.config.write_timeout();
-                    let initiated =
-                        handle_shutdown_signal(&server, payload, request_id, &writer).await;
-                    if initiated && !conn.handshake_done() {
-                        // Adapter flush does not prove that a Named Pipe peer
-                        // consumed the ACK. Its one-exchange client closes
-                        // after reading it; retain the OS stream until then.
-                        // Established RPC peers keep their ordinary receive
-                        // loop so accepted calls and releases still progress.
-                        wait_for_control_peer_close(&mut reader, deadline).await;
-                    }
-                    if *server.shutdown_tx.borrow() {
-                        conn.begin_shutdown();
-                    } else {
-                        conn.end(ConnectionEndReason::LocalClose, "shutdown_control_close");
-                    }
-                    continue;
-                }
-                match handle_signal(payload, request_id, &writer, &conn).await {
-                    SignalAction::Continue => {}
-                    SignalAction::Disconnect => {
-                        conn.end(ConnectionEndReason::PeerCloseMessage, "disconnect");
-                    }
-                }
-            } else if header.is_ctrl() && header.flags & c2_wire::flags::FLAG_RPC_RECORD == 0 {
-                if let Ok(reply) = writer.reserve_control() {
-                    let srv = Arc::clone(&server);
-                    let payload = payload.to_vec();
-                    tokio::spawn(async move {
-                        handle_ctrl(&srv, &payload, request_id, reply).await;
-                    });
-                }
-            } else if header.flags & c2_wire::flags::FLAG_RPC_RECORD != 0 {
-                handle_rpc_record(&server, &conn, &writer, &header, payload).await;
-            }
-        }
-
-        conn.cancel_queued_work();
-        server.cleanup_chunk_requests_for_connection(conn_id);
-        if reader.peer_ended() {
-            conn.peer_end();
-        }
-        // Invalid framing has no recoverable next boundary. Read only into a
-        // fixed discard buffer until peer end; a write error is no end proof.
-        let mut discard = [0u8; 8192];
-        if read_failed && !reader.peer_ended() {
-            conn.stop_reading();
-        }
-        if reader.peer_ended() {
-            loop {
-                let changed = conn.writer_wake.notified();
-                if conn.try_close() {
-                    break;
-                }
-                changed.await;
-            }
-        }
-        while !conn.reading_stopped() && !conn.try_close() {
-            let changed = conn.writer_wake.notified();
-            if reader.peer_ended() {
-                changed.await;
-                continue;
-            }
-            tokio::select! {
-                result = reader.read(&mut discard) => match result {
-                    Ok(0) => { conn.end(ConnectionEndReason::PeerEof, "discard_eof"); conn.peer_end(); },
-                    Ok(_) => {},
-                    Err(error) => {
-                        record_read_error(&conn, &abort, "discard_read", &error);
-                        if reader.peer_ended() { conn.peer_end(); }
-                        else {
-                            // An unrecoverable read without end proof cannot
-                            // grant permission to reuse published storage.
-                            conn.stop_reading();
-                        }
-                    }
-                },
-                _ = changed => {},
-            }
-        }
-        if conn.reading_stopped() {
-            // No more release facts can be read. Wake any blocked writer I/O;
-            // retirement guards still retain the native stream until B=0,
-            // and the original loan book keeps every unproved published loan.
-            abort.abort();
-        }
+        receive_connection(
+            &server,
+            &conn,
+            &mut reader,
+            &writer,
+            &abort,
+            &mut shutdown_rx,
+        )
+        .await;
         drop(writer);
         let _ = registration.writer_task.as_mut().unwrap().await;
         registration.writer_task.take();
@@ -2397,6 +2177,263 @@ fn handle_connection(
         conn.clear_remote_read_guard();
         conn.wait_idle().await;
         debug!(conn_id, "connection physically closed");
+    }
+}
+
+/// The accepted connection's sole receive loop, including its handshake.
+async fn receive_connection(
+    server: &Arc<Server>,
+    conn: &Arc<Connection>,
+    reader: &mut LocalReadHalf,
+    writer: &Arc<ConnectionWriter>,
+    abort: &c2_local::AbortHandle,
+    shutdown_rx: &mut watch::Receiver<bool>,
+) {
+    let conn_id = conn.conn_id();
+    let max_frame = server.config.max_frame_size;
+    let mut read_failed = false;
+
+    'frames: loop {
+        let mut len_buf = [0u8; 4];
+        match read_connection_exact(reader, &mut len_buf, conn, shutdown_rx).await {
+            Ok(true) => {}
+            Ok(false) => break,
+            Err(error) => {
+                record_read_error(conn, abort, "read_length", &error);
+                read_failed = true;
+                break;
+            }
+        }
+        let total_len = u32::from_le_bytes(len_buf);
+
+        if conn.write_peer_closed() && !conn.handshake_done() {
+            // A failed handshake write leaves the peer at an unknown stage.
+            // Drain its frames without metadata, admission or protocol checks;
+            // only DISCONNECT or a real read end can supply the closing cause.
+            let mut discard = [0u8; 8192];
+            let mut remaining = total_len;
+            while remaining != 0 {
+                let take = remaining.min(discard.len() as u32) as usize;
+                match read_connection_exact(reader, &mut discard[..take], conn, shutdown_rx).await {
+                    Ok(true) => remaining -= take as u32,
+                    Ok(false) => break 'frames,
+                    Err(error) => {
+                        record_read_error(conn, abort, "read_body", &error);
+                        read_failed = true;
+                        break 'frames;
+                    }
+                }
+            }
+            if total_len == FRAME_FIXED_BODY_LEN + c2_wire::msg_type::DISCONNECT_BYTES.len() as u32
+                && discard[8..12] == FLAG_SIGNAL.to_le_bytes()
+                && discard[12] == MsgType::Disconnect.as_byte()
+            {
+                conn.note_peer_close_message();
+                conn.end(ConnectionEndReason::PeerCloseMessage, "disconnect");
+            }
+            continue;
+        }
+
+        let variable_frame_over_limit = u64::from(total_len) > max_frame;
+        // Only the fixed-size preamble can reach header inspection outside
+        // the variable-frame budget; its exact flags and bytes are checked below.
+        if total_len < 12 || (variable_frame_over_limit && total_len != VERSION_PREAMBLE_BODY_LEN) {
+            warn!(conn_id, total_len, "invalid frame length");
+            conn.end(ConnectionEndReason::ProtocolError, "frame_length");
+            break;
+        }
+
+        // Inspect the fixed header before reading any payload byte or
+        // allocating. Even a header-only invalid preamble must be rejected
+        // before reading the body.
+        let mut prefix = [0u8; FRAME_FIXED_BODY_LEN as usize];
+        let prefix_len = FRAME_FIXED_BODY_LEN as usize;
+        match read_connection_exact(reader, &mut prefix[..prefix_len], conn, shutdown_rx).await {
+            Ok(true) => {}
+            Ok(false) => break,
+            Err(error) => {
+                record_read_error(conn, abort, "read_frame_prefix", &error);
+                read_failed = true;
+                break;
+            }
+        }
+        let (header, _) = decode_frame_body(&prefix[..prefix_len], total_len)
+            .expect("validated fixed frame header");
+        if header.flags == FLAG_HANDSHAKE {
+            if conn.handshake_done() || conn.ordinary_protocol() {
+                conn.end(ConnectionEndReason::ProtocolError, "duplicate_handshake");
+                break;
+            }
+            let mut version_header = [0u8; 16];
+            version_header[..4].copy_from_slice(&len_buf);
+            version_header[4..].copy_from_slice(&prefix[..prefix_len]);
+            let result = negotiate_handshake(server, conn, &version_header, reader, writer).await;
+            if let Err(error) = result {
+                warn!(conn_id, %error, "handshake failed");
+                match &error {
+                    ServerError::Io(error)
+                        if conn.write_peer_closed() && c2_local::is_peer_closed_error(error) =>
+                    {
+                        // The next iteration drains the peer's remaining
+                        // frames without restarting handshake interpretation.
+                        continue;
+                    }
+                    ServerError::Io(error) => conn.end_io("handshake", error),
+                    _ => conn.end(ConnectionEndReason::ProtocolError, "handshake"),
+                }
+                break;
+            }
+            continue;
+        }
+        if variable_frame_over_limit {
+            conn.end(ConnectionEndReason::ProtocolError, "frame_length");
+            break;
+        }
+        if !conn.handshake_done() && !header.is_signal() {
+            conn.end(ConnectionEndReason::ProtocolError, "frame_before_handshake");
+            break;
+        }
+
+        // 2. Read the remaining body (request_id + flags + payload).
+        let mut body = vec![0u8; total_len as usize];
+        body[..prefix_len].copy_from_slice(&prefix[..prefix_len]);
+        match read_connection_exact(reader, &mut body[prefix_len..], conn, shutdown_rx).await {
+            Ok(true) => {}
+            Ok(false) => break,
+            Err(error) => {
+                record_read_error(conn, abort, "read_body", &error);
+                read_failed = true;
+                break;
+            }
+        }
+
+        // 3. Decode header + payload.
+        let (header, payload) = match decode_frame_body(&body, total_len) {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(conn_id, ?e, "frame decode error");
+                conn.end(ConnectionEndReason::ProtocolError, "frame_decode");
+                break;
+            }
+        };
+
+        let flags = header.flags;
+        let request_id = header.request_id;
+
+        if header.flags & c2_wire::flags::FLAG_RPC_RECORD != 0
+            && payload.first() == Some(&(RpcRecordKind::Release as u8))
+        {
+            let outcome = {
+                let _publication = conn.publication_gate.lock();
+                conn.core.receive_release(&header, payload)
+            };
+            drop(outcome.reclaims);
+            if let Some(error) = outcome.error {
+                warn!(conn_id, %error, "invalid release record");
+                conn.end(ConnectionEndReason::ProtocolError, "release");
+            }
+            continue;
+        }
+
+        // 4. Dispatch by frame type.
+        if flags & c2_wire::flags::FLAG_RPC_RECORD == 0
+            && flags != FLAG_SIGNAL
+            && flags != FLAG_CTRL
+        {
+            conn.end(ConnectionEndReason::ProtocolError, "request_flags");
+            continue;
+        }
+        if header.is_signal() && header.flags & c2_wire::flags::FLAG_RPC_RECORD == 0 {
+            // A standalone control exchange still commits the ordinary role.
+            conn.select_ordinary_protocol();
+            if matches!(
+                payload.first().and_then(|&b| MsgType::from_byte(b)),
+                Some(MsgType::ShutdownClient)
+            ) {
+                let deadline = tokio::time::Instant::now() + server.config.write_timeout();
+                let initiated = handle_shutdown_signal(server, payload, request_id, writer).await;
+                if initiated && !conn.handshake_done() {
+                    // Adapter flush does not prove that a Named Pipe peer
+                    // consumed the ACK. Its one-exchange client closes
+                    // after reading it; retain the OS stream until then.
+                    // Established RPC peers keep their ordinary receive
+                    // loop so accepted calls and releases still progress.
+                    wait_for_control_peer_close(reader, deadline).await;
+                }
+                if *server.shutdown_tx.borrow() {
+                    conn.begin_shutdown();
+                } else {
+                    conn.end(ConnectionEndReason::LocalClose, "shutdown_control_close");
+                }
+                continue;
+            }
+            match handle_signal(payload, request_id, writer, conn).await {
+                SignalAction::Continue => {}
+                SignalAction::Disconnect => {
+                    conn.end(ConnectionEndReason::PeerCloseMessage, "disconnect");
+                }
+            }
+        } else if header.is_ctrl() && header.flags & c2_wire::flags::FLAG_RPC_RECORD == 0 {
+            if let Ok(reply) = writer.reserve_control() {
+                let srv = Arc::clone(server);
+                let payload = payload.to_vec();
+                tokio::spawn(async move {
+                    handle_ctrl(&srv, &payload, request_id, reply).await;
+                });
+            }
+        } else if header.flags & c2_wire::flags::FLAG_RPC_RECORD != 0 {
+            handle_rpc_record(server, conn, writer, &header, payload).await;
+        }
+    }
+
+    conn.cancel_queued_work();
+    server.cleanup_chunk_requests_for_connection(conn_id);
+    if reader.peer_ended() {
+        conn.peer_end();
+    }
+    // Invalid framing has no recoverable next boundary. Read only into a
+    // fixed discard buffer until peer end; a write error is no end proof.
+    let mut discard = [0u8; 8192];
+    if read_failed && !reader.peer_ended() {
+        conn.stop_reading();
+    }
+    if reader.peer_ended() {
+        loop {
+            let changed = conn.writer_wake.notified();
+            if conn.try_close() {
+                break;
+            }
+            changed.await;
+        }
+    }
+    while !conn.reading_stopped() && !conn.try_close() {
+        let changed = conn.writer_wake.notified();
+        if reader.peer_ended() {
+            changed.await;
+            continue;
+        }
+        tokio::select! {
+            result = reader.read(&mut discard) => match result {
+                Ok(0) => { conn.end(ConnectionEndReason::PeerEof, "discard_eof"); conn.peer_end(); },
+                Ok(_) => {},
+                Err(error) => {
+                    record_read_error(conn, abort, "discard_read", &error);
+                    if reader.peer_ended() { conn.peer_end(); }
+                    else {
+                        // An unrecoverable read without end proof cannot
+                        // grant permission to reuse published storage.
+                        conn.stop_reading();
+                    }
+                }
+            },
+            _ = changed => {},
+        }
+    }
+    if conn.reading_stopped() {
+        // No more release facts can be read. Wake any blocked writer I/O;
+        // retirement guards still retain the native stream until B=0,
+        // and the original loan book keeps every unproved published loan.
+        abort.abort();
     }
 }
 
@@ -4303,6 +4340,10 @@ mod tests;
 #[cfg(test)]
 #[path = "stream_tests.rs"]
 mod stream_tests;
+
+#[cfg(test)]
+#[path = "disconnect_tests.rs"]
+mod disconnect_tests;
 
 #[path = "stream.rs"]
 mod stream;

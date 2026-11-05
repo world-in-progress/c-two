@@ -180,6 +180,8 @@ pub struct Connection {
     first_end: Arc<Mutex<Option<PendingEnd>>>,
     /// The receive driver cannot obtain any more release or peer-end facts.
     read_stopped: AtomicBool,
+    /// A closed peer stopped the writer; the reader still determines its end.
+    write_peer_closed: AtomicBool,
     peer_ended: AtomicBool,
     /// The reader lost the peer or a trustworthy next frame boundary.
     work_cancelled: AtomicBool,
@@ -247,6 +249,7 @@ impl Connection {
             remote_read_guard_installed: AtomicBool::new(false),
             first_end: Arc::new(Mutex::new(None)),
             read_stopped: AtomicBool::new(false),
+            write_peer_closed: AtomicBool::new(false),
             peer_ended: AtomicBool::new(false),
             work_cancelled: AtomicBool::new(false),
             #[cfg(test)]
@@ -319,6 +322,22 @@ impl Connection {
         drop(self.core.deactivate());
     }
 
+    pub(crate) fn end_write(&self, operation: &'static str, error: &std::io::Error) {
+        if !c2_local::is_peer_closed_error(error) {
+            self.end_io(operation, error);
+            return;
+        }
+        let _publication = self.publication_gate.lock();
+        // A failed PONG flush may precede a buffered DISCONNECT. Keep reading
+        // until that message or a real read end supplies the first cause.
+        self.write_peer_closed.store(true, Ordering::Release);
+        drop(self.core.deactivate());
+    }
+
+    pub(crate) fn write_peer_closed(&self) -> bool {
+        self.write_peer_closed.load(Ordering::Acquire)
+    }
+
     fn record_end(&self, end: PendingEnd) {
         self.first_end.lock().get_or_insert(end);
     }
@@ -378,9 +397,17 @@ impl Connection {
     }
 
     pub(crate) fn try_close(&self) -> bool {
-        if !self.is_idle() && !self.reading_stopped() && !self.peer_ended.load(Ordering::Acquire) {
+        // Seal under the writer-end gate: a concurrent write failure must not
+        // set its read-side fence between this check and Core's close decision.
+        let _publication = self.publication_gate.lock();
+        if !self.reading_stopped()
+            && !self.peer_ended.load(Ordering::Acquire)
+            && (!self.is_idle() || (self.write_peer_closed() && self.first_end.lock().is_none()))
+        {
             return false;
         }
+        // Once a reason is known, retain the ordinary close bounds: only
+        // outstanding reads/loans/work can require further peer input.
         self.core.try_close()
     }
 

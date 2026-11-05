@@ -308,7 +308,7 @@ async fn run<W: AsyncWrite + Unpin>(
     let mut queue_closed = false;
     let mut controls_closed = false;
     loop {
-        if conn.reading_stopped() {
+        if conn.reading_stopped() || conn.write_peer_closed() {
             break;
         }
         if !controls_closed {
@@ -628,7 +628,7 @@ async fn write_item_batch<W: AsyncWrite + Unpin>(
             Ok(())
         }
         Err(error) => {
-            conn.end_io("item_data_write", &error);
+            conn.end_write("item_data_write", &error);
             batch.write_failed();
             Err(error)
         }
@@ -727,13 +727,13 @@ async fn drive_write<W: AsyncWrite + Unpin>(
             Ok(0) => {
                 let error =
                     io::Error::new(io::ErrorKind::WriteZero, "connection write returned zero");
-                conn.end_io("write", &error);
+                conn.end_write("write", &error);
                 batch.write_failed();
                 return Err(error);
             }
             Ok(count) => count,
             Err(error) => {
-                conn.end_io("write", &error);
+                conn.end_write("write", &error);
                 batch.write_failed();
                 return Err(error);
             }
@@ -762,7 +762,7 @@ async fn drive_write<W: AsyncWrite + Unpin>(
             Ok(())
         }
         Err(error) => {
-            conn.end_io("flush", &error);
+            conn.end_write("flush", &error);
             batch.write_failed();
             Err(error)
         }
@@ -771,7 +771,7 @@ async fn drive_write<W: AsyncWrite + Unpin>(
 
 fn report_timeout(conn: &Connection, receipt: &mut WriteReceipt, operation: &'static str) {
     let timeout = io::Error::new(io::ErrorKind::TimedOut, "local write deadline expired");
-    conn.end_io(operation, &timeout);
+    conn.end_write(operation, &timeout);
     if receipt
         .as_ref()
         .is_some_and(|waiter| !waiter.wait_for_flush)
