@@ -278,3 +278,26 @@ Rust resources and Rust clients can now use server streams over direct IPC ([ADR
 ### Validation
 
 On macOS with the FastDB sibling, the Rust Core workspace (1827 tests, including the unary code-generation baseline), c3 and the Rust SDK (109 together) and the CI Python gates, including the TypeScript and portable phases, passed on the integrated tree. An independent review found two defects that the Host reproduced before they were fixed: a Runtime streaming to itself over IPC could wait forever on its own payload buffer budget, and shutdown or unregistration during a final step that ended the stream was reported as a natural end. The Host also found that the client copied a whole SHM item in its receive loop under the stream's lock; that copy now runs outside both. The exact candidate `ae4b0647a0e973048f68e4bb8ad0923e204bb043` (the code of `fd913fad` plus its documentation) passed [Source Validation 41962137139](https://github.com/Dsssyc/c-two/actions/runs/41962137139) on every lane on the first attempt: Linux x64 with Python 3.12 and 3.14t, macOS arm64, and Windows x64 and ARM64.
+
+## Server streams in Python
+
+Python resources and Python clients now use server streams too, and Python and Rust resources and clients stream to each other over direct IPC. Generated TypeScript and relay forwarding do not support them yet. See [Python server streams](../reference/python-usage.md#server-streams).
+
+### Behavior
+
+- `@cc.stream` marks a CRM method that returns `Iterator[T]` or `Generator[T, None, None]`; `@cc.transfer(output=...)` describes one item. The resource implements it as a generator or returns an iterator, and each `next()` runs as one resource step that holds the route permit and the GIL only while it runs. One context, copied when the stream starts, runs the generator's creation, every step and its close, so `contextvars` and `decimal` contexts follow the generator across workers.
+- A call returns a `cc.Stream`. Leaving a `with` block or dropping the stream cancels it without waiting; `close(timeout=30.0)` cancels and then waits for the original call, `None` without bound and `0` once, and returns `completed`, `error` and `complete_items`. `cc.hold(...)` returns a stream of `HeldResult` items. A call deadline covers the whole iteration.
+- Over IPC each item is encoded inside its step; within the registering process a stream passes the yielded objects themselves, steps under the route's own limits and refuses a finite call deadline before dispatch. A borrowed input stays valid until the generator has been closed.
+- Code generation's Python target generates stream methods: `method_{index}_{name}` returns `Stream[Payload]` and `hold_method_{index}_{name}` returns `Stream[HeldResult[Payload]]`.
+- `call_execution_snapshot()` reports call slots only. Its byte fields are removed, and `rejected_reservations` counts only refused call slots; bytes and budget refusals are in `cc.observe.memory_stats()['payload_buffer']`.
+- The server bridge's `shutdown()` waits up to 30 seconds by default, like `cc.shutdown()`; it was 5 seconds.
+
+### Removed
+
+| Removed | Instead |
+| --- | --- |
+| `call_execution_snapshot()` fields `max_retained_bytes`, `used_retained_bytes` and `peak_retained_bytes` | `cc.observe.memory_stats()['payload_buffer']` |
+
+### Validation
+
+On macOS with the FastDB sibling, the Rust Core workspace (1838 tests, including the unary code-generation baseline), c3 and the Rust SDK (109 together) and the CI Python gates, including the TypeScript and portable phases, passed on the integrated tree. An independent review found two defects, which the Host confirmed in the code before they were fixed: a same-process stream unregistered between taking its first route permit and committing it reported `ResourceClosed` instead of `CallCancelled`, and the held items of generated Python clients were missing from `memory_stats()['holds']`. The Host also found that copying a Python item into a frame or shared memory took the GIL; it no longer does. Full-platform CI of the exact candidate is pending.

@@ -124,6 +124,45 @@ On the server side, portable inputs are owned by default. Registering with `cc.r
 
 `cc.transfer` accepts only `input` and `output`. The former `buffer` keyword is removed, including `None` and `"view"`; passing it raises `TypeError`. Remove that keyword and select borrowed inputs through registration-level `input_lifetime`. The module-level `auto_transfer` follows the same rule.
 
+## Server streams
+
+A CRM method marked with `@cc.stream` returns zero or more items for one input. Annotate its return as `Iterator[T]` or `Generator[T, None, None]`, where `T` is one item; `@cc.transfer(output=...)` describes the encoding of one item, as it does for a unary return. `@cc.stream` combines with `@cc.read`, `@cc.write` and `@cc.transfer`. The resource implements the method as a generator, or returns an iterator:
+
+```python
+from collections.abc import Iterator
+
+@cc.crm(namespace='science.sim', version='0.1.0')
+class Simulation:
+    @cc.stream
+    @cc.transfer(input=PARAMETERS, output=STATE)
+    def steps(self, parameters: Payload) -> Iterator[Payload]: ...
+
+class BasinSimulation:
+    def steps(self, parameters: Payload) -> Iterator[Payload]:
+        model = initialize(parameters)
+        try:
+            while model.has_next():
+                model.advance()
+                yield model.export_owned_state()
+        finally:
+            model.finish()
+
+cc.register(Simulation, BasinSimulation(), name='basin')
+
+with cc.connect(Simulation, name='basin', address='ipc://resource-process') as sim:
+    results = sim.steps(parameters)
+    with results:
+        for state in results:
+            consume(state)
+    outcome = results.close()
+```
+
+Each `next()` of the generator runs as one resource step: it holds the route permit and the GIL only while it runs, over IPC also an execution worker, and nothing between items. The stream copies the context once when it starts, and creating the generator, every `next()` and its `close()` all run in that one context, so `contextvars` and `decimal` contexts set inside the generator stay with it across workers and do not leak into them. Over IPC each item is encoded inside its step, so the generator may reuse or change an object after yielding it; within the process the consumer receives the yielded object itself. A borrowed input (`input_lifetime='borrowed'`) stays valid until the generator has been closed, then is invalidated and released.
+
+A call returns a `cc.Stream`, an iterator of decoded items. Leaving a `with` block or dropping the stream cancels it without waiting. `close(timeout=30.0)` cancels the stream if it is still running and then waits for the original call to finish: `None` waits without bound and `0` observes once. It returns a dict with `completed`, `error` and `complete_items`; while `completed` is false, the cleanup is still running and a later `close()` can observe it. `error` is the exception the stream ended with, or `None` after a natural end; a stream that the server ended reports `CallCancelled` naming shutdown or unregistration. `cc.hold(sim.steps)(parameters)` returns a stream of `HeldResult` items, each keeping its own local copy until released; several holds may coexist, and when they fill the payload buffer budget the next item waits until one is released. A call deadline from `cc.with_call_options` covers the whole iteration and is not reset for each item; its expiry ends only the caller's wait. Every stream holds one `max_outstanding_calls` slot until its real terminal.
+
+Within the registering process, a stream passes the yielded objects themselves, without encoding, and steps under the route's own concurrency limits; a finite call deadline is refused before dispatch. Over IPC, Python and Rust resources and clients stream to each other. A relay's HTTP forwarding refuses stream methods before dispatch with `UnsupportedCallMode`. [Runtime lifecycle](runtime-lifecycle.md#execution-admission) describes steps, cancellation and shutdown.
+
 ## Entry points
 
 ### Python SDK

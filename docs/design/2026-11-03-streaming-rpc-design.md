@@ -310,6 +310,8 @@ exact implementation candidate 必须通过 GitHub Actions 的 Linux、macOS、W
 
 块 6a 的两处调整（2026-11-05 补记）。其一，服务端的流条目不再计入 B：等存储额度时只持有资源交出的条目，SHM 条目直接写进 SHM 分配（计 SHM 预算），inline 条目写每个分片时才从条目编码这一片（不超过 `chunk_size`，属于传输帧）。原设想让服务端的编码副本在 B 里预约，可同一个 Runtime 经真实 IPC 给自己开流时，客户端已为整条预约了 B，服务端再等同一份 B 就会互等，条目长于 B 的一半时必然卡住（独立审查发现，Host 用 B=7、一条 4 字节条目复现）；Rust 同进程正走真实 IPC，用户走得到。逐帧编码同时去掉了服务端整条的第二份副本。其二，IPC 16 收窄：一个 SHM 的 ITEM_DATA 必须装整条条目，部分 SHM 或同一条目里 SHM 与 inline 混用是协议错误。客户端要把整条 SHM 的复制移出接收循环、不持流的状态锁，部分 SHM 会要求逐调用的有序复制队列或拆分同一分配的写区；服务端本来只发整条 SHM，块 8 的 relay 也按整条 SHM carrier 分片读取，IPC 16 尚未发布，没有兼容负担。
 
+块 6b 的一处取舍（2026-11-05 补记）。FastDB 0.2.4 的 Python 接口没有按区间读取载荷的正式入口，`Payload.binary_bytes()` 与 `Access.payload_bytes()` 都物化整条 bytes。Python 条目因此在它的推进里编码一次，得到条目自己持有的不可变 bytes，`write_range` 从这份 bytes 写进 SHM 分配或当前分片；它照 6a 的规则不计入 B，存到最后一片写出或流结束。在推进里编码也是必需的：生成器 yield 之后可能复用或改动同一个对象，必须在步内导出快照。同进程的流直接传对象，不编码。
+
 dispatcher 异步读锁不是 B2 才引入的隐患：现有 unary 接收循环已经在 `core/transport/c2-server/src/server.rs:2462`、`:2520` 等它，函数体在 `:3142`。第五节短发布修复同时覆盖现有 unary 和分片；只缩重组池锁不能证明控制持续推进。
 
 维护者确认第一期 Node 只做客户端；现有 Node 只有客户端生成路径（`core/foundation/c2-codegen/src/targets.rs:761`、`:927`）。v2 保留不要求 unary 契约重发，但 Node 内嵌 transport 仍须随 IPC/ABI 更新，这是第六节给出代码证据的独立迁移代价。

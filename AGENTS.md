@@ -178,6 +178,7 @@ Retired surfaces have no compatibility aliases; names of still-supported interna
 | Host lifecycle `phase`, `terminal` and `client_held_leases` | Lifecycle snapshots report `finished`, `listener_closed` and `work_drained`. |
 | The multi-field direct shutdown ACK (`acknowledged`, `shutdown_started`, `server_stopped`, route outcomes) | A one-byte ACK; direct shutdown returns `Initiated`, `Absent` or `Unconfirmed` (Python `'initiated'`, `'absent'`, `'unconfirmed'`), and completion is observed through the original receipt. |
 | `PyShmBuffer`, `c_two._native.ShmBuffer`, Python wire codecs and handshake objects | Use native Core buffer owners; Python `wire.py` retains `MethodTable` and the five existing native contract projections remain available. |
+| `call_execution_snapshot()` byte fields `max_retained_bytes`, `used_retained_bytes` and `peak_retained_bytes` | `memory_stats()['payload_buffer']`; the snapshot reports call slots only. |
 | Python response-pool access, SHM coordinate tuples, threshold-based response dispatch and `bytes(memoryview)` transport conversion | Return serialized bytes or buffer-protocol data and leave native payload limits and transport allocation to `c2-server`. |
 
 ## Documentation rules and routing

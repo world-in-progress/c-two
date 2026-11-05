@@ -124,6 +124,45 @@ with cc.hold(echo.echo)(source) as held:
 
 `cc.transfer` 只接受 `input` 和 `output`。原有 `buffer` 关键字已移除，包括 `None` 和 `"view"`；传入它会抛出 `TypeError`。应删除该关键字，并通过注册级 `input_lifetime` 选择借用输入。模块级 `auto_transfer` 遵循相同规则。
 
+## 服务端流
+
+标了 `@cc.stream` 的 CRM 方法对一份输入返回零条或多条条目。返回类型写成 `Iterator[T]` 或 `Generator[T, None, None]`，`T` 是一条条目；`@cc.transfer(output=...)` 描述一条条目的编码，与 unary 的返回值一样。`@cc.stream` 可以和 `@cc.read`、`@cc.write`、`@cc.transfer` 一起用。资源把这个方法写成生成器，或者返回一个迭代器：
+
+```python
+from collections.abc import Iterator
+
+@cc.crm(namespace='science.sim', version='0.1.0')
+class Simulation:
+    @cc.stream
+    @cc.transfer(input=PARAMETERS, output=STATE)
+    def steps(self, parameters: Payload) -> Iterator[Payload]: ...
+
+class BasinSimulation:
+    def steps(self, parameters: Payload) -> Iterator[Payload]:
+        model = initialize(parameters)
+        try:
+            while model.has_next():
+                model.advance()
+                yield model.export_owned_state()
+        finally:
+            model.finish()
+
+cc.register(Simulation, BasinSimulation(), name='basin')
+
+with cc.connect(Simulation, name='basin', address='ipc://resource-process') as sim:
+    results = sim.steps(parameters)
+    with results:
+        for state in results:
+            consume(state)
+    outcome = results.close()
+```
+
+生成器的每一次 `next()` 是一个资源推进：只在推进期间持有路由许可与 GIL，经 IPC 时还持有一个执行 worker，条目之间什么都不占。一条流开始时复制一次 context，建立生成器、每次 `next()` 与最后的 `close()` 都在这一个 context 里运行，所以生成器里设置的 `contextvars` 与 `decimal` context 跨 worker 跟着它走，也不会漏进 worker 自己的 context。经 IPC 时每条条目在它的推进里编码，生成器 yield 之后可以复用或修改同一个对象；在同一进程里，消费方拿到的就是 yield 出来的那个对象。借用的输入（`input_lifetime='borrowed'`）一直有效，到生成器关闭之后才先失效、再释放。
+
+调用返回一个 `cc.Stream`，迭代得到解码后的条目。离开 `with` 块或丢弃这个对象会取消它，不等待。`close(timeout=30.0)` 在流还在运行时先取消，再等原调用结束：`None` 一直等，`0` 只观察一次。它返回一个 dict，含 `completed`、`error` 与 `complete_items`；`completed` 为 False 时清理还在进行，之后可以再调用 `close()` 观察。`error` 是这条流结束时的异常，自然结束时为 `None`；服务端结束的流报 `CallCancelled`，消息写明是 shutdown 还是注销。`cc.hold(sim.steps)(parameters)` 返回由 `HeldResult` 组成的流，每条各自保留本地副本直到释放；多份 hold 可以同时存在，用满载荷缓冲预算时，下一条等到某一份释放。`cc.with_call_options` 给的截止时间涵盖整条迭代，不为每条重置；到期只结束调用方的等待。每条流占一个 `max_outstanding_calls` 名额，直到它的真实终态。
+
+在注册资源的进程里，流直接传递 yield 出来的对象，不编码，按路由自己的并发限制推进；有限的调用截止时间在派发前被拒绝。经 IPC 时，Python 与 Rust 的资源和客户端可以互相开流。经 relay 的 HTTP 转发调用流方法，会在派发前报 `UnsupportedCallMode`。推进、取消与 shutdown 见 [Runtime 生命周期](runtime-lifecycle.md#execution-admission)。
+
 ## 入口
 
 ### Python SDK

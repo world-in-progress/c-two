@@ -4,7 +4,7 @@
 
 ## 进行中
 
-- **流式 RPC**（[设计](2026-11-03-streaming-rpc-design.md)于 2026-11-04 批准，[ADR 0003](../decisions/0003-server-streams.md)；执行计划是设计第十节）：第一阶段（块 1 至 4）已于 2026-11-04 验收：确切候选 `787d4205` 的全平台 CI 通过，见[验收记录](../acceptance/2026-11-04-streaming-phase-1-acceptance.md)；分支 `socu/streaming` 在 fork 上，尚未合入上游 main。块 5a（IPC 16 调用记录）已于 2026-11-05 合入整合分支，确切候选 `b5b4853c` 的全平台 CI（run 41911808218）通过；块 5b（服务端流的传输）同日合入（`02b4c008`），确切候选 `d6c808f9` 的全平台 CI（run 41936786846）在重跑失败的任务后全部通过。块 6a（Runtime 与 Rust SDK 的服务端流）同日合入（`fd913fad`），确切候选 `ae4b0647` 的全平台 CI（run 41962137139）首次即全部通过。块 6b（Python）正在实施。块 6 也分两步：6a 做 Rust Core 与 Rust SDK，6b 做 Python。块 5 与块 6 分步的理由见设计第十节表格后的补记。
+- **流式 RPC**（[设计](2026-11-03-streaming-rpc-design.md)于 2026-11-04 批准，[ADR 0003](../decisions/0003-server-streams.md)；执行计划是设计第十节）：第一阶段（块 1 至 4）已于 2026-11-04 验收：确切候选 `787d4205` 的全平台 CI 通过，见[验收记录](../acceptance/2026-11-04-streaming-phase-1-acceptance.md)；分支 `socu/streaming` 在 fork 上，尚未合入上游 main。块 5a（IPC 16 调用记录）已于 2026-11-05 合入整合分支，确切候选 `b5b4853c` 的全平台 CI（run 41911808218）通过；块 5b（服务端流的传输）同日合入（`02b4c008`），确切候选 `d6c808f9` 的全平台 CI（run 41936786846）在重跑失败的任务后全部通过。块 6a（Runtime 与 Rust SDK 的服务端流）同日合入（`fd913fad`），确切候选 `ae4b0647` 的全平台 CI（run 41962137139）首次即全部通过。块 6b（Python 的服务端流）同日合入（`b2ee739b`），全平台 CI 待跑；块 6 至此完成，下一步是块 7（Node，ABI 8）与块 8（relay）。块 6 也分两步：6a 做 Rust Core 与 Rust SDK，6b 做 Python。块 5 与块 6 分步的理由见设计第十节表格后的补记。
 
 ## 接下来（建议的顺序，待维护者确认）
 
@@ -31,7 +31,8 @@
 - CI 的 sccache 以 GitHub Actions 缓存为后端，每个编译产物各占一个缓存条目：#215 的两次全量 PR CI 在 PR ref 下留下 795 个条目、8.37 GiB，fork 的 `socu/protocol-batch` 分支累计 3,434 个、9.80 GiB（2026-11-03 计数）。仓库的缓存上限是 10 GB，满了按最久未访问淘汰，几次全量 PR CI 就可能把 main 的缓存挤掉；条目这样多也没法手工清理，删除要逐条调用 API，3,434 条约占每小时额度的七成。先核实 main 与 PR 的 sccache 命中率是否因此下降，再决定怎样处理。
 - [内存策略的验收记录](../acceptance/2026-09-26-memory-policy.md)里，探针退出后客户端的 backing 仍能打开；那次探针经过透明 socket 转发器，还没有做不经转发器的对照。协议批已改了 backing 的所有权（[ADR 0001](../decisions/0001-single-owner-release.md)），这一点仍待核实。
 
-- Windows x64 上 c2-server 的 `shutdown_preserves_active_reply_refuses_new_calls_and_fences_lifecycle_hook` 偶发失败一次：run 41936786846 第一次运行（job 126947267484）读回复等了 5 秒超时，日志看不出是哪一次读；重跑失败的任务即通过。macOS 上单独跑 60 次、整套 c2-server 测试跑 15 次都没有复现。块 5b 没有改到 unary 的写端、调度与连接关闭，这个测试从 ABI 7 起就有。它守的是 shutdown 时进行中的调用照样回复，如果回复真的丢了就是产品缺陷，要在 Windows 测试机上循环复现、查清是哪一次读没等到回复。协议批修过同类的 Windows 管道问题（服务端在客户端读到确认之前就放掉管道，见[协议批验收记录](../acceptance/2026-11-03-protocol-batch-acceptance.md)）。
+- Windows x64 上 c2-server 的 `shutdown_preserves_active_reply_refuses_new_calls_and_fences_lifecycle_hook` 偶发失败一次：run 41936786846 第一次运行（job 126947267484）读回复等了 5 秒超时，日志看不出是哪一次读；重跑失败的任务即通过。macOS 上单独跑 60 次、整套 c2-server 测试跑 15 次都没有复现。块 5b 没有改到 unary 的写端、调度与连接关闭，这个测试从 ABI 7 起就有。它守的是 shutdown 时进行中的调用照样回复，如果回复真的丢了就是产品缺陷，要在 Windows 测试机上循环复现、查清是哪一次读没等到回复。协议批修过同类的 Windows 管道问题（服务端在客户端读到确认之前就放掉管道，见[协议批验收记录](../acceptance/2026-11-03-protocol-batch-acceptance.md)）。2026-11-05 派 Worker 在 Windows 11 x64 测试机上基于 `ae4b0647` 循环复现：单独跑、与整套 c2-server 测试并行跑、再加 12 个忙循环线程，共 1,796 次（7,184 次迭代），0 次失败；加了收帧、写出与 flush 的临时观察也没有超时现场，macOS 上 201 次同样通过。CI 那次卡在哪一次读仍不确定，Windows Server 2025 上没有直接验证。
+- Windows 上 c2-server 的 `normal_disconnect_before_eof_preserves_peer_close_message_as_first_cause` 偶发失败：上面那次复现里，与整套测试并行的第 14 轮把 DISCONNECT 之后的第一个关闭原因记成了 `IoError`，不是 `PeerCloseMessage`（`server_tests.rs:3437`，负载约 7%）。协议批的 `f83f35e8` 为同一个测试修过一次（先送达再关闭、先记关闭原因），看来还有路径没有兜住。待定位：是测试的假设，还是服务端在 Windows 上仍会先记下写失败。
 
 ## 不排期
 

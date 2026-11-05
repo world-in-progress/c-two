@@ -180,7 +180,7 @@ cc.endpoint.set_local_endpoint(root=str(ipc_dir))
 
 截止时间到达后结束调用方等待，已经派发的原生事务仍可能继续，直到真实结束；它的输入在传输复制之后就已释放。单次调用截止时间到期不会撤销 relay 路由，也不会使已经取得的 held 响应的载荷所有者失效。错误区分派发前到期与派发状态不确定；后者不能自动重放调用。
 
-有限调用的数量上限 `0` 拒绝所有新有限调用，没有截止时间的调用不计入这一上限。载荷缓冲预算 `0` 拒绝所有正字节的预约，有无截止时间的调用都一样。预算不足时，调用在自己的截止时间之内等待容量；预算计入哪些数据、什么情况下预约立即失败，见[内存策略](memory-policy.md#payload-buffer-budget)。`cc.observe.call_execution_snapshot()` 查看当前及退休域的真实计费，`cc.observe.memory_stats()['payload_buffer']` 查看这项预算。示例与错误阶段见[调用截止时间指南](../releases/0.7.1.md#per-call-deadlines-for-remote-calls)。
+有限调用的数量上限 `0` 拒绝所有新的有限调用与新的服务端流；没有截止时间的一元调用不计入这一上限。载荷缓冲预算 `0` 拒绝所有正字节的预约，有无截止时间的调用都一样。预算不足时，调用在自己的截止时间之内等待容量；预算计入哪些数据、什么情况下预约立即失败，见[内存策略](memory-policy.md#payload-buffer-budget)。`cc.observe.call_execution_snapshot()` 查看当前及退休域的调用名额，`cc.observe.memory_stats()['payload_buffer']` 查看这项预算的字节与拒绝次数。示例与错误阶段见[调用截止时间指南](../releases/0.7.1.md#per-call-deadlines-for-remote-calls)。
 
 ## 并发与资源生命周期
 

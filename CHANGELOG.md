@@ -19,6 +19,7 @@ See the [unreleased notes](docs/releases/unreleased.md).
 - Breaking: one payload buffer budget per Runtime and relay (`payload_buffer_budget_bytes`, `C2_CALL_PAYLOAD_BUFFER_BUDGET_BYTES`, `--call-payload-buffer-budget-bytes`) replaces the retained-input budget. It also charges HTTP bodies and calls without a deadline, releases input once the transport has copied it, and makes a call wait within its deadline when the budget is short.
 - Breaking: `max_total_chunks` / `C2_IPC_MAX_TOTAL_CHUNKS` is renamed `max_inflight_chunk_frames` / `C2_IPC_MAX_INFLIGHT_CHUNK_FRAMES`.
 - A relay-aware call no longer re-sends after the relay reports a stale route, and chunked IPC calls reserve their route in frame order like unchunked calls.
+- Breaking: `call_execution_snapshot()` reports call slots only; its byte fields are removed in favor of `memory_stats()['payload_buffer']`, and `rejected_reservations` counts only refused call slots. The server bridge's `shutdown()` defaults to 30 seconds.
 - Breaking: IPC 16 call records replace the IPC 15 business frames, so upgrade the SDKs, c3 and generated TypeScript clients together and regenerate the clients. A call the server refused before it entered the resource is now reported as pre-dispatch (NotExecuted) instead of as a resource error.
 - A frame write that exceeds `write_timeout` deactivates the connection without cutting off the call record being written; the call follows that frame's real result.
 
@@ -26,7 +27,8 @@ See the [unreleased notes](docs/releases/unreleased.md).
 
 - `ipc_overrides` keys `write_timeout`, `max_dedicated_segments` and `spill_threshold`, with their `C2_IPC_*` environment variables.
 - Error code `CallCancelled` (718) for a server stream whose cancellation has finished. The IPC transport carries server-stream items, grants and cancellation; the SDKs cannot use server streams yet.
-- Server streams for Rust resources and clients over direct IPC: generated `ResponseStream` methods and `Service` iterators, cancellation on drop, `close()` with a 30-second default, and shutdown or unregistration ending open streams between steps with `CallCancelled`. Every stream holds a `max_outstanding_calls` slot until its real terminal. Python, generated TypeScript and relay forwarding follow.
+- Server streams for Rust resources and clients over direct IPC: generated `ResponseStream` methods and `Service` iterators, cancellation on drop, `close()` with a 30-second default, and shutdown or unregistration ending open streams between steps with `CallCancelled`. Every stream holds a `max_outstanding_calls` slot until its real terminal. Generated TypeScript and relay forwarding follow.
+- Server streams for Python resources and clients: `@cc.stream`, `cc.Stream` with `close(timeout=30.0)`, held items, same-process object streams and generated Python stream methods; Python and Rust stream to each other over direct IPC.
 
 ### Removed
 

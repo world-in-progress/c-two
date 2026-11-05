@@ -55,7 +55,7 @@ finally:
 
 ## FastDB view lifetime
 
-FastDB can enforce stale-use detection only through its public `Payload` owner and checked-view contract. C-Two must invalidate held responses and borrowed inputs before freeing their local copy. Values that must outlive the hold or the method call must be materialized through the official FastDB API.
+FastDB can enforce stale-use detection only through its public `Payload` owner and checked-view contract. C-Two must invalidate held responses and borrowed inputs before freeing their local copy. A server stream's borrowed input stays valid until its generator or iterator has been closed in the stream's cleanup, and each held stream item keeps its own local copy. Values that must outlive the hold or the method call must be materialized through the official FastDB API.
 
 FastDB cannot reliably invalidate every raw pointer a user deliberately extracts from a view. In particular, unsafe NumPy access can produce an ndarray or pointer that no longer consults the payload owner on later reads. Treat such APIs as explicit unsafe escapes: tests should assert normal FastDB view invalidation after release, but do not claim that a leaked raw NumPy pointer can be made mechanically impossible in Python.
 
