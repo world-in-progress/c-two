@@ -244,9 +244,16 @@ test('loader accepts a native library in a Unicode directory with spaces', () =>
   const library = resolve(directory, process.platform === 'win32' ? 'memory.dll' : 'memory-library');
   copyFileSync(bundled(), library);
   try {
-    const { symbols } = loadC2MemFfiNodeNativeSymbols(library);
-    assert.equal(symbols.c2_mem_ffi_abi_version(), C2_MEM_FFI_ABI_VERSION);
-  } finally { rmSync(directory, { recursive: true, force: true }); }
+    const moduleUrl = new URL('../dist/index.js', import.meta.url).href;
+    const script = `import { C2_MEM_FFI_ABI_VERSION, loadC2MemFfiNodeNativeSymbols } from ${JSON.stringify(moduleUrl)};
+      const { symbols } = loadC2MemFfiNodeNativeSymbols(process.argv[1]);
+      if (symbols.c2_mem_ffi_abi_version() !== C2_MEM_FFI_ABI_VERSION) process.exit(1);`;
+    const result = spawnSync(process.execPath, ['--input-type=module', '-e', script, library], { encoding: 'utf8' });
+    assert.equal(result.status, 0, result.stdout + result.stderr);
+  } finally {
+    // A child process owns the loaded DLL so Windows can delete it after exit.
+    rmSync(directory, { recursive: true, force: true });
+  }
 });
 
 test('connector exposes a shared native domain and endpoint resolver', async () => {

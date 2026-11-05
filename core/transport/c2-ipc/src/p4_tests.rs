@@ -168,6 +168,22 @@ async fn accept(listener: &mut LocalListener) -> LocalStream {
     stream
 }
 
+// A rejected handshake closes the client end as soon as the malformed reply is
+// classified, which is exactly the behavior under test. On Windows a
+// LocalStream write_all still drains the pipe adapter with a zero-byte flush
+// write after the payload, and that probe fails once the client has closed,
+// even though the payload itself was already delivered and read. Delivery
+// stays proven by the client-side rejection asserts: an undelivered reply
+// would surface as the connect timeout instead.
+async fn write_malformed_reply(stream: &mut LocalStream, bytes: &[u8]) {
+    if let Err(error) = stream.write_all(bytes).await {
+        assert!(
+            c2_local::is_peer_closed_error(&error),
+            "fake peer failed to write its malformed reply: {error}"
+        );
+    }
+}
+
 async fn expect_fake_peer_handshake_error(
     preamble: [u8; 25],
     metadata_ack: Option<Vec<u8>>,
@@ -181,11 +197,11 @@ async fn expect_fake_peer_handshake_error(
         let mut hello = [0; 25];
         stream.read_exact(&mut hello).await.unwrap();
         assert_eq!(hello, encode_version_preamble(VersionPreambleKind::Hello));
-        stream.write_all(&preamble).await.unwrap();
+        write_malformed_reply(&mut stream, &preamble).await;
         if let Some(ack) = metadata_ack {
             let (header, _) = read_frame(&mut stream).await;
             assert_eq!(header.flags, flags::FLAG_HANDSHAKE);
-            stream.write_all(&ack).await.unwrap();
+            write_malformed_reply(&mut stream, &ack).await;
         }
         // Keep the peer open until connect has returned. An EOF must not be
         // needed to classify a complete malformed reply.
