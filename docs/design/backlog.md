@@ -29,6 +29,7 @@
 
 ## 要核实的事
 
+- Node 绑定的测试 `ABI 8 unary encoding consumes the native pre-dispatch deadline`（`core/foundation/c2-mem-ffi/bindings/typescript/tests/c2-mem-ffi-protocol.test.mjs`）在 2026-11-05 修 Windows CI 的 Worker 那里，Windows 11 x64 上跑三轮失败过一次，单独连跑三次都通过。测试用 1 ms 的调用截止时间加 20 ms 的忙等编码，没有留下失败时的输出，原因未知；CI 上再出现就派 Windows Worker 复现。
 - CI 的 sccache 以 GitHub Actions 缓存为后端，每个编译产物各占一个缓存条目：#215 的两次全量 PR CI 在 PR ref 下留下 795 个条目、8.37 GiB，fork 的 `socu/protocol-batch` 分支累计 3,434 个、9.80 GiB（2026-11-03 计数）。仓库的缓存上限是 10 GB，满了按最久未访问淘汰，几次全量 PR CI 就可能把 main 的缓存挤掉；条目这样多也没法手工清理，删除要逐条调用 API，3,434 条约占每小时额度的七成。先核实 main 与 PR 的 sccache 命中率是否因此下降，再决定怎样处理。
 - [内存策略的验收记录](../acceptance/2026-09-26-memory-policy.md)里，探针退出后客户端的 backing 仍能打开；那次探针经过透明 socket 转发器，还没有做不经转发器的对照。协议批已改了 backing 的所有权（[ADR 0001](../decisions/0001-single-owner-release.md)），这一点仍待核实。
 
