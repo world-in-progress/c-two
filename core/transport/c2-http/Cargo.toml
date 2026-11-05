@@ -11,6 +11,7 @@ description = "C-Two HTTP transport layer (client + relay server)"
 default = []
 relay = [
     "dep:axum",
+    "dep:http-body",
     "dep:tower-http",
     "dep:c2-ipc",
     "dep:tracing",
@@ -39,6 +40,7 @@ futures = { version = "0.3" }
 
 # Relay-only dependencies (behind feature gate)
 axum = { version = "0.8", optional = true }
+http-body = { version = "1", optional = true }
 tower-http = { version = "0.7", features = ["cors"], optional = true }
 c2-ipc = { version = "0.1.0", path = "../c2-ipc", optional = true }
 tracing = { version = "0.1", optional = true }

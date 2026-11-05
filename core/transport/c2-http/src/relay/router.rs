@@ -5,13 +5,17 @@ use std::convert::Infallible;
 use std::future::Future;
 use std::io::Write;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use axum::{
     Json, Router,
-    body::{Body, Bytes},
-    extract::{ConnectInfo, DefaultBodyLimit, FromRequestParts, Path, Query, State},
+    body::{Body, Bytes, HttpBody},
+    extract::{
+        ConnectInfo, DefaultBodyLimit, Extension, FromRequestParts, Path, Query, Request, State,
+    },
     http::request::Parts,
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
@@ -338,45 +342,23 @@ where
     )
 }
 
-fn content_length_from_headers(
-    headers: &HeaderMap,
-    budget: &PayloadBufferBudget,
-) -> ResponseResult<Option<u64>> {
+#[derive(Clone, Copy)]
+struct DeclaredBodyLength(Result<Option<u64>, &'static str>);
+
+fn content_length_from_headers(headers: &HeaderMap) -> Result<Option<u64>, &'static str> {
     let mut values = headers.get_all(header::CONTENT_LENGTH).iter();
     let Some(value) = values.next() else {
         return Ok(None);
     };
     if values.next().is_some() {
-        return Err(json_error_response(
-            StatusCode::BAD_REQUEST,
-            serde_json::json!({
-                "error": "InvalidContentLength",
-                "message": "Content-Length must appear at most once",
-            }),
-            Some(budget),
-        )
-        .into());
+        return Err("Content-Length must appear at most once");
     }
-    let raw = value.to_str().map_err(|_| {
-        json_error_response(
-            StatusCode::BAD_REQUEST,
-            serde_json::json!({
-                "error": "InvalidContentLength",
-                "message": "Content-Length must be an ASCII unsigned integer",
-            }),
-            Some(budget),
-        )
-    })?;
-    let content_length = raw.parse::<u64>().map_err(|_| {
-        json_error_response(
-            StatusCode::BAD_REQUEST,
-            serde_json::json!({
-                "error": "InvalidContentLength",
-                "message": "Content-Length must be an unsigned integer",
-            }),
-            Some(budget),
-        )
-    })?;
+    let raw = value
+        .to_str()
+        .map_err(|_| "Content-Length must be an ASCII unsigned integer")?;
+    let content_length = raw
+        .parse::<u64>()
+        .map_err(|_| "Content-Length must be an unsigned integer")?;
     Ok(Some(content_length))
 }
 
@@ -863,6 +845,70 @@ pub fn build_router(state: Arc<RelayState>) -> Router {
         .merge(control_router)
         .merge(data_router)
         .with_state(state)
+        .layer(axum::middleware::from_fn(finish_unread_body_rejection))
+}
+
+// Retain the transport body at the router boundary until its first read. This
+// also covers extractors that reject without reading (for example Json's 415).
+// Once reading starts, the handler owns the body, including any partial read.
+struct UnreadRequestBody {
+    unread: Arc<parking_lot::Mutex<Option<Body>>>,
+    reading: Option<Body>,
+}
+
+impl HttpBody for UnreadRequestBody {
+    type Data = Bytes;
+    type Error = axum::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        let this = self.get_mut();
+        if this.reading.is_none() {
+            this.reading = this.unread.lock().take();
+        }
+        Pin::new(this.reading.as_mut().expect("first read owns the body")).poll_frame(cx)
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        match &self.reading {
+            Some(body) => body.size_hint(),
+            None => self.unread.lock().as_ref().unwrap().size_hint(),
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        match &self.reading {
+            Some(body) => body.is_end_stream(),
+            None => self.unread.lock().as_ref().unwrap().is_end_stream(),
+        }
+    }
+}
+
+async fn finish_unread_body_rejection(
+    mut request: Request,
+    next: axum::middleware::Next,
+) -> Response {
+    // Parse once, retaining the result for the call handler's existing error
+    // precedence. Invalid declarations cannot authorize transport disposal.
+    let length = DeclaredBodyLength(content_length_from_headers(request.headers()));
+    let expect = request.headers().contains_key(header::EXPECT);
+    request.extensions_mut().insert(length);
+    let (parts, body) = request.into_parts();
+    let unread = Arc::new(parking_lot::Mutex::new(Some(body)));
+    let body = Body::new(UnreadRequestBody {
+        unread: unread.clone(),
+        reading: None,
+    });
+    let response = next.run(Request::from_parts(parts, body)).await;
+    let body = unread.lock().take();
+    if (response.status().is_client_error() || response.status().is_server_error())
+        && let Some(body) = body
+    {
+        return finish_early_rejection(expect, length.0.ok().flatten(), body, response).await;
+    }
+    response
 }
 
 // -- Control-plane handlers -----------------------------------------------
@@ -1895,6 +1941,7 @@ async fn handle_probe_in_context(
 async fn call_handler(
     State(state): State<Arc<RelayState>>,
     Path((route_name, method_name)): Path<(String, String)>,
+    Extension(declared_length): Extension<DeclaredBodyLength>,
     headers: HeaderMap,
     body: Body,
 ) -> Response {
@@ -1917,9 +1964,15 @@ async fn call_handler(
     {
         return response.into_response();
     }
-    let content_length = match content_length_from_headers(&headers, &budget) {
+    let content_length = match declared_length.0 {
         Ok(value) => value,
-        Err(response) => return response.into_response(),
+        Err(message) => {
+            return json_error_response(
+                StatusCode::BAD_REQUEST,
+                serde_json::json!({"error": "InvalidContentLength", "message": message}),
+                Some(&budget),
+            );
+        }
     };
     if let Some(content_length) = content_length
         && content_length > advertised_route.max_payload_size
@@ -1938,8 +1991,8 @@ async fn call_handler(
         .is_some_and(|value| value.as_bytes() == crate::stream_wire::MEDIA_TYPE.as_bytes());
     let work_state = state.clone();
     let work_route_name = route_name.clone();
-    // Keep the transport body in the HTTP handler until admission succeeds.
-    // A rejected spawn drops its closure without dropping the unread body.
+    // Keep the body in the HTTP handler until admission succeeds. A rejected
+    // spawn leaves the unread transport body at the router boundary.
     let (body_tx, body_rx) = tokio::sync::oneshot::channel();
     let work = move |permit, cancelled| async move {
         let body = body_rx
@@ -1961,8 +2014,7 @@ async fn call_handler(
     let waiter = match state.forwarding.spawn(work) {
         Ok(waiter) => waiter,
         Err(error) => {
-            let response = forwarding_capacity_response(&route_name, error.to_string());
-            return finish_capacity_rejection(&headers, content_length, body, response).await;
+            return forwarding_capacity_response(&route_name, error.to_string());
         }
     };
     // No await separates admission from this ownership handoff.
@@ -1980,18 +2032,16 @@ async fn call_handler(
     }
 }
 
-async fn finish_capacity_rejection(
-    headers: &HeaderMap,
+async fn finish_early_rejection(
+    expect: bool,
     content_length: Option<u64>,
     mut body: Body,
     response: Response,
 ) -> Response {
     // Expect refusals must never poll Incoming: doing so sends 100 Continue.
-    // Unknown bodies are not drained. Invalid/oversized declarations are
-    // rejected by call_handler before admission and never reach this path.
-    if !headers.contains_key(header::EXPECT)
-        && let Some(mut remaining) = content_length
-    {
+    // Only a valid declared length permits disposal, including one above the
+    // route's payload limit. Unknown or invalid lengths are never drained.
+    if !expect && let Some(mut remaining) = content_length {
         // Hyper 1.x only tries one read after an unread Incoming is dropped,
         // then closes the read side. An eager sender can lose the final error
         // to a socket abort. Keep the receiver alive through bounded EOF instead.
@@ -2020,7 +2070,7 @@ async fn finish_capacity_rejection(
         })
         .await;
     }
-    // A source fault, excess bytes or timeout cannot replace capacity authority.
+    // A source fault, excess bytes or timeout cannot replace the original refusal.
     response
 }
 
@@ -5242,7 +5292,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn relay_rejects_oversized_content_length_before_polling_body() {
+    async fn relay_rejects_oversized_expect_content_length_without_polling_body() {
         let state = test_state();
         state.with_route_table_mut(|rt| {
             assert!(rt.register_route(RouteEntry {
@@ -5279,7 +5329,8 @@ mod tests {
                             .method("POST")
                             .uri("/grid/ping")
                             .header("content-type", "application/octet-stream")
-                            .header("content-length", "5"),
+                            .header("content-length", "5")
+                            .header("expect", "100-continue"),
                     ),
                     route.as_ref(),
                 )
@@ -5298,7 +5349,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn relay_rejects_duplicate_content_length_before_polling_body() {
+    async fn relay_rejects_invalid_content_length_without_polling_body() {
         let state = test_state();
         state.with_route_table_mut(|rt| {
             assert!(rt.register_route(RouteEntry {
@@ -5321,35 +5372,34 @@ mod tests {
         });
         let route = state.local_route("grid");
         let app = build_router(state);
-        let stream = futures::stream::once(async {
-            panic!("invalid content-length request body should not be polled");
-            #[allow(unreachable_code)]
-            Ok::<Bytes, std::io::Error>(Bytes::new())
-        });
-
-        let response = app
-            .oneshot(
-                add_route_token_headers(
-                    add_expected_echo_headers(
-                        Request::builder()
-                            .method("POST")
-                            .uri("/grid/ping")
-                            .header("content-type", "application/octet-stream")
-                            .header("content-length", "5")
-                            .header("content-length", "5"),
-                    ),
-                    route.as_ref(),
-                )
-                .body(Body::from_stream(stream))
-                .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(payload["error"], "InvalidContentLength");
+        for values in [
+            vec![axum::http::HeaderValue::from_static("5"); 2],
+            vec![axum::http::HeaderValue::from_static("not-a-number")],
+            vec![axum::http::HeaderValue::from_static("18446744073709551616")],
+            vec![axum::http::HeaderValue::from_bytes(b"\xff").unwrap()],
+        ] {
+            let stream = futures::stream::once(async {
+                panic!("invalid content-length request body should not be polled");
+                #[allow(unreachable_code)]
+                Ok::<Bytes, std::io::Error>(Bytes::new())
+            });
+            let mut request = add_route_token_headers(
+                add_expected_echo_headers(Request::builder().method("POST").uri("/grid/ping")),
+                route.as_ref(),
+            );
+            for value in values {
+                request = request.header(header::CONTENT_LENGTH, value);
+            }
+            let response = app
+                .clone()
+                .oneshot(request.body(Body::from_stream(stream)).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(payload["error"], "InvalidContentLength");
+        }
     }
 
     #[tokio::test]
@@ -7098,17 +7148,13 @@ mod forwarding_admission_tests {
     #[tokio::test]
     async fn rejected_body_expect_and_unknown_length_are_never_polled() {
         for (expect, length) in [(true, Some(4)), (false, None)] {
-            let mut headers = HeaderMap::new();
-            if expect {
-                headers.insert(header::EXPECT, "100-continue".parse().unwrap());
-            }
             let body = Body::from_stream(futures::stream::once(async {
                 panic!("ineligible rejected body must not be polled");
                 #[allow(unreachable_code)]
                 Ok::<Bytes, std::io::Error>(Bytes::new())
             }));
-            let response = finish_capacity_rejection(
-                &headers,
+            let response = finish_early_rejection(
+                expect,
                 length,
                 body,
                 forwarding_capacity_response("grid", "original refusal"),
@@ -7137,16 +7183,22 @@ mod forwarding_admission_tests {
                 };
                 std::task::Poll::Ready(item)
             }));
-            let response = finish_capacity_rejection(
-                &HeaderMap::new(),
+            let response = finish_early_rejection(
+                false,
                 Some(4),
                 body,
-                forwarding_capacity_response("grid", "original refusal"),
+                (StatusCode::NOT_FOUND, "original refusal").into_response(),
             )
             .await;
             assert_eq!(polls.load(Ordering::SeqCst), 2);
             assert!(dropped.load(Ordering::SeqCst));
-            assert_capacity_response(response).await;
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+            assert_eq!(
+                axum::body::to_bytes(response.into_body(), 4096)
+                    .await
+                    .unwrap(),
+                "original refusal"
+            );
         }
     }
 
@@ -7165,8 +7217,8 @@ mod forwarding_admission_tests {
             }));
             let response = tokio::time::timeout(
                 REJECTED_BODY_DRAIN_TIMEOUT + Duration::from_secs(1),
-                finish_capacity_rejection(
-                    &HeaderMap::new(),
+                finish_early_rejection(
+                    false,
                     Some(4),
                     body,
                     forwarding_capacity_response("grid", "original refusal"),
@@ -7187,9 +7239,8 @@ mod forwarding_admission_tests {
             let _keep_owner = &owner;
             std::task::Poll::Pending::<Option<Result<Bytes, std::io::Error>>>
         }));
-        let headers = HeaderMap::new();
-        let mut cleanup = Box::pin(finish_capacity_rejection(
-            &headers,
+        let mut cleanup = Box::pin(finish_early_rejection(
+            false,
             Some(4),
             body,
             forwarding_capacity_response("grid", "original refusal"),

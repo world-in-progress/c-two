@@ -183,6 +183,7 @@ dependencies = [
  "futures",
  "getrandom 0.4.3",
  "hex",
+ "http-body",
  "parking_lot",
  "percent-encoding",
  "reqwest",

@@ -389,6 +389,456 @@ async fn capacity_freed_during_rejected_body_cleanup_does_not_readmit() {
     capacity_rejection_case(CapacityRequest::DirectEagerRelease).await;
 }
 
+mod early_rejection {
+    use super::*;
+    use axum::body::{Body, HttpBody};
+    use axum::http::Request;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    struct Case {
+        path: &'static str,
+        replace: Option<(&'static str, &'static str)>,
+        status: u16,
+        error: &'static str,
+    }
+
+    fn cases() -> Vec<Case> {
+        let mut cases = vec![
+            Case {
+                path: "/grid/ping",
+                replace: Some(("x-c2-expected-crm-ns: test.echo\r\n", "")),
+                status: 400,
+                error: "InvalidCrmTag",
+            },
+            Case {
+                path: "/grid/ping",
+                replace: Some((TEST_ABI_HASH, "invalid-hash")),
+                status: 400,
+                error: "InvalidCrmTag",
+            },
+            Case {
+                path: "/missing/ping",
+                replace: None,
+                status: 404,
+                error: "ResourceNotFound",
+            },
+            Case {
+                path: "/grid/ping",
+                replace: Some((
+                    "x-c2-expected-crm-name: Echo",
+                    "x-c2-expected-crm-name: Other",
+                )),
+                status: 409,
+                error: "ContractMismatch",
+            },
+            Case {
+                path: "/grid/ping",
+                replace: Some(("x-c2-route-uid: early-route\r\n", "")),
+                status: 400,
+                error: "ProtocolViolation",
+            },
+            Case {
+                path: "/grid/ping",
+                replace: Some((
+                    "x-c2-route-uid: early-route",
+                    "x-c2-route-uid: early-route\r\nx-c2-route-uid: early-route",
+                )),
+                status: 400,
+                error: "ProtocolViolation",
+            },
+            Case {
+                path: "/grid/ping",
+                replace: Some(("x-c2-route-uid: early-route", "x-c2-route-uid:")),
+                status: 400,
+                error: "ProtocolViolation",
+            },
+            Case {
+                path: "/grid/ping",
+                replace: Some(("early-route", "retired-route")),
+                status: 409,
+                error: "RouteStale",
+            },
+            Case {
+                path: "/grid/ping",
+                replace: None,
+                status: 413,
+                error: "PayloadTooLarge",
+            },
+        ];
+        for path in [
+            "/_register",
+            "/_unregister",
+            "/_admin/unregister",
+            "/_peer/announce",
+            "/_peer/join",
+            "/_peer/heartbeat",
+            "/_peer/leave",
+            "/_peer/digest",
+        ] {
+            for replace in [None, Some(("Content-Type: text/plain\r\n", ""))] {
+                cases.push(Case {
+                    path,
+                    replace,
+                    status: 415,
+                    error: "application/json",
+                });
+            }
+        }
+        cases
+    }
+
+    // The barrier belongs only to this HTTP test. Preserve Incoming's size hint,
+    // trailers and EOF; signal the first attempted poll before allowing it.
+    struct PollBarrier {
+        body: Body,
+        entered: Option<oneshot::Sender<()>>,
+        release: Option<oneshot::Receiver<()>>,
+        frames: Arc<AtomicUsize>,
+        bytes: Arc<AtomicUsize>,
+    }
+
+    impl HttpBody for PollBarrier {
+        type Data = bytes::Bytes;
+        type Error = axum::Error;
+
+        fn poll_frame(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+            if let Some(entered) = self.entered.take() {
+                let _ = entered.send(());
+            }
+            if let Some(release) = self.release.as_mut() {
+                if Pin::new(release).poll(cx).is_pending() {
+                    return Poll::Pending;
+                }
+                self.release = None;
+            }
+            let result = Pin::new(&mut self.body).poll_frame(cx);
+            if let Poll::Ready(Some(Ok(frame))) = &result {
+                self.frames.fetch_add(1, Ordering::SeqCst);
+                if let Some(data) = frame.data_ref() {
+                    self.bytes.fetch_add(data.len(), Ordering::SeqCst);
+                }
+            }
+            result
+        }
+
+        fn size_hint(&self) -> http_body::SizeHint {
+            self.body.size_hint()
+        }
+        fn is_end_stream(&self) -> bool {
+            self.body.is_end_stream()
+        }
+    }
+
+    struct Listener {
+        state: Arc<RelayState>,
+        socket: std::net::SocketAddr,
+        entered: oneshot::Receiver<()>,
+        release: Option<oneshot::Sender<()>>,
+        frames: Arc<AtomicUsize>,
+        bytes: Arc<AtomicUsize>,
+        stop: oneshot::Sender<()>,
+        task: JoinHandle<std::io::Result<()>>,
+        _root: tempfile::TempDir,
+    }
+
+    impl Listener {
+        async fn start() -> Self {
+            let root = tempfile::tempdir().unwrap();
+            #[cfg(unix)]
+            let context = LocalEndpointContext::with_unix_root(root.path()).unwrap();
+            #[cfg(windows)]
+            let context = LocalEndpointContext::default_for_platform().unwrap();
+            let state = Arc::new(RelayState::new_with_context(
+                Arc::new(RelayConfig {
+                    relay_id: "early-rejection".into(),
+                    ..RelayConfig::default()
+                }),
+                Arc::new(NoopDisseminator),
+                context,
+            ));
+            state.with_route_table_mut(|table| {
+                assert!(table.register_route(RouteEntry {
+                    name: "grid".into(),
+                    relay_id: "early-rejection".into(),
+                    relay_url: "http://127.0.0.1:9".into(),
+                    server_id: Some("never-acquired".into()),
+                    server_instance_id: Some("never-acquired-instance".into()),
+                    ipc_address: Some("ipc://never-acquired".into()),
+                    crm_ns: "test.echo".into(),
+                    crm_name: "Echo".into(),
+                    crm_ver: "0.1.0".into(),
+                    abi_hash: TEST_ABI_HASH.into(),
+                    signature_hash: TEST_SIGNATURE_HASH.into(),
+                    max_payload_size: 3,
+                    route_uid: "early-route".into(),
+                    locality: super::super::types::Locality::Local,
+                    registered_at: 1.0,
+                }))
+            });
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let socket = listener.local_addr().unwrap();
+            let (entered_tx, entered) = oneshot::channel();
+            let (release, release_rx) = oneshot::channel();
+            let barrier = Arc::new(parking_lot::Mutex::new(Some((entered_tx, release_rx))));
+            let frames = Arc::new(AtomicUsize::new(0));
+            let bytes = Arc::new(AtomicUsize::new(0));
+            let counted_frames = frames.clone();
+            let counted_bytes = bytes.clone();
+            let app = build_router(state.clone()).layer(axum::middleware::from_fn(
+                move |request: Request<Body>, next: axum::middleware::Next| {
+                    let (entered, release) = barrier.lock().take().unwrap();
+                    let request = request.map(|body| {
+                        Body::new(PollBarrier {
+                            body,
+                            entered: Some(entered),
+                            release: Some(release),
+                            frames: counted_frames.clone(),
+                            bytes: counted_bytes.clone(),
+                        })
+                    });
+                    async move { next.run(request).await }
+                },
+            ));
+            let (stop, stopped) = oneshot::channel();
+            let task = tokio::spawn(async move {
+                axum::serve(listener, app)
+                    .with_graceful_shutdown(async {
+                        let _ = stopped.await;
+                    })
+                    .await
+            });
+            Self {
+                state,
+                socket,
+                entered,
+                release: Some(release),
+                frames,
+                bytes,
+                stop,
+                task,
+                _root: root,
+            }
+        }
+
+        fn head(&self, case: &Case, framing: &str) -> String {
+            let entry = self.state.local_route("grid").unwrap();
+            let head = request_head(self.socket, &entry, "ping", framing)
+                .replacen("/grid/ping", case.path, 1)
+                .replace(
+                    "Connection: close",
+                    "Connection: close\r\nContent-Type: text/plain",
+                );
+            match case.replace {
+                Some((from, to)) => head.replace(from, to),
+                None => head,
+            }
+        }
+
+        async fn stop(self) {
+            self.state.forwarding.close();
+            bounded(self.state.forwarding.drain()).await;
+            bounded(self.state.clients.shutdown()).await;
+            let _ = self.stop.send(());
+            bounded(self.task).await.unwrap().unwrap();
+        }
+    }
+
+    fn assert_reply(case: &Case, reply: &[u8]) {
+        assert!(
+            reply.starts_with(format!("HTTP/1.1 {} ", case.status).as_bytes()),
+            "{}: {}",
+            case.path,
+            String::from_utf8_lossy(reply)
+        );
+        assert!(
+            reply
+                .windows(case.error.len())
+                .any(|part| part == case.error.as_bytes()),
+            "{}: {}",
+            case.path,
+            String::from_utf8_lossy(reply)
+        );
+    }
+
+    #[tokio::test]
+    async fn every_early_rejection_drains_declared_body_before_reply_and_clean_eof() {
+        for case in cases() {
+            let mut server = Listener::start().await;
+            let result = AssertUnwindSafe(async {
+                let mut stream = bounded(tokio::net::TcpStream::connect(server.socket)).await.unwrap();
+                bounded(stream.write_all(server.head(&case, "Content-Length: 4").as_bytes())).await.unwrap();
+                bounded(stream.write_all(b"a")).await.unwrap();
+                bounded(async {
+                    tokio::select! {
+                        entered = &mut server.entered => entered.expect("unread request was dropped before cleanup"),
+                        reply = read_framed_reply(&mut stream) => panic!("{}: refusal arrived before declared-body cleanup: {reply:?}", case.path),
+                    }
+                }).await;
+                assert_eq!(server.state.forwarding.snapshot().used_operations, 0);
+                bounded(stream.write_all(b"bcd")).await.unwrap();
+                server.release.take().unwrap().send(()).unwrap();
+                let reply = bounded(read_framed_reply(&mut stream)).await.unwrap();
+                assert_reply(&case, &reply);
+                assert_eq!(server.bytes.load(Ordering::SeqCst), 4);
+                assert_eq!(bounded(stream.read(&mut [0])).await.unwrap(), 0, "reset after a refusal is a failure");
+                assert_eq!(server.state.forwarding.snapshot().used_operations, 0);
+                assert_eq!(server.state.forwarding.payload_budget().snapshot().used_bytes, 0);
+            }).catch_unwind().await;
+            server.stop().await;
+            if let Err(panic) = result {
+                std::panic::resume_unwind(panic);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn every_early_rejection_with_expect_never_polls_incoming_or_sends_continue() {
+        for case in cases() {
+            let mut server = Listener::start().await;
+            let result = AssertUnwindSafe(async {
+                let mut stream = bounded(tokio::net::TcpStream::connect(server.socket))
+                    .await
+                    .unwrap();
+                bounded(
+                    stream.write_all(
+                        server
+                            .head(&case, "Content-Length: 4\r\nExpect: 100-continue")
+                            .as_bytes(),
+                    ),
+                )
+                .await
+                .unwrap();
+                let reply = bounded(read_framed_reply(&mut stream)).await.unwrap();
+                assert_reply(&case, &reply); // The framing reader rejects every 1xx.
+                assert!(matches!(
+                    server.entered.try_recv(),
+                    Err(oneshot::error::TryRecvError::Empty | oneshot::error::TryRecvError::Closed)
+                ));
+                assert_eq!(server.frames.load(Ordering::SeqCst), 0);
+                assert_eq!(bounded(stream.read(&mut [0])).await.unwrap(), 0);
+            })
+            .catch_unwind()
+            .await;
+            server.stop().await;
+            if let Err(panic) = result {
+                std::panic::resume_unwind(panic);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn unknown_length_early_rejections_never_poll_incoming() {
+        for case in cases().into_iter().filter(|case| case.status != 413) {
+            let mut server = Listener::start().await;
+            let result = AssertUnwindSafe(async {
+                let mut stream = bounded(tokio::net::TcpStream::connect(server.socket))
+                    .await
+                    .unwrap();
+                bounded(
+                    stream.write_all(server.head(&case, "Transfer-Encoding: chunked").as_bytes()),
+                )
+                .await
+                .unwrap();
+                assert_reply(
+                    &case,
+                    &bounded(read_framed_reply(&mut stream)).await.unwrap(),
+                );
+                assert!(matches!(
+                    server.entered.try_recv(),
+                    Err(oneshot::error::TryRecvError::Closed | oneshot::error::TryRecvError::Empty)
+                ));
+                assert_eq!(server.frames.load(Ordering::SeqCst), 0);
+            })
+            .catch_unwind()
+            .await;
+            server.stop().await;
+            if let Err(panic) = result {
+                std::panic::resume_unwind(panic);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn json_rejection_after_reading_does_not_restart_body_cleanup() {
+        use tower::ServiceExt;
+        let server = Listener::start().await;
+        let polls = Arc::new(AtomicUsize::new(0));
+        let observed = polls.clone();
+        let body = Body::from_stream(futures::stream::poll_fn(move |_| {
+            Poll::Ready(match observed.fetch_add(1, Ordering::SeqCst) {
+                0 => Some(Ok(bytes::Bytes::from_static(b"{"))),
+                1 => Some(Err(std::io::Error::other("actual source failure"))),
+                _ => panic!("a partially read failure must not be read again"),
+            })
+        }));
+        let result = AssertUnwindSafe(async {
+            let response = build_router(server.state.clone())
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/_register")
+                        .header("content-type", "application/json")
+                        .header("content-length", 4)
+                        .body(body)
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(polls.load(Ordering::SeqCst), 2);
+            assert!(
+                String::from_utf8(
+                    axum::body::to_bytes(response.into_body(), MAX_REPLY)
+                        .await
+                        .unwrap()
+                        .to_vec()
+                )
+                .unwrap()
+                .contains("actual source failure")
+            );
+        })
+        .catch_unwind()
+        .await;
+        server.stop().await;
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
+    }
+
+    #[tokio::test]
+    async fn incomplete_rejected_upload_keeps_original_error_after_drain_deadline() {
+        for case in [cases().remove(2), cases().remove(8), cases().remove(9)] {
+            let mut server = Listener::start().await;
+            let result = AssertUnwindSafe(async {
+                let mut stream = bounded(tokio::net::TcpStream::connect(server.socket))
+                    .await
+                    .unwrap();
+                let started = tokio::time::Instant::now();
+                bounded(stream.write_all(server.head(&case, "Content-Length: 4").as_bytes()))
+                    .await
+                    .unwrap();
+                bounded(stream.write_all(b"a")).await.unwrap();
+                bounded(&mut server.entered).await.unwrap();
+                server.release.take().unwrap().send(()).unwrap();
+                let reply = bounded(read_framed_reply(&mut stream)).await.unwrap();
+                assert_reply(&case, &reply);
+                assert!(started.elapsed() >= Duration::from_secs(2));
+                assert_eq!(server.bytes.load(Ordering::SeqCst), 1);
+            })
+            .catch_unwind()
+            .await;
+            server.stop().await;
+            if let Err(panic) = result {
+                std::panic::resume_unwind(panic);
+            }
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum CapacityRequest {
     Continue,
