@@ -312,6 +312,8 @@ exact implementation candidate 必须通过 GitHub Actions 的 Linux、macOS、W
 
 块 6b 的一处取舍（2026-11-05 补记）。FastDB 0.2.4 的 Python 接口没有按区间读取载荷的正式入口，`Payload.binary_bytes()` 与 `Access.payload_bytes()` 都物化整条 bytes。Python 条目因此在它的推进里编码一次，得到条目自己持有的不可变 bytes，`write_range` 从这份 bytes 写进 SHM 分配或当前分片；它照 6a 的规则不计入 B，存到最后一片写出或流结束。在推进里编码也是必需的：生成器 yield 之后可能复用或改动同一个对象，必须在步内导出快照。同进程的流直接传对象，不编码。
 
+块 7 的几处调整（2026-11-05 补记）。其一，ABI 8 没有照第七节的设想给 native endpoint context 加持续读与流事件，而是把 c2-core 的客户端整体投影给 Node：客户端域、端点、调用、本地缓冲与错误，共 28 个入口。连接、握手、唯一的 reader 与 writer、调用记录与借出都在 Rust 里，Node 不再读写帧；把验证过的连接转交给外部事件循环的入口与不带捕获上下文的端点解析随之删除。其二，“按请求号分派到有界调用记录”里的“有界”，按每条记录缓存的东西有界理解：交付槽一条，加最多一条已授权、尚未交付的条目，不限制记录的数量；没有截止时间的 unary 仍不占 `max_outstanding_calls`。其三，`requestShmThreshold` 与 `requestChunkSize` 属于客户端域那一个 Runtime，只在创建连接器时设定。其四，生成 transport 的 unary `call` 改收编码闭包，调用截止时间从编码之前算起，与流一致。其五，表格里块 7 的“fetch 增量读取”移到块 8：块 7 经 HTTP 调用流方法时在派发前报 `UnsupportedCallMode`，不预先做 HTTP 流的解码。
+
 dispatcher 异步读锁不是 B2 才引入的隐患：现有 unary 接收循环已经在 `core/transport/c2-server/src/server.rs:2462`、`:2520` 等它，函数体在 `:3142`。第五节短发布修复同时覆盖现有 unary 和分片；只缩重组池锁不能证明控制持续推进。
 
 维护者确认第一期 Node 只做客户端；现有 Node 只有客户端生成路径（`core/foundation/c2-codegen/src/targets.rs:761`、`:927`）。v2 保留不要求 unary 契约重发，但 Node 内嵌 transport 仍须随 IPC/ABI 更新，这是第六节给出代码证据的独立迁移代价。

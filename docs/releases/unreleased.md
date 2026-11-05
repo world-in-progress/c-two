@@ -143,7 +143,7 @@ IPC handshake 15, SHM 4, C/FFI ABI 7 and relay mesh protocol 7 replace 14, 3, 6 
 ### Added
 
 - `ipc_overrides` keys `write_timeout`, `max_dedicated_segments` and `spill_threshold`, with `C2_IPC_WRITE_TIMEOUT`, `C2_IPC_MAX_DEDICATED_SEGMENTS` and `C2_IPC_SPILL_THRESHOLD` ([configuration](../reference/configuration.md)).
-- `cc.connect(timeout=...)` also bounds the OS connection, the namespace gate or listener-lease wait and the handshake, which 0.10.1 limited to fixed five-second guards; without a timeout those guards remain. Generated TypeScript accepts `connectTimeoutMs` for the same attempt, and the ABI 7 connect entries take a nullable `timeout_millis` ([C ABI](../reference/c-abi.md)).
+- `cc.connect(timeout=...)` also bounds the OS connection, the namespace gate or listener-lease wait and the handshake, which 0.10.1 limited to fixed five-second guards; without a timeout those guards remain. Generated TypeScript accepts `connectTimeoutMs` for the same attempt.
 - `cc.serve(shutdown_timeout=30.0)` validates the budget on entry, calls `shutdown` once with it after a signal and returns the outcome; 0.10.1 looped until shutdown completed. A pending outcome prints a line saying cleanup continues.
 
 ### Removed
@@ -168,7 +168,7 @@ Found by the strict comparison against 0.10.1 and not listed above:
   - `BaseIPCOverrides`, `ServerIPCOverrides` and `ClientIPCOverrides` live in `c_two.config`; `InputLifetimeLike`, `CoreError.body` and `Server.get_slot_info` are removed, `CoreError.lifecycle_kind` no longer lists `relay_duplicate_route`, `relay_http` or `held_response_copy`, and a proxy's tracker is `local_copy_tracker` (was `lease_tracker`).
   - `c_two.mem`: `PoolAlloc.allocation_id` and `PoolStats.dedicated_pending_free_bytes` are removed; `max_dedicated_segments` above 65536 is rejected; a dedicated segment no longer has a 64-byte header.
 - Rust: `Held::release` consumes the value even when invalidation fails or panics, and a later call returns `Ok`. `LifecycleError::HeldResponseCopy` is removed and `HeldResponseRelease` carries one required `invalidation_error`. `Runtime::shutdown_without_host` is removed; `Runtime::begin_session_retirement` with `RuntimeShutdownTarget::ClientsOnly` retires a Runtime that has no Host. `c_two::observe::ConnectionClosed::is_peer_end()` reports whether the peer ended the connection. The Core crate `c2-mem` changes its low-level API: `free_at` takes the allocation level instead of the data size and allocation ID, `release_handle` panics on a handle from another pool, `BuddySegment::allocator()` panics on a peer segment, and `destroy`, `gc_dedicated`, `SegmentHeader` and `ShmSpinlock` are removed. `c2-config`'s `CallTimeoutError` is replaced by `TimeoutError`, shared by every waiting budget. Receivers read a peer's blocks through `PeerMappingCache`; `MemPool::ensure_peer_segment`, `ensure_peer_dedicated`, `open_dedicated_at`, `validate_data_at`, `copy_data_at` and `data_ptr_at` are removed, and `MemPool::open_peer` only validates a peer's pool identity.
-- TypeScript: options accept an explicit `undefined` for `ipcAddress`, `serverId`, `serverInstanceId`, the two `observe` callbacks and `C2Fetch.signal`. Node applies `write_timeout`, deactivates the connection on a zero loan id as Rust does, and accepts every dedicated segment index the wire carries.
+- TypeScript: options accept an explicit `undefined` for `ipcAddress`, `serverId`, `serverInstanceId`, the two `observe` callbacks and `C2Fetch.signal`.
 - Wire: `RouteAck` (0x14), `RouteRecord.owner_epoch` and `lease_deadline_ms`, `RouteNack.nonce`, `DigestDiffEntry.hash` and the `FLAG_SHM`, `FLAG_POOL` and `FLAG_DISK_SPILL` flags are removed. A route's state is `ready` or `closed`, its reason is one of `register_committed`, `explicit_unregister` or `shutdown` and is always present, and the route directory and the mesh reject unknown fields.
 - Connections:
   - Aborting or dropping a local stream no longer forces an OS disconnect: the handle closes when its last holder releases it, so a forked child that inherited the descriptor keeps the peer from seeing the end.
@@ -206,7 +206,7 @@ There are no aliases. The old Python keyword, override key and c3 flag are rejec
 - When the budget is short, a call waits for capacity within its own deadline instead of failing, and a call without a deadline can wait without bound. A request larger than the whole budget, and unknown-length data that grows past its first reservation, fail at once with `CallCapacityExceeded` and `stage=payload_buffer_admission`. A hold of an HTTP response keeps its reservation until it is released.
 - A call's input is released as soon as the transport has written or copied it, not when the reply arrives.
 - `cc.observe.memory_stats()` adds `payload_buffer`, the budget's limit, use, peak and rejections, and `retired_payload_buffers` for earlier sessions. A wait is not counted as a rejection.
-- A relay-aware call sends its business POST once. When the relay reports that the route is stale, the call fails with that pre-dispatch `RouteStale` error and the next call resolves the route again; 0.10.1 re-sent the call once from a retained copy of its input. Generated TypeScript clients still re-send once; they follow in a later change.
+- A relay-aware call sends its business POST once. When the relay reports that the route is stale, the call fails with that pre-dispatch `RouteStale` error and the next call resolves the route again; 0.10.1 re-sent the call once from a retained copy of its input. Generated TypeScript clients do the same.
 - A chunked IPC call reserves its route at its first chunk in the connection's receive loop, in frame order, as an unchunked call does, and takes the server-wide pending permit there. Under `exclusive` and `read_parallel`, a later call on the same connection can no longer run before an earlier chunked write.
 - Registering or unregistering a route no longer makes a connection's receive loop wait, and reassembly copies no longer hold the pool or registry locks, so a large copy does not delay other calls or the expiry sweep.
 - Contract v2 accepts `"mode": "server_stream"` on a method that returns a payload. The mode enters the ABI and signature fingerprints only for such methods, so unary contracts keep their fingerprints. Code generation rejects server-stream methods until the SDKs support them.
@@ -226,7 +226,7 @@ IPC 16 replaces 15. A version 15 peer and a version 16 endpoint receive a typed 
 
 ### Behavior
 
-- A call that the server refused before it entered the resource now ends with the status NotExecuted and is reported as pre-dispatch with its canonical code and details. This covers a closed, removed or stale route, a contract or identity mismatch, server capacity and chunked input that timed out. IPC 15 reported these refusals as resource errors, which a relay turned into HTTP 500. Rust reports `IpcError::CallRejected`; Core and Python errors carry `transport_phase=pre_dispatch`; a relay answers with an HTTP status that follows the code and adds `dispatch_phase=pre_dispatch`; generated TypeScript raises `C2IpcCallRejectedError` with `retrySafe` true. C-Two still does not retry or replay the call itself.
+- A call that the server refused before it entered the resource now ends with the status NotExecuted and is reported as pre-dispatch with its canonical code and details. This covers a closed, removed or stale route, a contract or identity mismatch, server capacity and chunked input that timed out. IPC 15 reported these refusals as resource errors, which a relay turned into HTTP 500. Rust reports `IpcError::CallRejected`; Core and Python errors carry `transport_phase=pre_dispatch`; a relay answers with an HTTP status that follows the code and adds `dispatch_phase=pre_dispatch`; generated TypeScript raises `C2IpcTransportError` with `transportPhase` `pre_dispatch` and `retrySafe` true. C-Two still does not retry or replay the call itself.
 - A resource error no longer carries the phase of a call the resource made: the client removes `transport_phase` and `dispatch_phase` from it, so a Rust resource that returns a nested call's refusal is not reported as not executed.
 - The relay withdraws a route when the upstream resource reports, before execution, that the route is missing, removed or closed or that the contract or identity does not match, as it already did for the same facts at route acquisition. A stale route token withdraws nothing.
 - Each connection's writer assigns a call's request ID when it first writes the call, so calls reach the server in request-ID order.
@@ -249,7 +249,7 @@ On macOS with the FastDB sibling, the Rust Core workspace (1732 tests), c3 (81),
 
 ## Server streams in the IPC transport
 
-The IPC transport now carries server streams. The server sends each item as ITEM_BEGIN followed by ITEM_DATA, and the client grants storage and demand with CREDIT and stops a stream with CANCEL; the [server streams](../reference/ipc-handshake.md#server-streams) section gives the rules. The SDKs cannot declare or call server streams yet, and generated TypeScript, Node and the relay do not carry them. IPC 16, SHM 4, C/FFI ABI 7 and relay mesh 7 are unchanged.
+The IPC transport now carries server streams. The server sends each item as ITEM_BEGIN followed by ITEM_DATA, and the client grants storage and demand with CREDIT and stops a stream with CANCEL; the [server streams](../reference/ipc-handshake.md#server-streams) section gives the rules. The sections below add them to the SDKs.
 
 ### Behavior
 
@@ -263,7 +263,7 @@ On macOS with the FastDB sibling, the Rust Core workspace (1791 tests), c3 and t
 
 ## Server streams in Rust
 
-Rust resources and Rust clients can now use server streams over direct IPC ([ADR 0003](../decisions/0003-server-streams.md), [design](../design/2026-11-03-streaming-rpc-design.md)). The Python SDK, generated TypeScript and relay forwarding do not support them yet. IPC 16, SHM 4, C/FFI ABI 7 and relay mesh 7 are unchanged apart from the narrower SHM rule below.
+Rust resources and Rust clients can now use server streams over direct IPC ([ADR 0003](../decisions/0003-server-streams.md), [design](../design/2026-11-03-streaming-rpc-design.md)). The IPC 16 wire is unchanged apart from the narrower SHM rule below.
 
 ### Behavior
 
@@ -281,7 +281,7 @@ On macOS with the FastDB sibling, the Rust Core workspace (1827 tests, including
 
 ## Server streams in Python
 
-Python resources and Python clients now use server streams too, and Python and Rust resources and clients stream to each other over direct IPC. Generated TypeScript and relay forwarding do not support them yet. See [Python server streams](../reference/python-usage.md#server-streams).
+Python resources and Python clients now use server streams too, and Python and Rust resources and clients stream to each other over direct IPC. See [Python server streams](../reference/python-usage.md#server-streams).
 
 ### Behavior
 
@@ -301,6 +301,38 @@ Python resources and Python clients now use server streams too, and Python and R
 ### Validation
 
 On macOS with the FastDB sibling, the Rust Core workspace (1838 tests, including the unary code-generation baseline), c3 and the Rust SDK (109 together) and the CI Python gates, including the TypeScript and portable phases, passed on the integrated tree. An independent review found two defects, which the Host confirmed in the code before they were fixed: a same-process stream unregistered between taking its first route permit and committing it reported `ResourceClosed` instead of `CallCancelled`, and the held items of generated Python clients were missing from `memory_stats()['holds']`. The Host also found that copying a Python item into a frame or shared memory took the GIL; it no longer does. The first full-platform CI of the candidate `ca405b34` ([41978967958](https://github.com/Dsssyc/c-two/actions/runs/41978967958)) exposed two races in tests: a relay test asserted the budget the moment a callback entered, before the asynchronous release, and a Python stream test released the running step before the server had recorded its shutdown or unregistration. Both tests now wait for the state they assert (`293bbe37`). The exact candidate `293bbe376bf98668fe41f42f2021c281ea31dbaa` then passed [Source Validation 41987564596](https://github.com/Dsssyc/c-two/actions/runs/41987564596) on every lane after a rerun of one failed job: Linux x64 with Python 3.12 and 3.14t, macOS arm64, and Windows x64 and ARM64. The rerun job was Linux 3.12, where a generated Node client finished a rejected 64 MiB chunked upload before handling its early refusal, a timing dependence of the TypeScript transport that block 7 replaces.
+
+## Node clients on the Rust client (C/FFI ABI 8, breaking)
+
+Generated TypeScript clients now call the Rust client through C/FFI ABI 8 instead of reading and writing IPC frames in TypeScript, and they consume server streams over direct IPC. Relay forwarding does not carry server streams yet. See the [C ABI](../reference/c-abi.md) and the [TypeScript binding](../../core/foundation/c2-mem-ffi/bindings/typescript/README.md).
+
+### Upgrade together
+
+C/FFI ABI 8 replaces 7. The Node addon checks the native library's ABI before it loads anything else, so a version 7 library fails with a version error. Regenerate TypeScript clients: the generated transport changed, while the contract, release and payload artifacts are byte-for-byte unchanged.
+
+### Behavior
+
+- Each physical connection has one reader and one writer, in Rust, shared by all calls on it. The TypeScript `callChain`, which ran the calls on a connection one after another, is removed, so unary calls issued without awaiting now run concurrently, ordered only by when each call reserves its route, as in Rust and Python; await a call before issuing the next when order matters. Server admission (`max_pending_requests`, refused as NotExecuted) and the payload buffer budget bound such calls, and a unary call without a deadline still takes no `max_outstanding_calls` slot.
+- A connector from `createNodeIpcConnector` owns one native client domain; its payload buffer budget covers every connection and reconnect, and a new connection does not reset it. `requestShmThreshold` and `requestChunkSize` are fixed when the connector is created.
+- `method_{index}_{name}` of a stream method returns a `C2ResponseStream`, an async iterable, and `hold_method_{index}_{name}` yields each item as a `C2HeldResult`. Leaving a `for await` loop early or losing the stream to garbage collection submits CANCEL without waiting. `close(timeoutMs)` cancels and then waits for the original call, 30000 ms by default, without bound for `null` and once for `0`, and returns `{ completed, error, completeItems }`. A call deadline covers encoding, admission, decoding and the whole iteration, for unary calls as for streams.
+- A failure that carries a transport phase becomes `C2IpcTransportError`, whose `transportPhase` and `retrySafe` come from the native structured error; a resource error becomes `C2CoreError`. Both keep the canonical code, name and details. A stream method reached through relay HTTP forwarding fails before dispatch with `UnsupportedCallMode` (716).
+- A relay-aware call sends its business POST once and reports a stale route as a pre-dispatch `RouteStale`, and `FallbackDenied` keeps the first IPC failure as its cause.
+- Dropping a dispatched unary call's handle never cancels it.
+
+### Removed
+
+| Removed | Instead |
+| --- | --- |
+| Generated transport types `C2IpcConnection`, `C2IpcMemoryContext`, `C2IpcMemoryWrite`, `C2IpcPreparedRequest` and `C2IpcShmBlock`, and the errors `C2IpcCallRejectedError` and `C2IpcRouteNotFoundError` | `C2NativeEndpointContext`, `C2NativeCall` and `C2NativeBuffer`; a refusal is a `C2IpcTransportError` whose `transportPhase` is `pre_dispatch` |
+| `requestShmThreshold` and `requestChunkSize` in `createIpcEncodedTransport` and per-connection options | The same options of `createNodeIpcConnector` |
+| `call(routeName, contract, method, payload)` of the encoded transports | `call(routeName, contract, method, encode)`; `encode` runs inside the call deadline |
+| Binding `createNodeIpcConnect`, `createBundledC2MemFfiNodeRuntime`, `C2NodeIpcConnect`, `C2NodeIpcConnectOptions`, `C2NodeIpcConnection` and `C2NodeIpcSocket`, the memory context, block, write and prepared-request types, `C2MemFfiStatus` with its constants, `C2_MEM_FFI_MAX_SHM_PREFIX_BYTES` and the native socket types | `createNodeIpcConnector` with the native endpoint, call and buffer types; native failures are `C2NativeError` |
+| Custom connections with `write`, `readExactly` and `close`, and injected sockets with `pause` and `resume` | None: the native client owns the connection |
+| C/FFI ABI 7 memory context, request, response, write and release entries, the Unix and Windows connection transfer entries and the endpoint resolver without a captured context | ABI 8 client domain, endpoint context, call, buffer and error entries |
+
+### Validation
+
+On macOS with the FastDB sibling, the Rust Core workspace (1825 tests, including the unary code-generation baseline with its TypeScript transport entries recomputed), c3 and the Rust SDK, the CI Python gates (1447 ordinary tests, 25 portable and 14 TypeScript) and the repository checks (976) passed on the integrated tree. An independent review found five defects, three confirmed by the Host in the code and two reproduced by the reviewer, and all were fixed before integration: a native buffer released after its backing had been collected read freed memory; terminating a Worker while a call was pending could free the completion state that the native call still used; a unary call's deadline started after its input was encoded; `FallbackDenied` kept the last IPC failure instead of the first; and a close budget above 2^31−1 ms was cut to 1 ms by `setTimeout`. The Host's reading of the delivered interfaces then removed four C entries and a connector wrapper that had no users and moved the two request policies to connector creation. A host check also found that the Node test projects took type definitions from the directories above them; every TypeScript project a test writes now uses only its own `node_modules/@types`. The Windows code changed in c2-local was not compiled on macOS; full-platform CI of the exact candidate is pending.
 
 ## Connection close on Windows
 

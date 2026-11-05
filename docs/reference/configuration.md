@@ -60,6 +60,8 @@ Typed overrides are `BaseIPCOverrides`, `ServerIPCOverrides` and `ClientIPCOverr
 
 An explicit `address='ipc://...'` uses local IPC independently of relay discovery. The relay anchor handles registration and discovery; HTTP calls use the relay URL selected by resolution. Remote batch size controls C-Two payload batches, without specifying TCP packets or HTTP frames.
 
+A Node connector from `createNodeIpcConnector` fixes its client settings when it is created. Its `requestShmThreshold` and `requestChunkSize` options set the SHM threshold and the client `chunk_size`; every other setting, including the payload buffer budget and `C2_CALL_MAX_OUTSTANDING`, comes from the environment, as for a Runtime without overrides.
+
 ## Server startup timeout
 
 `cc.set_server(startup_timeout=seconds)` configures the Core startup wait before the first registration. The native `RuntimeSession` constructor and `set_server_options` accept the same keyword. Values must be finite, non-negative seconds representable by the native clock; zero expires immediately. Omitted/`None` selects the existing finite five-second default, not unlimited waiting. This default bounds unattended startup; it is not a performance guarantee for a busy runner. Applications should choose their deployment budget explicitly.

@@ -60,6 +60,8 @@ Typed overrides 为 `BaseIPCOverrides`、`ServerIPCOverrides`、`ClientIPCOverri
 
 显式 `address='ipc://...'` 连接独立于 relay 发现直接使用本地 IPC。Relay anchor 负责注册和发现，HTTP 调用使用解析结果中的目标 relay URL。远程分片大小控制 C-Two 载荷批次，不等同于 TCP 包或 HTTP frame 大小。
 
+`createNodeIpcConnector` 创建的 Node 连接器在创建时固定自己的客户端设置：选项 `requestShmThreshold` 与 `requestChunkSize` 设定 SHM 阈值与客户端的 `chunk_size`，其余设置（包括载荷缓冲预算与 `C2_CALL_MAX_OUTSTANDING`）都来自环境变量，与没有覆盖项的 Runtime 相同。
+
 ## 服务启动超时
 
 在首次注册前用 `cc.set_server(startup_timeout=seconds)` 设置 Core 的启动等待预算。原生 `RuntimeSession` 构造器和 `set_server_options` 接受同名参数。数值必须有限、非负且能由原生时钟表示；零表示立即到期。省略或 `None` 使用原有的 5 秒有限默认值，不表示无限等待。保留默认值是为了约束无人配置时的启动等待，不保证繁忙运行器能在 5 秒内就绪；应用应明确选择自己的部署预算。

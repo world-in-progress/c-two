@@ -68,7 +68,7 @@ c3 contract codegen python echo.contract.json --out-dir generated-python
 c3 contract codegen typescript echo.contract.json --out-dir generated-typescript
 ```
 
-The output contains C-Two contract/release/composition metadata, the target-specific C-Two adapter, and FastDB Core-owned payload modules. The Rust and Python targets generate server-stream methods; the TypeScript target rejects a contract that has one. Generation is fail-closed: invalid or colliding paths, hash mismatches, FastDB errors, and existing destinations produce no partial winning tree. There is no separate payload sidecar input.
+The output contains C-Two contract/release/composition metadata, the target-specific C-Two adapter, and FastDB Core-owned payload modules. All three targets generate server-stream methods. The TypeScript target generates clients only: `method_{index}_{name}` returns a `C2ResponseStream`, and `hold_method_{index}_{name}` yields each item as a `C2HeldResult`. Generation is fail-closed: invalid or colliding paths, hash mismatches, FastDB errors, and existing destinations produce no partial winning tree. There is no separate payload sidecar input.
 
 `c3 contract diagnose` reports methods that remain Python-only. Portable payload structure is authored explicitly with `@cc.transfer(...)`.
 

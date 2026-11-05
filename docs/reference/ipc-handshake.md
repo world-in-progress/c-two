@@ -6,7 +6,7 @@ Handshake 15 (the single-owner release), 14 (C-Two 0.10.x) and the preamble-free
 
 ## Scope
 
-This specification governs only `HANDSHAKE` version negotiation on ordinary RPC connections: business handshakes initiated by Rust/Python clients and generated TypeScript clients over Unix UDS or Windows Named Pipes. SIGNAL ping/shutdown control does not use this preamble and does not change with the RPC version. Diagnosability of different IPC versions applies only to RPC connections using this fixed preamble; it does not imply that any local channel or unresponsive process can report a version.
+This specification governs only `HANDSHAKE` version negotiation on ordinary RPC connections: business handshakes initiated by the Rust client, which the Python SDK and generated TypeScript clients also use through their native bindings, over Unix UDS or Windows Named Pipes. SIGNAL ping/shutdown control does not use this preamble and does not change with the RPC version. Diagnosability of different IPC versions applies only to RPC connections using this fixed preamble; it does not imply that any local channel or unresponsive process can report a version.
 
 ## Permanent fixed preamble (25 bytes)
 
@@ -21,7 +21,7 @@ Before selecting a version, both ends exchange one fixed 25-byte record. Its ide
 | 20 | `1 = Hello`, `2 = Accepted`, `3 = VersionMismatch` |
 | 21–24 | Sender's protocol version as `u32 LE`, in the range 1–4294967295 |
 
-Each side first reads the fixed 16-byte envelope and checks `total_len=21`, `RID=0`, and exact direction flags, then reads the fixed 9-byte content and checks magic, kind, and version. Do not use length-driven payload allocation or TypeScript `readIpcFrame` for an unknown preamble. Reject version zero as malformed. The fixed preamble is independent of `max_frame_size`; metadata, business, and other control frames still obey their original limits, and only a preamble satisfying both fixed length and flags is exempt. Versions are compared only for equality, with no downgrade negotiation. The preamble has no variable-length diagnostic text, supported-version list, alternate version, reserved field, or configuration switch.
+Each side first reads the fixed 16-byte envelope and checks `total_len=21`, `RID=0`, and exact direction flags, then reads the fixed 9-byte content and checks magic, kind, and version. Do not use length-driven payload allocation for an unknown preamble. Reject version zero as malformed. The fixed preamble is independent of `max_frame_size`; metadata, business, and other control frames still obey their original limits, and only a preamble satisfying both fixed length and flags is exempt. Versions are compared only for equality, with no downgrade negotiation. The preamble has no variable-length diagnostic text, supported-version list, alternate version, reserved field, or configuration switch.
 
 ## Negotiation sequence and RPC phase fence
 
@@ -85,7 +85,7 @@ A malformed record is a protocol error, not a version fact. Incorrect envelope l
 
 ## Deadlines, terminal outcome, and close
 
-Rust/Python clients place both handshake stages under the caller's existing single absolute `ConnectAttempt` deadline and handshake phase guard; neither stage receives a fresh budget. Generated TypeScript retains its existing connection interface. This change adds no handshake timer or setting and cannot promise an overall deadline for an unresponsive custom connection. A version mismatch is terminal: it does not enter stale-pool reconnection, relay HTTP fallback, or background retry, and it does not revoke other valid shared connections. After reading the fixed refusal, the client constructs the structured error and closes locally without waiting for server EOF. Server preamble reads, response writes, and metadata reads retain shutdown cancellation.
+Clients place both handshake stages under the caller's single absolute `ConnectAttempt` deadline and handshake phase guard; neither stage receives a fresh budget. Generated TypeScript clients set that deadline through the native connect timeout. There is no separate handshake timer or setting. A version mismatch is terminal: it does not enter stale-pool reconnection, relay HTTP fallback, or background retry, and it does not revoke other valid shared connections. After reading the fixed refusal, the client constructs the structured error and closes locally without waiting for server EOF. Server preamble reads, response writes, and metadata reads retain shutdown cancellation.
 
 The server creates one absolute `DEFAULT_CONNECT_TIMEOUT` (five-second) upper bound when it starts sending a rejection. Writer acquisition, `write_all`, asynchronous flush, and bounded peer-close wait share its remaining time and can be canceled by shutdown; no step gets a new budget. Version-rejection peer-close wait continues until client close, shutdown cancellation, or this budget's expiry, without the earlier control-ACK 50 ms window. Do not call synchronous `FlushFileBuffers` and occupy a Tokio worker: Microsoft documents that it waits for the client to consume buffered data, while `DisconnectNamedPipe` discards unread data. Asynchronous flush only drains existing adapter writes and does not prove client consumption.
 
