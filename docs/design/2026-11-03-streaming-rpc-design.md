@@ -316,6 +316,8 @@ exact implementation candidate 必须通过 GitHub Actions 的 Linux、macOS、W
 
 块 8 计划阶段的更正（2026-11-05 补记）。3.8 写了“多跳同样逐跳拉取”，但 relay 只把调用转给自己的本地路由（`core/transport/c2-http/src/relay/router.rs` 的 `validate_expected_crm_for_route` 只查本地路由），没有 relay 到 relay 的转发；客户端经 mesh 解析后直接找拥有路由的 relay。块 8 不新造多跳转发，那一句作废。另外，3.4 末段要求转发一跳把 whole SHM 的 carrier 保留到最后一片复制结束，这需要转发用的 IPC 客户端只有正窗口时就能收到 whole SHM 的 ITEM_DATA；复制只占窗口，SHM backing 仍计在服务端的 SHM 预算上。最终消费者的路径不变，仍先为整条预约 B、再授予整条的存储额度。
 
+块 8a 的几处调整（2026-11-06 补记）。其一，终态记录是控制信息：服务端流的 IPC CALL_END，以及 HTTP 流的 CALL_END 与 FAILURE，接收方都不计入 B、也不为它等 B，长度上限由 IPC 帧的 u32 长度推出（`c2_wire::rpc::MAX_CALL_END_PAYLOAD_BYTES`，4294967282 字节），IPC 与 HTTP 共用；条目与 unary 经 HTTP 的响应体仍计入 B。原先客户端为终态预约 B，调用方的 hold 用满 B 时，一条 121 字节的 `CallCancelled` 终态读不进来，`close` 只能报派发不确定。其二，HTTP 流的条目改成 ITEM_BEGIN 加若干 ITEM_DATA：开头记录只给总长，数据分片各自带长度，Failed 的 CALL_END 可以跟在半条之后，客户端丢弃这半条，完整条目数只算完整的。最初的格式把整条长度写进条目头，资源在条目中途出错时 relay 无法在 HTTP 上交付真实终态，只能中止响应，把已结束的调用变成派发不确定（独立审查发现）。其三，服务端只要收到正的存储额度就可以发整条 SHM 条目，这一帧用掉已授予的全部额度；最终消费者照旧整条预约、整条授予，relay 每次只授予一个复制窗口，逐片复制、最后一片之后才结束读区间。其四，relay 先预约 B、再取上游连接的租约，取得后重新核对路由，等 B 期间不占连接；两个方向的最小发送区与输入在派发前一次原子预约。其五，经 relay 的慢读实测（macOS 本机回环 TCP、一跳、B=256 KiB、片宽 4 KiB）：64 字节条目最多提前 5179 步，128 KiB 条目 10 步，空条目在测试的 20 万条内一直推进到底。第十二节第 5 条预想的“多推进几步”只对大条目成立；提前量约等于 HTTP 与 TCP 缓冲能装下的记录数，按步数没有上界。
+
 dispatcher 异步读锁不是 B2 才引入的隐患：现有 unary 接收循环已经在 `core/transport/c2-server/src/server.rs:2462`、`:2520` 等它，函数体在 `:3142`。第五节短发布修复同时覆盖现有 unary 和分片；只缩重组池锁不能证明控制持续推进。
 
 维护者确认第一期 Node 只做客户端；现有 Node 只有客户端生成路径（`core/foundation/c2-codegen/src/targets.rs:761`、`:927`）。v2 保留不要求 unary 契约重发，但 Node 内嵌 transport 仍须随 IPC/ABI 更新，这是第六节给出代码证据的独立迁移代价。

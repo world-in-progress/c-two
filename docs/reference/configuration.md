@@ -127,7 +127,7 @@ C2_RELAY_IDLE_TIMEOUT=60
 | System HTTP proxy | — | `C2_RELAY_USE_PROXY` | `false` |
 | Anti-entropy interval | — | `C2_RELAY_ANTI_ENTROPY_INTERVAL` | 60 seconds; `0` disables anti-entropy |
 
-`remote_payload_chunk_size` is the single remote-body batching policy, resolved by Rust from the typed transport override or `C2_REMOTE_PAYLOAD_CHUNK_SIZE`. It defaults to 1 MiB and accepts positive values up to 128 MiB. Relay HTTP uses it for outbound request bodies and materialized response-body streaming; `C2_IPC_CHUNK_SIZE` independently controls IPC wire chunks and reassembly. The remote value does not specify TCP packets or HTTP frame boundaries.
+`remote_payload_chunk_size` is the single remote-body batching policy, resolved by Rust from the typed transport override or `C2_REMOTE_PAYLOAD_CHUNK_SIZE`. It defaults to 1 MiB and accepts positive values up to 128 MiB. Relay HTTP uses it for outbound request bodies, and a relay copies each response or stream-item slice out of its upstream carrier in at most the lesser of this size and the upstream IPC `chunk_size`; `C2_IPC_CHUNK_SIZE` independently controls IPC wire chunks and reassembly. The remote value does not specify TCP packets or HTTP frame boundaries.
 
 Core relay-aware clients make one route observation followed by at most one pre-dispatch refresh; this bound is fixed and is not configurable through SDK settings.
 
@@ -137,7 +137,7 @@ Relay freezes forwarding limits at startup and applies them to all forwarded bus
 
 Relay capacity rejection is fixed before business admission. For a request without Expect and with a valid declared length, the HTTP handler discards transport data frame by frame within that length and one two-second deadline. It does not aggregate the payload, decode it, invoke a resource or retry admission; capacity released during disposal does not change the rejection. Rejected Expect or unknown-length bodies are not read. Read faults, length mismatches and timeout preserve the original capacity error. An incomplete or faulty transport can prevent the client from receiving that response.
 
-After an HTTP caller disconnects, an already-dispatched forward keeps its upstream connection until actual completion; its request body is released once it has been copied upstream. Relay shutdown stops admission and waits for forwarding and native client cleanup. A resource method that never returns continues to occupy its slot and delays shutdown.
+After an HTTP caller disconnects, an already-dispatched forward keeps its upstream connection until actual completion; its request body is released once it has been copied upstream. Relay shutdown stops admission, ends the server streams it forwards between their steps with `CallCancelled` naming relay shutdown, and waits for forwarding and native client cleanup; unary calls already forwarded still finish. A resource method that never returns, or a stream client that has stopped reading, continues to occupy its slot and delays shutdown.
 
 ## Local endpoint directories
 

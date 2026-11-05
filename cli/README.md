@@ -134,7 +134,7 @@ The relay resolves and freezes its own upstream IPC policy at startup; an applic
 
 Forwarding limits freeze at startup and apply to every business request, including callers with unlimited waits. Known input lengths reserve capacity before request transfer; unknown lengths charge checked growth as bytes arrive. Capacity refusal does not withdraw a route. These limits are independent of the upstream storage budgets and do not measure process RSS.
 
-Each forwarding transaction owns its input and upstream operation after its HTTP waiter disconnects. Ctrl+C closes admission and waits for actual forwarding completion and native-client cleanup. A resource method that never returns can keep shutdown pending; disconnecting the caller does not cancel that method.
+Each forwarding transaction owns its input and upstream operation after its HTTP waiter disconnects. Disconnecting cancels nothing for a unary call; for a server stream the relay submits cancellation upstream when the caller drops the response. Ctrl+C closes admission, ends the server streams the relay forwards between their steps with `CallCancelled` naming relay shutdown, and waits for actual forwarding completion and native-client cleanup; unary calls already forwarded still finish. A resource method that never returns, or a stream client that has stopped reading, can keep shutdown pending.
 
 ```bash
 c3 relay --bind 127.0.0.1:8080 --idle-timeout 10 \

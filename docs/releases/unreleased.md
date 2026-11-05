@@ -218,7 +218,7 @@ The exact candidate `787d4205b5e9a23505c22b8155cf18a5a92dcad2` passed [Source Va
 
 ## IPC 16 call records (breaking)
 
-Calls now travel as IPC 16 call records; the [IPC handshake and call records](../reference/ipc-handshake.md#call-records-version-16) page gives the layout, and section 7 of the [streaming design](../design/2026-11-03-streaming-rpc-design.md) the reasons. SHM 4, C/FFI ABI 7 and relay mesh 7 are unchanged. The transport also carries server streams ([below](#server-streams-in-the-ipc-transport)), but the SDKs cannot use them yet.
+Calls now travel as IPC 16 call records; the [IPC handshake and call records](../reference/ipc-handshake.md#call-records-version-16) page gives the layout, and section 7 of the [streaming design](../design/2026-11-03-streaming-rpc-design.md) the reasons. SHM 4 and relay mesh 7 are unchanged; C/FFI ABI 8 follows [below](#node-clients-on-the-rust-client-cffi-abi-8-breaking). The transport also carries server streams ([below](#server-streams-in-the-ipc-transport)), which the SDK sections that follow use.
 
 ### Upgrade together
 
@@ -273,7 +273,6 @@ Rust resources and Rust clients can now use server streams over direct IPC ([ADR
 - Every server stream holds a `max_outstanding_calls` slot until its real terminal, also without a deadline; unary calls without a deadline are still not counted. A finite unary call now releases its slot before its result reaches the caller, so a caller that sends the next call at once is no longer refused while the limit is full.
 - The server no longer charges stream items to the payload buffer budget: an SHM item is written straight into its shared-memory allocation and an inline item is copied one frame at a time, so a Runtime that streams to itself over IPC cannot wait on its own reservation. The client still reserves each item in full before granting storage for it.
 - An SHM ITEM_DATA must now carry the whole item; a partial SHM part, or an item that mixes SHM and inline parts, is a protocol error. The client copies a whole SHM item outside its receive loop, so other calls on the connection keep moving during the copy.
-- A relay's HTTP forwarding refuses a stream method before dispatch with `UnsupportedCallMode`; the unary methods of the same contract still go through the relay.
 
 ### Validation
 
@@ -304,7 +303,7 @@ On macOS with the FastDB sibling, the Rust Core workspace (1838 tests, including
 
 ## Node clients on the Rust client (C/FFI ABI 8, breaking)
 
-Generated TypeScript clients now call the Rust client through C/FFI ABI 8 instead of reading and writing IPC frames in TypeScript, and they consume server streams over direct IPC. Relay forwarding does not carry server streams yet. See the [C ABI](../reference/c-abi.md) and the [TypeScript binding](../../core/foundation/c2-mem-ffi/bindings/typescript/README.md).
+Generated TypeScript clients now call the Rust client through C/FFI ABI 8 instead of reading and writing IPC frames in TypeScript, and they consume server streams over direct IPC. They do not read server streams through a relay yet; Rust and Python clients do ([below](#server-streams-through-a-relay)). See the [C ABI](../reference/c-abi.md) and the [TypeScript binding](../../core/foundation/c2-mem-ffi/bindings/typescript/README.md).
 
 ### Upgrade together
 
@@ -333,6 +332,26 @@ C/FFI ABI 8 replaces 7. The Node addon checks the native library's ABI before it
 ### Validation
 
 On macOS with the FastDB sibling, the Rust Core workspace (1825 tests, including the unary code-generation baseline with its TypeScript transport entries recomputed), c3 and the Rust SDK, the CI Python gates (1447 ordinary tests, 25 portable and 14 TypeScript) and the repository checks (976) passed on the integrated tree. An independent review found five defects, three confirmed by the Host in the code and two reproduced by the reviewer, and all were fixed before integration: a native buffer released after its backing had been collected read freed memory; terminating a Worker while a call was pending could free the completion state that the native call still used; a unary call's deadline started after its input was encoded; `FallbackDenied` kept the last IPC failure instead of the first; and a close budget above 2^31−1 ms was cut to 1 ms by `setTimeout`. The Host's reading of the delivered interfaces then removed four C entries and a connector wrapper that had no users and moved the two request policies to connector creation. A host check also found that the Node test projects took type definitions from the directories above them; every TypeScript project a test writes now uses only its own `node_modules/@types`. The Windows code changed in c2-local was not compiled on macOS; full-platform CI of the exact candidate is pending.
+
+## Server streams through a relay
+
+Rust and Python clients now read server streams through a relay, with the same handles, `close` and holds as over IPC. See [server streams over HTTP](../reference/contracts-and-routing.md#server-streams-over-http) and section 3.8 of the [streaming design](../design/2026-11-03-streaming-rpc-design.md). Generated TypeScript clients still refuse a stream method over relay HTTP before dispatch; they will read relay streams with the TypeScript runtime package.
+
+### Behavior
+
+- A stream call sends its business POST once, with `Accept: application/vnd.c-two.server-stream;version=1`. The relay answers with an `x-c2-call-token` header and a body of ITEM_BEGIN, ITEM_DATA, CALL_END and FAILURE records. A Failed CALL_END may follow part of an item, which the client discards; the count of complete items covers whole items only.
+- The relay copies a response out of its upstream carrier one slice at a time, only when the HTTP library asks for more body and the slice's payload buffer reservation is granted, instead of assembling the whole value first; this applies to unary responses too. An upstream SHM value keeps its read range until its last slice has been copied. The relay now charges the responses and stream items it forwards to its payload buffer budget, and before dispatch it reserves the input and a minimum sending area for each direction in one step, then acquires its upstream connection and checks the route again, so it holds no connection while it waits for the budget.
+- Dropping a stream or calling `close()` sends `DELETE /_calls/{token}`; the original response stays readable, and `close()` reports the real terminal and count of complete items. When a client drops the HTTP response, the relay cancels the call upstream. Other calls on the same upstream connection are not affected.
+- Relay shutdown ends the streams the relay forwards between their steps: the running step finishes, the items already produced are still forwarded, and the stream ends with `CallCancelled` naming relay shutdown. A stream not yet dispatched is refused with the same error before dispatch, and unary calls already forwarded still finish. IPC 16's CANCEL record now carries its cause, Consumer or Lifecycle, so that a relay's shutdown keeps delivering the items already produced.
+- A stream's terminal record is control: neither the IPC client, the relay nor the HTTP client charges it to the payload buffer budget or waits for the budget to read it. Its size is bounded by the IPC frame length, 4294967282 bytes. Before this, a 121-byte `CallCancelled` terminal could not be read while the caller's holds filled the budget.
+- The server may send a whole SHM item once any storage has been granted. A relay grants one copy window at a time and copies such an item in slices; a client that consumes the item still reserves and grants it whole.
+- HTTP carries no CREDIT, so a resource can run ahead of a consumer that stops reading by about as many items as the HTTP and TCP buffers between them hold. In one measurement on macOS through one relay, a resource ran up to 5,179 steps ahead with 64-byte items and 10 steps with 128 KiB items, and with empty items it ran through all 200,000 items of the test. Use direct IPC when a stream's steps must wait for its consumer.
+- An unknown-length request is no longer refused when the budget leaves room only for one-byte sending areas; widening the area for a known total is an optimization, not part of admission.
+- A relay's own error before dispatch, such as a stale route, is read under the IPC frame bound instead of the route's `max_payload_size`, so a route with a very small payload limit still reports it as pre-dispatch. This applies to unary calls too.
+
+### Validation
+
+On macOS with the FastDB sibling, the Rust Core workspace (1900 tests), c3, the Rust SDK, the CI Python gates (1455 ordinary tests, 25 portable and 14 TypeScript) and the repository checks (976) passed on the integrated tree. An independent review found four defects, which the Host confirmed in the code before they were fixed: a stream reader could end without the item queued just before the terminal; the first HTTP record format fixed an item's whole length in its header, so a resource error in the middle of an item could only abort the response; an unknown-length request was refused when the upload area could not be widened; and a relay's pre-dispatch error was read under the route's payload limit and reported as dispatch-uncertain. Full-platform CI of the exact candidate is pending.
 
 ## Connection close on Windows
 

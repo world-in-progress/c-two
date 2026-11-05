@@ -127,7 +127,7 @@ C2_RELAY_IDLE_TIMEOUT=60
 | 系统 HTTP proxy | — | `C2_RELAY_USE_PROXY` | `false` |
 | 反熵交换间隔 | — | `C2_RELAY_ANTI_ENTROPY_INTERVAL` | 60 秒，`0` 关闭反熵 |
 
-`remote_payload_chunk_size` 是唯一的远程 body 分批策略，由 Rust 从传输策略覆盖值或 `C2_REMOTE_PAYLOAD_CHUNK_SIZE` 解析；默认 1 MiB，允许大于零且不超过 128 MiB。Relay HTTP 将其用于发出的请求 body 及已物化响应 body 的流式发送；`C2_IPC_CHUNK_SIZE` 独立控制 IPC 线格式分片与重组。远程配置值不指定 TCP packet 或 HTTP frame 的边界。
+`remote_payload_chunk_size` 是唯一的远程 body 分批策略，由 Rust 从传输策略覆盖值或 `C2_REMOTE_PAYLOAD_CHUNK_SIZE` 解析；默认 1 MiB，允许大于零且不超过 128 MiB。Relay HTTP 将其用于发出的请求 body；relay 从上游 carrier 复制响应或流条目时，每片不超过它与上游 IPC `chunk_size` 中较小的一个；`C2_IPC_CHUNK_SIZE` 独立控制 IPC 线格式分片与重组。远程配置值不指定 TCP packet 或 HTTP frame 的边界。
 
 Core relay-aware 客户端进行一次路由观察，随后至多进行一次派发前刷新；此上限固定，不通过 SDK 设置配置。
 
@@ -137,7 +137,7 @@ Relay 在启动时冻结转发限额，所有业务转发均受约束，包括�
 
 Relay 容量不足时，拒绝结果在业务准入前确定。对于没有 Expect 头、长度声明有效的请求，HTTP handler 按帧丢弃传输数据，受声明长度和 2 秒的总截止时间约束；不聚合整包、不解码、不调用资源、不再次申请业务准入。期间容量释放也不改变拒绝结果。Expect 或未知长度的拒绝请求不读取 body；读取错误、长度不符或超时保留原容量错误。未完成或错误的传输可能使客户端无法收到该响应。
 
-HTTP 调用方断开后，已经派发的转发仍持有上游连接，直到实际完成；它的请求体在复制到上游之后就释放。Relay 关闭先停止准入，再等待转发和原生客户端清理。始终不返回的资源方法会持续占用名额，也会阻塞关闭。
+HTTP 调用方断开后，已经派发的转发仍持有上游连接，直到实际完成；它的请求体在复制到上游之后就释放。Relay 关闭先停止准入，让经它转发的服务端流在步之间结束，以写明 relay 关闭的 `CallCancelled` 收尾，再等待转发和原生客户端清理；已经转发的 unary 调用照常完成。始终不返回的资源方法，或已停止读取的流客户端，会持续占用名额，也会阻塞关闭。
 
 ## 本地端点位置与平台差异
 
