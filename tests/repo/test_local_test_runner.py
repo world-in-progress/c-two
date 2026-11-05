@@ -146,6 +146,30 @@ def test_rust_counts_preserve_ignored_and_reject_unknown_ignore():
         runner.test_counts('core', 'test some_unknown ... ignored\ntest result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.1s\n', None)
 
 
+def test_rust_counts_allow_on_demand_http_slow_reader_measurement():
+    runner = local()
+    log = '''\
+     Running unittests src/lib.rs (core/target/debug/deps/c2_http-candidate)
+
+running 3 tests
+test relay::block8_tests::one_hop_real_http_stream_inline_and_whole_shm ... ok
+test relay::block8_tests::slow_reader_large_items_stall_tcp_and_bound_producer_distance ... ok
+test relay::block8_tests::slow_reader_records_real_tcp_stall_and_producer_distance ... ignored, on-demand slow-reader measurement; run command is in the adjacent test comments
+
+test result: ok. 2 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.58s
+'''
+    assert runner.test_counts('core', log, None) == {
+        'passed': 2, 'failed': 0, 'ignored': 1, 'measured': 0, 'filtered': 0,
+    }
+    # A matching reason does not authorize an unregistered test name.
+    unknown = log.replace(
+        'relay::block8_tests::slow_reader_records_real_tcp_stall_and_producer_distance',
+        'relay::block8_tests::unregistered_measurement',
+    )
+    with pytest.raises(runner.LocalError, match='unrecognized ignored Rust test'):
+        runner.test_counts('core', unknown, None)
+
+
 def test_repo_preparation_provides_official_release_fixtures_without_native_build(tmp_path, monkeypatch):
     monkeypatch.delenv('C2_DEV_FASTDB_RELEASE_FIXTURES', raising=False)
     runner = local()

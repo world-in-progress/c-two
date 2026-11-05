@@ -161,6 +161,72 @@ impl Harness {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn completion_observes_published_terminal_under_state_lock_contention() {
+    let harness = Harness::start().await;
+    let response = harness.stream().await;
+    response
+        .cancellation()
+        .cancel(rpc::CancelCause::Consumer)
+        .unwrap();
+    tokio::time::timeout(WAIT, async {
+        loop {
+            let changed = response.call.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if response.call.state.lock().ended {
+                break;
+            }
+            changed.await;
+        }
+    })
+    .await
+    .unwrap();
+
+    // The real CALL_END has been published. Hold the same short lock that the
+    // writer takes for has_control/take_control, without issuing another wake
+    // when it is released. The barrier starts observation inside this interval.
+    let state = response.call.state.lock();
+    assert!(state.terminal.is_some());
+    let entered = std::sync::Barrier::new(2);
+    let (parked_tx, parked_rx) = std::sync::mpsc::channel();
+    let runtime = tokio::runtime::Handle::current();
+    let result = std::thread::scope(|scope| {
+        let observer = scope.spawn(|| {
+            runtime.block_on(async {
+                let completion = response.completion();
+                tokio::pin!(completion);
+                entered.wait();
+                tokio::time::timeout(
+                    WAIT,
+                    std::future::poll_fn(|cx| {
+                        let result = completion.as_mut().poll(cx);
+                        if result.is_pending() {
+                            let _ = parked_tx.send(());
+                        }
+                        result
+                    }),
+                )
+                .await
+            })
+        });
+        entered.wait();
+        // A try_lock waiter parks and releases this gate immediately. A lock
+        // waiter blocks inside its poll, so bound the rendezvous before letting
+        // it acquire the lock. No sleep schedules the failing interleaving.
+        let _ = parked_rx.recv_timeout(Duration::from_millis(100));
+        drop(state);
+        observer.join().unwrap()
+    });
+    let terminal = result
+        .expect("completion lost the terminal's last wake")
+        .unwrap();
+    assert_eq!(terminal.status, CallStatus::Failed);
+    assert_eq!(terminal.error.unwrap().code, ErrorCode::CallCancelled);
+    drop(response);
+    harness.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn consumer_cancel_between_shm_ready_and_copy_preparation_is_a_call_error() {
     let harness = Harness::start().await;
     let mut response = harness.stream().await;
@@ -230,7 +296,7 @@ async fn terminal_during_owned_copy(consumer_first: bool) {
     .await
     .unwrap();
     assert!(call.state.try_lock().is_some());
-    assert!(response.try_completion().is_none());
+    assert!(response.completion().now_or_never().is_none());
     let id = call.state.lock().id.unwrap();
     assert!(call.conn.core.stream_state(id).is_some());
     let unary = tokio::time::timeout(
@@ -246,7 +312,7 @@ async fn terminal_during_owned_copy(consumer_first: bool) {
         .cancellation()
         .cancel(rpc::CancelCause::Consumer)
         .unwrap();
-    assert!(response.try_completion().is_none());
+    assert!(response.completion().now_or_never().is_none());
     let mut last_read = [0; 1];
     step.carrier
         .copy_range_into(step.offset, &mut last_read)
@@ -290,7 +356,7 @@ async fn physical_failure_waits_for_owned_shm_copy_to_end() {
         .prepare_copy_locked(&mut call.state.lock(), budget.try_reserve(8).unwrap(), 8)
         .unwrap();
     call.transport_failed(IpcError::Closed);
-    assert!(response.try_completion().is_none());
+    assert!(response.completion().now_or_never().is_none());
     assert!(call.state.lock().deferred_failure.is_some());
     assert!(call.copy_carrier(step).is_err());
     assert_eq!(budget.snapshot().used_bytes, 0);
@@ -335,9 +401,9 @@ async fn successful_call_end_and_later_failure_wait_for_final_owned_copy() {
     )
     .await
     .unwrap();
-    assert!(response.try_completion().is_none());
+    assert!(response.completion().now_or_never().is_none());
     call.transport_failed(IpcError::Closed);
-    assert!(response.try_completion().is_none());
+    assert!(response.completion().now_or_never().is_none());
     let last = call.copy_carrier(step).unwrap();
     assert_eq!(last.as_ref(), &[7; 8]);
     let terminal = response.completion().await.unwrap();

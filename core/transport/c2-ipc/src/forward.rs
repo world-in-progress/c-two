@@ -319,28 +319,28 @@ impl IpcForwardStream {
             let notified = self.call.changed.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
-            if let Some(result) = self.try_completion() {
+            let observed = {
+                // Contention is not a pending outcome: the last notification
+                // may have been sent while this state lock was still held.
+                let state = self.call.state.lock();
+                if let Some(terminal) = &state.terminal {
+                    Some(Ok(terminal.clone()))
+                } else if state.ended {
+                    Some(Err(dispatch_uncertain_call_error(
+                        state
+                            .io_error
+                            .as_ref()
+                            .map_or(IpcError::Closed, stream::clone_observation_error),
+                    )))
+                } else {
+                    None
+                }
+            };
+            if let Some(result) = observed {
                 return result;
             }
             notified.await;
         }
-    }
-
-    pub fn try_completion(&self) -> Option<Result<stream::StreamTerminal, crate::IpcCallError>> {
-        self.call.state.try_lock().and_then(|state| {
-            if let Some(terminal) = &state.terminal {
-                Some(Ok(terminal.clone()))
-            } else if state.ended {
-                Some(Err(dispatch_uncertain_call_error(
-                    state
-                        .io_error
-                        .as_ref()
-                        .map_or(IpcError::Closed, stream::clone_observation_error),
-                )))
-            } else {
-                None
-            }
-        })
     }
 }
 

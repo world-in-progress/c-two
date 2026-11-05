@@ -1190,15 +1190,17 @@ async fn real_http_capacity_freed_during_rejected_upload_never_dispatches() {
             !fixture.state.forwarding.snapshot().closed,
             "domain must stay open while B finishes uploading"
         );
-        assert_eq!(
+        // A delivered reply can precede Hyper dropping its final payload slice.
+        eventually(|| {
             fixture
                 .state
                 .forwarding
                 .payload_budget()
                 .snapshot()
-                .used_bytes,
-            0
-        );
+                .used_bytes
+                == 0
+        })
+        .await;
 
         bounded(rejected.write_all(&vec![7; INPUT_LEN - 1]))
             .await
@@ -1961,6 +1963,7 @@ async fn h1_admitted_unknown_upload_can_finish_after_operation_admission_closes(
             String::from_utf8_lossy(&reply)
         );
         bounded(fixture.state.forwarding.drain()).await;
+        eventually(|| fixture.state.forwarding.payload_budget().snapshot().used_bytes == 0).await;
         let refunded = fixture.state.forwarding.snapshot();
         let refunded_payload = fixture.state.forwarding.payload_budget().snapshot();
         assert_eq!(

@@ -673,95 +673,138 @@ impl Consumer {
     }
 }
 
+async fn slow_reader_case(
+    shm: bool,
+    repetition: usize,
+    count: u32,
+    size: u32,
+    pause_limit: Duration,
+) -> serde_json::Value {
+    let mut fixture = Fixture::start(shm, 256 * 1024).await;
+    let response = bounded(fixture.request(count, size).send()).await.unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.headers()["content-type"], stream_wire::MEDIA_TYPE);
+    fixture.armed.store(true, Ordering::SeqCst);
+    // No response-body read occurs before actual write stall or natural
+    // source exhaustion. Large item-count caps probe beyond the original
+    // small/empty runs; a naturally exhausted row establishes no bound.
+    let stalled = tokio::select! {
+        result = fixture.pending.recv() => result.is_some(),
+        _ = tokio::time::timeout(pause_limit, async {
+            while fixture.observed.finished.load(Ordering::SeqCst) != 1 {
+                tokio::task::yield_now().await;
+            }
+        }) => {
+            assert_eq!(fixture.observed.finished.load(Ordering::SeqCst), 1,
+                "source neither stalled nor exhausted within the pause safety cap");
+            false
+        },
+    };
+    let at_pause = fixture.observed.produced.load(Ordering::SeqCst);
+    let consumed_at_pause = fixture.observed.consumed.load(Ordering::SeqCst);
+    assert_eq!(
+        consumed_at_pause, 0,
+        "reader has not received a complete ITEM"
+    );
+    let natural = fixture.observed.finished.load(Ordering::SeqCst) == 1;
+    if size > 4096 {
+        assert!(stalled, "large ITEM must produce a real TCP write stall");
+        assert!(
+            !natural,
+            "source naturally exhausted before the socket stalled"
+        );
+    }
+    let mut consumer = Consumer::new();
+    consumer.max_ahead = at_pause;
+    let mut response = response;
+    while let Some(chunk) = bounded(response.chunk()).await.unwrap() {
+        consumer.push(
+            &chunk,
+            fixture.observed.produced.load(Ordering::SeqCst),
+            size as usize,
+            &fixture.observed,
+        );
+    }
+    assert_eq!(consumer.complete, count as usize);
+    assert_eq!(
+        fixture.observed.consumed.load(Ordering::SeqCst),
+        count as usize
+    );
+    assert!(consumer.terminal);
+    assert!(consumer.buffer.is_empty());
+    assert_eq!(fixture.observed.finished.load(Ordering::SeqCst), 1);
+    let record = serde_json::json!({
+        "carrier": if shm { "whole_shm" } else { "inline" },
+        "repetition": repetition,
+        "item_bytes": size, "items": count,
+        "pause_safety_cap_seconds": pause_limit.as_secs(),
+        "relay_budget_bytes": fixture.budget_bytes,
+        "relay_copy_window_bytes": 4096,
+        "server_ipc_chunk_bytes": 4096,
+        "upstream_ipc_chunk_bytes": 4096,
+        "remote_payload_chunk_bytes": 4096,
+        "tcp_write_pending_observed": stalled,
+        "source_naturally_exhausted_while_reader_paused": natural,
+        "P_at_pause_boundary": at_pause,
+        "C_at_pause_boundary": consumed_at_pause,
+        "max_event_P_minus_C": fixture.observed.peak_ahead.load(Ordering::SeqCst),
+        "max_read_sample_P_minus_C": consumer.max_ahead,
+        "backpressure_peak_P_minus_C": (!natural && stalled).then(|| fixture.observed.peak_ahead.load(Ordering::SeqCst)),
+        "natural_exhaustion_P_minus_C": natural.then_some(at_pause),
+        "server_shm_peak_bytes": fixture.server.memory_budget_snapshot().budget.shm.peak_bytes,
+        "final_P": fixture.observed.produced.load(Ordering::SeqCst),
+        "final_C": consumer.complete,
+    });
+    eprintln!("[block8-slow-read] {record}");
+    fixture.stop().await;
+    record
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn slow_reader_large_items_stall_tcp_and_bound_producer_distance() {
+    // A strict distance below the finite source length rules out exhausting
+    // the source into HTTP buffers and mistaking that for backpressure.
+    const COUNT: u32 = 64;
+    for shm in [false, true] {
+        let record = slow_reader_case(shm, 0, COUNT, 128 * 1024, WAIT).await;
+        assert!(record["tcp_write_pending_observed"].as_bool().unwrap());
+        let ahead = record["max_event_P_minus_C"].as_u64().unwrap();
+        assert!(
+            ahead < u64::from(COUNT),
+            "producer distance reached the source safety cap: {record}"
+        );
+    }
+}
+
+// Full measurement, deliberately separate from the regression above. Run:
+// CARGO_TARGET_DIR="$PWD/core/target" cargo test --manifest-path core/Cargo.toml \
+//   -p c2-http --features relay --lib \
+//   relay::block8_tests::slow_reader_records_real_tcp_stall_and_producer_distance \
+//   -- --exact --ignored --nocapture --test-threads=1
+// Both upstream carriers run twice for empty, 64-byte and 128-KiB items. The
+// final consumer does not read the HTTP body until the real TCP poll_write
+// returns Pending or the resource finishes. P is counted on each yield, C on
+// each complete item received, with one test lock capturing max(P-C) at those
+// events. Natural exhaustion and the 120-second safety cap establish no bound.
+// JSON rows record both the event peak and read samples, final counts, carrier,
+// windows and budgets in target/block8a-fix-validation/slow-read.json. These
+// observations depend on the OS's HTTP/TCP buffers; no small-item step bound
+// is asserted. The metered socket delegates all bytes and wakeups unchanged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "on-demand slow-reader measurement; run command is in the adjacent test comments"]
 async fn slow_reader_records_real_tcp_stall_and_producer_distance() {
     let mut records = Vec::new();
     for shm in [false, true] {
         for repetition in 0..2 {
             for (count, size) in [(200_000_u32, 0_u32), (100_000, 64), (512, 128 * 1024)] {
-                let mut fixture = Fixture::start(shm, 256 * 1024).await;
-                let response = bounded(fixture.request(count, size).send()).await.unwrap();
-                assert_eq!(response.status(), 200);
-                assert_eq!(response.headers()["content-type"], stream_wire::MEDIA_TYPE);
-                fixture.armed.store(true, Ordering::SeqCst);
-                // No response-body read occurs before actual write stall or natural
-                // source exhaustion. Large item-count caps probe beyond the original
-                // small/empty runs; a naturally exhausted row establishes no bound.
-                let stalled = tokio::select! {
-                    result = fixture.pending.recv() => result.is_some(),
-                    _ = tokio::time::timeout(Duration::from_secs(120), async {
-                        while fixture.observed.finished.load(Ordering::SeqCst) != 1 {
-                            tokio::task::yield_now().await;
-                        }
-                    }) => {
-                        assert_eq!(fixture.observed.finished.load(Ordering::SeqCst), 1,
-                            "source neither stalled nor exhausted within the 120-second test safety cap");
-                        false
-                    },
-                };
-                let at_pause = fixture.observed.produced.load(Ordering::SeqCst);
-                let consumed_at_pause = fixture.observed.consumed.load(Ordering::SeqCst);
-                assert_eq!(
-                    consumed_at_pause, 0,
-                    "reader has not received a complete ITEM"
+                records.push(
+                    slow_reader_case(shm, repetition, count, size, Duration::from_secs(120)).await,
                 );
-                let natural = fixture.observed.finished.load(Ordering::SeqCst) == 1;
-                if size > 4096 {
-                    assert!(stalled, "large ITEM must produce a real TCP write stall");
-                    assert!(
-                        !natural,
-                        "source naturally exhausted before the socket stalled"
-                    );
-                }
-                let mut consumer = Consumer::new();
-                consumer.max_ahead = at_pause;
-                let mut response = response;
-                while let Some(chunk) = bounded(response.chunk()).await.unwrap() {
-                    consumer.push(
-                        &chunk,
-                        fixture.observed.produced.load(Ordering::SeqCst),
-                        size as usize,
-                        &fixture.observed,
-                    );
-                }
-                assert_eq!(consumer.complete, count as usize);
-                assert_eq!(
-                    fixture.observed.consumed.load(Ordering::SeqCst),
-                    count as usize
-                );
-                assert!(consumer.terminal);
-                assert!(consumer.buffer.is_empty());
-                assert_eq!(fixture.observed.finished.load(Ordering::SeqCst), 1);
-                let record = serde_json::json!({
-                    "carrier": if shm { "whole_shm" } else { "inline" },
-                    "repetition": repetition,
-                    "item_bytes": size, "items": count,
-                    "pause_safety_cap_seconds": 120,
-                    "relay_budget_bytes": fixture.budget_bytes,
-                    "relay_copy_window_bytes": 4096,
-                    "server_ipc_chunk_bytes": 4096,
-                    "upstream_ipc_chunk_bytes": 4096,
-                    "remote_payload_chunk_bytes": 4096,
-                    "tcp_write_pending_observed": stalled,
-                    "source_naturally_exhausted_while_reader_paused": natural,
-                    "P_at_pause_boundary": at_pause,
-                    "C_at_pause_boundary": consumed_at_pause,
-                    "max_event_P_minus_C": fixture.observed.peak_ahead.load(Ordering::SeqCst),
-                    "max_read_sample_P_minus_C": consumer.max_ahead,
-                    "backpressure_peak_P_minus_C": (!natural && stalled).then(|| fixture.observed.peak_ahead.load(Ordering::SeqCst)),
-                    "natural_exhaustion_P_minus_C": natural.then_some(at_pause),
-                    "server_shm_peak_bytes": fixture.server.memory_budget_snapshot().budget.shm.peak_bytes,
-                    "final_P": fixture.observed.produced.load(Ordering::SeqCst),
-                    "final_C": consumer.complete,
-                });
-                eprintln!("[block8-slow-read] {record}");
-                records.push(record);
-                fixture.stop().await;
             }
         }
     }
     let output = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../../target/streaming-block8-validation/slow-read.json");
+        .join("../../../target/block8a-fix-validation/slow-read.json");
     std::fs::create_dir_all(output.parent().unwrap()).unwrap();
     std::fs::write(output, serde_json::to_vec_pretty(&serde_json::json!({
         "method": "real HTTP/1 over TCP; final consumer paused until test-only AsyncWrite observed actual poll_write Pending or resource exhaustion; P advances on each completed resource yield, C after each entire HTTP ITEM reaches the final consumer; a test-only gate serializes both event counters and captures their peak",
