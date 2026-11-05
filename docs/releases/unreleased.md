@@ -361,7 +361,7 @@ On macOS with the FastDB sibling, the Rust Core workspace (1900 tests), c3, the 
 
 ### Validation
 
-The defect surfaced as a Windows x64 failure of `test_call_unknown_route_404` in run 42110086137. New tests send each of 25 refusals over real TCP, finish the body after the relay has started discarding it, and check the complete refusal and a normal end of stream; others cover Expect, unknown lengths, the deadline and a body whose reading had already started. On macOS with the FastDB sibling the Rust Core workspace (1906 tests), c3, the Rust SDK, the CI Python gates and the repository checks passed on the integrated tree. Full-platform CI is pending.
+The defect surfaced as a Windows x64 failure of `test_call_unknown_route_404` in run 42110086137. New tests send each of 25 refusals over real TCP, finish the body after the relay has started discarding it, and check the complete refusal and a normal end of stream; others cover Expect, unknown lengths, the deadline and a body whose reading had already started. On macOS with the FastDB sibling the Rust Core workspace (1906 tests), c3, the Rust SDK, the CI Python gates and the repository checks passed on the integrated tree. The exact candidate `4e29a3f3` passed [run 42120578509](https://github.com/Dsssyc/c-two/actions/runs/42120578509) on every lane at the first attempt: Linux x64 with Python 3.12 and 3.14t, macOS arm64, and Windows x64 and ARM64.
 
 ## Connection close on Windows
 
