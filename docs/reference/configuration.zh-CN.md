@@ -173,7 +173,7 @@ cc.endpoint.set_local_endpoint(root=str(ipc_dir))
 | --- | --- | --- | --- |
 | 单次调用等待 | `cc.with_call_options(proxy, timeout=...)` | 继承传输默认 | 单次远程业务调用的调用方等待预算 |
 | Relay 逻辑调用截止时间 | `C2_RELAY_CALL_TIMEOUT` | 300 秒，`0` 为无限 | Relay HTTP CRM 调用超时秒数；0 关闭 reqwest 总超时 |
-| 有限调用名额 | `cc.set_call_execution_limits(max_outstanding_calls=...)` / `C2_CALL_MAX_OUTSTANDING` | 1,024 / Runtime | 带有限截止时间、尚未结束的调用数上限，包括调用方已不再等待、仍在继续的调用 |
+| 有限调用名额 | `cc.set_call_execution_limits(max_outstanding_calls=...)` / `C2_CALL_MAX_OUTSTANDING` | 1,024 / Runtime | 带有限截止时间、尚未结束的调用数上限，包括调用方已不再等待、仍在继续的调用，另加每条服务端流直到它的真实终态 |
 | 载荷缓冲预算 | `payload_buffer_budget_bytes=...` / `C2_CALL_PAYLOAD_BUFFER_BUDGET_BYTES` | 16 GiB / Runtime | C-Two 为调用保留的载荷缓冲的字节预算，有无截止时间的调用都计入；见[内存策略](memory-policy.md#payload-buffer-budget) |
 
 直连 IPC 默认无限等待；HTTP 的预算覆盖一个逻辑调用和其内的路由重取。`timeout=None` 显式无限，`0` 在派发前到期，负数和非有限值在入口拒绝。同进程同步调用只接受继承或无限策略。

@@ -173,7 +173,7 @@ Expiration returns `CallDeadlineExceeded` with `operation=connect`, `transport_p
 | --- | --- | --- | --- |
 | Per-call waiting | `cc.with_call_options(proxy, timeout=...)` | Transport default | Caller waiting budget for one remote business call |
 | Logical relay call deadline | `C2_RELAY_CALL_TIMEOUT` | 300 seconds; `0` means unlimited | Relay HTTP CRM call timeout in seconds; 0 disables the reqwest total timeout |
-| Outstanding finite-deadline calls | `cc.set_call_execution_limits(max_outstanding_calls=...)` / `C2_CALL_MAX_OUTSTANDING` | 1,024 per Runtime | Maximum unfinished calls with a finite deadline, including calls that continue after their caller's deadline |
+| Outstanding finite-deadline calls | `cc.set_call_execution_limits(max_outstanding_calls=...)` / `C2_CALL_MAX_OUTSTANDING` | 1,024 per Runtime | Maximum unfinished calls with a finite deadline, including calls that continue after their caller's deadline, plus every server stream until its real terminal |
 | Payload buffer budget | `payload_buffer_budget_bytes=...` / `C2_CALL_PAYLOAD_BUFFER_BUDGET_BYTES` | 16 GiB per Runtime | Byte budget for the payload buffers C-Two keeps for calls with and without a deadline; see [memory policy](memory-policy.md#payload-buffer-budget) |
 
 Direct IPC waits indefinitely by default; an HTTP budget covers one logical call and its route reacquisition. `timeout=None` explicitly waits indefinitely; `0` expires before dispatch. Negative and non-finite values are rejected. Same-process synchronous calls accept inherited or unlimited waiting only.

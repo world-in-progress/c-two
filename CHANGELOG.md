@@ -26,6 +26,7 @@ See the [unreleased notes](docs/releases/unreleased.md).
 
 - `ipc_overrides` keys `write_timeout`, `max_dedicated_segments` and `spill_threshold`, with their `C2_IPC_*` environment variables.
 - Error code `CallCancelled` (718) for a server stream whose cancellation has finished. The IPC transport carries server-stream items, grants and cancellation; the SDKs cannot use server streams yet.
+- Server streams for Rust resources and clients over direct IPC: generated `ResponseStream` methods and `Service` iterators, cancellation on drop, `close()` with a 30-second default, and shutdown or unregistration ending open streams between steps with `CallCancelled`. Every stream holds a `max_outstanding_calls` slot until its real terminal. Python, generated TypeScript and relay forwarding follow.
 
 ### Removed
 
@@ -37,6 +38,7 @@ See the [unreleased notes](docs/releases/unreleased.md).
 ### Fixed
 
 - Large chunked payloads, malformed control frames and acknowledgements, custom IPC roots with many entries, contended listener drops, oversized pool segments, relay mesh versions and registration retries, `c3 registry` on malformed responses, TypeScript NACKs with new error codes, and several silent Python fallbacks. See the [unreleased notes](docs/releases/unreleased.md).
+- A finite call releases its `max_outstanding_calls` slot before its result reaches the caller, so an immediate next call is no longer refused while the limit is full.
 
 ## [0.10.1] — companion c3 0.6.0
 
