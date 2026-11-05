@@ -1,6 +1,6 @@
 //! Relay-aware HTTP client with route failover.
 
-use c2_mem::retention::{BudgetedBuffer, PayloadBufferBudget};
+use c2_mem::retention::{BudgetedBuffer, PayloadBufferBudget, PayloadBufferReservation};
 use std::collections::HashSet;
 use std::net::IpAddr;
 use std::sync::{Arc, OnceLock};
@@ -12,8 +12,8 @@ use serde_json::json;
 use super::call_control::check_active;
 use super::http_client::HttpCallInput;
 use super::{
-    HttpCallControl, HttpClientPool, HttpError, HttpInputOwner, RelayControlClient,
-    RelayResolvedRoutes, RelayRouteInfo,
+    HttpCallControl, HttpClientPool, HttpError, HttpInputOwner, HttpResponseStream,
+    HttpStreamCancellation, RelayControlClient, RelayResolvedRoutes, RelayRouteInfo,
 };
 use c2_config::LocalEndpointContext;
 use c2_contract::ExpectedRouteContract;
@@ -241,6 +241,115 @@ impl RelayAwareHttpClient {
             .map_err(|source| HttpCallError::new(http_call_error_phase(&source), source))
     }
 
+    /// Resolve once and issue one route-bound streaming business POST. The
+    /// returned actor retains the original operation slot through CALL_END.
+    #[doc(hidden)]
+    pub async fn stream_controlled_async(
+        &self,
+        method_name: &str,
+        data: HttpInputOwner,
+        send_headroom: PayloadBufferReservation,
+        completion_owner: Box<dyn Send>,
+        cancellation: HttpStreamCancellation,
+        control: &HttpCallControl,
+    ) -> Result<HttpResponseStream, HttpCallError> {
+        let result = self
+            .stream_inner_async(
+                method_name,
+                data,
+                send_headroom,
+                completion_owner,
+                cancellation,
+                control,
+            )
+            .await;
+        result.map_err(|source| HttpCallError::new(http_call_error_phase(&source), source))
+    }
+
+    async fn stream_inner_async(
+        &self,
+        method_name: &str,
+        data: HttpInputOwner,
+        send_headroom: PayloadBufferReservation,
+        completion_owner: Box<dyn Send>,
+        cancellation: HttpStreamCancellation,
+        control: &HttpCallControl,
+    ) -> Result<HttpResponseStream, HttpError> {
+        let budget = control.payload_budget().unwrap_or(&self.payload_budget);
+        let attempts = self.config.max_attempts.max(1);
+        let mut last_error = None;
+        for attempt in 0..attempts {
+            let routes = match self
+                .resolve_routes_async(
+                    attempt > 0,
+                    false,
+                    Some(control),
+                    c2_config::ConnectDeadline::default(),
+                )
+                .await
+            {
+                Ok(routes) if !routes.routes.is_empty() => routes,
+                Ok(_) => {
+                    return Err(HttpError::ServerError(
+                        404,
+                        resource_not_found_body(self.route_name()),
+                    ));
+                }
+                Err(error) if resolve_retryable(&error) && attempt + 1 < attempts => {
+                    last_error = Some(error);
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            for route in self.order_routes(routes.routes, &HashSet::new()) {
+                let relay_url = route.relay_url.trim_end_matches('/').to_string();
+                let client = match self.acquire_route_client(&relay_url, Some(control)) {
+                    Ok(client) => client,
+                    Err(error @ HttpError::LocalCallRejected(_)) => return Err(error),
+                    Err(error) => {
+                        last_error = Some(error);
+                        continue;
+                    }
+                };
+                let result = client
+                    .client
+                    .stream_with_route_token_async(
+                        &self.expected,
+                        &route.route_token(),
+                        route.max_payload_size,
+                        method_name,
+                        HttpCallInput::Owned(data),
+                        budget,
+                        send_headroom,
+                        completion_owner,
+                        cancellation,
+                        control,
+                    )
+                    .await;
+                match result {
+                    Ok(stream) => {
+                        *self.current.lock() = Some(relay_url);
+                        return Ok(stream);
+                    }
+                    Err(error) if route_is_stale(&error) => {
+                        self.control.invalidate(self.route_name());
+                        *self.current.lock() = None;
+                        return Err(error);
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            if attempt + 1 < attempts {
+                check_active(Some(control))?;
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                check_active(Some(control))?;
+            }
+        }
+        Err(last_error.unwrap_or_else(|| {
+            HttpError::ServerError(404, resource_not_found_body(self.route_name()))
+        }))
+    }
+
     pub fn connect(&self) -> Result<(), HttpError> {
         super::http_client::runtime()
             .handle()
@@ -393,7 +502,6 @@ impl RelayAwareHttpClient {
                     client.client.probe_route_with_token_async(
                         &self.expected,
                         &route.route_token(),
-                        route.max_payload_size,
                         &self.payload_budget,
                     ),
                 )

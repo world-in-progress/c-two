@@ -202,6 +202,7 @@ impl CallExecutionContext {
             permit,
             payload_budget: self.payload_budget(),
             input_reservation: None,
+            stream_http_headroom: 0,
         })
     }
 
@@ -221,9 +222,16 @@ pub(crate) struct PreparingCall {
     permit: Option<RetentionPermit>,
     payload_budget: PayloadBufferBudget,
     input_reservation: Option<PayloadBufferReservation>,
+    stream_http_headroom: u64,
 }
 
 impl PreparingCall {
+    /// The HTTP receive path needs one byte of atomically admitted send/receive
+    /// headroom in addition to the input owner before materialization.
+    pub(crate) fn with_stream_http_headroom(mut self) -> Self {
+        self.stream_http_headroom = 1;
+        self
+    }
     pub(crate) fn scope_clone(&self) -> CallScope {
         self.scope.clone()
     }
@@ -250,6 +258,9 @@ impl PreparingCall {
     /// Growth of an existing positive-byte owner is immediate.
     pub(crate) fn charge_input(&mut self, nbytes: u64) -> Result<(), Error> {
         self.scope.check_pre_dispatch().map_err(scope_error)?;
+        let nbytes = nbytes
+            .checked_add(self.stream_http_headroom)
+            .ok_or_else(|| configuration("input and HTTP headroom exceed u64"))?;
         if self
             .input_reservation
             .as_ref()
@@ -288,6 +299,9 @@ impl PreparingCall {
         if self.input_reservation.is_some() {
             return self.charge_input(nbytes);
         }
+        let nbytes = nbytes
+            .checked_add(self.stream_http_headroom)
+            .ok_or_else(|| configuration("input and HTTP headroom exceed u64"))?;
         let reservation = match self.scope.deadline() {
             Some(deadline) => tokio::time::timeout_at(
                 tokio::time::Instant::from_std(deadline),
@@ -476,6 +490,7 @@ impl PreparingCall {
             let scope = guard.shared.scope.clone();
             let operation = self.permit;
             let mut input_reservation = self.input_reservation;
+            let stream_http_headroom = self.stream_http_headroom;
             // Materialization is native work too: a slow copy cannot delay
             // the independent caller deadline or destroy its Vec on timeout.
             // The operation slot stays with this task. The B reservation moves
@@ -494,7 +509,10 @@ impl PreparingCall {
                 let reservation = input_reservation
                     .as_mut()
                     .expect("input was charged before materialization");
-                let additional = actual_capacity.saturating_sub(reservation.bytes());
+                let required = actual_capacity
+                    .checked_add(stream_http_headroom)
+                    .ok_or_else(|| configuration("input capacity and HTTP headroom exceed u64"))?;
+                let additional = required.saturating_sub(reservation.bytes());
                 if additional > 0 {
                     reservation
                         .try_grow(additional)

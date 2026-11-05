@@ -19,8 +19,8 @@ use tokio::io::AsyncReadExt;
 use tokio::sync::Notify;
 
 use super::{
-    HttpCallControl, HttpCallError, HttpCallPhase, HttpError, RelayAwareClientConfig,
-    RelayAwareHttpClient, RelayRouteInfo,
+    HttpCallControl, HttpCallError, HttpCallPhase, HttpError, HttpStreamCancellation,
+    RelayAwareClientConfig, RelayAwareHttpClient, RelayRouteInfo,
 };
 
 const ABI_HASH: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -152,6 +152,19 @@ async fn registry(urls: &[&str], gate: Option<Arc<Gate>>) -> (Server, Arc<Atomic
     )
     .await;
     (server, calls)
+}
+
+async fn registry_with_max_payload_size(url: &str, max_payload_size: u64) -> Server {
+    let mut selected = route(url);
+    selected.max_payload_size = max_payload_size;
+    serve(Router::new().route(
+        "/_resolve/{route}",
+        get(move || {
+            let selected = selected.clone();
+            async move { Json(vec![selected]) }
+        }),
+    ))
+    .await
 }
 
 #[derive(Clone, Copy)]
@@ -361,6 +374,59 @@ async fn authoritative_stale_post_reports_predispatch_without_retaining_replay_i
     assert_eq!(stale.calls.load(Ordering::SeqCst), 1);
     assert_eq!(live.calls.load(Ordering::SeqCst), 0);
     assert_eq!(resolves.load(Ordering::SeqCst), 1);
+}
+
+fn assert_stale_control_error(error: &HttpCallError) {
+    assert_eq!(error.phase(), HttpCallPhase::PreDispatch);
+    assert!(error.is_retry_safe());
+    let HttpError::ResponseError(409, body) = error.source_error() else {
+        panic!("expected the relay's 409 error envelope, got {error:?}");
+    };
+    let envelope = serde_json::from_slice(body.as_ref()).unwrap();
+    let decoded = C2Error::from_envelope(envelope).unwrap();
+    assert_eq!(decoded.code, ErrorCode::RouteStale);
+}
+
+#[tokio::test]
+async fn unary_route_stale_control_envelope_exceeds_one_byte_business_limit() {
+    let stale = Data::new(Reply::Stale);
+    let server = data_server(&stale).await;
+    let registry = registry_with_max_payload_size(&server.url, 1).await;
+    let control = allowed();
+
+    let error = client(&registry)
+        .call_controlled_async("step", Arc::new(vec![1]), &control)
+        .await
+        .unwrap_err();
+
+    assert_stale_control_error(&error);
+    assert_eq!(stale.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn stream_route_stale_control_envelope_exceeds_one_byte_business_limit() {
+    let stale = Data::new(Reply::Stale);
+    let server = data_server(&stale).await;
+    let registry = registry_with_max_payload_size(&server.url, 1).await;
+    let budget = c2_mem::retention::PayloadBufferBudget::new(4096);
+    let headroom = budget.try_reserve(1).unwrap();
+    let control = allowed().with_payload_budget(budget, None);
+
+    let error = client(&registry)
+        .stream_controlled_async(
+            "step",
+            Arc::new(vec![1]),
+            headroom,
+            Box::new(()),
+            HttpStreamCancellation::new(),
+            &control,
+        )
+        .await
+        .err()
+        .expect("stale route must reject the stream before dispatch");
+
+    assert_stale_control_error(&error);
+    assert_eq!(stale.calls.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
@@ -747,13 +813,8 @@ fn assert_response_limit(error: &HttpCallError) {
 }
 
 #[tokio::test]
-async fn response_message_limit_covers_success_crm_and_other_errors_before_eof() {
-    for status in [
-        StatusCode::OK,
-        StatusCode::INTERNAL_SERVER_ERROR,
-        StatusCode::CONFLICT,
-        StatusCode::BAD_GATEWAY,
-    ] {
+async fn business_response_message_limit_covers_success_and_crm_before_eof() {
+    for status in [StatusCode::OK, StatusCode::INTERNAL_SERVER_ERROR] {
         for chunked in [false, true] {
             for http_only in [false, true] {
                 let calls = Arc::new(AtomicUsize::new(0));
@@ -803,6 +864,37 @@ async fn response_message_limit_covers_success_crm_and_other_errors_before_eof()
 }
 
 #[tokio::test]
+async fn relay_control_error_uses_protocol_limit_and_retains_b_charge() {
+    for status in [StatusCode::CONFLICT, StatusCode::BAD_GATEWAY] {
+        for chunked in [false, true] {
+            let (_server, _registry, client) = response_fixture(ResponseData {
+                status,
+                chunked,
+                calls: Arc::new(AtomicUsize::new(0)),
+                late: None,
+                tail: None,
+            })
+            .await;
+            let budget = c2_mem::retention::PayloadBufferBudget::new(64);
+            let control = allowed().with_payload_budget(budget.clone(), None);
+            let error = client
+                .call_controlled_async("large", Arc::new(vec![1]), &control)
+                .await
+                .unwrap_err();
+            assert_eq!(error.phase(), HttpCallPhase::DispatchUncertain);
+            let HttpError::ResponseError(actual_status, body) = error.source_error() else {
+                panic!("expected relay control error, got {error:?}");
+            };
+            assert_eq!(*actual_status, status.as_u16());
+            assert_eq!(body.len(), 9);
+            assert_eq!(budget.snapshot().used_bytes, 9);
+            drop(error);
+            assert_eq!(budget.snapshot().used_bytes, 0);
+        }
+    }
+}
+
+#[tokio::test]
 async fn response_message_limit_also_covers_borrowed_legacy_calls() {
     let (_server, _registry, client) = response_fixture(ResponseData {
         status: StatusCode::OK,
@@ -836,7 +928,7 @@ impl AsRef<[u8]> for ReservedResponseInput {
 }
 
 #[tokio::test]
-async fn late_response_limit_keeps_only_actual_request_reader_and_native_driver() {
+async fn late_response_completion_keeps_only_actual_request_reader_and_native_driver() {
     for status in [
         StatusCode::OK,
         StatusCode::INTERNAL_SERVER_ERROR,
@@ -923,7 +1015,15 @@ async fn late_response_limit_keeps_only_actual_request_reader_and_native_driver(
             !delivered,
             "late completion cannot deliver a second caller outcome"
         );
-        assert_response_limit(&result.unwrap_err());
+        let error = result.unwrap_err();
+        if status == StatusCode::BAD_GATEWAY {
+            assert_eq!(error.phase(), HttpCallPhase::DispatchUncertain);
+            assert!(
+                matches!(error.source_error(), HttpError::ResponseError(502, body) if body.as_ref() == b"123123123")
+            );
+        } else {
+            assert_response_limit(&error);
+        }
         assert_eq!(
             active_checks.load(Ordering::SeqCst),
             checks_at_expiry,
@@ -1002,8 +1102,54 @@ async fn response_reader_bounds_500() {
     check_response_reader(500, true).await;
 }
 #[tokio::test]
-async fn response_reader_bounds_other_error() {
-    check_response_reader(502, true).await;
+async fn relay_control_error_declared_length_above_protocol_limit_rejects_before_body_poll() {
+    use tokio::io::AsyncWriteExt;
+
+    let limit = crate::stream_wire::MAX_TERMINAL_PAYLOAD_BYTES;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut request = Vec::new();
+        while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+            let mut bytes = [0; 1024];
+            let count = socket.read(&mut bytes).await.unwrap();
+            assert!(count > 0);
+            request.extend_from_slice(&bytes[..count]);
+        }
+        socket
+            .write_all(
+                format!(
+                    "HTTP/1.1 502 Bad Gateway\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    limit + 1
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+    });
+    let response = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .unwrap()
+        .get(url)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.content_length(), Some(limit + 1));
+    let budget = c2_mem::retention::PayloadBufferBudget::new(64);
+    let error = crate::payload::read_http_response(response, RESPONSE_LIMIT, &budget, None)
+        .await
+        .unwrap_err();
+    let HttpError::ServerError(502, body) = error else {
+        panic!("expected response protocol error, got {error:?}");
+    };
+    let decoded = C2Error::from_envelope(serde_json::from_str(&body).unwrap()).unwrap();
+    assert_eq!(decoded.code, ErrorCode::ProtocolViolation);
+    assert_eq!(decoded.details["reason"], "response_payload_too_large");
+    assert_eq!(decoded.details["max_payload_size"], limit.to_string());
+    assert_eq!(budget.snapshot().peak_bytes, 0);
+    server.await.unwrap();
 }
 
 #[tokio::test]
@@ -1015,8 +1161,28 @@ async fn response_reader_bounds_chunked_500() {
     check_response_reader(500, false).await;
 }
 #[tokio::test]
-async fn response_reader_bounds_chunked_other_error() {
-    check_response_reader(502, false).await;
+async fn chunked_relay_control_error_respects_b_before_waiting_for_eof() {
+    let polls = Arc::new(AtomicUsize::new(0));
+    let budget = c2_mem::retention::PayloadBufferBudget::new(4);
+    let result = tokio::time::timeout(
+        std::time::Duration::from_millis(100),
+        crate::payload::read_http_response(
+            response_from_chunks(502, false, polls.clone()),
+            RESPONSE_LIMIT,
+            &budget,
+            None,
+        ),
+    )
+    .await
+    .expect("B rejection must precede the pending EOF");
+    let error = result.unwrap_err();
+    let HttpError::LocalCallRejected(details) = &error else {
+        panic!("expected B capacity rejection, got {error:?}");
+    };
+    assert_eq!(details.code, ErrorCode::CallCapacityExceeded);
+    assert_eq!(details.details["transport_phase"], "dispatch_uncertain");
+    assert_eq!(polls.load(Ordering::SeqCst), 2);
+    assert_eq!(budget.snapshot().used_bytes, 0);
 }
 
 #[tokio::test]
@@ -1159,4 +1325,74 @@ async fn completed_request_budget_is_reused_by_its_known_length_response() {
     assert_eq!(budget.snapshot().peak_bytes, 7);
     drop(output);
     assert_eq!(budget.snapshot().used_bytes, 0);
+}
+
+#[tokio::test]
+async fn controlled_stream_uses_one_bound_post_and_stream_accept_header() {
+    use crate::stream_wire::{
+        HttpStreamRecordKind, HttpStreamStatus, HttpStreamTerminal, encode_header, encode_terminal,
+    };
+    let calls = Arc::new(AtomicUsize::new(0));
+    let seen_headers = Arc::new(Mutex::new(None::<HeaderMap>));
+    let post_calls = calls.clone();
+    let post_headers = seen_headers.clone();
+    let server = serve(Router::new().route(
+        "/{route}/{method}",
+        post(move |headers: HeaderMap, body: Bytes| {
+            let calls = post_calls.clone();
+            let seen = post_headers.clone();
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                *seen.lock() = Some(headers);
+                assert_eq!(body.as_ref(), b"input");
+                let mut record = crate::stream_wire::encode_item_begin(4).to_vec();
+                record.extend_from_slice(&encode_header(HttpStreamRecordKind::ItemData, 4));
+                record.extend_from_slice(b"item");
+                record.extend_from_slice(
+                    &encode_terminal(&HttpStreamTerminal {
+                        status: HttpStreamStatus::Success,
+                        complete_items: Some(1),
+                        error: None,
+                    })
+                    .unwrap(),
+                );
+                (
+                    StatusCode::OK,
+                    [
+                        ("content-type", crate::stream_wire::MEDIA_TYPE),
+                        ("x-c2-call-token", "0123456789abcdef0123456789abcdef"),
+                    ],
+                    record,
+                )
+            }
+        }),
+    ))
+    .await;
+    let (registry, _) = registry(&[&server.url], None).await;
+    let budget = c2_mem::retention::PayloadBufferBudget::new(128);
+    let input = Arc::new(ReservedResponseInput {
+        bytes: b"input".to_vec(),
+        _permit: budget.try_reserve(5).unwrap(),
+    });
+    let headroom = budget.try_reserve(1).unwrap();
+    let control = allowed().with_payload_budget(budget.clone(), None);
+    let client = client(&registry);
+    let mut stream = client
+        .stream_controlled_async(
+            "step",
+            input,
+            headroom,
+            Box::new(()),
+            HttpStreamCancellation::new(),
+            &control,
+        )
+        .await
+        .unwrap();
+    assert_eq!(stream.recv().await.unwrap().unwrap().as_ref(), b"item");
+    assert!(stream.recv().await.unwrap().is_none());
+    assert_eq!(stream.completion().await.unwrap().complete_items, Some(1));
+    let headers = seen_headers.lock().clone().unwrap();
+    assert_eq!(headers["accept"], crate::stream_wire::MEDIA_TYPE);
+    assert_eq!(headers["x-c2-route-uid"], "controlled-grid-route");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
 }

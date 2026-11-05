@@ -310,6 +310,25 @@ impl Drop for ReserveFuture<'_> {
     }
 }
 
+/// An invalid request to move more bytes than a reservation owns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PayloadBufferSplitError {
+    pub requested: u64,
+    pub reserved: u64,
+}
+
+impl fmt::Display for PayloadBufferSplitError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "cannot split {} bytes from a {}-byte payload-buffer reservation",
+            self.requested, self.reserved
+        )
+    }
+}
+
+impl Error for PayloadBufferSplitError {}
+
 /// One move-only charge. Moving it with a Vec transfers ownership; dropping
 /// it refunds exactly once and wakes waiting calls.
 #[must_use = "keep this reservation with its actual buffer storage"]
@@ -322,6 +341,23 @@ pub struct PayloadBufferReservation {
 impl PayloadBufferReservation {
     pub fn bytes(&self) -> u64 {
         self.bytes
+    }
+
+    /// Transfer an existing charge to a separate owner. This does not
+    /// reserve, refund, or change the budget's counters; each owner refunds
+    /// only its remaining charge when dropped.
+    pub fn split_off(&mut self, bytes: u64) -> Result<Self, PayloadBufferSplitError> {
+        if bytes > self.bytes {
+            return Err(PayloadBufferSplitError {
+                requested: bytes,
+                reserved: self.bytes,
+            });
+        }
+        self.bytes -= bytes;
+        Ok(Self {
+            shared: self.shared.clone(),
+            bytes,
+        })
     }
 
     /// Grow the same storage before its next allocation or copy. A positive
@@ -652,6 +688,71 @@ mod tests {
         drop(first);
         assert_eq!(budget.snapshot().used_bytes, 4);
         drop(second);
+        assert_eq!(budget.snapshot().used_bytes, 0);
+    }
+
+    #[test]
+    fn split_charge_refunds_only_when_each_owner_drops() {
+        let budget = PayloadBufferBudget::new(10);
+        let mut input = budget.reserve_blocking(10, None).unwrap();
+        let upstream = input.split_off(3).unwrap();
+        let downstream = input.split_off(4).unwrap();
+        assert_eq!(
+            (input.bytes(), upstream.bytes(), downstream.bytes()),
+            (3, 3, 4)
+        );
+        assert_eq!(budget.snapshot().used_bytes, 10);
+        assert_eq!(budget.snapshot().peak_bytes, 10);
+        assert_eq!(budget.snapshot().rejected_allocations, 0);
+        let mut waiting = Box::pin(budget.reserve(3));
+        let wake = Arc::new(CountWake(AtomicUsize::new(0)));
+        let waker = Waker::from(wake.clone());
+        assert!(matches!(
+            waiting.as_mut().poll(&mut Context::from_waker(&waker)),
+            Poll::Pending
+        ));
+        drop(input);
+        assert_eq!(budget.snapshot().used_bytes, 7);
+        assert!(wake.0.load(Ordering::SeqCst) > 0);
+        let admitted = match waiting.as_mut().poll(&mut Context::from_waker(&waker)) {
+            Poll::Ready(Ok(reservation)) => reservation,
+            other => panic!("split owner release must wake the waiter: {other:?}"),
+        };
+        assert_eq!(budget.snapshot().used_bytes, 10);
+        drop(admitted);
+        drop(waiting);
+        drop(upstream);
+        assert_eq!(budget.snapshot().used_bytes, 4);
+        drop(downstream);
+        assert_eq!(budget.snapshot().used_bytes, 0);
+        assert_eq!(budget.snapshot().rejected_allocations, 0);
+    }
+
+    #[test]
+    fn split_out_of_range_preserves_charge_and_zero_split_has_no_effect() {
+        let budget = PayloadBufferBudget::new(u64::MAX);
+        let mut whole = budget.reserve_blocking(4, None).unwrap();
+        assert_eq!(
+            whole.split_off(5).unwrap_err(),
+            PayloadBufferSplitError {
+                requested: 5,
+                reserved: 4,
+            }
+        );
+        let empty = whole.split_off(0).unwrap();
+        assert_eq!(empty.bytes(), 0);
+        assert_eq!(budget.snapshot().used_bytes, 4);
+        assert_eq!(budget.snapshot().rejected_allocations, 0);
+        drop(empty);
+        drop(whole);
+        assert_eq!(budget.snapshot().used_bytes, 0);
+        let mut all = budget.reserve_blocking(u64::MAX, None).unwrap();
+        let split = all.split_off(u64::MAX).unwrap();
+        assert_eq!(all.bytes(), 0);
+        assert_eq!(budget.snapshot().used_bytes, u64::MAX);
+        drop(all);
+        assert_eq!(budget.snapshot().used_bytes, u64::MAX);
+        drop(split);
         assert_eq!(budget.snapshot().used_bytes, 0);
     }
 

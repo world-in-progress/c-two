@@ -7,6 +7,14 @@ use crate::flags::{FLAG_BUDDY, FLAG_CHUNKED, FLAG_FIRST_CHUNK, FLAG_RESPONSE, FL
 use crate::frame::{DecodeError, FrameHeader, encode_frame};
 use crate::release::{ReleaseBatch, decode_release_frame};
 
+const MAX_RPC_RECORD_BYTES: usize = u32::MAX as usize - (crate::frame::HEADER_SIZE - 4);
+
+/// Maximum inline CALL_END payload after its kind byte, including status,
+/// complete-item count when present, and error bytes. HTTP terminal records
+/// use the same payload units. The u32 frame length includes RID and flags,
+/// but excludes its own four-byte prefix.
+pub const MAX_CALL_END_PAYLOAD_BYTES: u64 = (MAX_RPC_RECORD_BYTES - 1) as u64;
+
 /// Wire encoding failed because a field cannot be represented by IPC 16.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EncodeError {
@@ -262,6 +270,25 @@ impl TryFrom<u8> for CallStatus {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum CancelCause {
+    Consumer = 0,
+    Lifecycle = 1,
+}
+
+impl TryFrom<u8> for CancelCause {
+    type Error = DecodeError;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::Consumer),
+            1 => Ok(Self::Lifecycle),
+            _ => Err(invalid("CANCEL cause", value.into())),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ValueStorage<'a> {
     Inline(&'a [u8]),
     Shm(BuddyPayload),
@@ -332,7 +359,9 @@ pub enum RpcRecord<'a> {
         storage_bytes: u64,
         item_demand: u64,
     },
-    Cancel,
+    Cancel {
+        cause: CancelCause,
+    },
     CallEnd {
         status: CallStatus,
         complete_items: Option<u64>,
@@ -529,11 +558,13 @@ pub fn decode_rpc_record<'a>(
             })
         }
         RpcRecordKind::Cancel => {
-            require_exact(body, 0, "CANCEL")?;
+            require_exact(body, 1, "CANCEL")?;
             if !no_storage {
                 return Err(invalid("CANCEL flags", header.flags.into()));
             }
-            Ok(RpcRecord::Cancel)
+            Ok(RpcRecord::Cancel {
+                cause: CancelCause::try_from(body[0])?,
+            })
         }
         RpcRecordKind::CallEnd => {
             if chunked && !first {
@@ -718,10 +749,10 @@ fn encode_value(out: &mut Vec<u8>, value: ValuePart<'_>) -> Result<u32, EncodeEr
 }
 
 fn checked_frame(request_id: u64, flags: u32, payload: &[u8]) -> Result<Vec<u8>, EncodeError> {
-    if payload.len() > u32::MAX as usize - 12 {
+    if payload.len() > MAX_RPC_RECORD_BYTES {
         return Err(EncodeError::FieldTooLong {
             field: "RPC record",
-            max: u32::MAX as usize - 12,
+            max: MAX_RPC_RECORD_BYTES,
             actual: payload.len(),
         });
     }
@@ -863,9 +894,13 @@ pub fn encode_credit_frame(
     checked_frame(request_id, FLAG_RPC_RECORD, &payload)
 }
 
-pub fn encode_cancel_frame(request_id: u64) -> Result<Vec<u8>, EncodeError> {
+pub fn encode_cancel_frame(request_id: u64, cause: CancelCause) -> Result<Vec<u8>, EncodeError> {
     if request_id == 0 {
         return Err(encode_invalid("CANCEL", "request id must be nonzero"));
     }
-    checked_frame(request_id, FLAG_RPC_RECORD, &[RpcRecordKind::Cancel as u8])
+    checked_frame(
+        request_id,
+        FLAG_RPC_RECORD,
+        &[RpcRecordKind::Cancel as u8, cause as u8],
+    )
 }

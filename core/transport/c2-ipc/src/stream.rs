@@ -14,6 +14,7 @@ use tokio::sync::{Notify, mpsc};
 #[derive(Clone, Default)]
 pub struct IpcStreamCancellation {
     state: Arc<StdMutex<CancellationIntent>>,
+    changed: Arc<Notify>,
 }
 
 #[derive(Default)]
@@ -27,6 +28,22 @@ impl IpcStreamCancellation {
         Self::default()
     }
 
+    pub fn is_requested(&self) -> bool {
+        self.state.lock().requested
+    }
+
+    pub async fn wait_requested(&self) {
+        loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if self.is_requested() {
+                return;
+            }
+            changed.await;
+        }
+    }
+
     pub fn cancel(&self) {
         let call = {
             let mut state = self.state.lock();
@@ -36,6 +53,7 @@ impl IpcStreamCancellation {
         if let Some(call) = call {
             let _ = call.cancel();
         }
+        self.changed.notify_waiters();
     }
 
     fn attach(&self, call: &Arc<StreamReceive>) {
@@ -191,7 +209,7 @@ fn completion_from_state(
 
 // Completion and recv can both inspect the same physical failure. Preserve
 // the typed IPC variant and OS error kind when building each owned result.
-fn clone_observation_error(error: &IpcError) -> IpcError {
+pub(super) fn clone_observation_error(error: &IpcError) -> IpcError {
     match error {
         IpcError::LocalCallRejected(error) => IpcError::LocalCallRejected(error.clone()),
         IpcError::CallRejected(error) => IpcError::CallRejected(error.clone()),
@@ -297,7 +315,7 @@ fn receive_after_empty(
     }
 }
 
-fn terminal_failure(terminal: &StreamTerminal) -> crate::IpcCallError {
+pub(super) fn terminal_failure(terminal: &StreamTerminal) -> crate::IpcCallError {
     let error = terminal.error.as_ref().expect("checked error CALL_END");
     if terminal.status == CallStatus::NotExecuted {
         pre_dispatch_call_error(IpcError::CallRejected(error.clone()))
@@ -382,8 +400,9 @@ impl StreamReceive {
                 rpc::encode_credit_frame(id, storage, demand).expect("nonzero checked grant"),
             );
         }
-        std::mem::take(&mut state.pending_cancel)
-            .then(|| rpc::encode_cancel_frame(id).expect("nonzero stream ID"))
+        std::mem::take(&mut state.pending_cancel).then(|| {
+            rpc::encode_cancel_frame(id, rpc::CancelCause::Consumer).expect("nonzero stream ID")
+        })
     }
 
     pub(crate) fn has_control(&self) -> bool {
@@ -571,11 +590,12 @@ impl StreamReceive {
                     ));
                 }
             }
-            let offset = self
-                .conn
-                .core
-                .stream_data(id, storage.len())
-                .map_err(core_error)?;
+            let offset = if carrier.is_some() {
+                self.conn.core.stream_shm_data(id, storage.len())
+            } else {
+                self.conn.core.stream_data(id, storage.len())
+            }
+            .map_err(core_error)?;
             let flow = self
                 .conn
                 .core

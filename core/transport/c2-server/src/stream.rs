@@ -266,8 +266,8 @@ async fn send_item(
     if len == 0 {
         return Ok(());
     }
-    let storage = wait_storage(conn, id).await?;
-    let use_shm = storage >= len && conn.shm_response_capable() && !conn.is_deactivated();
+    wait_storage(conn, id).await?;
+    let use_shm = conn.shm_response_capable() && !conn.is_deactivated();
     let pool = server.response_pool.clone();
     let threshold = server.config.shm_threshold;
     let (item, prepared) = if use_shm {
@@ -297,7 +297,7 @@ async fn send_item(
         {
             None => {
                 conn.core
-                    .stream_data(id, len)
+                    .stream_shm_data(id, len)
                     .map_err(|error| ItemSendError::Output(error.to_string()))?;
                 conn.core
                     .stream_finish_item(id)

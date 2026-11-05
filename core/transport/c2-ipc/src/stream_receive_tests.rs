@@ -215,7 +215,8 @@ async fn cancellation_and_zero_observation_do_not_wait_for_brief_receive_state_l
         assert_eq!(cancel.request_id, open.request_id);
         assert_eq!(
             payload,
-            encode_cancel_frame(open.request_id).unwrap()[HEADER_SIZE..]
+            encode_cancel_frame(open.request_id, rpc::CancelCause::Consumer).unwrap()
+                [HEADER_SIZE..]
         );
         let error = C2Error::new(ErrorCode::CallCancelled, "cancelled after copy").to_wire_bytes();
         socket
@@ -272,7 +273,8 @@ async fn opening_abandonment_intent_attaches_before_request_publication() {
         assert_eq!(cancel.request_id, open.request_id);
         assert_eq!(
             payload,
-            encode_cancel_frame(open.request_id).unwrap()[HEADER_SIZE..]
+            encode_cancel_frame(open.request_id, rpc::CancelCause::Consumer).unwrap()
+                [HEADER_SIZE..]
         );
         let error = C2Error::new(ErrorCode::CallCancelled, "opening waiter left").to_wire_bytes();
         socket

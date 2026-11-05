@@ -45,6 +45,8 @@ macro_rules! test_commit_registration {
 
 pub(crate) mod authority;
 pub(crate) mod background;
+#[cfg(test)]
+mod block8_tests;
 pub(crate) mod client_lifecycle;
 #[cfg(test)]
 mod client_lifecycle_tests;
@@ -62,6 +64,7 @@ pub(crate) mod route_table;
 pub(crate) mod router;
 pub mod server;
 pub(crate) mod state;
+pub(crate) mod streaming;
 #[cfg(test)]
 pub(crate) mod test_support;
 pub(crate) mod types;

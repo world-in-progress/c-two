@@ -322,6 +322,32 @@ impl ConnectionCore {
         Ok(offset)
     }
 
+    /// Admit one whole SHM item after spending its positive receiver copy window.
+    /// The full item remains charged to its sender's loan and backing until release.
+    pub fn stream_shm_data(&self, id: u64, bytes: u64) -> Result<u64, ConnectionError> {
+        let mut state = self.shared.state.lock();
+        let stream = stream_mut(&mut state, id)?;
+        if bytes == 0
+            || stream.total_bytes != Some(bytes)
+            || stream.admitted_bytes != 0
+            || stream.storage_bytes == 0
+        {
+            return Err(stream_violation(
+                "SHM data requires a whole item and positive copy window",
+            ));
+        }
+        let spent = stream.storage_bytes;
+        let connection_remaining = state
+            .stream_storage_bytes
+            .checked_sub(spent)
+            .ok_or_else(|| stream_violation("connection stream storage underflow"))?;
+        let stream = stream_mut(&mut state, id)?;
+        stream.storage_bytes = 0;
+        stream.admitted_bytes = bytes;
+        state.stream_storage_bytes = connection_remaining;
+        Ok(0)
+    }
+
     /// Record complete local copy or write of the already admitted item.
     pub fn stream_finish_item(&self, id: u64) -> Result<(), ConnectionError> {
         let mut state = self.shared.state.lock();

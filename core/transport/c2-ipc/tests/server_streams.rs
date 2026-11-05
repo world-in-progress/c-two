@@ -17,6 +17,8 @@ use c2_server::{
 use c2_wire::rpc::CallStatus;
 
 const WAIT: Duration = Duration::from_secs(5);
+#[path = "server_streams/forward.rs"]
+mod forward_streams;
 const DESCRIPTOR: &[u8] =
     include_bytes!("../../../foundation/c2-contract/tests/fixtures/server-stream.contract.json");
 

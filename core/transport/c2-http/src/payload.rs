@@ -117,6 +117,16 @@ impl SegmentedPayload {
         self.len
     }
 
+    pub(crate) fn push_reserved_chunk(
+        &mut self,
+        chunk: &[u8],
+        reservation: PayloadBufferReservation,
+    ) {
+        self.parts
+            .push(BudgetedBuffer::new(chunk.to_vec(), reservation));
+        self.len += chunk.len();
+    }
+
     pub(crate) async fn push_chunk(
         &mut self,
         chunk: &[u8],
@@ -134,9 +144,7 @@ impl SegmentedPayload {
                 .try_reserve(chunk.len() as u64)
                 .map_err(|error| payload_budget_error(error, phase))?
         };
-        self.parts
-            .push(BudgetedBuffer::new(chunk.to_vec(), reservation));
-        self.len += chunk.len();
+        self.push_reserved_chunk(chunk, reservation);
         Ok(())
     }
 
@@ -255,9 +263,16 @@ pub(crate) async fn read_http_response(
     deadline: Option<Instant>,
 ) -> Result<BudgetedBuffer, HttpError> {
     let status = response.status().as_u16();
+    // Successful and CRM-error bodies carry business payloads. Other statuses
+    // are relay control errors and must remain readable even for a tiny route.
+    let response_limit = if matches!(status, 200 | 500) {
+        max_payload_size
+    } else {
+        crate::stream_wire::MAX_TERMINAL_PAYLOAD_BYTES
+    };
     let body = read_http_response_body(
         response,
-        max_payload_size,
+        response_limit,
         budget,
         deadline,
         "dispatch_uncertain",
@@ -348,28 +363,6 @@ fn payload_chunks(
         let remaining = if end == len { Bytes::new() } else { bytes };
         Some((Ok::<Bytes, Infallible>(chunk), (remaining, end)))
     })
-}
-
-#[cfg(feature = "relay")]
-pub(crate) fn axum_body_from_payload(
-    data: Vec<u8>,
-    chunk_size: u64,
-) -> Result<axum::body::Body, HttpError> {
-    let chunk_size = validate_remote_payload_chunk_size(chunk_size)?;
-    if data.len() <= chunk_size {
-        return Ok(axum::body::Body::from(data));
-    }
-    let bytes = Bytes::from(data);
-    let len = bytes.len();
-    let chunks = stream::unfold((bytes, 0usize), move |(bytes, offset)| async move {
-        if offset >= len {
-            return None;
-        }
-        let end = offset.saturating_add(chunk_size).min(len);
-        let chunk = bytes.slice(offset..end);
-        Some((Ok::<Bytes, Infallible>(chunk), (bytes, end)))
-    });
-    Ok(axum::body::Body::from_stream(chunks))
 }
 
 #[cfg(test)]

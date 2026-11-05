@@ -15,7 +15,7 @@ use axum::{
     http::request::Parts,
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{delete, get, post},
 };
 use futures::StreamExt;
 
@@ -33,8 +33,11 @@ use crate::relay::route_table::valid_route_name;
 use crate::relay::server::connect_register_attestation_client;
 use crate::relay::state::{RegisterCommitResult, RelayState, UpstreamAcquireError};
 use crate::relay::types::{RouteEntry, UpstreamEndpointKey};
+use crate::send_budget::{SendBufferPlan, SendBuffers, reserve_send_buffers};
 use c2_ipc::IpcClient;
-use c2_mem::retention::{BudgetedBuffer, PayloadBufferBudget, PayloadBufferReservation};
+use c2_mem::retention::{
+    BudgetedBuffer, PayloadBufferBudget, PayloadBufferError, PayloadBufferReservation,
+};
 use tokio_util::sync::CancellationToken;
 
 const CONTROL_BODY_LIMIT_BYTES: usize = 64 * 1024;
@@ -838,6 +841,7 @@ pub fn build_router(state: Arc<RelayState>) -> Router {
         .route("/_resolve/{*name}", get(handle_resolve))
         .route("/_probe/{*name}", get(handle_probe))
         .route("/_peers", get(handle_peers))
+        .route("/_calls/{token}", delete(cancel_stream_call))
         .route("/_peer/announce", post(peer_handlers::handle_peer_announce))
         .route("/_peer/join", post(peer_handlers::handle_peer_join))
         .route("/_peer/sync", get(peer_handlers::handle_peer_sync))
@@ -1613,61 +1617,177 @@ async fn handle_peers(State(state): State<Arc<RelayState>>) -> impl IntoResponse
     Json(state.list_peers()).into_response()
 }
 
+struct PreparedUnknownInput {
+    payload: SegmentedPayload,
+    upload: PayloadBufferReservation,
+    download: PayloadBufferReservation,
+}
+
+impl PreparedUnknownInput {
+    fn len(&self) -> usize {
+        self.payload.len()
+    }
+    #[cfg(test)]
+    fn into_segments(self) -> Vec<BudgetedBuffer> {
+        self.payload.into_segments()
+    }
+}
+
+async fn cancel_stream_call(
+    State(state): State<Arc<RelayState>>,
+    Path(token): Path<String>,
+) -> StatusCode {
+    if state.forwarding.cancel_stream(&token) {
+        StatusCode::NO_CONTENT
+    } else {
+        StatusCode::NOT_FOUND
+    }
+}
+
 async fn read_unknown_length_body(
     route_name: &str,
     body: Body,
     max_payload_size: u64,
     budget: &PayloadBufferBudget,
     cancelled: &CancellationToken,
-) -> ResponseResult<Option<SegmentedPayload>> {
+    copy_cap: u64,
+) -> ResponseResult<Option<PreparedUnknownInput>> {
     let limit = UNKNOWN_LENGTH_BODY_LIMIT_BYTES.min(max_payload_size);
-    let limit_usize = usize::try_from(limit).unwrap_or(usize::MAX);
-    let mut segments = SegmentedPayload::new();
-    let mut stream = body.into_data_stream();
-
+    let mut payload = SegmentedPayload::new();
+    let mut buffers = None;
+    let mut source = body.into_data_stream();
     while let Some(next) = tokio::select! {
         biased;
         _ = cancelled.cancelled() => return Ok(None),
-        next = stream.next() => next,
+        next = source.next() => next,
     } {
-        let chunk = next.map_err(|err| {
-            json_error_response(
-                StatusCode::BAD_REQUEST,
-                serde_json::json!({
-                    "error": "RequestBodyReadError",
-                    "route": route_name,
-                    "message": err.to_string(),
-                }),
-                Some(budget),
-            )
-        })?;
+        let chunk = next.map_err(|err| json_error_response(
+            StatusCode::BAD_REQUEST,
+            serde_json::json!({"error":"RequestBodyReadError", "route":route_name, "message":err.to_string()}),
+            Some(budget),
+        ))?;
         if chunk.is_empty() {
             continue;
         }
-        let next_len = segments.len().checked_add(chunk.len()).ok_or_else(|| {
+        let next_len = payload.len().checked_add(chunk.len()).ok_or_else(|| {
             payload_too_large_response(route_name, u64::MAX, max_payload_size, budget)
         })?;
-        let next_len_u64 = u64::try_from(next_len).unwrap_or(u64::MAX);
-        if next_len_u64 > max_payload_size {
+        if next_len as u64 > max_payload_size {
             return Err(payload_too_large_response(
                 route_name,
-                next_len_u64,
+                next_len as u64,
                 max_payload_size,
                 budget,
             )
             .into());
         }
-        if next_len > limit_usize {
+        if next_len as u64 > limit {
             return Err(unknown_length_too_large_response(route_name, limit, budget).into());
         }
-        let appended = tokio::select! {
-            biased;
-            _ = cancelled.cancelled() => return Ok(None),
-            appended = segments.push_chunk(&chunk, budget, None, "pre_dispatch") => appended,
-        };
-        appended.map_err(|err| forwarding_capacity_response(route_name, err.to_string()))?;
+        if buffers.is_none() {
+            let plan = SendBufferPlan::new(
+                budget.snapshot().limit_bytes,
+                chunk.len() as u64,
+                copy_cap,
+                copy_cap,
+            )
+            .map_err(|error| forwarding_capacity_response(route_name, error.to_string()))?;
+            let SendBuffers {
+                input,
+                upload,
+                download,
+            } = tokio::select! {
+                biased;
+                _ = cancelled.cancelled() => return Ok(None),
+                reservation = reserve_send_buffers(budget, plan, None) => reservation,
+            }
+            .map_err(|error| forwarding_capacity_response(route_name, error.to_string()))?;
+            payload.push_reserved_chunk(&chunk, input);
+            buffers = Some((upload, download));
+        } else {
+            // Neither sending area has been allocated or used yet. Give
+            // growing input only the unused part it needs, retaining both
+            // directions' minimum progress unit; never wait on these charges.
+            let snapshot = budget.snapshot();
+            let mut deficit =
+                (chunk.len() as u64).saturating_sub(snapshot.limit_bytes - snapshot.used_bytes);
+            let (upload, download) = buffers
+                .as_mut()
+                .expect("first input admitted both directions");
+            while deficit != 0 {
+                let area = if upload.bytes() >= download.bytes() {
+                    &mut *upload
+                } else {
+                    &mut *download
+                };
+                let refund = deficit.min(area.bytes().saturating_sub(1));
+                if refund == 0 {
+                    break;
+                }
+                drop(area.split_off(refund).expect("unused sending capacity"));
+                deficit -= refund;
+            }
+            payload
+                .push_chunk(&chunk, budget, None, "pre_dispatch")
+                .await
+                .map_err(|error| forwarding_capacity_response(route_name, error.to_string()))?;
+        }
     }
-    Ok(Some(segments))
+    let (mut upload, mut download) = match buffers {
+        Some(buffers) => buffers,
+        None => {
+            let plan = SendBufferPlan::new(budget.snapshot().limit_bytes, 0, copy_cap, copy_cap)
+                .map_err(|error| forwarding_capacity_response(route_name, error.to_string()))?;
+            let SendBuffers {
+                input,
+                upload,
+                download,
+            } = tokio::select! {
+                biased;
+                _ = cancelled.cancelled() => return Ok(None),
+                reservation = reserve_send_buffers(budget, plan, None) => reservation,
+            }
+            .map_err(|error| forwarding_capacity_response(route_name, error.to_string()))?;
+            drop(input);
+            (upload, download)
+        }
+    };
+    // The full input length is now known. Widen the upload copy window when
+    // capacity permits, without making that optimization part of admission.
+    // Both directions already own at least one byte for forward progress.
+    let additional = copy_cap
+        .min(payload.len() as u64)
+        .saturating_sub(upload.bytes());
+    if additional != 0 {
+        let snapshot = budget.snapshot();
+        let refund = additional
+            .saturating_sub(snapshot.limit_bytes.saturating_sub(snapshot.used_bytes))
+            .min(download.bytes().saturating_sub(1));
+        drop(
+            download
+                .split_off(refund)
+                .expect("unused receiving capacity"),
+        );
+        let snapshot = budget.snapshot();
+        let growth = additional.min(snapshot.limit_bytes.saturating_sub(snapshot.used_bytes));
+        if growth != 0 {
+            match upload.try_grow(growth) {
+                Ok(())
+                | Err(
+                    PayloadBufferError::TooLarge { .. }
+                    | PayloadBufferError::InsufficientCapacity { .. },
+                ) => {}
+                Err(error) => {
+                    return Err(forwarding_capacity_response(route_name, error.to_string()).into());
+                }
+            }
+        }
+    }
+    Ok(Some(PreparedUnknownInput {
+        payload,
+        upload,
+        download,
+    }))
 }
 
 // The declared N bytes have one reservation. Each yielded Bytes owns a share
@@ -1813,6 +1933,9 @@ async fn call_handler(
     }
     #[cfg(test)]
     run_data_plane_after_precheck_hook(&route_name);
+    let server_stream = headers
+        .get(header::ACCEPT)
+        .is_some_and(|value| value.as_bytes() == crate::stream_wire::MEDIA_TYPE.as_bytes());
     let work_state = state.clone();
     let work_route_name = route_name.clone();
     // Keep the transport body in the HTTP handler until admission succeeds.
@@ -1831,6 +1954,7 @@ async fn call_handler(
             body,
             permit,
             cancelled,
+            server_stream,
         )
         .await
     };
@@ -1930,10 +2054,87 @@ async fn forward_call(
     advertised_route: RouteEntry,
     content_length: Option<u64>,
     body: Body,
-    _permit: c2_mem::RetentionPermit,
+    permit: c2_mem::RetentionPermit,
     cancelled: CancellationToken,
+    server_stream: bool,
 ) -> Response {
     let budget = state.forwarding.payload_budget();
+    let copy_cap = state
+        .config()
+        .remote_payload_chunk_size
+        .min(state.config().upstream_ipc.chunk_size)
+        .max(1);
+    let shutdown = state.forwarding.shutdown_token();
+    let (input_len, chunks, upload, download): (
+        _,
+        futures::stream::BoxStream<'static, Result<Bytes, std::io::Error>>,
+        _,
+        _,
+    ) = match content_length {
+        Some(input_len) => {
+            let plan = match SendBufferPlan::new(
+                budget.snapshot().limit_bytes,
+                input_len,
+                copy_cap,
+                copy_cap,
+            ) {
+                Ok(plan) => plan,
+                Err(error) => return forwarding_capacity_response(&route_name, error.to_string()),
+            };
+            let buffers = tokio::select! {
+                biased;
+                _ = cancelled.cancelled() => return StatusCode::NO_CONTENT.into_response(),
+                _ = shutdown.cancelled(), if server_stream => return relay_shutdown_refusal(&route_name, &budget),
+                buffers = reserve_send_buffers(&budget, plan, None) => buffers,
+            };
+            let SendBuffers {
+                input,
+                upload,
+                download,
+            } = match buffers {
+                Ok(buffers) => buffers,
+                Err(error) => return forwarding_capacity_response(&route_name, error.to_string()),
+            };
+            let chunks = known_length_body_stream(body, input_len, input)
+                .map(|part| part.map_err(std::io::Error::other))
+                .boxed();
+            (input_len, chunks, upload, download)
+        }
+        None => {
+            let prepared = tokio::select! {
+                biased;
+                _ = shutdown.cancelled(), if server_stream => return relay_shutdown_refusal(&route_name, &budget),
+                prepared = read_unknown_length_body(&route_name, body, advertised_route.max_payload_size, &budget, &cancelled, copy_cap) => prepared,
+            };
+            let prepared = match prepared {
+                Ok(Some(prepared)) => prepared,
+                Ok(None) => return StatusCode::NO_CONTENT.into_response(),
+                Err(response) => {
+                    #[cfg(test)]
+                    if response.0.status() == StatusCode::BAD_REQUEST {
+                        state.forwarding.record_source_fault(true);
+                    }
+                    return response.into_response();
+                }
+            };
+            let input_len = prepared.len() as u64;
+            let chunks = futures::stream::iter(
+                prepared
+                    .payload
+                    .into_segments()
+                    .into_iter()
+                    .map(|part| Ok::<_, std::io::Error>(Bytes::from_owner(part))),
+            )
+            .boxed();
+            (input_len, chunks, prepared.upload, prepared.download)
+        }
+    };
+    if cancelled.is_cancelled() {
+        return StatusCode::NO_CONTENT.into_response();
+    }
+    if server_stream && shutdown.is_cancelled() {
+        return relay_shutdown_refusal(&route_name, &budget);
+    }
     let (lease, binding) =
         match acquire_request_client_for_route(state.clone(), &advertised_route).await {
             RequestClient::Ready(ready) => {
@@ -1960,83 +2161,59 @@ async fn forward_call(
             }
         };
     let client = lease.client();
+    if cancelled.is_cancelled() {
+        return StatusCode::NO_CONTENT.into_response();
+    }
+    if server_stream && shutdown.is_cancelled() {
+        return relay_shutdown_refusal(&route_name, &budget);
+    }
 
-    let call_result = match content_length {
-        Some(content_length) => {
-            let reservation = tokio::select! {
-                biased;
-                _ = cancelled.cancelled() => return StatusCode::NO_CONTENT.into_response(),
-                reservation = budget.reserve(content_length) => reservation,
-            };
-            let reservation = match reservation {
-                Ok(reservation) => reservation,
-                Err(error) => return forwarding_capacity_response(&route_name, error.to_string()),
-            };
-            if cancelled.is_cancelled() {
-                return StatusCode::NO_CONTENT.into_response();
-            }
-            let stream = known_length_body_stream(body, content_length, reservation);
-            client
-                .call_bound_sized_stream_phased(
-                    &binding,
-                    &method_name,
-                    content_length,
-                    stream,
-                    Some(&budget),
-                )
-                .await
-        }
-        None => {
-            let body = match read_unknown_length_body(
-                &route_name,
-                body,
-                advertised_route.max_payload_size,
-                &budget,
-                &cancelled,
-            )
+    enum ForwardedResponse {
+        Unary(c2_ipc::ResponseData),
+        Stream(c2_ipc::IpcForwardStream),
+    }
+    let width = usize::try_from(download.bytes()).expect("local copy window is addressable");
+    let call_result = if server_stream {
+        match client
+            .forward_stream_bound_sized_phased(&binding, &method_name, input_len, chunks, upload)
             .await
-            {
-                Ok(Some(body)) => body,
-                Ok(None) => return StatusCode::NO_CONTENT.into_response(),
-                Err(response) => {
-                    // Only actual Body stream failures produce BAD_REQUEST
-                    // here; payload/capacity rejection has a different status.
-                    #[cfg(test)]
-                    if response.0.status() == StatusCode::BAD_REQUEST {
-                        state.forwarding.record_source_fault(true);
-                    }
-                    drop(lease);
-                    return response.into_response();
-                }
-            };
-            if cancelled.is_cancelled() {
-                return StatusCode::NO_CONTENT.into_response();
-            }
-            let body_len = u64::try_from(body.len()).expect("bounded request length fits u64");
-            let stream = futures::stream::iter(
-                body.into_segments()
-                    .into_iter()
-                    .map(Ok::<_, std::io::Error>),
-            );
-            client
-                .call_bound_sized_stream_phased(
-                    &binding,
-                    &method_name,
-                    body_len,
-                    stream,
-                    Some(&budget),
-                )
+        {
+            Ok(stream) => finish_stream_upload(stream, &cancelled, &shutdown)
                 .await
+                .map(ForwardedResponse::Stream),
+            Err(error) => Err(error),
         }
+    } else {
+        client
+            .forward_unary_bound_sized_phased(&binding, &method_name, input_len, chunks, upload)
+            .await
+            .map(ForwardedResponse::Unary)
     };
 
     match call_result {
-        Ok(result) => materialized_response_or_error(
-            &route_name,
-            result.into_owned_bytes(),
-            state.config().remote_payload_chunk_size,
-            &budget,
+        Ok(ForwardedResponse::Unary(result)) => super::streaming::unary_response(
+            result,
+            StatusCode::OK,
+            download,
+            budget.clone(),
+            width,
         ),
+        Ok(ForwardedResponse::Stream(stream)) => match super::streaming::stream_response(
+            state.clone(),
+            stream,
+            lease,
+            permit,
+            download,
+            width,
+        ) {
+            Ok(response) => response,
+            Err(error) => resource_unavailable_response_budgeted(
+                &route_name,
+                format!("cannot create call cancellation token: {error}"),
+                "dispatch_uncertain",
+                &budget,
+            ),
+        },
         Err(error) => {
             let phase = error.phase();
             let error = error.into_source();
@@ -2072,12 +2249,13 @@ async fn forward_call(
                 {
                     forwarding_capacity_response(&route_name, error.message)
                 }
-                c2_ipc::IpcError::CrmError(err_bytes) => (
+                c2_ipc::IpcError::CrmError(err_bytes) => super::streaming::unary_response(
+                    c2_ipc::ResponseData::Inline(err_bytes),
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    [("content-type", "application/octet-stream")],
-                    err_bytes,
-                )
-                    .into_response(),
+                    download,
+                    budget.clone(),
+                    width,
+                ),
                 c2_ipc::IpcError::RouteStale { .. } => {
                     drop(lease);
                     route_stale_response_budgeted(&advertised_route, &budget)
@@ -2132,40 +2310,51 @@ async fn forward_call(
     }
 }
 
-fn materialized_response_or_error(
-    route_name: &str,
-    result: Result<Vec<u8>, String>,
-    remote_payload_chunk_size: u64,
-    budget: &PayloadBufferBudget,
-) -> Response {
-    match result {
-        Ok(bytes) => {
-            let content_length = bytes.len().to_string();
-            match crate::payload::axum_body_from_payload(bytes, remote_payload_chunk_size) {
-                Ok(body) => (
-                    StatusCode::OK,
-                    [
-                        (header::CONTENT_TYPE, "application/octet-stream".to_string()),
-                        (header::CONTENT_LENGTH, content_length),
-                    ],
-                    body,
-                )
-                    .into_response(),
-                Err(err) => resource_unavailable_response_budgeted(
-                    route_name,
-                    format!("failed to construct relay response body: {err}"),
-                    "dispatch_uncertain",
-                    budget,
-                ),
+async fn finish_stream_upload(
+    mut stream: c2_ipc::IpcForwardStream,
+    cancelled: &CancellationToken,
+    shutdown: &CancellationToken,
+) -> Result<c2_ipc::IpcForwardStream, c2_ipc::IpcCallError> {
+    let control = stream.cancellation();
+    let uploaded = {
+        let upload = stream.wait_uploaded();
+        tokio::pin!(upload);
+        let mut cancellation_sent = false;
+        let mut shutdown_sent = false;
+        loop {
+            tokio::select! {
+                biased;
+                _ = cancelled.cancelled(), if !cancellation_sent => {
+                    cancellation_sent = true;
+                    let _ = control.cancel(c2_wire::rpc::CancelCause::Consumer);
+                }
+                _ = shutdown.cancelled(), if !shutdown_sent => {
+                    shutdown_sent = true;
+                    let _ = control.cancel(c2_wire::rpc::CancelCause::Lifecycle);
+                }
+                result = &mut upload => break result,
             }
         }
-        Err(err) => resource_unavailable_response_budgeted(
-            route_name,
-            format!("failed to materialize upstream response: {err}"),
-            "dispatch_uncertain",
-            budget,
-        ),
+    };
+    match uploaded {
+        Ok(()) => Ok(stream),
+        Err(error) => {
+            let _ = control.cancel(c2_wire::rpc::CancelCause::Consumer);
+            let _ = stream.completion().await;
+            Err(error)
+        }
     }
+}
+
+fn relay_shutdown_refusal(route: &str, budget: &PayloadBufferBudget) -> Response {
+    ipc_route_error_response(
+        route,
+        &c2_ipc::IpcError::CallRejected(c2_error::C2Error::new(
+            c2_error::ErrorCode::CallCancelled,
+            "server stream cancelled by relay shutdown",
+        )),
+        Some(budget),
+    )
 }
 
 async fn acquire_request_client_for_route(
@@ -3685,87 +3874,6 @@ mod tests {
             assert!(
                 unregister_body.contains(expected),
                 "HTTP unregister path must log diagnostic event: {expected}"
-            );
-        }
-    }
-
-    #[test]
-    fn relay_data_plane_uses_canonical_ipc_call_api() {
-        let source = include_str!("router.rs");
-        let body = source_between(
-            source,
-            "async fn call_handler",
-            "fn materialized_response_or_error",
-        )
-        .expect("call_handler body should be found");
-
-        for forbidden in [".call_full(", ".call_inline("] {
-            assert!(
-                !body.contains(forbidden),
-                "relay data-plane must not call IPC bypass API: {forbidden}"
-            );
-        }
-        let request_path = body.split_once("    match call_result {").unwrap().0;
-        assert!(
-            !request_path.contains("to_bytes("),
-            "relay data-plane must not materialize request bodies before IPC forwarding"
-        );
-        for forbidden in [
-            ".call(&route_name,",
-            ".call_sized_stream(\n                    &route_name,",
-        ] {
-            assert!(
-                !body.contains(forbidden),
-                "relay data-plane must not forward by mutable route name after acquire: {forbidden}"
-            );
-        }
-        assert!(
-            body.contains(".call_bound_sized_stream_phased("),
-            "relay data-plane must use phased route-bound sized streaming for Content-Length requests"
-        );
-        assert!(
-            body.matches(".call_bound_sized_stream_phased(").count() >= 2,
-            "known and bounded unknown requests must both use the phased route-bound sized stream"
-        );
-    }
-
-    #[tokio::test]
-    async fn materialized_response_error_is_not_silently_returned_as_empty_success() {
-        for (result, chunk_size, expected_message) in [
-            (
-                Err("server pool not initialised".to_string()),
-                c2_config::DEFAULT_REMOTE_PAYLOAD_CHUNK_SIZE,
-                "server pool not initialised",
-            ),
-            (
-                Err("response SHM release failed: backing unavailable".to_string()),
-                c2_config::DEFAULT_REMOTE_PAYLOAD_CHUNK_SIZE,
-                "response SHM release failed: backing unavailable",
-            ),
-            (
-                Ok(b"already dispatched".to_vec()),
-                0,
-                "remote_payload_chunk_size",
-            ),
-        ] {
-            let response = materialized_response_or_error(
-                "grid",
-                result,
-                chunk_size,
-                &PayloadBufferBudget::new(4096),
-            );
-            assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
-            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-            let envelope: c2_error::C2ErrorEnvelope = serde_json::from_slice(&body)
-                .expect("relay failures must decode through the canonical HTTP error envelope");
-            let error = c2_error::C2Error::from_envelope(envelope).unwrap();
-            assert_eq!(error.code, c2_error::ErrorCode::ResourceUnavailable);
-            assert_eq!(error.details["route"], "grid");
-            assert_eq!(error.details["dispatch_phase"], "dispatch_uncertain");
-            assert!(
-                error.message.contains(expected_message),
-                "{}",
-                error.message
             );
         }
     }
@@ -5612,12 +5720,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn materialized_relay_response_uses_remote_payload_chunk_size() {
-        let response = materialized_response_or_error(
-            "grid",
-            Ok(b"abcdefg".to_vec()),
+    async fn relay_response_cursor_uses_charged_remote_payload_chunks() {
+        let budget = PayloadBufferBudget::new(3);
+        let response = super::super::streaming::unary_response(
+            c2_ipc::ResponseData::Inline(b"abcdefg".to_vec()),
+            StatusCode::OK,
+            budget.try_reserve(3).unwrap(),
+            budget.clone(),
             3,
-            &PayloadBufferBudget::new(4096),
         );
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(response.headers()[header::CONTENT_LENGTH], "7");
@@ -7098,7 +7208,7 @@ mod forwarding_admission_tests {
             Ok::<_, std::io::Error>(Bytes::from_static(b"abc")),
             Ok(Bytes::from_static(b"def")),
         ]));
-        let response = read_unknown_length_body("grid", body, 100, &budget, &cancelled)
+        let response = read_unknown_length_body("grid", body, 100, &budget, &cancelled, 1)
             .await
             .err()
             .expect("growth must reject")
@@ -7109,7 +7219,58 @@ mod forwarding_admission_tests {
             .unwrap();
         let error: serde_json::Value = serde_json::from_slice(&response).unwrap();
         assert_eq!(error["details"]["dispatch_phase"], "pre_dispatch");
-        assert_eq!(budget.snapshot().peak_bytes, 3);
+        assert_eq!(budget.snapshot().peak_bytes, 5);
+        assert_eq!(budget.snapshot().used_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn unknown_length_growth_can_reuse_unused_sending_capacity() {
+        let budget = PayloadBufferBudget::new(1024);
+        let cancelled = CancellationToken::new();
+        let body = Body::from_stream(futures::stream::iter([
+            Ok::<_, std::io::Error>(Bytes::from(vec![1; 100])),
+            Ok(Bytes::from(vec![2; 100])),
+        ]));
+        let prepared = read_unknown_length_body("grid", body, 1000, &budget, &cancelled, 1024)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(prepared.len(), 200);
+        assert!(prepared.upload.bytes() > 0);
+        assert!(prepared.download.bytes() > 0);
+        assert!(budget.snapshot().peak_bytes <= 1024);
+        assert_eq!(budget.snapshot().rejected_allocations, 0);
+        drop(prepared);
+        assert_eq!(budget.snapshot().used_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn unknown_length_two_chunks_admit_when_known_length_fits_same_budget() {
+        let budget = PayloadBufferBudget::new(4);
+        let known_plan = SendBufferPlan::new(4, 2, 2, 2).unwrap();
+        let known = reserve_send_buffers(&budget, known_plan, None)
+            .await
+            .expect("Content-Length: 2 fits input and both sending directions");
+        assert_eq!(known.input.bytes(), 2);
+        assert_eq!(known.upload.bytes(), 1);
+        assert_eq!(known.download.bytes(), 1);
+        drop(known);
+        assert_eq!(budget.snapshot().used_bytes, 0);
+
+        let body = Body::from_stream(futures::stream::iter([
+            Ok::<_, std::io::Error>(Bytes::from_static(b"a")),
+            Ok(Bytes::from_static(b"b")),
+        ]));
+        let prepared =
+            read_unknown_length_body("grid", body, 2, &budget, &CancellationToken::new(), 2)
+                .await
+                .expect("unknown length must admit the same two bytes")
+                .expect("body read was not cancelled");
+        assert_eq!(prepared.len(), 2);
+        assert_eq!(prepared.upload.bytes(), 1);
+        assert_eq!(prepared.download.bytes(), 1);
+        assert_eq!(budget.snapshot().used_bytes, 4);
+        drop(prepared);
         assert_eq!(budget.snapshot().used_bytes, 0);
     }
 
@@ -7124,13 +7285,13 @@ mod forwarding_admission_tests {
                 "real source failure",
             )),
         ]));
-        let response = read_unknown_length_body("grid", body, 100, &budget, &cancelled)
+        let response = read_unknown_length_body("grid", body, 100, &budget, &cancelled, 1)
             .await
             .err()
             .expect("source fault must reject")
             .into_response();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        assert_eq!(budget.snapshot().peak_bytes, 3);
+        assert_eq!(budget.snapshot().peak_bytes, 5);
         let response = axum::body::to_bytes(response.into_body(), 4096)
             .await
             .unwrap();
@@ -7141,8 +7302,8 @@ mod forwarding_admission_tests {
     }
 
     #[tokio::test]
-    async fn unknown_length_segments_fit_single_copy_budget() {
-        let budget = PayloadBufferBudget::new(5);
+    async fn unknown_length_segments_fit_input_and_sending_budget() {
+        let budget = PayloadBufferBudget::new(7);
         let cancelled = CancellationToken::new();
         let body = Body::from_stream(futures::stream::iter([
             Ok::<_, std::io::Error>(Bytes::new()),
@@ -7151,7 +7312,7 @@ mod forwarding_admission_tests {
         ]));
         let input = tokio::time::timeout(
             Duration::from_secs(1),
-            read_unknown_length_body("grid", body, 5, &budget, &cancelled),
+            read_unknown_length_body("grid", body, 5, &budget, &cancelled, 1),
         )
         .await
         .expect("segments must not wait for a second full-size allocation")
@@ -7162,18 +7323,24 @@ mod forwarding_admission_tests {
         assert_eq!(segments.len(), 2);
         assert_eq!(segments[0].as_ref(), b"abc");
         assert_eq!(segments[1].as_ref(), b"de");
-        assert_eq!(budget.snapshot().peak_bytes, 5);
+        assert_eq!(budget.snapshot().peak_bytes, 7);
         assert_eq!(budget.snapshot().used_bytes, 5);
         drop(segments);
         assert_eq!(budget.snapshot().used_bytes, 0);
 
         let error_budget = PayloadBufferBudget::new(1024);
-        let response =
-            read_unknown_length_body("grid", Body::from("abcdef"), 5, &error_budget, &cancelled)
-                .await
-                .err()
-                .expect("payload limit must reject")
-                .into_response();
+        let response = read_unknown_length_body(
+            "grid",
+            Body::from("abcdef"),
+            5,
+            &error_budget,
+            &cancelled,
+            1,
+        )
+        .await
+        .err()
+        .expect("payload limit must reject")
+        .into_response();
         assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
         assert_eq!(error_budget.snapshot().used_bytes, 0);
     }
@@ -7189,6 +7356,7 @@ mod forwarding_admission_tests {
             5,
             &budget,
             &cancelled,
+            1,
         ));
         assert!(futures::poll!(&mut read).is_pending());
         assert_eq!(budget.snapshot().used_bytes, 5);
@@ -7202,7 +7370,7 @@ mod forwarding_admission_tests {
 
     #[tokio::test]
     async fn concurrent_partial_unknown_uploads_do_not_wait_on_each_others_growth() {
-        let budget = PayloadBufferBudget::new(6);
+        let budget = PayloadBufferBudget::new(10);
         let cancelled = CancellationToken::new();
         let (resume_a, paused_a) = tokio::sync::oneshot::channel::<()>();
         let (resume_b, paused_b) = tokio::sync::oneshot::channel::<()>();
@@ -7221,14 +7389,14 @@ mod forwarding_admission_tests {
                 })),
         );
         let mut read_a = Box::pin(read_unknown_length_body(
-            "grid", body_a, 6, &budget, &cancelled,
+            "grid", body_a, 6, &budget, &cancelled, 1,
         ));
         let mut read_b = Box::pin(read_unknown_length_body(
-            "grid", body_b, 6, &budget, &cancelled,
+            "grid", body_b, 6, &budget, &cancelled, 1,
         ));
         assert!(futures::poll!(&mut read_a).is_pending());
         assert!(futures::poll!(&mut read_b).is_pending());
-        assert_eq!(budget.snapshot().used_bytes, 6);
+        assert_eq!(budget.snapshot().used_bytes, 10);
 
         resume_a.send(()).unwrap();
         let rejected = tokio::time::timeout(Duration::from_secs(1), &mut read_a)
@@ -7238,12 +7406,12 @@ mod forwarding_admission_tests {
             .expect("later segment must reject")
             .into_response();
         assert_eq!(rejected.status(), StatusCode::BAD_GATEWAY);
-        assert_eq!(budget.snapshot().used_bytes, 3);
+        assert_eq!(budget.snapshot().used_bytes, 5);
 
         resume_b.send(()).unwrap();
         let accepted = read_b.await.unwrap().unwrap();
         assert_eq!(accepted.len(), 4);
-        assert_eq!(budget.snapshot().used_bytes, 4);
+        assert_eq!(budget.snapshot().used_bytes, 6);
         drop(accepted);
         assert_eq!(budget.snapshot().used_bytes, 0);
     }

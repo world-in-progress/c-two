@@ -178,7 +178,9 @@ async fn rejected_shm_settles_on_original_connection(fault: InvalidShm) {
                     continue;
                 }
                 match decode_rpc_record(&header, &payload, Some(CallMode::ServerStream)).unwrap() {
-                    RpcRecord::Cancel => {
+                    RpcRecord::Cancel {
+                        cause: rpc::CancelCause::Consumer,
+                    } => {
                         assert_eq!(header.request_id, id);
                         cancelled = true;
                     }

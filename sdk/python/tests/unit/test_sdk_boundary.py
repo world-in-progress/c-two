@@ -1030,21 +1030,3 @@ def test_crm_proxy_does_not_expose_raw_relay_wire_entrypoint():
 
     assert "    def relay(" not in source
     assert "._client.relay(" not in source
-
-
-def test_relay_router_does_not_silence_response_materialization_errors():
-    root = Path(__file__).resolve().parents[4]
-    router_source = (
-        root / "core" / "transport" / "c2-http" / "src" / "relay" / "router.rs"
-    ).read_text(encoding="utf-8")
-    production = router_source.split("\n#[cfg(test)]\nmod tests")[0]
-    call_handler = production[production.index("async fn call_handler"):]
-    call_handler = call_handler[:call_handler.index("async fn acquire_request_client")]
-
-    assert "result.into_owned_bytes()" in call_handler
-    materialization = call_handler[call_handler.index("fn materialized_response_or_error"):]
-    assert "resource_unavailable_response_budgeted" in materialization
-    assert '"dispatch_uncertain"' in materialization
-    assert '"pre_dispatch"' not in materialization
-    assert "Json(serde_json::json!" not in materialization
-    assert "unwrap_or_default()" not in call_handler

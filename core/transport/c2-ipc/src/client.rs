@@ -139,6 +139,8 @@ use c2_wire::rpc::{
 use c2_mem::config::PoolConfig;
 use c2_mem::retention::{BudgetedBuffer, PayloadBufferBudget};
 
+#[path = "forward.rs"]
+pub mod forward;
 #[path = "stream.rs"]
 pub mod stream;
 use c2_mem::{MemHandle, MemPool, PeerMappingCache, PeerMappingError, PeerRead, PoolAllocation};
@@ -755,10 +757,18 @@ pub(crate) struct PendingResponse {
     pub(crate) kind: PendingKind,
     upload_stop: Option<watch::Sender<bool>>,
     pub(crate) stream: Option<Arc<stream::StreamReceive>>,
+    pub(crate) forward: Option<Arc<forward::ForwardReceive>>,
 }
 impl PendingResponse {
     pub(crate) fn complete(self, result: Result<ResponseData, IpcError>) {
-        if let Some(stream) = self.stream {
+        if let Some(forward) = self.forward {
+            forward.transport_failed(result.err().unwrap_or_else(|| {
+                IpcError::Protocol("unary response for forwarded stream".into())
+            }));
+            if let Some(tx) = self.tx {
+                let _ = tx.send(Err(IpcError::Closed));
+            }
+        } else if let Some(stream) = self.stream {
             stream.transport_failed(
                 result.err().unwrap_or_else(|| {
                     IpcError::Protocol("unary response for server stream".into())
@@ -1263,6 +1273,7 @@ impl IpcClient {
             kind,
             upload_stop: None,
             stream: None,
+            forward: None,
         });
         Ok((
             SendGuard {
@@ -3346,6 +3357,54 @@ pub(crate) fn recv_loop(
                 .lock()
                 .get(&rid)
                 .and_then(|entry| entry.stream.clone());
+            let forward = pending
+                .lock()
+                .get(&rid)
+                .and_then(|entry| entry.forward.clone());
+            if let Some(forward) = forward {
+                let result = match record {
+                    RpcRecord::ItemBegin { total_bytes } => forward.begin(total_bytes),
+                    RpcRecord::ItemData { value } => {
+                        forward.data(value.storage, server_pool, shm_allowed, retirement.clone())
+                    }
+                    RpcRecord::CallEnd {
+                        status,
+                        complete_items,
+                        error,
+                        value,
+                    } => {
+                        discard_response_storage(
+                            value.storage,
+                            server_pool,
+                            shm_allowed,
+                            conn,
+                            retirement.clone(),
+                        );
+                        let terminal = stream::StreamTerminal {
+                            status,
+                            complete_items: complete_items.unwrap_or(0),
+                            error,
+                        };
+                        let entry = pending.lock().remove(&rid).expect("active forwarded reply");
+                        forward.finish(terminal, entry);
+                        Ok(())
+                    }
+                    _ => Err(IpcError::Protocol(
+                        "unexpected forwarded stream record".into(),
+                    )),
+                };
+                if let Err(error) = result {
+                    if matches!(&error, IpcError::Protocol(_)) {
+                        conn.end(
+                            ConnectionEndReason::ProtocolError,
+                            "forward_record_admission",
+                        );
+                    }
+                    forward.fail_response(error);
+                }
+                conn.wake.notify_one();
+                continue;
+            }
             if let Some(stream) = stream {
                 let result = match record {
                     RpcRecord::ItemBegin { total_bytes } => stream.begin(total_bytes),
@@ -3460,11 +3519,9 @@ pub(crate) fn recv_loop(
                             let ValueStorage::Inline(bytes) = value.storage else {
                                 unreachable!("checked C2E1 storage")
                             };
-                            complete_pending(
-                                &pending,
-                                rid,
-                                Err(IpcError::CrmError(bytes.to_vec())),
-                            );
+                            let len = bytes.len();
+                            let bytes = take_inline_response(&mut payload, len);
+                            complete_pending(&pending, rid, Err(IpcError::CrmError(bytes)));
                             conn.wake.notify_one();
                             continue;
                         }
@@ -3512,14 +3569,23 @@ pub(crate) fn recv_loop(
                 }
             };
             let result = match value.chunk {
-                ChunkPosition::Whole => admit_response_storage(
-                    value.storage,
-                    &server_pool,
-                    shm_allowed,
-                    conn,
-                    retirement.clone(),
-                )
-                .map(Some),
+                ChunkPosition::Whole => match value.storage {
+                    ValueStorage::Inline(bytes) => {
+                        let len = bytes.len();
+                        Ok(Some(ResponseData::Inline(take_inline_response(
+                            &mut payload,
+                            len,
+                        ))))
+                    }
+                    storage => admit_response_storage(
+                        storage,
+                        &server_pool,
+                        shm_allowed,
+                        conn,
+                        retirement.clone(),
+                    )
+                    .map(Some),
+                },
                 _ => receive_rpc_chunk(
                     &hdr,
                     value,
@@ -3641,6 +3707,20 @@ fn receive_rpc_chunk(
         .map(Some)
         .map_err(IpcError::Protocol)
 }
+
+// The decoder already proved that the whole inline value ends at the frame's
+// end. Reuse that admitted frame allocation instead of cloning the full value
+// before the relay can reserve its bounded local copying window.
+fn take_inline_response(frame: &mut Vec<u8>, len: usize) -> Vec<u8> {
+    let start = frame.len() - len;
+    let mut bytes = std::mem::take(frame);
+    bytes.drain(..start);
+    bytes
+}
+
+#[cfg(test)]
+#[path = "response_frame_tests.rs"]
+mod response_frame_tests;
 
 fn complete_pending(
     pending: &StdMutex<PendingMap>,

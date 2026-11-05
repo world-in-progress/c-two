@@ -1,4 +1,3 @@
-use std::collections::BTreeMap;
 use std::error::Error as _;
 use std::fmt;
 use std::io::ErrorKind;
@@ -6,11 +5,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use c2_config::{CallOptions, ConnectDeadline, ConnectOptions};
-use c2_http::client::HttpCallControl;
+use c2_http::client::{HttpCallControl, HttpResponseStream, HttpStreamCancellation};
 use c2_ipc::IpcCallControl;
 
 use crate::call_execution::{PreparingCall, guard_error, scope_error};
-use crate::client_stream::CoreResponseStream;
+use crate::client_stream::{CoreResponseStream, StreamTransport};
 use crate::{CallScope, CallScopeError, CallState};
 
 use c2_contract::{ExpectedRouteContract, validate_expected_route_contract};
@@ -205,23 +204,15 @@ impl Client {
     /// slot, including calls with an unlimited deadline.
     #[doc(hidden)]
     pub fn begin_stream(&self, method: &str) -> Result<PreparedCall, Error> {
-        if matches!(&self.inner.transport, ClientInner::Http(..)) {
-            return Err(c2_error::C2Error::new(
-                c2_error::ErrorCode::UnsupportedCallMode,
-                "server streams over HTTP relay are not supported",
-            )
-            .with_details(BTreeMap::from([(
-                "transport_phase".into(),
-                "pre_dispatch".into(),
-            )]))
-            .into());
-        }
         let scope = CallScope::new(self.options, None).map_err(scope_error)?;
-        let preparing = self
+        let mut preparing = self
             .inner
             .runtime
             .call_execution_context()?
             .prepare_stream_scope(scope)?;
+        if matches!(&self.inner.transport, ClientInner::Http(..)) {
+            preparing = preparing.with_stream_http_headroom();
+        }
         Ok(PreparedCall {
             preparing,
             inner: self.inner.clone(),
@@ -306,12 +297,13 @@ pub struct EncodedCall {
 
 impl EncodedCall {
     pub fn stream(self) -> Result<CoreResponseStream, Error> {
-        let (started, scope, cancellation) =
+        let (started, scope, cancellation, http_cancellation) =
             self.start_stream(false, c2_ipc::IpcStreamCancellation::new())?;
         Ok(CoreResponseStream::new(
             started.wait()?,
             scope,
             cancellation,
+            http_cancellation,
         ))
     }
 
@@ -322,11 +314,17 @@ impl EncodedCall {
         self,
         cancellation: c2_ipc::IpcStreamCancellation,
     ) -> Result<CoreResponseStream, Error> {
-        let (started, scope, cancellation) = self.start_stream(true, cancellation)?;
+        let (started, scope, cancellation, http_cancellation) =
+            self.start_stream(true, cancellation)?;
+        let stream = started.wait_original().await?;
+        if cancellation.is_requested() {
+            http_cancellation.cancel();
+        }
         Ok(CoreResponseStream::new(
-            started.wait_original().await?,
+            stream,
             scope,
             cancellation,
+            http_cancellation,
         ))
     }
 
@@ -336,9 +334,10 @@ impl EncodedCall {
         cancellation: c2_ipc::IpcStreamCancellation,
     ) -> Result<
         (
-            crate::call_execution::ExecutingCall<c2_ipc::IpcResponseStream>,
+            crate::call_execution::ExecutingCall<StreamTransport>,
             CallScope,
             c2_ipc::IpcStreamCancellation,
+            HttpStreamCancellation,
         ),
         Error,
     > {
@@ -359,31 +358,43 @@ impl EncodedCall {
         let permit = preparing.take_stream_permit();
         let transport_cancellation = cancellation.clone();
         let handle_cancellation = cancellation.clone();
+        let http_cancellation = HttpStreamCancellation::new();
+        let transport_http_cancellation = http_cancellation.clone();
+        let abandon_http_cancellation = http_cancellation.clone();
         let transport = move |input, scope| async move {
             match &inner.transport {
-                ClientInner::Ipc(connection) => {
-                    call_ipc_stream(
-                        connection,
-                        &method,
-                        input,
-                        scope,
-                        payload_budget,
-                        Box::new(permit),
-                        transport_cancellation,
-                    )
-                    .await
-                }
-                ClientInner::Http(..) => Err(c2_error::C2Error::new(
-                    c2_error::ErrorCode::UnsupportedCallMode,
-                    "server streams over HTTP relay are not supported",
+                ClientInner::Ipc(connection) => call_ipc_stream(
+                    connection,
+                    &method,
+                    input,
+                    scope,
+                    payload_budget,
+                    Box::new(permit),
+                    transport_cancellation,
                 )
-                .into()),
+                .await
+                .map(StreamTransport::Ipc),
+                ClientInner::Http(client, _) => call_http_stream(
+                    client,
+                    &method,
+                    input,
+                    scope,
+                    payload_budget,
+                    Box::new(permit),
+                    transport_cancellation,
+                    transport_http_cancellation,
+                )
+                .await
+                .map(StreamTransport::Http),
             }
         };
-        let abandon = |stream: &c2_ipc::IpcResponseStream| {
-            let _ = stream.cancel();
+        let abandon = |stream: &StreamTransport| {
+            stream.cancel();
         };
-        let on_abandon = move || cancellation.cancel();
+        let on_abandon = move || {
+            cancellation.cancel();
+            abandon_http_cancellation.cancel();
+        };
         let started = if original {
             preparing.execute_stream_record(
                 self.nbytes,
@@ -401,7 +412,7 @@ impl EncodedCall {
                 on_abandon,
             )?
         };
-        Ok((started, scope, handle_cancellation))
+        Ok((started, scope, handle_cancellation, http_cancellation))
     }
 
     pub fn call_owned(self) -> Result<Vec<u8>, Error> {
@@ -525,6 +536,82 @@ async fn call_ipc_stream(
         )
         .await
         .map_err(normalize_ipc_call_error)
+}
+
+async fn call_http_stream(
+    client: &RelayAwareHttpClient,
+    method: &str,
+    input: BudgetedBuffer,
+    scope: CallScope,
+    payload_budget: PayloadBufferBudget,
+    completion_owner: Box<dyn Send>,
+    opening_cancellation: c2_ipc::IpcStreamCancellation,
+    cancellation: HttpStreamCancellation,
+) -> Result<HttpResponseStream, Error> {
+    let (bytes, mut reservation) = input.into_parts();
+    let input_reservation = reservation
+        .split_off(bytes.capacity() as u64)
+        .map_err(|error| LifecycleError::Configuration(error.to_string()))?;
+    let input = BudgetedBuffer::new(bytes, input_reservation);
+    let active = scope.clone();
+    let deadline = scope.deadline();
+    let before_attempt_cancellation = opening_cancellation.clone();
+    let control = HttpCallControl::new(
+        move || {
+            if before_attempt_cancellation.is_requested() {
+                return Err(pre_dispatch_stream_cancellation());
+            }
+            match active.observe_deadline() {
+                CallState::PreDispatch | CallState::Dispatched => Ok(()),
+                CallState::ExpiredPreDispatch => {
+                    Err(guard_error(CallScopeError::DeadlineExceeded {
+                        phase: TransportPhase::PreDispatch,
+                    }))
+                }
+                CallState::ExpiredDispatchUncertain => {
+                    Err(guard_error(CallScopeError::DeadlineExceeded {
+                        phase: TransportPhase::DispatchUncertain,
+                    }))
+                }
+                state => Err(guard_error(CallScopeError::InvalidState { state })),
+            }
+        },
+        move || {
+            if opening_cancellation.is_requested() {
+                return Err(pre_dispatch_stream_cancellation());
+            }
+            scope.try_begin_dispatch().map_err(guard_error)
+        },
+    )
+    .with_payload_budget(payload_budget, deadline);
+    client
+        .stream_controlled_async(
+            method,
+            Arc::new(input),
+            reservation,
+            completion_owner,
+            cancellation,
+            &control,
+        )
+        .await
+        .map_err(|error| {
+            let phase = match error.phase() {
+                HttpCallPhase::PreDispatch => TransportPhase::PreDispatch,
+                HttpCallPhase::DispatchUncertain => TransportPhase::DispatchUncertain,
+            };
+            normalize_http_error(error.into_source(), phase)
+        })
+}
+
+fn pre_dispatch_stream_cancellation() -> c2_error::C2Error {
+    c2_error::C2Error::new(
+        c2_error::ErrorCode::CallCancelled,
+        "consumer canceled the stream before dispatch",
+    )
+    .with_details(std::collections::BTreeMap::from([
+        ("transport_phase".into(), "pre_dispatch".into()),
+        ("stage".into(), "stream_open".into()),
+    ]))
 }
 
 async fn call_http(

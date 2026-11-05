@@ -404,7 +404,11 @@ impl EncodedStreamService for ProbeService {
         self.0.opens.fetch_add(1, Ordering::SeqCst);
         Ok(Box::new(ProbeStream {
             probe: self.0.clone(),
-            count: request[0] as usize,
+            count: if request[1] == 6 {
+                usize::MAX
+            } else {
+                request[0] as usize
+            },
             mode: request[1],
             cursor: 0,
         }))
@@ -425,7 +429,7 @@ impl EncodedStream for ProbeStream {
             .step_entered
             .send((self.mode, self.cursor))
             .unwrap();
-        if self.mode == 3 && self.cursor == 0 {
+        if (self.mode == 3 && self.cursor == 0) || (self.mode == 6 && self.cursor == 2) {
             self.probe.step_gate.wait();
         }
         if self.cursor == self.count {
@@ -1325,7 +1329,100 @@ fn deadline_only_ends_waiting_and_the_original_stream_can_be_cancelled_later() {
 }
 
 #[test]
-fn http_refuses_only_stream_calls_and_verified_relay_local_ipc_still_streams() {
+fn http_deadline_keeps_original_post_for_later_close() {
+    let fixture = Fixture::with_relay(
+        false,
+        2,
+        ServiceConcurrencyMode::ReadParallel,
+        Some(1),
+        None,
+        true,
+    );
+    let client = fixture
+        .server
+        .connect(
+            fixture.client.expected_route().clone(),
+            Connect::ExplicitRelay {
+                relay_url: fixture.server.relay_anchor_address_override().unwrap(),
+            },
+        )
+        .unwrap();
+    let timed = client.with_call_options(CallOptions::with_timeout(CallTimeout::After(
+        Duration::from_secs(1),
+    )));
+    let mut stream = timed
+        .begin_stream("echo")
+        .unwrap()
+        .encode_vec(vec![2, 3])
+        .unwrap()
+        .stream()
+        .unwrap();
+    assert_eq!(fixture.step_events.recv_timeout(WAIT).unwrap(), (3, 0));
+    assert_semantic(
+        expect_stream_error(&mut stream),
+        ErrorCode::CallDeadlineExceeded,
+        "deadline",
+    );
+    assert_eq!(fixture.probe.finishes.load(Ordering::SeqCst), 0);
+    let pending = stream.close_with_timeout(Some(Duration::ZERO));
+    assert!(!pending.completed);
+    fixture.probe.step_gate.release();
+    let receipt = stream.close_with_timeout(Some(WAIT));
+    assert!(receipt.completed);
+    assert_semantic(
+        receipt
+            .terminal
+            .unwrap()
+            .expect_err("explicit cancellation"),
+        ErrorCode::CallCancelled,
+        "consumer",
+    );
+    assert_eq!(fixture.probe.finishes.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn http_opening_cancellation_refuses_business_post() {
+    let fixture = Fixture::with_relay(
+        false,
+        2,
+        ServiceConcurrencyMode::ReadParallel,
+        None,
+        None,
+        true,
+    );
+    let client = fixture
+        .server
+        .connect(
+            fixture.client.expected_route().clone(),
+            Connect::ExplicitRelay {
+                relay_url: fixture.server.relay_anchor_address_override().unwrap(),
+            },
+        )
+        .unwrap();
+    let cancellation = c2_ipc::IpcStreamCancellation::new();
+    cancellation.cancel();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let result = runtime.block_on(
+        client
+            .begin_stream("echo")
+            .unwrap()
+            .encode_vec(vec![1, 0])
+            .unwrap()
+            .stream_record_async(cancellation),
+    );
+    let error = match result {
+        Ok(_) => panic!("canceled opening unexpectedly dispatched"),
+        Err(error) => error,
+    };
+    assert_semantic(error, ErrorCode::CallCancelled, "before dispatch");
+    assert_eq!(fixture.probe.opens.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn http_and_verified_relay_local_ipc_streams_share_core_facade() {
     let fixture = Fixture::with_relay(
         false,
         2,
@@ -1344,21 +1441,18 @@ fn http_refuses_only_stream_calls_and_verified_relay_local_ipc_still_streams() {
             },
         )
         .unwrap();
-    let error = http
+    let mut stream = http
         .begin_stream("echo")
-        .err()
-        .expect("HTTP stream must refuse before encoding");
-    match error {
-        Error::Semantic(error) => {
-            assert_eq!(error.code, ErrorCode::UnsupportedCallMode);
-            assert_eq!(
-                error.details.get("transport_phase").map(String::as_str),
-                Some("pre_dispatch")
-            );
-        }
-        other => panic!("unexpected stream refusal: {other}"),
-    }
-    assert_eq!(fixture.probe.opens.load(Ordering::SeqCst), 0);
+        .unwrap()
+        .encode_vec(vec![1, 0])
+        .unwrap()
+        .stream()
+        .unwrap();
+    drop(assert_item(&mut stream, 1));
+    assert!(stream.next_item().unwrap().is_none());
+    let receipt = stream.close();
+    assert!(receipt.terminal.unwrap().is_ok());
+    assert_eq!(receipt.complete_items, Some(1));
     assert_eq!(http.call_owned("ping", &[]).unwrap(), b"pong");
     let local = fixture
         .server
@@ -1407,6 +1501,237 @@ fn http_refuses_only_stream_calls_and_verified_relay_local_ipc_still_streams() {
     drop(assert_item(&mut stream, 1));
     assert!(stream.next_item().unwrap().is_none());
     assert!(stream.close().terminal.unwrap().is_ok());
+}
+
+#[test]
+fn explicit_http_zero_one_multiple_and_resource_errors_preserve_counts() {
+    let fixture = Fixture::with_relay(
+        false,
+        2,
+        ServiceConcurrencyMode::ReadParallel,
+        None,
+        None,
+        true,
+    );
+    let client = fixture
+        .server
+        .connect(
+            fixture.client.expected_route().clone(),
+            Connect::ExplicitRelay {
+                relay_url: fixture.server.relay_anchor_address_override().unwrap(),
+            },
+        )
+        .unwrap();
+    for count in [0, 1, 3] {
+        let mut stream = client
+            .begin_stream("echo")
+            .unwrap()
+            .encode_vec(vec![count, 0])
+            .unwrap()
+            .stream()
+            .unwrap();
+        for index in 1..=count {
+            drop(assert_item(&mut stream, index));
+        }
+        assert!(stream.next_item().unwrap().is_none());
+        let receipt = stream.close_with_timeout(Some(WAIT));
+        assert!(receipt.completed);
+        assert!(receipt.terminal.unwrap().is_ok());
+        assert_eq!(receipt.complete_items, Some(count as u64));
+    }
+    for (mode, reason) in [
+        (1, "step failed after complete items"),
+        (2, "finish failed after complete items"),
+    ] {
+        let mut stream = client
+            .begin_stream("echo")
+            .unwrap()
+            .encode_vec(vec![1, mode])
+            .unwrap()
+            .stream()
+            .unwrap();
+        drop(assert_item(&mut stream, 1));
+        assert_semantic(
+            expect_stream_error(&mut stream),
+            ErrorCode::ResourceFunctionExecuting,
+            reason,
+        );
+        let receipt = stream.close_with_timeout(Some(WAIT));
+        assert!(receipt.completed);
+        assert_eq!(receipt.complete_items, Some(1));
+        assert_semantic(
+            receipt.terminal.unwrap().expect_err("original failure"),
+            ErrorCode::ResourceFunctionExecuting,
+            reason,
+        );
+    }
+    assert_eq!(fixture.probe.finishes.load(Ordering::SeqCst), 5);
+}
+
+#[test]
+fn explicit_http_multiple_holds_release_b_for_next_item() {
+    let fixture = Fixture::with_relay(
+        false,
+        2,
+        ServiceConcurrencyMode::ReadParallel,
+        None,
+        Some(8),
+        true,
+    );
+    let client = fixture
+        .server
+        .connect(
+            fixture.client.expected_route().clone(),
+            Connect::ExplicitRelay {
+                relay_url: fixture.server.relay_anchor_address_override().unwrap(),
+            },
+        )
+        .unwrap();
+    let mut stream = client
+        .begin_stream("echo")
+        .unwrap()
+        .encode_vec(vec![3, 0])
+        .unwrap()
+        .stream()
+        .unwrap();
+    let first = assert_item(&mut stream, 1);
+    let second = assert_item(&mut stream, 2);
+    observe_until(|| fixture.server.payload_buffer_stats().unwrap().used_bytes == 8);
+    let (started, started_rx) = mpsc::channel();
+    let (returned, returned_rx) = mpsc::channel();
+    let waiting = std::thread::spawn(move || {
+        started.send(()).unwrap();
+        let third = stream.next_item();
+        returned.send(third).unwrap();
+        stream
+    });
+    started_rx.recv_timeout(WAIT).unwrap();
+    assert!(
+        returned_rx.try_recv().is_err(),
+        "third item bypassed full B"
+    );
+    drop(first);
+    let third = returned_rx.recv_timeout(WAIT).unwrap().unwrap().unwrap();
+    assert_eq!(third.bytes(), &[3; 4]);
+    drop(second);
+    drop(third);
+    let stream = waiting.join().unwrap();
+    assert!(stream.next_item().unwrap().is_none());
+    let receipt = stream.close_with_timeout(Some(WAIT));
+    assert!(receipt.completed);
+    assert_eq!(receipt.complete_items, Some(3));
+    assert!(receipt.terminal.unwrap().is_ok());
+    observe_until(|| fixture.server.payload_buffer_stats().unwrap().used_bytes == 0);
+}
+
+#[test]
+fn explicit_http_close_keeps_cancelled_outcome_when_small_b_is_full() {
+    let fixture = Fixture::with_relay(
+        false,
+        2,
+        ServiceConcurrencyMode::ReadParallel,
+        None,
+        Some(8),
+        true,
+    );
+    let client = fixture
+        .server
+        .connect(
+            fixture.client.expected_route().clone(),
+            Connect::ExplicitRelay {
+                relay_url: fixture.server.relay_anchor_address_override().unwrap(),
+            },
+        )
+        .unwrap();
+    let mut stream = client
+        .begin_stream("echo")
+        .unwrap()
+        .encode_vec(vec![0, 6])
+        .unwrap()
+        .stream()
+        .unwrap();
+    let first = assert_item(&mut stream, 1);
+    let second = assert_item(&mut stream, 2);
+    for index in 0..=2 {
+        assert_eq!(fixture.step_events.recv_timeout(WAIT).unwrap(), (6, index));
+    }
+    assert_eq!(fixture.server.payload_buffer_stats().unwrap().used_bytes, 8);
+    assert!(!stream.close_with_timeout(Some(Duration::ZERO)).completed);
+    fixture.probe.step_gate.release();
+    let receipt = stream.close_with_timeout(Some(WAIT));
+    assert!(receipt.completed);
+    assert_eq!(fixture.probe.finishes.load(Ordering::SeqCst), 1);
+    assert_semantic(
+        receipt.terminal.unwrap().expect_err("consumer cancelled"),
+        ErrorCode::CallCancelled,
+        "consumer",
+    );
+    assert!((2..=3).contains(&receipt.complete_items.expect("actual complete-item count")));
+    assert_eq!(first.bytes(), &[1; 4]);
+    assert_eq!(second.bytes(), &[2; 4]);
+}
+
+#[test]
+fn relay_shutdown_delivers_running_http_item_then_true_cancelled_terminal() {
+    let mut fixture = Fixture::with_relay(
+        false,
+        2,
+        ServiceConcurrencyMode::ReadParallel,
+        None,
+        None,
+        true,
+    );
+    let client = fixture
+        .server
+        .connect(
+            fixture.client.expected_route().clone(),
+            Connect::ExplicitRelay {
+                relay_url: fixture.server.relay_anchor_address_override().unwrap(),
+            },
+        )
+        .unwrap();
+    let mut stream = client
+        .begin_stream("echo")
+        .unwrap()
+        .encode_vec(vec![3, 3])
+        .unwrap()
+        .stream()
+        .unwrap();
+    assert_eq!(fixture.step_events.recv_timeout(WAIT).unwrap(), (3, 0));
+    let mut relay = fixture._relay.take().unwrap();
+    let (stopped_tx, stopped_rx) = mpsc::channel();
+    let stopping = std::thread::spawn(move || {
+        stopped_tx.send(relay.stop()).unwrap();
+    });
+    // The relay keeps this existing HTTP response alive while its forwarding
+    // admission gate closes. An independent ping observes that gate before the
+    // gated resource step is released.
+    observe_until(|| match client.call_owned("ping", &[]) {
+        Ok(_) => false,
+        Err(Error::Semantic(error)) if error.code == ErrorCode::CallCapacityExceeded => true,
+        Err(error) => panic!("unexpected admission observation: {error}"),
+    });
+    assert!(
+        stopped_rx.try_recv().is_err(),
+        "relay stopped before running step ended"
+    );
+    fixture.probe.step_gate.release();
+    drop(assert_item(&mut stream, 1));
+    assert_semantic(
+        expect_stream_error(&mut stream),
+        ErrorCode::CallCancelled,
+        "relay shutdown",
+    );
+    let receipt = stream.close_with_timeout(Some(WAIT));
+    assert!(receipt.completed);
+    assert_eq!(receipt.complete_items, Some(1));
+    assert_semantic(
+        receipt.terminal.unwrap().expect_err("relay shutdown"),
+        ErrorCode::CallCancelled,
+        "relay shutdown",
+    );
+    assert!(stopped_rx.recv_timeout(WAIT).unwrap().is_ok());
+    stopping.join().unwrap();
 }
 
 #[test]

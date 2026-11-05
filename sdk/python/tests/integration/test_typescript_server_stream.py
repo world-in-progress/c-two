@@ -10,6 +10,7 @@ import subprocess
 import pytest
 
 import c_two as cc
+from tests.fixtures.process_control import portable_command
 from tests.fixtures.stream_matrix import Portable, PythonHost, RustHarness, build_payload, inspect
 from tests.fixtures.typescript_project import write_node_tsconfig
 
@@ -19,7 +20,10 @@ TS_SOURCE = REPOSITORY / "core/foundation/c2-codegen/assets/typescript_transport
 
 
 def _checked(command: list[str], root: Path) -> subprocess.CompletedProcess[str]:
-    result = subprocess.run(command, cwd=root, capture_output=True, text=True, timeout=300, check=False)
+    result = subprocess.run(
+        portable_command(command), cwd=root, capture_output=True, text=True,
+        encoding="utf-8", timeout=300, check=False,
+    )
     assert result.returncode == 0, f"{command!r}\n{result.stdout}\n{result.stderr}"
     return result
 

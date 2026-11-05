@@ -181,6 +181,7 @@ dependencies = [
  "c2-mem",
  "c2-wire",
  "futures",
+ "getrandom 0.4.3",
  "hex",
  "parking_lot",
  "percent-encoding",

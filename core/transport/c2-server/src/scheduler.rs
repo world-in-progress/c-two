@@ -121,6 +121,7 @@ pub enum StreamCancelCause {
     Consumer,
     Shutdown,
     Unregister,
+    RelayShutdown,
 }
 
 impl StreamCancelCause {
@@ -129,6 +130,7 @@ impl StreamCancelCause {
             Self::Consumer => "server stream cancelled by consumer",
             Self::Shutdown => "server stream cancelled by Runtime shutdown",
             Self::Unregister => "server stream cancelled by route unregister",
+            Self::RelayShutdown => "server stream cancelled by relay shutdown",
         }
     }
 }

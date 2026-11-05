@@ -56,6 +56,37 @@ fn stream_demand_and_storage_reject_overgrant_without_changing_connection_book()
 }
 
 #[test]
+fn whole_shm_item_spends_positive_copy_window_and_keeps_connection_balance() {
+    let core = established(ConnectionSide::Client);
+    core.stream_open(1).unwrap();
+    core.stream_open(2).unwrap();
+    core.stream_begin_item(1, 9).unwrap();
+    core.stream_begin_item(2, 4).unwrap();
+    core.stream_credit(1, 1, 0).unwrap();
+    core.stream_credit(2, 2, 0).unwrap();
+    assert!(core.stream_data(1, 9).is_err());
+    assert!(core.stream_shm_data(1, 8).is_err());
+    assert_eq!(core.shared.state.lock().stream_storage_bytes, 3);
+    assert_eq!(core.stream_shm_data(1, 9).unwrap(), 0);
+    assert_eq!(core.shared.state.lock().stream_storage_bytes, 2);
+    assert_eq!(core.stream_state(1).unwrap().admitted_bytes, 9);
+    assert_eq!(core.stream_data(2, 2).unwrap(), 0);
+    assert_eq!(core.shared.state.lock().stream_storage_bytes, 0);
+    core.stream_finish_item(1).unwrap();
+    core.stream_retire(1).unwrap();
+    assert_eq!(core.shared.state.lock().stream_storage_bytes, 0);
+
+    let other = established(ConnectionSide::Client);
+    other.stream_open(3).unwrap();
+    other.stream_begin_item(3, 5).unwrap();
+    assert!(other.stream_shm_data(3, 5).is_err());
+    other.stream_credit(3, 2, 0).unwrap();
+    other.stream_data(3, 1).unwrap();
+    assert!(other.stream_shm_data(3, 5).is_err());
+    assert_eq!(other.shared.state.lock().stream_storage_bytes, 1);
+}
+
+#[test]
 fn stream_cancel_is_idempotent_and_late_credit_does_not_revive_it() {
     let core = established(ConnectionSide::Server);
     core.stream_open(8).unwrap();

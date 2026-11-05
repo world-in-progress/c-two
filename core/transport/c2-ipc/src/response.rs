@@ -3,6 +3,7 @@
 
 use std::sync::Arc;
 
+use c2_mem::retention::{BudgetedBuffer, PayloadBufferReservation};
 use c2_mem::{PeerMappingError, PeerRead};
 use c2_wire::{buddy::BuddyPayload, chunk::ReassemblyBacking, connection::RemoteLoan};
 use parking_lot::RwLock;
@@ -72,9 +73,90 @@ impl ServerShmResponse {
         // copy returns; dropping it then ends the read and queues RELEASE.
         unsafe { self.read.copy_into(destination) }
     }
+
+    pub(crate) fn copy_range_into(
+        &self,
+        offset: usize,
+        destination: &mut [u8],
+    ) -> Result<(), String> {
+        // SAFETY: this move-only carrier pins the mapping and remote loan for
+        // the entire synchronous copy. The borrow ends before any await.
+        unsafe { self.read.copy_range_into(offset, destination) }
+    }
+}
+
+/// Sequential local reads from one admitted response carrier. A SHM loan is
+/// released immediately after its final range has been copied.
+pub struct ResponseCursor {
+    data: Option<ResponseData>,
+    offset: usize,
+    len: usize,
+}
+
+impl ResponseCursor {
+    pub fn len(&self) -> usize {
+        self.len
+    }
+    pub fn remaining(&self) -> usize {
+        self.len - self.offset
+    }
+
+    pub fn read_chunk(
+        &mut self,
+        mut reservation: PayloadBufferReservation,
+        max_bytes: usize,
+    ) -> Result<Option<BudgetedBuffer>, crate::client::IpcError> {
+        let take = self
+            .remaining()
+            .min(max_bytes)
+            .min(usize::try_from(reservation.bytes()).unwrap_or(usize::MAX));
+        if take == 0 {
+            if self.remaining() == 0 {
+                return Ok(None);
+            }
+            return Err(crate::client::IpcError::Config(
+                "positive response copy window required".into(),
+            ));
+        }
+        let mut bytes = vec![0; take];
+        if bytes.capacity() as u64 > reservation.bytes() {
+            return Err(crate::client::IpcError::Config(
+                "response copy allocation exceeds reservation".into(),
+            ));
+        }
+        match self.data.as_ref().expect("live response cursor") {
+            ResponseData::Inline(source) => {
+                bytes.copy_from_slice(&source[self.offset..self.offset + take])
+            }
+            ResponseData::Shm(carrier) => carrier
+                .copy_range_into(self.offset, &mut bytes)
+                .map_err(crate::client::IpcError::Shm)?,
+            ResponseData::Handle(backing) => backing
+                .with_slice(|source| {
+                    bytes.copy_from_slice(&source[self.offset..self.offset + take])
+                })
+                .map_err(crate::client::IpcError::Shm)?,
+        }
+        self.offset += take;
+        if self.remaining() == 0 {
+            self.data.take();
+        }
+        let charge = reservation
+            .split_off(bytes.capacity() as u64)
+            .expect("bounded by reservation");
+        Ok(Some(BudgetedBuffer::new(bytes, charge)))
+    }
 }
 
 impl ResponseData {
+    pub fn into_cursor(self) -> ResponseCursor {
+        let len = self.len();
+        ResponseCursor {
+            data: Some(self),
+            offset: 0,
+            len,
+        }
+    }
     pub fn len(&self) -> usize {
         match self {
             Self::Inline(bytes) => bytes.len(),

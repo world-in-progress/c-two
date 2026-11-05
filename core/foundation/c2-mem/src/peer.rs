@@ -187,13 +187,39 @@ impl PeerRead {
         if destination.len() != self.len {
             return Err("destination length does not match the admitted peer span".into());
         }
+        // SAFETY: the caller maintains the peer's read interval and the
+        // destination is disjoint from the read-only peer mapping.
+        unsafe { self.copy_range_into(0, destination) }
+    }
+
+    /// Copy a subrange of the admitted span. `offset` is relative to that
+    /// span, not to the OS mapping. An empty copy at the end is valid.
+    ///
+    /// # Safety
+    /// The publishing peer must keep the admitted span immutable until this
+    /// read ends. Keep the connection's remote loan alive through this copy.
+    pub unsafe fn copy_range_into(
+        &self,
+        offset: usize,
+        destination: &mut [u8],
+    ) -> Result<(), String> {
+        let end = offset
+            .checked_add(destination.len())
+            .ok_or_else(|| "peer copy range overflow".to_owned())?;
+        if end > self.len {
+            return Err("peer copy range exceeds the admitted span".into());
+        }
+        let source_offset = self
+            .offset
+            .checked_add(offset)
+            .ok_or_else(|| "peer mapping offset overflow".to_owned())?;
         // SAFETY: admission checked the span and this owner pins the mapping;
         // the caller supplies the peer's read interval and nonaliasing output.
         unsafe {
             std::ptr::copy_nonoverlapping(
-                self.mapping.base_ptr().add(self.offset),
+                self.mapping.base_ptr().add(source_offset),
                 destination.as_mut_ptr(),
-                self.len,
+                destination.len(),
             );
         }
         Ok(())
@@ -313,6 +339,67 @@ mod tests {
             "the OS view was dropped without waiting for GC"
         );
         owner.release_handle(handle);
+    }
+
+    #[test]
+    fn range_copies_stay_within_admitted_span_until_last_carrier_drops() {
+        let mut owner = MemPool::new(config()).unwrap();
+        let cache = PeerMappingCache::new(config(), owner.prefix().into()).unwrap();
+        let (mut handle, allocation) = payload(&mut owner, 16384, 0);
+        owner
+            .handle_slice_mut(&mut handle)
+            .iter_mut()
+            .enumerate()
+            .for_each(|(index, byte)| *byte = (index % 251) as u8);
+        let first = admit(&cache, allocation, 16384);
+        let last = admit(&cache, allocation, 16384);
+        let mapping = Arc::downgrade(&first.mapping);
+        drop(first);
+        assert!(mapping.upgrade().is_some());
+
+        let mut middle = [0; 7];
+        unsafe { last.copy_range_into(251, &mut middle) }.unwrap();
+        assert_eq!(middle, [0, 1, 2, 3, 4, 5, 6]);
+        let mut tail = [0; 1];
+        unsafe { last.copy_range_into(16383, &mut tail) }.unwrap();
+        assert_eq!(tail[0], (16383 % 251) as u8);
+        unsafe { last.copy_range_into(16384, &mut []) }.unwrap();
+
+        let mut untouched = [0xAA; 2];
+        assert!(unsafe { last.copy_range_into(16383, &mut untouched) }.is_err());
+        assert_eq!(untouched, [0xAA; 2]);
+        assert!(unsafe { last.copy_range_into(16385, &mut []) }.is_err());
+        assert!(unsafe { last.copy_range_into(usize::MAX, &mut untouched) }.is_err());
+        assert_eq!(untouched, [0xAA; 2]);
+        assert_eq!(unsafe { last.copy() }.unwrap().len(), 16384);
+
+        drop(last);
+        assert_eq!(cache.mapped_segments(), 0);
+        assert!(mapping.upgrade().is_none());
+        owner.release_handle(handle);
+    }
+
+    #[test]
+    fn range_offset_is_relative_to_admitted_buddy_allocation() {
+        let mut owner = MemPool::new(config()).unwrap();
+        let cache = PeerMappingCache::new(config(), owner.prefix().into()).unwrap();
+        let (first_handle, _) = payload(&mut owner, 4096, 11);
+        let (second_handle, second) = payload(&mut owner, 1024, 22);
+        assert!(!second.is_dedicated);
+        assert!(second.offset > 0);
+        let read = admit(&cache, second, 1024);
+        let mut copied = [0; 3];
+        unsafe { read.copy_range_into(0, &mut copied) }.unwrap();
+        assert_eq!(copied, [22; 3]);
+        unsafe { read.copy_range_into(1021, &mut copied) }.unwrap();
+        assert_eq!(copied, [22; 3]);
+        let mut full = vec![0; 1024];
+        unsafe { read.copy_into(&mut full) }.unwrap();
+        assert_eq!(full, vec![22; 1024]);
+        assert!(unsafe { read.copy_into(&mut copied) }.is_err());
+        drop(read);
+        owner.release_handle(second_handle);
+        owner.release_handle(first_handle);
     }
 
     #[test]

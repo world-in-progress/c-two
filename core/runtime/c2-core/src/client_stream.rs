@@ -1,7 +1,9 @@
-//! Synchronous facade over one original IPC server-stream call record.
+//! Synchronous facade over one original server-stream call record.
 
 use std::time::{Duration, Instant};
 
+use c2_http::client::{HttpError, HttpResponseStream, HttpStreamCancellation};
+use c2_http::stream_wire::{HttpStreamStatus, HttpStreamTerminal};
 use c2_ipc::{IpcError, IpcResponseStream, IpcStreamCancellation, StreamTerminal};
 use c2_mem::retention::BudgetedBuffer;
 use c2_wire::rpc::CallStatus;
@@ -14,10 +16,101 @@ use crate::{CallScope, CallState, Error, HeldResponse, TransportPhase, normalize
 /// One client-owned view of a server stream. The transport record keeps its
 /// operation slot until the actual terminal, independently of this facade.
 pub struct CoreResponseStream {
-    stream: Mutex<IpcResponseStream>,
+    stream: Mutex<StreamTransport>,
     cancellation: IpcStreamCancellation,
+    http_cancellation: HttpStreamCancellation,
     scope: CallScope,
     runtime: tokio::runtime::Handle,
+}
+
+pub(crate) enum StreamTransport {
+    Ipc(IpcResponseStream),
+    Http(HttpResponseStream),
+}
+
+impl StreamTransport {
+    pub(crate) fn cancel(&self) {
+        match self {
+            Self::Ipc(stream) => {
+                let _ = stream.cancel();
+            }
+            Self::Http(stream) => stream.cancel(),
+        }
+    }
+
+    async fn recv(&mut self) -> Result<Option<BudgetedBuffer>, Error> {
+        match self {
+            Self::Ipc(stream) => stream.recv().await.map_err(normalize_ipc_call_error),
+            Self::Http(stream) => stream.recv().await.map_err(normalize_http_stream_error),
+        }
+    }
+
+    async fn completion(&mut self) -> Result<CoreTerminal, Error> {
+        match self {
+            Self::Ipc(stream) => stream
+                .completion()
+                .await
+                .map(CoreTerminal::Ipc)
+                .map_err(normalize_ipc_call_error),
+            Self::Http(stream) => stream
+                .completion_after_cancel()
+                .await
+                .map(CoreTerminal::Http)
+                .map_err(normalize_http_stream_error),
+        }
+    }
+
+    fn discard_buffered(&mut self) {
+        if let Self::Http(stream) = self {
+            stream.discard_buffered();
+        }
+    }
+
+    fn try_completion(&self) -> Option<Result<CoreTerminal, Error>> {
+        match self {
+            Self::Ipc(stream) => stream.try_completion().map(|result| {
+                result
+                    .map(CoreTerminal::Ipc)
+                    .map_err(normalize_ipc_call_error)
+            }),
+            Self::Http(stream) => stream.try_completion().map(|result| {
+                result
+                    .map(CoreTerminal::Http)
+                    .map_err(normalize_http_stream_error)
+            }),
+        }
+    }
+}
+
+enum CoreTerminal {
+    Ipc(StreamTerminal),
+    Http(HttpStreamTerminal),
+}
+
+impl CoreTerminal {
+    fn complete_items(&self) -> Option<u64> {
+        match self {
+            Self::Ipc(terminal) => Some(terminal.complete_items),
+            Self::Http(terminal) if terminal.status == HttpStreamStatus::NotExecuted => Some(0),
+            Self::Http(terminal) => terminal.complete_items,
+        }
+    }
+
+    fn outcome(self) -> Result<(), Error> {
+        match self {
+            Self::Ipc(terminal) => terminal_outcome(terminal),
+            Self::Http(terminal) => match terminal.status {
+                HttpStreamStatus::Success => Ok(()),
+                HttpStreamStatus::NotExecuted | HttpStreamStatus::Failed => {
+                    Err(Error::Semantic(terminal.error.expect("error CALL_END")))
+                }
+            },
+        }
+    }
+}
+
+fn normalize_http_stream_error(error: HttpError) -> Error {
+    crate::normalize_http_error(error, TransportPhase::DispatchUncertain)
 }
 
 /// Observation of the original call after cancellation intent is submitted.
@@ -30,13 +123,15 @@ pub struct CoreStreamCloseReceipt {
 
 impl CoreResponseStream {
     pub(crate) fn new(
-        stream: IpcResponseStream,
+        stream: StreamTransport,
         scope: CallScope,
         cancellation: IpcStreamCancellation,
+        http_cancellation: HttpStreamCancellation,
     ) -> Self {
         Self {
             stream: Mutex::new(stream),
             cancellation,
+            http_cancellation,
             scope,
             runtime: shared_executor().expect("stream execution already started on shared runtime"),
         }
@@ -63,9 +158,8 @@ impl CoreResponseStream {
                             phase: TransportPhase::DispatchUncertain,
                         })
                     })?
-                    .map_err(normalize_ipc_call_error)
             }
-            None => stream.recv().await.map_err(normalize_ipc_call_error),
+            None => stream.recv().await,
         };
         publish_received(&self.scope, received)
     }
@@ -91,6 +185,7 @@ impl CoreResponseStream {
     /// Submit cancellation intent without waiting for cleanup.
     pub fn cancel(&self) -> Result<(), Error> {
         self.cancellation.cancel();
+        self.http_cancellation.cancel();
         Ok(())
     }
 
@@ -117,13 +212,14 @@ impl CoreResponseStream {
             Some(timeout) => tokio::time::timeout(timeout, self.stream.lock()).await.ok(),
             None => Some(self.stream.lock().await),
         };
-        let Some(stream) = stream else {
+        let Some(mut stream) = stream else {
             return CoreStreamCloseReceipt {
                 completed: false,
                 terminal: None,
                 complete_items: None,
             };
         };
+        stream.discard_buffered();
         let timeout = timeout.map(|timeout| timeout.saturating_sub(started.elapsed()));
         let terminal = match timeout {
             Some(Duration::ZERO) => stream.try_completion(),
@@ -134,8 +230,8 @@ impl CoreResponseStream {
         };
         match terminal {
             Some(Ok(terminal)) => {
-                let complete_items = terminal.complete_items;
-                let outcome = terminal_outcome(terminal);
+                let complete_items = terminal.complete_items();
+                let outcome = terminal.outcome();
                 if outcome.is_ok() {
                     let _ = self.scope.complete_success();
                 } else {
@@ -144,14 +240,14 @@ impl CoreResponseStream {
                 CoreStreamCloseReceipt {
                     completed: true,
                     terminal: Some(outcome),
-                    complete_items: Some(complete_items),
+                    complete_items,
                 }
             }
             Some(Err(error)) => {
                 let _ = self.scope.complete_failure();
                 CoreStreamCloseReceipt {
                     completed: true,
-                    terminal: Some(Err(normalize_ipc_call_error(error))),
+                    terminal: Some(Err(error)),
                     complete_items: None,
                 }
             }
@@ -199,6 +295,7 @@ fn publish_received(
 impl Drop for CoreResponseStream {
     fn drop(&mut self) {
         self.cancellation.cancel();
+        self.http_cancellation.cancel();
     }
 }
 

@@ -306,6 +306,7 @@ dependencies = [
  "c2-mem",
  "c2-wire",
  "futures",
+ "getrandom 0.4.2",
  "hex",
  "parking_lot",
  "percent-encoding",

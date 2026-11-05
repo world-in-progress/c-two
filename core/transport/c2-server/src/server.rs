@@ -3040,7 +3040,7 @@ async fn handle_rpc_record(
                 }
             }
         },
-        RpcRecord::Cancel => {
+        RpcRecord::Cancel { cause } => {
             let lookup = conn.calls.lock().continuation(id);
             match lookup {
                 CallLookup::Retired => return,
@@ -3051,7 +3051,15 @@ async fn handle_rpc_record(
                     if call.data.stream.lock().is_none() {
                         conn.end(ConnectionEndReason::ProtocolError, "cancel_for_unary");
                     } else {
-                        submit_stream_cancel(conn, id, &call, StreamCancelCause::Consumer);
+                        submit_stream_cancel(
+                            conn,
+                            id,
+                            &call,
+                            match cause {
+                                rpc::CancelCause::Consumer => StreamCancelCause::Consumer,
+                                rpc::CancelCause::Lifecycle => StreamCancelCause::RelayShutdown,
+                            },
+                        );
                     }
                 }
             }

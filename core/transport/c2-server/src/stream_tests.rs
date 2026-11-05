@@ -147,7 +147,7 @@ async fn item_begin_does_not_allocate_a_copy_before_storage_credit() {
     assert!(observed.encoded_ranges.lock().unwrap().is_empty());
     harness
         .peer
-        .write_all(&rpc::encode_cancel_frame(1).unwrap())
+        .write_all(&rpc::encode_cancel_frame(1, rpc::CancelCause::Consumer).unwrap())
         .await
         .unwrap();
     assert!(matches!(
@@ -193,6 +193,80 @@ async fn unregister_cleans_while_current_item_waits_for_storage_then_delivers_it
         SeenRecord::End(CallStatus::Failed, Some(1), Some(ErrorCode::CallCancelled))
     ));
     assert!(unregister.await.unwrap());
+    harness.stop().await;
+}
+
+#[tokio::test]
+async fn relay_lifecycle_cancel_delivers_running_item_then_cleans_with_named_terminal() {
+    let observed = Arc::new(Observed::default());
+    let (entered_tx, entered_rx) = oneshot::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    *observed.step_entered.lock().unwrap() = Some(entered_tx);
+    *observed.release_step.lock().unwrap() = Some(release_rx);
+    let mut harness = Harness::start(observed.clone(), ServerIpcConfig::default(), 0).await;
+    harness.open(1, &[2]).await;
+    entered_rx.await.unwrap();
+    harness
+        .peer
+        .write_all(&rpc::encode_cancel_frame(1, rpc::CancelCause::Lifecycle).unwrap())
+        .await
+        .unwrap();
+    let conn = harness
+        .server
+        .active_connection(harness.server.active_connection_ids()[0])
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let cause = conn.calls.lock().get(1).and_then(|call| {
+                call.data
+                    .stream
+                    .lock()
+                    .as_ref()
+                    .and_then(|stream| stream.cancellation)
+            });
+            if cause == Some(StreamCancelCause::RelayShutdown) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    release_tx.send(()).unwrap();
+    assert!(matches!(
+        read_record(&mut harness.peer, CallMode::ServerStream).await,
+        SeenRecord::Begin(4)
+    ));
+    harness
+        .peer
+        .write_all(&rpc::encode_credit_frame(1, 4, 0).unwrap())
+        .await
+        .unwrap();
+    assert!(matches!(
+        read_record(&mut harness.peer, CallMode::ServerStream).await,
+        SeenRecord::Data(data) if data == [0; 4]
+    ));
+    let mut len = [0; 4];
+    harness.peer.read_exact(&mut len).await.unwrap();
+    let mut body = vec![0; u32::from_le_bytes(len) as usize];
+    harness.peer.read_exact(&mut body).await.unwrap();
+    let mut bytes = len.to_vec();
+    bytes.extend_from_slice(&body);
+    let (header, payload) = frame::decode_frame(&bytes).unwrap();
+    match rpc::decode_rpc_record(&header, payload, Some(CallMode::ServerStream)).unwrap() {
+        RpcRecord::CallEnd {
+            status: CallStatus::Failed,
+            complete_items: Some(1),
+            error: Some(error),
+            ..
+        } => {
+            assert_eq!(error.code, ErrorCode::CallCancelled);
+            assert!(error.message.contains("relay shutdown"));
+        }
+        other => panic!("expected relay shutdown terminal, got {other:?}"),
+    }
+    assert_eq!(observed.steps.load(Ordering::SeqCst), 1);
+    assert_eq!(observed.finished.load(Ordering::SeqCst), 1);
     harness.stop().await;
 }
 
@@ -545,7 +619,7 @@ async fn stream_items_require_storage_credit_and_terminal_counts_complete_items(
     }
     harness
         .peer
-        .write_all(&rpc::encode_cancel_frame(3).unwrap())
+        .write_all(&rpc::encode_cancel_frame(3, rpc::CancelCause::Consumer).unwrap())
         .await
         .unwrap();
     harness
@@ -619,7 +693,7 @@ async fn paused_stream_keeps_call_slot_but_releases_worker_for_unary() {
     ));
     harness
         .peer
-        .write_all(&rpc::encode_cancel_frame(1).unwrap())
+        .write_all(&rpc::encode_cancel_frame(1, rpc::CancelCause::Consumer).unwrap())
         .await
         .unwrap();
     assert!(matches!(
@@ -858,7 +932,7 @@ async fn cancellation_before_resource_entry_is_not_executed() {
     harness.open(2, &[1]).await;
     harness
         .peer
-        .write_all(&rpc::encode_cancel_frame(2).unwrap())
+        .write_all(&rpc::encode_cancel_frame(2, rpc::CancelCause::Consumer).unwrap())
         .await
         .unwrap();
     assert!(matches!(
@@ -892,7 +966,7 @@ async fn cancellation_during_incomplete_input_refuses_without_waiting_for_contin
     harness.peer.write_all(&first).await.unwrap();
     harness
         .peer
-        .write_all(&rpc::encode_cancel_frame(1).unwrap())
+        .write_all(&rpc::encode_cancel_frame(1, rpc::CancelCause::Consumer).unwrap())
         .await
         .unwrap();
     assert!(matches!(
@@ -993,12 +1067,12 @@ async fn cancellation_during_step(failure: u8, expected: ErrorCode) {
     entered_rx.await.unwrap();
     harness
         .peer
-        .write_all(&rpc::encode_cancel_frame(1).unwrap())
+        .write_all(&rpc::encode_cancel_frame(1, rpc::CancelCause::Consumer).unwrap())
         .await
         .unwrap();
     harness
         .peer
-        .write_all(&rpc::encode_cancel_frame(1).unwrap())
+        .write_all(&rpc::encode_cancel_frame(1, rpc::CancelCause::Consumer).unwrap())
         .await
         .unwrap();
     assert_eq!(observed.finished.load(Ordering::SeqCst), 0);
@@ -1093,7 +1167,7 @@ async fn cleanup_error_takes_priority_over_cancellation() {
     ));
     harness
         .peer
-        .write_all(&rpc::encode_cancel_frame(1).unwrap())
+        .write_all(&rpc::encode_cancel_frame(1, rpc::CancelCause::Consumer).unwrap())
         .await
         .unwrap();
     assert!(matches!(
@@ -1126,7 +1200,7 @@ async fn stream_item_can_use_real_shm_carrier() {
     ));
     harness
         .peer
-        .write_all(&rpc::encode_credit_frame(1, 4, 0).unwrap())
+        .write_all(&rpc::encode_credit_frame(1, 1, 0).unwrap())
         .await
         .unwrap();
     match read_record(&mut harness.peer, CallMode::ServerStream).await {
@@ -1265,7 +1339,7 @@ async fn item_write_timeout_preserves_terminal_while_another_stream_keeps_connec
     assert!(conn.core.stream_state(2).is_some());
     harness
         .peer
-        .write_all(&rpc::encode_cancel_frame(2).unwrap())
+        .write_all(&rpc::encode_cancel_frame(2, rpc::CancelCause::Consumer).unwrap())
         .await
         .unwrap();
     assert!(matches!(

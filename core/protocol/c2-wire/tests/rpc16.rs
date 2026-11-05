@@ -3,9 +3,10 @@ use c2_wire::buddy::BuddyPayload;
 use c2_wire::flags::{FLAG_CHUNKED, FLAG_FIRST_CHUNK, FLAG_RPC_RECORD};
 use c2_wire::frame::{DecodeError, decode_frame};
 use c2_wire::rpc::{
-    CallMode, CallStatus, ChunkPosition, RouteCallIdentity, RpcRecord, ValuePart, ValueStorage,
-    decode_rpc_record, decode_rpc_record_with_carrier, encode_call_end_frame, encode_cancel_frame,
-    encode_credit_frame, encode_item_begin_frame, encode_item_data_frame, encode_open_frame,
+    CallMode, CallStatus, CancelCause, ChunkPosition, RouteCallIdentity, RpcRecord, ValuePart,
+    ValueStorage, decode_rpc_record, decode_rpc_record_with_carrier, encode_call_end_frame,
+    encode_cancel_frame, encode_credit_frame, encode_item_begin_frame, encode_item_data_frame,
+    encode_open_frame,
 };
 
 fn identity() -> RouteCallIdentity<&'static str> {
@@ -374,13 +375,28 @@ fn future_record_kinds_have_exact_shapes_and_reject_retired_flag_bit() {
     ));
     assert!(encode_credit_frame(5, 0, 0).is_err());
 
-    let cancel = encode_cancel_frame(5).unwrap();
+    let cancel = encode_cancel_frame(5, CancelCause::Consumer).unwrap();
     let (header, payload) = decode_frame(&cancel).unwrap();
-    assert_eq!(payload, [5]);
+    assert_eq!(payload, [5, 0]);
     assert!(matches!(
         decode_rpc_record(&header, payload, None).unwrap(),
-        RpcRecord::Cancel
+        RpcRecord::Cancel {
+            cause: CancelCause::Consumer
+        }
     ));
+    let lifecycle = encode_cancel_frame(5, CancelCause::Lifecycle).unwrap();
+    let (lifecycle_header, lifecycle_payload) = decode_frame(&lifecycle).unwrap();
+    assert_eq!(lifecycle_payload, [5, 1]);
+    assert!(matches!(
+        decode_rpc_record(&lifecycle_header, lifecycle_payload, None).unwrap(),
+        RpcRecord::Cancel {
+            cause: CancelCause::Lifecycle
+        }
+    ));
+    assert!(decode_rpc_record(&header, &[5], None).is_err());
+    assert!(decode_rpc_record(&header, &[5, 2], None).is_err());
+    assert!(decode_rpc_record(&header, &[5, 0, 0], None).is_err());
+    assert!(encode_cancel_frame(0, CancelCause::Consumer).is_err());
     let legacy_flag_header = c2_wire::frame::FrameHeader {
         flags: header.flags | 0x0400,
         ..header
