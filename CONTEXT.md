@@ -114,6 +114,10 @@ _Avoid_: status (alone), completion
 The server instance, connection and request id an error carries to identify the original call. It is not a durable query handle.
 _Avoid_: call id, trace id
 
+**调用令牌 / call token**:
+The random value a relay gives at the start of one forwarded call's response. A client uses it only to cancel that call while the relay is still forwarding it; it is not a query or replay handle.
+_Avoid_: call id, session token
+
 ### Transport
 
 **直接 IPC / direct IPC**:
