@@ -998,6 +998,10 @@ impl Runtime {
                         Runtime::resolve_relay_connection_after_local_ipc_failures_with_deadline(
                             client,
                             std::slice::from_ref(&candidate),
+                            match &direct_error {
+                                Error::Semantic(error) => Some(error.code),
+                                _ => None,
+                            },
                             deadline,
                         )
                         .map_err(|error| retain_local_ipc_cause(error, &direct_error))?;
