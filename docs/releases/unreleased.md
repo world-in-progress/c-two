@@ -398,6 +398,16 @@ New tests cover parsing and boundary validation of the setting, real eviction af
 
 New tests cover the direct and relay-local acquire during shutdown, the entered call, the route list and the relay's withdrawal. On macOS with the FastDB sibling, the Rust Core workspace (1941 tests), c3, the Rust SDK, the CI Python gates (1590 ordinary tests, 25 portable and 14 TypeScript) and the repository checks (977) passed on the integrated tree.
 
+## Route acquisition after re-registration
+
+### Fixed
+
+- A relay-aware client that acquires a route by name no longer fails when its cached route token went stale because the route was registered again. Through a relay, a stale probe now excludes that route UID at its relay instead of the whole relay, so the fresh resolution binds the route UID the same relay now serves; before, the acquisition failed with `RouteStale`. On the relay-local path, a local acquisition that fails with `RouteStale` now lets the fresh resolution bind the new route UID on the same endpoint; before, it reported `FallbackDenied`. Any other local failure still excludes the endpoint.
+
+### Validation
+
+New Rust tests of the relay-aware client reproduce both failures and pass with the fix. Gate tests for persistent clients now cover Python (27 cases), the Rust SDK (25) and generated Node clients (21): a route registered later on the same endpoint, close, removal and re-registration, idle eviction followed by concurrent reconnects, a resource restart with a new instance, and no replay of a stale or failed call; each file passed 20 consecutive rounds on macOS. On macOS with the FastDB sibling, the Rust Core workspace (1943 tests), c3, the Rust SDK, the CI Python gates (1635 ordinary tests, 25 portable and 14 TypeScript) and the repository checks (977) passed on the integrated tree.
+
 ## Connection close on Windows
 
 ### Fixed
