@@ -207,16 +207,14 @@ fn completion_from_state(
     )))
 }
 
-// Completion and recv can both inspect the same physical failure. Preserve
-// the typed IPC variant and OS error kind when building each owned result.
-pub(super) fn clone_observation_error(error: &IpcError) -> IpcError {
+// Completion, recv and concurrent pool acquires can inspect the same failure.
+// Preserve the typed IPC variant and native OS code in each owned result.
+pub(crate) fn clone_observation_error(error: &IpcError) -> IpcError {
     match error {
         IpcError::LocalCallRejected(error) => IpcError::LocalCallRejected(error.clone()),
         IpcError::CallRejected(error) => IpcError::CallRejected(error.clone()),
-        IpcError::Io(error) => IpcError::Io(std::io::Error::new(error.kind(), error.to_string())),
-        IpcError::Connect(error) => {
-            IpcError::Connect(std::io::Error::new(error.kind(), error.to_string()))
-        }
+        IpcError::Io(error) => IpcError::Io(c2_local::clone_io_error(error)),
+        IpcError::Connect(error) => IpcError::Connect(c2_local::clone_io_error(error)),
         IpcError::Config(message) => IpcError::Config(message.clone()),
         IpcError::Decode(error) => IpcError::Decode(error.clone()),
         IpcError::Protocol(message) => IpcError::Protocol(message.clone()),

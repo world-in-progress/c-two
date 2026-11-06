@@ -253,6 +253,39 @@ impl std::error::Error for ContextIoError {
     }
 }
 
+/// Copy a local transport I/O error, retaining its native cause and markers.
+///
+/// OS errors are rebuilt from their native code. Local context and typed
+/// refusals retain their payload; errors carrying only a diagnostic retain
+/// that diagnostic and their kind.
+pub fn clone_io_error(error: &io::Error) -> io::Error {
+    if let Some(code) = error.raw_os_error() {
+        return io::Error::from_raw_os_error(code);
+    }
+    if let Some(context) = error
+        .get_ref()
+        .and_then(|cause| cause.downcast_ref::<ContextIoError>())
+    {
+        return io::Error::new(
+            error.kind(),
+            ContextIoError {
+                message: context.message.clone(),
+                source: clone_io_error(&context.source),
+            },
+        );
+    }
+    if let Some(reason) = error
+        .get_ref()
+        .and_then(|cause| cause.downcast_ref::<EndpointUnverifiedReason>())
+    {
+        return io::Error::new(error.kind(), *reason);
+    }
+    if let Some(copy) = c2_local_security::clone_peer_identity_mismatch(error) {
+        return copy;
+    }
+    io::Error::new(error.kind(), error.to_string())
+}
+
 /// Bounds one incremental maintenance batch. The default is a scheduling
 /// target, not a hard real-time guarantee for filesystem calls.
 #[derive(Clone, Copy, Debug)]
@@ -772,6 +805,8 @@ pub fn reap_endpoint(
 
 #[cfg(test)]
 mod credential_tests;
+#[cfg(test)]
+mod error_tests;
 #[cfg(test)]
 mod tests;
 
