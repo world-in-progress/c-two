@@ -382,6 +382,7 @@ New tests cover the OPEN layout with both modes for whole values and first chunk
 
 - A Runtime's cache of IPC client connections takes its retention time from the new IPC override `client_idle_timeout` (`C2_IPC_CLIENT_IDLE_TIMEOUT`), 60 seconds by default; `0` disables timed eviction. It was fixed at 60 seconds, while the relay's upstream `idle_timeout` was already configurable.
 - A connection that nothing has referenced for that long is now evicted in the background. Before, an expired connection was dropped only when a later connect looked it up, so a process that stopped calling kept its idle connections open. Eviction deactivates the connection as before: calls already sent still finish, and the next call connects again.
+- Callers that acquire the same endpoint at the same time now share one connection attempt; before, each opened its own connection and all but one were closed. Each caller waits within its own deadline, and a failed attempt gives every waiter the same pre-dispatch failure with its native OS error code intact. The same lossless copy now keeps the native code in the errors that a stream's completion and its receiver both report.
 
 ### Validation
 
