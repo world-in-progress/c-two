@@ -42,6 +42,7 @@ struct Echo {
     gate: Arc<Gate>,
     unary_gate: Arc<Gate>,
     unary_dispatches: Arc<AtomicUsize>,
+    stream_dispatches: Arc<AtomicUsize>,
 }
 impl CrmCallback for Echo {
     fn invoke(
@@ -122,6 +123,7 @@ impl CrmStreamCallback for Echo {
         if method != 1 || request.len() != 6 {
             return Err(CrmError::InternalError("invalid stream request".into()));
         }
+        self.stream_dispatches.fetch_add(1, Ordering::Relaxed);
         let length = u32::from_le_bytes(request[2..6].try_into().unwrap()) as usize;
         Ok(Box::new(BytesStream {
             mode: request[0],
@@ -153,6 +155,7 @@ async fn main() {
     let gate = Arc::new(Gate::default());
     let unary_gate = Arc::new(Gate::default());
     let unary_dispatches = Arc::new(AtomicUsize::new(0));
+    let stream_dispatches = Arc::new(AtomicUsize::new(0));
     let route = server
         .build_stream_route(
             RouteBuildSpec {
@@ -171,6 +174,7 @@ async fn main() {
                 gate: gate.clone(),
                 unary_gate: unary_gate.clone(),
                 unary_dispatches: unary_dispatches.clone(),
+                stream_dispatches: stream_dispatches.clone(),
             }),
             descriptor,
         )
@@ -202,7 +206,8 @@ async fn main() {
         if line == "stats" {
             emit(
                 json!({"kind": "stats", "allocations": server.response_pool_arc().read().stats().alloc_count,
-                    "unary_dispatches": unary_dispatches.load(Ordering::Relaxed)}),
+                    "unary_dispatches": unary_dispatches.load(Ordering::Relaxed),
+                    "stream_dispatches": stream_dispatches.load(Ordering::Relaxed)}),
             );
         }
         if line == "release" {

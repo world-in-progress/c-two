@@ -2,16 +2,21 @@
 from __future__ import annotations
 
 import json
+from itertools import product
 import os
 from pathlib import Path
 import shutil
 import subprocess
+import threading
 
 import pytest
 
 import c_two as cc
-from tests.fixtures.process_control import portable_command
-from tests.fixtures.stream_matrix import Portable, PythonHost, RustHarness, build_payload, inspect
+from tests.fixtures.process_control import portable_command, readline_with_timeout
+from tests.fixtures.stream_matrix import (
+    CHUNK_SIZE, TRANSPORT_CASES, Portable, PythonHost, RustHarness,
+    build_payload, inspect, process_environment,
+)
 from tests.fixtures.typescript_project import write_node_tsconfig
 
 REPOSITORY = Path(__file__).resolve().parents[4]
@@ -159,3 +164,254 @@ def test_generated_node_streams_from_real_hosts(
             assert server.shutdown(timeout=5)["completed"]
         if rust_host is not None:
             rust_host.abort()
+
+
+class ObservedNodePythonHost(NodePythonHost):
+    def echo(self, payload):
+        self.input_stats = self.observe_input()
+        yield from super().echo(payload)
+
+
+def _node_config(root, payload_relative, tmp_path, address, route, **options):
+    source = build_payload(options.pop("large", False))
+    try:
+        input_path = tmp_path / "input.bin"
+        input_path.write_bytes(source.binary_bytes())
+    finally:
+        source.close()
+    config = {
+        "address": address, "route": route, "inputPath": str(input_path),
+        "contractModule": str(root / "dist/typescript/c_two_contract.js"),
+        "payloadModule": str(root / "dist" / payload_relative),
+        **options,
+    }
+    destination = tmp_path / "node-config.json"
+    destination.write_text(json.dumps(config), encoding="utf-8")
+    return destination, input_path.stat().st_size
+
+
+def _assert_node_carriers(case, encoded_len, input_stats, server_stats, node_stats, count):
+    """Matrix B: observe resource backing; ABI 8 exposes B and slots, not client IPC cells."""
+    at_input = input_stats["cells"]
+    server = server_stats["server"]["cells"]
+    for cells in (at_input, server):
+        for kind in ("shm", "file", "reassembly"):
+            assert cells[kind]["used_bytes"] == 0, (case.name, kind, cells)
+            assert cells[kind]["peak_bytes"] <= cells[kind]["limit_bytes"]
+        assert cells["shm"]["limit_bytes"] == case.shm_budget
+    if case.large:
+        assert encoded_len > CHUNK_SIZE
+    for cells in (at_input, server):
+        if case.reassembly != "none":
+            assert cells["reassembly"]["peak_bytes"] >= encoded_len
+        else:
+            assert cells["reassembly"]["peak_bytes"] == 0
+        if case.reassembly == "file":
+            assert cells["file"]["peak_bytes"] >= encoded_len
+        else:
+            assert cells["file"]["peak_bytes"] == 0
+    if case.reassembly == "shm":
+        assert at_input["shm"]["peak_bytes"] >= encoded_len
+    else:
+        assert at_input["shm"]["peak_bytes"] == 0
+    if case.reassembly == "shm" or (case.name == "shm" and count > 0):
+        assert server["shm"]["peak_bytes"] >= encoded_len
+    else:
+        assert server["shm"]["peak_bytes"] == 0
+    assert int(node_stats["payload_buffer"]["used_bytes"]) == 0
+    assert int(node_stats["payload_buffer"]["peak_bytes"]) >= encoded_len
+    assert node_stats["used_operations"] == "0"
+
+
+_NODE_MATRIX_ROWS = list(product(
+    [("python", 0, False), ("python", 1, False), ("python", 5, False),
+     ("python", 3, True), ("rust", 2, False)],
+    [False, True], TRANSPORT_CASES,
+))
+
+
+@pytest.mark.timeout(180)
+@pytest.mark.parametrize(
+    "host_case,held,transport", _NODE_MATRIX_ROWS,
+    ids=[f"{host}-{count}-{'error' if fail else 'ok'}-{'hold' if held else 'materialized'}-{case.name}"
+         for (host, count, fail), held, case in _NODE_MATRIX_ROWS],
+)
+def test_generated_node_stream_transport_matrix(
+    node_stream_project, rust_stream_harness, monkeypatch, tmp_path,
+    host_case, held, transport,
+):
+    """Requirement 1: generated clients verify actual carriers and terminals in matrix B."""
+    monkeypatch.delenv("C2_RELAY_ANCHOR_ADDRESS", raising=False)
+    root, node, payload_relative = node_stream_project
+    ipc_root = tmp_path / "ipc"
+    ipc_root.mkdir(mode=0o700)
+    host_language, count, fail = host_case
+    route = f"node-carrier-{os.getpid()}-{tmp_path.name}"
+    address = f"ipc://c2_node_carrier_{os.getpid()}_{tmp_path.name}"
+    threshold = 64 * 1024 if transport.prefer_shm else 1 << 30
+    overrides = transport.overrides()
+    node_options = {"requestShmThreshold": threshold, "requestChunkSize": CHUNK_SIZE}
+    if os.name != "nt":
+        node_options["ipcRoot"] = str(ipc_root)
+    config, encoded_len = _node_config(
+        root, payload_relative, tmp_path, address, route, large=transport.large,
+        hold=held, count=count, fail=fail, collectStats=True, connectorOptions=node_options,
+    )
+    server = resource = rust_host = None
+    try:
+        if host_language == "python":
+            server = cc.Runtime()
+            if os.name != "nt":
+                server.set_local_endpoint(root=str(ipc_root))
+            server.set_transport_policy(shm_threshold=threshold)
+            server.set_server(server_id=address.removeprefix("ipc://"), ipc_overrides=overrides)
+            resource = ObservedNodePythonHost(transport.large, count, fail)
+            resource.observe_input = lambda: server.memory_stats()["server"]
+            server.register(Portable, resource, name=route)
+        else:
+            rust_host = rust_stream_harness.host(
+                address, route, transport.prefer_shm, transport.large,
+                ipc_overrides=overrides, ipc_root=ipc_root,
+            )
+        run = subprocess.run(
+            [node, str(root / NODE_FIXTURE.name), str(config)], cwd=root,
+            env=process_environment(overrides, ipc_root), capture_output=True, text=True,
+            timeout=60, check=False,
+        )
+        assert run.returncode == 0, f"{run.stdout}\n{run.stderr}"
+        receipt = json.loads(run.stdout.strip().splitlines()[-1])
+        assert {key: receipt[key] for key in ("count", "completeItems", "held", "failed")} == {
+            "count": count, "completeItems": str(count), "held": held, "failed": fail,
+        }
+        if resource is not None:
+            assert resource.calls == 1
+            input_stats, server_stats = resource.input_stats, server.memory_stats()
+        else:
+            stats = rust_host.stats()
+            input_stats, server_stats = stats["input"], stats["memory"]
+        _assert_node_carriers(transport, encoded_len, input_stats, server_stats, receipt["stats"], count)
+        if rust_host is not None:
+            rust_host.stop()
+            rust_host = None
+    finally:
+        if server is not None:
+            assert server.shutdown(timeout=5)["completed"]
+        if resource is not None:
+            resource.close()
+        if rust_host is not None:
+            rust_host.abort()
+
+
+class InterleavedNodeResource(PythonHost):
+    def __init__(self):
+        super().__init__(False)
+        self.blocked = [threading.Event(), threading.Event()]
+        self.release = threading.Event()
+        self.stream_calls = [0, 0]
+        self.unary_calls = 0
+
+    def echo(self, payload):
+        large = len(payload.binary_bytes()) > CHUNK_SIZE
+        inspect(payload, large)
+        index = int(large)
+        self.stream_calls[index] += 1
+        for step in range(index + 3):
+            if step == 1:
+                self.blocked[index].set()
+                assert self.release.wait(30), "test did not release the stream step"
+            output = build_payload(large)
+            self.outputs.append(output)
+            yield output
+
+    def ping(self):
+        assert all(event.is_set() for event in self.blocked)
+        assert not self.release.is_set()
+        self.unary_calls += 1
+
+
+class ConcurrentUnaryNodeResource(PythonHost):
+    def __init__(self):
+        super().__init__(False)
+        self.blocked = threading.Event()
+        self.second_completed = threading.Event()
+        self.release = threading.Event()
+        self.unary_calls = 0
+
+    def ping(self):
+        self.unary_calls += 1
+        if self.unary_calls == 1:
+            self.blocked.set()
+            assert self.release.wait(30), "test did not release the first unary"
+        else:
+            assert self.blocked.is_set()
+            assert not self.release.is_set()
+            self.second_completed.set()
+
+
+@pytest.mark.timeout(90)
+@pytest.mark.parametrize("scenario", ["interleave", "unary"])
+def test_generated_contract_client_connection_concurrency(
+    node_stream_project, monkeypatch, tmp_path, scenario,
+):
+    """Requirement 2: real ContractClient interleaves two streams/unary or overlaps unary on one connection."""
+    monkeypatch.delenv("C2_RELAY_ANCHOR_ADDRESS", raising=False)
+    root, node, payload_relative = node_stream_project
+    ipc_root = tmp_path / "ipc"
+    ipc_root.mkdir(mode=0o700)
+    route = f"node-concurrent-{os.getpid()}-{tmp_path.name}"
+    address = f"ipc://c2_node_concurrent_{os.getpid()}_{tmp_path.name}"
+    options = {} if os.name == "nt" else {"ipcRoot": str(ipc_root)}
+    second_input = tmp_path / "second.bin"
+    second = build_payload(True)
+    try:
+        second_input.write_bytes(second.binary_bytes())
+    finally:
+        second.close()
+    config, _ = _node_config(
+        root, payload_relative, tmp_path, address, route, scenario=scenario,
+        secondInputPath=str(second_input), connectorOptions=options,
+    )
+    server = cc.Runtime()
+    if os.name != "nt":
+        server.set_local_endpoint(root=str(ipc_root))
+    server.set_server(server_id=address.removeprefix("ipc://"), ipc_overrides={"max_execution_workers": 4})
+    resource = InterleavedNodeResource() if scenario == "interleave" else ConcurrentUnaryNodeResource()
+    child = None
+    try:
+        server.register(
+            Portable, resource, name=route,
+            concurrency=cc.ConcurrencyConfig(mode="parallel", max_workers=4),
+        )
+        child = subprocess.Popen(
+            [node, str(root / NODE_FIXTURE.name), str(config)], cwd=root,
+            env=process_environment(ipc_root=ipc_root), stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        if scenario == "unary":
+            assert resource.blocked.wait(30), "first unary did not enter the resource"
+            child.stdin.write("first_unary_blocked\n")
+            child.stdin.flush()
+        expected = "unary_interleaved" if scenario == "interleave" else "second_unary_completed"
+        event = json.loads(readline_with_timeout(child.stdout, 30))
+        assert event == {"kind": expected}
+        if scenario == "interleave":
+            assert all(event.is_set() for event in resource.blocked)
+            assert resource.stream_calls == [1, 1]
+            assert resource.unary_calls == 1
+        else:
+            assert resource.blocked.is_set() and resource.second_completed.is_set()
+            assert resource.unary_calls == 2
+        resource.release.set()
+        stdout, stderr = child.communicate(timeout=30)
+        assert child.returncode == 0, f"{stdout}\n{stderr}"
+        receipt = json.loads(stdout.strip().splitlines()[-1])
+        assert receipt["scenario"] == scenario
+        assert receipt["connections"] == 1
+        assert receipt["connectionId"]
+    finally:
+        resource.release.set()
+        if child is not None and child.poll() is None:
+            child.kill()
+            child.communicate(timeout=10)
+        assert server.shutdown(timeout=5)["completed"]
+        resource.close()
