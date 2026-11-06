@@ -166,8 +166,10 @@ async fn item_write_range_failure_preserves_failed_call_end() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn whole_shm_item_larger_than_copy_window_releases_after_last_chunk() {
+    // Block 9b3 requirement 5: one original SHM loan spans all eight copy
+    // windows; returned local copies keep their charge until their last owner.
     let fixture = Harness::start_with_config(ServerIpcConfig {
-        shm_threshold: 1,
+        shm_threshold: 8,
         ..ServerIpcConfig::default()
     })
     .await;
@@ -193,8 +195,10 @@ async fn whole_shm_item_larger_than_copy_window_releases_after_last_chunk() {
         ForwardRecord::ItemBegin { total_bytes: 64 }
     ));
     fixture.unary().await; // Shared connection remains readable while B is held by the caller.
+    let pool = fixture.server.response_pool_arc();
+    assert_eq!(pool.read().stats().alloc_count, 0);
     let mut output = Vec::new();
-    for _ in 0..8 {
+    for index in 0..8 {
         let chunk =
             tokio::time::timeout(WAIT, response.read_chunk(budget.try_reserve(8).unwrap(), 8))
                 .await
@@ -202,7 +206,21 @@ async fn whole_shm_item_larger_than_copy_window_releases_after_last_chunk() {
                 .unwrap()
                 .unwrap();
         output.extend_from_slice(chunk.as_ref());
+        // This inline unary is a wire barrier for RELEASE on this same
+        // connection, and does not itself allocate response SHM.
+        fixture.unary().await;
+        assert_eq!(
+            pool.read().stats().alloc_count,
+            u32::from(index < 7),
+            "the original whole-item loan must end only after its last copy"
+        );
+        let chunk = Arc::new(chunk);
+        let last_reader = chunk.clone();
         drop(chunk);
+        assert_eq!(budget.snapshot().used_bytes, 8);
+        assert_eq!(last_reader.as_ref().as_ref(), &[0; 8]);
+        drop(last_reader);
+        assert_eq!(budget.snapshot().used_bytes, 0);
     }
     assert_eq!(output, vec![0; 64]);
     let end = tokio::time::timeout(WAIT, response.next_record())
@@ -224,8 +242,10 @@ async fn whole_shm_item_larger_than_copy_window_releases_after_last_chunk() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn consumer_cancel_mid_item_keeps_shared_unary_alive() {
+    // Block 9b3 requirement 5: cancelling an unread suffix settles the one
+    // original loan, while the already copied prefix belongs to its real owner.
     let fixture = Harness::start_with_config(ServerIpcConfig {
-        shm_threshold: 1,
+        shm_threshold: 8,
         ..ServerIpcConfig::default()
     })
     .await;
@@ -254,6 +274,10 @@ async fn consumer_cancel_mid_item_keeps_shared_unary_alive() {
         .unwrap()
         .unwrap();
     assert_eq!(part.as_ref(), &[0; 8]);
+    let pool = fixture.server.response_pool_arc();
+    assert_eq!(pool.read().stats().alloc_count, 1);
+    let part = Arc::new(part);
+    let last_reader = part.clone();
     response
         .cancellation()
         .cancel(CancelCause::Consumer)
@@ -265,7 +289,11 @@ async fn consumer_cancel_mid_item_keeps_shared_unary_alive() {
         .unwrap();
     assert_eq!(end.status, CallStatus::Failed);
     assert_eq!(end.error.unwrap().code, ErrorCode::CallCancelled);
+    assert_eq!(pool.read().stats().alloc_count, 0);
+    assert_eq!(last_reader.as_ref().as_ref(), &[0; 8]);
     drop(part);
+    assert_eq!(budget.snapshot().used_bytes, 8);
+    drop(last_reader);
     assert_eq!(budget.snapshot().used_bytes, 0);
     fixture.stop().await;
 }

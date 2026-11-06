@@ -564,6 +564,190 @@ async fn complete_item_waiting_for_consumer_survives_peer_eof() {
     complete_item_before_end(true).await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancel_natural_end_and_peer_eof_share_one_stream_terminal() {
+    // Block 9b3 requirement 1: cancellation, natural completion and real EOF
+    // race on one barrier with one delivered item and one admitted half-item.
+    check_cancel_natural_eof_race(false).await;
+    // Also force the section 8 boundary: a terminal actually obtained before
+    // EOF remains the same terminal after the physical peer end is observed.
+    check_cancel_natural_eof_race(true).await;
+}
+
+async fn check_cancel_natural_eof_race(terminal_before_eof: bool) {
+    use tokio::sync::{Barrier, Mutex};
+
+    let endpoint = Endpoint::new();
+    let mut listener = LocalListener::bind(&endpoint.endpoint).unwrap();
+    let (ready_tx, ready_rx) = oneshot::channel();
+    let peer = tokio::spawn(async move {
+        let mut socket = accept(&mut listener).await;
+        let (open, _) = read_frame(&mut socket).await;
+        let rid = open.request_id;
+        send_item(&mut socket, rid, b"abc").await;
+        grant(&mut socket, rid, 0, 1).await;
+        socket
+            .write_all(&encode_item_begin_frame(rid, 4).unwrap())
+            .await
+            .unwrap();
+        grant(&mut socket, rid, 4, 0).await;
+        socket
+            .write_all(&encode_item_data_frame(rid, ValueStorage::Inline(b"xy")).unwrap())
+            .await
+            .unwrap();
+        assert!(ready_tx.send((socket, rid, listener)).is_ok());
+    });
+
+    let mut client = endpoint.client();
+    client.connect().await.unwrap();
+    let observation = client.connection_observation().unwrap();
+    let mut response = client
+        .stream_bound(&binding(), "items", b"", PayloadBufferBudget::new(16))
+        .await
+        .unwrap();
+    let first = timeout(WAIT, response.recv())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(first.as_ref(), b"abc");
+    let (socket, rid, listener) = ready_rx.await.unwrap();
+    peer.await.unwrap();
+    timeout(WAIT, async {
+        loop {
+            let state = client
+                .driver
+                .read()
+                .as_ref()
+                .unwrap()
+                .core
+                .stream_state(rid)
+                .unwrap();
+            if state.total_bytes == Some(4) && state.admitted_bytes == 2 {
+                assert_eq!(state.complete_items, 1);
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the client did not admit the half item before the race");
+
+    // The second item is only half complete when all three competitors start.
+    // The peer's mutex makes END plus its final data one complete operation:
+    // EOF can win before it or follow it, never forge a truncated END frame.
+    let socket = Arc::new(Mutex::new(Some(socket)));
+    let start = Arc::new(Barrier::new(4));
+    let cancel_task = tokio::spawn({
+        let start = start.clone();
+        async move {
+            start.wait().await;
+            response.cancel().unwrap();
+            response
+        }
+    });
+    let natural_end = tokio::spawn({
+        let start = start.clone();
+        let socket = socket.clone();
+        async move {
+            start.wait().await;
+            let mut guard = socket.lock().await;
+            if let Some(socket) = guard.as_mut() {
+                socket
+                    .write_all(&encode_item_data_frame(rid, ValueStorage::Inline(b"zw")).unwrap())
+                    .await
+                    .unwrap();
+                socket
+                    .write_all(
+                        &encode_call_end_frame(
+                            rid,
+                            CallMode::ServerStream,
+                            CallStatus::Success,
+                            2,
+                            ValuePart::whole(ValueStorage::Inline(&[])),
+                        )
+                        .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+            }
+        }
+    });
+    let (allow_eof, end_observed) = oneshot::channel();
+    let eof = tokio::spawn({
+        let start = start.clone();
+        let socket = socket.clone();
+        async move {
+            start.wait().await;
+            if terminal_before_eof {
+                end_observed.await.unwrap();
+            }
+            // Dropping the only peer LocalStream closes the real OS endpoint.
+            drop(socket.lock().await.take());
+        }
+    });
+    start.wait().await;
+    let mut response = cancel_task.await.unwrap();
+    let before_eof = if terminal_before_eof {
+        let terminal = timeout(WAIT, response.completion()).await.unwrap().unwrap();
+        assert_eq!(terminal.status, CallStatus::Success);
+        assert_eq!(terminal.complete_items, 2);
+        allow_eof.send(()).unwrap();
+        Some(terminal)
+    } else {
+        None
+    };
+    natural_end.await.unwrap();
+    eof.await.unwrap();
+    observation
+        .wait_closed(Some(WAIT))
+        .await
+        .expect("the client did not observe the physical peer end");
+
+    // This peer only sends natural Success. EOF before a complete END yields
+    // DispatchUncertain; cancellation alone cannot invent CallCancelled.
+    // Neither outcome may revoke the already delivered "abc".
+    let completion = timeout(WAIT, response.completion()).await.unwrap();
+    if let Some(terminal) = before_eof {
+        assert_eq!(completion.as_ref().unwrap(), &terminal);
+    }
+    match &completion {
+        Ok(terminal) => {
+            assert_eq!(terminal.status, CallStatus::Success);
+            assert_eq!(terminal.complete_items, 2);
+            assert!(terminal.error.is_none());
+            assert_eq!(terminal, &response.completion().await.unwrap());
+        }
+        Err(error) => {
+            assert_eq!(error.phase(), crate::TransportPhase::DispatchUncertain);
+            assert_eq!(
+                response.completion().await.unwrap_err().phase(),
+                crate::TransportPhase::DispatchUncertain
+            );
+        }
+    }
+    assert_eq!(first.as_ref(), b"abc");
+    let next = timeout(WAIT, response.recv()).await.unwrap();
+    let final_read = match next {
+        Ok(Some(item)) => {
+            assert_eq!(item.as_ref(), b"xyzw");
+            timeout(WAIT, response.recv()).await.unwrap()
+        }
+        terminal => terminal,
+    };
+    match final_read {
+        Ok(None) => assert!(matches!(&completion, Ok(t) if t.status == CallStatus::Success)),
+        Err(error) => {
+            assert_eq!(error.phase(), crate::TransportPhase::DispatchUncertain);
+            assert!(!matches!(&completion, Ok(t) if t.status == CallStatus::Success));
+        }
+        Ok(Some(item)) => panic!("unexpected extra item: {item:?}"),
+    }
+    drop(first);
+    assert!(client.close_shared_bounded(WAIT).await);
+    crate::tests::close_listener(listener).await;
+}
+
 #[tokio::test]
 async fn not_executed_after_item_begin_is_never_retry_safe() {
     bad_terminal(2).await;

@@ -7,8 +7,14 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use tokio::sync::oneshot;
 
+#[path = "stalled_peer_tests.rs"]
+mod stalled_peer_tests;
+
 const STREAM_DESCRIPTOR: &[u8] =
     include_bytes!("../../../foundation/c2-contract/tests/fixtures/server-stream.contract.json");
+
+#[path = "stream_loan_retention_tests.rs"]
+mod loan_retention;
 
 struct CounterStream {
     next: u8,

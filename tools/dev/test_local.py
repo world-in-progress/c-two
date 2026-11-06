@@ -35,6 +35,8 @@ RUST_IGNORED = {
     ('http_only_child', 'isolated process fixture, invoked by parent'),
     ('relay::block8_tests::slow_reader_records_real_tcp_stall_and_producer_distance',
      'on-demand slow-reader measurement; run command is in the adjacent test comments'),
+    ('server::stream_tests::stalled_peer_tests::posix::stalled_peer_child',
+     'run only as the controlled child of sigstop_peer_resumes_and_settles'),
 }
 NODE_PLATFORM_SKIPS = {
     'win32': {
