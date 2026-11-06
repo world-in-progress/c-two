@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections import Counter
 from collections.abc import Iterator
 import json
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler
 import threading
 import time
 import urllib.parse
@@ -17,6 +17,7 @@ from c_two.crm.contract import crm_contract
 import httpx
 import pytest
 from fastdb4py.payload import Payload
+from tests.fixtures.http_server import LoopbackHTTPServer
 from tests.fixtures.stream_python import BLOB_SPEC, blob_payload
 
 
@@ -131,7 +132,7 @@ class SnapshotResolver:
                 self.end_headers()
                 self.wfile.write(data)
 
-        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.server = LoopbackHTTPServer(("127.0.0.1", 0), Handler)
         self.url = f"http://127.0.0.1:{self.server.server_port}"
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()

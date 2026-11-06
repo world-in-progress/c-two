@@ -90,7 +90,10 @@ def test_route_close_remove_and_reregister_use_current_authority(lab):
             wait_state(scheduler.snapshot, lambda state: state.closed)
             if lab.path != "relay_aware_relay":
                 lab.assert_acquire_closed("target", old_uid)
-            with pytest.raises(cc.error.ResourceClosed) as closed:
+            closed_errors = cc.error.ResourceClosed
+            if lab.path == "relay_aware_relay":
+                closed_errors = (cc.error.ResourceClosed, cc.error.ResourceNotFound)
+            with pytest.raises(closed_errors) as closed:
                 proxy.call("closed")
             lab.extra["closed_error"] = {
                 "details": closed.value.details,
@@ -100,8 +103,8 @@ def test_route_close_remove_and_reregister_use_current_authority(lab):
             if lab.path != "relay_aware_relay":
                 lab.assert_pre_dispatch(closed.value)
             if lab.path == "relay_aware_relay":
-                # A forwarded NotExecuted closed error withdraws the route.
-                # The next name acquisition observes no matching resource.
+                # Either the periodic attestation or this call withdraws the
+                # closed route; the next name acquisition sees no resource.
                 wait_state(lambda: lab.routes("target"), lambda routes: not routes)
                 lab.assert_acquire_closed("target", old_uid)
             assert resource.snapshot() == {"call": 1, "blocked": 1}

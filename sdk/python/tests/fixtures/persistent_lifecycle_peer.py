@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import signal
 import subprocess
 import sys
 import threading
@@ -91,7 +92,6 @@ class Peer:
             self.errors.close()
             raise AssertionError(f"resource startup failed: {diagnostic}") from None
         self.identity = self.ready["identity"]
-        assert self.ready["pid"] == self.process.pid
 
     def read(self) -> dict:
         line = readline_with_timeout(self.process.stdout, 15)
@@ -126,8 +126,11 @@ class Peer:
 
     def kill(self) -> dict:
         before = self.command("snapshot")
-        self.process.kill()
-        self.process.wait(timeout=5)
+        # A Windows venv launcher has a different PID from its interpreter.
+        # Terminate the resource itself; the launcher waits for that child.
+        os.kill(self.ready["pid"], signal.SIGTERM if os.name == "nt" else signal.SIGKILL)
+        assert self.process.wait(timeout=5) != 0
+        assert readline_with_timeout(self.process.stdout, 5) == ""
         self.stopped = True
         self.cleanup = self.reap()
         return {**self.ready, **before, "exit_code": self.process.returncode,
