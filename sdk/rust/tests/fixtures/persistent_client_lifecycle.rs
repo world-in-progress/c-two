@@ -273,22 +273,32 @@ impl Fixture {
         #[cfg(windows)]
         let context = LocalEndpointContext::default_for_platform().unwrap();
         let (relay, relay_url) = if path != PathKind::Direct {
-            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-            let address = listener.local_addr().unwrap();
-            drop(listener);
-            let url = format!("http://{address}");
-            let relay = RelayServer::start_with_context(
-                RelayConfig {
-                    bind: address.to_string(),
-                    advertise_url: url.clone(),
-                    idle_timeout_secs: relay_idle,
-                    anti_entropy_interval: Duration::ZERO,
-                    heartbeat_interval: Duration::ZERO,
-                    ..Default::default()
-                },
-                context,
-            )
-            .unwrap();
+            let mut attempt = 0;
+            let (relay, url) = loop {
+                attempt += 1;
+                let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+                let address = listener.local_addr().unwrap();
+                drop(listener);
+                let url = format!("http://{address}");
+                match RelayServer::start_with_context(
+                    RelayConfig {
+                        bind: address.to_string(),
+                        advertise_url: url.clone(),
+                        idle_timeout_secs: relay_idle,
+                        anti_entropy_interval: Duration::ZERO,
+                        heartbeat_interval: Duration::ZERO,
+                        ..Default::default()
+                    },
+                    context.clone(),
+                ) {
+                    Ok(relay) => break (relay, url),
+                    // A parallel test can claim the port after the probe closes.
+                    Err(error)
+                        if attempt < 8
+                            && error.starts_with("Relay failed to start: Failed to bind ") => {}
+                    Err(error) => panic!("relay starts: {error}"),
+                }
+            };
             (Some(relay), Some(url))
         } else {
             (None, None)
@@ -881,14 +891,31 @@ pub fn run_resource_process() {
     );
     assert!(host.lifecycle_snapshot().finished);
     events.extend(drain_events(&connections));
-    let opened = events
+    let mut opened = events
         .iter()
         .filter(|event| matches!(event, ConnectionEvent::Opened(_)))
         .count();
-    let closed = events
+    let mut closed = events
         .iter()
         .filter(|event| matches!(event, ConnectionEvent::Closed(_)))
         .count();
+    // The Host receipt fences listener closure and business drain. Physical
+    // retirement publishes separately through the connection event source.
+    let deadline = Instant::now() + WAIT;
+    while closed < opened {
+        match c2_core::recv_connection_event(
+            &connections,
+            Some(deadline.saturating_duration_since(Instant::now())),
+        )
+        .unwrap()
+        {
+            Some(c2_core::ConnectionEventWait::Event(ConnectionEvent::Opened(_))) => opened += 1,
+            Some(c2_core::ConnectionEventWait::Event(ConnectionEvent::Closed(_))) => closed += 1,
+            other => panic!(
+                "resource process carriers did not all close within {WAIT:?}: opened={opened}, closed={closed}, receive={other:?}"
+            ),
+        }
+    }
     assert_eq!(opened, closed, "resource process carriers must all close");
     process_event(
         serde_json::json!({"kind":"stopped", "finished":true, "physical_opened":opened, "physical_closed":closed, "opens":probe.opens.load(Ordering::SeqCst), "finishes":probe.finishes.load(Ordering::SeqCst)}),
