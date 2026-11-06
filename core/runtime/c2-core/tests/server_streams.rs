@@ -84,6 +84,7 @@ fn local_object_stream_preserves_identity_and_releases_per_step_permit() {
         &values[0]
     ));
     assert_eq!(steps_rx.recv_timeout(WAIT).unwrap(), 2);
+    observe_until(|| route.snapshot().active_workers == 0);
     let snapshot = route.snapshot();
     assert_eq!(snapshot.pending, 1, "original call slot remains");
     assert_eq!(snapshot.active_workers, 0, "yield releases route permit");

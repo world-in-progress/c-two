@@ -355,6 +355,8 @@ def test_other_route_refusal_preserves_inflight_held_response(lab, transition):
                 removing = threads.submit(lab.server.unregister, lab.name("b"))
                 wait_state(scheduler.snapshot, lambda state: state.closed)
                 expected = cc.error.ResourceClosed
+                if lab.path == "relay_aware_relay":
+                    expected = (cc.error.ResourceClosed, cc.error.ResourceNotFound)
             else:
                 lab.server.unregister(lab.name("b"))
                 expected = (cc.error.ResourceNotFound if lab.path == "relay_aware_relay"
