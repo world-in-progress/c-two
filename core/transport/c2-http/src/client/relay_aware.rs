@@ -2599,4 +2599,311 @@ mod tests {
         registry_handle.abort();
         live_handle.abort();
     }
+
+    mod block9b4 {
+        use super::*;
+        use crate::stream_wire::{
+            self, HttpStreamRecordKind, HttpStreamStatus, HttpStreamTerminal,
+        };
+        use c2_mem::retention::RetentionBudget;
+        use std::future::Future;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::sync::oneshot;
+
+        async fn bounded<T>(work: impl Future<Output = T>) -> T {
+            tokio::time::timeout(Duration::from_secs(10), work)
+                .await
+                .expect("HTTP stream acceptance step timed out")
+        }
+
+        struct Peer {
+            url: String,
+            task: tokio::task::JoinHandle<()>,
+            written: oneshot::Receiver<()>,
+            end: Option<oneshot::Sender<()>>,
+        }
+
+        impl Drop for Peer {
+            fn drop(&mut self) {
+                self.task.abort();
+            }
+        }
+
+        // A non-relay HTTP/1 peer needs raw TCP: Hyper would enforce a known
+        // Body length before exposing the contradictory bytes to the client.
+        // The end barrier follows application delivery, never elapsed time.
+        async fn peer(prefix: Vec<u8>, tail: Vec<u8>, declared: Option<usize>) -> Peer {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let (written, received) = oneshot::channel();
+            let (end, may_end) = oneshot::channel();
+            let task = tokio::spawn(async move {
+                let (mut socket, _) = bounded(listener.accept()).await.unwrap();
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    request.push(bounded(socket.read_u8()).await.unwrap());
+                }
+                let request = String::from_utf8(request).unwrap().to_ascii_lowercase();
+                assert!(request.starts_with("post /grid/step http/1.1\r\n"));
+                assert!(request.contains("content-length: 0\r\n"));
+                assert!(request.contains(&format!("accept: {}\r\n", stream_wire::MEDIA_TYPE)));
+                let framing = match declared {
+                    Some(length) => format!("Content-Length: {length}\r\n"),
+                    None => "Transfer-Encoding: chunked\r\n".into(),
+                };
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nx-c2-call-token: 0123456789abcdef0123456789abcdef\r\n{framing}Connection: close\r\n\r\n",
+                    stream_wire::MEDIA_TYPE,
+                );
+                bounded(socket.write_all(head.as_bytes())).await.unwrap();
+                if declared.is_none() {
+                    bounded(socket.write_all(format!("{:x}\r\n", prefix.len() + 1).as_bytes()))
+                        .await
+                        .unwrap();
+                }
+                bounded(socket.write_all(&prefix)).await.unwrap();
+                written.send(()).unwrap();
+                bounded(may_end).await.unwrap();
+                if declared.is_some() {
+                    bounded(socket.write_all(&tail)).await.unwrap();
+                    bounded(socket.shutdown()).await.unwrap();
+                } else {
+                    // Tokio exposes SO_LINGER(0) on Unix and Windows. This is
+                    // an actual TCP reset after the complete item was received.
+                    socket.set_zero_linger().unwrap();
+                }
+            });
+            Peer {
+                url,
+                task,
+                written: received,
+                end: Some(end),
+            }
+        }
+
+        fn item(bytes: &[u8]) -> Vec<u8> {
+            let mut record = stream_wire::encode_item_begin(bytes.len() as u64).to_vec();
+            record.extend_from_slice(&stream_wire::encode_header(
+                HttpStreamRecordKind::ItemData,
+                bytes.len() as u64,
+            ));
+            record.extend_from_slice(bytes);
+            record
+        }
+
+        async fn client_for(peer: &Peer) -> (RelayAwareHttpClient, tokio::task::JoinHandle<()>) {
+            let selected = route_info("grid".into(), peer.url.clone());
+            let (url, task) = spawn_app(Router::new().route(
+                "/_resolve/{route}",
+                get(move || {
+                    let selected = selected.clone();
+                    async move { Json(vec![selected]) }
+                }),
+            ))
+            .await;
+            let client = RelayAwareHttpClient::new(
+                &url,
+                expected_contract(),
+                false,
+                RelayAwareClientConfig::default(),
+            )
+            .unwrap()
+            .with_http_only();
+            (client, task)
+        }
+
+        // Requirement 9b4.4: a real reset in ITEM_DATA preserves the delivered
+        // owner, refunds the partial item and slot, and is dispatch-uncertain.
+        #[tokio::test]
+        async fn block9b4_body_reset_mid_record_keeps_item_and_refunds_b() {
+            let mut prefix = item(b"kept");
+            prefix.extend_from_slice(&stream_wire::encode_item_begin(8));
+            prefix.extend_from_slice(&stream_wire::encode_header(
+                HttpStreamRecordKind::ItemData,
+                8,
+            ));
+            prefix.extend_from_slice(b"par");
+            let mut peer = peer(prefix, Vec::new(), None).await;
+            let (client, registry) = client_for(&peer).await;
+            let retention = RetentionBudget::new(1, 64);
+            let budget = retention.payload_budget();
+            let control = HttpCallControl::new(|| Ok(()), || Ok(()))
+                .with_payload_budget(budget.clone(), None);
+            let mut stream = bounded(client.stream_controlled_async(
+                "step",
+                Arc::new(Vec::<u8>::new()),
+                budget.try_reserve(1).unwrap(),
+                Box::new(retention.reserve().unwrap()),
+                HttpStreamCancellation::new(),
+                &control,
+            ))
+            .await
+            .unwrap();
+            bounded(&mut peer.written).await.unwrap();
+            let kept = bounded(stream.recv()).await.unwrap().unwrap();
+            assert_eq!(kept.as_ref(), b"kept");
+            bounded(async {
+                while budget.snapshot().used_bytes != 12 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await;
+            assert_eq!(retention.snapshot().used_operations, 1);
+            peer.end.take().unwrap().send(()).unwrap();
+            bounded(&mut peer.task).await.unwrap();
+            let error = bounded(stream.recv()).await.unwrap_err();
+            assert!(
+                matches!(&error, HttpError::Transport(message) if message.contains("HTTP stream body read failed")),
+                "{error:?}"
+            );
+            assert_eq!(
+                http_call_error_phase(&error),
+                HttpCallPhase::DispatchUncertain
+            );
+            let terminal = bounded(stream.completion()).await.unwrap_err();
+            assert_eq!(
+                http_call_error_phase(&terminal),
+                HttpCallPhase::DispatchUncertain
+            );
+            assert_eq!(kept.as_ref(), b"kept");
+            assert_eq!(budget.snapshot().used_bytes, 4);
+            assert_eq!(retention.snapshot().used_operations, 0);
+            drop(kept);
+            assert_eq!(budget.snapshot().used_bytes, 0);
+            registry.abort();
+        }
+
+        // Requirement 9b4.3(a), streaming RPC design section 8: an already
+        // obtained terminal cannot be replaced by a later EOF, even when the
+        // HTTP Content-Length promises more bytes after the complete CALL_END.
+        #[tokio::test]
+        async fn block9b4_complete_success_survives_short_http_body() {
+            let prefix = item(b"kept");
+            let tail = stream_wire::encode_terminal(&HttpStreamTerminal {
+                status: HttpStreamStatus::Success,
+                complete_items: Some(1),
+                error: None,
+            })
+            .unwrap();
+            let declared = prefix.len() + tail.len() + 1;
+            let mut peer = peer(prefix, tail, Some(declared)).await;
+            let (client, registry) = client_for(&peer).await;
+            let retention = RetentionBudget::new(1, 64);
+            let budget = retention.payload_budget();
+            let control = HttpCallControl::new(|| Ok(()), || Ok(()))
+                .with_payload_budget(budget.clone(), None);
+            let mut stream = bounded(client.stream_controlled_async(
+                "step",
+                Arc::new(Vec::<u8>::new()),
+                budget.try_reserve(1).unwrap(),
+                Box::new(retention.reserve().unwrap()),
+                HttpStreamCancellation::new(),
+                &control,
+            ))
+            .await
+            .unwrap();
+            bounded(&mut peer.written).await.unwrap();
+            let kept = bounded(stream.recv()).await.unwrap().unwrap();
+            assert_eq!(kept.as_ref(), b"kept");
+            peer.end.take().unwrap().send(()).unwrap();
+            bounded(&mut peer.task).await.unwrap();
+            let terminal = bounded(stream.completion()).await.unwrap();
+            assert_eq!(terminal.status, HttpStreamStatus::Success);
+            assert_eq!(terminal.complete_items, Some(1));
+            assert!(terminal.error.is_none());
+            assert!(bounded(stream.recv()).await.unwrap().is_none());
+            assert_eq!(kept.as_ref(), b"kept");
+            assert_eq!(budget.snapshot().used_bytes, 4);
+            assert_eq!(retention.snapshot().used_operations, 0);
+            drop(kept);
+            assert_eq!(budget.snapshot().used_bytes, 0);
+            registry.abort();
+        }
+
+        async fn truncated_response_is_dispatch_uncertain(truncate_item: bool) {
+            let prefix = item(b"kept");
+            let mut tail = if truncate_item {
+                item(b"partial!")
+            } else {
+                Vec::new()
+            };
+            tail.extend_from_slice(
+                &stream_wire::encode_terminal(&HttpStreamTerminal {
+                    status: HttpStreamStatus::Success,
+                    complete_items: Some(if truncate_item { 2 } else { 1 }),
+                    error: None,
+                })
+                .unwrap(),
+            );
+            let cut = if truncate_item {
+                // Three of eight ITEM_DATA bytes fit in the declared body.
+                stream_wire::encode_item_begin(8).len() + stream_wire::RECORD_HEADER_LEN + 3
+            } else {
+                // Only three bytes of the CALL_END status/count payload fit.
+                stream_wire::RECORD_HEADER_LEN + 3
+            };
+            let declared = prefix.len() + cut;
+            assert!(declared < prefix.len() + tail.len());
+            let mut peer = peer(prefix, tail, Some(declared)).await;
+            let (client, registry) = client_for(&peer).await;
+            let retention = RetentionBudget::new(1, 64);
+            let budget = retention.payload_budget();
+            let control = HttpCallControl::new(|| Ok(()), || Ok(()))
+                .with_payload_budget(budget.clone(), None);
+            let mut stream = bounded(client.stream_controlled_async(
+                "step",
+                Arc::new(Vec::<u8>::new()),
+                budget.try_reserve(1).unwrap(),
+                Box::new(retention.reserve().unwrap()),
+                HttpStreamCancellation::new(),
+                &control,
+            ))
+            .await
+            .unwrap();
+            bounded(&mut peer.written).await.unwrap();
+            let kept = bounded(stream.recv()).await.unwrap().unwrap();
+            assert_eq!(kept.as_ref(), b"kept");
+            peer.end.take().unwrap().send(()).unwrap();
+            bounded(&mut peer.task).await.unwrap();
+            let error = bounded(stream.recv()).await.unwrap_err();
+            let terminal = bounded(stream.completion()).await.unwrap_err();
+            assert_eq!(kept.as_ref(), b"kept");
+            assert_eq!(budget.snapshot().used_bytes, 4);
+            assert_eq!(retention.snapshot().used_operations, 0);
+            drop(kept);
+            assert_eq!(budget.snapshot().used_bytes, 0);
+            registry.abort();
+            let expected = if truncate_item {
+                "HTTP stream ended mid ITEM_DATA"
+            } else {
+                "HTTP stream ended mid terminal"
+            };
+            for outcome in [&error, &terminal] {
+                assert_eq!(
+                    http_call_error_phase(outcome),
+                    HttpCallPhase::DispatchUncertain
+                );
+                assert!(
+                    matches!(outcome, HttpError::Transport(message) if message.contains(expected)),
+                    "expected a peer end inside the record: {outcome:?}"
+                );
+            }
+        }
+
+        // Requirement 9b4.3(b): a too-small Content-Length truncates ITEM_DATA
+        // before CALL_END. As in ipc-handshake.md's Server streams rule, a peer
+        // end without CALL_END is dispatch-uncertain; earlier items stay valid.
+        #[tokio::test]
+        async fn block9b4_short_content_length_mid_item_is_dispatch_uncertain() {
+            truncated_response_is_dispatch_uncertain(true).await;
+        }
+
+        // Requirement 9b4.3(b): a too-small Content-Length truncates CALL_END,
+        // so no complete terminal is available. Treat the end as peer end,
+        // matching the same IPC rule, and retain the earlier complete item.
+        #[tokio::test]
+        async fn block9b4_short_content_length_mid_call_end_is_dispatch_uncertain() {
+            truncated_response_is_dispatch_uncertain(false).await;
+        }
+    }
 }

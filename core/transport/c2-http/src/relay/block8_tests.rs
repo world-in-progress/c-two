@@ -250,10 +250,65 @@ struct Fixture {
     armed: Arc<AtomicBool>,
     pending: mpsc::Receiver<()>,
     budget_bytes: u64,
+    frame_tap: Option<tokio::task::JoinHandle<()>>,
+}
+
+type RpcFrames = Arc<parking_lot::Mutex<Vec<(bool, u64, c2_wire::rpc::RpcRecordKind)>>>;
+
+// A transparent test peer observes complete frames on both native OS backends.
+// It forwards handshake/control frames too, and adds no production observer.
+async fn forward_frames(
+    mut reader: c2_local::LocalReadHalf,
+    mut writer: c2_local::LocalWriteHalf,
+    response: bool,
+    frames: RpcFrames,
+) {
+    use c2_wire::{flags, frame};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    loop {
+        let mut raw = [0; frame::HEADER_SIZE];
+        if reader.read(&mut raw[..1]).await.unwrap() == 0 {
+            break;
+        }
+        reader.read_exact(&mut raw[1..]).await.unwrap();
+        let (length, body) = frame::decode_total_len(&raw).unwrap();
+        let (header, _) = frame::decode_frame_body(body, length).unwrap();
+        let mut payload = vec![0; header.payload_len()];
+        reader.read_exact(&mut payload).await.unwrap();
+        if header.flags & flags::FLAG_RPC_RECORD != 0 {
+            frames
+                .lock()
+                .push((response, header.request_id, payload[0].try_into().unwrap()));
+        }
+        let mut frame = raw.to_vec();
+        frame.extend_from_slice(&payload);
+        // Keep the tap's reader alive when an idle client has already closed:
+        // the inherent write_all aborts both halves on a failed courtesy ACK.
+        let written = async {
+            AsyncWriteExt::write_all(&mut writer, &frame).await?;
+            writer.flush().await
+        }
+        .await;
+        if let Err(error) = written {
+            // An idle client closes without waiting for the courtesy ACK.
+            // Still read the upstream through EOF to count its entire output.
+            assert!(
+                response && c2_local::is_peer_closed_error(&error),
+                "{error}"
+            );
+            assert_eq!(header.request_id, 0);
+            assert_eq!(header.flags, flags::FLAG_SIGNAL | flags::FLAG_RESPONSE);
+            assert_eq!(payload, c2_wire::msg_type::DISCONNECT_ACK_BYTES);
+        }
+    }
 }
 
 impl Fixture {
     async fn start(shm: bool, budget_bytes: u64) -> Self {
+        Self::start_with_frame_tap(shm, budget_bytes, None).await
+    }
+
+    async fn start_with_frame_tap(shm: bool, budget_bytes: u64, frames: Option<RpcFrames>) -> Self {
         let ordinal = NEXT.fetch_add(1, Ordering::SeqCst);
         let id = format!("b8-{}-{ordinal}", std::process::id());
         let address = format!("ipc://{id}");
@@ -312,6 +367,36 @@ impl Fixture {
         bounded(server.wait_until_responsive(Duration::from_secs(2)))
             .await
             .unwrap();
+
+        let (address, frame_tap) = if let Some(frames) = frames {
+            let address = format!("ipc://{id}-tap");
+            let mut listener =
+                c2_local::LocalListener::bind(&context.endpoint(&address).unwrap()).unwrap();
+            let endpoint = endpoint.clone();
+            let task = tokio::spawn(async move {
+                let incoming = bounded(listener.accept()).await.unwrap();
+                let outgoing = bounded(c2_local::LocalStream::connect(&endpoint, WAIT))
+                    .await
+                    .unwrap();
+                let (incoming_read, incoming_write) = incoming.into_split();
+                let (outgoing_read, outgoing_write) = outgoing.into_split();
+                tokio::join!(
+                    forward_frames(incoming_read, outgoing_write, false, frames.clone()),
+                    forward_frames(outgoing_read, incoming_write, true, frames),
+                );
+                let result = tokio::task::spawn_blocking(move || listener.close())
+                    .await
+                    .unwrap();
+                assert!(matches!(
+                    result,
+                    c2_local::EndpointReapResult::Reaped
+                        | c2_local::EndpointReapResult::NotApplicable
+                ));
+            });
+            (address, Some(task))
+        } else {
+            (address, None)
+        };
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let socket = listener.local_addr().unwrap();
@@ -410,6 +495,7 @@ impl Fixture {
             armed,
             pending,
             budget_bytes,
+            frame_tap,
         }
     }
 
@@ -443,6 +529,9 @@ impl Fixture {
         bounded(self.state.stop_upstream_controls()).await;
         bounded(self.state.clients.shutdown()).await;
         bounded(self.observer_task).await.unwrap();
+        if let Some(task) = self.frame_tap {
+            bounded(task).await.unwrap();
+        }
         bounded(self.server.shutdown_and_wait(Duration::from_secs(2)))
             .await
             .unwrap();
@@ -1527,4 +1616,177 @@ async fn mismatched_http_call_modes_are_not_executed_and_keep_upstream() {
     );
     drop(lease);
     fixture.stop().await;
+}
+
+// Requirement 9b4.1: stream payload Bytes, including a slice, keep their
+// original allocation charged after the response Body has reached CALL_END.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn block9b4_stream_body_last_bytes_reference_refunds_b() {
+    use axum::{body::Body, http::Request};
+    use futures::StreamExt;
+    use tower::ServiceExt;
+
+    const LEN: usize = 4096;
+    for shm in [false, true] {
+        let fixture = Fixture::start(shm, 32 * 1024).await;
+        let request = Request::builder()
+            .method("POST")
+            .uri("/portable/echo")
+            .header("accept", stream_wire::MEDIA_TYPE)
+            .header("x-c2-expected-crm-ns", &fixture.entry.crm_ns)
+            .header("x-c2-expected-crm-name", &fixture.entry.crm_name)
+            .header("x-c2-expected-crm-ver", &fixture.entry.crm_ver)
+            .header("x-c2-expected-abi-hash", &fixture.entry.abi_hash)
+            .header(
+                "x-c2-expected-signature-hash",
+                &fixture.entry.signature_hash,
+            )
+            .header("x-c2-route-uid", &fixture.entry.route_uid)
+            .header("content-length", "8")
+            .body(Body::from(
+                [1u32.to_le_bytes(), (LEN as u32).to_le_bytes()].concat(),
+            ))
+            .unwrap();
+        let response = bounded(build_router(fixture.state.clone()).oneshot(request))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let mut body = response.into_body().into_data_stream();
+        let begin = bounded(body.next()).await.unwrap().unwrap();
+        assert_eq!(begin.as_ref(), stream_wire::encode_item_begin(LEN as u64));
+        let header = bounded(body.next()).await.unwrap().unwrap();
+        assert_eq!(
+            header.as_ref(),
+            stream_wire::encode_header(HttpStreamRecordKind::ItemData, LEN as u64)
+        );
+        let bytes = bounded(body.next()).await.unwrap().unwrap();
+        assert_eq!(bytes.as_ref(), &[0; LEN]);
+        let clone = bytes.clone();
+        let slice = clone.slice(7..12);
+        drop(bytes);
+        let end = bounded(body.next()).await.unwrap().unwrap();
+        let terminal = stream_wire::decode_terminal(&end[9..]).unwrap();
+        assert_eq!(terminal.status, HttpStreamStatus::Success);
+        assert_eq!(terminal.complete_items, Some(1));
+        assert!(bounded(body.next()).await.is_none());
+        drop(body);
+        fixture.state.forwarding.close();
+        bounded(fixture.state.forwarding.drain()).await;
+        let budget = fixture.state.forwarding.payload_budget();
+        assert_eq!(fixture.state.forwarding.snapshot().used_operations, 0);
+        assert_eq!(budget.snapshot().used_bytes, LEN as u64);
+        drop(clone);
+        assert_eq!(budget.snapshot().used_bytes, LEN as u64);
+        assert_eq!(slice.as_ref(), &[0; 5]);
+        drop(slice);
+        assert_eq!(budget.snapshot().used_bytes, 0);
+        fixture.stop().await;
+    }
+}
+
+// Requirement 9b4.2: a real one-hop relay reaches the public client with an
+// item larger than its B; local refusal cannot replace the resource's end.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn block9b4_relay_oversized_item_keeps_real_terminal_and_refunds_b() {
+    use crate::client::{
+        HttpCallControl, HttpError, HttpStreamCancellation, RelayAwareClientConfig,
+        RelayAwareHttpClient,
+    };
+    use c2_error::ErrorCode;
+    use c2_mem::retention::PayloadBufferBudget;
+
+    let fixture = Fixture::start(true, 64 * 1024).await;
+    let gate = Arc::new(FinishGate {
+        entered: std::sync::Barrier::new(2),
+        release: std::sync::Barrier::new(2),
+    });
+    *fixture.observed.finish_gate.lock() = Some(gate.clone());
+    let client = RelayAwareHttpClient::new(
+        &format!("http://{}", fixture.socket),
+        c2_contract::ExpectedRouteContract {
+            route_name: fixture.entry.name.clone(),
+            crm_ns: fixture.entry.crm_ns.clone(),
+            crm_name: fixture.entry.crm_name.clone(),
+            crm_ver: fixture.entry.crm_ver.clone(),
+            abi_hash: fixture.entry.abi_hash.clone(),
+            signature_hash: fixture.entry.signature_hash.clone(),
+        },
+        false,
+        RelayAwareClientConfig::default(),
+    )
+    .unwrap()
+    .with_http_only();
+    let budget = PayloadBufferBudget::new(4096);
+    let control =
+        HttpCallControl::new(|| Ok(()), || Ok(())).with_payload_budget(budget.clone(), None);
+    let mut stream = bounded(client.stream_controlled_async(
+        "echo",
+        Arc::new([1u32.to_le_bytes(), 8192u32.to_le_bytes()].concat()),
+        budget.try_reserve(1).unwrap(),
+        Box::new(()),
+        HttpStreamCancellation::new(),
+        &control,
+    ))
+    .await
+    .unwrap();
+    gate.entered.wait();
+    let release = ReleaseFinish(gate);
+    let error = bounded(stream.recv()).await.unwrap_err();
+    let HttpError::LocalCallRejected(error) = error else {
+        panic!("expected local item capacity refusal: {error:?}")
+    };
+    assert_eq!(error.code, ErrorCode::CallCapacityExceeded);
+    assert_eq!(error.details["stage"], "payload_buffer_admission");
+    assert_eq!(fixture.observed.finished.load(Ordering::SeqCst), 0);
+    {
+        let terminal = stream.completion();
+        tokio::pin!(terminal);
+        assert!(futures::poll!(&mut terminal).is_pending());
+    }
+    drop(release);
+    let terminal = bounded(stream.completion()).await.unwrap();
+    assert_ne!(terminal.status, HttpStreamStatus::NotExecuted);
+    assert_eq!(terminal.complete_items, Some(1));
+    if let Some(error) = terminal.error {
+        assert_eq!(error.code, ErrorCode::CallCancelled);
+    }
+    assert_eq!(fixture.observed.produced.load(Ordering::SeqCst), 1);
+    assert_eq!(fixture.observed.finished.load(Ordering::SeqCst), 1);
+    assert_eq!(budget.snapshot().used_bytes, 0);
+    assert_eq!(budget.snapshot().rejected_allocations, 1);
+    drop(stream);
+    drop(client);
+    fixture.stop().await;
+}
+
+// Requirement 9b4.5: observe the actual relay/upstream IPC connection through
+// its close barrier, so an extra OPEN, CALL_END or CREDIT cannot escape count.
+// LocalStream selects UDS on Unix and Named Pipes on Windows for the same proof.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn block9b4_relay_unary_upstream_has_one_open_one_call_end_no_credit() {
+    use c2_wire::rpc::RpcRecordKind;
+
+    let frames = RpcFrames::default();
+    let fixture = Fixture::start_with_frame_tap(false, 64 * 1024, Some(frames.clone())).await;
+    let response = bounded(
+        fixture
+            .method_request("ping", false)
+            .body(Vec::new())
+            .send(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(bounded(response.bytes()).await.unwrap().as_ref(), b"pong");
+    assert_eq!(fixture.observed.unary_calls.load(Ordering::SeqCst), 1);
+    fixture.stop().await;
+    let frames = frames.lock();
+    assert_eq!(
+        frames.len(),
+        2,
+        "the whole IPC lifetime has exactly two RPC records: {frames:?}"
+    );
+    assert_eq!(frames[0].0, false);
+    assert_eq!(frames[0].2, RpcRecordKind::Open);
+    assert_eq!(frames[1], (true, frames[0].1, RpcRecordKind::CallEnd));
 }
