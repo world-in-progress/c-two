@@ -10,6 +10,9 @@ import pytest
 
 import c_two as cc
 from c_two import error
+from tests.fixtures.relay_stream_cross import (
+    SLOW_ITEMS, record_result, relay_cross, relay_cross_rust,
+)
 
 
 @cc.crm(namespace="test.relay-server-stream", version="0.1.0")
@@ -304,3 +307,42 @@ def test_close_during_running_step_cancels_only_stream(relay_values):
         if worker.ident is not None:
             worker.join(5)
         stream.close(timeout=0)
+
+
+@pytest.mark.timeout(300)
+@pytest.mark.parametrize("count", [0, 1, 5])
+def test_cross_language_relay_items_and_complete_count(relay_cross, count, record_property):
+    """Routing HTTP streams: Python→Rust and Rust→Python deliver 0/1/many items and CALL_END counts."""
+    relay_cross.start(count)
+    report = record_result(relay_cross, relay_cross.consume(), record_property)
+    assert report["error"] is None
+
+
+@pytest.mark.timeout(300)
+def test_cross_language_relay_holds_keep_budget_until_release(relay_cross, record_property):
+    """Memory policy: Python hold / Rust typed Held keep HTTP reservations; release admits the next item."""
+    relay_cross.start(3, behavior="hold")
+    report = record_result(relay_cross, relay_cross.held(), record_property)
+    assert report["error"] is None
+    assert report["memory"]["payload_buffer"]["rejected_allocations"] == 0
+
+
+@pytest.mark.timeout(300)
+@pytest.mark.parametrize("ending", ["step", "cleanup", "cleanup-step"])
+def test_cross_language_relay_failure_after_items(relay_cross, ending, record_property):
+    """IPC streams: step failure follows three items; cleanup failure replaces success or step failure."""
+    relay_cross.start(3, ending=ending)
+    report = record_result(relay_cross, relay_cross.consume(), record_property)
+    expected = "relay cross step failed" if ending == "step" else "relay cross cleanup failed"
+    assert report["error"]["code"] == 3
+    assert expected in report["error"]["message"]
+    assert report["error"]["details"].get("transport_phase") is None
+    assert report["error"]["details"].get("dispatch_phase") is None
+
+
+@pytest.mark.timeout(300)
+def test_cross_language_relay_slow_reader_stops_and_resumes(relay_cross, record_property):
+    """Runtime lifecycle: 128 KiB items fill HTTP/TCP buffers, bound resource run-ahead, then reach real terminal."""
+    relay_cross.start(SLOW_ITEMS, behavior="slow")
+    report = record_result(relay_cross, relay_cross.slow(), record_property)
+    assert report["error"] is None

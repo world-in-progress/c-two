@@ -18,6 +18,43 @@ const DESCRIPTOR: &[u8] = include_bytes!("../fixtures/stream.contract.json");
 const SPEC: &[u8] = include_bytes!("../fixtures/stream-spec.json");
 const LARGE_LEN: usize = 256 * 1024;
 
+#[derive(Clone)]
+struct StreamOutcome {
+    count: usize,
+    ending: String,
+}
+
+impl StreamOutcome {
+    fn parse(args: impl Iterator<Item = String>) -> Result<Self, Box<dyn Error>> {
+        let mut outcome = Self {
+            count: 2,
+            ending: "success".into(),
+        };
+        let mut args = args;
+        while let Some(flag) = args.next() {
+            match flag.as_str() {
+                "--items" => outcome.count = args.next().ok_or("missing --items value")?.parse()?,
+                "--ending" => {
+                    outcome.ending = args.next().ok_or("missing --ending value")?;
+                    assert!(matches!(
+                        outcome.ending.as_str(),
+                        "success" | "step" | "cleanup" | "cleanup-step"
+                    ));
+                }
+                _ => return Err(format!("unknown stream option: {flag}").into()),
+            }
+        }
+        Ok(outcome)
+    }
+}
+
+fn stream_failure(message: &str) -> C2Error {
+    C2Error::new(
+        c_two::generated::ErrorCode::ResourceFunctionExecuting,
+        message,
+    )
+}
+
 fn cell(value: c_two::observe::MemoryCellStats) -> Value {
     json!({
         "limit_bytes": value.limit_bytes, "used_bytes": value.used_bytes,
@@ -87,6 +124,7 @@ struct Resource {
     input_stats: Arc<Mutex<Option<Value>>>,
     gated: bool,
     gate: Arc<(Mutex<bool>, Condvar)>,
+    outcome: StreamOutcome,
 }
 
 impl EncodedService for Resource {
@@ -114,11 +152,12 @@ impl EncodedStreamService for Resource {
             std::io::stdout().flush().unwrap();
         }
         let bytes = build_payload(self.large).unwrap().binary_bytes().unwrap();
-        Ok(Box::new(TwoItems {
+        Ok(Box::new(MatrixItems {
             bytes,
             position: 0,
             gated: self.gated,
             gate: self.gate.clone(),
+            outcome: self.outcome.clone(),
         }))
     }
 }
@@ -134,16 +173,21 @@ impl EncodedStreamItem for Item {
     }
 }
 
-struct TwoItems {
+struct MatrixItems {
     bytes: Vec<u8>,
     position: usize,
     gated: bool,
     gate: Arc<(Mutex<bool>, Condvar)>,
+    outcome: StreamOutcome,
 }
-impl EncodedStream for TwoItems {
+impl EncodedStream for MatrixItems {
     fn step(&mut self) -> Result<Option<Box<dyn EncodedStreamItem>>, C2Error> {
-        if self.position == 2 {
-            return Ok(None);
+        if self.position == self.outcome.count {
+            return if matches!(self.outcome.ending.as_str(), "step" | "cleanup-step") {
+                Err(stream_failure("stream matrix step failed"))
+            } else {
+                Ok(None)
+            };
         }
         if self.gated && self.position == 1 {
             println!("STEP_BLOCKED");
@@ -158,7 +202,11 @@ impl EncodedStream for TwoItems {
         Ok(Some(Box::new(Item(self.bytes.clone()))))
     }
     fn finish(self: Box<Self>) -> Result<(), C2Error> {
-        Ok(())
+        if self.outcome.ending.starts_with("cleanup") {
+            Err(stream_failure("stream matrix cleanup failed"))
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -177,6 +225,7 @@ fn host(
     shm: bool,
     large: bool,
     gated: bool,
+    outcome: StreamOutcome,
 ) -> Result<(), Box<dyn Error>> {
     let server_id = address
         .strip_prefix("ipc://")
@@ -210,6 +259,7 @@ fn host(
             input_stats: input_stats.clone(),
             gated,
             gate: gate.clone(),
+            outcome,
         }),
     )?;
     let mut registration = host.register(definition)?;
@@ -311,15 +361,370 @@ fn client(
 fn main() -> Result<(), Box<dyn Error>> {
     let mut args = std::env::args().skip(1);
     let mode = args.next().ok_or("missing mode")?;
+    if mode == "relay-host" {
+        return relay::host(args.collect());
+    }
+    if mode == "relay-client" {
+        return relay::client(args.collect());
+    }
     let address = args.next().ok_or("missing address")?;
     let route = args.next().ok_or("missing route")?;
     let shm = args.next().ok_or("missing shm")? == "shm";
     let large = args.next().ok_or("missing size")? == "large";
-    let held = args.next().unwrap_or_default() == "hold";
+    let mut args = args.peekable();
+    let held = if matches!(
+        args.peek().map(String::as_str),
+        Some("hold" | "materialized")
+    ) {
+        args.next().unwrap() == "hold"
+    } else {
+        false
+    };
+    let outcome = StreamOutcome::parse(args)?;
     match mode.as_str() {
-        "host" => host(&address, &route, shm, large, false),
-        "gated-host" => host(&address, &route, shm, large, true),
+        "host" => host(&address, &route, shm, large, false, outcome),
+        "gated-host" => host(&address, &route, shm, large, true, outcome),
         "client" => client(&address, &route, shm, large, held),
         _ => Err("unknown mode".into()),
+    }
+}
+
+// Additional one-hop relay modes share the portable contract with the direct
+// matrix above. They do not change its input, output or process protocol.
+mod relay {
+    use super::*;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    const ITEM_BYTES: usize = 128 * 1024;
+
+    fn payload(text: &str) -> Result<Payload, PayloadError> {
+        let spec = CompiledSpec::compile(SPEC)?;
+        let mut builder = Builder::create(&spec)?;
+        builder.entry_begin(0, 1)?.value_str(text)?;
+        Ok(builder
+            .freeze()?
+            .execute(BuildPolicy::AllowStaging)?
+            .payload)
+    }
+
+    fn item(index: usize) -> Vec<u8> {
+        let overhead = payload("").unwrap().binary_bytes().unwrap().len();
+        let text = format!("{}{:012}", "x".repeat(ITEM_BYTES - overhead - 12), index);
+        let bytes = payload(&text).unwrap().binary_bytes().unwrap();
+        assert_eq!(bytes.len(), ITEM_BYTES);
+        bytes
+    }
+
+    fn inspect_item(value: &Payload, index: usize) {
+        assert_eq!(value.binary_bytes().unwrap().len(), ITEM_BYTES);
+        let actual = value
+            .entry_view(0)
+            .unwrap()
+            .at(0)
+            .unwrap()
+            .acquire()
+            .unwrap();
+        let text = actual.str().unwrap();
+        assert!(text.ends_with(&format!("{index:012}")));
+        assert!(text[..text.len() - 12].bytes().all(|byte| byte == b'x'));
+    }
+
+    #[derive(Default)]
+    struct Counts {
+        steps: usize,
+        produced: usize,
+        cleanups: usize,
+    }
+
+    impl Counts {
+        fn json(&self) -> Value {
+            json!({"steps": self.steps, "produced": self.produced, "cleanups": self.cleanups})
+        }
+    }
+
+    struct RelayResource {
+        counts: Arc<(Mutex<Counts>, Condvar)>,
+        count: usize,
+        ending: String,
+    }
+
+    impl EncodedService for RelayResource {
+        fn invoke(&self, method: u16, request: Vec<u8>) -> Result<Vec<u8>, C2Error> {
+            assert_eq!(method, 0);
+            assert!(request.is_empty());
+            Ok(Vec::new())
+        }
+    }
+
+    impl EncodedStreamService for RelayResource {
+        fn open_stream(
+            &self,
+            method: u16,
+            request: Vec<u8>,
+        ) -> Result<Box<dyn EncodedStream>, C2Error> {
+            assert_eq!(method, 1);
+            let spec = CompiledSpec::compile(SPEC).unwrap();
+            inspect(
+                &Payload::open_copy(&spec, &request, &OpenOptions::default()).unwrap(),
+                false,
+            )
+            .unwrap();
+            Ok(Box::new(RelayItems {
+                counts: self.counts.clone(),
+                count: self.count,
+                position: 0,
+                ending: self.ending.clone(),
+            }))
+        }
+    }
+
+    struct RelayItems {
+        counts: Arc<(Mutex<Counts>, Condvar)>,
+        count: usize,
+        position: usize,
+        ending: String,
+    }
+
+    impl EncodedStream for RelayItems {
+        fn step(&mut self) -> Result<Option<Box<dyn EncodedStreamItem>>, C2Error> {
+            {
+                let mut counts = self.counts.0.lock().unwrap();
+                counts.steps += 1;
+                self.counts.1.notify_all();
+            }
+            if self.position == self.count {
+                return if self.ending == "step" || self.ending == "cleanup-step" {
+                    Err(stream_failure("relay cross step failed"))
+                } else {
+                    Ok(None)
+                };
+            }
+            let bytes = item(self.position);
+            self.position += 1;
+            let mut counts = self.counts.0.lock().unwrap();
+            counts.produced += 1;
+            self.counts.1.notify_all();
+            Ok(Some(Box::new(Item(bytes))))
+        }
+
+        fn finish(self: Box<Self>) -> Result<(), C2Error> {
+            let mut counts = self.counts.0.lock().unwrap();
+            counts.cleanups += 1;
+            self.counts.1.notify_all();
+            if self.ending.starts_with("cleanup") {
+                Err(stream_failure("relay cross cleanup failed"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    fn emit(value: Value) {
+        println!("{value}");
+        std::io::stdout().flush().unwrap();
+    }
+
+    fn command(expected: &str) {
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line).unwrap();
+        assert_eq!(line.trim(), expected);
+    }
+
+    pub fn host(args: Vec<String>) -> Result<(), Box<dyn Error>> {
+        let address = &args[0];
+        let route = &args[1];
+        let runtime = runtime(Some(address.strip_prefix("ipc://").unwrap().into()), true)?;
+        let host = runtime.host(HostOptions::default().with_relay_anchor_address(&args[2]))?;
+        let release = ContractRelease::from_descriptor_json(DESCRIPTOR)?;
+        let outcome = StreamOutcome::parse(args[3..].iter().cloned())?;
+        let counts = Arc::new((Mutex::new(Counts::default()), Condvar::new()));
+        let definition = ServiceDefinition::new_stream(
+            &release,
+            release.reference(),
+            route,
+            [
+                MethodDefinition {
+                    index: 0,
+                    name: "ping".into(),
+                    access: MethodAccess::Read,
+                },
+                MethodDefinition {
+                    index: 1,
+                    name: "echo".into(),
+                    access: MethodAccess::Write,
+                },
+            ],
+            Arc::new(RelayResource {
+                counts: counts.clone(),
+                count: outcome.count,
+                ending: outcome.ending,
+            }),
+        )?;
+        let mut registration = host.register(definition)?;
+        emit(json!({"event": "ready", "address": address}));
+        loop {
+            let mut line = String::new();
+            std::io::stdin().read_line(&mut line)?;
+            match line.trim() {
+                "stats" => emit(counts.0.lock().unwrap().json()),
+                "quiet" => {
+                    // Observe an unchanged resource counter while the consumer
+                    // is parked at its stdin barrier. No producer barrier can
+                    // artificially cap the transport's measured run-ahead.
+                    let deadline = Instant::now() + Duration::from_secs(10);
+                    let mut current = counts.0.lock().unwrap();
+                    loop {
+                        let before = current.steps;
+                        let (next, timeout) = counts
+                            .1
+                            .wait_timeout(current, Duration::from_secs(1))
+                            .unwrap();
+                        current = next;
+                        assert!(
+                            current.steps <= 65,
+                            "relay did not stop within 64 run-ahead items"
+                        );
+                        if timeout.timed_out() && current.steps == before {
+                            emit(current.json());
+                            break;
+                        }
+                        assert!(Instant::now() < deadline, "resource did not become quiet");
+                    }
+                }
+                "produced-three" => {
+                    let counts = counts
+                        .1
+                        .wait_timeout_while(
+                            counts.0.lock().unwrap(),
+                            Duration::from_secs(10),
+                            |value| value.produced < 3,
+                        )
+                        .unwrap()
+                        .0;
+                    assert!(counts.produced >= 3);
+                    emit(counts.json());
+                }
+                "stop" => break,
+                other => panic!("unknown relay host command: {other}"),
+            }
+        }
+        registration.close()?;
+        emit(counts.0.lock().unwrap().json());
+        Ok(())
+    }
+
+    fn error_json(error: &CTwoError) -> Value {
+        match error {
+            CTwoError::Semantic(error) => {
+                json!({"code": u16::from(error.code), "message": error.message, "details": error.details})
+            }
+            other => panic!("expected semantic resource error, got {other:?}"),
+        }
+    }
+
+    pub fn client(args: Vec<String>) -> Result<(), Box<dyn Error>> {
+        let runtime = runtime(None, true)?;
+        let behavior = args[3].as_str();
+        let budget = if behavior == "hold" {
+            2 * ITEM_BYTES
+        } else {
+            3 * ITEM_BYTES
+        };
+        runtime.set_call_execution_limits(c_two::CallExecutionLimitsOverrides {
+            payload_buffer_budget_bytes: Some(budget as u64),
+            ..Default::default()
+        })?;
+        let release = ContractRelease::from_descriptor_json(DESCRIPTOR)?;
+        let connection = runtime.connect(
+            release.expected_route(&args[1])?,
+            Connect::ExplicitRelay {
+                relay_url: args[0].clone(),
+            },
+        )?;
+        assert_eq!(
+            connection.observed_path(),
+            c_two::observe::ObservedPath::ExplicitRelay
+        );
+        let input = build_payload(false)?;
+        let mut call = connection.begin_stream("echo")?;
+        c_two::generated::charge_payload_input(&mut call, &input)?;
+        let core = call.encode_vec(input.binary_bytes()?)?.stream()?;
+        let mut delivered = 0;
+        let mut failure = Value::Null;
+        let mut holds = Value::Null;
+        let receipt;
+        if behavior == "hold" {
+            let mut stream = ResponseStream::from_core(core, decode_held);
+            let mut first = stream.next().unwrap()?;
+            let mut second = stream.next().unwrap()?;
+            inspect_item(first.value().unwrap(), 0);
+            inspect_item(second.value().unwrap(), 1);
+            let full = memory_stats(runtime.memory_stats());
+            assert_eq!(full["payload_buffer"]["used_bytes"], budget);
+            let (started, ready) = mpsc::sync_channel(0);
+            let (done, result) = mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                started.send(()).unwrap();
+                let third = stream.next().unwrap();
+                done.send((stream, third)).unwrap();
+            });
+            ready.recv()?;
+            emit(json!({"event": "holds-full", "memory": full}));
+            command("release");
+            assert!(matches!(result.try_recv(), Err(mpsc::TryRecvError::Empty)));
+            first.release()?;
+            let (mut stream, third) = result.recv_timeout(Duration::from_secs(10))?;
+            let mut third = third?;
+            worker.join().unwrap();
+            inspect_item(third.value().unwrap(), 2);
+            inspect_item(second.value().unwrap(), 1);
+            let after_one_release = memory_stats(runtime.memory_stats());
+            assert_eq!(after_one_release["payload_buffer"]["used_bytes"], budget);
+            second.release()?;
+            third.release()?;
+            assert!(stream.next().is_none());
+            receipt = stream.close();
+            assert_eq!(stream.close().complete_items, receipt.complete_items);
+            delivered = 3;
+            holds = json!({"full": full, "after_one_release": after_one_release});
+        } else {
+            let mut stream = ResponseStream::from_core(core, decode_owned);
+            while let Some(item) = stream.next() {
+                match item {
+                    Ok(item) => {
+                        inspect_item(&item, delivered);
+                        delivered += 1;
+                        if behavior == "slow" && delivered == 1 {
+                            emit(json!({"event": "paused", "delivered": delivered}));
+                            command("resume");
+                        }
+                    }
+                    Err(error) => {
+                        failure = error_json(&error);
+                        break;
+                    }
+                }
+            }
+            receipt = stream.close();
+            assert!(stream.next().is_none());
+            assert_eq!(stream.close().complete_items, receipt.complete_items);
+        }
+        assert!(receipt.completed);
+        let terminal = match receipt.terminal.as_ref().unwrap() {
+            Ok(()) => Value::Null,
+            Err(error) => error_json(error),
+        };
+        assert_eq!(failure, terminal);
+        assert_eq!(delivered, args[2].parse::<usize>()?);
+        assert_eq!(receipt.complete_items, Some(delivered as u64));
+        let stats = memory_stats(runtime.memory_stats());
+        assert_eq!(stats["payload_buffer"]["used_bytes"], 0);
+        assert_eq!(runtime.call_execution_snapshot()?.used_operations, 0);
+        emit(
+            json!({"event": "done", "delivered": delivered, "complete_items": receipt.complete_items,
+                    "error": terminal, "memory": stats, "holds": holds, "path": "explicit_relay"}),
+        );
+        Ok(())
     }
 }
