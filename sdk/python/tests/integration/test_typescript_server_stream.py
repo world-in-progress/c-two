@@ -109,6 +109,35 @@ class NodePythonHost(PythonHost):
             raise ValueError("node-python-stream-error")
 
 
+class NodeRustHost:
+    def __init__(self, harness, address, route, transport, ending, count, ipc_overrides, ipc_root):
+        self.process = subprocess.Popen(
+            [str(harness.binary), "host", address, route,
+             "shm" if transport.prefer_shm else "no-shm",
+             "large" if transport.large else "inline", "--items", str(count), "--ending", ending],
+            cwd=harness.root, env=process_environment(ipc_overrides, ipc_root),
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, bufsize=1,
+        )
+        ready = readline_with_timeout(self.process.stdout, 30)
+        assert ready.startswith(f"READY address={address} route_uid="), ready
+
+    def stats(self):
+        self.process.stdin.write("stats\n")
+        self.process.stdin.flush()
+        return json.loads(readline_with_timeout(self.process.stdout, 5))
+
+    def stop(self):
+        out, err = self.process.communicate(input="\n", timeout=30)
+        assert self.process.returncode == 0, err
+        assert "HOST_RECEIPT calls=1" in out, out
+
+    def abort(self):
+        if self.process.poll() is None:
+            self.process.kill()
+        self.process.communicate()
+
+
 @pytest.mark.timeout(180)
 @pytest.mark.parametrize("host_language,count,fail", [
     ("python", 0, False), ("python", 1, False),
@@ -224,8 +253,11 @@ def _assert_node_carriers(case, encoded_len, input_stats, server_stats, node_sta
 
 
 _NODE_MATRIX_ROWS = list(product(
-    [("python", 0, False), ("python", 1, False), ("python", 5, False),
-     ("python", 3, True), ("rust", 2, False)],
+    [("python", 0, "success"), ("python", 1, "success"),
+     ("python", 5, "success"), ("python", 3, "step"),
+     ("rust", 0, "success"), ("rust", 1, "success"),
+     ("rust", 5, "success"), ("rust", 3, "step"),
+     ("rust", 3, "cleanup"), ("rust", 3, "cleanup-step")],
     [False, True], TRANSPORT_CASES,
 ))
 
@@ -233,8 +265,8 @@ _NODE_MATRIX_ROWS = list(product(
 @pytest.mark.timeout(180)
 @pytest.mark.parametrize(
     "host_case,held,transport", _NODE_MATRIX_ROWS,
-    ids=[f"{host}-{count}-{'error' if fail else 'ok'}-{'hold' if held else 'materialized'}-{case.name}"
-         for (host, count, fail), held, case in _NODE_MATRIX_ROWS],
+    ids=[f"{host}-{count}-{ending}-{'hold' if held else 'materialized'}-{case.name}"
+         for (host, count, ending), held, case in _NODE_MATRIX_ROWS],
 )
 def test_generated_node_stream_transport_matrix(
     node_stream_project, rust_stream_harness, monkeypatch, tmp_path,
@@ -245,7 +277,8 @@ def test_generated_node_stream_transport_matrix(
     root, node, payload_relative = node_stream_project
     ipc_root = tmp_path / "ipc"
     ipc_root.mkdir(mode=0o700)
-    host_language, count, fail = host_case
+    host_language, count, ending = host_case
+    fail = ending != "success"
     route = f"node-carrier-{os.getpid()}-{tmp_path.name}"
     address = f"ipc://c2_node_carrier_{os.getpid()}_{tmp_path.name}"
     threshold = 64 * 1024 if transport.prefer_shm else 1 << 30
@@ -255,7 +288,8 @@ def test_generated_node_stream_transport_matrix(
         node_options["ipcRoot"] = str(ipc_root)
     config, encoded_len = _node_config(
         root, payload_relative, tmp_path, address, route, large=transport.large,
-        hold=held, count=count, fail=fail, collectStats=True, connectorOptions=node_options,
+        hold=held, count=count, fail=fail, ending=ending, host=host_language,
+        collectStats=True, connectorOptions=node_options,
     )
     server = resource = rust_host = None
     try:
@@ -269,9 +303,9 @@ def test_generated_node_stream_transport_matrix(
             resource.observe_input = lambda: server.memory_stats()["server"]
             server.register(Portable, resource, name=route)
         else:
-            rust_host = rust_stream_harness.host(
-                address, route, transport.prefer_shm, transport.large,
-                ipc_overrides=overrides, ipc_root=ipc_root,
+            rust_host = NodeRustHost(
+                rust_stream_harness, address, route, transport, ending, count,
+                overrides, ipc_root,
             )
         run = subprocess.run(
             [node, str(root / NODE_FIXTURE.name), str(config)], cwd=root,

@@ -60,7 +60,10 @@ try {
       assert.ok(failure instanceof Error);
       assert.ok(receipt.error instanceof Error);
       assert.equal(receipt.error.code, failure.code);
-      assert.match(receipt.error.message, /node-python-stream-error/);
+      const expectedError = config.host === 'rust'
+        ? (config.ending === 'step' ? /stream matrix step failed/ : /stream matrix cleanup failed/)
+        : /node-python-stream-error/;
+      assert.match(receipt.error.message, expectedError);
       assert.equal(receipt.error.transportPhase, null);
     } else {
       assert.equal(failure, null);
