@@ -342,6 +342,10 @@ dispatcher 异步读锁不是 B2 才引入的隐患：现有 unary 接收循环�
 9. 经 relay 的取消用按调用的令牌：业务 POST 的响应在正文之前给出随机、不可猜的令牌，`DELETE /_calls/{token}` 只提交 CANCEL，原响应继续可读，`close` 读到真实终态与完整条目数；令牌只在这次转发存在期间有效，不提供查询、恢复或重放。
 10. 块 8 只做 relay 与 Rust、Python 客户端；生成的 TypeScript 经 relay 的流，随 TypeScript 运行时独立成包那一批再做，免得先手写一遍再重构，第九节里 Node 经 relay 的流相应顺延（2026-11-05 维护者同意）。
 
+2026-11-06 维护者为 IPC 16 另定一项：
+
+11. OPEN 带上调用方认定的 mode，服务端在核对契约身份与方法序号的同一处比对，不符时以 NotExecuted 的 `UnsupportedCallMode`（716）拒绝：资源没有被进入，连接不停用，调用方可以安全重试。relay 按 `Accept` 头选择转发方式，这个选择随之写进 OPEN；直接 IPC 的客户端写它这次调用的 mode。第七节表格里“mode 不在线上传”与第十一节块 5a 补记里的同一判断随之作废：relay 不知道方法的 mode，在它那里推导不出来。原先头与方法不符时，错误要到派发之后才发现，调用报派发不确定；流方法照 unary 转发时，relay 的上游连接还会因协议错误被停用。
+
 另外统一了 `close` 的缺省观察预算（3.5）。新术语已写进 [CONTEXT.md](../../CONTEXT.md)；全文既有 Runtime、Host、hold、借出、租约、停用、对端结束、预算和截止时间沿原义。
 
 本稿尚未运行验证：跨 worker 的 native/GIL/context 行为、增量编码在容量等待时的线程占用、hyper/可注入 fetch/代理的真实缓冲及预产范围、性能和三平台证据。v2 的投影/规范化及 hyper 的缓冲门已静态核对，不能代替上述实验；持久结果查询/去重仍待独立调研与 ADR。
