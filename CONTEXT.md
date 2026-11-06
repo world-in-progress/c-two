@@ -27,8 +27,12 @@ The name chosen by the application in `cc.register(..., name=...)` and `cc.conne
 _Avoid_: service name, resource name, endpoint (for a route)
 
 **路由 / route**:
-A route name bound to one resource in one Host, together with the contract identity it serves.
+A route name together with the contract identity it serves; it names one resource's state. Within its scope (the relay mesh, or one endpoint for direct IPC) at most one registration of it is live at a time.
 _Avoid_: binding, endpoint
+
+**注册 / registration**:
+One period in which a Host serves a route, from `cc.register` until the route is unregistered or the Host stops. A route may have many registrations over time; the route UID tells them apart inside C-Two and is not shown to clients.
+_Avoid_: instance, activation, incarnation
 
 **CRM 命名空间 / CRM namespace**:
 The `namespace` argument of `@cc.crm`, part of the contract identity.
@@ -135,6 +139,10 @@ _Avoid_: 中继, proxy, gateway, broker
 **relay 锚点 / relay anchor**:
 The relay a process registers its routes with and resolves names through (`C2_RELAY_ANCHOR_ADDRESS`). Calls may travel through a different relay.
 _Avoid_: home relay, registry
+
+**路由冲突 / route conflict**:
+The state in which more than one relay holds a live registration of the same route after a partition. New acquisitions fail until only one registration is left; C-Two never chooses between them.
+_Avoid_: duplicate route, split brain
 
 **端点 / endpoint**:
 The operating-system object behind an `ipc://` address: a Unix socket in an endpoint namespace, or a Windows named pipe.

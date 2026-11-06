@@ -28,4 +28,6 @@ relay 不上 HTTP/2：请求体一次发完，响应体逐条流式发送，取�
 
 补记（2026-11-05）：维护者为块 8 定了经 relay 的两件事。其一，取消不只是中止 HTTP：业务 POST 的响应在正文之前给出一个随机、不可猜的调用令牌，`DELETE /_calls/{token}` 只提交 CANCEL，原响应继续可读，`close` 因而能像直接 IPC 一样读到真实终态与完整条目数；令牌只在这次转发存在期间有效，不提供查询、恢复或重放。客户端中止 HTTP 仍会让 relay 向上游提交 CANCEL，只是读不到终态。其二，relay 关闭时照 Runtime shutdown 的规则结束经它转发、还开着的流：正在运行的那一步照常完成，已产出的条目照常转发，清理之后以写明 relay 关闭的 `CallCancelled` 结束，unary 照旧等它完成；为此 IPC 16 的 CANCEL 记录带上取消起因，区分客户端放弃与生命周期结束。另外核实了 relay 只把调用转给自己的本地路由，没有 relay 到 relay 的转发，上文“各跳”的背压只指客户端、relay 与资源之间的这几段。
 
+补记（2026-11-06）：[ADR 0004](0004-route-name-identity.md) 定下路由名是资源状态的唯一身份，代理跟随路由名，重新注册对调用方透明，跨注册的状态延续由 Host 负责。上文不自动重发的两条理由里，“过期路由通常意味着资源换了实例，新实例没有原来的状态”由它取代；“要把输入保留到回复”仍然成立，调用照旧只发一次。
+
 依据：[流式 RPC 设计](../design/2026-11-03-streaming-rpc-design.md)、[流式 RPC 调研](../research/2026-11-03-streaming-rpc-survey.md)、[ADR 0001](0001-single-owner-release.md)。
