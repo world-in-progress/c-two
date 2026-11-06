@@ -6324,6 +6324,69 @@ async fn host_close_retires_committed_route_before_admission() {
 }
 
 #[tokio::test]
+async fn route_list_projects_host_admission_closed_while_route_is_open() {
+    use c2_wire::route_catalog_control::{
+        RouteListRequest, RouteSelector, RouteStateReasonWire, RouteStateWire,
+        decode_route_list_response, encode_route_list_request,
+    };
+
+    let server = test_server_new(
+        &unique_readiness_address("route_list_host_admission_closed"),
+        ServerIpcConfig::default(),
+    )
+    .unwrap();
+    let route = make_host_route(&server, "grid");
+    let expected_uid = route.route_uid.clone();
+    let reservation = server
+        .reserve_route(BuiltRoute::new(route).unwrap())
+        .await
+        .unwrap();
+    server.commit_reserved_route(reservation).await.unwrap();
+
+    assert_eq!(
+        server
+            .dispatcher
+            .read()
+            .resolve("grid")
+            .unwrap()
+            .scheduler
+            .route_admission_state(),
+        RouteAdmissionState::Opened
+    );
+    assert!(server.business_admission_closed() == false);
+
+    // Close only the Host admission gate so this projection is checked before
+    // per-route scheduler closure catches up.
+    server.admission.lock().terminate();
+    let request = encode_route_list_request(&RouteListRequest {
+        selector: RouteSelector::RouteName {
+            route_name: "grid".into(),
+        },
+    })
+    .unwrap();
+    let payload = route_list_payload(&server, &request).await;
+    let response = decode_route_list_response(&payload).unwrap();
+    assert_eq!(response.routes.len(), 1);
+    assert_eq!(response.routes[0].route_uid, expected_uid);
+    assert_eq!(response.routes[0].state, RouteStateWire::Closed);
+    assert_eq!(
+        response.routes[0].state_reason,
+        RouteStateReasonWire::Shutdown
+    );
+    assert_eq!(
+        server
+            .dispatcher
+            .read()
+            .resolve("grid")
+            .unwrap()
+            .scheduler
+            .route_admission_state(),
+        RouteAdmissionState::Opened,
+        "RouteList must report the Host gate without needing route mutation"
+    );
+}
+
+#[tokio::test]
 async fn aborted_and_dropped_reservations_terminally_close_their_schedulers() {
     let server = test_server_new(
         &unique_readiness_address("route_reservation_abort"),

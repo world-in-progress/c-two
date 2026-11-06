@@ -3215,6 +3215,42 @@ mod tests {
         );
     }
 
+    #[test]
+    fn closed_upstream_lookup_withdraws_the_matching_route() {
+        let state = test_state();
+        match test_commit_registration!(
+            &state,
+            "closed-upstream".into(),
+            "server-grid".into(),
+            "server-grid-instance".into(),
+            "ipc://closed-upstream".into(),
+            TEST_CRM_NS.into(),
+            TEST_CRM_NAME.into(),
+            TEST_CRM_VER.into(),
+            TEST_ABI_HASH.into(),
+            TEST_SIGNATURE_HASH.into(),
+            1024,
+            "closed-upstream-uid".into(),
+            None,
+        ) {
+            RegisterCommitResult::Registered { .. } => {}
+            _ => panic!("unexpected route registration result"),
+        }
+        let route = state
+            .local_route("closed-upstream")
+            .expect("advertised route");
+        let error = c2_ipc::IpcError::RouteClosed {
+            route_name: "closed-upstream".into(),
+            route_uid: "closed-upstream-uid".into(),
+            reason: "Shutdown".into(),
+        };
+        let reason = semantic_withdrawal_reason(&error).expect("closed is authoritative");
+
+        remove_unreachable_route_for_error(&state, &route, &error, reason);
+
+        assert!(state.local_route("closed-upstream").is_none());
+    }
+
     async fn wait_for_local_route_removed(state: &Arc<RelayState>, name: &str) {
         for _ in 0..40 {
             if state.local_route(name).is_none() {

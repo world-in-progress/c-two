@@ -2700,6 +2700,7 @@ async fn route_records(server: &Server) -> Vec<RouteRecordWire> {
 
 fn route_record(server: &Server, route: &CrmRoute) -> RouteRecordWire {
     let admission = route.scheduler.route_admission_state();
+    let host_admission_closed = server.business_admission_closed();
     RouteRecordWire {
         route_name: route.name.clone(),
         route_uid: route.route_uid.clone(),
@@ -2723,20 +2724,25 @@ fn route_record(server: &Server, route: &CrmRoute) -> RouteRecordWire {
             })
             .collect(),
         max_payload_size: server.config.max_payload_size,
-        state: match admission {
-            RouteAdmissionState::Opened => RouteStateWire::Ready,
-            RouteAdmissionState::CommittedPending | RouteAdmissionState::Closed => {
-                RouteStateWire::Closed
+        state: if host_admission_closed {
+            RouteStateWire::Closed
+        } else {
+            match admission {
+                RouteAdmissionState::Opened => RouteStateWire::Ready,
+                RouteAdmissionState::CommittedPending | RouteAdmissionState::Closed => {
+                    RouteStateWire::Closed
+                }
             }
         },
-        state_reason: match admission {
-            RouteAdmissionState::Opened | RouteAdmissionState::CommittedPending => {
-                RouteStateReasonWire::RegisterCommitted
+        state_reason: if host_admission_closed {
+            RouteStateReasonWire::Shutdown
+        } else {
+            match admission {
+                RouteAdmissionState::Opened | RouteAdmissionState::CommittedPending => {
+                    RouteStateReasonWire::RegisterCommitted
+                }
+                RouteAdmissionState::Closed => RouteStateReasonWire::ExplicitUnregister,
             }
-            RouteAdmissionState::Closed if server.business_admission_closed() => {
-                RouteStateReasonWire::Shutdown
-            }
-            RouteAdmissionState::Closed => RouteStateReasonWire::ExplicitUnregister,
         },
     }
 }
