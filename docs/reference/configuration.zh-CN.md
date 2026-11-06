@@ -94,6 +94,7 @@ Core 在首次 Host 启动尝试时冻结服务配置，失败也保持冻结；
 | `chunk_gc_interval` | `C2_IPC_CHUNK_GC_INTERVAL` | 5 秒 | 分片垃圾回收扫描的间隔秒数 |
 | `max_reassembly_bytes` | `C2_IPC_MAX_REASSEMBLY_BYTES` | 8 GiB | 重组缓冲内存的最大字节数 |
 | `write_timeout` | `C2_IPC_WRITE_TIMEOUT` | 30 秒 | 写一帧允许的秒数，超时就停用这条连接 |
+| `client_idle_timeout` | `C2_IPC_CLIENT_IDLE_TIMEOUT` | 60 秒 | Runtime 缓存的客户端连接不再被引用之后保留的秒数，到时在后台驱逐；`0` 关闭定时驱逐 |
 | `max_dedicated_segments` | `C2_IPC_MAX_DEDICATED_SEGMENTS` | 4 | 一个池同时保有的独立 SHM 段数，最多 65536 |
 | `spill_threshold` | `C2_IPC_SPILL_THRESHOLD` | 0.8 | 新建 SHM backing 可占到的可用内存比例，取 0 到 1；1 表示不检查 |
 

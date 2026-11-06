@@ -28,6 +28,7 @@ See the [unreleased notes](docs/releases/unreleased.md).
 ### Added
 
 - `ipc_overrides` keys `write_timeout`, `max_dedicated_segments` and `spill_threshold`, with their `C2_IPC_*` environment variables.
+- `ipc_overrides` key `client_idle_timeout` (`C2_IPC_CLIENT_IDLE_TIMEOUT`, 60 seconds by default, `0` disables timed eviction). A Runtime now evicts a cached client connection that nothing references once this time has passed, in the background; before, such a connection stayed open until the next connect found it expired.
 - Error code `CallCancelled` (718) for a server stream whose cancellation has finished. The IPC transport carries server-stream items, grants and cancellation.
 - Server streams for Rust resources and clients over direct IPC: generated `ResponseStream` methods and `Service` iterators, cancellation on drop, `close()` with a 30-second default, and shutdown or unregistration ending open streams between steps with `CallCancelled`. Every stream holds a `max_outstanding_calls` slot until its real terminal.
 - Server streams for Python resources and clients: `@cc.stream`, `cc.Stream` with `close(timeout=30.0)`, held items, same-process object streams and generated Python stream methods; Python and Rust stream to each other over direct IPC.

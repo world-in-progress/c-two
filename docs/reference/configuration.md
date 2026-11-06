@@ -94,6 +94,7 @@ Set the following fields through the appropriate endpoint's `ipc_overrides`. All
 | `chunk_gc_interval` | `C2_IPC_CHUNK_GC_INTERVAL` | 5 seconds | Chunk garbage-collection sweep interval in seconds |
 | `max_reassembly_bytes` | `C2_IPC_MAX_REASSEMBLY_BYTES` | 8 GiB | Maximum reassembly buffer memory in bytes |
 | `write_timeout` | `C2_IPC_WRITE_TIMEOUT` | 30 seconds | Seconds one frame write may take before its connection is deactivated |
+| `client_idle_timeout` | `C2_IPC_CLIENT_IDLE_TIMEOUT` | 60 seconds | Seconds a Runtime keeps a cached client connection that nothing references before it evicts the connection in the background; `0` disables timed eviction |
 | `max_dedicated_segments` | `C2_IPC_MAX_DEDICATED_SEGMENTS` | 4 | Dedicated SHM segments one pool keeps at once, up to 65536 |
 | `spill_threshold` | `C2_IPC_SPILL_THRESHOLD` | 0.8 | Fraction of observed available memory that new SHM backing may reach, from 0 to 1; 1 disables the check |
 

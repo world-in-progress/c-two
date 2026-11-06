@@ -375,6 +375,17 @@ The defect surfaced as a Windows x64 failure of `test_call_unknown_route_404` in
 
 New tests cover the OPEN layout with both modes for whole values and first chunks, unknown mode and CANCEL cause values, mismatched OPENs in both directions on a real IPC connection, including a chunked SHM OPEN whose later chunks are discarded and whose loans are returned, and both HTTP cases over real TCP, where the resource does not run and the same upstream connection serves the next call. On macOS with the FastDB sibling, the Rust Core workspace (1913 tests), c3, the Rust SDK, the CI Python gates (1455 ordinary tests, including the relay tests, 25 portable and 14 TypeScript) and the repository checks (977) passed on the integrated tree. The exact candidate `a55219ee` passed [run 42160416841](https://github.com/Dsssyc/c-two/actions/runs/42160416841) on every lane at the first attempt: Linux x64 with Python 3.12 and 3.14t, macOS arm64, and Windows x64 and ARM64.
 
+## Client idle timeout
+
+### Behavior
+
+- A Runtime's cache of IPC client connections takes its retention time from the new IPC override `client_idle_timeout` (`C2_IPC_CLIENT_IDLE_TIMEOUT`), 60 seconds by default; `0` disables timed eviction. It was fixed at 60 seconds, while the relay's upstream `idle_timeout` was already configurable.
+- A connection that nothing has referenced for that long is now evicted in the background. Before, an expired connection was dropped only when a later connect looked it up, so a process that stopped calling kept its idle connections open. Eviction deactivates the connection as before: calls already sent still finish, and the next call connects again.
+
+### Validation
+
+New tests cover parsing and boundary validation of the setting, real eviction after a short timeout with reuse before it and no eviction at `0`, and the Python and Rust SDK projections. On macOS with the FastDB sibling, c2-config, c2-ipc and c2-core (624 tests), the Rust SDK (38) and the Python configuration tests together with the existing idle cleanup test (114) passed on the integrated tree.
+
 ## Connection close on Windows
 
 ### Fixed
