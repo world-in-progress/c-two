@@ -373,7 +373,7 @@ The defect surfaced as a Windows x64 failure of `test_call_unknown_route_404` in
 
 ### Validation
 
-New tests cover the OPEN layout with both modes for whole values and first chunks, unknown mode and CANCEL cause values, mismatched OPENs in both directions on a real IPC connection, including a chunked SHM OPEN whose later chunks are discarded and whose loans are returned, and both HTTP cases over real TCP, where the resource does not run and the same upstream connection serves the next call. On macOS with the FastDB sibling, the Rust Core workspace (1913 tests), c3, the Rust SDK, the CI Python gates (1455 ordinary tests, including the relay tests, 25 portable and 14 TypeScript) and the repository checks (977) passed on the integrated tree.
+New tests cover the OPEN layout with both modes for whole values and first chunks, unknown mode and CANCEL cause values, mismatched OPENs in both directions on a real IPC connection, including a chunked SHM OPEN whose later chunks are discarded and whose loans are returned, and both HTTP cases over real TCP, where the resource does not run and the same upstream connection serves the next call. On macOS with the FastDB sibling, the Rust Core workspace (1913 tests), c3, the Rust SDK, the CI Python gates (1455 ordinary tests, including the relay tests, 25 portable and 14 TypeScript) and the repository checks (977) passed on the integrated tree. The exact candidate `a55219ee` passed [run 42160416841](https://github.com/Dsssyc/c-two/actions/runs/42160416841) on every lane at the first attempt: Linux x64 with Python 3.12 and 3.14t, macOS arm64, and Windows x64 and ARM64.
 
 ## Connection close on Windows
 
