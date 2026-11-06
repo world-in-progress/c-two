@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import gc
 import os
+import weakref
 import multiprocessing
+from pathlib import Path
+import tempfile
 import threading
 import time
 import uuid
@@ -11,9 +15,11 @@ from itertools import product
 import pytest
 
 import c_two as cc
+import c_two.endpoint
 from c_two import error
 from fastdb4py.payload import Payload, PayloadError
 from tests.fixtures.stream_python import (
+    BLOB_SPEC,
     StreamPayloads,
     StreamValues,
     ValuesResource,
@@ -23,7 +29,10 @@ from tests.fixtures.stream_python import (
 from tests.fixtures.stream_matrix import (
     Portable as MatrixPortable,
     PythonHost as MatrixPythonHost,
+    PythonHostProcess,
     RustHarness,
+    TRANSPORT_CASES,
+    assert_transport_stats,
     build_payload as matrix_payload,
     inspect as inspect_matrix_payload,
 )
@@ -257,6 +266,302 @@ def test_yielded_stream_does_not_occupy_route_worker_or_block_unary(direct_value
         for stream in streams:
             assert stream.close(timeout=None)["completed"]
     assert client.call_execution_snapshot()["used_operations"] == 0
+
+
+def test_direct_ipc_stopped_consumer_has_one_queued_and_one_authorized_item(monkeypatch, tmp_path):
+    """Section 9, clarified delivery boundary: taking k items permits k + 2 steps."""
+    monkeypatch.delenv("C2_RELAY_ANCHOR_ADDRESS", raising=False)
+
+    @cc.crm(namespace="test.stream.stopped-consumer", version="0.1.0")
+    class Progress:
+        @cc.stream
+        @cc.transfer(input=BLOB_SPEC, output=BLOB_SPEC)
+        def steps(self, payload: Payload) -> Iterator[Payload]: ...
+
+        @cc.read
+        def ping(self) -> None: ...
+
+    taken = 1
+    queued_step = threading.Event()
+    release_queued_step = threading.Event()
+    authorized_step = threading.Event()
+    release_authorized_step = threading.Event()
+    forbidden_step = threading.Event()
+    cleaned = threading.Event()
+    steps: list[int] = []
+    outputs = [blob_payload(b"x" * size) for size in (16_384, 32_768, 262_144)]
+    lengths = [len(output.binary_bytes()) for output in outputs]
+    source = blob_payload(b"input")
+
+    class Resource:
+        def ping(self) -> None:
+            return None
+
+        def steps(self, payload: Payload) -> Iterator[Payload]:
+            try:
+                for index in range(100):
+                    steps.append(index)
+                    if index == taken:
+                        queued_step.set()
+                        assert release_queued_step.wait(5)
+                    if index == taken + 1:
+                        authorized_step.set()
+                        assert release_authorized_step.wait(5)
+                    if index == taken + 2:
+                        forbidden_step.set()
+                    yield outputs[min(index, 2)]
+            finally:
+                cleaned.set()
+
+    server, client = cc.Runtime(), cc.Runtime()
+    if os.name != "nt":
+        server.set_local_endpoint(root=str(tmp_path))
+        client.set_local_endpoint(root=str(tmp_path))
+    server.set_transport_policy(shm_threshold=1024)
+    server.set_server(ipc_overrides={"pool_enabled": False, "spill_threshold": 1.0})
+    proxy = stream = None
+    try:
+        server.register(Progress, Resource(), name="stopped-consumer")
+        proxy = client.connect(Progress, name="stopped-consumer", address=server.server_address())
+        assert proxy.client.observed_path == "direct_ipc"
+        stream = proxy.steps(source)
+        first = next(stream)
+        assert blob_bytes(first) == b"x" * 16_384
+        first.close()
+        assert queued_step.wait(5)
+        release_queued_step.set()
+        assert authorized_step.wait(5)
+        # Starting step k+2 proves item k+1 entered the capacity-one consumer
+        # interface. The third step is still blocked inside the resource.
+        assert client.memory_stats()["payload_buffer"]["used_bytes"] == lengths[1]
+        assert steps == list(range(taken + 2))
+        assert server.memory_stats()["server"]["cells"]["shm"]["peak_bytes"] < lengths[2]
+        release_authorized_step.set()
+        deadline = time.monotonic() + 5
+        while True:
+            shm = server.memory_stats()["server"]["cells"]["shm"]
+            buffered = client.memory_stats()["payload_buffer"]["used_bytes"]
+            if shm["peak_bytes"] >= lengths[2] and shm["used_bytes"] == 0 and buffered == sum(lengths[1:]):
+                break
+            assert time.monotonic() < deadline, "authorized item was not copied and released"
+            proxy.ping()
+        # The larger SHM allocation has been copied and its loan released;
+        # this is a receive-completion barrier, not just ITEM_BEGIN admission.
+        # Item k+1 stays queued, item k+2 waits for that delivery slot, and
+        # neither consumption nor a grant for step k+3 has occurred.
+        proxy.ping()
+        assert not forbidden_step.is_set()
+        receipt = stream.close(timeout=None)
+        assert receipt["completed"]
+        assert isinstance(receipt["error"], error.CallCancelled)
+        assert cleaned.is_set()
+        assert steps == list(range(taken + 2))
+        assert not forbidden_step.is_set()
+        assert client.call_execution_snapshot()["used_operations"] == 0
+        stream = None  # Drop the unread item already delivered to this handle.
+        deadline = time.monotonic() + 5
+        while client.memory_stats()["payload_buffer"]["used_bytes"]:
+            assert time.monotonic() < deadline
+            proxy.ping()
+    finally:
+        release_queued_step.set()
+        release_authorized_step.set()
+        if stream is not None:
+            stream.close(timeout=0)
+        source.close()
+        if proxy is not None:
+            cc.close(proxy)
+        assert client.shutdown(timeout=5)["completed"]
+        assert server.shutdown(timeout=5)["completed"]
+        for output in outputs:
+            output.close()
+
+
+@pytest.mark.parametrize("abandon", ["with", "gc"])
+def test_direct_ipc_implicit_cancel_does_not_wait_for_step_or_cleanup(monkeypatch, tmp_path, abandon):
+    """Section 9: with exit and last-handle GC submit CANCEL without waiting."""
+    monkeypatch.delenv("C2_RELAY_ANCHOR_ADDRESS", raising=False)
+    server, client = cc.Runtime(), cc.Runtime()
+    if os.name != "nt":
+        server.set_local_endpoint(root=str(tmp_path))
+        client.set_local_endpoint(root=str(tmp_path))
+    cleaned = threading.Event()
+
+    class InfiniteValues(ValuesResource):
+        def gated(self) -> Iterator[int]:
+            try:
+                yield 0
+                self.step_entered.set()
+                assert self.release_step.wait(5)
+                while True:
+                    yield 1
+            finally:
+                self.cleanup_entered.set()
+                assert self.release_cleanup.wait(5)
+                cleaned.set()
+
+    resource = InfiniteValues()
+    proxy = None
+    owners = []
+    abandoned = threading.Event()
+    failures: list[BaseException] = []
+
+    def discard() -> None:
+        try:
+            owned = owners.pop()
+            if abandon == "with":
+                with owned:
+                    pass
+                owners.append(owned)
+            else:
+                del owned
+                gc.collect()
+        except BaseException as exc:
+            failures.append(exc)
+        finally:
+            abandoned.set()
+
+    thread = threading.Thread(target=discard, daemon=True)
+    try:
+        server.register(StreamValues, resource, name="implicit-cancel")
+        proxy = client.connect(StreamValues, name="implicit-cancel", address=server.server_address())
+        assert proxy.client.observed_path == "direct_ipc"
+        owners.append(proxy.gated())
+        reference = weakref.ref(owners[0])
+        assert next(owners[0]) == 0
+        assert resource.step_entered.wait(5)
+        thread.start()
+        assert abandoned.wait(5), "implicit cancellation waited for the running resource step"
+        thread.join(5)
+        assert not thread.is_alive() and not failures
+        if abandon == "gc":
+            assert reference() is None
+        assert not cleaned.is_set()
+        assert client.call_execution_snapshot()["used_operations"] == 1
+        resource.release_step.set()
+        assert resource.cleanup_entered.wait(5), "infinite stream did not receive CANCEL"
+        assert client.call_execution_snapshot()["used_operations"] == 1
+        assert not cleaned.is_set()
+        if owners:
+            assert owners[0].close(timeout=0)["completed"] is False
+        resource.release_cleanup.set()
+        assert cleaned.wait(5)
+        if owners:
+            receipt = owners[0].close(timeout=None)
+            assert receipt["completed"] and isinstance(receipt["error"], error.CallCancelled)
+        deadline = time.monotonic() + 5
+        while client.call_execution_snapshot()["used_operations"]:
+            assert time.monotonic() < deadline
+            proxy.ping()
+        assert client.memory_stats()["payload_buffer"]["used_bytes"] == 0
+    finally:
+        resource.release_step.set()
+        resource.release_cleanup.set()
+        for stream in owners:
+            stream.close(timeout=0)
+        if thread.ident is not None:
+            thread.join(5)
+        if proxy is not None:
+            cc.close(proxy)
+        assert client.shutdown(timeout=5)["completed"]
+        assert server.shutdown(timeout=5)["completed"]
+
+
+def test_direct_ipc_multiple_holds_deadline_and_cancel_cross_full_budget(monkeypatch, tmp_path):
+    """Section 9: full B waits for hold release or deadline; CANCEL/terminal bypass B."""
+    monkeypatch.delenv("C2_RELAY_ANCHOR_ADDRESS", raising=False)
+    server, client = cc.Runtime(), cc.Runtime()
+    if os.name != "nt":
+        server.set_local_endpoint(root=str(tmp_path))
+        client.set_local_endpoint(root=str(tmp_path))
+    output = blob_payload(b"b" * 20_000)
+    source = blob_payload(b"input")
+    encoded_len = len(output.binary_bytes())
+    client.set_call_execution_limits(payload_buffer_budget_bytes=2 * encoded_len)
+    waiting_item = threading.Event()
+    waiting_again = threading.Event()
+    cleaned = threading.Event()
+
+    class Resource:
+        def steps(self, payload: Payload) -> Iterator[Payload]:
+            try:
+                for index in range(100):
+                    if index == 2:
+                        waiting_item.set()
+                    if index == 3:
+                        waiting_again.set()
+                    yield output
+            finally:
+                cleaned.set()
+
+    proxy = view = stream = None
+    holds = []
+    delivered = {}
+    started = threading.Event()
+    finished = threading.Event()
+
+    def take_waiting_item():
+        started.set()
+        try:
+            delivered["value"] = next(stream)
+        except BaseException as exc:
+            delivered["error"] = exc
+        finally:
+            finished.set()
+
+    thread = threading.Thread(target=take_waiting_item, daemon=True)
+    try:
+        server.register(StreamPayloads, Resource(), name="deadline-holds")
+        proxy = client.connect(StreamPayloads, name="deadline-holds", address=server.server_address())
+        assert proxy.client.observed_path == "direct_ipc"
+        view = cc.with_call_options(proxy, timeout=2)
+        stream = cc.hold(view.steps)(source)
+        holds.extend((next(stream), next(stream)))
+        assert waiting_item.wait(5)
+        budget = client.memory_stats()["payload_buffer"]
+        assert budget["used_bytes"] == budget["limit_bytes"] == 2 * encoded_len
+        assert client.memory_stats()["holds"]["active_holds"] == 2
+        thread.start()
+        assert started.wait(5)
+        assert not finished.is_set(), "next crossed B while both holds still owned it"
+        holds.pop(0).release()
+        thread.join(5)
+        assert not thread.is_alive() and "error" not in delivered
+        holds.append(delivered["value"])
+        assert waiting_again.wait(5)
+        assert client.memory_stats()["holds"]["active_holds"] == 2
+        assert client.memory_stats()["payload_buffer"]["used_bytes"] == 2 * encoded_len
+        with pytest.raises(error.CallDeadlineExceeded) as raised:
+            next(stream)
+        assert raised.value.transport_phase == "dispatch_uncertain"
+        assert not cleaned.is_set(), "caller deadline cancelled the resource"
+        assert client.call_execution_snapshot()["used_operations"] == 1
+        assert client.memory_stats()["payload_buffer"]["rejected_allocations"] == 0
+        receipt = stream.close(timeout=5)
+        assert receipt["completed"] and isinstance(receipt["error"], error.CallCancelled)
+        assert cleaned.is_set()
+        assert client.call_execution_snapshot()["used_operations"] == 0
+        assert client.memory_stats()["payload_buffer"]["used_bytes"] == 2 * encoded_len
+        for held in holds:
+            assert blob_bytes(held.value) == b"b" * 20_000
+            held.release()
+        assert client.memory_stats()["holds"]["active_holds"] == 0
+        assert client.memory_stats()["payload_buffer"]["used_bytes"] == 0
+    finally:
+        for held in holds:
+            held.release()
+        if stream is not None:
+            stream.close(timeout=0)
+        if thread.ident is not None:
+            thread.join(5)
+        source.close()
+        output.close()
+        if view is not None:
+            cc.close(view)
+        if proxy is not None:
+            cc.close(proxy)
+        assert client.shutdown(timeout=5)["completed"]
+        assert server.shutdown(timeout=5)["completed"]
 
 
 @pytest.mark.parametrize("end", ["shutdown", "unregister"])
@@ -583,89 +888,221 @@ def rust_stream_harness(tmp_path_factory):
     return RustHarness.prepare(tmp_path_factory.mktemp("c-two-stream-matrix"))
 
 
+@pytest.fixture
+def private_stream_ipc_root():
+    """Contain abrupt listener exits; Windows pipes/leases are kernel-owned."""
+    with tempfile.TemporaryDirectory(
+        prefix="c2-stream-", dir="/tmp" if os.name != "nt" else None,
+    ) as directory:
+        root = Path(directory)
+        yield root
+        if os.name != "nt":
+            # Test teardown has waited for each child and completed Runtime
+            # shutdown. Reap only this private namespace, never the default.
+            with cc.endpoint.sweep_endpoints(root=str(root)) as sweep:
+                while True:
+                    batch = sweep.next_batch()
+                    assert not batch["round_interrupted"], batch
+                    assert not batch["io_errors"], batch
+                    if batch["round_complete"]:
+                        break
+        assert not list(root.rglob("*.lease"))
+        assert not any(path.is_socket() for path in root.rglob("*"))
+    assert not root.exists()
+
+
+@pytest.mark.timeout(300)
+@pytest.mark.parametrize("host_language", ["python", "rust"])
+def test_direct_ipc_peer_process_end_preserves_item_and_never_replays(
+    rust_stream_harness, private_stream_ipc_root, monkeypatch, host_language,
+):
+    """Section 9: real peer end is dispatch-uncertain, keeps delivered holds and never replays."""
+    monkeypatch.delenv("C2_RELAY_ANCHOR_ADDRESS", raising=False)
+    route = f"stream-peer-end-{uuid.uuid4().hex[:12]}"
+    address = f"ipc://c2_stream_peer_end_{os.getpid()}_{uuid.uuid4().hex[:12]}"
+    transport = next(case for case in TRANSPORT_CASES if case.name == "shm")
+    client = cc.Runtime()
+    if os.name != "nt":
+        client.set_local_endpoint(root=str(private_stream_ipc_root))
+    client.set_transport_policy(shm_threshold=64 * 1024)
+    client.set_client(ipc_overrides=transport.overrides())
+    host = proxy = source = stream = held = None
+    try:
+        if host_language == "python":
+            host = PythonHostProcess(address, route, private_stream_ipc_root, transport.overrides())
+        else:
+            host = rust_stream_harness.host(
+                address, route, True, True,
+                ipc_overrides=transport.overrides(), gated=True, ipc_root=private_stream_ipc_root,
+            )
+        if os.name != "nt":
+            context = cc.endpoint.local_endpoint_context(root=str(private_stream_ipc_root))
+            endpoint = Path(context.endpoint_name(address))
+            assert endpoint.is_socket()
+            assert endpoint.with_suffix(".lease").is_file()
+        proxy = client.connect(MatrixPortable, name=route, address=address)
+        assert proxy.client.observed_path == "direct_ipc"
+        source = matrix_payload(True)
+        stream = cc.hold(proxy.echo)(source)
+        held = next(stream)
+        owner = held.value
+        inspect_matrix_payload(owner, True)
+        host.wait_blocked()
+        # kill()/Process.kill() ends the native peer on Windows and POSIX;
+        # no signal suspension or platform-specific substitute is involved.
+        remaining = host.abort()
+        if host_language == "rust":
+            assert host.process.returncode != 0
+            assert "CALL calls=" not in remaining, "resource was entered again"
+        else:
+            assert host.process.exitcode != 0
+            assert host.calls.value == 1
+        inspect_matrix_payload(owner, True)
+        assert client.memory_stats()["holds"]["active_holds"] == 1
+        with pytest.raises(error.CCBaseError) as raised:
+            next(stream)
+        assert raised.value.transport_phase == "dispatch_uncertain"
+        receipt = stream.close(timeout=5)
+        assert receipt["completed"]
+        assert receipt["complete_items"] is None
+        assert receipt["error"].transport_phase == "dispatch_uncertain"
+        assert client.call_execution_snapshot()["used_operations"] == 0
+        inspect_matrix_payload(owner, True)
+        held.release()
+        with pytest.raises(PayloadError) as released:
+            owner.entry_view(0)
+        assert released.value.symbol == "VIEW_INVALIDATED"
+        stats = client.memory_stats()
+        assert stats["holds"]["active_holds"] == 0
+        assert stats["holds"]["total_held_bytes"] == 0
+        assert stats["payload_buffer"]["used_bytes"] == 0
+        for kind in ("shm", "file", "reassembly"):
+            assert stats["runtime_outgoing"]["cells"][kind]["used_bytes"] == 0
+    finally:
+        if host is not None:
+            host.abort()
+        if held is not None:
+            held.release()
+        if stream is not None:
+            stream.close(timeout=0)
+        if source is not None:
+            source.close()
+        if proxy is not None:
+            cc.close(proxy)
+        assert client.shutdown(timeout=5)["completed"]
+
+
+# Carrier choices depend on both language adapters; retaining an item must refund
+# the same carriers. Five distinct profiles avoid the old redundant size/threshold
+# combinations while checking every adapter and consumption mode (40 rows).
 _MATRIX_ROWS = list(product(
-    ("python", "rust"),  # host
-    ("python", "rust"),  # client
+    ("python", "rust"),
+    ("python", "rust"),
     ("materialized", "hold"),
-    (False, True),  # SHM disabled/enabled
-    (False, True),  # inline/large
+    TRANSPORT_CASES,
 ))
 
 
 @pytest.mark.timeout(300)
 @pytest.mark.parametrize(
-    ("host_language", "client_language", "mode", "shm", "large"),
+    ("host_language", "client_language", "mode", "transport"),
     _MATRIX_ROWS,
-    ids=["-".join((host, client, mode, "shm" if shm else "no-shm", "large" if large else "inline"))
-         for host, client, mode, shm, large in _MATRIX_ROWS],
+    ids=["-".join((host, client, mode, case.name))
+         for host, client, mode, case in _MATRIX_ROWS],
 )
 def test_python_rust_direct_ipc_stream_matrix(
-    rust_stream_harness, monkeypatch,
-    host_language, client_language, mode, shm, large,
+    rust_stream_harness, private_stream_ipc_root, monkeypatch,
+    host_language, client_language, mode, transport,
 ):
+    """Section 9: both carrier directions and retained owners in all four languages pairs."""
     monkeypatch.delenv("C2_RELAY_ANCHOR_ADDRESS", raising=False)
     route = f"stream-matrix-{uuid.uuid4().hex[:12]}"
     address = f"ipc://c2_stream_matrix_{os.getpid()}_{uuid.uuid4().hex[:12]}"
-    threshold = 64 * 1024 if shm else 1 << 30
-    server = None
-    rust_host = None
-    resource = None
-    client = None
-    proxy = None
-    source = None
+    threshold = 64 * 1024 if transport.prefer_shm else 1 << 30
+    overrides = transport.overrides()
+    server = rust_host = resource = client = proxy = source = stream = None
     try:
         if host_language == "python":
             server = cc.Runtime()
+            if os.name != "nt":
+                server.set_local_endpoint(root=str(private_stream_ipc_root))
             server.set_transport_policy(shm_threshold=threshold)
-            server.set_server(server_id=address.removeprefix("ipc://"))
-            resource = MatrixPythonHost(large)
+            server.set_server(
+                server_id=address.removeprefix("ipc://"), ipc_overrides=overrides,
+            )
+            resource = MatrixPythonHost(transport.large)
+            resource.observe_input = lambda: server.memory_stats()["server"]
             server.register(MatrixPortable, resource, name=route)
             assert server.server_address() == address
         else:
-            rust_host = rust_stream_harness.host(address, route, shm, large)
+            rust_host = rust_stream_harness.host(
+                address, route, transport.prefer_shm, transport.large,
+                ipc_overrides=overrides, ipc_root=private_stream_ipc_root,
+            )
 
         if client_language == "rust":
-            rust_stream_harness.client(address, route, shm, large, mode == "hold")
+            receipt = rust_stream_harness.client(
+                address, route, transport.prefer_shm, transport.large, mode == "hold",
+                ipc_overrides=overrides, ipc_root=private_stream_ipc_root,
+            )
+            client_stats = receipt["memory"]
+            encoded_len = receipt["encoded_len"]
         else:
             client = cc.Runtime()
+            if os.name != "nt":
+                client.set_local_endpoint(root=str(private_stream_ipc_root))
             client.set_transport_policy(shm_threshold=threshold)
+            client.set_client(ipc_overrides=overrides)
             proxy = client.connect(MatrixPortable, name=route, address=address)
             assert proxy.client.observed_path == "direct_ipc"
-            source = matrix_payload(large)
-            stream = (
-                cc.hold(proxy.echo)(source) if mode == "hold" else proxy.echo(source)
-            )
+            source = matrix_payload(transport.large)
+            encoded_len = len(source.binary_bytes())
+            stream = cc.hold(proxy.echo)(source) if mode == "hold" else proxy.echo(source)
             for _ in range(2):
                 item = next(stream)
                 if mode == "hold":
                     assert isinstance(item, cc.HeldResult)
+                    assert len(item.unsafe_buffer) == encoded_len
                     retained = item.value
-                    inspect_matrix_payload(retained, large)
+                    inspect_matrix_payload(retained, transport.large)
                     item.release()
                     with pytest.raises(PayloadError) as released:
                         retained.entry_view(0)
                     assert released.value.symbol == "VIEW_INVALIDATED"
                 else:
-                    inspect_matrix_payload(item, large)
+                    assert len(item.binary_bytes()) == encoded_len
+                    inspect_matrix_payload(item, transport.large)
                     item.close()
             with pytest.raises(StopIteration):
                 next(stream)
             assert stream.close() == {
                 "completed": True, "error": None, "complete_items": 2,
             }
-            assert client.memory_stats()["holds"]["active_holds"] == 0
+            # This same-connection round trip follows the queued input/item
+            # RELEASE records, so backing refunds are observed without a sleep.
+            proxy.ping()
+            client_stats = client.memory_stats()
+            assert client_stats["holds"]["active_holds"] == 0
+            assert client_stats["holds"]["total_held_bytes"] == 0
             assert client.call_execution_snapshot()["used_operations"] == 0
-            outgoing = client.memory_stats()["runtime_outgoing"]["cells"]
-            assert outgoing["reassembly"]["used_bytes"] == 0
-            if large and shm:
-                assert outgoing["shm"]["peak_bytes"] > 0
 
         if resource is not None:
             assert resource.calls == 1
+            input_stats = resource.input_stats
+            server_stats = server.memory_stats()
+        else:
+            receipt = rust_host.stats()
+            input_stats = receipt["input"]
+            server_stats = receipt["memory"]
+        assert_transport_stats(transport, encoded_len, input_stats, server_stats, client_stats)
         if rust_host is not None:
             rust_host.stop()
             rust_host = None
     finally:
+        if rust_host is not None:
+            rust_host.abort()
+        if stream is not None:
+            stream.close(timeout=0)
         if source is not None:
             source.close()
         if proxy is not None:
@@ -676,5 +1113,3 @@ def test_python_rust_direct_ipc_stream_matrix(
             resource.close()
         if server is not None:
             assert server.shutdown(timeout=5)["completed"]
-        if rust_host is not None:
-            rust_host.abort()
