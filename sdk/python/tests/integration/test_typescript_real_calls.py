@@ -163,6 +163,8 @@ class TypeScriptArtifacts:
             )
         candidate_packages = all(configured_packages)
         if not candidate_packages:
+            from tests.fixtures.typescript_project import require_c2_mem_node_build
+            require_c2_mem_node_build(REPOSITORY)
             assert _git(FASTDB_REPOSITORY, "rev-parse", "HEAD") == FASTDB_COMMIT
             assert _git(FASTDB_REPOSITORY, "status", "--porcelain") == ""
             # MatrixArtifacts.prepare resolves the CLI through the shared helper,

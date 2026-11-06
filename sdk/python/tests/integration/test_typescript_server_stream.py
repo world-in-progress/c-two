@@ -17,7 +17,7 @@ from tests.fixtures.stream_matrix import (
     CHUNK_SIZE, TRANSPORT_CASES, Portable, PythonHost, RustHarness,
     build_payload, inspect, process_environment,
 )
-from tests.fixtures.typescript_project import write_node_tsconfig
+from tests.fixtures.typescript_project import require_c2_mem_node_build, require_fastdb_node_build, write_node_tsconfig
 
 REPOSITORY = Path(__file__).resolve().parents[4]
 NODE_FIXTURE = REPOSITORY / "sdk/python/tests/fixtures/typescript_server_stream.mjs"
@@ -47,6 +47,8 @@ def node_stream_project(tmp_path_factory):
         archives = [str(Path(path).resolve()) for path in supplied if path]
     else:
         fastdb = REPOSITORY.parent / "fastdb/ts/fastdb4ts"
+        require_c2_mem_node_build(REPOSITORY)
+        require_fastdb_node_build(fastdb)
         dependencies = (
             fastdb,
             REPOSITORY / "core/foundation/c2-mem-ffi/bindings/typescript",
@@ -55,8 +57,6 @@ def node_stream_project(tmp_path_factory):
         archives = []
         for index, source in enumerate(dependencies):
             assert (source / "package.json").is_file(), f"Node dependency missing: {source}"
-            if index < 2:
-                assert (source / "dist/index.js").is_file(), f"build Node dependency before this suite: {source}"
             packed = root / "packages" / str(index)
             packed.mkdir(parents=True)
             _checked(["npm", "pack", str(source), "--offline", "--ignore-scripts",

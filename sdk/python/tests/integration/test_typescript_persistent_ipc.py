@@ -20,7 +20,7 @@ import pytest
 from tests.fixtures import local_server
 
 import c_two as cc
-from tests.fixtures.typescript_project import write_node_tsconfig
+from tests.fixtures.typescript_project import require_c2_mem_node_build, require_fastdb_node_build, write_node_tsconfig
 
 import c_two.endpoint
 
@@ -98,6 +98,8 @@ def persistent_node_project(tmp_path_factory: pytest.TempPathFactory) -> Iterato
         assert all(Path(archive).is_file() for archive in archives), "supplied TS package tarball missing"
     else:
         fastdb = REPOSITORY.parent / "fastdb/ts/fastdb4ts"
+        require_c2_mem_node_build(REPOSITORY)
+        require_fastdb_node_build(fastdb)
         dependencies = {
             "fastdb4ts": fastdb,
             "typescript": fastdb / "node_modules/typescript",
@@ -106,8 +108,6 @@ def persistent_node_project(tmp_path_factory: pytest.TempPathFactory) -> Iterato
         archives = []
         for index, (name, source) in enumerate(dependencies.items()):
             assert (source / "package.json").is_file(), f"prebuilt Node dependency missing: {source}"
-            if name != "typescript":
-                assert (source / "dist/index.js").is_file(), f"build the Node dependency before this suite: {source}"
             destination = root / "packages" / str(index)
             destination.mkdir(parents=True)
             # Consume the same packaged layout as candidate mode. Do not run

@@ -198,8 +198,9 @@ def test_aggregate_deadline_bounds_children_and_retains_failure_evidence(tmp_pat
     assert "deadline exhausted" in evidence["steps"][1]["reason"]
 
 
-def test_full_scope_preserves_coverage_and_reuses_prepared_outputs():
+def test_full_scope_preserves_coverage_and_reuses_prepared_outputs(monkeypatch):
     runner = _runner()
+    monkeypatch.setattr(runner.platform, "machine", lambda: "x86_64")
     inventories = {}
     for platform_name in ("linux", "macos", "windows"):
         gates = runner.gates(sys.executable, Path("evidence"), runner.FULL_SCOPE, target_platform=platform_name)
@@ -231,11 +232,12 @@ def test_full_scope_preserves_coverage_and_reuses_prepared_outputs():
         assert "../fastdb" not in commands["fastdb-wheel-build"]
         assert "--lib" not in commands["core-test"]
         assert all(not deps for name, _, deps in gates if name in runner.INDEPENDENT_SETUP_GATES)
-    assert inventories["linux"] == inventories["macos"]
-    assert inventories["windows"] - inventories["linux"] == {
+    assert inventories["linux"] - inventories["macos"] == {"python310-build", "python310-suite"}
+    assert inventories["macos"] <= inventories["linux"]
+    assert inventories["windows"] - inventories["macos"] == {
         "windows-standard-user-consumer", "windows-pipe-identity-test",
     }
-    assert inventories["linux"] <= inventories["windows"]
+    assert inventories["macos"] <= inventories["windows"]
     local = runner.gates(sys.executable, Path("evidence"), runner.LOCAL_PLATFORM_SCOPE, target_platform="linux")
     assert [name for name, _, _ in local] == ["local-platform-tests"]
     assert "c2-core" in local[0][1] and "c2-http/relay" in local[0][1] and "--lib" not in local[0][1]
@@ -247,6 +249,32 @@ def test_full_scope_preserves_coverage_and_reuses_prepared_outputs():
     python = {name for name, _, _ in runner.gates(sys.executable, Path("evidence"), runner.PYTHON_SCOPE)}
     assert {"python-suite", "python-native-test", "python-build", "cli-artifact", "python310-install"} <= python
     assert "core-test" not in python and "python-wheel-build" not in python
+
+
+@pytest.mark.parametrize("platform_name,architecture,scope,expected", [
+    ("linux", "x86_64", "full", True), ("linux", "AMD64", "full", True),
+    ("linux", "aarch64", "full", False), ("linux", "x86_64", "python", False),
+    ("linux", "x86_64", "local-platform", False), ("macos", "x86_64", "full", False),
+    ("windows", "AMD64", "full", False),
+])
+def test_python310_runtime_gate_is_linux_x64_full_only(monkeypatch, tmp_path, platform_name, architecture, scope, expected):
+    runner = _runner()
+    monkeypatch.setattr(runner.platform, "machine", lambda: architecture)
+    selected = runner.gates(sys.executable, tmp_path, scope, target_platform=platform_name)
+    commands = {name: command for name, command, _ in selected}
+    dependencies = {name: set(required) for name, _, required in selected}
+    assert ("python310-build" in commands) is expected
+    assert ("python310-suite" in commands) is expected
+    if expected:
+        assert commands["python310-build"] == ["uv", "sync", "--locked", "--python", "3.10"]
+        assert dependencies["python310-build"] == {"python310-install"}
+        suite = commands["python310-suite"]
+        assert suite[suite.index("--python") + 1] == str(tmp_path / ".venv-py310/bin/python")
+        assert suite[suite.index("--output") + 1] == str(tmp_path / "python310-suite")
+        assert "--ordinary-only" in suite
+        assert {"python310-build", "fastdb-npm-build", "c2-mem-node-tests", "cli-artifact", "typescript-packages"} <= dependencies["python310-suite"]
+        assert 0 < runner.GATE_TIMEOUT_S.get("python310-build", runner.STEP_TIMEOUT_S) < float("inf")
+        assert 0 < runner.GATE_TIMEOUT_S["python310-suite"] < float("inf")
 
 
 @pytest.mark.parametrize("target_platform", ["linux", "macos", "windows"])
@@ -313,7 +341,7 @@ def test_gate_environment_selects_system_mode_except_for_app_gates(tmp_path):
     assert system["FASTDB_PAYLOAD_LINK_MODE"] == "system"
     assert system["FASTDB_PAYLOAD_SYSTEM_LIB_DIR"] == str(lib_dir)
     assert system["PATH"].startswith(f"{lib_dir}{runner.os.pathsep}")
-    for gate in runner.SOURCE_MODE_GATES:
+    for gate in runner.SOURCE_MODE_GATES | {"python310-build"}:
         child = runner.gate_environment(gate, base, lib_dir)
         assert child["FASTDB_PAYLOAD_LINK_MODE"] == "source", gate
         assert "FASTDB_PAYLOAD_SYSTEM_LIB_DIR" not in child, gate
@@ -667,13 +695,57 @@ def test_independent_setup_overlaps_but_consumers_wait(tmp_path, monkeypatch):
 def test_artifact_inventory_retains_proofs_without_disposable_build_trees(tmp_path):
     paths = ["cli/c3", "python-suite/run.json", "python-suite/portable-matrix-receipt.v2.json",
              "python-suite/ordinary/junit.xml", "python-suite/typescript/output.log",
-             "python-suite/portable/tmp/build/unneeded", "python-suite/typescript/tmp/node_modules/typescript/index.js"]
+             "python310-suite/ordinary/junit.xml", "python310-suite/collection/ordinary/collected-master.json",
+             "python-suite/portable/tmp/build/unneeded", "python-suite/typescript/tmp/node_modules/typescript/index.js",
+             "python310-suite/ordinary/tmp/unneeded", ".venv-py310/bin/python"]
     for name in paths:
         p = tmp_path / name
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text("evidence")
     retained = {p.relative_to(tmp_path).as_posix() for p in _runner().retained_artifacts(tmp_path)}
-    assert retained == set(paths[:5])
+    assert retained == set(paths[:7])
+
+
+@pytest.mark.parametrize("build_failed,cleanup_confirmed", [(False, True), (True, True), (False, False)])
+def test_python310_build_env_is_scoped_and_scratch_is_removed(tmp_path, monkeypatch, build_failed, cleanup_confirmed):
+    runner = _runner()
+    monkeypatch.setattr(runner, "ROOT", tmp_path)
+    monkeypatch.setattr(runner, "capture", lambda *args: {"exit_code": 0, "output": "a" * 40})
+    output = tmp_path / "output"
+    prepared = tmp_path / "lib"
+    prepared.mkdir()
+    (prepared / runner.platform_fastdb_library()).write_bytes(b"library")
+    selected = [(name, [], ()) for name in sorted(runner.SOURCE_MODE_GATES)]
+    selected += [("python310-install", [], ()), ("python310-build", [], ("python310-install",)),
+                 ("python310-suite", [], ("python310-build",))]
+    monkeypatch.setattr(runner, "gates", lambda *args: selected)
+    observed = []
+    def execute(name, command, *, environment, **kwargs):
+        observed.append(name)
+        if name == "python310-build":
+            assert environment["UV_PROJECT_ENVIRONMENT"] == str(output / ".venv-py310")
+            assert environment[runner.FASTDB_LINK_MODE_ENV] == "source"
+            assert runner.FASTDB_SYSTEM_LIB_DIR_ENV not in environment
+            (output / ".venv-py310").mkdir()
+        else:
+            assert "UV_PROJECT_ENVIRONMENT" not in environment
+        if name == "python310-suite":
+            (output / "python310-suite/ordinary/tmp").mkdir(parents=True)
+            (output / "python310-suite/run.json").write_text(json.dumps({
+                "status": "passed" if cleanup_confirmed else "failed",
+                "steps": [{"cleanup_confirmed": cleanup_confirmed, "process_exited": True}],
+            }))
+        failed = name == "python310-build" and build_failed or name == "python310-suite" and not cleanup_confirmed
+        return {"id": name, "status": "failed" if failed else "passed", "exit_code": int(failed)}
+    monkeypatch.delenv("UV_PROJECT_ENVIRONMENT", raising=False)
+    monkeypatch.setattr(runner, "run_step", execute)
+    assert runner.main([
+        "--expected-c-two-sha", "a" * 40, "--expected-fastdb-sha", "a" * 40,
+        "--output", str(output), "--fastdb-system-lib-dir", str(prepared),
+    ]) == int(build_failed or not cleanup_confirmed)
+    assert ("python310-suite" in observed) is not build_failed
+    assert (output / ".venv-py310").exists() is not cleanup_confirmed
+    assert (output / "python310-suite/ordinary/tmp").exists() is not cleanup_confirmed
 
 
 def test_wasm_build_keeps_tracked_loader_and_installs_matching_dist_pair(tmp_path, monkeypatch):

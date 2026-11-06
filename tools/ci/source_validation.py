@@ -51,7 +51,7 @@ STEP_TIMEOUT_S = 1200
 # bounded above the summed row budget (9 x 300 s) plus startup margin instead
 # of by the single-command default.
 IPC_MEMORY_STEP_TIMEOUT_S = 3600
-GATE_TIMEOUT_S = {IPC_MEMORY_GATE: IPC_MEMORY_STEP_TIMEOUT_S, "python-suite": 7200}
+GATE_TIMEOUT_S = {IPC_MEMORY_GATE: IPC_MEMORY_STEP_TIMEOUT_S, "python-suite": 7200, "python310-suite": 7200}
 # These write disjoint trees and never invoke Cargo. The FastDB Python wheel
 # can compile while Rust uses the shared target; consumers wait for its result.
 INDEPENDENT_SETUP_GATES = frozenset({
@@ -343,7 +343,7 @@ def gate_environment(
 ) -> dict[str, str]:
     if system_lib_dir is None:
         return dict(base)
-    if name in SOURCE_MODE_GATES:
+    if name in SOURCE_MODE_GATES or name == "python310-build":
         environment = source_mode_environment(base)
         if name == "python-native-test":
             environment["PYO3_PYTHON"] = str(ROOT / ".venv" / ("Scripts/python.exe" if os.name == "nt" else "bin/python"))
@@ -473,6 +473,18 @@ def gates(python: str, output: Path, scope: str = FULL_SCOPE, *, target_platform
         selected = [gate for gate in selected if gate[0] != "windows-standard-user-consumer"]
     if scope == FULL_SCOPE:
         selected.extend(windows_identity)
+        if target_platform == "linux" and platform.machine().lower() in {"x86_64", "amd64"}:
+            python310 = output / ".venv-py310" / "bin/python"
+            selected.extend([
+                ("python310-build", ["uv", "sync", "--locked", "--python", "3.10"], ("python310-install",)),
+                ("python310-suite", [python, str(ROOT / "tools/dev/test_python.py"),
+                                     "--python", str(python310), "--c3", str(retained_cli),
+                                     "--ordinary-only", "--workers", "2", "--output", str(output / "python310-suite"),
+                                     "--fastdb-package", str(output / "npm/fastdb4ts.tgz"),
+                                     "--c2-mem-package", str(output / "npm/c2-mem-ffi.tgz"),
+                                     "--typescript-package", str(output / "npm/typescript.tgz")],
+                 ("python310-build", "fastdb-npm-build", "c2-mem-node-tests", "cli-artifact", "typescript-packages")),
+            ])
     if scope == PYTHON_SCOPE:
         omitted = {"fastdb-rust-test", "core-check", "core-test", "rust-sdk-test",
                    "fastdb-wheel-build", "python-wheel-build", "wheel-consumer",
@@ -485,9 +497,11 @@ def gates(python: str, output: Path, scope: str = FULL_SCOPE, *, target_platform
 def retained_artifacts(output: Path):
     # pytest's basetemp contains disposable npm installs and compiled harness
     # trees. Keep receipts, plans, node IDs, logs and JUnit, as in the old gates.
-    scratch_parents = {"python-suite/ordinary", "python-suite/portable", "python-suite/typescript"}
+    scratch_parents = {"python-suite/ordinary", "python-suite/portable", "python-suite/typescript", "python310-suite/ordinary"}
     for directory, children, files in os.walk(output):
         parent = Path(directory)
+        if parent == output and ".venv-py310" in children:
+            children.remove(".venv-py310")
         if parent.relative_to(output).as_posix() in scratch_parents and "tmp" in children:
             children.remove("tmp")
         for filename in sorted(files):
@@ -581,7 +595,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "fastdb_sdk": {
             "system_lib_dir": str(system_lib_dir) if system_lib_dir else None,
             "expected_library": platform_fastdb_library(),
-            "source_mode_gates": sorted(SOURCE_MODE_GATES & {name for name, _, _ in selected_gates}),
+            "source_mode_gates": sorted((SOURCE_MODE_GATES | {"python310-build"}) & {name for name, _, _ in selected_gates}),
         },
         "workflow_sha": os.environ.get("C2_WORKFLOW_SHA"),
         "run_id": os.environ.get("GITHUB_RUN_ID"),
@@ -601,8 +615,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             if remaining <= 0:
                 return {"id": name, "command": list(command), "status": "not_run",
                         "reason": "aggregate validation deadline exhausted"}
+            child_environment = gate_environment(name, environment, system_lib_dir)
+            if name == "python310-build":
+                child_environment["UV_PROJECT_ENVIRONMENT"] = str(output / ".venv-py310")
             return run_step(name, command, cwd=ROOT, output=output,
-                            environment=gate_environment(name, environment, system_lib_dir),
+                            environment=child_environment,
                             timeout=min(remaining, GATE_TIMEOUT_S.get(name, STEP_TIMEOUT_S)),
                             summary=Path(environment["GITHUB_STEP_SUMMARY"])
                             if environment.get("GITHUB_STEP_SUMMARY") else None)
@@ -629,6 +646,19 @@ def main(argv: Sequence[str] | None = None) -> int:
                                     summary.write(f"\n### Failed: {name} evidence\n\n{problem}\n")
                 evidence["steps"].append(record)
                 write_evidence(output, evidence)
+                if name == "python310-suite":
+                    receipt = output / "python310-suite/run.json"
+                    cleanup_confirmed = record["status"] == "not_run"
+                    if receipt.is_file():
+                        suite = json.loads(receipt.read_text(encoding="utf-8"))
+                        cleanup_confirmed = suite["status"] in {"passed", "failed"} and all(
+                            step["cleanup_confirmed"] and step["process_exited"] for step in suite["steps"]
+                        )
+                    if cleanup_confirmed:
+                        for scratch in (output / ".venv-py310", output / "python310-suite/ordinary/tmp"):
+                            if scratch.is_dir():
+                                shutil.rmtree(scratch)
+                    record["scratch_cleanup"] = "completed" if cleanup_confirmed else "retained_unconfirmed"
     evidence["status"] = "passed" if evidence["steps"] and all(step["status"] == "passed" for step in evidence["steps"]) and "error" not in evidence else "failed"
     for artifact in retained_artifacts(output):
         if artifact.is_file():

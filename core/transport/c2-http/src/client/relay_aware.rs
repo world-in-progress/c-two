@@ -2798,7 +2798,7 @@ mod tests {
         live_handle.abort();
     }
 
-    mod block9b4 {
+    mod stream_body_failures {
         use super::*;
         use crate::stream_wire::{
             self, HttpStreamRecordKind, HttpStreamStatus, HttpStreamTerminal,
@@ -2913,7 +2913,7 @@ mod tests {
         // Requirement 9b4.4: a real reset in ITEM_DATA preserves the delivered
         // owner, refunds the partial item and slot, and is dispatch-uncertain.
         #[tokio::test]
-        async fn block9b4_body_reset_mid_record_keeps_item_and_refunds_b() {
+        async fn body_reset_mid_record_keeps_item_and_refunds_b() {
             let mut prefix = item(b"kept");
             prefix.extend_from_slice(&stream_wire::encode_item_begin(8));
             prefix.extend_from_slice(&stream_wire::encode_header(
@@ -2975,7 +2975,7 @@ mod tests {
         // obtained terminal cannot be replaced by a later EOF, even when the
         // HTTP Content-Length promises more bytes after the complete CALL_END.
         #[tokio::test]
-        async fn block9b4_complete_success_survives_short_http_body() {
+        async fn complete_success_survives_short_http_body() {
             let prefix = item(b"kept");
             let tail = stream_wire::encode_terminal(&HttpStreamTerminal {
                 status: HttpStreamStatus::Success,
@@ -3092,7 +3092,7 @@ mod tests {
         // before CALL_END. As in ipc-handshake.md's Server streams rule, a peer
         // end without CALL_END is dispatch-uncertain; earlier items stay valid.
         #[tokio::test]
-        async fn block9b4_short_content_length_mid_item_is_dispatch_uncertain() {
+        async fn short_content_length_mid_item_is_dispatch_uncertain() {
             truncated_response_is_dispatch_uncertain(true).await;
         }
 
@@ -3100,7 +3100,7 @@ mod tests {
         // so no complete terminal is available. Treat the end as peer end,
         // matching the same IPC rule, and retain the earlier complete item.
         #[tokio::test]
-        async fn block9b4_short_content_length_mid_call_end_is_dispatch_uncertain() {
+        async fn short_content_length_mid_call_end_is_dispatch_uncertain() {
             truncated_response_is_dispatch_uncertain(false).await;
         }
     }

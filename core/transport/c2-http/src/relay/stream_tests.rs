@@ -878,7 +878,7 @@ async fn slow_reader_large_items_stall_tcp_and_bound_producer_distance() {
 // Full measurement, deliberately separate from the regression above. Run:
 // CARGO_TARGET_DIR="$PWD/core/target" cargo test --manifest-path core/Cargo.toml \
 //   -p c2-http --features relay --lib \
-//   relay::block8_tests::slow_reader_records_real_tcp_stall_and_producer_distance \
+//   relay::stream_tests::slow_reader_records_real_tcp_stall_and_producer_distance \
 //   -- --exact --ignored --nocapture --test-threads=1
 // Both upstream carriers run twice for empty, 64-byte and 128-KiB items. The
 // final consumer does not read the HTTP body until the real TCP poll_write
@@ -1621,7 +1621,7 @@ async fn mismatched_http_call_modes_are_not_executed_and_keep_upstream() {
 // Requirement 9b4.1: stream payload Bytes, including a slice, keep their
 // original allocation charged after the response Body has reached CALL_END.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn block9b4_stream_body_last_bytes_reference_refunds_b() {
+async fn stream_body_last_bytes_reference_refunds_b() {
     use axum::{body::Body, http::Request};
     use futures::StreamExt;
     use tower::ServiceExt;
@@ -1687,7 +1687,7 @@ async fn block9b4_stream_body_last_bytes_reference_refunds_b() {
 // Requirement 9b4.2: a real one-hop relay reaches the public client with an
 // item larger than its B; local refusal cannot replace the resource's end.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn block9b4_relay_oversized_item_keeps_real_terminal_and_refunds_b() {
+async fn relay_oversized_item_keeps_real_terminal_and_refunds_b() {
     use crate::client::{
         HttpCallControl, HttpError, HttpStreamCancellation, RelayAwareClientConfig,
         RelayAwareHttpClient,
@@ -1763,7 +1763,7 @@ async fn block9b4_relay_oversized_item_keeps_real_terminal_and_refunds_b() {
 // its close barrier, so an extra OPEN, CALL_END or CREDIT cannot escape count.
 // LocalStream selects UDS on Unix and Named Pipes on Windows for the same proof.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn block9b4_relay_unary_upstream_has_one_open_one_call_end_no_credit() {
+async fn relay_unary_upstream_has_one_open_one_call_end_no_credit() {
     use c2_wire::rpc::RpcRecordKind;
 
     let frames = RpcFrames::default();

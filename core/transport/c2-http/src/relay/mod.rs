@@ -46,7 +46,7 @@ macro_rules! test_commit_registration {
 pub(crate) mod authority;
 pub(crate) mod background;
 #[cfg(test)]
-mod block8_tests;
+mod stream_tests;
 pub(crate) mod client_lifecycle;
 #[cfg(test)]
 mod client_lifecycle_tests;
