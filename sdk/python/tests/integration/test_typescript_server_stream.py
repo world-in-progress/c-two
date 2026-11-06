@@ -89,7 +89,11 @@ def node_stream_project(tmp_path_factory):
 
 @pytest.fixture(scope="module")
 def rust_stream_harness(tmp_path_factory):
-    return RustHarness.prepare(tmp_path_factory.mktemp("c-two-node-rust-stream"))
+    with RustHarness.prepare(
+        tmp_path_factory.mktemp("c-two-node-rust-stream"),
+        name="c-two-typescript-stream-harness",
+    ) as harness:
+        yield harness
 
 
 class NodePythonHost(PythonHost):

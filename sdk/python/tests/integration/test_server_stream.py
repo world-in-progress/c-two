@@ -885,7 +885,11 @@ def test_native_iteration_and_close_wait_release_gil_in_subprocess():
 
 @pytest.fixture(scope="module")
 def rust_stream_harness(tmp_path_factory):
-    return RustHarness.prepare(tmp_path_factory.mktemp("c-two-stream-matrix"))
+    with RustHarness.prepare(
+        tmp_path_factory.mktemp("c-two-stream-matrix"),
+        name="c-two-python-stream-harness",
+    ) as harness:
+        yield harness
 
 
 @pytest.fixture

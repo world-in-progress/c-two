@@ -1,4 +1,4 @@
-"""Python/Rust direct IPC stream matrix fixtures with one shared Cargo build."""
+"""Python/Rust direct IPC stream matrix fixtures with one shared Cargo target."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ import os
 import shutil
 import subprocess
 from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -188,7 +189,8 @@ class RustHarness:
     binary: Path
 
     @classmethod
-    def prepare(cls, root: Path) -> RustHarness:
+    @contextmanager
+    def prepare(cls, root: Path, *, name: str) -> Iterator[RustHarness]:
         (root / "src").mkdir(parents=True)
         (root / "fixtures").mkdir()
         shutil.copyfile(RUST_SOURCE, root / "src/main.rs")
@@ -200,7 +202,7 @@ class RustHarness:
             json.dumps(SPEC, sort_keys=True, separators=(",", ":")), encoding="utf-8",
         )
         manifest = f"""[package]
-name = "c-two-stream-matrix-harness"
+name = {json.dumps(name)}
 version = "0.0.0"
 edition = "2024"
 publish = false
@@ -221,11 +223,18 @@ serde_json = "1"
             check=False,
         )
         assert result.returncode == 0, result.stderr
-        binary = target / "debug" / (
-            "c-two-stream-matrix-harness.exe" if os.name == "nt" else "c-two-stream-matrix-harness"
-        )
-        assert binary.is_file()
-        return cls(root, binary)
+        executable = name + (".exe" if os.name == "nt" else "")
+        built_binary = target / "debug" / executable
+        assert built_binary.is_file()
+        # Callers use distinct Cargo names so publishing one cannot unlink the
+        # other's binary. Run a private copy so Windows can rebuild either one
+        # while its resource process is still running.
+        binary = root / executable
+        shutil.copy2(built_binary, binary)
+        try:
+            yield cls(root, binary)
+        finally:
+            binary.unlink()
 
     def client(self, address: str, route: str, shm: bool, large: bool, hold: bool,
                *, ipc_overrides=None, ipc_root=None) -> dict:
