@@ -190,6 +190,7 @@ impl Fixture {
                 endpoint,
                 route.as_ptr(),
                 contract.as_ptr(),
+                ptr::null(),
                 callback,
                 user,
             )
@@ -431,6 +432,7 @@ fn factory_transport_policy_is_fixed_before_endpoints_and_reused_on_reconnect() 
                 fixture.endpoint,
                 route.as_ptr(),
                 contract.as_ptr(),
+                ptr::null(),
                 c,
                 u,
             )
@@ -466,6 +468,7 @@ fn factory_transport_policy_is_fixed_before_endpoints_and_reused_on_reconnect() 
                 fixture.endpoint,
                 route.as_ptr(),
                 contract.as_ptr(),
+                ptr::null(),
                 c,
                 u,
             )
@@ -502,7 +505,14 @@ fn closing_one_endpoint_does_not_close_another_endpoint_at_the_same_address() {
     let contract=CString::new(json!({"namespace":expected.crm_ns,"name":expected.crm_name,"version":expected.crm_ver,"abiHash":expected.abi_hash,"signatureHash":expected.signature_hash}).to_string()).unwrap();
     let route = CString::new("items").unwrap();
     let prepared = async_result(|c, u| unsafe {
-        c2_mem_ffi_endpoint_context_prepare(second, route.as_ptr(), contract.as_ptr(), c, u)
+        c2_mem_ffi_endpoint_context_prepare(
+            second,
+            route.as_ptr(),
+            contract.as_ptr(),
+            ptr::null(),
+            c,
+            u,
+        )
     });
     unsafe {
         success(prepared);
@@ -534,7 +544,8 @@ fn close_waits_for_a_connection_whose_route_preparation_was_refused() {
     let mut endpoint = ptr::null_mut();
     let mut error = ptr::null_mut();
     let address = CString::new(fixture.host.local_endpoint().address()).unwrap();
-    let options = CString::new(r#"{"expectedRouteToken":{"routeUid":"wrong-uid"}}"#).unwrap();
+    let options = CString::new("{}").unwrap();
+    let token = CString::new(r#"{"routeUid":"wrong-uid"}"#).unwrap();
     assert_eq!(
         unsafe {
             c2_mem_ffi_endpoint_context_new(
@@ -552,7 +563,14 @@ fn close_waits_for_a_connection_whose_route_preparation_was_refused() {
     let contract=CString::new(json!({"namespace":expected.crm_ns,"name":expected.crm_name,"version":expected.crm_ver,"abiHash":expected.abi_hash,"signatureHash":expected.signature_hash}).to_string()).unwrap();
     let route = CString::new("items").unwrap();
     let rejected = async_result(|c, u| unsafe {
-        c2_mem_ffi_endpoint_context_prepare(endpoint, route.as_ptr(), contract.as_ptr(), c, u)
+        c2_mem_ffi_endpoint_context_prepare(
+            endpoint,
+            route.as_ptr(),
+            contract.as_ptr(),
+            token.as_ptr(),
+            c,
+            u,
+        )
     });
     unsafe {
         assert!(!(*rejected).error.is_null());
@@ -576,4 +594,174 @@ fn close_waits_for_a_connection_whose_route_preparation_was_refused() {
         actually_closed,
         "close must await the original connection even without a published route binding"
     );
+}
+
+#[test]
+fn route_token_rejection_preserves_other_route_on_same_endpoint() {
+    let fixture = Fixture::new(64);
+    let release = ContractRelease::from_descriptor_json(DESCRIPTOR).unwrap();
+    let mut other_registration = fixture
+        .host
+        .register(
+            ServiceDefinition::new_stream(
+                &release,
+                release.reference(),
+                "other",
+                [
+                    MethodDefinition {
+                        index: 0,
+                        name: "ping".into(),
+                        access: MethodAccess::Read,
+                    },
+                    MethodDefinition {
+                        index: 1,
+                        name: "echo".into(),
+                        access: MethodAccess::Write,
+                    },
+                ],
+                Arc::new(Service),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let expected = release.expected_route("other").unwrap();
+    let contract = CString::new(json!({"namespace":expected.crm_ns,"name":expected.crm_name,"version":expected.crm_ver,"abiHash":expected.abi_hash,"signatureHash":expected.signature_hash}).to_string()).unwrap();
+    let other = CString::new("other").unwrap();
+    let items = CString::new("items").unwrap();
+    let items_expected = release.expected_route("items").unwrap();
+    let items_contract = CString::new(json!({"namespace":items_expected.crm_ns,"name":items_expected.crm_name,"version":items_expected.crm_ver,"abiHash":items_expected.abi_hash,"signatureHash":items_expected.signature_hash}).to_string()).unwrap();
+    let wrong = CString::new(r#"{"routeUid":"wrong-uid"}"#).unwrap();
+
+    let refused = async_result(|c, u| unsafe {
+        c2_mem_ffi_endpoint_context_prepare(
+            fixture.endpoint,
+            other.as_ptr(),
+            contract.as_ptr(),
+            wrong.as_ptr(),
+            c,
+            u,
+        )
+    });
+    unsafe {
+        assert!(!(*refused).error.is_null());
+        let error: Value = serde_json::from_str(
+            CStr::from_ptr(c2_mem_ffi_error_parts((*refused).error))
+                .to_str()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(error["code"], 704);
+        assert_eq!(error["transportPhase"], "pre_dispatch");
+        c2_mem_ffi_result_free(refused);
+    }
+    let items_result = async_result(|c, u| unsafe {
+        c2_mem_ffi_endpoint_context_prepare(
+            fixture.endpoint,
+            items.as_ptr(),
+            items_contract.as_ptr(),
+            ptr::null(),
+            c,
+            u,
+        )
+    });
+    let items_connection = unsafe { metadata(items_result) }["connectionId"].clone();
+    unsafe {
+        c2_mem_ffi_result_free(items_result);
+    }
+    let other_result = async_result(|c, u| unsafe {
+        c2_mem_ffi_endpoint_context_prepare(
+            fixture.endpoint,
+            other.as_ptr(),
+            contract.as_ptr(),
+            ptr::null(),
+            c,
+            u,
+        )
+    });
+    let other_metadata = unsafe { metadata(other_result) };
+    assert_eq!(other_metadata["connectionId"], items_connection);
+    let token = CString::new(json!({"routeUid":other_metadata["routeUid"]}).to_string()).unwrap();
+    unsafe {
+        c2_mem_ffi_result_free(other_result);
+    }
+    let other_again = async_result(|c, u| unsafe {
+        c2_mem_ffi_endpoint_context_prepare(
+            fixture.endpoint,
+            other.as_ptr(),
+            contract.as_ptr(),
+            token.as_ptr(),
+            c,
+            u,
+        )
+    });
+    unsafe {
+        success(other_again);
+        c2_mem_ffi_result_free(other_again);
+    }
+    other_registration.close().unwrap();
+    let _replacement = fixture
+        .host
+        .register(
+            ServiceDefinition::new_stream(
+                &release,
+                release.reference(),
+                "other",
+                [
+                    MethodDefinition {
+                        index: 0,
+                        name: "ping".into(),
+                        access: MethodAccess::Read,
+                    },
+                    MethodDefinition {
+                        index: 1,
+                        name: "echo".into(),
+                        access: MethodAccess::Write,
+                    },
+                ],
+                Arc::new(Service),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let current = fixture
+        ._runtime
+        .connect(
+            release.expected_route("other").unwrap(),
+            c2_core::Connect::DirectIpc {
+                address: fixture.host.local_endpoint().address().to_string(),
+            },
+        )
+        .unwrap();
+    let new_token =
+        CString::new(json!({"routeUid":current.observed_route().route_uid}).to_string()).unwrap();
+    let stale = async_result(|c, u| unsafe {
+        c2_mem_ffi_endpoint_context_prepare(
+            fixture.endpoint,
+            other.as_ptr(),
+            contract.as_ptr(),
+            new_token.as_ptr(),
+            c,
+            u,
+        )
+    });
+    unsafe {
+        assert!(!(*stale).error.is_null());
+        let error: Value = serde_json::from_str(
+            CStr::from_ptr(c2_mem_ffi_error_parts((*stale).error))
+                .to_str()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(error["code"], 704);
+        assert_eq!(error["details"]["stage"], "route_binding");
+        c2_mem_ffi_result_free(stale);
+    }
+    let unary = fixture.call("ping", &[], false);
+    let result = async_result(|c, u| unsafe { c2_mem_ffi_call_next(unary, c, u) });
+    unsafe {
+        success(result);
+        assert_eq!((*(*result).buffer).0.bytes(), b"pong");
+        c2_mem_ffi_result_free(result);
+        c2_mem_ffi_call_free(unary);
+    }
 }

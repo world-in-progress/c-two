@@ -263,18 +263,18 @@ test('two unary calls enter native begin without a JS call chain', async () => {
 test('IPC endpoint options reach the native connector once', async () => {
   const seen=[];
   const endpoint={
-    async prepare(){return {serverId:'s',serverInstanceId:'i',routeUid:'u',connectionId:1n}},
+    async prepare(route,contract,token){assert.deepEqual(token,{routeUid:'u'});return {serverId:'s',serverInstanceId:'i',routeUid:'u',connectionId:1n}},
     beginCall(){throw Error('unexpected')}, async close(){}, deactivate(){},
   };
   const transport=createIpcEncodedTransport('ipc://test',{
     connect:async (address,timeout,options)=>{seen.push({address,timeout,options});return endpoint},
     connectTimeoutMs:17,
-    expectedServerIdentity:{serverId:'s',serverInstanceId:'i'}, expectedRouteToken:{routeUid:'u'},
+    expectedServerIdentity:{serverId:'s',serverInstanceId:'i'},
   });
-  await transport.prepare('route',contract);
+  await transport.prepare('route',contract,{routeUid:'u'});
   assert.deepEqual(seen,[{address:'ipc://test',timeout:17,options:{
     connectTimeoutMs:17,
-    expectedServerIdentity:{serverId:'s',serverInstanceId:'i'},expectedRouteToken:{routeUid:'u'},
+    expectedServerIdentity:{serverId:'s',serverInstanceId:'i'},
   }}]);
 });
 

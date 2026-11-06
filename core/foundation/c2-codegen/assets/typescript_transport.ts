@@ -86,7 +86,7 @@ export interface C2NativeCall {
 }
 
 export interface C2NativeEndpointContext {
-  prepare(routeName: string, contract: C2RouteContractIdentity): Promise<{
+  prepare(routeName: string, contract: C2RouteContractIdentity, expectedRouteToken?: C2RouteToken): Promise<{
     serverId: string; serverInstanceId: string; routeUid: string; connectionId: bigint | string;
   }>;
   beginCall(routeName: string, method: string, serverStream: boolean, timeoutMs: number | null): C2NativeCall;
@@ -97,7 +97,6 @@ export interface C2NativeEndpointContext {
 export interface C2IpcNativeEndpointOptions {
   readonly connectTimeoutMs?: number;
   readonly expectedServerIdentity?: C2ServerIdentity;
-  readonly expectedRouteToken?: C2RouteToken;
 }
 
 export type C2IpcConnect = (address: string, timeoutMs?: number, nativeOptions?: C2IpcNativeEndpointOptions) => Promise<C2NativeEndpointContext>;
@@ -112,13 +111,12 @@ export interface C2IpcTransportOptions<Payload extends C2ResponsePayload = C2Byt
   readonly callTimeoutMs?: number | null;
   readonly responsePayloadAllocator?: C2ResponsePayloadAllocator<Payload>;
   readonly expectedServerIdentity?: C2ServerIdentity;
-  readonly expectedRouteToken?: C2RouteToken;
   readonly observationPath?: "DirectIpc" | "RelayAwareLocalIpc";
   readonly observe?: C2TransportObserver | undefined;
 }
 
 export interface C2IpcEncodedTransport<Payload extends C2ResponsePayload = C2ByteArray> extends C2StreamEncodedClientTransport {
-  prepare(routeName: string, contract: C2ContractIdentity): Promise<void>;
+  prepare(routeName: string, contract: C2ContractIdentity, expectedRouteToken?: C2RouteToken): Promise<void>;
   call(routeName: string, contract: C2ContractIdentity, method: string, encode: () => C2ByteArray): Promise<Payload>;
   close(): Promise<void>;
 }
@@ -474,6 +472,7 @@ interface C2DeferredStreamState<T> {
   cancelled: boolean;
   collected: boolean;
   dispose?: () => void;
+  failure?: (error: unknown) => void;
 }
 
 const deferredStreamFinalizer = new FinalizationRegistry<C2DeferredStreamState<unknown>>(state => {
@@ -484,13 +483,18 @@ const deferredStreamFinalizer = new FinalizationRegistry<C2DeferredStreamState<u
 });
 
 async function readDeferredStreamNext<T>(state: C2DeferredStreamState<T>, ready: Promise<C2ResponseStream<T>>): Promise<IteratorResult<T>> {
+  try {
     if (state.cancelled) return { done: true, value: undefined };
     const stream = await ready;
     if (state.cancelled) return { done: true, value: undefined };
     const result = await stream.next();
     if (result.done) state.dispose?.();
     return result;
+  } catch (error) {
+    state.failure?.(error);
+    throw error;
   }
+}
 
 class DeferredC2ResponseStream<T> implements C2ResponseStream<T> {
   private readonly state: C2DeferredStreamState<T> = { cancelled: false, collected: false };
@@ -526,7 +530,11 @@ class DeferredC2ResponseStream<T> implements C2ResponseStream<T> {
     const stream = this.state.stream ?? await waitForCloseReady(this.ready, timeoutMs, startedAt);
     if (stream === undefined) return incompleteStreamReceipt();
     const remaining = timeoutMs === null ? null : Math.max(0, Math.ceil(timeoutMs - (performance.now() - startedAt)));
-    const receipt = await stream.close(remaining);
+    const receipt = await stream.close(remaining).catch(error => {
+      this.state.failure?.(error);
+      throw error;
+    });
+    if (receipt.error !== null) this.state.failure?.(receipt.error);
     if (receipt.completed) {
       deferredStreamFinalizer.unregister(this);
       this.state.dispose?.();
@@ -557,7 +565,6 @@ export function createIpcEncodedTransport<Payload extends C2ResponsePayload = C2
       const nativeOptions: C2IpcNativeEndpointOptions = {
         ...(options.connectTimeoutMs === undefined ? {} : { connectTimeoutMs: options.connectTimeoutMs }),
         ...(options.expectedServerIdentity === undefined ? {} : { expectedServerIdentity: options.expectedServerIdentity }),
-        ...(options.expectedRouteToken === undefined ? {} : { expectedRouteToken: options.expectedRouteToken }),
       };
       const pending = Promise.resolve().then(() => options.connect(address, options.connectTimeoutMs, nativeOptions)).catch(error => {
         if (endpointPromise === pending) endpointPromise = undefined;
@@ -567,14 +574,14 @@ export function createIpcEncodedTransport<Payload extends C2ResponsePayload = C2
     }
     return endpointPromise;
   };
-  const prepare = async (routeName: string, contract: C2ContractIdentity) => {
+  const prepare = async (routeName: string, contract: C2ContractIdentity, expectedRouteToken?: C2RouteToken) => {
     const routeContract = requireRouteContractIdentity(contract);
     const native = await endpoint();
-    const binding = await native.prepare(routeName, routeContract).catch(error => { throw projectNativeError(error); });
+    const binding = await native.prepare(routeName, routeContract, expectedRouteToken).catch(error => { throw projectNativeError(error); });
     return { native, binding };
   };
   return {
-    async prepare(routeName, contract): Promise<void> { await prepare(routeName, contract); },
+    async prepare(routeName, contract, expectedRouteToken): Promise<void> { await prepare(routeName, contract, expectedRouteToken); },
     async call(routeName, contract, method, encode): Promise<Payload> {
       const { native, binding } = await prepare(routeName, contract);
       const call = native.beginCall(routeName, method, false, callTimeoutMs);
@@ -752,6 +759,42 @@ export function createRelayAwareHttpEncodedTransport<Payload extends C2ResponseP
   const ipcOptions = normalizeRelayAwareIpcOptions(normalizedOptions.ipc);
   const routeCache = new Map<string, C2RelayRouteCacheEntry>();
   const currentRelayByCacheKey = new Map<string, string>();
+  const localTransports = new Map<string, C2IpcEncodedTransport<Payload>>();
+  let closePromise: Promise<void> | undefined;
+  const retiredLocalTransports: Promise<PromiseSettledResult<void>>[] = [];
+  let closed = false;
+  const requireOpen = (): void => {
+    if (closed) throw new C2IpcTransportError("C-Two relay-aware transport is deactivated.");
+  };
+  const localKey = (route: C2RelayRouteInfo): string => JSON.stringify([
+    route.ipcAddress, route.serverId, route.serverInstanceId,
+  ]);
+  const localTransportFor = (route: C2RelayRouteInfo): C2IpcEncodedTransport<Payload> => {
+    requireOpen();
+    const key = localKey(route);
+    let transport = localTransports.get(key);
+    if (transport === undefined) {
+      transport = createIpcEncodedTransport<Payload>(route.ipcAddress as string, {
+        ...ipcOptions!,
+        expectedServerIdentity: { serverId: route.serverId as string, serverInstanceId: route.serverInstanceId as string },
+        observationPath: "RelayAwareLocalIpc", observe,
+      });
+      localTransports.set(key, transport);
+    }
+    return transport;
+  };
+  const discardLocalTransport = (route: C2RelayRouteInfo, transport: C2IpcEncodedTransport<Payload>, error: unknown): Promise<PromiseSettledResult<void>> | undefined => {
+    if (!(localEndpointFailure(error) || localCandidateFailureIsTerminal(error)) || localTransports.get(localKey(route)) !== transport) return undefined;
+    localTransports.delete(localKey(route));
+    // Stop admission immediately, but let unrelated dispatched calls drain in
+    // the background. The enclosing transport observes all cleanup at close.
+    const closing = transport.close().then(
+      (): PromiseFulfilledResult<void> => ({ status: "fulfilled", value: undefined }),
+      (reason): PromiseRejectedResult => ({ status: "rejected", reason }),
+    );
+    retiredLocalTransports.push(closing);
+    return closing;
+  };
   let requests = 0;
   let responses = 0;
   return {
@@ -764,16 +807,11 @@ export function createRelayAwareHttpEncodedTransport<Payload extends C2ResponseP
         );
         const route = selectLocalIpcRoute(routes, normalizedAnchorUrl, ipcOptions, new Set());
         if (route === undefined || ipcOptions === undefined) throw new C2UnsupportedCallModeError();
-        const transport = createIpcEncodedTransport(route.ipcAddress as string, {
-          ...ipcOptions,
-          expectedServerIdentity: { serverId: route.serverId as string, serverInstanceId: route.serverInstanceId as string },
-          expectedRouteToken: { routeUid: route.routeUid },
-          observationPath: "RelayAwareLocalIpc", observe,
-        });
-        state.dispose = () => { void transport.close().catch(error => console.warn("Warning: local stream transport cleanup failed:", error)); };
-        try { await transport.prepare(routeName, routeContract); }
+        const transport = localTransportFor(route);
+        state.failure = error => { discardLocalTransport(route, transport, error); };
+        try { await transport.prepare(routeName, routeContract, { routeUid: route.routeUid }); }
         catch (error) {
-          await transport.close().catch(cleanupError => console.warn("Warning: local stream transport cleanup failed:", cleanupError));
+          discardLocalTransport(route, transport, error);
           throw error;
         }
         const stream = hold
@@ -784,6 +822,7 @@ export function createRelayAwareHttpEncodedTransport<Payload extends C2ResponseP
       });
     },
     async call(routeName: string, contract: C2ContractIdentity, method: string, encode: () => C2ByteArray): Promise<Payload> {
+      requireOpen();
       requireRouteNamePathValue(routeName);
       requireMethodPathValue(method);
       const routeContract = requireRouteContractIdentity(contract);
@@ -825,34 +864,14 @@ export function createRelayAwareHttpEncodedTransport<Payload extends C2ResponseP
         );
         if (localRoute !== undefined && ipcOptions !== undefined) {
           const localTokenKey = routeTokenKey(localRoute);
-          const localTransport = createIpcEncodedTransport<Payload>(
-            localRoute.ipcAddress as string,
-            {
-              ...ipcOptions,
-              expectedServerIdentity: {
-                serverId: localRoute.serverId as string,
-                serverInstanceId: localRoute.serverInstanceId as string,
-              },
-              expectedRouteToken: {
-                routeUid: localRoute.routeUid,
-              },
-              observationPath: "RelayAwareLocalIpc",
-              observe,
-            },
-          );
+          const localTransport = localTransportFor(localRoute);
           try {
-            await localTransport.prepare(routeName, routeContract);
+            await localTransport.prepare(routeName, routeContract, { routeUid: localRoute.routeUid });
           } catch (error) {
-            try {
-              await localTransport.close();
-            } catch (closeError) {
-              const primaryError = error instanceof Error ? error : new C2IpcTransportError(
-                `C-Two relay-aware local IPC preparation failed: ${String(error)}`,
-              );
-              Object.defineProperty(primaryError, "cleanupError", { value: closeError });
-              throw primaryError;
-            }
+            const closing = discardLocalTransport(localRoute, localTransport, error);
             if (localCandidateFailureIsTerminal(error)) {
+              const cleanup = await closing;
+              if (cleanup?.status === "rejected") Object.defineProperty(error, "cleanupError", { value: cleanup.reason });
               throw error;
             }
             firstLocalFailure ??= error;
@@ -867,13 +886,12 @@ export function createRelayAwareHttpEncodedTransport<Payload extends C2ResponseP
             }
             continue;
           }
-          return await callPreparedLocalIpcAndClose(
-            localTransport,
-            routeName,
-            routeContract,
-            method,
-            encode,
-          );
+          try {
+            return await localTransport.call(routeName, routeContract, method, encode);
+          } catch (error) {
+            discardLocalTransport(localRoute, localTransport, error);
+            throw error;
+          }
         }
         const httpRoutes = routes.filter(
           (route) => !excludedLocalRouteTokens.has(routeTokenKey(route)),
@@ -960,9 +978,24 @@ export function createRelayAwareHttpEncodedTransport<Payload extends C2ResponseP
       throw resourceNotFoundError(routeName);
     },
 
-    async close(): Promise<void> {
-      routeCache.clear();
-      currentRelayByCacheKey.clear();
+    close(): Promise<void> {
+      if (closePromise !== undefined) return closePromise;
+      closed = true;
+      closePromise = (async () => {
+        routeCache.clear();
+        currentRelayByCacheKey.clear();
+        const closing = [...localTransports.values()].map(transport => transport.close());
+        localTransports.clear();
+        const results = await Promise.all([
+          ...retiredLocalTransports,
+          ...closing.map(pending => pending.then(
+            (): PromiseFulfilledResult<void> => ({ status: "fulfilled", value: undefined }),
+            (reason): PromiseRejectedResult => ({ status: "rejected", reason }),
+          )),
+        ]);
+        for (const result of results) if (result.status === "rejected") throw result.reason;
+      })();
+      return closePromise;
     },
   };
 }
@@ -1590,31 +1623,13 @@ async function callResolvedHttpRoute<Payload extends C2ResponsePayload>(
   }, callTimeoutMs, "C-Two HTTP relay call");
 }
 
-async function callPreparedLocalIpcAndClose<Payload extends C2ResponsePayload>(
-  transport: C2IpcEncodedTransport<Payload>,
-  routeName: string,
-  contract: C2ContractIdentity,
-  method: string,
-  encode: () => C2ByteArray,
-): Promise<Payload> {
-  let response: Payload;
-  try {
-    response = await transport.call(routeName, contract, method, encode);
-  } catch (error) {
-    try {
-      await transport.close();
-    } catch (cleanupError) {
-      console.warn("Warning: local IPC transport cleanup failed:", cleanupError);
-    }
-    throw error;
-  }
-  try {
-    await transport.close();
-  } catch (error) {
-    tryReleaseResponsePayload(response);
-    throw error;
-  }
-  return response;
+function localEndpointFailure(failure: unknown): boolean {
+  const error = projectNativeError(failure);
+  return error instanceof C2IpcTransportError && (
+    (error.code === 704 && error.details.stage === "route_binding") ||
+    error.code === null || error.code === 702 || error.code === 707 || error.code === 710 ||
+    error.category === "runtime_retired" || error.category === "protocol_version_mismatch"
+  );
 }
 
 function observeTransportResponse<Payload extends C2ResponsePayload>(
@@ -1652,7 +1667,7 @@ function normalizeRelayAwareIpcOptions<Payload extends C2ResponsePayload>(value:
   if (typeof value !== "object" || value === null || typeof value.connect !== "function") {
     throw new TypeError("C-Two relay-aware ipc requires native connect.");
   }
-  if (value.expectedServerIdentity !== undefined || value.expectedRouteToken !== undefined || value.observationPath !== undefined || value.observe !== undefined) {
+  if (value.expectedServerIdentity !== undefined || value.observationPath !== undefined || value.observe !== undefined) {
     throw new TypeError("C-Two relay-aware ipc expected route facts and observation are owned by relay resolution.");
   }
   return value;

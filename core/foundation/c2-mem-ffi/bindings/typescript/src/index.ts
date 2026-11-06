@@ -46,7 +46,7 @@ export interface NativePreparedRoute {
 }
 
 export interface NativeEndpointContext {
-  prepare(routeName: string, contract: object): Promise<NativePreparedRoute>;
+  prepare(routeName: string, contract: object, expectedRouteToken?: { readonly routeUid: string }): Promise<NativePreparedRoute>;
   beginCall(routeName: string, method: string, serverStream: boolean, timeoutMs: number | null): NativeCall;
   deactivate(): void;
   close(): Promise<void>;
@@ -55,7 +55,6 @@ export interface NativeEndpointContext {
 export interface NativeEndpointOptions {
   readonly connectTimeoutMs?: number;
   readonly expectedServerIdentity?: { readonly serverId: string; readonly serverInstanceId: string };
-  readonly expectedRouteToken?: { readonly routeUid: string };
 }
 
 export interface NativeClientDomainOptions {
@@ -195,7 +194,9 @@ class ProjectedCall implements NativeCall {
 
 class ProjectedEndpoint implements NativeEndpointContext {
   constructor(private readonly native: NativeEndpointContext) {}
-  prepare(routeName: string, contract: object): Promise<NativePreparedRoute> { return nativePromise(() => this.native.prepare(routeName, contract)); }
+  prepare(routeName: string, contract: object, expectedRouteToken?: { readonly routeUid: string }): Promise<NativePreparedRoute> {
+    return nativePromise(() => this.native.prepare(routeName, contract, expectedRouteToken));
+  }
   beginCall(routeName: string, method: string, serverStream: boolean, timeoutMs: number | null): NativeCall {
     return new ProjectedCall(nativeValue(() => this.native.beginCall(routeName, method, serverStream, timeoutMs)));
   }
@@ -370,7 +371,7 @@ export function createNodeIpcConnector(options: C2NodeIpcConnectorOptions = {}):
   validateConnectTimeout(options.connectTimeoutMs);
   const permitted = new Set([
     "addonPath", "ipcRoot", "endpointContext", "nativeSymbols", "connectTimeoutMs",
-    "requestShmThreshold", "requestChunkSize", "expectedServerIdentity", "expectedRouteToken",
+    "requestShmThreshold", "requestChunkSize", "expectedServerIdentity",
   ]);
   for (const key of Object.keys(options)) {
     if (!permitted.has(key)) throw new C2NodeIpcConnectionError(`C-Two Node IPC connector has unknown option ${key}.`);
@@ -382,7 +383,6 @@ export function createNodeIpcConnector(options: C2NodeIpcConnectorOptions = {}):
   validateSymbols(symbols);
   const endpointOptions: NativeEndpointOptions = {
     ...(options.expectedServerIdentity === undefined ? {} : { expectedServerIdentity: options.expectedServerIdentity }),
-    ...(options.expectedRouteToken === undefined ? {} : { expectedRouteToken: options.expectedRouteToken }),
   };
   const domainOptions: NativeClientDomainOptions = {
     ...(options.requestShmThreshold === undefined ? {} : { requestShmThreshold: options.requestShmThreshold }),
@@ -435,6 +435,11 @@ export function createNodeIpcConnector(options: C2NodeIpcConnectorOptions = {}):
     validateAddress(address);
     if (typeof nativeOptions !== "object" || nativeOptions === null) {
       throw new C2NodeIpcConnectionError("C-Two native endpoint options must be an object.");
+    }
+    for (const key of Object.keys(nativeOptions)) {
+      if (key !== "connectTimeoutMs" && key !== "expectedServerIdentity") {
+        throw new C2NodeIpcConnectionError(`C-Two native endpoint has unknown option ${key}.`);
+      }
     }
     validateConnectTimeout(timeoutMs);
     validateConnectTimeout(nativeOptions.connectTimeoutMs);

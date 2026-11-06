@@ -286,3 +286,107 @@ def test_generated_node_persistent_dynamic_acquire_and_identity_fences(
             assert server.shutdown()["completed"]
     inspection = cc.endpoint.inspect_endpoint(unique_ipc_address)
     assert inspection["status"] in ("absent", "not-applicable"), inspection
+
+
+def test_generated_node_relay_local_late_route_reuses_physical_connection(
+    persistent_node_project, start_c3_relay, monkeypatch, tmp_path,
+) -> None:
+    """Gates 1/6: late builder acquisition keeps one relay-local IPC carrier.
+
+    The direct counterpart is the existing persistent dynamic-acquire test.
+    Native prepare connection IDs count physical connections, independently
+    of how often the generated transport invokes its endpoint connector.
+    """
+    import tempfile
+
+    from tests.fixtures.typescript_idle_gates import node_gate_client
+
+    with tempfile.TemporaryDirectory(
+        prefix="c2-n9-", dir="/tmp" if os.name != "nt" else None,
+    ) as ipc_root:
+        local_root = ipc_root if os.name != "nt" else None
+        if local_root is not None:
+            monkeypatch.setenv("C2_IPC_ROOT", local_root)
+        else:
+            monkeypatch.delenv("C2_IPC_ROOT", raising=False)
+        monkeypatch.setenv("C2_RELAY_ANCHOR_ADDRESS", "")
+        relay = start_c3_relay(idle_timeout=0)
+        server = cc.Runtime()
+        server.set_local_endpoint(root=local_root)
+        server.set_relay_anchor(relay.url)
+        builder = CountingResource()
+
+        class LateManager(CountingResource):
+            def ping(self) -> None:
+                super().ping()
+                if self.calls == 1:
+                    server.register(Builder, builder, name="builder")
+
+        manager = LateManager()
+        try:
+            server.register(Manager, manager, name="manager")
+            identity = dict(server._runtime_session.ensure_server())
+            with node_gate_client(persistent_node_project, tmp_path, relay.url, local_root) as node:
+                first = _ok(node())
+                late = _ok(node(route="builder"))
+                assert manager.calls == builder.calls == 1
+                observed = late["observations"]
+                assert [item["routeName"] for item in observed] == ["manager", "builder"]
+                assert all(item["path"] == "RelayAwareLocalIpc" for item in observed)
+                assert all(item["serverId"] == identity["server_id"] for item in observed)
+                assert all(item["serverInstanceId"] == identity["server_instance_id"] for item in observed)
+                assert observed[0]["routeUid"] != observed[1]["routeUid"]
+                assert all(item["method"] == "GET" for item in late["http"]), late
+                assert len({item["connectionId"] for item in first["preparations"]}) == 1
+                connections = {item["connectionId"] for item in late["preparations"]}
+                assert len(connections) == 1, f"late acquisition replaced its physical IPC connection: {late}"
+        finally:
+            assert server.shutdown(timeout=5)["completed"]
+            relay.stop()
+            assert not list(Path(ipc_root).glob("*.lease"))
+            assert not any(path.is_socket() for path in Path(ipc_root).iterdir())
+
+
+def test_generated_node_relay_local_rebuilds_after_endpoint_deactivation(
+    persistent_node_project, start_c3_relay, monkeypatch, tmp_path,
+) -> None:
+    """A failed call retires its endpoint; the following call gets a new carrier."""
+    import tempfile
+
+    from tests.fixtures.typescript_idle_gates import node_gate_client
+
+    with tempfile.TemporaryDirectory(
+        prefix="c2-n9-rebuild-", dir="/tmp" if os.name != "nt" else None,
+    ) as ipc_root:
+        local_root = ipc_root if os.name != "nt" else None
+        if local_root is not None:
+            monkeypatch.setenv("C2_IPC_ROOT", local_root)
+        else:
+            monkeypatch.delenv("C2_IPC_ROOT", raising=False)
+        monkeypatch.setenv("C2_RELAY_ANCHOR_ADDRESS", "")
+        relay = start_c3_relay(idle_timeout=0)
+        server = cc.Runtime()
+        server.set_local_endpoint(root=local_root)
+        server.set_relay_anchor(relay.url)
+        manager = CountingResource()
+        try:
+            server.register(Manager, manager, name="manager")
+            with node_gate_client(persistent_node_project, tmp_path, relay.url, local_root) as node:
+                first = _ok(node())
+                old_connection = first["preparations"][-1]["connectionId"]
+                _ok(node("deactivate-next-call"))
+                failed = node()
+                _reject(failed)
+                assert failed["error"]["code"] == 707, failed
+                assert failed["error"]["transportPhase"] == "pre_dispatch", failed
+                assert manager.calls == 1
+                rebuilt = _ok(node())
+                assert manager.calls == 2
+                assert rebuilt["preparations"][-1]["connectionId"] != old_connection
+                assert all(item["path"] == "RelayAwareLocalIpc" for item in rebuilt["observations"])
+                assert all(item["method"] == "GET" for item in rebuilt["http"]), rebuilt
+        finally:
+            assert server.shutdown(timeout=5)["completed"]
+            relay.stop()
+            assert not list(Path(ipc_root).glob("*.lease"))
+            assert not any(path.is_socket() for path in Path(ipc_root).iterdir())

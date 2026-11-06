@@ -68,15 +68,40 @@ test('per-transport native options override factory defaults and explicit timeou
   await connect('ipc://route', 300, {
     connectTimeoutMs: 200,
     expectedServerIdentity: {serverId: 'transport', serverInstanceId: 'i2'},
-    expectedRouteToken: {routeUid: 'uid'},
   });
   await connect('ipc://second', undefined, {connectTimeoutMs: 250});
   assert.deepEqual(events.filter(e => Array.isArray(e) && e[0] === 'endpoint').map(e => e[2]), [
     {connectTimeoutMs: 300,
-      expectedServerIdentity: {serverId: 'transport', serverInstanceId: 'i2'}, expectedRouteToken: {routeUid: 'uid'}},
+      expectedServerIdentity: {serverId: 'transport', serverInstanceId: 'i2'}},
     {connectTimeoutMs: 250, expectedServerIdentity: {serverId: 'factory', serverInstanceId: 'i'}},
   ]);
   connect.close();
+});
+
+test('route token is supplied to each preparation, not endpoint creation', async () => {
+  const {symbols, events, nativeEndpoint} = fixture();
+  const prepared = [];
+  nativeEndpoint.prepare = async (route, contract, token) => {
+    prepared.push([route, contract, token]);
+    return {serverId: 's', serverInstanceId: 'i', routeUid: 'r', connectionId: 1n};
+  };
+  const connect = createNodeIpcConnector({nativeSymbols: symbols});
+  try {
+    const endpoint = await connect('ipc://shared');
+    const contract = {namespace: 'example'};
+    await endpoint.prepare('one', contract, {routeUid: 'uid-one'});
+    await endpoint.prepare('two', contract, {routeUid: 'uid-two'});
+    assert.deepEqual(prepared, [
+      ['one', contract, {routeUid: 'uid-one'}],
+      ['two', contract, {routeUid: 'uid-two'}],
+    ]);
+    assert.deepEqual(events.find(e => Array.isArray(e) && e[0] === 'endpoint')[2], {});
+  } finally { connect.close(); }
+  assert.throws(() => createNodeIpcConnector({nativeSymbols: symbols, expectedRouteToken: {routeUid: 'old'}}), /unknown option/);
+  const another = createNodeIpcConnector({nativeSymbols: symbols});
+  try {
+    await assert.rejects(another('ipc://shared', undefined, {expectedRouteToken: {routeUid: 'old'}}), /unknown option/);
+  } finally { another.close(); }
 });
 
 test('factory transport policy is captured once before any endpoint can choose it', async () => {

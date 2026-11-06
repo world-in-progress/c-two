@@ -30,7 +30,7 @@ typedef struct Symbols {
     void (*domain_free)(C2MemFfiClientDomain *);
     C2MemFfiStatus (*domain_stats)(const C2MemFfiClientDomain *, C2MemFfiResult **);
     C2MemFfiStatus (*endpoint_new)(const C2MemFfiClientDomain *, const char *, const char *, C2MemFfiEndpointContext **, C2MemFfiError **);
-    C2MemFfiStatus (*endpoint_prepare)(const C2MemFfiEndpointContext *, const char *, const char *, C2MemFfiComplete, void *);
+    C2MemFfiStatus (*endpoint_prepare)(const C2MemFfiEndpointContext *, const char *, const char *, const char *, C2MemFfiComplete, void *);
     C2MemFfiStatus (*endpoint_deactivate)(const C2MemFfiEndpointContext *);
     C2MemFfiStatus (*endpoint_close)(const C2MemFfiEndpointContext *, C2MemFfiComplete, void *);
     void (*endpoint_free)(C2MemFfiEndpointContext *);
@@ -539,15 +539,20 @@ static napi_value endpoint_method(napi_env env, napi_callback_info info) {
         return async_status(env, operation, st, promise);
     }
     if (data == (void *)1) {
-        if (argc != 2) return bad(env, "prepare expects route name and contract.");
+        if (argc != 2 && argc != 3) return bad(env, "prepare expects route name, contract and optional route token.");
         char *route = string(env, argv[0], "Route name must be a string.");
         if (route == NULL) return NULL;
         char *contract = json_string(env, argv[1], "Contract must be an object.");
         if (contract == NULL) { free(route); return NULL; }
+        char *token = NULL;
+        if (argc == 3 && !nullish(env, argv[2])) {
+            token = json_string(env, argv[2], "Route token must be an object.");
+            if (token == NULL) { free(route); free(contract); return NULL; }
+        }
         napi_value promise; Async *operation = async_new(env, s, ASYNC_JSON, &promise);
-        if (operation == NULL) { free(route); free(contract); return NULL; }
-        st = s->endpoint_prepare(owner->ptr, route, contract, native_complete, operation);
-        free(route); free(contract);
+        if (operation == NULL) { free(route); free(contract); free(token); return NULL; }
+        st = s->endpoint_prepare(owner->ptr, route, contract, token, native_complete, operation);
+        free(route); free(contract); free(token);
         return async_status(env, operation, st, promise);
     }
     if (argc != 4) return bad(env, "beginCall expects route, method, stream flag and timeout.");
