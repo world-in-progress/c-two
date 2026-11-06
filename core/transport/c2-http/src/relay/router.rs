@@ -2495,6 +2495,7 @@ fn ipc_route_error_response(
         c2_ipc::IpcError::CallRejected(error) => {
             let status = match error.code {
                 ErrorCode::ResourceNotFound => StatusCode::NOT_FOUND,
+                ErrorCode::UnsupportedCallMode => StatusCode::NOT_ACCEPTABLE,
                 ErrorCode::ResourceRemoved => StatusCode::GONE,
                 ErrorCode::RouteStale
                 | ErrorCode::ContractMismatch

@@ -400,8 +400,14 @@ async fn handshake_flush_before_following_frame(fail_flush: usize, disconnect: b
             abi_hash: "0123456789abcdef".repeat(4),
             signature_hash: "abcdef0123456789".repeat(4),
         };
-        rpc::encode_open_frame(1, &identity, 0, ValuePart::whole(ValueStorage::Inline(&[])))
-            .unwrap()
+        rpc::encode_open_frame(
+            1,
+            &identity,
+            0,
+            c2_wire::rpc::CallMode::Unary,
+            ValuePart::whole(ValueStorage::Inline(&[])),
+        )
+        .unwrap()
     };
     client.write_all(&following).await.unwrap();
     if disconnect {

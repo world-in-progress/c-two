@@ -166,7 +166,7 @@ mod ipc16_tests {
             "\x04grid\x03uid\x02ns\x04Grid\x050.1.0\x40",
             "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
             "\x40abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
-            "\x07\x00"
+            "\x07\x00\x00"
         )
         .as_bytes()
         .to_vec()
@@ -256,6 +256,7 @@ mod ipc16_tests {
             42,
             &identity("grid"),
             7,
+            crate::rpc::CallMode::Unary,
             ValuePart::whole(ValueStorage::Inline(b"input")),
         )
         .unwrap();
@@ -269,6 +270,7 @@ mod ipc16_tests {
             identity,
             method_idx,
             value,
+            ..
         } = decode_rpc_record(&header, payload, None).unwrap()
         else {
             panic!("OPEN");
@@ -303,7 +305,7 @@ mod ipc16_tests {
                 _ => value.signature_hash = &long,
             }
             assert_eq!(
-                encode_open_metadata(&value, 7).unwrap_err(),
+                encode_open_metadata(&value, 7, crate::rpc::CallMode::Unary).unwrap_err(),
                 EncodeError::FieldTooLong {
                     field,
                     max: 255,
@@ -316,6 +318,7 @@ mod ipc16_tests {
             19,
             &identity(&route),
             19,
+            crate::rpc::CallMode::Unary,
             ValuePart::whole(ValueStorage::Inline(&[])),
         )
         .unwrap();
@@ -338,6 +341,7 @@ mod ipc16_tests {
             7,
             &identity("grid"),
             7,
+            crate::rpc::CallMode::Unary,
             ValuePart::whole(ValueStorage::Inline(&[])),
         )
         .unwrap();
@@ -365,9 +369,14 @@ mod ipc16_tests {
                 "crm" => value.crm_name = text,
                 _ => value.abi_hash = text,
             }
-            let frame =
-                encode_open_frame(7, &value, 7, ValuePart::whole(ValueStorage::Inline(&[])))
-                    .unwrap();
+            let frame = encode_open_frame(
+                7,
+                &value,
+                7,
+                crate::rpc::CallMode::Unary,
+                ValuePart::whole(ValueStorage::Inline(&[])),
+            )
+            .unwrap();
             let (header, payload) = decode_frame(&frame).unwrap();
             assert!(
                 decode_rpc_record(&header, payload, None).is_err(),
@@ -435,6 +444,7 @@ mod ipc16_tests {
             8,
             &identity("grid"),
             7,
+            crate::rpc::CallMode::Unary,
             ValuePart::first(5, ValueStorage::Inline(b"ab")),
         )
         .unwrap();

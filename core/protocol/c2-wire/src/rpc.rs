@@ -137,11 +137,11 @@ fn read_identity_text(
     Ok(value)
 }
 
-/// Decode and validate the OPEN kind, seven identity fields and method index.
+/// Decode and validate the OPEN kind, seven identity fields, method index and call mode.
 /// Returns the byte offset where the value storage begins.
 pub fn decode_open_metadata(
     payload: &[u8],
-) -> Result<(RouteCallIdentity, u16, usize), DecodeError> {
+) -> Result<(RouteCallIdentity, u16, CallMode, usize), DecodeError> {
     if payload.first().copied() != Some(RpcRecordKind::Open as u8) {
         return Err(invalid(
             "OPEN kind",
@@ -198,6 +198,12 @@ pub fn decode_open_metadata(
     }
     let method_idx = u16::from_le_bytes(payload[pos..pos + 2].try_into().unwrap());
     pos += 2;
+    let mode = CallMode::try_from(*payload.get(pos).ok_or(DecodeError::Truncated {
+        field: "call mode",
+        need: 1,
+        have: 0,
+    })?)?;
+    pos += 1;
     Ok((
         RouteCallIdentity {
             route_name,
@@ -209,6 +215,7 @@ pub fn decode_open_metadata(
             signature_hash,
         },
         method_idx,
+        mode,
         pos,
     ))
 }
@@ -243,9 +250,22 @@ impl TryFrom<u8> for RpcRecordKind {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
 pub enum CallMode {
-    Unary,
-    ServerStream,
+    Unary = 0,
+    ServerStream = 1,
+}
+
+impl TryFrom<u8> for CallMode {
+    type Error = DecodeError;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::Unary),
+            1 => Ok(Self::ServerStream),
+            _ => Err(invalid("call mode", value.into())),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -344,6 +364,7 @@ pub enum RpcRecord<'a> {
     Open {
         identity: RouteCallIdentity,
         method_idx: u16,
+        mode: CallMode,
         value: ValuePart<'a>,
     },
     OpenContinuation {
@@ -425,7 +446,7 @@ fn inspect_carrier(
                         return None;
                     }
                 }
-                offset = offset.checked_add(2)?;
+                offset = offset.checked_add(3)?;
             }
             RpcRecordKind::CallEnd => {
                 let status = CallStatus::try_from(*payload.get(offset)?).ok()?;
@@ -518,11 +539,12 @@ pub fn decode_rpc_record<'a>(
                     value: decode_value(body, shm, ChunkPosition::Continuation)?,
                 });
             }
-            let (identity, method_idx, used) = decode_open_metadata(payload)?;
+            let (identity, method_idx, mode, used) = decode_open_metadata(payload)?;
             let value = decode_value_at(payload, used, shm, first)?;
             Ok(RpcRecord::Open {
                 identity,
                 method_idx,
+                mode,
                 value,
             })
         }
@@ -771,25 +793,28 @@ pub fn encode_open_frame<S: AsRef<str>>(
     request_id: u64,
     identity: &RouteCallIdentity<S>,
     method_idx: u16,
+    mode: CallMode,
     value: ValuePart<'_>,
 ) -> Result<Vec<u8>, EncodeError> {
     if request_id == 0 || value.chunk == ChunkPosition::Continuation {
         return Err(encode_invalid("OPEN", "invalid request id or continuation"));
     }
-    let mut payload = encode_open_metadata(identity, method_idx)?;
+    let mut payload = encode_open_metadata(identity, method_idx, mode)?;
     let flags = encode_value(&mut payload, value)?;
     checked_frame(request_id, FLAG_RPC_RECORD | flags, &payload)
 }
 
-/// Encode the kind, route identity and method prefix for a first OPEN
+/// Encode the kind, route identity, method index and mode prefix for a first OPEN
 /// chunk. The caller appends total_bytes and the first value segment.
 pub fn encode_open_metadata<S: AsRef<str>>(
     identity: &RouteCallIdentity<S>,
     method_idx: u16,
+    mode: CallMode,
 ) -> Result<Vec<u8>, EncodeError> {
     let mut payload = vec![RpcRecordKind::Open as u8];
     payload.extend_from_slice(&encode_identity(identity)?);
     payload.extend_from_slice(&method_idx.to_le_bytes());
+    payload.push(mode as u8);
     Ok(payload)
 }
 

@@ -2053,7 +2053,7 @@ impl IpcClient {
     ) -> Result<ResponseData, crate::IpcCallError> {
         IpcCallControl::check_preparation(control).map_err(pre_dispatch_call_error)?;
         let (send, mut rx) = self.begin_call().map_err(pre_dispatch_call_error)?;
-        let metadata = rpc::encode_open_metadata(identity, method_idx)
+        let metadata = rpc::encode_open_metadata(identity, method_idx, CallMode::Unary)
             .map_err(|error| pre_dispatch_call_error(IpcError::Protocol(error.to_string())))?;
         // The draft has no wire identity until the unique writer submits it.
         let bytes =
@@ -2199,7 +2199,7 @@ impl IpcClient {
             is_dedicated: alloc.is_dedicated,
             loan_id: loan.id(),
         });
-        let metadata = rpc::encode_open_metadata(identity, method_idx)
+        let metadata = rpc::encode_open_metadata(identity, method_idx, CallMode::Unary)
             .map_err(|error| pre_dispatch_call_error(IpcError::Protocol(error.to_string())))?;
         let bytes = frame::encode_frame_parts(
             0,
@@ -2283,7 +2283,7 @@ impl IpcClient {
         let conn = send.conn.clone();
         let state = send.state.clone();
         let rid = 0;
-        let ctrl = rpc::encode_open_metadata(identity, method_idx)
+        let ctrl = rpc::encode_open_metadata(identity, method_idx, CallMode::Unary)
             .map_err(|error| pre_dispatch_call_error(IpcError::Protocol(error.to_string())))?;
         let (upload_stop, stop_upload) = watch::channel(false);
         if let Some(entry) = self.pending.lock().unpublished_mut(&send.state) {

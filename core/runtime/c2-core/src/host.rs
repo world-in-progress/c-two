@@ -1696,7 +1696,9 @@ mod lifecycle_tests {
                 abi_hash: expected.abi_hash,
                 signature_hash: expected.signature_hash,
             };
-            let mut call = c2_wire::rpc::encode_open_metadata(&identity, 1).unwrap();
+            let mut call =
+                c2_wire::rpc::encode_open_metadata(&identity, 1, c2_wire::rpc::CallMode::Unary)
+                    .unwrap();
             call.extend_from_slice(&vec![0x5a; 32 * 1024]);
             peer.write_all(&encode_frame(1, FLAG_RPC_RECORD, &call))
                 .await

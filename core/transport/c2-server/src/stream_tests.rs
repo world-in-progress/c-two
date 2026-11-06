@@ -20,6 +20,7 @@ struct CounterStream {
 
 #[derive(Default)]
 struct Observed {
+    entries: AtomicUsize,
     steps: AtomicUsize,
     finished: AtomicUsize,
     item_bytes: AtomicUsize,
@@ -361,6 +362,7 @@ impl CrmCallback for CounterCallback {
         _: Vec<u8>,
         _: Arc<crate::ResponsePool>,
     ) -> Result<ResponseMeta, CrmError> {
+        self.0.entries.fetch_add(1, Ordering::SeqCst);
         if let Some(entered) = self.0.unary_entered.lock().unwrap().take() {
             let _ = entered.send(());
         }
@@ -379,6 +381,7 @@ impl CrmStreamCallback for CounterCallback {
         request: Vec<u8>,
         _: Arc<crate::ResponsePool>,
     ) -> Result<Box<dyn CrmStream>, CrmError> {
+        self.0.entries.fetch_add(1, Ordering::SeqCst);
         Ok(Box::new(CounterStream {
             next: 0,
             total: request[0],
@@ -514,6 +517,7 @@ impl Harness {
                     id,
                     &self.identity,
                     1,
+                    CallMode::ServerStream,
                     ValuePart::whole(ValueStorage::Inline(input)),
                 )
                 .unwrap(),
@@ -629,6 +633,7 @@ async fn stream_items_require_storage_credit_and_terminal_counts_complete_items(
                 4,
                 &harness.identity,
                 0,
+                CallMode::Unary,
                 ValuePart::whole(ValueStorage::Inline(&[])),
             )
             .unwrap(),
@@ -681,6 +686,7 @@ async fn paused_stream_keeps_call_slot_but_releases_worker_for_unary() {
                 2,
                 &harness.identity,
                 0,
+                CallMode::Unary,
                 ValuePart::whole(ValueStorage::Inline(&[])),
             )
             .unwrap(),
@@ -749,6 +755,7 @@ async fn unregister_cancels_published_stream_waiting_for_its_first_route_permit(
                 1,
                 &harness.identity,
                 0,
+                CallMode::Unary,
                 ValuePart::whole(ValueStorage::Inline(&[])),
             )
             .unwrap(),
@@ -856,6 +863,7 @@ async fn host_close_rejects_stream_queued_before_first_resource_entry() {
                 1,
                 &harness.identity,
                 0,
+                CallMode::Unary,
                 ValuePart::whole(ValueStorage::Inline(&[])),
             )
             .unwrap(),
@@ -922,6 +930,7 @@ async fn cancellation_before_resource_entry_is_not_executed() {
                 1,
                 &harness.identity,
                 0,
+                CallMode::Unary,
                 ValuePart::whole(ValueStorage::Inline(&[])),
             )
             .unwrap(),
@@ -960,6 +969,7 @@ async fn cancellation_during_incomplete_input_refuses_without_waiting_for_contin
         1,
         &harness.identity,
         1,
+        CallMode::ServerStream,
         ValuePart::first(2, ValueStorage::Inline(&[1])),
     )
     .unwrap();
@@ -989,6 +999,7 @@ async fn cancellation_during_incomplete_input_refuses_without_waiting_for_contin
                 2,
                 &harness.identity,
                 0,
+                CallMode::Unary,
                 ValuePart::whole(ValueStorage::Inline(&[])),
             )
             .unwrap(),
@@ -1013,6 +1024,7 @@ async fn chunked_open_uses_original_stream_admission() {
                 1,
                 &harness.identity,
                 1,
+                CallMode::ServerStream,
                 ValuePart::first(2, ValueStorage::Inline(&[1])),
             )
             .unwrap(),
@@ -1368,4 +1380,217 @@ async fn peer_end_waits_for_current_step_then_cleans_resource() {
         .unwrap()
         .unwrap();
     assert_eq!(observed.finished.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn mismatched_open_mode_is_not_executed_and_preserves_connection() {
+    for (method_idx, call_mode, method_mode, chunked) in [
+        (1, CallMode::Unary, CallMode::ServerStream, false),
+        (0, CallMode::ServerStream, CallMode::Unary, false),
+        (1, CallMode::Unary, CallMode::ServerStream, true),
+        (0, CallMode::ServerStream, CallMode::Unary, true),
+    ] {
+        let observed = Arc::new(Observed::default());
+        let mut harness = Harness::start(observed.clone(), ServerIpcConfig::default(), 0).await;
+        let value = if chunked {
+            ValuePart::first(2, ValueStorage::Inline(&[0]))
+        } else {
+            ValuePart::whole(ValueStorage::Inline(&[0]))
+        };
+        harness
+            .peer
+            .write_all(
+                &rpc::encode_open_frame(1, &harness.identity, method_idx, call_mode, value)
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let (id, flags, payload) = super::tests::read_reply_frame(&mut harness.peer).await;
+        assert_eq!(id, 1);
+        let header = frame::FrameHeader {
+            total_len: 12 + payload.len() as u32,
+            request_id: id,
+            flags,
+        };
+        let RpcRecord::CallEnd {
+            status,
+            error: Some(error),
+            complete_items,
+            ..
+        } = rpc::decode_rpc_record(&header, &payload, Some(call_mode)).unwrap()
+        else {
+            panic!("expected refusal")
+        };
+        assert_eq!(status, CallStatus::NotExecuted);
+        assert_eq!(complete_items, None);
+        assert_eq!(error.code, ErrorCode::UnsupportedCallMode);
+        let label = |mode| {
+            if mode == CallMode::Unary {
+                "unary"
+            } else {
+                "server_stream"
+            }
+        };
+        assert_eq!(
+            error.details,
+            std::collections::BTreeMap::from([
+                ("route".into(), "portable".into()),
+                ("method_idx".into(), method_idx.to_string()),
+                ("call_mode".into(), label(call_mode).into()),
+                ("method_mode".into(), label(method_mode).into()),
+            ])
+        );
+        assert_eq!(
+            error.message,
+            format!(
+                "call mode mismatch for route portable method index {method_idx}: the call is {}, the method is {}",
+                label(call_mode),
+                label(method_mode)
+            )
+        );
+        assert_eq!(observed.entries.load(Ordering::SeqCst), 0);
+        assert_eq!(observed.steps.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            harness
+                .server
+                .dispatcher
+                .read()
+                .resolve("portable")
+                .unwrap()
+                .scheduler
+                .snapshot()
+                .pending,
+            0
+        );
+        assert_eq!(harness.server.chunk_registry.active_count(), 0);
+        let conn = harness
+            .server
+            .active_connection(harness.server.active_connection_ids()[0])
+            .unwrap();
+        assert!(!conn.is_deactivated());
+        if chunked {
+            harness
+                .peer
+                .write_all(
+                    &rpc::encode_value_continuation_frame(
+                        1,
+                        RpcRecordKind::Open,
+                        ValueStorage::Inline(&[0]),
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+        }
+        harness
+            .peer
+            .write_all(
+                &rpc::encode_open_frame(
+                    2,
+                    &harness.identity,
+                    0,
+                    CallMode::Unary,
+                    ValuePart::whole(ValueStorage::Inline(&[])),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            read_record(&mut harness.peer, CallMode::Unary).await,
+            SeenRecord::End(CallStatus::Success, None, None)
+        ));
+        assert_eq!(observed.entries.load(Ordering::SeqCst), 1);
+        assert!(!conn.is_deactivated());
+        harness.stop().await;
+    }
+}
+
+#[tokio::test]
+async fn unknown_open_mode_and_cancel_cause_deactivate_but_preserve_dispatched_call() {
+    for unknown_open in [false, true] {
+        let observed = Arc::new(Observed::default());
+        let (entered, running) = oneshot::channel();
+        let (release, released) = mpsc::channel();
+        *observed.unary_entered.lock().unwrap() = Some(entered);
+        *observed.release_unary.lock().unwrap() = Some(released);
+        let mut harness = Harness::start(observed.clone(), ServerIpcConfig::default(), 0).await;
+        harness
+            .peer
+            .write_all(
+                &rpc::encode_open_frame(
+                    1,
+                    &harness.identity,
+                    0,
+                    CallMode::Unary,
+                    ValuePart::whole(ValueStorage::Inline(&[])),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), running)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut malformed = if unknown_open {
+            rpc::encode_open_frame(
+                2,
+                &harness.identity,
+                0,
+                CallMode::Unary,
+                ValuePart::whole(ValueStorage::Inline(&[])),
+            )
+            .unwrap()
+        } else {
+            rpc::encode_cancel_frame(1, rpc::CancelCause::Consumer).unwrap()
+        };
+        *malformed.last_mut().unwrap() = 2;
+        harness.peer.write_all(&malformed).await.unwrap();
+        let conn = harness
+            .server
+            .active_connection(harness.server.active_connection_ids()[0])
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !conn.is_deactivated() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        release.send(()).unwrap();
+        let mut success = false;
+        let mut refusal = !unknown_open;
+        while !success || !refusal {
+            let (id, flags, payload) = super::tests::read_reply_frame(&mut harness.peer).await;
+            let header = frame::FrameHeader {
+                total_len: 12 + payload.len() as u32,
+                request_id: id,
+                flags,
+            };
+            match rpc::decode_rpc_record(&header, &payload, Some(CallMode::Unary)).unwrap() {
+                RpcRecord::CallEnd {
+                    status: CallStatus::Success,
+                    ..
+                } => {
+                    assert_eq!(id, 1);
+                    assert!(!success);
+                    success = true;
+                }
+                RpcRecord::CallEnd {
+                    status: CallStatus::NotExecuted,
+                    error: Some(error),
+                    ..
+                } => {
+                    assert_eq!(id, 2);
+                    assert_eq!(error.code, ErrorCode::ResourceInputDeserializing);
+                    assert!(!refusal);
+                    refusal = true;
+                }
+                other => panic!("unexpected record: {other:?}"),
+            }
+        }
+        assert_eq!(observed.entries.load(Ordering::SeqCst), 1);
+        harness.stop().await;
+    }
 }

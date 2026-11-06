@@ -27,6 +27,7 @@ fn open_and_end_have_one_record_inside_the_sixteen_byte_envelope() {
         9,
         &identity(),
         3,
+        c2_wire::rpc::CallMode::Unary,
         ValuePart::whole(ValueStorage::Inline(b"x")),
     )
     .unwrap();
@@ -73,7 +74,7 @@ fn open_and_end_have_one_record_inside_the_sixteen_byte_envelope() {
 #[test]
 fn chunk_first_is_strictly_less_than_total_and_zero_loan_is_typed() {
     let part = ValuePart::first(3, ValueStorage::Inline(b"x"));
-    let open = encode_open_frame(2, &identity(), 1, part).unwrap();
+    let open = encode_open_frame(2, &identity(), 1, c2_wire::rpc::CallMode::Unary, part).unwrap();
     let (header, payload) = decode_frame(&open).unwrap();
     assert_eq!(
         header.flags,
@@ -107,6 +108,7 @@ fn chunk_first_is_strictly_less_than_total_and_zero_loan_is_typed() {
         2,
         &identity(),
         1,
+        c2_wire::rpc::CallMode::Unary,
         ValuePart::whole(ValueStorage::Shm(descriptor)),
     )
     .unwrap();
@@ -334,6 +336,7 @@ fn invalid_open_identity_still_exposes_original_shm_carrier() {
         8,
         &identity(),
         1,
+        c2_wire::rpc::CallMode::Unary,
         ValuePart::whole(ValueStorage::Shm(descriptor)),
     )
     .unwrap();
@@ -402,4 +405,89 @@ fn future_record_kinds_have_exact_shapes_and_reject_retired_flag_bit() {
         ..header
     };
     assert!(decode_rpc_record(&legacy_flag_header, payload, None).is_err());
+}
+
+#[test]
+fn open_roundtrips_call_mode_in_whole_and_first_chunk() {
+    for mode in [CallMode::Unary, CallMode::ServerStream] {
+        for value in [
+            ValuePart::whole(ValueStorage::Inline(b"x")),
+            ValuePart::first(2, ValueStorage::Inline(b"x")),
+        ] {
+            let wire = encode_open_frame(1, &identity(), 3, mode, value).unwrap();
+            let (header, payload) = decode_frame(&wire).unwrap();
+            let metadata = c2_wire::rpc::encode_open_metadata(&identity(), 3, mode).unwrap();
+            assert_eq!(&metadata[metadata.len() - 3..], &[3, 0, mode as u8]);
+            assert!(matches!(decode_rpc_record(&header, payload, None).unwrap(),
+                RpcRecord::Open { method_idx: 3, mode: actual, value: actual_value, .. }
+                if actual == mode && actual_value == value));
+        }
+    }
+}
+
+#[test]
+fn unknown_open_mode_and_cancel_cause_use_invalid_value() {
+    for value in [2, 255] {
+        let mut wire = encode_open_frame(
+            1,
+            &identity(),
+            0,
+            CallMode::Unary,
+            ValuePart::whole(ValueStorage::Inline(b"")),
+        )
+        .unwrap();
+        *wire.last_mut().unwrap() = value;
+        let (header, payload) = decode_frame(&wire).unwrap();
+        assert_eq!(
+            decode_rpc_record(&header, payload, None).unwrap_err(),
+            DecodeError::InvalidValue {
+                field: "call mode",
+                value: value.into()
+            }
+        );
+        let mut cancel = encode_cancel_frame(1, CancelCause::Consumer).unwrap();
+        *cancel.last_mut().unwrap() = value;
+        let (header, payload) = decode_frame(&cancel).unwrap();
+        assert_eq!(
+            decode_rpc_record(&header, payload, None).unwrap_err(),
+            DecodeError::InvalidValue {
+                field: "CANCEL cause",
+                value: value.into()
+            }
+        );
+    }
+}
+
+#[test]
+fn unknown_open_mode_preserves_whole_and_first_chunk_shm_carrier() {
+    let descriptor = BuddyPayload {
+        seg_idx: 1,
+        generation: 1,
+        offset: 0,
+        data_size: 1,
+        is_dedicated: false,
+        loan_id: 42,
+    };
+    for part in [
+        ValuePart::whole(ValueStorage::Shm(descriptor)),
+        ValuePart::first(2, ValueStorage::Shm(descriptor)),
+    ] {
+        let mut wire = encode_open_frame(1, &identity(), 0, CallMode::Unary, part).unwrap();
+        let mode_offset = 16
+            + c2_wire::rpc::encode_open_metadata(&identity(), 0, CallMode::Unary)
+                .unwrap()
+                .len()
+            - 1;
+        wire[mode_offset] = 2;
+        let (header, payload) = decode_frame(&wire).unwrap();
+        let failure = decode_rpc_record_with_carrier(&header, payload, None).unwrap_err();
+        assert_eq!(
+            failure.error,
+            DecodeError::InvalidValue {
+                field: "call mode",
+                value: 2
+            }
+        );
+        assert_eq!(failure.carrier, Some(descriptor));
+    }
 }

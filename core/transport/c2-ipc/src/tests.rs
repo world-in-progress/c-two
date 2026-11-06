@@ -73,6 +73,7 @@ mod client_tests {
             42,
             &call_identity("grid"),
             0,
+            c2_wire::rpc::CallMode::Unary,
             ValuePart::whole(ValueStorage::Inline(b"hello")),
         )
         .unwrap();
@@ -83,6 +84,7 @@ mod client_tests {
             identity,
             method_idx,
             value,
+            ..
         } = decode_rpc_record(&header, payload, None).unwrap()
         else {
             panic!("OPEN");
@@ -151,6 +153,7 @@ mod client_tests {
             99,
             &call_identity("grid"),
             3,
+            c2_wire::rpc::CallMode::Unary,
             ValuePart::whole(ValueStorage::Shm(descriptor)),
         )
         .unwrap();
@@ -161,6 +164,7 @@ mod client_tests {
             identity,
             method_idx,
             value,
+            ..
         } = decode_rpc_record(&header, payload, None).unwrap()
         else {
             panic!("OPEN");
@@ -180,6 +184,7 @@ mod client_tests {
             42,
             &call_identity("grid"),
             2,
+            c2_wire::rpc::CallMode::Unary,
             ValuePart::first(256, ValueStorage::Inline(&[0xab; 128])),
         )
         .unwrap();

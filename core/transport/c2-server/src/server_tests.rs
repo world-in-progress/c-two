@@ -1167,7 +1167,7 @@ async fn reserved_route_pending_cannot_activate_after_generation_change() {
     let route = admission_route(server, "grid", ConcurrencyMode::Parallel).await;
     let mut identity = call_identity("grid");
     identity.route_uid = route.route_uid.clone();
-    let request = reserve_accepted_route_execution(server, &identity, 0)
+    let request = reserve_accepted_route_execution(server, &identity, 0, CallMode::Unary)
         .ok()
         .expect("route reservation");
     assert_eq!(route.scheduler.snapshot().pending, 1);
@@ -1252,23 +1252,23 @@ async fn admission_keeps_contract_identity_and_method_error_priority() {
     identity.route_uid = route.route_uid.clone();
     server.close_business_admission("test").await;
     assert!(matches!(
-        reserve_accepted_route_execution(server, &identity, 0),
+        reserve_accepted_route_execution(server, &identity, 0, CallMode::Unary),
         Err(RouteAdmissionError::Acquire(SchedulerAcquireError::Closed))
     ));
     assert!(matches!(
-        reserve_accepted_route_execution(server, &identity, 99),
+        reserve_accepted_route_execution(server, &identity, 99, CallMode::Unary),
         Err(RouteAdmissionError::UnknownMethod { .. })
     ));
     let mut wrong = identity.clone();
     wrong.route_uid.push_str("-stale");
     assert!(matches!(
-        reserve_accepted_route_execution(server, &wrong, 99),
+        reserve_accepted_route_execution(server, &wrong, 99, CallMode::Unary),
         Err(RouteAdmissionError::RouteStale { .. })
     ));
     wrong = identity;
     wrong.abi_hash = "0".repeat(64);
     assert!(matches!(
-        reserve_accepted_route_execution(server, &wrong, 99),
+        reserve_accepted_route_execution(server, &wrong, 99, CallMode::Unary),
         Err(RouteAdmissionError::ContractMismatch { .. })
     ));
 }
@@ -1748,7 +1748,8 @@ async fn inline_dispatch_rejects_unknown_method_index_before_callback() {
     });
     server.register_route(route).await.unwrap();
 
-    let payload = encode_open_metadata(&call_identity("grid"), 99).unwrap();
+    let payload =
+        encode_open_metadata(&call_identity("grid"), 99, c2_wire::rpc::CallMode::Unary).unwrap();
     let (request_id, _flags, reply_payload) = call_over_connection(&server, 42, &payload).await;
 
     assert_eq!(request_id, 42);
@@ -1792,7 +1793,12 @@ async fn same_error_code_distinguishes_admission_from_resource_failure() {
     route.callback = Arc::new(FailingResource(Arc::clone(&calls)));
     server.register_route(route).await.unwrap();
 
-    let refused = c2_wire::rpc::encode_open_metadata(&call_identity("grid"), 99).unwrap();
+    let refused = c2_wire::rpc::encode_open_metadata(
+        &call_identity("grid"),
+        99,
+        c2_wire::rpc::CallMode::Unary,
+    )
+    .unwrap();
     let (_, _, refused_reply) = call_over_connection(&server, 1, &refused).await;
     assert_call_end_status(&refused_reply, c2_wire::rpc::CallStatus::NotExecuted);
     assert_eq!(
@@ -1801,7 +1807,12 @@ async fn same_error_code_distinguishes_admission_from_resource_failure() {
     );
     assert_eq!(calls.load(Ordering::SeqCst), 0);
 
-    let valid = c2_wire::rpc::encode_open_metadata(&call_identity("grid"), 0).unwrap();
+    let valid = c2_wire::rpc::encode_open_metadata(
+        &call_identity("grid"),
+        0,
+        c2_wire::rpc::CallMode::Unary,
+    )
+    .unwrap();
     let (_, _, failed_reply) = call_over_connection(&server, 2, &valid).await;
     assert_call_end_status(&failed_reply, c2_wire::rpc::CallStatus::Failed);
     assert_eq!(
@@ -1845,7 +1856,7 @@ async fn inline_dispatch_rejects_stale_route_token_before_callback() {
     let mut identity = call_identity("grid");
     identity.route_uid = "retired-grid-uid".into();
 
-    let payload = encode_open_metadata(&identity, 0).unwrap();
+    let payload = encode_open_metadata(&identity, 0, c2_wire::rpc::CallMode::Unary).unwrap();
     let (request_id, _flags, reply_payload) = call_over_connection(&server, 42, &payload).await;
 
     assert_eq!(request_id, 42);
@@ -1933,8 +1944,10 @@ async fn remote_callbacks_respect_server_wide_execution_limit_across_routes() {
         server.register_route(route).await.unwrap();
     }
 
-    let payload_a = encode_open_metadata(&call_identity("grid_a"), 0).unwrap();
-    let payload_b = encode_open_metadata(&call_identity("grid_b"), 0).unwrap();
+    let payload_a =
+        encode_open_metadata(&call_identity("grid_a"), 0, c2_wire::rpc::CallMode::Unary).unwrap();
+    let payload_b =
+        encode_open_metadata(&call_identity("grid_b"), 0, c2_wire::rpc::CallMode::Unary).unwrap();
 
     let first = {
         let server = Arc::clone(&server);
@@ -2063,8 +2076,12 @@ fn route_waiters_do_not_occupy_blocking_execution_threads() {
             server.register_route(route).await.unwrap();
         }
 
-        let payload_a = encode_open_metadata(&call_identity("grid_a"), 0).unwrap();
-        let payload_b = encode_open_metadata(&call_identity("grid_b"), 0).unwrap();
+        let payload_a =
+            encode_open_metadata(&call_identity("grid_a"), 0, c2_wire::rpc::CallMode::Unary)
+                .unwrap();
+        let payload_b =
+            encode_open_metadata(&call_identity("grid_b"), 0, c2_wire::rpc::CallMode::Unary)
+                .unwrap();
 
         let first_a = {
             let server = Arc::clone(&server);
@@ -2209,8 +2226,12 @@ fn unregister_closes_admission_before_waiting_on_blocking_pool_drain() {
             server.register_route(route).await.unwrap();
         }
 
-        let payload_a = encode_open_metadata(&call_identity("grid_a"), 0).unwrap();
-        let payload_b = encode_open_metadata(&call_identity("grid_b"), 0).unwrap();
+        let payload_a =
+            encode_open_metadata(&call_identity("grid_a"), 0, c2_wire::rpc::CallMode::Unary)
+                .unwrap();
+        let payload_b =
+            encode_open_metadata(&call_identity("grid_b"), 0, c2_wire::rpc::CallMode::Unary)
+                .unwrap();
 
         let first = {
             let server = Arc::clone(&server);
@@ -2428,7 +2449,8 @@ async fn shutdown_signal_waits_for_active_connection_drain_before_stopped() {
     .expect("connection should register");
     assert!(server.active_connection(conn_id).is_some());
     handshake_test_client(&mut client).await;
-    let payload = encode_open_metadata(&call_identity("grid"), 0).unwrap();
+    let payload =
+        encode_open_metadata(&call_identity("grid"), 0, c2_wire::rpc::CallMode::Unary).unwrap();
     client
         .write_all(&encode_frame(1, c2_wire::flags::FLAG_RPC_RECORD, &payload))
         .await
@@ -2538,8 +2560,10 @@ async fn unregister_cancels_request_waiting_for_server_execution_slot() {
         server.register_route(route).await.unwrap();
     }
 
-    let payload_a = encode_open_metadata(&call_identity("grid_a"), 0).unwrap();
-    let payload_b = encode_open_metadata(&call_identity("grid_b"), 0).unwrap();
+    let payload_a =
+        encode_open_metadata(&call_identity("grid_a"), 0, c2_wire::rpc::CallMode::Unary).unwrap();
+    let payload_b =
+        encode_open_metadata(&call_identity("grid_b"), 0, c2_wire::rpc::CallMode::Unary).unwrap();
 
     let first = {
         let server = Arc::clone(&server);
@@ -2675,7 +2699,9 @@ async fn connection_close_cancels_request_waiting_for_server_execution_slot() {
             .unwrap();
         let available = server.pending_requests.available_permits();
         for (rid, route) in [(1, "grid_a"), (2, "grid_b")] {
-            let payload = encode_open_metadata(&call_identity(route), 0).unwrap();
+            let payload =
+                encode_open_metadata(&call_identity(route), 0, c2_wire::rpc::CallMode::Unary)
+                    .unwrap();
             peer.as_mut()
                 .unwrap()
                 .write_all(&encode_frame(
@@ -2880,8 +2906,10 @@ async fn inline_dispatch_rejects_when_server_pending_capacity_is_exhausted() {
         server.register_route(route).await.unwrap();
     }
 
-    let payload_a = encode_open_metadata(&call_identity("grid_a"), 0).unwrap();
-    let payload_b = encode_open_metadata(&call_identity("grid_b"), 0).unwrap();
+    let payload_a =
+        encode_open_metadata(&call_identity("grid_a"), 0, c2_wire::rpc::CallMode::Unary).unwrap();
+    let payload_b =
+        encode_open_metadata(&call_identity("grid_b"), 0, c2_wire::rpc::CallMode::Unary).unwrap();
 
     let first = {
         let server = Arc::clone(&server);
@@ -3231,17 +3259,19 @@ fn open_metadata_precedes_shm_descriptor() {
         1,
         &call_identity("grid"),
         1,
+        c2_wire::rpc::CallMode::Unary,
         ValuePart::whole(ValueStorage::Shm(bp)),
     )
     .unwrap();
     let (header, payload) = c2_wire::frame::decode_frame(&frame).unwrap();
-    let (_, _, storage_offset) = c2_wire::rpc::decode_open_metadata(payload).unwrap();
+    let (_, _, _, storage_offset) = c2_wire::rpc::decode_open_metadata(payload).unwrap();
     assert_eq!(&payload[storage_offset..], &encode_buddy_payload(&bp));
     match c2_wire::rpc::decode_rpc_record(&header, payload, None).unwrap() {
         RpcRecord::Open {
             identity,
             method_idx,
             value,
+            ..
         } => {
             assert_eq!(identity.route_name, "grid");
             assert_eq!(method_idx, 1);
@@ -3269,7 +3299,7 @@ impl CrmCallback for EchoRequestBytes {
 }
 
 /// Read one complete reply frame from the client side of a local pair.
-async fn read_reply_frame(client: &mut LocalStream) -> (u64, u32, Vec<u8>) {
+pub(super) async fn read_reply_frame(client: &mut LocalStream) -> (u64, u32, Vec<u8>) {
     let mut len_buf = [0u8; 4];
     tokio::time::timeout(Duration::from_secs(5), client.read_exact(&mut len_buf))
         .await
@@ -4217,7 +4247,12 @@ async fn assert_bad_call_isolated(flags: u32, payload: &[u8], deactivates: bool)
     let conn = server
         .active_connection(server.active_connection_ids()[0])
         .unwrap();
-    let mut good = c2_wire::rpc::encode_open_metadata(&call_identity("grid"), 0).unwrap();
+    let mut good = c2_wire::rpc::encode_open_metadata(
+        &call_identity("grid"),
+        0,
+        c2_wire::rpc::CallMode::Unary,
+    )
+    .unwrap();
     good.extend_from_slice(b"accepted");
     client
         .write_all(&encode_frame(41, c2_wire::flags::FLAG_RPC_RECORD, &good))
@@ -4307,7 +4342,12 @@ fn reply_error_code(payload: &[u8]) -> ErrorCode {
 }
 
 fn bad_call_buddy_payload(loan_id: u64) -> Vec<u8> {
-    let mut payload = c2_wire::rpc::encode_open_metadata(&call_identity("grid"), 0).unwrap();
+    let mut payload = c2_wire::rpc::encode_open_metadata(
+        &call_identity("grid"),
+        0,
+        c2_wire::rpc::CallMode::Unary,
+    )
+    .unwrap();
     payload.extend_from_slice(&encode_buddy_payload(&BuddyPayload {
         seg_idx: 0,
         generation: 1,
@@ -4321,7 +4361,12 @@ fn bad_call_buddy_payload(loan_id: u64) -> Vec<u8> {
 
 #[tokio::test]
 async fn malformed_inline_call_control_only_fails_its_call() {
-    let mut payload = c2_wire::rpc::encode_open_metadata(&call_identity("grid"), 0).unwrap();
+    let mut payload = c2_wire::rpc::encode_open_metadata(
+        &call_identity("grid"),
+        0,
+        c2_wire::rpc::CallMode::Unary,
+    )
+    .unwrap();
     payload[2] = 0xff; // invalid UTF-8 in the first identity field
     assert_bad_call_isolated(c2_wire::flags::FLAG_RPC_RECORD, &payload, false).await;
 }
@@ -4393,7 +4438,14 @@ fn value_chunk_call_frame(
         } else {
             ValuePart::first(total_bytes, ValueStorage::Inline(data))
         };
-        encode_open_frame(request_id, &call_identity(identity), 0, value).unwrap()
+        encode_open_frame(
+            request_id,
+            &call_identity(identity),
+            0,
+            c2_wire::rpc::CallMode::Unary,
+            value,
+        )
+        .unwrap()
     } else {
         encode_value_continuation_frame(request_id, RpcRecordKind::Open, ValueStorage::Inline(data))
             .unwrap()
@@ -4738,7 +4790,12 @@ async fn first_chunk_write_precedes_later_unary_on_same_connection() {
             .write_all(&value_chunk_call_frame(1, 0, 11, b"first-", "grid"))
             .await
             .unwrap();
-        let mut unary = c2_wire::rpc::encode_open_metadata(&call_identity("grid"), 1).unwrap();
+        let mut unary = c2_wire::rpc::encode_open_metadata(
+            &call_identity("grid"),
+            1,
+            c2_wire::rpc::CallMode::Unary,
+        )
+        .unwrap();
         unary.extend_from_slice(b"read");
         client
             .write_all(&encode_frame(2, c2_wire::flags::FLAG_RPC_RECORD, &unary))
@@ -5351,6 +5408,7 @@ async fn unnegotiated_buddy_chunk_frame_is_refused_with_correlated_error() {
                 44,
                 &call_identity("grid"),
                 0,
+                c2_wire::rpc::CallMode::Unary,
                 c2_wire::rpc::ValuePart::first(256, c2_wire::rpc::ValueStorage::Shm(descriptor)),
             )
             .unwrap(),
@@ -5400,6 +5458,7 @@ fn inline_call_frame(request_id: u64, identity: &str, data: &[u8]) -> Vec<u8> {
         request_id,
         &call_identity(identity),
         0,
+        c2_wire::rpc::CallMode::Unary,
         c2_wire::rpc::ValuePart::whole(c2_wire::rpc::ValueStorage::Inline(data)),
     )
     .unwrap()
@@ -5410,6 +5469,7 @@ fn shm_call_frame(request_id: u64, identity: &str, descriptor: BuddyPayload) -> 
         request_id,
         &call_identity(identity),
         0,
+        c2_wire::rpc::CallMode::Unary,
         c2_wire::rpc::ValuePart::whole(c2_wire::rpc::ValueStorage::Shm(descriptor)),
     )
     .unwrap()
@@ -6390,7 +6450,12 @@ impl ShutdownReplyFixture {
             completed,
             release,
         };
-        let payload = c2_wire::rpc::encode_open_metadata(&call_identity("grid"), 0).unwrap();
+        let payload = c2_wire::rpc::encode_open_metadata(
+            &call_identity("grid"),
+            0,
+            c2_wire::rpc::CallMode::Unary,
+        )
+        .unwrap();
         if chunked {
             for index in 0..2 {
                 fixture
@@ -6466,7 +6531,12 @@ async fn shutdown_preserves_active_reply_refuses_new_calls_and_fences_lifecycle_
             !f.conn.is_deactivated(),
             "active response must retain business write admission"
         );
-        let payload = c2_wire::rpc::encode_open_metadata(&call_identity("grid"), 0).unwrap();
+        let payload = c2_wire::rpc::encode_open_metadata(
+            &call_identity("grid"),
+            0,
+            c2_wire::rpc::CallMode::Unary,
+        )
+        .unwrap();
         f.peer
             .write_all(&encode_frame(2, c2_wire::flags::FLAG_RPC_RECORD, &payload))
             .await
@@ -6766,7 +6836,12 @@ async fn saturated_writer_preserves_business_errors_capacity_replies_and_other_c
         .next()
         .unwrap()
         .clone();
-    let success = c2_wire::rpc::encode_open_metadata(&call_identity("grid"), 0).unwrap();
+    let success = c2_wire::rpc::encode_open_metadata(
+        &call_identity("grid"),
+        0,
+        c2_wire::rpc::CallMode::Unary,
+    )
+    .unwrap();
     for id in 1..=CALLS {
         peer.write_all(&encode_frame(id, c2_wire::flags::FLAG_RPC_RECORD, &success))
             .await
@@ -6785,7 +6860,12 @@ async fn saturated_writer_preserves_business_errors_capacity_replies_and_other_c
         server.pending_requests.available_permits() <= 128 - 65,
         "pending admission covers replies waiting for the writer"
     );
-    let business_error = c2_wire::rpc::encode_open_metadata(&call_identity("grid"), 1).unwrap();
+    let business_error = c2_wire::rpc::encode_open_metadata(
+        &call_identity("grid"),
+        1,
+        c2_wire::rpc::CallMode::Unary,
+    )
+    .unwrap();
     peer.write_all(&encode_frame(
         101,
         c2_wire::flags::FLAG_RPC_RECORD,
@@ -6793,7 +6873,12 @@ async fn saturated_writer_preserves_business_errors_capacity_replies_and_other_c
     ))
     .await
     .unwrap();
-    let capacity_error = c2_wire::rpc::encode_open_metadata(&call_identity("limited"), 0).unwrap();
+    let capacity_error = c2_wire::rpc::encode_open_metadata(
+        &call_identity("limited"),
+        0,
+        c2_wire::rpc::CallMode::Unary,
+    )
+    .unwrap();
     peer.write_all(&encode_frame(
         102,
         c2_wire::flags::FLAG_RPC_RECORD,
@@ -7355,7 +7440,12 @@ async fn zero_business_pending_budget_keeps_control_and_capacity_replies() {
         .await
         .unwrap();
     handshake_test_client(&mut peer).await;
-    let call = c2_wire::rpc::encode_open_metadata(&call_identity("grid"), 0).unwrap();
+    let call = c2_wire::rpc::encode_open_metadata(
+        &call_identity("grid"),
+        0,
+        c2_wire::rpc::CallMode::Unary,
+    )
+    .unwrap();
     peer.write_all(&encode_frame(1, c2_wire::flags::FLAG_RPC_RECORD, &call))
         .await
         .unwrap();
@@ -7418,7 +7508,12 @@ async fn deactivation_keeps_calls_waiting_for_route_or_global_execution() {
         let conn = server
             .active_connection(server.active_connection_ids()[0])
             .unwrap();
-        let mut payload = c2_wire::rpc::encode_open_metadata(&call_identity("grid"), 0).unwrap();
+        let mut payload = c2_wire::rpc::encode_open_metadata(
+            &call_identity("grid"),
+            0,
+            c2_wire::rpc::CallMode::Unary,
+        )
+        .unwrap();
         payload.extend_from_slice(b"queued");
         peer.write_all(&encode_frame(1, c2_wire::flags::FLAG_RPC_RECORD, &payload))
             .await
@@ -7485,7 +7580,12 @@ async fn deactivation_and_shutdown_preserve_started_chunked_calls() {
             } else {
                 conn.end(ConnectionEndReason::ProtocolError, "test_deactivation");
             }
-            let inline = c2_wire::rpc::encode_open_metadata(&call_identity("grid"), 0).unwrap();
+            let inline = c2_wire::rpc::encode_open_metadata(
+                &call_identity("grid"),
+                0,
+                c2_wire::rpc::CallMode::Unary,
+            )
+            .unwrap();
             peer.write_all(&encode_frame(2, c2_wire::flags::FLAG_RPC_RECORD, &inline))
                 .await
                 .unwrap();
@@ -7558,7 +7658,12 @@ async fn shutdown_preserves_accepted_calls_behind_route_and_global_gates() {
             "global" => Some(server.execution_scheduler.try_acquire(0).unwrap()),
             _ => None,
         };
-        let payload = c2_wire::rpc::encode_open_metadata(&call_identity("grid"), 0).unwrap();
+        let payload = c2_wire::rpc::encode_open_metadata(
+            &call_identity("grid"),
+            0,
+            c2_wire::rpc::CallMode::Unary,
+        )
+        .unwrap();
         peer.write_all(&encode_frame(1, c2_wire::flags::FLAG_RPC_RECORD, &payload))
             .await
             .unwrap();
@@ -7661,6 +7766,7 @@ async fn buddy_chunk_continuations_survive_deactivation_and_shutdown() {
                         1,
                         &call_identity("grid"),
                         0,
+                        c2_wire::rpc::CallMode::Unary,
                         c2_wire::rpc::ValuePart::first(
                             8,
                             c2_wire::rpc::ValueStorage::Shm(descriptor),
@@ -7703,8 +7809,12 @@ async fn buddy_chunk_continuations_survive_deactivation_and_shutdown() {
                             "test_buddy_deactivation",
                         );
                     }
-                    let new_call =
-                        c2_wire::rpc::encode_open_metadata(&call_identity("grid"), 0).unwrap();
+                    let new_call = c2_wire::rpc::encode_open_metadata(
+                        &call_identity("grid"),
+                        0,
+                        c2_wire::rpc::CallMode::Unary,
+                    )
+                    .unwrap();
                     peer.write_all(&encode_frame(2, c2_wire::flags::FLAG_RPC_RECORD, &new_call))
                         .await
                         .unwrap();
@@ -7762,6 +7872,7 @@ async fn whole_open_over_payload_limit_is_not_executed() {
         2,
         &call_identity("grid"),
         0,
+        c2_wire::rpc::CallMode::Unary,
         c2_wire::rpc::ValuePart::first(128, c2_wire::rpc::ValueStorage::Inline(&[7; 64])),
     )
     .unwrap();
@@ -8065,6 +8176,7 @@ async fn incomplete_call_end_preserves_running_queued_calls_and_releases() {
             id,
             &call_identity("grid"),
             0,
+            c2_wire::rpc::CallMode::Unary,
             ValuePart::whole(ValueStorage::Inline(input)),
         )
         .unwrap();
@@ -8168,4 +8280,119 @@ async fn incomplete_call_end_preserves_running_queued_calls_and_releases() {
     assert!(conn.calls.lock().active().next().is_none());
     assert!(conn.try_close());
     drop((writer, reader, input_writer, input_peer));
+}
+
+#[tokio::test]
+async fn mode_refused_shm_open_and_retired_continuation_release_original_loans() {
+    for chunked in [false, true] {
+        let server = chunk_test_server("ipc://mode_refused_shm", 8);
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut route = make_host_route(&server, "grid");
+        route.callback = Arc::new(EchoRequestBytes {
+            calls: calls.clone(),
+        });
+        let scheduler = route.scheduler.clone();
+        server.register_route(route).await.unwrap();
+        let mut pool = MemPool::new_with_prefix(
+            PoolConfig {
+                segment_size: 64 * 1024,
+                min_block_size: 4096,
+                max_segments: 1,
+                ..Default::default()
+            },
+            unique_response_pool_prefix("mode-refused"),
+        )
+        .unwrap();
+        let (mut peer, stream) = isolated_pair().await;
+        let handler = tokio::spawn(handle_connection(server.clone(), stream));
+        handshake_test_client_with(&mut peer, CAP_SHM_REQUEST, pool.prefix()).await;
+        let conn = server
+            .active_connection(server.active_connection_ids()[0])
+            .unwrap();
+        for index in 0..if chunked { 2 } else { 1 } {
+            let mut handle = pool.alloc_shm_handle(4).unwrap();
+            pool.handle_slice_mut(&mut handle).copy_from_slice(b"data");
+            let alloc = handle.shm_allocation().unwrap();
+            let descriptor = BuddyPayload {
+                seg_idx: alloc.seg_idx as u16,
+                generation: alloc.generation,
+                offset: alloc.offset,
+                data_size: 4,
+                is_dedicated: alloc.is_dedicated,
+                loan_id: 101 + index,
+            };
+            let frame = if index == 0 {
+                rpc::encode_open_frame(
+                    1,
+                    &call_identity("grid"),
+                    0,
+                    CallMode::ServerStream,
+                    if chunked {
+                        ValuePart::first(8, ValueStorage::Shm(descriptor))
+                    } else {
+                        ValuePart::whole(ValueStorage::Shm(descriptor))
+                    },
+                )
+                .unwrap()
+            } else {
+                rpc::encode_value_continuation_frame(
+                    1,
+                    RpcRecordKind::Open,
+                    ValueStorage::Shm(descriptor),
+                )
+                .unwrap()
+            };
+            peer.write_all(&frame).await.unwrap();
+            let mut released = false;
+            let mut refused = index != 0;
+            while !released || !refused {
+                let (id, flags, payload) = read_reply_frame(&mut peer).await;
+                let bytes = encode_frame(id, flags, &payload);
+                let (header, payload) = c2_wire::frame::decode_frame(&bytes).unwrap();
+                match rpc::decode_rpc_record(&header, payload, Some(CallMode::ServerStream))
+                    .unwrap()
+                {
+                    RpcRecord::Release(batch) => {
+                        assert!(!released);
+                        assert_eq!(batch.ids(), &[descriptor.loan_id]);
+                        released = true;
+                    }
+                    RpcRecord::CallEnd {
+                        status: CallStatus::NotExecuted,
+                        error: Some(error),
+                        ..
+                    } => {
+                        assert!(!refused, "retired chunks cannot produce another terminal");
+                        assert_eq!(error.code, ErrorCode::UnsupportedCallMode);
+                        refused = true;
+                    }
+                    other => panic!("unexpected record: {other:?}"),
+                }
+            }
+            pool.release_handle(handle);
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(scheduler.snapshot().pending, 0);
+        assert_eq!(server.chunk_registry.active_count(), 0);
+        assert!(!conn.is_deactivated());
+        peer.write_all(
+            &rpc::encode_open_frame(
+                2,
+                &call_identity("grid"),
+                0,
+                CallMode::Unary,
+                ValuePart::whole(ValueStorage::Inline(b"next")),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        let (id, _, payload) = read_reply_frame(&mut peer).await;
+        assert_eq!(id, 2);
+        assert_call_end_status(&payload, CallStatus::Success);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(!conn.is_deactivated());
+        drop(peer);
+        handler.await.unwrap();
+    }
 }

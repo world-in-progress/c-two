@@ -796,7 +796,7 @@ impl IpcClient {
             entry.upload_stop = Some(upload_stop);
             entry.forward = Some(call.clone());
         }
-        let metadata = rpc::encode_open_metadata(&identity, index)
+        let metadata = rpc::encode_open_metadata(&identity, index, CallMode::ServerStream)
             .map_err(|e| pre_dispatch_call_error(IpcError::Protocol(e.to_string())))?;
         let chunk_size = self
             .forward_chunk_size(data_size, send_reservation.bytes(), metadata.len())
@@ -890,7 +890,7 @@ impl IpcClient {
         let (send, rx) = self
             .begin_pending(PendingKind::Call(CallMode::Unary))
             .map_err(pre_dispatch_call_error)?;
-        let metadata = rpc::encode_open_metadata(&identity, index)
+        let metadata = rpc::encode_open_metadata(&identity, index, CallMode::Unary)
             .map_err(|e| pre_dispatch_call_error(IpcError::Protocol(e.to_string())))?;
         let chunk_size = self
             .forward_chunk_size(data_size, send_reservation.bytes(), metadata.len())

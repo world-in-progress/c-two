@@ -44,6 +44,7 @@ struct Observed {
     consumed: AtomicUsize,
     peak_ahead: AtomicUsize,
     progress_gate: parking_lot::Mutex<()>,
+    unary_calls: AtomicUsize,
     opened: AtomicUsize,
     finished: AtomicUsize,
     fail_second_item: AtomicBool,
@@ -94,6 +95,7 @@ impl CrmCallback for Resource {
         input: Vec<u8>,
         _: Arc<ResponsePool>,
     ) -> Result<ResponseMeta, CrmError> {
+        self.0.unary_calls.fetch_add(1, Ordering::SeqCst);
         assert_eq!(method, 0);
         if input.is_empty() {
             return Ok(ResponseMeta::Inline(b"pong".to_vec()));
@@ -412,17 +414,25 @@ impl Fixture {
     }
 
     fn request(&self, count: u32, size: u32) -> reqwest::RequestBuilder {
+        self.method_request("echo", true)
+            .body([count.to_le_bytes(), size.to_le_bytes()].concat())
+    }
+
+    fn method_request(&self, method: &str, stream: bool) -> reqwest::RequestBuilder {
         let client = reqwest::Client::builder().no_proxy().build().unwrap();
-        client
-            .post(format!("http://{}/portable/echo", self.socket))
-            .header("accept", stream_wire::MEDIA_TYPE)
+        let request = client
+            .post(format!("http://{}/portable/{method}", self.socket))
             .header("x-c2-expected-crm-ns", &self.entry.crm_ns)
             .header("x-c2-expected-crm-name", &self.entry.crm_name)
             .header("x-c2-expected-crm-ver", &self.entry.crm_ver)
             .header("x-c2-expected-abi-hash", &self.entry.abi_hash)
             .header("x-c2-expected-signature-hash", &self.entry.signature_hash)
-            .header("x-c2-route-uid", &self.entry.route_uid)
-            .body([count.to_le_bytes(), size.to_le_bytes()].concat())
+            .header("x-c2-route-uid", &self.entry.route_uid);
+        if stream {
+            request.header("accept", stream_wire::MEDIA_TYPE)
+        } else {
+            request
+        }
     }
 
     async fn stop(self) {
@@ -1362,4 +1372,159 @@ async fn token_cancel_after_lifecycle_cancel_finishes_without_another_copy_windo
         drop(body);
         fixture.stop().await;
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mismatched_http_call_modes_are_not_executed_and_keep_upstream() {
+    use crate::client::{
+        HttpCallControl, HttpCallPhase, HttpError, HttpStreamCancellation, RelayAwareClientConfig,
+        RelayAwareHttpClient,
+    };
+    use c2_error::ErrorCode;
+    let fixture = Fixture::start(false, 64 * 1024).await;
+    let (lease, _) = bounded(fixture.state.acquire_upstream_for_route(&fixture.entry))
+        .await
+        .unwrap_or_else(|_| panic!("upstream acquire failed"));
+    let original = lease.client();
+    let original_observation = original.connection_observation().unwrap();
+    drop(lease);
+
+    let response = bounded(
+        fixture
+            .method_request("echo", false)
+            .body([1u32.to_le_bytes(), 64u32.to_le_bytes()].concat())
+            .send(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(response.status(), 406);
+    let error: serde_json::Value =
+        serde_json::from_slice(&bounded(response.bytes()).await.unwrap()).unwrap();
+    assert_eq!(error["code"], 716);
+    assert_eq!(error["name"], "UnsupportedCallMode");
+    assert_eq!(error["details"]["dispatch_phase"], "pre_dispatch");
+    assert_eq!(error["details"]["call_mode"], "unary");
+    assert_eq!(error["details"]["method_mode"], "server_stream");
+    assert_eq!(fixture.observed.opened.load(Ordering::SeqCst), 0);
+    assert_eq!(fixture.observed.produced.load(Ordering::SeqCst), 0);
+    let response = bounded(
+        fixture
+            .method_request("ping", false)
+            .body(Vec::new())
+            .send(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(bounded(response.bytes()).await.unwrap().as_ref(), b"pong");
+
+    let before = fixture.observed.unary_calls.load(Ordering::SeqCst);
+    let response = bounded(fixture.method_request("ping", true).body(Vec::new()).send())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.headers()["content-type"], stream_wire::MEDIA_TYPE);
+    let body = bounded(response.bytes()).await.unwrap();
+    let (kind, len) = stream_wire::decode_header(body[..9].try_into().unwrap()).unwrap();
+    assert_eq!(kind, HttpStreamRecordKind::CallEnd);
+    assert_eq!(
+        len as usize,
+        body.len() - 9,
+        "one terminal and no other records"
+    );
+    let terminal = stream_wire::decode_terminal(&body[9..]).unwrap();
+    assert_eq!(terminal.status, HttpStreamStatus::NotExecuted);
+    assert_eq!(terminal.complete_items, None);
+    assert_eq!(terminal.error.unwrap().code, ErrorCode::UnsupportedCallMode);
+    assert_eq!(fixture.observed.unary_calls.load(Ordering::SeqCst), before);
+    let response = bounded(
+        fixture
+            .method_request("ping", false)
+            .body(Vec::new())
+            .send(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(bounded(response.bytes()).await.unwrap().as_ref(), b"pong");
+
+    let descriptor = ValidatedContractDescriptor::from_json(DESCRIPTOR).unwrap();
+    let expected = c2_contract::ExpectedRouteContract {
+        route_name: "portable".into(),
+        crm_ns: descriptor.crm_namespace().into(),
+        crm_name: descriptor.crm_name().into(),
+        crm_ver: descriptor.crm_version().into(),
+        abi_hash: descriptor.abi_hash().into(),
+        signature_hash: descriptor.signature_hash().into(),
+    };
+    let client = RelayAwareHttpClient::new(
+        &format!("http://{}", fixture.socket),
+        expected,
+        false,
+        RelayAwareClientConfig::default(),
+    )
+    .unwrap()
+    .with_http_only();
+    let budget = c2_mem::retention::PayloadBufferBudget::new(64 * 1024);
+    let control =
+        HttpCallControl::new(|| Ok(()), || Ok(())).with_payload_budget(budget.clone(), None);
+    let error = bounded(client.call_controlled_async(
+        "echo",
+        Arc::new([1u32.to_le_bytes(), 64u32.to_le_bytes()].concat()),
+        &control,
+    ))
+    .await
+    .unwrap_err();
+    assert_eq!(error.phase(), HttpCallPhase::PreDispatch);
+    assert!(error.is_retry_safe());
+    let (status, envelope) = match error.source_error() {
+        HttpError::ServerError(status, body) => (*status, body.as_bytes()),
+        HttpError::ResponseError(status, body) => (*status, body.as_ref()),
+        other => panic!("expected HTTP error envelope: {other:?}"),
+    };
+    assert_eq!(status, 406);
+    let envelope: serde_json::Value = serde_json::from_slice(envelope).unwrap();
+    assert_eq!(envelope["code"], 716);
+    assert_eq!(fixture.observed.opened.load(Ordering::SeqCst), 0);
+    let before = fixture.observed.unary_calls.load(Ordering::SeqCst);
+    let mut stream = bounded(client.stream_controlled_async(
+        "ping",
+        Arc::new(Vec::<u8>::new()),
+        budget.try_reserve(1).unwrap(),
+        Box::new(()),
+        HttpStreamCancellation::new(),
+        &control,
+    ))
+    .await
+    .unwrap();
+    let error = bounded(stream.recv()).await.unwrap_err();
+    let HttpError::LocalCallRejected(error) = error else {
+        panic!("expected NotExecuted")
+    };
+    assert_eq!(error.code, ErrorCode::UnsupportedCallMode);
+    assert_eq!(error.details["transport_phase"], "pre_dispatch");
+    assert_eq!(error.details["dispatch_phase"], "pre_dispatch");
+    let terminal = bounded(stream.completion()).await.unwrap();
+    assert_eq!(terminal.status, HttpStreamStatus::NotExecuted);
+    assert_eq!(terminal.error.unwrap().code, ErrorCode::UnsupportedCallMode);
+    assert_eq!(fixture.observed.unary_calls.load(Ordering::SeqCst), before);
+    assert_eq!(
+        bounded(client.call_controlled_async("ping", Arc::new(Vec::<u8>::new()), &control))
+            .await
+            .unwrap()
+            .as_ref(),
+        b"pong"
+    );
+    drop(stream);
+    drop(client);
+    let (lease, _) = bounded(fixture.state.acquire_upstream_for_route(&fixture.entry))
+        .await
+        .unwrap_or_else(|_| panic!("upstream reacquire failed"));
+    assert!(Arc::ptr_eq(&original, &lease.client()));
+    assert!(original.is_connected());
+    assert_eq!(
+        original.connection_observation().unwrap().connection_id(),
+        original_observation.connection_id()
+    );
+    drop(lease);
+    fixture.stop().await;
 }

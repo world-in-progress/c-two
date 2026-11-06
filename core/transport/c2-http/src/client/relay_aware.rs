@@ -833,8 +833,8 @@ fn route_is_stale(err: &HttpError) -> bool {
 
 fn relay_rejection_is_pre_dispatch(error: &HttpError) -> bool {
     let body = match error {
-        HttpError::ResponseError(404 | 409 | 410 | 429 | 502 | 503, body) => body.as_ref(),
-        HttpError::ServerError(404 | 409 | 410 | 429 | 502 | 503, body) => body.as_bytes(),
+        HttpError::ResponseError(404 | 406 | 409 | 410 | 429 | 502 | 503, body) => body.as_ref(),
+        HttpError::ServerError(404 | 406 | 409 | 410 | 429 | 502 | 503, body) => body.as_bytes(),
         _ => return false,
     };
     let Ok(envelope) = serde_json::from_slice::<c2_error::C2ErrorEnvelope>(body) else {
@@ -1328,6 +1328,23 @@ mod tests {
         rejected["details"]["dispatch_phase"] = json!("pre_dispatch");
         assert_eq!(
             http_call_error_phase(&HttpError::ServerError(404, rejected.to_string())),
+            HttpCallPhase::PreDispatch
+        );
+        let mut unsupported =
+            canonical_error_json(716, "UnsupportedCallMode", "not executed", "grid");
+        unsupported["details"]["dispatch_phase"] = json!("pre_dispatch");
+        assert_eq!(
+            http_call_error_phase(&HttpError::ServerError(406, unsupported.to_string())),
+            HttpCallPhase::PreDispatch
+        );
+        let bytes = unsupported.to_string().into_bytes();
+        let budget = PayloadBufferBudget::new(bytes.capacity() as u64);
+        let reservation = budget.try_reserve(bytes.capacity() as u64).unwrap();
+        assert_eq!(
+            http_call_error_phase(&HttpError::ResponseError(
+                406,
+                BudgetedBuffer::new(bytes, reservation)
+            )),
             HttpCallPhase::PreDispatch
         );
         let mut unavailable =

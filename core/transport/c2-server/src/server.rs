@@ -3003,7 +3003,14 @@ async fn handle_rpc_record(
                 drop(request_storage(server, conn, ValueStorage::Shm(descriptor)));
             }
             if failure.error == frame::DecodeError::ZeroLoanId
-                || matches!(failure.error, frame::DecodeError::InvalidRpcEnvelope { .. })
+                || matches!(
+                    failure.error,
+                    frame::DecodeError::InvalidRpcEnvelope { .. }
+                        | frame::DecodeError::InvalidValue {
+                            field: "call mode",
+                            ..
+                        }
+                )
                 || duplicate
                 || (header.flags & c2_wire::flags::FLAG_BUDDY != 0 && failure.carrier.is_none())
             {
@@ -3067,6 +3074,7 @@ async fn handle_rpc_record(
         RpcRecord::Open {
             identity,
             method_idx,
+            mode,
             value,
         } => {
             let call = new_call.expect("first OPEN published before admission");
@@ -3085,7 +3093,8 @@ async fn handle_rpc_record(
                 .await;
                 return;
             }
-            let route = match reserve_accepted_route_execution(server, &identity, method_idx) {
+            let route = match reserve_accepted_route_execution(server, &identity, method_idx, mode)
+            {
                 Ok(route) => route,
                 Err(error) => {
                     drop(data);
@@ -3326,6 +3335,12 @@ enum RouteAdmissionError {
         route_name: String,
         method_idx: u16,
     },
+    CallModeMismatch {
+        route_name: String,
+        method_idx: u16,
+        call_mode: CallMode,
+        method_mode: CallMode,
+    },
     Acquire(SchedulerAcquireError),
 }
 
@@ -3407,6 +3422,7 @@ fn reserve_accepted_route_execution(
     server: &Server,
     identity: &RouteCallIdentity,
     method_idx: u16,
+    call_mode: CallMode,
 ) -> Result<RouteExecutionAdmission, RouteAdmissionError> {
     // Lookup and route reservation share the dispatcher publication boundary.
     // Identity errors still precede host availability.
@@ -3458,6 +3474,15 @@ fn reserve_accepted_route_execution(
         return Err(RouteAdmissionError::UnknownMethod {
             route_name: route.name.clone(),
             method_idx,
+        });
+    }
+    let method_mode = route.method_modes[method_idx as usize];
+    if call_mode != method_mode {
+        return Err(RouteAdmissionError::CallModeMismatch {
+            route_name: route.name.clone(),
+            method_idx,
+            call_mode,
+            method_mode,
         });
     }
     let pending_permit = route
@@ -3603,6 +3628,29 @@ fn route_admission_reply(err: RouteAdmissionError) -> Vec<u8> {
             (
                 ErrorCode::ResourceFunctionExecuting,
                 format!("unknown method index {method_idx} for route {route_name}"),
+            )
+        }
+        RouteAdmissionError::CallModeMismatch {
+            route_name,
+            method_idx,
+            call_mode,
+            method_mode,
+        } => {
+            let label = |mode| match mode {
+                CallMode::Unary => "unary",
+                CallMode::ServerStream => "server_stream",
+            };
+            let call_mode = label(call_mode);
+            let method_mode = label(method_mode);
+            details.insert("route".into(), route_name.clone());
+            details.insert("method_idx".into(), method_idx.to_string());
+            details.insert("call_mode".into(), call_mode.into());
+            details.insert("method_mode".into(), method_mode.into());
+            (
+                ErrorCode::UnsupportedCallMode,
+                format!(
+                    "call mode mismatch for route {route_name} method index {method_idx}: the call is {call_mode}, the method is {method_mode}"
+                ),
             )
         }
         RouteAdmissionError::Acquire(SchedulerAcquireError::Closed) => {

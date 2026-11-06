@@ -1089,8 +1089,9 @@ impl IpcClient {
                         is_dedicated: alloc.is_dedicated,
                         loan_id: loan.id(),
                     });
-                    let metadata = rpc::encode_open_metadata(&identity, index)
-                        .map_err(|error| IpcError::Protocol(error.to_string()))?;
+                    let metadata =
+                        rpc::encode_open_metadata(&identity, index, CallMode::ServerStream)
+                            .map_err(|error| IpcError::Protocol(error.to_string()))?;
                     let bytes = frame::encode_frame_parts(
                         0,
                         flags::FLAG_RPC_RECORD | flags::FLAG_BUDDY,
@@ -1109,7 +1110,7 @@ impl IpcClient {
             }
             let size = self.config.chunk_size as usize;
             if data.as_ref().len() > size {
-                let metadata = rpc::encode_open_metadata(&identity, index)
+                let metadata = rpc::encode_open_metadata(&identity, index, CallMode::ServerStream)
                     .map_err(|error| IpcError::Protocol(error.to_string()))?;
                 for (part, bytes) in data.as_ref().chunks(size).enumerate() {
                     if *stop_upload.borrow() {
@@ -1129,7 +1130,7 @@ impl IpcClient {
                 }
                 Ok(())
             } else {
-                let metadata = rpc::encode_open_metadata(&identity, index)
+                let metadata = rpc::encode_open_metadata(&identity, index, CallMode::ServerStream)
                     .map_err(|error| IpcError::Protocol(error.to_string()))?;
                 send.conn
                     .submit(
