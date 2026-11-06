@@ -363,6 +363,18 @@ On macOS with the FastDB sibling, the Rust Core workspace (1900 tests), c3, the 
 
 The defect surfaced as a Windows x64 failure of `test_call_unknown_route_404` in run 42110086137. New tests send each of 25 refusals over real TCP, finish the body after the relay has started discarding it, and check the complete refusal and a normal end of stream; others cover Expect, unknown lengths, the deadline and a body whose reading had already started. On macOS with the FastDB sibling the Rust Core workspace (1906 tests), c3, the Rust SDK, the CI Python gates and the repository checks passed on the integrated tree. The exact candidate `4e29a3f3` passed [run 42120578509](https://github.com/Dsssyc/c-two/actions/runs/42120578509) on every lane at the first attempt: Linux x64 with Python 3.12 and 3.14t, macOS arm64, and Windows x64 and ARM64.
 
+## Call mode in OPEN
+
+### Behavior
+
+- An IPC 16 OPEN record now carries the mode of the call, unary or server stream, after the method index. A client writes the mode of the call it makes, and a relay writes the mode its `Accept` header selects. Before the call takes a call slot, the server compares that mode with the method's mode in the contract and refuses a mismatch as NotExecuted with `UnsupportedCallMode` (716), whose details name `call_mode` and `method_mode`; the connection stays active. Through a relay, a server-stream method called without the stream media type gets HTTP 406, and a unary method called with it gets a stream whose only record is a NotExecuted CALL_END. Before this change the server took the mode from the contract alone while the relay followed the header, so a hand-written request with the wrong header was found out only after dispatch: a stream method forwarded as unary ran one step and the relay retired its upstream connection, a unary method forwarded as a stream ran and its result was lost, and both calls were reported as dispatch-uncertain. SDK clients always sent the right header and were not affected.
+- An OPEN with an unknown mode value is a protocol error: the server refuses it as NotExecuted and deactivates the connection, and the calls already sent on it finish.
+- The Rust relay-aware client reports a 406 refusal that carries `dispatch_phase=pre_dispatch` as pre-dispatch.
+
+### Validation
+
+New tests cover the OPEN layout with both modes for whole values and first chunks, unknown mode and CANCEL cause values, mismatched OPENs in both directions on a real IPC connection, including a chunked SHM OPEN whose later chunks are discarded and whose loans are returned, and both HTTP cases over real TCP, where the resource does not run and the same upstream connection serves the next call. On macOS with the FastDB sibling, the Rust Core workspace (1913 tests), c3, the Rust SDK, the CI Python gates (1455 ordinary tests, including the relay tests, 25 portable and 14 TypeScript) and the repository checks (977) passed on the integrated tree.
+
 ## Connection close on Windows
 
 ### Fixed

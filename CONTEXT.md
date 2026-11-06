@@ -66,6 +66,10 @@ _Avoid_: simple call, request (for the whole call)
 A call that sends one input and returns zero or more items, declared with `@cc.stream`; its contract method carries `"mode": "server_stream"`.
 _Avoid_: subscription, streaming call (for this kind alone)
 
+**调用模式 / call mode**:
+Whether a call is a unary call or a server stream. A contract method declares its mode; each call states the mode it uses, and the server refuses a call whose mode differs from its method's before the call enters the resource.
+_Avoid_: call type, call kind
+
 **条目 / item**:
 One complete domain value a server stream delivers per iteration; it may travel as several chunks.
 _Avoid_: message, event, element

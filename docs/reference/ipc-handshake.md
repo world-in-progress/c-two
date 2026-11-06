@@ -45,7 +45,7 @@ Any other bit is rejected; IPC 15 used `0x0400` for its last chunk, and version 
 
 | Kind | Record | Body after the kind byte | Direction and `request_id` |
 | --- | --- | --- | --- |
-| 1 | OPEN | identity, method index (u16), input value | Client to server, non-zero |
+| 1 | OPEN | identity, method index (u16), call mode (u8): Unary 0, ServerStream 1, input value | Client to server, non-zero |
 | 2 | ITEM_BEGIN | item length (u64) | Server to client, non-zero; server streams only |
 | 3 | ITEM_DATA | one part of an item, inline or one SHM descriptor | Server to client, non-zero; server streams only |
 | 4 | CREDIT | storage bytes (u64), item demand (u64) | Client to server, non-zero; server streams only |
@@ -53,7 +53,7 @@ Any other bit is rejected; IPC 15 used `0x0400` for its last chunk, and version 
 | 6 | CALL_END | status (u8), result or error | Server to client, non-zero; Success and Failed of a server-stream call also carry its count of complete items (u64) after the status |
 | 7 | RELEASE | count (u8, 1 to 64), loan IDs (u64 each) | Both directions, `request_id` 0 |
 
-The identity in OPEN is the seven route and contract fields `route_name`, `route_uid`, `crm_ns`, `crm_name`, `crm_ver`, `abi_hash` and `signature_hash`, each a u8 byte length followed by UTF-8 text, validated as before. OPEN carries no mode and no initial demand: the mode comes from the validated contract, and a server stream starts with demand for one item.
+The identity in OPEN is the seven route and contract fields `route_name`, `route_uid`, `crm_ns`, `crm_name`, `crm_ver`, `abi_hash` and `signature_hash`, each a u8 byte length followed by UTF-8 text, validated as before. OPEN carries the mode of the call and no initial demand; a server stream starts with demand for one item. A client writes the mode of the call it makes, and a relay the mode its HTTP `Accept` header selects. After the identity and method index checks, and before the call takes a call slot, the server compares that mode with the method's mode in the validated contract and refuses a mismatch as NotExecuted with `UnsupportedCallMode` (716), whose details name `call_mode` and `method_mode`; the connection stays active. An unknown mode value is a protocol error: the server refuses that OPEN as NotExecuted and deactivates the connection.
 
 CALL_END has one status: Success (0), Failed (1) or NotExecuted (2). Failed and NotExecuted carry a non-empty inline C2E1 error. NotExecuted means the call never entered the resource: the server sends it only while the call is still being prepared or queued, so a client can report it as pre-dispatch even though OPEN was written. Failed means the resource ran. NotExecuted never carries an item count, so a receiver reads the count only when the status is Success or Failed and the call's validated mode is a server stream. A server stream's CALL_END is one inline frame, so its body after the kind byte is at most 4294967282 bytes; a relay keeps the same bound for the terminal records of the HTTP streams it forwards.
 
@@ -67,7 +67,7 @@ A frame write that exceeds `write_timeout` deactivates the connection, but a cal
 
 ## Server streams
 
-A server stream opens with one OPEN, and the validated contract gives its mode. Once the server admits it, the stream has demand for one item. The server runs a resource step only while the stream has demand, and each step yields one item, finishes or raises. A call has at most one unfinished item.
+A server stream opens with one OPEN whose mode is ServerStream. Once the server admits it, the stream has demand for one item. The server runs a resource step only while the stream has demand, and each step yields one item, finishes or raises. A call has at most one unfinished item.
 
 Each item starts with ITEM_BEGIN, which carries the item's length; an item of length zero is complete at ITEM_BEGIN and has no ITEM_DATA. On ITEM_BEGIN the client reserves the whole length in its payload buffer budget and only then sends CREDIT for that many storage bytes; while the budget is short only this call waits, and the receive loop goes on with other frames. An item longer than the whole budget fails at once: the consumer receives `CallCapacityExceeded` and the client sends CANCEL, keeping the call's record until CALL_END. Once storage has been granted, the server sends the item either as one SHM ITEM_DATA that carries the whole item and uses up all storage granted so far, or as inline ITEM_DATA parts, each no longer than the storage still granted and at most `chunk_size` long, so other calls' frames pass between them. A client that consumes the item grants the whole item at once. A relay that forwards the stream grants one copy window at a time, so it can receive a whole SHM item under a smaller grant; it copies that item in slices and ends its read range after the last one. An SHM ITEM_DATA that does not carry the whole item, or an item that mixes SHM and inline parts, is a protocol error and deactivates the connection; its SHM descriptor is still released to the original connection. Inline ITEM_DATA carries no chunk flags and no offset: each part continues where the item's received bytes end. The client copies a whole SHM item outside its receive loop, so it keeps reading other calls' frames during the copy, and it delivers the call's CALL_END only after that item.
 
