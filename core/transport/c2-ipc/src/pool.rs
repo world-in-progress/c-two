@@ -95,7 +95,7 @@ fn differing_client_policy_fields(
         file_backing_budget_bytes,
         live_reassembly_budget_bytes,
     );
-    compare!(cached, requested; shm_threshold, pool_decay_seconds);
+    compare!(cached, requested; shm_threshold, pool_decay_seconds, client_idle_timeout_secs);
     if differing.is_empty() {
         differing.push("none");
     }
@@ -171,7 +171,10 @@ impl PoolReferences {
             Err(_) => false,
         }
     }
-    fn expired(&self, grace: Duration) -> bool {
+    fn expired(&self, grace: Option<Duration>) -> bool {
+        let Some(grace) = grace else {
+            return false;
+        };
         if self.count.load(Ordering::Acquire) != 0 {
             return false;
         }
@@ -425,7 +428,8 @@ pub struct ClientPool {
     endpoint_context: Result<LocalEndpointContext, String>,
     connection_event_source: Option<c2_local::ConnectionEventSource>,
     state: Arc<Mutex<CacheState>>,
-    grace_period: Duration,
+    grace_period: Option<Duration>,
+    sweeper: Mutex<Option<tokio::task::JoinHandle<()>>>,
     default_config: Mutex<Option<ClientIpcConfig>>,
     drain_gate: Mutex<()>,
 }
@@ -478,21 +482,26 @@ impl ClientCloseObservation<'_> {
 }
 
 impl ClientPool {
-    pub fn new(grace_period: Duration) -> Self {
+    /// Retain unreferenced clients for this duration. None disables timed
+    /// eviction; an explicit zero duration makes them expire immediately.
+    pub fn new(grace_period: impl Into<Option<Duration>>) -> Self {
         Self::from_endpoint_context(
-            grace_period,
+            grace_period.into(),
             LocalEndpointContext::default_for_platform().map_err(|error| error.to_string()),
         )
     }
-    pub fn with_endpoint_context(grace_period: Duration, context: LocalEndpointContext) -> Self {
-        Self::from_endpoint_context(grace_period, Ok(context))
+    pub fn with_endpoint_context(
+        grace_period: impl Into<Option<Duration>>,
+        context: LocalEndpointContext,
+    ) -> Self {
+        Self::from_endpoint_context(grace_period.into(), Ok(context))
     }
     pub fn with_connection_event_source(mut self, source: c2_local::ConnectionEventSource) -> Self {
         self.connection_event_source = Some(source);
         self
     }
     fn from_endpoint_context(
-        grace_period: Duration,
+        grace_period: Option<Duration>,
         endpoint_context: Result<LocalEndpointContext, String>,
     ) -> Self {
         Self {
@@ -507,6 +516,7 @@ impl ClientPool {
                 next_record: 0,
             })),
             grace_period,
+            sweeper: Mutex::new(None),
             default_config: Mutex::new(None),
             drain_gate: Mutex::new(()),
         }
@@ -700,7 +710,8 @@ impl ClientPool {
             .endpoint_context()?
             .endpoint(address)
             .map_err(crate::control::endpoint_error)?;
-        crate::sync_client::shared_io_handle(deadline)?;
+        let io = crate::sync_client::shared_io_handle(deadline)?;
+        self.start_sweeper(&io, deadline)?;
         let mut attempt = 0;
         let client = loop {
             crate::client::connect_check(deadline, "pool_connect")?;
@@ -823,13 +834,44 @@ impl ClientPool {
         Ok(true)
     }
     pub fn sweep_expired(&self) {
+        Self::sweep_expired_state(&self.state, self.grace_period);
+    }
+
+    fn start_sweeper(
+        &self,
+        io: &tokio::runtime::Handle,
+        deadline: ConnectDeadline,
+    ) -> Result<(), IpcError> {
+        let Some(grace) = self.grace_period else {
+            return Ok(());
+        };
+        let mut sweeper = connect_lock(&self.sweeper, deadline, "pool_maintenance_wait")?;
+        if sweeper.is_none() {
+            let state = Arc::downgrade(&self.state);
+            let interval = grace.clamp(Duration::from_millis(1), Duration::from_secs(1));
+            *sweeper = Some(io.spawn(async move {
+                let mut ticks = tokio::time::interval(interval);
+                ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    ticks.tick().await;
+                    let Some(state) = state.upgrade() else {
+                        return;
+                    };
+                    Self::sweep_expired_state(&state, Some(grace));
+                }
+            }));
+        }
+        Ok(())
+    }
+
+    fn sweep_expired_state(state: &Mutex<CacheState>, grace: Option<Duration>) {
         let detached = {
-            let mut state = self.state.lock();
+            let mut state = state.lock();
             state.records.retain(|_, record| !record.complete());
             let expired: Vec<_> = state
                 .entries
                 .iter()
-                .filter(|(_, entry)| entry.references.expired(self.grace_period))
+                .filter(|(_, entry)| entry.references.expired(grace))
                 .map(|(address, _)| address.clone())
                 .collect();
             expired
@@ -935,6 +977,15 @@ impl ClientPool {
         self.state.lock().entries.contains_key(address)
     }
 }
+
+impl Drop for ClientPool {
+    fn drop(&mut self) {
+        if let Some(sweeper) = self.sweeper.get_mut().take() {
+            sweeper.abort();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

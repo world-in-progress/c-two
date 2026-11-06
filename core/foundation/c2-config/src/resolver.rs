@@ -113,6 +113,7 @@ pub struct ServerIpcConfigOverrides {
 
 #[derive(Debug, Clone, Default)]
 pub struct ClientIpcConfigOverrides {
+    pub client_idle_timeout_secs: Option<f64>,
     pub write_timeout_secs: Option<f64>,
     pub max_dedicated_segments: Option<u32>,
     pub spill_threshold: Option<f64>,
@@ -579,6 +580,7 @@ fn resolve_client_ipc_config(
 
     resolve_ipc_fields!(base, &mut cfg.base, &overrides, catalog);
     resolve_ipc_fields!(&mut cfg, &overrides, catalog;
+        client_idle_timeout_secs: optional_f64("C2_IPC_CLIENT_IDLE_TIMEOUT"),
         pool_decay_seconds: optional_f64("C2_IPC_POOL_DECAY_SECONDS"),
     );
 

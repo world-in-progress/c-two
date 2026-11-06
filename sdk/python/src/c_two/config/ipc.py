@@ -77,6 +77,10 @@ class ServerIPCOverrides(BaseIPCOverrides, total=False):
 class ClientIPCOverrides(BaseIPCOverrides, total=False):
     """Client-side IPC code-level overrides."""
 
+    # Seconds an unreferenced cached connection is retained (default 60).
+    # Zero disables timed eviction.
+    client_idle_timeout: float
+
     # Idle window before the client's own request/reassembly buddy segments
     # may be retired while the connection stays open. Zero retires idle
     # segments at the next maintenance tick; negative values are rejected.

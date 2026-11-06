@@ -58,6 +58,7 @@ pub const SERVER_IPC_OVERRIDE_KEYS: &[&str] = &[
 
 /// Code-level IPC override fields accepted for client config resolution.
 pub const CLIENT_IPC_OVERRIDE_KEYS: &[&str] = &[
+    "client_idle_timeout",
     "write_timeout",
     "max_dedicated_segments",
     "spill_threshold",
@@ -159,6 +160,10 @@ pub struct ServerIpcConfig {
 pub struct ClientIpcConfig {
     pub base: BaseIpcConfig,
     pub shm_threshold: u64,
+    /// Seconds an unreferenced cached connection is retained before eviction.
+    /// Zero disables timed eviction; dispatched calls still finish when an
+    /// expired connection is deactivated.
+    pub client_idle_timeout_secs: f64,
     /// Idle window before the client's own request/reassembly buddy segments
     /// may be retired by the connection's periodic maintenance task while the
     /// connection stays open. `0` retires idle segments at the next maintenance
@@ -219,6 +224,7 @@ impl Default for ClientIpcConfig {
         Self {
             base: BaseIpcConfig::default(),
             shm_threshold: 4_096,
+            client_idle_timeout_secs: 60.0,
             pool_decay_seconds: 60.0,
         }
     }
@@ -506,6 +512,14 @@ impl ServerIpcConfig {
 impl ClientIpcConfig {
     pub fn validate(&self) -> Result<(), String> {
         self.base.validate()?;
+        let idle_timeout =
+            Duration::try_from_secs_f64(self.client_idle_timeout_secs).map_err(|_| {
+                "client_idle_timeout_secs must be finite, non-negative and representable in seconds"
+                    .to_owned()
+            })?;
+        if idle_timeout.as_millis() > u128::from(u64::MAX) {
+            return Err("client_idle_timeout_secs must fit in milliseconds".into());
+        }
         if !self.pool_decay_seconds.is_finite() {
             return Err(format!(
                 "pool_decay_seconds ({}) must be finite",
@@ -514,6 +528,12 @@ impl ClientIpcConfig {
         }
         validate_duration_secs("pool_decay_seconds", self.pool_decay_seconds)?;
         Ok(())
+    }
+
+    /// Cache retention after boundary validation. None disables timed eviction.
+    pub fn client_idle_timeout(&self) -> Option<Duration> {
+        (self.client_idle_timeout_secs != 0.0)
+            .then(|| Duration::from_secs_f64(self.client_idle_timeout_secs))
     }
 
     /// Owner-pool role tuning for the client's own request and reassembly

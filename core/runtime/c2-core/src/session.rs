@@ -1205,7 +1205,7 @@ impl Runtime {
                         .get_or_insert_with(|| {
                             Arc::new(
                                 c2_ipc::ClientPool::with_endpoint_context(
-                                    Duration::from_secs(60),
+                                    config.client_idle_timeout(),
                                     context.clone(),
                                 )
                                 .with_connection_event_source(events),
@@ -1240,7 +1240,7 @@ impl Runtime {
                 .get_or_insert_with(|| {
                     Arc::new(
                         c2_ipc::ClientPool::with_endpoint_context(
-                            Duration::from_secs(60),
+                            config.client_idle_timeout(),
                             context.clone(),
                         )
                         .with_connection_event_source(events),
