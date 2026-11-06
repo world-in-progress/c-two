@@ -291,6 +291,8 @@ exact implementation candidate 必须通过 GitHub Actions 的 Linux、macOS、W
 
 块 6 也分两步实施（2026-11-05 补记）。块 6 跨 Rust Core、Rust SDK、Python 与两个代码生成目标，一次做完的差异比块 5b 还大，难以审查。6a 做 Rust Core 与 Rust SDK：Runtime 注册与推进流路由，服务端流条目改用所在 Runtime 的载荷缓冲预算，shutdown 与注销结束流，客户端的流句柄、截止时间、Drop 与 close，经 relay 的流方法在块 8 之前于派发前拒绝，以及代码生成的 Rust 目标；AGENTS.md 里 shutdown 的承诺随 6a 修改。6b 做 Python：`@cc.stream`、`Stream[T]`、hold、contextvars、借用输入、同进程对象直传与有限截止时间的拒绝、代码生成的 Python 目标，以及 Python 与 Rust 资源、客户端交叉的直接 IPC 矩阵。下面列给块 6 的顺带项按所在的层分开：有限调用名额的释放顺序与服务端流的预算归 6a，其余归 6b。两步合起来的退出条件与原表相同。
 
+块 9 分四步实施（2026-11-06 补记）。表里的验收范围随后来的决定收窄：relay 不再把调用转给另一个 relay（块 8），双跳组合取消；生成的 TypeScript 经 relay 的流随 TypeScript 运行时那一批再做（第十二节第 10 条），Node→Python 的 relay 组合顺延到那一批。relay 单跳因此做 Python 客户端→Rust 资源与 Rust 客户端→Python 资源两种组合。9a 只读盘点：把第九节的直接 IPC 矩阵、relay 组合与异常表，以及闲置驱逐审查的六道门禁，逐项对到现有测试，列出缺口及应补的位置，不写代码。9b 按 9a 的缺口补测试，测出的产品缺陷照常修。9c 做基准：先用现有的 `ipc-memory-paired.yml` 以分支起点 `d772ca3a` 为基线跑 unary 回归，按第十二节第 7 条的门槛判断；再给配对基准加上服务端流与同内容的整份 unary、多次 unary 的对照行。9d 写验收记录，并在最终的确切候选上跑全平台 CI。9a 与 9c 可以同时开始，9b 在 9a 之后。
+
 关键路径为块 1、3 → 4 → 5 → 6、7 → 8 → 9，块 1、2、3 可以同时开始。第一阶段是块 1 至 4，仍为 IPC 15，对外只有两项设置改名；第二阶段是块 5 至 8，IPC 16 与 ABI 8 同批切换；第三阶段是块 9。每个阶段结束时，整合分支跑一次全平台 CI。块 6 与块 7 都改 `c2-codegen/src/targets.rs`，各自只动本目标的生成函数，共用的方法遍历与 mode 处理由块 2 定下。
 
 顺带做掉同一块里的小待办：
