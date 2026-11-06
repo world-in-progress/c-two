@@ -6,6 +6,7 @@ uses current native codegen, and retains command/Node logs under the platform te
 """
 from __future__ import annotations
 
+from contextlib import contextmanager
 import json
 import os
 from pathlib import Path
@@ -390,3 +391,564 @@ def test_generated_node_relay_local_rebuilds_after_endpoint_deactivation(
             relay.stop()
             assert not list(Path(ipc_root).glob("*.lease"))
             assert not any(path.is_socket() for path in Path(ipc_root).iterdir())
+
+
+@pytest.fixture(scope="module")
+def idle_node_project(persistent_node_project):
+    """Generate the resource's instance evidence as an ordinary portable result."""
+    from tests.fixtures.typescript_idle_gates import IdleGate
+
+    root, node = persistent_node_project
+    artifacts = cc.contract.compile_artifacts(
+        cc.contract.export_descriptor(IdleGate).encode(), target="typescript",
+    )
+    for artifact in artifacts.artifacts:
+        destination = root / "generated/gates" / artifact.relative_path
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(artifact.bytes)
+    _run([node, str(root / "node_modules/typescript/bin/tsc"), "--project", str(root / "tsconfig.json")], root, "compile-idle-gates")
+    return root, node
+
+
+@pytest.fixture
+def node_gate_root(monkeypatch):
+    import tempfile
+
+    with tempfile.TemporaryDirectory(prefix="c2-n9b-", dir="/tmp" if os.name != "nt" else None) as root:
+        ipc_root = root if os.name != "nt" else None
+        if ipc_root is None:
+            monkeypatch.delenv("C2_IPC_ROOT", raising=False)
+        else:
+            monkeypatch.setenv("C2_IPC_ROOT", ipc_root)
+        monkeypatch.setenv("C2_ENV_FILE", "")
+        monkeypatch.setenv("C2_RELAY_ANCHOR_ADDRESS", "")
+        monkeypatch.setenv("C2_IPC_CLIENT_IDLE_TIMEOUT", "0")
+        yield ipc_root
+        assert not list(Path(root).glob("*.lease"))
+        assert not any(path.is_socket() for path in Path(root).iterdir())
+
+
+def _gate_wait(predicate, message: str):
+    import threading
+    import time
+
+    deadline = time.monotonic() + 8
+    wake = threading.Event()
+    while time.monotonic() < deadline:
+        result = predicate()
+        if result:
+            return result
+        wake.wait(0.005)
+    pytest.fail(message)
+
+
+def _gate_error(result):
+    _reject(result)
+    error = result["error"]
+    return json.loads(error["body"]) if "body" in error else error
+
+
+def _gate_identity(result, identity, path):
+    _ok(result)
+    assert result["value"]["server_id"] == identity["server_id"], result
+    assert result["value"]["server_instance_id"] == identity["server_instance_id"], result
+    observation = result["observations"][-1]
+    assert observation["path"] == path, result
+    assert observation["routeUid"], result
+    if path != "RelayAwareHttp":
+        assert observation["serverId"] == identity["server_id"], result
+        assert observation["serverInstanceId"] == identity["server_instance_id"], result
+
+
+@pytest.mark.parametrize("mode", ["direct", "relay-local", "http"])
+def test_generated_node_closed_route_keeps_dispatched_sibling_and_first_cause(
+    idle_node_project, node_gate_root, start_c3_relay, tmp_path, mode,
+):
+    """Gates 2/4/6: closed lookup is current, A drains, and IPC cause survives.
+
+    Unregistration while B is inside its resource supplies the deterministic
+    closed interval. A is already inside its own resource when B closes.
+    HTTP uses the relay's current withdrawal authority. Direct IPC also checks
+    the generated transport's public name-based prepare separately from call.
+    """
+    from tests.fixtures.typescript_idle_gates import GateResource, IdleGate, node_gate_client
+    from concurrent.futures import ThreadPoolExecutor
+
+    relay = start_c3_relay(idle_timeout=0) if mode != "direct" else None
+    server = cc.Runtime()
+    server.set_local_endpoint(root=node_gate_root)
+    if relay:
+        server.set_relay_anchor(relay.url)
+    manager, builder = GateResource(), GateResource()
+    executor = ThreadPoolExecutor(max_workers=1)
+    path = {"direct": "DirectIpc", "relay-local": "RelayAwareLocalIpc", "http": "RelayAwareHttp"}[mode]
+    try:
+        server.register(IdleGate, manager, name="manager")
+        server.register(IdleGate, builder, name="builder")
+        identity = dict(server._runtime_session.ensure_server())
+        manager.identity = builder.identity = identity
+        bridge = server._runtime_session.ensure_server_bridge()
+        scheduler = bridge.get_local_slot_info("builder")[1]
+        address = server.server_address() if mode == "direct" else relay.url
+        with node_gate_client(idle_node_project, tmp_path, address, node_gate_root, mode=mode, portable=True) as node:
+            _gate_identity(node(), identity, path)
+            ready = node(route="builder")
+            _gate_identity(ready, identity, path)
+            assert manager.calls == builder.calls == 1
+            if mode != "http":
+                assert ready["physicalConnections"] == 1, ready
+            manager.block = True
+            _ok(node("start-call", id="a"))
+            assert manager.entered.wait(5), "A did not enter the resource"
+            builder.block = True
+            _ok(node("start-call", route="builder", id="b"))
+            assert builder.entered.wait(5), "B did not enter the resource"
+            try:
+                closing = executor.submit(bridge.unregister_crm, "builder")
+                _gate_wait(lambda: scheduler.snapshot().closed, "route admission did not close")
+                acquired = node("prepare", route="builder") if mode == "direct" else None
+                if mode == "http":
+                    def withdrawn():
+                        result = node(route="builder")
+                        assert builder.calls == 2, result
+                        return result if _gate_error(result)["code"] == 701 else None
+                    refused = _gate_wait(withdrawn, "relay did not withdraw its closed route")
+                else:
+                    refused = node(route="builder")
+                assert builder.calls == 2, refused
+                assert manager.calls == 2
+            finally:
+                manager.release.set()
+                builder.release.set()
+            completed = node("finish-call", id="a")
+            _gate_identity(completed, identity, path)
+            assert completed["value"]["calls"] == 2
+            assert len({item["routeUid"] for item in completed["observations"] if item["routeName"] == "manager"}) == 1
+            drained_b = node("finish-call", id="b")
+            _gate_identity(drained_b, identity, path)
+            assert drained_b["value"]["calls"] == 2
+            cleanup = closing.result(timeout=5)
+            assert cleanup["local_removed"] and cleanup["close"]["active_drained"], cleanup
+            (tmp_path / "closed-gate-evidence.json").write_text(json.dumps({
+                "mode": mode, "identity": identity, "manager_calls": manager.calls,
+                "builder_calls": builder.calls, "acquired": acquired,
+                "refused": refused, "completed": completed, "cleanup": cleanup,
+            }, indent=2), encoding="utf-8")
+            if mode == "http":
+                assert _gate_error(refused)["name"] == "ResourceNotFound"
+                assert refused["physicalConnections"] == 0
+            else:
+                if mode == "direct":
+                    assert acquired is not None
+                    error = _gate_error(acquired)
+                    call_error = _gate_error(refused)
+                    assert call_error["code"] == 707, refused
+                    assert call_error["transportPhase"] == "pre_dispatch", refused
+                    assert call_error["retrySafe"] is True, refused
+                else:
+                    assert _gate_error(refused)["name"] == "FallbackDenied", refused
+                    error = refused["error"]["cause"]
+                    assert all(item["method"] == "GET" for item in refused["http"]), refused
+                assert error["code"] == 707, refused
+                assert error["transportPhase"] == "pre_dispatch", refused
+                assert error["retrySafe"] is True, refused
+                assert refused["physicalConnections"] == 1, refused
+    finally:
+        manager.release.set()
+        builder.release.set()
+        executor.shutdown(wait=True)
+        assert server.shutdown(timeout=5)["completed"]
+        manager.close()
+        builder.close()
+        if relay:
+            relay.stop()
+
+
+_GATE_PATHS = {"direct": "DirectIpc", "relay-local": "RelayAwareLocalIpc", "http": "RelayAwareHttp"}
+
+
+def _save_gate(work, name, **evidence):
+    (work / f"{name}-evidence.json").write_text(json.dumps(evidence, indent=2), encoding="utf-8")
+
+
+@contextmanager
+def _gate_host(root, work, relay=None, *, late_builder=False):
+    from tests.fixtures.typescript_idle_gates import AcceptedConnections, GateResource, IdleGate
+
+    server = cc.Runtime()
+    server.set_local_endpoint(root=root)
+    if relay:
+        server.set_relay_anchor(relay.url)
+    connections = AcceptedConnections(server.connection_events())
+    manager, builder = GateResource(), GateResource()
+    if late_builder:
+        class LateManager(GateResource):
+            def ping(self):
+                result = super().ping()
+                if self.calls == 1:
+                    server.register(IdleGate, builder, name="builder")
+                return result
+        manager = LateManager()
+    try:
+        server.start()
+        for connection_id in connections.snapshot()["active"]:
+            connections.wait_closed({connection_id})
+        server.register(IdleGate, manager, name="manager")
+        if not late_builder:
+            server.register(IdleGate, builder, name="builder")
+        identity = dict(server._runtime_session.ensure_server())
+        manager.identity = builder.identity = identity
+        yield server, manager, builder, identity, connections
+    finally:
+        manager.release.set()
+        builder.release.set()
+        cleanup = server.shutdown(timeout=5)
+        assert cleanup["completed"], cleanup
+        manager.close()
+        builder.close()
+        assert server.call_execution_snapshot()["used_operations"] == 0
+        memory = server.memory_stats()
+        assert memory["holds"]["active_holds"] == 0
+        _save_gate(work, "host-cleanup", shutdown=cleanup, memory=memory, connections=connections.snapshot())
+        connections.events.close()
+
+
+def test_generated_node_http_late_route_reuses_upstream_connection(
+    idle_node_project, node_gate_root, start_c3_relay, tmp_path,
+):
+    """Gate 1 HTTP: persistent manager sees late builder on the same upstream."""
+    from tests.fixtures.typescript_idle_gates import node_gate_client
+
+    relay = start_c3_relay(idle_timeout=0)
+    try:
+        with _gate_host(node_gate_root, tmp_path, relay, late_builder=True) as (server, manager, builder, identity, connections):
+            with node_gate_client(idle_node_project, tmp_path, relay.url, node_gate_root, mode="http", portable=True) as node:
+                first = node()
+                _gate_identity(first, identity, "RelayAwareHttp")
+                initial = connections.snapshot()
+                late = node(route="builder")
+                _gate_identity(late, identity, "RelayAwareHttp")
+                final = node()
+                _gate_identity(final, identity, "RelayAwareHttp")
+                assert manager.calls == 2 and builder.calls == 1
+                assert [item["routeName"] for item in final["observations"]] == ["manager", "builder", "manager"]
+                assert first["observations"][-1]["routeUid"] == final["observations"][-1]["routeUid"]
+                assert late["observations"][-1]["routeUid"] != final["observations"][-1]["routeUid"]
+                assert final["physicalConnections"] == 0
+                assert connections.snapshot()["opened"] == initial["opened"]
+                missing = node(route="never-registered")
+                assert _gate_error(missing)["code"] == 701, missing
+                assert manager.calls == 2 and builder.calls == 1
+                assert sum(item["method"] == "POST" for item in missing["http"]) == 3
+                _save_gate(tmp_path, "late-http", identity=identity, result=final, absent=missing,
+                           connections=connections.snapshot(), manager_calls=manager.calls, builder_calls=builder.calls)
+    finally:
+        relay.stop()
+
+
+@pytest.mark.parametrize("mode", ["direct", "relay-local"])
+def test_generated_node_background_idle_eviction_and_concurrent_reconnect(
+    idle_node_project, node_gate_root, start_c3_relay, tmp_path, monkeypatch, mode,
+):
+    """Gate 3: an unreferenced cached carrier is evicted without another acquire.
+
+    A refused first acquire leaves no bound proxy, as the documented idle rule
+    requires. The persistent generated transport survives. Server events prove
+    eviction before eight simultaneous manager calls share one reconnect.
+    """
+    from tests.fixtures.typescript_idle_gates import node_gate_client
+
+    monkeypatch.setenv("C2_IPC_CLIENT_IDLE_TIMEOUT", "0.05")
+    relay = start_c3_relay(idle_timeout=0) if mode != "direct" else None
+    try:
+        with _gate_host(node_gate_root, tmp_path, relay) as (server, manager, builder, identity, connections):
+            scheduler = server._runtime_session.ensure_server_bridge().get_local_slot_info("manager")[1]
+            address = server.server_address() if mode == "direct" else relay.url
+            baseline = connections.snapshot()
+            with node_gate_client(idle_node_project, tmp_path, address, node_gate_root, mode=mode, portable=True) as node:
+                if mode == "relay-local":
+                    _ok(node("pause", target="resolve"))
+                    _ok(node("start-call", route="builder", id="lookup"))
+                    _ok(node("wait-paused"))
+                removed = server._runtime_session.ensure_server_bridge().unregister_crm("builder")
+                assert removed["local_removed"]
+                if mode == "relay-local":
+                    _ok(node("resume"))
+                    refused = node("finish-call", id="lookup")
+                    assert _gate_error(refused)["code"] == 714, refused
+                    assert refused["error"]["cause"]["code"] == 708, refused
+                else:
+                    refused = node(route="builder")
+                    assert _gate_error(refused)["code"] == 708, refused
+                before_idle = connections.snapshot()
+                old = set(before_idle["opened"]) - set(baseline["opened"])
+                assert len(old) == 1, (baseline, before_idle, refused)
+                closed_id = connections.wait_closed(old)
+                assert manager.calls == builder.calls == 0
+                assert not scheduler.snapshot().closed
+                after_idle = connections.snapshot()
+                rebuilt = _ok(node("call-many", count=8))
+                assert manager.calls == 8 and builder.calls == 0
+                assert all(item["value"]["server_id"] == identity["server_id"] for item in rebuilt["outcomes"])
+                assert all(item["value"]["server_instance_id"] == identity["server_instance_id"] for item in rebuilt["outcomes"])
+                assert {item["path"] for item in rebuilt["observations"]} == {_GATE_PATHS[mode]}
+                assert len({item["routeUid"] for item in rebuilt["observations"]}) == 1
+                assert rebuilt["physicalConnections"] == 1, rebuilt
+                after_reconnect = connections.snapshot()
+                assert len(set(after_reconnect["opened"]) - set(after_idle["opened"])) == 1, after_reconnect
+                assert all(item["method"] == "GET" for item in rebuilt["http"]), rebuilt
+                _save_gate(tmp_path, "idle", mode=mode, identity=identity, refused=refused,
+                           idle_connection=closed_id, idle=after_idle, reconnected=after_reconnect,
+                           result=rebuilt, business_calls=manager.calls)
+    finally:
+        if relay:
+            relay.stop()
+
+
+def test_generated_node_http_relay_idle_eviction_preserves_route(
+    idle_node_project, node_gate_root, start_c3_relay, tmp_path,
+):
+    """Gate 3 HTTP: relay idle eviction preserves registration and route UID."""
+    from tests.fixtures.typescript_idle_gates import node_gate_client
+
+    relay = start_c3_relay(idle_timeout=1)
+    try:
+        with _gate_host(node_gate_root, tmp_path, relay) as (server, manager, builder, identity, connections):
+            with node_gate_client(idle_node_project, tmp_path, relay.url, node_gate_root, mode="http", portable=True) as node:
+                first = node()
+                _gate_identity(first, identity, "RelayAwareHttp")
+                initial = connections.snapshot()
+                closed = connections.wait_closed(set(initial["active"]))
+                idle = connections.snapshot()
+                assert manager.calls == 1 and builder.calls == 0
+                rebuilt = _ok(node("call-many", count=8))
+                assert manager.calls == 9 and builder.calls == 0
+                assert rebuilt["physicalConnections"] == 0
+                assert {item["routeUid"] for item in rebuilt["observations"]} == {first["observations"][-1]["routeUid"]}
+                assert all(item["path"] == "RelayAwareHttp" for item in rebuilt["observations"])
+                assert all(item["value"]["server_instance_id"] == identity["server_instance_id"] for item in rebuilt["outcomes"])
+                after = connections.snapshot()
+                assert len(set(after["opened"]) - set(idle["opened"])) == 1, (idle, after)
+                _save_gate(tmp_path, "http-idle", identity=identity, first=first, closed=closed,
+                           idle=idle, reconnected=after, result=rebuilt, business_calls=manager.calls)
+    finally:
+        relay.stop()
+
+
+@pytest.mark.parametrize("mode", ["direct", "relay-local", "http"])
+@pytest.mark.parametrize("transition", ["removed", "reregistered"])
+def test_generated_node_call_time_route_error_does_not_end_sibling(
+    idle_node_project, node_gate_root, start_c3_relay, tmp_path, mode, transition,
+):
+    """Gates 2/4/6: change B after acquire; A and its carrier still finish.
+
+    The test wrapper pauses native dispatch (HTTP: the real business POST)
+    after lookup/probe, exercising the server's call-time identity check.
+    A stale HTTP POST is sent once; the next explicit call resolves again.
+    """
+    from tests.fixtures.typescript_idle_gates import GateResource, IdleGate, node_gate_client
+
+    relay = start_c3_relay(idle_timeout=0) if mode != "direct" else None
+    replacement = GateResource()
+    try:
+        with _gate_host(node_gate_root, tmp_path, relay) as (server, manager, builder, identity, connections):
+            replacement.identity = identity
+            address = server.server_address() if mode == "direct" else relay.url
+            with node_gate_client(idle_node_project, tmp_path, address, node_gate_root, mode=mode, portable=True) as node:
+                _gate_identity(node(), identity, _GATE_PATHS[mode])
+                old_b = node(route="builder")
+                _gate_identity(old_b, identity, _GATE_PATHS[mode])
+                manager.block = True
+                _ok(node("start-call", id="a"))
+                assert manager.entered.wait(5)
+                _ok(node("pause", target="post" if mode == "http" else "dispatch"))
+                _ok(node("start-call", route="builder", id="b"))
+                acquired = _ok(node("wait-paused"))
+                try:
+                    assert server._runtime_session.ensure_server_bridge().unregister_crm("builder")["local_removed"]
+                    if transition == "reregistered":
+                        server.register(IdleGate, replacement, name="builder")
+                    _ok(node("resume"))
+                    refused = node("finish-call", id="b")
+                    error = _gate_error(refused)
+                    assert error["code"] == (704 if transition == "reregistered" else 701 if mode == "http" else 708), refused
+                    if mode == "http":
+                        assert refused["error"]["retrySafe"] is True, refused
+                        assert sum(item["method"] == "POST" for item in refused["http"]) == sum(item["method"] == "POST" for item in acquired["http"]), refused
+                    else:
+                        assert error["transportPhase"] == "pre_dispatch", refused
+                        assert refused["physicalConnections"] == 1, refused
+                    assert builder.calls == 1 and replacement.calls == 0
+                finally:
+                    manager.release.set()
+                    _ok(node("resume"))
+                completed = node("finish-call", id="a")
+                _gate_identity(completed, identity, _GATE_PATHS[mode])
+                assert completed["value"]["calls"] == 2
+                if transition == "reregistered":
+                    fresh = node(route="builder", client="main" if mode == "http" else "fresh")
+                    _gate_identity(fresh, identity, _GATE_PATHS[mode])
+                    assert fresh["observations"][-1]["routeUid"] != old_b["observations"][-1]["routeUid"]
+                    assert replacement.calls == 1
+                else:
+                    absent = node(route="builder", client="fresh")
+                    assert _gate_error(absent)["code"] == (701 if mode != "direct" else 708), absent
+                    assert builder.calls == 1
+                _save_gate(tmp_path, "call-time", mode=mode, transition=transition, identity=identity,
+                           refused=refused, completed=completed, connections=connections.snapshot(),
+                           old_business_calls=builder.calls, replacement_calls=replacement.calls)
+    finally:
+        replacement.close()
+        if relay:
+            relay.stop()
+
+
+@pytest.mark.parametrize("mode", ["direct", "relay-local", "http"])
+def test_generated_node_real_peer_end_is_uncertain_without_replay(
+    idle_node_project, node_gate_root, start_c3_relay, tmp_path, mode,
+):
+    """Gates 3/4/6: real peer end closes the carrier without replaying a call.
+
+    Direct and relay-local break an entered server stream; HTTP breaks an
+    entered unary. A completed result remains completed after EOF. A fresh
+    acquisition recovers against the restarted resource, before dispatch.
+    """
+    import uuid
+    from tests.fixtures.typescript_idle_gates import GateProcess, node_gate_client
+
+    relay = start_c3_relay(idle_timeout=0) if mode != "direct" else None
+    server_id = f"node-cut-{uuid.uuid4().hex}"
+    try:
+        with GateProcess(tmp_path, node_gate_root, server_id, relay.url if relay else None, "old") as old:
+            identity = old.ready["identity"]
+            address = old.ready["address"] if mode == "direct" else relay.url
+            with node_gate_client(idle_node_project, tmp_path, address, node_gate_root, mode=mode, portable=True) as node:
+                _gate_identity(node(), identity, _GATE_PATHS[mode])
+                old_b = node(route="builder")
+                _gate_identity(old_b, identity, _GATE_PATHS[mode])
+                _ok(node("pause", target="http-response" if mode == "http" else "response"))
+                _ok(node("start-call", id="settled"))
+                settled_ready = _ok(node("wait-paused"))
+                if mode == "http":
+                    assert settled_ready["http"][-1]["completeBodyBytes"] > 0
+                if mode == "http":
+                    _ok(old.request("arm"))
+                    _ok(node("start-call", id="broken"))
+                    _ok(old.request("entered"))
+                else:
+                    _ok(node("stream-open", id="broken"))
+                    first_item = _ok(node("stream-next", id="broken", retain=True))
+                    assert not first_item["done"] and first_item["value"]["steps"] == 1
+                    assert first_item["value"]["server_instance_id"] == identity["server_instance_id"]
+                    _ok(old.request("entered", stream=True))
+                    _ok(node("start-next", id="broken"))
+                before_end = _ok(node("snapshot"))
+                old_stats = old.request()
+                old.kill()
+                with GateProcess(tmp_path, node_gate_root, server_id, relay.url if relay else None, "new") as new:
+                    new_identity = new.ready["identity"]
+                    assert new_identity["server_id"] == identity["server_id"]
+                    assert new_identity["server_instance_id"] != identity["server_instance_id"]
+                    uncertain = node("finish-call", id="broken")
+                    error = _gate_error(uncertain)
+                    assert uncertain["error"]["retrySafe"] is False, uncertain
+                    if mode == "http":
+                        assert error["code"] == 702, uncertain
+                        assert error["details"]["dispatch_phase"] == "dispatch_uncertain", uncertain
+                        assert sum(item["method"] == "POST" for item in uncertain["http"]) == sum(item["method"] == "POST" for item in before_end["http"]), uncertain
+                    else:
+                        assert error["transportPhase"] == "dispatch_uncertain", uncertain
+                        assert len(uncertain["dispatches"]) == len(before_end["dispatches"]), uncertain
+                        receipt = _ok(node("stream-close", id="broken"))["receipt"]
+                        # EOF carries no CALL_END item count. The one item
+                        # actually delivered stays valid independently.
+                        assert receipt["completed"] and receipt["completeItems"] is None, receipt
+                        assert receipt["error"]["transportPhase"] == "dispatch_uncertain", receipt
+                        assert _ok(node("retained-item", id="broken"))["value"] == first_item["value"]
+                        _ok(node("release-item", id="broken"))
+                    _ok(node("resume"))
+                    still_settled = node("finish-call", id="settled")
+                    _gate_identity(still_settled, identity, _GATE_PATHS[mode])
+                    assert still_settled["value"]["calls"] == 2, still_settled
+                    if mode != "http":
+                        old_proxy = node()
+                        assert _gate_error(old_proxy)["code"] == 710, old_proxy
+                        assert old_proxy["error"]["transportPhase"] == "pre_dispatch", old_proxy
+                    recovered = node(route="builder", client="fresh")
+                    _gate_identity(recovered, new_identity, _GATE_PATHS[mode])
+                    assert recovered["observations"][-1]["routeUid"] != old_b["observations"][-1]["routeUid"]
+                    new_stats = new.request()
+                    assert new_stats["resources"]["manager"]["calls"] == 0, new_stats
+                    assert new_stats["resources"]["manager"]["stream_calls"] == 0, new_stats
+                    assert new_stats["resources"]["builder"]["calls"] == 1, new_stats
+                    ledger = [json.loads(line) for line in (tmp_path / "resources.jsonl").read_text(encoding="utf-8").splitlines()]
+                    old_manager = [entry for entry in ledger if entry["server_instance_id"] == identity["server_instance_id"] and entry["route"] == "manager"]
+                    assert sum(entry["method"] == "ping" for entry in old_manager) == (3 if mode == "http" else 2), ledger
+                    assert sum(entry["method"] == "items" for entry in old_manager) == (0 if mode == "http" else 1), ledger
+                    _save_gate(tmp_path, "peer-end", mode=mode, old_identity=identity, new_identity=new_identity,
+                               old=old_stats, uncertain=uncertain, settled=still_settled, recovered=recovered,
+                               new=new_stats, ledger=ledger)
+    finally:
+        if relay:
+            relay.stop()
+
+
+@pytest.mark.parametrize("mode", ["relay-local", "http"])
+def test_generated_node_old_candidate_cannot_discard_restarted_relay_owner(
+    idle_node_project, node_gate_root, start_c3_relay, tmp_path, mode,
+):
+    """Gate 5: interrupt real upstream control, register a new instance, then
+    finish an old candidate. Current authority and the new carrier survive.
+
+    HTTP also proves a stale business POST fails once; the next explicit call
+    resolves the current UID. Relay recovery has no watch history cursor.
+    """
+    import uuid
+    from tests.fixtures.typescript_idle_gates import GateProcess, node_gate_client
+
+    relay = start_c3_relay(idle_timeout=0)
+    server_id = f"node-owner-{uuid.uuid4().hex}"
+    try:
+        with GateProcess(tmp_path, node_gate_root, server_id, relay.url, "old") as old:
+            identity = old.ready["identity"]
+            with node_gate_client(idle_node_project, tmp_path, relay.url, node_gate_root, mode=mode, portable=True) as node:
+                first = node()
+                _gate_identity(first, identity, _GATE_PATHS[mode])
+                _ok(node("pause", target="post" if mode == "http" else "dispatch"))
+                _ok(node("start-call", id="candidate"))
+                _ok(node("wait-paused"))
+                assert old.request()["resources"]["manager"]["calls"] == 1
+                old.kill()
+                with GateProcess(tmp_path, node_gate_root, server_id, relay.url, "new") as new:
+                    new_identity = new.ready["identity"]
+                    assert new_identity["server_id"] == identity["server_id"]
+                    assert new_identity["server_instance_id"] != identity["server_instance_id"]
+                    fresh = node(route="builder")
+                    _gate_identity(fresh, new_identity, _GATE_PATHS[mode])
+                    alive = new.request()
+                    _ok(node("resume"))
+                    refused = node("finish-call", id="candidate")
+                    _reject(refused)
+                    if mode == "http":
+                        error = _gate_error(refused)
+                        assert error["code"] == 704 and refused["error"]["retrySafe"] is True, refused
+                        assert sum(item["method"] == "POST" for item in refused["http"]) == sum(item["method"] == "POST" for item in fresh["http"]), refused
+                    after_old = new.request()
+                    assert after_old["resources"]["manager"]["calls"] == 0, after_old
+                    kept = node(route="builder")
+                    _gate_identity(kept, new_identity, _GATE_PATHS[mode])
+                    assert kept["observations"][-1]["routeUid"] == fresh["observations"][-1]["routeUid"]
+                    if mode == "relay-local":
+                        assert kept["preparations"][-1]["connectionId"] == fresh["preparations"][-1]["connectionId"]
+                    kept_stats = new.request()
+                    assert kept_stats["connections"]["opened"] == alive["connections"]["opened"], (alive, kept_stats)
+                    assert kept_stats["resources"]["builder"]["calls"] == 2
+                    current = node(client="main" if mode == "http" else "fresh")
+                    _gate_identity(current, new_identity, _GATE_PATHS[mode])
+                    assert current["observations"][-1]["routeUid"] != first["observations"][-1]["routeUid"]
+                    assert new.request()["resources"]["manager"]["calls"] == 1
+                    _save_gate(tmp_path, "restart", mode=mode, old_identity=identity, new_identity=new_identity,
+                               refused=refused, fresh=fresh, kept=kept, current=current,
+                               before_old_result=alive, after_old_result=after_old, after_second_call=kept_stats)
+    finally:
+        relay.stop()
