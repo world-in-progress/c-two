@@ -108,7 +108,7 @@ pub enum PathKind {
 }
 
 impl PathKind {
-    fn observed(self) -> ObservedPath {
+    pub fn observed(self) -> ObservedPath {
         match self {
             Self::Direct => ObservedPath::DirectIpc,
             Self::Local => ObservedPath::RelayAwareLocalIpc,
@@ -157,6 +157,12 @@ impl EncodedService for Resource {
         let calls = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
         if command == "blocked" {
             self.gate.wait();
+        }
+        if command == "fail" {
+            return Err(C2Error::new(
+                ErrorCode::ResourceFunctionExecuting,
+                "resource failed after entering",
+            ));
         }
         Ok(encode(
             &serde_json::json!({
@@ -220,6 +226,7 @@ pub struct Fixture {
     pub client_events: ConnectionEvents,
     pub server_events: ConnectionEvents,
     outgoing: Mutex<BTreeSet<u64>>,
+    accepted: Mutex<Vec<ConnectionEvent>>,
     relay: Option<RelayServer>,
     anchor: Option<HttpAnchor>,
     finished: bool,
@@ -311,6 +318,7 @@ impl Fixture {
             client_events,
             server_events,
             outgoing: Mutex::new(BTreeSet::new()),
+            accepted: Mutex::new(Vec::new()),
             relay,
             anchor,
             finished: false,
@@ -387,7 +395,17 @@ impl Fixture {
 
     pub fn call(&self, client: &Client, route: &Registered, command: &str) {
         let bytes = client.call_owned("echo", &encode(command)).unwrap();
-        let response: serde_json::Value = serde_json::from_str(&decode(&bytes)).unwrap();
+        self.assert_response(client, route, command, &bytes);
+    }
+
+    pub fn assert_response(
+        &self,
+        client: &Client,
+        route: &Registered,
+        command: &str,
+        bytes: &[u8],
+    ) {
+        let response: serde_json::Value = serde_json::from_str(&decode(bytes)).unwrap();
         let registered = route.registration.outcome();
         assert_eq!(response["identity"]["server_id"], registered.server_id);
         assert_eq!(
@@ -411,6 +429,28 @@ impl Fixture {
             }
         }
         ids.clone()
+    }
+
+    pub fn accepted_events(&self) -> Vec<ConnectionEvent> {
+        let mut events = self.accepted.lock().unwrap();
+        events.extend(drain_events(&self.server_events));
+        events.clone()
+    }
+
+    pub fn live_accepted(&self) -> Vec<c_two::observe::ConnectionObservation> {
+        self.accepted_events()
+            .into_iter()
+            .filter_map(|event| match event {
+                ConnectionEvent::Opened(observation) if observation.snapshot().is_none() => {
+                    Some(observation)
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    pub fn relay_url(&self) -> Option<String> {
+        self.server.relay_anchor_address_override()
     }
 
     pub fn assert_paths(&self, acquisitions: u64) {
@@ -485,7 +525,7 @@ impl Fixture {
             self.path,
             self.outgoing_ids()
         );
-        let accepted = drain_events(&self.server_events);
+        let accepted = self.accepted_events();
         let opened = accepted
             .iter()
             .filter(|event| matches!(event, ConnectionEvent::Opened(_)))
@@ -613,4 +653,483 @@ impl Drop for HttpAnchor {
             worker.join().unwrap();
         }
     }
+}
+
+const STREAM_DESCRIPTOR: &[u8] = include_bytes!(
+    "../../../../core/foundation/c2-contract/tests/fixtures/server-stream.contract.json"
+);
+const PROCESS_MARKER: &str = "C2_PERSISTENT_PROCESS ";
+
+pub fn stream_expected(name: &str) -> c_two::contract::ExpectedRouteContract {
+    ContractRelease::from_descriptor_json(STREAM_DESCRIPTOR)
+        .unwrap()
+        .expected_route(name)
+        .unwrap()
+}
+
+pub fn open_stream(client: &Client, command: &str) -> c_two::ResponseStream<fastdb::Payload> {
+    let core = client
+        .begin_stream("echo")
+        .unwrap()
+        .encode_vec(encode(command))
+        .unwrap()
+        .stream()
+        .unwrap();
+    c_two::ResponseStream::from_core(core, |response| {
+        c_two::generated::open_owned(&CompiledSpec::compile(SPEC).unwrap(), response.bytes())
+            .map_err(|error| {
+                Error::Semantic(c_two::generated::fastdb_adapter_error(
+                    c_two::generated::AdapterFailurePhase::ClientOutputDeserializing,
+                    error,
+                ))
+            })
+    })
+}
+
+pub fn stream_value(payload: &fastdb::Payload) -> serde_json::Value {
+    serde_json::from_str(
+        payload
+            .entry_view(0)
+            .unwrap()
+            .at(0)
+            .unwrap()
+            .acquire()
+            .unwrap()
+            .str()
+            .unwrap(),
+    )
+    .unwrap()
+}
+
+fn process_event(value: serde_json::Value) {
+    println!("{PROCESS_MARKER}{value}");
+    std::io::stdout().flush().unwrap();
+}
+
+struct ProcessProbe {
+    identity: serde_json::Value,
+    uid: Mutex<String>,
+    gate: Gate,
+    opens: AtomicUsize,
+    steps: AtomicUsize,
+    finishes: AtomicUsize,
+    unary: AtomicUsize,
+}
+struct ProcessService(Arc<ProcessProbe>);
+impl EncodedService for ProcessService {
+    fn invoke(&self, index: u16, _: Vec<u8>) -> Result<Vec<u8>, C2Error> {
+        assert_eq!(index, 0);
+        let calls = self.0.unary.fetch_add(1, Ordering::SeqCst) + 1;
+        process_event(serde_json::json!({"kind":"unary", "calls":calls}));
+        Ok(Vec::new())
+    }
+}
+impl c_two::generated::EncodedStreamService for ProcessService {
+    fn open_stream(
+        &self,
+        index: u16,
+        request: Vec<u8>,
+    ) -> Result<Box<dyn c_two::generated::EncodedStream>, C2Error> {
+        assert_eq!(index, 1);
+        let command = decode(&request);
+        let calls = self.0.opens.fetch_add(1, Ordering::SeqCst) + 1;
+        process_event(serde_json::json!({"kind":"open", "calls":calls, "command":command}));
+        Ok(Box::new(ProcessIterator {
+            probe: self.0.clone(),
+            command,
+            cursor: 0,
+        }))
+    }
+}
+struct ProcessIterator {
+    probe: Arc<ProcessProbe>,
+    command: String,
+    cursor: usize,
+}
+impl c_two::generated::EncodedStream for ProcessIterator {
+    fn step(&mut self) -> Result<Option<Box<dyn c_two::generated::EncodedStreamItem>>, C2Error> {
+        self.probe.steps.fetch_add(1, Ordering::SeqCst);
+        process_event(
+            serde_json::json!({"kind":"step", "index":self.cursor, "command":self.command}),
+        );
+        if self.command == "blocked" && self.cursor == 1 {
+            self.probe.gate.wait();
+        }
+        if self.command == "fail" && self.cursor == 1 {
+            return Err(C2Error::new(
+                ErrorCode::ResourceFunctionExecuting,
+                "resource step failed after one item",
+            ));
+        }
+        if self.cursor == if self.command == "blocked" { 2 } else { 1 } {
+            return Ok(None);
+        }
+        self.cursor += 1;
+        Ok(Some(Box::new(ProcessItem(encode(
+            &serde_json::json!({
+                "identity":self.probe.identity,
+                "route_uid":*self.probe.uid.lock().unwrap(),
+                "index":self.cursor,
+            })
+            .to_string(),
+        )))))
+    }
+    fn finish(self: Box<Self>) -> Result<(), C2Error> {
+        let finishes = self.probe.finishes.fetch_add(1, Ordering::SeqCst) + 1;
+        process_event(serde_json::json!({"kind":"finish", "finishes":finishes}));
+        Ok(())
+    }
+}
+struct ProcessItem(Vec<u8>);
+impl c_two::generated::EncodedStreamItem for ProcessItem {
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+    fn write_range(&self, offset: usize, destination: &mut [u8]) -> Result<(), C2Error> {
+        destination.copy_from_slice(&self.0[offset..offset + destination.len()]);
+        Ok(())
+    }
+}
+
+// Exact subprocess entry. The parent supplies every endpoint parameter;
+// the child never selects a default Unix namespace.
+pub fn run_resource_process() {
+    let Some(root) = std::env::var_os("C2_PERSISTENT_CHILD_ROOT") else {
+        return;
+    };
+    let root = PathBuf::from(root);
+    let id = std::env::var("C2_PERSISTENT_CHILD_ID").unwrap();
+    let relay = std::env::var("C2_PERSISTENT_CHILD_RELAY")
+        .ok()
+        .filter(|url| !url.is_empty());
+    let server = runtime(&root, id, relay.clone(), 0.0);
+    let connections = server.connection_events();
+    let host = server
+        .host(if relay.is_some() {
+            HostOptions::default()
+        } else {
+            HostOptions::default().without_relay()
+        })
+        .unwrap();
+    let identity = server.ensure_server().unwrap();
+    let probe = Arc::new(ProcessProbe {
+        identity: serde_json::json!({"server_id":identity.server_id,"server_instance_id":identity.server_instance_id}),
+        uid: Mutex::new(String::new()),
+        gate: Gate::default(),
+        opens: AtomicUsize::new(0),
+        steps: AtomicUsize::new(0),
+        finishes: AtomicUsize::new(0),
+        unary: AtomicUsize::new(0),
+    });
+    let release = ContractRelease::from_descriptor_json(STREAM_DESCRIPTOR).unwrap();
+    let registration = host
+        .register(
+            ServiceDefinition::new_stream(
+                &release,
+                release.reference(),
+                "process-route",
+                [
+                    MethodDefinition {
+                        index: 0,
+                        name: "ping".into(),
+                        access: MethodAccess::Read,
+                    },
+                    MethodDefinition {
+                        index: 1,
+                        name: "echo".into(),
+                        access: MethodAccess::Write,
+                    },
+                ],
+                Arc::new(ProcessService(probe.clone())),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    *probe.uid.lock().unwrap() = registration.outcome().route_uid.clone();
+    let mut events = drain_events(&connections);
+    process_event(
+        serde_json::json!({"kind":"ready", "identity":probe.identity, "route_uid":*probe.uid.lock().unwrap(), "address":host.local_endpoint().address(), "credential":host.endpoint_credential().map(|credential| credential.to_json().unwrap())}),
+    );
+    for line in std::io::stdin().lock().lines() {
+        match line.unwrap().as_str() {
+            "release" => probe.gate.release(),
+            "snapshot" => {
+                events.extend(drain_events(&connections));
+                let opened = events
+                    .iter()
+                    .filter(|event| matches!(event, ConnectionEvent::Opened(_)))
+                    .count();
+                let closed = events
+                    .iter()
+                    .filter(|event| matches!(event, ConnectionEvent::Closed(_)))
+                    .count();
+                process_event(
+                    serde_json::json!({"kind":"snapshot", "opens":probe.opens.load(Ordering::SeqCst), "steps":probe.steps.load(Ordering::SeqCst), "finishes":probe.finishes.load(Ordering::SeqCst), "unary":probe.unary.load(Ordering::SeqCst), "physical_opened":opened, "physical_closed":closed}),
+                );
+            }
+            "quit" => break,
+            command => panic!("unknown resource process command: {command}"),
+        }
+    }
+    probe.gate.release();
+    let outcome = host.shutdown_with_timeout(WAIT);
+    assert!(
+        outcome.runtime_barrier_error.is_none()
+            && outcome.route_close_error.is_none()
+            && outcome.relay_errors.is_empty(),
+        "{outcome:?}"
+    );
+    assert!(host.lifecycle_snapshot().finished);
+    events.extend(drain_events(&connections));
+    let opened = events
+        .iter()
+        .filter(|event| matches!(event, ConnectionEvent::Opened(_)))
+        .count();
+    let closed = events
+        .iter()
+        .filter(|event| matches!(event, ConnectionEvent::Closed(_)))
+        .count();
+    assert_eq!(opened, closed, "resource process carriers must all close");
+    process_event(
+        serde_json::json!({"kind":"stopped", "finished":true, "physical_opened":opened, "physical_closed":closed, "opens":probe.opens.load(Ordering::SeqCst), "finishes":probe.finishes.load(Ordering::SeqCst)}),
+    );
+}
+
+pub struct ResourceProcess {
+    child: Option<std::process::Child>,
+    reader: Option<std::thread::JoinHandle<()>>,
+    events: Arc<Mutex<Vec<serde_json::Value>>>,
+    pub ready: serde_json::Value,
+}
+impl ResourceProcess {
+    pub fn start(fixture: &Fixture, server_id: &str) -> Self {
+        use std::process::{Command, Stdio};
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "persistent_resource_process",
+                "--exact",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("C2_PERSISTENT_CHILD_ROOT", &fixture.root)
+            .env("C2_PERSISTENT_CHILD_ID", server_id)
+            .env(
+                "C2_PERSISTENT_CHILD_RELAY",
+                fixture.relay_url().unwrap_or_default(),
+            )
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let output = events.clone();
+        let reader = std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines() {
+                let line = line.unwrap();
+                if let Some(start) = line.find(PROCESS_MARKER) {
+                    let event: serde_json::Value =
+                        serde_json::from_str(&line[start + PROCESS_MARKER.len()..]).unwrap();
+                    println!("{PROCESS_MARKER}{event}");
+                    output.lock().unwrap().push(event);
+                }
+            }
+        });
+        let mut process = Self {
+            child: Some(child),
+            reader: Some(reader),
+            events,
+            ready: serde_json::Value::Null,
+        };
+        observe_until(|| process.records("ready").len() == 1);
+        process.ready = process.records("ready").pop().unwrap();
+        process
+    }
+    pub fn records(&self, kind: &str) -> Vec<serde_json::Value> {
+        self.events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| event["kind"] == kind)
+            .cloned()
+            .collect()
+    }
+    pub fn send(&mut self, command: &str) {
+        let stdin = self.child.as_mut().unwrap().stdin.as_mut().unwrap();
+        writeln!(stdin, "{command}").unwrap();
+        stdin.flush().unwrap();
+    }
+    pub fn snapshot(&mut self) -> serde_json::Value {
+        let before = self.records("snapshot").len();
+        self.send("snapshot");
+        observe_until(|| self.records("snapshot").len() > before);
+        self.records("snapshot").pop().unwrap()
+    }
+    pub fn connect(&self, fixture: &Fixture) -> Client {
+        let expected = stream_expected("process-route");
+        let mode = if fixture.path == PathKind::Direct {
+            Connect::DirectIpc {
+                address: self.ready["address"].as_str().unwrap().into(),
+            }
+        } else {
+            Connect::RelayAware
+        };
+        let client = fixture.client_runtime.connect(expected, mode).unwrap();
+        assert_eq!(client.observed_path(), fixture.path.observed());
+        assert_eq!(client.observed_route().route_uid, self.ready["route_uid"]);
+        if let Some(identity) = client.ipc_server_identity() {
+            assert_eq!(identity.server_id, self.ready["identity"]["server_id"]);
+            assert_eq!(
+                identity.server_instance_id,
+                self.ready["identity"]["server_instance_id"]
+            );
+        }
+        println!(
+            "C2_PERSISTENT_PROCESS_ACQUIRE {}",
+            serde_json::json!({"path":format!("{:?}", client.observed_path()), "identity":self.ready["identity"], "route_uid":self.ready["route_uid"], "physical_connections":fixture.outgoing_ids()})
+        );
+        client
+    }
+    pub fn assert_item(&self, payload: &fastdb::Payload, index: usize) {
+        let value = stream_value(payload);
+        assert_eq!(value["identity"], self.ready["identity"]);
+        assert_eq!(value["route_uid"], self.ready["route_uid"]);
+        assert_eq!(value["index"], index);
+    }
+    pub fn credential(&self) -> Option<c_two::endpoint::EndpointCredential> {
+        self.ready["credential"]
+            .as_str()
+            .map(|json| c_two::endpoint::EndpointCredential::from_json(json).unwrap())
+    }
+    pub fn kill(&mut self) {
+        let mut child = self.child.take().unwrap();
+        child.kill().unwrap();
+        child.wait().unwrap();
+        self.reader.take().unwrap().join().unwrap();
+        if let Some(credential) = self.credential() {
+            use c_two::endpoint::{EndpointReapResult, reap_endpoint};
+            let outcome = reap_endpoint(credential.endpoint(), &credential);
+            assert!(
+                matches!(
+                    outcome,
+                    EndpointReapResult::Reaped
+                        | EndpointReapResult::AlreadyAbsent
+                        | EndpointReapResult::NotApplicable
+                ),
+                "{outcome:?}"
+            );
+            println!("C2_PERSISTENT_PROCESS_REAP {outcome:?}");
+        }
+    }
+    pub fn stop(mut self) {
+        self.send("quit");
+        let mut child = self.child.take().unwrap();
+        observe_until(|| child.try_wait().unwrap().is_some());
+        assert!(child.wait().unwrap().success());
+        self.reader.take().unwrap().join().unwrap();
+        assert_eq!(self.records("stopped").len(), 1);
+        assert_eq!(self.records("stopped")[0]["finished"], true);
+    }
+}
+impl Drop for ResourceProcess {
+    fn drop(&mut self) {
+        if self.child.is_some() {
+            self.kill();
+        }
+    }
+}
+
+pub fn assert_uncertain(error: Error) {
+    println!("C2_PERSISTENT_UNCERTAIN {error:?}");
+    match error {
+        Error::Transport(error) => {
+            assert_eq!(error.phase(), c2_core::TransportPhase::DispatchUncertain);
+            assert!(!error.is_fallback_eligible());
+        }
+        Error::Semantic(error) => {
+            assert_eq!(error.code, ErrorCode::ResourceUnavailable);
+            assert_eq!(error.details["dispatch_phase"], "dispatch_uncertain");
+        }
+        error => panic!("expected dispatch-uncertain peer end: {error:?}"),
+    }
+}
+
+pub fn race_old_owner_evidence(fixture: &Fixture, old: &ResourceProcess) {
+    use c_two::endpoint::{EndpointReapResult, reap_endpoint};
+    if let Some(credential) = old.credential() {
+        let outcome = reap_endpoint(credential.endpoint(), &credential);
+        if cfg!(unix) {
+            // The new listener holds the live lease; maintenance refuses it
+            // before an old credential can authorize any collection.
+            assert!(matches!(outcome, EndpointReapResult::Busy), "{outcome:?}");
+        } else {
+            // Windows kernel-owned pipes have no filesystem object to reap;
+            // the common old-proxy/instance checks still run on Windows.
+            assert!(
+                matches!(outcome, EndpointReapResult::NotApplicable),
+                "{outcome:?}"
+            );
+        }
+        println!("C2_PERSISTENT_OLD_CREDENTIAL {outcome:?}");
+    }
+    let Some(url) = fixture.relay_url() else {
+        return;
+    };
+    let context = fixture.server.local_endpoint_context().unwrap();
+    let old = &old.ready;
+    let barrier = Arc::new(std::sync::Barrier::new(3));
+    std::thread::scope(|scope| {
+        let url_register = url.clone();
+        let context_register = context.clone();
+        let candidate_gate = barrier.clone();
+        let candidate = scope.spawn(move || {
+            let control = c2_http::client::RelayControlClient::new(&url_register, false)
+                .unwrap()
+                .with_local_endpoint_context(&context_register);
+            let expected = stream_expected("process-route");
+            candidate_gate.wait();
+            let error = control
+                .register(c2_http::client::RelayRegistration {
+                    expected: &expected,
+                    server_id: old["identity"]["server_id"].as_str().unwrap(),
+                    server_instance_id: old["identity"]["server_instance_id"].as_str().unwrap(),
+                    address: old["address"].as_str().unwrap(),
+                    max_payload_size: c2_config::ServerIpcConfig::default().max_payload_size,
+                })
+                .unwrap_err();
+            // Registration's identity attestation refuses this retired instance
+            // with HTTP 502, before the resource's business callback.
+            assert!(
+                matches!(
+                    &error,
+                    c2_http::client::HttpError::ServerError(502, _)
+                        | c2_http::client::HttpError::ResponseError(502, _)
+                ),
+                "{error:?}"
+            );
+            println!("C2_PERSISTENT_OLD_CANDIDATE {error:?}");
+        });
+        let withdrawal_gate = barrier.clone();
+        let withdrawal = scope.spawn(move || {
+            let control = c2_http::client::RelayControlClient::new(&url, false)
+                .unwrap()
+                .with_local_endpoint_context(&context);
+            let retired = c2_http::client::RelayRegistrationScope {
+                name: "process-route".into(),
+                server_id: old["identity"]["server_id"].as_str().unwrap().into(),
+                server_instance_id: old["identity"]["server_instance_id"]
+                    .as_str()
+                    .unwrap()
+                    .into(),
+                route_uid: old["route_uid"].as_str().unwrap().into(),
+            };
+            withdrawal_gate.wait();
+            control.unregister_registration(&retired).unwrap();
+            println!("C2_PERSISTENT_OLD_WITHDRAWAL {retired:?}");
+        });
+        barrier.wait();
+        candidate.join().unwrap();
+        withdrawal.join().unwrap();
+    });
 }

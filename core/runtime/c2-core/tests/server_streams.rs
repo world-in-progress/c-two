@@ -1666,7 +1666,14 @@ fn explicit_http_close_keeps_cancelled_outcome_when_small_b_is_full() {
         ErrorCode::CallCancelled,
         "consumer",
     );
-    assert!((2..=3).contains(&receipt.complete_items.expect("actual complete-item count")));
+    // Each four-byte item is encoded in one range. HTTP/TCP buffering can
+    // let the resource run ahead while cancellation reaches the relay;
+    // compare the terminal with actual complete encodings, not a step bound.
+    let encoded = fixture.encoded_events.try_iter().collect::<Vec<_>>();
+    for (index, event) in encoded.iter().enumerate() {
+        assert_eq!(*event, (6, index + 1));
+    }
+    assert_eq!(receipt.complete_items, Some(encoded.len() as u64));
     assert_eq!(first.bytes(), &[1; 4]);
     assert_eq!(second.bytes(), &[2; 4]);
 }

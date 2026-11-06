@@ -253,3 +253,612 @@ fn route_authority(path: PathKind) {
     drop((old, fresh, route, replacement));
     fixture.finish();
 }
+
+// Gates 2 and 6, relay-local: after withdrawal, name acquisition finds no
+// resource while the bound proxy reports removal. Re-registration changes
+// the UID, and the old proxy's call is refused without entering either resource.
+#[test]
+fn relay_local_removed_and_reregistered_routes_preserve_old_binding() {
+    let fixture = Fixture::new(PathKind::Local, 0.0, 0);
+    let mut route = fixture.register("replacement");
+    let old = fixture.connect(&route);
+    fixture.call(&old, &route, "before-removal");
+    let physical = fixture.outgoing_ids();
+    let outcome = route.registration.close().unwrap();
+    assert!(outcome.local_removed && outcome.close.active_drained);
+    assert!(outcome.close.close_error.is_none());
+    fixture::assert_semantic(
+        fixture.connect_name("replacement").unwrap_err(),
+        fixture::ErrorCode::ResourceNotFound,
+    );
+    fixture::assert_semantic(
+        old.call_owned("echo", &fixture::encode("removed"))
+            .unwrap_err(),
+        fixture::ErrorCode::ResourceRemoved,
+    );
+    assert_eq!(route.calls(), 1);
+    let replacement = fixture.register("replacement");
+    assert_ne!(
+        route.registration.outcome().route_uid,
+        replacement.registration.outcome().route_uid
+    );
+    fixture::assert_semantic(
+        old.call_owned("echo", &fixture::encode("stale"))
+            .unwrap_err(),
+        fixture::ErrorCode::RouteStale,
+    );
+    assert_eq!(replacement.calls(), 0);
+    let fresh = fixture.connect(&replacement);
+    fixture.call(&fresh, &replacement, "fresh");
+    assert_eq!(
+        old.observed_route().route_uid,
+        route.registration.outcome().route_uid
+    );
+    assert_eq!(replacement.calls(), 1);
+    assert_eq!(fixture.outgoing_ids(), physical);
+    fixture.assert_paths(2);
+    drop((old, fresh, route, replacement));
+    fixture.finish();
+}
+
+// Gate 4, direct IPC and relay-local: A and B share the physical connection.
+// Closing, removing and replacing B refuses only B; A's dispatched unary and
+// the original carrier survive all three route errors.
+#[test]
+fn direct_route_errors_preserve_other_route_inflight_call_and_carrier() {
+    route_errors_are_local(PathKind::Direct);
+}
+
+#[test]
+fn relay_local_route_errors_preserve_other_route_inflight_call_and_carrier() {
+    route_errors_are_local(PathKind::Local);
+}
+
+fn route_errors_are_local(path: PathKind) {
+    let fixture = Fixture::new(path, 0.0, 0);
+    let a = fixture.register("a");
+    let mut b = fixture.register("b");
+    let a_client = fixture.connect(&a);
+    let b_client = fixture.connect(&b);
+    let a_entered = a_client.clone();
+    let a_call =
+        std::thread::spawn(move || a_entered.call_owned("echo", &fixture::encode("blocked")));
+    let b_entered = b_client.clone();
+    let b_call =
+        std::thread::spawn(move || b_entered.call_owned("echo", &fixture::encode("blocked")));
+    observe_until(|| a.calls() == 1 && b.calls() == 1);
+    let physical = fixture.outgoing_ids();
+    assert_eq!(physical.len(), 1);
+    let carrier = a_client.connection_observation().unwrap();
+    assert_eq!(
+        carrier.connection_id(),
+        b_client.connection_observation().unwrap().connection_id()
+    );
+    let concurrency = b.registration.route_concurrency();
+    let evidence = b.evidence();
+    let b_response = std::thread::scope(|scope| {
+        let evidence = evidence;
+        let closing = scope.spawn(|| b.registration.close().unwrap());
+        observe_until(|| concurrency.snapshot().closed);
+        fixture::assert_semantic(
+            b_client
+                .call_owned("echo", &fixture::encode("closed-b"))
+                .unwrap_err(),
+            fixture::ErrorCode::ResourceClosed,
+        );
+        assert_eq!(evidence.calls(), 1);
+        assert!(!a_call.is_finished());
+        assert!(carrier.snapshot().is_none());
+        evidence.release();
+        let response = b_call.join().unwrap().unwrap();
+        let outcome = closing.join().unwrap();
+        assert!(outcome.local_removed && outcome.close.active_drained);
+        assert!(outcome.close.close_error.is_none());
+        response
+    });
+    fixture.assert_response(&b_client, &b, "blocked", &b_response);
+    fixture::assert_semantic(
+        b_client
+            .call_owned("echo", &fixture::encode("removed-b"))
+            .unwrap_err(),
+        fixture::ErrorCode::ResourceRemoved,
+    );
+    let replacement = fixture.register("b");
+    fixture::assert_semantic(
+        b_client
+            .call_owned("echo", &fixture::encode("stale-b"))
+            .unwrap_err(),
+        fixture::ErrorCode::RouteStale,
+    );
+    assert_eq!(replacement.calls(), 0);
+    assert!(!a_call.is_finished());
+    assert!(carrier.snapshot().is_none());
+    a.evidence().release();
+    fixture.assert_response(&a_client, &a, "blocked", &a_call.join().unwrap().unwrap());
+    fixture.call(&a_client, &a, "a-after-b-errors");
+    assert_eq!((a.calls(), b.calls(), replacement.calls()), (2, 1, 0));
+    assert_eq!(fixture.outgoing_ids(), physical);
+    fixture.assert_paths(2);
+    drop((a_client, b_client, a, b, replacement));
+    fixture.finish();
+}
+
+// Gate 2, HTTP removal: both a name acquire and the cached proxy are refused;
+// no callback runs after relay withdrawal.
+#[test]
+fn relay_http_removed_route_refuses_acquire_and_old_call() {
+    let fixture = Fixture::new(PathKind::Http, 0.0, 0);
+    let mut route = fixture.register("removed-http");
+    let old = fixture.connect(&route);
+    fixture.call(&old, &route, "before-removal");
+    let outcome = route.registration.close().unwrap();
+    assert!(outcome.local_removed && outcome.close.active_drained);
+    assert!(outcome.close.close_error.is_none());
+    fixture::assert_semantic(
+        old.call_owned("echo", &fixture::encode("removed"))
+            .unwrap_err(),
+        fixture::ErrorCode::ResourceNotFound,
+    );
+    fixture::assert_semantic(
+        fixture.connect_name("removed-http").unwrap_err(),
+        fixture::ErrorCode::ResourceNotFound,
+    );
+    assert_eq!(route.calls(), 1);
+    assert!(fixture.outgoing_ids().is_empty());
+    fixture.assert_paths(1);
+    drop((old, route));
+    fixture.finish();
+}
+
+// Gates 2 and 6, HTTP replacement: the original cached business token is stale.
+// Its POST fails without entering the new resource; only an explicit next call
+// resolves again. Discovery is not refreshed between removal and replacement.
+#[test]
+fn relay_http_reregistered_route_refuses_stale_post_then_resolves_next_call() {
+    let fixture = Fixture::new(PathKind::Http, 0.0, 0);
+    let mut route = fixture.register("stale-http");
+    let old = fixture.connect(&route);
+    fixture.call(&old, &route, "before-replacement");
+    assert!(route.registration.close().unwrap().local_removed);
+    let replacement = fixture.register("stale-http");
+    assert_ne!(
+        route.registration.outcome().route_uid,
+        replacement.registration.outcome().route_uid
+    );
+    fixture::assert_semantic(
+        old.call_owned("echo", &fixture::encode("stale"))
+            .unwrap_err(),
+        fixture::ErrorCode::RouteStale,
+    );
+    assert_eq!((route.calls(), replacement.calls()), (1, 0));
+    fixture.call(&old, &replacement, "explicit-next-call");
+    let fresh = fixture.connect(&replacement);
+    fixture.call(&fresh, &replacement, "new-acquire");
+    assert_eq!((route.calls(), replacement.calls()), (1, 2));
+    assert!(fixture.outgoing_ids().is_empty());
+    fixture.assert_paths(2);
+    drop((old, fresh, route, replacement));
+    fixture.finish();
+}
+
+// Gate 3, HTTP: observe the relay's actual background idle eviction, then
+// eight simultaneous callers. The upstream control remains live, the route
+// UID and instance are unchanged, and only one new data carrier is opened.
+#[test]
+fn relay_http_idle_eviction_retains_route_and_coalesces_concurrent_reconnects() {
+    use c_two::observe::ConnectionEvent;
+    let fixture = Fixture::new(PathKind::Http, 0.0, 1);
+    let route = fixture.register("idle-http");
+    let client = fixture.connect(&route);
+    fixture.call(&client, &route, "before-eviction");
+    observe_until(|| fixture.live_accepted().len() == 2);
+    let original = fixture.live_accepted();
+    observe_until(|| {
+        original
+            .iter()
+            .filter(|connection| connection.snapshot().is_none())
+            .count()
+            == 1
+    });
+    let evicted = original
+        .iter()
+        .find(|connection| connection.snapshot().is_some())
+        .unwrap();
+    let control = original
+        .iter()
+        .find(|connection| connection.snapshot().is_none())
+        .unwrap();
+    assert!(!route.registration.is_closed());
+    assert_eq!(route.calls(), 1);
+    let prior = fixture.accepted_events().len();
+    let barrier = Arc::new(Barrier::new(8));
+    std::thread::scope(|scope| {
+        let mut calls = Vec::new();
+        for _ in 0..8 {
+            let barrier = barrier.clone();
+            let client = client.clone();
+            let fixture = &fixture;
+            let route = &route;
+            calls.push(scope.spawn(move || {
+                barrier.wait();
+                fixture.call(&client, route, "after-eviction");
+            }));
+        }
+        for call in calls {
+            call.join().unwrap();
+        }
+    });
+    let events = fixture.accepted_events();
+    let new_connections = events[prior..]
+        .iter()
+        .filter_map(|event| match event {
+            ConnectionEvent::Opened(observation) => Some(observation.connection_id()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(new_connections.len(), 1);
+    assert!(control.snapshot().is_none());
+    assert_eq!(route.calls(), 9);
+    assert!(fixture.outgoing_ids().is_empty());
+    fixture.assert_paths(1);
+    println!(
+        "C2_PERSISTENT_RELAY_EVICTION old={} control={} new={new_connections:?}",
+        evicted.connection_id(),
+        control.connection_id()
+    );
+    drop((client, route));
+    fixture.finish();
+}
+
+// Exact subprocess entry; an ordinary suite invocation returns before
+// opening any endpoint because no child configuration is present.
+#[test]
+fn persistent_resource_process() {
+    fixture::run_resource_process();
+}
+
+// Gates 3, 4, 5 and 6: true peer end before CALL_END is dispatch-uncertain.
+// The delivered item stays valid, no second open is made, and the broken
+// carrier closes. A fresh acquire after restart selects the current instance
+// before business dispatch. The relay restores authority after its old control
+// connection ends; concurrent retired registration/withdrawal evidence cannot
+// remove or deactivate its new owner. Rust streams over HTTP as well.
+#[test]
+fn direct_peer_end_preserves_delivered_item_and_recovers_only_new_acquire() {
+    peer_end_and_recovery(PathKind::Direct);
+}
+#[test]
+fn relay_local_peer_end_preserves_delivered_item_and_recovers_only_new_acquire() {
+    peer_end_and_recovery(PathKind::Local);
+}
+#[test]
+fn relay_http_peer_end_preserves_delivered_item_and_recovers_only_new_acquire() {
+    peer_end_and_recovery(PathKind::Http);
+}
+fn peer_end_and_recovery(path: PathKind) {
+    let fixture = Fixture::new(path, 0.0, 0);
+    let id = fixture::unique("peer-end");
+    let mut peer = fixture::ResourceProcess::start(&fixture, &id);
+    let old = peer.connect(&fixture);
+    let mut stream = fixture::open_stream(&old, "blocked");
+    let first = stream.next().unwrap().unwrap();
+    peer.assert_item(&first, 1);
+    observe_until(|| peer.records("step").iter().any(|event| event["index"] == 1));
+    let before = peer.snapshot();
+    assert_eq!(before["opens"], 1);
+    assert_eq!(before["finishes"], 0);
+    let physical = fixture.outgoing_ids();
+    let old_connection = (path != PathKind::Http).then(|| old.connection_observation().unwrap());
+    peer.kill();
+    fixture::assert_uncertain(
+        stream
+            .next()
+            .expect("missing terminal is an error")
+            .unwrap_err(),
+    );
+    assert!(stream.next().is_none());
+    let receipt = stream.close_with_timeout(Some(fixture::WAIT));
+    assert!(receipt.completed);
+    fixture::assert_uncertain(receipt.terminal.unwrap().unwrap_err());
+    peer.assert_item(&first, 1);
+    assert_eq!(peer.records("open").len(), 1);
+    assert_eq!(
+        fixture.outgoing_ids(),
+        physical,
+        "dispatched stream must not reconnect or replay"
+    );
+    if let Some(connection) = &old_connection {
+        observe_until(|| connection.snapshot().is_some());
+        assert!(connection.snapshot().unwrap().is_peer_end());
+    }
+    let mut replacement = fixture::ResourceProcess::start(&fixture, &id);
+    assert_eq!(
+        peer.ready["identity"]["server_id"],
+        replacement.ready["identity"]["server_id"]
+    );
+    assert_ne!(
+        peer.ready["identity"]["server_instance_id"],
+        replacement.ready["identity"]["server_instance_id"]
+    );
+    assert_ne!(peer.ready["route_uid"], replacement.ready["route_uid"]);
+    assert_eq!(replacement.snapshot()["opens"], 0);
+    let refusal = old.call_owned("ping", &[]).unwrap_err();
+    if path == PathKind::Http {
+        fixture::assert_semantic(refusal, fixture::ErrorCode::RouteStale);
+    } else {
+        println!("C2_PERSISTENT_OLD_PROXY_REFUSAL {refusal:?}");
+    }
+    assert_eq!(replacement.snapshot()["unary"], 0);
+    let fresh = replacement.connect(&fixture);
+    assert_eq!(old.observed_route().route_uid, peer.ready["route_uid"]);
+    if let Some(identity) = old.ipc_server_identity() {
+        assert_eq!(
+            identity.server_instance_id,
+            peer.ready["identity"]["server_instance_id"]
+        );
+    }
+    assert_eq!(
+        replacement.snapshot()["opens"],
+        0,
+        "acquisition cannot dispatch the stream"
+    );
+    let mut recovered = fixture::open_stream(&fresh, "blocked");
+    let item = recovered.next().unwrap().unwrap();
+    replacement.assert_item(&item, 1);
+    observe_until(|| {
+        replacement
+            .records("step")
+            .iter()
+            .any(|event| event["index"] == 1)
+    });
+    let carrier = (path != PathKind::Http).then(|| fresh.connection_observation().unwrap());
+    fixture::race_old_owner_evidence(&fixture, &peer);
+    let racing = replacement.snapshot();
+    assert_eq!(racing["opens"], 1);
+    assert_eq!(racing["finishes"], 0);
+    assert_eq!(racing["unary"], 0);
+    if let Some(carrier) = &carrier {
+        assert!(carrier.snapshot().is_none());
+    }
+    replacement.send("release");
+    let second = recovered.next().unwrap().unwrap();
+    replacement.assert_item(&second, 2);
+    assert!(recovered.next().is_none());
+    let terminal = recovered.close_with_timeout(Some(fixture::WAIT));
+    assert!(terminal.completed && terminal.terminal.unwrap().is_ok());
+    assert_eq!(terminal.complete_items, Some(2));
+    let after = replacement.snapshot();
+    assert_eq!(after["opens"], 1);
+    assert_eq!(after["finishes"], 1);
+    fresh.call_owned("ping", &[]).unwrap();
+    let healthy = replacement.snapshot();
+    assert_eq!(healthy["unary"], 1);
+    assert_eq!(
+        healthy["physical_opened"], after["physical_opened"],
+        "old evidence must not force a new data carrier"
+    );
+    if let Some(carrier) = &carrier {
+        assert!(carrier.snapshot().is_none());
+    }
+    peer.assert_item(&first, 1);
+    assert_eq!(
+        fixture.outgoing_ids().len(),
+        if path == PathKind::Http { 0 } else { 2 }
+    );
+    fixture.assert_paths(2);
+    drop((stream, recovered, first, item, second, old, fresh));
+    replacement.stop();
+    fixture.finish();
+}
+
+// Gate 4, HTTP: one upstream carrier serves A and the error routes. Closed,
+// removed and stale-token refusals preserve A and that carrier. Separate route
+// names keep the stale token cached while the closed/removed route is probed.
+#[test]
+fn relay_http_route_errors_preserve_other_route_inflight_call_and_carrier() {
+    use c_two::observe::ConnectionEvent;
+    let fixture = Fixture::new(PathKind::Http, 0.0, 0);
+    let a = fixture.register("a-http");
+    let mut b = fixture.register("closed-b-http");
+    let mut token = fixture.register("stale-b-http");
+    let a_client = fixture.connect(&a);
+    let b_client = fixture.connect(&b);
+    let token_client = fixture.connect(&token);
+    fixture.call(&token_client, &token, "cache-business-token");
+    let entered = a_client.clone();
+    let a_call =
+        std::thread::spawn(move || entered.call_owned("echo", &fixture::encode("blocked")));
+    let entered = b_client.clone();
+    let b_call =
+        std::thread::spawn(move || entered.call_owned("echo", &fixture::encode("blocked")));
+    observe_until(|| a.calls() == 1 && b.calls() == 1);
+    observe_until(|| fixture.live_accepted().len() == 2);
+    let carriers = fixture.live_accepted();
+    let concurrency = b.registration.route_concurrency();
+    let evidence = b.evidence();
+    let b_response = std::thread::scope(|scope| {
+        let evidence = evidence;
+        let closing = scope.spawn(|| b.registration.close().unwrap());
+        observe_until(|| concurrency.snapshot().closed);
+        fixture::assert_semantic(
+            fixture.connect_name("closed-b-http").unwrap_err(),
+            fixture::ErrorCode::ResourceNotFound,
+        );
+        fixture::assert_semantic(
+            b_client
+                .call_owned("echo", &fixture::encode("closed"))
+                .unwrap_err(),
+            fixture::ErrorCode::ResourceNotFound,
+        );
+        assert!(!a_call.is_finished());
+        assert!(carriers.iter().all(|carrier| carrier.snapshot().is_none()));
+        evidence.release();
+        let response = b_call.join().unwrap().unwrap();
+        let outcome = closing.join().unwrap();
+        assert!(outcome.local_removed && outcome.close.active_drained);
+        assert!(outcome.close.close_error.is_none());
+        response
+    });
+    fixture.assert_response(&b_client, &b, "blocked", &b_response);
+    fixture::assert_semantic(
+        b_client
+            .call_owned("echo", &fixture::encode("removed"))
+            .unwrap_err(),
+        fixture::ErrorCode::ResourceNotFound,
+    );
+    assert!(token.registration.close().unwrap().local_removed);
+    let replacement = fixture.register("stale-b-http");
+    fixture::assert_semantic(
+        token_client
+            .call_owned("echo", &fixture::encode("stale"))
+            .unwrap_err(),
+        fixture::ErrorCode::RouteStale,
+    );
+    assert_eq!(replacement.calls(), 0);
+    assert!(!a_call.is_finished());
+    assert!(carriers.iter().all(|carrier| carrier.snapshot().is_none()));
+    a.evidence().release();
+    fixture.assert_response(&a_client, &a, "blocked", &a_call.join().unwrap().unwrap());
+    let before = fixture.accepted_events().len();
+    fixture.call(&a_client, &a, "after-b-refusals");
+    let fresh = fixture.connect(&replacement);
+    fixture.call(&fresh, &replacement, "fresh-b");
+    let events = fixture.accepted_events();
+    assert!(
+        !events[before..]
+            .iter()
+            .any(|event| matches!(event, ConnectionEvent::Opened(_)))
+    );
+    assert!(carriers.iter().all(|carrier| carrier.snapshot().is_none()));
+    assert_eq!(
+        (a.calls(), b.calls(), token.calls(), replacement.calls()),
+        (2, 1, 1, 1)
+    );
+    assert!(fixture.outgoing_ids().is_empty());
+    fixture.assert_paths(4);
+    println!(
+        "C2_PERSISTENT_HTTP_SHARED_CARRIERS {:?}",
+        carriers
+            .iter()
+            .map(|carrier| carrier.connection_id())
+            .collect::<Vec<_>>()
+    );
+    drop((
+        a_client,
+        b_client,
+        token_client,
+        fresh,
+        a,
+        b,
+        token,
+        replacement,
+    ));
+    fixture.finish();
+}
+
+// Gate 6: a resource error is a known terminal after dispatch. It is returned
+// once, without replay or fallback; an explicit next call uses the same route.
+#[test]
+fn direct_resource_error_is_terminal_without_replay_or_reconnect() {
+    resource_error(PathKind::Direct);
+}
+#[test]
+fn relay_local_resource_error_is_terminal_without_replay_or_reconnect() {
+    resource_error(PathKind::Local);
+}
+#[test]
+fn relay_http_resource_error_is_terminal_without_replay_or_reconnect() {
+    resource_error(PathKind::Http);
+}
+fn resource_error(path: PathKind) {
+    let fixture = Fixture::new(path, 0.0, 0);
+    let route = fixture.register("service-error");
+    let client = fixture.connect(&route);
+    let physical = fixture.outgoing_ids();
+    fixture::assert_semantic(
+        client
+            .call_owned("echo", &fixture::encode("fail"))
+            .unwrap_err(),
+        fixture::ErrorCode::ResourceFunctionExecuting,
+    );
+    assert_eq!(route.calls(), 1);
+    fixture.call(&client, &route, "caller-next-call");
+    assert_eq!(route.calls(), 2);
+    assert_eq!(fixture.outgoing_ids(), physical);
+    assert_eq!(physical.len(), usize::from(path != PathKind::Http));
+    fixture.assert_paths(1);
+    drop((client, route));
+    fixture.finish();
+}
+
+// Gate 6 and streaming design section 8: once Success or a resource Failed
+// terminal is known, a later real EOF cannot replace it with uncertainty.
+// Both complete payloads remain readable after their resource process ends.
+#[test]
+fn direct_known_terminals_and_items_survive_later_peer_end() {
+    known_terminal(PathKind::Direct);
+}
+#[test]
+fn relay_local_known_terminals_and_items_survive_later_peer_end() {
+    known_terminal(PathKind::Local);
+}
+#[test]
+fn relay_http_known_terminals_and_items_survive_later_peer_end() {
+    known_terminal(PathKind::Http);
+}
+fn known_terminal(path: PathKind) {
+    let fixture = Fixture::new(path, 0.0, 0);
+    let mut peer = fixture::ResourceProcess::start(&fixture, &fixture::unique("known-end"));
+    let client = peer.connect(&fixture);
+    let mut success = fixture::open_stream(&client, "complete");
+    let item = success.next().unwrap().unwrap();
+    peer.assert_item(&item, 1);
+    assert!(success.next().is_none());
+    let terminal = success.close_with_timeout(Some(fixture::WAIT));
+    assert!(terminal.completed && terminal.terminal.unwrap().is_ok());
+    assert_eq!(terminal.complete_items, Some(1));
+    let mut failed = fixture::open_stream(&client, "fail");
+    let failed_item = failed.next().unwrap().unwrap();
+    peer.assert_item(&failed_item, 1);
+    fixture::assert_semantic(
+        failed.next().unwrap().unwrap_err(),
+        fixture::ErrorCode::ResourceFunctionExecuting,
+    );
+    assert!(failed.next().is_none());
+    let terminal = failed.close_with_timeout(Some(fixture::WAIT));
+    assert!(terminal.completed);
+    fixture::assert_semantic(
+        terminal.terminal.unwrap().unwrap_err(),
+        fixture::ErrorCode::ResourceFunctionExecuting,
+    );
+    assert_eq!(terminal.complete_items, Some(1));
+    let before = peer.snapshot();
+    assert_eq!(before["opens"], 2);
+    assert_eq!(before["finishes"], 2);
+    let physical = fixture.outgoing_ids();
+    let connection = (path != PathKind::Http).then(|| client.connection_observation().unwrap());
+    peer.kill();
+    if let Some(connection) = connection {
+        observe_until(|| connection.snapshot().is_some());
+        assert!(connection.snapshot().unwrap().is_peer_end());
+    }
+    let terminal = success.close_with_timeout(Some(fixture::WAIT));
+    assert!(terminal.completed && terminal.terminal.unwrap().is_ok());
+    assert_eq!(terminal.complete_items, Some(1));
+    let terminal = failed.close_with_timeout(Some(fixture::WAIT));
+    assert!(terminal.completed);
+    fixture::assert_semantic(
+        terminal.terminal.unwrap().unwrap_err(),
+        fixture::ErrorCode::ResourceFunctionExecuting,
+    );
+    assert_eq!(terminal.complete_items, Some(1));
+    assert!(success.next().is_none() && failed.next().is_none());
+    peer.assert_item(&item, 1);
+    peer.assert_item(&failed_item, 1);
+    assert_eq!(peer.records("open").len(), 2);
+    assert_eq!(fixture.outgoing_ids(), physical);
+    assert_eq!(physical.len(), usize::from(path != PathKind::Http));
+    fixture.assert_paths(1);
+    drop((success, failed, item, failed_item, client));
+    fixture.finish();
+}
