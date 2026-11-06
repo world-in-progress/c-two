@@ -48,6 +48,7 @@ See the [unreleased notes](docs/releases/unreleased.md).
 - A finite call releases its `max_outstanding_calls` slot before its result reaches the caller, so an immediate next call is no longer refused while the limit is full.
 - Generated TypeScript relay-aware clients reuse one local IPC connection per server instance for relay-local calls instead of opening and closing a connection for each call.
 - Callers that acquire the same endpoint at once share one connection attempt instead of each opening a connection, and a shared failure keeps its native OS error code.
+- Once a Host stops admitting calls during shutdown, route lookup and listing report its routes closed with reason shutdown, matching the `ResourceClosed` refusal that calls get; before, lookup still answered ready.
 - On Windows, a client's DISCONNECT no longer loses to a failed reply flush as the connection's first close reason; a write that fails because the peer has closed is a peer end, and the reader decides the reason.
 - A relay discards the request body before every refusal it sends without reading it, so on Windows a client that is still sending receives the refusal, such as a stale route reported before dispatch, instead of a reset connection.
 

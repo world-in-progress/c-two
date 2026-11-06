@@ -388,6 +388,16 @@ New tests cover the OPEN layout with both modes for whole values and first chunk
 
 New tests cover parsing and boundary validation of the setting, real eviction after a short timeout with reuse before it and no eviction at `0`, and the Python and Rust SDK projections. On macOS with the FastDB sibling, c2-config, c2-ipc and c2-core (624 tests), the Rust SDK (38) and the Python configuration tests together with the existing idle cleanup test (114) passed on the integrated tree.
 
+## Route state during Host shutdown
+
+### Fixed
+
+- Once a Host stops admitting calls during Runtime shutdown, route lookup and listing report its routes closed, with the reason shutdown. Before, lookup still answered ready while every call was refused with `ResourceClosed` before dispatch, so lookup and the call-time check disagreed. A direct acquire now fails with `ResourceClosed`, a relay-aware client on the relay-local path reports `FallbackDenied` that keeps `ResourceClosed` as its first cause, calls already entered still finish, and a relay withdraws the closed route.
+
+### Validation
+
+New tests cover the direct and relay-local acquire during shutdown, the entered call, the route list and the relay's withdrawal. On macOS with the FastDB sibling, the Rust Core workspace (1941 tests), c3, the Rust SDK, the CI Python gates (1590 ordinary tests, 25 portable and 14 TypeScript) and the repository checks (977) passed on the integrated tree.
+
 ## Connection close on Windows
 
 ### Fixed
