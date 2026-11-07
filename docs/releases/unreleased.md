@@ -417,3 +417,33 @@ New Rust tests of the relay-aware client reproduce both failures and pass with t
 ### Validation
 
 A Worker reproduced the failure on a Windows 11 x64 test machine in 1 of 249 runs without logging and 2 of 1418 runs with frame capture, and traced both captured failures to the flush of a PONG reply returning 232. After the fix it ran the original test and the two new handshake tests 300 times each on Windows and on macOS without a failure. An independent review found that the first version lost the handshake phase after such a write failure and reported valid handshake frames as protocol errors; it was fixed before integration. On macOS with the FastDB sibling the Rust Core workspace (1848 tests), c3 and the Rust SDK (109 together) and the CI Python gates passed. The first full-platform CI of the candidate `76f164e1` ([42000339894](https://github.com/Dsssyc/c-two/actions/runs/42000339894)) failed only on macOS, in a c2-ipc test that asserted on the peer cache after the protocol error had already retired the connection; the test now accepts a retired cache (`c396652b`). The exact candidate `c396652b59fe32b76ac3fce7ee1bc1c81054eff6` then passed [Source Validation 42003739984](https://github.com/Dsssyc/c-two/actions/runs/42003739984) on every lane at the first attempt: Linux x64 with Python 3.12 and 3.14t, macOS arm64, and Windows x64 and ARM64.
+
+## Python call path
+
+### Behavior
+
+- A unary call from a Python client gives up the GIL once for taking its input, charging the payload buffer budget, encoding and waiting for the response, instead of once for each of these steps, so it makes two GIL release and reacquire pairs. The client writes each call record once into a frame of the right length, and the server learns at registration whether a method is a stream instead of looking it up on every call.
+
+### Fixed
+
+- Releasing a held response no longer deadlocks with a thread that exports a buffer of the same response at the same time. The release ran the Python invalidator while holding the response's own lock; an invalidator that gave up the GIL let the other thread wait for that lock while it held the GIL. The response now stops accepting new views and buffer exports under its lock and runs the invalidator after releasing it, as [payload lifetimes](../reference/payload-lifetime.md#fastdb-view-lifetime) describe.
+
+### Validation
+
+A subprocess test that deadlocked before the fix now passes, and new tests cover the prepared-call path of unary and stream calls, the stream flag in the server's dispatch table and the one-pass record encoding. On macOS with the FastDB sibling, the Rust Core workspace (1951 tests), c3, the Rust SDK, the CI Python gates (1647 ordinary tests, 25 portable and 14 TypeScript) and the repository checks (1008) passed on the integrated tree.
+
+## Relay acquisition while a route is withdrawn
+
+### Fixed
+
+- A request that a relay is still connecting upstream for when the relay withdraws or replaces its route now reports that route fact: `ResourceNotFound` (HTTP 404) for a withdrawn route and `RouteStale` (HTTP 409) for a replaced one. Before, a request that met the upstream client the relay had just retired for a closed route reported `ResourceUnavailable` ("relay upstream unavailable", HTTP 503), and a withdrawn route could also be reported stale. A transport failure answers `ResourceUnavailable` only while the same route is still current, and an authoritative refusal from the upstream is kept. A relay-aware client invalidates its cached route on either answer, so the next call resolves the route again.
+
+### Validation
+
+Three new Rust tests use test seams to withdraw or replace the route while an acquisition is in progress. In a reproduction with 800 calls racing a route close, 110 answered `ResourceUnavailable` and 23 `RouteStale` before the fix and none after it. The persistent-client gates now accept that a relay may withdraw a closed route at any moment instead of listing exceptions per path. On macOS with the FastDB sibling, the Rust Core workspace (1954 tests), c3, the Rust SDK, the CI Python gates (1647 ordinary tests, 25 portable and 14 TypeScript) and the repository checks (1008) passed on the integrated tree.
+
+## Streaming acceptance
+
+### Validation
+
+The exact candidate `4df9120c1ef672717071f2c59a6db22fa34e91a6` of blocks 5 to 9 passed [Source Validation 42389270549](https://github.com/Dsssyc/c-two/actions/runs/42389270549) on every lane at the first attempt: Linux x64 with Python 3.12, which also runs the ordinary tests under Python 3.10, and 3.14t, macOS arm64, and Windows x64 and ARM64. The [paired IPC benchmark 42391112745](https://github.com/Dsssyc/c-two/actions/runs/42391112745) against `d772ca3a`, the main branch before the streaming work, passed on all four platforms with no candidate failures. On Linux and Windows, the p50 and p95 of 1-byte calls stayed within 2% of that baseline. On Linux the p95 of the two 4 MiB rows was 11–13% higher because the candidate reached steady state one call later within the eight measured calls, while their p50 was 1–2% higher; the macOS runner is too noisy to resolve 5%. The stream comparison rows ran on all four platforms. The [acceptance record](../acceptance/2026-11-08-streaming-acceptance.md) lists every full-platform run of the streaming work and the measurements.

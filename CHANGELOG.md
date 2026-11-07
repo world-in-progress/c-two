@@ -52,6 +52,8 @@ See the [unreleased notes](docs/releases/unreleased.md).
 - A relay-aware client acquiring a route by name after the route was registered again binds the new route UID instead of failing with `RouteStale` through a relay or `FallbackDenied` on the relay-local path.
 - On Windows, a client's DISCONNECT no longer loses to a failed reply flush as the connection's first close reason; a write that fails because the peer has closed is a peer end, and the reader decides the reason.
 - A relay discards the request body before every refusal it sends without reading it, so on Windows a client that is still sending receives the refusal, such as a stale route reported before dispatch, instead of a reset connection.
+- Releasing a held response no longer deadlocks with another thread that exports a buffer of the same response.
+- A request that a relay is still connecting upstream for when it withdraws or replaces the route reports `ResourceNotFound` or `RouteStale` instead of `ResourceUnavailable`.
 
 ## [0.10.1] — companion c3 0.6.0
 
