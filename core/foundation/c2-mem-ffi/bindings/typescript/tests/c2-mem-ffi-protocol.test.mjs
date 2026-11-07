@@ -495,12 +495,16 @@ const connect = async (...args) => {
       return new Proxy(call, {get(native, member) {
         if (member === 'cancel') return () => {
           native.cancel();
-          if (!cancelled) { cancelled = true; emit('native_cancel_submitted'); }
+          if (!cancelled) {
+            cancelled = true;
+            emit('native_cancel_submitted');
+            // Observation also cancels: start it only after GC submitted CANCEL.
+            receipt = native.observe(null);
+          }
         };
         if (member === 'next') return () => {
           const pending = native.next();
           if (++reads === 2) {
-            receipt = native.observe(null);
             nextStarted();
             emit('next_pending');
           }
@@ -523,6 +527,8 @@ try {
   await pendingStarted;
   await new Promise(resolve => process.stdin.once('data', resolve));
   process.stdin.pause();
+  // Read after the collect barrier to keep the public stream live until then.
+  assert.equal(stream[Symbol.asyncIterator](), stream);
   stream = null;
   assert.equal(typeof globalThis.gc, 'function');
   for (let turn = 0; !cancelled && turn < 10000; turn++) {
