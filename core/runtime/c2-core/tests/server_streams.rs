@@ -405,7 +405,7 @@ impl EncodedStreamService for ProbeService {
         self.0.opens.fetch_add(1, Ordering::SeqCst);
         Ok(Box::new(ProbeStream {
             probe: self.0.clone(),
-            count: if request[1] == 6 {
+            count: if matches!(request[1], 6 | 7) {
                 usize::MAX
             } else {
                 request[0] as usize
@@ -430,7 +430,8 @@ impl EncodedStream for ProbeStream {
             .step_entered
             .send((self.mode, self.cursor))
             .unwrap();
-        if (self.mode == 3 && self.cursor == 0) || (self.mode == 6 && self.cursor == 2) {
+        if (matches!(self.mode, 3 | 7) && self.cursor == 0) || (self.mode == 6 && self.cursor == 2)
+        {
             self.probe.step_gate.wait();
         }
         if self.cursor == self.count {
@@ -1354,11 +1355,12 @@ fn http_deadline_keeps_original_post_for_later_close() {
     let mut stream = timed
         .begin_stream("echo")
         .unwrap()
-        .encode_vec(vec![2, 3])
+        // Keep the stream open until the asynchronous DELETE reaches it.
+        .encode_vec(vec![0, 7])
         .unwrap()
         .stream()
         .unwrap();
-    assert_eq!(fixture.step_events.recv_timeout(WAIT).unwrap(), (3, 0));
+    assert_eq!(fixture.step_events.recv_timeout(WAIT).unwrap(), (7, 0));
     assert_semantic(
         expect_stream_error(&mut stream),
         ErrorCode::CallDeadlineExceeded,
@@ -1681,14 +1683,8 @@ fn explicit_http_close_keeps_cancelled_outcome_when_small_b_is_full() {
 
 #[test]
 fn relay_shutdown_delivers_running_http_item_then_true_cancelled_terminal() {
-    let mut fixture = Fixture::with_relay(
-        false,
-        2,
-        ServiceConcurrencyMode::ReadParallel,
-        None,
-        None,
-        true,
-    );
+    let mut fixture =
+        Fixture::with_relay(false, 2, ServiceConcurrencyMode::Parallel, None, None, true);
     let client = fixture
         .server
         .connect(
@@ -1706,6 +1702,8 @@ fn relay_shutdown_delivers_running_http_item_then_true_cancelled_terminal() {
         .stream()
         .unwrap();
     assert_eq!(fixture.step_events.recv_timeout(WAIT).unwrap(), (3, 0));
+    // Admission probes must run while the stream's write step is gated.
+    assert_eq!(client.call_owned("ping", &[]).unwrap(), b"pong");
     let mut relay = fixture._relay.take().unwrap();
     let (stopped_tx, stopped_rx) = mpsc::channel();
     let stopping = std::thread::spawn(move || {

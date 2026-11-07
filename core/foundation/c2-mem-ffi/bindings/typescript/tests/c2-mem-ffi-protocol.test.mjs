@@ -624,6 +624,14 @@ test('public holds keep the same native domain charge across distinct connection
     await withServer(async ({connector, address, contract, lines, createIpcEncodedTransport}) => {
       const transports = [];
       const holds = [];
+      const waitForInputRefund = async () => {
+        const deadline = performance.now() + 10_000;
+        while (performance.now() < deadline) {
+          if (connector.stats().payload_buffer.used_bytes === '4096') return;
+          await new Promise(resolve => setImmediate(resolve));
+        }
+        assert.fail('stream input reservation was not refunded');
+      };
       const open = async mode => {
         const endpoint = await connector(address);
         const binding = await endpoint.prepare('echo', contract);
@@ -644,6 +652,8 @@ test('public holds keep the same native domain charge across distinct connection
         let settled = false;
         const pending = second.stream.next().then(item => { settled = true; return item; });
         assert.equal(JSON.parse((await lines.next()).value).kind, 'second_stream_step');
+        // Resource entry can precede the client's input reservation refund.
+        await waitForInputRefund();
         assert.equal(settled, false);
         assert.equal(connector.stats().payload_buffer.used_bytes, '4096');
         await first.transport.close();
@@ -662,6 +672,7 @@ test('public holds keep the same native domain charge across distinct connection
         let resumed = false;
         const next = reconnected.stream.next().then(item => { resumed = true; return item; });
         assert.equal(JSON.parse((await lines.next()).value).kind, 'second_stream_step');
+        await waitForInputRefund();
         assert.equal(resumed, false);
         assert.equal(connector.stats().payload_buffer.used_bytes, '4096');
         assert.equal(retained.value.byteLength, 4096);

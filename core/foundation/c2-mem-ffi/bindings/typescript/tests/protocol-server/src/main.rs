@@ -88,9 +88,6 @@ impl CrmStream for BytesStream {
             emit(json!({"kind": "step_blocked"}));
             self.gate.wait();
         }
-        if self.mode == 4 && self.cursor == 2 {
-            emit(json!({"kind": "continued_after_deadline"}));
-        }
         if self.mode != 7 && self.cursor >= self.count {
             if self.mode == 1 {
                 return Err(CrmError::InternalError(
@@ -105,6 +102,10 @@ impl CrmStream for BytesStream {
     }
 
     fn finish(self: Box<Self>) -> Result<(), CrmError> {
+        if self.mode == 4 {
+            // The driver decides the natural terminal before entering cleanup.
+            emit(json!({"kind": "continued_after_deadline"}));
+        }
         if self.mode == 5 {
             emit(json!({"kind": "stream_cleanup"}));
         }
