@@ -1,6 +1,7 @@
 """Pickle calls exercise native preparation without portable-payload fixtures."""
 
 from collections.abc import Iterator
+import os
 
 import pytest
 
@@ -37,7 +38,7 @@ def test_native_stream_then_unary_preserves_input_and_terminal(
 ):
     monkeypatch.delenv('C2_RELAY_ANCHOR_ADDRESS', raising=False)
     runtime = cc.Runtime()
-    if transport == 'ipc':
+    if transport == 'ipc' and os.name != 'nt':
         runtime.set_local_endpoint(root=str(tmp_path))
     resource = Resource()
     proxy = view = stream = None

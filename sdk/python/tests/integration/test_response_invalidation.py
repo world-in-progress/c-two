@@ -31,7 +31,8 @@ def test_response_invalidator_releases_state_lock_before_python_callback(
                 return value
 
         runtime = cc.Runtime()
-        runtime.set_local_endpoint(root=sys.argv[1])
+        if os.name != 'nt':
+            runtime.set_local_endpoint(root=sys.argv[1])
         proxy = None
         try:
             runtime.register(Echo, Resource(), name='echo')
