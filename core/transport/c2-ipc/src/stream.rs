@@ -1079,22 +1079,21 @@ impl IpcClient {
                     block.write_at(0, data.as_ref())?;
                     let loan = block.prepare(&send.conn)?;
                     let alloc = block.allocation();
-                    let descriptor = encode_buddy_payload(&BuddyPayload {
+                    let descriptor = BuddyPayload {
                         seg_idx: alloc.seg_idx as u16,
                         generation: alloc.generation,
                         offset: alloc.offset,
                         data_size: block.len() as u32,
                         is_dedicated: alloc.is_dedicated,
                         loan_id: loan.id(),
-                    });
-                    let metadata =
-                        rpc::encode_open_metadata(&identity, index, CallMode::ServerStream)
-                            .map_err(|error| IpcError::Protocol(error.to_string()))?;
-                    let bytes = frame::encode_frame_parts(
-                        0,
-                        flags::FLAG_RPC_RECORD | flags::FLAG_BUDDY,
-                        &[&metadata, &descriptor],
-                    );
+                    };
+                    let bytes = rpc::encode_open_draft_frame(
+                        &identity,
+                        index,
+                        CallMode::ServerStream,
+                        ValuePart::whole(ValueStorage::Shm(descriptor)),
+                    )
+                    .map_err(|error| IpcError::Protocol(error.to_string()))?;
                     return send
                         .conn
                         .submit(
@@ -1108,8 +1107,6 @@ impl IpcClient {
             }
             let size = self.config.chunk_size as usize;
             if data.as_ref().len() > size {
-                let metadata = rpc::encode_open_metadata(&identity, index, CallMode::ServerStream)
-                    .map_err(|error| IpcError::Protocol(error.to_string()))?;
                 for (part, bytes) in data.as_ref().chunks(size).enumerate() {
                     if *stop_upload.borrow() {
                         return Ok(());
@@ -1117,10 +1114,9 @@ impl IpcClient {
                     Self::write_chunk_frame(
                         &send.conn,
                         &send.state,
-                        0,
                         part,
                         data.as_ref().len(),
-                        (part == 0).then_some(metadata.as_slice()),
+                        (&identity, index, CallMode::ServerStream),
                         bytes,
                         if part == 0 { control.cloned() } else { None },
                     )
@@ -1128,15 +1124,16 @@ impl IpcClient {
                 }
                 Ok(())
             } else {
-                let metadata = rpc::encode_open_metadata(&identity, index, CallMode::ServerStream)
-                    .map_err(|error| IpcError::Protocol(error.to_string()))?;
+                let bytes = rpc::encode_open_draft_frame(
+                    &identity,
+                    index,
+                    CallMode::ServerStream,
+                    ValuePart::whole(ValueStorage::Inline(data.as_ref())),
+                )
+                .map_err(|error| IpcError::Protocol(error.to_string()))?;
                 send.conn
                     .submit(
-                        frame::encode_frame_parts(
-                            0,
-                            flags::FLAG_RPC_RECORD,
-                            &[&metadata, data.as_ref()],
-                        ),
+                        bytes,
                         WriteRequest::Business(Vec::new()),
                         send.state.clone(),
                         control.cloned(),

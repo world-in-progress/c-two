@@ -27,4 +27,6 @@ pub mod rpc;
 pub mod shutdown_control;
 
 #[cfg(test)]
+mod rpc_encoding_tests;
+#[cfg(test)]
 mod tests;

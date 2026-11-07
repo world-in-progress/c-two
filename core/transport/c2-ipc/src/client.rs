@@ -109,7 +109,9 @@ pub(crate) async fn with_connect_deadline<T>(
 use crate::connection::{
     ClientConnection, EndState, PhysicalRetirement, ReadDriver, SendState, core_error,
 };
-use c2_wire::buddy::{BuddyPayload, encode_buddy_payload};
+use c2_wire::buddy::BuddyPayload;
+#[cfg(test)]
+use c2_wire::buddy::encode_buddy_payload;
 use c2_wire::chunk::{ChunkAdmissionError, ChunkConfig, ChunkRegistry};
 use c2_wire::connection::calls::ValueReceive;
 use c2_wire::connection::{PreparedLoan, WriteRequest};
@@ -2053,11 +2055,14 @@ impl IpcClient {
     ) -> Result<ResponseData, crate::IpcCallError> {
         IpcCallControl::check_preparation(control).map_err(pre_dispatch_call_error)?;
         let (send, mut rx) = self.begin_call().map_err(pre_dispatch_call_error)?;
-        let metadata = rpc::encode_open_metadata(identity, method_idx, CallMode::Unary)
-            .map_err(|error| pre_dispatch_call_error(IpcError::Protocol(error.to_string())))?;
         // The draft has no wire identity until the unique writer submits it.
-        let bytes =
-            frame::encode_frame_parts(0, flags::FLAG_RPC_RECORD, &[&metadata, data.as_ref()]);
+        let bytes = rpc::encode_open_draft_frame(
+            identity,
+            method_idx,
+            CallMode::Unary,
+            ValuePart::whole(ValueStorage::Inline(data.as_ref())),
+        )
+        .map_err(|error| pre_dispatch_call_error(IpcError::Protocol(error.to_string())))?;
         let written = send
             .conn
             .submit(
@@ -2191,21 +2196,21 @@ impl IpcClient {
         let (send, mut rx) = self.begin_call().map_err(pre_dispatch_call_error)?;
         let loan = block.prepare(&send.conn).map_err(pre_dispatch_call_error)?;
         let alloc = block.allocation();
-        let descriptor = encode_buddy_payload(&BuddyPayload {
+        let descriptor = BuddyPayload {
             seg_idx: alloc.seg_idx as u16,
             generation: alloc.generation,
             offset: alloc.offset,
             data_size: block.len() as u32,
             is_dedicated: alloc.is_dedicated,
             loan_id: loan.id(),
-        });
-        let metadata = rpc::encode_open_metadata(identity, method_idx, CallMode::Unary)
-            .map_err(|error| pre_dispatch_call_error(IpcError::Protocol(error.to_string())))?;
-        let bytes = frame::encode_frame_parts(
-            0,
-            flags::FLAG_RPC_RECORD | flags::FLAG_BUDDY,
-            &[&metadata, &descriptor],
-        );
+        };
+        let bytes = rpc::encode_open_draft_frame(
+            identity,
+            method_idx,
+            CallMode::Unary,
+            ValuePart::whole(ValueStorage::Shm(descriptor)),
+        )
+        .map_err(|error| pre_dispatch_call_error(IpcError::Protocol(error.to_string())))?;
         let written = send
             .conn
             .submit(
@@ -2282,9 +2287,7 @@ impl IpcClient {
         let (mut send, mut rx) = self.begin_call().map_err(pre_dispatch_call_error)?;
         let conn = send.conn.clone();
         let state = send.state.clone();
-        let rid = 0;
-        let ctrl = rpc::encode_open_metadata(identity, method_idx, CallMode::Unary)
-            .map_err(|error| pre_dispatch_call_error(IpcError::Protocol(error.to_string())))?;
+        let identity = identity.clone();
         let (upload_stop, stop_upload) = watch::channel(false);
         if let Some(entry) = self.pending.lock().unpublished_mut(&send.state) {
             entry.upload_stop = Some(upload_stop);
@@ -2293,11 +2296,11 @@ impl IpcClient {
             Self::send_chunked_stream_frames(
                 conn,
                 state,
-                rid,
                 total_chunks,
                 chunk_size,
                 data_size,
-                ctrl,
+                identity,
+                method_idx,
                 chunks,
                 policy,
                 stop_upload,
@@ -2345,11 +2348,11 @@ impl IpcClient {
     async fn send_chunked_stream_frames<S, B, E>(
         conn: Arc<ClientConnection>,
         state: Arc<StdMutex<SendState>>,
-        rid: u64,
         total_chunks: usize,
         chunk_size: usize,
         data_size: usize,
-        ctrl: Vec<u8>,
+        identity: RouteCallIdentity,
+        method_idx: u16,
         chunks: S,
         policy: Option<IpcCallControl>,
         mut stop_upload: watch::Receiver<bool>,
@@ -2404,10 +2407,9 @@ impl IpcClient {
                     Self::write_chunk_frame(
                         &conn,
                         &state,
-                        rid,
                         index,
                         data_size,
-                        (index == 0).then_some(ctrl.as_slice()),
+                        (&identity, method_idx, CallMode::Unary),
                         &buffered,
                         if index == 0 { policy.clone() } else { None },
                     )
@@ -2435,10 +2437,9 @@ impl IpcClient {
             Self::write_chunk_frame(
                 &conn,
                 &state,
-                rid,
                 index,
                 data_size,
-                (index == 0).then_some(ctrl.as_slice()),
+                (&identity, method_idx, CallMode::Unary),
                 &buffered,
                 if index == 0 { policy } else { None },
             )
@@ -2479,33 +2480,23 @@ impl IpcClient {
     async fn write_chunk_frame(
         conn: &Arc<ClientConnection>,
         state: &Arc<StdMutex<SendState>>,
-        rid: u64,
         chunk_idx: usize,
         total_bytes: usize,
-        ctrl: Option<&[u8]>,
+        open: (&RouteCallIdentity, u16, CallMode),
         chunk_data: &[u8],
         policy: Option<IpcCallControl>,
     ) -> Result<(), IpcError> {
-        let record_flags = flags::FLAG_RPC_RECORD
-            | flags::FLAG_CHUNKED
-            | if chunk_idx == 0 {
-                flags::FLAG_FIRST_CHUNK
-            } else {
-                0
-            };
-        let bytes = if let Some(metadata) = ctrl {
-            frame::encode_frame_parts(
-                rid,
-                record_flags,
-                &[metadata, &(total_bytes as u64).to_le_bytes(), chunk_data],
+        let bytes = if chunk_idx == 0 {
+            rpc::encode_open_draft_frame(
+                open.0,
+                open.1,
+                open.2,
+                ValuePart::first(total_bytes as u64, ValueStorage::Inline(chunk_data)),
             )
         } else {
-            frame::encode_frame_parts(
-                rid,
-                record_flags,
-                &[&[RpcRecordKind::Open as u8], chunk_data],
-            )
-        };
+            rpc::encode_open_continuation_draft_frame(ValueStorage::Inline(chunk_data))
+        }
+        .map_err(|error| IpcError::Protocol(error.to_string()))?;
         let request = if chunk_idx == 0 {
             WriteRequest::Business(Vec::new())
         } else {

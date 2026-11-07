@@ -848,10 +848,6 @@ def test_relay_connected_http_mode_uses_single_core_client_call_path():
         runtime_source,
     )
     assert re.search(r'inner:\s*Mutex\s*<\s*Option\s*<\s*Client\s*>\s*>', client_source)
-    # Encoding consumes the prepared scope; execution receives only that
-    # encoded owner, with no second route or method argument.
-    assert re.search(r'fn\s+finish\s*\([^)]*encoded:\s*c2_core::EncodedCall\s*,?\s*\)', client_source)
-    assert re.search(r'py\s*\.detach\(move\s*\|\|\s*encoded\.call_held\(\)\)', client_source)
     assert 'RelayAwareHttpClient' not in runtime_source
     assert 'release_http_client_from_global_pool' not in client_source
 

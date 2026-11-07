@@ -416,8 +416,11 @@ fn open_roundtrips_call_mode_in_whole_and_first_chunk() {
         ] {
             let wire = encode_open_frame(1, &identity(), 3, mode, value).unwrap();
             let (header, payload) = decode_frame(&wire).unwrap();
-            let metadata = c2_wire::rpc::encode_open_metadata(&identity(), 3, mode).unwrap();
-            assert_eq!(&metadata[metadata.len() - 3..], &[3, 0, mode as u8]);
+            let (_, _, _, metadata_len) = c2_wire::rpc::decode_open_metadata(payload).unwrap();
+            assert_eq!(
+                &payload[metadata_len - 3..metadata_len],
+                &[3, 0, mode as u8]
+            );
             assert!(matches!(decode_rpc_record(&header, payload, None).unwrap(),
                 RpcRecord::Open { method_idx: 3, mode: actual, value: actual_value, .. }
                 if actual == mode && actual_value == value));
@@ -473,11 +476,8 @@ fn unknown_open_mode_preserves_whole_and_first_chunk_shm_carrier() {
         ValuePart::first(2, ValueStorage::Shm(descriptor)),
     ] {
         let mut wire = encode_open_frame(1, &identity(), 0, CallMode::Unary, part).unwrap();
-        let mode_offset = 16
-            + c2_wire::rpc::encode_open_metadata(&identity(), 0, CallMode::Unary)
-                .unwrap()
-                .len()
-            - 1;
+        let (_, _, _, metadata_len) = c2_wire::rpc::decode_open_metadata(&wire[16..]).unwrap();
+        let mode_offset = 16 + metadata_len - 1;
         wire[mode_offset] = 2;
         let (header, payload) = decode_frame(&wire).unwrap();
         let failure = decode_rpc_record_with_carrier(&header, payload, None).unwrap_err();

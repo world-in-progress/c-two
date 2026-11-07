@@ -591,25 +591,12 @@ def test_native_route_contract_boundaries_have_no_empty_defaults_or_raw_calls():
     client_impl = re.search(r'#\[pymethods\]\s*impl\s+PyCoreClient\s*\{', core_ffi)
     assert client_impl is not None
     client_source = core_ffi[client_impl.start():]
-    begin = _rust_compact(_rust_function(client_source, 'begin_call'))
     call = _rust_compact(_rust_function(client_source, 'call'))
-    finish = _rust_compact(_rust_function(core_ffi, 'finish'))
     take = _rust_compact(_rust_function(core_ffi, 'take'))
     clone = _rust_compact(_rust_function(core_ffi, 'client'))
-    assert 'letclient=self.client()?;' in begin
-    assert 'detach(move||client.begin_call(method_name))' in begin
     assert 'self.begin_call(py,method_name)?.call(py,data)' in call
-    assert 'encoded:c2_core::EncodedCall' in finish
-    assert 'detach(move||encoded.call_held())' in finish
     assert 'self.inner.lock().take()' in take
     assert 'self.inner.lock().clone()' in clone
-    assert '.lock()' not in begin + call + finish
-    prepared_call = _rust_compact(_rust_function(core_ffi, 'call'))
-    encode = _rust_compact(_rust_function(core_ffi, 'encode'))
-    assert 'Self::finish(py,self.encode(py,data)?)' in prepared_call
-    assert 'letmutprepared=py.detach(||self.take())?;' in encode
-    assert 'begin_call(' not in encode
-    assert 'begin_call(' not in prepared_call
     for source in (core_ffi, runtime_session):
         assert re.search(
             r'\bfn\s+call(?:<[^>]*>)?\s*\([^)]*\broute_name\s*:', source,

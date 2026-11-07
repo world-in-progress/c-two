@@ -68,7 +68,7 @@ class CRMSlot:
     methods: list[str]
     shutdown_method: str | None = None
     input_lifetime: dict[str, _InputLifetime] = field(default_factory=dict)
-    _dispatch_table: dict[str, tuple[Any, MethodAccess, str]] = field(
+    _dispatch_table: dict[str, tuple[Any, MethodAccess, str, bool]] = field(
         default_factory=dict, repr=False,
     )
 
@@ -93,7 +93,10 @@ class CRMSlot:
                     buffer_mode = 'borrowed'
                 else:
                     buffer_mode = 'view'
-                self._dispatch_table[name] = (method, access, buffer_mode)
+                self._dispatch_table[name] = (
+                    method, access, buffer_mode,
+                    bool(getattr(method, '__cc_stream__', False)),
+                )
 
 
 def _close_outcome_by_route(outcome: Mapping[str, Any]) -> dict[str, Mapping[str, Any]]:
@@ -218,7 +221,7 @@ class NativeServerBridge:
         for idx, mname in enumerate(methods):
             entry = slot._dispatch_table.get(mname)
             if entry is not None:
-                _, access, _bm = entry
+                _, access, _bm, _is_stream = entry
                 access_map[idx] = (
                     'read' if access is MethodAccess.READ else 'write'
                 )
@@ -461,7 +464,7 @@ class NativeServerBridge:
             entry = dispatch_table.get(method_name)
             if entry is None:
                 raise RuntimeError(f'Method not found: {method_name}')
-            method, _access, buffer_mode = entry
+            method, _access, buffer_mode, is_stream = entry
 
             # 2. Buffer-mode-aware request handling
             mv = memoryview(request_buf)
@@ -474,7 +477,7 @@ class NativeServerBridge:
                     request_buf.release()
                     released = True
 
-            if getattr(method, '__cc_stream__', False):
+            if is_stream:
                 if buffer_mode == 'borrowed' and local_copy_tracker is not None:
                     request_buf.track_retained(local_copy_tracker, route_name,
                                                method_name, 'resource_input')

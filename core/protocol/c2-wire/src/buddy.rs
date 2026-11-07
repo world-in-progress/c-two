@@ -38,6 +38,12 @@ pub struct BuddyPayload {
 /// Encode buddy payload into exactly [`BUDDY_PAYLOAD_SIZE`] bytes.
 pub fn encode_buddy_payload(bp: &BuddyPayload) -> [u8; BUDDY_PAYLOAD_SIZE] {
     let mut buf = [0u8; BUDDY_PAYLOAD_SIZE];
+    encode_buddy_payload_into(bp, &mut buf);
+    buf
+}
+
+/// Write the descriptor directly into its final fixed-size storage.
+pub(crate) fn encode_buddy_payload_into(bp: &BuddyPayload, buf: &mut [u8; BUDDY_PAYLOAD_SIZE]) {
     buf[0..2].copy_from_slice(&bp.seg_idx.to_le_bytes());
     buf[2..6].copy_from_slice(&bp.generation.to_le_bytes());
     buf[6..10].copy_from_slice(&bp.offset.to_le_bytes());
@@ -48,7 +54,6 @@ pub fn encode_buddy_payload(bp: &BuddyPayload) -> [u8; BUDDY_PAYLOAD_SIZE] {
         SHM_KIND_BUDDY
     };
     buf[15..23].copy_from_slice(&bp.loan_id.to_le_bytes());
-    buf
 }
 
 // ── Decoding ─────────────────────────────────────────────────────────────

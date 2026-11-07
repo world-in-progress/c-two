@@ -2,9 +2,11 @@
 
 use c2_error::C2Error;
 
-use crate::buddy::{BUDDY_PAYLOAD_SIZE, BuddyPayload, decode_buddy_payload, encode_buddy_payload};
+use crate::buddy::{
+    BUDDY_PAYLOAD_SIZE, BuddyPayload, decode_buddy_payload, encode_buddy_payload_into,
+};
 use crate::flags::{FLAG_BUDDY, FLAG_CHUNKED, FLAG_FIRST_CHUNK, FLAG_RESPONSE, FLAG_RPC_RECORD};
-use crate::frame::{DecodeError, FrameHeader, encode_frame};
+use crate::frame::{DecodeError, FrameHeader, HEADER_SIZE};
 use crate::release::{ReleaseBatch, decode_release_frame};
 
 const MAX_RPC_RECORD_BYTES: usize = u32::MAX as usize - (crate::frame::HEADER_SIZE - 4);
@@ -84,8 +86,7 @@ fn identity_fields<S: AsRef<str>>(identity: &RouteCallIdentity<S>) -> [&str; 7] 
     ]
 }
 
-fn encode_identity<S: AsRef<str>>(identity: &RouteCallIdentity<S>) -> Result<Vec<u8>, EncodeError> {
-    let fields = identity_fields(identity);
+fn identity_encoded_len(fields: &[&str; 7]) -> Result<usize, EncodeError> {
     for (field, value) in IDENTITY_FIELDS.into_iter().zip(fields) {
         if value.len() > u8::MAX as usize {
             return Err(EncodeError::FieldTooLong {
@@ -95,12 +96,14 @@ fn encode_identity<S: AsRef<str>>(identity: &RouteCallIdentity<S>) -> Result<Vec
             });
         }
     }
-    let mut out = Vec::with_capacity(7 + fields.iter().map(|s| s.len()).sum::<usize>());
-    for value in fields {
-        out.push(value.len() as u8);
-        out.extend_from_slice(value.as_bytes());
-    }
-    Ok(out)
+    Ok(7 + fields.iter().map(|s| s.len()).sum::<usize>())
+}
+
+/// Size of OPEN's kind, identity, method index and mode, without allocating.
+pub fn encoded_open_metadata_len<S: AsRef<str>>(
+    identity: &RouteCallIdentity<S>,
+) -> Result<usize, EncodeError> {
+    Ok(4 + identity_encoded_len(&identity_fields(identity))?)
 }
 
 fn read_identity_text(
@@ -739,46 +742,90 @@ fn invalid(field: &'static str, value: u64) -> DecodeError {
     DecodeError::InvalidValue { field, value }
 }
 
-fn encode_value(out: &mut Vec<u8>, value: ValuePart<'_>) -> Result<u32, EncodeError> {
+fn chunk_layout(chunk: ChunkPosition, bytes: u64) -> Result<(usize, u32), EncodeError> {
     let mut flags = 0;
-    match value.chunk {
-        ChunkPosition::Whole => {}
-        ChunkPosition::First { total_bytes }
-            if value.storage.len() > 0 && value.storage.len() < total_bytes =>
-        {
+    let prefix_len = match chunk {
+        ChunkPosition::Whole => 0,
+        ChunkPosition::First { total_bytes } if bytes > 0 && bytes < total_bytes => {
             flags |= FLAG_CHUNKED | FLAG_FIRST_CHUNK;
-            out.extend_from_slice(&total_bytes.to_le_bytes());
+            8
         }
-        ChunkPosition::Continuation if value.storage.len() > 0 => flags |= FLAG_CHUNKED,
+        ChunkPosition::Continuation if bytes > 0 => {
+            flags |= FLAG_CHUNKED;
+            0
+        }
         _ => {
             return Err(encode_invalid(
                 "RPC chunk length",
                 "first/continuation requires a nonempty strict chunk",
             ));
         }
-    }
-    match value.storage {
-        ValueStorage::Inline(bytes) => out.extend_from_slice(bytes),
+    };
+    Ok((prefix_len, flags))
+}
+
+fn value_layout(value: ValuePart<'_>) -> Result<(usize, u32), EncodeError> {
+    let (prefix_len, mut flags) = chunk_layout(value.chunk, value.storage.len())?;
+    let storage_len = match value.storage {
+        ValueStorage::Inline(bytes) => bytes.len(),
         ValueStorage::Shm(descriptor) => {
             flags |= FLAG_BUDDY;
             if descriptor.data_size == 0 {
                 return Err(encode_invalid("SHM data size", "must be nonzero"));
             }
-            out.extend_from_slice(&encode_buddy_payload(&descriptor));
+            BUDDY_PAYLOAD_SIZE
         }
-    }
-    Ok(flags)
+    };
+    Ok((record_len(prefix_len, storage_len)?, flags))
 }
 
-fn checked_frame(request_id: u64, flags: u32, payload: &[u8]) -> Result<Vec<u8>, EncodeError> {
-    if payload.len() > MAX_RPC_RECORD_BYTES {
+fn write_value(out: &mut Vec<u8>, value: ValuePart<'_>) {
+    if let ChunkPosition::First { total_bytes } = value.chunk {
+        out.extend_from_slice(&total_bytes.to_le_bytes());
+    }
+    write_storage(out, value.storage);
+}
+
+fn write_storage(out: &mut Vec<u8>, storage: ValueStorage<'_>) {
+    match storage {
+        ValueStorage::Inline(bytes) => out.extend_from_slice(bytes),
+        ValueStorage::Shm(descriptor) => {
+            let start = out.len();
+            out.resize(start + BUDDY_PAYLOAD_SIZE, 0);
+            encode_buddy_payload_into(
+                &descriptor,
+                (&mut out[start..])
+                    .try_into()
+                    .expect("fixed SHM descriptor"),
+            );
+        }
+    }
+}
+
+/// Allocate the final frame only after all record lengths have been checked.
+fn record_frame(request_id: u64, flags: u32, payload_len: usize) -> Result<Vec<u8>, EncodeError> {
+    if payload_len > MAX_RPC_RECORD_BYTES {
         return Err(EncodeError::FieldTooLong {
             field: "RPC record",
             max: MAX_RPC_RECORD_BYTES,
-            actual: payload.len(),
+            actual: payload_len,
         });
     }
-    Ok(encode_frame(request_id, flags, payload))
+    let mut out = Vec::with_capacity(HEADER_SIZE + payload_len);
+    out.extend_from_slice(&((12 + payload_len) as u32).to_le_bytes());
+    out.extend_from_slice(&request_id.to_le_bytes());
+    out.extend_from_slice(&flags.to_le_bytes());
+    Ok(out)
+}
+
+fn record_len(prefix_len: usize, value_len: usize) -> Result<usize, EncodeError> {
+    prefix_len
+        .checked_add(value_len)
+        .ok_or(EncodeError::FieldTooLong {
+            field: "RPC record",
+            max: MAX_RPC_RECORD_BYTES,
+            actual: usize::MAX,
+        })
 }
 
 fn encode_invalid(field: &'static str, reason: &str) -> EncodeError {
@@ -796,26 +843,94 @@ pub fn encode_open_frame<S: AsRef<str>>(
     mode: CallMode,
     value: ValuePart<'_>,
 ) -> Result<Vec<u8>, EncodeError> {
-    if request_id == 0 || value.chunk == ChunkPosition::Continuation {
+    if request_id == 0 {
         return Err(encode_invalid("OPEN", "invalid request id or continuation"));
     }
-    let mut payload = encode_open_metadata(identity, method_idx, mode)?;
-    let flags = encode_value(&mut payload, value)?;
-    checked_frame(request_id, FLAG_RPC_RECORD | flags, &payload)
+    encode_open_record(request_id, identity, method_idx, mode, value)
 }
 
-/// Encode the kind, route identity, method index and mode prefix for a first OPEN
-/// chunk. The caller appends total_bytes and the first value segment.
-pub fn encode_open_metadata<S: AsRef<str>>(
+/// Encode a complete OPEN draft. The connection's unique writer assigns its RID.
+pub fn encode_open_draft_frame<S: AsRef<str>>(
     identity: &RouteCallIdentity<S>,
     method_idx: u16,
     mode: CallMode,
+    value: ValuePart<'_>,
 ) -> Result<Vec<u8>, EncodeError> {
-    let mut payload = vec![RpcRecordKind::Open as u8];
-    payload.extend_from_slice(&encode_identity(identity)?);
-    payload.extend_from_slice(&method_idx.to_le_bytes());
-    payload.push(mode as u8);
-    Ok(payload)
+    encode_open_record(0, identity, method_idx, mode, value)
+}
+
+fn encode_open_record<S: AsRef<str>>(
+    request_id: u64,
+    identity: &RouteCallIdentity<S>,
+    method_idx: u16,
+    mode: CallMode,
+    value: ValuePart<'_>,
+) -> Result<Vec<u8>, EncodeError> {
+    let (value_len, flags) = value_layout(value)?;
+    let mut out = open_record_prefix(
+        request_id,
+        identity,
+        method_idx,
+        mode,
+        value.chunk,
+        value_len,
+        flags,
+    )?;
+    write_storage(&mut out, value.storage);
+    Ok(out)
+}
+
+/// Reserve one complete inline OPEN draft before a charged streaming source
+/// appends exactly `value_bytes` bytes. Its final length is already in the header.
+pub fn encode_open_inline_draft_prefix<S: AsRef<str>>(
+    identity: &RouteCallIdentity<S>,
+    method_idx: u16,
+    mode: CallMode,
+    chunk: ChunkPosition,
+    value_bytes: usize,
+) -> Result<Vec<u8>, EncodeError> {
+    let (prefix_len, flags) = chunk_layout(chunk, value_bytes as u64)?;
+    open_record_prefix(
+        0,
+        identity,
+        method_idx,
+        mode,
+        chunk,
+        record_len(prefix_len, value_bytes)?,
+        flags,
+    )
+}
+
+fn open_record_prefix<S: AsRef<str>>(
+    request_id: u64,
+    identity: &RouteCallIdentity<S>,
+    method_idx: u16,
+    mode: CallMode,
+    chunk: ChunkPosition,
+    value_len: usize,
+    flags: u32,
+) -> Result<Vec<u8>, EncodeError> {
+    if chunk == ChunkPosition::Continuation {
+        return Err(encode_invalid("OPEN", "invalid request id or continuation"));
+    }
+    let fields = identity_fields(identity);
+    let metadata_len = 1 + identity_encoded_len(&fields)? + 2 + 1;
+    let mut out = record_frame(
+        request_id,
+        FLAG_RPC_RECORD | flags,
+        record_len(metadata_len, value_len)?,
+    )?;
+    out.push(RpcRecordKind::Open as u8);
+    for field in fields {
+        out.push(field.len() as u8);
+        out.extend_from_slice(field.as_bytes());
+    }
+    out.extend_from_slice(&method_idx.to_le_bytes());
+    out.push(mode as u8);
+    if let ChunkPosition::First { total_bytes } = chunk {
+        out.extend_from_slice(&total_bytes.to_le_bytes());
+    }
+    Ok(out)
 }
 
 /// Encode CALL_END with mode-dependent metadata. Error bytes are checked once.
@@ -838,16 +953,19 @@ pub fn encode_call_end_frame(
             reason,
         }
     })?;
-    let mut payload = vec![RpcRecordKind::CallEnd as u8, status as u8];
-    if status != CallStatus::NotExecuted && mode == CallMode::ServerStream {
-        payload.extend_from_slice(&complete_items.to_le_bytes());
-    }
-    let flags = encode_value(&mut payload, value)?;
-    checked_frame(
+    let has_count = status != CallStatus::NotExecuted && mode == CallMode::ServerStream;
+    let (value_len, flags) = value_layout(value)?;
+    let mut out = record_frame(
         request_id,
         FLAG_RPC_RECORD | FLAG_RESPONSE | flags,
-        &payload,
-    )
+        record_len(2 + if has_count { 8 } else { 0 }, value_len)?,
+    )?;
+    out.extend_from_slice(&[RpcRecordKind::CallEnd as u8, status as u8]);
+    if has_count {
+        out.extend_from_slice(&complete_items.to_le_bytes());
+    }
+    write_value(&mut out, value);
+    Ok(out)
 }
 
 /// Encode a subsequent OPEN or CALL_END value chunk without repeating metadata.
@@ -856,15 +974,58 @@ pub fn encode_value_continuation_frame(
     kind: RpcRecordKind,
     storage: ValueStorage<'_>,
 ) -> Result<Vec<u8>, EncodeError> {
-    if request_id == 0 || !matches!(kind, RpcRecordKind::Open | RpcRecordKind::CallEnd) {
+    if request_id == 0 {
         return Err(encode_invalid(
             "RPC continuation",
             "invalid request id or kind",
         ));
     }
-    let mut payload = vec![kind as u8];
-    let flags = encode_value(&mut payload, ValuePart::continuation(storage))?;
-    checked_frame(
+    encode_continuation_record(request_id, kind, storage)
+}
+
+/// Encode an OPEN continuation draft for the same unique connection writer.
+pub fn encode_open_continuation_draft_frame(
+    storage: ValueStorage<'_>,
+) -> Result<Vec<u8>, EncodeError> {
+    encode_continuation_record(0, RpcRecordKind::Open, storage)
+}
+
+/// Reserve a complete inline OPEN continuation before appending its data.
+pub fn encode_open_continuation_draft_prefix(value_bytes: usize) -> Result<Vec<u8>, EncodeError> {
+    let (prefix_len, flags) = chunk_layout(ChunkPosition::Continuation, value_bytes as u64)?;
+    continuation_record_prefix(
+        0,
+        RpcRecordKind::Open,
+        record_len(prefix_len, value_bytes)?,
+        flags,
+    )
+}
+
+fn encode_continuation_record(
+    request_id: u64,
+    kind: RpcRecordKind,
+    storage: ValueStorage<'_>,
+) -> Result<Vec<u8>, EncodeError> {
+    if !matches!(kind, RpcRecordKind::Open | RpcRecordKind::CallEnd) {
+        return Err(encode_invalid(
+            "RPC continuation",
+            "invalid request id or kind",
+        ));
+    }
+    let value = ValuePart::continuation(storage);
+    let (value_len, flags) = value_layout(value)?;
+    let mut out = continuation_record_prefix(request_id, kind, value_len, flags)?;
+    write_storage(&mut out, storage);
+    Ok(out)
+}
+
+fn continuation_record_prefix(
+    request_id: u64,
+    kind: RpcRecordKind,
+    value_len: usize,
+    flags: u32,
+) -> Result<Vec<u8>, EncodeError> {
+    let mut out = record_frame(
         request_id,
         FLAG_RPC_RECORD
             | if kind == RpcRecordKind::CallEnd {
@@ -873,17 +1034,20 @@ pub fn encode_value_continuation_frame(
                 0
             }
             | flags,
-        &payload,
-    )
+        record_len(1, value_len)?,
+    )?;
+    out.push(kind as u8);
+    Ok(out)
 }
 
 pub fn encode_item_begin_frame(request_id: u64, total_bytes: u64) -> Result<Vec<u8>, EncodeError> {
     if request_id == 0 {
         return Err(encode_invalid("ITEM_BEGIN", "request id must be nonzero"));
     }
-    let mut payload = vec![RpcRecordKind::ItemBegin as u8];
-    payload.extend_from_slice(&total_bytes.to_le_bytes());
-    checked_frame(request_id, FLAG_RPC_RECORD | FLAG_RESPONSE, &payload)
+    let mut out = record_frame(request_id, FLAG_RPC_RECORD | FLAG_RESPONSE, 9)?;
+    out.push(RpcRecordKind::ItemBegin as u8);
+    out.extend_from_slice(&total_bytes.to_le_bytes());
+    Ok(out)
 }
 
 pub fn encode_item_data_frame(
@@ -896,13 +1060,16 @@ pub fn encode_item_data_frame(
             "request id and storage length must be nonzero",
         ));
     }
-    let mut payload = vec![RpcRecordKind::ItemData as u8];
-    let flags = encode_value(&mut payload, ValuePart::whole(storage))?;
-    checked_frame(
+    let value = ValuePart::whole(storage);
+    let (value_len, flags) = value_layout(value)?;
+    let mut out = record_frame(
         request_id,
         FLAG_RPC_RECORD | FLAG_RESPONSE | flags,
-        &payload,
-    )
+        record_len(1, value_len)?,
+    )?;
+    out.push(RpcRecordKind::ItemData as u8);
+    write_value(&mut out, value);
+    Ok(out)
 }
 
 pub fn encode_credit_frame(
@@ -913,19 +1080,18 @@ pub fn encode_credit_frame(
     if request_id == 0 || storage_bytes == 0 && item_demand == 0 {
         return Err(encode_invalid("CREDIT", "invalid request id or zero grant"));
     }
-    let mut payload = vec![RpcRecordKind::Credit as u8];
-    payload.extend_from_slice(&storage_bytes.to_le_bytes());
-    payload.extend_from_slice(&item_demand.to_le_bytes());
-    checked_frame(request_id, FLAG_RPC_RECORD, &payload)
+    let mut out = record_frame(request_id, FLAG_RPC_RECORD, 17)?;
+    out.push(RpcRecordKind::Credit as u8);
+    out.extend_from_slice(&storage_bytes.to_le_bytes());
+    out.extend_from_slice(&item_demand.to_le_bytes());
+    Ok(out)
 }
 
 pub fn encode_cancel_frame(request_id: u64, cause: CancelCause) -> Result<Vec<u8>, EncodeError> {
     if request_id == 0 {
         return Err(encode_invalid("CANCEL", "request id must be nonzero"));
     }
-    checked_frame(
-        request_id,
-        FLAG_RPC_RECORD,
-        &[RpcRecordKind::Cancel as u8, cause as u8],
-    )
+    let mut out = record_frame(request_id, FLAG_RPC_RECORD, 2)?;
+    out.extend_from_slice(&[RpcRecordKind::Cancel as u8, cause as u8]);
+    Ok(out)
 }

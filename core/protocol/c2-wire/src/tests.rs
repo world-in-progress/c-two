@@ -119,7 +119,7 @@ mod ipc16_tests {
     use crate::rpc::{
         CallMode, CallStatus, ChunkPosition, EncodeError, RouteCallIdentity, RpcRecord,
         RpcRecordKind, ValuePart, ValueStorage, decode_rpc_record, encode_call_end_frame,
-        encode_open_frame, encode_open_metadata, encode_value_continuation_frame,
+        encode_open_frame, encode_value_continuation_frame,
     };
 
     const ABI: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -305,7 +305,14 @@ mod ipc16_tests {
                 _ => value.signature_hash = &long,
             }
             assert_eq!(
-                encode_open_metadata(&value, 7, crate::rpc::CallMode::Unary).unwrap_err(),
+                encode_open_frame(
+                    1,
+                    &value,
+                    7,
+                    crate::rpc::CallMode::Unary,
+                    ValuePart::whole(ValueStorage::Inline(&[])),
+                )
+                .unwrap_err(),
                 EncodeError::FieldTooLong {
                     field,
                     max: 255,

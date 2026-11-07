@@ -796,10 +796,10 @@ impl IpcClient {
             entry.upload_stop = Some(upload_stop);
             entry.forward = Some(call.clone());
         }
-        let metadata = rpc::encode_open_metadata(&identity, index, CallMode::ServerStream)
+        let metadata_len = rpc::encoded_open_metadata_len(&identity)
             .map_err(|e| pre_dispatch_call_error(IpcError::Protocol(e.to_string())))?;
         let chunk_size = self
-            .forward_chunk_size(data_size, send_reservation.bytes(), metadata.len())
+            .forward_chunk_size(data_size, send_reservation.bytes(), metadata_len)
             .map_err(pre_dispatch_call_error)?;
         let (opening_tx, opening_rx) = oneshot::channel();
         let driver = send.conn.clone();
@@ -809,7 +809,7 @@ impl IpcClient {
             let result = Self::send_forward_frames(
                 conn.clone(),
                 state.clone(),
-                metadata,
+                (identity, index, CallMode::ServerStream),
                 data_size,
                 chunk_size,
                 request_block,
@@ -890,10 +890,10 @@ impl IpcClient {
         let (send, rx) = self
             .begin_pending(PendingKind::Call(CallMode::Unary))
             .map_err(pre_dispatch_call_error)?;
-        let metadata = rpc::encode_open_metadata(&identity, index, CallMode::Unary)
+        let metadata_len = rpc::encoded_open_metadata_len(&identity)
             .map_err(|e| pre_dispatch_call_error(IpcError::Protocol(e.to_string())))?;
         let chunk_size = self
-            .forward_chunk_size(data_size, send_reservation.bytes(), metadata.len())
+            .forward_chunk_size(data_size, send_reservation.bytes(), metadata_len)
             .map_err(pre_dispatch_call_error)?;
         let (upload_stop, stop_upload) = watch::channel(false);
         self.pending
@@ -907,7 +907,7 @@ impl IpcClient {
             let sent = Self::send_forward_frames(
                 send.conn.clone(),
                 send.state.clone(),
-                metadata,
+                (identity, index, CallMode::Unary),
                 data_size,
                 chunk_size,
                 request_block,
@@ -968,7 +968,7 @@ impl IpcClient {
     async fn send_forward_frames<S, B, E>(
         conn: Arc<ClientConnection>,
         state: Arc<StdMutex<SendState>>,
-        metadata: Vec<u8>,
+        open: (RouteCallIdentity, u16, CallMode),
         data_size: usize,
         chunk_size: usize,
         request_block: Option<RequestBlock>,
@@ -981,6 +981,9 @@ impl IpcClient {
         B: AsRef<[u8]> + Send,
         E: Display + Send,
     {
+        let (identity, method_idx, mode) = open;
+        let metadata_len = rpc::encoded_open_metadata_len(&identity)
+            .map_err(|error| IpcError::Protocol(error.to_string()))?;
         let send_reservation = Arc::new(send_reservation);
         if let Some(block) = request_block {
             // This allocation belongs to the original request pool. Fill it
@@ -1024,19 +1027,21 @@ impl IpcClient {
             }
             let loan = block.prepare(&conn)?;
             let alloc = block.allocation();
-            let descriptor = encode_buddy_payload(&BuddyPayload {
+            let descriptor = BuddyPayload {
                 seg_idx: alloc.seg_idx as u16,
                 generation: alloc.generation,
                 offset: alloc.offset,
                 data_size: data_size as u32,
                 is_dedicated: alloc.is_dedicated,
                 loan_id: loan.id(),
-            });
-            let frame = frame::encode_frame_parts(
-                0,
-                flags::FLAG_RPC_RECORD | flags::FLAG_BUDDY,
-                &[&metadata, &descriptor],
-            );
+            };
+            let frame = rpc::encode_open_draft_frame(
+                &identity,
+                method_idx,
+                mode,
+                ValuePart::whole(ValueStorage::Shm(descriptor)),
+            )
+            .map_err(|error| IpcError::Protocol(error.to_string()))?;
             return conn
                 .submit_owned(
                     frame,
@@ -1048,7 +1053,13 @@ impl IpcClient {
                 .await;
         }
         if data_size == 0 {
-            let frame = frame::encode_frame_parts(0, flags::FLAG_RPC_RECORD, &[&metadata]);
+            let frame = rpc::encode_open_draft_frame(
+                &identity,
+                method_idx,
+                mode,
+                ValuePart::whole(ValueStorage::Inline(&[])),
+            )
+            .map_err(|error| IpcError::Protocol(error.to_string()))?;
             conn.submit_owned(
                 frame,
                 WriteRequest::Business(Vec::new()),
@@ -1060,8 +1071,15 @@ impl IpcClient {
             return Ok(());
         }
         if data_size <= chunk_size {
-            let mut frame = frame::encode_frame_parts(0, flags::FLAG_RPC_RECORD, &[&metadata]);
-            frame.reserve_exact(data_size);
+            let mut frame = rpc::encode_open_inline_draft_prefix(
+                &identity,
+                method_idx,
+                mode,
+                ChunkPosition::Whole,
+                data_size,
+            )
+            .map_err(|error| IpcError::Protocol(error.to_string()))?;
+            let frame_len = frame::HEADER_SIZE + metadata_len + data_size;
             futures_util::pin_mut!(chunks);
             loop {
                 let next = loop {
@@ -1080,19 +1098,18 @@ impl IpcClient {
                     return Ok(());
                 }
                 let source = next.map_err(stream_error)?;
-                if frame.len() - 16 + source.as_ref().len() > metadata.len() + data_size {
+                if frame.len() + source.as_ref().len() > frame_len {
                     return Err(IpcError::Config(
                         "request stream exceeded declared content length".into(),
                     ));
                 }
                 frame.extend_from_slice(source.as_ref());
             }
-            if frame.len() != 16 + metadata.len() + data_size {
+            if frame.len() != frame_len {
                 return Err(IpcError::Config(
                     "request stream ended before declared content length".into(),
                 ));
             }
-            Self::finish_forward_frame(&mut frame);
             return conn
                 .submit_owned(
                     frame,
@@ -1105,8 +1122,8 @@ impl IpcClient {
         }
         let mut written = 0usize;
         let mut part = 0usize;
-        let mut frame = Self::forward_frame_prefix(&metadata, data_size, part);
-        frame.reserve_exact(chunk_size);
+        let mut frame =
+            Self::forward_frame_prefix((&identity, method_idx, mode), data_size, part, chunk_size)?;
         let mut filled = 0usize;
         futures_util::pin_mut!(chunks);
         loop {
@@ -1139,7 +1156,6 @@ impl IpcClient {
                 data = &data[take..];
                 filled += take;
                 if filled == chunk_size {
-                    Self::finish_forward_frame(&mut frame);
                     let request = if part == 0 {
                         WriteRequest::Business(Vec::new())
                     } else {
@@ -1157,8 +1173,16 @@ impl IpcClient {
                     .await?;
                     part += 1;
                     filled = 0;
-                    frame = Self::forward_frame_prefix(&metadata, data_size, part);
-                    frame.reserve_exact(chunk_size);
+                    frame = if part * chunk_size < data_size {
+                        Self::forward_frame_prefix(
+                            (&identity, method_idx, mode),
+                            data_size,
+                            part,
+                            chunk_size,
+                        )?
+                    } else {
+                        Vec::new()
+                    };
                 }
             }
         }
@@ -1171,7 +1195,6 @@ impl IpcClient {
             )));
         }
         if filled > 0 {
-            Self::finish_forward_frame(&mut frame);
             let request = if part == 0 {
                 WriteRequest::Business(Vec::new())
             } else {
@@ -1183,21 +1206,27 @@ impl IpcClient {
         Ok(())
     }
 
-    fn forward_frame_prefix(metadata: &[u8], data_size: usize, part: usize) -> Vec<u8> {
-        let first = part == 0;
-        let flags = flags::FLAG_RPC_RECORD
-            | flags::FLAG_CHUNKED
-            | if first { flags::FLAG_FIRST_CHUNK } else { 0 };
-        if first {
-            frame::encode_frame_parts(0, flags, &[metadata, &(data_size as u64).to_le_bytes()])
+    fn forward_frame_prefix(
+        open: (&RouteCallIdentity, u16, CallMode),
+        data_size: usize,
+        part: usize,
+        chunk_size: usize,
+    ) -> Result<Vec<u8>, IpcError> {
+        let value_bytes = chunk_size.min(data_size - part * chunk_size);
+        if part == 0 {
+            rpc::encode_open_inline_draft_prefix(
+                open.0,
+                open.1,
+                open.2,
+                ChunkPosition::First {
+                    total_bytes: data_size as u64,
+                },
+                value_bytes,
+            )
         } else {
-            frame::encode_frame_parts(0, flags, &[&[RpcRecordKind::Open as u8]])
+            rpc::encode_open_continuation_draft_prefix(value_bytes)
         }
-    }
-
-    fn finish_forward_frame(frame: &mut [u8]) {
-        let total = u32::try_from(frame.len() - 4).expect("frame bounded by IPC format");
-        frame[..4].copy_from_slice(&total.to_le_bytes());
+        .map_err(|error| IpcError::Protocol(error.to_string()))
     }
 }
 
