@@ -1435,6 +1435,218 @@ impl Fixture {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+enum WithdrawalPause {
+    BeforeLookup,
+    ControlWrite,
+    Precheck,
+    Recheck,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum WithdrawalRequest {
+    Post,
+    Probe,
+    Stream,
+}
+
+async fn withdrawn_route_during_acquire(request: WithdrawalRequest, pause: WithdrawalPause) {
+    const LEN: usize = 32;
+    let mut fixture = Fixture::start_with_input_len(
+        Carrier::Inline,
+        2,
+        2 * forwarding_budget(Carrier::Inline, LEN),
+        LEN,
+    )
+    .await;
+    let mut resume = None;
+    let result = AssertUnwindSafe(async {
+        bounded(fixture.state.stop_upstream_controls()).await;
+        let socket = fixture.socket;
+        let head = fixture.head("other", "Content-Length: 32");
+        let inflight = tokio::spawn(async move {
+            let mut stream = bounded(tokio::net::TcpStream::connect(socket))
+                .await
+                .unwrap();
+            bounded(stream.write_all(head.as_bytes())).await.unwrap();
+            bounded(stream.write_all(&[7; LEN])).await.unwrap();
+            bounded(read_framed_reply(&mut stream)).await.unwrap()
+        });
+        bounded(fixture.probe.entered[0].notified()).await;
+
+        let state = fixture.state.clone();
+        let entry = fixture.entry.clone();
+        let withdraw = move || {
+            let (_, _, client) = state
+                .remove_unreachable_local_upstream_if_matches(&entry)
+                .expect("withdraw the captured route");
+            state
+                .clients
+                .close(&client.expect("last route retires its cached client"));
+        };
+        let entered = match pause {
+            WithdrawalPause::Precheck => {
+                assert_eq!(
+                    fixture.server.close_business_admission("maintenance").await,
+                    1
+                );
+                super::router::set_data_plane_after_precheck_hook(
+                    &fixture.state,
+                    "grid".into(),
+                    withdraw,
+                );
+                None
+            }
+            WithdrawalPause::BeforeLookup
+            | WithdrawalPause::ControlWrite
+            | WithdrawalPause::Recheck => {
+                let (entered_tx, entered_rx) = oneshot::channel();
+                let (resume_tx, resume_rx) = oneshot::channel();
+                resume = Some(resume_tx);
+                match pause {
+                    WithdrawalPause::BeforeLookup => fixture
+                        .state
+                        .set_acquire_lookup_seam_for_test(entered_tx, resume_rx),
+                    WithdrawalPause::ControlWrite => fixture
+                        .client
+                        .set_write_pause_for_test(Some((entered_tx, resume_rx))),
+                    WithdrawalPause::Recheck => fixture
+                        .state
+                        .set_acquire_recheck_seam_for_test(entered_tx, resume_rx),
+                    WithdrawalPause::Precheck => unreachable!(),
+                }
+                Some((entered_rx, withdraw))
+            }
+        };
+        let head = match request {
+            WithdrawalRequest::Probe => fixture.head("target", "Content-Length: 0").replacen(
+                "POST /grid/target",
+                "GET /_probe/grid",
+                1,
+            ),
+            WithdrawalRequest::Post => fixture.head("target", "Content-Length: 32"),
+            WithdrawalRequest::Stream => fixture.head(
+                "target",
+                &format!(
+                    "Content-Length: 32\r\nAccept: {}",
+                    crate::stream_wire::MEDIA_TYPE
+                ),
+            ),
+        };
+        let refused = tokio::spawn(async move {
+            let mut stream = bounded(tokio::net::TcpStream::connect(socket))
+                .await
+                .unwrap();
+            bounded(stream.write_all(head.as_bytes())).await.unwrap();
+            if !matches!(request, WithdrawalRequest::Probe) {
+                bounded(stream.write_all(&[7; LEN])).await.unwrap();
+            }
+            bounded(read_framed_reply(&mut stream)).await.unwrap()
+        });
+        if let Some((entered, withdraw)) = entered {
+            bounded(entered).await.unwrap();
+            assert_eq!(
+                fixture.server.close_business_admission("maintenance").await,
+                1
+            );
+            withdraw();
+            resume.take().unwrap().send(()).unwrap();
+        }
+        let reply = bounded(refused).await.unwrap();
+        let (status, name) = if matches!(pause, WithdrawalPause::ControlWrite) {
+            // The control was already committed: preserve the owner's reply.
+            (b"HTTP/1.1 503 ".as_slice(), "ResourceClosed")
+        } else {
+            (b"HTTP/1.1 404 ".as_slice(), "ResourceNotFound")
+        };
+        assert!(
+            reply.starts_with(status),
+            "{request:?}/{pause:?}: {}",
+            String::from_utf8_lossy(&reply)
+        );
+        let body = reply
+            .windows(4)
+            .position(|bytes| bytes == b"\r\n\r\n")
+            .unwrap()
+            + 4;
+        let error: c2_error::C2ErrorEnvelope = serde_json::from_slice(&reply[body..]).unwrap();
+        assert_eq!(error.name, name);
+        assert!(
+            !inflight.is_finished(),
+            "withdrawal must retain the dispatched call"
+        );
+        assert!(
+            fixture
+                .client
+                .connection_observation()
+                .unwrap()
+                .snapshot()
+                .is_none()
+        );
+        fixture.release(0);
+        let reply = bounded(inflight).await.unwrap();
+        assert!(
+            reply.starts_with(b"HTTP/1.1 200 "),
+            "{}",
+            String::from_utf8_lossy(&reply)
+        );
+        assert!(reply.ends_with(&[0; LEN]));
+        assert_eq!(
+            fixture
+                .probe
+                .calls
+                .each_ref()
+                .map(|calls| calls.load(Ordering::SeqCst)),
+            [1, 0, 0]
+        );
+    })
+    .catch_unwind()
+    .await;
+    if let Some(resume) = resume {
+        let _ = resume.send(());
+    }
+    fixture.stop().await;
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn withdrawn_route_during_post_acquire_preserves_inflight_reply() {
+    for pause in [
+        WithdrawalPause::BeforeLookup,
+        WithdrawalPause::ControlWrite,
+        WithdrawalPause::Precheck,
+        WithdrawalPause::Recheck,
+    ] {
+        withdrawn_route_during_acquire(WithdrawalRequest::Post, pause).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn withdrawn_route_during_probe_acquire_preserves_inflight_reply() {
+    for pause in [
+        WithdrawalPause::BeforeLookup,
+        WithdrawalPause::ControlWrite,
+        WithdrawalPause::Precheck,
+        WithdrawalPause::Recheck,
+    ] {
+        withdrawn_route_during_acquire(WithdrawalRequest::Probe, pause).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn withdrawn_route_during_stream_acquire_preserves_inflight_reply() {
+    for pause in [
+        WithdrawalPause::BeforeLookup,
+        WithdrawalPause::ControlWrite,
+        WithdrawalPause::Precheck,
+        WithdrawalPause::Recheck,
+    ] {
+        withdrawn_route_during_acquire(WithdrawalRequest::Stream, pause).await;
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn evicted_upstream_preserves_forwarded_reply_and_reconnects_new_request() {
     let mut fixture = Fixture::start(

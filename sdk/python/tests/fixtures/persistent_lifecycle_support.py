@@ -273,16 +273,19 @@ class Lab:
         phase_key = "dispatch_phase" if self.path == "relay_aware_relay" else "transport_phase"
         assert error.details[phase_key] == "pre_dispatch"
 
+    def closed_route_errors(self, *, acquiring: bool = False) -> tuple[type[Exception], ...]:
+        """A relay may withdraw a closed route before lookup or HTTP admission."""
+        refused = (cc.error.FallbackDenied if acquiring and self.path == "relay_aware_local_ipc"
+                   else cc.error.ResourceClosed)
+        if self.anchor is not None and (acquiring or self.path == "relay_aware_relay"):
+            return refused, cc.error.ResourceNotFound
+        return (refused,)
+
     def assert_acquire_closed(self, label: str, uid: str) -> None:
-        """Gates 2/6: same-endpoint fallback preserves the typed IPC refusal."""
-        expected = {
-            "direct_ipc": cc.error.ResourceClosed,
-            "relay_aware_local_ipc": cc.error.FallbackDenied,
-            "relay_aware_relay": cc.error.ResourceNotFound,
-        }[self.path]
-        with pytest.raises(expected) as caught:
+        """Keep the typed IPC cause whenever acquisition denies its fallback."""
+        with pytest.raises(self.closed_route_errors(acquiring=True)) as caught:
             self.connect(label)
-        if self.path == "relay_aware_local_ipc":
+        if isinstance(caught.value, cc.error.FallbackDenied):
             details = caught.value.details
             assert details["direct_ipc_failure_kind"] == "semantic:ResourceClosed"
             assert details["direct_ipc_failure_phase"] == "pre_dispatch"

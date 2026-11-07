@@ -407,6 +407,7 @@ struct ResolveQuery {
 
 #[cfg(test)]
 struct DataPlanePrecheckHook {
+    state: std::sync::Weak<RelayState>,
     route_name: String,
     action: Box<dyn FnOnce() + Send + 'static>,
 }
@@ -416,23 +417,28 @@ static DATA_PLANE_AFTER_PRECHECK_HOOKS: std::sync::Mutex<Vec<DataPlanePrecheckHo
     std::sync::Mutex::new(Vec::new());
 
 #[cfg(test)]
-fn set_data_plane_after_precheck_hook(route_name: String, action: impl FnOnce() + Send + 'static) {
+pub(super) fn set_data_plane_after_precheck_hook(
+    state: &Arc<RelayState>,
+    route_name: String,
+    action: impl FnOnce() + Send + 'static,
+) {
     DATA_PLANE_AFTER_PRECHECK_HOOKS
         .lock()
         .unwrap()
         .push(DataPlanePrecheckHook {
+            state: Arc::downgrade(state),
             route_name,
             action: Box::new(action),
         });
 }
 
 #[cfg(test)]
-fn run_data_plane_after_precheck_hook(route_name: &str) {
+fn run_data_plane_after_precheck_hook(state: &Arc<RelayState>, route_name: &str) {
     let hook = {
         let mut guard = DATA_PLANE_AFTER_PRECHECK_HOOKS.lock().unwrap();
         guard
             .iter()
-            .position(|hook| hook.route_name == route_name)
+            .position(|hook| hook.route_name == route_name && hook.state.ptr_eq(&Arc::downgrade(state)))
             .map(|index| guard.remove(index))
     };
     if let Some(hook) = hook {
@@ -1914,7 +1920,7 @@ async fn handle_probe_in_context(
         return response.into_response();
     }
     #[cfg(test)]
-    run_data_plane_after_precheck_hook(&route_name);
+    run_data_plane_after_precheck_hook(&state, &route_name);
     match acquire_request_client_for_route(state, &advertised_route).await {
         RequestClient::Ready(ready) => {
             let ReadyRequestClient { lease, .. } = *ready;
@@ -1985,7 +1991,7 @@ async fn call_handler(
         );
     }
     #[cfg(test)]
-    run_data_plane_after_precheck_hook(&route_name);
+    run_data_plane_after_precheck_hook(&state, &route_name);
     let server_stream = headers
         .get(header::ACCEPT)
         .is_some_and(|value| value.as_bytes() == crate::stream_wire::MEDIA_TYPE.as_bytes());
@@ -5895,10 +5901,10 @@ mod tests {
         crm_ns: &'static str,
         crm_name: &'static str,
     ) {
-        let state_for_hook = state;
+        let state_for_hook = state.clone();
         let route_for_hook = route_name.to_string();
         let new_address_for_hook = new_address.to_string();
-        set_data_plane_after_precheck_hook(route_name.to_string(), move || {
+        set_data_plane_after_precheck_hook(&state, route_name.to_string(), move || {
             if let crate::relay::state::UnregisterResult::Removed { client, .. } =
                 state_for_hook.unregister_upstream(&route_for_hook, "server-old")
                 && let Some(client) = client
