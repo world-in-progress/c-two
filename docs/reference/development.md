@@ -23,6 +23,7 @@ esac
 FASTDB_PAYLOAD_LINK_MODE=source uv sync        # compile the Python extension with static FastDB
 FASTDB_PAYLOAD_LINK_MODE=source uv sync --group examples  # optional: pandas
 FASTDB_PAYLOAD_LINK_MODE=source python tools/dev/c3_tool.py --build --link  # build and link the native c3 CLI
+python tools/dev/build_route_scope_attestor.py  # test-only registration attestor for relay control tests
 cp .env.example .env                          # optional: local environment configuration
 ```
 

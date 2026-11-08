@@ -45,6 +45,8 @@ uv sync
 uv sync --reinstall-package c-two
 
 # Run the full Python test suite. Empty C2_RELAY_ANCHOR_ADDRESS avoids env interference.
+# Relay control tests read a registration identity through a prebuilt test helper.
+python tools/dev/build_route_scope_attestor.py
 C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests/ -q --timeout=30
 
 # Ensure the Python 3.10 compatibility syntax check executes instead of
