@@ -4,7 +4,7 @@ Status refreshed: 2026-11-03.
 
 This page records the direction of C-Two's 0.x line: the current foundation, and the exit criteria of the product capabilities that are not yet built. Open work, its order and its status live only in the [backlog](backlog.md), a Chinese working record.
 
-The latest release is C-Two 0.10.1 with c3 0.6.0. Since then `main` has merged the interface slimming, the defect and dead-code fixes, the removal of the owner subsystem and single-owner shared-memory release (IPC 15, SHM 4, C/FFI ABI 7, relay mesh 7); they are unreleased and described in the [unreleased notes](../releases/unreleased.md). FastDB is pinned to 0.2.4 (native source `f82fa13adeae2b87a295bf984821c85c44b55a3d`). The Rust SDK, Core and TypeScript bindings keep independent 0.1.0 versions, with no C-Two crates.io or npm publication.
+The latest release is C-Two 0.10.1 with c3 0.6.0. Since then `main` has merged the interface slimming, the defect and dead-code fixes, the removal of the owner subsystem, single-owner shared-memory release and server streams (IPC 16, SHM 4, C/FFI ABI 8, relay mesh 7); they are unreleased and described in the [unreleased notes](../releases/unreleased.md). FastDB is pinned to 0.2.4 (native source `f82fa13adeae2b87a295bf984821c85c44b55a3d`). The Rust SDK, Core and TypeScript bindings keep independent 0.1.0 versions, with no C-Two crates.io or npm publication.
 
 `docs/reference/` owns current behavior. [CI and release qualification](../reference/ci-cd.md) distinguishes source validation, package validation and publication; each release retains its exact source and artifact receipts.
 
@@ -41,7 +41,7 @@ These capabilities are not yet built; the backlog records their order. Do not by
 | Dry-run mechanism | Impact analysis depends on the same explicit metadata/admission boundary. | Dry-run semantics state what is evaluated, which side effects are forbidden, and how unsupported methods fail. |
 | Async unary API | Async should extend one stable unary contract instead of creating a second protocol. | Supported SDKs provide async proxy/context-manager behavior over the same route, error, payload, and lifetime semantics. |
 | Telemetry, backpressure, and adaptive memory lifecycle | Streaming amplifies cancellation and retention risks. | Rust owns bounded telemetry and policy for pools, dedicated segments, chunks, queues, and cancellation; SDKs remain thin facades. |
-| Streaming RPC | Existing chunking is byte transport, not a user-visible stream. | Stream identity, frames, ordering, cancellation, errors, backpressure, and resource release are specified and proven end to end. |
+| Streaming RPC | Server streams are delivered ([ADR 0003](../decisions/0003-server-streams.md)); client and bidirectional streams, and generated TypeScript clients reading streams through a relay, are not built yet. | Stream identity, frames, ordering, cancellation, errors, backpressure, and resource release are specified and proven end to end. |
 | Publishable TypeScript SDK/runtime | The generated Node proof exists, but official packaging and browser boundaries remain incomplete. | A supported package consumes the same contract/release/payload identities and proves its declared Node/browser lifetime and transport matrix. |
 | Discovery and namespace governance | Relay mesh propagates live routes; broad search is an admin/governance concern. | A separate discovery surface returns candidate metadata while ordinary calls remain exact contract-scoped and never fall back to name-only admission. |
 

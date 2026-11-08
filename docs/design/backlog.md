@@ -20,7 +20,7 @@
 7. **发版工具，方案 B**（2026-11-05 架构审查补充的先后：先把仍在用的两种回执迁到 `tools/testing`（`tools/dev/test_python.py` 与正式矩阵还在调用），把 Unix 跨 UID 验证并入 Source Validation，再删旧候选三件套、它们的自测与 `local-endpoint-validation.yml`；那个工作流的理由还写着已由 ADR 0002 退役的 owner 机制）（[发版敏捷性审查](2026-10-30-release-agility-review.md)第三、四节）：与产品代码无关，可以随时插入。B1 候选重整、B2 删除约 8 千行（`tools/local_rc` 与 `local-endpoint-validation.yml` 仍在）、B3 FastDB 版本只写一处、B5 精简各条线的 gate、B6 修 `PROBE_BUDGET` 的偶发失败。顺带修配对基准的两处：收据只给 p99 的比值，而流式设计第十二节第 7 条的门槛用 p95，补上 p95；`run_matrix` 在行控制器退出时若看到 Windows Job 仍计着一个活进程，就把这一行报成超过等待时限并改写真实退出码，也不记下剩下的是哪个进程（流式 run 42349023784 的 Windows x64 作业出现过一次，那一行 200 次调用全部成功、清理完整），要记下这个进程并如实报告。
 8. **路线图上的其余产品能力**（完成标准见[路线图](roadmap.zh-CN.md#产品能力)）：官方不可变的包分发、契约兼容、调用元数据与准入钩子、dry-run、async unary、遥测与背压、可发布的 TypeScript SDK、发现与命名空间治理。顺序待维护者定。
 9. **文档里的协作流程用词**（2026-11-04 维护者同意）：设计文档里用 Host、Worker、微任务、看板、委派块、任务书指协作流程，约 60 处，分布在 9 份设计文档里；仓库外的读者不知道它们指谁，Host 还与术语表里的 Host 撞名，worker 与执行 worker 撞名。改为不写角色，例如“Host 建议”只写“建议”。指拍板者的“用户”改为“维护者”，约 120 处；“开发者”在这里指 C-Two 的使用者，不用来指维护者。冻结的验收记录不改。
-10. **下一次发版时：** 根 README、SDK README 与 `cli/README.md` 里的版本说明（IPC 14、SHM 3、ABI 6）改为发版时的 IPC 16、SHM 4、C/FFI ABI（块 7 之后为 8）与 mesh 7。
+10. **下一次发版时：** 根 README、SDK README 与 `cli/README.md` 里的版本说明（IPC 14、SHM 3、ABI 6）改为发版时的版本，现在是 IPC 16、SHM 4、C/FFI ABI 8 与 mesh 7，路由身份那一批若升 mesh 版本以它为准；`CHANGELOG.md` 的 [Unreleased] 里 IPC 15 与 IPC 16 两条协议改动合成一条，从 0.10.1 的版本直接写到发版时的版本。
 
 各批一并删除只钉源码文本或已删名字的测试（复审第六节）；复审附录里各区未裁决的待议项，实施到对应区域时再定。[瘦身账本](2026-10-13-local-slimming-batches.md)暂缓表与条目边界表里的其余各项仍按账本写明的条件。
 

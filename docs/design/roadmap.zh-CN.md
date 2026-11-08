@@ -4,7 +4,7 @@
 
 本页写 C-Two 0.x 的方向：现有的地基，以及还没做的产品能力各自的完成标准。还没做的事、它们的顺序与进度只记在[待办](backlog.md)里。
 
-最新发版是 C-Two 0.10.1 与 c3 0.6.0。此后 `main` 合入了接口精简、缺陷与死代码修复、删除 owner 子系统与单一属主释放（IPC 15、SHM 4、C/FFI ABI 7、relay mesh 7），尚未发版，见[未发布的改动](../releases/unreleased.md)。FastDB 固定 0.2.4（原生源码 `f82fa13adeae2b87a295bf984821c85c44b55a3d`）。Rust SDK、Core 与 TypeScript 绑定各自保持 0.1.0，C-Two 不在 crates.io 或 npm 发布。
+最新发版是 C-Two 0.10.1 与 c3 0.6.0。此后 `main` 合入了接口精简、缺陷与死代码修复、删除 owner 子系统、单一属主释放与服务端流（IPC 16、SHM 4、C/FFI ABI 8、relay mesh 7），尚未发版，见[未发布的改动](../releases/unreleased.md)。FastDB 固定 0.2.4（原生源码 `f82fa13adeae2b87a295bf984821c85c44b55a3d`）。Rust SDK、Core 与 TypeScript 绑定各自保持 0.1.0，C-Two 不在 crates.io 或 npm 发布。
 
 `docs/reference/` 负责现行行为。[CI 与发行流程](../reference/ci-cd.md)区分源码验证、包验证与发布；各次发行保留确切源码与产物收据。
 
@@ -41,7 +41,7 @@
 | Dry-run mechanism | Impact analysis 依赖同一个显式 metadata/admission 边界。 | Dry-run 明确评估什么、禁止哪些副作用，以及不支持的方法怎样失败。 |
 | Async unary API | Async 应扩展同一个稳定的 unary contract，而不是形成第二套协议。 | 受支持的 SDK 在同一 route/error/payload/lifetime 语义上提供 async proxy/context manager。 |
 | Telemetry、backpressure 与 adaptive memory lifecycle | Streaming 会放大取消与保留的风险。 | Rust 拥有 pool、dedicated segment、chunk、queue 与 cancellation 的有界遥测与策略；SDK 保持 thin facade。 |
-| Streaming RPC | 现有分片是字节传输，不是用户可见的 stream。 | Stream identity、frame、ordering、cancellation、error、backpressure 与资源释放被规格化并端到端证明。 |
+| Streaming RPC | 服务端流已经交付（[ADR 0003](../decisions/0003-server-streams.md)）；客户端流、双向流，以及生成的 TypeScript 客户端经 relay 读取流，都还没有做。 | Stream identity、frame、ordering、cancellation、error、backpressure 与资源释放被规格化并端到端证明。 |
 | 可发布的 TypeScript SDK/runtime | 生成的 Node 证明已有，但官方打包与 browser 边界尚未闭环。 | 一个受支持的 package 消费相同的 contract/release/payload identity，并证明声明的 Node/browser lifetime 与 transport 矩阵。 |
 | Discovery 与 namespace governance | Relay mesh 传播 live route；广义搜索属于 admin/governance。 | 独立的 discovery surface 返回候选 metadata，普通调用仍按精确契约，绝不退化为只按名字准入。 |
 
