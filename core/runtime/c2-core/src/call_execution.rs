@@ -13,9 +13,11 @@
 //! Finite calls run on one process-wide two-worker Tokio executor. Each finite
 //! preparation takes a slot, so tasks are bounded by their owning domains;
 //! there is no per-call thread, timer task, abort, or blocking-task pool.
-//! Unlimited calls drive the future inline on the same runtime, with neither
-//! a deadline timer, a continuation task, nor a retention-budget charge. Budget
-//! closure affects finite admissions only. Transports must be cooperative async
+//! Unlimited unary calls drive the future inline on the same runtime, with
+//! neither a deadline timer, a continuation task, nor an operation slot.
+//! Every server stream has one operation slot, including unlimited streams.
+//! Their owned input still uses B. Closing call-slot admissions leaves B available to
+//! already dispatched calls. Transports must be cooperative async
 //! futures, and native materialization must be bounded work. A stalled native
 //! copy does not block caller expiry, but does occupy its worker; this is not
 //! an unlimited worker-performance guarantee or a separate CPU thread pool.
@@ -37,6 +39,10 @@ use c2_config::CallExecutionLimits;
 #[cfg(test)]
 use c2_config::CallOptions;
 use c2_error::{C2Error, ErrorCode};
+use c2_mem::retention::{
+    BudgetedBuffer, PayloadBufferBudget, PayloadBufferError, PayloadBufferReservation,
+    PayloadBufferSnapshot,
+};
 use c2_mem::{RetentionBudget, RetentionError, RetentionPermit, RetentionSnapshot};
 use futures_util::FutureExt;
 use parking_lot::{Condvar, Mutex};
@@ -44,7 +50,7 @@ use tokio::runtime::{Builder, Handle, Runtime};
 
 use crate::{CallScope, CallScopeError, CallState, Error, LifecycleError, TransportPhase};
 
-/// Pure metadata observation of one Runtime's finite-call domain.
+/// Pure metadata observation of one Runtime's call-operation domain.
 ///
 /// Capturing or reading this handle never resolves configuration or creates
 /// an executor. It can outlive the Runtime and retains only accounting state,
@@ -62,7 +68,7 @@ struct ObservationState {
 }
 
 /// One consistent metadata observation. An uninitialized open domain remains
-/// live: the first business call may still establish its accounting budget.
+/// live: the first payload use may still establish its accounting budget.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CallExecutionObservation {
     pub initialized: bool,
@@ -89,12 +95,13 @@ impl CallExecutionObserver {
     }
 
     /// Retired metadata may be discarded only after closure and real release
-    /// of every operation and input byte. Open, uninitialized domains are live.
+    /// of every operation and payload byte. Open, uninitialized domains are live.
     pub fn is_live(&self) -> bool {
-        let observation = self.snapshot();
-        !observation.closed
-            || observation.counters.is_some_and(|counters| {
-                counters.used_operations != 0 || counters.used_retained_bytes != 0
+        let state = self.state.lock();
+        !state.closed
+            || state.budget.as_ref().is_some_and(|budget| {
+                budget.snapshot().used_operations != 0
+                    || budget.payload_budget().snapshot().used_bytes != 0
             })
     }
 
@@ -140,6 +147,14 @@ impl CallExecutionContext {
         }
     }
 
+    pub(crate) fn payload_budget(&self) -> PayloadBufferBudget {
+        self.budget.payload_budget()
+    }
+
+    pub(crate) fn payload_snapshot(&self) -> PayloadBufferSnapshot {
+        self.payload_budget().snapshot()
+    }
+
     #[cfg(test)]
     pub(crate) fn prepare(
         &self,
@@ -149,28 +164,50 @@ impl CallExecutionContext {
         self.prepare_scope(CallScope::new(options, path_default).map_err(scope_error)?)
     }
 
+    #[cfg(test)]
+    pub(crate) fn prepare_stream(
+        &self,
+        options: CallOptions,
+        path_default: Option<Duration>,
+    ) -> Result<PreparingCall, Error> {
+        self.prepare_stream_scope(CallScope::new(options, path_default).map_err(scope_error)?)
+    }
+
     /// The Client establishes its scope at entry, before first-domain config
     /// resolution/metadata waits. Admission checks that original D afterwards.
     pub(crate) fn prepare_scope(&self, scope: CallScope) -> Result<PreparingCall, Error> {
+        self.prepare_scope_for(scope, false)
+    }
+
+    pub(crate) fn prepare_stream_scope(&self, scope: CallScope) -> Result<PreparingCall, Error> {
+        self.prepare_scope_for(scope, true)
+    }
+
+    fn prepare_scope_for(&self, scope: CallScope, stream: bool) -> Result<PreparingCall, Error> {
         scope.check_pre_dispatch().map_err(scope_error)?;
-        // Finite continuation slot first, zero bytes: SDK serialization must
-        // not precede this. No deadline means synchronous caller ownership;
-        // that path neither consults nor charges the continuation budget.
-        let permit = if scope.deadline().is_some() {
+        // Reserve before SDK serialization. Unlimited unary has no operation
+        // slot; every stream has one. Input still reserves B in either case.
+        let permit = if stream || scope.deadline().is_some() {
             Some(
                 self.budget
-                    .reserve(0)
+                    .reserve()
                     .map_err(|error| settle_failure(&scope, admission_error(error)))?,
             )
         } else {
             None
         };
         scope.check_pre_dispatch().map_err(scope_error)?;
-        Ok(PreparingCall { scope, permit })
+        Ok(PreparingCall {
+            scope,
+            permit,
+            payload_budget: self.payload_budget(),
+            input_reservation: None,
+            stream_http_headroom: 0,
+        })
     }
 
-    /// Stops finite admission/growth only; Unlimited is unaffected. No
-    /// cancellation, refund or runtime drain.
+    /// Stops new finite-unary and stream slots. Already admitted calls may still
+    /// reserve B for their real storage; this does not cancel work or refund.
     pub(crate) fn close(&self) {
         self.budget.close();
     }
@@ -183,26 +220,154 @@ impl CallExecutionContext {
 pub(crate) struct PreparingCall {
     scope: CallScope,
     permit: Option<RetentionPermit>,
+    payload_budget: PayloadBufferBudget,
+    input_reservation: Option<PayloadBufferReservation>,
+    stream_http_headroom: u64,
 }
 
 impl PreparingCall {
+    /// The HTTP receive path needs one byte of atomically admitted send/receive
+    /// headroom in addition to the input owner before materialization.
+    pub(crate) fn with_stream_http_headroom(mut self) -> Self {
+        self.stream_http_headroom = 1;
+        self
+    }
+    pub(crate) fn scope_clone(&self) -> CallScope {
+        self.scope.clone()
+    }
+
+    /// The original stream receive record owns its call slot until it publishes
+    /// a real terminal, even after an opening waiter or facade leaves.
+    pub(crate) fn take_stream_permit(&mut self) -> RetentionPermit {
+        self.permit
+            .take()
+            .expect("stream preparation reserved a slot")
+    }
+
+    pub(crate) fn payload_budget(&self) -> PayloadBufferBudget {
+        self.payload_budget.clone()
+    }
+
     #[cfg(test)]
     pub(crate) fn scope(&self) -> &CallScope {
         &self.scope
     }
 
-    /// Charge at least the finite call's declared size. Unlimited has no
-    /// permit and no charge. Overestimates remain charged; there is deliberately
-    /// no shrink seam. Rejection settles this logical call before payload work;
-    /// it cannot be retried with a smaller charge.
+    /// Reserve known input bytes before materialization. Only the first
+    /// positive-byte charge may wait under the original pre-dispatch deadline.
+    /// Growth of an existing positive-byte owner is immediate.
     pub(crate) fn charge_input(&mut self, nbytes: u64) -> Result<(), Error> {
         self.scope.check_pre_dispatch().map_err(scope_error)?;
-        if let Some(permit) = &mut self.permit {
-            permit
-                .try_grow(nbytes.saturating_sub(permit.bytes()))
-                .map_err(|error| settle_failure(&self.scope, admission_error(error)))?;
+        let nbytes = nbytes
+            .checked_add(self.stream_http_headroom)
+            .ok_or_else(|| configuration("input and HTTP headroom exceed u64"))?;
+        if self
+            .input_reservation
+            .as_ref()
+            .is_some_and(|reservation| reservation.bytes() == 0)
+        {
+            self.input_reservation = None;
         }
+        if let Some(reservation) = &mut self.input_reservation {
+            let additional = nbytes.saturating_sub(reservation.bytes());
+            if additional > 0 {
+                reservation
+                    .try_grow(additional)
+                    .map_err(|error| settle_failure(&self.scope, payload_admission_error(error)))?;
+            }
+        } else {
+            self.input_reservation = Some(
+                self.payload_budget
+                    .reserve_blocking(nbytes, self.scope.deadline())
+                    .map_err(|error| settle_failure(&self.scope, payload_admission_error(error)))?,
+            );
+        }
+        self.scope.check_pre_dispatch().map_err(scope_error)?;
         Ok(())
+    }
+
+    /// Async foreign-runtime admission uses the same budget without parking a worker.
+    pub(crate) async fn charge_input_async(&mut self, nbytes: u64) -> Result<(), Error> {
+        self.scope.check_pre_dispatch().map_err(scope_error)?;
+        if self
+            .input_reservation
+            .as_ref()
+            .is_some_and(|r| r.bytes() == 0)
+        {
+            self.input_reservation = None;
+        }
+        if self.input_reservation.is_some() {
+            return self.charge_input(nbytes);
+        }
+        let nbytes = nbytes
+            .checked_add(self.stream_http_headroom)
+            .ok_or_else(|| configuration("input and HTTP headroom exceed u64"))?;
+        let reservation = match self.scope.deadline() {
+            Some(deadline) => tokio::time::timeout_at(
+                tokio::time::Instant::from_std(deadline),
+                self.payload_budget.reserve(nbytes),
+            )
+            .await
+            .unwrap_or(Err(PayloadBufferError::DeadlineExceeded)),
+            None => self.payload_budget.reserve(nbytes).await,
+        }
+        .map_err(|error| settle_failure(&self.scope, payload_admission_error(error)))?;
+        self.input_reservation = Some(reservation);
+        self.scope.check_pre_dispatch().map_err(scope_error)
+    }
+
+    /// Native async facades keep the original record even after their own wait
+    /// deadline. This observation is separate from dispatch and cancellation.
+    pub(crate) fn execute_stream_record<R, M, T, F>(
+        self,
+        nbytes: usize,
+        materialize: M,
+        transport: T,
+        abandon: fn(&R),
+        on_waiter_abandon: impl Fn() + Send + Sync + 'static,
+    ) -> Result<ExecutingCall<R>, Error>
+    where
+        R: Send + 'static,
+        M: FnOnce() -> Result<Vec<u8>, Error> + Send + 'static,
+        T: FnOnce(BudgetedBuffer, CallScope) -> F + Send + 'static,
+        F: Future<Output = Result<R, Error>> + Send + 'static,
+    {
+        let scope = self.scope.clone();
+        self.start_on(
+            nbytes,
+            materialize,
+            transport,
+            shared_executor,
+            CompletionMode::OriginalRecord { stream: true },
+            Some(abandon),
+            Some(Arc::new(on_waiter_abandon)),
+        )
+        .map_err(|error| settle_failure(&scope, error))
+    }
+
+    pub(crate) fn execute_whole_record<R, M, T, F>(
+        self,
+        nbytes: usize,
+        materialize: M,
+        transport: T,
+    ) -> Result<ExecutingCall<R>, Error>
+    where
+        R: Send + 'static,
+        M: FnOnce() -> Result<Vec<u8>, Error> + Send + 'static,
+        T: FnOnce(BudgetedBuffer, CallScope) -> F + Send + 'static,
+        F: Future<Output = Result<R, Error>> + Send + 'static,
+    {
+        let scope = self.scope.clone();
+        self.start_on(
+            nbytes,
+            materialize,
+            transport,
+            shared_executor,
+            CompletionMode::OriginalRecord { stream: false },
+            None,
+            None,
+        )
+        .map_err(|error| settle_failure(&scope, error))
     }
 
     /// `materialize` must return exactly `nbytes` bytes. This trusted internal
@@ -222,10 +387,37 @@ impl PreparingCall {
     where
         R: Send + 'static,
         M: FnOnce() -> Result<Vec<u8>, Error> + Send + 'static,
-        T: FnOnce(Arc<RetainedCallInput>, CallScope) -> F + Send + 'static,
+        T: FnOnce(BudgetedBuffer, CallScope) -> F + Send + 'static,
         F: Future<Output = Result<R, Error>> + Send + 'static,
     {
         self.execute_on(nbytes, materialize, transport, shared_executor)
+    }
+
+    pub(crate) fn execute_stream<R, M, T, F>(
+        self,
+        nbytes: usize,
+        materialize: M,
+        transport: T,
+        abandon: fn(&R),
+        on_waiter_abandon: impl Fn() + Send + Sync + 'static,
+    ) -> Result<ExecutingCall<R>, Error>
+    where
+        R: Send + 'static,
+        M: FnOnce() -> Result<Vec<u8>, Error> + Send + 'static,
+        T: FnOnce(BudgetedBuffer, CallScope) -> F + Send + 'static,
+        F: Future<Output = Result<R, Error>> + Send + 'static,
+    {
+        let scope = self.scope.clone();
+        self.start_on(
+            nbytes,
+            materialize,
+            transport,
+            shared_executor,
+            CompletionMode::StreamOpen,
+            Some(abandon),
+            Some(Arc::new(on_waiter_abandon)),
+        )
+        .map_err(|error| settle_failure(&scope, error))
     }
 
     fn execute_on<R, M, T, F>(
@@ -238,12 +430,20 @@ impl PreparingCall {
     where
         R: Send + 'static,
         M: FnOnce() -> Result<Vec<u8>, Error> + Send + 'static,
-        T: FnOnce(Arc<RetainedCallInput>, CallScope) -> F + Send + 'static,
+        T: FnOnce(BudgetedBuffer, CallScope) -> F + Send + 'static,
         F: Future<Output = Result<R, Error>> + Send + 'static,
     {
         let scope = self.scope.clone();
-        self.start_on(nbytes, materialize, transport, executor)
-            .map_err(|error| settle_failure(&scope, error))
+        self.start_on(
+            nbytes,
+            materialize,
+            transport,
+            executor,
+            CompletionMode::WholeCall,
+            None,
+            None,
+        )
+        .map_err(|error| settle_failure(&scope, error))
     }
 
     fn start_on<R, M, T, F>(
@@ -252,11 +452,14 @@ impl PreparingCall {
         materialize: M,
         transport: T,
         executor: impl FnOnce() -> Result<Handle, Error>,
+        mode: CompletionMode,
+        abandon: Option<fn(&R)>,
+        on_waiter_abandon: Option<Arc<dyn Fn() + Send + Sync>>,
     ) -> Result<ExecutingCall<R>, Error>
     where
         R: Send + 'static,
         M: FnOnce() -> Result<Vec<u8>, Error> + Send + 'static,
-        T: FnOnce(Arc<RetainedCallInput>, CallScope) -> F + Send + 'static,
+        T: FnOnce(BudgetedBuffer, CallScope) -> F + Send + 'static,
         F: Future<Output = Result<R, Error>> + Send + 'static,
     {
         let bytes = u64::try_from(nbytes).map_err(|_| configuration("input length exceeds u64"))?;
@@ -266,11 +469,15 @@ impl PreparingCall {
         self.scope.check_pre_dispatch().map_err(scope_error)?;
         let shared = Arc::new(Completion {
             scope: self.scope,
+            mode,
+            abandon,
+            on_waiter_abandon,
             state: Mutex::new(Outcome {
                 result: None,
                 caller: true,
             }),
             changed: Condvar::new(),
+            async_changed: tokio::sync::Notify::new(),
         });
         // Construct BEFORE spawn: even a stopped runtime dropping an unpolled
         // task owns the completion guard and wakes the caller through Drop.
@@ -281,13 +488,14 @@ impl PreparingCall {
         let task = async move {
             let mut guard = guard;
             let scope = guard.shared.scope.clone();
-            let mut owner = None;
-            let mut permit = self.permit;
+            let operation = self.permit;
+            let mut input_reservation = self.input_reservation;
+            let stream_http_headroom = self.stream_http_headroom;
             // Materialization is native work too: a slow copy cannot delay
             // the independent caller deadline or destroy its Vec on timeout.
-            // Any finite permit is transferred into the real input owner
-            // immediately when the charged materialization finishes. Unlimited
-            // keeps the same owned-input lifetime with no accounting permit.
+            // The operation slot stays with this task. The B reservation moves
+            // into the real input owner when materialization finishes, for
+            // both finite and unlimited calls.
             let result = AssertUnwindSafe(async {
                 scope.check_pre_dispatch().map_err(scope_error)?;
                 let bytes = materialize()?;
@@ -296,11 +504,24 @@ impl PreparingCall {
                         "materialized input length differs from charged length",
                     ));
                 }
-                let input = Arc::new(RetainedCallInput {
+                let actual_capacity = u64::try_from(bytes.capacity())
+                    .map_err(|_| configuration("materialized input capacity exceeds u64"))?;
+                let reservation = input_reservation
+                    .as_mut()
+                    .expect("input was charged before materialization");
+                let required = actual_capacity
+                    .checked_add(stream_http_headroom)
+                    .ok_or_else(|| configuration("input capacity and HTTP headroom exceed u64"))?;
+                let additional = required.saturating_sub(reservation.bytes());
+                if additional > 0 {
+                    reservation
+                        .try_grow(additional)
+                        .map_err(payload_admission_error)?;
+                }
+                let input = BudgetedBuffer::new(
                     bytes,
-                    _permit: permit.take(),
-                });
-                owner = Some(input.clone());
+                    input_reservation.take().expect("input was charged"),
+                );
                 transport(input, scope).await
             })
             .catch_unwind()
@@ -312,13 +533,18 @@ impl PreparingCall {
                     "native transport or materializer panicked",
                 )),
             };
+            // A finite unary call releases its slot before publishing a
+            // result. A stream transferred its slot to the receive record.
+            drop(operation);
+            // The input reservation follows its actual last reader, including
+            // any request-body slices still owned by the HTTP stack.
+            drop(input_reservation);
             guard.finish(result);
-            // Body Arc clones can continue owning bytes AND permit after this.
-            drop(owner);
-            drop(permit);
         };
         let started = catch_unwind(AssertUnwindSafe(|| {
-            if shared.scope.deadline().is_some() {
+            if matches!(shared.mode, CompletionMode::OriginalRecord { .. })
+                || shared.scope.deadline().is_some()
+            {
                 // Dropping a Tokio JoinHandle detaches; never abort on timeout.
                 drop(handle.spawn(task));
             } else {
@@ -338,31 +564,26 @@ impl PreparingCall {
     }
 }
 
-/// One real input owner, suitable for coercion to
-/// `Arc<dyn AsRef<[u8]> + Send + Sync>` and HTTP Bytes::from_owner. A finite
-/// call's permit refunds once at the last Arc, not at await return or waiter
-/// timeout. Unlimited carries no permit. Vec is destroyed before its optional
-/// metadata permit (field order); c2-mem owns no bytes.
-pub(crate) struct RetainedCallInput {
-    bytes: Vec<u8>,
-    _permit: Option<RetentionPermit>,
-}
-
-impl AsRef<[u8]> for RetainedCallInput {
-    fn as_ref(&self) -> &[u8] {
-        &self.bytes
-    }
-}
-
 struct Outcome<R> {
     result: Option<Result<R, Error>>,
     caller: bool,
 }
 
+#[derive(Clone, Copy)]
+enum CompletionMode {
+    WholeCall,
+    StreamOpen,
+    OriginalRecord { stream: bool },
+}
+
 struct Completion<R> {
     scope: CallScope,
+    mode: CompletionMode,
+    abandon: Option<fn(&R)>,
+    on_waiter_abandon: Option<Arc<dyn Fn() + Send + Sync>>,
     state: Mutex<Outcome<R>>,
     changed: Condvar,
+    async_changed: tokio::sync::Notify,
 }
 
 impl<R> Completion<R> {
@@ -372,10 +593,41 @@ impl<R> Completion<R> {
         let invalid_success = execution_error(&self.scope, "success without dispatch admission");
         {
             let mut state = self.state.lock();
-            let confirmation = if pending.as_ref().unwrap().is_ok() {
-                self.scope.complete_success()
-            } else {
-                self.scope.complete_failure()
+            let confirmation = match (self.mode, pending.as_ref().unwrap().is_ok()) {
+                (CompletionMode::OriginalRecord { stream: true }, true) => {
+                    if matches!(
+                        self.scope.state(),
+                        CallState::Dispatched | CallState::ExpiredDispatchUncertain
+                    ) {
+                        Ok(())
+                    } else {
+                        Err(CallScopeError::InvalidState {
+                            state: self.scope.state(),
+                        })
+                    }
+                }
+                (CompletionMode::OriginalRecord { .. }, success) => {
+                    // A caller's expired observation cannot erase a real native
+                    // outcome. Its phase still prevents retry of that caller.
+                    if success {
+                        let _ = self.scope.complete_success();
+                    } else {
+                        let _ = self.scope.complete_failure();
+                    }
+                    Ok(())
+                }
+                (CompletionMode::StreamOpen, true) => match self.scope.observe_deadline() {
+                    CallState::Dispatched => Ok(()),
+                    CallState::ExpiredPreDispatch => Err(CallScopeError::DeadlineExceeded {
+                        phase: TransportPhase::PreDispatch,
+                    }),
+                    CallState::ExpiredDispatchUncertain => Err(CallScopeError::DeadlineExceeded {
+                        phase: TransportPhase::DispatchUncertain,
+                    }),
+                    state => Err(CallScopeError::InvalidState { state }),
+                },
+                (_, true) => self.scope.complete_success(),
+                (_, false) => self.scope.complete_failure(),
             };
             match confirmation {
                 Ok(()) if state.caller => state.result = pending.take(),
@@ -390,6 +642,10 @@ impl<R> Completion<R> {
                 _ => {}
             }
             self.changed.notify_all();
+            self.async_changed.notify_waiters();
+        }
+        if let (Some(abandon), Some(Ok(value))) = (self.abandon, pending.as_ref()) {
+            abandon(value);
         }
         // Late/unreceived HeldResponse, arbitrary error and Vec cleanup occur
         // here on native execution, never under metadata or waiter timeout.
@@ -427,10 +683,27 @@ pub(crate) struct ExecutingCall<R> {
 }
 
 impl<R> ExecutingCall<R> {
+    pub(crate) async fn wait_original(self) -> Result<R, Error> {
+        loop {
+            let changed = self.shared.async_changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            {
+                let mut state = self.shared.state.lock();
+                if let Some(result) = state.result.take() {
+                    state.caller = false;
+                    return result;
+                }
+            }
+            changed.await;
+        }
+    }
+
     pub(crate) fn wait(self) -> Result<R, Error> {
         let mut state = self.shared.state.lock();
         loop {
             if let Some(result) = state.result.take() {
+                state.caller = false;
                 drop(state);
                 return result;
             }
@@ -443,6 +716,9 @@ impl<R> ExecutingCall<R> {
             if let Some(phase) = phase {
                 state.caller = false;
                 drop(state);
+                if let Some(abandon) = &self.shared.on_waiter_abandon {
+                    abandon();
+                }
                 return Err(deadline_error(phase));
             }
             if let Some(deadline) = self.shared.scope.deadline() {
@@ -459,18 +735,27 @@ impl<R> ExecutingCall<R> {
 
 impl<R> Drop for ExecutingCall<R> {
     fn drop(&mut self) {
-        let result = {
+        let (was_caller, result) = {
             let mut state = self.shared.state.lock();
+            let was_caller = state.caller;
             state.caller = false;
-            state.result.take()
+            (was_caller, state.result.take())
         };
+        if was_caller {
+            if let Some(abandon) = &self.shared.on_waiter_abandon {
+                abandon();
+            }
+        }
         // A caller abandoning an already-delivered result owns its cleanup.
         // On timeout there is no published result; native cleanup stays native.
+        if let (Some(abandon), Some(Ok(value))) = (self.shared.abandon, result.as_ref()) {
+            abandon(value);
+        }
         drop(result);
     }
 }
 
-fn shared_executor() -> Result<Handle, Error> {
+pub(crate) fn shared_executor() -> Result<Handle, Error> {
     static EXECUTOR: OnceLock<Result<Runtime, String>> = OnceLock::new();
     let runtime = EXECUTOR.get_or_init(|| {
         catch_unwind(AssertUnwindSafe(|| {
@@ -554,6 +839,49 @@ fn admission_error(error: RetentionError) -> Error {
     error_out
 }
 
+fn payload_admission_error(error: PayloadBufferError) -> Error {
+    match error {
+        PayloadBufferError::DeadlineExceeded => deadline_error(TransportPhase::PreDispatch),
+        PayloadBufferError::TooLarge { requested, limit } => {
+            let mut error_out = local_error(
+                ErrorCode::CallCapacityExceeded,
+                error.to_string(),
+                TransportPhase::PreDispatch,
+                "payload_buffer_admission",
+            );
+            if let Error::Semantic(semantic) = &mut error_out {
+                semantic
+                    .details
+                    .insert("requested_bytes".into(), requested.to_string());
+                semantic
+                    .details
+                    .insert("limit_bytes".into(), limit.to_string());
+            }
+            error_out
+        }
+        PayloadBufferError::InsufficientCapacity {
+            requested,
+            available,
+        } => {
+            let mut error_out = local_error(
+                ErrorCode::CallCapacityExceeded,
+                error.to_string(),
+                TransportPhase::PreDispatch,
+                "payload_buffer_admission",
+            );
+            if let Error::Semantic(semantic) = &mut error_out {
+                semantic
+                    .details
+                    .insert("requested_bytes".into(), requested.to_string());
+                semantic
+                    .details
+                    .insert("available_bytes".into(), available.to_string());
+            }
+            error_out
+        }
+    }
+}
+
 fn execution_error(scope: &CallScope, message: &str) -> Error {
     local_error(
         ErrorCode::ClientCallingResource,
@@ -621,7 +949,7 @@ mod tests {
     fn context(slots: u64, bytes: u64) -> CallExecutionContext {
         CallExecutionContext::new(&CallExecutionLimits {
             max_outstanding_calls: slots,
-            retained_input_budget_bytes: bytes,
+            payload_buffer_budget_bytes: bytes,
         })
     }
 
@@ -730,15 +1058,15 @@ mod tests {
         let snap = context.snapshot();
         assert_eq!(snap.peak_operations, 0);
         assert_eq!(snap.rejected_reservations, 0);
-        assert_eq!(snap.used_retained_bytes, 0);
+        assert_eq!(context.payload_snapshot().used_bytes, 0);
     }
 
     #[test]
-    fn slot_bytes_closed_rejections_precede_owned_copy_and_transport() {
+    fn slot_oversize_and_closed_rejections_precede_owned_copy_and_transport() {
         let context = context(1, 4);
         let mut first = prepare(&context);
         assert_eq!(context.snapshot().used_operations, 1);
-        assert_eq!(context.snapshot().used_retained_bytes, 0);
+        assert_eq!(context.payload_snapshot().used_bytes, 0);
         let slot = context
             .prepare(CallOptions::new(), Some(FINITE))
             .err()
@@ -750,7 +1078,7 @@ mod tests {
             "call_execution_admission",
         );
         first.charge_input(2).unwrap();
-        assert_eq!(context.snapshot().used_retained_bytes, 2);
+        assert_eq!(context.payload_snapshot().used_bytes, 2);
         let first_scope = first.scope().clone();
         let error = first
             .execute::<(), _, _, _>(
@@ -764,26 +1092,26 @@ mod tests {
             &error,
             ErrorCode::CallCapacityExceeded,
             "pre_dispatch",
-            "call_execution_admission",
+            "payload_buffer_admission",
         );
         assert_eq!(first_scope.state(), CallState::FailedPreDispatch);
         assert_eq!(context.snapshot().used_operations, 0);
+        assert_eq!(context.snapshot().rejected_reservations, 1);
+        assert_eq!(context.payload_snapshot().rejected_allocations, 1);
         let prepared = prepare(&context);
         context.close();
-        let error = prepared
+        let call = prepared
             .execute::<(), _, _, _>(
                 1,
-                || panic!("copied after close"),
-                |_, _| async { panic!("transport after close") },
+                || Ok(vec![1]),
+                |input, scope| async move {
+                    scope.try_begin_dispatch().map_err(scope_error)?;
+                    assert_eq!(input.as_ref().as_ref(), &[1]);
+                    Ok(())
+                },
             )
-            .err()
             .unwrap();
-        semantic(
-            &error,
-            ErrorCode::CallCapacityExceeded,
-            "pre_dispatch",
-            "call_execution_admission",
-        );
+        call.wait().unwrap();
         let closed = context
             .prepare(CallOptions::new(), Some(FINITE))
             .err()
@@ -795,7 +1123,105 @@ mod tests {
             "call_execution_admission",
         );
         assert_eq!(context.snapshot().used_operations, 0);
-        assert_eq!(context.snapshot().peak_retained_bytes, 2);
+        assert_eq!(context.snapshot().rejected_reservations, 2);
+        assert_eq!(context.payload_snapshot().peak_bytes, 2);
+    }
+
+    #[test]
+    fn byte_wait_expiry_is_pre_dispatch_and_does_not_count_as_rejection() {
+        let context = context(2, 4);
+        let mut first = prepare(&context);
+        first.charge_input(4).unwrap();
+        let mut second = context
+            .prepare(
+                CallOptions::with_timeout(CallTimeout::After(Duration::from_millis(20))),
+                None,
+            )
+            .unwrap();
+        let error = second.charge_input(1).unwrap_err();
+        semantic(
+            &error,
+            ErrorCode::CallDeadlineExceeded,
+            "pre_dispatch",
+            "call_deadline",
+        );
+        assert_eq!(context.payload_snapshot().rejected_allocations, 0);
+        drop(second);
+        assert_eq!(context.snapshot().used_operations, 1);
+        drop(first);
+        assert_eq!(context.payload_snapshot().used_bytes, 0);
+    }
+
+    #[test]
+    fn partial_inputs_cannot_wait_for_each_others_growth() {
+        let context = context(2, 8);
+        let mut first = prepare(&context);
+        let mut second = prepare(&context);
+        first.charge_input(4).unwrap();
+        second.charge_input(4).unwrap();
+        let error = first.charge_input(5).unwrap_err();
+        semantic(
+            &error,
+            ErrorCode::CallCapacityExceeded,
+            "pre_dispatch",
+            "payload_buffer_admission",
+        );
+        assert_eq!(context.payload_snapshot().rejected_allocations, 1);
+        assert_eq!(context.payload_snapshot().rejected_bytes, 5);
+        drop(first);
+        second.charge_input(5).unwrap();
+        assert_eq!(context.payload_snapshot().used_bytes, 5);
+    }
+
+    #[test]
+    fn materialized_input_actual_capacity_is_charged_before_transport() {
+        let context = context(1, 4);
+        let mut preparing = prepare(&context);
+        preparing.charge_input(4).unwrap();
+        let error = preparing
+            .execute::<(), _, _, _>(
+                4,
+                || {
+                    let mut bytes = Vec::with_capacity(8);
+                    bytes.extend_from_slice(&[1; 4]);
+                    Ok(bytes)
+                },
+                |_, _| async { panic!("transport after actual capacity rejection") },
+            )
+            .unwrap()
+            .wait()
+            .unwrap_err();
+        semantic(
+            &error,
+            ErrorCode::CallCapacityExceeded,
+            "pre_dispatch",
+            "payload_buffer_admission",
+        );
+        assert_eq!(context.payload_snapshot().rejected_allocations, 1);
+        assert_eq!(context.payload_snapshot().rejected_bytes, 8);
+        eventually(|| context.payload_snapshot().used_bytes == 0);
+    }
+
+    #[test]
+    fn zero_precharge_does_not_turn_first_positive_charge_into_immediate_rejection() {
+        let context = context(2, 4);
+        let mut first = prepare(&context);
+        first.charge_input(4).unwrap();
+        let mut second = context
+            .prepare(
+                CallOptions::with_timeout(CallTimeout::After(Duration::from_millis(20))),
+                None,
+            )
+            .unwrap();
+        second.charge_input(0).unwrap();
+        let error = second.charge_input(1).unwrap_err();
+        semantic(
+            &error,
+            ErrorCode::CallDeadlineExceeded,
+            "pre_dispatch",
+            "call_deadline",
+        );
+        assert_eq!(context.payload_snapshot().rejected_allocations, 0);
     }
 
     #[test]
@@ -809,13 +1235,13 @@ mod tests {
             .execute(
                 7,
                 move || {
-                    assert_eq!(seen.snapshot().used_retained_bytes, 7);
+                    assert_eq!(seen.payload_snapshot().used_bytes, 7);
                     assert_eq!(seen.snapshot().used_operations, 1);
                     Ok(vec![1; 7])
                 },
                 move |input, scope| async move {
                     scope.try_begin_dispatch().map_err(scope_error)?;
-                    let body: Arc<dyn AsRef<[u8]> + Send + Sync> = input;
+                    let body: Arc<dyn AsRef<[u8]> + Send + Sync> = Arc::new(input);
                     body_tx.send(body).unwrap();
                     Ok(HeldResponse::from_owned_bytes(vec![2; 3]))
                 },
@@ -828,14 +1254,14 @@ mod tests {
         assert_eq!(body.as_ref().as_ref(), &[1; 7]);
         assert_eq!(response.bytes(), &[2; 3]);
         // Outcome has completed; HTTP-like body still owns the full charge.
-        assert_eq!(context.snapshot().used_retained_bytes, 7);
-        assert_eq!(context.snapshot().used_operations, 1);
+        assert_eq!(context.payload_snapshot().used_bytes, 7);
+        assert_eq!(context.snapshot().used_operations, 0);
         context.close();
         drop(response);
-        assert_eq!(context.snapshot().used_operations, 1);
+        assert_eq!(context.snapshot().used_operations, 0);
         drop(body);
         eventually(|| context.snapshot().used_operations == 0);
-        assert_eq!(context.snapshot().used_retained_bytes, 0);
+        assert_eq!(context.payload_snapshot().used_bytes, 0);
     }
 
     #[test]
@@ -893,6 +1319,7 @@ mod tests {
                 || Ok(vec![3; 4]),
                 move |input, scope| async move {
                     scope.try_begin_dispatch().map_err(scope_error)?;
+                    let input = Arc::new(input);
                     entered.send(Arc::downgrade(&input)).unwrap();
                     pending.await.unwrap();
                     assert_eq!(input.as_ref().as_ref(), &[3; 4]);
@@ -932,7 +1359,7 @@ mod tests {
         release.send(()).unwrap();
         eventually(|| drops.load(Ordering::SeqCst) == 1 && input.upgrade().is_none());
         eventually(|| context.snapshot().used_operations == 0);
-        assert_eq!(context.snapshot().used_retained_bytes, 0);
+        assert_eq!(context.payload_snapshot().used_bytes, 0);
         assert_eq!(
             scope.observe_deadline(),
             CallState::ExpiredDispatchUncertain
@@ -983,6 +1410,52 @@ mod tests {
     }
 
     #[test]
+    fn abandoned_result_drops_after_slot_release() {
+        let context = context(1, 0);
+        let (release, pending) = oneshot::channel();
+        let (entered, started) = mpsc::channel();
+        let (observed_tx, observed_rx) = mpsc::channel();
+        let next_context = context.clone();
+        let call = prepare(&context)
+            .execute(
+                0,
+                || Ok(Vec::new()),
+                move |_, scope| async move {
+                    scope.try_begin_dispatch().map_err(scope_error)?;
+                    entered.send(()).unwrap();
+                    pending.await.unwrap();
+                    Ok(TrackedResponse::new(
+                        Arc::new(AtomicUsize::new(0)),
+                        move || {
+                            // The caller abandoned delivery. Its response is destroyed
+                            // inside Completion::finish on the native task, so this
+                            // checks the exact publication/slot-release boundary.
+                            let next = next_context
+                                .prepare(CallOptions::new(), Some(FINITE))
+                                .is_ok();
+                            observed_tx.send(next).unwrap();
+                        },
+                    ))
+                },
+            )
+            .unwrap();
+        started.recv_timeout(TEST_WAIT).unwrap();
+        drop(call);
+        release.send(()).unwrap();
+        assert!(observed_rx.recv_timeout(TEST_WAIT).unwrap());
+    }
+
+    #[test]
+    fn unlimited_stream_reserves_outstanding_call_slot() {
+        let context = context(1, 0);
+        let first = context.prepare_stream(CallOptions::new(), None).unwrap();
+        assert_eq!(context.snapshot().used_operations, 1);
+        assert!(context.prepare_stream(CallOptions::new(), None).is_err());
+        drop(first);
+        assert!(context.prepare_stream(CallOptions::new(), None).is_ok());
+    }
+
+    #[test]
     fn dropping_caller_does_not_drop_inflight_input_or_native_future() {
         let context = context(1, 4);
         let (release, pending) = oneshot::channel();
@@ -995,6 +1468,7 @@ mod tests {
                 || Ok(vec![3; 4]),
                 move |input, scope| async move {
                     scope.try_begin_dispatch().map_err(scope_error)?;
+                    let input = Arc::new(input);
                     entered.send(Arc::downgrade(&input)).unwrap();
                     pending.await.unwrap();
                     Ok(TrackedResponse::new(captured, || {}))
@@ -1005,7 +1479,7 @@ mod tests {
         drop(call);
         context.close();
         assert!(weak.upgrade().is_some());
-        assert_eq!(context.snapshot().used_retained_bytes, 4);
+        assert_eq!(context.payload_snapshot().used_bytes, 4);
         assert_eq!(context.snapshot().used_operations, 1);
         release.send(()).unwrap();
         eventually(|| drops.load(Ordering::SeqCst) == 1 && weak.upgrade().is_none());
@@ -1053,8 +1527,8 @@ mod tests {
     }
 
     #[test]
-    fn unlimited_and_inherit_none_bypass_zero_limits_and_closed_budget_inline() {
-        let context = context(0, 0);
+    fn unlimited_and_inherit_none_bypass_operation_slots_but_charge_input() {
+        let context = context(0, 4);
         // An un-driven current-thread runtime makes any accidental background
         // spawn observable: execute must finish the future before returning.
         let runtime = Builder::new_current_thread().enable_all().build().unwrap();
@@ -1063,7 +1537,6 @@ mod tests {
             if closed {
                 context.close();
             }
-            let before = context.snapshot();
             for (options, path_default) in [
                 (
                     CallOptions::with_timeout(CallTimeout::Unlimited),
@@ -1074,9 +1547,9 @@ mod tests {
                 let mut preparing = context.prepare(options, path_default).unwrap();
                 let scope = preparing.scope().clone();
                 assert_eq!(scope.deadline(), None);
-                // Prepared payload size must not accidentally charge Unlimited.
-                preparing.charge_input(u64::MAX).unwrap();
-                assert_eq!(context.snapshot(), before);
+                preparing.charge_input(4).unwrap();
+                assert_eq!(context.payload_snapshot().used_bytes, 4);
+                assert_eq!(context.snapshot().used_operations, 0);
                 let handle = runtime.handle().clone();
                 let call = preparing
                     .execute_on(
@@ -1090,9 +1563,9 @@ mod tests {
                             scope.try_begin_dispatch().map_err(scope_error)?;
                             tokio::task::yield_now().await;
                             assert_eq!(thread::current().id(), caller);
-                            // A real escaping body owner still holds owned bytes,
-                            // but Unlimited must never carry a retention permit.
-                            let body: Arc<dyn AsRef<[u8]> + Send + Sync> = input;
+                            // A real escaping body owner keeps B until its
+                            // final reference, without consuming a call slot.
+                            let body: Arc<dyn AsRef<[u8]> + Send + Sync> = Arc::new(input);
                             Ok(body)
                         },
                         || Ok(handle),
@@ -1103,12 +1576,12 @@ mod tests {
                     CallState::Succeeded,
                     "background continuation was created"
                 );
-                assert_eq!(context.snapshot(), before);
+                assert_eq!(context.payload_snapshot().used_bytes, 4);
                 let body = call.wait().unwrap();
                 assert_eq!(body.as_ref().as_ref(), &[8; 4]);
-                assert_eq!(context.snapshot(), before);
+                assert_eq!(context.payload_snapshot().used_bytes, 4);
                 drop(body);
-                assert_eq!(context.snapshot(), before);
+                assert_eq!(context.payload_snapshot().used_bytes, 0);
             }
         }
     }
@@ -1129,7 +1602,7 @@ mod tests {
         let before = context.snapshot();
         assert_eq!(before.rejected_reservations, 1);
         assert_eq!(before.peak_operations, 0);
-        assert_eq!(before.peak_retained_bytes, 0);
+        assert_eq!(context.payload_snapshot().peak_bytes, 0);
         // Closed and zero-slot budget must not mask After(ZERO)'s first expiry.
         context.close();
         let before = context.snapshot();
@@ -1196,7 +1669,7 @@ mod tests {
             "call_deadline",
         );
         assert_eq!(context.snapshot().used_operations, 1);
-        assert_eq!(context.snapshot().used_retained_bytes, 4);
+        assert_eq!(context.payload_snapshot().used_bytes, 4);
         release.send(()).unwrap();
         transport_rx.recv_timeout(TEST_WAIT).unwrap();
         eventually(|| weak.upgrade().is_none());
@@ -1230,11 +1703,11 @@ mod tests {
         });
         assert!(weak.upgrade().is_none());
         assert_eq!(context.snapshot().used_operations, 0);
-        assert_eq!(context.snapshot().used_retained_bytes, 0);
+        assert_eq!(context.payload_snapshot().used_bytes, 0);
     }
 
     struct PanicFuture {
-        input: Arc<RetainedCallInput>,
+        input: BudgetedBuffer,
         scope: CallScope,
         on_drop: mpsc::Sender<()>,
     }
@@ -1253,7 +1726,7 @@ mod tests {
     }
 
     struct DropPanicFuture {
-        input: Arc<RetainedCallInput>,
+        input: BudgetedBuffer,
         scope: CallScope,
         on_drop: mpsc::Sender<()>,
     }
@@ -1315,7 +1788,7 @@ mod tests {
                 drop_rx.recv_timeout(TEST_WAIT).unwrap();
             }
             eventually(|| context.snapshot().used_operations == 0);
-            assert_eq!(context.snapshot().used_retained_bytes, 0);
+            assert_eq!(context.payload_snapshot().used_bytes, 0);
             assert_eq!(
                 scope.state(),
                 if boundary < 2 {
@@ -1422,5 +1895,72 @@ mod tests {
         ));
         assert_eq!(scope.state(), CallState::FailedPreDispatch);
         eventually(|| context.snapshot().used_operations == 0);
+    }
+}
+
+#[cfg(test)]
+mod native_record_tests {
+    use super::*;
+    use c2_config::{CallOptions, CallTimeout};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn original_stream_record_is_observable_after_the_callers_deadline() {
+        let context = CallExecutionContext::new(&CallExecutionLimits::default());
+        let preparing = context
+            .prepare_stream(
+                CallOptions::with_timeout(CallTimeout::After(Duration::from_millis(100))),
+                None,
+            )
+            .unwrap();
+        let scope = preparing.scope_clone();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let cancelled = Arc::new(AtomicUsize::new(0));
+        let cancellation = cancelled.clone();
+        let record = preparing
+            .execute_stream_record(
+                0,
+                || Ok(Vec::new()),
+                move |_, scope| async move {
+                    scope.try_begin_dispatch().map_err(scope_error)?;
+                    started_tx.send(()).unwrap();
+                    release_rx.await.unwrap();
+                    Ok(19u64)
+                },
+                |_| {},
+                move || {
+                    cancellation.fetch_add(1, Ordering::SeqCst);
+                },
+            )
+            .unwrap();
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let _ = tokio::time::timeout_at(
+                tokio::time::Instant::from_std(scope.deadline().unwrap()),
+                std::future::pending::<()>(),
+            )
+            .await;
+        });
+        assert_eq!(
+            scope.observe_deadline(),
+            CallState::ExpiredDispatchUncertain
+        );
+        assert_eq!(
+            cancelled.load(Ordering::SeqCst),
+            0,
+            "deadline is not cancellation"
+        );
+        release_tx.send(()).unwrap();
+        assert_eq!(runtime.block_on(record.wait_original()).unwrap(), 19);
+        assert_eq!(
+            cancelled.load(Ordering::SeqCst),
+            0,
+            "observing the real record does not abandon it"
+        );
     }
 }

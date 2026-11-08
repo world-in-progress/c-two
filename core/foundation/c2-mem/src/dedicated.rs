@@ -1,7 +1,9 @@
 //! Headerless dedicated SHM for one locally owned allocation.
 
 use crate::budget::BudgetReservation;
+use crate::segment::ChargedMapping;
 use crate::segment::ShmRegion;
+use std::sync::{Arc, Mutex};
 
 #[cfg(unix)]
 pub(crate) fn native_page_size() -> Option<usize> {
@@ -34,9 +36,9 @@ fn round_payload_to_page(data_size: usize, page_size: usize) -> Option<usize> {
 }
 
 pub struct DedicatedSegment {
-    region: ShmRegion,
-    // Drop the mapping before returning its owner-creation budget charge.
-    budget_guard: Option<BudgetReservation>,
+    name: String,
+    size: usize,
+    mapping: Mutex<Option<Arc<ChargedMapping>>>,
 }
 
 impl DedicatedSegment {
@@ -49,37 +51,77 @@ impl DedicatedSegment {
         let size = Self::required_shm_size(data_size).ok_or_else(|| {
             format!("dedicated backing geometry unsupported for {data_size} payload bytes")
         })?;
-        Ok(Self {
-            region: ShmRegion::create(name, size)?,
-            budget_guard: None,
-        })
+        Ok(Self::from_region(ShmRegion::create(name, size)?))
     }
 
     /// Open the OS object's full, read-only view; no geometry lives in SHM.
     pub fn open(name: &str, min_size: usize) -> Result<Self, String> {
-        Ok(Self {
-            region: ShmRegion::open(name, min_size)?,
-            budget_guard: None,
-        })
+        Ok(Self::from_region(ShmRegion::open(name, min_size)?))
+    }
+
+    fn from_region(region: ShmRegion) -> Self {
+        Self {
+            name: region.name().to_owned(),
+            size: region.size(),
+            mapping: Mutex::new(Some(Arc::new(ChargedMapping {
+                region,
+                reservation: None,
+            }))),
+        }
     }
 
     pub(crate) fn with_budget_guard(mut self, guard: BudgetReservation) -> Self {
-        self.budget_guard = Some(guard);
+        Arc::get_mut(
+            self.mapping
+                .get_mut()
+                .expect("dedicated mapping poisoned")
+                .as_mut()
+                .unwrap(),
+        )
+        .expect("backing not published")
+        .reservation = Some(guard);
         self
+    }
+
+    pub(crate) fn pin(&self) -> Arc<ChargedMapping> {
+        self.try_pin().expect("live allocation pins its mapping")
+    }
+
+    pub(crate) fn try_pin(&self) -> Option<Arc<ChargedMapping>> {
+        self.mapping
+            .lock()
+            .expect("dedicated mapping poisoned")
+            .clone()
+    }
+
+    pub(crate) fn is_mapped(&self) -> bool {
+        self.mapping
+            .lock()
+            .expect("dedicated mapping poisoned")
+            .is_some()
+    }
+
+    pub(crate) fn release(&self) {
+        let mapping = self
+            .mapping
+            .lock()
+            .expect("dedicated mapping poisoned")
+            .take();
+        drop(mapping);
     }
 
     /// Raw data at offset zero. A peer mapping may only be read.
     pub fn data_ptr(&self) -> *mut u8 {
-        self.region.base_ptr()
+        self.pin().region.base_ptr()
     }
     pub fn data_size(&self) -> usize {
-        self.region.size()
+        self.size
     }
     pub fn size(&self) -> usize {
-        self.region.size()
+        self.size
     }
     pub fn name(&self) -> &str {
-        self.region.name()
+        &self.name
     }
 }
 
@@ -94,7 +136,7 @@ mod tests {
         let page = native_page_size().unwrap();
         let creator = DedicatedSegment::create(&name, 8192).unwrap();
         assert_eq!(creator.size(), span);
-        assert_eq!(creator.data_ptr(), creator.region.base_ptr());
+        assert_eq!(creator.data_ptr(), creator.pin().region.base_ptr());
         unsafe {
             *creator.data_ptr() = 0xAB;
             if span > page {

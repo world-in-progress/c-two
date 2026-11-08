@@ -67,9 +67,9 @@ finally:
 
 可移植方法在每个方向携带零个或一个 `Payload` 封套；C-Two 将每个嵌套规格作为不透明 JSON 值嵌入，且不重新解释它。没有明确绑定的方法仍可使用普通 Python 值进行仅限 Python 的原型开发，但可移植描述符导出与代码生成会诊断并拒绝这些方法。
 
-`cc.hold(echo.echo)(source)` 将响应保留为 `HeldResult`，它持有一份本地副本：复制完成后传输内存就已释放，所以 hold 不会占住服务端的共享内存。显式 `release()` 让载荷所有者失效一次，再释放本地副本；失效操作不会重放，此后该值不可访问。如果导出被拒绝，先释放额外导出的 memoryview 再重试；拒绝发生在失效操作之前。手工构造的 `HeldResult(release_cb=...)` 回调仍只运行一次。常规作用域使用 `with cc.hold(...) as held`，需要超出作用域存活的值应实体化。
+`cc.hold(echo.echo)(source)` 将响应保留为 `HeldResult`，它持有一份本地副本：复制完成后传输内存就已释放，所以 hold 不会占住服务端的共享内存。显式 `release()` 让载荷所有者失效一次，再释放本地副本；失效操作不会重放，此后该值不可访问。如果导出被拒绝，先释放额外导出的 memoryview 再重试；拒绝发生在失效操作之前。手工构造的 `HeldResult(release_cb=...)` 回调仍只运行一次。常规作用域使用 `with cc.hold(method)(args) as held`，需要超出作用域存活的值应实体化。
 
-`cc.observe.memory_stats()['holds']` 统计这些本地副本：`active_holds`、`total_held_bytes`（逻辑字节，不是 SHM 容量）、`oldest_hold_seconds` 与 `by_direction`。backing 与重组预算的各项及其核算边界见[内存策略](memory-policy.md#statistics-and-payload-lifetime)。
+`cc.observe.memory_stats()['holds']` 统计这些本地副本：`active_holds`、`total_held_bytes`（逻辑字节，不是 SHM 容量）、`oldest_hold_seconds` 与 `by_direction`。backing、重组与载荷缓冲预算的各项及其核算边界见[内存策略](memory-policy.md#statistics-and-payload-lifetime)。
 
 ## 远程连接与截止时间
 
@@ -107,22 +107,61 @@ server = session.ensure_server_bridge()
 
 ## 载荷生命周期
 
-已经证实的可移植接收路径打开的是**由副本支持**的载荷所有者。`cc.hold()` 是生命周期契约，不构成零拷贝声明：它一同保留 C-Two 响应租约与载荷所有者，并保证释放租约*之前*，先让载荷所有者及其受检查的视图失效。
+已经证实的可移植接收路径打开的是**由副本支持**的载荷所有者。`cc.hold()` 是生命周期契约，不构成零拷贝声明：它一同保留响应的本地副本与载荷所有者，并保证释放本地副本*之前*，先让载荷所有者及其受检查的视图失效。
 
 ```python
 with cc.hold(echo.echo)(source) as held:
     payload = held.value                    # FastDB Payload owner; checked views stay valid
     ...
-# leaving the block (or held.release()) invalidates owner and views, then frees the lease
+# leaving the block (or held.release()) invalidates the payload owner and checked views, then frees the local copy
 ```
 
 释放有三层方式：显式 `.release()`、`with` 上下文管理器，以及遗漏前两者时发出警告的 `__del__` 兜底。`cc.observe.memory_stats()["holds"]` 报告监控中的活动 hold 数量。
 
 `held.unsafe_buffer` 将保留的原始线格式缓冲区作为 `memoryview` 逃逸入口暴露。从中派生的原始 NumPy 数组或指针绕开 FastDB 的载荷所有者与受检查视图，**无法通过机制撤销**；要把值保存到 hold 作用域之外，应先通过 FastDB 实体化。
 
-服务端的可移植输入默认由服务端拥有。以 `cc.register(..., input_lifetime={...: 'borrowed'})` 注册，可将指定方法设为仅在调用期间借用输入：调用返回或抛出异常时，C-Two 在释放请求租约前让载荷及其受检查视图失效。方法返回后不要保留借用的载荷或视图。
+服务端的可移植输入默认由服务端拥有。以 `cc.register(..., input_lifetime={...: 'borrowed'})` 注册，可将指定方法设为仅在调用期间借用输入：请求租约在资源方法运行前就已释放。方法返回或抛出异常时，C-Two 先使载荷所有者及其受检查视图失效，再释放本地输入副本。方法返回后不要保留借用的载荷或视图。
 
 `cc.transfer` 只接受 `input` 和 `output`。原有 `buffer` 关键字已移除，包括 `None` 和 `"view"`；传入它会抛出 `TypeError`。应删除该关键字，并通过注册级 `input_lifetime` 选择借用输入。模块级 `auto_transfer` 遵循相同规则。
+
+## 服务端流
+
+标了 `@cc.stream` 的 CRM 方法对一份输入返回零条或多条条目。返回类型写成 `Iterator[T]` 或 `Generator[T, None, None]`，`T` 是一条条目；`@cc.transfer(output=...)` 描述一条条目的编码，与 unary 的返回值一样。`@cc.stream` 可以和 `@cc.read`、`@cc.write`、`@cc.transfer` 一起用。资源把这个方法写成生成器，或者返回一个迭代器：
+
+```python
+from collections.abc import Iterator
+
+@cc.crm(namespace='science.sim', version='0.1.0')
+class Simulation:
+    @cc.stream
+    @cc.transfer(input=PARAMETERS, output=STATE)
+    def steps(self, parameters: Payload) -> Iterator[Payload]: ...
+
+class BasinSimulation:
+    def steps(self, parameters: Payload) -> Iterator[Payload]:
+        model = initialize(parameters)
+        try:
+            while model.has_next():
+                model.advance()
+                yield model.export_owned_state()
+        finally:
+            model.finish()
+
+cc.register(Simulation, BasinSimulation(), name='basin')
+
+with cc.connect(Simulation, name='basin', address='ipc://resource-process') as sim:
+    results = sim.steps(parameters)
+    with results:
+        for state in results:
+            consume(state)
+    outcome = results.close()
+```
+
+生成器的每一次 `next()` 是一个资源推进：只在推进期间持有路由许可与 GIL，经 IPC 时还持有一个执行 worker，条目之间什么都不占。一条流开始时复制一次 context，建立生成器、每次 `next()` 与最后的 `close()` 都在这一个 context 里运行，所以生成器里设置的 `contextvars` 与 `decimal` context 跨 worker 跟着它走，也不会漏进 worker 自己的 context。经 IPC 时每条条目在它的推进里编码，生成器 yield 之后可以复用或修改同一个对象；在同一进程里，消费方拿到的就是 yield 出来的那个对象。借用的输入（`input_lifetime='borrowed'`）一直有效，到生成器关闭之后才先失效、再释放。
+
+调用返回一个 `cc.Stream`，迭代得到解码后的条目。离开 `with` 块或丢弃这个对象会取消它，不等待。`close(timeout=30.0)` 在流还在运行时先取消，再等原调用结束：`None` 一直等，`0` 只观察一次。它返回一个 dict，含 `completed`、`error` 与 `complete_items`；`completed` 为 False 时清理还在进行，之后可以再调用 `close()` 观察。`error` 是这条流结束时的异常，自然结束时为 `None`；服务端或 relay 结束的流报 `CallCancelled`，消息写明是 shutdown、注销还是 relay 关闭。`cc.hold(sim.steps)(parameters)` 返回由 `HeldResult` 组成的流，每条各自保留本地副本直到释放；多份 hold 可以同时存在，用满载荷缓冲预算时，下一条等到某一份释放。`cc.with_call_options` 给的截止时间涵盖整条迭代，不为每条重置；到期只结束调用方的等待。每条流占一个 `max_outstanding_calls` 名额，直到它的真实终态。
+
+在注册资源的进程里，流直接传递 yield 出来的对象，不编码，按路由自己的并发限制推进；有限的调用截止时间在派发前被拒绝。经 IPC 时，Python 与 Rust 的资源和客户端可以互相开流；经 relay 时它们经 HTTP 开流，`cc.Stream`、`close` 与 hold 的行为相同。经 relay 时，消费方停止读取后，资源最多还能多推进 HTTP 与 TCP 缓冲装得下的那么多条，小条目可达数千条。推进、取消与 shutdown 见 [Runtime 生命周期](runtime-lifecycle.md#execution-admission)。
 
 ## 入口
 
@@ -133,7 +172,7 @@ with cc.hold(echo.echo)(source) as held:
 应用以 `import c_two as cc` 开始。需要时导入专用模块：
 
 ```python
-from c_two import owner, endpoint, observe, contract
+from c_two import endpoint, observe, contract
 ```
 
 Rust 使用者从面向用户的 `c_two` 包导入，不使用 Core 或传输 crate 名称：
@@ -180,7 +219,7 @@ class Grid:
 
 ```python
 with cc.connect(Grid, name='grid', address='ipc://server') as grid:
-    result = grid.subdivide_grids([1], [0])
+    result = grid.some_method(1)
 ```
 
 不存在独立的 `compo/` 模块、`@cc.runtime.connect` 装饰器或 `Component` 类型。路由名称是传给 `cc.register(name=...)` 和 `cc.connect(name=...)` 的用户自选字符串，与 CRM `namespace` 有别。不同 CRM 契约，或同一契约的不同实例，可使用不同名称并存。对远程 IPC 和 relay 路径，原生 Runtime 还会匹配从客户端 CRM 类派生的预期 CRM 标签及契约哈希。
@@ -230,10 +269,10 @@ cc.shutdown()
 
 调用 `runtime.shutdown(timeout=...)` 会为该 SDK 会话启动 Core Runtime 唯一且永久的退役作用域；模块级 `cc.shutdown()` 对默认 Runtime 执行相同操作。该作用域封闭 Core 客户端池，并停止接受新的注册、启动和远程连接任务。待定观察保留旧会话及其槽位；Core 此后自行完成也不会替换它们。应再次调用 SDK shutdown，消费已完成的回执并进行会话交接。零或较短的等待预算只限制当前调用方的观察，不取消驱动任务。如果交接退役之前截止时间到期，shutdown 抛出 `CoreError`，包含 `lifecycle_kind='shutdown_wait_timeout'`、`details.stage` 和 `timeout_seconds`；这不是待定回执。Python 的数值转换在取得 SDK 实例锁前发生。等待取得该锁不计入 shutdown 截止时间；取得锁后，Native Host、Core 与连接池等待共用一个绝对截止时间。关闭错误投影和关闭回调在 Python 绑定锁外运行。回调在会话替换后运行；如果构造替换会话失败，原始槽位及日志仍可用。
 
-关闭从不让已发出的调用失败：其他线程上的在途调用照常完成并拿到结果，它们还在执行时，关闭报告 `completed=False`。一个没设调用期限、在等一个停住的服务端的线程会继续等下去，而 Python 退出前会等所有非守护线程；这类调用请用 `cc.with_call_options(timeout=...)` 设期限。
+关闭从不让已发出的一元调用失败：其他线程上的在途调用照常完成并拿到结果，它们还在执行时，关闭报告 `completed=False`。这个 Runtime 作为资源方的服务端流是例外：关闭在两步之间结束它，先交付已产出的条目，再执行清理，最后以写明 shutdown 的 `CallCancelled` 结束；关闭要等这次清理结束才算完成。这个 Runtime 作为客户端消费的流不会被它自己的关闭结束，要显式关闭或丢弃。一个没设调用期限、在等一个停住的服务端的线程会继续等下去，而 Python 退出前会等所有非守护线程；这类调用请用 `cc.with_call_options(timeout=...)` 设期限。
 
-`cc.serve(shutdown_timeout=30.0)` 在开始服务之前就拒绝无效的预算，之后阻塞到收到 SIGINT 或 SIGTERM，再以 `shutdown(timeout=shutdown_timeout)` 调用一次关闭并返回其结果。结果为待定时，清理在后台继续，之后再调用 `cc.shutdown()` 可以观察到它完成。
+`cc.serve(shutdown_timeout=30.0)` 在开始服务之前就拒绝无效的预算，之后阻塞到 Unix 上收到 SIGINT 或 SIGTERM、Windows 上收到 SIGINT 或 SIGBREAK，或原生 Host 自己停止（例如收到直接 IPC 关停请求），再以 `shutdown(timeout=shutdown_timeout)` 调用一次关闭并返回其结果。结果为待定时，清理在后台继续，之后再调用 `cc.shutdown()` 可以观察到它完成。`blocking=False` 时立即返回 `None`。
 
-传给远程 `connect()` 的截止时间也约束 SDK 最终发布检查。若原截止时间在发布前到期，connect 抛出对应的截止时间错误，仅释放自身的逻辑客户端，且不重试。其他情况下成功的连接继续正常复用其池化客户端。`runtime_retired` 生命周期错误没有 I/O 原因。仅使用 HTTP 不会创建 IPC 池，shutdown 也不保证每个 HTTP keepalive 套接字都已物理关闭。Rust 底层 Host 的关闭/重启生命周期仍独立且可重启；永久退役仅适用于 Python SDK Runtime 作用域。IPC 握手 14、SHM 3 和 C/FFI ABI 6 均未改变。R07 final Drop 仍是独立工作。
+传给远程 `connect()` 的截止时间也约束 SDK 最终发布检查。若原截止时间在发布前到期，connect 抛出对应的截止时间错误，仅释放自身的逻辑客户端，且不重试。其他情况下成功的连接继续正常复用其池化客户端。`runtime_retired` 生命周期错误没有 I/O 原因。仅使用 HTTP 不会创建 IPC 池，shutdown 也不保证每个 HTTP keepalive 套接字都已物理关闭。Rust 底层 Host 的关闭/重启生命周期仍独立且可重启；永久退役仅适用于 Python SDK Runtime 作用域。
 
 完成交接后，已配置的端点选择、传输策略、调用限制和 relay 覆盖值保留现有交接行为，而服务端身份、IPC 覆盖值和启动超时会重置。现有的 `connection_events()` 订阅只观察原会话；新会话需要重新订阅。返回值是正在关闭的会话的结果；已保留的载荷继续遵循自身的生命周期。应用拥有自己创建的任何自定义端点目录；Runtime 不会移除该目录。[预检示例](../../examples/python/independent_runtime.py)在删除新建的私有目录前检查关闭结果。

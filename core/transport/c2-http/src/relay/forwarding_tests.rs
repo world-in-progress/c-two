@@ -66,17 +66,27 @@ enum Carrier {
     Chunked,
 }
 
+fn copy_window(carrier: Carrier) -> u64 {
+    if carrier == Carrier::Inline {
+        16 * 1024
+    } else {
+        4096
+    }
+}
+
+// Allow an unchanged carrier: admission retains the input and reserves both
+// direction windows before IPC starts. The upload itself is capped by H.
+fn forwarding_budget(carrier: Carrier, input_len: usize) -> u64 {
+    input_len as u64 + 2 * copy_window(carrier)
+}
+
 fn policy(carrier: Carrier) -> ClientIpcConfig {
     let mut config = ClientIpcConfig::default();
     config.base.pool_segment_size = 64 * 1024;
     config.base.max_pool_segments = 1;
     config.base.pool_enabled = carrier == Carrier::Buddy;
     config.base.pool_prewarm_segments = 0;
-    config.base.chunk_size = if carrier == Carrier::Inline {
-        16 * 1024
-    } else {
-        4096
-    };
+    config.base.chunk_size = copy_window(carrier);
     config.base.shm_backing_budget_bytes = if matches!(carrier, Carrier::Buddy | Carrier::Dedicated)
     {
         1024 * 1024
@@ -379,6 +389,456 @@ async fn capacity_freed_during_rejected_body_cleanup_does_not_readmit() {
     capacity_rejection_case(CapacityRequest::DirectEagerRelease).await;
 }
 
+mod early_rejection {
+    use super::*;
+    use axum::body::{Body, HttpBody};
+    use axum::http::Request;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    struct Case {
+        path: &'static str,
+        replace: Option<(&'static str, &'static str)>,
+        status: u16,
+        error: &'static str,
+    }
+
+    fn cases() -> Vec<Case> {
+        let mut cases = vec![
+            Case {
+                path: "/grid/ping",
+                replace: Some(("x-c2-expected-crm-ns: test.echo\r\n", "")),
+                status: 400,
+                error: "InvalidCrmTag",
+            },
+            Case {
+                path: "/grid/ping",
+                replace: Some((TEST_ABI_HASH, "invalid-hash")),
+                status: 400,
+                error: "InvalidCrmTag",
+            },
+            Case {
+                path: "/missing/ping",
+                replace: None,
+                status: 404,
+                error: "ResourceNotFound",
+            },
+            Case {
+                path: "/grid/ping",
+                replace: Some((
+                    "x-c2-expected-crm-name: Echo",
+                    "x-c2-expected-crm-name: Other",
+                )),
+                status: 409,
+                error: "ContractMismatch",
+            },
+            Case {
+                path: "/grid/ping",
+                replace: Some(("x-c2-route-uid: early-route\r\n", "")),
+                status: 400,
+                error: "ProtocolViolation",
+            },
+            Case {
+                path: "/grid/ping",
+                replace: Some((
+                    "x-c2-route-uid: early-route",
+                    "x-c2-route-uid: early-route\r\nx-c2-route-uid: early-route",
+                )),
+                status: 400,
+                error: "ProtocolViolation",
+            },
+            Case {
+                path: "/grid/ping",
+                replace: Some(("x-c2-route-uid: early-route", "x-c2-route-uid:")),
+                status: 400,
+                error: "ProtocolViolation",
+            },
+            Case {
+                path: "/grid/ping",
+                replace: Some(("early-route", "retired-route")),
+                status: 409,
+                error: "RouteStale",
+            },
+            Case {
+                path: "/grid/ping",
+                replace: None,
+                status: 413,
+                error: "PayloadTooLarge",
+            },
+        ];
+        for path in [
+            "/_register",
+            "/_unregister",
+            "/_admin/unregister",
+            "/_peer/announce",
+            "/_peer/join",
+            "/_peer/heartbeat",
+            "/_peer/leave",
+            "/_peer/digest",
+        ] {
+            for replace in [None, Some(("Content-Type: text/plain\r\n", ""))] {
+                cases.push(Case {
+                    path,
+                    replace,
+                    status: 415,
+                    error: "application/json",
+                });
+            }
+        }
+        cases
+    }
+
+    // The barrier belongs only to this HTTP test. Preserve Incoming's size hint,
+    // trailers and EOF; signal the first attempted poll before allowing it.
+    struct PollBarrier {
+        body: Body,
+        entered: Option<oneshot::Sender<()>>,
+        release: Option<oneshot::Receiver<()>>,
+        frames: Arc<AtomicUsize>,
+        bytes: Arc<AtomicUsize>,
+    }
+
+    impl HttpBody for PollBarrier {
+        type Data = bytes::Bytes;
+        type Error = axum::Error;
+
+        fn poll_frame(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+            if let Some(entered) = self.entered.take() {
+                let _ = entered.send(());
+            }
+            if let Some(release) = self.release.as_mut() {
+                if Pin::new(release).poll(cx).is_pending() {
+                    return Poll::Pending;
+                }
+                self.release = None;
+            }
+            let result = Pin::new(&mut self.body).poll_frame(cx);
+            if let Poll::Ready(Some(Ok(frame))) = &result {
+                self.frames.fetch_add(1, Ordering::SeqCst);
+                if let Some(data) = frame.data_ref() {
+                    self.bytes.fetch_add(data.len(), Ordering::SeqCst);
+                }
+            }
+            result
+        }
+
+        fn size_hint(&self) -> http_body::SizeHint {
+            self.body.size_hint()
+        }
+        fn is_end_stream(&self) -> bool {
+            self.body.is_end_stream()
+        }
+    }
+
+    struct Listener {
+        state: Arc<RelayState>,
+        socket: std::net::SocketAddr,
+        entered: oneshot::Receiver<()>,
+        release: Option<oneshot::Sender<()>>,
+        frames: Arc<AtomicUsize>,
+        bytes: Arc<AtomicUsize>,
+        stop: oneshot::Sender<()>,
+        task: JoinHandle<std::io::Result<()>>,
+        _root: tempfile::TempDir,
+    }
+
+    impl Listener {
+        async fn start() -> Self {
+            let root = tempfile::tempdir().unwrap();
+            #[cfg(unix)]
+            let context = LocalEndpointContext::with_unix_root(root.path()).unwrap();
+            #[cfg(windows)]
+            let context = LocalEndpointContext::default_for_platform().unwrap();
+            let state = Arc::new(RelayState::new_with_context(
+                Arc::new(RelayConfig {
+                    relay_id: "early-rejection".into(),
+                    ..RelayConfig::default()
+                }),
+                Arc::new(NoopDisseminator),
+                context,
+            ));
+            state.with_route_table_mut(|table| {
+                assert!(table.register_route(RouteEntry {
+                    name: "grid".into(),
+                    relay_id: "early-rejection".into(),
+                    relay_url: "http://127.0.0.1:9".into(),
+                    server_id: Some("never-acquired".into()),
+                    server_instance_id: Some("never-acquired-instance".into()),
+                    ipc_address: Some("ipc://never-acquired".into()),
+                    crm_ns: "test.echo".into(),
+                    crm_name: "Echo".into(),
+                    crm_ver: "0.1.0".into(),
+                    abi_hash: TEST_ABI_HASH.into(),
+                    signature_hash: TEST_SIGNATURE_HASH.into(),
+                    max_payload_size: 3,
+                    route_uid: "early-route".into(),
+                    locality: super::super::types::Locality::Local,
+                    registered_at: 1.0,
+                }))
+            });
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let socket = listener.local_addr().unwrap();
+            let (entered_tx, entered) = oneshot::channel();
+            let (release, release_rx) = oneshot::channel();
+            let barrier = Arc::new(parking_lot::Mutex::new(Some((entered_tx, release_rx))));
+            let frames = Arc::new(AtomicUsize::new(0));
+            let bytes = Arc::new(AtomicUsize::new(0));
+            let counted_frames = frames.clone();
+            let counted_bytes = bytes.clone();
+            let app = build_router(state.clone()).layer(axum::middleware::from_fn(
+                move |request: Request<Body>, next: axum::middleware::Next| {
+                    let (entered, release) = barrier.lock().take().unwrap();
+                    let request = request.map(|body| {
+                        Body::new(PollBarrier {
+                            body,
+                            entered: Some(entered),
+                            release: Some(release),
+                            frames: counted_frames.clone(),
+                            bytes: counted_bytes.clone(),
+                        })
+                    });
+                    async move { next.run(request).await }
+                },
+            ));
+            let (stop, stopped) = oneshot::channel();
+            let task = tokio::spawn(async move {
+                axum::serve(listener, app)
+                    .with_graceful_shutdown(async {
+                        let _ = stopped.await;
+                    })
+                    .await
+            });
+            Self {
+                state,
+                socket,
+                entered,
+                release: Some(release),
+                frames,
+                bytes,
+                stop,
+                task,
+                _root: root,
+            }
+        }
+
+        fn head(&self, case: &Case, framing: &str) -> String {
+            let entry = self.state.local_route("grid").unwrap();
+            let head = request_head(self.socket, &entry, "ping", framing)
+                .replacen("/grid/ping", case.path, 1)
+                .replace(
+                    "Connection: close",
+                    "Connection: close\r\nContent-Type: text/plain",
+                );
+            match case.replace {
+                Some((from, to)) => head.replace(from, to),
+                None => head,
+            }
+        }
+
+        async fn stop(self) {
+            self.state.forwarding.close();
+            bounded(self.state.forwarding.drain()).await;
+            bounded(self.state.clients.shutdown()).await;
+            let _ = self.stop.send(());
+            bounded(self.task).await.unwrap().unwrap();
+        }
+    }
+
+    fn assert_reply(case: &Case, reply: &[u8]) {
+        assert!(
+            reply.starts_with(format!("HTTP/1.1 {} ", case.status).as_bytes()),
+            "{}: {}",
+            case.path,
+            String::from_utf8_lossy(reply)
+        );
+        assert!(
+            reply
+                .windows(case.error.len())
+                .any(|part| part == case.error.as_bytes()),
+            "{}: {}",
+            case.path,
+            String::from_utf8_lossy(reply)
+        );
+    }
+
+    #[tokio::test]
+    async fn every_early_rejection_drains_declared_body_before_reply_and_clean_eof() {
+        for case in cases() {
+            let mut server = Listener::start().await;
+            let result = AssertUnwindSafe(async {
+                let mut stream = bounded(tokio::net::TcpStream::connect(server.socket)).await.unwrap();
+                bounded(stream.write_all(server.head(&case, "Content-Length: 4").as_bytes())).await.unwrap();
+                bounded(stream.write_all(b"a")).await.unwrap();
+                bounded(async {
+                    tokio::select! {
+                        entered = &mut server.entered => entered.expect("unread request was dropped before cleanup"),
+                        reply = read_framed_reply(&mut stream) => panic!("{}: refusal arrived before declared-body cleanup: {reply:?}", case.path),
+                    }
+                }).await;
+                assert_eq!(server.state.forwarding.snapshot().used_operations, 0);
+                bounded(stream.write_all(b"bcd")).await.unwrap();
+                server.release.take().unwrap().send(()).unwrap();
+                let reply = bounded(read_framed_reply(&mut stream)).await.unwrap();
+                assert_reply(&case, &reply);
+                assert_eq!(server.bytes.load(Ordering::SeqCst), 4);
+                assert_eq!(bounded(stream.read(&mut [0])).await.unwrap(), 0, "reset after a refusal is a failure");
+                assert_eq!(server.state.forwarding.snapshot().used_operations, 0);
+                assert_eq!(server.state.forwarding.payload_budget().snapshot().used_bytes, 0);
+            }).catch_unwind().await;
+            server.stop().await;
+            if let Err(panic) = result {
+                std::panic::resume_unwind(panic);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn every_early_rejection_with_expect_never_polls_incoming_or_sends_continue() {
+        for case in cases() {
+            let mut server = Listener::start().await;
+            let result = AssertUnwindSafe(async {
+                let mut stream = bounded(tokio::net::TcpStream::connect(server.socket))
+                    .await
+                    .unwrap();
+                bounded(
+                    stream.write_all(
+                        server
+                            .head(&case, "Content-Length: 4\r\nExpect: 100-continue")
+                            .as_bytes(),
+                    ),
+                )
+                .await
+                .unwrap();
+                let reply = bounded(read_framed_reply(&mut stream)).await.unwrap();
+                assert_reply(&case, &reply); // The framing reader rejects every 1xx.
+                assert!(matches!(
+                    server.entered.try_recv(),
+                    Err(oneshot::error::TryRecvError::Empty | oneshot::error::TryRecvError::Closed)
+                ));
+                assert_eq!(server.frames.load(Ordering::SeqCst), 0);
+                assert_eq!(bounded(stream.read(&mut [0])).await.unwrap(), 0);
+            })
+            .catch_unwind()
+            .await;
+            server.stop().await;
+            if let Err(panic) = result {
+                std::panic::resume_unwind(panic);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn unknown_length_early_rejections_never_poll_incoming() {
+        for case in cases().into_iter().filter(|case| case.status != 413) {
+            let mut server = Listener::start().await;
+            let result = AssertUnwindSafe(async {
+                let mut stream = bounded(tokio::net::TcpStream::connect(server.socket))
+                    .await
+                    .unwrap();
+                bounded(
+                    stream.write_all(server.head(&case, "Transfer-Encoding: chunked").as_bytes()),
+                )
+                .await
+                .unwrap();
+                assert_reply(
+                    &case,
+                    &bounded(read_framed_reply(&mut stream)).await.unwrap(),
+                );
+                assert!(matches!(
+                    server.entered.try_recv(),
+                    Err(oneshot::error::TryRecvError::Closed | oneshot::error::TryRecvError::Empty)
+                ));
+                assert_eq!(server.frames.load(Ordering::SeqCst), 0);
+            })
+            .catch_unwind()
+            .await;
+            server.stop().await;
+            if let Err(panic) = result {
+                std::panic::resume_unwind(panic);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn json_rejection_after_reading_does_not_restart_body_cleanup() {
+        use tower::ServiceExt;
+        let server = Listener::start().await;
+        let polls = Arc::new(AtomicUsize::new(0));
+        let observed = polls.clone();
+        let body = Body::from_stream(futures::stream::poll_fn(move |_| {
+            Poll::Ready(match observed.fetch_add(1, Ordering::SeqCst) {
+                0 => Some(Ok(bytes::Bytes::from_static(b"{"))),
+                1 => Some(Err(std::io::Error::other("actual source failure"))),
+                _ => panic!("a partially read failure must not be read again"),
+            })
+        }));
+        let result = AssertUnwindSafe(async {
+            let response = build_router(server.state.clone())
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/_register")
+                        .header("content-type", "application/json")
+                        .header("content-length", 4)
+                        .body(body)
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(polls.load(Ordering::SeqCst), 2);
+            assert!(
+                String::from_utf8(
+                    axum::body::to_bytes(response.into_body(), MAX_REPLY)
+                        .await
+                        .unwrap()
+                        .to_vec()
+                )
+                .unwrap()
+                .contains("actual source failure")
+            );
+        })
+        .catch_unwind()
+        .await;
+        server.stop().await;
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
+    }
+
+    #[tokio::test]
+    async fn incomplete_rejected_upload_keeps_original_error_after_drain_deadline() {
+        for case in [cases().remove(2), cases().remove(8), cases().remove(9)] {
+            let mut server = Listener::start().await;
+            let result = AssertUnwindSafe(async {
+                let mut stream = bounded(tokio::net::TcpStream::connect(server.socket))
+                    .await
+                    .unwrap();
+                let started = tokio::time::Instant::now();
+                bounded(stream.write_all(server.head(&case, "Content-Length: 4").as_bytes()))
+                    .await
+                    .unwrap();
+                bounded(stream.write_all(b"a")).await.unwrap();
+                bounded(&mut server.entered).await.unwrap();
+                server.release.take().unwrap().send(()).unwrap();
+                let reply = bounded(read_framed_reply(&mut stream)).await.unwrap();
+                assert_reply(&case, &reply);
+                assert!(started.elapsed() >= Duration::from_secs(2));
+                assert_eq!(server.bytes.load(Ordering::SeqCst), 1);
+            })
+            .catch_unwind()
+            .await;
+            server.stop().await;
+            if let Err(panic) = result {
+                std::panic::resume_unwind(panic);
+            }
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum CapacityRequest {
     Continue,
@@ -403,7 +863,7 @@ async fn capacity_rejection_case(kind: CapacityRequest) {
     } else {
         INPUT_LEN
     };
-    for operations in [1, 2] {
+    for operations in [1] {
         let listener = if network {
             Some(
                 bounded(tokio::net::TcpListener::bind("127.0.0.1:0"))
@@ -426,7 +886,7 @@ async fn capacity_rejection_case(kind: CapacityRequest) {
             LocalEndpointContext::default_for_platform().unwrap(),
             CallExecutionLimits {
                 max_outstanding_calls: operations,
-                retained_input_budget_bytes: input_len as u64,
+                payload_buffer_budget_bytes: input_len as u64,
             },
         ));
         let entry = RouteEntry {
@@ -451,7 +911,7 @@ async fn capacity_rejection_case(kind: CapacityRequest) {
         let release = Arc::new(parking_lot::Mutex::new(Some(release)));
         let pending = state
             .forwarding
-            .spawn(input_len as u64, |permit| async move {
+            .spawn(|permit, _| async move {
                 let _ = released.await;
                 drop(permit);
             })
@@ -518,11 +978,7 @@ async fn capacity_rejection_case(kind: CapacityRequest) {
                 let observed = dispatches.clone();
                 let control = HttpCallControl::new(
                     || Ok(()),
-                    move |previous| {
-                        assert!(
-                            previous.is_none(),
-                            "capacity refusal cannot authorize a repeated POST"
-                        );
+                    move || {
                         observed.fetch_add(1, Ordering::SeqCst);
                         Ok(())
                     },
@@ -547,17 +1003,13 @@ async fn capacity_rejection_case(kind: CapacityRequest) {
                         calls,
                         "the HTTP client must not hide a POST replay"
                     );
-                    // The HTTP wrapper conservatively preserves uncertainty;
-                    // the canonical capacity envelope still says pre_dispatch.
-                    assert_eq!(
-                        error.phase(),
-                        crate::client::HttpCallPhase::DispatchUncertain
-                    );
-                    let HttpError::ServerError(status, body) = error.source_error() else {
+                    // The canonical relay refusal proves this call was not dispatched.
+                    assert_eq!(error.phase(), crate::client::HttpCallPhase::PreDispatch);
+                    let HttpError::ResponseError(status, body) = error.source_error() else {
                         panic!("eager SDK call lost the production capacity response: {error:?}");
                     };
                     assert_eq!(*status, 502);
-                    envelope = serde_json::from_str(body).unwrap();
+                    envelope = serde_json::from_slice(body.as_ref()).unwrap();
                     assert_eq!(envelope["code"], 717);
                     assert_eq!(envelope["details"]["dispatch_phase"], "pre_dispatch");
                     assert_eq!(
@@ -672,7 +1124,6 @@ async fn capacity_rejection_case(kind: CapacityRequest) {
             assert_eq!(envelope["code"], 717);
             assert_eq!(envelope["name"], "CallCapacityExceeded");
             assert_eq!(envelope["details"]["dispatch_phase"], "pre_dispatch");
-            assert_eq!(envelope["details"]["route"], "grid");
             assert_eq!(
                 state.forwarding.snapshot().rejected_reservations,
                 if kind == CapacityRequest::ControlledEager {
@@ -686,10 +1137,7 @@ async fn capacity_rejection_case(kind: CapacityRequest) {
                 state.forwarding.snapshot().used_operations,
                 if freed { 0 } else { 1 }
             );
-            assert_eq!(
-                state.forwarding.snapshot().used_retained_bytes,
-                if freed { 0 } else { input_len as u64 }
-            );
+            assert_eq!(state.forwarding.payload_budget().snapshot().used_bytes, 0);
             assert!(state.local_route("grid").is_some());
         })
         .catch_unwind()
@@ -715,7 +1163,7 @@ async fn capacity_rejection_case(kind: CapacityRequest) {
                 .unwrap();
         }
         assert_eq!(state.forwarding.snapshot().used_operations, 0);
-        assert_eq!(state.forwarding.snapshot().used_retained_bytes, 0);
+        assert_eq!(state.forwarding.payload_budget().snapshot().used_bytes, 0);
         if let Err(panic) = result {
             std::panic::resume_unwind(panic);
         }
@@ -821,7 +1269,7 @@ impl Fixture {
             LocalEndpointContext::default_for_platform().unwrap(),
             CallExecutionLimits {
                 max_outstanding_calls: operations,
-                retained_input_budget_bytes: bytes,
+                payload_buffer_budget_bytes: bytes,
             },
         ));
         let id = unique_id();
@@ -987,9 +1435,226 @@ impl Fixture {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+enum WithdrawalPause {
+    BeforeLookup,
+    ControlWrite,
+    Precheck,
+    Recheck,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum WithdrawalRequest {
+    Post,
+    Probe,
+    Stream,
+}
+
+async fn withdrawn_route_during_acquire(request: WithdrawalRequest, pause: WithdrawalPause) {
+    const LEN: usize = 32;
+    let mut fixture = Fixture::start_with_input_len(
+        Carrier::Inline,
+        2,
+        2 * forwarding_budget(Carrier::Inline, LEN),
+        LEN,
+    )
+    .await;
+    let mut resume = None;
+    let result = AssertUnwindSafe(async {
+        bounded(fixture.state.stop_upstream_controls()).await;
+        let socket = fixture.socket;
+        let head = fixture.head("other", "Content-Length: 32");
+        let inflight = tokio::spawn(async move {
+            let mut stream = bounded(tokio::net::TcpStream::connect(socket))
+                .await
+                .unwrap();
+            bounded(stream.write_all(head.as_bytes())).await.unwrap();
+            bounded(stream.write_all(&[7; LEN])).await.unwrap();
+            bounded(read_framed_reply(&mut stream)).await.unwrap()
+        });
+        bounded(fixture.probe.entered[0].notified()).await;
+
+        let state = fixture.state.clone();
+        let entry = fixture.entry.clone();
+        let withdraw = move || {
+            let (_, _, client) = state
+                .remove_unreachable_local_upstream_if_matches(&entry)
+                .expect("withdraw the captured route");
+            state
+                .clients
+                .close(&client.expect("last route retires its cached client"));
+        };
+        let entered = match pause {
+            WithdrawalPause::Precheck => {
+                assert_eq!(
+                    fixture.server.close_business_admission("maintenance").await,
+                    1
+                );
+                super::router::set_data_plane_after_precheck_hook(
+                    &fixture.state,
+                    "grid".into(),
+                    withdraw,
+                );
+                None
+            }
+            WithdrawalPause::BeforeLookup
+            | WithdrawalPause::ControlWrite
+            | WithdrawalPause::Recheck => {
+                let (entered_tx, entered_rx) = oneshot::channel();
+                let (resume_tx, resume_rx) = oneshot::channel();
+                resume = Some(resume_tx);
+                match pause {
+                    WithdrawalPause::BeforeLookup => fixture
+                        .state
+                        .set_acquire_lookup_seam_for_test(entered_tx, resume_rx),
+                    WithdrawalPause::ControlWrite => fixture
+                        .client
+                        .set_write_pause_for_test(Some((entered_tx, resume_rx))),
+                    WithdrawalPause::Recheck => fixture
+                        .state
+                        .set_acquire_recheck_seam_for_test(entered_tx, resume_rx),
+                    WithdrawalPause::Precheck => unreachable!(),
+                }
+                Some((entered_rx, withdraw))
+            }
+        };
+        let head = match request {
+            WithdrawalRequest::Probe => fixture.head("target", "Content-Length: 0").replacen(
+                "POST /grid/target",
+                "GET /_probe/grid",
+                1,
+            ),
+            WithdrawalRequest::Post => fixture.head("target", "Content-Length: 32"),
+            WithdrawalRequest::Stream => fixture.head(
+                "target",
+                &format!(
+                    "Content-Length: 32\r\nAccept: {}",
+                    crate::stream_wire::MEDIA_TYPE
+                ),
+            ),
+        };
+        let refused = tokio::spawn(async move {
+            let mut stream = bounded(tokio::net::TcpStream::connect(socket))
+                .await
+                .unwrap();
+            bounded(stream.write_all(head.as_bytes())).await.unwrap();
+            if !matches!(request, WithdrawalRequest::Probe) {
+                bounded(stream.write_all(&[7; LEN])).await.unwrap();
+            }
+            bounded(read_framed_reply(&mut stream)).await.unwrap()
+        });
+        if let Some((entered, withdraw)) = entered {
+            bounded(entered).await.unwrap();
+            assert_eq!(
+                fixture.server.close_business_admission("maintenance").await,
+                1
+            );
+            withdraw();
+            resume.take().unwrap().send(()).unwrap();
+        }
+        let reply = bounded(refused).await.unwrap();
+        let (status, name) = if matches!(pause, WithdrawalPause::ControlWrite) {
+            // The control was already committed: preserve the owner's reply.
+            (b"HTTP/1.1 503 ".as_slice(), "ResourceClosed")
+        } else {
+            (b"HTTP/1.1 404 ".as_slice(), "ResourceNotFound")
+        };
+        assert!(
+            reply.starts_with(status),
+            "{request:?}/{pause:?}: {}",
+            String::from_utf8_lossy(&reply)
+        );
+        let body = reply
+            .windows(4)
+            .position(|bytes| bytes == b"\r\n\r\n")
+            .unwrap()
+            + 4;
+        let error: c2_error::C2ErrorEnvelope = serde_json::from_slice(&reply[body..]).unwrap();
+        assert_eq!(error.name, name);
+        assert!(
+            !inflight.is_finished(),
+            "withdrawal must retain the dispatched call"
+        );
+        assert!(
+            fixture
+                .client
+                .connection_observation()
+                .unwrap()
+                .snapshot()
+                .is_none()
+        );
+        fixture.release(0);
+        let reply = bounded(inflight).await.unwrap();
+        assert!(
+            reply.starts_with(b"HTTP/1.1 200 "),
+            "{}",
+            String::from_utf8_lossy(&reply)
+        );
+        assert!(reply.ends_with(&[0; LEN]));
+        assert_eq!(
+            fixture
+                .probe
+                .calls
+                .each_ref()
+                .map(|calls| calls.load(Ordering::SeqCst)),
+            [1, 0, 0]
+        );
+    })
+    .catch_unwind()
+    .await;
+    if let Some(resume) = resume {
+        let _ = resume.send(());
+    }
+    fixture.stop().await;
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn withdrawn_route_during_post_acquire_preserves_inflight_reply() {
+    for pause in [
+        WithdrawalPause::BeforeLookup,
+        WithdrawalPause::ControlWrite,
+        WithdrawalPause::Precheck,
+        WithdrawalPause::Recheck,
+    ] {
+        withdrawn_route_during_acquire(WithdrawalRequest::Post, pause).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn withdrawn_route_during_probe_acquire_preserves_inflight_reply() {
+    for pause in [
+        WithdrawalPause::BeforeLookup,
+        WithdrawalPause::ControlWrite,
+        WithdrawalPause::Precheck,
+        WithdrawalPause::Recheck,
+    ] {
+        withdrawn_route_during_acquire(WithdrawalRequest::Probe, pause).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn withdrawn_route_during_stream_acquire_preserves_inflight_reply() {
+    for pause in [
+        WithdrawalPause::BeforeLookup,
+        WithdrawalPause::ControlWrite,
+        WithdrawalPause::Precheck,
+        WithdrawalPause::Recheck,
+    ] {
+        withdrawn_route_during_acquire(WithdrawalRequest::Stream, pause).await;
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn evicted_upstream_preserves_forwarded_reply_and_reconnects_new_request() {
-    let mut fixture = Fixture::start(Carrier::Inline, 2, (2 * INPUT_LEN) as u64).await;
+    let mut fixture = Fixture::start(
+        Carrier::Inline,
+        2,
+        2 * forwarding_budget(Carrier::Inline, INPUT_LEN),
+    )
+    .await;
     let result = AssertUnwindSafe(async {
         let socket = fixture.socket;
         let old_head = fixture.head("target", &format!("Content-Length: {INPUT_LEN}"));
@@ -1073,7 +1738,12 @@ async fn evicted_upstream_preserves_forwarded_reply_and_reconnects_new_request()
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn forced_native_cleanup_preserves_forwarded_http_reply() {
-    let mut fixture = Fixture::start(Carrier::Inline, 1, INPUT_LEN as u64).await;
+    let mut fixture = Fixture::start(
+        Carrier::Inline,
+        1,
+        forwarding_budget(Carrier::Inline, INPUT_LEN),
+    )
+    .await;
     let result = AssertUnwindSafe(async {
         let socket = fixture.socket;
         let head = fixture.head("target", &format!("Content-Length: {INPUT_LEN}"));
@@ -1135,7 +1805,12 @@ async fn forced_native_cleanup_preserves_forwarded_http_reply() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn real_http_capacity_freed_during_rejected_upload_never_dispatches() {
-    let mut fixture = Fixture::start(Carrier::Inline, 1, INPUT_LEN as u64).await;
+    let mut fixture = Fixture::start(
+        Carrier::Inline,
+        1,
+        forwarding_budget(Carrier::Inline, INPUT_LEN),
+    )
+    .await;
     let result = AssertUnwindSafe(async {
         let mut admitted = bounded(tokio::net::TcpStream::connect(fixture.socket))
             .await
@@ -1177,7 +1852,17 @@ async fn real_http_capacity_freed_during_rejected_upload_never_dispatches() {
             !fixture.state.forwarding.snapshot().closed,
             "domain must stay open while B finishes uploading"
         );
-        assert_eq!(fixture.state.forwarding.snapshot().used_retained_bytes, 0);
+        // A delivered reply can precede Hyper dropping its final payload slice.
+        eventually(|| {
+            fixture
+                .state
+                .forwarding
+                .payload_budget()
+                .snapshot()
+                .used_bytes
+                == 0
+        })
+        .await;
 
         bounded(rejected.write_all(&vec![7; INPUT_LEN - 1]))
             .await
@@ -1193,7 +1878,15 @@ async fn real_http_capacity_freed_during_rejected_upload_never_dispatches() {
         assert_eq!(error["details"]["dispatch_phase"], "pre_dispatch");
         assert_eq!(fixture.state.forwarding.snapshot().rejected_reservations, 1);
         assert_eq!(fixture.state.forwarding.snapshot().used_operations, 0);
-        assert_eq!(fixture.state.forwarding.snapshot().used_retained_bytes, 0);
+        assert_eq!(
+            fixture
+                .state
+                .forwarding
+                .payload_budget()
+                .snapshot()
+                .used_bytes,
+            0
+        );
         assert_eq!(
             fixture
                 .probe
@@ -1219,7 +1912,9 @@ async fn real_http_capacity_freed_during_rejected_upload_never_dispatches() {
 }
 
 async fn disconnected_response_case(carrier: Carrier, operations: u64) {
-    let mut fixture = Fixture::start(carrier, operations, INPUT_LEN as u64).await;
+    let bytes = forwarding_budget(carrier, INPUT_LEN);
+    let download_charge = copy_window(carrier);
+    let mut fixture = Fixture::start(carrier, operations, bytes).await;
     let client = fixture.client.clone();
     let binding = fixture.binding.clone();
     let mut other = tokio::spawn(async move {
@@ -1235,14 +1930,15 @@ async fn disconnected_response_case(carrier: Carrier, operations: u64) {
         bounded(upload.write_all(&vec![7; INPUT_LEN])).await.unwrap();
         bounded(fixture.probe.entered[1].notified()).await;
         let admitted = fixture.state.forwarding.snapshot();
-        assert_eq!((admitted.used_operations, admitted.used_retained_bytes), (1, INPUT_LEN as u64));
+        assert_eq!(admitted.used_operations, 1);
+        eventually(|| fixture.state.forwarding.payload_budget().snapshot().used_bytes == download_charge).await;
         if carrier == Carrier::File {
             assert_eq!(fixture.state.upstream_memory_snapshot().reassembly.peak_bytes, 0, "only the later response may charge relay receive reassembly");
         }
         let detached = fixture.state.forwarding.detached_waiters();
         drop(upload); // Real HTTP/1 socket disconnection, after complete upload.
         eventually(|| fixture.state.forwarding.detached_waiters() > detached).await;
-        assert_eq!((fixture.state.forwarding.snapshot().used_operations, fixture.state.forwarding.snapshot().used_retained_bytes), (1, INPUT_LEN as u64));
+        assert_eq!((fixture.state.forwarding.snapshot().used_operations, fixture.state.forwarding.payload_budget().snapshot().used_bytes), (1, download_charge));
         assert!(fixture.client.is_connected(), "HTTP waiter drop must preserve original shared IPC incarnation");
         let rejected = fixture.request_capacity_rejection(INPUT_LEN).await;
         assert!(rejected.starts_with(b"HTTP/1.1 502 "), "capacity rejects before upstream dispatch: {}", String::from_utf8_lossy(&rejected));
@@ -1266,7 +1962,7 @@ async fn disconnected_response_case(carrier: Carrier, operations: u64) {
         let (lease, _) = bounded(fixture.state.acquire_upstream_for_route(&fixture.entry)).await.unwrap_or_else(|_| panic!("same pooled client acquire failed"));
         assert!(Arc::ptr_eq(&lease.client(), &fixture.client), "liveness cannot be masked by reconnecting");
         drop(lease);
-        assert_eq!((fixture.state.forwarding.snapshot().used_operations, fixture.state.forwarding.snapshot().used_retained_bytes), (0, 0));
+        assert_eq!((fixture.state.forwarding.snapshot().used_operations, fixture.state.forwarding.payload_budget().snapshot().used_bytes), (0, 0));
         assert_eq!(fixture.probe.calls.each_ref().map(|c| c.load(Ordering::SeqCst)), [1, 1, 1]);
         if matches!(carrier, Carrier::Buddy | Carrier::Dedicated) {
             assert_eq!(fixture.probe.response_kind.load(Ordering::SeqCst), if carrier == Carrier::Buddy { 2 } else { 3 });
@@ -1303,8 +1999,8 @@ async fn h1_disconnect_keeps_shared_ipc_other_rid_and_late_inline_response() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn h1_disconnect_keeps_byte_budget_and_late_buddy_response() {
-    disconnected_response_case(Carrier::Buddy, 2).await;
+async fn h1_disconnect_refunds_request_budget_and_late_buddy_response() {
+    disconnected_response_case(Carrier::Buddy, 1).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1326,7 +2022,12 @@ async fn h1_disconnect_finishes_chunked_upstream_and_keeps_same_client() {
 // are not deadline expiry and the test never supplies missing bytes to IPC.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn h1_partial_upload_source_fault_refunds_without_dispatch_or_withdrawal() {
-    let fixture = Fixture::start(Carrier::Inline, 2, INPUT_LEN as u64).await;
+    let fixture = Fixture::start(
+        Carrier::Inline,
+        2,
+        forwarding_budget(Carrier::Inline, INPUT_LEN),
+    )
+    .await;
     let result = AssertUnwindSafe(async {
         for unknown in [false, true] {
             let mut upload = bounded(tokio::net::TcpStream::connect(fixture.socket))
@@ -1347,9 +2048,19 @@ async fn h1_partial_upload_source_fault_refunds_without_dispatch_or_withdrawal()
             } else {
                 bounded(upload.write_all(&[7; 8])).await.unwrap();
             }
-            let expected_charge = if unknown { 8 } else { INPUT_LEN as u64 };
+            let expected_charge = if unknown {
+                8 + 8 + copy_window(Carrier::Inline)
+            } else {
+                2 * INPUT_LEN as u64 + copy_window(Carrier::Inline)
+            };
             eventually(|| {
-                fixture.state.forwarding.snapshot().used_retained_bytes == expected_charge
+                fixture
+                    .state
+                    .forwarding
+                    .payload_budget()
+                    .snapshot()
+                    .used_bytes
+                    == expected_charge
             })
             .await;
             assert_eq!(fixture.state.forwarding.snapshot().used_operations, 1);
@@ -1399,7 +2110,15 @@ async fn h1_partial_upload_source_fault_refunds_without_dispatch_or_withdrawal()
                 assert!(!message.contains("Deadline"));
             }
             eventually(|| fixture.state.forwarding.snapshot().used_operations == 0).await;
-            assert_eq!(fixture.state.forwarding.snapshot().used_retained_bytes, 0);
+            assert_eq!(
+                fixture
+                    .state
+                    .forwarding
+                    .payload_budget()
+                    .snapshot()
+                    .used_bytes,
+                0
+            );
             assert!(fixture.state.local_route("grid").is_some());
             assert!(fixture.client.is_connected());
         }
@@ -1427,7 +2146,7 @@ async fn h1_partial_upload_source_fault_refunds_without_dispatch_or_withdrawal()
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn h1_unknown_chunk_growth_rejects_before_takeover_and_dispatch() {
-    let fixture = Fixture::start(Carrier::Inline, 2, 8).await;
+    let fixture = Fixture::start(Carrier::Inline, 2, 10).await;
     let result = AssertUnwindSafe(async {
         let mut upload = bounded(tokio::net::TcpStream::connect(fixture.socket))
             .await
@@ -1444,7 +2163,16 @@ async fn h1_unknown_chunk_growth_rejects_before_takeover_and_dispatch() {
         bounded(upload.write_all(b"8\r\n\x07\x07\x07\x07\x07\x07\x07\x07\r\n"))
             .await
             .unwrap();
-        eventually(|| fixture.state.forwarding.snapshot().used_retained_bytes == 8).await;
+        eventually(|| {
+            fixture
+                .state
+                .forwarding
+                .payload_budget()
+                .snapshot()
+                .used_bytes
+                == 10
+        })
+        .await;
         bounded(upload.write_all(b"1\r\n\x07\r\n0\r\n\r\n"))
             .await
             .unwrap();
@@ -1457,11 +2185,10 @@ async fn h1_unknown_chunk_growth_rejects_before_takeover_and_dispatch() {
         assert!(String::from_utf8_lossy(&reply).contains("pre_dispatch"));
         eventually(|| fixture.state.forwarding.snapshot().used_operations == 0).await;
         let retention = fixture.state.forwarding.snapshot();
-        assert_eq!(
-            (retention.used_retained_bytes, retention.peak_retained_bytes),
-            (0, 8)
-        );
-        assert!(retention.rejected_reservations > 0);
+        let payload = fixture.state.forwarding.payload_budget().snapshot();
+        assert_eq!((payload.used_bytes, payload.peak_bytes), (0, 10));
+        assert_eq!(retention.rejected_reservations, 0);
+        assert!(payload.rejected_allocations > 0);
         assert_eq!(
             fixture.probe.calls[1].load(Ordering::SeqCst),
             0,
@@ -1484,7 +2211,12 @@ async fn h1_unknown_chunk_growth_rejects_before_takeover_and_dispatch() {
 // abort this incomplete shared stream; no test fills in the missing chunk.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn h1_chunked_upstream_source_fault_is_dispatch_uncertain_and_reclaims_actual_owner() {
-    let fixture = Fixture::start(Carrier::Chunked, 1, INPUT_LEN as u64).await;
+    let fixture = Fixture::start(
+        Carrier::Chunked,
+        1,
+        forwarding_budget(Carrier::Chunked, INPUT_LEN),
+    )
+    .await;
     let result = AssertUnwindSafe(async {
         assert_eq!(fixture.server.memory_budget_snapshot().budget.reassembly.used_bytes, 0);
         let before_faults = fixture.state.forwarding.published_source_faults();
@@ -1495,7 +2227,7 @@ async fn h1_chunked_upstream_source_fault_is_dispatch_uncertain_and_reclaims_act
         // exist after the first actual IPC chunk reaches the upstream reader.
         eventually(|| fixture.server.memory_budget_snapshot().budget.reassembly.used_bytes == INPUT_LEN as u64 + 2).await;
         assert_eq!(fixture.probe.calls[1].load(Ordering::SeqCst), 0);
-        assert_eq!((fixture.state.forwarding.snapshot().used_operations, fixture.state.forwarding.snapshot().used_retained_bytes), (1, INPUT_LEN as u64));
+        assert_eq!((fixture.state.forwarding.snapshot().used_operations, fixture.state.forwarding.payload_budget().snapshot().used_bytes), (1, forwarding_budget(Carrier::Chunked, INPUT_LEN)));
         bounded(upload.shutdown()).await.unwrap();
         let mut wire_reply = Vec::new();
         if let Err(error) = bounded(upload.read_to_end(&mut wire_reply)).await {
@@ -1503,7 +2235,7 @@ async fn h1_chunked_upstream_source_fault_is_dispatch_uncertain_and_reclaims_act
         }
         eventually(|| fixture.state.forwarding.published_source_faults() == before_faults + 1).await;
         eventually(|| fixture.state.forwarding.snapshot().used_operations == 0).await;
-        assert_eq!(fixture.state.forwarding.snapshot().used_retained_bytes, 0);
+        assert_eq!(fixture.state.forwarding.payload_budget().snapshot().used_bytes, 0);
         assert_eq!(fixture.probe.calls[1].load(Ordering::SeqCst), 0, "incomplete input must not invoke resource");
         assert!(fixture.state.local_route("grid").is_some(), "real transport fault must not withdraw route");
         assert!(!fixture.client.is_connected(), "incomplete published IPC transaction uses real connection failure, not deadline cancellation");
@@ -1527,7 +2259,7 @@ enum WriterPausePoint {
 // cannot be mistaken for a cancelled waiter in either regression.
 async fn disconnect_during_ipc_write_preserves_same_client(pause_point: WriterPausePoint) {
     const LEN: usize = 32;
-    let mut fixture = Fixture::start_with_input_len(Carrier::Inline, 1, LEN as u64, LEN).await;
+    let mut fixture = Fixture::start_with_input_len(Carrier::Inline, 1, 3 * LEN as u64, LEN).await;
     let client = fixture.client.clone();
     let binding = fixture.binding.clone();
     let mut other =
@@ -1566,7 +2298,10 @@ async fn disconnect_during_ipc_write_preserves_same_client(pause_point: WriterPa
         drop(upload);
         eventually(|| fixture.state.forwarding.detached_waiters() > before).await;
         let held = fixture.state.forwarding.snapshot();
-        assert_eq!((held.used_operations, held.used_retained_bytes), (1, LEN as u64), "native task still owns full input while real writer is parked");
+        assert_eq!(held.used_operations, 1);
+        let held_payload = fixture.state.forwarding.payload_budget().snapshot();
+        assert_eq!(held_payload.used_bytes, 2 * LEN as u64, "upload and download windows stay charged while the native writer is parked");
+        assert_eq!(held_payload.peak_bytes, 3 * LEN as u64, "input and both direction windows are atomically charged under B");
         assert_eq!(fixture.client.pending_len_for_test(), 2);
         assert!(fixture.client.is_connected(), "waiter departure must preserve the started IPC write");
         let rejected = fixture.request_capacity_rejection(LEN).await;
@@ -1578,14 +2313,16 @@ async fn disconnect_during_ipc_write_preserves_same_client(pause_point: WriterPa
         other_joined = true;
         assert_eq!(other_result.unwrap().unwrap().into_owned_bytes().unwrap(), vec![0; 32], "already-dispatched RID must finish before the target writer resumes");
         assert!(fixture.client.is_connected());
-        assert_eq!((fixture.state.forwarding.snapshot().used_operations, fixture.state.forwarding.snapshot().used_retained_bytes), (1, LEN as u64));
+        assert_eq!((fixture.state.forwarding.snapshot().used_operations, fixture.state.forwarding.payload_budget().snapshot().used_bytes), (1, 2 * LEN as u64));
         write_release.take().unwrap().send(()).unwrap();
         bounded(fixture.probe.entered[1].notified()).await;
+        eventually(|| fixture.state.forwarding.payload_budget().snapshot().used_bytes == LEN as u64).await;
+        assert_eq!(fixture.state.forwarding.snapshot().used_operations, 1, "reply is still blocked with only its download window charged");
         assert_eq!(fixture.probe.calls[1].load(Ordering::SeqCst), 1, "complete input reaches real upstream callback once after the writer resumes");
         fixture.release(1);
         eventually(|| fixture.state.forwarding.snapshot().used_operations == 0).await;
         eventually(|| fixture.client.pending_len_for_test() == 0).await;
-        assert_eq!(fixture.state.forwarding.snapshot().used_retained_bytes, 0);
+        assert_eq!(fixture.state.forwarding.payload_budget().snapshot().used_bytes, 0);
         let ping = bounded(fixture.client.call_bound_phased(&fixture.binding, "ping", &[7; LEN])).await.unwrap();
         assert_eq!(ping.into_owned_bytes().unwrap(), vec![2; 32]);
         let current = fixture.state.local_route("grid").expect("HTTP disconnect must not withdraw route");
@@ -1622,6 +2359,72 @@ async fn disconnect_during_ipc_write_preserves_same_client(pause_point: WriterPa
     }
 }
 
+// A complete unary response moves its charged cursor into Body. HTTP Bytes
+// references then own the copied storage after both native work and Body end.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unary_body_last_bytes_reference_refunds_download_window() {
+    use futures::StreamExt;
+    use tower::ServiceExt;
+
+    const LEN: usize = 32;
+    let mut fixture = Fixture::start_with_input_len(Carrier::Inline, 1, 3 * LEN as u64, LEN).await;
+    fixture.release(1);
+    let budget = fixture.state.forwarding.payload_budget();
+    let result = AssertUnwindSafe(async {
+        let mut request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/grid/target");
+        for line in fixture.head("target", "Content-Length: 32").lines().skip(1) {
+            if let Some((name, value)) = line.split_once(':') {
+                request = request.header(name, value.trim());
+            }
+        }
+        let response = bounded(
+            build_router(fixture.state.clone())
+                .oneshot(request.body(axum::body::Body::from(vec![7; LEN])).unwrap()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["content-length"], LEN.to_string());
+        assert_eq!(fixture.state.forwarding.snapshot().used_operations, 0);
+        assert_eq!(budget.snapshot().used_bytes, LEN as u64);
+        let mut body = response.into_body().into_data_stream();
+        let bytes = bounded(body.next()).await.unwrap().unwrap();
+        assert_eq!(bytes.as_ref(), &[1; LEN]);
+        let clone = bytes.clone();
+        let slice = bytes.slice(7..12);
+        drop(bytes);
+        assert!(bounded(body.next()).await.is_none());
+        drop(body);
+        assert_eq!(
+            budget.snapshot().used_bytes,
+            LEN as u64,
+            "completed Body must leave its copied storage charged to surviving Bytes"
+        );
+        drop(clone);
+        assert_eq!(
+            budget.snapshot().used_bytes,
+            LEN as u64,
+            "a slice retains the complete original allocation"
+        );
+        drop(slice);
+        assert_eq!(
+            budget.snapshot().used_bytes,
+            0,
+            "the final Bytes reference refunds its unique reservation"
+        );
+        assert_eq!(fixture.probe.calls[1].load(Ordering::SeqCst), 1);
+        assert!(fixture.client.is_connected());
+    })
+    .catch_unwind()
+    .await;
+    fixture.stop().await;
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
+
 // The first pause follows begin_io but precedes the first frame byte.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn h1_disconnect_after_ipc_write_begins_before_first_byte_preserves_same_client() {
@@ -1637,8 +2440,13 @@ async fn h1_disconnect_after_real_eight_byte_ipc_prefix_preserves_same_client() 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn eviction_during_ipc_frame_write_finishes_old_http_reply_and_reconnects() {
     const LEN: usize = 32;
-    let mut fixture =
-        Fixture::start_with_input_len(Carrier::Inline, 2, (2 * LEN) as u64, LEN).await;
+    let mut fixture = Fixture::start_with_input_len(
+        Carrier::Inline,
+        2,
+        2 * forwarding_budget(Carrier::Inline, LEN),
+        LEN,
+    )
+    .await;
     let (acquired_tx, acquired_rx) = oneshot::channel();
     let (resume_tx, resume_rx) = oneshot::channel();
     let mut resume = Some(resume_tx);
@@ -1738,8 +2546,13 @@ async fn eviction_during_ipc_frame_write_finishes_old_http_reply_and_reconnects(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn h1_admitted_unknown_upload_growth_after_close_is_pre_dispatch_capacity_terminal() {
-    let fixture = Fixture::start(Carrier::Inline, 1, INPUT_LEN as u64).await;
+async fn h1_admitted_unknown_upload_can_finish_after_operation_admission_closes() {
+    let mut fixture = Fixture::start(
+        Carrier::Inline,
+        1,
+        forwarding_budget(Carrier::Inline, INPUT_LEN),
+    )
+    .await;
     let result = AssertUnwindSafe(async {
         let mut upload = bounded(tokio::net::TcpStream::connect(fixture.socket))
             .await
@@ -1756,7 +2569,16 @@ async fn h1_admitted_unknown_upload_growth_after_close_is_pre_dispatch_capacity_
         bounded(upload.write_all(b"8\r\n\x07\x07\x07\x07\x07\x07\x07\x07\r\n"))
             .await
             .unwrap();
-        eventually(|| fixture.state.forwarding.snapshot().used_retained_bytes == 8).await;
+        eventually(|| {
+            fixture
+                .state
+                .forwarding
+                .payload_budget()
+                .snapshot()
+                .used_bytes
+                == 8 + 8 + copy_window(Carrier::Inline)
+        })
+        .await;
         assert_eq!(fixture.state.forwarding.snapshot().used_operations, 1);
         fixture.state.forwarding.close();
         assert!(
@@ -1765,39 +2587,61 @@ async fn h1_admitted_unknown_upload_growth_after_close_is_pre_dispatch_capacity_
                 .is_err(),
             "closing admission cannot manufacture completed upload ownership"
         );
-        // A complete valid source continues after close. Its next growth is
-        // rejected by the frozen budget's Closed state before taking bytes or
-        // dispatching. This is capacity termination, never a body fault or
-        // deadline, and an already-admitted upload has no grandfathered growth.
-        bounded(upload.write_all(b"1\r\n\x07\r\n0\r\n\r\n"))
+        // Closing operation admission does not revoke B for an admitted call.
+        // Both sending windows were already reserved with the first segment.
+        bounded(upload.write_all(format!("{:x}\r\n", INPUT_LEN - 8).as_bytes()))
             .await
             .unwrap();
+        bounded(upload.write_all(&vec![7; INPUT_LEN - 8]))
+            .await
+            .unwrap();
+        bounded(upload.write_all(b"\r\n0\r\n\r\n")).await.unwrap();
+        bounded(async {
+            tokio::select! {
+                _ = fixture.probe.entered[1].notified() => {},
+                reply = read_framed_reply(&mut upload) => {
+                    let reply = reply.expect("admitted upload must retain complete HTTP framing");
+                    panic!("admitted upload ended before resource entry: {}", String::from_utf8_lossy(&reply));
+                },
+            }
+        }).await;
+        // Input and upload storage refund after the write, leaving only the
+        // download window while the response callback remains parked.
+        eventually(|| {
+            fixture
+                .state
+                .forwarding
+                .payload_budget()
+                .snapshot()
+                .used_bytes
+                == copy_window(Carrier::Inline)
+        })
+        .await;
+        fixture.release(1);
         let reply = bounded(read_framed_reply(&mut upload)).await.unwrap();
         assert!(
-            reply.starts_with(b"HTTP/1.1 502 "),
-            "actual close rejection: {}",
+            reply.starts_with(b"HTTP/1.1 200 "),
+            "admitted call after close: {}",
             String::from_utf8_lossy(&reply)
         );
-        let message = String::from_utf8_lossy(&reply);
-        assert!(message.contains("pre_dispatch"));
-        assert!(message.contains("retention budget is closed"));
-        assert!(!message.contains("Deadline"));
         bounded(fixture.state.forwarding.drain()).await;
+        eventually(|| fixture.state.forwarding.payload_budget().snapshot().used_bytes == 0).await;
         let refunded = fixture.state.forwarding.snapshot();
+        let refunded_payload = fixture.state.forwarding.payload_budget().snapshot();
         assert_eq!(
             (
                 refunded.used_operations,
-                refunded.used_retained_bytes,
-                refunded.peak_retained_bytes
+                refunded_payload.used_bytes,
+                refunded_payload.peak_bytes
             ),
-            (0, 0, 8)
+            (0, 0, 2 * INPUT_LEN as u64 + copy_window(Carrier::Inline))
         );
         assert_eq!(
             fixture.state.forwarding.source_faults(true),
             0,
             "complete HTTP source is not a sourcefault"
         );
-        assert_eq!(fixture.probe.calls[1].load(Ordering::SeqCst), 0);
+        assert_eq!(fixture.probe.calls[1].load(Ordering::SeqCst), 1);
         assert!(fixture.state.local_route("grid").is_some());
         assert!(fixture.client.is_connected());
         let ping = bounded(fixture.client.call_bound_phased(

@@ -6,7 +6,7 @@ This guide owns shared macOS/Unix and Windows development test preparation, exec
 
 ## Tools and platform preparation
 
-Use an installed Python 3.12 interpreter, uv, Git and a Rust 1.95 or newer toolchain for the target. Windows builds need an MSVC Developer PowerShell (or the environment from `vcvars64.bat`); macOS builds need the Xcode command-line tools. Repository installer checks also require PowerShell (`pwsh` on macOS/Unix, or Windows PowerShell). The official FastDB SDK preparation script chooses a published host target and checks pinned manifests and archives. An unsupported host target fails with its available-target list.
+Use an installed Python 3.12 interpreter, uv, Git and a Rust 1.95 or newer toolchain for the target. The full Python suite also requires `hey` v0.1.4 on PATH (`go install github.com/rakyll/hey@v0.1.4`). Windows builds need an MSVC Developer PowerShell (or the environment from `vcvars64.bat`); macOS builds need the Xcode command-line tools. Repository installer checks also require PowerShell (`pwsh` on macOS/Unix, or Windows PowerShell). The official FastDB SDK preparation script chooses a published host target and checks pinned manifests and archives. An unsupported host target fails with its available-target list.
 
 The Windows commands below show x64 tools. For ARM64, follow the [native Windows prerequisites](windows-native-usage.md): use ARM64 Python, Rust, MSVC and Node. The x64 Emscripten build tool does not substitute for native ARM64 test consumers.
 
@@ -38,13 +38,13 @@ macOS/Unix uses the same actions and flags with Unix paths and `.venv/bin/python
   --output /absolute/new/evidence --workers 2
 ```
 
-The existing command requires the CoreSDK environment and prebuilt TypeScript inputs, as before. It does not perform installation. The shared sidecar defaults to one worker; `--workers 2` or `4` parallelizes ordinary Python files only. Portable and TypeScript matrices always run serially.
+The existing command requires the CoreSDK environment and prebuilt TypeScript inputs, as before. It does not perform installation. The shared sidecar defaults to one worker; `--workers 2` or `4` parallelizes ordinary Python files only. Portable and TypeScript matrices always run serially. `--ordinary-only` keeps the full collection and partition checks but runs only the ordinary group and writes no matrix receipts; CI uses it for the Python 3.10 run.
 
 ## Suites and evidence
 
 Available suites are `core`, `cli`, `rust-sdk`, `native`, `node`, `repo`, `python`, `typescript` and `all`. `all` runs the four Rust suites, Node bindings, repository checks, and the complete Python SDK including both portable and TypeScript matrices. The focused `typescript` suite still validates exact execution and its development receipt. c3 defaults to the source debug binary; `--c3` selects an explicit prebuilt binary.
 
-`check.json` records tool paths, versions, capabilities and missing prerequisites. `run.json` and each `step.json` record commands, source provenance, link modes, finite timeouts, cleanup status and suite outcomes. Cargo summaries, Node TAP summaries and repository JUnit counts are checked. Python keeps its collected-nodeid partition, exactly-once execution, platform skips only through the `platform` marker, package/native hashes and matrix receipt validation. Missing dependencies, unknown skips, filtered tests, crashes, failed builds and unconfirmed cleanup fail validation. The two Rust HTTP child entrypoints marked ignored are invoked by their parent tests and are explicitly identified in the local report policy.
+`check.json` records tool paths, versions, capabilities and missing prerequisites. `run.json` and each `step.json` record commands, source provenance, link modes, finite timeouts, cleanup status and suite outcomes. Cargo summaries, Node TAP summaries and repository JUnit counts are checked. Python keeps its collected-nodeid partition, exactly-once execution, platform skips only through the `platform` marker, package/native hashes and matrix receipt validation. Missing dependencies, unknown skips, filtered tests, crashes, failed builds and unconfirmed cleanup fail validation. Two ignored Rust HTTP child entrypoints are invoked by their parent tests, and the ignored relay slow-reader measurement runs only on demand, see the [development guide](development.md#relay-slow-reader-measurement); all three are named in the local report policy.
 
 Repository tests that validate official FastDB release archives need `--release-fixtures`; `prepare --suite repo` or `all` retains the four pinned official target archives. Missing fixture files do not become allowed platform skips. The original synthetic CI SDK tests continue to run independently of these archives. The local skip policy names specific platform tests and reasons; it does not accept arbitrary skips with a matching reason.
 

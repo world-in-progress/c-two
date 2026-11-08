@@ -1,0 +1,84 @@
+{
+  "crm": {
+    "name": "Portable",
+    "namespace": "test.contract-release",
+    "version": "0.1.0"
+  },
+  "fingerprints": {
+    "abi_hash": "fcf19b34cf97fd4279f366d2982657d60ee39efe9f83d33a06a3d66ca0b2e48d",
+    "signature_hash": "d20cdd44be43e72ab1f657fa31244172eda8fa2cb33c0e5cc7d76f74b97e7de0"
+  },
+  "methods": [
+    {
+      "access": "read",
+      "bindings": {
+        "input": null,
+        "output": null
+      },
+      "name": "ping",
+      "parameters": [],
+      "return": {
+        "kind": "none"
+      }
+    },
+    {
+      "access": "write",
+      "bindings": {
+        "input": {
+          "kind": "fastdb",
+          "spec": {
+            "components": [],
+            "entries": [
+              {
+                "cardinality": "one",
+                "id": "value",
+                "type": {
+                  "kind": "str",
+                  "nullable": true
+                }
+              }
+            ],
+            "profile": "record.v1",
+            "schema": "fastdb.payload.v1"
+          }
+        },
+        "output": {
+          "kind": "fastdb",
+          "spec": {
+            "components": [],
+            "entries": [
+              {
+                "cardinality": "one",
+                "id": "value",
+                "type": {
+                  "kind": "str",
+                  "nullable": true
+                }
+              }
+            ],
+            "profile": "record.v1",
+            "schema": "fastdb.payload.v1"
+          }
+        }
+      },
+      "mode": "server_stream",
+      "name": "echo",
+      "parameters": [
+        {
+          "default": {
+            "kind": "missing"
+          },
+          "kind": "POSITIONAL_OR_KEYWORD",
+          "name": "payload",
+          "type": {
+            "kind": "payload"
+          }
+        }
+      ],
+      "return": {
+        "kind": "payload"
+      }
+    }
+  ],
+  "schema": "c-two.contract.v2"
+}

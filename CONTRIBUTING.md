@@ -4,7 +4,7 @@ Thanks for your interest in contributing! C-Two is a resource-oriented RPC frame
 
 ## Dev Setup
 
-**Prerequisites:** Python ≥ 3.10, Rust ≥ 1.95, [uv](https://docs.astral.sh/uv/) package manager.
+**Prerequisites:** Python ≥ 3.10, Rust ≥ 1.95, [uv](https://docs.astral.sh/uv/) package manager. The full Python suite also requires `hey` v0.1.4 on PATH (`go install github.com/rakyll/hey@v0.1.4`).
 
 ```bash
 git clone https://github.com/world-in-progress/c-two.git
@@ -35,7 +35,7 @@ C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests/ -q --timeout=30
 
 # Single file / single test
 uv run pytest sdk/python/tests/unit/test_wire.py -q
-uv run pytest sdk/python/tests/unit/test_transferable.py::TestTransferableDecorator::test_hello_data_round_trip -q
+uv run pytest sdk/python/tests/unit/test_held_result.py::TestHeldResultBasic::test_access_value -q
 
 # Rust core tests
 cargo test --manifest-path core/Cargo.toml --workspace
@@ -45,8 +45,7 @@ uv sync --reinstall-package c-two
 C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests -q --timeout=30
 ```
 
-For local Unix validation with two Python workers, prepare the native extension,
-`c3`, Node 22, the pinned FastDB CoreSDK and TypeScript build inputs first, then use:
+For local Unix validation with two Python workers, prepare the native extension, `c3`, Node 22 with Node-API 10 or newer, the pinned FastDB CoreSDK and TypeScript build inputs first, then use:
 
 ```bash
 .venv/bin/python tools/dev/test_python.py --python .venv/bin/python \
@@ -85,12 +84,12 @@ refactor: simplify MethodTable index lookup
 - **Type hints required** — use modern syntax (`list[int]`, `str | None`). No `from __future__` needed (Python ≥ 3.10).
 - **CRM contracts:** plain class names, **no `I` prefix** (`Grid`, not `IGrid`). Method bodies are `...` (ellipsis).
 - **Resource classes:** named by domain semantics (`NestedGrid`), not by the contract.
-- **Transferable types:** do **not** add `@staticmethod` to `serialize`/`deserialize`/`from_buffer` — the metaclass handles it.
+- **Portable methods:** declare FastDB payloads with `@cc.transfer(input=..., output=...)`; FastDB Core owns the payload format.
 - Follow existing formatting conventions in the file you're editing.
 
 ### Rust
 
-- Code lives in `core/` (a Cargo workspace of 7 crates).
+- Code lives in `core/` (a Cargo workspace).
 - Run `cargo test --manifest-path core/Cargo.toml --workspace` before submitting core changes.
 - The Python SDK native extension lives in `sdk/python/native/`; rebuild it with `uv sync --reinstall-package c-two` before submitting Python SDK native changes.
 - Prefer zero-copy and single-allocation patterns in wire/transport code.
@@ -101,11 +100,12 @@ refactor: simplify MethodTable index lookup
 core/
 ├── foundation/
 ├── protocol/
-└── transport/
+├── transport/
+└── runtime/
 cli/
 └── src/          # Native c3 CLI
 sdk/python/src/c_two/
-├── crm/          # CRM contracts, @transferable, decorators
+├── crm/          # CRM contracts, @transfer, decorators
 ├── transport/    # Registry, proxy, server bridge, scheduler
 ├── config/       # Python override facades backed by Rust config resolution
 └── mem/          # Python wrappers for Rust memory subsystem

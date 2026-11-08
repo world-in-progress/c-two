@@ -1,5 +1,4 @@
 mod admission;
-mod chunk_ordering;
 pub mod config;
 pub mod connection;
 mod dispatcher;
@@ -16,12 +15,13 @@ pub use c2_local::{
 pub use config::ServerIpcConfig;
 pub use connection::Connection;
 pub use dispatcher::{
-    BuiltRoute, CrmCallback, CrmError, PreparedShmResponse, ResponseMeta, RouteBuildSpec,
+    BuiltRoute, CrmCallback, CrmError, CrmStream, CrmStreamCallback, CrmStreamItem,
+    PreparedShmResponse, ResponseMeta, RouteBuildSpec,
 };
 pub use runtime::{ServerRuntimeBuilder, ServerRuntimeOptions};
 pub use scheduler::{
-    AccessLevel, ConcurrencyMode, RouteConcurrencyHandle, SchedulerAcquireError, SchedulerGuard,
-    SchedulerLimits, SchedulerSnapshot,
+    AccessLevel, ConcurrencyMode, LocalStreamCall, LocalStreamCancellation, RouteConcurrencyHandle,
+    SchedulerAcquireError, SchedulerGuard, SchedulerLimits, SchedulerSnapshot, StreamCancelCause,
 };
 pub use server::{
     DIRECT_IPC_SHUTDOWN_REASON, Server, ServerError, ServerFailure, ServerIdentity,

@@ -11,12 +11,13 @@ use crate::buddy_segment::BuddySegment;
 use crate::budget::{BudgetError, BudgetKind, BudgetReservation, MemoryBudget};
 use crate::config::{PoolAllocation, PoolConfig, PoolStats};
 use crate::dedicated::DedicatedSegment;
-use crate::handle::{HandleBacking, MemHandle, PoolIncarnation};
+use crate::handle::{HandleBacking, MemHandle, OwnedAllocation, OwnedBacking, PoolIncarnation};
 use crate::pressure::{PressureDecision, PressureEngine};
 use crate::spill;
 use base64::Engine;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Backing-creation failure at a policy-enforced seam.
@@ -52,7 +53,7 @@ struct TierCounters {
 }
 
 struct DedicatedEntry {
-    segment: DedicatedSegment,
+    segment: Arc<DedicatedSegment>,
     generation: u32,
 }
 
@@ -62,7 +63,7 @@ struct DedicatedEntry {
 pub struct MemPool {
     config: PoolConfig,
     /// Buddy-managed segments.
-    segments: Vec<Option<BuddySegment>>,
+    segments: Vec<Option<Arc<BuddySegment>>>,
     /// Never truncated when an owner slot is reclaimed.
     generations: Vec<u32>,
     is_peer: bool,
@@ -73,9 +74,6 @@ pub struct MemPool {
     incarnation: PoolIncarnation,
     /// Dedicated slot generations persist across local release and slot reuse.
     dedicated_generations: Vec<u32>,
-    /// When each buddy segment became fully idle (alloc_count == 0).
-    /// None means the segment has active allocations.
-    idle_since: Vec<Option<Instant>>,
     /// A stopped owner keeps pool identity, but no longer caches empty backing.
     retain_idle_backing: bool,
     /// Owner-creation budget context. Owner pools always carry one (shared or
@@ -180,7 +178,6 @@ impl MemPool {
             name_prefix,
             incarnation: PoolIncarnation::new(),
             dedicated_generations: Vec::new(),
-            idle_since: Vec::new(),
             retain_idle_backing: true,
             budget,
             pressure,
@@ -341,14 +338,24 @@ impl MemPool {
                 .dedicated
                 .get(&alloc.seg_idx)
                 .ok_or("invalid dedicated segment index")?;
-            Ok(entry.segment.data_ptr())
+            let mapping = entry
+                .segment
+                .try_pin()
+                .ok_or("stale or unavailable shared-memory backing generation")?;
+            Ok(mapping.region.base_ptr())
         } else {
             let seg = self
                 .segments
                 .get(alloc.seg_idx as usize)
                 .and_then(Option::as_ref)
                 .ok_or("invalid segment index")?;
-            Ok(seg.base_ptr().wrapping_add(alloc.offset as usize))
+            let mapping = seg
+                .try_pin()
+                .ok_or("stale or unavailable shared-memory backing generation")?;
+            Ok(mapping
+                .region
+                .base_ptr()
+                .wrapping_add(alloc.offset as usize))
         }
     }
 
@@ -357,7 +364,7 @@ impl MemPool {
         let mut buddy_data = 0u64;
         let mut buddy_idle = 0u64;
         let mut alloc_count = 0u32;
-        for segment in self.segments.iter().flatten() {
+        for segment in self.segments.iter().flatten().filter(|s| s.is_mapped()) {
             buddy_data += segment.size() as u64;
             buddy_idle += segment.allocator().free_bytes();
             alloc_count += segment.allocator().alloc_count();
@@ -365,14 +372,19 @@ impl MemPool {
         let dedicated_mapped: u64 = self
             .dedicated
             .values()
+            .filter(|e| e.segment.is_mapped())
             .map(|e| e.segment.size() as u64)
             .sum();
-        let dedicated_active_count = self.dedicated.len();
+        let dedicated_active_count = self
+            .dedicated
+            .values()
+            .filter(|e| e.segment.is_mapped())
+            .count();
         alloc_count += dedicated_active_count as u32;
         let buddy_occupied = buddy_data - buddy_idle;
         PoolStats {
             total_segments: self.segment_count(),
-            dedicated_segments: self.dedicated.len(),
+            dedicated_segments: dedicated_active_count,
             alloc_count,
             buddy_data_bytes: buddy_data,
             buddy_occupied_bytes: buddy_occupied,
@@ -401,14 +413,13 @@ impl MemPool {
     /// released. Re-enabling retention preserves pool identity and generations.
     pub fn set_idle_backing_retention(&mut self, retain: bool) {
         self.retain_idle_backing = retain;
+        for segment in self.segments.iter().flatten() {
+            segment.set_retention(retain);
+        }
         if !retain {
-            for (index, segment) in self.segments.iter_mut().enumerate() {
-                if segment
-                    .as_ref()
-                    .is_some_and(|segment| segment.allocator().alloc_count() == 0)
-                {
+            for segment in &mut self.segments {
+                if segment.as_ref().is_some_and(|s| !s.is_mapped()) {
                     segment.take();
-                    self.idle_since[index] = None;
                 }
             }
         }
@@ -433,15 +444,17 @@ impl MemPool {
             let Some(segment) = self.segments[index].as_ref() else {
                 continue;
             };
+            if !segment.is_mapped() {
+                self.segments[index].take();
+                continue;
+            }
             if segment.allocator().alloc_count() != 0 {
                 break;
             }
-            let idle_at = *self.idle_since[index].get_or_insert(now);
-            if now.duration_since(idle_at) < delay {
+            if !segment.expired(now, delay) {
                 break;
             }
             self.segments[index].take();
-            self.idle_since[index] = None;
             live -= 1;
             removed += 1;
         }
@@ -482,7 +495,11 @@ impl MemPool {
 
     /// Get the number of buddy segments.
     pub fn segment_count(&self) -> usize {
-        self.segments.iter().flatten().count()
+        self.segments
+            .iter()
+            .flatten()
+            .filter(|s| s.is_mapped())
+            .count()
     }
 
     /// Read-only view of the effective pool configuration, including the
@@ -493,7 +510,10 @@ impl MemPool {
 
     /// Get a specific segment by index.
     pub fn segment(&self, idx: usize) -> Option<&BuddySegment> {
-        self.segments.get(idx).and_then(Option::as_ref)
+        self.segments
+            .get(idx)
+            .and_then(Option::as_deref)
+            .filter(|s| s.is_mapped())
     }
 
     /// Get the SHM name for a buddy segment.
@@ -503,7 +523,10 @@ impl MemPool {
 
     /// Get the SHM name for a dedicated segment.
     pub fn dedicated_name(&self, idx: u32) -> Option<&str> {
-        self.dedicated.get(&idx).map(|e| e.segment.name())
+        self.dedicated
+            .get(&idx)
+            .filter(|e| e.segment.is_mapped())
+            .map(|e| e.segment.name())
     }
 
     /// Get the pool name prefix (for handshake exchange).
@@ -556,7 +579,10 @@ impl MemPool {
         dedicated: bool,
     ) -> Result<(), String> {
         let current = if dedicated {
-            self.dedicated.get(&seg_idx).map(|entry| entry.generation)
+            self.dedicated
+                .get(&seg_idx)
+                .filter(|entry| entry.segment.is_mapped())
+                .map(|entry| entry.generation)
         } else {
             self.segment_generation(seg_idx as usize)
         };
@@ -619,6 +645,81 @@ impl MemPool {
                 .alloc_file_spill(size)
                 .map_err(BackingError::into_message),
         }
+    }
+
+    /// Allocate local storage with a fixed mapping and original release owner.
+    /// It follows the same tiered allocation policy as `alloc_handle`, but
+    /// payload borrows and final release do not need to re-enter this pool.
+    pub fn alloc_owned(&mut self, size: usize) -> Result<OwnedAllocation, String> {
+        let handle = self.alloc_handle(size)?;
+        match self.admit_owned(handle) {
+            Ok(owner) => Ok(owner),
+            Err((error, handle)) => {
+                self.release_handle(handle);
+                Err(error)
+            }
+        }
+    }
+
+    fn admit_owned(&self, handle: MemHandle) -> Result<OwnedAllocation, (String, MemHandle)> {
+        // One boundary establishes owner, generation and the full allocation
+        // span. Internal payload access then trusts the consumed authority.
+        let validation = (|| {
+            self.validate_handle_owner(&handle)?;
+            if let HandleBacking::Shm {
+                allocation, len, ..
+            } = &handle.backing
+            {
+                self.validate_generation(
+                    allocation.seg_idx,
+                    allocation.generation,
+                    allocation.is_dedicated,
+                )?;
+                let span = if allocation.is_dedicated {
+                    self.dedicated[&allocation.seg_idx].segment.size()
+                } else {
+                    self.segment(allocation.seg_idx as usize).unwrap().size()
+                };
+                check_span(
+                    span,
+                    allocation.offset as usize,
+                    allocation.actual_size as usize,
+                )?;
+                if *len > allocation.actual_size as usize {
+                    return Err("owned allocation logical length exceeds its capacity".into());
+                }
+            }
+            Ok(())
+        })();
+        if let Err(error) = validation {
+            return Err((error, handle));
+        }
+        let len = handle.len();
+        let backing = match handle.backing {
+            HandleBacking::Shm { allocation, .. } if allocation.is_dedicated => {
+                let segment = self.dedicated[&allocation.seg_idx].segment.clone();
+                let mapping = segment.pin();
+                OwnedBacking::Dedicated {
+                    segment,
+                    allocation,
+                    mapping,
+                }
+            }
+            HandleBacking::Shm { allocation, .. } => {
+                let segment = self.segments[allocation.seg_idx as usize]
+                    .as_ref()
+                    .unwrap()
+                    .clone();
+                let mapping = segment.pin();
+                OwnedBacking::Buddy {
+                    segment,
+                    allocation,
+                    mapping,
+                }
+            }
+            HandleBacking::FileSpill { mmap, path, .. } => OwnedBacking::File { mmap, path },
+        };
+        Ok(OwnedAllocation { backing, len })
     }
 
     /// Allocate from Buddy or Dedicated SHM only — no FileSpill fallback.
@@ -792,11 +893,7 @@ impl MemPool {
             let Some(seg) = seg else {
                 continue;
             };
-            if let Some(a) = seg.allocator().alloc(size) {
-                // Mark segment as active (not idle).
-                if idx < self.idle_since.len() {
-                    self.idle_since[idx] = None;
-                }
+            if let Some(a) = seg.alloc(size) {
                 self.counters.buddy_reused_allocs =
                     self.counters.buddy_reused_allocs.saturating_add(1);
                 return Some(PoolAllocation {
@@ -818,10 +915,7 @@ impl MemPool {
     /// pressure, budget, or OS); callers fall through to the next tier.
     fn expand_buddy(&mut self, size: usize) -> Option<PoolAllocation> {
         let (idx, segment) = self.create_segment().ok()?;
-        let allocation = segment
-            .allocator()
-            .alloc(size)
-            .expect("size fits new buddy backing");
+        let allocation = segment.alloc(size).expect("size fits new buddy backing");
         self.install_segment(idx, segment);
         self.counters.buddy_expanded_allocs = self.counters.buddy_expanded_allocs.saturating_add(1);
         Some(PoolAllocation {
@@ -837,13 +931,13 @@ impl MemPool {
     fn install_segment(&mut self, idx: usize, segment: BuddySegment) {
         if self.segments.len() <= idx {
             self.segments.resize_with(idx + 1, || None);
-            self.idle_since.resize(idx + 1, None);
         }
-        self.segments[idx] = Some(segment);
-        self.idle_since[idx] = None;
+        segment.set_retention(self.retain_idle_backing);
+        self.segments[idx] = Some(Arc::new(segment));
     }
 
     fn alloc_dedicated(&mut self, size: usize) -> Result<PoolAllocation, BackingError> {
+        self.dedicated.retain(|_, entry| entry.segment.is_mapped());
         // Each kind has its own u16 slot space. Only empty slots advance;
         // checked generation exhaustion retires that slot permanently.
         let (idx, generation) = (0..self.config.max_dedicated_segments)
@@ -890,7 +984,7 @@ impl MemPool {
         self.dedicated.insert(
             idx,
             DedicatedEntry {
-                segment,
+                segment: Arc::new(segment),
                 generation,
             },
         );
@@ -907,16 +1001,11 @@ impl MemPool {
 
     fn free_buddy(&mut self, allocation: &PoolAllocation) {
         let idx = allocation.seg_idx as usize;
-        let allocator = self.segment(idx).expect("validated generation").allocator();
+        let segment = self.segment(idx).expect("validated generation");
         // SAFETY: exact level/offset came from the unique local allocation.
-        unsafe { allocator.free(allocation.offset, allocation.level) };
-        if allocator.alloc_count() == 0 {
-            if self.retain_idle_backing {
-                self.idle_since[idx] = Some(Instant::now());
-            } else {
-                self.segments[idx].take();
-                self.idle_since[idx] = None;
-            }
+        unsafe { segment.free(allocation.offset, allocation.level) };
+        if !segment.is_mapped() {
+            self.segments[idx].take();
         }
     }
 
@@ -1079,6 +1168,167 @@ mod tests {
         unsafe { pool.free(&a) }.unwrap();
         let stats = pool.stats();
         assert_eq!(stats.alloc_count, 0);
+    }
+
+    #[test]
+    fn owned_allocations_keep_mapping_and_original_charge_after_pool_drop() {
+        for (buddy, shm) in [(true, 1 << 20), (false, 1 << 20), (false, 0)] {
+            let budget = MemoryBudget::new(shm, 8192, 0);
+            let mut pool = MemPool::new_with_prefix_and_budget(
+                PoolConfig {
+                    buddy_enabled: buddy,
+                    spill_threshold: 1.0,
+                    ..small_config()
+                },
+                "owned-lifetime".into(),
+                budget.clone(),
+            )
+            .unwrap();
+            let mut owner = pool.alloc_owned(8192).unwrap();
+            assert_eq!(owner.is_buddy(), buddy);
+            assert_eq!(owner.is_file_spill(), shm == 0);
+            owner.as_mut_slice().fill(0x42);
+            owner.trim_to(7).unwrap();
+            drop(pool);
+            let live = budget.snapshot();
+            assert!(if shm == 0 {
+                live.file.used_bytes >= 8192
+            } else {
+                live.shm.used_bytes >= 8192
+            });
+            assert_eq!(owner.as_slice(), &[0x42; 7]);
+            drop(owner);
+            assert_eq!(budget.snapshot().file.used_bytes, 0);
+            assert_eq!(budget.snapshot().shm.used_bytes, 0);
+        }
+    }
+
+    #[test]
+    fn owned_release_preserves_retention_dedicated_slots_and_generations() {
+        for buddy in [true, false] {
+            let budget = MemoryBudget::new(1 << 20, 0, 0);
+            let mut pool = MemPool::new_with_prefix_and_budget(
+                PoolConfig {
+                    buddy_enabled: buddy,
+                    max_segments: 1,
+                    min_retained_segments: 0,
+                    max_dedicated_segments: 1,
+                    spill_threshold: 1.0,
+                    ..small_config()
+                },
+                "owned-slot".into(),
+                budget.clone(),
+            )
+            .unwrap();
+            pool.set_idle_backing_retention(false);
+            let first = pool.alloc_owned(4096).unwrap();
+            let before = first.shm_allocation().unwrap();
+            assert!(pool.alloc_owned(128 * 1024).is_err() || buddy);
+            drop(first);
+            assert_eq!(pool.stats().alloc_count, 0);
+            assert_eq!(budget.snapshot().shm.used_bytes, 0);
+            let next = pool.alloc_owned(4096).unwrap();
+            let after = next.shm_allocation().unwrap();
+            assert_eq!(before.seg_idx, after.seg_idx);
+            assert_eq!(after.generation, before.generation + 1);
+            drop(next);
+            assert_eq!(budget.snapshot().shm.used_bytes, 0);
+        }
+    }
+
+    #[test]
+    fn owned_admission_checks_owner_generation_capacity_and_logical_span_once() {
+        for dedicated in [false, true] {
+            let mut pool = test_pool(small_config());
+            let other = test_pool(small_config());
+            let handle = pool
+                .alloc_handle(if dedicated { 128 * 1024 } else { 4096 })
+                .unwrap();
+            let (error, handle) = other.admit_owned(handle).unwrap_err();
+            assert!(error.contains("owner"));
+            let original = handle.shm_allocation().unwrap();
+            let mut handle = handle;
+            for invalid in 0..3 {
+                let HandleBacking::Shm {
+                    allocation, len, ..
+                } = &mut handle.backing
+                else {
+                    unreachable!()
+                };
+                *allocation = original;
+                *len = 4096;
+                match invalid {
+                    0 => allocation.generation += 1,
+                    1 => allocation.offset = u32::MAX,
+                    2 => *len = allocation.actual_size as usize + 1,
+                    _ => unreachable!(),
+                }
+                let (error, returned) = pool.admit_owned(handle).unwrap_err();
+                assert!(error.contains(match invalid {
+                    0 => "generation",
+                    1 => "span",
+                    _ => "logical length",
+                }));
+                handle = returned;
+            }
+            let HandleBacking::Shm {
+                allocation, len, ..
+            } = &mut handle.backing
+            else {
+                unreachable!()
+            };
+            *allocation = original;
+            *len = 4096;
+            let mut owner = pool.admit_owned(handle).unwrap();
+            owner.as_mut_slice().fill(0x11);
+            owner.trim_to(0).unwrap();
+            assert!(owner.as_slice().is_empty());
+            drop(owner);
+            assert_eq!(pool.stats().alloc_count, 0);
+        }
+    }
+
+    #[test]
+    fn mapping_query_reports_release_after_a_valid_generation_snapshot() {
+        for buddy in [false, true] {
+            let mut pool = test_pool(PoolConfig {
+                buddy_enabled: buddy,
+                spill_threshold: 1.0,
+                ..small_config()
+            });
+            pool.set_idle_backing_retention(false);
+            let owner = pool.alloc_owned(4096).unwrap();
+            let allocation = owner.shm_allocation().unwrap();
+            let query: Box<dyn Fn() -> bool> = match &owner.backing {
+                OwnedBacking::Buddy { segment, .. } => {
+                    let segment = segment.clone();
+                    Box::new(move || {
+                        // Raw address metadata alone never pins a mapping or
+                        // authorizes a read, including after owner retirement.
+                        assert_eq!(segment.base_ptr(), segment.allocator().data_ptr(0));
+                        segment.try_pin().is_some()
+                    })
+                }
+                OwnedBacking::Dedicated { segment, .. } => {
+                    let segment = segment.clone();
+                    Box::new(move || segment.try_pin().is_some())
+                }
+                OwnedBacking::File { .. } => unreachable!(),
+            };
+            assert!(pool.data_ptr(&allocation).is_ok());
+            // Independent owner release can follow the generation snapshot
+            // while a reader still holds the pool and segment metadata.
+            pool.validate_generation(
+                allocation.seg_idx,
+                allocation.generation,
+                allocation.is_dedicated,
+            )
+            .unwrap();
+            drop(owner);
+            assert!(!query(), "released mapping must be a fallible query");
+            assert!(pool.data_ptr(&allocation).is_err());
+            assert_eq!(pool.stats().alloc_count, 0);
+        }
     }
 
     #[test]

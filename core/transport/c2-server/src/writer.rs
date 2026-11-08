@@ -13,7 +13,12 @@ use tokio::task::JoinHandle;
 use crate::connection::{Connection, PhysicalRetirement, WriteGuard};
 use crate::dispatcher::PreparedShmResponse;
 
-type WriteReceipt = Option<oneshot::Sender<io::Result<Option<PreparedShmResponse>>>>;
+struct WriteWaiter {
+    sender: oneshot::Sender<io::Result<Option<PreparedShmResponse>>>,
+    wait_for_flush: bool,
+}
+
+type WriteReceipt = Option<WriteWaiter>;
 
 const QUEUE_CAPACITY: usize = 64;
 
@@ -35,10 +40,22 @@ struct Submission {
     bytes: Vec<u8>,
     request: WriteRequest,
     reply: WriteReceipt,
-    prepared: Option<(u64, PreparedShmResponse)>,
+    prepared: Option<(u64, PreparedShmResponse, PreparedRecordKind)>,
+    item: Option<ItemFrame>,
     // Nonblocking replies retain drain ownership after their dispatcher returns.
     _flight: WriteGuard,
     _pending: Option<OwnedSemaphorePermit>,
+}
+
+struct ItemFrame {
+    request_id: u64,
+    bytes: Vec<u8>,
+}
+
+#[derive(Clone, Copy)]
+enum PreparedRecordKind {
+    UnaryEnd,
+    ItemData,
 }
 
 /// Submit complete frames to the connection's sole write task. Dropping a
@@ -47,25 +64,26 @@ pub(crate) struct ConnectionWriter {
     queue: mpsc::Sender<Submission>,
     controls: mpsc::UnboundedSender<Submission>,
     control_budget: Arc<Semaphore>,
-    conn: Arc<Connection>,
+    pub(crate) conn: Arc<Connection>,
 }
 
 /// Receive-loop replies reserve their pending slot before any async work.
 /// The bounded control backlog is independent of business queue occupancy.
-pub(crate) struct ControlReplyPermit {
+pub(crate) struct QueuedReplyPermit {
     queue: mpsc::UnboundedSender<Submission>,
     pending: OwnedSemaphorePermit,
     request: WriteRequest,
     flight: WriteGuard,
 }
 
-impl ControlReplyPermit {
+impl QueuedReplyPermit {
     pub(crate) fn send(self, bytes: Vec<u8>) {
         let _ = self.queue.send(Submission {
             bytes,
             request: self.request,
             reply: None,
             prepared: None,
+            item: None,
             _flight: self.flight,
             _pending: Some(self.pending),
         });
@@ -73,6 +91,32 @@ impl ControlReplyPermit {
 }
 
 impl ConnectionWriter {
+    #[cfg(test)]
+    pub(crate) fn spawn_test_stream<W: AsyncWrite + Unpin + Send + 'static>(
+        mut stream: W,
+        conn: Arc<Connection>,
+    ) -> (Arc<Self>, JoinHandle<()>) {
+        let (queue, receiver) = mpsc::channel(QUEUE_CAPACITY);
+        let (controls, control_receiver) = mpsc::unbounded_channel();
+        let writer = Arc::new(Self {
+            queue,
+            controls,
+            control_budget: Arc::new(Semaphore::new(1024)),
+            conn: conn.clone(),
+        });
+        let task = tokio::spawn(async move {
+            run(
+                &mut stream,
+                conn,
+                receiver,
+                control_receiver,
+                Duration::from_secs(30),
+            )
+            .await;
+        });
+        (writer, task)
+    }
+
     pub(crate) fn spawn(
         write_half: LocalWriteHalf,
         conn: Arc<Connection>,
@@ -111,7 +155,32 @@ impl ConnectionWriter {
     }
 
     pub(crate) async fn write_all(&self, bytes: &[u8]) -> io::Result<()> {
-        self.submit(bytes.to_vec(), None).await.map(|_| ())
+        self.submit(bytes.to_vec(), None, false, None)
+            .await
+            .map(|_| ())
+    }
+
+    pub(crate) async fn write_call_end(&self, bytes: &[u8]) -> io::Result<()> {
+        self.submit(bytes.to_vec(), None, true, None)
+            .await
+            .map(|_| ())
+    }
+
+    pub(crate) async fn write_item(&self, request_id: u64, bytes: Vec<u8>) -> io::Result<()> {
+        if request_id == 0 || bytes.is_empty() || bytes.len() > u32::MAX as usize - 13 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid ITEM_DATA frame",
+            ));
+        }
+        self.submit(
+            Vec::new(),
+            None,
+            true,
+            Some(ItemFrame { request_id, bytes }),
+        )
+        .await
+        .map(|_| ())
     }
 
     /// Keep the local response owner until the sole writer can publish it.
@@ -122,25 +191,60 @@ impl ConnectionWriter {
         request_id: u64,
         prepared: PreparedShmResponse,
     ) -> io::Result<Option<PreparedShmResponse>> {
-        self.submit(Vec::new(), Some((request_id, prepared))).await
+        self.submit(
+            Vec::new(),
+            Some((request_id, prepared, PreparedRecordKind::UnaryEnd)),
+            true,
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn write_item_prepared(
+        &self,
+        request_id: u64,
+        prepared: PreparedShmResponse,
+    ) -> io::Result<Option<PreparedShmResponse>> {
+        self.submit(
+            Vec::new(),
+            Some((request_id, prepared, PreparedRecordKind::ItemData)),
+            true,
+            None,
+        )
+        .await
     }
 
     async fn submit(
         &self,
         bytes: Vec<u8>,
-        prepared: Option<(u64, PreparedShmResponse)>,
+        prepared: Option<(u64, PreparedShmResponse, PreparedRecordKind)>,
+        call_record: bool,
+        item: Option<ItemFrame>,
     ) -> io::Result<Option<PreparedShmResponse>> {
         let (reply, receipt) = oneshot::channel();
         // Every queued response retains write access through deactivation;
         // only publication of a new SHM loan requires business admission.
-        let request =
-            WriteRequest::Control(self.conn.core.prepare_control_frame().map_err(core_error)?);
+        let request = if call_record {
+            WriteRequest::CallEnd {
+                frame: self.conn.core.prepare_call_record().map_err(core_error)?,
+                loans: Vec::new(),
+            }
+        } else {
+            WriteRequest::Control(self.conn.core.prepare_control_frame().map_err(core_error)?)
+        };
         self.queue
             .send(Submission {
                 bytes,
                 request,
                 prepared,
-                reply: Some(reply),
+                item,
+                reply: Some(WriteWaiter {
+                    sender: reply,
+                    // A call's next chunk, item count and terminal depend on
+                    // this frame's real result. A write deadline only seals
+                    // new admission; it cannot finish an accepted operation.
+                    wait_for_flush: call_record,
+                }),
                 _flight: WriteGuard::new(&self.conn),
                 _pending: None,
             })
@@ -150,8 +254,12 @@ impl ConnectionWriter {
     }
 
     /// The receive loop only enqueues; it never waits for a blocked OS write.
-    pub(crate) fn reserve_control(&self) -> io::Result<ControlReplyPermit> {
+    pub(crate) fn reserve_control(&self) -> io::Result<QueuedReplyPermit> {
         let control = self.conn.core.prepare_control_frame().map_err(core_error)?;
+        self.reserve_reply(WriteRequest::Control(control))
+    }
+
+    fn reserve_reply(&self, request: WriteRequest) -> io::Result<QueuedReplyPermit> {
         let pending = self
             .control_budget
             .clone()
@@ -166,12 +274,22 @@ impl ConnectionWriter {
                 );
                 io::Error::new(io::ErrorKind::OutOfMemory, "pending reply budget exhausted")
             })?;
-        Ok(ControlReplyPermit {
+        Ok(QueuedReplyPermit {
             queue: self.controls.clone(),
             pending,
-            request: WriteRequest::Control(control),
+            request,
             flight: WriteGuard::new(&self.conn),
         })
+    }
+
+    pub(crate) fn queue_call_end(&self, bytes: Vec<u8>) -> io::Result<()> {
+        let frame = self.conn.core.prepare_call_record().map_err(core_error)?;
+        self.reserve_reply(WriteRequest::CallEnd {
+            frame,
+            loans: Vec::new(),
+        })?
+        .send(bytes);
+        Ok(())
     }
 
     pub(crate) fn queue_control(&self, bytes: Vec<u8>) -> io::Result<()> {
@@ -180,8 +298,8 @@ impl ConnectionWriter {
     }
 }
 
-async fn run(
-    stream: &mut LocalWriteHalf,
+async fn run<W: AsyncWrite + Unpin>(
+    stream: &mut W,
     conn: Arc<Connection>,
     mut receiver: mpsc::Receiver<Submission>,
     mut controls: mpsc::UnboundedReceiver<Submission>,
@@ -190,7 +308,7 @@ async fn run(
     let mut queue_closed = false;
     let mut controls_closed = false;
     loop {
-        if conn.reading_stopped() {
+        if conn.reading_stopped() || conn.write_peer_closed() {
             break;
         }
         if !controls_closed {
@@ -259,8 +377,8 @@ async fn run(
     }
 }
 
-async fn process_submission(
-    stream: &mut LocalWriteHalf,
+async fn process_submission<W: AsyncWrite + Unpin>(
+    stream: &mut W,
     conn: &Connection,
     mut submission: Submission,
     write_timeout: Duration,
@@ -268,14 +386,14 @@ async fn process_submission(
     if submission
         .reply
         .as_ref()
-        .is_some_and(oneshot::Sender::is_closed)
+        .is_some_and(|waiter| waiter.sender.is_closed())
     {
         // A waiter cancelled before publication. Dropping the original loan
         // token releases its unpublished allocation through ConnectionCore.
         return;
     }
-    let result = if let Some((request_id, prepared)) = submission.prepared.take() {
-        match prepare_response_write(conn, request_id, prepared) {
+    let result = if let Some((request_id, prepared, kind)) = submission.prepared.take() {
+        match prepare_response_write(conn, request_id, prepared, kind) {
             Ok(PreparedResponseWrite::Owned(prepared)) => Ok(Some(prepared)),
             Ok(PreparedResponseWrite::Published(batch)) => {
                 drive_write(stream, conn, batch, &mut submission.reply, write_timeout)
@@ -283,6 +401,21 @@ async fn process_submission(
                     .map(|_| None)
             }
             Err(error) => Err(error),
+        }
+    } else if let Some(item) = submission.item.take() {
+        match conn.core.begin_write(submission.request) {
+            Ok(Some(batch)) => write_item_batch(
+                stream,
+                conn,
+                batch,
+                item,
+                &mut submission.reply,
+                write_timeout,
+            )
+            .await
+            .map(|_| None),
+            Ok(None) => unreachable!("queued ITEM_DATA supplies a frame"),
+            Err(error) => Err(core_error(error)),
         }
     } else {
         match conn.core.begin_write(submission.request) {
@@ -310,7 +443,7 @@ async fn process_submission(
         );
     }
     if let Some(reply) = submission.reply.take() {
-        let _ = reply.send(result);
+        let _ = reply.sender.send(result);
     }
 }
 
@@ -381,9 +514,10 @@ fn prepare_response_write(
     conn: &Connection,
     request_id: u64,
     prepared: PreparedShmResponse,
+    kind: PreparedRecordKind,
 ) -> io::Result<PreparedResponseWrite> {
-    use c2_wire::buddy::{BuddyPayload, encode_buddy_payload};
-    use c2_wire::flags::{FLAG_BUDDY, FLAG_REPLY_V2, FLAG_RESPONSE};
+    use c2_wire::buddy::BuddyPayload;
+    use c2_wire::rpc::{CallMode, CallStatus, ValuePart, ValueStorage, encode_call_end_frame};
     let _publication = conn.publication_gate.lock();
     if conn.core.is_deactivated() {
         return Ok(PreparedResponseWrite::Owned(prepared));
@@ -399,22 +533,141 @@ fn prepare_response_write(
         is_dedicated: allocation.is_dedicated,
         loan_id: loan.id(),
     };
-    let frame = c2_wire::frame::encode_frame_parts(
-        request_id,
-        FLAG_REPLY_V2 | FLAG_RESPONSE | FLAG_BUDDY,
-        &[
-            &encode_buddy_payload(&descriptor),
-            &[c2_wire::control::STATUS_SUCCESS],
-        ],
-    );
+    let frame = match kind {
+        PreparedRecordKind::UnaryEnd => encode_call_end_frame(
+            request_id,
+            CallMode::Unary,
+            CallStatus::Success,
+            0,
+            ValuePart::whole(ValueStorage::Shm(descriptor)),
+        ),
+        PreparedRecordKind::ItemData => {
+            c2_wire::rpc::encode_item_data_frame(request_id, ValueStorage::Shm(descriptor))
+        }
+    }
+    .map_err(|error| io::Error::other(error.to_string()))?;
+    let frame_permit = conn.core.prepare_call_record().map_err(core_error)?;
     let batch = conn
         .core
-        .begin_write(WriteRequest::Business(vec![loan]))
+        .begin_write(WriteRequest::CallEnd {
+            frame: frame_permit,
+            loans: vec![loan],
+        })
         .map_err(core_error)?
         .expect("response frame");
     let mut write = assemble_write(conn, batch, Some(&frame))?;
     write.batch.begin_io().map_err(core_error)?;
     Ok(PreparedResponseWrite::Published(write))
+}
+
+/// Write one ITEM_DATA frame without another payload copy. The single
+/// WriteBatch covers releases, fixed header and payload through the flush.
+async fn write_item_batch<W: AsyncWrite + Unpin>(
+    stream: &mut W,
+    conn: &Connection,
+    mut batch: WriteBatch,
+    item: ItemFrame,
+    receipt: &mut WriteReceipt,
+    write_timeout: Duration,
+) -> io::Result<()> {
+    use c2_wire::flags::{FLAG_RESPONSE, FLAG_RPC_RECORD};
+    use c2_wire::rpc::RpcRecordKind;
+
+    let mut prefix = Vec::new();
+    prefix
+        .try_reserve_exact(batch.release_bytes().len())
+        .map_err(|error| io::Error::new(io::ErrorKind::OutOfMemory, error))?;
+    prefix.extend_from_slice(batch.release_bytes());
+    let mut header = [0u8; 17];
+    let total_len = 13 + item.bytes.len() as u32;
+    header[..4].copy_from_slice(&total_len.to_le_bytes());
+    header[4..12].copy_from_slice(&item.request_id.to_le_bytes());
+    header[12..16].copy_from_slice(&(FLAG_RPC_RECORD | FLAG_RESPONSE).to_le_bytes());
+    header[16] = RpcRecordKind::ItemData as u8;
+    batch.begin_io().map_err(core_error)?;
+    let deadline = tokio::time::Instant::now() + write_timeout;
+    let mut timed_out = false;
+    let result = async {
+        let mut offset = 0;
+        while offset < prefix.len() {
+            let body_len =
+                u32::from_le_bytes(prefix[offset..offset + 4].try_into().unwrap()) as usize;
+            let end = offset + 4 + body_len;
+            write_segment(
+                stream,
+                conn,
+                &prefix[offset..end],
+                receipt,
+                deadline,
+                &mut timed_out,
+            )
+            .await?;
+            batch.frame_completed();
+            offset = end;
+        }
+        write_segment(stream, conn, &header, receipt, deadline, &mut timed_out).await?;
+        write_segment(stream, conn, &item.bytes, receipt, deadline, &mut timed_out).await?;
+        batch.frame_completed();
+        let mut flush = Box::pin(AsyncWriteExt::flush(stream));
+        if timed_out {
+            flush.await
+        } else {
+            tokio::select! {
+                result = &mut flush => result,
+                _ = tokio::time::sleep_until(deadline) => {
+                    report_timeout(conn, receipt, "flush_timeout");
+                    flush.await
+                }
+            }
+        }
+    }
+    .await;
+    match result {
+        Ok(()) => {
+            batch.flush_completed();
+            Ok(())
+        }
+        Err(error) => {
+            conn.end_write("item_data_write", &error);
+            batch.write_failed();
+            Err(error)
+        }
+    }
+}
+
+async fn write_segment<W: AsyncWrite + Unpin>(
+    stream: &mut W,
+    conn: &Connection,
+    bytes: &[u8],
+    receipt: &mut WriteReceipt,
+    deadline: tokio::time::Instant,
+    timed_out: &mut bool,
+) -> io::Result<()> {
+    let mut written = 0;
+    while written < bytes.len() {
+        let mut write = Box::pin(AsyncWriteExt::write(stream, &bytes[written..]));
+        let result = if *timed_out {
+            write.await
+        } else {
+            tokio::select! {
+                result = &mut write => result,
+                _ = tokio::time::sleep_until(deadline) => {
+                    report_timeout(conn, receipt, "write_timeout");
+                    *timed_out = true;
+                    write.await
+                }
+            }
+        };
+        let count = result?;
+        if count == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "connection write returned zero",
+            ));
+        }
+        written += count;
+    }
+    Ok(())
 }
 
 async fn write_batch<W: AsyncWrite + Unpin>(
@@ -474,13 +727,13 @@ async fn drive_write<W: AsyncWrite + Unpin>(
             Ok(0) => {
                 let error =
                     io::Error::new(io::ErrorKind::WriteZero, "connection write returned zero");
-                conn.end_io("write", &error);
+                conn.end_write("write", &error);
                 batch.write_failed();
                 return Err(error);
             }
             Ok(count) => count,
             Err(error) => {
-                conn.end_io("write", &error);
+                conn.end_write("write", &error);
                 batch.write_failed();
                 return Err(error);
             }
@@ -509,7 +762,7 @@ async fn drive_write<W: AsyncWrite + Unpin>(
             Ok(())
         }
         Err(error) => {
-            conn.end_io("flush", &error);
+            conn.end_write("flush", &error);
             batch.write_failed();
             Err(error)
         }
@@ -518,9 +771,13 @@ async fn drive_write<W: AsyncWrite + Unpin>(
 
 fn report_timeout(conn: &Connection, receipt: &mut WriteReceipt, operation: &'static str) {
     let timeout = io::Error::new(io::ErrorKind::TimedOut, "local write deadline expired");
-    conn.end_io(operation, &timeout);
-    if let Some(sender) = receipt.take() {
-        let _ = sender.send(Err(timeout));
+    conn.end_write(operation, &timeout);
+    if receipt
+        .as_ref()
+        .is_some_and(|waiter| !waiter.wait_for_flush)
+    {
+        let waiter = receipt.take().expect("timeout waiter");
+        let _ = waiter.sender.send(Err(timeout));
     }
 }
 
@@ -542,7 +799,162 @@ fn broken_pipe() -> io::Error {
 mod tests {
     use super::*;
     use c2_wire::frame::encode_frame;
+    use c2_wire::rpc::{self, CallMode, CallStatus, ValuePart, ValueStorage};
+    use std::future::Future;
     use tokio::io::AsyncReadExt;
+
+    struct FirstFlushGate {
+        bytes: Arc<std::sync::Mutex<Vec<u8>>>,
+        entered: Option<oneshot::Sender<()>>,
+        release: oneshot::Receiver<()>,
+        first_flush: bool,
+        released: bool,
+    }
+
+    impl AsyncWrite for FirstFlushGate {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<io::Result<usize>> {
+            self.bytes.lock().unwrap().extend_from_slice(buf);
+            std::task::Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            if !self.first_flush {
+                self.first_flush = true;
+                if let Some(entered) = self.entered.take() {
+                    let _ = entered.send(());
+                }
+            }
+            if !self.released {
+                match std::pin::Pin::new(&mut self.release).poll(cx) {
+                    std::task::Poll::Ready(Ok(())) => self.released = true,
+                    std::task::Poll::Ready(Err(_)) => {
+                        return std::task::Poll::Ready(Err(io::Error::other("flush gate closed")));
+                    }
+                    std::task::Poll::Pending => return std::task::Poll::Pending,
+                }
+            }
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn queued_unary_runs_between_complete_stream_data_frames() {
+        let bytes = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let sink = FirstFlushGate {
+            bytes: bytes.clone(),
+            entered: Some(entered_tx),
+            release: release_rx,
+            first_flush: false,
+            released: false,
+        };
+        let conn = Arc::new(Connection::new(41));
+        conn.set_handshake_done(true).unwrap();
+        let (writer, driver) = ConnectionWriter::spawn_test_stream(sink, conn.clone());
+        let unary = rpc::encode_call_end_frame(
+            2,
+            CallMode::Unary,
+            CallStatus::Success,
+            0,
+            ValuePart::whole(ValueStorage::Inline(b"u")),
+        )
+        .unwrap();
+        let stream = tokio::spawn({
+            let writer = writer.clone();
+            async move {
+                writer.write_item(1, b"a".to_vec()).await.unwrap();
+                writer.write_item(1, b"b".to_vec()).await.unwrap();
+            }
+        });
+        entered_rx.await.unwrap();
+        let unary_task = tokio::spawn({
+            let writer = writer.clone();
+            async move { writer.write_call_end(&unary).await.unwrap() }
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while writer.queue.capacity() != QUEUE_CAPACITY - 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        release_tx.send(()).unwrap();
+        stream.await.unwrap();
+        unary_task.await.unwrap();
+        conn.end(c2_local::ConnectionEndReason::LocalClose, "test_done");
+        driver.await.unwrap();
+        let bytes = bytes.lock().unwrap();
+        let mut ids = Vec::new();
+        let mut offset = 0;
+        while offset < bytes.len() {
+            let total_len =
+                u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap()) as usize;
+            let end = offset + 4 + total_len;
+            let (header, _) = c2_wire::frame::decode_frame(&bytes[offset..end]).unwrap();
+            ids.push(header.request_id);
+            offset = end;
+        }
+        assert_eq!(ids, [1, 2, 1]);
+    }
+
+    #[tokio::test]
+    async fn item_frame_survives_caller_cancellation_until_flush() {
+        let bytes = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let sink = FirstFlushGate {
+            bytes: bytes.clone(),
+            entered: Some(entered_tx),
+            release: release_rx,
+            first_flush: false,
+            released: false,
+        };
+        let conn = Arc::new(Connection::new(42));
+        conn.set_handshake_done(true).unwrap();
+        let (writer, driver) = ConnectionWriter::spawn_test_stream(sink, conn.clone());
+        let caller = tokio::spawn({
+            let writer = writer.clone();
+            async move { writer.write_item(1, b"ab".to_vec()).await }
+        });
+        entered_rx.await.unwrap();
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+        let mut idle = Box::pin(conn.wait_idle());
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(idle.as_mut().poll(&mut context).is_pending());
+        release_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), idle)
+            .await
+            .unwrap();
+        conn.end(c2_local::ConnectionEndReason::LocalClose, "test_done");
+        driver.await.unwrap();
+        let encoded = bytes.lock().unwrap();
+        let (header, data) = c2_wire::frame::decode_frame(&encoded).unwrap();
+        assert!(matches!(
+            rpc::decode_rpc_record(&header, data, Some(CallMode::ServerStream)).unwrap(),
+            rpc::RpcRecord::ItemData {
+                value: ValuePart {
+                    storage: ValueStorage::Inline(b"ab"),
+                    ..
+                }
+            }
+        ));
+    }
 
     #[tokio::test]
     async fn queued_release_precedes_business_in_one_core_batch() {
@@ -624,6 +1036,65 @@ mod tests {
         drop(reader);
     }
     #[tokio::test(start_paused = true)]
+    async fn call_record_timeout_waits_for_its_real_flush() {
+        for kind in [
+            rpc::RpcRecordKind::ItemBegin,
+            rpc::RpcRecordKind::ItemData,
+            rpc::RpcRecordKind::CallEnd,
+        ] {
+            let (entered, waiting) = oneshot::channel();
+            let (release, resume) = oneshot::channel();
+            let sink = FirstFlushGate {
+                bytes: Arc::new(std::sync::Mutex::new(Vec::new())),
+                entered: Some(entered),
+                release: resume,
+                first_flush: false,
+                released: false,
+            };
+            let conn = Arc::new(Connection::new(44));
+            conn.set_handshake_done(true).unwrap();
+            let (writer, driver) = ConnectionWriter::spawn_test_stream(sink, conn.clone());
+            let mut send = Box::pin(async {
+                match kind {
+                    rpc::RpcRecordKind::ItemData => writer.write_item(1, b"ab".to_vec()).await,
+                    rpc::RpcRecordKind::ItemBegin => {
+                        writer
+                            .write_call_end(&rpc::encode_item_begin_frame(1, 2).unwrap())
+                            .await
+                    }
+                    rpc::RpcRecordKind::CallEnd => {
+                        let frame = rpc::encode_call_end_frame(
+                            1,
+                            CallMode::ServerStream,
+                            CallStatus::Success,
+                            0,
+                            ValuePart::whole(ValueStorage::Inline(&[])),
+                        )
+                        .unwrap();
+                        writer.write_call_end(&frame).await
+                    }
+                    _ => unreachable!(),
+                }
+            });
+            let waker = std::task::Waker::noop();
+            let mut context = std::task::Context::from_waker(waker);
+            assert!(send.as_mut().poll(&mut context).is_pending());
+            waiting.await.unwrap();
+            tokio::time::advance(Duration::from_secs(31)).await;
+            while !conn.is_deactivated() {
+                tokio::task::yield_now().await;
+            }
+            assert!(
+                send.as_mut().poll(&mut context).is_pending(),
+                "{kind:?} cannot advance until its flush completes"
+            );
+            release.send(()).unwrap();
+            send.await.unwrap();
+            driver.await.unwrap();
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn timeout_keeps_the_same_batch_through_its_release_prefix_and_flush() {
         let conn = Arc::new(Connection::new(8));
         conn.set_handshake_done(true).unwrap();
@@ -643,7 +1114,10 @@ mod tests {
         let driver = tokio::spawn({
             let conn = conn.clone();
             async move {
-                let mut reply = Some(reply);
+                let mut reply = Some(WriteWaiter {
+                    sender: reply,
+                    wait_for_flush: false,
+                });
                 write_batch(
                     &mut writer,
                     &conn,

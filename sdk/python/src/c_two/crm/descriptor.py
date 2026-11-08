@@ -86,6 +86,7 @@ def _fingerprints_from_descriptor(
         "crm": descriptor["crm"],
         "methods": [
             {
+                **({"mode": method["mode"]} if "mode" in method else {}),
                 "buffer": method["buffer"],
                 "input": method["wire"]["input"],
                 "name": method["name"],
@@ -99,6 +100,7 @@ def _fingerprints_from_descriptor(
         "crm": descriptor["crm"],
         "methods": [
             {
+                **({"mode": method["mode"]} if "mode" in method else {}),
                 "access": method["access"],
                 "buffer": method["buffer"],
                 "name": method["name"],
@@ -245,8 +247,13 @@ def _runtime_method_descriptor(
     if "return" not in type_hints:
         raise TypeError(f"{method_name} is missing a return annotation.")
     return_annotation = type_hints["return"]
+    is_stream = getattr(method, '__cc_stream__', False)
+    if is_stream:
+        from .stream import stream_item_annotation
+        return_annotation = stream_item_annotation(return_annotation)
     access = get_method_access(method)
     return {
+        **({"mode": "server_stream"} if is_stream else {}),
         "access": "read" if access is MethodAccess.READ else "write",
         # Preserve runtime fingerprints; registration owns input lifetime.
         "buffer": "view",
@@ -332,6 +339,10 @@ def _portable_method_descriptor(
     if "return" not in type_hints:
         raise TypeError(f"{method_name} is missing a return annotation.")
     return_annotation = type_hints["return"]
+    is_stream = getattr(method, '__cc_stream__', False)
+    if is_stream:
+        from .stream import stream_item_annotation
+        return_annotation = stream_item_annotation(return_annotation)
     if output_binding.kind is PayloadPlanKind.FASTDB:
         if return_annotation is not payload_type:
             raise TypeError(
@@ -348,6 +359,7 @@ def _portable_method_descriptor(
 
     access = get_method_access(method)
     return {
+        **({"mode": "server_stream"} if is_stream else {}),
         "access": "read" if access is MethodAccess.READ else "write",
         "name": method_name,
         "parameters": parameter_descriptors,

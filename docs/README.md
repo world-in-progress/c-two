@@ -17,7 +17,7 @@ This page routes each subject to the document that owns it. It states no behavio
 
 | Path | Contents |
 | --- | --- |
-| `core/` | The language-neutral Rust workspace: foundation crates (contract, codegen, config, error, memory and the C ABI), the wire protocol, transports (local endpoints, IPC client and server, HTTP and relay) and the `c2-core` runtime |
+| `core/` | The language-neutral Rust workspace: foundation crates (contract, codegen, config, error, local OS-object security, memory and the C ABI), the wire protocol, transports (local endpoints, IPC client and server, HTTP and relay) and the `c2-core` runtime |
 | `sdk/python/` | The Python SDK, `c_two`, with its PyO3 extension in `native/` |
 | `sdk/rust/` | The user-facing Rust SDK, the `c-two` crate imported as `c_two` |
 | `cli/` | The `c3` command, including `c3 relay` |
@@ -50,7 +50,7 @@ This page routes each subject to the document that owns it. It states no behavio
 | Document | Role |
 | --- | --- |
 | [Backlog](design/backlog.md) | The only list of open work and pending decisions |
-| [Roadmap](design/roadmap.md) ([中文](design/roadmap.zh-CN.md)) | Priorities for the 0.x line |
+| [Roadmap](design/roadmap.md) ([中文](design/roadmap.zh-CN.md)) | Direction of the 0.x line and exit criteria of the product capabilities; their order is in the backlog |
 | [Endgame architecture](design/endgame-architecture.md) | The long-range architecture the roadmap works toward |
 | [Contract-release deferred capabilities](design/contract-release-deferred-capabilities.md) | Capabilities deliberately left out of the portable contract release, with their exit conditions |
 
@@ -64,6 +64,8 @@ The dated plans and reviews in `design/` belong to work still in progress; each 
 | --- | --- |
 | [0001](decisions/0001-single-owner-release.md) | Single-owner release of shared memory |
 | [0002](decisions/0002-remove-owner-subsystem.md) | Removal of the owner subsystem |
+| [0003](decisions/0003-server-streams.md) | Server streams: call records, receiver-granted credit, contract mode and stream ending |
+| [0004](decisions/0004-route-name-identity.md) | Route name as the one identity of a resource's state |
 
 ## Records
 

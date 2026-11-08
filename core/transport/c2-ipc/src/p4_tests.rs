@@ -5,8 +5,14 @@ use c2_server::{
     ConcurrencyMode, CrmCallback, CrmError, ResponseMeta, RouteBuildSpec, SchedulerLimits, Server,
     ServerIpcConfig,
 };
-use c2_wire::control::encode_reply_control;
-use c2_wire::handshake::{ServerIdentity, encode_server_handshake};
+use c2_wire::handshake::{
+    HANDSHAKE_VERSION, ServerIdentity, VersionPreambleKind, encode_server_handshake,
+    encode_version_preamble,
+};
+use c2_wire::rpc::{
+    CallMode, CallStatus, RpcRecord, RpcRecordKind, ValuePart, ValueStorage, decode_rpc_record,
+    encode_call_end_frame, encode_value_continuation_frame,
+};
 use std::time::Duration;
 use tokio::time::timeout;
 
@@ -161,16 +167,119 @@ async fn accept(listener: &mut LocalListener) -> LocalStream {
         .unwrap();
     stream
 }
-async fn reply(stream: &mut LocalStream, rid: u64, data: &[u8]) {
-    let ctrl = encode_reply_control(&ReplyControl::Success);
-    stream
-        .write_all(&frame::encode_frame_parts(
-            rid,
-            flags::FLAG_RESPONSE | flags::FLAG_REPLY_V2,
-            &[&ctrl, data],
-        ))
+
+// A rejected handshake closes the client end as soon as the malformed reply is
+// classified, which is exactly the behavior under test. On Windows a
+// LocalStream write_all still drains the pipe adapter with a zero-byte flush
+// write after the payload, and that probe fails once the client has closed,
+// even though the payload itself was already delivered and read. Delivery
+// stays proven by the client-side rejection asserts: an undelivered reply
+// would surface as the connect timeout instead.
+async fn write_malformed_reply(stream: &mut LocalStream, bytes: &[u8]) {
+    if let Err(error) = stream.write_all(bytes).await {
+        assert!(
+            c2_local::is_peer_closed_error(&error),
+            "fake peer failed to write its malformed reply: {error}"
+        );
+    }
+}
+
+async fn expect_fake_peer_handshake_error(
+    preamble: [u8; 25],
+    metadata_ack: Option<Vec<u8>>,
+    expected_peer_version: Option<u32>,
+) {
+    let endpoint = Endpoint::new();
+    let mut listener = LocalListener::bind(&endpoint.endpoint).unwrap();
+    let (finish, finished) = oneshot::channel();
+    let peer = tokio::spawn(async move {
+        let mut stream = timeout(WAIT, listener.accept()).await.unwrap().unwrap();
+        let mut hello = [0; 25];
+        stream.read_exact(&mut hello).await.unwrap();
+        assert_eq!(hello, encode_version_preamble(VersionPreambleKind::Hello));
+        write_malformed_reply(&mut stream, &preamble).await;
+        if let Some(ack) = metadata_ack {
+            let (header, _) = read_frame(&mut stream).await;
+            assert_eq!(header.flags, flags::FLAG_HANDSHAKE);
+            write_malformed_reply(&mut stream, &ack).await;
+        }
+        // Keep the peer open until connect has returned. An EOF must not be
+        // needed to classify a complete malformed reply.
+        finished.await.unwrap();
+        drop(stream);
+        crate::tests::close_listener(listener).await;
+    });
+    let mut client = endpoint.client();
+    let error = timeout(WAIT, client.connect())
         .await
-        .unwrap();
+        .expect("a complete rejection must return while the peer stays open")
+        .unwrap_err();
+    match expected_peer_version {
+        Some(peer_version) => assert!(
+            matches!(error, IpcError::ProtocolVersionMismatch { local, peer }
+                if local == HANDSHAKE_VERSION && peer == peer_version),
+            "unexpected rejection: {error:?}"
+        ),
+        None => assert!(
+            matches!(error, IpcError::Protocol(_) | IpcError::Decode(_)),
+            "malformed handshake was misclassified: {error:?}"
+        ),
+    }
+    finish.send(()).unwrap();
+    peer.await.unwrap();
+}
+
+#[tokio::test]
+async fn fixed_version_rejections_are_typed_only_after_a_trusted_preamble() {
+    for peer_version in [1, 13, 15, 256, u32::MAX] {
+        let mut response = encode_version_preamble(VersionPreambleKind::VersionMismatch);
+        response[21..].copy_from_slice(&peer_version.to_le_bytes());
+        expect_fake_peer_handshake_error(response, None, Some(peer_version)).await;
+    }
+
+    let mut malformed = encode_version_preamble(VersionPreambleKind::VersionMismatch);
+    malformed[21..].copy_from_slice(&13u32.to_le_bytes());
+    for byte in [0, 12, 16, 20, 21] {
+        let mut response = malformed;
+        response[byte] = 0;
+        expect_fake_peer_handshake_error(response, None, None).await;
+    }
+    let mut wrong_request_id = malformed;
+    wrong_request_id[4] = 1;
+    expect_fake_peer_handshake_error(wrong_request_id, None, None).await;
+    let mut contradictory = encode_version_preamble(VersionPreambleKind::Accepted);
+    contradictory[21..].copy_from_slice(&13u32.to_le_bytes());
+    expect_fake_peer_handshake_error(contradictory, None, None).await;
+    expect_fake_peer_handshake_error(
+        encode_version_preamble(VersionPreambleKind::VersionMismatch),
+        None,
+        None,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn malformed_metadata_ack_returns_before_peer_eof() {
+    let valid_preamble = encode_version_preamble(VersionPreambleKind::Accepted);
+    for ack in [
+        frame::encode_frame(1, flags::FLAG_HANDSHAKE | flags::FLAG_RESPONSE, b"bad"),
+        frame::encode_frame(0, flags::FLAG_HANDSHAKE, b"bad"),
+        frame::encode_frame(0, flags::FLAG_HANDSHAKE | flags::FLAG_RESPONSE, b"bad"),
+    ] {
+        expect_fake_peer_handshake_error(valid_preamble, Some(ack), None).await;
+    }
+}
+
+async fn reply(stream: &mut LocalStream, rid: u64, data: &[u8]) {
+    let frame = encode_call_end_frame(
+        rid,
+        CallMode::Unary,
+        CallStatus::Success,
+        0,
+        ValuePart::whole(ValueStorage::Inline(data)),
+    )
+    .unwrap();
+    stream.write_all(&frame).await.unwrap();
 }
 async fn eventually(mut check: impl FnMut() -> bool) {
     timeout(WAIT, async {
@@ -191,7 +300,9 @@ async fn response_does_not_release_a_request_loan_and_peer_end_does() {
         let mut stream = accept(&mut listener).await;
         let (hdr, payload) = read_frame(&mut stream).await;
         assert!(hdr.is_buddy());
-        assert_ne!(decode_buddy_payload(&payload).unwrap().0.loan_id, 0);
+        assert!(
+            matches!(decode_rpc_record(&hdr, &payload, None).unwrap(), RpcRecord::Open { value: ValuePart { storage: ValueStorage::Shm(descriptor), .. }, .. } if descriptor.loan_id != 0)
+        );
         reply(&mut stream, hdr.request_id, b"ok").await;
         closed.await.unwrap();
         drop(stream);
@@ -227,44 +338,49 @@ async fn response_does_not_release_a_request_loan_and_peer_end_does() {
 async fn high_request_bits_are_preserved_through_pending_and_delivery() {
     let endpoint = Endpoint::new();
     let mut listener = LocalListener::bind(&endpoint.endpoint).unwrap();
-    let (received, first) = oneshot::channel();
+    let ids = [7, (1u64 << 32) | 7, (1u64 << 53) | 7, u64::MAX - 1];
+    let (sent, reads): (Vec<_>, Vec<_>) = ids.iter().map(|_| oneshot::channel()).unzip();
     let peer = tokio::spawn(async move {
         let mut stream = accept(&mut listener).await;
-        let (low, _) = read_frame(&mut stream).await;
-        assert_eq!(low.request_id, 7);
-        received.send(()).unwrap();
-        let (high, _) = read_frame(&mut stream).await;
-        assert_eq!(high.request_id, (1 << 32) | 7);
-        reply(&mut stream, high.request_id, b"high").await;
-        reply(&mut stream, low.request_id, b"low").await;
+        for (id, received) in ids.into_iter().zip(sent) {
+            let (header, _) = read_frame(&mut stream).await;
+            assert_eq!(header.request_id, id);
+            received.send(()).unwrap();
+        }
+        for id in ids.into_iter().rev() {
+            reply(&mut stream, id, &id.to_le_bytes()).await;
+        }
         expect_disconnect_or_eof(&mut stream).await;
         crate::tests::close_listener(listener).await;
     });
     let mut client = endpoint.client();
     client.connect().await.unwrap();
-    client.rid_counter.store(6, Ordering::Relaxed);
     let client = Arc::new(client);
-    let low = tokio::spawn({
-        let client = client.clone();
-        async move {
-            client
-                .call_inline(&identity(), 0, b"low")
-                .await
-                .unwrap()
-                .into_owned_bytes()
-                .unwrap()
-        }
-    });
-    first.await.unwrap();
-    client.rid_counter.store((1 << 32) | 6, Ordering::Relaxed);
-    let high = client
-        .call_inline(&identity(), 0, b"high")
-        .await
-        .unwrap()
-        .into_owned_bytes()
-        .unwrap();
-    assert_eq!(high, b"high");
-    assert_eq!(low.await.unwrap(), b"low");
+    let mut callers = Vec::new();
+    for (id, read) in ids.into_iter().zip(reads) {
+        client
+            .driver
+            .read()
+            .as_ref()
+            .unwrap()
+            .sequence
+            .store(id - 1, Ordering::Relaxed);
+        callers.push(tokio::spawn({
+            let client = client.clone();
+            async move {
+                client
+                    .call_inline(&identity(), 0, b"pending")
+                    .await
+                    .unwrap()
+                    .into_owned_bytes()
+                    .unwrap()
+            }
+        }));
+        timeout(WAIT, read).await.unwrap().unwrap();
+    }
+    for (id, caller) in ids.into_iter().zip(callers) {
+        assert_eq!(caller.await.unwrap(), id.to_le_bytes());
+    }
     assert!(client.close_shared_bounded(WAIT).await);
     peer.await.unwrap();
 }
@@ -284,7 +400,13 @@ async fn exhausted_request_ids_deactivate_without_reconnect_or_any_frame() {
     let mut client = endpoint.client();
     client.connect().await.unwrap();
     let id = client.connection_observation().unwrap().connection_id();
-    client.rid_counter.store(u64::MAX, Ordering::Relaxed);
+    client
+        .driver
+        .read()
+        .as_ref()
+        .unwrap()
+        .sequence
+        .store(u64::MAX, Ordering::Relaxed);
     let error = client
         .call_inline(&identity(), 0, b"unpublished")
         .await
@@ -301,6 +423,7 @@ async fn exhausted_request_ids_deactivate_without_reconnect_or_any_frame() {
     assert_eq!(error.phase(), crate::TransportPhase::PreDispatch);
     assert!(matches!(error.source_error(), IpcError::Closed));
     assert_eq!(client.connection_observation().unwrap().connection_id(), id);
+    assert!(client.close_shared_bounded(WAIT).await);
     assert_eq!(client.pending_len_for_test(), 0);
     peer.await.unwrap();
 }
@@ -572,12 +695,23 @@ async fn cancelling_a_started_shm_write_keeps_the_driver_and_never_replays() {
         let mut stream = accept(&mut listener).await;
         let (hdr, payload) = read_frame(&mut stream).await;
         assert!(hdr.is_buddy());
-        let loan = decode_buddy_payload(&payload).unwrap().0.loan_id;
+        let loan = match decode_rpc_record(&hdr, &payload, None).unwrap() {
+            RpcRecord::Open {
+                value:
+                    ValuePart {
+                        storage: ValueStorage::Shm(descriptor),
+                        ..
+                    },
+                ..
+            } => descriptor.loan_id,
+            _ => panic!("SHM OPEN"),
+        };
         let release = c2_wire::release::encode_release_frame(
             &c2_wire::release::ReleaseBatch::new(&[loan]).unwrap(),
             true,
         );
         stream.write_all(&release).await.unwrap();
+        reply(&mut stream, hdr.request_id, b"finished").await;
         // The helper permits only the normal close signal after this one
         // complete request; a replay or second request still fails.
         expect_disconnect_or_eof(&mut stream).await;
@@ -1091,9 +1225,17 @@ async fn started_inline_cancellation_finishes_the_original_frame_once() {
     let peer = tokio::spawn(async move {
         let mut stream = accept(&mut listener).await;
         let (header, payload) = read_frame(&mut stream).await;
-        assert!(header.is_call_v2());
-        let (_, consumed) = c2_wire::control::decode_call_control(&payload, 0).unwrap();
-        assert_eq!(&payload[consumed..], b"one side effect");
+        assert!(matches!(
+            decode_rpc_record(&header, &payload, None).unwrap(),
+            RpcRecord::Open {
+                value: ValuePart {
+                    storage: ValueStorage::Inline(b"one side effect"),
+                    ..
+                },
+                ..
+            }
+        ));
+        reply(&mut stream, header.request_id, b"finished").await;
         expect_disconnect_or_eof(&mut stream).await;
         crate::tests::close_listener(listener).await;
     });
@@ -1159,12 +1301,14 @@ async fn unnegotiated_shm_reply_is_rejected_before_mapping_or_loan_admission() {
             is_dedicated: false,
             loan_id: 17,
         });
-        let control = encode_reply_control(&ReplyControl::Success);
         stream
             .write_all(&frame::encode_frame_parts(
                 call.request_id,
-                flags::FLAG_RESPONSE | flags::FLAG_REPLY_V2 | flags::FLAG_BUDDY,
-                &[&descriptor, &control],
+                flags::FLAG_RPC_RECORD | flags::FLAG_RESPONSE | flags::FLAG_BUDDY,
+                &[
+                    &[RpcRecordKind::CallEnd as u8, CallStatus::Success as u8],
+                    &descriptor,
+                ],
             ))
             .await
             .unwrap();
@@ -1173,22 +1317,20 @@ async fn unnegotiated_shm_reply_is_rejected_before_mapping_or_loan_admission() {
     });
     let mut client = endpoint.client();
     client.connect().await.unwrap();
+    let peer_pool = client.server_pool.lock().as_ref().unwrap().clone();
     let error = client.call_inline(&identity(), 0, b"x").await.unwrap_err();
     assert_eq!(error.phase(), crate::TransportPhase::DispatchUncertain);
     assert!(
         matches!(error.source_error(), IpcError::ResponseFailure(error) if error.to_string().contains("not negotiated"))
     );
+    // The protocol error ends the connection at once, and its retirement may
+    // already have dropped the peer cache together with any mapping.
     assert_eq!(
-        client
-            .server_pool
-            .lock()
-            .as_ref()
-            .unwrap()
+        peer_pool
             .read()
             .cache
             .as_ref()
-            .unwrap()
-            .mapped_segments(),
+            .map_or(0, |cache| cache.mapped_segments()),
         0
     );
     assert!(client.close_shared_bounded(WAIT).await);
@@ -1206,22 +1348,24 @@ async fn cancelled_chunk_sender_finishes_its_stream_and_preserves_other_calls() 
     let peer = tokio::spawn(async move {
         let mut stream = accept(&mut listener).await;
         let (first, body) = read_frame(&mut stream).await;
-        assert!(flags::is_chunked(first.flags));
-        let (index, total, _) = c2_wire::chunk::header::decode_chunk_header(&body, 0).unwrap();
-        assert_eq!((index, total), (0, 3));
+        assert_eq!(
+            first.flags,
+            flags::FLAG_RPC_RECORD | flags::FLAG_CHUNKED | flags::FLAG_FIRST_CHUNK
+        );
+        assert!(
+            matches!(decode_rpc_record(&first, &body, None).unwrap(), RpcRecord::Open { value: ValuePart { chunk: c2_wire::rpc::ChunkPosition::First { total_bytes }, .. }, .. } if total_bytes == 3 * 4096)
+        );
         first_sent.send(()).unwrap();
         let (other, _) = read_frame(&mut stream).await;
         assert_ne!(other.request_id, first.request_id);
         reply(&mut stream, other.request_id, b"other").await;
-        for expected in 1..3 {
+        for _ in 1..3 {
             let (header, body) = read_frame(&mut stream).await;
             assert_eq!(header.request_id, first.request_id);
-            assert_eq!(
-                c2_wire::chunk::header::decode_chunk_header(&body, 0)
-                    .unwrap()
-                    .0,
-                expected
-            );
+            assert!(matches!(
+                decode_rpc_record(&header, &body, None).unwrap(),
+                RpcRecord::OpenContinuation { .. }
+            ));
         }
         reply(&mut stream, first.request_id, b"cancelled result").await;
         complete.send(()).unwrap();
@@ -1264,7 +1408,7 @@ async fn cancelled_chunk_sender_finishes_its_stream_and_preserves_other_calls() 
     drop(source);
     completed.await.unwrap();
     assert!(client.is_connected());
-    assert_eq!(client.pending_len_for_test(), 0);
+    eventually(|| client.pending_len_for_test() == 0).await;
     assert!(client.close_shared_bounded(WAIT).await);
     peer.await.unwrap();
 }
@@ -1272,7 +1416,7 @@ async fn cancelled_chunk_sender_finishes_its_stream_and_preserves_other_calls() 
 #[derive(Clone, Copy, Debug)]
 enum FramedFault {
     Direction,
-    ReplyControl,
+    CallEndStatus,
     UnnegotiatedShm,
     ZeroLoan,
     MissingMapping,
@@ -1314,23 +1458,50 @@ fn publish_file_loan(
     (id, pool, budget)
 }
 fn reply_chunk(rid: u64, count: u32, index: u32, data: &[u8]) -> Vec<u8> {
-    let meta = c2_wire::chunk::header::encode_reply_chunk_meta(8192, count, index);
-    frame::encode_frame_parts(
-        rid,
-        flags::FLAG_RESPONSE | flags::FLAG_REPLY_V2 | flags::FLAG_CHUNKED,
-        &[&meta, data],
-    )
+    if count == 0 {
+        return frame::encode_frame(
+            rid,
+            flags::FLAG_RPC_RECORD
+                | flags::FLAG_RESPONSE
+                | flags::FLAG_CHUNKED
+                | flags::FLAG_FIRST_CHUNK,
+            &[6, 0, 0],
+        );
+    }
+    if count == 1 {
+        return encode_call_end_frame(
+            rid,
+            CallMode::Unary,
+            CallStatus::Success,
+            0,
+            ValuePart::whole(ValueStorage::Inline(data)),
+        )
+        .unwrap();
+    }
+    if index == 0 {
+        encode_call_end_frame(
+            rid,
+            CallMode::Unary,
+            CallStatus::Success,
+            0,
+            ValuePart::first(8192, ValueStorage::Inline(data)),
+        )
+        .unwrap()
+    } else {
+        encode_value_continuation_frame(rid, RpcRecordKind::CallEnd, ValueStorage::Inline(data))
+            .unwrap()
+    }
 }
 
-// Group: correlated frame-content faults preserve admission while the reader
-// still settles the original loan book. A zero loan ID stops admission.
+// Group: readable frame-content faults still settle the original loan book.
+// A zero loan ID or an unnegotiated SHM direction stops new admission.
 // No SHM allocation is claimed by this proof:
 // the file handle isolates the driver's control/read and error-phase wiring.
 #[tokio::test]
 async fn framed_response_faults_remain_uncertain_and_still_settle_release_records() {
     for fault in [
         FramedFault::Direction,
-        FramedFault::ReplyControl,
+        FramedFault::CallEndStatus,
         FramedFault::UnnegotiatedShm,
         FramedFault::ZeroLoan,
         FramedFault::MissingMapping,
@@ -1371,12 +1542,12 @@ async fn framed_response_faults_remain_uncertain_and_still_settle_release_record
             let (request, _) = read_frame(&mut stream).await;
             let bad = match fault {
                 FramedFault::Direction => {
-                    frame::encode_frame(request.request_id, flags::FLAG_CALL_V2, &[0])
+                    frame::encode_frame(request.request_id, flags::FLAG_RPC_RECORD, &[6, 0])
                 }
-                FramedFault::ReplyControl => frame::encode_frame(
+                FramedFault::CallEndStatus => frame::encode_frame(
                     request.request_id,
-                    flags::FLAG_RESPONSE | flags::FLAG_REPLY_V2,
-                    &[0xff],
+                    flags::FLAG_RESPONSE | flags::FLAG_RPC_RECORD,
+                    &[6, 0xff],
                 ),
                 FramedFault::ChunkGeometry => reply_chunk(request.request_id, 0, 0, b"x"),
                 FramedFault::DuplicateChunk => {
@@ -1399,8 +1570,8 @@ async fn framed_response_faults_remain_uncertain_and_still_settle_release_record
                     });
                     frame::encode_frame_parts(
                         request.request_id,
-                        flags::FLAG_RESPONSE | flags::FLAG_REPLY_V2 | flags::FLAG_BUDDY,
-                        &[&descriptor, &[0]],
+                        flags::FLAG_RESPONSE | flags::FLAG_RPC_RECORD | flags::FLAG_BUDDY,
+                        &[&[6, 0], &descriptor],
                     )
                 }
             };
@@ -1435,7 +1606,7 @@ async fn framed_response_faults_remain_uncertain_and_still_settle_release_record
                             break;
                         }
                         assert!(
-                            header.is_ctrl(),
+                            header.flags == flags::FLAG_RPC_RECORD && payload.first() == Some(&7),
                             "response failure must not replay a business call"
                         );
                     }
@@ -1460,7 +1631,8 @@ async fn framed_response_faults_remain_uncertain_and_still_settle_release_record
         );
         assert_eq!(
             client.is_connected(),
-            !matches!(fault, FramedFault::ZeroLoan)
+            !matches!(fault, FramedFault::ZeroLoan | FramedFault::UnnegotiatedShm),
+            "{fault:?}"
         );
         assert!(budget.snapshot().file.used_bytes > 0);
         loan_sent.send(loan).unwrap();
@@ -1474,7 +1646,7 @@ async fn framed_response_faults_remain_uncertain_and_still_settle_release_record
                 .snapshot()
                 .unwrap()
                 .reason(),
-            if matches!(fault, FramedFault::ZeroLoan) {
+            if matches!(fault, FramedFault::ZeroLoan | FramedFault::UnnegotiatedShm) {
                 ConnectionEndReason::ProtocolError
             } else {
                 ConnectionEndReason::LocalClose
@@ -1547,12 +1719,13 @@ async fn materialization_failure_is_uncertain_and_refunds_local_backing_once() {
     peer.await.unwrap();
 }
 
-// Group: periodic expiry owns local reassembly/idle pool reclamation, and its
-// references end with the physical driver rather than a live client shell.
+// Group: an abandoned waiter retains partial reply storage until peer end.
+// Maintenance references end with the driver rather than a live client shell.
 #[tokio::test]
-async fn client_gc_expires_a_stalled_reply_and_stops_with_the_driver() {
+async fn abandoned_waiter_keeps_partial_reply_storage_until_peer_end() {
     let endpoint = Endpoint::new();
     let mut listener = LocalListener::bind(&endpoint.endpoint).unwrap();
+    let (end_peer, peer_done) = oneshot::channel();
     let peer = tokio::spawn(async move {
         let mut stream = accept(&mut listener).await;
         let (request, _) = read_frame(&mut stream).await;
@@ -1560,7 +1733,8 @@ async fn client_gc_expires_a_stalled_reply_and_stops_with_the_driver() {
             .write_all(&reply_chunk(request.request_id, 2, 0, &[1; 4096]))
             .await
             .unwrap();
-        expect_disconnect_or_eof(&mut stream).await;
+        peer_done.await.unwrap();
+        drop(stream);
         crate::tests::close_listener(listener).await;
     });
     let mut cfg = config();
@@ -1578,15 +1752,20 @@ async fn client_gc_expires_a_stalled_reply_and_stops_with_the_driver() {
         let client = client.clone();
         async move { client.call_inline(&identity(), 0, b"partial").await }
     });
-    eventually(|| client.memory_budget.snapshot().reassembly.used_bytes > 0).await;
-    eventually(|| client.memory_budget.snapshot().reassembly.used_bytes == 0).await;
-    assert_eq!(client.memory_budget.snapshot().file.used_bytes, 0);
+    eventually(|| client.memory_budget.snapshot().file.used_bytes > 0).await;
+    assert!(client.memory_budget.snapshot().reassembly.used_bytes > 0);
     caller.abort();
     let _ = caller.await;
-    assert_eq!(client.pending_len_for_test(), 0);
-    assert!(client.close_shared_bounded(WAIT).await);
-    eventually(|| weak.upgrade().is_none()).await;
+    assert_eq!(client.pending_len_for_test(), 1);
+    assert!(client.memory_budget.snapshot().file.used_bytes > 0);
+    assert!(client.memory_budget.snapshot().reassembly.used_bytes > 0);
+    end_peer.send(()).unwrap();
     peer.await.unwrap();
+    eventually(|| client.pending_len_for_test() == 0).await;
+    assert!(client.close_shared_bounded(WAIT).await);
+    assert_eq!(client.memory_budget.snapshot().file.used_bytes, 0);
+    assert_eq!(client.memory_budget.snapshot().reassembly.used_bytes, 0);
+    eventually(|| weak.upgrade().is_none()).await;
 }
 
 #[path = "p4_continuation_tests.rs"]
@@ -1600,3 +1779,32 @@ mod fixes;
 
 #[path = "g1_tests.rs"]
 mod g1;
+
+#[path = "stream_receive_tests.rs"]
+mod stream_receive;
+
+#[tokio::test]
+async fn inline_unary_has_one_rpc_record_in_each_direction() {
+    let endpoint = Endpoint::new();
+    let mut listener = LocalListener::bind(&endpoint.endpoint).unwrap();
+    let peer = tokio::spawn(async move {
+        let mut stream = accept(&mut listener).await;
+        let (header, body) = read_frame(&mut stream).await;
+        assert_eq!(header.flags, 0x1000, "one inline OPEN, no credit exchange");
+        assert_eq!(body[0], 1);
+        assert!(body.ends_with(b"one input"));
+        let result = frame::encode_frame(header.request_id, 0x1002, &[6, 0, 42]);
+        stream.write_all(&result).await.unwrap();
+        expect_disconnect_or_eof(&mut stream).await;
+        crate::tests::close_listener(listener).await;
+    });
+    let mut client = endpoint.client();
+    client.connect().await.unwrap();
+    let result = client
+        .call_inline(&identity(), 0, b"one input")
+        .await
+        .unwrap();
+    assert_eq!(result.into_owned_bytes().unwrap(), vec![42]);
+    assert!(client.close_shared_bounded(WAIT).await);
+    peer.await.unwrap();
+}

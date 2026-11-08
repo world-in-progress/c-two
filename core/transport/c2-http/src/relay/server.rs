@@ -409,22 +409,36 @@ impl RelayServer {
         // Spawn background tasks (heartbeat, failure detection, anti-entropy, etc.)
         let bg_handles = spawn_background_tasks(state.clone(), cancel.clone());
 
+        let (http_stop, http_stopped) = oneshot::channel();
         let server = axum::serve(
             listener,
             app.into_make_service_with_connect_info::<SocketAddr>(),
-        );
+        )
+        .with_graceful_shutdown(async {
+            let _ = http_stopped.await;
+        });
+        let mut server = tokio::spawn(std::future::IntoFuture::into_future(server));
         let sweeper = Self::idle_sweeper(state.clone(), idle_timeout_secs);
 
-        tokio::select! {
-            _ = server => {},
-            _ = Self::command_loop(state.clone(), &mut cmd_rx) => {},
-            _ = sweeper => {},
-        }
+        let http_finished = tokio::select! {
+            _ = &mut server => true,
+            _ = Self::command_loop(state.clone(), &mut cmd_rx) => false,
+            _ = sweeper => false,
+        };
 
         // Fence admission and observe native forwarding before the runtime can
         // destroy tasks/IPC futures. Waiter disappearance never counts as drain.
         state.forwarding.close();
         state.forwarding.drain().await;
+        // Registration handlers can be waiting for control publication. Fence
+        // it before awaiting HTTP handlers, so graceful drain has no cycle.
+        state.stop_upstream_controls().await;
+        // The HTTP task keeps polling existing responses and token cancellation
+        // while native forwarding drains. New business admission is closed.
+        let _ = http_stop.send(());
+        if !http_finished {
+            let _ = server.await;
+        }
 
         // Shutdown: broadcast leave, cancel background tasks
         let leave = PeerEnvelope::new(
@@ -442,7 +456,6 @@ impl RelayServer {
         for handle in bg_handles {
             let _ = handle.await;
         }
-        state.stop_upstream_controls().await;
         state.clients.shutdown().await;
         let _ = client_observer.await;
     }

@@ -32,6 +32,12 @@ pub fn is_peer_identity_mismatch(error: &io::Error) -> bool {
         .is_some_and(|cause| cause.is::<PeerIdentityMismatch>())
 }
 
+/// Copy this crate's native identity refusal without erasing its marker.
+pub fn clone_peer_identity_mismatch(error: &io::Error) -> Option<io::Error> {
+    let cause = error.get_ref()?.downcast_ref::<PeerIdentityMismatch>()?;
+    Some(io::Error::new(error.kind(), PeerIdentityMismatch(cause.0)))
+}
+
 #[cfg(windows)]
 mod windows;
 #[cfg(windows)]

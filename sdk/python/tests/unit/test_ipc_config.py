@@ -47,6 +47,8 @@ def _reset_registry_and_settings(monkeypatch):
         'C2_IPC_POOL_PREWARM_SEGMENTS',
         'C2_IPC_POOL_MIN_RETAINED_SEGMENTS',
         'C2_IPC_POOL_DECAY_SECONDS',
+        'C2_IPC_MAX_TOTAL_CHUNKS',
+        'C2_IPC_MAX_INFLIGHT_CHUNK_FRAMES',
         'C2_IPC_SHM_BACKING_BUDGET_BYTES',
         'C2_IPC_FILE_BACKING_BUDGET_BYTES',
         'C2_IPC_LIVE_REASSEMBLY_BUDGET_BYTES',
@@ -271,7 +273,7 @@ _COMMON_IPC_FIELDS = (
     ('pool_min_retained_segments', 'C2_IPC_POOL_MIN_RETAINED_SEGMENTS', 2, 0),
     ('reassembly_segment_size', 'C2_IPC_REASSEMBLY_SEGMENT_SIZE', 65536, 131072),
     ('reassembly_max_segments', 'C2_IPC_REASSEMBLY_MAX_SEGMENTS', 3, 2),
-    ('max_total_chunks', 'C2_IPC_MAX_TOTAL_CHUNKS', 8192, 16384),
+    ('max_inflight_chunk_frames', 'C2_IPC_MAX_INFLIGHT_CHUNK_FRAMES', 8192, 16384),
     ('chunk_gc_interval', 'C2_IPC_CHUNK_GC_INTERVAL', 2.5, 5.0),
     ('chunk_threshold_ratio', 'C2_IPC_CHUNK_THRESHOLD_RATIO', 0.5, 0.75),
     ('chunk_assembler_timeout', 'C2_IPC_CHUNK_ASSEMBLER_TIMEOUT', 30.0, 60.0),
@@ -288,6 +290,29 @@ _SERVER_IPC_FIELDS = (
     ('max_pending_requests', 'C2_IPC_MAX_PENDING_REQUESTS', 7, 11),
     ('max_execution_workers', 'C2_IPC_MAX_EXECUTION_WORKERS', 9, 7),
 )
+
+
+@pytest.mark.parametrize('role', ('server', 'client'))
+def test_retired_chunk_capacity_override_is_rejected_and_env_ignored(monkeypatch, role):
+    resolve = getattr(_native, f'resolve_{role}_ipc_config')
+    monkeypatch.setenv('C2_IPC_MAX_TOTAL_CHUNKS', 'invalid')
+    cfg = resolve(None, None)
+    assert cfg['max_inflight_chunk_frames'] == 512
+    assert 'max_total_chunks' not in cfg
+
+    with pytest.raises(ValueError, match='max_total_chunks'):
+        resolve({'max_total_chunks': 2}, None)
+
+
+@pytest.mark.parametrize('role', ('server', 'client'))
+def test_new_chunk_capacity_rejects_zero(monkeypatch, role):
+    resolve = getattr(_native, f'resolve_{role}_ipc_config')
+    with pytest.raises(ValueError, match='max_inflight_chunk_frames'):
+        resolve({'max_inflight_chunk_frames': 0}, None)
+
+    monkeypatch.setenv('C2_IPC_MAX_INFLIGHT_CHUNK_FRAMES', '0')
+    with pytest.raises(ValueError, match='max_inflight_chunk_frames'):
+        resolve(None, None)
 
 
 @pytest.mark.parametrize(
@@ -671,7 +696,7 @@ class _FakeRuntimeSession:
         self,
         *,
         max_outstanding_calls: int | None = None,
-        retained_input_budget_bytes: int | None = None,
+        payload_buffer_budget_bytes: int | None = None,
         **_kwargs,
     ) -> None:
         from c_two._native import resolve_local_endpoint_context
@@ -680,7 +705,7 @@ class _FakeRuntimeSession:
         self._limits = {
             key: value for key, value in (
                 ('max_outstanding_calls', max_outstanding_calls),
-                ('retained_input_budget_bytes', retained_input_budget_bytes),
+                ('payload_buffer_budget_bytes', payload_buffer_budget_bytes),
             ) if value is not None
         }
         self.adopted_observations: list[_FakeRetiredObservation] = []
@@ -776,7 +801,7 @@ def test_relay_resolved_connect_delegates_route_validation_to_runtime_session(mo
 def test_route_spy_shutdown_preserves_native_context_and_accepted_limits(monkeypatch):
     registry = _get_default_runtime()
     installed = _FakeRuntimeSession(
-        max_outstanding_calls=7, retained_input_budget_bytes=8192,
+        max_outstanding_calls=7, payload_buffer_budget_bytes=8192,
     )
     captured = installed.local_endpoint_context()
 
@@ -787,7 +812,7 @@ def test_route_spy_shutdown_preserves_native_context_and_accepted_limits(monkeyp
         assert replacement is not installed
         assert replacement.local_endpoint_context() is captured
         assert replacement.call_execution_limits_overrides == {
-            'max_outstanding_calls': 7, 'retained_input_budget_bytes': 8192,
+            'max_outstanding_calls': 7, 'payload_buffer_budget_bytes': 8192,
         }
         assert len(replacement.adopted_observations) == 1
         assert isinstance(replacement.adopted_observations[0], _FakeRetiredObservation)
@@ -823,10 +848,6 @@ def test_relay_connected_http_mode_uses_single_core_client_call_path():
         runtime_source,
     )
     assert re.search(r'inner:\s*Mutex\s*<\s*Option\s*<\s*Client\s*>\s*>', client_source)
-    # Encoding consumes the prepared scope; execution receives only that
-    # encoded owner, with no second route or method argument.
-    assert re.search(r'fn\s+finish\s*\([^)]*encoded:\s*c2_core::EncodedCall\s*,?\s*\)', client_source)
-    assert re.search(r'py\s*\.detach\(move\s*\|\|\s*encoded\.call_held\(\)\)', client_source)
     assert 'RelayAwareHttpClient' not in runtime_source
     assert 'release_http_client_from_global_pool' not in client_source
 

@@ -27,8 +27,12 @@ The name chosen by the application in `cc.register(..., name=...)` and `cc.conne
 _Avoid_: service name, resource name, endpoint (for a route)
 
 **路由 / route**:
-A route name bound to one resource in one Host, together with the contract identity it serves.
+A route name together with the contract identity it serves; it names one resource's state. Within its scope (the relay mesh, or one endpoint for direct IPC) at most one registration of it is live at a time.
 _Avoid_: binding, endpoint
+
+**注册 / registration**:
+One period in which a Host serves a route, from `cc.register` until the route is unregistered or the Host stops. A route may have many registrations over time; the route UID tells them apart inside C-Two and is not shown to clients.
+_Avoid_: instance, activation, incarnation
 
 **CRM 命名空间 / CRM namespace**:
 The `namespace` argument of `@cc.crm`, part of the contract identity.
@@ -56,6 +60,72 @@ _Avoid_: 运行时 or a lowercase runtime for this object (both name C-Two as a 
 The server side of a Runtime: it listens on an IPC endpoint and serves the registered resources.
 _Avoid_: 宿主, server process
 
+### Calls and streams
+
+**一元调用 / unary call**:
+A call that sends at most one value each way and ends with one terminal outcome.
+_Avoid_: simple call, request (for the whole call)
+
+**服务端流 / server stream**:
+A call that sends one input and returns zero or more items, declared with `@cc.stream`; its contract method carries `"mode": "server_stream"`.
+_Avoid_: subscription, streaming call (for this kind alone)
+
+**调用模式 / call mode**:
+Whether a call is a unary call or a server stream. A contract method declares its mode; each call states the mode it uses, and the server refuses a call whose mode differs from its method's before the call enters the resource.
+_Avoid_: call type, call kind
+
+**条目 / item**:
+One complete domain value a server stream delivers per iteration; it may travel as several chunks.
+_Avoid_: message, event, element
+
+**资源推进 / resource step**:
+One run of a server stream's resource code under a route permit, until it yields an item, finishes or raises. Waiting for demand, budget or the network happens between steps.
+_Avoid_: iteration (for the server side), tick
+
+**调用记录 / call record**:
+The single state of one call inside C-Two: its admission, progress, values awaiting delivery, terminal outcome and cleanup.
+_Avoid_: request state, call context
+
+**未执行 / not executed**:
+The call-end status a server sends when it refused a call before the call entered the resource. The client reports such a call as pre-dispatch, so retrying it is safe.
+_Avoid_: rejected (for the status)
+
+**请求号高水位 / request-ID high-water mark**:
+The largest request ID a connection has opened. A later chunk for a smaller ID whose call has ended is discarded without a new call or another reply.
+_Avoid_: tombstone, settled marker
+
+**准入凭证 / admission token**:
+The proof that a call was admitted to a route. Later steps and the cleanup of the same call continue under it while the route drains.
+_Avoid_: lease, permit (for the admission)
+
+**路由许可 / route permit**:
+The execution permission one resource step or cleanup takes under the route's concurrency mode; it is released when the step ends.
+_Avoid_: lock, slot
+
+**调用槽 / call slot**:
+The counted capacity an active call occupies for its whole life, limited by `max_pending_requests` and a route's `max_pending`; a single step's worker is counted separately.
+_Avoid_: worker (for a slot)
+
+**条目需求 / item demand**:
+Permission for a server stream to produce one more item. The first is granted when the stream opens, and each delivered item grants the next.
+_Avoid_: credit (for demand)
+
+**窗口 / flow-control window**:
+Staging space a receiver has really reserved and granted to its sender. Only a hop that forwards while it receives uses one, returning the space chunk by chunk.
+_Avoid_: buffer (for the grant), quota
+
+**调用终态 / call terminal outcome**:
+The one final result of a call, reported after its execution and cleanup have really ended; separate from the settlement of its loans.
+_Avoid_: status (alone), completion
+
+**调用定位符 / call locator**:
+The server instance, connection and request id an error carries to identify the original call. It is not a durable query handle.
+_Avoid_: call id, trace id
+
+**调用令牌 / call token**:
+The random value a relay gives at the start of one forwarded call's response. A client uses it only to cancel that call while the relay is still forwarding it; it is not a query or replay handle.
+_Avoid_: call id, session token
+
 ### Transport
 
 **直接 IPC / direct IPC**:
@@ -69,6 +139,10 @@ _Avoid_: 中继, proxy, gateway, broker
 **relay 锚点 / relay anchor**:
 The relay a process registers its routes with and resolves names through (`C2_RELAY_ANCHOR_ADDRESS`). Calls may travel through a different relay.
 _Avoid_: home relay, registry
+
+**路由冲突 / route conflict**:
+The state in which more than one relay holds a live registration of the same route after a partition. New acquisitions fail until only one registration is left; C-Two never chooses between them.
+_Avoid_: duplicate route, split brain
 
 **端点 / endpoint**:
 The operating-system object behind an `ipc://` address: a Unix socket in an endpoint namespace, or a Windows named pipe.
@@ -160,6 +234,10 @@ _Avoid_: disk cache, swap
 A finite allowance of bytes or time that one scope may consume, such as the SHM backing bytes of one direction or the wait of one call.
 _Avoid_: quota; limit (for a budget)
 
+**载荷缓冲预算 / payload buffer budget**:
+The one byte budget of a Runtime or relay for the payload buffers C-Two keeps for calls, such as a call's input before its transport copy and HTTP bodies. It is separate from the IPC backing and reassembly budgets.
+_Avoid_: retained input budget
+
 **释放 / release**:
 Ending a lease, an allocation or a hold. Across processes it travels as a release record on the physical connection; a local release does not mean the pool owner has reclaimed the allocation.
 _Avoid_: free (for a lease), close, 归还
@@ -171,3 +249,9 @@ _Avoid_: 期限
 **超时 / timeout**:
 A configured or caller-passed duration after which something expires, such as `timeout=`, `startup_timeout` or `C2_RELAY_CALL_TIMEOUT`; a bounded operation computes its deadline from it.
 _Avoid_: 期限
+
+### Project
+
+**维护者 / maintainer**:
+The people who decide C-Two's direction; the backlog, designs and ADRs record their decisions and approvals.
+_Avoid_: 用户 and 开发者 for a maintainer (both name the people and applications that use C-Two)

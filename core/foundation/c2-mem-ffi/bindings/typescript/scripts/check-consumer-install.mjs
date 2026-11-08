@@ -113,7 +113,10 @@ try {
   const source = readFileSync(resolve(packageRoot, '../../../c2-codegen/assets/typescript_transport.ts'), 'utf8');
   writeFileSync(resolve(consumerRoot, 'transport.ts'), source);
   writeFileSync(resolve(consumerRoot, 'transport.mjs'), ts.transpileModule(source, {
-    compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ES2022 },
+    compilerOptions: {
+      target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ES2022,
+      typeRoots: [resolve(consumerRoot, 'node_modules', '@types')],
+    },
   }).outputText);
   writeFileSync(resolve(consumerRoot, 'smoke.mjs'), `
 import assert from 'node:assert/strict';
@@ -122,34 +125,33 @@ import { mkdirSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { createInterface } from 'node:readline';
 import {
-  C2_MEM_FFI_ABI_VERSION, createNodeIpcConnect, loadBundledC2MemFfiNodeNativeSymbols,
+  C2_MEM_FFI_ABI_VERSION, createNodeIpcConnector, loadBundledC2MemFfiNodeNativeSymbols,
 } from '@c-two/c2-mem-ffi';
 import { createIpcEncodedTransport } from './transport.mjs';
 const { symbols } = loadBundledC2MemFfiNodeNativeSymbols();
-assert.equal(C2_MEM_FFI_ABI_VERSION, 7);
-assert.equal(symbols.c2_mem_ffi_abi_version(), 7);
+assert.equal(C2_MEM_FFI_ABI_VERSION, 8);
+assert.equal(symbols.c2_mem_ffi_abi_version(), 8);
 const address = 'ipc://packed-node-' + process.pid;
 const root = resolve('ipc'); mkdirSync(root, {mode: 0o700});
 const child = spawn(process.argv[2], [process.platform === 'win32' ? '-' : root, address], {stdio: ['pipe', 'pipe', 'pipe']});
 let stderr = ''; child.stderr.on('data', b => {stderr += b;});
 const closed = new Promise(resolve => child.once('exit', code => resolve(code)));
 const lines = createInterface({input: child.stdout})[Symbol.asyncIterator]();
-const connect = createNodeIpcConnect(process.platform === 'win32' ? {} : {ipcRoot: root});
-let connection;
-const transport = createIpcEncodedTransport(address, {connect: async address => (connection = await connect(address))});
+const connect = createNodeIpcConnector(process.platform === 'win32' ? {} : {ipcRoot: root});
+const transport = createIpcEncodedTransport(address, {connect});
 try {
-  assert.equal(JSON.parse((await lines.next()).value).kind, 'ready');
-  const contract = {schema: 'c-two.contract.v2', namespace: 'test.p8a', name: 'Echo', version: '0.1.0', descriptorSha256: 'd'.repeat(64), abiHash: 'a'.repeat(64), signatureHash: 'b'.repeat(64)};
+  const ready = JSON.parse((await lines.next()).value);
+  assert.equal(ready.kind, 'ready');
+  const contract = ready.contract;
   for (const payload of [new Uint8Array([1, 3, 5, 7]), new Uint8Array(8192).fill(9)]) {
-    assert.deepEqual(await transport.call('echo', contract, 'echo', payload), payload);
+    const response = await transport.call('echo', contract, 'ping', () => payload);
+    try { assert.deepEqual(Uint8Array.from(response), payload); }
+    finally { response.release(); }
   }
-  const memory = connection.memory;
-  const request = memory.prepareRequest(new Uint8Array([2, 4, 6, 8]));
-  assert.equal(typeof request.block.loanId, 'bigint'); assert.ok(request.block.loanId > 0n);
-  memory.discardRequest(request);
+  assert.equal(typeof connect.stats(), 'object');
   await transport.close();
 } finally {
-  connection?.close(); connect.close(); child.stdin.end('quit\\n');
+  connect.close(); child.stdin.end('quit\\n');
   const timer = setTimeout(() => child.kill(), 12000);
   const code = await closed; clearTimeout(timer); assert.equal(code, 0, stderr);
 }
@@ -157,26 +159,24 @@ try {
   writeFileSync(resolve(consumerRoot, 'smoke-types.mts'), `
 import {
   C2_MEM_FFI_ABI_VERSION,
-  type C2MemFfiMemoryContext, type C2MemFfiPreparedRequest, type C2MemFfiBlock,
-  type C2MemFfiNodeNativeSymbols, createNodeIpcConnect, loadBundledC2MemFfiNodeNativeSymbols,
+  type NativeEndpointContext, type NativeCall, type NativeBuffer,
+  type C2MemFfiNodeNativeSymbols, createNodeIpcConnector, loadBundledC2MemFfiNodeNativeSymbols,
 } from '@c-two/c2-mem-ffi';
 import type { C2IpcConnect } from './transport.js';
-const abiVersion: 7 = C2_MEM_FFI_ABI_VERSION;
-const symbols: C2MemFfiNodeNativeSymbols = loadBundledC2MemFfiNodeNativeSymbols();
-const connect = createNodeIpcConnect();
+const abiVersion: 8 = C2_MEM_FFI_ABI_VERSION;
+const symbols: C2MemFfiNodeNativeSymbols = loadBundledC2MemFfiNodeNativeSymbols().symbols;
+const connect = createNodeIpcConnector();
 const genericConnect: C2IpcConnect = connect;
 void genericConnect;
-async function smokeTypes(): Promise<C2MemFfiBlock | undefined> {
-  const connection = await connect('ipc://typecheck');
-  const memory: C2MemFfiMemoryContext | undefined = connection.memory;
-  if (memory === undefined) return undefined;
-  const request: C2MemFfiPreparedRequest = memory.prepareRequest(new Uint8Array([abiVersion]));
-  const block: C2MemFfiBlock = request.block;
-  const id: bigint = block.loanId;
-  memory.discardRequest(request);
+async function smokeTypes(): Promise<NativeBuffer | null> {
+  const connection: NativeEndpointContext = await connect('ipc://typecheck');
+  const call: NativeCall = connection.beginCall('echo', 'echo', false, null);
+  await call.chargeInput(1);
+  await call.dispatch(new Uint8Array([abiVersion]));
+  const response = await call.next();
+  call.close();
   await connection.close();
-  void id;
-  return block;
+  return response;
 }
 void symbols; void smokeTypes;
 `);
@@ -191,6 +191,7 @@ void symbols; void smokeTypes;
     "skipLibCheck": false,
     "strict": true,
     "target": "ES2022",
+    "typeRoots": ${JSON.stringify([resolve(consumerRoot, 'node_modules', '@types')])},
     "types": []
   },
   "include": ["smoke-types.mts"]
@@ -206,7 +207,7 @@ void symbols; void smokeTypes;
   run(process.execPath, ['smoke.mjs', peer], {
     cwd: consumerRoot,
   });
-  console.log('npm packed ABI 7 runtime and TypeScript tarballs install, typecheck, and exercise verified IPC plus opaque memory owners from a clean consumer project.');
+  console.log('npm packed ABI 8 runtime and TypeScript tarballs install, typecheck, and exercise native IPC endpoints and response owners from a clean consumer project.');
 } finally {
   rmSync(tempRoot, { recursive: true, force: true });
 }

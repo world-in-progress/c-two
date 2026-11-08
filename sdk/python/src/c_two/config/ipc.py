@@ -34,8 +34,9 @@ class BaseIPCOverrides(TypedDict, total=False):
     reassembly_segment_size: int
     # Maximum number of reassembly segments retained for a transfer.
     reassembly_max_segments: int
-    # Maximum number of chunks tracked across active reassembly operations.
-    max_total_chunks: int
+    # Maximum server chunk frames processed at once; the reassembly registry
+    # derives its soft maintenance threshold from this value.
+    max_inflight_chunk_frames: int
     # Seconds between garbage-collection sweeps for stale chunks.
     chunk_gc_interval: float
     # Fraction of a segment at which payloads switch to chunked transfer.
@@ -75,6 +76,10 @@ class ServerIPCOverrides(BaseIPCOverrides, total=False):
 
 class ClientIPCOverrides(BaseIPCOverrides, total=False):
     """Client-side IPC code-level overrides."""
+
+    # Seconds an unreferenced cached connection is retained (default 60).
+    # Zero disables timed eviction.
+    client_idle_timeout: float
 
     # Idle window before the client's own request/reassembly buddy segments
     # may be retired while the connection stays open. Zero retires idle

@@ -1,4 +1,4 @@
-//! C ABI substrate for foreign runtime adapters that need C-Two shared memory.
+//! C ABI for native client domains, IPC endpoints, calls and local buffers.
 
 use c2_config::{ConfigResolver, ConfigSources, LocalEndpointContext, LocalEndpointOptions};
 use std::ffi::CStr;
@@ -6,10 +6,8 @@ use std::os::raw::c_char;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
 use std::ptr;
-use std::time::{Duration, Instant};
 
-const MAX_SHM_PREFIX_LEN: usize = 255;
-const C2_MEM_FFI_ABI_VERSION: u32 = 7;
+const C2_MEM_FFI_ABI_VERSION: u32 = 8;
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -24,8 +22,8 @@ pub enum C2MemFfiStatus {
     IdentityMismatch = 7,
 }
 
-mod memory;
-pub use memory::*;
+mod client;
+pub use client::*;
 
 /// Owned immutable endpoint context. The C API exposes only an opaque pointer.
 pub struct C2MemFfiLocalEndpointContext {
@@ -38,23 +36,6 @@ fn guard_status(action: impl FnOnce() -> Result<(), C2MemFfiStatus>) -> C2MemFfi
         Ok(Err(status)) => status,
         Err(_) => C2MemFfiStatus::PoolError,
     }
-}
-
-fn parse_prefix(prefix: *const c_char) -> Result<String, C2MemFfiStatus> {
-    if prefix.is_null() {
-        return Err(C2MemFfiStatus::NullPointer);
-    }
-    let prefix = unsafe { CStr::from_ptr(prefix) }
-        .to_str()
-        .map_err(|_| C2MemFfiStatus::InvalidArgument)?;
-    if prefix.len() <= 1
-        || !prefix.starts_with('/')
-        || prefix[1..].contains('/')
-        || prefix.len() > MAX_SHM_PREFIX_LEN
-    {
-        return Err(C2MemFfiStatus::InvalidArgument);
-    }
-    Ok(prefix.to_string())
 }
 
 fn write_len(out_len: *mut usize, value: usize) -> Result<(), C2MemFfiStatus> {
@@ -140,39 +121,6 @@ fn endpoint_name_in_context(
         .to_str()
         .map(str::to_owned)
         .ok_or(C2MemFfiStatus::InvalidArgument)
-}
-
-/// Resolve the process configuration for this one legacy operation.
-fn local_endpoint_name(address: *const c_char) -> Result<String, C2MemFfiStatus> {
-    let address = parse_utf8_c_string(address)?;
-    endpoint_name_in_context(&capture_local_endpoint_context(None)?, &address)
-}
-
-/// Project the native local endpoint name without duplicating platform rules.
-/// Each invocation resolves the current configuration independently. Use an
-/// owned endpoint context for a stable two-operation length/copy query.
-///
-/// # Safety
-/// `address` must be NUL-terminated and `out_len` valid for one `usize`.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn c2_mem_ffi_local_endpoint_len(
-    address: *const c_char,
-    out_len: *mut usize,
-) -> C2MemFfiStatus {
-    guard_status(|| write_len(out_len, local_endpoint_name(address)?.len()))
-}
-
-/// # Safety
-/// `address` must be NUL-terminated; `dst` and `out_written` must be writable for `dst_len`
-/// bytes and one `usize`, respectively.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn c2_mem_ffi_local_endpoint_copy(
-    address: *const c_char,
-    dst: *mut c_char,
-    dst_len: usize,
-    out_written: *mut usize,
-) -> C2MemFfiStatus {
-    guard_status(|| copy_c_string(&local_endpoint_name(address)?, dst, dst_len, out_written))
 }
 
 /// Capture code/process/`.env`/platform endpoint configuration exactly once.
@@ -309,164 +257,6 @@ pub unsafe extern "C" fn c2_mem_ffi_local_endpoint_context_namespace_id_copy(
     })
 }
 
-/// Transfers one connected Unix socket to a foreign event loop. Invoke this
-/// bounded operation on a worker, and keep the captured context alive until it
-/// returns. Windows consumers use their native Named Pipe connection API.
-/// Typed peer identity refusals arrive as `IdentityMismatch`, other permission
-/// failures as `PermissionDenied`, and other IO failures as `IoError`.
-///
-/// # Safety
-/// `context`, the NUL-terminated `address`, and a non-null `timeout_millis`
-/// must remain live throughout the call. Both output pointers must be writable
-/// and non-overlapping. On success
-/// the caller owns `out_fd` and must close or adopt it exactly once. On failure
-/// `out_fd` is -1; `out_os_error` is zero or the native errno.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn c2_mem_ffi_local_endpoint_context_connect_unix(
-    context: *const C2MemFfiLocalEndpointContext,
-    address: *const c_char,
-    timeout_millis: *const u64,
-    out_fd: *mut i32,
-    out_os_error: *mut i32,
-) -> C2MemFfiStatus {
-    guard_status(|| {
-        if out_fd.is_null() || out_os_error.is_null() {
-            return Err(C2MemFfiStatus::NullPointer);
-        }
-        unsafe {
-            *out_fd = -1;
-            *out_os_error = 0;
-        }
-        if context.is_null() {
-            return Err(C2MemFfiStatus::NullPointer);
-        }
-        let deadline = connect_deadline(timeout_millis)?;
-        let address = parse_utf8_c_string(address)?;
-        let endpoint = unsafe { (*context).inner.endpoint(&address) }
-            .map_err(|_| C2MemFfiStatus::InvalidArgument)?;
-        #[cfg(unix)]
-        {
-            use std::os::fd::IntoRawFd;
-            let connect = || -> std::io::Result<std::os::unix::net::UnixStream> {
-                tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()?
-                    .block_on(c2_local::connect_unix_stream_until(&endpoint, deadline))
-            };
-            let stream = connect().map_err(|error| {
-                unsafe {
-                    *out_os_error = error.raw_os_error().unwrap_or(0);
-                }
-                connect_failure_status(&error)
-            })?;
-            unsafe {
-                *out_fd = stream.into_raw_fd();
-            }
-            Ok(())
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = (endpoint, deadline);
-            Err(C2MemFfiStatus::InvalidArgument)
-        }
-    })
-}
-
-/// A null pointer explicitly selects the native phase guard. A supplied zero
-/// budget is already expired, including when a Node worker waited in its queue.
-fn connect_deadline(timeout_millis: *const u64) -> Result<Option<Instant>, C2MemFfiStatus> {
-    if timeout_millis.is_null() {
-        return Ok(None);
-    }
-    let millis = unsafe { *timeout_millis };
-    Instant::now()
-        .checked_add(Duration::from_millis(millis))
-        .map(Some)
-        .ok_or(C2MemFfiStatus::InvalidArgument)
-}
-
-/// Endpoint identity verification happens before the first byte in c2-local;
-/// such refusals stay distinguishable from other IO failures. A missing raw
-/// OS code stays 0 and is never fabricated.
-#[cfg(any(unix, windows))]
-fn connect_failure_status(error: &std::io::Error) -> C2MemFfiStatus {
-    if c2_local::is_peer_identity_mismatch(error) {
-        C2MemFfiStatus::IdentityMismatch
-    } else if error.kind() == std::io::ErrorKind::PermissionDenied {
-        C2MemFfiStatus::PermissionDenied
-    } else {
-        C2MemFfiStatus::IoError
-    }
-}
-
-/// Transfer one verified Windows Named Pipe connection, plus its pinned server
-/// process, to a foreign runtime. Both handles are overlapped-capable,
-/// IOCP-unregistered, and owned by the caller exactly once. The connect uses
-/// the same optional caller deadline as the Unix bridge. Windows only; other
-/// platforms return `InvalidArgument`.
-///
-/// # Safety
-/// `context`, the NUL-terminated `address`, and a non-null `timeout_millis`
-/// must remain live throughout the call. All output pointers must be writable
-/// and non-overlapping. On success
-/// `out_pipe` and `out_process` hold raw HANDLE values the caller must close
-/// or adopt exactly once. On failure both are 0; `out_os_error` is zero or the
-/// native OS error.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn c2_mem_ffi_local_endpoint_context_connect_windows(
-    context: *const C2MemFfiLocalEndpointContext,
-    address: *const c_char,
-    timeout_millis: *const u64,
-    out_pipe: *mut usize,
-    out_process: *mut usize,
-    out_os_error: *mut i32,
-) -> C2MemFfiStatus {
-    guard_status(|| {
-        if out_pipe.is_null() || out_process.is_null() || out_os_error.is_null() {
-            return Err(C2MemFfiStatus::NullPointer);
-        }
-        unsafe {
-            *out_pipe = 0;
-            *out_process = 0;
-            *out_os_error = 0;
-        }
-        if context.is_null() {
-            return Err(C2MemFfiStatus::NullPointer);
-        }
-        let deadline = connect_deadline(timeout_millis)?;
-        let address = parse_utf8_c_string(address)?;
-        let endpoint = unsafe { (*context).inner.endpoint(&address) }
-            .map_err(|_| C2MemFfiStatus::InvalidArgument)?;
-        #[cfg(windows)]
-        {
-            use std::os::windows::io::IntoRawHandle;
-            let connect = || {
-                tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()?
-                    .block_on(c2_local::connect_windows_pipe_until(&endpoint, deadline))
-            };
-            let connection = connect().map_err(|error| {
-                unsafe {
-                    *out_os_error = error.raw_os_error().unwrap_or(0);
-                }
-                connect_failure_status(&error)
-            })?;
-            let (pipe, process) = connection.into_parts();
-            unsafe {
-                *out_pipe = pipe.into_raw_handle() as usize;
-                *out_process = process.into_raw_handle() as usize;
-            }
-            Ok(())
-        }
-        #[cfg(not(windows))]
-        {
-            let _ = (endpoint, deadline);
-            Err(C2MemFfiStatus::InvalidArgument)
-        }
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -481,29 +271,6 @@ mod tests {
     // other tests launch a compiler. Serialize those boundaries, including
     // socketpair's non-atomic CLOEXEC setup on macOS.
     pub(super) static PROCESS_STATE_LOCK: Mutex<()> = Mutex::new(());
-
-    #[test]
-    #[cfg(any(unix, windows))]
-    fn connect_status_distinguishes_identity_from_os_access_failure() {
-        let mismatch = c2_local::peer_identity_mismatch("peer identity differs");
-        assert_eq!(mismatch.kind(), std::io::ErrorKind::PermissionDenied);
-        assert_eq!(mismatch.raw_os_error(), None);
-        assert_eq!(mismatch.to_string(), "peer identity differs");
-        assert_eq!(
-            connect_failure_status(&mismatch),
-            C2MemFfiStatus::IdentityMismatch
-        );
-        let denied = std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            "peer identity differs",
-        );
-        assert_eq!(
-            connect_failure_status(&denied),
-            C2MemFfiStatus::PermissionDenied
-        );
-        let absent = std::io::Error::from(std::io::ErrorKind::NotFound);
-        assert_eq!(connect_failure_status(&absent), C2MemFfiStatus::IoError);
-    }
 
     struct SavedEndpointEnv {
         root: Option<std::ffi::OsString>,
@@ -618,52 +385,6 @@ mod tests {
             .to_string()
     }
 
-    #[test]
-    fn c_endpoint_projection_uses_the_same_platform_authority() {
-        let _lock = PROCESS_STATE_LOCK.lock().unwrap();
-        let address = CString::new("ipc://c-ffi-endpoint").unwrap();
-        let context = ConfigResolver::resolve_local_endpoint(
-            LocalEndpointOptions::default(),
-            ConfigSources::from_process(),
-        )
-        .unwrap();
-        let expected = context.endpoint(address.to_str().unwrap()).unwrap();
-        let expected = expected.os_name().to_str().unwrap();
-        let mut length = 0;
-        assert_eq!(
-            unsafe { c2_mem_ffi_local_endpoint_len(address.as_ptr(), &mut length) },
-            C2MemFfiStatus::Ok
-        );
-        assert_eq!(length, expected.len());
-        let mut buffer = vec![0_i8; length + 1];
-        let mut written = 0;
-        assert_eq!(
-            unsafe {
-                c2_mem_ffi_local_endpoint_copy(
-                    address.as_ptr(),
-                    buffer.as_mut_ptr(),
-                    buffer.len(),
-                    &mut written,
-                )
-            },
-            C2MemFfiStatus::Ok
-        );
-        assert_eq!(written, length);
-        assert_eq!(
-            unsafe { CStr::from_ptr(buffer.as_ptr()) }.to_str().unwrap(),
-            expected
-        );
-        let invalid = CString::new("tcp://not-ipc").unwrap();
-        assert_eq!(
-            unsafe { c2_mem_ffi_local_endpoint_len(invalid.as_ptr(), &mut length) },
-            C2MemFfiStatus::InvalidArgument
-        );
-        assert_eq!(
-            unsafe { c2_mem_ffi_local_endpoint_len(std::ptr::null(), &mut length) },
-            C2MemFfiStatus::NullPointer
-        );
-    }
-
     #[cfg(unix)]
     #[test]
     fn endpoint_context_freezes_sources_and_keeps_resolution_pure() {
@@ -718,13 +439,6 @@ mod tests {
         let fresh = EndpointContextHandle::capture(None);
         assert!(fresh.name(&address).starts_with(&format!("{root_b}/")));
         assert_ne!(fresh.namespace_id(), namespace_a);
-        let legacy_name = copy_string(
-            |out| unsafe { c2_mem_ffi_local_endpoint_len(address.as_ptr(), out) },
-            |dst, len, out| unsafe {
-                c2_mem_ffi_local_endpoint_copy(address.as_ptr(), dst, len, out)
-            },
-        );
-        assert_eq!(legacy_name, fresh.name(&address));
 
         let code_root = CString::new(root_code.as_str()).unwrap();
         let explicit = EndpointContextHandle::capture(Some(&code_root));
@@ -740,12 +454,6 @@ mod tests {
                 .namespace_id()
         );
         SavedEndpointEnv::set_root(Some(&root_code));
-        let mut fresh_legacy_len = 0;
-        assert_eq!(
-            unsafe { c2_mem_ffi_local_endpoint_len(address.as_ptr(), &mut fresh_legacy_len) },
-            C2MemFfiStatus::Ok
-        );
-        assert_eq!(fresh_legacy_len, explicit.name(&address).len());
 
         // A descriptive path may exceed socket address capacity. Native IO
         // addresses its directory descriptor and short name separately.
@@ -1037,158 +745,6 @@ mod tests {
 
     #[test]
     fn public_abi_version_is_exported() {
-        assert_eq!(c2_mem_ffi_abi_version(), 7);
-    }
-
-    #[test]
-    fn windows_connect_rejects_invalid_arguments_without_transferring_handles() {
-        let mut pipe = 77_usize;
-        let mut process = 88_usize;
-        let mut os_error = 99;
-        assert_eq!(
-            unsafe {
-                c2_mem_ffi_local_endpoint_context_connect_windows(
-                    ptr::null(),
-                    ptr::null(),
-                    ptr::null(),
-                    &mut pipe,
-                    &mut process,
-                    &mut os_error,
-                )
-            },
-            C2MemFfiStatus::NullPointer
-        );
-        assert_eq!((pipe, process, os_error), (0, 0, 0));
-        assert_eq!(
-            unsafe {
-                c2_mem_ffi_local_endpoint_context_connect_windows(
-                    ptr::null(),
-                    ptr::null(),
-                    ptr::null(),
-                    ptr::null_mut(),
-                    &mut process,
-                    &mut os_error,
-                )
-            },
-            C2MemFfiStatus::NullPointer
-        );
-        assert_eq!(
-            unsafe {
-                c2_mem_ffi_local_endpoint_context_connect_windows(
-                    ptr::null(),
-                    ptr::null(),
-                    ptr::null(),
-                    &mut pipe,
-                    ptr::null_mut(),
-                    &mut os_error,
-                )
-            },
-            C2MemFfiStatus::NullPointer
-        );
-        assert_eq!(
-            unsafe {
-                c2_mem_ffi_local_endpoint_context_connect_windows(
-                    ptr::null(),
-                    ptr::null(),
-                    ptr::null(),
-                    &mut pipe,
-                    &mut process,
-                    ptr::null_mut(),
-                )
-            },
-            C2MemFfiStatus::NullPointer
-        );
-        assert_eq!((pipe, process, os_error), (0, 0, 0));
-        let context = C2MemFfiLocalEndpointContext {
-            inner: LocalEndpointContext::default_for_platform().unwrap(),
-        };
-        let address = std::ffi::CString::new("http://invalid").unwrap();
-        assert_eq!(
-            unsafe {
-                c2_mem_ffi_local_endpoint_context_connect_windows(
-                    &context,
-                    address.as_ptr(),
-                    ptr::null(),
-                    &mut pipe,
-                    &mut process,
-                    &mut os_error,
-                )
-            },
-            C2MemFfiStatus::InvalidArgument
-        );
-        assert_eq!((pipe, process, os_error), (0, 0, 0));
-        #[cfg(not(windows))]
-        {
-            // Outside Windows the mandatory entry keeps the platform refusal
-            // contract: no handles are produced and no error code is invented.
-            let address = std::ffi::CString::new("ipc://valid").unwrap();
-            assert_eq!(
-                unsafe {
-                    c2_mem_ffi_local_endpoint_context_connect_windows(
-                        &context,
-                        address.as_ptr(),
-                        ptr::null(),
-                        &mut pipe,
-                        &mut process,
-                        &mut os_error,
-                    )
-                },
-                C2MemFfiStatus::InvalidArgument
-            );
-            assert_eq!((pipe, process, os_error), (0, 0, 0));
-        }
-    }
-
-    #[test]
-    fn unix_connect_rejects_invalid_arguments_without_transferring_a_descriptor() {
-        let mut fd = 77;
-        let mut os_error = 88;
-        assert_eq!(
-            unsafe {
-                c2_mem_ffi_local_endpoint_context_connect_unix(
-                    ptr::null(),
-                    ptr::null(),
-                    ptr::null(),
-                    &mut fd,
-                    &mut os_error,
-                )
-            },
-            C2MemFfiStatus::NullPointer
-        );
-        assert_eq!((fd, os_error), (-1, 0));
-        let context = C2MemFfiLocalEndpointContext {
-            inner: LocalEndpointContext::default_for_platform().unwrap(),
-        };
-        let address = std::ffi::CString::new("http://invalid").unwrap();
-        assert_eq!(
-            unsafe {
-                c2_mem_ffi_local_endpoint_context_connect_unix(
-                    &context,
-                    address.as_ptr(),
-                    ptr::null(),
-                    &mut fd,
-                    &mut os_error,
-                )
-            },
-            C2MemFfiStatus::InvalidArgument
-        );
-        assert_eq!((fd, os_error), (-1, 0));
-        #[cfg(windows)]
-        {
-            let address = std::ffi::CString::new("ipc://valid").unwrap();
-            assert_eq!(
-                unsafe {
-                    c2_mem_ffi_local_endpoint_context_connect_unix(
-                        &context,
-                        address.as_ptr(),
-                        ptr::null(),
-                        &mut fd,
-                        &mut os_error,
-                    )
-                },
-                C2MemFfiStatus::InvalidArgument
-            );
-            assert_eq!((fd, os_error), (-1, 0));
-        }
+        assert_eq!(c2_mem_ffi_abi_version(), 8);
     }
 }

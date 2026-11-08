@@ -72,6 +72,7 @@ jobs:
           arch: ${{ runner.arch == 'ARM64' && 'arm64' || 'x64' }}
       - uses: astral-sh/setup-uv@v6
       - name: Build separate baseline and candidate environments
+        id: build_environments
         shell: python
         run: |
           import os, pathlib, subprocess, sys
@@ -115,6 +116,22 @@ jobs:
         env:
           BASELINE_REF: ${{ inputs.baseline_ref }}
           CANDIDATE_REF: ${{ inputs.candidate_ref || github.sha }}
+      - name: Run candidate unary and stream comparison
+        id: candidate_stream
+        if: ${{ !cancelled() && steps.build_environments.outcome == 'success' }}
+        shell: python
+        run: |
+          import os, pathlib, subprocess, sys
+          candidate = pathlib.Path(os.environ['GITHUB_WORKSPACE']) / 'candidate' / 'c-two'
+          sys.path.insert(0, str(candidate / 'tools' / 'ci'))
+          from source_validation import source_mode_environment
+          python = candidate / '.venv' / ('Scripts/python.exe' if os.name == 'nt' else 'bin/python')
+          output = pathlib.Path(os.environ['RUNNER_TEMP']) / 'ipc-stream'
+          env = source_mode_environment(dict(os.environ,
+              CARGO_TARGET_DIR=str(candidate / 'core' / 'target')))
+          subprocess.run([str(python), str(candidate / 'tools' / 'benchmarks' / 'ipc_stream.py'),
+                          '--python', str(python), '--output-dir', str(output)],
+                         cwd=candidate, env=env, check=True)
       - name: Remove rebuildable build and environment artifacts
         if: always()
         shell: python
@@ -131,5 +148,13 @@ jobs:
         with:
           name: ipc-memory-paired-${{ matrix.os }}-${{ github.sha }}
           path: ${{ runner.temp }}/ipc-paired/
+          if-no-files-found: warn
+          retention-days: 30
+      - name: Retain candidate stream comparison evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ipc-stream-${{ matrix.os }}-${{ github.sha }}
+          path: ${{ runner.temp }}/ipc-stream/
           if-no-files-found: warn
           retention-days: 30

@@ -1,11 +1,11 @@
-"""HTTP client — connects to the Grid CRM via the relay.
+"""Relay client — connects to the Grid CRM by name via the relay.
 
-Demonstrates that the CRM proxy works identically over HTTP as it
-does over IPC — only the address changes.
+Demonstrates discovery by name via the relay. A loopback relay anchor in the
+same endpoint namespace selects local IPC.
 
 Usage (3-terminal workflow):
 
-    # Terminal 1 — start the HTTP relay
+    # Terminal 1 — start the relay
     c3 relay -b 0.0.0.0:8300
 
     # Terminal 2 — start the Grid CRM and register it with the relay
@@ -60,12 +60,12 @@ def main() -> None:
     args = parse_args()
     cc.set_relay_anchor(args.relay_url)
 
-    # Connect via HTTP relay — same API as IPC, different address.
+    # Connect by name via the relay.
     grid = cc.connect(GridPython, name='examples/grid')
-    print(f'[Client] Connected via HTTP (mode: {grid.client._mode})\n')
+    print(f'[Client] Connected by name via relay (mode: {grid.client._mode})\n')
 
     # ── Hello ─────────────────────────────────────────────────────
-    msg = grid.hello('HTTP Client (standalone relay)')
+    msg = grid.hello('Relay client')
     print(f'[Client] hello → {msg}')
 
     # ── Grid info ─────────────────────────────────────────────────

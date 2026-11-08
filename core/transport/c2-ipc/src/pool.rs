@@ -7,8 +7,8 @@ use c2_local::ConnectionObservation;
 use c2_mem::{MemPool, PoolConfig};
 use parking_lot::{Condvar, Mutex, RwLock};
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 static CLIENT_POOL_GEN: AtomicU64 = AtomicU64::new(0);
 pub(crate) fn pool_config_from_client_config(cfg: &ClientIpcConfig) -> PoolConfig {
@@ -85,7 +85,7 @@ fn differing_client_policy_fields(
         pool_min_retained_segments,
         reassembly_segment_size,
         reassembly_max_segments,
-        max_total_chunks,
+        max_inflight_chunk_frames,
         chunk_gc_interval_secs,
         chunk_threshold_ratio,
         chunk_assembler_timeout_secs,
@@ -95,7 +95,7 @@ fn differing_client_policy_fields(
         file_backing_budget_bytes,
         live_reassembly_budget_bytes,
     );
-    compare!(cached, requested; shm_threshold, pool_decay_seconds);
+    compare!(cached, requested; shm_threshold, pool_decay_seconds, client_idle_timeout_secs);
     if differing.is_empty() {
         differing.push("none");
     }
@@ -171,7 +171,10 @@ impl PoolReferences {
             Err(_) => false,
         }
     }
-    fn expired(&self, grace: Duration) -> bool {
+    fn expired(&self, grace: Option<Duration>) -> bool {
+        let Some(grace) = grace else {
+            return false;
+        };
         if self.count.load(Ordering::Acquire) != 0 {
             return false;
         }
@@ -187,8 +190,31 @@ impl PoolReferences {
 #[doc(hidden)]
 pub struct ClientLease {
     client: Arc<SyncClient>,
+    reference: PoolReference,
+}
+
+// An acquire reserves its reference before waiting for a shared connection.
+// This also prevents idle eviction between publication and waiter delivery.
+struct PoolReference {
     references: Arc<PoolReferences>,
     counted: bool,
+}
+
+impl PoolReference {
+    fn acquire(references: &Arc<PoolReferences>) -> Self {
+        references.acquire();
+        Self {
+            references: references.clone(),
+            counted: true,
+        }
+    }
+
+    fn into_lease(self, client: Arc<SyncClient>) -> ClientLease {
+        ClientLease {
+            client,
+            reference: self,
+        }
+    }
 }
 
 impl ClientLease {
@@ -198,7 +224,7 @@ impl ClientLease {
 
     /// Transfer the counted reference to an explicit-release caller.
     pub fn into_client(mut self) -> Arc<SyncClient> {
-        self.counted = false;
+        self.reference.counted = false;
         self.client.clone()
     }
 }
@@ -210,7 +236,7 @@ impl std::ops::Deref for ClientLease {
     }
 }
 
-impl Drop for ClientLease {
+impl Drop for PoolReference {
     fn drop(&mut self) {
         if self.counted {
             self.references.release();
@@ -237,6 +263,7 @@ struct CloseRecord {
     address: String,
     state: Mutex<CloseState>,
     changed: Condvar,
+    async_changed: tokio::sync::Notify,
 }
 impl CloseRecord {
     fn preparing(address: &str) -> Self {
@@ -244,11 +271,13 @@ impl CloseRecord {
             address: address.into(),
             state: Mutex::new(CloseState::Preparing),
             changed: Condvar::new(),
+            async_changed: tokio::sync::Notify::new(),
         }
     }
     fn finish(&self) {
         *self.state.lock() = CloseState::Finished;
         self.changed.notify_all();
+        self.async_changed.notify_waiters();
     }
     fn deactivate(&self, client: Arc<SyncClient>) {
         // Install the observation and retain the business Arc before changing
@@ -259,7 +288,35 @@ impl CloseRecord {
         };
         client.deactivate();
         self.changed.notify_all();
+        self.async_changed.notify_waiters();
     }
+    async fn wait_async(&self) {
+        loop {
+            let changed = self.async_changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            let observation = {
+                let state = self.state.lock();
+                match &*state {
+                    CloseState::Preparing => None,
+                    CloseState::Closing {
+                        observation: Some(observation),
+                        ..
+                    } => Some(Some(observation.clone())),
+                    _ => Some(None),
+                }
+            };
+            match observation {
+                Some(Some(observation)) => {
+                    observation.wait_closed(None).await;
+                    return;
+                }
+                Some(None) => return,
+                None => changed.await,
+            }
+        }
+    }
+
     fn complete(&self) -> bool {
         match &*self.state.lock() {
             CloseState::Preparing => false,
@@ -361,12 +418,74 @@ pub struct ClientCacheCloseReport {
 
 struct CacheState {
     entries: HashMap<String, PoolEntry>,
+    connecting: HashMap<String, Weak<PendingConnection>>,
     epoch: Option<u64>,
     draining: bool,
     budget: Option<c2_mem::MemoryBudget>,
     records: HashMap<u64, Arc<CloseRecord>>,
     next_record: u64,
 }
+
+struct PendingConnection {
+    epoch: u64,
+    config: ClientIpcConfig,
+    references: Arc<PoolReferences>,
+    result: Mutex<Option<Result<Arc<SyncClient>, IpcError>>>,
+    changed: Condvar,
+}
+
+impl PendingConnection {
+    fn wait(&self, deadline: ConnectDeadline) -> Result<Arc<SyncClient>, IpcError> {
+        let mut result = connect_lock(&self.result, deadline, "pool_connect_wait")?;
+        loop {
+            crate::client::connect_check(deadline, "pool_connect_wait")?;
+            if let Some(result) = &*result {
+                return result
+                    .as_ref()
+                    .map(Arc::clone)
+                    .map_err(crate::client::stream::clone_observation_error);
+            }
+            match deadline.instant() {
+                Some(instant) => {
+                    self.changed.wait_until(&mut result, instant);
+                }
+                None => self.changed.wait(&mut result),
+            }
+        }
+    }
+}
+
+// Publish to the acquires already attached, including if the owner unwinds.
+// The cache holds only a weak reference, so completing an attempt needs no
+// cache lock and cannot extend the owner's deadline waiting for that lock.
+struct PendingConnectionOwner {
+    pending: Arc<PendingConnection>,
+    finished: bool,
+}
+
+impl PendingConnectionOwner {
+    fn finish(&mut self, result: &Result<Arc<SyncClient>, IpcError>) {
+        *self.pending.result.lock() = Some(
+            result
+                .as_ref()
+                .map(Arc::clone)
+                .map_err(crate::client::stream::clone_observation_error),
+        );
+        self.finished = true;
+        self.pending.changed.notify_all();
+    }
+}
+
+impl Drop for PendingConnectionOwner {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.finish(&Err(IpcError::Pool(
+                "client pool connection attempt interrupted".into(),
+            )));
+        }
+    }
+}
+
 impl CacheState {
     fn record(&mut self, address: &str) -> Arc<CloseRecord> {
         let record = Arc::new(CloseRecord::preparing(address));
@@ -394,7 +513,8 @@ pub struct ClientPool {
     endpoint_context: Result<LocalEndpointContext, String>,
     connection_event_source: Option<c2_local::ConnectionEventSource>,
     state: Arc<Mutex<CacheState>>,
-    grace_period: Duration,
+    grace_period: Option<Duration>,
+    sweeper: Mutex<Option<tokio::task::JoinHandle<()>>>,
     default_config: Mutex<Option<ClientIpcConfig>>,
     drain_gate: Mutex<()>,
 }
@@ -447,21 +567,26 @@ impl ClientCloseObservation<'_> {
 }
 
 impl ClientPool {
-    pub fn new(grace_period: Duration) -> Self {
+    /// Retain unreferenced clients for this duration. None disables timed
+    /// eviction; an explicit zero duration makes them expire immediately.
+    pub fn new(grace_period: impl Into<Option<Duration>>) -> Self {
         Self::from_endpoint_context(
-            grace_period,
+            grace_period.into(),
             LocalEndpointContext::default_for_platform().map_err(|error| error.to_string()),
         )
     }
-    pub fn with_endpoint_context(grace_period: Duration, context: LocalEndpointContext) -> Self {
-        Self::from_endpoint_context(grace_period, Ok(context))
+    pub fn with_endpoint_context(
+        grace_period: impl Into<Option<Duration>>,
+        context: LocalEndpointContext,
+    ) -> Self {
+        Self::from_endpoint_context(grace_period.into(), Ok(context))
     }
     pub fn with_connection_event_source(mut self, source: c2_local::ConnectionEventSource) -> Self {
         self.connection_event_source = Some(source);
         self
     }
     fn from_endpoint_context(
-        grace_period: Duration,
+        grace_period: Option<Duration>,
         endpoint_context: Result<LocalEndpointContext, String>,
     ) -> Self {
         Self {
@@ -469,6 +594,7 @@ impl ClientPool {
             connection_event_source: None,
             state: Arc::new(Mutex::new(CacheState {
                 entries: HashMap::new(),
+                connecting: HashMap::new(),
                 epoch: Some(0),
                 draining: false,
                 budget: None,
@@ -476,10 +602,81 @@ impl ClientPool {
                 next_record: 0,
             })),
             grace_period,
+            sweeper: Mutex::new(None),
             default_config: Mutex::new(None),
             drain_gate: Mutex::new(()),
         }
     }
+    /// A foreign endpoint owns its own physical connections while sharing this
+    /// factory's backing budget. Its retirement cannot seal another endpoint.
+    #[doc(hidden)]
+    pub fn fork_endpoint_scope(
+        &self,
+        config: &ClientIpcConfig,
+        deadline: ConnectDeadline,
+    ) -> Result<Self, IpcError> {
+        let budget = {
+            let mut state = connect_lock(&self.state, deadline, "pool_scope_wait")?;
+            if state.epoch.is_none() {
+                return Err(IpcError::PoolRetired);
+            }
+            let requested = config.memory_budget_limits();
+            let budget = state
+                .budget
+                .get_or_insert_with(|| c2_mem::MemoryBudget::from_limits(&requested))
+                .clone();
+            if budget.limits() != requested {
+                return Err(budget_limits_mismatch(
+                    &budget.limits(),
+                    &requested,
+                    "cache domain",
+                ));
+            }
+            budget
+        };
+        let mut scoped =
+            Self::with_endpoint_context(self.grace_period, self.endpoint_context()?.clone());
+        scoped.connection_event_source = self.connection_event_source.clone();
+        scoped.state.lock().budget = Some(budget);
+        *scoped.default_config.lock() = Some(config.clone());
+        Ok(scoped)
+    }
+
+    /// Seal a native endpoint's whole cache, including unsuccessful route preparations.
+    #[doc(hidden)]
+    pub fn deactivate_endpoint_scope(&self) {
+        let detached = {
+            let mut state = self.state.lock();
+            state.epoch = None;
+            std::mem::take(&mut state.entries)
+                .into_iter()
+                .map(|(address, entry)| (state.record(&address), entry.client))
+                .collect::<Vec<_>>()
+        };
+        for (record, client) in detached {
+            record.deactivate(client);
+        }
+    }
+
+    #[doc(hidden)]
+    pub async fn close_endpoint_scope(&self) {
+        self.deactivate_endpoint_scope();
+        let records = self
+            .state
+            .lock()
+            .records
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        for record in records {
+            record.wait_async().await;
+        }
+        self.state
+            .lock()
+            .records
+            .retain(|_, record| !record.complete());
+    }
+
     pub fn endpoint_context(&self) -> Result<&LocalEndpointContext, IpcError> {
         self.endpoint_context
             .as_ref()
@@ -539,13 +736,18 @@ impl ClientPool {
         let epoch;
         let cfg;
         let budget;
-        let mut fresh;
+        let fresh;
+        let pending;
+        let reference;
         let mut detached = Vec::new();
         {
             let mut state = connect_lock(&self.state, deadline, "pool_wait")?;
             epoch = state.epoch.ok_or(IpcError::PoolRetired)?;
             state.check_epoch(epoch)?;
             state.records.retain(|_, record| !record.complete());
+            state
+                .connecting
+                .retain(|_, pending| pending.strong_count() != 0);
             cfg = match config {
                 Some(config) => config.clone(),
                 None => connect_lock(&self.default_config, deadline, "pool_config_wait")?
@@ -566,13 +768,27 @@ impl ClientPool {
                     if entry.client.config() != &cfg {
                         return Err(client_policy_mismatch(address, entry.client.config(), &cfg));
                     }
-                    entry.references.acquire();
-                    return Ok(ClientLease {
-                        client: entry.client.clone(),
-                        references: entry.references.clone(),
-                        counted: true,
-                    });
+                    return Ok(
+                        PoolReference::acquire(&entry.references).into_lease(entry.client.clone())
+                    );
                 }
+            }
+            if let Some(connecting) = state
+                .connecting
+                .get(address)
+                .and_then(Weak::upgrade)
+                .filter(|connecting| {
+                    connecting.epoch == epoch && connecting.result.lock().is_none()
+                })
+            {
+                if connecting.config != cfg {
+                    return Err(client_policy_mismatch(address, &connecting.config, &cfg));
+                }
+                let reference = PoolReference::acquire(&connecting.references);
+                drop(state);
+                let client = connecting.wait(deadline)?;
+                connect_lock(&self.state, deadline, "pool_publish_wait")?.check_epoch(epoch)?;
+                return Ok(reference.into_lease(client));
             }
             let expired: Vec<_> = state
                 .entries
@@ -591,103 +807,106 @@ impl ClientPool {
                 client: None,
                 published: false,
             };
+            pending = Arc::new(PendingConnection {
+                epoch,
+                config: cfg.clone(),
+                references: Arc::new(PoolReferences::new(0, None)),
+                result: Mutex::new(None),
+                changed: Condvar::new(),
+            });
+            reference = PoolReference::acquire(&pending.references);
+            state
+                .connecting
+                .insert(address.into(), Arc::downgrade(&pending));
         }
-        for (record, client) in detached {
-            record.deactivate(client);
-        }
-        let endpoint = self
-            .endpoint_context()?
-            .endpoint(address)
-            .map_err(crate::control::endpoint_error)?;
-        crate::sync_client::shared_io_handle(deadline)?;
-        let mut attempt = 0;
-        let client = loop {
-            crate::client::connect_check(deadline, "pool_connect")?;
-            connect_lock(&self.state, deadline, "pool_wait")?.check_epoch(epoch)?;
-            let counter = CLIENT_POOL_GEN.fetch_add(1, Ordering::Relaxed);
-            let prefix = format!("/cc3c{:08x}{counter:016x}", std::process::id());
-            let pool = Arc::new(RwLock::new(
-                MemPool::new_with_prefix_and_budget(
-                    pool_config_from_client_config(&cfg),
-                    prefix,
-                    budget.clone(),
-                )
-                .map_err(IpcError::Config)?,
-            ));
-            let (candidate, result) = SyncClient::connect_transport_pool_attempt_with_deadline(
-                endpoint.clone(),
-                pool,
-                cfg.clone(),
-                budget.clone(),
-                deadline,
-                self.connection_event_source.as_ref(),
-            )?;
-            let candidate = Arc::new(candidate);
-            fresh.client = Some(candidate.clone());
-            match result {
-                Ok(()) => break candidate,
-                Err(error) => {
-                    // These are initial, unpublished connect attempts. A
-                    // business connection never reconnects or replays here.
-                    let transient = matches!(&error, IpcError::Io(error) | IpcError::Connect(error) if matches!(error.kind(), std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted | std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::NotConnected));
-                    if !transient || attempt == 2 {
-                        return Err(error);
-                    }
-                    let remaining = deadline
-                        .remaining("pool_cleanup")
-                        .map_err(|_| crate::client::connect_expired("pool_cleanup"))?;
-                    if !candidate.close_shared(
-                        remaining
-                            .unwrap_or(Duration::from_secs(5))
-                            .min(Duration::from_secs(5)),
-                    ) {
-                        return Err(error);
-                    }
-                    fresh.client.take();
-                    attempt += 1;
-                    let remaining = deadline
-                        .remaining("pool_retry")
-                        .map_err(|_| crate::client::connect_expired("pool_retry"))?;
-                    let delay = Duration::from_millis(10 * attempt);
-                    std::thread::sleep(remaining.map_or(delay, |left| delay.min(left)));
-                }
-            }
+        let mut owner = PendingConnectionOwner {
+            pending: pending.clone(),
+            finished: false,
         };
-        let mut state = connect_lock(&self.state, deadline, "pool_publish_wait")?;
-        state.check_epoch(epoch)?;
-        if let Some(entry) = state.entries.get(address) {
-            if entry.client.is_connected() && !entry.references.expired(self.grace_period) {
-                if entry.client.config() != &cfg {
-                    return Err(client_policy_mismatch(address, entry.client.config(), &cfg));
-                }
-                entry.references.acquire();
-                return Ok(ClientLease {
-                    client: entry.client.clone(),
-                    references: entry.references.clone(),
-                    counted: true,
-                });
+        let result = (|| {
+            let mut fresh = fresh;
+            for (record, client) in detached {
+                record.deactivate(client);
             }
-        }
-        let references = Arc::new(PoolReferences::new(1, None));
-        let replaced = state.entries.insert(
-            address.into(),
-            PoolEntry {
-                client: client.clone(),
-                references: references.clone(),
-            },
-        );
-        let replacement = replaced.map(|entry| (state.record(address), entry.client));
-        fresh.published = true;
-        fresh.record.finish();
-        drop(state);
-        if let Some((record, client)) = replacement {
-            record.deactivate(client);
-        }
-        Ok(ClientLease {
-            client,
-            references,
-            counted: true,
-        })
+            let endpoint = self
+                .endpoint_context()?
+                .endpoint(address)
+                .map_err(crate::control::endpoint_error)?;
+            let io = crate::sync_client::shared_io_handle(deadline)?;
+            self.start_sweeper(&io, deadline)?;
+            let mut attempt = 0;
+            let client = loop {
+                crate::client::connect_check(deadline, "pool_connect")?;
+                connect_lock(&self.state, deadline, "pool_wait")?.check_epoch(epoch)?;
+                let counter = CLIENT_POOL_GEN.fetch_add(1, Ordering::Relaxed);
+                let prefix = format!("/cc3c{:08x}{counter:016x}", std::process::id());
+                let pool = Arc::new(RwLock::new(
+                    MemPool::new_with_prefix_and_budget(
+                        pool_config_from_client_config(&cfg),
+                        prefix,
+                        budget.clone(),
+                    )
+                    .map_err(IpcError::Config)?,
+                ));
+                let (candidate, result) = SyncClient::connect_transport_pool_attempt_with_deadline(
+                    endpoint.clone(),
+                    pool,
+                    cfg.clone(),
+                    budget.clone(),
+                    deadline,
+                    self.connection_event_source.as_ref(),
+                )?;
+                let candidate = Arc::new(candidate);
+                fresh.client = Some(candidate.clone());
+                match result {
+                    Ok(()) => break candidate,
+                    Err(error) => {
+                        // These are initial, unpublished connect attempts. A
+                        // business connection never reconnects or replays here.
+                        let transient = matches!(&error, IpcError::Io(error) | IpcError::Connect(error) if matches!(error.kind(), std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted | std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::NotConnected));
+                        if !transient || attempt == 2 {
+                            return Err(error);
+                        }
+                        let remaining = deadline
+                            .remaining("pool_cleanup")
+                            .map_err(|_| crate::client::connect_expired("pool_cleanup"))?;
+                        if !candidate.close_shared(
+                            remaining
+                                .unwrap_or(Duration::from_secs(5))
+                                .min(Duration::from_secs(5)),
+                        ) {
+                            return Err(error);
+                        }
+                        fresh.client.take();
+                        attempt += 1;
+                        let remaining = deadline
+                            .remaining("pool_retry")
+                            .map_err(|_| crate::client::connect_expired("pool_retry"))?;
+                        let delay = Duration::from_millis(10 * attempt);
+                        std::thread::sleep(remaining.map_or(delay, |left| delay.min(left)));
+                    }
+                }
+            };
+            let mut state = connect_lock(&self.state, deadline, "pool_publish_wait")?;
+            state.check_epoch(epoch)?;
+            let replaced = state.entries.insert(
+                address.into(),
+                PoolEntry {
+                    client: client.clone(),
+                    references: pending.references.clone(),
+                },
+            );
+            debug_assert!(
+                replaced.is_none(),
+                "only the pending connection can publish"
+            );
+            fresh.published = true;
+            fresh.record.finish();
+            drop(state);
+            Ok(client)
+        })();
+        owner.finish(&result);
+        result.map(|client| reference.into_lease(client))
     }
     pub fn release_if_same(&self, address: &str, client: &Arc<SyncClient>) -> bool {
         self.state
@@ -722,13 +941,44 @@ impl ClientPool {
         Ok(true)
     }
     pub fn sweep_expired(&self) {
+        Self::sweep_expired_state(&self.state, self.grace_period);
+    }
+
+    fn start_sweeper(
+        &self,
+        io: &tokio::runtime::Handle,
+        deadline: ConnectDeadline,
+    ) -> Result<(), IpcError> {
+        let Some(grace) = self.grace_period else {
+            return Ok(());
+        };
+        let mut sweeper = connect_lock(&self.sweeper, deadline, "pool_maintenance_wait")?;
+        if sweeper.is_none() {
+            let state = Arc::downgrade(&self.state);
+            let interval = grace.clamp(Duration::from_millis(1), Duration::from_secs(1));
+            *sweeper = Some(io.spawn(async move {
+                let mut ticks = tokio::time::interval(interval);
+                ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    ticks.tick().await;
+                    let Some(state) = state.upgrade() else {
+                        return;
+                    };
+                    Self::sweep_expired_state(&state, Some(grace));
+                }
+            }));
+        }
+        Ok(())
+    }
+
+    fn sweep_expired_state(state: &Mutex<CacheState>, grace: Option<Duration>) {
         let detached = {
-            let mut state = self.state.lock();
+            let mut state = state.lock();
             state.records.retain(|_, record| !record.complete());
             let expired: Vec<_> = state
                 .entries
                 .iter()
-                .filter(|(_, entry)| entry.references.expired(self.grace_period))
+                .filter(|(_, entry)| entry.references.expired(grace))
                 .map(|(address, _)| address.clone())
                 .collect();
             expired
@@ -834,6 +1084,15 @@ impl ClientPool {
         self.state.lock().entries.contains_key(address)
     }
 }
+
+impl Drop for ClientPool {
+    fn drop(&mut self) {
+        if let Some(sweeper) = self.sweeper.get_mut().take() {
+            sweeper.abort();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

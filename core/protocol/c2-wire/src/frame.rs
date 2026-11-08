@@ -54,16 +54,6 @@ impl FrameHeader {
     }
 
     #[inline]
-    pub const fn is_call_v2(&self) -> bool {
-        flags::is_call_v2(self.flags)
-    }
-
-    #[inline]
-    pub const fn is_reply_v2(&self) -> bool {
-        flags::is_reply_v2(self.flags)
-    }
-
-    #[inline]
     pub const fn is_handshake(&self) -> bool {
         flags::is_handshake(self.flags)
     }
@@ -88,7 +78,7 @@ pub fn encode_frame(request_id: u64, frame_flags: u32, payload: &[u8]) -> Vec<u8
     encode_frame_parts(request_id, frame_flags, &[payload])
 }
 
-/// Encode payload fragments into one frame allocation, in slice order.
+/// Encode payload chunks into one frame allocation, in slice order.
 pub fn encode_frame_parts(request_id: u64, frame_flags: u32, parts: &[&[u8]]) -> Vec<u8> {
     let payload_len: usize = parts.iter().map(|part| part.len()).sum();
     let total_len = (12 + payload_len) as u32;
@@ -107,6 +97,10 @@ pub fn encode_frame_parts(request_id: u64, frame_flags: u32, parts: &[&[u8]]) ->
 /// Error returned when frame data is malformed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DecodeError {
+    /// A shared-memory descriptor cannot borrow loan zero.
+    ZeroLoanId,
+    /// Record flags, direction or request role violate the RPC envelope.
+    InvalidRpcEnvelope { field: &'static str, value: u64 },
     /// Buffer is shorter than the minimum header size.
     BufferTooShort { need: usize, have: usize },
     /// A length field references more data than available.
@@ -126,6 +120,10 @@ pub enum DecodeError {
 impl std::fmt::Display for DecodeError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
+            Self::ZeroLoanId => f.write_str("SHM descriptor has zero loan id"),
+            Self::InvalidRpcEnvelope { field, value } => {
+                write!(f, "invalid RPC envelope {field}: {value}")
+            }
             Self::BufferTooShort { need, have } => {
                 write!(f, "buffer too short: need {need}, have {have}")
             }

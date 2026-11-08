@@ -1,24 +1,44 @@
 use super::*;
-use c2_wire::chunk::header::encode_reply_chunk_meta;
 use c2_wire::release::{ReleaseBatch, decode_release_frame, encode_release_frame};
 
 #[derive(Clone, Copy, Debug)]
 enum ReplyFault {
     Geometry(u64, u32, usize),
-    ShortMetadata,
-    ChangedMetadata,
+    EmptyContinuation,
+    UnexpectedFirstFlag,
     DuplicateFirst,
-    DuplicateLater,
+    ShortContinuation,
     Oversized,
     LocalOpen,
+    WholeShmDuringChunks,
+    RejectedDuringChunks,
+    MissingFirst,
 }
 
 fn chunk(rid: u64, size: u64, count: u32, index: u32, data: &[u8]) -> Vec<u8> {
-    frame::encode_frame_parts(
-        rid,
-        flags::FLAG_RESPONSE | flags::FLAG_REPLY_V2 | flags::FLAG_CHUNKED,
-        &[&encode_reply_chunk_meta(size, count, index), data],
-    )
+    if index == 0 && count == 1 {
+        return encode_call_end_frame(
+            rid,
+            CallMode::Unary,
+            CallStatus::Success,
+            0,
+            ValuePart::whole(ValueStorage::Inline(data)),
+        )
+        .unwrap();
+    }
+    if index == 0 {
+        let total = if count == 0 { 0 } else { size };
+        return frame::encode_frame_parts(
+            rid,
+            flags::FLAG_RPC_RECORD
+                | flags::FLAG_RESPONSE
+                | flags::FLAG_CHUNKED
+                | flags::FLAG_FIRST_CHUNK,
+            &[&[6, 0], &total.to_le_bytes(), data],
+        );
+    }
+    encode_value_continuation_frame(rid, RpcRecordKind::CallEnd, ValueStorage::Inline(data))
+        .unwrap()
 }
 
 // Both requests really cross the OS stream before the broken reply arrives.
@@ -30,7 +50,10 @@ async fn isolated_reply_failure(fault: ReplyFault) {
     let (ready, assembly_ready) = oneshot::channel();
     let (break_reply, break_requested) = oneshot::channel();
     let (finish_other, other_requested) = oneshot::channel();
-    let partial = !matches!(fault, ReplyFault::Geometry(..) | ReplyFault::LocalOpen);
+    let partial = !matches!(
+        fault,
+        ReplyFault::Geometry(..) | ReplyFault::LocalOpen | ReplyFault::MissingFirst
+    );
     let peer = tokio::spawn(async move {
         let mut stream = accept(&mut listener).await;
         let (target, _) = read_frame(&mut stream).await;
@@ -48,25 +71,40 @@ async fn isolated_reply_failure(fault: ReplyFault) {
             ReplyFault::Geometry(size, count, len) => {
                 chunk(target.request_id, size, count, 0, &vec![1; len])
             }
-            ReplyFault::ShortMetadata => frame::encode_frame(
+            ReplyFault::EmptyContinuation => frame::encode_frame(
                 target.request_id,
-                flags::FLAG_RESPONSE | flags::FLAG_REPLY_V2 | flags::FLAG_CHUNKED,
-                &[0; 8],
+                flags::FLAG_RESPONSE | flags::FLAG_RPC_RECORD | flags::FLAG_CHUNKED,
+                &[6],
             ),
-            ReplyFault::ChangedMetadata => chunk(target.request_id, 2048, 4, 1, &[2; 512]),
-            ReplyFault::DuplicateFirst => chunk(target.request_id, 1536, 3, 0, &[2; 512]),
-            ReplyFault::DuplicateLater => {
-                stream
-                    .write_all(&chunk(target.request_id, 1536, 3, 1, &[2; 512]))
-                    .await
-                    .unwrap();
-                chunk(target.request_id, 1536, 3, 1, &[3; 512])
-            }
-            ReplyFault::Oversized => chunk(target.request_id, 1536, 3, 1, &[2; 1024]),
-            ReplyFault::LocalOpen => frame::encode_frame_parts(
+            ReplyFault::UnexpectedFirstFlag => frame::encode_frame(
                 target.request_id,
-                flags::FLAG_RESPONSE | flags::FLAG_REPLY_V2 | flags::FLAG_BUDDY,
+                flags::FLAG_RPC_RECORD | flags::FLAG_RESPONSE | flags::FLAG_FIRST_CHUNK,
+                &[6, 0],
+            ),
+            ReplyFault::DuplicateFirst => chunk(target.request_id, 1536, 3, 0, &[2; 512]),
+            ReplyFault::ShortContinuation => chunk(target.request_id, 1536, 3, 1, &[2; 1]),
+            ReplyFault::Oversized => chunk(target.request_id, 1536, 3, 1, &[2; 1024]),
+            ReplyFault::MissingFirst => chunk(target.request_id, 1536, 3, 1, &[2; 512]),
+            ReplyFault::RejectedDuringChunks => {
+                let error = c2_error::C2Error::new(
+                    c2_error::ErrorCode::RouteStale,
+                    "not executed after a success value began",
+                )
+                .to_wire_bytes();
+                encode_call_end_frame(
+                    target.request_id,
+                    CallMode::Unary,
+                    CallStatus::NotExecuted,
+                    0,
+                    ValuePart::whole(ValueStorage::Inline(&error)),
+                )
+                .unwrap()
+            }
+            ReplyFault::LocalOpen | ReplyFault::WholeShmDuringChunks => frame::encode_frame_parts(
+                target.request_id,
+                flags::FLAG_RESPONSE | flags::FLAG_RPC_RECORD | flags::FLAG_BUDDY,
                 &[
+                    &[6, 0],
                     &encode_buddy_payload(&BuddyPayload {
                         seg_idx: 0,
                         generation: 1,
@@ -75,7 +113,6 @@ async fn isolated_reply_failure(fault: ReplyFault) {
                         is_dedicated: false,
                         loan_id: 77,
                     }),
-                    &[0],
                 ],
             ),
         };
@@ -96,7 +133,7 @@ async fn isolated_reply_failure(fault: ReplyFault) {
         let mut released = Vec::new();
         let ping = loop {
             let (header, payload) = read_frame(&mut stream).await;
-            if header.is_ctrl() {
+            if header.flags & flags::FLAG_RPC_RECORD != 0 && payload.first() == Some(&7) {
                 released.extend_from_slice(
                     decode_release_frame(&header, &payload, false, true)
                         .unwrap()
@@ -108,7 +145,10 @@ async fn isolated_reply_failure(fault: ReplyFault) {
         };
         assert_eq!(
             released,
-            if matches!(fault, ReplyFault::LocalOpen) {
+            if matches!(
+                fault,
+                ReplyFault::LocalOpen | ReplyFault::WholeShmDuringChunks
+            ) {
                 vec![77]
             } else {
                 vec![]
@@ -127,7 +167,10 @@ async fn isolated_reply_failure(fault: ReplyFault) {
     }
     let mut client = IpcClient::with_endpoint(endpoint.endpoint.clone(), cfg).unwrap();
     client.connect().await.unwrap();
-    if matches!(fault, ReplyFault::LocalOpen) {
+    if matches!(
+        fault,
+        ReplyFault::LocalOpen | ReplyFault::WholeShmDuringChunks
+    ) {
         client
             .server_pool
             .lock()
@@ -164,7 +207,9 @@ async fn isolated_reply_failure(fault: ReplyFault) {
             (ReplyFault::LocalOpen, IpcError::Shm(message)) => {
                 assert!(message.contains("injected EMFILE/ENOMEM"))
             }
-            (_, IpcError::Chunk(ChunkError::Protocol(_))) => {}
+            (_, IpcError::Chunk(ChunkError::Protocol(_)))
+            | (_, IpcError::Decode(_))
+            | (_, IpcError::Protocol(_)) => {}
             _ => panic!("unexpected correlated error for {fault:?}: {error}"),
         },
         _ => panic!("missing response phase for {fault:?}: {error}"),
@@ -221,29 +266,30 @@ async fn isolated_reply_failure(fault: ReplyFault) {
 }
 
 #[tokio::test]
-async fn encoded_invalid_reply_geometry_is_protocol_and_ping_stays_usable() {
-    for (size, count, len) in [
-        (128, 0, 64),
-        (0, 1, 1),
-        (0, 2, 64),
-        (128, 2, 0),
-        (128, 1, 0),
-        (128, 1, 129),
-    ] {
+async fn invalid_chunk_lengths_are_protocol_and_ping_stays_usable() {
+    for (size, count, len) in [(128, 0, 64), (0, 2, 64), (128, 2, 0), (128, 2, 129)] {
         isolated_reply_failure(ReplyFault::Geometry(size, count, len)).await;
     }
 }
 
 #[tokio::test]
-async fn malformed_later_chunk_metadata_aborts_assembly_and_keeps_connection_usable() {
-    for fault in [ReplyFault::ShortMetadata, ReplyFault::ChangedMetadata] {
+async fn empty_continuation_and_unexpected_first_flag_abort_assembly() {
+    for fault in [
+        ReplyFault::EmptyContinuation,
+        ReplyFault::UnexpectedFirstFlag,
+    ] {
         isolated_reply_failure(fault).await;
     }
 }
 
 #[tokio::test]
-async fn duplicate_later_chunk_aborts_assembly_and_releases_budget_once() {
-    isolated_reply_failure(ReplyFault::DuplicateLater).await;
+async fn short_continuation_aborts_assembly_and_releases_budget_once() {
+    isolated_reply_failure(ReplyFault::ShortContinuation).await;
+}
+
+#[tokio::test]
+async fn continuation_without_first_result_is_dispatch_uncertain() {
+    isolated_reply_failure(ReplyFault::MissingFirst).await;
 }
 
 #[tokio::test]
@@ -532,8 +578,9 @@ async fn configured_write_timeout_preserves_a_sent_calls_readable_reply() {
         let (header, _) = frame::decode_frame_body(body, length).unwrap();
         let mut payload = vec![0; header.payload_len()];
         stream.read_exact(&mut payload).await.unwrap();
-        let (_, consumed) = c2_wire::control::decode_call_control(&payload, 0).unwrap();
-        assert_eq!(&payload[consumed..], vec![7; 8 * 1024 * 1024]);
+        assert!(
+            matches!(decode_rpc_record(&header, &payload, None).unwrap(), RpcRecord::Open { value: ValuePart { storage: ValueStorage::Inline(bytes), .. }, .. } if bytes == vec![7; 8 * 1024 * 1024])
+        );
         reply(&mut stream, header.request_id, b"timed out write completes").await;
         expect_disconnect_or_eof(&mut stream).await;
         crate::tests::close_listener(listener).await;
@@ -670,8 +717,8 @@ async fn zero_response_loan_deactivates_with_zero_shm_budget_and_preserves_other
         stream
             .write_all(&frame::encode_frame_parts(
                 target.request_id,
-                flags::FLAG_RESPONSE | flags::FLAG_REPLY_V2 | flags::FLAG_BUDDY,
-                &[&descriptor, &[0]],
+                flags::FLAG_RESPONSE | flags::FLAG_RPC_RECORD | flags::FLAG_BUDDY,
+                &[&[6, 0], &descriptor],
             ))
             .await
             .unwrap();
@@ -698,7 +745,7 @@ async fn zero_response_loan_deactivates_with_zero_shm_budget_and_preserves_other
     assert_eq!(error.phase(), crate::TransportPhase::DispatchUncertain);
     assert!(
         matches!(error.source_error(), IpcError::ResponseFailure(error)
-        if matches!(error.as_ref(), IpcError::Decode(DecodeError::InvalidValue { field: "loan id", value: 0 })))
+        if matches!(error.as_ref(), IpcError::Decode(DecodeError::ZeroLoanId)))
     );
     assert!(!client.is_connected());
     assert_eq!(client.pending_len_for_test(), 1);
@@ -727,18 +774,27 @@ async fn early_chunk_rejection_stops_at_the_frame_boundary_and_preserves_the_con
         let peer = tokio::spawn(async move {
             let mut stream = accept(&mut listener).await;
             let (first, _) = read_frame(&mut stream).await;
-            assert!(flags::is_chunked(first.flags));
+            assert_eq!(
+                first.flags,
+                flags::FLAG_RPC_RECORD | flags::FLAG_CHUNKED | flags::FLAG_FIRST_CHUNK
+            );
             seen.send(()).unwrap();
             let mut header = [0; HEADER_SIZE];
             if partial_frame {
                 stream.read_exact(&mut header[..8]).await.unwrap();
             }
+            let error = br#"C2E1{"version":1,"code":713,"name":"ProtocolViolation","message":"early rejection","details":{}}"#;
             stream
-                .write_all(&frame::encode_frame(
-                    first.request_id,
-                    flags::FLAG_RESPONSE | flags::FLAG_REPLY_V2,
-                    &encode_reply_control(&ReplyControl::Error(b"early rejection".to_vec())),
-                ))
+                .write_all(
+                    &encode_call_end_frame(
+                        first.request_id,
+                        CallMode::Unary,
+                        CallStatus::Failed,
+                        0,
+                        ValuePart::whole(ValueStorage::Inline(error)),
+                    )
+                    .unwrap(),
+                )
                 .await
                 .unwrap();
             if partial_frame {
@@ -748,17 +804,16 @@ async fn early_chunk_rejection_stops_at_the_frame_boundary_and_preserves_the_con
                 assert_eq!(second.request_id, first.request_id);
                 let mut payload = vec![0; second.payload_len()];
                 stream.read_exact(&mut payload).await.unwrap();
-                let (index, count, consumed) =
-                    c2_wire::chunk::header::decode_chunk_header(&payload, 0).unwrap();
-                assert_eq!((index, count), (1, 3));
-                assert_eq!(&payload[consumed..], &[2; 4096]);
+                assert!(
+                    matches!(decode_rpc_record(&second, &payload, None).unwrap(), RpcRecord::OpenContinuation { value: ValuePart { storage: ValueStorage::Inline(bytes), .. } } if bytes == [2; 4096])
+                );
             }
             let (next, _) = read_frame(&mut stream).await;
             assert_ne!(
                 next.request_id, first.request_id,
                 "no later chunk may be written after the early reply"
             );
-            assert!(!flags::is_chunked(next.flags));
+            assert_eq!(next.flags, flags::FLAG_RPC_RECORD);
             reply(&mut stream, next.request_id, b"same connection").await;
             expect_disconnect_or_eof(&mut stream).await;
             crate::tests::close_listener(listener).await;
@@ -802,7 +857,7 @@ async fn early_chunk_rejection_stops_at_the_frame_boundary_and_preserves_the_con
         let error = timeout(WAIT, call).await.unwrap().unwrap().unwrap_err();
         assert_eq!(error.phase(), crate::TransportPhase::DispatchUncertain);
         assert!(
-            matches!(error.source_error(), IpcError::CrmError(bytes) if bytes == b"early rejection")
+            matches!(error.source_error(), IpcError::CrmError(bytes) if bytes.starts_with(b"C2E1"))
         );
         assert!(client.is_connected());
         assert_eq!(
@@ -821,4 +876,10 @@ async fn early_chunk_rejection_stops_at_the_frame_boundary_and_preserves_the_con
         assert!(client.close_shared_bounded(WAIT).await);
         timeout(WAIT, peer).await.unwrap().unwrap();
     }
+}
+
+#[tokio::test]
+async fn second_call_end_preserves_phase_and_releases_its_shm() {
+    isolated_reply_failure(ReplyFault::RejectedDuringChunks).await;
+    isolated_reply_failure(ReplyFault::WholeShmDuringChunks).await;
 }

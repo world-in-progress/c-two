@@ -203,13 +203,13 @@ class Runtime:
         self,
         *,
         max_outstanding_calls: int | None = None,
-        retained_input_budget_bytes: int | None = None,
+        payload_buffer_budget_bytes: int | None = None,
     ) -> None:
-        """Set native finite call limits before their first business call."""
+        """Set native call limits before business calls or HTTP acquisition."""
         with self._lock:
             self._runtime_session.set_call_execution_limits(
                 max_outstanding_calls=max_outstanding_calls,
-                retained_input_budget_bytes=retained_input_budget_bytes,
+                payload_buffer_budget_bytes=payload_buffer_budget_bytes,
             )
 
     def set_relay_anchor(self, address: str) -> None:
@@ -871,10 +871,10 @@ class Runtime:
         if not blocking:
             return
 
-        # The native lifecycle is the truth: the host can stop
-        # itself when its controller closes, without any signal, so serve()
-        # must also watch the native terminal outcome instead of polling
-        # only for a stop request.
+        # The native lifecycle is the truth: the Host can stop itself,
+        # for example after a direct IPC shutdown request, without any signal,
+        # so serve() must also watch the native terminal outcome instead of
+        # polling only for a stop request.
         while not serve_stop.wait(timeout=0.1):
             if self._native_host_terminated():
                 break
@@ -1149,30 +1149,29 @@ def serve(
 def set_call_execution_limits(
     *,
     max_outstanding_calls: int | None = None,
-    retained_input_budget_bytes: int | None = None,
+    payload_buffer_budget_bytes: int | None = None,
 ) -> None:
-    """Set Core finite call admission limits before the first business call.
+    """Set Core call limits before the first business call or HTTP acquisition.
 
     Each ``None`` inherits native environment and default policy. Zero rejects
-    that dimension. Connections and snapshot observations do not freeze it;
-    the first business call does. Limits are per Runtime/domain and shared by
-    its call views.
+    positive byte admission. Snapshot observations and direct IPC connections
+    do not freeze it; HTTP acquisition starts the shared payload domain.
+    Limits are per Runtime/domain and shared by its call views.
     """
     _get_default_runtime().set_call_execution_limits(
         max_outstanding_calls=max_outstanding_calls,
-        retained_input_budget_bytes=retained_input_budget_bytes,
+        payload_buffer_budget_bytes=payload_buffer_budget_bytes,
     )
 
 
 def call_execution_snapshot() -> CallExecutionSnapshot:
-    """Observe Core finite input charges without freezing admission policy.
+    """Observe native call slots without freezing admission policy.
 
-    Includes unfinished continuations after caller expiry. ``retired`` reports
-    earlier sessions separately while native operations still own charges;
-    shutdown closes admission and never refunds unfinished input ownership.
-    Each Runtime has its own admission domain; these rows do not imply a
-    shared process-wide limit across replacement sessions. Counters measure
-    retained input, not process memory usage.
+    Counts finite unary calls and all server streams through their real terminal,
+    including work continuing after caller expiry. ``retired`` reports earlier
+    sessions while their native operations or payload owners remain alive.
+    Each Runtime has its own admission domain; payload byte accounting and
+    allocation rejection counters live in ``memory_stats()['payload_buffer']``.
     """
     return _get_default_runtime().call_execution_snapshot()
 

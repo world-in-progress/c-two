@@ -59,9 +59,9 @@ pub struct RelayArgs {
     #[arg(long)]
     pub call_max_outstanding: Option<u64>,
 
-    /// Retained forwarding input budget in bytes. Zero rejects positive input.
+    /// Payload buffer budget in bytes. Zero rejects positive byte admission.
     #[arg(long)]
-    pub call_retained_input_budget_bytes: Option<u64>,
+    pub call_payload_buffer_budget_bytes: Option<u64>,
 
     /// Validate and print relay configuration without starting the server.
     #[arg(long, hide = true)]
@@ -117,7 +117,7 @@ pub fn run(args: RelayArgs) -> Result<()> {
     let options = RelayServerOptions {
         call_execution: CallExecutionLimitsOverrides {
             max_outstanding_calls: args.call_max_outstanding,
-            retained_input_budget_bytes: args.call_retained_input_budget_bytes,
+            payload_buffer_budget_bytes: args.call_payload_buffer_budget_bytes,
         },
     };
     let sources = ConfigSources::from_process();
@@ -141,8 +141,8 @@ pub fn run(args: RelayArgs) -> Result<()> {
         .map_err(|e| anyhow!("{e}"))?;
         println!("call_max_outstanding={}", limits.max_outstanding_calls);
         println!(
-            "call_retained_input_budget_bytes={}",
-            limits.retained_input_budget_bytes
+            "call_payload_buffer_budget_bytes={}",
+            limits.payload_buffer_budget_bytes
         );
         println!("local_namespace={}", context.namespace_id());
         println!("bind={}", config.bind);

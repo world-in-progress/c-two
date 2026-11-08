@@ -1,5 +1,6 @@
 //! Relay-aware HTTP client with route failover.
 
+use c2_mem::retention::{BudgetedBuffer, PayloadBufferBudget, PayloadBufferReservation};
 use std::collections::HashSet;
 use std::net::IpAddr;
 use std::sync::{Arc, OnceLock};
@@ -11,8 +12,8 @@ use serde_json::json;
 use super::call_control::check_active;
 use super::http_client::HttpCallInput;
 use super::{
-    HttpCallControl, HttpClientPool, HttpError, HttpInputOwner, RelayControlClient,
-    RelayResolvedRoutes, RelayRouteInfo,
+    HttpCallControl, HttpClientPool, HttpError, HttpInputOwner, HttpResponseStream,
+    HttpStreamCancellation, RelayControlClient, RelayResolvedRoutes, RelayRouteInfo,
 };
 use c2_config::LocalEndpointContext;
 use c2_contract::ExpectedRouteContract;
@@ -115,6 +116,7 @@ impl RelayResolvedTarget {
 }
 
 pub struct RelayAwareHttpClient {
+    payload_budget: PayloadBufferBudget,
     control: Arc<RelayControlClient>,
     pool: &'static HttpClientPool,
     expected: ExpectedRouteContract,
@@ -149,6 +151,9 @@ impl RelayAwareHttpClient {
         // HTTP construction must not require a local logon SID or resolve an IPC
         // root. Local selection derives the platform default lazily.
         Ok(Self {
+            payload_budget: PayloadBufferBudget::new(
+                c2_config::DEFAULT_PAYLOAD_BUFFER_BUDGET_BYTES,
+            ),
             local_endpoint_context: None,
             default_local_endpoint_context: OnceLock::new(),
             http_only: false,
@@ -160,6 +165,12 @@ impl RelayAwareHttpClient {
             config,
             current: Mutex::new(None),
         })
+    }
+
+    /// Use the Runtime's one payload domain for calls and HTTP probe errors.
+    pub fn with_payload_buffer_budget(mut self, budget: PayloadBufferBudget) -> Self {
+        self.payload_budget = budget;
+        self
     }
 
     /// Project the context whose endpoints the caller can open. Namespace agreement
@@ -224,10 +235,119 @@ impl RelayAwareHttpClient {
         method_name: &str,
         data: HttpInputOwner,
         control: &HttpCallControl,
-    ) -> Result<Vec<u8>, HttpCallError> {
+    ) -> Result<BudgetedBuffer, HttpCallError> {
         self.call_inner_async(method_name, HttpCallInput::Owned(data), Some(control))
             .await
             .map_err(|source| HttpCallError::new(http_call_error_phase(&source), source))
+    }
+
+    /// Resolve once and issue one route-bound streaming business POST. The
+    /// returned actor retains the original operation slot through CALL_END.
+    #[doc(hidden)]
+    pub async fn stream_controlled_async(
+        &self,
+        method_name: &str,
+        data: HttpInputOwner,
+        send_headroom: PayloadBufferReservation,
+        completion_owner: Box<dyn Send>,
+        cancellation: HttpStreamCancellation,
+        control: &HttpCallControl,
+    ) -> Result<HttpResponseStream, HttpCallError> {
+        let result = self
+            .stream_inner_async(
+                method_name,
+                data,
+                send_headroom,
+                completion_owner,
+                cancellation,
+                control,
+            )
+            .await;
+        result.map_err(|source| HttpCallError::new(http_call_error_phase(&source), source))
+    }
+
+    async fn stream_inner_async(
+        &self,
+        method_name: &str,
+        data: HttpInputOwner,
+        send_headroom: PayloadBufferReservation,
+        completion_owner: Box<dyn Send>,
+        cancellation: HttpStreamCancellation,
+        control: &HttpCallControl,
+    ) -> Result<HttpResponseStream, HttpError> {
+        let budget = control.payload_budget().unwrap_or(&self.payload_budget);
+        let attempts = self.config.max_attempts.max(1);
+        let mut last_error = None;
+        for attempt in 0..attempts {
+            let routes = match self
+                .resolve_routes_async(
+                    attempt > 0,
+                    false,
+                    Some(control),
+                    c2_config::ConnectDeadline::default(),
+                )
+                .await
+            {
+                Ok(routes) if !routes.routes.is_empty() => routes,
+                Ok(_) => {
+                    return Err(HttpError::ServerError(
+                        404,
+                        resource_not_found_body(self.route_name()),
+                    ));
+                }
+                Err(error) if resolve_retryable(&error) && attempt + 1 < attempts => {
+                    last_error = Some(error);
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            for route in self.order_routes(routes.routes, &HashSet::new()) {
+                let relay_url = route.relay_url.trim_end_matches('/').to_string();
+                let client = match self.acquire_route_client(&relay_url, Some(control)) {
+                    Ok(client) => client,
+                    Err(error @ HttpError::LocalCallRejected(_)) => return Err(error),
+                    Err(error) => {
+                        last_error = Some(error);
+                        continue;
+                    }
+                };
+                let result = client
+                    .client
+                    .stream_with_route_token_async(
+                        &self.expected,
+                        &route.route_token(),
+                        route.max_payload_size,
+                        method_name,
+                        HttpCallInput::Owned(data),
+                        budget,
+                        send_headroom,
+                        completion_owner,
+                        cancellation,
+                        control,
+                    )
+                    .await;
+                match result {
+                    Ok(stream) => {
+                        *self.current.lock() = Some(relay_url);
+                        return Ok(stream);
+                    }
+                    Err(error) if route_is_stale(&error) => {
+                        self.control.invalidate(self.route_name());
+                        *self.current.lock() = None;
+                        return Err(error);
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            if attempt + 1 < attempts {
+                check_active(Some(control))?;
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                check_active(Some(control))?;
+            }
+        }
+        Err(last_error.unwrap_or_else(|| {
+            HttpError::ServerError(404, resource_not_found_body(self.route_name()))
+        }))
     }
 
     pub fn connect(&self) -> Result<(), HttpError> {
@@ -244,7 +364,13 @@ impl RelayAwareHttpClient {
         super::connect_deadline::check(deadline, "relay_resolve")?;
         super::http_client::runtime_with_deadline(deadline)?
             .handle()
-            .block_on(self.select_target_with_local_exclusions_async(true, &[], false, deadline))
+            .block_on(self.select_target_with_local_exclusions_async(
+                true,
+                &[],
+                None,
+                false,
+                deadline,
+            ))
     }
 
     pub fn resolve_http_target_with_deadline(
@@ -254,12 +380,19 @@ impl RelayAwareHttpClient {
         super::connect_deadline::check(deadline, "relay_resolve")?;
         super::http_client::runtime_with_deadline(deadline)?
             .handle()
-            .block_on(self.select_target_with_local_exclusions_async(false, &[], false, deadline))
+            .block_on(self.select_target_with_local_exclusions_async(
+                false,
+                &[],
+                None,
+                false,
+                deadline,
+            ))
     }
 
     pub fn resolve_target_after_local_ipc_failures_with_deadline(
         &self,
         failed_candidates: &[RelayLocalIpcCandidate],
+        failure_code: Option<c2_error::ErrorCode>,
         deadline: c2_config::ConnectDeadline,
     ) -> Result<RelayResolvedTarget, HttpError> {
         super::connect_deadline::check(deadline, "relay_resolve")?;
@@ -268,6 +401,7 @@ impl RelayAwareHttpClient {
             .block_on(self.select_target_with_local_exclusions_async(
                 true,
                 failed_candidates,
+                failure_code,
                 true,
                 deadline,
             ))
@@ -287,6 +421,7 @@ impl RelayAwareHttpClient {
         self.select_target_with_local_exclusions_async(
             prefer_local_ipc,
             &[],
+            None,
             false,
             c2_config::ConnectDeadline::default(),
         )
@@ -297,6 +432,7 @@ impl RelayAwareHttpClient {
         &self,
         prefer_local_ipc: bool,
         excluded_local_ipc_candidates: &[RelayLocalIpcCandidate],
+        failure_code: Option<c2_error::ErrorCode>,
         fallback_denied_when_only_excluded: bool,
         deadline: c2_config::ConnectDeadline,
     ) -> Result<RelayResolvedTarget, HttpError> {
@@ -333,8 +469,11 @@ impl RelayAwareHttpClient {
             let namespace_allows_local_ipc = prefer_local_ipc
                 && self.namespace_allows_local_ipc(routes.local_endpoint_namespace.as_deref());
             let had_routes_before_local_exclusion = !routes.routes.is_empty();
-            let routes =
-                filter_failed_local_ipc_candidates(routes.routes, excluded_local_ipc_candidates);
+            let routes = filter_failed_local_ipc_candidates(
+                routes.routes,
+                excluded_local_ipc_candidates,
+                failure_code,
+            );
             if routes.is_empty()
                 && fallback_denied_when_only_excluded
                 && had_routes_before_local_exclusion
@@ -373,13 +512,16 @@ impl RelayAwareHttpClient {
                         }
                     };
 
+                // A selected next attempt replaces the previous error. Its
+                // received bytes must not occupy B while the new probe waits.
+                drop(last_error.take());
                 let probe = super::connect_deadline::run(
                     deadline,
                     "relay_probe",
                     client.client.probe_route_with_token_async(
                         &self.expected,
                         &route.route_token(),
-                        route.max_payload_size,
+                        &self.payload_budget,
                     ),
                 )
                 .await;
@@ -398,7 +540,7 @@ impl RelayAwareHttpClient {
                             .invalidate_with_deadline(self.route_name(), deadline)?;
                         *super::connect_deadline::lock(&self.current, deadline, "relay_select")? =
                             None;
-                        excluded_routes.insert(relay_url);
+                        excluded_routes.insert((relay_url, route.route_uid));
                         last_error = Some(err);
                     }
                     Err(err) => {
@@ -428,6 +570,7 @@ impl RelayAwareHttpClient {
     ) -> Result<Vec<u8>, HttpError> {
         self.call_inner_async(method_name, HttpCallInput::Borrowed(data), None)
             .await
+            .map(BudgetedBuffer::into_vec)
     }
 
     async fn call_inner_async(
@@ -435,11 +578,14 @@ impl RelayAwareHttpClient {
         method_name: &str,
         data: HttpCallInput<'_>,
         control: Option<&HttpCallControl>,
-    ) -> Result<Vec<u8>, HttpError> {
+    ) -> Result<BudgetedBuffer, HttpError> {
+        let budget = control
+            .and_then(HttpCallControl::payload_budget)
+            .unwrap_or(&self.payload_budget);
+        let mut data = Some(data);
         let attempts = self.config.max_attempts.max(1);
         let mut last_error = None;
-        let mut excluded_routes = HashSet::new();
-        let mut previous_dispatch = None;
+        let excluded_routes = HashSet::new();
 
         for attempt in 0..attempts {
             let routes = match self
@@ -491,9 +637,10 @@ impl RelayAwareHttpClient {
                         &route.route_token(),
                         route.max_payload_size,
                         method_name,
-                        &data,
+                        data.take()
+                            .expect("the request owner is consumed at its sole business POST"),
+                        budget,
                         control,
-                        previous_dispatch,
                     )
                     .await
                 {
@@ -503,13 +650,11 @@ impl RelayAwareHttpClient {
                     }
                     Err(HttpError::CrmError(err)) => return Err(HttpError::CrmError(err)),
                     Err(err) if route_is_stale(&err) => {
-                        check_active(control)?;
-                        previous_dispatch = Some(HttpCallPhase::PreDispatch);
                         self.control.invalidate(self.route_name());
                         *self.current.lock() = None;
-                        excluded_routes.insert(relay_url);
-                        last_error = Some(err);
-                        break;
+                        // No input is retained solely for a possible replay.
+                        // The next logical call acquires the fresh route.
+                        return Err(err);
                     }
                     Err(err) => return Err(err),
                 }
@@ -647,7 +792,7 @@ impl RelayAwareHttpClient {
     fn order_routes(
         &self,
         routes: Vec<RelayRouteInfo>,
-        excluded_routes: &HashSet<String>,
+        excluded_routes: &HashSet<(String, String)>,
     ) -> Vec<RelayRouteInfo> {
         // Calls retain their existing policy; only connect supplies a deadline.
         self.order_routes_with_deadline(
@@ -661,12 +806,17 @@ impl RelayAwareHttpClient {
     fn order_routes_with_deadline(
         &self,
         routes: Vec<RelayRouteInfo>,
-        excluded_routes: &HashSet<String>,
+        excluded_routes: &HashSet<(String, String)>,
         deadline: c2_config::ConnectDeadline,
     ) -> Result<Vec<RelayRouteInfo>, HttpError> {
         let routes = routes
             .into_iter()
-            .filter(|route| !excluded_routes.contains(route.relay_url.trim_end_matches('/')))
+            .filter(|route| {
+                !excluded_routes.contains(&(
+                    route.relay_url.trim_end_matches('/').to_owned(),
+                    route.route_uid.clone(),
+                ))
+            })
             .collect::<Vec<_>>();
         let current =
             super::connect_deadline::lock(&self.current, deadline, "relay_select")?.clone();
@@ -690,24 +840,52 @@ impl RelayAwareHttpClient {
 type RelayPoolGuard = super::pool::HttpPoolLease;
 
 fn route_is_stale(err: &HttpError) -> bool {
-    match err {
-        HttpError::ServerError(404, body) => {
-            relay_error_code_is(body, c2_error::ErrorCode::ResourceNotFound)
-        }
-        HttpError::ServerError(409, body) => {
-            relay_error_code_is(body, c2_error::ErrorCode::RouteStale)
-        }
-        // ResourceUnavailable + pre_dispatch also covers local request capacity
-        // rejection. It proves no business dispatch, but not a stale route, so
-        // it must not trigger withdrawal or authorize another business POST.
+    let (status, body) = match err {
+        HttpError::ServerError(status, body) => (*status, body.as_bytes()),
+        HttpError::ResponseError(status, body) => (*status, body.as_ref()),
+        _ => return false,
+    };
+    let Ok(body) = std::str::from_utf8(body) else {
+        return false;
+    };
+    match status {
+        404 => relay_error_code_is(body, c2_error::ErrorCode::ResourceNotFound),
+        409 => relay_error_code_is(body, c2_error::ErrorCode::RouteStale),
         _ => false,
     }
 }
 
+fn relay_rejection_is_pre_dispatch(error: &HttpError) -> bool {
+    let body = match error {
+        HttpError::ResponseError(404 | 406 | 409 | 410 | 429 | 502 | 503, body) => body.as_ref(),
+        HttpError::ServerError(404 | 406 | 409 | 410 | 429 | 502 | 503, body) => body.as_bytes(),
+        _ => return false,
+    };
+    let Ok(envelope) = serde_json::from_slice::<c2_error::C2ErrorEnvelope>(body) else {
+        return false;
+    };
+    c2_error::C2Error::from_envelope(envelope).is_ok_and(|error| {
+        error
+            .details
+            .get("dispatch_phase")
+            .is_some_and(|phase| phase == "pre_dispatch")
+    })
+}
+
 fn http_call_error_phase(error: &HttpError) -> HttpCallPhase {
     match error {
+        HttpError::LocalCallRejected(error)
+            if error
+                .details
+                .get("transport_phase")
+                .is_some_and(|phase| phase == "dispatch_uncertain") =>
+        {
+            HttpCallPhase::DispatchUncertain
+        }
         HttpError::InvalidInput(_) | HttpError::LocalCallRejected(_) => HttpCallPhase::PreDispatch,
-        error if route_is_stale(error) => HttpCallPhase::PreDispatch,
+        error if route_is_stale(error) || relay_rejection_is_pre_dispatch(error) => {
+            HttpCallPhase::PreDispatch
+        }
         _ => HttpCallPhase::DispatchUncertain,
     }
 }
@@ -815,6 +993,7 @@ fn select_local_ipc_candidate(
 fn filter_failed_local_ipc_candidates(
     routes: Vec<RelayRouteInfo>,
     failed_candidates: &[RelayLocalIpcCandidate],
+    failure_code: Option<c2_error::ErrorCode>,
 ) -> Vec<RelayRouteInfo> {
     if failed_candidates.is_empty() {
         return routes;
@@ -824,7 +1003,7 @@ fn filter_failed_local_ipc_candidates(
         .filter(|route| {
             !failed_candidates
                 .iter()
-                .any(|failed| route_matches_local_ipc_candidate(route, failed))
+                .any(|failed| route_matches_local_ipc_candidate(route, failed, failure_code))
         })
         .collect()
 }
@@ -832,12 +1011,15 @@ fn filter_failed_local_ipc_candidates(
 fn route_matches_local_ipc_candidate(
     route: &RelayRouteInfo,
     failed: &RelayLocalIpcCandidate,
+    failure_code: Option<c2_error::ErrorCode>,
 ) -> bool {
-    // A same-endpoint local IPC retry with a newer token would silently bind a
-    // replacement route. Exclude by endpoint identity, not by route token.
+    // A stale route token does not disprove its endpoint. Other failures keep
+    // excluding that endpoint even when discovery advertises a different UID.
     route.ipc_address.as_deref() == Some(failed.address.as_str())
         && route.server_id.as_deref() == Some(failed.server_id.as_str())
         && route.server_instance_id.as_deref() == Some(failed.server_instance_id.as_str())
+        && (failure_code != Some(c2_error::ErrorCode::RouteStale)
+            || route.route_uid == failed.route_uid)
 }
 
 fn filter_routes_by_expected_contract(
@@ -955,7 +1137,7 @@ mod tests {
         .with_http_only();
         let start = std::time::Instant::now();
         let error = client
-            .select_target_with_local_exclusions_async(true, &[], false, connect_budget(50))
+            .select_target_with_local_exclusions_async(true, &[], None, false, connect_budget(50))
             .await
             .unwrap_err();
         assert!(start.elapsed() < Duration::from_millis(500));
@@ -963,7 +1145,13 @@ mod tests {
         responsive.store(true, Ordering::SeqCst);
         assert_eq!(
             client
-                .select_target_with_local_exclusions_async(false, &[], false, connect_budget(1000))
+                .select_target_with_local_exclusions_async(
+                    false,
+                    &[],
+                    None,
+                    false,
+                    connect_budget(1000)
+                )
                 .await
                 .unwrap()
                 .as_url(),
@@ -1034,7 +1222,13 @@ mod tests {
         .with_http_only();
         assert_connect_expired(
             client
-                .select_target_with_local_exclusions_async(false, &[], false, connect_budget(200))
+                .select_target_with_local_exclusions_async(
+                    false,
+                    &[],
+                    None,
+                    false,
+                    connect_budget(200),
+                )
                 .await
                 .unwrap_err(),
             "relay_probe",
@@ -1043,7 +1237,13 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         stall_probe.store(false, Ordering::SeqCst);
         client
-            .select_target_with_local_exclusions_async(false, &[], false, connect_budget(1000))
+            .select_target_with_local_exclusions_async(
+                false,
+                &[],
+                None,
+                false,
+                connect_budget(1000),
+            )
             .await
             .unwrap();
         assert_eq!(probes.load(Ordering::SeqCst), 2);
@@ -1082,7 +1282,13 @@ mod tests {
         let start = std::time::Instant::now();
         assert_connect_expired(
             client
-                .select_target_with_local_exclusions_async(false, &[], false, connect_budget(150))
+                .select_target_with_local_exclusions_async(
+                    false,
+                    &[],
+                    None,
+                    false,
+                    connect_budget(150),
+                )
                 .await
                 .unwrap_err(),
             "relay_resolve",
@@ -1132,6 +1338,81 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn stale_probe_refresh_selects_new_uid_on_same_relay_without_reprobing_old_token() {
+        let probes = Arc::new(Mutex::new(Vec::new()));
+        let observed_probes = probes.clone();
+        let (relay_url, relay_task) = spawn_app(Router::new().route(
+            "/_probe/{route}",
+            get(move |headers: axum::http::HeaderMap| {
+                let probes = observed_probes.clone();
+                async move {
+                    let uid = headers["x-c2-route-uid"].to_str().unwrap().to_owned();
+                    probes.lock().push(uid.clone());
+                    if uid == "old-uid" {
+                        (
+                            StatusCode::CONFLICT,
+                            Json(canonical_error_json(
+                                704,
+                                "RouteStale",
+                                "stale token",
+                                "grid",
+                            )),
+                        )
+                            .into_response()
+                    } else {
+                        assert_eq!(uid, "new-uid");
+                        StatusCode::OK.into_response()
+                    }
+                }
+            }),
+        ))
+        .await;
+        let resolves = Arc::new(AtomicUsize::new(0));
+        let observed_resolves = resolves.clone();
+        let advertised_relay = relay_url.clone();
+        let (registry_url, registry_task) = spawn_app(Router::new().route(
+            "/_resolve/{route}",
+            get(move || {
+                let count = observed_resolves.fetch_add(1, Ordering::SeqCst);
+                let mut old = route_info("grid".into(), advertised_relay.clone());
+                old.route_uid = "old-uid".into();
+                let mut routes = vec![old.clone()];
+                if count > 0 {
+                    old.route_uid = "new-uid".into();
+                    routes.push(old);
+                }
+                async move { Json(routes) }
+            }),
+        ))
+        .await;
+        let client = RelayAwareHttpClient::new(
+            &registry_url,
+            expected_contract(),
+            false,
+            RelayAwareClientConfig {
+                max_attempts: 2,
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .with_http_only();
+        let result = client.select_target_async(false).await;
+        registry_task.abort();
+        relay_task.abort();
+        let _ = registry_task.await;
+        let _ = relay_task.await;
+        assert_eq!(
+            result.unwrap(),
+            RelayResolvedTarget::Http {
+                relay_url,
+                route_uid: "new-uid".into(),
+            }
+        );
+        assert_eq!(resolves.load(Ordering::SeqCst), 2);
+        assert_eq!(*probes.lock(), ["old-uid", "new-uid"]);
+    }
+
     async fn registry_resolve(
         State(state): State<RegistryState>,
         Path(name): Path<String>,
@@ -1170,17 +1451,70 @@ mod tests {
         assert!(route_is_stale(&stale));
         assert_eq!(http_call_error_phase(&stale), HttpCallPhase::PreDispatch);
 
-        let mut capacity = canonical_error_json(702, "ResourceUnavailable", "capacity", "grid");
-        capacity["details"]["dispatch_phase"] = json!("pre_dispatch");
+        let mut rejected = canonical_error_json(701, "ResourceNotFound", "not executed", "grid");
+        rejected["details"]["dispatch_phase"] = json!("pre_dispatch");
+        assert_eq!(
+            http_call_error_phase(&HttpError::ServerError(404, rejected.to_string())),
+            HttpCallPhase::PreDispatch
+        );
+        let mut unsupported =
+            canonical_error_json(716, "UnsupportedCallMode", "not executed", "grid");
+        unsupported["details"]["dispatch_phase"] = json!("pre_dispatch");
+        assert_eq!(
+            http_call_error_phase(&HttpError::ServerError(406, unsupported.to_string())),
+            HttpCallPhase::PreDispatch
+        );
+        let bytes = unsupported.to_string().into_bytes();
+        let budget = PayloadBufferBudget::new(bytes.capacity() as u64);
+        let reservation = budget.try_reserve(bytes.capacity() as u64).unwrap();
+        assert_eq!(
+            http_call_error_phase(&HttpError::ResponseError(
+                406,
+                BudgetedBuffer::new(bytes, reservation)
+            )),
+            HttpCallPhase::PreDispatch
+        );
+        let mut unavailable =
+            canonical_error_json(702, "ResourceUnavailable", "not executed", "grid");
+        unavailable["details"]["dispatch_phase"] = json!("pre_dispatch");
+        assert_eq!(
+            http_call_error_phase(&HttpError::ServerError(503, unavailable.to_string())),
+            HttpCallPhase::PreDispatch
+        );
+
+        let mut capacity_rejected =
+            canonical_error_json(717, "CallCapacityExceeded", "not executed", "grid");
+        capacity_rejected["details"]["dispatch_phase"] = json!("pre_dispatch");
+        assert_eq!(
+            http_call_error_phase(&HttpError::ServerError(502, capacity_rejected.to_string())),
+            HttpCallPhase::PreDispatch
+        );
+
+        let mut failed_after_callback = rejected.clone();
+        failed_after_callback["details"]["dispatch_phase"] = json!("dispatch_uncertain");
+        assert_eq!(
+            http_call_error_phase(&HttpError::ServerError(
+                500,
+                failed_after_callback.to_string()
+            )),
+            HttpCallPhase::DispatchUncertain
+        );
+
+        let capacity = canonical_error_json(702, "ResourceUnavailable", "capacity", "grid");
         for error in [
             HttpError::ServerError(502, capacity.to_string()),
             HttpError::ServerError(429, capacity.to_string()),
             HttpError::ServerError(404, "ResourceNotFound in an untrusted body".into()),
-            HttpError::CrmError(
-                canonical_error_json(704, "RouteStale", "user error", "grid")
+            HttpError::CrmError({
+                let bytes = canonical_error_json(704, "RouteStale", "user error", "grid")
                     .to_string()
-                    .into_bytes(),
-            ),
+                    .into_bytes();
+                let budget = PayloadBufferBudget::new(bytes.capacity() as u64);
+                let reservation = budget
+                    .reserve_blocking(bytes.capacity() as u64, None)
+                    .unwrap();
+                BudgetedBuffer::new(bytes, reservation)
+            }),
             HttpError::Transport("connection lost after POST".into()),
         ] {
             assert!(!route_is_stale(&error));
@@ -1414,7 +1748,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn call_re_resolves_and_tries_next_route_after_stale_route() {
+    async fn stale_post_is_not_replayed_and_the_next_call_resolves_again() {
         let (stale_url, stale_handle) =
             spawn_app(Router::new().route("/{route}/{method}", post(stale_call))).await;
         let (live_url, live_handle) =
@@ -1443,11 +1777,20 @@ mod tests {
         )
         .unwrap();
 
-        let bytes = client.call_async("step", b"payload").await.unwrap();
-        assert_eq!(bytes, b"ok:payload");
-        assert!(
-            resolve_count.load(Ordering::SeqCst) >= 2,
-            "stale route should invalidate cache and re-resolve"
+        let error = client.call_async("step", b"payload").await.unwrap_err();
+        assert!(route_is_stale(&error));
+        assert_eq!(
+            resolve_count.load(Ordering::SeqCst),
+            1,
+            "one logical call does not replay its POST"
+        );
+        drop(error);
+        let next = client.call_async("step", b"payload").await.unwrap_err();
+        assert!(route_is_stale(&next));
+        assert_eq!(
+            resolve_count.load(Ordering::SeqCst),
+            2,
+            "a new logical call performs a fresh resolution"
         );
 
         registry_handle.abort();
@@ -1750,6 +2093,7 @@ mod tests {
             .select_target_with_local_exclusions_async(
                 true,
                 std::slice::from_ref(&failed),
+                None,
                 true,
                 c2_config::ConnectDeadline::default(),
             )
@@ -1807,6 +2151,7 @@ mod tests {
             .select_target_with_local_exclusions_async(
                 true,
                 std::slice::from_ref(&failed),
+                None,
                 true,
                 c2_config::ConnectDeadline::default(),
             )
@@ -1837,9 +2182,78 @@ mod tests {
         };
 
         assert!(
-            filter_failed_local_ipc_candidates(vec![refreshed_same_endpoint], &[failed]).is_empty(),
+            filter_failed_local_ipc_candidates(vec![refreshed_same_endpoint], &[failed], None)
+                .is_empty(),
             "same endpoint with a replacement token must stay excluded"
         );
+    }
+
+    #[tokio::test]
+    async fn local_stale_token_refresh_keeps_new_uid_but_endpoint_failure_stays_excluded() {
+        for code in [
+            None,
+            Some(c2_error::ErrorCode::ResourceUnavailable),
+            Some(c2_error::ErrorCode::RouteStale),
+        ] {
+            let count = Arc::new(AtomicUsize::new(0));
+            let (url, task) = spawn_app(
+                Router::new()
+                    .route(
+                        "/_resolve/{name}",
+                        get(registry_resolve_only_failed_local_ipc),
+                    )
+                    .with_state(RegistryState {
+                        stale_url: "http://127.0.0.1:9".into(),
+                        live_url: String::new(),
+                        resolve_count: count.clone(),
+                    }),
+            )
+            .await;
+            let client = RelayAwareHttpClient::new(
+                &url,
+                expected_contract(),
+                false,
+                RelayAwareClientConfig {
+                    max_attempts: 1,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let failed = RelayLocalIpcCandidate {
+                address: "ipc://local-grid".into(),
+                server_id: "local-grid".into(),
+                server_instance_id: "inst-local-grid".into(),
+                route_uid: "old-uid".into(),
+            };
+            let result = client
+                .select_target_with_local_exclusions_async(
+                    true,
+                    &[failed],
+                    code,
+                    true,
+                    c2_config::ConnectDeadline::default(),
+                )
+                .await;
+            task.abort();
+            let _ = task.await;
+            if code == Some(c2_error::ErrorCode::RouteStale) {
+                assert_eq!(
+                    result.unwrap(),
+                    RelayResolvedTarget::Ipc {
+                        candidate: RelayLocalIpcCandidate {
+                            address: "ipc://local-grid".into(),
+                            server_id: "local-grid".into(),
+                            server_instance_id: "inst-local-grid".into(),
+                            route_uid: "grid-route-uid-0001".into(),
+                        },
+                    }
+                );
+            } else {
+                assert!(matches!(result, Err(HttpError::ServerError(409, body))
+                    if relay_error_code_is(&body, c2_error::ErrorCode::FallbackDenied)));
+            }
+            assert_eq!(count.load(Ordering::SeqCst), 1);
+        }
     }
 
     #[tokio::test]
@@ -2115,7 +2529,7 @@ mod tests {
         .unwrap();
 
         let err = client.call_async("step", b"payload").await.unwrap_err();
-        assert!(matches!(err, HttpError::ServerError(502, _)));
+        assert!(matches!(err, HttpError::ResponseError(502, _)));
         assert_eq!(resolve_count.load(Ordering::SeqCst), 1);
 
         registry_handle.abort();
@@ -2154,7 +2568,7 @@ mod tests {
         .unwrap();
 
         let err = client.call_async("step", b"payload").await.unwrap_err();
-        assert!(matches!(err, HttpError::ServerError(502, _)));
+        assert!(matches!(err, HttpError::ResponseError(502, _)));
         assert_eq!(resolve_count.load(Ordering::SeqCst), 1);
 
         registry_handle.abort();
@@ -2163,7 +2577,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn structured_404_is_treated_as_stale_route() {
+    async fn structured_404_invalidates_route_without_retaining_replay_input() {
         let (stale_url, stale_handle) =
             spawn_app(Router::new().route("/{route}/{method}", post(stale_not_found))).await;
         let (live_url, live_handle) =
@@ -2192,9 +2606,21 @@ mod tests {
         )
         .unwrap();
 
-        let bytes = client.call_async("step", b"payload").await.unwrap();
-        assert_eq!(bytes, b"ok:payload");
-        assert!(resolve_count.load(Ordering::SeqCst) >= 2);
+        let error = client.call_async("step", b"payload").await.unwrap_err();
+        assert!(route_is_stale(&error));
+        assert_eq!(
+            resolve_count.load(Ordering::SeqCst),
+            1,
+            "one logical call does not replay its POST"
+        );
+        drop(error);
+        let next = client.call_async("step", b"payload").await.unwrap_err();
+        assert!(route_is_stale(&next));
+        assert_eq!(
+            resolve_count.load(Ordering::SeqCst),
+            2,
+            "a new logical call performs a fresh resolution"
+        );
 
         registry_handle.abort();
         stale_handle.abort();
@@ -2232,7 +2658,7 @@ mod tests {
         .unwrap();
 
         let err = client.call_async("step", b"payload").await.unwrap_err();
-        assert!(matches!(err, HttpError::ServerError(404, _)));
+        assert!(matches!(err, HttpError::ResponseError(404, _)));
         assert_eq!(resolve_count.load(Ordering::SeqCst), 1);
 
         registry_handle.abort();
@@ -2271,7 +2697,7 @@ mod tests {
         .unwrap();
 
         let err = client.call_async("step", b"payload").await.unwrap_err();
-        assert!(matches!(err, HttpError::ServerError(503, _)));
+        assert!(matches!(err, HttpError::ResponseError(503, _)));
         assert_eq!(
             resolve_count.load(Ordering::SeqCst),
             1,
@@ -2319,7 +2745,7 @@ mod tests {
             .call_controlled_async(
                 "step",
                 Arc::new(b"payload".to_vec()),
-                &HttpCallControl::new(|| Ok(()), |_| Ok(())),
+                &HttpCallControl::new(|| Ok(()), || Ok(())),
             )
             .await
             .expect_err("dispatch-uncertain relay failure");
@@ -2370,5 +2796,312 @@ mod tests {
 
         registry_handle.abort();
         live_handle.abort();
+    }
+
+    mod stream_body_failures {
+        use super::*;
+        use crate::stream_wire::{
+            self, HttpStreamRecordKind, HttpStreamStatus, HttpStreamTerminal,
+        };
+        use c2_mem::retention::RetentionBudget;
+        use std::future::Future;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::sync::oneshot;
+
+        async fn bounded<T>(work: impl Future<Output = T>) -> T {
+            tokio::time::timeout(Duration::from_secs(10), work)
+                .await
+                .expect("HTTP stream acceptance step timed out")
+        }
+
+        struct Peer {
+            url: String,
+            task: tokio::task::JoinHandle<()>,
+            written: oneshot::Receiver<()>,
+            end: Option<oneshot::Sender<()>>,
+        }
+
+        impl Drop for Peer {
+            fn drop(&mut self) {
+                self.task.abort();
+            }
+        }
+
+        // A non-relay HTTP/1 peer needs raw TCP: Hyper would enforce a known
+        // Body length before exposing the contradictory bytes to the client.
+        // The end barrier follows application delivery, never elapsed time.
+        async fn peer(prefix: Vec<u8>, tail: Vec<u8>, declared: Option<usize>) -> Peer {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let (written, received) = oneshot::channel();
+            let (end, may_end) = oneshot::channel();
+            let task = tokio::spawn(async move {
+                let (mut socket, _) = bounded(listener.accept()).await.unwrap();
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    request.push(bounded(socket.read_u8()).await.unwrap());
+                }
+                let request = String::from_utf8(request).unwrap().to_ascii_lowercase();
+                assert!(request.starts_with("post /grid/step http/1.1\r\n"));
+                assert!(request.contains("content-length: 0\r\n"));
+                assert!(request.contains(&format!("accept: {}\r\n", stream_wire::MEDIA_TYPE)));
+                let framing = match declared {
+                    Some(length) => format!("Content-Length: {length}\r\n"),
+                    None => "Transfer-Encoding: chunked\r\n".into(),
+                };
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nx-c2-call-token: 0123456789abcdef0123456789abcdef\r\n{framing}Connection: close\r\n\r\n",
+                    stream_wire::MEDIA_TYPE,
+                );
+                bounded(socket.write_all(head.as_bytes())).await.unwrap();
+                if declared.is_none() {
+                    bounded(socket.write_all(format!("{:x}\r\n", prefix.len() + 1).as_bytes()))
+                        .await
+                        .unwrap();
+                }
+                bounded(socket.write_all(&prefix)).await.unwrap();
+                written.send(()).unwrap();
+                bounded(may_end).await.unwrap();
+                if declared.is_some() {
+                    bounded(socket.write_all(&tail)).await.unwrap();
+                    bounded(socket.shutdown()).await.unwrap();
+                } else {
+                    // Tokio exposes SO_LINGER(0) on Unix and Windows. This is
+                    // an actual TCP reset after the complete item was received.
+                    socket.set_zero_linger().unwrap();
+                }
+            });
+            Peer {
+                url,
+                task,
+                written: received,
+                end: Some(end),
+            }
+        }
+
+        fn item(bytes: &[u8]) -> Vec<u8> {
+            let mut record = stream_wire::encode_item_begin(bytes.len() as u64).to_vec();
+            record.extend_from_slice(&stream_wire::encode_header(
+                HttpStreamRecordKind::ItemData,
+                bytes.len() as u64,
+            ));
+            record.extend_from_slice(bytes);
+            record
+        }
+
+        async fn client_for(peer: &Peer) -> (RelayAwareHttpClient, tokio::task::JoinHandle<()>) {
+            let selected = route_info("grid".into(), peer.url.clone());
+            let (url, task) = spawn_app(Router::new().route(
+                "/_resolve/{route}",
+                get(move || {
+                    let selected = selected.clone();
+                    async move { Json(vec![selected]) }
+                }),
+            ))
+            .await;
+            let client = RelayAwareHttpClient::new(
+                &url,
+                expected_contract(),
+                false,
+                RelayAwareClientConfig::default(),
+            )
+            .unwrap()
+            .with_http_only();
+            (client, task)
+        }
+
+        // Requirement 9b4.4: a real reset in ITEM_DATA preserves the delivered
+        // owner, refunds the partial item and slot, and is dispatch-uncertain.
+        #[tokio::test]
+        async fn body_reset_mid_record_keeps_item_and_refunds_b() {
+            let mut prefix = item(b"kept");
+            prefix.extend_from_slice(&stream_wire::encode_item_begin(8));
+            prefix.extend_from_slice(&stream_wire::encode_header(
+                HttpStreamRecordKind::ItemData,
+                8,
+            ));
+            prefix.extend_from_slice(b"par");
+            let mut peer = peer(prefix, Vec::new(), None).await;
+            let (client, registry) = client_for(&peer).await;
+            let retention = RetentionBudget::new(1, 64);
+            let budget = retention.payload_budget();
+            let control = HttpCallControl::new(|| Ok(()), || Ok(()))
+                .with_payload_budget(budget.clone(), None);
+            let mut stream = bounded(client.stream_controlled_async(
+                "step",
+                Arc::new(Vec::<u8>::new()),
+                budget.try_reserve(1).unwrap(),
+                Box::new(retention.reserve().unwrap()),
+                HttpStreamCancellation::new(),
+                &control,
+            ))
+            .await
+            .unwrap();
+            bounded(&mut peer.written).await.unwrap();
+            let kept = bounded(stream.recv()).await.unwrap().unwrap();
+            assert_eq!(kept.as_ref(), b"kept");
+            bounded(async {
+                while budget.snapshot().used_bytes != 12 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await;
+            assert_eq!(retention.snapshot().used_operations, 1);
+            peer.end.take().unwrap().send(()).unwrap();
+            bounded(&mut peer.task).await.unwrap();
+            let error = bounded(stream.recv()).await.unwrap_err();
+            assert!(
+                matches!(&error, HttpError::Transport(message) if message.contains("HTTP stream body read failed")),
+                "{error:?}"
+            );
+            assert_eq!(
+                http_call_error_phase(&error),
+                HttpCallPhase::DispatchUncertain
+            );
+            let terminal = bounded(stream.completion()).await.unwrap_err();
+            assert_eq!(
+                http_call_error_phase(&terminal),
+                HttpCallPhase::DispatchUncertain
+            );
+            assert_eq!(kept.as_ref(), b"kept");
+            assert_eq!(budget.snapshot().used_bytes, 4);
+            assert_eq!(retention.snapshot().used_operations, 0);
+            drop(kept);
+            assert_eq!(budget.snapshot().used_bytes, 0);
+            registry.abort();
+        }
+
+        // Requirement 9b4.3(a), streaming RPC design section 8: an already
+        // obtained terminal cannot be replaced by a later EOF, even when the
+        // HTTP Content-Length promises more bytes after the complete CALL_END.
+        #[tokio::test]
+        async fn complete_success_survives_short_http_body() {
+            let prefix = item(b"kept");
+            let tail = stream_wire::encode_terminal(&HttpStreamTerminal {
+                status: HttpStreamStatus::Success,
+                complete_items: Some(1),
+                error: None,
+            })
+            .unwrap();
+            let declared = prefix.len() + tail.len() + 1;
+            let mut peer = peer(prefix, tail, Some(declared)).await;
+            let (client, registry) = client_for(&peer).await;
+            let retention = RetentionBudget::new(1, 64);
+            let budget = retention.payload_budget();
+            let control = HttpCallControl::new(|| Ok(()), || Ok(()))
+                .with_payload_budget(budget.clone(), None);
+            let mut stream = bounded(client.stream_controlled_async(
+                "step",
+                Arc::new(Vec::<u8>::new()),
+                budget.try_reserve(1).unwrap(),
+                Box::new(retention.reserve().unwrap()),
+                HttpStreamCancellation::new(),
+                &control,
+            ))
+            .await
+            .unwrap();
+            bounded(&mut peer.written).await.unwrap();
+            let kept = bounded(stream.recv()).await.unwrap().unwrap();
+            assert_eq!(kept.as_ref(), b"kept");
+            peer.end.take().unwrap().send(()).unwrap();
+            bounded(&mut peer.task).await.unwrap();
+            let terminal = bounded(stream.completion()).await.unwrap();
+            assert_eq!(terminal.status, HttpStreamStatus::Success);
+            assert_eq!(terminal.complete_items, Some(1));
+            assert!(terminal.error.is_none());
+            assert!(bounded(stream.recv()).await.unwrap().is_none());
+            assert_eq!(kept.as_ref(), b"kept");
+            assert_eq!(budget.snapshot().used_bytes, 4);
+            assert_eq!(retention.snapshot().used_operations, 0);
+            drop(kept);
+            assert_eq!(budget.snapshot().used_bytes, 0);
+            registry.abort();
+        }
+
+        async fn truncated_response_is_dispatch_uncertain(truncate_item: bool) {
+            let prefix = item(b"kept");
+            let mut tail = if truncate_item {
+                item(b"partial!")
+            } else {
+                Vec::new()
+            };
+            tail.extend_from_slice(
+                &stream_wire::encode_terminal(&HttpStreamTerminal {
+                    status: HttpStreamStatus::Success,
+                    complete_items: Some(if truncate_item { 2 } else { 1 }),
+                    error: None,
+                })
+                .unwrap(),
+            );
+            let cut = if truncate_item {
+                // Three of eight ITEM_DATA bytes fit in the declared body.
+                stream_wire::encode_item_begin(8).len() + stream_wire::RECORD_HEADER_LEN + 3
+            } else {
+                // Only three bytes of the CALL_END status/count payload fit.
+                stream_wire::RECORD_HEADER_LEN + 3
+            };
+            let declared = prefix.len() + cut;
+            assert!(declared < prefix.len() + tail.len());
+            let mut peer = peer(prefix, tail, Some(declared)).await;
+            let (client, registry) = client_for(&peer).await;
+            let retention = RetentionBudget::new(1, 64);
+            let budget = retention.payload_budget();
+            let control = HttpCallControl::new(|| Ok(()), || Ok(()))
+                .with_payload_budget(budget.clone(), None);
+            let mut stream = bounded(client.stream_controlled_async(
+                "step",
+                Arc::new(Vec::<u8>::new()),
+                budget.try_reserve(1).unwrap(),
+                Box::new(retention.reserve().unwrap()),
+                HttpStreamCancellation::new(),
+                &control,
+            ))
+            .await
+            .unwrap();
+            bounded(&mut peer.written).await.unwrap();
+            let kept = bounded(stream.recv()).await.unwrap().unwrap();
+            assert_eq!(kept.as_ref(), b"kept");
+            peer.end.take().unwrap().send(()).unwrap();
+            bounded(&mut peer.task).await.unwrap();
+            let error = bounded(stream.recv()).await.unwrap_err();
+            let terminal = bounded(stream.completion()).await.unwrap_err();
+            assert_eq!(kept.as_ref(), b"kept");
+            assert_eq!(budget.snapshot().used_bytes, 4);
+            assert_eq!(retention.snapshot().used_operations, 0);
+            drop(kept);
+            assert_eq!(budget.snapshot().used_bytes, 0);
+            registry.abort();
+            let expected = if truncate_item {
+                "HTTP stream ended mid ITEM_DATA"
+            } else {
+                "HTTP stream ended mid terminal"
+            };
+            for outcome in [&error, &terminal] {
+                assert_eq!(
+                    http_call_error_phase(outcome),
+                    HttpCallPhase::DispatchUncertain
+                );
+                assert!(
+                    matches!(outcome, HttpError::Transport(message) if message.contains(expected)),
+                    "expected a peer end inside the record: {outcome:?}"
+                );
+            }
+        }
+
+        // Requirement 9b4.3(b): a too-small Content-Length truncates ITEM_DATA
+        // before CALL_END. As in ipc-handshake.md's Server streams rule, a peer
+        // end without CALL_END is dispatch-uncertain; earlier items stay valid.
+        #[tokio::test]
+        async fn short_content_length_mid_item_is_dispatch_uncertain() {
+            truncated_response_is_dispatch_uncertain(true).await;
+        }
+
+        // Requirement 9b4.3(b): a too-small Content-Length truncates CALL_END,
+        // so no complete terminal is available. Treat the end as peer end,
+        // matching the same IPC rule, and retain the earlier complete item.
+        #[tokio::test]
+        async fn short_content_length_mid_call_end_is_dispatch_uncertain() {
+            truncated_response_is_dispatch_uncertain(false).await;
+        }
     }
 }

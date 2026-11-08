@@ -5,15 +5,17 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use c2_config::{CallOptions, ConnectDeadline, ConnectOptions};
-use c2_http::client::HttpCallControl;
+use c2_http::client::{HttpCallControl, HttpResponseStream, HttpStreamCancellation};
 use c2_ipc::IpcCallControl;
 
-use crate::call_execution::{PreparingCall, RetainedCallInput, guard_error, scope_error};
+use crate::call_execution::{PreparingCall, guard_error, scope_error};
+use crate::client_stream::{CoreResponseStream, StreamTransport};
 use crate::{CallScope, CallScopeError, CallState};
 
 use c2_contract::{ExpectedRouteContract, validate_expected_route_contract};
 use c2_http::client::{HttpCallPhase, RelayAwareHttpClient, RelayLocalIpcCandidate};
 use c2_ipc::{IpcCallError, RouteBinding};
+use c2_mem::retention::{BudgetedBuffer, PayloadBufferBudget};
 
 use crate::session::RelayResolvedConnection;
 use crate::{
@@ -120,6 +122,14 @@ impl fmt::Debug for Client {
 }
 
 impl Client {
+    #[doc(hidden)]
+    pub fn ipc_server_identity(&self) -> Option<c2_wire::handshake::ServerIdentity> {
+        match &self.inner.transport {
+            ClientInner::Ipc(client) => client.client.server_identity().cloned(),
+            ClientInner::Http(..) => None,
+        }
+    }
+
     /// Observe this physical IPC connection without connecting or reconnecting.
     /// Other logical views may share it; closing one view need not end it.
     pub fn connection_observation(&self) -> Result<c2_local::ConnectionObservation, Error> {
@@ -185,6 +195,29 @@ impl Client {
             preparing,
             inner: self.inner.clone(),
             method: method.to_string(),
+            stream: false,
+        })
+    }
+
+    /// Establish one server-stream call before input encoding. Stream calls
+    /// have no inherited HTTP unary timeout and every stream reserves a call
+    /// slot, including calls with an unlimited deadline.
+    #[doc(hidden)]
+    pub fn begin_stream(&self, method: &str) -> Result<PreparedCall, Error> {
+        let scope = CallScope::new(self.options, None).map_err(scope_error)?;
+        let mut preparing = self
+            .inner
+            .runtime
+            .call_execution_context()?
+            .prepare_stream_scope(scope)?;
+        if matches!(&self.inner.transport, ClientInner::Http(..)) {
+            preparing = preparing.with_stream_http_headroom();
+        }
+        Ok(PreparedCall {
+            preparing,
+            inner: self.inner.clone(),
+            method: method.to_string(),
+            stream: true,
         })
     }
 }
@@ -196,9 +229,20 @@ pub struct PreparedCall {
     preparing: PreparingCall,
     inner: Arc<ClientConnection>,
     method: String,
+    stream: bool,
 }
 
 impl PreparedCall {
+    #[doc(hidden)]
+    pub fn scope(&self) -> CallScope {
+        self.preparing.scope_clone()
+    }
+
+    #[doc(hidden)]
+    pub async fn charge_input_async(&mut self, nbytes: u64) -> Result<(), Error> {
+        self.preparing.charge_input_async(nbytes).await
+    }
+
     /// Reserve known prepared input bytes before native allocation/copy. For
     /// unknown pickle length, serialize on the caller after begin_call, then
     /// charge the resulting length; this checks the original deadline. It is
@@ -208,9 +252,9 @@ impl PreparedCall {
     }
 
     /// Hand off ALREADY PREPARED native-owned data, not a user serializer.
-    /// The factory must produce exactly nbytes bytes. Finite execution owns
-    /// materialization, input and transport until real completion; Unlimited
-    /// drives the same async transport inline without a task/budget charge.
+    /// The factory must produce exactly nbytes bytes. Finite execution keeps
+    /// its native task through real completion; Unlimited drives the same
+    /// transport inline. Both retain B for the actual input owner.
     pub fn encode<M>(mut self, nbytes: usize, materialize: M) -> Result<EncodedCall, Error>
     where
         M: FnOnce() -> Result<Vec<u8>, Error> + Send + 'static,
@@ -231,7 +275,7 @@ impl PreparedCall {
         self.encode(request.len(), move || Ok(request))
     }
 
-    /// Borrowed compatibility entry: charge before making the owned native copy.
+    /// Borrowed entry: charge before making the owned native copy.
     /// Rust cannot hand a borrowed slice to a detached continuation.
     pub fn encode_slice(mut self, request: &[u8]) -> Result<EncodedCall, Error> {
         self.charge_input(
@@ -252,12 +296,138 @@ pub struct EncodedCall {
 }
 
 impl EncodedCall {
+    pub fn stream(self) -> Result<CoreResponseStream, Error> {
+        let (started, scope, cancellation, http_cancellation) =
+            self.start_stream(false, c2_ipc::IpcStreamCancellation::new())?;
+        Ok(CoreResponseStream::new(
+            started.wait()?,
+            scope,
+            cancellation,
+            http_cancellation,
+        ))
+    }
+
+    /// Keep the original opening record available to a native facade whose
+    /// caller may stop waiting independently of the transport.
+    #[doc(hidden)]
+    pub async fn stream_record_async(
+        self,
+        cancellation: c2_ipc::IpcStreamCancellation,
+    ) -> Result<CoreResponseStream, Error> {
+        let (started, scope, cancellation, http_cancellation) =
+            self.start_stream(true, cancellation)?;
+        let stream = started.wait_original().await?;
+        if cancellation.is_requested() {
+            http_cancellation.cancel();
+        }
+        Ok(CoreResponseStream::new(
+            stream,
+            scope,
+            cancellation,
+            http_cancellation,
+        ))
+    }
+
+    fn start_stream(
+        self,
+        original: bool,
+        cancellation: c2_ipc::IpcStreamCancellation,
+    ) -> Result<
+        (
+            crate::call_execution::ExecutingCall<StreamTransport>,
+            CallScope,
+            c2_ipc::IpcStreamCancellation,
+            HttpStreamCancellation,
+        ),
+        Error,
+    > {
+        let PreparedCall {
+            mut preparing,
+            inner,
+            method,
+            stream,
+        } = self.prepared;
+        if !stream {
+            return Err(LifecycleError::Configuration(
+                "stream handoff requires begin_stream".into(),
+            )
+            .into());
+        }
+        let scope = preparing.scope_clone();
+        let payload_budget = preparing.payload_budget();
+        let permit = preparing.take_stream_permit();
+        let transport_cancellation = cancellation.clone();
+        let handle_cancellation = cancellation.clone();
+        let http_cancellation = HttpStreamCancellation::new();
+        let transport_http_cancellation = http_cancellation.clone();
+        let abandon_http_cancellation = http_cancellation.clone();
+        let transport = move |input, scope| async move {
+            match &inner.transport {
+                ClientInner::Ipc(connection) => call_ipc_stream(
+                    connection,
+                    &method,
+                    input,
+                    scope,
+                    payload_budget,
+                    Box::new(permit),
+                    transport_cancellation,
+                )
+                .await
+                .map(StreamTransport::Ipc),
+                ClientInner::Http(client, _) => call_http_stream(
+                    client,
+                    &method,
+                    input,
+                    scope,
+                    payload_budget,
+                    Box::new(permit),
+                    transport_cancellation,
+                    transport_http_cancellation,
+                )
+                .await
+                .map(StreamTransport::Http),
+            }
+        };
+        let abandon = |stream: &StreamTransport| {
+            stream.cancel();
+        };
+        let on_abandon = move || {
+            cancellation.cancel();
+            abandon_http_cancellation.cancel();
+        };
+        let started = if original {
+            preparing.execute_stream_record(
+                self.nbytes,
+                self.materialize,
+                transport,
+                abandon,
+                on_abandon,
+            )?
+        } else {
+            preparing.execute_stream(
+                self.nbytes,
+                self.materialize,
+                transport,
+                abandon,
+                on_abandon,
+            )?
+        };
+        Ok((started, scope, handle_cancellation, http_cancellation))
+    }
+
     pub fn call_owned(self) -> Result<Vec<u8>, Error> {
         let PreparedCall {
             preparing,
             inner,
             method,
+            stream,
         } = self.prepared;
+        if stream {
+            return Err(
+                LifecycleError::Configuration("unary handoff requires begin_call".into()).into(),
+            );
+        }
+        let payload_budget = preparing.payload_budget();
         preparing
             .execute(
                 self.nbytes,
@@ -271,7 +441,9 @@ impl EncodedCall {
                                 .map_err(|error| LifecycleError::ResponseCopy(error).into())
                         }
                         ClientInner::Http(client, _) => {
-                            call_http(client, &method, input, scope).await
+                            call_http(client, &method, input, scope, payload_budget)
+                                .await
+                                .map(BudgetedBuffer::into_vec)
                         }
                     }
                 },
@@ -280,35 +452,53 @@ impl EncodedCall {
     }
 
     pub fn call_held(self) -> Result<HeldResponse, Error> {
+        self.start_held(false)?.wait()
+    }
+
+    #[doc(hidden)]
+    pub async fn call_held_record_async(self) -> Result<HeldResponse, Error> {
+        self.start_held(true)?.wait_original().await
+    }
+
+    fn start_held(
+        self,
+        original: bool,
+    ) -> Result<crate::call_execution::ExecutingCall<HeldResponse>, Error> {
         let PreparedCall {
             preparing,
             inner,
             method,
+            stream,
         } = self.prepared;
-        preparing
-            .execute(
-                self.nbytes,
-                self.materialize,
-                move |input, scope| async move {
-                    let response = match &inner.transport {
-                        ClientInner::Ipc(connection) => HeldResponse::from_response_data(
-                            call_ipc(connection, &method, input, scope).await?,
-                        )?,
-                        ClientInner::Http(client, _) => HeldResponse::from_owned_bytes(
-                            call_http(client, &method, input, scope).await?,
-                        ),
-                    };
-                    Ok(response)
-                },
-            )?
-            .wait()
+        if stream {
+            return Err(
+                LifecycleError::Configuration("unary handoff requires begin_call".into()).into(),
+            );
+        }
+        let payload_budget = preparing.payload_budget();
+        let transport = move |input, scope| async move {
+            let response = match &inner.transport {
+                ClientInner::Ipc(connection) => HeldResponse::from_response_data(
+                    call_ipc(connection, &method, input, scope).await?,
+                )?,
+                ClientInner::Http(client, _) => HeldResponse::from_budgeted_bytes(
+                    call_http(client, &method, input, scope, payload_budget).await?,
+                ),
+            };
+            Ok(response)
+        };
+        if original {
+            preparing.execute_whole_record(self.nbytes, self.materialize, transport)
+        } else {
+            preparing.execute(self.nbytes, self.materialize, transport)
+        }
     }
 }
 
 async fn call_ipc(
     connection: &PooledIpcClient,
     method: &str,
-    input: Arc<RetainedCallInput>,
+    input: BudgetedBuffer,
     scope: CallScope,
 ) -> Result<c2_ipc::ResponseData, Error> {
     let preparation = scope.clone();
@@ -316,27 +506,126 @@ async fn call_ipc(
         .with_before_prepare(move || preparation.check_pre_dispatch().map_err(guard_error));
     connection
         .client
-        .call_bound_controlled_async_phased(
+        .call_bound_owned_controlled_async_phased(&connection.binding, method, input, &control)
+        .await
+        .map_err(normalize_ipc_call_error)
+}
+
+async fn call_ipc_stream(
+    connection: &PooledIpcClient,
+    method: &str,
+    input: BudgetedBuffer,
+    scope: CallScope,
+    payload_budget: PayloadBufferBudget,
+    completion_owner: Box<dyn Send>,
+    cancellation: c2_ipc::IpcStreamCancellation,
+) -> Result<c2_ipc::IpcResponseStream, Error> {
+    let preparation = scope.clone();
+    let control = IpcCallControl::new(move || scope.try_begin_dispatch().map_err(guard_error))
+        .with_before_prepare(move || preparation.check_pre_dispatch().map_err(guard_error));
+    connection
+        .client
+        .stream_bound_owned_controlled_async_phased(
             &connection.binding,
             method,
-            input.as_ref().as_ref(),
+            input,
+            payload_budget,
+            completion_owner,
+            cancellation,
             &control,
         )
         .await
         .map_err(normalize_ipc_call_error)
 }
 
+async fn call_http_stream(
+    client: &RelayAwareHttpClient,
+    method: &str,
+    input: BudgetedBuffer,
+    scope: CallScope,
+    payload_budget: PayloadBufferBudget,
+    completion_owner: Box<dyn Send>,
+    opening_cancellation: c2_ipc::IpcStreamCancellation,
+    cancellation: HttpStreamCancellation,
+) -> Result<HttpResponseStream, Error> {
+    let (bytes, mut reservation) = input.into_parts();
+    let input_reservation = reservation
+        .split_off(bytes.capacity() as u64)
+        .map_err(|error| LifecycleError::Configuration(error.to_string()))?;
+    let input = BudgetedBuffer::new(bytes, input_reservation);
+    let active = scope.clone();
+    let deadline = scope.deadline();
+    let before_attempt_cancellation = opening_cancellation.clone();
+    let control = HttpCallControl::new(
+        move || {
+            if before_attempt_cancellation.is_requested() {
+                return Err(pre_dispatch_stream_cancellation());
+            }
+            match active.observe_deadline() {
+                CallState::PreDispatch | CallState::Dispatched => Ok(()),
+                CallState::ExpiredPreDispatch => {
+                    Err(guard_error(CallScopeError::DeadlineExceeded {
+                        phase: TransportPhase::PreDispatch,
+                    }))
+                }
+                CallState::ExpiredDispatchUncertain => {
+                    Err(guard_error(CallScopeError::DeadlineExceeded {
+                        phase: TransportPhase::DispatchUncertain,
+                    }))
+                }
+                state => Err(guard_error(CallScopeError::InvalidState { state })),
+            }
+        },
+        move || {
+            if opening_cancellation.is_requested() {
+                return Err(pre_dispatch_stream_cancellation());
+            }
+            scope.try_begin_dispatch().map_err(guard_error)
+        },
+    )
+    .with_payload_budget(payload_budget, deadline);
+    client
+        .stream_controlled_async(
+            method,
+            Arc::new(input),
+            reservation,
+            completion_owner,
+            cancellation,
+            &control,
+        )
+        .await
+        .map_err(|error| {
+            let phase = match error.phase() {
+                HttpCallPhase::PreDispatch => TransportPhase::PreDispatch,
+                HttpCallPhase::DispatchUncertain => TransportPhase::DispatchUncertain,
+            };
+            normalize_http_error(error.into_source(), phase)
+        })
+}
+
+fn pre_dispatch_stream_cancellation() -> c2_error::C2Error {
+    c2_error::C2Error::new(
+        c2_error::ErrorCode::CallCancelled,
+        "consumer canceled the stream before dispatch",
+    )
+    .with_details(std::collections::BTreeMap::from([
+        ("transport_phase".into(), "pre_dispatch".into()),
+        ("stage".into(), "stream_open".into()),
+    ]))
+}
+
 async fn call_http(
     client: &RelayAwareHttpClient,
     method: &str,
-    input: Arc<RetainedCallInput>,
+    input: BudgetedBuffer,
     scope: CallScope,
-) -> Result<Vec<u8>, Error> {
+    payload_budget: PayloadBufferBudget,
+) -> Result<BudgetedBuffer, Error> {
     let active = scope.clone();
+    let deadline = scope.deadline();
     let control = HttpCallControl::new(
-        // A preceding business POST can be authoritatively refused as stale.
-        // Resolution/probe waits keep Dispatched sticky and the original D;
-        // they grant no dispatch/retry permission themselves.
+        // Resolution and probe waits share the original deadline and do not
+        // grant business dispatch permission.
         move || match active.observe_deadline() {
             CallState::PreDispatch | CallState::Dispatched => Ok(()),
             CallState::ExpiredPreDispatch => Err(guard_error(CallScopeError::DeadlineExceeded {
@@ -349,23 +638,13 @@ async fn call_http(
             }
             state => Err(guard_error(CallScopeError::InvalidState { state })),
         },
-        move |previous| {
-            match previous {
-                None => scope.try_begin_dispatch(),
-                Some(HttpCallPhase::PreDispatch) => {
-                    scope.try_begin_retry_dispatch(TransportPhase::PreDispatch)
-                }
-                Some(HttpCallPhase::DispatchUncertain) => {
-                    scope.try_begin_retry_dispatch(TransportPhase::DispatchUncertain)
-                }
-            }
-            .map_err(guard_error)
-        },
-    );
+        move || scope.try_begin_dispatch().map_err(guard_error),
+    )
+    .with_payload_budget(payload_budget, deadline);
     // The controlled channel has no reqwest total/upload timer for ALL policy
     // modes, including inherited defaults and explicit Unlimited/600 seconds.
     client
-        .call_controlled_async(method, input, &control)
+        .call_controlled_async(method, Arc::new(input), &control)
         .await
         .map_err(|error| {
             let phase = match error.phase() {
@@ -402,6 +681,93 @@ impl EncodedClient for Client {
 
     fn call_held(&self, method: &str, request: &[u8]) -> Result<HeldResponse, Error> {
         self.begin_call(method)?.encode_slice(request)?.call_held()
+    }
+}
+
+/// Native endpoint connection ownership. Configuration and all accounting are
+/// shared with the Runtime; only the physical client cache belongs to this endpoint.
+#[doc(hidden)]
+pub struct NativeEndpointContext {
+    runtime: Runtime,
+    address: String,
+    config: c2_config::ClientIpcConfig,
+    pool: c2_ipc::ClientPool,
+}
+
+impl NativeEndpointContext {
+    pub fn deactivate(&self) {
+        self.pool.deactivate_endpoint_scope();
+    }
+
+    pub async fn close(&self) {
+        self.pool.close_endpoint_scope().await;
+    }
+
+    pub fn config(&self) -> &c2_config::ClientIpcConfig {
+        &self.config
+    }
+
+    pub fn prepare(
+        &self,
+        expected: ExpectedRouteContract,
+        attempt: &crate::ConnectAttempt,
+    ) -> Result<Client, Error> {
+        let deadline = attempt.deadline();
+        validate_expected_route_contract(&expected)?;
+        self.runtime.ensure_active_with_attempt(attempt)?;
+        let mut acquired = None;
+        for index in 0..STALE_POOL_RECONNECT_ATTEMPTS {
+            let client = self
+                .pool
+                .acquire_lease_with_deadline(&self.address, Some(&self.config), deadline)
+                .map_err(|error| normalize_ipc_error(error, TransportPhase::PreDispatch))?;
+            match client.acquire_route_with_deadline(&expected, deadline) {
+                Ok(binding) => {
+                    acquired = Some(PooledIpcClient { client, binding });
+                    break;
+                }
+                Err(error)
+                    if index + 1 < STALE_POOL_RECONNECT_ATTEMPTS
+                        && is_stale_pooled_session_error(&error) =>
+                {
+                    self.pool
+                        .discard_if_same_with_deadline(&self.address, client.client(), deadline)
+                        .map_err(|error| normalize_ipc_error(error, TransportPhase::PreDispatch))?;
+                }
+                Err(error) => return Err(normalize_ipc_error(error, TransportPhase::PreDispatch)),
+            }
+        }
+        let connection = acquired.expect("acquire loop returned or bound a route");
+        let observed = observed_ipc_route(&connection);
+        self.runtime.finish_client(
+            expected,
+            ObservedPath::DirectIpc,
+            observed,
+            ClientInner::Ipc(connection),
+            deadline,
+        )
+    }
+}
+
+impl Runtime {
+    #[doc(hidden)]
+    pub fn native_endpoint_context(
+        &self,
+        address: &str,
+        attempt: &crate::ConnectAttempt,
+    ) -> Result<NativeEndpointContext, Error> {
+        let (config, domain) = self
+            .ipc_client_domain(attempt.deadline())
+            .map_err(|error| normalize_ipc_error(error, TransportPhase::PreDispatch))?;
+        let pool = domain
+            .fork_endpoint_scope(&config, attempt.deadline())
+            .map_err(|error| normalize_ipc_error(error, TransportPhase::PreDispatch))?;
+        Ok(NativeEndpointContext {
+            runtime: self.clone(),
+            address: address.to_owned(),
+            config,
+            pool,
+        })
     }
 }
 
@@ -632,6 +998,10 @@ impl Runtime {
                         Runtime::resolve_relay_connection_after_local_ipc_failures_with_deadline(
                             client,
                             std::slice::from_ref(&candidate),
+                            match &direct_error {
+                                Error::Semantic(error) => Some(error.code),
+                                _ => None,
+                            },
                             deadline,
                         )
                         .map_err(|error| retain_local_ipc_cause(error, &direct_error))?;
@@ -685,7 +1055,7 @@ fn is_stale_pooled_session_error(error: &c2_ipc::IpcError) -> bool {
     }
 }
 
-fn normalize_ipc_call_error(error: IpcCallError) -> Error {
+pub(crate) fn normalize_ipc_call_error(error: IpcCallError) -> Error {
     let phase = match error.phase() {
         c2_ipc::TransportPhase::PreDispatch => TransportPhase::PreDispatch,
         c2_ipc::TransportPhase::DispatchUncertain => TransportPhase::DispatchUncertain,

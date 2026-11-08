@@ -971,7 +971,7 @@ fn relay_aware_selects_an_independent_http_path_when_no_local_candidate_exists()
 }
 
 #[test]
-fn a_cached_stale_route_is_refreshed_once_and_a_second_stale_result_is_terminal() {
+fn a_stale_post_is_pre_dispatch_and_the_next_call_refreshes_the_route() {
     let _environment = relay_env_lock();
     let release = release();
     let expected = release
@@ -1008,21 +1008,30 @@ fn a_cached_stale_route_is_refreshed_once_and_a_second_stale_result_is_terminal(
 
     let Error::Semantic(error) = client
         .call_owned("echo", b"request")
-        .expect_err("second stale result must be terminal")
+        .expect_err("a stale POST must end this logical call")
     else {
         panic!("stale route must remain a semantic error");
     };
     assert_eq!(error.code, ErrorCode::RouteStale);
     assert_eq!(
         resolve_count.load(Ordering::SeqCst),
-        2,
-        "Core permits exactly one fresh resolution after the cached route is stale"
+        1,
+        "the same call must not refresh solely to replay a consumed request owner"
     );
     assert_eq!(
         call_count.load(Ordering::SeqCst),
         1,
-        "the refreshed resolution must not replay through the already-rejected relay endpoint"
+        "the business POST must be sent once per logical call"
     );
+    let Error::Semantic(error) = client
+        .call_owned("echo", b"next request")
+        .expect_err("the independent call also reaches the stale endpoint")
+    else {
+        panic!("stale route must remain a semantic error");
+    };
+    assert_eq!(error.code, ErrorCode::RouteStale);
+    assert_eq!(resolve_count.load(Ordering::SeqCst), 2);
+    assert_eq!(call_count.load(Ordering::SeqCst), 2);
 }
 
 #[test]
@@ -1302,4 +1311,120 @@ fn first_connection_attempt_freezes_client_config_atomically_before_connect_io()
         Err(c2_core::LifecycleError::ClientConfigFrozen)
     ));
     server_thread.join().unwrap();
+}
+
+#[test]
+fn http_probe_error_storage_uses_the_runtime_payload_budget() {
+    let _environment = relay_env_lock();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let thread = std::thread::spawn(move || {
+        let io = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        io.block_on(async move {
+            let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+            let app = Router::new().route(
+                "/_probe/{route}",
+                get(|| async {
+                    (
+                        StatusCode::CONFLICT,
+                        Json(
+                            C2Error::new(ErrorCode::ContractMismatch, "probe contract mismatch")
+                                .envelope(),
+                        ),
+                    )
+                }),
+            );
+            ready_tx.send(()).unwrap();
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+                .unwrap();
+        });
+    });
+    ready_rx.recv().unwrap();
+    let data_plane = RegistryServer {
+        url,
+        shutdown: Some(shutdown_tx),
+        thread: Some(thread),
+    };
+    let expected = release()
+        .expected_route(unique_name("probe-budget"))
+        .unwrap();
+    let registry = registry_server(
+        RelayRouteInfo {
+            name: expected.route_name.clone(),
+            relay_url: data_plane.url.clone(),
+            route_uid: "probe-budget-route".into(),
+            ipc_address: None,
+            server_id: None,
+            server_instance_id: None,
+            crm_ns: expected.crm_ns.clone(),
+            crm_name: expected.crm_name.clone(),
+            crm_ver: expected.crm_ver.clone(),
+            abi_hash: expected.abi_hash.clone(),
+            signature_hash: expected.signature_hash.clone(),
+            max_payload_size: 4096,
+        },
+        Arc::new(AtomicUsize::new(0)),
+    );
+    let error_bytes = serde_json::to_vec(
+        &C2Error::new(ErrorCode::ContractMismatch, "probe contract mismatch").envelope(),
+    )
+    .unwrap()
+    .len() as u64;
+    for limit in [0, error_bytes] {
+        let runtime =
+            Runtime::new(runtime_options(unique_name("probe-budget-runtime"), None)).unwrap();
+        runtime
+            .set_call_execution_limits_with_sources(
+                c2_config::CallExecutionLimitsOverrides {
+                    max_outstanding_calls: Some(1024),
+                    payload_buffer_budget_bytes: Some(limit),
+                },
+                c2_config::ConfigSources::empty(),
+            )
+            .unwrap();
+        let Error::Semantic(error) = runtime
+            .connect_with_options(
+                expected.clone(),
+                Connect::ExplicitRelay {
+                    relay_url: registry.url.clone(),
+                },
+                c2_config::ConnectOptions::new().with_timeout(Duration::from_secs(2)),
+            )
+            .unwrap_err()
+        else {
+            panic!("semantic probe failure required")
+        };
+        let stats = runtime.memory_stats().payload_buffer.unwrap();
+        assert_eq!(stats.limit_bytes, limit);
+        assert_eq!(stats.used_bytes, 0);
+        if limit == 0 {
+            assert_eq!(error.code, ErrorCode::CallCapacityExceeded);
+            assert_eq!(error.details["transport_phase"], "pre_dispatch");
+            assert_eq!(stats.rejected_allocations, 1);
+            assert_eq!(stats.peak_bytes, 0);
+        } else {
+            assert_eq!(error.code, ErrorCode::ContractMismatch);
+            assert_eq!(stats.peak_bytes, error_bytes);
+        }
+        assert!(
+            matches!(
+                runtime.set_call_execution_limits(c2_config::CallExecutionLimitsOverrides {
+                    max_outstanding_calls: Some(1024),
+                    payload_buffer_budget_bytes: Some(limit + 1),
+                }),
+                Err(c2_core::LifecycleError::ConfigFrozen)
+            ),
+            "HTTP acquisition has already used this domain"
+        );
+    }
 }

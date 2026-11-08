@@ -20,10 +20,12 @@ import c_two as cc
 from c_two.config.settings import settings
 from c_two.transport.registry import _reset_default_runtime
 from tests.fixtures.ipc_version_peer import ipc_version_peer_binary, running_version_peer
+from tests.fixtures.typescript_project import write_node_tsconfig
 from tests.fixtures.portable_interop import FASTDB_REPOSITORY, logical_result_sha256
 from tests.fixtures.portable_matrix import (
     CRM_CLASSES,
     DESCRIPTOR_PATHS,
+    IPC_OVERRIDES,
     MatrixArtifacts,
     MatrixRelay,
     RustHost,
@@ -161,6 +163,8 @@ class TypeScriptArtifacts:
             )
         candidate_packages = all(configured_packages)
         if not candidate_packages:
+            from tests.fixtures.typescript_project import require_c2_mem_node_build
+            require_c2_mem_node_build(REPOSITORY)
             assert _git(FASTDB_REPOSITORY, "rev-parse", "HEAD") == FASTDB_COMMIT
             assert _git(FASTDB_REPOSITORY, "status", "--porcelain") == ""
             # MatrixArtifacts.prepare resolves the CLI through the shared helper,
@@ -303,24 +307,7 @@ class TypeScriptArtifacts:
             )
             generated_tree_sha256[payload] = _tree_sha256(destination)
 
-        config = {
-            "compilerOptions": {
-                "target": "ES2022",
-                "module": "NodeNext",
-                "moduleResolution": "NodeNext",
-                "lib": ["ES2022", "DOM"],
-                "strict": True,
-                "skipLibCheck": False,
-                "rootDir": str(generated_root),
-                "outDir": str(node_root / "dist"),
-            },
-            "include": [str(generated_root / "**/*.ts")],
-        }
-        config_path = node_root / "tsconfig.json"
-        config_path.write_text(
-            json.dumps(config, indent=2, sort_keys=True),
-            encoding="utf-8",
-        )
+        config_path = write_node_tsconfig(node_root)
         tsc = node_root / "node_modules/typescript/bin/tsc"
         node_binary = shutil.which("node")
         if node_binary is None or not tsc.is_file():
@@ -581,8 +568,8 @@ def test_generated_typescript_calls_real_hosts(
     assert calls == expected_calls
     assert receipt["logicalResultSha256"] == logical_result_sha256(payload)
     assert receipt["cleanup"] == {
-        "nodeRuntimeCreated": mode in {"direct-ipc", "relay-aware-local-ipc"},
-        "nodeRuntimeClosed": mode in {"direct-ipc", "relay-aware-local-ipc"},
+        "nodeConnectorCreated": mode in {"direct-ipc", "relay-aware-local-ipc"},
+        "nodeConnectorClosed": mode in {"direct-ipc", "relay-aware-local-ipc"},
         "transportClosedIdempotently": True,
     }
     observations = receipt["observations"]
@@ -644,26 +631,26 @@ def test_typescript_real_connector_version_mismatch(
     script.write_text(dedent("""\
         import assert from 'node:assert/strict';
         import { pathToFileURL } from 'node:url';
-        import { createBundledC2MemFfiNodeRuntime } from '@c-two/c2-mem-ffi';
+        import { createNodeIpcConnector } from '@c-two/c2-mem-ffi';
         const [modulePath, address, root] = process.argv.slice(2);
         const contract = await import(pathToFileURL(modulePath).href);
-        const runtime = createBundledC2MemFfiNodeRuntime(root ? {ipcRoot: root} : {});
+        const connector = createNodeIpcConnector(root ? {ipcRoot: root} : {});
         let connects = 0;
         const transport = contract.createIpcEncodedTransport(address, {
-          connect: async (target) => { connects++; return runtime.connect(target); },
+          connect: async (target) => { connects++; return connector(target); },
         });
         try {
           await assert.rejects(transport.prepare('version', contract.CONTRACT), (error) => {
             assert.ok(error instanceof contract.C2IpcTransportError);
             assert.equal(error.category, 'protocol_version_mismatch');
-            assert.equal(error.localProtocolVersion, 15);
-            assert.equal(error.peerProtocolVersion, 16);
+            assert.equal(error.localProtocolVersion, 16);
+            assert.equal(error.peerProtocolVersion, 17);
             return true;
           });
           assert.equal(connects, 1);
-        } finally { await transport.close(); await runtime.close(); }
+        } finally { await transport.close(); await connector.close(); }
         """), encoding="utf-8")
-    with running_version_peer(ipc_version_peer_binary, "mismatch16") as (address, context):
+    with running_version_peer(ipc_version_peer_binary, "mismatch17") as (address, context):
         _run_checked(
             [typescript_artifacts.node_binary, str(script),
              str(typescript_artifacts.contract_modules["no-payload"]), address, context.root or ""],

@@ -95,7 +95,7 @@ pub struct ServerIpcConfigOverrides {
     pub pool_min_retained_segments: Option<u32>,
     pub reassembly_segment_size: Option<u64>,
     pub reassembly_max_segments: Option<u32>,
-    pub max_total_chunks: Option<u32>,
+    pub max_inflight_chunk_frames: Option<u32>,
     pub chunk_gc_interval_secs: Option<f64>,
     pub chunk_threshold_ratio: Option<f64>,
     pub chunk_assembler_timeout_secs: Option<f64>,
@@ -113,6 +113,7 @@ pub struct ServerIpcConfigOverrides {
 
 #[derive(Debug, Clone, Default)]
 pub struct ClientIpcConfigOverrides {
+    pub client_idle_timeout_secs: Option<f64>,
     pub write_timeout_secs: Option<f64>,
     pub max_dedicated_segments: Option<u32>,
     pub spill_threshold: Option<f64>,
@@ -123,7 +124,7 @@ pub struct ClientIpcConfigOverrides {
     pub pool_min_retained_segments: Option<u32>,
     pub reassembly_segment_size: Option<u64>,
     pub reassembly_max_segments: Option<u32>,
-    pub max_total_chunks: Option<u32>,
+    pub max_inflight_chunk_frames: Option<u32>,
     pub chunk_gc_interval_secs: Option<f64>,
     pub chunk_threshold_ratio: Option<f64>,
     pub chunk_assembler_timeout_secs: Option<f64>,
@@ -154,7 +155,7 @@ pub struct RelayConfigOverrides {
 #[derive(Debug, Clone, Default)]
 pub struct CallExecutionLimitsOverrides {
     pub max_outstanding_calls: Option<u64>,
-    pub retained_input_budget_bytes: Option<u64>,
+    pub payload_buffer_budget_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -303,15 +304,15 @@ impl ConfigResolver {
             None => call_execution_limit_from_env(&catalog, "C2_CALL_MAX_OUTSTANDING")?
                 .unwrap_or(crate::DEFAULT_MAX_OUTSTANDING_CALLS),
         };
-        let retained_input_budget_bytes = match overrides.retained_input_budget_bytes {
+        let payload_buffer_budget_bytes = match overrides.payload_buffer_budget_bytes {
             Some(value) => value,
-            None => call_execution_limit_from_env(&catalog, "C2_CALL_RETAINED_INPUT_BUDGET_BYTES")?
-                .unwrap_or(crate::DEFAULT_RETAINED_INPUT_BUDGET_BYTES),
+            None => call_execution_limit_from_env(&catalog, "C2_CALL_PAYLOAD_BUFFER_BUDGET_BYTES")?
+                .unwrap_or(crate::DEFAULT_PAYLOAD_BUFFER_BUDGET_BYTES),
         };
 
         Ok(CallExecutionLimits {
             max_outstanding_calls,
-            retained_input_budget_bytes,
+            payload_buffer_budget_bytes,
         })
     }
 
@@ -519,7 +520,7 @@ macro_rules! resolve_ipc_fields {
             pool_min_retained_segments: optional_u32("C2_IPC_POOL_MIN_RETAINED_SEGMENTS"),
             reassembly_segment_size: optional_u64("C2_IPC_REASSEMBLY_SEGMENT_SIZE"),
             reassembly_max_segments: optional_u32("C2_IPC_REASSEMBLY_MAX_SEGMENTS"),
-            max_total_chunks: optional_u32("C2_IPC_MAX_TOTAL_CHUNKS"),
+            max_inflight_chunk_frames: optional_u32("C2_IPC_MAX_INFLIGHT_CHUNK_FRAMES"),
             chunk_gc_interval_secs: optional_f64("C2_IPC_CHUNK_GC_INTERVAL"),
             chunk_threshold_ratio: optional_f64("C2_IPC_CHUNK_THRESHOLD_RATIO"),
             chunk_assembler_timeout_secs: optional_f64("C2_IPC_CHUNK_ASSEMBLER_TIMEOUT"),
@@ -579,6 +580,7 @@ fn resolve_client_ipc_config(
 
     resolve_ipc_fields!(base, &mut cfg.base, &overrides, catalog);
     resolve_ipc_fields!(&mut cfg, &overrides, catalog;
+        client_idle_timeout_secs: optional_f64("C2_IPC_CLIENT_IDLE_TIMEOUT"),
         pool_decay_seconds: optional_f64("C2_IPC_POOL_DECAY_SECONDS"),
     );
 
@@ -1008,6 +1010,59 @@ mod tests {
     }
 
     #[test]
+    fn inflight_chunk_frames_new_env_and_old_env_resolution() {
+        let old_only = ConfigSources {
+            env_file: EnvFilePolicy::Disabled,
+            process_env: env(&[("C2_IPC_MAX_TOTAL_CHUNKS", "invalid")]),
+        };
+        let server = ConfigResolver::resolve_server_ipc(
+            ServerIpcConfigOverrides::default(),
+            RuntimeConfigOverrides::default(),
+            old_only,
+        )
+        .expect("retired environment variable is ignored");
+        assert_eq!(server.max_inflight_chunk_frames, 512);
+
+        let new_env = ConfigSources {
+            env_file: EnvFilePolicy::Disabled,
+            process_env: env(&[("C2_IPC_MAX_INFLIGHT_CHUNK_FRAMES", "1")]),
+        };
+        let client = ConfigResolver::resolve_client_ipc(
+            ClientIpcConfigOverrides::default(),
+            RuntimeConfigOverrides::default(),
+            new_env,
+        )
+        .expect("new environment variable resolves");
+        assert_eq!(client.max_inflight_chunk_frames, 1);
+    }
+
+    #[test]
+    fn inflight_chunk_frames_rejects_zero_and_invalid_environment() {
+        let zero = ConfigResolver::resolve_server_ipc(
+            ServerIpcConfigOverrides {
+                max_inflight_chunk_frames: Some(0),
+                ..Default::default()
+            },
+            RuntimeConfigOverrides::default(),
+            ConfigSources::empty(),
+        )
+        .expect_err("zero processing capacity is invalid");
+        assert!(zero.to_string().contains("max_inflight_chunk_frames"));
+
+        let invalid_env = ConfigSources {
+            env_file: EnvFilePolicy::Disabled,
+            process_env: env(&[("C2_IPC_MAX_INFLIGHT_CHUNK_FRAMES", "invalid")]),
+        };
+        let err = ConfigResolver::resolve_client_ipc(
+            ClientIpcConfigOverrides::default(),
+            RuntimeConfigOverrides::default(),
+            invalid_env,
+        )
+        .expect_err("invalid new environment variable fails");
+        assert!(err.to_string().contains("C2_IPC_MAX_INFLIGHT_CHUNK_FRAMES"));
+    }
+
+    #[test]
     fn server_ipc_execution_workers_rejects_zero_env_and_override() {
         let env_sources = ConfigSources {
             env_file: EnvFilePolicy::Disabled,
@@ -1326,7 +1381,23 @@ mod tests {
 
         assert_eq!(limits, CallExecutionLimits::default());
         assert_eq!(limits.max_outstanding_calls, 1024);
-        assert_eq!(limits.retained_input_budget_bytes, 16 * 1024 * 1024 * 1024);
+        assert_eq!(limits.payload_buffer_budget_bytes, 16 * 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn retired_retained_input_environment_does_not_set_payload_budget() {
+        let limits = ConfigResolver::resolve_call_execution_limits(
+            CallExecutionLimitsOverrides::default(),
+            ConfigSources {
+                env_file: EnvFilePolicy::Disabled,
+                process_env: env(&[("C2_CALL_RETAINED_INPUT_BUDGET_BYTES", "7")]),
+            },
+        )
+        .expect("unrecognized environment keys are ignored by the scoped resolver");
+        assert_eq!(
+            limits.payload_buffer_budget_bytes,
+            crate::DEFAULT_PAYLOAD_BUFFER_BUDGET_BYTES
+        );
     }
 
     #[test]
@@ -1337,7 +1408,7 @@ mod tests {
             &env_file,
             [
                 "C2_CALL_MAX_OUTSTANDING=64",
-                "C2_CALL_RETAINED_INPUT_BUDGET_BYTES=1073741824",
+                "C2_CALL_PAYLOAD_BUFFER_BUDGET_BYTES=1073741824",
             ]
             .join("\n"),
         )
@@ -1353,7 +1424,7 @@ mod tests {
         .expect("env-file limits should resolve");
 
         assert_eq!(limits.max_outstanding_calls, 64);
-        assert_eq!(limits.retained_input_budget_bytes, 1_073_741_824);
+        assert_eq!(limits.payload_buffer_budget_bytes, 1_073_741_824);
     }
 
     #[test]
@@ -1364,7 +1435,7 @@ mod tests {
             &env_file,
             [
                 "C2_CALL_MAX_OUTSTANDING=64",
-                "C2_CALL_RETAINED_INPUT_BUDGET_BYTES=1073741824",
+                "C2_CALL_PAYLOAD_BUFFER_BUDGET_BYTES=1073741824",
             ]
             .join("\n"),
         )
@@ -1376,14 +1447,14 @@ mod tests {
                 env_file: EnvFilePolicy::Path(env_file),
                 process_env: env(&[
                     ("C2_CALL_MAX_OUTSTANDING", "128"),
-                    ("C2_CALL_RETAINED_INPUT_BUDGET_BYTES", "2147483648"),
+                    ("C2_CALL_PAYLOAD_BUFFER_BUDGET_BYTES", "2147483648"),
                 ]),
             },
         )
         .expect("process env should win over the env file");
 
         assert_eq!(limits.max_outstanding_calls, 128);
-        assert_eq!(limits.retained_input_budget_bytes, 2_147_483_648);
+        assert_eq!(limits.payload_buffer_budget_bytes, 2_147_483_648);
     }
 
     #[test]
@@ -1392,21 +1463,21 @@ mod tests {
             env_file: EnvFilePolicy::Disabled,
             process_env: env(&[
                 ("C2_CALL_MAX_OUTSTANDING", "64"),
-                ("C2_CALL_RETAINED_INPUT_BUDGET_BYTES", "1073741824"),
+                ("C2_CALL_PAYLOAD_BUFFER_BUDGET_BYTES", "1073741824"),
             ]),
         };
 
         let limits = ConfigResolver::resolve_call_execution_limits(
             CallExecutionLimitsOverrides {
                 max_outstanding_calls: Some(7),
-                retained_input_budget_bytes: Some(4096),
+                payload_buffer_budget_bytes: Some(4096),
             },
             sources,
         )
         .expect("explicit limits should beat env");
 
         assert_eq!(limits.max_outstanding_calls, 7);
-        assert_eq!(limits.retained_input_budget_bytes, 4096);
+        assert_eq!(limits.payload_buffer_budget_bytes, 4096);
     }
 
     #[test]
@@ -1416,20 +1487,20 @@ mod tests {
         let limits = ConfigResolver::resolve_call_execution_limits(
             CallExecutionLimitsOverrides {
                 max_outstanding_calls: Some(7),
-                retained_input_budget_bytes: Some(4096),
+                payload_buffer_budget_bytes: Some(4096),
             },
             ConfigSources {
                 env_file: EnvFilePolicy::Disabled,
                 process_env: env(&[
                     ("C2_CALL_MAX_OUTSTANDING", "not-a-number"),
-                    ("C2_CALL_RETAINED_INPUT_BUDGET_BYTES", "-1"),
+                    ("C2_CALL_PAYLOAD_BUFFER_BUDGET_BYTES", "-1"),
                 ]),
             },
         )
         .expect("explicit limits should bypass env parsing entirely");
 
         assert_eq!(limits.max_outstanding_calls, 7);
-        assert_eq!(limits.retained_input_budget_bytes, 4096);
+        assert_eq!(limits.payload_buffer_budget_bytes, 4096);
     }
 
     #[test]
@@ -1439,15 +1510,15 @@ mod tests {
         let zeroed_max = ConfigResolver::resolve_call_execution_limits(
             CallExecutionLimitsOverrides {
                 max_outstanding_calls: Some(0),
-                retained_input_budget_bytes: None,
+                payload_buffer_budget_bytes: None,
             },
             ConfigSources::empty(),
         )
         .expect("explicit zero outstanding calls should resolve");
         assert_eq!(zeroed_max.max_outstanding_calls, 0);
         assert_eq!(
-            zeroed_max.retained_input_budget_bytes,
-            crate::DEFAULT_RETAINED_INPUT_BUDGET_BYTES
+            zeroed_max.payload_buffer_budget_bytes,
+            crate::DEFAULT_PAYLOAD_BUFFER_BUDGET_BYTES
         );
 
         // An environmental zero is a present value in exactly the same way:
@@ -1456,7 +1527,7 @@ mod tests {
             CallExecutionLimitsOverrides::default(),
             ConfigSources {
                 env_file: EnvFilePolicy::Disabled,
-                process_env: env(&[("C2_CALL_RETAINED_INPUT_BUDGET_BYTES", "0")]),
+                process_env: env(&[("C2_CALL_PAYLOAD_BUFFER_BUDGET_BYTES", "0")]),
             },
         )
         .expect("zero retained budget should resolve as finite and rejecting");
@@ -1464,7 +1535,7 @@ mod tests {
             zero_env.max_outstanding_calls,
             crate::DEFAULT_MAX_OUTSTANDING_CALLS
         );
-        assert_eq!(zero_env.retained_input_budget_bytes, 0);
+        assert_eq!(zero_env.payload_buffer_budget_bytes, 0);
     }
 
     #[test]
@@ -1476,7 +1547,7 @@ mod tests {
                 process_env: env(&[
                     ("C2_CALL_MAX_OUTSTANDING", "18446744073709551615"),
                     (
-                        "C2_CALL_RETAINED_INPUT_BUDGET_BYTES",
+                        "C2_CALL_PAYLOAD_BUFFER_BUDGET_BYTES",
                         "18446744073709551615",
                     ),
                 ]),
@@ -1484,18 +1555,18 @@ mod tests {
         )
         .expect("u64::MAX is a legal finite limit");
         assert_eq!(from_env.max_outstanding_calls, u64::MAX);
-        assert_eq!(from_env.retained_input_budget_bytes, u64::MAX);
+        assert_eq!(from_env.payload_buffer_budget_bytes, u64::MAX);
 
         let from_override = ConfigResolver::resolve_call_execution_limits(
             CallExecutionLimitsOverrides {
                 max_outstanding_calls: Some(u64::MAX),
-                retained_input_budget_bytes: Some(u64::MAX),
+                payload_buffer_budget_bytes: Some(u64::MAX),
             },
             ConfigSources::empty(),
         )
         .expect("u64::MAX overrides are legal");
         assert_eq!(from_override.max_outstanding_calls, u64::MAX);
-        assert_eq!(from_override.retained_input_budget_bytes, u64::MAX);
+        assert_eq!(from_override.payload_buffer_budget_bytes, u64::MAX);
     }
 
     #[test]
@@ -1506,12 +1577,12 @@ mod tests {
             ("C2_CALL_MAX_OUTSTANDING", "   "),
             ("C2_CALL_MAX_OUTSTANDING", "not-a-number"),
             ("C2_CALL_MAX_OUTSTANDING", "18446744073709551616"),
-            ("C2_CALL_RETAINED_INPUT_BUDGET_BYTES", "-1"),
-            ("C2_CALL_RETAINED_INPUT_BUDGET_BYTES", ""),
-            ("C2_CALL_RETAINED_INPUT_BUDGET_BYTES", "   "),
-            ("C2_CALL_RETAINED_INPUT_BUDGET_BYTES", "not-a-number"),
+            ("C2_CALL_PAYLOAD_BUFFER_BUDGET_BYTES", "-1"),
+            ("C2_CALL_PAYLOAD_BUFFER_BUDGET_BYTES", ""),
+            ("C2_CALL_PAYLOAD_BUFFER_BUDGET_BYTES", "   "),
+            ("C2_CALL_PAYLOAD_BUFFER_BUDGET_BYTES", "not-a-number"),
             (
-                "C2_CALL_RETAINED_INPUT_BUDGET_BYTES",
+                "C2_CALL_PAYLOAD_BUFFER_BUDGET_BYTES",
                 "18446744073709551616",
             ),
         ] {
@@ -1539,7 +1610,7 @@ mod tests {
             env_file: EnvFilePolicy::Disabled,
             process_env: env(&[
                 ("C2_CALL_MAX_OUTSTANDING", "32"),
-                ("C2_CALL_RETAINED_INPUT_BUDGET_BYTES", "65536"),
+                ("C2_CALL_PAYLOAD_BUFFER_BUDGET_BYTES", "65536"),
                 ("C2_IPC_MAX_FRAME_SIZE", "not-a-number"),
                 ("C2_IPC_POOL_SEGMENT_SIZE", "-1"),
                 ("C2_RELAY_IDLE_TIMEOUT", "not-a-number"),
@@ -1555,7 +1626,7 @@ mod tests {
         .expect("call limit resolution must not parse other scopes");
 
         assert_eq!(limits.max_outstanding_calls, 32);
-        assert_eq!(limits.retained_input_budget_bytes, 65_536);
+        assert_eq!(limits.payload_buffer_budget_bytes, 65_536);
     }
 
     #[test]

@@ -1,13 +1,15 @@
 //! HTTP client for CRM calls through a relay server.
 
+use c2_mem::retention::{BudgetedBuffer, PayloadBufferBudget, PayloadBufferReservation};
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use reqwest::header::CONTENT_LENGTH;
 use thiserror::Error;
 
-use super::{HttpCallControl, HttpCallPhase};
+use super::HttpCallControl;
+use super::{HttpResponseStream, HttpStreamCancellation};
 use c2_contract::ExpectedRouteContract;
 
 /// Characters allowed unencoded in URL path segments — matches Python's
@@ -102,7 +104,11 @@ pub enum HttpError {
 
     /// HTTP 500 — body contains serialized CCError bytes.
     #[error("CRM method error")]
-    CrmError(Vec<u8>),
+    CrmError(BudgetedBuffer),
+
+    /// Received non-CRM HTTP error body, retaining its payload reservation.
+    #[error("HTTP {0}: {1:?}")]
+    ResponseError(u16, BudgetedBuffer),
 
     /// Network / connection errors.
     #[error("HTTP transport error: {0}")]
@@ -148,13 +154,46 @@ impl HttpCallInput<'_> {
         }
     }
 
-    fn body(&self, chunk_size: u64) -> Result<reqwest::Body, HttpError> {
+    async fn into_body(
+        self,
+        chunk_size: u64,
+        budget: &PayloadBufferBudget,
+        deadline: Option<Instant>,
+        input_charged: bool,
+    ) -> Result<reqwest::Body, HttpError> {
         match self {
-            Self::Borrowed(data) => crate::payload::reqwest_body_from_payload(data, chunk_size),
+            Self::Borrowed(data) => {
+                crate::payload::reqwest_body_from_payload(data, chunk_size, budget, deadline).await
+            }
             Self::Owned(data) => {
-                crate::payload::reqwest_body_from_owned_payload(Arc::clone(data), chunk_size)
+                let owner = if input_charged {
+                    data
+                } else {
+                    let reservation = crate::payload::reserve_payload(
+                        budget,
+                        data.as_ref().as_ref().len() as u64,
+                        deadline,
+                        "pre_dispatch",
+                    )
+                    .await?;
+                    Arc::new(ReservedInput {
+                        data,
+                        _reservation: reservation,
+                    })
+                };
+                crate::payload::reqwest_body_from_owned_payload(owner, chunk_size)
             }
         }
+    }
+}
+
+struct ReservedInput {
+    data: HttpInputOwner,
+    _reservation: PayloadBufferReservation,
+}
+impl AsRef<[u8]> for ReservedInput {
+    fn as_ref(&self) -> &[u8] {
+        self.data.as_ref().as_ref()
     }
 }
 
@@ -267,22 +306,33 @@ impl HttpClient {
         route_token: &HttpRouteToken,
         max_payload_size: u64,
         method_name: &str,
-        data: &HttpCallInput<'_>,
+        data: HttpCallInput<'_>,
+        budget: &PayloadBufferBudget,
         control: Option<&HttpCallControl>,
-        previous_dispatch: Option<HttpCallPhase>,
-    ) -> Result<Vec<u8>, HttpError> {
+    ) -> Result<BudgetedBuffer, HttpError> {
         let url = format!(
             "{}/{}/{}",
             self.base_url,
             encode_segment(&expected.route_name),
             encode_segment(method_name),
         );
+        let length = data.len();
+        let deadline = control.and_then(HttpCallControl::deadline);
+        super::call_control::check_active(control)?;
+        let body = data
+            .into_body(
+                self.remote_payload_chunk_size,
+                budget,
+                deadline,
+                control.is_some_and(|control| control.payload_budget().is_some()),
+            )
+            .await?;
         let request = self
             .client
             .post(&url)
             .header("Content-Type", "application/octet-stream")
-            .header(CONTENT_LENGTH, data.len().to_string())
-            .body(data.body(self.remote_payload_chunk_size)?);
+            .header(CONTENT_LENGTH, length.to_string())
+            .body(body);
         let request = add_expected_contract_headers(request, expected);
         let request = add_route_token_headers(request, route_token);
         let request = request
@@ -291,7 +341,7 @@ impl HttpClient {
         // The body and headers are fully prepared before the actual send gate.
         super::call_control::check_active(control)?;
         if let Some(control) = control {
-            control.check_dispatch(previous_dispatch)?;
+            control.check_dispatch()?;
         }
         let resp = self
             .client
@@ -299,7 +349,97 @@ impl HttpClient {
             .await
             .map_err(|e| HttpError::Transport(e.to_string()))?;
 
-        crate::payload::read_http_response(resp, max_payload_size).await
+        crate::payload::read_http_response(resp, max_payload_size, budget, None).await
+    }
+
+    pub(crate) async fn stream_with_route_token_async(
+        &self,
+        expected: &ExpectedRouteContract,
+        route_token: &HttpRouteToken,
+        max_payload_size: u64,
+        method_name: &str,
+        data: HttpCallInput<'_>,
+        budget: &PayloadBufferBudget,
+        send_headroom: PayloadBufferReservation,
+        completion_owner: Box<dyn Send>,
+        cancellation: HttpStreamCancellation,
+        control: &HttpCallControl,
+    ) -> Result<HttpResponseStream, HttpError> {
+        let url = format!(
+            "{}/{}/{}",
+            self.base_url,
+            encode_segment(&expected.route_name),
+            encode_segment(method_name),
+        );
+        let length = data.len();
+        control.check_active()?;
+        let body = data
+            .into_body(
+                self.remote_payload_chunk_size,
+                budget,
+                control.deadline(),
+                control.payload_budget().is_some(),
+            )
+            .await?;
+        let request = self
+            .client
+            .post(&url)
+            .header("Content-Type", "application/octet-stream")
+            .header("Accept", crate::stream_wire::MEDIA_TYPE)
+            .header(CONTENT_LENGTH, length.to_string())
+            .body(body);
+        let request = add_route_token_headers(
+            add_expected_contract_headers(request, expected),
+            route_token,
+        )
+        .build()
+        .map_err(|error| HttpError::InvalidInput(error.to_string()))?;
+        control.check_active()?;
+        control.check_dispatch()?;
+        let response = self
+            .client
+            .execute(request)
+            .await
+            .map_err(|error| HttpError::Transport(error.to_string()))?;
+        // The input owner follows the actual reqwest body. This reservation
+        // was acquired atomically with it before dispatch and is now unused.
+        drop(send_headroom);
+        if response.status().as_u16() != 200 {
+            let status = response.status().as_u16();
+            let body = crate::payload::read_http_response_body(
+                response,
+                crate::stream_wire::MAX_TERMINAL_PAYLOAD_BYTES,
+                budget,
+                None,
+                "dispatch_uncertain",
+            )
+            .await?;
+            return Err(HttpError::ResponseError(status, body));
+        }
+        let media_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok());
+        if media_type != Some(crate::stream_wire::MEDIA_TYPE) {
+            return Err(stream_protocol_error("invalid_content_type"));
+        }
+        let token = response
+            .headers()
+            .get("x-c2-call-token")
+            .and_then(|value| value.to_str().ok())
+            .filter(|token| token.len() >= 32 && token.bytes().all(|byte| byte.is_ascii_hexdigit()))
+            .ok_or_else(|| stream_protocol_error("invalid_call_token"))?
+            .to_owned();
+        Ok(HttpResponseStream::start(
+            response,
+            self.client.clone(),
+            self.base_url.clone(),
+            token,
+            budget.clone(),
+            max_payload_size,
+            completion_owner,
+            cancellation,
+        ))
     }
 
     /// Health check — GET /health.
@@ -324,7 +464,7 @@ impl HttpClient {
         &self,
         expected: &ExpectedRouteContract,
         route_token: &HttpRouteToken,
-        max_payload_size: u64,
+        budget: &PayloadBufferBudget,
     ) -> Result<(), HttpError> {
         let url = format!(
             "{}/_probe/{}",
@@ -340,11 +480,15 @@ impl HttpClient {
         match resp.status().as_u16() {
             200 => Ok(()),
             code => {
-                let body = crate::payload::read_http_response_body(resp, max_payload_size).await?;
-                Err(HttpError::ServerError(
-                    code,
-                    String::from_utf8_lossy(&body).into_owned(),
-                ))
+                let body = crate::payload::read_http_response_body(
+                    resp,
+                    crate::stream_wire::MAX_TERMINAL_PAYLOAD_BYTES,
+                    budget,
+                    None,
+                    "pre_dispatch",
+                )
+                .await?;
+                Err(HttpError::ResponseError(code, body))
             }
         }
     }
@@ -357,6 +501,22 @@ impl HttpClient {
     pub fn remote_payload_chunk_size(&self) -> u64 {
         self.remote_payload_chunk_size
     }
+}
+
+fn stream_protocol_error(reason: &'static str) -> HttpError {
+    let error = c2_error::C2Error::new(
+        c2_error::ErrorCode::ProtocolViolation,
+        "HTTP stream response headers are invalid",
+    )
+    .with_details(std::collections::BTreeMap::from([
+        ("transport".into(), "http".into()),
+        ("transport_phase".into(), "dispatch_uncertain".into()),
+        ("reason".into(), reason.into()),
+    ]));
+    HttpError::ServerError(
+        200,
+        serde_json::to_string(&error.envelope()).expect("canonical error envelope is serializable"),
+    )
 }
 
 fn add_expected_contract_headers(
@@ -456,12 +616,11 @@ mod tests {
         let rejected = rejection.clone();
         let control = HttpCallControl::new(
             || Ok(()),
-            move |phase| {
-                assert_eq!(phase, None);
+            move || {
                 assert_eq!(
                     observe_body.strong_count(),
-                    2,
-                    "prepared body shares the original input"
+                    1,
+                    "only the actual request reader retains the original input"
                 );
                 Err(rejected.clone())
             },
@@ -473,20 +632,17 @@ mod tests {
                 &token,
                 1024,
                 "step",
-                &input,
+                input,
+                &PayloadBufferBudget::new(1024),
                 Some(&control),
-                None,
             )
             .await
             .unwrap_err();
         assert!(matches!(error, HttpError::LocalCallRejected(error) if error == rejection));
-        assert_eq!(
-            weak.strong_count(),
-            1,
-            "rejected request releases its body owner"
+        assert!(
+            weak.upgrade().is_none(),
+            "rejected request releases its last input reader"
         );
-        drop(input);
-        assert!(weak.upgrade().is_none());
     }
 
     #[test]

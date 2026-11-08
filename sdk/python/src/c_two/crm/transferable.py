@@ -4,7 +4,8 @@ import inspect
 import sys
 import warnings
 from functools import wraps
-from typing import Any, Callable, Generic, ParamSpec, TypeVar, get_type_hints
+from collections.abc import Iterator
+from typing import Any, Callable, Generic, ParamSpec, TYPE_CHECKING, TypeVar, get_type_hints, overload
 
 from .. import error
 from .payload_plan import (
@@ -19,6 +20,9 @@ from .payload_plan import (
 
 R = TypeVar("R")
 P = ParamSpec("P")
+
+if TYPE_CHECKING:
+    from .stream import Stream
 
 
 class HeldResult(Generic[R]):
@@ -171,7 +175,15 @@ class HeldResult(Generic[R]):
 
 
 
-def hold(method: Callable[P, R]) -> Callable[P, HeldResult[R]]:
+@overload
+def hold(method: Callable[P, Iterator[R]]) -> Callable[P, Stream[HeldResult[R]]]: ...
+
+
+@overload
+def hold(method: Callable[P, R]) -> Callable[P, HeldResult[R]]: ...
+
+
+def hold(method):
     """Retain one local response copy until the returned owner is released."""
 
     if not callable(method):
@@ -213,6 +225,10 @@ def _build_transfer_wrapper(
     output: PayloadBinding | None = None,
 ):
     """Build the client/resource closure over opaque payload bytes."""
+
+    if getattr(func, '__cc_stream__', False):
+        from .stream import _build_stream_wrapper
+        return _build_stream_wrapper(func, input, output)
 
     method_name = func.__name__
     method_signature = inspect.signature(func)
@@ -607,6 +623,10 @@ def auto_transfer(func=None, *, input=None, output=None):
             input_binding = python_pickle_input_binding(target)
 
         return_annotation = hints.get("return", inspect.Signature.empty)
+        is_stream = getattr(target, '__cc_stream__', False)
+        if is_stream:
+            from .stream import stream_item_annotation
+            return_annotation = stream_item_annotation(return_annotation)
         if output is not None:
             if return_annotation is not payload_type:
                 raise TypeError(
@@ -617,7 +637,7 @@ def auto_transfer(func=None, *, input=None, output=None):
                 output,
                 label=f"{target.__name__}.output",
             )
-        elif return_annotation in (None, type(None), inspect.Signature.empty):
+        elif not is_stream and return_annotation in (None, type(None), inspect.Signature.empty):
             output_binding = no_payload_binding()
         else:
             if return_annotation is payload_type:

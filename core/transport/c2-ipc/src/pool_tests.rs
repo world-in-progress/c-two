@@ -396,82 +396,314 @@ fn in_flight_connect_cannot_publish_across_permanent_seal() {
     in_flight_connect_is_fenced(true);
 }
 
-#[test]
-fn same_address_race_closes_losing_native_connection() {
-    let serving = Serving::new();
-    let address = "ipc://same_address_race".to_string();
-    let endpoint = serving.context.endpoint(&address).unwrap();
-    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
-    let (closed_tx, closed_rx) = std::sync::mpsc::channel();
-    let peer = thread::spawn(move || {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap()
-            .block_on(async {
-                let mut listener = c2_local::LocalListener::bind(&endpoint).unwrap();
-                ready_tx.send(()).unwrap();
-                let mut streams = Vec::new();
-                for _ in 0..2 {
-                    let mut stream = tokio::time::timeout(WAIT, listener.accept())
-                        .await
-                        .unwrap()
-                        .unwrap();
-                    let capabilities = read_handshake_request(&mut stream).await;
-                    streams.push((stream, capabilities));
-                }
-                for (stream, capabilities) in &mut streams {
-                    write_handshake_reply(stream, *capabilities).await;
-                }
-                let watchers: Vec<_> = streams
-                    .into_iter()
-                    .map(|(mut stream, _)| {
-                        let sender = closed_tx.clone();
-                        tokio::spawn(async move {
-                            let mut prefix = [0_u8; 4];
-                            let closed = tokio::time::timeout(
-                                Duration::from_secs(2),
-                                stream.read_exact(&mut prefix),
-                            )
-                            .await
-                            .is_ok();
-                            sender.send(closed).unwrap();
-                        })
-                    })
-                    .collect();
-                for watcher in watchers {
-                    watcher.await.unwrap();
-                }
-                crate::tests::close_listener(listener).await;
-            });
-    });
-    ready_rx.recv_timeout(WAIT).unwrap();
-    let pool = Arc::new(serving.pool(WAIT));
-    let barrier = Arc::new(std::sync::Barrier::new(2));
-    let mut acquiring = Vec::new();
-    for _ in 0..2 {
-        let pool = Arc::clone(&pool);
-        let barrier = Arc::clone(&barrier);
-        let address = address.clone();
-        acquiring.push(thread::spawn(move || {
-            barrier.wait();
-            pool.acquire(&address, None)
-        }));
+// The peer holds its handshake reply until the test has observed every
+// acquire's reserved reference. No elapsed delay determines the interleaving.
+struct PausedConnectPeer {
+    accepted: Arc<AtomicUsize>,
+    handshakes: std::sync::mpsc::Receiver<()>,
+    replies: Arc<tokio::sync::Semaphore>,
+    stop: Option<tokio::sync::oneshot::Sender<()>>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl PausedConnectPeer {
+    fn new(serving: &Serving, address: &str, reject_first: bool) -> Self {
+        let endpoint = serving.context.endpoint(address).unwrap();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (handshake_tx, handshakes) = std::sync::mpsc::channel();
+        let (stop, mut stopped) = tokio::sync::oneshot::channel();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let replies = Arc::new(tokio::sync::Semaphore::new(0));
+        let thread = thread::spawn({
+            let accepted = accepted.clone();
+            let replies = replies.clone();
+            move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(async move {
+                        let mut listener = c2_local::LocalListener::bind(&endpoint).unwrap();
+                        let mut connections = tokio::task::JoinSet::new();
+                        ready_tx.send(()).unwrap();
+                        loop {
+                            tokio::select! {
+                                _ = &mut stopped => break,
+                                ended = connections.join_next(), if !connections.is_empty() => {
+                                    ended.unwrap().unwrap();
+                                }
+                                stream = listener.accept() => {
+                                    let mut stream = stream.unwrap();
+                                    let index = accepted.fetch_add(1, Ordering::SeqCst);
+                                    let replies = replies.clone();
+                                    let handshake_tx = handshake_tx.clone();
+                                    connections.spawn(async move {
+                                        if reject_first && index == 0 {
+                                            use c2_wire::handshake::{
+                                                HANDSHAKE_VERSION, VersionPreambleKind,
+                                                encode_version_preamble,
+                                            };
+                                            let mut hello = [0_u8; 25];
+                                            stream.read_exact(&mut hello).await.unwrap();
+                                            assert_eq!(hello, encode_version_preamble(VersionPreambleKind::Hello));
+                                            handshake_tx.send(()).unwrap();
+                                            replies.acquire().await.unwrap().forget();
+                                            let mut refusal = encode_version_preamble(VersionPreambleKind::VersionMismatch);
+                                            refusal[21..].copy_from_slice(&(HANDSHAKE_VERSION + 1).to_le_bytes());
+                                            stream.write_all(&refusal).await.unwrap();
+                                        } else {
+                                            let capabilities = read_handshake_request(&mut stream).await;
+                                            handshake_tx.send(()).unwrap();
+                                            replies.acquire().await.unwrap().forget();
+                                            write_handshake_reply(&mut stream, capabilities).await;
+                                        }
+                                        // Drain the close frame until EOF or a native peer end.
+                                        let mut buffer = [0_u8; 256];
+                                        loop {
+                                            match stream.read(&mut buffer).await {
+                                                Ok(0) => break,
+                                                Ok(_) => {}
+                                                Err(error) if c2_local::is_peer_closed_error(&error) => break,
+                                                Err(error) => panic!("peer read failed: {error}"),
+                                            }
+                                        }
+                                    });
+                                }
+                            }
+                        }
+                        connections.shutdown().await;
+                        crate::tests::close_listener(listener).await;
+                    });
+            }
+        });
+        ready_rx.recv_timeout(WAIT).unwrap();
+        Self {
+            accepted,
+            handshakes,
+            replies,
+            stop: Some(stop),
+            thread: Some(thread),
+        }
     }
-    let first = acquiring.remove(0).join().unwrap().unwrap();
-    let second = acquiring.remove(0).join().unwrap().unwrap();
-    assert!(Arc::ptr_eq(&first, &second));
-    assert_eq!(pool.refcount(&address), 2);
-    let closed = [
-        closed_rx.recv_timeout(WAIT).unwrap(),
-        closed_rx.recv_timeout(WAIT).unwrap(),
-    ];
-    assert_eq!(
-        closed.into_iter().filter(|closed| *closed).count(),
-        1,
-        "{closed:?}"
+
+    fn handshake(&self) {
+        self.handshakes.recv_timeout(WAIT).unwrap();
+    }
+
+    fn reply(&self) {
+        self.replies.add_permits(1);
+    }
+
+    fn connections(&self) -> usize {
+        self.accepted.load(Ordering::SeqCst)
+    }
+}
+
+impl Drop for PausedConnectPeer {
+    fn drop(&mut self) {
+        let _ = self.stop.take().unwrap().send(());
+        self.thread.take().unwrap().join().unwrap();
+    }
+}
+
+fn concurrent_acquires(
+    pool: &Arc<ClientPool>,
+    address: &str,
+    count: usize,
+) -> Vec<thread::JoinHandle<Result<ClientLease, IpcError>>> {
+    let barrier = Arc::new(std::sync::Barrier::new(count + 1));
+    let threads = (0..count)
+        .map(|_| {
+            let pool = pool.clone();
+            let address = address.to_string();
+            let barrier = barrier.clone();
+            thread::spawn(move || {
+                barrier.wait();
+                pool.acquire_lease_with_deadline(&address, None, ConnectDeadline::default())
+            })
+        })
+        .collect();
+    barrier.wait();
+    threads
+}
+
+fn wait_for_connect_references(pool: &ClientPool, address: &str, count: usize) {
+    let deadline = Instant::now() + WAIT;
+    loop {
+        let pending = pool
+            .state
+            .lock()
+            .connecting
+            .get(address)
+            .and_then(Weak::upgrade);
+        if let Some(pending) = pending {
+            assert!(
+                pending.result.lock().is_none(),
+                "handshake barrier must still hold"
+            );
+            if pending.references.count.load(Ordering::Acquire) == count {
+                return;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "acquires did not join the connection attempt"
+        );
+        thread::yield_now();
+    }
+}
+
+#[test]
+fn concurrent_empty_pool_acquires_share_one_connection() {
+    let mut serving = Serving::new();
+    let address = "ipc://shared_connect";
+    let peer = PausedConnectPeer::new(&serving, address, false);
+    let pool = Arc::new(serving.pool(WAIT));
+    let acquiring = concurrent_acquires(&pool, address, 8);
+    peer.handshake();
+    wait_for_connect_references(&pool, address, 8);
+    assert_eq!(peer.connections(), 1);
+
+    let divergent = ClientIpcConfig {
+        shm_threshold: ClientIpcConfig::default().shm_threshold + 1,
+        ..Default::default()
+    };
+    let error = pool.acquire(address, Some(&divergent)).err().unwrap();
+    assert!(matches!(error, IpcError::Pool(_)) && error.to_string().contains("shm_threshold"));
+    // Another address remains usable while this address's handshake is held.
+    let other_address = serving.start("independent_connect");
+    let other = pool.acquire(&other_address, None).unwrap();
+    assert!(other.is_connected());
+    assert!(pool.release_if_same(&other_address, &other));
+
+    peer.reply();
+    let leases: Vec<_> = acquiring
+        .into_iter()
+        .map(|thread| thread.join().unwrap().unwrap())
+        .collect();
+    for lease in &leases {
+        assert!(Arc::ptr_eq(leases[0].client(), lease.client()));
+    }
+    assert_eq!(pool.refcount(address), 8);
+    assert_eq!(peer.connections(), 1);
+    drop(leases);
+    let report = pool.close_all(WAIT);
+    assert!(
+        report.unconfirmed.is_empty() && report.error.is_none(),
+        "{report:?}"
     );
-    peer.join().unwrap();
+}
+
+#[test]
+fn concurrent_connect_failure_is_shared_and_next_acquire_retries() {
+    let serving = Serving::new();
+    let address = "ipc://shared_failure";
+    let peer = PausedConnectPeer::new(&serving, address, true);
+    let pool = Arc::new(serving.pool(WAIT));
+    let acquiring = concurrent_acquires(&pool, address, 8);
+    peer.handshake();
+    wait_for_connect_references(&pool, address, 8);
+    peer.reply();
+    for thread in acquiring {
+        let error = thread.join().unwrap().err().unwrap();
+        assert_eq!(
+            crate::sync_client::call_error_phase(&error),
+            crate::sync_client::TransportPhase::PreDispatch
+        );
+        assert!(
+            matches!(error, IpcError::ProtocolVersionMismatch { local, peer }
+            if local == c2_wire::handshake::HANDSHAKE_VERSION && peer == local + 1),
+            "{error:?}"
+        );
+    }
+    assert_eq!(peer.connections(), 1);
+    assert_eq!(pool.active_count(), 0);
+    let retrying = concurrent_acquires(&pool, address, 1).pop().unwrap();
+    peer.handshake();
+    peer.reply();
+    let lease = retrying.join().unwrap().unwrap();
+    assert!(lease.is_connected());
+    assert_eq!(peer.connections(), 2);
+    assert_eq!(pool.refcount(address), 1);
+    drop(lease);
+    let report = pool.close_all(WAIT);
+    assert!(
+        report.unconfirmed.is_empty() && report.error.is_none(),
+        "{report:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn shared_connect_failure_retains_native_io_cause() {
+    let root = tempfile::Builder::new()
+        .prefix("c2-connect-cause-")
+        .tempdir_in(std::env::temp_dir())
+        .unwrap();
+    let link = root.path().join("link");
+    std::os::unix::fs::symlink(root.path(), &link).unwrap();
+    let context = LocalEndpointContext::with_unix_root(&link).unwrap();
+    let pool = ClientPool::with_endpoint_context(None, context);
+    let failure = pool.acquire("ipc://native_cause", None).err().unwrap();
+    let shared = crate::client::stream::clone_observation_error(&failure);
+    let (IpcError::Connect(original), IpcError::Connect(copy)) = (&failure, &shared) else {
+        panic!("expected the same pre-dispatch connection failure: {failure:?}, {shared:?}");
+    };
+    assert_eq!(original.to_string(), copy.to_string());
+    let original_cause = c2_local::EndpointIoError::from(original);
+    assert!(
+        original_cause.raw_os_error.is_some(),
+        "native cause must be present"
+    );
+    assert_eq!(c2_local::EndpointIoError::from(copy), original_cause);
+}
+
+#[test]
+fn connect_waiter_deadline_preserves_shared_attempt() {
+    let serving = Serving::new();
+    let address = "ipc://shared_deadline";
+    let peer = PausedConnectPeer::new(&serving, address, false);
+    let pool = Arc::new(serving.pool(WAIT));
+    let acquiring = concurrent_acquires(&pool, address, 2);
+    peer.handshake();
+    wait_for_connect_references(&pool, address, 2);
+    let expiring = thread::spawn({
+        let pool = pool.clone();
+        move || {
+            pool.acquire_lease_with_deadline(
+                address,
+                None,
+                ConnectDeadline::start(ConnectOptions::new().with_timeout(Duration::from_secs(1)))
+                    .unwrap(),
+            )
+        }
+    });
+    wait_for_connect_references(&pool, address, 3);
+    let error = expiring.join().unwrap().err().unwrap();
+    let IpcError::LocalCallRejected(error) = error else {
+        panic!("{error:?}")
+    };
+    assert_eq!(error.code, c2_error::ErrorCode::CallDeadlineExceeded);
+    assert_eq!(error.details["operation"], "connect");
+    assert_eq!(error.details["transport_phase"], "pre_dispatch");
+    assert_eq!(error.details["stage"], "pool_connect_wait");
+    wait_for_connect_references(&pool, address, 2);
+    assert!(acquiring.iter().all(|thread| !thread.is_finished()));
+    assert_eq!(peer.connections(), 1);
+    peer.reply();
+    let leases: Vec<_> = acquiring
+        .into_iter()
+        .map(|thread| thread.join().unwrap().unwrap())
+        .collect();
+    assert!(Arc::ptr_eq(leases[0].client(), leases[1].client()));
+    assert_eq!(pool.refcount(address), 2);
+    assert_eq!(peer.connections(), 1);
+    drop(leases);
+    let report = pool.close_all(WAIT);
+    assert!(
+        report.unconfirmed.is_empty() && report.error.is_none(),
+        "{report:?}"
+    );
 }
 
 #[test]

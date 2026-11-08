@@ -1,9 +1,11 @@
 use crate::LifecycleError;
+use c2_mem::retention::{BudgetedBuffer, PayloadBufferReservation};
 
 /// Local response bytes owned independently of transport storage or connections.
 /// SDKs invalidate their checked payload owner before ending this local buffer.
 pub struct HeldResponse {
     bytes: Vec<u8>,
+    reservation: Option<PayloadBufferReservation>,
     released: bool,
 }
 
@@ -11,6 +13,16 @@ impl HeldResponse {
     pub fn from_owned_bytes(bytes: Vec<u8>) -> Self {
         Self {
             bytes,
+            reservation: None,
+            released: false,
+        }
+    }
+
+    pub fn from_budgeted_bytes(buffer: BudgetedBuffer) -> Self {
+        let (bytes, reservation) = buffer.into_parts();
+        Self {
+            bytes,
+            reservation: Some(reservation),
             released: false,
         }
     }
@@ -44,9 +56,9 @@ impl HeldResponse {
         self.released = true;
         // Keep the allocation alive through invalidation. Unwinding drops
         // this same local owner and cannot replay the callback on retry.
-        let bytes = std::mem::take(&mut self.bytes);
+        let owned = (std::mem::take(&mut self.bytes), self.reservation.take());
         let result = invalidate();
-        drop(bytes);
+        drop(owned);
         result.map_err(|invalidation_error| LifecycleError::HeldResponseRelease {
             invalidation_error,
         })
@@ -56,7 +68,22 @@ impl HeldResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use c2_mem::retention::PayloadBufferBudget;
     use std::cell::Cell;
+
+    #[test]
+    fn http_hold_keeps_b_until_invalidation_and_buffer_release() {
+        let budget = PayloadBufferBudget::new(4);
+        let bytes = BudgetedBuffer::new(vec![1; 4], budget.reserve_blocking(4, None).unwrap());
+        let mut held = HeldResponse::from_budgeted_bytes(bytes);
+        assert_eq!(budget.snapshot().used_bytes, 4);
+        held.invalidate_then_release(|| {
+            assert_eq!(budget.snapshot().used_bytes, 4);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(budget.snapshot().used_bytes, 0);
+    }
 
     #[test]
     fn caught_invalidator_panic_does_not_replay_callback() {

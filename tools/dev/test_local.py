@@ -28,11 +28,15 @@ from tools.dev import test_python as strict
 
 ALL = ['core', 'cli', 'rust-sdk', 'native', 'node', 'repo', 'python']
 TS = ROOT / 'core/foundation/c2-mem-ffi/bindings/typescript'
-# These ignored Rust functions are child-process entrypoints executed by their
-# parent tests; they are not missing coverage or optional environment gates.
+# Child-process entrypoints run through their parent tests. The slow-reader
+# measurement runs on demand, using the command in its adjacent Rust comments.
 RUST_IGNORED = {
     ('http_only_process_child', 'isolated process fixture, invoked by its parent test'),
     ('http_only_child', 'isolated process fixture, invoked by parent'),
+    ('relay::stream_tests::slow_reader_records_real_tcp_stall_and_producer_distance',
+     'on-demand slow-reader measurement; run command is in the adjacent test comments'),
+    ('server::stream_tests::stalled_peer_tests::posix::stalled_peer_child',
+     'run only as the controlled child of sigstop_peer_resumes_and_settles'),
 }
 NODE_PLATFORM_SKIPS = {
     'win32': {

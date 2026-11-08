@@ -28,6 +28,14 @@ def read(func: _F) -> _F:
 def write(func: _F) -> _F:
     return _set_method_access(func, MethodAccess.WRITE)
 
+
+def stream(func: _F) -> _F:
+    """Declare one input followed by zero or more response items."""
+    if not callable(func):
+        raise TypeError('@cc.stream can only be applied to callables.')
+    setattr(func, '__cc_stream__', True)
+    return func
+
 def get_method_access(func: Callable) -> MethodAccess:
     access = getattr(func, _METHOD_ACCESS_ATTR, MethodAccess.WRITE)
     if isinstance(access, MethodAccess):

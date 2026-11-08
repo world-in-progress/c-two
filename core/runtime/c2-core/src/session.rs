@@ -678,8 +678,8 @@ impl Runtime {
         })
     }
 
-    /// Configure the independent finite-call domain before its first business
-    /// call. Connect does not freeze this policy. Clones and every Client share
+    /// Configure the call domain before its first payload use: a business call
+    /// or HTTP acquisition. Clones and every Client share
     /// the one domain; teardown never replaces it or launders live charges.
     pub fn set_call_execution_limits(
         &self,
@@ -707,7 +707,7 @@ impl Runtime {
         if let Some(context) = &state.call_execution {
             let snapshot = context.snapshot();
             return if snapshot.max_operations == limits.max_outstanding_calls
-                && snapshot.max_retained_bytes == limits.retained_input_budget_bytes
+                && context.payload_snapshot().limit_bytes == limits.payload_buffer_budget_bytes
             {
                 // Record accepted optional code inputs, even for an idempotent
                 // setter. The frozen budget and its live charges stay intact.
@@ -727,12 +727,30 @@ impl Runtime {
         Ok(())
     }
 
-    /// Consistent read-only input retention counters. Before first call this
+    /// Consistent read-only operation-slot counters. Before first call this
     /// resolves policy without freezing or constructing an executor. It counts
-    /// actual finite owners, including continuations after caller timeout;
+    /// finite-unary and stream owners, including continuations after caller timeout;
     /// response-storage observations stay in outgoing_memory_observer().
     pub fn call_execution_snapshot(&self) -> Result<crate::CallExecutionSnapshot, LifecycleError> {
         Ok(self.resolve_call_execution_context(false)?.snapshot())
+    }
+
+    /// Observe the frozen B domain without creating one or retaining producer
+    /// authority. A retired session may still have live storage owners.
+    pub fn payload_buffer_observer(&self) -> Option<c2_mem::retention::PayloadBufferObserverWeak> {
+        self.state
+            .lock()
+            .call_execution
+            .as_ref()
+            .map(|context| context.payload_budget().downgrade())
+    }
+
+    pub fn payload_buffer_stats(&self) -> Option<crate::MemoryCellStats> {
+        self.state
+            .lock()
+            .call_execution
+            .as_ref()
+            .map(|context| crate::MemoryCellStats::from_payload_buffer(context.payload_snapshot()))
     }
 
     /// Capture pure metadata for this Runtime's independent domain, including
@@ -755,9 +773,17 @@ impl Runtime {
         &self,
         freeze: bool,
     ) -> Result<CallExecutionContext, LifecycleError> {
+        self.resolve_call_execution_context_with_lock(freeze, || Ok(self.state.lock()))
+    }
+
+    fn resolve_call_execution_context_with_lock<'a, E: From<LifecycleError>>(
+        &'a self,
+        freeze: bool,
+        lock: impl Fn() -> Result<parking_lot::MutexGuard<'a, RuntimeState>, E>,
+    ) -> Result<CallExecutionContext, E> {
         loop {
             let (overrides, sources, revision) = {
-                let state = self.state.lock();
+                let state = lock()?;
                 if let Some(context) = &state.call_execution {
                     return Ok(context.clone());
                 }
@@ -770,14 +796,14 @@ impl Runtime {
             // Environment/.env I/O outside runtime metadata, just as for the
             // existing configuration domains. A racing setter wins by revision.
             let resolved = resolve_call_execution_limits(overrides, sources);
-            let mut state = self.state.lock();
+            let mut state = lock()?;
             if let Some(context) = &state.call_execution {
                 return Ok(context.clone());
             }
             if state.call_execution_revision != revision {
                 continue;
             }
-            let context = CallExecutionContext::new(&resolved?);
+            let context = CallExecutionContext::new(&resolved.map_err(E::from)?);
             if state.call_execution_observer.is_closed() {
                 context.close();
             }
@@ -826,6 +852,25 @@ impl Runtime {
         state.local_endpoint_options = options;
         state.local_endpoint_sources = sources;
         state.inherited_local_endpoint = None;
+        state.local_endpoint_revision += 1;
+        Ok(())
+    }
+
+    /// Install an already captured native endpoint configuration without resolving again.
+    #[doc(hidden)]
+    pub fn set_captured_local_endpoint(
+        &self,
+        context: c2_config::LocalEndpointContext,
+    ) -> Result<(), LifecycleError> {
+        let mut state = self.state.lock();
+        if let Some(frozen) = &state.frozen_local_endpoint {
+            return if frozen == &context {
+                Ok(())
+            } else {
+                Err(LifecycleError::ConfigFrozen)
+            };
+        }
+        state.inherited_local_endpoint = Some(context);
         state.local_endpoint_revision += 1;
         Ok(())
     }
@@ -1116,6 +1161,7 @@ impl Runtime {
         crate::RuntimeMemoryStats {
             runtime_outgoing: self.outgoing_memory_stats(),
             server: None,
+            payload_buffer: self.payload_buffer_stats(),
         }
     }
 
@@ -1133,6 +1179,14 @@ impl Runtime {
         address: &str,
         deadline: ConnectDeadline,
     ) -> Result<c2_ipc::pool::ClientLease, c2_ipc::IpcError> {
+        let (config, pool) = self.ipc_client_domain(deadline)?;
+        pool.acquire_lease_with_deadline(address, Some(&config), deadline)
+    }
+
+    pub(crate) fn ipc_client_domain(
+        &self,
+        deadline: ConnectDeadline,
+    ) -> Result<(c2_config::ClientIpcConfig, Arc<c2_ipc::ClientPool>), c2_ipc::IpcError> {
         let context = self
             .resolve_local_endpoint_context_with_deadline(true, None, deadline)
             .map_err(connect_error_to_ipc)?
@@ -1151,7 +1205,7 @@ impl Runtime {
                         .get_or_insert_with(|| {
                             Arc::new(
                                 c2_ipc::ClientPool::with_endpoint_context(
-                                    Duration::from_secs(60),
+                                    config.client_idle_timeout(),
                                     context.clone(),
                                 )
                                 .with_connection_event_source(events),
@@ -1186,7 +1240,7 @@ impl Runtime {
                 .get_or_insert_with(|| {
                     Arc::new(
                         c2_ipc::ClientPool::with_endpoint_context(
-                            Duration::from_secs(60),
+                            config.client_idle_timeout(),
                             context.clone(),
                         )
                         .with_connection_event_source(events),
@@ -1195,8 +1249,7 @@ impl Runtime {
                 .clone();
             break (config, pool);
         };
-        // Connect outside the RuntimeState lock.
-        pool.acquire_lease_with_deadline(address, Some(&config), deadline)
+        Ok((config, pool))
     }
 
     pub(crate) fn discard_ipc_client_with_deadline(
@@ -2404,11 +2457,16 @@ impl Runtime {
     pub(crate) fn resolve_relay_connection_after_local_ipc_failures_with_deadline(
         client: RelayAwareHttpClient,
         failed_candidates: &[RelayLocalIpcCandidate],
+        failure_code: Option<c2_error::ErrorCode>,
         deadline: ConnectDeadline,
     ) -> Result<RelayResolvedConnection, crate::Error> {
         connect_stage_check(deadline, "relay_acquire")?;
         match client
-            .resolve_target_after_local_ipc_failures_with_deadline(failed_candidates, deadline)
+            .resolve_target_after_local_ipc_failures_with_deadline(
+                failed_candidates,
+                failure_code,
+                deadline,
+            )
             .map_err(|error| {
                 crate::normalize_http_error(error, crate::TransportPhase::PreDispatch)
             })? {
@@ -2470,6 +2528,12 @@ impl Runtime {
         prefer_local_ipc: bool,
         deadline: ConnectDeadline,
     ) -> Result<RelayAwareHttpClient, crate::Error> {
+        // HTTP acquisition can receive an error body before a business call.
+        // It starts the same frozen B domain, with the original connect budget.
+        let payload = self.resolve_call_execution_context_with_lock(true, || {
+            connect_state_lock(&self.state, deadline, "runtime_payload_budget_wait")
+        })?;
+        let client = client.with_payload_buffer_budget(payload.payload_budget());
         let frozen = connect_state_lock(&self.state, deadline, "runtime_relay_wait")?
             .frozen_local_endpoint
             .clone();
@@ -2815,7 +2879,7 @@ mod tests {
             .set_call_execution_limits_with_sources(
                 c2_config::CallExecutionLimitsOverrides {
                     max_outstanding_calls: Some(8),
-                    retained_input_budget_bytes: Some(256),
+                    payload_buffer_budget_bytes: Some(256),
                 },
                 c2_config::ConfigSources::empty(),
             )
@@ -2857,9 +2921,15 @@ mod tests {
         assert!(observed.initialized);
         assert!(!observed.closed);
         let counters = observed.counters.unwrap();
+        assert_eq!(counters.used_operations, 8);
         assert_eq!(
-            (counters.used_operations, counters.used_retained_bytes),
-            (8, 256)
+            runtime
+                .payload_buffer_observer()
+                .unwrap()
+                .snapshot()
+                .unwrap()
+                .used_bytes,
+            256
         );
         assert_eq!(counters, runtime.call_execution_snapshot().unwrap());
         assert!(observer.same_domain(&runtime.clone().call_execution_observer()));
@@ -2876,6 +2946,7 @@ mod tests {
         let weak_session = Arc::downgrade(&runtime.state);
         let observer = runtime.call_execution_observer();
         let context = runtime.call_execution_context().unwrap();
+        let payload_observer = runtime.payload_buffer_observer().unwrap();
         let input = context
             .prepare(
                 CallOptions::with_timeout(CallTimeout::After(Duration::from_secs(10))),
@@ -2901,14 +2972,22 @@ mod tests {
         // alive by the observer. Its budget metadata still sees the real Vec.
         assert!(weak_session.upgrade().is_none());
         assert_eq!(input.as_ref().as_ref(), &[7; 32]);
+        // Outcome publication wakes wait() before the native task drops its
+        // operation owner. Observe that real cleanup before checking its refund.
+        let until = Instant::now() + Duration::from_secs(10);
+        while observer.snapshot().counters.unwrap().used_operations != 0 {
+            assert!(
+                Instant::now() < until,
+                "native operation owner did not finish"
+            );
+            std::thread::yield_now();
+        }
         let observation = observer.snapshot();
         assert!(observation.closed);
         let counters = observation.counters.unwrap();
         assert!(counters.closed);
-        assert_eq!(
-            (counters.used_operations, counters.used_retained_bytes),
-            (1, 32)
-        );
+        assert_eq!(counters.used_operations, 0);
+        assert_eq!(payload_observer.snapshot().unwrap().used_bytes, 32);
         assert!(observer.is_live());
         drop(input);
         let until = Instant::now() + Duration::from_secs(10);
@@ -2920,10 +2999,8 @@ mod tests {
             std::thread::yield_now();
         }
         let counters = observer.snapshot().counters.unwrap();
-        assert_eq!(
-            (counters.used_operations, counters.used_retained_bytes),
-            (0, 0)
-        );
+        assert_eq!(counters.used_operations, 0);
+        assert_eq!(payload_observer.snapshot().unwrap().used_bytes, 0);
         assert!(counters.closed);
     }
 
@@ -2981,7 +3058,7 @@ mod tests {
             .set_call_execution_limits_with_sources(
                 c2_config::CallExecutionLimitsOverrides {
                     max_outstanding_calls: Some(3),
-                    retained_input_budget_bytes: Some(64),
+                    payload_buffer_budget_bytes: Some(64),
                 },
                 c2_config::ConfigSources::empty(),
             )
@@ -3008,7 +3085,7 @@ mod tests {
             env_file: c2_config::EnvFilePolicy::Disabled,
             process_env: c2_config::EnvMap::from([
                 ("C2_CALL_MAX_OUTSTANDING".into(), "8".into()),
-                ("C2_CALL_RETAINED_INPUT_BUDGET_BYTES".into(), "256".into()),
+                ("C2_CALL_PAYLOAD_BUFFER_BUDGET_BYTES".into(), "256".into()),
             ]),
         };
         runtime
@@ -3016,10 +3093,15 @@ mod tests {
             .unwrap();
         let accepted = runtime.call_execution_limits_overrides();
         assert_eq!(accepted.max_outstanding_calls, None);
-        assert_eq!(accepted.retained_input_budget_bytes, None);
+        assert_eq!(accepted.payload_buffer_budget_bytes, None);
         assert_eq!(observer.snapshot().counters.unwrap().max_operations, 8);
         assert_eq!(
-            observer.snapshot().counters.unwrap().used_retained_bytes,
+            runtime
+                .payload_buffer_observer()
+                .unwrap()
+                .snapshot()
+                .unwrap()
+                .used_bytes,
             32
         );
         assert!(
@@ -3027,7 +3109,7 @@ mod tests {
                 .set_call_execution_limits_with_sources(
                     c2_config::CallExecutionLimitsOverrides {
                         max_outstanding_calls: Some(9),
-                        retained_input_budget_bytes: None,
+                        payload_buffer_budget_bytes: None,
                     },
                     c2_config::ConfigSources::empty(),
                 )
@@ -3343,26 +3425,25 @@ mod tests {
                     env_file: c2_config::EnvFilePolicy::Disabled,
                     process_env: EnvMap::from([
                         ("C2_CALL_MAX_OUTSTANDING".into(), "3".into()),
-                        ("C2_CALL_RETAINED_INPUT_BUDGET_BYTES".into(), "17".into()),
+                        ("C2_CALL_PAYLOAD_BUFFER_BUDGET_BYTES".into(), "17".into()),
                     ]),
                 },
             )
             .unwrap();
         let snapshot = runtime.call_execution_snapshot().unwrap();
-        assert_eq!(
-            (snapshot.max_operations, snapshot.max_retained_bytes),
-            (3, 17)
-        );
-        assert_eq!(
-            (snapshot.used_operations, snapshot.used_retained_bytes),
-            (0, 0)
-        );
+        assert_eq!(snapshot.max_operations, 3);
+        let payload = runtime
+            .resolve_call_execution_context(false)
+            .unwrap()
+            .payload_snapshot();
+        assert_eq!((payload.limit_bytes, payload.used_bytes), (17, 0));
+        assert_eq!(snapshot.used_operations, 0);
         // Observation did not freeze: a later typed override wins.
         runtime
             .set_call_execution_limits_with_sources(
                 CallExecutionLimitsOverrides {
                     max_outstanding_calls: Some(1),
-                    retained_input_budget_bytes: Some(32),
+                    payload_buffer_budget_bytes: Some(32),
                 },
                 ConfigSources::empty(),
             )
@@ -3376,7 +3457,7 @@ mod tests {
         let runtime = Runtime::new(RuntimeOptions::default()).unwrap();
         let overrides = CallExecutionLimitsOverrides {
             max_outstanding_calls: Some(1),
-            retained_input_budget_bytes: Some(32),
+            payload_buffer_budget_bytes: Some(32),
         };
         runtime
             .set_call_execution_limits_with_sources(overrides.clone(), ConfigSources::empty())
@@ -3391,7 +3472,12 @@ mod tests {
             .unwrap();
         call.charge_input(32).unwrap();
         assert_eq!(
-            clone.call_execution_snapshot().unwrap().used_retained_bytes,
+            clone
+                .payload_buffer_observer()
+                .unwrap()
+                .snapshot()
+                .unwrap()
+                .used_bytes,
             32
         );
         clone
@@ -3402,7 +3488,7 @@ mod tests {
             clone.set_call_execution_limits_with_sources(
                 CallExecutionLimitsOverrides {
                     max_outstanding_calls: Some(2),
-                    retained_input_budget_bytes: Some(64)
+                    payload_buffer_budget_bytes: Some(64)
                 },
                 ConfigSources::empty(),
             ),
@@ -3430,7 +3516,7 @@ mod tests {
             .set_call_execution_limits_with_sources(
                 CallExecutionLimitsOverrides {
                     max_outstanding_calls: Some(1),
-                    retained_input_budget_bytes: Some(32),
+                    payload_buffer_budget_bytes: Some(32),
                 },
                 ConfigSources::empty(),
             )
@@ -3455,9 +3541,15 @@ mod tests {
         assert!(retirement_completed, "{retirement_outcome:?}");
         let snapshot = runtime.call_execution_snapshot().unwrap();
         assert!(snapshot.closed);
+        assert_eq!(snapshot.used_operations, 1);
         assert_eq!(
-            (snapshot.used_operations, snapshot.used_retained_bytes),
-            (1, 32)
+            runtime
+                .payload_buffer_observer()
+                .unwrap()
+                .snapshot()
+                .unwrap()
+                .used_bytes,
+            32
         );
         assert_eq!(observer.snapshot().counters, Some(snapshot));
         assert!(observer.is_live());
@@ -3479,17 +3571,21 @@ mod tests {
         drop(unlimited);
         assert_eq!(
             runtime
-                .call_execution_snapshot()
+                .payload_buffer_observer()
                 .unwrap()
-                .used_retained_bytes,
+                .snapshot()
+                .unwrap()
+                .used_bytes,
             32
         );
         drop(call);
         assert_eq!(
             runtime
-                .call_execution_snapshot()
+                .payload_buffer_observer()
                 .unwrap()
-                .used_retained_bytes,
+                .snapshot()
+                .unwrap()
+                .used_bytes,
             0
         );
         assert!(!observer.is_live());

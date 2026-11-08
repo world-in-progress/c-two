@@ -1,6 +1,6 @@
 use super::*;
-use crate::flags::{FLAG_CTRL, FLAG_RESPONSE};
-use crate::frame::{decode_frame, encode_frame};
+use crate::flags::{FLAG_CTRL, FLAG_RESPONSE, FLAG_RPC_RECORD};
+use crate::frame::decode_frame;
 use crate::release::{ReleaseBatch, encode_release_frame};
 use c2_mem::{MemoryBudget, config::PoolConfig};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -9,6 +9,125 @@ fn established(side: ConnectionSide) -> ConnectionCore {
     let core = ConnectionCore::new(side, || {});
     core.finish_handshake().unwrap();
     core
+}
+
+#[test]
+fn stream_zero_item_and_variable_data_sizes_track_one_position() {
+    let core = established(ConnectionSide::Server);
+    core.stream_open(7).unwrap();
+    assert!(core.stream_start_step(7).unwrap());
+    core.stream_begin_item(7, 0).unwrap();
+    assert_eq!(core.stream_state(7).unwrap().complete_items, 1);
+    assert!(!core.stream_start_step(7).unwrap());
+    core.stream_credit(7, 0, 1).unwrap();
+    assert!(core.stream_start_step(7).unwrap());
+    core.stream_begin_item(7, 7).unwrap();
+    core.stream_credit(7, 7, 0).unwrap();
+    assert_eq!(core.stream_data(7, 2).unwrap(), 0);
+    assert_eq!(core.stream_data(7, 5).unwrap(), 2);
+    core.stream_finish_item(7).unwrap();
+    let state = core.stream_state(7).unwrap();
+    assert_eq!(state.complete_items, 2);
+    assert_eq!(state.total_bytes, None);
+    assert_eq!(state.admitted_bytes, 0);
+}
+
+#[test]
+fn stream_demand_and_storage_reject_overgrant_without_changing_connection_book() {
+    let core = established(ConnectionSide::Client);
+    core.stream_open(1).unwrap();
+    core.stream_open(2).unwrap();
+    assert!(core.stream_credit(1, 0, 1).is_err());
+    core.stream_begin_item(1, 4).unwrap();
+    core.stream_begin_item(2, 3).unwrap();
+    core.stream_credit(1, 3, 0).unwrap();
+    core.stream_credit(2, 2, 0).unwrap();
+    assert!(core.stream_credit(1, 2, 0).is_err());
+    assert!(core.stream_data(1, 4).is_err());
+    assert!(core.stream_data(1, 0).is_err());
+    assert_eq!(core.shared.state.lock().stream_storage_bytes, 5);
+    assert_eq!(core.stream_data(1, 2).unwrap(), 0);
+    assert_eq!(core.shared.state.lock().stream_storage_bytes, 3);
+    assert_eq!(core.stream_data(2, 2).unwrap(), 0);
+    assert_eq!(core.shared.state.lock().stream_storage_bytes, 1);
+    assert_eq!(core.stream_retire(1).unwrap().storage_bytes, 1);
+    assert_eq!(core.shared.state.lock().stream_storage_bytes, 0);
+    assert_eq!(core.stream_state(2).unwrap().admitted_bytes, 2);
+}
+
+#[test]
+fn whole_shm_item_spends_positive_copy_window_and_keeps_connection_balance() {
+    let core = established(ConnectionSide::Client);
+    core.stream_open(1).unwrap();
+    core.stream_open(2).unwrap();
+    core.stream_begin_item(1, 9).unwrap();
+    core.stream_begin_item(2, 4).unwrap();
+    core.stream_credit(1, 1, 0).unwrap();
+    core.stream_credit(2, 2, 0).unwrap();
+    assert!(core.stream_data(1, 9).is_err());
+    assert!(core.stream_shm_data(1, 8).is_err());
+    assert_eq!(core.shared.state.lock().stream_storage_bytes, 3);
+    assert_eq!(core.stream_shm_data(1, 9).unwrap(), 0);
+    assert_eq!(core.shared.state.lock().stream_storage_bytes, 2);
+    assert_eq!(core.stream_state(1).unwrap().admitted_bytes, 9);
+    assert_eq!(core.stream_data(2, 2).unwrap(), 0);
+    assert_eq!(core.shared.state.lock().stream_storage_bytes, 0);
+    core.stream_finish_item(1).unwrap();
+    core.stream_retire(1).unwrap();
+    assert_eq!(core.shared.state.lock().stream_storage_bytes, 0);
+
+    let other = established(ConnectionSide::Client);
+    other.stream_open(3).unwrap();
+    other.stream_begin_item(3, 5).unwrap();
+    assert!(other.stream_shm_data(3, 5).is_err());
+    other.stream_credit(3, 2, 0).unwrap();
+    other.stream_data(3, 1).unwrap();
+    assert!(other.stream_shm_data(3, 5).is_err());
+    assert_eq!(other.shared.state.lock().stream_storage_bytes, 1);
+}
+
+#[test]
+fn stream_cancel_is_idempotent_and_late_credit_does_not_revive_it() {
+    let core = established(ConnectionSide::Server);
+    core.stream_open(8).unwrap();
+    assert!(core.stream_start_step(8).unwrap());
+    core.stream_begin_item(8, 5).unwrap();
+    core.stream_credit(8, 5, 0).unwrap();
+    assert!(core.stream_cancel(8).unwrap());
+    assert!(!core.stream_cancel(8).unwrap());
+    core.stream_credit(8, 10, 1).unwrap();
+    assert_eq!(core.stream_state(8).unwrap().storage_bytes, 5);
+    assert_eq!(core.stream_data(8, 5).unwrap(), 0);
+    core.stream_finish_item(8).unwrap();
+    assert!(!core.stream_start_step(8).unwrap());
+}
+
+#[test]
+fn live_stream_blocks_close_even_after_peer_end_until_driver_retires_it() {
+    let core = established(ConnectionSide::Server);
+    core.stream_open(9).unwrap();
+    drop(core.peer_end());
+    assert!(!core.try_close());
+    assert!(core.stream_state(9).is_some());
+    core.stream_retire(9).unwrap();
+    assert!(core.try_close());
+}
+
+#[test]
+fn stream_registration_requires_handshake_and_live_admission() {
+    let core = ConnectionCore::new(ConnectionSide::Client, || {});
+    assert_eq!(core.stream_open(1), Err(ConnectionError::BeforeHandshake));
+    core.finish_handshake().unwrap();
+    assert!(core.stream_open(0).is_err());
+    core.stream_open(1).unwrap();
+    assert!(core.stream_open(1).is_err());
+    assert!(core.stream_start_step(1).is_err());
+    assert!(core.stream_finish_item(1).is_err());
+    drop(core.deactivate());
+    assert_eq!(core.stream_open(2), Err(ConnectionError::Deactivated));
+    assert!(!core.try_close());
+    core.stream_retire(1).unwrap();
+    assert!(core.try_close());
 }
 
 // File-backed move-only handles let the control-plane algorithm exercise real
@@ -107,7 +226,7 @@ fn remote_read_drop_queues_release_and_wakes_idle_writer() {
     assert!(wakes.load(Ordering::SeqCst) > 0);
     let mut write = core.begin_write(WriteRequest::Releases).unwrap().unwrap();
     let (header, payload) = decode_frame(write.release_bytes()).unwrap();
-    assert_eq!(header.flags, FLAG_CTRL | FLAG_RESPONSE);
+    assert_eq!(header.flags, FLAG_RPC_RECORD | FLAG_RESPONSE);
     assert_eq!(
         crate::release::decode_release_frame(&header, payload, true, true)
             .unwrap()
@@ -314,10 +433,17 @@ fn release_queue_batches_and_cosubmits_with_one_business_frame() {
     assert!(write.has_business_frame());
     // The driver performs one write with these bytes; core never receives the
     // business payload or its byte-budget guard.
-    let business = encode_frame(99, crate::flags::FLAG_REPLY_V2 | FLAG_RESPONSE, b"business");
+    let business = crate::rpc::encode_call_end_frame(
+        99,
+        crate::rpc::CallMode::Unary,
+        crate::rpc::CallStatus::Success,
+        0,
+        crate::rpc::ValuePart::whole(crate::rpc::ValueStorage::Inline(b"business")),
+    )
+    .unwrap();
     let submission = [write.release_bytes(), &business].concat();
     let tail = &submission[write.release_bytes().len()..];
-    assert_eq!(decode_frame(tail).unwrap().1, b"business");
+    assert_eq!(&decode_frame(tail).unwrap().1[2..], b"business");
     write.begin_io().unwrap();
     for _ in 0..4 {
         write.frame_completed();

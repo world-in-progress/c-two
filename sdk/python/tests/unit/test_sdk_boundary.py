@@ -338,7 +338,7 @@ def test_runtime_endpoint_and_accepted_budget_authority_are_native():
         field for field in state_fields
         if any(part in field for part in (
             'endpoint', 'execution_limits', 'execution_context',
-            'outstanding_calls', 'retained_input_budget',
+            'outstanding_calls', 'payload_buffer_budget',
         ))
     }
     calls = {
@@ -591,22 +591,12 @@ def test_native_route_contract_boundaries_have_no_empty_defaults_or_raw_calls():
     client_impl = re.search(r'#\[pymethods\]\s*impl\s+PyCoreClient\s*\{', core_ffi)
     assert client_impl is not None
     client_source = core_ffi[client_impl.start():]
-    begin = _rust_compact(_rust_function(client_source, 'begin_call'))
     call = _rust_compact(_rust_function(client_source, 'call'))
-    finish = _rust_compact(_rust_function(core_ffi, 'finish'))
     take = _rust_compact(_rust_function(core_ffi, 'take'))
     clone = _rust_compact(_rust_function(core_ffi, 'client'))
-    assert 'letclient=self.client()?;' in begin
-    assert 'detach(move||client.begin_call(method_name))' in begin
     assert 'self.begin_call(py,method_name)?.call(py,data)' in call
-    assert 'encoded:c2_core::EncodedCall' in finish
-    assert 'detach(move||encoded.call_held())' in finish
     assert 'self.inner.lock().take()' in take
     assert 'self.inner.lock().clone()' in clone
-    assert '.lock()' not in begin + call + finish
-    prepared_call = _rust_compact(_rust_function(core_ffi, 'call'))
-    assert 'letmutprepared=self.take()?;' in prepared_call
-    assert 'begin_call(' not in prepared_call
     for source in (core_ffi, runtime_session):
         assert re.search(
             r'\bfn\s+call(?:<[^>]*>)?\s*\([^)]*\broute_name\s*:', source,
@@ -1027,21 +1017,3 @@ def test_crm_proxy_does_not_expose_raw_relay_wire_entrypoint():
 
     assert "    def relay(" not in source
     assert "._client.relay(" not in source
-
-
-def test_relay_router_does_not_silence_response_materialization_errors():
-    root = Path(__file__).resolve().parents[4]
-    router_source = (
-        root / "core" / "transport" / "c2-http" / "src" / "relay" / "router.rs"
-    ).read_text(encoding="utf-8")
-    production = router_source.split("\n#[cfg(test)]\nmod tests")[0]
-    call_handler = production[production.index("async fn call_handler"):]
-    call_handler = call_handler[:call_handler.index("async fn acquire_request_client")]
-
-    assert "result.into_owned_bytes()" in call_handler
-    materialization = call_handler[call_handler.index("fn materialized_response_or_error"):]
-    assert "resource_unavailable_response_with_phase" in materialization
-    assert '"dispatch_uncertain"' in materialization
-    assert '"pre_dispatch"' not in materialization
-    assert "Json(serde_json::json!" not in materialization
-    assert "unwrap_or_default()" not in call_handler

@@ -31,11 +31,20 @@ pub(crate) async fn close_listener(listener: c2_local::LocalListener) {
 
 #[cfg(test)]
 mod client_tests {
-    use c2_wire::buddy::{BUDDY_PAYLOAD_SIZE, decode_buddy_payload};
-    use c2_wire::chunk::header::{CHUNK_HEADER_SIZE, decode_chunk_header};
-    use c2_wire::control::*;
+    #[test]
+    fn test_ipc_config_defaults() {
+        let cfg = crate::ClientIpcConfig::default();
+        assert_eq!(cfg.shm_threshold, 4096);
+        assert_eq!(cfg.chunk_size, 131072);
+    }
+    use c2_wire::buddy::BUDDY_PAYLOAD_SIZE;
     use c2_wire::flags;
     use c2_wire::frame;
+    use c2_wire::rpc::{
+        CallMode, CallStatus, RouteCallIdentity, RpcRecord, RpcRecordKind, ValuePart, ValueStorage,
+        decode_rpc_record, encode_call_end_frame, encode_open_frame,
+        encode_value_continuation_frame,
+    };
 
     use crate::client::{
         ClientIpcConfig, IpcClient, RequestTransportKind, choose_request_transport,
@@ -59,190 +68,154 @@ mod client_tests {
     }
 
     #[test]
-    fn encode_v2_inline_call() {
-        // Verify that an inline v2 call frame has the expected layout:
-        // [16B header (flags=FLAG_CALL_V2)] [call_control] [data]
-        let ctrl = encode_call_control(&call_identity("grid"), 0).unwrap();
-        let data = b"hello";
-        let mut payload = Vec::new();
-        payload.extend_from_slice(&ctrl);
-        payload.extend_from_slice(data);
-        let frame_bytes = frame::encode_frame(42, flags::FLAG_CALL_V2, &payload);
-
-        let (hdr, frame_payload) = frame::decode_frame(&frame_bytes).unwrap();
-        assert_eq!(hdr.request_id, 42);
-        assert!(hdr.is_call_v2());
-        assert!(!hdr.is_buddy());
-
-        let (decoded_ctrl, consumed) = decode_call_control(frame_payload, 0).unwrap();
-        assert_eq!(decoded_ctrl.identity.route_name, "grid");
-        assert_eq!(decoded_ctrl.method_idx, 0);
-
-        let inline_data = &frame_payload[consumed..];
-        assert_eq!(inline_data, b"hello");
+    fn encode_inline_open_record() {
+        let frame_bytes = encode_open_frame(
+            42,
+            &call_identity("grid"),
+            0,
+            c2_wire::rpc::CallMode::Unary,
+            ValuePart::whole(ValueStorage::Inline(b"hello")),
+        )
+        .unwrap();
+        let (header, payload) = frame::decode_frame(&frame_bytes).unwrap();
+        assert_eq!(header.request_id, 42);
+        assert_eq!(header.flags, flags::FLAG_RPC_RECORD);
+        let RpcRecord::Open {
+            identity,
+            method_idx,
+            value,
+            ..
+        } = decode_rpc_record(&header, payload, None).unwrap()
+        else {
+            panic!("OPEN");
+        };
+        assert_eq!(identity.route_name, "grid");
+        assert_eq!(method_idx, 0);
+        assert_eq!(value.storage, ValueStorage::Inline(b"hello"));
     }
 
     #[test]
-    fn encode_v2_inline_reply() {
-        // [16B header (flags=RESPONSE|REPLY_V2)] [1B status=OK] [data]
-        let ctrl = encode_reply_control(&ReplyControl::Success);
-        let data = b"result";
-        let mut payload = Vec::new();
-        payload.extend_from_slice(&ctrl);
-        payload.extend_from_slice(data);
-        let frame_bytes =
-            frame::encode_frame(42, flags::FLAG_RESPONSE | flags::FLAG_REPLY_V2, &payload);
+    fn encode_inline_call_end_records() {
+        let success = encode_call_end_frame(
+            42,
+            CallMode::Unary,
+            CallStatus::Success,
+            0,
+            ValuePart::whole(ValueStorage::Inline(b"result")),
+        )
+        .unwrap();
+        let (header, payload) = frame::decode_frame(&success).unwrap();
+        assert_eq!(header.flags, flags::FLAG_RPC_RECORD | flags::FLAG_RESPONSE);
+        let RpcRecord::CallEnd {
+            status,
+            complete_items,
+            value,
+            ..
+        } = decode_rpc_record(&header, payload, Some(CallMode::Unary)).unwrap()
+        else {
+            panic!("CALL_END");
+        };
+        assert_eq!(status, CallStatus::Success);
+        assert_eq!(complete_items, None);
+        assert_eq!(value.storage, ValueStorage::Inline(b"result"));
 
-        let (hdr, frame_payload) = frame::decode_frame(&frame_bytes).unwrap();
-        assert!(hdr.is_response());
-        assert!(hdr.is_reply_v2());
-        assert!(!hdr.is_buddy());
-
-        let (ctrl, consumed) = decode_reply_control(frame_payload, 0).unwrap();
-        assert_eq!(ctrl, ReplyControl::Success);
-        assert_eq!(&frame_payload[consumed..], b"result");
+        let error = br#"C2E1{"version":1,"code":713,"name":"ProtocolViolation","message":"bad","details":{}}"#;
+        let failed = encode_call_end_frame(
+            42,
+            CallMode::Unary,
+            CallStatus::Failed,
+            0,
+            ValuePart::whole(ValueStorage::Inline(error)),
+        )
+        .unwrap();
+        let (header, payload) = frame::decode_frame(&failed).unwrap();
+        assert!(matches!(
+            decode_rpc_record(&header, payload, Some(CallMode::Unary)).unwrap(),
+            RpcRecord::CallEnd {
+                status: CallStatus::Failed,
+                ..
+            }
+        ));
     }
 
     #[test]
-    fn encode_v2_error_reply() {
-        let err = br#"C2E1{"version":1,"code":3,"name":"ResourceFunctionExecuting","message":"test error","details":{}}"#.to_vec();
-        let ctrl = encode_reply_control(&ReplyControl::Error(err.clone()));
-        let frame_bytes =
-            frame::encode_frame(42, flags::FLAG_RESPONSE | flags::FLAG_REPLY_V2, &ctrl);
-
-        let (hdr, frame_payload) = frame::decode_frame(&frame_bytes).unwrap();
-        assert!(hdr.is_response());
-        assert!(hdr.is_reply_v2());
-
-        let (decoded, _) = decode_reply_control(frame_payload, 0).unwrap();
-        assert_eq!(decoded, ReplyControl::Error(err));
-    }
-
-    // ── New tests for buddy + chunked transport ─────────────────────────
-
-    #[test]
-    fn test_ipc_config_defaults() {
-        let cfg = ClientIpcConfig::default();
-        assert_eq!(cfg.shm_threshold, 4096);
-        assert_eq!(cfg.chunk_size, 131072);
-    }
-
-    #[test]
-    fn test_buddy_frame_encoding() {
-        // Build a buddy call frame as call_buddy would:
-        // payload = [23B buddy_payload][call_control]
-        // flags   = FLAG_CALL_V2 | FLAG_BUDDY
-        use c2_wire::buddy::{BuddyPayload, encode_buddy_payload};
-
-        let bp = BuddyPayload {
-            seg_idx: 0,
+    fn shm_descriptor_follows_open_metadata() {
+        use c2_wire::buddy::BuddyPayload;
+        let descriptor = BuddyPayload {
+            seg_idx: 5,
             generation: 1,
             offset: 4096,
             data_size: 8192,
             is_dedicated: false,
-            loan_id: 0x0807_0605_0403_0201,
-        };
-        let buddy_bytes = encode_buddy_payload(&bp);
-        assert_eq!(buddy_bytes.len(), BUDDY_PAYLOAD_SIZE);
-
-        let ctrl = encode_call_control(&call_identity("grid"), 3).unwrap();
-        let mut payload = Vec::new();
-        payload.extend_from_slice(&buddy_bytes);
-        payload.extend_from_slice(&ctrl);
-
-        let frame_flags = flags::FLAG_CALL_V2 | flags::FLAG_BUDDY;
-        let frame_bytes = frame::encode_frame(99, frame_flags, &payload);
-
-        // Decode and verify structure.
-        let (hdr, frame_payload) = frame::decode_frame(&frame_bytes).unwrap();
-        assert_eq!(hdr.request_id, 99);
-        assert!(hdr.is_call_v2());
-        assert!(hdr.is_buddy());
-        assert!(!flags::is_chunked(hdr.flags));
-
-        // Decode buddy payload.
-        let (decoded_bp, bp_consumed) = decode_buddy_payload(frame_payload).unwrap();
-        assert_eq!(decoded_bp.seg_idx, 0);
-        assert_eq!(decoded_bp.generation, 1);
-        assert_eq!(decoded_bp.offset, 4096);
-        assert_eq!(decoded_bp.data_size, 8192);
-        assert!(!decoded_bp.is_dedicated);
-        assert_eq!(decoded_bp.loan_id, bp.loan_id);
-        assert_eq!(bp_consumed, BUDDY_PAYLOAD_SIZE);
-
-        // Decode call control after buddy payload.
-        let (decoded_ctrl, _) = decode_call_control(frame_payload, BUDDY_PAYLOAD_SIZE).unwrap();
-        assert_eq!(decoded_ctrl.identity.route_name, "grid");
-        assert_eq!(decoded_ctrl.method_idx, 3);
-    }
-
-    #[test]
-    fn test_buddy_frame_dedicated_segment() {
-        use c2_wire::buddy::{BuddyPayload, encode_buddy_payload};
-
-        let bp = BuddyPayload {
-            seg_idx: 5,
-            generation: 1,
-            offset: 0,
-            data_size: 1_000_000,
-            is_dedicated: true,
             loan_id: 17,
         };
-        let buddy_bytes = encode_buddy_payload(&bp);
-
-        let ctrl = encode_call_control(&call_identity("net"), 1).unwrap();
-
-        let mut payload = Vec::new();
-        payload.extend_from_slice(&buddy_bytes);
-        payload.extend_from_slice(&ctrl);
-
-        let frame_bytes = frame::encode_frame(7, flags::FLAG_CALL_V2 | flags::FLAG_BUDDY, &payload);
-
-        let (hdr, frame_payload) = frame::decode_frame(&frame_bytes).unwrap();
-        assert!(hdr.is_buddy());
-        let (decoded_bp, _) = decode_buddy_payload(frame_payload).unwrap();
-        assert_eq!(decoded_bp.seg_idx, 5);
-        assert_eq!(decoded_bp.generation, 1);
-        assert!(decoded_bp.is_dedicated);
-        assert_eq!(decoded_bp.data_size, 1_000_000);
+        let frame_bytes = encode_open_frame(
+            99,
+            &call_identity("grid"),
+            3,
+            c2_wire::rpc::CallMode::Unary,
+            ValuePart::whole(ValueStorage::Shm(descriptor)),
+        )
+        .unwrap();
+        let (header, payload) = frame::decode_frame(&frame_bytes).unwrap();
+        assert_eq!(header.flags, flags::FLAG_RPC_RECORD | flags::FLAG_BUDDY);
+        assert!(payload.len() > BUDDY_PAYLOAD_SIZE);
+        let RpcRecord::Open {
+            identity,
+            method_idx,
+            value,
+            ..
+        } = decode_rpc_record(&header, payload, None).unwrap()
+        else {
+            panic!("OPEN");
+        };
+        assert_eq!(identity.route_name, "grid");
+        assert_eq!(method_idx, 3);
+        assert_eq!(value.storage, ValueStorage::Shm(descriptor));
+        assert_eq!(
+            &payload[payload.len() - BUDDY_PAYLOAD_SIZE..],
+            &c2_wire::buddy::encode_buddy_payload(&descriptor)
+        );
     }
 
     #[test]
-    fn test_chunked_frame_encoding() {
-        use c2_wire::chunk::header::encode_chunk_header;
-
-        let ctrl = encode_call_control(&call_identity("grid"), 2).unwrap();
-        let data = [0xABu8; 128];
-        for (idx, count, last) in [(0, 1, true), (0, 3, false), (1, 3, false), (2, 3, true)] {
-            let chunk_header = encode_chunk_header(idx, count);
-            let frame_flags = flags::FLAG_CALL_V2
-                | flags::FLAG_CHUNKED
-                | if last { flags::FLAG_CHUNK_LAST } else { 0 };
-            let encoded = frame::encode_frame_parts(
-                42,
-                frame_flags,
-                &[&chunk_header, if idx == 0 { &ctrl } else { &[] }, &data],
-            );
-            let (header, payload) = frame::decode_frame(&encoded).unwrap();
-            assert_eq!(header.request_id, 42);
-            assert!(header.is_call_v2());
-            assert!(flags::is_chunked(header.flags));
-            assert_eq!(flags::is_chunk_last(header.flags), last);
-            let (actual_idx, actual_count, offset) = decode_chunk_header(payload, 0).unwrap();
-            assert_eq!(
-                (actual_idx, actual_count, offset),
-                (idx, count, CHUNK_HEADER_SIZE)
-            );
-            let control_len = if idx == 0 {
-                let (decoded, consumed) = decode_call_control(payload, offset).unwrap();
-                assert_eq!(decoded.identity.route_name, "grid");
-                assert_eq!(decoded.method_idx, 2);
-                consumed
-            } else {
-                0
-            };
-            assert_eq!(&payload[offset + control_len..], &data);
-        }
+    fn chunked_open_has_one_metadata_record_then_continuation() {
+        let first = encode_open_frame(
+            42,
+            &call_identity("grid"),
+            2,
+            c2_wire::rpc::CallMode::Unary,
+            ValuePart::first(256, ValueStorage::Inline(&[0xab; 128])),
+        )
+        .unwrap();
+        let continuation = encode_value_continuation_frame(
+            42,
+            RpcRecordKind::Open,
+            ValueStorage::Inline(&[0xab; 128]),
+        )
+        .unwrap();
+        let (first_header, first_payload) = frame::decode_frame(&first).unwrap();
+        let (next_header, next_payload) = frame::decode_frame(&continuation).unwrap();
+        assert_eq!(
+            first_header.flags,
+            flags::FLAG_RPC_RECORD | flags::FLAG_CHUNKED | flags::FLAG_FIRST_CHUNK
+        );
+        assert_eq!(
+            next_header.flags,
+            flags::FLAG_RPC_RECORD | flags::FLAG_CHUNKED
+        );
+        assert!(matches!(
+            decode_rpc_record(&first_header, first_payload, None).unwrap(),
+            RpcRecord::Open { .. }
+        ));
+        assert_eq!(
+            next_payload,
+            [&[RpcRecordKind::Open as u8][..], &[0xab; 128]].concat()
+        );
+        assert!(matches!(
+            decode_rpc_record(&next_header, next_payload, None).unwrap(),
+            RpcRecord::OpenContinuation { .. }
+        ));
     }
 
     #[test]
@@ -298,7 +271,10 @@ mod client_tests {
         let chunk_size = cfg.chunk_size as usize;
         let total_chunks = request_chunk_count(600, chunk_size).unwrap();
         assert_eq!(total_chunks, 2); // 600 / 500 = 1.2 -> 2 chunks
-        assert!(request_chunk_count(usize::from(u16::MAX) * chunk_size + 1, chunk_size).is_err());
+        assert_eq!(
+            request_chunk_count(usize::from(u16::MAX) * chunk_size + 1, chunk_size).unwrap(),
+            usize::from(u16::MAX) + 1
+        );
     }
 
     #[test]

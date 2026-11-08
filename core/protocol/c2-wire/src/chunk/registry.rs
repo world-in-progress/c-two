@@ -1,24 +1,23 @@
 //! Sharded chunk registry.
 //!
 //! [`ChunkRegistry`] is a thread-safe, sharded manager for in-flight chunked
-//! reassemblies and settled requests. It wraps [`ChunkAssembler`] instances
-//! with tracking metadata and provides frame admission, one error-reply claim,
-//! reassembly and connection/GC cleanup through the same sharded table.
+//! reassemblies. It wraps [`ChunkAssembler`] instances with tracking metadata
+//! and provides storage admission, reassembly and connection/GC cleanup.
 //!
 //! Admission is finite: `insert` reserves the checked assembly capacity from
 //! the pool's canonical reassembly budget before any storage is allocated,
 //! and the resulting charge stays live — through `finish` (including its
-//! logical trim), queueing as a request/response backing, and held results —
+//! logical trim) and queueing as a request/response backing —
 //! until the [`ReassemblyBacking`](crate::chunk::ReassemblyBacking) carrier
 //! actually releases the storage.
 
 use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
 
-use crate::assembler::ChunkAssembler;
+use crate::assembler::{ChunkAssembler, CopiedChunk, PreparedChunk};
 use c2_mem::MemPool;
 use tracing::warn;
 
@@ -32,64 +31,192 @@ const SHARD_COUNT: usize = 16;
 pub struct GcStats {
     pub expired: usize,
     pub remaining: usize,
+    /// Bytes detached from registry accounting. Copy tokens can retain the
+    /// actual allocation and budget charge after this value is reported.
     pub freed_bytes: u64,
 }
 
-#[derive(Default)]
-struct RequestState {
-    settled: AtomicBool,
-    last_received: AtomicBool,
+#[repr(u8)]
+#[derive(Clone, Copy)]
+enum StorageState {
+    Pending,
+    Reserved,
+    Assembling,
+    Retired,
 }
 
-/// One request's shared error-reply claim. Dispatched frames retain this exact
-/// claim even after its last frame removes the registry entry.
-pub struct ChunkRequest {
+struct RequestState {
+    settled: AtomicBool,
+    expired: AtomicBool,
+    // Storage admission ends at take, GC, abort or settlement. Frame tokens
+    // retain this exact fact even after removal from the shard.
+    storage: AtomicU8,
+    waiters: Mutex<Vec<(Arc<()>, std::task::Waker)>>,
+}
+
+impl Default for RequestState {
+    fn default() -> Self {
+        Self {
+            settled: AtomicBool::new(false),
+            expired: AtomicBool::new(false),
+            storage: AtomicU8::new(StorageState::Pending as u8),
+            waiters: Mutex::new(Vec::new()),
+        }
+    }
+}
+
+/// Original assembly storage and work-cancellation token. Frame tasks retain
+/// this owner after shard removal; the connection call table owns CALL_END.
+pub struct ChunkRequest<C = ()> {
     conn_id: u64,
     request_id: u64,
     state: Arc<RequestState>,
+    entry: Arc<TrackedRequest<C>>,
 }
 
-impl ChunkRequest {
+impl<C> Clone for ChunkRequest<C> {
+    fn clone(&self) -> Self {
+        Self {
+            conn_id: self.conn_id,
+            request_id: self.request_id,
+            state: self.state.clone(),
+            entry: self.entry.clone(),
+        }
+    }
+}
+
+impl<C> ChunkRequest<C> {
     pub fn is_settled(&self) -> bool {
         self.state.settled.load(Ordering::Acquire)
     }
+
+    /// A timeout sweep retired this original input, rather than take/abort.
+    /// The connection call table decides its terminal outcome exactly once.
+    pub fn storage_expired(&self) -> bool {
+        self.state.expired.load(Ordering::Acquire)
+    }
+
+    pub fn storage_retired(&self) -> bool {
+        self.state.storage.load(Ordering::Acquire) == StorageState::Retired as u8
+    }
+
+    /// Wait only for this call's storage publication, using its actual progress.
+    /// Unknown continuations have no reservation to wait for.
+    pub async fn wait_ready(&self) -> bool {
+        let waiter = ReadyWaiter {
+            state: self.state.clone(),
+            key: Arc::new(()),
+        };
+        std::future::poll_fn(|cx| {
+            let mut waiters = waiter.state.waiters.lock();
+            match waiter.state.storage.load(Ordering::Acquire) {
+                state if state == StorageState::Assembling as u8 => std::task::Poll::Ready(true),
+                state if state == StorageState::Reserved as u8 => {
+                    if let Some((_, waker)) = waiters
+                        .iter_mut()
+                        .find(|(key, _)| Arc::ptr_eq(key, &waiter.key))
+                    {
+                        waker.clone_from(cx.waker());
+                    } else {
+                        waiters.push((waiter.key.clone(), cx.waker().clone()));
+                    }
+                    std::task::Poll::Pending
+                }
+                _ => std::task::Poll::Ready(false),
+            }
+        })
+        .await
+    }
 }
 
-/// One request's pending, assembling or settled state. Empty entries retain no
-/// backing or context and consume none of the reassembly or chunk allowance.
-struct TrackedRequest<C> {
-    // Storage and its charge are released before the associated admission.
+impl RequestState {
+    fn notify_ready(&self) {
+        let waiters = std::mem::take(&mut *self.waiters.lock());
+        for (_, waker) in waiters {
+            waker.wake();
+        }
+    }
+}
+
+struct ReadyWaiter {
+    state: Arc<RequestState>,
+    key: Arc<()>,
+}
+
+impl Drop for ReadyWaiter {
+    fn drop(&mut self) {
+        self.state
+            .waiters
+            .lock()
+            .retain(|(key, _)| !Arc::ptr_eq(key, &self.key));
+    }
+}
+
+#[derive(Default)]
+struct RegistryAccounting {
+    active_count: AtomicUsize,
+    total_bytes: AtomicU64,
+}
+
+struct RequestContents<C> {
+    // Field order also releases storage before admission on final registry drop.
     inner: Option<ChunkAssembler>,
     context: Option<C>,
-    request: Arc<RequestState>,
     last_activity: Instant,
+    // Only input preparation has an assembler deadline. An active reply waits
+    // for its real terminal delivery or connection end, even under pressure.
+    can_expire: bool,
     total_bytes: u64,
+    accounting: Arc<RegistryAccounting>,
+}
+
+// The last real call owner may outlive its shard entry during a copy.
+// Storage is destroyed before the admission token and the call slot.
+impl<C> Drop for RequestContents<C> {
+    fn drop(&mut self) {
+        if let Some(inner) = self.inner.take() {
+            self.accounting.active_count.fetch_sub(1, Ordering::Relaxed);
+            self.accounting
+                .total_bytes
+                .fetch_sub(self.total_bytes, Ordering::Relaxed);
+            drop(inner);
+        }
+        drop(self.context.take());
+    }
+}
+
+/// The shard owns a reference to this entry, never its payload borrow. All
+/// storage transitions use `contents`; no caller waits for it under a shard.
+struct TrackedRequest<C> {
+    contents: Mutex<RequestContents<C>>,
+    request: Arc<RequestState>,
 }
 
 impl<C> TrackedRequest<C> {
-    fn pending(request: Arc<RequestState>) -> Self {
+    fn pending(accounting: Arc<RegistryAccounting>, can_expire: bool) -> Self {
         Self {
-            inner: None,
-            context: None,
-            request,
-            last_activity: Instant::now(),
-            total_bytes: 0,
+            contents: Mutex::new(RequestContents {
+                inner: None,
+                context: None,
+                last_activity: Instant::now(),
+                can_expire,
+                total_bytes: 0,
+                accounting,
+            }),
+            request: Arc::new(RequestState::default()),
         }
-    }
-
-    fn has_unsettled_frames(&self) -> bool {
-        !self.request.settled.load(Ordering::Acquire) && Arc::strong_count(&self.request) > 1
     }
 }
 
+type Shard<C> = Mutex<HashMap<(u64, u64), Arc<TrackedRequest<C>>>>;
+
 /// Sharded chunk reassembly lifecycle manager.
 pub struct ChunkRegistry<C> {
-    shards: [Mutex<HashMap<(u64, u64), TrackedRequest<C>>>; SHARD_COUNT],
+    shards: [Shard<C>; SHARD_COUNT],
     pool: Arc<RwLock<MemPool>>,
     config: ChunkConfig,
-    active_count: AtomicUsize,
-    total_bytes: AtomicU64,
-    // A completed full sweep proves no entry can expire before this time.
+    accounting: Arc<RegistryAccounting>,
+    // A sweep without skipped borrows proves no entry expires before this time.
     gc_not_before: Mutex<Option<Instant>>,
     #[cfg(test)]
     admission_probe: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
@@ -98,17 +225,13 @@ pub struct ChunkRegistry<C> {
 }
 
 impl<C> ChunkRegistry<C> {
-    /// Create a new registry backed by `pool` with the given `config`.
-    ///
-    /// The pool's [`MemPool::budget`] reassembly cell is the canonical
-    /// admission authority for this registry.
+    /// Create a registry using the pool's canonical reassembly budget.
     pub fn new(pool: Arc<RwLock<MemPool>>, config: ChunkConfig) -> Self {
         Self {
             shards: std::array::from_fn(|_| Mutex::new(HashMap::new())),
             pool,
             config,
-            active_count: AtomicUsize::new(0),
-            total_bytes: AtomicU64::new(0),
+            accounting: Arc::new(RegistryAccounting::default()),
             gc_not_before: Mutex::new(None),
             #[cfg(test)]
             admission_probe: Mutex::new(None),
@@ -117,115 +240,260 @@ impl<C> ChunkRegistry<C> {
         }
     }
 
-    fn shard(&self, conn_id: u64) -> &Mutex<HashMap<(u64, u64), TrackedRequest<C>>> {
+    fn shard(&self, conn_id: u64) -> &Shard<C> {
         &self.shards[conn_id as usize % SHARD_COUNT]
     }
 
-    /// Number of in-flight assemblies.
+    fn lookup(&self, conn_id: u64, request_id: u64) -> Option<Arc<TrackedRequest<C>>> {
+        self.shard(conn_id)
+            .lock()
+            .get(&(conn_id, request_id))
+            .cloned()
+    }
+
+    fn admission_entry(
+        &self,
+        conn_id: u64,
+        request_id: u64,
+        request: Option<&ChunkRequest<C>>,
+        can_expire: bool,
+    ) -> Option<Arc<TrackedRequest<C>>> {
+        let mut shard = self.shard(conn_id).lock();
+        if let Some(request) = request {
+            // A frame token can only use the record that minted it. Check
+            // its original outcome before any Pending record can be created.
+            if request.is_settled()
+                || request.state.storage.load(Ordering::Acquire) == StorageState::Retired as u8
+            {
+                return None;
+            }
+            shard
+                .get(&(conn_id, request_id))
+                .filter(|entry| Arc::ptr_eq(&request.state, &entry.request))
+                .cloned()
+        } else {
+            Some(
+                shard
+                    .entry((conn_id, request_id))
+                    .or_insert_with(|| {
+                        Arc::new(TrackedRequest::pending(self.accounting.clone(), can_expire))
+                    })
+                    .clone(),
+            )
+        }
+    }
+
+    // Every remover owns `entry` while removing the shard's reference. Even
+    // its final payload/context destructors therefore run after both guards.
+    fn remove(&self, key: (u64, u64), entry: &Arc<TrackedRequest<C>>) {
+        let mut shard = self.shard(key.0).lock();
+        if shard
+            .get(&key)
+            .is_some_and(|current| Arc::ptr_eq(current, entry))
+        {
+            shard.remove(&key);
+        }
+    }
+
+    // Rejected admission removes only the original entry. Already dispatched
+    // frames keep their Arc owner without a historical shard marker.
+    fn remove_if_unobserved(&self, key: (u64, u64), entry: &Arc<TrackedRequest<C>>) {
+        let mut shard = self.shard(key.0).lock();
+        if shard
+            .get(&key)
+            .is_some_and(|current| Arc::ptr_eq(current, entry))
+        {
+            entry
+                .request
+                .storage
+                .store(StorageState::Retired as u8, Ordering::Release);
+            shard.remove(&key);
+        }
+    }
+
+    fn detach(
+        &self,
+        contents: &mut RequestContents<C>,
+    ) -> (Option<ChunkAssembler>, Option<C>, u64) {
+        let inner = contents.inner.take();
+        let context = contents.context.take();
+        let bytes = std::mem::take(&mut contents.total_bytes);
+        if inner.is_some() {
+            self.accounting.active_count.fetch_sub(1, Ordering::Relaxed);
+            self.accounting
+                .total_bytes
+                .fetch_sub(bytes, Ordering::Relaxed);
+        }
+        (inner, context, bytes)
+    }
+
+    /// Number of in-flight assemblies, excluding transferred finished owners.
     pub fn active_count(&self) -> usize {
-        self.active_count.load(Ordering::Relaxed)
+        self.accounting.active_count.load(Ordering::Relaxed)
     }
-
-    /// Total bytes allocated for in-flight assemblies.
+    /// Payload and tracking capacity currently owned by registry entries.
+    /// Finished backing reservations remain charged independently.
     pub fn total_bytes(&self) -> u64 {
-        self.total_bytes.load(Ordering::Relaxed)
+        self.accounting.total_bytes.load(Ordering::Relaxed)
     }
-
     /// Borrow the chunk configuration.
     pub fn config(&self) -> &ChunkConfig {
         &self.config
     }
-
-    /// Borrow the shared pool.
+    /// Borrow the admission pool; live backing owners are independent of it.
     pub fn pool(&self) -> &Arc<RwLock<MemPool>> {
         &self.pool
     }
 
-    /// Whether an assembly exists for `(conn_id, request_id)`.
+    /// Whether this key still owns an in-flight assembly.
     pub fn contains(&self, conn_id: u64, request_id: u64) -> bool {
-        self.shard(conn_id)
-            .lock()
-            .get(&(conn_id, request_id))
-            .is_some_and(|entry| entry.inner.is_some())
+        self.lookup(conn_id, request_id).is_some_and(|entry| {
+            entry.request.storage.load(Ordering::Acquire) == StorageState::Assembling as u8
+        })
     }
 
-    /// Observe a frame before dispatch, including before first-chunk admission.
-    /// A settled request's last frame removes its marker without refreshing its
-    /// settlement time. The returned token still suppresses old task replies.
-    pub fn begin_frame(&self, conn_id: u64, request_id: u64, last: bool) -> ChunkRequest {
-        let mut shard = self.shard(conn_id).lock();
-        let key = (conn_id, request_id);
-        let entry = shard
-            .entry(key)
-            .or_insert_with(|| TrackedRequest::pending(Arc::new(RequestState::default())));
-        if last {
-            entry.request.last_received.store(true, Ordering::Release);
-        }
-        let request = ChunkRequest {
-            conn_id,
-            request_id,
-            state: entry.request.clone(),
+    /// An admission token exists before allocation and remains authoritative
+    /// while its call drains after connection deactivation.
+    pub fn has_admission(&self, conn_id: u64, request_id: u64) -> bool {
+        self.lookup(conn_id, request_id).is_some_and(|entry| {
+            matches!(entry.request.storage.load(Ordering::Acquire), state if state == StorageState::Reserved as u8 || state == StorageState::Assembling as u8)
+        })
+    }
+
+    /// Observe a frame before dispatch. The connection call table owns the
+    /// request's terminal outcome; this token pins only original storage.
+    pub fn begin_frame(&self, conn_id: u64, request_id: u64) -> ChunkRequest<C> {
+        let (entry, request) = {
+            let mut shard = self.shard(conn_id).lock();
+            let entry = shard
+                .entry((conn_id, request_id))
+                .or_insert_with(|| Arc::new(TrackedRequest::pending(self.accounting.clone(), true)))
+                .clone();
+            let request = ChunkRequest {
+                conn_id,
+                request_id,
+                state: entry.request.clone(),
+                entry: entry.clone(),
+            };
+            (entry, request)
         };
-        if request.is_settled() && last {
-            shard.remove(&key);
-        }
+        let _ = entry;
         request
     }
 
     pub fn is_settled(&self, conn_id: u64, request_id: u64) -> bool {
-        self.shard(conn_id)
-            .lock()
-            .get(&(conn_id, request_id))
+        self.lookup(conn_id, request_id)
             .is_some_and(|entry| entry.request.settled.load(Ordering::Acquire))
     }
 
-    /// Claim the request's one error reply and release any assembly. The
-    /// admission fence is acquired only after claiming the shared outcome,
-    /// under the shard lock; it must not re-enter the registry. Its guard stays
-    /// alive until backing and context release have finished outside the lock.
-    pub fn settle<F>(&self, request: &ChunkRequest, fence: impl FnOnce() -> F) -> bool {
-        let (removed, fence) = {
-            let mut shard = self.shard(request.conn_id).lock();
-            let key = (request.conn_id, request.request_id);
-            if request
-                .state
-                .settled
-                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                .is_err()
-            {
-                return false;
-            }
-            let fence = fence();
-            let removed = shard.get_mut(&key).map(|entry| {
-                let removed = (entry.inner.take(), entry.context.take());
-                if removed.0.is_some() {
-                    self.active_count.fetch_sub(1, Ordering::Relaxed);
-                    self.total_bytes
-                        .fetch_sub(entry.total_bytes, Ordering::Relaxed);
-                    entry.total_bytes = 0;
-                }
-                entry.last_activity = Instant::now();
-                removed
-            });
-            if request.state.last_received.load(Ordering::Acquire) {
-                shard.remove(&key);
-            }
-            (removed, fence)
-        };
-        drop(removed);
-        drop(fence);
+    /// Stop work on this original assembly without waiting for allocation/copy.
+    /// Active tasks retain its real storage; CALL_END is claimed separately.
+    pub fn settle(&self, request: &ChunkRequest<C>) -> bool {
+        if request
+            .state
+            .settled
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return false;
+        }
+        self.retire_request(request);
         true
     }
 
-    /// Begin a new chunked reassembly for `(conn_id, request_id)`.
-    ///
-    /// Admission order: soft-limit GC sweep (advisory only), per-message
-    /// limit and geometry checks, reassembly budget reservation for the
-    /// checked payload and chunk-tracking capacity, then allocation. A
-    /// budget rejection returns the cell/size error and creates no mapping.
-    ///
-    /// The context is published with the assembly; rejection returns it so the
-    /// caller retains control of its lifetime.
+    fn retire_request(&self, request: &ChunkRequest<C>) {
+        request
+            .state
+            .storage
+            .store(StorageState::Retired as u8, Ordering::Release);
+        request.state.notify_ready();
+        let removed = {
+            let mut shard = self.shard(request.conn_id).lock();
+            let key = (request.conn_id, request.request_id);
+            if shard
+                .get(&key)
+                .is_some_and(|entry| Arc::ptr_eq(&entry.request, &request.state))
+            {
+                shard.remove(&key)
+            } else {
+                None
+            }
+        };
+        drop(removed);
+        // A busy borrow observes Retired before leaving and releases the same
+        // contents outside its lock. No reader waits behind payload work.
+        let detached = request
+            .entry
+            .contents
+            .try_lock()
+            .map(|mut contents| self.detach(&mut contents));
+        drop(detached);
+    }
+
+    /// Publish the call's admission token before submitting allocation/copy.
+    /// Only the first frame can change Pending to Reserved.
+    pub fn prepare_request(
+        &self,
+        request: &ChunkRequest<C>,
+        context: C,
+    ) -> Result<(), (ChunkAdmissionError, C)> {
+        if request
+            .state
+            .storage
+            .compare_exchange(
+                StorageState::Pending as u8,
+                StorageState::Reserved as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return Err((
+                ChunkAdmissionError::Duplicate {
+                    conn_id: request.conn_id,
+                    request_id: request.request_id,
+                },
+                context,
+            ));
+        }
+        // Reserved cannot yet have an allocator or a payload borrow.
+        let mut contents = request.entry.contents.lock();
+        if request.state.storage.load(Ordering::Acquire) != StorageState::Reserved as u8 {
+            return Err((
+                ChunkAdmissionError::Duplicate {
+                    conn_id: request.conn_id,
+                    request_id: request.request_id,
+                },
+                context,
+            ));
+        }
+        contents.context = Some(context);
+        contents.last_activity = Instant::now();
+        Ok(())
+    }
+
+    /// Allocate only for this already-published call record.
+    pub fn allocate_request(
+        &self,
+        request: &ChunkRequest<C>,
+        total_chunks: usize,
+        chunk_size: usize,
+    ) -> Result<(), ChunkAdmissionError> {
+        self.insert_tracked(
+            request.conn_id,
+            request.request_id,
+            Some(request),
+            total_chunks,
+            chunk_size,
+            None,
+            true,
+        )
+        .map_err(|(error, _)| error)
+    }
+
+    /// Admit storage and its context together. Geometry and the per-message
+    /// limit precede reservation; the budget covers full payload capacity and
+    /// tracking flags. Rejection returns the caller's context unconsumed.
     pub fn insert(
         &self,
         conn_id: u64,
@@ -234,14 +502,22 @@ impl<C> ChunkRegistry<C> {
         chunk_size: usize,
         context: C,
     ) -> Result<(), (ChunkAdmissionError, C)> {
-        self.insert_tracked(conn_id, request_id, None, total_chunks, chunk_size, context)
+        self.insert_tracked(
+            conn_id,
+            request_id,
+            None,
+            total_chunks,
+            chunk_size,
+            Some(context),
+            true,
+        )
+        .map_err(|(error, context)| (error, context.unwrap()))
     }
 
-    /// First-chunk admission rechecks the shared outcome under the shard lock:
-    /// a concurrent refusal may have already removed the last-frame marker.
+    /// Admit only through this frame's original, still-active request state.
     pub fn insert_request(
         &self,
-        request: &ChunkRequest,
+        request: &ChunkRequest<C>,
         total_chunks: usize,
         chunk_size: usize,
         context: C,
@@ -252,21 +528,28 @@ impl<C> ChunkRegistry<C> {
             Some(request),
             total_chunks,
             chunk_size,
-            context,
+            Some(context),
+            true,
         )
+        .map_err(|(error, context)| (error, context.unwrap()))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn insert_tracked(
         &self,
         conn_id: u64,
         request_id: u64,
-        request: Option<&ChunkRequest>,
+        request: Option<&ChunkRequest<C>>,
         total_chunks: usize,
         chunk_size: usize,
-        context: C,
-    ) -> Result<(), (ChunkAdmissionError, C)> {
-        // Soft-limit check: GC sweep first, then warn but never reject. The
-        // hard admission bound is the reassembly budget cell.
+        mut context: Option<C>,
+        can_expire: bool,
+    ) -> Result<(), (ChunkAdmissionError, Option<C>)> {
+        let expected = if context.is_some() {
+            StorageState::Pending
+        } else {
+            StorageState::Reserved
+        };
         if self.active_count() >= self.config.soft_limit as usize
             || self.total_bytes() >= self.config.max_reassembly_bytes
         {
@@ -281,16 +564,20 @@ impl<C> ChunkRegistry<C> {
                 );
             }
         }
-
+        let mut geometry = None;
         loop {
-            // A live duplicate is rejected before any reservation. Pool contention
-            // must never make us hold this shard while blocking for a write guard:
-            // a finished carrier can hold a pool read guard and call contains().
-            let mut shard = self.shard(conn_id).lock();
-            if request.is_some_and(ChunkRequest::is_settled)
-                || shard.get(&(conn_id, request_id)).is_some_and(|entry| {
-                    entry.inner.is_some() || entry.request.settled.load(Ordering::Acquire)
-                })
+            let Some(entry) = self.admission_entry(conn_id, request_id, request, can_expire) else {
+                return Err((
+                    ChunkAdmissionError::Duplicate {
+                        conn_id,
+                        request_id,
+                    },
+                    context,
+                ));
+            };
+            let mut contents = entry.contents.lock();
+            if entry.request.settled.load(Ordering::Acquire)
+                || entry.request.storage.load(Ordering::Acquire) != expected as u8
             {
                 return Err((
                     ChunkAdmissionError::Duplicate {
@@ -300,70 +587,104 @@ impl<C> ChunkRegistry<C> {
                     context,
                 ));
             }
-
             #[cfg(test)]
             if let Some(probe) = self.admission_probe.lock().clone() {
                 probe();
             }
-
-            let geometry = match ChunkAssembler::check_geometry(
-                total_chunks,
-                chunk_size,
-                self.config.max_reassembly_bytes,
-            ) {
-                Ok(geometry) => geometry,
-                Err(error) => return Err((error, context)),
-            };
+            if geometry.is_none() {
+                geometry = Some(
+                    match ChunkAssembler::check_geometry(
+                        total_chunks,
+                        chunk_size,
+                        self.config.max_reassembly_bytes,
+                    ) {
+                        Ok(geometry) => geometry,
+                        Err(error) => {
+                            self.remove_if_unobserved((conn_id, request_id), &entry);
+                            return Err((error, context));
+                        }
+                    },
+                );
+            }
             let Some(pool_guard) = self.pool.try_write() else {
-                drop(shard);
+                drop(contents);
                 #[cfg(test)]
                 if let Some(probe) = self.admission_wait_probe.lock().clone() {
                     probe();
                 }
-                // Wait outside the shard and release the pool guard before retry.
-                // Never acquire a blocking shard with a pool guard held: feed has
-                // the existing shard -> pool-read order. Retry rechecks key/GC
-                // state under the shard rather than trusting an old snapshot.
+                // Neither entry nor shard is held while waiting for the pool.
+                // Retry uses the current entry and its original outcome.
                 drop(self.pool.write());
                 continue;
             };
-            // Both guards belong to this attempt. The constructor consumes the
-            // pool guard without reacquiring it; reserve/allocate/publish remains
-            // one atomic shard decision when the pool is available.
             let assembler = match ChunkAssembler::new_with_guard(
                 Arc::clone(&self.pool),
                 pool_guard,
-                geometry,
+                geometry.take().expect("geometry checked at admission"),
             ) {
                 Ok(assembler) => assembler,
-                Err(error) => return Err((error, context)),
+                Err(error) => {
+                    self.remove_if_unobserved((conn_id, request_id), &entry);
+                    return Err((error, context));
+                }
             };
-            let alloc_bytes = assembler.capacity_bytes();
-
-            let now = Instant::now();
-            let tracked = TrackedRequest {
-                inner: Some(assembler),
-                context: Some(context),
-                request: shard
-                    .get(&(conn_id, request_id))
-                    .map(|entry| entry.request.clone())
-                    .unwrap_or_default(),
-                last_activity: now,
-                total_bytes: alloc_bytes,
-            };
-
-            // Publish and move counters under the same decision lock.
-            shard.insert((conn_id, request_id), tracked);
-            self.active_count.fetch_add(1, Ordering::Relaxed);
-            self.total_bytes.fetch_add(alloc_bytes, Ordering::Relaxed);
-            drop(shard);
+            let bytes = assembler.capacity_bytes();
+            contents.inner = Some(assembler);
+            contents.total_bytes = bytes;
+            contents.last_activity = Instant::now();
+            self.accounting.active_count.fetch_add(1, Ordering::Relaxed);
+            self.accounting
+                .total_bytes
+                .fetch_add(bytes, Ordering::Relaxed);
+            if entry
+                .request
+                .storage
+                .compare_exchange(
+                    expected as u8,
+                    StorageState::Assembling as u8,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_err()
+            {
+                let removed = self.detach(&mut contents);
+                drop(contents);
+                drop(removed);
+                return Err((
+                    ChunkAdmissionError::Duplicate {
+                        conn_id,
+                        request_id,
+                    },
+                    context,
+                ));
+            }
+            if let Some(context) = context.take() {
+                contents.context = Some(context);
+            }
+            if entry.request.storage.load(Ordering::Acquire) == StorageState::Retired as u8 {
+                let (inner, returned_context, _) = self.detach(&mut contents);
+                drop(contents);
+                drop(inner);
+                return Err((
+                    ChunkAdmissionError::Duplicate {
+                        conn_id,
+                        request_id,
+                    },
+                    if matches!(expected, StorageState::Reserved) {
+                        drop(returned_context);
+                        None
+                    } else {
+                        returned_context
+                    },
+                ));
+            }
+            drop(contents);
+            entry.request.notify_ready();
             return Ok(());
         }
     }
 
-    /// Feed a data chunk into an existing assembly.
-    ///
-    /// Returns `Ok(true)` when all chunks have been received.
+    /// Copy under this entry's exclusive borrow, after leaving the shard.
     pub fn feed(
         &self,
         conn_id: u64,
@@ -371,200 +692,319 @@ impl<C> ChunkRegistry<C> {
         chunk_idx: usize,
         data: &[u8],
     ) -> Result<bool, String> {
-        let mut shard = self.shard(conn_id).lock();
-        let tracked = shard
-            .get_mut(&(conn_id, request_id))
+        let entry = self
+            .lookup(conn_id, request_id)
             .ok_or_else(|| format!("no assembly for ({conn_id}, {request_id})"))?;
-
-        let complete = tracked
-            .inner
-            .as_mut()
-            .ok_or_else(|| format!("no assembly for ({conn_id}, {request_id})"))?
-            .feed_chunk(chunk_idx, data)?;
-        tracked.last_activity = Instant::now();
-        Ok(complete)
+        let request = ChunkRequest {
+            conn_id,
+            request_id,
+            state: entry.request.clone(),
+            entry,
+        };
+        self.feed_request(&request, chunk_idx, data)
     }
 
-    /// Remove an assembly and its context together, outside the shard lock.
-    ///
-    /// The caller owns both even when `ChunkAssembler::finish` fails, allowing
-    /// an admission context to remain live through an error reply. Registry
-    /// counters end here; the backing keeps its full capacity charged through
-    /// finish/trim until storage release, including file-spill storage.
+    /// Borrow the original call's reassembly while obtaining/copying a frame's
+    /// source data. Terminal cleanup keeps both storage and admission through
+    /// this real read interval and destroys them after leaving the borrow.
+    pub fn with_request<R>(
+        &self,
+        request: &ChunkRequest<C>,
+        f: impl FnOnce(&mut ChunkAssembler) -> R,
+    ) -> Result<R, String> {
+        self.with_entry(
+            &request.entry,
+            request.conn_id,
+            request.request_id,
+            |inner| Ok(f(inner)),
+        )
+    }
+
+    pub fn feed_request(
+        &self,
+        request: &ChunkRequest<C>,
+        chunk_idx: usize,
+        data: &[u8],
+    ) -> Result<bool, String> {
+        let prepared = self.prepare_chunk(request, chunk_idx, data.len())?;
+        let copied = prepared.copy_from(data)?;
+        self.commit_chunk(request, copied)
+    }
+
+    /// Mint a range token under the original entry lock, then copy outside it.
+    pub fn prepare_chunk(
+        &self,
+        request: &ChunkRequest<C>,
+        chunk_idx: usize,
+        len: usize,
+    ) -> Result<PreparedChunk, String> {
+        self.with_entry(
+            &request.entry,
+            request.conn_id,
+            request.request_id,
+            |inner| inner.prepare_chunk(chunk_idx, len),
+        )
+    }
+
+    /// Commit a completed copy to the original entry. GC may already have
+    /// retired it; the copied token still pinned backing until this call.
+    pub fn commit_chunk(
+        &self,
+        request: &ChunkRequest<C>,
+        copied: CopiedChunk,
+    ) -> Result<bool, String> {
+        self.with_entry(
+            &request.entry,
+            request.conn_id,
+            request.request_id,
+            |inner| inner.commit_chunk(copied),
+        )
+    }
+
+    #[cfg(test)]
+    fn with_assembly<R>(
+        &self,
+        conn_id: u64,
+        request_id: u64,
+        f: impl FnOnce(&mut ChunkAssembler) -> Result<R, String>,
+    ) -> Result<R, String> {
+        let entry = self
+            .lookup(conn_id, request_id)
+            .ok_or_else(|| format!("no assembly for ({conn_id}, {request_id})"))?;
+        self.with_entry(&entry, conn_id, request_id, f)
+    }
+
+    fn with_entry<R>(
+        &self,
+        entry: &Arc<TrackedRequest<C>>,
+        conn_id: u64,
+        request_id: u64,
+        f: impl FnOnce(&mut ChunkAssembler) -> Result<R, String>,
+    ) -> Result<R, String> {
+        let missing = || format!("no assembly for ({conn_id}, {request_id})");
+        let mut contents = entry.contents.lock();
+        if entry.request.storage.load(Ordering::Acquire) != StorageState::Assembling as u8 {
+            return Err(missing());
+        }
+        let result = f(contents.inner.as_mut().ok_or_else(missing)?);
+        contents.last_activity = Instant::now();
+        if entry.request.storage.load(Ordering::Acquire) == StorageState::Retired as u8 {
+            let removed = self.detach(&mut contents);
+            drop(contents);
+            drop(removed);
+            return Err(missing());
+        }
+        result
+    }
+
+    /// Transfer storage and admission together. It waits only for this entry's
+    /// current payload borrow, never under a shard or public pool lock.
     pub fn take(&self, conn_id: u64, request_id: u64) -> Result<(ChunkAssembler, C), String> {
-        let tracked = {
-            let mut shard = self.shard(conn_id).lock();
-            if !shard
-                .get(&(conn_id, request_id))
-                .is_some_and(|entry| entry.inner.is_some())
-            {
-                return Err(format!("no assembly for ({conn_id}, {request_id})"));
-            }
-            let tracked = shard.remove(&(conn_id, request_id)).unwrap();
-            self.active_count.fetch_sub(1, Ordering::Relaxed);
-            self.total_bytes
-                .fetch_sub(tracked.total_bytes, Ordering::Relaxed);
-            tracked
-        };
-        Ok((tracked.inner.unwrap(), tracked.context.unwrap()))
+        let missing = || format!("no assembly for ({conn_id}, {request_id})");
+        let entry = self.lookup(conn_id, request_id).ok_or_else(missing)?;
+        self.take_entry(&entry, conn_id, request_id, false)
     }
 
-    /// Abort an in-flight assembly, releasing all resources.
-    ///
+    pub fn take_request(&self, request: &ChunkRequest<C>) -> Result<(ChunkAssembler, C), String> {
+        self.take_entry(&request.entry, request.conn_id, request.request_id, true)
+    }
+
+    fn take_entry(
+        &self,
+        entry: &Arc<TrackedRequest<C>>,
+        conn_id: u64,
+        request_id: u64,
+        stop_work: bool,
+    ) -> Result<(ChunkAssembler, C), String> {
+        let missing = || format!("no assembly for ({conn_id}, {request_id})");
+        let mut contents = entry.contents.lock();
+        if contents.inner.is_none()
+            || entry.request.storage.load(Ordering::Acquire) != StorageState::Assembling as u8
+            || entry.request.settled.load(Ordering::Acquire)
+        {
+            return Err(missing());
+        }
+        if stop_work
+            && entry
+                .request
+                .settled
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+        {
+            return Err(missing());
+        }
+        if entry
+            .request
+            .storage
+            .compare_exchange(
+                StorageState::Assembling as u8,
+                StorageState::Retired as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return Err(missing());
+        }
+        entry.request.notify_ready();
+        let (inner, context, _) = self.detach(&mut contents);
+        self.remove((conn_id, request_id), &entry);
+        drop(contents);
+        Ok((inner.unwrap(), context.unwrap()))
+    }
+
+    /// Retire this exact key; existing copy tasks retain its original owners.
     pub fn abort(&self, conn_id: u64, request_id: u64) {
-        let removed = {
-            let mut shard = self.shard(conn_id).lock();
-            match shard.remove(&(conn_id, request_id)) {
-                Some(tracked) => {
-                    if tracked.inner.is_some() {
-                        self.active_count.fetch_sub(1, Ordering::Relaxed);
-                        self.total_bytes
-                            .fetch_sub(tracked.total_bytes, Ordering::Relaxed);
-                    }
-                    Some(tracked)
-                }
-                None => None,
-            }
-        };
-        // Backing release and charge refund happen on drop, outside the shard
-        // lock.
-        drop(removed);
+        if let Some(entry) = self.lookup(conn_id, request_id) {
+            let request = ChunkRequest {
+                conn_id,
+                request_id,
+                state: entry.request.clone(),
+                entry,
+            };
+            self.retire_request(&request);
+        }
     }
 
-    /// Sweep expired assemblies across all shards.
+    /// Sweep expired storage without waiting for payload borrows. Frame tasks
+    /// retain original storage; skipped borrows invalidate the expiry proof.
     pub fn gc_sweep(&self) -> GcStats {
+        self.gc_sweep_expired().0
+    }
+
+    /// Sweep storage and return its exact original expired assembly tokens.
+    pub fn gc_sweep_expired(&self) -> (GcStats, Vec<ChunkRequest<C>>) {
         let mut stats = GcStats::default();
-        let timeout = self.config.assembler_timeout;
+        let mut expired = Vec::new();
         let now = Instant::now();
         let mut oldest_live = now;
-
-        for shard_mutex in &self.shards {
-            let mut removed = Vec::new();
-            let remaining;
-            {
-                let mut shard = shard_mutex.lock();
-                let expired_keys: Vec<(u64, u64)> = shard
-                    .iter()
-                    .filter(|(_, tracked)| {
-                        if now.duration_since(tracked.last_activity) >= timeout {
-                            true
-                        } else {
-                            oldest_live = oldest_live.min(tracked.last_activity);
-                            false
-                        }
-                    })
-                    .map(|(key, _)| *key)
-                    .collect();
-                for key in expired_keys {
-                    if let Some(tracked) = shard.get_mut(&key) {
-                        // Counters move with the entry removal, under the
-                        // same shard lock.
-                        if tracked.inner.is_some() {
-                            self.active_count.fetch_sub(1, Ordering::Relaxed);
-                            self.total_bytes
-                                .fetch_sub(tracked.total_bytes, Ordering::Relaxed);
-                            stats.expired += 1;
-                            stats.freed_bytes += tracked.total_bytes;
-                            tracked.total_bytes = 0;
-                        }
-                        removed.push((tracked.inner.take(), tracked.context.take()));
-                        // A frame already dispatched must retain its exact
-                        // reply claim if GC removes its assembly underneath it.
-                        // With no frame tasks, GC removes the entire request as
-                        // before: a later continuation then fails its own feed.
-                        if !tracked.has_unsettled_frames() {
-                            shard.remove(&key);
-                        }
-                    }
-                }
-                remaining = shard.values().filter(|entry| entry.inner.is_some()).count();
-            }
-            stats.remaining += remaining;
-            // Backing release and charge refund happen on drop, outside the
-            // shard lock.
-            drop(removed);
-        }
-        // Feed only moves activity forward; new entries in an already scanned
-        // shard cannot predate `now`. Publish after every shard and context Drop,
-        // without holding this lock across either. An older proof is still safe.
-        *self.gc_not_before.lock() = oldest_live.checked_add(timeout);
-        stats
-    }
-
-    /// Remove all in-flight assemblies for a specific connection.
-    ///
-    /// Called when a connection disconnects to prevent orphaned assemblies.
-    /// Only accesses the single shard for `conn_id` (O(shard_size) scan).
-    pub fn cleanup_connection(&self, conn_id: u64) {
-        let mut removed = Vec::new();
-        {
-            let mut shard = self.shard(conn_id).lock();
-            let conn_keys: Vec<(u64, u64)> = shard
-                .keys()
-                .filter(|(cid, _)| *cid == conn_id)
-                .copied()
+        let mut skipped_borrow = false;
+        for shard in &self.shards {
+            let entries: Vec<_> = shard
+                .lock()
+                .iter()
+                .map(|(key, entry)| (*key, entry.clone()))
                 .collect();
-            for key in conn_keys {
-                if let Some(tracked) = shard.remove(&key) {
-                    if tracked.inner.is_some() {
-                        self.active_count.fetch_sub(1, Ordering::Relaxed);
-                        self.total_bytes
-                            .fetch_sub(tracked.total_bytes, Ordering::Relaxed);
+            for (key, entry) in entries {
+                let removed = {
+                    let Some(mut contents) = entry.contents.try_lock() else {
+                        skipped_borrow = true;
+                        continue;
+                    };
+                    if !contents.can_expire {
+                        continue;
                     }
-                    removed.push(tracked);
-                }
+                    if now.saturating_duration_since(contents.last_activity)
+                        < self.config.assembler_timeout
+                    {
+                        oldest_live = oldest_live.min(contents.last_activity);
+                        continue;
+                    }
+                    if contents.inner.is_some() || contents.context.is_some() {
+                        entry.request.expired.store(true, Ordering::Release);
+                    }
+                    entry
+                        .request
+                        .storage
+                        .store(StorageState::Retired as u8, Ordering::Release);
+                    entry.request.notify_ready();
+                    let removed = self.detach(&mut contents);
+                    if removed.0.is_some() {
+                        stats.expired += 1;
+                        stats.freed_bytes += removed.2;
+                        expired.push(ChunkRequest {
+                            conn_id: key.0,
+                            request_id: key.1,
+                            state: entry.request.clone(),
+                            entry: entry.clone(),
+                        });
+                    }
+                    self.remove_if_unobserved(key, &entry);
+                    removed
+                };
+                drop(removed);
             }
         }
-        // Backing release and charge refund happen on drop, outside the shard
-        // lock.
-        drop(removed);
+        stats.remaining = self.active_count();
+        *self.gc_not_before.lock() = if skipped_borrow {
+            // Its last activity is unknown: the next pressure admission may
+            // need to collect this entry as soon as the borrow ends.
+            None
+        } else {
+            oldest_live.checked_add(self.config.assembler_timeout)
+        };
+        (stats, expired)
     }
 
-    /// Nonblocking connection teardown. Busy releases retain the complete
-    /// assembler until its local pool lock is available.
-    /// Finished carriers are independent.
+    /// Retire the original assembly tokens for this connection.
+    pub fn cleanup_connection(&self, conn_id: u64) {
+        let entries: Vec<_> = self
+            .shard(conn_id)
+            .lock()
+            .iter()
+            .filter(|(key, _)| key.0 == conn_id)
+            .map(|(key, entry)| (*key, entry.clone()))
+            .collect();
+        for ((_, request_id), entry) in entries {
+            let request = ChunkRequest {
+                conn_id,
+                request_id,
+                state: entry.request.clone(),
+                entry,
+            };
+            request.state.settled.store(true, Ordering::Release);
+            self.retire_request(&request);
+        }
+    }
+
+    /// Skip busy entry borrows or shards, retaining their complete owner.
     pub fn try_cleanup_connection(&self, conn_id: u64) -> bool {
         self.try_drain_shard(
             self.shard(conn_id),
-            |(cid, _), _| *cid == conn_id,
+            |key| key.0 == conn_id,
+            |_| true,
             None,
             false,
         )
         .0
     }
 
-    /// Connection teardown with a deadline checked before each release.
+    /// Nonblocking teardown with the deadline checked before each release.
     pub fn try_cleanup_connection_until(&self, conn_id: u64, deadline: Instant) -> bool {
         self.try_drain_shard(
             self.shard(conn_id),
-            |(cid, _), _| *cid == conn_id,
+            |key| key.0 == conn_id,
+            |_| true,
             Some(deadline),
             false,
         )
         .0
     }
 
-    /// Nonblocking abort of one key. Contention retains its exact owner here.
+    /// Nonblocking abort of one exact entry; unrelated busy entries are skipped.
     pub fn try_abort(&self, conn_id: u64, request_id: u64) -> bool {
         self.try_drain_shard(
             self.shard(conn_id),
-            |key, _| *key == (conn_id, request_id),
+            |key| *key == (conn_id, request_id),
+            |_| true,
             None,
             false,
         )
         .0
     }
 
-    /// Maintenance sweep that skips busy shards/backings without dropping
-    /// release authority. Only physically released entries count as expired.
+    /// Nonblocking GC; only successfully detached storage counts as expired.
     pub fn try_gc_sweep(&self) -> GcStats {
         let mut stats = GcStats::default();
         let now = Instant::now();
         for shard in &self.shards {
             let (_, released) = self.try_drain_shard(
                 shard,
-                |_, tracked| {
-                    now.duration_since(tracked.last_activity) >= self.config.assembler_timeout
+                |_| true,
+                |contents| {
+                    contents.can_expire
+                        && now.saturating_duration_since(contents.last_activity)
+                            >= self.config.assembler_timeout
                 },
                 None,
                 true,
@@ -578,58 +1018,72 @@ impl<C> ChunkRegistry<C> {
 
     fn try_drain_shard(
         &self,
-        shard: &Mutex<HashMap<(u64, u64), TrackedRequest<C>>>,
-        matches: impl Fn(&(u64, u64), &TrackedRequest<C>) -> bool,
+        shard: &Shard<C>,
+        matches_key: impl Fn(&(u64, u64)) -> bool,
+        matches_contents: impl Fn(&RequestContents<C>) -> bool,
         deadline: Option<Instant>,
-        keep_frames: bool,
+        expire: bool,
     ) -> (bool, GcStats) {
-        // Declared before the guard so unwinding also drops contexts unlocked.
-        let mut removed = Vec::new();
-        let Some(mut shard) = shard.try_lock() else {
-            return (false, GcStats::default());
+        let entries: Vec<_> = {
+            let Some(shard) = shard.try_lock() else {
+                return (false, GcStats::default());
+            };
+            shard
+                .iter()
+                .filter(|(key, _)| matches_key(key))
+                .map(|(key, entry)| (*key, entry.clone()))
+                .collect()
         };
         let mut complete = true;
         let mut stats = GcStats::default();
-        for (_, tracked) in shard.extract_if(|key, tracked| {
-            if !matches(key, tracked) {
-                return false;
+        for (key, entry) in entries {
+            let Some(mut contents) = entry.contents.try_lock() else {
+                complete = false;
+                continue;
+            };
+            if !matches_contents(&contents) {
+                continue;
             }
             if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
                 complete = false;
-                return false;
+                continue;
             }
-            if tracked
-                .inner
-                .as_mut()
-                .is_some_and(|inner| !inner.try_release())
-            {
+            // The second shard acquisition is also nonblocking. Do not retire
+            // storage until this attempt can commit its exact entry removal.
+            let Some(mut shard) = shard.try_lock() else {
                 complete = false;
-                return false;
+                continue;
+            };
+            if expire && (contents.inner.is_some() || contents.context.is_some()) {
+                entry.request.expired.store(true, Ordering::Release);
             }
-            if tracked.inner.is_some() {
-                self.active_count.fetch_sub(1, Ordering::Relaxed);
-                self.total_bytes
-                    .fetch_sub(tracked.total_bytes, Ordering::Relaxed);
+            entry
+                .request
+                .storage
+                .store(StorageState::Retired as u8, Ordering::Release);
+            entry.request.notify_ready();
+            let removed = self.detach(&mut contents);
+            if removed.0.is_some() {
                 stats.expired += 1;
-                stats.freed_bytes += tracked.total_bytes;
-                tracked.total_bytes = 0;
+                stats.freed_bytes += removed.2;
             }
-            removed.push((tracked.inner.take(), tracked.context.take()));
-            !keep_frames || !tracked.has_unsettled_frames()
-        }) {
-            // Only empty metadata remains; backing/context drop below, unlocked.
-            drop(tracked);
+            if shard
+                .get(&key)
+                .is_some_and(|current| Arc::ptr_eq(current, &entry))
+            {
+                shard.remove(&key);
+            }
+            drop(shard);
+            drop(contents);
+            drop(removed);
         }
-        stats.remaining = shard.values().filter(|entry| entry.inner.is_some()).count();
-        drop(shard);
-        // Context Drop runs outside both shard and pool guards.
-        drop(removed);
+        stats.remaining = self.active_count();
         (complete, stats)
     }
 }
 
 impl ChunkRegistry<()> {
-    /// Admit the first reply chunk using its decoded wire metadata.
+    /// Admit response storage from the first value chunk's derived geometry.
     /// Decoding alone accepts zero fields; validate them here before any
     /// reservation, then use the same atomic registry admission authority.
     pub fn insert_reply(
@@ -662,8 +1116,16 @@ impl ChunkRegistry<()> {
                 ChunkAdmissionError::Protocol("total_size exceeds addressable capacity".to_string())
             })?
         };
-        self.insert(conn_id, request_id, total_chunks, chunk_size, ())
-            .map_err(|(error, ())| error)
+        self.insert_tracked(
+            conn_id,
+            request_id,
+            None,
+            total_chunks,
+            chunk_size,
+            Some(()),
+            false,
+        )
+        .map_err(|(error, _)| error)
     }
 }
 
@@ -724,82 +1186,602 @@ mod tests {
     }
 
     #[test]
-    fn settled_request_releases_backing_and_last_frame_preserves_old_reply_claims() {
-        let (pool, budget) = budgeted_pool(128);
-        let reg = ChunkRegistry::new(pool, ChunkConfig::default());
-        let first = reg.begin_frame(1, 7, false);
-        let competing = reg.begin_frame(1, 7, false);
-        reg.insert(1, 7, 2, 32, ()).unwrap();
-        assert!(reassembly_used(&budget) > 0);
-        assert!(reg.settle(&first, || ()));
-        assert_eq!(reassembly_used(&budget), 0);
-        assert_eq!(reg.active_count(), 0);
-        assert_eq!(reg.total_bytes(), 0);
-        assert!(reg.is_settled(1, 7));
-        assert!(reg.begin_frame(1, 7, true).is_settled());
-        assert!(!reg.shard(1).lock().contains_key(&(1, 7)));
-        assert!(
-            !reg.settle(&competing, || ()),
-            "a delayed task cannot reply again after last-frame cleanup"
-        );
+    fn call_record_readiness_uses_publication_and_cancellation_notifications() {
+        use std::future::Future;
+        use std::task::{Context, Poll, Wake, Waker};
+        struct WakeCount(AtomicUsize);
+        impl Wake for WakeCount {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        for retire in [false, true] {
+            let (pool, _) = budgeted_pool(4096);
+            let registry = ChunkRegistry::new(pool, ChunkConfig::default());
+            let request = registry.begin_frame(1, 11);
+            registry.prepare_request(&request, ()).unwrap();
+            let wake = Arc::new(WakeCount(AtomicUsize::new(0)));
+            let waker = Waker::from(wake.clone());
+            let mut cx = Context::from_waker(&waker);
+            let mut cancelled = Box::pin(request.wait_ready());
+            assert!(cancelled.as_mut().poll(&mut cx).is_pending());
+            assert_eq!(request.state.waiters.lock().len(), 1);
+            drop(cancelled);
+            assert!(request.state.waiters.lock().is_empty());
+            let mut waiting = Box::pin(request.wait_ready());
+            assert!(waiting.as_mut().poll(&mut cx).is_pending());
+            if retire {
+                registry.cleanup_connection(1);
+            } else {
+                registry.allocate_request(&request, 2, 64).unwrap();
+            }
+            assert_eq!(wake.0.load(Ordering::SeqCst), 1);
+            assert_eq!(waiting.as_mut().poll(&mut cx), Poll::Ready(!retire));
+            // Publication before the first poll is observed without another wake.
+            let mut late_waiter = Box::pin(request.wait_ready());
+            assert_eq!(late_waiter.as_mut().poll(&mut cx), Poll::Ready(!retire));
+            assert!(request.state.waiters.lock().is_empty());
+        }
     }
 
     #[test]
-    fn settled_records_use_no_chunk_budget_and_gc_does_not_refresh_their_age() {
-        for nonblocking in [false, true] {
-            let (pool, budget) = budgeted_pool(128);
-            let reg = ChunkRegistry::new(
-                pool,
-                ChunkConfig {
-                    soft_limit: 1,
-                    ..Default::default()
-                },
-            );
-            for id in 1..=100 {
-                let request = reg.begin_frame(1, id, false);
-                assert!(reg.settle(&request, || ()));
-            }
-            assert_eq!(reassembly_used(&budget), 0);
-            assert_eq!(reg.active_count(), 0);
-            reg.insert(2, 1, 2, 32, ()).unwrap();
-            reg.abort(2, 1);
-            let expired = Instant::now() - reg.config.assembler_timeout;
-            for entry in reg.shard(1).lock().values_mut() {
-                entry.last_activity = expired;
-            }
-            assert!(reg.begin_frame(1, 1, false).is_settled());
-            assert_eq!(reg.shard(1).lock()[&(1, 1)].last_activity, expired);
-            let swept = if nonblocking {
-                reg.try_gc_sweep()
+    fn old_call_tasks_cannot_feed_take_or_settle_a_reused_key() {
+        for dispatched in [false, true] {
+            let (pool, budget) = budgeted_pool(4096);
+            let registry = ChunkRegistry::new(pool, ChunkConfig::default());
+            let old = registry.begin_frame(1, 11);
+            registry.prepare_request(&old, 41).unwrap();
+            registry.allocate_request(&old, 1, 64).unwrap();
+            assert!(registry.feed_request(&old, 0, &[7; 64]).unwrap());
+            let completed = if dispatched {
+                Some(registry.take_request(&old).unwrap())
             } else {
-                reg.gc_sweep()
+                registry.abort(1, 11);
+                None
             };
-            assert_eq!(swept.expired, 0, "settled entries own no assemblies");
-            assert_eq!(swept.freed_bytes, 0);
-            assert_eq!(swept.remaining, 0);
-            assert!(reg.shard(1).lock().is_empty());
+            let current = registry.begin_frame(1, 11);
+            registry.prepare_request(&current, 42).unwrap();
+            registry.allocate_request(&current, 1, 32).unwrap();
+            assert_eq!(registry.settle(&old), !dispatched);
+            assert!(!registry.settle(&old));
+            assert!(registry.feed_request(&old, 0, &[9; 32]).is_err());
+            assert!(registry.take_request(&old).is_err());
+            assert!(registry.has_admission(1, 11));
+            assert!(registry.feed_request(&current, 0, &[5; 32]).unwrap());
+            let (assembly, admission) = registry.take_request(&current).unwrap();
+            assert_eq!(admission, 42);
+            assert_eq!(assembly.finish().unwrap().copy_bytes().unwrap(), &[5; 32]);
+            drop(completed);
             assert_eq!(reassembly_used(&budget), 0);
         }
     }
 
     #[test]
-    fn gc_releases_assembly_but_keeps_inflight_frames_on_one_error_claim() {
+    fn concurrent_refusals_claim_one_terminal_reply_and_release_one_admission() {
+        let (pool, budget) = budgeted_pool(4096);
+        let registry = Arc::new(ChunkRegistry::new(pool, ChunkConfig::default()));
+        let request = registry.begin_frame(1, 11);
+        let admission = Arc::new(());
+        registry
+            .prepare_request(&request, admission.clone())
+            .unwrap();
+        registry.allocate_request(&request, 1, 64).unwrap();
+        let start = Arc::new(std::sync::Barrier::new(9));
+        let mut competitors = Vec::new();
+        for _ in 0..8 {
+            let registry = registry.clone();
+            let request = request.clone();
+            let start = start.clone();
+            competitors.push(thread::spawn(move || {
+                start.wait();
+                registry.settle(&request)
+            }));
+        }
+        start.wait();
+        let winners = competitors
+            .into_iter()
+            .map(|task| usize::from(task.join().unwrap()))
+            .sum::<usize>();
+        assert_eq!(winners, 1);
+        assert_eq!(Arc::strong_count(&admission), 1);
+        assert_eq!(reassembly_used(&budget), 0);
+        assert_eq!(registry.active_count(), 0);
+        assert!(!registry.settle(&request));
+    }
+
+    #[test]
+    fn settlement_during_copy_retains_only_the_original_call_owners() {
+        struct CallSlot(Arc<AtomicUsize>);
+        impl Drop for CallSlot {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+        let (pool, budget) = budgeted_pool(4096);
+        let registry = Arc::new(ChunkRegistry::new(pool, ChunkConfig::default()));
+        let slots = Arc::new(AtomicUsize::new(2));
+        let request = registry.begin_frame(1, 11);
+        registry
+            .insert_request(&request, 1, 64, CallSlot(slots.clone()))
+            .unwrap_or_else(|(error, _)| panic!("{error}"));
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let resume = Arc::new(std::sync::Barrier::new(2));
+        let copying = registry.clone();
+        let copy_entered = entered.clone();
+        let copy_resume = resume.clone();
+        let worker = thread::spawn(move || {
+            copying.with_assembly(1, 11, |assembly| {
+                copy_entered.wait();
+                copy_resume.wait();
+                assembly.feed_chunk(0, &[7; 64])
+            })
+        });
+        entered.wait();
+        let settling = registry.clone();
+        let (done, observed) = std::sync::mpsc::channel();
+        let terminal = thread::spawn(move || {
+            assert!(settling.settle(&request));
+            done.send(()).unwrap();
+        });
+        let progressed = observed.recv_timeout(Duration::from_secs(2));
+        assert_eq!(reassembly_used(&budget), 65);
+        assert_eq!(slots.load(Ordering::SeqCst), 2);
+        resume.wait();
+        let _ = worker.join().unwrap();
+        terminal.join().unwrap();
+        progressed.expect("reader settlement waited for the payload copy");
+        assert_eq!(reassembly_used(&budget), 0);
+        assert_eq!(slots.load(Ordering::SeqCst), 1);
+        registry
+            .insert(1, 11, 1, 32, CallSlot(slots.clone()))
+            .unwrap_or_else(|(error, _)| panic!("{error}"));
+        assert_eq!(slots.load(Ordering::SeqCst), 1);
+        assert_eq!(reassembly_used(&budget), 33);
+        registry.abort(1, 11);
+        assert_eq!(slots.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn failed_admission_retires_original_storage_without_a_marker() {
+        for (reassembly_limit, file_limit) in [(0, 4096), (1024, 0)] {
+            let (reg, pool, budget) = typed_file_registry(reassembly_limit, file_limit);
+            for request_id in 1..=32 {
+                assert!(reg.insert_reply(1, request_id, 128, 2, 64).is_err());
+                assert!(
+                    reg.shard(1).lock().is_empty(),
+                    "rejected reply left uncounted metadata"
+                );
+                assert!(reg.insert(1, request_id, 0, 64, ()).is_err());
+                assert!(
+                    reg.shard(1).lock().is_empty(),
+                    "bad geometry left uncounted metadata"
+                );
+            }
+            let request = reg.begin_frame(1, 99);
+            assert!(reg.insert_request(&request, 2, 64, ()).is_err());
+            let continuation = reg.begin_frame(1, 99);
+            assert!(!Arc::ptr_eq(&request.state, &continuation.state));
+            assert!(request.storage_retired());
+            assert!(reg.settle(&request));
+            assert!(reg.settle(&continuation));
+            assert!(reg.shard(1).lock().is_empty());
+            assert_eq!(reg.active_count(), 0);
+            assert_eq!(budget.snapshot().reassembly.used_bytes, 0);
+            assert_no_shm_mappings(&pool);
+        }
+    }
+
+    #[test]
+    fn settled_first_chunk_token_never_recreates_pending() {
+        for settled in [true, false] {
+            let (pool, budget) = budgeted_pool(128);
+            let reg = Arc::new(ChunkRegistry::new(pool.clone(), ChunkConfig::default()));
+            let first = reg.begin_frame(1, 11);
+            let entered = Arc::new(std::sync::Barrier::new(2));
+            let resume = Arc::new(std::sync::Barrier::new(2));
+            let inserting = reg.clone();
+            let task_entered = entered.clone();
+            let task_resume = resume.clone();
+            let task = thread::spawn(move || {
+                task_entered.wait();
+                task_resume.wait();
+                inserting.insert_request(&first, 1, 64, 42)
+            });
+            entered.wait();
+            if settled {
+                let last = reg.begin_frame(1, 11);
+                assert!(reg.settle(&last));
+            } else {
+                reg.abort(1, 11);
+            }
+            assert!(!reg.shard(1).lock().contains_key(&(1, 11)));
+            resume.wait();
+            assert!(matches!(
+                task.join().unwrap(),
+                Err((
+                    ChunkAdmissionError::Duplicate {
+                        conn_id: 1,
+                        request_id: 11
+                    },
+                    42
+                ))
+            ));
+            assert!(
+                !reg.shard(1).lock().contains_key(&(1, 11)),
+                "the delayed first chunk recreated a retired request"
+            );
+            assert_eq!(reg.active_count(), 0);
+            assert_eq!(reg.total_bytes(), 0);
+            assert_eq!(budget.snapshot().reassembly.peak_bytes, 0);
+            assert_no_shm_mappings(&pool);
+        }
+    }
+
+    #[test]
+    fn pressure_gc_admits_third_call_during_copy() {
+        for file in [false, true] {
+            for (soft_limit, byte_limit) in [(2, 4096), (512, 128)] {
+                let (pool, budget) = if file {
+                    budgeted_spill_pool(3 * (64 + 1))
+                } else {
+                    budgeted_pool(3 * (64 + 1))
+                };
+                let reg = Arc::new(ChunkRegistry::new(
+                    pool,
+                    ChunkConfig {
+                        soft_limit,
+                        max_reassembly_bytes: byte_limit,
+                        ..ChunkConfig::default()
+                    },
+                ));
+                reg.insert(1, 11, 1, 64, ()).unwrap();
+                let other_conn = 1 + SHARD_COUNT as u64;
+                reg.insert(other_conn, 22, 1, 64, ()).unwrap();
+                reg.lookup(1, 11).unwrap().contents.lock().last_activity =
+                    Instant::now() - reg.config.assembler_timeout;
+                let entered = Arc::new(std::sync::Barrier::new(2));
+                let resume = Arc::new(std::sync::Barrier::new(2));
+                let copying = reg.clone();
+                let copy_entered = entered.clone();
+                let copy_resume = resume.clone();
+                let worker = thread::spawn(move || {
+                    copying.with_assembly(1, 11, |assembly| {
+                        copy_entered.wait();
+                        copy_resume.wait();
+                        assembly.feed_chunk(0, &[0x11; 64])
+                    })
+                });
+                entered.wait();
+                let (done, observed) = std::sync::mpsc::channel();
+                let advancing = reg.clone();
+                let third = thread::spawn(move || {
+                    done.send(advancing.insert(1, 33, 1, 64, ())).unwrap();
+                });
+                let progressed = observed.recv_timeout(Duration::from_secs(2));
+                let charged = budget.snapshot();
+                let bound = *reg.gc_not_before.lock();
+                resume.wait();
+                assert!(worker.join().unwrap().unwrap());
+                third.join().unwrap();
+                progressed
+                    .expect("pressure GC waited for another call's copy")
+                    .unwrap();
+                assert_eq!(charged.reassembly.used_bytes, 3 * (64 + 1));
+                assert_eq!(
+                    bound, None,
+                    "a skipped entry cannot prove a later expiry bound"
+                );
+                assert_eq!(reg.active_count(), 3);
+                // The skipped entry may need collecting on the very next
+                // pressure admission; no timer or delayed scan may be required.
+                reg.lookup(1, 11).unwrap().contents.lock().last_activity =
+                    Instant::now() - reg.config.assembler_timeout;
+                reg.insert(1, 44, 1, 64, ()).unwrap();
+                assert!(!reg.contains(1, 11));
+                assert!(reg.contains(other_conn, 22));
+                assert!(reg.contains(1, 33));
+                assert!(reg.contains(1, 44));
+                assert_eq!(reassembly_used(&budget), 3 * (64 + 1));
+                assert_eq!(budget.snapshot().reassembly.rejected_allocations, 0);
+                reg.cleanup_connection(1);
+                reg.cleanup_connection(other_conn);
+                assert_eq!(reassembly_used(&budget), 0);
+                assert_eq!(budget.snapshot().file.used_bytes, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn entry_copy_borrow_allows_same_shard_admission_release_and_cancellation() {
+        for file in [false, true] {
+            let (pool, budget) = if file {
+                budgeted_spill_pool(1 << 20)
+            } else {
+                budgeted_pool(1 << 20)
+            };
+            let reg = Arc::new(ChunkRegistry::new(pool.clone(), ChunkConfig::default()));
+            reg.insert(1, 11, 1, 4096, ()).unwrap();
+            let entered = Arc::new(std::sync::Barrier::new(2));
+            let resume = Arc::new(std::sync::Barrier::new(2));
+            let copying = reg.clone();
+            let copy_entered = entered.clone();
+            let copy_resume = resume.clone();
+            let worker = thread::spawn(move || {
+                copying.with_assembly(1, 11, |assembly| {
+                    // Pause with exactly the exclusive entry borrow used by feed;
+                    // the backing test separately pauses its actual slice borrow.
+                    copy_entered.wait();
+                    copy_resume.wait();
+                    assembly.feed_chunk(0, &[0x11; 4096])
+                })
+            });
+            entered.wait();
+            let (done, observed) = std::sync::mpsc::channel();
+            let advancing = reg.clone();
+            let progress = thread::spawn(move || {
+                assert!(advancing.shard(1).try_lock().is_some());
+                assert!(advancing.pool.try_write().is_some());
+                assert!(advancing.contains(1, 11));
+                let request = advancing.begin_frame(1, 22);
+                advancing.insert_request(&request, 1, 4096, ()).unwrap();
+                advancing.feed(1, 22, 0, &[0x22; 4096]).unwrap();
+                assert!(advancing.settle(&request));
+                assert!(advancing.try_abort(1, 22));
+                done.send(()).unwrap();
+            });
+            let progressed = observed.recv_timeout(Duration::from_secs(2));
+            let charged = budget.snapshot();
+            resume.wait();
+            assert!(worker.join().unwrap().unwrap());
+            progress.join().unwrap();
+            progressed.expect("another call waited for the copy's shard or pool lock");
+            assert_eq!(charged.reassembly.used_bytes, 4096 + 1);
+            if file {
+                assert_eq!(charged.file.used_bytes, 4096);
+            }
+            let (assembly, ()) = reg.take(1, 11).unwrap();
+            assert_eq!(
+                assembly.finish().unwrap().copy_bytes().unwrap(),
+                &[0x11; 4096]
+            );
+            assert_eq!(budget.snapshot().reassembly.used_bytes, 0);
+        }
+    }
+
+    #[test]
+    fn terminal_paths_preserve_the_entry_borrow_and_refund_only_its_owner() {
+        struct Context {
+            request_id: u64,
+            drops: Arc<Mutex<Vec<u64>>>,
+            registry: std::sync::Weak<ChunkRegistry<Context>>,
+            budget: MemoryBudget,
+        }
+        impl Drop for Context {
+            fn drop(&mut self) {
+                let registry = self.registry.upgrade().unwrap();
+                assert!(registry.shard(1).try_lock().is_some());
+                assert_eq!(
+                    self.budget.snapshot().reassembly.used_bytes,
+                    if self.request_id == 11 { 1024 + 1 } else { 0 }
+                );
+                self.drops.lock().push(self.request_id);
+            }
+        }
+        for file in [false, true] {
+            for action in ["gc", "take", "settle", "abort", "disconnect"] {
+                let (pool, budget) = if file {
+                    budgeted_spill_pool(1 << 20)
+                } else {
+                    budgeted_pool(1 << 20)
+                };
+                let reg = Arc::new(ChunkRegistry::new(
+                    pool.clone(),
+                    ChunkConfig {
+                        assembler_timeout: Duration::from_secs(60),
+                        ..ChunkConfig::default()
+                    },
+                ));
+                let request = reg.begin_frame(1, 11);
+                let drops = Arc::new(Mutex::new(Vec::new()));
+                let context = |request_id| Context {
+                    request_id,
+                    drops: drops.clone(),
+                    registry: Arc::downgrade(&reg),
+                    budget: budget.clone(),
+                };
+                reg.insert_request(&request, 1, 4096, context(11))
+                    .unwrap_or_else(|(e, _)| panic!("{e}"));
+                // An unrelated connection shares the shard and the budget.
+                reg.insert(1 + SHARD_COUNT as u64, 22, 1, 1024, context(22))
+                    .unwrap_or_else(|(e, _)| panic!("{e}"));
+                let entered = Arc::new(std::sync::Barrier::new(2));
+                let resume = Arc::new(std::sync::Barrier::new(2));
+                let copy_entered = entered.clone();
+                let copy_resume = resume.clone();
+                let copying = reg.clone();
+                let worker = thread::spawn(move || {
+                    copying.with_assembly(1, 11, |assembly| {
+                        copy_entered.wait();
+                        copy_resume.wait();
+                        assembly.feed_chunk(0, &[0x11; 4096])
+                    })
+                });
+                entered.wait();
+                assert!(!reg.try_abort(1, 11));
+                assert!(
+                    drops.lock().is_empty(),
+                    "copy borrow must retain its admission"
+                );
+                assert_eq!(
+                    budget.snapshot().reassembly.used_bytes,
+                    (4096 + 1) + (1024 + 1)
+                );
+                let (done, observed) = std::sync::mpsc::channel();
+                let terminal = reg.clone();
+                let terminal_started = Arc::new(std::sync::Barrier::new(2));
+                let started = terminal_started.clone();
+                let terminating = thread::spawn(move || {
+                    started.wait();
+                    let taken = match action {
+                        "gc" => {
+                            terminal.gc_sweep();
+                            None
+                        }
+                        "take" => Some(terminal.take(1, 11).unwrap()),
+                        "settle" => {
+                            assert!(terminal.settle(&request));
+                            None
+                        }
+                        "abort" => {
+                            terminal.abort(1, 11);
+                            None
+                        }
+                        "disconnect" => {
+                            terminal.cleanup_connection(1);
+                            None
+                        }
+                        _ => unreachable!(),
+                    };
+                    done.send(taken).unwrap();
+                });
+                terminal_started.wait();
+                let before_resume = observed.recv_timeout(if action != "take" {
+                    Duration::from_secs(2)
+                } else {
+                    Duration::ZERO
+                });
+                // Skipping or waiting for this borrow cannot retain the shard.
+                let (progressed, progress_observed) = std::sync::mpsc::channel();
+                let checking = reg.clone();
+                let progress = thread::spawn(move || {
+                    let other = checking.begin_frame(1, 33);
+                    assert!(checking.settle(&other));
+                    progressed.send(()).unwrap();
+                });
+                let advanced = progress_observed.recv_timeout(Duration::from_secs(2));
+                assert!(pool.try_write().is_some());
+                assert_eq!(
+                    budget.snapshot().reassembly.used_bytes,
+                    (4096 + 1) + (1024 + 1)
+                );
+                resume.wait();
+                progress.join().unwrap();
+                advanced.expect("a terminal path retained the shard while waiting for a copy");
+                let copied = worker.join().unwrap();
+                if matches!(action, "gc" | "take") {
+                    assert!(copied.unwrap());
+                } else {
+                    assert!(
+                        copied.is_err(),
+                        "retired copy must not gain dispatch authority"
+                    );
+                }
+                terminating.join().unwrap();
+                let taken = if action != "take" {
+                    before_resume.expect("retirement waited for a payload borrow")
+                } else {
+                    assert!(matches!(
+                        before_resume,
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                    ));
+                    observed.recv_timeout(Duration::from_secs(2)).unwrap()
+                };
+                if let Some((assembly, admission)) = taken {
+                    let backing = assembly.finish().unwrap();
+                    assert_eq!(backing.copy_bytes().unwrap(), &[0x11; 4096]);
+                    assert_eq!(backing.capacity_bytes(), 4096 + 1);
+                    drop(backing);
+                    drop(admission);
+                }
+                if action == "gc" {
+                    // GC skipped the borrow and retained storage plus admission.
+                    assert_eq!(
+                        budget.snapshot().reassembly.used_bytes,
+                        (4096 + 1) + (1024 + 1)
+                    );
+                    reg.lookup(1, 11).unwrap().contents.lock().last_activity =
+                        Instant::now() - reg.config.assembler_timeout;
+                    assert_eq!(reg.gc_sweep().expired, 1);
+                }
+                assert_eq!(budget.snapshot().reassembly.used_bytes, 1024 + 1);
+                assert_eq!(*drops.lock(), vec![11]);
+                assert!(reg.contains(1 + SHARD_COUNT as u64, 22));
+                reg.abort(1 + SHARD_COUNT as u64, 22);
+                assert_eq!(*drops.lock(), vec![11, 22]);
+                assert_eq!(budget.snapshot().reassembly.used_bytes, 0);
+                assert_eq!(budget.snapshot().file.used_bytes, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn settled_request_releases_backing_and_original_claim() {
         let (pool, budget) = budgeted_pool(128);
         let reg = ChunkRegistry::new(pool, ChunkConfig::default());
-        let queued = reg.begin_frame(1, 9, false);
+        let first = reg.begin_frame(1, 7);
+        let competing = reg.begin_frame(1, 7);
+        reg.insert(1, 7, 2, 32, ()).unwrap();
+        assert!(reassembly_used(&budget) > 0);
+        assert!(reg.settle(&first));
+        assert_eq!(reassembly_used(&budget), 0);
+        assert_eq!(reg.active_count(), 0);
+        assert_eq!(reg.total_bytes(), 0);
+        assert!(first.storage_retired());
+        assert!(!reg.is_settled(1, 7));
+        assert!(!reg.shard(1).lock().contains_key(&(1, 7)));
+        assert!(
+            !reg.settle(&competing),
+            "a delayed task cannot stop the original assembly twice"
+        );
+    }
+
+    #[test]
+    fn gc_releases_assembly_and_reports_original_token() {
+        let (pool, budget) = budgeted_pool(128);
+        let reg = ChunkRegistry::new(pool, ChunkConfig::default());
+        let queued = reg.begin_frame(1, 9);
         reg.insert(1, 9, 2, 32, ()).unwrap();
-        reg.shard(1).lock().get_mut(&(1, 9)).unwrap().last_activity =
-            Instant::now() - reg.config.assembler_timeout;
-        assert_eq!(reg.gc_sweep().expired, 1);
+        reg.shard(1)
+            .lock()
+            .get_mut(&(1, 9))
+            .unwrap()
+            .contents
+            .lock()
+            .last_activity = Instant::now() - reg.config.assembler_timeout;
+        let (stats, expired) = reg.gc_sweep_expired();
+        assert_eq!(stats.expired, 1);
+        assert_eq!(expired.len(), 1);
+        assert!(Arc::ptr_eq(&queued.state, &expired[0].state));
+        assert!(queued.storage_retired());
         assert!(!reg.contains(1, 9));
         assert_eq!(reassembly_used(&budget), 0);
-        let late = reg.begin_frame(1, 9, false);
-        assert!(Arc::ptr_eq(&queued.state, &late.state));
-        assert!(reg.settle(&queued, || ()));
-        assert!(!reg.settle(&late, || ()));
+        let late = reg.begin_frame(1, 9);
+        assert!(!Arc::ptr_eq(&queued.state, &late.state));
+        assert!(reg.settle(&queued));
+        assert!(reg.settle(&late));
         reg.cleanup_connection(1);
         assert!(reg.shard(1).lock().is_empty());
-        assert!(!reg.settle(&queued, || ()));
+        assert!(!reg.settle(&queued));
+    }
+
+    #[test]
+    fn gc_keeps_original_backing_while_prepared_copy_is_in_flight() {
+        let (pool, budget) = budgeted_pool(128);
+        let reg = ChunkRegistry::new(pool, ChunkConfig::default());
+        let request = reg.begin_frame(3, 17);
+        reg.insert_request(&request, 2, 32, ()).unwrap();
+        let token = reg.prepare_chunk(&request, 0, 32).unwrap();
+        reg.lookup(3, 17).unwrap().contents.lock().last_activity =
+            Instant::now() - reg.config.assembler_timeout;
+        let (stats, expired) = reg.gc_sweep_expired();
+        assert_eq!(stats.expired, 1);
+        assert_eq!(expired.len(), 1);
+        assert!(Arc::ptr_eq(&request.state, &expired[0].state));
+        assert!(request.storage_retired());
+        assert_eq!(reassembly_used(&budget), 66);
+        let copied = token.copy_from(&[5; 32]).unwrap();
+        assert!(reg.commit_chunk(&request, copied).is_err());
+        assert_eq!(reassembly_used(&budget), 0);
     }
 
     #[test]
@@ -1023,11 +2005,12 @@ mod tests {
                     assert_eq!(reg.gc_sweep().expired, 1);
                 }
                 "try_cleanup" => {
-                    let held_pool = pool.read();
+                    let entry = reg.lookup(1, 1).unwrap();
+                    let held_entry = entry.contents.lock();
                     assert!(!reg.try_cleanup_connection(1));
                     assert_eq!(dropped.load(Ordering::SeqCst), index);
                     assert_eq!(reassembly_used(&budget), 1024 + 1);
-                    drop(held_pool);
+                    drop(held_entry);
                     assert!(reg.try_cleanup_connection(1));
                 }
                 _ => unreachable!(),
@@ -1093,19 +2076,32 @@ mod tests {
                 // this context inserts and refreshes a new generation there.
                 reg.insert(0, 2, 1, 64, Context(None))
                     .unwrap_or_else(|(e, _)| panic!("{e}"));
-                reg.shard(0).lock().get_mut(&(0, 2)).unwrap().last_activity =
-                    Instant::now() - Duration::from_secs(2);
+                reg.shard(0)
+                    .lock()
+                    .get_mut(&(0, 2))
+                    .unwrap()
+                    .contents
+                    .lock()
+                    .last_activity = Instant::now() - Duration::from_secs(2);
                 let before = Instant::now();
                 reg.feed(0, 2, 0, &[42; 64]).unwrap();
                 let after = Instant::now();
-                assert!((before..=after).contains(&reg.shard(0).lock()[&(0, 2)].last_activity));
+                assert!(
+                    (before..=after)
+                        .contains(&reg.shard(0).lock()[&(0, 2)].contents.lock().last_activity)
+                );
                 assert_eq!(reg.gc_sweep().expired, 0); // nested scan publishes first
                 thread::sleep(Duration::from_millis(1100)); // slow outer scan crosses expiry
             }))),
         )
         .unwrap_or_else(|(e, _)| panic!("{e}"));
-        reg.shard(1).lock().get_mut(&(1, 1)).unwrap().last_activity =
-            Instant::now() - Duration::from_secs(2);
+        reg.shard(1)
+            .lock()
+            .get_mut(&(1, 1))
+            .unwrap()
+            .contents
+            .lock()
+            .last_activity = Instant::now() - Duration::from_secs(2);
         assert_eq!(reg.gc_sweep().expired, 1);
         assert!(reg.contains(0, 2));
         // No timer: the next pressure admission must collect the late entry,
@@ -1146,6 +2142,8 @@ mod tests {
                     .lock()
                     .get_mut(&(conn, rid))
                     .unwrap()
+                    .contents
+                    .lock()
                     .last_activity = activity;
             }
             if partial {
@@ -1720,7 +2718,7 @@ mod tests {
     }
 
     #[test]
-    fn try_cleanup_file_retains_connection_charge_and_other_owners() {
+    fn try_cleanup_file_releases_only_its_connection_during_another_owner_borrow() {
         let (pool, budget) = budgeted_spill_pool(1 << 20);
         let reg = Arc::new(ChunkRegistry::new(pool, ChunkConfig::default()));
         reg.insert(1, 11, 1, 512, ()).unwrap();
@@ -1744,7 +2742,7 @@ mod tests {
             held
         });
         ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
-        let charged = budget.snapshot();
+        assert!(!reg.try_cleanup_connection_until(1, Instant::now()));
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let worker_reg = Arc::clone(&reg);
         let worker = thread::spawn(move || {
@@ -1767,14 +2765,12 @@ mod tests {
         let (closed, aborted) =
             completed.expect("try_cleanup_connection/try_abort blocked on live owner");
         let (live, count, bytes, assembly_retained) = locked_phase.unwrap();
-        assert!(!closed && !aborted);
-        assert_eq!(count, 2);
-        assert_eq!(bytes, (2048 + 2) + (1024 + 1));
-        assert!(assembly_retained);
-        assert_eq!(live.file.used_bytes, charged.file.used_bytes);
-        assert_eq!(live.reassembly.used_bytes, charged.reassembly.used_bytes);
-        assert!(!reg.try_cleanup_connection_until(1, Instant::now()));
-        assert_eq!(reg.active_count(), 2);
+        assert!(closed && aborted);
+        assert_eq!(count, 1);
+        assert_eq!(bytes, 1024 + 1);
+        assert!(!assembly_retained);
+        assert_eq!(live.file.used_bytes, 1024 + 512);
+        assert_eq!(live.reassembly.used_bytes, (1024 + 1) + (512 + 1));
         assert!(reg.try_cleanup_connection(1));
         assert!(!reg.contains(1, 22));
         assert!(reg.contains(other_conn, 22));
@@ -1795,7 +2791,7 @@ mod tests {
     }
 
     #[test]
-    fn try_gc_file_busy_shard_and_backing_are_retryable() {
+    fn try_gc_skips_busy_shard_but_another_backing_borrow_does_not_block_it() {
         let (pool, budget) = budgeted_spill_pool(1 << 20);
         let reg = Arc::new(ChunkRegistry::new(
             Arc::clone(&pool),
@@ -1871,12 +2867,16 @@ mod tests {
         second_worker.join().unwrap();
         let _ = shard_release_tx.send(());
         shard_holder.join().unwrap();
-        assert_eq!(skipped.expired, 0);
-        assert_eq!(skipped.remaining, 2);
-        assert_eq!(live.file.used_bytes, charged.file.used_bytes);
-        assert_eq!(live.reassembly.used_bytes, charged.reassembly.used_bytes);
-        assert_eq!(released_one.expired, 1);
-        assert_eq!(released_one.freed_bytes, 2048 + 2);
+        assert_eq!(skipped.expired, 1);
+        assert_eq!(skipped.freed_bytes, 2048 + 2);
+        assert_eq!(skipped.remaining, 1);
+        assert_eq!(live.file.used_bytes, charged.file.used_bytes - 2048);
+        assert_eq!(
+            live.reassembly.used_bytes,
+            charged.reassembly.used_bytes - (2048 + 2)
+        );
+        assert_eq!(released_one.expired, 0);
+        assert_eq!(released_one.freed_bytes, 0);
         assert_eq!(released_one.remaining, 1);
         let released_other = reg.try_gc_sweep();
         assert_eq!(released_other.expired, 1);
@@ -1967,12 +2967,7 @@ mod tests {
         chunks: u32,
         data_len: usize,
     ) -> Result<(), ChunkAdmissionError> {
-        use crate::chunk::header::{decode_reply_chunk_meta, encode_reply_chunk_meta};
-        let mut bytes = encode_reply_chunk_meta(size, chunks, 0).to_vec();
-        bytes.resize(bytes.len() + data_len, 0x42);
-        let (size, chunks, index, consumed) = decode_reply_chunk_meta(&bytes, 0).unwrap();
-        assert_eq!(index, 0);
-        reg.insert_reply(1, rid, size, chunks as usize, bytes.len() - consumed)
+        reg.insert_reply(1, rid, size, chunks as usize, data_len)
     }
 
     #[test]
@@ -2138,13 +3133,46 @@ mod tests {
     }
 
     #[test]
+    fn active_reply_survives_timeout_timer_and_pressure_gc() {
+        let (mut reg, pool, budget) = typed_file_registry(128 + 2, 4096);
+        Arc::get_mut(&mut reg).unwrap().config.soft_limit = 1;
+        reg.insert_reply(1, 11, 128, 2, 64).unwrap();
+        reg.feed(1, 11, 0, &[0x11; 64]).unwrap();
+        reg.lookup(1, 11).unwrap().contents.lock().last_activity =
+            Instant::now() - Duration::from_secs(61);
+        assert_eq!(reg.try_gc_sweep().expired, 0);
+        assert_eq!(reg.gc_sweep().expired, 0);
+        *reg.gc_not_before.lock() = None;
+        assert!(matches!(
+            reg.insert_reply(1, 22, 128, 2, 64),
+            Err(ChunkAdmissionError::Capacity(_))
+        ));
+        assert!(reg.contains(1, 11));
+        assert_eq!(reassembly_used(&budget), 130);
+        assert!(reg.feed(1, 11, 1, &[0x22; 64]).unwrap());
+        let (assembly, ()) = reg.take(1, 11).unwrap();
+        let mut backing = assembly.finish().unwrap();
+        let bytes = backing.copy_bytes().unwrap();
+        assert_eq!(&bytes[..64], &[0x11; 64]);
+        assert_eq!(&bytes[64..], &[0x22; 64]);
+        backing.release();
+        assert_eq!(reassembly_used(&budget), 0);
+        assert_no_shm_mappings(&pool);
+    }
+
+    #[test]
     fn typed_gc_removal_makes_same_key_a_fresh_capacity_decision() {
         let (reg, pool, budget) = typed_file_registry(2 * (64 + 1), 4096);
-        raw_reply(&reg, 11, 64, 1, 64).unwrap();
-        raw_reply(&reg, 22, 64, 1, 64).unwrap();
+        reg.insert(1, 11, 1, 64, ()).unwrap();
+        reg.insert(1, 22, 1, 64, ()).unwrap();
         assert!(reg.contains(1, 11)); // A caller's old snapshot is now deliberately stale.
-        reg.shard(1).lock().get_mut(&(1, 11)).unwrap().last_activity =
-            Instant::now() - Duration::from_secs(61);
+        reg.shard(1)
+            .lock()
+            .get_mut(&(1, 11))
+            .unwrap()
+            .contents
+            .lock()
+            .last_activity = Instant::now() - Duration::from_secs(61);
         assert_eq!(reg.gc_sweep().expired, 1);
         raw_reply(&reg, 33, 64, 1, 64).unwrap(); // Another RID consumes the refunded space.
         let error = raw_reply(&reg, 11, 64, 1, 64).unwrap_err();
@@ -2165,10 +3193,15 @@ mod tests {
     #[test]
     fn typed_gc_and_duplicate_are_rechecked_after_pool_contention() {
         let (reg, pool, budget) = typed_file_registry(2 * (64 + 1), 4096);
-        raw_reply(&reg, 11, 64, 1, 64).unwrap();
-        raw_reply(&reg, 22, 64, 1, 64).unwrap();
-        reg.shard(1).lock().get_mut(&(1, 11)).unwrap().last_activity =
-            Instant::now() - Duration::from_secs(61);
+        reg.insert(1, 11, 1, 64, ()).unwrap();
+        reg.insert(1, 22, 1, 64, ()).unwrap();
+        reg.shard(1)
+            .lock()
+            .get_mut(&(1, 11))
+            .unwrap()
+            .contents
+            .lock()
+            .last_activity = Instant::now() - Duration::from_secs(61);
         // Gate only after production insert released its shard on contention.
         // Neither the GC result nor the eventual admission cause is mocked.
         let gate = Arc::new(std::sync::Barrier::new(2));
@@ -2195,12 +3228,14 @@ mod tests {
             );
             std::thread::yield_now();
         }
-        assert_eq!(reg.active_count(), 1);
-        // Storage release waits for the real pool lock, so the old charge is
-        // still live even though GC already removed the expired registry key.
-        assert_eq!(reassembly_used(&budget), 2 * (64 + 1));
-        drop(pool_guard);
+        // Final storage release uses its fixed owner and can finish while
+        // admission is waiting for the unrelated public pool write guard.
+        // GC publishes Retired before it detaches the entry, so the count is
+        // checked only after the sweep has returned.
         assert_eq!(gc_thread.join().unwrap().expired, 1);
+        assert_eq!(reg.active_count(), 1);
+        assert_eq!(reassembly_used(&budget), 64 + 1);
+        drop(pool_guard);
         assert_eq!(reassembly_used(&budget), 64 + 1);
         // Another actual insert publishes the waiting key and fills the budget.
         // Retrying insert must now see Duplicate, without attempting a charge.
@@ -2248,95 +3283,43 @@ mod tests {
     }
 
     #[test]
-    fn typed_review_file_carrier_callback_and_insert_do_not_deadlock() {
-        const CHILD: &str = "C2_WIRE_ADMISSION_REENTRY_CHILD";
-        const NAME: &str =
-            "chunk::registry::tests::typed_review_file_carrier_callback_and_insert_do_not_deadlock";
-        if std::env::var(CHILD).as_deref() != Ok(NAME) {
-            // A deadlocked child cannot strand this test process. A watchdog
-            // kill is always a failing verdict, never counted as completion.
-            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", NAME, "--nocapture"])
-                .env(CHILD, NAME)
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped())
-                .spawn()
-                .unwrap();
-            let deadline = Instant::now() + Duration::from_secs(5);
-            loop {
-                if child.try_wait().unwrap().is_some() {
-                    let output = child.wait_with_output().unwrap();
-                    assert!(
-                        output.status.success(),
-                        "child failed: {}",
-                        String::from_utf8_lossy(&output.stderr)
-                    );
-                    return;
-                }
-                if Instant::now() >= deadline {
-                    child.kill().unwrap();
-                    let output = child.wait_with_output().unwrap();
-                    panic!(
-                        "watchdog killed admission/carrier deadlock probe: {}",
-                        String::from_utf8_lossy(&output.stderr)
-                    );
-                }
-                std::thread::sleep(Duration::from_millis(10));
-            }
-        }
-
+    fn file_carrier_borrow_allows_same_shard_admission_and_registry_reentry() {
         let (reg, pool, budget) = typed_file_registry(1024, 4096);
         raw_reply(&reg, 11, 64, 1, 64).unwrap();
         assert!(reg.feed(1, 11, 0, &[0x11; 64]).unwrap());
         let (assembler, ()) = reg.take(1, 11).unwrap();
         let carrier = assembler.finish().unwrap();
-        assert!(carrier.is_file_spill());
-        let read_gate = Arc::new(std::sync::Barrier::new(2));
-        let insert_gate = Arc::new(std::sync::Barrier::new(2));
-        let (reader_ready, reader_observed) = std::sync::mpsc::channel();
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let resume = Arc::new(std::sync::Barrier::new(2));
+        let reader_entry = entered.clone();
+        let reader_resume = resume.clone();
         let querying = reg.clone();
-        let reader_gate = read_gate.clone();
-        let reader = std::thread::spawn(move || {
-            carrier
+        let reader = thread::spawn(move || {
+            let copied = carrier
                 .with_slice(|bytes| {
-                    assert_eq!(bytes, &[0x11; 64]);
-                    eprintln!("real file carrier callback holds pool read guard");
-                    reader_ready.send(()).unwrap();
-                    reader_gate.wait();
-                    eprintln!("carrier callback entering production contains");
-                    assert!(!querying.contains(1, 22));
+                    reader_entry.wait();
+                    reader_resume.wait();
+                    assert!(querying.contains(1, 22));
+                    bytes.to_vec()
                 })
                 .unwrap();
+            assert_eq!(copied, &[0x11; 64]);
             carrier
         });
-        reader_observed
-            .recv_timeout(Duration::from_secs(2))
-            .unwrap();
-        let (insert_entered, insert_observed) = std::sync::mpsc::channel();
-        let gate = insert_gate.clone();
-        let once = std::sync::atomic::AtomicBool::new(false);
-        *reg.admission_probe.lock() = Some(Arc::new(move || {
-            if !once.swap(true, Ordering::Relaxed) {
-                eprintln!("production insert reached shard decision before pool admission");
-                insert_entered.send(()).unwrap();
-                gate.wait();
-            }
-        }));
+        entered.wait();
+        let (done, observed) = std::sync::mpsc::channel();
         let inserting = reg.clone();
-        let writer = std::thread::spawn(move || inserting.insert(1, 22, 1, 64, ()));
-        insert_observed
-            .recv_timeout(Duration::from_secs(2))
-            .unwrap();
-        // The probe only gates entry into the real constructor; it neither
-        // replaces admission nor mocks the carrier's publicly held read guard.
-        read_gate.wait();
-        insert_gate.wait();
+        let writer = thread::spawn(move || {
+            inserting.insert(1, 22, 1, 64, ()).unwrap();
+            done.send(()).unwrap();
+        });
+        let progressed = observed.recv_timeout(Duration::from_secs(2));
+        resume.wait();
         let mut carrier = reader.join().unwrap();
-        writer.join().unwrap().unwrap();
-        assert!(reg.contains(1, 22));
+        writer.join().unwrap();
+        progressed.expect("admission blocked behind another carrier borrow");
         assert_eq!(reg.active_count(), 1);
         assert_eq!(reassembly_used(&budget), 2 * (64 + 1));
-        assert_eq!(carrier.copy_bytes().unwrap(), &[0x11; 64]);
         reg.abort(1, 22);
         assert_eq!(reassembly_used(&budget), 64 + 1);
         carrier.release();

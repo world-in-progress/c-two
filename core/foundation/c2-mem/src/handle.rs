@@ -2,6 +2,7 @@
 
 use crate::{PoolAllocation, spill::SpillMapping};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Local identity, independent of probabilistic OS backing names. Never reused.
@@ -12,9 +13,143 @@ impl PoolIncarnation {
     pub(crate) fn new() -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(1);
         Self(
-            NEXT.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
+            NEXT.try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
                 .expect("pool identity space exhausted"),
         )
+    }
+}
+
+/// A local allocation whose mapping, range and release authority were fixed
+/// at pool admission. Scoped borrows need no pool lock. Unlike a transport
+/// handle, this owner is not published to a peer or a connection loan book.
+pub struct OwnedAllocation {
+    pub(crate) backing: OwnedBacking,
+    pub(crate) len: usize,
+}
+
+pub(crate) enum OwnedBacking {
+    Buddy {
+        segment: Arc<crate::BuddySegment>,
+        allocation: PoolAllocation,
+        mapping: Arc<crate::segment::ChargedMapping>,
+    },
+    Dedicated {
+        segment: Arc<crate::DedicatedSegment>,
+        allocation: PoolAllocation,
+        mapping: Arc<crate::segment::ChargedMapping>,
+    },
+    File {
+        mmap: SpillMapping,
+        path: PathBuf,
+    },
+}
+
+impl OwnedAllocation {
+    pub fn len(&self) -> usize {
+        self.len
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+    pub fn is_buddy(&self) -> bool {
+        matches!(self.backing, OwnedBacking::Buddy { .. })
+    }
+    pub fn is_dedicated(&self) -> bool {
+        matches!(self.backing, OwnedBacking::Dedicated { .. })
+    }
+    pub fn is_file_spill(&self) -> bool {
+        matches!(self.backing, OwnedBacking::File { .. })
+    }
+
+    pub fn shm_allocation(&self) -> Option<PoolAllocation> {
+        match &self.backing {
+            OwnedBacking::Buddy { allocation, .. } | OwnedBacking::Dedicated { allocation, .. } => {
+                Some(*allocation)
+            }
+            OwnedBacking::File { .. } => None,
+        }
+    }
+
+    pub fn file_spill_path(&self) -> Option<&Path> {
+        match &self.backing {
+            OwnedBacking::File { path, .. } => Some(path),
+            _ => None,
+        }
+    }
+
+    pub fn trim_to(&mut self, len: usize) -> Result<(), String> {
+        if len > self.len {
+            return Err("cannot grow owned allocation".into());
+        }
+        self.len = len;
+        Ok(())
+    }
+
+    /// The private admission boundary checked the span against this exact
+    /// mapping. This owner's borrow pins it and excludes release or mutation.
+    pub fn as_slice(&self) -> &[u8] {
+        let pointer = match &self.backing {
+            OwnedBacking::Buddy {
+                mapping,
+                allocation,
+                ..
+            } => mapping
+                .region
+                .base_ptr()
+                .wrapping_add(allocation.offset as usize),
+            OwnedBacking::Dedicated { mapping, .. } => mapping.region.base_ptr(),
+            OwnedBacking::File { mmap, .. } => return &mmap[..self.len],
+        };
+        // SAFETY: the move-only owner pins the checked mapping and allocation;
+        // its logical length can only shrink. No pointer escapes this borrow.
+        unsafe { std::slice::from_raw_parts(pointer, self.len) }
+    }
+
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        let pointer = match &mut self.backing {
+            OwnedBacking::Buddy {
+                mapping,
+                allocation,
+                ..
+            } => mapping
+                .region
+                .base_ptr()
+                .wrapping_add(allocation.offset as usize),
+            OwnedBacking::Dedicated { mapping, .. } => mapping.region.base_ptr(),
+            OwnedBacking::File { mmap, .. } => return &mut mmap[..self.len],
+        };
+        // SAFETY: admission consumed the unique allocation authority. The
+        // exclusive owner borrow excludes all safe readers and other writers.
+        unsafe { std::slice::from_raw_parts_mut(pointer, self.len) }
+    }
+}
+
+impl Drop for OwnedAllocation {
+    fn drop(&mut self) {
+        match &self.backing {
+            OwnedBacking::Buddy {
+                segment,
+                allocation,
+                ..
+            } => {
+                // SAFETY: this owner is the only release authority and all
+                // scoped payload borrows ended before its destructor.
+                unsafe { segment.free(allocation.offset, allocation.level) };
+            }
+            OwnedBacking::Dedicated { segment, .. } => segment.release(),
+            OwnedBacking::File { .. } => {}
+        }
+        // Mapping pins (and their creation charges) drop after local release.
+    }
+}
+
+impl std::fmt::Debug for OwnedAllocation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OwnedAllocation")
+            .field("allocation", &self.shm_allocation())
+            .field("len", &self.len)
+            .field("file", &self.file_spill_path())
+            .finish()
     }
 }
 

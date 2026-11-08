@@ -19,6 +19,53 @@ fn relay_help_exposes_mesh_and_idle_options() {
         .stdout(predicate::str::contains("--ipc-file-backing-budget-bytes"))
         .stdout(predicate::str::contains(
             "--ipc-live-reassembly-budget-bytes",
+        ))
+        .stdout(predicate::str::contains(
+            "--call-payload-buffer-budget-bytes",
+        ))
+        .stdout(predicate::str::contains("--call-retained-input-budget-bytes").not());
+}
+
+#[test]
+fn relay_call_payload_budget_flag_accepts_full_u64_range_and_zero() {
+    for value in ["0", "18446744073709551615"] {
+        isolated_relay_command()
+            .args([
+                "relay",
+                "--call-payload-buffer-budget-bytes",
+                value,
+                "--dry-run",
+            ])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains(format!(
+                "call_payload_buffer_budget_bytes={value}"
+            )));
+    }
+}
+
+#[test]
+fn relay_retired_call_budget_flag_is_rejected() {
+    isolated_relay_command()
+        .args([
+            "relay",
+            "--call-retained-input-budget-bytes",
+            "7",
+            "--dry-run",
+        ])
+        .assert()
+        .failure();
+}
+
+#[test]
+fn relay_retired_call_budget_environment_is_ignored() {
+    isolated_relay_command()
+        .env("C2_CALL_RETAINED_INPUT_BUDGET_BYTES", "7")
+        .args(["relay", "--dry-run"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "call_payload_buffer_budget_bytes=17179869184",
         ));
 }
 

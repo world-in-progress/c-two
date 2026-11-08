@@ -67,9 +67,9 @@ finally:
 
 A portable method carries zero or one `Payload` envelope in each direction; C-Two embeds each nested specification as an opaque JSON value and never reinterprets it. Methods without an explicit binding can still use ordinary Python values for Python-scoped prototyping, but portable descriptor export and codegen diagnose and reject them.
 
-`cc.hold(echo.echo)(source)` retains a response as `HeldResult`, which owns a local copy: the transport memory was released right after the copy, so holding never keeps the server's shared memory. Explicit `release()` runs FastDB invalidation once, then frees the local copy; invalidation does not replay and the value stays inaccessible afterwards. Release an additional exported memoryview before retrying an export rejection, which occurs before invalidation. Manually constructed `HeldResult(release_cb=...)` callbacks still run once. Use `with cc.hold(...) as held` for normal scopes and materialize values that must outlive them.
+`cc.hold(echo.echo)(source)` retains a response as `HeldResult`, which owns a local copy: the transport memory was released right after the copy, so holding never keeps the server's shared memory. Explicit `release()` runs FastDB invalidation once, then frees the local copy; invalidation does not replay and the value stays inaccessible afterwards. Release an additional exported memoryview before retrying an export rejection, which occurs before invalidation. Manually constructed `HeldResult(release_cb=...)` callbacks still run once. Use `with cc.hold(method)(args) as held` for normal scopes and materialize values that must outlive them.
 
-`cc.observe.memory_stats()['holds']` counts these local copies: `active_holds`, `total_held_bytes` (logical bytes, not SHM capacity), `oldest_hold_seconds` and `by_direction`. See [memory policy](memory-policy.md#statistics-and-payload-lifetime) for the backing and reassembly cells and their accounting limits.
+`cc.observe.memory_stats()['holds']` counts these local copies: `active_holds`, `total_held_bytes` (logical bytes, not SHM capacity), `oldest_hold_seconds` and `by_direction`. See [memory policy](memory-policy.md#statistics-and-payload-lifetime) for the backing, reassembly and payload buffer cells and their accounting limits.
 
 ## Remote connections and deadlines
 
@@ -107,22 +107,61 @@ The session owns identity, IPC overrides and relay configuration. `Server(runtim
 
 ## Payload lifetimes
 
-The proven portable receive path opens a **copy-backed** payload owner. `cc.hold()` is a lifetime contract, not a zero-copy claim: it retains the C-Two response lease together with the payload owner and guarantees that release invalidates the payload owner and its checked views *before* the lease goes back.
+The proven portable receive path opens a **copy-backed** payload owner. `cc.hold()` is a lifetime contract, not a zero-copy claim: it retains the response's local copy together with the payload owner and guarantees that release invalidates the payload owner and its checked views *before* freeing the local copy.
 
 ```python
 with cc.hold(echo.echo)(source) as held:
     payload = held.value                    # FastDB Payload owner; checked views stay valid
     ...
-# leaving the block (or held.release()) invalidates owner and views, then frees the lease
+# leaving the block (or held.release()) invalidates the payload owner and checked views, then frees the local copy
 ```
 
 Release is layered: explicit `.release()`, the `with` context manager, and a `__del__` fallback that warns if you forget both. `cc.observe.memory_stats()["holds"]` reports active holds for monitoring.
 
 `held.unsafe_buffer` exposes the retained raw wire buffer as a `memoryview` escape hatch. Raw NumPy arrays or pointers derived from it bypass FastDB's payload owner and checked views and **cannot be revoked mechanically** — materialize values through FastDB before storing them beyond the hold scope.
 
-On the server side, portable inputs are owned by default. Registering with `cc.register(..., input_lifetime={...: 'borrowed'})` opts specific methods into call-scoped borrowed inputs: C-Two invalidates the payload and its checked views before releasing the request lease when the call returns or raises. Do not retain a borrowed payload or view after the method returns.
+On the server side, portable inputs are owned by default. Registering with `cc.register(..., input_lifetime={...: 'borrowed'})` opts specific methods into call-scoped borrowed inputs: the request lease is already released before the resource method runs. When the method returns or raises, C-Two invalidates the payload owner and its checked views, then frees the local input copy. Do not retain a borrowed payload or view after the method returns.
 
 `cc.transfer` accepts only `input` and `output`. The former `buffer` keyword is removed, including `None` and `"view"`; passing it raises `TypeError`. Remove that keyword and select borrowed inputs through registration-level `input_lifetime`. The module-level `auto_transfer` follows the same rule.
+
+## Server streams
+
+A CRM method marked with `@cc.stream` returns zero or more items for one input. Annotate its return as `Iterator[T]` or `Generator[T, None, None]`, where `T` is one item; `@cc.transfer(output=...)` describes the encoding of one item, as it does for a unary return. `@cc.stream` combines with `@cc.read`, `@cc.write` and `@cc.transfer`. The resource implements the method as a generator, or returns an iterator:
+
+```python
+from collections.abc import Iterator
+
+@cc.crm(namespace='science.sim', version='0.1.0')
+class Simulation:
+    @cc.stream
+    @cc.transfer(input=PARAMETERS, output=STATE)
+    def steps(self, parameters: Payload) -> Iterator[Payload]: ...
+
+class BasinSimulation:
+    def steps(self, parameters: Payload) -> Iterator[Payload]:
+        model = initialize(parameters)
+        try:
+            while model.has_next():
+                model.advance()
+                yield model.export_owned_state()
+        finally:
+            model.finish()
+
+cc.register(Simulation, BasinSimulation(), name='basin')
+
+with cc.connect(Simulation, name='basin', address='ipc://resource-process') as sim:
+    results = sim.steps(parameters)
+    with results:
+        for state in results:
+            consume(state)
+    outcome = results.close()
+```
+
+Each `next()` of the generator runs as one resource step: it holds the route permit and the GIL only while it runs, over IPC also an execution worker, and nothing between items. The stream copies the context once when it starts, and creating the generator, every `next()` and its `close()` all run in that one context, so `contextvars` and `decimal` contexts set inside the generator stay with it across workers and do not leak into them. Over IPC each item is encoded inside its step, so the generator may reuse or change an object after yielding it; within the process the consumer receives the yielded object itself. A borrowed input (`input_lifetime='borrowed'`) stays valid until the generator has been closed, then is invalidated and released.
+
+A call returns a `cc.Stream`, an iterator of decoded items. Leaving a `with` block or dropping the stream cancels it without waiting. `close(timeout=30.0)` cancels the stream if it is still running and then waits for the original call to finish: `None` waits without bound and `0` observes once. It returns a dict with `completed`, `error` and `complete_items`; while `completed` is false, the cleanup is still running and a later `close()` can observe it. `error` is the exception the stream ended with, or `None` after a natural end; a stream that the server or a relay ended reports `CallCancelled` naming shutdown, unregistration or relay shutdown. `cc.hold(sim.steps)(parameters)` returns a stream of `HeldResult` items, each keeping its own local copy until released; several holds may coexist, and when they fill the payload buffer budget the next item waits until one is released. A call deadline from `cc.with_call_options` covers the whole iteration and is not reset for each item; its expiry ends only the caller's wait. Every stream holds one `max_outstanding_calls` slot until its real terminal.
+
+Within the registering process, a stream passes the yielded objects themselves, without encoding, and steps under the route's own concurrency limits; a finite call deadline is refused before dispatch. Over IPC, Python and Rust resources and clients stream to each other, and through a relay they stream over HTTP with the same `cc.Stream`, `close` and hold behavior; there a resource can run ahead of a consumer that stops reading by as many items as the HTTP and TCP buffers hold, which for small items can be thousands. [Runtime lifecycle](runtime-lifecycle.md#execution-admission) describes steps, cancellation and shutdown.
 
 ## Entry points
 
@@ -133,7 +172,7 @@ The `c_two` root holds only the everyday API: contract decorators, `hold` / `Hel
 Applications start with `import c_two as cc`. Import the specialized modules when needed:
 
 ```python
-from c_two import owner, endpoint, observe, contract
+from c_two import endpoint, observe, contract
 ```
 
 Rust users import the user-facing package as `c_two`, not by a Core or transport crate name:
@@ -180,7 +219,7 @@ Any code calling `cc.connect(CRMClass, name='...', address='...')` is a client. 
 
 ```python
 with cc.connect(Grid, name='grid', address='ipc://server') as grid:
-    result = grid.subdivide_grids([1], [0])
+    result = grid.some_method(1)
 ```
 
 There is no separate `compo/` module, `@cc.runtime.connect` decorator, or `Component` type. Routing names are user-chosen strings passed to `cc.register(name=...)` and `cc.connect(name=...)`, distinct from the CRM `namespace`. Different CRM contracts, or different instances of one contract, can coexist under distinct names. For remote IPC and relay paths, the native runtime also matches the expected CRM tag and contract hashes derived from the client's CRM class.
@@ -230,10 +269,10 @@ cc.shutdown()
 
 Calling `runtime.shutdown(timeout=...)` starts the Core Runtime's single permanent retirement scope for that SDK session; module-level `cc.shutdown()` does the same for the default Runtime. This scope seals the Core client pool and closes admission for new registration, start and remote connection work. A pending observation keeps the old session and its slots; later Core completion alone does not replace them. Call SDK shutdown again to consume the completed receipt and perform the session handoff. A zero or short wait budget limits only this caller's observation and does not cancel the driver. If the deadline expires before retirement is handed off, shutdown raises `CoreError` with `lifecycle_kind='shutdown_wait_timeout'`, `details.stage` and `timeout_seconds`; this is not a pending receipt. Python's numeric conversion happens before the SDK instance lock. Waiting to acquire that lock remains outside the shutdown deadline; after acquiring it, Native Host, Core and pool waits share one absolute deadline. Shutdown error projection and shutdown hooks run outside the Python binding lock. Hooks run after session replacement; if replacement construction fails, the original slots and journal remain available.
 
-Shutdown never fails a call already sent: calls in flight on other threads finish and receive their results, and shutdown reports `completed=False` while they run. A thread waiting without a call deadline on a stopped server keeps waiting, and Python waits for non-daemon threads before it exits; give such calls a deadline with `cc.with_call_options(timeout=...)`.
+Shutdown never fails a unary call already sent: calls in flight on other threads finish and receive their results, and shutdown reports `completed=False` while they run. A server stream that this Runtime serves is the exception: shutdown ends it between its steps, delivers the items already produced, runs its cleanup and ends it with `CallCancelled` naming shutdown, and shutdown completes only after that cleanup. A stream that this Runtime consumes as a client is not ended by its shutdown; close or drop it. A thread waiting without a call deadline on a stopped server keeps waiting, and Python waits for non-daemon threads before it exits; give such calls a deadline with `cc.with_call_options(timeout=...)`.
 
-`cc.serve(shutdown_timeout=30.0)` rejects an invalid budget before serving, blocks until SIGINT or SIGTERM, then calls `shutdown(timeout=shutdown_timeout)` once and returns that outcome. A pending outcome means cleanup continues in the background; a later `cc.shutdown()` observes its completion.
+`cc.serve(shutdown_timeout=30.0)` rejects an invalid budget before serving, blocks until SIGINT or SIGTERM on Unix, SIGINT or SIGBREAK on Windows, or the native Host stops (for example, after a direct IPC shutdown request), then calls `shutdown(timeout=shutdown_timeout)` once and returns that outcome. A pending outcome means cleanup continues in the background; a later `cc.shutdown()` observes its completion. With `blocking=False`, it returns `None` immediately.
 
-The deadline passed to remote `connect()` also bounds the SDK's final publication check. If that original deadline expires before publication, connect raises the corresponding deadline error and releases only its own logical client; it does not retry. An otherwise successful connection continues to reuse its pooled client normally. A `runtime_retired` lifecycle error has no I/O cause. HTTP-only use does not create an IPC pool, and shutdown does not promise that every HTTP keepalive socket has physically closed. The Rust low-level Host shutdown/restart lifecycle remains separate and restartable; this permanent retirement applies to the Python SDK Runtime scope. IPC handshake 14, SHM 3 and C/FFI ABI 6 are unchanged. R07 final Drop remains separate work.
+The deadline passed to remote `connect()` also bounds the SDK's final publication check. If that original deadline expires before publication, connect raises the corresponding deadline error and releases only its own logical client; it does not retry. An otherwise successful connection continues to reuse its pooled client normally. A `runtime_retired` lifecycle error has no I/O cause. HTTP-only use does not create an IPC pool, and shutdown does not promise that every HTTP keepalive socket has physically closed. The Rust low-level Host shutdown/restart lifecycle remains separate and restartable; this permanent retirement applies to the Python SDK Runtime scope.
 
 After completed handoff, configured endpoint selection, transport policy, call limits and relay override retain their existing handoff behavior, while server identity, IPC overrides and startup timeout reset. An existing `connection_events()` subscription observes its original session only; subscribe again for the new session. The return value is the closing session's result, and held payloads retain their own lifetime. An application owns any custom endpoint directory it creates; the Runtime does not remove that directory. The [preflight example](../../examples/python/independent_runtime.py) checks the shutdown outcome before deleting its newly created private directory.

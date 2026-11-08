@@ -17,7 +17,7 @@ mod timeout;
 
 pub use call::{
     CallExecutionLimits, CallOptions, CallTimeout, DEFAULT_MAX_OUTSTANDING_CALLS,
-    DEFAULT_RETAINED_INPUT_BUDGET_BYTES,
+    DEFAULT_PAYLOAD_BUFFER_BUDGET_BYTES,
 };
 pub use connect_options::{
     ConnectDeadline, ConnectDeadlineExceeded, ConnectOptions, ConnectTimeoutError,

@@ -32,6 +32,7 @@ _NATIVE_TO_PY_ERROR_NAMES = {
     "CallDeadlineExceeded": "ERROR_CALL_DEADLINE_EXCEEDED",
     "UnsupportedCallMode": "ERROR_UNSUPPORTED_CALL_MODE",
     "CallCapacityExceeded": "ERROR_CALL_CAPACITY_EXCEEDED",
+    "CallCancelled": "ERROR_CALL_CANCELLED",
 }
 
 
@@ -93,7 +94,7 @@ class CoreError(CCBaseError, RuntimeError):
         'invalid_server_id', 'config_frozen', 'client_config_frozen',
         'duplicate_route', 'missing_route', 'missing_relay_address',
         'register_failure',
-        'held_response_copy', 'held_response_release', 'response_copy',
+        'held_response_release', 'response_copy',
         'configuration', 'server', 'startup_timeout', 'relay',
         'runtime_retired', 'shutdown_wait_timeout',
     ] | None
@@ -412,6 +413,17 @@ class CallCapacityExceeded(CCError):
             details=details,
         )
 
+class CallCancelled(CCError):
+    """Raised when a server stream's cancellation has completed."""
+    ERROR_CODE = 718
+
+    def __init__(self, message: str | None = None, details: Mapping[str, str] | None = None):
+        super().__init__(
+            code=ERROR_Code.ERROR_CALL_CANCELLED,
+            message=message or 'Call cancelled',
+            details=details,
+        )
+
 _CODE_TO_CLASS: dict[int, type] = {
     ERROR_Code.ERROR_AT_RESOURCE_INPUT_DESERIALIZING: ResourceDeserializeInput,
     ERROR_Code.ERROR_AT_RESOURCE_INPUT_FROM_BUFFER:    ResourceInputFromBuffer,
@@ -438,6 +450,7 @@ _CODE_TO_CLASS: dict[int, type] = {
     ERROR_Code.ERROR_CALL_DEADLINE_EXCEEDED:           CallDeadlineExceeded,
     ERROR_Code.ERROR_UNSUPPORTED_CALL_MODE:            UnsupportedCallMode,
     ERROR_Code.ERROR_CALL_CAPACITY_EXCEEDED:           CallCapacityExceeded,
+    ERROR_Code.ERROR_CALL_CANCELLED:                   CallCancelled,
 }
 
 
@@ -470,5 +483,6 @@ __all__ = [
     'CallDeadlineExceeded',
     'UnsupportedCallMode',
     'CallCapacityExceeded',
+    'CallCancelled',
     'ERROR_Code',
 ]

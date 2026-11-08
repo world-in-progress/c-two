@@ -44,24 +44,21 @@ pub enum Stream {
     Server(NamedPipeServer),
 }
 
-/// An owned, verified overlapped pipe that has never been associated with IOCP,
-/// plus the pinned server process. Same TokenUser does not imply equal trust or
-/// prevent denial of service by another process running as that user.
-pub struct WindowsPipeConnection {
+/// An owned, verified pipe and its pinned server process before Tokio adoption.
+/// Same TokenUser does not imply equal trust or prevent denial of service by
+/// another process running as that user.
+struct WindowsPipeConnection {
     pipe: OwnedHandle,
     server_process: OwnedHandle,
 }
 
 impl WindowsPipeConnection {
-    /// Transfer both owners exactly once: pipe first, server process second.
-    /// The adopter must keep the process handle until it closes the pipe, and
-    /// must register the pipe with at most one event loop/IOCP.
-    pub fn into_parts(self) -> (OwnedHandle, OwnedHandle) {
+    fn into_parts(self) -> (OwnedHandle, OwnedHandle) {
         (self.pipe, self.server_process)
     }
 }
 
-pub(super) async fn connect_raw(endpoint: &LocalEndpoint) -> io::Result<WindowsPipeConnection> {
+async fn connect_raw(endpoint: &LocalEndpoint) -> io::Result<WindowsPipeConnection> {
     loop {
         match open_verified_pipe(endpoint.os_name()) {
             Ok(connection) => return Ok(connection),

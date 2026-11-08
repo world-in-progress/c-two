@@ -68,7 +68,7 @@ c3 contract codegen python echo.contract.json --out-dir generated-python
 c3 contract codegen typescript echo.contract.json --out-dir generated-typescript
 ```
 
-The output contains C-Two contract/release/composition metadata, the target-specific C-Two adapter, and FastDB Core-owned payload modules. Generation is fail-closed: invalid or colliding paths, hash mismatches, FastDB errors, and existing destinations produce no partial winning tree. There is no separate payload sidecar input.
+The output contains C-Two contract/release/composition metadata, the target-specific C-Two adapter, and FastDB Core-owned payload modules. All three targets generate server-stream methods. The TypeScript target generates clients only: `method_{index}_{name}` returns a `C2ResponseStream`, and `hold_method_{index}_{name}` yields each item as a `C2HeldResult`. Generation is fail-closed: invalid or colliding paths, hash mismatches, FastDB errors, and existing destinations produce no partial winning tree. There is no separate payload sidecar input.
 
 `c3 contract diagnose` reports methods that remain Python-only. Portable payload structure is authored explicitly with `@cc.transfer(...)`.
 
@@ -113,7 +113,7 @@ Useful options:
 | `--ipc-file-backing-budget-bytes` | `C2_IPC_FILE_BACKING_BUDGET_BYTES` | 16 GiB | Shared upstream file backing budget. |
 | `--ipc-live-reassembly-budget-bytes` | `C2_IPC_LIVE_REASSEMBLY_BUDGET_BYTES` | 8 GiB | Shared upstream reassembly/retention capacity budget. |
 | `--call-max-outstanding` | `C2_CALL_MAX_OUTSTANDING` | 1,024 | Outstanding forwarding transactions; zero refuses all new forwarding. |
-| `--call-retained-input-budget-bytes` | `C2_CALL_RETAINED_INPUT_BUDGET_BYTES` | 16 GiB | Retained forwarding input; zero refuses positive input. |
+| `--call-payload-buffer-budget-bytes` | `C2_CALL_PAYLOAD_BUFFER_BUDGET_BYTES` | 16 GiB | Shared budget for the request bodies the relay buffers and copies while forwarding; a short budget makes a forward wait, and zero refuses positive input. |
 | `--upstream`, `-u` | none | empty | Pre-register an upstream as `NAME=SERVER_ID@ADDRESS`. `SERVER_ID` must match the IPC server handshake identity. Repeatable. |
 
 Examples:
@@ -134,7 +134,7 @@ The relay resolves and freezes its own upstream IPC policy at startup; an applic
 
 Forwarding limits freeze at startup and apply to every business request, including callers with unlimited waits. Known input lengths reserve capacity before request transfer; unknown lengths charge checked growth as bytes arrive. Capacity refusal does not withdraw a route. These limits are independent of the upstream storage budgets and do not measure process RSS.
 
-Each forwarding transaction owns its input and upstream operation after its HTTP waiter disconnects. Ctrl+C closes admission and waits for actual forwarding completion and native-client cleanup. A resource method that never returns can keep shutdown pending; disconnecting the caller does not cancel that method.
+Each forwarding transaction owns its input and upstream operation after its HTTP waiter disconnects. Disconnecting cancels nothing for a unary call; for a server stream the relay submits cancellation upstream when the caller drops the response. Ctrl+C closes admission, ends the server streams the relay forwards between their steps with `CallCancelled` naming relay shutdown, and waits for actual forwarding completion and native-client cleanup; unary calls already forwarded still finish. A resource method that never returns, or a stream client that has stopped reading, can keep shutdown pending.
 
 ```bash
 c3 relay --bind 127.0.0.1:8080 --idle-timeout 10 \

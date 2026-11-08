@@ -202,23 +202,31 @@ fn definition(route_name: &str) -> ServiceDefinition {
 }
 
 fn relay() -> (RelayServer, String) {
-    let probe = TcpListener::bind("127.0.0.1:0").expect("reserve relay port");
-    let address = probe.local_addr().expect("relay address");
-    drop(probe);
-    let relay_url = format!("http://{address}");
-    let relay = RelayServer::start_with_context(
-        RelayConfig {
-            bind: address.to_string(),
-            advertise_url: relay_url.clone(),
-            idle_timeout_secs: 0,
-            anti_entropy_interval: std::time::Duration::ZERO,
-            heartbeat_interval: std::time::Duration::ZERO,
-            ..RelayConfig::default()
-        },
-        test_context().clone(),
-    )
-    .expect("relay starts");
-    (relay, relay_url)
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        let probe = TcpListener::bind("127.0.0.1:0").expect("reserve relay port");
+        let address = probe.local_addr().expect("relay address");
+        drop(probe);
+        let relay_url = format!("http://{address}");
+        match RelayServer::start_with_context(
+            RelayConfig {
+                bind: address.to_string(),
+                advertise_url: relay_url.clone(),
+                idle_timeout_secs: 0,
+                anti_entropy_interval: std::time::Duration::ZERO,
+                heartbeat_interval: std::time::Duration::ZERO,
+                ..RelayConfig::default()
+            },
+            test_context().clone(),
+        ) {
+            Ok(relay) => return (relay, relay_url),
+            // A parallel test can claim the port after the probe closes.
+            Err(error)
+                if attempt < 8 && error.starts_with("Relay failed to start: Failed to bind ") => {}
+            Err(error) => panic!("relay starts: {error}"),
+        }
+    }
 }
 
 #[test]
@@ -637,20 +645,14 @@ fn finite_call_configuration_is_consumed_through_the_sdk_facade() {
                 env_file: EnvFilePolicy::Disabled,
                 process_env: EnvMap::from([
                     ("C2_CALL_MAX_OUTSTANDING".into(), "3".into()),
-                    ("C2_CALL_RETAINED_INPUT_BUDGET_BYTES".into(), "17".into()),
+                    ("C2_CALL_PAYLOAD_BUFFER_BUDGET_BYTES".into(), "17".into()),
                 ]),
             },
         )
         .unwrap();
     let snapshot: CallExecutionSnapshot = runtime.call_execution_snapshot().unwrap();
-    assert_eq!(
-        (snapshot.max_operations, snapshot.max_retained_bytes),
-        (3, 17)
-    );
-    assert_eq!(
-        (snapshot.used_operations, snapshot.used_retained_bytes),
-        (0, 0)
-    );
+    assert_eq!(snapshot.max_operations, 3);
+    assert_eq!(snapshot.used_operations, 0);
     // Observation leaves configuration mutable; the Runtime clone sees the same policy.
     let limits = CallExecutionLimits::zeroed();
     runtime
@@ -658,7 +660,7 @@ fn finite_call_configuration_is_consumed_through_the_sdk_facade() {
         .set_call_execution_limits_with_sources(
             CallExecutionLimitsOverrides {
                 max_outstanding_calls: Some(limits.max_outstanding_calls),
-                retained_input_budget_bytes: Some(limits.retained_input_budget_bytes),
+                payload_buffer_budget_bytes: Some(limits.payload_buffer_budget_bytes),
             },
             ConfigSources::empty(),
         )
@@ -674,6 +676,30 @@ fn finite_call_configuration_is_consumed_through_the_sdk_facade() {
         CallTimeout::try_after_seconds(0.0).unwrap(),
         CallTimeout::After(Duration::ZERO)
     );
+}
+
+#[test]
+fn inflight_chunk_frames_configuration_uses_the_core_resolver() {
+    for capacity in [0, 1, 7] {
+        let runtime = test_runtime(RuntimeOptions {
+            server_ipc_overrides: Some(c2_config::ServerIpcConfigOverrides {
+                max_inflight_chunk_frames: Some(capacity),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .unwrap();
+        match runtime.server_ipc_config() {
+            Ok(config) => {
+                assert_ne!(capacity, 0, "zero frame capacity must be rejected");
+                assert_eq!(config.max_inflight_chunk_frames, capacity);
+            }
+            Err(c_two::LifecycleError::Configuration(message)) if capacity == 0 => {
+                assert!(message.contains("max_inflight_chunk_frames"));
+            }
+            Err(error) => panic!("{error}"),
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -803,7 +829,7 @@ fn preparation_fixture(
         .set_call_execution_limits_with_sources(
             CallExecutionLimitsOverrides {
                 max_outstanding_calls: Some(slots),
-                retained_input_budget_bytes: Some(bytes),
+                payload_buffer_budget_bytes: Some(bytes),
             },
             ConfigSources::empty(),
         )
@@ -891,11 +917,11 @@ fn sdk_preparation_rejects_zero_deadline_and_capacity_before_factories_and_busin
             .with_call_options(CallOptions::with_timeout(CallTimeout::Unlimited))
             .begin_call("echo")
             .unwrap()
-            .encode_vec(vec![42])
+            .encode_vec(Vec::new())
             .unwrap()
             .call_owned()
             .unwrap(),
-        vec![42]
+        Vec::<u8>::new()
     );
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     assert_eq!(
@@ -947,19 +973,13 @@ fn sdk_preparation_charges_before_copy_and_keeps_the_original_serialization_dead
         runtime.call_execution_snapshot().unwrap().used_operations,
         0
     );
-    assert_eq!(
-        runtime
-            .call_execution_snapshot()
-            .unwrap()
-            .used_retained_bytes,
-        0
-    );
+    assert_eq!(runtime.payload_buffer_stats().unwrap().used_bytes, 0);
     assert_eq!(calls.load(Ordering::SeqCst), 0);
     assert_eq!(
         runtime.set_call_execution_limits_with_sources(
             CallExecutionLimitsOverrides {
                 max_outstanding_calls: Some(2),
-                retained_input_budget_bytes: Some(8)
+                payload_buffer_budget_bytes: Some(8)
             },
             ConfigSources::empty(),
         ),

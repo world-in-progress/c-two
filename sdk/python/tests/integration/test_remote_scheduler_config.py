@@ -402,9 +402,12 @@ def test_remote_ipc_scheduler_max_pending_shares_with_local_thread_calls():
         t1.start()
         assert resource.hold_entered.wait(timeout=1)
 
-        with pytest.raises(Exception, match='max_pending=1'):
+        with pytest.raises(cc.error.CCError, match='max_pending=1') as refused:
             remote.probe()
 
+        assert refused.value.code == 702  # ResourceUnavailable from server admission.
+        assert refused.value.details['transport_phase'] == 'pre_dispatch'
+        assert refused.value.details['dispatch_phase'] == 'pre_dispatch'
         assert resource.probe_calls == 0
         assert not errors
         resource.release.set()

@@ -23,7 +23,7 @@ The core abstraction is resources, not services.
 C-Two resources hold state, and their calls are often non-idempotent and ordered by the caller, which awaits one call before issuing the next. Several choices that are safe for stateless RPC such as gRPC are therefore wrong here:
 
 - Never turn a completed call into an unknown outcome. A failure fails only the call it belongs to. Deactivating a connection stops new calls and loans on it while calls already sent still finish; its other in-flight calls fail only when its framing can no longer be trusted.
-- C-Two never abandons a dispatched call on its own: deactivation, eviction and Runtime shutdown stop new calls but let calls already sent finish and deliver their results. A caller stops waiting only through its own call deadline or a genuine failure (peer end, broken framing), reported as dispatch-uncertain.
+- C-Two never abandons a dispatched call on its own: deactivation, eviction, route unregistration and Runtime shutdown stop new calls but let unary calls already sent finish and deliver their results. Server streams differ only in this: route unregistration, Runtime shutdown and relay shutdown end an open stream between its steps, because an endless stream would never finish. The running step finishes, the items already produced are delivered, the cleanup runs, and the stream ends with `CallCancelled` naming the cause; deactivation and eviction still let streams continue. A caller stops waiting only through its own call deadline or a genuine failure (peer end, broken framing), reported as dispatch-uncertain.
 - Only pre-dispatch failures are retry-safe. A dispatch-uncertain call is never retried, replayed or hedged automatically; the caller decides.
 - Lifecycle reports are truthful. `completed` means the real terminal state; a caller's budget bounds only its own wait and never cancels cleanup. A stopped or stuck peer keeps its loans until it releases them or its connection ends, and no block is reused without that proof.
 - Do not size waits, payloads or budgets for the "usual" case. Durations and sizes that grow with a workload are exposed through the existing per-call or configuration path rather than fixed.
@@ -120,8 +120,9 @@ The language-neutral Cargo workspace is `core/`; the Python SDK owns its PyO3/ma
 | foundation | `c2-codegen` | FastDB Core delegation plus deterministic multi-owner artifact composition and new-tree publication |
 | foundation | `c2-config` | Unified IPC and relay configuration structs/resolvers |
 | foundation | `c2-error` | Canonical error registry and versioned `C2E1` wire codec |
+| foundation | `c2-local-security` | User-scoped security for local OS objects: Windows TokenUser identity, ACLs, pipe-owner checks and native peer identity failures |
 | foundation | `c2-mem` | Buddy allocator, SHM regions, unified memory pool |
-| foundation | `c2-mem-ffi` | Native memory and endpoint ABI, including verified Windows connection transfer |
+| foundation | `c2-mem-ffi` | C ABI 8 for the Node client: projects the `c2-core` client as endpoint contexts, calls and local response buffers; it depends on `c2-core` and `c2-ipc` despite its directory |
 | protocol | `c2-wire` | Wire protocol codec, frames, chunk assembler, chunk registry |
 | transport | `c2-local` | Async Unix UDS / Windows Named Pipe streams, listener ownership and cancellation |
 | transport | `c2-ipc` | Async IPC client, local streams, SHM, chunked transfer |
@@ -166,8 +167,9 @@ Retired surfaces have no compatibility aliases; names of still-supported interna
 | Replaceable receive-pool slots and safe coordinate-to-lease constructors | Frame admission mints pool-bound carriers; prepared SHM replies carry their allocated owner. |
 | `endpoint_protocol`, protocol-selecting SDK/CLI APIs, logon-name fallback | `c2-config::LocalEndpoint::from_address()` derives one OS implementation and verifies native identity. |
 | The owner subsystem: `OwnerBound`, owner control and its 0x16 frame, `OwnerBootstrap`, recovery tickets and takeover, owned children, `LifecycleConfig` | Removed without replacement ([ADR 0002](docs/decisions/0002-remove-owner-subsystem.md)); supervise host processes with ordinary process management and shutdown. |
-| Handshake 14 or older, SHM 3, C/FFI ABI 6, relay mesh 6, old Unix credential schemas and namespace-format adoption | Use IPC 15, SHM 4, C/FFI ABI 7, relay mesh 7 and Unix credential schema 4; unsupported roots require offline archive/rebuild. |
-| Second Node receive loop or compatibility ABI loader, raw socket/path/symbol injection, ABI 6 request/response pools and their split read/release | Use the complete ABI 7 endpoint-context symbols, the per-connection memory context and verified Windows connection transfer. |
+| Handshake 15 or older, SHM 3, C/FFI ABI 7 or older, relay mesh 6, old Unix credential schemas and namespace-format adoption | Use IPC 16, SHM 4, C/FFI ABI 8, relay mesh 7 and Unix credential schema 4; unsupported roots require offline archive/rebuild. |
+| IPC 15 business frames: `FLAG_CALL_V2`, `FLAG_REPLY_V2`, `FLAG_CHUNK_LAST`, call and reply controls, indexed chunk headers, the CTRL release frame, and settled-request markers in the chunk registry | IPC 16 call records (OPEN, CALL_END, RELEASE and the stream records), writer-assigned request IDs and the request-ID high-water mark. |
+| Node frame reading and writing in TypeScript, `callChain`, compatibility ABI loaders, raw socket/path/symbol injection, ABI 7's per-connection memory context with its request/response/write/release entries, and verified connection transfer to a foreign event loop | Use ABI 8: the Node client calls the Rust `c2-core` client through a client domain, endpoint contexts, calls and local response buffers. |
 | `CRMProxy.call_prepared`, `CoreClient.call_prepared`, `NativePreparedCall.call_prepared`, arbitrary client write plans | Use `begin_call` / `charge_input` / `call` / `close`, explicit FastDB payloads or Python-only pickle fallback. |
 | Producerless server writable sinks and Rust IPC preallocation API | Core receives owned response bytes; `c2-server` selects allocation and transport. |
 | Python held-buffer weakref registries; holds that retain transport memory (`HeldResponse` leases and pins, `abandon`, `_abandon_after_failed_release`) | A hold owns only a local copy; Core `LocalCopy*` accounting backs `memory_stats()['holds']`. |
@@ -177,6 +179,7 @@ Retired surfaces have no compatibility aliases; names of still-supported interna
 | Host lifecycle `phase`, `terminal` and `client_held_leases` | Lifecycle snapshots report `finished`, `listener_closed` and `work_drained`. |
 | The multi-field direct shutdown ACK (`acknowledged`, `shutdown_started`, `server_stopped`, route outcomes) | A one-byte ACK; direct shutdown returns `Initiated`, `Absent` or `Unconfirmed` (Python `'initiated'`, `'absent'`, `'unconfirmed'`), and completion is observed through the original receipt. |
 | `PyShmBuffer`, `c_two._native.ShmBuffer`, Python wire codecs and handshake objects | Use native Core buffer owners; Python `wire.py` retains `MethodTable` and the five existing native contract projections remain available. |
+| `call_execution_snapshot()` byte fields `max_retained_bytes`, `used_retained_bytes` and `peak_retained_bytes` | `memory_stats()['payload_buffer']`; the snapshot reports call slots only. |
 | Python response-pool access, SHM coordinate tuples, threshold-based response dispatch and `bytes(memoryview)` transport conversion | Return serialized bytes or buffer-protocol data and leave native payload limits and transport allocation to `c2-server`. |
 
 ## Documentation rules and routing
@@ -192,7 +195,7 @@ Retired surfaces have no compatibility aliases; names of still-supported interna
 | Path or mechanism | Owning documents to read before changing |
 | --- | --- |
 | `core/foundation/c2-mem/`, `core/foundation/c2-mem-ffi/` | [Memory policy](docs/reference/memory-policy.md), [C ABI](docs/reference/c-abi.md), [payload lifetimes](docs/reference/payload-lifetime.md) |
-| `core/transport/c2-local/`, endpoint parts of `core/foundation/c2-config/` | [Local endpoint lifecycle](docs/reference/local-endpoint-lifecycle.md), [Windows native implementation](docs/reference/windows-native-implementation.md), [configuration](docs/reference/configuration.md) |
+| `core/transport/c2-local/`, `core/foundation/c2-local-security/`, endpoint parts of `core/foundation/c2-config/` | [Local endpoint lifecycle](docs/reference/local-endpoint-lifecycle.md), [Windows native implementation](docs/reference/windows-native-implementation.md), [configuration](docs/reference/configuration.md) |
 | `core/protocol/c2-wire/`, `core/transport/c2-ipc/`, `core/transport/c2-server/` | [IPC handshake](docs/reference/ipc-handshake.md), [memory policy](docs/reference/memory-policy.md), [payload lifetimes](docs/reference/payload-lifetime.md), [Runtime lifecycle](docs/reference/runtime-lifecycle.md) |
 | Relay in `core/transport/c2-http/` | [Contracts and routing](docs/reference/contracts-and-routing.md), [configuration](docs/reference/configuration.md), [c3](cli/README.md) |
 | `core/runtime/c2-core/` | [Runtime lifecycle](docs/reference/runtime-lifecycle.md), [contracts and routing](docs/reference/contracts-and-routing.md), [errors](docs/reference/errors.md) |
@@ -223,6 +226,7 @@ Requires Python 3.10 or newer, including downstream Taichi stacks pinned to 3.10
 - Keep local-candidate truth separate from official release truth. Reused version metadata identifies an artifact only together with its source commit and SHA-256; do not substitute registry packages for the retained candidate or call documentation-only commits package inputs.
 - For bug fixes and behavior changes, add or update focused tests first when feasible, then implement the correct production-grade code change needed to satisfy the verified behavior; do not use phase boundaries to justify temporary shims or lower-quality shortcuts.
 - When work is split into phases, treat the split as sequencing only. Write the phase boundaries, exit criteria, and follow-up items into the plan document before implementation, keep that plan updated as the authoritative record, and finish each phase with docs that make the remaining work explicit.
+- Run npm only through the repository's scripts or with `--prefix` pointing inside the checkout; never run `npm ci` or `npm install` at a worktree root. npm walks up to the nearest `package.json`, which can lie outside the checkout, and `npm ci` first deletes that directory's `node_modules`.
 - Do not revert unrelated user changes in a dirty worktree.
 - Avoid destructive git commands unless the user explicitly asks for them.
 - When editing Markdown prose such as README or AGENTS content, keep each paragraph on one physical line and let editors/renderers handle visual wrapping; do not hard-wrap prose unless a table, list, code block, or generated artifact requires it.
