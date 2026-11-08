@@ -65,7 +65,10 @@ enum ShutdownPoint {
 
 fn encoding_waits(shm: bool, shutdown: ShutdownPoint) {
     let stop_executor = matches!(shutdown, ShutdownPoint::BeforeEncoding);
-    let peer_runtime = tokio::runtime::Builder::new_current_thread()
+    // Windows overlapped writes need the pipe's reactor to keep running while
+    // the controlling thread blocks on encoding and dispatch signals.
+    let peer_runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
         .enable_all()
         .build()
         .unwrap();

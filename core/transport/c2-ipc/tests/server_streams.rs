@@ -279,6 +279,15 @@ fn server_executor_teardown_reports_peer_end_as_dispatch_uncertain() {
         wait_for_steps(&fixture.observed, 2).await;
         let first = stream.recv().await.unwrap().unwrap();
         server_executor.shutdown_background();
+        // On Windows the cancelled task handle keeps overlapped reads and the
+        // pipe alive; the client then waits for its deadline without false completion.
+        assert!(
+            tokio::time::timeout(WAIT, fixture.run)
+                .await
+                .unwrap()
+                .unwrap_err()
+                .is_cancelled()
+        );
         let error = tokio::time::timeout(WAIT, stream.completion())
             .await
             .unwrap()
@@ -295,7 +304,6 @@ fn server_executor_teardown_reports_peer_end_as_dispatch_uncertain() {
         assert_eq!(first.as_ref(), &[0; 8]);
         assert_eq!(fixture.observed.finished.load(Ordering::SeqCst), 0);
         fixture.client.close_shared().await;
-        assert!(fixture.run.await.unwrap_err().is_cancelled());
     });
 }
 
