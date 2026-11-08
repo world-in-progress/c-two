@@ -29,7 +29,7 @@ export interface NativeStreamReceipt {
 
 export interface NativeCall {
   chargeInput(byteLength: bigint | number): Promise<void>;
-  dispatch(bytes: Uint8Array): Promise<void>;
+  dispatch(bytes: Uint8Array): Promise<NativeCallDispatchTarget>;
   next(): Promise<NativeBuffer | null>;
   cancel(): void;
   observe(timeoutMs: number | null): Promise<NativeStreamReceipt>;
@@ -44,8 +44,19 @@ export interface NativePreparedRoute {
   readonly connectionId: bigint | string;
 }
 
+/** The physical target selected at this call's dispatch handoff. */
+export interface NativeCallDispatchTarget extends NativePreparedRoute {
+  readonly path: "DirectIpc" | "ExplicitRelay" | "RelayAwareLocalIpc" | "RelayAwareHttp";
+}
+
+/** Metadata for the physical connection captured by the last successful route preparation. */
+export interface NativeConnectionSnapshot extends NativePreparedRoute {
+  readonly endReason: "local_close" | "peer_close_message" | "peer_eof" | "connection_reset" | "protocol_error" | "io_error" | null;
+}
+
 export interface NativeEndpointContext {
-  prepare(routeName: string, contract: object): Promise<NativePreparedRoute>;
+  prepare(routeName: string, contract: object, timeoutMs?: number | null): Promise<NativePreparedRoute>;
+  connectionSnapshot(routeName: string): NativeConnectionSnapshot | null;
   beginCall(routeName: string, method: string, serverStream: boolean, timeoutMs: number | null): NativeCall;
   deactivate(): void;
   close(): Promise<void>;
@@ -53,6 +64,7 @@ export interface NativeEndpointContext {
 
 export interface NativeEndpointOptions {
   readonly connectTimeoutMs?: number;
+  /** Checked on every acquisition; omission accepts a new instance after peer end. */
   readonly expectedServerIdentity?: { readonly serverId: string; readonly serverInstanceId: string };
 }
 
@@ -180,7 +192,7 @@ function nativeValue<T>(get: () => T): T {
 class ProjectedCall implements NativeCall {
   constructor(private readonly native: NativeCall) {}
   chargeInput(byteLength: bigint | number): Promise<void> { return nativePromise(() => this.native.chargeInput(byteLength)); }
-  dispatch(bytes: Uint8Array): Promise<void> { return nativePromise(() => this.native.dispatch(bytes)); }
+  dispatch(bytes: Uint8Array): Promise<NativeCallDispatchTarget> { return nativePromise(() => this.native.dispatch(bytes)); }
   next(): Promise<NativeBuffer | null> { return nativePromise(() => this.native.next()); }
   cancel(): void { nativeValue(() => this.native.cancel()); }
   async observe(timeoutMs: number | null): Promise<NativeStreamReceipt> {
@@ -193,8 +205,13 @@ class ProjectedCall implements NativeCall {
 
 class ProjectedEndpoint implements NativeEndpointContext {
   constructor(private readonly native: NativeEndpointContext) {}
-  prepare(routeName: string, contract: object): Promise<NativePreparedRoute> {
-    return nativePromise(() => this.native.prepare(routeName, contract));
+  prepare(routeName: string, contract: object, timeoutMs?: number | null): Promise<NativePreparedRoute> {
+    return nativePromise(() => timeoutMs === undefined
+      ? this.native.prepare(routeName, contract)
+      : this.native.prepare(routeName, contract, timeoutMs));
+  }
+  connectionSnapshot(routeName: string): NativeConnectionSnapshot | null {
+    return nativeValue(() => this.native.connectionSnapshot(routeName));
   }
   beginCall(routeName: string, method: string, serverStream: boolean, timeoutMs: number | null): NativeCall {
     return new ProjectedCall(nativeValue(() => this.native.beginCall(routeName, method, serverStream, timeoutMs)));
@@ -452,6 +469,7 @@ export function createNodeIpcConnector(options: C2NodeIpcConnectorOptions = {}):
     };
     const endpoint = nativeValue(() => clientDomain.createEndpoint(address, mergedOptions));
     if (endpoint === null || typeof endpoint !== "object" || typeof endpoint.prepare !== "function"
+      || typeof endpoint.connectionSnapshot !== "function"
       || typeof endpoint.beginCall !== "function" || typeof endpoint.deactivate !== "function" || typeof endpoint.close !== "function") {
       throw new C2MemFfiBindingError("C-Two native endpoint returned an invalid owner.");
     }

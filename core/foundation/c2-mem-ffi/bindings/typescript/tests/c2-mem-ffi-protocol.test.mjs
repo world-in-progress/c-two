@@ -103,6 +103,12 @@ test('ABI 8 native endpoint completes unary calls and reuses the connector domai
   await withServer(async ({connector, address, lines, child, contract}) => {
     const first = await connector(address);
     try {
+      assert.equal(first.connectionSnapshot('echo'), null);
+      const prepared = await first.prepare('echo', contract);
+      assert.deepEqual(first.connectionSnapshot('echo'), {...prepared, endReason: null});
+      await assert.rejects(first.prepare('echo', contract, 0), error =>
+        error?.nativeDetails?.code === 715 && error.nativeDetails.transportPhase === 'pre_dispatch');
+      assert.deepEqual(first.connectionSnapshot('echo'), {...prepared, endReason: null});
       assert.deepEqual(await unary(first, contract, new Uint8Array([1, 2])), new Uint8Array([1, 2]));
       child.stdin.write('stats\n');
       assert.equal(JSON.parse((await lines.next()).value).allocations, 0, 'released response owner settled before next call');
@@ -473,21 +479,21 @@ test('public stream deadline leaves the original record running and later report
   });
 });
 
-test('ABI 8 unary encoding consumes the native pre-dispatch deadline', {timeout: 150_000}, async () => {
+test('ABI 8 unary preparation and encoding share the pre-dispatch deadline', {timeout: 150_000}, async () => {
   await withServer(async ({connector, address, contract, lines, child, createIpcEncodedTransport}) => {
     const transport = createIpcEncodedTransport(address, {connect: connector, callTimeoutMs: 1});
-    let encoded = false;
     try {
       await transport.prepare('echo', contract);
       await assert.rejects(() => transport.call('echo', contract, 'ping', () => {
-        encoded = true;
         const start = performance.now();
         let iterations = 0;
         while (performance.now() - start < 20) iterations++;
         return Uint8Array.of(iterations & 255);
       }), error => error.code === 715 && error.transportPhase === 'pre_dispatch');
     } finally { await transport.close(); }
-    assert.equal(encoded, true);
+    // The original budget can expire during preparation, before the encoder.
+    // Either phase must leave the resource untouched; synchronous encoding
+    // exhaustion is also exercised by the deterministic codegen unit test.
     child.stdin.write('stats\n');
     const stats = JSON.parse((await lines.next()).value);
     assert.equal(stats.kind, 'stats');

@@ -28,7 +28,6 @@ const nativeError = (code, canonicalName, details = {}) => new api.C2IpcTranspor
 function client(options = {}) {
   const state = {connections:0, closed:[], prepared:[], calls:[], deactivated:false, generation:0};
   const transport = api.createRelayAwareHttpEncodedTransport('http://localhost:8300', {
-    routeCacheTtlMs:0,
     async fetch(url, init) {
       assert.equal(init.method,'GET','a local failure must not POST to the same endpoint');
       const route = decodeURIComponent(new URL(url).pathname.split('/').pop());
@@ -44,16 +43,17 @@ function client(options = {}) {
       assert.deepEqual(nativeOptions.expectedServerIdentity,{serverId:'s',serverInstanceId:'i'});
       assert.equal('expectedRouteToken' in nativeOptions,false);
       return {
+        connectionSnapshot(){return null},
         async prepare(...args) {
-          assert.equal(args.length,2);
+          assert.equal(args.length,3);
           const [route] = args;
           await options.onPrepare?.({id,route,state});
           if (state.deactivated) throw nativeError(707,'ResourceClosed');
           state.prepared.push({id,route});
           return {serverId:'s',serverInstanceId:'i',connectionId:String(id)};
         },
-        beginCall(route) {return {
-          async chargeInput(){}, async dispatch(){state.calls.push(route)},
+        beginCall(route) {if(state.deactivated)throw nativeError(707,'ResourceClosed');return {
+          async chargeInput(){}, async dispatch(){state.calls.push(route);return {path:'DirectIpc',serverId:'s',serverInstanceId:'i',connectionId:String(id)}},
           async next(){const value=Uint8Array.of(id + state.generation);value.release=()=>{};return value},
           checkDeadline(){},close(){},cancel(){},async observe(){return {completed:true,error:null,completeItems:1n}},
         }},
@@ -70,7 +70,7 @@ test('relay-local prepares late routes on one endpoint and closes it once', asyn
   const {state,transport,call}=client();
   await Promise.all([call('manager'),call('builder')]);
   assert.equal(state.connections,1);
-  assert.deepEqual(state.prepared.map(x=>x.route).sort(),['builder','builder','manager','manager']);
+  assert.deepEqual(state.prepared.map(x=>x.route).sort(),['builder','manager']);
   assert.deepEqual(state.calls.sort(),['builder','manager']);
   assert.deepEqual(state.closed,[]);
   await Promise.all([transport.close(),transport.close()]);
@@ -94,7 +94,7 @@ test('a deactivated endpoint is discarded without waiting for unrelated work', a
   const {state,transport,call}=client({drain:()=>gate});
   await call('manager');
   state.deactivated=true;
-  await assert.rejects(call('manager'),error=>JSON.parse(error.body).code===714 && error.cause.code===707);
+  await assert.rejects(call('manager'),error=>error.code===707);
   state.deactivated=false;
   await call('manager');
   assert.equal(state.connections,2);
@@ -125,13 +125,13 @@ test('stream close retires an endpoint when its asynchronous preparation fails',
   const gate=new Promise(resolve=>{release=resolve});
   let prepares=0;
   const {state,transport,call}=client({async onPrepare() {
-    if (++prepares === 2) {entered();await gate;throw nativeError(707,'ResourceClosed')}
+    if (++prepares === 1) {entered();await gate;throw nativeError(707,'ResourceClosed')}
   }});
   const stream=transport.stream('manager',contract,'steps',()=>new Uint8Array(),bytes=>bytes);
   await started;
   const closed=stream.close(null);
   release();
-  await assert.rejects(closed,error=>error.code===707);
+  await assert.rejects(closed,error=>error.cause.code===707);
   await call('manager');
   assert.equal(state.connections,2);
   await transport.close();

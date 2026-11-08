@@ -107,7 +107,7 @@ fn generated_transport_uses_native_endpoint_and_has_no_wire_reader() {
         "C2NativeEndpointContext",
         "C2NativeCall",
         "C2ResponseStream",
-        "beginCall(routeName, method, true, callTimeoutMs)",
+        "beginCall(routeName, method, true, nativeLimit(budget))",
         "call.chargeInput(request.byteLength)",
         "call.dispatch(request)",
         "C2UnsupportedCallModeError",
@@ -187,6 +187,7 @@ import {
 const hash = 'a'.repeat(64);
 const contract = {schema:'c-two.contract.v2', namespace:'test', name:'Test', version:'0.1.0', descriptorSha256:hash, abiHash:hash, signatureHash:hash};
 const receipt = {completed:true, error:null, completeItems:2n};
+const nativeTarget={path:'DirectIpc',serverId:'s',serverInstanceId:'i',connectionId:'1'};
 function buffer(bytes, onRelease) { const value = Uint8Array.from(bytes); value.release = onRelease; return value; }
 
 test('stream is immediate; native begin precedes encoding; each hold has a local owner', async () => {
@@ -196,7 +197,7 @@ test('stream is immediate; native begin precedes encoding; each hold has a local
   let cancelled = false;
   const call = {
     async chargeInput(n) { events.push(`charge:${n}`); },
-    async dispatch(bytes) { events.push(`dispatch:${bytes.length}`); },
+    async dispatch(bytes) { events.push(`dispatch:${bytes.length}`); return nativeTarget; },
     async next() { events.push('next'); return item++ < 2 ? buffer([item], () => {releaseCount++}) : null; },
     cancel() { cancelled = true; events.push('cancel'); },
     async observe(timeout) { events.push(`observe:${timeout}`); return receipt; },
@@ -204,7 +205,7 @@ test('stream is immediate; native begin precedes encoding; each hold has a local
     close() { events.push('free'); },
   };
   const endpoint = {
-    async prepare() { events.push('prepare'); return {serverId:'server',serverInstanceId:'instance',connectionId:1n}; },
+    connectionSnapshot(){return null}, async prepare() { events.push('prepare'); return {serverId:'server',serverInstanceId:'instance',connectionId:1n}; },
     beginCall(_route,_method,serverStream) { assert.equal(serverStream,true); events.push('begin'); return call; },
     async close() {}, deactivate() {},
   };
@@ -220,7 +221,7 @@ test('stream is immediate; native begin precedes encoding; each hold has a local
   assert.equal(second.value.value.value,2);
   second.value.release();
   assert.deepEqual(await stream.next(), {done:true,value:undefined});
-  assert.deepEqual(events.slice(0,4), ['prepare','begin','encode','charge:1']);
+  assert.deepEqual(events.slice(0,5), ['prepare','begin','encode','deadline','charge:1']);
   assert.deepEqual(await stream.close(0), receipt);
   assert.equal(cancelled,true);
   assert.ok(events.indexOf('cancel') < events.indexOf('observe:0'));
@@ -231,14 +232,14 @@ test('two unary calls enter native begin without a JS call chain', async () => {
   let releaseCount = 0;
   const pending = [];
   const endpoint = {
-    async prepare() {return {serverId:'s',serverInstanceId:'i',connectionId:1n}},
+    connectionSnapshot(){return null}, async prepare() {return {serverId:'s',serverInstanceId:'i',connectionId:1n}},
     beginCall() {
       begins++;
       let finish;
       const gate = new Promise(resolve => {finish = resolve});
       pending.push(finish);
       return {
-        async chargeInput() {}, async dispatch() {await gate},
+        async chargeInput() {}, async dispatch() {await gate;return nativeTarget},
         async next() {return buffer([7], () => {releaseCount++})},
         close() {}, cancel() {}, async observe() {return receipt}, checkDeadline() {},
       };
@@ -260,7 +261,7 @@ test('two unary calls enter native begin without a JS call chain', async () => {
 test('IPC endpoint options reach the native connector once', async () => {
   const seen=[];
   const endpoint={
-    async prepare(...args){assert.deepEqual(args,['route',contract]);return {serverId:'s',serverInstanceId:'i',connectionId:1n}},
+    connectionSnapshot(){return null}, async prepare(...args){assert.deepEqual(args,['route',contract,undefined]);return {serverId:'s',serverInstanceId:'i',connectionId:1n}},
     beginCall(){throw Error('unexpected')}, async close(){}, deactivate(){},
   };
   const transport=createIpcEncodedTransport('ipc://test',{
@@ -295,12 +296,12 @@ test('return before native admission cancels without encoding or dispatch', asyn
   let dispatched = 0;
   let cancelled = 0;
   const call = {
-    async chargeInput() {}, async dispatch() { dispatched++; }, async next() { return null; },
+    async chargeInput() {}, async dispatch() { dispatched++; return nativeTarget; }, async next() { return null; },
     cancel() { cancelled++; }, async observe() { return {completed:true,error:null,completeItems:0n}; },
     checkDeadline() {}, close() {},
   };
   const endpoint = {
-    async prepare() { await gate; return {serverId:'s',serverInstanceId:'i',connectionId:1n}; },
+    connectionSnapshot(){return null}, async prepare() { await gate; return {serverId:'s',serverInstanceId:'i',connectionId:1n}; },
     beginCall() { return call; }, async close() {}, deactivate() {},
   };
   const transport=createIpcEncodedTransport('ipc://test',{connect:async()=>endpoint});
@@ -315,8 +316,8 @@ test('close zero observes without waiting for native preparation', async () => {
   let allowPrepare;
   const gate = new Promise(resolve => { allowPrepare = resolve; });
   const endpoint = {
-    async prepare() { await gate; return {serverId:'s',serverInstanceId:'i',connectionId:1n}; },
-    beginCall() { return {cancel(){},async chargeInput(){},async dispatch(){},async next(){return null},async observe(ms){assert.equal(ms,0);return receipt},checkDeadline(){},close(){}}; },
+    connectionSnapshot(){return null}, async prepare() { await gate; return {serverId:'s',serverInstanceId:'i',connectionId:1n}; },
+    beginCall() { return {cancel(){},async chargeInput(){},async dispatch(){return nativeTarget},async next(){return null},async observe(ms){assert.equal(ms,0);return receipt},checkDeadline(){},close(){}}; },
     async close(){},deactivate(){},
   };
   const stream=createIpcEncodedTransport('ipc://test',{connect:async()=>endpoint}).stream('route',contract,'steps',()=>Uint8Array.of(),x=>x);
@@ -329,8 +330,8 @@ test('close zero observes without waiting for native preparation', async () => {
 test('finite close budget includes native preparation', async () => {
   let allowPrepare;
   const gate = new Promise(resolve => {allowPrepare=resolve});
-  const endpoint={async prepare(){await gate;return {serverId:'s',serverInstanceId:'i',connectionId:1n}},
-    beginCall(){return {cancel(){},async chargeInput(){},async dispatch(){},async next(){return null},async observe(){return receipt},checkDeadline(){},close(){}}},
+  const endpoint={connectionSnapshot(){return null}, async prepare(){await gate;return {serverId:'s',serverInstanceId:'i',connectionId:1n}},
+    beginCall(){return {cancel(){},async chargeInput(){},async dispatch(){return nativeTarget},async next(){return null},async observe(){return receipt},checkDeadline(){},close(){}}},
     async close(){},deactivate(){}};
   const stream=createIpcEncodedTransport('ipc://test',{connect:async()=>endpoint}).stream('route',contract,'steps',()=>Uint8Array.of(),x=>x);
   const started=performance.now();
@@ -344,9 +345,9 @@ test('deadline after synchronous decode prevents publishing the item', async () 
   let expired=false, released=0, disposed=0;
   const timeout=new Error('deadline');
   timeout.nativeDetails={message:'deadline',code:715,canonicalName:'CallDeadlineExceeded',transportPhase:'dispatch_uncertain'};
-  const call={async chargeInput(){},async dispatch(){},async next(){return buffer([1],()=>released++)},
+  const call={async chargeInput(){},async dispatch(){return nativeTarget},async next(){return buffer([1],()=>released++)},
     cancel(){},async observe(){return receipt},close(){},checkDeadline(){if(expired)throw timeout}};
-  const endpoint={async prepare(){return {serverId:'s',serverInstanceId:'i',connectionId:1n}},
+  const endpoint={connectionSnapshot(){return null}, async prepare(){return {serverId:'s',serverInstanceId:'i',connectionId:1n}},
     beginCall(){return call},async close(){},deactivate(){}};
   const stream=createIpcEncodedTransport('ipc://test',{connect:async()=>endpoint}).stream('route',contract,'steps',()=>{return Uint8Array.of()},()=>{
     expired=true; return {dispose(){disposed++}};
@@ -358,9 +359,9 @@ test('deadline after synchronous decode prevents publishing the item', async () 
 test('resource error projects separately from uncertain transport failure', async () => {
   const failure=new Error('resource failed');
   failure.nativeDetails={message:'resource failed',code:3,canonicalName:'ResourceFunctionExecuting',details:{method:'steps'}};
-  const call={async chargeInput(){},async dispatch(){},async next(){throw failure},cancel(){},
+  const call={async chargeInput(){},async dispatch(){return nativeTarget},async next(){throw failure},cancel(){},
     async observe(){return receipt},checkDeadline(){},close(){}};
-  const endpoint={async prepare(){return {serverId:'s',serverInstanceId:'i',connectionId:1n}},
+  const endpoint={connectionSnapshot(){return null}, async prepare(){return {serverId:'s',serverInstanceId:'i',connectionId:1n}},
     beginCall(){return call},async close(){},deactivate(){}};
   const stream=createIpcEncodedTransport('ipc://test',{connect:async()=>endpoint}).stream('route',contract,'steps',()=>Uint8Array.of(),x=>x);
   await assert.rejects(stream.next(),e=>e instanceof C2CoreError && e.code===3 && e.retrySafe===false && e.details.method==='steps');
@@ -370,9 +371,9 @@ test('deadline stops waiting without cancelling the dispatched native call', asy
   let cancellations=0;
   const deadline=new Error('deadline');
   deadline.nativeDetails={message:'deadline',code:715,canonicalName:'CallDeadlineExceeded',transportPhase:'dispatch_uncertain'};
-  const call={async chargeInput(){},async dispatch(){},async next(){throw deadline},cancel(){cancellations++},
+  const call={async chargeInput(){},async dispatch(){return nativeTarget},async next(){throw deadline},cancel(){cancellations++},
     async observe(){return {completed:false,error:null,completeItems:null}},checkDeadline(){},close(){}};
-  const endpoint={async prepare(){return {serverId:'s',serverInstanceId:'i',connectionId:1n}},
+  const endpoint={connectionSnapshot(){return null}, async prepare(){return {serverId:'s',serverInstanceId:'i',connectionId:1n}},
     beginCall(){return call},async close(){},deactivate(){}};
   const stream=createIpcEncodedTransport('ipc://test',{connect:async()=>endpoint}).stream('route',contract,'steps',()=>Uint8Array.of(),x=>x);
   await assert.rejects(stream.next(),e=>e.code===715&&e.transportPhase==='dispatch_uncertain');
@@ -387,7 +388,7 @@ test('deadline during dispatch retains native call for later observation', async
   deadline.nativeDetails={message:'deadline',code:715,canonicalName:'CallDeadlineExceeded',transportPhase:'dispatch_uncertain'};
   const call={async chargeInput(){},async dispatch(){throw deadline},async next(){throw Error('not reached')},cancel(){cancellations++},
     async observe(){observations++;return {completed:false,error:null,completeItems:null}},checkDeadline(){},close(){}};
-  const endpoint={async prepare(){return {serverId:'s',serverInstanceId:'i',connectionId:1n}},
+  const endpoint={connectionSnapshot(){return null}, async prepare(){return {serverId:'s',serverInstanceId:'i',connectionId:1n}},
     beginCall(){return call},async close(){},deactivate(){}};
   const stream=createIpcEncodedTransport('ipc://test',{connect:async()=>endpoint}).stream('route',contract,'steps',()=>Uint8Array.of(),x=>x);
   await assert.rejects(stream.next(),e=>e.code===715);
@@ -413,7 +414,7 @@ test('relay-aware canonical 701 POST is returned once and the next call resolves
     if(init.method==='POST') {
       posts++;
       return posts===1
-        ? reply(404,JSON.stringify({version:1,code:701,name:'ResourceNotFound',message:'missing',details:{}}))
+        ? reply(404,JSON.stringify({version:1,code:701,name:'ResourceNotFound',message:'missing',details:{dispatch_phase:'pre_dispatch'}}))
         : reply(200,'',Uint8Array.of(9));
     }
     throw Error(`unexpected ${url}`);
@@ -440,7 +441,7 @@ test('same-path fallback denial retains typed first native cause', async () => {
     return {status:200, async text(){return JSON.stringify([route])}, async arrayBuffer(){return new ArrayBuffer(0)}};
   };
   const connect=async()=>({
-    async prepare(){throw nativeFailure}, beginCall(){throw Error('unexpected dispatch')},
+    connectionSnapshot(){return null}, async prepare(){throw nativeFailure}, beginCall(){throw Error('unexpected dispatch')},
     async close(){}, deactivate(){},
   });
   const transport=createRelayAwareHttpEncodedTransport('http://localhost:8300',{fetch,ipc:{connect}});
@@ -475,7 +476,7 @@ test('relay local trust and deadline failures never select another candidate', a
       if(init.method==='POST') posts++; else resolves++;
       return {status:200,async text(){return JSON.stringify(alternatives?[route,{...route,ipc_address:undefined,server_id:undefined,server_instance_id:undefined}]:[route])},async arrayBuffer(){return new ArrayBuffer(0)}};
     };
-    const endpoint={async prepare(){throw failure},beginCall(){throw Error('unexpected dispatch')},async close(){if(closeFails)throw cleanup},deactivate(){}};
+    const endpoint={connectionSnapshot(){return null}, async prepare(){throw failure},beginCall(){throw Error('unexpected dispatch')},async close(){if(closeFails)throw cleanup},deactivate(){}};
     const transport=createRelayAwareHttpEncodedTransport('http://localhost:8300',{fetch,ipc:{connect:async()=>endpoint}});
     await assert.rejects(transport.call('route',contract,'ping',()=>new Uint8Array()),e=>e.nativeDetails===failure.nativeDetails && e.cause===failure && (!closeFails||e.cleanupError===cleanup));
     assert.equal(resolves,1); assert.equal(posts,0);
@@ -490,9 +491,9 @@ test('relay-aware close zero does not wait for route resolution', async () => {
     ipc_address:'ipc://local',server_id:'s',server_instance_id:'i',
     crm_ns:'test',crm_name:'Test',crm_ver:'0.1.0',abi_hash:hash,signature_hash:hash,max_payload_size:100};
   const fetch=async()=>{await gate;return {status:200,async text(){return JSON.stringify([route])},async arrayBuffer(){return new ArrayBuffer(0)}}};
-  const call={async chargeInput(){},async dispatch(){dispatched++},async next(){return null},cancel(){},
+  const call={async chargeInput(){},async dispatch(){dispatched++;return nativeTarget},async next(){return null},cancel(){},
     async observe(){return {completed:true,error:null,completeItems:0n}},checkDeadline(){},close(){}};
-  const endpoint={async prepare(){return {serverId:'s',serverInstanceId:'i',connectionId:1n}},
+  const endpoint={connectionSnapshot(){return null}, async prepare(){return {serverId:'s',serverInstanceId:'i',connectionId:1n}},
     beginCall(){return call},async close(){},deactivate(){}};
   const transport=createRelayAwareHttpEncodedTransport('http://localhost:8300',{fetch,ipc:{connect:async()=>endpoint}});
   const stream=transport.stream('route',contract,'steps',()=>{encoded++;return Uint8Array.of()},x=>x);
@@ -505,11 +506,11 @@ test('relay-aware close zero does not wait for route resolution', async () => {
 test('collecting the public stream while next waits only submits cancellation', async () => {
   let enteredResolve, finishNext, freed=0, cancelled=0;
   const entered=new Promise(resolve=>{enteredResolve=resolve});
-  const nativeCall={async chargeInput(){},async dispatch(){},
+  const nativeCall={async chargeInput(){},async dispatch(){return nativeTarget},
     next(){enteredResolve();return new Promise(resolve=>{finishNext=resolve})},
     cancel(){cancelled++;},close(){freed++;finishNext?.(null)},checkDeadline(){},
     async observe(){return {completed:false,error:null,completeItems:null}}};
-  const endpoint={async prepare(){return {serverId:'s',serverInstanceId:'i',connectionId:1n}},
+  const endpoint={connectionSnapshot(){return null}, async prepare(){return {serverId:'s',serverInstanceId:'i',connectionId:1n}},
     beginCall(){return nativeCall},async close(){},deactivate(){}};
   const transport=createIpcEncodedTransport('ipc://gc',{connect:async()=>endpoint});
   let stream=transport.stream('route',contract,'steps',()=>new Uint8Array(),x=>Array.from(x));

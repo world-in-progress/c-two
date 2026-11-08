@@ -43,6 +43,29 @@ pub enum ObservedPath {
     RelayAwareRelay,
 }
 
+/// Shared identity of the physical IPC connection selected for one call.
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IpcCallTarget {
+    pub server_identity: Arc<c2_wire::handshake::ServerIdentity>,
+    pub connection_id: u64,
+}
+
+/// The transport selected at the original call's dispatch handoff.
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallDispatchTarget {
+    pub path: ObservedPath,
+    pub ipc: Option<IpcCallTarget>,
+}
+
+/// Original outcome and its immutable dispatch target, including failures.
+#[doc(hidden)]
+pub struct CallRecordOutcome<R> {
+    pub result: Result<R, Error>,
+    pub dispatch_target: Option<CallDispatchTarget>,
+}
+
 /// Monotonic process-runtime observations of successfully selected paths.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PathCounters {
@@ -127,6 +150,23 @@ enum ClientInner {
 struct PooledIpcClient {
     client: c2_ipc::pool::ClientLease,
     binding: RouteBinding,
+    server_identity: Arc<c2_wire::handshake::ServerIdentity>,
+}
+
+impl PooledIpcClient {
+    fn new(client: c2_ipc::pool::ClientLease, binding: RouteBinding) -> Self {
+        let server_identity = Arc::new(
+            client
+                .server_identity()
+                .expect("route-bound IPC client has handshake identity")
+                .clone(),
+        );
+        Self {
+            client,
+            binding,
+            server_identity,
+        }
+    }
 }
 
 /// One SDK call's original budget, including acquisition before serialization.
@@ -170,6 +210,23 @@ impl ClientTarget {
             path_default,
             transport,
             facts: AtomicU8::new(0),
+        }
+    }
+
+    fn dispatch_target(&self) -> CallDispatchTarget {
+        CallDispatchTarget {
+            path: self.observed_path,
+            ipc: match &self.transport {
+                ClientInner::Ipc(connection) => Some(IpcCallTarget {
+                    server_identity: Arc::clone(&connection.server_identity),
+                    connection_id: connection
+                        .client
+                        .connection_observation()
+                        .expect("route-bound IPC client has physical connection")
+                        .connection_id(),
+                }),
+                ClientInner::Http(..) => None,
+            },
         }
     }
 
@@ -520,19 +577,31 @@ impl EncodedCall {
     pub async fn stream_record_async(
         self,
         cancellation: c2_ipc::IpcStreamCancellation,
-    ) -> Result<CoreResponseStream, Error> {
+    ) -> CallRecordOutcome<CoreResponseStream> {
         let (started, scope, cancellation, http_cancellation) =
-            self.start_stream(true, cancellation)?;
-        let stream = started.wait_original().await?;
-        if cancellation.is_requested() {
-            http_cancellation.cancel();
+            match self.start_stream(true, cancellation) {
+                Ok(started) => started,
+                Err(error) => {
+                    return CallRecordOutcome {
+                        result: Err(error),
+                        dispatch_target: None,
+                    };
+                }
+            };
+        let CallRecordOutcome {
+            result,
+            dispatch_target,
+        } = started.wait_original().await;
+        let result = result.map(|stream| {
+            if cancellation.is_requested() {
+                http_cancellation.cancel();
+            }
+            CoreResponseStream::new(stream, scope, cancellation, http_cancellation)
+        });
+        CallRecordOutcome {
+            result,
+            dispatch_target,
         }
-        Ok(CoreResponseStream::new(
-            stream,
-            scope,
-            cancellation,
-            http_cancellation,
-        ))
     }
 
     fn start_stream(
@@ -571,39 +640,43 @@ impl EncodedCall {
         let transport_http_cancellation = http_cancellation.clone();
         let abandon_http_cancellation = http_cancellation.clone();
         let http_headroom_reserved = matches!(&target.transport, ClientInner::Http(..));
-        let transport = move |input, scope: CallScope| async move {
-            let target = inner.target_for_call(target, &scope, deadline).await?;
-            let result = match &target.transport {
-                ClientInner::Ipc(connection) => call_ipc_stream(
-                    connection,
-                    &method,
-                    input,
-                    scope,
-                    payload_budget,
-                    Box::new(permit),
-                    transport_cancellation,
-                )
-                .await
-                .map(StreamTransport::Ipc),
-                ClientInner::Http(client, _) => call_http_stream(
-                    client,
-                    &method,
-                    input,
-                    scope,
-                    payload_budget,
-                    Box::new(permit),
-                    transport_cancellation,
-                    transport_http_cancellation,
-                    http_headroom_reserved,
-                )
-                .await
-                .map(StreamTransport::Http),
+        let transport =
+            move |input, scope: CallScope, record: crate::call_execution::CallRecord<_>| async move {
+                let target = inner.target_for_call(target, &scope, deadline).await?;
+                if original {
+                    record.record_target(target.dispatch_target());
+                }
+                let result = match &target.transport {
+                    ClientInner::Ipc(connection) => call_ipc_stream(
+                        connection,
+                        &method,
+                        input,
+                        scope,
+                        payload_budget,
+                        Box::new(permit),
+                        transport_cancellation,
+                    )
+                    .await
+                    .map(StreamTransport::Ipc),
+                    ClientInner::Http(client, _) => call_http_stream(
+                        client,
+                        &method,
+                        input,
+                        scope,
+                        payload_budget,
+                        Box::new(permit),
+                        transport_cancellation,
+                        transport_http_cancellation,
+                        http_headroom_reserved,
+                    )
+                    .await
+                    .map(StreamTransport::Http),
+                };
+                if let Err(error) = &result {
+                    target.observe_error(error);
+                }
+                result.map(|stream| (stream, target))
             };
-            if let Err(error) = &result {
-                target.observe_error(error);
-            }
-            result.map(|stream| (stream, target))
-        };
         let abandon = |(stream, _target): &(StreamTransport, Arc<ClientTarget>)| {
             stream.cancel();
         };
@@ -682,8 +755,14 @@ impl EncodedCall {
     }
 
     #[doc(hidden)]
-    pub async fn call_held_record_async(self) -> Result<HeldResponse, Error> {
-        self.start_held(true)?.wait_original().await
+    pub async fn call_held_record_async(self) -> CallRecordOutcome<HeldResponse> {
+        match self.start_held(true) {
+            Ok(started) => started.wait_original().await,
+            Err(error) => CallRecordOutcome {
+                result: Err(error),
+                dispatch_target: None,
+            },
+        }
     }
 
     fn start_held(
@@ -704,29 +783,41 @@ impl EncodedCall {
             );
         }
         let payload_budget = preparing.payload_budget();
-        let transport = move |input, scope: CallScope| async move {
-            let target = inner.target_for_call(target, &scope, deadline).await?;
-            let result = async {
-                let response = match &target.transport {
-                    ClientInner::Ipc(connection) => HeldResponse::from_response_data(
-                        call_ipc(connection, &method, input, scope).await?,
-                    )?,
-                    ClientInner::Http(client, _) => HeldResponse::from_budgeted_bytes(
-                        call_http(client, &method, input, scope, payload_budget).await?,
-                    ),
-                };
-                Ok(response)
-            }
-            .await;
-            if let Err(error) = &result {
-                target.observe_error(error);
-            }
-            result
-        };
+        let transport =
+            move |input,
+                  scope: CallScope,
+                  record: Option<crate::call_execution::CallRecord<HeldResponse>>| async move {
+                let target = inner.target_for_call(target, &scope, deadline).await?;
+                if let Some(record) = record {
+                    record.record_target(target.dispatch_target());
+                }
+                let result = async {
+                    let response = match &target.transport {
+                        ClientInner::Ipc(connection) => HeldResponse::from_response_data(
+                            call_ipc(connection, &method, input, scope).await?,
+                        )?,
+                        ClientInner::Http(client, _) => HeldResponse::from_budgeted_bytes(
+                            call_http(client, &method, input, scope, payload_budget).await?,
+                        ),
+                    };
+                    Ok(response)
+                }
+                .await;
+                if let Err(error) = &result {
+                    target.observe_error(error);
+                }
+                result
+            };
         if original {
-            preparing.execute_whole_record(self.nbytes, self.materialize, transport)
+            preparing.execute_whole_record(
+                self.nbytes,
+                self.materialize,
+                move |input, scope, record| transport(input, scope, Some(record)),
+            )
         } else {
-            preparing.execute(self.nbytes, self.materialize, transport)
+            preparing.execute(self.nbytes, self.materialize, move |input, scope| {
+                transport(input, scope, None)
+            })
         }
     }
 }
@@ -973,7 +1064,7 @@ impl EndpointAcquisition {
                 }
             }
             match client.acquire_route_with_deadline(expected, deadline) {
-                Ok(binding) => return Ok(PooledIpcClient { client, binding }),
+                Ok(binding) => return Ok(PooledIpcClient::new(client, binding)),
                 Err(error)
                     if index + 1 < STALE_POOL_RECONNECT_ATTEMPTS
                         && is_stale_pooled_session_error(&error) =>
@@ -1149,7 +1240,7 @@ impl Runtime {
                 .map_err(|error| normalize_ipc_error(error, TransportPhase::PreDispatch))?;
             match client.acquire_route_with_deadline(expected, deadline) {
                 Ok(binding) => {
-                    return Ok(PooledIpcClient { client, binding });
+                    return Ok(PooledIpcClient::new(client, binding));
                 }
                 Err(error)
                     if attempt + 1 < STALE_POOL_RECONNECT_ATTEMPTS
@@ -1210,7 +1301,7 @@ impl Runtime {
 
             match client.acquire_route_with_deadline(expected, deadline) {
                 Ok(binding) => {
-                    return Ok(PooledIpcClient { client, binding });
+                    return Ok(PooledIpcClient::new(client, binding));
                 }
                 Err(error)
                     if attempt + 1 < STALE_POOL_RECONNECT_ATTEMPTS

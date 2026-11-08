@@ -34,8 +34,9 @@ const contract = {schema:'c-two.contract.v2', namespace:'test', name:'Echo', ver
 function nativeEndpoint(next, prepare = async () => ({serverId:'s',serverInstanceId:'i',connectionId:1n})) {
   return {
     prepare,
+    connectionSnapshot(){return null},
     beginCall() { return {
-      async chargeInput() {}, async dispatch() {}, next, cancel() {},
+      async chargeInput() {}, async dispatch() {return {path:'DirectIpc',serverId:'s',serverInstanceId:'i',connectionId:'1'}}, next, cancel() {},
       async observe() {return {completed:true,error:null,completeItems:1n}},
       checkDeadline() {}, close() {},
     }; },
@@ -69,12 +70,12 @@ test('IPC observation exposes route and server identity without a route UID', as
   await client.call('route', contract, 'echo', () => Uint8Array.of(1));
   assert.equal(observations.length, 1);
   assert.deepEqual(Object.keys(observations[0]).sort(),
-    ['ipcAddress', 'path', 'requests', 'responses', 'routeName', 'serverId', 'serverInstanceId']);
+    ['connectionId', 'ipcAddress', 'path', 'requests', 'responses', 'routeName', 'serverId', 'serverInstanceId']);
   await client.close();
 });
 
 test('HTTP call and observation use route name and contract without a route UID', async () => {
-  const retiredHeader = ['x-c2-route-', 'uid'].join('');
+  const retiredHeader = 'x-c2-route-uid';
   const observations = [];
   const route = {name:'route',relay_url:'http://localhost:8301',
     crm_ns:contract.namespace,crm_name:contract.name,crm_ver:contract.version,

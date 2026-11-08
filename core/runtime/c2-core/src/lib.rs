@@ -31,6 +31,8 @@ pub use client::{
     CallBudget, Client, Connect, EncodedCall, EncodedClient, HeldResponse, NativeEndpointContext,
     ObservedPath, PathCounters, PreparedCall,
 };
+#[doc(hidden)]
+pub use client::{CallDispatchTarget, CallRecordOutcome, IpcCallTarget};
 pub use client_stream::{CoreResponseStream, CoreStreamCloseReceipt};
 pub use connect_deadline::{ConnectAttempt, connect_deadline_error};
 pub use control::{direct_ipc_endpoint, ping_direct_ipc, shutdown_direct_ipc};

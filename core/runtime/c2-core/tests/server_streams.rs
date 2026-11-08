@@ -1416,7 +1416,7 @@ fn http_opening_cancellation_refuses_business_post() {
             .unwrap()
             .stream_record_async(cancellation),
     );
-    let error = match result {
+    let error = match result.result {
         Ok(_) => panic!("canceled opening unexpectedly dispatched"),
         Err(error) => error,
     };
@@ -1750,21 +1750,28 @@ fn async_native_client_projection_shares_the_original_stream_and_unary_driver() 
     rt.block_on(async {
         let mut prepared = fixture.client.begin_stream("echo").unwrap();
         prepared.charge_input_async(2).await.unwrap();
-        let stream = prepared
+        let stream_outcome = prepared
             .encode_vec(vec![3, 0])
             .unwrap()
             .stream_record_async(c2_ipc::IpcStreamCancellation::new())
-            .await
-            .unwrap();
-        let unary = fixture
+            .await;
+        let stream_target = stream_outcome.dispatch_target.unwrap().ipc.unwrap();
+        let stream = stream_outcome.result.unwrap();
+        let unary_outcome = fixture
             .client
             .begin_call("ping")
             .unwrap()
             .encode_vec(vec![])
             .unwrap()
             .call_held_record_async()
-            .await
-            .unwrap();
+            .await;
+        let unary_target = unary_outcome.dispatch_target.unwrap().ipc.unwrap();
+        assert_eq!(stream_target.connection_id, unary_target.connection_id);
+        assert!(Arc::ptr_eq(
+            &stream_target.server_identity,
+            &unary_target.server_identity,
+        ));
+        let unary = unary_outcome.result.unwrap();
         assert_eq!(unary.bytes(), b"pong");
         for expected in 1..=3 {
             assert_eq!(

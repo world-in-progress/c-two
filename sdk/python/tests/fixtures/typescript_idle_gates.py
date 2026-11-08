@@ -27,7 +27,7 @@ EVIDENCE_SPEC = {
 
 @cc.crm(namespace="test.typescript-idle-gates", version="0.1.0")
 class IdleGate:
-    __cc_rpc_methods__ = ["ping", "items"]
+    __cc_rpc_methods__ = ["ping", "items", "echo"]
 
     @cc.transfer(output=EVIDENCE_SPEC)
     def ping(self) -> Payload: ...
@@ -35,6 +35,9 @@ class IdleGate:
     @cc.stream
     @cc.transfer(output=EVIDENCE_SPEC)
     def items(self) -> Iterator[Payload]: ...
+
+    @cc.transfer(input=EVIDENCE_SPEC, output=EVIDENCE_SPEC)
+    def echo(self, payload: Payload) -> Payload: ...
 
 
 class GateResource:
@@ -48,13 +51,15 @@ class GateResource:
         self.release = threading.Event()
         self.outputs: list[Payload] = []
         self.stream_calls = 0
+        self.echo_calls = 0
         self.steps = 0
         self.cleaned = 0
         self.stream_entered = threading.Event()
         self.on_call: Callable[[dict[str, Any]], None] | None = None
 
     def evidence(self) -> dict[str, Any]:
-        return {**self.identity, "calls": self.calls, "stream_calls": self.stream_calls, "steps": self.steps, "cleaned": self.cleaned}
+        return {**self.identity, "calls": self.calls, "stream_calls": self.stream_calls,
+                "echo_calls": self.echo_calls, "steps": self.steps, "cleaned": self.cleaned}
 
     def record(self, method: str) -> None:
         if self.on_call:
@@ -82,6 +87,13 @@ class GateResource:
         finally:
             self.cleaned += 1
 
+    def echo(self, payload: Payload) -> Payload:
+        with payload.entry_view(0) as entry, entry.at(0) as item, item.acquire() as acquired:
+            value = json.loads(acquired.str())
+        self.echo_calls += 1
+        self.record("echo")
+        return self.payload(value)
+
     def payload(self, evidence: dict[str, Any]) -> Payload:
         spec = CompiledSpec.compile(json.dumps(EVIDENCE_SPEC).encode())
         builder = Builder.create(spec)
@@ -107,6 +119,8 @@ class GateResource:
 def node_gate_client(
     project: tuple[Path, str], work: Path, address: str, ipc_root: str | None,
     *, mode: str = "relay-local", portable: bool = False,
+    call_timeout_ms: int | None = None,
+    expected_server_identity: dict[str, str] | None = None,
 ) -> Iterator[Callable[..., dict[str, Any]]]:
     root, node = project
     fixture = Path(__file__).with_suffix(".mjs")
@@ -114,9 +128,11 @@ def node_gate_client(
     module = root / "dist/gates/typescript/c_two_contract.js"
     config.write_text(json.dumps({
         "address": address, "ipcRoot": ipc_root, "mode": mode,
-        "portable": portable,
+        "portable": portable, "callTimeoutMs": call_timeout_ms,
+        "expectedServerIdentity": expected_server_identity,
         "managerModule": str(module if portable else root / "dist/manager/typescript/c_two_contract.js"),
         "builderModule": str(module if portable else root / "dist/builder/typescript/c_two_contract.js"),
+        "payloadModule": str(next((root / "dist/gates/typescript/payloads").glob("*/fastdb_payload_*.js"))) if portable else None,
     }), encoding="utf-8")
     # Resolve the native package beside the generated modules without editing
     # the existing persistent-IPC fixture or any shared test helper.
@@ -208,13 +224,15 @@ class AcceptedConnections:
 class GateProcess:
     """An owned resource process, with exact credential cleanup after real EOF."""
 
-    def __init__(self, work: Path, ipc_root: str | None, server_id: str, relay: str | None, label: str) -> None:
+    def __init__(self, work: Path, ipc_root: str | None, server_id: str, relay: str | None, label: str,
+                 max_payload_size: int | None = None) -> None:
         self.work = work
         self.ipc_root = ipc_root
         self.label = label
         self.cleanup: dict[str, Any] = {}
         config = work / f"resource-{label}.json"
-        config.write_text(json.dumps({"server_id": server_id, "relay": relay, "ledger": str(work / "resources.jsonl")}), encoding="utf-8")
+        config.write_text(json.dumps({"server_id": server_id, "relay": relay, "ledger": str(work / "resources.jsonl"),
+                                      "max_payload_size": max_payload_size}), encoding="utf-8")
         environment = {**os.environ, "C2_ENV_FILE": "", "C2_RELAY_ANCHOR_ADDRESS": ""}
         environment["PYTHONPATH"] = os.pathsep.join([str(Path(__file__).resolve().parents[2]), environment.get("PYTHONPATH", "")])
         if ipc_root is None:
@@ -300,6 +318,8 @@ def _resource_main(config: dict[str, Any]) -> None:
     from c_two._native import RuntimeSession
 
     session = RuntimeSession(server_id=config["server_id"], use_process_relay_anchor=False)
+    if config["max_payload_size"] is not None:
+        session.set_server_options(config["server_id"], {"max_payload_size": config["max_payload_size"]})
     if config["relay"]:
         session.set_relay_anchor_address(config["relay"])
     server = session.ensure_server_bridge()

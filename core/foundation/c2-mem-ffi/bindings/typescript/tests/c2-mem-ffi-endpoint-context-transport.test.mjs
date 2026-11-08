@@ -11,12 +11,13 @@ test('captured endpoint context flows through native domain, prepare and call', 
   };
   const nativeCall = {
     async chargeInput(size) { events.push(['charge', size]); },
-    async dispatch(bytes) { events.push(['dispatch', Array.from(bytes)]); },
+    async dispatch(bytes) { events.push(['dispatch', Array.from(bytes)]); return {path: 'DirectIpc', serverId: 'server', serverInstanceId: 'instance', connectionId: '1'}; },
     async next() { return Object.assign(new Uint8Array([9]), {release() { events.push('buffer.release'); }}); },
     cancel() {}, async observe() { return {completed: true, error: null, completeItems: 1n}; },
     checkDeadline() {}, close() { events.push('call.close'); },
   };
   const endpoint = {
+    connectionSnapshot(){return null},
     async prepare(route, contract) { events.push(['prepare', route, contract.abiHash]); return {serverId: 'server', serverInstanceId: 'instance', connectionId: 1n}; },
     beginCall(route, method, serverStream) { events.push(['begin', route, method, serverStream]); return nativeCall; },
     deactivate() {}, async close() { events.push('endpoint.close'); },
@@ -38,7 +39,7 @@ test('captured endpoint context flows through native domain, prepare and call', 
   await connection.prepare('echo', contract);
   const call = connection.beginCall('echo', 'echo', false, 1000);
   await call.chargeInput(2);
-  await call.dispatch(new Uint8Array([1, 2]));
+  assert.deepEqual(await call.dispatch(new Uint8Array([1, 2])), {path: 'DirectIpc', serverId: 'server', serverInstanceId: 'instance', connectionId: '1'});
   const response = await call.next();
   assert.deepEqual(Array.from(response), [9]);
   response.release();
