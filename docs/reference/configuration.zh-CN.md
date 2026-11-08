@@ -120,13 +120,15 @@ C2_RELAY_IDLE_TIMEOUT=60
 | --- | --- | --- | --- |
 | HTTP 监听地址 | `--bind` | `C2_RELAY_BIND` | `0.0.0.0:8080` |
 | Relay 标识 | `--relay-id` | `C2_RELAY_ID` | 生成的 `<hostname>_<pid>_<UUID 前 8 位>` |
-| 对外公布地址 | `--advertise-url` | `C2_RELAY_ADVERTISE_URL` | 从 bind 派生 |
+| 对外公布地址 | `--advertise-url` | `C2_RELAY_ADVERTISE_URL` | 从实际绑定的地址派生 |
 | Mesh seeds | `--seeds` | `C2_RELAY_SEEDS` | 空 |
 | 上游 IPC 空闲断连 | `--idle-timeout` | `C2_RELAY_IDLE_TIMEOUT` | 60 秒，`0` 关闭时间驱逐 |
 | 转发事务数量 | `--call-max-outstanding` | `C2_CALL_MAX_OUTSTANDING` | 1,024 / Relay |
 | 载荷缓冲预算 | `--call-payload-buffer-budget-bytes` | `C2_CALL_PAYLOAD_BUFFER_BUDGET_BYTES` | 16 GiB / Relay |
 | 系统 HTTP proxy | — | `C2_RELAY_USE_PROXY` | `false` |
 | 反熵交换间隔 | — | `C2_RELAY_ANTI_ENTROPY_INTERVAL` | 60 秒，`0` 关闭反熵 |
+
+relay 先绑定监听地址，再启动其余部分。端口为 `0` 时取一个空闲端口，按实际绑定的地址派生对外公布地址，`c3 relay` 在 `C-Two relay listening at` 一行打印这个地址；其他端口派生出的地址与原来相同。
 
 `remote_payload_chunk_size` 是唯一的远程 body 分批策略，由 Rust 从传输策略覆盖值或 `C2_REMOTE_PAYLOAD_CHUNK_SIZE` 解析；默认 1 MiB，允许大于零且不超过 128 MiB。Relay HTTP 将其用于发出的请求 body；relay 从上游 carrier 复制响应或流条目时，每片不超过它与上游 IPC `chunk_size` 中较小的一个；`C2_IPC_CHUNK_SIZE` 独立控制 IPC 线格式分片与重组。远程配置值不指定 TCP packet 或 HTTP frame 的边界。
 

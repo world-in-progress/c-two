@@ -103,11 +103,11 @@ Useful options:
 
 | Option | Environment | Default | Purpose |
 |---|---|---:|---|
-| `--bind`, `-b` | `C2_RELAY_BIND` | `0.0.0.0:8080` | HTTP listen address. |
+| `--bind`, `-b` | `C2_RELAY_BIND` | `0.0.0.0:8080` | HTTP listen address. Port `0` takes a free port; the `C-Two relay listening at` line prints the bound address. |
 | `--idle-timeout` | `C2_RELAY_IDLE_TIMEOUT` | `60` | Seconds before idle upstream IPC connections are evicted. Use `0` to disable time-based eviction. |
 | `--seeds`, `-s` | `C2_RELAY_SEEDS` | empty | Comma-separated seed relay URLs for mesh mode. |
 | `--relay-id` | `C2_RELAY_ID` | generated | Stable relay identifier for the mesh protocol. |
-| `--advertise-url` | `C2_RELAY_ADVERTISE_URL` | derived | Public URL other relays should use to reach this relay. |
+| `--advertise-url` | `C2_RELAY_ADVERTISE_URL` | derived from the bound address | Public URL other relays should use to reach this relay. |
 | `--ipc-root` | `C2_IPC_ROOT` | `/tmp/c2-v3-<uidhex>` (Unix) | Final owner-controlled endpoint directory; custom directories are application-provisioned, and `0755` is accepted when other identities cannot modify them. Not applicable on Windows, where upstream IPC uses TokenUser-scoped Named Pipes. |
 | `--ipc-pool-enabled <true\|false>` | `C2_IPC_POOL_ENABLED` | Rust resolver | Enable buddy for data-plane upstream IPC; `false` still permits dedicated SHM. |
 | `--ipc-shm-backing-budget-bytes` | `C2_IPC_SHM_BACKING_BUDGET_BYTES` | 8 GiB | Shared upstream buddy/dedicated backing budget. |

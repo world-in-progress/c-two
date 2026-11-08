@@ -120,13 +120,15 @@ C2_RELAY_IDLE_TIMEOUT=60
 | --- | --- | --- | --- |
 | HTTP listener | `--bind` | `C2_RELAY_BIND` | `0.0.0.0:8080` |
 | Relay identity | `--relay-id` | `C2_RELAY_ID` | Generated `<hostname>_<pid>_<first 8 UUID characters>` |
-| Advertised URL | `--advertise-url` | `C2_RELAY_ADVERTISE_URL` | Derived from bind |
+| Advertised URL | `--advertise-url` | `C2_RELAY_ADVERTISE_URL` | Derived from the bound address |
 | Mesh seeds | `--seeds` | `C2_RELAY_SEEDS` | Empty |
 | Upstream IPC idle disconnect | `--idle-timeout` | `C2_RELAY_IDLE_TIMEOUT` | 60 seconds; `0` disables timed eviction |
 | Forwarding transaction count | `--call-max-outstanding` | `C2_CALL_MAX_OUTSTANDING` | 1,024 per relay |
 | Payload buffer budget | `--call-payload-buffer-budget-bytes` | `C2_CALL_PAYLOAD_BUFFER_BUDGET_BYTES` | 16 GiB per relay |
 | System HTTP proxy | — | `C2_RELAY_USE_PROXY` | `false` |
 | Anti-entropy interval | — | `C2_RELAY_ANTI_ENTROPY_INTERVAL` | 60 seconds; `0` disables anti-entropy |
+
+The relay binds its listener before anything else starts. With port `0` it takes a free port, derives the advertised URL from the address it actually bound, and `c3 relay` prints that address in its `C-Two relay listening at` line; any other port derives the same URL as before.
 
 `remote_payload_chunk_size` is the single remote-body batching policy, resolved by Rust from the typed transport override or `C2_REMOTE_PAYLOAD_CHUNK_SIZE`. It defaults to 1 MiB and accepts positive values up to 128 MiB. Relay HTTP uses it for outbound request bodies, and a relay copies each response or stream-item slice out of its upstream carrier in at most the lesser of this size and the upstream IPC `chunk_size`; `C2_IPC_CHUNK_SIZE` independently controls IPC wire chunks and reassembly. The remote value does not specify TCP packets or HTTP frame boundaries.
 
