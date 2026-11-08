@@ -115,6 +115,8 @@ ADR 0004 的几处用词与[术语表](../../CONTEXT.md)冲突或重复。下面
 
 退出条件：三种客户端的跟随行为一致；全平台 CI 通过。
 
+执行记录（2026-11-08）：生成的 TypeScript 的三种传输各为每个（路由名，契约）保存一个当前目标，由同一个传输的客户端共用；只在已知目标不在了时，于下一次调用之前按调用的预算重新获取，同时等待的调用共用一次。relay-local 的目标经 relay 重新获取，新的端点上下文期望 relay 报出的身份；被替换的端点停止接纳，等它的调用结束后关闭。原来只为每次调用解析服务的路由缓存没有读者，连同 `maxAttempts`、`routeCacheTtlMs` 与按注册 `maxPayloadSize` 的请求预检一起删除。ABI 8 补了两个原生投影：按路由只读的连接快照（不做 I/O），以及 prepare 的按次时长（与显式的 `connectTimeoutMs` 取较小者）。验收中发现，直接 IPC 的调用在 prepare 之后、派发之前遇到 Host 重启时，Core 重新获取并由新实例执行，观察却仍报旧实例；改为由 Core 的原调用记录在把输入交给传输时写入实际派发目标（身份放在获取目标时建立的 `Arc` 里），`dispatch` 的结果带回它，观察据此报告每次调用自己的目标。
+
 ### 块 5：强制离开
 
 范围：决定 A 的管理端点 `POST /_admin/force-leave`、对端消息 `RelayForceLeave` 与它的处理，`c3 registry force-leave`，以及[契约与路由](../reference/contracts-and-routing.md)与 `cli/README.md` 的说明。在块 6 之前，它忘掉的是 Suspect 对端仍留着的路由与对端记录；块 6 之后，失联 relay 的名字都要靠它或那个 relay 回来才能放手。
