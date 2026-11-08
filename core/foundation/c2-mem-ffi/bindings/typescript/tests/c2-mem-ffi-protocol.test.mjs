@@ -479,6 +479,48 @@ test('public stream deadline leaves the original record running and later report
   });
 });
 
+test('ABI 8 unary preparation observes a native rejection after its caller deadline', {timeout: 150_000}, async () => {
+  await withServer(async ({connector, address, contract, lines, child, createIpcEncodedTransport}) => {
+    let clock = 0, rejectPreparation, preparations = 0;
+    const late = new Promise((_resolve, reject) => { rejectPreparation = reject; });
+    const failure = new Error('connect deadline exceeded');
+    failure.nativeDetails = {message: failure.message, code: 715, canonicalName: 'CallDeadlineExceeded', transportPhase: 'pre_dispatch'};
+    const descriptor = Object.getOwnPropertyDescriptor(performance, 'now');
+    Object.defineProperty(performance, 'now', {configurable: true, value: () => clock});
+    const transport = createIpcEncodedTransport(address, {
+      callTimeoutMs: 10,
+      connect: async (...args) => {
+        const endpoint = await connector(...args);
+        return new Proxy(endpoint, {get(target, key) {
+          if (key === 'prepare') return (_route, _contract, timeout) => {
+            assert.equal(timeout, 10);
+            preparations++;
+            clock = 11;
+            return late;
+          };
+          const value = Reflect.get(target, key);
+          return typeof value === 'function' ? value.bind(target) : value;
+        }});
+      },
+    });
+    try {
+      await assert.rejects(transport.call('echo', contract, 'ping', () => {
+        assert.fail('expired preparation must not encode input');
+      }), error => error.message === 'call deadline exceeded' && error.code === 715 && error.retrySafe);
+      rejectPreparation(failure);
+      await new Promise(resolve => setImmediate(resolve));
+      assert.equal(preparations, 1);
+    } finally {
+      rejectPreparation(failure);
+      if (descriptor === undefined) delete performance.now;
+      else Object.defineProperty(performance, 'now', descriptor);
+      await transport.close();
+    }
+    child.stdin.write('stats\n');
+    assert.equal(JSON.parse((await lines.next()).value).unary_dispatches, 0);
+  });
+});
+
 test('ABI 8 unary preparation and encoding share the pre-dispatch deadline', {timeout: 150_000}, async () => {
   await withServer(async ({connector, address, contract, lines, child, createIpcEncodedTransport}) => {
     const transport = createIpcEncodedTransport(address, {connect: connector, callTimeoutMs: 1});

@@ -24,6 +24,89 @@ const nativeTarget={...binding,path:'DirectIpc'};
 const nextTurn=()=>new Promise(resolve=>setImmediate(resolve));
 function deferred(){let resolve;const promise=new Promise(r=>{resolve=r});return {promise,resolve};}
 
+for (const relayLocal of [false, true]) for (const stream of [false, true]) {
+  test(`expired preparation observes a late native rejection (relayLocal=${relayLocal}, stream=${stream})`, async () => {
+    let clock = 0, rejectPreparation, preparations = 0, encoded = 0, begun = 0;
+    const late = new Promise((_resolve, reject) => { rejectPreparation = reject; });
+    const failure = new Error('connect deadline exceeded');
+    failure.nativeDetails = {message: failure.message, code: 715, canonicalName: 'CallDeadlineExceeded', transportPhase: 'pre_dispatch'};
+    const descriptor = Object.getOwnPropertyDescriptor(performance, 'now');
+    Object.defineProperty(performance, 'now', {configurable: true, value: () => clock});
+    const endpoint = {
+      connectionSnapshot() { return null; },
+      prepare(_route, _contract, timeout) {
+        assert.equal(timeout, 10);
+        preparations++;
+        clock = 11; // Native setup exhausts the budget before returning its Promise.
+        return late;
+      },
+      beginCall() { begun++; throw new Error('expired preparation must not begin a call'); },
+      deactivate() {}, async close() {},
+    };
+    const client = relayLocal
+      ? transport.createRelayAwareHttpEncodedTransport('http://localhost:8300', {
+          callTimeoutMs: 10, ipc: {connect: async () => endpoint},
+          fetch: async url => {
+            assert.ok(url.includes('/_resolve/'));
+            return {status: 200, async text() { return JSON.stringify([relayRoute(1, true)]); }};
+          },
+        })
+      : transport.createIpcEncodedTransport('ipc://deadline', {connect: async () => endpoint, callTimeoutMs: 10});
+    let response;
+    try {
+      const encode = () => { encoded++; return new Uint8Array(); };
+      response = stream ? client.stream('route', contract, 'steps', encode, value => value) : undefined;
+      const pending = stream ? response.next() : client.call('route', contract, 'ping', encode);
+      await assert.rejects(pending, error => {
+        assert.equal(error.message, 'call deadline exceeded');
+        assert.equal(error.code, 715);
+        assert.equal(error.transportPhase, 'pre_dispatch');
+        assert.equal(error.retrySafe, true);
+        return true;
+      });
+      rejectPreparation(failure);
+      await nextTurn(); // Node reports an unhandled rejection by this turn.
+      assert.deepEqual({preparations, encoded, begun}, {preparations: 1, encoded: 0, begun: 0});
+      if (stream) await assert.rejects(response.close(null), error => error.code === 715);
+    } finally {
+      rejectPreparation(failure);
+      if (descriptor === undefined) delete performance.now;
+      else Object.defineProperty(performance, 'now', descriptor);
+      await client.close();
+    }
+  });
+}
+
+test('expired connector wait preserves the shared acquisition rejection for another waiter', async () => {
+  let reads = 0, rejectConnection, connects = 0;
+  const late = new Promise((_resolve, reject) => { rejectConnection = reject; });
+  const failure = new Error('late connection failure');
+  failure.nativeDetails = {message: failure.message, code: 707, canonicalName: 'ResourceUnavailable', transportPhase: 'pre_dispatch'};
+  const descriptor = Object.getOwnPropertyDescriptor(performance, 'now');
+  Object.defineProperty(performance, 'now', {configurable: true, value: () => reads++ === 0 ? 0 : 11});
+  const client = transport.createIpcEncodedTransport('ipc://deadline', {
+    callTimeoutMs: 10, connect: () => { connects++; return late; },
+  });
+  try {
+    await assert.rejects(client.call('route', contract, 'ping', () => { throw new Error('must not encode'); }),
+      error => error.code === 715 && error.message === 'call deadline exceeded' && error.retrySafe);
+    const other = assert.rejects(client.prepare('route', contract), error => {
+      assert.equal(error.code, 707);
+      assert.equal(error.cause, failure);
+      return true;
+    });
+    rejectConnection(failure);
+    await other;
+    await nextTurn();
+    assert.equal(connects, 1);
+  } finally {
+    rejectConnection(failure);
+    if (descriptor === undefined) delete performance.now;
+    else Object.defineProperty(performance, 'now', descriptor);
+    await client.close();
+  }
+});
+
 test('unary starts its native deadline before encoding and never dispatches an expired input',async()=>{
   let clock=0,dispatched=0;
   const clockDescriptor=Object.getOwnPropertyDescriptor(performance,'now');

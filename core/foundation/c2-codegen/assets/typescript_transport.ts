@@ -560,12 +560,18 @@ class C2CallBudget {
     return this.deadline !== null && performance.now() >= this.deadline;
   }
   async wait<T>(pending: Promise<T>): Promise<T> {
+    // Native setup may have exhausted the budget before returning its Promise.
+    // Observe it before checking the deadline, retaining either outcome for waiters.
+    const observed: Promise<PromiseSettledResult<T>> = pending.then(
+      value => ({ status: "fulfilled", value }),
+      reason => ({ status: "rejected", reason }),
+    );
     const remaining = this.remaining();
-    if (remaining === null) return pending;
-    const result = await waitForCloseReady(pending, remaining, performance.now());
+    const result = remaining === null ? await observed : await waitForCloseReady(observed, remaining, performance.now());
     if (result === undefined) throw callDeadlineError("pre_dispatch");
+    if (result.status === "rejected") throw result.reason;
     this.remaining();
-    return result;
+    return result.value;
   }
   stageLimit(limit: number): number {
     const remaining = this.remaining();
