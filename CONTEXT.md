@@ -145,7 +145,7 @@ The state in which more than one relay holds a live registration of the same rou
 _Avoid_: duplicate route, split brain
 
 **强制离开 / force-leave**:
-The deployer's declaration, made at any live relay, that an unreachable relay has left the mesh. Every relay that cannot reach it forgets it and its routes, so its route names can be registered elsewhere.
+The deployer's declaration, made at any live relay, that an unreachable relay has left the mesh. Each relay that already sees it as unreachable forgets it and its routes, so its route names can be registered elsewhere. It is not a ban: the relay joins again when it comes back.
 _Avoid_: release (for this operation), evict
 
 **端点 / endpoint**:

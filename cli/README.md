@@ -13,6 +13,7 @@ This guide covers the native c3 interface. Configuration is documented in the [c
 - `c3 relay` starts the HTTP relay used for cross-machine discovery.
 - `c3 registry list-routes` lists route names registered with a relay.
 - `c3 registry peers` lists peer relays known by a mesh relay.
+- `c3 registry force-leave` makes a mesh relay forget an unreachable relay.
 - `c3 endpoint inspect/reap/sweep` projects native local endpoint maintenance.
 - `c3 contract` validates/releases `c-two.contract.v2` descriptors and composes complete Rust, Python, or TypeScript project trees.
 
@@ -182,7 +183,15 @@ List known mesh peers:
 c3 registry peers --relay http://127.0.0.1:8080
 ```
 
-Registry requests use a five-second HTTP timeout. Malformed route or peer responses fail the command with a JSON error. By default, the CLI bypasses system proxy settings for relay inspection unless the relay layer is configured to use proxies.
+Force an unreachable relay to leave the mesh:
+
+```bash
+c3 registry force-leave relay-c --relay http://127.0.0.1:8080
+```
+
+The relay given with `--relay` accepts only a relay it currently sees as Suspect or Dead. It forgets that relay together with its routes and tombstones and passes the declaration on to its live peers; each peer applies it only if it also sees that relay as Suspect or Dead. Relays notice a lost peer at slightly different times, so a relay that still saw it as Alive when the declaration arrived keeps it: check `c3 registry peers` on the other relays and run the command there once they show it as Suspect or Dead. The command prints `Force-left relay-c.` and exits 0. A relay that is still Alive in that relay's view, the relay itself, an unknown relay and an invalid relay ID are refused, and the command prints the relay's reason and exits 1. Force-leave is not a ban: a force-left relay that becomes reachable again joins the relays it still remembers, and after a restart it joins through its seeds. A restarted relay without seeds starts alone, because no relay looks for it any more.
+
+Registry requests use a five-second HTTP timeout. A failed request, a refusal or a malformed response fails the command with an error message and exit code 1. By default, the CLI bypasses system proxy settings for relay inspection unless the relay layer is configured to use proxies.
 
 ## Development
 

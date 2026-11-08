@@ -121,6 +121,8 @@ ADR 0004 的几处用词与[术语表](../../CONTEXT.md)冲突或重复。下面
 
 退出条件：部署方对任一个 relay 的一次操作让整个网格忘掉一个失联的 relay；拒绝条件与回来之后的行为有测试；文档写明；全平台 CI 通过。
 
+执行记录（2026-11-08）：检查改用进程内 relay 的测试配置缩短心跳与探测，因为 c3 没有暴露这些时限，不为测试加配置项。验收时发现，被强制离开而又没有种子的 relay 在分区愈合后回不来：别的 relay 已经忘掉它，不再探测它；它的死对端探测恢复后只发摘要，对方不认识它而忽略。改为死对端探测恢复时先发 `RelayJoin`、再交换摘要，返回的全量同步不合并；普通的分区愈合也走这条路。另外，各 relay 发现失联的时刻不同，声明到达时仍把它看作 Alive 的 relay 不处理，部署方在那里再执行一次；退出条件里的“整个网格忘掉”以各 relay 已看到它失联为前提。
+
 ### 块 6：relay 网格里名字唯一
 
 范围：注册时除了本地，还检查对端：名字已由存活的对端持有，或者仍归一个失联的 relay，都报 `ResourceAlreadyRegistered`，细节写明持有的 relay 与它的状态。失联（Suspect 或 Dead）relay 名下的路由不再删除，不参与解析；名字只由它们持有时，解析报 `ResourceUnavailable`。解析至多返回一次注册，删除按 (registered_at, relay_id) 排序的逻辑。同一个名字在多个 relay 上都有在线注册时（分区愈合之后，或者两个 relay 同时接受了同一个新名字），新的获取在派发前报 719 `RouteConflict`；已有的代理按块 3、块 4 的规则停在它当前的 relay 上，不跨到别的注册。`/_routes`（`c3 registry list-routes`）标出冲突的注册与仍归失联 relay 的路由，relay 在发现冲突与冲突解除时各记一条日志。对端消息与全量同步去掉 route_uid（决定 B）。c2-error 新增 719，Python 加 `RouteConflict` 类、`ERROR_Code` 成员与映射，Rust 与 TypeScript 加映射。按决定 D，在参考文档与 `cli/README.md` 写明 Host 崩溃之后名字怎样回来。顺带改掉 `sdk/python/src/c_two/error.py` 里重复注册错误把 route name 写成 resource name 的 docstring（待办第 5 项）。
