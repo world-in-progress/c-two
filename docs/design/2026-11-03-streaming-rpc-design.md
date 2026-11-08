@@ -1,6 +1,6 @@
 # 流式 RPC 设计
 
-状态：已批准（2026-11-04），块 1 至 9 已实施并验收，见[第一阶段](../acceptance/2026-11-04-streaming-phase-1-acceptance.md)与[第二、三阶段](../acceptance/2026-11-08-streaming-acceptance.md)的验收记录；分支 `socu/streaming` 尚未合入上游 main。维护者按推荐裁定第十二节的七项，服务端结束流选 (b)，决定记在 [ADR 0003](../decisions/0003-server-streams.md)；执行计划在第十节，进度只记在[待办](backlog.md)。源码依据为 `645f06631450a5aa71a4d241757e98406c16c410`；源码推论与待运行验证分别标明，不把设计视为已有能力。
+状态：已批准（2026-11-04），块 1 至 9 已实施并验收，见[第一阶段](../acceptance/2026-11-04-streaming-phase-1-acceptance.md)与[第二、三阶段](../acceptance/2026-11-08-streaming-acceptance.md)的验收记录，2026-11-08 经 [world-in-progress/c-two#219](https://github.com/world-in-progress/c-two/pull/219) 合入上游 main（`a5ab5eaa`）。维护者按推荐裁定第十二节的七项，服务端结束流选 (b)，决定记在 [ADR 0003](../decisions/0003-server-streams.md)；执行计划在第十节，进度只记在[待办](backlog.md)。源码依据为 `645f06631450a5aa71a4d241757e98406c16c410`；源码推论与待运行验证分别标明，不把设计视为已有能力。
 
 第一期做服务端流：一次输入、零到多个输出条目；同步生成器由 Rust 按步推进，等需求、额度或 I/O 时不占执行线程，每步结束释放路由许可。async unary 不作前置。unary 与流共用调用记录和传输实现；完整值接收方按整条预约，只有边收边转发的一跳使用有限滚动窗口。直接 IPC、同进程及 relay 的端到端证明完成后，才接受本期能力。
 
