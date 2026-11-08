@@ -1015,6 +1015,115 @@ fn a_not_found_post_is_pre_dispatch_and_the_next_call_refreshes_the_route() {
 }
 
 #[test]
+fn only_authoritative_contract_refusal_reacquires_the_http_target() {
+    let _environment = relay_env_lock();
+    for code in [
+        ErrorCode::CallCapacityExceeded,
+        ErrorCode::CallDeadlineExceeded,
+        ErrorCode::IdentityMismatch,
+        ErrorCode::ProtocolViolation,
+        ErrorCode::ContractMismatch,
+    ] {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let (shutdown, stopped) = tokio::sync::oneshot::channel();
+        let (ready, started) = std::sync::mpsc::channel();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        let thread = std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async move {
+                    let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+                    let app = Router::new()
+                        .route("/_probe/{route}", get(|| async { StatusCode::OK }))
+                        .route(
+                            "/{route}/{method}",
+                            post(move || {
+                                observed.fetch_add(1, Ordering::SeqCst);
+                                async move {
+                                    (
+                                        StatusCode::SERVICE_UNAVAILABLE,
+                                        Json(
+                                            C2Error::new(code, "pre-dispatch refusal")
+                                                .with_details(BTreeMap::from([(
+                                                    "dispatch_phase".into(),
+                                                    "pre_dispatch".into(),
+                                                )]))
+                                                .envelope(),
+                                        ),
+                                    )
+                                }
+                            }),
+                        );
+                    ready.send(()).unwrap();
+                    axum::serve(listener, app)
+                        .with_graceful_shutdown(async {
+                            let _ = stopped.await;
+                        })
+                        .await
+                        .unwrap();
+                });
+        });
+        started.recv().unwrap();
+        let data = RegistryServer {
+            url,
+            shutdown: Some(shutdown),
+            thread: Some(thread),
+        };
+        let expected = release().expected_route(unique_name("refusal")).unwrap();
+        let resolves = Arc::new(AtomicUsize::new(0));
+        let registry = registry_server(
+            RelayRouteInfo {
+                name: expected.route_name.clone(),
+                relay_url: data.url.clone(),
+                ipc_address: None,
+                server_id: None,
+                server_instance_id: None,
+                crm_ns: expected.crm_ns.clone(),
+                crm_name: expected.crm_name.clone(),
+                crm_ver: expected.crm_ver.clone(),
+                abi_hash: expected.abi_hash.clone(),
+                signature_hash: expected.signature_hash.clone(),
+                max_payload_size: 1024,
+            },
+            resolves.clone(),
+        );
+        let runtime = Runtime::new(runtime_options(
+            unique_name("refusal-runtime"),
+            Some(registry.url.clone()),
+        ))
+        .unwrap();
+        let client = runtime.connect(expected, Connect::RelayAware).unwrap();
+        for round in 1..=2 {
+            let Error::Semantic(error) = client.call_owned("echo", b"input").unwrap_err() else {
+                panic!("typed refusal")
+            };
+            assert_eq!(error.code, code);
+            assert_eq!(error.details["transport_phase"], "pre_dispatch");
+            assert_eq!(calls.load(Ordering::SeqCst), round, "no business replay");
+            let acquisitions = if code == ErrorCode::ContractMismatch {
+                round
+            } else {
+                1
+            };
+            assert_eq!(
+                resolves.load(Ordering::SeqCst),
+                acquisitions,
+                "only the route fact invalidates the target: {code:?}"
+            );
+            assert_eq!(
+                runtime.path_counters().relay_aware_relay(),
+                acquisitions as u64
+            );
+        }
+    }
+}
+
+#[test]
 fn service_error_is_not_replayed() {
     let _environment = relay_env_lock();
     struct Fails {

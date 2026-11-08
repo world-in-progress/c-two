@@ -24,10 +24,12 @@ mod session;
 pub use c2_config::{ConnectOptions, ConnectTimeoutError};
 pub use c2_ipc::DirectIpcShutdownOutcome;
 pub use c2_server::{ServerFailure, ServerStartupStage, ServerStartupTimeout};
+#[doc(hidden)]
+pub use c2_wire::handshake::ServerIdentity;
 pub use call_scope::{CallScope, CallScopeError, CallState};
 pub use client::{
-    Client, Connect, EncodedCall, EncodedClient, HeldResponse, NativeEndpointContext, ObservedPath,
-    PathCounters, PreparedCall,
+    CallBudget, Client, Connect, EncodedCall, EncodedClient, HeldResponse, NativeEndpointContext,
+    ObservedPath, PathCounters, PreparedCall,
 };
 pub use client_stream::{CoreResponseStream, CoreStreamCloseReceipt};
 pub use connect_deadline::{ConnectAttempt, connect_deadline_error};

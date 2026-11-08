@@ -127,6 +127,20 @@ enum Operation {
 }
 
 impl CallScope {
+    pub(crate) fn from_deadline(deadline: Option<Instant>) -> Self {
+        let state = if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            CallState::ExpiredPreDispatch
+        } else {
+            CallState::PreDispatch
+        };
+        Self {
+            inner: Arc::new(ScopeState {
+                deadline,
+                state: AtomicU8::new(state as u8),
+            }),
+        }
+    }
+
     /// Resolve policy once, at logical-call entry, against this path's default.
     /// `After(ZERO)` is already expired; `None`/`Unlimited` needs no timer.
     pub fn new(

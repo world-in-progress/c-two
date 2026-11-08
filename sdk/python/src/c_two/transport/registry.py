@@ -55,7 +55,7 @@ from c_two.error import (
     RegistryUnavailable,
 )
 from .input_lifetime import _InputLifetime
-from .client.proxy import CRMProxy
+from .client.proxy import CRMProxy, _FollowingLocalRoute
 from ._snapshots import CallExecutionSnapshot, LifecycleSnapshot, ShutdownOutcome
 from .server.scheduler import ConcurrencyConfig
 from .server.native import NativeServerBridge as Server
@@ -594,6 +594,8 @@ class Runtime:
                 if address is None and server is not None
                 else None
             )
+            if local is not None and local[1] is not None and local[1].snapshot().closed:
+                local = None
             local_copy_tracker = runtime_session.local_copy_tracker()
 
             remote = address is not None or local is None
@@ -611,6 +613,9 @@ class Runtime:
                 name=name,
                 scheduler=scheduler,
                 local_copy_tracker=local_copy_tracker,
+                following_local=_FollowingLocalRoute(
+                    self, runtime_session, crm_class, name, crm_instance, scheduler,
+                ),
             )
         elif address is not None and address.startswith(('http://', 'https://')):
             # HTTP mode — cross-node via relay server.

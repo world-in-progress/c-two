@@ -35,7 +35,6 @@ struct Endpoint {
 }
 #[derive(Default)]
 struct Bindings {
-    server: Option<(String, String)>,
     clients: HashMap<String, Client>,
 }
 pub struct C2MemFfiCall(Arc<Call>);
@@ -318,12 +317,24 @@ impl Endpoint {
             abi_hash: field(&contract, "abiHash")?,
             signature_hash: field(&contract, "signatureHash")?,
         };
+        let supplied = self
+            .options
+            .get("expectedServerIdentity")
+            .map(|value| {
+                Ok::<_, Error>(c2_core::ServerIdentity {
+                    server_id: field(value, "serverId")?,
+                    server_instance_id: field(value, "serverInstanceId")?,
+                })
+            })
+            .transpose()?;
         let connection = {
             let mut connection = self.connection.lock();
             if connection.is_none() {
-                *connection = Some(Arc::new(
-                    runtime.native_endpoint_context(&self.address, &attempt)?,
-                ));
+                *connection = Some(Arc::new(runtime.native_endpoint_context(
+                    &self.address,
+                    supplied,
+                    &attempt,
+                )?));
             }
             connection.as_ref().unwrap().clone()
         };
@@ -338,27 +349,8 @@ impl Endpoint {
         let identity = client
             .ipc_server_identity()
             .ok_or_else(|| invalid("IPC handshake identity missing"))?;
-        let pair = (
-            identity.server_id.clone(),
-            identity.server_instance_id.clone(),
-        );
         let observation = client.connection_observation()?;
         let mut bindings = self.bindings.lock();
-        let supplied = self
-            .options
-            .get("expectedServerIdentity")
-            .map(|v| Ok::<_, Error>((field(v, "serverId")?, field(v, "serverInstanceId")?)))
-            .transpose()?;
-        if supplied
-            .as_ref()
-            .or(bindings.server.as_ref())
-            .is_some_and(|expected| expected != &pair)
-        {
-            return Err(refused(
-                ErrorCode::IdentityMismatch,
-                "IPC server identity mismatch",
-            ));
-        }
         if self.closed.load(Ordering::Acquire) {
             connection.deactivate();
             return Err(refused(
@@ -374,7 +366,6 @@ impl Endpoint {
                 ));
             }
         }
-        bindings.server.get_or_insert(pair);
         bindings.clients.insert(route, client);
         Ok(
             json!({"serverId":identity.server_id,"serverInstanceId":identity.server_instance_id,"connectionId":observation.connection_id().to_string()}),

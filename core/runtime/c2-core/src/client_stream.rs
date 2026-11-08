@@ -1,5 +1,7 @@
 //! Synchronous facade over one original server-stream call record.
 
+use crate::client::ClientTarget;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use c2_http::client::{HttpError, HttpResponseStream, HttpStreamCancellation};
@@ -17,6 +19,7 @@ use crate::{CallScope, CallState, Error, HeldResponse, TransportPhase, normalize
 /// operation slot until the actual terminal, independently of this facade.
 pub struct CoreResponseStream {
     stream: Mutex<StreamTransport>,
+    target: Arc<ClientTarget>,
     cancellation: IpcStreamCancellation,
     http_cancellation: HttpStreamCancellation,
     scope: CallScope,
@@ -123,13 +126,14 @@ pub struct CoreStreamCloseReceipt {
 
 impl CoreResponseStream {
     pub(crate) fn new(
-        stream: StreamTransport,
+        (stream, target): (StreamTransport, Arc<ClientTarget>),
         scope: CallScope,
         cancellation: IpcStreamCancellation,
         http_cancellation: HttpStreamCancellation,
     ) -> Self {
         Self {
             stream: Mutex::new(stream),
+            target,
             cancellation,
             http_cancellation,
             scope,
@@ -161,6 +165,9 @@ impl CoreResponseStream {
             }
             None => stream.recv().await,
         };
+        if let Err(error) = &received {
+            self.target.observe_error(error);
+        }
         publish_received(&self.scope, received)
     }
 
@@ -232,6 +239,9 @@ impl CoreResponseStream {
             Some(Ok(terminal)) => {
                 let complete_items = terminal.complete_items();
                 let outcome = terminal.outcome();
+                if let Err(error) = &outcome {
+                    self.target.observe_error(error);
+                }
                 if outcome.is_ok() {
                     let _ = self.scope.complete_success();
                 } else {
@@ -244,6 +254,7 @@ impl CoreResponseStream {
                 }
             }
             Some(Err(error)) => {
+                self.target.observe_error(&error);
                 let _ = self.scope.complete_failure();
                 CoreStreamCloseReceipt {
                     completed: true,

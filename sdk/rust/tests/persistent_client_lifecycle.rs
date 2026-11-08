@@ -2,6 +2,7 @@
 #[path = "fixtures/persistent_client_lifecycle.rs"]
 mod fixture;
 
+use c_two::CallOptions;
 use c_two::generated::EncodedClient;
 use fixture::{Fixture, PathKind, observe_until};
 use std::sync::{Arc, Barrier};
@@ -211,19 +212,8 @@ fn route_authority(path: PathKind) {
         assert!(outcome.local_removed && outcome.close.active_drained);
         assert!(outcome.close.close_error.is_none());
     });
-    if path == PathKind::Http {
-        assert_eq!(route.calls(), 1);
-        fixture.assert_paths(1);
-        assert_eq!(
-            fixture.outgoing_ids().len(),
-            usize::from(path == PathKind::Local)
-        );
-        drop((old, route));
-        fixture.finish();
-        return;
-    }
-    // This new acquisition resolves the now absent route without first trying
-    // a cached IPC candidate; the old proxy below still retains its carrier.
+    // A known closed target is re-acquired on the next call. With the route
+    // absent, that acquisition fails before entering any resource callback.
     fixture.client_runtime.clear_relay_projection_cache();
     fixture::assert_semantic(
         fixture.connect_name("authority").unwrap_err(),
@@ -236,7 +226,11 @@ fn route_authority(path: PathKind) {
     fixture::assert_semantic(
         old.call_owned("echo", &fixture::encode("removed"))
             .unwrap_err(),
-        fixture::ErrorCode::ResourceRemoved,
+        if path == PathKind::Direct {
+            fixture::ErrorCode::ResourceRemoved
+        } else {
+            fixture::ErrorCode::ResourceNotFound
+        },
     );
     assert_eq!(route.calls(), 1);
     let replacement = fixture.register("authority");
@@ -249,7 +243,7 @@ fn route_authority(path: PathKind) {
         fixture.outgoing_ids().len(),
         usize::from(path != PathKind::Http)
     );
-    fixture.assert_paths(2);
+    fixture.assert_paths(3);
     drop((old, fresh, route, replacement));
     fixture.finish();
 }
@@ -285,7 +279,7 @@ fn relay_local_removed_and_reregistered_routes_preserve_old_binding() {
     fixture.call(&fresh, &replacement, "fresh");
     assert_eq!(replacement.calls(), 2);
     assert_eq!(fixture.outgoing_ids(), physical);
-    fixture.assert_paths(2);
+    fixture.assert_paths(3);
     drop((old, fresh, route, replacement));
     fixture.finish();
 }
@@ -381,7 +375,7 @@ fn real_process_same_endpoint_reregistration(path: PathKind) {
     let terminal = acquired.close_with_timeout(Some(fixture::WAIT));
     assert!(terminal.completed && terminal.terminal.unwrap().is_ok());
     assert_eq!(peer.snapshot()["opens"], 3);
-    fixture.assert_paths(2);
+    fixture.assert_paths(3);
     drop((original, current, acquired, first, item, old, fresh));
     peer.stop();
     fixture.finish();
@@ -450,7 +444,11 @@ fn route_errors_are_local(path: PathKind) {
         b_client
             .call_owned("echo", &fixture::encode("removed-b"))
             .unwrap_err(),
-        fixture::ErrorCode::ResourceRemoved,
+        if path == PathKind::Direct {
+            fixture::ErrorCode::ResourceRemoved
+        } else {
+            fixture::ErrorCode::ResourceNotFound
+        },
     );
     let replacement = fixture.register("b");
     fixture.call(&b_client, &replacement, "current-b");
@@ -464,7 +462,7 @@ fn route_errors_are_local(path: PathKind) {
     fixture.call(&a_client, &a, "a-after-b-errors");
     assert_eq!((a.calls(), b.calls(), replacement.calls()), (3, 1, 1));
     assert_eq!(fixture.outgoing_ids(), physical);
-    fixture.assert_paths(2);
+    fixture.assert_paths(3);
     drop((a_client, b_client, a, b, replacement));
     fixture.finish();
 }
@@ -622,19 +620,23 @@ fn persistent_resource_process() {
 // connection ends; concurrent retired registration/withdrawal evidence cannot
 // remove or deactivate its new owner. Rust streams over HTTP as well.
 #[test]
-fn direct_peer_end_preserves_delivered_item_and_recovers_only_new_acquire() {
+fn direct_peer_end_preserves_delivered_item_and_existing_proxy_follows() {
     peer_end_and_recovery(PathKind::Direct);
 }
 #[test]
-fn relay_local_peer_end_preserves_delivered_item_and_recovers_only_new_acquire() {
+fn relay_local_peer_end_preserves_delivered_item_and_existing_proxy_follows() {
     peer_end_and_recovery(PathKind::Local);
 }
 #[test]
-fn relay_http_peer_end_preserves_delivered_item_and_recovers_only_new_acquire() {
+fn relay_http_peer_end_preserves_delivered_item_and_existing_proxy_follows() {
     peer_end_and_recovery(PathKind::Http);
 }
 fn peer_end_and_recovery(path: PathKind) {
-    let fixture = Fixture::new(path, 0.0, 0);
+    let fixture = if path == PathKind::Direct {
+        Fixture::new(path, 0.0, 0)
+    } else {
+        Fixture::with_c3_path(path)
+    };
     let id = fixture::unique("peer-end");
     let mut peer = fixture::ResourceProcess::start(&fixture, &id);
     let old = peer.connect(&fixture);
@@ -680,21 +682,31 @@ fn peer_end_and_recovery(path: PathKind) {
     );
     assert_ne!(peer.ready["resource"], replacement.ready["resource"]);
     assert_eq!(replacement.snapshot()["opens"], 0);
-    if path == PathKind::Http {
-        old.call_owned("ping", &[]).unwrap();
-    } else {
-        let refusal = old.call_owned("ping", &[]).unwrap_err();
-        println!("C2_PERSISTENT_OLD_PROXY_REFUSAL {refusal:?}");
-    }
-    assert_eq!(
-        replacement.snapshot()["unary"],
-        if path == PathKind::Http { 1 } else { 0 }
-    );
-    let fresh = replacement.connect(&fixture);
+    let view = old.with_call_options(CallOptions::default());
+    let barrier = Arc::new(Barrier::new(8));
+    std::thread::scope(|scope| {
+        let mut calls = Vec::new();
+        for index in 0..8 {
+            let barrier = barrier.clone();
+            let client = if index % 2 == 0 {
+                old.clone()
+            } else {
+                view.clone()
+            };
+            calls.push(scope.spawn(move || {
+                barrier.wait();
+                client.call_owned("ping", &[]).unwrap();
+            }));
+        }
+        for call in calls {
+            call.join().unwrap();
+        }
+    });
+    assert_eq!(replacement.snapshot()["unary"], 8);
     if let Some(identity) = old.ipc_server_identity() {
         assert_eq!(
             identity.server_instance_id,
-            peer.ready["identity"]["server_instance_id"]
+            replacement.ready["identity"]["server_instance_id"]
         );
     }
     assert_eq!(
@@ -702,7 +714,7 @@ fn peer_end_and_recovery(path: PathKind) {
         0,
         "acquisition cannot dispatch the stream"
     );
-    let mut recovered = fixture::open_stream(&fresh, "blocked");
+    let mut recovered = fixture::open_stream(&view, "blocked");
     let item = recovered.next().unwrap().unwrap();
     replacement.assert_item(&item, 1);
     observe_until(|| {
@@ -711,12 +723,12 @@ fn peer_end_and_recovery(path: PathKind) {
             .iter()
             .any(|event| event["index"] == 1)
     });
-    let carrier = (path != PathKind::Http).then(|| fresh.connection_observation().unwrap());
+    let carrier = (path != PathKind::Http).then(|| old.connection_observation().unwrap());
     fixture::race_old_owner_evidence(&fixture, &peer);
     let racing = replacement.snapshot();
     assert_eq!(racing["opens"], 1);
     assert_eq!(racing["finishes"], 0);
-    assert_eq!(racing["unary"], if path == PathKind::Http { 1 } else { 0 });
+    assert_eq!(racing["unary"], 8);
     if let Some(carrier) = &carrier {
         assert!(carrier.snapshot().is_none());
     }
@@ -730,9 +742,9 @@ fn peer_end_and_recovery(path: PathKind) {
     let after = replacement.snapshot();
     assert_eq!(after["opens"], 1);
     assert_eq!(after["finishes"], 1);
-    fresh.call_owned("ping", &[]).unwrap();
+    view.call_owned("ping", &[]).unwrap();
     let healthy = replacement.snapshot();
-    assert_eq!(healthy["unary"], if path == PathKind::Http { 2 } else { 1 });
+    assert_eq!(healthy["unary"], 9);
     assert_eq!(
         healthy["physical_opened"], after["physical_opened"],
         "old evidence must not force a new data carrier"
@@ -745,9 +757,144 @@ fn peer_end_and_recovery(path: PathKind) {
         fixture.outgoing_ids().len(),
         if path == PathKind::Http { 0 } else { 2 }
     );
-    fixture.assert_paths(2);
-    drop((stream, recovered, first, item, second, old, fresh));
+    fixture.assert_paths(if path == PathKind::Http { 1 } else { 2 });
+    drop((stream, recovered, first, item, second, old, view));
     replacement.stop();
+    fixture.finish();
+}
+
+#[test]
+fn direct_existing_proxy_follows_restart_with_unavailable_relay_anchor() {
+    let fixture = Fixture::direct_with_unavailable_relay();
+    let server_id = fixture::unique("direct-unavailable-relay");
+    let mut old_owner = fixture::ResourceProcess::start(&fixture, &server_id);
+    let proxy = old_owner.connect(&fixture);
+    proxy.call_owned("ping", &[]).unwrap();
+    let old_connection = proxy.connection_observation().unwrap();
+    old_owner.kill();
+    observe_until(|| old_connection.snapshot().is_some());
+    assert!(old_connection.snapshot().unwrap().is_peer_end());
+    let mut replacement = fixture::ResourceProcess::start(&fixture, &server_id);
+    proxy.call_owned("ping", &[]).unwrap();
+    assert_eq!(replacement.snapshot()["unary"], 1);
+    assert_eq!(proxy.observed_path(), PathKind::Direct.observed());
+    assert_ne!(
+        proxy.connection_observation().unwrap().connection_id(),
+        old_connection.connection_id()
+    );
+    assert_eq!(fixture.outgoing_ids().len(), 2);
+    fixture.assert_paths(2);
+    drop(proxy);
+    replacement.stop();
+    fixture.finish();
+}
+
+#[test]
+fn relay_aware_proxy_switches_local_http_local_through_real_c3_mesh() {
+    c3_mesh_follow(false);
+}
+
+#[test]
+fn explicit_http_proxy_follows_between_real_c3_relays_after_one_refusal() {
+    c3_mesh_follow(true);
+}
+
+fn c3_mesh_follow(explicit: bool) {
+    let mut fixture = Fixture::with_c3_path(PathKind::Local);
+    let relay_a = fixture.relay_url().unwrap();
+    let relay_b = fixture.add_c3_peer();
+    let mut owner_a = fixture::ResourceProcess::start(&fixture, &fixture::unique("mesh-a"));
+    let client = if explicit {
+        fixture
+            .client_runtime
+            .connect(
+                fixture::stream_expected("process-route"),
+                c_two::Connect::ExplicitRelay {
+                    relay_url: relay_a.clone(),
+                },
+            )
+            .unwrap()
+    } else {
+        owner_a.connect(&fixture)
+    };
+    let first_path = if explicit {
+        c_two::observe::ObservedPath::ExplicitRelay
+    } else {
+        PathKind::Local.observed()
+    };
+    assert_eq!(client.observed_path(), first_path);
+    client.call_owned("ping", &[]).unwrap();
+    assert_eq!(owner_a.snapshot()["unary"], 1);
+    owner_a.command_barrier("unregister", "unregistered");
+    if !explicit {
+        fixture::assert_semantic(
+            client.call_owned("ping", &[]).unwrap_err(),
+            fixture::ErrorCode::ResourceRemoved,
+        );
+    }
+    fixture::wait_relay_absent(&fixture, &relay_b);
+    let mut owner_b = fixture::ResourceProcess::start_with_relay(
+        &fixture,
+        &fixture::unique("mesh-b"),
+        Some(relay_b.clone()),
+    );
+    fixture::wait_relay_owner(
+        &fixture,
+        &relay_b,
+        owner_b.ready["identity"]["server_instance_id"]
+            .as_str()
+            .unwrap(),
+    );
+    fixture::wait_relay_target(&fixture, &relay_a, &relay_b);
+    if explicit {
+        fixture::assert_semantic(
+            client.call_owned("ping", &[]).unwrap_err(),
+            fixture::ErrorCode::ResourceNotFound,
+        );
+        assert_eq!(owner_b.snapshot()["unary"], 0);
+    }
+    client.call_owned("ping", &[]).unwrap();
+    assert_eq!(owner_b.snapshot()["unary"], 1);
+    assert_eq!(
+        client.observed_path(),
+        if explicit {
+            c_two::observe::ObservedPath::ExplicitRelay
+        } else {
+            PathKind::Http.observed()
+        }
+    );
+    assert!(client.connection_observation().is_err());
+    owner_b.command_barrier("unregister", "unregistered");
+    fixture::wait_relay_absent(&fixture, &relay_a);
+    owner_a.command_barrier("register", "registered");
+    fixture::wait_relay_owner(
+        &fixture,
+        &relay_a,
+        owner_a.ready["identity"]["server_instance_id"]
+            .as_str()
+            .unwrap(),
+    );
+    fixture::assert_semantic(
+        client.call_owned("ping", &[]).unwrap_err(),
+        fixture::ErrorCode::ResourceNotFound,
+    );
+    assert_eq!(owner_a.snapshot()["unary"], 1);
+    client.call_owned("ping", &[]).unwrap();
+    assert_eq!(owner_a.snapshot()["unary"], 2);
+    assert_eq!(client.observed_path(), first_path);
+    if !explicit {
+        assert!(client.connection_observation().is_ok());
+    }
+    let counters = fixture.client_runtime.path_counters();
+    if explicit {
+        assert_eq!(counters.explicit_relay(), 3);
+    } else {
+        assert_eq!(counters.relay_aware_local_ipc(), 2);
+        assert_eq!(counters.relay_aware_relay(), 1);
+    }
+    drop(client);
+    owner_b.stop();
+    owner_a.stop();
     fixture.finish();
 }
 

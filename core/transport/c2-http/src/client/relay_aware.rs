@@ -1,4 +1,4 @@
-//! Relay-aware HTTP client with route failover.
+//! Relay-aware HTTP client with acquisition-time route selection.
 
 use c2_mem::retention::{BudgetedBuffer, PayloadBufferBudget, PayloadBufferReservation};
 use std::net::IpAddr;
@@ -99,6 +99,11 @@ pub enum RelayResolvedTarget {
     Http { relay_url: String },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SelectedHttpTarget {
+    relay_url: String,
+}
+
 impl RelayResolvedTarget {
     pub fn as_url(&self) -> &str {
         match self {
@@ -115,7 +120,7 @@ pub struct RelayAwareHttpClient {
     expected: ExpectedRouteContract,
     use_proxy: bool,
     config: RelayAwareClientConfig,
-    current: Mutex<Option<String>>,
+    current: Mutex<Option<SelectedHttpTarget>>,
     anchor_allows_local_ipc: bool,
     local_endpoint_context: Option<LocalEndpointContext>,
     default_local_endpoint_context: OnceLock<Option<LocalEndpointContext>>,
@@ -234,7 +239,7 @@ impl RelayAwareHttpClient {
             .map_err(|source| HttpCallError::new(http_call_error_phase(&source), source))
     }
 
-    /// Resolve once and issue one route-bound streaming business POST. The
+    /// Issue one route-bound streaming business POST to the selected target. The
     /// returned actor retains the original operation slot through CALL_END.
     #[doc(hidden)]
     pub async fn stream_controlled_async(
@@ -268,78 +273,22 @@ impl RelayAwareHttpClient {
         cancellation: HttpStreamCancellation,
         control: &HttpCallControl,
     ) -> Result<HttpResponseStream, HttpError> {
-        let budget = control.payload_budget().unwrap_or(&self.payload_budget);
-        let attempts = self.config.max_attempts.max(1);
-        let mut last_error = None;
-        for attempt in 0..attempts {
-            let routes = match self
-                .resolve_routes_async(
-                    attempt > 0,
-                    false,
-                    Some(control),
-                    c2_config::ConnectDeadline::default(),
-                )
-                .await
-            {
-                Ok(routes) if !routes.routes.is_empty() => routes,
-                Ok(_) => {
-                    return Err(HttpError::ServerError(
-                        404,
-                        resource_not_found_body(self.route_name()),
-                    ));
-                }
-                Err(error) if resolve_retryable(&error) && attempt + 1 < attempts => {
-                    last_error = Some(error);
-                    continue;
-                }
-                Err(error) => return Err(error),
-            };
-            for route in self.order_routes(routes.routes) {
-                let relay_url = route.relay_url.trim_end_matches('/').to_string();
-                let client = match self.acquire_route_client(&relay_url, Some(control)) {
-                    Ok(client) => client,
-                    Err(error @ HttpError::LocalCallRejected(_)) => return Err(error),
-                    Err(error) => {
-                        last_error = Some(error);
-                        continue;
-                    }
-                };
-                let result = client
-                    .client
-                    .stream_route_async(
-                        &self.expected,
-                        route.max_payload_size,
-                        method_name,
-                        HttpCallInput::Owned(data),
-                        budget,
-                        send_headroom,
-                        completion_owner,
-                        cancellation,
-                        control,
-                    )
-                    .await;
-                match result {
-                    Ok(stream) => {
-                        *self.current.lock() = Some(relay_url);
-                        return Ok(stream);
-                    }
-                    Err(error) if route_not_found(&error) => {
-                        self.control.invalidate(self.route_name());
-                        *self.current.lock() = None;
-                        return Err(error);
-                    }
-                    Err(error) => return Err(error),
-                }
-            }
-            if attempt + 1 < attempts {
-                check_active(Some(control))?;
-                tokio::time::sleep(Duration::from_millis(50)).await;
-                check_active(Some(control))?;
-            }
-        }
-        Err(last_error.unwrap_or_else(|| {
-            HttpError::ServerError(404, resource_not_found_body(self.route_name()))
-        }))
+        check_active(Some(control))?;
+        let target = self.selected_http_target()?;
+        let client = self.acquire_route_client(&target.relay_url, Some(control))?;
+        client
+            .client
+            .stream_route_async(
+                &self.expected,
+                method_name,
+                HttpCallInput::Owned(data),
+                control.payload_budget().unwrap_or(&self.payload_budget),
+                send_headroom,
+                completion_owner,
+                cancellation,
+                control,
+            )
+            .await
     }
 
     pub fn connect(&self) -> Result<(), HttpError> {
@@ -357,6 +306,16 @@ impl RelayAwareHttpClient {
         super::http_client::runtime_with_deadline(deadline)?
             .handle()
             .block_on(self.select_target_with_local_exclusions_async(true, &[], false, deadline))
+    }
+
+    /// Forget the shared route-resolution cache before a Core reacquisition.
+    /// Existing selected targets continue to serve their current registration.
+    pub fn invalidate_resolution_with_deadline(
+        &self,
+        deadline: c2_config::ConnectDeadline,
+    ) -> Result<(), HttpError> {
+        self.control
+            .invalidate_with_deadline(self.route_name(), deadline)
     }
 
     pub fn resolve_http_target_with_deadline(
@@ -421,7 +380,6 @@ impl RelayAwareHttpClient {
                 .resolve_routes_async(
                     attempt > 0 || fallback_denied_when_only_excluded,
                     prefer_local_ipc,
-                    None,
                     deadline,
                 )
                 .await
@@ -474,6 +432,7 @@ impl RelayAwareHttpClient {
                 &routes,
                 &self.expected,
             ) {
+                *super::connect_deadline::lock(&self.current, deadline, "relay_select")? = None;
                 return Ok(RelayResolvedTarget::Ipc { candidate });
             }
 
@@ -510,15 +469,15 @@ impl RelayAwareHttpClient {
                 match probe {
                     Ok(()) => {
                         *super::connect_deadline::lock(&self.current, deadline, "relay_select")? =
-                            Some(relay_url.clone());
+                            Some(SelectedHttpTarget {
+                                relay_url: relay_url.clone(),
+                            });
                         return Ok(RelayResolvedTarget::Http { relay_url });
                     }
                     Err(err @ HttpError::LocalCallRejected(_)) => return Err(err),
                     Err(err) if route_not_found(&err) => {
                         self.control
                             .invalidate_with_deadline(self.route_name(), deadline)?;
-                        *super::connect_deadline::lock(&self.current, deadline, "relay_select")? =
-                            None;
                         last_error = Some(err);
                     }
                     Err(err) if terminal_route_refusal(&err) => return Err(err),
@@ -561,102 +520,27 @@ impl RelayAwareHttpClient {
         let budget = control
             .and_then(HttpCallControl::payload_budget)
             .unwrap_or(&self.payload_budget);
-        let mut data = Some(data);
-        let attempts = self.config.max_attempts.max(1);
-        let mut last_error = None;
+        check_active(control)?;
+        let target = self.selected_http_target()?;
+        let client = self.acquire_route_client(&target.relay_url, control)?;
+        client
+            .client
+            .call_route_async(&self.expected, method_name, data, budget, control)
+            .await
+    }
 
-        for attempt in 0..attempts {
-            let routes = match self
-                .resolve_routes_async(
-                    attempt > 0,
-                    false,
-                    control,
-                    c2_config::ConnectDeadline::default(),
-                )
-                .await
-            {
-                Ok(routes) if !routes.routes.is_empty() => routes,
-                Ok(_) => {
-                    return Err(HttpError::ServerError(
-                        404,
-                        resource_not_found_body(self.route_name()),
-                    ));
-                }
-                Err(err) => {
-                    if resolve_retryable(&err) && attempt + 1 < attempts {
-                        last_error = Some(err);
-                        continue;
-                    }
-                    return Err(err);
-                }
-            };
-
-            let ordered = self.order_routes(routes.routes);
-            if ordered.is_empty() {
-                return Err(last_error.unwrap_or_else(|| {
-                    HttpError::ServerError(404, resource_not_found_body(self.route_name()))
-                }));
-            }
-            for route in ordered {
-                let relay_url = route.relay_url.trim_end_matches('/').to_string();
-                let client = match self.acquire_route_client(&relay_url, control) {
-                    Ok(client) => client,
-                    Err(err @ HttpError::LocalCallRejected(_)) => return Err(err),
-                    Err(err) => {
-                        last_error = Some(err);
-                        continue;
-                    }
-                };
-
-                match client
-                    .client
-                    .call_route_async(
-                        &self.expected,
-                        route.max_payload_size,
-                        method_name,
-                        data.take()
-                            .expect("the request owner is consumed at its sole business POST"),
-                        budget,
-                        control,
-                    )
-                    .await
-                {
-                    Ok(bytes) => {
-                        *self.current.lock() = Some(relay_url);
-                        return Ok(bytes);
-                    }
-                    Err(HttpError::CrmError(err)) => return Err(HttpError::CrmError(err)),
-                    Err(err) if route_not_found(&err) => {
-                        self.control.invalidate(self.route_name());
-                        *self.current.lock() = None;
-                        // No input is retained solely for a possible replay.
-                        // The next logical call acquires the fresh route.
-                        return Err(err);
-                    }
-                    Err(err) => return Err(err),
-                }
-            }
-
-            if attempt + 1 < attempts {
-                check_active(control)?;
-                tokio::time::sleep(Duration::from_millis(50)).await;
-                check_active(control)?;
-            }
-        }
-
-        Err(last_error.unwrap_or_else(|| {
-            HttpError::ServerError(404, resource_not_found_body(self.route_name()))
-        }))
+    fn selected_http_target(&self) -> Result<SelectedHttpTarget, HttpError> {
+        self.current.lock().clone().ok_or_else(|| {
+            HttpError::InvalidInput("HTTP route target has not been acquired".into())
+        })
     }
 
     async fn resolve_routes_async(
         &self,
         force_refresh: bool,
         prefer_local_ipc: bool,
-        control: Option<&HttpCallControl>,
         deadline: c2_config::ConnectDeadline,
     ) -> Result<RelayResolvedRoutes, HttpError> {
-        check_active(control)?;
         if force_refresh {
             self.control
                 .invalidate_with_deadline(self.route_name(), deadline)?;
@@ -664,19 +548,16 @@ impl RelayAwareHttpClient {
         let routes = self
             .resolve_with_endpoint_context_async(prefer_local_ipc, deadline)
             .await;
-        check_active(control)?;
         let routes = routes?;
         let raw_routes_non_empty = !routes.routes.is_empty();
         let local_endpoint_namespace = routes.local_endpoint_namespace;
         let filtered = filter_routes_by_expected_contract(routes.routes, &self.expected);
         if !force_refresh && raw_routes_non_empty && filtered.is_empty() {
-            check_active(control)?;
             self.control
                 .invalidate_with_deadline(self.route_name(), deadline)?;
             let refreshed = self
                 .resolve_with_endpoint_context_async(prefer_local_ipc, deadline)
                 .await;
-            check_active(control)?;
             let refreshed = refreshed?;
             let refreshed_routes_non_empty = !refreshed.routes.is_empty();
             let local_endpoint_namespace = refreshed.local_endpoint_namespace;
@@ -766,12 +647,6 @@ impl RelayAwareHttpClient {
         client
     }
 
-    fn order_routes(&self, routes: Vec<RelayRouteInfo>) -> Vec<RelayRouteInfo> {
-        // Calls retain their existing policy; only connect supplies a deadline.
-        self.order_routes_with_deadline(routes, c2_config::ConnectDeadline::default())
-            .expect("unlimited connection budget cannot expire")
-    }
-
     fn order_routes_with_deadline(
         &self,
         routes: Vec<RelayRouteInfo>,
@@ -785,7 +660,7 @@ impl RelayAwareHttpClient {
         let mut preferred = Vec::new();
         let mut rest = Vec::new();
         for route in routes {
-            if route.relay_url.trim_end_matches('/') == current {
+            if route.relay_url.trim_end_matches('/') == current.relay_url {
                 preferred.push(route);
             } else {
                 rest.push(route);
@@ -937,7 +812,7 @@ fn canonical_relay_error_body(
 fn resolve_retryable(err: &HttpError) -> bool {
     matches!(
         err,
-        HttpError::Transport(_) | HttpError::ServerError(500..=599, _)
+        HttpError::Transport(_) | HttpError::Request(_) | HttpError::ServerError(500..=599, _)
     )
 }
 
@@ -1267,7 +1142,6 @@ mod tests {
         RelayRouteInfo {
             name,
             relay_url,
-
             ipc_address: None,
             server_id: None,
             server_instance_id: None,
@@ -1289,7 +1163,7 @@ mod tests {
             get(move |headers: axum::http::HeaderMap| {
                 let probes = observed_probes.clone();
                 async move {
-                    assert!(!headers.contains_key(concat!("x-c2-route-", "uid")));
+                    assert!(!headers.contains_key("x-c2-route-uid"));
                     if probes.fetch_add(1, Ordering::SeqCst) == 0 {
                         (
                             StatusCode::NOT_FOUND,
@@ -1314,9 +1188,8 @@ mod tests {
         let (registry_url, registry_task) = spawn_app(Router::new().route(
             "/_resolve/{route}",
             get(move || {
-                let count = observed_resolves.fetch_add(1, Ordering::SeqCst);
+                observed_resolves.fetch_add(1, Ordering::SeqCst);
                 let route = route_info("grid".into(), advertised_relay.clone());
-                let _ = count;
                 async move { Json(vec![route]) }
             }),
         ))
@@ -1642,7 +1515,7 @@ mod tests {
     }
 
     fn route_uid_header_absent(headers: &HeaderMap) -> bool {
-        !headers.contains_key(concat!("x-c2-route-", "uid"))
+        !headers.contains_key("x-c2-route-uid")
     }
 
     async fn probe_requires_expected_crm_headers(headers: HeaderMap) -> Response {
@@ -1694,12 +1567,27 @@ mod tests {
         (url, handle)
     }
 
+    async fn acquire_http(client: &RelayAwareHttpClient) {
+        assert!(matches!(
+            client.select_target_async(false).await.unwrap(),
+            RelayResolvedTarget::Http { .. }
+        ));
+    }
+
     #[tokio::test]
-    async fn not_found_post_is_not_replayed_and_the_next_call_resolves_again() {
-        let (missing_url, missing_handle) =
-            spawn_app(Router::new().route("/{route}/{method}", post(not_found_call))).await;
-        let (live_url, live_handle) =
-            spawn_app(Router::new().route("/{route}/{method}", post(live_call))).await;
+    async fn not_found_post_is_not_replayed_and_explicit_reacquisition_selects_new_relay() {
+        let (missing_url, missing_handle) = spawn_app(
+            Router::new()
+                .route("/_probe/{route}", get(|| async { StatusCode::OK }))
+                .route("/{route}/{method}", post(not_found_call)),
+        )
+        .await;
+        let (live_url, live_handle) = spawn_app(
+            Router::new()
+                .route("/_probe/{route}", get(|| async { StatusCode::OK }))
+                .route("/{route}/{method}", post(live_call)),
+        )
+        .await;
         let resolve_count = Arc::new(AtomicUsize::new(0));
         let observed_resolves = resolve_count.clone();
         let advertised_missing = missing_url.clone();
@@ -1728,6 +1616,7 @@ mod tests {
             },
         )
         .unwrap();
+        acquire_http(&client).await;
 
         let error = client.call_async("step", b"payload").await.unwrap_err();
         assert!(route_not_found(&error));
@@ -1737,12 +1626,16 @@ mod tests {
             "one logical call does not replay its POST"
         );
         drop(error);
+        client
+            .invalidate_resolution_with_deadline(c2_config::ConnectDeadline::default())
+            .unwrap();
+        acquire_http(&client).await;
         let next = client.call_async("step", b"payload").await.unwrap();
         assert_eq!(next, b"ok:payload");
         assert_eq!(
             resolve_count.load(Ordering::SeqCst),
             2,
-            "a new logical call performs a fresh resolution"
+            "explicit reacquisition performs a fresh resolution"
         );
 
         registry_handle.abort();
@@ -1784,7 +1677,14 @@ mod tests {
         .unwrap();
 
         client.connect_async().await.unwrap();
-        assert_eq!(client.current.lock().as_deref(), Some(live_url.as_str()));
+        assert_eq!(
+            client
+                .current
+                .lock()
+                .as_ref()
+                .map(|target| target.relay_url.as_str()),
+            Some(live_url.as_str())
+        );
         let bytes = client.call_async("step", b"payload").await.unwrap();
         assert_eq!(bytes, b"ok:payload");
 
@@ -2466,10 +2366,18 @@ mod tests {
 
     #[tokio::test]
     async fn generic_502_does_not_prove_route_not_found() {
-        let (bad_url, bad_handle) =
-            spawn_app(Router::new().route("/{route}/{method}", post(generic_bad_gateway))).await;
-        let (live_url, live_handle) =
-            spawn_app(Router::new().route("/{route}/{method}", post(live_call))).await;
+        let (bad_url, bad_handle) = spawn_app(
+            Router::new()
+                .route("/_probe/{route}", get(|| async { StatusCode::OK }))
+                .route("/{route}/{method}", post(generic_bad_gateway)),
+        )
+        .await;
+        let (live_url, live_handle) = spawn_app(
+            Router::new()
+                .route("/_probe/{route}", get(|| async { StatusCode::OK }))
+                .route("/{route}/{method}", post(live_call)),
+        )
+        .await;
         let resolve_count = Arc::new(AtomicUsize::new(0));
         let registry_state = RegistryState {
             stale_url: bad_url,
@@ -2493,6 +2401,7 @@ mod tests {
             },
         )
         .unwrap();
+        acquire_http(&client).await;
 
         let err = client.call_async("step", b"payload").await.unwrap_err();
         assert!(matches!(err, HttpError::ResponseError(502, _)));
@@ -2505,10 +2414,18 @@ mod tests {
 
     #[tokio::test]
     async fn misleading_502_text_does_not_prove_route_not_found() {
-        let (bad_url, bad_handle) =
-            spawn_app(Router::new().route("/{route}/{method}", post(misleading_bad_gateway))).await;
-        let (live_url, live_handle) =
-            spawn_app(Router::new().route("/{route}/{method}", post(live_call))).await;
+        let (bad_url, bad_handle) = spawn_app(
+            Router::new()
+                .route("/_probe/{route}", get(|| async { StatusCode::OK }))
+                .route("/{route}/{method}", post(misleading_bad_gateway)),
+        )
+        .await;
+        let (live_url, live_handle) = spawn_app(
+            Router::new()
+                .route("/_probe/{route}", get(|| async { StatusCode::OK }))
+                .route("/{route}/{method}", post(live_call)),
+        )
+        .await;
         let resolve_count = Arc::new(AtomicUsize::new(0));
         let registry_state = RegistryState {
             stale_url: bad_url,
@@ -2532,6 +2449,7 @@ mod tests {
             },
         )
         .unwrap();
+        acquire_http(&client).await;
 
         let err = client.call_async("step", b"payload").await.unwrap_err();
         assert!(matches!(err, HttpError::ResponseError(502, _)));
@@ -2543,11 +2461,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn structured_404_invalidates_route_without_retaining_replay_input() {
-        let (stale_url, stale_handle) =
-            spawn_app(Router::new().route("/{route}/{method}", post(stale_not_found))).await;
-        let (live_url, live_handle) =
-            spawn_app(Router::new().route("/{route}/{method}", post(live_call))).await;
+    async fn structured_404_waits_for_explicit_reacquisition_without_replay() {
+        let (stale_url, stale_handle) = spawn_app(
+            Router::new()
+                .route("/_probe/{route}", get(|| async { StatusCode::OK }))
+                .route("/{route}/{method}", post(stale_not_found)),
+        )
+        .await;
+        let (live_url, live_handle) = spawn_app(
+            Router::new()
+                .route("/_probe/{route}", get(|| async { StatusCode::OK }))
+                .route("/{route}/{method}", post(live_call)),
+        )
+        .await;
         let resolve_count = Arc::new(AtomicUsize::new(0));
         let registry_state = RegistryState {
             stale_url,
@@ -2571,6 +2497,7 @@ mod tests {
             },
         )
         .unwrap();
+        acquire_http(&client).await;
 
         let error = client.call_async("step", b"payload").await.unwrap_err();
         assert!(route_not_found(&error));
@@ -2580,12 +2507,16 @@ mod tests {
             "one logical call does not replay its POST"
         );
         drop(error);
+        client
+            .invalidate_resolution_with_deadline(c2_config::ConnectDeadline::default())
+            .unwrap();
+        acquire_http(&client).await;
         let next = client.call_async("step", b"payload").await.unwrap_err();
         assert!(route_not_found(&next));
         assert_eq!(
             resolve_count.load(Ordering::SeqCst),
             2,
-            "a new logical call performs a fresh resolution"
+            "explicit reacquisition performs a fresh resolution"
         );
 
         registry_handle.abort();
@@ -2595,10 +2526,18 @@ mod tests {
 
     #[tokio::test]
     async fn generic_404_does_not_prove_route_not_found() {
-        let (bad_url, bad_handle) =
-            spawn_app(Router::new().route("/{route}/{method}", post(generic_not_found))).await;
-        let (live_url, live_handle) =
-            spawn_app(Router::new().route("/{route}/{method}", post(live_call))).await;
+        let (bad_url, bad_handle) = spawn_app(
+            Router::new()
+                .route("/_probe/{route}", get(|| async { StatusCode::OK }))
+                .route("/{route}/{method}", post(generic_not_found)),
+        )
+        .await;
+        let (live_url, live_handle) = spawn_app(
+            Router::new()
+                .route("/_probe/{route}", get(|| async { StatusCode::OK }))
+                .route("/{route}/{method}", post(live_call)),
+        )
+        .await;
         let resolve_count = Arc::new(AtomicUsize::new(0));
         let registry_state = RegistryState {
             stale_url: bad_url,
@@ -2622,6 +2561,7 @@ mod tests {
             },
         )
         .unwrap();
+        acquire_http(&client).await;
 
         let err = client.call_async("step", b"payload").await.unwrap_err();
         assert!(matches!(err, HttpError::ResponseError(404, _)));
@@ -2634,10 +2574,18 @@ mod tests {
 
     #[tokio::test]
     async fn ambiguous_call_failure_is_not_replayed() {
-        let (bad_url, bad_handle) =
-            spawn_app(Router::new().route("/{route}/{method}", post(transient_unavailable))).await;
-        let (live_url, live_handle) =
-            spawn_app(Router::new().route("/{route}/{method}", post(live_call))).await;
+        let (bad_url, bad_handle) = spawn_app(
+            Router::new()
+                .route("/_probe/{route}", get(|| async { StatusCode::OK }))
+                .route("/{route}/{method}", post(transient_unavailable)),
+        )
+        .await;
+        let (live_url, live_handle) = spawn_app(
+            Router::new()
+                .route("/_probe/{route}", get(|| async { StatusCode::OK }))
+                .route("/{route}/{method}", post(live_call)),
+        )
+        .await;
         let resolve_count = Arc::new(AtomicUsize::new(0));
         let registry_state = RegistryState {
             stale_url: bad_url,
@@ -2661,6 +2609,7 @@ mod tests {
             },
         )
         .unwrap();
+        acquire_http(&client).await;
 
         let err = client.call_async("step", b"payload").await.unwrap_err();
         assert!(matches!(err, HttpError::ResponseError(503, _)));
@@ -2678,11 +2627,17 @@ mod tests {
     #[tokio::test]
     async fn canonical_dispatch_uncertain_failure_is_not_replayed() {
         let (bad_url, bad_handle) = spawn_app(
-            Router::new().route("/{route}/{method}", post(dispatch_uncertain_unavailable)),
+            Router::new()
+                .route("/_probe/{route}", get(|| async { StatusCode::OK }))
+                .route("/{route}/{method}", post(dispatch_uncertain_unavailable)),
         )
         .await;
-        let (live_url, live_handle) =
-            spawn_app(Router::new().route("/{route}/{method}", post(live_call))).await;
+        let (live_url, live_handle) = spawn_app(
+            Router::new()
+                .route("/_probe/{route}", get(|| async { StatusCode::OK }))
+                .route("/{route}/{method}", post(live_call)),
+        )
+        .await;
         let resolve_count = Arc::new(AtomicUsize::new(0));
         let registry_state = RegistryState {
             stale_url: bad_url,
@@ -2706,6 +2661,7 @@ mod tests {
             },
         )
         .unwrap();
+        acquire_http(&client).await;
 
         let error = client
             .call_controlled_async(
@@ -2757,7 +2713,14 @@ mod tests {
         .unwrap();
 
         client.connect_async().await.unwrap();
-        assert_eq!(client.current.lock().as_deref(), Some(live_url.as_str()));
+        assert_eq!(
+            client
+                .current
+                .lock()
+                .as_ref()
+                .map(|target| target.relay_url.as_str()),
+            Some(live_url.as_str())
+        );
         assert_eq!(resolve_count.load(Ordering::SeqCst), 2);
 
         registry_handle.abort();
@@ -2802,6 +2765,18 @@ mod tests {
             let (written, received) = oneshot::channel();
             let (end, may_end) = oneshot::channel();
             let task = tokio::spawn(async move {
+                let (mut probe_socket, _) = bounded(listener.accept()).await.unwrap();
+                let mut probe_request = Vec::new();
+                while !probe_request.ends_with(b"\r\n\r\n") {
+                    probe_request.push(bounded(probe_socket.read_u8()).await.unwrap());
+                }
+                assert!(probe_request.starts_with(b"GET /_probe/grid HTTP/1.1\r\n"));
+                bounded(probe_socket.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                ))
+                .await
+                .unwrap();
+                drop(probe_socket);
                 let (mut socket, _) = bounded(listener.accept()).await.unwrap();
                 let mut request = Vec::new();
                 while !request.ends_with(b"\r\n\r\n") {
@@ -2873,6 +2848,7 @@ mod tests {
             )
             .unwrap()
             .with_http_only();
+            acquire_http(&client).await;
             (client, task)
         }
 

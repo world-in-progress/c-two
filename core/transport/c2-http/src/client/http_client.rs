@@ -110,6 +110,10 @@ pub enum HttpError {
     ResponseError(u16, BudgetedBuffer),
 
     /// Network / connection errors.
+    #[error("HTTP request error: {0}")]
+    Request(#[source] reqwest::Error),
+
+    /// Local transport/runtime errors without a reqwest source.
     #[error("HTTP transport error: {0}")]
     Transport(String),
 
@@ -278,14 +282,10 @@ impl HttpClient {
             .map_err(|e| HttpError::Transport(e.to_string()))?;
         // Probes are control-plane operations with an independent safety timeout.
         // Waiting for them never resets the owner's original absolute deadline.
-        let probe_client = if controlled {
-            crate::relay_client_builder_with_proxy(use_proxy)
-                .timeout(Duration::from_secs(5))
-                .build()
-                .map_err(|e| HttpError::Transport(e.to_string()))?
-        } else {
-            client.clone()
-        };
+        let probe_client = crate::relay_client_builder_with_proxy(use_proxy)
+            .timeout(Duration::from_secs(5))
+            .build()
+            .map_err(|e| HttpError::Transport(e.to_string()))?;
         Ok(Self {
             client,
             probe_client,
@@ -297,7 +297,6 @@ impl HttpClient {
     pub(crate) async fn call_route_async(
         &self,
         expected: &ExpectedRouteContract,
-        max_payload_size: u64,
         method_name: &str,
         data: HttpCallInput<'_>,
         budget: &PayloadBufferBudget,
@@ -339,15 +338,14 @@ impl HttpClient {
             .client
             .execute(request)
             .await
-            .map_err(|e| HttpError::Transport(e.to_string()))?;
+            .map_err(HttpError::Request)?;
 
-        crate::payload::read_http_response(resp, max_payload_size, budget, None).await
+        crate::payload::read_http_response(resp, budget, None).await
     }
 
     pub(crate) async fn stream_route_async(
         &self,
         expected: &ExpectedRouteContract,
-        max_payload_size: u64,
         method_name: &str,
         data: HttpCallInput<'_>,
         budget: &PayloadBufferBudget,
@@ -388,7 +386,7 @@ impl HttpClient {
             .client
             .execute(request)
             .await
-            .map_err(|error| HttpError::Transport(error.to_string()))?;
+            .map_err(HttpError::Request)?;
         // The input owner follows the actual reqwest body. This reservation
         // was acquired atomically with it before dispatch and is now unused.
         drop(send_headroom);
@@ -424,7 +422,7 @@ impl HttpClient {
             self.base_url.clone(),
             token,
             budget.clone(),
-            max_payload_size,
+            crate::stream_wire::MAX_TERMINAL_PAYLOAD_BYTES,
             completion_owner,
             cancellation,
         ))
@@ -444,7 +442,7 @@ impl HttpClient {
             .get(&url)
             .send()
             .await
-            .map_err(|e| HttpError::Transport(e.to_string()))?;
+            .map_err(HttpError::Request)?;
         Ok(resp.status().as_u16() == 200)
     }
 
@@ -459,10 +457,7 @@ impl HttpClient {
             encode_segment(&expected.route_name)
         );
         let request = add_expected_contract_headers(self.probe_client.get(&url), expected);
-        let resp = request
-            .send()
-            .await
-            .map_err(|e| HttpError::Transport(e.to_string()))?;
+        let resp = request.send().await.map_err(HttpError::Request)?;
         match resp.status().as_u16() {
             200 => Ok(()),
             code => {
@@ -605,7 +600,6 @@ mod tests {
         let error = client
             .call_route_async(
                 &expected,
-                1024,
                 "step",
                 input,
                 &PayloadBufferBudget::new(1024),

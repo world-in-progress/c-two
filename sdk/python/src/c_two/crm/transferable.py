@@ -233,7 +233,7 @@ def _build_transfer_wrapper(
     method_name = func.__name__
     method_signature = inspect.signature(func)
 
-    def com_to_crm(*args, _c2_buffer=None):
+    def com_to_crm(*args, _c2_buffer=None, _c2_follow_budget=None):
         stage = "call_crm"
         prepared = None
         output_hook = "deserialize"
@@ -253,19 +253,39 @@ def _build_transfer_wrapper(
             and output.supports_scoped_owner
         )
 
-        try:
-            if len(args) < 1:
-                raise ValueError(
-                    "Instance method requires self, but no instance was provided.",
-                )
+        if len(args) < 1:
+            raise ValueError(
+                "Instance method requires self, but no instance was provided.",
+            )
+        crm = args[0]
+        client = crm.client
+        if _c2_follow_budget is not None:
+            client = client.resolve_for_call(_c2_follow_budget)
+        else:
+            following = getattr(client, '_following_local', None)
+            if following is not None:
+                target = following.target
+                if target is not None:
+                    client = client.snapshot_followed_target(target)
+        budget = _c2_follow_budget
 
-            crm = args[0]
-            client = crm.client
+        try:
             request = args[1:] if len(args) > 1 else None
 
             if getattr(client, "supports_direct_call", False):
                 stage = "execute_direct"
-                result = client.call_direct(method_name, request or ())
+                try:
+                    result = client.call_direct(method_name, request or ())
+                except Exception as exc:
+                    from ..transport.client.proxy import _LocalRouteClosed
+                    if not isinstance(exc, _LocalRouteClosed):
+                        raise
+                    if budget is None:
+                        budget = crm.client.start_call_budget()
+                    return com_to_crm(
+                        *args, _c2_buffer=_c2_buffer,
+                        _c2_follow_budget=budget,
+                    )
                 if _c2_buffer == "hold":
                     return HeldResult(result)
                 return result

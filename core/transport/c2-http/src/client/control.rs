@@ -364,10 +364,7 @@ impl RelayControlClient {
             }
             None => request,
         };
-        let resp = request
-            .send()
-            .await
-            .map_err(|e| HttpError::Transport(e.to_string()))?;
+        let resp = request.send().await.map_err(HttpError::Request)?;
         let status = resp.status().as_u16();
         if resp
             .headers()
@@ -464,6 +461,9 @@ impl RelayControlClient {
                 Err(HttpError::Transport(message)) => {
                     last_server_error = Some(HttpError::Transport(message));
                 }
+                Err(HttpError::Request(error)) => {
+                    last_server_error = Some(HttpError::Request(error));
+                }
                 Err(err) => return Err(err),
             }
 
@@ -494,10 +494,7 @@ impl RelayControlClient {
             }
             None => request,
         };
-        let resp = request
-            .send()
-            .await
-            .map_err(|e| HttpError::Transport(e.to_string()))?;
+        let resp = request.send().await.map_err(HttpError::Request)?;
         let status = resp.status().as_u16();
         if success_codes.contains(&status) {
             return Ok(());

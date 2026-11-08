@@ -1576,6 +1576,14 @@ async fn mismatched_http_call_modes_are_not_executed_and_keep_upstream() {
     )
     .unwrap()
     .with_http_only();
+    let client = bounded(tokio::task::spawn_blocking(move || {
+        client
+            .resolve_http_target_with_deadline(c2_config::ConnectDeadline::default())
+            .unwrap();
+        client
+    }))
+    .await
+    .unwrap();
     let budget = c2_mem::retention::PayloadBufferBudget::new(64 * 1024);
     let control =
         HttpCallControl::new(|| Ok(()), || Ok(())).with_payload_budget(budget.clone(), None);
@@ -1738,6 +1746,14 @@ async fn relay_oversized_item_keeps_real_terminal_and_refunds_b() {
     )
     .unwrap()
     .with_http_only();
+    let client = bounded(tokio::task::spawn_blocking(move || {
+        client
+            .resolve_http_target_with_deadline(c2_config::ConnectDeadline::default())
+            .unwrap();
+        client
+    }))
+    .await
+    .unwrap();
     let budget = PayloadBufferBudget::new(4096);
     let control =
         HttpCallControl::new(|| Ok(()), || Ok(())).with_payload_budget(budget.clone(), None);

@@ -226,8 +226,7 @@ pub(crate) struct PreparingCall {
 }
 
 impl PreparingCall {
-    /// The HTTP receive path needs one byte of atomically admitted send/receive
-    /// headroom in addition to the input owner before materialization.
+    /// An HTTP stream admits one receive byte with its input before materialization.
     pub(crate) fn with_stream_http_headroom(mut self) -> Self {
         self.stream_http_headroom = 1;
         self
@@ -839,7 +838,7 @@ fn admission_error(error: RetentionError) -> Error {
     error_out
 }
 
-fn payload_admission_error(error: PayloadBufferError) -> Error {
+pub(crate) fn payload_admission_error(error: PayloadBufferError) -> Error {
     match error {
         PayloadBufferError::DeadlineExceeded => deadline_error(TransportPhase::PreDispatch),
         PayloadBufferError::TooLarge { requested, limit } => {

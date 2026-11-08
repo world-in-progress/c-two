@@ -42,6 +42,31 @@ if TYPE_CHECKING:
     from ..server.scheduler import Scheduler
 
 
+class _LocalRouteClosed(Exception):
+    """Native admission closed before a same-process resource was entered."""
+
+
+class _FollowingLocalRoute:
+    """Target shared by the views of one registered same-process connection."""
+
+    def __init__(self, runtime, session, crm_class, name, resource, scheduler):
+        self.lock = threading.Lock()
+        self.acquire_gate = threading.Lock()
+        self.runtime = runtime
+        self.session = session
+        self.crm_class = crm_class
+        self.name = name
+        self.local = (resource, scheduler)
+        # None means the original local target; later publication is one
+        # immutable local pair or one remote proxy.
+        self.target = None
+
+    def __del__(self):
+        target = self.target
+        if isinstance(target, CRMProxy):
+            target.terminate()
+
+
 def _require_explicit_route_name(name: str, transport: str) -> str:
     if not isinstance(name, str):
         raise TypeError(f'{transport} CRMProxy requires route name as a string')
@@ -67,8 +92,9 @@ class CRMProxy:
 
     __slots__ = (
         '_mode', '_crm', '_client', '_name',
-        '_closed', '_close_lock', '_on_terminate',
+        '_closed_event', '_close_lock', '_on_terminate',
         '_scheduler', '_local_copy_tracker', '_call_options',
+        '_call_timeout', '_call_budget', '_following_local',
     )
 
     # ------------------------------------------------------------------
@@ -84,6 +110,7 @@ class CRMProxy:
         scheduler: Scheduler | None = None,
         on_terminate: Callable[[], None] | None = None,
         local_copy_tracker: Any = None,
+        following_local: _FollowingLocalRoute | None = None,
     ) -> CRMProxy:
         """Create a thread-local proxy (same process, no serialization).
 
@@ -107,11 +134,14 @@ class CRMProxy:
             else ''
         )
         proxy._close_lock = threading.Lock()
-        proxy._closed = False
+        proxy._closed_event = threading.Event()
         proxy._on_terminate = on_terminate
         proxy._scheduler = scheduler
         proxy._local_copy_tracker = local_copy_tracker
         proxy._call_options = None
+        proxy._call_timeout = ...
+        proxy._call_budget = None
+        proxy._following_local = following_local
         return proxy
 
     @classmethod
@@ -136,11 +166,14 @@ class CRMProxy:
         proxy._client = client
         proxy._name = route_name
         proxy._close_lock = threading.Lock()
-        proxy._closed = False
+        proxy._closed_event = threading.Event()
         proxy._on_terminate = on_terminate
         proxy._scheduler = None
         proxy._local_copy_tracker = local_copy_tracker
         proxy._call_options = None
+        proxy._call_timeout = ...
+        proxy._call_budget = None
+        proxy._following_local = None
         return proxy
 
     @classmethod
@@ -163,11 +196,14 @@ class CRMProxy:
         proxy._client = http_client
         proxy._name = route_name
         proxy._close_lock = threading.Lock()
-        proxy._closed = False
+        proxy._closed_event = threading.Event()
         proxy._on_terminate = on_terminate
         proxy._scheduler = None
         proxy._local_copy_tracker = local_copy_tracker
         proxy._call_options = None
+        proxy._call_timeout = ...
+        proxy._call_budget = None
+        proxy._following_local = None
         return proxy
 
     # ------------------------------------------------------------------
@@ -185,6 +221,133 @@ class CRMProxy:
         return self._mode == 'thread'
 
     @property
+    def _closed(self) -> bool:
+        return self._closed_event.is_set()
+
+    def snapshot_followed_target(self, target) -> CRMProxy:
+        """Freeze a published replacement for dispatch with this view's options."""
+        if isinstance(target, tuple):
+            return self._local_snapshot(*target)
+        return self._remote_snapshot(target, None)
+
+    def start_call_budget(self):
+        """Start the deadline after native local admission rejects a call."""
+        if self._following_local is None:
+            return None
+        from ..._native import NativeCallOptions
+        options = self._call_options or NativeCallOptions()
+        return _native_call(options.call_budget)
+
+    def resolve_for_call(self, budget=None) -> CRMProxy:
+        """Capture the current target before choosing direct or encoded dispatch."""
+        state = self._following_local
+        if state is None:
+            return self
+        if self._closed:
+            raise RuntimeError('Proxy is closed')
+
+        target = state.target
+        if isinstance(target, CRMProxy):
+            return self._remote_snapshot(target, budget)
+        resource, scheduler = target if target is not None else state.local
+        if scheduler is None or not scheduler.snapshot().closed:
+            return self._local_snapshot(resource, scheduler)
+
+        # Only callers rejected by native admission enter the acquisition gate.
+        # Publication uses a separate short lock after the native work finishes.
+        if budget is None:
+            budget = self.start_call_budget()
+        attempt = _native_call(budget.connect_attempt) if budget is not None else None
+        from ..registry import _connect_lock, _connect_native_call
+        with _connect_lock(state.acquire_gate, attempt, 'local_route_follow_wait'):
+            current = state.target
+            local = current if isinstance(current, tuple) else state.local
+            if not isinstance(current, CRMProxy) and local[1].snapshot().closed:
+                with _connect_lock(state.runtime._lock, attempt, 'local_session_wait'):
+                    if state.runtime._runtime_session is not state.session:
+                        raise RuntimeError('Runtime session was replaced during route follow')
+                _connect_native_call(state.session.check_active, connect_attempt=attempt)
+                try:
+                    connection = state.runtime._connect(
+                        state.crm_class, name=state.name, address=None, attempt=attempt,
+                    )
+                except LookupError as exc:
+                    from ...error import ResourceClosed
+                    raise ResourceClosed(
+                        f"route {state.name!r} is closed",
+                        details={'route': state.name},
+                    ) from exc
+                target = connection.client
+                try:
+                    with _connect_lock(state.runtime._lock, attempt, 'local_session_wait'):
+                        if state.runtime._runtime_session is not state.session:
+                            raise RuntimeError('Runtime session was replaced during route follow')
+                    _connect_native_call(state.session.check_active, connect_attempt=attempt)
+                except Exception:
+                    target.terminate()
+                    raise
+                if target._mode == 'thread':
+                    if target._scheduler is not None and target._scheduler.snapshot().closed:
+                        target.terminate()
+                        from ...error import ResourceClosed
+                        raise ResourceClosed(
+                            f"route {state.name!r} is closed",
+                            details={'route': state.name},
+                        )
+                    with state.lock:
+                        state.local = (target._crm, target._scheduler)
+                        state.target = state.local
+                    target.terminate()
+                else:
+                    with state.lock:
+                        state.target = target
+            current = state.target
+            local = current if isinstance(current, tuple) else state.local
+        if self._closed:
+            raise RuntimeError('Proxy is closed')
+        if not isinstance(current, CRMProxy):
+            return self._local_snapshot(*local)
+        return self._remote_snapshot(current, budget)
+
+    def _local_snapshot(self, resource, scheduler) -> CRMProxy:
+        target = self._snapshot()
+        target._crm = resource
+        target._scheduler = scheduler
+        target._mode = 'thread'
+        target._client = None
+        target._call_budget = None
+        return target
+
+    def _remote_snapshot(self, remote, budget) -> CRMProxy:
+        with self._close_lock:
+            if self._closed:
+                raise RuntimeError('Proxy is closed')
+            client = self._client
+            if client is None:
+                if self._call_timeout is ...:
+                    client = remote._client
+                else:
+                    client = _native_call(
+                        remote._client.with_call_options,
+                        timeout=self._call_timeout,
+                    )
+                    self._client = client
+            target = self._snapshot()
+            target._mode = client.mode
+            target._client = client
+            target._crm = None
+            target._scheduler = None
+            target._call_budget = budget
+            return target
+
+    def _snapshot(self) -> CRMProxy:
+        snapshot = object.__new__(type(self))
+        for name in self.__slots__:
+            setattr(snapshot, name, getattr(self, name))
+        snapshot._on_terminate = None
+        return snapshot
+
+    @property
     def route_name(self) -> str:
         """Routing name associated with this proxy."""
         return self._name
@@ -192,6 +355,9 @@ class CRMProxy:
     @property
     def observed_path(self) -> str:
         """Core-observed transport path for this remote proxy."""
+        state = self._following_local
+        if state is not None and isinstance(state.target, CRMProxy):
+            return state.target._client.observed_path
         if self._mode == 'thread':
             return 'thread_local'
         return self._client.observed_path
@@ -203,29 +369,34 @@ class CRMProxy:
 
     def with_call_options(self, *, timeout=...) -> CRMProxy:
         """Create an independent connection view with Core-owned call options."""
+        from ..._native import NativeCallOptions
         with self._close_lock:
             if self._closed:
                 raise RuntimeError('Proxy is closed')
-        from ..._native import NativeCallOptions
-
-        view = object.__new__(type(self))
-        for name in self.__slots__:
-            setattr(view, name, getattr(self, name))
-        view._close_lock = threading.Lock()
-        view._closed = False
-        if self._mode == 'thread':
-            view._call_options = NativeCallOptions(timeout=timeout)
-            view._on_terminate = None
-        else:
-            view._client = _native_call(self._client.with_call_options, timeout=timeout)
-            view._on_terminate = view._client.close
-        return view
+            view = object.__new__(type(self))
+            for name in self.__slots__:
+                setattr(view, name, getattr(self, name))
+            view._close_lock = threading.Lock()
+            view._closed_event = threading.Event()
+            if self._mode == 'thread':
+                view._call_options = NativeCallOptions(timeout=timeout)
+                view._call_timeout = timeout
+                view._client = None
+                view._on_terminate = None
+            else:
+                view._client = _native_call(self._client.with_call_options, timeout=timeout)
+                view._on_terminate = view._client.close
+            return view
 
     def begin_call(self, method_name: str):
         """Reserve the Core operation before Python input serialization."""
         with self._close_lock:
             if self._closed:
                 raise RuntimeError('Proxy is closed')
+        if self._call_budget is not None:
+            budget = self._call_budget
+            self._call_budget = None
+            return _native_call(self._client.begin_call_with_budget, method_name, budget)
         return _native_call(self._client.begin_call, method_name)
 
     def prepare_call(self, method_name: str):
@@ -237,6 +408,10 @@ class CRMProxy:
         with self._close_lock:
             if self._closed:
                 raise RuntimeError('Proxy is closed')
+        if self._call_budget is not None:
+            budget = self._call_budget
+            self._call_budget = None
+            return _native_call(self._client.begin_stream_with_budget, method_name, budget)
         return _native_call(self._client.begin_stream, method_name)
 
     def open_direct_stream(self, method_name: str, args: tuple):
@@ -245,15 +420,36 @@ class CRMProxy:
         with self._close_lock:
             if self._closed:
                 raise RuntimeError('Proxy is closed')
-        _native_call((self._call_options or NativeCallOptions()).validate_thread)
+        try:
+            _native_call((self._call_options or NativeCallOptions()).validate_thread)
+        except Exception as exc:
+            from ...error import UnsupportedCallMode
+            if (
+                isinstance(exc, UnsupportedCallMode)
+                and self._following_local is not None
+                and self._scheduler is not None
+                and self._scheduler.snapshot().closed
+            ):
+                raise _LocalRouteClosed() from exc
+            raise
         if self._scheduler is None:
             raise RuntimeError('same-process streams require a registered native route')
         method = getattr(self._crm, method_name)
-        return _native_call(
-            self._scheduler.open_stream,
-            self._scheduler.method_idx(method_name),
-            lambda: _ResourceStream(method, args=args, encoded=False),
-        )
+        try:
+            return _native_call(
+                self._scheduler.open_stream,
+                self._scheduler.method_idx(method_name),
+                lambda: _ResourceStream(method, args=args, encoded=False),
+            )
+        except Exception as exc:
+            from ...error import ResourceClosed
+            if (
+                isinstance(exc, ResourceClosed)
+                and self._following_local is not None
+                and self._scheduler.snapshot().closed
+            ):
+                raise _LocalRouteClosed() from exc
+            raise
 
     def call(self, method_name: str, data: bytes | bytearray | memoryview | None = None) -> bytes:
         """Send a serialized CRM call (IPC or HTTP mode).
@@ -286,7 +482,18 @@ class CRMProxy:
                 'call_direct() only available in thread-local mode',
             )
         from ..._native import NativeCallOptions
-        _native_call((self._call_options or NativeCallOptions()).validate_thread)
+        try:
+            _native_call((self._call_options or NativeCallOptions()).validate_thread)
+        except Exception as exc:
+            from ...error import UnsupportedCallMode
+            if (
+                isinstance(exc, UnsupportedCallMode)
+                and self._following_local is not None
+                and self._scheduler is not None
+                and self._scheduler.snapshot().closed
+            ):
+                raise _LocalRouteClosed() from exc
+            raise
         method = getattr(self._crm, method_name, None)
         if method is None:
             raise AttributeError(
@@ -306,6 +513,11 @@ class CRMProxy:
                 from ...error import CCError, ResourceClosed
                 cc_err = CCError.deserialize(memoryview(error_bytes))
                 if isinstance(cc_err, ResourceClosed) and self._name:
+                    if (
+                        self._following_local is not None
+                        and self._scheduler.snapshot().closed
+                    ):
+                        raise _LocalRouteClosed() from exc
                     raise ResourceClosed(
                         f"route {self._name!r} is closed",
                         details={'route': self._name},
@@ -314,12 +526,13 @@ class CRMProxy:
                     raise cc_err from exc
             if str(exc) == 'route closed':
                 from ...error import ResourceClosed
+                if (
+                    self._following_local is not None
+                    and self._scheduler.snapshot().closed
+                ):
+                    raise _LocalRouteClosed() from exc
                 details = {'route': self._name} if self._name else {}
-                message = (
-                    f"route {self._name!r} is closed"
-                    if self._name
-                    else 'route is closed'
-                )
+                message = f"route {self._name!r} is closed" if self._name else 'route is closed'
                 raise ResourceClosed(message, details=details) from exc
             raise
         try:
@@ -333,9 +546,15 @@ class CRMProxy:
             if self._closed:
                 from ...error import ResourceClosed
                 raise ResourceClosed('CRM proxy is closed')
-            if self._mode != 'ipc':
+            if self._mode == 'thread' and self._following_local is None:
                 from ...error import UnsupportedCallMode
                 raise UnsupportedCallMode('connection observation requires a physical IPC connection')
+            state = self._following_local
+            if state is not None:
+                if not isinstance(state.target, CRMProxy):
+                    from ...error import UnsupportedCallMode
+                    raise UnsupportedCallMode('connection observation requires a physical IPC connection')
+                return _native_call(state.target._client.connection_observation)
             return _native_call(self._client.connection_observation)
 
     def terminate(self) -> None:
@@ -343,9 +562,19 @@ class CRMProxy:
         with self._close_lock:
             if self._closed:
                 return
-            self._closed = True
-        if self._on_terminate is not None:
-            self._on_terminate()
+            self._closed_event.set()
+            callback = self._on_terminate
+            self._on_terminate = None
+            owned_client = self._client if self._mode == 'thread' else None
+            shared_target = self._following_local
+            self._following_local = None
+        try:
+            if owned_client is not None:
+                owned_client.close()
+            if callback is not None:
+                callback()
+        finally:
+            del shared_target
 
 
 def _native_call(operation, *args, **kwargs):

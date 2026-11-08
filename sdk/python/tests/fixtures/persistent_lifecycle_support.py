@@ -225,13 +225,13 @@ class Lab:
             self.wait_route(label)
         return resource
 
-    def routes(self, label: str) -> list[dict]:
+    def routes(self, label: str, *, relay_url: str | None = None) -> list[dict]:
         expected = crm_contract(Lifecycle)
         query = urllib.parse.urlencode({key: getattr(expected, key) for key in (
             "crm_ns", "crm_name", "crm_ver", "abi_hash", "signature_hash",
         )})
         response = self.http.get(
-            f"{self.anchor.url}/_resolve/{self.name(label)}?{query}",
+            f"{relay_url or self.anchor.url}/_resolve/{self.name(label)}?{query}",
             headers={"x-c2-local-namespace": self.server._runtime_session.local_endpoint_context().namespace_id},
         )
         if response.status_code == 404:

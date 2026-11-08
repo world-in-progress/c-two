@@ -330,7 +330,7 @@ pub fn normalize_ipc_error(error: IpcError, phase: TransportPhase) -> Error {
         ),
         IpcError::RouteRemoved { route_name } => semantic_route_error(
             ErrorCode::ResourceRemoved,
-            format!("route removed: {route_name}"),
+            format!("route {route_name} was removed"),
             [("route", route_name)],
         ),
         IpcError::RouteClosed { route_name, reason } => semantic_route_error(
@@ -352,6 +352,7 @@ pub fn normalize_ipc_error(error: IpcError, phase: TransportPhase) -> Error {
         } => Error::Semantic(
             C2Error::new(ErrorCode::IdentityMismatch, "IPC server identity mismatch").with_details(
                 BTreeMap::from([
+                    ("transport_phase".to_string(), "pre_dispatch".to_string()),
                     ("actual_server_id".to_string(), actual_server_id),
                     (
                         "actual_server_instance_id".to_string(),
@@ -408,6 +409,10 @@ fn semantic_route_error<const N: usize>(
             details
                 .into_iter()
                 .map(|(key, value)| (key.to_string(), value))
+                .chain([
+                    ("transport_phase".into(), "pre_dispatch".into()),
+                    ("dispatch_phase".into(), "pre_dispatch".into()),
+                ])
                 .collect(),
         ),
     )

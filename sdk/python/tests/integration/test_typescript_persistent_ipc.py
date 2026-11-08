@@ -822,6 +822,7 @@ def test_generated_node_real_peer_end_is_uncertain_without_replay(
     Direct and relay-local break an entered server stream; HTTP breaks an
     entered unary. A completed result remains completed after EOF. A fresh
     acquisition recovers against the restarted resource, before dispatch.
+    An unpinned direct proxy also follows the restarted resource itself.
     """
     import uuid
     from tests.fixtures.typescript_idle_gates import GateProcess, node_gate_client
@@ -880,7 +881,12 @@ def test_generated_node_real_peer_end_is_uncertain_without_replay(
                     still_settled = node("finish-call", id="settled")
                     _gate_identity(still_settled, identity, _GATE_PATHS[mode])
                     assert still_settled["value"]["calls"] == 2, still_settled
-                    if mode != "http":
+                    if mode == "direct":
+                        old_proxy = node()
+                        _gate_identity(old_proxy, new_identity, _GATE_PATHS[mode])
+                        assert old_proxy["value"]["calls"] == 1, old_proxy
+                        assert len(old_proxy["dispatches"]) == len(still_settled["dispatches"]) + 1, old_proxy
+                    elif mode == "relay-local":
                         old_proxy = node()
                         assert _gate_error(old_proxy)["code"] == 710, old_proxy
                         assert old_proxy["error"]["transportPhase"] == "pre_dispatch", old_proxy
@@ -888,7 +894,7 @@ def test_generated_node_real_peer_end_is_uncertain_without_replay(
                     _gate_identity(recovered, new_identity, _GATE_PATHS[mode])
                     assert recovered["value"]["server_instance_id"] != old_b["value"]["server_instance_id"]
                     new_stats = new.request()
-                    assert new_stats["resources"]["manager"]["calls"] == 0, new_stats
+                    assert new_stats["resources"]["manager"]["calls"] == (1 if mode == "direct" else 0), new_stats
                     assert new_stats["resources"]["manager"]["stream_calls"] == 0, new_stats
                     assert new_stats["resources"]["builder"]["calls"] == 1, new_stats
                     ledger = [json.loads(line) for line in (tmp_path / "resources.jsonl").read_text(encoding="utf-8").splitlines()]
@@ -948,17 +954,22 @@ def test_generated_node_old_candidate_cannot_discard_restarted_relay_owner(
                         # Fresh already includes the paused manager POST record.
                         assert sum(item["method"] == "POST" for item in refused["http"]) == sum(item["method"] == "POST" for item in fresh["http"]), refused
                     else:
-                        _reject(refused)
+                        assert _gate_error(refused)["code"] == 710, refused
+                        assert refused["error"]["transportPhase"] == "pre_dispatch", refused
                     after_old = new.request()
                     assert after_old["resources"]["manager"]["calls"] == (1 if mode == "http" else 0), after_old
                     assert after_old["resources"]["builder"]["calls"] == 1, after_old
+                    if mode == "relay-local":
+                        # The old endpoint context connects once to check its
+                        # explicit identity. It cannot use the builder's carrier.
+                        assert len(set(after_old["connections"]["opened"]) - set(alive["connections"]["opened"])) == 1, (alive, after_old)
                     kept = node(route="builder")
                     _gate_identity(kept, new_identity, _GATE_PATHS[mode])
                     assert kept["observations"][-1]["routeName"] == fresh["observations"][-1]["routeName"] == "builder"
                     if mode == "relay-local":
                         assert kept["preparations"][-1]["connectionId"] == fresh["preparations"][-1]["connectionId"]
                     kept_stats = new.request()
-                    assert kept_stats["connections"]["opened"] == alive["connections"]["opened"], (alive, kept_stats)
+                    assert kept_stats["connections"]["opened"] == after_old["connections"]["opened"], (after_old, kept_stats)
                     assert kept["value"]["calls"] == 2, kept
                     assert kept_stats["resources"]["builder"]["calls"] == 2, kept_stats
                     current = node(client="main" if mode == "http" else "fresh")

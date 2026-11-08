@@ -10,15 +10,46 @@ use std::time::Duration;
 #[derive(Debug, Clone, Copy)]
 pub struct ConnectAttempt {
     deadline: ConnectDeadline,
+    call: bool,
 }
 
 impl ConnectAttempt {
+    pub(crate) const fn from_deadline(deadline: ConnectDeadline) -> Self {
+        Self {
+            deadline,
+            call: true,
+        }
+    }
+
     pub fn start(options: c2_config::ConnectOptions) -> Result<Self, Error> {
         let deadline = ConnectDeadline::start(options)
             .map_err(|error| crate::LifecycleError::Configuration(error.to_string()))?;
-        let attempt = Self { deadline };
+        let attempt = Self {
+            deadline,
+            call: false,
+        };
         attempt.check("connect_start")?;
         Ok(attempt)
+    }
+
+    fn expired(&self, stage: &str) -> Error {
+        if self.call {
+            crate::call_execution::scope_error(crate::CallScopeError::DeadlineExceeded {
+                phase: crate::TransportPhase::PreDispatch,
+            })
+        } else {
+            connect_deadline_error(stage)
+        }
+    }
+
+    pub(crate) fn classify(&self, error: Error) -> Error {
+        if self.call
+            && matches!(&error, Error::Semantic(error) if error.code == ErrorCode::CallDeadlineExceeded)
+        {
+            self.expired("call_reacquire")
+        } else {
+            error
+        }
     }
 
     pub fn check(&self, stage: &str) -> Result<(), Error> {
@@ -28,7 +59,7 @@ impl ConnectAttempt {
     pub fn remaining(&self, stage: &str) -> Result<Option<Duration>, Error> {
         self.deadline
             .remaining("connect_attempt")
-            .map_err(|_| connect_deadline_error(stage))
+            .map_err(|_| self.expired(stage))
     }
 
     pub fn lock<'a, T>(
@@ -41,7 +72,7 @@ impl ConnectAttempt {
             None => mutex.lock(),
             Some(instant) => mutex
                 .try_lock_until(instant)
-                .ok_or_else(|| connect_deadline_error(stage))?,
+                .ok_or_else(|| self.expired(stage))?,
         };
         self.check(stage)?;
         Ok(guard)

@@ -1114,12 +1114,12 @@ impl Runtime {
         self.state.lock().path_counters
     }
 
-    pub(crate) fn publish_client_with_deadline(
+    pub(crate) fn publish_client_with_deadline<T>(
         &self,
         path: ObservedPath,
         deadline: ConnectDeadline,
-        publish: impl FnOnce() -> crate::Client,
-    ) -> Result<crate::Client, crate::Error> {
+        publish: impl FnOnce() -> T,
+    ) -> Result<T, crate::Error> {
         let mut state = connect_state_lock(&self.state, deadline, "connect_finish")?;
         state.ensure_active()?;
         let client = publish();
@@ -2406,6 +2406,7 @@ impl Runtime {
         call_timeout_secs: f64,
         remote_payload_chunk_size: u64,
         deadline: ConnectDeadline,
+        refresh: bool,
     ) -> Result<RelayResolvedConnection, crate::Error> {
         connect_stage_check(deadline, "relay_acquire")?;
         let frozen_context = connect_state_lock(&self.state, deadline, "runtime_relay_wait")?
@@ -2430,6 +2431,13 @@ impl Runtime {
         )
         .map_err(|error| crate::normalize_http_error(error, crate::TransportPhase::PreDispatch))?;
         let client = self.project_relay_client_context_with_deadline(client, true, deadline)?;
+        if refresh {
+            client
+                .invalidate_resolution_with_deadline(deadline)
+                .map_err(|error| {
+                    crate::normalize_http_error(error, crate::TransportPhase::PreDispatch)
+                })?;
+        }
         match client
             .resolve_target_with_deadline(deadline)
             .map_err(|error| {
@@ -2484,6 +2492,7 @@ impl Runtime {
         call_timeout_secs: f64,
         remote_payload_chunk_size: u64,
         deadline: ConnectDeadline,
+        refresh: bool,
     ) -> Result<RelayAwareHttpClient, crate::Error> {
         connect_stage_check(deadline, "relay_acquire")?;
         let client = RelayAwareHttpClient::new(
@@ -2501,6 +2510,13 @@ impl Runtime {
         let client = self
             .project_relay_client_context_with_deadline(client, false, deadline)?
             .with_http_only();
+        if refresh {
+            client
+                .invalidate_resolution_with_deadline(deadline)
+                .map_err(|error| {
+                    crate::normalize_http_error(error, crate::TransportPhase::PreDispatch)
+                })?;
+        }
         match client
             .resolve_http_target_with_deadline(deadline)
             .map_err(|error| {

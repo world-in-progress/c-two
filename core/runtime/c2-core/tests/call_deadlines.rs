@@ -1048,6 +1048,38 @@ fn check_http_refresh(expire: bool, uncertain_error: bool, initial_resolve: bool
         ..Default::default()
     })
     .unwrap();
+    if initial_resolve {
+        // The SDK starts the business budget before its initial acquisition.
+        // This uses the same absolute deadline and never serializes or dispatches input.
+        resolves.store(1, Ordering::SeqCst);
+        let budget = c2_core::CallBudget::new(finite(), None).unwrap();
+        let attempt = budget.connect_attempt();
+        let acquiring = runtime.clone();
+        let caller = std::thread::spawn(move || {
+            acquiring
+                .connect_with_attempt(expected, Connect::RelayAware, &attempt)?
+                .begin_call_with_budget("echo", budget)?
+                .encode_vec(b"original-input".to_vec())?
+                .call_owned()
+        });
+        refresh_entered
+            .recv_timeout(EVENT_WAIT)
+            .expect("initial acquisition entered resolution");
+        assert_semantic(
+            caller.join().unwrap().unwrap_err(),
+            ErrorCode::CallDeadlineExceeded,
+            "pre_dispatch",
+        );
+        gate.add_permits(1);
+        assert_eq!(
+            runtime.call_execution_snapshot().unwrap().used_operations,
+            0
+        );
+        assert_eq!(runtime.payload_buffer_stats().unwrap().used_bytes, 0);
+        assert_eq!(first_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(next_calls.load(Ordering::SeqCst), 0);
+        return;
+    }
     let client = runtime
         .connect(expected, Connect::RelayAware)
         .unwrap()
@@ -1057,9 +1089,6 @@ fn check_http_refresh(expire: bool, uncertain_error: bool, initial_resolve: bool
         runtime.call_execution_snapshot().unwrap().used_operations,
         0
     );
-    if initial_resolve {
-        runtime.clear_relay_projection_cache();
-    }
     let next_call = client.clone();
     let caller = std::thread::spawn(move || client.call_owned("echo", b"original-input"));
     if uncertain_error {
@@ -1069,24 +1098,6 @@ fn check_http_refresh(expire: bool, uncertain_error: bool, initial_resolve: bool
         assert_eq!(error.code, ErrorCode::ResourceFunctionExecuting);
         assert!(!error.details.contains_key("dispatch_phase"));
         assert_eq!(resolves.load(Ordering::SeqCst), 1);
-        assert_eq!(next_calls.load(Ordering::SeqCst), 0);
-    } else if initial_resolve {
-        refresh_entered
-            .recv_timeout(EVENT_WAIT)
-            .expect("the initial call must enter route resolution");
-        assert_semantic(
-            caller.join().unwrap().unwrap_err(),
-            ErrorCode::CallDeadlineExceeded,
-            "pre_dispatch",
-        );
-        let still_owned = runtime.call_execution_snapshot().unwrap();
-        assert_eq!(still_owned.used_operations, 1);
-        assert_eq!(
-            runtime.payload_buffer_stats().unwrap().used_bytes,
-            b"original-input".len() as u64
-        );
-        gate.add_permits(1);
-        observe_until(|| runtime.call_execution_snapshot().unwrap().used_operations == 0);
         assert_eq!(next_calls.load(Ordering::SeqCst), 0);
     } else {
         let Error::Semantic(not_found) = caller.join().unwrap().unwrap_err() else {
@@ -1113,14 +1124,11 @@ fn check_http_refresh(expire: bool, uncertain_error: bool, initial_resolve: bool
                 ErrorCode::CallDeadlineExceeded,
                 "pre_dispatch",
             );
-            let still_owned = runtime.call_execution_snapshot().unwrap();
-            assert_eq!(still_owned.used_operations, 1);
-            assert_eq!(
-                runtime.payload_buffer_stats().unwrap().used_bytes,
-                b"original-input".len() as u64
-            );
-            gate.add_permits(1);
+            // Acquisition has its own projection of this same D. Unlike a
+            // dispatched call it ends at expiry, independently of the server gate.
             observe_until(|| runtime.call_execution_snapshot().unwrap().used_operations == 0);
+            assert_eq!(runtime.payload_buffer_stats().unwrap().used_bytes, 0);
+            gate.add_permits(1);
             assert_eq!(next_calls.load(Ordering::SeqCst), 0);
         } else {
             gate.add_permits(1);
@@ -1148,8 +1156,73 @@ fn http_business_error_has_no_authority_to_repeat_unknown_post() {
     check_http_refresh(false, true, false);
 }
 #[test]
-fn http_initial_call_route_wait_expires_pre_dispatch_without_business_post() {
+fn http_initial_call_budget_bounds_acquisition_before_business_post() {
     check_http_refresh(true, false, true);
+}
+
+#[test]
+fn reacquisition_waiter_deadline_does_not_cancel_the_shared_leader() {
+    let first_calls = Arc::new(AtomicUsize::new(0));
+    let next_calls = Arc::new(AtomicUsize::new(0));
+    let first = http_data(true, false, first_calls.clone());
+    let next = http_data(false, false, next_calls.clone());
+    let expected = ContractRelease::from_descriptor_json(DESCRIPTOR.as_bytes())
+        .unwrap()
+        .expected_route(unique("shared-refresh"))
+        .unwrap();
+    let resolves = Arc::new(AtomicUsize::new(0));
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let (entered, refresh_entered) = mpsc::channel();
+    let registry = http_server(|_| {
+        Router::new()
+            .route("/_resolve/{route}", get(http_resolve))
+            .with_state(RefreshState {
+                first: http_route(&expected, &first.url),
+                next: http_route(&expected, &next.url),
+                resolves: resolves.clone(),
+                refresh_entered: entered,
+                gate: gate.clone(),
+            })
+    });
+    let _release_on_unwind = AsyncGateRelease(gate.clone());
+    let runtime = Runtime::new(RuntimeOptions {
+        relay_anchor_address: Some(registry.url.clone()),
+        use_process_relay_anchor: false,
+        ..Default::default()
+    })
+    .unwrap();
+    let client = runtime
+        .connect(expected, Connect::RelayAware)
+        .unwrap()
+        .with_call_options(CallOptions::with_timeout(CallTimeout::Unlimited));
+    assert_semantic(
+        client.call_owned("echo", b"refused").unwrap_err(),
+        ErrorCode::ResourceNotFound,
+        "pre_dispatch",
+    );
+    let leader = client.clone();
+    let leader = std::thread::spawn(move || leader.call_owned("echo", b"leader"));
+    refresh_entered
+        .recv_timeout(EVENT_WAIT)
+        .expect("leader entered acquisition");
+    let waiter = client.with_call_options(finite());
+    assert_semantic(
+        waiter.call_owned("echo", b"waiter").unwrap_err(),
+        ErrorCode::CallDeadlineExceeded,
+        "pre_dispatch",
+    );
+    assert_eq!(
+        resolves.load(Ordering::SeqCst),
+        2,
+        "waiter must share the in-progress acquisition"
+    );
+    assert_eq!(next_calls.load(Ordering::SeqCst), 0);
+    gate.add_permits(1);
+    assert_eq!(leader.join().unwrap().unwrap(), b"leader");
+    assert_eq!(next_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(runtime.path_counters().relay_aware_relay(), 2);
+    assert_eq!(client.call_owned("echo", b"after").unwrap(), b"after");
+    assert_eq!(resolves.load(Ordering::SeqCst), 2);
 }
 
 #[derive(Clone)]

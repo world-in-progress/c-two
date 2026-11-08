@@ -101,15 +101,14 @@ def test_route_close_remove_and_reregister_use_current_authority(lab):
             resource.release.set()
         lab.assert_reply(running.result(5), resource, "x" * (256 * 1024))
         removing.result(5)
-    # After relay withdrawal a new name lookup has no matching resource.
-    # The already-bound IPC proxy still addresses the removed route name.
+    # A closed target is re-acquired on its next call. Relay discovery then
+    # reports the absent route before the proxy enters a callback.
     acquire_removed = cc.error.ResourceRemoved
     call_removed = cc.error.ResourceRemoved
     if lab.anchor is not None:
         wait_state(lambda: lab.routes("target"), lambda routes: not routes)
         acquire_removed = cc.error.ResourceNotFound
-        if lab.path == "relay_aware_relay":
-            call_removed = cc.error.ResourceNotFound
+        call_removed = cc.error.ResourceNotFound
     with pytest.raises(acquire_removed):
         lab.connect("target")
     with pytest.raises(call_removed):
@@ -204,6 +203,108 @@ def test_http_old_proxy_uses_current_registration_with_cached_and_refreshed_meta
             cc.close(proxy)
         assert client.shutdown(timeout=5)["completed"]
         resolver.close()
+
+
+@pytest.mark.parametrize("lab", ["relay_aware_relay"], indirect=True)
+def test_explicit_http_proxy_follows_across_real_c3_relays_after_one_refusal(lab, private_root, tmp_path):
+    """The old A data target refuses once; the next call resolves B through A."""
+    name = lab.name("migration")
+    old = Peer(name, f"persistent-a-{uuid.uuid4().hex}", lab.owner.url,
+               tmp_path / "migration-a.calls", private_root)
+    new = None
+    proxy = None
+    try:
+        routes = wait_state(lambda: lab.routes("migration", relay_url=lab.owner.url),
+                            lambda routes: bool(routes) and routes[0]["relay_url"] == lab.owner.url)
+        assert routes[0]["server_instance_id"] == old.identity["server_instance_id"]
+        proxy = lab.client.connect(Lifecycle, name=name, address=lab.owner.url, timeout=5)
+        assert proxy.client.observed_path == "explicit_relay"
+        settled = proxy.call("on-a")
+        assert settled["server_instance_id"] == old.identity["server_instance_id"]
+        assert [entry["method"] for entry in old.journal_records()] == ["call"]
+        assert old.command("unregister")["unregistered"]
+        wait_state(lambda: lab.routes("migration"), lambda routes: not routes)
+        new = Peer(name, f"persistent-b-{uuid.uuid4().hex}", lab.anchor.url,
+                   tmp_path / "migration-b.calls", private_root)
+        wait_state(lambda: lab.routes("migration", relay_url=lab.owner.url),
+                   lambda routes: bool(routes) and routes[0]["relay_url"] == lab.anchor.url)
+        before = lab.client._runtime_session.path_counters()["explicit_relay"]  # noqa: SLF001
+        with pytest.raises(cc.error.ResourceNotFound) as refused:
+            proxy.call("refused-on-a")
+        assert refused.value.details["dispatch_phase"] == "pre_dispatch"
+        assert old.journal_records() == [{"method": "call", "resource": name, "calls": {"call": 1}}]
+        assert new.journal_records() == []
+        assert lab.client._runtime_session.path_counters()["explicit_relay"] == before  # noqa: SLF001
+        followed = proxy.call("on-b")
+        assert followed["server_instance_id"] == new.identity["server_instance_id"]
+        assert followed["value"] == "on-b"
+        assert new.command("snapshot")["calls"] == {"call": 1}
+        assert lab.client._runtime_session.path_counters()["explicit_relay"] == before + 1  # noqa: SLF001
+        assert proxy.client.observed_path == "explicit_relay"
+        lab.extra["explicit_migration"] = {
+            "from": old.identity, "to": new.identity,
+            "old_journal": old.journal_records(), "new_journal": new.journal_records(),
+        }
+    finally:
+        if proxy is not None:
+            cc.close(proxy)
+        if new is not None:
+            lab.extra["migration_b_cleanup"] = new.close()
+        lab.extra["migration_a_cleanup"] = old.close()
+
+
+@pytest.mark.parametrize("lab", ["relay_aware_local_ipc"], indirect=True)
+def test_relay_aware_proxy_switches_local_http_local_in_real_c3_mesh(
+    lab, private_root, tmp_path, start_c3_relay,
+):
+    """One proxy selects A locally, B over HTTP, then A locally again."""
+    relay_b = start_c3_relay(seeds=[lab.owner.url])
+    name = lab.name("path-switch")
+    owner_a = Peer(name, f"persistent-a-{uuid.uuid4().hex}", lab.owner.url,
+                   tmp_path / "switch-a.calls", private_root)
+    owner_b = None
+    try:
+        lab.address = owner_a.identity["ipc_address"]
+        lab.identity = owner_a.identity
+        lab.wait_route("path-switch")
+        proxy = lab.connect("path-switch")
+        assert proxy.client.observed_path == "relay_aware_local_ipc"
+        assert proxy.call("on-a")["server_instance_id"] == owner_a.identity["server_instance_id"]
+        assert owner_a.command("unregister")["unregistered"]
+        with pytest.raises(cc.error.ResourceRemoved) as missing:
+            proxy.call("missing-on-a")
+        lab.assert_pre_dispatch(missing.value)
+        wait_state(lambda: lab.routes("path-switch", relay_url=relay_b.url),
+                   lambda routes: not routes)
+        owner_b = Peer(name, f"persistent-b-{uuid.uuid4().hex}", relay_b.url,
+                       tmp_path / "switch-b.calls", private_root)
+        wait_state(lambda: lab.routes("path-switch"),
+                   lambda routes: bool(routes) and routes[0]["relay_url"] == relay_b.url)
+        assert proxy.call("on-b")["server_instance_id"] == owner_b.identity["server_instance_id"]
+        assert proxy.client.observed_path == "relay_aware_relay"
+        with pytest.raises(cc.error.UnsupportedCallMode):
+            cc.observe.connection_observation(proxy)
+        assert owner_b.command("unregister")["unregistered"]
+        wait_state(lambda: lab.routes("path-switch"), lambda routes: not routes)
+        assert owner_a.command("register")["registered"]
+        wait_state(lambda: lab.routes("path-switch"),
+                   lambda routes: bool(routes) and routes[0]["relay_url"] == lab.owner.url
+                   and routes[0]["server_instance_id"] == owner_a.identity["server_instance_id"])
+        with pytest.raises(cc.error.ResourceNotFound) as missing:
+            proxy.call("missing-on-b")
+        assert missing.value.details["dispatch_phase"] == "pre_dispatch"
+        assert proxy.call("back-on-a")["server_instance_id"] == owner_a.identity["server_instance_id"]
+        assert proxy.client.observed_path == "relay_aware_local_ipc"
+        assert cc.observe.connection_observation(proxy).connection_id is not None
+        counters = lab.client._runtime_session.path_counters()  # noqa: SLF001
+        assert counters["relay_aware_local_ipc"] == 2
+        assert counters["relay_aware_relay"] == 1
+        assert [entry["method"] for entry in owner_a.journal_records()] == ["call", "call"]
+        assert [entry["method"] for entry in owner_b.journal_records()] == ["call"]
+    finally:
+        if owner_b is not None:
+            lab.extra["switch_b_cleanup"] = owner_b.close()
+        lab.extra["switch_a_cleanup"] = owner_a.close()
 
 
 def test_stateful_resource_failure_is_not_replayed(lab):
@@ -425,8 +526,8 @@ def test_other_route_refusal_preserves_inflight_held_response(lab, transition):
         assert replacement.snapshot() == {"call": 1}
 
 
-def test_peer_eof_is_uncertain_and_new_acquire_uses_new_instance(lab, private_root, tmp_path):
-    """Gates 3/4/5/6: real stream EOF, no replay, then acquire the restarted owner.
+def test_peer_eof_is_uncertain_and_existing_proxy_follows_new_registration(lab, private_root, tmp_path):
+    """Gates 3/4/5/6: real stream EOF, no replay, then the old proxy follows.
 
     Both Unix sockets and Windows Named Pipes use a killed resource process.
     Its durable journal proves that the dispatched stream was entered once.
@@ -483,26 +584,34 @@ def test_peer_eof_is_uncertain_and_new_acquire_uses_new_instance(lab, private_ro
                 lambda: lab.routes("crash"),
                 lambda routes: bool(routes) and routes[0]["server_instance_id"] != old.identity["server_instance_id"],
             )
-        replacement = lab.connect("crash")
-        assert not hasattr(replacement.client, "route_uid")
         assert new.command("snapshot")["calls"] == {}
-        reply = replacement.call("recovered-before-dispatch")
-        assert reply["server_instance_id"] == new.identity["server_instance_id"]
-        assert reply["calls"] == {"call": 1}
-        if lab.path != "relay_aware_relay":
-            with pytest.raises(cc.error.CCBaseError):
-                proxy.call("old-binding")
+        paths_before = lab.client._runtime_session.path_counters()[lab.path]  # noqa: SLF001
+        view = cc.with_call_options(proxy, timeout=5)
+        barrier = threading.Barrier(8)
+
+        def follow(index):
+            barrier.wait(timeout=5)
+            return (view if index % 2 else proxy).call(f"follow-{index}")
+
+        try:
+            with ThreadPoolExecutor(max_workers=8) as threads:
+                replies = list(threads.map(follow, range(8)))
+        finally:
+            cc.close(view)
+        assert {reply["value"] for reply in replies} == {f"follow-{index}" for index in range(8)}
+        assert all(reply["server_instance_id"] == new.identity["server_instance_id"] for reply in replies)
         assert not hasattr(proxy.client, "route_uid")
-        assert new.command("snapshot")["calls"] == {"call": 1}
+        assert new.command("snapshot")["calls"] == {"call": 8}
+        assert lab.client._runtime_session.path_counters()[lab.path] == paths_before + (lab.path != "relay_aware_relay")  # noqa: SLF001
         if lab.path == "relay_aware_relay":
             assert not lab.outgoing.ids("opened", "client")
         else:
             assert len(lab.outgoing.ids("opened", "client") - before) == 1
         # The old control observer's disconnect and the old bound call must
         # not withdraw the replacement owner's route.
-        reply = replacement.call("owner-still-live")
+        reply = proxy.call("owner-still-live")
         assert reply["server_instance_id"] == new.identity["server_instance_id"]
-        assert reply["calls"] == {"call": 2}
+        assert reply["calls"] == {"call": 9}
         lab.extra["new_snapshot"] = new.command("snapshot")
     finally:
         if stream is not None:

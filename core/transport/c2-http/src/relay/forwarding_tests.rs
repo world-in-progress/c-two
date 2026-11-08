@@ -870,13 +870,6 @@ async fn capacity_rejection_case(kind: CapacityRequest) {
         state.with_route_table_mut(|table| assert!(table.register_route(entry.clone())));
         let (release, released) = oneshot::channel();
         let release = Arc::new(parking_lot::Mutex::new(Some(release)));
-        let pending = state
-            .forwarding
-            .spawn(|permit, _| async move {
-                let _ = released.await;
-                drop(permit);
-            })
-            .unwrap();
         let (stop, stopped) = oneshot::channel();
         let resolves = Arc::new(AtomicUsize::new(0));
         let posts = Arc::new(AtomicUsize::new(0));
@@ -890,6 +883,14 @@ async fn capacity_rejection_case(kind: CapacityRequest) {
                     let observed = observed.clone();
                     let observed_posts = observed_posts.clone();
                     async move {
+                        // This capacity fixture has a deliberately unreachable upstream.
+                        // Preparing its HTTP client must not exercise that upstream.
+                        if request.uri().path() == "/_probe/grid" {
+                            return axum::http::Response::builder()
+                                .status(200)
+                                .body(axum::body::Body::empty())
+                                .unwrap();
+                        }
                         assert!(!request.headers().contains_key("expect"));
                         assert!(!request.headers().contains_key("connection"));
                         if request.uri().path() == "/_resolve/grid" {
@@ -915,26 +916,47 @@ async fn capacity_rejection_case(kind: CapacityRequest) {
                     .await
             })
         });
-        let result = AssertUnwindSafe(async {
-            let envelope: serde_json::Value = if kind == CapacityRequest::ControlledEager {
-                use crate::client::{
-                    HttpCallControl, HttpError, RelayAwareClientConfig, RelayAwareHttpClient,
-                };
-                let expected = c2_contract::ExpectedRouteContract {
-                    route_name: entry.name.clone(),
-                    crm_ns: entry.crm_ns.clone(),
-                    crm_name: entry.crm_name.clone(),
-                    crm_ver: entry.crm_ver.clone(),
-                    abi_hash: entry.abi_hash.clone(),
-                    signature_hash: entry.signature_hash.clone(),
-                };
-                let config = RelayAwareClientConfig {
-                    max_attempts: 3,
-                    ..Default::default()
-                };
-                let client = RelayAwareHttpClient::new(&entry.relay_url, expected, false, config)
+        let eager_client = if kind == CapacityRequest::ControlledEager {
+            let expected = c2_contract::ExpectedRouteContract {
+                route_name: entry.name.clone(),
+                crm_ns: entry.crm_ns.clone(),
+                crm_name: entry.crm_name.clone(),
+                crm_ver: entry.crm_ver.clone(),
+                abi_hash: entry.abi_hash.clone(),
+                signature_hash: entry.signature_hash.clone(),
+            };
+            let config = crate::client::RelayAwareClientConfig {
+                max_attempts: 3,
+                ..Default::default()
+            };
+            let client =
+                crate::client::RelayAwareHttpClient::new(&entry.relay_url, expected, false, config)
                     .unwrap()
                     .with_http_only();
+            Some(
+                bounded(tokio::task::spawn_blocking(move || {
+                    client
+                        .resolve_http_target_with_deadline(c2_config::ConnectDeadline::default())
+                        .unwrap();
+                    client
+                }))
+                .await
+                .unwrap(),
+            )
+        } else {
+            None
+        };
+        let pending = state
+            .forwarding
+            .spawn(|permit, _| async move {
+                let _ = released.await;
+                drop(permit);
+            })
+            .unwrap();
+        let result = AssertUnwindSafe(async {
+            let envelope: serde_json::Value = if kind == CapacityRequest::ControlledEager {
+                use crate::client::{HttpCallControl, HttpError};
+                let client = eager_client.as_ref().unwrap();
                 let dispatches = Arc::new(AtomicUsize::new(0));
                 let observed = dispatches.clone();
                 let control = HttpCallControl::new(
@@ -946,9 +968,8 @@ async fn capacity_rejection_case(kind: CapacityRequest) {
                 );
                 // Exercise the actual SDK transport: an eager owned body,
                 // no Expect or Connection override, and no hidden POST retry.
-                // This performs production resolve and POST, without the
-                // separate connect-time probe. Three acquisition attempts
-                // must still produce exactly one business dispatch.
+                // The selected target was acquired before capacity was spent;
+                // both calls must use that target.
                 let mut envelope = serde_json::Value::Null;
                 for calls in 1..=2 {
                     let error = bounded(client.call_controlled_async(
