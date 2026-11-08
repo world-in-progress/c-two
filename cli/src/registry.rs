@@ -22,6 +22,9 @@ struct RouteRecord {
     crm_ver: String,
     abi_hash: String,
     signature_hash: String,
+    registered_at: f64,
+    relay_status: PeerStatus,
+    conflict: bool,
 }
 
 #[derive(Deserialize)]
@@ -176,7 +179,19 @@ fn list_routes(relay: &str) -> Result<()> {
         return Ok(());
     }
     for route in routes {
-        println!("{}", route.name);
+        println!(
+            "{} ({}, {}) - registered_at={} - {}{}",
+            route.name,
+            route.relay_id,
+            route.relay_url,
+            route.registered_at,
+            route.relay_status.as_str(),
+            if route.conflict {
+                " - route conflict"
+            } else {
+                ""
+            }
+        );
     }
     Ok(())
 }

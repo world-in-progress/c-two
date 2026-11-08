@@ -3,6 +3,7 @@ from c_two.error import (
     ResourceNotFound,
     ResourceUnavailable,
     RegistryUnavailable,
+    RouteConflict,
     RouteWatchUnavailable,
 )
 
@@ -27,6 +28,11 @@ class TestMeshErrors:
     def test_route_watch_unavailable_code(self):
         err = RouteWatchUnavailable("watch unavailable")
         assert err.ERROR_CODE == 712
+
+    def test_route_conflict_code(self):
+        err = RouteConflict("grid", details={"route": "grid", "dispatch_phase": "pre_dispatch"})
+        assert err.ERROR_CODE == 719
+        assert err.details == {"route": "grid", "dispatch_phase": "pre_dispatch"}
 
     def test_error_serialize_roundtrip(self):
         err = ResourceNotFound("grid")

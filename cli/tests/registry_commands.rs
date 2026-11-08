@@ -98,6 +98,52 @@ fn list_routes_rejects_missing_route_metadata() {
 }
 
 #[test]
+fn list_routes_rejects_missing_new_route_fields() {
+    for body in [
+        r#"{"routes":[{"name":"grid","relay_id":"relay-a","relay_url":"http://relay-a:8080","locality":"local","crm_ns":"example","crm_name":"Grid","crm_ver":"1","abi_hash":"abc","signature_hash":"def","relay_status":"Alive","conflict":false}]}"#,
+        r#"{"routes":[{"name":"grid","relay_id":"relay-a","relay_url":"http://relay-a:8080","locality":"local","crm_ns":"example","crm_name":"Grid","crm_ver":"1","abi_hash":"abc","signature_hash":"def","registered_at":1234.5,"conflict":false}]}"#,
+        r#"{"routes":[{"name":"grid","relay_id":"relay-a","relay_url":"http://relay-a:8080","locality":"local","crm_ns":"example","crm_name":"Grid","crm_ver":"1","abi_hash":"abc","signature_hash":"def","registered_at":1234.5,"relay_status":"Alive"}]}"#,
+    ] {
+        registry_command("list-routes", body)
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("invalid JSON"));
+    }
+}
+
+#[test]
+fn list_routes_rejects_invalid_status_and_timestamp() {
+    for body in [
+        r#"{"routes":[{"name":"grid","relay_id":"relay-a","relay_url":"http://relay-a:8080","locality":"local","crm_ns":"example","crm_name":"Grid","crm_ver":"1","abi_hash":"abc","signature_hash":"def","registered_at":1234.5,"relay_status":"Unknown","conflict":false}]}"#,
+        r#"{"routes":[{"name":"grid","relay_id":"relay-a","relay_url":"http://relay-a:8080","locality":"local","crm_ns":"example","crm_name":"Grid","crm_ver":"1","abi_hash":"abc","signature_hash":"def","registered_at":"yesterday","relay_status":"Dead","conflict":false}]}"#,
+    ] {
+        registry_command("list-routes", body)
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("invalid JSON"));
+    }
+}
+
+#[test]
+fn list_routes_prints_each_conflicting_and_unreachable_registration() {
+    registry_command(
+        "list-routes",
+        r#"{"routes":[{"name":"grid","relay_id":"relay-a","relay_url":"http://relay-a:8080","locality":"local","crm_ns":"example","crm_name":"Grid","crm_ver":"1","abi_hash":"abc","signature_hash":"def","registered_at":1234.5,"relay_status":"Alive","conflict":true},{"name":"grid","relay_id":"relay-b","relay_url":"http://relay-b:8080","locality":"peer","crm_ns":"example","crm_name":"Grid","crm_ver":"1","abi_hash":"abc","signature_hash":"def","registered_at":1235.5,"relay_status":"Alive","conflict":true},{"name":"old","relay_id":"relay-c","relay_url":"http://relay-c:8080","locality":"peer","crm_ns":"example","crm_name":"Grid","crm_ver":"1","abi_hash":"abc","signature_hash":"def","registered_at":1200.0,"relay_status":"Dead","conflict":false}]}"#,
+    )
+    .assert()
+    .success()
+    .stdout("grid (relay-a, http://relay-a:8080) - registered_at=1234.5 - Alive - route conflict\ngrid (relay-b, http://relay-b:8080) - registered_at=1235.5 - Alive - route conflict\nold (relay-c, http://relay-c:8080) - registered_at=1200 - Dead\n");
+}
+
+#[test]
+fn list_routes_empty_preserves_message() {
+    registry_command("list-routes", r#"{"routes":[]}"#)
+        .assert()
+        .success()
+        .stdout("No routes registered.\n");
+}
+
+#[test]
 fn peers_rejects_missing_peer_fields() {
     registry_command("peers", r#"[{"relay_id":"relay-a"}]"#)
         .assert()
@@ -120,11 +166,11 @@ fn peers_rejects_malformed_peer_status() {
 fn registry_displays_valid_responses() {
     registry_command(
         "list-routes",
-        r#"{"routes":[{"name":"grid","relay_id":"relay-a","relay_url":"http://relay-a:8080","locality":"local","crm_ns":"example","crm_name":"Grid","crm_ver":"1","abi_hash":"abc","signature_hash":"def"}]}"#,
+        r#"{"routes":[{"name":"grid","relay_id":"relay-a","relay_url":"http://relay-a:8080","locality":"local","crm_ns":"example","crm_name":"Grid","crm_ver":"1","abi_hash":"abc","signature_hash":"def","registered_at":1234.5,"relay_status":"Alive","conflict":false}]}"#,
     )
     .assert()
     .success()
-    .stdout("grid\n");
+    .stdout("grid (relay-a, http://relay-a:8080) - registered_at=1234.5 - Alive\n");
 
     registry_command(
         "peers",

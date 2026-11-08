@@ -27,6 +27,7 @@ pub(crate) enum ControlError {
     ContractMismatch { reason: String },
     AddressMismatch { existing_address: String },
     DuplicateRoute { existing_address: String },
+    PeerRouteHeld { registrations: String },
     OwnerMismatch,
     NotFound,
 }
@@ -416,6 +417,21 @@ impl<'a> RouteAuthority<'a> {
         })
     }
 
+    pub(crate) fn check_peer_name(
+        table: &crate::relay::route_table::RouteTable,
+        name: &str,
+    ) -> Result<(), ControlError> {
+        let holders = table.peer_name_holders(name);
+        if holders.is_empty() {
+            Ok(())
+        } else {
+            Err(ControlError::PeerRouteHeld {
+                registrations: serde_json::to_string(&holders)
+                    .expect("registration metadata serializes"),
+            })
+        }
+    }
+
     pub(crate) fn register_local_preflight(
         &self,
         name: &str,
@@ -428,7 +444,10 @@ impl<'a> RouteAuthority<'a> {
         self.validate_server_instance_id(server_instance_id)?;
         self.validate_ipc_address(address)?;
 
-        let existing = self.state.local_route(name);
+        let existing = self.state.with_route_table(|table| {
+            Self::check_peer_name(table, name)?;
+            Ok(table.local_route(name))
+        })?;
         let Some(existing) = existing else {
             return Ok(RegisterPreflight::Available { replacement: None });
         };
@@ -465,7 +484,10 @@ impl<'a> RouteAuthority<'a> {
             self.validate_server_id(server_id)?;
             self.validate_ipc_address(address)?;
 
-            let existing = self.state.local_route(name);
+            let existing = self.state.with_route_table(|table| {
+                Self::check_peer_name(table, name)?;
+                Ok(table.local_route(name))
+            })?;
             let Some(existing) = existing else {
                 return Ok(None);
             };
@@ -614,6 +636,7 @@ impl<'a> RouteAuthority<'a> {
         })?;
 
         let mut route_table = self.state.route_table_write();
+        Self::check_peer_name(&route_table, &name)?;
         let mut required_replacement_address = None;
         let mut old_endpoint_for_cleanup = None;
         if let Some(existing) = route_table.local_route(&name) {
@@ -643,7 +666,7 @@ impl<'a> RouteAuthority<'a> {
                         ) {
                             return Err(ControlError::ContractMismatch { reason });
                         }
-                        if existing.route_uid == route_uid {
+                        if existing.route_uid.as_deref() == Some(route_uid.as_str()) {
                             if let Some(token) =
                                 self.state.owner_token_for_endpoint(&existing_endpoint)
                             {
@@ -671,7 +694,7 @@ impl<'a> RouteAuthority<'a> {
                             || token.abi_hash != existing.abi_hash
                             || token.signature_hash != existing.signature_hash
                             || token.max_payload_size != existing.max_payload_size
-                            || token.route_uid != existing.route_uid
+                            || Some(token.route_uid.as_str()) != existing.route_uid.as_deref()
                         {
                             return Err(ControlError::DuplicateRoute { existing_address });
                         }
@@ -696,7 +719,8 @@ impl<'a> RouteAuthority<'a> {
             abi_hash,
             signature_hash,
             max_payload_size,
-            route_uid,
+            route_uid: Some(route_uid),
+
             locality: Locality::Local,
             registered_at: route_table.next_local_timestamp(),
         };
@@ -775,7 +799,10 @@ impl<'a> RouteAuthority<'a> {
                     abi_hash: existing.abi_hash.clone(),
                     signature_hash: existing.signature_hash.clone(),
                     max_payload_size: existing.max_payload_size,
-                    route_uid: existing.route_uid.clone(),
+                    route_uid: existing
+                        .route_uid
+                        .clone()
+                        .expect("local registration has UID"),
                     token,
                 })
             }
@@ -807,7 +834,7 @@ impl<'a> RouteAuthority<'a> {
             };
             if existing.server_id.as_deref() != Some(scope.server_id.as_str())
                 || existing.server_instance_id.as_deref() != Some(scope.server_instance_id.as_str())
-                || existing.route_uid != scope.route_uid
+                || existing.route_uid.as_deref() != Some(scope.route_uid.as_str())
             {
                 return Ok(RegistrationWithdrawal::Superseded);
             }
@@ -950,15 +977,6 @@ impl<'a> RouteAuthority<'a> {
             .route_table_write()
             .unregister_route_with_tombstone(&name, &relay_id, removed_at);
         Ok(())
-    }
-
-    pub(crate) fn remove_peer_routes(&self, relay_id: &str) {
-        if self.validate_relay_id(relay_id).is_err() || relay_id == self.state.relay_id() {
-            return;
-        }
-        self.state
-            .route_table_write()
-            .remove_routes_by_relay(relay_id);
     }
 
     pub(crate) fn force_leave_peer(&self, relay_id: &str) -> Result<(), ForceLeaveError> {
@@ -1199,7 +1217,7 @@ mod tests {
             signature_hash: "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
                 .into(),
             max_payload_size: 1024,
-            route_uid: format!("{name}-{relay_id}-uid"),
+            route_uid: None,
             locality: Locality::Peer,
             registered_at: 1000.0,
         }

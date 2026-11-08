@@ -115,7 +115,7 @@ def test_route_close_remove_and_reregister_use_current_authority(lab):
         proxy.call("removed")
     replacement = lab.register("target")
     new_proxy = lab.connect("target")
-    # The preceding authoritative 404 invalidated an HTTP client's cache.
+    # Each new acquisition reads the current relay registration.
     lab.assert_reply(proxy.call("after-observed-removal"), replacement, "after-observed-removal")
     lab.assert_reply(new_proxy.call("new"), replacement, "new")
     assert resource.snapshot() == {"call": 1, "blocked": 1}
@@ -157,7 +157,7 @@ def test_real_process_same_endpoint_reregistration_reaches_current_resource(lab,
 
 
 @pytest.mark.parametrize("lab", ["relay_aware_relay"], indirect=True)
-def test_http_old_proxy_uses_current_registration_with_cached_and_refreshed_metadata(lab, private_root):
+def test_http_old_proxy_uses_current_registration_after_reacquisition(lab, private_root):
     """Gate 2: old HTTP proxies reach each new registration exactly once."""
     old = lab.register("stale")
     resolver = SnapshotResolver(lab.routes("stale"))
@@ -173,13 +173,12 @@ def test_http_old_proxy_uses_current_registration_with_cached_and_refreshed_meta
         lab.server.unregister(lab.name("stale"))
         new = lab.register("stale")
         requests_before = resolver.requests
-        lab.assert_reply(proxy.call("old-cached"), new, "old-cached")
+        lab.assert_reply(proxy.call("old-current"), new, "old-current")
         assert resolver.requests == requests_before
         assert new.snapshot() == {"call": 1}
         assert old.snapshot() == {"call": 1}
         lab.server.unregister(lab.name("stale"))
-        # The real relay's pre-dispatch refusal invalidates the shared cache;
-        # a subsequent independent acquire supplies the fresh observation.
+        # The real relay's pre-dispatch refusal prompts a subsequent acquire.
         with pytest.raises(cc.error.ResourceNotFound) as missing:
             proxy.call("missing-before-replacement")
         lab.assert_pre_dispatch(missing.value)
@@ -189,8 +188,8 @@ def test_http_old_proxy_uses_current_registration_with_cached_and_refreshed_meta
         other = client.connect(Lifecycle, name=lab.name("stale"), timeout=3)
         try:
             assert other.client.observed_path == "relay_aware_relay"
-            lab.assert_reply(proxy.call("old-after-refresh"), latest, "old-after-refresh")
-            lab.assert_reply(other.call("other-after-refresh"), latest, "other-after-refresh")
+            lab.assert_reply(proxy.call("old-after-acquire"), latest, "old-after-acquire")
+            lab.assert_reply(other.call("other-after-acquire"), latest, "other-after-acquire")
             assert latest.snapshot() == {"call": 2}
             assert resolver.requests > requests_before
         finally:

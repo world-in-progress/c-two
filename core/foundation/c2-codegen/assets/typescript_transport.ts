@@ -308,11 +308,34 @@ export class C2CoreError extends Error {
   }
 }
 
+export class C2RouteConflictError extends C2CoreError {
+  constructor(message: string, details: Readonly<Record<string, string>> = {}) {
+    super(message, {
+      message,
+      code: 719,
+      canonicalName: "RouteConflict",
+      transportPhase: "pre_dispatch",
+      details,
+    });
+  }
+}
+
 function projectNativeError(error: unknown): Error {
+  if (error instanceof C2RouteConflictError) return error;
+  if (error instanceof C2IpcTransportError && error.code === 719 && error.canonicalName === "RouteConflict" && error.transportPhase === "pre_dispatch") {
+    const projected = new C2RouteConflictError(error.message, error.details);
+    projected.cause = error;
+    return projected;
+  }
   if (error instanceof C2IpcTransportError) return error;
   if (error instanceof Error) {
     const nativeDetails = (error as Error & { nativeDetails?: C2NativeErrorDetails }).nativeDetails;
     if (nativeDetails !== undefined) {
+      if (nativeDetails.code === 719 && nativeDetails.canonicalName === "RouteConflict" && nativeDetails.transportPhase === "pre_dispatch") {
+        const projected = new C2RouteConflictError(error.message, nativeDetails.details);
+        projected.cause = error;
+        return projected;
+      }
       if (nativeDetails.code !== undefined && nativeDetails.transportPhase === undefined) {
         const projected = new C2CoreError(error.message, nativeDetails);
         projected.cause = error;
@@ -913,7 +936,7 @@ function createRelayTransport<Payload extends C2ResponsePayload>(baseUrl: string
         } catch (failure) {
           const error = projectNativeError(failure);
           lastError = error;
-          if (terminalRouteRefusal(error) || (error instanceof C2CoreError && error.code === 715) || preDispatchRouteCode(error) === 709) throw error;
+          if (error instanceof C2RouteConflictError || terminalRouteRefusal(error) || (error instanceof C2CoreError && error.code === 715) || preDispatchRouteCode(error) === 709) throw error;
           if (preDispatchRouteCode(error) === 701 && !refreshed) {
             refreshed = true;
             resolveAgain = true;
@@ -1559,7 +1582,7 @@ async function probeResolvedHttpRoute(
     } catch (error) {
       throw new C2HttpTransportError(`C-Two HTTP relay probe body read failed: ${String(error)}`);
     }
-    throw new C2HttpRelayError(response.status, body, "pre_dispatch");
+    throw projectHttpAcquisitionError(response.status, body);
   }, timeoutMs, "C-Two HTTP relay probe");
 }
 
@@ -1682,6 +1705,7 @@ function localRouteEndpointIsExcluded(route: C2RelayRouteInfo, excluded: Readonl
 }
 
 function localCandidateFailureIsTerminal(error: unknown): boolean {
+  if (error instanceof C2RouteConflictError) return true;
   return error instanceof C2IpcTransportError && (
     error.category === "protocol_version_mismatch" || error.category === "runtime_retired" ||
     error.code === 709 || error.code === 710 || error.code === 713 || error.code === 715
@@ -1828,7 +1852,7 @@ async function resolveRelayRoutes(
       } catch (error) {
         throw new C2HttpTransportError(`C-Two relay resolve body read failed: ${String(error)}`);
       }
-      throw new C2HttpRelayError(response.status, body, "pre_dispatch");
+      throw projectHttpAcquisitionError(response.status, body);
     }
     let body: string;
     try {
@@ -1956,31 +1980,43 @@ function httpConnectFailure(error: unknown): boolean {
 
 function parseCanonicalRelayError(
   body: string,
-): { readonly code: number; readonly name: string; readonly details: Readonly<Record<string, unknown>> } | undefined {
+): { readonly version: 1; readonly code: number; readonly name: string; readonly message: string; readonly details: Readonly<Record<string, string>> } | undefined {
   try {
     const parsed = JSON.parse(body) as unknown;
     if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
       return undefined;
     }
     const record = parsed as Record<string, unknown>;
-    if (record.version !== 1 || !Number.isSafeInteger(record.code) || typeof record.name !== "string") {
+    if (record.version !== 1 || !Number.isSafeInteger(record.code) || typeof record.name !== "string" || typeof record.message !== "string") {
       return undefined;
     }
     if (
       typeof record.details !== "object" ||
       record.details === null ||
-      Array.isArray(record.details)
+      Array.isArray(record.details) ||
+      !Object.values(record.details).every(value => typeof value === "string")
     ) {
       return undefined;
     }
     return {
+      version: 1,
       code: record.code as number,
       name: record.name,
-      details: record.details as Readonly<Record<string, unknown>>,
+      message: record.message,
+      details: record.details as Readonly<Record<string, string>>,
     };
   } catch {
     return undefined;
   }
+}
+
+function projectHttpAcquisitionError(status: number, body: string): Error {
+  const canonical = parseCanonicalRelayError(body);
+  if (status === 409 && canonical?.code === 719 && canonical.name === "RouteConflict" &&
+      canonical.details.dispatch_phase === "pre_dispatch") {
+    return new C2RouteConflictError(canonical.message, canonical.details);
+  }
+  return new C2HttpRelayError(status, body, "pre_dispatch");
 }
 
 function requireRouteContractIdentity(contract: C2ContractIdentity): C2RouteContractIdentity {

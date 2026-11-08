@@ -36,7 +36,7 @@ use crate::relay::peer_handlers;
 use crate::relay::route_table::valid_route_name;
 use crate::relay::server::connect_register_attestation_client;
 use crate::relay::state::{RegisterCommitResult, RelayState, UpstreamAcquireError};
-use crate::relay::types::{RouteEntry, UpstreamEndpointKey};
+use crate::relay::types::{PeerStatus, RouteEntry, RouteResolutionError, UpstreamEndpointKey};
 use crate::send_budget::{SendBufferPlan, SendBuffers, reserve_send_buffers};
 use c2_ipc::IpcClient;
 use c2_mem::retention::{
@@ -113,14 +113,61 @@ where
     }
 }
 
-fn duplicate_route_response(name: &str, existing_address: &str) -> Response {
-    c2_error_response(
+fn duplicate_route_response(
+    state: &RelayState,
+    name: &str,
+    existing_address: Option<&str>,
+    registrations: Option<String>,
+) -> Response {
+    let registrations = registrations.unwrap_or_else(|| {
+        state.with_route_table(|table| {
+            serde_json::to_string(&table.name_holders(name))
+                .expect("registration metadata serializes")
+        })
+    });
+    let mut details = BTreeMap::from([
+        ("name".into(), name.into()),
+        ("registrations".into(), registrations),
+    ]);
+    if let Some(address) = existing_address {
+        details.insert("existing_address".into(), address.into());
+    }
+    json_error_response(
         StatusCode::CONFLICT,
-        c2_error::ErrorCode::ResourceAlreadyRegistered,
-        format!("route already registered: {name}"),
+        c2_error::C2Error::new(
+            c2_error::ErrorCode::ResourceAlreadyRegistered,
+            format!("route already registered: {name}"),
+        )
+        .with_details(details)
+        .envelope(),
+        None,
+    )
+}
+
+fn route_resolution_error_response(name: &str, error: RouteResolutionError) -> Response {
+    let (status, code, registrations) = match error {
+        RouteResolutionError::Conflict(registrations) => (
+            StatusCode::CONFLICT,
+            c2_error::ErrorCode::RouteConflict,
+            registrations,
+        ),
+        RouteResolutionError::Unavailable(registrations) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            c2_error::ErrorCode::ResourceUnavailable,
+            registrations,
+        ),
+    };
+    c2_error_response(
+        status,
+        code,
+        format!("{}: {name}", code.name()),
         [
-            ("name", name.to_string()),
-            ("existing_address", existing_address.to_string()),
+            ("route", name.into()),
+            ("dispatch_phase", "pre_dispatch".into()),
+            (
+                "registrations",
+                serde_json::to_string(&registrations).expect("registration metadata serializes"),
+            ),
         ],
     )
 }
@@ -940,7 +987,7 @@ async fn handle_register(
             eprintln!(
                 "[relay] Register rejected: name={name} server_id={server_id} address={address} reason=duplicate existing_address={existing_address}"
             );
-            return duplicate_route_response(&name, &existing_address);
+            return duplicate_route_response(&state, &name, Some(&existing_address), None);
         }
         Err(ControlError::InvalidName { reason })
         | Err(ControlError::InvalidServerId { reason })
@@ -951,6 +998,9 @@ async fn handle_register(
                 "[relay] Register rejected: name={name} server_id={server_id} address={address} reason={reason}"
             );
             return (StatusCode::BAD_REQUEST, reason).into_response();
+        }
+        Err(ControlError::PeerRouteHeld { registrations }) => {
+            return duplicate_route_response(&state, &name, None, Some(registrations));
         }
         Err(ControlError::OwnerMismatch) | Err(ControlError::NotFound) => {
             eprintln!(
@@ -1233,7 +1283,11 @@ async fn handle_register(
             eprintln!(
                 "[relay] Register rejected: name={name} server_id={server_id} address={address} reason=duplicate existing_address={existing_address}"
             );
-            return duplicate_route_response(&name, &existing_address);
+            return duplicate_route_response(&state, &name, Some(&existing_address), None);
+        }
+        Err(ControlError::PeerRouteHeld { registrations }) => {
+            close_arc_client(&state, client);
+            return duplicate_route_response(&state, &name, None, Some(registrations));
         }
         Err(ControlError::OwnerMismatch) | Err(ControlError::NotFound) => {
             close_arc_client(&state, client);
@@ -1309,7 +1363,11 @@ async fn handle_register(
             eprintln!(
                 "[relay] Register rejected: name={name} reason=duplicate existing_address={existing_address}"
             );
-            return duplicate_route_response(&name, &existing_address);
+            return duplicate_route_response(&state, &name, Some(&existing_address), None);
+        }
+        RegisterCommitResult::PeerRouteHeld { registrations } => {
+            close_arc_client(&state, client);
+            return duplicate_route_response(&state, &name, None, Some(registrations));
         }
         RegisterCommitResult::Invalid { reason } => {
             close_arc_client(&state, client);
@@ -1502,10 +1560,10 @@ async fn handle_admin_unregister(
 /// this endpoint is reachable by anyone who can hit the relay's HTTP port, and
 /// owner identity plus local UDS path are private to this relay.
 async fn handle_list_routes(State(state): State<Arc<RelayState>>) -> impl IntoResponse {
-    let routes: Vec<serde_json::Value> = state
-        .list_routes()
-        .into_iter()
-        .map(|r| {
+    let routes: Vec<serde_json::Value> = state.with_route_table(|table| {
+        let conflicts = table.conflicts();
+        table.list_routes().into_iter().map(|r| {
+            let info = table.registration_info(&r);
             serde_json::json!({
                 "name": r.name,
                 "relay_id": r.relay_id,
@@ -1519,9 +1577,12 @@ async fn handle_list_routes(State(state): State<Arc<RelayState>>) -> impl IntoRe
                 "crm_ver": r.crm_ver,
                 "abi_hash": r.abi_hash,
                 "signature_hash": r.signature_hash,
+                "registered_at": r.registered_at,
+                "relay_status": info.relay_status,
+                "conflict": info.relay_status == PeerStatus::Alive && conflicts.contains_key(&r.name),
             })
-        })
-        .collect();
+        }).collect()
+    });
     Json(serde_json::json!({"routes": routes}))
 }
 
@@ -1603,10 +1664,11 @@ async fn handle_resolve(
                 .into_response();
         }
     };
-    let mut routes = state.resolve_matching(&expected_crm);
-    if routes.is_empty() {
-        return resource_not_found_response(&name);
-    }
+    let mut routes = match state.resolve_matching(&expected_crm) {
+        Ok(Some(route)) => vec![route],
+        Ok(None) => return resource_not_found_response(&name),
+        Err(error) => return route_resolution_error_response(&name, error),
+    };
     if !expose_ipc_address {
         for route in &mut routes {
             route.ipc_address = None;
@@ -1860,6 +1922,9 @@ async fn handle_probe_in_context(
         Ok(expected) => expected,
         Err(response) => return response.into_response(),
     };
+    if let Err(error @ RouteResolutionError::Conflict(_)) = state.resolve_matching(&expected_crm) {
+        return route_resolution_error_response(&route_name, error);
+    }
     let advertised_route =
         match validate_expected_crm_for_route(&state, &route_name, &expected_crm, None) {
             Ok(route) => route,
@@ -2445,7 +2510,10 @@ fn ipc_route_error_response(
                 ErrorCode::ResourceRemoved,
                 format!("route removed: {route_name}"),
             )
-            .with_details(BTreeMap::from([("route".into(), route_name.clone())])),
+            .with_details(BTreeMap::from([
+                ("route".into(), route_name.clone()),
+                ("dispatch_phase".into(), "pre_dispatch".into()),
+            ])),
         ),
         c2_ipc::IpcError::RouteClosed { route_name, reason } => semantic_error_response(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -2456,12 +2524,14 @@ fn ipc_route_error_response(
             .with_details(BTreeMap::from([
                 ("route".into(), route_name.clone()),
                 ("reason".into(), reason.clone()),
+                ("dispatch_phase".into(), "pre_dispatch".into()),
             ])),
         ),
         c2_ipc::IpcError::ContractMismatch(message) => semantic_error_response(
             StatusCode::CONFLICT,
             C2Error::new(ErrorCode::ContractMismatch, message.clone()).with_details(
                 BTreeMap::from([
+                    ("dispatch_phase".to_string(), "pre_dispatch".to_string()),
                     ("route".to_string(), route_name.to_string()),
                     ("transport".to_string(), "ipc".to_string()),
                 ]),
@@ -2921,6 +2991,14 @@ mod tests {
                 expected_code.name(),
                 "unexpected name for error={error}"
             );
+            if matches!(
+                expected_code,
+                ErrorCode::ResourceRemoved
+                    | ErrorCode::ResourceClosed
+                    | ErrorCode::ContractMismatch
+            ) {
+                assert_eq!(body["details"]["dispatch_phase"], "pre_dispatch");
+            }
             assert_ne!(
                 body["name"], "ResourceUnavailable",
                 "semantic error was flattened: {error}"
@@ -2989,7 +3067,7 @@ mod tests {
             abi_hash: TEST_ABI_HASH.into(),
             signature_hash: TEST_SIGNATURE_HASH.into(),
             max_payload_size: 1024,
-            route_uid: "grid-uid".into(),
+            route_uid: Some("grid-uid".into()),
             locality: Locality::Local,
             registered_at: 1.0,
         };
@@ -3411,7 +3489,10 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(response.status(), status);
-            assert_eq!(state.local_route("grid").unwrap().route_uid, "grid-uid");
+            assert_eq!(
+                state.local_route("grid").unwrap().route_uid.as_deref(),
+                Some("grid-uid")
+            );
         }
         let response = build_router(state.clone())
             .oneshot(
@@ -3433,7 +3514,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        assert_eq!(state.local_route("grid").unwrap().route_uid, "grid-uid");
+        assert_eq!(
+            state.local_route("grid").unwrap().route_uid.as_deref(),
+            Some("grid-uid")
+        );
     }
 
     #[cfg(unix)]
@@ -3454,7 +3538,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::CONFLICT);
-        assert_eq!(state.local_route("grid").unwrap().route_uid, "grid-uid");
+        assert_eq!(
+            state.local_route("grid").unwrap().route_uid.as_deref(),
+            Some("grid-uid")
+        );
         // Both missing and mismatched namespace checks precede route owner
         // preparation, which can itself open a captured owner's IPC endpoint.
         let source = source_between(
@@ -4475,8 +4562,8 @@ mod tests {
                     Request::builder()
                         .method("GET")
                         .uri("/_probe/grid")
-                        .header(retired_header, current_route.route_uid.as_str())
-                        .header(retired_header, current_route.route_uid.as_str()),
+                        .header(retired_header, current_route.route_uid.as_deref().unwrap())
+                        .header(retired_header, current_route.route_uid.as_deref().unwrap()),
                 )
                 .body(Body::empty())
                 .unwrap(),
@@ -5181,7 +5268,7 @@ mod tests {
                 abi_hash: TEST_ABI_HASH.into(),
                 signature_hash: TEST_SIGNATURE_HASH.into(),
                 max_payload_size: 4,
-                route_uid: "grid-oversized-uid".into(),
+                route_uid: Some("grid-oversized-uid".into()),
                 locality: crate::relay::types::Locality::Local,
                 registered_at: 1000.0,
             }));
@@ -5234,7 +5321,7 @@ mod tests {
                 abi_hash: TEST_ABI_HASH.into(),
                 signature_hash: TEST_SIGNATURE_HASH.into(),
                 max_payload_size: 1024,
-                route_uid: "grid-duplicate-content-length-uid".into(),
+                route_uid: Some("grid-duplicate-content-length-uid".into()),
                 locality: crate::relay::types::Locality::Local,
                 registered_at: 1000.0,
             }));
@@ -5750,6 +5837,9 @@ mod tests {
                     panic!(
                         "failed to install replacement route in precheck hook: {existing_address}"
                     )
+                }
+                RegisterCommitResult::PeerRouteHeld { registrations } => {
+                    panic!("unexpected peer-held name: {registrations}")
                 }
                 RegisterCommitResult::Invalid { reason } => {
                     panic!("failed to install replacement route in precheck hook: {reason}")
@@ -6710,6 +6800,9 @@ mod tests {
             | RegisterCommitResult::ConflictingOwner { existing_address } => {
                 panic!("unexpected duplicate route at {existing_address}")
             }
+            RegisterCommitResult::PeerRouteHeld { registrations } => {
+                panic!("unexpected peer-held name: {registrations}")
+            }
             RegisterCommitResult::Invalid { reason } => {
                 panic!("unexpected invalid route in test: {reason}")
             }
@@ -6809,6 +6902,9 @@ mod tests {
             RegisterCommitResult::Duplicate { existing_address }
             | RegisterCommitResult::ConflictingOwner { existing_address } => {
                 panic!("unexpected duplicate route at {existing_address}")
+            }
+            RegisterCommitResult::PeerRouteHeld { registrations } => {
+                panic!("unexpected peer-held name: {registrations}")
             }
             RegisterCommitResult::Invalid { reason } => {
                 panic!("unexpected invalid route in test: {reason}")
@@ -7020,7 +7116,7 @@ mod tests {
             name: entry.name.clone(),
             server_id: entry.server_id.clone().unwrap(),
             server_instance_id: entry.server_instance_id.clone().unwrap(),
-            route_uid: entry.route_uid.clone(),
+            route_uid: entry.route_uid.clone().expect("local UID"),
         }
     }
 
@@ -7057,7 +7153,7 @@ mod tests {
                 .local_route("grid")
                 .unwrap()
                 .route_uid,
-            new.route_uid
+            Some(new.route_uid.clone())
         );
         let mut wrong_instance = new.clone();
         wrong_instance.server_instance_id.push_str("-old");

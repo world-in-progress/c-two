@@ -214,7 +214,6 @@ fn route_authority(path: PathKind) {
     });
     // A known closed target is re-acquired on the next call. With the route
     // absent, that acquisition fails before entering any resource callback.
-    fixture.client_runtime.clear_relay_projection_cache();
     fixture::assert_semantic(
         fixture.connect_name("authority").unwrap_err(),
         if path == PathKind::Direct {
@@ -261,7 +260,6 @@ fn relay_local_removed_and_reregistered_routes_preserve_old_binding() {
     let outcome = route.registration.close().unwrap();
     assert!(outcome.local_removed && outcome.close.active_drained);
     assert!(outcome.close.close_error.is_none());
-    fixture.client_runtime.clear_relay_projection_cache();
     fixture::assert_semantic(
         fixture.connect_name("replacement").unwrap_err(),
         fixture::ErrorCode::ResourceNotFound,
@@ -285,14 +283,14 @@ fn relay_local_removed_and_reregistered_routes_preserve_old_binding() {
 }
 
 #[test]
-fn relay_local_first_acquire_uses_current_registration_with_cached_resolution() {
+fn relay_local_first_acquire_uses_current_registration() {
     let fixture = Fixture::new(PathKind::Local, 0.0, 0);
-    let mut route = fixture.register("cached-resolution");
+    let mut route = fixture.register("current-resolution");
     let old = fixture.connect(&route);
-    fixture.call(&old, &route, "cache-resolution");
+    fixture.call(&old, &route, "initial-resolution");
     let physical = fixture.outgoing_ids();
     assert!(route.registration.close().unwrap().local_removed);
-    let replacement = fixture.register("cached-resolution");
+    let replacement = fixture.register("current-resolution");
     assert_ne!(route.label(), replacement.label());
     let fresh = fixture.connect(&replacement);
     assert_eq!(fresh.observed_path(), fixture::PathKind::Local.observed());
@@ -467,7 +465,7 @@ fn route_errors_are_local(path: PathKind) {
     fixture.finish();
 }
 
-// Gate 2, HTTP removal: both a name acquire and the cached proxy are refused;
+// Gate 2, HTTP removal: both a name acquire and the existing proxy are refused;
 // no callback runs after relay withdrawal.
 #[test]
 fn relay_http_removed_route_refuses_acquire_and_old_call() {
@@ -494,17 +492,16 @@ fn relay_http_removed_route_refuses_acquire_and_old_call() {
     fixture.finish();
 }
 
-// Gates 2 and 6, HTTP replacement: an old proxy reaches the current registration
-// even when its shared discovery cache still holds the previous route metadata.
+// Gates 2 and 6, HTTP replacement: an old proxy reaches the current registration.
 #[test]
-fn relay_http_reregistered_route_accepts_old_cached_proxy() {
+fn relay_http_reregistered_route_accepts_old_proxy() {
     let fixture = Fixture::with_c3();
     let mut route = fixture.register("stale-http");
     let old = fixture.connect(&route);
     fixture.call(&old, &route, "before-replacement");
     assert!(route.registration.close().unwrap().local_removed);
     let replacement = fixture.register("stale-http");
-    fixture.call(&old, &replacement, "old-cached-proxy");
+    fixture.call(&old, &replacement, "old-current-proxy");
     assert_eq!((route.calls(), replacement.calls()), (1, 1));
     let fresh = fixture.connect(&replacement);
     fixture.call(&fresh, &replacement, "new-acquire");
@@ -516,20 +513,20 @@ fn relay_http_reregistered_route_accepts_old_cached_proxy() {
 }
 
 #[test]
-fn relay_http_other_acquire_refreshes_shared_cache_before_old_proxy_call() {
+fn relay_http_other_acquire_does_not_change_old_proxy_target() {
     let fixture = Fixture::with_c3();
-    let mut route = fixture.register("shared-cache-http");
+    let mut route = fixture.register("shared-target-http");
     let old = fixture.connect(&route);
     fixture.call(&old, &route, "before-replacement");
     assert!(route.registration.close().unwrap().local_removed);
     fixture::assert_semantic(
-        fixture.connect_name("shared-cache-http").unwrap_err(),
+        fixture.connect_name("shared-target-http").unwrap_err(),
         fixture::ErrorCode::ResourceNotFound,
     );
-    let replacement = fixture.register("shared-cache-http");
+    let replacement = fixture.register("shared-target-http");
     let other = fixture.connect(&replacement);
     fixture.call(&old, &replacement, "old-after-other-acquire");
-    fixture.call(&other, &replacement, "other-after-refresh");
+    fixture.call(&other, &replacement, "other-after-acquire");
     assert_eq!((route.calls(), replacement.calls()), (1, 2));
     assert!(fixture.outgoing_ids().is_empty());
     fixture.assert_paths(2);

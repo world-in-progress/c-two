@@ -317,12 +317,10 @@ impl ClientConnection {
             tokio::task::spawn_blocking(move || {
                 // The worker owns the gate until the original bounded attempt ends.
                 let _guard = guard;
-                let target = owner.runtime.acquire_target(
-                    &owner.expected,
-                    &owner.acquire,
-                    deadline,
-                    true,
-                )?;
+                let target =
+                    owner
+                        .runtime
+                        .acquire_target(&owner.expected, &owner.acquire, deadline)?;
                 let target = owner.runtime.publish_client_with_deadline(
                     target.observed_path,
                     deadline,
@@ -1099,10 +1097,10 @@ impl NativeEndpointContext {
         validate_expected_route_contract(&expected)?;
         self.source.runtime.ensure_active_with_attempt(attempt)?;
         let acquire = ClientAcquire::Endpoint(self.source.clone());
-        let target =
-            self.source
-                .runtime
-                .acquire_target(&expected, &acquire, attempt.deadline(), false)?;
+        let target = self
+            .source
+            .runtime
+            .acquire_target(&expected, &acquire, attempt.deadline())?;
         self.source
             .runtime
             .finish_client(expected, acquire, target, attempt.deadline())
@@ -1176,7 +1174,7 @@ impl Runtime {
                     http_only: false,
                 },
             };
-            let target = self.acquire_target(&expected, &acquire, deadline, false)?;
+            let target = self.acquire_target(&expected, &acquire, deadline)?;
             self.finish_client(expected, acquire, target, deadline)
         })()
         .map_err(|error| attempt.classify(error))
@@ -1206,7 +1204,6 @@ impl Runtime {
         expected: &ExpectedRouteContract,
         acquire: &ClientAcquire,
         deadline: ConnectDeadline,
-        refresh: bool,
     ) -> Result<ClientTarget, Error> {
         self.ensure_active_with_deadline(deadline)?;
         match acquire {
@@ -1222,9 +1219,7 @@ impl Runtime {
                 anchor,
                 settings,
                 http_only,
-            } => {
-                self.acquire_relay_target(expected, anchor, settings, *http_only, deadline, refresh)
-            }
+            } => self.acquire_relay_target(expected, anchor, settings, *http_only, deadline),
         }
     }
 
@@ -1328,7 +1323,6 @@ impl Runtime {
         settings: &c2_config::ResolvedRelayClientConfig,
         http_only: bool,
         deadline: ConnectDeadline,
-        refresh: bool,
     ) -> Result<ClientTarget, Error> {
         let http = |client| {
             ClientTarget::new(
@@ -1352,7 +1346,6 @@ impl Runtime {
                     settings.call_timeout_secs,
                     settings.remote_payload_chunk_size,
                     deadline,
-                    refresh,
                 )
                 .map(http);
         }
@@ -1363,7 +1356,6 @@ impl Runtime {
             settings.call_timeout_secs,
             settings.remote_payload_chunk_size,
             deadline,
-            refresh,
         )?;
         self.ensure_active_with_deadline(deadline)?;
         let resolved = self.reconcile_relay_connection_with_deadline(resolved, deadline)?;

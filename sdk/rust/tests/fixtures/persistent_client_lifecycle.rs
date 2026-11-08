@@ -842,7 +842,6 @@ pub fn wait_relay_owner(fixture: &Fixture, url: &str, instance: &str) {
         .with_local_endpoint_context(&context);
     let expected = stream_expected("process-route");
     observe_until(|| {
-        control.invalidate("process-route");
         let routes = c2_core::native_client_executor()
             .unwrap()
             .block_on(control.resolve_matching_async(&expected))
@@ -860,7 +859,6 @@ pub fn wait_relay_target(fixture: &Fixture, url: &str, owner: &str) {
         .with_local_endpoint_context(&context);
     let expected = stream_expected("process-route");
     observe_until(|| {
-        control.invalidate("process-route");
         let resolved = c2_core::native_client_executor()
             .unwrap()
             .block_on(control.resolve_matching_async(&expected));
@@ -885,7 +883,6 @@ pub fn wait_relay_absent(fixture: &Fixture, url: &str) {
         .with_local_endpoint_context(&context);
     let expected = stream_expected("process-route");
     observe_until(|| {
-        control.invalidate("process-route");
         let routes = c2_core::native_client_executor()
             .unwrap()
             .block_on(control.resolve_matching_async(&expected))

@@ -5,6 +5,7 @@
 //!   2. conn_pool (internal slot mutexes)
 
 use std::collections::HashMap;
+use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -25,6 +26,44 @@ use crate::relay::conn_pool::{
 use crate::relay::route_table::{RouteTable, TombstoneGcEntry};
 use crate::relay::types::*;
 use crate::relay::upstream_control::{self, UpstreamControlTask, UpstreamOwnerKey};
+
+pub(crate) struct RouteTableWrite<'a> {
+    table: RwLockWriteGuard<'a, RouteTable>,
+}
+impl Deref for RouteTableWrite<'_> {
+    type Target = RouteTable;
+    fn deref(&self) -> &RouteTable {
+        &self.table
+    }
+}
+impl DerefMut for RouteTableWrite<'_> {
+    fn deref_mut(&mut self) -> &mut RouteTable {
+        &mut self.table
+    }
+}
+impl Drop for RouteTableWrite<'_> {
+    fn drop(&mut self) {
+        let (before, current) = self.table.finish_conflict_changes();
+        for (name, registrations) in &current {
+            if before[name].is_empty() {
+                eprintln!(
+                    "[relay] route conflict detected: route={} registrations={}",
+                    name,
+                    serde_json::to_string(registrations).expect("registration metadata serializes")
+                );
+            }
+        }
+        for (name, registrations) in &before {
+            if !registrations.is_empty() && !current.contains_key(name) {
+                eprintln!(
+                    "[relay] route conflict resolved: route={} registrations={}",
+                    name,
+                    serde_json::to_string(registrations).expect("registration metadata serializes")
+                );
+            }
+        }
+    }
+}
 
 #[derive(Default)]
 struct UpstreamControls {
@@ -51,6 +90,9 @@ pub struct RelayState {
     acquire_recheck_seam: parking_lot::Mutex<Option<TestPause>>,
     #[cfg(test)]
     acquire_lookup_seam: parking_lot::Mutex<Option<TestPause>>,
+    #[cfg(test)]
+    peer_removal_seam:
+        parking_lot::Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
     config: Arc<RelayConfig>,
     endpoint_context: LocalEndpointContext,
     default_endpoint_namespace: bool,
@@ -84,6 +126,7 @@ pub enum RegisterCommitResult {
     Registered { entry: RouteEntry },
     SameOwner { entry: RouteEntry },
     Duplicate { existing_address: String },
+    PeerRouteHeld { registrations: String },
     ConflictingOwner { existing_address: String },
     Invalid { reason: String },
 }
@@ -202,6 +245,8 @@ impl RelayState {
             acquire_recheck_seam: parking_lot::Mutex::new(None),
             #[cfg(test)]
             acquire_lookup_seam: parking_lot::Mutex::new(None),
+            #[cfg(test)]
+            peer_removal_seam: parking_lot::Mutex::new(None),
             disseminator,
             config,
             endpoint_context,
@@ -256,6 +301,9 @@ impl RelayState {
             Err(ControlError::AddressMismatch { existing_address }) => {
                 RegisterCommitResult::ConflictingOwner { existing_address }
             }
+            Err(ControlError::PeerRouteHeld { registrations }) => {
+                RegisterCommitResult::PeerRouteHeld { registrations }
+            }
             Err(ControlError::DuplicateRoute { existing_address }) => {
                 RegisterCommitResult::Duplicate { existing_address }
             }
@@ -298,7 +346,9 @@ impl RelayState {
             | Err(ControlError::InvalidServerInstanceId { .. })
             | Err(ControlError::InvalidAddress { .. })
             | Err(ControlError::ContractMismatch { .. }) => UnregisterResult::OwnerMismatch,
-            Err(ControlError::DuplicateRoute { .. }) => UnregisterResult::OwnerMismatch,
+            Err(ControlError::DuplicateRoute { .. } | ControlError::PeerRouteHeld { .. }) => {
+                UnregisterResult::OwnerMismatch
+            }
         }
     }
 
@@ -307,7 +357,7 @@ impl RelayState {
         expected: &RouteEntry,
     ) -> Option<(RouteEntry, f64, Option<Arc<IpcClient>>)> {
         let (entry, removed_at, client) = {
-            let mut route_table = self.route_table.write();
+            let mut route_table = self.route_table_write();
             let (entry, removed_at) = route_table.unregister_local_route_if_matches(expected);
             let client = entry
                 .as_ref()
@@ -329,7 +379,7 @@ impl RelayState {
     pub fn resolve_matching(
         &self,
         expected: &c2_contract::ExpectedRouteContract,
-    ) -> Vec<RouteInfo> {
+    ) -> Result<Option<RouteInfo>, RouteResolutionError> {
         self.route_table.read().resolve_matching(expected)
     }
 
@@ -934,8 +984,10 @@ impl RelayState {
         }
     }
 
-    pub(crate) fn route_table_write(&self) -> RwLockWriteGuard<'_, RouteTable> {
-        self.route_table.write()
+    pub(crate) fn route_table_write(&self) -> RouteTableWrite<'_> {
+        let mut table = self.route_table.write();
+        table.begin_conflict_changes();
+        RouteTableWrite { table }
     }
 
     pub(crate) fn evict_idle(
@@ -973,11 +1025,26 @@ impl RelayState {
 
     #[cfg(test)]
     pub fn register_peer(&self, info: PeerInfo) {
-        self.route_table.write().register_peer(info);
+        self.route_table_write().register_peer(info);
     }
 
     pub fn unregister_peer(&self, relay_id: &str) -> Option<PeerInfo> {
-        self.route_table.write().unregister_peer(relay_id)
+        #[cfg(test)]
+        if let Some((entered, resume)) = self.peer_removal_seam.lock().take() {
+            entered.send(()).unwrap();
+            resume.recv_timeout(Duration::from_secs(5)).unwrap();
+        }
+        self.route_table_write().unregister_peer(relay_id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pause_before_peer_removal(
+        &self,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        *self.peer_removal_seam.lock() = Some((entered_tx, resume_rx));
+        (entered_rx, resume_tx)
     }
 
     pub fn has_peer(&self, relay_id: &str) -> bool {
@@ -1013,7 +1080,7 @@ impl RelayState {
     }
 
     pub fn merge_snapshot(&self, sync: ValidatedFullSync) {
-        self.route_table.write().merge_validated_snapshot(sync);
+        self.route_table_write().merge_validated_snapshot(sync);
     }
 
     pub fn route_digest(&self) -> HashMap<(String, String, bool), RouteDigestHash> {
@@ -1042,7 +1109,7 @@ impl RelayState {
     }
 
     pub(crate) fn gc_tombstones(&self, retention: std::time::Duration) -> Vec<TombstoneGcEntry> {
-        self.route_table.write().gc_tombstones(retention)
+        self.route_table_write().gc_tombstones(retention)
     }
 
     pub(crate) fn with_route_table<F, R>(&self, f: F) -> R
@@ -1056,7 +1123,7 @@ impl RelayState {
     where
         F: FnOnce(&mut RouteTable) -> R,
     {
-        f(&mut self.route_table.write())
+        f(&mut self.route_table_write())
     }
 }
 
@@ -2124,6 +2191,9 @@ mod tests {
             | RegisterCommitResult::ConflictingOwner { existing_address } => {
                 panic!("unexpected duplicate route at {existing_address}")
             }
+            RegisterCommitResult::PeerRouteHeld { registrations } => {
+                panic!("unexpected peer-held name: {registrations}")
+            }
             RegisterCommitResult::Invalid { reason } => {
                 panic!("unexpected invalid route in test helper: {reason}")
             }
@@ -2213,10 +2283,6 @@ mod tests {
             .unwrap();
     }
 
-    fn remove_peer_routes(state: &RelayState, relay_id: &str) {
-        RouteAuthority::new(state).remove_peer_routes(relay_id);
-    }
-
     #[test]
     fn local_commit_rejects_invalid_crm_tag_without_fake_duplicate() {
         let state = RelayState::new(test_config(), null_disseminator());
@@ -2276,7 +2342,11 @@ mod tests {
             IpcClient::with_config("ipc://grid", c2_config::ClientIpcConfig::default()).unwrap(),
         );
         let registered = register_local(&state, "grid", "server-grid", "ipc://grid", client);
-        let routes = state.resolve_matching(&expected_contract_for_route(&registered));
+        let routes = state
+            .resolve_matching(&expected_contract_for_route(&registered))
+            .unwrap()
+            .into_iter()
+            .collect::<Vec<_>>();
         assert_eq!(routes.len(), 1);
         assert_eq!(routes[0].ipc_address.as_deref(), Some("ipc://grid"));
         assert_eq!(
@@ -2547,7 +2617,7 @@ mod tests {
                 abi_hash: TEST_ABI_HASH.into(),
                 signature_hash: TEST_SIGNATURE_HASH.into(),
                 max_payload_size: 1024,
-                route_uid: "grid-route-uid-0001".into(),
+                route_uid: None,
                 locality: Locality::Peer,
                 registered_at: 1000.0,
             },
@@ -2585,7 +2655,7 @@ mod tests {
                 abi_hash: TEST_ABI_HASH.into(),
                 signature_hash: TEST_SIGNATURE_HASH.into(),
                 max_payload_size: 1024,
-                route_uid: "grid-route-uid-0001".into(),
+                route_uid: None,
                 locality: Locality::Peer,
                 registered_at: 1000.0,
             },
@@ -2621,14 +2691,14 @@ mod tests {
     }
 
     #[test]
-    fn remove_routes_by_relay_does_not_remove_local_routes() {
+    fn unregister_peer_does_not_remove_local_routes() {
         let state = RelayState::new(test_config(), null_disseminator());
         let client = Arc::new(
             IpcClient::with_config("ipc://grid", c2_config::ClientIpcConfig::default()).unwrap(),
         );
         register_local(&state, "grid", "server-grid", "ipc://grid", client);
 
-        remove_peer_routes(&state, "test-relay");
+        state.unregister_peer("test-relay");
 
         let route = state.local_route("grid").unwrap().to_route_info();
         assert_eq!(route.ipc_address.as_deref(), Some("ipc://grid"));
@@ -2651,7 +2721,7 @@ mod tests {
                 abi_hash: TEST_ABI_HASH.to_string(),
                 signature_hash: TEST_SIGNATURE_HASH.to_string(),
                 max_payload_size: 1024,
-                route_uid: "grid-route-uid-0001".into(),
+                route_uid: Some("grid-route-uid-0001".into()),
                 locality: Locality::Local,
                 registered_at: 1000.0,
             });
@@ -3088,7 +3158,7 @@ mod tests {
             abi_hash: TEST_ABI_HASH.into(),
             signature_hash: TEST_SIGNATURE_HASH.into(),
             max_payload_size: 1024,
-            route_uid: "grid-route-uid-0001".into(),
+            route_uid: Some("grid-route-uid-0001".into()),
             locality: Locality::Local,
             registered_at: 0.0,
         };

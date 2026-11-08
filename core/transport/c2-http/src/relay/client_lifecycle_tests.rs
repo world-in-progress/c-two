@@ -288,9 +288,9 @@ async fn replacement_acquire_reuses_healthy_client_and_exact_close_stays_isolate
         assert!(server.unregister_route("grid").await);
         super::test_support::register_echo_route(&server, "grid").await;
         let new_uid = server.registered_route_identity("grid").await.unwrap();
-        assert_ne!(new_uid, old_entry.route_uid);
+        assert_ne!(Some(&new_uid), old_entry.route_uid.as_ref());
         let mut new_entry = old_entry.clone();
-        new_entry.route_uid = new_uid;
+        new_entry.route_uid = Some(new_uid);
         assert_eq!(new_entry.ipc_address.as_deref(), Some(address.as_str()));
         assert!(state.with_route_table_mut(|table| table.register_route(new_entry.clone())));
         resume_acquire.take().unwrap().send(()).unwrap();

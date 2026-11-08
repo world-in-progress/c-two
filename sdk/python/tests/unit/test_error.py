@@ -11,6 +11,7 @@ from c_two.error import (
     ClientSerializeInput, ClientDeserializeOutput, ClientOutputFromBuffer,
     ClientCallResource,
     ResourceAlreadyRegistered,
+    RouteConflict,
     ResourceClosed, ResourceRemoved, ContractMismatch, IdentityMismatch,
     RouteWatchUnavailable, ProtocolViolation, FallbackDenied,
     CallDeadlineExceeded, UnsupportedCallMode, CallCapacityExceeded, CallCancelled,
@@ -54,9 +55,10 @@ class TestERRORCode:
         assert ERROR_Code.ERROR_UNSUPPORTED_CALL_MODE == 716
         assert ERROR_Code.ERROR_CALL_CAPACITY_EXCEEDED == 717
         assert ERROR_Code.ERROR_CALL_CANCELLED == 718
+        assert ERROR_Code.ERROR_ROUTE_CONFLICT == 719
 
-    def test_has_exactly_24_members(self):
-        assert len(ERROR_Code) == 24
+    def test_has_exactly_25_members(self):
+        assert len(ERROR_Code) == 25
 
     def test_retired_errors_are_absent(self):
         retired = (("Route", "Stale", 704), ("Write", "Conflict", 706),
@@ -408,6 +410,7 @@ ALL_SUBCLASSES = [
     error.UnsupportedCallMode,
     error.CallCapacityExceeded,
     error.CallCancelled,
+    error.RouteConflict,
 ]
 
 
@@ -436,6 +439,14 @@ class TestSubclassDeserialization:
         assert isinstance(result, ResourceAlreadyRegistered)
         assert result.code == ERROR_Code.ERROR_RESOURCE_ALREADY_REGISTERED
         assert result.message == "Route name already registered: 'grid'"
+
+    def test_route_conflict_round_trip(self):
+        details = {"route": "grid", "dispatch_phase": "pre_dispatch", "registrations": "[]"}
+        original = RouteConflict("duplicate online route", details=details)
+        result = CCError.deserialize(memoryview(CCError.serialize(original)))
+        assert isinstance(result, RouteConflict)
+        assert result.code == ERROR_Code.ERROR_ROUTE_CONFLICT
+        assert result.details == details
 
     def test_from_buffer_errors_round_trip_to_specific_subclasses(self):
         resource_err = ResourceInputFromBuffer("bad input view")
@@ -502,6 +513,7 @@ class TestNativeErrorRegistryParity:
             "ERROR_UNSUPPORTED_CALL_MODE": ("UnsupportedCallMode", 716),
             "ERROR_CALL_CAPACITY_EXCEEDED": ("CallCapacityExceeded", 717),
             "ERROR_CALL_CANCELLED": ("CallCancelled", 718),
+            "ERROR_ROUTE_CONFLICT": ("RouteConflict", 719),
         }
 
         assert set(ERROR_Code.__members__) == set(expected)
@@ -513,7 +525,7 @@ class TestNativeErrorRegistryParity:
         from c_two import _native
 
         native = _native.error_registry()
-        assert len(native) == 24
+        assert len(native) == 25
         names = list(native.keys())
         values = list(native.values())
         assert len(set(names)) == len(names)

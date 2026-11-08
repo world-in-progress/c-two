@@ -37,6 +37,7 @@ const REGISTER_ATTESTATION_RETRY_DELAY: Duration = Duration::from_millis(20);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RelayControlError {
     DuplicateRoute { name: String },
+    PeerRouteHeld { name: String, registrations: String },
     Other(String),
 }
 
@@ -46,6 +47,13 @@ impl std::fmt::Display for RelayControlError {
             RelayControlError::DuplicateRoute { name } => {
                 write!(f, "Route name already registered: '{name}'")
             }
+            RelayControlError::PeerRouteHeld {
+                name,
+                registrations,
+            } => write!(
+                f,
+                "Route name already registered: '{name}', registrations={registrations}"
+            ),
             RelayControlError::Other(message) => f.write_str(message),
         }
     }
@@ -60,6 +68,17 @@ impl RelayControlError {
                 c2_error::ErrorCode::ResourceAlreadyRegistered,
                 self.to_string(),
             ),
+            RelayControlError::PeerRouteHeld {
+                name,
+                registrations,
+            } => c2_error::C2Error::new(
+                c2_error::ErrorCode::ResourceAlreadyRegistered,
+                self.to_string(),
+            )
+            .with_details(std::collections::BTreeMap::from([
+                ("name".into(), name.clone()),
+                ("registrations".into(), registrations.clone()),
+            ])),
             RelayControlError::Other(message) => c2_error::C2Error::unknown(message.clone()),
         }
     }
@@ -119,6 +138,7 @@ fn control_error_to_relay_error(err: ControlError) -> RelayControlError {
         | ControlError::InvalidServerInstanceId { reason }
         | ControlError::InvalidAddress { reason }
         | ControlError::ContractMismatch { reason } => RelayControlError::Other(reason),
+        ControlError::PeerRouteHeld { registrations } => RelayControlError::Other(registrations),
         ControlError::AddressMismatch { .. }
         | ControlError::DuplicateRoute { .. }
         | ControlError::OwnerMismatch
@@ -520,6 +540,13 @@ impl RelayServer {
                         .await
                     {
                         Ok(replacement) => replacement,
+                        Err(ControlError::PeerRouteHeld { registrations }) => {
+                            let _ = reply.send(Err(RelayControlError::PeerRouteHeld {
+                                name,
+                                registrations,
+                            }));
+                            continue;
+                        }
                         Err(ControlError::AddressMismatch { .. })
                         | Err(ControlError::DuplicateRoute { .. }) => {
                             eprintln!(
@@ -655,6 +682,14 @@ impl RelayServer {
                                     .await
                                 {
                                     Ok(replacement) => replacement,
+                                    Err(ControlError::PeerRouteHeld { registrations }) => {
+                                        state.clients.close(&client);
+                                        let _ = reply.send(Err(RelayControlError::PeerRouteHeld {
+                                            name,
+                                            registrations,
+                                        }));
+                                        continue;
+                                    }
                                     Err(ControlError::AddressMismatch { .. })
                                     | Err(ControlError::DuplicateRoute { .. })
                                     | Err(ControlError::OwnerMismatch)
@@ -720,6 +755,13 @@ impl RelayServer {
                                         );
                                         state.start_upstream_control(&entry);
                                         Ok(())
+                                    }
+                                    RegisterCommitResult::PeerRouteHeld { registrations } => {
+                                        state.clients.close(&client);
+                                        Err(RelayControlError::PeerRouteHeld {
+                                            name,
+                                            registrations,
+                                        })
                                     }
                                     RegisterCommitResult::Duplicate { .. }
                                     | RegisterCommitResult::ConflictingOwner { .. } => {

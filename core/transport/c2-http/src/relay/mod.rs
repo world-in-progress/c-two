@@ -45,8 +45,6 @@ macro_rules! test_commit_registration {
 
 pub(crate) mod authority;
 pub(crate) mod background;
-#[cfg(test)]
-mod stream_tests;
 pub(crate) mod client_lifecycle;
 #[cfg(test)]
 mod client_lifecycle_tests;
@@ -62,10 +60,14 @@ pub(crate) mod gossip;
 mod memory_tests;
 pub(crate) mod peer;
 pub(crate) mod peer_handlers;
+#[cfg(test)]
+mod route_identity_tests;
 pub(crate) mod route_table;
 pub(crate) mod router;
 pub mod server;
 pub(crate) mod state;
+#[cfg(test)]
+mod stream_tests;
 pub(crate) mod streaming;
 #[cfg(test)]
 pub(crate) mod test_support;

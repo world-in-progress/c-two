@@ -134,10 +134,20 @@ fn registration_rollback_outcome(route_name: &str, local_removed: bool) -> Route
     }
 }
 
-fn http_error_parts(err: HttpError) -> (Option<u16>, String) {
+fn http_error_parts(err: HttpError) -> (Option<u16>, String, Option<c2_error::C2Error>) {
+    let message = err.to_string();
     match err {
-        HttpError::ServerError(status_code, body) => (Some(status_code), body),
-        other => (None, other.to_string()),
+        HttpError::ServerError(status_code, body) => {
+            // Control failures can also be plain text. Preserve that original
+            // failure regardless of whether it carries a semantic envelope.
+            let semantic_error = match serde_json::from_str::<c2_error::C2ErrorEnvelope>(&body) {
+                Ok(envelope) => Some(crate::error::semantic_error_from_http_envelope(envelope)),
+                Err(_) => None,
+            };
+            (Some(status_code), body, semantic_error)
+        }
+        HttpError::LocalCallRejected(error) => (None, message, Some(error)),
+        _ => (None, message, None),
     }
 }
 
@@ -1528,6 +1538,7 @@ impl Runtime {
                             failure_source: "relay_projection".to_string(),
                             error_message: err.to_string(),
                             status_code: None,
+                            semantic_error: None,
                             rollback: Some(registration_rollback_outcome(&route_name, false)),
                             relay_cleanup_error: None,
                         },
@@ -1554,13 +1565,14 @@ impl Runtime {
                         reservation.take().expect("reservation should exist"),
                     ),
                 );
-                let (status_code, error_message) = http_error_parts(err);
+                let (status_code, error_message, semantic_error) = http_error_parts(err);
                 return Err(LifecycleError::RegisterFailure(Box::new(
                     RegisterFailureOutcome {
                         route_name: route_name.clone(),
                         failure_source: "relay_prepare".to_string(),
                         error_message,
                         status_code,
+                        semantic_error,
                         rollback: Some(registration_rollback_outcome(&route_name, false)),
                         relay_cleanup_error: None,
                     },
@@ -1594,6 +1606,7 @@ impl Runtime {
                             failure_source: "commit".to_string(),
                             error_message: err.to_string(),
                             status_code: None,
+                            semantic_error: None,
                             rollback: Some(registration_rollback_outcome(&route_name, false)),
                             relay_cleanup_error: None,
                         },
@@ -1610,6 +1623,7 @@ impl Runtime {
                         failure_source: "commit".to_string(),
                         error_message: err.to_string(),
                         status_code: None,
+                        semantic_error: None,
                         rollback: Some(registration_rollback_outcome(&route_name, false)),
                         relay_cleanup_error: None,
                     },
@@ -1633,13 +1647,14 @@ impl Runtime {
                     relay_use_proxy,
                     &registration_scope,
                 );
-                let (status_code, error_message) = http_error_parts(err);
+                let (status_code, error_message, semantic_error) = http_error_parts(err);
                 return Err(LifecycleError::RegisterFailure(Box::new(
                     RegisterFailureOutcome {
                         route_name: route_name.clone(),
                         failure_source: "relay_register".to_string(),
                         error_message,
                         status_code,
+                        semantic_error,
                         rollback: Some(registration_rollback_outcome(&route_name, local_removed)),
                         relay_cleanup_error,
                     },
@@ -1661,6 +1676,7 @@ impl Runtime {
                         failure_source: "route_open".to_string(),
                         error_message: err.to_string(),
                         status_code: None,
+                        semantic_error: None,
                         rollback: Some(registration_rollback_outcome(&route_name, local_removed)),
                         relay_cleanup_error,
                     },
@@ -2406,7 +2422,6 @@ impl Runtime {
         call_timeout_secs: f64,
         remote_payload_chunk_size: u64,
         deadline: ConnectDeadline,
-        refresh: bool,
     ) -> Result<RelayResolvedConnection, crate::Error> {
         connect_stage_check(deadline, "relay_acquire")?;
         let frozen_context = connect_state_lock(&self.state, deadline, "runtime_relay_wait")?
@@ -2431,13 +2446,6 @@ impl Runtime {
         )
         .map_err(|error| crate::normalize_http_error(error, crate::TransportPhase::PreDispatch))?;
         let client = self.project_relay_client_context_with_deadline(client, true, deadline)?;
-        if refresh {
-            client
-                .invalidate_resolution_with_deadline(deadline)
-                .map_err(|error| {
-                    crate::normalize_http_error(error, crate::TransportPhase::PreDispatch)
-                })?;
-        }
         match client
             .resolve_target_with_deadline(deadline)
             .map_err(|error| {
@@ -2492,7 +2500,6 @@ impl Runtime {
         call_timeout_secs: f64,
         remote_payload_chunk_size: u64,
         deadline: ConnectDeadline,
-        refresh: bool,
     ) -> Result<RelayAwareHttpClient, crate::Error> {
         connect_stage_check(deadline, "relay_acquire")?;
         let client = RelayAwareHttpClient::new(
@@ -2510,13 +2517,6 @@ impl Runtime {
         let client = self
             .project_relay_client_context_with_deadline(client, false, deadline)?
             .with_http_only();
-        if refresh {
-            client
-                .invalidate_resolution_with_deadline(deadline)
-                .map_err(|error| {
-                    crate::normalize_http_error(error, crate::TransportPhase::PreDispatch)
-                })?;
-        }
         match client
             .resolve_http_target_with_deadline(deadline)
             .map_err(|error| {
@@ -2595,12 +2595,6 @@ impl Runtime {
             RelayResolvedTarget::Ipc { .. } => {
                 unreachable!("HTTP-only reconciliation returned IPC")
             }
-        }
-    }
-
-    pub fn clear_relay_projection_cache(&self) {
-        if let Some(projection) = self.state.lock().relay_projection.as_ref() {
-            projection.control.clear_cache();
         }
     }
 
@@ -3823,7 +3817,7 @@ mod tests {
     }
 
     #[test]
-    fn relay_anchor_address_override_is_canonicalized_and_clear_cache_is_safe() {
+    fn relay_anchor_address_override_is_canonicalized() {
         let session = Runtime::new(RuntimeOptions {
             relay_anchor_address: Some(" http://relay.test/ ".to_string()),
             use_process_relay_anchor: false,
@@ -3836,7 +3830,6 @@ mod tests {
             Some("http://relay.test"),
         );
 
-        session.clear_relay_projection_cache();
         session.set_relay_anchor_address(Some("http://relay-b.test/".to_string()));
         assert_eq!(
             session.relay_anchor_address_override().as_deref(),
@@ -4059,17 +4052,28 @@ mod tests {
 
     #[test]
     fn relay_register_failure_after_prepare_rolls_back_and_preserves_cleanup_error() {
-        check_relay_final_failure(FinalInterference::None);
+        check_relay_final_failure(FinalInterference::None, None);
     }
 
     #[test]
     fn old_relay_final_failure_preserves_core_registered_same_name_replacement() {
-        check_relay_final_failure(FinalInterference::Replace);
+        check_relay_final_failure(FinalInterference::Replace, None);
     }
 
     #[test]
     fn unrelated_unregister_preserves_pending_registration_rollback() {
-        check_relay_final_failure(FinalInterference::UnregisterOther);
+        check_relay_final_failure(FinalInterference::UnregisterOther, None);
+    }
+
+    #[test]
+    fn canonical_relay_failure_keeps_error_and_rollback_receipt() {
+        // Error contracts: "including code, name, message, and structured details."
+        let error = c2_error::C2Error::new(c2_error::ErrorCode::ResourceAlreadyRegistered, "route already registered: grid")
+            .with_details(std::collections::BTreeMap::from([
+                ("name".into(), "grid".into()),
+                ("registrations".into(), r#"[{"relay_id":"relay-a","relay_url":"http://relay-a:8080","registered_at":1000,"relay_status":"Alive"}]"#.into()),
+            ]));
+        check_relay_final_failure(FinalInterference::None, Some(error));
     }
 
     enum FinalInterference {
@@ -4078,7 +4082,10 @@ mod tests {
         UnregisterOther,
     }
 
-    fn check_relay_final_failure(interference: FinalInterference) {
+    fn check_relay_final_failure(
+        interference: FinalInterference,
+        semantic_error: Option<c2_error::C2Error>,
+    ) {
         use std::io::{BufRead, BufReader, Read, Write};
         use std::net::TcpListener;
         use std::sync::mpsc;
@@ -4130,12 +4137,21 @@ mod tests {
         listener.set_nonblocking(true).unwrap();
         let (final_seen_tx, final_seen_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
+        let expected_message = match &semantic_error {
+            Some(error) => serde_json::to_string(&error.envelope()).unwrap(),
+            None => "final failed".to_string(),
+        };
+        let final_response = format!(
+            "HTTP/1.1 409 Conflict\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}",
+            expected_message.len(),
+            expected_message
+        );
         let relay_thread = thread::spawn(move || {
             let mut requests = Vec::new();
             for (index, response) in [
-                "HTTP/1.1 202 Accepted\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
-                "HTTP/1.1 409 Conflict\r\nConnection: close\r\nContent-Length: 12\r\n\r\nfinal failed",
-                "HTTP/1.1 409 Conflict\r\nConnection: close\r\nContent-Length: 14\r\n\r\ncleanup failed",
+                "HTTP/1.1 202 Accepted\r\nConnection: close\r\nContent-Length: 0\r\n\r\n".to_string(),
+                final_response,
+                "HTTP/1.1 409 Conflict\r\nConnection: close\r\nContent-Length: 14\r\n\r\ncleanup failed".to_string(),
             ].into_iter().enumerate() {
                 let deadline = Instant::now() + Duration::from_secs(5);
                 let (mut stream, _) = loop {
@@ -4242,7 +4258,8 @@ mod tests {
         assert_eq!(failure.route_name, route_name);
         assert_eq!(failure.failure_source, "relay_register");
         assert_eq!(failure.status_code, Some(409));
-        assert_eq!(failure.error_message, "final failed");
+        assert_eq!(failure.error_message, expected_message);
+        assert_eq!(failure.semantic_error, semantic_error);
         let rollback = failure
             .rollback
             .expect("rollback outcome should be preserved");

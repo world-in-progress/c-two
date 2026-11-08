@@ -30,6 +30,7 @@ _NATIVE_TO_PY_ERROR_NAMES = {
     "UnsupportedCallMode": "ERROR_UNSUPPORTED_CALL_MODE",
     "CallCapacityExceeded": "ERROR_CALL_CAPACITY_EXCEEDED",
     "CallCancelled": "ERROR_CALL_CANCELLED",
+    "RouteConflict": "ERROR_ROUTE_CONFLICT",
 }
 
 
@@ -400,6 +401,17 @@ class CallCancelled(CCError):
             details=details,
         )
 
+class RouteConflict(CCError):
+    """Raised when multiple online registrations hold one route name."""
+    ERROR_CODE = 719
+
+    def __init__(self, message: str | None = None, details: Mapping[str, str] | None = None):
+        super().__init__(
+            code=ERROR_Code.ERROR_ROUTE_CONFLICT,
+            message=message or 'Route conflict',
+            details=details,
+        )
+
 _CODE_TO_CLASS: dict[int, type] = {
     ERROR_Code.ERROR_AT_RESOURCE_INPUT_DESERIALIZING: ResourceDeserializeInput,
     ERROR_Code.ERROR_AT_RESOURCE_INPUT_FROM_BUFFER:    ResourceInputFromBuffer,
@@ -424,6 +436,7 @@ _CODE_TO_CLASS: dict[int, type] = {
     ERROR_Code.ERROR_UNSUPPORTED_CALL_MODE:            UnsupportedCallMode,
     ERROR_Code.ERROR_CALL_CAPACITY_EXCEEDED:           CallCapacityExceeded,
     ERROR_Code.ERROR_CALL_CANCELLED:                   CallCancelled,
+    ERROR_Code.ERROR_ROUTE_CONFLICT:                   RouteConflict,
 }
 
 
@@ -454,5 +467,6 @@ __all__ = [
     'UnsupportedCallMode',
     'CallCapacityExceeded',
     'CallCancelled',
+    'RouteConflict',
     'ERROR_Code',
 ]

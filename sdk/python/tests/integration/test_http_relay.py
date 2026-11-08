@@ -337,7 +337,10 @@ class TestCcConnectHttp:
 
         relay = start_c3_relay()
         relay_url = relay.url
-        with httpx.Client(trust_env=False, timeout=5.0) as http:
+        with httpx.Client(
+            trust_env=False, timeout=5.0,
+            headers={'x-c2-local-namespace': cc.endpoint.local_endpoint_context().namespace_id},
+        ) as http:
             resp = http.post(
                 f'{relay_url}/_register',
                 json={
@@ -452,7 +455,10 @@ class TestCcConnectHttp:
             )
 
             wrong_contract = crm_contract(Counter)
-            with httpx.Client(trust_env=False, timeout=5.0) as http:
+            with httpx.Client(
+                trust_env=False, timeout=5.0,
+                headers={'x-c2-local-namespace': cc.endpoint.local_endpoint_context().namespace_id},
+            ) as http:
                 resp = http.post(
                     f'{relay_url}/_register',
                     json={
@@ -556,7 +562,10 @@ class TestRelayControlPlane:
         relay = start_c3_relay()
         relay_url = relay.url
 
-        with httpx.Client(trust_env=False, timeout=5.0) as http:
+        with httpx.Client(
+            trust_env=False, timeout=5.0,
+            headers={'x-c2-local-namespace': cc.endpoint.local_endpoint_context().namespace_id},
+        ) as http:
             # Register via control endpoint.
             resp = http.post(
                 f'{relay_url}/_register',
@@ -598,7 +607,10 @@ class TestRelayControlPlane:
         relay = start_c3_relay()
         relay_url = relay.url
 
-        with httpx.Client(trust_env=False, timeout=5.0) as http:
+        with httpx.Client(
+            trust_env=False, timeout=5.0,
+            headers={'x-c2-local-namespace': cc.endpoint.local_endpoint_context().namespace_id},
+        ) as http:
             resp = http.post(
                 f'{relay_url}/_register',
                 json={
@@ -715,7 +727,10 @@ class TestRelayControlPlane:
         relay = start_c3_relay()
         relay_url = relay.url
 
-        with httpx.Client(trust_env=False, timeout=5.0) as http:
+        with httpx.Client(
+            trust_env=False, timeout=5.0,
+            headers={'x-c2-local-namespace': cc.endpoint.local_endpoint_context().namespace_id},
+        ) as http:
             for name in ('hello', 'counter'):
                 resp = http.post(
                     f'{relay_url}/_register',

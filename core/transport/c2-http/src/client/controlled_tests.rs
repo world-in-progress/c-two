@@ -687,7 +687,6 @@ async fn selected_http_target_stays_pinned_when_another_client_refreshes_shared_
     let mut replacement = route(&new_server.url);
     replacement.max_payload_size = 1;
     *routes.lock() = vec![replacement];
-    control.invalidate("grid");
     let selected = Arc::clone(&new_client);
     tokio::task::spawn_blocking(move || {
         selected.resolve_http_target_with_deadline(c2_config::ConnectDeadline::default())
@@ -1873,7 +1872,6 @@ async fn controlled_stream_uses_one_bound_post_and_stream_accept_header() {
     let mut replacement = route(&newer_server.url);
     replacement.max_payload_size = 1;
     *routes.lock() = vec![replacement];
-    relay_control.invalidate("grid");
     let newer_client = RelayAwareHttpClient::new_with_control(
         Arc::clone(&relay_control),
         expected(),

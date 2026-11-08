@@ -24,6 +24,144 @@ const nativeTarget={...binding,path:'DirectIpc'};
 const nextTurn=()=>new Promise(resolve=>setImmediate(resolve));
 function deferred(){let resolve;const promise=new Promise(r=>{resolve=r});return {promise,resolve};}
 
+test('719 resolve is typed, pre-dispatch, and a later acquisition can succeed',async()=>{
+  const registrations='[{"relay_id":"a","relay_url":"http://localhost:8301","registered_at":1,"relay_status":"Alive"}]';
+  const details={route:'route',dispatch_phase:'pre_dispatch',registrations};
+  const route={name:'route',relay_url:'http://localhost:8301',crm_ns:'test',crm_name:'Test',crm_ver:'0.1.0',abi_hash:hash,signature_hash:hash,max_payload_size:100};
+  let resolves=0,probes=0,posts=0;
+  const fetch=async(url)=>{
+    if(url.includes('/_resolve/')){
+      resolves++;
+      return resolves===1
+        ? {status:409,async text(){return JSON.stringify({version:1,code:719,name:'RouteConflict',message:'conflict',details})}}
+        : {status:200,async text(){return JSON.stringify([route])}};
+    }
+    if(url.includes('/_probe/')){probes++;return {status:200,async text(){return ''}}}
+    posts++;return {status:200,async arrayBuffer(){return Uint8Array.of(8).buffer}};
+  };
+  const client=transport.createRelayAwareHttpEncodedTransport('http://localhost:8300',{fetch});
+  try{
+    await assert.rejects(client.call('route',contract,'ping',()=>new Uint8Array()),error=>{
+      assert.ok(error instanceof transport.C2RouteConflictError);
+      assert.ok(error instanceof transport.C2CoreError);
+      assert.equal(error.code,719);
+      assert.equal(error.canonicalName,'RouteConflict');
+      assert.equal(error.transportPhase,'pre_dispatch');
+      assert.equal(error.retrySafe,true);
+      assert.deepEqual(error.details,details);
+      return true;
+    });
+    assert.deepEqual([resolves,probes,posts],[1,0,0]);
+    assert.equal((await client.call('route',contract,'ping',()=>new Uint8Array()))[0],8);
+    assert.deepEqual([resolves,probes,posts],[2,1,1]);
+  }finally{await client.close()}
+});
+
+test('719 resolution parses a complete canonical error once',async()=>{
+  const details={route:'route',dispatch_phase:'pre_dispatch',registrations:'[]'};
+  const body=JSON.stringify({version:1,code:719,name:'RouteConflict',message:'conflict',details});
+  const client=transport.createRelayAwareHttpEncodedTransport('http://localhost:8300',{
+    fetch:async()=>({status:409,async text(){return body}}),
+  });
+  const originalParse=JSON.parse;
+  let parses=0;
+  JSON.parse=function(...args){parses++;return originalParse.apply(this,args)};
+  try{
+    await assert.rejects(client.call('route',contract,'ping',()=>new Uint8Array()),error=>{
+      assert.ok(error instanceof transport.C2RouteConflictError);
+      assert.equal(error.message,'conflict');
+      assert.deepEqual(error.details,details);
+      return true;
+    });
+    assert.equal(parses,1);
+  }finally{JSON.parse=originalParse;await client.close()}
+});
+
+test('719 with invalid canonical fields keeps the HTTP relay error',async()=>{
+  const details={route:'route',dispatch_phase:'pre_dispatch',registrations:'[]'};
+  for(const invalid of [
+    {message:undefined,details},
+    {message:719,details},
+    {message:'conflict',details:{...details,registrations:719}},
+  ]){
+    const body=JSON.stringify({version:1,code:719,name:'RouteConflict',...invalid});
+    const client=transport.createRelayAwareHttpEncodedTransport('http://localhost:8300',{
+      fetch:async()=>({status:409,async text(){return body}}),
+    });
+    try{
+      await assert.rejects(client.call('route',contract,'ping',()=>new Uint8Array()),error=>{
+        assert.ok(error instanceof transport.C2HttpRelayError);
+        assert.equal(error instanceof transport.C2RouteConflictError,false);
+        assert.equal(error.status,409);
+        assert.equal(error.body,body);
+        assert.equal(error.retrySafe,false);
+        return true;
+      });
+    }finally{await client.close()}
+  }
+});
+
+test('native 719 projection has the same typed error',async()=>{
+  const details={route:'route',dispatch_phase:'pre_dispatch',registrations:'[]'};
+  const nativeDetails={message:'conflict',code:719,canonicalName:'RouteConflict',details,transportPhase:'pre_dispatch'};
+  const plain=new Error('conflict');plain.nativeDetails=nativeDetails;
+  for(const native of [plain,new transport.C2IpcTransportError('conflict',nativeDetails)]){
+    const client=transport.createIpcEncodedTransport('ipc://route',{connect:async()=>({
+      connectionSnapshot(){return null},async prepare(){throw native},deactivate(){},async close(){},
+    })});
+    try{
+      await assert.rejects(client.call('route',contract,'ping',()=>new Uint8Array()),error=>{
+        assert.ok(error instanceof transport.C2RouteConflictError);
+        assert.ok(error instanceof transport.C2CoreError);
+        assert.equal(error.code,719);
+        assert.equal(error.canonicalName,'RouteConflict');
+        assert.equal(error.transportPhase,'pre_dispatch');
+        assert.equal(error.retrySafe,true);
+        assert.deepEqual(error.details,details);
+        return true;
+      });
+    }finally{await client.close()}
+  }
+});
+
+test('719 probe stops acquisition before trying another registration',async()=>{
+  const details={route:'route',dispatch_phase:'pre_dispatch',registrations:'[]'};
+  const routes=[8301,8302].map(port=>({name:'route',relay_url:`http://localhost:${port}`,crm_ns:'test',crm_name:'Test',crm_ver:'0.1.0',abi_hash:hash,signature_hash:hash,max_payload_size:100}));
+  let resolves=0,probes=0,posts=0;
+  const fetch=async(url)=>{
+    if(url.includes('/_resolve/')){resolves++;return {status:200,async text(){return JSON.stringify(routes)}}}
+    if(url.includes('/_probe/')){
+      probes++;
+      return {status:409,async text(){return JSON.stringify({version:1,code:719,name:'RouteConflict',message:'conflict',details})}};
+    }
+    posts++;throw Error('unexpected POST');
+  };
+  const client=transport.createRelayAwareHttpEncodedTransport('http://localhost:8300',{fetch});
+  try{
+    await assert.rejects(client.call('route',contract,'ping',()=>new Uint8Array()),error=>error instanceof transport.C2RouteConflictError && error.retrySafe);
+    assert.deepEqual([resolves,probes,posts],[1,1,0]);
+  }finally{await client.close()}
+});
+
+test('719 without a pre-dispatch proof preserves the native failure phase',async()=>{
+  for(const transportPhase of [undefined,'dispatch_uncertain']){
+    const native=new Error('resource propagated a conflict');
+    native.nativeDetails={message:native.message,code:719,canonicalName:'RouteConflict',details:{route:'route'},transportPhase};
+    const client=transport.createIpcEncodedTransport('ipc://route',{connect:async()=>({
+      connectionSnapshot(){return null},async prepare(){throw native},deactivate(){},async close(){},
+    })});
+    try{
+      await assert.rejects(client.call('route',contract,'ping',()=>new Uint8Array()),error=>{
+        assert.equal(error instanceof transport.C2RouteConflictError,false);
+        assert.equal(error.code,719);
+        assert.equal(error.retrySafe,false);
+        assert.equal(error.transportPhase,transportPhase??null);
+        return true;
+      });
+    }finally{await client.close()}
+  }
+});
+
 for (const relayLocal of [false, true]) for (const stream of [false, true]) {
   test(`expired preparation observes a late native rejection (relayLocal=${relayLocal}, stream=${stream})`, async () => {
     let clock = 0, rejectPreparation, preparations = 0, encoded = 0, begun = 0;

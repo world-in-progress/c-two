@@ -20,6 +20,7 @@ def test_native_error_registry_exposes_canonical_codes():
     assert not retired_names & registry.keys()
     assert registry["RouteWatchUnavailable"] == 712
     assert registry["ProtocolViolation"] == 713
+    assert registry["RouteConflict"] == 719
     assert registry["FallbackDenied"] == 714
 
 
@@ -35,6 +36,12 @@ def test_native_decode_error_wire_parts_known_code():
         b'"message":"grid exists","details":{"route":"grid"}}'
     ))
     assert decoded == (703, "grid exists", {"route": "grid"})
+
+
+def test_native_route_conflict_wire_preserves_registrations():
+    details = {"route": "grid", "dispatch_phase": "pre_dispatch", "registrations": "[]"}
+    wire = _native.encode_error_wire(719, "conflict", details)
+    assert _native.decode_error_wire_parts(memoryview(wire)) == (719, "conflict", details)
 
 
 def test_native_decode_error_wire_parts_unknown_code_degrades():

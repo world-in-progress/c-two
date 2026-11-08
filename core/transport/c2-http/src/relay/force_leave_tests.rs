@@ -69,7 +69,7 @@ fn route(name: &str, owner: &str, locality: Locality) -> RouteEntry {
         abi_hash: TEST_ABI_HASH.into(),
         signature_hash: TEST_SIGNATURE_HASH.into(),
         max_payload_size: 1024,
-        route_uid: format!("{name}-{owner}-uid"),
+        route_uid: (locality == Locality::Local).then(|| format!("{name}-{owner}-uid")),
         locality,
         registered_at: 1000.0,
     }
@@ -154,10 +154,10 @@ fn force_leave_route_table_uses_current_status_at_mutation() {
     let (state, _) = state("relay-a");
     target_records(&state, "relay-c", PeerStatus::Suspect);
     state.with_route_table_mut(|table| {
-        table.get_peer_mut("relay-c").unwrap().status = PeerStatus::Alive;
+        table.set_peer_status("relay-c", PeerStatus::Alive);
         assert!(table.force_leave_peer("relay-c").is_err());
         assert!(table.has_peer("relay-c"));
-        table.get_peer_mut("relay-c").unwrap().status = PeerStatus::Dead;
+        table.set_peer_status("relay-c", PeerStatus::Dead);
         table.force_leave_peer("relay-c").unwrap();
     });
     assert_forgotten(&state, "relay-c");
@@ -217,9 +217,7 @@ async fn force_leave_admin_status_body_and_no_broadcast_on_rejection() {
         assert!(state.has_peer("relay-c"));
         assert!(recorder.0.lock().unwrap().is_empty());
     }
-    state.with_route_table_mut(|table| {
-        table.get_peer_mut("relay-c").unwrap().status = PeerStatus::Suspect
-    });
+    state.with_route_table_mut(|table| table.set_peer_status("relay-c", PeerStatus::Suspect));
     let (status, text) = post(
         state.clone(),
         "/_admin/force-leave",
@@ -419,7 +417,7 @@ async fn force_leave_seed_rejoin_adopts_the_seeds_current_view() {
         target_records(&seed, "relay-c", PeerStatus::Alive);
         if !seed_remembers_target {
             seed.with_route_table_mut(|table| {
-                table.get_peer_mut("relay-c").unwrap().status = PeerStatus::Suspect
+                table.set_peer_status("relay-c", PeerStatus::Suspect)
             });
             RouteAuthority::new(&seed)
                 .force_leave_peer("relay-c")

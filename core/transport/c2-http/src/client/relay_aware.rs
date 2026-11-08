@@ -308,16 +308,6 @@ impl RelayAwareHttpClient {
             .block_on(self.select_target_with_local_exclusions_async(true, &[], false, deadline))
     }
 
-    /// Forget the shared route-resolution cache before a Core reacquisition.
-    /// Existing selected targets continue to serve their current registration.
-    pub fn invalidate_resolution_with_deadline(
-        &self,
-        deadline: c2_config::ConnectDeadline,
-    ) -> Result<(), HttpError> {
-        self.control
-            .invalidate_with_deadline(self.route_name(), deadline)
-    }
-
     pub fn resolve_http_target_with_deadline(
         &self,
         deadline: c2_config::ConnectDeadline,
@@ -376,14 +366,7 @@ impl RelayAwareHttpClient {
 
         for attempt in 0..attempts {
             super::connect_deadline::check(deadline, "relay_resolve")?;
-            let routes = match self
-                .resolve_routes_async(
-                    attempt > 0 || fallback_denied_when_only_excluded,
-                    prefer_local_ipc,
-                    deadline,
-                )
-                .await
-            {
+            let routes = match self.resolve_routes_async(prefer_local_ipc, deadline).await {
                 Ok(routes) if !routes.routes.is_empty() => routes,
                 Ok(_) if fallback_denied_when_only_excluded => {
                     return Err(HttpError::ServerError(
@@ -475,11 +458,7 @@ impl RelayAwareHttpClient {
                         return Ok(RelayResolvedTarget::Http { relay_url });
                     }
                     Err(err @ HttpError::LocalCallRejected(_)) => return Err(err),
-                    Err(err) if route_not_found(&err) => {
-                        self.control
-                            .invalidate_with_deadline(self.route_name(), deadline)?;
-                        last_error = Some(err);
-                    }
+                    Err(err) if route_not_found(&err) => last_error = Some(err),
                     Err(err) if terminal_route_refusal(&err) => return Err(err),
                     Err(err) => {
                         last_error = Some(err);
@@ -537,44 +516,16 @@ impl RelayAwareHttpClient {
 
     async fn resolve_routes_async(
         &self,
-        force_refresh: bool,
         prefer_local_ipc: bool,
         deadline: c2_config::ConnectDeadline,
     ) -> Result<RelayResolvedRoutes, HttpError> {
-        if force_refresh {
-            self.control
-                .invalidate_with_deadline(self.route_name(), deadline)?;
-        }
         let routes = self
             .resolve_with_endpoint_context_async(prefer_local_ipc, deadline)
-            .await;
-        let routes = routes?;
+            .await?;
         let raw_routes_non_empty = !routes.routes.is_empty();
         let local_endpoint_namespace = routes.local_endpoint_namespace;
         let filtered = filter_routes_by_expected_contract(routes.routes, &self.expected);
-        if !force_refresh && raw_routes_non_empty && filtered.is_empty() {
-            self.control
-                .invalidate_with_deadline(self.route_name(), deadline)?;
-            let refreshed = self
-                .resolve_with_endpoint_context_async(prefer_local_ipc, deadline)
-                .await;
-            let refreshed = refreshed?;
-            let refreshed_routes_non_empty = !refreshed.routes.is_empty();
-            let local_endpoint_namespace = refreshed.local_endpoint_namespace;
-            let refreshed_filtered =
-                filter_routes_by_expected_contract(refreshed.routes, &self.expected);
-            if refreshed_routes_non_empty && refreshed_filtered.is_empty() {
-                return Err(HttpError::ServerError(
-                    409,
-                    crm_contract_mismatch_body(self.route_name()),
-                ));
-            }
-            return Ok(RelayResolvedRoutes {
-                routes: refreshed_filtered,
-                local_endpoint_namespace,
-            });
-        }
-        if force_refresh && raw_routes_non_empty && filtered.is_empty() {
+        if raw_routes_non_empty && filtered.is_empty() {
             return Err(HttpError::ServerError(
                 409,
                 crm_contract_mismatch_body(self.route_name()),
@@ -697,7 +648,8 @@ fn terminal_route_refusal(err: &HttpError) -> bool {
     c2_error::C2Error::from_envelope(envelope).is_ok_and(|error| {
         matches!(
             error.code,
-            c2_error::ErrorCode::ContractMismatch
+            c2_error::ErrorCode::RouteConflict
+                | c2_error::ErrorCode::ContractMismatch
                 | c2_error::ErrorCode::IdentityMismatch
                 | c2_error::ErrorCode::ProtocolViolation
         )
@@ -1626,9 +1578,6 @@ mod tests {
             "one logical call does not replay its POST"
         );
         drop(error);
-        client
-            .invalidate_resolution_with_deadline(c2_config::ConnectDeadline::default())
-            .unwrap();
         acquire_http(&client).await;
         let next = client.call_async("step", b"payload").await.unwrap();
         assert_eq!(next, b"ok:payload");
@@ -2125,7 +2074,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cached_wrong_contract_routes_force_fresh_resolve_before_404() {
+    async fn wrong_contract_response_is_rejected_without_repeated_lookup() {
         let (live_url, live_handle) =
             spawn_app(Router::new().route("/_probe/{route}", get(|| async { StatusCode::OK })))
                 .await;
@@ -2153,11 +2102,12 @@ mod tests {
         )
         .unwrap();
 
-        client.connect_async().await.unwrap();
+        let error = client.connect_async().await.unwrap_err();
+        assert!(matches!(error, HttpError::ServerError(409, _)));
         assert_eq!(
             resolve_count.load(Ordering::SeqCst),
-            2,
-            "CRM-filtered cached routes should force one fresh resolve before reporting no compatible route"
+            1,
+            "one acquisition resolves once before rejecting a mismatched contract"
         );
 
         registry_handle.abort();
@@ -2507,9 +2457,6 @@ mod tests {
             "one logical call does not replay its POST"
         );
         drop(error);
-        client
-            .invalidate_resolution_with_deadline(c2_config::ConnectDeadline::default())
-            .unwrap();
         acquire_http(&client).await;
         let next = client.call_async("step", b"payload").await.unwrap_err();
         assert!(route_not_found(&next));

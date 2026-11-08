@@ -71,6 +71,7 @@ define_error_codes! {
     UnsupportedCallMode = 716,
     CallCapacityExceeded = 717,
     CallCancelled = 718,
+    RouteConflict = 719,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -264,7 +265,7 @@ mod tests {
     fn error_code_registry_matches_canonical_wire_values() {
         use ErrorCode::*;
 
-        let expected: [(ErrorCode, u16, &str); 24] = [
+        let expected: [(ErrorCode, u16, &str); 25] = [
             (Unknown, 0, "Unknown"),
             (ResourceInputDeserializing, 1, "ResourceInputDeserializing"),
             (ResourceOutputSerializing, 2, "ResourceOutputSerializing"),
@@ -289,6 +290,7 @@ mod tests {
             (UnsupportedCallMode, 716, "UnsupportedCallMode"),
             (CallCapacityExceeded, 717, "CallCapacityExceeded"),
             (CallCancelled, 718, "CallCancelled"),
+            (RouteConflict, 719, "RouteConflict"),
         ];
         let registry = ErrorCode::registry();
         assert_eq!(registry.len(), expected.len());
@@ -299,7 +301,7 @@ mod tests {
             assert_eq!(variant.name(), name);
             assert_eq!(ErrorCode::try_from(value), Ok(variant));
         }
-        for value in [9, 700, 719, 9999, u16::MAX] {
+        for value in [9, 700, 9999, u16::MAX] {
             assert_eq!(ErrorCode::try_from(value), Err(()));
         }
     }
@@ -328,6 +330,24 @@ mod tests {
             .unwrap();
         assert_eq!(decoded, error);
         assert_eq!(decoded.code as u16, 718);
+    }
+
+    #[test]
+    fn route_conflict_round_trips_with_canonical_code_and_registrations() {
+        let registrations = r#"[{"relay_id":"a","relay_url":"http://relay","registered_at":1,"relay_status":"Alive"}]"#;
+        let error = C2Error::new(ErrorCode::RouteConflict, "duplicate online route").with_details(
+            BTreeMap::from([
+                ("route".into(), "grid".into()),
+                ("dispatch_phase".into(), "pre_dispatch".into()),
+                ("registrations".into(), registrations.into()),
+            ]),
+        );
+        let decoded = C2Error::from_wire_bytes(&error.to_wire_bytes())
+            .unwrap()
+            .unwrap();
+        assert_eq!(decoded, error);
+        assert_eq!(decoded.code as u16, 719);
+        assert_eq!(decoded.code.name(), "RouteConflict");
     }
 
     #[test]

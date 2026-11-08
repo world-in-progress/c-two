@@ -506,6 +506,10 @@ pub fn semantic_error_from_http_body(body: &str) -> C2Error {
             );
         }
     };
+    semantic_error_from_http_envelope(envelope)
+}
+
+pub(crate) fn semantic_error_from_http_envelope(envelope: C2ErrorEnvelope) -> C2Error {
     match C2Error::from_envelope(envelope) {
         Ok(error) => error,
         Err(error) => protocol_violation(

@@ -30,7 +30,7 @@ pub enum PeerMessage {
         abi_hash: String,
         signature_hash: String,
         max_payload_size: u64,
-        route_uid: String,
+
         registered_at: f64,
     },
     /// A CRM route was unregistered.
@@ -80,7 +80,7 @@ pub enum DigestDiffEntry {
         abi_hash: String,
         signature_hash: String,
         max_payload_size: u64,
-        route_uid: String,
+
         registered_at: f64,
     },
     Deleted {
@@ -162,7 +162,7 @@ pub fn validate_route_state_envelope(
             abi_hash,
             signature_hash,
             max_payload_size,
-            route_uid,
+
             registered_at,
         } => {
             if relay_id.as_str() != envelope.sender_relay_id
@@ -176,7 +176,6 @@ pub fn validate_route_state_envelope(
                     abi_hash,
                     signature_hash,
                     *max_payload_size,
-                    route_uid,
                     *registered_at,
                 )
             {
@@ -262,7 +261,7 @@ fn validate_digest_diff_entries(
                 abi_hash,
                 signature_hash,
                 max_payload_size,
-                route_uid,
+
                 registered_at,
             } => {
                 if relay_id != sender_relay_id
@@ -276,7 +275,6 @@ fn validate_digest_diff_entries(
                         &abi_hash,
                         &signature_hash,
                         max_payload_size,
-                        &route_uid,
                         registered_at,
                     )
                 {
@@ -297,7 +295,8 @@ fn validate_digest_diff_entries(
                     abi_hash,
                     signature_hash,
                     max_payload_size,
-                    route_uid,
+
+                    route_uid: None,
                     locality: Locality::Peer,
                     registered_at,
                 }));
@@ -336,7 +335,7 @@ fn valid_active_route_fields(
     abi_hash: &str,
     signature_hash: &str,
     max_payload_size: u64,
-    route_uid: &str,
+
     registered_at: f64,
 ) -> bool {
     crate::relay::route_table::valid_route_name(name)
@@ -346,7 +345,6 @@ fn valid_active_route_fields(
         && c2_contract::validate_contract_hash("abi_hash", abi_hash).is_ok()
         && c2_contract::validate_contract_hash("signature_hash", signature_hash).is_ok()
         && max_payload_size > 0
-        && c2_contract::validate_call_route_key("route_uid", route_uid).is_ok()
         && registered_at.is_finite()
 }
 
@@ -386,7 +384,7 @@ mod tests {
             "name": "grid", "relay_id": "relay-a", "relay_url": "http://relay-a:8080",
             "crm_ns": "test.ns", "crm_name": "Grid", "crm_ver": "0.1.0",
             "abi_hash": "a".repeat(64), "signature_hash": "b".repeat(64),
-            "max_payload_size": 1024, "route_uid": "grid-uid", "registered_at": 1000.0,
+            "max_payload_size": 1024, "registered_at": 1000.0,
         });
         let deleted = serde_json::json!({
             "name": "grid", "relay_id": "relay-a", "removed_at": 1001.0,
@@ -396,7 +394,7 @@ mod tests {
                 active.clone(),
                 "RouteAnnounce",
                 false,
-                vec!["route_revision"],
+                vec!["route_uid", "route_revision"],
             ),
             (
                 deleted.clone(),
@@ -404,7 +402,12 @@ mod tests {
                 false,
                 vec!["removed_revision"],
             ),
-            (active, "Active", true, vec!["hash", "route_revision"]),
+            (
+                active,
+                "Active",
+                true,
+                vec!["route_uid", "hash", "route_revision"],
+            ),
             (deleted, "Deleted", true, vec!["hash", "removed_revision"]),
         ] {
             for retired in retired_fields {
@@ -465,7 +468,7 @@ mod tests {
                 signature_hash: "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
                     .into(),
                 max_payload_size: 1024,
-                route_uid: "grid-route-uid-0001".into(),
+
                 registered_at: 1000.0,
             },
         );
@@ -495,7 +498,7 @@ mod tests {
                 signature_hash: "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
                     .into(),
                 max_payload_size: 1024,
-                route_uid: "grid-route-uid-0001".into(),
+
                 registered_at: 1000.0,
             },
         );

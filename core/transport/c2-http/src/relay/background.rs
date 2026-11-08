@@ -137,7 +137,7 @@ fn tombstone_retention(state: &RelayState) -> Duration {
     MIN_RETENTION.max(anti_entropy_window)
 }
 
-/// Detect failed peers: Alive→Suspect→Dead with route removal.
+/// Detect failed peers: Alive→Suspect→Dead while their routes remain held.
 async fn failure_detection_loop(state: Arc<RelayState>, cancel: CancellationToken) {
     let hb = state.config().heartbeat_interval;
     let check_interval = hb * 2;
@@ -166,16 +166,11 @@ async fn failure_detection_loop(state: Arc<RelayState>, cancel: CancellationToke
             let elapsed = now.duration_since(last_hb);
             if status == PeerStatus::Suspect && elapsed > dead_deadline {
                 state.with_route_table_mut(|rt| {
-                    if let Some(p) = rt.get_peer_mut(&relay_id) {
-                        p.status = PeerStatus::Dead;
-                    }
+                    rt.set_peer_status(&relay_id, PeerStatus::Dead);
                 });
-                RouteAuthority::new(&state).remove_peer_routes(&relay_id);
             } else if status == PeerStatus::Alive && elapsed > suspect_deadline {
                 state.with_route_table_mut(|rt| {
-                    if let Some(p) = rt.get_peer_mut(&relay_id) {
-                        p.status = PeerStatus::Suspect;
-                    }
+                    rt.set_peer_status(&relay_id, PeerStatus::Suspect);
                 });
             }
         }
@@ -295,10 +290,7 @@ async fn dead_peer_probe_loop(state: Arc<RelayState>, cancel: CancellationToken)
                 }
                 // Peer is back — mark alive
                 state.with_route_table_mut(|rt| {
-                    if let Some(p) = rt.get_peer_mut(&relay_id) {
-                        p.status = PeerStatus::Alive;
-                        p.last_heartbeat = std::time::Instant::now();
-                    }
+                    rt.record_peer_probe_success(&relay_id);
                 });
 
                 // Immediate digest exchange with recovered peer
@@ -447,5 +439,63 @@ mod tests {
         assert!(line.contains("server_id=server-grid"));
         assert!(line.contains("removed_at=2000"));
         assert!(line.contains("reason=retention-expired"));
+    }
+    #[tokio::test]
+    async fn failure_detection_keeps_dead_peer_routes_and_digest() {
+        // ADR 0004: "联系不上不等于已经没了。"
+        let state = Arc::new(RelayState::new(
+            Arc::new(c2_config::RelayConfig {
+                relay_id: "relay-local".into(),
+                heartbeat_interval: Duration::from_millis(5),
+                heartbeat_miss_threshold: 1,
+                ..Default::default()
+            }),
+            Arc::new(crate::relay::test_support::NoopDisseminator),
+        ));
+        state.register_peer(crate::relay::types::PeerInfo {
+            relay_id: "relay-peer".into(),
+            url: "http://relay-peer:8080".into(),
+            route_count: 1,
+            last_heartbeat: std::time::Instant::now() - Duration::from_secs(1),
+            status: PeerStatus::Alive,
+        });
+        state.with_route_table_mut(|table| {
+            assert!(table.register_route(crate::relay::types::RouteEntry {
+                name: "grid".into(),
+                relay_id: "relay-peer".into(),
+                relay_url: "http://relay-peer:8080".into(),
+                server_id: None,
+                server_instance_id: None,
+                ipc_address: None,
+                crm_ns: "test.echo".into(),
+                crm_name: "Echo".into(),
+                crm_ver: "0.1.0".into(),
+                abi_hash: crate::relay::test_support::TEST_ABI_HASH.into(),
+                signature_hash: crate::relay::test_support::TEST_SIGNATURE_HASH.into(),
+                max_payload_size: 1024,
+                route_uid: None,
+                locality: crate::relay::types::Locality::Peer,
+                registered_at: 1000.0,
+            }))
+        });
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(failure_detection_loop(state.clone(), cancel.clone()));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !state.with_route_table(|table| {
+                table.get_peer("relay-peer").unwrap().status == PeerStatus::Dead
+            }) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(state.list_routes().len(), 1);
+        assert!(
+            state
+                .route_digest()
+                .contains_key(&("grid".into(), "relay-peer".into(), false))
+        );
+        cancel.cancel();
+        task.await.unwrap();
     }
 }

@@ -536,7 +536,7 @@ mod early_rejection {
                     abi_hash: TEST_ABI_HASH.into(),
                     signature_hash: TEST_SIGNATURE_HASH.into(),
                     max_payload_size: 3,
-                    route_uid: "early-route".into(),
+                    route_uid: Some("early-route".into()),
                     locality: super::super::types::Locality::Local,
                     registered_at: 1.0,
                 }))
@@ -863,7 +863,7 @@ async fn capacity_rejection_case(kind: CapacityRequest) {
             abi_hash: TEST_ABI_HASH.into(),
             signature_hash: TEST_SIGNATURE_HASH.into(),
             max_payload_size: input_len as u64,
-            route_uid: "capacity-route".into(),
+            route_uid: Some("capacity-route".into()),
             locality: super::types::Locality::Local,
             registered_at: 1000.0,
         };
