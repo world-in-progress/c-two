@@ -6,7 +6,7 @@
 
 同一块代码里的事合成一批做，免得先做的被后面的批次推翻。
 
-1. **路由身份**（[ADR 0004](../decisions/0004-route-name-identity.md)，2026-11-06 采用；依据是[单一持有者调研](../research/2026-11-06-single-owner-naming-survey.md)）：路由名加契约身份是一份资源状态的唯一身份，代理跟随路由名，重新注册对调用方透明；relay mesh 内同一个名字同时只有一次在线注册，失联对端的名字保留到它撤下或被明确释放，分区愈合后同名报路由冲突，由部署方注销其中一份。改 IPC 16 的调用标识、C ABI 8 的 prepare 与经 relay 的调用和探测，代理不再暴露 route UID；退役 704 `RouteStale`，新增路由冲突错误码，并删除没有生产者的 706 `WriteConflict` 与 711 `RouteCatalogCompacted`，连同 Python 的错误类、映射、`__all__` 与相关测试；删掉流式块 9b7b 按 route UID 排除候选的逻辑；加回 9b8b 为等那处修复而去掉的 relay-local 首次 acquire 用例；明确释放失联 relay 名字的管理操作与 mesh 协议是否升版本在实施计划里定。流式批次已于 2026-11-08 经 [world-in-progress/c-two#219](https://github.com/world-in-progress/c-two/pull/219) 合入（`a5ab5eaa`），main 从此包含 IPC 16 与流式块 9 测出的已知问题 D5（见[验收记录](../acceptance/2026-11-08-streaming-acceptance.md)），这一批同时解决 D5。它要在任何包含 IPC 16 的版本发布之前完成，这样调用标识的改动不必再升协议版本；它合入之前不从 main 发版。
+1. **路由身份**（[ADR 0004](../decisions/0004-route-name-identity.md)，2026-11-06 采用；[执行计划](2026-11-08-route-identity-plan.md) 2026-11-08 批准，进行中）：路由名加契约身份是一份资源状态的唯一身份，代理跟随路由名，同一个端点或 relay 上的重新注册对调用方透明；relay 网格内同一个名字同时只有一次在线注册，名字仍归失联的 relay，直到它回来后撤下或部署方对它强制离开，同名的多次在线注册报路由冲突（719 `RouteConflict`），由部署方注销其中一份。计划分七块：IPC 与 ABI 8 的调用标识去掉 route UID；relay 的 HTTP 调用与探测去掉 route UID，退役 704 并删除 706 与 711；代理跟随路由名，先在 Core、Python 与 Rust SDK，再在生成的 TypeScript 客户端；强制离开；网格内名字唯一；交叉验收。块 1 进行中。main 从 `a5ab5eaa`（world-in-progress/c-two#219）起包含 IPC 16 与流式块 9 测出的已知问题 D5（见[验收记录](../acceptance/2026-11-08-streaming-acceptance.md)），这一批同时解决 D5。它要在任何包含 IPC 16 的版本发布之前完成，这样调用标识的改动不必再升协议版本；它合入之前不从 main 发版。
 2. **派发后的结果查询与去重**（维护者 2026-11-02 认为值得做）：事发那一刻进程内兜不住，结果未知时如实报派发不确定；这一项让调用方事后能查清一个派发不确定的调用是否执行过，或带同一个调用标识安全重试而不重复执行。业界有数据库的事务结果查询（例如 Oracle 的逻辑事务 ID）与 HTTP 幂等键，待一手来源调研。协议批之后先写设计与 ADR：调用标识跨重连与进程的稳定性、服务端结果的保留期限与存储、与有状态调用顺序的关系、与流式 RPC 的交叉。
 3. **按区域的结构调整与重复校验。** 不碰协议，各区先出方案：
    - **Core 与 Python：** E1、E2、E4、E13；C5、C6；G5、G9；R06 回调重入导致自锁的风险。块 9c3 的检查在 `sdk/python/native/src/runtime_session_ffi.rs` 里又记下两类持锁碰 Python 的写法，与 9c3 修好的 `invalidate_then_release` 属同一类：在 `server_bridge` 的锁内释放 Python 对象（第 924、1287 行的 `take()`，第 1039 行替换旧值），最后一个引用的析构可能执行 Python 代码；在 host 的锁内投影 Python 异常（第 952、966 行）。只做了静态核对，还没有复现；修法同样是先在锁内取出，放开锁之后再碰 Python。
@@ -50,7 +50,7 @@
 
 - 配置项的逐项表。
 - relay 轮询的间隔（复审建议秒级，不做成配置）。
-- `/_admin/unregister` 有没有人手动使用（F7）。
+- `/_admin/unregister` 有没有人手动使用（F7）。路由身份计划的决定 D（2026-11-08 批准）把它定为 Host 崩溃之后部署方在原 relay 上撤下名字的途径，它因此保留；第 3 项里注销 202/204/404 的区分仍待答复。
 - `crm.client = <对象>` 与 `HeldResult(release_cb=…)` 算不算扩展点（G2）。
 - `c_two.config.settings` 的直接写入是否受支持（G8）。
 - R21：Resource 模板生成器输出的仍是装饰并继承 CRM 的旧模型，c2-codegen 没有等价的 Resource 骨架；修好这个工具，还是退役这项功能（约 613 行）。

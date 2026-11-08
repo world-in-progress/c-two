@@ -141,8 +141,12 @@ The relay a process registers its routes with and resolves names through (`C2_RE
 _Avoid_: home relay, registry
 
 **路由冲突 / route conflict**:
-The state in which more than one relay holds a live registration of the same route after a partition. New acquisitions fail until only one registration is left; C-Two never chooses between them.
+The state in which more than one relay holds a live registration of the same route name, after a partition heals or when two relays accept the same new name at the same time. New acquisitions fail until only one registration is left; C-Two never chooses between them.
 _Avoid_: duplicate route, split brain
+
+**强制离开 / force-leave**:
+The deployer's declaration, made at any live relay, that an unreachable relay has left the mesh. Every relay that cannot reach it forgets it and its routes, so its route names can be registered elsewhere.
+_Avoid_: release (for this operation), evict
 
 **端点 / endpoint**:
 The operating-system object behind an `ipc://` address: a Unix socket in an endpoint namespace, or a Windows named pipe.
@@ -255,3 +259,7 @@ _Avoid_: 期限
 **维护者 / maintainer**:
 The people who decide C-Two's direction; the backlog, designs and ADRs record their decisions and approvals.
 _Avoid_: 用户 and 开发者 for a maintainer (both name the people and applications that use C-Two)
+
+**部署方 / deployer**:
+The people or systems that run a C-Two deployment's relays and Hosts. They choose route names, resolve route conflicts and force unreachable relays to leave the mesh.
+_Avoid_: operator, 运维方

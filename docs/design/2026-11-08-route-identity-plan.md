@@ -1,8 +1,8 @@
 # 路由身份的执行计划
 
-状态：草稿，待维护者批准（2026-11-08）。批准之前不开始实施。
+状态：维护者 2026-11-08 按推荐批准，包括第二节的决定 A 至 F 与第三节的用词；实施中。
 
-本计划实施 [ADR 0004](../decisions/0004-route-name-identity.md)，即[待办](backlog.md)“接下来”的第 1 项。依据是 ADR 0004、[单一持有者调研](../research/2026-11-06-single-owner-naming-survey.md)、[流式第二、三阶段验收记录](../acceptance/2026-11-08-streaming-acceptance.md)里的已知问题 D5，以及[闲置驱逐审查](../acceptance/2026-10-10-idle-eviction-regression-audit.md)的六道门禁。这一批要在任何包含 IPC 16 的版本发布之前合入 main；main 从 `a5ab5eaa`（world-in-progress/c-two#219）起已经包含 IPC 16。整合分支 `socu/route-identity` 从 `a5ab5eaa` 切出。第一节的现状来自对 `a5ab5eaa` 源码的静态阅读，没有运行验证；第七节列出留给各块核实的地方。
+本计划实施 [ADR 0004](../decisions/0004-route-name-identity.md)，即[待办](backlog.md)“接下来”的第 1 项。依据是 ADR 0004、[单一持有者调研](../research/2026-11-06-single-owner-naming-survey.md)、[流式第二、三阶段验收记录](../acceptance/2026-11-08-streaming-acceptance.md)里的已知问题 D5，以及[闲置驱逐审查](../acceptance/2026-10-10-idle-eviction-regression-audit.md)的六道门禁。这一批要在任何包含 IPC 16 的版本发布之前合入 main；main 从 `a5ab5eaa`（world-in-progress/c-two#219）起已经包含 IPC 16。整合分支 `socu/route-identity` 从上游 main 的 `fd33e140` 切出，它与 `a5ab5eaa` 只差 world-in-progress/c-two#220 的文档。第一节的现状来自对 `a5ab5eaa` 源码的静态阅读，没有运行验证；第七节列出留给各块核实的地方。
 
 ## 一、现状
 
@@ -62,7 +62,7 @@ ADR 0004 列出的是代理上的 route UID（Rust `observed_route()`、Python `
 
 ## 三、用词
 
-ADR 0004 的几处用词与[术语表](../../CONTEXT.md)冲突或重复。建议批准时一并定下，在 ADR 0004 的日期补记里说明，术语表在块 5、块 6 合入时更新。
+ADR 0004 的几处用词与[术语表](../../CONTEXT.md)冲突或重复。下面的建议随计划一起批准，已写进 ADR 0004 的日期补记与术语表；术语表里路由冲突的定义同时改为按路由名，并包括两个 relay 同时接受同一个新名字的情形。
 
 - ADR 写“运维方明确释放”。术语表里“释放 / release”指租约、分配或 hold 的结束。建议这个操作叫“强制离开 / force-leave”，与 relay 主动离开网格的 `RelayLeave` 对应。建议的条目：**强制离开 / force-leave**: The deployer's declaration that an unreachable relay has left the mesh. Every relay forgets that relay and its routes, and its route names can be registered elsewhere. _Avoid_: release (for this operation), evict.
 - ADR 写“它持有的名字仍然保留”。术语表把“保留”定为 hold 在中文里的动词。建议这种情形写作“名字仍归失联的 relay”，不另立术语。
@@ -133,7 +133,7 @@ ADR 0004 的几处用词与[术语表](../../CONTEXT.md)冲突或重复。建议
 
 范围：按第五节的表述，在 Python、Rust SDK 与生成的 Node 客户端上补齐六道门禁与两道新门禁，覆盖持久直连、relay-local 与 HTTP；直接 IPC 与 relay 矩阵和可移植矩阵；配对基准；参考文档、CONTEXT.md、AGENTS.md 的退役表、ADR 0004 的补记、发行说明与验收记录。
 
-检查：配对基准（`ipc-memory-paired.yml`）以 `a5ab5eaa` 为基线，门槛沿用[流式设计](2026-11-03-streaming-rpc-design.md)第十二节第 7 条：一元调用的中位延迟、p95 或吞吐退化超过 5% 且超出噪声，先定位，再交维护者裁决。确切候选在 Linux、macOS、Windows x64 与 ARM64 上的全平台 CI。
+检查：配对基准（`ipc-memory-paired.yml`）以这一批的起点 `fd33e140` 为基线（代码与 `a5ab5eaa` 相同），门槛沿用[流式设计](2026-11-03-streaming-rpc-design.md)第十二节第 7 条：一元调用的中位延迟、p95 或吞吐退化超过 5% 且超出噪声，先定位，再交维护者裁决。确切候选在 Linux、macOS、Windows x64 与 ARM64 上的全平台 CI。
 
 退出条件：就是这一批的完成标准：各块都已验收；确切候选的全平台 CI 通过；验收记录与 `docs/releases/unreleased.md` 写好；维护者发话之后开上游 PR。
 
