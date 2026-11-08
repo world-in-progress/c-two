@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-import base64
 import json
 import os
 from pathlib import Path
-import pickle
+import shutil
 import subprocess
+import tempfile
 import urllib.parse
 import uuid
 
@@ -21,7 +21,6 @@ from c_two.crm.contract import crm_contract
 from tests.fixtures.persistent_lifecycle_support import Lifecycle
 from tests.fixtures.route_identity_host import Host
 from tests.fixtures.route_identity_mesh_support import GatedRelay, wait_state
-from tests.fixtures.route_identity_node import NodeDriver
 from tests.conftest import c3_binary
 
 
@@ -29,22 +28,20 @@ pytestmark = pytest.mark.timeout(180)
 
 
 @pytest.fixture
-def mesh(monkeypatch):
-    """All c3/host endpoints use one private root; process logs stay in checkout."""
-    run = (Path("target/route-identity-b6-validation") / f"mesh-{uuid.uuid4().hex}").resolve()
-    run.mkdir(parents=True)
-    root = None if os.name == "nt" else str(run / "ipc")
-    if root is not None:
-        Path(root).mkdir(mode=0o700)
+def mesh(monkeypatch, request, tmp_path):
+    """Keep logs in pytest's temporary path and Unix IPC paths short."""
+    run = tmp_path
+    root = None if os.name == "nt" else tempfile.mkdtemp(prefix="c2-mesh-", dir="/tmp")
     monkeypatch.setenv("C2_ENV_FILE", "")
     monkeypatch.setenv("C2_RELAY_ANCHOR_ADDRESS", "")
     if root is not None:
         monkeypatch.setenv("C2_IPC_ROOT", root)
+    else:
+        monkeypatch.delenv("C2_IPC_ROOT", raising=False)
     relays = []
     hosts = []
     clients = []
     proxies = []
-    nodes = []
 
     class Scenario:
         def __init__(self):
@@ -74,19 +71,6 @@ def mesh(monkeypatch):
         def track(self, proxy):
             proxies.append(proxy)
             return proxy
-
-        def node(self, name: str, a: GatedRelay, b: GatedRelay) -> NodeDriver:
-            contract = crm_contract(Lifecycle)
-            driver = NodeDriver(run, {
-                "name": name, "relayA": a.url, "relayB": b.url,
-                "contract": {"schema": "c-two.contract.v2", "namespace": contract.crm_ns,
-                             "name": contract.crm_name, "version": contract.crm_ver,
-                             "descriptorSha256": contract.abi_hash,
-                             "abiHash": contract.abi_hash,
-                             "signatureHash": contract.signature_hash},
-            })
-            nodes.append(driver)
-            return driver
 
         def routes(self, relay: GatedRelay, name: str) -> list[dict]:
             response = self.http.get(f"{relay.url}/_routes")
@@ -156,11 +140,6 @@ def mesh(monkeypatch):
         yield scenario
     finally:
         cleanup_errors = []
-        for node in nodes:
-            try:
-                node.close()
-            except Exception as error:
-                cleanup_errors.append(error)
         for proxy in proxies:
             try:
                 cc.close(proxy)
@@ -182,22 +161,26 @@ def mesh(monkeypatch):
             except Exception as error:
                 cleanup_errors.append(error)
         scenario.http.close()
-        (run / "private-root.txt").write_text(f"{root}\n")
+        assert not cleanup_errors, cleanup_errors
+        if root is not None:
+            assert not list(Path(root).glob("*.lease"))
+            assert not any(path.is_socket() for path in Path(root).iterdir())
+            shutil.rmtree(root)
+        new_variant = (request.node.name.endswith(("[relay_aware_local_ipc]", "[force_leave]"))
+                       or request.node.path.name == "test_typescript_route_identity_mesh.py")
+        if new_variant:
+            request.node.user_properties.append(("route_identity_mesh_cleanup", json.dumps({
+                "host_process_count": len(hosts), "relay_process_count": len(relays),
+                "hosts_closed": all(host.process.poll() is not None for host in hosts),
+                "relays_closed": all(relay.process.poll() is not None for relay in relays),
+                "ipc_root_removed": root is None or not Path(root).exists(),
+                "errors": [repr(error) for error in cleanup_errors],
+            })))
         assert not cleanup_errors, cleanup_errors
 
 
 def _registered(host: Host) -> None:
     assert host.command("register") == {"registered": True}, host.stderr()
-
-
-def _pickle_request(value: str) -> str:
-    return base64.b64encode(pickle.dumps(value, protocol=4)).decode("ascii")
-
-
-def _node_reply(result: dict, resource: str, value: str) -> None:
-    reply = pickle.loads(base64.b64decode(result["value"]))
-    assert reply["resource"] == resource
-    assert reply["value"] == value
 
 
 def _holders(details: dict, expected_ids: set[str]) -> list[dict]:
@@ -253,13 +236,16 @@ def test_peer_registration_rejects_second_host(mesh):
     assert all(row["relay_id"] != b.relay_id for row in mesh.routes(b, name))
 
 
-def test_unreachable_owner_keeps_name_until_host_withdraws(mesh):
+@pytest.mark.parametrize("release", ["owner_withdrawal", "force_leave"])
+def test_unreachable_owner_keeps_name_until_host_withdraws(mesh, release, record_property):
     name = f"unreachable-{uuid.uuid4().hex}"
     a = mesh.relay("unreachable-a")
     b = mesh.relay("unreachable-b", seeds=[a.gate.url])
     mesh.join(a, b)
     host_a = mesh.host(name, a, "unreachable-a")
     host_b = mesh.host(name, b, "unreachable-b")
+    client = mesh.client(b)
+    acquisition_failures = []
     _registered(host_a)
     wait_state(lambda: mesh.routes(b, name), lambda rows: len(rows) == 1)
     a.gate.block()
@@ -274,22 +260,74 @@ def test_unreachable_owner_keeps_name_until_host_withdraws(mesh):
         assert f" - {status}\n" in mesh.registry_text(b)
         rejected = host_b.command("register")
         assert rejected["code"] == 703
+        assert rejected["error"] == "ResourceAlreadyRegistered"
+        assert _holders(rejected["details"], {a.relay_id})[0]["relay_status"] == status
         raw = mesh.register_http(b, host_b, name)
         assert raw.status_code == 409, raw.text
         assert raw.json()["code"] == 703
         assert _holders(raw.json()["details"], {a.relay_id})[0]["relay_status"] == status
         details = _error(mesh.resolve(b, name), 503, 702, "ResourceUnavailable", name)
         assert _holders(details, {a.relay_id})[0]["relay_status"] == status
-    a.gate.restore()
-    b.gate.restore()
-    wait_state(lambda: mesh.peer(b, a.relay_id),
-               lambda peer: peer is not None and peer["status"] == "Alive", timeout=55)
-    assert host_a.command("unregister")["unregistered"]
+        # ADR 0004 note: "名字只归失联的 relay 时，解析报 `ResourceUnavailable`（702），在别处注册报
+        # `ResourceAlreadyRegistered`（703）". Reference: "A relay that is Suspect or Dead
+        # keeps its registrations: they do not resolve".
+        for address in (None, b.url):
+            with pytest.raises(cc.error.ResourceUnavailable) as unavailable:
+                client.connect(Lifecycle, name=name, address=address, timeout=5)
+            assert unavailable.value.code == 702
+            assert unavailable.value.details["dispatch_phase"] == "pre_dispatch"
+            assert _holders(unavailable.value.details, {a.relay_id})[0]["relay_status"] == status
+            acquisition_failures.append({
+                "state": status, "requested_mode": "relay_aware" if address is None else "explicit_http",
+                "actual_path": None, "error": type(unavailable.value).__name__,
+            })
+    if release == "owner_withdrawal":
+        a.gate.restore()
+        b.gate.restore()
+        wait_state(lambda: mesh.peer(b, a.relay_id),
+                   lambda peer: peer is not None and peer["status"] == "Alive", timeout=55)
+        assert host_a.command("unregister")["unregistered"]
+    else:
+        response = mesh.http.post(f"{b.url}/_admin/force-leave", json={"relay_id": a.relay_id})
+        assert response.status_code == 200, response.text
     wait_state(lambda: mesh.routes(b, name), lambda rows: not rows)
     _registered(host_b)
+    if release == "force_leave":
+        # The registration succeeded while A still had its original route:
+        # force-leave, rather than A's withdrawal, freed B's authority.
+        assert len(mesh.routes(a, name)) == 1
+        assert host_a.command("unregister")["unregistered"]
+        a.gate.restore()
+        b.gate.restore()
+        mesh.join(a, b)
+        for relay in (a, b):
+            wait_state(lambda: mesh.routes(relay, name),
+                       lambda rows: len(rows) == 1 and rows[0]["relay_id"] == b.relay_id)
+    wait_state(lambda: mesh.routes(b, name),
+               lambda rows: len(rows) == 1 and rows[0]["relay_id"] == b.relay_id)
+    paths = []
+    for address, expected_path in ((None, "relay_aware_local_ipc"),
+                                   (b.url, "explicit_relay")):
+        proxy = mesh.track(client.connect(Lifecycle, name=name, address=address, timeout=5))
+        assert proxy.client.observed_path == expected_path
+        reply = proxy.call(expected_path)
+        assert reply["resource"] == host_b.identity["server_id"]
+        assert reply["server_instance_id"] == host_b.identity["server_instance_id"]
+        paths.append(proxy.client.observed_path)
+    assert host_a.records() == []
+    assert [row["method"] for row in host_b.records()] == ["call", "call"]
+    if release == "force_leave":
+        record_property("route_identity_g8", json.dumps({
+            "release": release, "holder": host_a.identity, "new_owner": host_b.identity,
+            "failed_acquisitions": acquisition_failures,
+            "paths": paths, "callbacks": host_b.records(),
+        }))
 
 
-def test_independent_registrations_join_conflict_and_existing_proxies_follow(mesh):
+@pytest.mark.parametrize("path", ["relay_aware_local_ipc", "explicit_relay"])
+def test_independent_registrations_join_conflict_and_existing_proxies_follow(
+    mesh, path, record_property,
+):
     name = f"conflict-{uuid.uuid4().hex}"
     a = mesh.relay("conflict-a")
     b = mesh.relay("conflict-b")
@@ -299,8 +337,14 @@ def test_independent_registrations_join_conflict_and_existing_proxies_follow(mes
     _registered(host_b)
     client_a = mesh.client(a)
     client_b = mesh.client(b)
-    old_a = mesh.track(client_a.connect(Lifecycle, name=name, address=a.url, timeout=5))
-    old_b = mesh.track(client_b.connect(Lifecycle, name=name, address=b.url, timeout=5))
+    address_a = a.url if path == "explicit_relay" else None
+    address_b = b.url if path == "explicit_relay" else None
+    old_a = mesh.track(client_a.connect(Lifecycle, name=name, address=address_a, timeout=5))
+    old_b = mesh.track(client_b.connect(Lifecycle, name=name, address=address_b, timeout=5))
+    assert old_a.client.observed_path == path
+    assert old_b.client.observed_path == path
+    original_a = (cc.observe.connection_observation(old_a).connection_id
+                  if path == "relay_aware_local_ipc" else None)
     assert old_a.call("before-join-a")["resource"] == host_a.identity["server_id"]
     assert old_b.call("before-join-b")["resource"] == host_b.identity["server_id"]
     mesh.join(a, b)
@@ -314,7 +358,9 @@ def test_independent_registrations_join_conflict_and_existing_proxies_follow(mes
         assert {row["relay_status"] for row in _holders(details, {a.relay_id, b.relay_id})} == {"Alive"}
     for client, relay in ((client_a, a), (client_b, b)):
         with pytest.raises(cc.error.RouteConflict) as conflict:
-            client.connect(Lifecycle, name=name, address=relay.url, timeout=5)
+            client.connect(Lifecycle, name=name,
+                           address=relay.url if path == "explicit_relay" else None,
+                           timeout=5)
         assert conflict.value.details["dispatch_phase"] == "pre_dispatch"
         _holders(conflict.value.details, {a.relay_id, b.relay_id})
     assert old_a.call("still-a")["resource"] == host_a.identity["server_id"]
@@ -324,13 +370,33 @@ def test_independent_registrations_join_conflict_and_existing_proxies_follow(mes
         wait_state(lambda: mesh.routes(relay, name),
                    lambda rows: len(rows) == 1 and rows[0]["relay_id"] == b.relay_id
                    and rows[0]["conflict"] is False)
-    with pytest.raises(cc.error.ResourceNotFound) as refused:
+    # ADR 0004 note: "只能从这次调用得知时（端点或 relay 仍在线，名字已换到别处），这次调用在派发前失败".
+    # Errors reference: "including a route a relay has withdrawn (`ResourceNotFound`, 701)"
+    # and "removed (`ResourceRemoved`, 708)". The next call follows the live name.
+    refusal_type = (cc.error.ResourceRemoved if path == "relay_aware_local_ipc"
+                    else cc.error.ResourceNotFound)
+    with pytest.raises(refusal_type) as refused:
         old_a.call("refused-on-a")
-    assert refused.value.details["dispatch_phase"] == "pre_dispatch"
+    phase_key = ("transport_phase" if path == "relay_aware_local_ipc"
+                 else "dispatch_phase")
+    assert refused.value.details[phase_key] == "pre_dispatch"
     assert old_a.call("followed-b")["resource"] == host_b.identity["server_id"]
+    expected_follow_path = ("relay_aware_relay" if path == "relay_aware_local_ipc"
+                            else "explicit_relay")
+    assert old_a.client.observed_path == expected_follow_path
+    if original_a is not None:
+        with pytest.raises(cc.error.UnsupportedCallMode):
+            cc.observe.connection_observation(old_a)
     assert old_b.call("still-b-after")["resource"] == host_b.identity["server_id"]
     assert [row["method"] for row in host_a.records()] == ["call", "call"]
     assert [row["method"] for row in host_b.records()] == ["call"] * 4
+    if path == "relay_aware_local_ipc":
+        record_property("route_identity_g7", json.dumps({
+            "starting_path": path, "follow_path": old_a.client.observed_path,
+            "original_connection": original_a, "host_a": host_a.identity,
+            "host_b": host_b.identity, "host_a_callbacks": host_a.records(),
+            "host_b_callbacks": host_b.records(), "refusal": type(refused.value).__name__,
+        }))
     for relay in (a, b):
         detected = f"route conflict detected: route={name}"
         resolved = f"route conflict resolved: route={name}"
@@ -356,46 +422,6 @@ def test_crashed_host_admin_withdrawal_propagates(mesh):
     assert response.status_code == 200, response.text
     wait_state(lambda: mesh.routes(b, name), lambda rows: not rows)
     _registered(host_b)
-
-
-def test_generated_node_client_conflict_keeps_old_targets_and_follows(mesh):
-    name = f"node-conflict-{uuid.uuid4().hex}"
-    a = mesh.relay("node-a")
-    b = mesh.relay("node-b")
-    host_a = mesh.host(name, a, "node-a")
-    host_b = mesh.host(name, b, "node-b")
-    _registered(host_a)
-    _registered(host_b)
-    node = mesh.node(name, a, b)
-    before = node.command("before", a=_pickle_request("before-a"), b=_pickle_request("before-b"))
-    _node_reply(before["a"], host_a.identity["server_id"], "before-a")
-    _node_reply(before["b"], host_b.identity["server_id"], "before-b")
-    mesh.join(a, b)
-    for relay in (a, b):
-        wait_state(lambda: mesh.routes(relay, name),
-                   lambda rows: len(rows) == 2 and all(row["conflict"] for row in rows))
-    during = node.command("conflict", a=_pickle_request("during-a"),
-                          b=_pickle_request("during-b"))
-    for key in ("newA", "newB"):
-        error = during[key]["error"]
-        assert error["routeConflictInstance"] is True
-        assert error["coreInstance"] is True
-        assert error["code"] == 719 and error["canonicalName"] == "RouteConflict"
-        assert error["transportPhase"] == "pre_dispatch" and error["retrySafe"] is True
-        _holders(error["details"], {a.relay_id, b.relay_id})
-    _node_reply(during["oldA"], host_a.identity["server_id"], "during-a")
-    _node_reply(during["oldB"], host_b.identity["server_id"], "during-b")
-    assert host_a.command("unregister")["unregistered"]
-    wait_state(lambda: mesh.routes(a, name),
-               lambda rows: len(rows) == 1 and rows[0]["relay_id"] == b.relay_id)
-    after = node.command("follow", a=_pickle_request("refused-a"),
-                         b=_pickle_request("follow-b"))
-    refused = after["refused"]["error"]
-    assert json.loads(refused["body"])["details"]["dispatch_phase"] == "pre_dispatch", refused
-    _node_reply(after["followed"], host_b.identity["server_id"], "follow-b")
-    _node_reply(after["oldB"], host_b.identity["server_id"], "follow-b")
-    assert [entry["method"] for entry in host_a.records()] == ["call", "call"]
-    assert [entry["method"] for entry in host_b.records()] == ["call"] * 4
 
 
 def test_force_leave_allows_registration_then_restored_owner_conflicts(mesh):

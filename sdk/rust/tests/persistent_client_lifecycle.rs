@@ -7,6 +7,23 @@ use c_two::generated::EncodedClient;
 use fixture::{Fixture, PathKind, observe_until};
 use std::sync::{Arc, Barrier};
 
+fn assert_pre_dispatch_route_refusal(error: c_two::Error, code: fixture::ErrorCode) {
+    let c_two::Error::Semantic(ref semantic) = error else {
+        panic!("expected route refusal: {error:?}")
+    };
+    assert_eq!(
+        semantic
+            .details
+            .get("transport_phase")
+            .or_else(|| semantic.details.get("dispatch_phase"))
+            .map(String::as_str),
+        Some("pre_dispatch"),
+        "{semantic:?}"
+    );
+    assert!(!semantic.details.contains_key("route_uid"));
+    fixture::assert_semantic(error, code);
+}
+
 // Gates 1 and 6: a persistent manager connection sees a builder registered
 // later on the same endpoint. Local paths keep the original physical carrier;
 // HTTP uses the actual relay data plane, without a local SDK connection.
@@ -193,7 +210,7 @@ fn route_authority(path: PathKind) {
                 },
             );
         }
-        fixture::assert_semantic(
+        assert_pre_dispatch_route_refusal(
             old.call_owned("echo", &fixture::encode("closed"))
                 .unwrap_err(),
             if path == PathKind::Http {
@@ -222,7 +239,7 @@ fn route_authority(path: PathKind) {
             fixture::ErrorCode::ResourceNotFound
         },
     );
-    fixture::assert_semantic(
+    assert_pre_dispatch_route_refusal(
         old.call_owned("echo", &fixture::encode("removed"))
             .unwrap_err(),
         if path == PathKind::Direct {
@@ -264,7 +281,7 @@ fn relay_local_removed_and_reregistered_routes_preserve_old_binding() {
         fixture.connect_name("replacement").unwrap_err(),
         fixture::ErrorCode::ResourceNotFound,
     );
-    fixture::assert_semantic(
+    assert_pre_dispatch_route_refusal(
         old.call_owned("echo", &fixture::encode("removed"))
             .unwrap_err(),
         fixture::ErrorCode::ResourceRemoved,
@@ -329,7 +346,7 @@ fn real_process_same_endpoint_reregistration(path: PathKind) {
     let removed = peer.command_barrier("unregister", "unregistered");
     assert_eq!(removed["resource"], old_label);
     let refusal = old.call_owned("ping", &[]).unwrap_err();
-    fixture::assert_semantic(refusal, fixture::ErrorCode::ResourceRemoved);
+    assert_pre_dispatch_route_refusal(refusal, fixture::ErrorCode::ResourceRemoved);
     let acquire = fixture
         .client_runtime
         .connect(
@@ -782,6 +799,102 @@ fn direct_existing_proxy_follows_restart_with_unavailable_relay_anchor() {
     assert_eq!(fixture.outgoing_ids().len(), 2);
     fixture.assert_paths(2);
     drop(proxy);
+    replacement.stop();
+    fixture.finish();
+}
+
+thread_local! {
+    static OLD_ITEM_GATE: std::cell::RefCell<Option<(
+        std::sync::mpsc::SyncSender<()>,
+        std::sync::mpsc::Receiver<()>,
+    )>> = const { std::cell::RefCell::new(None) };
+}
+
+fn deliver_old_item(response: c2_core::HeldResponse) -> Result<fastdb::Payload, c_two::Error> {
+    OLD_ITEM_GATE.with(|slot| {
+        let (arrived, release) = slot.borrow_mut().take().expect("old item decoder gate");
+        arrived.send(()).unwrap();
+        release.recv_timeout(fixture::WAIT).unwrap();
+    });
+    fixture::decode_stream_item(response)
+}
+
+#[test]
+fn direct_late_old_result_and_terminal_preserve_restarted_target() {
+    // contracts-and-routing.md: "Calls already sent keep their target and finish there."
+    // ADR 0004: "注册结束时正在进行的调用照旧报完成或派发不确定，从不重放".
+    // The public SDK item decoder is the response-delivery seam: all native
+    // I/O is real, and the old stream still observes its original terminal.
+    let fixture = Fixture::new(PathKind::Direct, 0.0, 0);
+    let id = fixture::unique("late-direct");
+    let mut peer = fixture::ResourceProcess::start(&fixture, &id);
+    let client = peer.connect(&fixture);
+    client.call_owned("ping", &[]).unwrap();
+    let old_connection = client.connection_observation().unwrap();
+    let old_client = client.clone();
+    let (arrived, arrival) = std::sync::mpsc::sync_channel(1);
+    let (release, released) = std::sync::mpsc::sync_channel(1);
+    let old_call = std::thread::spawn(move || {
+        OLD_ITEM_GATE.with(|slot| *slot.borrow_mut() = Some((arrived, released)));
+        let core = old_client
+            .begin_stream("echo")
+            .unwrap()
+            .encode_vec(fixture::encode("blocked"))
+            .unwrap()
+            .stream()
+            .unwrap();
+        let mut stream = c_two::ResponseStream::from_core(core, deliver_old_item);
+        let item = stream.next().unwrap().unwrap();
+        fixture::assert_uncertain(stream.next().unwrap().unwrap_err());
+        let terminal = stream.close_with_timeout(Some(fixture::WAIT));
+        assert!(terminal.completed);
+        fixture::assert_uncertain(terminal.terminal.unwrap().unwrap_err());
+        item
+    });
+    arrival.recv_timeout(fixture::WAIT).unwrap();
+    let before = peer.snapshot();
+    assert_eq!(before["unary"], 1);
+    assert_eq!(before["opens"], 1);
+    peer.kill();
+    observe_until(|| old_connection.snapshot().is_some());
+    let mut replacement = fixture::ResourceProcess::start(&fixture, &id);
+    assert_eq!(
+        peer.ready["identity"]["server_id"],
+        replacement.ready["identity"]["server_id"]
+    );
+    assert_ne!(
+        peer.ready["identity"]["server_instance_id"],
+        replacement.ready["identity"]["server_instance_id"]
+    );
+    client.call_owned("ping", &[]).unwrap();
+    let current = client.connection_observation().unwrap();
+    assert_ne!(old_connection.connection_id(), current.connection_id());
+    assert!(current.snapshot().is_none());
+    assert_eq!(replacement.snapshot()["unary"], 1);
+    release.send(()).unwrap();
+    let late = old_call.join().unwrap();
+    peer.assert_item(&late, 1);
+    assert!(current.snapshot().is_none());
+    assert_eq!(replacement.snapshot()["opens"], 0);
+    client.call_owned("ping", &[]).unwrap();
+    let after = replacement.snapshot();
+    assert_eq!(after["unary"], 2);
+    assert_eq!(
+        client.connection_observation().unwrap().connection_id(),
+        current.connection_id()
+    );
+    assert_eq!(fixture.outgoing_ids().len(), 2);
+    println!(
+        "C2_ROUTE_IDENTITY_LATE_DIRECT {}",
+        serde_json::json!({
+            "actual_path": format!("{:?}", client.observed_path()),
+            "old_identity": peer.ready["identity"], "new_identity": replacement.ready["identity"],
+            "old_callbacks": {"unary": before["unary"], "stream": before["opens"]},
+            "new_callbacks": {"unary": after["unary"], "stream": after["opens"]},
+            "reconnects": 1, "new_connection_retired": current.snapshot().is_some(),
+        })
+    );
+    drop((late, client, current, old_connection));
     replacement.stop();
     fixture.finish();
 }

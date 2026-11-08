@@ -2,7 +2,7 @@
 
 use std::collections::BTreeSet;
 use std::io::{Read, Write};
-use std::net::TcpStream;
+use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 use c_two::generated::{
     C2Error, EncodedClient, EncodedService, ErrorCode, MethodAccess, MethodDefinition,
 };
+use c_two::observe::ObservedPath;
 use c_two::{
     Client, ConfigSources, Connect, ContractRelease, Error, Host, HostOptions, LifecycleError,
     Registration, Runtime, ServiceDefinition,
@@ -19,6 +20,7 @@ use c_two::{
 use serde_json::{Value, json};
 
 const WAIT: Duration = Duration::from_secs(30);
+static NEXT_DIRECTORY: AtomicUsize = AtomicUsize::new(0);
 const DESCRIPTOR: &[u8] = br#"{
   "schema":"c-two.contract.v2",
   "crm":{"namespace":"test.contract-release","name":"Portable","version":"0.1.0"},
@@ -177,6 +179,20 @@ fn wait_until(mut predicate: impl FnMut() -> bool) {
     }
 }
 
+fn retire_clients(runtime: &Runtime) {
+    let deadline = Instant::now() + WAIT;
+    let receipt = runtime
+        .begin_session_retirement(c2_core::RuntimeShutdownTarget::ClientsOnly, deadline)
+        .unwrap();
+    let (outcome, completed) = receipt.observe_until(deadline);
+    assert!(completed, "{outcome:?}");
+    assert!(outcome.ipc_client_close_error.is_none(), "{outcome:?}");
+    assert_eq!(
+        runtime.call_execution_snapshot().unwrap().used_operations,
+        0
+    );
+}
+
 fn http(
     url: &str,
     method: &str,
@@ -263,6 +279,89 @@ fn routes(relay: &Relay, name: &str) -> Vec<Value> {
         .filter(|route| route["name"] == name)
         .cloned()
         .collect()
+}
+
+fn peer_status(relay: &Relay, peer: &Relay) -> Option<String> {
+    get(&relay.url, "/_peers")
+        .unwrap()
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["relay_id"] == peer.id)
+        .and_then(|item| item["status"].as_str())
+        .map(str::to_owned)
+}
+
+fn peer_url(relay: &Relay, peer: &Relay) -> String {
+    get(&relay.url, "/_peers")
+        .unwrap()
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["relay_id"] == peer.id)
+        .unwrap()["url"]
+        .as_str()
+        .unwrap()
+        .to_owned()
+}
+
+fn test_directory(gate: &str, explicit: bool, release: &str) -> PathBuf {
+    let directory = std::env::temp_dir().join(format!(
+        "c2-route-identity-{gate}-{}-{}-{}-{release}",
+        std::process::id(),
+        NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed),
+        if explicit { "http" } else { "local" },
+    ));
+    std::fs::create_dir(&directory).unwrap();
+    println!("C2_ROUTE_MESH_LOG_ROOT {}", directory.display());
+    directory
+}
+
+fn unavailable(error: Error, name: &str, owner: &Relay, owner_url: &str, status: &str) {
+    let Error::Semantic(error) = error else {
+        panic!("expected semantic unavailable: {error:?}")
+    };
+    assert_eq!(error.code, ErrorCode::ResourceUnavailable, "{error:?}");
+    assert_eq!(error.details["route"], name);
+    assert_eq!(error.details["dispatch_phase"], "pre_dispatch");
+    let registrations: Vec<Value> = serde_json::from_str(&error.details["registrations"]).unwrap();
+    assert_eq!(registrations.len(), 1);
+    assert_eq!(registrations[0]["relay_id"], owner.id);
+    assert_eq!(registrations[0]["relay_url"], owner_url);
+    assert_eq!(registrations[0]["relay_status"], status);
+    assert!(
+        registrations[0]["registered_at"]
+            .as_f64()
+            .unwrap()
+            .is_finite()
+    );
+}
+
+fn held_registration(error: Error, name: &str, owner: &Relay, owner_url: &str, status: &str) {
+    let Error::Lifecycle(LifecycleError::RegisterFailure(receipt)) = error else {
+        panic!("expected registration failure receipt: {error:?}")
+    };
+    assert_eq!(receipt.route_name, name);
+    assert_eq!(receipt.status_code, Some(409));
+    assert_eq!(receipt.failure_source, "relay_prepare");
+    let semantic = receipt.semantic_error.as_ref().expect("canonical C2 error");
+    assert_eq!(semantic.code, ErrorCode::ResourceAlreadyRegistered);
+    let registrations: Vec<Value> =
+        serde_json::from_str(&semantic.details["registrations"]).unwrap();
+    assert_eq!(registrations.len(), 1);
+    assert_eq!(registrations[0]["relay_id"], owner.id);
+    assert_eq!(registrations[0]["relay_url"], owner_url);
+    assert_eq!(registrations[0]["relay_status"], status);
+    assert!(
+        registrations[0]["registered_at"]
+            .as_f64()
+            .unwrap()
+            .is_finite()
+    );
+    let rollback = receipt.rollback.as_ref().expect("registration rollback");
+    assert_eq!(rollback.route_name, name);
+    assert!(rollback.active_drained);
+    assert!(rollback.close_error.is_none());
 }
 
 fn assert_conflict_log(relay: &Relay, name: &str, action: &str, other: &Relay) {
@@ -384,7 +483,7 @@ fn conflict(error: Error, name: &str, a: &Relay, b: &Relay) {
     }
 }
 
-// ADR 0004: existing proxies keep their owner while new acquisitions report
+// ADR 0004: "已有代理继续用它当前那次注册" while new acquisitions report
 // every live registration; after one owner withdraws, its proxy follows.
 #[test]
 fn real_c3_join_conflict_preserves_old_proxies_and_clears_after_withdrawal() {
@@ -394,19 +493,7 @@ fn real_c3_join_conflict_preserves_old_proxies_and_clears_after_withdrawal() {
 }
 
 fn run_case(explicit: bool) {
-    let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .canonicalize()
-        .unwrap();
-    let directory = repository
-        .join("target/route-identity-b6-validation")
-        .join(format!(
-            "rust-mesh-{}-{}",
-            std::process::id(),
-            if explicit { "http" } else { "local" }
-        ));
-    std::fs::create_dir_all(&directory).unwrap();
-    println!("C2_ROUTE_MESH_LOG_ROOT {}", directory.display());
+    let directory = test_directory("g7", explicit, "withdraw");
     let a = Relay::start("a", &directory);
     let b = Relay::start("b", &directory);
     let release = ContractRelease::from_descriptor_json(DESCRIPTOR).unwrap();
@@ -427,8 +514,34 @@ fn run_case(explicit: bool) {
     let client_b = runtime(&b.root, &b, "mesh-client-b");
     let old_a = connect(&client_a, &release, &name, &a, explicit).unwrap();
     let old_b = connect(&client_b, &release, &name, &b, explicit).unwrap();
+    let initial_path = if explicit {
+        ObservedPath::ExplicitRelay
+    } else {
+        ObservedPath::RelayAwareLocalIpc
+    };
+    assert_eq!(old_a.observed_path(), initial_path);
+    assert_eq!(old_b.observed_path(), initial_path);
+    let carrier_a = (!explicit).then(|| old_a.connection_observation().unwrap());
+    let carrier_b = (!explicit).then(|| old_b.connection_observation().unwrap());
+    if let (Some(carrier_a), Some(carrier_b)) = (&carrier_a, &carrier_b) {
+        assert_ne!(carrier_a.connection_id(), carrier_b.connection_id());
+        assert!(carrier_a.snapshot().is_none());
+        assert!(carrier_b.snapshot().is_none());
+    }
     call_owner(&old_a, "A");
     call_owner(&old_b, "B");
+    assert_eq!(old_a.observed_path(), initial_path);
+    assert_eq!(old_b.observed_path(), initial_path);
+    if let (Some(carrier_a), Some(carrier_b)) = (&carrier_a, &carrier_b) {
+        assert_eq!(
+            old_a.connection_observation().unwrap().connection_id(),
+            carrier_a.connection_id()
+        );
+        assert_eq!(
+            old_b.connection_observation().unwrap().connection_id(),
+            carrier_b.connection_id()
+        );
+    }
     join_and_exchange(&a, &b);
     for relay in [&a, &b] {
         wait_until(|| {
@@ -455,6 +568,18 @@ fn run_case(explicit: bool) {
     );
     call_owner(&old_a, "A");
     call_owner(&old_b, "B");
+    assert_eq!(old_a.observed_path(), initial_path);
+    assert_eq!(old_b.observed_path(), initial_path);
+    if let (Some(carrier_a), Some(carrier_b)) = (&carrier_a, &carrier_b) {
+        assert_eq!(
+            old_a.connection_observation().unwrap().connection_id(),
+            carrier_a.connection_id()
+        );
+        assert_eq!(
+            old_b.connection_observation().unwrap().connection_id(),
+            carrier_b.connection_id()
+        );
+    }
     assert_eq!(calls_a.load(Ordering::SeqCst), 2);
     assert_eq!(calls_b.load(Ordering::SeqCst), 2);
     registration_b.close().unwrap();
@@ -518,18 +643,266 @@ fn run_case(explicit: bool) {
             ErrorCode::ResourceRemoved
         }
     );
-    if explicit {
-        assert_eq!(
-            semantic.details.get("dispatch_phase").map(String::as_str),
-            Some("pre_dispatch")
-        );
-    }
+    assert_eq!(
+        semantic
+            .details
+            .get(if explicit {
+                "dispatch_phase"
+            } else {
+                "transport_phase"
+            })
+            .map(String::as_str),
+        Some("pre_dispatch")
+    );
+    assert!(!semantic.details.contains_key("route_uid"));
     call_owner(&old_b, "A");
+    assert_eq!(old_a.observed_path(), initial_path);
+    assert_eq!(
+        old_b.observed_path(),
+        if explicit {
+            ObservedPath::ExplicitRelay
+        } else {
+            ObservedPath::RelayAwareRelay
+        }
+    );
+    if let Some(carrier_a) = &carrier_a {
+        assert_eq!(
+            old_a.connection_observation().unwrap().connection_id(),
+            carrier_a.connection_id()
+        );
+        assert!(old_b.connection_observation().is_err());
+    }
     assert_eq!(calls_b.load(Ordering::SeqCst), 2);
     assert_eq!(calls_a.load(Ordering::SeqCst), 4);
-    drop((old_a, old_b, client_a, client_b, registration_b));
+    drop((old_a, old_b, registration_b));
+    retire_clients(&client_a);
+    retire_clients(&client_b);
+    if let Some(connection) = &carrier_a {
+        wait_until(|| connection.snapshot().is_some());
+    }
+    if let Some(connection) = &carrier_b {
+        wait_until(|| connection.snapshot().is_some());
+    }
     let outcome_a = host_a.shutdown_with_timeout(WAIT);
     let outcome_b = host_b.shutdown_with_timeout(WAIT);
     assert!(outcome_a.runtime_barrier_error.is_none(), "{outcome_a:?}");
     assert!(outcome_b.runtime_barrier_error.is_none(), "{outcome_b:?}");
+    for relay in [&a, &b] {
+        wait_until(|| routes(relay, &name).is_empty());
+    }
+    drop((
+        _registration_a,
+        host_a,
+        host_b,
+        client_a,
+        client_b,
+        server_a,
+        server_b,
+        a,
+        b,
+    ));
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+fn unreachable_peer_listener() -> (String, TcpListener) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    (url, listener)
+}
+
+fn join_without_reachable_peer_urls(a: &Relay, b: &Relay, name: &str) -> Vec<TcpListener> {
+    // Only the peer contact URLs are partitioned. Both c3 processes and the
+    // resource's real IPC Host remain live while failure detection runs.
+    let mut unreachable_listeners = Vec::new();
+    for (source, target) in [(a, b), (b, a)] {
+        let (url, listener) = unreachable_peer_listener();
+        unreachable_listeners.push(listener);
+        let joined = post(
+            &target.url,
+            "/_peer/join",
+            &envelope(
+                source,
+                json!({"type":"RelayJoin", "relay_id":source.id, "url":url}),
+            ),
+        );
+        assert_eq!(joined["protocol_version"], 7, "{joined}");
+    }
+    let diff = post(
+        &a.url,
+        "/_peer/digest",
+        &envelope(b, json!({"type":"DigestExchange", "digest":[]})),
+    );
+    assert_eq!(diff["message"]["type"], "DigestDiff", "{diff}");
+    assert_eq!(diff["message"]["entries"].as_array().unwrap().len(), 1);
+    assert!(post(&b.url, "/_peer/digest", &diff).is_null());
+    wait_until(|| routes(b, name).len() == 1);
+    unreachable_listeners
+}
+
+fn restore_peer_urls(a: &Relay, b: &Relay) {
+    for (source, target) in [(a, b), (b, a)] {
+        let joined = post(
+            &target.url,
+            "/_peer/join",
+            &envelope(
+                source,
+                json!({"type":"RelayJoin", "relay_id":source.id, "url":source.url}),
+            ),
+        );
+        assert_eq!(joined["protocol_version"], 7, "{joined}");
+    }
+    wait_until(|| {
+        peer_status(a, b).as_deref() == Some("Alive")
+            && peer_status(b, a).as_deref() == Some("Alive")
+    });
+}
+
+// ADR 0004: "联系不上不等于已经没了". Contracts and routing says a Suspect or
+// Dead relay "keeps its registrations" until withdrawal or force-leave.
+#[test]
+fn real_c3_local_suspect_and_dead_names_recover_after_owner_withdrawal() {
+    run_unavailable_case(false, false);
+}
+
+#[test]
+fn real_c3_local_suspect_and_dead_names_recover_after_force_leave() {
+    run_unavailable_case(false, true);
+}
+
+#[test]
+fn real_c3_http_suspect_and_dead_names_recover_after_owner_withdrawal() {
+    run_unavailable_case(true, false);
+}
+
+#[test]
+fn real_c3_http_suspect_and_dead_names_recover_after_force_leave() {
+    run_unavailable_case(true, true);
+}
+
+fn run_unavailable_case(explicit: bool, force_leave: bool) {
+    let release_method = if force_leave {
+        "force-leave"
+    } else {
+        "withdraw"
+    };
+    let directory = test_directory("g8", explicit, release_method);
+    let a = Relay::start("a", &directory);
+    let b = Relay::start("b", &directory);
+    let release = ContractRelease::from_descriptor_json(DESCRIPTOR).unwrap();
+    let name = format!(
+        "mesh-unavailable-{}-{}-{}",
+        std::process::id(),
+        if explicit { "http" } else { "local" },
+        release_method,
+    );
+    let server_a = runtime(&a.root, &a, &format!("mesh-unavailable-host-a-{name}"));
+    let server_b = runtime(&b.root, &b, &format!("mesh-unavailable-host-b-{name}"));
+    let host_a = server_a.host(HostOptions::default()).unwrap();
+    let host_b = server_b.host(HostOptions::default()).unwrap();
+    let identity_a = server_a.ensure_server().unwrap();
+    let identity_b = server_b.ensure_server().unwrap();
+    let calls_a = Arc::new(AtomicUsize::new(0));
+    let calls_b = Arc::new(AtomicUsize::new(0));
+    let mut registration_a = register(&host_a, &release, &name, "A", &calls_a);
+    let client_b = runtime(&b.root, &b, &format!("mesh-unavailable-client-b-{name}"));
+    let unreachable_listeners = join_without_reachable_peer_urls(&a, &b, &name);
+
+    // Gate 8: a name held only by a Suspect or Dead peer yields typed 702 on
+    // acquisition and typed 703, with the holder details, on registration.
+    for status in ["Suspect", "Dead"] {
+        wait_until(|| peer_status(&b, &a).as_deref() == Some(status));
+        let owner_url = peer_url(&b, &a);
+        let listed = routes(&b, &name);
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0]["relay_id"], a.id);
+        assert_eq!(listed[0]["relay_url"], owner_url);
+        assert_eq!(listed[0]["relay_status"], status);
+        unavailable(
+            connect(&client_b, &release, &name, &b, explicit).unwrap_err(),
+            &name,
+            &a,
+            &owner_url,
+            status,
+        );
+        held_registration(
+            host_b
+                .register(definition(&release, &name, "B", &calls_b))
+                .unwrap_err(),
+            &name,
+            &a,
+            &owner_url,
+            status,
+        );
+        assert_eq!(calls_a.load(Ordering::SeqCst), 0);
+        assert_eq!(calls_b.load(Ordering::SeqCst), 0);
+    }
+
+    if force_leave {
+        assert_eq!(
+            post(&b.url, "/_admin/force-leave", &json!({"relay_id":a.id}))["force_left"],
+            a.id
+        );
+    } else {
+        drop(unreachable_listeners);
+        restore_peer_urls(&a, &b);
+        registration_a.close().unwrap();
+    }
+    wait_until(|| routes(&b, &name).is_empty());
+    let mut registration_b = register(&host_b, &release, &name, "B", &calls_b);
+    if force_leave {
+        let original = routes(&a, &name);
+        assert_eq!(original.len(), 1);
+        assert_eq!(original[0]["relay_id"], a.id);
+    }
+    let recovered = connect(&client_b, &release, &name, &b, explicit).unwrap();
+    assert_eq!(
+        recovered.observed_path(),
+        if explicit {
+            ObservedPath::ExplicitRelay
+        } else {
+            ObservedPath::RelayAwareLocalIpc
+        }
+    );
+    let recovered_connection = (!explicit).then(|| recovered.connection_observation().unwrap());
+    call_owner(&recovered, "B");
+    if let Some(connection) = &recovered_connection {
+        assert_eq!(
+            recovered.connection_observation().unwrap().connection_id(),
+            connection.connection_id()
+        );
+    }
+    assert_eq!(calls_a.load(Ordering::SeqCst), 0);
+    assert_eq!(calls_b.load(Ordering::SeqCst), 1);
+    registration_b.close().unwrap();
+    wait_until(|| routes(&b, &name).is_empty());
+    if force_leave {
+        registration_a.close().unwrap();
+    }
+    let actual_path = recovered.observed_path();
+    drop((recovered, registration_a, registration_b));
+    retire_clients(&client_b);
+    if let Some(connection) = &recovered_connection {
+        wait_until(|| connection.snapshot().is_some());
+    }
+    let outcome_a = host_a.shutdown_with_timeout(WAIT);
+    let outcome_b = host_b.shutdown_with_timeout(WAIT);
+    assert!(outcome_a.runtime_barrier_error.is_none(), "{outcome_a:?}");
+    assert!(outcome_b.runtime_barrier_error.is_none(), "{outcome_b:?}");
+    assert!(outcome_a.route_close_error.is_none() && outcome_a.relay_errors.is_empty());
+    assert!(outcome_b.route_close_error.is_none() && outcome_b.relay_errors.is_empty());
+    assert!(host_a.lifecycle_snapshot().finished && host_b.lifecycle_snapshot().finished);
+    println!(
+        "C2_ROUTE_IDENTITY_G8 {}",
+        json!({
+            "release": release_method, "actual_path":format!("{actual_path:?}"),
+            "old_identity":{"server_id":identity_a.server_id,"server_instance_id":identity_a.server_instance_id},
+            "new_identity":{"server_id":identity_b.server_id,"server_instance_id":identity_b.server_instance_id},
+            "callbacks":{"old":calls_a.load(Ordering::SeqCst),"new":calls_b.load(Ordering::SeqCst)},
+            "physical_client_connections":usize::from(!explicit),"reconnects":0,
+            "cleanup":{"clients_retired":true,"hosts_finished":true,
+                       "local_connection_closed":recovered_connection.as_ref().map(|connection|connection.snapshot().is_some())},
+        })
+    );
+    drop((host_a, host_b, client_b, server_a, server_b, a, b));
+    std::fs::remove_dir_all(directory).unwrap();
 }

@@ -10,6 +10,7 @@ import subprocess
 import sys
 
 import c_two as cc
+import c_two.endpoint
 from tests.fixtures.persistent_lifecycle_support import Lifecycle
 from tests.fixtures.persistent_lifecycle_peer import JournalResource
 from tests.fixtures.process_control import python_process_options, readline_with_timeout
@@ -24,7 +25,9 @@ def serve(route: str, server_id: str, anchor: str, root: str, journal: str) -> N
     runtime.start()
     identity = dict(runtime._runtime_session.ensure_server())
     resource = JournalResource(identity, server_id, Path(journal))
-    print(json.dumps({"identity": identity, "pid": os.getpid()}), flush=True)
+    credential = runtime.server_credential()
+    print(json.dumps({"identity": identity, "pid": os.getpid(),
+                      "credential": credential.to_json() if credential else None}), flush=True)
     try:
         for line in sys.stdin:
             command = line.strip()
@@ -59,6 +62,7 @@ def serve(route: str, server_id: str, anchor: str, root: str, journal: str) -> N
 
 class Host:
     def __init__(self, route: str, server_id: str, anchor: str, root: str | None, journal: Path):
+        self.root = root
         self.journal = journal
         self.error_path = journal.with_suffix(".stderr")
         self.errors = self.error_path.open("w+", encoding="utf-8")
@@ -107,6 +111,20 @@ class Host:
         os.kill(self.ready["pid"], signal.SIGTERM if os.name == "nt" else signal.SIGKILL)
         assert self.process.wait(timeout=5) != 0
         self.closed = True
+        self.reap()
+
+    def reap(self) -> None:
+        context = cc.endpoint.local_endpoint_context(root=self.root)
+        credential = self.ready["credential"]
+        if credential is not None:
+            result = cc.endpoint.reap_endpoint(
+                self.identity["ipc_address"], cc.endpoint.EndpointCredential.from_json(credential),
+                context=context,
+            )
+            expected = ("not-applicable",) if os.name == "nt" else ("reaped", "already-absent")
+            assert result["status"] in expected, result
+        inspected = cc.endpoint.inspect_endpoint(self.identity["ipc_address"], context=context)
+        assert inspected["status"] == ("not-applicable" if os.name == "nt" else "absent"), inspected
 
     def close(self) -> None:
         try:
@@ -114,6 +132,7 @@ class Host:
                 assert self.command("stop")["shutdown"]["completed"]
                 assert self.process.wait(timeout=5) == 0
                 self.closed = True
+                self.reap()
         finally:
             if self.process.poll() is None:
                 self.process.kill()

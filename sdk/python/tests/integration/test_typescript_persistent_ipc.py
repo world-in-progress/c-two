@@ -544,6 +544,9 @@ def test_generated_node_closed_route_keeps_dispatched_sibling_and_first_cause(
             }, indent=2), encoding="utf-8")
             if mode == "http":
                 assert _gate_error(refused)["name"] == "ResourceNotFound"
+                assert _gate_error(refused)["details"]["dispatch_phase"] == "pre_dispatch", refused
+                assert refused["error"]["retrySafe"] is True, refused
+                assert "routeUid" not in json.dumps(refused) and "route_uid" not in json.dumps(refused)
                 assert refused["physicalConnections"] == 0
             else:
                 if mode == "direct":
@@ -1001,6 +1004,7 @@ def test_generated_node_call_time_route_change_does_not_end_sibling(
                         error = _gate_error(changed)
                         assert error["code"] == (701 if mode == "http" else 708), changed
                         if mode == "http":
+                            assert error["details"]["dispatch_phase"] == "pre_dispatch", changed
                             assert changed["error"]["retrySafe"] is True, changed
                             assert sum(item["method"] == "POST" for item in changed["http"]) == sum(item["method"] == "POST" for item in acquired["http"]), changed
                         else:
@@ -1021,7 +1025,10 @@ def test_generated_node_call_time_route_change_does_not_end_sibling(
                 else:
                     absent = node(route="builder", client="fresh")
                     assert _gate_error(absent)["code"] == (701 if mode != "direct" else 708), absent
+                    assert absent["error"]["transportPhase"] == "pre_dispatch", absent
+                    assert "routeUid" not in json.dumps(absent) and "route_uid" not in json.dumps(absent)
                     assert builder.calls == 1
+                    assert replacement.calls == 0
                 _save_gate(tmp_path, "call-time", mode=mode, transition=transition, identity=identity,
                            changed=changed, completed=completed, connections=connections.snapshot(),
                            old_business_calls=builder.calls, replacement_calls=replacement.calls)
@@ -1325,15 +1332,19 @@ def test_generated_node_reacquires_route_on_another_relay(
                 with GateProcess(tmp_path, host_b_root, f"node-relay-b-{uuid.uuid4().hex}", relay_b.url, "new") as new:
                     new_identity = new.ready["identity"]
                     _gate_wait(owner_is_b, "relay A did not resolve the new owner on relay B")
+                    assert new.request()["resources"]["manager"]["calls"] == 0
                     refused = None
                     if mode != "relay-local":
                         refused = node()
                         assert _gate_error(refused)["code"] == 701, refused
+                        assert _gate_error(refused)["details"]["dispatch_phase"] == "pre_dispatch", refused
                         assert refused["error"]["retrySafe"] is True, refused
+                        assert "routeUid" not in json.dumps(refused) and "route_uid" not in json.dumps(refused), refused
                         assert new.request()["resources"]["manager"]["calls"] == 0
                     followed = node()
                     _gate_identity(followed, new_identity,
                                    "RelayAwareHttp" if mode == "relay-local" else _GATE_PATHS[mode])
+                    assert "routeUid" not in json.dumps(followed) and "route_uid" not in json.dumps(followed), followed
                     assert followed["value"]["calls"] == 1, followed
                     assert followed["observations"][-1]["relayUrl"] == relay_b.url, followed
                     assert new.request()["resources"]["manager"]["calls"] == 1

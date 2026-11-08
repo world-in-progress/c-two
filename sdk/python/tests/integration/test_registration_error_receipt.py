@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler
 import json
 import os
 from pathlib import Path
+import shutil
+import tempfile
 import threading
 import uuid
 
@@ -13,6 +15,7 @@ import pytest
 
 import c_two as cc
 from c_two.error import ContractMismatch, ResourceAlreadyRegistered, ResourceUnavailable
+from tests.fixtures.http_server import LoopbackHTTPServer
 
 
 @cc.crm(namespace="test.registration-receipt", version="1.0.0")
@@ -61,9 +64,8 @@ def test_registration_canonical_error_preserves_type_details_and_receipt(
             pass
 
     monkeypatch.setenv("C2_ENV_FILE", "")
-    root = Path("target/route-identity-b6-validation") / f"receipt-{uuid.uuid4().hex}"
-    root.mkdir(parents=True, mode=0o700)
-    relay = ThreadingHTTPServer(("127.0.0.1", 0), Relay)
+    root = Path(tempfile.mkdtemp(prefix="c2-receipt-", dir=None if os.name == "nt" else "/tmp"))
+    relay = LoopbackHTTPServer(("127.0.0.1", 0), Relay)
     worker = threading.Thread(target=relay.serve_forever)
     worker.start()
     runtime = cc.Runtime()
@@ -104,3 +106,7 @@ def test_registration_canonical_error_preserves_type_details_and_receipt(
             worker.join(timeout=5)
         assert not worker.is_alive()
         assert cleanup["completed"]
+        if os.name != "nt":
+            assert not list(root.glob("*.lease"))
+            assert not any(path.is_socket() for path in root.iterdir())
+        shutil.rmtree(root)

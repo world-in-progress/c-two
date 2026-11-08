@@ -90,8 +90,8 @@ def test_route_close_remove_and_reregister_use_current_authority(lab):
                 "cause_details": getattr(closed.value.__cause__, "details", None),
                 "cause_phase": getattr(closed.value.__cause__, "transport_phase", None),
             }
-            if lab.path != "relay_aware_relay":
-                lab.assert_pre_dispatch(closed.value)
+            lab.assert_pre_dispatch(closed.value)
+            assert "route_uid" not in closed.value.details
             if lab.anchor is not None:
                 # A closed route can disappear from any relay's resolution.
                 wait_state(lambda: lab.routes("target"), lambda routes: not routes)
@@ -111,8 +111,11 @@ def test_route_close_remove_and_reregister_use_current_authority(lab):
         call_removed = cc.error.ResourceNotFound
     with pytest.raises(acquire_removed):
         lab.connect("target")
-    with pytest.raises(call_removed):
+    with pytest.raises(call_removed) as absent:
         proxy.call("removed")
+    lab.assert_pre_dispatch(absent.value)
+    assert "route_uid" not in absent.value.details
+    assert resource.snapshot() == {"call": 1, "blocked": 1}
     replacement = lab.register("target")
     new_proxy = lab.connect("target")
     # Each new acquisition reads the current relay registration.
@@ -120,6 +123,8 @@ def test_route_close_remove_and_reregister_use_current_authority(lab):
     lab.assert_reply(new_proxy.call("new"), replacement, "new")
     assert resource.snapshot() == {"call": 1, "blocked": 1}
     assert replacement.snapshot() == {"call": 2}
+    assert not hasattr(proxy.client, "route_uid")
+    assert not hasattr(new_proxy.client._client, "route_uid")
 
 
 @pytest.mark.parametrize("lab", ["direct_ipc", "relay_aware_local_ipc"], indirect=True)
@@ -618,3 +623,95 @@ def test_peer_eof_is_uncertain_and_existing_proxy_follows_new_registration(lab, 
         if new is not None:
             lab.extra["new_cleanup"] = new.close()
         lab.extra["old_cleanup"] = old.close()
+
+
+@pytest.mark.parametrize("lab", ["direct_ipc"], indirect=True)
+def test_late_old_response_cannot_close_restarted_direct_target(lab, private_root, tmp_path):
+    """contracts-and-routing: "Calls already sent keep their target and finish there."
+
+    ADR 0004: "注册结束时正在进行的调用照旧报完成或派发不确定，从不重放".
+    Pause a real native reply before the SDK finishes its original prepared
+    call, as the generated client's response barrier does; no I/O is mocked.
+    """
+    name = lab.name("late-response")
+    server_id = f"persistent-late-{uuid.uuid4().hex}"
+    old = Peer(name, server_id, "", tmp_path / "late-old.calls", private_root)
+    new = None
+    arrived = threading.Event()
+    release = threading.Event()
+
+    class PausedCall:
+        def __init__(self, native):
+            self.native = native
+
+        def __getattr__(self, attribute):
+            return getattr(self.native, attribute)
+
+        def call(self, data):
+            result = self.native.call(data)
+            arrived.set()
+            release.wait()
+            return result
+
+    class PausedClient:
+        def __init__(self, native):
+            self.native = native
+            self.pause_next = True
+            self.lock = threading.Lock()
+
+        def __getattr__(self, attribute):
+            return getattr(self.native, attribute)
+
+        def begin_call(self, method):
+            prepared = self.native.begin_call(method)
+            with self.lock:
+                pause = self.pause_next
+                self.pause_next = False
+            return PausedCall(prepared) if pause else prepared
+
+    try:
+        lab.address, lab.identity = old.identity["ipc_address"], old.identity
+        proxy = lab.connect("late-response")
+        assert proxy.call("before")["server_instance_id"] == old.identity["server_instance_id"]
+        old_connection = cc.observe.connection_observation(proxy)
+        proxy.client._client = PausedClient(proxy.client._client)
+        with ThreadPoolExecutor(max_workers=1) as threads:
+            late = threads.submit(proxy.call, "old-late")
+            try:
+                assert arrived.wait(5), "old native reply did not arrive"
+                assert old.command("snapshot")["calls"] == {"call": 2}
+                lab.extra["old_peer_end"] = old.kill()
+                wait_state(old_connection.snapshot, lambda state: state is not None)
+                new = Peer(name, server_id, "", tmp_path / "late-new.calls", private_root)
+                assert new.identity["server_id"] == old.identity["server_id"]
+                assert new.identity["server_instance_id"] != old.identity["server_instance_id"]
+                followed = proxy.call("new-target")
+                assert followed["server_instance_id"] == new.identity["server_instance_id"]
+                assert followed["calls"] == {"call": 1}
+                current = cc.observe.connection_observation(proxy)
+                assert current.connection_id != old_connection.connection_id
+                assert current.snapshot() is None
+            finally:
+                release.set()
+            delivered = late.result(5)
+        assert delivered["server_instance_id"] == old.identity["server_instance_id"]
+        assert delivered["value"] == "old-late" and delivered["calls"] == {"call": 2}
+        assert new.command("snapshot")["calls"] == {"call": 1}
+        assert current.snapshot() is None
+        after = proxy.call("after-old-completion")
+        assert after["server_instance_id"] == new.identity["server_instance_id"]
+        assert after["calls"] == {"call": 2}
+        assert cc.observe.connection_observation(proxy).connection_id == current.connection_id
+        assert len(lab.outgoing.ids("opened", "client")) == 2
+        assert len(old.journal_records()) == len(new.journal_records()) == 2
+        lab.extra["late_response"] = {
+            "actual_path": proxy.client.observed_path,
+            "from": old.identity, "to": new.identity,
+            "old_result": delivered, "current_result": after,
+            "reconnects": 1, "old_calls": old.journal_records(), "new_calls": new.journal_records(),
+        }
+    finally:
+        release.set()
+        if new is not None:
+            lab.extra["late_new_cleanup"] = new.close()
+        lab.extra["late_old_cleanup"] = old.close()

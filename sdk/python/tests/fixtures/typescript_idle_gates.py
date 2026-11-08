@@ -121,6 +121,7 @@ def node_gate_client(
     *, mode: str = "relay-local", portable: bool = False,
     call_timeout_ms: int | None = None,
     expected_server_identity: dict[str, str] | None = None,
+    record_cleanup: bool = False,
 ) -> Iterator[Callable[..., dict[str, Any]]]:
     root, node = project
     fixture = Path(__file__).with_suffix(".mjs")
@@ -160,6 +161,7 @@ def node_gate_client(
             assert json.loads(readline_with_timeout(process.stdout, 20)) == {"ready": True}
             yield request
         finally:
+            cleaned = None
             try:
                 if process.poll() is None:
                     cleaned = request("exit")
@@ -172,6 +174,11 @@ def node_gate_client(
                     process.wait(timeout=10)
                 process.stdin.close()
                 process.stdout.close()
+                if record_cleanup:
+                    (work / "node-gates-cleanup.json").write_text(json.dumps({
+                        "exit_code": process.returncode,
+                        "stats": cleaned["stats"] if cleaned is not None else None,
+                    }, indent=2), encoding="utf-8")
 
 
 class AcceptedConnections:

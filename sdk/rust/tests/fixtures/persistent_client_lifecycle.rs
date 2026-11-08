@@ -901,6 +901,17 @@ pub fn open_stream(client: &Client, command: &str) -> c_two::ResponseStream<fast
     })
 }
 
+pub fn decode_stream_item(response: c2_core::HeldResponse) -> Result<fastdb::Payload, Error> {
+    c_two::generated::open_owned(&CompiledSpec::compile(SPEC).unwrap(), response.bytes()).map_err(
+        |error| {
+            Error::Semantic(c_two::generated::fastdb_adapter_error(
+                c_two::generated::AdapterFailurePhase::ClientOutputDeserializing,
+                error,
+            ))
+        },
+    )
+}
+
 pub fn stream_value(payload: &fastdb::Payload) -> serde_json::Value {
     serde_json::from_str(
         payload
@@ -1224,7 +1235,11 @@ impl ResourceProcess {
                 if let Some(start) = line.find(PROCESS_MARKER) {
                     let event: serde_json::Value =
                         serde_json::from_str(&line[start + PROCESS_MARKER.len()..]).unwrap();
-                    println!("{PROCESS_MARKER}{event}");
+                    let mut observation = event.clone();
+                    if let Some(fields) = observation.as_object_mut() {
+                        fields.remove("route_uid");
+                    }
+                    println!("{PROCESS_MARKER}{observation}");
                     output.lock().unwrap().push(event);
                 }
             }

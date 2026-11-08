@@ -124,6 +124,10 @@ const pending = new Map();
 function describeError(error) {
   return {
     name: error.name, message: error.message, code: error.code,
+    canonicalName: error.canonicalName,
+    coreInstance: error instanceof manager.C2CoreError,
+    routeConflictInstance: error instanceof manager.C2RouteConflictError,
+    httpRelayInstance: error instanceof manager.C2HttpRelayError,
     transportPhase: error.transportPhase, retrySafe: error.retrySafe,
     nativeDetails: error.nativeDetails, details: error.details,
     status: error.status, body: error.body,
