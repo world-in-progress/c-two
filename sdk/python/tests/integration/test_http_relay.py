@@ -64,6 +64,7 @@ def _registration_scope(http: httpx.Client, relay_url: str, name: str, binary) -
     expected = crm_contract(Hello)
     response = http.get(
         f'{relay_url}/_resolve/{name}',
+        headers={'x-c2-local-namespace': cc.endpoint.local_endpoint_context().namespace_id},
         params={
             'crm_ns': expected.crm_ns, 'crm_name': expected.crm_name,
             'crm_ver': expected.crm_ver, 'abi_hash': expected.abi_hash,
@@ -106,7 +107,10 @@ def relay_stack(start_c3_relay):
     relay = start_c3_relay()
     relay_url = relay.url
 
-    with httpx.Client(trust_env=False, timeout=5.0) as http:
+    with httpx.Client(
+        trust_env=False, timeout=5.0,
+        headers={'x-c2-local-namespace': cc.endpoint.local_endpoint_context().namespace_id},
+    ) as http:
         for name in ('hello', 'counter'):
             resp = http.post(
                 f'{relay_url}/_register',
@@ -630,7 +634,10 @@ class TestRelayControlPlane:
         relay = start_c3_relay()
         relay_url = relay.url
 
-        with httpx.Client(trust_env=False, timeout=5.0) as http:
+        with httpx.Client(
+            trust_env=False, timeout=5.0,
+            headers={'x-c2-local-namespace': cc.endpoint.local_endpoint_context().namespace_id},
+        ) as http:
             # Register, then unregister.
             registered = http.post(
                 f'{relay_url}/_register',

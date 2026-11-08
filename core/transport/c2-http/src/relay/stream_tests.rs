@@ -258,49 +258,234 @@ type RpcFrames = Arc<parking_lot::Mutex<Vec<(bool, u64, c2_wire::rpc::RpcRecordK
 // A transparent test peer observes complete frames on both native OS backends.
 // It forwards handshake/control frames too, and adds no production observer.
 async fn forward_frames(
-    mut reader: c2_local::LocalReadHalf,
-    mut writer: c2_local::LocalWriteHalf,
+    mut reader: impl AsyncRead + Unpin,
+    mut writer: impl AsyncWrite + Unpin,
     response: bool,
     frames: RpcFrames,
 ) {
     use c2_wire::{flags, frame};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    loop {
-        let mut raw = [0; frame::HEADER_SIZE];
-        if reader.read(&mut raw[..1]).await.unwrap() == 0 {
-            break;
+    let result = async {
+        loop {
+            let mut raw = [0; frame::HEADER_SIZE];
+            if reader.read(&mut raw[..1]).await? == 0 {
+                break;
+            }
+            reader.read_exact(&mut raw[1..]).await?;
+            let (length, body) = frame::decode_total_len(&raw).unwrap();
+            let (header, _) = frame::decode_frame_body(body, length).unwrap();
+            let mut payload = vec![0; header.payload_len()];
+            reader.read_exact(&mut payload).await?;
+            if header.flags & flags::FLAG_RPC_RECORD != 0 {
+                frames
+                    .lock()
+                    .push((response, header.request_id, payload[0].try_into().unwrap()));
+            }
+            let mut frame = raw.to_vec();
+            frame.extend_from_slice(&payload);
+            // Keep the tap's reader alive when an idle client has already closed:
+            // the inherent write_all aborts both halves on a failed courtesy ACK.
+            let written = async {
+                AsyncWriteExt::write_all(&mut writer, &frame).await?;
+                writer.flush().await
+            }
+            .await;
+            if let Err(error) = written {
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionAborted
+                ) {
+                    return Err(error);
+                }
+                // An idle client closes without waiting for the courtesy ACK.
+                // Still read the upstream through EOF to count its entire output.
+                assert!(
+                    response && c2_local::is_peer_closed_error(&error),
+                    "{error}"
+                );
+                assert_eq!(header.request_id, 0);
+                assert_eq!(header.flags, flags::FLAG_SIGNAL | flags::FLAG_RESPONSE);
+                assert_eq!(payload, c2_wire::msg_type::DISCONNECT_ACK_BYTES);
+            }
         }
-        reader.read_exact(&mut raw[1..]).await.unwrap();
-        let (length, body) = frame::decode_total_len(&raw).unwrap();
-        let (header, _) = frame::decode_frame_body(body, length).unwrap();
-        let mut payload = vec![0; header.payload_len()];
-        reader.read_exact(&mut payload).await.unwrap();
-        if header.flags & flags::FLAG_RPC_RECORD != 0 {
-            frames
-                .lock()
-                .push((response, header.request_id, payload[0].try_into().unwrap()));
+        Ok::<(), io::Error>(())
+    }
+    .await;
+    if let Err(error) = result {
+        assert!(
+            matches!(
+                error.kind(),
+                io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionAborted
+            ),
+            "frame forwarding failed: {error}"
+        );
+    }
+}
+
+// The peer publishes its OS error only after the forwarder has entered the
+// selected I/O operation. This makes reset/abort coverage independent of OS
+// buffering and of whether a native pipe maps teardown to reset or abort.
+struct PeerEndGate {
+    entered: Option<oneshot::Sender<()>>,
+    error: oneshot::Receiver<io::ErrorKind>,
+}
+
+impl PeerEndGate {
+    fn poll(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if let Some(entered) = self.entered.take() {
+            entered.send(()).unwrap();
         }
-        let mut frame = raw.to_vec();
-        frame.extend_from_slice(&payload);
-        // Keep the tap's reader alive when an idle client has already closed:
-        // the inherent write_all aborts both halves on a failed courtesy ACK.
-        let written = async {
-            AsyncWriteExt::write_all(&mut writer, &frame).await?;
-            writer.flush().await
-        }
-        .await;
-        if let Err(error) = written {
-            // An idle client closes without waiting for the courtesy ACK.
-            // Still read the upstream through EOF to count its entire output.
-            assert!(
-                response && c2_local::is_peer_closed_error(&error),
-                "{error}"
-            );
-            assert_eq!(header.request_id, 0);
-            assert_eq!(header.flags, flags::FLAG_SIGNAL | flags::FLAG_RESPONSE);
-            assert_eq!(payload, c2_wire::msg_type::DISCONNECT_ACK_BYTES);
+        match Pin::new(&mut self.error).poll(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(error) => Poll::Ready(Err(io::Error::from(error.unwrap()))),
         }
     }
+}
+
+struct EndingReader(PeerEndGate);
+
+impl AsyncRead for EndingReader {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        _: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        self.0.poll(cx)
+    }
+}
+
+struct EndingWriter {
+    flush: bool,
+    gate: PeerEndGate,
+}
+
+impl AsyncWrite for EndingWriter {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        if self.flush {
+            Poll::Ready(Ok(buf.len()))
+        } else {
+            self.gate.poll(cx).map_ok(|()| unreachable!())
+        }
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.gate.poll(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+#[tokio::test]
+async fn forward_frames_peer_ends_during_each_io_operation() {
+    let frame = c2_wire::frame::encode_frame(1, 0, b"payload");
+    // Header start, partial header, partial payload, write, flush.
+    for operation in 0..5 {
+        for kind in [
+            io::ErrorKind::ConnectionReset,
+            io::ErrorKind::ConnectionAborted,
+            io::ErrorKind::PermissionDenied,
+        ] {
+            let (entered, waiting) = oneshot::channel();
+            let (peer, error) = oneshot::channel();
+            let gate = PeerEndGate {
+                entered: Some(entered),
+                error,
+            };
+            let frames = RpcFrames::default();
+            let task = if operation < 3 {
+                let count = [0, 1, c2_wire::frame::HEADER_SIZE + 1][operation];
+                // Owned input survives the spawned forwarding task.
+                let prefix = frame[..count].to_vec();
+                tokio::spawn(async move {
+                    let mut input = prefix.as_slice();
+                    let reader = tokio::io::AsyncReadExt::chain(&mut input, EndingReader(gate));
+                    forward_frames(reader, tokio::io::sink(), false, frames).await;
+                })
+            } else {
+                let input = frame.clone();
+                tokio::spawn(async move {
+                    forward_frames(
+                        input.as_slice(),
+                        EndingWriter {
+                            flush: operation == 4,
+                            gate,
+                        },
+                        false,
+                        frames,
+                    )
+                    .await;
+                })
+            };
+            bounded(waiting).await.unwrap();
+            peer.send(kind).unwrap();
+            let result = bounded(task).await;
+            if kind == io::ErrorKind::PermissionDenied {
+                assert!(result.unwrap_err().is_panic(), "operation {operation}");
+            } else {
+                result.unwrap();
+            }
+        }
+    }
+}
+
+struct PendingRead<R> {
+    inner: R,
+    pending: Option<oneshot::Sender<()>>,
+    ended: Option<oneshot::Sender<io::ErrorKind>>,
+}
+
+impl<R: AsyncRead + Unpin> AsyncRead for PendingRead<R> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let result = Pin::new(&mut self.inner).poll_read(cx, buf);
+        if result.is_pending() {
+            if let Some(pending) = self.pending.take() {
+                pending.send(()).unwrap();
+            }
+        }
+        if let Poll::Ready(Err(error)) = &result {
+            self.ended.take().unwrap().send(error.kind()).unwrap();
+        }
+        result
+    }
+}
+
+#[tokio::test]
+async fn forward_frames_real_peer_resets_while_read_is_pending() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let peer = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
+        .await
+        .unwrap();
+    let (reader, _) = listener.accept().await.unwrap();
+    let (pending, waiting) = oneshot::channel();
+    let (ended, error) = oneshot::channel();
+    let task = tokio::spawn(forward_frames(
+        PendingRead {
+            inner: reader,
+            pending: Some(pending),
+            ended: Some(ended),
+        },
+        tokio::io::sink(),
+        false,
+        RpcFrames::default(),
+    ));
+    bounded(waiting).await.unwrap();
+    peer.set_zero_linger().unwrap();
+    drop(peer);
+    bounded(task).await.unwrap();
+    assert!(matches!(
+        bounded(error).await.unwrap(),
+        io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionAborted
+    ));
 }
 
 impl Fixture {

@@ -55,7 +55,10 @@ def _http_post(url: str, body: dict) -> urllib.request.Request:
     return urllib.request.Request(
         url,
         data=json.dumps(body).encode(),
-        headers={"Content-Type": "application/json"},
+        headers={
+            "Content-Type": "application/json",
+            "x-c2-local-namespace": cc.endpoint.local_endpoint_context().namespace_id,
+        },
         method="POST",
     )
 
@@ -90,7 +93,11 @@ def _register_body(name: str, server_id: str) -> dict[str, object]:
 def _registration_scope(base_url: str, name: str, binary) -> dict[str, object]:
     # Capture the full native identity from the registering relay, not a peer
     # projection (remote entries deliberately omit local server identity).
-    route = _http_get_json(_resolve_url(base_url, name))[0]
+    request = urllib.request.Request(
+        _resolve_url(base_url, name),
+        headers={"x-c2-local-namespace": cc.endpoint.local_endpoint_context().namespace_id},
+    )
+    route = _http_get_json(request)[0]
     return attested_registration_scope(
         binary, name, route['ipc_address'], route['server_id'], route['server_instance_id'],
     )

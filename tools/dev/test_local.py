@@ -155,6 +155,7 @@ def suite_steps(options, root: Path) -> list[Step]:
     output = options.output.resolve()
     python = os.path.abspath(os.path.expanduser(options.python))
     c3 = options.c3 or root / ('cli/target/debug/c3.exe' if os.name == 'nt' else 'cli/target/debug/c3')
+    attestor = root / 'core/target/debug' / ('c2-route-scope-attestor.exe' if os.name == 'nt' else 'c2-route-scope-attestor')
     env = child_environment(dict(os.environ), options.tool_path, options.coresdk_lib)
     node = Path(shutil.which('node', path=env['PATH']) or 'node')
     commands = {
@@ -165,6 +166,7 @@ def suite_steps(options, root: Path) -> list[Step]:
         'repo': [os.path.abspath(options.repo_python or python), '-m', 'pytest', '--confcutdir=tests/repo', 'tests/repo', '-q', '-rs', '--timeout=60',
                  f'--basetemp={output / "repo/tmp"}', f'--junitxml={output / "repo/junit.xml"}'],
         'python': [python, 'tools/dev/test_python.py', '--python', python, '--c3', str(c3.resolve()),
+                   '--route-scope-attestor', str(attestor.resolve()),
                    '--output', str(output / 'python/evidence'), '--workers', str(options.workers),
                    '--stage-timeout', str(options.stage_timeout), *package_args(options)],
         'typescript': strict.build_pytest_command(python, 'typescript', output / 'typescript', 1),
@@ -349,6 +351,11 @@ def check(options, env: dict[str, str]) -> dict:
             c3 = options.c3 or ROOT / ('cli/target/debug/c3.exe' if os.name == 'nt' else 'cli/target/debug/c3')
             probe([str(c3), '--version'], env)
             report.setdefault('input_hashes', {}).update({str(c3.resolve()): strict.sha256(c3), info['native']: info['native_sha256']})
+            if 'python' in selected:
+                attestor = ROOT / 'core/target/debug' / ('c2-route-scope-attestor.exe' if os.name == 'nt' else 'c2-route-scope-attestor')
+                if not attestor.is_file():
+                    raise LocalError(f'registration attestor missing: {attestor}; run prepare --suite python')
+                report['input_hashes'][str(attestor)] = strict.sha256(attestor)
             for path in packages(options):
                 if path and not path.is_file():
                     raise LocalError(f'package missing: {path}')
@@ -498,6 +505,8 @@ def preparation_steps(options, staging: Path) -> list[Step]:
                                'source' if suite == 'native' else 'system'))
     if any(s in selected for s in ('cli', 'python', 'typescript')):
         result.append(Step('c3-build', ['cargo', 'build', '--locked', '--manifest-path', 'cli/Cargo.toml', '--bins'], 'source'))
+    if 'python' in selected:
+        result.append(Step('route-scope-attestor-build', [options.python, 'tools/dev/build_route_scope_attestor.py']))
     if any(s in selected for s in ('python', 'typescript', 'native')):
         result.append(Step('python-sync', ['uv', 'sync', '--locked', '--python', options.python], 'source'))
     if 'repo' in selected:
