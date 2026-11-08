@@ -495,7 +495,6 @@ impl Harness {
             .unwrap();
         let identity = RouteCallIdentity {
             route_name: built.name().to_string(),
-            route_uid: built.route_uid().to_string(),
             crm_ns: built.crm_ns().to_string(),
             crm_name: built.crm_name().to_string(),
             crm_ver: built.crm_ver().to_string(),

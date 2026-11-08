@@ -18,7 +18,7 @@ try {
 } finally {rmSync(directory,{recursive:true,force:true});}
 const hash='a'.repeat(64);
 const contract={schema:'c-two.contract.v2',namespace:'test',name:'Test',version:'0.1.0',descriptorSha256:hash,abiHash:hash,signatureHash:hash};
-const binding={serverId:'s',serverInstanceId:'i',routeUid:'uid',connectionId:1n};
+const binding={serverId:'s',serverInstanceId:'i',connectionId:1n};
 const receipt={completed:true,error:null,completeItems:0n};
 const nextTurn=()=>new Promise(resolve=>setImmediate(resolve));
 function deferred(){let resolve;const promise=new Promise(r=>{resolve=r});return {promise,resolve};}
@@ -51,6 +51,7 @@ for(const maxAttempts of [2,3])test(`FallbackDenied retains first local IPC caus
   await assert.rejects(client.call('route',contract,'ping',()=>new Uint8Array()),error=>{
     assert.equal(typeof error.body,'string','both failed local tokens leave no independent fallback');
     assert.equal(JSON.parse(error.body).name,'FallbackDenied');
+    assert.deepEqual(JSON.parse(error.body).details,{route:'route'});
     assert.equal(error.cause.nativeDetails.ioKind,'ConnectionRefused');
     assert.equal(error.cause.cause,failures[0]);return true;
   });

@@ -301,7 +301,6 @@ impl Endpoint {
         &self,
         route: String,
         contract: Value,
-        expected_route_token: Option<Value>,
         attempt: c2_core::ConnectAttempt,
     ) -> Result<Value, Error> {
         if self.closed.load(Ordering::Acquire) {
@@ -343,7 +342,6 @@ impl Endpoint {
             identity.server_id.clone(),
             identity.server_instance_id.clone(),
         );
-        let uid = client.observed_route().route_uid.clone();
         let observation = client.connection_observation()?;
         let mut bindings = self.bindings.lock();
         let supplied = self
@@ -360,30 +358,6 @@ impl Endpoint {
                 ErrorCode::IdentityMismatch,
                 "IPC server identity mismatch",
             ));
-        }
-        let expected_uid = expected_route_token
-            .as_ref()
-            .map(|token| field(token, "routeUid"))
-            .transpose()?;
-        if expected_uid
-            .as_deref()
-            .is_some_and(|expected| expected != uid)
-        {
-            return Err(refused(ErrorCode::RouteStale, "IPC route token mismatch"));
-        }
-        if bindings
-            .clients
-            .get(&route)
-            .is_some_and(|client| client.observed_route().route_uid != uid)
-        {
-            return Err(
-                C2Error::new(ErrorCode::RouteStale, "IPC route binding changed")
-                    .with_details(std::collections::BTreeMap::from([
-                        ("transport_phase".into(), "pre_dispatch".into()),
-                        ("stage".into(), "route_binding".into()),
-                    ]))
-                    .into(),
-            );
         }
         if self.closed.load(Ordering::Acquire) {
             connection.deactivate();
@@ -403,7 +377,7 @@ impl Endpoint {
         bindings.server.get_or_insert(pair);
         bindings.clients.insert(route, client);
         Ok(
-            json!({"serverId":identity.server_id,"serverInstanceId":identity.server_instance_id,"routeUid":uid,"connectionId":observation.connection_id().to_string()}),
+            json!({"serverId":identity.server_id,"serverInstanceId":identity.server_instance_id,"connectionId":observation.connection_id().to_string()}),
         )
     }
     async fn close(&self) -> Result<(), Error> {
@@ -642,7 +616,6 @@ pub unsafe extern "C" fn c2_mem_ffi_endpoint_context_prepare(
     endpoint: *const C2MemFfiEndpointContext,
     route: *const c_char,
     contract: *const c_char,
-    expected_route_token: *const c_char,
     complete: C2MemFfiComplete,
     user: *mut std::ffi::c_void,
 ) -> C2MemFfiStatus {
@@ -652,11 +625,7 @@ pub unsafe extern "C" fn c2_mem_ffi_endpoint_context_prepare(
     let endpoint = unsafe { &*endpoint }.0.clone();
     let args = text(route).and_then(|route| {
         let contract = parse(contract)?;
-        let expected_route_token = if expected_route_token.is_null() {
-            None
-        } else {
-            Some(parse(expected_route_token)?)
-        };
+
         let mut options = c2_core::ConnectOptions::new();
         if let Some(value) = endpoint.options.get("connectTimeoutMs") {
             options = options.with_timeout(Duration::from_millis(
@@ -665,20 +634,15 @@ pub unsafe extern "C" fn c2_mem_ffi_endpoint_context_prepare(
                     .ok_or_else(|| invalid("invalid connectTimeoutMs"))?,
             ));
         }
-        Ok((
-            route,
-            contract,
-            expected_route_token,
-            c2_core::ConnectAttempt::start(options)?,
-        ))
+        Ok((route, contract, c2_core::ConnectAttempt::start(options)?))
     });
     endpoint.preparing.fetch_add(1, Ordering::AcqRel);
     let preparing = Preparing(endpoint.clone());
     launch(complete, user, async move {
-        let (route, contract, expected_route_token, attempt) = args?;
+        let (route, contract, attempt) = args?;
         tokio::task::spawn_blocking(move || {
             let _preparing = preparing;
-            match endpoint.prepare(route, contract, expected_route_token, attempt) {
+            match endpoint.prepare(route, contract, attempt) {
                 Ok(value) => Ok(Output::Json(value)),
                 Err(error) => {
                     let mut value = error_value(&error);

@@ -36,7 +36,8 @@ fn nested_not_executed_phase_stops_at_the_resource_a_boundary() {
     assert_eq!(outer.code, inner.code);
     assert_eq!(outer.message, inner.message);
     assert_eq!(outer.details["route"], fixture.route_b);
-    assert_eq!(outer.details["route_uid"], inner.details["route_uid"]);
+    assert!(!outer.details.contains_key("route_uid"));
+    assert!(!inner.details.contains_key("route_uid"));
     assert!(!outer.details.contains_key("transport_phase"));
     assert!(!outer.details.contains_key("dispatch_phase"));
 }

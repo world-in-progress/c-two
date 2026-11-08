@@ -14,7 +14,7 @@ function fixture() {
     close() { events.push('call.close'); },
   };
   const endpoint = {
-    async prepare(route, contract) { events.push(['prepare', route, contract]); return {serverId: 'server', serverInstanceId: 'instance', routeUid: 'uid', connectionId: 7n}; },
+    async prepare(route, contract) { events.push(['prepare', route, contract]); return {serverId: 'server', serverInstanceId: 'instance', connectionId: 7n}; },
     beginCall(route, method, stream, timeout) { events.push(['begin', route, method, stream, timeout]); return call; },
     deactivate() { events.push('deactivate'); },
     async close() { events.push('endpoint.close'); },
@@ -32,7 +32,7 @@ test('endpoint and call methods pass through route, method and deadline exactly'
   const connector = createNodeIpcConnector({nativeSymbols: symbols});
   const endpoint = await connector('ipc://x');
   const contract = {abiHash: 'a'};
-  assert.deepEqual(await endpoint.prepare('echo', contract), {serverId: 'server', serverInstanceId: 'instance', routeUid: 'uid', connectionId: 7n});
+  assert.deepEqual(await endpoint.prepare('echo', contract), {serverId: 'server', serverInstanceId: 'instance', connectionId: 7n});
   const call = endpoint.beginCall('echo', 'steps', true, null);
   await call.chargeInput(3n);
   const input = new Uint8Array([1, 2, 3]);

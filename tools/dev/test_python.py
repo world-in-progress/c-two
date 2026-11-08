@@ -297,8 +297,8 @@ def validate_receipts(output: Path, c3_hash: str) -> None:
     from tools.local_rc.portable_matrix_receipt import load_and_validate_receipt as portable
     from tools.local_rc.typescript_receipt import load_and_validate_receipt as typescript
 
-    p = portable(output / "portable-matrix-receipt.v2.json", expected_stage="development")
-    t = typescript(output / "typescript-real-call-receipt.v2.json", expected_stage="development")
+    p = portable(output / "portable-matrix-receipt.v3.json", expected_stage="development")
+    t = typescript(output / "typescript-real-call-receipt.v3.json", expected_stage="development")
     # 结构验证包含精确行集/顺序/负例；还绑定本次c3字节。
     if any(row["c3_sha256"] != c3_hash for row in p["rows"] if row["transport"] == "relay") or t["packages"]["c3_sha256"] != c3_hash:
         raise RunnerError("收据c3哈希与本次输入不一致")
@@ -394,8 +394,8 @@ def main(argv: list[str] | None = None) -> int:
         base["C2_PORTABLE_MATRIX_FIXTURE_ROOT"] = str(Path(os.environ["C2_PORTABLE_MATRIX_FIXTURE_ROOT"]).expanduser().resolve())
     base.update({"C2_ENV_FILE": "", "C2_RELAY_ANCHOR_ADDRESS": "", "PYTHONDONTWRITEBYTECODE": "1", "CTWO_TEST_RUN_NAMESPACE": namespace,
         "CTWO_RELAY_START_LOCK": str(args.output / "relay-start.lock"), "CTWO_TEST_C3_BIN": str(args.c3),
-        "C2_PORTABLE_MATRIX_C3_BIN": str(args.c3), "C2_PORTABLE_MATRIX_RECEIPT": str(args.output / "portable-matrix-receipt.v2.json"),
-        "C2_TYPESCRIPT_RECEIPT": str(args.output / "typescript-real-call-receipt.v2.json"), "C2_PORTABLE_MATRIX_EVIDENCE_STAGE": "development",
+        "C2_PORTABLE_MATRIX_C3_BIN": str(args.c3), "C2_PORTABLE_MATRIX_RECEIPT": str(args.output / "portable-matrix-receipt.v3.json"),
+        "C2_TYPESCRIPT_RECEIPT": str(args.output / "typescript-real-call-receipt.v3.json"), "C2_PORTABLE_MATRIX_EVIDENCE_STAGE": "development",
         "C2_TYPESCRIPT_EVIDENCE_STAGE": "development", "C2_TYPESCRIPT_FASTDB_SOURCE_SHA": FASTDB_SHA,
         "NO_PROXY": "127.0.0.1,localhost", "no_proxy": "127.0.0.1,localhost", "PYTHONUTF8": "1",
         "PYTHONWARNDEFAULTENCODING": "1",

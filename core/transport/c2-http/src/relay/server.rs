@@ -1644,7 +1644,10 @@ mod tests {
             .unwrap();
             attestor.connect().await.unwrap();
             let manager_contract = attestor.route_contract("manager").unwrap();
-            let manager_binding = attestor.acquire_route(&manager_contract).await.unwrap();
+            let manager_binding = attestor
+                .attest_route_for_registration(&manager_contract)
+                .await
+                .unwrap();
             let manager = match test_commit_registration!(
                 &state,
                 "manager".into(),
@@ -1656,8 +1659,8 @@ mod tests {
                 "0.1.0".into(),
                 TEST_ABI_HASH.to_string(),
                 TEST_SIGNATURE_HASH.to_string(),
-                manager_binding.max_payload_size(),
-                manager_binding.route_uid().to_string(),
+                manager_binding.max_payload_size,
+                manager_binding.route_uid,
                 None,
             ) {
                 RegisterCommitResult::Registered { entry } => entry,
@@ -1701,7 +1704,7 @@ mod tests {
                 ..manager_contract.clone()
             };
             let builder_binding = manager_client
-                .acquire_route(&builder_contract)
+                .attest_route_for_registration(&builder_contract)
                 .await
                 .unwrap();
             let builder = match test_commit_registration!(
@@ -1715,8 +1718,8 @@ mod tests {
                 "0.1.0".into(),
                 TEST_ABI_HASH.to_string(),
                 TEST_SIGNATURE_HASH.to_string(),
-                builder_binding.max_payload_size(),
-                builder_binding.route_uid().to_string(),
+                builder_binding.max_payload_size,
+                builder_binding.route_uid,
                 None,
             ) {
                 RegisterCommitResult::Registered { entry } => entry,

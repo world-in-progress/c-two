@@ -385,7 +385,7 @@ def execute_steps(steps: list[Step], output: Path, environment: dict[str, str], 
         env = {**environment, 'FASTDB_PAYLOAD_LINK_MODE': step.link_mode}
         print(f'{step.name}: {subprocess.list2cmdline(step.command)}', flush=True)
         if step.name == 'typescript':
-            env.update(CTWO_PYTHON_STAGE_DIR=str(directory), C2_TYPESCRIPT_RECEIPT=str(directory / 'typescript-real-call-receipt.v2.json'),
+            env.update(CTWO_PYTHON_STAGE_DIR=str(directory), C2_TYPESCRIPT_RECEIPT=str(directory / 'typescript-real-call-receipt.v3.json'),
                        C2_TYPESCRIPT_EVIDENCE_STAGE='development')
         # The strict Python subprocess acquires all its own resource leases.
         with ExitStack() as stack:
@@ -436,7 +436,7 @@ def execute_steps(steps: list[Step], output: Path, environment: dict[str, str], 
                     if planned is not None and record['status'] == 'passed':
                         strict.validate_execution(directory, planned, 1)
                         from tools.local_rc.typescript_receipt import load_and_validate_receipt
-                        load_and_validate_receipt(directory / 'typescript-real-call-receipt.v2.json', expected_stage='development')
+                        load_and_validate_receipt(directory / 'typescript-real-call-receipt.v3.json', expected_stage='development')
                 except (subprocess.TimeoutExpired, KeyboardInterrupt) as error:
                     record['status'] = 'cancelled' if isinstance(error, KeyboardInterrupt) else 'timed_out'
                     record['error'] = str(error)

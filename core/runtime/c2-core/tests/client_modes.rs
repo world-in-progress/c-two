@@ -498,7 +498,6 @@ fn all_connection_modes_return_the_same_client_surface_and_record_distinct_paths
     let mut registration = host
         .register(definition(&route_name))
         .expect("route registration");
-    let registered_route_uid = registration.outcome().route_uid.clone();
     let expected = release()
         .expected_route(&route_name)
         .expect("expected route");
@@ -514,7 +513,6 @@ fn all_connection_modes_return_the_same_client_surface_and_record_distinct_paths
         .expect("direct client");
     accepts_client(&direct);
     assert_eq!(direct.observed_path(), ObservedPath::DirectIpc);
-    assert_eq!(direct.observed_route().route_uid, registered_route_uid);
     assert_eq!(direct.expected_route(), &expected);
     assert_eq!(
         direct.call_owned("echo", b"direct").expect("direct call"),
@@ -531,7 +529,7 @@ fn all_connection_modes_return_the_same_client_surface_and_record_distinct_paths
         .expect("explicit relay client");
     accepts_client(&explicit);
     assert_eq!(explicit.observed_path(), ObservedPath::ExplicitRelay);
-    assert_eq!(explicit.observed_route().route_uid, registered_route_uid);
+    assert_eq!(explicit.expected_route(), &expected);
     assert_eq!(
         explicit
             .call_owned("echo", b"explicit")
@@ -547,7 +545,7 @@ fn all_connection_modes_return_the_same_client_surface_and_record_distinct_paths
         relay_aware.observed_path(),
         ObservedPath::RelayAwareLocalIpc
     );
-    assert_eq!(relay_aware.observed_route().route_uid, registered_route_uid);
+    assert_eq!(relay_aware.expected_route(), &expected);
     assert_eq!(
         relay_aware
             .call_owned("echo", b"aware")
@@ -662,24 +660,15 @@ fn route_state_and_terminal_identity_errors_use_the_canonical_registry() {
         (
             IpcError::RouteRemoved {
                 route_name: "route".to_string(),
-                route_uid: Some("uid".to_string()),
             },
             ErrorCode::ResourceRemoved,
         ),
         (
             IpcError::RouteClosed {
                 route_name: "route".to_string(),
-                route_uid: "uid".to_string(),
                 reason: "draining".to_string(),
             },
             ErrorCode::ResourceClosed,
-        ),
-        (
-            IpcError::RouteStale {
-                route_name: "route".to_string(),
-                current_route_uid: "uid".to_string(),
-            },
-            ErrorCode::RouteStale,
         ),
         (
             IpcError::ContractMismatch("wrong release".to_string()),
@@ -707,6 +696,8 @@ fn route_state_and_terminal_identity_errors_use_the_canonical_registry() {
             panic!("route and identity state must normalize semantically");
         };
         assert_eq!(error.code, expected_code);
+        assert!(!error.details.contains_key("route_uid"));
+        assert!(!error.details.contains_key("current_route_uid"));
     }
 }
 
@@ -716,9 +707,8 @@ fn retained_release_identity_is_unchanged_by_route_failures() {
     let retained_ref = release.reference();
     let expected_json = retained_ref.to_canonical_json().expect("reference JSON");
     let _ = normalize_ipc_error(
-        IpcError::RouteStale {
+        IpcError::RouteRemoved {
             route_name: "route".to_string(),
-            current_route_uid: "uid".to_string(),
         },
         c2_core::TransportPhase::PreDispatch,
     );
@@ -844,35 +834,19 @@ fn relay_aware_contract_mismatch_is_terminal_without_fallback_resolution() {
         .expect("local registration");
     let identity = runtime.ensure_server().expect("runtime identity");
     let address = runtime.server_address().expect("server address");
-    // Inspect the server's local route token through a standalone throwaway
-    // client pool. Runtime-owned caches stay private (no public escape
-    // hatch). The inspection releases exactly the acquired client by identity.
-    let inspector_pool = c2_ipc::ClientPool::with_endpoint_context(
-        Duration::from_secs(60),
-        runtime.local_endpoint_context().unwrap(),
-    );
-    let inspector = inspector_pool
-        .acquire(&address, Some(&c2_ipc::ClientIpcConfig::default()))
-        .expect("inspect local route token");
-    let binding = inspector
-        .acquire_route(&actual_expected)
-        .expect("actual route binding");
-
     let mut claimed_expected = actual_expected;
     claimed_expected.crm_name = "DifferentPortableContract".to_string();
     let resolve_count = Arc::new(AtomicUsize::new(0));
-    let mut candidate = local_candidate(
+    let candidate = local_candidate(
         &claimed_expected,
         address.clone(),
         identity.server_id,
         identity.server_instance_id,
     );
-    candidate.route_uid = binding.route_uid().to_string();
     let registry = registry_server(candidate, resolve_count.clone());
     runtime.set_relay_anchor_address(Some(registry.url.clone()));
 
     let result = runtime.connect(claimed_expected, Connect::RelayAware);
-    assert!(inspector_pool.release_if_same(&address, &inspector));
     let Error::Semantic(error) = result.expect_err("contract mismatch must be terminal") else {
         panic!("contract mismatch must be semantic");
     };

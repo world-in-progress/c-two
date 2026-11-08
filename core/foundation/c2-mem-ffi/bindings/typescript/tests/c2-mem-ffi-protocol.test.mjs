@@ -115,6 +115,32 @@ test('ABI 8 native endpoint completes unary calls and reuses the connector domai
   });
 });
 
+test('ABI 8 same-endpoint re-registration reaches the current resource without a route UID', {timeout: 150_000}, async () => {
+  await withServer(async ({connector, address, contract, lines, child}) => {
+    const endpoint = await connector(address);
+    try {
+      const before = await endpoint.prepare('echo', contract);
+      assert.deepEqual(Object.keys(before).sort(), ['connectionId', 'serverId', 'serverInstanceId']);
+      assert.deepEqual(await unary(endpoint, contract, Uint8Array.of(7)), Uint8Array.of(7));
+
+      child.stdin.write('replace\n');
+      assert.equal(JSON.parse((await lines.next()).value).kind, 'route_removed');
+      await assert.rejects(endpoint.prepare('echo', contract));
+
+      child.stdin.write('register_replacement\n');
+      assert.equal(JSON.parse((await lines.next()).value).kind, 'route_replaced');
+      const after = await endpoint.prepare('echo', contract);
+      assert.deepEqual(Object.keys(after).sort(), ['connectionId', 'serverId', 'serverInstanceId']);
+      assert.deepEqual(after, before);
+      assert.deepEqual(await unary(endpoint, contract, Uint8Array.of(8)), Uint8Array.of(8, 1));
+      const fresh = await connector(address);
+      try {
+        assert.deepEqual(await unary(fresh, contract, Uint8Array.of(9)), Uint8Array.of(9, 1));
+      } finally { await fresh.close(); }
+    } finally { await endpoint.close(); }
+  });
+});
+
 test('ABI 8 real IPC backing survives view GC and release survives backing GC', {timeout: 150_000}, async () => {
   await withServer(async ({address, contract, root}) => {
     const script = `

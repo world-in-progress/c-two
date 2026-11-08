@@ -20,7 +20,7 @@ function fixture() {
     checkDeadline() {}, close() {},
   };
   const nativeEndpoint = {
-    prepare: async () => ({serverId: 's', serverInstanceId: 'i', routeUid: 'r', connectionId: 1n}),
+    prepare: async () => ({serverId: 's', serverInstanceId: 'i', connectionId: 1n}),
     beginCall: () => nativeCall, deactivate() {}, close: async () => {},
   };
   const domain = {
@@ -78,22 +78,22 @@ test('per-transport native options override factory defaults and explicit timeou
   connect.close();
 });
 
-test('route token is supplied to each preparation, not endpoint creation', async () => {
+test('each preparation supplies only route and contract to the shared endpoint', async () => {
   const {symbols, events, nativeEndpoint} = fixture();
   const prepared = [];
-  nativeEndpoint.prepare = async (route, contract, token) => {
-    prepared.push([route, contract, token]);
-    return {serverId: 's', serverInstanceId: 'i', routeUid: 'r', connectionId: 1n};
+  nativeEndpoint.prepare = async (...args) => {
+    prepared.push(args);
+    return {serverId: 's', serverInstanceId: 'i', connectionId: 1n};
   };
   const connect = createNodeIpcConnector({nativeSymbols: symbols});
   try {
     const endpoint = await connect('ipc://shared');
     const contract = {namespace: 'example'};
-    await endpoint.prepare('one', contract, {routeUid: 'uid-one'});
-    await endpoint.prepare('two', contract, {routeUid: 'uid-two'});
+    await endpoint.prepare('one', contract);
+    await endpoint.prepare('two', contract);
     assert.deepEqual(prepared, [
-      ['one', contract, {routeUid: 'uid-one'}],
-      ['two', contract, {routeUid: 'uid-two'}],
+      ['one', contract],
+      ['two', contract],
     ]);
     assert.deepEqual(events.find(e => Array.isArray(e) && e[0] === 'endpoint')[2], {});
   } finally { connect.close(); }

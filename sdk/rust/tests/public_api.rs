@@ -287,7 +287,6 @@ fn one_client_type_covers_direct_explicit_relay_and_relay_aware_calls() {
     let mut registration = host
         .register(definition(&route_name))
         .expect("route registration");
-    let registered_route_uid = registration.outcome().route_uid.clone();
     let expected = release()
         .expected_route(&route_name)
         .expect("expected route");
@@ -301,7 +300,10 @@ fn one_client_type_covers_direct_explicit_relay_and_relay_aware_calls() {
         )
         .expect("direct IPC client");
     accepts_client(&direct);
-    assert_eq!(direct.observed_route().route_uid, registered_route_uid);
+    assert_eq!(
+        direct.observed_path(),
+        c_two::observe::ObservedPath::DirectIpc
+    );
     assert_eq!(
         direct.call_owned("echo", b"direct").expect("direct call"),
         b"direct"
@@ -316,7 +318,10 @@ fn one_client_type_covers_direct_explicit_relay_and_relay_aware_calls() {
         )
         .expect("explicit relay client");
     accepts_client(&explicit);
-    assert_eq!(explicit.observed_route().route_uid, registered_route_uid);
+    assert_eq!(
+        explicit.observed_path(),
+        c_two::observe::ObservedPath::ExplicitRelay
+    );
     assert_eq!(
         explicit
             .call_owned("echo", b"explicit")
@@ -328,7 +333,10 @@ fn one_client_type_covers_direct_explicit_relay_and_relay_aware_calls() {
         .connect(expected, Connect::RelayAware)
         .expect("relay-aware client");
     accepts_client(&relay_aware);
-    assert_eq!(relay_aware.observed_route().route_uid, registered_route_uid);
+    assert_eq!(
+        relay_aware.observed_path(),
+        c_two::observe::ObservedPath::RelayAwareLocalIpc
+    );
     assert_eq!(
         relay_aware
             .call_owned("echo", b"aware")

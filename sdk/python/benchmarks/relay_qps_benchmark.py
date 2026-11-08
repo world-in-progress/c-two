@@ -13,11 +13,13 @@ Outputs: QPS=<number>
 """
 from __future__ import annotations
 
+import json
 import os
 import pickle
 import re
 import subprocess
 import sys
+import urllib.parse
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -98,9 +100,22 @@ def main():
                 f.write(pickle.dumps('Benchmark'))
             try:
                 cc.register(Hello, HelloImpl(), name=route_name)
-                with cc.connect(Hello, name=route_name, address=relay_url) as hello:
+                with cc.connect(Hello, name=route_name, address=relay_url):
+                    expected = crm_contract(Hello)
+                    query = urllib.parse.urlencode({
+                        'crm_ns': expected.crm_ns,
+                        'crm_name': expected.crm_name,
+                        'crm_ver': expected.crm_ver,
+                        'abi_hash': expected.abi_hash,
+                        'signature_hash': expected.signature_hash,
+                    })
+                    route_path = urllib.parse.quote(route_name, safe='')
+                    with relay._NO_PROXY_OPENER.open(
+                        f'{relay_url}/_resolve/{route_path}?{query}', timeout=5,
+                    ) as response:
+                        routes = json.load(response)
                     expected_header_args = _route_hey_args(
-                        crm_contract(Hello), hello.client.route_uid,
+                        expected, routes[0]['route_uid'],
                     )
 
                 # Warmup with hey

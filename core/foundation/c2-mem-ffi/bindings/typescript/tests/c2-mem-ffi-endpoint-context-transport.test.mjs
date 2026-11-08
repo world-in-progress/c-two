@@ -17,7 +17,7 @@ test('captured endpoint context flows through native domain, prepare and call', 
     checkDeadline() {}, close() { events.push('call.close'); },
   };
   const endpoint = {
-    async prepare(route, contract) { events.push(['prepare', route, contract.abiHash]); return {serverId: 'server', serverInstanceId: 'instance', routeUid: 'route', connectionId: 1n}; },
+    async prepare(route, contract) { events.push(['prepare', route, contract.abiHash]); return {serverId: 'server', serverInstanceId: 'instance', connectionId: 1n}; },
     beginCall(route, method, serverStream) { events.push(['begin', route, method, serverStream]); return nativeCall; },
     deactivate() {}, async close() { events.push('endpoint.close'); },
   };

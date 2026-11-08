@@ -27,7 +27,7 @@ pub use c2_server::{ServerFailure, ServerStartupStage, ServerStartupTimeout};
 pub use call_scope::{CallScope, CallScopeError, CallState};
 pub use client::{
     Client, Connect, EncodedCall, EncodedClient, HeldResponse, NativeEndpointContext, ObservedPath,
-    ObservedRoute, PathCounters, PreparedCall,
+    PathCounters, PreparedCall,
 };
 pub use client_stream::{CoreResponseStream, CoreStreamCloseReceipt};
 pub use connect_deadline::{ConnectAttempt, connect_deadline_error};

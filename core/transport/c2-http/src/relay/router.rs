@@ -438,7 +438,9 @@ fn run_data_plane_after_precheck_hook(state: &Arc<RelayState>, route_name: &str)
         let mut guard = DATA_PLANE_AFTER_PRECHECK_HOOKS.lock().unwrap();
         guard
             .iter()
-            .position(|hook| hook.route_name == route_name && hook.state.ptr_eq(&Arc::downgrade(state)))
+            .position(|hook| {
+                hook.route_name == route_name && hook.state.ptr_eq(&Arc::downgrade(state))
+            })
             .map(|index| guard.remove(index))
     };
     if let Some(hook) = hook {
@@ -2312,10 +2314,6 @@ async fn forward_call(
                     budget.clone(),
                     width,
                 ),
-                c2_ipc::IpcError::RouteStale { .. } => {
-                    drop(lease);
-                    route_stale_response_budgeted(&advertised_route, &budget)
-                }
                 error if matches!(phase, c2_ipc::TransportPhase::PreDispatch) => {
                     if let Some(reason) = semantic_withdrawal_reason(&error) {
                         drop(lease);
@@ -2528,51 +2526,23 @@ fn ipc_route_error_response(
             )
             .with_details(BTreeMap::from([("route".to_string(), route.clone())])),
         ),
-        c2_ipc::IpcError::RouteRemoved {
-            route_name,
-            route_uid,
-        } => {
-            let mut details = BTreeMap::from([("route".to_string(), route_name.clone())]);
-            if let Some(route_uid) = route_uid {
-                details.insert("route_uid".to_string(), route_uid.clone());
-            }
-            semantic_error_response(
-                StatusCode::GONE,
-                C2Error::new(
-                    ErrorCode::ResourceRemoved,
-                    format!("route removed: {route_name}"),
-                )
-                .with_details(details),
+        c2_ipc::IpcError::RouteRemoved { route_name } => semantic_error_response(
+            StatusCode::GONE,
+            C2Error::new(
+                ErrorCode::ResourceRemoved,
+                format!("route removed: {route_name}"),
             )
-        }
-        c2_ipc::IpcError::RouteClosed {
-            route_name,
-            route_uid,
-            reason,
-        } => semantic_error_response(
+            .with_details(BTreeMap::from([("route".into(), route_name.clone())])),
+        ),
+        c2_ipc::IpcError::RouteClosed { route_name, reason } => semantic_error_response(
             StatusCode::SERVICE_UNAVAILABLE,
             C2Error::new(
                 ErrorCode::ResourceClosed,
                 format!("route closed: {route_name}"),
             )
             .with_details(BTreeMap::from([
-                ("reason".to_string(), reason.clone()),
-                ("route".to_string(), route_name.clone()),
-                ("route_uid".to_string(), route_uid.clone()),
-            ])),
-        ),
-        c2_ipc::IpcError::RouteStale {
-            route_name,
-            current_route_uid,
-        } => semantic_error_response(
-            StatusCode::CONFLICT,
-            C2Error::new(
-                ErrorCode::RouteStale,
-                format!("route token is stale: {route_name}"),
-            )
-            .with_details(BTreeMap::from([
-                ("current_route_uid".to_string(), current_route_uid.clone()),
-                ("route".to_string(), route_name.clone()),
+                ("route".into(), route_name.clone()),
+                ("reason".into(), reason.clone()),
             ])),
         ),
         c2_ipc::IpcError::ContractMismatch(message) => semantic_error_response(
@@ -2671,7 +2641,6 @@ fn upstream_acquire_error_kind(error: &c2_ipc::IpcError) -> &'static str {
         c2_ipc::IpcError::RouteNotFound(_) => "route-missing",
         c2_ipc::IpcError::RouteRemoved { .. } => "route-removed",
         c2_ipc::IpcError::RouteClosed { .. } => "route-closed",
-        c2_ipc::IpcError::RouteStale { .. } => "route-stale",
         c2_ipc::IpcError::MethodNotFound { .. } => "method-missing",
         c2_ipc::IpcError::Shm(_) => "shm",
         c2_ipc::IpcError::Chunk(_) => "chunk",
@@ -2944,14 +2913,12 @@ mod tests {
         assert_eq!(
             semantic_withdrawal_reason(&c2_ipc::IpcError::RouteRemoved {
                 route_name: "grid".into(),
-                route_uid: Some("grid-uid".into()),
             }),
             Some("route-removed")
         );
         assert_eq!(
             semantic_withdrawal_reason(&c2_ipc::IpcError::RouteClosed {
                 route_name: "grid".into(),
-                route_uid: "grid-uid".into(),
                 reason: "shutdown".into(),
             }),
             Some("route-closed")
@@ -2967,13 +2934,6 @@ mod tests {
             semantic_withdrawal_reason(&c2_ipc::IpcError::Io(std::io::Error::from(
                 std::io::ErrorKind::TimedOut,
             ))),
-            None
-        );
-        assert_eq!(
-            semantic_withdrawal_reason(&c2_ipc::IpcError::RouteStale {
-                route_name: "grid".into(),
-                current_route_uid: "new-grid-uid".into(),
-            }),
             None
         );
         assert_eq!(
@@ -2998,7 +2958,6 @@ mod tests {
             (
                 c2_ipc::IpcError::RouteRemoved {
                     route_name: "grid".into(),
-                    route_uid: Some("grid-uid".into()),
                 },
                 StatusCode::GONE,
                 ErrorCode::ResourceRemoved,
@@ -3006,19 +2965,10 @@ mod tests {
             (
                 c2_ipc::IpcError::RouteClosed {
                     route_name: "grid".into(),
-                    route_uid: "grid-uid".into(),
                     reason: "shutdown".into(),
                 },
                 StatusCode::SERVICE_UNAVAILABLE,
                 ErrorCode::ResourceClosed,
-            ),
-            (
-                c2_ipc::IpcError::RouteStale {
-                    route_name: "grid".into(),
-                    current_route_uid: "grid-uid-v2".into(),
-                },
-                StatusCode::CONFLICT,
-                ErrorCode::RouteStale,
             ),
             (
                 c2_ipc::IpcError::ContractMismatch("wrong contract".into()),
@@ -3247,7 +3197,6 @@ mod tests {
             .expect("advertised route");
         let error = c2_ipc::IpcError::RouteClosed {
             route_name: "closed-upstream".into(),
-            route_uid: "closed-upstream-uid".into(),
             reason: "Shutdown".into(),
         };
         let reason = semantic_withdrawal_reason(&error).expect("closed is authoritative");
@@ -3780,10 +3729,7 @@ mod tests {
                 ipc.server_instance_id(),
                 Some(candidate.server_instance_id.as_str())
             );
-            let binding = ipc
-                .acquire_route_token(&expected, &candidate.route_uid)
-                .await
-                .unwrap();
+            let binding = ipc.acquire_route(&expected).await.unwrap();
             let response = ipc.call_bound(&binding, "ping", b"").await.unwrap();
             assert_eq!(
                 response.into_owned_bytes().unwrap(),
@@ -6349,17 +6295,23 @@ mod tests {
         let owner_server = start_live_server(&owner_address, "server-grid").await;
 
         // Capture the live route identity before removal. The server
-        // tombstone keeps this uid, so the withdrawal response can be pinned
-        // to the exact removed incarnation.
+        // The directory UID is used only to register the route with the relay.
+        // Its later removal is reported publicly by route name.
         let mut attested =
             c2_ipc::IpcClient::with_config(&owner_address, ClientIpcConfig::default()).unwrap();
         attested
             .connect()
             .await
             .expect("attestation client connects");
-        let table = attested.route_table("grid").expect("server exports grid");
-        let route_uid = table.route_uid().to_string();
-        let max_payload_size = table.max_payload_size();
+        let contract = attested
+            .route_contract("grid")
+            .expect("server exports grid");
+        let table = attested
+            .attest_route_for_registration(&contract)
+            .await
+            .unwrap();
+        let route_uid = table.route_uid.clone();
+        let max_payload_size = table.max_payload_size;
         attested.close().await;
 
         assert!(owner_server.unregister_route("grid").await);
@@ -6394,7 +6346,7 @@ mod tests {
         assert_eq!(body["name"], "ResourceRemoved");
         assert_eq!(body["message"], "route removed: grid");
         assert_eq!(body["details"]["route"], "grid");
-        assert_eq!(body["details"]["route_uid"], route_uid);
+        assert!(body["details"].get("route_uid").is_none());
         assert!(
             state.local_route("grid").is_none(),
             "known-removed upstream route is semantic withdrawal evidence"
@@ -6509,9 +6461,15 @@ mod tests {
             .connect()
             .await
             .expect("attestation client connects");
-        let table = attested.route_table("grid").expect("server exports grid");
-        let route_uid = table.route_uid().to_string();
-        let max_payload_size = table.max_payload_size();
+        let contract = attested
+            .route_contract("grid")
+            .expect("server exports grid");
+        let table = attested
+            .attest_route_for_registration(&contract)
+            .await
+            .unwrap();
+        let route_uid = table.route_uid.clone();
+        let max_payload_size = table.max_payload_size;
         attested.close().await;
 
         assert!(owner_server.unregister_route("grid").await);
@@ -6548,7 +6506,7 @@ mod tests {
         assert_eq!(body["name"], "ResourceRemoved");
         assert_eq!(body["message"], "route removed: grid");
         assert_eq!(body["details"]["route"], "grid");
-        assert_eq!(body["details"]["route_uid"], route_uid);
+        assert!(body["details"].get("route_uid").is_none());
         assert!(
             state.local_route("grid").is_none(),
             "known-removed upstream route is semantic withdrawal evidence"
@@ -6732,7 +6690,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn relay_upstream_stale_snapshot_does_not_bind_later_route_by_name() {
+    async fn relay_upstream_stale_snapshot_acquires_current_route_by_name() {
         let state = test_state_for_client();
         let address = format!(
             "ipc://relay_upstream_live_route_refresh_{}_{}",
@@ -6798,17 +6756,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(response.status(), StatusCode::OK);
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        let body = String::from_utf8(body.to_vec()).unwrap();
-        assert!(
-            body.contains("RouteStale"),
-            "stale snapshot must not be refreshed by route name: {body}"
-        );
-        assert!(
-            state.local_route("builder").is_some(),
-            "stale route token must not be treated as generic unreachable"
-        );
+        assert_eq!(body.as_ref(), b"echo");
+        assert!(state.local_route("builder").is_some());
 
         shutdown_live_server(&server).await;
     }
@@ -6853,7 +6804,13 @@ mod tests {
             .connect()
             .await
             .expect("attestation client connects");
-        let table = attested.route_table("grid").expect("server exports grid");
+        let contract = attested
+            .route_contract("grid")
+            .expect("server exports grid");
+        let table = attested
+            .attest_route_for_registration(&contract)
+            .await
+            .unwrap();
         attested.close().await;
 
         match test_commit_registration!(
@@ -6867,8 +6824,8 @@ mod tests {
             "0.1.0".into(),
             TEST_ABI_HASH.into(),
             TEST_SIGNATURE_HASH.into(),
-            table.max_payload_size(),
-            table.route_uid().to_string(),
+            table.max_payload_size,
+            table.route_uid.clone(),
             None,
         ) {
             RegisterCommitResult::Registered { .. } => {}

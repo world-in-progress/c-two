@@ -16,7 +16,7 @@ import pytest
 
 import c_two as cc
 from c_two.config.settings import settings
-from c_two.error import ContractMismatch, ResourceAlreadyRegistered, RouteStale
+from c_two.error import ContractMismatch, ResourceAlreadyRegistered, ResourceRemoved
 from c_two.transport.registry import Runtime, _get_default_runtime, _reset_default_runtime
 from c_two.transport.client.proxy import CRMProxy
 
@@ -319,22 +319,26 @@ class TestRegisterConnect:
         finally:
             cc.close(crm)
 
-    def test_ipc_proxy_keeps_acquired_route_token_after_reregister(self):
+    def test_ipc_proxy_follows_same_endpoint_reregistration(self):
         cc.register(Hello, PrefixHelloImpl('old'), name='hello')
         addr = cc.server_address()
         assert addr is not None
 
         old_crm = cc.connect(Hello, name='hello', address=addr)
         try:
+            assert not hasattr(old_crm.client, 'route_uid')
+            assert not hasattr(old_crm.client._client, 'route_uid')  # noqa: SLF001
             assert old_crm.greeting('grid') == 'old:grid'
             cc.unregister('hello')
+            with pytest.raises(ResourceRemoved) as removed:
+                old_crm.greeting('gap')
+            assert removed.value.details['transport_phase'] == 'pre_dispatch'
             cc.register(Hello, PrefixHelloImpl('new'), name='hello')
 
             new_crm = cc.connect(Hello, name='hello', address=addr)
             try:
                 assert new_crm.greeting('grid') == 'new:grid'
-                with pytest.raises(RouteStale, match='stale route token'):
-                    old_crm.greeting('grid')
+                assert old_crm.greeting('grid') == 'new:grid'
             finally:
                 cc.close(new_crm)
         finally:

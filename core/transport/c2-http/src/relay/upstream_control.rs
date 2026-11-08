@@ -649,7 +649,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap_or_else(|_| panic!("live acquire must succeed"));
-            assert_eq!(binding.route_uid(), fixture.entry.route_uid);
+            assert_eq!(binding.route_name(), fixture.entry.name);
             let reply =
                 tokio::time::timeout(STEP, lease.client().call_bound(&binding, "ping", &[]))
                     .await

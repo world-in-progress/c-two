@@ -223,8 +223,8 @@ impl Upstream {
             "0.1.0".into(),
             TEST_ABI_HASH.into(),
             TEST_SIGNATURE_HASH.into(),
-            attestation.max_payload_size(),
-            attestation.route_uid().to_string(),
+            attestation.max_payload_size,
+            attestation.route_uid,
             None,
         ) {
             RegisterCommitResult::Registered { entry } => entry,
@@ -244,7 +244,7 @@ impl Upstream {
             Ok(value) => value,
             Err(_) => panic!("real attested upstream acquisition failed"),
         };
-        assert_eq!(binding.route_uid(), self.entry.route_uid);
+        assert_eq!(binding.route_name(), self.entry.name);
         let client = lease.client();
         assert!(client.is_connected());
         assert_eq!(client.server_id(), self.entry.server_id.as_deref());
@@ -773,7 +773,7 @@ async fn exercise_http_upload(
         surviving_client.server_instance_id(),
         upstream.entry.server_instance_id.as_deref()
     );
-    assert_eq!(binding.route_uid(), upstream.entry.route_uid);
+    assert_eq!(binding.route_name(), upstream.entry.name);
     assert_eq!(upstream.probe.calls.load(Ordering::SeqCst), 0);
     drop(lease);
     let mut idle = state.evict_idle(0);

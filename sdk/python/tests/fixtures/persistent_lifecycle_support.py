@@ -258,7 +258,8 @@ class Lab:
             raise
         self.proxies.append(proxy)
         assert proxy.client.observed_path == self.path
-        assert proxy.client.route_uid
+        assert not hasattr(proxy.client, "route_uid")
+        assert not hasattr(proxy.client._client, "route_uid")  # noqa: SLF001
         return proxy
 
     def assert_reply(self, reply: dict, resource: Resource, value: str) -> None:
@@ -281,7 +282,7 @@ class Lab:
             return refused, cc.error.ResourceNotFound
         return (refused,)
 
-    def assert_acquire_closed(self, label: str, uid: str) -> None:
+    def assert_acquire_closed(self, label: str) -> None:
         """Keep the typed IPC cause whenever acquisition denies its fallback."""
         with pytest.raises(self.closed_route_errors(acquiring=True)) as caught:
             self.connect(label)
@@ -294,10 +295,10 @@ class Lab:
             assert cause["name"] == "ResourceClosed"
             assert cause["code"] == 707
             assert cause["details"]["route"] == self.name(label)
-            assert cause["details"]["route_uid"] == uid
+            assert "route_uid" not in cause["details"]
             assert details["server_id"] == self.identity["server_id"]
             assert details["server_instance_id"] == self.identity["server_instance_id"]
-            assert details["route_uid"] == uid
+            assert "route_uid" not in details
 
     def cleanup(self) -> dict:
         for resource in self.resources:
@@ -319,8 +320,8 @@ class Lab:
     def receipt(self, cleanup: dict) -> str:
         return json.dumps({
             "observed_path": self.path, "identity": self.identity,
-            "route_uids": [proxy.client.route_uid for proxy in self.proxies],
-            "business_calls": [resource.snapshot() for resource in self.resources],
+            "resources": [{"label": resource.label, "calls": resource.snapshot()}
+                          for resource in self.resources],
             "acquire_refusals": self.refusals,
             "physical_client_connections": len(self.outgoing.ids("opened", "client")),
             "physical_server_connections": len(self.accepted.ids("opened", "server")),

@@ -41,12 +41,6 @@ pub enum ObservedPath {
     RelayAwareRelay,
 }
 
-/// Immutable route identity observed when one Core client is acquired.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ObservedRoute {
-    pub route_uid: String,
-}
-
 /// Monotonic process-runtime observations of successfully selected paths.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PathCounters {
@@ -95,7 +89,6 @@ pub struct Client {
 struct ClientConnection {
     expected: ExpectedRouteContract,
     observed_path: ObservedPath,
-    observed_route: ObservedRoute,
     runtime: Runtime,
     path_default: Option<Duration>,
     transport: ClientInner,
@@ -155,10 +148,6 @@ impl Client {
 
     pub fn observed_path(&self) -> ObservedPath {
         self.inner.observed_path
-    }
-
-    pub fn observed_route(&self) -> &ObservedRoute {
-        &self.inner.observed_route
     }
 
     /// Immutable policy view sharing the exact route and connection acquisition.
@@ -738,11 +727,9 @@ impl NativeEndpointContext {
             }
         }
         let connection = acquired.expect("acquire loop returned or bound a route");
-        let observed = observed_ipc_route(&connection);
         self.runtime.finish_client(
             expected,
             ObservedPath::DirectIpc,
-            observed,
             ClientInner::Ipc(connection),
             deadline,
         )
@@ -801,18 +788,16 @@ impl Runtime {
         match mode {
             Connect::DirectIpc { address } => {
                 let connection = self.acquire_direct_ipc(&address, &expected, deadline)?;
-                let observed_route = observed_ipc_route(&connection);
                 self.finish_client(
                     expected,
                     ObservedPath::DirectIpc,
-                    observed_route,
                     ClientInner::Ipc(connection),
                     deadline,
                 )
             }
             Connect::ExplicitRelay { relay_url } => {
                 let settings = self.relay_client_settings_with_deadline(deadline)?;
-                let (client, route_uid) = self.connect_explicit_relay_http_client_with_deadline(
+                let client = self.connect_explicit_relay_http_client_with_deadline(
                     &relay_url,
                     expected.clone(),
                     settings.use_proxy,
@@ -823,7 +808,6 @@ impl Runtime {
                 self.finish_client(
                     expected,
                     ObservedPath::ExplicitRelay,
-                    ObservedRoute { route_uid },
                     ClientInner::Http(client, relay_default(settings.call_timeout_secs)?),
                     deadline,
                 )
@@ -836,7 +820,6 @@ impl Runtime {
         &self,
         expected: ExpectedRouteContract,
         observed_path: ObservedPath,
-        observed_route: ObservedRoute,
         inner: ClientInner,
         deadline: ConnectDeadline,
     ) -> Result<Client, Error> {
@@ -848,7 +831,6 @@ impl Runtime {
             inner: Arc::new(ClientConnection {
                 expected,
                 observed_path,
-                observed_route,
                 runtime: self.clone(),
                 path_default,
                 transport: inner,
@@ -928,8 +910,7 @@ impl Runtime {
                 ));
             }
 
-            match client.acquire_route_token_with_deadline(expected, &candidate.route_uid, deadline)
-            {
+            match client.acquire_route_with_deadline(expected, deadline) {
                 Ok(binding) => {
                     return Ok(PooledIpcClient { client, binding });
                 }
@@ -971,26 +952,21 @@ impl Runtime {
         self.ensure_active_with_deadline(deadline)?;
         let resolved = self.reconcile_relay_connection_with_deadline(resolved, deadline)?;
         match resolved {
-            RelayResolvedConnection::Http { client, route_uid } => self.finish_client(
+            RelayResolvedConnection::Http { client } => self.finish_client(
                 expected,
                 ObservedPath::RelayAwareRelay,
-                ObservedRoute { route_uid },
                 ClientInner::Http(client, relay_default(settings.call_timeout_secs)?),
                 deadline,
             ),
             RelayResolvedConnection::Ipc {
                 client, candidate, ..
             } => match self.acquire_relay_ipc(&candidate, &expected, deadline) {
-                Ok(connection) => {
-                    let observed_route = observed_ipc_route(&connection);
-                    self.finish_client(
-                        expected,
-                        ObservedPath::RelayAwareLocalIpc,
-                        observed_route,
-                        ClientInner::Ipc(connection),
-                        deadline,
-                    )
-                }
+                Ok(connection) => self.finish_client(
+                    expected,
+                    ObservedPath::RelayAwareLocalIpc,
+                    ClientInner::Ipc(connection),
+                    deadline,
+                ),
                 Err(error) if local_candidate_failure_is_terminal(&error) => Err(error),
                 Err(direct_error) => {
                     self.ensure_active_with_deadline(deadline)?;
@@ -1008,21 +984,18 @@ impl Runtime {
                     let resolved =
                         self.reconcile_relay_connection_with_deadline(resolved, deadline)?;
                     match resolved {
-                        RelayResolvedConnection::Http { client, route_uid } => self.finish_client(
+                        RelayResolvedConnection::Http { client } => self.finish_client(
                             expected,
                             ObservedPath::RelayAwareRelay,
-                            ObservedRoute { route_uid },
                             ClientInner::Http(client, relay_default(settings.call_timeout_secs)?),
                             deadline,
                         ),
                         RelayResolvedConnection::Ipc { candidate, .. } => {
                             let connection =
                                 self.acquire_relay_ipc(&candidate, &expected, deadline)?;
-                            let observed_route = observed_ipc_route(&connection);
                             self.finish_client(
                                 expected,
                                 ObservedPath::RelayAwareLocalIpc,
-                                observed_route,
                                 ClientInner::Ipc(connection),
                                 deadline,
                             )
@@ -1031,12 +1004,6 @@ impl Runtime {
                 }
             },
         }
-    }
-}
-
-fn observed_ipc_route(connection: &PooledIpcClient) -> ObservedRoute {
-    ObservedRoute {
-        route_uid: connection.binding.route_uid().to_string(),
     }
 }
 

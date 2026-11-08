@@ -79,7 +79,6 @@ pub struct RouteListResponse {
 #[serde(deny_unknown_fields)]
 pub struct RouteLookupRequest {
     pub expected: RouteContractWire,
-    pub observed_route_uid: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -94,15 +93,10 @@ pub enum RouteLookupResponse {
     },
     Removed {
         route_name: String,
-        route_uid: Option<String>,
     },
     Closed {
         route_name: String,
-        route_uid: String,
         reason: RouteStateReasonWire,
-    },
-    Stale {
-        current: RouteRecordWire,
     },
     ContractMismatch {
         current: RouteRecordWire,
@@ -218,36 +212,16 @@ fn validate_route_list_response(response: &RouteListResponse) -> Result<(), Stri
 
 fn validate_route_lookup_request(request: &RouteLookupRequest) -> Result<(), String> {
     validate_contract(&request.expected)?;
-    if let Some(uid) = &request.observed_route_uid {
-        validate_route_uid(uid)?;
-    }
     Ok(())
 }
 
 fn validate_route_lookup_response(response: &RouteLookupResponse) -> Result<(), String> {
     match response {
         RouteLookupResponse::Ready { current }
-        | RouteLookupResponse::Stale { current }
         | RouteLookupResponse::ContractMismatch { current } => validate_route_record(current),
         RouteLookupResponse::NotFound { route_name } => validate_route_name(route_name),
-        RouteLookupResponse::Removed {
-            route_name,
-            route_uid,
-        } => {
-            validate_route_name(route_name)?;
-            if let Some(uid) = route_uid {
-                validate_route_uid(uid)?;
-            }
-            Ok(())
-        }
-        RouteLookupResponse::Closed {
-            route_name,
-            route_uid,
-            ..
-        } => {
-            validate_route_name(route_name)?;
-            validate_route_uid(route_uid)
-        }
+        RouteLookupResponse::Removed { route_name }
+        | RouteLookupResponse::Closed { route_name, .. } => validate_route_name(route_name),
     }
 }
 

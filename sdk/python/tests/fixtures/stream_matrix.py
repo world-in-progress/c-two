@@ -266,8 +266,8 @@ class RustHostProcess:
         )
         try:
             assert self.process.stdout is not None
-            ready = readline_with_timeout(self.process.stdout, 30)
-            assert ready.startswith(f"READY address={address} route_uid="), ready
+            ready = readline_with_timeout(self.process.stdout, 30).rstrip("\r\n")
+            assert ready == f"READY address={address}", ready
         except BaseException:
             self.process.kill()
             self.process.communicate()

@@ -416,7 +416,6 @@ pub(crate) enum RelayResolvedConnection {
     },
     Http {
         client: RelayAwareHttpClient,
-        route_uid: String,
     },
 }
 
@@ -1672,7 +1671,6 @@ impl Runtime {
 
         Ok(RegisterOutcome {
             route_name,
-            route_uid,
             server_id: identity.server_id,
             server_instance_id: identity.server_instance_id,
             ipc_address: identity.ipc_address,
@@ -2448,9 +2446,7 @@ impl Runtime {
                     context,
                 })
             }
-            RelayResolvedTarget::Http { route_uid, .. } => {
-                Ok(RelayResolvedConnection::Http { client, route_uid })
-            }
+            RelayResolvedTarget::Http { .. } => Ok(RelayResolvedConnection::Http { client }),
         }
     }
 
@@ -2481,9 +2477,7 @@ impl Runtime {
                     context,
                 })
             }
-            RelayResolvedTarget::Http { route_uid, .. } => {
-                Ok(RelayResolvedConnection::Http { client, route_uid })
-            }
+            RelayResolvedTarget::Http { .. } => Ok(RelayResolvedConnection::Http { client }),
         }
     }
 
@@ -2495,7 +2489,7 @@ impl Runtime {
         call_timeout_secs: f64,
         remote_payload_chunk_size: u64,
         deadline: ConnectDeadline,
-    ) -> Result<(RelayAwareHttpClient, String), crate::Error> {
+    ) -> Result<RelayAwareHttpClient, crate::Error> {
         connect_stage_check(deadline, "relay_acquire")?;
         let client = RelayAwareHttpClient::new(
             relay_url,
@@ -2517,7 +2511,7 @@ impl Runtime {
             .map_err(|error| {
                 crate::normalize_http_error(error, crate::TransportPhase::PreDispatch)
             })? {
-            RelayResolvedTarget::Http { route_uid, .. } => Ok((client, route_uid)),
+            RelayResolvedTarget::Http { .. } => Ok(client),
             RelayResolvedTarget::Ipc { .. } => unreachable!("HTTP relay connect returned IPC"),
         }
     }
@@ -2586,9 +2580,7 @@ impl Runtime {
             .map_err(|error| {
                 crate::normalize_http_error(error, crate::TransportPhase::PreDispatch)
             })? {
-            RelayResolvedTarget::Http { route_uid, .. } => {
-                Ok(RelayResolvedConnection::Http { client, route_uid })
-            }
+            RelayResolvedTarget::Http { .. } => Ok(RelayResolvedConnection::Http { client }),
             RelayResolvedTarget::Ipc { .. } => {
                 unreachable!("HTTP-only reconciliation returned IPC")
             }
@@ -4257,11 +4249,16 @@ mod tests {
         if let Some((removal, replacement)) = replacement {
             assert!(removal.unwrap().local_removed);
             let replacement = replacement.unwrap();
-            assert_ne!(replacement.route_uid, old_scope.route_uid);
+            let replacement_uid = remaining_scope
+                .as_ref()
+                .expect("replacement scope")
+                .route_uid
+                .clone();
+            assert_ne!(replacement_uid, old_scope.route_uid);
             assert!(!replacement.relay_registered);
             assert_eq!(
                 remaining_identity,
-                Some(replacement.route_uid.clone()),
+                Some(replacement_uid.clone()),
                 "old final failure must preserve the Core-registered replacement"
             );
             assert!(
@@ -4274,7 +4271,7 @@ mod tests {
                     name: replacement.route_name,
                     server_id: replacement.server_id,
                     server_instance_id: replacement.server_instance_id,
-                    route_uid: replacement.route_uid,
+                    route_uid: replacement_uid,
                 }),
                 "old final failure must preserve the replacement's Core scope"
             );

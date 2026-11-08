@@ -1,4 +1,4 @@
-"""T3: actual generated Node clients retain route/owner bindings across IPC streams.
+"""T3: actual generated Node clients retain endpoint and owner identity across IPC streams.
 
 This focused fixture does not build or modify sibling repositories. It consumes
 already built packages (or the same three supplied tarballs as the TS matrix),
@@ -240,7 +240,8 @@ def test_generated_node_persistent_dynamic_acquire_and_identity_fences(
         bound = late["observations"][-1]
         assert bound["serverId"] == native_identity["server_id"]
         assert bound["serverInstanceId"] == native_identity["server_instance_id"]
-        assert bound["routeUid"] != first["observations"][-1]["routeUid"]
+        assert bound["routeName"] == "builder"
+        assert first["observations"][-1]["routeName"] == "manager"
         _ok(node.request("prepare", "builder"))
 
         removed = server.unregister_crm("builder")
@@ -253,12 +254,12 @@ def test_generated_node_persistent_dynamic_acquire_and_identity_fences(
 
         replacement = CountingResource()
         server.register_crm(Builder, replacement, name="builder")
-        _reject(node.request("prepare", "builder"))
-        _reject(node.request("call", "builder"))
-        assert replacement.calls == 0
-        fresh = _ok(node.request("call", "builder", transport="fresh"))
+        _ok(node.request("prepare", "builder"))
+        _ok(node.request("call", "builder"))
         assert replacement.calls == 1
-        assert fresh["observations"][-1]["routeUid"] != bound["routeUid"]
+        fresh = _ok(node.request("call", "builder", transport="fresh"))
+        assert replacement.calls == 2
+        assert fresh["observations"][-1]["routeName"] == "builder"
         healthy = _ok(node.request("call"))
         assert healthy["connects"] == 1 and manager.calls == 3
 
@@ -336,7 +337,7 @@ def test_generated_node_relay_local_late_route_reuses_physical_connection(
                 assert all(item["path"] == "RelayAwareLocalIpc" for item in observed)
                 assert all(item["serverId"] == identity["server_id"] for item in observed)
                 assert all(item["serverInstanceId"] == identity["server_instance_id"] for item in observed)
-                assert observed[0]["routeUid"] != observed[1]["routeUid"]
+                assert [item["routeName"] for item in observed] == ["manager", "builder"]
                 assert all(item["method"] == "GET" for item in late["http"]), late
                 assert len({item["connectionId"] for item in first["preparations"]}) == 1
                 connections = {item["connectionId"] for item in late["preparations"]}
@@ -454,7 +455,7 @@ def _gate_identity(result, identity, path):
     assert result["value"]["server_instance_id"] == identity["server_instance_id"], result
     observation = result["observations"][-1]
     assert observation["path"] == path, result
-    assert observation["routeUid"], result
+    assert "routeUid" not in observation, result
     if path != "RelayAwareHttp":
         assert observation["serverId"] == identity["server_id"], result
         assert observation["serverInstanceId"] == identity["server_instance_id"], result
@@ -523,7 +524,8 @@ def test_generated_node_closed_route_keeps_dispatched_sibling_and_first_cause(
             completed = node("finish-call", id="a")
             _gate_identity(completed, identity, path)
             assert completed["value"]["calls"] == 2
-            assert len({item["routeUid"] for item in completed["observations"] if item["routeName"] == "manager"}) == 1
+            assert any(item["routeName"] == "manager" for item in completed["observations"]), completed
+            assert all("routeUid" not in item for item in completed["observations"]), completed
             drained_b = node("finish-call", id="b")
             _gate_identity(drained_b, identity, path)
             assert drained_b["value"]["calls"] == 2
@@ -632,8 +634,8 @@ def test_generated_node_http_late_route_reuses_upstream_connection(
                 _gate_identity(final, identity, "RelayAwareHttp")
                 assert manager.calls == 2 and builder.calls == 1
                 assert [item["routeName"] for item in final["observations"]] == ["manager", "builder", "manager"]
-                assert first["observations"][-1]["routeUid"] == final["observations"][-1]["routeUid"]
-                assert late["observations"][-1]["routeUid"] != final["observations"][-1]["routeUid"]
+                assert first["observations"][-1]["routeName"] == final["observations"][-1]["routeName"] == "manager"
+                assert late["observations"][-1]["routeName"] == "builder"
                 assert final["physicalConnections"] == 0
                 assert connections.snapshot()["opened"] == initial["opened"]
                 missing = node(route="never-registered")
@@ -692,7 +694,7 @@ def test_generated_node_background_idle_eviction_and_concurrent_reconnect(
                 assert all(item["value"]["server_id"] == identity["server_id"] for item in rebuilt["outcomes"])
                 assert all(item["value"]["server_instance_id"] == identity["server_instance_id"] for item in rebuilt["outcomes"])
                 assert {item["path"] for item in rebuilt["observations"]} == {_GATE_PATHS[mode]}
-                assert len({item["routeUid"] for item in rebuilt["observations"]}) == 1
+                assert {item["routeName"] for item in rebuilt["observations"]} == {"manager"}
                 assert rebuilt["physicalConnections"] == 1, rebuilt
                 after_reconnect = connections.snapshot()
                 assert len(set(after_reconnect["opened"]) - set(after_idle["opened"])) == 1, after_reconnect
@@ -724,7 +726,7 @@ def test_generated_node_http_relay_idle_eviction_preserves_route(
                 rebuilt = _ok(node("call-many", count=8))
                 assert manager.calls == 9 and builder.calls == 0
                 assert rebuilt["physicalConnections"] == 0
-                assert {item["routeUid"] for item in rebuilt["observations"]} == {first["observations"][-1]["routeUid"]}
+                assert {item["routeName"] for item in rebuilt["observations"]} == {first["observations"][-1]["routeName"]}
                 assert all(item["path"] == "RelayAwareHttp" for item in rebuilt["observations"])
                 assert all(item["value"]["server_instance_id"] == identity["server_instance_id"] for item in rebuilt["outcomes"])
                 after = connections.snapshot()
@@ -737,13 +739,13 @@ def test_generated_node_http_relay_idle_eviction_preserves_route(
 
 @pytest.mark.parametrize("mode", ["direct", "relay-local", "http"])
 @pytest.mark.parametrize("transition", ["removed", "reregistered"])
-def test_generated_node_call_time_route_error_does_not_end_sibling(
+def test_generated_node_call_time_route_change_does_not_end_sibling(
     idle_node_project, node_gate_root, start_c3_relay, tmp_path, mode, transition,
 ):
     """Gates 2/4/6: change B after acquire; A and its carrier still finish.
 
     The test wrapper pauses native dispatch (HTTP: the real business POST)
-    after lookup/probe, exercising the server's call-time identity check.
+    after lookup/probe, exercising current registration admission.
     A stale HTTP POST is sent once; the next explicit call resolves again.
     """
     from tests.fixtures.typescript_idle_gates import GateResource, IdleGate, node_gate_client
@@ -769,16 +771,21 @@ def test_generated_node_call_time_route_error_does_not_end_sibling(
                     if transition == "reregistered":
                         server.register(IdleGate, replacement, name="builder")
                     _ok(node("resume"))
-                    refused = node("finish-call", id="b")
-                    error = _gate_error(refused)
-                    assert error["code"] == (704 if transition == "reregistered" else 701 if mode == "http" else 708), refused
-                    if mode == "http":
-                        assert refused["error"]["retrySafe"] is True, refused
-                        assert sum(item["method"] == "POST" for item in refused["http"]) == sum(item["method"] == "POST" for item in acquired["http"]), refused
+                    changed = node("finish-call", id="b")
+                    if transition == "reregistered" and mode != "http":
+                        _gate_identity(changed, identity, _GATE_PATHS[mode])
+                        assert changed["value"]["calls"] == 1, changed
+                        assert builder.calls == replacement.calls == 1
                     else:
-                        assert error["transportPhase"] == "pre_dispatch", refused
-                        assert refused["physicalConnections"] == 1, refused
-                    assert builder.calls == 1 and replacement.calls == 0
+                        error = _gate_error(changed)
+                        assert error["code"] == (704 if transition == "reregistered" else 701 if mode == "http" else 708), changed
+                        if mode == "http":
+                            assert changed["error"]["retrySafe"] is True, changed
+                            assert sum(item["method"] == "POST" for item in changed["http"]) == sum(item["method"] == "POST" for item in acquired["http"]), changed
+                        else:
+                            assert error["transportPhase"] == "pre_dispatch", changed
+                            assert changed["physicalConnections"] == 1, changed
+                        assert builder.calls == 1 and replacement.calls == 0
                 finally:
                     manager.release.set()
                     _ok(node("resume"))
@@ -788,14 +795,14 @@ def test_generated_node_call_time_route_error_does_not_end_sibling(
                 if transition == "reregistered":
                     fresh = node(route="builder", client="main" if mode == "http" else "fresh")
                     _gate_identity(fresh, identity, _GATE_PATHS[mode])
-                    assert fresh["observations"][-1]["routeUid"] != old_b["observations"][-1]["routeUid"]
-                    assert replacement.calls == 1
+                    assert fresh["observations"][-1]["routeName"] == old_b["observations"][-1]["routeName"] == "builder"
+                    assert replacement.calls == (1 if mode == "http" else 2)
                 else:
                     absent = node(route="builder", client="fresh")
                     assert _gate_error(absent)["code"] == (701 if mode != "direct" else 708), absent
                     assert builder.calls == 1
                 _save_gate(tmp_path, "call-time", mode=mode, transition=transition, identity=identity,
-                           refused=refused, completed=completed, connections=connections.snapshot(),
+                           changed=changed, completed=completed, connections=connections.snapshot(),
                            old_business_calls=builder.calls, replacement_calls=replacement.calls)
     finally:
         replacement.close()
@@ -876,7 +883,7 @@ def test_generated_node_real_peer_end_is_uncertain_without_replay(
                         assert old_proxy["error"]["transportPhase"] == "pre_dispatch", old_proxy
                     recovered = node(route="builder", client="fresh")
                     _gate_identity(recovered, new_identity, _GATE_PATHS[mode])
-                    assert recovered["observations"][-1]["routeUid"] != old_b["observations"][-1]["routeUid"]
+                    assert recovered["value"]["server_instance_id"] != old_b["value"]["server_instance_id"]
                     new_stats = new.request()
                     assert new_stats["resources"]["manager"]["calls"] == 0, new_stats
                     assert new_stats["resources"]["manager"]["stream_calls"] == 0, new_stats
@@ -937,7 +944,7 @@ def test_generated_node_old_candidate_cannot_discard_restarted_relay_owner(
                     assert after_old["resources"]["manager"]["calls"] == 0, after_old
                     kept = node(route="builder")
                     _gate_identity(kept, new_identity, _GATE_PATHS[mode])
-                    assert kept["observations"][-1]["routeUid"] == fresh["observations"][-1]["routeUid"]
+                    assert kept["observations"][-1]["routeName"] == fresh["observations"][-1]["routeName"] == "builder"
                     if mode == "relay-local":
                         assert kept["preparations"][-1]["connectionId"] == fresh["preparations"][-1]["connectionId"]
                     kept_stats = new.request()
@@ -945,7 +952,7 @@ def test_generated_node_old_candidate_cannot_discard_restarted_relay_owner(
                     assert kept_stats["resources"]["builder"]["calls"] == 2
                     current = node(client="main" if mode == "http" else "fresh")
                     _gate_identity(current, new_identity, _GATE_PATHS[mode])
-                    assert current["observations"][-1]["routeUid"] != first["observations"][-1]["routeUid"]
+                    assert current["value"]["server_instance_id"] != first["value"]["server_instance_id"]
                     assert new.request()["resources"]["manager"]["calls"] == 1
                     _save_gate(tmp_path, "restart", mode=mode, old_identity=identity, new_identity=new_identity,
                                refused=refused, fresh=fresh, kept=kept, current=current,

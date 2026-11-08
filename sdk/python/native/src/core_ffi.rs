@@ -12,7 +12,7 @@ use pyo3::types::{PyBytes, PyDict, PyList};
 use c2_core::memory::LocalCopyGuard;
 use c2_core::{
     CallOptions, CallTimeout, Client, EncodedService, EncodedStreamService, HeldResponse,
-    LifecycleError, ObservedPath, ObservedRoute, PreparedCall, ServerFailure,
+    LifecycleError, ObservedPath, PreparedCall, ServerFailure,
 };
 use c2_error::{C2Error, ErrorCode};
 
@@ -24,7 +24,6 @@ pub(crate) struct PyCoreClient {
     inner: Mutex<Option<Client>>,
     route_name: String,
     observed_path: ObservedPath,
-    observed_route: ObservedRoute,
     local_copy_tracker: PyLocalCopyTracker,
 }
 
@@ -32,12 +31,10 @@ impl PyCoreClient {
     pub(crate) fn new(client: Client, local_copy_tracker: PyLocalCopyTracker) -> Self {
         let route_name = client.expected_route().route_name.clone();
         let observed_path = client.observed_path();
-        let observed_route = client.observed_route().clone();
         Self {
             inner: Mutex::new(Some(client)),
             route_name,
             observed_path,
-            observed_route,
             local_copy_tracker,
         }
     }
@@ -245,11 +242,6 @@ impl PyCoreClient {
             ObservedPath::RelayAwareLocalIpc => "relay_aware_local_ipc",
             ObservedPath::RelayAwareRelay => "relay_aware_relay",
         }
-    }
-
-    #[getter]
-    fn route_uid(&self) -> &str {
-        &self.observed_route.route_uid
     }
 
     #[pyo3(signature = (*, timeout=inherit_timeout()))]

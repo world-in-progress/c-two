@@ -1689,7 +1689,6 @@ mod lifecycle_tests {
             read_raw_frame(&mut peer).await;
             let identity = c2_wire::rpc::RouteCallIdentity {
                 route_name: expected.route_name,
-                route_uid: registration.outcome().route_uid.clone(),
                 crm_ns: expected.crm_ns,
                 crm_name: expected.crm_name,
                 crm_ver: expected.crm_ver,

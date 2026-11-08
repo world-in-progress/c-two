@@ -133,13 +133,13 @@ pub(crate) async fn read_ipc_route_contract(
         .await
         .map_err(|err| attestation_error_from_ipc(route_name, err))?;
     Ok(AttestedRouteContract {
-        route_uid: binding.route_uid().to_string(),
+        route_uid: binding.route_uid,
         crm_ns: contract.crm_ns,
         crm_name: contract.crm_name,
         crm_ver: contract.crm_ver,
         abi_hash: contract.abi_hash,
         signature_hash: contract.signature_hash,
-        max_payload_size: binding.max_payload_size(),
+        max_payload_size: binding.max_payload_size,
     })
 }
 
@@ -159,7 +159,7 @@ pub(crate) async fn attest_ipc_route_contract(
         .attest_route_for_registration(claimed.expected)
         .await
         .map_err(|err| attestation_error_from_ipc(route_name, err))?;
-    let max_payload_size = binding.max_payload_size();
+    let max_payload_size = binding.max_payload_size;
     if claimed.max_payload_size != max_payload_size {
         return Err(RouteAttestationError::ContractMismatch {
             reason: format!(
@@ -169,7 +169,7 @@ pub(crate) async fn attest_ipc_route_contract(
         });
     }
     Ok(AttestedRouteContract {
-        route_uid: binding.route_uid().to_string(),
+        route_uid: binding.route_uid,
         crm_ns: claimed.expected.crm_ns.clone(),
         crm_name: claimed.expected.crm_name.clone(),
         crm_ver: claimed.expected.crm_ver.clone(),
@@ -185,7 +185,7 @@ pub(crate) async fn attest_ipc_pending_route_contract(
     claimed: ClaimedRouteContract<'_>,
 ) -> Result<AttestedRouteContract, RouteAttestationError> {
     let route_name = claimed.expected.route_name.as_str();
-    let (contract, binding) = match client
+    let contract = match client
         .acquire_pending_route_attestation(route_name, registration_token)
         .await
     {
@@ -195,7 +195,7 @@ pub(crate) async fn attest_ipc_pending_route_contract(
             return Err(attestation_error_from_ipc(route_name, err));
         }
     };
-    let max_payload_size = binding.max_payload_size();
+    let max_payload_size = contract.max_payload_size;
     if c2_contract::validate_expected_route_contract(claimed.expected).is_err() {
         return Err(RouteAttestationError::ContractMismatch {
             reason: format!(
@@ -203,7 +203,15 @@ pub(crate) async fn attest_ipc_pending_route_contract(
             ),
         });
     }
-    if claimed.expected != &contract {
+    let expected = ExpectedRouteContract {
+        route_name: contract.route_name.clone(),
+        crm_ns: contract.crm_ns.clone(),
+        crm_name: contract.crm_name.clone(),
+        crm_ver: contract.crm_ver.clone(),
+        abi_hash: contract.abi_hash.clone(),
+        signature_hash: contract.signature_hash.clone(),
+    };
+    if claimed.expected != &expected {
         return Err(RouteAttestationError::ContractMismatch {
             reason: format!(
                 "IPC upstream pending route '{route_name}' CRM contract mismatch: claimed {}/{}/{} hashes={}/{}, got {}/{}/{} hashes={}/{}",
@@ -229,7 +237,7 @@ pub(crate) async fn attest_ipc_pending_route_contract(
         });
     }
     Ok(AttestedRouteContract {
-        route_uid: binding.route_uid().to_string(),
+        route_uid: contract.route_uid,
         crm_ns: contract.crm_ns,
         crm_name: contract.crm_name,
         crm_ver: contract.crm_ver,

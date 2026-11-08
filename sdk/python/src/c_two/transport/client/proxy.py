@@ -197,13 +197,6 @@ class CRMProxy:
         return self._client.observed_path
 
     @property
-    def route_uid(self) -> str:
-        """Immutable route identity observed when this remote proxy connected."""
-        if self._mode == 'thread':
-            raise RuntimeError('thread-local proxy has no remote route token')
-        return self._client.route_uid
-
-    @property
     def local_copy_tracker(self) -> Any:
         """Native local-copy tracker for this process session."""
         return self._local_copy_tracker

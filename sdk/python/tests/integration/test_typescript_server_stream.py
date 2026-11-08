@@ -123,8 +123,8 @@ class NodeRustHost:
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, bufsize=1,
         )
-        ready = readline_with_timeout(self.process.stdout, 30)
-        assert ready.startswith(f"READY address={address} route_uid="), ready
+        ready = readline_with_timeout(self.process.stdout, 30).rstrip("\r\n")
+        assert ready == f"READY address={address}", ready
 
     def stats(self):
         self.process.stdin.write("stats\n")

@@ -447,7 +447,7 @@ impl Fixture {
             descriptor.abi_hash().into(),
             descriptor.signature_hash().into(),
             server.config().max_payload_size,
-            binding.route_uid().to_string(),
+            binding.route_uid,
             None
         ) {
             RegisterCommitResult::Registered { entry } => entry,

@@ -1166,7 +1166,6 @@ async fn reserved_route_pending_cannot_activate_after_generation_change() {
     let server = &fixture.server;
     let route = admission_route(server, "grid", ConcurrencyMode::Parallel).await;
     let mut identity = call_identity("grid");
-    identity.route_uid = route.route_uid.clone();
     let request = reserve_accepted_route_execution(server, &identity, 0, CallMode::Unary)
         .ok()
         .expect("route reservation");
@@ -1247,9 +1246,8 @@ async fn admission_global_queue_rejects_old_route_guard() {
 async fn admission_keeps_contract_identity_and_method_error_priority() {
     let fixture = admission_fixture();
     let server = &fixture.server;
-    let route = admission_route(server, "grid", ConcurrencyMode::Parallel).await;
-    let mut identity = call_identity("grid");
-    identity.route_uid = route.route_uid.clone();
+    let _route = admission_route(server, "grid", ConcurrencyMode::Parallel).await;
+    let identity = call_identity("grid");
     server.close_business_admission("test").await;
     assert!(matches!(
         reserve_accepted_route_execution(server, &identity, 0, CallMode::Unary),
@@ -1259,13 +1257,7 @@ async fn admission_keeps_contract_identity_and_method_error_priority() {
         reserve_accepted_route_execution(server, &identity, 99, CallMode::Unary),
         Err(RouteAdmissionError::UnknownMethod { .. })
     ));
-    let mut wrong = identity.clone();
-    wrong.route_uid.push_str("-stale");
-    assert!(matches!(
-        reserve_accepted_route_execution(server, &wrong, 99, CallMode::Unary),
-        Err(RouteAdmissionError::RouteStale { .. })
-    ));
-    wrong = identity;
+    let mut wrong = identity;
     wrong.abi_hash = "0".repeat(64);
     assert!(matches!(
         reserve_accepted_route_execution(server, &wrong, 99, CallMode::Unary),
@@ -1288,7 +1280,6 @@ async fn admission_rejects_routes_built_for_another_host() {
 fn call_identity(name: &str) -> c2_wire::rpc::RouteCallIdentity {
     c2_wire::rpc::RouteCallIdentity {
         route_name: name.into(),
-        route_uid: format!("{name}-uid-0001"),
         crm_ns: "test.grid".into(),
         crm_name: "Grid".into(),
         crm_ver: "0.1.0".into(),
@@ -1831,74 +1822,99 @@ async fn same_error_code_distinguishes_admission_from_resource_failure() {
     assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
 
+// ADR 0004: “同一个端点或 relay 上的重新注册按名字接纳，不报错。”
 #[tokio::test]
-async fn inline_dispatch_rejects_stale_route_token_before_callback() {
+async fn inline_dispatch_uses_current_registration_and_distinguishes_removed_names() {
     use std::sync::atomic::{AtomicUsize, Ordering};
-
-    struct CountingCallback {
+    struct Counted {
         calls: Arc<AtomicUsize>,
+        reply: &'static [u8],
     }
-
-    impl CrmCallback for CountingCallback {
+    impl CrmCallback for Counted {
         fn invoke(
             &self,
             _: &str,
             _: u16,
-            _request: Vec<u8>,
-            _response_pool: Arc<crate::ResponsePool>,
+            _: Vec<u8>,
+            _: Arc<crate::ResponsePool>,
         ) -> Result<ResponseMeta, CrmError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            Ok(ResponseMeta::Inline(b"should-not-run".to_vec()))
+            Ok(ResponseMeta::Inline(self.reply.to_vec()))
         }
     }
-
     let server =
-        Arc::new(test_server_new("ipc://stale_route_uid", ServerIpcConfig::default()).unwrap());
-    let calls = Arc::new(AtomicUsize::new(0));
-    let mut route = make_host_route(&server, "grid");
-    route.callback = Arc::new(CountingCallback {
-        calls: Arc::clone(&calls),
+        Arc::new(test_server_new("ipc://route_name_identity", ServerIpcConfig::default()).unwrap());
+    let old_calls = Arc::new(AtomicUsize::new(0));
+    let new_calls = Arc::new(AtomicUsize::new(0));
+    let mut old = make_host_route(&server, "grid");
+    old.callback = Arc::new(Counted {
+        calls: old_calls.clone(),
+        reply: b"old",
     });
-    server.register_route(route).await.unwrap();
-
-    let mut identity = call_identity("grid");
-    identity.route_uid = "retired-grid-uid".into();
-
-    let frame = c2_wire::rpc::encode_open_frame(
-        42,
-        &identity,
-        0,
-        c2_wire::rpc::CallMode::Unary,
-        c2_wire::rpc::ValuePart::whole(c2_wire::rpc::ValueStorage::Inline(&[])),
-    )
-    .unwrap();
-    let (request_id, _flags, reply_payload) = call_over_connection(&server, &frame).await;
-
-    assert_eq!(request_id, 42);
-    match decode_test_call_end(&reply_payload, 0).unwrap().0 {
-        TestReply::Error(err) => {
-            let decoded = C2Error::from_wire_bytes(&err)
-                .unwrap()
-                .expect("route stale must be encoded as a C2 error");
-            assert_eq!(decoded.code, ErrorCode::RouteStale);
-            assert!(decoded.message.contains("stale route token"));
-            assert!(decoded.message.contains("retired-grid-uid"));
+    server.register_route(old).await.unwrap();
+    let (mut client, stream) = isolated_pair().await;
+    let handler = tokio::spawn(handle_connection(server.clone(), stream));
+    handshake_test_client(&mut client).await;
+    let identity = call_identity("grid");
+    for (id, name, expected) in [
+        (1, "grid", None),
+        (2, "grid", Some(ErrorCode::ResourceRemoved)),
+        (3, "never", Some(ErrorCode::ResourceNotFound)),
+        (4, "grid", None),
+    ] {
+        let target = if name == "grid" {
+            identity.clone()
+        } else {
+            call_identity(name)
+        };
+        let frame = c2_wire::rpc::encode_open_frame(
+            id,
+            &target,
+            0,
+            CallMode::Unary,
+            c2_wire::rpc::ValuePart::whole(c2_wire::rpc::ValueStorage::Inline(&[])),
+        )
+        .unwrap();
+        client.write_all(&frame).await.unwrap();
+        let (rid, _, payload) = read_reply_frame(&mut client).await;
+        assert_eq!(rid, id);
+        if let Some(code) = expected {
+            assert_call_end_status(&payload, c2_wire::rpc::CallStatus::NotExecuted);
+            let TestReply::Error(bytes) = decode_test_call_end(&payload, 0).unwrap().0 else {
+                panic!("expected refusal")
+            };
+            let error = C2Error::from_wire_bytes(&bytes).unwrap().unwrap();
+            assert_eq!(error.code, code);
             assert_eq!(
-                decoded.details.get("route").map(String::as_str),
-                Some("grid")
+                error.details,
+                std::collections::BTreeMap::from([("route".into(), name.into())])
             );
-            assert_eq!(
-                decoded.details.get("route_uid").map(String::as_str),
-                Some("retired-grid-uid")
-            );
-            assert_eq!(
-                decoded.details.get("current_route_uid").map(String::as_str),
-                Some(call_identity("grid").route_uid.as_str())
-            );
+            assert!(!error.message.contains("uid"));
+            assert_eq!(old_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(new_calls.load(Ordering::SeqCst), 0);
+        } else {
+            assert_call_end_status(&payload, c2_wire::rpc::CallStatus::Success);
+            assert!(payload.ends_with(if id == 1 { b"old" } else { b"new" }));
         }
-        other => panic!("expected route-stale error reply, got {other:?}"),
+        if id == 1 {
+            assert!(server.unregister_route("grid").await);
+        }
+        if id == 3 {
+            let mut new = make_host_route(&server, "grid");
+            new.callback = Arc::new(Counted {
+                calls: new_calls.clone(),
+                reply: b"new",
+            });
+            server.register_route(new).await.unwrap();
+        }
     }
-    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert_eq!(old_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(new_calls.load(Ordering::SeqCst), 1);
+    drop(client);
+    tokio::time::timeout(Duration::from_secs(2), handler)
+        .await
+        .unwrap()
+        .unwrap();
 }
 
 #[tokio::test]

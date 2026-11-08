@@ -36,7 +36,7 @@ export interface C2ServerIdentity {
   readonly serverInstanceId: string;
 }
 
-export interface C2TransportObservation extends C2RouteToken {
+export interface C2TransportObservation {
   readonly path: C2ObservedPath;
   readonly routeName: string;
   readonly requests: number;
@@ -86,8 +86,8 @@ export interface C2NativeCall {
 }
 
 export interface C2NativeEndpointContext {
-  prepare(routeName: string, contract: C2RouteContractIdentity, expectedRouteToken?: C2RouteToken): Promise<{
-    serverId: string; serverInstanceId: string; routeUid: string; connectionId: bigint | string;
+  prepare(routeName: string, contract: C2RouteContractIdentity): Promise<{
+    serverId: string; serverInstanceId: string; connectionId: bigint | string;
   }>;
   beginCall(routeName: string, method: string, serverStream: boolean, timeoutMs: number | null): C2NativeCall;
   deactivate(): void;
@@ -116,7 +116,7 @@ export interface C2IpcTransportOptions<Payload extends C2ResponsePayload = C2Byt
 }
 
 export interface C2IpcEncodedTransport<Payload extends C2ResponsePayload = C2ByteArray> extends C2StreamEncodedClientTransport {
-  prepare(routeName: string, contract: C2ContractIdentity, expectedRouteToken?: C2RouteToken): Promise<void>;
+  prepare(routeName: string, contract: C2ContractIdentity): Promise<void>;
   call(routeName: string, contract: C2ContractIdentity, method: string, encode: () => C2ByteArray): Promise<Payload>;
   close(): Promise<void>;
 }
@@ -574,14 +574,14 @@ export function createIpcEncodedTransport<Payload extends C2ResponsePayload = C2
     }
     return endpointPromise;
   };
-  const prepare = async (routeName: string, contract: C2ContractIdentity, expectedRouteToken?: C2RouteToken) => {
+  const prepare = async (routeName: string, contract: C2ContractIdentity) => {
     const routeContract = requireRouteContractIdentity(contract);
     const native = await endpoint();
-    const binding = await native.prepare(routeName, routeContract, expectedRouteToken).catch(error => { throw projectNativeError(error); });
+    const binding = await native.prepare(routeName, routeContract).catch(error => { throw projectNativeError(error); });
     return { native, binding };
   };
   return {
-    async prepare(routeName, contract, expectedRouteToken): Promise<void> { await prepare(routeName, contract, expectedRouteToken); },
+    async prepare(routeName, contract): Promise<void> { await prepare(routeName, contract); },
     async call(routeName, contract, method, encode): Promise<Payload> {
       const { native, binding } = await prepare(routeName, contract);
       const call = native.beginCall(routeName, method, false, callTimeoutMs);
@@ -598,7 +598,7 @@ export function createIpcEncodedTransport<Payload extends C2ResponsePayload = C2
         try { result = copyResponsePayloadToAllocator(response, allocator); }
         finally { if (allocator !== undefined) response.release(); }
         return observeTransportResponse(result, observe, {
-          path: observationPath, routeName, routeUid: binding.routeUid,
+          path: observationPath, routeName,
           serverId: binding.serverId, serverInstanceId: binding.serverInstanceId,
           ipcAddress: address, requests, responses,
         });
@@ -728,7 +728,6 @@ export function createHttpRelayEncodedTransport<Payload extends C2ResponsePayloa
       return observeTransportResponse(response, observe, {
         path: "ExplicitRelay",
         routeName,
-        routeUid: route.routeUid,
         relayUrl: route.relayUrl,
         requests,
         responses,
@@ -809,7 +808,7 @@ export function createRelayAwareHttpEncodedTransport<Payload extends C2ResponseP
         if (route === undefined || ipcOptions === undefined) throw new C2UnsupportedCallModeError();
         const transport = localTransportFor(route);
         state.failure = error => { discardLocalTransport(route, transport, error); };
-        try { await transport.prepare(routeName, routeContract, { routeUid: route.routeUid }); }
+        try { await transport.prepare(routeName, routeContract); }
         catch (error) {
           discardLocalTransport(route, transport, error);
           throw error;
@@ -866,7 +865,7 @@ export function createRelayAwareHttpEncodedTransport<Payload extends C2ResponseP
           const localTokenKey = routeTokenKey(localRoute);
           const localTransport = localTransportFor(localRoute);
           try {
-            await localTransport.prepare(routeName, routeContract, { routeUid: localRoute.routeUid });
+            await localTransport.prepare(routeName, routeContract);
           } catch (error) {
             const closing = discardLocalTransport(localRoute, localTransport, error);
             if (localCandidateFailureIsTerminal(error)) {
@@ -882,7 +881,7 @@ export function createRelayAwareHttpEncodedTransport<Payload extends C2ResponseP
               (route) => !excludedLocalRouteTokens.has(routeTokenKey(route)),
             );
             if (distinctRoutes.length === 0) {
-              throw samePathFallbackDeniedError(routeName, localRoute, firstLocalFailure);
+              throw samePathFallbackDeniedError(routeName, firstLocalFailure);
             }
             continue;
           }
@@ -897,7 +896,7 @@ export function createRelayAwareHttpEncodedTransport<Payload extends C2ResponseP
           (route) => !excludedLocalRouteTokens.has(routeTokenKey(route)),
         );
         if (httpRoutes.length === 0 && excludedLocalRouteTokens.size > 0) {
-          throw samePathFallbackDeniedError(routeName, routes[0], firstLocalFailure);
+          throw samePathFallbackDeniedError(routeName, firstLocalFailure);
         }
         const orderedRoutes = orderRelayRoutes(httpRoutes, currentRelayByCacheKey.get(cacheKey), excludedRoutes);
         if (orderedRoutes.length === 0) {
@@ -947,7 +946,6 @@ export function createRelayAwareHttpEncodedTransport<Payload extends C2ResponseP
             return observeTransportResponse(result, observe, {
               path: "RelayAwareHttp",
               routeName,
-              routeUid: route.routeUid,
               relayUrl,
               requests,
               responses,
@@ -1694,7 +1692,6 @@ function localCandidateFailureIsTerminal(error: unknown): boolean {
 
 function samePathFallbackDeniedError(
   routeName: string,
-  route: C2RelayRouteInfo,
   firstCause?: unknown,
 ): C2HttpRelayError {
   const denied = new C2HttpRelayError(
@@ -1705,7 +1702,6 @@ function samePathFallbackDeniedError(
       message: "same-path fallback denied after verified local IPC failure",
       details: {
         route: routeName,
-        route_uid: route.routeUid,
       },
     }),
   );

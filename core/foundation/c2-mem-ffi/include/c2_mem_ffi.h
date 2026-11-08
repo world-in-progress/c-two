@@ -96,14 +96,13 @@ C2MemFfiStatus c2_mem_ffi_client_domain_new(const C2MemFfiLocalEndpointContext *
 void c2_mem_ffi_client_domain_free(C2MemFfiClientDomain *domain);
 C2MemFfiStatus c2_mem_ffi_client_domain_stats(const C2MemFfiClientDomain *domain, C2MemFfiResult **out);
 /* new performs no I/O. prepare connects using Rust's sole IPC reader/writer,
- * validates the complete contract and pins server identity and route UID.
+ * validates the complete contract and pins server identity.
  * JSON options/contract are UTF-8. Endpoint options are connectTimeoutMs,
  * expectedServerIdentity; transport policy belongs to the client domain.
- * prepare takes an optional expected route token JSON ({"routeUid":"..."});
- * NULL omits it. All input strings are borrowed for the call.
+ * All input strings are borrowed for the call.
  * prepare/close complete asynchronously. Deactivate stops new calls only. */
 C2MemFfiStatus c2_mem_ffi_endpoint_context_new(const C2MemFfiClientDomain *domain, const char *address, const char *options_json, C2MemFfiEndpointContext **out, C2MemFfiError **error);
-C2MemFfiStatus c2_mem_ffi_endpoint_context_prepare(const C2MemFfiEndpointContext *endpoint, const char *route, const char *contract_json, const char *expected_route_token_json, C2MemFfiComplete complete, void *user);
+C2MemFfiStatus c2_mem_ffi_endpoint_context_prepare(const C2MemFfiEndpointContext *endpoint, const char *route, const char *contract_json, C2MemFfiComplete complete, void *user);
 C2MemFfiStatus c2_mem_ffi_endpoint_context_deactivate(const C2MemFfiEndpointContext *endpoint);
 C2MemFfiStatus c2_mem_ffi_endpoint_context_close(const C2MemFfiEndpointContext *endpoint, C2MemFfiComplete complete, void *user);
 void c2_mem_ffi_endpoint_context_free(C2MemFfiEndpointContext *endpoint);

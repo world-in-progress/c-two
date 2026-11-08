@@ -25,7 +25,8 @@ class JournalResource(Resource):
     def reply(self, method: str, value: str) -> dict:
         reply = super().reply(method, value)
         with self.journal_lock, self.journal.open("a", encoding="utf-8") as output:
-            output.write(json.dumps({"method": method, "calls": reply["calls"]}) + "\n")
+            output.write(json.dumps({"method": method, "resource": self.label,
+                                     "calls": reply["calls"]}) + "\n")
         return reply
 
 
@@ -51,6 +52,16 @@ def serve(route: str, server_id: str, anchor: str, journal: str) -> None:
             if operation == "snapshot":
                 events.drain()
                 print(json.dumps({"calls": resource.snapshot(), "connections": events.records}), flush=True)
+            elif operation == "unregister":
+                runtime.unregister(route)
+                print(json.dumps({"unregistered": True}), flush=True)
+            elif operation == "register":
+                resource = JournalResource(identity, f"{route}:replacement", Path(journal))
+                runtime.register(
+                    Lifecycle, resource, name=route,
+                    concurrency=cc.ConcurrencyConfig(mode="parallel", max_workers=4),
+                )
+                print(json.dumps({"registered": True, "identity": identity}), flush=True)
             elif operation == "stop":
                 resource.release.set()
                 outcome = runtime.shutdown(timeout=10)

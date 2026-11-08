@@ -457,7 +457,7 @@ class RustHost:
                 raise AssertionError(
                     f"Rust matrix host address mismatch: {ready!r}"
                 )
-            self.route_uid = ready["route_uid"]
+            self.server_instance_id = ready["server_instance_id"]
         except BaseException:
             self._kill_and_collect()
             raise

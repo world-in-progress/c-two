@@ -313,7 +313,7 @@ async fn stale_acquire_disconnects_exact_old_client_before_same_endpoint_replace
                 .unwrap_or_else(|_| panic!("same endpoint replacement acquisition"));
         let replacement = replacement_lease.client();
         assert!(!Arc::ptr_eq(&replacement, &old_client));
-        assert_eq!(binding.route_uid(), new_entry.route_uid);
+        assert_eq!(binding.route_name(), new_entry.name);
         let reply = tokio::time::timeout(STEP, replacement.call_bound(&binding, "ping", &[]))
             .await
             .unwrap()

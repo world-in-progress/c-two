@@ -574,9 +574,9 @@ def test_generated_typescript_calls_real_hosts(
     }
     observations = receipt["observations"]
     assert len(observations) == expected_calls
-    route_uids = {observation["routeUid"] for observation in observations}
+    assert {observation["routeName"] for observation in observations} == {route_name}
+    assert all("routeUid" not in observation for observation in observations)
     observed_paths = {observation["path"] for observation in observations}
-    assert len(route_uids) == 1
     assert len(observed_paths) == 1
 
     if row_id == DIGEST_ROW_ID:
@@ -604,7 +604,7 @@ def test_generated_typescript_calls_real_hosts(
         "contract_release_ref": deepcopy(facts.release_ref),
         "fastdb_spec_sha256": facts.fastdb_spec_sha256,
         "route": {
-            "uid": next(iter(route_uids)),
+            "name": route_name,
         },
         "logical_result_sha256": receipt["logicalResultSha256"],
         "path_counters": {
@@ -675,10 +675,10 @@ def test_typescript_real_calls_write_strict_development_receipt(
         Path(configured)
         if configured
         else REPOSITORY
-        / "target/local-rc/typescript-real-call-receipt.v2.json"
+        / "target/local-rc/typescript-real-call-receipt.v3.json"
     )
     receipt = {
-        "schema": "c-two.typescript-real-call-receipt.v2",
+        "schema": "c-two.typescript-real-call-receipt.v3",
         "evidence_stage": evidence_stage,
         "runtime": {
             "node_version": typescript_artifacts.node_version,

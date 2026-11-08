@@ -3,7 +3,6 @@ pub use c2_ipc::pool::IpcClientCloseDetail;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RegisterOutcome {
     pub route_name: String,
-    pub route_uid: String,
     pub server_id: String,
     pub server_instance_id: String,
     pub ipc_address: String,

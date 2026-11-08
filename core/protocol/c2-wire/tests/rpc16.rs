@@ -12,7 +12,6 @@ use c2_wire::rpc::{
 fn identity() -> RouteCallIdentity<&'static str> {
     RouteCallIdentity {
         route_name: "grid",
-        route_uid: "uid",
         crm_ns: "ns",
         crm_name: "Grid",
         crm_ver: "1",

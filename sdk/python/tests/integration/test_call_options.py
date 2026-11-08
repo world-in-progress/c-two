@@ -131,7 +131,8 @@ def test_concurrent_views_share_connection_with_independent_timeouts_and_close(i
     connection, resource = ipc_connection
     short = cc.with_call_options(connection, timeout=0.05)
     long = cc.with_call_options(connection, timeout=2)
-    assert short.client.route_uid == long.client.route_uid == connection.client.route_uid
+    assert len({cc.observe.connection_observation(proxy).connection_id
+                for proxy in (short, long, connection)}) == 1
     try:
         with ThreadPoolExecutor(max_workers=2) as executor:
             slow = executor.submit(short.echo, 'slow', timeout=0.2)

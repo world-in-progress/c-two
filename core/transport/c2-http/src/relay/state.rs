@@ -133,7 +133,6 @@ fn is_route_local_acquire_failure(error: &c2_ipc::IpcError) -> bool {
             | c2_ipc::IpcError::RouteNotFound(_)
             | c2_ipc::IpcError::RouteRemoved { .. }
             | c2_ipc::IpcError::RouteClosed { .. }
-            | c2_ipc::IpcError::RouteStale { .. }
     )
 }
 
@@ -495,14 +494,10 @@ impl RelayState {
         }
         #[cfg(test)]
         Self::pause_for_test(&self.acquire_lookup_seam).await;
-        let binding = match lease
-            .client()
-            .acquire_route_token(&expected_contract, &expected.route_uid)
-            .await
-        {
+        let binding = match lease.client().acquire_route(&expected_contract).await {
             Ok(binding) => binding,
             Err(error) => {
-                // Admission or token rejection concerns only this route. The
+                // Admission rejection concerns only this route. The
                 // endpoint may still be serving another lease's inflight call.
                 // Identity/transport/protocol failures retain exact-client eviction.
                 if !is_route_local_acquire_failure(&error)
@@ -595,15 +590,7 @@ impl RelayState {
         if !authoritative && let Err(error) = self.with_current_upstream_route(expected, || ()) {
             return error;
         }
-        match failure {
-            UpstreamAcquireError::Unreachable {
-                error: c2_ipc::IpcError::RouteStale { .. },
-                ..
-            } => UpstreamAcquireError::Stale {
-                route: expected.clone(),
-            },
-            other => other,
-        }
+        failure
     }
     #[cfg(test)]
     pub(crate) fn get_address(&self, name: &str) -> Option<String> {
@@ -1201,7 +1188,9 @@ mod tests {
                 acquire_step(probe.connect()).await.unwrap();
                 for name in ["a", "b"] {
                     let contract = probe.route_contract(name).unwrap();
-                    let binding = acquire_step(probe.acquire_route(&contract)).await.unwrap();
+                    let binding = acquire_step(probe.attest_route_for_registration(&contract))
+                        .await
+                        .unwrap();
                     let entry = match test_commit_registration!(
                         &fixture.state,
                         name.into(),
@@ -1213,8 +1202,8 @@ mod tests {
                         TEST_CRM_VER.into(),
                         TEST_ABI_HASH.into(),
                         TEST_SIGNATURE_HASH.into(),
-                        binding.max_payload_size(),
-                        binding.route_uid().into(),
+                        binding.max_payload_size,
+                        binding.route_uid,
                         None
                     ) {
                         RegisterCommitResult::Registered { entry } => entry,
@@ -1284,60 +1273,74 @@ mod tests {
         Reregistered,
     }
 
-    async fn exact_token_transition(transition: AcquireTransition) {
+    // ADR 0004: same-endpoint re-registration is admitted by name and contract.
+    async fn name_acquire_transition(transition: AcquireTransition) {
         use futures::FutureExt;
         let fixture = AcquireFixture::new().await;
-        let mut exact = fixture.client();
-        let mut ordinary = fixture.client();
+        let mut client = fixture.client();
         let result = std::panic::AssertUnwindSafe(async {
-            acquire_step(exact.connect()).await.unwrap();
-            acquire_step(ordinary.connect()).await.unwrap();
+            acquire_step(client.connect()).await.unwrap();
             let contract = expected_contract_for_route(&fixture.entries[1]);
-            let old = acquire_step(exact.acquire_route(&contract)).await.unwrap();
-            let ready = acquire_step(exact.acquire_route_token(&contract, old.route_uid())).await.unwrap();
-            assert_eq!(ready.route_uid(), old.route_uid());
+            let old = acquire_step(client.acquire_route(&contract)).await.unwrap();
             match transition {
-                AcquireTransition::Closed => { assert_eq!(fixture.server.close_business_admission("maintenance").await, 2); }
+                AcquireTransition::Closed => {
+                    assert_eq!(
+                        fixture.server.close_business_admission("maintenance").await,
+                        2
+                    );
+                }
                 AcquireTransition::Removed | AcquireTransition::Reregistered => {
                     assert!(fixture.server.unregister_route("b").await);
                     if matches!(transition, AcquireTransition::Reregistered) {
-                        AcquireFixture::register(&fixture.server, "b", fixture.probes[1].clone()).await;
+                        AcquireFixture::register(&fixture.server, "b", fixture.probes[1].clone())
+                            .await;
                     }
                 }
             }
-            // Check exact first: ordinary lookup must not refresh its positive cache.
-            let token = acquire_step(exact.acquire_route_token(&contract, old.route_uid())).await;
-            let plain = acquire_step(ordinary.acquire_route(&contract)).await;
-            match transition {
-                AcquireTransition::Closed => {
-                    assert!(matches!(token, Err(c2_ipc::IpcError::RouteClosed { .. })), "exact: {token:?}");
-                    assert!(matches!(plain, Err(c2_ipc::IpcError::RouteClosed { .. })));
+            let fresh = acquire_step(client.acquire_route(&contract)).await;
+            if matches!(transition, AcquireTransition::Reregistered) {
+                let fresh = fresh.unwrap();
+                for binding in [&old, &fresh] {
+                    acquire_step(client.call_bound(binding, "ping", &[]))
+                        .await
+                        .unwrap();
                 }
-                AcquireTransition::Removed => {
-                    assert!(matches!(token, Err(c2_ipc::IpcError::RouteRemoved { .. })), "exact: {token:?}");
-                    assert!(matches!(plain, Err(c2_ipc::IpcError::RouteRemoved { .. })));
-                }
-                AcquireTransition::Reregistered => {
-                    let current = plain.unwrap();
-                    assert_ne!(current.route_uid(), old.route_uid());
-                    assert!(matches!(token, Err(c2_ipc::IpcError::RouteStale { ref current_route_uid, .. })
-                        if current_route_uid == current.route_uid()), "exact: {token:?}");
-                    let fresh = acquire_step(exact.acquire_route_token(&contract, current.route_uid())).await.unwrap();
-                    assert_eq!(fresh.route_uid(), current.route_uid());
-                }
+                assert_eq!(
+                    fixture.probes[1]
+                        .pings
+                        .load(std::sync::atomic::Ordering::SeqCst),
+                    2
+                );
+            } else {
+                let code = match transition {
+                    AcquireTransition::Closed => {
+                        assert!(matches!(fresh, Err(c2_ipc::IpcError::RouteClosed { .. })));
+                        c2_error::ErrorCode::ResourceClosed
+                    }
+                    _ => {
+                        assert!(matches!(fresh, Err(c2_ipc::IpcError::RouteRemoved { .. })));
+                        c2_error::ErrorCode::ResourceRemoved
+                    }
+                };
+                let error = acquire_step(client.call_bound(&old, "ping", &[]))
+                    .await
+                    .unwrap_err();
+                let c2_ipc::IpcError::CallRejected(error) = error else {
+                    panic!("old call: {error}");
+                };
+                assert_eq!(error.code, code);
+                assert!(!error.details.contains_key("route_uid"));
+                assert_eq!(
+                    fixture.probes[1]
+                        .pings
+                        .load(std::sync::atomic::Ordering::SeqCst),
+                    0
+                );
             }
-            let error = acquire_step(exact.call_bound(&old, "ping", &[])).await.unwrap_err();
-            let c2_ipc::IpcError::CallRejected(error) = error else { panic!("old call: {error}"); };
-            assert_eq!(error.code, match transition {
-                AcquireTransition::Closed => c2_error::ErrorCode::ResourceClosed,
-                AcquireTransition::Removed => c2_error::ErrorCode::ResourceRemoved,
-                AcquireTransition::Reregistered => c2_error::ErrorCode::RouteStale,
-            });
-            assert_eq!(fixture.probes[1].pings.load(std::sync::atomic::Ordering::SeqCst), 0);
-            assert_eq!(old.route_uid(), fixture.entries[1].route_uid.as_str());
-        }).catch_unwind().await;
-        acquire_step(exact.close()).await;
-        acquire_step(ordinary.close()).await;
+        })
+        .catch_unwind()
+        .await;
+        acquire_step(client.close()).await;
         fixture.finish().await;
         if let Err(panic) = result {
             std::panic::resume_unwind(panic);
@@ -1345,16 +1348,16 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn exact_token_ready_to_closed_uses_current_authority() {
-        exact_token_transition(AcquireTransition::Closed).await;
+    async fn name_acquire_ready_to_closed_uses_current_authority() {
+        name_acquire_transition(AcquireTransition::Closed).await;
     }
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn exact_token_ready_to_removed_uses_current_authority() {
-        exact_token_transition(AcquireTransition::Removed).await;
+    async fn name_acquire_ready_to_removed_uses_current_authority() {
+        name_acquire_transition(AcquireTransition::Removed).await;
     }
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn exact_token_ready_to_reregistered_uses_current_authority() {
-        exact_token_transition(AcquireTransition::Reregistered).await;
+    async fn name_acquire_ready_to_reregistered_uses_current_authority() {
+        name_acquire_transition(AcquireTransition::Reregistered).await;
     }
 
     async fn shared_acquire_transition(transition: AcquireTransition, watch_unavailable: bool) {
@@ -1462,7 +1465,17 @@ mod tests {
                     })
                 )),
                 AcquireTransition::Reregistered => {
-                    assert!(matches!(rejected, Err(UpstreamAcquireError::Stale { .. })))
+                    let (lease, binding) = rejected.unwrap_or_else(|_| {
+                        panic!("same-endpoint replacement must acquire by name")
+                    });
+                    acquire_step(lease.client().call_bound(&binding, "ping", &[]))
+                        .await
+                        .unwrap();
+                    assert!(
+                        !call_a.as_ref().unwrap().is_finished(),
+                        "B must complete while A remains in the resource"
+                    );
+                    drop(lease);
                 }
             }
             let retained_allocations = pool.read().stats().alloc_count;
@@ -1481,26 +1494,38 @@ mod tests {
                 client.is_connected(),
                 "healthy shared endpoint remains connected"
             );
-            let error = acquire_step(client.call_bound(&old_b, "ping", &[]))
-                .await
-                .unwrap_err();
-            let c2_ipc::IpcError::CallRejected(error) = error else {
-                panic!("old B call: {error}");
-            };
-            assert_eq!(
-                error.code,
-                match transition {
-                    AcquireTransition::Closed => c2_error::ErrorCode::ResourceClosed,
-                    AcquireTransition::Removed => c2_error::ErrorCode::ResourceRemoved,
-                    AcquireTransition::Reregistered => c2_error::ErrorCode::RouteStale,
-                }
-            );
-            assert_eq!(
-                fixture.probes[1]
-                    .pings
-                    .load(std::sync::atomic::Ordering::SeqCst),
-                0
-            );
+            if matches!(transition, AcquireTransition::Reregistered) {
+                acquire_step(client.call_bound(&old_b, "ping", &[]))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    fixture.probes[1]
+                        .pings
+                        .load(std::sync::atomic::Ordering::SeqCst),
+                    2
+                );
+            } else {
+                let error = acquire_step(client.call_bound(&old_b, "ping", &[]))
+                    .await
+                    .unwrap_err();
+                let c2_ipc::IpcError::CallRejected(error) = error else {
+                    panic!("old B call: {error}");
+                };
+                assert_eq!(
+                    error.code,
+                    if matches!(transition, AcquireTransition::Closed) {
+                        c2_error::ErrorCode::ResourceClosed
+                    } else {
+                        c2_error::ErrorCode::ResourceRemoved
+                    }
+                );
+                assert_eq!(
+                    fixture.probes[1]
+                        .pings
+                        .load(std::sync::atomic::Ordering::SeqCst),
+                    0
+                );
+            }
             fixture.release(1);
             if let Some(blocked) = blocked_b.take() {
                 acquire_step(blocked).await.unwrap().unwrap();
@@ -1713,8 +1738,8 @@ mod tests {
             TEST_CRM_VER.into(),
             TEST_ABI_HASH.into(),
             TEST_SIGNATURE_HASH.into(),
-            attestation.max_payload_size(),
-            attestation.route_uid().to_string(),
+            attestation.max_payload_size,
+            attestation.route_uid,
             None,
         ) {
             RegisterCommitResult::Registered { entry } => entry,

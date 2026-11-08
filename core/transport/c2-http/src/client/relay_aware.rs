@@ -932,7 +932,6 @@ fn fallback_denied_body(route_name: &str, failed_candidates: &[RelayLocalIpcCand
             "server_instance_id".to_string(),
             json!(candidate.server_instance_id),
         );
-        details.insert("route_uid".to_string(), json!(candidate.route_uid));
     }
     json!({
         "version": c2_error::ERROR_WIRE_VERSION,

@@ -78,9 +78,7 @@ def _valid_receipt() -> dict[str, Any]:
                 "fastdb_spec_sha256": (
                     None if payload == "no-payload" else _digest("b")
                 ),
-                "route": {
-                    "uid": f"matrix-route-{index:02d}",
-                },
+                "route": {"name": f"matrix-route-{index:02d}"},
                 "logical_result_sha256": _digest("c"),
                 "packages": {
                     "client_sha256": _digest("d"),
@@ -95,7 +93,7 @@ def _valid_receipt() -> dict[str, Any]:
             }
         )
     return {
-        "schema": "c-two.portable-matrix-receipt.v2",
+        "schema": "c-two.portable-matrix-receipt.v3",
         "evidence_stage": "development",
         "rows": rows,
     }
@@ -114,7 +112,7 @@ def test_dimensions_and_exact_order_are_frozen() -> None:
 
 def test_valid_receipt_round_trips_as_canonical_json(tmp_path: Path) -> None:
     receipt = _valid_receipt()
-    destination = tmp_path / "portable-matrix-receipt.v2.json"
+    destination = tmp_path / "portable-matrix-receipt.v3.json"
 
     write_receipt(destination, receipt, expected_stage="development")
     first = destination.read_bytes()
@@ -128,11 +126,29 @@ def test_valid_receipt_round_trips_as_canonical_json(tmp_path: Path) -> None:
     ) == receipt
 
 
-def test_v1_schema_is_rejected() -> None:
+@pytest.mark.parametrize("old_version", ("v1", "v2"))
+def test_old_schema_is_rejected(old_version: str) -> None:
     receipt = _valid_receipt()
-    receipt["schema"] = "c-two.portable-matrix-receipt.v1"
+    receipt["schema"] = f"c-two.portable-matrix-receipt.{old_version}"
 
-    with pytest.raises(ReceiptValidationError, match=r"\$\.schema.*v2"):
+    with pytest.raises(ReceiptValidationError, match=r"\$\.schema.*v3"):
+        validate_receipt(receipt, expected_stage="development")
+
+
+@pytest.mark.parametrize("name", ("", " bad", "bad ", "bad\\route", "bad\nroute", "x" * 256))
+def test_route_name_must_be_valid(name: str) -> None:
+    receipt = _valid_receipt()
+    receipt["rows"][0]["route"]["name"] = name
+
+    with pytest.raises(ReceiptValidationError, match="route.name"):
+        validate_receipt(receipt, expected_stage="development")
+
+
+def test_old_route_uid_is_rejected() -> None:
+    receipt = _valid_receipt()
+    receipt["rows"][0]["route"]["uid"] = "retired"
+
+    with pytest.raises(ReceiptValidationError, match="unknown field.*uid"):
         validate_receipt(receipt, expected_stage="development")
 
 
@@ -241,7 +257,7 @@ def test_unknown_fields_are_rejected(
 
 def test_absolute_paths_are_rejected() -> None:
     receipt = _valid_receipt()
-    receipt["rows"][0]["route"]["uid"] = "/tmp/not-portable"
+    receipt["rows"][0]["route"]["name"] = "/tmp/not-portable"
 
     with pytest.raises(ReceiptValidationError, match="absolute path"):
         validate_receipt(receipt, expected_stage="development")
@@ -250,8 +266,8 @@ def test_absolute_paths_are_rejected() -> None:
 def test_duplicate_json_keys_are_rejected(tmp_path: Path) -> None:
     destination = tmp_path / "duplicate.json"
     destination.write_text(
-        '{"schema":"c-two.portable-matrix-receipt.v2",'
-        '"schema":"c-two.portable-matrix-receipt.v2",'
+        '{"schema":"c-two.portable-matrix-receipt.v3",'
+        '"schema":"c-two.portable-matrix-receipt.v3",'
         '"evidence_stage":"development","rows":[]}',
         encoding="utf-8",
     )

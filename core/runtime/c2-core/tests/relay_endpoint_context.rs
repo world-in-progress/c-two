@@ -511,7 +511,10 @@ mod unix {
             after_mismatch.observed_path(),
             ObservedPath::RelayAwareLocalIpc
         );
-        assert_eq!(after_mismatch.observed_route(), ipc.observed_route());
+        assert_eq!(
+            after_mismatch.ipc_server_identity(),
+            ipc.ipc_server_identity()
+        );
         assert_eq!(
             after_mismatch
                 .call_owned("echo", b"after-mismatch")

@@ -17,8 +17,8 @@ MANIFEST_SCHEMA = "c-two.local-release-candidate-manifest.v1"
 MANIFEST_FILENAME = "local-release-candidate-manifest.v1.json"
 EVIDENCE_FILENAMES = {
     "package-consumer-receipt.v1.json",
-    "portable-matrix-receipt.v2.json",
-    "typescript-real-call-receipt.v2.json",
+    "portable-matrix-receipt.v3.json",
+    "typescript-real-call-receipt.v3.json",
 }
 SOURCE_ORDER = ("c-two", "fastdb")
 SOURCE_FIELDS = {

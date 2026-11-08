@@ -41,12 +41,11 @@ export interface NativeCall {
 export interface NativePreparedRoute {
   readonly serverId: string;
   readonly serverInstanceId: string;
-  readonly routeUid: string;
   readonly connectionId: bigint | string;
 }
 
 export interface NativeEndpointContext {
-  prepare(routeName: string, contract: object, expectedRouteToken?: { readonly routeUid: string }): Promise<NativePreparedRoute>;
+  prepare(routeName: string, contract: object): Promise<NativePreparedRoute>;
   beginCall(routeName: string, method: string, serverStream: boolean, timeoutMs: number | null): NativeCall;
   deactivate(): void;
   close(): Promise<void>;
@@ -194,8 +193,8 @@ class ProjectedCall implements NativeCall {
 
 class ProjectedEndpoint implements NativeEndpointContext {
   constructor(private readonly native: NativeEndpointContext) {}
-  prepare(routeName: string, contract: object, expectedRouteToken?: { readonly routeUid: string }): Promise<NativePreparedRoute> {
-    return nativePromise(() => this.native.prepare(routeName, contract, expectedRouteToken));
+  prepare(routeName: string, contract: object): Promise<NativePreparedRoute> {
+    return nativePromise(() => this.native.prepare(routeName, contract));
   }
   beginCall(routeName: string, method: string, serverStream: boolean, timeoutMs: number | null): NativeCall {
     return new ProjectedCall(nativeValue(() => this.native.beginCall(routeName, method, serverStream, timeoutMs)));

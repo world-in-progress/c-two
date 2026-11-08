@@ -471,7 +471,8 @@ const expectedPath = {
 }[config.mode];
 assert.ok(observations.length >= 1);
 assert.ok(observations.every((observation) => observation.path === expectedPath));
-assert.ok(observations.every((observation) => observation.routeUid));
+assert.ok(observations.every((observation) => observation.routeName === config.routeName));
+assert.ok(observations.every((observation) => !('routeUid' in observation)));
 
 process.stdout.write(`NODE_RECEIPT ${JSON.stringify({
   cleanup: {

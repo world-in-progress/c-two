@@ -124,7 +124,8 @@ fn sdk_idle(path: PathKind) {
 
 // Gate 2: an entered call exposes the deterministic closed interval.
 // Acquisition and old-proxy calls consult current authority without entering
-// the resource; after removal and re-registration the old UID is stale.
+// the resource; after removal and re-registration the old proxy reaches the
+// current resource on the same endpoint.
 #[test]
 fn direct_closed_removed_and_reregistered_routes_use_current_authority() {
     route_authority(PathKind::Direct);
@@ -176,10 +177,8 @@ fn route_authority(path: PathKind) {
                 serde_json::from_str(&error.details["direct_ipc_failure_envelope"]).unwrap();
             assert_eq!(cause["code"], 707);
             assert_eq!(cause["name"], "ResourceClosed");
-            assert_eq!(
-                cause["details"]["route_uid"],
-                old.observed_route().route_uid
-            );
+            assert_eq!(cause["details"]["route"], "authority");
+            assert!(cause["details"].get("route_uid").is_none());
             println!("C2_PERSISTENT_FALLBACK_DENIED {error:?}");
         } else {
             // A real relay probe withdraws a closed upstream route. Discovery
@@ -212,7 +211,7 @@ fn route_authority(path: PathKind) {
         assert!(outcome.local_removed && outcome.close.active_drained);
         assert!(outcome.close.close_error.is_none());
     });
-    if path != PathKind::Direct {
+    if path == PathKind::Http {
         assert_eq!(route.calls(), 1);
         fixture.assert_paths(1);
         assert_eq!(
@@ -225,7 +224,11 @@ fn route_authority(path: PathKind) {
     }
     fixture::assert_semantic(
         fixture.connect_name("authority").unwrap_err(),
-        fixture::ErrorCode::ResourceRemoved,
+        if path == PathKind::Direct {
+            fixture::ErrorCode::ResourceRemoved
+        } else {
+            fixture::ErrorCode::ResourceNotFound
+        },
     );
     fixture::assert_semantic(
         old.call_owned("echo", &fixture::encode("removed"))
@@ -234,29 +237,23 @@ fn route_authority(path: PathKind) {
     );
     assert_eq!(route.calls(), 1);
     let replacement = fixture.register("authority");
-    assert_ne!(
-        route.registration.outcome().route_uid,
-        replacement.registration.outcome().route_uid
-    );
+    assert_ne!(route.label(), replacement.label());
     let fresh = fixture.connect(&replacement);
-    fixture::assert_semantic(
-        old.call_owned("echo", &fixture::encode("stale"))
-            .unwrap_err(),
-        fixture::ErrorCode::RouteStale,
-    );
-    assert_eq!(replacement.calls(), 0);
+    fixture.call(&old, &replacement, "old-proxy-current");
     fixture.call(&fresh, &replacement, "fresh");
+    assert_eq!(replacement.calls(), 2);
     assert_eq!(
         fixture.outgoing_ids().len(),
         usize::from(path != PathKind::Http)
     );
+    fixture.assert_paths(2);
     drop((old, fresh, route, replacement));
     fixture.finish();
 }
 
 // Gates 2 and 6, relay-local: after withdrawal, name acquisition finds no
 // resource while the bound proxy reports removal. Re-registration changes
-// the UID, and the old proxy's call is refused without entering either resource.
+// the registration, and the old proxy reaches the current resource.
 #[test]
 fn relay_local_removed_and_reregistered_routes_preserve_old_binding() {
     let fixture = Fixture::new(PathKind::Local, 0.0, 0);
@@ -278,32 +275,117 @@ fn relay_local_removed_and_reregistered_routes_preserve_old_binding() {
     );
     assert_eq!(route.calls(), 1);
     let replacement = fixture.register("replacement");
-    assert_ne!(
-        route.registration.outcome().route_uid,
-        replacement.registration.outcome().route_uid
-    );
-    fixture::assert_semantic(
-        old.call_owned("echo", &fixture::encode("stale"))
-            .unwrap_err(),
-        fixture::ErrorCode::RouteStale,
-    );
-    assert_eq!(replacement.calls(), 0);
+    assert_ne!(route.label(), replacement.label());
+    fixture.call(&old, &replacement, "old-proxy-current");
     let fresh = fixture.connect(&replacement);
     fixture.call(&fresh, &replacement, "fresh");
-    assert_eq!(
-        old.observed_route().route_uid,
-        route.registration.outcome().route_uid
-    );
-    assert_eq!(replacement.calls(), 1);
+    assert_eq!(replacement.calls(), 2);
     assert_eq!(fixture.outgoing_ids(), physical);
     fixture.assert_paths(2);
     drop((old, fresh, route, replacement));
     fixture.finish();
 }
 
+#[test]
+fn relay_local_first_acquire_uses_current_registration_with_cached_resolution() {
+    let fixture = Fixture::new(PathKind::Local, 0.0, 0);
+    let mut route = fixture.register("cached-resolution");
+    let old = fixture.connect(&route);
+    fixture.call(&old, &route, "cache-resolution");
+    let physical = fixture.outgoing_ids();
+    assert!(route.registration.close().unwrap().local_removed);
+    let replacement = fixture.register("cached-resolution");
+    assert_ne!(route.label(), replacement.label());
+    let fresh = fixture.connect(&replacement);
+    assert_eq!(fresh.observed_path(), fixture::PathKind::Local.observed());
+    fixture.call(&fresh, &replacement, "new-acquisition");
+    fixture.call(&old, &replacement, "old-acquisition");
+    assert_eq!((route.calls(), replacement.calls()), (1, 2));
+    assert_eq!(fixture.outgoing_ids(), physical);
+    fixture.assert_paths(2);
+    drop((old, fresh, route, replacement));
+    fixture.finish();
+}
+
+#[test]
+fn direct_real_process_same_endpoint_reregistration_uses_current_resource() {
+    real_process_same_endpoint_reregistration(PathKind::Direct);
+}
+
+#[test]
+fn relay_local_real_process_same_endpoint_reregistration_uses_current_resource() {
+    real_process_same_endpoint_reregistration(PathKind::Local);
+}
+
+fn real_process_same_endpoint_reregistration(path: PathKind) {
+    let fixture = Fixture::new(path, 0.0, 0);
+    let mut peer = fixture::ResourceProcess::start(&fixture, &fixture::unique("same-endpoint"));
+    let old = peer.connect(&fixture);
+    let old_connection = old.connection_observation().unwrap();
+    let mut original = fixture::open_stream(&old, "complete");
+    let first = original.next().unwrap().unwrap();
+    peer.assert_item(&first, 1);
+    assert!(original.next().is_none());
+    let terminal = original.close_with_timeout(Some(fixture::WAIT));
+    assert!(terminal.completed && terminal.terminal.unwrap().is_ok());
+    let old_label = peer.ready["resource"].clone();
+    let before = peer.snapshot();
+    let removed = peer.command_barrier("unregister", "unregistered");
+    assert_eq!(removed["resource"], old_label);
+    let refusal = old.call_owned("ping", &[]).unwrap_err();
+    fixture::assert_semantic(refusal, fixture::ErrorCode::ResourceRemoved);
+    let acquire = fixture
+        .client_runtime
+        .connect(
+            fixture::stream_expected("process-route"),
+            if path == PathKind::Direct {
+                c_two::Connect::DirectIpc {
+                    address: peer.ready["address"].as_str().unwrap().into(),
+                }
+            } else {
+                c_two::Connect::RelayAware
+            },
+        )
+        .unwrap_err();
+    fixture::assert_semantic(
+        acquire,
+        if path == PathKind::Direct {
+            fixture::ErrorCode::ResourceRemoved
+        } else {
+            fixture::ErrorCode::ResourceNotFound
+        },
+    );
+    assert_eq!(peer.snapshot()["opens"], before["opens"]);
+    let registered = peer.command_barrier("register", "registered");
+    assert_ne!(registered["resource"], old_label);
+    peer.ready["resource"] = registered["resource"].clone();
+    let fresh = peer.connect(&fixture);
+    assert_eq!(
+        fresh.connection_observation().unwrap().connection_id(),
+        old_connection.connection_id()
+    );
+    let mut current = fixture::open_stream(&old, "complete");
+    let item = current.next().unwrap().unwrap();
+    peer.assert_item(&item, 1);
+    assert!(current.next().is_none());
+    let terminal = current.close_with_timeout(Some(fixture::WAIT));
+    assert!(terminal.completed && terminal.terminal.unwrap().is_ok());
+    let mut acquired = fixture::open_stream(&fresh, "complete");
+    let item = acquired.next().unwrap().unwrap();
+    peer.assert_item(&item, 1);
+    assert!(acquired.next().is_none());
+    let terminal = acquired.close_with_timeout(Some(fixture::WAIT));
+    assert!(terminal.completed && terminal.terminal.unwrap().is_ok());
+    assert_eq!(peer.snapshot()["opens"], 3);
+    fixture.assert_paths(2);
+    drop((original, current, acquired, first, item, old, fresh));
+    peer.stop();
+    fixture.finish();
+}
+
 // Gate 4, direct IPC and relay-local: A and B share the physical connection.
-// Closing, removing and replacing B refuses only B; A's dispatched unary and
-// the original carrier survive all three route errors.
+// Closing and removing B refuses only B; replacement reaches the current B.
+// A's dispatched unary, held response, and carrier survive these changes.
 #[test]
 fn direct_route_errors_preserve_other_route_inflight_call_and_carrier() {
     route_errors_are_local(PathKind::Direct);
@@ -320,13 +402,16 @@ fn route_errors_are_local(path: PathKind) {
     let mut b = fixture.register("b");
     let a_client = fixture.connect(&a);
     let b_client = fixture.connect(&b);
+    let mut held = a_client
+        .call_held("echo", &fixture::encode("held-before-b"))
+        .unwrap();
     let a_entered = a_client.clone();
     let a_call =
         std::thread::spawn(move || a_entered.call_owned("echo", &fixture::encode("blocked")));
     let b_entered = b_client.clone();
     let b_call =
         std::thread::spawn(move || b_entered.call_owned("echo", &fixture::encode("blocked")));
-    observe_until(|| a.calls() == 1 && b.calls() == 1);
+    observe_until(|| a.calls() == 2 && b.calls() == 1);
     let physical = fixture.outgoing_ids();
     assert_eq!(physical.len(), 1);
     let carrier = a_client.connection_observation().unwrap();
@@ -364,19 +449,16 @@ fn route_errors_are_local(path: PathKind) {
         fixture::ErrorCode::ResourceRemoved,
     );
     let replacement = fixture.register("b");
-    fixture::assert_semantic(
-        b_client
-            .call_owned("echo", &fixture::encode("stale-b"))
-            .unwrap_err(),
-        fixture::ErrorCode::RouteStale,
-    );
-    assert_eq!(replacement.calls(), 0);
+    fixture.call(&b_client, &replacement, "current-b");
+    assert_eq!(replacement.calls(), 1);
+    fixture.assert_response(&a_client, &a, "held-before-b", held.bytes());
+    held.invalidate_then_release(|| Ok(())).unwrap();
     assert!(!a_call.is_finished());
     assert!(carrier.snapshot().is_none());
     a.evidence().release();
     fixture.assert_response(&a_client, &a, "blocked", &a_call.join().unwrap().unwrap());
     fixture.call(&a_client, &a, "a-after-b-errors");
-    assert_eq!((a.calls(), b.calls(), replacement.calls()), (2, 1, 0));
+    assert_eq!((a.calls(), b.calls(), replacement.calls()), (3, 1, 1));
     assert_eq!(fixture.outgoing_ids(), physical);
     fixture.assert_paths(2);
     drop((a_client, b_client, a, b, replacement));
@@ -419,11 +501,12 @@ fn relay_http_reregistered_route_refuses_stale_post_then_resolves_next_call() {
     let mut route = fixture.register("stale-http");
     let old = fixture.connect(&route);
     fixture.call(&old, &route, "before-replacement");
+    let old_uid = fixture.relay_route_uid(fixture::expected("stale-http"));
     assert!(route.registration.close().unwrap().local_removed);
     let replacement = fixture.register("stale-http");
     assert_ne!(
-        route.registration.outcome().route_uid,
-        replacement.registration.outcome().route_uid
+        old_uid,
+        fixture.relay_route_uid(fixture::expected("stale-http"))
     );
     fixture::assert_semantic(
         old.call_owned("echo", &fixture::encode("stale"))
@@ -580,7 +663,7 @@ fn peer_end_and_recovery(path: PathKind) {
         peer.ready["identity"]["server_instance_id"],
         replacement.ready["identity"]["server_instance_id"]
     );
-    assert_ne!(peer.ready["route_uid"], replacement.ready["route_uid"]);
+    assert_ne!(peer.ready["resource"], replacement.ready["resource"]);
     assert_eq!(replacement.snapshot()["opens"], 0);
     let refusal = old.call_owned("ping", &[]).unwrap_err();
     if path == PathKind::Http {
@@ -590,7 +673,6 @@ fn peer_end_and_recovery(path: PathKind) {
     }
     assert_eq!(replacement.snapshot()["unary"], 0);
     let fresh = replacement.connect(&fixture);
-    assert_eq!(old.observed_route().route_uid, peer.ready["route_uid"]);
     if let Some(identity) = old.ipc_server_identity() {
         assert_eq!(
             identity.server_instance_id,
