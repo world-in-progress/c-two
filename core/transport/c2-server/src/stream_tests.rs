@@ -10,6 +10,9 @@ use tokio::sync::oneshot;
 #[path = "stalled_peer_tests.rs"]
 mod stalled_peer_tests;
 
+#[path = "stream_executor_tests.rs"]
+mod stream_executor_tests;
+
 const STREAM_DESCRIPTOR: &[u8] =
     include_bytes!("../../../foundation/c2-contract/tests/fixtures/server-stream.contract.json");
 

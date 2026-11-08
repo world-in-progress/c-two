@@ -18,6 +18,10 @@ const WAIT: Duration = Duration::from_secs(10);
 const DESCRIPTOR: &[u8] =
     include_bytes!("../../../foundation/c2-contract/tests/fixtures/server-stream.contract.json");
 
+#[path = "server_streams/diagnostics.rs"]
+mod diagnostics;
+use diagnostics::StreamDiagnostics;
+
 fn unique(prefix: &str) -> String {
     format!("{prefix}-{}", uuid::Uuid::new_v4().simple())
 }
@@ -500,6 +504,7 @@ struct Fixture {
     registration: Option<Registration>,
     _client_runtime: Runtime,
     client: Client,
+    connection_events: Option<c2_local::ConnectionEvents>,
     probe: Arc<Probe>,
     step_events: mpsc::Receiver<(u8, usize)>,
     encoded_events: mpsc::Receiver<(u8, usize)>,
@@ -657,6 +662,7 @@ impl Fixture {
                 .unwrap(),
             )
             .unwrap();
+        let connection_events = Some(server.connection_events());
         let client = client_runtime
             .connect(
                 release.expected_route(&route_name).unwrap(),
@@ -671,6 +677,7 @@ impl Fixture {
             registration: Some(registration),
             _client_runtime: client_runtime,
             client,
+            connection_events,
             probe,
             step_events,
             encoded_events,
@@ -689,6 +696,25 @@ impl Fixture {
             .unwrap()
             .stream()
             .unwrap()
+    }
+
+    fn observe_shutdown_cancellation(&self) {
+        let route = self.registration.as_ref().unwrap().route_concurrency();
+        observe_until(|| route.snapshot().closed);
+        // The admission snapshot closes before IPC cancellation is published.
+        // A subsequent catalog lookup crosses the dispatcher's publication
+        // lock, which shutdown retains until every stream has its cause.
+        let error = self
+            ._client_runtime
+            .connect_with_options(
+                self.client.expected_route().clone(),
+                Connect::DirectIpc {
+                    address: self.host.local_endpoint().address().into(),
+                },
+                c2_core::ConnectOptions::new().with_timeout(WAIT),
+            )
+            .expect_err("shutdown closed the route catalog");
+        assert_semantic(error, ErrorCode::ResourceClosed, "route closed");
     }
 }
 
@@ -896,7 +922,6 @@ fn runtime_shutdown_preserves_the_running_step_and_entered_unary_call() {
     let unary_client = fixture.client.clone();
     let unary = std::thread::spawn(move || unary_client.call_owned("ping", b"gated"));
     fixture.unary_events.recv_timeout(WAIT).unwrap();
-    let route = fixture.registration.as_ref().unwrap().route_concurrency();
     let receipt = fixture
         .server
         .begin_session_retirement(
@@ -904,7 +929,7 @@ fn runtime_shutdown_preserves_the_running_step_and_entered_unary_call() {
             Instant::now() + WAIT,
         )
         .unwrap();
-    observe_until(|| route.snapshot().closed);
+    fixture.observe_shutdown_cancellation();
     assert!(!receipt.observe_until(Instant::now()).1);
     fixture.probe.step_gate.release();
     fixture.probe.unary_gate.release();
@@ -1001,7 +1026,6 @@ fn shutdown_during_final_step_reports_its_cancellation_cause() {
     let fixture = Fixture::new(true, 2, ServiceConcurrencyMode::ReadParallel, None, None);
     let mut stream = fixture.stream(0, 3);
     assert_eq!(fixture.step_events.recv_timeout(WAIT).unwrap(), (3, 0));
-    let route = fixture.registration.as_ref().unwrap().route_concurrency();
     let retirement = fixture
         .server
         .begin_session_retirement(
@@ -1009,7 +1033,7 @@ fn shutdown_during_final_step_reports_its_cancellation_cause() {
             Instant::now() + WAIT,
         )
         .unwrap();
-    observe_until(|| route.snapshot().closed);
+    fixture.observe_shutdown_cancellation();
     assert!(!retirement.observe_until(Instant::now()).1);
     fixture.probe.step_gate.release();
     assert_semantic(
@@ -1055,7 +1079,6 @@ fn shutdown_during_cleanup_does_not_rewrite_an_already_natural_end() {
     let fixture = Fixture::new(true, 2, ServiceConcurrencyMode::ReadParallel, None, None);
     let mut stream = fixture.stream(0, 4);
     assert_eq!(fixture.finish_events.recv_timeout(WAIT).unwrap(), 4);
-    let route = fixture.registration.as_ref().unwrap().route_concurrency();
     let retirement = fixture
         .server
         .begin_session_retirement(
@@ -1063,7 +1086,7 @@ fn shutdown_during_cleanup_does_not_rewrite_an_already_natural_end() {
             Instant::now() + WAIT,
         )
         .unwrap();
-    observe_until(|| route.snapshot().closed);
+    fixture.observe_shutdown_cancellation();
     assert!(!retirement.observe_until(Instant::now()).1);
     fixture.probe.finish_gate.release();
     assert!(stream.next_item().unwrap().is_none());
@@ -1184,54 +1207,95 @@ fn one_runtime_budget_counts_receive_copy_and_multiple_client_holds() {
     observe_until(|| fixture.server.payload_buffer_stats().unwrap().used_bytes == 0);
 }
 
+fn assert_unlimited_item(
+    fixture: &Fixture,
+    stream: &mut CoreResponseStream,
+    index: u8,
+) -> c2_core::HeldResponse {
+    let result = stream.next_item();
+    if !matches!(&result, Ok(Some(_))) {
+        eprintln!(
+            "unlimited probe: opens={} steps={} finishes={} current_target={:?}",
+            fixture.probe.opens.load(Ordering::SeqCst),
+            fixture.probe.steps.load(Ordering::SeqCst),
+            fixture.probe.finishes.load(Ordering::SeqCst),
+            fixture
+                .client
+                .connection_observation()
+                .map(|observed| observed.snapshot()),
+        );
+    }
+    let item = result.unwrap().expect("complete item");
+    assert_eq!(item.bytes(), &[index; 4]);
+    item
+}
+
 #[test]
 fn unlimited_stream_uses_an_operation_slot_until_real_terminal() {
-    let fixture = Fixture::new(
-        false,
-        2,
-        ServiceConcurrencyMode::ReadParallel,
-        Some(1),
-        None,
-    );
-    let mut first = fixture.stream(3, 0);
-    drop(assert_item(&mut first, 1));
-    assert_eq!(
-        fixture
-            .server
-            .call_execution_snapshot()
-            .unwrap()
-            .used_operations,
-        1
-    );
-    let refusal = match fixture.client.begin_stream("echo") {
-        Ok(_) => panic!("second unlimited stream must be refused before encoding"),
-        Err(error) => error,
-    };
-    assert_semantic(refusal, ErrorCode::CallCapacityExceeded, "operation slot");
-    let receipt = first.close_with_timeout(Some(WAIT));
-    assert!(receipt.completed);
-    assert_semantic(
-        receipt
-            .terminal
-            .unwrap()
-            .expect_err("first stream cancelled"),
-        ErrorCode::CallCancelled,
-        "consumer",
-    );
-    observe_until(|| {
-        fixture
-            .server
-            .call_execution_snapshot()
-            .unwrap()
-            .used_operations
-            == 0
+    let diagnostics = StreamDiagnostics::new();
+    diagnostics.run(|| {
+        let mut fixture = Fixture::new(
+            false,
+            2,
+            ServiceConcurrencyMode::ReadParallel,
+            Some(1),
+            None,
+        );
+        diagnostics.attach(
+            fixture.connection_events.take().unwrap(),
+            fixture.client.connection_observation().unwrap(),
+        );
+        let _failure_guard = diagnostics.failure_guard();
+        diagnostics.stage("initial/open");
+        let mut first = fixture.stream(3, 0);
+        diagnostics.stage("initial/recv1");
+        drop(assert_unlimited_item(&fixture, &mut first, 1));
+        diagnostics.stage("initial/slot");
+        assert_eq!(
+            fixture
+                .server
+                .call_execution_snapshot()
+                .unwrap()
+                .used_operations,
+            1
+        );
+        diagnostics.stage("refusal");
+        let refusal = match fixture.client.begin_stream("echo") {
+            Ok(_) => panic!("second unlimited stream must be refused before encoding"),
+            Err(error) => error,
+        };
+        assert_semantic(refusal, ErrorCode::CallCapacityExceeded, "operation slot");
+        diagnostics.stage("initial/close");
+        let receipt = first.close_with_timeout(Some(WAIT));
+        assert!(receipt.completed);
+        assert_semantic(
+            receipt
+                .terminal
+                .unwrap()
+                .expect_err("first stream cancelled"),
+            ErrorCode::CallCancelled,
+            "consumer",
+        );
+        diagnostics.stage("refund/wait");
+        observe_until(|| {
+            fixture
+                .server
+                .call_execution_snapshot()
+                .unwrap()
+                .used_operations
+                == 0
+        });
+        diagnostics.stage("recovery/open");
+        let mut recovered = fixture.stream(1, 0);
+        diagnostics.stage("recovery/recv1");
+        drop(assert_unlimited_item(&fixture, &mut recovered, 1));
+        diagnostics.stage("recovery/end");
+        assert!(recovered.next_item().unwrap().is_none());
+        diagnostics.stage("recovery/close");
+        let terminal = recovered.close_with_timeout(Some(WAIT));
+        assert!(terminal.completed);
+        assert!(terminal.terminal.unwrap().is_ok());
     });
-    let mut recovered = fixture.stream(1, 0);
-    drop(assert_item(&mut recovered, 1));
-    assert!(recovered.next_item().unwrap().is_none());
-    let terminal = recovered.close_with_timeout(Some(WAIT));
-    assert!(terminal.completed);
-    assert!(terminal.terminal.unwrap().is_ok());
 }
 
 #[test]

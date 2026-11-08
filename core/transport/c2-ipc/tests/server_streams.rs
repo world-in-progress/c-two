@@ -156,6 +156,13 @@ impl Harness {
     }
 
     async fn start_with_config(config: ServerIpcConfig) -> Self {
+        Self::start_on_executor(config, None).await
+    }
+
+    async fn start_on_executor(
+        config: ServerIpcConfig,
+        executor: Option<&tokio::runtime::Handle>,
+    ) -> Self {
         let descriptor = ValidatedContractDescriptor::from_json(DESCRIPTOR).unwrap();
         static NEXT_ADDRESS: AtomicUsize = AtomicUsize::new(0);
         let address = format!(
@@ -196,10 +203,14 @@ impl Harness {
         let reservation = server.reserve_route(built).await.unwrap();
         server.commit_reserved_route(reservation).await.unwrap();
         server.begin_start_attempt().unwrap();
-        let run = tokio::spawn({
+        let serving = {
             let server = server.clone();
             async move { server.run().await }
-        });
+        };
+        let run = match executor {
+            Some(executor) => executor.spawn(serving),
+            None => tokio::spawn(serving),
+        };
         server.wait_until_ready(WAIT).await.unwrap();
         let mut client = IpcClient::with_endpoint(endpoint, ClientIpcConfig::default()).unwrap();
         client.connect().await.unwrap();
@@ -238,6 +249,54 @@ impl Harness {
             .unwrap();
         assert_eq!(reply.into_owned_bytes().unwrap(), b"pong");
     }
+}
+
+#[test]
+fn server_executor_teardown_reports_peer_end_as_dispatch_uncertain() {
+    let server_executor = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    let peer_executor = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    peer_executor.block_on(async {
+        let fixture =
+            Harness::start_on_executor(ServerIpcConfig::default(), Some(server_executor.handle()))
+                .await;
+        let mut stream = fixture
+            .client
+            .stream_bound(
+                &fixture.binding,
+                "echo",
+                &[6],
+                PayloadBufferBudget::new(1024),
+            )
+            .await
+            .unwrap();
+        wait_for_steps(&fixture.observed, 2).await;
+        let first = stream.recv().await.unwrap().unwrap();
+        server_executor.shutdown_background();
+        let error = tokio::time::timeout(WAIT, stream.completion())
+            .await
+            .unwrap()
+            .expect_err("peer ended without CALL_END");
+        assert_eq!(error.phase(), c2_ipc::TransportPhase::DispatchUncertain);
+        assert!(!error.is_retry_safe());
+        assert!(
+            matches!(
+                error.source_error(),
+                c2_ipc::IpcError::Closed | c2_ipc::IpcError::Io(_)
+            ),
+            "{error:?}"
+        );
+        assert_eq!(first.as_ref(), &[0; 8]);
+        assert_eq!(fixture.observed.finished.load(Ordering::SeqCst), 0);
+        fixture.client.close_shared().await;
+        assert!(fixture.run.await.unwrap_err().is_cancelled());
+    });
 }
 
 async fn wait_for_steps(observed: &Observed, expected: usize) {
@@ -468,15 +527,23 @@ async fn local_delivery_grants_one_step_ahead_without_waiting_for_recv() {
         .unwrap();
     wait_for_steps(&fixture.observed, 2).await;
     assert_eq!(fixture.observed.steps.load(Ordering::SeqCst), 2);
-    assert_eq!(
-        fixture
-            .server
-            .route_scheduler_snapshot("portable")
-            .await
-            .unwrap()
-            .active_workers,
-        0
-    );
+    // The callback reports entry before its step guard releases the worker.
+    tokio::time::timeout(WAIT, async {
+        loop {
+            let snapshot = fixture
+                .server
+                .route_scheduler_snapshot("portable")
+                .await
+                .unwrap();
+            if snapshot.active_workers == 0 {
+                assert_eq!(snapshot.pending, 1);
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("second stream step kept its route worker active");
     fixture.unary().await;
     assert_eq!(fixture.observed.steps.load(Ordering::SeqCst), 2);
 
