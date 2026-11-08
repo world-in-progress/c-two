@@ -13,13 +13,11 @@ Outputs: QPS=<number>
 """
 from __future__ import annotations
 
-import json
 import os
 import pickle
 import re
 import subprocess
 import sys
-import urllib.parse
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -40,7 +38,7 @@ CONCURRENCY = 32
 PAYLOAD_FILE = '/tmp/c2_bench_payload.bin'
 
 
-def _route_hey_args(expected: CRMContract, route_uid: str) -> list[str]:
+def _route_hey_args(expected: CRMContract) -> list[str]:
     return [
         '-H',
         f'x-c2-expected-crm-ns: {expected.crm_ns}',
@@ -52,8 +50,6 @@ def _route_hey_args(expected: CRMContract, route_uid: str) -> list[str]:
         f'x-c2-expected-abi-hash: {expected.abi_hash}',
         '-H',
         f'x-c2-expected-signature-hash: {expected.signature_hash}',
-        '-H',
-        f'x-c2-route-uid: {route_uid}',
     ]
 
 
@@ -102,21 +98,7 @@ def main():
                 cc.register(Hello, HelloImpl(), name=route_name)
                 with cc.connect(Hello, name=route_name, address=relay_url):
                     expected = crm_contract(Hello)
-                    query = urllib.parse.urlencode({
-                        'crm_ns': expected.crm_ns,
-                        'crm_name': expected.crm_name,
-                        'crm_ver': expected.crm_ver,
-                        'abi_hash': expected.abi_hash,
-                        'signature_hash': expected.signature_hash,
-                    })
-                    route_path = urllib.parse.quote(route_name, safe='')
-                    with relay._NO_PROXY_OPENER.open(
-                        f'{relay_url}/_resolve/{route_path}?{query}', timeout=5,
-                    ) as response:
-                        routes = json.load(response)
-                    expected_header_args = _route_hey_args(
-                        expected, routes[0]['route_uid'],
-                    )
+                    expected_header_args = _route_hey_args(expected)
 
                 # Warmup with hey
                 _run_hey(

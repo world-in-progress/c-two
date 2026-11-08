@@ -73,16 +73,20 @@ test('IPC observation exposes route and server identity without a route UID', as
   await client.close();
 });
 
-test('HTTP observation omits the internal route UID', async () => {
+test('HTTP call and observation use route name and contract without a route UID', async () => {
+  const retiredHeader = ['x-c2-route-', 'uid'].join('');
   const observations = [];
-  const route = {name:'route',relay_url:'http://localhost:8301',route_uid:'internal',
+  const route = {name:'route',relay_url:'http://localhost:8301',
     crm_ns:contract.namespace,crm_name:contract.name,crm_ver:contract.version,
     abi_hash:hash,signature_hash:hash,max_payload_size:100};
   const fetch = async (url, init) => {
     if (url.includes('/_resolve/')) return {status:200,async text(){return JSON.stringify([route])}};
-    if (url.includes('/_probe/')) return {status:200,async text(){return ''}};
+    if (url.includes('/_probe/')) {
+      assert.equal(retiredHeader in init.headers, false);
+      return {status:200,async text(){return ''}};
+    }
     assert.equal(init.method, 'POST');
-    assert.equal(init.headers['x-c2-route-uid'], 'internal');
+    assert.equal(retiredHeader in init.headers, false);
     return {status:200,async arrayBuffer(){return Uint8Array.of(4).buffer}};
   };
   const client = transport.createHttpRelayEncodedTransport('http://localhost:8300', {

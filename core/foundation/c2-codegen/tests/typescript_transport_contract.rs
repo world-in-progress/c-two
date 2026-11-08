@@ -19,8 +19,7 @@ fn generated_contract_keeps_http_route_binding_and_fastdb_error_projection() {
     let source =
         std::str::from_utf8(set.get("typescript/c_two_contract.ts").unwrap().bytes()).unwrap();
     for required in [
-        "requestHeadersForResolvedRoute",
-        "x-c2-route-uid",
+        "requestHeadersForRouteContract",
         "expectedServerIdentity",
         "same-path fallback denied",
         "C2PayloadAdapterError",
@@ -35,7 +34,6 @@ fn generated_contract_keeps_http_route_binding_and_fastdb_error_projection() {
         "ExplicitRelay",
         "RelayAwareLocalIpc",
         "RelayAwareHttp",
-        "routeUid",
         "/_probe/",
         "ipcAddress",
         "serverId",
@@ -398,30 +396,30 @@ test('deadline during dispatch retains native call for later observation', async
   assert.equal(observations,1);
 });
 
-test('relay-aware stale POST is returned once and the next call resolves again', async () => {
+test('relay-aware canonical 701 POST is returned once and the next call resolves again', async () => {
   let resolves=0, posts=0;
   const reply=(status,text,bytes=new Uint8Array())=>({
     status, headers:{get(name){return name==='content-length'?String(bytes.length):null}},
     async text(){return text}, async arrayBuffer(){return bytes.buffer},
   });
-  const route=token=>({
-    name:'route',relay_url:'http://localhost:8301',route_uid:token,
+  const route=()=>({
+    name:'route',relay_url:'http://localhost:8301',
     crm_ns:'test',crm_name:'Test',crm_ver:'0.1.0',abi_hash:hash,signature_hash:hash,
     max_payload_size:100,
   });
   const fetch=async (url,init)=>{
-    if(url.includes('/_resolve/')) return reply(200,JSON.stringify([route(++resolves===1?'old':'new')]));
+    if(url.includes('/_resolve/')) {resolves++;return reply(200,JSON.stringify([route()]));}
     if(url.includes('/_probe/')) return reply(200,'');
     if(init.method==='POST') {
       posts++;
       return posts===1
-        ? reply(409,JSON.stringify({version:1,code:704,name:'RouteStale',message:'stale',details:{}}))
+        ? reply(404,JSON.stringify({version:1,code:701,name:'ResourceNotFound',message:'missing',details:{}}))
         : reply(200,'',Uint8Array.of(9));
     }
     throw Error(`unexpected ${url}`);
   };
   const transport=createRelayAwareHttpEncodedTransport('http://localhost:8300',{fetch});
-  await assert.rejects(transport.call('route',contract,'ping',()=>Uint8Array.of()), e=>e.status===409&&e.retrySafe===true);
+  await assert.rejects(transport.call('route',contract,'ping',()=>Uint8Array.of()), e=>e.status===404&&e.retrySafe===true);
   assert.equal(posts,1);
   assert.equal(resolves,1);
   const result=await transport.call('route',contract,'ping',()=>Uint8Array.of());
@@ -434,7 +432,7 @@ test('same-path fallback denial retains typed first native cause', async () => {
   let posts=0;
   const nativeFailure=new Error('native connection refused');
   nativeFailure.nativeDetails={message:'native connection refused',transportPhase:'pre_dispatch',category:'ipc',ioOperation:'connect',ioKind:'ConnectionRefused',rawOsError:61};
-  const route={name:'route',relay_url:'http://localhost:8301',route_uid:'old',
+  const route={name:'route',relay_url:'http://localhost:8301',
     ipc_address:'ipc://local',server_id:'s',server_instance_id:'i',
     crm_ns:'test',crm_name:'Test',crm_ver:'0.1.0',abi_hash:hash,signature_hash:hash,max_payload_size:100};
   const fetch=async (_url,init)=>{
@@ -470,12 +468,12 @@ test('relay local trust and deadline failures never select another candidate', a
     const cleanup=new Error('local close failure');
     const failure=new Error('terminal local failure');
     failure.nativeDetails={message:failure.message,transportPhase:'pre_dispatch',...nativeDetails};
-    const route={name:'route',relay_url:'http://localhost:8301',route_uid:'local',
+    const route={name:'route',relay_url:'http://localhost:8301',
       ipc_address:'ipc://local',server_id:'s',server_instance_id:'i',
       crm_ns:'test',crm_name:'Test',crm_ver:'0.1.0',abi_hash:hash,signature_hash:hash,max_payload_size:100};
     const fetch=async (_url,init)=>{
       if(init.method==='POST') posts++; else resolves++;
-      return {status:200,async text(){return JSON.stringify(alternatives?[route,{...route,route_uid:'remote',ipc_address:undefined,server_id:undefined,server_instance_id:undefined}]:[route])},async arrayBuffer(){return new ArrayBuffer(0)}};
+      return {status:200,async text(){return JSON.stringify(alternatives?[route,{...route,ipc_address:undefined,server_id:undefined,server_instance_id:undefined}]:[route])},async arrayBuffer(){return new ArrayBuffer(0)}};
     };
     const endpoint={async prepare(){throw failure},beginCall(){throw Error('unexpected dispatch')},async close(){if(closeFails)throw cleanup},deactivate(){}};
     const transport=createRelayAwareHttpEncodedTransport('http://localhost:8300',{fetch,ipc:{connect:async()=>endpoint}});
@@ -488,7 +486,7 @@ test('relay-aware close zero does not wait for route resolution', async () => {
   let resolveRoute;
   const gate=new Promise(resolve=>{resolveRoute=resolve});
   let encoded=0, dispatched=0;
-  const route={name:'route',relay_url:'http://localhost:8301',route_uid:'uid',
+  const route={name:'route',relay_url:'http://localhost:8301',
     ipc_address:'ipc://local',server_id:'s',server_instance_id:'i',
     crm_ns:'test',crm_name:'Test',crm_ver:'0.1.0',abi_hash:hash,signature_hash:hash,max_payload_size:100};
   const fetch=async()=>{await gate;return {status:200,async text(){return JSON.stringify([route])},async arrayBuffer(){return new ArrayBuffer(0)}}};

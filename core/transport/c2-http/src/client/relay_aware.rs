@@ -1,7 +1,6 @@
 //! Relay-aware HTTP client with route failover.
 
 use c2_mem::retention::{BudgetedBuffer, PayloadBufferBudget, PayloadBufferReservation};
-use std::collections::HashSet;
 use std::net::IpAddr;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -92,18 +91,12 @@ pub struct RelayLocalIpcCandidate {
     pub address: String,
     pub server_id: String,
     pub server_instance_id: String,
-    pub route_uid: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RelayResolvedTarget {
-    Ipc {
-        candidate: RelayLocalIpcCandidate,
-    },
-    Http {
-        relay_url: String,
-        route_uid: String,
-    },
+    Ipc { candidate: RelayLocalIpcCandidate },
+    Http { relay_url: String },
 }
 
 impl RelayResolvedTarget {
@@ -301,7 +294,7 @@ impl RelayAwareHttpClient {
                 }
                 Err(error) => return Err(error),
             };
-            for route in self.order_routes(routes.routes, &HashSet::new()) {
+            for route in self.order_routes(routes.routes) {
                 let relay_url = route.relay_url.trim_end_matches('/').to_string();
                 let client = match self.acquire_route_client(&relay_url, Some(control)) {
                     Ok(client) => client,
@@ -313,9 +306,8 @@ impl RelayAwareHttpClient {
                 };
                 let result = client
                     .client
-                    .stream_with_route_token_async(
+                    .stream_route_async(
                         &self.expected,
-                        &route.route_token(),
                         route.max_payload_size,
                         method_name,
                         HttpCallInput::Owned(data),
@@ -331,7 +323,7 @@ impl RelayAwareHttpClient {
                         *self.current.lock() = Some(relay_url);
                         return Ok(stream);
                     }
-                    Err(error) if route_is_stale(&error) => {
+                    Err(error) if route_not_found(&error) => {
                         self.control.invalidate(self.route_name());
                         *self.current.lock() = None;
                         return Err(error);
@@ -364,13 +356,7 @@ impl RelayAwareHttpClient {
         super::connect_deadline::check(deadline, "relay_resolve")?;
         super::http_client::runtime_with_deadline(deadline)?
             .handle()
-            .block_on(self.select_target_with_local_exclusions_async(
-                true,
-                &[],
-                None,
-                false,
-                deadline,
-            ))
+            .block_on(self.select_target_with_local_exclusions_async(true, &[], false, deadline))
     }
 
     pub fn resolve_http_target_with_deadline(
@@ -380,19 +366,12 @@ impl RelayAwareHttpClient {
         super::connect_deadline::check(deadline, "relay_resolve")?;
         super::http_client::runtime_with_deadline(deadline)?
             .handle()
-            .block_on(self.select_target_with_local_exclusions_async(
-                false,
-                &[],
-                None,
-                false,
-                deadline,
-            ))
+            .block_on(self.select_target_with_local_exclusions_async(false, &[], false, deadline))
     }
 
     pub fn resolve_target_after_local_ipc_failures_with_deadline(
         &self,
         failed_candidates: &[RelayLocalIpcCandidate],
-        failure_code: Option<c2_error::ErrorCode>,
         deadline: c2_config::ConnectDeadline,
     ) -> Result<RelayResolvedTarget, HttpError> {
         super::connect_deadline::check(deadline, "relay_resolve")?;
@@ -401,7 +380,6 @@ impl RelayAwareHttpClient {
             .block_on(self.select_target_with_local_exclusions_async(
                 true,
                 failed_candidates,
-                failure_code,
                 true,
                 deadline,
             ))
@@ -421,7 +399,6 @@ impl RelayAwareHttpClient {
         self.select_target_with_local_exclusions_async(
             prefer_local_ipc,
             &[],
-            None,
             false,
             c2_config::ConnectDeadline::default(),
         )
@@ -432,13 +409,11 @@ impl RelayAwareHttpClient {
         &self,
         prefer_local_ipc: bool,
         excluded_local_ipc_candidates: &[RelayLocalIpcCandidate],
-        failure_code: Option<c2_error::ErrorCode>,
         fallback_denied_when_only_excluded: bool,
         deadline: c2_config::ConnectDeadline,
     ) -> Result<RelayResolvedTarget, HttpError> {
         let attempts = self.config.max_attempts.max(1);
         let mut last_error = None;
-        let mut excluded_routes = HashSet::new();
 
         for attempt in 0..attempts {
             super::connect_deadline::check(deadline, "relay_resolve")?;
@@ -452,10 +427,22 @@ impl RelayAwareHttpClient {
                 .await
             {
                 Ok(routes) if !routes.routes.is_empty() => routes,
+                Ok(_) if fallback_denied_when_only_excluded => {
+                    return Err(HttpError::ServerError(
+                        409,
+                        fallback_denied_body(self.route_name(), excluded_local_ipc_candidates),
+                    ));
+                }
                 Ok(_) => {
                     return Err(HttpError::ServerError(
                         404,
                         resource_not_found_body(self.route_name()),
+                    ));
+                }
+                Err(err) if fallback_denied_when_only_excluded && route_not_found(&err) => {
+                    return Err(HttpError::ServerError(
+                        409,
+                        fallback_denied_body(self.route_name(), excluded_local_ipc_candidates),
                     ));
                 }
                 Err(err) => {
@@ -469,11 +456,8 @@ impl RelayAwareHttpClient {
             let namespace_allows_local_ipc = prefer_local_ipc
                 && self.namespace_allows_local_ipc(routes.local_endpoint_namespace.as_deref());
             let had_routes_before_local_exclusion = !routes.routes.is_empty();
-            let routes = filter_failed_local_ipc_candidates(
-                routes.routes,
-                excluded_local_ipc_candidates,
-                failure_code,
-            );
+            let routes =
+                filter_failed_local_ipc_candidates(routes.routes, excluded_local_ipc_candidates);
             if routes.is_empty()
                 && fallback_denied_when_only_excluded
                 && had_routes_before_local_exclusion
@@ -493,7 +477,7 @@ impl RelayAwareHttpClient {
                 return Ok(RelayResolvedTarget::Ipc { candidate });
             }
 
-            let ordered = self.order_routes_with_deadline(routes, &excluded_routes, deadline)?;
+            let ordered = self.order_routes_with_deadline(routes, deadline)?;
             if ordered.is_empty() {
                 return Err(last_error.unwrap_or_else(|| {
                     HttpError::ServerError(404, resource_not_found_body(self.route_name()))
@@ -518,31 +502,26 @@ impl RelayAwareHttpClient {
                 let probe = super::connect_deadline::run(
                     deadline,
                     "relay_probe",
-                    client.client.probe_route_with_token_async(
-                        &self.expected,
-                        &route.route_token(),
-                        &self.payload_budget,
-                    ),
+                    client
+                        .client
+                        .probe_route_async(&self.expected, &self.payload_budget),
                 )
                 .await;
                 match probe {
                     Ok(()) => {
                         *super::connect_deadline::lock(&self.current, deadline, "relay_select")? =
                             Some(relay_url.clone());
-                        return Ok(RelayResolvedTarget::Http {
-                            relay_url,
-                            route_uid: route.route_uid,
-                        });
+                        return Ok(RelayResolvedTarget::Http { relay_url });
                     }
                     Err(err @ HttpError::LocalCallRejected(_)) => return Err(err),
-                    Err(err) if route_is_stale(&err) => {
+                    Err(err) if route_not_found(&err) => {
                         self.control
                             .invalidate_with_deadline(self.route_name(), deadline)?;
                         *super::connect_deadline::lock(&self.current, deadline, "relay_select")? =
                             None;
-                        excluded_routes.insert((relay_url, route.route_uid));
                         last_error = Some(err);
                     }
+                    Err(err) if terminal_route_refusal(&err) => return Err(err),
                     Err(err) => {
                         last_error = Some(err);
                     }
@@ -585,7 +564,6 @@ impl RelayAwareHttpClient {
         let mut data = Some(data);
         let attempts = self.config.max_attempts.max(1);
         let mut last_error = None;
-        let excluded_routes = HashSet::new();
 
         for attempt in 0..attempts {
             let routes = match self
@@ -613,7 +591,7 @@ impl RelayAwareHttpClient {
                 }
             };
 
-            let ordered = self.order_routes(routes.routes, &excluded_routes);
+            let ordered = self.order_routes(routes.routes);
             if ordered.is_empty() {
                 return Err(last_error.unwrap_or_else(|| {
                     HttpError::ServerError(404, resource_not_found_body(self.route_name()))
@@ -632,9 +610,8 @@ impl RelayAwareHttpClient {
 
                 match client
                     .client
-                    .call_with_route_token_async(
+                    .call_route_async(
                         &self.expected,
-                        &route.route_token(),
                         route.max_payload_size,
                         method_name,
                         data.take()
@@ -649,7 +626,7 @@ impl RelayAwareHttpClient {
                         return Ok(bytes);
                     }
                     Err(HttpError::CrmError(err)) => return Err(HttpError::CrmError(err)),
-                    Err(err) if route_is_stale(&err) => {
+                    Err(err) if route_not_found(&err) => {
                         self.control.invalidate(self.route_name());
                         *self.current.lock() = None;
                         // No input is retained solely for a possible replay.
@@ -789,35 +766,17 @@ impl RelayAwareHttpClient {
         client
     }
 
-    fn order_routes(
-        &self,
-        routes: Vec<RelayRouteInfo>,
-        excluded_routes: &HashSet<(String, String)>,
-    ) -> Vec<RelayRouteInfo> {
+    fn order_routes(&self, routes: Vec<RelayRouteInfo>) -> Vec<RelayRouteInfo> {
         // Calls retain their existing policy; only connect supplies a deadline.
-        self.order_routes_with_deadline(
-            routes,
-            excluded_routes,
-            c2_config::ConnectDeadline::default(),
-        )
-        .expect("unlimited connection budget cannot expire")
+        self.order_routes_with_deadline(routes, c2_config::ConnectDeadline::default())
+            .expect("unlimited connection budget cannot expire")
     }
 
     fn order_routes_with_deadline(
         &self,
         routes: Vec<RelayRouteInfo>,
-        excluded_routes: &HashSet<(String, String)>,
         deadline: c2_config::ConnectDeadline,
     ) -> Result<Vec<RelayRouteInfo>, HttpError> {
-        let routes = routes
-            .into_iter()
-            .filter(|route| {
-                !excluded_routes.contains(&(
-                    route.relay_url.trim_end_matches('/').to_owned(),
-                    route.route_uid.clone(),
-                ))
-            })
-            .collect::<Vec<_>>();
         let current =
             super::connect_deadline::lock(&self.current, deadline, "relay_select")?.clone();
         let Some(current) = current else {
@@ -839,7 +798,7 @@ impl RelayAwareHttpClient {
 
 type RelayPoolGuard = super::pool::HttpPoolLease;
 
-fn route_is_stale(err: &HttpError) -> bool {
+fn route_not_found(err: &HttpError) -> bool {
     let (status, body) = match err {
         HttpError::ServerError(status, body) => (*status, body.as_bytes()),
         HttpError::ResponseError(status, body) => (*status, body.as_ref()),
@@ -848,11 +807,26 @@ fn route_is_stale(err: &HttpError) -> bool {
     let Ok(body) = std::str::from_utf8(body) else {
         return false;
     };
-    match status {
-        404 => relay_error_code_is(body, c2_error::ErrorCode::ResourceNotFound),
-        409 => relay_error_code_is(body, c2_error::ErrorCode::RouteStale),
-        _ => false,
-    }
+    status == 404 && relay_error_code_is(body, c2_error::ErrorCode::ResourceNotFound)
+}
+
+fn terminal_route_refusal(err: &HttpError) -> bool {
+    let body = match err {
+        HttpError::ServerError(_, body) => body.as_bytes(),
+        HttpError::ResponseError(_, body) => body.as_ref(),
+        _ => return false,
+    };
+    let Ok(envelope) = serde_json::from_slice::<c2_error::C2ErrorEnvelope>(body) else {
+        return false;
+    };
+    c2_error::C2Error::from_envelope(envelope).is_ok_and(|error| {
+        matches!(
+            error.code,
+            c2_error::ErrorCode::ContractMismatch
+                | c2_error::ErrorCode::IdentityMismatch
+                | c2_error::ErrorCode::ProtocolViolation
+        )
+    })
 }
 
 fn relay_rejection_is_pre_dispatch(error: &HttpError) -> bool {
@@ -883,7 +857,7 @@ fn http_call_error_phase(error: &HttpError) -> HttpCallPhase {
             HttpCallPhase::DispatchUncertain
         }
         HttpError::InvalidInput(_) | HttpError::LocalCallRejected(_) => HttpCallPhase::PreDispatch,
-        error if route_is_stale(error) || relay_rejection_is_pre_dispatch(error) => {
+        error if route_not_found(error) || relay_rejection_is_pre_dispatch(error) => {
             HttpCallPhase::PreDispatch
         }
         _ => HttpCallPhase::DispatchUncertain,
@@ -984,7 +958,6 @@ fn select_local_ipc_candidate(
             address: route.ipc_address.clone()?,
             server_id: route.server_id.clone()?,
             server_instance_id: route.server_instance_id.clone()?,
-            route_uid: route.route_uid.clone(),
         })
     })
 }
@@ -992,7 +965,6 @@ fn select_local_ipc_candidate(
 fn filter_failed_local_ipc_candidates(
     routes: Vec<RelayRouteInfo>,
     failed_candidates: &[RelayLocalIpcCandidate],
-    failure_code: Option<c2_error::ErrorCode>,
 ) -> Vec<RelayRouteInfo> {
     if failed_candidates.is_empty() {
         return routes;
@@ -1002,7 +974,7 @@ fn filter_failed_local_ipc_candidates(
         .filter(|route| {
             !failed_candidates
                 .iter()
-                .any(|failed| route_matches_local_ipc_candidate(route, failed, failure_code))
+                .any(|failed| route_matches_local_ipc_candidate(route, failed))
         })
         .collect()
 }
@@ -1010,15 +982,10 @@ fn filter_failed_local_ipc_candidates(
 fn route_matches_local_ipc_candidate(
     route: &RelayRouteInfo,
     failed: &RelayLocalIpcCandidate,
-    failure_code: Option<c2_error::ErrorCode>,
 ) -> bool {
-    // A stale route token does not disprove its endpoint. Other failures keep
-    // excluding that endpoint even when discovery advertises a different UID.
     route.ipc_address.as_deref() == Some(failed.address.as_str())
         && route.server_id.as_deref() == Some(failed.server_id.as_str())
         && route.server_instance_id.as_deref() == Some(failed.server_instance_id.as_str())
-        && (failure_code != Some(c2_error::ErrorCode::RouteStale)
-            || route.route_uid == failed.route_uid)
 }
 
 fn filter_routes_by_expected_contract(
@@ -1136,7 +1103,7 @@ mod tests {
         .with_http_only();
         let start = std::time::Instant::now();
         let error = client
-            .select_target_with_local_exclusions_async(true, &[], None, false, connect_budget(50))
+            .select_target_with_local_exclusions_async(true, &[], false, connect_budget(50))
             .await
             .unwrap_err();
         assert!(start.elapsed() < Duration::from_millis(500));
@@ -1144,13 +1111,7 @@ mod tests {
         responsive.store(true, Ordering::SeqCst);
         assert_eq!(
             client
-                .select_target_with_local_exclusions_async(
-                    false,
-                    &[],
-                    None,
-                    false,
-                    connect_budget(1000)
-                )
+                .select_target_with_local_exclusions_async(false, &[], false, connect_budget(1000))
                 .await
                 .unwrap()
                 .as_url(),
@@ -1221,13 +1182,7 @@ mod tests {
         .with_http_only();
         assert_connect_expired(
             client
-                .select_target_with_local_exclusions_async(
-                    false,
-                    &[],
-                    None,
-                    false,
-                    connect_budget(200),
-                )
+                .select_target_with_local_exclusions_async(false, &[], false, connect_budget(200))
                 .await
                 .unwrap_err(),
             "relay_probe",
@@ -1236,13 +1191,7 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         stall_probe.store(false, Ordering::SeqCst);
         client
-            .select_target_with_local_exclusions_async(
-                false,
-                &[],
-                None,
-                false,
-                connect_budget(1000),
-            )
+            .select_target_with_local_exclusions_async(false, &[], false, connect_budget(1000))
             .await
             .unwrap();
         assert_eq!(probes.load(Ordering::SeqCst), 2);
@@ -1281,13 +1230,7 @@ mod tests {
         let start = std::time::Instant::now();
         assert_connect_expired(
             client
-                .select_target_with_local_exclusions_async(
-                    false,
-                    &[],
-                    None,
-                    false,
-                    connect_budget(150),
-                )
+                .select_target_with_local_exclusions_async(false, &[], false, connect_budget(150))
                 .await
                 .unwrap_err(),
             "relay_resolve",
@@ -1324,7 +1267,7 @@ mod tests {
         RelayRouteInfo {
             name,
             relay_url,
-            route_uid: "grid-route-uid-0001".to_string(),
+
             ipc_address: None,
             server_id: None,
             server_instance_id: None,
@@ -1338,29 +1281,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stale_probe_refresh_selects_new_uid_on_same_relay_without_reprobing_old_token() {
-        let probes = Arc::new(Mutex::new(Vec::new()));
+    async fn not_found_probe_refreshes_same_relay_without_route_uid() {
+        let probes = Arc::new(AtomicUsize::new(0));
         let observed_probes = probes.clone();
         let (relay_url, relay_task) = spawn_app(Router::new().route(
             "/_probe/{route}",
             get(move |headers: axum::http::HeaderMap| {
                 let probes = observed_probes.clone();
                 async move {
-                    let uid = headers["x-c2-route-uid"].to_str().unwrap().to_owned();
-                    probes.lock().push(uid.clone());
-                    if uid == "old-uid" {
+                    assert!(!headers.contains_key(concat!("x-c2-route-", "uid")));
+                    if probes.fetch_add(1, Ordering::SeqCst) == 0 {
                         (
-                            StatusCode::CONFLICT,
+                            StatusCode::NOT_FOUND,
                             Json(canonical_error_json(
-                                704,
-                                "RouteStale",
-                                "stale token",
+                                701,
+                                "ResourceNotFound",
+                                "route unavailable",
                                 "grid",
                             )),
                         )
                             .into_response()
                     } else {
-                        assert_eq!(uid, "new-uid");
                         StatusCode::OK.into_response()
                     }
                 }
@@ -1374,14 +1315,9 @@ mod tests {
             "/_resolve/{route}",
             get(move || {
                 let count = observed_resolves.fetch_add(1, Ordering::SeqCst);
-                let mut old = route_info("grid".into(), advertised_relay.clone());
-                old.route_uid = "old-uid".into();
-                let mut routes = vec![old.clone()];
-                if count > 0 {
-                    old.route_uid = "new-uid".into();
-                    routes.push(old);
-                }
-                async move { Json(routes) }
+                let route = route_info("grid".into(), advertised_relay.clone());
+                let _ = count;
+                async move { Json(vec![route]) }
             }),
         ))
         .await;
@@ -1401,15 +1337,9 @@ mod tests {
         relay_task.abort();
         let _ = registry_task.await;
         let _ = relay_task.await;
-        assert_eq!(
-            result.unwrap(),
-            RelayResolvedTarget::Http {
-                relay_url,
-                route_uid: "new-uid".into(),
-            }
-        );
+        assert_eq!(result.unwrap(), RelayResolvedTarget::Http { relay_url });
         assert_eq!(resolves.load(Ordering::SeqCst), 2);
-        assert_eq!(*probes.lock(), ["old-uid", "new-uid"]);
+        assert_eq!(probes.load(Ordering::SeqCst), 2);
     }
 
     async fn registry_resolve(
@@ -1442,13 +1372,13 @@ mod tests {
     }
 
     #[test]
-    fn retry_proof_requires_stale_route_authority_and_never_capacity_or_crm_failure() {
-        let stale = HttpError::ServerError(
-            409,
-            canonical_error_json(704, "RouteStale", "stale token", "grid").to_string(),
+    fn retry_proof_requires_canonical_not_found_and_never_capacity_or_crm_failure() {
+        let missing = HttpError::ServerError(
+            404,
+            canonical_error_json(701, "ResourceNotFound", "route not found", "grid").to_string(),
         );
-        assert!(route_is_stale(&stale));
-        assert_eq!(http_call_error_phase(&stale), HttpCallPhase::PreDispatch);
+        assert!(route_not_found(&missing));
+        assert_eq!(http_call_error_phase(&missing), HttpCallPhase::PreDispatch);
 
         let mut rejected = canonical_error_json(701, "ResourceNotFound", "not executed", "grid");
         rejected["details"]["dispatch_phase"] = json!("pre_dispatch");
@@ -1505,7 +1435,7 @@ mod tests {
             HttpError::ServerError(429, capacity.to_string()),
             HttpError::ServerError(404, "ResourceNotFound in an untrusted body".into()),
             HttpError::CrmError({
-                let bytes = canonical_error_json(704, "RouteStale", "user error", "grid")
+                let bytes = canonical_error_json(701, "ResourceNotFound", "user error", "grid")
                     .to_string()
                     .into_bytes();
                 let budget = PayloadBufferBudget::new(bytes.capacity() as u64);
@@ -1516,7 +1446,7 @@ mod tests {
             }),
             HttpError::Transport("connection lost after POST".into()),
         ] {
-            assert!(!route_is_stale(&error));
+            assert!(!route_not_found(&error));
             assert_eq!(
                 http_call_error_phase(&error),
                 HttpCallPhase::DispatchUncertain
@@ -1524,9 +1454,29 @@ mod tests {
         }
     }
 
-    async fn stale_call(Path((route, _method)): Path<(String, String)>) -> Response {
-        let error = canonical_error_json(704, "RouteStale", "relay route token is stale", &route);
-        (StatusCode::CONFLICT, Json(error)).into_response()
+    #[test]
+    fn contract_identity_and_protocol_probe_refusals_are_terminal() {
+        for (code, name) in [
+            (709, "ContractMismatch"),
+            (710, "IdentityMismatch"),
+            (713, "ProtocolViolation"),
+        ] {
+            let refusal = HttpError::ServerError(
+                409,
+                canonical_error_json(code, name, "route refused", "grid").to_string(),
+            );
+            assert!(terminal_route_refusal(&refusal));
+        }
+        assert!(!terminal_route_refusal(&HttpError::ServerError(
+            409,
+            "untrusted ContractMismatch text".into(),
+        )));
+    }
+
+    async fn not_found_call(Path((route, _method)): Path<(String, String)>) -> Response {
+        let mut error = canonical_error_json(701, "ResourceNotFound", "route not found", &route);
+        error["details"]["dispatch_phase"] = json!("pre_dispatch");
+        (StatusCode::NOT_FOUND, Json(error)).into_response()
     }
 
     async fn generic_bad_gateway() -> Response {
@@ -1691,14 +1641,12 @@ mod tests {
                 .is_some_and(|v| v == TEST_SIGNATURE_HASH)
     }
 
-    fn route_token_headers_match(headers: &HeaderMap) -> bool {
-        headers
-            .get("x-c2-route-uid")
-            .is_some_and(|v| v == "grid-route-uid-0001")
+    fn route_uid_header_absent(headers: &HeaderMap) -> bool {
+        !headers.contains_key(concat!("x-c2-route-", "uid"))
     }
 
     async fn probe_requires_expected_crm_headers(headers: HeaderMap) -> Response {
-        if expected_crm_headers_match(&headers) && route_token_headers_match(&headers) {
+        if expected_crm_headers_match(&headers) && route_uid_header_absent(&headers) {
             StatusCode::OK.into_response()
         } else {
             (
@@ -1719,7 +1667,7 @@ mod tests {
         Path((route, _method)): Path<(String, String)>,
         body: Bytes,
     ) -> Response {
-        if expected_crm_headers_match(&headers) && route_token_headers_match(&headers) {
+        if expected_crm_headers_match(&headers) && route_uid_header_absent(&headers) {
             let mut out = b"ok:".to_vec();
             out.extend_from_slice(&body);
             (StatusCode::OK, out).into_response()
@@ -1747,22 +1695,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stale_post_is_not_replayed_and_the_next_call_resolves_again() {
-        let (stale_url, stale_handle) =
-            spawn_app(Router::new().route("/{route}/{method}", post(stale_call))).await;
+    async fn not_found_post_is_not_replayed_and_the_next_call_resolves_again() {
+        let (missing_url, missing_handle) =
+            spawn_app(Router::new().route("/{route}/{method}", post(not_found_call))).await;
         let (live_url, live_handle) =
             spawn_app(Router::new().route("/{route}/{method}", post(live_call))).await;
         let resolve_count = Arc::new(AtomicUsize::new(0));
-        let registry_state = RegistryState {
-            stale_url,
-            live_url,
-            resolve_count: resolve_count.clone(),
-        };
-        let (registry_url, registry_handle) = spawn_app(
-            Router::new()
-                .route("/_resolve/{name}", get(registry_resolve))
-                .with_state(registry_state),
-        )
+        let observed_resolves = resolve_count.clone();
+        let advertised_missing = missing_url.clone();
+        let advertised_live = live_url.clone();
+        let (registry_url, registry_handle) = spawn_app(Router::new().route(
+            "/_resolve/{name}",
+            get(move |Path(name): Path<String>| {
+                let count = observed_resolves.fetch_add(1, Ordering::SeqCst);
+                let url = if count == 0 {
+                    advertised_missing.clone()
+                } else {
+                    advertised_live.clone()
+                };
+                async move { Json(vec![route_info(name, url)]) }
+            }),
+        ))
         .await;
 
         let client = RelayAwareHttpClient::new(
@@ -1777,15 +1730,15 @@ mod tests {
         .unwrap();
 
         let error = client.call_async("step", b"payload").await.unwrap_err();
-        assert!(route_is_stale(&error));
+        assert!(route_not_found(&error));
         assert_eq!(
             resolve_count.load(Ordering::SeqCst),
             1,
             "one logical call does not replay its POST"
         );
         drop(error);
-        let next = client.call_async("step", b"payload").await.unwrap_err();
-        assert!(route_is_stale(&next));
+        let next = client.call_async("step", b"payload").await.unwrap();
+        assert_eq!(next, b"ok:payload");
         assert_eq!(
             resolve_count.load(Ordering::SeqCst),
             2,
@@ -1793,7 +1746,7 @@ mod tests {
         );
 
         registry_handle.abort();
-        stale_handle.abort();
+        missing_handle.abort();
         live_handle.abort();
     }
 
@@ -2085,14 +2038,12 @@ mod tests {
             address: "ipc://local-grid".to_string(),
             server_id: "local-grid".to_string(),
             server_instance_id: "inst-local-grid".to_string(),
-            route_uid: "grid-route-uid-0001".to_string(),
         };
 
         let target = client
             .select_target_with_local_exclusions_async(
                 true,
                 std::slice::from_ref(&failed),
-                None,
                 true,
                 c2_config::ConnectDeadline::default(),
             )
@@ -2103,7 +2054,6 @@ mod tests {
             target,
             RelayResolvedTarget::Http {
                 relay_url: live_url,
-                route_uid: "grid-route-uid-0001".to_string(),
             }
         );
         assert_eq!(resolve_count.load(Ordering::SeqCst), 1);
@@ -2143,14 +2093,12 @@ mod tests {
             address: "ipc://local-grid".to_string(),
             server_id: "local-grid".to_string(),
             server_instance_id: "inst-local-grid".to_string(),
-            route_uid: "grid-route-uid-0001".to_string(),
         };
 
         let err = client
             .select_target_with_local_exclusions_async(
                 true,
                 std::slice::from_ref(&failed),
-                None,
                 true,
                 c2_config::ConnectDeadline::default(),
             )
@@ -2164,49 +2112,20 @@ mod tests {
         registry_handle.abort();
     }
 
-    #[test]
-    fn failed_local_ipc_exclusion_ignores_replacement_token_on_same_endpoint() {
-        let failed = RelayLocalIpcCandidate {
-            address: "ipc://local-grid".to_string(),
-            server_id: "local-grid".to_string(),
-            server_instance_id: "inst-local-grid".to_string(),
-            route_uid: "grid-route-uid-0001".to_string(),
-        };
-        let refreshed_same_endpoint = RelayRouteInfo {
-            ipc_address: Some("ipc://local-grid".to_string()),
-            server_id: Some("local-grid".to_string()),
-            server_instance_id: Some("inst-local-grid".to_string()),
-            route_uid: "grid-route-uid-0002".to_string(),
-            ..route_info("grid".to_string(), "http://127.0.0.1:8080".to_string())
-        };
-
-        assert!(
-            filter_failed_local_ipc_candidates(vec![refreshed_same_endpoint], &[failed], None)
-                .is_empty(),
-            "same endpoint with a replacement token must stay excluded"
-        );
-    }
-
     #[tokio::test]
-    async fn local_stale_token_refresh_keeps_new_uid_but_endpoint_failure_stays_excluded() {
-        for code in [
-            None,
-            Some(c2_error::ErrorCode::ResourceUnavailable),
-            Some(c2_error::ErrorCode::RouteStale),
-        ] {
-            let count = Arc::new(AtomicUsize::new(0));
-            let (url, task) = spawn_app(
-                Router::new()
-                    .route(
-                        "/_resolve/{name}",
-                        get(registry_resolve_only_failed_local_ipc),
-                    )
-                    .with_state(RegistryState {
-                        stale_url: "http://127.0.0.1:9".into(),
-                        live_url: String::new(),
-                        resolve_count: count.clone(),
-                    }),
-            )
+    async fn local_failure_with_empty_fresh_resolution_is_fallback_denied() {
+        for status in [200, 404] {
+            let (url, task) = spawn_app(Router::new().route(
+                "/_resolve/{name}",
+                get(move || async move {
+                    let body = if status == 200 {
+                        "[]".to_string()
+                    } else {
+                        resource_not_found_body("grid")
+                    };
+                    (StatusCode::from_u16(status).unwrap(), body)
+                }),
+            ))
             .await;
             let client = RelayAwareHttpClient::new(
                 &url,
@@ -2219,40 +2138,90 @@ mod tests {
             )
             .unwrap();
             let failed = RelayLocalIpcCandidate {
-                address: "ipc://local-grid".into(),
-                server_id: "local-grid".into(),
-                server_instance_id: "inst-local-grid".into(),
-                route_uid: "old-uid".into(),
+                address: "ipc://failed".into(),
+                server_id: "failed".into(),
+                server_instance_id: "failed-process".into(),
             };
-            let result = client
+            let error = client
                 .select_target_with_local_exclusions_async(
                     true,
                     &[failed],
-                    code,
                     true,
                     c2_config::ConnectDeadline::default(),
                 )
-                .await;
+                .await
+                .unwrap_err();
+            assert!(matches!(&error, HttpError::ServerError(409, body)
+                if relay_error_code_is(body, c2_error::ErrorCode::FallbackDenied)));
             task.abort();
-            let _ = task.await;
-            if code == Some(c2_error::ErrorCode::RouteStale) {
-                assert_eq!(
-                    result.unwrap(),
-                    RelayResolvedTarget::Ipc {
-                        candidate: RelayLocalIpcCandidate {
-                            address: "ipc://local-grid".into(),
-                            server_id: "local-grid".into(),
-                            server_instance_id: "inst-local-grid".into(),
-                            route_uid: "grid-route-uid-0001".into(),
-                        },
-                    }
-                );
-            } else {
-                assert!(matches!(result, Err(HttpError::ServerError(409, body))
-                    if relay_error_code_is(&body, c2_error::ErrorCode::FallbackDenied)));
-            }
-            assert_eq!(count.load(Ordering::SeqCst), 1);
         }
+    }
+
+    #[test]
+    fn failed_local_ipc_exclusion_uses_endpoint_identity() {
+        let failed = RelayLocalIpcCandidate {
+            address: "ipc://local-grid".to_string(),
+            server_id: "local-grid".to_string(),
+            server_instance_id: "inst-local-grid".to_string(),
+        };
+        let refreshed_same_endpoint = RelayRouteInfo {
+            ipc_address: Some("ipc://local-grid".to_string()),
+            server_id: Some("local-grid".to_string()),
+            server_instance_id: Some("inst-local-grid".to_string()),
+
+            ..route_info("grid".to_string(), "http://127.0.0.1:8080".to_string())
+        };
+
+        assert!(
+            filter_failed_local_ipc_candidates(vec![refreshed_same_endpoint], &[failed]).is_empty(),
+            "the failed endpoint identity must stay excluded"
+        );
+    }
+
+    #[tokio::test]
+    async fn local_refresh_excludes_failed_endpoint_identity() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let (url, task) = spawn_app(
+            Router::new()
+                .route(
+                    "/_resolve/{name}",
+                    get(registry_resolve_only_failed_local_ipc),
+                )
+                .with_state(RegistryState {
+                    stale_url: "http://127.0.0.1:9".into(),
+                    live_url: String::new(),
+                    resolve_count: count.clone(),
+                }),
+        )
+        .await;
+        let client = RelayAwareHttpClient::new(
+            &url,
+            expected_contract(),
+            false,
+            RelayAwareClientConfig {
+                max_attempts: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let failed = RelayLocalIpcCandidate {
+            address: "ipc://local-grid".into(),
+            server_id: "local-grid".into(),
+            server_instance_id: "inst-local-grid".into(),
+        };
+        let result = client
+            .select_target_with_local_exclusions_async(
+                true,
+                &[failed],
+                true,
+                c2_config::ConnectDeadline::default(),
+            )
+            .await;
+        task.abort();
+        let _ = task.await;
+        assert!(matches!(result, Err(HttpError::ServerError(409, body))
+            if relay_error_code_is(&body, c2_error::ErrorCode::FallbackDenied)));
+        assert_eq!(count.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -2444,7 +2413,6 @@ mod tests {
                 address: "ipc://grid-server".to_string(),
                 server_id: "grid-server".to_string(),
                 server_instance_id: "inst-a".to_string(),
-                route_uid: "grid-route-uid-0001".to_string(),
             }),
         );
     }
@@ -2463,7 +2431,6 @@ mod tests {
         assert_eq!(candidate.address, "ipc://grid-server");
         assert_eq!(candidate.server_id, "grid-server");
         assert_eq!(candidate.server_instance_id, "inst-a");
-        assert_eq!(candidate.route_uid, "grid-route-uid-0001");
     }
 
     #[test]
@@ -2498,7 +2465,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn generic_502_is_not_treated_as_stale_route() {
+    async fn generic_502_does_not_prove_route_not_found() {
         let (bad_url, bad_handle) =
             spawn_app(Router::new().route("/{route}/{method}", post(generic_bad_gateway))).await;
         let (live_url, live_handle) =
@@ -2537,7 +2504,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn misleading_502_text_is_not_treated_as_stale_route() {
+    async fn misleading_502_text_does_not_prove_route_not_found() {
         let (bad_url, bad_handle) =
             spawn_app(Router::new().route("/{route}/{method}", post(misleading_bad_gateway))).await;
         let (live_url, live_handle) =
@@ -2606,7 +2573,7 @@ mod tests {
         .unwrap();
 
         let error = client.call_async("step", b"payload").await.unwrap_err();
-        assert!(route_is_stale(&error));
+        assert!(route_not_found(&error));
         assert_eq!(
             resolve_count.load(Ordering::SeqCst),
             1,
@@ -2614,7 +2581,7 @@ mod tests {
         );
         drop(error);
         let next = client.call_async("step", b"payload").await.unwrap_err();
-        assert!(route_is_stale(&next));
+        assert!(route_not_found(&next));
         assert_eq!(
             resolve_count.load(Ordering::SeqCst),
             2,
@@ -2627,7 +2594,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn generic_404_is_not_treated_as_stale_route() {
+    async fn generic_404_does_not_prove_route_not_found() {
         let (bad_url, bad_handle) =
             spawn_app(Router::new().route("/{route}/{method}", post(generic_not_found))).await;
         let (live_url, live_handle) =

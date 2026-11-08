@@ -45,6 +45,7 @@ macro_rules! define_error_codes {
     };
 }
 
+// Permanently retired: 704 RouteStale, 706 WriteConflict, 711 RouteCatalogCompacted. Never reassign.
 define_error_codes! {
     Unknown = 0,
     ResourceInputDeserializing = 1,
@@ -58,14 +59,11 @@ define_error_codes! {
     ResourceNotFound = 701,
     ResourceUnavailable = 702,
     ResourceAlreadyRegistered = 703,
-    RouteStale = 704,
     RegistryUnavailable = 705,
-    WriteConflict = 706,
     ResourceClosed = 707,
     ResourceRemoved = 708,
     ContractMismatch = 709,
     IdentityMismatch = 710,
-    RouteCatalogCompacted = 711,
     RouteWatchUnavailable = 712,
     ProtocolViolation = 713,
     FallbackDenied = 714,
@@ -247,10 +245,26 @@ mod tests {
     use std::collections::BTreeMap;
 
     #[test]
+    fn retired_error_codes_are_never_reassigned() {
+        for code in [704, 706, 711] {
+            assert!(ErrorCode::try_from(code).is_err());
+            assert!(
+                ErrorCode::registry()
+                    .iter()
+                    .all(|entry| u16::from(entry.code) != code)
+            );
+        }
+        assert_eq!(
+            ErrorCode::try_from(712),
+            Ok(ErrorCode::RouteWatchUnavailable)
+        );
+    }
+
+    #[test]
     fn error_code_registry_matches_canonical_wire_values() {
         use ErrorCode::*;
 
-        let expected: [(ErrorCode, u16, &str); 27] = [
+        let expected: [(ErrorCode, u16, &str); 24] = [
             (Unknown, 0, "Unknown"),
             (ResourceInputDeserializing, 1, "ResourceInputDeserializing"),
             (ResourceOutputSerializing, 2, "ResourceOutputSerializing"),
@@ -263,14 +277,11 @@ mod tests {
             (ResourceNotFound, 701, "ResourceNotFound"),
             (ResourceUnavailable, 702, "ResourceUnavailable"),
             (ResourceAlreadyRegistered, 703, "ResourceAlreadyRegistered"),
-            (RouteStale, 704, "RouteStale"),
             (RegistryUnavailable, 705, "RegistryUnavailable"),
-            (WriteConflict, 706, "WriteConflict"),
             (ResourceClosed, 707, "ResourceClosed"),
             (ResourceRemoved, 708, "ResourceRemoved"),
             (ContractMismatch, 709, "ContractMismatch"),
             (IdentityMismatch, 710, "IdentityMismatch"),
-            (RouteCatalogCompacted, 711, "RouteCatalogCompacted"),
             (RouteWatchUnavailable, 712, "RouteWatchUnavailable"),
             (ProtocolViolation, 713, "ProtocolViolation"),
             (FallbackDenied, 714, "FallbackDenied"),

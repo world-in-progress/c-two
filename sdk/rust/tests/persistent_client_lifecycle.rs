@@ -222,6 +222,9 @@ fn route_authority(path: PathKind) {
         fixture.finish();
         return;
     }
+    // This new acquisition resolves the now absent route without first trying
+    // a cached IPC candidate; the old proxy below still retains its carrier.
+    fixture.client_runtime.clear_relay_projection_cache();
     fixture::assert_semantic(
         fixture.connect_name("authority").unwrap_err(),
         if path == PathKind::Direct {
@@ -264,6 +267,7 @@ fn relay_local_removed_and_reregistered_routes_preserve_old_binding() {
     let outcome = route.registration.close().unwrap();
     assert!(outcome.local_removed && outcome.close.active_drained);
     assert!(outcome.close.close_error.is_none());
+    fixture.client_runtime.clear_relay_projection_cache();
     fixture::assert_semantic(
         fixture.connect_name("replacement").unwrap_err(),
         fixture::ErrorCode::ResourceNotFound,
@@ -492,35 +496,46 @@ fn relay_http_removed_route_refuses_acquire_and_old_call() {
     fixture.finish();
 }
 
-// Gates 2 and 6, HTTP replacement: the original cached business token is stale.
-// Its POST fails without entering the new resource; only an explicit next call
-// resolves again. Discovery is not refreshed between removal and replacement.
+// Gates 2 and 6, HTTP replacement: an old proxy reaches the current registration
+// even when its shared discovery cache still holds the previous route metadata.
 #[test]
-fn relay_http_reregistered_route_refuses_stale_post_then_resolves_next_call() {
-    let fixture = Fixture::new(PathKind::Http, 0.0, 0);
+fn relay_http_reregistered_route_accepts_old_cached_proxy() {
+    let fixture = Fixture::with_c3();
     let mut route = fixture.register("stale-http");
     let old = fixture.connect(&route);
     fixture.call(&old, &route, "before-replacement");
-    let old_uid = fixture.relay_route_uid(fixture::expected("stale-http"));
     assert!(route.registration.close().unwrap().local_removed);
     let replacement = fixture.register("stale-http");
-    assert_ne!(
-        old_uid,
-        fixture.relay_route_uid(fixture::expected("stale-http"))
-    );
-    fixture::assert_semantic(
-        old.call_owned("echo", &fixture::encode("stale"))
-            .unwrap_err(),
-        fixture::ErrorCode::RouteStale,
-    );
-    assert_eq!((route.calls(), replacement.calls()), (1, 0));
-    fixture.call(&old, &replacement, "explicit-next-call");
+    fixture.call(&old, &replacement, "old-cached-proxy");
+    assert_eq!((route.calls(), replacement.calls()), (1, 1));
     let fresh = fixture.connect(&replacement);
     fixture.call(&fresh, &replacement, "new-acquire");
     assert_eq!((route.calls(), replacement.calls()), (1, 2));
     assert!(fixture.outgoing_ids().is_empty());
     fixture.assert_paths(2);
     drop((old, fresh, route, replacement));
+    fixture.finish();
+}
+
+#[test]
+fn relay_http_other_acquire_refreshes_shared_cache_before_old_proxy_call() {
+    let fixture = Fixture::with_c3();
+    let mut route = fixture.register("shared-cache-http");
+    let old = fixture.connect(&route);
+    fixture.call(&old, &route, "before-replacement");
+    assert!(route.registration.close().unwrap().local_removed);
+    fixture::assert_semantic(
+        fixture.connect_name("shared-cache-http").unwrap_err(),
+        fixture::ErrorCode::ResourceNotFound,
+    );
+    let replacement = fixture.register("shared-cache-http");
+    let other = fixture.connect(&replacement);
+    fixture.call(&old, &replacement, "old-after-other-acquire");
+    fixture.call(&other, &replacement, "other-after-refresh");
+    assert_eq!((route.calls(), replacement.calls()), (1, 2));
+    assert!(fixture.outgoing_ids().is_empty());
+    fixture.assert_paths(2);
+    drop((old, other, route, replacement));
     fixture.finish();
 }
 
@@ -665,13 +680,16 @@ fn peer_end_and_recovery(path: PathKind) {
     );
     assert_ne!(peer.ready["resource"], replacement.ready["resource"]);
     assert_eq!(replacement.snapshot()["opens"], 0);
-    let refusal = old.call_owned("ping", &[]).unwrap_err();
     if path == PathKind::Http {
-        fixture::assert_semantic(refusal, fixture::ErrorCode::RouteStale);
+        old.call_owned("ping", &[]).unwrap();
     } else {
+        let refusal = old.call_owned("ping", &[]).unwrap_err();
         println!("C2_PERSISTENT_OLD_PROXY_REFUSAL {refusal:?}");
     }
-    assert_eq!(replacement.snapshot()["unary"], 0);
+    assert_eq!(
+        replacement.snapshot()["unary"],
+        if path == PathKind::Http { 1 } else { 0 }
+    );
     let fresh = replacement.connect(&fixture);
     if let Some(identity) = old.ipc_server_identity() {
         assert_eq!(
@@ -698,7 +716,7 @@ fn peer_end_and_recovery(path: PathKind) {
     let racing = replacement.snapshot();
     assert_eq!(racing["opens"], 1);
     assert_eq!(racing["finishes"], 0);
-    assert_eq!(racing["unary"], 0);
+    assert_eq!(racing["unary"], if path == PathKind::Http { 1 } else { 0 });
     if let Some(carrier) = &carrier {
         assert!(carrier.snapshot().is_none());
     }
@@ -714,7 +732,7 @@ fn peer_end_and_recovery(path: PathKind) {
     assert_eq!(after["finishes"], 1);
     fresh.call_owned("ping", &[]).unwrap();
     let healthy = replacement.snapshot();
-    assert_eq!(healthy["unary"], 1);
+    assert_eq!(healthy["unary"], if path == PathKind::Http { 2 } else { 1 });
     assert_eq!(
         healthy["physical_opened"], after["physical_opened"],
         "old evidence must not force a new data carrier"
@@ -733,9 +751,8 @@ fn peer_end_and_recovery(path: PathKind) {
     fixture.finish();
 }
 
-// Gate 4, HTTP: one upstream carrier serves A and the error routes. Closed,
-// removed and stale-token refusals preserve A and that carrier. Separate route
-// names keep the stale token cached while the closed/removed route is probed.
+// Gate 4, HTTP: one upstream carrier serves A and the other routes. Closed and
+// removed refusals preserve A; replacement serves B without disturbing A.
 #[test]
 fn relay_http_route_errors_preserve_other_route_inflight_call_and_carrier() {
     use c_two::observe::ConnectionEvent;
@@ -790,13 +807,8 @@ fn relay_http_route_errors_preserve_other_route_inflight_call_and_carrier() {
     );
     assert!(token.registration.close().unwrap().local_removed);
     let replacement = fixture.register("stale-b-http");
-    fixture::assert_semantic(
-        token_client
-            .call_owned("echo", &fixture::encode("stale"))
-            .unwrap_err(),
-        fixture::ErrorCode::RouteStale,
-    );
-    assert_eq!(replacement.calls(), 0);
+    fixture.call(&token_client, &replacement, "replaced");
+    assert_eq!(replacement.calls(), 1);
     assert!(!a_call.is_finished());
     assert!(carriers.iter().all(|carrier| carrier.snapshot().is_none()));
     a.evidence().release();
@@ -814,7 +826,7 @@ fn relay_http_route_errors_preserve_other_route_inflight_call_and_carrier() {
     assert!(carriers.iter().all(|carrier| carrier.snapshot().is_none()));
     assert_eq!(
         (a.calls(), b.calls(), token.calls(), replacement.calls()),
-        (2, 1, 1, 1)
+        (2, 1, 1, 2)
     );
     assert!(fixture.outgoing_ids().is_empty());
     fixture.assert_paths(4);

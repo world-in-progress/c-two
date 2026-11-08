@@ -5,7 +5,7 @@ use parking_lot::Mutex;
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use serde::{Deserialize, Serialize};
 
-use super::http_client::{HttpError, HttpRouteToken, runtime};
+use super::http_client::{HttpError, runtime};
 use c2_config::LocalEndpointContext;
 use c2_contract::ExpectedRouteContract;
 
@@ -138,7 +138,6 @@ struct AdminUnregisterRequest<'a> {
 pub struct RelayRouteInfo {
     pub name: String,
     pub relay_url: String,
-    pub route_uid: String,
     pub ipc_address: Option<String>,
     pub server_id: Option<String>,
     pub server_instance_id: Option<String>,
@@ -148,14 +147,6 @@ pub struct RelayRouteInfo {
     pub abi_hash: String,
     pub signature_hash: String,
     pub max_payload_size: u64,
-}
-
-impl RelayRouteInfo {
-    pub(crate) fn route_token(&self) -> HttpRouteToken {
-        HttpRouteToken {
-            route_uid: self.route_uid.clone(),
-        }
-    }
 }
 
 /// Routes and the relay namespace advertised by the discovery response header.
@@ -419,10 +410,6 @@ impl RelayControlClient {
             routes,
             local_endpoint_namespace,
         };
-        for route in &resolved.routes {
-            validate_resolved_route(route)?;
-        }
-
         // Prepare potentially large metadata before the publish check. A
         // deadline that expires while cloning must not populate the cache.
         let entry = CacheEntry {
@@ -544,12 +531,6 @@ impl RelayControlClient {
             local_endpoint_namespace: entry.local_endpoint_namespace.clone(),
         }))
     }
-}
-
-fn validate_resolved_route(route: &RelayRouteInfo) -> Result<(), HttpError> {
-    c2_contract::validate_call_route_key("route_uid", &route.route_uid)
-        .map_err(|err| HttpError::Transport(format!("malformed relay route token: {err}")))?;
-    Ok(())
 }
 
 #[cfg(test)]
@@ -781,7 +762,6 @@ mod tests {
                 routes: vec![RelayRouteInfo {
                     name: "grid".into(),
                     relay_url: "http://relay-a.test".into(),
-                    route_uid: "grid-route-uid-0001".into(),
                     ipc_address: None,
                     server_id: None,
                     server_instance_id: None,

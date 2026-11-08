@@ -642,7 +642,7 @@ mod tests {
                     .upstream_control_watch_unavailable_for_route(&fixture.entry)
                     .is_some()
             );
-            let (lease, binding) = tokio::time::timeout(
+            let (lease, binding, _) = tokio::time::timeout(
                 STEP,
                 fixture.state.acquire_upstream_for_route(&fixture.entry),
             )

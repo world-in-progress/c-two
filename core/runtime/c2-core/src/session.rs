@@ -2453,16 +2453,11 @@ impl Runtime {
     pub(crate) fn resolve_relay_connection_after_local_ipc_failures_with_deadline(
         client: RelayAwareHttpClient,
         failed_candidates: &[RelayLocalIpcCandidate],
-        failure_code: Option<c2_error::ErrorCode>,
         deadline: ConnectDeadline,
     ) -> Result<RelayResolvedConnection, crate::Error> {
         connect_stage_check(deadline, "relay_acquire")?;
         match client
-            .resolve_target_after_local_ipc_failures_with_deadline(
-                failed_candidates,
-                failure_code,
-                deadline,
-            )
+            .resolve_target_after_local_ipc_failures_with_deadline(failed_candidates, deadline)
             .map_err(|error| {
                 crate::normalize_http_error(error, crate::TransportPhase::PreDispatch)
             })? {

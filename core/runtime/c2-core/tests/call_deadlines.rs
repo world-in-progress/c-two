@@ -933,17 +933,17 @@ impl Drop for AsyncGateRelease {
 #[derive(Clone)]
 struct HttpCallState {
     calls: Arc<AtomicUsize>,
-    stale: bool,
+    route_missing: bool,
     uncertain_error: bool,
 }
 
 async fn http_echo(State(state): State<HttpCallState>, body: Bytes) -> (StatusCode, Vec<u8>) {
     state.calls.fetch_add(1, Ordering::SeqCst);
-    if state.stale {
+    if state.route_missing {
         return (
-            StatusCode::CONFLICT,
+            StatusCode::NOT_FOUND,
             serde_json::to_vec(
-                &C2Error::new(ErrorCode::RouteStale, "authoritative stale token")
+                &C2Error::new(ErrorCode::ResourceNotFound, "route no longer found")
                     .with_details(BTreeMap::from([(
                         "dispatch_phase".into(),
                         "pre_dispatch".into(),
@@ -957,8 +957,8 @@ async fn http_echo(State(state): State<HttpCallState>, body: Bytes) -> (StatusCo
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             C2Error::new(
-                ErrorCode::RouteStale,
-                "business error is not stale-route authority",
+                ErrorCode::ResourceFunctionExecuting,
+                "resource callback failed",
             )
             .to_wire_bytes(),
         );
@@ -966,14 +966,14 @@ async fn http_echo(State(state): State<HttpCallState>, body: Bytes) -> (StatusCo
     (StatusCode::OK, body.to_vec())
 }
 
-fn http_data(stale: bool, uncertain_error: bool, calls: Arc<AtomicUsize>) -> HttpServer {
+fn http_data(route_missing: bool, uncertain_error: bool, calls: Arc<AtomicUsize>) -> HttpServer {
     http_server(|_| {
         Router::new()
             .route("/_probe/{route}", get(|| async { StatusCode::OK }))
             .route("/{route}/{method}", post(http_echo))
             .with_state(HttpCallState {
                 calls,
-                stale,
+                route_missing,
                 uncertain_error,
             })
     })
@@ -1002,15 +1002,10 @@ async fn http_resolve(State(state): State<RefreshState>) -> Json<Vec<RelayRouteI
     Json(vec![state.next])
 }
 
-fn http_route(
-    expected: &c2_contract::ExpectedRouteContract,
-    url: &str,
-    token: u64,
-) -> RelayRouteInfo {
+fn http_route(expected: &c2_contract::ExpectedRouteContract, url: &str) -> RelayRouteInfo {
     RelayRouteInfo {
         name: expected.route_name.clone(),
         relay_url: url.into(),
-        route_uid: format!("route-{token}"),
         ipc_address: None,
         server_id: None,
         server_instance_id: None,
@@ -1039,8 +1034,8 @@ fn check_http_refresh(expire: bool, uncertain_error: bool, initial_resolve: bool
         Router::new()
             .route("/_resolve/{route}", get(http_resolve))
             .with_state(RefreshState {
-                first: http_route(&expected, &first.url, 1),
-                next: http_route(&expected, &next.url, 2),
+                first: http_route(&expected, &first.url),
+                next: http_route(&expected, &next.url),
                 resolves: resolves.clone(),
                 refresh_entered: entered,
                 gate: gate.clone(),
@@ -1068,7 +1063,11 @@ fn check_http_refresh(expire: bool, uncertain_error: bool, initial_resolve: bool
     let next_call = client.clone();
     let caller = std::thread::spawn(move || client.call_owned("echo", b"original-input"));
     if uncertain_error {
-        assert!(caller.join().unwrap().is_err());
+        let Error::Semantic(error) = caller.join().unwrap().unwrap_err() else {
+            panic!("resource failure must remain a semantic error");
+        };
+        assert_eq!(error.code, ErrorCode::ResourceFunctionExecuting);
+        assert!(!error.details.contains_key("dispatch_phase"));
         assert_eq!(resolves.load(Ordering::SeqCst), 1);
         assert_eq!(next_calls.load(Ordering::SeqCst), 0);
     } else if initial_resolve {
@@ -1090,12 +1089,12 @@ fn check_http_refresh(expire: bool, uncertain_error: bool, initial_resolve: bool
         observe_until(|| runtime.call_execution_snapshot().unwrap().used_operations == 0);
         assert_eq!(next_calls.load(Ordering::SeqCst), 0);
     } else {
-        let Error::Semantic(stale) = caller.join().unwrap().unwrap_err() else {
-            panic!("authoritative stale response must be semantic");
+        let Error::Semantic(not_found) = caller.join().unwrap().unwrap_err() else {
+            panic!("authoritative missing-route response must be semantic");
         };
-        assert_eq!(stale.code, ErrorCode::RouteStale);
+        assert_eq!(not_found.code, ErrorCode::ResourceNotFound);
         assert_eq!(
-            stale.details.get("dispatch_phase").map(String::as_str),
+            not_found.details.get("dispatch_phase").map(String::as_str),
             Some("pre_dispatch")
         );
         assert_eq!(resolves.load(Ordering::SeqCst), 1);
@@ -1132,16 +1131,16 @@ fn check_http_refresh(expire: bool, uncertain_error: bool, initial_resolve: bool
     assert_eq!(
         first_calls.load(Ordering::SeqCst),
         if initial_resolve { 0 } else { 1 },
-        "business POST must never replay to stale/uncertain endpoint"
+        "business POST must never replay to a failed endpoint"
     );
 }
 
 #[test]
-fn http_next_call_deadline_bounds_refresh_after_prior_stale() {
+fn http_next_call_deadline_bounds_refresh_after_prior_not_found() {
     check_http_refresh(true, false, false);
 }
 #[test]
-fn http_stale_error_refunds_input_and_next_call_refreshes() {
+fn http_not_found_error_refunds_input_and_next_call_refreshes() {
     check_http_refresh(false, false, false);
 }
 #[test]
@@ -1202,7 +1201,7 @@ fn http_explicit_unlimited_and_600_seconds_bypass_legacy_total_request_timer() {
     let gate = Arc::new(tokio::sync::Semaphore::new(0));
     let (entered_tx, entered) = mpsc::channel();
     let data = http_server(|url| {
-        let route = http_route(&expected, &url, 1);
+        let route = http_route(&expected, &url);
         Router::new()
             .route(
                 "/_resolve/{route}",

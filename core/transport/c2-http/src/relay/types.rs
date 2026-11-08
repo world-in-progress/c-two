@@ -114,7 +114,6 @@ pub struct RouteInfo {
     pub abi_hash: String,
     pub signature_hash: String,
     pub max_payload_size: u64,
-    pub route_uid: String,
 }
 
 impl RouteEntry {
@@ -145,7 +144,6 @@ impl RouteEntry {
             abi_hash: self.abi_hash.clone(),
             signature_hash: self.signature_hash.clone(),
             max_payload_size: self.max_payload_size,
-            route_uid: self.route_uid.clone(),
         }
     }
 }

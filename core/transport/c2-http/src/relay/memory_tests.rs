@@ -240,7 +240,8 @@ impl Upstream {
     }
 
     async fn acquire(&self, state: &RelayState) -> (UpstreamLease, Arc<IpcClient>, RouteBinding) {
-        let (lease, binding) = match bounded(state.acquire_upstream_for_route(&self.entry)).await {
+        let (lease, binding, _) = match bounded(state.acquire_upstream_for_route(&self.entry)).await
+        {
             Ok(value) => value,
             Err(_) => panic!("real attested upstream acquisition failed"),
         };
@@ -654,7 +655,6 @@ fn http_headers(entry: &RouteEntry) -> reqwest::header::HeaderMap {
             "x-c2-expected-signature-hash",
             entry.signature_hash.as_str(),
         ),
-        ("x-c2-route-uid", entry.route_uid.as_str()),
     ] {
         headers.insert(key, value.parse().unwrap());
     }

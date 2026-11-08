@@ -75,7 +75,7 @@ const ipc = {
   };
 const options = {
   async fetch(url, init) {
-    const record = {url, method: init.method, routeUid: init.headers?.['x-c2-route-uid']};
+    const record = {url, method: init.method};
     http.push(record);
     if (init.method === 'POST') await pauseAt('post');
     const response = await fetch(url, init);

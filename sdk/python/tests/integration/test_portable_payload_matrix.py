@@ -19,7 +19,6 @@ from c_two.error import (
     ContractMismatch,
     ResourceNotFound,
     ResourceRemoved,
-    RouteStale,
 )
 from c_two.transport.registry import _get_default_runtime, _reset_default_runtime
 from fastdb4py.payload import Payload
@@ -385,7 +384,7 @@ def test_route_disappearance_preserves_release_reference(
             expected_error = (
                 ResourceRemoved
                 if transport == "direct"
-                else (ResourceNotFound, RouteStale)
+                else ResourceNotFound
             )
             with pytest.raises(expected_error):
                 proxy.ping()

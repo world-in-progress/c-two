@@ -50,18 +50,17 @@ const EXPECTED_CRM_NAME_HEADER: &str = "x-c2-expected-crm-name";
 const EXPECTED_CRM_VER_HEADER: &str = "x-c2-expected-crm-ver";
 const EXPECTED_ABI_HASH_HEADER: &str = "x-c2-expected-abi-hash";
 const EXPECTED_SIGNATURE_HASH_HEADER: &str = "x-c2-expected-signature-hash";
-const ROUTE_UID_HEADER: &str = "x-c2-route-uid";
 const UNKNOWN_LENGTH_BODY_LIMIT_BYTES: u64 = 64 * 1024;
 const REJECTED_BODY_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 
 struct ReadyRequestClient {
     lease: UpstreamLease,
     binding: c2_ipc::RouteBinding,
+    route: RouteEntry,
 }
 
 enum RequestClient {
     Ready(Box<ReadyRequestClient>),
-    Stale(Box<RouteEntry>),
     WatchUnavailable {
         route: Box<RouteEntry>,
         reason: String,
@@ -69,10 +68,6 @@ enum RequestClient {
     NotFound,
     RouteError(c2_ipc::IpcError),
     Unreachable,
-}
-
-struct ExpectedRouteToken {
-    route_uid: String,
 }
 
 #[derive(Debug)]
@@ -135,7 +130,10 @@ fn resource_not_found_response(route_name: &str) -> Response {
         StatusCode::NOT_FOUND,
         c2_error::ErrorCode::ResourceNotFound,
         format!("route not found: {route_name}"),
-        [("route", route_name.to_string())],
+        [
+            ("route", route_name.to_string()),
+            ("dispatch_phase", "pre_dispatch".to_string()),
+        ],
     )
 }
 
@@ -147,7 +145,10 @@ fn resource_not_found_response_budgeted(
         StatusCode::NOT_FOUND,
         c2_error::ErrorCode::ResourceNotFound,
         format!("route not found: {route_name}"),
-        [("route", route_name.to_string())],
+        [
+            ("route", route_name.to_string()),
+            ("dispatch_phase", "pre_dispatch".to_string()),
+        ],
         budget,
     )
 }
@@ -554,29 +555,6 @@ fn crm_contract_mismatch_response_budgeted(
     )
 }
 
-fn protocol_violation_response(route_name: &str, message: impl Into<String>) -> Response {
-    c2_error_response(
-        StatusCode::BAD_REQUEST,
-        c2_error::ErrorCode::ProtocolViolation,
-        message,
-        [("route", route_name.to_string())],
-    )
-}
-
-fn protocol_violation_response_budgeted(
-    route_name: &str,
-    message: impl Into<String>,
-    budget: &PayloadBufferBudget,
-) -> Response {
-    c2_error_response_with_budget(
-        StatusCode::BAD_REQUEST,
-        c2_error::ErrorCode::ProtocolViolation,
-        message,
-        [("route", route_name.to_string())],
-        budget,
-    )
-}
-
 fn route_matches_expected_crm(
     route: &RouteEntry,
     expected: &c2_contract::ExpectedRouteContract,
@@ -587,79 +565,6 @@ fn route_matches_expected_crm(
         && route.crm_ver == expected.crm_ver
         && route.abi_hash == expected.abi_hash
         && route.signature_hash == expected.signature_hash
-}
-
-fn route_token_from_headers(
-    route_name: &str,
-    headers: &HeaderMap,
-    budget: Option<&PayloadBufferBudget>,
-) -> ResponseResult<ExpectedRouteToken> {
-    let route_uid = single_route_token_header(route_name, headers, ROUTE_UID_HEADER, budget)?
-        .ok_or_else(|| match budget {
-            Some(budget) => protocol_violation_response_budgeted(
-                route_name,
-                "route token header is required",
-                budget,
-            ),
-            None => protocol_violation_response(route_name, "route token header is required"),
-        })?;
-    c2_contract::validate_call_route_key("route_uid", &route_uid).map_err(|err| {
-        let message = format!("invalid route token header {ROUTE_UID_HEADER}: {err}");
-        match budget {
-            Some(budget) => protocol_violation_response_budgeted(route_name, message, budget),
-            None => protocol_violation_response(route_name, message),
-        }
-    })?;
-    Ok(ExpectedRouteToken { route_uid })
-}
-
-fn single_route_token_header(
-    route_name: &str,
-    headers: &HeaderMap,
-    header_name: &'static str,
-    budget: Option<&PayloadBufferBudget>,
-) -> ResponseResult<Option<String>> {
-    let mut values = headers.get_all(header_name).iter();
-    let Some(value) = values.next() else {
-        return Ok(None);
-    };
-    if values.next().is_some() {
-        let message = format!("route token header {header_name} must not be repeated");
-        return Err(match budget {
-            Some(budget) => protocol_violation_response_budgeted(route_name, message, budget),
-            None => protocol_violation_response(route_name, message),
-        }
-        .into());
-    }
-    value.to_str().map(str::to_string).map(Some).map_err(|_| {
-        match budget {
-            Some(budget) => protocol_violation_response_budgeted(
-                route_name,
-                "route token headers must be valid UTF-8",
-                budget,
-            ),
-            None => {
-                protocol_violation_response(route_name, "route token headers must be valid UTF-8")
-            }
-        }
-        .into()
-    })
-}
-
-fn validate_route_token_for_route(
-    route: &RouteEntry,
-    expected: &ExpectedRouteToken,
-    budget: Option<&PayloadBufferBudget>,
-) -> ResponseResult<()> {
-    if route.route_uid == expected.route_uid {
-        Ok(())
-    } else {
-        Err(match budget {
-            Some(budget) => route_stale_response_budgeted(route, budget),
-            None => route_stale_response(route),
-        }
-        .into())
-    }
 }
 
 fn register_contract_claim_from_body(
@@ -1914,13 +1819,6 @@ async fn handle_probe_in_context(
             Ok(route) => route,
             Err(response) => return response.into_response(),
         };
-    let route_token = match route_token_from_headers(&route_name, &headers, None) {
-        Ok(token) => token,
-        Err(response) => return response.into_response(),
-    };
-    if let Err(response) = validate_route_token_for_route(&advertised_route, &route_token, None) {
-        return response.into_response();
-    }
     #[cfg(test)]
     run_data_plane_after_precheck_hook(&state, &route_name);
     match acquire_request_client_for_route(state, &advertised_route).await {
@@ -1929,7 +1827,6 @@ async fn handle_probe_in_context(
             drop(lease);
             StatusCode::OK.into_response()
         }
-        RequestClient::Stale(route) => route_stale_response(&route),
         RequestClient::WatchUnavailable { route, reason } => {
             route_watch_unavailable_response(&route.name, reason)
         }
@@ -1963,15 +1860,6 @@ async fn call_handler(
             Ok(route) => route,
             Err(response) => return response.into_response(),
         };
-    let route_token = match route_token_from_headers(&route_name, &headers, Some(&budget)) {
-        Ok(token) => token,
-        Err(response) => return response.into_response(),
-    };
-    if let Err(response) =
-        validate_route_token_for_route(&advertised_route, &route_token, Some(&budget))
-    {
-        return response.into_response();
-    }
     let content_length = match declared_length.0 {
         Ok(value) => value,
         Err(message) => {
@@ -2193,13 +2081,16 @@ async fn forward_call(
     if server_stream && shutdown.is_cancelled() {
         return relay_shutdown_refusal(&route_name, &budget);
     }
-    let (lease, binding) =
+    let (lease, binding, current_route) =
         match acquire_request_client_for_route(state.clone(), &advertised_route).await {
             RequestClient::Ready(ready) => {
-                let ReadyRequestClient { lease, binding } = *ready;
-                (lease, binding)
+                let ReadyRequestClient {
+                    lease,
+                    binding,
+                    route,
+                } = *ready;
+                (lease, binding, route)
             }
-            RequestClient::Stale(route) => return route_stale_response_budgeted(&route, &budget),
             RequestClient::WatchUnavailable { route, reason } => {
                 return route_watch_unavailable_response_budgeted(&route.name, reason, &budget);
             }
@@ -2218,6 +2109,14 @@ async fn forward_call(
                 );
             }
         };
+    if input_len > current_route.max_payload_size {
+        return payload_too_large_response(
+            &route_name,
+            input_len,
+            current_route.max_payload_size,
+            &budget,
+        );
+    }
     let client = lease.client();
     if cancelled.is_cancelled() {
         return StatusCode::NO_CONTENT.into_response();
@@ -2417,11 +2316,12 @@ async fn acquire_request_client_for_route(
 ) -> RequestClient {
     let route_name = route.name.clone();
     match state.acquire_upstream_for_route(route).await {
-        Ok((lease, binding)) => {
-            RequestClient::Ready(Box::new(ReadyRequestClient { lease, binding }))
-        }
+        Ok((lease, binding, route)) => RequestClient::Ready(Box::new(ReadyRequestClient {
+            lease,
+            binding,
+            route,
+        })),
         Err(UpstreamAcquireError::NotFound) => RequestClient::NotFound,
-        Err(UpstreamAcquireError::Stale { route }) => RequestClient::Stale(Box::new(route)),
         Err(UpstreamAcquireError::WatchUnavailable { route, reason }) => {
             RequestClient::WatchUnavailable {
                 route: Box::new(route),
@@ -2455,37 +2355,6 @@ async fn acquire_request_client_for_route(
     }
 }
 
-fn route_stale_response(route: &RouteEntry) -> Response {
-    c2_error_response(
-        StatusCode::CONFLICT,
-        c2_error::ErrorCode::RouteStale,
-        format!(
-            "stale relay route token for {} uid={}",
-            route.name, route.route_uid
-        ),
-        [
-            ("route", route.name.clone()),
-            ("route_uid", route.route_uid.clone()),
-        ],
-    )
-}
-
-fn route_stale_response_budgeted(route: &RouteEntry, budget: &PayloadBufferBudget) -> Response {
-    c2_error_response_with_budget(
-        StatusCode::CONFLICT,
-        c2_error::ErrorCode::RouteStale,
-        format!(
-            "stale relay route token for {} uid={}",
-            route.name, route.route_uid
-        ),
-        [
-            ("route", route.name.clone()),
-            ("route_uid", route.route_uid.clone()),
-        ],
-        budget,
-    )
-}
-
 fn ipc_route_error_response(
     route_name: &str,
     error: &c2_ipc::IpcError,
@@ -2501,9 +2370,7 @@ fn ipc_route_error_response(
                 ErrorCode::ResourceNotFound => StatusCode::NOT_FOUND,
                 ErrorCode::UnsupportedCallMode => StatusCode::NOT_ACCEPTABLE,
                 ErrorCode::ResourceRemoved => StatusCode::GONE,
-                ErrorCode::RouteStale
-                | ErrorCode::ContractMismatch
-                | ErrorCode::IdentityMismatch => StatusCode::CONFLICT,
+                ErrorCode::ContractMismatch | ErrorCode::IdentityMismatch => StatusCode::CONFLICT,
                 ErrorCode::ResourceClosed
                 | ErrorCode::ResourceUnavailable
                 | ErrorCode::CallCapacityExceeded => StatusCode::SERVICE_UNAVAILABLE,
@@ -2754,21 +2621,6 @@ async fn echo_handler(body: Bytes) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn route_token_uses_uid_and_ignores_unknown_headers() {
-        let mut headers = HeaderMap::new();
-        headers.insert(ROUTE_UID_HEADER, "route-uid-0001".parse().unwrap());
-        let token = route_token_from_headers("grid", &headers, None)
-            .unwrap_or_else(|_| panic!("UID is a complete route token"));
-        assert_eq!(token.route_uid, "route-uid-0001");
-        headers.append("x-c2-route-revision", "invalid".parse().unwrap());
-        headers.append("x-c2-route-revision", "0".parse().unwrap());
-        headers.append("x-another-unknown-header", "ignored".parse().unwrap());
-        let token = route_token_from_headers("grid", &headers, None)
-            .unwrap_or_else(|_| panic!("unknown headers must be ignored"));
-        assert_eq!(token.route_uid, "route-uid-0001");
-    }
 
     use axum::body::{Body, to_bytes};
     use axum::extract::ConnectInfo;
@@ -3045,7 +2897,6 @@ mod tests {
         for (code, status) in [
             (ErrorCode::ResourceNotFound, StatusCode::NOT_FOUND),
             (ErrorCode::ResourceRemoved, StatusCode::GONE),
-            (ErrorCode::RouteStale, StatusCode::CONFLICT),
             (ErrorCode::ContractMismatch, StatusCode::CONFLICT),
             (ErrorCode::IdentityMismatch, StatusCode::CONFLICT),
             (ErrorCode::ResourceClosed, StatusCode::SERVICE_UNAVAILABLE),
@@ -3314,6 +3165,25 @@ mod tests {
         route_name: &str,
         marker: &'static [u8],
     ) -> Arc<Server> {
+        start_callback_server_in_context(
+            context,
+            address,
+            server_id,
+            server_instance_id,
+            route_name,
+            Arc::new(MarkerCallback { marker }),
+        )
+        .await
+    }
+
+    async fn start_callback_server_in_context(
+        context: &c2_config::LocalEndpointContext,
+        address: &str,
+        server_id: &str,
+        server_instance_id: &str,
+        route_name: &str,
+        callback: Arc<dyn CrmCallback>,
+    ) -> Arc<Server> {
         let server = Arc::new(
             Server::new_with_identity_and_endpoint(
                 context.endpoint(address).unwrap(),
@@ -3339,7 +3209,7 @@ mod tests {
                     concurrency_mode: ConcurrencyMode::ReadParallel,
                     limits: SchedulerLimits::default(),
                 },
-                Arc::new(MarkerCallback { marker }),
+                callback,
             )
             .unwrap();
         let reservation = server.reserve_route(route).await.unwrap();
@@ -3468,7 +3338,7 @@ mod tests {
                 namespace.as_deref() == Some(context.namespace_id())
             );
             assert_eq!(body[0]["name"], "grid");
-            assert_eq!(body[0]["route_uid"], "grid-uid");
+            assert!(body[0].get("route_uid").is_none());
         }
     }
 
@@ -4128,29 +3998,15 @@ mod tests {
             .header("x-c2-expected-signature-hash", TEST_SIGNATURE_HASH)
     }
 
-    fn add_route_token_headers(
-        builder: axum::http::request::Builder,
-        route: Option<&RouteEntry>,
-    ) -> axum::http::request::Builder {
-        match route {
-            Some(route) => builder.header("x-c2-route-uid", route.route_uid.as_str()),
-            None => builder,
-        }
-    }
-
     async fn post_call(state: Arc<RelayState>, name: &str, method: &str) -> StatusCode {
-        let route = state.local_route(name);
         let app = build_router(state);
         let response = app
             .oneshot(
-                add_route_token_headers(
-                    add_expected_echo_headers(
-                        Request::builder()
-                            .method("POST")
-                            .uri(format!("/{name}/{method}"))
-                            .header("content-type", "application/octet-stream"),
-                    ),
-                    route.as_ref(),
+                add_expected_echo_headers(
+                    Request::builder()
+                        .method("POST")
+                        .uri(format!("/{name}/{method}"))
+                        .header("content-type", "application/octet-stream"),
                 )
                 .body(Body::from(Vec::new()))
                 .unwrap(),
@@ -4167,18 +4023,14 @@ mod tests {
         name: &str,
         method: &str,
     ) -> (StatusCode, Vec<u8>) {
-        let route = state.local_route(name);
         let app = build_router(state);
         let response = app
             .oneshot(
-                add_route_token_headers(
-                    add_expected_echo_headers(
-                        Request::builder()
-                            .method("POST")
-                            .uri(format!("/{name}/{method}"))
-                            .header("content-type", "application/octet-stream"),
-                    ),
-                    route.as_ref(),
+                add_expected_echo_headers(
+                    Request::builder()
+                        .method("POST")
+                        .uri(format!("/{name}/{method}"))
+                        .header("content-type", "application/octet-stream"),
                 )
                 .body(Body::from(Vec::new()))
                 .unwrap(),
@@ -4198,21 +4050,17 @@ mod tests {
         crm_name: &str,
         crm_ver: &str,
     ) -> StatusCode {
-        let route = state.local_route(name);
         let app = build_router(state);
         let response = app
             .oneshot(
-                add_route_token_headers(
-                    add_expected_crm_tag_headers(
-                        Request::builder()
-                            .method("POST")
-                            .uri(format!("/{name}/{method}"))
-                            .header("content-type", "application/octet-stream"),
-                        crm_ns,
-                        crm_name,
-                        crm_ver,
-                    ),
-                    route.as_ref(),
+                add_expected_crm_tag_headers(
+                    Request::builder()
+                        .method("POST")
+                        .uri(format!("/{name}/{method}"))
+                        .header("content-type", "application/octet-stream"),
+                    crm_ns,
+                    crm_name,
+                    crm_ver,
                 )
                 .body(Body::from(Vec::new()))
                 .unwrap(),
@@ -4225,17 +4073,13 @@ mod tests {
     }
 
     async fn get_probe(state: Arc<RelayState>, name: &str) -> StatusCode {
-        let route = state.local_route(name);
         let app = build_router(state);
         let response = app
             .oneshot(
-                add_route_token_headers(
-                    add_expected_echo_headers(
-                        Request::builder()
-                            .method("GET")
-                            .uri(format!("/_probe/{name}")),
-                    ),
-                    route.as_ref(),
+                add_expected_echo_headers(
+                    Request::builder()
+                        .method("GET")
+                        .uri(format!("/_probe/{name}")),
                 )
                 .body(Body::empty())
                 .unwrap(),
@@ -4248,17 +4092,13 @@ mod tests {
     }
 
     async fn get_probe_response(state: Arc<RelayState>, name: &str) -> (StatusCode, Vec<u8>) {
-        let route = state.local_route(name);
         let app = build_router(state);
         let response = app
             .oneshot(
-                add_route_token_headers(
-                    add_expected_echo_headers(
-                        Request::builder()
-                            .method("GET")
-                            .uri(format!("/_probe/{name}")),
-                    ),
-                    route.as_ref(),
+                add_expected_echo_headers(
+                    Request::builder()
+                        .method("GET")
+                        .uri(format!("/_probe/{name}")),
                 )
                 .body(Body::empty())
                 .unwrap(),
@@ -4499,7 +4339,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn relay_probe_requires_route_token_headers_for_matching_route() {
+    async fn relay_probe_accepts_contract_without_retired_header() {
         let state = test_state();
         let address = format!(
             "ipc://relay_probe_missing_route_token_{}_{}",
@@ -4522,19 +4362,16 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(response.status(), StatusCode::OK);
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(body["version"], 1);
-        assert_eq!(body["code"], 713);
-        assert_eq!(body["name"], "ProtocolViolation");
-        assert_eq!(body["details"]["route"], "grid");
+        assert!(body.is_empty());
 
         shutdown_live_server(&server).await;
     }
 
     #[tokio::test]
-    async fn relay_probe_rejects_stale_external_route_token_before_acquire() {
+    async fn relay_probe_ignores_retired_header_value() {
+        let retired_header = concat!("x-c2-route-", "uid");
         let state = test_state();
         let address = format!(
             "ipc://relay_probe_stale_external_token_{}_{}",
@@ -4546,7 +4383,6 @@ mod tests {
             post_register(state.clone(), "grid", "server-grid", &address).await,
             StatusCode::CREATED,
         );
-        let current_route = state.local_route("grid").expect("route registered");
 
         let app = build_router(state);
         let response = app
@@ -4555,7 +4391,7 @@ mod tests {
                     Request::builder()
                         .method("GET")
                         .uri("/_probe/grid")
-                        .header("x-c2-route-uid", "stale-grid-route-uid"),
+                        .header(retired_header, "stale-grid-route-uid"),
                 )
                 .body(Body::empty())
                 .unwrap(),
@@ -4563,20 +4399,16 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(response.status(), StatusCode::OK);
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(body["version"], 1);
-        assert_eq!(body["code"], 704);
-        assert_eq!(body["name"], "RouteStale");
-        assert_eq!(body["details"]["route"], "grid");
-        assert_eq!(body["details"]["route_uid"], current_route.route_uid);
+        assert!(body.is_empty());
 
         shutdown_live_server(&server).await;
     }
 
     #[tokio::test]
-    async fn relay_probe_rejects_repeated_route_token_header() {
+    async fn relay_probe_ignores_repeated_retired_header() {
+        let retired_header = concat!("x-c2-route-", "uid");
         let state = test_state();
         let address = format!(
             "ipc://relay_probe_repeated_route_token_{}_{}",
@@ -4597,8 +4429,8 @@ mod tests {
                     Request::builder()
                         .method("GET")
                         .uri("/_probe/grid")
-                        .header("x-c2-route-uid", current_route.route_uid.as_str())
-                        .header("x-c2-route-uid", current_route.route_uid.as_str()),
+                        .header(retired_header, current_route.route_uid.as_str())
+                        .header(retired_header, current_route.route_uid.as_str()),
                 )
                 .body(Body::empty())
                 .unwrap(),
@@ -4606,13 +4438,9 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(response.status(), StatusCode::OK);
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(body["version"], 1);
-        assert_eq!(body["code"], 713);
-        assert_eq!(body["name"], "ProtocolViolation");
-        assert_eq!(body["details"]["route"], "grid");
+        assert!(body.is_empty());
 
         shutdown_live_server(&server).await;
     }
@@ -4700,7 +4528,12 @@ mod tests {
         assert_eq!(routes[0].ipc_address.as_deref(), Some("ipc://grid"));
         assert_eq!(routes[0].server_id.as_deref(), Some("server-grid"));
         assert_eq!(routes[0].server_instance_id.as_deref(), Some("inst-grid"));
-        assert_eq!(routes[0].route_uid, "grid-server-grid-uid");
+        assert!(
+            serde_json::to_value(&routes[0])
+                .unwrap()
+                .get("route_uid")
+                .is_none()
+        );
 
         let (status, routes) = get_resolve_routes_from(
             state,
@@ -4712,7 +4545,12 @@ mod tests {
         assert_eq!(routes[0].ipc_address, None);
         assert_eq!(routes[0].server_id, None);
         assert_eq!(routes[0].server_instance_id, None);
-        assert_eq!(routes[0].route_uid, "grid-server-grid-uid");
+        assert!(
+            serde_json::to_value(&routes[0])
+                .unwrap()
+                .get("route_uid")
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -5302,7 +5140,6 @@ mod tests {
                 registered_at: 1000.0,
             }));
         });
-        let route = state.local_route("grid");
         let app = build_router(state);
         let stream = futures::stream::once(async {
             panic!("oversized relay request body should not be polled");
@@ -5312,16 +5149,13 @@ mod tests {
 
         let response = app
             .oneshot(
-                add_route_token_headers(
-                    add_expected_echo_headers(
-                        Request::builder()
-                            .method("POST")
-                            .uri("/grid/ping")
-                            .header("content-type", "application/octet-stream")
-                            .header("content-length", "5")
-                            .header("expect", "100-continue"),
-                    ),
-                    route.as_ref(),
+                add_expected_echo_headers(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/grid/ping")
+                        .header("content-type", "application/octet-stream")
+                        .header("content-length", "5")
+                        .header("expect", "100-continue"),
                 )
                 .body(Body::from_stream(stream))
                 .unwrap(),
@@ -5359,7 +5193,6 @@ mod tests {
                 registered_at: 1000.0,
             }));
         });
-        let route = state.local_route("grid");
         let app = build_router(state);
         for values in [
             vec![axum::http::HeaderValue::from_static("5"); 2],
@@ -5372,10 +5205,8 @@ mod tests {
                 #[allow(unreachable_code)]
                 Ok::<Bytes, std::io::Error>(Bytes::new())
             });
-            let mut request = add_route_token_headers(
-                add_expected_echo_headers(Request::builder().method("POST").uri("/grid/ping")),
-                route.as_ref(),
-            );
+            let mut request =
+                add_expected_echo_headers(Request::builder().method("POST").uri("/grid/ping"));
             for value in values {
                 request = request.header(header::CONTENT_LENGTH, value);
             }
@@ -5410,18 +5241,14 @@ mod tests {
             Ok::<Bytes, std::io::Error>(Bytes::from(vec![b'b'; 32 * 1024])),
             Ok::<Bytes, std::io::Error>(Bytes::from_static(b"c")),
         ]);
-        let route = state.local_route("grid");
         let app = build_router(state);
         let response = app
             .oneshot(
-                add_route_token_headers(
-                    add_expected_echo_headers(
-                        Request::builder()
-                            .method("POST")
-                            .uri("/grid/ping")
-                            .header("content-type", "application/octet-stream"),
-                    ),
-                    route.as_ref(),
+                add_expected_echo_headers(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/grid/ping")
+                        .header("content-type", "application/octet-stream"),
                 )
                 .body(Body::from_stream(stream))
                 .unwrap(),
@@ -5457,15 +5284,12 @@ mod tests {
         let app = build_router(state.clone());
         let response = app
             .oneshot(
-                add_route_token_headers(
-                    add_expected_echo_headers(
-                        Request::builder()
-                            .method("POST")
-                            .uri("/grid/ping")
-                            .header("content-type", "application/octet-stream")
-                            .header("content-length", content_length),
-                    ),
-                    route.as_ref(),
+                add_expected_echo_headers(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/grid/ping")
+                        .header("content-type", "application/octet-stream")
+                        .header("content-length", content_length),
                 )
                 .body(Body::from(payload.clone()))
                 .unwrap(),
@@ -5476,7 +5300,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         assert_eq!(&body[..], payload.as_slice());
-        let (lease, _) = state
+        let (lease, _, _) = state
             .acquire_upstream_for_route(route.as_ref().unwrap())
             .await
             .unwrap_or_else(|_| panic!("route remains acquirable"));
@@ -5657,7 +5481,7 @@ mod tests {
                     .header(EXPECTED_CRM_VER_HEADER, "0.1.0")
                     .header(EXPECTED_ABI_HASH_HEADER, TEST_ABI_HASH)
                     .header(EXPECTED_SIGNATURE_HASH_HEADER, TEST_SIGNATURE_HASH)
-                    .header(ROUTE_UID_HEADER, &route.route_uid)
+
                     .body(vec![7; 32])
             };
             let blocked = request("blocked").send();
@@ -5846,6 +5670,7 @@ mod tests {
         new_address: &str,
         crm_ns: &'static str,
         crm_name: &'static str,
+        max_payload_size: u64,
     ) {
         let state_for_hook = state.clone();
         let route_for_hook = route_name.to_string();
@@ -5868,7 +5693,7 @@ mod tests {
                 "0.1.0".into(),
                 TEST_ABI_HASH.to_string(),
                 TEST_SIGNATURE_HASH.to_string(),
-                1024,
+                max_payload_size,
                 format!("{route_for_hook}-server-new-uid"),
                 None,
             ) {
@@ -5888,7 +5713,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn call_rejects_same_contract_route_replacement_after_precheck() {
+    async fn call_uses_current_registration_after_precheck() {
         let state = test_state();
         let suffix = unique_suffix();
         let route_name = format!("grid-token-toctou-call-{suffix}");
@@ -5929,22 +5754,135 @@ mod tests {
             &new_address,
             "test.echo",
             "Echo",
+            1024,
         );
 
         let (status, body) = post_call_response(state.clone(), &route_name, "ping").await;
-        assert_eq!(status, StatusCode::CONFLICT);
-        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(body["version"], 1);
-        assert_eq!(body["code"], 704);
-        assert_eq!(body["name"], "RouteStale");
-        assert_eq!(body["details"]["route"], route_name);
-        assert!(
-            !body.to_string().contains("new-route"),
-            "relay call must not replay against replacement route: {body}"
-        );
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, b"new-route");
 
         shutdown_live_server(&old_server).await;
         shutdown_live_server(&new_server).await;
+    }
+
+    // Gate 2: "没有在线注册时，调用在派发前失败，不进入任何资源".
+    // A replaced registration's smaller limit is also decided before the sole OPEN.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn replacement_payload_limit_is_checked_before_dispatch() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct CountCalls(Arc<AtomicUsize>);
+        impl CrmCallback for CountCalls {
+            fn invoke(
+                &self,
+                _: &str,
+                _: u16,
+                _: Vec<u8>,
+                _: Arc<c2_server::ResponsePool>,
+            ) -> Result<ResponseMeta, CrmError> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(ResponseMeta::Inline(Vec::new()))
+            }
+        }
+        #[cfg(unix)]
+        let root = crate::relay::test_support::EndpointTestRoot::new();
+        #[cfg(unix)]
+        let context = root.context();
+        #[cfg(windows)]
+        let context = c2_config::LocalEndpointContext::default_for_platform().unwrap();
+        for known_length in [true, false] {
+            let suffix = unique_suffix();
+            let route = format!("payload-replacement-{suffix}");
+            let old_address = format!("ipc://limit-old-{suffix}");
+            let new_address = format!("ipc://limit-new-{suffix}");
+            let calls = Arc::new(AtomicUsize::new(0));
+            let old = start_callback_server_in_context(
+                &context,
+                &old_address,
+                "server-old",
+                "server-old-instance",
+                &route,
+                Arc::new(CountCalls(calls.clone())),
+            )
+            .await;
+            let new = start_callback_server_in_context(
+                &context,
+                &new_address,
+                "server-new",
+                "server-new-instance",
+                &route,
+                Arc::new(CountCalls(calls.clone())),
+            )
+            .await;
+            let state = namespace_test_state(context.clone());
+            let clients = state.clients.clone();
+            let observer = tokio::spawn(async move {
+                clients.run().await;
+            });
+            // Test-owned registration attestation, without HTTP namespace-dependent setup.
+            assert!(matches!(
+                test_commit_registration!(
+                    &state,
+                    route.clone(),
+                    "server-old".into(),
+                    "server-old-instance".into(),
+                    old_address,
+                    "test.echo".into(),
+                    "Echo".into(),
+                    "0.1.0".into(),
+                    TEST_ABI_HASH.into(),
+                    TEST_SIGNATURE_HASH.into(),
+                    1024,
+                    format!("old-{suffix}"),
+                    None
+                ),
+                RegisterCommitResult::Registered { .. }
+            ));
+            install_route_swap_after_precheck(
+                state.clone(),
+                &route,
+                &new_address,
+                "test.echo",
+                "Echo",
+                3,
+            );
+            let mut request = add_expected_echo_headers(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/{route}/ping")),
+            );
+            let body = if known_length {
+                request = request.header("content-length", 4);
+                Body::from("data")
+            } else {
+                Body::from_stream(futures::stream::iter([Ok::<_, std::io::Error>(
+                    Bytes::from_static(b"data"),
+                )]))
+            };
+            let response = build_router(state.clone())
+                .oneshot(request.body(body).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+            let error: serde_json::Value =
+                serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                    .unwrap();
+            assert_eq!(error["max_payload_size"], 3);
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                0,
+                "neither registration may run"
+            );
+            state.stop_upstream_controls().await;
+            tokio::time::timeout(Duration::from_secs(5), state.clients.shutdown())
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(5), observer)
+                .await
+                .unwrap()
+                .unwrap();
+            shutdown_live_server(&old).await;
+            shutdown_live_server(&new).await;
+        }
     }
 
     async fn mismatched_route_replacement_after_precheck(probe: bool) {
@@ -5992,6 +5930,7 @@ mod tests {
             &new_address,
             "test.other",
             "OtherEcho",
+            1024,
         );
 
         let (status, body) = if probe {
@@ -6002,8 +5941,8 @@ mod tests {
         assert_eq!(status, StatusCode::CONFLICT);
         let error: c2_error::C2ErrorEnvelope = serde_json::from_slice(&body).unwrap();
         assert_eq!(error.version, 1);
-        assert_eq!(error.code, 704);
-        assert_eq!(error.name, "RouteStale");
+        assert_eq!(error.code, 709);
+        assert_eq!(error.name, "ContractMismatch");
         assert_eq!(error.details["route"], route_name);
 
         shutdown_live_server(&old_server).await;
@@ -6606,23 +6545,18 @@ mod tests {
         );
         state.evict_connection("grid");
 
-        let route = state.local_route("grid");
         let app = build_router(state.clone());
         let mut tasks = Vec::new();
         for _ in 0..16 {
             let app = app.clone();
-            let route = route.clone();
             tasks.push(tokio::spawn(async move {
                 let response = app
                     .oneshot(
-                        add_route_token_headers(
-                            add_expected_echo_headers(
-                                Request::builder()
-                                    .method("POST")
-                                    .uri("/grid/ping")
-                                    .header("content-type", "application/octet-stream"),
-                            ),
-                            route.as_ref(),
+                        add_expected_echo_headers(
+                            Request::builder()
+                                .method("POST")
+                                .uri("/grid/ping")
+                                .header("content-type", "application/octet-stream"),
                         )
                         .body(Body::from(Vec::new()))
                         .unwrap(),
@@ -6737,18 +6671,14 @@ mod tests {
         state.reconnect("builder", stale_client.into_shared());
         register_echo_route(&server, "builder").await;
 
-        let route = state.local_route("builder");
         let app = build_router(state.clone());
         let response = app
             .oneshot(
-                add_route_token_headers(
-                    add_expected_echo_headers(
-                        Request::builder()
-                            .method("POST")
-                            .uri("/builder/ping")
-                            .header("content-type", "application/octet-stream"),
-                    ),
-                    route.as_ref(),
+                add_expected_echo_headers(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/builder/ping")
+                        .header("content-type", "application/octet-stream"),
                 )
                 .body(Body::empty())
                 .unwrap(),

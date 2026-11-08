@@ -27,10 +27,6 @@ export type C2ObservedPath =
   | "RelayAwareLocalIpc"
   | "RelayAwareHttp";
 
-export interface C2RouteToken {
-  readonly routeUid: string;
-}
-
 export interface C2ServerIdentity {
   readonly serverId: string;
   readonly serverInstanceId: string;
@@ -193,7 +189,6 @@ export interface C2RelayAwareHttpTransportOptions<Payload extends C2ResponsePayl
 interface C2RelayRouteInfo {
   readonly name: string;
   readonly relayUrl: string;
-  readonly routeUid: string;
   readonly ipcAddress?: string | undefined;
   readonly serverId?: string | undefined;
   readonly serverInstanceId?: string | undefined;
@@ -693,7 +688,6 @@ export function createHttpRelayEncodedTransport<Payload extends C2ResponsePayloa
             candidate.relayUrl,
             routeName,
             routeContract,
-            candidate,
             headers,
             resolveTimeoutMs,
           );
@@ -715,7 +709,6 @@ export function createHttpRelayEncodedTransport<Payload extends C2ResponsePayloa
         route.relayUrl,
         routeName,
         routeContract,
-        route,
         method,
         requestPayload,
         headers,
@@ -830,7 +823,7 @@ export function createRelayAwareHttpEncodedTransport<Payload extends C2ResponseP
       let firstLocalFailure: unknown;
       let httpRequest: ReturnType<typeof encodeHttpUnaryInput> | undefined;
       const excludedRoutes = new Set<string>();
-      const excludedLocalRouteTokens = new Set<string>();
+      const excludedLocalEndpoints = new Set<string>();
       for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
         let routes: readonly C2RelayRouteInfo[];
         try {
@@ -846,6 +839,10 @@ export function createRelayAwareHttpEncodedTransport<Payload extends C2ResponseP
             attempt > 0,
           );
         } catch (error) {
+          if (excludedLocalEndpoints.size > 0 && error instanceof C2HttpRelayError &&
+              error.status === 404 && isRetryableRouteError(error)) {
+            throw samePathFallbackDeniedError(routeName, firstLocalFailure);
+          }
           lastError = error;
           if (isRetryableResolveError(error) && attempt + 1 < maxAttempts) {
             continue;
@@ -853,16 +850,19 @@ export function createRelayAwareHttpEncodedTransport<Payload extends C2ResponseP
           throw error;
         }
         if (routes.length === 0) {
+          if (excludedLocalEndpoints.size > 0) {
+            throw samePathFallbackDeniedError(routeName, firstLocalFailure);
+          }
           throw resourceNotFoundError(routeName);
         }
         const localRoute = selectLocalIpcRoute(
           routes,
           normalizedAnchorUrl,
           ipcOptions,
-          excludedLocalRouteTokens,
+          excludedLocalEndpoints,
         );
         if (localRoute !== undefined && ipcOptions !== undefined) {
-          const localTokenKey = routeTokenKey(localRoute);
+          const localEndpointKey = localRouteEndpointKey(localRoute);
           const localTransport = localTransportFor(localRoute);
           try {
             await localTransport.prepare(routeName, routeContract);
@@ -875,12 +875,9 @@ export function createRelayAwareHttpEncodedTransport<Payload extends C2ResponseP
             }
             firstLocalFailure ??= error;
             lastError = error;
-            excludedLocalRouteTokens.add(localTokenKey);
+            excludedLocalEndpoints.add(localEndpointKey);
             invalidateRelayRouteCache(routeCache, cacheKey);
-            const distinctRoutes = routes.filter(
-              (route) => !excludedLocalRouteTokens.has(routeTokenKey(route)),
-            );
-            if (distinctRoutes.length === 0) {
+            if (attempt + 1 >= maxAttempts) {
               throw samePathFallbackDeniedError(routeName, firstLocalFailure);
             }
             continue;
@@ -892,10 +889,8 @@ export function createRelayAwareHttpEncodedTransport<Payload extends C2ResponseP
             throw error;
           }
         }
-        const httpRoutes = routes.filter(
-          (route) => !excludedLocalRouteTokens.has(routeTokenKey(route)),
-        );
-        if (httpRoutes.length === 0 && excludedLocalRouteTokens.size > 0) {
+        const httpRoutes = routes.filter((route) => !localRouteEndpointIsExcluded(route, excludedLocalEndpoints));
+        if (httpRoutes.length === 0 && excludedLocalEndpoints.size > 0) {
           throw samePathFallbackDeniedError(routeName, firstLocalFailure);
         }
         const orderedRoutes = orderRelayRoutes(httpRoutes, currentRelayByCacheKey.get(cacheKey), excludedRoutes);
@@ -921,7 +916,6 @@ export function createRelayAwareHttpEncodedTransport<Payload extends C2ResponseP
               relayUrl,
               routeName,
               routeContract,
-              route,
               headers,
               resolveTimeoutMs,
             );
@@ -932,7 +926,6 @@ export function createRelayAwareHttpEncodedTransport<Payload extends C2ResponseP
               relayUrl,
               routeName,
               routeContract,
-              route,
               method,
               requestPayload,
               headers,
@@ -1413,7 +1406,6 @@ const C2_RESERVED_HTTP_HEADER_NAMES = new Set([
   "x-c2-expected-crm-ver",
   "x-c2-expected-abi-hash",
   "x-c2-expected-signature-hash",
-  "x-c2-route-uid",
 ]);
 const C2_MAX_RESPONSE_PAYLOAD_BYTES = 2_147_483_647;
 const C2_MAX_WIRE_TEXT_BYTES = 255;
@@ -1513,24 +1505,11 @@ function requestHeadersForRouteContract(customHeaders: Readonly<Record<string, s
   return headers;
 }
 
-function requestHeadersForResolvedRoute(
-  customHeaders: Readonly<Record<string, string>>,
-  routeContract: C2RouteContractIdentity,
-  route: C2RouteToken,
-): Readonly<Record<string, string>> {
-  const headers = {
-    ...requestHeadersForRouteContract(customHeaders, routeContract),
-  } as Record<string, string>;
-  headers["x-c2-route-uid"] = route.routeUid;
-  return headers;
-}
-
 async function probeResolvedHttpRoute(
   fetchImpl: C2Fetch,
   relayUrl: string,
   routeName: string,
   routeContract: C2RouteContractIdentity,
-  route: C2RelayRouteInfo,
   headers: Readonly<Record<string, string>>,
   timeoutMs: number,
 ): Promise<void> {
@@ -1541,7 +1520,7 @@ async function probeResolvedHttpRoute(
         `${relayUrl}/_probe/${encodePathSegment(routeName)}`,
         {
           method: "GET",
-          headers: requestHeadersForResolvedRoute(headers, routeContract, route),
+          headers: requestHeadersForRouteContract(headers, routeContract),
           signal,
         },
       );
@@ -1566,7 +1545,6 @@ async function callResolvedHttpRoute<Payload extends C2ResponsePayload>(
   relayUrl: string,
   routeName: string,
   routeContract: C2RouteContractIdentity,
-  route: C2RelayRouteInfo,
   method: string,
   requestPayload: Uint8Array,
   headers: Readonly<Record<string, string>>,
@@ -1582,7 +1560,7 @@ async function callResolvedHttpRoute<Payload extends C2ResponsePayload>(
         `${relayUrl}/${encodePathSegment(routeName)}/${encodePathSegment(method)}`,
         {
           method: "POST",
-          headers: requestHeadersForResolvedRoute(headers, routeContract, route),
+          headers: requestHeadersForRouteContract(headers, routeContract),
           body: requestPayload,
           signal,
         },
@@ -1624,7 +1602,6 @@ async function callResolvedHttpRoute<Payload extends C2ResponsePayload>(
 function localEndpointFailure(failure: unknown): boolean {
   const error = projectNativeError(failure);
   return error instanceof C2IpcTransportError && (
-    (error.code === 704 && error.details.stage === "route_binding") ||
     error.code === null || error.code === 702 || error.code === 707 || error.code === 710 ||
     error.category === "runtime_retired" || error.category === "protocol_version_mismatch"
   );
@@ -1671,9 +1648,9 @@ function normalizeRelayAwareIpcOptions<Payload extends C2ResponsePayload>(value:
   return value;
 }
 
-function selectLocalIpcRoute<Payload extends C2ResponsePayload>(routes: readonly C2RelayRouteInfo[], anchorUrl: string, ipcOptions: C2IpcTransportOptions<Payload> | undefined, excludedRouteTokens: ReadonlySet<string>): C2RelayRouteInfo | undefined {
+function selectLocalIpcRoute<Payload extends C2ResponsePayload>(routes: readonly C2RelayRouteInfo[], anchorUrl: string, ipcOptions: C2IpcTransportOptions<Payload> | undefined, excludedLocalEndpoints: ReadonlySet<string>): C2RelayRouteInfo | undefined {
   if (ipcOptions === undefined || !relayAnchorAllowsLocalIpc(anchorUrl)) return undefined;
-  return routes.find(route => route.ipcAddress !== undefined && route.serverId !== undefined && route.serverInstanceId !== undefined && !excludedRouteTokens.has(routeTokenKey(route)));
+  return routes.find(route => route.ipcAddress !== undefined && route.serverId !== undefined && route.serverInstanceId !== undefined && !localRouteEndpointIsExcluded(route, excludedLocalEndpoints));
 }
 
 function relayAnchorAllowsLocalIpc(anchorUrl: string): boolean {
@@ -1681,7 +1658,13 @@ function relayAnchorAllowsLocalIpc(anchorUrl: string): boolean {
   return hostname === "localhost" || hostname.startsWith("127.") || hostname === "::1" || hostname === "[::1]";
 }
 
-function routeTokenKey(route: C2RouteToken): string { return JSON.stringify([route.routeUid]); }
+function localRouteEndpointKey(route: C2RelayRouteInfo): string {
+  return JSON.stringify([route.ipcAddress, route.serverId, route.serverInstanceId]);
+}
+
+function localRouteEndpointIsExcluded(route: C2RelayRouteInfo, excluded: ReadonlySet<string>): boolean {
+  return route.ipcAddress !== undefined && route.serverId !== undefined && route.serverInstanceId !== undefined && excluded.has(localRouteEndpointKey(route));
+}
 
 function localCandidateFailureIsTerminal(error: unknown): boolean {
   return error instanceof C2IpcTransportError && (
@@ -1962,7 +1945,6 @@ function normalizeRelayRouteInfo(route: unknown, index: number): C2RelayRouteInf
       stringField(item, "relay_url", index),
       `C-Two relay resolve route ${index} relay_url`,
     ),
-    routeUid: stringField(item, "route_uid", index),
     ipcAddress,
     serverId,
     serverInstanceId,
@@ -2039,29 +2021,26 @@ function isRetryableRouteError(error: unknown): boolean {
   if (canonical === undefined) {
     return false;
   }
-  if (error.status === 404 && canonical.name === "ResourceNotFound") {
-    return true;
-  }
-  if (error.status === 409 && canonical.name === "RouteStale") {
+  if (error.status === 404 && canonical.code === 701 && canonical.name === "ResourceNotFound") {
     return true;
   }
   return (
     error.status === 502 &&
-    canonical.name === "ResourceUnavailable" &&
+    canonical.code === 702 && canonical.name === "ResourceUnavailable" &&
     canonical.details.dispatch_phase === "pre_dispatch"
   );
 }
 
 function parseCanonicalRelayError(
   body: string,
-): { readonly name: string; readonly details: Readonly<Record<string, unknown>> } | undefined {
+): { readonly code: number; readonly name: string; readonly details: Readonly<Record<string, unknown>> } | undefined {
   try {
     const parsed = JSON.parse(body) as unknown;
     if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
       return undefined;
     }
     const record = parsed as Record<string, unknown>;
-    if (typeof record.name !== "string") {
+    if (record.version !== 1 || !Number.isSafeInteger(record.code) || typeof record.name !== "string") {
       return undefined;
     }
     if (
@@ -2072,6 +2051,7 @@ function parseCanonicalRelayError(
       return undefined;
     }
     return {
+      code: record.code as number,
       name: record.name,
       details: record.details as Readonly<Record<string, unknown>>,
     };

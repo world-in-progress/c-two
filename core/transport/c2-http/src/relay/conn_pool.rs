@@ -377,6 +377,30 @@ impl ConnectionPool {
                 .renew_owner_lease(token, self.owner_lease_deadline())
     }
 
+    /// Renew only the slot and physical client captured by this acquisition.
+    pub fn renew_lease_owner(&self, lease: &UpstreamLease) -> bool {
+        let inner = self.inner.lock();
+        let Some(slot) = inner.entries.get(&lease.slot.key) else {
+            return false;
+        };
+        if !Arc::ptr_eq(slot, &lease.slot) {
+            return false;
+        }
+        let mut owner = slot.inner.lock();
+        if owner.state == SlotState::Retired
+            || !owner
+                .client
+                .as_ref()
+                .is_some_and(|client| Arc::ptr_eq(client, &lease.client))
+        {
+            return false;
+        }
+        owner.owner_lease_epoch = owner.owner_lease_epoch.saturating_add(1);
+        owner.owner_lease_deadline = self.owner_lease_deadline();
+        true
+    }
+
+    #[cfg(test)]
     pub fn renew_current_owner_lease(&self, key: &UpstreamEndpointKey) -> bool {
         let Some(slot) = self.slot(key) else {
             return false;
@@ -859,6 +883,7 @@ impl UpstreamLease {
         self.slot.address()
     }
 
+    #[cfg(test)]
     pub fn endpoint(&self) -> UpstreamEndpointKey {
         self.slot.key.clone()
     }

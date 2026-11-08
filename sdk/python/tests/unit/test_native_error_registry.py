@@ -9,17 +9,24 @@ def test_native_error_registry_exposes_canonical_codes():
     assert registry["ClientOutputFromBuffer"] == 8
     assert registry["ResourceUnavailable"] == 702
     assert registry["ResourceAlreadyRegistered"] == 703
-    assert registry["RouteStale"] == 704
     assert registry["RegistryUnavailable"] == 705
-    assert registry["WriteConflict"] == 706
     assert registry["ResourceClosed"] == 707
     assert registry["ResourceRemoved"] == 708
     assert registry["ContractMismatch"] == 709
     assert registry["IdentityMismatch"] == 710
-    assert registry["RouteCatalogCompacted"] == 711
+    retired_names = {"".join(parts) for parts in (
+        ("Route", "Stale"), ("Write", "Conflict"), ("Route", "Catalog", "Compacted"),
+    )}
+    assert not retired_names & registry.keys()
     assert registry["RouteWatchUnavailable"] == 712
     assert registry["ProtocolViolation"] == 713
     assert registry["FallbackDenied"] == 714
+
+
+def test_retired_codes_encode_as_unknown():
+    for code in (704, 706, 711):
+        wire = _native.encode_error_wire(code, "retired", {})
+        assert _native.decode_error_wire_parts(memoryview(wire)) == (0, "retired", {})
 
 
 def test_native_decode_error_wire_parts_known_code():

@@ -158,8 +158,8 @@ def test_real_process_same_endpoint_reregistration_reaches_current_resource(lab,
 
 
 @pytest.mark.parametrize("lab", ["relay_aware_relay"], indirect=True)
-def test_http_stale_post_is_not_replayed_and_next_call_resolves(lab, private_root):
-    """Gates 2/6: a stale business POST fails once, then the caller may retry."""
+def test_http_old_proxy_uses_current_registration_with_cached_and_refreshed_metadata(lab, private_root):
+    """Gate 2: old HTTP proxies reach each new registration exactly once."""
     old = lab.register("stale")
     resolver = SnapshotResolver(lab.routes("stale"))
     client = cc.Runtime()
@@ -170,24 +170,35 @@ def test_http_stale_post_is_not_replayed_and_next_call_resolves(lab, private_roo
     try:
         proxy = client.connect(Lifecycle, name=lab.name("stale"), timeout=3)
         assert proxy.client.observed_path == "relay_aware_relay"
-        old_uid = resolver.routes[0]["route_uid"]
         lab.assert_reply(proxy.call("old"), old, "old")
         lab.server.unregister(lab.name("stale"))
         new = lab.register("stale")
-        current = lab.routes("stale")
-        assert current[0]["route_uid"] != old_uid
-        with pytest.raises(cc.error.RouteStale):
-            proxy.call("must-not-replay")
-        assert new.snapshot() == {}
         requests_before = resolver.requests
-        resolver.routes = current
-        lab.assert_reply(proxy.call("caller-retries"), new, "caller-retries")
-        assert resolver.requests == requests_before + 1
+        lab.assert_reply(proxy.call("old-cached"), new, "old-cached")
+        assert resolver.requests == requests_before
         assert new.snapshot() == {"call": 1}
         assert old.snapshot() == {"call": 1}
-        lab.extra["stale_http"] = {"observed_path": proxy.client.observed_path,
-                                  "old_uid": old_uid, "new_uid": current[0]["route_uid"],
-                                  "resolve_requests": resolver.requests}
+        lab.server.unregister(lab.name("stale"))
+        # The real relay's pre-dispatch refusal invalidates the shared cache;
+        # a subsequent independent acquire supplies the fresh observation.
+        with pytest.raises(cc.error.ResourceNotFound) as missing:
+            proxy.call("missing-before-replacement")
+        lab.assert_pre_dispatch(missing.value)
+        assert new.snapshot() == {"call": 1}
+        latest = lab.register("stale")
+        resolver.routes = lab.routes("stale")
+        other = client.connect(Lifecycle, name=lab.name("stale"), timeout=3)
+        try:
+            assert other.client.observed_path == "relay_aware_relay"
+            lab.assert_reply(proxy.call("old-after-refresh"), latest, "old-after-refresh")
+            lab.assert_reply(other.call("other-after-refresh"), latest, "other-after-refresh")
+            assert latest.snapshot() == {"call": 2}
+            assert resolver.requests > requests_before
+        finally:
+            cc.close(other)
+        lab.extra["current_http"] = {"observed_path": proxy.client.observed_path,
+                                     "resolve_requests": resolver.requests,
+                                     "current_calls": latest.snapshot()}
     finally:
         if proxy is not None:
             cc.close(proxy)
@@ -225,7 +236,6 @@ def test_late_candidate_cannot_withdraw_or_close_current_owner(lab, private_root
     lab.register("manager")
     old = lab.register("candidate")
     old_proxy = lab.connect("candidate")
-    old_uid = lab.routes("candidate")[0]["route_uid"]
     lab.assert_reply(old_proxy.call("old"), old, "old")
     namespace = cc.endpoint.local_endpoint_context(root=private_root).namespace_id
     resolver = SnapshotResolver(lab.routes("candidate"), namespace=namespace, pause_first=True)
@@ -244,8 +254,6 @@ def test_late_candidate_cannot_withdraw_or_close_current_owner(lab, private_root
                 lab.server.unregister(lab.name("candidate"))
                 replacement = lab.register("candidate")
                 current = lab.connect("candidate")
-                new_uid = lab.routes("candidate")[0]["route_uid"]
-                assert new_uid != old_uid
                 lab.assert_reply(current.call("new"), replacement, "new")
                 running = threads.submit(current.blocked)
                 assert replacement.entered.wait(5)
@@ -269,11 +277,13 @@ def test_late_candidate_cannot_withdraw_or_close_current_owner(lab, private_root
                 assert len(lab.accepted.ids("opened", "server") - accepted) == (1 if lab.path == "relay_aware_local_ipc" else 0)
                 assert len(events.ids("opened", "client")) == (1 if lab.path == "relay_aware_local_ipc" else 0)
                 assert len(lab.outgoing.ids("opened", "client")) == len(carrier)
-                assert resolver.requests == (1 if lab.path == "relay_aware_local_ipc" else 2)
+                # Same-relay replacement is accepted by name on both paths.
+                assert resolver.requests == 1
                 routes = lab.routes("candidate")
-                assert routes[0]["route_uid"] == new_uid
+                assert routes[0]["relay_url"] == lab.owner.url
+                if lab.path == "relay_aware_local_ipc":
+                    assert routes[0]["server_instance_id"] == lab.identity["server_instance_id"]
                 lab.extra["late_candidate"] = {
-                    "old_uid": old_uid, "new_uid": new_uid,
                     "observed_path": candidate.client.observed_path,
                     "identity": lab.identity, "resolves": resolver.requests,
                     "calls": replacement.snapshot(),
@@ -305,7 +315,7 @@ def test_background_idle_eviction_then_concurrent_reconnect(lab):
     lab.client.set_client(ipc_overrides={"client_idle_timeout": 0.1})
     resource = lab.register("idle")
     proxy = lab.connect("idle")
-    uid = lab.routes("idle")[0]["route_uid"] if lab.anchor is not None else None
+    original_instance = lab.routes("idle")[0]["server_instance_id"] if lab.anchor is not None else None
     lab.assert_reply(proxy.call("before-idle"), resource, "before-idle")
     outgoing_before = lab.outgoing.ids("opened", "client")
     accepted_before = lab.accepted.ids("opened", "server")
@@ -322,7 +332,7 @@ def test_background_idle_eviction_then_concurrent_reconnect(lab):
     assert resource.snapshot() == {"call": 1}
     if lab.anchor is not None:
         routes = lab.wait_route("idle")
-        assert routes[0]["route_uid"] == uid
+        assert routes[0]["server_instance_id"] == original_instance
         assert routes[0]["relay_url"] == lab.owner.url
     barrier = threading.Barrier(4)
 
@@ -381,10 +391,10 @@ def test_other_route_refusal_preserves_inflight_held_response(lab, transition):
                             else cc.error.ResourceRemoved)
                 if transition == "replaced":
                     replacement = lab.register("b")
-            if transition == "replaced" and lab.path != "relay_aware_relay":
+            if transition == "replaced":
                 lab.assert_reply(b.call("replaced"), replacement, "replaced")
             else:
-                with pytest.raises(cc.error.RouteStale if transition == "replaced" else expected) as refused:
+                with pytest.raises(expected) as refused:
                     b.call("refused")
                 if lab.path != "relay_aware_relay":
                     lab.assert_pre_dispatch(refused.value)
@@ -396,7 +406,7 @@ def test_other_route_refusal_preserves_inflight_held_response(lab, transition):
                 lab.assert_reply(b_running.result(5), second, "x" * (256 * 1024))
                 removing.result(5)
             if transition == "replaced":
-                assert replacement.snapshot() == ({"call": 1} if lab.path != "relay_aware_relay" else {})
+                assert replacement.snapshot() == {"call": 1}
         finally:
             first.release.set()
             second.release.set()
@@ -412,7 +422,7 @@ def test_other_route_refusal_preserves_inflight_held_response(lab, transition):
     assert first.snapshot() == {"blocked": 1, "call": 1}
     assert second.snapshot() == ({"call": 1, "blocked": 1} if transition == "closed" else {"call": 1})
     if transition == "replaced":
-        assert replacement.snapshot() == ({"call": 1} if lab.path != "relay_aware_relay" else {})
+        assert replacement.snapshot() == {"call": 1}
 
 
 def test_peer_eof_is_uncertain_and_new_acquire_uses_new_instance(lab, private_root, tmp_path):

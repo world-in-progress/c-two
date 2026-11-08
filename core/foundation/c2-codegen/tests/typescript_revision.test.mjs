@@ -43,13 +43,13 @@ for(const maxAttempts of [2,3])test(`FallbackDenied retains first local IPC caus
   const failures=['ConnectionRefused','ConnectionReset'].map(ioKind=>{
     const error=new Error(ioKind);error.nativeDetails={message:ioKind,transportPhase:'pre_dispatch',category:'ipc',ioOperation:'connect',ioKind};return error;
   });
-  const routes=['a','b'].map((id,index)=>({name:'route',relay_url:`http://localhost:${8301+index}`,route_uid:id,ipc_address:`ipc://${id}`,server_id:id,server_instance_id:'i',crm_ns:'test',crm_name:'Test',crm_ver:'0.1.0',abi_hash:hash,signature_hash:hash,max_payload_size:100}));
+  const routes=['a','b'].map((id,index)=>({name:'route',relay_url:`http://localhost:${8301+index}`,ipc_address:`ipc://${id}`,server_id:id,server_instance_id:'i',crm_ns:'test',crm_name:'Test',crm_ver:'0.1.0',abi_hash:hash,signature_hash:hash,max_payload_size:100}));
   let posts=0;const attempts=[];
   const fetch=async(_url,init)=>{if(init.method==='POST')posts++;return {status:200,async text(){return JSON.stringify(routes)},async arrayBuffer(){return new ArrayBuffer(0)}}};
   const connect=async address=>({async prepare(){const index=address==='ipc://a'?0:1;attempts.push(index);throw failures[index]},beginCall(){throw Error('unexpected dispatch')},async close(){},deactivate(){}});
   const client=transport.createRelayAwareHttpEncodedTransport('http://localhost:8300',{fetch,ipc:{connect},maxAttempts});
   await assert.rejects(client.call('route',contract,'ping',()=>new Uint8Array()),error=>{
-    assert.equal(typeof error.body,'string','both failed local tokens leave no independent fallback');
+    assert.equal(typeof error.body,'string','both failed local endpoints leave no independent fallback');
     assert.equal(JSON.parse(error.body).name,'FallbackDenied');
     assert.deepEqual(JSON.parse(error.body).details,{route:'route'});
     assert.equal(error.cause.nativeDetails.ioKind,'ConnectionRefused');
@@ -58,11 +58,74 @@ for(const maxAttempts of [2,3])test(`FallbackDenied retains first local IPC caus
   assert.deepEqual(attempts,[0,1]);assert.equal(posts,0);
 });
 
+test('fresh resolve excludes the same failed local endpoint identity',async()=>{
+  const failure=new Error('refused');
+  failure.nativeDetails={message:'refused',transportPhase:'pre_dispatch',category:'ipc',ioOperation:'connect',ioKind:'ConnectionRefused'};
+  const route={name:'route',relay_url:'http://localhost:8301',ipc_address:'ipc://same',server_id:'s',server_instance_id:'i',crm_ns:'test',crm_name:'Test',crm_ver:'0.1.0',abi_hash:hash,signature_hash:hash,max_payload_size:100};
+  let resolves=0,connects=0,posts=0;
+  const fetch=async(_url,init)=>{if(init.method==='POST')posts++;else resolves++;return {status:200,async text(){return JSON.stringify([route])},async arrayBuffer(){return new ArrayBuffer(0)}}};
+  const connect=async()=>{connects++;return {async prepare(){throw failure},beginCall(){throw Error('unexpected dispatch')},async close(){},deactivate(){}}};
+  const client=transport.createRelayAwareHttpEncodedTransport('http://localhost:8300',{fetch,ipc:{connect},maxAttempts:3});
+  await assert.rejects(client.call('route',contract,'ping',()=>new Uint8Array()),error=>{
+    assert.equal(JSON.parse(error.body).name,'FallbackDenied');
+    assert.equal(error.cause.nativeDetails.ioKind,'ConnectionRefused');
+    return true;
+  });
+  assert.equal(resolves,2);
+  assert.equal(connects,1);
+  assert.equal(posts,0);
+  await client.close();
+});
+
+for (const response of ['empty', 'not-found']) test(`empty fresh resolve retains first local cause (${response})`,async()=>{
+  const first=new Error('first refused');
+  first.nativeDetails={message:'first refused',transportPhase:'pre_dispatch',category:'ipc',ioOperation:'connect',ioKind:'ConnectionRefused'};
+  const route={name:'route',relay_url:'http://localhost:8301',ipc_address:'ipc://same',server_id:'s',server_instance_id:'i',crm_ns:'test',crm_name:'Test',crm_ver:'0.1.0',abi_hash:hash,signature_hash:hash,max_payload_size:100};
+  let resolves=0,posts=0;
+  const fetch=async(_url,init)=>{
+    if(init.method==='POST'){posts++;throw Error('unexpected POST')}
+    resolves++;
+    if(resolves===1)return {status:200,async text(){return JSON.stringify([route])}};
+    return response==='empty' ? {status:200,async text(){return '[]'}} :
+      {status:404,async text(){return JSON.stringify({version:1,code:701,name:'ResourceNotFound',message:'missing',details:{}})}};
+  };
+  const connect=async()=>({async prepare(){throw first},beginCall(){throw Error('unexpected dispatch')},async close(){},deactivate(){}});
+  const client=transport.createRelayAwareHttpEncodedTransport('http://localhost:8300',{fetch,ipc:{connect},maxAttempts:3});
+  await assert.rejects(client.call('route',contract,'ping',()=>new Uint8Array()),error=>{
+    assert.equal(JSON.parse(error.body).name,'FallbackDenied');
+    assert.equal(error.cause.nativeDetails.ioKind,'ConnectionRefused');
+    assert.equal(error.cause.cause,first);
+    return true;
+  });
+  assert.equal(posts,0);
+  assert.equal(resolves,2);
+  await client.close();
+});
+
+test('canonical 701 POST invalidates the cache without replaying that call',async()=>{
+  const route={name:'route',relay_url:'http://localhost:8301',crm_ns:'test',crm_name:'Test',crm_ver:'0.1.0',abi_hash:hash,signature_hash:hash,max_payload_size:100};
+  let resolves=0,posts=0,encodes=0;
+  const fetch=async(url,init)=>{
+    if(url.includes('/_resolve/')){resolves++;return {status:200,async text(){return JSON.stringify([route])}}}
+    if(url.includes('/_probe/'))return {status:200,async text(){return ''}};
+    posts++;
+    if(posts===1)return {status:404,async text(){return JSON.stringify({version:1,code:701,name:'ResourceNotFound',message:'missing',details:{}})}};
+    return {status:200,async arrayBuffer(){return Uint8Array.of(8).buffer}};
+  };
+  const client=transport.createRelayAwareHttpEncodedTransport('http://localhost:8300',{fetch,maxAttempts:3});
+  const encode=()=>{encodes++;return new Uint8Array()};
+  await assert.rejects(client.call('route',contract,'ping',encode),error=>error.status===404&&error.retrySafe===true);
+  assert.deepEqual([resolves,posts,encodes],[1,1,1]);
+  assert.equal((await client.call('route',contract,'ping',encode))[0],8);
+  assert.deepEqual([resolves,posts,encodes],[2,2,2]);
+  await client.close();
+});
+
 for(const path of ['direct','relay-local'])test(`${path} close accepts 2147483648 ms while opening remains pending`,async()=>{
   const opened=deferred();let observes=0;
   const call={cancel(){},async chargeInput(){},async dispatch(){},async next(){return null},async observe(ms){observes++;assert.ok(ms>2147483000);return receipt},checkDeadline(){},close(){}};
   const endpoint={async prepare(){await opened.promise;return binding},beginCall(){return call},deactivate(){},async close(){}};
-  const route={name:'route',relay_url:'http://localhost:8301',route_uid:'uid',ipc_address:'ipc://local',server_id:'s',server_instance_id:'i',crm_ns:'test',crm_name:'Test',crm_ver:'0.1.0',abi_hash:hash,signature_hash:hash,max_payload_size:100};
+  const route={name:'route',relay_url:'http://localhost:8301',ipc_address:'ipc://local',server_id:'s',server_instance_id:'i',crm_ns:'test',crm_name:'Test',crm_ver:'0.1.0',abi_hash:hash,signature_hash:hash,max_payload_size:100};
   const client=path==='direct'?transport.createIpcEncodedTransport('ipc://close',{connect:async()=>endpoint}):transport.createRelayAwareHttpEncodedTransport('http://localhost:8300',{ipc:{connect:async()=>endpoint},fetch:async()=>({status:200,async text(){return JSON.stringify([route])},async arrayBuffer(){return new ArrayBuffer(0)}})});
   let clock=0,id=0;const timers=new Map();
   const originalTimeout=globalThis.setTimeout,originalClear=globalThis.clearTimeout;
@@ -122,7 +185,7 @@ for(const relayAware of [false,true])test(`HTTP unary encoding uses its original
   let clock=0,encoded=0,posts=0,fetches=0;
   const descriptor=Object.getOwnPropertyDescriptor(performance,'now');
   Object.defineProperty(performance,'now',{configurable:true,value:()=>clock});
-  const routes=[{name:'route',relay_url:'http://localhost:8301',route_uid:'uid',crm_ns:'test',crm_name:'Test',crm_ver:'0.1.0',abi_hash:hash,signature_hash:hash,max_payload_size:100}];
+  const routes=[{name:'route',relay_url:'http://localhost:8301',crm_ns:'test',crm_name:'Test',crm_ver:'0.1.0',abi_hash:hash,signature_hash:hash,max_payload_size:100}];
   const fetch=async(_url,init)=>{fetches++;if(init.method==='POST')posts++;return {status:200,async text(){return JSON.stringify(routes)},async arrayBuffer(){return new ArrayBuffer(0)}}};
   const factory=relayAware?transport.createRelayAwareHttpEncodedTransport:transport.createHttpRelayEncodedTransport;
   const client=factory('http://localhost:8300',{fetch,callTimeoutMs:10});
@@ -139,12 +202,12 @@ for(const relayAware of [false,true])test(`HTTP pre-dispatch probes never restar
   let clock=0,encoded=0,posts=0,probes=0;
   const descriptor=Object.getOwnPropertyDescriptor(performance,'now');
   Object.defineProperty(performance,'now',{configurable:true,value:()=>clock});
-  const routes=[0,1].map(index=>({name:'route',relay_url:`http://localhost:${8301+index}`,route_uid:`uid-${index}`,crm_ns:'test',crm_name:'Test',crm_ver:'0.1.0',abi_hash:hash,signature_hash:hash,max_payload_size:100}));
+  const routes=[0,1].map(index=>({name:'route',relay_url:`http://localhost:${8301+index}`,crm_ns:'test',crm_name:'Test',crm_ver:'0.1.0',abi_hash:hash,signature_hash:hash,max_payload_size:100}));
   const fetch=async(url,init)=>{
     if(init.method==='POST'){posts++;throw Error('expired input must not dispatch')}
     if(url.includes('/_probe/')){
       probes++;clock+=probes===1?4:5;
-      return {status:probes===1?409:200,async text(){return JSON.stringify({version:1,code:704,name:'RouteStale',message:'stale',details:{}})},async arrayBuffer(){return new ArrayBuffer(0)}};
+      return {status:probes===1?404:200,async text(){return JSON.stringify({version:1,code:701,name:'ResourceNotFound',message:'missing',details:{}})},async arrayBuffer(){return new ArrayBuffer(0)}};
     }
     clock+=2;return {status:200,async text(){return JSON.stringify(routes)},async arrayBuffer(){return new ArrayBuffer(0)}};
   };

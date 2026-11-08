@@ -625,7 +625,6 @@ pub unsafe extern "C" fn c2_mem_ffi_endpoint_context_prepare(
     let endpoint = unsafe { &*endpoint }.0.clone();
     let args = text(route).and_then(|route| {
         let contract = parse(contract)?;
-
         let mut options = c2_core::ConnectOptions::new();
         if let Some(value) = endpoint.options.get("connectTimeoutMs") {
             options = options.with_timeout(Duration::from_millis(

@@ -198,7 +198,7 @@ async fn public_stop_fences_real_http_registration_control_watch_publication() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn stale_acquire_disconnects_exact_old_client_before_same_endpoint_replacement() {
+async fn replacement_acquire_reuses_healthy_client_and_exact_close_stays_isolated() {
     let socket = {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         listener.local_addr().unwrap()
@@ -265,10 +265,11 @@ async fn stale_acquire_disconnects_exact_old_client_before_same_endpoint_replace
             .await
             .unwrap();
         let old_entry = state.local_route("grid").unwrap();
-        let (lease, _) = tokio::time::timeout(STEP, state.acquire_upstream_for_route(&old_entry))
-            .await
-            .unwrap()
-            .unwrap_or_else(|_| panic!("initial real acquisition"));
+        let (lease, _, _) =
+            tokio::time::timeout(STEP, state.acquire_upstream_for_route(&old_entry))
+                .await
+                .unwrap()
+                .unwrap_or_else(|_| panic!("initial real acquisition"));
         let old_client = lease.client();
         drop(lease);
         assert!(old_client.is_connected());
@@ -293,20 +294,25 @@ async fn stale_acquire_disconnects_exact_old_client_before_same_endpoint_replace
         assert_eq!(new_entry.ipc_address.as_deref(), Some(address.as_str()));
         assert!(state.with_route_table_mut(|table| table.register_route(new_entry.clone())));
         resume_acquire.take().unwrap().send(()).unwrap();
-        let stale = tokio::time::timeout(STEP, acquire_task.as_mut().unwrap())
+        let current = tokio::time::timeout(STEP, acquire_task.as_mut().unwrap())
             .await
             .unwrap()
             .unwrap();
         acquire_task.take();
-        assert!(matches!(
-            stale,
-            Err(super::state::UpstreamAcquireError::Stale { .. })
-        ));
-        assert!(
-            !old_client.is_connected(),
-            "stale acquire must initiate native disconnect before returning"
-        );
-        let (replacement_lease, binding) =
+        let (current_lease, binding, route) =
+            current.unwrap_or_else(|_| panic!("replacement acquire"));
+        assert_eq!(route.route_uid, new_entry.route_uid);
+        assert!(Arc::ptr_eq(&current_lease.client(), &old_client));
+        let reply = tokio::time::timeout(STEP, old_client.call_bound(&binding, "ping", &[]))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reply.into_owned_bytes().unwrap(), b"echo");
+        drop(current_lease);
+        // Genuine retirement still detaches the precise old physical client.
+        state.clients.close(&old_client);
+        assert!(old_client.close_shared_bounded(STEP).await);
+        let (replacement_lease, binding, _) =
             tokio::time::timeout(STEP, state.acquire_upstream_for_route(&new_entry))
                 .await
                 .unwrap()
@@ -322,7 +328,7 @@ async fn stale_acquire_disconnects_exact_old_client_before_same_endpoint_replace
         // Re-observing the precise closing owner cannot target its replacement.
         state.clients.close(&old_client);
         assert!(old_client.close_shared_bounded(STEP).await);
-        let (same_lease, same_binding) =
+        let (same_lease, same_binding, _) =
             tokio::time::timeout(STEP, state.acquire_upstream_for_route(&new_entry))
                 .await
                 .unwrap()

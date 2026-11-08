@@ -401,7 +401,7 @@ impl contract::Service for Echo {
             0 | 1 => Ok(input.clone()),
             2 => Err(c_two::Error::Semantic(
                 c_two::generated::C2Error::new(
-                    c_two::generated::ErrorCode::WriteConflict,
+                    c_two::generated::ErrorCode::ResourceFunctionExecuting,
                     "service fixture conflict",
                 )
                 .with_details(BTreeMap::from([(
@@ -539,7 +539,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     require_latest_input_invalidated(&escaped_inputs, 3);
     assert_eq!(
         semantic.code,
-        c_two::generated::ErrorCode::WriteConflict
+        c_two::generated::ErrorCode::ResourceFunctionExecuting
     );
     assert_eq!(semantic.message, "service fixture conflict");
     assert_eq!(

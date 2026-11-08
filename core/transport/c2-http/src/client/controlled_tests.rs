@@ -42,7 +42,6 @@ fn route(url: &str) -> RelayRouteInfo {
     RelayRouteInfo {
         name: contract.route_name,
         relay_url: url.into(),
-        route_uid: "controlled-grid-route".into(),
         ipc_address: None,
         server_id: None,
         server_instance_id: None,
@@ -170,7 +169,7 @@ async fn registry_with_max_payload_size(url: &str, max_payload_size: u64) -> Ser
 #[derive(Clone, Copy)]
 enum Reply {
     Echo,
-    Stale,
+    NotFound,
     Crm,
     Capacity,
     CapacityPreDispatch,
@@ -219,9 +218,9 @@ async fn business(
     }
     match *state.reply.lock() {
         Reply::Echo => (StatusCode::OK, body).into_response(),
-        Reply::Stale => (
-            StatusCode::CONFLICT,
-            semantic_error(ErrorCode::RouteStale, None),
+        Reply::NotFound => (
+            StatusCode::NOT_FOUND,
+            semantic_error(ErrorCode::ResourceNotFound, Some("pre_dispatch")),
         )
             .into_response(),
         Reply::Crm => (StatusCode::INTERNAL_SERVER_ERROR, b"crm-failure".to_vec()).into_response(),
@@ -355,12 +354,12 @@ async fn owner_deadline_rejection_after_route_wait_never_dispatches() {
 }
 
 #[tokio::test]
-async fn authoritative_stale_post_reports_predispatch_without_retaining_replay_input() {
-    let stale = Data::new(Reply::Stale);
+async fn authoritative_not_found_post_reports_predispatch_without_retaining_replay_input() {
+    let missing = Data::new(Reply::NotFound);
     let live = Data::new(Reply::Echo);
-    let stale_server = data_server(&stale).await;
+    let missing_server = data_server(&missing).await;
     let live_server = data_server(&live).await;
-    let (registry, resolves) = registry(&[&stale_server.url, &live_server.url], None).await;
+    let (registry, resolves) = registry(&[&missing_server.url, &live_server.url], None).await;
     let phases = Arc::new(Mutex::new(Vec::new()));
     let control = record_dispatches(&phases);
     let client = client(&registry);
@@ -371,26 +370,26 @@ async fn authoritative_stale_post_reports_predispatch_without_retaining_replay_i
 
     assert_eq!(error.phase(), HttpCallPhase::PreDispatch);
     assert_eq!(*phases.lock(), vec![None]);
-    assert_eq!(stale.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(missing.calls.load(Ordering::SeqCst), 1);
     assert_eq!(live.calls.load(Ordering::SeqCst), 0);
     assert_eq!(resolves.load(Ordering::SeqCst), 1);
 }
 
-fn assert_stale_control_error(error: &HttpCallError) {
+fn assert_not_found_control_error(error: &HttpCallError) {
     assert_eq!(error.phase(), HttpCallPhase::PreDispatch);
     assert!(error.is_retry_safe());
-    let HttpError::ResponseError(409, body) = error.source_error() else {
-        panic!("expected the relay's 409 error envelope, got {error:?}");
+    let HttpError::ResponseError(404, body) = error.source_error() else {
+        panic!("expected the relay's 404 error envelope, got {error:?}");
     };
     let envelope = serde_json::from_slice(body.as_ref()).unwrap();
     let decoded = C2Error::from_envelope(envelope).unwrap();
-    assert_eq!(decoded.code, ErrorCode::RouteStale);
+    assert_eq!(decoded.code, ErrorCode::ResourceNotFound);
 }
 
 #[tokio::test]
-async fn unary_route_stale_control_envelope_exceeds_one_byte_business_limit() {
-    let stale = Data::new(Reply::Stale);
-    let server = data_server(&stale).await;
+async fn unary_route_not_found_control_envelope_exceeds_one_byte_business_limit() {
+    let missing = Data::new(Reply::NotFound);
+    let server = data_server(&missing).await;
     let registry = registry_with_max_payload_size(&server.url, 1).await;
     let control = allowed();
 
@@ -399,14 +398,14 @@ async fn unary_route_stale_control_envelope_exceeds_one_byte_business_limit() {
         .await
         .unwrap_err();
 
-    assert_stale_control_error(&error);
-    assert_eq!(stale.calls.load(Ordering::SeqCst), 1);
+    assert_not_found_control_error(&error);
+    assert_eq!(missing.calls.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
-async fn stream_route_stale_control_envelope_exceeds_one_byte_business_limit() {
-    let stale = Data::new(Reply::Stale);
-    let server = data_server(&stale).await;
+async fn stream_route_not_found_control_envelope_exceeds_one_byte_business_limit() {
+    let missing = Data::new(Reply::NotFound);
+    let server = data_server(&missing).await;
     let registry = registry_with_max_payload_size(&server.url, 1).await;
     let budget = c2_mem::retention::PayloadBufferBudget::new(4096);
     let headroom = budget.try_reserve(1).unwrap();
@@ -423,19 +422,19 @@ async fn stream_route_stale_control_envelope_exceeds_one_byte_business_limit() {
         )
         .await
         .err()
-        .expect("stale route must reject the stream before dispatch");
+        .expect("missing route must reject the stream before dispatch");
 
-    assert_stale_control_error(&error);
-    assert_eq!(stale.calls.load(Ordering::SeqCst), 1);
+    assert_not_found_control_error(&error);
+    assert_eq!(missing.calls.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
 async fn consumed_input_does_not_enter_a_second_dispatch_guard() {
-    let stale = Data::new(Reply::Stale);
+    let missing = Data::new(Reply::NotFound);
     let live = Data::new(Reply::Echo);
-    let stale_server = data_server(&stale).await;
+    let missing_server = data_server(&missing).await;
     let live_server = data_server(&live).await;
-    let (registry, _) = registry(&[&stale_server.url, &live_server.url], None).await;
+    let (registry, _) = registry(&[&missing_server.url, &live_server.url], None).await;
     let phases = Arc::new(Mutex::new(Vec::new()));
     let observed = Arc::clone(&phases);
     let control = HttpCallControl::new(
@@ -452,7 +451,7 @@ async fn consumed_input_does_not_enter_a_second_dispatch_guard() {
 
     assert_eq!(error.phase(), HttpCallPhase::PreDispatch);
     assert_eq!(*phases.lock(), vec![None]);
-    assert_eq!(stale.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(missing.calls.load(Ordering::SeqCst), 1);
     assert_eq!(live.calls.load(Ordering::SeqCst), 0);
 }
 
@@ -574,7 +573,7 @@ async fn capacity_refusal_preserves_cache_and_never_provides_retry_proof() {
 }
 
 #[tokio::test]
-async fn predispatched_capacity_refusal_is_not_a_stale_route_proof() {
+async fn predispatched_capacity_refusal_does_not_prove_route_not_found() {
     assert_capacity_preserves_route(Reply::CapacityPreDispatch, 502, HttpCallPhase::PreDispatch)
         .await;
 }
@@ -624,11 +623,11 @@ fn assert_headers(headers: &HeaderMap, len: usize) {
         ("x-c2-expected-crm-ver", "0.1.0"),
         ("x-c2-expected-abi-hash", ABI_HASH),
         ("x-c2-expected-signature-hash", SIGNATURE_HASH),
-        ("x-c2-route-uid", "controlled-grid-route"),
         ("content-type", "application/octet-stream"),
     ] {
         assert_eq!(headers[key], expected, "header {key}");
     }
+    assert!(headers.get(concat!("x-c2-route-", "uid")).is_none());
     assert_eq!(headers["content-length"], len.to_string());
     assert!(headers.get("transfer-encoding").is_none());
 }
@@ -1393,6 +1392,6 @@ async fn controlled_stream_uses_one_bound_post_and_stream_accept_header() {
     assert_eq!(stream.completion().await.unwrap().complete_items, Some(1));
     let headers = seen_headers.lock().clone().unwrap();
     assert_eq!(headers["accept"], crate::stream_wire::MEDIA_TYPE);
-    assert_eq!(headers["x-c2-route-uid"], "controlled-grid-route");
+    assert!(headers.get(concat!("x-c2-route-", "uid")).is_none());
     assert_eq!(calls.load(Ordering::SeqCst), 1);
 }

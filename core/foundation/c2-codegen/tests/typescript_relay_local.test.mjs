@@ -26,14 +26,14 @@ const nativeError = (code, canonicalName, details = {}) => new api.C2IpcTranspor
   message:canonicalName, code, canonicalName, details, transportPhase:'pre_dispatch', category:'ipc',
 });
 function client(options = {}) {
-  const state = {connections:0, closed:[], prepared:[], calls:[], deactivated:false, resolvedUid:'original', generation:0};
+  const state = {connections:0, closed:[], prepared:[], calls:[], deactivated:false, generation:0};
   const transport = api.createRelayAwareHttpEncodedTransport('http://localhost:8300', {
     routeCacheTtlMs:0,
     async fetch(url, init) {
       assert.equal(init.method,'GET','a local failure must not POST to the same endpoint');
       const route = decodeURIComponent(new URL(url).pathname.split('/').pop());
       return {status:200, async text() {return JSON.stringify([{
-        name:route,relay_url:'http://localhost:8300',route_uid:state.resolvedUid,
+        name:route,relay_url:'http://localhost:8300',
         ipc_address:'ipc://server',server_id:'s',server_instance_id:'i',
         crm_ns:contract.namespace,crm_name:contract.name,crm_ver:contract.version,
         abi_hash:hash,signature_hash:hash,max_payload_size:1024,
@@ -78,10 +78,9 @@ test('relay-local prepares late routes on one endpoint and closes it once', asyn
   await assert.rejects(call('manager'),/deactivated/);
 });
 
-test('an older resolved UID still prepares by name on the healthy carrier', async () => {
+test('a later route still prepares by name on the healthy carrier', async () => {
   const {state,transport,call}=client();
   await call('manager');
-  state.resolvedUid='older-builder';
   await call('builder');
   await call('manager');
   assert.equal(state.connections,1);
@@ -112,7 +111,6 @@ test('a deactivated endpoint is discarded without waiting for unrelated work', a
 test('same-endpoint replacement reaches the current registration without retiring its carrier', async () => {
   const {state,transport,call}=client();
   assert.deepEqual([...await call('builder')],[1]);
-  state.resolvedUid='replacement';
   state.generation=1;
   assert.deepEqual([...await call('builder')],[2]);
   await call('manager');

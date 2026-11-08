@@ -101,9 +101,6 @@ pub enum UnregisterResult {
 
 pub enum UpstreamAcquireError {
     NotFound,
-    Stale {
-        route: RouteEntry,
-    },
     WatchUnavailable {
         route: RouteEntry,
         reason: String,
@@ -113,6 +110,18 @@ pub enum UpstreamAcquireError {
         address: String,
         error: c2_ipc::IpcError,
     },
+}
+
+// A registration change is consumed before dispatch and never becomes a wire error.
+enum UpstreamSnapshotError {
+    Changed,
+    Failure(UpstreamAcquireError),
+}
+
+impl From<UpstreamAcquireError> for UpstreamSnapshotError {
+    fn from(error: UpstreamAcquireError) -> Self {
+        Self::Failure(error)
+    }
 }
 
 fn expected_contract_for_route(route: &RouteEntry) -> c2_contract::ExpectedRouteContract {
@@ -348,18 +357,55 @@ impl RelayState {
             .read()
             .local_route(name)
             .ok_or(UpstreamAcquireError::NotFound)?;
-        let (lease, _binding) = self.acquire_upstream_for_route(&expected).await?;
-        Ok((lease, expected))
+        let (lease, _binding, current) = self.acquire_upstream_for_route(&expected).await?;
+        Ok((lease, current))
     }
 
     pub async fn acquire_upstream_for_route(
         &self,
         expected: &RouteEntry,
-    ) -> Result<(UpstreamLease, RouteBinding), UpstreamAcquireError> {
+    ) -> Result<(UpstreamLease, RouteBinding, RouteEntry), UpstreamAcquireError> {
+        let contract = expected_contract_for_route(expected);
+        for attempt in 0..2 {
+            let current = self
+                .route_table
+                .read()
+                .local_route(&expected.name)
+                .ok_or(UpstreamAcquireError::NotFound)?;
+            if expected_contract_for_route(&current) != contract {
+                return Err(UpstreamAcquireError::Unreachable {
+                    address: current.ipc_address.clone().unwrap_or_default(),
+                    route: current,
+                    error: c2_ipc::IpcError::ContractMismatch(format!(
+                        "route contract mismatch: {}",
+                        expected.name
+                    )),
+                });
+            }
+            match self.acquire_upstream_snapshot(&current).await {
+                Ok((lease, binding)) => return Ok((lease, binding, current)),
+                Err(UpstreamSnapshotError::Failure(error)) => return Err(error),
+                Err(UpstreamSnapshotError::Changed) if attempt == 0 => continue,
+                Err(UpstreamSnapshotError::Changed) => {
+                    return Err(UpstreamAcquireError::Unreachable {
+                        address: current.ipc_address.clone().unwrap_or_default(),
+                        route: current,
+                        error: c2_ipc::IpcError::Closed,
+                    });
+                }
+            }
+        }
+        unreachable!("the final acquisition always returns")
+    }
+
+    async fn acquire_upstream_snapshot(
+        &self,
+        expected: &RouteEntry,
+    ) -> Result<(UpstreamLease, RouteBinding), UpstreamSnapshotError> {
         self.with_current_upstream_route(expected, || ())?;
 
         let Some(endpoint_key) = UpstreamEndpointKey::from_route(expected) else {
-            return Err(UpstreamAcquireError::NotFound);
+            return Err(UpstreamAcquireError::NotFound.into());
         };
         let route_name = expected.name.clone();
         let expected_for_connect = expected.clone();
@@ -519,17 +565,17 @@ impl RelayState {
 
         #[cfg(test)]
         Self::pause_for_test(&self.acquire_recheck_seam).await;
-        let lease_endpoint = lease.endpoint();
-        let route_matches_lease = self.with_current_upstream_route(expected, || {
-            self.conn_pool.renew_current_owner_lease(&lease_endpoint)
-        });
+        let route_matches_lease =
+            self.with_current_upstream_route(expected, || self.conn_pool.renew_lease_owner(&lease));
 
         if matches!(route_matches_lease, Ok(true)) {
             Ok((lease, binding))
         } else {
             let client = lease.client();
             drop(lease);
-            self.close_failed_acquire_client(&client).await;
+            if !matches!(route_matches_lease, Err(UpstreamSnapshotError::Changed)) {
+                self.close_failed_acquire_client(&client).await;
+            }
             Err(match route_matches_lease {
                 Err(error) => error,
                 Ok(_) => self.classify_upstream_acquire_failure(
@@ -564,15 +610,13 @@ impl RelayState {
         &self,
         expected: &RouteEntry,
         when_current: impl FnOnce() -> T,
-    ) -> Result<T, UpstreamAcquireError> {
+    ) -> Result<T, UpstreamSnapshotError> {
         let route_table = self.route_table.read();
         let Some(entry) = route_table.local_route(&expected.name) else {
-            return Err(UpstreamAcquireError::NotFound);
+            return Err(UpstreamAcquireError::NotFound.into());
         };
         if !local_route_matches(&entry, expected) {
-            return Err(UpstreamAcquireError::Stale {
-                route: expected.clone(),
-            });
+            return Err(UpstreamSnapshotError::Changed);
         }
         Ok(when_current())
     }
@@ -581,16 +625,24 @@ impl RelayState {
         &self,
         expected: &RouteEntry,
         failure: UpstreamAcquireError,
-    ) -> UpstreamAcquireError {
-        // Keep the owner's authoritative refusal. A local retirement or I/O
-        // failure instead observes any withdrawal/replacement that caused it.
-        let authoritative = matches!(&failure,
+    ) -> UpstreamSnapshotError {
+        // Identity and protocol refusals remain terminal. Route-local evidence
+        // belongs to the captured registration, never its replacement.
+        let terminal = matches!(&failure,
             UpstreamAcquireError::Unreachable { error, .. }
-                if should_treat_as_semantic_route_failure(error));
-        if !authoritative && let Err(error) = self.with_current_upstream_route(expected, || ()) {
-            return error;
+                if matches!(error, c2_ipc::IpcError::IdentityMismatch { .. }
+                    | c2_ipc::IpcError::Protocol(_) | c2_ipc::IpcError::ProtocolVersionMismatch { .. }));
+        if !terminal {
+            let authoritative = matches!(&failure,
+                UpstreamAcquireError::Unreachable { error, .. }
+                    if should_treat_as_semantic_route_failure(error));
+            match self.with_current_upstream_route(expected, || ()) {
+                Err(UpstreamSnapshotError::Changed) => return UpstreamSnapshotError::Changed,
+                Err(error) if !authoritative => return error,
+                _ => {}
+            }
         }
-        failure
+        failure.into()
     }
     #[cfg(test)]
     pub(crate) fn get_address(&self, name: &str) -> Option<String> {
@@ -1222,6 +1274,50 @@ mod tests {
             fixture
         }
 
+        async fn reregister_b(&mut self) -> Arc<AcquireProbe> {
+            let old = self.entries[1].clone();
+            assert!(self.server.unregister_route("b").await);
+            let probe = Arc::new(AcquireProbe {
+                entered: tokio::sync::Notify::new(),
+                release: parking_lot::Mutex::new(None),
+                pings: std::sync::atomic::AtomicUsize::new(0),
+            });
+            Self::register(&self.server, "b", probe.clone()).await;
+            let mut client = self.client();
+            acquire_step(client.connect()).await.unwrap();
+            let record = acquire_step(
+                client.attest_route_for_registration(&expected_contract_for_route(&old)),
+            )
+            .await
+            .unwrap();
+            acquire_step(client.close()).await;
+            assert!(matches!(
+                self.state
+                    .unregister_upstream("b", old.server_id.as_deref().unwrap()),
+                UnregisterResult::Removed { .. }
+            ));
+            let entry = match test_commit_registration!(
+                &self.state,
+                "b".into(),
+                old.server_id.unwrap(),
+                old.server_instance_id.unwrap(),
+                old.ipc_address.unwrap(),
+                old.crm_ns,
+                old.crm_name,
+                old.crm_ver,
+                old.abi_hash,
+                old.signature_hash,
+                record.max_payload_size,
+                record.route_uid,
+                None
+            ) {
+                RegisterCommitResult::Registered { entry } => entry,
+                _ => panic!("replacement registration"),
+            };
+            self.entries[1] = entry;
+            probe
+        }
+
         fn client(&self) -> IpcClient {
             IpcClient::with_endpoint(
                 self.server.local_endpoint().clone(),
@@ -1360,6 +1456,88 @@ mod tests {
         name_acquire_transition(AcquireTransition::Reregistered).await;
     }
 
+    // ADR 0004: "服务端与 relay 按路由名和契约身份接纳调用".
+    // Both pauses precede the sole business dispatch; no resource can be replayed.
+    async fn replacement_during_acquire(before_lookup: bool, changes: usize) {
+        let mut fixture = AcquireFixture::new().await;
+        let mut entered_next = None;
+        let mut resume_next = None;
+        let (entered, waiting) = tokio::sync::oneshot::channel();
+        let (resume, resumed) = tokio::sync::oneshot::channel();
+        if before_lookup {
+            fixture
+                .state
+                .set_acquire_lookup_seam_for_test(entered, resumed);
+        } else {
+            fixture
+                .state
+                .set_acquire_recheck_seam_for_test(entered, resumed);
+        }
+        let state = fixture.state.clone();
+        let expected = fixture.entries[1].clone();
+        let acquire =
+            tokio::spawn(async move { state.acquire_upstream_for_route(&expected).await });
+        acquire_step(waiting).await.unwrap();
+        let mut latest = fixture.reregister_b().await;
+        if changes == 2 {
+            let (entered, waiting) = tokio::sync::oneshot::channel();
+            let (resume, resumed) = tokio::sync::oneshot::channel();
+            fixture
+                .state
+                .set_acquire_recheck_seam_for_test(entered, resumed);
+            entered_next = Some(waiting);
+            resume_next = Some(resume);
+        }
+        resume.send(()).unwrap();
+        if let Some(waiting) = entered_next {
+            acquire_step(waiting).await.unwrap();
+            latest = fixture.reregister_b().await;
+            resume_next.unwrap().send(()).unwrap();
+        }
+        let result = acquire_step(acquire).await.unwrap();
+        if changes == 1 {
+            let (lease, binding, current) =
+                result.unwrap_or_else(|_| panic!("current registration"));
+            assert!(local_route_matches(&current, &fixture.entries[1]));
+            acquire_step(lease.client().call_bound(&binding, "ping", &[]))
+                .await
+                .unwrap();
+            assert_eq!(latest.pings.load(std::sync::atomic::Ordering::SeqCst), 1);
+            drop(lease);
+        } else {
+            assert!(matches!(
+                result,
+                Err(UpstreamAcquireError::Unreachable {
+                    error: c2_ipc::IpcError::Closed,
+                    ..
+                })
+            ));
+            assert_eq!(latest.pings.load(std::sync::atomic::Ordering::SeqCst), 0);
+        }
+        assert_eq!(
+            fixture.probes[1]
+                .pings
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        fixture.finish().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn lookup_replacement_acquires_current_registration() {
+        replacement_during_acquire(true, 1).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn final_recheck_replacement_acquires_current_registration() {
+        replacement_during_acquire(false, 1).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn repeated_replacement_stops_before_dispatch() {
+        replacement_during_acquire(false, 2).await;
+    }
+
     async fn shared_acquire_transition(transition: AcquireTransition, watch_unavailable: bool) {
         use futures::FutureExt;
         let mut fixture = AcquireFixture::new().await;
@@ -1367,7 +1545,7 @@ mod tests {
         let mut unregister = None;
         let mut call_a = None;
         let result = std::panic::AssertUnwindSafe(async {
-            let (lease_a, binding_a) = acquire_step(
+            let (lease_a, binding_a, _) = acquire_step(
                 fixture
                     .state
                     .acquire_upstream_for_route(&fixture.entries[0]),
@@ -1375,7 +1553,7 @@ mod tests {
             .await
             .unwrap_or_else(|_| panic!("acquire A"));
             let client = lease_a.client();
-            let (lease_b, old_b) = acquire_step(
+            let (lease_b, old_b, _) = acquire_step(
                 fixture
                     .state
                     .acquire_upstream_for_route(&fixture.entries[1]),
@@ -1465,7 +1643,7 @@ mod tests {
                     })
                 )),
                 AcquireTransition::Reregistered => {
-                    let (lease, binding) = rejected.unwrap_or_else(|_| {
+                    let (lease, binding, _) = rejected.unwrap_or_else(|_| {
                         panic!("same-endpoint replacement must acquire by name")
                     });
                     acquire_step(lease.client().call_bound(&binding, "ping", &[]))
@@ -1533,7 +1711,7 @@ mod tests {
             if let Some(task) = unregister.take() {
                 assert!(acquire_step(task).await.unwrap());
             }
-            let (same, _) = acquire_step(
+            let (same, _, _) = acquire_step(
                 fixture
                     .state
                     .acquire_upstream_for_route(&fixture.entries[0]),
@@ -1762,7 +1940,7 @@ mod tests {
         };
         let mut previous = None;
         for _ in 0..2 {
-            let (lease, binding) = match state.acquire_upstream_for_route(&entry).await {
+            let (lease, binding, _) = match state.acquire_upstream_for_route(&entry).await {
                 Ok(acquired) => acquired,
                 Err(_) => panic!("resolved IPC policy must acquire a real client"),
             };

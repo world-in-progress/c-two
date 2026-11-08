@@ -744,9 +744,9 @@ def test_generated_node_call_time_route_change_does_not_end_sibling(
 ):
     """Gates 2/4/6: change B after acquire; A and its carrier still finish.
 
-    The test wrapper pauses native dispatch (HTTP: the real business POST)
-    after lookup/probe, exercising current registration admission.
-    A stale HTTP POST is sent once; the next explicit call resolves again.
+    The wrapper pauses native dispatch or the send of an already-recorded HTTP
+    POST after lookup/probe. Re-registration admits the pending call once by name;
+    removal refuses that call before it enters a resource.
     """
     from tests.fixtures.typescript_idle_gates import GateResource, IdleGate, node_gate_client
 
@@ -772,13 +772,16 @@ def test_generated_node_call_time_route_change_does_not_end_sibling(
                         server.register(IdleGate, replacement, name="builder")
                     _ok(node("resume"))
                     changed = node("finish-call", id="b")
-                    if transition == "reregistered" and mode != "http":
+                    if transition == "reregistered":
                         _gate_identity(changed, identity, _GATE_PATHS[mode])
                         assert changed["value"]["calls"] == 1, changed
                         assert builder.calls == replacement.calls == 1
+                        if mode == "http":
+                            # The paused POST was recorded before the send barrier.
+                            assert sum(item["method"] == "POST" for item in changed["http"]) == sum(item["method"] == "POST" for item in acquired["http"]), changed
                     else:
                         error = _gate_error(changed)
-                        assert error["code"] == (704 if transition == "reregistered" else 701 if mode == "http" else 708), changed
+                        assert error["code"] == (701 if mode == "http" else 708), changed
                         if mode == "http":
                             assert changed["error"]["retrySafe"] is True, changed
                             assert sum(item["method"] == "POST" for item in changed["http"]) == sum(item["method"] == "POST" for item in acquired["http"]), changed
@@ -796,7 +799,7 @@ def test_generated_node_call_time_route_change_does_not_end_sibling(
                     fresh = node(route="builder", client="main" if mode == "http" else "fresh")
                     _gate_identity(fresh, identity, _GATE_PATHS[mode])
                     assert fresh["observations"][-1]["routeName"] == old_b["observations"][-1]["routeName"] == "builder"
-                    assert replacement.calls == (1 if mode == "http" else 2)
+                    assert replacement.calls == 2
                 else:
                     absent = node(route="builder", client="fresh")
                     assert _gate_error(absent)["code"] == (701 if mode != "direct" else 708), absent
@@ -904,11 +907,11 @@ def test_generated_node_real_peer_end_is_uncertain_without_replay(
 def test_generated_node_old_candidate_cannot_discard_restarted_relay_owner(
     idle_node_project, node_gate_root, start_c3_relay, tmp_path, mode,
 ):
-    """Gate 5: interrupt real upstream control, register a new instance, then
-    finish an old candidate. Current authority and the new carrier survive.
+    """Gate 5: interrupt real upstream control, restart the Host, then finish an
+    old candidate. Current authority and the new carrier survive.
 
-    HTTP also proves a stale business POST fails once; the next explicit call
-    resolves the current UID. Relay recovery has no watch history cursor.
+    The paused HTTP manager call reaches the new registration once by name;
+    the relay-local candidate is refused on its old carrier.
     """
     import uuid
     from tests.fixtures.typescript_idle_gates import GateProcess, node_gate_client
@@ -922,6 +925,7 @@ def test_generated_node_old_candidate_cannot_discard_restarted_relay_owner(
                 first = node()
                 _gate_identity(first, identity, _GATE_PATHS[mode])
                 _ok(node("pause", target="post" if mode == "http" else "dispatch"))
+                # The request helper defaults this candidate to manager.
                 _ok(node("start-call", id="candidate"))
                 _ok(node("wait-paused"))
                 assert old.request()["resources"]["manager"]["calls"] == 1
@@ -933,15 +937,21 @@ def test_generated_node_old_candidate_cannot_discard_restarted_relay_owner(
                     fresh = node(route="builder")
                     _gate_identity(fresh, new_identity, _GATE_PATHS[mode])
                     alive = new.request()
+                    assert alive["resources"]["manager"]["calls"] == 0, alive
+                    assert alive["resources"]["builder"]["calls"] == 1, alive
                     _ok(node("resume"))
                     refused = node("finish-call", id="candidate")
-                    _reject(refused)
                     if mode == "http":
-                        error = _gate_error(refused)
-                        assert error["code"] == 704 and refused["error"]["retrySafe"] is True, refused
+                        _gate_identity(refused, new_identity, _GATE_PATHS[mode])
+                        assert refused["observations"][-1]["routeName"] == "manager"
+                        assert refused["value"]["calls"] == 1, refused
+                        # Fresh already includes the paused manager POST record.
                         assert sum(item["method"] == "POST" for item in refused["http"]) == sum(item["method"] == "POST" for item in fresh["http"]), refused
+                    else:
+                        _reject(refused)
                     after_old = new.request()
-                    assert after_old["resources"]["manager"]["calls"] == 0, after_old
+                    assert after_old["resources"]["manager"]["calls"] == (1 if mode == "http" else 0), after_old
+                    assert after_old["resources"]["builder"]["calls"] == 1, after_old
                     kept = node(route="builder")
                     _gate_identity(kept, new_identity, _GATE_PATHS[mode])
                     assert kept["observations"][-1]["routeName"] == fresh["observations"][-1]["routeName"] == "builder"
@@ -949,11 +959,13 @@ def test_generated_node_old_candidate_cannot_discard_restarted_relay_owner(
                         assert kept["preparations"][-1]["connectionId"] == fresh["preparations"][-1]["connectionId"]
                     kept_stats = new.request()
                     assert kept_stats["connections"]["opened"] == alive["connections"]["opened"], (alive, kept_stats)
-                    assert kept_stats["resources"]["builder"]["calls"] == 2
+                    assert kept["value"]["calls"] == 2, kept
+                    assert kept_stats["resources"]["builder"]["calls"] == 2, kept_stats
                     current = node(client="main" if mode == "http" else "fresh")
                     _gate_identity(current, new_identity, _GATE_PATHS[mode])
                     assert current["value"]["server_instance_id"] != first["value"]["server_instance_id"]
-                    assert new.request()["resources"]["manager"]["calls"] == 1
+                    assert current["value"]["calls"] == (2 if mode == "http" else 1), current
+                    assert new.request()["resources"]["manager"]["calls"] == (2 if mode == "http" else 1)
                     _save_gate(tmp_path, "restart", mode=mode, old_identity=identity, new_identity=new_identity,
                                refused=refused, fresh=fresh, kept=kept, current=current,
                                before_old_result=alive, after_old_result=after_old, after_second_call=kept_stats)

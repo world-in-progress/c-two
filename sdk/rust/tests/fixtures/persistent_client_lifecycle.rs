@@ -220,6 +220,115 @@ impl Drop for Evidence {
     }
 }
 
+enum FixtureRelay {
+    Embedded(RelayServer),
+    Process(std::process::Child),
+}
+
+impl FixtureRelay {
+    fn c3(root: &Path, idle: u64) -> (Self, String) {
+        use std::process::{Command, Stdio};
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let target = std::env::var_os("CARGO_TARGET_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| repository.join("core/target"));
+        let binary = std::env::var_os("CTWO_TEST_C3_BIN")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                target
+                    .join("debug")
+                    .join(if cfg!(windows) { "c3.exe" } else { "c3" })
+            });
+        assert!(
+            binary.is_file(),
+            "build c3 first or set CTWO_TEST_C3_BIN: {}",
+            binary.display()
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let socket = listener.local_addr().unwrap();
+        drop(listener);
+        let url = format!("http://{socket}");
+        let mut command = Command::new(binary);
+        command.args([
+            "relay",
+            "--bind",
+            &socket.to_string(),
+            "--advertise-url",
+            &url,
+            "--idle-timeout",
+            &idle.to_string(),
+        ]);
+        #[cfg(unix)]
+        command.arg("--ipc-root").arg(root);
+        let child = command
+            .env_remove("C2_IPC_ROOT")
+            .env_remove("C2_RELAY_ANCHOR_ADDRESS")
+            .stdin(Stdio::null())
+            .stdout(std::fs::File::create(root.join("c3.stdout.log")).unwrap())
+            .stderr(std::fs::File::create(root.join("c3.stderr.log")).unwrap())
+            .spawn()
+            .unwrap();
+        let mut relay = Self::Process(child);
+        let deadline = Instant::now() + WAIT;
+        loop {
+            let Self::Process(child) = &mut relay else {
+                unreachable!()
+            };
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "c3 exited; inspect {}",
+                root.display()
+            );
+            if let Ok(mut stream) = TcpStream::connect_timeout(&socket, Duration::from_millis(100))
+            {
+                stream.set_read_timeout(Some(WAIT)).unwrap();
+                stream
+                    .write_all(
+                        b"GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+                    )
+                    .unwrap();
+                let mut response = String::new();
+                stream.read_to_string(&mut response).unwrap();
+                if response.starts_with("HTTP/1.1 200 ") {
+                    break;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "c3 readiness: {}",
+                root.display()
+            );
+            std::thread::yield_now();
+        }
+        (relay, url)
+    }
+
+    fn stop(&mut self) -> Result<(), String> {
+        match self {
+            Self::Embedded(relay) => relay.stop(),
+            Self::Process(child) => {
+                if child
+                    .try_wait()
+                    .map_err(|error| error.to_string())?
+                    .is_none()
+                {
+                    child.kill().map_err(|error| error.to_string())?;
+                }
+                child.wait().map_err(|error| error.to_string())?;
+                Ok(())
+            }
+        }
+    }
+}
+
+impl Drop for FixtureRelay {
+    fn drop(&mut self) {
+        if matches!(self, Self::Process(_)) {
+            let _ = self.stop();
+        }
+    }
+}
+
 pub struct Fixture {
     pub path: PathKind,
     pub root: PathBuf,
@@ -230,7 +339,7 @@ pub struct Fixture {
     pub server_events: ConnectionEvents,
     outgoing: Mutex<BTreeSet<u64>>,
     accepted: Mutex<Vec<ConnectionEvent>>,
-    relay: Option<RelayServer>,
+    relay: Option<FixtureRelay>,
     anchor: Option<HttpAnchor>,
     finished: bool,
 }
@@ -260,6 +369,14 @@ pub fn runtime(root: &Path, server_id: String, relay: Option<String>, idle: f64)
 
 impl Fixture {
     pub fn new(path: PathKind, idle: f64, relay_idle: u64) -> Self {
+        Self::new_inner(path, idle, relay_idle, false)
+    }
+
+    pub fn with_c3() -> Self {
+        Self::new_inner(PathKind::Http, 0.0, 0, true)
+    }
+
+    fn new_inner(path: PathKind, idle: f64, relay_idle: u64, c3: bool) -> Self {
         #[cfg(unix)]
         let root = Path::new("/tmp").join(unique("c2-persist"));
         #[cfg(windows)]
@@ -275,7 +392,10 @@ impl Fixture {
         let context = LocalEndpointContext::with_unix_root(&root).unwrap();
         #[cfg(windows)]
         let context = LocalEndpointContext::default_for_platform().unwrap();
-        let (relay, relay_url) = if path != PathKind::Direct {
+        let (relay, relay_url) = if c3 {
+            let (relay, url) = FixtureRelay::c3(&root, relay_idle);
+            (Some(relay), Some(url))
+        } else if path != PathKind::Direct {
             let mut attempt = 0;
             let (relay, url) = loop {
                 attempt += 1;
@@ -302,7 +422,7 @@ impl Fixture {
                     Err(error) => panic!("relay starts: {error}"),
                 }
             };
-            (Some(relay), Some(url))
+            (Some(FixtureRelay::Embedded(relay)), Some(url))
         } else {
             (None, None)
         };
@@ -462,31 +582,6 @@ impl Fixture {
 
     pub fn relay_url(&self) -> Option<String> {
         self.server.relay_anchor_address_override()
-    }
-
-    // Internal relay control evidence for HTTP token and late-withdrawal tests.
-    // Business clients do not expose a route UID.
-    pub fn relay_route_uid(&self, expected: c_two::contract::ExpectedRouteContract) -> String {
-        let control = Arc::new(
-            c2_http::client::RelayControlClient::new(&self.relay_url().unwrap(), false)
-                .unwrap()
-                .with_local_endpoint_context(&self.server.local_endpoint_context().unwrap()),
-        );
-        let client = c2_http::client::RelayAwareHttpClient::new_with_control(
-            control,
-            expected,
-            false,
-            c2_http::client::RelayAwareClientConfig::default(),
-        )
-        .unwrap()
-        .with_local_endpoint_context(&self.server.local_endpoint_context().unwrap());
-        match client
-            .resolve_target_with_deadline(c2_config::ConnectDeadline::default())
-            .unwrap()
-        {
-            c2_http::client::RelayResolvedTarget::Ipc { candidate } => candidate.route_uid,
-            c2_http::client::RelayResolvedTarget::Http { route_uid, .. } => route_uid,
-        }
     }
 
     pub fn assert_paths(&self, acquisitions: u64) {
@@ -891,8 +986,25 @@ pub fn run_resource_process() {
         )
         .unwrap();
     let mut events = drain_events(&connections);
+    // The test process captures its own internal registration evidence through
+    // the existing IPC attestation path. Public relay resolution omits UID.
+    let old_route_uid = c2_core::native_client_executor().unwrap().block_on(async {
+        let mut attestor = c2_ipc::IpcClient::with_endpoint(
+            host.local_endpoint_context()
+                .endpoint(host.local_endpoint().address())
+                .unwrap(),
+            c2_config::ClientIpcConfig::default(),
+        )
+        .unwrap();
+        attestor.connect().await.unwrap();
+        attestor
+            .attest_route_for_registration(&stream_expected("process-route"))
+            .await
+            .unwrap()
+            .route_uid
+    });
     process_event(
-        serde_json::json!({"kind":"ready", "identity":probe.identity, "resource":label, "address":host.local_endpoint().address(), "credential":host.endpoint_credential().map(|credential| credential.to_json().unwrap())}),
+        serde_json::json!({"kind":"ready", "identity":probe.identity, "resource":label, "address":host.local_endpoint().address(), "credential":host.endpoint_credential().map(|credential| credential.to_json().unwrap()), "route_uid":old_route_uid}),
     );
     for line in std::io::stdin().lock().lines() {
         match line.unwrap().as_str() {
@@ -996,7 +1108,6 @@ pub struct ResourceProcess {
     reader: Option<std::thread::JoinHandle<()>>,
     events: Arc<Mutex<Vec<serde_json::Value>>>,
     pub ready: serde_json::Value,
-    relay_uid: Option<String>,
 }
 impl ResourceProcess {
     pub fn start(fixture: &Fixture, server_id: &str) -> Self {
@@ -1038,13 +1149,9 @@ impl ResourceProcess {
             reader: Some(reader),
             events,
             ready: serde_json::Value::Null,
-            relay_uid: None,
         };
         observe_until(|| process.records("ready").len() == 1);
         process.ready = process.records("ready").pop().unwrap();
-        process.relay_uid = fixture
-            .relay_url()
-            .map(|_| fixture.relay_route_uid(stream_expected("process-route")));
         process
     }
     pub fn records(&self, kind: &str) -> Vec<serde_json::Value> {
@@ -1183,7 +1290,7 @@ pub fn race_old_owner_evidence(fixture: &Fixture, old: &ResourceProcess) {
         return;
     };
     let context = fixture.server.local_endpoint_context().unwrap();
-    let old_relay_uid = old.relay_uid.as_ref().unwrap().clone();
+    let old_relay_uid = old.ready["route_uid"].as_str().unwrap().to_owned();
     let old = &old.ready;
     let barrier = Arc::new(std::sync::Barrier::new(3));
     std::thread::scope(|scope| {

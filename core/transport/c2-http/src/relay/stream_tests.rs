@@ -512,8 +512,7 @@ impl Fixture {
             .header("x-c2-expected-crm-name", &self.entry.crm_name)
             .header("x-c2-expected-crm-ver", &self.entry.crm_ver)
             .header("x-c2-expected-abi-hash", &self.entry.abi_hash)
-            .header("x-c2-expected-signature-hash", &self.entry.signature_hash)
-            .header("x-c2-route-uid", &self.entry.route_uid);
+            .header("x-c2-expected-signature-hash", &self.entry.signature_hash);
         if stream {
             request.header("accept", stream_wire::MEDIA_TYPE)
         } else {
@@ -660,6 +659,36 @@ async fn item_write_range_failure_keeps_real_terminal_and_http_ends_normally() {
         drop(receiver);
         fixture.stop().await;
     }
+}
+
+// ADR 0004 removes route UID from relay calls and probes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn retired_header_is_ignored_for_unary_and_stream_calls() {
+    let fixture = Fixture::start(false, 256 * 1024).await;
+    let retired_header = concat!("x-c2-route-", "uid");
+    for headers in [
+        vec![],
+        vec!["obsolete"],
+        vec!["invalid value", "another value"],
+    ] {
+        let mut request = fixture.request(1, 64);
+        for value in &headers {
+            request = request.header(retired_header, *value);
+        }
+        let response = bounded(request.send()).await.unwrap();
+        assert_eq!(response.status(), 200);
+        assert!(!response.headers().contains_key(retired_header));
+        parse_records(&bounded(response.bytes()).await.unwrap(), 1, 64);
+        let mut request = fixture.method_request("ping", false).body(Vec::new());
+        for value in &headers {
+            request = request.header(retired_header, *value);
+        }
+        let response = bounded(request.send()).await.unwrap();
+        assert_eq!(response.status(), 200);
+        assert!(!response.headers().contains_key(retired_header));
+        assert_eq!(bounded(response.bytes()).await.unwrap().as_ref(), b"pong");
+    }
+    fixture.stop().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -932,7 +961,7 @@ async fn wait_for_admission(state: &RelayState) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn budget_wait_precedes_upstream_lease_then_reconnects_after_idle_evict() {
     let fixture = Fixture::start(false, 32 * 1024).await;
-    let (lease, _) = bounded(fixture.state.acquire_upstream_for_route(&fixture.entry))
+    let (lease, _, _) = bounded(fixture.state.acquire_upstream_for_route(&fixture.entry))
         .await
         .unwrap_or_else(|_| panic!("live pooled upstream acquire failed"));
     let old_client = lease.client();
@@ -1017,7 +1046,6 @@ async fn dropping_body_while_next_pull_waits_for_b_cancels_and_preserves_shared_
                 "x-c2-expected-signature-hash",
                 &fixture.entry.signature_hash,
             )
-            .header("x-c2-route-uid", &fixture.entry.route_uid)
             .header("content-length", "8")
             .body(Body::from(input))
             .unwrap();
@@ -1075,7 +1103,7 @@ async fn dropping_body_while_next_pull_waits_for_b_cancels_and_preserves_shared_
             );
         }
         drop(body); // The driver must see abandonment while its IPC pull is pending.
-        let (lease, binding) = bounded(fixture.state.acquire_upstream_for_route(&fixture.entry))
+        let (lease, binding, _) = bounded(fixture.state.acquire_upstream_for_route(&fixture.entry))
             .await
             .unwrap_or_else(|_| panic!("shared upstream unavailable after Body drop"));
         let unary = bounded(lease.client().call_bound(&binding, "ping", b""))
@@ -1119,7 +1147,6 @@ async fn abandoned_budget_wait_stops_before_ipc_dispatch() {
             "x-c2-expected-signature-hash",
             &fixture.entry.signature_hash,
         )
-        .header("x-c2-route-uid", &fixture.entry.route_uid)
         .header("content-length", "8")
         .body(Body::from(input))
         .unwrap();
@@ -1160,7 +1187,6 @@ async fn cancelled_stream_terminal_is_delivered_while_another_http_response_fill
             "x-c2-expected-signature-hash",
             &fixture.entry.signature_hash,
         )
-        .header("x-c2-route-uid", &fixture.entry.route_uid)
         .header("content-length", "8")
         .body(Body::from(
             [2_u32.to_le_bytes(), 64_u32.to_le_bytes()].concat(),
@@ -1224,7 +1250,6 @@ async fn cancelled_stream_terminal_is_delivered_while_another_http_response_fill
             "x-c2-expected-signature-hash",
             &fixture.entry.signature_hash,
         )
-        .header("x-c2-route-uid", &fixture.entry.route_uid)
         .header("content-length", "4")
         .body(Body::from((32 * 1024_u32).to_le_bytes().to_vec()))
         .unwrap();
@@ -1315,7 +1340,6 @@ async fn abandoned_data_header_refunds_its_payload_before_blocked_cleanup() {
             "x-c2-expected-signature-hash",
             &fixture.entry.signature_hash,
         )
-        .header("x-c2-route-uid", &fixture.entry.route_uid)
         .header("content-length", "8")
         .body(Body::from(
             [1_u32.to_le_bytes(), 8192_u32.to_le_bytes()].concat(),
@@ -1390,7 +1414,6 @@ async fn token_cancel_after_lifecycle_cancel_finishes_without_another_copy_windo
                 "x-c2-expected-signature-hash",
                 &fixture.entry.signature_hash,
             )
-            .header("x-c2-route-uid", &fixture.entry.route_uid)
             .header("content-length", "8")
             .body(Body::from(
                 [1_u32.to_le_bytes(), (128 * 1024_u32).to_le_bytes()].concat(),
@@ -1471,7 +1494,7 @@ async fn mismatched_http_call_modes_are_not_executed_and_keep_upstream() {
     };
     use c2_error::ErrorCode;
     let fixture = Fixture::start(false, 64 * 1024).await;
-    let (lease, _) = bounded(fixture.state.acquire_upstream_for_route(&fixture.entry))
+    let (lease, _, _) = bounded(fixture.state.acquire_upstream_for_route(&fixture.entry))
         .await
         .unwrap_or_else(|_| panic!("upstream acquire failed"));
     let original = lease.client();
@@ -1605,7 +1628,7 @@ async fn mismatched_http_call_modes_are_not_executed_and_keep_upstream() {
     );
     drop(stream);
     drop(client);
-    let (lease, _) = bounded(fixture.state.acquire_upstream_for_route(&fixture.entry))
+    let (lease, _, _) = bounded(fixture.state.acquire_upstream_for_route(&fixture.entry))
         .await
         .unwrap_or_else(|_| panic!("upstream reacquire failed"));
     assert!(Arc::ptr_eq(&original, &lease.client()));
@@ -1641,7 +1664,6 @@ async fn stream_body_last_bytes_reference_refunds_b() {
                 "x-c2-expected-signature-hash",
                 &fixture.entry.signature_hash,
             )
-            .header("x-c2-route-uid", &fixture.entry.route_uid)
             .header("content-length", "8")
             .body(Body::from(
                 [1u32.to_le_bytes(), (LEN as u32).to_le_bytes()].concat(),

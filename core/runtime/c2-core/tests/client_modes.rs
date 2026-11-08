@@ -386,27 +386,32 @@ fn malformed_ipc_server() -> MalformedIpcServer {
     }
 }
 
-async fn stale_relay_call(
+async fn missing_route_relay_call(
     State(call_count): State<Arc<AtomicUsize>>,
     Path((route, _method)): Path<(String, String)>,
 ) -> (StatusCode, Json<c2_error::C2ErrorEnvelope>) {
     call_count.fetch_add(1, Ordering::SeqCst);
     (
-        StatusCode::CONFLICT,
+        StatusCode::NOT_FOUND,
         Json(
-            C2Error::new(ErrorCode::RouteStale, "stale route token")
-                .with_details(BTreeMap::from([("route".to_string(), route)]))
+            C2Error::new(ErrorCode::ResourceNotFound, "route no longer found")
+                .with_details(BTreeMap::from([
+                    ("route".to_string(), route),
+                    ("dispatch_phase".to_string(), "pre_dispatch".to_string()),
+                ]))
                 .envelope(),
         ),
     )
 }
 
-fn stale_data_plane_server(call_count: Arc<AtomicUsize>) -> RegistryServer {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("stale data-plane listener");
+fn missing_route_data_plane_server(call_count: Arc<AtomicUsize>) -> RegistryServer {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("missing-route data-plane listener");
     listener
         .set_nonblocking(true)
-        .expect("nonblocking stale data-plane listener");
-    let address = listener.local_addr().expect("stale data-plane address");
+        .expect("nonblocking missing-route data-plane listener");
+    let address = listener
+        .local_addr()
+        .expect("missing-route data-plane address");
     let url = format!("http://{address}");
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
     let (ready_tx, ready_rx) = std::sync::mpsc::channel();
@@ -414,24 +419,24 @@ fn stale_data_plane_server(call_count: Arc<AtomicUsize>) -> RegistryServer {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
-            .expect("stale data-plane runtime");
+            .expect("missing-route data-plane runtime");
         runtime.block_on(async move {
             let listener = tokio::net::TcpListener::from_std(listener)
-                .expect("tokio stale data-plane listener");
+                .expect("tokio missing-route data-plane listener");
             let app = Router::new()
                 .route("/_probe/{route}", get(|| async { StatusCode::OK }))
-                .route("/{route}/{method}", post(stale_relay_call))
+                .route("/{route}/{method}", post(missing_route_relay_call))
                 .with_state(call_count);
-            ready_tx.send(()).expect("stale data-plane ready");
+            ready_tx.send(()).expect("missing-route data-plane ready");
             axum::serve(listener, app)
                 .with_graceful_shutdown(async {
                     let _ = shutdown_rx.await;
                 })
                 .await
-                .expect("stale data-plane serve");
+                .expect("missing-route data-plane serve");
         });
     });
-    ready_rx.recv().expect("stale data-plane readiness");
+    ready_rx.recv().expect("missing-route data-plane readiness");
     RegistryServer {
         url,
         shutdown: Some(shutdown_tx),
@@ -448,7 +453,6 @@ fn local_candidate(
     RelayRouteInfo {
         name: expected.route_name.clone(),
         relay_url: "http://127.0.0.1:9".to_string(),
-        route_uid: "route-uid-1".to_string(),
         ipc_address: Some(address),
         server_id: Some(server_id),
         server_instance_id: Some(server_instance_id),
@@ -911,7 +915,6 @@ fn relay_aware_selects_an_independent_http_path_when_no_local_candidate_exists()
         RelayRouteInfo {
             name: expected.route_name.clone(),
             relay_url: data_plane.url.clone(),
-            route_uid: "route-uid-http".to_string(),
             ipc_address: None,
             server_id: None,
             server_instance_id: None,
@@ -945,20 +948,19 @@ fn relay_aware_selects_an_independent_http_path_when_no_local_candidate_exists()
 }
 
 #[test]
-fn a_stale_post_is_pre_dispatch_and_the_next_call_refreshes_the_route() {
+fn a_not_found_post_is_pre_dispatch_and_the_next_call_refreshes_the_route() {
     let _environment = relay_env_lock();
     let release = release();
     let expected = release
-        .expected_route(unique_name("stale-once"))
+        .expected_route(unique_name("missing-once"))
         .expect("expected route");
     let call_count = Arc::new(AtomicUsize::new(0));
-    let data_plane = stale_data_plane_server(call_count.clone());
+    let data_plane = missing_route_data_plane_server(call_count.clone());
     let resolve_count = Arc::new(AtomicUsize::new(0));
     let registry = registry_server(
         RelayRouteInfo {
             name: expected.route_name.clone(),
             relay_url: data_plane.url.clone(),
-            route_uid: "route-uid-stale".to_string(),
             ipc_address: None,
             server_id: None,
             server_instance_id: None,
@@ -972,7 +974,7 @@ fn a_stale_post_is_pre_dispatch_and_the_next_call_refreshes_the_route() {
         resolve_count.clone(),
     );
     let runtime = Runtime::new(runtime_options(
-        unique_name("stale-runtime"),
+        unique_name("missing-route-runtime"),
         Some(registry.url.clone()),
     ))
     .expect("runtime");
@@ -982,11 +984,15 @@ fn a_stale_post_is_pre_dispatch_and_the_next_call_refreshes_the_route() {
 
     let Error::Semantic(error) = client
         .call_owned("echo", b"request")
-        .expect_err("a stale POST must end this logical call")
+        .expect_err("a not-found POST must end this logical call")
     else {
-        panic!("stale route must remain a semantic error");
+        panic!("not-found route must remain a semantic error");
     };
-    assert_eq!(error.code, ErrorCode::RouteStale);
+    assert_eq!(error.code, ErrorCode::ResourceNotFound);
+    assert_eq!(
+        error.details.get("dispatch_phase").map(String::as_str),
+        Some("pre_dispatch")
+    );
     assert_eq!(
         resolve_count.load(Ordering::SeqCst),
         1,
@@ -999,11 +1005,11 @@ fn a_stale_post_is_pre_dispatch_and_the_next_call_refreshes_the_route() {
     );
     let Error::Semantic(error) = client
         .call_owned("echo", b"next request")
-        .expect_err("the independent call also reaches the stale endpoint")
+        .expect_err("the independent call also reaches the missing-route endpoint")
     else {
-        panic!("stale route must remain a semantic error");
+        panic!("not-found route must remain a semantic error");
     };
-    assert_eq!(error.code, ErrorCode::RouteStale);
+    assert_eq!(error.code, ErrorCode::ResourceNotFound);
     assert_eq!(resolve_count.load(Ordering::SeqCst), 2);
     assert_eq!(call_count.load(Ordering::SeqCst), 2);
 }
@@ -1336,7 +1342,6 @@ fn http_probe_error_storage_uses_the_runtime_payload_budget() {
         RelayRouteInfo {
             name: expected.route_name.clone(),
             relay_url: data_plane.url.clone(),
-            route_uid: "probe-budget-route".into(),
             ipc_address: None,
             server_id: None,
             server_instance_id: None,
