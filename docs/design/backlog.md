@@ -26,6 +26,7 @@
 
 ## 要核实的事
 
+- fork CI run 42490629331（`6c87c7ac`）的 Windows ARM64 上有两处流式批次留下的问题：c2-ipc 的 `local_delivery_grants_one_step_ahead_without_waiting_for_recv` 在 `tests/server_streams.rs:471` 读调度器快照时得到 1 而不是 0；同时 c2-server `src/stream.rs:339` 对编码任务的 `JoinError` 用 `expect("stream encoding worker panicked")`，测试拆除时任务被取消（`JoinError::Cancelled`）也被当成 panic。前者像是断言在步骤推进之前读了快照，后者是产品代码把运行时关闭时的取消当作崩溃，要按真实的结束原因处理。
 - 路由身份批第一次 fork CI（run 42473351631，`25a93160`）里，Windows x64（windows-2025）上 c2-core 的 `server_streams` 测试进程以 `0xc0000374 STATUS_HEAP_CORRUPTION` 退出，32 个测试里 17 个已报 ok，其余还在并行。在 Windows 11 x64 测试机上，本分支与 `fd33e140` 各默认并行跑 200 次都没有复现，事件日志里也没有对应的应用错误；同一轮 Windows ARM64 与之后的 run 42481482052 都通过。CI 上再出现就保留那次的完整输出，并在 Windows Server 2025 上复现。
 - `server_streams` 在 Windows 11 x64 上默认并行时偶发失败，`fd33e140` 上同样出现，单独运行各 100 次都通过：`shutdown_during_final_step_reports_its_cancellation_cause` 在 `expect_stream_error` 处拿到的不是终态错误（本分支 200 次里 5 次，`fd33e140` 3 次），`runtime_shutdown_preserves_the_running_step_and_entered_unary_call` 在基线上同样失败 1 次。测试先等路由关闭再放行最后一步，按“Runtime 关闭在步与步之间结束流，最后以 `CallCancelled` 写明原因”的约定应当总是取消，所以可能是流的终态与关闭之间的竞争，要先定位是产品还是测试。同一批运行里本分支有 2 轮、共 3 个 HTTP 流测试在绑定 relay 端口时报 Windows 10048（地址已被占用），测试拿空闲端口的方式也要查。
 - Node 绑定的测试 `ABI 8 unary encoding consumes the native pre-dispatch deadline`（`core/foundation/c2-mem-ffi/bindings/typescript/tests/c2-mem-ffi-protocol.test.mjs`）在 2026-11-05 修 Windows CI 的 Worker 那里，Windows 11 x64 上跑三轮失败过一次，单独连跑三次都通过。测试用 1 ms 的调用截止时间加 20 ms 的忙等编码，没有留下失败时的输出，原因未知；CI 上再出现就派 Windows Worker 复现。
