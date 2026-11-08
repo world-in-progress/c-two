@@ -52,6 +52,8 @@ pub(crate) mod client_lifecycle;
 mod client_lifecycle_tests;
 pub(crate) mod conn_pool;
 pub(crate) mod disseminator;
+#[cfg(test)]
+mod force_leave_tests;
 pub(crate) mod forwarding;
 #[cfg(test)]
 mod forwarding_tests;

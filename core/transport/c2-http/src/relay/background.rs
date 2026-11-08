@@ -246,7 +246,7 @@ fn build_digest(state: &RelayState) -> Vec<DigestEntry> {
         .collect()
 }
 
-/// Probe dead peers with health checks; recover and exchange digest on success.
+/// Probe dead peers with health checks; rejoin and exchange digest on recovery.
 async fn dead_peer_probe_loop(state: Arc<RelayState>, cancel: CancellationToken) {
     let interval = state.config().dead_peer_probe_interval;
     let mut ticker = tokio::time::interval(interval);
@@ -277,6 +277,22 @@ async fn dead_peer_probe_loop(state: Arc<RelayState>, cancel: CancellationToken)
                 Err(_) => false,
             };
             if probe_ok {
+                // The peer may have forgotten us through force-leave. Rejoin
+                // before exchanging state; its snapshot is for seed bootstrap
+                // only and must not be merged on this recovery path.
+                let join = PeerEnvelope::new(
+                    state.relay_id(),
+                    PeerMessage::RelayJoin {
+                        relay_id: state.relay_id().to_string(),
+                        url: state.config().effective_advertise_url(),
+                    },
+                );
+                let join_url = peer_endpoint_url(&url, "/_peer/join");
+                if !matches!(client.post(&join_url).json(&join).send().await,
+                    Ok(response) if response.status().is_success())
+                {
+                    continue;
+                }
                 // Peer is back — mark alive
                 state.with_route_table_mut(|rt| {
                     if let Some(p) = rt.get_peer_mut(&relay_id) {

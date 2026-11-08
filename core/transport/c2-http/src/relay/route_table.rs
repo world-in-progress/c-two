@@ -27,6 +27,14 @@ pub struct RouteTable {
     next_timestamp: f64,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ForceLeaveError {
+    InvalidRelayId(String),
+    SelfRelay,
+    Alive,
+    Unknown,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct TombstoneGcEntry {
     pub tombstone: RouteTombstone,
@@ -463,6 +471,23 @@ impl RouteTable {
 
     pub fn unregister_peer(&mut self, relay_id: &str) -> Option<PeerInfo> {
         self.peers.remove(relay_id)
+    }
+
+    /// The caller holds the write lock across the liveness decision and removal.
+    /// Static relay-ID validation belongs to the incoming request boundary.
+    pub(crate) fn force_leave_peer(&mut self, relay_id: &str) -> Result<(), ForceLeaveError> {
+        if relay_id == self.relay_id {
+            return Err(ForceLeaveError::SelfRelay);
+        }
+        match self.peers.get(relay_id).map(|peer| peer.status) {
+            Some(PeerStatus::Alive) => return Err(ForceLeaveError::Alive),
+            None => return Err(ForceLeaveError::Unknown),
+            Some(PeerStatus::Suspect | PeerStatus::Dead) => {}
+        }
+        self.peers.remove(relay_id);
+        self.remove_routes_by_relay(relay_id);
+        self.tombstones.retain(|(_, owner), _| owner != relay_id);
+        Ok(())
     }
 
     pub fn get_peer(&self, relay_id: &str) -> Option<&PeerInfo> {

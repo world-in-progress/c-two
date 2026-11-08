@@ -12,7 +12,9 @@ use crate::relay::conn_pool::{
     CachedClient, OwnerReplaceError, OwnerReplacementEvidence, OwnerToken,
 };
 use crate::relay::peer::ValidatedDigestDiffEntry;
-use crate::relay::route_table::{valid_route_name, validate_server_instance_id_value};
+use crate::relay::route_table::{
+    ForceLeaveError, valid_route_name, validate_server_instance_id_value,
+};
 use crate::relay::state::RelayState;
 use crate::relay::types::{Locality, RouteEntry, UpstreamEndpointKey};
 
@@ -957,6 +959,20 @@ impl<'a> RouteAuthority<'a> {
         self.state
             .route_table_write()
             .remove_routes_by_relay(relay_id);
+    }
+
+    pub(crate) fn force_leave_peer(&self, relay_id: &str) -> Result<(), ForceLeaveError> {
+        c2_config::validate_relay_id(relay_id).map_err(ForceLeaveError::InvalidRelayId)?;
+        self.state.route_table_write().force_leave_peer(relay_id)
+    }
+
+    /// IDs and sender/target distinction were checked by the peer wire boundary.
+    pub(crate) fn force_leave_from_peer(&self, sender: &str, relay_id: &str) -> bool {
+        let mut table = self.state.route_table_write();
+        if sender == table.relay_id() || !table.peer_is_alive(sender) {
+            return false;
+        }
+        table.force_leave_peer(relay_id).is_ok()
     }
 
     fn trusted_peer_owner(&self, sender_relay_id: &str, relay_id: &str) -> bool {

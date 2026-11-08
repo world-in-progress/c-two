@@ -254,6 +254,24 @@ pub async fn handle_peer_leave(
     StatusCode::OK
 }
 
+/// POST /_peer/force-leave — a deployer declaration forwarded by a live peer
+pub async fn handle_peer_force_leave(
+    State(state): State<Arc<RelayState>>,
+    Json(envelope): Json<PeerEnvelope>,
+) -> impl IntoResponse {
+    let Ok(ValidatedRouteStateEnvelope::Message(envelope)) =
+        validate_route_state_envelope(envelope, None)
+    else {
+        return StatusCode::OK;
+    };
+    if let PeerMessage::RelayForceLeave { relay_id } = envelope.message
+        && RouteAuthority::new(&state).force_leave_from_peer(&envelope.sender_relay_id, &relay_id)
+    {
+        crate::relay::gossip::broadcast_force_leave(&state, relay_id);
+    }
+    StatusCode::OK
+}
+
 /// POST /_peer/digest — anti-entropy digest exchange
 pub async fn handle_peer_digest(
     State(state): State<Arc<RelayState>>,

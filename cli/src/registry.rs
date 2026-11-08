@@ -69,6 +69,21 @@ pub enum RegistryCommand {
     ListRoutes(RelayOnly),
     /// List known peer relays.
     Peers(RelayOnly),
+    /// Force an unreachable relay to leave the mesh.
+    ForceLeave(ForceLeaveArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct ForceLeaveArgs {
+    pub relay_id: String,
+    /// Relay HTTP address.
+    #[arg(long, short = 'r')]
+    pub relay: String,
+}
+
+#[derive(Deserialize)]
+struct ForceLeaveResponse {
+    force_left: String,
 }
 
 #[derive(Debug, Args)]
@@ -82,7 +97,44 @@ pub fn run(args: RegistryArgs) -> Result<()> {
     match args.command {
         RegistryCommand::ListRoutes(args) => list_routes(&args.relay),
         RegistryCommand::Peers(args) => peers(&args.relay),
+        RegistryCommand::ForceLeave(args) => force_leave(&args.relay, &args.relay_id),
     }
+}
+
+fn force_leave(relay: &str, relay_id: &str) -> Result<()> {
+    let url = format!("{}/_admin/force-leave", relay.trim_end_matches('/'));
+    let builder = reqwest::blocking::Client::builder().timeout(std::time::Duration::from_secs(5));
+    let builder = if resolve_relay_use_proxy(ConfigSources::from_process())? {
+        builder
+    } else {
+        builder.no_proxy()
+    };
+    let client = builder
+        .build()
+        .map_err(|e| anyhow!("failed to build HTTP client: {e}"))?;
+    let response = client
+        .post(&url)
+        .json(&serde_json::json!({"relay_id": relay_id}))
+        .send()
+        .map_err(|e| anyhow!("request failed for {url}: {e}"))?;
+    let status = response.status();
+    if !status.is_success() {
+        let reason = response
+            .text()
+            .map_err(|e| anyhow!("failed to read rejection from {url}: {e}"))?;
+        return Err(anyhow!("relay returned HTTP {status} for {url}: {reason}"));
+    }
+    let result = response
+        .json::<ForceLeaveResponse>()
+        .map_err(|e| anyhow!("invalid JSON from {url}: {e}"))?;
+    if result.force_left != relay_id {
+        return Err(anyhow!(
+            "unexpected force-left relay from {url}: {}",
+            result.force_left
+        ));
+    }
+    println!("Force-left {relay_id}.");
+    Ok(())
 }
 
 fn get_json<T: DeserializeOwned>(relay: &str, path: &str) -> Result<T> {

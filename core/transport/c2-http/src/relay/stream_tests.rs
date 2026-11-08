@@ -665,7 +665,7 @@ async fn item_write_range_failure_keeps_real_terminal_and_http_ends_normally() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn retired_header_is_ignored_for_unary_and_stream_calls() {
     let fixture = Fixture::start(false, 256 * 1024).await;
-    let retired_header = concat!("x-c2-route-", "uid");
+    let retired_header = "x-c2-route-uid";
     for headers in [
         vec![],
         vec!["obsolete"],

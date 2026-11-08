@@ -43,6 +43,8 @@ pub enum PeerMessage {
     RelayJoin { relay_id: String, url: String },
     /// A relay is gracefully leaving the mesh.
     RelayLeave { relay_id: String },
+    /// A deployer asks peers that cannot reach a relay to forget it.
+    RelayForceLeave { relay_id: String },
     /// Periodic heartbeat.
     Heartbeat { relay_id: String, route_count: u32 },
     /// Anti-entropy digest exchange (request or response).
@@ -121,6 +123,7 @@ pub enum PeerRouteStateError {
     InvalidRouteAnnounce { reason: String },
     InvalidRouteWithdraw { reason: String },
     InvalidRelayLeave { reason: String },
+    InvalidRelayForceLeave { reason: String },
     InvalidDigestEntry { reason: String },
     InvalidDigestDiff { reason: String },
 }
@@ -199,6 +202,13 @@ pub fn validate_route_state_envelope(
             if relay_id.as_str() != envelope.sender_relay_id || !valid_wire_relay_id(relay_id) {
                 return Err(PeerRouteStateError::InvalidRelayLeave {
                     reason: "invalid relay leave".to_string(),
+                });
+            }
+        }
+        PeerMessage::RelayForceLeave { relay_id } => {
+            if relay_id.as_str() == envelope.sender_relay_id || !valid_wire_relay_id(relay_id) {
+                return Err(PeerRouteStateError::InvalidRelayForceLeave {
+                    reason: "invalid relay force-leave".to_string(),
                 });
             }
         }

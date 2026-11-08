@@ -732,6 +732,7 @@ pub fn build_router(state: Arc<RelayState>) -> Router {
         .route("/_register", post(handle_register))
         .route("/_unregister", post(handle_unregister))
         .route("/_admin/unregister", post(handle_admin_unregister))
+        .route("/_admin/force-leave", post(handle_admin_force_leave))
         .route("/_routes", get(handle_list_routes))
         .route("/_resolve/{*name}", get(handle_resolve))
         .route("/_probe/{*name}", get(handle_probe))
@@ -745,6 +746,10 @@ pub fn build_router(state: Arc<RelayState>) -> Router {
             post(peer_handlers::handle_peer_heartbeat),
         )
         .route("/_peer/leave", post(peer_handlers::handle_peer_leave))
+        .route(
+            "/_peer/force-leave",
+            post(peer_handlers::handle_peer_force_leave),
+        )
         .route("/_peer/digest", post(peer_handlers::handle_peer_digest))
         .route("/health", get(handle_health))
         .layer(DefaultBodyLimit::max(CONTROL_BODY_LIMIT_BYTES));
@@ -1364,6 +1369,47 @@ async fn handle_unregister(
             format!("invalid registration withdrawal: {error:?}"),
         )
             .into_response(),
+    }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ForceLeaveRequest {
+    relay_id: String,
+}
+
+/// `POST /_admin/force-leave` — forget one unreachable relay in this relay's view.
+async fn handle_admin_force_leave(
+    State(state): State<Arc<RelayState>>,
+    body: Result<Json<ForceLeaveRequest>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    use crate::relay::route_table::ForceLeaveError;
+
+    let Json(ForceLeaveRequest { relay_id }) = match body {
+        Ok(body) => body,
+        Err(error) => return (StatusCode::BAD_REQUEST, error.body_text()).into_response(),
+    };
+    match RouteAuthority::new(&state).force_leave_peer(&relay_id) {
+        Ok(()) => {
+            crate::relay::gossip::broadcast_force_leave(&state, relay_id.clone());
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({"force_left": relay_id})),
+            )
+                .into_response()
+        }
+        Err(ForceLeaveError::InvalidRelayId(reason)) => {
+            (StatusCode::BAD_REQUEST, reason).into_response()
+        }
+        Err(ForceLeaveError::SelfRelay) => {
+            (StatusCode::CONFLICT, "cannot force-leave this relay").into_response()
+        }
+        Err(ForceLeaveError::Alive) => {
+            (StatusCode::CONFLICT, format!("relay {relay_id} is Alive")).into_response()
+        }
+        Err(ForceLeaveError::Unknown) => {
+            (StatusCode::NOT_FOUND, format!("unknown relay {relay_id}")).into_response()
+        }
     }
 }
 
@@ -4371,7 +4417,7 @@ mod tests {
 
     #[tokio::test]
     async fn relay_probe_ignores_retired_header_value() {
-        let retired_header = concat!("x-c2-route-", "uid");
+        let retired_header = "x-c2-route-uid";
         let state = test_state();
         let address = format!(
             "ipc://relay_probe_stale_external_token_{}_{}",
@@ -4408,7 +4454,7 @@ mod tests {
 
     #[tokio::test]
     async fn relay_probe_ignores_repeated_retired_header() {
-        let retired_header = concat!("x-c2-route-", "uid");
+        let retired_header = "x-c2-route-uid";
         let state = test_state();
         let address = format!(
             "ipc://relay_probe_repeated_route_token_{}_{}",

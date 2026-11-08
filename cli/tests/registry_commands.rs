@@ -134,3 +134,133 @@ fn registry_displays_valid_responses() {
     .success()
     .stdout("relay-b (http://relay-b:8080) - Alive\n");
 }
+
+fn force_leave_relay(status: u16, body: &str) -> (String, std::thread::JoinHandle<()>) {
+    use std::io::Read;
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let body = body.to_string();
+    let handle = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        let mut request = BufReader::new(stream.try_clone().unwrap());
+        let mut line = String::new();
+        request.read_line(&mut line).unwrap();
+        assert_eq!(line, "POST /_admin/force-leave HTTP/1.1\r\n");
+        let mut length = None;
+        loop {
+            line.clear();
+            assert_ne!(request.read_line(&mut line).unwrap(), 0);
+            if line == "\r\n" {
+                break;
+            }
+            if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                length = Some(value.trim().parse::<usize>().unwrap());
+            }
+        }
+        let mut bytes = vec![0; length.unwrap()];
+        request.read_exact(&mut bytes).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap(),
+            serde_json::json!({"relay_id":"relay-c"})
+        );
+        write!(stream, "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+    });
+    (format!("http://{address}"), handle)
+}
+
+#[test]
+fn force_leave_requires_target_and_relay() {
+    for args in [
+        vec!["registry", "force-leave"],
+        vec!["registry", "force-leave", "relay-c"],
+        vec!["registry", "force-leave", "--relay", "http://127.0.0.1:1"],
+    ] {
+        Command::cargo_bin("c3")
+            .unwrap()
+            .args(args)
+            .assert()
+            .code(2);
+    }
+    Command::cargo_bin("c3")
+        .unwrap()
+        .args(["registry", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("force-leave"));
+}
+
+#[test]
+fn force_leave_posts_target_and_prints_text_success() {
+    for flag in ["--relay", "-r"] {
+        let (relay, server) = force_leave_relay(200, r#"{"force_left":"relay-c"}"#);
+        Command::cargo_bin("c3")
+            .unwrap()
+            .args(["registry", "force-leave", "relay-c", flag, &relay])
+            .env("C2_RELAY_USE_PROXY", "0")
+            .assert()
+            .code(0)
+            .stdout("Force-left relay-c.\n")
+            .stderr("");
+        server.join().unwrap();
+    }
+}
+
+#[test]
+fn force_leave_reports_relay_rejections_with_reason_and_exit_one() {
+    for (status, reason) in [
+        (400, "invalid relay_id"),
+        (404, "unknown relay relay-c"),
+        (409, "cannot force-leave this relay"),
+        (409, "relay relay-c is Alive"),
+    ] {
+        let (relay, server) = force_leave_relay(status, reason);
+        Command::cargo_bin("c3")
+            .unwrap()
+            .args(["registry", "force-leave", "relay-c", "--relay", &relay])
+            .env("C2_RELAY_USE_PROXY", "0")
+            .assert()
+            .code(1)
+            .stdout("")
+            .stderr(predicate::str::contains(reason))
+            .stderr(predicate::str::contains(status.to_string()));
+        server.join().unwrap();
+    }
+}
+
+#[test]
+fn force_leave_rejects_malformed_or_mismatched_success_response() {
+    for body in [
+        "not json",
+        "{}",
+        r#"{"force_left":3}"#,
+        r#"{"force_left":"relay-other"}"#,
+    ] {
+        let (relay, server) = force_leave_relay(200, body);
+        Command::cargo_bin("c3")
+            .unwrap()
+            .args(["registry", "force-leave", "relay-c", "--relay", &relay])
+            .env("C2_RELAY_USE_PROXY", "0")
+            .assert()
+            .code(1)
+            .stdout("");
+        server.join().unwrap();
+    }
+}
+
+#[test]
+fn force_leave_reports_network_error() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let relay = format!("http://{}", listener.local_addr().unwrap());
+    drop(listener);
+    Command::cargo_bin("c3")
+        .unwrap()
+        .args(["registry", "force-leave", "relay-c", "--relay", &relay])
+        .env("C2_RELAY_USE_PROXY", "0")
+        .assert()
+        .code(1)
+        .stdout("")
+        .stderr(predicate::str::contains("request failed"));
+}
