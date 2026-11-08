@@ -1,14 +1,14 @@
-//! IPC 15 metadata follows the permanent fixed version preamble.
+//! IPC 16 metadata follows the permanent fixed version preamble.
 //!
 //! Client metadata is `[prefix_len:u8][prefix][SHM direction bits:u16 LE]`.
 //! Server metadata appends identity and routes; routes carry full contract
 //! identity, payload limit and method table, without a revision.
 
-use crate::control::EncodeError;
 use crate::frame::DecodeError;
+use crate::rpc::EncodeError;
 
 /// RPC protocol version; metadata from earlier versions is not supported.
-pub const HANDSHAKE_VERSION: u32 = 15;
+pub const HANDSHAKE_VERSION: u32 = 16;
 
 /// Fixed preamble body length, independent of configurable variable-frame limits.
 pub const VERSION_PREAMBLE_BODY_LEN: u32 = 21;

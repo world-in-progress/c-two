@@ -11,7 +11,7 @@ use pyo3::types::{PyAny, PyDict, PyList};
 
 use c2_contract::{
     ContractError, ContractRelease, ContractReleaseRef, ExpectedRouteContract, MethodAccess,
-    PORTABLE_CONTRACT_SCHEMA, contract_descriptor_sha256_hex,
+    MethodMode, PORTABLE_CONTRACT_SCHEMA, contract_descriptor_sha256_hex,
 };
 use c2_core::memory::{LocalCopyStats, LocalCopyTracker};
 use c2_core::{
@@ -420,6 +420,9 @@ impl PyRuntimeSession {
         if let Some(observer) = self.inner.outgoing_memory_observer() {
             pending.push_scope(c2_core::scope::RUNTIME_OUTGOING, observer);
         }
+        if let Some(observer) = self.inner.payload_buffer_observer() {
+            pending.push_payload_buffer(observer);
+        }
         if let Some(host) = self.host.lock().host.as_ref() {
             pending.push_scope(c2_core::scope::SERVER, host.server_memory_observer());
         }
@@ -489,7 +492,7 @@ impl PyRuntimeSession {
             }
         };
         py.detach(|| self.inner.connect_with_attempt(expected, mode, &attempt))
-            .map(PyCoreClient::new)
+            .map(|client| PyCoreClient::new(client, self.local_copy_tracker()))
             .map_err(core_error_to_py)
     }
 }
@@ -509,7 +512,7 @@ impl PyRuntimeSession {
     }
 
     #[new]
-    #[pyo3(signature = (server_id=None, server_ipc_overrides=None, client_ipc_overrides=None, shm_threshold=None, remote_payload_chunk_size=None, use_process_relay_anchor=true, max_outstanding_calls=None, retained_input_budget_bytes=None, startup_timeout=None))]
+    #[pyo3(signature = (server_id=None, server_ipc_overrides=None, client_ipc_overrides=None, shm_threshold=None, remote_payload_chunk_size=None, use_process_relay_anchor=true, max_outstanding_calls=None, payload_buffer_budget_bytes=None, startup_timeout=None))]
     #[allow(clippy::too_many_arguments)] // PyO3 signature is the existing Python call boundary.
     fn new(
         server_id: Option<String>,
@@ -519,7 +522,7 @@ impl PyRuntimeSession {
         remote_payload_chunk_size: Option<u64>,
         use_process_relay_anchor: bool,
         max_outstanding_calls: Option<u64>,
-        retained_input_budget_bytes: Option<u64>,
+        payload_buffer_budget_bytes: Option<u64>,
         startup_timeout: Option<f64>,
     ) -> PyResult<Self> {
         let server_ipc_overrides = server_ipc_overrides
@@ -545,9 +548,9 @@ impl PyRuntimeSession {
         .map_err(runtime_configuration_error_to_py)?;
         let call_execution_overrides = c2_config::CallExecutionLimitsOverrides {
             max_outstanding_calls,
-            retained_input_budget_bytes,
+            payload_buffer_budget_bytes,
         };
-        if max_outstanding_calls.is_some() || retained_input_budget_bytes.is_some() {
+        if max_outstanding_calls.is_some() || payload_buffer_budget_bytes.is_some() {
             inner
                 .set_call_execution_limits(call_execution_overrides.clone())
                 .map_err(lifecycle_error_to_py)?;
@@ -665,15 +668,15 @@ impl PyRuntimeSession {
         local_copy_stats_dict(py, &self.merged_local_copy_stats())
     }
 
-    #[pyo3(signature = (*, max_outstanding_calls=None, retained_input_budget_bytes=None))]
+    #[pyo3(signature = (*, max_outstanding_calls=None, payload_buffer_budget_bytes=None))]
     fn set_call_execution_limits(
         &self,
         max_outstanding_calls: Option<u64>,
-        retained_input_budget_bytes: Option<u64>,
+        payload_buffer_budget_bytes: Option<u64>,
     ) -> PyResult<()> {
         let overrides = c2_config::CallExecutionLimitsOverrides {
             max_outstanding_calls,
-            retained_input_budget_bytes,
+            payload_buffer_budget_bytes,
         };
         self.inner
             .set_call_execution_limits(overrides)
@@ -689,14 +692,14 @@ impl PyRuntimeSession {
         let dict = PyDict::new(py);
         dict.set_item("max_outstanding_calls", overrides.max_outstanding_calls)?;
         dict.set_item(
-            "retained_input_budget_bytes",
-            overrides.retained_input_budget_bytes,
+            "payload_buffer_budget_bytes",
+            overrides.payload_buffer_budget_bytes,
         )?;
         Ok(dict)
     }
 
-    /// Actual Core-owned finite input charges, including unfinished native
-    /// continuations after a Python caller times out or a session is replaced.
+    /// Operation slots, including every stream and finite calls that continue
+    /// after caller expiry or session replacement; byte statistics are separate.
     fn call_execution_snapshot<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
         let snapshot = self
             .inner
@@ -716,11 +719,8 @@ impl PyRuntimeSession {
                 None => {
                     let report = PyDict::new(py);
                     report.set_item("max_operations", py.None())?;
-                    report.set_item("max_retained_bytes", py.None())?;
                     report.set_item("used_operations", 0)?;
-                    report.set_item("used_retained_bytes", 0)?;
                     report.set_item("peak_operations", 0)?;
-                    report.set_item("peak_retained_bytes", 0)?;
                     report.set_item("rejected_reservations", 0)?;
                     report.set_item("closed", observation.closed)?;
                     report
@@ -749,7 +749,7 @@ impl PyRuntimeSession {
     /// until that scope exists (a scope that was never frozen stays
     /// ``None``).
     ///
-    /// The three budget cells are independent accounting scopes, not process
+    /// The budget cells are independent accounting scopes, not process
     /// RSS; their sum must never be read as physical memory usage.
     fn memory_stats<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
         let stats = match self.host.lock().host.as_ref() {
@@ -782,6 +782,23 @@ impl PyRuntimeSession {
                 .collect::<PyResult<Vec<_>>>()?,
         )?;
         dict.set_item("retired", retired_list)?;
+        dict.set_item(
+            "payload_buffer",
+            match stats.payload_buffer.as_ref() {
+                Some(cell) => memory_cell_dict(py, cell)?.into_any(),
+                None => py.None().into_bound(py),
+            },
+        )?;
+        dict.set_item(
+            "retired_payload_buffers",
+            PyList::new(
+                py,
+                RetiredMemoryObservation::compose_payload_buffer_reports(&retired)
+                    .iter()
+                    .map(|cell| memory_cell_dict(py, cell))
+                    .collect::<PyResult<Vec<_>>>()?,
+            )?,
+        )?;
         dict.set_item(
             "holds",
             local_copy_stats_dict(py, &self.merged_local_copy_stats())?,
@@ -1123,8 +1140,7 @@ impl PyRuntimeSession {
         let methods = method_definitions(&method_names, access_map)?;
         let expected =
             expected_route_contract(name, crm_ns, crm_name, crm_ver, abi_hash, signature_hash)?;
-        let service: Arc<dyn c2_core::EncodedService> =
-            Arc::new(PyCoreService::new(name.to_string(), dispatcher));
+        let service = Arc::new(PyCoreService::new(name.to_string(), dispatcher));
         let definition = service_definition(descriptor_json, expected, methods, service)?
             .with_concurrency(
                 parse_concurrency_mode(concurrency_mode)?,
@@ -1482,7 +1498,7 @@ fn service_definition(
     descriptor_json: &[u8],
     expected: ExpectedRouteContract,
     methods: Vec<MethodDefinition>,
-    service: Arc<dyn c2_core::EncodedService>,
+    service: Arc<PyCoreService>,
 ) -> PyResult<ServiceDefinition> {
     let descriptor: serde_json::Value = serde_json::from_slice(descriptor_json)
         .map_err(|error| PyValueError::new_err(format!("invalid contract descriptor: {error}")))?;
@@ -1505,6 +1521,21 @@ fn service_definition(
                 }
                 .into(),
             ));
+        }
+        if release
+            .descriptor()
+            .methods()
+            .iter()
+            .any(|method| method.mode() == MethodMode::ServerStream)
+        {
+            return ServiceDefinition::new_stream(
+                &release,
+                release.reference(),
+                expected.route_name,
+                methods,
+                service,
+            )
+            .map_err(core_error_to_py);
         }
         return ServiceDefinition::new(
             &release,
@@ -1531,8 +1562,40 @@ fn service_definition(
     .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
     let release_ref = ContractReleaseRef::from_json(&release_ref_json)
         .map_err(|error| core_error_to_py(c2_core::Error::from(error)))?;
-    ServiceDefinition::new_nonportable(release_ref, expected, methods, service)
-        .map_err(core_error_to_py)
+    let descriptor_methods = descriptor
+        .get("methods")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| PyValueError::new_err("Python descriptor is missing methods"))?;
+    if descriptor_methods.len() != methods.len() {
+        return Err(PyValueError::new_err(
+            "Python descriptor method count differs from route",
+        ));
+    }
+    let modes = descriptor_methods
+        .iter()
+        .zip(&methods)
+        .map(|(value, method)| {
+            if value.get("name").and_then(serde_json::Value::as_str) != Some(method.name.as_str()) {
+                return Err(PyValueError::new_err(
+                    "Python descriptor method differs from route",
+                ));
+            }
+            match value.get("mode") {
+                None => Ok(MethodMode::Unary),
+                Some(value) if value.as_str() == Some("server_stream") => {
+                    Ok(MethodMode::ServerStream)
+                }
+                _ => Err(PyValueError::new_err("unsupported Python method mode")),
+            }
+        })
+        .collect::<PyResult<Vec<_>>>()?;
+    if modes.contains(&MethodMode::ServerStream) {
+        ServiceDefinition::new_nonportable_stream(release_ref, expected, methods, modes, service)
+            .map_err(core_error_to_py)
+    } else {
+        ServiceDefinition::new_nonportable(release_ref, expected, methods, service)
+            .map_err(core_error_to_py)
+    }
 }
 
 fn expected_route_contract(
@@ -1576,11 +1639,8 @@ fn call_execution_snapshot_dict<'py>(
 ) -> PyResult<Bound<'py, PyDict>> {
     let dict = PyDict::new(py);
     dict.set_item("max_operations", snapshot.max_operations)?;
-    dict.set_item("max_retained_bytes", snapshot.max_retained_bytes)?;
     dict.set_item("used_operations", snapshot.used_operations)?;
-    dict.set_item("used_retained_bytes", snapshot.used_retained_bytes)?;
     dict.set_item("peak_operations", snapshot.peak_operations)?;
-    dict.set_item("peak_retained_bytes", snapshot.peak_retained_bytes)?;
     dict.set_item("rejected_reservations", snapshot.rejected_reservations)?;
     dict.set_item("closed", snapshot.closed)?;
     Ok(dict)

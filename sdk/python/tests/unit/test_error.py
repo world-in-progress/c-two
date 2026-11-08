@@ -13,7 +13,7 @@ from c_two.error import (
     ResourceAlreadyRegistered, RouteStale, WriteConflict,
     ResourceClosed, ResourceRemoved, ContractMismatch, IdentityMismatch,
     RouteCatalogCompacted, RouteWatchUnavailable, ProtocolViolation, FallbackDenied,
-    CallDeadlineExceeded, UnsupportedCallMode, CallCapacityExceeded,
+    CallDeadlineExceeded, UnsupportedCallMode, CallCapacityExceeded, CallCancelled,
 )
 
 
@@ -56,9 +56,10 @@ class TestERRORCode:
         assert ERROR_Code.ERROR_CALL_DEADLINE_EXCEEDED == 715
         assert ERROR_Code.ERROR_UNSUPPORTED_CALL_MODE == 716
         assert ERROR_Code.ERROR_CALL_CAPACITY_EXCEEDED == 717
+        assert ERROR_Code.ERROR_CALL_CANCELLED == 718
 
-    def test_has_exactly_26_members(self):
-        assert len(ERROR_Code) == 26
+    def test_has_exactly_27_members(self):
+        assert len(ERROR_Code) == 27
 
     def test_values_are_unique(self):
         values = [e.value for e in ERROR_Code]
@@ -212,6 +213,7 @@ CALL_ERROR_SUBCLASS_PARAMS = [
     (CallDeadlineExceeded, ERROR_Code.ERROR_CALL_DEADLINE_EXCEEDED),
     (UnsupportedCallMode, ERROR_Code.ERROR_UNSUPPORTED_CALL_MODE),
     (CallCapacityExceeded, ERROR_Code.ERROR_CALL_CAPACITY_EXCEEDED),
+    (CallCancelled, ERROR_Code.ERROR_CALL_CANCELLED),
 ]
 
 
@@ -365,6 +367,14 @@ class TestNewCallErrorCodec:
         assert restored.message == 'continuation byte capacity exhausted'
         assert restored.details == {}
 
+    def test_call_cancelled_round_trip(self):
+        original = CallCancelled('stream closed', details={'reason': 'client_close'})
+        restored = CCError.deserialize(memoryview(CCError.serialize(original)))
+        assert isinstance(restored, CallCancelled)
+        assert restored.code == ERROR_Code.ERROR_CALL_CANCELLED
+        assert restored.message == 'stream closed'
+        assert restored.details == {'reason': 'client_close'}
+
 
 ALL_SUBCLASSES = [
     error.ResourceDeserializeInput,
@@ -387,6 +397,7 @@ ALL_SUBCLASSES = [
     error.CallDeadlineExceeded,
     error.UnsupportedCallMode,
     error.CallCapacityExceeded,
+    error.CallCancelled,
 ]
 
 
@@ -497,6 +508,7 @@ class TestNativeErrorRegistryParity:
             "ERROR_CALL_DEADLINE_EXCEEDED": ("CallDeadlineExceeded", 715),
             "ERROR_UNSUPPORTED_CALL_MODE": ("UnsupportedCallMode", 716),
             "ERROR_CALL_CAPACITY_EXCEEDED": ("CallCapacityExceeded", 717),
+            "ERROR_CALL_CANCELLED": ("CallCancelled", 718),
         }
 
         assert set(ERROR_Code.__members__) == set(expected)
@@ -508,7 +520,7 @@ class TestNativeErrorRegistryParity:
         from c_two import _native
 
         native = _native.error_registry()
-        assert len(native) == 26
+        assert len(native) == 27
         names = list(native.keys())
         values = list(native.values())
         assert len(set(names)) == len(names)
@@ -516,6 +528,7 @@ class TestNativeErrorRegistryParity:
         assert native["CallDeadlineExceeded"] == 715
         assert native["UnsupportedCallMode"] == 716
         assert native["CallCapacityExceeded"] == 717
+        assert native["CallCancelled"] == 718
 
     def test_serialize_uses_native_wire_encoder(self, monkeypatch):
         calls = []

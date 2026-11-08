@@ -49,6 +49,8 @@ pub struct RelayState {
     controls_stop_seam: parking_lot::Mutex<Option<TestPause>>,
     #[cfg(test)]
     acquire_recheck_seam: parking_lot::Mutex<Option<TestPause>>,
+    #[cfg(test)]
+    acquire_lookup_seam: parking_lot::Mutex<Option<TestPause>>,
     config: Arc<RelayConfig>,
     endpoint_context: LocalEndpointContext,
     default_endpoint_namespace: bool,
@@ -190,6 +192,8 @@ impl RelayState {
             controls_stop_seam: parking_lot::Mutex::new(None),
             #[cfg(test)]
             acquire_recheck_seam: parking_lot::Mutex::new(None),
+            #[cfg(test)]
+            acquire_lookup_seam: parking_lot::Mutex::new(None),
             disseminator,
             config,
             endpoint_context,
@@ -353,16 +357,7 @@ impl RelayState {
         &self,
         expected: &RouteEntry,
     ) -> Result<(UpstreamLease, RouteBinding), UpstreamAcquireError> {
-        if !self
-            .route_table
-            .read()
-            .local_route(&expected.name)
-            .is_some_and(|current| local_route_matches(&current, expected))
-        {
-            return Err(UpstreamAcquireError::Stale {
-                route: expected.clone(),
-            });
-        }
+        self.with_current_upstream_route(expected, || ())?;
 
         let Some(endpoint_key) = UpstreamEndpointKey::from_route(expected) else {
             return Err(UpstreamAcquireError::NotFound);
@@ -440,23 +435,25 @@ impl RelayState {
             .await
         {
             Ok(lease) => lease,
-            Err(PoolAcquireError::NotFound) => return Err(UpstreamAcquireError::NotFound),
-            Err(PoolAcquireError::Unreachable { endpoint, error }) => {
-                if !self
-                    .route_table
-                    .read()
-                    .local_route(&expected.name)
-                    .is_some_and(|current| local_route_matches(&current, expected))
-                {
-                    return Err(UpstreamAcquireError::Stale {
+            Err(PoolAcquireError::NotFound) => {
+                return Err(self.classify_upstream_acquire_failure(
+                    expected,
+                    UpstreamAcquireError::Unreachable {
                         route: expected.clone(),
-                    });
-                }
-                return Err(UpstreamAcquireError::Unreachable {
-                    route: expected.clone(),
-                    address: endpoint.address().to_string(),
-                    error,
-                });
+                        address: endpoint_key.address().to_string(),
+                        error: c2_ipc::IpcError::Closed,
+                    },
+                ));
+            }
+            Err(PoolAcquireError::Unreachable { endpoint, error }) => {
+                return Err(self.classify_upstream_acquire_failure(
+                    expected,
+                    UpstreamAcquireError::Unreachable {
+                        route: expected.clone(),
+                        address: endpoint.address().to_string(),
+                        error,
+                    },
+                ));
             }
         };
 
@@ -472,24 +469,32 @@ impl RelayState {
                         self.close_failed_acquire_client(&old_client).await;
                     }
                     drop(lease);
-                    return Err(UpstreamAcquireError::Unreachable {
-                        route: expected.clone(),
-                        address: lease_address,
-                        error,
-                    });
+                    return Err(self.classify_upstream_acquire_failure(
+                        expected,
+                        UpstreamAcquireError::Unreachable {
+                            route: expected.clone(),
+                            address: lease_address,
+                            error,
+                        },
+                    ));
                 }
                 Err(error) => {
                     if let Some(old_client) = lease.evict_current_client() {
                         self.close_failed_acquire_client(&old_client).await;
                     }
                     drop(lease);
-                    return Err(UpstreamAcquireError::WatchUnavailable {
-                        route: expected.clone(),
-                        reason: format!("{reason}; route lookup unavailable: {error}"),
-                    });
+                    return Err(self.classify_upstream_acquire_failure(
+                        expected,
+                        UpstreamAcquireError::WatchUnavailable {
+                            route: expected.clone(),
+                            reason: format!("{reason}; route lookup unavailable: {error}"),
+                        },
+                    ));
                 }
             }
         }
+        #[cfg(test)]
+        Self::pause_for_test(&self.acquire_lookup_seam).await;
         let binding = match lease
             .client()
             .acquire_route_token(&expected_contract, &expected.route_uid)
@@ -506,33 +511,40 @@ impl RelayState {
                     self.close_failed_acquire_client(&old_client).await;
                 }
                 drop(lease);
-                return match error {
-                    c2_ipc::IpcError::RouteStale { .. } => Err(UpstreamAcquireError::Stale {
-                        route: expected.clone(),
-                    }),
-                    error => Err(UpstreamAcquireError::Unreachable {
+                return Err(self.classify_upstream_acquire_failure(
+                    expected,
+                    UpstreamAcquireError::Unreachable {
                         route: expected.clone(),
                         address: lease_address,
                         error,
-                    }),
-                };
+                    },
+                ));
             }
         };
 
         #[cfg(test)]
         Self::pause_for_test(&self.acquire_recheck_seam).await;
         let lease_endpoint = lease.endpoint();
-        let route_matches_lease =
-            self.renew_owner_lease_if_current_route(expected, &lease_endpoint);
+        let route_matches_lease = self.with_current_upstream_route(expected, || {
+            self.conn_pool.renew_current_owner_lease(&lease_endpoint)
+        });
 
-        if route_matches_lease {
+        if matches!(route_matches_lease, Ok(true)) {
             Ok((lease, binding))
         } else {
             let client = lease.client();
             drop(lease);
             self.close_failed_acquire_client(&client).await;
-            Err(UpstreamAcquireError::Stale {
-                route: expected.clone(),
+            Err(match route_matches_lease {
+                Err(error) => error,
+                Ok(_) => self.classify_upstream_acquire_failure(
+                    expected,
+                    UpstreamAcquireError::Unreachable {
+                        route: expected.clone(),
+                        address: lease_address,
+                        error: c2_ipc::IpcError::Closed,
+                    },
+                ),
             })
         }
     }
@@ -553,23 +565,46 @@ impl RelayState {
         }
     }
 
-    fn renew_owner_lease_if_current_route(
+    fn with_current_upstream_route<T>(
         &self,
         expected: &RouteEntry,
-        lease_endpoint: &UpstreamEndpointKey,
-    ) -> bool {
+        when_current: impl FnOnce() -> T,
+    ) -> Result<T, UpstreamAcquireError> {
         let route_table = self.route_table.read();
         let Some(entry) = route_table.local_route(&expected.name) else {
-            return false;
+            return Err(UpstreamAcquireError::NotFound);
         };
-        if !local_route_matches(&entry, expected)
-            || UpstreamEndpointKey::from_route(&entry).as_ref() != Some(lease_endpoint)
-        {
-            return false;
+        if !local_route_matches(&entry, expected) {
+            return Err(UpstreamAcquireError::Stale {
+                route: expected.clone(),
+            });
         }
-        self.conn_pool.renew_current_owner_lease(lease_endpoint)
+        Ok(when_current())
     }
 
+    fn classify_upstream_acquire_failure(
+        &self,
+        expected: &RouteEntry,
+        failure: UpstreamAcquireError,
+    ) -> UpstreamAcquireError {
+        // Keep the owner's authoritative refusal. A local retirement or I/O
+        // failure instead observes any withdrawal/replacement that caused it.
+        let authoritative = matches!(&failure,
+            UpstreamAcquireError::Unreachable { error, .. }
+                if should_treat_as_semantic_route_failure(error));
+        if !authoritative && let Err(error) = self.with_current_upstream_route(expected, || ()) {
+            return error;
+        }
+        match failure {
+            UpstreamAcquireError::Unreachable {
+                error: c2_ipc::IpcError::RouteStale { .. },
+                ..
+            } => UpstreamAcquireError::Stale {
+                route: expected.clone(),
+            },
+            other => other,
+        }
+    }
     #[cfg(test)]
     pub(crate) fn get_address(&self, name: &str) -> Option<String> {
         let key = self
@@ -729,6 +764,15 @@ impl RelayState {
         resume: tokio::sync::oneshot::Receiver<()>,
     ) {
         *self.acquire_recheck_seam.lock() = Some((entered, resume));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_acquire_lookup_seam_for_test(
+        &self,
+        entered: tokio::sync::oneshot::Sender<()>,
+        resume: tokio::sync::oneshot::Receiver<()>,
+    ) {
+        *self.acquire_lookup_seam.lock() = Some((entered, resume));
     }
 
     pub(crate) fn set_upstream_watch_status(
@@ -1283,8 +1327,7 @@ mod tests {
                 }
             }
             let error = acquire_step(exact.call_bound(&old, "ping", &[])).await.unwrap_err();
-            let c2_ipc::IpcError::CrmError(bytes) = error else { panic!("old call: {error}"); };
-            let error = c2_error::C2Error::from_wire_bytes(&bytes).unwrap().unwrap();
+            let c2_ipc::IpcError::CallRejected(error) = error else { panic!("old call: {error}"); };
             assert_eq!(error.code, match transition {
                 AcquireTransition::Closed => c2_error::ErrorCode::ResourceClosed,
                 AcquireTransition::Removed => c2_error::ErrorCode::ResourceRemoved,
@@ -1441,10 +1484,9 @@ mod tests {
             let error = acquire_step(client.call_bound(&old_b, "ping", &[]))
                 .await
                 .unwrap_err();
-            let c2_ipc::IpcError::CrmError(bytes) = error else {
+            let c2_ipc::IpcError::CallRejected(error) = error else {
                 panic!("old B call: {error}");
             };
-            let error = c2_error::C2Error::from_wire_bytes(&bytes).unwrap().unwrap();
             assert_eq!(
                 error.code,
                 match transition {

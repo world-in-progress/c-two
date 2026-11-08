@@ -104,6 +104,8 @@ def test_memory_stats_is_observable_without_freezing_an_unused_runtime() -> None
     assert first['runtime_outgoing'] is None
     assert second['runtime_outgoing'] is None
     assert first['server'] is None
+    assert first['payload_buffer'] is None
+    assert isinstance(first['retired_payload_buffers'], list)
     # A fresh process has no retired domains; a shared test process may still
     # report owner-backed retired domains from earlier tests, but the shape is
     # always an explicit list with scope labels.
@@ -145,6 +147,8 @@ def test_memory_stats_typed_shape_is_declared_for_the_public_facade() -> None:
         'runtime_outgoing',
         'server',
         'retired',
+        'payload_buffer',
+        'retired_payload_buffers',
         'holds',
     }
 

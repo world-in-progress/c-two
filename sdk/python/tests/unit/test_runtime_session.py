@@ -135,7 +135,7 @@ def test_native_runtime_session_projects_ipc_overrides_copy(side: str) -> None:
         'pool_min_retained_segments': 0,
         'reassembly_segment_size': 16 * 1024 * 1024,
         'reassembly_max_segments': 4,
-        'max_total_chunks': 128,
+        'max_inflight_chunk_frames': 128,
         'chunk_gc_interval': 0.5,
         'chunk_threshold_ratio': 0.75,
         'chunk_assembler_timeout': 1.0,
@@ -919,7 +919,7 @@ def test_shutdown_warns_when_native_cleanup_barrier_is_unconfirmed(caplog) -> No
             outcome: dict | None = None,
             *,
             max_outstanding_calls: int | None = None,
-            retained_input_budget_bytes: int | None = None,
+            payload_buffer_budget_bytes: int | None = None,
             **_kwargs,
         ) -> None:
             self._outcome = outcome if outcome is not None else {'relay_errors': []}
@@ -929,7 +929,7 @@ def test_shutdown_warns_when_native_cleanup_barrier_is_unconfirmed(caplog) -> No
             self._limits = {
                 key: value for key, value in (
                     ('max_outstanding_calls', max_outstanding_calls),
-                    ('retained_input_budget_bytes', retained_input_budget_bytes),
+                    ('payload_buffer_budget_bytes', payload_buffer_budget_bytes),
                 ) if value is not None
             }
 

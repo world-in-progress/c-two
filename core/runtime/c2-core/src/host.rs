@@ -7,19 +7,20 @@ use parking_lot::Mutex;
 
 use c2_contract::{
     ContractError, ContractRelease, ContractReleaseRef, ExpectedRouteContract,
-    MAX_CONTRACT_METHODS, MethodAccess, PORTABLE_CONTRACT_SCHEMA, validate_contract_text_field,
-    validate_expected_route_contract,
+    MAX_CONTRACT_METHODS, MethodAccess, MethodMode, PORTABLE_CONTRACT_SCHEMA,
+    ValidatedContractDescriptor, validate_contract_text_field, validate_expected_route_contract,
 };
 use c2_error::C2Error;
 use c2_server::{
-    AccessLevel, ConcurrencyMode, CrmCallback, CrmError, ResponseMeta, RouteBuildSpec,
-    RouteConcurrencyHandle, SchedulerAcquireError, SchedulerGuard, SchedulerLimits,
-    SchedulerSnapshot, Server, ServerFailure, ServerIdentity, ServerRuntimeBuilder,
+    AccessLevel, ConcurrencyMode, CrmCallback, CrmError, CrmStream, CrmStreamCallback,
+    CrmStreamItem, ResponseMeta, RouteBuildSpec, RouteConcurrencyHandle, SchedulerAcquireError,
+    SchedulerGuard, SchedulerLimits, SchedulerSnapshot, Server, ServerFailure, ServerIdentity,
+    ServerRuntimeBuilder,
 };
 
 use crate::{
-    Error, FailedStartShutdownReceipt, LifecycleError, RegisterOutcome, Runtime, ShutdownOutcome,
-    UnregisterOutcome,
+    CoreLocalResponseStream, Error, FailedStartShutdownReceipt, LifecycleError, LocalObjectStream,
+    RegisterOutcome, Runtime, ShutdownOutcome, UnregisterOutcome,
 };
 
 /// One generated method entry validated against an admitted release.
@@ -37,6 +38,31 @@ pub struct MethodDefinition {
 /// invalidate callback-scoped payload owners before dropping the local bytes.
 pub trait EncodedService: Send + Sync + 'static {
     fn invoke(&self, method_index: u16, request: Vec<u8>) -> Result<Vec<u8>, C2Error>;
+}
+
+/// A resource-owned item whose encoding is deferred until storage admission.
+pub trait EncodedStreamItem: Send + 'static {
+    fn len(&self) -> usize;
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+    /// Encode the requested range directly into the selected transport storage.
+    fn write_range(&self, offset: usize, destination: &mut [u8]) -> Result<(), C2Error>;
+}
+
+/// The resource continuation. Establishment, steps and finish run serially
+/// under the original route admission; only finish destroys its iterator.
+pub trait EncodedStream: Send + 'static {
+    fn step(&mut self) -> Result<Option<Box<dyn EncodedStreamItem>>, C2Error>;
+    fn finish(self: Box<Self>) -> Result<(), C2Error>;
+}
+
+pub trait EncodedStreamService: EncodedService {
+    fn open_stream(
+        &self,
+        method_index: u16,
+        request: Vec<u8>,
+    ) -> Result<Box<dyn EncodedStream>, C2Error>;
 }
 
 /// Language-neutral execution policy shared by remote dispatch and any
@@ -142,6 +168,7 @@ impl From<SchedulerAcquireError> for RouteConcurrencyError {
 #[derive(Clone)]
 pub struct RouteConcurrency {
     inner: RouteConcurrencyHandle,
+    method_modes: Arc<[MethodMode]>,
 }
 
 impl fmt::Debug for RouteConcurrency {
@@ -171,6 +198,58 @@ impl RouteConcurrency {
     pub fn is_unconstrained(&self) -> bool {
         self.inner.is_unconstrained()
     }
+
+    /// Start a same-process object stream on the registered route's own call
+    /// slot. The factory and every continuation run only during a route step.
+    pub fn open_local_stream<T, F>(
+        &self,
+        method_index: u16,
+        factory: F,
+    ) -> Result<CoreLocalResponseStream<T>, Error>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> Result<Box<dyn LocalObjectStream<T>>, C2Error> + Send + 'static,
+    {
+        if self.method_modes.get(method_index as usize) != Some(&MethodMode::ServerStream) {
+            return Err(C2Error::new(
+                c2_error::ErrorCode::ContractMismatch,
+                "method is not a registered server stream",
+            )
+            .into());
+        }
+        let call = self
+            .inner
+            .begin_local_stream_call(method_index)
+            .map_err(local_stream_admission_error)?;
+        CoreLocalResponseStream::open(
+            call,
+            factory,
+            #[cfg(test)]
+            None,
+        )
+    }
+}
+
+pub(crate) fn local_stream_admission_error(error: SchedulerAcquireError) -> Error {
+    local_stream_scheduler_error(error).into()
+}
+
+pub(crate) fn local_stream_scheduler_error(error: SchedulerAcquireError) -> C2Error {
+    let (code, message) = match error {
+        SchedulerAcquireError::Closed => (
+            c2_error::ErrorCode::ResourceClosed,
+            "route closed".to_string(),
+        ),
+        SchedulerAcquireError::Unavailable => (
+            c2_error::ErrorCode::ResourceUnavailable,
+            "host admission unavailable".to_string(),
+        ),
+        SchedulerAcquireError::Capacity { field, limit } => (
+            c2_error::ErrorCode::ResourceUnavailable,
+            format!("route concurrency capacity exceeded: {field}={limit}"),
+        ),
+    };
+    C2Error::new(code, message)
 }
 
 pub struct RouteConcurrencyGuard {
@@ -199,6 +278,9 @@ pub struct ServiceDefinition {
     expected: ExpectedRouteContract,
     methods: Arc<[MethodDefinition]>,
     service: Arc<dyn EncodedService>,
+    stream_service: Option<Arc<dyn EncodedStreamService>>,
+    stream_descriptor: Option<ValidatedContractDescriptor>,
+    stream_modes: Option<Arc<[MethodMode]>>,
     concurrency_mode: ServiceConcurrencyMode,
     max_pending: Option<usize>,
     max_workers: Option<usize>,
@@ -229,10 +311,61 @@ impl ServiceDefinition {
     where
         I: IntoIterator<Item = MethodDefinition>,
     {
+        Self::from_release(
+            release,
+            release_ref,
+            route_name.into(),
+            methods,
+            service,
+            None,
+        )
+    }
+
+    pub fn new_stream<I>(
+        release: &ContractRelease,
+        release_ref: ContractReleaseRef,
+        route_name: impl Into<String>,
+        methods: I,
+        service: Arc<dyn EncodedStreamService>,
+    ) -> Result<Self, Error>
+    where
+        I: IntoIterator<Item = MethodDefinition>,
+    {
+        Self::from_release(
+            release,
+            release_ref,
+            route_name.into(),
+            methods,
+            service.clone(),
+            Some(service),
+        )
+    }
+
+    fn from_release<I>(
+        release: &ContractRelease,
+        release_ref: ContractReleaseRef,
+        route_name: String,
+        methods: I,
+        service: Arc<dyn EncodedService>,
+        stream_service: Option<Arc<dyn EncodedStreamService>>,
+    ) -> Result<Self, Error>
+    where
+        I: IntoIterator<Item = MethodDefinition>,
+    {
         release_ref.verify_release(release)?;
         let expected = release.expected_route(route_name)?;
         let methods = methods.into_iter().collect::<Vec<_>>();
         let descriptor_methods = release.descriptor().methods();
+        if stream_service.is_none()
+            && descriptor_methods
+                .iter()
+                .any(|method| method.mode() == MethodMode::ServerStream)
+        {
+            return Err(method_contract_error(
+                "$.methods",
+                "server-stream methods require a stream service".into(),
+            ));
+        }
         if methods.len() != descriptor_methods.len() {
             return Err(method_contract_error(
                 "$.methods",
@@ -288,6 +421,19 @@ impl ServiceDefinition {
             expected,
             methods: methods.into(),
             service,
+            stream_descriptor: stream_service
+                .as_ref()
+                .map(|_| release.descriptor().clone()),
+            stream_modes: stream_service.as_ref().map(|_| {
+                release
+                    .descriptor()
+                    .methods()
+                    .iter()
+                    .map(|method| method.mode())
+                    .collect::<Vec<_>>()
+                    .into()
+            }),
+            stream_service,
             concurrency_mode: ServiceConcurrencyMode::default(),
             max_pending: None,
             max_workers: None,
@@ -352,10 +498,43 @@ impl ServiceDefinition {
             expected,
             methods: methods.into(),
             service,
+            stream_service: None,
+            stream_descriptor: None,
+            stream_modes: None,
             concurrency_mode: ServiceConcurrencyMode::default(),
             max_pending: None,
             max_workers: None,
         })
+    }
+
+    /// Construct a language-local stream service. The language descriptor
+    /// supplies the already-validated positional method modes.
+    #[doc(hidden)]
+    pub fn new_nonportable_stream<I, M>(
+        release_ref: ContractReleaseRef,
+        expected: ExpectedRouteContract,
+        methods: I,
+        method_modes: M,
+        service: Arc<dyn EncodedStreamService>,
+    ) -> Result<Self, Error>
+    where
+        I: IntoIterator<Item = MethodDefinition>,
+        M: IntoIterator<Item = MethodMode>,
+    {
+        let mut definition =
+            Self::new_nonportable(release_ref, expected, methods, service.clone())?;
+        let modes = method_modes.into_iter().collect::<Vec<_>>();
+        if modes.len() != definition.methods.len()
+            || !modes.iter().any(|mode| *mode == MethodMode::ServerStream)
+        {
+            return Err(method_contract_error(
+                "$.methods",
+                "stream modes must cover every method and include a server stream".into(),
+            ));
+        }
+        definition.stream_service = Some(service);
+        definition.stream_modes = Some(modes.into());
+        Ok(definition)
     }
 
     pub fn with_concurrency(
@@ -735,6 +914,7 @@ impl Host {
             server: Some(crate::MemoryScopeStats::from_server(
                 self.inner.server.memory_budget_snapshot(),
             )),
+            payload_buffer: self.inner.runtime.payload_buffer_stats(),
         }
     }
 
@@ -751,16 +931,40 @@ impl Host {
         self.inner.runtime.ensure_active()?;
         let route_name = definition.expected.route_name.clone();
         let route_spec = route_spec(&definition)?;
-        let callback: Arc<dyn CrmCallback> = Arc::new(CoreCallback {
-            service: Arc::clone(&definition.service),
-        });
-        let route = self
-            .inner
-            .server
-            .build_route(route_spec, callback)
-            .map_err(LifecycleError::from)?;
+        let route = match &definition.stream_service {
+            Some(service) => {
+                let callback = Arc::new(CoreStreamCallback {
+                    service: service.clone(),
+                });
+                match definition.stream_descriptor.as_ref() {
+                    Some(descriptor) => self
+                        .inner
+                        .server
+                        .build_stream_route(route_spec, callback, descriptor),
+                    None => self.inner.server.build_nonportable_stream_route(
+                        route_spec,
+                        callback,
+                        definition
+                            .stream_modes
+                            .as_deref()
+                            .expect("stream method modes"),
+                    ),
+                }
+            }
+            None => self.inner.server.build_route(
+                route_spec,
+                Arc::new(CoreCallback {
+                    service: Arc::clone(&definition.service),
+                }),
+            ),
+        }
+        .map_err(LifecycleError::from)?;
         let route_concurrency = RouteConcurrency {
             inner: route.route_handle(),
+            method_modes: definition
+                .stream_modes
+                .clone()
+                .unwrap_or_else(|| vec![MethodMode::Unary; definition.methods.len()].into()),
         };
         let outcome = self.inner.runtime.register_route(
             &self.inner.server,
@@ -1091,10 +1295,195 @@ impl CrmCallback for CoreCallback {
     }
 }
 
+struct CoreStreamCallback {
+    service: Arc<dyn EncodedStreamService>,
+}
+
+impl CrmCallback for CoreStreamCallback {
+    fn invoke(
+        &self,
+        _: &str,
+        index: u16,
+        request: Vec<u8>,
+        _: Arc<c2_server::ResponsePool>,
+    ) -> Result<ResponseMeta, CrmError> {
+        self.service
+            .invoke(index, request)
+            .map(ResponseMeta::Inline)
+            .map_err(|error| CrmError::UserError(error.to_wire_bytes()))
+    }
+}
+
+impl CrmStreamCallback for CoreStreamCallback {
+    fn open_stream(
+        &self,
+        _: &str,
+        index: u16,
+        request: Vec<u8>,
+        _: Arc<c2_server::ResponsePool>,
+    ) -> Result<Box<dyn CrmStream>, CrmError> {
+        self.service
+            .open_stream(index, request)
+            .map(|stream| Box::new(CoreStream(stream)) as Box<dyn CrmStream>)
+            .map_err(|error| CrmError::UserError(error.to_wire_bytes()))
+    }
+}
+
+struct CoreStream(Box<dyn EncodedStream>);
+
+impl CrmStream for CoreStream {
+    fn step(&mut self) -> Result<Option<Box<dyn CrmStreamItem>>, CrmError> {
+        self.0
+            .step()
+            .map(|item| item.map(|item| Box::new(CoreStreamItem(item)) as Box<dyn CrmStreamItem>))
+            .map_err(|error| CrmError::UserError(error.to_wire_bytes()))
+    }
+
+    fn finish(self: Box<Self>) -> Result<(), CrmError> {
+        self.0
+            .finish()
+            .map_err(|error| CrmError::UserError(error.to_wire_bytes()))
+    }
+}
+
+struct CoreStreamItem(Box<dyn EncodedStreamItem>);
+
+impl CrmStreamItem for CoreStreamItem {
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+    fn write_range(&self, offset: usize, destination: &mut [u8]) -> Result<(), CrmError> {
+        self.0
+            .write_range(offset, destination)
+            .map_err(|error| CrmError::UserError(error.to_wire_bytes()))
+    }
+}
+
 #[cfg(test)]
 mod lifecycle_tests {
     use super::*;
     use tokio::io::AsyncReadExt;
+
+    fn cancel_local_stream_before_first_commit(shutdown: bool) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::mpsc;
+
+        const WAIT: Duration = Duration::from_secs(10);
+        struct NeverInvoked;
+        impl EncodedService for NeverInvoked {
+            fn invoke(&self, _: u16, _: Vec<u8>) -> Result<Vec<u8>, C2Error> {
+                unreachable!("local object calls skip encoded dispatch")
+            }
+        }
+        impl EncodedStreamService for NeverInvoked {
+            fn open_stream(&self, _: u16, _: Vec<u8>) -> Result<Box<dyn EncodedStream>, C2Error> {
+                unreachable!("local object calls skip encoded dispatch")
+            }
+        }
+        let (runtime, directory) = receipt_test_runtime();
+        let host = runtime
+            .host(HostOptions::default().without_relay())
+            .unwrap();
+        let release = ContractRelease::from_descriptor_json(include_bytes!(
+            "../../../foundation/c2-contract/tests/fixtures/server-stream.contract.json"
+        ))
+        .unwrap();
+        let methods = release
+            .descriptor()
+            .methods()
+            .iter()
+            .enumerate()
+            .map(|(index, method)| MethodDefinition {
+                index: index as u16,
+                name: method.name().into(),
+                access: method.access(),
+            });
+        let mut registration = host
+            .register(
+                ServiceDefinition::new_stream(
+                    &release,
+                    release.reference(),
+                    "before-commit",
+                    methods,
+                    Arc::new(NeverInvoked),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let route = registration.route_concurrency();
+        let call = route.inner.begin_local_stream_call(1).unwrap();
+        let cancellation = call.cancellation();
+        let factories = Arc::new(AtomicUsize::new(0));
+        let invoked = factories.clone();
+        let (entered, observed) = mpsc::sync_channel(1);
+        let (proceed, blocked) = mpsc::channel();
+        let stream: CoreLocalResponseStream<u8> = CoreLocalResponseStream::open(
+            call,
+            move || {
+                invoked.fetch_add(1, Ordering::SeqCst);
+                unreachable!("cancellation before commit must prevent factory entry")
+            },
+            Some((entered, blocked)),
+        )
+        .unwrap();
+        observed.recv_timeout(WAIT).unwrap();
+        assert_eq!(route.snapshot().active_workers, 1);
+        let lifecycle = std::thread::spawn(move || {
+            if shutdown {
+                let outcome = host.shutdown();
+                assert!(outcome.runtime_barrier_error.is_none(), "{outcome:?}");
+            } else {
+                assert!(registration.close().unwrap().local_removed);
+            }
+        });
+        let deadline = Instant::now() + WAIT;
+        while cancellation.cause().is_none() {
+            assert!(
+                Instant::now() < deadline,
+                "lifecycle did not submit cancellation"
+            );
+            std::thread::yield_now();
+        }
+        assert!(route.snapshot().closed);
+        proceed.send(()).unwrap();
+        let next = stream
+            .next_item()
+            .expect_err("lifecycle ends the original stream");
+        let receipt = stream.close_with_timeout(Some(WAIT));
+        lifecycle.join().unwrap();
+        assert_eq!(factories.load(Ordering::SeqCst), 0);
+        assert_eq!(route.snapshot().pending, 0);
+        drop((stream, route, runtime));
+        close_receipt_root(directory);
+        assert!(receipt.completed);
+        assert_eq!(receipt.complete_items, Some(0));
+        let terminal = receipt
+            .terminal
+            .unwrap()
+            .expect_err("original cancellation terminal");
+        for error in [next, terminal] {
+            let Error::Semantic(error) = error else {
+                panic!("expected semantic cancellation")
+            };
+            assert_eq!(error.code, c2_error::ErrorCode::CallCancelled);
+            assert!(
+                error
+                    .message
+                    .contains(if shutdown { "shutdown" } else { "unregister" }),
+                "{error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn local_shutdown_before_first_commit_preserves_cancellation_cause() {
+        cancel_local_stream_before_first_commit(true);
+    }
+
+    #[test]
+    fn local_unregister_before_first_commit_preserves_cancellation_cause() {
+        cancel_local_stream_before_first_commit(false);
+    }
 
     struct LocalEcho;
     impl EncodedService for LocalEcho {
@@ -1298,7 +1687,7 @@ mod lifecycle_tests {
             .await
             .unwrap();
             read_raw_frame(&mut peer).await;
-            let identity = c2_wire::control::RouteCallIdentity {
+            let identity = c2_wire::rpc::RouteCallIdentity {
                 route_name: expected.route_name,
                 route_uid: registration.outcome().route_uid.clone(),
                 crm_ns: expected.crm_ns,
@@ -1307,11 +1696,18 @@ mod lifecycle_tests {
                 abi_hash: expected.abi_hash,
                 signature_hash: expected.signature_hash,
             };
-            let mut call = c2_wire::control::encode_call_control(&identity, 1).unwrap();
-            call.extend_from_slice(&vec![0x5a; 32 * 1024]);
-            peer.write_all(&encode_frame(1, FLAG_CALL_V2, &call))
-                .await
-                .unwrap();
+            let call = c2_wire::rpc::encode_open_frame(
+                1,
+                &identity,
+                1,
+                c2_wire::rpc::CallMode::Unary,
+                c2_wire::rpc::ValuePart::whole(c2_wire::rpc::ValueStorage::Inline(&vec![
+                    0x5a;
+                    32 * 1024
+                ])),
+            )
+            .unwrap();
+            peer.write_all(&call).await.unwrap();
             read_raw_frame(&mut peer).await
         });
         let (header, payload) = c2_wire::frame::decode_frame(&response).unwrap();
@@ -1319,7 +1715,18 @@ mod lifecycle_tests {
             header.is_buddy(),
             "test must retain an actual response loan"
         );
-        let (descriptor, _) = c2_wire::buddy::decode_buddy_payload(payload).unwrap();
+        let c2_wire::rpc::RpcRecord::CallEnd {
+            value:
+                c2_wire::rpc::ValuePart {
+                    storage: c2_wire::rpc::ValueStorage::Shm(descriptor),
+                    ..
+                },
+            ..
+        } = c2_wire::rpc::decode_rpc_record(&header, payload, Some(c2_wire::rpc::CallMode::Unary))
+            .unwrap()
+        else {
+            panic!("expected whole SHM CALL_END");
+        };
         assert_eq!(
             host.inner
                 .server

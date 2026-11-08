@@ -35,7 +35,7 @@ C-Two 是为有状态资源设计的 RPC 框架，主要用于分布式科学计
 | 调用到达哪里 | 服务的任意一个实例，状态通常存放在外部存储中 | 同一个资源对象，状态保存在这个对象里 |
 | 并发 | 请求彼此独立 | 方法默认按写处理，同一资源上一次只执行一个；标为 `@cc.read` 的方法可以并行 |
 | 出错之后 | 可以通过配置自动重试或对冲 | 可能已经执行过的调用不会被自动重试或重放，Python 与 Rust 的错误会说明调用是否可能已经执行 |
-| 关闭时 | 通常有一段宽限期，期满后取消在途请求 | 不再接收新调用，已经发出的调用照常执行完并交付结果 |
+| 关闭时 | 通常有一段宽限期，期满后取消在途请求 | 不再接收新调用；已经发出的一元调用照常执行完并交付结果，开着的服务端流交付已产出的条目后在两步之间结束 |
 | 大数据 | 每条消息整体在内存中编解码，数据较大时通常由应用自行切分 | 单次调用可以传输数 GB 的数组；同机时经共享内存，必要时分片或溢出到文件，上限可以配置 |
 
 ## 特点
@@ -43,8 +43,9 @@ C-Two 是为有状态资源设计的 RPC 框架，主要用于分布式科学计
 - **本地与远程调用**：同进程直接传递 Python 对象，同机 IPC 使用 Unix domain socket 或 Windows Named Pipe，跨机器经 HTTP relay。Relay 发现会选择经过验证的本机 IPC 路径或 HTTP 目标；显式 IPC 连接独立于 relay 发现。
 - **状态与并发**：资源在调用之间保留状态。`@cc.read`、`@cc.write` 声明访问语义，默认采用写访问；原生路由调度统一约束本地和远程调用的并发与排队数量。
 - **载荷与内存**：`@cc.transfer(...)` 绑定 FastDB `Payload` 规格，Python 之间也可以直接传递普通 Python 值。IPC 通过按需 buddy 池、独占共享内存、检查过的分片传输和文件溢出传输大载荷，并受内存预算约束。`cc.hold()` 保留响应的本地副本，注册时可以为方法选择借用输入；两者都只保留本地副本，释放时先让载荷所有者和 checked view 失效。详见[内存策略](docs/reference/memory-policy.md)与 [Python 载荷用法](docs/reference/python-usage.zh-CN.md)。
+- **服务端流**：标了 `@cc.stream` 的方法对一份输入返回零条或多条条目。Python 与 Rust 资源一步一步产出条目，只在一步之内持有路由许可；客户端可以迭代、hold 或关闭这条流。流可以在同一进程内与经 IPC 使用，Rust 与 Python 客户端也可以经 relay 使用；生成的 TypeScript 客户端经 IPC 消费，还不能经 relay 读取。详见 [Python 服务端流](docs/reference/python-usage.zh-CN.md#服务端流)。
 - **跨语言契约**：契约工具验证可移植描述符，并生成 Python、Rust、TypeScript 绑定；客户端会匹配路由名称、CRM 身份和契约哈希。Python 与 Rust 共用同一个 Rust core 的路由、传输、内存、错误和生命周期机制。
-- **relay、工具与生命周期**：原生 c3 CLI 在 Linux、macOS、Windows x64 / ARM64 上提供 relay 与 relay mesh、契约工具和端点维护。`cc.observe.connection_events()` 把客户端和服务端的物理 IPC 连接汇总给一个可关闭的消费者，原因只描述连接事实，不能证明进程已经退出。原生 shutdown 会排空工作，限定范围的端点维护会清理已确认退出的端点，详见[生命周期指南](docs/reference/local-endpoint-lifecycle.md)。
+- **relay、工具与生命周期**：原生 c3 CLI 在 Linux、macOS、Windows x64 / ARM64 上提供 relay 与 relay mesh、契约工具和端点维护。`cc.observe.connection_events()` 把客户端和服务端的物理 IPC 连接汇总给一个可关闭的消费者，原因只描述连接事实，不能证明进程已经退出。原生 shutdown 与路由注销让已发出的一元调用跑完；开着的服务端流在两步之间结束，先交付已产出的条目，再以 `CallCancelled` 结束。限定范围的端点维护会清理已确认退出的端点，详见[生命周期指南](docs/reference/local-endpoint-lifecycle.md)。
 
 ## 安装
 

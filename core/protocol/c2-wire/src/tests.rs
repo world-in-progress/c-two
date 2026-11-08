@@ -10,21 +10,24 @@ mod frame_tests {
     #[test]
     fn encode_decode_roundtrip() {
         let payload = b"hello world";
-        let golden = b"\x17\0\0\0\x2a\0\0\0\0\0\0\0\xc0\0\0\0hello world";
-        assert_eq!(encode_frame(42, FLAG_BUDDY | FLAG_CALL_V2, payload), golden);
+        let golden = b"\x17\0\0\0\x2a\0\0\0\0\0\0\0\x40\x10\0\0hello world";
+        assert_eq!(
+            encode_frame(42, FLAG_BUDDY | FLAG_RPC_RECORD, payload),
+            golden
+        );
         for parts in [
             &[payload.as_slice()][..],
             &[b"hello ", b"world"],
             &[b"", b"hello ", b"", b"world", b""],
         ] {
-            let encoded = encode_frame_parts(42, FLAG_BUDDY | FLAG_CALL_V2, parts);
+            let encoded = encode_frame_parts(42, FLAG_BUDDY | FLAG_RPC_RECORD, parts);
             assert_eq!(encoded, golden);
             let (hdr, decoded_payload) = decode_frame(&encoded).unwrap();
             assert_eq!(hdr.request_id, 42);
-            assert_eq!(hdr.flags, FLAG_BUDDY | FLAG_CALL_V2);
+            assert_eq!(hdr.flags, FLAG_BUDDY | FLAG_RPC_RECORD);
             assert_eq!(decoded_payload, payload);
             assert!(hdr.is_buddy());
-            assert!(hdr.is_call_v2());
+            assert!(hdr.flags & FLAG_RPC_RECORD != 0);
             assert!(!hdr.is_response());
         }
     }
@@ -66,12 +69,11 @@ mod frame_tests {
         let hdr = FrameHeader {
             total_len: 12,
             request_id: 1,
-            flags: FLAG_RESPONSE | FLAG_REPLY_V2 | FLAG_BUDDY,
+            flags: FLAG_RESPONSE | FLAG_RPC_RECORD | FLAG_BUDDY,
         };
         assert!(hdr.is_response());
-        assert!(hdr.is_reply_v2());
+        assert!(hdr.flags & FLAG_RPC_RECORD != 0);
         assert!(hdr.is_buddy());
-        assert!(!hdr.is_call_v2());
         assert!(!hdr.is_handshake());
         assert!(!hdr.is_ctrl());
     }
@@ -82,7 +84,7 @@ mod frame_tests {
         // total_len = 12 + payload_len
         // Frame = [4B total_len][8B rid][4B flags][payload]
         let payload = b"test";
-        let encoded = encode_frame(100, FLAG_CALL_V2, payload);
+        let encoded = encode_frame(100, FLAG_RPC_RECORD, payload);
 
         // Check total_len value
         let total_len = u32::from_le_bytes([encoded[0], encoded[1], encoded[2], encoded[3]]);
@@ -103,18 +105,22 @@ mod frame_tests {
 
         // Check flags
         let flags = u32::from_le_bytes([encoded[12], encoded[13], encoded[14], encoded[15]]);
-        assert_eq!(flags, FLAG_CALL_V2);
+        assert_eq!(flags, FLAG_RPC_RECORD);
     }
 }
 
-mod ipc15_tests {
+mod ipc16_tests {
     use crate::buddy::*;
-    use crate::control::*;
     use crate::flags::*;
     use crate::frame::*;
     use crate::handshake::*;
     use crate::msg_type::MsgType;
     use crate::route_catalog_control::*;
+    use crate::rpc::{
+        CallMode, CallStatus, ChunkPosition, EncodeError, RouteCallIdentity, RpcRecord,
+        RpcRecordKind, ValuePart, ValueStorage, decode_rpc_record, encode_call_end_frame,
+        encode_open_frame, encode_value_continuation_frame,
+    };
 
     const ABI: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     const SIG: &str = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
@@ -160,7 +166,7 @@ mod ipc15_tests {
             "\x04grid\x03uid\x02ns\x04Grid\x050.1.0\x40",
             "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
             "\x40abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
-            "\x07\x00"
+            "\x07\x00\x00"
         )
         .as_bytes()
         .to_vec()
@@ -181,7 +187,7 @@ mod ipc15_tests {
     #[test]
     fn request_numbers_keep_all_u64_bits() {
         for id in [1, 1 + (1 << 32), u64::MAX] {
-            let frame = encode_frame(id, FLAG_CALL_V2, b"body");
+            let frame = encode_frame(id, FLAG_RPC_RECORD, b"body");
             assert_eq!(decode_frame(&frame).unwrap().0.request_id, id);
         }
     }
@@ -245,41 +251,40 @@ mod ipc15_tests {
     }
 
     #[test]
-    fn borrowed_call_identity_encodes_without_revision() {
-        let bytes = encode_call_control(&identity("grid"), 7).unwrap();
-        assert_eq!(bytes, call_golden());
-        let (decoded, consumed) = decode_call_control(&call_golden(), 0).unwrap();
-        assert_eq!(consumed, bytes.len());
-        assert_eq!(decoded.identity.route_name, "grid");
-        assert_eq!(decoded.identity.route_uid, "uid");
-        assert_eq!(decoded.identity.abi_hash, ABI);
-        assert_eq!(decoded.identity.signature_hash, SIG);
-        assert_eq!(decoded.method_idx, 7);
-    }
-
-    #[test]
-    fn call_control_writes_only_inside_checked_output_range() {
-        let value = identity("grid");
-        let size = encoded_call_control_len(&value);
-        let mut out = vec![0xaa; size + 4];
+    fn open_identity_and_input_match_handwritten_record() {
+        let frame = encode_open_frame(
+            42,
+            &identity("grid"),
+            7,
+            crate::rpc::CallMode::Unary,
+            ValuePart::whole(ValueStorage::Inline(b"input")),
+        )
+        .unwrap();
+        let (header, payload) = decode_frame(&frame).unwrap();
+        assert_eq!(header.flags, FLAG_RPC_RECORD);
         assert_eq!(
-            encode_call_control_into(&mut out, 2, &value, 7).unwrap(),
-            size
+            payload,
+            [&[1][..], call_golden().as_slice(), b"input"].concat()
         );
-        assert_eq!(&out[2..size + 2], &call_golden());
-        assert_eq!(&out[..2], &[0xaa; 2]);
-        assert_eq!(&out[size + 2..], &[0xaa; 2]);
-        assert_eq!(decode_call_control(&out, 2).unwrap().0.method_idx, 7);
-        for offset in [0, 1, usize::MAX] {
-            let mut out = vec![0xaa; size - 1];
-            assert!(encode_call_control_into(&mut out, offset, &value, 7).is_err());
-            assert!(out.iter().all(|byte| *byte == 0xaa));
-        }
+        let RpcRecord::Open {
+            identity,
+            method_idx,
+            value,
+            ..
+        } = decode_rpc_record(&header, payload, None).unwrap()
+        else {
+            panic!("OPEN");
+        };
+        assert_eq!(identity.route_name, "grid");
+        assert_eq!(identity.route_uid, "uid");
+        assert_eq!(identity.abi_hash, ABI);
+        assert_eq!(method_idx, 7);
+        assert_eq!(value, ValuePart::whole(ValueStorage::Inline(b"input")));
     }
 
     #[test]
-    fn call_control_rejects_overlong_text_fields_before_writing_output() {
-        let long = "é".repeat(128); // 256 UTF-8 bytes
+    fn open_metadata_validates_text_before_publishing_frame() {
+        let long = "é".repeat(128);
         for field in [
             "route_name",
             "route_uid",
@@ -299,45 +304,65 @@ mod ipc15_tests {
                 "abi_hash" => value.abi_hash = &long,
                 _ => value.signature_hash = &long,
             }
-            let expected = EncodeError::FieldTooLong {
-                field,
-                max: 255,
-                actual: 256,
-            };
-            assert_eq!(encode_call_control(&value, 7).unwrap_err(), expected);
-            let mut output = vec![0xaa; encoded_call_control_len(&value)];
             assert_eq!(
-                encode_call_control_into(&mut output, 0, &value, 7),
-                Err(expected)
+                encode_open_frame(
+                    1,
+                    &value,
+                    7,
+                    crate::rpc::CallMode::Unary,
+                    ValuePart::whole(ValueStorage::Inline(&[])),
+                )
+                .unwrap_err(),
+                EncodeError::FieldTooLong {
+                    field,
+                    max: 255,
+                    actual: 256
+                }
             );
-            assert!(output.iter().all(|byte| *byte == 0xaa));
         }
-    }
-
-    #[test]
-    fn call_control_roundtrips_a_255_byte_route_name() {
         let route = "r".repeat(255);
-        let value = identity(&route);
-        let encoded = encode_call_control(&value, 19).unwrap();
-        let (decoded, consumed) = decode_call_control(&encoded, 0).unwrap();
-        assert_eq!(decoded.identity.route_name, route);
-        assert_eq!(decoded.method_idx, 19);
-        assert_eq!(consumed, encoded.len());
-        let mut output = vec![0; encoded.len()];
-        assert_eq!(
-            encode_call_control_into(&mut output, 0, &value, 19).unwrap(),
-            encoded.len()
-        );
-        assert_eq!(output, encoded);
+        let frame = encode_open_frame(
+            19,
+            &identity(&route),
+            19,
+            crate::rpc::CallMode::Unary,
+            ValuePart::whole(ValueStorage::Inline(&[])),
+        )
+        .unwrap();
+        let (header, payload) = decode_frame(&frame).unwrap();
+        let RpcRecord::Open {
+            identity,
+            method_idx,
+            ..
+        } = decode_rpc_record(&header, payload, None).unwrap()
+        else {
+            panic!("OPEN");
+        };
+        assert_eq!(identity.route_name, route);
+        assert_eq!(method_idx, 19);
     }
 
     #[test]
-    fn call_boundary_rejects_truncation_bad_contract_and_legacy_revision() {
-        let bytes = call_golden();
-        for len in 0..bytes.len() {
-            assert!(decode_call_control(&bytes[..len], 0).is_err());
+    fn open_boundary_rejects_truncation_and_bad_contract() {
+        let frame = encode_open_frame(
+            7,
+            &identity("grid"),
+            7,
+            crate::rpc::CallMode::Unary,
+            ValuePart::whole(ValueStorage::Inline(&[])),
+        )
+        .unwrap();
+        let (header, payload) = decode_frame(&frame).unwrap();
+        for len in 0..payload.len() {
+            let short = FrameHeader {
+                total_len: 12 + len as u32,
+                ..header
+            };
+            assert!(
+                decode_rpc_record(&short, &payload[..len], None).is_err(),
+                "{len}"
+            );
         }
-        assert!(decode_call_control(&bytes, usize::MAX).is_err());
         for (field, text) in [
             ("route", "grid\0hidden"),
             ("uid", "bad/uid"),
@@ -351,52 +376,127 @@ mod ipc15_tests {
                 "crm" => value.crm_name = text,
                 _ => value.abi_hash = text,
             }
+            let frame = encode_open_frame(
+                7,
+                &value,
+                7,
+                crate::rpc::CallMode::Unary,
+                ValuePart::whole(ValueStorage::Inline(&[])),
+            )
+            .unwrap();
+            let (header, payload) = decode_frame(&frame).unwrap();
             assert!(
-                decode_call_control(&encode_call_control(&value, 7).unwrap(), 0).is_err(),
+                decode_rpc_record(&header, payload, None).is_err(),
                 "{field}"
             );
         }
-        let mut old = bytes;
-        old.splice(9..9, 1u64.to_le_bytes());
-        assert!(decode_call_control(&old, 0).is_err());
     }
 
     #[test]
-    fn reply_control_preserves_status_and_registered_error_bytes() {
-        let error = br#"C2E1{"version":1,"code":713,"name":"ProtocolViolation","message":"bad","details":{}}"#.to_vec();
-        for reply in [
-            ReplyControl::Success,
-            ReplyControl::Error(error),
-            ReplyControl::Error(vec![]),
-            ReplyControl::RouteNotFound("grid".into()),
-        ] {
-            let bytes = encode_reply_control(&reply);
-            assert_eq!(
-                decode_reply_control(&bytes, 0).unwrap(),
-                (reply, bytes.len())
-            );
-            for len in 0..bytes.len() {
-                assert!(decode_reply_control(&bytes[..len], 0).is_err());
-            }
-            assert!(decode_reply_control(&bytes, usize::MAX).is_err());
-        }
-        assert_eq!(encode_reply_control(&ReplyControl::Success), [0]);
-        assert_eq!(
-            encode_reply_control(&ReplyControl::Error(b"abc".to_vec())),
-            b"\x01\x03\0\0\0abc"
-        );
-        assert!(decode_reply_control(&[255], 0).is_err());
-        assert!(
-            decode_reply_control(
-                &encode_reply_control(&ReplyControl::RouteNotFound("bad\0route".into())),
-                0
+    fn call_end_preserves_status_and_canonical_error_bytes() {
+        let error = br#"C2E1{"version":1,"code":713,"name":"ProtocolViolation","message":"bad","details":{}}"#;
+        for status in [CallStatus::Failed, CallStatus::NotExecuted] {
+            let frame = encode_call_end_frame(
+                9,
+                CallMode::Unary,
+                status,
+                0,
+                ValuePart::whole(ValueStorage::Inline(error)),
             )
-            .is_err()
-        );
+            .unwrap();
+            let (header, payload) = decode_frame(&frame).unwrap();
+            assert_eq!(header.flags, FLAG_RPC_RECORD | FLAG_RESPONSE);
+            assert_eq!(payload, [&[6, status as u8][..], error].concat());
+            let RpcRecord::CallEnd {
+                status: actual,
+                complete_items,
+                value,
+                ..
+            } = decode_rpc_record(&header, payload, Some(CallMode::Unary)).unwrap()
+            else {
+                panic!("CALL_END");
+            };
+            assert_eq!(actual, status);
+            assert_eq!(complete_items, None);
+            assert_eq!(value.storage, ValueStorage::Inline(error));
+        }
+        for bad in [&[][..], b"abc", br#"C2E1{"version":1,"code":713,"name":"ResourceNotFound","message":"bad","details":{}}"#] {
+            assert!(encode_call_end_frame(9, CallMode::Unary, CallStatus::Failed, 0, ValuePart::whole(ValueStorage::Inline(bad))).is_err());
+        }
     }
 
     #[test]
-    fn permanent_preamble_stays_25_bytes_and_advertises_15() {
+    fn call_end_receive_rejects_a_wrong_name_for_call_cancelled() {
+        // Peer bytes bypass the local encoder so this checks the receive boundary.
+        for status in [CallStatus::Failed, CallStatus::NotExecuted] {
+            let good = br#"C2E1{"version":1,"code":718,"name":"CallCancelled","message":"cancelled","details":{}}"#;
+            let bad = br#"C2E1{"version":1,"code":718,"name":"ProtocolViolation","message":"cancelled","details":{}}"#;
+            for (error, accepted) in [(good.as_slice(), true), (bad.as_slice(), false)] {
+                let mut payload = vec![RpcRecordKind::CallEnd as u8, status as u8];
+                payload.extend_from_slice(error);
+                let frame = encode_frame(9, FLAG_RPC_RECORD | FLAG_RESPONSE, &payload);
+                let (header, body) = decode_frame(&frame).unwrap();
+                assert_eq!(
+                    decode_rpc_record(&header, body, Some(CallMode::Unary)).is_ok(),
+                    accepted,
+                    "status={status:?}, accepted={accepted}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn chunks_have_metadata_only_on_first_record() {
+        let first = encode_open_frame(
+            8,
+            &identity("grid"),
+            7,
+            crate::rpc::CallMode::Unary,
+            ValuePart::first(5, ValueStorage::Inline(b"ab")),
+        )
+        .unwrap();
+        let continuation =
+            encode_value_continuation_frame(8, RpcRecordKind::Open, ValueStorage::Inline(b"cde"))
+                .unwrap();
+        let (first_header, first_payload) = decode_frame(&first).unwrap();
+        let (next_header, next_payload) = decode_frame(&continuation).unwrap();
+        assert_eq!(
+            first_header.flags,
+            FLAG_RPC_RECORD | FLAG_CHUNKED | FLAG_FIRST_CHUNK
+        );
+        assert_eq!(next_header.flags, FLAG_RPC_RECORD | FLAG_CHUNKED);
+        assert_eq!(
+            first_payload,
+            [
+                &[1][..],
+                call_golden().as_slice(),
+                &5u64.to_le_bytes(),
+                b"ab"
+            ]
+            .concat()
+        );
+        assert_eq!(next_payload, b"\x01cde");
+        assert!(matches!(
+            decode_rpc_record(&first_header, first_payload, None).unwrap(),
+            RpcRecord::Open {
+                value: ValuePart {
+                    chunk: ChunkPosition::First { total_bytes: 5 },
+                    ..
+                },
+                ..
+            }
+        ));
+        assert!(matches!(
+            decode_rpc_record(&next_header, next_payload, None).unwrap(),
+            RpcRecord::OpenContinuation { .. }
+        ));
+        let mut bad = first_header;
+        bad.flags |= 0x400;
+        assert!(decode_rpc_record(&bad, first_payload, None).is_err());
+    }
+
+    #[test]
+    fn permanent_preamble_stays_25_bytes_and_advertises_16() {
         for (kind, flags) in [
             (VersionPreambleKind::Hello, 4),
             (VersionPreambleKind::Accepted, 6),
@@ -407,12 +507,12 @@ mod ipc15_tests {
             golden[12] = flags;
             golden[16..20].copy_from_slice(b"C2IP");
             golden[20] = kind as u8;
-            golden[21] = 15;
+            golden[21] = 16;
             assert_eq!(encode_version_preamble(kind), golden);
             validate_version_preamble_header(golden[..16].try_into().unwrap(), flags == 6).unwrap();
             assert_eq!(
                 decode_version_preamble_payload(golden[16..].try_into().unwrap()).unwrap(),
-                (kind, 15)
+                (kind, 16)
             );
         }
     }
@@ -435,12 +535,12 @@ mod ipc15_tests {
         // The permanent codec must read other nonzero versions so drivers can
         // produce a typed VersionMismatch; accepting equality is their fence.
         let mut old = good;
-        old[21..].copy_from_slice(&14u32.to_le_bytes());
+        old[21..].copy_from_slice(&15u32.to_le_bytes());
         assert_eq!(
             decode_version_preamble_payload(old[16..].try_into().unwrap())
                 .unwrap()
                 .1,
-            14
+            15
         );
     }
 
@@ -469,7 +569,7 @@ mod ipc15_tests {
     }
 
     #[test]
-    fn server_metadata_matches_handwritten_ipc15_golden() {
+    fn server_metadata_matches_handwritten_ipc16_golden() {
         let bytes = encode_server_handshake(0x18, &[route()], "p", &server()).unwrap();
         assert_eq!(bytes, server_golden());
         let decoded = decode_handshake(&server_golden(), true).unwrap();

@@ -28,7 +28,7 @@ pub use budget::{
 };
 pub use config::{PoolAllocation, PoolConfig, PoolStats};
 pub use dedicated::DedicatedSegment;
-pub use handle::MemHandle;
+pub use handle::{MemHandle, OwnedAllocation};
 pub use peer::{PeerMappingCache, PeerMappingError, PeerRead};
 pub use pool::MemPool;
 pub use retention::{

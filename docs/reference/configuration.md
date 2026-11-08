@@ -60,6 +60,8 @@ Typed overrides are `BaseIPCOverrides`, `ServerIPCOverrides` and `ClientIPCOverr
 
 An explicit `address='ipc://...'` uses local IPC independently of relay discovery. The relay anchor handles registration and discovery; HTTP calls use the relay URL selected by resolution. Remote batch size controls C-Two payload batches, without specifying TCP packets or HTTP frames.
 
+A Node connector from `createNodeIpcConnector` fixes its client settings when it is created. Its `requestShmThreshold` and `requestChunkSize` options set the SHM threshold and the client `chunk_size`; every other setting, including the payload buffer budget and `C2_CALL_MAX_OUTSTANDING`, comes from the environment, as for a Runtime without overrides.
+
 ## Server startup timeout
 
 `cc.set_server(startup_timeout=seconds)` configures the Core startup wait before the first registration. The native `RuntimeSession` constructor and `set_server_options` accept the same keyword. Values must be finite, non-negative seconds representable by the native clock; zero expires immediately. Omitted/`None` selects the existing finite five-second default, not unlimited waiting. This default bounds unattended startup; it is not a performance guarantee for a busy runner. Applications should choose their deployment budget explicitly.
@@ -85,13 +87,14 @@ Set the following fields through the appropriate endpoint's `ipc_overrides`. All
 | `live_reassembly_budget_bytes` | `C2_IPC_LIVE_REASSEMBLY_BUDGET_BYTES` | 8 GiB | Byte budget for incomplete and retained reassembly capacity |
 | `reassembly_segment_size` | `C2_IPC_REASSEMBLY_SEGMENT_SIZE` | 64 MiB | Reassembly pool segment size in bytes |
 | `reassembly_max_segments` | `C2_IPC_REASSEMBLY_MAX_SEGMENTS` | 4 | Maximum reassembly pool segments, from 1 to 255 |
-| `max_total_chunks` | `C2_IPC_MAX_TOTAL_CHUNKS` | 512 | Server-wide limit on chunk frames processed at once; a chunk that finds no free slot fails its request with `ResourceUnavailable`. The same count also starts an early reassembly cleanup sweep, which never rejects |
+| `max_inflight_chunk_frames` | `C2_IPC_MAX_INFLIGHT_CHUNK_FRAMES` | 512 | Server-wide limit on chunk frames processed at once; a chunk that finds no free slot fails its request with `ResourceUnavailable`. When that many reassemblies are in flight, admitting another first sweeps expired assemblies; the sweep never rejects |
 | `chunk_size` | `C2_IPC_CHUNK_SIZE` | 128 KiB | Individual chunk size in bytes |
 | `chunk_threshold_ratio` | `C2_IPC_CHUNK_THRESHOLD_RATIO` | 0.9 | Configured fraction of maximum frame size; accepted and validated, but not currently used by transport selection |
 | `chunk_assembler_timeout` | `C2_IPC_CHUNK_ASSEMBLER_TIMEOUT` | 60 seconds | Incomplete chunk-reassembly timeout in seconds |
 | `chunk_gc_interval` | `C2_IPC_CHUNK_GC_INTERVAL` | 5 seconds | Chunk garbage-collection sweep interval in seconds |
 | `max_reassembly_bytes` | `C2_IPC_MAX_REASSEMBLY_BYTES` | 8 GiB | Maximum reassembly buffer memory in bytes |
 | `write_timeout` | `C2_IPC_WRITE_TIMEOUT` | 30 seconds | Seconds one frame write may take before its connection is deactivated |
+| `client_idle_timeout` | `C2_IPC_CLIENT_IDLE_TIMEOUT` | 60 seconds | Seconds a Runtime keeps a cached client connection that nothing references before it evicts the connection in the background; `0` disables timed eviction |
 | `max_dedicated_segments` | `C2_IPC_MAX_DEDICATED_SEGMENTS` | 4 | Dedicated SHM segments one pool keeps at once, up to 65536 |
 | `spill_threshold` | `C2_IPC_SPILL_THRESHOLD` | 0.8 | Fraction of observed available memory that new SHM backing may reach, from 0 to 1; 1 disables the check |
 
@@ -121,21 +124,21 @@ C2_RELAY_IDLE_TIMEOUT=60
 | Mesh seeds | `--seeds` | `C2_RELAY_SEEDS` | Empty |
 | Upstream IPC idle disconnect | `--idle-timeout` | `C2_RELAY_IDLE_TIMEOUT` | 60 seconds; `0` disables timed eviction |
 | Forwarding transaction count | `--call-max-outstanding` | `C2_CALL_MAX_OUTSTANDING` | 1,024 per relay |
-| Retained forwarding input | `--call-retained-input-budget-bytes` | `C2_CALL_RETAINED_INPUT_BUDGET_BYTES` | 16 GiB per relay |
+| Payload buffer budget | `--call-payload-buffer-budget-bytes` | `C2_CALL_PAYLOAD_BUFFER_BUDGET_BYTES` | 16 GiB per relay |
 | System HTTP proxy | — | `C2_RELAY_USE_PROXY` | `false` |
 | Anti-entropy interval | — | `C2_RELAY_ANTI_ENTROPY_INTERVAL` | 60 seconds; `0` disables anti-entropy |
 
-`remote_payload_chunk_size` is the single remote-body batching policy, resolved by Rust from the typed transport override or `C2_REMOTE_PAYLOAD_CHUNK_SIZE`. It defaults to 1 MiB and accepts positive values up to 128 MiB. Relay HTTP uses it for outbound request bodies and materialized response-body streaming; `C2_IPC_CHUNK_SIZE` independently controls IPC wire chunks and reassembly. The remote value does not specify TCP packets or HTTP frame boundaries.
+`remote_payload_chunk_size` is the single remote-body batching policy, resolved by Rust from the typed transport override or `C2_REMOTE_PAYLOAD_CHUNK_SIZE`. It defaults to 1 MiB and accepts positive values up to 128 MiB. Relay HTTP uses it for outbound request bodies, and a relay copies each response or stream-item slice out of its upstream carrier in at most the lesser of this size and the upstream IPC `chunk_size`; `C2_IPC_CHUNK_SIZE` independently controls IPC wire chunks and reassembly. The remote value does not specify TCP packets or HTTP frame boundaries.
 
 Core relay-aware clients make one route observation followed by at most one pre-dispatch refresh; this bound is fixed and is not configurable through SDK settings.
 
 Pre-register upstreams as `--upstream NAME=SERVER_ID@ADDRESS`; `SERVER_ID` must match the IPC handshake. See the [c3 guide](../../cli/README.md) for upstream budgets, mesh and dry-run options.
 
-Relay freezes forwarding limits at startup and applies them to all forwarded business calls, including calls with unlimited caller waiting. A zero count limit rejects new forwards; a zero byte budget rejects positive input. Known-length input is reserved before dispatch; unknown-length input is checked as it grows. Capacity refusal preserves the route. These limits are independent of upstream IPC backing and reassembly budgets and do not measure process RSS.
+Relay freezes forwarding limits at startup and applies them to all forwarded business calls, including calls with unlimited caller waiting. A zero count limit rejects new forwards; a zero payload buffer budget rejects every positive reservation. A known-length request body is reserved once before it is read; when the budget is short, the forward waits until capacity is released or the HTTP caller disconnects. An unknown-length body reserves its first part the same way, and later growth that finds no capacity fails at once. Capacity refusal preserves the route. These limits are independent of upstream IPC backing and reassembly budgets and do not measure process RSS; the [memory policy](memory-policy.md#payload-buffer-budget) lists what the payload buffer budget charges.
 
-Relay capacity rejection is fixed before business admission. For a request without Expect and with a valid declared length, the HTTP handler discards transport data frame by frame within that length and one two-second deadline. It does not aggregate the payload, decode it, invoke a resource or retry admission; capacity released during disposal does not change the rejection. Rejected Expect or unknown-length bodies are not read. Read faults, length mismatches and timeout preserve the original capacity error. An incomplete or faulty transport can prevent the client from receiving that response.
+Relay capacity rejection is fixed before business admission. Every refusal the relay sends before it reads a request body, whether for a contract, identity, route or route-token mismatch, an invalid or oversized declared length, a rejected request format or capacity, first discards the body frame by frame within its declared length and one two-second deadline, so that a client still sending the body receives the refusal rather than a reset connection. Disposal does not aggregate the payload, decode it, invoke a resource or retry admission, and capacity released during disposal does not change a capacity refusal. Bodies of requests with Expect or of unknown length are not read. Read faults, excess bytes and the timeout preserve the original refusal. An incomplete or faulty transport can still prevent the client from receiving it.
 
-After an HTTP caller disconnects, an already-dispatched forward retains its input and upstream connection until actual completion. Relay shutdown stops admission and waits for forwarding and native client cleanup. A resource method that never returns continues to occupy its slot and delays shutdown.
+After an HTTP caller disconnects, an already-dispatched forward keeps its upstream connection until actual completion; its request body is released once it has been copied upstream. Relay shutdown stops admission, ends the server streams it forwards between their steps with `CallCancelled` naming relay shutdown, and waits for forwarding and native client cleanup; unary calls already forwarded still finish. A resource method that never returns, or a stream client that has stopped reading, continues to occupy its slot and delays shutdown.
 
 ## Local endpoint directories
 
@@ -173,14 +176,14 @@ Expiration returns `CallDeadlineExceeded` with `operation=connect`, `transport_p
 | --- | --- | --- | --- |
 | Per-call waiting | `cc.with_call_options(proxy, timeout=...)` | Transport default | Caller waiting budget for one remote business call |
 | Logical relay call deadline | `C2_RELAY_CALL_TIMEOUT` | 300 seconds; `0` means unlimited | Relay HTTP CRM call timeout in seconds; 0 disables the reqwest total timeout |
-| Finite-deadline call slots | `cc.set_call_execution_limits(max_outstanding_calls=...)` / `C2_CALL_MAX_OUTSTANDING` | 1,024 per Runtime | Maximum concurrent finite-deadline calls retaining native transactions |
-| Retained input for those calls | `retained_input_budget_bytes=...` / `C2_CALL_RETAINED_INPUT_BUDGET_BYTES` | 16 GiB per Runtime | Byte budget for input retained by those finite-deadline calls |
+| Outstanding finite-deadline calls | `cc.set_call_execution_limits(max_outstanding_calls=...)` / `C2_CALL_MAX_OUTSTANDING` | 1,024 per Runtime | Maximum unfinished calls with a finite deadline, including calls that continue after their caller's deadline, plus every server stream until its real terminal |
+| Payload buffer budget | `payload_buffer_budget_bytes=...` / `C2_CALL_PAYLOAD_BUFFER_BUDGET_BYTES` | 16 GiB per Runtime | Byte budget for the payload buffers C-Two keeps for calls with and without a deadline; see [memory policy](memory-policy.md#payload-buffer-budget) |
 
 Direct IPC waits indefinitely by default; an HTTP budget covers one logical call and its route reacquisition. `timeout=None` explicitly waits indefinitely; `0` expires before dispatch. Negative and non-finite values are rejected. Same-process synchronous calls accept inherited or unlimited waiting only.
 
-Expiry ends the caller's wait, while a dispatched native transaction may continue through transport completion and release its retained input afterward. A call deadline alone does not withdraw a relay route or invalidate an already acquired held response owner. The deadline error distinguishes expiry before dispatch from an uncertain dispatched call; do not replay a call after the latter outcome.
+Expiry ends the caller's wait, while a dispatched native transaction may continue to its real end; its input was already released when the transport copied it. A call deadline alone does not withdraw a relay route or invalidate an already acquired held response owner. The deadline error distinguishes expiry before dispatch from an uncertain dispatched call; do not replay a call after the latter outcome.
 
-A zero finite-call count rejects finite calls; a zero byte budget rejects positive input. Unlimited calls are outside these two finite-call admission limits. `cc.observe.call_execution_snapshot()` observes active and retired domains. Examples and error phases are in the [deadline guide](../releases/0.7.1.md#per-call-deadlines-for-remote-calls).
+A zero finite-call count rejects every new finite call and every new server stream; unary calls without a deadline are not counted. A zero payload buffer budget rejects every positive reservation, for calls with and without a deadline. When the budget is short, a call waits for capacity within its own deadline; the [memory policy](memory-policy.md#payload-buffer-budget) describes what the budget charges and when a reservation fails at once. `cc.observe.call_execution_snapshot()` observes the call slots of active and retired domains, and `cc.observe.memory_stats()['payload_buffer']` observes the budget's bytes and rejections. Examples and error phases are in the [deadline guide](../releases/0.7.1.md#per-call-deadlines-for-remote-calls).
 
 ## Concurrency and lifecycle
 

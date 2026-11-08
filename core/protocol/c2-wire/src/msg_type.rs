@@ -1,7 +1,7 @@
 //! IPC message/signal type enum — single source of truth.
 //!
 //! Each variant maps to a 1-byte discriminant used as the inline frame body
-//! for signal messages, or as a type tag in legacy v1 wire messages.
+//! for signal messages and independent route/control payloads.
 
 /// IPC message type (1-byte discriminant).
 #[repr(u8)]
@@ -9,9 +9,8 @@
 pub enum MsgType {
     Ping = 0x01,
     Pong = 0x02,
-    CrmCall = 0x03,
-    CrmReply = 0x04,
     ShutdownClient = 0x05,
+    // 0x03 and 0x04 are retired business tags.
     // 0x06 reserved (was SHUTDOWN_SERVER — never implemented)
     ShutdownAck = 0x07,
     Disconnect = 0x08,
@@ -23,7 +22,6 @@ pub enum MsgType {
     RouteLookup = 0x10,
     RouteLookupAck = 0x11,
     RouteNack = 0x15,
-    Release = 0x17,
 }
 
 impl MsgType {
@@ -33,8 +31,6 @@ impl MsgType {
         match b {
             0x01 => Some(Self::Ping),
             0x02 => Some(Self::Pong),
-            0x03 => Some(Self::CrmCall),
-            0x04 => Some(Self::CrmReply),
             0x05 => Some(Self::ShutdownClient),
             0x07 => Some(Self::ShutdownAck),
             0x08 => Some(Self::Disconnect),
@@ -46,7 +42,6 @@ impl MsgType {
             0x10 => Some(Self::RouteLookup),
             0x11 => Some(Self::RouteLookupAck),
             0x15 => Some(Self::RouteNack),
-            0x17 => Some(Self::Release),
             _ => None,
         }
     }
@@ -93,8 +88,6 @@ mod tests {
         for (byte, expected) in [
             (0x01, MsgType::Ping),
             (0x02, MsgType::Pong),
-            (0x03, MsgType::CrmCall),
-            (0x04, MsgType::CrmReply),
             (0x05, MsgType::ShutdownClient),
             (0x07, MsgType::ShutdownAck),
             (0x08, MsgType::Disconnect),
@@ -106,7 +99,6 @@ mod tests {
             (0x10, MsgType::RouteLookup),
             (0x11, MsgType::RouteLookupAck),
             (0x15, MsgType::RouteNack),
-            (0x17, MsgType::Release),
         ] {
             let parsed = MsgType::from_byte(byte).unwrap();
             assert_eq!(parsed, expected);
@@ -129,7 +121,5 @@ mod tests {
         assert!(MsgType::ShutdownAck.is_signal());
         assert!(MsgType::Disconnect.is_signal());
         assert!(MsgType::DisconnectAck.is_signal());
-        assert!(!MsgType::CrmCall.is_signal());
-        assert!(!MsgType::CrmReply.is_signal());
     }
 }

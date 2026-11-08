@@ -25,7 +25,7 @@ fn capture_open_uninitialized_domain_without_freezing_policy() {
         .set_call_execution_limits_with_sources(
             CallExecutionLimitsOverrides {
                 max_outstanding_calls: Some(1),
-                retained_input_budget_bytes: Some(32),
+                payload_buffer_budget_bytes: Some(32),
             },
             ConfigSources::empty(),
         )
@@ -43,7 +43,7 @@ fn capture_open_uninitialized_domain_without_freezing_policy() {
         .set_call_execution_limits_with_sources(
             CallExecutionLimitsOverrides {
                 max_outstanding_calls: Some(2),
-                retained_input_budget_bytes: Some(64),
+                payload_buffer_budget_bytes: Some(64),
             },
             ConfigSources::empty(),
         )

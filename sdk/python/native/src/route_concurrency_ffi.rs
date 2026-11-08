@@ -81,6 +81,20 @@ fn acquire_error_to_py(py: Python<'_>, err: RouteConcurrencyError) -> PyErr {
 
 #[pymethods]
 impl PyRouteConcurrency {
+    fn open_stream(
+        &self,
+        py: Python<'_>,
+        method_idx: u16,
+        factory: Py<PyAny>,
+    ) -> PyResult<crate::stream_ffi::PyCoreLocalResponseStream> {
+        crate::stream_ffi::PyCoreLocalResponseStream::open(
+            py,
+            self.inner.clone(),
+            method_idx,
+            factory,
+        )
+    }
+
     fn snapshot(&self) -> PyRouteConcurrencySnapshot {
         PyRouteConcurrencySnapshot::from(self.inner.snapshot())
     }

@@ -32,7 +32,7 @@ The workspace dev group includes `c-two[fastdb]` and pins Python `fastdb4py==0.2
 
 Banner generation uses the separate `banner` dependency group with patched Pillow 13 and Python 3.11+: `uv run --python 3.11 --group banner tools/dev/generate_banner.py`. Pillow is not required by the SDK or its test suite; those retain Python 3.10 support.
 
-Full interoperability tests also require Node 22, CMake/Ninja and Emscripten 5.0.2 (with `emcmake` on `PATH`). Install both sets of TypeScript dependencies and the minimum Python interpreter before running those suites:
+Full interoperability tests also require Node 22, CMake/Ninja and Emscripten 5.0.2 (with `emcmake` on `PATH`). Install both sets of TypeScript dependencies and the minimum Python interpreter before running those suites. Without the built c2-mem-ffi Node binding or fastdb4ts, the TypeScript tests fail and name the build step to run:
 
 ```bash
 npm ci --prefix ../fastdb/ts/fastdb4ts
@@ -45,6 +45,18 @@ The [CI setup](../../.github/workflows/ci.yml) records the pinned Emscripten set
 ## Native extension conventions
 
 New PyO3 `#[pyclass]` types use `frozen` by default so mutation is explicit through an interior-mutability primitive chosen for its access pattern: atomics for independent flags or counters, a mutex for short exclusive updates, a read/write lock for shared reads, and an async mutex only when a guard must cross an await. Store Python object references as `Py<T>` and enter Python through a Python token when invoking callbacks. The two current non-frozen exceptions are `PyEndpointSweep`, whose iterator advances its owned sweep state, and `PyRouteConcurrencyGuard`, whose one-use guard is consumed on release; review either exception's mutation and thread boundary before extending it. The frozen session, memory pool and client wrappers keep their mutable native state behind locks.
+
+## Relay slow-reader measurement
+
+The run-ahead figures in [Runtime lifecycle](runtime-lifecycle.md#execution-admission) come from an ignored c2-http test that runs only on demand, because it streams hundreds of thousands of items for several minutes. The ordinary suite keeps a short regression that checks that large items stall the TCP writer and keep the producer's lead below the stream length. Run the full measurement with:
+
+```bash
+CARGO_TARGET_DIR="$PWD/core/target" cargo test --manifest-path core/Cargo.toml -p c2-http --features relay --lib \
+  relay::stream_tests::slow_reader_records_real_tcp_stall_and_producer_distance \
+  -- --exact --ignored --nocapture --test-threads=1
+```
+
+It prints one JSON row per carrier, repetition and item size, and the comment beside the test describes how producer and consumer progress are counted. The results depend on the operating system's TCP buffers.
 
 ## Portable payload matrix
 

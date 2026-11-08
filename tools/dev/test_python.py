@@ -114,9 +114,9 @@ def run_step(command: list[str], directory: Path, environment: dict[str, str], t
                     record['compiler_helper_cleanup'] = helpers
             if tree.alive():
                 record['residual_processes'] = tree.diagnostics()
-                tree.stop()
                 record["status"] = "failed"
-                record["error"] = "父进程退出后进程组仍存活，已强制清理；不能记成功"
+                record["error"] = "父进程退出后进程组仍存活，不能记成功"
+                tree.stop()
             else:
                 record["cleanup_confirmed"] = True
             if process.returncode < 0:
@@ -136,7 +136,7 @@ def run_step(command: list[str], directory: Path, environment: dict[str, str], t
         except OSError as error:
             record['status'] = 'failed'
             record['cleanup_confirmed'] = False
-            record["error"] = str(error)
+            record["cleanup_error" if "error" in record else "error"] = str(error)
         finally:
             if tree is not None:
                 try:
@@ -320,7 +320,8 @@ def execute(options: argparse.Namespace, output: Path, base: dict[str, str], inf
     validate_partition(plans["full"], {name: plans[name] for name in ("ordinary", "portable", "typescript")})
     write_json(output / "plan.json", plans)
     failed = False
-    for name in ("ordinary", "portable", "typescript"):
+    groups = ("ordinary",) if options.ordinary_only else ("ordinary", "portable", "typescript")
+    for name in groups:
         directory = output / name
         print(f"{name}: 开始", flush=True)
         record = run_step(build_pytest_command(options.python, name, directory, options.workers), directory, stage_environment(base, directory), options.stage_timeout)
@@ -339,7 +340,8 @@ def execute(options: argparse.Namespace, output: Path, base: dict[str, str], inf
             raise KeyboardInterrupt
         if not record["cleanup_confirmed"]:
             raise RunnerError(f"{name}取消/超时或有残留风险，停止后续组")
-    validate_receipts(output, info["c3_sha256"])
+    if not options.ordinary_only:
+        validate_receipts(output, info["c3_sha256"])
     if sha256(options.c3) != info["c3_sha256"] or sha256(Path(info["native"])) != info["native_sha256"]:
         raise RunnerError("运行期间native/c3被另一任务替换")
     for relative, digest in info.get("runner_inputs", {}).items():
@@ -360,6 +362,7 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--c3", type=Path, required=True, help="预建c3的文件路径")
     result.add_argument("--output", type=Path, required=True, help="必须不存在的新证据目录")
     result.add_argument("--workers", type=int, choices=(1, 2, 4), default=2, help="普通组：1为-n0串行；2/4为loadfile，矩阵始终-n0")
+    result.add_argument("--ordinary-only", action="store_true", help="保留完整收集分组校验，只执行普通组，不生成矩阵收据")
     result.add_argument("--stage-timeout", type=float, default=3600, help="每收集/执行组的有限wall timeout，秒，最大14400")
     result.add_argument("--fastdb-package", type=Path)
     result.add_argument("--c2-mem-package", type=Path)
@@ -406,7 +409,7 @@ def main(argv: list[str] | None = None) -> int:
     for key, value in zip(("C2_TYPESCRIPT_FASTDB_PACKAGE", "C2_TYPESCRIPT_C2_MEM_PACKAGE", "C2_TYPESCRIPT_COMPILER_PACKAGE"), (args.fastdb_package, args.c2_mem_package, args.typescript_package)):
         if value:
             base[key] = str(value)
-    evidence = {"schema": "c-two.python-test-run.v1", "status": "running", "workers": args.workers, "namespace": namespace, "cpu_count": os.cpu_count(), "started_at": datetime.now(timezone.utc).isoformat(), "steps": []}
+    evidence = {"schema": "c-two.python-test-run.v1", "status": "running", "workers": args.workers, "ordinary_only": args.ordinary_only, "namespace": namespace, "cpu_count": os.cpu_count(), "started_at": datetime.now(timezone.utc).isoformat(), "steps": []}
     write_json(args.output / "run.json", evidence)
     def cancel(*_: Any) -> None:
         raise KeyboardInterrupt

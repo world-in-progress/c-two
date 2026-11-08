@@ -205,7 +205,7 @@ fn runtime(label: &str, slots: u64, bytes: u64) -> Runtime {
         ..Default::default()
     }).unwrap();
     runtime.set_call_execution_limits_with_sources(CallExecutionLimitsOverrides {
-        max_outstanding_calls: Some(slots), retained_input_budget_bytes: Some(bytes),
+        max_outstanding_calls: Some(slots), payload_buffer_budget_bytes: Some(bytes),
     }, ConfigSources::empty()).unwrap();
     runtime
 }
@@ -216,7 +216,7 @@ fn connect(runtime: &Runtime, route: &str) -> contract::ContractClient {
 fn assert_idle(runtime: &Runtime) {
     let snapshot = runtime.call_execution_snapshot().unwrap();
     assert_eq!(snapshot.used_operations, 0);
-    assert_eq!(snapshot.used_retained_bytes, 0);
+    assert_eq!(runtime.memory_stats().payload_buffer.unwrap().used_bytes, 0);
 }
 fn wait_for_idle(runtime: &Runtime) {
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
@@ -253,7 +253,7 @@ fn main() {
         semantic(view.method_3_put(&stale), code);
         assert_eq!(state.calls.load(Ordering::SeqCst), 0);
         assert_idle(&runtime);
-        // Explicit unlimited ignores finite capacity; inherited direct IPC
+        // Explicit unlimited bypasses operation slots; inherited direct IPC
         // remains unlimited as well. Both keep business signatures unchanged.
         let source = payload("unlimited");
         view.with_call_options(CallOptions::with_timeout(CallTimeout::Unlimited))
@@ -262,7 +262,7 @@ fn main() {
         assert_idle(&runtime);
         registration.close().unwrap();
     }
-    // Positive bytes cannot pass a zero retained-input budget. Empty input
+    // Positive bytes cannot pass a zero payload-buffer budget. Empty input
     // still works and can hold a portable response with the same policy.
     {
         let runtime = runtime("zero-bytes", 8, 0);

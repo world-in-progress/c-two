@@ -1,13 +1,11 @@
 //! Chunk codec and lifecycle management.
 //!
-//! - `header`: chunk header encode/decode (4-byte wire format)
 //! - `backing`: owned reassembly backing carrier (pool + handle + budget charge)
 //! - `config`: chunk reassembly configuration
 //! - `registry`: sharded lifecycle manager for in-flight chunked transfers
 
 pub mod backing;
 pub mod config;
-pub mod header;
 pub mod registry;
 
 // Re-export key types at chunk:: level.

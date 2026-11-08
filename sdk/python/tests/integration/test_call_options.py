@@ -54,7 +54,7 @@ def ipc_connection(unique_ipc_address, request):
     if hasattr(request, 'param'):
         slots, budget = request.param
         cc.set_call_execution_limits(
-            max_outstanding_calls=slots, retained_input_budget_bytes=budget,
+            max_outstanding_calls=slots, payload_buffer_budget_bytes=budget,
         )
     resource = TimedResource()
     server = local_server(unique_ipc_address)
@@ -216,24 +216,48 @@ def test_http_original_deadline_explicit_unlimited_and_long_override(http_connec
 
 
 @pytest.mark.parametrize('ipc_connection', [(1, None)], indirect=True)
-def test_slot_capacity_rejects_before_pickle_and_releases_after_real_work(ipc_connection, invoke):
+def test_slot_capacity_rejects_before_pickle_and_releases_after_real_work(ipc_connection, invoke, monkeypatch):
     connection, resource = ipc_connection
     view = cc.with_call_options(connection, timeout=0.05)
     second_view = cc.with_call_options(connection, timeout=1)
+    release_resource = threading.Event()
+
+    def gated_echo(value, timeout=0.0):
+        resource.calls += 1
+        resource.started.set()
+        try:
+            assert release_resource.wait(10)
+            resource.completed.append(value)
+            return value
+        finally:
+            resource.finished.set()
+
+    monkeypatch.setattr(resource, 'echo', gated_echo)
     SlowPickle.caller_threads = []
     try:
-        with pytest.raises(cc.error.CallDeadlineExceeded):
+        with pytest.raises(cc.error.CallDeadlineExceeded) as timeout:
             view.echo('active', timeout=0.2)
+        assert timeout.value.transport_phase == 'dispatch_uncertain'
+        assert resource.started.wait(1)
+        # Server callback entry can precede the client's asynchronous send
+        # receipt. Keep the callback gated while that receipt refunds input.
+        deadline = time.monotonic() + 2
+        while (cc.observe.memory_stats()['payload_buffer']['used_bytes']
+               and time.monotonic() < deadline):
+            time.sleep(0.01)
         snapshot = cc.observe.call_execution_snapshot()
         assert snapshot['max_operations'] == 1
         assert snapshot['used_operations'] == 1
-        assert snapshot['used_retained_bytes'] > 0
+        # The sent input has left the budget; the unfinished reply still owns
+        # the operation slot and prevents another call from being admitted.
+        assert cc.observe.memory_stats()['payload_buffer']['used_bytes'] == 0
         with pytest.raises(cc.error.CallCapacityExceeded) as failure:
             invoke(second_view, SlowPickle())
         assert int(failure.value.code) == 717
         assert failure.value.details['transport_phase'] == 'pre_dispatch'
         assert failure.value.details['fallback_eligible'] == 'false'
         assert SlowPickle.caller_threads == []
+        release_resource.set()
         assert resource.finished.wait(2)
         deadline = time.monotonic() + 2
         while cc.observe.call_execution_snapshot()['used_operations'] and time.monotonic() < deadline:
@@ -241,6 +265,7 @@ def test_slot_capacity_rejects_before_pickle_and_releases_after_real_work(ipc_co
         assert cc.observe.call_execution_snapshot()['used_operations'] == 0
         assert view.echo('after') == 'after'
     finally:
+        release_resource.set()
         cc.close(view)
         cc.close(second_view)
 
@@ -257,7 +282,7 @@ def test_unknown_pickle_bytes_charged_before_native_handoff(ipc_connection):
         assert resource.calls == 0
         snapshot = cc.observe.call_execution_snapshot()
         assert snapshot['used_operations'] == 0
-        assert snapshot['used_retained_bytes'] == 0
+        assert cc.observe.memory_stats()['payload_buffer']['used_bytes'] == 0
     finally:
         cc.close(view)
 
@@ -265,7 +290,6 @@ def test_unknown_pickle_bytes_charged_before_native_handoff(ipc_connection):
 @pytest.mark.parametrize('ipc_connection', [(1, None)], indirect=True)
 @pytest.mark.parametrize('owner_kind', ['prepared', 'rpc'])
 def test_retired_domain_and_shutdown_report_unfinished_charges_honestly(ipc_connection, monkeypatch, owner_kind):
-    import pickle
     from c_two._native import NativePreparedCall, RuntimeSession
 
     connection, resource = ipc_connection
@@ -281,11 +305,12 @@ def test_retired_domain_and_shutdown_report_unfinished_charges_honestly(ipc_conn
             # of client transport shutdown; no materialization/dispatch is needed.
             owner = view.client.begin_call('echo')
             assert isinstance(owner, NativePreparedCall)
-            nbytes = 32
-            owner.charge_input(nbytes)
+            retained_bytes = 32
+            owner.charge_input(retained_bytes)
         else:
             # Hold server execution with a barrier, not a guessed sleep. Its
-            # lifetime is distinct from the client's native transport future.
+            # operation slot outlives the caller's deadline, while its sent
+            # input bytes have already returned to the payload budget.
             def gated_echo(value, timeout=0.0):
                 resource.calls += 1
                 resource.started.set()
@@ -304,23 +329,23 @@ def test_retired_domain_and_shutdown_report_unfinished_charges_honestly(ipc_conn
                 call.result(2)
             assert failure.value.transport_phase == 'dispatch_uncertain'
             assert not resource.finished.is_set()
-            nbytes = len(pickle.dumps(('active', 0.0), protocol=4))
+            retained_bytes = 0
 
         actual = session.call_execution_snapshot()
         assert not actual['closed']
         assert actual['used_operations'] == 1
-        assert actual['used_retained_bytes'] == nbytes
+        assert session.memory_stats()['payload_buffer']['used_bytes'] == retained_bytes
         observation = session.retire_memory_observation()
         replacement.adopt_retired_memory_observation(observation)
         snapshot = replacement.call_execution_snapshot()
         assert snapshot['used_operations'] == 0
-        assert snapshot['used_retained_bytes'] == 0
+        assert replacement.memory_stats()['payload_buffer'] is None
         assert len(snapshot['retired']) == 1
         retired = snapshot['retired'][0]
         assert retired['state'] == 'retired'
         assert not retired['closed']
         assert retired['used_operations'] == 1
-        assert retired['used_retained_bytes'] == nbytes
+        assert replacement.memory_stats()['retired_payload_buffers'][0]['used_bytes'] == retained_bytes
 
         if owner_kind == 'prepared':
             outcome = session.begin_shutdown().observe()
@@ -332,7 +357,7 @@ def test_retired_domain_and_shutdown_report_unfinished_charges_honestly(ipc_conn
             assert retired['state'] == 'retired'
             assert retired['closed']
             assert retired['used_operations'] == 1
-            assert retired['used_retained_bytes'] == nbytes
+            assert replacement.memory_stats()['retired_payload_buffers'][0]['used_bytes'] == retained_bytes
             assert resource.calls == 0
             owner.close()
         else:
@@ -341,11 +366,12 @@ def test_retired_domain_and_shutdown_report_unfinished_charges_honestly(ipc_conn
             assert outcome['ipc_clients_drained'] is False, outcome
             assert not resource.finished.is_set()
             # The caller's deadline ended only its wait. Retirement keeps the
-            # dispatched call and its charge until the resource finishes.
+            # dispatched operation slot until the resource finishes; its sent
+            # input bytes were already returned to the payload budget.
             actual = session.call_execution_snapshot()
             assert actual['closed']
             assert actual['used_operations'] == 1
-            assert actual['used_retained_bytes'] == nbytes
+            assert session.memory_stats()['payload_buffer']['used_bytes'] == retained_bytes
             release_resource.set()
             assert resource.finished.wait(2)
             outcome = session.begin_shutdown(timeout_seconds=2).observe()
@@ -353,10 +379,16 @@ def test_retired_domain_and_shutdown_report_unfinished_charges_honestly(ipc_conn
             assert outcome['ipc_clients_drained'], outcome
             assert resource.completed == ['active']
 
+        # Shutdown completes when the connections drain. The dispatched
+        # call's native task frees its operation slot only after it has
+        # published the late reply, which may come a moment later.
+        deadline = time.monotonic() + 2
+        while session.call_execution_snapshot()['used_operations'] and time.monotonic() < deadline:
+            time.sleep(0.01)
         actual = session.call_execution_snapshot()
         assert actual['closed']
         assert actual['used_operations'] == 0
-        assert actual['used_retained_bytes'] == 0
+        assert session.memory_stats()['payload_buffer']['used_bytes'] == 0
         assert replacement.call_execution_snapshot()['retired'] == []
     finally:
         release_resource.set()
@@ -377,7 +409,7 @@ def portable_connection(unique_ipc_address, request):
         if isinstance(request.param, dict):
             cc.set_call_execution_limits(**request.param)
         else:
-            cc.set_call_execution_limits(retained_input_budget_bytes=request.param)
+            cc.set_call_execution_limits(payload_buffer_budget_bytes=request.param)
     server = local_server(unique_ipc_address)
     server.register_crm(Echo, EchoResource(), name='portable-options')
     server.start()
@@ -410,7 +442,7 @@ def test_real_known_fastdb_rejects_before_any_binary_copy(portable_connection, m
             invoke(view, source)
         assert calls == []
         assert cc.observe.call_execution_snapshot()['used_operations'] == 0
-        assert cc.observe.call_execution_snapshot()['used_retained_bytes'] == 0
+        assert cc.observe.memory_stats()['payload_buffer']['used_bytes'] == 0
     finally:
         source.close()
         cc.close(view)
@@ -463,8 +495,195 @@ def test_native_prepared_call_is_single_use(ipc_connection):
         cc.close(view)
 
 
-def test_http_stale_retry_keeps_original_deadline_and_later_call_survives():
-    """Two real HTTP endpoints produce a proven stale refusal then slow success."""
+@pytest.mark.parametrize('ipc_connection', [(None, 64)], indirect=True)
+@pytest.mark.parametrize('first_timeout', [15, None])
+def test_sent_ipc_input_refunds_full_budget_before_reply(ipc_connection, monkeypatch, first_timeout):
+    import pickle
+
+    connection, resource = ipc_connection
+    first_view = cc.with_call_options(connection, timeout=first_timeout)
+    second_view = cc.with_call_options(connection, timeout=5)
+    first = first_view.client.begin_call('echo')
+    second = None
+    active_started = threading.Event()
+    active_finished = threading.Event()
+    release_active = threading.Event()
+
+    def gated_echo(value, timeout=0.0):
+        resource.calls += 1
+        if value == 'active':
+            active_started.set()
+            try:
+                assert release_active.wait(12)
+            finally:
+                active_finished.set()
+        return value
+
+    monkeypatch.setattr(resource, 'echo', gated_echo)
+    active_request = pickle.dumps(('active', 0.0), protocol=4).ljust(64, b'\0')
+    second_request = pickle.dumps(('second', 0.0), protocol=4).ljust(64, b'\0')
+    assert len(active_request) == len(second_request) == 64
+    try:
+        first.charge_input(64)
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            active = executor.submit(first.call, active_request)
+            try:
+                assert active_started.wait(3)
+                assert not active.done()
+                second = second_view.client.begin_call('echo')
+                # This bounded charge waits for the first send to return all
+                # 64 bytes, even if its asynchronous send receipt trails the
+                # resource callback's entry. The first reply is still gated.
+                second.charge_input(64)
+                assert not active_finished.is_set()
+                subsequent = executor.submit(second.call, second_request)
+                response = subsequent.result(6)
+                try:
+                    assert pickle.loads(memoryview(response)) == 'second'
+                finally:
+                    response.release()
+                assert not active_finished.is_set()
+                assert not active.done()
+            finally:
+                release_active.set()
+            response = active.result(6)
+            try:
+                assert pickle.loads(memoryview(response)) == 'active'
+            finally:
+                response.release()
+        assert resource.calls == 2
+        assert cc.observe.memory_stats()['payload_buffer']['used_bytes'] == 0
+    finally:
+        release_active.set()
+        first.close()
+        if second is not None:
+            second.close()
+        cc.close(first_view)
+        cc.close(second_view)
+
+
+@pytest.mark.parametrize('ipc_connection', [(None, 64)], indirect=True)
+@pytest.mark.parametrize('entry', ['charge', 'bytes', 'buffer', 'resized_buffer'])
+def test_full_payload_budget_wait_releases_gil_for_reservation_release(ipc_connection, entry):
+    import pickle
+
+    connection, resource = ipc_connection
+    view = cc.with_call_options(connection, timeout=2)
+    first = connection.client.begin_call('echo')
+    first.charge_input(64)
+    cell = cc.observe.memory_stats()['payload_buffer']
+    assert set(cell) == {
+        'limit_bytes', 'used_bytes', 'peak_bytes',
+        'rejected_allocations', 'rejected_bytes',
+    }
+    assert cell['limit_bytes'] == 64
+    assert cell['used_bytes'] > 0
+    request = pickle.dumps(('second', 0.0), protocol=4).ljust(64, b'\0')
+    source = bytearray(request) if entry in ('buffer', 'resized_buffer') else request
+    entered = threading.Event()
+
+    def wait_for_budget():
+        prepared = view.client.begin_call('echo')
+        try:
+            entered.set()
+            if entry == 'charge':
+                prepared.charge_input(64)
+                return None
+            return prepared.call(source)
+        finally:
+            prepared.close()
+
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(wait_for_budget)
+            assert entered.wait(1)
+            # This observation wait gives the worker the GIL and must expire
+            # independently of its native budget wait.
+            from concurrent.futures import TimeoutError as FutureTimeoutError
+            with pytest.raises(FutureTimeoutError):
+                future.result(timeout=0.05)
+            if entry == 'resized_buffer':
+                source.extend(b'x')
+            first.close()
+            if entry == 'resized_buffer':
+                with pytest.raises(ValueError, match='buffer size changed'):
+                    future.result(2)
+                result = None
+            else:
+                result = future.result(2)
+            if result is not None:
+                try:
+                    assert pickle.loads(memoryview(result)) == 'second'
+                finally:
+                    result.release()
+        assert resource.calls == (0 if entry in ('charge', 'resized_buffer') else 1)
+        assert cc.observe.memory_stats()['payload_buffer']['used_bytes'] == 0
+    finally:
+        first.close()
+        cc.close(view)
+
+
+@pytest.mark.parametrize('ipc_connection', [(None, 64)], indirect=True)
+def test_full_payload_budget_wait_uses_original_pre_dispatch_deadline(ipc_connection):
+    import pickle
+
+    connection, resource = ipc_connection
+    first = connection.client.begin_call('echo')
+    first.charge_input(64)
+    view = cc.with_call_options(connection, timeout=0.05)
+    try:
+        prepared = view.client.begin_call('echo')
+        with pytest.raises(cc.error.CoreError) as failure:
+            prepared.charge_input(64)
+        assert failure.value.name == 'CallDeadlineExceeded'
+        assert failure.value.transport_phase == 'pre_dispatch'
+        prepared.close()
+        assert resource.calls == 0
+        assert cc.observe.call_execution_snapshot()['used_operations'] == 0
+    finally:
+        first.close()
+        cc.close(view)
+
+
+@pytest.mark.parametrize('ipc_connection', [(None, 0)], indirect=True)
+def test_zero_payload_budget_accepts_zero_and_rejects_positive_input(ipc_connection):
+    connection, resource = ipc_connection
+    prepared = connection.client.begin_call('echo')
+    try:
+        prepared.charge_input(0)
+        with pytest.raises(cc.error.CoreError) as failure:
+            prepared.charge_input(1)
+        assert failure.value.name == 'CallCapacityExceeded'
+        assert failure.value.transport_phase == 'pre_dispatch'
+        assert resource.calls == 0
+    finally:
+        prepared.close()
+    assert cc.observe.memory_stats()['payload_buffer']['used_bytes'] == 0
+
+
+@pytest.mark.parametrize('ipc_connection', [(None, 64)], indirect=True)
+def test_payload_buffer_retirement_observation_follows_live_reservation(ipc_connection):
+    import pickle
+
+    connection, _ = ipc_connection
+    response = connection.client.begin_call('echo')
+    response.charge_input(64)
+    old = _get_default_runtime()._runtime_session  # noqa: SLF001
+    replacement = RuntimeSession()
+    handoff = old.retire_memory_observation()
+    replacement.adopt_retired_memory_observation(handoff)
+    try:
+        cells = replacement.memory_stats()['retired_payload_buffers']
+        assert len(cells) == 1
+        assert cells[0]['limit_bytes'] == 64
+        assert cells[0]['used_bytes'] > 0
+    finally:
+        response.close()
+    assert replacement.memory_stats()['retired_payload_buffers'][0]['used_bytes'] == 0
+
+
+def test_http_stale_refusal_does_not_retain_input_for_post_replay():
+    """A stale POST is reported without retaining a speculative replay copy."""
     import json
     import pickle
     from http.server import BaseHTTPRequestHandler
@@ -477,12 +696,7 @@ def test_http_stale_retry_keeps_original_deadline_and_later_call_survives():
     servers = []
     threads = []
     route_name = 'deadline-retry'
-    # Keep enough time for both real HTTP dispatches on a loaded runner. The
-    # second response fits a fresh budget, but the two delays exceed the one
-    # original budget, so restarting that budget would make the call succeed.
     call_timeout = 3.0
-    stale_delay = 1.5
-    success_delay = 2.0
 
     def route(index):
         return {
@@ -521,12 +735,10 @@ def test_http_stale_retry_keeps_original_deadline_and_later_call_survives():
                 calls[index] += 1
                 headers_seen.append(dict(self.headers))
                 if index == 0:
-                    time.sleep(stale_delay)
                     refusal = {'version': 1, 'code': 704, 'name': 'RouteStale',
                                'message': 'authoritative stale route', 'details': {}}
                     self.reply(409, json.dumps(refusal).encode())
                 else:
-                    time.sleep(success_delay)
                     value, _business_timeout = pickle.loads(body)
                     self.reply(200, pickle.dumps(value))
         return Handler
@@ -545,13 +757,9 @@ def test_http_stale_retry_keeps_original_deadline_and_later_call_survives():
         anchor = f'http://127.0.0.1:{servers[0].server_port}'
         connection = cc.connect(TimedContract, name=route_name, address=anchor)
         finite = cc.with_call_options(connection, timeout=call_timeout)
-        with pytest.raises(cc.error.CallDeadlineExceeded) as failure:
+        with pytest.raises(cc.error.RouteStale):
             finite.echo('retry')
-        assert failure.value.transport_phase == 'dispatch_uncertain'
-        assert calls == [1, 1]
-        unlimited = cc.with_call_options(connection, timeout=None)
-        assert unlimited.echo('later') == 'later'
-        assert calls[1] == 2
+        assert calls == [1, 0]
         for headers in headers_seen:
             normalized = {key.lower(): value for key, value in headers.items()}
             assert normalized['x-c2-expected-abi-hash'] == expected.abi_hash
@@ -580,7 +788,7 @@ def test_zero_slots_rejects_both_entry_forms_without_reducer_or_resource(ipc_con
         assert SlowPickle.caller_threads == []
         assert resource.calls == 0
         assert cc.observe.call_execution_snapshot()['used_operations'] == 0
-        assert cc.observe.call_execution_snapshot()['used_retained_bytes'] == 0
+        assert cc.observe.memory_stats()['payload_buffer']['used_bytes'] == 0
     finally:
         cc.close(view)
 
@@ -610,7 +818,7 @@ def test_zero_slots_or_deadline_never_materializes_fastdb(portable_connection, m
             invoke(view, source)
         assert calls == {'report': 0, 'copy': 0, 'resource': 0}
         assert cc.observe.call_execution_snapshot()['used_operations'] == 0
-        assert cc.observe.call_execution_snapshot()['used_retained_bytes'] == 0
+        assert cc.observe.memory_stats()['payload_buffer']['used_bytes'] == 0
     finally:
         source.close()
         cc.close(view)
@@ -639,7 +847,7 @@ def test_report_or_invalid_owner_error_keeps_input_classification_and_zero_charg
         else:
             assert isinstance(failure.value.__cause__, ValueError)
         assert cc.observe.call_execution_snapshot()['used_operations'] == 0
-        assert cc.observe.call_execution_snapshot()['used_retained_bytes'] == 0
+        assert cc.observe.memory_stats()['payload_buffer']['used_bytes'] == 0
     finally:
         source.close()
         cc.close(view)
@@ -655,8 +863,9 @@ def test_closed_view_is_call_resource_error_before_serializer(ipc_connection, in
     assert SlowPickle.caller_threads == []
     assert resource.calls == 0
     assert cc.observe.call_execution_snapshot()['used_operations'] == 0
-    assert cc.observe.call_execution_snapshot()['used_retained_bytes'] == 0
+    assert cc.observe.memory_stats()['payload_buffer'] is None
     assert connection.echo('after') == 'after'
+    assert cc.observe.memory_stats()['payload_buffer']['used_bytes'] == 0
 
 
 def test_prepared_close_gc_and_invalid_buffer_refund_only_pre_dispatch(ipc_connection):
@@ -669,26 +878,26 @@ def test_prepared_close_gc_and_invalid_buffer_refund_only_pre_dispatch(ipc_conne
             prepared = view.client.begin_call('echo')
             prepared.charge_input(16)
             assert cc.observe.call_execution_snapshot()['used_operations'] == 1
-            assert cc.observe.call_execution_snapshot()['used_retained_bytes'] == 16
+            assert cc.observe.memory_stats()['payload_buffer']['used_bytes'] == 16
             if explicit_close:
                 prepared.close()
             del prepared
             gc.collect()
             assert cc.observe.call_execution_snapshot()['used_operations'] == 0
-            assert cc.observe.call_execution_snapshot()['used_retained_bytes'] == 0
+            assert cc.observe.memory_stats()['payload_buffer']['used_bytes'] == 0
 
         prepared = view.client.begin_call('echo')
         prepared.charge_input(16)
         with pytest.raises(TypeError):
             prepared.call(object())
         assert cc.observe.call_execution_snapshot()['used_operations'] == 0
-        assert cc.observe.call_execution_snapshot()['used_retained_bytes'] == 0
+        assert cc.observe.memory_stats()['payload_buffer']['used_bytes'] == 0
         with pytest.raises(ValueError, match='consumed'):
             prepared.call(b'')
         del prepared
         gc.collect()
         assert cc.observe.call_execution_snapshot()['used_operations'] == 0
-        assert cc.observe.call_execution_snapshot()['used_retained_bytes'] == 0
+        assert cc.observe.memory_stats()['payload_buffer']['used_bytes'] == 0
         assert resource.calls == 0
         assert connection.echo('after') == 'after'
     finally:
@@ -736,4 +945,38 @@ def test_mutable_backing_snapshot_survives_caller_handoff(ipc_connection, monkey
     finally:
         if readonly_alias:
             source.release()
+        cc.close(view)
+
+
+@pytest.mark.parametrize('ipc_connection', [(None, 64)], indirect=True)
+def test_prepared_call_consumption_releases_gil_while_a_charge_waits(ipc_connection):
+    import pickle
+    from concurrent.futures import TimeoutError as FutureTimeoutError
+
+    connection, resource = ipc_connection
+    occupied = connection.client.begin_call('echo')
+    occupied.charge_input(64)
+    view = cc.with_call_options(connection, timeout=3)
+    prepared = view.client.begin_call('echo')
+    request = pickle.dumps(('ready', 0.0), protocol=4).ljust(64, b'\0')
+    try:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            charging = executor.submit(prepared.charge_input, 64)
+            with pytest.raises(FutureTimeoutError):
+                charging.result(timeout=0.05)
+            calling = executor.submit(prepared.call, request)
+            with pytest.raises(FutureTimeoutError):
+                calling.result(timeout=0.05)
+            occupied.close()
+            charging.result(timeout=2)
+            response = calling.result(timeout=2)
+            try:
+                assert pickle.loads(memoryview(response)) == 'ready'
+            finally:
+                response.release()
+        assert resource.calls == 1
+        assert cc.observe.memory_stats()['payload_buffer']['used_bytes'] == 0
+    finally:
+        occupied.close()
+        prepared.close()
         cc.close(view)

@@ -8,6 +8,7 @@ use std::sync::{Arc, OnceLock};
 
 use c2_mem::MemPool;
 
+use crate::client::stream::{IpcResponseStream, IpcStreamCancellation};
 use crate::client::{
     ClientIpcConfig, IpcCallControl, IpcClient, IpcError, MethodTable, RouteBinding,
 };
@@ -71,7 +72,8 @@ impl std::error::Error for IpcCallError {
 
 pub(crate) fn call_error_phase(error: &IpcError) -> TransportPhase {
     match error {
-        IpcError::LocalCallRejected(_)
+        IpcError::CallRejected(_)
+        | IpcError::LocalCallRejected(_)
         | IpcError::Config(_)
         | IpcError::Protocol(_)
         | IpcError::ProtocolVersionMismatch { .. }
@@ -282,15 +284,46 @@ impl SyncClient {
             .await
     }
 
-    pub async fn call_bound_controlled_async_phased(
+    /// Transfer the request owner to IPC. Its storage is released after
+    /// preparation/send, independently of the continuing response wait.
+    pub async fn call_bound_owned_controlled_async_phased<B>(
         &self,
         binding: &RouteBinding,
         method_name: &str,
-        data: &[u8],
+        data: B,
         control: &IpcCallControl,
-    ) -> Result<ResponseData, IpcCallError> {
+    ) -> Result<ResponseData, IpcCallError>
+    where
+        B: AsRef<[u8]> + Send + 'static,
+    {
         self.inner
-            .call_bound_controlled_phased(binding, method_name, data, control)
+            .call_bound_owned_controlled_phased(binding, method_name, data, control)
+            .await
+    }
+
+    pub async fn stream_bound_owned_controlled_async_phased<B>(
+        &self,
+        binding: &RouteBinding,
+        method_name: &str,
+        data: B,
+        budget: c2_mem::retention::PayloadBufferBudget,
+        completion_owner: Box<dyn Send>,
+        cancellation: IpcStreamCancellation,
+        control: &IpcCallControl,
+    ) -> Result<IpcResponseStream, IpcCallError>
+    where
+        B: AsRef<[u8]> + Send + 'static,
+    {
+        self.inner
+            .stream_bound_owned_controlled_phased(
+                binding,
+                method_name,
+                data,
+                budget,
+                completion_owner,
+                cancellation,
+                control,
+            )
             .await
     }
 

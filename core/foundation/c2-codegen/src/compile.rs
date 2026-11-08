@@ -4,7 +4,8 @@ use crate::{
     targets::{TargetMethod, render_target_artifacts},
 };
 use c2_contract::{
-    BindingDirection, ContractRelease, MethodAccess, NestedFastDbSpec, canonical_json, lower_hex,
+    BindingDirection, ContractRelease, MethodAccess, MethodMode, NestedFastDbSpec, canonical_json,
+    lower_hex,
 };
 use fastdb::{
     ArtifactKind as FastDbArtifactKind, Capabilities, CodegenOptions as FastDbCodegenOptions,
@@ -70,6 +71,7 @@ struct MethodFact {
     index: usize,
     name: String,
     access: MethodAccess,
+    mode: MethodMode,
     input_sha256: Option<String>,
     output_sha256: Option<String>,
 }
@@ -130,6 +132,7 @@ pub fn compile_contract_artifacts(
             index,
             name: method.name().to_string(),
             access: method.access(),
+            mode: method.mode(),
             input_sha256,
             output_sha256,
         });
@@ -141,6 +144,7 @@ pub fn compile_contract_artifacts(
             index: method.index,
             name: &method.name,
             access: method.access,
+            mode: method.mode,
             input_sha256: method.input_sha256.as_deref(),
             output_sha256: method.output_sha256.as_deref(),
         })

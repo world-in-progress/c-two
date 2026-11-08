@@ -67,7 +67,7 @@ def synthetic_suite(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, fail: bo
     native.write_bytes(b'native')
     environment = {k: v for k, v in os.environ.items() if not k.startswith(('PYTEST_', 'CTWO_'))}
     environment.update(PYTHONPATH=str(ROOT), PYTHONDONTWRITEBYTECODE='1', PYTHONUTF8='1')
-    options = SimpleNamespace(python=sys.executable, workers=2, stage_timeout=20, c3=c3)
+    options = SimpleNamespace(python=sys.executable, workers=2, stage_timeout=20, c3=c3, ordinary_only=False)
     info = {'c3_sha256': runner.sha256(c3), 'native': str(native), 'native_sha256': runner.sha256(native)}
     monkeypatch.setattr(runner, 'validate_receipts', lambda *args: None)
     return root, options, environment, info
@@ -116,6 +116,24 @@ def test_collection_skip_stops_before_execution(tmp_path: Path, monkeypatch: pyt
     with pytest.raises(runner.RunnerError, match='skip'):
         runner.execute(options, root / 'evidence', environment, info, evidence)
     assert [s['id'] for s in evidence['steps']] == ['collect-full']
+
+
+@pytest.mark.parametrize('fail', [False, True])
+def test_ordinary_only_keeps_collection_proof_and_runs_no_matrices(tmp_path, monkeypatch, fail):
+    root, options, environment, info = synthetic_suite(tmp_path, monkeypatch, fail=fail)
+    options.ordinary_only = runner.parser().parse_args(['--c3', str(options.c3), '--output', str(root / 'unused'), '--ordinary-only']).ordinary_only
+    def unexpected_receipts(*args):
+        raise AssertionError('ordinary-only must not require matrix receipts')
+    monkeypatch.setattr(runner, 'validate_receipts', unexpected_receipts)
+    evidence = {'steps': []}
+    output = root / 'ordinary evidence'
+    assert runner.execute(options, output, environment, info, evidence) == int(fail)
+    assert [step['id'] for step in evidence['steps']] == [
+        'collect-full', 'collect-ordinary', 'collect-portable', 'collect-typescript', 'ordinary',
+    ]
+    assert len(json.loads((output / 'plan.json').read_text(encoding='utf-8'))['full']) == 8
+    assert (output / 'ordinary/junit.xml').is_file()
+    assert not (output / 'portable').exists() and not (output / 'typescript').exists()
 
 
 @pytest.mark.parametrize('phase,reason,accepted', [
@@ -418,21 +436,23 @@ def test_parent_exit_with_live_descendant_is_not_success(tmp_path: Path) -> None
     assert not record['cleanup_confirmed'] and '进程组仍存活' in record['error']
 
 
-def test_cleanup_failure_cannot_retain_passed_status(tmp_path, monkeypatch):
+@pytest.mark.parametrize('cleanup_error', [OSError('termination probe failed'), PermissionError(1, 'Operation not permitted')])
+def test_cleanup_failure_cannot_retain_passed_status(tmp_path, monkeypatch, cleanup_error):
     original = runner.ProcessTree.stop
     failed = False
     def stop(tree):
         nonlocal failed
         if not failed:
             failed = True
-            raise OSError('termination probe failed')
+            raise cleanup_error
         return original(tree)
     monkeypatch.setattr(runner.ProcessTree, 'stop', stop)
     script = 'import subprocess,sys; subprocess.Popen([sys.executable,"-c","import time; time.sleep(60)"])'
     record = runner.run_step([sys.executable, '-c', script], tmp_path / 'cleanup-error', os.environ.copy(), 5)
     assert record['status'] == 'failed'
     assert not record['cleanup_confirmed']
-    assert record['error'] == 'termination probe failed'
+    assert '进程组仍存活' in record['error']
+    assert record['cleanup_error'] == str(cleanup_error)
 
 
 @pytest.mark.parametrize('timeout', [0, -1, float('nan'), float('inf')])

@@ -9,6 +9,7 @@ mod control;
 mod http_client;
 mod pool;
 mod relay_aware;
+mod stream;
 
 pub use call_control::HttpCallControl;
 #[cfg(feature = "relay")]
@@ -23,6 +24,7 @@ pub use relay_aware::{
     HttpCallError, HttpCallPhase, RelayAwareClientConfig, RelayAwareHttpClient,
     RelayLocalIpcCandidate, RelayResolvedTarget,
 };
+pub use stream::{HttpResponseStream, HttpStreamCancellation};
 
 #[cfg(all(test, feature = "relay"))]
 mod controlled_tests;

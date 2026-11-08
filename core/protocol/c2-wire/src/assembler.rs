@@ -1,9 +1,9 @@
-//! Chunked payload reassembly backed by [`MemHandle`].
+//! Chunked payload reassembly in fixed local storage.
 //!
 //! Provides a single Rust implementation that writes chunks directly into a unified
-//! [`MemHandle`] (buddy SHM, dedicated SHM, or file-backed mmap). The allocated
-//! backing, its owner pool, and its reassembly budget reservation travel together
-//! in one [`ReassemblyBacking`] carrier from admission to release.
+//! [`c2_mem::OwnedAllocation`] (buddy SHM, dedicated SHM, or file-backed mmap).
+//! Its fixed mapping, release authority, and reassembly budget reservation
+//! travel together in one [`ReassemblyBacking`] carrier from admission to release.
 
 use std::sync::Arc;
 
@@ -13,7 +13,7 @@ use parking_lot::{RwLock, RwLockWriteGuard};
 use crate::chunk::ChunkAdmissionError;
 use crate::chunk::backing::{ReassemblyBacking, checked_capacity};
 
-/// Reassembles chunked payloads into a contiguous [`MemHandle`].
+/// Reassembles chunked payloads into a contiguous owned allocation.
 ///
 /// # Lifecycle
 /// ```text
@@ -21,15 +21,55 @@ use crate::chunk::backing::{ReassemblyBacking, checked_capacity};
 /// ```
 ///
 /// Every exit path is ownership-safe: `finish()` on an incomplete assembly,
-/// `abort()`, and plain drop all release the backing storage through the pool
-/// authority and then refund the reassembly budget charge exactly once.
+/// `abort()`, and plain drop all release storage through its fixed allocation
+/// owner and then refund the reassembly budget charge exactly once.
 pub struct ChunkAssembler {
     total_chunks: usize,
     chunk_size: usize,
     received: usize,
     /// High-water mark: one past the last byte written.
     written_end: usize,
-    backing: ReassemblyBacking,
+    backing: Arc<ReassemblyBacking>,
+    /// 0 unseen, 1 reserved for a copy token, 2 committed.
+    chunk_state: Vec<u8>,
+    allocation_address: usize,
+}
+
+/// One move-only, checked write range. It pins the original backing and its
+/// reservation even if the registry removes the assembly during the copy.
+pub struct PreparedChunk {
+    backing: Arc<ReassemblyBacking>,
+    allocation_address: usize,
+    chunk_idx: usize,
+    offset: usize,
+    len: usize,
+}
+
+/// A completed write awaiting the assembler's short metadata commit.
+pub struct CopiedChunk(PreparedChunk);
+
+impl PreparedChunk {
+    pub fn copy_from(self, data: &[u8]) -> Result<CopiedChunk, String> {
+        if data.len() != self.len {
+            return Err(format!(
+                "prepared chunk length {} differs from {}",
+                data.len(),
+                self.len
+            ));
+        }
+        // SAFETY: prepare_chunk uniquely reserves this chunk index under the
+        // assembler's exclusive borrow. Checked geometry yields disjoint spans;
+        // the Arc pins the exact allocation, mapping and budget until commit or
+        // drop. No safe reader of the unfinished backing is exposed.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                data.as_ptr(),
+                (self.allocation_address as *mut u8).add(self.offset),
+                data.len(),
+            );
+        }
+        Ok(CopiedChunk(self))
+    }
 }
 
 /// Checked immutable geometry. Only the canonical checks can create this token.
@@ -95,10 +135,10 @@ impl ChunkAssembler {
             total_chunks,
             chunk_size,
         } = geometry;
-        // Vec<bool> stores one byte per flag. Reserve those bytes together with
+        // Each tracking state occupies one byte. Reserve those bytes together with
         // the payload before allocating either storage, using the same owner
         // reservation throughout the backing's lifetime.
-        let backing = ReassemblyBacking::admit_with_guard(
+        let mut backing = ReassemblyBacking::admit_with_guard(
             pool,
             guard,
             total_chunks,
@@ -106,12 +146,20 @@ impl ChunkAssembler {
             total_chunks,
         )
         .map_err(ChunkAdmissionError::Capacity)?;
+        let chunk_state = backing
+            .take_received_flags()
+            .map_err(ChunkAdmissionError::Capacity)?;
+        let allocation_address = backing
+            .allocation_address()
+            .map_err(ChunkAdmissionError::Capacity)?;
         Ok(Self {
             total_chunks,
             chunk_size,
             received: 0,
             written_end: 0,
-            backing,
+            backing: Arc::new(backing),
+            chunk_state,
+            allocation_address,
         })
     }
 
@@ -119,27 +167,58 @@ impl ChunkAssembler {
     ///
     /// Returns `true` when all chunks have been received.
     pub fn feed_chunk(&mut self, chunk_idx: usize, data: &[u8]) -> Result<bool, String> {
+        let token = self.prepare_chunk(chunk_idx, data.len())?;
+        let copied = token.copy_from(data)?;
+        self.commit_chunk(copied)
+    }
+
+    /// Reserve one nonoverlapping copy span while the assembler is locked.
+    pub fn prepare_chunk(&mut self, chunk_idx: usize, len: usize) -> Result<PreparedChunk, String> {
         if chunk_idx >= self.total_chunks {
             return Err(format!(
                 "chunk_idx {chunk_idx} >= total_chunks {}",
                 self.total_chunks
             ));
         }
-        if self.backing.chunk_received(chunk_idx)? {
+        if self.chunk_state[chunk_idx] != 0 {
             return Err(format!("duplicate chunk_idx {chunk_idx}"));
         }
-        if data.len() > self.chunk_size {
+        if len > self.chunk_size {
             return Err(format!(
                 "data length {} exceeds chunk_size {}",
-                data.len(),
-                self.chunk_size
+                len, self.chunk_size
             ));
         }
-        let offset = chunk_idx * self.chunk_size;
-        self.backing.write_at(offset, data)?;
-        self.backing.mark_chunk_received(chunk_idx)?;
+        let offset = chunk_idx
+            .checked_mul(self.chunk_size)
+            .ok_or_else(|| "chunk offset overflow".to_string())?;
+        let end = offset
+            .checked_add(len)
+            .ok_or_else(|| "chunk end overflow".to_string())?;
+        if end > self.backing.len() {
+            return Err("chunk span exceeds backing".into());
+        }
+        self.chunk_state[chunk_idx] = 1;
+        Ok(PreparedChunk {
+            backing: Arc::clone(&self.backing),
+            allocation_address: self.allocation_address,
+            chunk_idx,
+            offset,
+            len,
+        })
+    }
+
+    /// Publish a completed copy. All bytes are in place before completion.
+    pub fn commit_chunk(&mut self, copied: CopiedChunk) -> Result<bool, String> {
+        let token = copied.0;
+        if !Arc::ptr_eq(&self.backing, &token.backing)
+            || self.chunk_state.get(token.chunk_idx) != Some(&1)
+        {
+            return Err("chunk token belongs to another or retired assembly".into());
+        }
+        self.chunk_state[token.chunk_idx] = 2;
         self.received += 1;
-        let end = offset + data.len();
+        let end = token.offset + token.len;
         if end > self.written_end {
             self.written_end = end;
         }
@@ -169,8 +248,8 @@ impl ChunkAssembler {
     /// retains its chunk flags and their charge; trimming never refunds storage.
     ///
     /// On an incomplete assembly this returns `Err`; the assembler value
-    /// drops on that return, releasing the backing storage through the pool
-    /// authority and refunding the reassembly charge exactly once.
+    /// drops on that return, releasing storage through its fixed allocation
+    /// owner and refunding the reassembly charge exactly once.
     pub fn finish(self) -> Result<ReassemblyBacking, String> {
         if !self.is_complete() {
             return Err(format!(
@@ -179,7 +258,14 @@ impl ChunkAssembler {
             ));
         }
         let written_end = self.written_end;
-        let ChunkAssembler { mut backing, .. } = self;
+        let ChunkAssembler {
+            backing,
+            chunk_state,
+            ..
+        } = self;
+        let mut backing = Arc::try_unwrap(backing)
+            .map_err(|_| "in-flight chunk copy still owns backing".to_string())?;
+        backing.restore_received_flags(chunk_state)?;
         backing.trim_to(written_end)?;
         Ok(backing)
     }
@@ -190,11 +276,6 @@ impl ChunkAssembler {
     /// marker for callers.
     pub fn abort(self) {
         drop(self)
-    }
-
-    /// Try to release without consuming the assembler on local pool contention.
-    pub fn try_release(&mut self) -> bool {
-        self.backing.try_release()
     }
 
     /// One past the last byte written (actual data length).
@@ -253,7 +334,7 @@ mod tests {
     }
 
     #[test]
-    fn try_release_file_keeps_partial_assembly_for_retry() {
+    fn release_file_does_not_wait_for_public_pool_borrow() {
         let budget = MemoryBudget::new(0, 8192, 8194);
         let pool = Arc::new(RwLock::new(
             MemPool::new_with_prefix_and_budget(
@@ -261,35 +342,20 @@ mod tests {
                     spill_threshold: 0.0,
                     ..PoolConfig::default()
                 },
-                "assembler-try-release-file".into(),
+                "assembler-file-release".into(),
                 budget.clone(),
             )
             .unwrap(),
         ));
-        let mut asm = ChunkAssembler::new(Arc::clone(&pool), 2, 4096, 8192).unwrap();
+        let mut asm = ChunkAssembler::new(pool.clone(), 2, 4096, 8192).unwrap();
         assert!(asm.backing.is_file_spill());
         assert!(!asm.feed_chunk(0, &[27; 4096]).unwrap());
-        {
-            let _reader = pool.read();
-            assert!(!asm.try_release());
-            assert_eq!(asm.received(), 1);
-            assert_eq!(asm.written_end(), 4096);
-            assert_eq!(asm.capacity_bytes(), 8194);
-            assert_eq!(budget.snapshot().file.used_bytes, 8192);
-            assert_eq!(budget.snapshot().reassembly.used_bytes, 8194);
-        }
-        // Failed cleanup left data and chunk geometry intact, rather than
-        // consuming the assembler or silently refunding an unfinished owner.
-        assert!(asm.feed_chunk(1, &[38; 1024]).unwrap());
-        assert_eq!(&asm.backing.copy_bytes().unwrap()[..4096], &[27; 4096]);
-        assert_eq!(&asm.backing.copy_bytes().unwrap()[4096..5120], &[38; 1024]);
-        assert!(asm.try_release());
-        assert_eq!(asm.capacity_bytes(), 0);
+        assert_eq!(budget.snapshot().file.used_bytes, 8192);
+        assert_eq!(budget.snapshot().reassembly.used_bytes, 8194);
+        let _reader = pool.read();
+        asm.abort();
         assert_eq!(budget.snapshot().file.used_bytes, 0);
         assert_eq!(budget.snapshot().reassembly.used_bytes, 0);
-        let _writer = pool.write();
-        assert!(asm.try_release());
-        drop(asm); // successful cleanup's Drop must not reacquire the pool
     }
 
     #[test]
@@ -321,6 +387,52 @@ mod tests {
         // Trim happened but the full capacity stays charged until release.
         assert_eq!(backing.capacity_bytes(), 27);
         backing.release();
+    }
+
+    #[test]
+    fn prepared_ranges_copy_concurrently_and_commit_out_of_order() {
+        use std::sync::Barrier;
+
+        let pool = test_pool_arc();
+        let mut asm = ChunkAssembler::new(pool, 2, 4096, 8192).unwrap();
+        let first = asm.prepare_chunk(0, 4096).unwrap();
+        let second = asm.prepare_chunk(1, 4096).unwrap();
+        assert!(asm.prepare_chunk(0, 4096).is_err());
+        let barrier = Arc::new(Barrier::new(3));
+        let handles: Vec<_> = [(first, 0x11), (second, 0x22)]
+            .into_iter()
+            .map(|(token, byte)| {
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    token.copy_from(&vec![byte; 4096]).unwrap()
+                })
+            })
+            .collect();
+        barrier.wait();
+        let mut copies: Vec<_> = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect();
+        assert!(!asm.commit_chunk(copies.pop().unwrap()).unwrap());
+        assert!(asm.commit_chunk(copies.pop().unwrap()).unwrap());
+        let backing = asm.finish().unwrap();
+        let bytes = backing.copy_bytes().unwrap();
+        assert_eq!(&bytes[..4096], &[0x11; 4096]);
+        assert_eq!(&bytes[4096..], &[0x22; 4096]);
+    }
+
+    #[test]
+    fn prepared_copy_keeps_original_charge_after_assembly_abort() {
+        let (pool, budget) = budgeted_pool_arc(8194);
+        let mut asm = ChunkAssembler::new(pool, 2, 4096, 8192).unwrap();
+        let token = asm.prepare_chunk(0, 4096).unwrap();
+        asm.abort();
+        assert_eq!(budget.snapshot().reassembly.used_bytes, 8194);
+        let copied = token.copy_from(&[7; 4096]).unwrap();
+        assert_eq!(budget.snapshot().reassembly.used_bytes, 8194);
+        drop(copied);
+        assert_eq!(budget.snapshot().reassembly.used_bytes, 0);
     }
 
     #[test]

@@ -7,6 +7,7 @@
 mod call_execution;
 mod call_scope;
 mod client;
+mod client_stream;
 mod connect_deadline;
 mod connection_observation;
 mod control;
@@ -15,6 +16,7 @@ mod host;
 mod identity;
 mod lifecycle;
 mod lifetime;
+mod local_stream;
 pub mod memory;
 mod outcome;
 mod session;
@@ -24,9 +26,10 @@ pub use c2_ipc::DirectIpcShutdownOutcome;
 pub use c2_server::{ServerFailure, ServerStartupStage, ServerStartupTimeout};
 pub use call_scope::{CallScope, CallScopeError, CallState};
 pub use client::{
-    Client, Connect, EncodedCall, EncodedClient, HeldResponse, ObservedPath, ObservedRoute,
-    PathCounters, PreparedCall,
+    Client, Connect, EncodedCall, EncodedClient, HeldResponse, NativeEndpointContext, ObservedPath,
+    ObservedRoute, PathCounters, PreparedCall,
 };
+pub use client_stream::{CoreResponseStream, CoreStreamCloseReceipt};
 pub use connect_deadline::{ConnectAttempt, connect_deadline_error};
 pub use control::{direct_ipc_endpoint, ping_direct_ipc, shutdown_direct_ipc};
 pub use error::{
@@ -37,13 +40,14 @@ pub use error::{
     semantic_error_from_ipc_bytes,
 };
 pub use host::{
-    EncodedService, Host, HostOptions, MethodDefinition, Registration, RouteConcurrency,
-    RouteConcurrencyError, RouteConcurrencyGuard, RouteConcurrencySnapshot, ServiceConcurrencyMode,
-    ServiceDefinition,
+    EncodedService, EncodedStream, EncodedStreamItem, EncodedStreamService, Host, HostOptions,
+    MethodDefinition, Registration, RouteConcurrency, RouteConcurrencyError, RouteConcurrencyGuard,
+    RouteConcurrencySnapshot, ServiceConcurrencyMode, ServiceDefinition,
 };
 pub use identity::{
     auto_server_id, auto_server_instance_id, ipc_address_for_server_id, validate_server_id,
 };
+pub use local_stream::{CoreLocalResponseStream, CoreLocalStreamCloseReceipt, LocalObjectStream};
 // The native local-endpoint lifecycle surface is owned by `c2-local`. Core
 // re-exports it so SDKs and the CLI share one implementation instead of
 // writing their own paths, parsers, or management loops.
@@ -77,5 +81,11 @@ pub use c2_config::{
     CallExecutionLimits, CallExecutionLimitsOverrides, CallOptions, CallTimeout, ConfigSources,
     EnvFilePolicy, EnvMap, LocalEndpointContext, LocalEndpointNamespace, LocalEndpointOptions,
 };
-/// Read-only counters for the Runtime finite-call input retention domain.
+/// Read-only operation-slot and payload-buffer counters for one Runtime.
 pub use c2_mem::RetentionSnapshot as CallExecutionSnapshot;
+
+/// Shared asynchronous executor for native client projections.
+#[doc(hidden)]
+pub fn native_client_executor() -> Result<tokio::runtime::Handle, Error> {
+    call_execution::shared_executor()
+}

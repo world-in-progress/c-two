@@ -23,6 +23,7 @@ use std::time::Instant;
 use parking_lot::Mutex;
 
 use c2_config::MemoryBudgetLimits;
+use c2_mem::retention::{PayloadBufferObserverWeak, PayloadBufferSnapshot};
 use c2_mem::{BudgetCellSnapshot, BudgetObserver, BudgetObserverWeak, BudgetSnapshot};
 use c2_server::ServerMemorySnapshot;
 
@@ -237,6 +238,16 @@ impl MemoryCellStats {
             rejected_bytes: cell.rejected_bytes,
         }
     }
+
+    pub const fn from_payload_buffer(cell: PayloadBufferSnapshot) -> Self {
+        Self {
+            limit_bytes: cell.limit_bytes,
+            used_bytes: cell.used_bytes,
+            peak_bytes: cell.peak_bytes,
+            rejected_allocations: cell.rejected_allocations,
+            rejected_bytes: cell.rejected_bytes,
+        }
+    }
 }
 
 /// A scope-labelled snapshot of all three budget cells.
@@ -278,6 +289,8 @@ pub struct RuntimeMemoryStats {
     pub runtime_outgoing: Option<MemoryScopeStats>,
     /// Server direction of this Runtime's Core host, when one exists.
     pub server: Option<MemoryScopeStats>,
+    /// One Runtime's B domain, initialized by business calls or HTTP acquisition.
+    pub payload_buffer: Option<MemoryCellStats>,
 }
 
 /// One retired scope: a role label plus a weak view of its budget accounting.
@@ -321,6 +334,7 @@ pub struct RetiredScopeReport {
 #[derive(Debug, Default)]
 struct RetiredMemoryObservationState {
     scopes: parking_lot::Mutex<Vec<RetiredScope>>,
+    payload_buffers: parking_lot::Mutex<Vec<PayloadBufferObserverWeak>>,
     trackers: parking_lot::Mutex<Vec<LocalCopyObserver>>,
 }
 
@@ -365,6 +379,32 @@ impl RetiredMemoryObservation {
             role,
             observer: observer.downgrade(),
         });
+    }
+
+    pub fn push_payload_buffer(&self, observer: PayloadBufferObserverWeak) {
+        let mut buffers = self.state.payload_buffers.lock();
+        if !buffers.iter().any(|existing| existing.ptr_eq(&observer)) {
+            buffers.push(observer);
+        }
+    }
+
+    pub fn compose_payload_buffer_reports(
+        bundles: &[Arc<RetiredMemoryObservation>],
+    ) -> Vec<MemoryCellStats> {
+        let mut seen = Vec::<PayloadBufferObserverWeak>::new();
+        let mut reports = Vec::new();
+        for bundle in bundles {
+            for observer in bundle.state.payload_buffers.lock().iter() {
+                if seen.iter().any(|existing| existing.ptr_eq(observer)) {
+                    continue;
+                }
+                if let Some(snapshot) = observer.snapshot() {
+                    seen.push(observer.clone());
+                    reports.push(MemoryCellStats::from_payload_buffer(snapshot));
+                }
+            }
+        }
+        reports
     }
 
     /// Register one Rust-owned local-buffer tracker; duplicates by identity
@@ -417,6 +457,10 @@ impl RetiredMemoryObservation {
             .scopes
             .lock()
             .retain(|scope| scope.observer.is_alive());
+        self.state
+            .payload_buffers
+            .lock()
+            .retain(PayloadBufferObserverWeak::is_alive);
         let mut trackers = self.state.trackers.lock();
         trackers.retain(|observer| observer.is_alive());
         let mut deduped: Vec<LocalCopyObserver> = Vec::with_capacity(trackers.len());
@@ -430,7 +474,9 @@ impl RetiredMemoryObservation {
 
     /// Whether every record was pruned away, so the bundle itself can go.
     pub fn is_empty(&self) -> bool {
-        self.state.scopes.lock().is_empty() && self.state.trackers.lock().is_empty()
+        self.state.scopes.lock().is_empty()
+            && self.state.payload_buffers.lock().is_empty()
+            && self.state.trackers.lock().is_empty()
     }
 
     /// Prune detached records inside bundles and drop emptied bundles from a
@@ -564,7 +610,25 @@ impl RetirementHandoff {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use c2_mem::retention::PayloadBufferBudget;
     use c2_mem::{BudgetKind, MemoryBudget};
+
+    #[test]
+    fn retired_payload_buffer_reports_live_storage_once_until_last_owner_drops() {
+        let budget = PayloadBufferBudget::new(8);
+        let reservation = budget.reserve_blocking(5, None).unwrap();
+        let first = Arc::new(RetiredMemoryObservation::new());
+        let second = Arc::new(RetiredMemoryObservation::new());
+        first.push_payload_buffer(budget.downgrade());
+        second.push_payload_buffer(budget.downgrade());
+        drop(budget);
+        let bundles = vec![first, second];
+        let reports = RetiredMemoryObservation::compose_payload_buffer_reports(&bundles);
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].used_bytes, 5);
+        drop(reservation);
+        assert!(RetiredMemoryObservation::compose_payload_buffer_reports(&bundles).is_empty());
+    }
 
     fn limits() -> MemoryBudgetLimits {
         MemoryBudgetLimits {

@@ -5,14 +5,13 @@
 //! budget: `Inherit` resolves from the path's default policy, `Unlimited`
 //! explicitly disables the deadline, and `After(Duration)` bounds the whole
 //! logical call. [`CallExecutionLimits`] carries the canonical finite
-//! admission limits for the future bounded deadline transactions — the
-//! default of [`DEFAULT_MAX_OUTSTANDING_CALLS`] outstanding calls and
-//! [`DEFAULT_RETAINED_INPUT_BUDGET_BYTES`] retained input bytes is the Host
-//! capacity decision recorded in the 0.7.1 design, section 4.3.
+//! admission limits for outstanding calls and locally retained payload
+//! buffers. [`DEFAULT_MAX_OUTSTANDING_CALLS`] and
+//! [`DEFAULT_PAYLOAD_BUFFER_BUDGET_BYTES`] define their defaults.
 //!
 //! This module is pure policy data and checked conversion. It reads no
 //! environment (the `C2_CALL_MAX_OUTSTANDING` and
-//! `C2_CALL_RETAINED_INPUT_BUDGET_BYTES` overrides are wired by
+//! `C2_CALL_PAYLOAD_BUFFER_BUDGET_BYTES` overrides are wired by
 //! [`crate::ConfigResolver::resolve_call_execution_limits`], not by these
 //! types), starts no runtime, and resolves no transport default: the
 //! HTTP default policy and the `Inherit` resolution both belong to the
@@ -115,21 +114,20 @@ impl CallOptions {
     }
 }
 
-/// Canonical finite admission limits for bounded deadline transactions.
+/// Canonical call admission and payload buffer limits.
 ///
 /// Both fields are finite upper bounds: a zero value rejects every positive
 /// request in that dimension, it never means unlimited. The byte limit is
-/// the retention policy for transport continuations that keep their own
-/// request copies — it is finite admission, not a preallocation, a process
-/// RSS bound, or a complete HTTP buffering guarantee. The reservation
-/// primitive for the byte dimension is `c2_mem::RetentionBudget`.
+/// the shared payload buffer budget for a Runtime or relay, not a
+/// preallocation or a process RSS bound. The reservation primitive for the
+/// byte dimension is `c2_mem::retention::PayloadBufferBudget`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct CallExecutionLimits {
     /// Maximum unfinished bounded deadline transactions per runtime; the
     /// next admission is rejected before dispatch when exhausted.
     pub max_outstanding_calls: u64,
-    /// Finite byte budget for continuation-owned retained request input.
-    pub retained_input_budget_bytes: u64,
+    /// Finite byte budget for locally retained payload buffers.
+    pub payload_buffer_budget_bytes: u64,
 }
 
 /// Default outstanding bounded deadline transactions per runtime.
@@ -137,9 +135,8 @@ pub const DEFAULT_MAX_OUTSTANDING_CALLS: u64 = 1024;
 
 const GIB: u64 = 1 << 30;
 
-/// Default retained-input byte budget, matching the current default
-/// single-message cap so one default-sized input can always be taken over.
-pub const DEFAULT_RETAINED_INPUT_BUDGET_BYTES: u64 = 16 * GIB;
+/// Default payload buffer budget, matching the current single-message cap.
+pub const DEFAULT_PAYLOAD_BUFFER_BUDGET_BYTES: u64 = 16 * GIB;
 
 impl CallExecutionLimits {
     /// Limits with both cells at zero: every positive request is rejected.
@@ -149,7 +146,7 @@ impl CallExecutionLimits {
     pub const fn zeroed() -> Self {
         Self {
             max_outstanding_calls: 0,
-            retained_input_budget_bytes: 0,
+            payload_buffer_budget_bytes: 0,
         }
     }
 }
@@ -158,7 +155,7 @@ impl Default for CallExecutionLimits {
     fn default() -> Self {
         Self {
             max_outstanding_calls: DEFAULT_MAX_OUTSTANDING_CALLS,
-            retained_input_budget_bytes: DEFAULT_RETAINED_INPUT_BUDGET_BYTES,
+            payload_buffer_budget_bytes: DEFAULT_PAYLOAD_BUFFER_BUDGET_BYTES,
         }
     }
 }
@@ -172,9 +169,9 @@ mod tests {
     fn canonical_defaults_match_the_host_capacity_decision() {
         let limits = CallExecutionLimits::default();
         assert_eq!(limits.max_outstanding_calls, 1024);
-        assert_eq!(limits.retained_input_budget_bytes, 16 * 1024 * 1024 * 1024);
+        assert_eq!(limits.payload_buffer_budget_bytes, 16 * 1024 * 1024 * 1024);
         assert_eq!(DEFAULT_MAX_OUTSTANDING_CALLS, 1024);
-        assert_eq!(DEFAULT_RETAINED_INPUT_BUDGET_BYTES, 16 * 1024 * 1024 * 1024);
+        assert_eq!(DEFAULT_PAYLOAD_BUFFER_BUDGET_BYTES, 16 * 1024 * 1024 * 1024);
     }
 
     #[test]
@@ -183,7 +180,7 @@ mod tests {
             CallExecutionLimits::zeroed(),
             CallExecutionLimits {
                 max_outstanding_calls: 0,
-                retained_input_budget_bytes: 0,
+                payload_buffer_budget_bytes: 0,
             }
         );
     }

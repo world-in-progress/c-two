@@ -16,7 +16,7 @@ pub const MAX_EXECUTION_WORKERS: u32 = 64;
 /// Maximum number of loan IDs carried by one IPC release frame.
 pub const IPC_RELEASE_BATCH_CAPACITY: usize = 64;
 
-// total_len excludes its own u32: request_id + flags + type + count + loan IDs.
+// total_len excludes its own u32: request_id + flags + kind + count + loan IDs.
 const MIN_IPC_FRAME_SIZE: u64 = 8 + 4 + 1 + 1 + 8 * IPC_RELEASE_BATCH_CAPACITY as u64;
 
 /// Canonical upper bound on configured buddy pool segments
@@ -40,7 +40,7 @@ pub const SERVER_IPC_OVERRIDE_KEYS: &[&str] = &[
     "pool_min_retained_segments",
     "reassembly_segment_size",
     "reassembly_max_segments",
-    "max_total_chunks",
+    "max_inflight_chunk_frames",
     "chunk_gc_interval",
     "chunk_threshold_ratio",
     "chunk_assembler_timeout",
@@ -58,6 +58,7 @@ pub const SERVER_IPC_OVERRIDE_KEYS: &[&str] = &[
 
 /// Code-level IPC override fields accepted for client config resolution.
 pub const CLIENT_IPC_OVERRIDE_KEYS: &[&str] = &[
+    "client_idle_timeout",
     "write_timeout",
     "max_dedicated_segments",
     "spill_threshold",
@@ -68,7 +69,7 @@ pub const CLIENT_IPC_OVERRIDE_KEYS: &[&str] = &[
     "pool_min_retained_segments",
     "reassembly_segment_size",
     "reassembly_max_segments",
-    "max_total_chunks",
+    "max_inflight_chunk_frames",
     "chunk_gc_interval",
     "chunk_threshold_ratio",
     "chunk_assembler_timeout",
@@ -116,7 +117,9 @@ pub struct BaseIpcConfig {
     pub reassembly_max_segments: u32,
 
     // ── Chunked transfer settings ────────────────────────────────────────
-    pub max_total_chunks: u32,
+    /// Maximum server chunk frames being processed at once; the reassembly
+    /// registry derives its soft maintenance threshold from this value.
+    pub max_inflight_chunk_frames: u32,
     pub chunk_gc_interval_secs: f64,
     pub chunk_threshold_ratio: f64,
     pub chunk_assembler_timeout_secs: f64,
@@ -157,6 +160,10 @@ pub struct ServerIpcConfig {
 pub struct ClientIpcConfig {
     pub base: BaseIpcConfig,
     pub shm_threshold: u64,
+    /// Seconds an unreferenced cached connection is retained before eviction.
+    /// Zero disables timed eviction; dispatched calls still finish when an
+    /// expired connection is deactivated.
+    pub client_idle_timeout_secs: f64,
     /// Idle window before the client's own request/reassembly buddy segments
     /// may be retired by the connection's periodic maintenance task while the
     /// connection stays open. `0` retires idle segments at the next maintenance
@@ -183,7 +190,7 @@ impl Default for BaseIpcConfig {
             reassembly_segment_size: 64 * 1024 * 1024, // 64 MB
             reassembly_max_segments: 4,
 
-            max_total_chunks: 512,
+            max_inflight_chunk_frames: 512,
             chunk_gc_interval_secs: 5.0,
             chunk_threshold_ratio: 0.9,
             chunk_assembler_timeout_secs: 60.0,
@@ -217,6 +224,7 @@ impl Default for ClientIpcConfig {
         Self {
             base: BaseIpcConfig::default(),
             shm_threshold: 4_096,
+            client_idle_timeout_secs: 60.0,
             pool_decay_seconds: 60.0,
         }
     }
@@ -409,6 +417,9 @@ impl BaseIpcConfig {
         if self.chunk_size == 0 {
             return Err("chunk_size must be > 0".into());
         }
+        if self.max_inflight_chunk_frames == 0 {
+            return Err("max_inflight_chunk_frames must be > 0".into());
+        }
         if !self.chunk_gc_interval_secs.is_finite() {
             return Err(format!(
                 "chunk_gc_interval_secs ({}) must be finite",
@@ -501,6 +512,14 @@ impl ServerIpcConfig {
 impl ClientIpcConfig {
     pub fn validate(&self) -> Result<(), String> {
         self.base.validate()?;
+        let idle_timeout =
+            Duration::try_from_secs_f64(self.client_idle_timeout_secs).map_err(|_| {
+                "client_idle_timeout_secs must be finite, non-negative and representable in seconds"
+                    .to_owned()
+            })?;
+        if idle_timeout.as_millis() > u128::from(u64::MAX) {
+            return Err("client_idle_timeout_secs must fit in milliseconds".into());
+        }
         if !self.pool_decay_seconds.is_finite() {
             return Err(format!(
                 "pool_decay_seconds ({}) must be finite",
@@ -509,6 +528,12 @@ impl ClientIpcConfig {
         }
         validate_duration_secs("pool_decay_seconds", self.pool_decay_seconds)?;
         Ok(())
+    }
+
+    /// Cache retention after boundary validation. None disables timed eviction.
+    pub fn client_idle_timeout(&self) -> Option<Duration> {
+        (self.client_idle_timeout_secs != 0.0)
+            .then(|| Duration::from_secs_f64(self.client_idle_timeout_secs))
     }
 
     /// Owner-pool role tuning for the client's own request and reassembly
@@ -1102,7 +1127,7 @@ mod tests {
                 ..base.clone()
             },
             BaseIpcConfig {
-                max_total_chunks: base.max_total_chunks + 1,
+                max_inflight_chunk_frames: base.max_inflight_chunk_frames + 1,
                 ..base.clone()
             },
             BaseIpcConfig {

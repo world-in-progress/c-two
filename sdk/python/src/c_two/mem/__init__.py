@@ -20,8 +20,8 @@ Typical usage::
     del pool
 
 This module also carries the typed shape of :func:`c_two.observe.memory_stats`.
-Those counters describe C-Two-owned IPC backing and live reassembly
-accounting. They are independent scopes, not process RSS, and must never be
+Those counters describe C-Two-owned payload buffers, IPC backing and live
+reassembly accounting. They are independent scopes, not process RSS, and must never be
 summed and presented as physical memory usage.
 """
 from __future__ import annotations
@@ -87,6 +87,8 @@ class MemoryStats(TypedDict):
     runtime_outgoing: MemoryScopeStats | None
     server: MemoryScopeStats | None
     retired: list[RetiredScopeStats]
+    payload_buffer: MemoryCellStats | None
+    retired_payload_buffers: list[MemoryCellStats]
     holds: dict
 
 

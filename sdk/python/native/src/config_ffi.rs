@@ -173,7 +173,7 @@ fn parse_server_ipc_overrides_dict(dict: &Bound<'_, PyDict>) -> PyResult<ServerI
         pool_min_retained_segments: get_opt(dict, "pool_min_retained_segments")?,
         reassembly_segment_size: get_opt(dict, "reassembly_segment_size")?,
         reassembly_max_segments: get_opt(dict, "reassembly_max_segments")?,
-        max_total_chunks: get_opt(dict, "max_total_chunks")?,
+        max_inflight_chunk_frames: get_opt(dict, "max_inflight_chunk_frames")?,
         chunk_gc_interval_secs: get_opt(dict, "chunk_gc_interval")?,
         chunk_threshold_ratio: get_opt(dict, "chunk_threshold_ratio")?,
         chunk_assembler_timeout_secs: get_opt(dict, "chunk_assembler_timeout")?,
@@ -232,8 +232,8 @@ pub(crate) fn server_ipc_overrides_to_dict<'py>(
     if let Some(value) = overrides.reassembly_max_segments {
         dict.set_item("reassembly_max_segments", value)?;
     }
-    if let Some(value) = overrides.max_total_chunks {
-        dict.set_item("max_total_chunks", value)?;
+    if let Some(value) = overrides.max_inflight_chunk_frames {
+        dict.set_item("max_inflight_chunk_frames", value)?;
     }
     if let Some(value) = overrides.chunk_gc_interval_secs {
         dict.set_item("chunk_gc_interval", value)?;
@@ -282,6 +282,9 @@ pub(crate) fn client_ipc_overrides_to_dict<'py>(
     overrides: &ClientIpcConfigOverrides,
 ) -> PyResult<Bound<'py, PyDict>> {
     let dict = PyDict::new(py);
+    if let Some(value) = overrides.client_idle_timeout_secs {
+        dict.set_item("client_idle_timeout", value)?;
+    }
     if let Some(value) = overrides.write_timeout_secs {
         dict.set_item("write_timeout", value)?;
     }
@@ -312,8 +315,8 @@ pub(crate) fn client_ipc_overrides_to_dict<'py>(
     if let Some(value) = overrides.reassembly_max_segments {
         dict.set_item("reassembly_max_segments", value)?;
     }
-    if let Some(value) = overrides.max_total_chunks {
-        dict.set_item("max_total_chunks", value)?;
+    if let Some(value) = overrides.max_inflight_chunk_frames {
+        dict.set_item("max_inflight_chunk_frames", value)?;
     }
     if let Some(value) = overrides.chunk_gc_interval_secs {
         dict.set_item("chunk_gc_interval", value)?;
@@ -370,6 +373,7 @@ fn client_overrides(overrides: Option<&Bound<'_, PyAny>>) -> PyResult<ClientIpcC
     reject_forbidden_ipc_fields(&dict)?;
     reject_unknown_ipc_fields(&dict, c2_config::CLIENT_IPC_OVERRIDE_KEYS)?;
     Ok(ClientIpcConfigOverrides {
+        client_idle_timeout_secs: get_opt(&dict, "client_idle_timeout")?,
         write_timeout_secs: get_opt(&dict, "write_timeout")?,
         max_dedicated_segments: get_opt(&dict, "max_dedicated_segments")?,
         spill_threshold: get_opt(&dict, "spill_threshold")?,
@@ -380,7 +384,7 @@ fn client_overrides(overrides: Option<&Bound<'_, PyAny>>) -> PyResult<ClientIpcC
         pool_min_retained_segments: get_opt(&dict, "pool_min_retained_segments")?,
         reassembly_segment_size: get_opt(&dict, "reassembly_segment_size")?,
         reassembly_max_segments: get_opt(&dict, "reassembly_max_segments")?,
-        max_total_chunks: get_opt(&dict, "max_total_chunks")?,
+        max_inflight_chunk_frames: get_opt(&dict, "max_inflight_chunk_frames")?,
         chunk_gc_interval_secs: get_opt(&dict, "chunk_gc_interval")?,
         chunk_threshold_ratio: get_opt(&dict, "chunk_threshold_ratio")?,
         chunk_assembler_timeout_secs: get_opt(&dict, "chunk_assembler_timeout")?,
@@ -449,6 +453,7 @@ pub(crate) fn client_ipc_to_dict<'py>(
     cfg: &ClientIpcConfig,
 ) -> PyResult<Bound<'py, PyDict>> {
     let dict = base_ipc_to_dict(py, &cfg.base)?;
+    dict.set_item("client_idle_timeout", cfg.client_idle_timeout_secs)?;
     dict.set_item("shm_threshold", cfg.shm_threshold)?;
     dict.set_item("pool_decay_seconds", cfg.pool_decay_seconds)?;
     Ok(dict)
@@ -473,7 +478,7 @@ fn base_ipc_to_dict<'py>(
     dict.set_item("pool_min_retained_segments", cfg.pool_min_retained_segments)?;
     dict.set_item("reassembly_segment_size", cfg.reassembly_segment_size)?;
     dict.set_item("reassembly_max_segments", cfg.reassembly_max_segments)?;
-    dict.set_item("max_total_chunks", cfg.max_total_chunks)?;
+    dict.set_item("max_inflight_chunk_frames", cfg.max_inflight_chunk_frames)?;
     dict.set_item("chunk_gc_interval", cfg.chunk_gc_interval_secs)?;
     dict.set_item("chunk_threshold_ratio", cfg.chunk_threshold_ratio)?;
     dict.set_item("chunk_assembler_timeout", cfg.chunk_assembler_timeout_secs)?;

@@ -243,6 +243,33 @@ fn remote_read_guard_retains_the_os_stream_after_executor_shutdown() {
 }
 
 #[cfg(windows)]
+#[tokio::test]
+async fn verified_client_stream_pins_noninheritable_server_process() {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::{GetHandleInformation, HANDLE_FLAG_INHERIT};
+    use windows_sys::Win32::System::Threading::GetProcessId;
+
+    let (_fixture, client, _server) = isolated_pair().await;
+    let native = client.owner.stream.lock().unwrap();
+    let platform::Stream::Client {
+        pipe,
+        _server_process,
+    } = &*native
+    else {
+        panic!("client stream must retain the verified pipe and process");
+    };
+    assert_eq!(
+        unsafe { GetProcessId(_server_process.as_raw_handle()) },
+        std::process::id()
+    );
+    for handle in [pipe.as_raw_handle(), _server_process.as_raw_handle()] {
+        let mut flags = 0;
+        assert_ne!(unsafe { GetHandleInformation(handle, &mut flags) }, 0);
+        assert_eq!(flags & HANDLE_FLAG_INHERIT, 0);
+    }
+}
+
+#[cfg(windows)]
 #[test]
 fn remote_read_guard_retains_native_pipe_handles_after_executor_shutdown() {
     use windows_sys::Win32::Foundation::{GetHandleInformation, HANDLE};

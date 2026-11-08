@@ -21,7 +21,7 @@ On a main push, the selector first applies the changed-path rules. Policy-only c
 
 Workflow policy always runs the pinned, hash-checked actionlint binary and automatically discovers all `tests/repo/` tests. Python tools come from the locked `ci-policy` dependency group, which installs neither C-Two nor its runtime dependencies. The development group includes that same tool group. Source jobs and workflow policy run in parallel after scope selection. The protected check names remain `test (py3.12)` and `test (py3.14t)`. Their always-running aggregation requires successful scope selection, policy success and either successful source checks or an intentional scope decision to omit them. A failed scope decision cannot produce a green gate.
 
-Full source coverage includes Linux, macOS, Windows Server 2025 x64, Windows 11 ARM64 and free-threaded Python, including relay, cross-language and endpoint-cleanup checks. ARM64 uses native Rust, Python and Node consumers. A policy-only green run cannot supply release source evidence. To qualify a commit without retained full source evidence:
+Full source coverage includes Linux, macOS, Windows Server 2025 x64, Windows 11 ARM64 and free-threaded Python, including relay, cross-language and endpoint-cleanup checks. The Linux x64 full lane also builds a separate Python 3.10 environment and runs the ordinary Python suite with it (`python310-build` and `python310-suite`); the other lanes only check that the examples compile on Python 3.10. ARM64 uses native Rust, Python and Node consumers. A policy-only green run cannot supply release source evidence. To qualify a commit without retained full source evidence:
 
 ```bash
 gh workflow run ci.yml --ref main -F force_full=true
@@ -42,6 +42,8 @@ Validation commands share one 45-minute aggregate budget. Each child command is 
 ```bash
 gh workflow run ipc-memory-paired.yml --ref <branch> -f baseline_ref=<commit>
 ```
+
+After the pairing, the same job runs `tools/benchmarks/ipc_stream.py` on the candidate alone, because the baseline may have no server streams. It delivers the same content as one unary call, as a batch of unary calls and as one server stream, over 23 rows: the existing workload classes, forced file backing, the SHM threshold, the fragment length and an item four times its size, the payload buffer budget, empty items and FastDB arrays and mixed fields. It records first-item, per-item p50/p95/p99 and terminal latency, throughput, CPU and RSS on both sides and the budget snapshots, plus the tail latency of short unary calls on the same connection beside a large transfer. Copies are recorded as `null`, since no counter exists and the benchmark adds no product probe. Wrong content, item counts, terminal states or capacity outcomes fail the run; timing differences are only reported. Its evidence is uploaded as `ipc-stream-<os>-<sha>`.
 
 ## Build one release candidate
 

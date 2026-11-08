@@ -1,7 +1,7 @@
 use crate::{
     ArtifactKind, ArtifactProvenance, CodegenError, ContractArtifact, ContractCodegenTarget,
 };
-use c2_contract::{MethodAccess, ValidatedContractDescriptor};
+use c2_contract::{MethodAccess, MethodMode, ValidatedContractDescriptor};
 use serde_json::Value;
 use std::collections::BTreeSet;
 
@@ -11,6 +11,7 @@ pub(crate) struct TargetMethod<'a> {
     pub(crate) index: usize,
     pub(crate) name: &'a str,
     pub(crate) access: MethodAccess,
+    pub(crate) mode: MethodMode,
     pub(crate) input_sha256: Option<&'a str>,
     pub(crate) output_sha256: Option<&'a str>,
 }
@@ -40,6 +41,9 @@ pub(crate) fn render_target_artifacts(
 }
 
 fn render_rust(descriptor: &ValidatedContractDescriptor, methods: &[TargetMethod<'_>]) -> String {
+    let has_stream = methods
+        .iter()
+        .any(|method| method.mode == MethodMode::ServerStream);
     let mut output = String::from(
         "// generated-by: c-two.contract.codegen.v2\n\
          // payload-semantics-owner: fastdb-core\n\
@@ -138,6 +142,9 @@ impl<S: Service> ServiceAdapter<S> {
 "#,
     );
     for method in methods {
+        if method.mode == MethodMode::ServerStream {
+            continue;
+        }
         render_rust_service_dispatch_arm(&mut output, method);
     }
     output.push_str(
@@ -176,7 +183,13 @@ impl<S: Service> c_two::generated::EncodedService for ServiceAdapter<S> {
         }
     }
 }
-
+"#,
+    );
+    if has_stream {
+        render_rust_stream_service(&mut output, methods);
+    }
+    output.push_str(
+        r#"
 pub fn service_definition<S: Service>(
     route_name: impl Into<String>,
     service: S,
@@ -202,8 +215,15 @@ pub fn service_definition<S: Service>(
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
-    c_two::ServiceDefinition::new(
-        &release,
+"#,
+    );
+    output.push_str(if has_stream {
+        "    c_two::ServiceDefinition::new_stream(\n"
+    } else {
+        "    c_two::ServiceDefinition::new(\n"
+    });
+    output.push_str(
+        r#"        &release,
         release_ref,
         route_name,
         methods,
@@ -294,6 +314,10 @@ fn render_rust_contract_facts(
 }
 
 fn render_rust_client_method(output: &mut String, method: &TargetMethod<'_>) {
+    if method.mode == MethodMode::ServerStream {
+        render_rust_stream_client_method(output, method);
+        return;
+    }
     let symbol = method_symbol(method.index, method.name);
     let parameter = if method.input_sha256.is_some() {
         ", payload: &fastdb::Payload"
@@ -346,7 +370,160 @@ fn render_rust_client_method(output: &mut String, method: &TargetMethod<'_>) {
     }
 }
 
+fn render_rust_stream_client_method(output: &mut String, method: &TargetMethod<'_>) {
+    let symbol = method_symbol(method.index, method.name);
+    let parameter = if method.input_sha256.is_some() {
+        ", payload: &fastdb::Payload"
+    } else {
+        ""
+    };
+    let request = if method.input_sha256.is_some() {
+        format!("encode_{symbol}_input(payload)?")
+    } else {
+        format!("encode_{symbol}_input()")
+    };
+    let preparation = if method.input_sha256.is_some() {
+        "        c_two::generated::charge_payload_input(&mut call, payload)?;\n"
+    } else {
+        ""
+    };
+    let binding = if method.input_sha256.is_some() {
+        "mut call"
+    } else {
+        "call"
+    };
+    output.push_str(&format!(
+        "\n    pub fn {symbol}(&self{parameter}) -> Result<c_two::ResponseStream<fastdb::Payload>, c_two::Error> {{\n\
+         \x20       let {binding} = self.client.begin_stream({})?;\n\
+         {preparation}\
+         \x20       let request = {request};\n\
+         \x20       let stream = call.encode_vec(request)?.stream()?;\n\
+         \x20       Ok(c_two::ResponseStream::from_core(stream, |response| {{\n\
+         \x20           decode_{symbol}_output(response.bytes())\n\
+         \x20       }}))\n\
+         \x20   }}\n",
+        quoted(method.name),
+    ));
+    output.push_str(&format!(
+        "\n    pub fn hold_{symbol}(\n\
+         \x20       &self{parameter},\n\
+         \x20   ) -> Result<c_two::ResponseStream<c_two::Held<fastdb::Payload>>, c_two::Error> {{\n\
+         \x20       let {binding} = self.client.begin_stream({})?;\n\
+         {preparation}\
+         \x20       let request = {request};\n\
+         \x20       let stream = call.encode_vec(request)?.stream()?;\n\
+         \x20       Ok(c_two::ResponseStream::from_core(stream, decode_{symbol}_output_held))\n\
+         \x20   }}\n",
+        quoted(method.name),
+    ));
+}
+
+fn render_rust_stream_service(output: &mut String, methods: &[TargetMethod<'_>]) {
+    output.push_str(
+        r#"
+impl<S: Service> ServiceAdapter<S> {
+    fn open_stream_checked(
+        &self,
+        method_index: u16,
+        request: Vec<u8>,
+    ) -> Result<Box<dyn c_two::generated::EncodedStream>, c_two::generated::C2Error> {
+        match method_index {
+"#,
+    );
+    for method in methods
+        .iter()
+        .filter(|method| method.mode == MethodMode::ServerStream)
+    {
+        let symbol = method_symbol(method.index, method.name);
+        output.push_str(&format!("            {} => {{\n", method.index));
+        if method.input_sha256.is_some() {
+            output.push_str(&format!(
+                "                let input = decode_{symbol}_input_borrowed(&request)?;\n\
+                 \x20               let iterator = self.service.{symbol}(input.payload()).map_err(|error| {{\n\
+                 \x20                   c_two::generated::adapter_error(\n\
+                 \x20                       c_two::generated::AdapterFailurePhase::ResourceFunctionExecuting,\n\
+                 \x20                       error,\n\
+                 \x20                   )\n\
+                 \x20               }})?;\n\
+                 \x20               let input = Some(input);\n"
+            ));
+        } else {
+            output.push_str(&format!(
+                "                decode_{symbol}_input(&request)?;\n\
+                 \x20               let iterator = self.service.{symbol}().map_err(|error| {{\n\
+                 \x20                   c_two::generated::adapter_error(\n\
+                 \x20                       c_two::generated::AdapterFailurePhase::ResourceFunctionExecuting,\n\
+                 \x20                       error,\n\
+                 \x20                   )\n\
+                 \x20               }})?;\n\
+                 \x20               let input = None;\n"
+            ));
+        }
+        let digest = method
+            .output_sha256
+            .expect("stream payload output validated by contract");
+        output.push_str(&format!(
+            "                Ok(Box::new(c_two::generated::PayloadStream::new(\n\
+             \x20                   iterator, input, payload_{digest}::PAYLOAD_SHA256_BYTES, {}, {},\n\
+             \x20               )))\n\
+             \x20           }}\n",
+            quoted(method.name),
+            method.index,
+        ));
+    }
+    output.push_str(
+        r#"            other => Err(c_two::generated::C2Error::new(
+                c_two::generated::ErrorCode::ProtocolViolation,
+                format!("unknown generated stream method index {other}"),
+            )),
+        }
+    }
+}
+
+impl<S: Service> c_two::generated::EncodedStreamService for ServiceAdapter<S> {
+    fn open_stream(
+        &self,
+        method_index: u16,
+        request: Vec<u8>,
+    ) -> Result<Box<dyn c_two::generated::EncodedStream>, c_two::generated::C2Error> {
+        let method_name = METHODS
+            .get(usize::from(method_index))
+            .map(|method| method.name)
+            .unwrap_or("<unknown>");
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.open_stream_checked(method_index, request)
+        })) {
+            Ok(result) => result,
+            Err(_) => Err(c_two::generated::normalize_adapter_failure(
+                c_two::generated::AdapterFailurePhase::ResourceFunctionExecuting,
+                c_two::generated::AdapterFailure::Local {
+                    message: format!("service method {method_name:?} stream factory panicked"),
+                    details: std::collections::BTreeMap::from([
+                        ("method".to_string(), method_name.to_string()),
+                        ("method_index".to_string(), method_index.to_string()),
+                    ]),
+                },
+            )),
+        }
+    }
+}
+"#,
+    );
+}
+
 fn render_rust_service_trait_method(output: &mut String, method: &TargetMethod<'_>) {
+    if method.mode == MethodMode::ServerStream {
+        let symbol = method_symbol(method.index, method.name);
+        let parameter = if method.input_sha256.is_some() {
+            ", input: &fastdb::Payload"
+        } else {
+            ""
+        };
+        output.push_str(&format!(
+            "    fn {symbol}(&self{parameter}) -> Result<Box<dyn Iterator<Item = Result<fastdb::Payload, c_two::Error>> + Send>, c_two::Error>;\n"
+        ));
+        return;
+    }
     let symbol = method_symbol(method.index, method.name);
     let parameter = if method.input_sha256.is_some() {
         ", input: &fastdb::Payload"
@@ -473,7 +650,7 @@ fn render_rust_payload_adapters(output: &mut String, method: &TargetMethod<'_>) 
     }
 
     if let Some(digest) = method.output_sha256 {
-        output.push_str(&format!(
+        let rendered = format!(
             "pub fn decode_{symbol}_output(\n\
              \x20   bytes: &[u8],\n\
              ) -> Result<fastdb::Payload, c_two::Error> {{\n\
@@ -550,7 +727,18 @@ fn render_rust_payload_adapters(output: &mut String, method: &TargetMethod<'_>) 
              \x20       )\n\
              \x20   }})\n\
              }}\n\n"
-        ));
+        );
+        if method.mode == MethodMode::ServerStream {
+            let encoder = format!("fn encode_{symbol}_output(");
+            output.push_str(
+                rendered
+                    .split_once(&encoder)
+                    .expect("payload renderer has a unary output encoder")
+                    .0,
+            );
+        } else {
+            output.push_str(&rendered);
+        }
     } else {
         output.push_str(&format!(
             "pub fn decode_{symbol}_output(bytes: &[u8]) -> Result<(), c_two::Error> {{\n\
@@ -571,6 +759,9 @@ fn render_rust_payload_adapters(output: &mut String, method: &TargetMethod<'_>) 
 }
 
 fn render_python(descriptor: &ValidatedContractDescriptor, methods: &[TargetMethod<'_>]) -> String {
+    let has_stream = methods
+        .iter()
+        .any(|method| method.mode == MethodMode::ServerStream);
     let mut output = String::from(
         "# generated-by: c-two.contract.codegen.v2\n\
          # payload-semantics-owner: fastdb-core\n\
@@ -583,6 +774,9 @@ fn render_python(descriptor: &ValidatedContractDescriptor, methods: &[TargetMeth
          from typing import Any, Protocol\n\n\
          from fastdb4py.payload import Payload\n\n",
     );
+    if has_stream {
+        output.push_str("from c_two import HeldResult, Stream\n\n");
+    }
     output.push_str(&format!(
         "CONTRACT_SCHEMA = {}\n\
          CRM_NAMESPACE = {}\n\
@@ -606,12 +800,27 @@ fn render_python(descriptor: &ValidatedContractDescriptor, methods: &[TargetMeth
          \x20   name: str\n\
          \x20   access: str\n\
          \x20   input_sha256: str | None\n\
-         \x20   output_sha256: str | None\n\n\
-         METHODS = (\n",
+         \x20   output_sha256: str | None\n",
     );
+    if has_stream {
+        output.push_str("    mode: str\n");
+    }
+    output.push_str("\nMETHODS = (\n");
     for method in methods {
+        let mode = if has_stream {
+            format!(
+                ", {}",
+                quoted(if method.mode == MethodMode::ServerStream {
+                    "server_stream"
+                } else {
+                    "unary"
+                })
+            )
+        } else {
+            String::new()
+        };
         output.push_str(&format!(
-            "    MethodBinding({}, {}, {}, {}, {}),\n",
+            "    MethodBinding({}, {}, {}, {}, {}{mode}),\n",
             method.index,
             quoted(method.name),
             quoted(access_name(method.access)),
@@ -657,9 +866,16 @@ fn render_python(descriptor: &ValidatedContractDescriptor, methods: &[TargetMeth
     {
         output.push('\n');
     }
+    output.push_str("class BoundClient(Protocol):\n    def call(self, method_name: str, data: bytes) -> Any: ...\n");
+    if has_stream {
+        output.push_str(
+            "    @property\n    def local_copy_tracker(self) -> Any: ...\n\
+             \x20   @property\n    def route_name(self) -> str: ...\n\
+             \x20   def begin_stream(self, method_name: str) -> Any: ...\n",
+        );
+    }
     output.push_str(
-        "class BoundClient(Protocol):\n\
-         \x20   def call(self, method_name: str, data: bytes) -> Any: ...\n\n\
+        "\n\
          def _copy_and_release_response(response: Any) -> bytes:\n\
          \x20   try:\n\
          \x20       data = bytes(response)\n\
@@ -698,6 +914,10 @@ fn render_python(descriptor: &ValidatedContractDescriptor, methods: &[TargetMeth
 }
 
 fn render_python_client_method(output: &mut String, method: &TargetMethod<'_>) {
+    if method.mode == MethodMode::ServerStream {
+        render_python_stream_client_method(output, method);
+        return;
+    }
     let symbol = method_symbol(method.index, method.name);
     let parameter = if method.input_sha256.is_some() {
         ", payload: Payload"
@@ -721,6 +941,55 @@ fn render_python_client_method(output: &mut String, method: &TargetMethod<'_>) {
          \x20       return decode_{symbol}_output(_copy_and_release_response(response))\n",
         quoted(method.name),
     ));
+}
+
+fn render_python_stream_client_method(output: &mut String, method: &TargetMethod<'_>) {
+    let symbol = method_symbol(method.index, method.name);
+    let parameter = if method.input_sha256.is_some() {
+        ", payload: Payload"
+    } else {
+        ""
+    };
+    let request = if method.input_sha256.is_some() {
+        format!("encode_{symbol}_input(payload)")
+    } else {
+        format!("encode_{symbol}_input()")
+    };
+    for held in [false, true] {
+        let name = if held {
+            format!("hold_{symbol}")
+        } else {
+            symbol.clone()
+        };
+        let return_type = if held {
+            "Stream[HeldResult[Payload]]"
+        } else {
+            "Stream[Payload]"
+        };
+        let charge = if method.input_sha256.is_some() {
+            "            prepared.charge_input(payload.execution_report().used_bytes)\n"
+        } else {
+            ""
+        };
+        let invalidator = if held {
+            ", invalidator=Payload.invalidate"
+        } else {
+            ""
+        };
+        let held_literal = if held { "True" } else { "False" };
+        let method_name = quoted(method.name);
+        output.push_str(&format!(
+            "\n    def {name}(self{parameter}) -> {return_type}:\n\
+             \x20       prepared = self._bound_client.begin_stream({method_name})\n\
+             \x20       try:\n\
+             {charge}\
+             \x20           request = {request}\n\
+             \x20           native = prepared.stream(request)\n\
+             \x20           return Stream._from_encoded(native, decode_{symbol}_output, held={held_literal}{invalidator}, tracker=self._bound_client.local_copy_tracker, route_name=self._bound_client.route_name, method_name={method_name})\n\
+             \x20       finally:\n\
+             \x20           prepared.close()\n",
+        ));
+    }
 }
 
 fn render_python_direction(
@@ -843,30 +1112,47 @@ function normalizeFastDbPayloadError(error: unknown): unknown {
         "export interface MethodBinding {\n\
          \x20 readonly index: number;\n\
          \x20 readonly name: string;\n\
-         \x20 readonly access: 'read' | 'write';\n\
-         \x20 readonly inputSha256?: string;\n\
+         \x20 readonly access: 'read' | 'write';\n",
+    );
+    if methods
+        .iter()
+        .any(|method| method.mode == MethodMode::ServerStream)
+    {
+        output.push_str("  readonly mode?: 'server_stream';\n");
+    }
+    output.push_str(
+        "  readonly inputSha256?: string;\n\
          \x20 readonly outputSha256?: string;\n\
          }\n\n\
          export const METHODS: readonly MethodBinding[] = Object.freeze([\n",
     );
     for method in methods {
         output.push_str(&format!(
-            "  {{ index: {}, name: {}, access: {}{}{} }},\n",
+            "  {{ index: {}, name: {}, access: {}{}{}{} }},\n",
             method.index,
             quoted(method.name),
             quoted(access_name(method.access)),
+            if method.mode == MethodMode::ServerStream {
+                ", mode: 'server_stream'"
+            } else {
+                ""
+            },
             typescript_optional_field("inputSha256", method.input_sha256),
             typescript_optional_field("outputSha256", method.output_sha256),
         ));
     }
+    output.push_str("]);\n\nexport class ContractClient {\n  constructor(\n");
     output.push_str(
-        "]);\n\n\
-         export class ContractClient {\n\
-         \x20 constructor(\n\
-         \x20   private readonly transport: C2EncodedClientTransport,\n\
-         \x20   private readonly routeName: string,\n\
-         \x20 ) {}\n",
+        if methods
+            .iter()
+            .any(|method| method.mode == MethodMode::ServerStream)
+        {
+            "    private readonly transport: C2StreamEncodedClientTransport,\n"
+        } else {
+            "    private readonly transport: C2EncodedClientTransport,\n"
+        },
     );
+    output.push_str("    private readonly routeName: string,\n  ) {}\n");
     for method in methods {
         render_typescript_client_method(&mut output, method);
     }
@@ -941,11 +1227,23 @@ fn render_typescript_client_method(output: &mut String, method: &TargetMethod<'_
     } else {
         format!("encode_{symbol}_input()")
     };
+    if method.mode == MethodMode::ServerStream {
+        output.push_str(&format!(
+            "\n  {symbol}({parameter}): C2ResponseStream<Payload> {{\n\
+             \x20   return this.transport.stream(this.routeName, CONTRACT, {}, () => {request}, decode_{symbol}_output);\n\
+             \x20 }}\n\n\
+             \x20 hold_{symbol}({parameter}): C2ResponseStream<C2HeldResult<Payload>> {{\n\
+             \x20   return this.transport.stream(this.routeName, CONTRACT, {}, () => {request}, decode_{symbol}_output, true);\n\
+             \x20 }}\n",
+            quoted(method.name),
+            quoted(method.name),
+        ));
+        return;
+    }
     output.push_str(&format!(
         "\n  async {symbol}({parameter}): Promise<{return_type}> {{\n\
-         \x20   const request = {request};\n\
          \x20   const response = requireResponsePayload(\n\
-         \x20     await this.transport.call(this.routeName, CONTRACT, {}, request),\n\
+         \x20     await this.transport.call(this.routeName, CONTRACT, {}, () => {request}),\n\
          \x20     \"encoded transport response\",\n\
          \x20   );\n\
          \x20   return decodeAndReleaseResponse(response, decode_{symbol}_output);\n\
@@ -955,9 +1253,8 @@ fn render_typescript_client_method(output: &mut String, method: &TargetMethod<'_
     if method.output_sha256.is_some() {
         output.push_str(&format!(
             "\n  async hold_{symbol}({parameter}): Promise<C2HeldResult<{return_type}>> {{\n\
-             \x20   const request = {request};\n\
              \x20   const response = requireResponsePayload(\n\
-             \x20     await this.transport.call(this.routeName, CONTRACT, {}, request),\n\
+             \x20     await this.transport.call(this.routeName, CONTRACT, {}, () => {request}),\n\
              \x20     \"encoded transport response\",\n\
              \x20   );\n\
              \x20   try {{\n\

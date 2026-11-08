@@ -239,6 +239,29 @@ class CRMProxy:
         """Project one reserved native call into the transfer interface."""
         return _PreparedClient(self.begin_call(method_name))
 
+    def begin_stream(self, method_name: str):
+        """Reserve the native stream call before encoding its input."""
+        with self._close_lock:
+            if self._closed:
+                raise RuntimeError('Proxy is closed')
+        return _native_call(self._client.begin_stream, method_name)
+
+    def open_direct_stream(self, method_name: str, args: tuple):
+        from ..._native import NativeCallOptions
+        from ...crm.stream import _ResourceStream
+        with self._close_lock:
+            if self._closed:
+                raise RuntimeError('Proxy is closed')
+        _native_call((self._call_options or NativeCallOptions()).validate_thread)
+        if self._scheduler is None:
+            raise RuntimeError('same-process streams require a registered native route')
+        method = getattr(self._crm, method_name)
+        return _native_call(
+            self._scheduler.open_stream,
+            self._scheduler.method_idx(method_name),
+            lambda: _ResourceStream(method, args=args, encoded=False),
+        )
+
     def call(self, method_name: str, data: bytes | bytearray | memoryview | None = None) -> bytes:
         """Send a serialized CRM call (IPC or HTTP mode).
 

@@ -9,12 +9,14 @@
 mod error;
 mod held;
 mod payload;
+mod stream;
 
 pub mod contract;
 pub mod endpoint;
 pub mod observe;
 
 pub use c2_contract::ContractRelease;
+pub use c2_core::CoreStreamCloseReceipt as StreamCloseReceipt;
 pub use c2_core::{
     CallExecutionLimits, CallExecutionLimitsOverrides, CallOptions, CallTimeout, Client,
     ConfigSources, Connect, ConnectOptions, EnvFilePolicy, EnvMap, Host, HostOptions,
@@ -24,6 +26,7 @@ pub use c2_core::{
 };
 pub use error::Error;
 pub use held::Held;
+pub use stream::ResponseStream;
 
 /// Stable implementation seam consumed by C-Two generated Rust modules.
 ///
@@ -35,14 +38,16 @@ pub mod generated {
     pub use c2_contract::MethodAccess;
     pub use c2_core::{
         AdapterFailure, AdapterFailurePhase, EncodedCall, EncodedClient, EncodedService,
-        ExternalCause, HeldResponse, MethodDefinition, PreparedCall, ServiceDefinition,
-        external_cause_details, normalize_adapter_failure,
+        EncodedStream, EncodedStreamItem, EncodedStreamService, ExternalCause, HeldResponse,
+        MethodDefinition, PreparedCall, ServiceDefinition, external_cause_details,
+        normalize_adapter_failure,
     };
     pub use c2_error::{C2Error, ErrorCode};
 
     pub use crate::error::{adapter_error, fastdb_adapter_error, fastdb_cause_details};
     pub use crate::held::release_held_after_error;
     pub use crate::payload::{
-        BorrowedPayload, charge_payload_input, open_borrowed, open_held, open_owned,
+        BorrowedPayload, PayloadStream, charge_payload_input, open_borrowed, open_held, open_owned,
     };
+    pub use c2_core::CoreResponseStream;
 }

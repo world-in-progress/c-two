@@ -1,11 +1,11 @@
-//! IPC 15 release records. Shape, direction and phase are checked at admission.
+//! IPC 16 release records. Shape, direction and phase are checked at admission.
 
 use c2_config::IPC_RELEASE_BATCH_CAPACITY;
 
-use crate::control::EncodeError;
-use crate::flags::{FLAG_CTRL, FLAG_RESPONSE};
+use crate::flags::{FLAG_RESPONSE, FLAG_RPC_RECORD};
 use crate::frame::{DecodeError, FrameHeader};
-use crate::msg_type::MsgType;
+use crate::rpc::EncodeError;
+use crate::rpc::RpcRecordKind;
 
 /// One nonempty, bounded release payload. IDs are settled in order by the
 /// connection core; a malformed ID must not undo preceding settlements.
@@ -54,8 +54,10 @@ pub fn encode_release_frame(batch: &ReleaseBatch, response: bool) -> Vec<u8> {
 pub(crate) fn append_release_frame(bytes: &mut Vec<u8>, ids: &[u64], response: bool) {
     bytes.extend_from_slice(&(14 + 8 * ids.len() as u32).to_le_bytes());
     bytes.extend_from_slice(&0u64.to_le_bytes());
-    bytes.extend_from_slice(&(FLAG_CTRL | if response { FLAG_RESPONSE } else { 0 }).to_le_bytes());
-    bytes.extend_from_slice(&[MsgType::Release.as_byte(), ids.len() as u8]);
+    bytes.extend_from_slice(
+        &(FLAG_RPC_RECORD | if response { FLAG_RESPONSE } else { 0 }).to_le_bytes(),
+    );
+    bytes.extend_from_slice(&[RpcRecordKind::Release as u8, ids.len() as u8]);
     for id in ids {
         bytes.extend_from_slice(&id.to_le_bytes());
     }
@@ -81,7 +83,7 @@ pub fn decode_release_frame(
             value: header.request_id,
         });
     }
-    let expected_flags = FLAG_CTRL | if response { FLAG_RESPONSE } else { 0 };
+    let expected_flags = FLAG_RPC_RECORD | if response { FLAG_RESPONSE } else { 0 };
     if header.flags != expected_flags {
         return Err(DecodeError::InvalidValue {
             field: "release flags",
@@ -94,7 +96,7 @@ pub fn decode_release_frame(
             have: payload.len(),
         });
     }
-    if payload[0] != MsgType::Release.as_byte() {
+    if payload[0] != RpcRecordKind::Release as u8 {
         return Err(DecodeError::InvalidValue {
             field: "release type",
             value: payload[0].into(),
@@ -137,7 +139,7 @@ mod tests {
         assert_eq!(
             bytes,
             [
-                22, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 16, 0, 0, 0, 0x17, 1, 1, 2, 3, 4, 5, 6, 7, 8
+                22, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 16, 0, 0, 7, 1, 1, 2, 3, 4, 5, 6, 7, 8
             ]
         );
         let ids: Vec<_> = (1..=64).collect();
@@ -160,7 +162,11 @@ mod tests {
         let (header, payload) = decode_frame(&bytes).unwrap();
         assert!(decode_release_frame(&header, payload, false, false).is_err());
         assert!(decode_release_frame(&header, payload, true, true).is_err());
-        for flags in [0, FLAG_CTRL | FLAG_HANDSHAKE, FLAG_CTRL | FLAG_BUDDY] {
+        for flags in [
+            0,
+            FLAG_RPC_RECORD | FLAG_HANDSHAKE,
+            FLAG_RPC_RECORD | FLAG_BUDDY,
+        ] {
             assert!(
                 decode_release_frame(&FrameHeader { flags, ..header }, payload, false, true)
                     .is_err()

@@ -182,13 +182,16 @@ dependencies = [
  "c2-server",
  "c2-wire",
  "futures",
+ "getrandom 0.4.3",
  "hex",
+ "http-body",
  "parking_lot",
  "percent-encoding",
  "reqwest",
  "serde",
  "serde_json",
  "sha2",
+ "tempfile",
  "thiserror",
  "tokio",
  "tokio-util",
@@ -260,10 +263,14 @@ name = "c2-mem-ffi"
 version = "0.1.0"
 dependencies = [
  "c2-config",
- "c2-local",
- "c2-mem",
- "c2-wire",
+ "c2-contract",
+ "c2-core",
+ "c2-error",
+ "c2-ipc",
+ "futures-util",
  "parking_lot",
+ "serde_json",
+ "tempfile",
  "tokio",
 ]
 
@@ -1141,9 +1148,9 @@ checksum = "94300abf3f1ae2e2b8ffb7b58043de3d399c73fa6f4b73826402a5c457614dbe"
 
 [[package]]
 name = "rustix"
-version = "1.1.5"
+version = "1.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "891efababe418670775f199f0d233d84843c227a0949a883ce15b37c78d6629d"
+checksum = "e5e76742e5294153d4dde1207dbec5bdd81eef6fabdc0d2118babadabfd858aa"
 dependencies = [
  "bitflags",
  "errno",

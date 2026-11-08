@@ -6,7 +6,7 @@ use c2_local::{
     AbortHandle, ConnectionEndReason, ConnectionPublisher, LocalReadHalf, LocalWriteHalf,
     RemoteReadGuard,
 };
-use c2_mem::MemPool;
+use c2_mem::{MemPool, retention::PayloadBufferReservation};
 use c2_wire::{
     chunk::ChunkRegistry,
     connection::{
@@ -32,19 +32,30 @@ type Receipt = oneshot::Sender<Result<(), IpcError>>;
 pub(crate) struct SendState {
     started: bool,
     cancelled: bool,
+    request_id: Option<u64>,
+    upload_failed: bool,
 }
 impl SendState {
+    pub(crate) fn request_id(&self) -> Option<u64> {
+        self.request_id
+    }
     pub fn started(&self) -> bool {
         self.started
     }
+    pub(crate) fn fail_upload(&mut self) {
+        self.upload_failed = true;
+    }
     pub fn cancel(&mut self) -> bool {
         self.cancelled = true;
-        !self.started
+        !self.started || self.upload_failed
     }
 }
 
 struct Submission {
     bytes: Vec<u8>,
+    // The queue and writer own the actual frame even when its submit waiter
+    // ends before publication. Keep its payload charge with those bytes.
+    _payload_owner: Option<Arc<PayloadBufferReservation>>,
     request: Arc<Mutex<Option<WriteRequest>>>,
     state: Arc<Mutex<SendState>>,
     policy: Option<IpcCallControl>,
@@ -186,6 +197,8 @@ pub(crate) struct ClientConnection {
     pub publisher: ConnectionPublisher,
     end: Arc<EndState>,
     pending: Arc<Mutex<PendingMap>>,
+    pub(crate) sequence: std::sync::atomic::AtomicU64,
+    stream_control_cursor: std::sync::atomic::AtomicU64,
     queue: mpsc::Sender<Submission>,
     abort: AbortHandle,
     read_stopped: AtomicBool,
@@ -199,7 +212,79 @@ pub(crate) struct ClientConnection {
     #[cfg(any(test, feature = "test-support"))]
     pub prefix_pause: Mutex<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>,
 }
+enum StreamControl {
+    Complete(Arc<crate::client::stream::StreamReceive>),
+    Forward(Arc<crate::client::forward::ForwardReceive>),
+}
+
+impl StreamControl {
+    fn has_control(&self) -> bool {
+        match self {
+            Self::Complete(s) => s.has_control(),
+            Self::Forward(s) => s.has_control(),
+        }
+    }
+    fn take_control(&self) -> Option<Vec<u8>> {
+        match self {
+            Self::Complete(s) => s.take_control(),
+            Self::Forward(s) => s.take_control(),
+        }
+    }
+    fn transport_failed(&self, error: IpcError) {
+        match self {
+            Self::Complete(s) => s.transport_failed(error),
+            Self::Forward(s) => s.transport_failed(error),
+        }
+    }
+}
+
 impl ClientConnection {
+    fn take_stream_control(&self) -> Option<Submission> {
+        // Each active call owns one coalesced control slot. The reader only
+        // updates that slot; it never queues an unbounded task or waits here.
+        let cursor = self.stream_control_cursor.load(Ordering::Relaxed);
+        let next = self
+            .pending
+            .lock()
+            .active
+            .iter()
+            .filter_map(|(&id, call)| {
+                let stream = call
+                    .stream
+                    .as_ref()
+                    .map(|stream| StreamControl::Complete(stream.clone()))
+                    .or_else(|| {
+                        call.forward
+                            .as_ref()
+                            .map(|forward| StreamControl::Forward(forward.clone()))
+                    })?;
+                stream
+                    .has_control()
+                    .then(|| ((id <= cursor, id), stream, call.state.clone()))
+            })
+            .min_by_key(|entry| entry.0);
+        if let Some(((_, id), stream, state)) = next {
+            self.stream_control_cursor.store(id, Ordering::Relaxed);
+            if let Some(bytes) = stream.take_control() {
+                let frame = match self.core.prepare_call_record() {
+                    Ok(frame) => frame,
+                    Err(error) => {
+                        stream.transport_failed(core_error(error));
+                        return None;
+                    }
+                };
+                return Some(Submission {
+                    bytes,
+                    _payload_owner: None,
+                    request: Arc::new(Mutex::new(Some(WriteRequest::CallContinuation(frame)))),
+                    state,
+                    policy: None,
+                    reply: None,
+                });
+            }
+        }
+        None
+    }
     pub fn spawn(
         stream: LocalWriteHalf,
         pending: Arc<Mutex<PendingMap>>,
@@ -222,6 +307,8 @@ impl ClientConnection {
             publisher: retirement.end.publisher.clone(),
             end: retirement.end.clone(),
             pending,
+            sequence: std::sync::atomic::AtomicU64::new(0),
+            stream_control_cursor: std::sync::atomic::AtomicU64::new(0),
             queue,
             abort,
             read_stopped: AtomicBool::new(false),
@@ -250,15 +337,11 @@ impl ClientConnection {
         // A queued future need not be polled again to stop retaining a pending
         // entry. Sent waiters remain until their own reply or a framing failure.
         let mut pending = self.pending.lock();
-        for (_, entry) in pending.extract_if(|_, entry| {
-            // The writer holds this lock while publication linearizes. It
-            // may itself report a preparation failure here, so never wait on
-            // that lock; its own receipt resolves the in-progress submission.
-            entry.state.try_lock().is_some_and(|state| !state.started())
-        }) {
+        let unpublished = std::mem::take(&mut pending.queued);
+        drop(pending);
+        for entry in unpublished {
             entry.complete(Err(IpcError::Closed));
         }
-        drop(pending);
         self.deactivated.send_replace(true);
     }
     /// Stop admission and drain sent calls and loans before physical close.
@@ -308,6 +391,32 @@ impl ClientConnection {
     /// Readable framing preserves every other call's outcome, including while
     /// admission is stopped for a release violation or local bookkeeping error.
     pub fn response_failed(&self, rid: u64, error: IpcError) {
+        let stream = self
+            .pending
+            .lock()
+            .get(&rid)
+            .and_then(|entry| entry.stream.clone());
+        if let Some(stream) = stream {
+            stream.fail_response(error);
+            self.wake.notify_one();
+            return;
+        }
+        let forward = self
+            .pending
+            .lock()
+            .get(&rid)
+            .and_then(|entry| entry.forward.clone());
+        if let Some(forward) = forward {
+            forward.fail_response(error);
+            self.wake.notify_one();
+            return;
+        }
+        self.terminal_response_failed(rid, error);
+    }
+
+    /// An invalid but fully framed terminal record ends this call's local
+    /// observation. Waiting for another CALL_END would retain it forever.
+    pub(crate) fn terminal_response_failed(&self, rid: u64, error: IpcError) {
         let target = self.pending.lock().remove(&rid);
         if let Some(entry) = target {
             entry.complete(Err(error.response_failure()));
@@ -320,7 +429,7 @@ impl ClientConnection {
     }
     fn fail_pending(&self) {
         let pending = std::mem::take(&mut *self.pending.lock());
-        for (_, entry) in pending {
+        for entry in pending.active.into_values().chain(pending.queued) {
             entry.complete(Err(IpcError::Closed));
         }
     }
@@ -393,7 +502,6 @@ impl ClientConnection {
                     biased;
                     changed = stop.changed() => { if changed.is_err() || *stop.borrow() { break; } }
                     _ = tick.tick() => {
-                        driver.registry.try_gc_sweep();
                         if let Some(mut pool) = driver.pool.try_write() { pool.gc_buddy(); }
                         if let Some(mut pool) = driver.registry.pool().try_write() { pool.gc_buddy(); }
                         if let Some(peer) = driver.peer.try_read() {
@@ -410,6 +518,30 @@ impl ClientConnection {
         request: WriteRequest,
         state: Arc<Mutex<SendState>>,
         policy: Option<IpcCallControl>,
+    ) -> Result<(), IpcError> {
+        self.submit_with_owner(bytes, request, state, policy, None)
+            .await
+    }
+
+    pub(crate) async fn submit_owned(
+        self: &Arc<Self>,
+        bytes: Vec<u8>,
+        request: WriteRequest,
+        state: Arc<Mutex<SendState>>,
+        policy: Option<IpcCallControl>,
+        payload_owner: Arc<PayloadBufferReservation>,
+    ) -> Result<(), IpcError> {
+        self.submit_with_owner(bytes, request, state, policy, Some(payload_owner))
+            .await
+    }
+
+    async fn submit_with_owner(
+        self: &Arc<Self>,
+        bytes: Vec<u8>,
+        request: WriteRequest,
+        state: Arc<Mutex<SendState>>,
+        policy: Option<IpcCallControl>,
+        payload_owner: Option<Arc<PayloadBufferReservation>>,
     ) -> Result<(), IpcError> {
         // Subscribe before waiting for queue capacity. Deactivation must wake
         // unpublished calls even while the writer and all 64 queue slots stall.
@@ -434,6 +566,7 @@ impl ClientConnection {
         }
         permit.send(Submission {
             bytes,
+            _payload_owner: payload_owner,
             request,
             state: state.clone(),
             policy,
@@ -498,6 +631,10 @@ fn run(
             if conn.close_ready() || conn.read_stopped.load(Ordering::Acquire) {
                 break;
             }
+            if let Some(submission) = conn.take_stream_control() {
+                process(stream, &conn, submission).await;
+                continue;
+            }
             if let Some(control) = conn.take_disconnect() {
                 if let Ok(Some(batch)) = conn.core.begin_write(WriteRequest::Control(control)) {
                     let frame = driver
@@ -560,6 +697,50 @@ async fn process(stream: &mut LocalWriteHalf, conn: &ClientConnection, mut submi
                         .begin_write(request)
                         .map_err(core_error)?
                         .expect("one submitted frame");
+                    // This unique writer owns the first-submission sequence.
+                    // Publish the receiver before any byte can reach the peer.
+                    let rid = match state.request_id {
+                        Some(rid) => rid,
+                        None => {
+                            let previous = match conn.sequence.try_update(
+                                Ordering::Relaxed,
+                                Ordering::Relaxed,
+                                |n| n.checked_add(1),
+                            ) {
+                                Ok(previous) => previous,
+                                Err(_) => {
+                                    conn.end(
+                                        ConnectionEndReason::ProtocolError,
+                                        "request_id_exhausted",
+                                    );
+                                    return Err(IpcError::Protocol(
+                                        "request ID space exhausted".into(),
+                                    ));
+                                }
+                            };
+                            let rid = previous + 1;
+                            conn.pending.lock().publish(&submission.state, rid)?;
+                            state.request_id = Some(rid);
+                            let receiver = conn
+                                .pending
+                                .lock()
+                                .get(&rid)
+                                .and_then(|call| call.stream.clone());
+                            if let Some(receiver) = receiver {
+                                receiver.publish(rid)?;
+                            }
+                            let forward = conn
+                                .pending
+                                .lock()
+                                .get(&rid)
+                                .and_then(|call| call.forward.clone());
+                            if let Some(forward) = forward {
+                                forward.publish(rid)?;
+                            }
+                            rid
+                        }
+                    };
+                    submission.bytes[4..12].copy_from_slice(&rid.to_le_bytes());
                     let batch = prepare(batch, submission.bytes, conn)?;
                     state.started = true;
                     Ok(batch)
@@ -594,6 +775,7 @@ async fn process(stream: &mut LocalWriteHalf, conn: &ClientConnection, mut submi
 
 struct PreparedWrite {
     batch: WriteBatch,
+    prefix: Vec<u8>,
     bytes: Vec<u8>,
     #[cfg(any(test, feature = "test-support"))]
     frame_start: usize,
@@ -606,29 +788,18 @@ fn prepare(
     frame: Vec<u8>,
     conn: &ClientConnection,
 ) -> Result<PreparedWrite, IpcError> {
-    let prefix = batch.release_bytes();
+    let prefix = batch.release_bytes().to_vec();
     #[cfg(any(test, feature = "test-support"))]
     let frame_start = prefix.len();
-    let bytes = if prefix.is_empty() {
-        frame
-    } else {
-        let length = prefix.len().checked_add(frame.len()).ok_or_else(|| {
-            conn.end(ConnectionEndReason::ProtocolError, "write_capacity");
-            IpcError::Protocol("write length overflow".into())
-        })?;
-        let mut bytes = Vec::new();
-        bytes.try_reserve_exact(length).map_err(|error| {
-            conn.end(ConnectionEndReason::ProtocolError, "write_capacity");
-            IpcError::Io(io::Error::new(io::ErrorKind::OutOfMemory, error))
-        })?;
-        bytes.extend_from_slice(prefix);
-        bytes.extend_from_slice(&frame);
-        bytes
-    };
+    prefix.len().checked_add(frame.len()).ok_or_else(|| {
+        conn.end(ConnectionEndReason::ProtocolError, "write_capacity");
+        IpcError::Protocol("write length overflow".into())
+    })?;
     batch.begin_io().map_err(core_error)?;
     Ok(PreparedWrite {
         batch,
-        bytes,
+        prefix,
+        bytes: frame,
         #[cfg(any(test, feature = "test-support"))]
         frame_start,
         #[cfg(any(test, feature = "test-support"))]
@@ -645,16 +816,31 @@ async fn write_batch<W: AsyncWrite + Unpin>(
     let deadline = tokio::time::Instant::now() + conn.write_timeout;
     let mut timed_out = false;
     let mut written = 0;
-    let mut boundary = 4 + u32::from_le_bytes(write.bytes[..4].try_into().unwrap()) as usize;
-    while written < write.bytes.len() {
-        let limit = write.bytes.len();
+    let total_len = write.prefix.len() + write.bytes.len();
+    let frame_length_at = |offset: usize| -> usize {
+        let bytes = if offset < write.prefix.len() {
+            &write.prefix[offset..offset + 4]
+        } else {
+            let offset = offset - write.prefix.len();
+            &write.bytes[offset..offset + 4]
+        };
+        4 + u32::from_le_bytes(bytes.try_into().unwrap()) as usize
+    };
+    let mut boundary = frame_length_at(0);
+    while written < total_len {
+        let limit = total_len;
         #[cfg(any(test, feature = "test-support"))]
         let limit = if write.prefix_pause.is_some() {
             write.frame_start + 8
         } else {
             limit
         };
-        let mut operation = Box::pin(AsyncWriteExt::write(stream, &write.bytes[written..limit]));
+        let chunk = if written < write.prefix.len() {
+            &write.prefix[written..limit.min(write.prefix.len())]
+        } else {
+            &write.bytes[written - write.prefix.len()..limit - write.prefix.len()]
+        };
+        let mut operation = Box::pin(AsyncWriteExt::write(stream, chunk));
         let result = if timed_out {
             operation.await
         } else {
@@ -682,12 +868,10 @@ async fn write_batch<W: AsyncWrite + Unpin>(
         }
         while boundary <= written {
             write.batch.frame_completed();
-            if boundary == write.bytes.len() {
+            if boundary == total_len {
                 break;
             }
-            boundary +=
-                4 + u32::from_le_bytes(write.bytes[boundary..boundary + 4].try_into().unwrap())
-                    as usize;
+            boundary += frame_length_at(boundary);
         }
         #[cfg(any(test, feature = "test-support"))]
         if written == write.frame_start + 8 {

@@ -1,4 +1,4 @@
-//! Independent fixed IPC15 records; deliberately no c2-wire or metadata codec.
+//! Independent fixed IPC16 records; deliberately no c2-wire or metadata codec.
 use c2_local::{EndpointReapResult, LocalEndpointContext, LocalListener};
 use std::{
     io::{self, Write},
@@ -7,7 +7,7 @@ use std::{
 };
 use tokio::io::AsyncReadExt;
 
-const HELLO15: &[u8; 25] = b"\x15\0\0\0\0\0\0\0\0\0\0\0\x04\0\0\0C2IP\x01\x0f\0\0\0";
+const HELLO16: &[u8; 25] = b"\x15\0\0\0\0\0\0\0\0\0\0\0\x04\0\0\0C2IP\x01\x10\0\0\0";
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> io::Result<()> {
@@ -19,14 +19,14 @@ async fn main() -> io::Result<()> {
     };
     let endpoint = context.endpoint(&args[1])?;
     let reply: &[u8; 25] = match args[3].as_str() {
-        "mismatch16" => b"\x15\0\0\0\0\0\0\0\0\0\0\0\x06\0\0\0C2IP\x03\x10\0\0\0",
+        "mismatch17" => b"\x15\0\0\0\0\0\0\0\0\0\0\0\x06\0\0\0C2IP\x03\x11\0\0\0",
         "mismatch14" => b"\x15\0\0\0\0\0\0\0\0\0\0\0\x06\0\0\0C2IP\x03\x0e\0\0\0",
         "mismatch13" => b"\x15\0\0\0\0\0\0\0\0\0\0\0\x06\0\0\0C2IP\x03\x0d\0\0\0",
         "mismatch-max" => b"\x15\0\0\0\0\0\0\0\0\0\0\0\x06\0\0\0C2IP\x03\xff\xff\xff\xff",
-        "bad-magic" => b"\x15\0\0\0\0\0\0\0\0\0\0\0\x06\0\0\0C2IQ\x03\x0f\0\0\0",
-        "accepted16" => b"\x15\0\0\0\0\0\0\0\0\0\0\0\x06\0\0\0C2IP\x02\x10\0\0\0",
+        "bad-magic" => b"\x15\0\0\0\0\0\0\0\0\0\0\0\x06\0\0\0C2IQ\x03\x10\0\0\0",
+        "accepted15" => b"\x15\0\0\0\0\0\0\0\0\0\0\0\x06\0\0\0C2IP\x02\x0f\0\0\0",
         "mismatch15" => b"\x15\0\0\0\0\0\0\0\0\0\0\0\x06\0\0\0C2IP\x03\x0f\0\0\0",
-        "probe" => HELLO15, // Bind/close only: parent checks native lease release after exit.
+        "probe" => HELLO16, // Bind/close only: parent checks native lease release after exit.
         _ => return Err(io::Error::other("unknown fixed reply")),
     };
     let mut listener = LocalListener::bind(&endpoint)?;
@@ -42,8 +42,8 @@ async fn main() -> io::Result<()> {
         connections += 1;
         let mut hello = [0; 25];
         stream.read_exact(&mut hello).await?;
-        if &hello != HELLO15 {
-            return Err(io::Error::other("not the golden Hello15"));
+        if &hello != HELLO16 {
+            return Err(io::Error::other("not the golden Hello16"));
         }
         // The SDK asserts complete receipt; this peer retains the stream until EOF.
         // Avoid LocalStream's additional flush probe racing the client's close.

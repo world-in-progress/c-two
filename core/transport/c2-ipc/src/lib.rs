@@ -25,6 +25,8 @@ pub mod sync_client;
 mod tests;
 
 pub use c2_local::{ConnectionClosed, ConnectionEndReason, ConnectionObservation};
+pub use client::forward::{ForwardRecord, IpcForwardCancellation, IpcForwardStream};
+pub use client::stream::{IpcResponseStream, IpcStreamCancellation, StreamTerminal};
 pub use client::{
     ClientIpcConfig, IpcCallControl, IpcClient, IpcError, MethodTable, RouteBinding,
     ServerPoolState,
@@ -34,7 +36,7 @@ pub use control::{
     ping_with_endpoint, shutdown, shutdown_with_context, shutdown_with_endpoint,
 };
 pub use pool::{ClientCacheMemorySnapshot, ClientPool};
-pub use response::{ResponseData, ServerShmResponse};
+pub use response::{ResponseCursor, ResponseData, ServerShmResponse};
 #[doc(hidden)]
 pub use sync_client::shared_io_handle;
 pub use sync_client::{IpcCallError, SyncClient, TransportPhase};
