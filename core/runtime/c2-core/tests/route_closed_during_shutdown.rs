@@ -38,14 +38,9 @@ fn unique_name(prefix: &str) -> String {
 }
 
 fn relay(context: c2_config::LocalEndpointContext) -> (RelayServer, String) {
-    let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve relay port");
-    let address = probe.local_addr().expect("relay address");
-    drop(probe);
-    let url = format!("http://{address}");
     let relay = RelayServer::start_with_context(
         RelayConfig {
-            bind: address.to_string(),
-            advertise_url: url.clone(),
+            bind: "127.0.0.1:0".into(),
             idle_timeout_secs: 0,
             anti_entropy_interval: Duration::ZERO,
             heartbeat_interval: Duration::ZERO,
@@ -54,6 +49,7 @@ fn relay(context: c2_config::LocalEndpointContext) -> (RelayServer, String) {
         context,
     )
     .expect("relay starts");
+    let url = format!("http://{}", relay.local_addr());
     (relay, url)
 }
 

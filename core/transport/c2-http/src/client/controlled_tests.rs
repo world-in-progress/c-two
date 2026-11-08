@@ -398,19 +398,12 @@ async fn live_relay_reregistration_larger_limit_preserves_old_client_unary_and_s
     let (old_server, old_task) = live_follow_server(&context, &descriptor, &old_id, 4).await;
     let (new_server, new_task) = live_follow_server(&context, &descriptor, &new_id, 32).await;
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let bind = listener.local_addr().unwrap().to_string();
-    drop(listener);
-    let url = format!("http://{bind}");
     let relay = tokio::task::spawn_blocking({
         let context = context.clone();
-        let bind = bind.clone();
-        let url = url.clone();
         move || {
             crate::relay::RelayServer::start_with_context(
                 c2_config::RelayConfig {
-                    bind,
-                    advertise_url: url,
+                    bind: "127.0.0.1:0".into(),
                     idle_timeout_secs: 0,
                     ..c2_config::RelayConfig::default()
                 },
@@ -421,6 +414,7 @@ async fn live_relay_reregistration_larger_limit_preserves_old_client_unary_and_s
     })
     .await
     .unwrap();
+    let url = format!("http://{}", relay.local_addr());
     let relay = Arc::new(Mutex::new(relay));
     tokio::task::spawn_blocking({
         let relay = relay.clone();

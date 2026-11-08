@@ -567,14 +567,9 @@ impl Fixture {
             )
             .unwrap();
         let relay = if use_relay {
-            let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            let address = probe.local_addr().unwrap();
-            drop(probe);
-            let url = format!("http://{address}");
             let relay = RelayServer::start_with_context(
                 RelayConfig {
-                    bind: address.to_string(),
-                    advertise_url: url.clone(),
+                    bind: "127.0.0.1:0".into(),
                     idle_timeout_secs: 0,
                     anti_entropy_interval: Duration::ZERO,
                     heartbeat_interval: Duration::ZERO,
@@ -583,7 +578,7 @@ impl Fixture {
                 server.local_endpoint_context().unwrap(),
             )
             .unwrap();
-            server.set_relay_anchor_address(Some(url));
+            server.set_relay_anchor_address(Some(format!("http://{}", relay.local_addr())));
             Some(relay)
         } else {
             None

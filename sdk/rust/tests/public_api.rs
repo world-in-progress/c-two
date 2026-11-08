@@ -1,5 +1,4 @@
 use std::collections::BTreeMap;
-use std::net::TcpListener;
 use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
@@ -202,31 +201,19 @@ fn definition(route_name: &str) -> ServiceDefinition {
 }
 
 fn relay() -> (RelayServer, String) {
-    let mut attempt = 0;
-    loop {
-        attempt += 1;
-        let probe = TcpListener::bind("127.0.0.1:0").expect("reserve relay port");
-        let address = probe.local_addr().expect("relay address");
-        drop(probe);
-        let relay_url = format!("http://{address}");
-        match RelayServer::start_with_context(
-            RelayConfig {
-                bind: address.to_string(),
-                advertise_url: relay_url.clone(),
-                idle_timeout_secs: 0,
-                anti_entropy_interval: std::time::Duration::ZERO,
-                heartbeat_interval: std::time::Duration::ZERO,
-                ..RelayConfig::default()
-            },
-            test_context().clone(),
-        ) {
-            Ok(relay) => return (relay, relay_url),
-            // A parallel test can claim the port after the probe closes.
-            Err(error)
-                if attempt < 8 && error.starts_with("Relay failed to start: Failed to bind ") => {}
-            Err(error) => panic!("relay starts: {error}"),
-        }
-    }
+    let relay = RelayServer::start_with_context(
+        RelayConfig {
+            bind: "127.0.0.1:0".into(),
+            idle_timeout_secs: 0,
+            anti_entropy_interval: std::time::Duration::ZERO,
+            heartbeat_interval: std::time::Duration::ZERO,
+            ..RelayConfig::default()
+        },
+        test_context().clone(),
+    )
+    .expect("relay starts");
+    let relay_url = format!("http://{}", relay.local_addr());
+    (relay, relay_url)
 }
 
 #[test]

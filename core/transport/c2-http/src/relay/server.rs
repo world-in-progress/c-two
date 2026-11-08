@@ -9,7 +9,7 @@
 //! upstreams are lazily reconnected through the route's upstream slot
 //! on the next HTTP request.
 
-use std::net::SocketAddr;
+use std::net::{SocketAddr, TcpListener};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -203,6 +203,7 @@ pub struct RelayServerOptions {
 /// Relay server with a synchronous control API.
 #[allow(dead_code)]
 pub struct RelayServer {
+    local_addr: SocketAddr,
     cmd_tx: Option<mpsc::Sender<Command>>,
     thread: Option<std::thread::JoinHandle<()>>,
     state: Arc<RelayState>,
@@ -210,6 +211,11 @@ pub struct RelayServer {
 }
 
 impl RelayServer {
+    /// The actual HTTP listener address, available after startup succeeds.
+    pub fn local_addr(&self) -> SocketAddr {
+        self.local_addr
+    }
+
     #[cfg(test)]
     pub(crate) fn state_for_test(&self) -> Arc<RelayState> {
         self.state.clone()
@@ -246,7 +252,7 @@ impl RelayServer {
     }
 
     pub fn start_with_context_and_options(
-        config: RelayConfig,
+        mut config: RelayConfig,
         context: LocalEndpointContext,
         options: RelayServerOptions,
     ) -> Result<Self, String> {
@@ -263,6 +269,12 @@ impl RelayServer {
             .bind
             .parse()
             .map_err(|e| format!("Invalid bind address '{}': {e}", config.bind))?;
+        let listener = TcpListener::bind(addr)
+            .map_err(|error| format!("Relay failed to start: Failed to bind {addr}: {error}"))?;
+        let local_addr = listener
+            .local_addr()
+            .map_err(|error| format!("Failed to read relay listener address: {error}"))?;
+        config.bind = local_addr.to_string();
         let effective_advertise_url = config.effective_advertise_url();
         if !crate::relay::route_table::valid_relay_url(&effective_advertise_url) {
             return Err(format!(
@@ -270,6 +282,9 @@ impl RelayServer {
                 effective_advertise_url
             ));
         }
+        listener
+            .set_nonblocking(true)
+            .map_err(|error| format!("Failed to make relay listener nonblocking: {error}"))?;
 
         let config = Arc::new(config);
         let disseminator: Arc<dyn crate::relay::disseminator::Disseminator> = Arc::new(
@@ -300,7 +315,7 @@ impl RelayServer {
 
                 rt.block_on(async move {
                     Self::run(
-                        addr,
+                        listener,
                         server_state,
                         cmd_rx,
                         ready_tx,
@@ -323,6 +338,7 @@ impl RelayServer {
         }
 
         Ok(Self {
+            local_addr,
             cmd_tx: Some(cmd_tx),
             thread: Some(thread),
             state,
@@ -404,7 +420,7 @@ impl RelayServer {
     }
 
     async fn run(
-        addr: SocketAddr,
+        listener: TcpListener,
         state: Arc<RelayState>,
         mut cmd_rx: mpsc::Receiver<Command>,
         ready_tx: oneshot::Sender<Result<(), String>>,
@@ -413,10 +429,10 @@ impl RelayServer {
     ) {
         let app = router::build_router(state.clone());
 
-        let listener = match tokio::net::TcpListener::bind(addr).await {
+        let listener = match tokio::net::TcpListener::from_std(listener) {
             Ok(l) => l,
             Err(e) => {
-                let _ = ready_tx.send(Err(format!("Failed to bind {addr}: {e}")));
+                let _ = ready_tx.send(Err(format!("Failed to adopt relay listener: {e}")));
                 return;
             }
         };
@@ -880,6 +896,125 @@ mod tests {
     use c2_ipc::{ClientIpcConfig, IpcClient};
 
     static NEXT_IPC_SUFFIX: AtomicU64 = AtomicU64::new(0);
+
+    fn port_test_context() -> (tempfile::TempDir, c2_config::LocalEndpointContext) {
+        let root = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        let context = c2_config::LocalEndpointContext::with_unix_root(root.path()).unwrap();
+        #[cfg(windows)]
+        let context = c2_config::LocalEndpointContext::default_for_platform().unwrap();
+        (root, context)
+    }
+
+    fn assert_healthy(address: std::net::SocketAddr) {
+        use std::io::{Read, Write};
+        let mut stream =
+            std::net::TcpStream::connect_timeout(&address, Duration::from_secs(10)).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        stream
+            .write_all(b"GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 200 "), "{response}");
+    }
+
+    #[test]
+    fn bound_address_avoids_a_deterministically_stolen_probe_port() {
+        let (_root, context) = port_test_context();
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = probe.local_addr().unwrap();
+        let (released, release_wait) = std::sync::mpsc::channel();
+        let (occupied, occupy_wait) = std::sync::mpsc::channel();
+        let (finished, finish_wait) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            scope.spawn(move || {
+                release_wait.recv_timeout(Duration::from_secs(10)).unwrap();
+                let _competitor = std::net::TcpListener::bind(address).unwrap();
+                occupied.send(()).unwrap();
+                let _ = finish_wait.recv_timeout(Duration::from_secs(10));
+            });
+            drop(probe);
+            released.send(()).unwrap();
+            occupy_wait.recv_timeout(Duration::from_secs(10)).unwrap();
+            let error = match RelayServer::start_with_context(
+                RelayConfig {
+                    bind: address.to_string(),
+                    ..Default::default()
+                },
+                context.clone(),
+            ) {
+                Err(error) => error,
+                Ok(_) => panic!("the competing listener must prevent the old startup pattern"),
+            };
+            assert!(error.contains("Failed to bind"), "{error}");
+            let mut relay = RelayServer::start_with_context(
+                RelayConfig {
+                    bind: "127.0.0.1:0".into(),
+                    ..Default::default()
+                },
+                context,
+            )
+            .unwrap();
+            assert_ne!(relay.local_addr().port(), 0);
+            assert_ne!(relay.local_addr(), address);
+            assert_healthy(relay.local_addr());
+            relay.stop().unwrap();
+            finished.send(()).unwrap();
+        });
+    }
+
+    #[test]
+    fn bound_address_ephemeral_port_is_advertised_after_startup() {
+        let (_root, context) = port_test_context();
+        let mut relay = RelayServer::start_with_context(
+            RelayConfig {
+                bind: "127.0.0.1:0".into(),
+                ..Default::default()
+            },
+            context,
+        )
+        .unwrap();
+        let address = relay.local_addr();
+        assert_ne!(address.port(), 0);
+        assert_eq!(relay.state.config().bind, address.to_string());
+        assert_eq!(
+            relay.state.config().effective_advertise_url(),
+            format!("http://{address}")
+        );
+        assert_healthy(address);
+        relay.stop().unwrap();
+    }
+
+    #[test]
+    fn bound_address_nonzero_port_keeps_existing_advertise_derivation() {
+        let (_root, context) = port_test_context();
+        for bind in ["127.0.0.1:0", "0.0.0.0:0"] {
+            let mut relay = RelayServer::start_with_context(
+                RelayConfig {
+                    bind: bind.into(),
+                    ..Default::default()
+                },
+                context.clone(),
+            )
+            .unwrap();
+            let address = relay.local_addr();
+            assert_ne!(address.port(), 0);
+            let fixed_config = RelayConfig {
+                bind: address.to_string(),
+                ..Default::default()
+            };
+            let expected = format!("http://127.0.0.1:{}", address.port());
+            assert_eq!(fixed_config.effective_advertise_url(), expected);
+            assert_eq!(relay.state.config().effective_advertise_url(), expected);
+            relay.stop().unwrap();
+        }
+    }
 
     #[derive(Default)]
     struct RecordingDisseminator {

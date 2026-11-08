@@ -2,7 +2,7 @@
 
 use std::collections::BTreeSet;
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
@@ -81,10 +81,7 @@ impl Relay {
             dir.mode(0o700);
         }
         dir.create(&root).unwrap();
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        drop(listener);
-        let url = format!("http://{address}");
+        let stdout_path = root.join("c3.stdout.log");
         let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../..")
             .canonicalize()
@@ -105,28 +102,20 @@ impl Relay {
             binary.display()
         );
         let mut command = Command::new(binary);
-        command.args([
-            "relay",
-            "--bind",
-            &address.to_string(),
-            "--advertise-url",
-            &url,
-            "--idle-timeout",
-            "0",
-        ]);
+        command.args(["relay", "--bind", "127.0.0.1:0", "--idle-timeout", "0"]);
         #[cfg(unix)]
         command.arg("--ipc-root").arg(&root);
         let child = command
             .env_remove("C2_IPC_ROOT")
             .env_remove("C2_RELAY_ANCHOR_ADDRESS")
             .stdin(Stdio::null())
-            .stdout(std::fs::File::create(root.join("c3.stdout.log")).unwrap())
+            .stdout(std::fs::File::create(&stdout_path).unwrap())
             .stderr(std::fs::File::create(root.join("c3.stderr.log")).unwrap())
             .spawn()
             .unwrap();
         let mut relay = Self {
             child,
-            url,
+            url: String::new(),
             id: String::new(),
             root,
         };
@@ -136,6 +125,20 @@ impl Relay {
                 "c3 exited: {}",
                 relay.root.display()
             );
+            if relay.url.is_empty() {
+                let stdout = std::fs::read_to_string(&stdout_path).unwrap();
+                let complete = stdout
+                    .rsplit_once('\n')
+                    .map(|(lines, _)| lines)
+                    .unwrap_or("");
+                let Some(url) = complete
+                    .lines()
+                    .find_map(|line| line.strip_prefix("C-Two relay listening at "))
+                else {
+                    return false;
+                };
+                relay.url = url.to_owned();
+            }
             get(&relay.url, "/health")
                 .map(|response| response["status"] == "ok")
                 .unwrap_or(false)

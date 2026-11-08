@@ -134,20 +134,19 @@ fn with_invalid_relay_proxy_env(test: impl FnOnce()) {
     }
 }
 
-fn relay() -> (RelayServer, String) {
-    let probe = TcpListener::bind("127.0.0.1:0").expect("reserve relay port");
-    let address = probe.local_addr().expect("relay address");
-    drop(probe);
-    let relay_url = format!("http://{address}");
-    let relay = RelayServer::start(RelayConfig {
-        bind: address.to_string(),
-        advertise_url: relay_url.clone(),
-        idle_timeout_secs: 0,
-        anti_entropy_interval: std::time::Duration::ZERO,
-        heartbeat_interval: std::time::Duration::ZERO,
-        ..RelayConfig::default()
-    })
+fn relay(context: c2_config::LocalEndpointContext) -> (RelayServer, String) {
+    let relay = RelayServer::start_with_context(
+        RelayConfig {
+            bind: "127.0.0.1:0".into(),
+            idle_timeout_secs: 0,
+            anti_entropy_interval: std::time::Duration::ZERO,
+            heartbeat_interval: std::time::Duration::ZERO,
+            ..RelayConfig::default()
+        },
+        context,
+    )
     .expect("relay starts");
+    let relay_url = format!("http://{}", relay.local_addr());
     (relay, relay_url)
 }
 
@@ -491,12 +490,21 @@ fn all_connection_modes_return_the_same_client_surface_and_record_distinct_paths
     let _environment = relay_env_lock();
     fn accepts_client(_: &c2_core::Client) {}
 
-    let (mut relay, relay_url) = relay();
-    let runtime = Runtime::new(runtime_options(
-        unique_name("client-modes"),
-        Some(relay_url.clone()),
-    ))
-    .expect("runtime");
+    let root = tempfile::tempdir().expect("private IPC root");
+    let runtime =
+        Runtime::new(runtime_options(unique_name("client-modes"), None)).expect("runtime");
+    runtime
+        .set_local_endpoint_with_sources(
+            c2_config::LocalEndpointOptions {
+                #[cfg(unix)]
+                unix_root: Some(root.path().to_path_buf()),
+                ..Default::default()
+            },
+            c2_config::ConfigSources::empty(),
+        )
+        .unwrap();
+    let (mut relay, relay_url) = relay(runtime.local_endpoint_context().unwrap());
+    runtime.set_relay_anchor_address(Some(relay_url.clone()));
     let host = runtime.host(HostOptions::default()).expect("host");
     let route_name = unique_name("echo");
     let mut registration = host

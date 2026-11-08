@@ -244,17 +244,12 @@ impl FixtureRelay {
             "build c3 first or set CTWO_TEST_C3_BIN: {}",
             binary.display()
         );
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let socket = listener.local_addr().unwrap();
-        drop(listener);
-        let url = format!("http://{socket}");
+        let stdout_path = root.join(format!("{}.stdout.log", unique("c3")));
         let mut command = Command::new(binary);
         command.args([
             "relay",
             "--bind",
-            &socket.to_string(),
-            "--advertise-url",
-            &url,
+            "127.0.0.1:0",
             "--idle-timeout",
             &idle.to_string(),
         ]);
@@ -267,9 +262,7 @@ impl FixtureRelay {
             .env_remove("C2_IPC_ROOT")
             .env_remove("C2_RELAY_ANCHOR_ADDRESS")
             .stdin(Stdio::null())
-            .stdout(
-                std::fs::File::create(root.join(format!("{}.stdout.log", unique("c3")))).unwrap(),
-            )
+            .stdout(std::fs::File::create(&stdout_path).unwrap())
             .stderr(
                 std::fs::File::create(root.join(format!("{}.stderr.log", unique("c3")))).unwrap(),
             )
@@ -277,7 +270,7 @@ impl FixtureRelay {
             .unwrap();
         let mut relay = Self::Process(child);
         let deadline = Instant::now() + WAIT;
-        loop {
+        let url = loop {
             let Self::Process(child) = &mut relay else {
                 unreachable!()
             };
@@ -286,18 +279,30 @@ impl FixtureRelay {
                 "c3 exited; inspect {}",
                 root.display()
             );
-            if let Ok(mut stream) = TcpStream::connect_timeout(&socket, Duration::from_millis(100))
+            let stdout = std::fs::read_to_string(&stdout_path).unwrap();
+            let complete = stdout
+                .rsplit_once('\n')
+                .map(|(lines, _)| lines)
+                .unwrap_or("");
+            if let Some(url) = complete
+                .lines()
+                .find_map(|line| line.strip_prefix("C-Two relay listening at "))
             {
-                stream.set_read_timeout(Some(WAIT)).unwrap();
-                stream
-                    .write_all(
-                        b"GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
-                    )
-                    .unwrap();
-                let mut response = String::new();
-                stream.read_to_string(&mut response).unwrap();
-                if response.starts_with("HTTP/1.1 200 ") {
-                    break;
+                let socket = url.strip_prefix("http://").unwrap().parse().unwrap();
+                if let Ok(mut stream) =
+                    TcpStream::connect_timeout(&socket, Duration::from_millis(100))
+                {
+                    stream.set_read_timeout(Some(WAIT)).unwrap();
+                    stream
+                        .write_all(
+                            b"GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+                        )
+                        .unwrap();
+                    let mut response = String::new();
+                    stream.read_to_string(&mut response).unwrap();
+                    if response.starts_with("HTTP/1.1 200 ") {
+                        break url.to_owned();
+                    }
                 }
             }
             assert!(
@@ -306,7 +311,7 @@ impl FixtureRelay {
                 root.display()
             );
             std::thread::yield_now();
-        }
+        };
         (relay, url)
     }
 
@@ -421,32 +426,18 @@ impl Fixture {
             let (relay, url) = FixtureRelay::c3(&root, relay_idle, &[]);
             (Some(relay), Some(url))
         } else if path != PathKind::Direct {
-            let mut attempt = 0;
-            let (relay, url) = loop {
-                attempt += 1;
-                let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-                let address = listener.local_addr().unwrap();
-                drop(listener);
-                let url = format!("http://{address}");
-                match RelayServer::start_with_context(
-                    RelayConfig {
-                        bind: address.to_string(),
-                        advertise_url: url.clone(),
-                        idle_timeout_secs: relay_idle,
-                        anti_entropy_interval: Duration::ZERO,
-                        heartbeat_interval: Duration::ZERO,
-                        ..Default::default()
-                    },
-                    context.clone(),
-                ) {
-                    Ok(relay) => break (relay, url),
-                    // A parallel test can claim the port after the probe closes.
-                    Err(error)
-                        if attempt < 8
-                            && error.starts_with("Relay failed to start: Failed to bind ") => {}
-                    Err(error) => panic!("relay starts: {error}"),
-                }
-            };
+            let relay = RelayServer::start_with_context(
+                RelayConfig {
+                    bind: "127.0.0.1:0".into(),
+                    idle_timeout_secs: relay_idle,
+                    anti_entropy_interval: Duration::ZERO,
+                    heartbeat_interval: Duration::ZERO,
+                    ..Default::default()
+                },
+                context.clone(),
+            )
+            .expect("relay starts");
+            let url = format!("http://{}", relay.local_addr());
             (Some(FixtureRelay::Embedded(relay)), Some(url))
         } else {
             (None, None)

@@ -13,10 +13,6 @@ const STEP: Duration = Duration::from_secs(10);
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn public_stop_fences_real_http_registration_control_watch_publication() {
-    let socket = {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.local_addr().unwrap()
-    };
     let id = format!(
         "relay_register_stop_{}_{}",
         std::process::id(),
@@ -60,8 +56,7 @@ async fn public_stop_fences_real_http_registration_control_watch_publication() {
             .await
             .unwrap();
         let config = RelayConfig {
-            bind: socket.to_string(),
-            advertise_url: format!("http://{socket}"),
+            bind: "127.0.0.1:0".into(),
             idle_timeout_secs: 0,
             ..RelayConfig::default()
         };
@@ -70,6 +65,7 @@ async fn public_stop_fences_real_http_registration_control_watch_publication() {
         })
         .await
         .unwrap();
+        let socket = running.local_addr();
         let state = running.state_for_test();
         cleanup_state = Some(state.clone());
         relay = Some(running);
@@ -199,10 +195,6 @@ async fn public_stop_fences_real_http_registration_control_watch_publication() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn replacement_acquire_reuses_healthy_client_and_exact_close_stays_isolated() {
-    let socket = {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.local_addr().unwrap()
-    };
     let id = format!(
         "relay_acquire_stale_{}_{}",
         std::process::id(),
@@ -243,8 +235,7 @@ async fn replacement_acquire_reuses_healthy_client_and_exact_close_stays_isolate
             .await
             .unwrap();
         let config = RelayConfig {
-            bind: socket.to_string(),
-            advertise_url: format!("http://{socket}"),
+            bind: "127.0.0.1:0".into(),
             idle_timeout_secs: 0,
             ..RelayConfig::default()
         };
@@ -258,6 +249,7 @@ async fn replacement_acquire_reuses_healthy_client_and_exact_close_stays_isolate
         })
         .await
         .unwrap();
+        let socket = running.local_addr();
         let state = running.state_for_test();
         relay = Some(running);
         // Keep the controlled table transition independent of watch delivery.
