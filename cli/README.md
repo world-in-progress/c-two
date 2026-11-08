@@ -145,7 +145,7 @@ c3 relay --bind 127.0.0.1:8080 --idle-timeout 10 \
   --ipc-live-reassembly-budget-bytes 134217728
 ```
 
-Idle eviction disconnects the relay's cached IPC connection, not the resource server. Reconnect preserves full contract and server/instance identity validation; it does not replay ambiguous data-plane failures. Core relay-aware clients make one route observation followed by at most one pre-dispatch refresh; this bound is fixed and is not configurable through SDK settings. See the [memory policy](../docs/reference/memory-policy.md) for lazy allocation, fallback and retained-owner accounting.
+Idle eviction disconnects the relay's cached IPC connection, not the resource server. Reconnect preserves full contract and server/instance identity validation; it does not replay ambiguous data-plane failures. Before a call hands its input to a transport, Core acquires the client's route again at most once, under that call's deadline, when its target is known to be gone; this bound is fixed and is not configurable through SDK settings. See the [memory policy](../docs/reference/memory-policy.md) for lazy allocation, fallback and retained-owner accounting.
 
 When running normally, `c3 relay` installs a Ctrl+C handler and stops the relay cleanly on interrupt.
 

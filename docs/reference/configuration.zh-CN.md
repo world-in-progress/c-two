@@ -130,7 +130,7 @@ C2_RELAY_IDLE_TIMEOUT=60
 
 `remote_payload_chunk_size` 是唯一的远程 body 分批策略，由 Rust 从传输策略覆盖值或 `C2_REMOTE_PAYLOAD_CHUNK_SIZE` 解析；默认 1 MiB，允许大于零且不超过 128 MiB。Relay HTTP 将其用于发出的请求 body；relay 从上游 carrier 复制响应或流条目时，每片不超过它与上游 IPC `chunk_size` 中较小的一个；`C2_IPC_CHUNK_SIZE` 独立控制 IPC 线格式分片与重组。远程配置值不指定 TCP packet 或 HTTP frame 的边界。
 
-Core relay-aware 客户端进行一次路由观察，随后至多进行一次派发前刷新；此上限固定，不通过 SDK 设置配置。
+一次调用把输入交给传输之前，若已知客户端的目标不在了，Core 在这次调用的截止时间内至多重新获取一次路由；此上限固定，不通过 SDK 设置配置。
 
 预注册上游的语法为 `--upstream NAME=SERVER_ID@ADDRESS`，身份与 IPC handshake 一致。上游 budget 参数、mesh 和 dry-run 用法见 [c3 指南](../../cli/README.md)。
 
