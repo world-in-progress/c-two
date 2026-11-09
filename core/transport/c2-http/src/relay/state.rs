@@ -5,6 +5,7 @@
 //!   2. conn_pool (internal slot mutexes)
 
 use std::collections::HashMap;
+use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -25,6 +26,44 @@ use crate::relay::conn_pool::{
 use crate::relay::route_table::{RouteTable, TombstoneGcEntry};
 use crate::relay::types::*;
 use crate::relay::upstream_control::{self, UpstreamControlTask, UpstreamOwnerKey};
+
+pub(crate) struct RouteTableWrite<'a> {
+    table: RwLockWriteGuard<'a, RouteTable>,
+}
+impl Deref for RouteTableWrite<'_> {
+    type Target = RouteTable;
+    fn deref(&self) -> &RouteTable {
+        &self.table
+    }
+}
+impl DerefMut for RouteTableWrite<'_> {
+    fn deref_mut(&mut self) -> &mut RouteTable {
+        &mut self.table
+    }
+}
+impl Drop for RouteTableWrite<'_> {
+    fn drop(&mut self) {
+        let (before, current) = self.table.finish_conflict_changes();
+        for (name, registrations) in &current {
+            if before[name].is_empty() {
+                eprintln!(
+                    "[relay] route conflict detected: route={} registrations={}",
+                    name,
+                    serde_json::to_string(registrations).expect("registration metadata serializes")
+                );
+            }
+        }
+        for (name, registrations) in &before {
+            if !registrations.is_empty() && !current.contains_key(name) {
+                eprintln!(
+                    "[relay] route conflict resolved: route={} registrations={}",
+                    name,
+                    serde_json::to_string(registrations).expect("registration metadata serializes")
+                );
+            }
+        }
+    }
+}
 
 #[derive(Default)]
 struct UpstreamControls {
@@ -51,6 +90,9 @@ pub struct RelayState {
     acquire_recheck_seam: parking_lot::Mutex<Option<TestPause>>,
     #[cfg(test)]
     acquire_lookup_seam: parking_lot::Mutex<Option<TestPause>>,
+    #[cfg(test)]
+    peer_removal_seam:
+        parking_lot::Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
     config: Arc<RelayConfig>,
     endpoint_context: LocalEndpointContext,
     default_endpoint_namespace: bool,
@@ -84,6 +126,7 @@ pub enum RegisterCommitResult {
     Registered { entry: RouteEntry },
     SameOwner { entry: RouteEntry },
     Duplicate { existing_address: String },
+    PeerRouteHeld { registrations: String },
     ConflictingOwner { existing_address: String },
     Invalid { reason: String },
 }
@@ -101,9 +144,6 @@ pub enum UnregisterResult {
 
 pub enum UpstreamAcquireError {
     NotFound,
-    Stale {
-        route: RouteEntry,
-    },
     WatchUnavailable {
         route: RouteEntry,
         reason: String,
@@ -113,6 +153,18 @@ pub enum UpstreamAcquireError {
         address: String,
         error: c2_ipc::IpcError,
     },
+}
+
+// A registration change is consumed before dispatch and never becomes a wire error.
+enum UpstreamSnapshotError {
+    Changed,
+    Failure(UpstreamAcquireError),
+}
+
+impl From<UpstreamAcquireError> for UpstreamSnapshotError {
+    fn from(error: UpstreamAcquireError) -> Self {
+        Self::Failure(error)
+    }
 }
 
 fn expected_contract_for_route(route: &RouteEntry) -> c2_contract::ExpectedRouteContract {
@@ -133,7 +185,6 @@ fn is_route_local_acquire_failure(error: &c2_ipc::IpcError) -> bool {
             | c2_ipc::IpcError::RouteNotFound(_)
             | c2_ipc::IpcError::RouteRemoved { .. }
             | c2_ipc::IpcError::RouteClosed { .. }
-            | c2_ipc::IpcError::RouteStale { .. }
     )
 }
 
@@ -194,6 +245,8 @@ impl RelayState {
             acquire_recheck_seam: parking_lot::Mutex::new(None),
             #[cfg(test)]
             acquire_lookup_seam: parking_lot::Mutex::new(None),
+            #[cfg(test)]
+            peer_removal_seam: parking_lot::Mutex::new(None),
             disseminator,
             config,
             endpoint_context,
@@ -248,6 +301,9 @@ impl RelayState {
             Err(ControlError::AddressMismatch { existing_address }) => {
                 RegisterCommitResult::ConflictingOwner { existing_address }
             }
+            Err(ControlError::PeerRouteHeld { registrations }) => {
+                RegisterCommitResult::PeerRouteHeld { registrations }
+            }
             Err(ControlError::DuplicateRoute { existing_address }) => {
                 RegisterCommitResult::Duplicate { existing_address }
             }
@@ -290,7 +346,9 @@ impl RelayState {
             | Err(ControlError::InvalidServerInstanceId { .. })
             | Err(ControlError::InvalidAddress { .. })
             | Err(ControlError::ContractMismatch { .. }) => UnregisterResult::OwnerMismatch,
-            Err(ControlError::DuplicateRoute { .. }) => UnregisterResult::OwnerMismatch,
+            Err(ControlError::DuplicateRoute { .. } | ControlError::PeerRouteHeld { .. }) => {
+                UnregisterResult::OwnerMismatch
+            }
         }
     }
 
@@ -299,7 +357,7 @@ impl RelayState {
         expected: &RouteEntry,
     ) -> Option<(RouteEntry, f64, Option<Arc<IpcClient>>)> {
         let (entry, removed_at, client) = {
-            let mut route_table = self.route_table.write();
+            let mut route_table = self.route_table_write();
             let (entry, removed_at) = route_table.unregister_local_route_if_matches(expected);
             let client = entry
                 .as_ref()
@@ -321,7 +379,7 @@ impl RelayState {
     pub fn resolve_matching(
         &self,
         expected: &c2_contract::ExpectedRouteContract,
-    ) -> Vec<RouteInfo> {
+    ) -> Result<Option<RouteInfo>, RouteResolutionError> {
         self.route_table.read().resolve_matching(expected)
     }
 
@@ -349,18 +407,55 @@ impl RelayState {
             .read()
             .local_route(name)
             .ok_or(UpstreamAcquireError::NotFound)?;
-        let (lease, _binding) = self.acquire_upstream_for_route(&expected).await?;
-        Ok((lease, expected))
+        let (lease, _binding, current) = self.acquire_upstream_for_route(&expected).await?;
+        Ok((lease, current))
     }
 
     pub async fn acquire_upstream_for_route(
         &self,
         expected: &RouteEntry,
-    ) -> Result<(UpstreamLease, RouteBinding), UpstreamAcquireError> {
+    ) -> Result<(UpstreamLease, RouteBinding, RouteEntry), UpstreamAcquireError> {
+        let contract = expected_contract_for_route(expected);
+        for attempt in 0..2 {
+            let current = self
+                .route_table
+                .read()
+                .local_route(&expected.name)
+                .ok_or(UpstreamAcquireError::NotFound)?;
+            if expected_contract_for_route(&current) != contract {
+                return Err(UpstreamAcquireError::Unreachable {
+                    address: current.ipc_address.clone().unwrap_or_default(),
+                    route: current,
+                    error: c2_ipc::IpcError::ContractMismatch(format!(
+                        "route contract mismatch: {}",
+                        expected.name
+                    )),
+                });
+            }
+            match self.acquire_upstream_snapshot(&current).await {
+                Ok((lease, binding)) => return Ok((lease, binding, current)),
+                Err(UpstreamSnapshotError::Failure(error)) => return Err(error),
+                Err(UpstreamSnapshotError::Changed) if attempt == 0 => continue,
+                Err(UpstreamSnapshotError::Changed) => {
+                    return Err(UpstreamAcquireError::Unreachable {
+                        address: current.ipc_address.clone().unwrap_or_default(),
+                        route: current,
+                        error: c2_ipc::IpcError::Closed,
+                    });
+                }
+            }
+        }
+        unreachable!("the final acquisition always returns")
+    }
+
+    async fn acquire_upstream_snapshot(
+        &self,
+        expected: &RouteEntry,
+    ) -> Result<(UpstreamLease, RouteBinding), UpstreamSnapshotError> {
         self.with_current_upstream_route(expected, || ())?;
 
         let Some(endpoint_key) = UpstreamEndpointKey::from_route(expected) else {
-            return Err(UpstreamAcquireError::NotFound);
+            return Err(UpstreamAcquireError::NotFound.into());
         };
         let route_name = expected.name.clone();
         let expected_for_connect = expected.clone();
@@ -495,14 +590,10 @@ impl RelayState {
         }
         #[cfg(test)]
         Self::pause_for_test(&self.acquire_lookup_seam).await;
-        let binding = match lease
-            .client()
-            .acquire_route_token(&expected_contract, &expected.route_uid)
-            .await
-        {
+        let binding = match lease.client().acquire_route(&expected_contract).await {
             Ok(binding) => binding,
             Err(error) => {
-                // Admission or token rejection concerns only this route. The
+                // Admission rejection concerns only this route. The
                 // endpoint may still be serving another lease's inflight call.
                 // Identity/transport/protocol failures retain exact-client eviction.
                 if !is_route_local_acquire_failure(&error)
@@ -524,17 +615,17 @@ impl RelayState {
 
         #[cfg(test)]
         Self::pause_for_test(&self.acquire_recheck_seam).await;
-        let lease_endpoint = lease.endpoint();
-        let route_matches_lease = self.with_current_upstream_route(expected, || {
-            self.conn_pool.renew_current_owner_lease(&lease_endpoint)
-        });
+        let route_matches_lease =
+            self.with_current_upstream_route(expected, || self.conn_pool.renew_lease_owner(&lease));
 
         if matches!(route_matches_lease, Ok(true)) {
             Ok((lease, binding))
         } else {
             let client = lease.client();
             drop(lease);
-            self.close_failed_acquire_client(&client).await;
+            if !matches!(route_matches_lease, Err(UpstreamSnapshotError::Changed)) {
+                self.close_failed_acquire_client(&client).await;
+            }
             Err(match route_matches_lease {
                 Err(error) => error,
                 Ok(_) => self.classify_upstream_acquire_failure(
@@ -569,15 +660,13 @@ impl RelayState {
         &self,
         expected: &RouteEntry,
         when_current: impl FnOnce() -> T,
-    ) -> Result<T, UpstreamAcquireError> {
+    ) -> Result<T, UpstreamSnapshotError> {
         let route_table = self.route_table.read();
         let Some(entry) = route_table.local_route(&expected.name) else {
-            return Err(UpstreamAcquireError::NotFound);
+            return Err(UpstreamAcquireError::NotFound.into());
         };
         if !local_route_matches(&entry, expected) {
-            return Err(UpstreamAcquireError::Stale {
-                route: expected.clone(),
-            });
+            return Err(UpstreamSnapshotError::Changed);
         }
         Ok(when_current())
     }
@@ -586,24 +675,24 @@ impl RelayState {
         &self,
         expected: &RouteEntry,
         failure: UpstreamAcquireError,
-    ) -> UpstreamAcquireError {
-        // Keep the owner's authoritative refusal. A local retirement or I/O
-        // failure instead observes any withdrawal/replacement that caused it.
-        let authoritative = matches!(&failure,
+    ) -> UpstreamSnapshotError {
+        // Identity and protocol refusals remain terminal. Route-local evidence
+        // belongs to the captured registration, never its replacement.
+        let terminal = matches!(&failure,
             UpstreamAcquireError::Unreachable { error, .. }
-                if should_treat_as_semantic_route_failure(error));
-        if !authoritative && let Err(error) = self.with_current_upstream_route(expected, || ()) {
-            return error;
+                if matches!(error, c2_ipc::IpcError::IdentityMismatch { .. }
+                    | c2_ipc::IpcError::Protocol(_) | c2_ipc::IpcError::ProtocolVersionMismatch { .. }));
+        if !terminal {
+            let authoritative = matches!(&failure,
+                UpstreamAcquireError::Unreachable { error, .. }
+                    if should_treat_as_semantic_route_failure(error));
+            match self.with_current_upstream_route(expected, || ()) {
+                Err(UpstreamSnapshotError::Changed) => return UpstreamSnapshotError::Changed,
+                Err(error) if !authoritative => return error,
+                _ => {}
+            }
         }
-        match failure {
-            UpstreamAcquireError::Unreachable {
-                error: c2_ipc::IpcError::RouteStale { .. },
-                ..
-            } => UpstreamAcquireError::Stale {
-                route: expected.clone(),
-            },
-            other => other,
-        }
+        failure.into()
     }
     #[cfg(test)]
     pub(crate) fn get_address(&self, name: &str) -> Option<String> {
@@ -895,8 +984,10 @@ impl RelayState {
         }
     }
 
-    pub(crate) fn route_table_write(&self) -> RwLockWriteGuard<'_, RouteTable> {
-        self.route_table.write()
+    pub(crate) fn route_table_write(&self) -> RouteTableWrite<'_> {
+        let mut table = self.route_table.write();
+        table.begin_conflict_changes();
+        RouteTableWrite { table }
     }
 
     pub(crate) fn evict_idle(
@@ -934,11 +1025,26 @@ impl RelayState {
 
     #[cfg(test)]
     pub fn register_peer(&self, info: PeerInfo) {
-        self.route_table.write().register_peer(info);
+        self.route_table_write().register_peer(info);
     }
 
     pub fn unregister_peer(&self, relay_id: &str) -> Option<PeerInfo> {
-        self.route_table.write().unregister_peer(relay_id)
+        #[cfg(test)]
+        if let Some((entered, resume)) = self.peer_removal_seam.lock().take() {
+            entered.send(()).unwrap();
+            resume.recv_timeout(Duration::from_secs(5)).unwrap();
+        }
+        self.route_table_write().unregister_peer(relay_id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pause_before_peer_removal(
+        &self,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        *self.peer_removal_seam.lock() = Some((entered_tx, resume_rx));
+        (entered_rx, resume_tx)
     }
 
     pub fn has_peer(&self, relay_id: &str) -> bool {
@@ -974,7 +1080,7 @@ impl RelayState {
     }
 
     pub fn merge_snapshot(&self, sync: ValidatedFullSync) {
-        self.route_table.write().merge_validated_snapshot(sync);
+        self.route_table_write().merge_validated_snapshot(sync);
     }
 
     pub fn route_digest(&self) -> HashMap<(String, String, bool), RouteDigestHash> {
@@ -1003,7 +1109,7 @@ impl RelayState {
     }
 
     pub(crate) fn gc_tombstones(&self, retention: std::time::Duration) -> Vec<TombstoneGcEntry> {
-        self.route_table.write().gc_tombstones(retention)
+        self.route_table_write().gc_tombstones(retention)
     }
 
     pub(crate) fn with_route_table<F, R>(&self, f: F) -> R
@@ -1017,7 +1123,7 @@ impl RelayState {
     where
         F: FnOnce(&mut RouteTable) -> R,
     {
-        f(&mut self.route_table.write())
+        f(&mut self.route_table_write())
     }
 }
 
@@ -1201,7 +1307,9 @@ mod tests {
                 acquire_step(probe.connect()).await.unwrap();
                 for name in ["a", "b"] {
                     let contract = probe.route_contract(name).unwrap();
-                    let binding = acquire_step(probe.acquire_route(&contract)).await.unwrap();
+                    let binding = acquire_step(probe.attest_route_for_registration(&contract))
+                        .await
+                        .unwrap();
                     let entry = match test_commit_registration!(
                         &fixture.state,
                         name.into(),
@@ -1213,8 +1321,8 @@ mod tests {
                         TEST_CRM_VER.into(),
                         TEST_ABI_HASH.into(),
                         TEST_SIGNATURE_HASH.into(),
-                        binding.max_payload_size(),
-                        binding.route_uid().into(),
+                        binding.max_payload_size,
+                        binding.route_uid,
                         None
                     ) {
                         RegisterCommitResult::Registered { entry } => entry,
@@ -1231,6 +1339,50 @@ mod tests {
                 std::panic::resume_unwind(panic);
             }
             fixture
+        }
+
+        async fn reregister_b(&mut self) -> Arc<AcquireProbe> {
+            let old = self.entries[1].clone();
+            assert!(self.server.unregister_route("b").await);
+            let probe = Arc::new(AcquireProbe {
+                entered: tokio::sync::Notify::new(),
+                release: parking_lot::Mutex::new(None),
+                pings: std::sync::atomic::AtomicUsize::new(0),
+            });
+            Self::register(&self.server, "b", probe.clone()).await;
+            let mut client = self.client();
+            acquire_step(client.connect()).await.unwrap();
+            let record = acquire_step(
+                client.attest_route_for_registration(&expected_contract_for_route(&old)),
+            )
+            .await
+            .unwrap();
+            acquire_step(client.close()).await;
+            assert!(matches!(
+                self.state
+                    .unregister_upstream("b", old.server_id.as_deref().unwrap()),
+                UnregisterResult::Removed { .. }
+            ));
+            let entry = match test_commit_registration!(
+                &self.state,
+                "b".into(),
+                old.server_id.unwrap(),
+                old.server_instance_id.unwrap(),
+                old.ipc_address.unwrap(),
+                old.crm_ns,
+                old.crm_name,
+                old.crm_ver,
+                old.abi_hash,
+                old.signature_hash,
+                record.max_payload_size,
+                record.route_uid,
+                None
+            ) {
+                RegisterCommitResult::Registered { entry } => entry,
+                _ => panic!("replacement registration"),
+            };
+            self.entries[1] = entry;
+            probe
         }
 
         fn client(&self) -> IpcClient {
@@ -1284,60 +1436,74 @@ mod tests {
         Reregistered,
     }
 
-    async fn exact_token_transition(transition: AcquireTransition) {
+    // ADR 0004: same-endpoint re-registration is admitted by name and contract.
+    async fn name_acquire_transition(transition: AcquireTransition) {
         use futures::FutureExt;
         let fixture = AcquireFixture::new().await;
-        let mut exact = fixture.client();
-        let mut ordinary = fixture.client();
+        let mut client = fixture.client();
         let result = std::panic::AssertUnwindSafe(async {
-            acquire_step(exact.connect()).await.unwrap();
-            acquire_step(ordinary.connect()).await.unwrap();
+            acquire_step(client.connect()).await.unwrap();
             let contract = expected_contract_for_route(&fixture.entries[1]);
-            let old = acquire_step(exact.acquire_route(&contract)).await.unwrap();
-            let ready = acquire_step(exact.acquire_route_token(&contract, old.route_uid())).await.unwrap();
-            assert_eq!(ready.route_uid(), old.route_uid());
+            let old = acquire_step(client.acquire_route(&contract)).await.unwrap();
             match transition {
-                AcquireTransition::Closed => { assert_eq!(fixture.server.close_business_admission("maintenance").await, 2); }
+                AcquireTransition::Closed => {
+                    assert_eq!(
+                        fixture.server.close_business_admission("maintenance").await,
+                        2
+                    );
+                }
                 AcquireTransition::Removed | AcquireTransition::Reregistered => {
                     assert!(fixture.server.unregister_route("b").await);
                     if matches!(transition, AcquireTransition::Reregistered) {
-                        AcquireFixture::register(&fixture.server, "b", fixture.probes[1].clone()).await;
+                        AcquireFixture::register(&fixture.server, "b", fixture.probes[1].clone())
+                            .await;
                     }
                 }
             }
-            // Check exact first: ordinary lookup must not refresh its positive cache.
-            let token = acquire_step(exact.acquire_route_token(&contract, old.route_uid())).await;
-            let plain = acquire_step(ordinary.acquire_route(&contract)).await;
-            match transition {
-                AcquireTransition::Closed => {
-                    assert!(matches!(token, Err(c2_ipc::IpcError::RouteClosed { .. })), "exact: {token:?}");
-                    assert!(matches!(plain, Err(c2_ipc::IpcError::RouteClosed { .. })));
+            let fresh = acquire_step(client.acquire_route(&contract)).await;
+            if matches!(transition, AcquireTransition::Reregistered) {
+                let fresh = fresh.unwrap();
+                for binding in [&old, &fresh] {
+                    acquire_step(client.call_bound(binding, "ping", &[]))
+                        .await
+                        .unwrap();
                 }
-                AcquireTransition::Removed => {
-                    assert!(matches!(token, Err(c2_ipc::IpcError::RouteRemoved { .. })), "exact: {token:?}");
-                    assert!(matches!(plain, Err(c2_ipc::IpcError::RouteRemoved { .. })));
-                }
-                AcquireTransition::Reregistered => {
-                    let current = plain.unwrap();
-                    assert_ne!(current.route_uid(), old.route_uid());
-                    assert!(matches!(token, Err(c2_ipc::IpcError::RouteStale { ref current_route_uid, .. })
-                        if current_route_uid == current.route_uid()), "exact: {token:?}");
-                    let fresh = acquire_step(exact.acquire_route_token(&contract, current.route_uid())).await.unwrap();
-                    assert_eq!(fresh.route_uid(), current.route_uid());
-                }
+                assert_eq!(
+                    fixture.probes[1]
+                        .pings
+                        .load(std::sync::atomic::Ordering::SeqCst),
+                    2
+                );
+            } else {
+                let code = match transition {
+                    AcquireTransition::Closed => {
+                        assert!(matches!(fresh, Err(c2_ipc::IpcError::RouteClosed { .. })));
+                        c2_error::ErrorCode::ResourceClosed
+                    }
+                    _ => {
+                        assert!(matches!(fresh, Err(c2_ipc::IpcError::RouteRemoved { .. })));
+                        c2_error::ErrorCode::ResourceRemoved
+                    }
+                };
+                let error = acquire_step(client.call_bound(&old, "ping", &[]))
+                    .await
+                    .unwrap_err();
+                let c2_ipc::IpcError::CallRejected(error) = error else {
+                    panic!("old call: {error}");
+                };
+                assert_eq!(error.code, code);
+                assert!(!error.details.contains_key("route_uid"));
+                assert_eq!(
+                    fixture.probes[1]
+                        .pings
+                        .load(std::sync::atomic::Ordering::SeqCst),
+                    0
+                );
             }
-            let error = acquire_step(exact.call_bound(&old, "ping", &[])).await.unwrap_err();
-            let c2_ipc::IpcError::CallRejected(error) = error else { panic!("old call: {error}"); };
-            assert_eq!(error.code, match transition {
-                AcquireTransition::Closed => c2_error::ErrorCode::ResourceClosed,
-                AcquireTransition::Removed => c2_error::ErrorCode::ResourceRemoved,
-                AcquireTransition::Reregistered => c2_error::ErrorCode::RouteStale,
-            });
-            assert_eq!(fixture.probes[1].pings.load(std::sync::atomic::Ordering::SeqCst), 0);
-            assert_eq!(old.route_uid(), fixture.entries[1].route_uid.as_str());
-        }).catch_unwind().await;
-        acquire_step(exact.close()).await;
-        acquire_step(ordinary.close()).await;
+        })
+        .catch_unwind()
+        .await;
+        acquire_step(client.close()).await;
         fixture.finish().await;
         if let Err(panic) = result {
             std::panic::resume_unwind(panic);
@@ -1345,16 +1511,98 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn exact_token_ready_to_closed_uses_current_authority() {
-        exact_token_transition(AcquireTransition::Closed).await;
+    async fn name_acquire_ready_to_closed_uses_current_authority() {
+        name_acquire_transition(AcquireTransition::Closed).await;
     }
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn exact_token_ready_to_removed_uses_current_authority() {
-        exact_token_transition(AcquireTransition::Removed).await;
+    async fn name_acquire_ready_to_removed_uses_current_authority() {
+        name_acquire_transition(AcquireTransition::Removed).await;
     }
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn exact_token_ready_to_reregistered_uses_current_authority() {
-        exact_token_transition(AcquireTransition::Reregistered).await;
+    async fn name_acquire_ready_to_reregistered_uses_current_authority() {
+        name_acquire_transition(AcquireTransition::Reregistered).await;
+    }
+
+    // ADR 0004: "服务端与 relay 按路由名和契约身份接纳调用".
+    // Both pauses precede the sole business dispatch; no resource can be replayed.
+    async fn replacement_during_acquire(before_lookup: bool, changes: usize) {
+        let mut fixture = AcquireFixture::new().await;
+        let mut entered_next = None;
+        let mut resume_next = None;
+        let (entered, waiting) = tokio::sync::oneshot::channel();
+        let (resume, resumed) = tokio::sync::oneshot::channel();
+        if before_lookup {
+            fixture
+                .state
+                .set_acquire_lookup_seam_for_test(entered, resumed);
+        } else {
+            fixture
+                .state
+                .set_acquire_recheck_seam_for_test(entered, resumed);
+        }
+        let state = fixture.state.clone();
+        let expected = fixture.entries[1].clone();
+        let acquire =
+            tokio::spawn(async move { state.acquire_upstream_for_route(&expected).await });
+        acquire_step(waiting).await.unwrap();
+        let mut latest = fixture.reregister_b().await;
+        if changes == 2 {
+            let (entered, waiting) = tokio::sync::oneshot::channel();
+            let (resume, resumed) = tokio::sync::oneshot::channel();
+            fixture
+                .state
+                .set_acquire_recheck_seam_for_test(entered, resumed);
+            entered_next = Some(waiting);
+            resume_next = Some(resume);
+        }
+        resume.send(()).unwrap();
+        if let Some(waiting) = entered_next {
+            acquire_step(waiting).await.unwrap();
+            latest = fixture.reregister_b().await;
+            resume_next.unwrap().send(()).unwrap();
+        }
+        let result = acquire_step(acquire).await.unwrap();
+        if changes == 1 {
+            let (lease, binding, current) =
+                result.unwrap_or_else(|_| panic!("current registration"));
+            assert!(local_route_matches(&current, &fixture.entries[1]));
+            acquire_step(lease.client().call_bound(&binding, "ping", &[]))
+                .await
+                .unwrap();
+            assert_eq!(latest.pings.load(std::sync::atomic::Ordering::SeqCst), 1);
+            drop(lease);
+        } else {
+            assert!(matches!(
+                result,
+                Err(UpstreamAcquireError::Unreachable {
+                    error: c2_ipc::IpcError::Closed,
+                    ..
+                })
+            ));
+            assert_eq!(latest.pings.load(std::sync::atomic::Ordering::SeqCst), 0);
+        }
+        assert_eq!(
+            fixture.probes[1]
+                .pings
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        fixture.finish().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn lookup_replacement_acquires_current_registration() {
+        replacement_during_acquire(true, 1).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn final_recheck_replacement_acquires_current_registration() {
+        replacement_during_acquire(false, 1).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn repeated_replacement_stops_before_dispatch() {
+        replacement_during_acquire(false, 2).await;
     }
 
     async fn shared_acquire_transition(transition: AcquireTransition, watch_unavailable: bool) {
@@ -1364,7 +1612,7 @@ mod tests {
         let mut unregister = None;
         let mut call_a = None;
         let result = std::panic::AssertUnwindSafe(async {
-            let (lease_a, binding_a) = acquire_step(
+            let (lease_a, binding_a, _) = acquire_step(
                 fixture
                     .state
                     .acquire_upstream_for_route(&fixture.entries[0]),
@@ -1372,7 +1620,7 @@ mod tests {
             .await
             .unwrap_or_else(|_| panic!("acquire A"));
             let client = lease_a.client();
-            let (lease_b, old_b) = acquire_step(
+            let (lease_b, old_b, _) = acquire_step(
                 fixture
                     .state
                     .acquire_upstream_for_route(&fixture.entries[1]),
@@ -1462,7 +1710,17 @@ mod tests {
                     })
                 )),
                 AcquireTransition::Reregistered => {
-                    assert!(matches!(rejected, Err(UpstreamAcquireError::Stale { .. })))
+                    let (lease, binding, _) = rejected.unwrap_or_else(|_| {
+                        panic!("same-endpoint replacement must acquire by name")
+                    });
+                    acquire_step(lease.client().call_bound(&binding, "ping", &[]))
+                        .await
+                        .unwrap();
+                    assert!(
+                        !call_a.as_ref().unwrap().is_finished(),
+                        "B must complete while A remains in the resource"
+                    );
+                    drop(lease);
                 }
             }
             let retained_allocations = pool.read().stats().alloc_count;
@@ -1481,26 +1739,38 @@ mod tests {
                 client.is_connected(),
                 "healthy shared endpoint remains connected"
             );
-            let error = acquire_step(client.call_bound(&old_b, "ping", &[]))
-                .await
-                .unwrap_err();
-            let c2_ipc::IpcError::CallRejected(error) = error else {
-                panic!("old B call: {error}");
-            };
-            assert_eq!(
-                error.code,
-                match transition {
-                    AcquireTransition::Closed => c2_error::ErrorCode::ResourceClosed,
-                    AcquireTransition::Removed => c2_error::ErrorCode::ResourceRemoved,
-                    AcquireTransition::Reregistered => c2_error::ErrorCode::RouteStale,
-                }
-            );
-            assert_eq!(
-                fixture.probes[1]
-                    .pings
-                    .load(std::sync::atomic::Ordering::SeqCst),
-                0
-            );
+            if matches!(transition, AcquireTransition::Reregistered) {
+                acquire_step(client.call_bound(&old_b, "ping", &[]))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    fixture.probes[1]
+                        .pings
+                        .load(std::sync::atomic::Ordering::SeqCst),
+                    2
+                );
+            } else {
+                let error = acquire_step(client.call_bound(&old_b, "ping", &[]))
+                    .await
+                    .unwrap_err();
+                let c2_ipc::IpcError::CallRejected(error) = error else {
+                    panic!("old B call: {error}");
+                };
+                assert_eq!(
+                    error.code,
+                    if matches!(transition, AcquireTransition::Closed) {
+                        c2_error::ErrorCode::ResourceClosed
+                    } else {
+                        c2_error::ErrorCode::ResourceRemoved
+                    }
+                );
+                assert_eq!(
+                    fixture.probes[1]
+                        .pings
+                        .load(std::sync::atomic::Ordering::SeqCst),
+                    0
+                );
+            }
             fixture.release(1);
             if let Some(blocked) = blocked_b.take() {
                 acquire_step(blocked).await.unwrap().unwrap();
@@ -1508,7 +1778,7 @@ mod tests {
             if let Some(task) = unregister.take() {
                 assert!(acquire_step(task).await.unwrap());
             }
-            let (same, _) = acquire_step(
+            let (same, _, _) = acquire_step(
                 fixture
                     .state
                     .acquire_upstream_for_route(&fixture.entries[0]),
@@ -1713,8 +1983,8 @@ mod tests {
             TEST_CRM_VER.into(),
             TEST_ABI_HASH.into(),
             TEST_SIGNATURE_HASH.into(),
-            attestation.max_payload_size(),
-            attestation.route_uid().to_string(),
+            attestation.max_payload_size,
+            attestation.route_uid,
             None,
         ) {
             RegisterCommitResult::Registered { entry } => entry,
@@ -1737,7 +2007,7 @@ mod tests {
         };
         let mut previous = None;
         for _ in 0..2 {
-            let (lease, binding) = match state.acquire_upstream_for_route(&entry).await {
+            let (lease, binding, _) = match state.acquire_upstream_for_route(&entry).await {
                 Ok(acquired) => acquired,
                 Err(_) => panic!("resolved IPC policy must acquire a real client"),
             };
@@ -1921,6 +2191,9 @@ mod tests {
             | RegisterCommitResult::ConflictingOwner { existing_address } => {
                 panic!("unexpected duplicate route at {existing_address}")
             }
+            RegisterCommitResult::PeerRouteHeld { registrations } => {
+                panic!("unexpected peer-held name: {registrations}")
+            }
             RegisterCommitResult::Invalid { reason } => {
                 panic!("unexpected invalid route in test helper: {reason}")
             }
@@ -2010,10 +2283,6 @@ mod tests {
             .unwrap();
     }
 
-    fn remove_peer_routes(state: &RelayState, relay_id: &str) {
-        RouteAuthority::new(state).remove_peer_routes(relay_id);
-    }
-
     #[test]
     fn local_commit_rejects_invalid_crm_tag_without_fake_duplicate() {
         let state = RelayState::new(test_config(), null_disseminator());
@@ -2073,7 +2342,11 @@ mod tests {
             IpcClient::with_config("ipc://grid", c2_config::ClientIpcConfig::default()).unwrap(),
         );
         let registered = register_local(&state, "grid", "server-grid", "ipc://grid", client);
-        let routes = state.resolve_matching(&expected_contract_for_route(&registered));
+        let routes = state
+            .resolve_matching(&expected_contract_for_route(&registered))
+            .unwrap()
+            .into_iter()
+            .collect::<Vec<_>>();
         assert_eq!(routes.len(), 1);
         assert_eq!(routes[0].ipc_address.as_deref(), Some("ipc://grid"));
         assert_eq!(
@@ -2344,7 +2617,7 @@ mod tests {
                 abi_hash: TEST_ABI_HASH.into(),
                 signature_hash: TEST_SIGNATURE_HASH.into(),
                 max_payload_size: 1024,
-                route_uid: "grid-route-uid-0001".into(),
+                route_uid: None,
                 locality: Locality::Peer,
                 registered_at: 1000.0,
             },
@@ -2382,7 +2655,7 @@ mod tests {
                 abi_hash: TEST_ABI_HASH.into(),
                 signature_hash: TEST_SIGNATURE_HASH.into(),
                 max_payload_size: 1024,
-                route_uid: "grid-route-uid-0001".into(),
+                route_uid: None,
                 locality: Locality::Peer,
                 registered_at: 1000.0,
             },
@@ -2418,14 +2691,14 @@ mod tests {
     }
 
     #[test]
-    fn remove_routes_by_relay_does_not_remove_local_routes() {
+    fn unregister_peer_does_not_remove_local_routes() {
         let state = RelayState::new(test_config(), null_disseminator());
         let client = Arc::new(
             IpcClient::with_config("ipc://grid", c2_config::ClientIpcConfig::default()).unwrap(),
         );
         register_local(&state, "grid", "server-grid", "ipc://grid", client);
 
-        remove_peer_routes(&state, "test-relay");
+        state.unregister_peer("test-relay");
 
         let route = state.local_route("grid").unwrap().to_route_info();
         assert_eq!(route.ipc_address.as_deref(), Some("ipc://grid"));
@@ -2448,7 +2721,7 @@ mod tests {
                 abi_hash: TEST_ABI_HASH.to_string(),
                 signature_hash: TEST_SIGNATURE_HASH.to_string(),
                 max_payload_size: 1024,
-                route_uid: "grid-route-uid-0001".into(),
+                route_uid: Some("grid-route-uid-0001".into()),
                 locality: Locality::Local,
                 registered_at: 1000.0,
             });
@@ -2885,7 +3158,7 @@ mod tests {
             abi_hash: TEST_ABI_HASH.into(),
             signature_hash: TEST_SIGNATURE_HASH.into(),
             max_payload_size: 1024,
-            route_uid: "grid-route-uid-0001".into(),
+            route_uid: Some("grid-route-uid-0001".into()),
             locality: Locality::Local,
             registered_at: 0.0,
         };

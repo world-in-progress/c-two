@@ -27,6 +27,7 @@ from c_two.transport.registry import Runtime, _get_default_runtime, _reset_defau
 from tests.fixtures.hello import HelloImpl
 from tests.fixtures.ihello import Hello
 from tests.fixtures.counter import Counter, CounterImpl
+from tests.fixtures.route_scope_attestor import attested_registration_scope, route_scope_attestor_binary
 
 DEFAULT_MAX_PAYLOAD_SIZE = int(resolve_server_ipc_config(None, None)['max_payload_size'])
 
@@ -59,10 +60,11 @@ def _expected_contract_headers(crm_class: type = Hello) -> dict[str, str]:
     }
 
 
-def _registration_scope(http: httpx.Client, relay_url: str, name: str) -> dict:
+def _registration_scope(http: httpx.Client, relay_url: str, name: str, binary) -> dict:
     expected = crm_contract(Hello)
     response = http.get(
         f'{relay_url}/_resolve/{name}',
+        headers={'x-c2-local-namespace': cc.endpoint.local_endpoint_context().namespace_id},
         params={
             'crm_ns': expected.crm_ns, 'crm_name': expected.crm_name,
             'crm_ver': expected.crm_ver, 'abi_hash': expected.abi_hash,
@@ -71,9 +73,9 @@ def _registration_scope(http: httpx.Client, relay_url: str, name: str) -> dict:
     )
     assert response.status_code == 200, response.text
     route = response.json()[0]
-    return {key: route[key] for key in (
-        'name', 'server_id', 'server_instance_id', 'route_uid',
-    )}
+    return attested_registration_scope(
+        binary, name, route['ipc_address'], route['server_id'], route['server_instance_id'],
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -105,7 +107,10 @@ def relay_stack(start_c3_relay):
     relay = start_c3_relay()
     relay_url = relay.url
 
-    with httpx.Client(trust_env=False, timeout=5.0) as http:
+    with httpx.Client(
+        trust_env=False, timeout=5.0,
+        headers={'x-c2-local-namespace': cc.endpoint.local_endpoint_context().namespace_id},
+    ) as http:
         for name in ('hello', 'counter'):
             resp = http.post(
                 f'{relay_url}/_register',
@@ -266,7 +271,7 @@ class TestCcConnectHttp:
         with pytest.raises(ResourceNotFound, match="route not found: hello"):
             cc.connect(Counter, name='hello', address=relay_url)
 
-    def test_connect_http_call_route_not_found_raises_cc_error(self, relay_stack):
+    def test_connect_http_call_route_not_found_raises_cc_error(self, relay_stack, route_scope_attestor_binary):
         relay_url, _ = relay_stack
         server_id = cc.endpoint.server_id()
 
@@ -275,7 +280,7 @@ class TestCcConnectHttp:
             with httpx.Client(trust_env=False, timeout=5.0) as http:
                 resp = http.post(
                     f'{relay_url}/_unregister',
-                    json=_registration_scope(http, relay_url, 'hello'),
+                    json=_registration_scope(http, relay_url, 'hello', route_scope_attestor_binary),
                 )
                 assert resp.status_code == 200, resp.text
 
@@ -332,7 +337,10 @@ class TestCcConnectHttp:
 
         relay = start_c3_relay()
         relay_url = relay.url
-        with httpx.Client(trust_env=False, timeout=5.0) as http:
+        with httpx.Client(
+            trust_env=False, timeout=5.0,
+            headers={'x-c2-local-namespace': cc.endpoint.local_endpoint_context().namespace_id},
+        ) as http:
             resp = http.post(
                 f'{relay_url}/_register',
                 json={
@@ -447,7 +455,10 @@ class TestCcConnectHttp:
             )
 
             wrong_contract = crm_contract(Counter)
-            with httpx.Client(trust_env=False, timeout=5.0) as http:
+            with httpx.Client(
+                trust_env=False, timeout=5.0,
+                headers={'x-c2-local-namespace': cc.endpoint.local_endpoint_context().namespace_id},
+            ) as http:
                 resp = http.post(
                     f'{relay_url}/_register',
                     json={
@@ -551,7 +562,10 @@ class TestRelayControlPlane:
         relay = start_c3_relay()
         relay_url = relay.url
 
-        with httpx.Client(trust_env=False, timeout=5.0) as http:
+        with httpx.Client(
+            trust_env=False, timeout=5.0,
+            headers={'x-c2-local-namespace': cc.endpoint.local_endpoint_context().namespace_id},
+        ) as http:
             # Register via control endpoint.
             resp = http.post(
                 f'{relay_url}/_register',
@@ -593,7 +607,10 @@ class TestRelayControlPlane:
         relay = start_c3_relay()
         relay_url = relay.url
 
-        with httpx.Client(trust_env=False, timeout=5.0) as http:
+        with httpx.Client(
+            trust_env=False, timeout=5.0,
+            headers={'x-c2-local-namespace': cc.endpoint.local_endpoint_context().namespace_id},
+        ) as http:
             resp = http.post(
                 f'{relay_url}/_register',
                 json={
@@ -619,7 +636,7 @@ class TestRelayControlPlane:
             )
             assert resp.status_code == 200
 
-    def test_unregister_removes_route(self, start_c3_relay):
+    def test_unregister_removes_route(self, start_c3_relay, route_scope_attestor_binary):
         """POST /_unregister removes the route; calls return 404."""
         cc.register(Hello, HelloImpl(), name='hello')
         ipc_addr = cc.server_address()
@@ -629,7 +646,10 @@ class TestRelayControlPlane:
         relay = start_c3_relay()
         relay_url = relay.url
 
-        with httpx.Client(trust_env=False, timeout=5.0) as http:
+        with httpx.Client(
+            trust_env=False, timeout=5.0,
+            headers={'x-c2-local-namespace': cc.endpoint.local_endpoint_context().namespace_id},
+        ) as http:
             # Register, then unregister.
             registered = http.post(
                 f'{relay_url}/_register',
@@ -642,7 +662,7 @@ class TestRelayControlPlane:
                 },
             )
             assert registered.status_code == 201, registered.text
-            scope = _registration_scope(http, relay_url, 'hello')
+            scope = _registration_scope(http, relay_url, 'hello', route_scope_attestor_binary)
             # A stale incarnation, UID or owner cannot remove this route.
             for key, value in (
                 ('server_id', 'other-server'),
@@ -654,16 +674,16 @@ class TestRelayControlPlane:
                 )
                 assert rejected.status_code == 202, rejected.text
                 assert rejected.json()['status'] == 'superseded'
-                assert _registration_scope(http, relay_url, 'hello') == scope
+                assert _registration_scope(http, relay_url, 'hello', route_scope_attestor_binary) == scope
             incomplete = http.post(
                 f'{relay_url}/_unregister',
                 json={'name': 'hello', 'server_id': server_id},
             )
             assert incomplete.status_code == 422
-            assert _registration_scope(http, relay_url, 'hello') == scope
+            assert _registration_scope(http, relay_url, 'hello', route_scope_attestor_binary) == scope
             resp = http.post(
                 f'{relay_url}/_unregister',
-                json=_registration_scope(http, relay_url, 'hello'),
+                json=_registration_scope(http, relay_url, 'hello', route_scope_attestor_binary),
             )
             assert resp.status_code == 200
 
@@ -707,7 +727,10 @@ class TestRelayControlPlane:
         relay = start_c3_relay()
         relay_url = relay.url
 
-        with httpx.Client(trust_env=False, timeout=5.0) as http:
+        with httpx.Client(
+            trust_env=False, timeout=5.0,
+            headers={'x-c2-local-namespace': cc.endpoint.local_endpoint_context().namespace_id},
+        ) as http:
             for name in ('hello', 'counter'):
                 resp = http.post(
                     f'{relay_url}/_register',

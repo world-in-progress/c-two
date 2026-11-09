@@ -13,10 +13,6 @@ const STEP: Duration = Duration::from_secs(10);
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn public_stop_fences_real_http_registration_control_watch_publication() {
-    let socket = {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.local_addr().unwrap()
-    };
     let id = format!(
         "relay_register_stop_{}_{}",
         std::process::id(),
@@ -60,8 +56,7 @@ async fn public_stop_fences_real_http_registration_control_watch_publication() {
             .await
             .unwrap();
         let config = RelayConfig {
-            bind: socket.to_string(),
-            advertise_url: format!("http://{socket}"),
+            bind: "127.0.0.1:0".into(),
             idle_timeout_secs: 0,
             ..RelayConfig::default()
         };
@@ -70,6 +65,7 @@ async fn public_stop_fences_real_http_registration_control_watch_publication() {
         })
         .await
         .unwrap();
+        let socket = running.local_addr();
         let state = running.state_for_test();
         cleanup_state = Some(state.clone());
         relay = Some(running);
@@ -198,11 +194,7 @@ async fn public_stop_fences_real_http_registration_control_watch_publication() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn stale_acquire_disconnects_exact_old_client_before_same_endpoint_replacement() {
-    let socket = {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.local_addr().unwrap()
-    };
+async fn replacement_acquire_reuses_healthy_client_and_exact_close_stays_isolated() {
     let id = format!(
         "relay_acquire_stale_{}_{}",
         std::process::id(),
@@ -243,8 +235,7 @@ async fn stale_acquire_disconnects_exact_old_client_before_same_endpoint_replace
             .await
             .unwrap();
         let config = RelayConfig {
-            bind: socket.to_string(),
-            advertise_url: format!("http://{socket}"),
+            bind: "127.0.0.1:0".into(),
             idle_timeout_secs: 0,
             ..RelayConfig::default()
         };
@@ -258,6 +249,7 @@ async fn stale_acquire_disconnects_exact_old_client_before_same_endpoint_replace
         })
         .await
         .unwrap();
+        let socket = running.local_addr();
         let state = running.state_for_test();
         relay = Some(running);
         // Keep the controlled table transition independent of watch delivery.
@@ -265,10 +257,11 @@ async fn stale_acquire_disconnects_exact_old_client_before_same_endpoint_replace
             .await
             .unwrap();
         let old_entry = state.local_route("grid").unwrap();
-        let (lease, _) = tokio::time::timeout(STEP, state.acquire_upstream_for_route(&old_entry))
-            .await
-            .unwrap()
-            .unwrap_or_else(|_| panic!("initial real acquisition"));
+        let (lease, _, _) =
+            tokio::time::timeout(STEP, state.acquire_upstream_for_route(&old_entry))
+                .await
+                .unwrap()
+                .unwrap_or_else(|_| panic!("initial real acquisition"));
         let old_client = lease.client();
         drop(lease);
         assert!(old_client.is_connected());
@@ -287,33 +280,38 @@ async fn stale_acquire_disconnects_exact_old_client_before_same_endpoint_replace
         assert!(server.unregister_route("grid").await);
         super::test_support::register_echo_route(&server, "grid").await;
         let new_uid = server.registered_route_identity("grid").await.unwrap();
-        assert_ne!(new_uid, old_entry.route_uid);
+        assert_ne!(Some(&new_uid), old_entry.route_uid.as_ref());
         let mut new_entry = old_entry.clone();
-        new_entry.route_uid = new_uid;
+        new_entry.route_uid = Some(new_uid);
         assert_eq!(new_entry.ipc_address.as_deref(), Some(address.as_str()));
         assert!(state.with_route_table_mut(|table| table.register_route(new_entry.clone())));
         resume_acquire.take().unwrap().send(()).unwrap();
-        let stale = tokio::time::timeout(STEP, acquire_task.as_mut().unwrap())
+        let current = tokio::time::timeout(STEP, acquire_task.as_mut().unwrap())
             .await
             .unwrap()
             .unwrap();
         acquire_task.take();
-        assert!(matches!(
-            stale,
-            Err(super::state::UpstreamAcquireError::Stale { .. })
-        ));
-        assert!(
-            !old_client.is_connected(),
-            "stale acquire must initiate native disconnect before returning"
-        );
-        let (replacement_lease, binding) =
+        let (current_lease, binding, route) =
+            current.unwrap_or_else(|_| panic!("replacement acquire"));
+        assert_eq!(route.route_uid, new_entry.route_uid);
+        assert!(Arc::ptr_eq(&current_lease.client(), &old_client));
+        let reply = tokio::time::timeout(STEP, old_client.call_bound(&binding, "ping", &[]))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reply.into_owned_bytes().unwrap(), b"echo");
+        drop(current_lease);
+        // Genuine retirement still detaches the precise old physical client.
+        state.clients.close(&old_client);
+        assert!(old_client.close_shared_bounded(STEP).await);
+        let (replacement_lease, binding, _) =
             tokio::time::timeout(STEP, state.acquire_upstream_for_route(&new_entry))
                 .await
                 .unwrap()
                 .unwrap_or_else(|_| panic!("same endpoint replacement acquisition"));
         let replacement = replacement_lease.client();
         assert!(!Arc::ptr_eq(&replacement, &old_client));
-        assert_eq!(binding.route_uid(), new_entry.route_uid);
+        assert_eq!(binding.route_name(), new_entry.name);
         let reply = tokio::time::timeout(STEP, replacement.call_bound(&binding, "ping", &[]))
             .await
             .unwrap()
@@ -322,7 +320,7 @@ async fn stale_acquire_disconnects_exact_old_client_before_same_endpoint_replace
         // Re-observing the precise closing owner cannot target its replacement.
         state.clients.close(&old_client);
         assert!(old_client.close_shared_bounded(STEP).await);
-        let (same_lease, same_binding) =
+        let (same_lease, same_binding, _) =
             tokio::time::timeout(STEP, state.acquire_upstream_for_route(&new_entry))
                 .await
                 .unwrap()

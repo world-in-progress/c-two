@@ -123,7 +123,7 @@ Relay freezes its local upstream context at startup: one relay local domain uses
 
 A typed RPC handshake version mismatch on a relay-selected local IPC candidate is terminal: the client cleans up locally and rethrows the same error without trying further routes, HTTP fallback or automatic retry. Over HTTP, a relay whose own upstream IPC connection fails version negotiation projects the existing `ProtocolViolation` (502) with `local_protocol_version` / `peer_protocol_version` details naming the relay/upstream pair — the caller's local end is not that pair. See the [handshake spec](ipc-handshake.md).
 
-Authoritative route acquisition queries current server state and binds the route UID and server instance. Idle eviction removes the data connection while retaining registration and owner state. An old proxy cannot acquire a replacement resource with the same name. Generated TypeScript persistent IPC clients use the same control lookup and identity rules.
+Authoritative route acquisition queries current server state and binds the route name, contract and server instance. Idle eviction removes the data connection while retaining registration and owner state. A route that the same server registers again under the same name and contract serves an existing proxy; a proxy whose connection has ended fails until the application connects again. Generated TypeScript persistent IPC clients use the same control lookup and identity rules.
 
 ## Observing physical IPC connections
 

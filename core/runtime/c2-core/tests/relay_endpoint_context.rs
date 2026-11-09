@@ -179,7 +179,6 @@ impl HttpFixture {
             route: RelayRouteInfo {
                 name: expected.route_name,
                 relay_url: url.clone(),
-                route_uid: "route-uid".into(),
                 ipc_address: Some("ipc://same-owner".into()),
                 server_id: Some("same-owner".into()),
                 server_instance_id: Some("candidate-instance".into()),
@@ -419,15 +418,10 @@ mod unix {
     #[test]
     fn real_relay_and_two_roots_select_the_correct_owner() {
         let roots = Roots::new();
-        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = probe.local_addr().unwrap();
-        drop(probe);
-        let url = format!("http://{address}");
         let context = c2_core::LocalEndpointContext::with_unix_root(&roots.a()).unwrap();
         let mut relay = RelayServer::start_with_context(
             RelayConfig {
-                bind: address.to_string(),
-                advertise_url: url.clone(),
+                bind: "127.0.0.1:0".into(),
                 idle_timeout_secs: 0,
                 anti_entropy_interval: Duration::ZERO,
                 heartbeat_interval: Duration::ZERO,
@@ -436,6 +430,7 @@ mod unix {
             context,
         )
         .unwrap();
+        let url = format!("http://{}", relay.local_addr());
         let owner_a = runtime(Some(url.clone()));
         at(&owner_a, &roots.a());
         let host_a = owner_a.host(HostOptions::default()).unwrap();
@@ -511,7 +506,10 @@ mod unix {
             after_mismatch.observed_path(),
             ObservedPath::RelayAwareLocalIpc
         );
-        assert_eq!(after_mismatch.observed_route(), ipc.observed_route());
+        assert_eq!(
+            after_mismatch.ipc_server_identity(),
+            ipc.ipc_server_identity()
+        );
         assert_eq!(
             after_mismatch
                 .call_owned("echo", b"after-mismatch")

@@ -65,7 +65,7 @@ def _receipt() -> dict[str, object]:
                 "fastdb_spec_sha256": (
                     None if payload == "no-payload" else _digest("b")
                 ),
-                "route": {"uid": f"typescript-route-{index}"},
+                "route": {"name": f"typescript-route-{index}"},
                 "logical_result_sha256": _digest("c"),
                 "path_counters": {
                     "requests": 2 if row_id == OPAQUE_ROW_ID else 1,
@@ -84,7 +84,7 @@ def _receipt() -> dict[str, object]:
             }
         )
     return {
-        "schema": "c-two.typescript-real-call-receipt.v2",
+        "schema": "c-two.typescript-real-call-receipt.v3",
         "evidence_stage": "development",
         "runtime": {
             "node_version": "v25.8.1",
@@ -142,7 +142,7 @@ def test_dimensions_freeze_all_real_node_paths() -> None:
 
 def test_receipt_round_trips_as_canonical_json(tmp_path: Path) -> None:
     receipt = _receipt()
-    destination = tmp_path / "typescript-real-call-receipt.v2.json"
+    destination = tmp_path / "typescript-real-call-receipt.v3.json"
 
     write_receipt(destination, receipt, expected_stage="development")
     first = destination.read_bytes()
@@ -156,12 +156,45 @@ def test_receipt_round_trips_as_canonical_json(tmp_path: Path) -> None:
     ) == receipt
 
 
-def test_v1_schema_is_rejected() -> None:
+@pytest.mark.parametrize("old_version", ("v1", "v2"))
+def test_old_schema_is_rejected(old_version: str) -> None:
     receipt = _receipt()
-    receipt["schema"] = "c-two.typescript-real-call-receipt.v1"
+    receipt["schema"] = f"c-two.typescript-real-call-receipt.{old_version}"
 
-    with pytest.raises(ReceiptValidationError, match=r"\$\.schema.*v2"):
+    with pytest.raises(ReceiptValidationError, match=r"\$\.schema.*v3"):
         validate_receipt(receipt, expected_stage="development")
+
+
+@pytest.mark.parametrize(
+    "route",
+    ({"uid": "retired"}, {"name": "typescript-route", "uid": "retired"}),
+)
+def test_old_route_uid_is_rejected(route: dict[str, str]) -> None:
+    receipt = _receipt()
+    receipt["rows"][0]["route"] = route
+
+    with pytest.raises(ReceiptValidationError, match="route"):
+        validate_receipt(receipt, expected_stage="development")
+
+
+@pytest.mark.parametrize(
+    "name",
+    (None, 1, "", " bad", "bad ", "bad\\route", "bad\nroute", "bad\x7froute", "x" * 256, "路" * 86),
+)
+def test_route_name_must_be_valid(name: object) -> None:
+    receipt = _receipt()
+    receipt["rows"][0]["route"]["name"] = name
+
+    with pytest.raises(ReceiptValidationError, match="route.name"):
+        validate_receipt(receipt, expected_stage="development")
+
+
+@pytest.mark.parametrize("name", ("group/route", "路" * 85))
+def test_route_name_accepts_namespace_and_utf8_boundary(name: str) -> None:
+    receipt = _receipt()
+    receipt["rows"][0]["route"]["name"] = name
+
+    assert validate_receipt(receipt, expected_stage="development") == receipt
 
 
 def test_route_revision_is_rejected() -> None:

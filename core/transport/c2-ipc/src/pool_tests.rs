@@ -1026,7 +1026,7 @@ fn registration_attestation_accepts_committed_closed_route() {
                 .attest_route_for_registration(&expected)
                 .await
                 .unwrap()
-                .route_name(),
+                .route_name,
             "grid"
         );
         server.open_route_admission(admission).await.unwrap();

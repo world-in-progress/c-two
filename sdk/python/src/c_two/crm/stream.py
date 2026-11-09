@@ -255,7 +255,7 @@ def _build_stream_wrapper(func, input_binding, output_binding):
     method_name = func.__name__
 
     @wraps(func)
-    def invoke(self, *args, _c2_buffer=None, **kwargs):
+    def invoke(self, *args, _c2_buffer=None, _c2_follow_budget=None, **kwargs):
         if self.direction == '<-':
             return _ResourceStream(
                 getattr(self.resource, method_name), output=output_binding,
@@ -270,8 +270,28 @@ def _build_stream_wrapper(func, input_binding, output_binding):
             raise TypeError('stream methods cannot transport keyword-only arguments')
         values = bound.args[1:]
         client = self.client
+        if _c2_follow_budget is not None:
+            client = client.resolve_for_call(_c2_follow_budget)
+        else:
+            following = getattr(client, '_following_local', None)
+            if following is not None:
+                target = following.target
+                if target is not None:
+                    client = client.snapshot_followed_target(target)
+        budget = _c2_follow_budget
         if client.supports_direct_call:
-            native = client.open_direct_stream(method_name, values)
+            try:
+                native = client.open_direct_stream(method_name, values)
+            except Exception as exc:
+                from ..transport.client.proxy import _LocalRouteClosed
+                if not isinstance(exc, _LocalRouteClosed):
+                    raise
+                if budget is None:
+                    budget = self.client.start_call_budget()
+                return invoke(
+                    self, *args, _c2_buffer=_c2_buffer,
+                    _c2_follow_budget=budget, **kwargs,
+                )
             return Stream._from_objects(native, held=_c2_buffer == 'hold')
         prepared = client.begin_stream(method_name)
         try:

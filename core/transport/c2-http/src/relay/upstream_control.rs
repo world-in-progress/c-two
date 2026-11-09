@@ -239,7 +239,8 @@ mod tests {
             abi_hash: TEST_ABI_HASH.into(),
             signature_hash: TEST_SIGNATURE_HASH.into(),
             max_payload_size: c2_server::ServerIpcConfig::default().max_payload_size,
-            route_uid,
+            route_uid: Some(route_uid),
+
             locality: Locality::Local,
             registered_at: 0.0,
         }
@@ -325,7 +326,10 @@ mod tests {
             )
             .await
             .expect("relay registration accepts a committed route before admission opens");
-            assert_eq!(attested.route_uid, route.route_uid);
+            assert_eq!(
+                Some(attested.route_uid.as_str()),
+                route.route_uid.as_deref()
+            );
             client.rebuild_route_catalog().await.unwrap();
             // Operator registration without a claimed contract only adopts routes already opened and exported by their owner.
             assert_eq!(
@@ -508,7 +512,7 @@ mod tests {
                     entry.abi_hash.clone(),
                     entry.signature_hash.clone(),
                     entry.max_payload_size,
-                    entry.route_uid.clone(),
+                    entry.route_uid.clone().expect("local UID"),
                     None
                 ),
                 crate::relay::state::RegisterCommitResult::Registered { .. }
@@ -642,14 +646,14 @@ mod tests {
                     .upstream_control_watch_unavailable_for_route(&fixture.entry)
                     .is_some()
             );
-            let (lease, binding) = tokio::time::timeout(
+            let (lease, binding, _) = tokio::time::timeout(
                 STEP,
                 fixture.state.acquire_upstream_for_route(&fixture.entry),
             )
             .await
             .unwrap()
             .unwrap_or_else(|_| panic!("live acquire must succeed"));
-            assert_eq!(binding.route_uid(), fixture.entry.route_uid);
+            assert_eq!(binding.route_name(), fixture.entry.name);
             let reply =
                 tokio::time::timeout(STEP, lease.client().call_bound(&binding, "ping", &[]))
                     .await

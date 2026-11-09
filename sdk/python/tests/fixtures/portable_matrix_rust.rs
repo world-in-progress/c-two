@@ -5,8 +5,8 @@ use fastdb::{
 };
 use std::error::Error;
 use std::io::Write;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[path = "../generated/no-payload/rust/rust/c_two_contract.rs"]
 mod no_payload_contract;
@@ -330,8 +330,8 @@ fn run_host(
         return Err(format!("expected host address {address:?}, got {actual_address:?}").into());
     }
     println!(
-        "READY address={} route_uid={}",
-        actual_address, outcome.route_uid
+        "READY address={} server_instance_id={}",
+        actual_address, outcome.server_instance_id
     );
     std::io::stdout().flush()?;
 
@@ -371,7 +371,6 @@ fn run_client(
     };
     let core_client = runtime.connect(expected, connect)?;
     let observed_path = core_client.observed_path();
-    let route_uid = core_client.observed_route().route_uid.clone();
 
     match payload {
         "no-payload" => {
@@ -403,9 +402,7 @@ fn run_client(
     if selected != 1 {
         return Err(format!("expected one selected path observation, got {selected}").into());
     }
-    println!(
-        "CLIENT_RECEIPT observed_path={observed_path:?} route_uid={route_uid} requests=1 responses=1"
-    );
+    println!("CLIENT_RECEIPT observed_path={observed_path:?} requests=1 responses=1");
     Ok(())
 }
 

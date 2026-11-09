@@ -131,7 +131,8 @@ def test_concurrent_views_share_connection_with_independent_timeouts_and_close(i
     connection, resource = ipc_connection
     short = cc.with_call_options(connection, timeout=0.05)
     long = cc.with_call_options(connection, timeout=2)
-    assert short.client.route_uid == long.client.route_uid == connection.client.route_uid
+    assert len({cc.observe.connection_observation(proxy).connection_id
+                for proxy in (short, long, connection)}) == 1
     try:
         with ThreadPoolExecutor(max_workers=2) as executor:
             slow = executor.submit(short.echo, 'slow', timeout=0.2)
@@ -682,8 +683,8 @@ def test_payload_buffer_retirement_observation_follows_live_reservation(ipc_conn
     assert replacement.memory_stats()['retired_payload_buffers'][0]['used_bytes'] == 0
 
 
-def test_http_stale_refusal_does_not_retain_input_for_post_replay():
-    """A stale POST is reported without retaining a speculative replay copy."""
+def test_http_missing_route_refusal_does_not_retain_input_for_post_replay():
+    """A missing-route POST is reported without retaining a replay copy."""
     import json
     import pickle
     from http.server import BaseHTTPRequestHandler
@@ -701,7 +702,6 @@ def test_http_stale_refusal_does_not_retain_input_for_post_replay():
     def route(index):
         return {
             'name': route_name, 'relay_url': f'http://127.0.0.1:{servers[index].server_port}',
-            'route_uid': f'deadline-retry-{index}',
             'ipc_address': None, 'server_id': None, 'server_instance_id': None,
             'crm_ns': expected.crm_ns, 'crm_name': expected.crm_name,
             'crm_ver': expected.crm_ver, 'abi_hash': expected.abi_hash,
@@ -735,9 +735,9 @@ def test_http_stale_refusal_does_not_retain_input_for_post_replay():
                 calls[index] += 1
                 headers_seen.append(dict(self.headers))
                 if index == 0:
-                    refusal = {'version': 1, 'code': 704, 'name': 'RouteStale',
-                               'message': 'authoritative stale route', 'details': {}}
-                    self.reply(409, json.dumps(refusal).encode())
+                    refusal = {'version': 1, 'code': 701, 'name': 'ResourceNotFound',
+                               'message': 'route absent', 'details': {}}
+                    self.reply(404, json.dumps(refusal).encode())
                 else:
                     value, _business_timeout = pickle.loads(body)
                     self.reply(200, pickle.dumps(value))
@@ -757,13 +757,14 @@ def test_http_stale_refusal_does_not_retain_input_for_post_replay():
         anchor = f'http://127.0.0.1:{servers[0].server_port}'
         connection = cc.connect(TimedContract, name=route_name, address=anchor)
         finite = cc.with_call_options(connection, timeout=call_timeout)
-        with pytest.raises(cc.error.RouteStale):
+        with pytest.raises(cc.error.ResourceNotFound):
             finite.echo('retry')
         assert calls == [1, 0]
         for headers in headers_seen:
             normalized = {key.lower(): value for key, value in headers.items()}
             assert normalized['x-c2-expected-abi-hash'] == expected.abi_hash
             assert normalized['x-c2-expected-signature-hash'] == expected.signature_hash
+            assert '-'.join(('x', 'c2', 'route', 'uid')) not in normalized
     finally:
         for view in (finite, unlimited, connection):
             if view is not None:

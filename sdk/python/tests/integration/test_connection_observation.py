@@ -246,16 +246,26 @@ def test_subscription_is_lazy_and_timeout_does_not_close_it():
         events.recv(1.0)
 
 
-def test_non_ipc_and_unconnected_values_are_explicitly_rejected():
+def test_non_ipc_and_unconnected_values_are_explicitly_rejected(start_c3_relay):
     from c_two.transport.client.proxy import CRMProxy
     from c_two.error import UnsupportedCallMode
     with pytest.raises(TypeError, match='connected CRM'):
         cc.observe.connection_observation(object())
-    for native in [CRMProxy.thread_local(PeerResource()), CRMProxy.http(object(), 'peer')]:
-        proxy = ObservationPeer()
-        proxy.client = native
+    local = ObservationPeer()
+    local.client = CRMProxy.thread_local(PeerResource())
+    with pytest.raises(UnsupportedCallMode, match='physical IPC'):
+        cc.observe.connection_observation(local)
+
+    relay = start_c3_relay()
+    cc.set_relay_anchor(relay.url)
+    cc.register(ObservationPeer, PeerResource(), name='peer')
+    remote = cc.connect(ObservationPeer, name='peer', address=relay.url)
+    try:
         with pytest.raises(UnsupportedCallMode, match='physical IPC'):
-            cc.observe.connection_observation(proxy)
+            cc.observe.connection_observation(remote)
+    finally:
+        cc.close(remote)
+        cc.unregister('peer')
 
 
 def test_lagged_subscription_ends_but_existing_observation_remains_usable():

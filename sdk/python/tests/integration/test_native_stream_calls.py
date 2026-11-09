@@ -31,6 +31,74 @@ class Resource:
         return value
 
 
+def test_same_process_stream_and_hold_follow_local_reregistration(tmp_path):
+    runtime = cc.Runtime()
+    if os.name != 'nt':
+        runtime.set_local_endpoint(root=str(tmp_path))
+    first = Resource()
+    second = Resource()
+    proxy = view = None
+    try:
+        runtime.register(Values, first, name='values')
+        proxy = runtime.connect(Values, name='values')
+        view = cc.with_call_options(proxy, timeout=None)
+        assert list(proxy.values(b'old')) == [b'old', b'old!']
+        runtime.unregister('values')
+        runtime.register(Values, second, name='values')
+        assert list(view.values(b'new')) == [b'new', b'new!']
+        with cc.hold(proxy.echo)(b'held') as held:
+            assert held.value == b'held'
+        assert first.cleanups == second.cleanups == 1
+    finally:
+        if view is not None:
+            cc.close(view)
+        if proxy is not None:
+            cc.close(proxy)
+        assert runtime.shutdown(timeout=5)['completed']
+
+
+def test_same_process_proxy_promotes_to_relay_and_keeps_remote_target(
+    tmp_path, monkeypatch, start_c3_relay,
+):
+    if os.name != 'nt':
+        root = tmp_path / 'ipc'
+        root.mkdir()
+        monkeypatch.setenv('C2_IPC_ROOT', str(root))
+    relay = start_c3_relay()
+    local = cc.Runtime()
+    remote = cc.Runtime()
+    if os.name != 'nt':
+        local.set_local_endpoint(root=str(root))
+        remote.set_local_endpoint(root=str(root))
+    local.set_relay_anchor(relay.url)
+    remote.set_relay_anchor(relay.url)
+
+    class RemoteResource(Resource):
+        def echo(self, value):
+            return b'remote:' + value
+
+    proxy = view = None
+    try:
+        local.register(Values, Resource(), name='values')
+        proxy = local.connect(Values, name='values')
+        view = cc.with_call_options(proxy, timeout=5)
+        local.unregister('values')
+        remote.register(Values, RemoteResource(), name='values')
+        assert view.echo(b'first') == b'remote:first'
+        assert proxy.client.observed_path != 'thread_local'
+        with cc.hold(proxy.echo)(b'held') as held:
+            assert held.value == b'remote:held'
+
+        assert not proxy.client._following_local.target.supports_direct_call
+    finally:
+        if view is not None:
+            cc.close(view)
+        if proxy is not None:
+            cc.close(proxy)
+        assert local.shutdown(timeout=5)['completed']
+        assert remote.shutdown(timeout=5)['completed']
+
+
 @pytest.mark.parametrize('transport', ['ipc', 'http'])
 @pytest.mark.parametrize('finite', [False, True])
 def test_native_stream_then_unary_preserves_input_and_terminal(

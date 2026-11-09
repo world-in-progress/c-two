@@ -693,7 +693,7 @@ def test_independent_setup_overlaps_but_consumers_wait(tmp_path, monkeypatch):
 
 
 def test_artifact_inventory_retains_proofs_without_disposable_build_trees(tmp_path):
-    paths = ["cli/c3", "python-suite/run.json", "python-suite/portable-matrix-receipt.v2.json",
+    paths = ["cli/c3", "python-suite/run.json", "python-suite/portable-matrix-receipt.v3.json",
              "python-suite/ordinary/junit.xml", "python-suite/typescript/output.log",
              "python310-suite/ordinary/junit.xml", "python310-suite/collection/ordinary/collected-master.json",
              "python-suite/portable/tmp/build/unneeded", "python-suite/typescript/tmp/node_modules/typescript/index.js",

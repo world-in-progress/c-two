@@ -367,7 +367,7 @@ async fn drive(
                 let total = stream_wire::decode_item_begin(total);
                 if total > max_item_size {
                     return protocol_failure(format!(
-                        "HTTP item exceeds route payload limit: {total}"
+                        "HTTP item exceeds protocol payload limit: {total}"
                     ));
                 }
                 let Ok(total) = usize::try_from(total) else {

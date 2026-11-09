@@ -9,6 +9,7 @@ from collections.abc import Iterator
 import pytest
 
 import c_two as cc
+from c_two.transport.client.proxy import CRMProxy
 from tests.fixtures.stream_python import StreamObjects, StreamValues, ValuesResource
 
 
@@ -90,6 +91,74 @@ def test_same_process_finite_deadline_rejected_before_factory(local_values, time
         assert resource.events == []
     finally:
         cc.close(view)
+
+
+def test_captured_local_stream_target_stays_local_until_native_admission(monkeypatch):
+    monkeypatch.delenv('C2_RELAY_ANCHOR_ADDRESS', raising=False)
+    runtime = cc.Runtime()
+    remote_runtime = cc.Runtime()
+    old_resource = ValuesResource()
+    remote_resource = ValuesResource()
+    runtime.register(StreamValues, old_resource, name='stream-follow')
+    remote_runtime.register(StreamValues, remote_resource, name='stream-follow')
+    proxy = runtime.connect(StreamValues, name='stream-follow')
+    monkeypatch.setattr(
+        runtime, '_connect',
+        lambda _crm_class, *, name, address, attempt: remote_runtime.connect(
+            StreamValues, name=name, address=address or remote_runtime.server_address(),
+        ),
+    )
+
+    captured = threading.Event()
+    proceed = threading.Event()
+    paused = False
+    getter = CRMProxy.supports_direct_call.fget
+
+    def gated_direct_call(target):
+        nonlocal paused
+        if threading.current_thread().name == 'captured-local-stream' and not paused:
+            paused = True
+            assert target._mode == 'thread'
+            assert target._client is None
+            captured.set()
+            assert proceed.wait(5)
+        return getter(target)
+
+    monkeypatch.setattr(CRMProxy, 'supports_direct_call', property(gated_direct_call))
+    result = {}
+
+    def call_captured():
+        try:
+            stream = proxy.steps(1)
+            try:
+                result['value'] = list(stream)
+            finally:
+                stream.close()
+        except BaseException as exc:
+            result['error'] = exc
+
+    worker = threading.Thread(target=call_captured, name='captured-local-stream')
+    try:
+        worker.start()
+        assert captured.wait(5)
+        runtime.unregister('stream-follow')
+        followed = proxy.steps(1)
+        try:
+            assert list(followed) == [0]
+        finally:
+            followed.close()
+        proceed.set()
+        worker.join(5)
+        assert not worker.is_alive()
+        assert result == {'value': [0]}
+        assert old_resource.events == []
+        assert remote_resource.events.count('factory') == 2
+    finally:
+        proceed.set()
+        worker.join(5)
+        cc.close(proxy)
+        assert runtime.shutdown(timeout=5)['completed']
+        assert remote_runtime.shutdown(timeout=5)['completed']
 
 
 def test_context_and_decimal_state_survive_yield_without_leaking_to_caller(monkeypatch):

@@ -27,10 +27,89 @@ enum StepResult {
 enum ItemSendError {
     Cancelled,
     PeerEnded,
+    ExecutorStopped,
     Output(String),
     Capacity(String),
     Crm(CrmError),
     Transport(String),
+}
+
+struct ExecutorStopped;
+
+fn worker_result<T>(
+    result: Result<T, tokio::task::JoinError>,
+    panic_message: &str,
+) -> Result<T, ExecutorStopped> {
+    match result {
+        Err(error) if error.is_cancelled() => Err(ExecutorStopped),
+        result => Ok(result.expect(panic_message)),
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static ENCODING_QUEUED: std::cell::RefCell<Option<std::sync::mpsc::Sender<()>>> =
+        const { std::cell::RefCell::new(None) };
+    static ENCODING_PAUSE: std::cell::RefCell<Option<EncodingPause>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+type EncodingPause = (std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>);
+
+#[cfg(test)]
+pub(super) fn observe_next_encoding(queued: std::sync::mpsc::Sender<()>) {
+    ENCODING_QUEUED.with(|observer| *observer.borrow_mut() = Some(queued));
+}
+
+#[cfg(test)]
+pub(super) fn pause_next_encoding(
+    ready: std::sync::mpsc::Sender<()>,
+    resume: std::sync::mpsc::Receiver<()>,
+) {
+    ENCODING_PAUSE.with(|pause| *pause.borrow_mut() = Some((ready, resume)));
+}
+
+async fn await_encoding<T, F>(work: F) -> Result<T, ItemSendError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    #[cfg(test)]
+    if let Some((ready, resume)) = ENCODING_PAUSE.with(|pause| pause.borrow_mut().take()) {
+        ready.send(()).expect("encoding controller still waiting");
+        resume
+            .recv()
+            .expect("encoding controller resumes submission");
+    }
+    let task = tokio::task::spawn_blocking(work);
+    #[cfg(test)]
+    ENCODING_QUEUED.with(|observer| {
+        if let Some(queued) = observer.borrow_mut().take() {
+            queued.send(()).expect("encoding observer still waiting");
+        }
+    });
+    // These handles are never aborted by C-Two. Tokio cancels queued blocking
+    // work when its executor is torn down; resource panics keep their old path.
+    worker_result(task.await, "stream encoding worker panicked")
+        .map_err(|_| ItemSendError::ExecutorStopped)
+}
+
+fn end_stream_after_executor_stop(writer: &ConnectionWriter, id: u64) {
+    writer
+        .conn
+        .end(ConnectionEndReason::LocalClose, "runtime_shutdown");
+    // Discard this record without claiming execution or cleanup completed.
+    // The initial worker may not have entered the resource at all.
+    let retired = writer.conn.calls.lock().retire(id);
+    if let Some(call) = retired {
+        call.reject_before_execution();
+        let input = call.data.input.lock().take();
+        if let Some(input) = input {
+            input.registry.settle(&input.request);
+        }
+    }
+    writer.conn.core.stream_retire(id);
 }
 
 fn cancelled(conn: &Connection, id: u64) -> StepStop {
@@ -271,7 +350,7 @@ async fn send_item(
     let pool = server.response_pool.clone();
     let threshold = server.config.shm_threshold;
     let (item, prepared) = if use_shm {
-        tokio::task::spawn_blocking(move || {
+        await_encoding(move || {
             let mut fill_error = None;
             let prepared = try_prepare_shm_response(&pool, threshold, item.len(), |dst| {
                 item.write_range(0, dst).map_err(|error| {
@@ -284,8 +363,7 @@ async fn send_item(
             });
             (item, prepared)
         })
-        .await
-        .expect("stream encoding worker panicked")
+        .await?
     } else {
         (item, Ok(None))
     };
@@ -325,7 +403,7 @@ async fn send_item(
             .unwrap_or(usize::MAX)
             .min(chunk_size)
             .min(item.len() - offset);
-        let (returned, bytes) = tokio::task::spawn_blocking(move || {
+        let (returned, bytes) = await_encoding(move || {
             let mut bytes = Vec::new();
             bytes
                 .try_reserve_exact(width)
@@ -335,8 +413,7 @@ async fn send_item(
                 .map_err(ItemSendError::Crm)?;
             Ok((item, bytes))
         })
-        .await
-        .expect("stream encoding worker panicked")?;
+        .await??;
         item = returned;
         conn.core
             .stream_data(id, width as u64)
@@ -355,21 +432,26 @@ async fn send_item(
 
 async fn finish_stream(
     server: &Server,
-    conn: &Connection,
+    conn: &Arc<Connection>,
     id: u64,
     slot: &SchedulerCallSlot,
     stream: Box<dyn crate::dispatcher::CrmStream>,
-) -> Result<(), CrmError> {
-    let pending = slot
-        .reserve_step()
-        .map_err(|error| CrmError::InternalError(error.to_string()))?;
-    let (route_guard, execution_guard) = acquire_step(server, conn, id, pending, Some(slot), false)
-        .await
-        .map_err(|error| match error {
-            StepStop::Acquire(error) => CrmError::InternalError(error.to_string()),
-            _ => unreachable!("cleanup is not interruptible"),
-        })?;
-    tokio::task::spawn_blocking(move || {
+) -> Result<Result<(), CrmError>, ExecutorStopped> {
+    let flight = crate::connection::FlightGuard::new(conn);
+    let pending = match slot.reserve_step() {
+        Ok(pending) => pending,
+        Err(error) => return Ok(Err(CrmError::InternalError(error.to_string()))),
+    };
+    let (route_guard, execution_guard) =
+        match acquire_step(server, conn, id, pending, Some(slot), false).await {
+            Ok(guards) => guards,
+            Err(StepStop::Acquire(error)) => {
+                return Ok(Err(CrmError::InternalError(error.to_string())));
+            }
+            Err(_) => unreachable!("cleanup is not interruptible"),
+        };
+    let result = tokio::task::spawn_blocking(move || {
+        let _flight = flight;
         let mut route_guard = route_guard;
         let _execution_guard = execution_guard;
         route_guard
@@ -377,8 +459,8 @@ async fn finish_stream(
             .map_err(|error| CrmError::InternalError(error.to_string()))?;
         stream.finish()
     })
-    .await
-    .expect("stream cleanup worker panicked")
+    .await;
+    worker_result(result, "stream cleanup worker panicked")
 }
 
 pub(super) async fn dispatch_stream_call(
@@ -458,8 +540,14 @@ pub(super) async fn dispatch_stream_call(
         let result = stream.step();
         Ok((stream, result))
     })
-    .await
-    .expect("stream initial worker panicked");
+    .await;
+    let first = match worker_result(first, "stream initial worker panicked") {
+        Ok(first) => first,
+        Err(ExecutorStopped) => {
+            end_stream_after_executor_stop(writer, id);
+            return;
+        }
+    };
     let (stream, mut step) = match first {
         Ok(value) => value,
         Err(FirstError::Cancelled) => {
@@ -513,9 +601,28 @@ pub(super) async fn dispatch_stream_call(
                         // Cleanup uses neither demand nor output storage. Keep
                         // polling the original send while cleanup runs, so no
                         // accepted frame or owned item is abandoned.
-                        let finishing = finish_stream(server, conn, id, &slot, stream.take().expect("live stream"));
-                        let (result, finished) = tokio::join!(&mut sending, finishing);
-                        cleanup = Some(finished);
+                        let finishing = finish_stream(server, &writer.conn, id, &slot, stream.take().expect("live stream"));
+                        // A stopped executor cannot finish either queued
+                        // worker. Poll encoding first and stop without
+                        // scheduling or awaiting further cleanup in that case.
+                        let completed = tokio::try_join!(
+                            biased;
+                            async {
+                                match (&mut sending).await {
+                                    Err(ItemSendError::ExecutorStopped) => Err(ExecutorStopped),
+                                    result => Ok(result),
+                                }
+                            },
+                            finishing,
+                        );
+                        let (result, finished) = match completed {
+                            Ok(completed) => completed,
+                            Err(ExecutorStopped) => {
+                                end_stream_after_executor_stop(writer, id);
+                                return;
+                            }
+                        };
+                        cleanup = Some(Ok(finished));
                         result
                     }
                 };
@@ -525,6 +632,10 @@ pub(super) async fn dispatch_stream_call(
                         break Some((CallStatus::Failed, cancellation_bytes(conn, id)));
                     }
                     Err(ItemSendError::PeerEnded) => break None,
+                    Err(ItemSendError::ExecutorStopped) => {
+                        end_stream_after_executor_stop(writer, id);
+                        return;
+                    }
                     Err(ItemSendError::Crm(error)) => {
                         break Some((CallStatus::Failed, crm_error_bytes(error)));
                     }
@@ -595,7 +706,7 @@ pub(super) async fn dispatch_stream_call(
             break None;
         };
         let mut advancing = stream.take().expect("live stream");
-        let (returned, result) = tokio::task::spawn_blocking(move || {
+        let result = tokio::task::spawn_blocking(move || {
             let mut route_guard = route_guard;
             let _execution_guard = execution_guard;
             if let Err(error) = route_guard.commit() {
@@ -612,8 +723,14 @@ pub(super) async fn dispatch_stream_call(
             let result = advancing.step();
             (advancing, StepResult::Advanced(result))
         })
-        .await
-        .expect("stream step worker panicked");
+        .await;
+        let (returned, result) = match worker_result(result, "stream step worker panicked") {
+            Ok(result) => result,
+            Err(ExecutorStopped) => {
+                end_stream_after_executor_stop(writer, id);
+                return;
+            }
+        };
         stream = Some(returned);
         step = match result {
             StepResult::Advanced(result) => result,
@@ -627,7 +744,23 @@ pub(super) async fn dispatch_stream_call(
     };
     let cleanup = match cleanup {
         Some(result) => result,
-        None => finish_stream(server, conn, id, &slot, stream.take().expect("live stream")).await,
+        None => {
+            finish_stream(
+                server,
+                &writer.conn,
+                id,
+                &slot,
+                stream.take().expect("live stream"),
+            )
+            .await
+        }
+    };
+    let cleanup = match cleanup {
+        Ok(cleanup) => cleanup,
+        Err(ExecutorStopped) => {
+            end_stream_after_executor_stop(writer, id);
+            return;
+        }
     };
     let terminal = terminal.map(|outcome| match cleanup {
         Err(error) => (CallStatus::Failed, crm_error_bytes(error)),

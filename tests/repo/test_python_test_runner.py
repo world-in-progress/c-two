@@ -408,7 +408,7 @@ def test_fresh_receipts_validate_and_bind_selected_c3(tmp_path: Path, monkeypatc
     monkeypatch.setattr(portable_matrix_receipt, 'load_and_validate_receipt', portable)
     monkeypatch.setattr(typescript_receipt, 'load_and_validate_receipt', typescript)
     runner.validate_receipts(tmp_path, 'actual')
-    assert calls == [(tmp_path / 'portable-matrix-receipt.v2.json', 'development'), (tmp_path / 'typescript-real-call-receipt.v2.json', 'development')]
+    assert calls == [(tmp_path / 'portable-matrix-receipt.v3.json', 'development'), (tmp_path / 'typescript-real-call-receipt.v3.json', 'development')]
     with pytest.raises(runner.RunnerError, match='哈希'):
         runner.validate_receipts(tmp_path, 'another build')
 

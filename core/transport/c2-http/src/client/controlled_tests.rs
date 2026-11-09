@@ -20,11 +20,12 @@ use tokio::sync::Notify;
 
 use super::{
     HttpCallControl, HttpCallError, HttpCallPhase, HttpError, HttpStreamCancellation,
-    RelayAwareClientConfig, RelayAwareHttpClient, RelayRouteInfo,
+    RelayAwareClientConfig, RelayAwareHttpClient, RelayControlClient, RelayRouteInfo,
 };
 
 const ABI_HASH: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 const SIGNATURE_HASH: &str = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+static NEXT_LIVE_FOLLOW: AtomicUsize = AtomicUsize::new(0);
 
 fn expected() -> ExpectedRouteContract {
     ExpectedRouteContract {
@@ -42,7 +43,6 @@ fn route(url: &str) -> RelayRouteInfo {
     RelayRouteInfo {
         name: contract.route_name,
         relay_url: url.into(),
-        route_uid: "controlled-grid-route".into(),
         ipc_address: None,
         server_id: None,
         server_instance_id: None,
@@ -167,10 +167,358 @@ async fn registry_with_max_payload_size(url: &str, max_payload_size: u64) -> Ser
     .await
 }
 
+#[tokio::test]
+async fn selected_relay_accepts_larger_unary_and_stream_after_same_contract_reregistration() {
+    use crate::stream_wire::{
+        HttpStreamRecordKind, HttpStreamStatus, HttpStreamTerminal, encode_header, encode_terminal,
+    };
+
+    let registration = Arc::new(Mutex::new(Vec::<RelayRouteInfo>::new()));
+    let active = Arc::new(AtomicBool::new(false));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let relay = serve(
+        Router::new()
+            .route(
+                "/_resolve/{route}",
+                get({
+                    let registration = registration.clone();
+                    move || {
+                        let registration = registration.clone();
+                        async move { Json(registration.lock().clone()) }
+                    }
+                }),
+            )
+            .route("/_probe/{route}", get(|| async { StatusCode::OK }))
+            .route(
+                "/{route}/{method}",
+                post({
+                    let active = active.clone();
+                    let calls = calls.clone();
+                    move |Path((_route, method)): Path<(String, String)>| {
+                        let active = active.clone();
+                        let calls = calls.clone();
+                        async move {
+                            calls.fetch_add(1, Ordering::SeqCst);
+                            if !active.load(Ordering::SeqCst) {
+                                return StatusCode::NOT_FOUND.into_response();
+                            }
+                            if method == "unary" {
+                                return (StatusCode::OK, b"larger result".to_vec()).into_response();
+                            }
+                            let mut record = crate::stream_wire::encode_item_begin(13).to_vec();
+                            record.extend_from_slice(&encode_header(
+                                HttpStreamRecordKind::ItemData,
+                                13,
+                            ));
+                            record.extend_from_slice(b"larger result");
+                            record.extend_from_slice(
+                                &encode_terminal(&HttpStreamTerminal {
+                                    status: HttpStreamStatus::Success,
+                                    complete_items: Some(1),
+                                    error: None,
+                                })
+                                .unwrap(),
+                            );
+                            (
+                                StatusCode::OK,
+                                [
+                                    ("content-type", crate::stream_wire::MEDIA_TYPE),
+                                    ("x-c2-call-token", "0123456789abcdef0123456789abcdef"),
+                                ],
+                                record,
+                            )
+                                .into_response()
+                        }
+                    }
+                }),
+            ),
+    )
+    .await;
+    let mut old = route(&relay.url);
+    old.max_payload_size = 4;
+    *registration.lock() = vec![old];
+    let client = acquired_client(&relay).await;
+
+    registration.lock().clear();
+    let mut renewed = route(&relay.url);
+    renewed.max_payload_size = 32;
+    *registration.lock() = vec![renewed];
+    active.store(true, Ordering::SeqCst);
+
+    let unary = client
+        .call_controlled_async("unary", Arc::new(vec![1]), &allowed())
+        .await
+        .unwrap();
+    assert_eq!(unary.as_ref(), b"larger result");
+    drop(unary);
+
+    let budget = c2_mem::retention::PayloadBufferBudget::new(128);
+    let headroom = budget.try_reserve(1).unwrap();
+    let control = allowed().with_payload_budget(budget, None);
+    let mut stream = client
+        .stream_controlled_async(
+            "stream",
+            Arc::new(vec![1]),
+            headroom,
+            Box::new(()),
+            HttpStreamCancellation::new(),
+            &control,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        stream.recv().await.unwrap().unwrap().as_ref(),
+        b"larger result"
+    );
+    assert!(stream.recv().await.unwrap().is_none());
+    assert_eq!(stream.completion().await.unwrap().complete_items, Some(1));
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+}
+
+struct LiveFollowResource;
+
+impl c2_server::CrmCallback for LiveFollowResource {
+    fn invoke(
+        &self,
+        _: &str,
+        method: u16,
+        _: Vec<u8>,
+        _: Arc<c2_server::ResponsePool>,
+    ) -> Result<c2_server::ResponseMeta, c2_server::CrmError> {
+        assert_eq!(method, 0);
+        Ok(c2_server::ResponseMeta::Inline(b"larger result".to_vec()))
+    }
+}
+
+impl c2_server::CrmStreamCallback for LiveFollowResource {
+    fn open_stream(
+        &self,
+        _: &str,
+        method: u16,
+        _: Vec<u8>,
+        _: Arc<c2_server::ResponsePool>,
+    ) -> Result<Box<dyn c2_server::CrmStream>, c2_server::CrmError> {
+        assert_eq!(method, 1);
+        Ok(Box::new(LiveFollowStream(false)))
+    }
+}
+
+struct LiveFollowStream(bool);
+
+impl c2_server::CrmStream for LiveFollowStream {
+    fn step(&mut self) -> Result<Option<Box<dyn c2_server::CrmStreamItem>>, c2_server::CrmError> {
+        if std::mem::replace(&mut self.0, true) {
+            Ok(None)
+        } else {
+            Ok(Some(Box::new(b"larger result".to_vec())))
+        }
+    }
+
+    fn finish(self: Box<Self>) -> Result<(), c2_server::CrmError> {
+        Ok(())
+    }
+}
+
+async fn live_follow_server(
+    context: &c2_config::LocalEndpointContext,
+    descriptor: &c2_contract::ValidatedContractDescriptor,
+    id: &str,
+    limit: u64,
+) -> (
+    Arc<c2_server::Server>,
+    tokio::task::JoinHandle<Result<(), c2_server::ServerError>>,
+) {
+    use c2_server::{
+        ConcurrencyMode, RouteBuildSpec, SchedulerLimits, ServerIdentity, ServerIpcConfig,
+    };
+    let address = format!("ipc://{id}");
+    let mut config = ServerIpcConfig::default();
+    config.max_payload_size = limit;
+    let server = Arc::new(
+        c2_server::Server::new_with_identity_and_endpoint(
+            context.endpoint(&address).unwrap(),
+            config,
+            ServerIdentity {
+                server_id: id.into(),
+                server_instance_id: format!("{id}-instance"),
+            },
+        )
+        .unwrap(),
+    );
+    let built = server
+        .build_stream_route(
+            RouteBuildSpec {
+                name: "portable".into(),
+                crm_ns: descriptor.crm_namespace().into(),
+                crm_name: descriptor.crm_name().into(),
+                crm_ver: descriptor.crm_version().into(),
+                abi_hash: descriptor.abi_hash().into(),
+                signature_hash: descriptor.signature_hash().into(),
+                method_names: vec!["ping".into(), "echo".into()],
+                access_map: std::collections::HashMap::new(),
+                concurrency_mode: ConcurrencyMode::Parallel,
+                limits: SchedulerLimits::default(),
+            },
+            Arc::new(LiveFollowResource),
+            descriptor,
+        )
+        .unwrap();
+    let reservation = server.reserve_route(built).await.unwrap();
+    server.commit_reserved_route(reservation).await.unwrap();
+    server.begin_start_attempt().unwrap();
+    let task = tokio::spawn({
+        let server = server.clone();
+        async move { server.run().await }
+    });
+    server
+        .wait_until_responsive(std::time::Duration::from_secs(2))
+        .await
+        .unwrap();
+    (server, task)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn live_relay_reregistration_larger_limit_preserves_old_client_unary_and_stream() {
+    let root = tempfile::tempdir().unwrap();
+    #[cfg(unix)]
+    let context = c2_config::LocalEndpointContext::with_unix_root(root.path()).unwrap();
+    #[cfg(windows)]
+    let context = c2_config::LocalEndpointContext::default_for_platform().unwrap();
+    let descriptor = c2_contract::ValidatedContractDescriptor::from_json(include_bytes!(
+        "../../../../foundation/c2-contract/tests/fixtures/server-stream.contract.json"
+    ))
+    .unwrap();
+    let id = format!(
+        "http-follow-{}-{}",
+        std::process::id(),
+        NEXT_LIVE_FOLLOW.fetch_add(1, Ordering::Relaxed)
+    );
+    let old_id = format!("{id}-old");
+    let new_id = format!("{id}-new");
+    let (old_server, old_task) = live_follow_server(&context, &descriptor, &old_id, 4).await;
+    let (new_server, new_task) = live_follow_server(&context, &descriptor, &new_id, 32).await;
+
+    let relay = tokio::task::spawn_blocking({
+        let context = context.clone();
+        move || {
+            crate::relay::RelayServer::start_with_context(
+                c2_config::RelayConfig {
+                    bind: "127.0.0.1:0".into(),
+                    idle_timeout_secs: 0,
+                    ..c2_config::RelayConfig::default()
+                },
+                context,
+            )
+            .unwrap()
+        }
+    })
+    .await
+    .unwrap();
+    let url = format!("http://{}", relay.local_addr());
+    let relay = Arc::new(Mutex::new(relay));
+    tokio::task::spawn_blocking({
+        let relay = relay.clone();
+        let old_id = old_id.clone();
+        move || {
+            relay
+                .lock()
+                .register_upstream("portable", &old_id, &format!("ipc://{old_id}"))
+                .unwrap()
+        }
+    })
+    .await
+    .unwrap();
+
+    let expected = c2_contract::ExpectedRouteContract {
+        route_name: "portable".into(),
+        crm_ns: descriptor.crm_namespace().into(),
+        crm_name: descriptor.crm_name().into(),
+        crm_ver: descriptor.crm_version().into(),
+        abi_hash: descriptor.abi_hash().into(),
+        signature_hash: descriptor.signature_hash().into(),
+    };
+    let client = tokio::task::spawn_blocking({
+        let url = url.clone();
+        move || {
+            let client =
+                RelayAwareHttpClient::new(&url, expected, false, RelayAwareClientConfig::default())
+                    .unwrap()
+                    .with_http_only();
+            client
+                .resolve_http_target_with_deadline(c2_config::ConnectDeadline::default())
+                .unwrap();
+            client
+        }
+    })
+    .await
+    .unwrap();
+
+    tokio::task::spawn_blocking({
+        let relay = relay.clone();
+        let old_id = old_id.clone();
+        let new_id = new_id.clone();
+        move || {
+            relay
+                .lock()
+                .unregister_upstream("portable", &old_id)
+                .unwrap();
+            relay
+                .lock()
+                .register_upstream("portable", &new_id, &format!("ipc://{new_id}"))
+                .unwrap();
+        }
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(
+        client
+            .call_controlled_async("ping", Arc::new(Vec::new()), &allowed())
+            .await
+            .unwrap()
+            .as_ref(),
+        b"larger result"
+    );
+    let budget = c2_mem::retention::PayloadBufferBudget::new(128);
+    let headroom = budget.try_reserve(1).unwrap();
+    let control = allowed().with_payload_budget(budget, None);
+    let mut stream = client
+        .stream_controlled_async(
+            "echo",
+            Arc::new(vec![0; 8]),
+            headroom,
+            Box::new(()),
+            HttpStreamCancellation::new(),
+            &control,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        stream.recv().await.unwrap().unwrap().as_ref(),
+        b"larger result"
+    );
+    assert!(stream.recv().await.unwrap().is_none());
+    assert_eq!(stream.completion().await.unwrap().complete_items, Some(1));
+    drop(stream);
+    tokio::task::spawn_blocking(move || relay.lock().stop().unwrap())
+        .await
+        .unwrap();
+    old_server
+        .shutdown_and_wait(std::time::Duration::from_secs(2))
+        .await
+        .unwrap();
+    new_server
+        .shutdown_and_wait(std::time::Duration::from_secs(2))
+        .await
+        .unwrap();
+    old_task.await.unwrap().unwrap();
+    new_task.await.unwrap().unwrap();
+}
+
 #[derive(Clone, Copy)]
 enum Reply {
     Echo,
-    Stale,
+    NotFound,
     Crm,
     Capacity,
     CapacityPreDispatch,
@@ -219,9 +567,9 @@ async fn business(
     }
     match *state.reply.lock() {
         Reply::Echo => (StatusCode::OK, body).into_response(),
-        Reply::Stale => (
-            StatusCode::CONFLICT,
-            semantic_error(ErrorCode::RouteStale, None),
+        Reply::NotFound => (
+            StatusCode::NOT_FOUND,
+            semantic_error(ErrorCode::ResourceNotFound, Some("pre_dispatch")),
         )
             .into_response(),
         Reply::Crm => (StatusCode::INTERNAL_SERVER_ERROR, b"crm-failure".to_vec()).into_response(),
@@ -249,6 +597,7 @@ async fn business(
 async fn data_server(state: &Data) -> Server {
     serve(
         Router::new()
+            .route("/_probe/{route}", get(|| async { StatusCode::OK }))
             .route("/{route}/{method}", post(business))
             .layer(DefaultBodyLimit::disable())
             .with_state(state.clone()),
@@ -264,6 +613,91 @@ fn client(registry: &Server) -> RelayAwareHttpClient {
         RelayAwareClientConfig::default(),
     )
     .unwrap()
+}
+
+async fn acquired_client(registry: &Server) -> RelayAwareHttpClient {
+    let client = client(registry);
+    tokio::task::spawn_blocking(move || {
+        client
+            .resolve_http_target_with_deadline(c2_config::ConnectDeadline::default())
+            .unwrap();
+        client
+    })
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn selected_http_target_stays_pinned_when_another_client_refreshes_shared_resolution() {
+    let old_data = Data::new(Reply::Echo);
+    let new_data = Data::new(Reply::Echo);
+    let old_server = data_server(&old_data).await;
+    let new_server = data_server(&new_data).await;
+    let routes = Arc::new(Mutex::new(vec![route(&old_server.url)]));
+    let resolves = Arc::new(AtomicUsize::new(0));
+    let registry = serve(Router::new().route(
+        "/_resolve/{route}",
+        get({
+            let routes = Arc::clone(&routes);
+            let resolves = Arc::clone(&resolves);
+            move || {
+                let routes = Arc::clone(&routes);
+                let resolves = Arc::clone(&resolves);
+                async move {
+                    resolves.fetch_add(1, Ordering::SeqCst);
+                    Json(routes.lock().clone())
+                }
+            }
+        }),
+    ))
+    .await;
+    let control = Arc::new(RelayControlClient::new(&registry.url, false).unwrap());
+    let old_client = Arc::new(
+        RelayAwareHttpClient::new_with_control(
+            Arc::clone(&control),
+            expected(),
+            false,
+            RelayAwareClientConfig::default(),
+        )
+        .unwrap(),
+    );
+    let new_client = Arc::new(
+        RelayAwareHttpClient::new_with_control(
+            Arc::clone(&control),
+            expected(),
+            false,
+            RelayAwareClientConfig::default(),
+        )
+        .unwrap(),
+    );
+    let selected = Arc::clone(&old_client);
+    tokio::task::spawn_blocking(move || {
+        selected.resolve_http_target_with_deadline(c2_config::ConnectDeadline::default())
+    })
+    .await
+    .unwrap()
+    .unwrap();
+
+    let mut replacement = route(&new_server.url);
+    replacement.max_payload_size = 1;
+    *routes.lock() = vec![replacement];
+    let selected = Arc::clone(&new_client);
+    tokio::task::spawn_blocking(move || {
+        selected.resolve_http_target_with_deadline(c2_config::ConnectDeadline::default())
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(resolves.load(Ordering::SeqCst), 2);
+
+    let result = old_client
+        .call_controlled_async("step", Arc::new(b"old-target".to_vec()), &allowed())
+        .await
+        .unwrap();
+    assert_eq!(result.as_ref(), b"old-target");
+    assert_eq!(resolves.load(Ordering::SeqCst), 2);
+    assert_eq!(old_data.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(new_data.calls.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]
@@ -296,7 +730,7 @@ async fn dispatch_guard_rejection_keeps_resolved_route_for_later_call() {
     let data = Data::new(Reply::Echo);
     let server = data_server(&data).await;
     let (registry, resolves) = registry(&[&server.url], None).await;
-    let client = client(&registry);
+    let client = acquired_client(&registry).await;
     let control = HttpCallControl::new(|| Ok(()), || Err(rejected()));
     let error = client
         .call_controlled_async("step", Arc::new(b"rejected".to_vec()), &control)
@@ -315,12 +749,11 @@ async fn dispatch_guard_rejection_keeps_resolved_route_for_later_call() {
 }
 
 #[tokio::test]
-async fn owner_deadline_rejection_after_route_wait_never_dispatches() {
+async fn owner_deadline_rejection_after_acquisition_never_dispatches() {
     let data = Data::new(Reply::Echo);
     let server = data_server(&data).await;
-    let gate = Arc::new(Gate::default());
-    let (registry, resolves) = registry(&[&server.url], Some(Arc::clone(&gate))).await;
-    let client = client(&registry);
+    let (registry, resolves) = registry(&[&server.url], None).await;
+    let client = acquired_client(&registry).await;
     // The owner supplies its terminal deadline observation. HTTP neither
     // constructs nor resets a deadline; events make this test deterministic.
     let expired = Arc::new(AtomicBool::new(false));
@@ -340,13 +773,10 @@ async fn owner_deadline_rejection_after_route_wait_never_dispatches() {
             Ok(())
         },
     );
-    let call = client.call_controlled_async("step", Arc::new(vec![1]), &control);
-    let expire_while_resolving = async {
-        gate.entered.notified().await;
-        expired.store(true, Ordering::SeqCst);
-        gate.resume.notify_one();
-    };
-    let (result, ()) = tokio::join!(call, expire_while_resolving);
+    expired.store(true, Ordering::SeqCst);
+    let result = client
+        .call_controlled_async("step", Arc::new(vec![1]), &control)
+        .await;
 
     assert_local(&result.unwrap_err());
     assert_eq!(resolves.load(Ordering::SeqCst), 1);
@@ -355,15 +785,15 @@ async fn owner_deadline_rejection_after_route_wait_never_dispatches() {
 }
 
 #[tokio::test]
-async fn authoritative_stale_post_reports_predispatch_without_retaining_replay_input() {
-    let stale = Data::new(Reply::Stale);
+async fn authoritative_not_found_post_reports_predispatch_without_retaining_replay_input() {
+    let missing = Data::new(Reply::NotFound);
     let live = Data::new(Reply::Echo);
-    let stale_server = data_server(&stale).await;
+    let missing_server = data_server(&missing).await;
     let live_server = data_server(&live).await;
-    let (registry, resolves) = registry(&[&stale_server.url, &live_server.url], None).await;
+    let (registry, resolves) = registry(&[&missing_server.url, &live_server.url], None).await;
     let phases = Arc::new(Mutex::new(Vec::new()));
     let control = record_dispatches(&phases);
-    let client = client(&registry);
+    let client = acquired_client(&registry).await;
     let error = client
         .call_controlled_async("step", Arc::new(b"same-input".to_vec()), &control)
         .await
@@ -371,48 +801,50 @@ async fn authoritative_stale_post_reports_predispatch_without_retaining_replay_i
 
     assert_eq!(error.phase(), HttpCallPhase::PreDispatch);
     assert_eq!(*phases.lock(), vec![None]);
-    assert_eq!(stale.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(missing.calls.load(Ordering::SeqCst), 1);
     assert_eq!(live.calls.load(Ordering::SeqCst), 0);
     assert_eq!(resolves.load(Ordering::SeqCst), 1);
 }
 
-fn assert_stale_control_error(error: &HttpCallError) {
+fn assert_not_found_control_error(error: &HttpCallError) {
     assert_eq!(error.phase(), HttpCallPhase::PreDispatch);
     assert!(error.is_retry_safe());
-    let HttpError::ResponseError(409, body) = error.source_error() else {
-        panic!("expected the relay's 409 error envelope, got {error:?}");
+    let HttpError::ResponseError(404, body) = error.source_error() else {
+        panic!("expected the relay's 404 error envelope, got {error:?}");
     };
     let envelope = serde_json::from_slice(body.as_ref()).unwrap();
     let decoded = C2Error::from_envelope(envelope).unwrap();
-    assert_eq!(decoded.code, ErrorCode::RouteStale);
+    assert_eq!(decoded.code, ErrorCode::ResourceNotFound);
 }
 
 #[tokio::test]
-async fn unary_route_stale_control_envelope_exceeds_one_byte_business_limit() {
-    let stale = Data::new(Reply::Stale);
-    let server = data_server(&stale).await;
+async fn unary_route_not_found_control_envelope_exceeds_one_byte_business_limit() {
+    let missing = Data::new(Reply::NotFound);
+    let server = data_server(&missing).await;
     let registry = registry_with_max_payload_size(&server.url, 1).await;
     let control = allowed();
 
-    let error = client(&registry)
+    let error = acquired_client(&registry)
+        .await
         .call_controlled_async("step", Arc::new(vec![1]), &control)
         .await
         .unwrap_err();
 
-    assert_stale_control_error(&error);
-    assert_eq!(stale.calls.load(Ordering::SeqCst), 1);
+    assert_not_found_control_error(&error);
+    assert_eq!(missing.calls.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
-async fn stream_route_stale_control_envelope_exceeds_one_byte_business_limit() {
-    let stale = Data::new(Reply::Stale);
-    let server = data_server(&stale).await;
+async fn stream_route_not_found_control_envelope_exceeds_one_byte_business_limit() {
+    let missing = Data::new(Reply::NotFound);
+    let server = data_server(&missing).await;
     let registry = registry_with_max_payload_size(&server.url, 1).await;
     let budget = c2_mem::retention::PayloadBufferBudget::new(4096);
     let headroom = budget.try_reserve(1).unwrap();
     let control = allowed().with_payload_budget(budget, None);
 
-    let error = client(&registry)
+    let error = acquired_client(&registry)
+        .await
         .stream_controlled_async(
             "step",
             Arc::new(vec![1]),
@@ -423,19 +855,19 @@ async fn stream_route_stale_control_envelope_exceeds_one_byte_business_limit() {
         )
         .await
         .err()
-        .expect("stale route must reject the stream before dispatch");
+        .expect("missing route must reject the stream before dispatch");
 
-    assert_stale_control_error(&error);
-    assert_eq!(stale.calls.load(Ordering::SeqCst), 1);
+    assert_not_found_control_error(&error);
+    assert_eq!(missing.calls.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
 async fn consumed_input_does_not_enter_a_second_dispatch_guard() {
-    let stale = Data::new(Reply::Stale);
+    let missing = Data::new(Reply::NotFound);
     let live = Data::new(Reply::Echo);
-    let stale_server = data_server(&stale).await;
+    let missing_server = data_server(&missing).await;
     let live_server = data_server(&live).await;
-    let (registry, _) = registry(&[&stale_server.url, &live_server.url], None).await;
+    let (registry, _) = registry(&[&missing_server.url, &live_server.url], None).await;
     let phases = Arc::new(Mutex::new(Vec::new()));
     let observed = Arc::clone(&phases);
     let control = HttpCallControl::new(
@@ -445,14 +877,15 @@ async fn consumed_input_does_not_enter_a_second_dispatch_guard() {
             Ok(())
         },
     );
-    let error = client(&registry)
+    let error = acquired_client(&registry)
+        .await
         .call_controlled_async("step", Arc::new(vec![1]), &control)
         .await
         .unwrap_err();
 
     assert_eq!(error.phase(), HttpCallPhase::PreDispatch);
     assert_eq!(*phases.lock(), vec![None]);
-    assert_eq!(stale.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(missing.calls.load(Ordering::SeqCst), 1);
     assert_eq!(live.calls.load(Ordering::SeqCst), 0);
 }
 
@@ -465,7 +898,8 @@ async fn uncertain_and_crm_failures_never_retry_or_forge_proof() {
         let live_server = data_server(&live).await;
         let (registry, resolves) = registry(&[&failed_server.url, &live_server.url], None).await;
         let phases = Arc::new(Mutex::new(Vec::new()));
-        let error = client(&registry)
+        let error = acquired_client(&registry)
+            .await
             .call_controlled_async("step", Arc::new(vec![1]), &record_dispatches(&phases))
             .await
             .unwrap_err();
@@ -512,6 +946,14 @@ async fn network_loss_after_post_does_not_send_again() {
                     break;
                 }
             }
+            if request.starts_with(b"GET /_probe/grid HTTP/1.1\r\n") {
+                use tokio::io::AsyncWriteExt;
+                socket
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    .await
+                    .unwrap();
+                continue;
+            }
             assert!(request.starts_with(b"POST /grid/step HTTP/1.1\r\n"));
             accepted.fetch_add(1, Ordering::SeqCst);
             drop(socket);
@@ -522,7 +964,8 @@ async fn network_loss_after_post_does_not_send_again() {
     let live_server = data_server(&live).await;
     let (registry, resolves) = registry(&[&lost_server.url, &live_server.url], None).await;
     let phases = Arc::new(Mutex::new(Vec::new()));
-    let error = client(&registry)
+    let error = acquired_client(&registry)
+        .await
         .call_controlled_async(
             "step",
             Arc::new(b"lost".to_vec()),
@@ -531,7 +974,7 @@ async fn network_loss_after_post_does_not_send_again() {
         .await
         .unwrap_err();
 
-    assert!(matches!(error.source_error(), HttpError::Transport(_)));
+    assert!(matches!(error.source_error(), HttpError::Request(_)));
     assert_eq!(error.phase(), HttpCallPhase::DispatchUncertain);
     assert_eq!(*phases.lock(), vec![None]);
     assert_eq!(calls.load(Ordering::SeqCst), 1);
@@ -543,7 +986,7 @@ async fn assert_capacity_preserves_route(reply: Reply, status: u16, phase: HttpC
     let data = Data::new(reply);
     let server = data_server(&data).await;
     let (registry, resolves) = registry(&[&server.url], None).await;
-    let client = client(&registry);
+    let client = acquired_client(&registry).await;
     let phases = Arc::new(Mutex::new(Vec::new()));
     let control = record_dispatches(&phases);
     let error = client
@@ -574,7 +1017,7 @@ async fn capacity_refusal_preserves_cache_and_never_provides_retry_proof() {
 }
 
 #[tokio::test]
-async fn predispatched_capacity_refusal_is_not_a_stale_route_proof() {
+async fn predispatched_capacity_refusal_does_not_prove_route_not_found() {
     assert_capacity_preserves_route(Reply::CapacityPreDispatch, 502, HttpCallPhase::PreDispatch)
         .await;
 }
@@ -586,7 +1029,7 @@ async fn concurrent_calls_keep_their_control_hooks_independent() {
     data.call_gate = Some(Arc::clone(&gate));
     let server = data_server(&data).await;
     let (registry, _) = registry(&[&server.url], None).await;
-    let client = client(&registry);
+    let client = acquired_client(&registry).await;
     let good_phases = Arc::new(Mutex::new(Vec::new()));
     let good = record_dispatches(&good_phases);
     let bad_phases = Arc::new(Mutex::new(Vec::new()));
@@ -624,11 +1067,11 @@ fn assert_headers(headers: &HeaderMap, len: usize) {
         ("x-c2-expected-crm-ver", "0.1.0"),
         ("x-c2-expected-abi-hash", ABI_HASH),
         ("x-c2-expected-signature-hash", SIGNATURE_HASH),
-        ("x-c2-route-uid", "controlled-grid-route"),
         ("content-type", "application/octet-stream"),
     ] {
         assert_eq!(headers[key], expected, "header {key}");
     }
+    assert!(headers.get("x-c2-route-uid").is_none());
     assert_eq!(headers["content-length"], len.to_string());
     assert!(headers.get("transfer-encoding").is_none());
 }
@@ -650,6 +1093,14 @@ async fn owned_payloads_preserve_content_length_contract_headers_and_contents() 
             ..Default::default()
         },
     )
+    .unwrap();
+    let client = tokio::task::spawn_blocking(move || {
+        client
+            .resolve_http_target_with_deadline(c2_config::ConnectDeadline::default())
+            .unwrap();
+        client
+    })
+    .await
     .unwrap();
     for len in [0, 1, 64 * 1024, 64 * 1024 + 1, 2 * 1024 * 1024 + 17] {
         let input = Arc::new(
@@ -681,7 +1132,7 @@ async fn test_owned_driver_finishes_after_application_waiter_leaves() {
     data.call_gate = Some(Arc::clone(&gate));
     let server = data_server(&data).await;
     let (registry, _) = registry(&[&server.url], None).await;
-    let client = client(&registry);
+    let client = acquired_client(&registry).await;
     let expired = Arc::new(AtomicBool::new(false));
     let observed = Arc::clone(&expired);
     let control = HttpCallControl::new(
@@ -725,9 +1176,7 @@ async fn test_owned_driver_finishes_after_application_waiter_leaves() {
     assert_eq!(data.calls.load(Ordering::SeqCst), 1);
 }
 
-// A small advertised native message limit deliberately differs from both the
-// request batching policy and the default limit. Both HTTP-only (explicit
-// relay) and relay-aware calls must consume the selected route's value.
+// A small advertised limit must not constrain responses after registration changes.
 const RESPONSE_LIMIT: u64 = 8;
 
 #[derive(Clone)]
@@ -793,33 +1242,28 @@ async fn response_fixture(state: ResponseData) -> (Server, Server, RelayAwareHtt
         }),
     ))
     .await;
-    let client = client(&registry);
+    let client = acquired_client(&registry).await;
     (server, registry, client)
 }
 
-fn assert_response_limit(error: &HttpCallError) {
+fn assert_response_budget(error: &HttpCallError) {
     assert_eq!(error.phase(), HttpCallPhase::DispatchUncertain);
     assert!(!error.is_retry_safe());
-    let HttpError::ServerError(_, body) = error.source_error() else {
-        panic!("expected canonical response protocol error, got {error:?}");
+    let HttpError::LocalCallRejected(error) = error.source_error() else {
+        panic!("expected local response budget error, got {error:?}");
     };
-    let error = C2Error::from_envelope(serde_json::from_str(body).unwrap()).unwrap();
-    assert_eq!(error.code, ErrorCode::ProtocolViolation);
-    assert_eq!(error.details["reason"], "response_payload_too_large");
-    assert_eq!(
-        error.details["max_payload_size"],
-        RESPONSE_LIMIT.to_string()
-    );
+    assert_eq!(error.code, ErrorCode::CallCapacityExceeded);
+    assert_eq!(error.details["stage"], "payload_buffer_admission");
 }
 
 #[tokio::test]
-async fn business_response_message_limit_covers_success_and_crm_before_eof() {
+async fn business_response_budget_covers_success_and_crm_before_eof() {
     for status in [StatusCode::OK, StatusCode::INTERNAL_SERVER_ERROR] {
         for chunked in [false, true] {
             for http_only in [false, true] {
                 let calls = Arc::new(AtomicUsize::new(0));
                 let tail = Arc::new(Gate::default());
-                let (_server, _registry, client) = response_fixture(ResponseData {
+                let (_server, registry, acquired) = response_fixture(ResponseData {
                     status,
                     chunked,
                     calls: calls.clone(),
@@ -828,11 +1272,20 @@ async fn business_response_message_limit_covers_success_and_crm_before_eof() {
                 })
                 .await;
                 let client = if http_only {
-                    client.with_http_only()
+                    let client = client(&registry).with_http_only();
+                    tokio::task::spawn_blocking(move || {
+                        client
+                            .resolve_http_target_with_deadline(c2_config::ConnectDeadline::default())
+                            .unwrap();
+                        client
+                    })
+                    .await
+                    .unwrap()
                 } else {
-                    client
+                    acquired
                 };
-                let control = allowed();
+                let budget = c2_mem::retention::PayloadBufferBudget::new(RESPONSE_LIMIT);
+                let control = allowed().with_payload_budget(budget, None);
                 let result = tokio::time::timeout(
                     std::time::Duration::from_secs(2),
                     client.call_controlled_async("large", Arc::new(vec![1]), &control),
@@ -843,7 +1296,7 @@ async fn business_response_message_limit_covers_success_and_crm_before_eof() {
                 let error = result
                     .expect("reader must reject without waiting for EOF")
                     .unwrap_err();
-                assert_response_limit(&error);
+                assert_response_budget(&error);
                 assert_eq!(
                     calls.load(Ordering::SeqCst),
                     1,
@@ -895,7 +1348,7 @@ async fn relay_control_error_uses_protocol_limit_and_retains_b_charge() {
 }
 
 #[tokio::test]
-async fn response_message_limit_also_covers_borrowed_legacy_calls() {
+async fn borrowed_legacy_calls_accept_responses_above_registration_limit() {
     let (_server, _registry, client) = response_fixture(ResponseData {
         status: StatusCode::OK,
         chunked: false,
@@ -904,15 +1357,9 @@ async fn response_message_limit_also_covers_borrowed_legacy_calls() {
         tail: None,
     })
     .await;
-    let error = client.call_async("large", &[1]).await.unwrap_err();
-    let HttpError::ServerError(_, body) = error else {
-        panic!("expected protocol error: {error:?}");
-    };
     assert_eq!(
-        C2Error::from_envelope(serde_json::from_str(&body).unwrap())
-            .unwrap()
-            .code,
-        ErrorCode::ProtocolViolation
+        client.call_async("large", &[1]).await.unwrap(),
+        vec![b'x'; 9]
     );
 }
 
@@ -965,7 +1412,8 @@ async fn late_response_completion_keeps_only_actual_request_reader_and_native_dr
                 }
             },
             || Ok(()),
-        );
+        )
+        .with_payload_budget(budget.clone(), None);
         let driver_client = client.clone();
         let (delivery, waiter) = tokio::sync::oneshot::channel();
         let driver = tokio::spawn(async move {
@@ -1016,14 +1464,7 @@ async fn late_response_completion_keeps_only_actual_request_reader_and_native_dr
             "late completion cannot deliver a second caller outcome"
         );
         let error = result.unwrap_err();
-        if status == StatusCode::BAD_GATEWAY {
-            assert_eq!(error.phase(), HttpCallPhase::DispatchUncertain);
-            assert!(
-                matches!(error.source_error(), HttpError::ResponseError(502, body) if body.as_ref() == b"123123123")
-            );
-        } else {
-            assert_response_limit(&error);
-        }
+        assert_response_budget(&error);
         assert_eq!(
             active_checks.load(Ordering::SeqCst),
             checks_at_expiry,
@@ -1072,22 +1513,22 @@ fn response_from_chunks(
 
 async fn check_response_reader(status: u16, known_length: bool) {
     let polls = Arc::new(AtomicUsize::new(0));
+    let budget = c2_mem::retention::PayloadBufferBudget::new(RESPONSE_LIMIT);
     let result = tokio::time::timeout(
         std::time::Duration::from_millis(100),
-        read_response(
+        crate::payload::read_http_response(
             response_from_chunks(status, known_length, polls.clone()),
-            RESPONSE_LIMIT,
+            &budget,
+            None,
         ),
     )
     .await
     .expect("reader must reject before polling EOF");
     let error = result.unwrap_err();
-    let HttpError::ServerError(_, body) = error else {
-        panic!("expected protocol error: {error:?}");
+    let HttpError::LocalCallRejected(error) = error else {
+        panic!("expected payload budget error: {error:?}");
     };
-    let error = C2Error::from_envelope(serde_json::from_str(&body).unwrap()).unwrap();
-    assert_eq!(error.code, ErrorCode::ProtocolViolation);
-    assert_eq!(error.details["reason"], "response_payload_too_large");
+    assert_eq!(error.code, ErrorCode::CallCapacityExceeded);
     if !known_length {
         assert_eq!(polls.load(Ordering::SeqCst), 3);
     }
@@ -1106,50 +1547,51 @@ async fn relay_control_error_declared_length_above_protocol_limit_rejects_before
     use tokio::io::AsyncWriteExt;
 
     let limit = crate::stream_wire::MAX_TERMINAL_PAYLOAD_BYTES;
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let url = format!("http://{}", listener.local_addr().unwrap());
-    let server = tokio::spawn(async move {
-        let (mut socket, _) = listener.accept().await.unwrap();
-        let mut request = Vec::new();
-        while !request.windows(4).any(|window| window == b"\r\n\r\n") {
-            let mut bytes = [0; 1024];
-            let count = socket.read(&mut bytes).await.unwrap();
-            assert!(count > 0);
-            request.extend_from_slice(&bytes[..count]);
-        }
-        socket
-            .write_all(
-                format!(
-                    "HTTP/1.1 502 Bad Gateway\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                    limit + 1
-                )
-                .as_bytes(),
-            )
+    for (status, reason) in [
+        (200, "OK"),
+        (500, "Internal Server Error"),
+        (502, "Bad Gateway"),
+    ] {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let mut bytes = [0; 1024];
+                let count = socket.read(&mut bytes).await.unwrap();
+                assert!(count > 0);
+                request.extend_from_slice(&bytes[..count]);
+            }
+            socket.write_all(format!(
+                "HTTP/1.1 {status} {reason}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                limit + 1,
+            ).as_bytes()).await.unwrap();
+        });
+        let response = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .get(url)
+            .send()
             .await
             .unwrap();
-    });
-    let response = reqwest::Client::builder()
-        .no_proxy()
-        .build()
-        .unwrap()
-        .get(url)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(response.content_length(), Some(limit + 1));
-    let budget = c2_mem::retention::PayloadBufferBudget::new(64);
-    let error = crate::payload::read_http_response(response, RESPONSE_LIMIT, &budget, None)
-        .await
-        .unwrap_err();
-    let HttpError::ServerError(502, body) = error else {
-        panic!("expected response protocol error, got {error:?}");
-    };
-    let decoded = C2Error::from_envelope(serde_json::from_str(&body).unwrap()).unwrap();
-    assert_eq!(decoded.code, ErrorCode::ProtocolViolation);
-    assert_eq!(decoded.details["reason"], "response_payload_too_large");
-    assert_eq!(decoded.details["max_payload_size"], limit.to_string());
-    assert_eq!(budget.snapshot().peak_bytes, 0);
-    server.await.unwrap();
+        assert_eq!(response.content_length(), Some(limit + 1));
+        let budget = c2_mem::retention::PayloadBufferBudget::new(64);
+        let error = crate::payload::read_http_response(response, &budget, None)
+            .await
+            .unwrap_err();
+        let HttpError::ServerError(actual, body) = error else {
+            panic!("expected response protocol error, got {error:?}");
+        };
+        assert_eq!(actual, status);
+        let decoded = C2Error::from_envelope(serde_json::from_str(&body).unwrap()).unwrap();
+        assert_eq!(decoded.code, ErrorCode::ProtocolViolation);
+        assert_eq!(decoded.details["reason"], "response_payload_too_large");
+        assert_eq!(decoded.details["max_payload_size"], limit.to_string());
+        assert_eq!(budget.snapshot().peak_bytes, 0);
+        server.await.unwrap();
+    }
 }
 
 #[tokio::test]
@@ -1168,7 +1610,6 @@ async fn chunked_relay_control_error_respects_b_before_waiting_for_eof() {
         std::time::Duration::from_millis(100),
         crate::payload::read_http_response(
             response_from_chunks(502, false, polls.clone()),
-            RESPONSE_LIMIT,
             &budget,
             None,
         ),
@@ -1208,7 +1649,7 @@ async fn response_reader_preserves_compliant_bodies_and_uses_actual_body_hint() 
                     .body(body)
                     .unwrap()
                     .into();
-                let result = read_response(response, RESPONSE_LIMIT).await;
+                let result = read_response(response).await;
                 match (status, result) {
                     (200, Ok(bytes)) => assert_eq!(bytes.as_ref(), expected),
                     (500, Err(HttpError::CrmError(bytes))) => assert_eq!(bytes.as_ref(), expected),
@@ -1231,13 +1672,13 @@ async fn response_reader_preserves_compliant_bodies_and_uses_actual_body_hint() 
         .into();
     assert_eq!(response.content_length(), Some(0));
     assert!(
-        matches!(read_response(response, RESPONSE_LIMIT).await, Err(HttpError::ResponseError(304, text)) if text.is_empty())
+        matches!(read_response(response).await, Err(HttpError::ResponseError(304, text)) if text.is_empty())
     );
 
     for len in [0, 1] {
         let response: reqwest::Response =
             axum::http::Response::new(reqwest::Body::from(vec![0; len])).into();
-        let bytes = read_response(response, u64::MAX).await.unwrap();
+        let bytes = read_response(response).await.unwrap();
         assert_eq!(bytes.len(), len);
         assert!(
             bytes.capacity() < 1024,
@@ -1278,18 +1719,17 @@ async fn response_content_length_metadata_can_exceed_limit_for_legal_empty_body(
     assert_eq!(response.headers()["content-length"], "999999");
     assert_eq!(response.content_length(), Some(0));
     assert!(
-        matches!(read_response(response, RESPONSE_LIMIT).await, Err(HttpError::ResponseError(304, text)) if text.is_empty())
+        matches!(read_response(response).await, Err(HttpError::ResponseError(304, text)) if text.is_empty())
     );
     server.await.unwrap();
 }
 
 async fn read_response(
     response: reqwest::Response,
-    max: u64,
 ) -> Result<c2_mem::retention::BudgetedBuffer, HttpError> {
     let budget =
         c2_mem::retention::PayloadBufferBudget::new(c2_config::DEFAULT_PAYLOAD_BUFFER_BUDGET_BYTES);
-    crate::payload::read_http_response(response, max, &budget, None).await
+    crate::payload::read_http_response(response, &budget, None).await
 }
 
 #[tokio::test]
@@ -1312,6 +1752,14 @@ async fn completed_request_budget_is_reused_by_its_known_length_response() {
             ..Default::default()
         },
     )
+    .unwrap();
+    let client = tokio::task::spawn_blocking(move || {
+        client
+            .resolve_http_target_with_deadline(c2_config::ConnectDeadline::default())
+            .unwrap();
+        client
+    })
+    .await
     .unwrap();
     let output = tokio::time::timeout(
         std::time::Duration::from_secs(2),
@@ -1336,39 +1784,62 @@ async fn controlled_stream_uses_one_bound_post_and_stream_accept_header() {
     let seen_headers = Arc::new(Mutex::new(None::<HeaderMap>));
     let post_calls = calls.clone();
     let post_headers = seen_headers.clone();
-    let server = serve(Router::new().route(
-        "/{route}/{method}",
-        post(move |headers: HeaderMap, body: Bytes| {
-            let calls = post_calls.clone();
-            let seen = post_headers.clone();
-            async move {
-                calls.fetch_add(1, Ordering::SeqCst);
-                *seen.lock() = Some(headers);
-                assert_eq!(body.as_ref(), b"input");
-                let mut record = crate::stream_wire::encode_item_begin(4).to_vec();
-                record.extend_from_slice(&encode_header(HttpStreamRecordKind::ItemData, 4));
-                record.extend_from_slice(b"item");
-                record.extend_from_slice(
-                    &encode_terminal(&HttpStreamTerminal {
-                        status: HttpStreamStatus::Success,
-                        complete_items: Some(1),
-                        error: None,
-                    })
-                    .unwrap(),
-                );
-                (
-                    StatusCode::OK,
-                    [
-                        ("content-type", crate::stream_wire::MEDIA_TYPE),
-                        ("x-c2-call-token", "0123456789abcdef0123456789abcdef"),
-                    ],
-                    record,
-                )
+    let server = serve(
+        Router::new()
+            .route("/_probe/{route}", get(|| async { StatusCode::OK }))
+            .route(
+                "/{route}/{method}",
+                post(move |headers: HeaderMap, body: Bytes| {
+                    let calls = post_calls.clone();
+                    let seen = post_headers.clone();
+                    async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        *seen.lock() = Some(headers);
+                        assert_eq!(body.as_ref(), b"input");
+                        let mut record = crate::stream_wire::encode_item_begin(4).to_vec();
+                        record.extend_from_slice(&encode_header(HttpStreamRecordKind::ItemData, 4));
+                        record.extend_from_slice(b"item");
+                        record.extend_from_slice(
+                            &encode_terminal(&HttpStreamTerminal {
+                                status: HttpStreamStatus::Success,
+                                complete_items: Some(1),
+                                error: None,
+                            })
+                            .unwrap(),
+                        );
+                        (
+                            StatusCode::OK,
+                            [
+                                ("content-type", crate::stream_wire::MEDIA_TYPE),
+                                ("x-c2-call-token", "0123456789abcdef0123456789abcdef"),
+                            ],
+                            record,
+                        )
+                    }
+                }),
+            ),
+    )
+    .await;
+    let newer = Data::new(Reply::Echo);
+    let newer_server = data_server(&newer).await;
+    let routes = Arc::new(Mutex::new(vec![route(&server.url)]));
+    let resolves = Arc::new(AtomicUsize::new(0));
+    let registry = serve(Router::new().route(
+        "/_resolve/{route}",
+        get({
+            let routes = Arc::clone(&routes);
+            let resolves = Arc::clone(&resolves);
+            move || {
+                let routes = Arc::clone(&routes);
+                let resolves = Arc::clone(&resolves);
+                async move {
+                    resolves.fetch_add(1, Ordering::SeqCst);
+                    Json(routes.lock().clone())
+                }
             }
         }),
     ))
     .await;
-    let (registry, _) = registry(&[&server.url], None).await;
     let budget = c2_mem::retention::PayloadBufferBudget::new(128);
     let input = Arc::new(ReservedResponseInput {
         bytes: b"input".to_vec(),
@@ -1376,7 +1847,39 @@ async fn controlled_stream_uses_one_bound_post_and_stream_accept_header() {
     });
     let headroom = budget.try_reserve(1).unwrap();
     let control = allowed().with_payload_budget(budget.clone(), None);
-    let client = client(&registry);
+    let relay_control = Arc::new(RelayControlClient::new(&registry.url, false).unwrap());
+    let client = RelayAwareHttpClient::new_with_control(
+        Arc::clone(&relay_control),
+        expected(),
+        false,
+        RelayAwareClientConfig::default(),
+    )
+    .unwrap();
+    let client = tokio::task::spawn_blocking(move || {
+        client
+            .resolve_http_target_with_deadline(c2_config::ConnectDeadline::default())
+            .unwrap();
+        client
+    })
+    .await
+    .unwrap();
+    let mut replacement = route(&newer_server.url);
+    replacement.max_payload_size = 1;
+    *routes.lock() = vec![replacement];
+    let newer_client = RelayAwareHttpClient::new_with_control(
+        Arc::clone(&relay_control),
+        expected(),
+        false,
+        RelayAwareClientConfig::default(),
+    )
+    .unwrap();
+    tokio::task::spawn_blocking(move || {
+        newer_client
+            .resolve_http_target_with_deadline(c2_config::ConnectDeadline::default())
+            .unwrap();
+    })
+    .await
+    .unwrap();
     let mut stream = client
         .stream_controlled_async(
             "step",
@@ -1393,6 +1896,8 @@ async fn controlled_stream_uses_one_bound_post_and_stream_accept_header() {
     assert_eq!(stream.completion().await.unwrap().complete_items, Some(1));
     let headers = seen_headers.lock().clone().unwrap();
     assert_eq!(headers["accept"], crate::stream_wire::MEDIA_TYPE);
-    assert_eq!(headers["x-c2-route-uid"], "controlled-grid-route");
+    assert!(headers.get("x-c2-route-uid").is_none());
     assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(newer.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(resolves.load(Ordering::SeqCst), 2);
 }

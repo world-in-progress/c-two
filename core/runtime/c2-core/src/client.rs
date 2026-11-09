@@ -1,7 +1,9 @@
+use parking_lot::RwLock;
 use std::error::Error as _;
 use std::fmt;
 use std::io::ErrorKind;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Duration;
 
 use c2_config::{CallOptions, ConnectDeadline, ConnectOptions};
@@ -41,10 +43,27 @@ pub enum ObservedPath {
     RelayAwareRelay,
 }
 
-/// Immutable route identity observed when one Core client is acquired.
+/// Shared identity of the physical IPC connection selected for one call.
+#[doc(hidden)]
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ObservedRoute {
-    pub route_uid: String,
+pub struct IpcCallTarget {
+    pub server_identity: Arc<c2_wire::handshake::ServerIdentity>,
+    pub connection_id: u64,
+}
+
+/// The transport selected at the original call's dispatch handoff.
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallDispatchTarget {
+    pub path: ObservedPath,
+    pub ipc: Option<IpcCallTarget>,
+}
+
+/// Original outcome and its immutable dispatch target, including failures.
+#[doc(hidden)]
+pub struct CallRecordOutcome<R> {
+    pub result: Result<R, Error>,
+    pub dispatch_target: Option<CallDispatchTarget>,
 }
 
 /// Monotonic process-runtime observations of successfully selected paths.
@@ -94,12 +113,34 @@ pub struct Client {
 
 struct ClientConnection {
     expected: ExpectedRouteContract,
-    observed_path: ObservedPath,
-    observed_route: ObservedRoute,
     runtime: Runtime,
+    acquire: ClientAcquire,
+    current: RwLock<Arc<ClientTarget>>,
+    refresh: Arc<tokio::sync::Mutex<()>>,
+}
+
+enum ClientAcquire {
+    Direct {
+        address: String,
+    },
+    Relay {
+        anchor: String,
+        settings: c2_config::ResolvedRelayClientConfig,
+        http_only: bool,
+    },
+    Endpoint(Arc<EndpointAcquisition>),
+}
+
+pub(crate) struct ClientTarget {
+    observed_path: ObservedPath,
     path_default: Option<Duration>,
     transport: ClientInner,
+    // Invalidations belong to this exact target, never a later publication.
+    facts: AtomicU8,
 }
+
+const NEEDS_ACQUIRE: u8 = 1;
+const TERMINAL_REFUSAL: u8 = 2;
 
 enum ClientInner {
     Ipc(PooledIpcClient),
@@ -109,6 +150,212 @@ enum ClientInner {
 struct PooledIpcClient {
     client: c2_ipc::pool::ClientLease,
     binding: RouteBinding,
+    server_identity: Arc<c2_wire::handshake::ServerIdentity>,
+}
+
+impl PooledIpcClient {
+    fn new(client: c2_ipc::pool::ClientLease, binding: RouteBinding) -> Self {
+        let server_identity = Arc::new(
+            client
+                .server_identity()
+                .expect("route-bound IPC client has handshake identity")
+                .clone(),
+        );
+        Self {
+            client,
+            binding,
+            server_identity,
+        }
+    }
+}
+
+/// One SDK call's original budget, including acquisition before serialization.
+#[doc(hidden)]
+pub struct CallBudget {
+    scope: CallScope,
+    deadline: ConnectDeadline,
+}
+
+impl CallBudget {
+    pub fn new(options: CallOptions, path_default: Option<Duration>) -> Result<Self, Error> {
+        let options = match options.effective_timeout(path_default) {
+            Some(timeout) => ConnectOptions::new().with_timeout(timeout),
+            None => ConnectOptions::new(),
+        };
+        let deadline = ConnectDeadline::start(options)
+            .map_err(|error| LifecycleError::Configuration(error.to_string()))?;
+        Ok(Self {
+            scope: CallScope::from_deadline(deadline.instant()),
+            deadline,
+        })
+    }
+
+    pub fn scope(&self) -> CallScope {
+        self.scope.clone()
+    }
+
+    pub fn connect_attempt(&self) -> crate::ConnectAttempt {
+        crate::ConnectAttempt::from_deadline(self.deadline)
+    }
+}
+
+impl ClientTarget {
+    fn new(observed_path: ObservedPath, transport: ClientInner) -> Self {
+        let path_default = match &transport {
+            ClientInner::Ipc(_) => None,
+            ClientInner::Http(_, default) => *default,
+        };
+        Self {
+            observed_path,
+            path_default,
+            transport,
+            facts: AtomicU8::new(0),
+        }
+    }
+
+    fn dispatch_target(&self) -> CallDispatchTarget {
+        CallDispatchTarget {
+            path: self.observed_path,
+            ipc: match &self.transport {
+                ClientInner::Ipc(connection) => Some(IpcCallTarget {
+                    server_identity: Arc::clone(&connection.server_identity),
+                    connection_id: connection
+                        .client
+                        .connection_observation()
+                        .expect("route-bound IPC client has physical connection")
+                        .connection_id(),
+                }),
+                ClientInner::Http(..) => None,
+            },
+        }
+    }
+
+    fn needs_acquire(&self) -> bool {
+        let facts = self.facts.load(Ordering::Acquire);
+        if facts & TERMINAL_REFUSAL != 0 {
+            return false;
+        }
+        if facts & NEEDS_ACQUIRE != 0 {
+            return true;
+        }
+        match &self.transport {
+            ClientInner::Ipc(connection) => connection
+                .client
+                .connection_observation()
+                .and_then(|observation| observation.snapshot())
+                .is_some_and(|closed| {
+                    matches!(
+                        closed.reason(),
+                        c2_local::ConnectionEndReason::PeerEof
+                            | c2_local::ConnectionEndReason::PeerCloseMessage
+                            | c2_local::ConnectionEndReason::ConnectionReset
+                    )
+                }),
+            ClientInner::Http(..) => false,
+        }
+    }
+
+    pub(crate) fn observe_error(&self, error: &Error) {
+        match error {
+            Error::Semantic(error)
+                if error
+                    .details
+                    .get("transport_phase")
+                    .or_else(|| error.details.get("dispatch_phase"))
+                    .is_some_and(|phase| phase == "pre_dispatch") =>
+            {
+                use c2_error::ErrorCode::*;
+                let fact = match error.code {
+                    ResourceNotFound | ResourceRemoved | ResourceClosed | ContractMismatch => {
+                        NEEDS_ACQUIRE
+                    }
+                    IdentityMismatch | ProtocolViolation => TERMINAL_REFUSAL,
+                    _ => 0,
+                };
+                self.facts.fetch_or(fact, Ordering::Release);
+            }
+            Error::ProtocolVersionMismatch { .. } => {
+                self.facts.fetch_or(TERMINAL_REFUSAL, Ordering::Release);
+            }
+            Error::Transport(error) => {
+                let source = error.source();
+                // IPC call failures do not identify why the connection ended.
+                // In particular, framing_failed records ProtocolError but
+                // fails dispatched calls with Closed. needs_acquire reads the
+                // connection's terminal reason instead.
+                let http =
+                    source.and_then(|source| source.downcast_ref::<c2_http::client::HttpError>());
+                let cannot_connect = matches!(http, Some(c2_http::client::HttpError::Request(error)) if error.is_connect());
+                if cannot_connect {
+                    self.facts.fetch_or(NEEDS_ACQUIRE, Ordering::Release);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+impl ClientConnection {
+    async fn target_for_call(
+        self: &Arc<Self>,
+        target: Arc<ClientTarget>,
+        scope: &CallScope,
+        deadline: ConnectDeadline,
+    ) -> Result<Arc<ClientTarget>, Error> {
+        scope.check_pre_dispatch().map_err(scope_error)?;
+        if !target.needs_acquire() {
+            return Ok(target);
+        }
+        let owner = self.clone();
+        let refresh = self.refresh.clone();
+        let acquire = async move {
+            let guard = refresh.lock_owned().await;
+            let target = owner.current.read().clone();
+            if !target.needs_acquire() {
+                return Ok(target);
+            }
+            tokio::task::spawn_blocking(move || {
+                // The worker owns the gate until the original bounded attempt ends.
+                let _guard = guard;
+                let target =
+                    owner
+                        .runtime
+                        .acquire_target(&owner.expected, &owner.acquire, deadline)?;
+                let target = owner.runtime.publish_client_with_deadline(
+                    target.observed_path,
+                    deadline,
+                    || Arc::new(target),
+                )?;
+                let previous = std::mem::replace(&mut *owner.current.write(), target.clone());
+                drop(previous);
+                Ok(target)
+            })
+            .await
+            .map_err(|error| {
+                LifecycleError::Configuration(format!("client acquisition task failed: {error}"))
+            })?
+        };
+        let result = match scope.deadline() {
+            Some(deadline) => {
+                tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), acquire)
+                    .await
+                    .map_err(|_| {
+                        scope_error(CallScopeError::DeadlineExceeded {
+                            phase: TransportPhase::PreDispatch,
+                        })
+                    })?
+            }
+            None => acquire.await,
+        };
+        result.map_err(|error| match error {
+            Error::Semantic(error) if error.code == c2_error::ErrorCode::CallDeadlineExceeded => {
+                scope_error(CallScopeError::DeadlineExceeded {
+                    phase: TransportPhase::PreDispatch,
+                })
+            }
+            other => other,
+        })
+    }
 }
 
 impl fmt::Debug for Client {
@@ -116,7 +363,7 @@ impl fmt::Debug for Client {
         formatter
             .debug_struct("Client")
             .field("expected", &self.inner.expected)
-            .field("observed_path", &self.inner.observed_path)
+            .field("observed_path", &self.observed_path())
             .finish_non_exhaustive()
     }
 }
@@ -124,7 +371,7 @@ impl fmt::Debug for Client {
 impl Client {
     #[doc(hidden)]
     pub fn ipc_server_identity(&self) -> Option<c2_wire::handshake::ServerIdentity> {
-        match &self.inner.transport {
+        match &self.inner.current.read().transport {
             ClientInner::Ipc(client) => client.client.server_identity().cloned(),
             ClientInner::Http(..) => None,
         }
@@ -133,7 +380,7 @@ impl Client {
     /// Observe this physical IPC connection without connecting or reconnecting.
     /// Other logical views may share it; closing one view need not end it.
     pub fn connection_observation(&self) -> Result<c2_local::ConnectionObservation, Error> {
-        match &self.inner.transport {
+        match &self.inner.current.read().transport {
             ClientInner::Ipc(client) => client.client.connection_observation().ok_or_else(|| {
                 c2_error::C2Error::new(
                     c2_error::ErrorCode::ResourceClosed,
@@ -154,11 +401,7 @@ impl Client {
     }
 
     pub fn observed_path(&self) -> ObservedPath {
-        self.inner.observed_path
-    }
-
-    pub fn observed_route(&self) -> &ObservedRoute {
-        &self.inner.observed_route
+        self.inner.current.read().observed_path
     }
 
     /// Immutable policy view sharing the exact route and connection acquisition.
@@ -183,41 +426,58 @@ impl Client {
     /// Initial connect remains a separate operation with its existing policy.
     #[doc(hidden)]
     pub fn begin_call(&self, method: &str) -> Result<PreparedCall, Error> {
-        // Configuration/admission lock waits are part of this same logical
-        // deadline. Never create a fresh D after first-domain resolution.
-        let scope = CallScope::new(self.options, self.inner.path_default).map_err(scope_error)?;
-        let preparing = self
-            .inner
-            .runtime
-            .call_execution_context()?
-            .prepare_scope(scope)?;
-        Ok(PreparedCall {
-            preparing,
-            inner: self.inner.clone(),
-            method: method.to_string(),
-            stream: false,
-        })
+        let target = self.inner.current.read().clone();
+        let budget = CallBudget::new(self.options, target.path_default)?;
+        self.prepare_with_budget(method, budget, target, false)
     }
 
-    /// Establish one server-stream call before input encoding. Stream calls
-    /// have no inherited HTTP unary timeout and every stream reserves a call
-    /// slot, including calls with an unlimited deadline.
+    #[doc(hidden)]
+    pub fn begin_call_with_budget(
+        &self,
+        method: &str,
+        budget: CallBudget,
+    ) -> Result<PreparedCall, Error> {
+        self.prepare_with_budget(method, budget, self.inner.current.read().clone(), false)
+    }
+
+    /// Streams have no inherited unary timeout and reserve a call slot.
     #[doc(hidden)]
     pub fn begin_stream(&self, method: &str) -> Result<PreparedCall, Error> {
-        let scope = CallScope::new(self.options, None).map_err(scope_error)?;
-        let mut preparing = self
-            .inner
-            .runtime
-            .call_execution_context()?
-            .prepare_stream_scope(scope)?;
-        if matches!(&self.inner.transport, ClientInner::Http(..)) {
+        self.begin_stream_with_budget(method, CallBudget::new(self.options, None)?)
+    }
+
+    #[doc(hidden)]
+    pub fn begin_stream_with_budget(
+        &self,
+        method: &str,
+        budget: CallBudget,
+    ) -> Result<PreparedCall, Error> {
+        self.prepare_with_budget(method, budget, self.inner.current.read().clone(), true)
+    }
+
+    fn prepare_with_budget(
+        &self,
+        method: &str,
+        budget: CallBudget,
+        target: Arc<ClientTarget>,
+        stream: bool,
+    ) -> Result<PreparedCall, Error> {
+        let context = self.inner.runtime.call_execution_context()?;
+        let mut preparing = if stream {
+            context.prepare_stream_scope(budget.scope)?
+        } else {
+            context.prepare_scope(budget.scope)?
+        };
+        if stream && matches!(&target.transport, ClientInner::Http(..)) {
             preparing = preparing.with_stream_http_headroom();
         }
         Ok(PreparedCall {
             preparing,
             inner: self.inner.clone(),
-            method: method.to_string(),
-            stream: true,
+            target,
+            deadline: budget.deadline,
+            method: method.into(),
+            stream,
         })
     }
 }
@@ -228,6 +488,8 @@ impl Client {
 pub struct PreparedCall {
     preparing: PreparingCall,
     inner: Arc<ClientConnection>,
+    target: Arc<ClientTarget>,
+    deadline: ConnectDeadline,
     method: String,
     stream: bool,
 }
@@ -313,19 +575,31 @@ impl EncodedCall {
     pub async fn stream_record_async(
         self,
         cancellation: c2_ipc::IpcStreamCancellation,
-    ) -> Result<CoreResponseStream, Error> {
+    ) -> CallRecordOutcome<CoreResponseStream> {
         let (started, scope, cancellation, http_cancellation) =
-            self.start_stream(true, cancellation)?;
-        let stream = started.wait_original().await?;
-        if cancellation.is_requested() {
-            http_cancellation.cancel();
+            match self.start_stream(true, cancellation) {
+                Ok(started) => started,
+                Err(error) => {
+                    return CallRecordOutcome {
+                        result: Err(error),
+                        dispatch_target: None,
+                    };
+                }
+            };
+        let CallRecordOutcome {
+            result,
+            dispatch_target,
+        } = started.wait_original().await;
+        let result = result.map(|stream| {
+            if cancellation.is_requested() {
+                http_cancellation.cancel();
+            }
+            CoreResponseStream::new(stream, scope, cancellation, http_cancellation)
+        });
+        CallRecordOutcome {
+            result,
+            dispatch_target,
         }
-        Ok(CoreResponseStream::new(
-            stream,
-            scope,
-            cancellation,
-            http_cancellation,
-        ))
     }
 
     fn start_stream(
@@ -334,7 +608,7 @@ impl EncodedCall {
         cancellation: c2_ipc::IpcStreamCancellation,
     ) -> Result<
         (
-            crate::call_execution::ExecutingCall<StreamTransport>,
+            crate::call_execution::ExecutingCall<(StreamTransport, Arc<ClientTarget>)>,
             CallScope,
             c2_ipc::IpcStreamCancellation,
             HttpStreamCancellation,
@@ -344,6 +618,8 @@ impl EncodedCall {
         let PreparedCall {
             mut preparing,
             inner,
+            target,
+            deadline,
             method,
             stream,
         } = self.prepared;
@@ -361,34 +637,45 @@ impl EncodedCall {
         let http_cancellation = HttpStreamCancellation::new();
         let transport_http_cancellation = http_cancellation.clone();
         let abandon_http_cancellation = http_cancellation.clone();
-        let transport = move |input, scope| async move {
-            match &inner.transport {
-                ClientInner::Ipc(connection) => call_ipc_stream(
-                    connection,
-                    &method,
-                    input,
-                    scope,
-                    payload_budget,
-                    Box::new(permit),
-                    transport_cancellation,
-                )
-                .await
-                .map(StreamTransport::Ipc),
-                ClientInner::Http(client, _) => call_http_stream(
-                    client,
-                    &method,
-                    input,
-                    scope,
-                    payload_budget,
-                    Box::new(permit),
-                    transport_cancellation,
-                    transport_http_cancellation,
-                )
-                .await
-                .map(StreamTransport::Http),
-            }
-        };
-        let abandon = |stream: &StreamTransport| {
+        let http_headroom_reserved = matches!(&target.transport, ClientInner::Http(..));
+        let transport =
+            move |input, scope: CallScope, record: crate::call_execution::CallRecord<_>| async move {
+                let target = inner.target_for_call(target, &scope, deadline).await?;
+                if original {
+                    record.record_target(target.dispatch_target());
+                }
+                let result = match &target.transport {
+                    ClientInner::Ipc(connection) => call_ipc_stream(
+                        connection,
+                        &method,
+                        input,
+                        scope,
+                        payload_budget,
+                        Box::new(permit),
+                        transport_cancellation,
+                    )
+                    .await
+                    .map(StreamTransport::Ipc),
+                    ClientInner::Http(client, _) => call_http_stream(
+                        client,
+                        &method,
+                        input,
+                        scope,
+                        payload_budget,
+                        Box::new(permit),
+                        transport_cancellation,
+                        transport_http_cancellation,
+                        http_headroom_reserved,
+                    )
+                    .await
+                    .map(StreamTransport::Http),
+                };
+                if let Err(error) = &result {
+                    target.observe_error(error);
+                }
+                result.map(|stream| (stream, target))
+            };
+        let abandon = |(stream, _target): &(StreamTransport, Arc<ClientTarget>)| {
             stream.cancel();
         };
         let on_abandon = move || {
@@ -419,6 +706,8 @@ impl EncodedCall {
         let PreparedCall {
             preparing,
             inner,
+            target,
+            deadline,
             method,
             stream,
         } = self.prepared;
@@ -432,20 +721,28 @@ impl EncodedCall {
             .execute(
                 self.nbytes,
                 self.materialize,
-                move |input, scope| async move {
-                    match &inner.transport {
-                        ClientInner::Ipc(connection) => {
-                            let response = call_ipc(connection, &method, input, scope).await?;
-                            response
-                                .into_owned_bytes()
-                                .map_err(|error| LifecycleError::ResponseCopy(error).into())
-                        }
-                        ClientInner::Http(client, _) => {
-                            call_http(client, &method, input, scope, payload_budget)
-                                .await
-                                .map(BudgetedBuffer::into_vec)
+                move |input, scope: CallScope| async move {
+                    let target = inner.target_for_call(target, &scope, deadline).await?;
+                    let result = async {
+                        match &target.transport {
+                            ClientInner::Ipc(connection) => {
+                                let response = call_ipc(connection, &method, input, scope).await?;
+                                response
+                                    .into_owned_bytes()
+                                    .map_err(|error| LifecycleError::ResponseCopy(error).into())
+                            }
+                            ClientInner::Http(client, _) => {
+                                call_http(client, &method, input, scope, payload_budget)
+                                    .await
+                                    .map(BudgetedBuffer::into_vec)
+                            }
                         }
                     }
+                    .await;
+                    if let Err(error) = &result {
+                        target.observe_error(error);
+                    }
+                    result
                 },
             )?
             .wait()
@@ -456,8 +753,14 @@ impl EncodedCall {
     }
 
     #[doc(hidden)]
-    pub async fn call_held_record_async(self) -> Result<HeldResponse, Error> {
-        self.start_held(true)?.wait_original().await
+    pub async fn call_held_record_async(self) -> CallRecordOutcome<HeldResponse> {
+        match self.start_held(true) {
+            Ok(started) => started.wait_original().await,
+            Err(error) => CallRecordOutcome {
+                result: Err(error),
+                dispatch_target: None,
+            },
+        }
     }
 
     fn start_held(
@@ -467,6 +770,8 @@ impl EncodedCall {
         let PreparedCall {
             preparing,
             inner,
+            target,
+            deadline,
             method,
             stream,
         } = self.prepared;
@@ -476,21 +781,41 @@ impl EncodedCall {
             );
         }
         let payload_budget = preparing.payload_budget();
-        let transport = move |input, scope| async move {
-            let response = match &inner.transport {
-                ClientInner::Ipc(connection) => HeldResponse::from_response_data(
-                    call_ipc(connection, &method, input, scope).await?,
-                )?,
-                ClientInner::Http(client, _) => HeldResponse::from_budgeted_bytes(
-                    call_http(client, &method, input, scope, payload_budget).await?,
-                ),
+        let transport =
+            move |input,
+                  scope: CallScope,
+                  record: Option<crate::call_execution::CallRecord<HeldResponse>>| async move {
+                let target = inner.target_for_call(target, &scope, deadline).await?;
+                if let Some(record) = record {
+                    record.record_target(target.dispatch_target());
+                }
+                let result = async {
+                    let response = match &target.transport {
+                        ClientInner::Ipc(connection) => HeldResponse::from_response_data(
+                            call_ipc(connection, &method, input, scope).await?,
+                        )?,
+                        ClientInner::Http(client, _) => HeldResponse::from_budgeted_bytes(
+                            call_http(client, &method, input, scope, payload_budget).await?,
+                        ),
+                    };
+                    Ok(response)
+                }
+                .await;
+                if let Err(error) = &result {
+                    target.observe_error(error);
+                }
+                result
             };
-            Ok(response)
-        };
         if original {
-            preparing.execute_whole_record(self.nbytes, self.materialize, transport)
+            preparing.execute_whole_record(
+                self.nbytes,
+                self.materialize,
+                move |input, scope, record| transport(input, scope, Some(record)),
+            )
         } else {
-            preparing.execute(self.nbytes, self.materialize, transport)
+            preparing.execute(self.nbytes, self.materialize, move |input, scope| {
+                transport(input, scope, None)
+            })
         }
     }
 }
@@ -547,8 +872,16 @@ async fn call_http_stream(
     completion_owner: Box<dyn Send>,
     opening_cancellation: c2_ipc::IpcStreamCancellation,
     cancellation: HttpStreamCancellation,
+    http_headroom_reserved: bool,
 ) -> Result<HttpResponseStream, Error> {
     let (bytes, mut reservation) = input.into_parts();
+    if !http_headroom_reserved {
+        // The final target is HTTP after an IPC preparation. Admission cannot
+        // wait while holding the input's positive reservation.
+        reservation
+            .try_grow(1)
+            .map_err(crate::call_execution::payload_admission_error)?;
+    }
     let input_reservation = reservation
         .split_off(bytes.capacity() as u64)
         .map_err(|error| LifecycleError::Configuration(error.to_string()))?;
@@ -688,44 +1021,48 @@ impl EncodedClient for Client {
 /// shared with the Runtime; only the physical client cache belongs to this endpoint.
 #[doc(hidden)]
 pub struct NativeEndpointContext {
+    source: Arc<EndpointAcquisition>,
+}
+
+struct EndpointAcquisition {
     runtime: Runtime,
     address: String,
     config: c2_config::ClientIpcConfig,
     pool: c2_ipc::ClientPool,
+    expected_identity: Option<c2_wire::handshake::ServerIdentity>,
 }
 
-impl NativeEndpointContext {
-    pub fn deactivate(&self) {
-        self.pool.deactivate_endpoint_scope();
-    }
-
-    pub async fn close(&self) {
-        self.pool.close_endpoint_scope().await;
-    }
-
-    pub fn config(&self) -> &c2_config::ClientIpcConfig {
-        &self.config
-    }
-
-    pub fn prepare(
+impl EndpointAcquisition {
+    fn acquire(
         &self,
-        expected: ExpectedRouteContract,
-        attempt: &crate::ConnectAttempt,
-    ) -> Result<Client, Error> {
-        let deadline = attempt.deadline();
-        validate_expected_route_contract(&expected)?;
-        self.runtime.ensure_active_with_attempt(attempt)?;
-        let mut acquired = None;
+        expected: &ExpectedRouteContract,
+        deadline: ConnectDeadline,
+    ) -> Result<PooledIpcClient, Error> {
         for index in 0..STALE_POOL_RECONNECT_ATTEMPTS {
             let client = self
                 .pool
                 .acquire_lease_with_deadline(&self.address, Some(&self.config), deadline)
                 .map_err(|error| normalize_ipc_error(error, TransportPhase::PreDispatch))?;
-            match client.acquire_route_with_deadline(&expected, deadline) {
-                Ok(binding) => {
-                    acquired = Some(PooledIpcClient { client, binding });
-                    break;
+            if let Some(expected_identity) = &self.expected_identity {
+                let actual = client
+                    .server_identity()
+                    .expect("verified IPC client has identity");
+                if actual != expected_identity {
+                    return Err(normalize_ipc_error(
+                        c2_ipc::IpcError::IdentityMismatch {
+                            expected_server_id: expected_identity.server_id.clone(),
+                            expected_server_instance_id: expected_identity
+                                .server_instance_id
+                                .clone(),
+                            actual_server_id: actual.server_id.clone(),
+                            actual_server_instance_id: actual.server_instance_id.clone(),
+                        },
+                        TransportPhase::PreDispatch,
+                    ));
                 }
+            }
+            match client.acquire_route_with_deadline(expected, deadline) {
+                Ok(binding) => return Ok(PooledIpcClient::new(client, binding)),
                 Err(error)
                     if index + 1 < STALE_POOL_RECONNECT_ATTEMPTS
                         && is_stale_pooled_session_error(&error) =>
@@ -737,15 +1074,36 @@ impl NativeEndpointContext {
                 Err(error) => return Err(normalize_ipc_error(error, TransportPhase::PreDispatch)),
             }
         }
-        let connection = acquired.expect("acquire loop returned or bound a route");
-        let observed = observed_ipc_route(&connection);
-        self.runtime.finish_client(
-            expected,
-            ObservedPath::DirectIpc,
-            observed,
-            ClientInner::Ipc(connection),
-            deadline,
-        )
+        unreachable!("bounded acquire returns a route or its original error")
+    }
+}
+
+impl NativeEndpointContext {
+    pub fn deactivate(&self) {
+        self.source.pool.deactivate_endpoint_scope();
+    }
+    pub async fn close(&self) {
+        self.source.pool.close_endpoint_scope().await;
+    }
+    pub fn config(&self) -> &c2_config::ClientIpcConfig {
+        &self.source.config
+    }
+
+    pub fn prepare(
+        &self,
+        expected: ExpectedRouteContract,
+        attempt: &crate::ConnectAttempt,
+    ) -> Result<Client, Error> {
+        validate_expected_route_contract(&expected)?;
+        self.source.runtime.ensure_active_with_attempt(attempt)?;
+        let acquire = ClientAcquire::Endpoint(self.source.clone());
+        let target = self
+            .source
+            .runtime
+            .acquire_target(&expected, &acquire, attempt.deadline())?;
+        self.source
+            .runtime
+            .finish_client(expected, acquire, target, attempt.deadline())
     }
 }
 
@@ -754,6 +1112,7 @@ impl Runtime {
     pub fn native_endpoint_context(
         &self,
         address: &str,
+        expected_identity: Option<c2_wire::handshake::ServerIdentity>,
         attempt: &crate::ConnectAttempt,
     ) -> Result<NativeEndpointContext, Error> {
         let (config, domain) = self
@@ -763,15 +1122,16 @@ impl Runtime {
             .fork_endpoint_scope(&config, attempt.deadline())
             .map_err(|error| normalize_ipc_error(error, TransportPhase::PreDispatch))?;
         Ok(NativeEndpointContext {
-            runtime: self.clone(),
-            address: address.to_owned(),
-            config,
-            pool,
+            source: Arc::new(EndpointAcquisition {
+                runtime: self.clone(),
+                address: address.into(),
+                config,
+                pool,
+                expected_identity,
+            }),
         })
     }
-}
 
-impl Runtime {
     pub fn connect(&self, expected: ExpectedRouteContract, mode: Connect) -> Result<Client, Error> {
         self.connect_with_options(expected, mode, ConnectOptions::new())
     }
@@ -786,7 +1146,7 @@ impl Runtime {
         self.connect_with_attempt(expected, mode, &attempt)
     }
 
-    /// Continue an SDK acquisition without restarting its original budget.
+    /// Continue SDK acquisition without restarting its original budget.
     #[doc(hidden)]
     pub fn connect_with_attempt(
         &self,
@@ -794,67 +1154,73 @@ impl Runtime {
         mode: Connect,
         attempt: &crate::ConnectAttempt,
     ) -> Result<Client, Error> {
-        let deadline = attempt.deadline();
-        crate::connect_deadline::check(deadline, "connect_start")?;
-        validate_expected_route_contract(&expected)?;
-        self.ensure_active_with_attempt(attempt)?;
-        match mode {
-            Connect::DirectIpc { address } => {
-                let connection = self.acquire_direct_ipc(&address, &expected, deadline)?;
-                let observed_route = observed_ipc_route(&connection);
-                self.finish_client(
-                    expected,
-                    ObservedPath::DirectIpc,
-                    observed_route,
-                    ClientInner::Ipc(connection),
-                    deadline,
-                )
-            }
-            Connect::ExplicitRelay { relay_url } => {
-                let settings = self.relay_client_settings_with_deadline(deadline)?;
-                let (client, route_uid) = self.connect_explicit_relay_http_client_with_deadline(
-                    &relay_url,
-                    expected.clone(),
-                    settings.use_proxy,
-                    settings.call_timeout_secs,
-                    settings.remote_payload_chunk_size,
-                    deadline,
-                )?;
-                self.finish_client(
-                    expected,
-                    ObservedPath::ExplicitRelay,
-                    ObservedRoute { route_uid },
-                    ClientInner::Http(client, relay_default(settings.call_timeout_secs)?),
-                    deadline,
-                )
-            }
-            Connect::RelayAware => self.connect_relay_aware(expected, deadline),
-        }
+        (|| {
+            let deadline = attempt.deadline();
+            crate::connect_deadline::check(deadline, "connect_start")?;
+            validate_expected_route_contract(&expected)?;
+            self.ensure_active_with_attempt(attempt)?;
+            let acquire = match mode {
+                Connect::DirectIpc { address } => ClientAcquire::Direct { address },
+                Connect::ExplicitRelay { relay_url } => ClientAcquire::Relay {
+                    anchor: relay_url,
+                    settings: self.relay_client_settings_with_deadline(deadline)?,
+                    http_only: true,
+                },
+                Connect::RelayAware => ClientAcquire::Relay {
+                    anchor: self
+                        .effective_relay_anchor_address_with_deadline(deadline)?
+                        .ok_or(LifecycleError::MissingRelayAddress)?,
+                    settings: self.relay_client_settings_with_deadline(deadline)?,
+                    http_only: false,
+                },
+            };
+            let target = self.acquire_target(&expected, &acquire, deadline)?;
+            self.finish_client(expected, acquire, target, deadline)
+        })()
+        .map_err(|error| attempt.classify(error))
     }
 
     fn finish_client(
         &self,
         expected: ExpectedRouteContract,
-        observed_path: ObservedPath,
-        observed_route: ObservedRoute,
-        inner: ClientInner,
+        acquire: ClientAcquire,
+        target: ClientTarget,
         deadline: ConnectDeadline,
     ) -> Result<Client, Error> {
-        let path_default = match &inner {
-            ClientInner::Ipc(_) => None,
-            ClientInner::Http(_, default) => *default,
-        };
-        self.publish_client_with_deadline(observed_path, deadline, || Client {
+        self.publish_client_with_deadline(target.observed_path, deadline, || Client {
             inner: Arc::new(ClientConnection {
                 expected,
-                observed_path,
-                observed_route,
                 runtime: self.clone(),
-                path_default,
-                transport: inner,
+                acquire,
+                current: RwLock::new(Arc::new(target)),
+                refresh: Arc::new(tokio::sync::Mutex::new(())),
             }),
             options: CallOptions::new(),
         })
+    }
+
+    fn acquire_target(
+        &self,
+        expected: &ExpectedRouteContract,
+        acquire: &ClientAcquire,
+        deadline: ConnectDeadline,
+    ) -> Result<ClientTarget, Error> {
+        self.ensure_active_with_deadline(deadline)?;
+        match acquire {
+            ClientAcquire::Direct { address } => Ok(ClientTarget::new(
+                ObservedPath::DirectIpc,
+                ClientInner::Ipc(self.acquire_direct_ipc(address, expected, deadline)?),
+            )),
+            ClientAcquire::Endpoint(endpoint) => Ok(ClientTarget::new(
+                ObservedPath::DirectIpc,
+                ClientInner::Ipc(endpoint.acquire(expected, deadline)?),
+            )),
+            ClientAcquire::Relay {
+                anchor,
+                settings,
+                http_only,
+            } => self.acquire_relay_target(expected, anchor, settings, *http_only, deadline),
+        }
     }
 
     fn acquire_direct_ipc(
@@ -869,7 +1235,7 @@ impl Runtime {
                 .map_err(|error| normalize_ipc_error(error, TransportPhase::PreDispatch))?;
             match client.acquire_route_with_deadline(expected, deadline) {
                 Ok(binding) => {
-                    return Ok(PooledIpcClient { client, binding });
+                    return Ok(PooledIpcClient::new(client, binding));
                 }
                 Err(error)
                     if attempt + 1 < STALE_POOL_RECONNECT_ATTEMPTS
@@ -928,10 +1294,9 @@ impl Runtime {
                 ));
             }
 
-            match client.acquire_route_token_with_deadline(expected, &candidate.route_uid, deadline)
-            {
+            match client.acquire_route_with_deadline(expected, deadline) {
                 Ok(binding) => {
-                    return Ok(PooledIpcClient { client, binding });
+                    return Ok(PooledIpcClient::new(client, binding));
                 }
                 Err(error)
                     if attempt + 1 < STALE_POOL_RECONNECT_ATTEMPTS
@@ -951,17 +1316,41 @@ impl Runtime {
         unreachable!("stale pooled relay IPC retry loop must return")
     }
 
-    fn connect_relay_aware(
+    fn acquire_relay_target(
         &self,
-        expected: ExpectedRouteContract,
+        expected: &ExpectedRouteContract,
+        anchor: &str,
+        settings: &c2_config::ResolvedRelayClientConfig,
+        http_only: bool,
         deadline: ConnectDeadline,
-    ) -> Result<Client, Error> {
-        let relay_anchor_address = self
-            .effective_relay_anchor_address_with_deadline(deadline)?
-            .ok_or(LifecycleError::MissingRelayAddress)?;
-        let settings = self.relay_client_settings_with_deadline(deadline)?;
+    ) -> Result<ClientTarget, Error> {
+        let http = |client| {
+            ClientTarget::new(
+                if http_only {
+                    ObservedPath::ExplicitRelay
+                } else {
+                    ObservedPath::RelayAwareRelay
+                },
+                ClientInner::Http(
+                    client,
+                    relay_default(settings.call_timeout_secs).expect("resolved timeout is valid"),
+                ),
+            )
+        };
+        if http_only {
+            return self
+                .connect_explicit_relay_http_client_with_deadline(
+                    anchor,
+                    expected.clone(),
+                    settings.use_proxy,
+                    settings.call_timeout_secs,
+                    settings.remote_payload_chunk_size,
+                    deadline,
+                )
+                .map(http);
+        }
         let resolved = self.resolve_relay_connection_with_deadline(
-            &relay_anchor_address,
+            anchor,
             expected.clone(),
             settings.use_proxy,
             settings.call_timeout_secs,
@@ -971,72 +1360,36 @@ impl Runtime {
         self.ensure_active_with_deadline(deadline)?;
         let resolved = self.reconcile_relay_connection_with_deadline(resolved, deadline)?;
         match resolved {
-            RelayResolvedConnection::Http { client, route_uid } => self.finish_client(
-                expected,
-                ObservedPath::RelayAwareRelay,
-                ObservedRoute { route_uid },
-                ClientInner::Http(client, relay_default(settings.call_timeout_secs)?),
-                deadline,
-            ),
+            RelayResolvedConnection::Http { client } => Ok(http(client)),
             RelayResolvedConnection::Ipc {
                 client, candidate, ..
-            } => match self.acquire_relay_ipc(&candidate, &expected, deadline) {
-                Ok(connection) => {
-                    let observed_route = observed_ipc_route(&connection);
-                    self.finish_client(
-                        expected,
+            } => {
+                match self.acquire_relay_ipc(&candidate, expected, deadline) {
+                    Ok(connection) => Ok(ClientTarget::new(
                         ObservedPath::RelayAwareLocalIpc,
-                        observed_route,
                         ClientInner::Ipc(connection),
-                        deadline,
-                    )
-                }
-                Err(error) if local_candidate_failure_is_terminal(&error) => Err(error),
-                Err(direct_error) => {
-                    self.ensure_active_with_deadline(deadline)?;
-                    let resolved =
-                        Runtime::resolve_relay_connection_after_local_ipc_failures_with_deadline(
-                            client,
-                            std::slice::from_ref(&candidate),
-                            match &direct_error {
-                                Error::Semantic(error) => Some(error.code),
-                                _ => None,
-                            },
-                            deadline,
-                        )
-                        .map_err(|error| retain_local_ipc_cause(error, &direct_error))?;
-                    let resolved =
-                        self.reconcile_relay_connection_with_deadline(resolved, deadline)?;
-                    match resolved {
-                        RelayResolvedConnection::Http { client, route_uid } => self.finish_client(
-                            expected,
-                            ObservedPath::RelayAwareRelay,
-                            ObservedRoute { route_uid },
-                            ClientInner::Http(client, relay_default(settings.call_timeout_secs)?),
-                            deadline,
-                        ),
-                        RelayResolvedConnection::Ipc { candidate, .. } => {
-                            let connection =
-                                self.acquire_relay_ipc(&candidate, &expected, deadline)?;
-                            let observed_route = observed_ipc_route(&connection);
-                            self.finish_client(
-                                expected,
-                                ObservedPath::RelayAwareLocalIpc,
-                                observed_route,
-                                ClientInner::Ipc(connection),
-                                deadline,
-                            )
+                    )),
+                    Err(error) if local_candidate_failure_is_terminal(&error) => Err(error),
+                    Err(direct_error) => {
+                        self.ensure_active_with_deadline(deadline)?;
+                        let resolved = Runtime::resolve_relay_connection_after_local_ipc_failures_with_deadline(
+                            client, std::slice::from_ref(&candidate), deadline,
+                        ).map_err(|error| retain_local_ipc_cause(error, &direct_error))?;
+                        match self.reconcile_relay_connection_with_deadline(resolved, deadline)? {
+                            RelayResolvedConnection::Http { client } => Ok(http(client)),
+                            RelayResolvedConnection::Ipc { candidate, .. } => {
+                                Ok(ClientTarget::new(
+                                    ObservedPath::RelayAwareLocalIpc,
+                                    ClientInner::Ipc(
+                                        self.acquire_relay_ipc(&candidate, expected, deadline)?,
+                                    ),
+                                ))
+                            }
                         }
                     }
                 }
-            },
+            }
         }
-    }
-}
-
-fn observed_ipc_route(connection: &PooledIpcClient) -> ObservedRoute {
-    ObservedRoute {
-        route_uid: connection.binding.route_uid().to_string(),
     }
 }
 

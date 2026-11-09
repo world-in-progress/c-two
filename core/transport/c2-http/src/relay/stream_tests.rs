@@ -258,49 +258,234 @@ type RpcFrames = Arc<parking_lot::Mutex<Vec<(bool, u64, c2_wire::rpc::RpcRecordK
 // A transparent test peer observes complete frames on both native OS backends.
 // It forwards handshake/control frames too, and adds no production observer.
 async fn forward_frames(
-    mut reader: c2_local::LocalReadHalf,
-    mut writer: c2_local::LocalWriteHalf,
+    mut reader: impl AsyncRead + Unpin,
+    mut writer: impl AsyncWrite + Unpin,
     response: bool,
     frames: RpcFrames,
 ) {
     use c2_wire::{flags, frame};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    loop {
-        let mut raw = [0; frame::HEADER_SIZE];
-        if reader.read(&mut raw[..1]).await.unwrap() == 0 {
-            break;
+    let result = async {
+        loop {
+            let mut raw = [0; frame::HEADER_SIZE];
+            if reader.read(&mut raw[..1]).await? == 0 {
+                break;
+            }
+            reader.read_exact(&mut raw[1..]).await?;
+            let (length, body) = frame::decode_total_len(&raw).unwrap();
+            let (header, _) = frame::decode_frame_body(body, length).unwrap();
+            let mut payload = vec![0; header.payload_len()];
+            reader.read_exact(&mut payload).await?;
+            if header.flags & flags::FLAG_RPC_RECORD != 0 {
+                frames
+                    .lock()
+                    .push((response, header.request_id, payload[0].try_into().unwrap()));
+            }
+            let mut frame = raw.to_vec();
+            frame.extend_from_slice(&payload);
+            // Keep the tap's reader alive when an idle client has already closed:
+            // the inherent write_all aborts both halves on a failed courtesy ACK.
+            let written = async {
+                AsyncWriteExt::write_all(&mut writer, &frame).await?;
+                writer.flush().await
+            }
+            .await;
+            if let Err(error) = written {
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionAborted
+                ) {
+                    return Err(error);
+                }
+                // An idle client closes without waiting for the courtesy ACK.
+                // Still read the upstream through EOF to count its entire output.
+                assert!(
+                    response && c2_local::is_peer_closed_error(&error),
+                    "{error}"
+                );
+                assert_eq!(header.request_id, 0);
+                assert_eq!(header.flags, flags::FLAG_SIGNAL | flags::FLAG_RESPONSE);
+                assert_eq!(payload, c2_wire::msg_type::DISCONNECT_ACK_BYTES);
+            }
         }
-        reader.read_exact(&mut raw[1..]).await.unwrap();
-        let (length, body) = frame::decode_total_len(&raw).unwrap();
-        let (header, _) = frame::decode_frame_body(body, length).unwrap();
-        let mut payload = vec![0; header.payload_len()];
-        reader.read_exact(&mut payload).await.unwrap();
-        if header.flags & flags::FLAG_RPC_RECORD != 0 {
-            frames
-                .lock()
-                .push((response, header.request_id, payload[0].try_into().unwrap()));
+        Ok::<(), io::Error>(())
+    }
+    .await;
+    if let Err(error) = result {
+        assert!(
+            matches!(
+                error.kind(),
+                io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionAborted
+            ),
+            "frame forwarding failed: {error}"
+        );
+    }
+}
+
+// The peer publishes its OS error only after the forwarder has entered the
+// selected I/O operation. This makes reset/abort coverage independent of OS
+// buffering and of whether a native pipe maps teardown to reset or abort.
+struct PeerEndGate {
+    entered: Option<oneshot::Sender<()>>,
+    error: oneshot::Receiver<io::ErrorKind>,
+}
+
+impl PeerEndGate {
+    fn poll(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if let Some(entered) = self.entered.take() {
+            entered.send(()).unwrap();
         }
-        let mut frame = raw.to_vec();
-        frame.extend_from_slice(&payload);
-        // Keep the tap's reader alive when an idle client has already closed:
-        // the inherent write_all aborts both halves on a failed courtesy ACK.
-        let written = async {
-            AsyncWriteExt::write_all(&mut writer, &frame).await?;
-            writer.flush().await
-        }
-        .await;
-        if let Err(error) = written {
-            // An idle client closes without waiting for the courtesy ACK.
-            // Still read the upstream through EOF to count its entire output.
-            assert!(
-                response && c2_local::is_peer_closed_error(&error),
-                "{error}"
-            );
-            assert_eq!(header.request_id, 0);
-            assert_eq!(header.flags, flags::FLAG_SIGNAL | flags::FLAG_RESPONSE);
-            assert_eq!(payload, c2_wire::msg_type::DISCONNECT_ACK_BYTES);
+        match Pin::new(&mut self.error).poll(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(error) => Poll::Ready(Err(io::Error::from(error.unwrap()))),
         }
     }
+}
+
+struct EndingReader(PeerEndGate);
+
+impl AsyncRead for EndingReader {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        _: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        self.0.poll(cx)
+    }
+}
+
+struct EndingWriter {
+    flush: bool,
+    gate: PeerEndGate,
+}
+
+impl AsyncWrite for EndingWriter {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        if self.flush {
+            Poll::Ready(Ok(buf.len()))
+        } else {
+            self.gate.poll(cx).map_ok(|()| unreachable!())
+        }
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.gate.poll(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+#[tokio::test]
+async fn forward_frames_peer_ends_during_each_io_operation() {
+    let frame = c2_wire::frame::encode_frame(1, 0, b"payload");
+    // Header start, partial header, partial payload, write, flush.
+    for operation in 0..5 {
+        for kind in [
+            io::ErrorKind::ConnectionReset,
+            io::ErrorKind::ConnectionAborted,
+            io::ErrorKind::PermissionDenied,
+        ] {
+            let (entered, waiting) = oneshot::channel();
+            let (peer, error) = oneshot::channel();
+            let gate = PeerEndGate {
+                entered: Some(entered),
+                error,
+            };
+            let frames = RpcFrames::default();
+            let task = if operation < 3 {
+                let count = [0, 1, c2_wire::frame::HEADER_SIZE + 1][operation];
+                // Owned input survives the spawned forwarding task.
+                let prefix = frame[..count].to_vec();
+                tokio::spawn(async move {
+                    let mut input = prefix.as_slice();
+                    let reader = tokio::io::AsyncReadExt::chain(&mut input, EndingReader(gate));
+                    forward_frames(reader, tokio::io::sink(), false, frames).await;
+                })
+            } else {
+                let input = frame.clone();
+                tokio::spawn(async move {
+                    forward_frames(
+                        input.as_slice(),
+                        EndingWriter {
+                            flush: operation == 4,
+                            gate,
+                        },
+                        false,
+                        frames,
+                    )
+                    .await;
+                })
+            };
+            bounded(waiting).await.unwrap();
+            peer.send(kind).unwrap();
+            let result = bounded(task).await;
+            if kind == io::ErrorKind::PermissionDenied {
+                assert!(result.unwrap_err().is_panic(), "operation {operation}");
+            } else {
+                result.unwrap();
+            }
+        }
+    }
+}
+
+struct PendingRead<R> {
+    inner: R,
+    pending: Option<oneshot::Sender<()>>,
+    ended: Option<oneshot::Sender<io::ErrorKind>>,
+}
+
+impl<R: AsyncRead + Unpin> AsyncRead for PendingRead<R> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let result = Pin::new(&mut self.inner).poll_read(cx, buf);
+        if result.is_pending() {
+            if let Some(pending) = self.pending.take() {
+                pending.send(()).unwrap();
+            }
+        }
+        if let Poll::Ready(Err(error)) = &result {
+            self.ended.take().unwrap().send(error.kind()).unwrap();
+        }
+        result
+    }
+}
+
+#[tokio::test]
+async fn forward_frames_real_peer_resets_while_read_is_pending() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let peer = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
+        .await
+        .unwrap();
+    let (reader, _) = listener.accept().await.unwrap();
+    let (pending, waiting) = oneshot::channel();
+    let (ended, error) = oneshot::channel();
+    let task = tokio::spawn(forward_frames(
+        PendingRead {
+            inner: reader,
+            pending: Some(pending),
+            ended: Some(ended),
+        },
+        tokio::io::sink(),
+        false,
+        RpcFrames::default(),
+    ));
+    bounded(waiting).await.unwrap();
+    peer.set_zero_linger().unwrap();
+    drop(peer);
+    bounded(task).await.unwrap();
+    assert!(matches!(
+        bounded(error).await.unwrap(),
+        io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionAborted
+    ));
 }
 
 impl Fixture {
@@ -447,7 +632,7 @@ impl Fixture {
             descriptor.abi_hash().into(),
             descriptor.signature_hash().into(),
             server.config().max_payload_size,
-            binding.route_uid().to_string(),
+            binding.route_uid,
             None
         ) {
             RegisterCommitResult::Registered { entry } => entry,
@@ -512,8 +697,7 @@ impl Fixture {
             .header("x-c2-expected-crm-name", &self.entry.crm_name)
             .header("x-c2-expected-crm-ver", &self.entry.crm_ver)
             .header("x-c2-expected-abi-hash", &self.entry.abi_hash)
-            .header("x-c2-expected-signature-hash", &self.entry.signature_hash)
-            .header("x-c2-route-uid", &self.entry.route_uid);
+            .header("x-c2-expected-signature-hash", &self.entry.signature_hash);
         if stream {
             request.header("accept", stream_wire::MEDIA_TYPE)
         } else {
@@ -660,6 +844,36 @@ async fn item_write_range_failure_keeps_real_terminal_and_http_ends_normally() {
         drop(receiver);
         fixture.stop().await;
     }
+}
+
+// ADR 0004 removes route UID from relay calls and probes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn retired_header_is_ignored_for_unary_and_stream_calls() {
+    let fixture = Fixture::start(false, 256 * 1024).await;
+    let retired_header = "x-c2-route-uid";
+    for headers in [
+        vec![],
+        vec!["obsolete"],
+        vec!["invalid value", "another value"],
+    ] {
+        let mut request = fixture.request(1, 64);
+        for value in &headers {
+            request = request.header(retired_header, *value);
+        }
+        let response = bounded(request.send()).await.unwrap();
+        assert_eq!(response.status(), 200);
+        assert!(!response.headers().contains_key(retired_header));
+        parse_records(&bounded(response.bytes()).await.unwrap(), 1, 64);
+        let mut request = fixture.method_request("ping", false).body(Vec::new());
+        for value in &headers {
+            request = request.header(retired_header, *value);
+        }
+        let response = bounded(request.send()).await.unwrap();
+        assert_eq!(response.status(), 200);
+        assert!(!response.headers().contains_key(retired_header));
+        assert_eq!(bounded(response.bytes()).await.unwrap().as_ref(), b"pong");
+    }
+    fixture.stop().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -932,7 +1146,7 @@ async fn wait_for_admission(state: &RelayState) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn budget_wait_precedes_upstream_lease_then_reconnects_after_idle_evict() {
     let fixture = Fixture::start(false, 32 * 1024).await;
-    let (lease, _) = bounded(fixture.state.acquire_upstream_for_route(&fixture.entry))
+    let (lease, _, _) = bounded(fixture.state.acquire_upstream_for_route(&fixture.entry))
         .await
         .unwrap_or_else(|_| panic!("live pooled upstream acquire failed"));
     let old_client = lease.client();
@@ -1017,7 +1231,6 @@ async fn dropping_body_while_next_pull_waits_for_b_cancels_and_preserves_shared_
                 "x-c2-expected-signature-hash",
                 &fixture.entry.signature_hash,
             )
-            .header("x-c2-route-uid", &fixture.entry.route_uid)
             .header("content-length", "8")
             .body(Body::from(input))
             .unwrap();
@@ -1075,7 +1288,7 @@ async fn dropping_body_while_next_pull_waits_for_b_cancels_and_preserves_shared_
             );
         }
         drop(body); // The driver must see abandonment while its IPC pull is pending.
-        let (lease, binding) = bounded(fixture.state.acquire_upstream_for_route(&fixture.entry))
+        let (lease, binding, _) = bounded(fixture.state.acquire_upstream_for_route(&fixture.entry))
             .await
             .unwrap_or_else(|_| panic!("shared upstream unavailable after Body drop"));
         let unary = bounded(lease.client().call_bound(&binding, "ping", b""))
@@ -1119,7 +1332,6 @@ async fn abandoned_budget_wait_stops_before_ipc_dispatch() {
             "x-c2-expected-signature-hash",
             &fixture.entry.signature_hash,
         )
-        .header("x-c2-route-uid", &fixture.entry.route_uid)
         .header("content-length", "8")
         .body(Body::from(input))
         .unwrap();
@@ -1160,7 +1372,6 @@ async fn cancelled_stream_terminal_is_delivered_while_another_http_response_fill
             "x-c2-expected-signature-hash",
             &fixture.entry.signature_hash,
         )
-        .header("x-c2-route-uid", &fixture.entry.route_uid)
         .header("content-length", "8")
         .body(Body::from(
             [2_u32.to_le_bytes(), 64_u32.to_le_bytes()].concat(),
@@ -1224,7 +1435,6 @@ async fn cancelled_stream_terminal_is_delivered_while_another_http_response_fill
             "x-c2-expected-signature-hash",
             &fixture.entry.signature_hash,
         )
-        .header("x-c2-route-uid", &fixture.entry.route_uid)
         .header("content-length", "4")
         .body(Body::from((32 * 1024_u32).to_le_bytes().to_vec()))
         .unwrap();
@@ -1315,7 +1525,6 @@ async fn abandoned_data_header_refunds_its_payload_before_blocked_cleanup() {
             "x-c2-expected-signature-hash",
             &fixture.entry.signature_hash,
         )
-        .header("x-c2-route-uid", &fixture.entry.route_uid)
         .header("content-length", "8")
         .body(Body::from(
             [1_u32.to_le_bytes(), 8192_u32.to_le_bytes()].concat(),
@@ -1390,7 +1599,6 @@ async fn token_cancel_after_lifecycle_cancel_finishes_without_another_copy_windo
                 "x-c2-expected-signature-hash",
                 &fixture.entry.signature_hash,
             )
-            .header("x-c2-route-uid", &fixture.entry.route_uid)
             .header("content-length", "8")
             .body(Body::from(
                 [1_u32.to_le_bytes(), (128 * 1024_u32).to_le_bytes()].concat(),
@@ -1471,7 +1679,7 @@ async fn mismatched_http_call_modes_are_not_executed_and_keep_upstream() {
     };
     use c2_error::ErrorCode;
     let fixture = Fixture::start(false, 64 * 1024).await;
-    let (lease, _) = bounded(fixture.state.acquire_upstream_for_route(&fixture.entry))
+    let (lease, _, _) = bounded(fixture.state.acquire_upstream_for_route(&fixture.entry))
         .await
         .unwrap_or_else(|_| panic!("upstream acquire failed"));
     let original = lease.client();
@@ -1553,6 +1761,14 @@ async fn mismatched_http_call_modes_are_not_executed_and_keep_upstream() {
     )
     .unwrap()
     .with_http_only();
+    let client = bounded(tokio::task::spawn_blocking(move || {
+        client
+            .resolve_http_target_with_deadline(c2_config::ConnectDeadline::default())
+            .unwrap();
+        client
+    }))
+    .await
+    .unwrap();
     let budget = c2_mem::retention::PayloadBufferBudget::new(64 * 1024);
     let control =
         HttpCallControl::new(|| Ok(()), || Ok(())).with_payload_budget(budget.clone(), None);
@@ -1605,7 +1821,7 @@ async fn mismatched_http_call_modes_are_not_executed_and_keep_upstream() {
     );
     drop(stream);
     drop(client);
-    let (lease, _) = bounded(fixture.state.acquire_upstream_for_route(&fixture.entry))
+    let (lease, _, _) = bounded(fixture.state.acquire_upstream_for_route(&fixture.entry))
         .await
         .unwrap_or_else(|_| panic!("upstream reacquire failed"));
     assert!(Arc::ptr_eq(&original, &lease.client()));
@@ -1641,7 +1857,6 @@ async fn stream_body_last_bytes_reference_refunds_b() {
                 "x-c2-expected-signature-hash",
                 &fixture.entry.signature_hash,
             )
-            .header("x-c2-route-uid", &fixture.entry.route_uid)
             .header("content-length", "8")
             .body(Body::from(
                 [1u32.to_le_bytes(), (LEN as u32).to_le_bytes()].concat(),
@@ -1716,6 +1931,14 @@ async fn relay_oversized_item_keeps_real_terminal_and_refunds_b() {
     )
     .unwrap()
     .with_http_only();
+    let client = bounded(tokio::task::spawn_blocking(move || {
+        client
+            .resolve_http_target_with_deadline(c2_config::ConnectDeadline::default())
+            .unwrap();
+        client
+    }))
+    .await
+    .unwrap();
     let budget = PayloadBufferBudget::new(4096);
     let control =
         HttpCallControl::new(|| Ok(()), || Ok(())).with_payload_budget(budget.clone(), None);

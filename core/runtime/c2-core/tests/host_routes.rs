@@ -437,26 +437,36 @@ fn registration_projects_the_core_owned_route_concurrency_state() {
 
 #[test]
 fn ordinary_host_shutdown_withdraws_its_actual_registered_relay_route() {
-    let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve relay port");
-    let address = probe.local_addr().expect("relay address");
-    drop(probe);
-    let relay_url = format!("http://{address}");
-    let mut relay = RelayServer::start(RelayConfig {
-        bind: address.to_string(),
-        advertise_url: relay_url.clone(),
-        idle_timeout_secs: 0,
-        anti_entropy_interval: std::time::Duration::ZERO,
-        heartbeat_interval: std::time::Duration::ZERO,
-        ..RelayConfig::default()
-    })
-    .expect("relay starts");
-
+    let root = tempfile::tempdir().expect("private IPC root");
     let runtime = Runtime::new(RuntimeOptions {
         server_id: Some(unique_name("relay-shutdown-server")),
         use_process_relay_anchor: false,
         ..RuntimeOptions::default()
     })
     .expect("runtime");
+    runtime
+        .set_local_endpoint_with_sources(
+            c2_core::LocalEndpointOptions {
+                #[cfg(unix)]
+                unix_root: Some(root.path().to_path_buf()),
+                ..Default::default()
+            },
+            c2_core::ConfigSources::empty(),
+        )
+        .unwrap();
+    let mut relay = RelayServer::start_with_context(
+        RelayConfig {
+            bind: "127.0.0.1:0".into(),
+            idle_timeout_secs: 0,
+            anti_entropy_interval: std::time::Duration::ZERO,
+            heartbeat_interval: std::time::Duration::ZERO,
+            ..RelayConfig::default()
+        },
+        runtime.local_endpoint_context().unwrap(),
+    )
+    .expect("relay starts");
+    let relay_url = format!("http://{}", relay.local_addr());
+
     let host = runtime
         .host(
             HostOptions::default()

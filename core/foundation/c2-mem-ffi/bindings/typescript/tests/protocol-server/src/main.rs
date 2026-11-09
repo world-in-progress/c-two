@@ -39,6 +39,7 @@ impl Gate {
 }
 
 struct Echo {
+    generation: u8,
     gate: Arc<Gate>,
     unary_gate: Arc<Gate>,
     unary_dispatches: Arc<AtomicUsize>,
@@ -49,7 +50,7 @@ impl CrmCallback for Echo {
         &self,
         _: &str,
         method: u16,
-        request: Vec<u8>,
+        mut request: Vec<u8>,
         _: Arc<c2_server::ResponsePool>,
     ) -> Result<ResponseMeta, CrmError> {
         if method != 0 {
@@ -62,6 +63,9 @@ impl CrmCallback for Echo {
             if request == [254] {
                 emit(json!({"kind": "unary_completed"}));
             }
+        }
+        if self.generation != 0 {
+            request.push(self.generation);
         }
         Ok(ResponseMeta::Inline(request))
     }
@@ -157,29 +161,33 @@ async fn main() {
     let unary_gate = Arc::new(Gate::default());
     let unary_dispatches = Arc::new(AtomicUsize::new(0));
     let stream_dispatches = Arc::new(AtomicUsize::new(0));
-    let route = server
-        .build_stream_route(
-            RouteBuildSpec {
-                name: "echo".into(),
-                crm_ns: descriptor.crm_namespace().into(),
-                crm_name: descriptor.crm_name().into(),
-                crm_ver: descriptor.crm_version().into(),
-                abi_hash: descriptor.abi_hash().into(),
-                signature_hash: descriptor.signature_hash().into(),
-                method_names: vec!["ping".into(), "echo".into()],
-                access_map: HashMap::new(),
-                concurrency_mode: ConcurrencyMode::Parallel,
-                limits: SchedulerLimits::default(),
-            },
-            Arc::new(Echo {
-                gate: gate.clone(),
-                unary_gate: unary_gate.clone(),
-                unary_dispatches: unary_dispatches.clone(),
-                stream_dispatches: stream_dispatches.clone(),
-            }),
-            descriptor,
-        )
-        .unwrap();
+    let route_for_generation = |generation| {
+        server
+            .build_stream_route(
+                RouteBuildSpec {
+                    name: "echo".into(),
+                    crm_ns: descriptor.crm_namespace().into(),
+                    crm_name: descriptor.crm_name().into(),
+                    crm_ver: descriptor.crm_version().into(),
+                    abi_hash: descriptor.abi_hash().into(),
+                    signature_hash: descriptor.signature_hash().into(),
+                    method_names: vec!["ping".into(), "echo".into()],
+                    access_map: HashMap::new(),
+                    concurrency_mode: ConcurrencyMode::Parallel,
+                    limits: SchedulerLimits::default(),
+                },
+                Arc::new(Echo {
+                    generation,
+                    gate: gate.clone(),
+                    unary_gate: unary_gate.clone(),
+                    unary_dispatches: unary_dispatches.clone(),
+                    stream_dispatches: stream_dispatches.clone(),
+                }),
+                descriptor,
+            )
+            .unwrap()
+    };
+    let route = route_for_generation(0);
     server
         .commit_reserved_route(server.reserve_route(route).await.unwrap())
         .await
@@ -218,6 +226,18 @@ async fn main() {
         if line == "release_unary" {
             unary_gate.release();
             emit(json!({"kind": "unary_released"}));
+        }
+        if line == "replace" {
+            assert!(server.unregister_route("echo").await);
+            emit(json!({"kind": "route_removed"}));
+        }
+        if line == "register_replacement" {
+            let route = route_for_generation(1);
+            server
+                .commit_reserved_route(server.reserve_route(route).await.unwrap())
+                .await
+                .unwrap();
+            emit(json!({"kind": "route_replaced"}));
         }
         if line == "shutdown" || line == "unregister" {
             let cause = line.clone();

@@ -7,7 +7,7 @@
 //!
 //! ```text
 //! HTTP handler
-//!     -> IpcClient::acquire_route_token(route contract, route token)
+//!     -> IpcClient::acquire_route(route contract)
 //!     -> IpcClient::call_bound(binding, method, payload)
 //!         -> select inline / buddy SHM / chunked request transport
 //!         -> send_task:  serialize frame -> write local stream

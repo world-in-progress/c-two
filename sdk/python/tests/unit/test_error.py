@@ -10,9 +10,10 @@ from c_two.error import (
     ResourceSerializeOutput, ResourceExecuteFunction,
     ClientSerializeInput, ClientDeserializeOutput, ClientOutputFromBuffer,
     ClientCallResource,
-    ResourceAlreadyRegistered, RouteStale, WriteConflict,
+    ResourceAlreadyRegistered,
+    RouteConflict,
     ResourceClosed, ResourceRemoved, ContractMismatch, IdentityMismatch,
-    RouteCatalogCompacted, RouteWatchUnavailable, ProtocolViolation, FallbackDenied,
+    RouteWatchUnavailable, ProtocolViolation, FallbackDenied,
     CallDeadlineExceeded, UnsupportedCallMode, CallCapacityExceeded, CallCancelled,
 )
 
@@ -43,13 +44,10 @@ class TestERRORCode:
         assert ERROR_Code.ERROR_AT_CLIENT_CALLING_RESOURCE == 7
         assert ERROR_Code.ERROR_AT_CLIENT_OUTPUT_FROM_BUFFER == 8
         assert ERROR_Code.ERROR_RESOURCE_ALREADY_REGISTERED == 703
-        assert ERROR_Code.ERROR_ROUTE_STALE == 704
-        assert ERROR_Code.ERROR_WRITE_CONFLICT == 706
         assert ERROR_Code.ERROR_RESOURCE_CLOSED == 707
         assert ERROR_Code.ERROR_RESOURCE_REMOVED == 708
         assert ERROR_Code.ERROR_CONTRACT_MISMATCH == 709
         assert ERROR_Code.ERROR_IDENTITY_MISMATCH == 710
-        assert ERROR_Code.ERROR_ROUTE_CATALOG_COMPACTED == 711
         assert ERROR_Code.ERROR_ROUTE_WATCH_UNAVAILABLE == 712
         assert ERROR_Code.ERROR_PROTOCOL_VIOLATION == 713
         assert ERROR_Code.ERROR_FALLBACK_DENIED == 714
@@ -57,9 +55,27 @@ class TestERRORCode:
         assert ERROR_Code.ERROR_UNSUPPORTED_CALL_MODE == 716
         assert ERROR_Code.ERROR_CALL_CAPACITY_EXCEEDED == 717
         assert ERROR_Code.ERROR_CALL_CANCELLED == 718
+        assert ERROR_Code.ERROR_ROUTE_CONFLICT == 719
 
-    def test_has_exactly_27_members(self):
-        assert len(ERROR_Code) == 27
+    def test_has_exactly_25_members(self):
+        assert len(ERROR_Code) == 25
+
+    def test_retired_errors_are_absent(self):
+        retired = (("Route", "Stale", 704), ("Write", "Conflict", 706),
+                   ("Route", "Catalog", "Compacted", 711))
+        for *parts, code in retired:
+            name = "".join(parts)
+            assert not hasattr(error, name)
+            assert name not in error.__all__
+            assert code not in ERROR_Code._value2member_map_
+        for parts in (("ROUTE", "STALE"), ("WRITE", "CONFLICT"),
+                      ("ROUTE", "CATALOG", "COMPACTED")):
+            name = "ERROR_" + "_".join(parts)
+            assert name not in ERROR_Code.__members__
+        for *parts, _code in retired:
+            name = "".join(parts)
+            with pytest.raises(ImportError):
+                exec(f"from c_two.error import {name}", {})
 
     def test_values_are_unique(self):
         values = [e.value for e in ERROR_Code]
@@ -198,12 +214,10 @@ SUBCLASS_PARAMS = [
 ]
 
 ROUTE_CATALOG_SUBCLASS_PARAMS = [
-    (RouteStale, ERROR_Code.ERROR_ROUTE_STALE),
     (ResourceClosed, ERROR_Code.ERROR_RESOURCE_CLOSED),
     (ResourceRemoved, ERROR_Code.ERROR_RESOURCE_REMOVED),
     (ContractMismatch, ERROR_Code.ERROR_CONTRACT_MISMATCH),
     (IdentityMismatch, ERROR_Code.ERROR_IDENTITY_MISMATCH),
-    (RouteCatalogCompacted, ERROR_Code.ERROR_ROUTE_CATALOG_COMPACTED),
     (RouteWatchUnavailable, ERROR_Code.ERROR_ROUTE_WATCH_UNAVAILABLE),
     (ProtocolViolation, ERROR_Code.ERROR_PROTOCOL_VIOLATION),
     (FallbackDenied, ERROR_Code.ERROR_FALLBACK_DENIED),
@@ -385,12 +399,10 @@ ALL_SUBCLASSES = [
     error.ClientDeserializeOutput,
     error.ClientOutputFromBuffer,
     error.ClientCallResource,
-    error.RouteStale,
     error.ResourceClosed,
     error.ResourceRemoved,
     error.ContractMismatch,
     error.IdentityMismatch,
-    error.RouteCatalogCompacted,
     error.RouteWatchUnavailable,
     error.ProtocolViolation,
     error.FallbackDenied,
@@ -398,6 +410,7 @@ ALL_SUBCLASSES = [
     error.UnsupportedCallMode,
     error.CallCapacityExceeded,
     error.CallCancelled,
+    error.RouteConflict,
 ]
 
 
@@ -427,6 +440,14 @@ class TestSubclassDeserialization:
         assert result.code == ERROR_Code.ERROR_RESOURCE_ALREADY_REGISTERED
         assert result.message == "Route name already registered: 'grid'"
 
+    def test_route_conflict_round_trip(self):
+        details = {"route": "grid", "dispatch_phase": "pre_dispatch", "registrations": "[]"}
+        original = RouteConflict("duplicate online route", details=details)
+        result = CCError.deserialize(memoryview(CCError.serialize(original)))
+        assert isinstance(result, RouteConflict)
+        assert result.code == ERROR_Code.ERROR_ROUTE_CONFLICT
+        assert result.details == details
+
     def test_from_buffer_errors_round_trip_to_specific_subclasses(self):
         resource_err = ResourceInputFromBuffer("bad input view")
         restored_resource = CCError.deserialize(CCError.serialize(resource_err))
@@ -441,20 +462,6 @@ class TestSubclassDeserialization:
         assert restored_client.code == ERROR_Code.ERROR_AT_CLIENT_OUTPUT_FROM_BUFFER
         assert "constructing client output from buffer" in restored_client.message
         assert "bad output view" in restored_client.message
-
-    def test_future_mesh_errors_round_trip(self):
-        stale = RouteStale("grid stale")
-        conflict = WriteConflict("grid write conflict")
-
-        stale_result = CCError.deserialize(memoryview(CCError.serialize(stale)))
-        conflict_result = CCError.deserialize(memoryview(CCError.serialize(conflict)))
-
-        assert isinstance(stale_result, RouteStale)
-        assert stale_result.code == ERROR_Code.ERROR_ROUTE_STALE
-        assert stale_result.message == "grid stale"
-        assert isinstance(conflict_result, WriteConflict)
-        assert conflict_result.code == ERROR_Code.ERROR_WRITE_CONFLICT
-        assert conflict_result.message == "grid write conflict"
 
     @pytest.mark.parametrize("subclass", ALL_SUBCLASSES, ids=lambda c: c.__name__)
     def test_none_message_produces_description(self, subclass):
@@ -494,14 +501,11 @@ class TestNativeErrorRegistryParity:
             "ERROR_RESOURCE_NOT_FOUND": ("ResourceNotFound", 701),
             "ERROR_RESOURCE_UNAVAILABLE": ("ResourceUnavailable", 702),
             "ERROR_RESOURCE_ALREADY_REGISTERED": ("ResourceAlreadyRegistered", 703),
-            "ERROR_ROUTE_STALE": ("RouteStale", 704),
             "ERROR_REGISTRY_UNAVAILABLE": ("RegistryUnavailable", 705),
-            "ERROR_WRITE_CONFLICT": ("WriteConflict", 706),
             "ERROR_RESOURCE_CLOSED": ("ResourceClosed", 707),
             "ERROR_RESOURCE_REMOVED": ("ResourceRemoved", 708),
             "ERROR_CONTRACT_MISMATCH": ("ContractMismatch", 709),
             "ERROR_IDENTITY_MISMATCH": ("IdentityMismatch", 710),
-            "ERROR_ROUTE_CATALOG_COMPACTED": ("RouteCatalogCompacted", 711),
             "ERROR_ROUTE_WATCH_UNAVAILABLE": ("RouteWatchUnavailable", 712),
             "ERROR_PROTOCOL_VIOLATION": ("ProtocolViolation", 713),
             "ERROR_FALLBACK_DENIED": ("FallbackDenied", 714),
@@ -509,6 +513,7 @@ class TestNativeErrorRegistryParity:
             "ERROR_UNSUPPORTED_CALL_MODE": ("UnsupportedCallMode", 716),
             "ERROR_CALL_CAPACITY_EXCEEDED": ("CallCapacityExceeded", 717),
             "ERROR_CALL_CANCELLED": ("CallCancelled", 718),
+            "ERROR_ROUTE_CONFLICT": ("RouteConflict", 719),
         }
 
         assert set(ERROR_Code.__members__) == set(expected)
@@ -520,7 +525,7 @@ class TestNativeErrorRegistryParity:
         from c_two import _native
 
         native = _native.error_registry()
-        assert len(native) == 27
+        assert len(native) == 25
         names = list(native.keys())
         values = list(native.values())
         assert len(set(names)) == len(names)

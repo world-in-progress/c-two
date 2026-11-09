@@ -94,7 +94,7 @@ def test_python_consumer_does_not_inherit_nested_pre_dispatch(
                         client.ping()
                     error = failure.value
                     assert error.details['route'] == route_b
-                    assert 'route_uid' in error.details
+                    assert 'route_uid' not in error.details
                     assert 'transport_phase' not in error.details
                     assert 'dispatch_phase' not in error.details
                     assert 'fallback_eligible' not in error.details

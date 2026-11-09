@@ -26,14 +26,13 @@ const nativeError = (code, canonicalName, details = {}) => new api.C2IpcTranspor
   message:canonicalName, code, canonicalName, details, transportPhase:'pre_dispatch', category:'ipc',
 });
 function client(options = {}) {
-  const state = {connections:0, closed:[], prepared:[], calls:[], deactivated:false, wrongToken:false};
+  const state = {connections:0, closed:[], prepared:[], calls:[], deactivated:false, generation:0};
   const transport = api.createRelayAwareHttpEncodedTransport('http://localhost:8300', {
-    routeCacheTtlMs:0,
     async fetch(url, init) {
       assert.equal(init.method,'GET','a local failure must not POST to the same endpoint');
       const route = decodeURIComponent(new URL(url).pathname.split('/').pop());
       return {status:200, async text() {return JSON.stringify([{
-        name:route,relay_url:'http://localhost:8300',route_uid:state.wrongToken && route === 'builder' ? 'wrong' : route,
+        name:route,relay_url:'http://localhost:8300',
         ipc_address:'ipc://server',server_id:'s',server_instance_id:'i',
         crm_ns:contract.namespace,crm_name:contract.name,crm_ver:contract.version,
         abi_hash:hash,signature_hash:hash,max_payload_size:1024,
@@ -44,16 +43,18 @@ function client(options = {}) {
       assert.deepEqual(nativeOptions.expectedServerIdentity,{serverId:'s',serverInstanceId:'i'});
       assert.equal('expectedRouteToken' in nativeOptions,false);
       return {
-        async prepare(route,_contract,token) {
+        connectionSnapshot(){return null},
+        async prepare(...args) {
+          assert.equal(args.length,3);
+          const [route] = args;
           await options.onPrepare?.({id,route,state});
           if (state.deactivated) throw nativeError(707,'ResourceClosed');
-          if (token && token.routeUid !== route) throw nativeError(704,'RouteStale');
-          state.prepared.push({id,route,token});
-          return {serverId:'s',serverInstanceId:'i',routeUid:route,connectionId:String(id)};
+          state.prepared.push({id,route});
+          return {serverId:'s',serverInstanceId:'i',connectionId:String(id)};
         },
-        beginCall(route) {return {
-          async chargeInput(){}, async dispatch(){state.calls.push(route)},
-          async next(){const value=Uint8Array.of(id);value.release=()=>{};return value},
+        beginCall(route) {if(state.deactivated)throw nativeError(707,'ResourceClosed');return {
+          async chargeInput(){}, async dispatch(){state.calls.push(route);return {path:'DirectIpc',serverId:'s',serverInstanceId:'i',connectionId:String(id)}},
+          async next(){const value=Uint8Array.of(id + state.generation);value.release=()=>{};return value},
           checkDeadline(){},close(){},cancel(){},async observe(){return {completed:true,error:null,completeItems:1n}},
         }},
         deactivate(){state.deactivated=true},
@@ -69,7 +70,7 @@ test('relay-local prepares late routes on one endpoint and closes it once', asyn
   const {state,transport,call}=client();
   await Promise.all([call('manager'),call('builder')]);
   assert.equal(state.connections,1);
-  assert.deepEqual(state.prepared.filter(x=>x.token).map(x=>[x.route,x.token.routeUid]),[['manager','manager'],['builder','builder']]);
+  assert.deepEqual(state.prepared.map(x=>x.route).sort(),['builder','manager']);
   assert.deepEqual(state.calls.sort(),['builder','manager']);
   assert.deepEqual(state.closed,[]);
   await Promise.all([transport.close(),transport.close()]);
@@ -77,22 +78,13 @@ test('relay-local prepares late routes on one endpoint and closes it once', asyn
   await assert.rejects(call('manager'),/deactivated/);
 });
 
-test('a mismatched route token retains its typed cause and the healthy carrier', async () => {
+test('a later route still prepares by name on the healthy carrier', async () => {
   const {state,transport,call}=client();
   await call('manager');
-  state.wrongToken=true;
-  await assert.rejects(call('builder'),error=>{
-    assert.equal(JSON.parse(error.body).code,714);
-    assert.equal(error.cause.code,704);
-    assert.equal(error.cause.transportPhase,'pre_dispatch');
-    return true;
-  });
+  await call('builder');
   await call('manager');
   assert.equal(state.connections,1);
-  assert.deepEqual(state.calls,['manager','manager']);
-  state.wrongToken=false;
-  await call('builder');
-  assert.equal(state.connections,1);
+  assert.deepEqual(state.calls,['manager','builder','manager']);
   await transport.close();
 });
 
@@ -102,7 +94,7 @@ test('a deactivated endpoint is discarded without waiting for unrelated work', a
   const {state,transport,call}=client({drain:()=>gate});
   await call('manager');
   state.deactivated=true;
-  await assert.rejects(call('manager'),error=>JSON.parse(error.body).code===714 && error.cause.code===707);
+  await assert.rejects(call('manager'),error=>error.code===707);
   state.deactivated=false;
   await call('manager');
   assert.equal(state.connections,2);
@@ -116,18 +108,14 @@ test('a deactivated endpoint is discarded without waiting for unrelated work', a
 });
 
 
-test('a changed pinned route retires its endpoint for the following call', async () => {
-  let changed=false;
-  const {state,transport,call}=client({onPrepare({route}) {
-    if (changed && route === 'builder') throw nativeError(704,'RouteStale',{stage:'route_binding'});
-  }});
-  await call('builder');
-  changed=true;
-  await assert.rejects(call('builder'),error=>JSON.parse(error.body).code===714 && error.cause.details.stage==='route_binding');
-  changed=false;
-  await call('builder');
+test('same-endpoint replacement reaches the current registration without retiring its carrier', async () => {
+  const {state,transport,call}=client();
+  assert.deepEqual([...await call('builder')],[1]);
+  state.generation=1;
+  assert.deepEqual([...await call('builder')],[2]);
   await call('manager');
-  assert.equal(state.connections,2);
+  assert.equal(state.connections,1);
+  assert.deepEqual(state.closed,[]);
   await transport.close();
 });
 
@@ -137,13 +125,13 @@ test('stream close retires an endpoint when its asynchronous preparation fails',
   const gate=new Promise(resolve=>{release=resolve});
   let prepares=0;
   const {state,transport,call}=client({async onPrepare() {
-    if (++prepares === 2) {entered();await gate;throw nativeError(707,'ResourceClosed')}
+    if (++prepares === 1) {entered();await gate;throw nativeError(707,'ResourceClosed')}
   }});
   const stream=transport.stream('manager',contract,'steps',()=>new Uint8Array(),bytes=>bytes);
   await started;
   const closed=stream.close(null);
   release();
-  await assert.rejects(closed,error=>error.code===707);
+  await assert.rejects(closed,error=>error.cause.code===707);
   await call('manager');
   assert.equal(state.connections,2);
   await transport.close();

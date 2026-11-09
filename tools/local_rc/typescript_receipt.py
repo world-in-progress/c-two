@@ -5,6 +5,7 @@ import json
 from pathlib import Path, PurePosixPath, PureWindowsPath
 import re
 from typing import Any, Mapping, NoReturn
+import unicodedata
 
 
 PAYLOADS = ("no-payload", "record-v1", "object-graph-v1")
@@ -19,7 +20,7 @@ EXPECTED_ROW_IDS = tuple(
 )
 DIGEST_ROW_ID = "record-v1__direct-ipc"
 OPAQUE_ROW_ID = "object-graph-v1__relay-aware-http"
-RECEIPT_SCHEMA = "c-two.typescript-real-call-receipt.v2"
+RECEIPT_SCHEMA = "c-two.typescript-real-call-receipt.v3"
 FROZEN_FASTDB_DIGEST_MISMATCH_CAUSE = {
     "cause_owner": "fastdb",
     "fastdb_code": "3006",
@@ -33,6 +34,7 @@ FROZEN_FASTDB_DIGEST_MISMATCH_CAUSE = {
     "fastdb_symbol": "DIGEST_MISMATCH",
 }
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_MAX_WIRE_TEXT_BYTES = 255
 _ROOT_FIELDS = frozenset(
     (
         "schema",
@@ -71,7 +73,7 @@ _RELEASE_REF_FIELDS = frozenset(
     ("schema", "contract_schema", "descriptor_sha256", "crm")
 )
 _CRM_FIELDS = frozenset(("namespace", "name", "version"))
-_ROUTE_FIELDS = frozenset(("uid",))
+_ROUTE_FIELDS = frozenset(("name",))
 _COUNTER_FIELDS = frozenset(("requests", "responses"))
 _LIFETIME_FIELDS = frozenset(
     ("close_idempotent", "checked_view_invalidated", "materialized_survived")
@@ -141,6 +143,18 @@ def _string(value: object, path: str) -> str:
     if not isinstance(value, str) or not value:
         _fail(path, "must be a non-empty string")
     return value
+
+
+def _route_name(value: object, path: str) -> str:
+    name = _string(value, path)
+    if (
+        len(name.encode("utf-8")) > _MAX_WIRE_TEXT_BYTES
+        or name.strip() != name
+        or any(unicodedata.category(character) == "Cc" for character in name)
+        or "\\" in name
+    ):
+        _fail(path, "must be a valid route key")
+    return name
 
 
 def _sha256(value: object, path: str) -> str:
@@ -223,7 +237,7 @@ def _validate_row(value: object, row_id: str, index: int) -> None:
         _sha256(row["fastdb_spec_sha256"], f"{path}.fastdb_spec_sha256")
     route = _object(row["route"], f"{path}.route")
     _fields(route, _ROUTE_FIELDS, f"{path}.route")
-    _string(route["uid"], f"{path}.route.uid")
+    _route_name(route["name"], f"{path}.route.name")
     _sha256(row["logical_result_sha256"], f"{path}.logical_result_sha256")
     counters = _object(row["path_counters"], f"{path}.path_counters")
     _fields(counters, _COUNTER_FIELDS, f"{path}.path_counters")

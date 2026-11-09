@@ -52,11 +52,10 @@ impl std::fmt::Display for EncodeError {
 
 impl std::error::Error for EncodeError {}
 
-/// Seven-field route and contract identity carried by OPEN.
+/// Six-field route and contract identity carried by OPEN.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RouteCallIdentity<S = String> {
     pub route_name: S,
-    pub route_uid: S,
     pub crm_ns: S,
     pub crm_name: S,
     pub crm_ver: S,
@@ -64,9 +63,8 @@ pub struct RouteCallIdentity<S = String> {
     pub signature_hash: S,
 }
 
-const IDENTITY_FIELDS: [&str; 7] = [
+const IDENTITY_FIELDS: [&str; 6] = [
     "route_name",
-    "route_uid",
     "crm_ns",
     "crm_name",
     "crm_ver",
@@ -74,10 +72,9 @@ const IDENTITY_FIELDS: [&str; 7] = [
     "signature_hash",
 ];
 
-fn identity_fields<S: AsRef<str>>(identity: &RouteCallIdentity<S>) -> [&str; 7] {
+fn identity_fields<S: AsRef<str>>(identity: &RouteCallIdentity<S>) -> [&str; 6] {
     [
         identity.route_name.as_ref(),
-        identity.route_uid.as_ref(),
         identity.crm_ns.as_ref(),
         identity.crm_name.as_ref(),
         identity.crm_ver.as_ref(),
@@ -86,7 +83,7 @@ fn identity_fields<S: AsRef<str>>(identity: &RouteCallIdentity<S>) -> [&str; 7] 
     ]
 }
 
-fn identity_encoded_len(fields: &[&str; 7]) -> Result<usize, EncodeError> {
+fn identity_encoded_len(fields: &[&str; 6]) -> Result<usize, EncodeError> {
     for (field, value) in IDENTITY_FIELDS.into_iter().zip(fields) {
         if value.len() > u8::MAX as usize {
             return Err(EncodeError::FieldTooLong {
@@ -96,7 +93,7 @@ fn identity_encoded_len(fields: &[&str; 7]) -> Result<usize, EncodeError> {
             });
         }
     }
-    Ok(7 + fields.iter().map(|s| s.len()).sum::<usize>())
+    Ok(6 + fields.iter().map(|s| s.len()).sum::<usize>())
 }
 
 /// Size of OPEN's kind, identity, method index and mode, without allocating.
@@ -140,7 +137,7 @@ fn read_identity_text(
     Ok(value)
 }
 
-/// Decode and validate the OPEN kind, seven identity fields, method index and call mode.
+/// Decode and validate the OPEN kind, six identity fields, method index and call mode.
 /// Returns the byte offset where the value storage begins.
 pub fn decode_open_metadata(
     payload: &[u8],
@@ -159,16 +156,6 @@ pub fn decode_open_metadata(
             reason: error.to_string(),
         }
     })?;
-    let route_uid = read_identity_text(payload, &mut pos, "route_uid")?;
-    if route_uid
-        .bytes()
-        .any(|b| b <= 0x20 || b == b'/' || b == b'\\')
-    {
-        return Err(DecodeError::InvalidText {
-            field: "route_uid",
-            reason: "contains an invalid character".into(),
-        });
-    }
     let crm_ns = read_identity_text(payload, &mut pos, "crm_ns")?;
     let crm_name = read_identity_text(payload, &mut pos, "crm_name")?;
     let crm_ver = read_identity_text(payload, &mut pos, "crm_ver")?;
@@ -210,7 +197,6 @@ pub fn decode_open_metadata(
     Ok((
         RouteCallIdentity {
             route_name,
-            route_uid,
             crm_ns,
             crm_name,
             crm_ver,
@@ -442,7 +428,7 @@ fn inspect_carrier(
     if !continuation {
         match kind {
             RpcRecordKind::Open => {
-                for _ in 0..7 {
+                for _ in 0..IDENTITY_FIELDS.len() {
                     let len = *payload.get(offset)? as usize;
                     offset = offset.checked_add(1 + len)?;
                     if offset > payload.len() {

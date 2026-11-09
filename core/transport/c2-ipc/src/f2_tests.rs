@@ -87,7 +87,7 @@ async fn isolated_reply_failure(fault: ReplyFault) {
             ReplyFault::MissingFirst => chunk(target.request_id, 1536, 3, 1, &[2; 512]),
             ReplyFault::RejectedDuringChunks => {
                 let error = c2_error::C2Error::new(
-                    c2_error::ErrorCode::RouteStale,
+                    c2_error::ErrorCode::ResourceNotFound,
                     "not executed after a success value began",
                 )
                 .to_wire_bytes();

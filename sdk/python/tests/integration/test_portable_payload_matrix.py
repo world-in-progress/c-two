@@ -19,9 +19,8 @@ from c_two.error import (
     ContractMismatch,
     ResourceNotFound,
     ResourceRemoved,
-    RouteStale,
 )
-from c_two.transport.registry import _reset_default_runtime
+from c_two.transport.registry import _get_default_runtime, _reset_default_runtime
 from fastdb4py.payload import Payload
 from tests.fixtures.portable_interop import (
     GRAPH_SPEC,
@@ -104,15 +103,13 @@ def _assert_client_receipt(
     receipt: dict[str, str],
     *,
     expected_path: str,
-) -> tuple[str, int, int]:
+) -> tuple[int, int]:
     assert receipt["observed_path"] == expected_path
-    route_uid = receipt["route_uid"]
     requests = int(receipt["requests"])
     responses = int(receipt["responses"])
-    assert route_uid
     assert requests > 0
     assert responses > 0
-    return route_uid, requests, responses
+    return requests, responses
 
 
 def _run_python_host_row(
@@ -122,7 +119,7 @@ def _run_python_host_row(
     transport: str,
     route_name: str,
     relay_url: str | None,
-) -> tuple[str, int, int]:
+) -> tuple[int, int]:
     resource = resource_for(payload)
     configure_python_runtime(
         server=True,
@@ -137,6 +134,7 @@ def _run_python_host_row(
     )
     actual_address = cc.server_address()
     assert actual_address is not None
+    host_instance = _get_default_runtime()._runtime_session.ensure_server()["server_instance_id"]  # noqa: SLF001
     try:
         resolved = (
             wait_for_contract_resolution(
@@ -161,7 +159,7 @@ def _run_python_host_row(
             expected_path="DirectIpc" if transport == "direct" else "ExplicitRelay",
         )
         if resolved is not None:
-            assert resolved["route_uid"] == result[0]
+            assert resolved["server_instance_id"] == host_instance
         return result
     finally:
         _reset_default_runtime()
@@ -177,7 +175,7 @@ def _run_rust_host_row(
     route_name: str,
     address: str,
     relay_url: str | None,
-) -> tuple[str, int, int]:
+) -> tuple[int, int]:
     host = RustHost(
         artifacts,
         payload=payload,
@@ -185,7 +183,7 @@ def _run_rust_host_row(
         route_name=route_name,
         relay_url=relay_url,
     )
-    result: tuple[str, int, int] | None = None
+    result: tuple[int, int] | None = None
     try:
         resolved = (
             wait_for_contract_resolution(
@@ -197,7 +195,7 @@ def _run_rust_host_row(
             else None
         )
         if resolved is not None:
-            assert resolved["route_uid"] == host.route_uid
+            assert resolved["server_instance_id"] == host.server_instance_id
         endpoint = address if transport == "direct" else relay_url or ""
         if client_language == "rust":
             receipt = run_rust_client(
@@ -234,11 +232,7 @@ def _run_rust_host_row(
                     "direct_ipc" if transport == "direct" else "explicit_relay"
                 )
                 assert proxy.client.observed_path == expected_path
-                result = (
-                    proxy.client.route_uid,
-                    1,
-                    1,
-                )
+                result = (1, 1)
             finally:
                 cc.close(proxy)
                 _reset_default_runtime()
@@ -246,7 +240,6 @@ def _run_rust_host_row(
         host_calls = host.stop()
     assert host_calls == 1
     assert result is not None
-    assert result[0] == host.route_uid
     return result
 
 
@@ -269,7 +262,7 @@ def test_portable_payload_matrix_row(
     with relay_context as relay:
         relay_url = relay.url if relay is not None else None
         if host_language == "python":
-            route_uid, requests, responses = (
+            requests, responses = (
                 _run_python_host_row(
                     matrix_artifacts,
                     payload=payload,
@@ -279,7 +272,7 @@ def test_portable_payload_matrix_row(
                 )
             )
         else:
-            route_uid, requests, responses = (
+            requests, responses = (
                 _run_rust_host_row(
                     matrix_artifacts,
                     payload=payload,
@@ -304,9 +297,7 @@ def test_portable_payload_matrix_row(
         "descriptor_sha256": facts.descriptor_sha256,
         "contract_release_ref": deepcopy(facts.release_ref),
         "fastdb_spec_sha256": facts.fastdb_spec_sha256,
-        "route": {
-            "uid": route_uid,
-        },
+        "route": {"name": route_name},
         "logical_result_sha256": logical_result_sha256(payload),
         "packages": {
             "client_sha256": matrix_artifacts.package_sha256(client_language),
@@ -336,10 +327,10 @@ def test_portable_payload_matrix_writes_complete_receipt(
         Path(configured_path)
         if configured_path
         else REPOSITORY
-        / "target/local-rc/portable-matrix-receipt.v2.json"
+        / "target/local-rc/portable-matrix-receipt.v3.json"
     )
     receipt = {
-        "schema": "c-two.portable-matrix-receipt.v2",
+        "schema": "c-two.portable-matrix-receipt.v3",
         "evidence_stage": evidence_stage,
         "rows": [_MATRIX_ROWS[row_id] for row_id in EXPECTED_ROW_IDS],
     }
@@ -388,17 +379,16 @@ def test_route_disappearance_preserves_release_reference(
         )
         try:
             assert proxy.ping() is None
-            retained_route = proxy.client.route_uid
+            assert not hasattr(proxy.client, "route_uid")
             cc.unregister(route_name)
             expected_error = (
                 ResourceRemoved
                 if transport == "direct"
-                else (ResourceNotFound, RouteStale)
+                else ResourceNotFound
             )
             with pytest.raises(expected_error):
                 proxy.ping()
             assert cc.contract.release_ref(PortableNoPayload) == retained_ref
-            assert retained_route
         finally:
             cc.close(proxy)
             _reset_default_runtime()

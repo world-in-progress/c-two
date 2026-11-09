@@ -235,28 +235,12 @@ pub(crate) fn clone_observation_error(error: &IpcError) -> IpcError {
         },
         IpcError::ContractMismatch(message) => IpcError::ContractMismatch(message.clone()),
         IpcError::RouteNotFound(name) => IpcError::RouteNotFound(name.clone()),
-        IpcError::RouteRemoved {
-            route_name,
-            route_uid,
-        } => IpcError::RouteRemoved {
+        IpcError::RouteRemoved { route_name } => IpcError::RouteRemoved {
             route_name: route_name.clone(),
-            route_uid: route_uid.clone(),
         },
-        IpcError::RouteClosed {
-            route_name,
-            route_uid,
-            reason,
-        } => IpcError::RouteClosed {
+        IpcError::RouteClosed { route_name, reason } => IpcError::RouteClosed {
             route_name: route_name.clone(),
-            route_uid: route_uid.clone(),
             reason: reason.clone(),
-        },
-        IpcError::RouteStale {
-            route_name,
-            current_route_uid,
-        } => IpcError::RouteStale {
-            route_name: route_name.clone(),
-            current_route_uid: current_route_uid.clone(),
         },
         IpcError::MethodNotFound {
             route_name,

@@ -18,12 +18,14 @@ See the [unreleased notes](docs/releases/unreleased.md).
 - Small IPC calls are slower: a 1-byte call takes about 40–70 µs more. See the [unreleased notes](docs/releases/unreleased.md).
 - Breaking: one payload buffer budget per Runtime and relay (`payload_buffer_budget_bytes`, `C2_CALL_PAYLOAD_BUFFER_BUDGET_BYTES`, `--call-payload-buffer-budget-bytes`) replaces the retained-input budget. It also charges HTTP bodies and calls without a deadline, releases input once the transport has copied it, and makes a call wait within its deadline when the budget is short.
 - Breaking: `max_total_chunks` / `C2_IPC_MAX_TOTAL_CHUNKS` is renamed `max_inflight_chunk_frames` / `C2_IPC_MAX_INFLIGHT_CHUNK_FRAMES`.
-- A relay-aware call no longer re-sends after the relay reports a stale route, and chunked IPC calls reserve their route in frame order like unchunked calls.
+- A relay-aware call sends its input once instead of re-sending it from a retained copy, and chunked IPC calls reserve their route in frame order like unchunked calls.
 - Breaking: `call_execution_snapshot()` reports call slots only; its byte fields are removed in favor of `memory_stats()['payload_buffer']`, and `rejected_reservations` counts only refused call slots. The server bridge's `shutdown()` defaults to 30 seconds.
 - Breaking: IPC 16 call records replace the IPC 15 business frames, so upgrade the SDKs, c3 and generated TypeScript clients together and regenerate the clients. A call the server refused before it entered the resource is now reported as pre-dispatch (NotExecuted) instead of as a resource error.
 - A frame write that exceeds `write_timeout` deactivates the connection without cutting off the call record being written; the call follows that frame's real result.
 - A relay sends responses while it reads them from upstream instead of assembling them first, charges the responses and stream items it forwards to its payload buffer budget, and no longer refuses an unknown-length request when the budget leaves only a one-byte sending area.
 - Breaking: generated TypeScript clients call the Rust client through C/FFI ABI 8, which replaces 7, so regenerate them and rebuild the Node binding. Unary calls issued on one connection without awaiting now run concurrently instead of one after another.
+- Breaking: clients follow the route name ([ADR 0004](docs/decisions/0004-route-name-identity.md)). A route registered again at the same endpoint or relay serves existing clients without an error, and a client whose target is known to be gone acquires the route again before its next call; calls already sent are never replayed. IPC 16, C/FFI ABI 8 and relay mesh 7 no longer carry route UIDs, so upgrade the SDKs, c3 relays and the Node binding together and regenerate TypeScript clients.
+- Breaking: a relay mesh holds at most one live registration of a name. A name stays with an unreachable relay, which answers resolution with `ResourceUnavailable` and registration elsewhere with `ResourceAlreadyRegistered`, until that relay withdraws it or the deployer forces it to leave.
 
 ### Added
 
@@ -34,6 +36,7 @@ See the [unreleased notes](docs/releases/unreleased.md).
 - Server streams for Python resources and clients: `@cc.stream`, `cc.Stream` with `close(timeout=30.0)`, held items, same-process object streams and generated Python stream methods; Python and Rust stream to each other over direct IPC.
 - Server streams for generated TypeScript clients over direct IPC: `C2ResponseStream` methods, held items, cancellation when a `for await` loop exits early, and `close(timeoutMs)` with a 30-second default.
 - Server streams through a relay for Rust and Python clients. The relay sends each item while it reads it from upstream, `DELETE /_calls/{token}` cancels one call while its response still reports the real terminal, and relay shutdown ends the streams it forwards between steps with `CallCancelled`. IPC 16's CANCEL carries its cause, and its OPEN carries the call mode: a call whose mode differs from the method's, such as a hand-written HTTP request without the stream media type, is refused before dispatch with `UnsupportedCallMode` (716), which a relay answers with HTTP 406. Generated TypeScript clients read streams over direct IPC only.
+- Error code `RouteConflict` (719) for a name with live registrations on more than one relay, and `c3 registry force-leave` (`POST /_admin/force-leave`) to make a mesh forget an unreachable relay and its routes.
 
 ### Removed
 
@@ -41,6 +44,7 @@ See the [unreleased notes](docs/releases/unreleased.md).
 - `C2_RELAY_ROUTE_MAX_ATTEMPTS`, the sweep and relay owner caps, duplicate lease counters, two shutdown-outcome fields, and dead Rust surface: `FreeResult`, the `SyncClient` preallocation API, IPC route-watch recovery, the relay route event history, configurable contract limits, and never-constructed errors.
 - `cc.Held`, `cc.hold_stats()`, the public `ConcurrencyMode` and `InputLifetime` enums (use string values), and the default namespace and version of `@cc.crm`.
 - Contract inference (`infer_crm_from_resource`, `c3 contract infer`) and the resource bridge (`cc.bridge`, `cc.ResourceBridge`, `register(bridge=...)`).
+- Route UIDs on client surfaces (Python `route_uid`, Rust `ObservedRoute` and `observed_route()`, `x-c2-route-uid`), the error codes 704 `RouteStale`, 706 and 711, which are never assigned again, the shared relay resolution cache, and the generated TypeScript options `maxAttempts` and `routeCacheTtlMs`.
 
 ### Fixed
 
@@ -49,11 +53,11 @@ See the [unreleased notes](docs/releases/unreleased.md).
 - Generated TypeScript relay-aware clients reuse one local IPC connection per server instance for relay-local calls instead of opening and closing a connection for each call.
 - Callers that acquire the same endpoint at once share one connection attempt instead of each opening a connection, and a shared failure keeps its native OS error code.
 - Once a Host stops admitting calls during shutdown, route lookup and listing report its routes closed with reason shutdown, matching the `ResourceClosed` refusal that calls get; before, lookup still answered ready.
-- A relay-aware client acquiring a route by name after the route was registered again binds the new route UID instead of failing with `RouteStale` through a relay or `FallbackDenied` on the relay-local path.
 - On Windows, a client's DISCONNECT no longer loses to a failed reply flush as the connection's first close reason; a write that fails because the peer has closed is a peer end, and the reader decides the reason.
-- A relay discards the request body before every refusal it sends without reading it, so on Windows a client that is still sending receives the refusal, such as a stale route reported before dispatch, instead of a reset connection.
+- A relay discards the request body before every refusal it sends without reading it, so on Windows a client that is still sending receives the refusal, such as a missing route reported before dispatch, instead of a reset connection.
 - Releasing a held response no longer deadlocks with another thread that exports a buffer of the same response.
-- A request that a relay is still connecting upstream for when it withdraws or replaces the route reports `ResourceNotFound` or `RouteStale` instead of `ResourceUnavailable`.
+- A request that a relay is still connecting upstream for when it withdraws the route reports `ResourceNotFound` instead of `ResourceUnavailable`, and one for a replaced route goes to the current registration.
+- `c3 relay --bind` with port `0` takes a free port, advertises it and prints it in its `listening at` line; before, it advertised and printed port 0.
 
 ## [0.10.1] — companion c3 0.6.0
 

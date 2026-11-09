@@ -45,7 +45,7 @@ uv sync --reinstall-package c-two
 C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests -q --timeout=30
 ```
 
-For local Unix validation with two Python workers, prepare the native extension, `c3`, Node 22 with Node-API 10 or newer, the pinned FastDB CoreSDK and TypeScript build inputs first, then use:
+For local Unix validation with two Python workers, prepare the native extension, `c3`, the registration attestor (`python tools/dev/build_route_scope_attestor.py`), Node 22 with Node-API 10 or newer, the pinned FastDB CoreSDK and TypeScript build inputs first, then use:
 
 ```bash
 .venv/bin/python tools/dev/test_python.py --python .venv/bin/python \

@@ -239,10 +239,122 @@ impl Fixture {
             c2_mem_ffi_call_dispatch(call, input.as_ptr(), input.len(), callback, user)
         });
         unsafe {
-            success(result);
+            let target = metadata(result);
+            assert_eq!(target["path"], "DirectIpc");
+            let mut snapshot = ptr::null_mut();
+            assert_eq!(
+                c2_mem_ffi_endpoint_context_connection_snapshot(
+                    self.endpoint,
+                    route.as_ptr(),
+                    &mut snapshot,
+                ),
+                C2MemFfiStatus::Ok
+            );
+            let prepared = metadata(snapshot);
+            for key in ["serverId", "serverInstanceId", "connectionId"] {
+                assert_eq!(target[key], prepared[key], "dispatch target field {key}");
+            }
+            c2_mem_ffi_result_free(snapshot);
             c2_mem_ffi_result_free(result);
         }
         call
+    }
+}
+
+#[test]
+fn connection_snapshot_reports_the_prepared_physical_connection_and_its_end() {
+    let fixture = Fixture::new(64);
+    let route = CString::new("items").unwrap();
+    let mut snapshot = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            c2_mem_ffi_endpoint_context_connection_snapshot(
+                fixture.endpoint,
+                route.as_ptr(),
+                &mut snapshot,
+            )
+        },
+        C2MemFfiStatus::Ok
+    );
+    let value = unsafe { metadata(snapshot) };
+    assert!(value["connectionId"].as_str().is_some());
+    assert!(value["serverId"].as_str().is_some());
+    assert!(value["serverInstanceId"].as_str().is_some());
+    assert!(value["endReason"].is_null());
+    unsafe {
+        c2_mem_ffi_result_free(snapshot);
+    }
+    let missing = CString::new("missing").unwrap();
+    assert_eq!(
+        unsafe {
+            c2_mem_ffi_endpoint_context_connection_snapshot(
+                fixture.endpoint,
+                missing.as_ptr(),
+                &mut snapshot,
+            )
+        },
+        C2MemFfiStatus::Ok
+    );
+    assert!(unsafe { (*snapshot).json.is_null() });
+    unsafe {
+        c2_mem_ffi_result_free(snapshot);
+    }
+    let closed =
+        async_result(|c, u| unsafe { c2_mem_ffi_endpoint_context_close(fixture.endpoint, c, u) });
+    unsafe {
+        success(closed);
+        c2_mem_ffi_result_free(closed);
+    }
+    assert_eq!(
+        unsafe {
+            c2_mem_ffi_endpoint_context_connection_snapshot(
+                fixture.endpoint,
+                route.as_ptr(),
+                &mut snapshot,
+            )
+        },
+        C2MemFfiStatus::Ok
+    );
+    let after = unsafe { metadata(snapshot) };
+    assert_eq!(after["connectionId"], value["connectionId"]);
+    assert_eq!(after["serverId"], value["serverId"]);
+    assert_eq!(after["serverInstanceId"], value["serverInstanceId"]);
+    assert_eq!(after["endReason"], "local_close");
+    unsafe {
+        c2_mem_ffi_result_free(snapshot);
+    }
+}
+
+#[test]
+fn prepare_zero_budget_expires_before_acquiring_an_existing_connection() {
+    let fixture = Fixture::new(64);
+    let release = ContractRelease::from_descriptor_json(DESCRIPTOR).unwrap();
+    let expected = release.expected_route("items").unwrap();
+    let contract = CString::new(json!({"namespace":expected.crm_ns,"name":expected.crm_name,"version":expected.crm_ver,"abiHash":expected.abi_hash,"signatureHash":expected.signature_hash}).to_string()).unwrap();
+    let route = CString::new("items").unwrap();
+    let zero = 0u64;
+    let result = async_result(|c, u| unsafe {
+        c2_mem_ffi_endpoint_context_prepare(
+            fixture.endpoint,
+            route.as_ptr(),
+            contract.as_ptr(),
+            &zero,
+            c,
+            u,
+        )
+    });
+    let error: Value = unsafe {
+        serde_json::from_str(
+            CStr::from_ptr(c2_mem_ffi_error_parts((*result).error))
+                .to_str()
+                .unwrap(),
+        )
+        .unwrap()
+    };
+    assert_eq!(error["code"], ErrorCode::CallDeadlineExceeded as u32);
+    assert_eq!(error["transportPhase"], "pre_dispatch");
+    unsafe {
+        c2_mem_ffi_result_free(result);
     }
 }
 impl Drop for Fixture {
@@ -303,6 +415,64 @@ fn native_calls_share_the_driver_and_report_real_complete_item_counts() {
             c2_mem_ffi_result_free(observed);
             c2_mem_ffi_call_free(call);
         }
+    }
+}
+
+#[test]
+fn dispatch_error_keeps_typed_failure_and_original_target() {
+    let fixture = Fixture::new(64);
+    let mut call = ptr::null_mut();
+    let mut error = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            c2_mem_ffi_call_begin(
+                fixture.endpoint,
+                c"items".as_ptr(),
+                c"missing".as_ptr(),
+                0,
+                ptr::null(),
+                &mut call,
+                &mut error,
+            )
+        },
+        C2MemFfiStatus::Ok
+    );
+    let charged = async_result(|c, u| unsafe { c2_mem_ffi_call_charge_input(call, 0, c, u) });
+    unsafe {
+        success(charged);
+        c2_mem_ffi_result_free(charged);
+    }
+    let dispatched =
+        async_result(|c, u| unsafe { c2_mem_ffi_call_dispatch(call, ptr::null(), 0, c, u) });
+    unsafe {
+        assert!(!(*dispatched).error.is_null());
+        let failure: Value = serde_json::from_str(
+            CStr::from_ptr(c2_mem_ffi_error_parts((*dispatched).error))
+                .to_str()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(failure["code"], ErrorCode::ProtocolViolation as u32);
+        assert_eq!(failure["transportPhase"], "pre_dispatch");
+        let target = (&*call).0.state.lock().dispatch_target.clone().unwrap();
+        assert_eq!(target.path, c2_core::ObservedPath::DirectIpc);
+        let ipc = target.ipc.unwrap();
+        let bound = (&*fixture.endpoint)
+            .0
+            .bindings
+            .lock()
+            .clients
+            .get("items")
+            .cloned()
+            .unwrap();
+        assert_eq!(ipc.server_identity.server_id, bound.server_id);
+        assert_eq!(
+            ipc.server_identity.server_instance_id,
+            bound.server_instance_id
+        );
+        assert_eq!(ipc.connection_id, bound.observation.connection_id());
+        c2_mem_ffi_result_free(dispatched);
+        c2_mem_ffi_call_free(call);
     }
 }
 #[test]
@@ -545,7 +715,6 @@ fn close_waits_for_a_connection_whose_route_preparation_was_refused() {
     let mut error = ptr::null_mut();
     let address = CString::new(fixture.host.local_endpoint().address()).unwrap();
     let options = CString::new("{}").unwrap();
-    let token = CString::new(r#"{"routeUid":"wrong-uid"}"#).unwrap();
     assert_eq!(
         unsafe {
             c2_mem_ffi_endpoint_context_new(
@@ -559,7 +728,8 @@ fn close_waits_for_a_connection_whose_route_preparation_was_refused() {
         C2MemFfiStatus::Ok
     );
     let release = ContractRelease::from_descriptor_json(DESCRIPTOR).unwrap();
-    let expected = release.expected_route("items").unwrap();
+    let mut expected = release.expected_route("items").unwrap();
+    expected.signature_hash = "0".repeat(64);
     let contract=CString::new(json!({"namespace":expected.crm_ns,"name":expected.crm_name,"version":expected.crm_ver,"abiHash":expected.abi_hash,"signatureHash":expected.signature_hash}).to_string()).unwrap();
     let route = CString::new("items").unwrap();
     let rejected = async_result(|c, u| unsafe {
@@ -567,7 +737,7 @@ fn close_waits_for_a_connection_whose_route_preparation_was_refused() {
             endpoint,
             route.as_ptr(),
             contract.as_ptr(),
-            token.as_ptr(),
+            ptr::null(),
             c,
             u,
         )
@@ -596,165 +766,147 @@ fn close_waits_for_a_connection_whose_route_preparation_was_refused() {
     );
 }
 
+// ADR 0004: same-endpoint re-registration is admitted by name and contract.
 #[test]
-fn route_token_rejection_preserves_other_route_on_same_endpoint() {
+fn route_refusal_and_replacement_preserve_other_route_on_same_endpoint() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct Tagged {
+        label: &'static [u8],
+        calls: Arc<AtomicUsize>,
+    }
+    impl EncodedService for Tagged {
+        fn invoke(&self, _: u16, _: Vec<u8>) -> Result<Vec<u8>, C2Error> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(self.label.to_vec())
+        }
+    }
+    impl EncodedStreamService for Tagged {
+        fn open_stream(
+            &self,
+            index: u16,
+            input: Vec<u8>,
+        ) -> Result<Box<dyn EncodedStream>, C2Error> {
+            Service.open_stream(index, input)
+        }
+    }
+    fn ping(endpoint: *mut C2MemFfiEndpointContext, route: &CString) -> *mut C2MemFfiResult {
+        let mut call = ptr::null_mut();
+        let mut error = ptr::null_mut();
+        assert_eq!(
+            unsafe {
+                c2_mem_ffi_call_begin(
+                    endpoint,
+                    route.as_ptr(),
+                    c"ping".as_ptr(),
+                    0,
+                    ptr::null(),
+                    &mut call,
+                    &mut error,
+                )
+            },
+            C2MemFfiStatus::Ok
+        );
+        let charged = async_result(|c, u| unsafe { c2_mem_ffi_call_charge_input(call, 0, c, u) });
+        unsafe {
+            success(charged);
+            c2_mem_ffi_result_free(charged);
+        }
+        let sent =
+            async_result(|c, u| unsafe { c2_mem_ffi_call_dispatch(call, ptr::null(), 0, c, u) });
+        if unsafe { !(*sent).error.is_null() } {
+            unsafe {
+                c2_mem_ffi_call_free(call);
+            }
+            return sent;
+        }
+        unsafe {
+            success(sent);
+            c2_mem_ffi_result_free(sent);
+        }
+        let result = async_result(|c, u| unsafe { c2_mem_ffi_call_next(call, c, u) });
+        unsafe {
+            c2_mem_ffi_call_free(call);
+        }
+        result
+    }
     let fixture = Fixture::new(64);
     let release = ContractRelease::from_descriptor_json(DESCRIPTOR).unwrap();
-    let mut other_registration = fixture
-        .host
-        .register(
-            ServiceDefinition::new_stream(
-                &release,
-                release.reference(),
-                "other",
-                [
-                    MethodDefinition {
-                        index: 0,
-                        name: "ping".into(),
-                        access: MethodAccess::Read,
-                    },
-                    MethodDefinition {
-                        index: 1,
-                        name: "echo".into(),
-                        access: MethodAccess::Write,
-                    },
-                ],
-                Arc::new(Service),
-            )
-            .unwrap(),
+    let old_calls = Arc::new(AtomicUsize::new(0));
+    let new_calls = Arc::new(AtomicUsize::new(0));
+    let definition = |label, calls| {
+        ServiceDefinition::new_stream(
+            &release,
+            release.reference(),
+            "other",
+            [
+                MethodDefinition {
+                    index: 0,
+                    name: "ping".into(),
+                    access: MethodAccess::Read,
+                },
+                MethodDefinition {
+                    index: 1,
+                    name: "echo".into(),
+                    access: MethodAccess::Write,
+                },
+            ],
+            Arc::new(Tagged { label, calls }),
         )
+        .unwrap()
+    };
+    let mut old = fixture
+        .host
+        .register(definition(b"old", old_calls.clone()))
         .unwrap();
     let expected = release.expected_route("other").unwrap();
     let contract = CString::new(json!({"namespace":expected.crm_ns,"name":expected.crm_name,"version":expected.crm_ver,"abiHash":expected.abi_hash,"signatureHash":expected.signature_hash}).to_string()).unwrap();
     let other = CString::new("other").unwrap();
-    let items = CString::new("items").unwrap();
-    let items_expected = release.expected_route("items").unwrap();
-    let items_contract = CString::new(json!({"namespace":items_expected.crm_ns,"name":items_expected.crm_name,"version":items_expected.crm_ver,"abiHash":items_expected.abi_hash,"signatureHash":items_expected.signature_hash}).to_string()).unwrap();
-    let wrong = CString::new(r#"{"routeUid":"wrong-uid"}"#).unwrap();
-
-    let refused = async_result(|c, u| unsafe {
-        c2_mem_ffi_endpoint_context_prepare(
-            fixture.endpoint,
-            other.as_ptr(),
-            contract.as_ptr(),
-            wrong.as_ptr(),
-            c,
-            u,
-        )
-    });
-    unsafe {
-        assert!(!(*refused).error.is_null());
-        let error: Value = serde_json::from_str(
-            CStr::from_ptr(c2_mem_ffi_error_parts((*refused).error))
-                .to_str()
-                .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(error["code"], 704);
-        assert_eq!(error["transportPhase"], "pre_dispatch");
-        c2_mem_ffi_result_free(refused);
-    }
-    let items_result = async_result(|c, u| unsafe {
-        c2_mem_ffi_endpoint_context_prepare(
-            fixture.endpoint,
-            items.as_ptr(),
-            items_contract.as_ptr(),
-            ptr::null(),
-            c,
-            u,
-        )
-    });
-    let items_connection = unsafe { metadata(items_result) }["connectionId"].clone();
-    unsafe {
-        c2_mem_ffi_result_free(items_result);
-    }
-    let other_result = async_result(|c, u| unsafe {
-        c2_mem_ffi_endpoint_context_prepare(
-            fixture.endpoint,
-            other.as_ptr(),
-            contract.as_ptr(),
-            ptr::null(),
-            c,
-            u,
-        )
-    });
-    let other_metadata = unsafe { metadata(other_result) };
-    assert_eq!(other_metadata["connectionId"], items_connection);
-    let token = CString::new(json!({"routeUid":other_metadata["routeUid"]}).to_string()).unwrap();
-    unsafe {
-        c2_mem_ffi_result_free(other_result);
-    }
-    let other_again = async_result(|c, u| unsafe {
-        c2_mem_ffi_endpoint_context_prepare(
-            fixture.endpoint,
-            other.as_ptr(),
-            contract.as_ptr(),
-            token.as_ptr(),
-            c,
-            u,
-        )
-    });
-    unsafe {
-        success(other_again);
-        c2_mem_ffi_result_free(other_again);
-    }
-    other_registration.close().unwrap();
-    let _replacement = fixture
-        .host
-        .register(
-            ServiceDefinition::new_stream(
-                &release,
-                release.reference(),
-                "other",
-                [
-                    MethodDefinition {
-                        index: 0,
-                        name: "ping".into(),
-                        access: MethodAccess::Read,
-                    },
-                    MethodDefinition {
-                        index: 1,
-                        name: "echo".into(),
-                        access: MethodAccess::Write,
-                    },
-                ],
-                Arc::new(Service),
+    let prepare = || {
+        async_result(|c, u| unsafe {
+            c2_mem_ffi_endpoint_context_prepare(
+                fixture.endpoint,
+                other.as_ptr(),
+                contract.as_ptr(),
+                ptr::null(),
+                c,
+                u,
             )
-            .unwrap(),
-        )
-        .unwrap();
-    let current = fixture
-        ._runtime
-        .connect(
-            release.expected_route("other").unwrap(),
-            c2_core::Connect::DirectIpc {
-                address: fixture.host.local_endpoint().address().to_string(),
-            },
-        )
-        .unwrap();
-    let new_token =
-        CString::new(json!({"routeUid":current.observed_route().route_uid}).to_string()).unwrap();
-    let stale = async_result(|c, u| unsafe {
-        c2_mem_ffi_endpoint_context_prepare(
-            fixture.endpoint,
-            other.as_ptr(),
-            contract.as_ptr(),
-            new_token.as_ptr(),
-            c,
-            u,
-        )
-    });
+        })
+    };
+    let first = prepare();
+    let first_metadata = unsafe { metadata(first) };
+    assert_eq!(
+        first_metadata
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>(),
+        std::collections::BTreeSet::from(["connectionId", "serverId", "serverInstanceId"])
+    );
     unsafe {
-        assert!(!(*stale).error.is_null());
+        c2_mem_ffi_result_free(first);
+    }
+    let result = ping(fixture.endpoint, &other);
+    unsafe {
+        success(result);
+        assert_eq!((*(*result).buffer).0.bytes(), b"old");
+        c2_mem_ffi_result_free(result);
+    }
+    old.close().unwrap();
+    let result = ping(fixture.endpoint, &other);
+    unsafe {
+        assert!(!(*result).error.is_null());
         let error: Value = serde_json::from_str(
-            CStr::from_ptr(c2_mem_ffi_error_parts((*stale).error))
+            CStr::from_ptr(c2_mem_ffi_error_parts((*result).error))
                 .to_str()
                 .unwrap(),
         )
         .unwrap();
-        assert_eq!(error["code"], 704);
-        assert_eq!(error["details"]["stage"], "route_binding");
-        c2_mem_ffi_result_free(stale);
+        assert_eq!(error["code"], 708);
+        assert_eq!(error["transportPhase"], "pre_dispatch");
+        assert!(error["details"].get("route_uid").is_none());
+        c2_mem_ffi_result_free(result);
     }
     let unary = fixture.call("ping", &[], false);
     let result = async_result(|c, u| unsafe { c2_mem_ffi_call_next(unary, c, u) });
@@ -764,4 +916,28 @@ fn route_token_rejection_preserves_other_route_on_same_endpoint() {
         c2_mem_ffi_result_free(result);
         c2_mem_ffi_call_free(unary);
     }
+    let _replacement = fixture
+        .host
+        .register(definition(b"new", new_calls.clone()))
+        .unwrap();
+    // The endpoint's previously prepared client calls the replacement without prepare.
+    let result = ping(fixture.endpoint, &other);
+    unsafe {
+        success(result);
+        assert_eq!((*(*result).buffer).0.bytes(), b"new");
+        c2_mem_ffi_result_free(result);
+    }
+    let again = prepare();
+    assert_eq!(unsafe { metadata(again) }, first_metadata);
+    unsafe {
+        c2_mem_ffi_result_free(again);
+    }
+    let result = ping(fixture.endpoint, &other);
+    unsafe {
+        success(result);
+        assert_eq!((*(*result).buffer).0.bytes(), b"new");
+        c2_mem_ffi_result_free(result);
+    }
+    assert_eq!(old_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(new_calls.load(Ordering::SeqCst), 2);
 }

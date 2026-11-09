@@ -103,6 +103,12 @@ test('ABI 8 native endpoint completes unary calls and reuses the connector domai
   await withServer(async ({connector, address, lines, child, contract}) => {
     const first = await connector(address);
     try {
+      assert.equal(first.connectionSnapshot('echo'), null);
+      const prepared = await first.prepare('echo', contract);
+      assert.deepEqual(first.connectionSnapshot('echo'), {...prepared, endReason: null});
+      await assert.rejects(first.prepare('echo', contract, 0), error =>
+        error?.nativeDetails?.code === 715 && error.nativeDetails.transportPhase === 'pre_dispatch');
+      assert.deepEqual(first.connectionSnapshot('echo'), {...prepared, endReason: null});
       assert.deepEqual(await unary(first, contract, new Uint8Array([1, 2])), new Uint8Array([1, 2]));
       child.stdin.write('stats\n');
       assert.equal(JSON.parse((await lines.next()).value).allocations, 0, 'released response owner settled before next call');
@@ -112,6 +118,32 @@ test('ABI 8 native endpoint completes unary calls and reuses the connector domai
       assert.deepEqual(await unary(second, contract, new Uint8Array([3, 4])), new Uint8Array([3, 4]));
       assert.equal(typeof connector.stats(), 'object');
     } finally { await first.close(); await second.close(); }
+  });
+});
+
+test('ABI 8 same-endpoint re-registration reaches the current resource without a route UID', {timeout: 150_000}, async () => {
+  await withServer(async ({connector, address, contract, lines, child}) => {
+    const endpoint = await connector(address);
+    try {
+      const before = await endpoint.prepare('echo', contract);
+      assert.deepEqual(Object.keys(before).sort(), ['connectionId', 'serverId', 'serverInstanceId']);
+      assert.deepEqual(await unary(endpoint, contract, Uint8Array.of(7)), Uint8Array.of(7));
+
+      child.stdin.write('replace\n');
+      assert.equal(JSON.parse((await lines.next()).value).kind, 'route_removed');
+      await assert.rejects(endpoint.prepare('echo', contract));
+
+      child.stdin.write('register_replacement\n');
+      assert.equal(JSON.parse((await lines.next()).value).kind, 'route_replaced');
+      const after = await endpoint.prepare('echo', contract);
+      assert.deepEqual(Object.keys(after).sort(), ['connectionId', 'serverId', 'serverInstanceId']);
+      assert.deepEqual(after, before);
+      assert.deepEqual(await unary(endpoint, contract, Uint8Array.of(8)), Uint8Array.of(8, 1));
+      const fresh = await connector(address);
+      try {
+        assert.deepEqual(await unary(fresh, contract, Uint8Array.of(9)), Uint8Array.of(9, 1));
+      } finally { await fresh.close(); }
+    } finally { await endpoint.close(); }
   });
 });
 
@@ -447,21 +479,63 @@ test('public stream deadline leaves the original record running and later report
   });
 });
 
-test('ABI 8 unary encoding consumes the native pre-dispatch deadline', {timeout: 150_000}, async () => {
+test('ABI 8 unary preparation observes a native rejection after its caller deadline', {timeout: 150_000}, async () => {
+  await withServer(async ({connector, address, contract, lines, child, createIpcEncodedTransport}) => {
+    let clock = 0, rejectPreparation, preparations = 0;
+    const late = new Promise((_resolve, reject) => { rejectPreparation = reject; });
+    const failure = new Error('connect deadline exceeded');
+    failure.nativeDetails = {message: failure.message, code: 715, canonicalName: 'CallDeadlineExceeded', transportPhase: 'pre_dispatch'};
+    const descriptor = Object.getOwnPropertyDescriptor(performance, 'now');
+    Object.defineProperty(performance, 'now', {configurable: true, value: () => clock});
+    const transport = createIpcEncodedTransport(address, {
+      callTimeoutMs: 10,
+      connect: async (...args) => {
+        const endpoint = await connector(...args);
+        return new Proxy(endpoint, {get(target, key) {
+          if (key === 'prepare') return (_route, _contract, timeout) => {
+            assert.equal(timeout, 10);
+            preparations++;
+            clock = 11;
+            return late;
+          };
+          const value = Reflect.get(target, key);
+          return typeof value === 'function' ? value.bind(target) : value;
+        }});
+      },
+    });
+    try {
+      await assert.rejects(transport.call('echo', contract, 'ping', () => {
+        assert.fail('expired preparation must not encode input');
+      }), error => error.message === 'call deadline exceeded' && error.code === 715 && error.retrySafe);
+      rejectPreparation(failure);
+      await new Promise(resolve => setImmediate(resolve));
+      assert.equal(preparations, 1);
+    } finally {
+      rejectPreparation(failure);
+      if (descriptor === undefined) delete performance.now;
+      else Object.defineProperty(performance, 'now', descriptor);
+      await transport.close();
+    }
+    child.stdin.write('stats\n');
+    assert.equal(JSON.parse((await lines.next()).value).unary_dispatches, 0);
+  });
+});
+
+test('ABI 8 unary preparation and encoding share the pre-dispatch deadline', {timeout: 150_000}, async () => {
   await withServer(async ({connector, address, contract, lines, child, createIpcEncodedTransport}) => {
     const transport = createIpcEncodedTransport(address, {connect: connector, callTimeoutMs: 1});
-    let encoded = false;
     try {
       await transport.prepare('echo', contract);
       await assert.rejects(() => transport.call('echo', contract, 'ping', () => {
-        encoded = true;
         const start = performance.now();
         let iterations = 0;
         while (performance.now() - start < 20) iterations++;
         return Uint8Array.of(iterations & 255);
       }), error => error.code === 715 && error.transportPhase === 'pre_dispatch');
     } finally { await transport.close(); }
-    assert.equal(encoded, true);
+    // The original budget can expire during preparation, before the encoder.
+    // Either phase must leave the resource untouched; synchronous encoding
+    // exhaustion is also exercised by the deterministic codegen unit test.
     child.stdin.write('stats\n');
     const stats = JSON.parse((await lines.next()).value);
     assert.equal(stats.kind, 'stats');

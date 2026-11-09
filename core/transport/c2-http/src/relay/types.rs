@@ -26,7 +26,7 @@ pub struct RouteEntry {
     pub abi_hash: String,
     pub signature_hash: String,
     pub max_payload_size: u64,
-    pub route_uid: String,
+    pub route_uid: Option<String>,
     pub locality: Locality,
     pub registered_at: f64,
 }
@@ -114,7 +114,6 @@ pub struct RouteInfo {
     pub abi_hash: String,
     pub signature_hash: String,
     pub max_payload_size: u64,
-    pub route_uid: String,
 }
 
 impl RouteEntry {
@@ -145,7 +144,6 @@ impl RouteEntry {
             abi_hash: self.abi_hash.clone(),
             signature_hash: self.signature_hash.clone(),
             max_payload_size: self.max_payload_size,
-            route_uid: self.route_uid.clone(),
         }
     }
 }
@@ -173,6 +171,21 @@ pub enum PeerStatus {
     Alive,
     Suspect,
     Dead,
+}
+
+/// One registration as observed in this relay's mesh view.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct RouteRegistrationInfo {
+    pub relay_id: String,
+    pub relay_url: String,
+    pub registered_at: f64,
+    pub relay_status: PeerStatus,
+}
+
+#[derive(Debug, Clone)]
+pub enum RouteResolutionError {
+    Unavailable(Vec<RouteRegistrationInfo>),
+    Conflict(Vec<RouteRegistrationInfo>),
 }
 
 /// Information about a peer relay.
@@ -231,7 +244,6 @@ pub struct FullSyncRoute {
     pub abi_hash: String,
     pub signature_hash: String,
     pub max_payload_size: u64,
-    pub route_uid: String,
     pub registered_at: f64,
     pub hash: RouteDigestHash,
 }
@@ -289,7 +301,6 @@ impl FullSyncRoute {
             abi_hash: entry.abi_hash.clone(),
             signature_hash: entry.signature_hash.clone(),
             max_payload_size: entry.max_payload_size,
-            route_uid: entry.route_uid.clone(),
             registered_at: entry.registered_at,
             hash: route_entry_digest_hash(entry),
         }
@@ -309,7 +320,7 @@ impl FullSyncRoute {
             abi_hash: self.abi_hash.clone(),
             signature_hash: self.signature_hash.clone(),
             max_payload_size: self.max_payload_size,
-            route_uid: self.route_uid.clone(),
+            route_uid: None,
             locality: Locality::Peer,
             registered_at: self.registered_at,
         }
@@ -422,7 +433,6 @@ fn valid_full_sync_route(route: &FullSyncRoute) -> bool {
         && c2_contract::validate_contract_hash("abi_hash", &route.abi_hash).is_ok()
         && c2_contract::validate_contract_hash("signature_hash", &route.signature_hash).is_ok()
         && route.max_payload_size > 0
-        && c2_contract::validate_call_route_key("route_uid", &route.route_uid).is_ok()
         && route.registered_at.is_finite()
         && valid_route_digest_hash(&route.hash)
 }
@@ -456,7 +466,6 @@ pub(crate) fn route_entry_digest_hash(entry: &RouteEntry) -> RouteDigestHash {
         &entry.abi_hash,
         &entry.signature_hash,
         entry.max_payload_size,
-        &entry.route_uid,
         entry.registered_at,
     )
 }
@@ -476,7 +485,6 @@ pub(crate) fn active_route_digest_hash(
     abi_hash: &str,
     signature_hash: &str,
     max_payload_size: u64,
-    route_uid: &str,
     registered_at: f64,
 ) -> RouteDigestHash {
     stable_route_digest_hash(&[
@@ -490,7 +498,6 @@ pub(crate) fn active_route_digest_hash(
         abi_hash,
         signature_hash,
         &max_payload_size.to_string(),
-        route_uid,
         &registered_at.to_bits().to_string(),
     ])
 }
@@ -537,7 +544,7 @@ mod tests {
             abi_hash: ABI_HASH.to_string(),
             signature_hash: SIGNATURE_HASH.to_string(),
             max_payload_size: 1024,
-            route_uid: format!("{name}-uid"),
+            route_uid: Some(format!("{name}-uid")),
             locality: Locality::Local,
             registered_at: 1000.0,
         }
@@ -597,6 +604,7 @@ mod tests {
             .is_ok()
         );
         for (collection, retired) in [
+            ("routes", "route_uid"),
             ("routes", "route_revision"),
             ("tombstones", "removed_revision"),
         ] {

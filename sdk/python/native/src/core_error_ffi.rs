@@ -23,32 +23,11 @@ pub(crate) fn core_error_to_py(error: Error) -> PyErr {
             },
         ),
         Error::Semantic(error) => {
-            let message = error.message.clone();
-            let code = u16::from(error.code);
-            let name = error.code.name();
-            let details = error.details.clone();
-            let error_bytes = error.to_wire_bytes();
-            let exception = CoreError::new_err(("semantic", message));
+            let exception = CoreError::new_err(("semantic", error.message.clone()));
             Python::attach(|py| {
                 let value = exception.value(py);
-                set_attr(value, "code", code);
-                set_attr(value, "name", name);
                 set_io_cause(value, None);
-                let detail_dict = PyDict::new(py);
-                for (key, item) in details {
-                    if key == "transport_phase" {
-                        set_attr(value, "transport_phase", &item);
-                    }
-                    if key == "fallback_eligible" {
-                        set_attr(value, "fallback_eligible", item == "true");
-                    }
-                    if key == "route_withdrawal" {
-                        set_attr(value, "route_withdrawal", item == "true");
-                    }
-                    let _ = detail_dict.set_item(key, item);
-                }
-                set_attr(value, "details", detail_dict);
-                set_attr(value, "error_bytes", PyBytes::new(py, &error_bytes));
+                set_semantic_error(value, &error);
             });
             exception
         }
@@ -91,6 +70,30 @@ pub(crate) fn core_error_to_py(error: Error) -> PyErr {
         }
         Error::Lifecycle(error) => lifecycle_error_to_py(error),
     }
+}
+
+fn set_semantic_error(value: &Bound<'_, PyAny>, error: &c2_error::C2Error) {
+    set_attr(value, "code", u16::from(error.code));
+    set_attr(value, "name", error.code.name());
+    let details = PyDict::new(value.py());
+    for (key, item) in &error.details {
+        if key == "transport_phase" {
+            set_attr(value, "transport_phase", item);
+        }
+        if key == "fallback_eligible" {
+            set_attr(value, "fallback_eligible", item == "true");
+        }
+        if key == "route_withdrawal" {
+            set_attr(value, "route_withdrawal", item == "true");
+        }
+        let _ = details.set_item(key, item);
+    }
+    set_attr(value, "details", details);
+    set_attr(
+        value,
+        "error_bytes",
+        PyBytes::new(value.py(), &error.to_wire_bytes()),
+    );
 }
 
 #[cfg(test)]
@@ -197,6 +200,128 @@ mod tests {
             }
         });
     }
+    #[test]
+    fn registration_failure_preserves_semantic_error_and_original_receipt() {
+        Python::initialize();
+        Python::attach(|py| {
+            for code in [
+                c2_error::ErrorCode::ResourceAlreadyRegistered,
+                c2_error::ErrorCode::ContractMismatch,
+                c2_error::ErrorCode::ResourceUnavailable,
+            ] {
+                let semantic = c2_error::C2Error::new(code, "canonical relay refusal")
+                    .with_details(std::collections::BTreeMap::from([
+                        ("name".into(), "grid".into()),
+                        ("registrations".into(), "[]".into()),
+                    ]));
+                let status = if code == c2_error::ErrorCode::ResourceUnavailable {
+                    503
+                } else {
+                    409
+                };
+                let original = serde_json::to_string(&semantic.envelope()).unwrap();
+                let error = core_error_to_py(Error::Lifecycle(LifecycleError::RegisterFailure(
+                    Box::new(RegisterFailureOutcome {
+                        route_name: "grid".into(),
+                        failure_source: "relay_prepare".into(),
+                        error_message: original.clone(),
+                        status_code: Some(status),
+                        semantic_error: Some(semantic.clone()),
+                        rollback: Some(RouteCloseOutcome {
+                            route_name: "grid".into(),
+                            local_removed: false,
+                            active_drained: true,
+                            closed_reason: "registration_rollback".into(),
+                            close_error: None,
+                        }),
+                        relay_cleanup_error: None,
+                    }),
+                )));
+                let value = error.value(py);
+                assert_eq!(
+                    value
+                        .getattr("category")
+                        .unwrap()
+                        .extract::<String>()
+                        .unwrap(),
+                    "lifecycle"
+                );
+                assert_eq!(
+                    value
+                        .getattr("status_code")
+                        .unwrap()
+                        .extract::<u16>()
+                        .unwrap(),
+                    status
+                );
+                assert_eq!(
+                    value.getattr("code").unwrap().extract::<u16>().unwrap(),
+                    u16::from(code)
+                );
+                assert_eq!(
+                    value.getattr("name").unwrap().extract::<String>().unwrap(),
+                    code.name()
+                );
+                assert_eq!(
+                    value
+                        .getattr("details")
+                        .unwrap()
+                        .extract::<std::collections::BTreeMap<String, String>>()
+                        .unwrap(),
+                    semantic.details
+                );
+                let bytes = value
+                    .getattr("error_bytes")
+                    .unwrap()
+                    .extract::<Vec<u8>>()
+                    .unwrap();
+                assert_eq!(
+                    c2_error::C2Error::from_wire_bytes(&bytes).unwrap().unwrap(),
+                    semantic
+                );
+                assert_eq!(
+                    value
+                        .getattr("message")
+                        .unwrap()
+                        .extract::<String>()
+                        .unwrap(),
+                    format!("registration failed at relay_prepare: {original}")
+                );
+                let failure = value.getattr("registration_failure").unwrap();
+                assert_eq!(
+                    failure
+                        .get_item("error_message")
+                        .unwrap()
+                        .extract::<String>()
+                        .unwrap(),
+                    original
+                );
+                let rollback = failure.get_item("rollback").unwrap();
+                assert!(
+                    !rollback
+                        .get_item("local_removed")
+                        .unwrap()
+                        .extract::<bool>()
+                        .unwrap()
+                );
+                assert!(
+                    rollback
+                        .get_item("active_drained")
+                        .unwrap()
+                        .extract::<bool>()
+                        .unwrap()
+                );
+                assert_eq!(
+                    value
+                        .getattr("relay_duplicate")
+                        .unwrap()
+                        .is_truthy()
+                        .unwrap(),
+                    code == c2_error::ErrorCode::ResourceAlreadyRegistered
+                );
+            }
+        });
+    }
 }
 
 pub(crate) fn lifecycle_error_to_py(error: LifecycleError) -> PyErr {
@@ -240,6 +365,9 @@ pub(crate) fn lifecycle_error_to_py(error: LifecycleError) -> PyErr {
                 set_attr(value, "lifecycle_kind", "register_failure");
                 set_attr(value, "failure_source", &failure.failure_source);
                 set_attr(value, "route_name", &failure.route_name);
+                if let Some(semantic_error) = &failure.semantic_error {
+                    set_semantic_error(value, semantic_error);
+                }
                 if let Ok(details) = register_failure_to_dict(value.py(), failure) {
                     set_attr(value, "registration_failure", details.clone());
                     match details.get_item("rollback") {
@@ -254,7 +382,13 @@ pub(crate) fn lifecycle_error_to_py(error: LifecycleError) -> PyErr {
                 if let Some(status_code) = failure.status_code {
                     set_attr(value, "status_code", status_code);
                     if status_code == 409 {
-                        set_attr(value, "relay_duplicate", true);
+                        set_attr(
+                            value,
+                            "relay_duplicate",
+                            failure.semantic_error.as_ref().is_none_or(|error| {
+                                error.code == c2_error::ErrorCode::ResourceAlreadyRegistered
+                            }),
+                        );
                     }
                 }
             }

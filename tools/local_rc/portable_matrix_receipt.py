@@ -4,6 +4,7 @@ from collections import Counter
 import json
 from pathlib import Path, PurePosixPath, PureWindowsPath
 import re
+import unicodedata
 from typing import Any, Mapping, NoReturn
 
 
@@ -21,7 +22,7 @@ EXPECTED_ROW_IDS = tuple(
     for transport in TRANSPORTS
 )
 
-RECEIPT_SCHEMA = "c-two.portable-matrix-receipt.v2"
+RECEIPT_SCHEMA = "c-two.portable-matrix-receipt.v3"
 RELEASE_REF_SCHEMA = "c-two.contract-release-ref.v1"
 CONTRACT_SCHEMA = "c-two.contract.v2"
 
@@ -49,10 +50,11 @@ _RELEASE_REF_FIELDS = frozenset(
     ("schema", "contract_schema", "descriptor_sha256", "crm")
 )
 _CRM_FIELDS = frozenset(("namespace", "name", "version"))
-_ROUTE_FIELDS = frozenset(("uid",))
+_ROUTE_FIELDS = frozenset(("name",))
 _PACKAGE_FIELDS = frozenset(("client_sha256", "host_sha256"))
 _PATH_COUNTER_FIELDS = frozenset(("requests", "responses"))
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_MAX_WIRE_TEXT_BYTES = 255
 
 
 class ReceiptValidationError(ValueError):
@@ -86,6 +88,16 @@ def _require_string(value: object, path: str) -> str:
     if not isinstance(value, str) or not value:
         _fail(path, "must be a non-empty string")
     return value
+
+
+def _require_route_name(value: object, path: str) -> str:
+    name = _require_string(value, path)
+    if (len(name.encode("utf-8")) > _MAX_WIRE_TEXT_BYTES
+            or name.strip() != name
+            or any(unicodedata.category(character) == "Cc" for character in name)
+            or "\\" in name):
+        _fail(path, "must be a valid route key")
+    return name
 
 
 def _require_exact(value: object, expected: object, path: str) -> None:
@@ -203,7 +215,7 @@ def _validate_row(value: object, expected_id: str, index: int) -> None:
     route_path = f"{path}.route"
     route = _require_object(row["route"], route_path)
     _reject_unknown_fields(route, _ROUTE_FIELDS, route_path)
-    _require_string(route["uid"], f"{route_path}.uid")
+    _require_route_name(route["name"], f"{route_path}.name")
 
     _require_sha256(
         row["logical_result_sha256"],

@@ -96,14 +96,22 @@ C2MemFfiStatus c2_mem_ffi_client_domain_new(const C2MemFfiLocalEndpointContext *
 void c2_mem_ffi_client_domain_free(C2MemFfiClientDomain *domain);
 C2MemFfiStatus c2_mem_ffi_client_domain_stats(const C2MemFfiClientDomain *domain, C2MemFfiResult **out);
 /* new performs no I/O. prepare connects using Rust's sole IPC reader/writer,
- * validates the complete contract and pins server identity and route UID.
+ * validates the complete contract and records the reached server identity.
  * JSON options/contract are UTF-8. Endpoint options are connectTimeoutMs,
  * expectedServerIdentity; transport policy belongs to the client domain.
- * prepare takes an optional expected route token JSON ({"routeUid":"..."});
- * NULL omits it. All input strings are borrowed for the call.
- * prepare/close complete asynchronously. Deactivate stops new calls only. */
+ * A supplied server identity is checked on every acquisition; without one,
+ * acquisition after peer end accepts a new instance at the same address.
+ * All input strings are borrowed for the call.
+ * prepare/close complete asynchronously. The nullable prepare timeout is an
+ * operation budget in milliseconds, capped by explicit connectTimeoutMs; zero
+ * expires immediately. NULL retains the endpoint's connection budget.
+ * Deactivate stops new calls only. */
 C2MemFfiStatus c2_mem_ffi_endpoint_context_new(const C2MemFfiClientDomain *domain, const char *address, const char *options_json, C2MemFfiEndpointContext **out, C2MemFfiError **error);
-C2MemFfiStatus c2_mem_ffi_endpoint_context_prepare(const C2MemFfiEndpointContext *endpoint, const char *route, const char *contract_json, const char *expected_route_token_json, C2MemFfiComplete complete, void *user);
+C2MemFfiStatus c2_mem_ffi_endpoint_context_prepare(const C2MemFfiEndpointContext *endpoint, const char *route, const char *contract_json, const uint64_t *timeout_millis, C2MemFfiComplete complete, void *user);
+/* Synchronous, read-only snapshot of the physical connection observed by the
+ * last successful preparation of this route. No preparation returns JSON NULL.
+ * A successful result is owned by the caller and freed with result_free. */
+C2MemFfiStatus c2_mem_ffi_endpoint_context_connection_snapshot(const C2MemFfiEndpointContext *endpoint, const char *route, C2MemFfiResult **out);
 C2MemFfiStatus c2_mem_ffi_endpoint_context_deactivate(const C2MemFfiEndpointContext *endpoint);
 C2MemFfiStatus c2_mem_ffi_endpoint_context_close(const C2MemFfiEndpointContext *endpoint, C2MemFfiComplete complete, void *user);
 void c2_mem_ffi_endpoint_context_free(C2MemFfiEndpointContext *endpoint);
@@ -115,6 +123,9 @@ void c2_mem_ffi_endpoint_context_free(C2MemFfiEndpointContext *endpoint);
  * A dispatched unary is never cancelled by dropping its facade. */
 C2MemFfiStatus c2_mem_ffi_call_begin(const C2MemFfiEndpointContext *endpoint, const char *route, const char *method, uint8_t server_stream, const uint64_t *timeout_millis, C2MemFfiCall **out, C2MemFfiError **error);
 C2MemFfiStatus c2_mem_ffi_call_charge_input(const C2MemFfiCall *call, uint64_t nbytes, C2MemFfiComplete complete, void *user);
+/* On success, dispatch returns JSON with the original call's selected target:
+ * {path,serverId,serverInstanceId,connectionId}. connectionId is decimal text.
+ * A failed call retains its original typed error; no target replaces it. */
 C2MemFfiStatus c2_mem_ffi_call_dispatch(const C2MemFfiCall *call, const uint8_t *data, size_t len, C2MemFfiComplete complete, void *user);
 C2MemFfiStatus c2_mem_ffi_call_next(const C2MemFfiCall *call, C2MemFfiComplete complete, void *user);
 C2MemFfiStatus c2_mem_ffi_call_cancel(const C2MemFfiCall *call);

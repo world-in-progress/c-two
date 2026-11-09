@@ -15,12 +15,15 @@ function fixture() {
     close() { events.push('context.close'); },
   };
   const nativeCall = {
-    chargeInput: async () => {}, dispatch: async () => {}, next: async () => null,
+    chargeInput: async () => {},
+    dispatch: async () => ({path: 'DirectIpc', serverId: 's', serverInstanceId: 'i', connectionId: '1'}),
+    next: async () => null,
     cancel() {}, observe: async () => ({completed: true, error: null, completeItems: 0n}),
     checkDeadline() {}, close() {},
   };
   const nativeEndpoint = {
-    prepare: async () => ({serverId: 's', serverInstanceId: 'i', routeUid: 'r', connectionId: 1n}),
+    prepare: async () => ({serverId: 's', serverInstanceId: 'i', connectionId: 1n}),
+    connectionSnapshot: () => null,
     beginCall: () => nativeCall, deactivate() {}, close: async () => {},
   };
   const domain = {
@@ -78,23 +81,24 @@ test('per-transport native options override factory defaults and explicit timeou
   connect.close();
 });
 
-test('route token is supplied to each preparation, not endpoint creation', async () => {
+test('each preparation supplies only route and contract to the shared endpoint', async () => {
   const {symbols, events, nativeEndpoint} = fixture();
   const prepared = [];
-  nativeEndpoint.prepare = async (route, contract, token) => {
-    prepared.push([route, contract, token]);
-    return {serverId: 's', serverInstanceId: 'i', routeUid: 'r', connectionId: 1n};
+  nativeEndpoint.prepare = async (...args) => {
+    prepared.push(args);
+    return {serverId: 's', serverInstanceId: 'i', connectionId: 1n};
   };
   const connect = createNodeIpcConnector({nativeSymbols: symbols});
   try {
     const endpoint = await connect('ipc://shared');
     const contract = {namespace: 'example'};
-    await endpoint.prepare('one', contract, {routeUid: 'uid-one'});
-    await endpoint.prepare('two', contract, {routeUid: 'uid-two'});
+    await endpoint.prepare('one', contract);
+    await endpoint.prepare('two', contract, 0);
     assert.deepEqual(prepared, [
-      ['one', contract, {routeUid: 'uid-one'}],
-      ['two', contract, {routeUid: 'uid-two'}],
+      ['one', contract],
+      ['two', contract, 0],
     ]);
+    assert.equal(endpoint.connectionSnapshot('one'), null);
     assert.deepEqual(events.find(e => Array.isArray(e) && e[0] === 'endpoint')[2], {});
   } finally { connect.close(); }
   assert.throws(() => createNodeIpcConnector({nativeSymbols: symbols, expectedRouteToken: {routeUid: 'old'}}), /unknown option/);
@@ -102,6 +106,18 @@ test('route token is supplied to each preparation, not endpoint creation', async
   try {
     await assert.rejects(another('ipc://shared', undefined, {expectedRouteToken: {routeUid: 'old'}}), /unknown option/);
   } finally { another.close(); }
+});
+
+test('connection snapshots preserve the observed identity and native end reason', async () => {
+  const {symbols, nativeEndpoint} = fixture();
+  const snapshot = {connectionId: '41', serverId: 'host', serverInstanceId: 'instance', endReason: 'peer_eof'};
+  nativeEndpoint.connectionSnapshot = route => route === 'echo' ? snapshot : null;
+  const connect = createNodeIpcConnector({nativeSymbols: symbols});
+  try {
+    const endpoint = await connect('ipc://host');
+    assert.deepEqual(endpoint.connectionSnapshot('echo'), snapshot);
+    assert.equal(endpoint.connectionSnapshot('missing'), null);
+  } finally { connect.close(); }
 });
 
 test('factory transport policy is captured once before any endpoint can choose it', async () => {
@@ -243,7 +259,7 @@ test('shared captured context releases after the last explicit or collected fact
     import {captureLocalIpcEndpointContextFromSymbols,createNodeIpcConnector} from ${JSON.stringify(new URL('../dist/index.js',import.meta.url).href)};
     let contexts=0,domains=0;
     const nativeContext={endpointName(){return 'endpoint'},namespaceId(){return 'namespace'},close(){contexts++}};
-    const endpoint={async prepare(){},beginCall(){},deactivate(){},async close(){}};
+    const endpoint={async prepare(){},connectionSnapshot(){return null},beginCall(){},deactivate(){},async close(){}};
     const symbols={c2_mem_ffi_abi_version(){return 8},captureEndpointContext(){return nativeContext},
       createClientDomain(){return {createEndpoint(){return endpoint},stats(){return {}},close(){domains++}}}};
     const context=captureLocalIpcEndpointContextFromSymbols(symbols);
