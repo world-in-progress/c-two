@@ -9,7 +9,10 @@ import sys
 
 import pytest
 
-from tools.dev import test_local as runner
+ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT))
+
+from tools.dev import test_local as runner  # noqa: E402
 
 
 def checkout(path):
