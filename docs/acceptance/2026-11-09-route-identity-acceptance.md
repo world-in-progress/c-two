@@ -14,6 +14,8 @@
 | 加上块 6 与执行器拆除的修正 | `d774f992` | [42506043902](https://github.com/Dsssyc/c-two/actions/runs/42506043902) | 失败在四处，都是测试问题：HTTP 流测试先探测空闲端口、放开之后再在它上面启动 relay，并行的测试可能先占走这个端口（Windows 上的 10048），`33ee933b` 让 relay 先绑定监听地址并报出实际地址，测试改为绑定端口 0；Windows 上执行器拆除的三个流测试没有驱动或释放命名管道，`402ac175` 只改测试；macOS 上注册回执测试的 HTTP 服务器绑定时反查 127.0.0.1 的主机名而卡住；Windows x64 上生成的 Node 客户端的冲突测试只等了一个 relay 的视图，后两处由 `88847903` 只改测试修好 |
 | 确切候选 | `72ffc97b` | [42520322994](https://github.com/Dsssyc/c-two/actions/runs/42520322994) | 第一次尝试全部通过 |
 
+确切候选之后，`4232e3c1` 只改文档，记下这次 CI 与配对基准。上游 main 一直停在 `fd33e140`，分支不用再与 main 同步。[world-in-progress/c-two#221](https://github.com/world-in-progress/c-two/pull/221) 在 `4232e3c1` 上的 [Source Validation 42546081826](https://github.com/world-in-progress/c-two/actions/runs/42546081826) 第一次尝试全部通过，源码各线的范围与确切候选那次运行相同。2026-11-09 以普通合并提交 `cc59ceee` 合入，它的树与 `4232e3c1` 相同；main 上这次推送的 [Source Validation 42557921196](https://github.com/world-in-progress/c-two/actions/runs/42557921196) 凭同一棵树已通过的 PR 运行跳过了源码各线。
+
 ## 门禁
 
 [闲置驱逐审查](2026-10-10-idle-eviction-regression-audit.md)的六道门禁里，门禁 1、3、4、6 照旧；门禁 2 与门禁 5 以执行计划第五节的新表述为准，另加两道新门禁。照录如下：
@@ -80,6 +82,6 @@
 
 门禁 5 的“control watch 中断后恢复”在 Host 在线时只断控制连接的情形没有单独测，原因见上文。
 
-补测留下的三处小问题与 Rust SDK 测试在 `/tmp` 下留下的私有根，记在[待办](../design/backlog.md)第 3 项的测试一条。
+补测留下的三处小问题与 Rust SDK 测试在 `/tmp` 下留下的私有根，记在[待办](../design/backlog.md)“按区域的结构调整与重复校验”的测试一条。
 
 待办“要核实的事”里与这一批相关的：Windows x64 上 c2-core 的 `server_streams` 一次堆损坏退出；`unlimited_stream_uses_an_operation_slot_until_real_terminal` 一次 `Closed`；负载高时 `tests/repo/test_source_validation.py` 的三个用例超时；Windows x64 上 c2-server 的 `shutdown_preserves_active_reply_refuses_new_calls_and_fences_lifecycle_hook` 偶发读回复超时。

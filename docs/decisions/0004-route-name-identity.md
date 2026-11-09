@@ -1,6 +1,6 @@
 # 路由名是资源状态的唯一身份
 
-状态：已采用（2026-11-06），[执行计划](../design/2026-11-08-route-identity-plan.md) 2026-11-08 批准，2026-11-09 在整合分支上实施完毕并验收（[验收记录](../acceptance/2026-11-09-route-identity-acceptance.md)），等合入上游 main。
+状态：已采用（2026-11-06），[执行计划](../design/2026-11-08-route-identity-plan.md) 2026-11-08 批准，2026-11-09 实施完毕并验收（[验收记录](../acceptance/2026-11-09-route-identity-acceptance.md)），同日经 [world-in-progress/c-two#221](https://github.com/world-in-progress/c-two/pull/221) 合入上游 main（`cc59ceee`）。
 
 路由名加契约身份，标识一份资源的状态；契约身份代表它的性质。一次注册是这份资源在某个 Host 上的一段服务期，route UID 只在 C-Two 内部区分不同的注册，用于注册、替换与撤下时的核对，不再出现在客户端看得到的接口和调用标识里。名字的范围：经 relay 连接时是整个 relay mesh，直接 IPC 时是那个端点。前提是两次注册之间，资源的状态和性质没有被 C-Two 之外的操作改变；跨注册的状态延续由 Host 负责，Host 若要让客户端知道这已是另一份状态，就换一个路由名。
 
