@@ -21,19 +21,11 @@ from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
-SCRIPTS_DIR = REPO_ROOT / ".github" / "scripts"
-for _path in (str(REPO_ROOT), str(SCRIPTS_DIR)):
-    if _path not in sys.path:
-        sys.path.insert(0, _path)
+SCRIPTS_DIR = Path(__file__).resolve().parent
+if str(SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS_DIR))
 
-from tools.local_rc.artifact_manifest import (  # noqa: E402
-    CandidateError,
-    checked_relative_path,
-    sha256_bytes,
-    sha256_file,
-    zip_inventory,
-)
+from safe_zip import CandidateError, checked_relative_path, sha256_bytes, zip_inventory  # noqa: E402
 from source_evidence import GitHubApi, PromotionError, find_source_evidence  # noqa: E402
 import release_candidate as rc_helper  # noqa: E402
 from packaging.utils import InvalidWheelFilename, parse_wheel_filename  # noqa: E402
@@ -223,7 +215,7 @@ def download_and_extract_artifact(
                 for chunk in iter(lambda: source.read(1 << 20), b""):
                     sink.write(chunk)
             _require(
-                sha256_file(target) == record["sha256"] and target.stat().st_size == record["bytes"],
+                rc_helper.sha256_file(target) == record["sha256"] and target.stat().st_size == record["bytes"],
                 f"extracted member {relative} does not match its verified inventory record",
             )
     archive_path.unlink()
@@ -317,7 +309,7 @@ def verify_manifest_binding(
             _require(path is not None, f"rc-manifest {kind} entry {name} is absent from the artifacts")
             _require(path.stat().st_size == entry.get("bytes"),
                      f"rc-manifest {kind} entry {name} size differs from extracted bytes")
-            _require(sha256_file(path) == entry.get("sha256"),
+            _require(rc_helper.sha256_file(path) == entry.get("sha256"),
                      f"rc-manifest {kind} entry {name} SHA-256 differs from extracted bytes")
             sidecar = extracted.get(_sidecar_name(name))
             _require(sidecar is not None, f"missing sidecar for candidate file {name}")
@@ -849,7 +841,7 @@ def stage_github_release_assets(
         assets.append({
             "name": name,
             "staged_path": target.relative_to(staged_root).as_posix(),
-            "sha256": sha256_file(target),
+            "sha256": rc_helper.sha256_file(target),
             "bytes": target.stat().st_size,
         })
         if with_sidecar:
@@ -858,7 +850,7 @@ def stage_github_release_assets(
             assets.append({
                 "name": _sidecar_name(name),
                 "staged_path": published_sidecar.relative_to(staged_root).as_posix(),
-                "sha256": sha256_file(published_sidecar),
+                "sha256": rc_helper.sha256_file(published_sidecar),
                 "bytes": published_sidecar.stat().st_size,
             })
 
@@ -888,7 +880,7 @@ def stage_pypi_files(
         target = staging / entry["name"]
         target.write_bytes(source.read_bytes())
         files.append({"name": entry["name"], "staged_path": target.relative_to(staged_root).as_posix(),
-                      "sha256": sha256_file(target), "bytes": target.stat().st_size})
+                      "sha256": rc_helper.sha256_file(target), "bytes": target.stat().st_size})
     _require(len(files) == 36, f"expected 36 PyPI files, staged {len(files)}")
     return files
 
@@ -1148,7 +1140,7 @@ def command_prepare(options: argparse.Namespace) -> int:
     manifest = _load_json_file(extraction / MANIFEST_NAME)
     _require(isinstance(manifest, dict), "rc-manifest.json is not an object")
     versions = verify_manifest_binding(manifest, extraction, source_sha)
-    manifest_sha = sha256_file(extraction / MANIFEST_NAME)
+    manifest_sha = rc_helper.sha256_file(extraction / MANIFEST_NAME)
     wheel_by_row = verify_wheel_rows(manifest["wheels"], versions["c_two_version"])
     verify_candidate_receipts(extraction, manifest, source_sha, wheel_by_row)
 
