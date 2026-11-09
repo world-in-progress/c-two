@@ -25,7 +25,6 @@ const EXPECTED_CRM_NAME_HEADER: &str = "x-c2-expected-crm-name";
 const EXPECTED_CRM_VER_HEADER: &str = "x-c2-expected-crm-ver";
 const EXPECTED_ABI_HASH_HEADER: &str = "x-c2-expected-abi-hash";
 const EXPECTED_SIGNATURE_HASH_HEADER: &str = "x-c2-expected-signature-hash";
-const ROUTE_UID_HEADER: &str = "x-c2-route-uid";
 
 fn encode_segment(s: &str) -> String {
     utf8_percent_encode(s, PATH_SEGMENT).to_string()
@@ -111,6 +110,10 @@ pub enum HttpError {
     ResponseError(u16, BudgetedBuffer),
 
     /// Network / connection errors.
+    #[error("HTTP request error: {0}")]
+    Request(#[source] reqwest::Error),
+
+    /// Local transport/runtime errors without a reqwest source.
     #[error("HTTP transport error: {0}")]
     Transport(String),
 
@@ -197,11 +200,6 @@ impl AsRef<[u8]> for ReservedInput {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct HttpRouteToken {
-    pub route_uid: String,
-}
-
 impl HttpClient {
     #[cfg(test)]
     fn new_with_proxy_policy(
@@ -284,14 +282,10 @@ impl HttpClient {
             .map_err(|e| HttpError::Transport(e.to_string()))?;
         // Probes are control-plane operations with an independent safety timeout.
         // Waiting for them never resets the owner's original absolute deadline.
-        let probe_client = if controlled {
-            crate::relay_client_builder_with_proxy(use_proxy)
-                .timeout(Duration::from_secs(5))
-                .build()
-                .map_err(|e| HttpError::Transport(e.to_string()))?
-        } else {
-            client.clone()
-        };
+        let probe_client = crate::relay_client_builder_with_proxy(use_proxy)
+            .timeout(Duration::from_secs(5))
+            .build()
+            .map_err(|e| HttpError::Transport(e.to_string()))?;
         Ok(Self {
             client,
             probe_client,
@@ -300,11 +294,9 @@ impl HttpClient {
         })
     }
 
-    pub(crate) async fn call_with_route_token_async(
+    pub(crate) async fn call_route_async(
         &self,
         expected: &ExpectedRouteContract,
-        route_token: &HttpRouteToken,
-        max_payload_size: u64,
         method_name: &str,
         data: HttpCallInput<'_>,
         budget: &PayloadBufferBudget,
@@ -334,7 +326,6 @@ impl HttpClient {
             .header(CONTENT_LENGTH, length.to_string())
             .body(body);
         let request = add_expected_contract_headers(request, expected);
-        let request = add_route_token_headers(request, route_token);
         let request = request
             .build()
             .map_err(|e| HttpError::InvalidInput(e.to_string()))?;
@@ -347,16 +338,14 @@ impl HttpClient {
             .client
             .execute(request)
             .await
-            .map_err(|e| HttpError::Transport(e.to_string()))?;
+            .map_err(HttpError::Request)?;
 
-        crate::payload::read_http_response(resp, max_payload_size, budget, None).await
+        crate::payload::read_http_response(resp, budget, None).await
     }
 
-    pub(crate) async fn stream_with_route_token_async(
+    pub(crate) async fn stream_route_async(
         &self,
         expected: &ExpectedRouteContract,
-        route_token: &HttpRouteToken,
-        max_payload_size: u64,
         method_name: &str,
         data: HttpCallInput<'_>,
         budget: &PayloadBufferBudget,
@@ -388,19 +377,16 @@ impl HttpClient {
             .header("Accept", crate::stream_wire::MEDIA_TYPE)
             .header(CONTENT_LENGTH, length.to_string())
             .body(body);
-        let request = add_route_token_headers(
-            add_expected_contract_headers(request, expected),
-            route_token,
-        )
-        .build()
-        .map_err(|error| HttpError::InvalidInput(error.to_string()))?;
+        let request = add_expected_contract_headers(request, expected)
+            .build()
+            .map_err(|error| HttpError::InvalidInput(error.to_string()))?;
         control.check_active()?;
         control.check_dispatch()?;
         let response = self
             .client
             .execute(request)
             .await
-            .map_err(|error| HttpError::Transport(error.to_string()))?;
+            .map_err(HttpError::Request)?;
         // The input owner follows the actual reqwest body. This reservation
         // was acquired atomically with it before dispatch and is now unused.
         drop(send_headroom);
@@ -436,7 +422,7 @@ impl HttpClient {
             self.base_url.clone(),
             token,
             budget.clone(),
-            max_payload_size,
+            crate::stream_wire::MAX_TERMINAL_PAYLOAD_BYTES,
             completion_owner,
             cancellation,
         ))
@@ -456,14 +442,13 @@ impl HttpClient {
             .get(&url)
             .send()
             .await
-            .map_err(|e| HttpError::Transport(e.to_string()))?;
+            .map_err(HttpError::Request)?;
         Ok(resp.status().as_u16() == 200)
     }
 
-    pub(crate) async fn probe_route_with_token_async(
+    pub(crate) async fn probe_route_async(
         &self,
         expected: &ExpectedRouteContract,
-        route_token: &HttpRouteToken,
         budget: &PayloadBufferBudget,
     ) -> Result<(), HttpError> {
         let url = format!(
@@ -472,11 +457,7 @@ impl HttpClient {
             encode_segment(&expected.route_name)
         );
         let request = add_expected_contract_headers(self.probe_client.get(&url), expected);
-        let request = add_route_token_headers(request, route_token);
-        let resp = request
-            .send()
-            .await
-            .map_err(|e| HttpError::Transport(e.to_string()))?;
+        let resp = request.send().await.map_err(HttpError::Request)?;
         match resp.status().as_u16() {
             200 => Ok(()),
             code => {
@@ -529,13 +510,6 @@ fn add_expected_contract_headers(
         .header(EXPECTED_CRM_VER_HEADER, &expected.crm_ver)
         .header(EXPECTED_ABI_HASH_HEADER, &expected.abi_hash)
         .header(EXPECTED_SIGNATURE_HASH_HEADER, &expected.signature_hash)
-}
-
-fn add_route_token_headers(
-    request: reqwest::RequestBuilder,
-    route_token: &HttpRouteToken,
-) -> reqwest::RequestBuilder {
-    request.header(ROUTE_UID_HEADER, &route_token.route_uid)
 }
 
 #[cfg(test)]
@@ -601,9 +575,6 @@ mod tests {
             abi_hash: "a".repeat(64),
             signature_hash: "b".repeat(64),
         };
-        let token = HttpRouteToken {
-            route_uid: "route-grid".into(),
-        };
         let owner = Arc::new(vec![1, 2, 3, 4, 5, 6, 7]);
         let weak = Arc::downgrade(&owner);
         let observe_body = weak.clone();
@@ -627,10 +598,8 @@ mod tests {
         );
         let input = HttpCallInput::Owned(owner);
         let error = client
-            .call_with_route_token_async(
+            .call_route_async(
                 &expected,
-                &token,
-                1024,
                 "step",
                 input,
                 &PayloadBufferBudget::new(1024),

@@ -322,23 +322,13 @@ async fn read_framed_reply<R: tokio::io::AsyncRead + Unpin>(
     Ok(reply)
 }
 
-fn request_head(
-    socket: std::net::SocketAddr,
-    entry: &RouteEntry,
-    method: &str,
-    framing: &str,
-) -> String {
+fn request_head(socket: std::net::SocketAddr, method: &str, framing: &str) -> String {
     format!(
-        "POST /grid/{method} HTTP/1.1\r\nHost: {socket}\r\n{framing}\r\nConnection: close\r\nx-c2-expected-crm-ns: test.echo\r\nx-c2-expected-crm-name: Echo\r\nx-c2-expected-crm-ver: 0.1.0\r\nx-c2-expected-abi-hash: {TEST_ABI_HASH}\r\nx-c2-expected-signature-hash: {TEST_SIGNATURE_HASH}\r\nx-c2-route-uid: {}\r\n\r\n",
-        entry.route_uid
+        "POST /grid/{method} HTTP/1.1\r\nHost: {socket}\r\n{framing}\r\nConnection: close\r\nx-c2-expected-crm-ns: test.echo\r\nx-c2-expected-crm-name: Echo\r\nx-c2-expected-crm-ver: 0.1.0\r\nx-c2-expected-abi-hash: {TEST_ABI_HASH}\r\nx-c2-expected-signature-hash: {TEST_SIGNATURE_HASH}\r\n\r\n"
     )
 }
 
-async fn request_capacity_rejection(
-    socket: std::net::SocketAddr,
-    entry: &RouteEntry,
-    input_len: usize,
-) -> Vec<u8> {
+async fn request_capacity_rejection(socket: std::net::SocketAddr, input_len: usize) -> Vec<u8> {
     let mut connection = bounded(tokio::net::TcpStream::connect(socket))
         .await
         .unwrap();
@@ -350,7 +340,6 @@ async fn request_capacity_rejection(
     // reset, EOF or timeout remains a failure, never an excuse to retry.
     let head = request_head(
         socket,
-        entry,
         "ping",
         &format!("Content-Length: {input_len}\r\nExpect: 100-continue"),
     );
@@ -431,33 +420,6 @@ mod early_rejection {
                 )),
                 status: 409,
                 error: "ContractMismatch",
-            },
-            Case {
-                path: "/grid/ping",
-                replace: Some(("x-c2-route-uid: early-route\r\n", "")),
-                status: 400,
-                error: "ProtocolViolation",
-            },
-            Case {
-                path: "/grid/ping",
-                replace: Some((
-                    "x-c2-route-uid: early-route",
-                    "x-c2-route-uid: early-route\r\nx-c2-route-uid: early-route",
-                )),
-                status: 400,
-                error: "ProtocolViolation",
-            },
-            Case {
-                path: "/grid/ping",
-                replace: Some(("x-c2-route-uid: early-route", "x-c2-route-uid:")),
-                status: 400,
-                error: "ProtocolViolation",
-            },
-            Case {
-                path: "/grid/ping",
-                replace: Some(("early-route", "retired-route")),
-                status: 409,
-                error: "RouteStale",
             },
             Case {
                 path: "/grid/ping",
@@ -574,7 +536,7 @@ mod early_rejection {
                     abi_hash: TEST_ABI_HASH.into(),
                     signature_hash: TEST_SIGNATURE_HASH.into(),
                     max_payload_size: 3,
-                    route_uid: "early-route".into(),
+                    route_uid: Some("early-route".into()),
                     locality: super::super::types::Locality::Local,
                     registered_at: 1.0,
                 }))
@@ -625,8 +587,7 @@ mod early_rejection {
         }
 
         fn head(&self, case: &Case, framing: &str) -> String {
-            let entry = self.state.local_route("grid").unwrap();
-            let head = request_head(self.socket, &entry, "ping", framing)
+            let head = request_head(self.socket, "ping", framing)
                 .replacen("/grid/ping", case.path, 1)
                 .replace(
                     "Connection: close",
@@ -902,20 +863,13 @@ async fn capacity_rejection_case(kind: CapacityRequest) {
             abi_hash: TEST_ABI_HASH.into(),
             signature_hash: TEST_SIGNATURE_HASH.into(),
             max_payload_size: input_len as u64,
-            route_uid: "capacity-route".into(),
+            route_uid: Some("capacity-route".into()),
             locality: super::types::Locality::Local,
             registered_at: 1000.0,
         };
         state.with_route_table_mut(|table| assert!(table.register_route(entry.clone())));
         let (release, released) = oneshot::channel();
         let release = Arc::new(parking_lot::Mutex::new(Some(release)));
-        let pending = state
-            .forwarding
-            .spawn(|permit, _| async move {
-                let _ = released.await;
-                drop(permit);
-            })
-            .unwrap();
         let (stop, stopped) = oneshot::channel();
         let resolves = Arc::new(AtomicUsize::new(0));
         let posts = Arc::new(AtomicUsize::new(0));
@@ -929,6 +883,14 @@ async fn capacity_rejection_case(kind: CapacityRequest) {
                     let observed = observed.clone();
                     let observed_posts = observed_posts.clone();
                     async move {
+                        // This capacity fixture has a deliberately unreachable upstream.
+                        // Preparing its HTTP client must not exercise that upstream.
+                        if request.uri().path() == "/_probe/grid" {
+                            return axum::http::Response::builder()
+                                .status(200)
+                                .body(axum::body::Body::empty())
+                                .unwrap();
+                        }
                         assert!(!request.headers().contains_key("expect"));
                         assert!(!request.headers().contains_key("connection"));
                         if request.uri().path() == "/_resolve/grid" {
@@ -954,26 +916,47 @@ async fn capacity_rejection_case(kind: CapacityRequest) {
                     .await
             })
         });
-        let result = AssertUnwindSafe(async {
-            let envelope: serde_json::Value = if kind == CapacityRequest::ControlledEager {
-                use crate::client::{
-                    HttpCallControl, HttpError, RelayAwareClientConfig, RelayAwareHttpClient,
-                };
-                let expected = c2_contract::ExpectedRouteContract {
-                    route_name: entry.name.clone(),
-                    crm_ns: entry.crm_ns.clone(),
-                    crm_name: entry.crm_name.clone(),
-                    crm_ver: entry.crm_ver.clone(),
-                    abi_hash: entry.abi_hash.clone(),
-                    signature_hash: entry.signature_hash.clone(),
-                };
-                let config = RelayAwareClientConfig {
-                    max_attempts: 3,
-                    ..Default::default()
-                };
-                let client = RelayAwareHttpClient::new(&entry.relay_url, expected, false, config)
+        let eager_client = if kind == CapacityRequest::ControlledEager {
+            let expected = c2_contract::ExpectedRouteContract {
+                route_name: entry.name.clone(),
+                crm_ns: entry.crm_ns.clone(),
+                crm_name: entry.crm_name.clone(),
+                crm_ver: entry.crm_ver.clone(),
+                abi_hash: entry.abi_hash.clone(),
+                signature_hash: entry.signature_hash.clone(),
+            };
+            let config = crate::client::RelayAwareClientConfig {
+                max_attempts: 3,
+                ..Default::default()
+            };
+            let client =
+                crate::client::RelayAwareHttpClient::new(&entry.relay_url, expected, false, config)
                     .unwrap()
                     .with_http_only();
+            Some(
+                bounded(tokio::task::spawn_blocking(move || {
+                    client
+                        .resolve_http_target_with_deadline(c2_config::ConnectDeadline::default())
+                        .unwrap();
+                    client
+                }))
+                .await
+                .unwrap(),
+            )
+        } else {
+            None
+        };
+        let pending = state
+            .forwarding
+            .spawn(|permit, _| async move {
+                let _ = released.await;
+                drop(permit);
+            })
+            .unwrap();
+        let result = AssertUnwindSafe(async {
+            let envelope: serde_json::Value = if kind == CapacityRequest::ControlledEager {
+                use crate::client::{HttpCallControl, HttpError};
+                let client = eager_client.as_ref().unwrap();
                 let dispatches = Arc::new(AtomicUsize::new(0));
                 let observed = dispatches.clone();
                 let control = HttpCallControl::new(
@@ -985,9 +968,8 @@ async fn capacity_rejection_case(kind: CapacityRequest) {
                 );
                 // Exercise the actual SDK transport: an eager owned body,
                 // no Expect or Connection override, and no hidden POST retry.
-                // This performs production resolve and POST, without the
-                // separate connect-time probe. Three acquisition attempts
-                // must still produce exactly one business dispatch.
+                // The selected target was acquired before capacity was spent;
+                // both calls must use that target.
                 let mut envelope = serde_json::Value::Null;
                 for calls in 1..=2 {
                     let error = bounded(client.call_controlled_async(
@@ -1025,7 +1007,7 @@ async fn capacity_rejection_case(kind: CapacityRequest) {
                 }
                 envelope
             } else if network {
-                let reply = request_capacity_rejection(socket, &entry, input_len).await;
+                let reply = request_capacity_rejection(socket, input_len).await;
                 assert!(
                     reply.starts_with(b"HTTP/1.1 502 "),
                     "{}",
@@ -1042,7 +1024,7 @@ async fn capacity_rejection_case(kind: CapacityRequest) {
                 if kind == CapacityRequest::Direct {
                     framing.push_str("\r\nExpect: 100-continue");
                 }
-                let head = request_head(socket, &entry, "ping", &framing);
+                let head = request_head(socket, "ping", &framing);
                 let mut request = axum::http::Request::builder()
                     .method("POST")
                     .uri("/grid/ping");
@@ -1352,7 +1334,7 @@ impl Fixture {
             assert_eq!(registered.status(), StatusCode::CREATED);
             bounded(registered.bytes()).await.unwrap();
             let entry = state.local_route("grid").unwrap();
-            let (lease, binding) = bounded(state.acquire_upstream_for_route(&entry)).await.unwrap_or_else(|_| panic!("real attested pooled IPC acquire failed"));
+            let (lease, binding, _) = bounded(state.acquire_upstream_for_route(&entry)).await.unwrap_or_else(|_| panic!("real attested pooled IPC acquire failed"));
             let client = lease.client();
             drop(lease);
             (entry, client, binding)
@@ -1394,11 +1376,11 @@ impl Fixture {
     }
 
     fn head(&self, method: &str, framing: &str) -> String {
-        request_head(self.socket, &self.entry, method, framing)
+        request_head(self.socket, method, framing)
     }
 
     async fn request_capacity_rejection(&self, input_len: usize) -> Vec<u8> {
-        let reply = request_capacity_rejection(self.socket, &self.entry, input_len).await;
+        let reply = request_capacity_rejection(self.socket, input_len).await;
         eprintln!(
             "[relay-forwarding] actual capacity response: {}",
             String::from_utf8_lossy(&reply)
@@ -1676,7 +1658,7 @@ async fn evicted_upstream_preserves_forwarded_reply_and_reconnects_new_request()
         fixture.state.clients.close(&evicted);
         assert!(!fixture.client.is_connected());
 
-        let (replacement_lease, _) =
+        let (replacement_lease, _, _) =
             bounded(fixture.state.acquire_upstream_for_route(&fixture.entry))
                 .await
                 .unwrap_or_else(|_| panic!("retired route must acquire a fresh upstream"));
@@ -1897,7 +1879,7 @@ async fn real_http_capacity_freed_during_rejected_upload_never_dispatches() {
         );
         assert!(fixture.state.local_route("grid").is_some());
         assert!(fixture.client.is_connected());
-        let (lease, _) = bounded(fixture.state.acquire_upstream_for_route(&fixture.entry))
+        let (lease, _, _) = bounded(fixture.state.acquire_upstream_for_route(&fixture.entry))
             .await
             .unwrap_or_else(|_| panic!("healthy shared IPC must remain available"));
         assert!(Arc::ptr_eq(&lease.client(), &fixture.client));
@@ -1959,7 +1941,7 @@ async fn disconnected_response_case(carrier: Carrier, operations: u64) {
         assert!(fixture.client.is_connected());
         let ping = bounded(fixture.client.call_bound_phased(&fixture.binding, "ping", &[7; INPUT_LEN])).await.unwrap();
         assert_eq!(ping.into_owned_bytes().unwrap(), vec![2; 32], "same client ping must succeed without reconnect");
-        let (lease, _) = bounded(fixture.state.acquire_upstream_for_route(&fixture.entry)).await.unwrap_or_else(|_| panic!("same pooled client acquire failed"));
+        let (lease, _, _) = bounded(fixture.state.acquire_upstream_for_route(&fixture.entry)).await.unwrap_or_else(|_| panic!("same pooled client acquire failed"));
         assert!(Arc::ptr_eq(&lease.client(), &fixture.client), "liveness cannot be masked by reconnecting");
         drop(lease);
         assert_eq!((fixture.state.forwarding.snapshot().used_operations, fixture.state.forwarding.payload_budget().snapshot().used_bytes), (0, 0));
@@ -2327,7 +2309,7 @@ async fn disconnect_during_ipc_write_preserves_same_client(pause_point: WriterPa
         assert_eq!(ping.into_owned_bytes().unwrap(), vec![2; 32]);
         let current = fixture.state.local_route("grid").expect("HTTP disconnect must not withdraw route");
         assert_eq!(current.route_uid, fixture.entry.route_uid);
-        let (lease, _) = bounded(fixture.state.acquire_upstream_for_route(&fixture.entry)).await.unwrap_or_else(|_| panic!("same pooled IPC acquire failed"));
+        let (lease, _, _) = bounded(fixture.state.acquire_upstream_for_route(&fixture.entry)).await.unwrap_or_else(|_| panic!("same pooled IPC acquire failed"));
         assert!(Arc::ptr_eq(&lease.client(), &fixture.client), "same-client ping cannot be concealed by reconnecting");
         drop(lease);
         assert_eq!(fixture.probe.calls.each_ref().map(|calls| calls.load(Ordering::SeqCst)), [1, 1, 1]);
@@ -2511,7 +2493,7 @@ async fn eviction_during_ipc_frame_write_finishes_old_http_reply_and_reconnects(
             String::from_utf8_lossy(&new_reply)
         );
         assert_eq!(fixture.probe.calls[2].load(Ordering::SeqCst), 1);
-        let (lease, _) = bounded(fixture.state.acquire_upstream_for_route(&fixture.entry))
+        let (lease, _, _) = bounded(fixture.state.acquire_upstream_for_route(&fixture.entry))
             .await
             .unwrap_or_else(|_| panic!("new request must acquire a replacement upstream"));
         assert!(!Arc::ptr_eq(&lease.client(), &old));

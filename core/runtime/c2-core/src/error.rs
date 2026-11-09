@@ -328,45 +328,15 @@ pub fn normalize_ipc_error(error: IpcError, phase: TransportPhase) -> Error {
             format!("route not found: {route_name}"),
             [("route", route_name)],
         ),
-        IpcError::RouteRemoved {
-            route_name,
-            route_uid,
-        } => {
-            let mut details = BTreeMap::from([("route".to_string(), route_name.clone())]);
-            if let Some(route_uid) = route_uid {
-                details.insert("route_uid".to_string(), route_uid);
-            }
-            Error::Semantic(
-                C2Error::new(
-                    ErrorCode::ResourceRemoved,
-                    format!("route removed: {route_name}"),
-                )
-                .with_details(details),
-            )
-        }
-        IpcError::RouteClosed {
-            route_name,
-            route_uid,
-            reason,
-        } => semantic_route_error(
+        IpcError::RouteRemoved { route_name } => semantic_route_error(
+            ErrorCode::ResourceRemoved,
+            format!("route {route_name} was removed"),
+            [("route", route_name)],
+        ),
+        IpcError::RouteClosed { route_name, reason } => semantic_route_error(
             ErrorCode::ResourceClosed,
             format!("route closed: {route_name}"),
-            [
-                ("route", route_name),
-                ("route_uid", route_uid),
-                ("reason", reason),
-            ],
-        ),
-        IpcError::RouteStale {
-            route_name,
-            current_route_uid,
-        } => semantic_route_error(
-            ErrorCode::RouteStale,
-            format!("route token is stale: {route_name}"),
-            [
-                ("route", route_name),
-                ("current_route_uid", current_route_uid),
-            ],
+            [("route", route_name), ("reason", reason)],
         ),
         IpcError::ContractMismatch(message) => Error::Semantic(
             C2Error::new(ErrorCode::ContractMismatch, message).with_details(BTreeMap::from([(
@@ -382,6 +352,7 @@ pub fn normalize_ipc_error(error: IpcError, phase: TransportPhase) -> Error {
         } => Error::Semantic(
             C2Error::new(ErrorCode::IdentityMismatch, "IPC server identity mismatch").with_details(
                 BTreeMap::from([
+                    ("transport_phase".to_string(), "pre_dispatch".to_string()),
                     ("actual_server_id".to_string(), actual_server_id),
                     (
                         "actual_server_instance_id".to_string(),
@@ -438,6 +409,10 @@ fn semantic_route_error<const N: usize>(
             details
                 .into_iter()
                 .map(|(key, value)| (key.to_string(), value))
+                .chain([
+                    ("transport_phase".into(), "pre_dispatch".into()),
+                    ("dispatch_phase".into(), "pre_dispatch".into()),
+                ])
                 .collect(),
         ),
     )
@@ -531,6 +506,10 @@ pub fn semantic_error_from_http_body(body: &str) -> C2Error {
             );
         }
     };
+    semantic_error_from_http_envelope(envelope)
+}
+
+pub(crate) fn semantic_error_from_http_envelope(envelope: C2ErrorEnvelope) -> C2Error {
     match C2Error::from_envelope(envelope) {
         Ok(error) => error,
         Err(error) => protocol_violation(

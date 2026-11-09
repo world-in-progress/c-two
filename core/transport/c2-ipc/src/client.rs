@@ -360,21 +360,9 @@ pub enum IpcError {
     /// Requested route no longer exists on the connected IPC server.
     RouteNotFound(String),
     /// Requested route was explicitly removed from the connected IPC server.
-    RouteRemoved {
-        route_name: String,
-        route_uid: Option<String>,
-    },
+    RouteRemoved { route_name: String },
     /// Requested route exists but no longer accepts new calls.
-    RouteClosed {
-        route_name: String,
-        route_uid: String,
-        reason: String,
-    },
-    /// Client observed an older route token than the connected server catalog.
-    RouteStale {
-        route_name: String,
-        current_route_uid: String,
-    },
+    RouteClosed { route_name: String, reason: String },
     /// Requested method does not exist on the connected route.
     MethodNotFound {
         route_name: String,
@@ -422,31 +410,10 @@ impl std::fmt::Display for IpcError {
             ),
             Self::ContractMismatch(msg) => write!(f, "IPC contract mismatch: {msg}"),
             Self::RouteNotFound(route) => write!(f, "IPC route not found: {route}"),
-            Self::RouteRemoved {
-                route_name,
-                route_uid,
-            } => {
-                if let Some(route_uid) = route_uid {
-                    write!(f, "IPC route removed: {route_name} uid={route_uid}")
-                } else {
-                    write!(f, "IPC route removed: {route_name}")
-                }
+            Self::RouteRemoved { route_name } => write!(f, "IPC route removed: {route_name}"),
+            Self::RouteClosed { route_name, reason } => {
+                write!(f, "IPC route closed: {route_name} reason={reason}")
             }
-            Self::RouteClosed {
-                route_name,
-                route_uid,
-                reason,
-            } => write!(
-                f,
-                "IPC route closed: {route_name} uid={route_uid} reason={reason}"
-            ),
-            Self::RouteStale {
-                route_name,
-                current_route_uid,
-            } => write!(
-                f,
-                "IPC route stale: {route_name} current_uid={current_route_uid}"
-            ),
             Self::MethodNotFound {
                 route_name,
                 method_name,
@@ -508,7 +475,6 @@ impl From<c2_wire::rpc::EncodeError> for IpcError {
 #[derive(Debug, Clone)]
 pub struct MethodTable {
     route_name: String,
-    route_uid: String,
     crm_ns: String,
     crm_name: String,
     crm_ver: String,
@@ -524,7 +490,6 @@ impl MethodTable {
             &route.methods,
             RouteCallIdentity {
                 route_name: route.name.clone(),
-                route_uid: route.route_uid.clone(),
                 crm_ns: route.crm_ns.clone(),
                 crm_name: route.crm_name.clone(),
                 crm_ver: route.crm_ver.clone(),
@@ -546,7 +511,6 @@ impl MethodTable {
         }
         Self {
             route_name: identity.route_name,
-            route_uid: identity.route_uid,
             crm_ns: identity.crm_ns,
             crm_name: identity.crm_name,
             crm_ver: identity.crm_ver,
@@ -594,14 +558,9 @@ impl MethodTable {
         self.max_payload_size
     }
 
-    pub fn route_uid(&self) -> &str {
-        &self.route_uid
-    }
-
     pub(crate) fn call_identity(&self) -> RouteCallIdentity {
         RouteCallIdentity {
             route_name: self.route_name.clone(),
-            route_uid: self.route_uid.clone(),
             crm_ns: self.crm_ns.clone(),
             crm_name: self.crm_name.clone(),
             crm_ver: self.crm_ver.clone(),
@@ -611,12 +570,7 @@ impl MethodTable {
     }
 }
 
-/// Immutable route token acquired by one route-bound client/proxy.
-///
-/// A binding keeps the route UID observed at acquire
-/// time. Long-lived clients may keep their shared connection directory fresh,
-/// but an existing proxy must not silently retarget itself to a newer resource
-/// instance with the same route name.
+/// Route name and complete contract acquired by one route-bound client.
 #[derive(Debug, Clone)]
 pub struct RouteBinding {
     table: MethodTable,
@@ -629,10 +583,6 @@ impl RouteBinding {
 
     pub fn route_name(&self) -> &str {
         &self.table.route_name
-    }
-
-    pub fn route_uid(&self) -> &str {
-        self.table.route_uid()
     }
 
     pub fn max_payload_size(&self) -> u64 {
@@ -714,6 +664,7 @@ impl RouteDirectory {
         self.routes.keys().cloned().collect()
     }
 
+    #[cfg(test)]
     pub(crate) fn insert_table(&mut self, name: String, table: MethodTable) {
         self.routes.insert(name, table);
     }
@@ -733,7 +684,6 @@ impl MethodTable {
             &methods,
             RouteCallIdentity {
                 route_name: record.route_name.clone(),
-                route_uid: record.route_uid.clone(),
                 crm_ns: record.contract.crm_ns.clone(),
                 crm_name: record.contract.crm_name.clone(),
                 crm_ver: record.contract.crm_ver.clone(),
@@ -1623,12 +1573,6 @@ impl IpcClient {
             abi_hash: expected.abi_hash.clone(),
             signature_hash: expected.signature_hash.clone(),
         }
-    }
-
-    fn observed_token_for(&self, route_name: &str) -> Result<Option<String>, IpcError> {
-        Ok(connect_directory_read(&self.route_directory)?
-            .route_table(route_name)
-            .map(|table| table.route_uid().to_string()))
     }
 
     fn payload_msg_type(payload: &[u8]) -> Option<MsgType> {
@@ -2534,51 +2478,6 @@ impl IpcClient {
         )))
     }
 
-    fn method_table_from_attestation(contract: &PendingRouteAttestation) -> MethodTable {
-        let method_entries = contract
-            .method_names
-            .iter()
-            .enumerate()
-            .map(|(index, name)| MethodEntry {
-                name: name.clone(),
-                index: index as u16,
-            })
-            .collect::<Vec<_>>();
-        MethodTable::from_entries(
-            &method_entries,
-            RouteCallIdentity {
-                route_name: contract.route_name.clone(),
-                route_uid: contract.route_uid.clone(),
-                crm_ns: contract.crm_ns.clone(),
-                crm_name: contract.crm_name.clone(),
-                crm_ver: contract.crm_ver.clone(),
-                abi_hash: contract.abi_hash.clone(),
-                signature_hash: contract.signature_hash.clone(),
-            },
-            contract.max_payload_size,
-        )
-    }
-
-    fn expected_contract_from_attestation(
-        contract: PendingRouteAttestation,
-    ) -> c2_contract::ExpectedRouteContract {
-        c2_contract::ExpectedRouteContract {
-            route_name: contract.route_name,
-            crm_ns: contract.crm_ns,
-            crm_name: contract.crm_name,
-            crm_ver: contract.crm_ver,
-            abi_hash: contract.abi_hash,
-            signature_hash: contract.signature_hash,
-        }
-    }
-
-    fn cache_attested_contract(&self, contract: &PendingRouteAttestation) {
-        self.route_directory.write().insert_table(
-            contract.route_name.clone(),
-            Self::method_table_from_attestation(contract),
-        );
-    }
-
     async fn send_control_inline(
         &self,
         payload: Vec<u8>,
@@ -2641,10 +2540,8 @@ impl IpcClient {
         &self,
         expected: &c2_contract::ExpectedRouteContract,
     ) -> Result<(), IpcError> {
-        let observed_route_uid = self.observed_token_for(&expected.route_name)?;
         let request = RouteLookupRequest {
             expected: Self::expected_contract_wire(expected),
-            observed_route_uid,
         };
         let payload = encode_route_lookup_request(&request).map_err(IpcError::Protocol)?;
         let payload = self.send_control_inline(payload, "route lookup").await?;
@@ -2653,7 +2550,7 @@ impl IpcClient {
         }
         let response = decode_route_lookup_response(&payload).map_err(IpcError::Protocol)?;
         match response {
-            RouteLookupResponse::Ready { current } | RouteLookupResponse::Stale { current } => {
+            RouteLookupResponse::Ready { current } => {
                 connect_directory_write(&self.route_directory)?.apply_record(current);
                 self.validate_route_contract(expected)
             }
@@ -2661,25 +2558,14 @@ impl IpcClient {
                 connect_directory_write(&self.route_directory)?.remove_route(&route_name);
                 Err(IpcError::RouteNotFound(route_name))
             }
-            RouteLookupResponse::Removed {
-                route_name,
-                route_uid,
-            } => {
+            RouteLookupResponse::Removed { route_name } => {
                 connect_directory_write(&self.route_directory)?.remove_route(&route_name);
-                Err(IpcError::RouteRemoved {
-                    route_name,
-                    route_uid,
-                })
+                Err(IpcError::RouteRemoved { route_name })
             }
-            RouteLookupResponse::Closed {
-                route_name,
-                route_uid,
-                reason,
-            } => {
+            RouteLookupResponse::Closed { route_name, reason } => {
                 connect_directory_write(&self.route_directory)?.remove_route(&route_name);
                 Err(IpcError::RouteClosed {
                     route_name,
-                    route_uid,
                     reason: format!("{reason:?}"),
                 })
             }
@@ -2775,7 +2661,7 @@ impl IpcClient {
     pub async fn attest_route_for_registration(
         &self,
         expected: &c2_contract::ExpectedRouteContract,
-    ) -> Result<RouteBinding, IpcError> {
+    ) -> Result<RouteRecordWire, IpcError> {
         c2_contract::validate_expected_route_contract(expected)
             .map_err(|err| IpcError::ContractMismatch(err.to_string()))?;
         let response = self
@@ -2793,15 +2679,14 @@ impl IpcClient {
         let table = MethodTable::from_record(&record);
         Self::validate_method_table_contract(&expected.route_name, &table, expected)?;
         match record.state {
-            RouteStateWire::Ready => Ok(RouteBinding::from_table(table)),
+            RouteStateWire::Ready => Ok(record),
             RouteStateWire::Closed
                 if record.state_reason == RouteStateReasonWire::RegisterCommitted =>
             {
-                Ok(RouteBinding::from_table(table))
+                Ok(record)
             }
             state => Err(IpcError::RouteClosed {
                 route_name: record.route_name,
-                route_uid: record.route_uid,
                 reason: format!("{state:?}:{:?}", record.state_reason),
             }),
         }
@@ -2817,67 +2702,6 @@ impl IpcClient {
         let table = self.bound_route_table(&expected.route_name)?;
         Self::validate_method_table_contract(&expected.route_name, &table, expected)?;
         Ok(RouteBinding::from_table(table))
-    }
-
-    /// Bind the cached route only if it still carries the exact route UID
-    /// observed observed by the caller.
-    pub(crate) fn bind_cached_route_token(
-        &self,
-        expected: &c2_contract::ExpectedRouteContract,
-        route_uid: &str,
-    ) -> Result<RouteBinding, IpcError> {
-        c2_contract::validate_expected_route_contract(expected)
-            .map_err(|err| IpcError::ContractMismatch(err.to_string()))?;
-        let table = self.bound_route_table(&expected.route_name)?;
-        Self::validate_method_table_contract(&expected.route_name, &table, expected)?;
-        if table.route_uid() != route_uid {
-            return Err(IpcError::RouteStale {
-                route_name: expected.route_name.clone(),
-                current_route_uid: table.route_uid().to_string(),
-            });
-        }
-        Ok(RouteBinding::from_table(table))
-    }
-
-    /// Acquire an exact token from current authority under the same caller budget.
-    /// A cached positive token cannot bypass the live admission/token query.
-    pub async fn acquire_route_token_with_deadline(
-        &self,
-        expected: &c2_contract::ExpectedRouteContract,
-        route_uid: &str,
-        deadline: ConnectDeadline,
-    ) -> Result<RouteBinding, IpcError> {
-        with_connect_deadline(
-            deadline,
-            "route_acquire",
-            self.acquire_route_token(expected, route_uid),
-        )
-        .await
-    }
-
-    /// Acquire an exact route token from the connected server's current authority.
-    /// The cached directory only binds the result of a live lookup, including
-    /// positive cache hits, without an extra total connection budget.
-    pub async fn acquire_route_token(
-        &self,
-        expected: &c2_contract::ExpectedRouteContract,
-        route_uid: &str,
-    ) -> Result<RouteBinding, IpcError> {
-        c2_contract::validate_expected_route_contract(expected)
-            .map_err(|err| IpcError::ContractMismatch(err.to_string()))?;
-        let mut delays = ROUTE_PUBLICATION_LOOKUP_RETRY_DELAYS_MS.iter();
-        loop {
-            self.lookup_route_contract_for_acquire(expected).await?;
-            match self.bind_cached_route_token(expected, route_uid) {
-                Err(err @ IpcError::RouteNotFound(_)) => {
-                    let Some(&delay_ms) = delays.next() else {
-                        return Err(err);
-                    };
-                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
-                }
-                other => return other,
-            }
-        }
     }
 
     /// CRM tag advertised by a route, if present.
@@ -2907,25 +2731,20 @@ impl IpcClient {
     ///
     /// This is a registration control-plane path: the route is not visible in
     /// the committed catalog yet, so ordinary authoritative route lookup cannot
-    /// acquire it. The pending attestation response is cached and immediately
-    /// bound to a route token for relay registration proof.
+    /// acquire it. The pending attestation response is
+    /// returned directly as relay registration proof.
     pub async fn acquire_pending_route_attestation(
         &mut self,
         route_name: &str,
         registration_token: &str,
-    ) -> Result<(c2_contract::ExpectedRouteContract, RouteBinding), IpcError> {
+    ) -> Result<PendingRouteAttestation, IpcError> {
         let payload = encode_pending_route_attestation_request(route_name, registration_token)
             .map_err(IpcError::Protocol)?;
         let payload = self
             .send_control_inline(payload, "pending route attestation")
             .await?;
         match decode_pending_route_attestation_response(&payload).map_err(IpcError::Protocol)? {
-            PendingRouteAttestationResponse::Attested { contract } => {
-                self.cache_attested_contract(&contract);
-                let expected = Self::expected_contract_from_attestation(contract);
-                let binding = self.bind_cached_route(&expected)?;
-                Ok((expected, binding))
-            }
+            PendingRouteAttestationResponse::Attested { contract } => Ok(contract),
             PendingRouteAttestationResponse::Rejected { code, message } => {
                 if code == PENDING_ROUTE_REJECT_NOT_FOUND {
                     Err(IpcError::RouteNotFound(route_name.to_string()))

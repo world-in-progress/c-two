@@ -49,7 +49,6 @@ fn handshake() -> Vec<u8> {
     let expected = expected();
     let route = RouteInfo {
         name: expected.route_name,
-        route_uid: ROUTE_UID.into(),
         crm_ns: expected.crm_ns,
         crm_name: expected.crm_name,
         crm_ver: expected.crm_ver,
@@ -413,7 +412,7 @@ fn prewarmed_handshake_timeout_settles_budget_and_recovers_without_pool_drain() 
     let binding = recovered
         .acquire_route_with_deadline(&expected(), deadline(Duration::from_secs(1)))
         .unwrap();
-    assert_eq!(binding.route_uid(), ROUTE_UID);
+    assert_eq!(binding.route_name(), "grid");
     #[cfg(feature = "test-support")]
     assert_eq!(recovered.pending_len_for_test(), 0);
     drop(lease);
@@ -481,7 +480,7 @@ fn cached_client_route_timeout_keeps_pending_until_late_reply_and_preserves_heal
     let binding = recovered
         .acquire_route_with_deadline(&expected(), deadline(Duration::from_secs(2)))
         .unwrap();
-    assert_eq!(binding.route_uid(), ROUTE_UID);
+    assert_eq!(binding.route_name(), "grid");
     #[cfg(feature = "test-support")]
     assert_eq!(recovered.pending_len_for_test(), 0);
     assert!(pool.release_if_same(&peer.address, &recovered));
@@ -531,7 +530,7 @@ fn handshake_and_route_lookup_consume_one_absolute_budget() {
     let binding = client
         .acquire_route_with_deadline(&expected(), deadline(Duration::from_secs(2)))
         .unwrap();
-    assert_eq!(binding.route_uid(), ROUTE_UID);
+    assert_eq!(binding.route_name(), "grid");
     #[cfg(feature = "test-support")]
     assert_eq!(client.pending_len_for_test(), 0);
     assert!(client.is_connected());
@@ -577,109 +576,102 @@ fn transient_handshake_retry_keeps_original_budget() {
 
 #[test]
 fn route_acquisition_respects_deadlines_and_last_lookup_result() {
-    for exact_token in [false, true] {
-        for (state, timeout_ms) in [
-            ("paused", 100),
-            ("retrying", 80),
-            ("ready", 3000),
-            ("not-found", 3000),
-            ("mismatch", 3000),
-        ] {
-            let lookups = Arc::new(AtomicUsize::new(0));
-            let observed = Arc::clone(&lookups);
-            let (resume, resumed) = oneshot::channel();
-            let (late_tx, late_rx) = mpsc::channel();
-            let peer = Peer::spawn(move |mut listener| async move {
-                let mut stream = listener.accept().await.unwrap();
-                read_handshake(&mut stream).await;
-                stream.write_all(&handshake()).await.unwrap();
-                let not_found = RouteLookupResponse::NotFound {
-                    route_name: "grid".into(),
-                };
-                let final_reply = match state {
-                    "ready" => ready_reply(),
-                    "mismatch" => {
-                        let RouteLookupResponse::Ready { mut current } = ready_reply() else {
-                            unreachable!("ready fixture")
-                        };
-                        current.contract.crm_ver = "2.0.0".into();
-                        RouteLookupResponse::ContractMismatch { current }
-                    }
-                    _ => not_found.clone(),
-                };
-                let mut resumed = Some(resumed);
-                let recovered_reply = ready_reply();
-                let mut recovered = false;
-                loop {
-                    let header = read_lookup(&mut stream).await;
-                    let attempt = observed.fetch_add(1, Ordering::SeqCst) + 1;
-                    // Hold the retried lookup at an awaited reply so expiry
-                    // cannot race a directory update and report its stage.
-                    if (state == "paused" && attempt == 1) || (state == "retrying" && attempt == 2)
-                    {
-                        let _ = resumed.take().unwrap().await;
-                        reply(&mut stream, header, &not_found).await;
-                        late_tx.send(()).unwrap();
-                        recovered = true;
-                        continue;
-                    }
-                    // Five configured delays allow a sixth and final lookup.
-                    let response = if recovered {
-                        &recovered_reply
-                    } else if attempt < 6 {
-                        &not_found
-                    } else {
-                        &final_reply
-                    };
-                    reply(&mut stream, header, response).await;
-                }
-            });
-            let pool = test_pool(&peer);
-            let client = pool.acquire(&peer.address, None).unwrap();
-            let budget = deadline(Duration::from_millis(timeout_ms));
-            let started = Instant::now();
-            let result = if exact_token {
-                client.acquire_route_token_with_deadline(&expected(), ROUTE_UID, budget)
-            } else {
-                client.acquire_route_with_deadline(&expected(), budget)
+    for (state, timeout_ms) in [
+        ("paused", 100),
+        ("retrying", 80),
+        ("ready", 3000),
+        ("not-found", 3000),
+        ("mismatch", 3000),
+    ] {
+        let lookups = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&lookups);
+        let (resume, resumed) = oneshot::channel();
+        let (late_tx, late_rx) = mpsc::channel();
+        let peer = Peer::spawn(move |mut listener| async move {
+            let mut stream = listener.accept().await.unwrap();
+            read_handshake(&mut stream).await;
+            stream.write_all(&handshake()).await.unwrap();
+            let not_found = RouteLookupResponse::NotFound {
+                route_name: "grid".into(),
             };
-            let queries = lookups.load(Ordering::SeqCst);
-            if matches!(state, "paused" | "retrying") {
-                assert_deadline(result.err().expect(state), "route_acquire");
-                assert!(started.elapsed() < Duration::from_millis(250));
-                if state == "paused" {
-                    assert_eq!(queries, 1, "cached token must perform a live lookup");
+            let final_reply = match state {
+                "ready" => ready_reply(),
+                "mismatch" => {
+                    let RouteLookupResponse::Ready { mut current } = ready_reply() else {
+                        unreachable!("ready fixture")
+                    };
+                    current.contract.crm_ver = "2.0.0".into();
+                    RouteLookupResponse::ContractMismatch { current }
+                }
+                _ => not_found.clone(),
+            };
+            let mut resumed = Some(resumed);
+            let recovered_reply = ready_reply();
+            let mut recovered = false;
+            loop {
+                let header = read_lookup(&mut stream).await;
+                let attempt = observed.fetch_add(1, Ordering::SeqCst) + 1;
+                // Hold the retried lookup at an awaited reply so expiry
+                // cannot race a directory update and report its stage.
+                if (state == "paused" && attempt == 1) || (state == "retrying" && attempt == 2) {
+                    let _ = resumed.take().unwrap().await;
+                    reply(&mut stream, header, &not_found).await;
+                    late_tx.send(()).unwrap();
+                    recovered = true;
+                    continue;
+                }
+                // Five configured delays allow a sixth and final lookup.
+                let response = if recovered {
+                    &recovered_reply
+                } else if attempt < 6 {
+                    &not_found
                 } else {
-                    assert_eq!(queries, 2, "fixture must reach the paused retry");
-                }
-                #[cfg(feature = "test-support")]
-                assert_eq!(client.pending_len_for_test(), 1);
-                assert!(client.is_connected());
-                resume.send(()).unwrap();
-                late_rx.recv_timeout(Duration::from_secs(2)).unwrap();
-                let binding = client
-                    .acquire_route_with_deadline(&expected(), deadline(Duration::from_secs(3)))
-                    .unwrap();
-                assert_eq!(binding.route_uid(), ROUTE_UID);
+                    &final_reply
+                };
+                reply(&mut stream, header, response).await;
+            }
+        });
+        let pool = test_pool(&peer);
+        let client = pool.acquire(&peer.address, None).unwrap();
+        let budget = deadline(Duration::from_millis(timeout_ms));
+        let started = Instant::now();
+        let result = client.acquire_route_with_deadline(&expected(), budget);
+        let queries = lookups.load(Ordering::SeqCst);
+        if matches!(state, "paused" | "retrying") {
+            assert_deadline(result.err().expect(state), "route_acquire");
+            assert!(started.elapsed() < Duration::from_millis(250));
+            if state == "paused" {
+                assert_eq!(queries, 1, "cached route must perform a live lookup");
             } else {
-                assert_eq!(queries, 6, "{state}, exact={exact_token}");
-                match state {
-                    "ready" => assert_eq!(result.unwrap().route_uid(), ROUTE_UID),
-                    "mismatch" => assert!(
-                        matches!(result, Err(IpcError::ContractMismatch(message)) if message.contains("2.0.0"))
-                    ),
-                    _ => assert!(
-                        matches!(result, Err(IpcError::RouteNotFound(name)) if name == "grid")
-                    ),
-                }
+                assert_eq!(queries, 2, "fixture must reach the paused retry");
             }
             #[cfg(feature = "test-support")]
-            assert_eq!(client.pending_len_for_test(), 0);
+            assert_eq!(client.pending_len_for_test(), 1);
             assert!(client.is_connected());
-            assert!(pool.release_if_same(&peer.address, &client));
-            assert_eq!(pool.refcount(&peer.address), 0);
-            peer.finish();
-            pool.close_all(Duration::from_secs(2));
+            resume.send(()).unwrap();
+            late_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            let binding = client
+                .acquire_route_with_deadline(&expected(), deadline(Duration::from_secs(3)))
+                .unwrap();
+            assert_eq!(binding.route_name(), "grid");
+        } else {
+            assert_eq!(queries, 6, "{state}");
+            match state {
+                "ready" => assert_eq!(result.unwrap().route_name(), "grid"),
+                "mismatch" => assert!(
+                    matches!(result, Err(IpcError::ContractMismatch(message)) if message.contains("2.0.0"))
+                ),
+                _ => {
+                    assert!(matches!(result, Err(IpcError::RouteNotFound(name)) if name == "grid"))
+                }
+            }
         }
+        #[cfg(feature = "test-support")]
+        assert_eq!(client.pending_len_for_test(), 0);
+        assert!(client.is_connected());
+        assert!(pool.release_if_same(&peer.address, &client));
+        assert_eq!(pool.refcount(&peer.address), 0);
+        peer.finish();
+        pool.close_all(Duration::from_secs(2));
     }
 }

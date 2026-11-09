@@ -264,10 +264,7 @@ fn host(
     )?;
     let mut registration = host.register(definition)?;
     assert_eq!(runtime.server_address().as_deref(), Some(address));
-    println!(
-        "READY address={address} route_uid={}",
-        registration.outcome().route_uid
-    );
+    println!("READY address={address}");
     std::io::stdout().flush()?;
     loop {
         let mut line = String::new();

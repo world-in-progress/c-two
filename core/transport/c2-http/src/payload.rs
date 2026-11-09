@@ -20,7 +20,7 @@ fn response_protocol_error(
 ) -> c2_error::C2Error {
     c2_error::C2Error::new(
         c2_error::ErrorCode::ProtocolViolation,
-        "HTTP response violates the selected route's message boundary",
+        "HTTP response exceeds its protocol message boundary",
     )
     .with_details(std::collections::BTreeMap::from([
         ("transport".into(), "http".into()),
@@ -258,18 +258,13 @@ pub(crate) async fn read_http_response_body(
 // Every status retains its received storage until its last actual reader ends.
 pub(crate) async fn read_http_response(
     response: reqwest::Response,
-    max_payload_size: u64,
     budget: &PayloadBufferBudget,
     deadline: Option<Instant>,
 ) -> Result<BudgetedBuffer, HttpError> {
     let status = response.status().as_u16();
-    // Successful and CRM-error bodies carry business payloads. Other statuses
-    // are relay control errors and must remain readable even for a tiny route.
-    let response_limit = if matches!(status, 200 | 500) {
-        max_payload_size
-    } else {
-        crate::stream_wire::MAX_TERMINAL_PAYLOAD_BYTES
-    };
+    // A selected relay URL does not freeze registration metadata. Every status
+    // uses the fixed HTTP message bound and the caller's payload buffer budget.
+    let response_limit = crate::stream_wire::MAX_TERMINAL_PAYLOAD_BYTES;
     let body = read_http_response_body(
         response,
         response_limit,
@@ -384,7 +379,7 @@ mod tests {
         ]);
         let response: reqwest::Response =
             axum::http::Response::new(reqwest::Body::wrap_stream(chunks)).into();
-        let mut read = Box::pin(read_http_response(response, 8, &budget, None));
+        let mut read = Box::pin(read_http_response(response, &budget, None));
         let result = futures::poll!(&mut read);
         assert!(
             matches!(result, std::task::Poll::Ready(Err(HttpError::LocalCallRejected(ref error)))
@@ -414,7 +409,7 @@ mod tests {
                 .unwrap()
                 .into();
             // Unknown length can read a library frame, but cannot copy it before admission.
-            let mut read = Box::pin(read_http_response(response, 8, &budget, None));
+            let mut read = Box::pin(read_http_response(response, &budget, None));
             assert!(futures::poll!(&mut read).is_pending());
             assert_eq!(budget.snapshot().used_bytes, 8);
             assert_eq!(budget.snapshot().rejected_allocations, 0);
@@ -442,7 +437,7 @@ mod tests {
         let occupied = budget.reserve(4).await.unwrap();
         let response: reqwest::Response =
             axum::http::Response::new(reqwest::Body::from(b"data".to_vec())).into();
-        let mut read = Box::pin(read_http_response(response, 4, &budget, None));
+        let mut read = Box::pin(read_http_response(response, &budget, None));
         assert!(futures::poll!(&mut read).is_pending());
         drop(read);
         drop(occupied);
@@ -459,9 +454,7 @@ mod tests {
         let budget = PayloadBufferBudget::new(4);
         let response: reqwest::Response =
             axum::http::Response::new(reqwest::Body::from(b"data".to_vec())).into();
-        let owned = read_http_response(response, 4, &budget, None)
-            .await
-            .unwrap();
+        let owned = read_http_response(response, &budget, None).await.unwrap();
         let bytes = Bytes::from_owner(owned);
         let slice = bytes.slice(1..3);
         let clone = slice.clone();

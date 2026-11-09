@@ -30,7 +30,8 @@ typedef struct Symbols {
     void (*domain_free)(C2MemFfiClientDomain *);
     C2MemFfiStatus (*domain_stats)(const C2MemFfiClientDomain *, C2MemFfiResult **);
     C2MemFfiStatus (*endpoint_new)(const C2MemFfiClientDomain *, const char *, const char *, C2MemFfiEndpointContext **, C2MemFfiError **);
-    C2MemFfiStatus (*endpoint_prepare)(const C2MemFfiEndpointContext *, const char *, const char *, const char *, C2MemFfiComplete, void *);
+    C2MemFfiStatus (*endpoint_prepare)(const C2MemFfiEndpointContext *, const char *, const char *, const uint64_t *, C2MemFfiComplete, void *);
+    C2MemFfiStatus (*endpoint_snapshot)(const C2MemFfiEndpointContext *, const char *, C2MemFfiResult **);
     C2MemFfiStatus (*endpoint_deactivate)(const C2MemFfiEndpointContext *);
     C2MemFfiStatus (*endpoint_close)(const C2MemFfiEndpointContext *, C2MemFfiComplete, void *);
     void (*endpoint_free)(C2MemFfiEndpointContext *);
@@ -516,6 +517,7 @@ static napi_value domain_method(napi_env env, napi_callback_info info) {
     if (st != C2_MEM_FFI_STATUS_OK || endpoint == NULL) return throw_native(env, s, error, st);
     napi_value object = owner_wrap(env, s, OWNER_ENDPOINT, endpoint);
     if (object == NULL || !method(env, object, "prepare", endpoint_method, (void *)1) ||
+        !method(env, object, "connectionSnapshot", endpoint_method, (void *)5) ||
         !method(env, object, "beginCall", endpoint_method, (void *)2) ||
         !method(env, object, "deactivate", endpoint_method, (void *)3) ||
         !method(env, object, "close", endpoint_method, (void *)4)) return NULL;
@@ -538,21 +540,33 @@ static napi_value endpoint_method(napi_env env, napi_callback_info info) {
         st = s->endpoint_close(owner->ptr, native_complete, operation);
         return async_status(env, operation, st, promise);
     }
+    if (data == (void *)5) {
+        if (argc != 1) return bad(env, "connectionSnapshot expects a route name.");
+        char *route = string(env, argv[0], "Route name must be a string.");
+        if (route == NULL) return NULL;
+        C2MemFfiResult *result = NULL;
+        st = s->endpoint_snapshot(owner->ptr, route, &result);
+        free(route);
+        if (st != C2_MEM_FFI_STATUS_OK || result == NULL) return throw_status(env, st);
+        napi_value out;
+        if (result->error != NULL) { out = throw_native(env, s, result->error, st); result->error = NULL; }
+        else if (result->json != NULL) out = json_parse(env, result->json);
+        else napi_get_null(env, &out);
+        s->result_free(result);
+        return out;
+    }
     if (data == (void *)1) {
-        if (argc != 2 && argc != 3) return bad(env, "prepare expects route name, contract and optional route token.");
+        if (argc < 2 || argc > 3) return bad(env, "prepare expects route name, contract and optional timeout.");
         char *route = string(env, argv[0], "Route name must be a string.");
         if (route == NULL) return NULL;
         char *contract = json_string(env, argv[1], "Contract must be an object.");
         if (contract == NULL) { free(route); return NULL; }
-        char *token = NULL;
-        if (argc == 3 && !nullish(env, argv[2])) {
-            token = json_string(env, argv[2], "Route token must be an object.");
-            if (token == NULL) { free(route); free(contract); return NULL; }
-        }
+        uint64_t millis = 0; const uint64_t *limit = NULL;
+        if (argc == 3 && !timeout(env, argv[2], &millis, &limit)) { free(route); free(contract); return NULL; }
         napi_value promise; Async *operation = async_new(env, s, ASYNC_JSON, &promise);
-        if (operation == NULL) { free(route); free(contract); free(token); return NULL; }
-        st = s->endpoint_prepare(owner->ptr, route, contract, token, native_complete, operation);
-        free(route); free(contract); free(token);
+        if (operation == NULL) { free(route); free(contract); return NULL; }
+        st = s->endpoint_prepare(owner->ptr, route, contract, limit, native_complete, operation);
+        free(route); free(contract);
         return async_status(env, operation, st, promise);
     }
     if (argc != 4) return bad(env, "beginCall expects route, method, stream flag and timeout.");
@@ -597,7 +611,8 @@ static napi_value call_method(napi_env env, napi_callback_info info) {
         }
         napi_value out; napi_get_undefined(env, &out); return out;
     }
-    AsyncKind kind = data == (void *)3 ? ASYNC_NEXT : data == (void *)5 ? ASYNC_OBSERVE : ASYNC_VOID;
+    AsyncKind kind = data == (void *)2 ? ASYNC_JSON :
+        data == (void *)3 ? ASYNC_NEXT : data == (void *)5 ? ASYNC_OBSERVE : ASYNC_VOID;
     napi_value promise; Async *operation;
     if (data == (void *)1) {
         uint64_t len = 0;
@@ -710,6 +725,7 @@ static bool load_all(napi_env env, Symbols *s) {
     LOAD_REQUIRED(domain_stats, "c2_mem_ffi_client_domain_stats");
     LOAD_REQUIRED(endpoint_new, "c2_mem_ffi_endpoint_context_new");
     LOAD_REQUIRED(endpoint_prepare, "c2_mem_ffi_endpoint_context_prepare");
+    LOAD_REQUIRED(endpoint_snapshot, "c2_mem_ffi_endpoint_context_connection_snapshot");
     LOAD_REQUIRED(endpoint_deactivate, "c2_mem_ffi_endpoint_context_deactivate");
     LOAD_REQUIRED(endpoint_close, "c2_mem_ffi_endpoint_context_close");
     LOAD_REQUIRED(endpoint_free, "c2_mem_ffi_endpoint_context_free");

@@ -38,7 +38,7 @@ macOS/Unix uses the same actions and flags with Unix paths and `.venv/bin/python
   --output /absolute/new/evidence --workers 2
 ```
 
-The existing command requires the CoreSDK environment and prebuilt TypeScript inputs, as before. It does not perform installation. The shared sidecar defaults to one worker; `--workers 2` or `4` parallelizes ordinary Python files only. Portable and TypeScript matrices always run serially. `--ordinary-only` keeps the full collection and partition checks but runs only the ordinary group and writes no matrix receipts; CI uses it for the Python 3.10 run.
+The existing command requires the CoreSDK environment and prebuilt TypeScript inputs, as before, and the test-only registration attestor that `python tools/dev/build_route_scope_attestor.py` builds into the shared Cargo target; `--route-scope-attestor` selects another build, and preparation of the python suite builds it. It does not perform installation. The shared sidecar defaults to one worker; `--workers 2` or `4` parallelizes ordinary Python files only. Portable and TypeScript matrices always run serially. `--ordinary-only` keeps the full collection and partition checks but runs only the ordinary group and writes no matrix receipts; CI uses it for the Python 3.10 run.
 
 ## Suites and evidence
 

@@ -6,7 +6,7 @@ function fixture() {
   const events = [];
   const call = {
     async chargeInput(size) { events.push(['charge', size]); },
-    async dispatch(bytes) { events.push(['dispatch', bytes]); },
+    async dispatch(bytes) { events.push(['dispatch', bytes]); return {path: 'DirectIpc', serverId: 'server', serverInstanceId: 'instance', connectionId: '7'}; },
     async next() { events.push('next'); return null; },
     cancel() { events.push('cancel'); },
     async observe(timeout) { events.push(['observe', timeout]); return {completed: true, error: null, completeItems: 0n}; },
@@ -14,7 +14,8 @@ function fixture() {
     close() { events.push('call.close'); },
   };
   const endpoint = {
-    async prepare(route, contract) { events.push(['prepare', route, contract]); return {serverId: 'server', serverInstanceId: 'instance', routeUid: 'uid', connectionId: 7n}; },
+    connectionSnapshot(){return null},
+    async prepare(route, contract) { events.push(['prepare', route, contract]); return {serverId: 'server', serverInstanceId: 'instance', connectionId: 7n}; },
     beginCall(route, method, stream, timeout) { events.push(['begin', route, method, stream, timeout]); return call; },
     deactivate() { events.push('deactivate'); },
     async close() { events.push('endpoint.close'); },
@@ -32,11 +33,11 @@ test('endpoint and call methods pass through route, method and deadline exactly'
   const connector = createNodeIpcConnector({nativeSymbols: symbols});
   const endpoint = await connector('ipc://x');
   const contract = {abiHash: 'a'};
-  assert.deepEqual(await endpoint.prepare('echo', contract), {serverId: 'server', serverInstanceId: 'instance', routeUid: 'uid', connectionId: 7n});
+  assert.deepEqual(await endpoint.prepare('echo', contract), {serverId: 'server', serverInstanceId: 'instance', connectionId: 7n});
   const call = endpoint.beginCall('echo', 'steps', true, null);
   await call.chargeInput(3n);
   const input = new Uint8Array([1, 2, 3]);
-  await call.dispatch(input);
+  assert.deepEqual(await call.dispatch(input), {path: 'DirectIpc', serverId: 'server', serverInstanceId: 'instance', connectionId: '7'});
   assert.equal(await call.next(), null);
   assert.deepEqual(await call.observe(0), {completed: true, error: null, completeItems: 0n});
   call.checkDeadline(); call.cancel(); call.close(); endpoint.deactivate(); await endpoint.close(); connector.close();

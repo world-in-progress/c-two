@@ -31,11 +31,12 @@ const transport = await transportModule();
 const hash = 'a'.repeat(64);
 const contract = {schema:'c-two.contract.v2', namespace:'test', name:'Echo', version:'0.1.0', descriptorSha256:hash, abiHash:hash, signatureHash:hash};
 
-function nativeEndpoint(next, prepare = async () => ({serverId:'s',serverInstanceId:'i',routeUid:'u',connectionId:1n})) {
+function nativeEndpoint(next, prepare = async () => ({serverId:'s',serverInstanceId:'i',connectionId:1n})) {
   return {
     prepare,
+    connectionSnapshot(){return null},
     beginCall() { return {
-      async chargeInput() {}, async dispatch() {}, next, cancel() {},
+      async chargeInput() {}, async dispatch() {return {path:'DirectIpc',serverId:'s',serverInstanceId:'i',connectionId:'1'}}, next, cancel() {},
       async observe() {return {completed:true,error:null,completeItems:1n}},
       checkDeadline() {}, close() {},
     }; },
@@ -59,14 +60,53 @@ test('provider allocation copies one native local buffer and releases its owner'
   await client.close();
 });
 
+test('IPC observation exposes route and server identity without a route UID', async () => {
+  const observations = [];
+  const response = Uint8Array.of(4); response.release = () => {};
+  const client = transport.createIpcEncodedTransport('ipc://consumer', {
+    connect: async () => nativeEndpoint(async () => response),
+    observe: value => observations.push(value),
+  });
+  await client.call('route', contract, 'echo', () => Uint8Array.of(1));
+  assert.equal(observations.length, 1);
+  assert.deepEqual(Object.keys(observations[0]).sort(),
+    ['connectionId', 'ipcAddress', 'path', 'requests', 'responses', 'routeName', 'serverId', 'serverInstanceId']);
+  await client.close();
+});
+
+test('HTTP call and observation use route name and contract without a route UID', async () => {
+  const retiredHeader = 'x-c2-route-uid';
+  const observations = [];
+  const route = {name:'route',relay_url:'http://localhost:8301',
+    crm_ns:contract.namespace,crm_name:contract.name,crm_ver:contract.version,
+    abi_hash:hash,signature_hash:hash,max_payload_size:100};
+  const fetch = async (url, init) => {
+    if (url.includes('/_resolve/')) return {status:200,async text(){return JSON.stringify([route])}};
+    if (url.includes('/_probe/')) {
+      assert.equal(retiredHeader in init.headers, false);
+      return {status:200,async text(){return ''}};
+    }
+    assert.equal(init.method, 'POST');
+    assert.equal(retiredHeader in init.headers, false);
+    return {status:200,async arrayBuffer(){return Uint8Array.of(4).buffer}};
+  };
+  const client = transport.createHttpRelayEncodedTransport('http://localhost:8300', {
+    fetch, observe: value => observations.push(value),
+  });
+  await client.call('route', contract, 'echo', () => Uint8Array.of(1));
+  assert.equal(observations.length, 1);
+  assert.deepEqual(Object.keys(observations[0]).sort(),
+    ['path', 'relayUrl', 'requests', 'responses', 'routeName']);
+});
+
 test('native pre-dispatch facts remain typed and retry-safe', async () => {
-  const native = new Error('route changed');
-  native.nativeDetails = {message:'route changed',code:704,canonicalName:'RouteStale',transportPhase:'pre_dispatch',details:{route:'route'}};
+  const native = new Error('route removed');
+  native.nativeDetails = {message:'route removed',code:708,canonicalName:'ResourceRemoved',transportPhase:'pre_dispatch',details:{route:'route'}};
   const endpoint = nativeEndpoint(async () => null, async () => {throw native});
   const client = transport.createIpcEncodedTransport('ipc://consumer', {connect:async()=>endpoint});
   await assert.rejects(client.prepare('route',contract), error => {
     assert.ok(error instanceof transport.C2IpcTransportError);
-    assert.equal(error.nativeDetails.code,704);
+    assert.equal(error.nativeDetails.code,708);
     assert.equal(error.transportPhase,'pre_dispatch');
     assert.equal(error.retrySafe,true);
     assert.deepEqual(error.details,{route:'route'});

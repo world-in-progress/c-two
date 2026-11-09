@@ -60,11 +60,11 @@ def test_relay_session_restores_unset_anchor_after_error(monkeypatch, capsys):
         relay.cc.set_relay_anchor(original or '')
 
 
-def test_relay_qps_hey_args_include_contract_and_route_identity():
+def test_relay_qps_hey_args_include_contract_identity():
     module = _load_benchmark('relay_qps_benchmark.py')
     expected = crm_contract(module.Hello)
 
-    args = module._route_hey_args(expected, 'registered-route-uid')
+    args = module._route_hey_args(expected)
 
     assert args == [
         '-H',
@@ -77,8 +77,6 @@ def test_relay_qps_hey_args_include_contract_and_route_identity():
         f'x-c2-expected-abi-hash: {expected.abi_hash}',
         '-H',
         f'x-c2-expected-signature-hash: {expected.signature_hash}',
-        '-H',
-        'x-c2-route-uid: registered-route-uid',
     ]
 
 
@@ -117,14 +115,14 @@ def test_relay_qps_headers_form_a_valid_hey_request(monkeypatch, tmp_path):
         result = module._run_hey('header-regression', [
             'hey', '-n', '1', '-c', '1', '-t', '2', '-m', 'POST',
             '-D', str(payload), '-T', 'application/octet-stream',
-            *module._route_hey_args(expected, 'registered-route-uid'),
+            *module._route_hey_args(expected),
             f'http://127.0.0.1:{server.server_port}/echo/greeting',
         ])
         assert result.returncode == 0
         path, headers, body = received.get_nowait()
         assert path == '/echo/greeting'
         assert body == payload.read_bytes()
-        assert headers['x-c2-route-uid'] == 'registered-route-uid'
+        assert '-'.join(('x', 'c2', 'route', 'uid')) not in headers
         assert headers['x-c2-expected-abi-hash'] == expected.abi_hash
         assert headers['x-c2-expected-signature-hash'] == expected.signature_hash
     finally:

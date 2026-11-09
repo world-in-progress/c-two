@@ -24,7 +24,7 @@ from ...crm.contract import (
 from ...crm.methods import rpc_method_names
 from ...crm.meta import MethodAccess, get_method_access, get_shutdown_method
 from ...crm.payload_plan import PayloadPlanKind
-from ...error import ResourceAlreadyRegistered
+from ...error import CCError, ResourceAlreadyRegistered
 from ..input_lifetime import (
     _InputLifetime,
     normalize_input_lifetime_map,
@@ -273,7 +273,14 @@ class NativeServerBridge:
                 ):
                     raise ResourceAlreadyRegistered(
                         f'Route name already registered with relay: {routing_name!r}',
+                        details=getattr(exc, 'details', None),
                     ) from exc
+                error_bytes = getattr(exc, 'error_bytes', None)
+                if error_bytes is not None:
+                    semantic_error = CCError.deserialize(memoryview(error_bytes))
+                    assert semantic_error is not None, 'native registration error must carry a canonical error'
+                    semantic_error.message = str(exc)
+                    raise semantic_error from exc
                 if getattr(exc, 'status_code', None) == 409:
                     raise ValueError(str(exc)) from exc
                 raise

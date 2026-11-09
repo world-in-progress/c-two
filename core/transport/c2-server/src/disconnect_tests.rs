@@ -393,7 +393,6 @@ async fn handshake_flush_before_following_frame(fail_flush: usize, disconnect: b
     } else {
         let identity = RouteCallIdentity {
             route_name: "unadmitted".to_string(),
-            route_uid: "unadmitted-uid".to_string(),
             crm_ns: "test.handshake".to_string(),
             crm_name: "Unadmitted".to_string(),
             crm_ver: "0.1.0".to_string(),

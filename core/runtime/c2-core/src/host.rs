@@ -1689,7 +1689,6 @@ mod lifecycle_tests {
             read_raw_frame(&mut peer).await;
             let identity = c2_wire::rpc::RouteCallIdentity {
                 route_name: expected.route_name,
-                route_uid: registration.outcome().route_uid.clone(),
                 crm_ns: expected.crm_ns,
                 crm_name: expected.crm_name,
                 crm_ver: expected.crm_ver,
@@ -2283,24 +2282,19 @@ mod lifecycle_tests {
                 Ok(request)
             }
         }
-        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = probe.local_addr().unwrap();
-        drop(probe);
-        let url = format!("http://{address}");
-        let mut relay = RelayServer::start(RelayConfig {
-            bind: address.to_string(),
-            advertise_url: url.clone(),
-            idle_timeout_secs: 1,
-            anti_entropy_interval: Duration::ZERO,
-            heartbeat_interval: Duration::ZERO,
-            ..Default::default()
-        })
+        let (runtime, directory) = receipt_test_runtime();
+        let mut relay = RelayServer::start_with_context(
+            RelayConfig {
+                bind: "127.0.0.1:0".into(),
+                idle_timeout_secs: 1,
+                anti_entropy_interval: Duration::ZERO,
+                heartbeat_interval: Duration::ZERO,
+                ..Default::default()
+            },
+            runtime.local_endpoint_context().unwrap(),
+        )
         .unwrap();
-        let runtime = Runtime::new(crate::RuntimeOptions {
-            use_process_relay_anchor: false,
-            ..Default::default()
-        })
-        .unwrap();
+        let url = format!("http://{}", relay.local_addr());
         let host = runtime
             .host(
                 HostOptions::default()
@@ -2341,6 +2335,9 @@ mod lifecycle_tests {
             ..Default::default()
         })
         .unwrap();
+        client_runtime
+            .inherit_local_endpoint_selection(&runtime)
+            .unwrap();
         let client = client_runtime
             .connect(
                 release.expected_route(&route).unwrap(),
@@ -2378,6 +2375,12 @@ mod lifecycle_tests {
         );
         host.shutdown();
         relay.stop().unwrap();
+        drop(client);
+        drop(_registration);
+        drop(host);
+        drop(client_runtime);
+        drop(runtime);
+        close_receipt_root(directory);
     }
     #[test]
     fn stopped_listener_with_pending_relay_withdraw_blocks_restart_and_identity_reset() {

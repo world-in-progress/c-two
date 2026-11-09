@@ -1,11 +1,9 @@
-use std::collections::HashMap;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use parking_lot::Mutex;
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use serde::{Deserialize, Serialize};
 
-use super::http_client::{HttpError, HttpRouteToken, runtime};
+use super::http_client::{HttpError, runtime};
 use c2_config::LocalEndpointContext;
 use c2_contract::ExpectedRouteContract;
 
@@ -34,29 +32,9 @@ const CONTROL_SEGMENT: &AsciiSet = &NON_ALPHANUMERIC
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_RETRY_ATTEMPTS: usize = 3;
 const DEFAULT_RETRY_DELAY: Duration = Duration::from_secs(1);
-const DEFAULT_CACHE_TTL: Duration = Duration::from_secs(30);
 
 fn encode_segment(s: &str) -> String {
     utf8_percent_encode(s, CONTROL_SEGMENT).to_string()
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct ResolveCacheKey {
-    expected: ExpectedRouteContract,
-    local_endpoint_namespace: Option<String>,
-}
-
-impl ResolveCacheKey {
-    fn route_name(&self) -> &str {
-        &self.expected.route_name
-    }
-}
-
-fn resolve_cache_key(expected: &ExpectedRouteContract) -> ResolveCacheKey {
-    ResolveCacheKey {
-        expected: expected.clone(),
-        local_endpoint_namespace: None,
-    }
 }
 
 fn canonical_base_url(base_url: &str) -> String {
@@ -138,7 +116,6 @@ struct AdminUnregisterRequest<'a> {
 pub struct RelayRouteInfo {
     pub name: String,
     pub relay_url: String,
-    pub route_uid: String,
     pub ipc_address: Option<String>,
     pub server_id: Option<String>,
     pub server_instance_id: Option<String>,
@@ -150,14 +127,6 @@ pub struct RelayRouteInfo {
     pub max_payload_size: u64,
 }
 
-impl RelayRouteInfo {
-    pub(crate) fn route_token(&self) -> HttpRouteToken {
-        HttpRouteToken {
-            route_uid: self.route_uid.clone(),
-        }
-    }
-}
-
 /// Routes and the relay namespace advertised by the discovery response header.
 #[derive(Debug, Clone)]
 pub struct RelayResolvedRoutes {
@@ -165,19 +134,11 @@ pub struct RelayResolvedRoutes {
     pub local_endpoint_namespace: Option<String>,
 }
 
-#[derive(Debug, Clone)]
-struct CacheEntry {
-    routes: Vec<RelayRouteInfo>,
-    local_endpoint_namespace: Option<String>,
-    inserted_at: Instant,
-}
-
 #[derive(Debug, Clone, Copy)]
 pub struct RelayControlClientConfig {
     pub timeout: Duration,
     pub retry_attempts: usize,
     pub retry_delay: Duration,
-    pub cache_ttl: Duration,
 }
 
 impl Default for RelayControlClientConfig {
@@ -186,7 +147,6 @@ impl Default for RelayControlClientConfig {
             timeout: DEFAULT_TIMEOUT,
             retry_attempts: DEFAULT_RETRY_ATTEMPTS,
             retry_delay: DEFAULT_RETRY_DELAY,
-            cache_ttl: DEFAULT_CACHE_TTL,
         }
     }
 }
@@ -195,7 +155,6 @@ pub struct RelayControlClient {
     client: reqwest::Client,
     base_url: String,
     config: RelayControlClientConfig,
-    cache: Mutex<HashMap<ResolveCacheKey, CacheEntry>>,
     local_endpoint_context: Option<LocalEndpointContext>,
 }
 
@@ -217,7 +176,6 @@ impl RelayControlClient {
             client,
             base_url: canonical_base_url(base_url),
             config,
-            cache: Mutex::new(HashMap::new()),
             local_endpoint_context: None,
         })
     }
@@ -227,19 +185,16 @@ impl RelayControlClient {
     /// Without this projection, control requests carry no namespace header.
     pub fn with_local_endpoint_context(mut self, context: &LocalEndpointContext) -> Self {
         self.local_endpoint_context = Some(context.clone());
-        self.cache.get_mut().clear();
         self
     }
 
     pub fn register(&self, registration: RelayRegistration<'_>) -> Result<(), HttpError> {
-        let route_name = registration.expected.route_name.clone();
         let request = registration.request(None, false);
         runtime().handle().block_on(self.post_json_with_retry(
             "/_register",
             &request,
             &[200, 201],
         ))?;
-        self.invalidate(&route_name);
         Ok(())
     }
 
@@ -262,7 +217,6 @@ impl RelayControlClient {
             scope,
             &[200, 202, 204, 404],
         ))?;
-        self.invalidate(&scope.name);
         Ok(())
     }
 
@@ -274,7 +228,6 @@ impl RelayControlClient {
             &request,
             &[200, 204],
         ))?;
-        self.invalidate(name);
         Ok(())
     }
 
@@ -293,12 +246,8 @@ impl RelayControlClient {
         &self,
         expected: &ExpectedRouteContract,
     ) -> Result<RelayResolvedRoutes, HttpError> {
-        self.resolve_with_query_async(
-            expected,
-            self.local_endpoint_context.as_ref(),
-            c2_config::ConnectDeadline::default(),
-        )
-        .await
+        self.resolve_with_query_async(expected, self.local_endpoint_context.as_ref())
+            .await
     }
 
     /// Project an already frozen Runtime context; never resolve process configuration here.
@@ -307,12 +256,7 @@ impl RelayControlClient {
         expected: &ExpectedRouteContract,
         context: &LocalEndpointContext,
     ) -> Result<RelayResolvedRoutes, HttpError> {
-        self.resolve_with_query_async(
-            expected,
-            Some(context),
-            c2_config::ConnectDeadline::default(),
-        )
-        .await
+        self.resolve_with_query_async(expected, Some(context)).await
     }
 
     pub(crate) async fn resolve_matching_with_namespace_deadline_async(
@@ -323,7 +267,7 @@ impl RelayControlClient {
         super::connect_deadline::run(
             deadline,
             "relay_resolve",
-            self.resolve_with_query_async(expected, self.local_endpoint_context.as_ref(), deadline),
+            self.resolve_with_query_async(expected, self.local_endpoint_context.as_ref()),
         )
         .await
     }
@@ -337,7 +281,7 @@ impl RelayControlClient {
         super::connect_deadline::run(
             deadline,
             "relay_resolve",
-            self.resolve_with_query_async(expected, Some(context), deadline),
+            self.resolve_with_query_async(expected, Some(context)),
         )
         .await
     }
@@ -346,17 +290,9 @@ impl RelayControlClient {
         &self,
         expected: &ExpectedRouteContract,
         context: Option<&LocalEndpointContext>,
-        deadline: c2_config::ConnectDeadline,
     ) -> Result<RelayResolvedRoutes, HttpError> {
         c2_contract::validate_expected_route_contract(expected)
             .map_err(|err| HttpError::InvalidInput(err.to_string()))?;
-        let mut cache_key = resolve_cache_key(expected);
-        cache_key.local_endpoint_namespace =
-            context.map(|context| context.namespace_id().to_owned());
-        if let Some(routes) = self.cached_with_namespace_deadline(&cache_key, deadline)? {
-            return Ok(routes);
-        }
-
         let path = format!(
             "/_resolve/{}?crm_ns={}&crm_name={}&crm_ver={}&abi_hash={}&signature_hash={}",
             encode_segment(&expected.route_name),
@@ -373,10 +309,7 @@ impl RelayControlClient {
             }
             None => request,
         };
-        let resp = request
-            .send()
-            .await
-            .map_err(|e| HttpError::Transport(e.to_string()))?;
+        let resp = request.send().await.map_err(HttpError::Request)?;
         let status = resp.status().as_u16();
         if resp
             .headers()
@@ -415,42 +348,10 @@ impl RelayControlClient {
                 return Err(HttpError::ServerError(code, text));
             }
         };
-        let resolved = RelayResolvedRoutes {
+        Ok(RelayResolvedRoutes {
             routes,
             local_endpoint_namespace,
-        };
-        for route in &resolved.routes {
-            validate_resolved_route(route)?;
-        }
-
-        // Prepare potentially large metadata before the publish check. A
-        // deadline that expires while cloning must not populate the cache.
-        let entry = CacheEntry {
-            routes: resolved.routes.clone(),
-            local_endpoint_namespace: resolved.local_endpoint_namespace.clone(),
-            inserted_at: Instant::now(),
-        };
-        super::connect_deadline::lock(&self.cache, deadline, "relay_resolve")?
-            .insert(cache_key, entry);
-        Ok(resolved)
-    }
-
-    pub fn clear_cache(&self) {
-        self.cache.lock().clear();
-    }
-
-    pub fn invalidate(&self, name: &str) {
-        self.cache.lock().retain(|key, _| key.route_name() != name);
-    }
-
-    pub(crate) fn invalidate_with_deadline(
-        &self,
-        name: &str,
-        deadline: c2_config::ConnectDeadline,
-    ) -> Result<(), HttpError> {
-        super::connect_deadline::lock(&self.cache, deadline, "relay_resolve")?
-            .retain(|key, _| key.route_name() != name);
-        Ok(())
+        })
     }
 
     pub fn base_url(&self) -> &str {
@@ -476,6 +377,9 @@ impl RelayControlClient {
                 }
                 Err(HttpError::Transport(message)) => {
                     last_server_error = Some(HttpError::Transport(message));
+                }
+                Err(HttpError::Request(error)) => {
+                    last_server_error = Some(HttpError::Request(error));
                 }
                 Err(err) => return Err(err),
             }
@@ -507,10 +411,7 @@ impl RelayControlClient {
             }
             None => request,
         };
-        let resp = request
-            .send()
-            .await
-            .map_err(|e| HttpError::Transport(e.to_string()))?;
+        let resp = request.send().await.map_err(HttpError::Request)?;
         let status = resp.status().as_u16();
         if success_codes.contains(&status) {
             return Ok(());
@@ -518,43 +419,59 @@ impl RelayControlClient {
         let text = resp.text().await.unwrap_or_default();
         Err(HttpError::ServerError(status, text))
     }
-
-    #[cfg(test)]
-    fn cached(&self, key: &ResolveCacheKey) -> Option<Vec<RelayRouteInfo>> {
-        self.cached_with_namespace_deadline(key, c2_config::ConnectDeadline::default())
-            .unwrap()
-            .map(|resolved| resolved.routes)
-    }
-
-    fn cached_with_namespace_deadline(
-        &self,
-        key: &ResolveCacheKey,
-        deadline: c2_config::ConnectDeadline,
-    ) -> Result<Option<RelayResolvedRoutes>, HttpError> {
-        let mut cache = super::connect_deadline::lock(&self.cache, deadline, "relay_resolve")?;
-        let Some(entry) = cache.get(key) else {
-            return Ok(None);
-        };
-        if entry.inserted_at.elapsed() >= self.config.cache_ttl {
-            cache.remove(key);
-            return Ok(None);
-        }
-        Ok(Some(RelayResolvedRoutes {
-            routes: entry.routes.clone(),
-            local_endpoint_namespace: entry.local_endpoint_namespace.clone(),
-        }))
-    }
-}
-
-fn validate_resolved_route(route: &RelayRouteInfo) -> Result<(), HttpError> {
-    c2_contract::validate_call_route_key("route_uid", &route.route_uid)
-        .map_err(|err| HttpError::Transport(format!("malformed relay route token: {err}")))?;
-    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "relay")]
+    use parking_lot::Mutex;
+
+    #[cfg(feature = "relay")]
+    #[tokio::test]
+    async fn each_acquisition_observes_current_relay_resolution() {
+        use axum::{Router, http::StatusCode, routing::get};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        let requests = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&requests);
+        let app = Router::new().route(
+            "/_resolve/{name}",
+            get(move || {
+                let request = observed.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if request == 0 {
+                        (StatusCode::OK, "[]")
+                    } else {
+                        (StatusCode::CONFLICT, "current route conflict")
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let client = RelayControlClient::new(&url, false).unwrap();
+        let expected = expected_contract();
+        assert!(
+            client
+                .resolve_matching_async(&expected)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let second = client.resolve_matching_async(&expected).await;
+        assert!(
+            matches!(second, Err(HttpError::ServerError(409, _))),
+            "{second:?}"
+        );
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+        server.abort();
+    }
 
     fn expected_contract() -> c2_contract::ExpectedRouteContract {
         c2_contract::ExpectedRouteContract {
@@ -567,36 +484,6 @@ mod tests {
             signature_hash: "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
                 .to_string(),
         }
-    }
-
-    #[test]
-    fn connect_deadline_bounds_resolve_cache_lock() {
-        let control =
-            std::sync::Arc::new(RelayControlClient::new("http://localhost:9985", false).unwrap());
-        let held = control.cache.lock();
-        let waiter_control = std::sync::Arc::clone(&control);
-        let waiter = std::thread::spawn(move || {
-            let deadline = c2_config::ConnectDeadline::start(
-                c2_config::ConnectOptions::new().with_timeout(Duration::from_millis(30)),
-            )
-            .unwrap();
-            let error = runtime()
-                .handle()
-                .block_on(
-                    waiter_control.resolve_matching_with_namespace_deadline_async(
-                        &expected_contract(),
-                        deadline,
-                    ),
-                )
-                .unwrap_err();
-            let HttpError::LocalCallRejected(error) = error else {
-                panic!("canonical error required")
-            };
-            assert_eq!(error.code, c2_error::ErrorCode::CallDeadlineExceeded);
-            assert_eq!(error.details["stage"], "relay_resolve");
-        });
-        waiter.join().unwrap();
-        assert!(held.is_empty());
     }
 
     #[test]
@@ -685,7 +572,6 @@ mod tests {
             "pub fn resolve(&self, name: &str)",
             "pub async fn resolve_async(&self, name: &str)",
             "expected: Option<&ExpectedRouteContract>",
-            "ResolveCacheKey::Name",
             "None => format!(\"/_resolve/{}\"",
         ] {
             assert!(
@@ -693,16 +579,6 @@ mod tests {
                 "RelayControlClient must not keep name-only runtime resolve surface: {forbidden}",
             );
         }
-    }
-
-    #[test]
-    fn route_cache_key_distinguishes_contract_hashes() {
-        let left = expected_contract();
-        let mut right = left.clone();
-        right.signature_hash =
-            "1111111111111111111111111111111111111111111111111111111111111111".to_string();
-
-        assert_ne!(resolve_cache_key(&left), resolve_cache_key(&right));
     }
 
     #[test]
@@ -730,81 +606,6 @@ mod tests {
             HttpError::InvalidInput(message) => assert!(message.contains("abi_hash"), "{message}"),
             other => panic!("unexpected error: {other}"),
         }
-    }
-
-    #[test]
-    fn namespace_response_cache_is_scoped_and_keeps_metadata() {
-        let client = RelayControlClient::new("http://relay.test", false).unwrap();
-        let context = LocalEndpointContext::default_for_platform().unwrap();
-        let legacy = resolve_cache_key(&expected_contract());
-        let mut typed = legacy.clone();
-        typed.local_endpoint_namespace = Some(context.namespace_id().into());
-        client.cache.lock().insert(
-            typed.clone(),
-            CacheEntry {
-                routes: vec![],
-                local_endpoint_namespace: Some(context.namespace_id().into()),
-                inserted_at: Instant::now(),
-            },
-        );
-        assert!(
-            client
-                .cached_with_namespace_deadline(&legacy, c2_config::ConnectDeadline::default())
-                .unwrap()
-                .is_none()
-        );
-        assert_eq!(
-            client
-                .cached_with_namespace_deadline(&typed, c2_config::ConnectDeadline::default())
-                .unwrap()
-                .unwrap()
-                .local_endpoint_namespace
-                .as_deref(),
-            Some(context.namespace_id())
-        );
-        client.invalidate("grid");
-        assert!(
-            client
-                .cached_with_namespace_deadline(&typed, c2_config::ConnectDeadline::default())
-                .unwrap()
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn route_cache_can_be_invalidated() {
-        let client = RelayControlClient::new("http://relay.test", false).unwrap();
-        let expected = expected_contract();
-        client.cache.lock().insert(
-            resolve_cache_key(&expected),
-            CacheEntry {
-                routes: vec![RelayRouteInfo {
-                    name: "grid".into(),
-                    relay_url: "http://relay-a.test".into(),
-                    route_uid: "grid-route-uid-0001".into(),
-                    ipc_address: None,
-                    server_id: None,
-                    server_instance_id: None,
-                    crm_ns: "".into(),
-                    crm_name: "".into(),
-                    crm_ver: "".into(),
-                    abi_hash: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-                        .into(),
-                    signature_hash:
-                        "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789".into(),
-                    max_payload_size: 1024,
-                }],
-                local_endpoint_namespace: None,
-                inserted_at: Instant::now(),
-            },
-        );
-
-        assert_eq!(
-            client.cached(&resolve_cache_key(&expected)).unwrap()[0].relay_url,
-            "http://relay-a.test"
-        );
-        client.invalidate("grid");
-        assert!(client.cached(&resolve_cache_key(&expected)).is_none());
     }
 
     #[cfg(feature = "relay")]

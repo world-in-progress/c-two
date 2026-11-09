@@ -457,7 +457,7 @@ class RustHost:
                 raise AssertionError(
                     f"Rust matrix host address mismatch: {ready!r}"
                 )
-            self.route_uid = ready["route_uid"]
+            self.server_instance_id = ready["server_instance_id"]
         except BaseException:
             self._kill_and_collect()
             raise
@@ -657,14 +657,10 @@ def wait_for_contract_resolution(
                         raise AssertionError(
                             f"relay resolution {route_key} mismatch: {route!r}"
                         )
-                if not route.get("route_uid"):
-                    raise AssertionError(
-                        f"relay resolution omitted route token: {route!r}"
-                    )
                 # Registration closes its attestation client before the relay
                 # lazily acquires a data-plane client. Resolution therefore
                 # proves catalog visibility, not yet upstream readiness. Poll
-                # the same contract- and token-scoped probe used by an
+                # the same contract-scoped probe used by an
                 # explicit-relay client; the real matrix call itself is still
                 # executed exactly once and is never replayed.
                 probe = Request(
@@ -680,7 +676,6 @@ def wait_for_contract_resolution(
                         "x-c2-expected-signature-hash": expected[
                             "signature_hash"
                         ],
-                        "x-c2-route-uid": route["route_uid"],
                     },
                 )
                 with opener.open(probe, timeout=1) as response:

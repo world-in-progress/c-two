@@ -57,7 +57,6 @@ mod client_tests {
     fn call_identity(route_name: &str) -> RouteCallIdentity {
         RouteCallIdentity {
             route_name: route_name.into(),
-            route_uid: format!("{route_name}-route-uid-0001"),
 
             crm_ns: "test.grid".into(),
             crm_name: "Grid".into(),

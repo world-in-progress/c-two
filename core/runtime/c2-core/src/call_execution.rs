@@ -48,6 +48,7 @@ use futures_util::FutureExt;
 use parking_lot::{Condvar, Mutex};
 use tokio::runtime::{Builder, Handle, Runtime};
 
+use crate::client::{CallDispatchTarget, CallRecordOutcome};
 use crate::{CallScope, CallScopeError, CallState, Error, LifecycleError, TransportPhase};
 
 /// Pure metadata observation of one Runtime's call-operation domain.
@@ -226,8 +227,7 @@ pub(crate) struct PreparingCall {
 }
 
 impl PreparingCall {
-    /// The HTTP receive path needs one byte of atomically admitted send/receive
-    /// headroom in addition to the input owner before materialization.
+    /// An HTTP stream admits one receive byte with its input before materialization.
     pub(crate) fn with_stream_http_headroom(mut self) -> Self {
         self.stream_http_headroom = 1;
         self
@@ -329,7 +329,7 @@ impl PreparingCall {
     where
         R: Send + 'static,
         M: FnOnce() -> Result<Vec<u8>, Error> + Send + 'static,
-        T: FnOnce(BudgetedBuffer, CallScope) -> F + Send + 'static,
+        T: FnOnce(BudgetedBuffer, CallScope, CallRecord<R>) -> F + Send + 'static,
         F: Future<Output = Result<R, Error>> + Send + 'static,
     {
         let scope = self.scope.clone();
@@ -354,7 +354,7 @@ impl PreparingCall {
     where
         R: Send + 'static,
         M: FnOnce() -> Result<Vec<u8>, Error> + Send + 'static,
-        T: FnOnce(BudgetedBuffer, CallScope) -> F + Send + 'static,
+        T: FnOnce(BudgetedBuffer, CallScope, CallRecord<R>) -> F + Send + 'static,
         F: Future<Output = Result<R, Error>> + Send + 'static,
     {
         let scope = self.scope.clone();
@@ -404,7 +404,7 @@ impl PreparingCall {
     where
         R: Send + 'static,
         M: FnOnce() -> Result<Vec<u8>, Error> + Send + 'static,
-        T: FnOnce(BudgetedBuffer, CallScope) -> F + Send + 'static,
+        T: FnOnce(BudgetedBuffer, CallScope, CallRecord<R>) -> F + Send + 'static,
         F: Future<Output = Result<R, Error>> + Send + 'static,
     {
         let scope = self.scope.clone();
@@ -437,7 +437,7 @@ impl PreparingCall {
         self.start_on(
             nbytes,
             materialize,
-            transport,
+            move |input, scope, _record| transport(input, scope),
             executor,
             CompletionMode::WholeCall,
             None,
@@ -459,7 +459,7 @@ impl PreparingCall {
     where
         R: Send + 'static,
         M: FnOnce() -> Result<Vec<u8>, Error> + Send + 'static,
-        T: FnOnce(BudgetedBuffer, CallScope) -> F + Send + 'static,
+        T: FnOnce(BudgetedBuffer, CallScope, CallRecord<R>) -> F + Send + 'static,
         F: Future<Output = Result<R, Error>> + Send + 'static,
     {
         let bytes = u64::try_from(nbytes).map_err(|_| configuration("input length exceeds u64"))?;
@@ -475,6 +475,7 @@ impl PreparingCall {
             state: Mutex::new(Outcome {
                 result: None,
                 caller: true,
+                dispatch_target: None,
             }),
             changed: Condvar::new(),
             async_changed: tokio::sync::Notify::new(),
@@ -522,7 +523,14 @@ impl PreparingCall {
                     bytes,
                     input_reservation.take().expect("input was charged"),
                 );
-                transport(input, scope).await
+                transport(
+                    input,
+                    scope,
+                    CallRecord {
+                        shared: guard.shared.clone(),
+                    },
+                )
+                .await
             })
             .catch_unwind()
             .await;
@@ -567,6 +575,24 @@ impl PreparingCall {
 struct Outcome<R> {
     result: Option<Result<R, Error>>,
     caller: bool,
+    dispatch_target: Option<CallDispatchTarget>,
+}
+
+/// A handle to the original execution's existing outcome metadata. The target
+/// itself contains only shared identity and copied connection information.
+pub(crate) struct CallRecord<R> {
+    shared: Arc<Completion<R>>,
+}
+
+impl<R> CallRecord<R> {
+    pub(crate) fn record_target(&self, target: CallDispatchTarget) {
+        let mut state = self.shared.state.lock();
+        assert!(
+            state.dispatch_target.is_none(),
+            "dispatch target recorded twice"
+        );
+        state.dispatch_target = Some(target);
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -683,7 +709,7 @@ pub(crate) struct ExecutingCall<R> {
 }
 
 impl<R> ExecutingCall<R> {
-    pub(crate) async fn wait_original(self) -> Result<R, Error> {
+    pub(crate) async fn wait_original(self) -> CallRecordOutcome<R> {
         loop {
             let changed = self.shared.async_changed.notified();
             tokio::pin!(changed);
@@ -692,7 +718,10 @@ impl<R> ExecutingCall<R> {
                 let mut state = self.shared.state.lock();
                 if let Some(result) = state.result.take() {
                     state.caller = false;
-                    return result;
+                    return CallRecordOutcome {
+                        result,
+                        dispatch_target: state.dispatch_target.take(),
+                    };
                 }
             }
             changed.await;
@@ -839,7 +868,7 @@ fn admission_error(error: RetentionError) -> Error {
     error_out
 }
 
-fn payload_admission_error(error: PayloadBufferError) -> Error {
+pub(crate) fn payload_admission_error(error: PayloadBufferError) -> Error {
     match error {
         PayloadBufferError::DeadlineExceeded => deadline_error(TransportPhase::PreDispatch),
         PayloadBufferError::TooLarge { requested, limit } => {
@@ -1922,7 +1951,7 @@ mod native_record_tests {
             .execute_stream_record(
                 0,
                 || Ok(Vec::new()),
-                move |_, scope| async move {
+                move |_, scope, _record| async move {
                     scope.try_begin_dispatch().map_err(scope_error)?;
                     started_tx.send(()).unwrap();
                     release_rx.await.unwrap();
@@ -1956,11 +1985,87 @@ mod native_record_tests {
             "deadline is not cancellation"
         );
         release_tx.send(()).unwrap();
-        assert_eq!(runtime.block_on(record.wait_original()).unwrap(), 19);
+        assert_eq!(runtime.block_on(record.wait_original()).result.unwrap(), 19);
         assert_eq!(
             cancelled.load(Ordering::SeqCst),
             0,
             "observing the real record does not abandon it"
+        );
+    }
+
+    #[test]
+    fn original_record_keeps_first_selected_target_with_a_failed_result() {
+        use crate::client::{CallDispatchTarget, IpcCallTarget, ObservedPath};
+
+        let context = CallExecutionContext::new(&CallExecutionLimits::default());
+        let preparing = context.prepare(CallOptions::default(), None).unwrap();
+        let selected = CallDispatchTarget {
+            path: ObservedPath::DirectIpc,
+            ipc: Some(IpcCallTarget {
+                server_identity: Arc::new(c2_wire::handshake::ServerIdentity {
+                    server_id: "original".into(),
+                    server_instance_id: "first".into(),
+                }),
+                connection_id: 17,
+            }),
+        };
+        let later = CallDispatchTarget {
+            path: ObservedPath::DirectIpc,
+            ipc: Some(IpcCallTarget {
+                server_identity: Arc::new(c2_wire::handshake::ServerIdentity {
+                    server_id: "replacement".into(),
+                    server_instance_id: "second".into(),
+                }),
+                connection_id: 18,
+            }),
+        };
+        let current_target = Arc::new(Mutex::new(selected.clone()));
+        let selected_for_transport = current_target.clone();
+        let owner = Arc::new(());
+        let owner_gone = Arc::downgrade(&owner);
+        let record = preparing
+            .execute_whole_record::<(), _, _, _>(
+                0,
+                || Ok(Vec::new()),
+                move |_, scope, record| async move {
+                    scope.try_begin_dispatch().map_err(scope_error)?;
+                    record.record_target(selected_for_transport.lock().clone());
+                    *selected_for_transport.lock() = later.clone();
+                    drop(owner);
+                    assert!(
+                        std::panic::catch_unwind(AssertUnwindSafe(|| {
+                            record.record_target(later);
+                        }))
+                        .is_err()
+                    );
+                    Err(
+                        C2Error::new(ErrorCode::ClientCallingResource, "failed after dispatch")
+                            .into(),
+                    )
+                },
+            )
+            .unwrap();
+        let outcome = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(record.wait_original());
+        assert!(outcome.result.is_err());
+        assert!(Arc::ptr_eq(
+            &outcome
+                .dispatch_target
+                .as_ref()
+                .unwrap()
+                .ipc
+                .as_ref()
+                .unwrap()
+                .server_identity,
+            &selected.ipc.as_ref().unwrap().server_identity,
+        ));
+        assert_eq!(outcome.dispatch_target, Some(selected));
+        assert!(
+            owner_gone.upgrade().is_none(),
+            "record retains no target owner"
         );
     }
 }

@@ -120,7 +120,7 @@ impl PathKind {
 struct Resource {
     calls: AtomicUsize,
     identity: serde_json::Value,
-    uid: Mutex<String>,
+    label: String,
     gate: Gate,
 }
 
@@ -167,7 +167,7 @@ impl EncodedService for Resource {
         Ok(encode(
             &serde_json::json!({
                 "identity": self.identity,
-                "route_uid": *self.uid.lock().unwrap(),
+                "resource": self.label,
                 "calls": calls,
                 "command": command,
             })
@@ -184,6 +184,9 @@ pub struct Registered {
 impl Registered {
     pub fn calls(&self) -> usize {
         self.resource.calls.load(Ordering::SeqCst)
+    }
+    pub fn label(&self) -> &str {
+        &self.resource.label
     }
     pub fn evidence(&self) -> Evidence {
         Evidence(self.resource.clone())
@@ -206,7 +209,7 @@ impl Drop for Registered {
         let outcome = self.registration.outcome();
         println!(
             "C2_PERSISTENT_RESOURCE {}",
-            serde_json::json!({"server_id":outcome.server_id,"server_instance_id":outcome.server_instance_id,"route_uid":outcome.route_uid,"business_calls":self.calls()})
+            serde_json::json!({"server_id":outcome.server_id,"server_instance_id":outcome.server_instance_id,"resource":self.resource.label,"business_calls":self.calls()})
         );
     }
 }
@@ -214,6 +217,127 @@ impl Drop for Registered {
 impl Drop for Evidence {
     fn drop(&mut self) {
         self.0.gate.release();
+    }
+}
+
+enum FixtureRelay {
+    Embedded(RelayServer),
+    Process(std::process::Child),
+}
+
+impl FixtureRelay {
+    fn c3(root: &Path, idle: u64, seeds: &[String]) -> (Self, String) {
+        use std::process::{Command, Stdio};
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let target = std::env::var_os("CARGO_TARGET_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| repository.join("core/target"));
+        let binary = std::env::var_os("CTWO_TEST_C3_BIN")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                target
+                    .join("debug")
+                    .join(if cfg!(windows) { "c3.exe" } else { "c3" })
+            });
+        assert!(
+            binary.is_file(),
+            "build c3 first or set CTWO_TEST_C3_BIN: {}",
+            binary.display()
+        );
+        let stdout_path = root.join(format!("{}.stdout.log", unique("c3")));
+        let mut command = Command::new(binary);
+        command.args([
+            "relay",
+            "--bind",
+            "127.0.0.1:0",
+            "--idle-timeout",
+            &idle.to_string(),
+        ]);
+        if !seeds.is_empty() {
+            command.args(["--seeds", &seeds.join(",")]);
+        }
+        #[cfg(unix)]
+        command.arg("--ipc-root").arg(root);
+        let child = command
+            .env_remove("C2_IPC_ROOT")
+            .env_remove("C2_RELAY_ANCHOR_ADDRESS")
+            .stdin(Stdio::null())
+            .stdout(std::fs::File::create(&stdout_path).unwrap())
+            .stderr(
+                std::fs::File::create(root.join(format!("{}.stderr.log", unique("c3")))).unwrap(),
+            )
+            .spawn()
+            .unwrap();
+        let mut relay = Self::Process(child);
+        let deadline = Instant::now() + WAIT;
+        let url = loop {
+            let Self::Process(child) = &mut relay else {
+                unreachable!()
+            };
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "c3 exited; inspect {}",
+                root.display()
+            );
+            let stdout = std::fs::read_to_string(&stdout_path).unwrap();
+            let complete = stdout
+                .rsplit_once('\n')
+                .map(|(lines, _)| lines)
+                .unwrap_or("");
+            if let Some(url) = complete
+                .lines()
+                .find_map(|line| line.strip_prefix("C-Two relay listening at "))
+            {
+                let socket = url.strip_prefix("http://").unwrap().parse().unwrap();
+                if let Ok(mut stream) =
+                    TcpStream::connect_timeout(&socket, Duration::from_millis(100))
+                {
+                    stream.set_read_timeout(Some(WAIT)).unwrap();
+                    stream
+                        .write_all(
+                            b"GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+                        )
+                        .unwrap();
+                    let mut response = String::new();
+                    stream.read_to_string(&mut response).unwrap();
+                    if response.starts_with("HTTP/1.1 200 ") {
+                        break url.to_owned();
+                    }
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "c3 readiness: {}",
+                root.display()
+            );
+            std::thread::yield_now();
+        };
+        (relay, url)
+    }
+
+    fn stop(&mut self) -> Result<(), String> {
+        match self {
+            Self::Embedded(relay) => relay.stop(),
+            Self::Process(child) => {
+                if child
+                    .try_wait()
+                    .map_err(|error| error.to_string())?
+                    .is_none()
+                {
+                    child.kill().map_err(|error| error.to_string())?;
+                }
+                child.wait().map_err(|error| error.to_string())?;
+                Ok(())
+            }
+        }
+    }
+}
+
+impl Drop for FixtureRelay {
+    fn drop(&mut self) {
+        if matches!(self, Self::Process(_)) {
+            let _ = self.stop();
+        }
     }
 }
 
@@ -227,7 +351,8 @@ pub struct Fixture {
     pub server_events: ConnectionEvents,
     outgoing: Mutex<BTreeSet<u64>>,
     accepted: Mutex<Vec<ConnectionEvent>>,
-    relay: Option<RelayServer>,
+    relay: Option<FixtureRelay>,
+    secondary_relay: Option<FixtureRelay>,
     anchor: Option<HttpAnchor>,
     finished: bool,
 }
@@ -257,6 +382,31 @@ pub fn runtime(root: &Path, server_id: String, relay: Option<String>, idle: f64)
 
 impl Fixture {
     pub fn new(path: PathKind, idle: f64, relay_idle: u64) -> Self {
+        Self::new_inner(path, idle, relay_idle, false)
+    }
+
+    pub fn with_c3() -> Self {
+        Self::new_inner(PathKind::Http, 0.0, 0, true)
+    }
+
+    pub fn with_c3_path(path: PathKind) -> Self {
+        assert_ne!(path, PathKind::Direct);
+        Self::new_inner(path, 0.0, 0, true)
+    }
+
+    pub fn direct_with_unavailable_relay() -> Self {
+        let mut fixture = Self::new(PathKind::Direct, 0.0, 0);
+        fixture.client_runtime = runtime(
+            &fixture.root,
+            unique("persistent-direct-client"),
+            Some("http://127.0.0.1:0".into()),
+            0.0,
+        );
+        fixture.client_events = fixture.client_runtime.connection_events();
+        fixture
+    }
+
+    fn new_inner(path: PathKind, idle: f64, relay_idle: u64, c3: bool) -> Self {
         #[cfg(unix)]
         let root = Path::new("/tmp").join(unique("c2-persist"));
         #[cfg(windows)]
@@ -272,34 +422,23 @@ impl Fixture {
         let context = LocalEndpointContext::with_unix_root(&root).unwrap();
         #[cfg(windows)]
         let context = LocalEndpointContext::default_for_platform().unwrap();
-        let (relay, relay_url) = if path != PathKind::Direct {
-            let mut attempt = 0;
-            let (relay, url) = loop {
-                attempt += 1;
-                let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-                let address = listener.local_addr().unwrap();
-                drop(listener);
-                let url = format!("http://{address}");
-                match RelayServer::start_with_context(
-                    RelayConfig {
-                        bind: address.to_string(),
-                        advertise_url: url.clone(),
-                        idle_timeout_secs: relay_idle,
-                        anti_entropy_interval: Duration::ZERO,
-                        heartbeat_interval: Duration::ZERO,
-                        ..Default::default()
-                    },
-                    context.clone(),
-                ) {
-                    Ok(relay) => break (relay, url),
-                    // A parallel test can claim the port after the probe closes.
-                    Err(error)
-                        if attempt < 8
-                            && error.starts_with("Relay failed to start: Failed to bind ") => {}
-                    Err(error) => panic!("relay starts: {error}"),
-                }
-            };
+        let (relay, relay_url) = if c3 {
+            let (relay, url) = FixtureRelay::c3(&root, relay_idle, &[]);
             (Some(relay), Some(url))
+        } else if path != PathKind::Direct {
+            let relay = RelayServer::start_with_context(
+                RelayConfig {
+                    bind: "127.0.0.1:0".into(),
+                    idle_timeout_secs: relay_idle,
+                    anti_entropy_interval: Duration::ZERO,
+                    heartbeat_interval: Duration::ZERO,
+                    ..Default::default()
+                },
+                context.clone(),
+            )
+            .expect("relay starts");
+            let url = format!("http://{}", relay.local_addr());
+            (Some(FixtureRelay::Embedded(relay)), Some(url))
         } else {
             (None, None)
         };
@@ -330,6 +469,7 @@ impl Fixture {
             outgoing: Mutex::new(BTreeSet::new()),
             accepted: Mutex::new(Vec::new()),
             relay,
+            secondary_relay: None,
             anchor,
             finished: false,
         }
@@ -340,7 +480,7 @@ impl Fixture {
         let identity = self.server.ensure_server().unwrap();
         let resource = Arc::new(Resource {
             calls: AtomicUsize::new(0),
-            uid: Mutex::new(String::new()),
+            label: unique("resource"),
             gate: Gate::default(),
             identity: serde_json::json!({"server_id":identity.server_id,"server_instance_id":identity.server_instance_id}),
         });
@@ -364,7 +504,6 @@ impl Fixture {
         )
         .unwrap();
         let registration = self.host.register(definition).unwrap();
-        *resource.uid.lock().unwrap() = registration.outcome().route_uid.clone();
         Registered {
             registration,
             resource,
@@ -391,14 +530,13 @@ impl Fixture {
         let client = self.connect_name(route.registration.route_name()).unwrap();
         assert_eq!(client.observed_path(), self.path.observed());
         let registered = route.registration.outcome();
-        assert_eq!(client.observed_route().route_uid, registered.route_uid);
         if let Some(identity) = client.ipc_server_identity() {
             assert_eq!(identity.server_id, registered.server_id);
             assert_eq!(identity.server_instance_id, registered.server_instance_id);
         }
         println!(
             "C2_PERSISTENT_ACQUIRE {}",
-            serde_json::json!({"path":format!("{:?}", client.observed_path()),"server_id":registered.server_id,"server_instance_id":registered.server_instance_id,"route_uid":registered.route_uid,"physical_connections":self.outgoing_ids()})
+            serde_json::json!({"path":format!("{:?}", client.observed_path()),"server_id":registered.server_id,"server_instance_id":registered.server_instance_id,"resource":route.resource.label,"physical_connections":self.outgoing_ids()})
         );
         client
     }
@@ -422,7 +560,7 @@ impl Fixture {
             response["identity"]["server_instance_id"],
             registered.server_instance_id
         );
-        assert_eq!(response["route_uid"], registered.route_uid);
+        assert_eq!(response["resource"], route.resource.label);
         assert_eq!(response["command"], command);
         println!(
             "C2_PERSISTENT {}",
@@ -461,6 +599,14 @@ impl Fixture {
 
     pub fn relay_url(&self) -> Option<String> {
         self.server.relay_anchor_address_override()
+    }
+
+    pub fn add_c3_peer(&mut self) -> String {
+        assert!(self.secondary_relay.is_none());
+        let anchor = self.relay_url().expect("primary c3 relay");
+        let (relay, url) = FixtureRelay::c3(&self.root, 0, &[anchor]);
+        self.secondary_relay = Some(relay);
+        url
     }
 
     pub fn assert_paths(&self, acquisitions: u64) {
@@ -508,6 +654,9 @@ impl Fixture {
         assert!(outcome.route_close_error.is_none(), "{outcome:?}");
         assert!(outcome.relay_errors.is_empty(), "{outcome:?}");
         assert!(self.host.lifecycle_snapshot().finished);
+        if let Some(relay) = &mut self.secondary_relay {
+            relay.stop().unwrap();
+        }
         if let Some(relay) = &mut self.relay {
             relay.stop().unwrap();
         }
@@ -677,6 +826,62 @@ pub fn stream_expected(name: &str) -> c_two::contract::ExpectedRouteContract {
         .unwrap()
 }
 
+pub fn wait_relay_owner(fixture: &Fixture, url: &str, instance: &str) {
+    let context = fixture.server.local_endpoint_context().unwrap();
+    let control = c2_http::client::RelayControlClient::new(url, false)
+        .unwrap()
+        .with_local_endpoint_context(&context);
+    let expected = stream_expected("process-route");
+    observe_until(|| {
+        let routes = c2_core::native_client_executor()
+            .unwrap()
+            .block_on(control.resolve_matching_async(&expected))
+            .unwrap_or_default();
+        routes
+            .iter()
+            .any(|route| route.server_instance_id.as_deref() == Some(instance))
+    });
+}
+
+pub fn wait_relay_target(fixture: &Fixture, url: &str, owner: &str) {
+    let context = fixture.server.local_endpoint_context().unwrap();
+    let control = c2_http::client::RelayControlClient::new(url, false)
+        .unwrap()
+        .with_local_endpoint_context(&context);
+    let expected = stream_expected("process-route");
+    observe_until(|| {
+        let resolved = c2_core::native_client_executor()
+            .unwrap()
+            .block_on(control.resolve_matching_async(&expected));
+        match resolved {
+            Ok(routes) => routes.iter().any(|route| route.relay_url == owner),
+            Err(c2_http::client::HttpError::ServerError(404, body)) => {
+                let envelope = serde_json::from_str(&body)
+                    .expect("relay resolve must return a structured error");
+                let error = C2Error::from_envelope(envelope).unwrap();
+                assert_eq!(error.code, ErrorCode::ResourceNotFound, "{error:?}");
+                false
+            }
+            Err(error) => panic!("relay target lookup failed: {error:?}"),
+        }
+    });
+}
+
+pub fn wait_relay_absent(fixture: &Fixture, url: &str) {
+    let context = fixture.server.local_endpoint_context().unwrap();
+    let control = c2_http::client::RelayControlClient::new(url, false)
+        .unwrap()
+        .with_local_endpoint_context(&context);
+    let expected = stream_expected("process-route");
+    observe_until(|| {
+        let routes = c2_core::native_client_executor()
+            .unwrap()
+            .block_on(control.resolve_matching_async(&expected))
+            .unwrap_or_default();
+        routes.is_empty()
+    });
+}
+
 pub fn open_stream(client: &Client, command: &str) -> c_two::ResponseStream<fastdb::Payload> {
     let core = client
         .begin_stream("echo")
@@ -694,6 +899,17 @@ pub fn open_stream(client: &Client, command: &str) -> c_two::ResponseStream<fast
                 ))
             })
     })
+}
+
+pub fn decode_stream_item(response: c2_core::HeldResponse) -> Result<fastdb::Payload, Error> {
+    c_two::generated::open_owned(&CompiledSpec::compile(SPEC).unwrap(), response.bytes()).map_err(
+        |error| {
+            Error::Semantic(c_two::generated::fastdb_adapter_error(
+                c_two::generated::AdapterFailurePhase::ClientOutputDeserializing,
+                error,
+            ))
+        },
+    )
 }
 
 pub fn stream_value(payload: &fastdb::Payload) -> serde_json::Value {
@@ -718,19 +934,21 @@ fn process_event(value: serde_json::Value) {
 
 struct ProcessProbe {
     identity: serde_json::Value,
-    uid: Mutex<String>,
     gate: Gate,
     opens: AtomicUsize,
     steps: AtomicUsize,
     finishes: AtomicUsize,
     unary: AtomicUsize,
 }
-struct ProcessService(Arc<ProcessProbe>);
+struct ProcessService {
+    probe: Arc<ProcessProbe>,
+    label: String,
+}
 impl EncodedService for ProcessService {
     fn invoke(&self, index: u16, _: Vec<u8>) -> Result<Vec<u8>, C2Error> {
         assert_eq!(index, 0);
-        let calls = self.0.unary.fetch_add(1, Ordering::SeqCst) + 1;
-        process_event(serde_json::json!({"kind":"unary", "calls":calls}));
+        let calls = self.probe.unary.fetch_add(1, Ordering::SeqCst) + 1;
+        process_event(serde_json::json!({"kind":"unary", "calls":calls, "resource":self.label}));
         Ok(Vec::new())
     }
 }
@@ -742,10 +960,13 @@ impl c_two::generated::EncodedStreamService for ProcessService {
     ) -> Result<Box<dyn c_two::generated::EncodedStream>, C2Error> {
         assert_eq!(index, 1);
         let command = decode(&request);
-        let calls = self.0.opens.fetch_add(1, Ordering::SeqCst) + 1;
-        process_event(serde_json::json!({"kind":"open", "calls":calls, "command":command}));
+        let calls = self.probe.opens.fetch_add(1, Ordering::SeqCst) + 1;
+        process_event(
+            serde_json::json!({"kind":"open", "calls":calls, "command":command, "resource":self.label}),
+        );
         Ok(Box::new(ProcessIterator {
-            probe: self.0.clone(),
+            probe: self.probe.clone(),
+            label: self.label.clone(),
             command,
             cursor: 0,
         }))
@@ -753,6 +974,7 @@ impl c_two::generated::EncodedStreamService for ProcessService {
 }
 struct ProcessIterator {
     probe: Arc<ProcessProbe>,
+    label: String,
     command: String,
     cursor: usize,
 }
@@ -778,7 +1000,7 @@ impl c_two::generated::EncodedStream for ProcessIterator {
         Ok(Some(Box::new(ProcessItem(encode(
             &serde_json::json!({
                 "identity":self.probe.identity,
-                "route_uid":*self.probe.uid.lock().unwrap(),
+                "resource":self.label,
                 "index":self.cursor,
             })
             .to_string(),
@@ -824,7 +1046,6 @@ pub fn run_resource_process() {
     let identity = server.ensure_server().unwrap();
     let probe = Arc::new(ProcessProbe {
         identity: serde_json::json!({"server_id":identity.server_id,"server_instance_id":identity.server_instance_id}),
-        uid: Mutex::new(String::new()),
         gate: Gate::default(),
         opens: AtomicUsize::new(0),
         steps: AtomicUsize::new(0),
@@ -832,7 +1053,8 @@ pub fn run_resource_process() {
         unary: AtomicUsize::new(0),
     });
     let release = ContractRelease::from_descriptor_json(STREAM_DESCRIPTOR).unwrap();
-    let registration = host
+    let mut label = unique("process-resource");
+    let mut registration = host
         .register(
             ServiceDefinition::new_stream(
                 &release,
@@ -850,19 +1072,73 @@ pub fn run_resource_process() {
                         access: MethodAccess::Write,
                     },
                 ],
-                Arc::new(ProcessService(probe.clone())),
+                Arc::new(ProcessService {
+                    probe: probe.clone(),
+                    label: label.clone(),
+                }),
             )
             .unwrap(),
         )
         .unwrap();
-    *probe.uid.lock().unwrap() = registration.outcome().route_uid.clone();
     let mut events = drain_events(&connections);
+    // The test process captures its own internal registration evidence through
+    // the existing IPC attestation path. Public relay resolution omits UID.
+    let old_route_uid = c2_core::native_client_executor().unwrap().block_on(async {
+        let mut attestor = c2_ipc::IpcClient::with_endpoint(
+            host.local_endpoint_context()
+                .endpoint(host.local_endpoint().address())
+                .unwrap(),
+            c2_config::ClientIpcConfig::default(),
+        )
+        .unwrap();
+        attestor.connect().await.unwrap();
+        attestor
+            .attest_route_for_registration(&stream_expected("process-route"))
+            .await
+            .unwrap()
+            .route_uid
+    });
     process_event(
-        serde_json::json!({"kind":"ready", "identity":probe.identity, "route_uid":*probe.uid.lock().unwrap(), "address":host.local_endpoint().address(), "credential":host.endpoint_credential().map(|credential| credential.to_json().unwrap())}),
+        serde_json::json!({"kind":"ready", "identity":probe.identity, "resource":label, "address":host.local_endpoint().address(), "credential":host.endpoint_credential().map(|credential| credential.to_json().unwrap()), "route_uid":old_route_uid}),
     );
     for line in std::io::stdin().lock().lines() {
         match line.unwrap().as_str() {
             "release" => probe.gate.release(),
+            "unregister" => {
+                let outcome = registration.close().unwrap();
+                assert!(outcome.local_removed && outcome.close.active_drained);
+                process_event(serde_json::json!({"kind":"unregistered", "resource":label}));
+            }
+            "register" => {
+                label = unique("process-resource");
+                registration = host
+                    .register(
+                        ServiceDefinition::new_stream(
+                            &release,
+                            release.reference(),
+                            "process-route",
+                            [
+                                MethodDefinition {
+                                    index: 0,
+                                    name: "ping".into(),
+                                    access: MethodAccess::Read,
+                                },
+                                MethodDefinition {
+                                    index: 1,
+                                    name: "echo".into(),
+                                    access: MethodAccess::Write,
+                                },
+                            ],
+                            Arc::new(ProcessService {
+                                probe: probe.clone(),
+                                label: label.clone(),
+                            }),
+                        )
+                        .unwrap(),
+                    )
+                    .unwrap();
+                process_event(serde_json::json!({"kind":"registered", "resource":label}));
+            }
             "snapshot" => {
                 events.extend(drain_events(&connections));
                 let opened = events
@@ -930,6 +1206,10 @@ pub struct ResourceProcess {
 }
 impl ResourceProcess {
     pub fn start(fixture: &Fixture, server_id: &str) -> Self {
+        Self::start_with_relay(fixture, server_id, fixture.relay_url())
+    }
+
+    pub fn start_with_relay(fixture: &Fixture, server_id: &str, relay_url: Option<String>) -> Self {
         use std::process::{Command, Stdio};
         let mut child = Command::new(std::env::current_exe().unwrap())
             .args([
@@ -940,10 +1220,7 @@ impl ResourceProcess {
             ])
             .env("C2_PERSISTENT_CHILD_ROOT", &fixture.root)
             .env("C2_PERSISTENT_CHILD_ID", server_id)
-            .env(
-                "C2_PERSISTENT_CHILD_RELAY",
-                fixture.relay_url().unwrap_or_default(),
-            )
+            .env("C2_PERSISTENT_CHILD_RELAY", relay_url.unwrap_or_default())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -958,7 +1235,11 @@ impl ResourceProcess {
                 if let Some(start) = line.find(PROCESS_MARKER) {
                     let event: serde_json::Value =
                         serde_json::from_str(&line[start + PROCESS_MARKER.len()..]).unwrap();
-                    println!("{PROCESS_MARKER}{event}");
+                    let mut observation = event.clone();
+                    if let Some(fields) = observation.as_object_mut() {
+                        fields.remove("route_uid");
+                    }
+                    println!("{PROCESS_MARKER}{observation}");
                     output.lock().unwrap().push(event);
                 }
             }
@@ -993,6 +1274,12 @@ impl ResourceProcess {
         observe_until(|| self.records("snapshot").len() > before);
         self.records("snapshot").pop().unwrap()
     }
+    pub fn command_barrier(&mut self, command: &str, event: &str) -> serde_json::Value {
+        let before = self.records(event).len();
+        self.send(command);
+        observe_until(|| self.records(event).len() > before);
+        self.records(event).pop().unwrap()
+    }
     pub fn connect(&self, fixture: &Fixture) -> Client {
         let expected = stream_expected("process-route");
         let mode = if fixture.path == PathKind::Direct {
@@ -1004,7 +1291,6 @@ impl ResourceProcess {
         };
         let client = fixture.client_runtime.connect(expected, mode).unwrap();
         assert_eq!(client.observed_path(), fixture.path.observed());
-        assert_eq!(client.observed_route().route_uid, self.ready["route_uid"]);
         if let Some(identity) = client.ipc_server_identity() {
             assert_eq!(identity.server_id, self.ready["identity"]["server_id"]);
             assert_eq!(
@@ -1014,14 +1300,14 @@ impl ResourceProcess {
         }
         println!(
             "C2_PERSISTENT_PROCESS_ACQUIRE {}",
-            serde_json::json!({"path":format!("{:?}", client.observed_path()), "identity":self.ready["identity"], "route_uid":self.ready["route_uid"], "physical_connections":fixture.outgoing_ids()})
+            serde_json::json!({"path":format!("{:?}", client.observed_path()), "identity":self.ready["identity"], "resource":self.ready["resource"], "physical_connections":fixture.outgoing_ids()})
         );
         client
     }
     pub fn assert_item(&self, payload: &fastdb::Payload, index: usize) {
         let value = stream_value(payload);
         assert_eq!(value["identity"], self.ready["identity"]);
-        assert_eq!(value["route_uid"], self.ready["route_uid"]);
+        assert_eq!(value["resource"], self.ready["resource"]);
         assert_eq!(value["index"], index);
     }
     pub fn credential(&self) -> Option<c_two::endpoint::EndpointCredential> {
@@ -1104,6 +1390,7 @@ pub fn race_old_owner_evidence(fixture: &Fixture, old: &ResourceProcess) {
         return;
     };
     let context = fixture.server.local_endpoint_context().unwrap();
+    let old_relay_uid = old.ready["route_uid"].as_str().unwrap().to_owned();
     let old = &old.ready;
     let barrier = Arc::new(std::sync::Barrier::new(3));
     std::thread::scope(|scope| {
@@ -1149,7 +1436,7 @@ pub fn race_old_owner_evidence(fixture: &Fixture, old: &ResourceProcess) {
                     .as_str()
                     .unwrap()
                     .into(),
-                route_uid: old["route_uid"].as_str().unwrap().into(),
+                route_uid: old_relay_uid,
             };
             withdrawal_gate.wait();
             control.unregister_registration(&retired).unwrap();

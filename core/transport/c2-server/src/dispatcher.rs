@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use c2_mem::{MemHandle, MemPool, PeerMappingCache, PeerRead};
@@ -508,14 +508,14 @@ impl CrmRoute {
 /// Route dispatcher — resolves (route_name, method_idx) to CrmRoute.
 pub(crate) struct Dispatcher {
     routes: HashMap<String, Arc<CrmRoute>>,
-    removed: HashMap<String, String>,
+    removed: HashSet<String>,
 }
 
 impl Dispatcher {
     pub fn new() -> Self {
         Self {
             routes: HashMap::new(),
-            removed: HashMap::new(),
+            removed: HashSet::new(),
         }
     }
 
@@ -529,14 +529,13 @@ impl Dispatcher {
     /// Remove a CRM route. Returns the removed route if it existed.
     pub fn unregister(&mut self, name: &str) -> Option<Arc<CrmRoute>> {
         let route = self.routes.remove(name)?;
-        self.removed
-            .insert(name.to_owned(), route.route_uid.clone());
+        self.removed.insert(name.to_owned());
         Some(route)
     }
 
-    /// Identity of the latest removed registration for a route name.
-    pub(crate) fn removed_uid(&self, name: &str) -> Option<String> {
-        self.removed.get(name).cloned()
+    /// Whether the name was removed and has no current registration.
+    pub(crate) fn was_removed(&self, name: &str) -> bool {
+        self.removed.contains(name)
     }
 
     /// Resolve a route by explicit name.
@@ -553,8 +552,7 @@ impl Dispatcher {
     pub fn take_all(&mut self) -> Vec<Arc<CrmRoute>> {
         let routes: Vec<_> = self.routes.drain().map(|(_, route)| route).collect();
         for route in &routes {
-            self.removed
-                .insert(route.name.clone(), route.route_uid.clone());
+            self.removed.insert(route.name.clone());
         }
         routes
     }
@@ -858,18 +856,18 @@ mod tests {
 
         assert!(d.unregister("grid").is_some());
         assert!(d.resolve("grid").is_none());
-        assert_eq!(d.removed_uid("grid"), Some("grid-uid-0001".into()));
+        assert!(d.was_removed("grid"));
         assert!(d.is_empty());
     }
 
     #[test]
-    fn registering_again_clears_removed_identity() {
+    fn registering_again_clears_removed_name() {
         let mut d = Dispatcher::new();
         d.register(make_route("grid"));
         d.unregister("grid");
-        assert!(d.removed_uid("grid").is_some());
+        assert!(d.was_removed("grid"));
         d.register(make_route("grid"));
-        assert!(d.removed_uid("grid").is_none());
+        assert!(!d.was_removed("grid"));
     }
 
     #[test]

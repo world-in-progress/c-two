@@ -38,7 +38,7 @@ CONCURRENCY = 32
 PAYLOAD_FILE = '/tmp/c2_bench_payload.bin'
 
 
-def _route_hey_args(expected: CRMContract, route_uid: str) -> list[str]:
+def _route_hey_args(expected: CRMContract) -> list[str]:
     return [
         '-H',
         f'x-c2-expected-crm-ns: {expected.crm_ns}',
@@ -50,8 +50,6 @@ def _route_hey_args(expected: CRMContract, route_uid: str) -> list[str]:
         f'x-c2-expected-abi-hash: {expected.abi_hash}',
         '-H',
         f'x-c2-expected-signature-hash: {expected.signature_hash}',
-        '-H',
-        f'x-c2-route-uid: {route_uid}',
     ]
 
 
@@ -98,10 +96,9 @@ def main():
                 f.write(pickle.dumps('Benchmark'))
             try:
                 cc.register(Hello, HelloImpl(), name=route_name)
-                with cc.connect(Hello, name=route_name, address=relay_url) as hello:
-                    expected_header_args = _route_hey_args(
-                        crm_contract(Hello), hello.client.route_uid,
-                    )
+                with cc.connect(Hello, name=route_name, address=relay_url):
+                    expected = crm_contract(Hello)
+                    expected_header_args = _route_hey_args(expected)
 
                 # Warmup with hey
                 _run_hey(

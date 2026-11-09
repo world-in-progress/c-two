@@ -45,6 +45,7 @@ macro_rules! define_error_codes {
     };
 }
 
+// Permanently retired: 704 RouteStale, 706 WriteConflict, 711 RouteCatalogCompacted. Never reassign.
 define_error_codes! {
     Unknown = 0,
     ResourceInputDeserializing = 1,
@@ -58,14 +59,11 @@ define_error_codes! {
     ResourceNotFound = 701,
     ResourceUnavailable = 702,
     ResourceAlreadyRegistered = 703,
-    RouteStale = 704,
     RegistryUnavailable = 705,
-    WriteConflict = 706,
     ResourceClosed = 707,
     ResourceRemoved = 708,
     ContractMismatch = 709,
     IdentityMismatch = 710,
-    RouteCatalogCompacted = 711,
     RouteWatchUnavailable = 712,
     ProtocolViolation = 713,
     FallbackDenied = 714,
@@ -73,6 +71,7 @@ define_error_codes! {
     UnsupportedCallMode = 716,
     CallCapacityExceeded = 717,
     CallCancelled = 718,
+    RouteConflict = 719,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -247,10 +246,26 @@ mod tests {
     use std::collections::BTreeMap;
 
     #[test]
+    fn retired_error_codes_are_never_reassigned() {
+        for code in [704, 706, 711] {
+            assert!(ErrorCode::try_from(code).is_err());
+            assert!(
+                ErrorCode::registry()
+                    .iter()
+                    .all(|entry| u16::from(entry.code) != code)
+            );
+        }
+        assert_eq!(
+            ErrorCode::try_from(712),
+            Ok(ErrorCode::RouteWatchUnavailable)
+        );
+    }
+
+    #[test]
     fn error_code_registry_matches_canonical_wire_values() {
         use ErrorCode::*;
 
-        let expected: [(ErrorCode, u16, &str); 27] = [
+        let expected: [(ErrorCode, u16, &str); 25] = [
             (Unknown, 0, "Unknown"),
             (ResourceInputDeserializing, 1, "ResourceInputDeserializing"),
             (ResourceOutputSerializing, 2, "ResourceOutputSerializing"),
@@ -263,14 +278,11 @@ mod tests {
             (ResourceNotFound, 701, "ResourceNotFound"),
             (ResourceUnavailable, 702, "ResourceUnavailable"),
             (ResourceAlreadyRegistered, 703, "ResourceAlreadyRegistered"),
-            (RouteStale, 704, "RouteStale"),
             (RegistryUnavailable, 705, "RegistryUnavailable"),
-            (WriteConflict, 706, "WriteConflict"),
             (ResourceClosed, 707, "ResourceClosed"),
             (ResourceRemoved, 708, "ResourceRemoved"),
             (ContractMismatch, 709, "ContractMismatch"),
             (IdentityMismatch, 710, "IdentityMismatch"),
-            (RouteCatalogCompacted, 711, "RouteCatalogCompacted"),
             (RouteWatchUnavailable, 712, "RouteWatchUnavailable"),
             (ProtocolViolation, 713, "ProtocolViolation"),
             (FallbackDenied, 714, "FallbackDenied"),
@@ -278,6 +290,7 @@ mod tests {
             (UnsupportedCallMode, 716, "UnsupportedCallMode"),
             (CallCapacityExceeded, 717, "CallCapacityExceeded"),
             (CallCancelled, 718, "CallCancelled"),
+            (RouteConflict, 719, "RouteConflict"),
         ];
         let registry = ErrorCode::registry();
         assert_eq!(registry.len(), expected.len());
@@ -288,7 +301,7 @@ mod tests {
             assert_eq!(variant.name(), name);
             assert_eq!(ErrorCode::try_from(value), Ok(variant));
         }
-        for value in [9, 700, 719, 9999, u16::MAX] {
+        for value in [9, 700, 9999, u16::MAX] {
             assert_eq!(ErrorCode::try_from(value), Err(()));
         }
     }
@@ -317,6 +330,24 @@ mod tests {
             .unwrap();
         assert_eq!(decoded, error);
         assert_eq!(decoded.code as u16, 718);
+    }
+
+    #[test]
+    fn route_conflict_round_trips_with_canonical_code_and_registrations() {
+        let registrations = r#"[{"relay_id":"a","relay_url":"http://relay","registered_at":1,"relay_status":"Alive"}]"#;
+        let error = C2Error::new(ErrorCode::RouteConflict, "duplicate online route").with_details(
+            BTreeMap::from([
+                ("route".into(), "grid".into()),
+                ("dispatch_phase".into(), "pre_dispatch".into()),
+                ("registrations".into(), registrations.into()),
+            ]),
+        );
+        let decoded = C2Error::from_wire_bytes(&error.to_wire_bytes())
+            .unwrap()
+            .unwrap();
+        assert_eq!(decoded, error);
+        assert_eq!(decoded.code as u16, 719);
+        assert_eq!(decoded.code.name(), "RouteConflict");
     }
 
     #[test]

@@ -2,8 +2,9 @@
 use super::*;
 use c2_contract::ExpectedRouteContract;
 use c2_core::{
-    CallOptions, CallScope, CallState, CallTimeout, Client, CoreResponseStream, Error,
-    HeldResponse, LifecycleError, PreparedCall, Runtime, RuntimeOptions, TransportPhase,
+    CallDispatchTarget, CallOptions, CallRecordOutcome, CallScope, CallState, CallTimeout, Client,
+    CoreResponseStream, Error, HeldResponse, LifecycleError, ObservedPath, PreparedCall, Runtime,
+    RuntimeOptions, TransportPhase,
 };
 use c2_error::{C2Error, ErrorCode};
 use c2_ipc::IpcStreamCancellation;
@@ -35,8 +36,14 @@ struct Endpoint {
 }
 #[derive(Default)]
 struct Bindings {
-    server: Option<(String, String)>,
-    clients: HashMap<String, Client>,
+    clients: HashMap<String, BoundClient>,
+}
+#[derive(Clone)]
+struct BoundClient {
+    client: Client,
+    server_id: String,
+    server_instance_id: String,
+    observation: c2_core::ConnectionObservation,
 }
 pub struct C2MemFfiCall(Arc<Call>);
 struct Call {
@@ -56,6 +63,7 @@ struct CallData {
     ready: bool,
     stream: Option<Arc<CoreResponseStream>>,
     unary: Option<HeldResponse>,
+    dispatch_target: Option<CallDispatchTarget>,
     error: Option<Value>,
     consumer_done: bool,
 }
@@ -301,7 +309,6 @@ impl Endpoint {
         &self,
         route: String,
         contract: Value,
-        expected_route_token: Option<Value>,
         attempt: c2_core::ConnectAttempt,
     ) -> Result<Value, Error> {
         if self.closed.load(Ordering::Acquire) {
@@ -319,12 +326,24 @@ impl Endpoint {
             abi_hash: field(&contract, "abiHash")?,
             signature_hash: field(&contract, "signatureHash")?,
         };
+        let supplied = self
+            .options
+            .get("expectedServerIdentity")
+            .map(|value| {
+                Ok::<_, Error>(c2_core::ServerIdentity {
+                    server_id: field(value, "serverId")?,
+                    server_instance_id: field(value, "serverInstanceId")?,
+                })
+            })
+            .transpose()?;
         let connection = {
             let mut connection = self.connection.lock();
             if connection.is_none() {
-                *connection = Some(Arc::new(
-                    runtime.native_endpoint_context(&self.address, &attempt)?,
-                ));
+                *connection = Some(Arc::new(runtime.native_endpoint_context(
+                    &self.address,
+                    supplied,
+                    &attempt,
+                )?));
             }
             connection.as_ref().unwrap().clone()
         };
@@ -339,52 +358,8 @@ impl Endpoint {
         let identity = client
             .ipc_server_identity()
             .ok_or_else(|| invalid("IPC handshake identity missing"))?;
-        let pair = (
-            identity.server_id.clone(),
-            identity.server_instance_id.clone(),
-        );
-        let uid = client.observed_route().route_uid.clone();
         let observation = client.connection_observation()?;
         let mut bindings = self.bindings.lock();
-        let supplied = self
-            .options
-            .get("expectedServerIdentity")
-            .map(|v| Ok::<_, Error>((field(v, "serverId")?, field(v, "serverInstanceId")?)))
-            .transpose()?;
-        if supplied
-            .as_ref()
-            .or(bindings.server.as_ref())
-            .is_some_and(|expected| expected != &pair)
-        {
-            return Err(refused(
-                ErrorCode::IdentityMismatch,
-                "IPC server identity mismatch",
-            ));
-        }
-        let expected_uid = expected_route_token
-            .as_ref()
-            .map(|token| field(token, "routeUid"))
-            .transpose()?;
-        if expected_uid
-            .as_deref()
-            .is_some_and(|expected| expected != uid)
-        {
-            return Err(refused(ErrorCode::RouteStale, "IPC route token mismatch"));
-        }
-        if bindings
-            .clients
-            .get(&route)
-            .is_some_and(|client| client.observed_route().route_uid != uid)
-        {
-            return Err(
-                C2Error::new(ErrorCode::RouteStale, "IPC route binding changed")
-                    .with_details(std::collections::BTreeMap::from([
-                        ("transport_phase".into(), "pre_dispatch".into()),
-                        ("stage".into(), "route_binding".into()),
-                    ]))
-                    .into(),
-            );
-        }
         if self.closed.load(Ordering::Acquire) {
             connection.deactivate();
             return Err(refused(
@@ -393,17 +368,24 @@ impl Endpoint {
             ));
         }
         if let Some(old) = bindings.clients.get(&route) {
-            if old.expected_route() != client.expected_route() {
+            if old.client.expected_route() != client.expected_route() {
                 return Err(refused(
                     ErrorCode::ContractMismatch,
                     "route contract changed",
                 ));
             }
         }
-        bindings.server.get_or_insert(pair);
-        bindings.clients.insert(route, client);
+        bindings.clients.insert(
+            route,
+            BoundClient {
+                client,
+                server_id: identity.server_id.clone(),
+                server_instance_id: identity.server_instance_id.clone(),
+                observation: observation.clone(),
+            },
+        );
         Ok(
-            json!({"serverId":identity.server_id,"serverInstanceId":identity.server_instance_id,"routeUid":uid,"connectionId":observation.connection_id().to_string()}),
+            json!({"serverId":identity.server_id,"serverInstanceId":identity.server_instance_id,"connectionId":observation.connection_id().to_string()}),
         )
     }
     async fn close(&self) -> Result<(), Error> {
@@ -642,7 +624,7 @@ pub unsafe extern "C" fn c2_mem_ffi_endpoint_context_prepare(
     endpoint: *const C2MemFfiEndpointContext,
     route: *const c_char,
     contract: *const c_char,
-    expected_route_token: *const c_char,
+    timeout_millis: *const u64,
     complete: C2MemFfiComplete,
     user: *mut std::ffi::c_void,
 ) -> C2MemFfiStatus {
@@ -652,33 +634,25 @@ pub unsafe extern "C" fn c2_mem_ffi_endpoint_context_prepare(
     let endpoint = unsafe { &*endpoint }.0.clone();
     let args = text(route).and_then(|route| {
         let contract = parse(contract)?;
-        let expected_route_token = if expected_route_token.is_null() {
+        let mut options = c2_core::ConnectOptions::new();
+        let configured = unsigned_option(&endpoint.options, "connectTimeoutMs")?;
+        let per_call = if timeout_millis.is_null() {
             None
         } else {
-            Some(parse(expected_route_token)?)
+            Some(unsafe { *timeout_millis })
         };
-        let mut options = c2_core::ConnectOptions::new();
-        if let Some(value) = endpoint.options.get("connectTimeoutMs") {
-            options = options.with_timeout(Duration::from_millis(
-                value
-                    .as_u64()
-                    .ok_or_else(|| invalid("invalid connectTimeoutMs"))?,
-            ));
+        if let Some(millis) = configured.into_iter().chain(per_call).min() {
+            options = options.with_timeout(Duration::from_millis(millis));
         }
-        Ok((
-            route,
-            contract,
-            expected_route_token,
-            c2_core::ConnectAttempt::start(options)?,
-        ))
+        Ok((route, contract, c2_core::ConnectAttempt::start(options)?))
     });
     endpoint.preparing.fetch_add(1, Ordering::AcqRel);
     let preparing = Preparing(endpoint.clone());
     launch(complete, user, async move {
-        let (route, contract, expected_route_token, attempt) = args?;
+        let (route, contract, attempt) = args?;
         tokio::task::spawn_blocking(move || {
             let _preparing = preparing;
-            match endpoint.prepare(route, contract, expected_route_token, attempt) {
+            match endpoint.prepare(route, contract, attempt) {
                 Ok(value) => Ok(Output::Json(value)),
                 Err(error) => {
                     let mut value = error_value(&error);
@@ -689,6 +663,45 @@ pub unsafe extern "C" fn c2_mem_ffi_endpoint_context_prepare(
         })
         .await
         .map_err(|e| invalid(e.to_string()))?
+    })
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn c2_mem_ffi_endpoint_context_connection_snapshot(
+    endpoint: *const C2MemFfiEndpointContext,
+    route: *const c_char,
+    out: *mut *mut C2MemFfiResult,
+) -> C2MemFfiStatus {
+    guard_status(|| {
+        if endpoint.is_null() || out.is_null() || route.is_null() {
+            return Err(C2MemFfiStatus::NullPointer);
+        }
+        unsafe {
+            *out = ptr::null_mut();
+        }
+        let route = text(route).map_err(|_| C2MemFfiStatus::InvalidArgument)?;
+        let binding = unsafe { &*endpoint }
+            .0
+            .bindings
+            .lock()
+            .clients
+            .get(&route)
+            .cloned();
+        let output = binding.map(|bound| {
+            let end = bound
+                .observation
+                .snapshot()
+                .map(|closed| closed.reason().as_str());
+            Output::Json(json!({
+                "connectionId": bound.observation.connection_id().to_string(),
+                "serverId": bound.server_id,
+                "serverInstanceId": bound.server_instance_id,
+                "endReason": end,
+            }))
+        });
+        unsafe {
+            *out = result(Ok(output.unwrap_or(Output::Empty)));
+        }
+        Ok(())
     })
 }
 #[unsafe(no_mangle)]
@@ -760,7 +773,8 @@ pub unsafe extern "C" fn c2_mem_ffi_call_begin(
                 .clients
                 .get(&route)
                 .cloned()
-                .ok_or_else(|| invalid("route must be prepared before call_begin"))?;
+                .ok_or_else(|| invalid("route must be prepared before call_begin"))?
+                .client;
             let client = client.with_call_options(CallOptions::with_timeout(
                 timeout(limit).map_or(CallTimeout::Unlimited, CallTimeout::After),
             ));
@@ -779,6 +793,7 @@ pub unsafe extern "C" fn c2_mem_ffi_call_begin(
                     ready: false,
                     stream: None,
                     unary: None,
+                    dispatch_target: None,
                     error: None,
                     consumer_done: false,
                 }),
@@ -903,24 +918,40 @@ pub unsafe extern "C" fn c2_mem_ffi_call_dispatch(
         // expires. No task or input is aborted and expiry never sends CANCEL.
         tokio::spawn(async move {
             let outcome = AssertUnwindSafe(async {
-                let encoded = prepared.encode_vec(bytes)?;
+                let encoded = match prepared.encode_vec(bytes) {
+                    Ok(encoded) => encoded,
+                    Err(error) => {
+                        return CallRecordOutcome {
+                            result: Err(error),
+                            dispatch_target: None,
+                        };
+                    }
+                };
                 if original.stream_mode {
-                    encoded
+                    let record = encoded
                         .stream_record_async(original.cancellation.clone())
-                        .await
-                        .map(|s| (Some(Arc::new(s)), None))
+                        .await;
+                    CallRecordOutcome {
+                        result: record.result.map(|s| (Some(Arc::new(s)), None)),
+                        dispatch_target: record.dispatch_target,
+                    }
                 } else {
-                    encoded
-                        .call_held_record_async()
-                        .await
-                        .map(|b| (None, Some(b)))
+                    let record = encoded.call_held_record_async().await;
+                    CallRecordOutcome {
+                        result: record.result.map(|b| (None, Some(b))),
+                        dispatch_target: record.dispatch_target,
+                    }
                 }
             })
             .catch_unwind()
             .await
-            .unwrap_or_else(|_| Err(invalid("native dispatch panicked")));
+            .unwrap_or_else(|_| CallRecordOutcome {
+                result: Err(invalid("native dispatch panicked")),
+                dispatch_target: None,
+            });
             let mut state = original.state.lock();
-            match outcome {
+            state.dispatch_target = outcome.dispatch_target;
+            match outcome.result {
                 Ok((stream, unary)) => {
                     state.stream = stream;
                     state.unary = unary;
@@ -934,7 +965,29 @@ pub unsafe extern "C" fn c2_mem_ffi_call_dispatch(
         });
         call.ready_for_caller().await?;
         let state = call.state.lock();
-        Ok(state.error.clone().map_or(Output::Empty, Output::Error))
+        if let Some(error) = &state.error {
+            return Ok(Output::Error(error.clone()));
+        }
+        let target = state
+            .dispatch_target
+            .as_ref()
+            .ok_or_else(|| invalid("dispatch target missing"))?;
+        let ipc = target
+            .ipc
+            .as_ref()
+            .ok_or_else(|| invalid("IPC dispatch target missing"))?;
+        let path = match target.path {
+            ObservedPath::DirectIpc => "DirectIpc",
+            ObservedPath::ExplicitRelay => "ExplicitRelay",
+            ObservedPath::RelayAwareLocalIpc => "RelayAwareLocalIpc",
+            ObservedPath::RelayAwareRelay => "RelayAwareHttp",
+        };
+        Ok(Output::Json(json!({
+            "path": path,
+            "serverId": ipc.server_identity.server_id,
+            "serverInstanceId": ipc.server_identity.server_instance_id,
+            "connectionId": ipc.connection_id.to_string(),
+        })))
     })
 }
 #[unsafe(no_mangle)]

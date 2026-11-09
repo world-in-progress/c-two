@@ -1,6 +1,6 @@
 # 流式 RPC 第二、三阶段验收记录
 
-日期：2026-11-08。基线：上游 main `d772ca3a`。依据：[流式 RPC 设计](../design/2026-11-03-streaming-rpc-design.md)第九、十节与 [ADR 0003](../decisions/0003-server-streams.md)。第二阶段是块 5 至 8，IPC 16 与 C/FFI ABI 8 同批切换，SHM 4、relay mesh 7 与契约 v2 不变；第三阶段是块 9 的交叉验收。第一阶段见[第一阶段验收记录](2026-11-04-streaming-phase-1-acceptance.md)。代码与文档在 fork 的分支 `socu/streaming` 上，尚未合入上游 main。CI 各线的工具链与二进制 SHA-256、配对基准各平台的收据摘要与逐次样本见[证据摘要](evidence/2026-11-08-streaming-acceptance.json)。
+日期：2026-11-08。基线：上游 main `d772ca3a`。依据：[流式 RPC 设计](../design/2026-11-03-streaming-rpc-design.md)第九、十节与 [ADR 0003](../decisions/0003-server-streams.md)。第二阶段是块 5 至 8，IPC 16 与 C/FFI ABI 8 同批切换，SHM 4、relay mesh 7 与契约 v2 不变；第三阶段是块 9 的交叉验收。第一阶段见[第一阶段验收记录](2026-11-04-streaming-phase-1-acceptance.md)。代码与文档在 fork 的分支 `socu/streaming` 上验收，2026-11-08 经 [world-in-progress/c-two#219](https://github.com/world-in-progress/c-two/pull/219) 合入上游 main，见“合入上游 main”一节。CI 各线的工具链与二进制 SHA-256、配对基准各平台的收据摘要与逐次样本见[证据摘要](evidence/2026-11-08-streaming-acceptance.json)。
 
 ## 确切候选与 CI
 
@@ -70,6 +70,10 @@
 
 块 9b 的门禁还测出 D5：relay-aware 客户端经 HTTP 的旧代理，在路由换成新实例之后可能一次 `RouteStale` 也收不到就进了新实例，它报出的 route UID 仍是旧的。维护者 2026-11-06 决定不单独修，改为重新定路由的身份（[ADR 0004](../decisions/0004-route-name-identity.md)），流式批次把 D5 记为已知问题。
 
+## 合入上游 main
+
+确切候选之后，`fe94478f` 与 `6a6c5344` 只改文档。开 PR 之前，上游 main 合入了 #218，只把 `core/Cargo.lock` 里的 rustix 从 1.1.5 升到 1.1.6。main 的保护规则要求分支与 main 同步，PR 的 CI 测的又是 head 提交而不是合并结果，所以先把上游 main `0e3d2ffd` 用普通合并并进分支，得到 `098e3b53`，没有冲突。[world-in-progress/c-two#219](https://github.com/world-in-progress/c-two/pull/219) 在 `098e3b53` 上的 [Source Validation 42435098894](https://github.com/world-in-progress/c-two/actions/runs/42435098894) 第一次尝试全部通过，源码各线的范围与确切候选那次运行相同。2026-11-08 以普通合并提交 `a5ab5eaa` 合入，它的树与 `098e3b53` 相同；main 上这次推送的 [Source Validation 42449036052](https://github.com/world-in-progress/c-two/actions/runs/42449036052) 凭同一棵树已通过的 PR 运行跳过了源码各线。rustix 的升级没有再跑配对基准。
+
 ## 留给后续的
 
 - 路由身份（ADR 0004，待办“接下来”第 1 项）解决 D5，要在任何包含 IPC 16 的版本发布之前完成，并加回 9b8b 为等那处修复而去掉的 relay-local 首次 acquire 用例。
@@ -77,4 +81,3 @@
 - `sdk/python/native/src/runtime_session_ffi.rs` 里还有两类持锁碰 Python 的写法，与 9c3 修好的死锁属同一类，只做了静态核对（待办第 3 项）。
 - 配对基准的收据只给 p99 的比值，第十二节第 7 条的门槛用 p95；`run_matrix` 曾在 Windows 上把一次正常结束的行报成超过等待时限（待办第 7 项的顺带项）。
 - 经 relay 的流的提前量，以及 Host 关闭返回时空闲连接可能还没关完，仍待维护者决定（待办“待维护者决定”）。
-- 分支 `socu/streaming` 尚未合入上游 main；开 PR 等维护者发话。

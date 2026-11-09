@@ -131,7 +131,6 @@ pub fn run(args: RelayArgs) -> Result<()> {
     let resolved =
         ConfigResolver::resolve_relay_server(overrides, sources).map_err(|e| anyhow!("{e}"))?;
     let config = resolved.relay;
-    let display_bind = config.bind.clone();
 
     if args.dry_run {
         let limits = ConfigResolver::resolve_call_execution_limits(
@@ -195,7 +194,10 @@ pub fn run(args: RelayArgs) -> Result<()> {
             .map_err(|e| anyhow!("failed to register upstream {name:?}: {e}"))?;
     }
 
-    println!("C-Two relay listening at {}", display_url(&display_bind));
+    println!(
+        "C-Two relay listening at {}",
+        display_url(&relay.local_addr().to_string())
+    );
     println!("Press Ctrl+C to stop.");
 
     let (tx, rx) = std::sync::mpsc::channel();

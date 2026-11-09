@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use c2_contract::{ExpectedRouteContract, MAX_WIRE_TEXT_BYTES};
@@ -8,7 +8,7 @@ use crate::relay::types::*;
 /// Route table — owns all route entries and peer info.
 ///
 /// Primary key for routes: (name, relay_id).
-/// Resolve returns LOCAL first, then PEER sorted by (registered_at, relay_id).
+/// New acquisitions require exactly one live registration of the route name.
 pub struct RouteTable {
     /// Routes keyed by (name, relay_id) for O(1) upsert/delete.
     routes: HashMap<(String, String), RouteEntry>,
@@ -25,6 +25,19 @@ pub struct RouteTable {
     /// process-local monotonicity while still outranking stale pre-restart
     /// logical counters seen through anti-entropy.
     next_timestamp: f64,
+    /// Before-images for names changed by the current write transaction only.
+    /// Drained before unlocking; never used by lookup or retained across writes.
+    conflict_changes: Option<BTreeMap<String, Vec<RouteRegistrationInfo>>>,
+    #[cfg(test)]
+    conflict_comparisons: parking_lot::Mutex<Vec<String>>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ForceLeaveError {
+    InvalidRelayId(String),
+    SelfRelay,
+    Alive,
+    Unknown,
 }
 
 #[derive(Debug, Clone)]
@@ -57,6 +70,9 @@ impl RouteTable {
             peers: HashMap::new(),
             relay_id,
             next_timestamp: current_epoch_millis().saturating_sub(1) as f64,
+            conflict_changes: None,
+            #[cfg(test)]
+            conflict_comparisons: parking_lot::Mutex::new(Vec::new()),
         }
     }
 
@@ -72,7 +88,6 @@ impl RouteTable {
             || c2_contract::validate_contract_hash("abi_hash", &entry.abi_hash).is_err()
             || c2_contract::validate_contract_hash("signature_hash", &entry.signature_hash).is_err()
             || entry.max_payload_size == 0
-            || c2_contract::validate_call_route_key("route_uid", &entry.route_uid).is_err()
             || !entry.registered_at.is_finite()
         {
             return false;
@@ -81,6 +96,9 @@ impl RouteTable {
         match entry.locality {
             Locality::Local => {
                 entry.relay_id == self.relay_id
+                    && entry.route_uid.as_deref().is_some_and(|uid| {
+                        c2_contract::validate_call_route_key("route_uid", uid).is_ok()
+                    })
                     && entry.server_id.as_deref().is_some_and(valid_server_id)
                     && entry
                         .server_instance_id
@@ -90,6 +108,7 @@ impl RouteTable {
             }
             Locality::Peer => {
                 entry.relay_id != self.relay_id
+                    && entry.route_uid.is_none()
                     && entry.server_id.is_none()
                     && entry.server_instance_id.is_none()
                     && entry.ipc_address.is_none()
@@ -125,6 +144,9 @@ impl RouteTable {
             "prevalidated route became invalid before commit"
         );
         let key = (entry.name.clone(), entry.relay_id.clone());
+        if !self.routes.contains_key(&key) {
+            self.note_conflict_changes([entry.name.clone()]);
+        }
         self.tombstones.remove(&key);
         self.withdrawn_registrations.remove(&key);
         self.routes.insert(key, entry);
@@ -296,6 +318,9 @@ impl RouteTable {
             }
         }
         tombstone.observed_at = Instant::now();
+        if self.routes.contains_key(&key) {
+            self.note_conflict_changes([tombstone.name.clone()]);
+        }
         self.routes.remove(&key);
         self.tombstones.insert(key, tombstone);
         true
@@ -313,44 +338,177 @@ impl RouteTable {
             .any(|entry| UpstreamEndpointKey::from_route(entry).as_ref() == Some(key))
     }
 
-    /// Resolve matching routes: LOCAL first, then live PEER routes ordered by time and ID.
-    pub fn resolve_matching(&self, expected: &ExpectedRouteContract) -> Vec<RouteInfo> {
-        if c2_contract::validate_expected_route_contract(expected).is_err() {
-            return Vec::new();
+    /// Resolve only a unique live registration; timestamps never choose a winner.
+    pub fn resolve_matching(
+        &self,
+        expected: &ExpectedRouteContract,
+    ) -> Result<Option<RouteInfo>, RouteResolutionError> {
+        let named: Vec<_> = self
+            .routes
+            .values()
+            .filter(|entry| entry.name == expected.route_name)
+            .collect();
+        let live: Vec<_> = named
+            .iter()
+            .copied()
+            .filter(|entry| self.route_is_live(entry))
+            .collect();
+        if live.len() > 1 {
+            return Err(RouteResolutionError::Conflict(
+                self.registration_infos(live),
+            ));
         }
-        let name = expected.route_name.as_str();
-        let mut local = Vec::new();
-        let mut peers = Vec::new();
+        let Some(entry) = live.first() else {
+            return if named.is_empty() {
+                Ok(None)
+            } else {
+                Err(RouteResolutionError::Unavailable(
+                    self.registration_infos(named),
+                ))
+            };
+        };
+        Ok((entry.crm_ns == expected.crm_ns
+            && entry.crm_name == expected.crm_name
+            && entry.crm_ver == expected.crm_ver
+            && entry.abi_hash == expected.abi_hash
+            && entry.signature_hash == expected.signature_hash)
+            .then(|| entry.to_route_info()))
+    }
 
-        for ((n, _), entry) in &self.routes {
-            if n != name {
-                continue;
-            }
-            if entry.crm_ns != expected.crm_ns
-                || entry.crm_name != expected.crm_name
-                || entry.crm_ver != expected.crm_ver
-                || entry.abi_hash != expected.abi_hash
-                || entry.signature_hash != expected.signature_hash
-            {
-                continue;
-            }
-            match entry.locality {
-                Locality::Local => local.push(entry.to_route_info()),
-                Locality::Peer if self.peer_is_alive(&entry.relay_id) => peers.push(entry),
-                Locality::Peer => {}
-            }
+    fn route_is_live(&self, entry: &RouteEntry) -> bool {
+        entry.locality == Locality::Local || self.peer_is_alive(&entry.relay_id)
+    }
+
+    pub(crate) fn registration_info(&self, entry: &RouteEntry) -> RouteRegistrationInfo {
+        RouteRegistrationInfo {
+            relay_id: entry.relay_id.clone(),
+            relay_url: entry.relay_url.clone(),
+            registered_at: entry.registered_at,
+            relay_status: if entry.locality == Locality::Local {
+                PeerStatus::Alive
+            } else {
+                self.peers
+                    .get(&entry.relay_id)
+                    .expect("peer registration has a known relay")
+                    .status
+            },
         }
+    }
 
-        peers.sort_by(|a, b| {
-            a.registered_at
-                .partial_cmp(&b.registered_at)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.relay_id.cmp(&b.relay_id))
-        });
+    fn registration_infos(&self, entries: Vec<&RouteEntry>) -> Vec<RouteRegistrationInfo> {
+        let mut infos: Vec<_> = entries
+            .into_iter()
+            .map(|entry| self.registration_info(entry))
+            .collect();
+        infos.sort_by(|a, b| a.relay_id.cmp(&b.relay_id));
+        infos
+    }
 
-        let mut result = local;
-        result.extend(peers.into_iter().map(|e| e.to_route_info()));
-        result
+    pub(crate) fn name_holders(&self, name: &str) -> Vec<RouteRegistrationInfo> {
+        self.registration_infos(
+            self.routes
+                .values()
+                .filter(|entry| entry.name == name)
+                .collect(),
+        )
+    }
+
+    pub(crate) fn peer_name_holders(&self, name: &str) -> Vec<RouteRegistrationInfo> {
+        self.registration_infos(
+            self.routes
+                .values()
+                .filter(|entry| entry.name == name && entry.locality == Locality::Peer)
+                .collect(),
+        )
+    }
+
+    pub(crate) fn conflicts(&self) -> BTreeMap<String, Vec<RouteRegistrationInfo>> {
+        self.conflicts_for_names(None)
+    }
+
+    fn conflicts_for_names(
+        &self,
+        affected: Option<&BTreeSet<String>>,
+    ) -> BTreeMap<String, Vec<RouteRegistrationInfo>> {
+        #[cfg(test)]
+        self.conflict_comparisons
+            .lock()
+            .extend(affected.map_or_else(
+                || self.route_names(),
+                |names| names.iter().cloned().collect(),
+            ));
+        let mut names: BTreeMap<String, Vec<&RouteEntry>> = BTreeMap::new();
+        for entry in self.routes.values().filter(|entry| {
+            affected.is_none_or(|names| names.contains(&entry.name)) && self.route_is_live(entry)
+        }) {
+            names.entry(entry.name.clone()).or_default().push(entry);
+        }
+        names
+            .into_iter()
+            .filter(|(_, entries)| entries.len() > 1)
+            .map(|(name, entries)| (name, self.registration_infos(entries)))
+            .collect()
+    }
+
+    pub(crate) fn begin_conflict_changes(&mut self) {
+        assert!(self.conflict_changes.is_none());
+        self.conflict_changes = Some(BTreeMap::new());
+    }
+
+    fn note_conflict_changes(&mut self, names: impl IntoIterator<Item = String>) {
+        let Some(changes) = &self.conflict_changes else {
+            return;
+        };
+        let names: BTreeSet<_> = names
+            .into_iter()
+            .filter(|name| !changes.contains_key(name))
+            .collect();
+        if names.is_empty() {
+            return;
+        }
+        let mut before = self.conflicts_for_names(Some(&names));
+        self.conflict_changes
+            .as_mut()
+            .unwrap()
+            .extend(names.into_iter().map(|name| {
+                let registrations = before.remove(&name).unwrap_or_default();
+                (name, registrations)
+            }));
+    }
+
+    pub(crate) fn finish_conflict_changes(
+        &mut self,
+    ) -> (
+        BTreeMap<String, Vec<RouteRegistrationInfo>>,
+        BTreeMap<String, Vec<RouteRegistrationInfo>>,
+    ) {
+        let before = self
+            .conflict_changes
+            .take()
+            .expect("write transaction tracks changes");
+        if before.is_empty() {
+            return (before, BTreeMap::new());
+        }
+        let names = before.keys().cloned().collect();
+        let after = self.conflicts_for_names(Some(&names));
+        (before, after)
+    }
+
+    fn note_peer_liveness_change(&mut self, relay_id: &str, status: PeerStatus) {
+        if self.peer_is_alive(relay_id) != (status == PeerStatus::Alive) {
+            let names = self
+                .routes
+                .keys()
+                .filter(|(_, owner)| owner == relay_id)
+                .map(|(name, _)| name.clone())
+                .collect::<Vec<_>>();
+            self.note_conflict_changes(names);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn take_conflict_comparisons(&self) -> Vec<String> {
+        std::mem::take(&mut *self.conflict_comparisons.lock())
     }
 
     /// List all routes.
@@ -386,6 +544,7 @@ impl RouteTable {
             .filter(|(_, rid)| rid == relay_id)
             .cloned()
             .collect();
+        self.note_conflict_changes(keys.iter().map(|(name, _)| name.clone()));
         let mut removed = Vec::new();
         for key in keys {
             let Some(entry) = self.routes.remove(&key) else {
@@ -429,6 +588,7 @@ impl RouteTable {
     pub fn register_peer(&mut self, info: PeerInfo) {
         let relay_id = info.relay_id.clone();
         let url = info.url.clone();
+        self.note_peer_liveness_change(&relay_id, info.status);
         self.peers.insert(relay_id.clone(), info);
         self.sync_peer_route_urls(&relay_id, &url);
     }
@@ -437,6 +597,7 @@ impl RouteTable {
         if !valid_relay_id(&relay_id) || relay_id == self.relay_id || !valid_relay_url(&url) {
             return false;
         }
+        self.note_peer_liveness_change(&relay_id, PeerStatus::Alive);
         let now = Instant::now();
         match self.peers.get_mut(&relay_id) {
             Some(peer) => {
@@ -462,7 +623,29 @@ impl RouteTable {
     }
 
     pub fn unregister_peer(&mut self, relay_id: &str) -> Option<PeerInfo> {
+        if relay_id == self.relay_id {
+            return None;
+        }
+        // Route ownership and membership leave together under the caller's
+        // write lock. A delayed announcement can run only before or after it.
+        self.remove_routes_by_relay(relay_id);
         self.peers.remove(relay_id)
+    }
+
+    /// The caller holds the write lock across the liveness decision and removal.
+    /// Static relay-ID validation belongs to the incoming request boundary.
+    pub(crate) fn force_leave_peer(&mut self, relay_id: &str) -> Result<(), ForceLeaveError> {
+        if relay_id == self.relay_id {
+            return Err(ForceLeaveError::SelfRelay);
+        }
+        match self.peers.get(relay_id).map(|peer| peer.status) {
+            Some(PeerStatus::Alive) => return Err(ForceLeaveError::Alive),
+            None => return Err(ForceLeaveError::Unknown),
+            Some(PeerStatus::Suspect | PeerStatus::Dead) => {}
+        }
+        self.unregister_peer(relay_id);
+        self.tombstones.retain(|(_, owner), _| owner != relay_id);
+        Ok(())
     }
 
     pub fn get_peer(&self, relay_id: &str) -> Option<&PeerInfo> {
@@ -479,8 +662,27 @@ impl RouteTable {
             .is_some_and(|peer| peer.status == PeerStatus::Alive)
     }
 
-    pub fn get_peer_mut(&mut self, relay_id: &str) -> Option<&mut PeerInfo> {
-        self.peers.get_mut(relay_id)
+    pub(crate) fn set_peer_status(&mut self, relay_id: &str, status: PeerStatus) {
+        if !self.has_peer(relay_id) {
+            return;
+        }
+        self.note_peer_liveness_change(relay_id, status);
+        self.peers.get_mut(relay_id).unwrap().status = status;
+    }
+
+    pub(crate) fn record_peer_heartbeat(&mut self, relay_id: &str, route_count: u32) {
+        self.set_peer_status(relay_id, PeerStatus::Alive);
+        if let Some(peer) = self.peers.get_mut(relay_id) {
+            peer.last_heartbeat = Instant::now();
+            peer.route_count = route_count;
+        }
+    }
+
+    pub(crate) fn record_peer_probe_success(&mut self, relay_id: &str) {
+        self.set_peer_status(relay_id, PeerStatus::Alive);
+        if let Some(peer) = self.peers.get_mut(relay_id) {
+            peer.last_heartbeat = Instant::now();
+        }
     }
 
     pub fn list_peers(&self) -> Vec<&PeerInfo> {
@@ -553,24 +755,37 @@ impl RouteTable {
             let Some(peer) = peer_snapshots.get(&entry.relay_id) else {
                 return;
             };
-            if !self.snapshot_route_owner_is_alive(peer) {
-                continue;
-            }
             entry.relay_url = peer.url.clone();
             let key = (entry.name.clone(), entry.relay_id.clone());
             replacement_routes.insert(key, entry);
         }
 
-        // Replace all existing PEER routes after the replacement set is ready.
-        let peer_keys: Vec<_> = self
-            .routes
-            .iter()
-            .filter(|(_, e)| e.locality == Locality::Peer)
-            .map(|(k, _)| k.clone())
+        // Capture this snapshot's membership changes together, before any
+        // mutation. Large snapshots compare each affected name only once.
+        let changed_names: Vec<_> = replacement_routes
+            .values()
+            .filter(|entry| {
+                !self
+                    .routes
+                    .contains_key(&(entry.name.clone(), entry.relay_id.clone()))
+                    && self.can_register_route(entry)
+            })
+            .map(|entry| entry.name.clone())
+            .chain(
+                tombstones
+                    .iter()
+                    .filter(|tombstone| {
+                        tombstone.relay_id != self.relay_id
+                            && self
+                                .routes
+                                .get(&(tombstone.name.clone(), tombstone.relay_id.clone()))
+                                .is_some_and(|entry| entry.registered_at <= tombstone.removed_at)
+                    })
+                    .map(|tombstone| tombstone.name.clone()),
+            )
             .collect();
-        for key in peer_keys {
-            self.routes.remove(&key);
-        }
+        self.note_conflict_changes(changed_names);
+
         for tombstone in tombstones {
             if tombstone.relay_id == self.relay_id {
                 continue;
@@ -594,15 +809,14 @@ impl RouteTable {
             }
             let relay_id = ps.relay_id.clone();
             let url = ps.url.clone();
+            if !self.has_peer(&relay_id) {
+                self.note_peer_liveness_change(&relay_id, ps.status);
+            }
             self.peers
                 .entry(ps.relay_id.clone())
                 .and_modify(|existing| {
                     existing.url = ps.url.clone();
                     existing.route_count = ps.route_count;
-                    if existing.status != PeerStatus::Dead {
-                        existing.status = ps.status;
-                    }
-                    existing.last_heartbeat = Instant::now();
                 })
                 .or_insert_with(|| PeerInfo {
                     relay_id: ps.relay_id,
@@ -613,13 +827,6 @@ impl RouteTable {
                 });
             self.sync_peer_route_urls(&relay_id, &url);
         }
-    }
-
-    fn snapshot_route_owner_is_alive(&self, peer: &PeerSnapshot) -> bool {
-        self.peers
-            .get(&peer.relay_id)
-            .map(|local| local.status == PeerStatus::Alive)
-            .unwrap_or(peer.status == PeerStatus::Alive)
     }
 
     /// Route digest for anti-entropy: (name, relay_id) → hash of fields that
@@ -677,7 +884,6 @@ impl RouteTable {
                 abi_hash: entry.abi_hash.clone(),
                 signature_hash: entry.signature_hash.clone(),
                 max_payload_size: entry.max_payload_size,
-                route_uid: entry.route_uid.clone(),
                 registered_at: entry.registered_at,
             })
     }
@@ -831,7 +1037,7 @@ mod tests {
             signature_hash: "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
                 .into(),
             max_payload_size: 1024,
-            route_uid: format!("{name}-{relay_id}-uid"),
+            route_uid: Some(format!("{name}-{relay_id}-uid")),
             locality: Locality::Local,
             registered_at: 1000.0,
         }
@@ -852,7 +1058,7 @@ mod tests {
             signature_hash: "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
                 .into(),
             max_payload_size: 1024,
-            route_uid: format!("{name}-{relay_id}-uid"),
+            route_uid: None,
             locality: Locality::Peer,
             registered_at,
         }
@@ -879,7 +1085,7 @@ mod tests {
             } else if owner.routes.is_empty() {
                 let mut fresh = local_entry("grid", "relay-a");
                 fresh.registered_at = owner.next_local_timestamp();
-                fresh.route_uid = "grid-reregistered-uid".into();
+                fresh.route_uid = Some("grid-reregistered-uid".into());
                 assert!(owner.register_route(fresh));
             }
             let diff = owner
@@ -1018,7 +1224,7 @@ mod tests {
         let active_digest = active_table.route_digest();
         assert_eq!(
             active_digest.get(&("grid".to_string(), "relay-a".to_string(), false)),
-            Some(&"6770f1031b3e9ec9d7d681beee048bc6c81035992975a9a637755a73b9e07e3e".to_string())
+            Some(&"041751786968419cef9940d98f60c292ae4a22c92166a51bc55c87f6e0601a18".to_string())
         );
 
         let mut deleted_table = RouteTable::new("relay-a".into());
@@ -1075,7 +1281,11 @@ mod tests {
     fn register_and_resolve_local() {
         let mut rt = RouteTable::new("relay-a".into());
         rt.register_route(local_entry("grid", "relay-a"));
-        let resolved = rt.resolve_matching(&expected_contract("grid"));
+        let resolved = rt
+            .resolve_matching(&expected_contract("grid"))
+            .unwrap()
+            .into_iter()
+            .collect::<Vec<_>>();
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].name, "grid");
         assert!(resolved[0].ipc_address.is_some());
@@ -1090,34 +1300,43 @@ mod tests {
     }
 
     #[test]
-    fn resolve_local_before_peer() {
+    fn resolve_local_and_peer_reports_conflict() {
         let mut rt = RouteTable::new("relay-a".into());
         register_alive_peer(&mut rt, "relay-b");
         rt.register_route(local_entry("grid", "relay-a"));
         rt.register_route(peer_entry("grid", "relay-b", 500.0));
-        let resolved = rt.resolve_matching(&expected_contract("grid"));
-        assert_eq!(resolved.len(), 2);
-        assert!(resolved[0].ipc_address.is_some()); // LOCAL first
-        assert!(resolved[0].server_instance_id.is_some());
-        assert!(resolved[1].ipc_address.is_none()); // PEER second
-        assert!(resolved[1].server_instance_id.is_none());
+        let Err(RouteResolutionError::Conflict(registrations)) =
+            rt.resolve_matching(&expected_contract("grid"))
+        else {
+            panic!("new acquisition must report route conflict")
+        };
+        assert_eq!(registrations.len(), 2);
+        assert!(
+            registrations
+                .iter()
+                .all(|entry| entry.relay_status == PeerStatus::Alive)
+        );
     }
 
     #[test]
-    fn resolve_peers_sorted_deterministically() {
+    fn resolve_live_peers_reports_all_conflicting_registrations() {
         let mut rt = RouteTable::new("relay-a".into());
         register_alive_peer(&mut rt, "relay-b");
         register_alive_peer(&mut rt, "relay-c");
         rt.register_route(peer_entry("grid", "relay-c", 1000.0));
         rt.register_route(peer_entry("grid", "relay-b", 1000.0));
-        let resolved = rt.resolve_matching(&expected_contract("grid"));
-        assert_eq!(resolved.len(), 2);
-        assert_eq!(resolved[0].relay_url, "http://relay-b:8080");
-        assert_eq!(resolved[1].relay_url, "http://relay-c:8080");
+        let Err(RouteResolutionError::Conflict(registrations)) =
+            rt.resolve_matching(&expected_contract("grid"))
+        else {
+            panic!("timestamps must not choose a registration")
+        };
+        assert_eq!(registrations.len(), 2);
+        assert_eq!(registrations[0].relay_id, "relay-b");
+        assert_eq!(registrations[1].relay_id, "relay-c");
     }
 
     #[test]
-    fn resolve_ignores_routes_owned_by_dead_peer() {
+    fn resolve_retains_dead_peer_name_as_unavailable() {
         let mut rt = RouteTable::new("relay-a".into());
         rt.register_peer(PeerInfo {
             relay_id: "relay-b".into(),
@@ -1128,7 +1347,11 @@ mod tests {
         });
         rt.register_route(peer_entry("grid", "relay-b", 1000.0));
 
-        assert!(rt.resolve_matching(&expected_contract("grid")).is_empty());
+        assert!(matches!(
+            rt.resolve_matching(&expected_contract("grid")),
+            Err(RouteResolutionError::Unavailable(_))
+        ));
+        assert_eq!(rt.list_routes().len(), 1);
     }
 
     #[test]
@@ -1143,7 +1366,13 @@ mod tests {
         });
         rt.register_route(peer_entry("grid", "relay-b", 1000.0));
 
-        assert_eq!(rt.resolve_matching(&expected_contract("grid")).len(), 1);
+        assert_eq!(
+            rt.resolve_matching(&expected_contract("grid"))
+                .unwrap()
+                .iter()
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -1280,7 +1509,11 @@ mod tests {
         merge_full_sync(&mut rt_c, snapshot).unwrap();
 
         assert!(rt_c.local_route("local_c").is_some());
-        let resolved = rt_c.resolve_matching(&expected_contract("grid"));
+        let resolved = rt_c
+            .resolve_matching(&expected_contract("grid"))
+            .unwrap()
+            .into_iter()
+            .collect::<Vec<_>>();
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].relay_url, "http://relay-a:8080");
         assert!(resolved[0].ipc_address.is_none());
@@ -1329,7 +1562,8 @@ mod tests {
         let rt = RouteTable::new("relay-a".into());
         assert!(
             rt.resolve_matching(&expected_contract("nonexistent"))
-                .is_empty()
+                .unwrap()
+                .is_none()
         );
     }
 
@@ -1349,7 +1583,11 @@ mod tests {
         )
         .unwrap();
 
-        let resolved = rt.resolve_matching(&expected_contract("grid"));
+        let resolved = rt
+            .resolve_matching(&expected_contract("grid"))
+            .unwrap()
+            .into_iter()
+            .collect::<Vec<_>>();
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].relay_url, "http://relay-a:8080");
     }
@@ -1359,11 +1597,17 @@ mod tests {
         let mut rt = RouteTable::new("relay-a".into());
         rt.register_route(local_entry("grid", "relay-a"));
 
-        assert_eq!(rt.resolve_matching(&expected_contract("grid")).len(), 1,);
+        assert_eq!(
+            rt.resolve_matching(&expected_contract("grid"))
+                .unwrap()
+                .iter()
+                .count(),
+            1,
+        );
         let mut mismatched_hash = expected_contract("grid");
         mismatched_hash.abi_hash =
             "1111111111111111111111111111111111111111111111111111111111111111".to_string();
-        assert!(rt.resolve_matching(&mismatched_hash).is_empty());
+        assert!(rt.resolve_matching(&mismatched_hash).unwrap().is_none());
     }
 
     #[test]
@@ -1657,7 +1901,10 @@ mod tests {
         );
         assert_eq!(rt.get_peer("relay-a").unwrap().route_count, 99);
         assert_eq!(
-            rt.resolve_matching(&expected_contract("grid"))[0].relay_url,
+            rt.resolve_matching(&expected_contract("grid"))
+                .unwrap()
+                .unwrap()
+                .relay_url,
             "http://relay-a-new:8080"
         );
     }
@@ -1683,7 +1930,10 @@ mod tests {
 
         assert_eq!(rt.get_peer("relay-a").unwrap().url, "http://relay-a:8080");
         assert_eq!(
-            rt.resolve_matching(&expected_contract("grid"))[0].relay_url,
+            rt.resolve_matching(&expected_contract("grid"))
+                .unwrap()
+                .unwrap()
+                .relay_url,
             "http://relay-a:8080"
         );
     }
@@ -1793,7 +2043,7 @@ mod tests {
     }
 
     #[test]
-    fn merge_snapshot_does_not_import_routes_for_dead_peer() {
+    fn merge_snapshot_keeps_dead_peer_registration_unavailable() {
         let mut rt = RouteTable::new("relay-c".into());
 
         merge_full_sync(
@@ -1811,7 +2061,11 @@ mod tests {
         )
         .unwrap();
 
-        assert!(rt.list_routes().is_empty());
+        assert_eq!(rt.list_routes().len(), 1);
+        assert!(matches!(
+            rt.resolve_matching(&expected_contract("grid")),
+            Err(RouteResolutionError::Unavailable(_))
+        ));
         assert_eq!(
             rt.get_peer("relay-a").map(|peer| peer.status),
             Some(PeerStatus::Dead)
@@ -1819,7 +2073,7 @@ mod tests {
     }
 
     #[test]
-    fn merge_snapshot_does_not_resurrect_locally_dead_peer_routes() {
+    fn merge_snapshot_keeps_registration_without_recovering_locally_dead_peer() {
         let mut rt = RouteTable::new("relay-c".into());
         rt.register_peer(PeerInfo {
             relay_id: "relay-a".into(),
@@ -1844,7 +2098,11 @@ mod tests {
         )
         .unwrap();
 
-        assert!(rt.list_routes().is_empty());
+        assert_eq!(rt.list_routes().len(), 1);
+        assert!(matches!(
+            rt.resolve_matching(&expected_contract("grid")),
+            Err(RouteResolutionError::Unavailable(_))
+        ));
         assert_eq!(
             rt.get_peer("relay-a").map(|peer| peer.status),
             Some(PeerStatus::Dead)
@@ -1870,7 +2128,13 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(rt.resolve_matching(&expected_contract("grid")).len(), 1);
+        assert_eq!(
+            rt.resolve_matching(&expected_contract("grid"))
+                .unwrap()
+                .iter()
+                .count(),
+            1
+        );
         assert_eq!(
             rt.get_peer("relay-a").map(|peer| peer.status),
             Some(PeerStatus::Alive)

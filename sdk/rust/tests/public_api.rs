@@ -1,5 +1,4 @@
 use std::collections::BTreeMap;
-use std::net::TcpListener;
 use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
@@ -202,31 +201,19 @@ fn definition(route_name: &str) -> ServiceDefinition {
 }
 
 fn relay() -> (RelayServer, String) {
-    let mut attempt = 0;
-    loop {
-        attempt += 1;
-        let probe = TcpListener::bind("127.0.0.1:0").expect("reserve relay port");
-        let address = probe.local_addr().expect("relay address");
-        drop(probe);
-        let relay_url = format!("http://{address}");
-        match RelayServer::start_with_context(
-            RelayConfig {
-                bind: address.to_string(),
-                advertise_url: relay_url.clone(),
-                idle_timeout_secs: 0,
-                anti_entropy_interval: std::time::Duration::ZERO,
-                heartbeat_interval: std::time::Duration::ZERO,
-                ..RelayConfig::default()
-            },
-            test_context().clone(),
-        ) {
-            Ok(relay) => return (relay, relay_url),
-            // A parallel test can claim the port after the probe closes.
-            Err(error)
-                if attempt < 8 && error.starts_with("Relay failed to start: Failed to bind ") => {}
-            Err(error) => panic!("relay starts: {error}"),
-        }
-    }
+    let relay = RelayServer::start_with_context(
+        RelayConfig {
+            bind: "127.0.0.1:0".into(),
+            idle_timeout_secs: 0,
+            anti_entropy_interval: std::time::Duration::ZERO,
+            heartbeat_interval: std::time::Duration::ZERO,
+            ..RelayConfig::default()
+        },
+        test_context().clone(),
+    )
+    .expect("relay starts");
+    let relay_url = format!("http://{}", relay.local_addr());
+    (relay, relay_url)
 }
 
 #[test]
@@ -287,7 +274,6 @@ fn one_client_type_covers_direct_explicit_relay_and_relay_aware_calls() {
     let mut registration = host
         .register(definition(&route_name))
         .expect("route registration");
-    let registered_route_uid = registration.outcome().route_uid.clone();
     let expected = release()
         .expected_route(&route_name)
         .expect("expected route");
@@ -301,7 +287,10 @@ fn one_client_type_covers_direct_explicit_relay_and_relay_aware_calls() {
         )
         .expect("direct IPC client");
     accepts_client(&direct);
-    assert_eq!(direct.observed_route().route_uid, registered_route_uid);
+    assert_eq!(
+        direct.observed_path(),
+        c_two::observe::ObservedPath::DirectIpc
+    );
     assert_eq!(
         direct.call_owned("echo", b"direct").expect("direct call"),
         b"direct"
@@ -316,7 +305,10 @@ fn one_client_type_covers_direct_explicit_relay_and_relay_aware_calls() {
         )
         .expect("explicit relay client");
     accepts_client(&explicit);
-    assert_eq!(explicit.observed_route().route_uid, registered_route_uid);
+    assert_eq!(
+        explicit.observed_path(),
+        c_two::observe::ObservedPath::ExplicitRelay
+    );
     assert_eq!(
         explicit
             .call_owned("echo", b"explicit")
@@ -328,7 +320,10 @@ fn one_client_type_covers_direct_explicit_relay_and_relay_aware_calls() {
         .connect(expected, Connect::RelayAware)
         .expect("relay-aware client");
     accepts_client(&relay_aware);
-    assert_eq!(relay_aware.observed_route().route_uid, registered_route_uid);
+    assert_eq!(
+        relay_aware.observed_path(),
+        c_two::observe::ObservedPath::RelayAwareLocalIpc
+    );
     assert_eq!(
         relay_aware
             .call_owned("echo", b"aware")

@@ -150,7 +150,7 @@ impl contract::Service for Resource {
             "error" => (VecDeque::from([
                 Ok(payload("one")),
                 Err(c_two::Error::Semantic(c_two::generated::C2Error::new(
-                    c_two::generated::ErrorCode::WriteConflict,
+                    c_two::generated::ErrorCode::ResourceFunctionExecuting,
                     "domain step failed",
                 ))),
             ]), false, false),
@@ -226,7 +226,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(text(&error.next().unwrap()?), "one");
     match error.next().unwrap() {
         Err(c_two::Error::Semantic(semantic)) => {
-            assert_eq!(semantic.code, c_two::generated::ErrorCode::WriteConflict)
+            assert_eq!(semantic.code, c_two::generated::ErrorCode::ResourceFunctionExecuting)
         }
         _ => panic!("domain error was not preserved"),
     }

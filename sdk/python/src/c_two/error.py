@@ -18,14 +18,11 @@ _NATIVE_TO_PY_ERROR_NAMES = {
     "ResourceNotFound": "ERROR_RESOURCE_NOT_FOUND",
     "ResourceUnavailable": "ERROR_RESOURCE_UNAVAILABLE",
     "ResourceAlreadyRegistered": "ERROR_RESOURCE_ALREADY_REGISTERED",
-    "RouteStale": "ERROR_ROUTE_STALE",
     "RegistryUnavailable": "ERROR_REGISTRY_UNAVAILABLE",
-    "WriteConflict": "ERROR_WRITE_CONFLICT",
     "ResourceClosed": "ERROR_RESOURCE_CLOSED",
     "ResourceRemoved": "ERROR_RESOURCE_REMOVED",
     "ContractMismatch": "ERROR_CONTRACT_MISMATCH",
     "IdentityMismatch": "ERROR_IDENTITY_MISMATCH",
-    "RouteCatalogCompacted": "ERROR_ROUTE_CATALOG_COMPACTED",
     "RouteWatchUnavailable": "ERROR_ROUTE_WATCH_UNAVAILABLE",
     "ProtocolViolation": "ERROR_PROTOCOL_VIOLATION",
     "FallbackDenied": "ERROR_FALLBACK_DENIED",
@@ -33,6 +30,7 @@ _NATIVE_TO_PY_ERROR_NAMES = {
     "UnsupportedCallMode": "ERROR_UNSUPPORTED_CALL_MODE",
     "CallCapacityExceeded": "ERROR_CALL_CAPACITY_EXCEEDED",
     "CallCancelled": "ERROR_CALL_CANCELLED",
+    "RouteConflict": "ERROR_ROUTE_CONFLICT",
 }
 
 
@@ -290,26 +288,12 @@ class ResourceAlreadyRegistered(CCError):
             details=details,
         )
 
-class RouteStale(CCError):
-    """Raised when an observed route token is older than current route state."""
-    ERROR_CODE = 704
-
-    def __init__(self, message: str | None = None, details: Mapping[str, str] | None = None):
-        super().__init__(code=ERROR_Code.ERROR_ROUTE_STALE, message=message or 'Route stale', details=details)
-
 class RegistryUnavailable(CCError):
     """Raised when no relay is available for name resolution."""
     ERROR_CODE = 705
 
     def __init__(self, message: str | None = None, details: Mapping[str, str] | None = None):
         super().__init__(code=ERROR_Code.ERROR_REGISTRY_UNAVAILABLE, message=message or 'Registry unavailable', details=details)
-
-class WriteConflict(CCError):
-    """Raised when a write cannot acquire the required resource coordination."""
-    ERROR_CODE = 706
-
-    def __init__(self, message: str | None = None, details: Mapping[str, str] | None = None):
-        super().__init__(code=ERROR_Code.ERROR_WRITE_CONFLICT, message=message or 'Write conflict', details=details)
 
 class ResourceClosed(CCError):
     """Raised when a route exists but no longer accepts new calls."""
@@ -338,13 +322,6 @@ class IdentityMismatch(CCError):
 
     def __init__(self, message: str | None = None, details: Mapping[str, str] | None = None):
         super().__init__(code=ERROR_Code.ERROR_IDENTITY_MISMATCH, message=message or 'Identity mismatch', details=details)
-
-class RouteCatalogCompacted(CCError):
-    """Raised when route watch history is no longer incrementally recoverable."""
-    ERROR_CODE = 711
-
-    def __init__(self, message: str | None = None, details: Mapping[str, str] | None = None):
-        super().__init__(code=ERROR_Code.ERROR_ROUTE_CATALOG_COMPACTED, message=message or 'Route catalog compacted', details=details)
 
 class RouteWatchUnavailable(CCError):
     """Raised when route state cannot be trusted because the watch is unavailable."""
@@ -424,6 +401,17 @@ class CallCancelled(CCError):
             details=details,
         )
 
+class RouteConflict(CCError):
+    """Raised when multiple online registrations hold one route name."""
+    ERROR_CODE = 719
+
+    def __init__(self, message: str | None = None, details: Mapping[str, str] | None = None):
+        super().__init__(
+            code=ERROR_Code.ERROR_ROUTE_CONFLICT,
+            message=message or 'Route conflict',
+            details=details,
+        )
+
 _CODE_TO_CLASS: dict[int, type] = {
     ERROR_Code.ERROR_AT_RESOURCE_INPUT_DESERIALIZING: ResourceDeserializeInput,
     ERROR_Code.ERROR_AT_RESOURCE_INPUT_FROM_BUFFER:    ResourceInputFromBuffer,
@@ -436,14 +424,11 @@ _CODE_TO_CLASS: dict[int, type] = {
     ERROR_Code.ERROR_RESOURCE_NOT_FOUND:               ResourceNotFound,
     ERROR_Code.ERROR_RESOURCE_UNAVAILABLE:             ResourceUnavailable,
     ERROR_Code.ERROR_RESOURCE_ALREADY_REGISTERED:      ResourceAlreadyRegistered,
-    ERROR_Code.ERROR_ROUTE_STALE:                      RouteStale,
     ERROR_Code.ERROR_REGISTRY_UNAVAILABLE:             RegistryUnavailable,
-    ERROR_Code.ERROR_WRITE_CONFLICT:                   WriteConflict,
     ERROR_Code.ERROR_RESOURCE_CLOSED:                  ResourceClosed,
     ERROR_Code.ERROR_RESOURCE_REMOVED:                 ResourceRemoved,
     ERROR_Code.ERROR_CONTRACT_MISMATCH:                ContractMismatch,
     ERROR_Code.ERROR_IDENTITY_MISMATCH:                IdentityMismatch,
-    ERROR_Code.ERROR_ROUTE_CATALOG_COMPACTED:          RouteCatalogCompacted,
     ERROR_Code.ERROR_ROUTE_WATCH_UNAVAILABLE:          RouteWatchUnavailable,
     ERROR_Code.ERROR_PROTOCOL_VIOLATION:               ProtocolViolation,
     ERROR_Code.ERROR_FALLBACK_DENIED:                  FallbackDenied,
@@ -451,6 +436,7 @@ _CODE_TO_CLASS: dict[int, type] = {
     ERROR_Code.ERROR_UNSUPPORTED_CALL_MODE:            UnsupportedCallMode,
     ERROR_Code.ERROR_CALL_CAPACITY_EXCEEDED:           CallCapacityExceeded,
     ERROR_Code.ERROR_CALL_CANCELLED:                   CallCancelled,
+    ERROR_Code.ERROR_ROUTE_CONFLICT:                   RouteConflict,
 }
 
 
@@ -469,14 +455,11 @@ __all__ = [
     'ResourceNotFound',
     'ResourceUnavailable',
     'ResourceAlreadyRegistered',
-    'RouteStale',
     'RegistryUnavailable',
-    'WriteConflict',
     'ResourceClosed',
     'ResourceRemoved',
     'ContractMismatch',
     'IdentityMismatch',
-    'RouteCatalogCompacted',
     'RouteWatchUnavailable',
     'ProtocolViolation',
     'FallbackDenied',
@@ -484,5 +467,6 @@ __all__ = [
     'UnsupportedCallMode',
     'CallCapacityExceeded',
     'CallCancelled',
+    'RouteConflict',
     'ERROR_Code',
 ]

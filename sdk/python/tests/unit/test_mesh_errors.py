@@ -3,8 +3,8 @@ from c_two.error import (
     ResourceNotFound,
     ResourceUnavailable,
     RegistryUnavailable,
-    RouteStale,
-    WriteConflict,
+    RouteConflict,
+    RouteWatchUnavailable,
 )
 
 
@@ -25,13 +25,14 @@ class TestMeshErrors:
         err = RegistryUnavailable("no relay configured")
         assert err.ERROR_CODE == 705
 
-    def test_route_stale_code(self):
-        err = RouteStale("grid stale")
-        assert err.ERROR_CODE == 704
+    def test_route_watch_unavailable_code(self):
+        err = RouteWatchUnavailable("watch unavailable")
+        assert err.ERROR_CODE == 712
 
-    def test_write_conflict_code(self):
-        err = WriteConflict("grid conflict")
-        assert err.ERROR_CODE == 706
+    def test_route_conflict_code(self):
+        err = RouteConflict("grid", details={"route": "grid", "dispatch_phase": "pre_dispatch"})
+        assert err.ERROR_CODE == 719
+        assert err.details == {"route": "grid", "dispatch_phase": "pre_dispatch"}
 
     def test_error_serialize_roundtrip(self):
         err = ResourceNotFound("grid")

@@ -10,8 +10,8 @@ use crate::rpc::{
 
 const REQUEST_ID: u64 = 0x0807_0605_0403_0201;
 const RID_BYTES: [u8; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
-const OPEN_UNARY: &[u8] = b"\x01\x01r\x01u\x01n\x01G\x01v\x01a\x01s\x34\x12\x00";
-const OPEN_STREAM: &[u8] = b"\x01\x01r\x01u\x01n\x01G\x01v\x01a\x01s\x34\x12\x01";
+const OPEN_UNARY: &[u8] = b"\x01\x01r\x01n\x01G\x01v\x01a\x01s\x34\x12\x00";
+const OPEN_STREAM: &[u8] = b"\x01\x01r\x01n\x01G\x01v\x01a\x01s\x34\x12\x01";
 const SHM_BYTES: [u8; 23] = [
     1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 2, 0, 0, 0, 1, 11, 12, 13, 14, 15, 16, 17, 18,
 ];
@@ -21,7 +21,6 @@ const ERROR: &[u8] =
 fn identity() -> RouteCallIdentity<&'static str> {
     RouteCallIdentity {
         route_name: "r",
-        route_uid: "u",
         crm_ns: "n",
         crm_name: "G",
         crm_ver: "v",
@@ -69,7 +68,7 @@ fn open_modes_and_storage_match_whole_frames() {
                 ValuePart::whole(ValueStorage::Inline(b"xy")),
             )
             .unwrap(),
-            frame([0x20, 0, 0, 0], [0, 0x10, 0, 0], &inline_body),
+            frame([0x1e, 0, 0, 0], [0, 0x10, 0, 0], &inline_body),
         );
 
         let mut shm_body = prefix.to_vec();
@@ -83,7 +82,7 @@ fn open_modes_and_storage_match_whole_frames() {
                 ValuePart::whole(ValueStorage::Shm(shm())),
             )
             .unwrap(),
-            frame([0x35, 0, 0, 0], [0x40, 0x10, 0, 0], &shm_body),
+            frame([0x33, 0, 0, 0], [0x40, 0x10, 0, 0], &shm_body),
         );
     }
 }
@@ -101,7 +100,7 @@ fn open_chunks_have_only_first_chunk_metadata() {
             ValuePart::first(5, ValueStorage::Inline(b"ab")),
         )
         .unwrap(),
-        frame([0x28, 0, 0, 0], [0, 0x32, 0, 0], &first_body),
+        frame([0x26, 0, 0, 0], [0, 0x32, 0, 0], &first_body),
     );
     assert_eq!(
         encode_value_continuation_frame(
@@ -122,10 +121,10 @@ fn open_drafts_and_streaming_prefixes_keep_one_reserved_frame() {
     };
 
     for (chunk, length, flags) in [
-        (ChunkPosition::Whole, [0x20, 0, 0, 0], [0, 0x10, 0, 0]),
+        (ChunkPosition::Whole, [0x1e, 0, 0, 0], [0, 0x10, 0, 0]),
         (
             ChunkPosition::First { total_bytes: 5 },
-            [0x28, 0, 0, 0],
+            [0x26, 0, 0, 0],
             [0, 0x32, 0, 0],
         ),
     ] {

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """窄的本机 Python 验证入口：普通文件 loadfile，完整矩阵串行。
 
-不安装/重建 native 或 c3，不接受 pytest 过滤参数。动态 harness 的编译
+不安装/重建 native、c3 或注册证明程序，不接受 pytest 过滤参数。动态 harness 的编译
 仍由既有矩阵 fixture 串行完成；运行期间不能另开 Cargo/npm/uv 写任务。
 loadfile/worker 命名空间依据：https://pytest-xdist.readthedocs.io/en/stable/
 distribution.html 和 how-to.html。平台后端限定清理本次启动的进程树。
@@ -231,6 +231,9 @@ def preflight(options: argparse.Namespace, environment: dict[str, str]) -> dict:
         raise RunnerError("需要固定fastdb4py==0.2.4")
     if not options.c3.is_file():
         raise RunnerError(f"预建c3不存在：{options.c3}")
+    if not options.route_scope_attestor.is_file():
+        raise RunnerError(f"预建注册证明程序不存在：{options.route_scope_attestor}；先运行 python tools/dev/build_route_scope_attestor.py")
+    info["route_scope_attestor"] = {"path": str(options.route_scope_attestor), "sha256": sha256(options.route_scope_attestor)}
     if Path(info["python_sdk"]).resolve().parent != (ROOT / "sdk/python/src/c_two").resolve():
         raise RunnerError("选定解释器的c_two Python源码不属于本checkout；需要外部预先安装本树editable包")
     info["c3_version"] = capture([str(options.c3), "--version"], environment)
@@ -239,6 +242,8 @@ def preflight(options: argparse.Namespace, environment: dict[str, str]) -> dict:
     info["tracked_diff_sha256"] = hashlib.sha256(capture(["git", "diff", "--binary", "HEAD"], environment).encode()).hexdigest()
     info["runner_inputs"] = {str(path.relative_to(ROOT)): sha256(path) for path in (
         ROOT / "tools/dev/test_python.py", ROOT / "tools/dev/test_platform.py", ROOT / "sdk/python/tests/conftest.py",
+        ROOT / "tools/dev/build_route_scope_attestor.py", ROOT / "sdk/python/tests/fixtures/route_scope_attestor.py",
+        ROOT / "sdk/python/tests/fixtures/route_scope_attestor.rs",
         ROOT / "pyproject.toml", ROOT / "uv.lock",
     )}
     # 与既有syntax gate一致，只查询，不安装。
@@ -297,8 +302,8 @@ def validate_receipts(output: Path, c3_hash: str) -> None:
     from tools.local_rc.portable_matrix_receipt import load_and_validate_receipt as portable
     from tools.local_rc.typescript_receipt import load_and_validate_receipt as typescript
 
-    p = portable(output / "portable-matrix-receipt.v2.json", expected_stage="development")
-    t = typescript(output / "typescript-real-call-receipt.v2.json", expected_stage="development")
+    p = portable(output / "portable-matrix-receipt.v3.json", expected_stage="development")
+    t = typescript(output / "typescript-real-call-receipt.v3.json", expected_stage="development")
     # 结构验证包含精确行集/顺序/负例；还绑定本次c3字节。
     if any(row["c3_sha256"] != c3_hash for row in p["rows"] if row["transport"] == "relay") or t["packages"]["c3_sha256"] != c3_hash:
         raise RunnerError("收据c3哈希与本次输入不一致")
@@ -344,6 +349,9 @@ def execute(options: argparse.Namespace, output: Path, base: dict[str, str], inf
         validate_receipts(output, info["c3_sha256"])
     if sha256(options.c3) != info["c3_sha256"] or sha256(Path(info["native"])) != info["native_sha256"]:
         raise RunnerError("运行期间native/c3被另一任务替换")
+    attestor = info.get("route_scope_attestor")
+    if attestor and sha256(Path(attestor["path"])) != attestor["sha256"]:
+        raise RunnerError("运行期间注册证明程序被另一任务替换")
     for relative, digest in info.get("runner_inputs", {}).items():
         if sha256(ROOT / relative) != digest:
             raise RunnerError(f"运行期间入口/fixture/依赖输入被替换：{relative}")
@@ -360,6 +368,7 @@ def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description=__doc__)
     result.add_argument("--python", default=sys.executable, help="已建native与全部测试依赖的解释器；不运行uv sync")
     result.add_argument("--c3", type=Path, required=True, help="预建c3的文件路径")
+    result.add_argument("--route-scope-attestor", type=Path, help="预建注册证明程序；默认共用 Cargo debug 目录，先运行 tools/dev/build_route_scope_attestor.py")
     result.add_argument("--output", type=Path, required=True, help="必须不存在的新证据目录")
     result.add_argument("--workers", type=int, choices=(1, 2, 4), default=2, help="普通组：1为-n0串行；2/4为loadfile，矩阵始终-n0")
     result.add_argument("--ordinary-only", action="store_true", help="保留完整收集分组校验，只执行普通组，不生成矩阵收据")
@@ -377,6 +386,9 @@ def main(argv: list[str] | None = None) -> int:
     # 保留venv的python symlink路径；resolve会把它变成全局解释器。
     args.python = os.path.abspath(os.path.expanduser(args.python))
     args.c3 = args.c3.expanduser().resolve()
+    target = Path(os.environ.get("CARGO_TARGET_DIR", ROOT / "core/target")).expanduser().resolve()
+    attestor_name = "c2-route-scope-attestor.exe" if os.name == "nt" else "c2-route-scope-attestor"
+    args.route_scope_attestor = (args.route_scope_attestor or target / "debug" / attestor_name).expanduser().resolve()
     args.output = args.output.expanduser().resolve()
     for key in ("fastdb_package", "c2_mem_package", "typescript_package"):
         if getattr(args, key):
@@ -394,12 +406,13 @@ def main(argv: list[str] | None = None) -> int:
         base["C2_PORTABLE_MATRIX_FIXTURE_ROOT"] = str(Path(os.environ["C2_PORTABLE_MATRIX_FIXTURE_ROOT"]).expanduser().resolve())
     base.update({"C2_ENV_FILE": "", "C2_RELAY_ANCHOR_ADDRESS": "", "PYTHONDONTWRITEBYTECODE": "1", "CTWO_TEST_RUN_NAMESPACE": namespace,
         "CTWO_RELAY_START_LOCK": str(args.output / "relay-start.lock"), "CTWO_TEST_C3_BIN": str(args.c3),
-        "C2_PORTABLE_MATRIX_C3_BIN": str(args.c3), "C2_PORTABLE_MATRIX_RECEIPT": str(args.output / "portable-matrix-receipt.v2.json"),
-        "C2_TYPESCRIPT_RECEIPT": str(args.output / "typescript-real-call-receipt.v2.json"), "C2_PORTABLE_MATRIX_EVIDENCE_STAGE": "development",
+        "CTWO_TEST_ROUTE_SCOPE_ATTESTOR_BIN": str(args.route_scope_attestor),
+        "C2_PORTABLE_MATRIX_C3_BIN": str(args.c3), "C2_PORTABLE_MATRIX_RECEIPT": str(args.output / "portable-matrix-receipt.v3.json"),
+        "C2_TYPESCRIPT_RECEIPT": str(args.output / "typescript-real-call-receipt.v3.json"), "C2_PORTABLE_MATRIX_EVIDENCE_STAGE": "development",
         "C2_TYPESCRIPT_EVIDENCE_STAGE": "development", "C2_TYPESCRIPT_FASTDB_SOURCE_SHA": FASTDB_SHA,
         "NO_PROXY": "127.0.0.1,localhost", "no_proxy": "127.0.0.1,localhost", "PYTHONUTF8": "1",
         "PYTHONWARNDEFAULTENCODING": "1",
-        "CARGO_BUILD_JOBS": "2", "CMAKE_BUILD_PARALLEL_LEVEL": "2", "CARGO_TARGET_DIR": str(ROOT / "core/target"),
+        "CARGO_BUILD_JOBS": "2", "CMAKE_BUILD_PARALLEL_LEVEL": "2", "CARGO_TARGET_DIR": str(target),
         "OMP_NUM_THREADS": "1", "OPENBLAS_NUM_THREADS": "1", "MKL_NUM_THREADS": "1", "NUMEXPR_NUM_THREADS": "1",
         "PYTHONPATH": str(ROOT) + os.pathsep + os.environ.get("PYTHONPATH", "")})
     if sys.platform == 'win32':
@@ -420,7 +433,7 @@ def main(argv: list[str] | None = None) -> int:
         info = preflight(args, base)
         evidence["inputs"] = info
         with ExitStack() as stack:
-            resources = (ROOT, Path(info["prefix"]), ROOT / "core/target", ROOT / "core/foundation/c2-mem-ffi/bindings/typescript", ROOT.parent / "fastdb")
+            resources = (ROOT, Path(info["prefix"]), target, ROOT / "core/foundation/c2-mem-ffi/bindings/typescript", ROOT.parent / "fastdb")
             for resource in sorted(set(resources)):
                 stack.enter_context(resource_lease(resource))
             code = execute(args, args.output, base, info, evidence)

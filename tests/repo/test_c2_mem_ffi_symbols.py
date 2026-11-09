@@ -21,5 +21,5 @@ def test_header_declarations_match_required_loader_symbols() -> None:
 
     assert len(header_symbols) == len(set(header_symbols))
     assert len(required_symbols) == len(set(required_symbols))
-    assert len(header_symbols) == len(required_symbols) == 28
+    assert len(header_symbols) == len(required_symbols) == 29
     assert set(header_symbols) == set(required_symbols)

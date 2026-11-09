@@ -128,7 +128,6 @@ mod ipc16_tests {
     fn identity(route_name: &str) -> RouteCallIdentity<&str> {
         RouteCallIdentity {
             route_name,
-            route_uid: "uid",
             crm_ns: "ns",
             crm_name: "Grid",
             crm_ver: "0.1.0",
@@ -140,7 +139,6 @@ mod ipc16_tests {
     fn route() -> RouteInfo<&'static str> {
         RouteInfo {
             name: "grid",
-            route_uid: "uid",
             crm_ns: "ns",
             crm_name: "Grid",
             crm_ver: "0.1.0",
@@ -163,7 +161,7 @@ mod ipc16_tests {
 
     fn call_golden() -> Vec<u8> {
         concat!(
-            "\x04grid\x03uid\x02ns\x04Grid\x050.1.0\x40",
+            "\x04grid\x02ns\x04Grid\x050.1.0\x40",
             "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
             "\x40abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
             "\x07\x00\x00"
@@ -175,7 +173,7 @@ mod ipc16_tests {
     fn server_golden() -> Vec<u8> {
         concat!(
             "\x01p\x18\x00\x03srv\x04inst\x01\x00",
-            "\x04grid\x03uid\x02ns\x04Grid\x050.1.0\x40",
+            "\x04grid\x02ns\x04Grid\x050.1.0\x40",
             "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
             "\x40abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
             "\x00\x04\x00\x00\x00\x00\x00\x00\x01\x00\x04echo\x07\x00"
@@ -276,7 +274,6 @@ mod ipc16_tests {
             panic!("OPEN");
         };
         assert_eq!(identity.route_name, "grid");
-        assert_eq!(identity.route_uid, "uid");
         assert_eq!(identity.abi_hash, ABI);
         assert_eq!(method_idx, 7);
         assert_eq!(value, ValuePart::whole(ValueStorage::Inline(b"input")));
@@ -287,7 +284,6 @@ mod ipc16_tests {
         let long = "é".repeat(128);
         for field in [
             "route_name",
-            "route_uid",
             "crm_ns",
             "crm_name",
             "crm_ver",
@@ -297,7 +293,6 @@ mod ipc16_tests {
             let mut value = identity("grid");
             match field {
                 "route_name" => value.route_name = &long,
-                "route_uid" => value.route_uid = &long,
                 "crm_ns" => value.crm_ns = &long,
                 "crm_name" => value.crm_name = &long,
                 "crm_ver" => value.crm_ver = &long,
@@ -365,14 +360,12 @@ mod ipc16_tests {
         }
         for (field, text) in [
             ("route", "grid\0hidden"),
-            ("uid", "bad/uid"),
             ("crm", "bad/crm"),
             ("hash", "short"),
         ] {
             let mut value = identity("grid");
             match field {
                 "route" => value.route_name = text,
-                "uid" => value.route_uid = text,
                 "crm" => value.crm_name = text,
                 _ => value.abi_hash = text,
             }
@@ -576,7 +569,6 @@ mod ipc16_tests {
         assert_eq!(decoded.routes.len(), 1);
         let current = &decoded.routes[0];
         assert_eq!(current.name, "grid");
-        assert_eq!(current.route_uid, "uid");
         assert_eq!(current.max_payload_size, 1024);
         assert_eq!(
             current.methods,
@@ -697,7 +689,6 @@ mod ipc16_tests {
         );
         let request = RouteLookupRequest {
             expected: record().contract,
-            observed_route_uid: Some("uid".into()),
         };
         assert_eq!(
             decode_route_lookup_request(&encode_route_lookup_request(&request).unwrap()).unwrap(),
@@ -722,6 +713,57 @@ mod ipc16_tests {
             decode_route_nack(&encode_route_nack(&nack).unwrap()).unwrap(),
             nack
         );
+    }
+
+    // ADR 0004: “IPC 16 的调用标识与 C ABI 8 的 prepare 去掉 route UID”.
+    #[test]
+    fn lookup_identity_bytes_only_keep_uid_in_catalog_records() {
+        let contract = serde_json::to_string(&record().contract).unwrap();
+        let request_bytes = format!("\u{10}{{\"expected\":{contract}}}").into_bytes();
+        let request = decode_route_lookup_request(&request_bytes).unwrap();
+        assert_eq!(
+            encode_route_lookup_request(&request).unwrap(),
+            request_bytes
+        );
+        for body in [
+            r#"{"status":"not_found","route_name":"grid"}"#,
+            r#"{"status":"removed","route_name":"grid"}"#,
+            r#"{"status":"closed","route_name":"grid","reason":"shutdown"}"#,
+        ] {
+            let mut bytes = vec![0x11];
+            bytes.extend_from_slice(body.as_bytes());
+            let response = decode_route_lookup_response(&bytes).unwrap();
+            assert_eq!(encode_route_lookup_response(&response).unwrap(), bytes);
+        }
+        for body in [format!(
+            r#"{{"expected":{contract},"observed_route_uid":"uid"}}"#
+        )] {
+            let mut bytes = vec![0x10];
+            bytes.extend_from_slice(body.as_bytes());
+            assert!(decode_route_lookup_request(&bytes).is_err());
+        }
+        for body in [
+            r#"{"status":"removed","route_name":"grid","route_uid":"uid"}"#.to_string(),
+            r#"{"status":"closed","route_name":"grid","route_uid":"uid","reason":"shutdown"}"#
+                .to_string(),
+            format!(
+                r#"{{"status":"stale","current":{}}}"#,
+                serde_json::to_string(&record()).unwrap()
+            ),
+        ] {
+            let mut bytes = vec![0x11];
+            bytes.extend_from_slice(body.as_bytes());
+            assert!(decode_route_lookup_response(&bytes).is_err());
+        }
+        for response in [
+            RouteLookupResponse::Ready { current: record() },
+            RouteLookupResponse::ContractMismatch { current: record() },
+        ] {
+            let bytes = encode_route_lookup_response(&response).unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&bytes[1..]).unwrap();
+            assert_eq!(json["current"]["route_uid"], "uid");
+            assert_eq!(decode_route_lookup_response(&bytes).unwrap(), response);
+        }
     }
 
     #[test]
@@ -753,7 +795,6 @@ mod ipc16_tests {
         }
         let request = RouteLookupRequest {
             expected: record().contract,
-            observed_route_uid: None,
         };
         let mut value = serde_json::to_value(request).unwrap();
         value["observed_route_revision"] = 1.into();

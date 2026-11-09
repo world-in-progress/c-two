@@ -120,7 +120,7 @@ C2_RELAY_IDLE_TIMEOUT=60
 | --- | --- | --- | --- |
 | HTTP listener | `--bind` | `C2_RELAY_BIND` | `0.0.0.0:8080` |
 | Relay identity | `--relay-id` | `C2_RELAY_ID` | Generated `<hostname>_<pid>_<first 8 UUID characters>` |
-| Advertised URL | `--advertise-url` | `C2_RELAY_ADVERTISE_URL` | Derived from bind |
+| Advertised URL | `--advertise-url` | `C2_RELAY_ADVERTISE_URL` | Derived from the bound address |
 | Mesh seeds | `--seeds` | `C2_RELAY_SEEDS` | Empty |
 | Upstream IPC idle disconnect | `--idle-timeout` | `C2_RELAY_IDLE_TIMEOUT` | 60 seconds; `0` disables timed eviction |
 | Forwarding transaction count | `--call-max-outstanding` | `C2_CALL_MAX_OUTSTANDING` | 1,024 per relay |
@@ -128,15 +128,17 @@ C2_RELAY_IDLE_TIMEOUT=60
 | System HTTP proxy | — | `C2_RELAY_USE_PROXY` | `false` |
 | Anti-entropy interval | — | `C2_RELAY_ANTI_ENTROPY_INTERVAL` | 60 seconds; `0` disables anti-entropy |
 
+The relay binds its listener before anything else starts. With port `0` it takes a free port, derives the advertised URL from the address it actually bound, and `c3 relay` prints that address in its `C-Two relay listening at` line; any other port derives the same URL as before.
+
 `remote_payload_chunk_size` is the single remote-body batching policy, resolved by Rust from the typed transport override or `C2_REMOTE_PAYLOAD_CHUNK_SIZE`. It defaults to 1 MiB and accepts positive values up to 128 MiB. Relay HTTP uses it for outbound request bodies, and a relay copies each response or stream-item slice out of its upstream carrier in at most the lesser of this size and the upstream IPC `chunk_size`; `C2_IPC_CHUNK_SIZE` independently controls IPC wire chunks and reassembly. The remote value does not specify TCP packets or HTTP frame boundaries.
 
-Core relay-aware clients make one route observation followed by at most one pre-dispatch refresh; this bound is fixed and is not configurable through SDK settings.
+Before a call hands its input to a transport, Core acquires the client's route again at most once, under that call's deadline, when its target is known to be gone; this bound is fixed and is not configurable through SDK settings.
 
 Pre-register upstreams as `--upstream NAME=SERVER_ID@ADDRESS`; `SERVER_ID` must match the IPC handshake. See the [c3 guide](../../cli/README.md) for upstream budgets, mesh and dry-run options.
 
 Relay freezes forwarding limits at startup and applies them to all forwarded business calls, including calls with unlimited caller waiting. A zero count limit rejects new forwards; a zero payload buffer budget rejects every positive reservation. A known-length request body is reserved once before it is read; when the budget is short, the forward waits until capacity is released or the HTTP caller disconnects. An unknown-length body reserves its first part the same way, and later growth that finds no capacity fails at once. Capacity refusal preserves the route. These limits are independent of upstream IPC backing and reassembly budgets and do not measure process RSS; the [memory policy](memory-policy.md#payload-buffer-budget) lists what the payload buffer budget charges.
 
-Relay capacity rejection is fixed before business admission. Every refusal the relay sends before it reads a request body, whether for a contract, identity, route or route-token mismatch, an invalid or oversized declared length, a rejected request format or capacity, first discards the body frame by frame within its declared length and one two-second deadline, so that a client still sending the body receives the refusal rather than a reset connection. Disposal does not aggregate the payload, decode it, invoke a resource or retry admission, and capacity released during disposal does not change a capacity refusal. Bodies of requests with Expect or of unknown length are not read. Read faults, excess bytes and the timeout preserve the original refusal. An incomplete or faulty transport can still prevent the client from receiving it.
+Relay capacity rejection is fixed before business admission. Every refusal the relay sends before it reads a request body, whether for a contract, identity or route mismatch, an invalid or oversized declared length, a rejected request format or capacity, first discards the body frame by frame within its declared length and one two-second deadline, so that a client still sending the body receives the refusal rather than a reset connection. Disposal does not aggregate the payload, decode it, invoke a resource or retry admission, and capacity released during disposal does not change a capacity refusal. Bodies of requests with Expect or of unknown length are not read. Read faults, excess bytes and the timeout preserve the original refusal. An incomplete or faulty transport can still prevent the client from receiving it.
 
 After an HTTP caller disconnects, an already-dispatched forward keeps its upstream connection until actual completion; its request body is released once it has been copied upstream. Relay shutdown stops admission, ends the server streams it forwards between their steps with `CallCancelled` naming relay shutdown, and waits for forwarding and native client cleanup; unary calls already forwarded still finish. A resource method that never returns, or a stream client that has stopped reading, continues to occupy its slot and delays shutdown.
 

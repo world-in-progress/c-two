@@ -5,7 +5,10 @@ Run commands from the repository root. Follow the [development setup](../../../d
 ```bash
 FASTDB_PAYLOAD_LINK_MODE=source uv sync
 FASTDB_PAYLOAD_LINK_MODE=source python tools/dev/c3_tool.py --build --link
+python tools/dev/build_route_scope_attestor.py
 ```
+
+Relay control tests read a real registration identity through a test-only helper. The last command builds it into the shared `CARGO_TARGET_DIR` (default `core/target`) before pytest runs, so no test compiles anything; `CTWO_TEST_ROUTE_SCOPE_ATTESTOR_BIN` selects another build. `tools/dev/test_python.py` and CI build it in their preparation steps.
 
 The SDK does not embed a relay. Tests start their own `c3 relay` processes using the available binary.
 

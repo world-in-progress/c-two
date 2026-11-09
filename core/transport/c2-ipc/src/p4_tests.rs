@@ -66,7 +66,6 @@ fn config() -> ClientIpcConfig {
 fn identity() -> RouteCallIdentity {
     RouteCallIdentity {
         route_name: "grid".into(),
-        route_uid: "grid-uid".into(),
         crm_ns: "test.p4".into(),
         crm_name: "Grid".into(),
         crm_ver: "0.1.0".into(),
@@ -839,7 +838,7 @@ fn client_projects_server_identity() {
 }
 
 #[test]
-fn route_binding_keeps_acquired_token_after_directory_update() {
+fn route_binding_keeps_expected_contract_after_directory_update() {
     const ABI_HASH: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     const SIG_HASH: &str = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
     let client =
@@ -854,7 +853,6 @@ fn route_binding_keeps_acquired_token_after_directory_update() {
             }],
             RouteCallIdentity {
                 route_name: "grid".to_string(),
-                route_uid: "grid-route-uid-0001".to_string(),
                 crm_ns: "test.grid".to_string(),
                 crm_name: "Grid".to_string(),
                 crm_ver: "0.1.0".to_string(),
@@ -885,11 +883,10 @@ fn route_binding_keeps_acquired_token_after_directory_update() {
             }],
             RouteCallIdentity {
                 route_name: "grid".to_string(),
-                route_uid: "grid-route-uid-0002".to_string(),
                 crm_ns: "test.grid".to_string(),
                 crm_name: "Grid".to_string(),
                 crm_ver: "0.1.0".to_string(),
-                abi_hash: ABI_HASH.to_string(),
+                abi_hash: "0".repeat(64),
                 signature_hash: SIG_HASH.to_string(),
             },
             1024,
@@ -899,64 +896,20 @@ fn route_binding_keeps_acquired_token_after_directory_update() {
     let (_, identity, _) = binding
         .call_target_for("ping")
         .expect("bound method should still exist");
-    assert_eq!(identity.route_uid, "grid-route-uid-0001");
+    assert_eq!(identity.abi_hash, ABI_HASH);
+    assert!(matches!(
+        client.bind_cached_route(&expected),
+        Err(IpcError::ContractMismatch(_))
+    ));
     let current_binding = client
-        .bind_cached_route(&expected)
-        .expect("directory should expose current route");
-    assert_eq!(current_binding.route_uid(), "grid-route-uid-0002");
-}
-
-#[test]
-fn exact_token_binding_rejects_same_name_replacement() {
-    const ABI_HASH: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-    const SIG_HASH: &str = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
-    let client = IpcClient::with_config(
-        "ipc://route_binding_stale_projection",
-        ClientIpcConfig::default(),
-    )
-    .unwrap();
-    client.route_directory.write().insert_table(
-        "grid".to_string(),
-        MethodTable::from_entries(
-            &[MethodEntry {
-                name: "ping".to_string(),
-                index: 0,
-            }],
-            RouteCallIdentity {
-                route_name: "grid".to_string(),
-                route_uid: "grid-route-uid-0002".to_string(),
-                crm_ns: "test.grid".to_string(),
-                crm_name: "Grid".to_string(),
-                crm_ver: "0.1.0".to_string(),
-                abi_hash: ABI_HASH.to_string(),
-                signature_hash: SIG_HASH.to_string(),
-            },
-            1024,
-        ),
-    );
-    let expected = c2_contract::ExpectedRouteContract {
-        route_name: "grid".to_string(),
-        crm_ns: "test.grid".to_string(),
-        crm_name: "Grid".to_string(),
-        crm_ver: "0.1.0".to_string(),
-        abi_hash: ABI_HASH.to_string(),
-        signature_hash: SIG_HASH.to_string(),
-    };
-
-    let err = client
-        .bind_cached_route_token(&expected, "grid-route-uid-0001")
-        .expect_err("exact token binding must reject replacement route");
-
-    assert!(
-        matches!(
-            &err,
-            IpcError::RouteStale {
-                route_name,
-                current_route_uid,
-            } if route_name == "grid"
-                && current_route_uid == "grid-route-uid-0002"
-        ),
-        "unexpected error: {err:?}"
+        .bind_cached_route(&c2_contract::ExpectedRouteContract {
+            abi_hash: "0".repeat(64),
+            ..expected
+        })
+        .unwrap();
+    assert_eq!(
+        current_binding.call_target_for("ping").unwrap().1.abi_hash,
+        "0".repeat(64)
     );
 }
 
@@ -972,7 +925,6 @@ fn client_validates_route_crm_contract_from_handshake_metadata() {
         "grid".to_string(),
         MethodTable {
             route_name: "grid".to_string(),
-            route_uid: "grid-route-uid-0001".to_string(),
             crm_ns: "test.grid".to_string(),
             crm_name: "Grid".to_string(),
             crm_ver: "0.1.0".to_string(),
@@ -1028,7 +980,6 @@ async fn client_rejects_request_over_route_payload_limit_before_transport() {
         "grid".to_string(),
         MethodTable {
             route_name: "grid".to_string(),
-            route_uid: "grid-route-uid-0001".to_string(),
             crm_ns: "test.grid".to_string(),
             crm_name: "Grid".to_string(),
             crm_ver: "0.1.0".to_string(),
@@ -1121,7 +1072,6 @@ fn cancellation_client(label: &str) -> (IpcClient, RouteBinding, Arc<RwLock<MemP
         "grid".to_string(),
         MethodTable {
             route_name: "grid".to_string(),
-            route_uid: "grid-route-uid-0001".to_string(),
             crm_ns: "test.grid".to_string(),
             crm_name: "Grid".to_string(),
             crm_ver: "0.1.0".to_string(),

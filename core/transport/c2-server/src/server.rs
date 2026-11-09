@@ -2563,7 +2563,6 @@ async fn handle_handshake(
         .filter(|route| route.scheduler.route_admission_state() == RouteAdmissionState::Opened)
         .map(|route| RouteInfo {
             name: route.name.as_str(),
-            route_uid: route.route_uid.as_str(),
             crm_ns: route.crm_ns.as_str(),
             crm_name: route.crm_name.as_str(),
             crm_ver: route.crm_ver.as_str(),
@@ -2805,35 +2804,28 @@ async fn route_lookup_payload(server: &Server, payload: &[u8]) -> Vec<u8> {
         Ok(request) => request,
         Err(error) => return route_catalog_nack_payload(error),
     };
-    let (route, removed_uid) = {
+    let (route, was_removed) = {
         let dispatcher = server.dispatcher.read();
         (
             dispatcher.resolve(&request.expected.route_name),
-            dispatcher.removed_uid(&request.expected.route_name),
+            dispatcher.was_removed(&request.expected.route_name),
         )
     };
     let response = if let Some(route) = route {
         let current = route_record(server, &route);
         if current.contract != request.expected {
             RouteLookupResponse::ContractMismatch { current }
-        } else if request
-            .observed_route_uid
-            .is_some_and(|uid| uid != current.route_uid)
-        {
-            RouteLookupResponse::Stale { current }
         } else if current.state != RouteStateWire::Ready {
             RouteLookupResponse::Closed {
                 route_name: current.route_name,
-                route_uid: current.route_uid,
                 reason: current.state_reason,
             }
         } else {
             RouteLookupResponse::Ready { current }
         }
-    } else if let Some(uid) = removed_uid {
+    } else if was_removed {
         RouteLookupResponse::Removed {
             route_name: request.expected.route_name,
-            route_uid: Some(uid),
         }
     } else {
         RouteLookupResponse::NotFound {
@@ -3326,12 +3318,6 @@ enum RouteAdmissionError {
     RouteNotFound(String),
     RouteRemoved {
         route_name: String,
-        route_uid: Option<String>,
-    },
-    RouteStale {
-        route_name: String,
-        expected_uid: String,
-        actual_uid: String,
     },
     ContractMismatch {
         route_name: String,
@@ -3437,12 +3423,12 @@ fn reserve_accepted_route_execution(
     let route = match dispatcher.resolve(&identity.route_name) {
         Some(route) => route,
         None => {
-            return Err(match dispatcher.removed_uid(&identity.route_name) {
-                Some(route_uid) => RouteAdmissionError::RouteRemoved {
+            return Err(if dispatcher.was_removed(&identity.route_name) {
+                RouteAdmissionError::RouteRemoved {
                     route_name: identity.route_name.clone(),
-                    route_uid: Some(route_uid),
-                },
-                None => RouteAdmissionError::RouteNotFound(identity.route_name.clone()),
+                }
+            } else {
+                RouteAdmissionError::RouteNotFound(identity.route_name.clone())
             });
         }
     };
@@ -3467,13 +3453,6 @@ fn reserve_accepted_route_execution(
                 route.abi_hash,
                 route.signature_hash,
             ),
-        });
-    }
-    if route.route_uid != identity.route_uid {
-        return Err(RouteAdmissionError::RouteStale {
-            route_name: identity.route_name.clone(),
-            expected_uid: identity.route_uid.clone(),
-            actual_uid: route.route_uid.clone(),
         });
     }
     if !route.has_method_index(method_idx) {
@@ -3588,33 +3567,11 @@ fn route_admission_reply(err: RouteAdmissionError) -> Vec<u8> {
                 format!("route not found: {name}"),
             )
         }
-        RouteAdmissionError::RouteRemoved {
-            route_name,
-            route_uid,
-        } => {
+        RouteAdmissionError::RouteRemoved { route_name } => {
             details.insert("route".into(), route_name.clone());
-            let message = match route_uid {
-                Some(uid) => {
-                    details.insert("route_uid".into(), uid.clone());
-                    format!("route {route_name} was removed: route_uid {uid}")
-                }
-                None => format!("route {route_name} was removed"),
-            };
-            (ErrorCode::ResourceRemoved, message)
-        }
-        RouteAdmissionError::RouteStale {
-            route_name,
-            expected_uid,
-            actual_uid,
-        } => {
-            details.insert("route".into(), route_name.clone());
-            details.insert("route_uid".into(), expected_uid.clone());
-            details.insert("current_route_uid".into(), actual_uid.clone());
             (
-                ErrorCode::RouteStale,
-                format!(
-                    "stale route token for {route_name}: expected route_uid {expected_uid}, current route_uid {actual_uid}"
-                ),
+                ErrorCode::ResourceRemoved,
+                format!("route {route_name} was removed"),
             )
         }
         RouteAdmissionError::ContractMismatch { route_name, reason } => {

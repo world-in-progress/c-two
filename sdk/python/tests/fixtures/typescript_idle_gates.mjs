@@ -5,9 +5,11 @@ import { pathToFileURL } from 'node:url';
 import { captureLocalIpcEndpointContext, createNodeIpcConnector } from '@c-two/c2-mem-ffi';
 
 const config = JSON.parse(await readFile(process.argv[2], 'utf8'));
-if (config.portable) await (await import('fastdb4ts/payload')).initPayload();
+const fastdb = config.portable ? await import('fastdb4ts/payload') : null;
+if (fastdb !== null) await fastdb.initPayload();
 const manager = await import(pathToFileURL(config.managerModule).href);
 const builder = await import(pathToFileURL(config.builderModule).href);
+const payloadModule = config.payloadModule === null ? null : await import(pathToFileURL(config.payloadModule).href);
 const endpointContext = captureLocalIpcEndpointContext(config.ipcRoot === null ? {} : {ipcRoot: config.ipcRoot});
 const connector = createNodeIpcConnector({endpointContext});
 const preparations = [];
@@ -35,9 +37,9 @@ const ipc = {
     async connect(address, timeout, options) {
       const endpoint = await connector(address, timeout, options);
       return {
-        async prepare(route, contract, token) {
+        async prepare(route, contract, timeoutMs) {
           try {
-            const binding = await endpoint.prepare(route, contract, token);
+            const binding = await endpoint.prepare(route, contract, timeoutMs);
             preparations.push({route, ...binding, connectionId: String(binding.connectionId)});
             return binding;
           } catch (error) {
@@ -68,14 +70,17 @@ const ipc = {
             checkDeadline: () => native.checkDeadline(), close: () => native.close(),
           };
         },
+        connectionSnapshot: route => endpoint.connectionSnapshot(route),
         deactivate: () => endpoint.deactivate(),
         close: () => endpoint.close(),
       };
     },
   };
 const options = {
+  ...(config.callTimeoutMs === null ? {} : {callTimeoutMs: config.callTimeoutMs}),
+  ...(config.expectedServerIdentity === null ? {} : {expectedServerIdentity: config.expectedServerIdentity}),
   async fetch(url, init) {
-    const record = {url, method: init.method, routeUid: init.headers?.['x-c2-route-uid']};
+    const record = {url, method: init.method};
     http.push(record);
     if (init.method === 'POST') await pauseAt('post');
     const response = await fetch(url, init);
@@ -91,6 +96,8 @@ const options = {
 };
 const createTransport = () => config.mode === 'direct'
   ? manager.createIpcEncodedTransport(config.address, {...ipc, ...options})
+  : config.mode === 'explicit-http'
+  ? manager.createHttpRelayEncodedTransport(config.address, options)
   : manager.createRelayAwareHttpEncodedTransport(config.address, {
     ...options,
     ...(config.mode === 'http' ? {} : {
@@ -117,6 +124,10 @@ const pending = new Map();
 function describeError(error) {
   return {
     name: error.name, message: error.message, code: error.code,
+    canonicalName: error.canonicalName,
+    coreInstance: error instanceof manager.C2CoreError,
+    routeConflictInstance: error instanceof manager.C2RouteConflictError,
+    httpRelayInstance: error instanceof manager.C2HttpRelayError,
     transportPhase: error.transportPhase, retrySafe: error.retrySafe,
     nativeDetails: error.nativeDetails, details: error.details,
     status: error.status, body: error.body,
@@ -153,6 +164,17 @@ async function call(route, name) {
     return {ok: false, error: describeError(error)};
   }
 }
+async function echo(route, name, inputPath) {
+  const bytes = new Uint8Array(await readFile(inputPath));
+  const source = fastdb.Payload.openCopy(payloadModule.compileSpec(), bytes);
+  try {
+    const result = await clientFor(route, name).method_2_echo(source);
+    const responseBytes = result.binaryBytes().byteLength;
+    return {ok: true, value: decodeEvidence(result), inputBytes: bytes.byteLength, responseBytes};
+  } catch (error) {
+    return {ok: false, error: describeError(error), inputBytes: bytes.byteLength};
+  } finally { source.dispose(); }
+}
 reply({ready: true});
 try {
   for await (const line of createInterface({input: process.stdin, crlfDelay: Infinity})) {
@@ -161,7 +183,7 @@ try {
       pause?.release.resolve();
       for (const stream of streams.values()) await stream.close(null);
       for (const item of retainedItems.values()) item.dispose();
-      await Promise.all([...transports.values()].map(state => state.transport.close()));
+      await Promise.all([...transports.values()].map(state => state.transport.close?.()));
       const stats = connector.stats();
       assert.equal(stats.used_operations, '0');
       assert.equal(stats.payload_buffer?.used_bytes ?? '0', '0');
@@ -233,6 +255,10 @@ try {
       reply({ok: outcomes.every(value => value.ok), outcomes, ...evidence()});
       continue;
     }
+    if (command.op === 'echo') {
+      reply({...await echo(command.route, command.client, command.inputPath), ...evidence()});
+      continue;
+    }
     if (command.op === 'stream-open') {
       streams.set(command.id, clientFor(command.route, command.client).method_1_items());
       reply({ok: true});
@@ -275,7 +301,7 @@ try {
   }
 } finally {
   pause?.release.resolve();
-  await Promise.all([...transports.values()].map(state => state.transport.close()));
+  await Promise.all([...transports.values()].map(state => state.transport.close?.()));
   connector.close();
   endpointContext.close();
 }

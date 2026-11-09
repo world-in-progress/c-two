@@ -87,7 +87,7 @@ pub async fn handle_peer_announce(
             abi_hash,
             signature_hash,
             max_payload_size,
-            route_uid,
+
             registered_at,
         } => {
             // Peer wire data never carries owner-private fields; keep peer
@@ -107,7 +107,8 @@ pub async fn handle_peer_announce(
                     abi_hash,
                     signature_hash,
                     max_payload_size,
-                    route_uid,
+
+                    route_uid: None,
                     locality: Locality::Peer,
                     registered_at,
                 },
@@ -214,13 +215,7 @@ pub async fn handle_peer_heartbeat(
             return StatusCode::OK;
         }
         state.with_route_table_mut(|rt| {
-            if let Some(peer) = rt.get_peer_mut(&relay_id) {
-                peer.last_heartbeat = std::time::Instant::now();
-                peer.route_count = route_count;
-                if peer.status == PeerStatus::Dead || peer.status == PeerStatus::Suspect {
-                    peer.status = PeerStatus::Alive;
-                }
-            }
+            rt.record_peer_heartbeat(&relay_id, route_count);
         });
     }
     StatusCode::OK
@@ -248,8 +243,25 @@ pub async fn handle_peer_leave(
         {
             return StatusCode::OK;
         }
-        RouteAuthority::new(&state).remove_peer_routes(&relay_id);
         state.unregister_peer(&relay_id);
+    }
+    StatusCode::OK
+}
+
+/// POST /_peer/force-leave — a deployer declaration forwarded by a live peer
+pub async fn handle_peer_force_leave(
+    State(state): State<Arc<RelayState>>,
+    Json(envelope): Json<PeerEnvelope>,
+) -> impl IntoResponse {
+    let Ok(ValidatedRouteStateEnvelope::Message(envelope)) =
+        validate_route_state_envelope(envelope, None)
+    else {
+        return StatusCode::OK;
+    };
+    if let PeerMessage::RelayForceLeave { relay_id } = envelope.message
+        && RouteAuthority::new(&state).force_leave_from_peer(&envelope.sender_relay_id, &relay_id)
+    {
+        crate::relay::gossip::broadcast_force_leave(&state, relay_id);
     }
     StatusCode::OK
 }
@@ -413,7 +425,7 @@ mod tests {
             abi_hash: TEST_ABI_HASH.into(),
             signature_hash: TEST_SIGNATURE_HASH.into(),
             max_payload_size: 1024,
-            route_uid: "grid-route-uid-0001".into(),
+
             registered_at: 1000.0,
         };
         entry
@@ -454,7 +466,7 @@ mod tests {
                 abi_hash: TEST_ABI_HASH.into(),
                 signature_hash: TEST_SIGNATURE_HASH.into(),
                 max_payload_size: 1024,
-                route_uid: "grid-route-uid-0001".into(),
+
                 registered_at: 1000.0,
             },
         );
@@ -483,7 +495,7 @@ mod tests {
                 abi_hash: TEST_ABI_HASH.into(),
                 signature_hash: TEST_SIGNATURE_HASH.into(),
                 max_payload_size: 1024,
-                route_uid: "grid-route-uid-0001".into(),
+
                 registered_at: 1000.0,
             },
         );
@@ -513,7 +525,7 @@ mod tests {
                 abi_hash: TEST_ABI_HASH.into(),
                 signature_hash: TEST_SIGNATURE_HASH.into(),
                 max_payload_size: 1024,
-                route_uid: "grid-route-uid-0001".into(),
+
                 registered_at: 1000.0,
             },
         );
@@ -555,7 +567,7 @@ mod tests {
                     abi_hash: TEST_ABI_HASH.into(),
                     signature_hash: TEST_SIGNATURE_HASH.into(),
                     max_payload_size: 1024,
-                    route_uid: "grid-route-uid-0001".into(),
+
                     registered_at: 1000.0,
                 },
             );
@@ -588,7 +600,7 @@ mod tests {
                 abi_hash: TEST_ABI_HASH.into(),
                 signature_hash: TEST_SIGNATURE_HASH.into(),
                 max_payload_size: 1024,
-                route_uid: "grid-route-uid-0001".into(),
+
                 registered_at: 1000.0,
             },
         );
@@ -620,7 +632,7 @@ mod tests {
                 abi_hash: TEST_ABI_HASH.into(),
                 signature_hash: TEST_SIGNATURE_HASH.into(),
                 max_payload_size: 1024,
-                route_uid: "grid-route-uid-0001".into(),
+
                 registered_at: 1000.0,
             },
         );
@@ -704,7 +716,8 @@ mod tests {
                 abi_hash: TEST_ABI_HASH.into(),
                 signature_hash: TEST_SIGNATURE_HASH.into(),
                 max_payload_size: 1024,
-                route_uid: "grid-route-uid-0001".into(),
+
+                route_uid: None,
                 locality: Locality::Peer,
                 registered_at: 1000.0,
             },
@@ -802,7 +815,8 @@ mod tests {
                 abi_hash: TEST_ABI_HASH.into(),
                 signature_hash: TEST_SIGNATURE_HASH.into(),
                 max_payload_size: 1024,
-                route_uid: "grid-route-uid-0001".into(),
+
+                route_uid: None,
                 locality: Locality::Peer,
                 registered_at: 1000.0,
             },
@@ -843,7 +857,8 @@ mod tests {
                 abi_hash: TEST_ABI_HASH.into(),
                 signature_hash: TEST_SIGNATURE_HASH.into(),
                 max_payload_size: 1024,
-                route_uid: "grid-route-uid-0001".into(),
+
+                route_uid: None,
                 locality: Locality::Peer,
                 registered_at: 1000.0,
             },
@@ -912,7 +927,8 @@ mod tests {
                 abi_hash: TEST_ABI_HASH.into(),
                 signature_hash: TEST_SIGNATURE_HASH.into(),
                 max_payload_size: 1024,
-                route_uid: "grid-route-uid-0001".into(),
+
+                route_uid: None,
                 locality: Locality::Peer,
                 registered_at: 1000.0,
             },
@@ -953,7 +969,8 @@ mod tests {
                 abi_hash: TEST_ABI_HASH.into(),
                 signature_hash: TEST_SIGNATURE_HASH.into(),
                 max_payload_size: 1024,
-                route_uid: "grid-route-uid-0001".into(),
+
+                route_uid: Some("grid-local-uid".into()),
                 locality: Locality::Local,
                 registered_at: 1000.0,
             });
@@ -1129,7 +1146,8 @@ mod tests {
                 abi_hash: TEST_ABI_HASH.into(),
                 signature_hash: TEST_SIGNATURE_HASH.into(),
                 max_payload_size: 1024,
-                route_uid: "grid-route-uid-0001".into(),
+
+                route_uid: Some("grid-local-uid".into()),
                 locality: Locality::Local,
                 registered_at: 1000.0,
             });
@@ -1149,7 +1167,8 @@ mod tests {
                 abi_hash: TEST_ABI_HASH.into(),
                 signature_hash: TEST_SIGNATURE_HASH.into(),
                 max_payload_size: 1024,
-                route_uid: "grid-route-uid-0001".into(),
+
+                route_uid: None,
                 locality: Locality::Peer,
                 registered_at: 1001.0,
             },
@@ -1259,7 +1278,8 @@ mod tests {
                 abi_hash: TEST_ABI_HASH.into(),
                 signature_hash: TEST_SIGNATURE_HASH.into(),
                 max_payload_size: 1024,
-                route_uid: "grid-route-uid-0001".into(),
+
+                route_uid: None,
                 locality: Locality::Peer,
                 registered_at: 1000.0,
             },
@@ -1314,7 +1334,8 @@ mod tests {
                 abi_hash: TEST_ABI_HASH.into(),
                 signature_hash: TEST_SIGNATURE_HASH.into(),
                 max_payload_size: 1024,
-                route_uid: "grid-route-uid-0001".into(),
+
+                route_uid: Some("grid-local-uid".into()),
                 locality: Locality::Local,
                 registered_at: 1000.0,
             });
@@ -1349,7 +1370,8 @@ mod tests {
                 abi_hash: TEST_ABI_HASH.into(),
                 signature_hash: TEST_SIGNATURE_HASH.into(),
                 max_payload_size: 1024,
-                route_uid: "grid-route-uid-0001".into(),
+
+                route_uid: Some("grid-local-uid".into()),
                 locality: Locality::Local,
                 registered_at: 1000.0,
             });

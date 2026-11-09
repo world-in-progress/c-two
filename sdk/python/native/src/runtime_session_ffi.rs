@@ -1625,7 +1625,6 @@ fn register_outcome_to_dict<'py>(
 ) -> PyResult<Bound<'py, PyDict>> {
     let dict = PyDict::new(py);
     dict.set_item("route_name", outcome.route_name)?;
-    dict.set_item("route_uid", outcome.route_uid)?;
     dict.set_item("server_id", outcome.server_id)?;
     dict.set_item("server_instance_id", outcome.server_instance_id)?;
     dict.set_item("ipc_address", outcome.ipc_address)?;

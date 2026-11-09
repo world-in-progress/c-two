@@ -11,11 +11,12 @@ use pyo3::types::{PyBytes, PyDict, PyList};
 
 use c2_core::memory::LocalCopyGuard;
 use c2_core::{
-    CallOptions, CallTimeout, Client, EncodedService, EncodedStreamService, HeldResponse,
-    LifecycleError, ObservedPath, ObservedRoute, PreparedCall, ServerFailure,
+    CallBudget, CallOptions, CallTimeout, Client, EncodedService, EncodedStreamService,
+    HeldResponse, LifecycleError, ObservedPath, PreparedCall, ServerFailure,
 };
 use c2_error::{C2Error, ErrorCode};
 
+use crate::config_ffi::PyConnectAttempt;
 use crate::core_error_ffi::{core_error_to_py, lifecycle_error_to_py};
 use crate::local_copy_ffi::PyLocalCopyTracker;
 
@@ -23,21 +24,15 @@ use crate::local_copy_ffi::PyLocalCopyTracker;
 pub(crate) struct PyCoreClient {
     inner: Mutex<Option<Client>>,
     route_name: String,
-    observed_path: ObservedPath,
-    observed_route: ObservedRoute,
     local_copy_tracker: PyLocalCopyTracker,
 }
 
 impl PyCoreClient {
     pub(crate) fn new(client: Client, local_copy_tracker: PyLocalCopyTracker) -> Self {
         let route_name = client.expected_route().route_name.clone();
-        let observed_path = client.observed_path();
-        let observed_route = client.observed_route().clone();
         Self {
             inner: Mutex::new(Some(client)),
             route_name,
-            observed_path,
-            observed_route,
             local_copy_tracker,
         }
     }
@@ -53,6 +48,24 @@ impl PyCoreClient {
 #[pyclass(name = "NativeCallOptions", frozen, skip_from_py_object)]
 struct PyNativeCallOptions {
     options: CallOptions,
+}
+
+#[pyclass(name = "NativeCallBudget", frozen, skip_from_py_object)]
+struct PyNativeCallBudget {
+    inner: Mutex<Option<CallBudget>>,
+}
+
+#[pymethods]
+impl PyNativeCallBudget {
+    fn connect_attempt(&self) -> PyResult<PyConnectAttempt> {
+        let inner = self.inner.lock();
+        let budget = inner
+            .as_ref()
+            .ok_or_else(|| PyValueError::new_err("call budget has already been consumed"))?;
+        Ok(PyConnectAttempt {
+            inner: budget.connect_attempt(),
+        })
+    }
 }
 
 fn inherit_timeout() -> Py<PyAny> {
@@ -97,6 +110,13 @@ impl PyNativeCallOptions {
             )));
         }
         Ok(())
+    }
+
+    fn call_budget(&self) -> PyResult<PyNativeCallBudget> {
+        let budget = CallBudget::new(self.options, None).map_err(core_error_to_py)?;
+        Ok(PyNativeCallBudget {
+            inner: Mutex::new(Some(budget)),
+        })
     }
 }
 
@@ -220,11 +240,13 @@ impl PyCoreClient {
     }
 
     #[getter]
-    fn mode(&self) -> &'static str {
-        match self.observed_path {
-            ObservedPath::DirectIpc | ObservedPath::RelayAwareLocalIpc => "ipc",
-            ObservedPath::ExplicitRelay | ObservedPath::RelayAwareRelay => "http",
-        }
+    fn mode(&self) -> PyResult<&'static str> {
+        Ok(
+            match self.client().map_err(core_error_to_py)?.observed_path() {
+                ObservedPath::DirectIpc | ObservedPath::RelayAwareLocalIpc => "ipc",
+                ObservedPath::ExplicitRelay | ObservedPath::RelayAwareRelay => "http",
+            },
+        )
     }
 
     #[getter]
@@ -238,18 +260,15 @@ impl PyCoreClient {
     }
 
     #[getter]
-    fn observed_path(&self) -> &'static str {
-        match self.observed_path {
-            ObservedPath::DirectIpc => "direct_ipc",
-            ObservedPath::ExplicitRelay => "explicit_relay",
-            ObservedPath::RelayAwareLocalIpc => "relay_aware_local_ipc",
-            ObservedPath::RelayAwareRelay => "relay_aware_relay",
-        }
-    }
-
-    #[getter]
-    fn route_uid(&self) -> &str {
-        &self.observed_route.route_uid
+    fn observed_path(&self) -> PyResult<&'static str> {
+        Ok(
+            match self.client().map_err(core_error_to_py)?.observed_path() {
+                ObservedPath::DirectIpc => "direct_ipc",
+                ObservedPath::ExplicitRelay => "explicit_relay",
+                ObservedPath::RelayAwareLocalIpc => "relay_aware_local_ipc",
+                ObservedPath::RelayAwareRelay => "relay_aware_relay",
+            },
+        )
     }
 
     #[pyo3(signature = (*, timeout=inherit_timeout()))]
@@ -270,9 +289,47 @@ impl PyCoreClient {
         })
     }
 
+    fn begin_call_with_budget(
+        &self,
+        py: Python<'_>,
+        method_name: &str,
+        budget: &PyNativeCallBudget,
+    ) -> PyResult<PyNativePreparedCall> {
+        let budget = budget
+            .inner
+            .lock()
+            .take()
+            .ok_or_else(|| PyValueError::new_err("call budget has already been consumed"))?;
+        let prepared = py
+            .detach(|| self.client()?.begin_call_with_budget(method_name, budget))
+            .map_err(core_error_to_py)?;
+        Ok(PyNativePreparedCall {
+            inner: Mutex::new(Some(prepared)),
+        })
+    }
+
     fn begin_stream(&self, py: Python<'_>, method_name: &str) -> PyResult<PyNativePreparedCall> {
         let prepared = py
             .detach(|| self.client()?.begin_stream(method_name))
+            .map_err(core_error_to_py)?;
+        Ok(PyNativePreparedCall {
+            inner: Mutex::new(Some(prepared)),
+        })
+    }
+
+    fn begin_stream_with_budget(
+        &self,
+        py: Python<'_>,
+        method_name: &str,
+        budget: &PyNativeCallBudget,
+    ) -> PyResult<PyNativePreparedCall> {
+        let budget = budget
+            .inner
+            .lock()
+            .take()
+            .ok_or_else(|| PyValueError::new_err("call budget has already been consumed"))?;
+        let prepared = py
+            .detach(|| self.client()?.begin_stream_with_budget(method_name, budget))
             .map_err(core_error_to_py)?;
         Ok(PyNativePreparedCall {
             inner: Mutex::new(Some(prepared)),
@@ -791,6 +848,7 @@ fn core_capability_receipt<'py>(py: Python<'py>) -> PyResult<Bound<'py, PyDict>>
 pub(crate) fn register_module(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyCoreClient>()?;
     module.add_class::<PyNativeCallOptions>()?;
+    module.add_class::<PyNativeCallBudget>()?;
     module.add_class::<PyNativePreparedCall>()?;
     module.add_class::<PyCoreResponse>()?;
     module.add_class::<PyCoreRequestBuffer>()?;

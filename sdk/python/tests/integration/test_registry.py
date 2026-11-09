@@ -16,7 +16,7 @@ import pytest
 
 import c_two as cc
 from c_two.config.settings import settings
-from c_two.error import ContractMismatch, ResourceAlreadyRegistered, RouteStale
+from c_two.error import ContractMismatch, ResourceAlreadyRegistered, ResourceRemoved
 from c_two.transport.registry import Runtime, _get_default_runtime, _reset_default_runtime
 from c_two.transport.client.proxy import CRMProxy
 
@@ -231,22 +231,245 @@ class TestRegisterConnect:
         finally:
             cc.close(crm)
 
-    def test_thread_local_proxy_rejects_calls_after_unregister(self):
-        """Thread-local proxies must observe native route admission close."""
+    def test_thread_local_proxy_follows_reregistration_across_views(self):
+        """An existing proxy and its view use the next local registration."""
         cc.register(Hello, HelloImpl(), name='hello')
+        crm = cc.connect(Hello, name='hello')
+        view = cc.with_call_options(crm, timeout=None)
+        try:
+            assert crm.greeting('World') == 'Hello, World!'
+            cc.unregister('hello')
+            cc.register(Hello, PrefixHelloImpl('next'), name='hello')
+            assert view.greeting('World') == 'next:World'
+            assert crm.greeting('Again') == 'next:Again'
+            assert crm.client.observed_path == 'thread_local'
+        finally:
+            cc.close(view)
+            cc.close(crm)
+
+    def test_thread_local_proxy_without_registration_rejects_before_resource(self):
+        """An absent route does not enter the previous resource."""
+        class CountingHello(HelloImpl):
+            calls = 0
+
+            def greeting(self, name: str) -> str:
+                self.calls += 1
+                return super().greeting(name)
+
+        resource = CountingHello()
+        cc.register(Hello, resource, name='hello')
         crm = cc.connect(Hello, name='hello')
         try:
             assert crm.greeting('World') == 'Hello, World!'
             cc.unregister('hello')
 
-            with pytest.raises(
-                cc.error.ResourceClosed,
-                match="route 'hello' is closed",
-            ) as exc_info:
+            with pytest.raises(cc.error.ResourceClosed, match="route 'hello' is closed") as failure:
                 crm.greeting('World')
-            assert exc_info.value.details == {'route': 'hello'}
+            assert failure.value.details == {'route': 'hello'}
+            assert resource.calls == 1
         finally:
             cc.close(crm)
+
+    def test_healthy_local_calls_do_not_resolve_or_create_a_budget(self, monkeypatch):
+        cc.register(Hello, HelloImpl(), name='hello')
+        crm = cc.connect(Hello, name='hello')
+        scheduler = crm.client._scheduler
+
+        def unexpected(*_args, **_kwargs):
+            raise AssertionError('healthy local call performed route resolution')
+
+        try:
+            with monkeypatch.context() as patch:
+                patch.setattr(CRMProxy, 'start_call_budget', unexpected)
+                patch.setattr(CRMProxy, 'resolve_for_call', unexpected)
+                patch.setattr(CRMProxy, '_local_snapshot', unexpected)
+                patch.setattr(scheduler, 'snapshot', unexpected)
+                assert crm.greeting('World') == 'Hello, World!'
+            monkeypatch.setattr(CRMProxy, 'start_call_budget', unexpected)
+            finite = cc.with_call_options(crm, timeout=0.1)
+            try:
+                with pytest.raises(cc.error.UnsupportedCallMode):
+                    finite.greeting('World')
+            finally:
+                cc.close(finite)
+        finally:
+            cc.close(crm)
+
+    def test_captured_local_target_stays_local_until_native_admission(self, monkeypatch):
+        """A's captured target cannot change when B follows the remote route."""
+        cc.register(Hello, PrefixHelloImpl('local'), name='hello')
+        crm = cc.connect(Hello, name='hello')
+        remote_runtime = Runtime()
+        remote_runtime.register(Hello, PrefixHelloImpl('remote'), name='hello')
+        address = remote_runtime.server_address()
+        runtime = _get_default_runtime()
+        monkeypatch.setattr(
+            runtime, '_connect',
+            lambda _crm_class, *, name, address, attempt: remote_runtime.connect(
+                Hello, name=name, address=address or remote_runtime.server_address(),
+            ),
+        )
+
+        captured = threading.Event()
+        proceed = threading.Event()
+        paused = False
+        getter = CRMProxy.supports_direct_call.fget
+
+        def gated_direct_call(target):
+            nonlocal paused
+            if threading.current_thread().name == 'captured-local-call' and not paused:
+                paused = True
+                assert target._mode == 'thread'
+                assert target._client is None
+                captured.set()
+                assert proceed.wait(5)
+            return getter(target)
+
+        monkeypatch.setattr(CRMProxy, 'supports_direct_call', property(gated_direct_call))
+        result = {}
+
+        def call_captured():
+            try:
+                result['value'] = crm.greeting('A')
+            except BaseException as exc:
+                result['error'] = exc
+
+        worker = threading.Thread(target=call_captured, name='captured-local-call')
+        try:
+            worker.start()
+            assert captured.wait(5)
+            cc.unregister('hello')
+            assert crm.greeting('B') == 'remote:B'
+            proceed.set()
+            worker.join(5)
+            assert not worker.is_alive()
+            assert result == {'value': 'remote:A'}
+        finally:
+            proceed.set()
+            worker.join(5)
+            cc.close(crm)
+            assert remote_runtime.shutdown()['completed']
+
+    def test_connect_skips_a_withdrawn_local_slot(self, monkeypatch):
+        cc.register(Hello, HelloImpl(), name='hello')
+        runtime = _get_default_runtime()
+        server = runtime._server
+        withdrawn_slot = server.get_local_slot_info('hello')
+        cc.unregister('hello')
+        assert withdrawn_slot[1].snapshot().closed
+        monkeypatch.setattr(
+            server, 'get_local_slot_info',
+            lambda _name, connect_attempt=None: withdrawn_slot,
+        )
+
+        with pytest.raises(LookupError, match='not registered locally'):
+            cc.connect(Hello, name='hello')
+
+    def test_view_creation_racing_original_close_keeps_followed_target(self, monkeypatch):
+        from c_two import _native
+
+        cc.register(Hello, PrefixHelloImpl('local'), name='hello')
+        crm = cc.connect(Hello, name='hello')
+        remote_runtime = Runtime()
+        remote_runtime.register(Hello, PrefixHelloImpl('remote'), name='hello')
+        runtime = _get_default_runtime()
+        acquisitions = []
+
+        def follow(_crm_class, *, name, address, attempt):
+            acquisitions.append(name)
+            return remote_runtime.connect(
+                Hello, name=name, address=remote_runtime.server_address(),
+            )
+
+        monkeypatch.setattr(runtime, '_connect', follow)
+        cc.unregister('hello')
+        assert crm.greeting('before') == 'remote:before'
+        assert acquisitions == ['hello']
+
+        target = crm.client._following_local.target
+        target_closes = []
+        original_close = target._on_terminate
+
+        def record_target_close():
+            target_closes.append(True)
+            original_close()
+
+        target._on_terminate = record_target_close
+        real_options = _native.NativeCallOptions
+        in_options = threading.Event()
+        finish_options = threading.Event()
+
+        def gated_options(*args, **kwargs):
+            in_options.set()
+            assert finish_options.wait(5)
+            return real_options(*args, **kwargs)
+
+        monkeypatch.setattr(_native, 'NativeCallOptions', gated_options)
+        created = {}
+        close_finished = threading.Event()
+        close_started = threading.Event()
+        close_acquired = threading.Event()
+        creator = closer = None
+
+        class TrackedLock:
+            def __init__(self):
+                self.inner = threading.Lock()
+                self.owner = None
+
+            def __enter__(self):
+                self.inner.acquire()
+                self.owner = threading.current_thread()
+                if self.owner is closer:
+                    close_acquired.set()
+                return self
+
+            def __exit__(self, *_args):
+                self.owner = None
+                self.inner.release()
+
+        tracked_lock = TrackedLock()
+        crm.client._close_lock = tracked_lock
+
+        def create_view():
+            try:
+                created['view'] = cc.with_call_options(crm, timeout=None)
+            except BaseException as exc:
+                created['error'] = exc
+
+        def close_original():
+            close_started.set()
+            cc.close(crm)
+            close_finished.set()
+
+        creator = threading.Thread(target=create_view)
+        closer = threading.Thread(target=close_original)
+        try:
+            creator.start()
+            assert in_options.wait(5)
+            closer.start()
+            assert close_started.wait(5)
+            if tracked_lock.owner is not creator:
+                assert close_acquired.wait(5)
+            finish_options.set()
+            creator.join(5)
+            closer.join(5)
+            assert not creator.is_alive() and not closer.is_alive()
+            assert close_finished.is_set()
+            assert 'error' not in created
+            view = created['view']
+            assert target_closes == []
+            assert view.greeting('after') == 'remote:after'
+            assert acquisitions == ['hello']
+            cc.close(view)
+            assert target_closes == [True]
+        finally:
+            finish_options.set()
+            creator.join(5)
+            closer.join(5)
+            if 'view' in created:
+                cc.close(created['view'])
+            cc.close(crm)
+            assert remote_runtime.shutdown()['completed']
 
     def test_connect_thread_local_resource_error_is_classified(self):
         """Thread-local resource errors should not be masked by client wrapper state."""
@@ -255,6 +478,25 @@ class TestRegisterConnect:
         try:
             with pytest.raises(cc.error.ResourceExecuteFunction, match='direct resource failed'):
                 crm.fail()
+        finally:
+            cc.close(crm)
+
+    def test_thread_local_resource_error_named_route_closed_does_not_follow(self):
+        class FailingHello(HelloImpl):
+            calls = 0
+
+            def greeting(self, name: str) -> str:
+                self.calls += 1
+                raise RuntimeError('route closed')
+
+        resource = FailingHello()
+        cc.register(Hello, resource, name='hello')
+        crm = cc.connect(Hello, name='hello')
+        try:
+            with pytest.raises(cc.error.ResourceExecuteFunction, match='route closed'):
+                crm.greeting('World')
+            assert resource.calls == 1
+            assert crm.client.observed_path == 'thread_local'
         finally:
             cc.close(crm)
 
@@ -319,22 +561,26 @@ class TestRegisterConnect:
         finally:
             cc.close(crm)
 
-    def test_ipc_proxy_keeps_acquired_route_token_after_reregister(self):
+    def test_ipc_proxy_follows_same_endpoint_reregistration(self):
         cc.register(Hello, PrefixHelloImpl('old'), name='hello')
         addr = cc.server_address()
         assert addr is not None
 
         old_crm = cc.connect(Hello, name='hello', address=addr)
         try:
+            assert not hasattr(old_crm.client, 'route_uid')
+            assert not hasattr(old_crm.client._client, 'route_uid')  # noqa: SLF001
             assert old_crm.greeting('grid') == 'old:grid'
             cc.unregister('hello')
+            with pytest.raises(ResourceRemoved) as removed:
+                old_crm.greeting('gap')
+            assert removed.value.details['transport_phase'] == 'pre_dispatch'
             cc.register(Hello, PrefixHelloImpl('new'), name='hello')
 
             new_crm = cc.connect(Hello, name='hello', address=addr)
             try:
                 assert new_crm.greeting('grid') == 'new:grid'
-                with pytest.raises(RouteStale, match='stale route token'):
-                    old_crm.greeting('grid')
+                assert old_crm.greeting('grid') == 'new:grid'
             finally:
                 cc.close(new_crm)
         finally:
@@ -365,6 +611,14 @@ class TestRegisterConnect:
         crm = cc.connect(Hello, name='hello')
         cc.close(crm)
         assert crm.client._closed is True
+
+    def test_close_refuses_a_local_call_captured_before_close(self):
+        cc.register(Hello, PrefixHelloImpl('closed'), name='hello')
+        crm = cc.connect(Hello, name='hello')
+        snapshot = crm.client.resolve_for_call(crm.client.start_call_budget())
+        cc.close(crm)
+        with pytest.raises(RuntimeError, match='Proxy is closed'):
+            snapshot.call_direct('greeting', ('grid',))
 
     def test_unregister(self):
         cc.register(Hello, HelloImpl(), name='hello')

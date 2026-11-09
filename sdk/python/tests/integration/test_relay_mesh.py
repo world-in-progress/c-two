@@ -23,6 +23,7 @@ from c_two._native import resolve_server_ipc_config
 from c_two.config.settings import settings
 from c_two.crm.contract import crm_contract
 from c_two.transport.registry import _get_default_runtime, _reset_default_runtime
+from tests.fixtures.route_scope_attestor import attested_registration_scope, route_scope_attestor_binary
 
 
 @cc.crm(namespace="test.mesh", version="0.1.0")
@@ -54,7 +55,10 @@ def _http_post(url: str, body: dict) -> urllib.request.Request:
     return urllib.request.Request(
         url,
         data=json.dumps(body).encode(),
-        headers={"Content-Type": "application/json"},
+        headers={
+            "Content-Type": "application/json",
+            "x-c2-local-namespace": cc.endpoint.local_endpoint_context().namespace_id,
+        },
         method="POST",
     )
 
@@ -86,13 +90,17 @@ def _register_body(name: str, server_id: str) -> dict[str, object]:
     }
 
 
-def _registration_scope(base_url: str, name: str) -> dict[str, object]:
+def _registration_scope(base_url: str, name: str, binary) -> dict[str, object]:
     # Capture the full native identity from the registering relay, not a peer
     # projection (remote entries deliberately omit local server identity).
-    route = _http_get_json(_resolve_url(base_url, name))[0]
-    return {key: route[key] for key in (
-        'name', 'server_id', 'server_instance_id', 'route_uid',
-    )}
+    request = urllib.request.Request(
+        _resolve_url(base_url, name),
+        headers={"x-c2-local-namespace": cc.endpoint.local_endpoint_context().namespace_id},
+    )
+    route = _http_get_json(request)[0]
+    return attested_registration_scope(
+        binary, name, route['ipc_address'], route['server_id'], route['server_instance_id'],
+    )
 
 
 def _http_get_json(url: str):
@@ -167,7 +175,7 @@ def _wait_for_peer(url: str, relay_id: str, *, timeout: float = 8.0):
 class TestSingleRelay:
     """Tests with one relay."""
 
-    def test_register_and_resolve(self, start_c3_relay):
+    def test_register_and_resolve(self, start_c3_relay, route_scope_attestor_binary):
         relay = start_c3_relay()
         base = relay.url
 
@@ -187,7 +195,7 @@ class TestSingleRelay:
         # Unregister.
         req = _http_post(
             f"{base}/_unregister",
-            _registration_scope(base, "grid"),
+            _registration_scope(base, "grid", route_scope_attestor_binary),
         )
         with urllib.request.urlopen(req, timeout=5) as resp:
             assert resp.status == 200
@@ -259,7 +267,7 @@ class TestTwoRelayMesh:
         peers_a = _http_get_json(f"{url_a}/_peers")
         assert any(p["relay_id"] == "relay-b" for p in peers_a)
 
-    def test_route_withdraw_propagation(self, start_c3_relay):
+    def test_route_withdraw_propagation(self, start_c3_relay, route_scope_attestor_binary):
         relay_a = start_c3_relay(
             relay_id="relay-a",
         )
@@ -286,7 +294,7 @@ class TestTwoRelayMesh:
         # Unregister on A.
         req = _http_post(
             f"{url_a}/_unregister",
-            _registration_scope(url_a, "net"),
+            _registration_scope(url_a, "net", route_scope_attestor_binary),
         )
         urllib.request.urlopen(req, timeout=5)
 

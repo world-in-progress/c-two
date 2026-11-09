@@ -27,16 +27,12 @@ export type C2ObservedPath =
   | "RelayAwareLocalIpc"
   | "RelayAwareHttp";
 
-export interface C2RouteToken {
-  readonly routeUid: string;
-}
-
 export interface C2ServerIdentity {
   readonly serverId: string;
   readonly serverInstanceId: string;
 }
 
-export interface C2TransportObservation extends C2RouteToken {
+export interface C2TransportObservation {
   readonly path: C2ObservedPath;
   readonly routeName: string;
   readonly requests: number;
@@ -45,6 +41,7 @@ export interface C2TransportObservation extends C2RouteToken {
   readonly ipcAddress?: string | undefined;
   readonly serverId?: string | undefined;
   readonly serverInstanceId?: string | undefined;
+  readonly connectionId?: string | undefined;
 }
 
 export type C2TransportObserver = (observation: C2TransportObservation) => void;
@@ -77,7 +74,7 @@ export interface C2StreamReceipt {
 
 export interface C2NativeCall {
   chargeInput(byteLength: bigint | number): Promise<void>;
-  dispatch(bytes: Uint8Array): Promise<void>;
+  dispatch(bytes: Uint8Array): Promise<C2NativeCallTarget>;
   next(): Promise<C2NativeBuffer | null>;
   cancel(): void;
   observe(timeoutMs: number | null): Promise<C2StreamReceipt>;
@@ -85,13 +82,24 @@ export interface C2NativeCall {
   close(): void;
 }
 
+export interface C2NativeCallTarget extends C2ServerIdentity {
+  readonly path: C2ObservedPath;
+  readonly connectionId: bigint | string;
+}
+
 export interface C2NativeEndpointContext {
-  prepare(routeName: string, contract: C2RouteContractIdentity, expectedRouteToken?: C2RouteToken): Promise<{
-    serverId: string; serverInstanceId: string; routeUid: string; connectionId: bigint | string;
+  prepare(routeName: string, contract: C2RouteContractIdentity, timeoutMs?: number): Promise<{
+    serverId: string; serverInstanceId: string; connectionId: bigint | string;
   }>;
+  connectionSnapshot(routeName: string): C2ConnectionSnapshot | null;
   beginCall(routeName: string, method: string, serverStream: boolean, timeoutMs: number | null): C2NativeCall;
   deactivate(): void;
   close(): Promise<void>;
+}
+
+export interface C2ConnectionSnapshot extends C2ServerIdentity {
+  readonly connectionId: bigint | string;
+  readonly endReason: "local_close" | "peer_close_message" | "peer_eof" | "connection_reset" | "protocol_error" | "io_error" | null;
 }
 
 export interface C2IpcNativeEndpointOptions {
@@ -116,7 +124,7 @@ export interface C2IpcTransportOptions<Payload extends C2ResponsePayload = C2Byt
 }
 
 export interface C2IpcEncodedTransport<Payload extends C2ResponsePayload = C2ByteArray> extends C2StreamEncodedClientTransport {
-  prepare(routeName: string, contract: C2ContractIdentity, expectedRouteToken?: C2RouteToken): Promise<void>;
+  prepare(routeName: string, contract: C2ContractIdentity): Promise<void>;
   call(routeName: string, contract: C2ContractIdentity, method: string, encode: () => C2ByteArray): Promise<Payload>;
   close(): Promise<void>;
 }
@@ -185,15 +193,12 @@ export interface C2HttpRelayTransportOptions<Payload extends C2ResponsePayload =
 }
 
 export interface C2RelayAwareHttpTransportOptions<Payload extends C2ResponsePayload = C2ByteArray> extends C2HttpRelayTransportOptions<Payload> {
-  readonly maxAttempts?: number;
-  readonly routeCacheTtlMs?: number;
   readonly ipc?: C2IpcTransportOptions<Payload>;
 }
 
 interface C2RelayRouteInfo {
   readonly name: string;
   readonly relayUrl: string;
-  readonly routeUid: string;
   readonly ipcAddress?: string | undefined;
   readonly serverId?: string | undefined;
   readonly serverInstanceId?: string | undefined;
@@ -202,17 +207,10 @@ interface C2RelayRouteInfo {
   readonly crmVer: string;
   readonly abiHash: string;
   readonly signatureHash: string;
-  readonly maxPayloadSize: number;
-}
-
-interface C2RelayRouteCacheEntry {
-  readonly routeName: string;
-  readonly routes: readonly C2RelayRouteInfo[];
-  readonly expiresAtMs: number;
 }
 
 export class C2HttpRelayError extends Error {
-  constructor(readonly status: number, readonly body: string) {
+  constructor(readonly status: number, readonly body: string, readonly transportPhase?: "pre_dispatch" | "dispatch_uncertain") {
     super(`C-Two HTTP relay call failed with status ${status}: ${body}`);
     this.name = "C2HttpRelayError";
     Object.setPrototypeOf(this, C2HttpRelayError.prototype);
@@ -223,12 +221,16 @@ export class C2HttpRelayError extends Error {
 }
 
 export class C2HttpTransportError extends Error {
-  constructor(message: string) {
-    super(`C-Two HTTP transport error: ${message}`);
+  readonly cannotConnect: boolean;
+  readonly transportPhase: "pre_dispatch" | "dispatch_uncertain";
+  constructor(message: string, cause?: unknown) {
+    super(`C-Two HTTP transport error: ${message}`, cause === undefined ? undefined : { cause });
     this.name = "C2HttpTransportError";
     Object.setPrototypeOf(this, C2HttpTransportError.prototype);
+    this.cannotConnect = httpConnectFailure(cause);
+    this.transportPhase = this.cannotConnect ? "pre_dispatch" : "dispatch_uncertain";
   }
-  get retrySafe(): boolean { return false; }
+  get retrySafe(): boolean { return this.transportPhase === "pre_dispatch"; }
 }
 
 export class C2CrmMethodError extends Error {
@@ -306,11 +308,34 @@ export class C2CoreError extends Error {
   }
 }
 
+export class C2RouteConflictError extends C2CoreError {
+  constructor(message: string, details: Readonly<Record<string, string>> = {}) {
+    super(message, {
+      message,
+      code: 719,
+      canonicalName: "RouteConflict",
+      transportPhase: "pre_dispatch",
+      details,
+    });
+  }
+}
+
 function projectNativeError(error: unknown): Error {
+  if (error instanceof C2RouteConflictError) return error;
+  if (error instanceof C2IpcTransportError && error.code === 719 && error.canonicalName === "RouteConflict" && error.transportPhase === "pre_dispatch") {
+    const projected = new C2RouteConflictError(error.message, error.details);
+    projected.cause = error;
+    return projected;
+  }
   if (error instanceof C2IpcTransportError) return error;
   if (error instanceof Error) {
     const nativeDetails = (error as Error & { nativeDetails?: C2NativeErrorDetails }).nativeDetails;
     if (nativeDetails !== undefined) {
+      if (nativeDetails.code === 719 && nativeDetails.canonicalName === "RouteConflict" && nativeDetails.transportPhase === "pre_dispatch") {
+        const projected = new C2RouteConflictError(error.message, nativeDetails.details);
+        projected.cause = error;
+        return projected;
+      }
       if (nativeDetails.code !== undefined && nativeDetails.transportPhase === undefined) {
         const projected = new C2CoreError(error.message, nativeDetails);
         projected.cause = error;
@@ -543,7 +568,59 @@ class DeferredC2ResponseStream<T> implements C2ResponseStream<T> {
   }
 }
 
+class C2CallBudget {
+  private readonly deadline: number | null;
+  constructor(timeoutMs: number | null) {
+    this.deadline = timeoutMs === null ? null : performance.now() + timeoutMs;
+  }
+  remaining(): number | null {
+    if (this.deadline === null) return null;
+    const remaining = this.deadline - performance.now();
+    if (remaining <= 0) throw callDeadlineError("pre_dispatch");
+    return Math.ceil(remaining);
+  }
+  expired(): boolean {
+    return this.deadline !== null && performance.now() >= this.deadline;
+  }
+  async wait<T>(pending: Promise<T>): Promise<T> {
+    // Native setup may have exhausted the budget before returning its Promise.
+    // Observe it before checking the deadline, retaining either outcome for waiters.
+    const observed: Promise<PromiseSettledResult<T>> = pending.then(
+      value => ({ status: "fulfilled", value }),
+      reason => ({ status: "rejected", reason }),
+    );
+    const remaining = this.remaining();
+    const result = remaining === null ? await observed : await waitForCloseReady(observed, remaining, performance.now());
+    if (result === undefined) throw callDeadlineError("pre_dispatch");
+    if (result.status === "rejected") throw result.reason;
+    this.remaining();
+    return result.value;
+  }
+  stageLimit(limit: number): number {
+    const remaining = this.remaining();
+    return remaining === null ? limit : limit === 0 ? remaining : Math.min(remaining, limit);
+  }
+}
+
+function callDeadlineError(phase: "pre_dispatch" | "dispatch_uncertain", message = "call deadline exceeded"): C2CoreError {
+  return new C2CoreError(message, {
+    message, code: 715,
+    canonicalName: "CallDeadlineExceeded", transportPhase: phase,
+  });
+}
+
+interface C2IpcTargetTransport<Payload extends C2ResponsePayload> extends C2IpcEncodedTransport<Payload> {
+  acquire(routeName: string, contract: C2ContractIdentity, budget: C2CallBudget): Promise<void>;
+  snapshot(routeName: string): C2ConnectionSnapshot | null;
+  callAcquired(routeName: string, method: string, encode: () => C2ByteArray, budget: C2CallBudget): Promise<Payload>;
+  streamAcquired<T>(routeName: string, method: string, encode: () => C2ByteArray, decode: (bytes: Uint8Array) => T, hold: boolean, budget: C2CallBudget, cancelled?: boolean): C2ResponseStream<T | C2HeldResult<T>>;
+}
+
 export function createIpcEncodedTransport<Payload extends C2ResponsePayload = C2ByteArray>(address: string, options: C2IpcTransportOptions<Payload>): C2IpcEncodedTransport<Payload> {
+  return createIpcTargetTransport(address, options);
+}
+
+function createIpcTargetTransport<Payload extends C2ResponsePayload>(address: string, options: C2IpcTransportOptions<Payload>, onDispatch?: () => void): C2IpcTargetTransport<Payload> {
   if (typeof address !== "string" || !address.startsWith("ipc://") || address.length <= 6) {
     throw new TypeError("C-Two IPC address must be an ipc:// address.");
   }
@@ -556,17 +633,26 @@ export function createIpcEncodedTransport<Payload extends C2ResponsePayload = C2
   const observe = normalizeTransportObserver(options.observe, "C-Two IPC observe");
   const callTimeoutMs = options.callTimeoutMs ?? null;
   let endpointPromise: Promise<C2NativeEndpointContext> | undefined;
+  let nativeEndpoint: C2NativeEndpointContext | undefined;
+  type Prepared = { native: C2NativeEndpointContext };
+  const prepared = new Map<string, Prepared>();
   let closed = false;
   let requests = 0;
   let responses = 0;
-  const endpoint = (): Promise<C2NativeEndpointContext> => {
+  const requireOpen = (): void => {
     if (closed) throw new C2IpcTransportError("C-Two IPC transport is deactivated.");
+  };
+  const endpoint = (): Promise<C2NativeEndpointContext> => {
+    requireOpen();
     if (endpointPromise === undefined) {
       const nativeOptions: C2IpcNativeEndpointOptions = {
         ...(options.connectTimeoutMs === undefined ? {} : { connectTimeoutMs: options.connectTimeoutMs }),
         ...(options.expectedServerIdentity === undefined ? {} : { expectedServerIdentity: options.expectedServerIdentity }),
       };
-      const pending = Promise.resolve().then(() => options.connect(address, options.connectTimeoutMs, nativeOptions)).catch(error => {
+      const pending = Promise.resolve().then(() => options.connect(address, options.connectTimeoutMs, nativeOptions)).then(native => {
+        nativeEndpoint = native;
+        return native;
+      }).catch(error => {
         if (endpointPromise === pending) endpointPromise = undefined;
         throw projectNativeError(error);
       });
@@ -574,62 +660,109 @@ export function createIpcEncodedTransport<Payload extends C2ResponsePayload = C2
     }
     return endpointPromise;
   };
-  const prepare = async (routeName: string, contract: C2ContractIdentity, expectedRouteToken?: C2RouteToken) => {
+  const prepare = async (routeName: string, contract: C2ContractIdentity, budget?: C2CallBudget): Promise<void> => {
     const routeContract = requireRouteContractIdentity(contract);
-    const native = await endpoint();
-    const binding = await native.prepare(routeName, routeContract, expectedRouteToken).catch(error => { throw projectNativeError(error); });
-    return { native, binding };
+    const native = budget === undefined ? await endpoint() : await budget.wait(endpoint());
+    requireOpen();
+    if (native.connectionSnapshot(routeName)?.endReason === "protocol_error") {
+      throw new C2IpcTransportError("IPC connection ended on a protocol error", {
+        message: "IPC connection ended on a protocol error", code: 713,
+        canonicalName: "ProtocolViolation", transportPhase: "pre_dispatch",
+      });
+    }
+    const remaining = budget?.remaining();
+    const pending = native.prepare(routeName, routeContract, remaining ?? undefined).catch(error => { throw projectNativeError(error); });
+    if (budget === undefined) await pending;
+    else await budget.wait(pending);
+    requireOpen();
+    prepared.set(routeName, { native });
   };
-  return {
-    async prepare(routeName, contract, expectedRouteToken): Promise<void> { await prepare(routeName, contract, expectedRouteToken); },
-    async call(routeName, contract, method, encode): Promise<Payload> {
-      const { native, binding } = await prepare(routeName, contract);
-      const call = native.beginCall(routeName, method, false, callTimeoutMs);
+  const acquired = (routeName: string): Prepared => {
+    requireOpen();
+    const value = prepared.get(routeName);
+    if (value === undefined) throw new Error("C-Two route must be acquired before dispatch.");
+    return value;
+  };
+  const nativeLimit = (budget: C2CallBudget): number | null => {
+    const remaining = budget.remaining();
+    return callTimeoutMs === null ? remaining : remaining === null ? callTimeoutMs : Math.min(callTimeoutMs, remaining);
+  };
+  const callAcquired = async (routeName: string, method: string, encode: () => C2ByteArray, budget: C2CallBudget): Promise<Payload> => {
+    const { native } = acquired(routeName);
+    let call: C2NativeCall | undefined;
+    try {
+      call = native.beginCall(routeName, method, false, nativeLimit(budget));
+      const request = requireUint8Array(encode(), "encoded input");
+      budget.remaining();
+      call.checkDeadline();
+      await call.chargeInput(request.byteLength);
       requests += 1;
+      onDispatch?.();
+      const target = await call.dispatch(request);
+      const response = await call.next();
+      if (response === null) throw new C2IpcTransportError("C-Two unary call ended without a response.");
+      responses += 1;
+      let result: Payload;
+      try { result = copyResponsePayloadToAllocator(response, allocator); }
+      finally { if (allocator !== undefined) response.release(); }
+      return observeTransportResponse(result, observe, {
+        path: observationPath === "RelayAwareLocalIpc" ? observationPath : target.path, routeName,
+        serverId: target.serverId, serverInstanceId: target.serverInstanceId,
+        connectionId: String(target.connectionId),
+        ipcAddress: address, requests, responses,
+      });
+    } catch (error) { throw projectNativeError(error); }
+    finally { call?.close(); }
+  };
+  const startStream = <T>(routeName: string, method: string, encode: () => C2ByteArray, decode: (bytes: Uint8Array) => T, hold: boolean, budget: C2CallBudget, preparation?: Promise<void>, cancelled = false): C2ResponseStream<T | C2HeldResult<T>> => {
+    return new NativeC2ResponseStream<T | C2HeldResult<T>>(async state => {
+      if (preparation !== undefined) await preparation;
+      state.cancelled ||= cancelled;
+      const { native } = acquired(routeName);
+      const call = native.beginCall(routeName, method, true, nativeLimit(budget));
+      state.call = call;
       try {
-        const request = requireUint8Array(encode(), "encoded input");
+        if (state.collected) {
+          call.cancel();
+          closeCollectedCall(state);
+          return call;
+        }
+        if (state.cancelled) { call.cancel(); return call; }
+        const request = requireUint8Array(encode(), "encoded stream input");
+        budget.remaining();
         call.checkDeadline();
         await call.chargeInput(request.byteLength);
+        if (state.cancelled) { call.cancel(); return call; }
+        requests += 1;
+        onDispatch?.();
         await call.dispatch(request);
-        const response = await call.next();
-        if (response === null) throw new C2IpcTransportError("C-Two unary call ended without a response.");
-        responses += 1;
-        let result: Payload;
-        try { result = copyResponsePayloadToAllocator(response, allocator); }
-        finally { if (allocator !== undefined) response.release(); }
-        return observeTransportResponse(result, observe, {
-          path: observationPath, routeName, routeUid: binding.routeUid,
-          serverId: binding.serverId, serverInstanceId: binding.serverInstanceId,
-          ipcAddress: address, requests, responses,
-        });
-      } catch (error) { throw projectNativeError(error); }
-      finally { call.close(); }
+        return call;
+      } catch (error) {
+        const projected = projectNativeError(error);
+        if (!state.callClosed && !((projected instanceof C2IpcTransportError || projected instanceof C2CoreError) && projected.code === 715)) call.cancel();
+        if (state.collected) closeCollectedCall(state);
+        throw projected;
+      }
+    }, decode as (bytes: Uint8Array) => T | C2HeldResult<T>, hold);
+  };
+  function stream<T>(routeName: string, contract: C2ContractIdentity, method: string, encode: () => C2ByteArray, decode: (bytes: Uint8Array) => T, hold?: false): C2ResponseStream<T>;
+  function stream<T>(routeName: string, contract: C2ContractIdentity, method: string, encode: () => C2ByteArray, decode: (bytes: Uint8Array) => T, hold: true): C2ResponseStream<C2HeldResult<T>>;
+  function stream<T>(routeName: string, contract: C2ContractIdentity, method: string, encode: () => C2ByteArray, decode: (bytes: Uint8Array) => T, hold = false): C2ResponseStream<T | C2HeldResult<T>> {
+    const budget = new C2CallBudget(callTimeoutMs);
+    return startStream(routeName, method, encode, decode, hold, budget, prepare(routeName, contract, budget));
+  }
+  return {
+    async prepare(routeName, contract): Promise<void> { await prepare(routeName, contract); },
+    acquire: prepare,
+    snapshot(routeName) { return nativeEndpoint?.connectionSnapshot(routeName) ?? null; },
+    callAcquired,
+    streamAcquired: (routeName, method, encode, decode, hold, budget, cancelled) => startStream(routeName, method, encode, decode, hold, budget, undefined, cancelled),
+    async call(routeName, contract, method, encode): Promise<Payload> {
+      const budget = new C2CallBudget(callTimeoutMs);
+      await prepare(routeName, contract, budget);
+      return callAcquired(routeName, method, encode, budget);
     },
-    stream(routeName, contract, method, encode, decode, hold = false) {
-      return new NativeC2ResponseStream(async state => {
-        const { native } = await prepare(routeName, contract);
-        const call = native.beginCall(routeName, method, true, callTimeoutMs);
-        state.call = call;
-        try {
-          if (state.collected) {
-            call.cancel();
-            closeCollectedCall(state);
-            return call;
-          }
-          if (state.cancelled) { call.cancel(); return call; }
-          const request = requireUint8Array(encode(), "encoded stream input");
-          await call.chargeInput(request.byteLength);
-          if (state.cancelled) { call.cancel(); return call; }
-          await call.dispatch(request);
-          return call;
-        } catch (error) {
-          const projected = projectNativeError(error);
-          if (!state.callClosed && !((projected instanceof C2IpcTransportError || projected instanceof C2CoreError) && projected.code === 715)) call.cancel();
-          if (state.collected) closeCollectedCall(state);
-          throw projected;
-        }
-      }, decode, hold);
-    },
+    stream,
     async close(): Promise<void> {
       closed = true;
       const native = await endpointPromise?.catch(() => undefined);
@@ -639,360 +772,275 @@ export function createIpcEncodedTransport<Payload extends C2ResponsePayload = C2
 }
 
 export function createHttpRelayEncodedTransport<Payload extends C2ResponsePayload = C2ByteArray>(baseUrl: string, options: C2HttpRelayTransportOptions<Payload> = {}): C2HttpRelayEncodedTransport<Payload> {
-  const normalizedOptions = normalizeHttpRelayTransportOptions(options, "C-Two HTTP relay transport options");
-  const normalizedBaseUrl = normalizeRelayBaseUrl(baseUrl, "C-Two HTTP relay base URL");
-  const fetchImpl = normalizeFetch(normalizedOptions.fetch, "C-Two HTTP relay fetch") ?? globalFetch();
-  const headers = normalizeHttpHeaders(normalizedOptions.headers, "C-Two HTTP relay headers");
-  const callTimeoutMs = normalizeTimeoutMs(normalizedOptions.callTimeoutMs, "C-Two HTTP relay callTimeoutMs", 300_000);
-  const resolveTimeoutMs = normalizeTimeoutMs(normalizedOptions.resolveTimeoutMs, "C-Two HTTP relay resolveTimeoutMs", 5_000);
-  const responsePayloadAllocator = normalizeResponsePayloadAllocator(normalizedOptions.responsePayloadAllocator, "C-Two HTTP relay responsePayloadAllocator");
-  const responsePayloadUnknownLengthStrategy = normalizeResponsePayloadUnknownLengthStrategy(
-    normalizedOptions.responsePayloadUnknownLengthStrategy,
-    "C-Two HTTP relay responsePayloadUnknownLengthStrategy",
-  );
-  const responsePayloadUnknownLengthMaxBytes = normalizeUnknownLengthBufferMaxBytes(
-    normalizedOptions.responsePayloadUnknownLengthMaxBytes,
-    "C-Two HTTP relay responsePayloadUnknownLengthMaxBytes",
-  );
-  const observe = normalizeTransportObserver(normalizedOptions.observe, "C-Two HTTP relay observe");
-  let requests = 0;
-  let responses = 0;
-  return {
-    stream(): never { throw new C2UnsupportedCallModeError(); },
-    async call(routeName: string, contract: C2ContractIdentity, method: string, encode: () => C2ByteArray): Promise<Payload> {
-      requireRouteNamePathValue(routeName);
-      requireMethodPathValue(method);
-      const request = encodeHttpUnaryInput(encode, callTimeoutMs);
-      const requestPayload = request.payload;
-      const routeContract = requireRouteContractIdentity(contract);
-      const routes = await resolveRelayRoutes(
-        fetchImpl,
-        normalizedBaseUrl,
-        routeName,
-        routeContract,
-        headers,
-        resolveTimeoutMs,
-      );
-      if (routes.length === 0) {
-        throw resourceNotFoundError(routeName);
-      }
-      let route: C2RelayRouteInfo | undefined;
-      let lastPreparationError: unknown;
-      for (const candidate of routes) {
-        if (requestPayload.byteLength > candidate.maxPayloadSize) {
-          lastPreparationError = payloadTooLargeError(
-            routeName,
-            requestPayload.byteLength,
-            candidate.maxPayloadSize,
-          );
-          continue;
-        }
-        try {
-          await probeResolvedHttpRoute(
-            fetchImpl,
-            candidate.relayUrl,
-            routeName,
-            routeContract,
-            candidate,
-            headers,
-            resolveTimeoutMs,
-          );
-          route = candidate;
-          break;
-        } catch (error) {
-          lastPreparationError = error;
-        }
-      }
-      if (route === undefined) {
-        if (lastPreparationError instanceof Error) {
-          throw lastPreparationError;
-        }
-        throw resourceNotFoundError(routeName);
-      }
-      requests += 1;
-      const response = await callResolvedHttpRoute(
-        fetchImpl,
-        route.relayUrl,
-        routeName,
-        routeContract,
-        route,
-        method,
-        requestPayload,
-        headers,
-        request.remaining(),
-        responsePayloadAllocator,
-        responsePayloadUnknownLengthStrategy,
-        responsePayloadUnknownLengthMaxBytes,
-      );
-      responses += 1;
-      return observeTransportResponse(response, observe, {
-        path: "ExplicitRelay",
-        routeName,
-        routeUid: route.routeUid,
-        relayUrl: route.relayUrl,
-        requests,
-        responses,
-      });
-    },
-  };
+  return createRelayTransport(baseUrl, options, true);
 }
 
 export function createRelayAwareHttpEncodedTransport<Payload extends C2ResponsePayload = C2ByteArray>(anchorUrl: string, options: C2RelayAwareHttpTransportOptions<Payload> = {}): C2RelayAwareHttpEncodedTransport<Payload> {
-  const normalizedOptions = normalizeHttpRelayTransportOptions(options, "C-Two relay-aware HTTP transport options");
-  const normalizedAnchorUrl = normalizeRelayBaseUrl(anchorUrl, "C-Two relay anchor URL");
-  const fetchImpl = normalizeFetch(normalizedOptions.fetch, "C-Two relay-aware HTTP fetch") ?? globalFetch();
-  const headers = normalizeHttpHeaders(normalizedOptions.headers, "C-Two HTTP relay headers");
-  const maxAttempts = normalizeRelayMaxAttempts(normalizedOptions.maxAttempts);
-  const routeCacheTtlMs = normalizeRelayRouteCacheTtlMs(normalizedOptions.routeCacheTtlMs);
-  const callTimeoutMs = normalizeTimeoutMs(normalizedOptions.callTimeoutMs, "C-Two HTTP relay callTimeoutMs", 300_000);
+  return createRelayTransport(anchorUrl, options, false);
+}
+
+interface C2RelayLocalTransport<Payload extends C2ResponsePayload> {
+  readonly key: string;
+  readonly transport: C2IpcTargetTransport<Payload>;
+  targets: number;
+  acquiring: number;
+  retiring: boolean;
+}
+
+type C2RelayTarget<Payload extends C2ResponsePayload> = {
+  readonly relayUrl: string;
+  readonly local?: C2RelayLocalTransport<Payload>;
+  needsAcquire: boolean;
+  terminal?: Error;
+};
+
+interface C2RelayTargetSlot<Payload extends C2ResponsePayload> {
+  current?: C2RelayTarget<Payload>;
+  acquiring?: Promise<C2RelayTarget<Payload>>;
+  acquiringBudget?: C2CallBudget;
+}
+
+function createRelayTransport<Payload extends C2ResponsePayload>(baseUrl: string, options: C2RelayAwareHttpTransportOptions<Payload>, explicit: boolean): C2RelayAwareHttpEncodedTransport<Payload> {
+  const normalizedOptions = normalizeHttpRelayTransportOptions(options, "C-Two relay transport options");
+  const anchorUrl = normalizeRelayBaseUrl(baseUrl, "C-Two relay URL");
+  const fetchImpl = normalizeFetch(normalizedOptions.fetch, "C-Two relay fetch") ?? globalFetch();
+  const headers = normalizeHttpHeaders(normalizedOptions.headers, "C-Two relay headers");
+  const callTimeoutMs = normalizeTimeoutMs(normalizedOptions.callTimeoutMs, "C-Two relay callTimeoutMs", 300_000);
   const resolveTimeoutMs = normalizeTimeoutMs(normalizedOptions.resolveTimeoutMs, "C-Two relay resolveTimeoutMs", 5_000);
-  const responsePayloadAllocator = normalizeResponsePayloadAllocator(normalizedOptions.responsePayloadAllocator, "C-Two relay-aware HTTP responsePayloadAllocator");
-  const responsePayloadUnknownLengthStrategy = normalizeResponsePayloadUnknownLengthStrategy(
-    normalizedOptions.responsePayloadUnknownLengthStrategy,
-    "C-Two relay-aware HTTP responsePayloadUnknownLengthStrategy",
-  );
-  const responsePayloadUnknownLengthMaxBytes = normalizeUnknownLengthBufferMaxBytes(
-    normalizedOptions.responsePayloadUnknownLengthMaxBytes,
-    "C-Two relay-aware HTTP responsePayloadUnknownLengthMaxBytes",
-  );
-  const observe = normalizeTransportObserver(normalizedOptions.observe, "C-Two relay-aware HTTP observe");
-  const ipcOptions = normalizeRelayAwareIpcOptions(normalizedOptions.ipc);
-  const routeCache = new Map<string, C2RelayRouteCacheEntry>();
-  const currentRelayByCacheKey = new Map<string, string>();
-  const localTransports = new Map<string, C2IpcEncodedTransport<Payload>>();
-  let closePromise: Promise<void> | undefined;
-  const retiredLocalTransports: Promise<PromiseSettledResult<void>>[] = [];
+  const allocator = normalizeResponsePayloadAllocator(normalizedOptions.responsePayloadAllocator, "C-Two relay responsePayloadAllocator");
+  const unknownLengthStrategy = normalizeResponsePayloadUnknownLengthStrategy(normalizedOptions.responsePayloadUnknownLengthStrategy, "C-Two relay responsePayloadUnknownLengthStrategy");
+  const unknownLengthMaxBytes = normalizeUnknownLengthBufferMaxBytes(normalizedOptions.responsePayloadUnknownLengthMaxBytes, "C-Two relay responsePayloadUnknownLengthMaxBytes");
+  const observe = normalizeTransportObserver(normalizedOptions.observe, "C-Two relay observe");
+  const ipcOptions = explicit ? undefined : normalizeRelayAwareIpcOptions(normalizedOptions.ipc);
+  const slots = new Map<string, C2RelayTargetSlot<Payload>>();
+  const localTransports = new Map<string, C2RelayLocalTransport<Payload>>();
+  const retired: Promise<PromiseSettledResult<void>>[] = [];
   let closed = false;
+  let closePromise: Promise<void> | undefined;
+  let requests = 0;
+  let responses = 0;
   const requireOpen = (): void => {
-    if (closed) throw new C2IpcTransportError("C-Two relay-aware transport is deactivated.");
+    if (closed) throw new C2IpcTransportError("C-Two relay transport is deactivated.");
   };
-  const localKey = (route: C2RelayRouteInfo): string => JSON.stringify([
-    route.ipcAddress, route.serverId, route.serverInstanceId,
-  ]);
-  const localTransportFor = (route: C2RelayRouteInfo): C2IpcEncodedTransport<Payload> => {
-    requireOpen();
-    const key = localKey(route);
-    let transport = localTransports.get(key);
-    if (transport === undefined) {
-      transport = createIpcEncodedTransport<Payload>(route.ipcAddress as string, {
-        ...ipcOptions!,
-        expectedServerIdentity: { serverId: route.serverId as string, serverInstanceId: route.serverInstanceId as string },
-        observationPath: "RelayAwareLocalIpc", observe,
-      });
-      localTransports.set(key, transport);
-    }
-    return transport;
-  };
-  const discardLocalTransport = (route: C2RelayRouteInfo, transport: C2IpcEncodedTransport<Payload>, error: unknown): Promise<PromiseSettledResult<void>> | undefined => {
-    if (!(localEndpointFailure(error) || localCandidateFailureIsTerminal(error)) || localTransports.get(localKey(route)) !== transport) return undefined;
-    localTransports.delete(localKey(route));
-    // Stop admission immediately, but let unrelated dispatched calls drain in
-    // the background. The enclosing transport observes all cleanup at close.
-    const closing = transport.close().then(
+  const retire = (local: C2RelayLocalTransport<Payload>): Promise<PromiseSettledResult<void>> | undefined => {
+    if (local.retiring) return undefined;
+    local.retiring = true;
+    if (localTransports.get(local.key) === local) localTransports.delete(local.key);
+    const pending = local.transport.close().then(
       (): PromiseFulfilledResult<void> => ({ status: "fulfilled", value: undefined }),
       (reason): PromiseRejectedResult => ({ status: "rejected", reason }),
     );
-    retiredLocalTransports.push(closing);
-    return closing;
+    retired.push(pending);
+    return pending;
   };
-  let requests = 0;
-  let responses = 0;
-  return {
-    stream<T>(routeName: string, contract: C2ContractIdentity, method: string, encode: () => C2ByteArray, decode: (bytes: Uint8Array) => T, hold = false) {
-      return new DeferredC2ResponseStream<T | C2HeldResult<T>>(async state => {
-        const routeContract = requireRouteContractIdentity(contract);
-        const routes = await resolveRelayRoutesCached(
-          fetchImpl, normalizedAnchorUrl, routeName, routeContract, headers,
-          routeCache, routeCacheTtlMs, resolveTimeoutMs, false,
-        );
-        const route = selectLocalIpcRoute(routes, normalizedAnchorUrl, ipcOptions, new Set());
-        if (route === undefined || ipcOptions === undefined) throw new C2UnsupportedCallModeError();
-        const transport = localTransportFor(route);
-        state.failure = error => { discardLocalTransport(route, transport, error); };
-        try { await transport.prepare(routeName, routeContract, { routeUid: route.routeUid }); }
-        catch (error) {
-          discardLocalTransport(route, transport, error);
-          throw error;
-        }
-        const stream = hold
-          ? transport.stream(routeName, routeContract, method, encode, decode, true)
-          : transport.stream(routeName, routeContract, method, encode, decode);
-        if (state.cancelled) void stream.return?.();
-        return stream;
-      });
-    },
-    async call(routeName: string, contract: C2ContractIdentity, method: string, encode: () => C2ByteArray): Promise<Payload> {
+  const localFor = (route: C2RelayRouteInfo): C2RelayLocalTransport<Payload> => {
+    requireOpen();
+    const key = localRouteEndpointKey(route);
+    let local = localTransports.get(key);
+    if (local === undefined) {
+      local = {
+        key, targets: 0, acquiring: 0, retiring: false,
+        transport: createIpcTargetTransport(route.ipcAddress!, {
+          ...ipcOptions!,
+          expectedServerIdentity: { serverId: route.serverId!, serverInstanceId: route.serverInstanceId! },
+          observationPath: "RelayAwareLocalIpc",
+          observe: value => {
+            responses += 1;
+            observe?.(Object.freeze({ ...value, requests, responses }));
+          },
+        }, () => { requests += 1; }),
+      };
+      localTransports.set(key, local);
+    }
+    return local;
+  };
+  const needsAcquire = (target: C2RelayTarget<Payload>, routeName: string): boolean => {
+    if (target.local !== undefined) {
+      const snapshot = target.local.transport.snapshot(routeName);
+      if (snapshot?.endReason === "protocol_error") {
+        target.terminal ??= new C2IpcTransportError("IPC connection ended on a protocol error", {
+          message: "IPC connection ended on a protocol error", code: 713,
+          canonicalName: "ProtocolViolation", transportPhase: "pre_dispatch",
+        });
+      } else if (snapshot !== null && (snapshot.endReason === "peer_eof" || snapshot.endReason === "peer_close_message" || snapshot.endReason === "connection_reset")) {
+        retire(target.local);
+        return true;
+      }
+    }
+    if (target.terminal !== undefined) throw target.terminal;
+    return target.needsAcquire;
+  };
+  const observeFailure = (target: C2RelayTarget<Payload>, failure: unknown): void => {
+    const error = projectNativeError(failure);
+    const code = preDispatchRouteCode(error);
+    if (code === 701 || code === 707 || code === 708 || code === 709) target.needsAcquire = true;
+    if (terminalRouteRefusal(error)) target.terminal = error;
+    if (error instanceof C2HttpTransportError && error.cannotConnect) target.needsAcquire = true;
+    if (target.local !== undefined && error instanceof C2IpcTransportError && error.code === 707 && error.transportPhase === "pre_dispatch" && error.details.route === undefined) {
+      retire(target.local);
+    }
+  };
+  const acquire = async (routeName: string, contract: C2RouteContractIdentity, budget: C2CallBudget): Promise<C2RelayTarget<Payload>> => {
+    let refreshed = false;
+    let firstLocalFailure: unknown;
+    let lastError: unknown;
+    const excluded = new Set<string>();
+    const resolve = () => resolveRelayRoutes(fetchImpl, anchorUrl, routeName, contract, headers, budget.stageLimit(resolveTimeoutMs));
+    let routes = await resolve();
+    while (true) {
+      budget.remaining();
       requireOpen();
-      requireRouteNamePathValue(routeName);
-      requireMethodPathValue(method);
-      const routeContract = requireRouteContractIdentity(contract);
-      const cacheKey = relayRouteCacheKey(routeName, routeContract);
-      let lastError: unknown;
-      let firstLocalFailure: unknown;
-      let httpRequest: ReturnType<typeof encodeHttpUnaryInput> | undefined;
-      const excludedRoutes = new Set<string>();
-      const excludedLocalRouteTokens = new Set<string>();
-      for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
-        let routes: readonly C2RelayRouteInfo[];
+      const route = selectLocalIpcRoute(routes, anchorUrl, ipcOptions, excluded);
+      if (route !== undefined) {
+        const local = localFor(route);
+        local.acquiring += 1;
         try {
-          routes = await resolveRelayRoutesCached(
-            fetchImpl,
-            normalizedAnchorUrl,
-            routeName,
-            routeContract,
-            headers,
-            routeCache,
-            routeCacheTtlMs,
-            resolveTimeoutMs,
-            attempt > 0,
-          );
-        } catch (error) {
-          lastError = error;
-          if (isRetryableResolveError(error) && attempt + 1 < maxAttempts) {
-            continue;
-          }
-          throw error;
-        }
-        if (routes.length === 0) {
-          throw resourceNotFoundError(routeName);
-        }
-        const localRoute = selectLocalIpcRoute(
-          routes,
-          normalizedAnchorUrl,
-          ipcOptions,
-          excludedLocalRouteTokens,
-        );
-        if (localRoute !== undefined && ipcOptions !== undefined) {
-          const localTokenKey = routeTokenKey(localRoute);
-          const localTransport = localTransportFor(localRoute);
-          try {
-            await localTransport.prepare(routeName, routeContract, { routeUid: localRoute.routeUid });
-          } catch (error) {
-            const closing = discardLocalTransport(localRoute, localTransport, error);
-            if (localCandidateFailureIsTerminal(error)) {
-              const cleanup = await closing;
-              if (cleanup?.status === "rejected") Object.defineProperty(error, "cleanupError", { value: cleanup.reason });
-              throw error;
-            }
-            firstLocalFailure ??= error;
-            lastError = error;
-            excludedLocalRouteTokens.add(localTokenKey);
-            invalidateRelayRouteCache(routeCache, cacheKey);
-            const distinctRoutes = routes.filter(
-              (route) => !excludedLocalRouteTokens.has(routeTokenKey(route)),
-            );
-            if (distinctRoutes.length === 0) {
-              throw samePathFallbackDeniedError(routeName, localRoute, firstLocalFailure);
-            }
-            continue;
-          }
-          try {
-            return await localTransport.call(routeName, routeContract, method, encode);
-          } catch (error) {
-            discardLocalTransport(localRoute, localTransport, error);
+          await local.transport.acquire(routeName, contract, budget);
+          local.acquiring -= 1;
+          local.targets += 1;
+          return { relayUrl: route.relayUrl, local, needsAcquire: false };
+        } catch (failure) {
+          local.acquiring -= 1;
+          const error = projectNativeError(failure);
+          const closing = local.targets === 0 && local.acquiring === 0 ? retire(local) : undefined;
+          if (localCandidateFailureIsTerminal(error)) {
+            const cleanup = await closing;
+            if (cleanup?.status === "rejected") Object.defineProperty(error, "cleanupError", { value: cleanup.reason });
             throw error;
           }
-        }
-        const httpRoutes = routes.filter(
-          (route) => !excludedLocalRouteTokens.has(routeTokenKey(route)),
-        );
-        if (httpRoutes.length === 0 && excludedLocalRouteTokens.size > 0) {
-          throw samePathFallbackDeniedError(routeName, routes[0], firstLocalFailure);
-        }
-        const orderedRoutes = orderRelayRoutes(httpRoutes, currentRelayByCacheKey.get(cacheKey), excludedRoutes);
-        if (orderedRoutes.length === 0) {
-          if (lastError instanceof Error) {
-            throw lastError;
-          }
-          throw resourceNotFoundError(routeName);
-        }
-        httpRequest ??= encodeHttpUnaryInput(encode, callTimeoutMs);
-        const requestPayload = httpRequest.payload;
-        let staleRoute = false;
-        for (const route of orderedRoutes) {
-          const relayUrl = normalizeRelayBaseUrl(route.relayUrl, "C-Two resolved relay URL");
-          if (requestPayload.byteLength > route.maxPayloadSize) {
-            lastError = payloadTooLargeError(routeName, requestPayload.byteLength, route.maxPayloadSize);
-            continue;
-          }
-          let businessPostStarted = false;
-          try {
-            await probeResolvedHttpRoute(
-              fetchImpl,
-              relayUrl,
-              routeName,
-              routeContract,
-              route,
-              headers,
-              resolveTimeoutMs,
-            );
-            requests += 1;
-            businessPostStarted = true;
-            const result = await callResolvedHttpRoute(
-              fetchImpl,
-              relayUrl,
-              routeName,
-              routeContract,
-              route,
-              method,
-              requestPayload,
-              headers,
-              httpRequest.remaining(),
-              responsePayloadAllocator,
-              responsePayloadUnknownLengthStrategy,
-              responsePayloadUnknownLengthMaxBytes,
-            );
-            responses += 1;
-            currentRelayByCacheKey.set(cacheKey, relayUrl);
-            return observeTransportResponse(result, observe, {
-              path: "RelayAwareHttp",
-              routeName,
-              routeUid: route.routeUid,
-              relayUrl,
-              requests,
-              responses,
-            });
-          } catch (error) {
-            lastError = error;
-            if (!isRetryableRouteError(error)) {
-              throw error;
+          firstLocalFailure ??= error;
+          lastError = error;
+          excluded.add(localRouteEndpointKey(route));
+          if (!refreshed) {
+            refreshed = true;
+            try { routes = await resolve(); }
+            catch (failure) {
+              if (preDispatchRouteCode(failure) === 701) throw samePathFallbackDeniedError(routeName, firstLocalFailure);
+              throw failure;
             }
-            invalidateRelayRouteCache(routeCache, cacheKey);
-            currentRelayByCacheKey.delete(cacheKey);
-            if (businessPostStarted) throw error;
-            excludedRoutes.add(relayUrl);
-            staleRoute = true;
-            break;
           }
-        }
-        if (lastError instanceof C2HttpRelayError && lastError.status === 413) {
-          throw lastError;
-        }
-        if (staleRoute) {
           continue;
         }
       }
-      if (lastError instanceof Error) {
-        throw lastError;
+      const available = routes.filter(route => !localRouteEndpointIsExcluded(route, excluded));
+      if (available.length === 0) {
+        if (excluded.size > 0) throw samePathFallbackDeniedError(routeName, firstLocalFailure);
+        throw resourceNotFoundError(routeName);
       }
-      throw resourceNotFoundError(routeName);
+      let resolveAgain = false;
+      for (const route of available) {
+        try {
+          await probeResolvedHttpRoute(fetchImpl, route.relayUrl, routeName, contract, headers, budget.stageLimit(resolveTimeoutMs));
+          budget.remaining();
+          return { relayUrl: route.relayUrl, needsAcquire: false };
+        } catch (failure) {
+          const error = projectNativeError(failure);
+          lastError = error;
+          if (error instanceof C2RouteConflictError || terminalRouteRefusal(error) || (error instanceof C2CoreError && error.code === 715) || preDispatchRouteCode(error) === 709) throw error;
+          if (preDispatchRouteCode(error) === 701 && !refreshed) {
+            refreshed = true;
+            resolveAgain = true;
+            break;
+          }
+        }
+      }
+      if (resolveAgain) { routes = await resolve(); continue; }
+      throw lastError;
+    }
+  };
+  const targetForCall = async (routeName: string, contract: C2RouteContractIdentity, budget: C2CallBudget): Promise<C2RelayTarget<Payload>> => {
+    requireOpen();
+    budget.remaining();
+    const key = routeContractKey(routeName, contract);
+    let slot = slots.get(key);
+    if (slot === undefined) { slot = {}; slots.set(key, slot); }
+    if (slot.current !== undefined && !needsAcquire(slot.current, routeName)) return slot.current;
+    while (true) {
+      if (slot.acquiring === undefined) {
+        const owner = slot;
+        const pending = Promise.resolve().then(async () => {
+          const next = await acquire(routeName, contract, budget);
+          try { budget.remaining(); requireOpen(); }
+          catch (error) {
+            if (next.local !== undefined) {
+              next.local.targets -= 1;
+              if (next.local.targets === 0 && next.local.acquiring === 0) retire(next.local);
+            }
+            throw error;
+          }
+          const previous = owner.current;
+          owner.current = next;
+          if (previous?.local !== undefined) {
+            previous.local.targets -= 1;
+            if (previous.local.targets === 0 && previous.local !== next.local) retire(previous.local);
+          }
+          return next;
+        });
+        owner.acquiring = pending;
+        owner.acquiringBudget = budget;
+        void pending.finally(() => {
+          if (owner.acquiring === pending) {
+            delete owner.acquiring;
+            delete owner.acquiringBudget;
+          }
+        }).catch(() => undefined);
+      }
+      const pending = slot.acquiring!;
+      const ownerBudget = slot.acquiringBudget!;
+      try { return await budget.wait(pending); }
+      catch (error) {
+        budget.remaining();
+        // A longer-lived waiter may start the next acquisition only after the
+        // bounded attempt it shared has really returned.
+        if ((error instanceof C2CoreError || error instanceof C2IpcTransportError) && error.code === 715 && ownerBudget !== budget && ownerBudget.expired() && slot.acquiring !== pending) continue;
+        throw error;
+      }
+    }
+  };
+  function stream<T>(routeName: string, contract: C2ContractIdentity, method: string, encode: () => C2ByteArray, decode: (bytes: Uint8Array) => T, hold?: false): C2ResponseStream<T>;
+  function stream<T>(routeName: string, contract: C2ContractIdentity, method: string, encode: () => C2ByteArray, decode: (bytes: Uint8Array) => T, hold: true): C2ResponseStream<C2HeldResult<T>>;
+  function stream<T>(routeName: string, contract: C2ContractIdentity, method: string, encode: () => C2ByteArray, decode: (bytes: Uint8Array) => T, hold = false): C2ResponseStream<T | C2HeldResult<T>> {
+      if (explicit) throw new C2UnsupportedCallModeError();
+      const budget = new C2CallBudget(callTimeoutMs === 0 ? null : callTimeoutMs);
+      return new DeferredC2ResponseStream<T | C2HeldResult<T>>(async state => {
+        requireRouteNamePathValue(routeName);
+        requireMethodPathValue(method);
+        const target = await targetForCall(routeName, requireRouteContractIdentity(contract), budget);
+        if (target.local === undefined) throw new C2UnsupportedCallModeError();
+        state.failure = error => observeFailure(target, error);
+        const stream = target.local.transport.streamAcquired(routeName, method, encode, decode, hold, budget, state.cancelled);
+        if (state.cancelled) void stream.return?.();
+        return stream;
+      });
+  }
+  return {
+    async call(routeName, contract, method, encode): Promise<Payload> {
+      requireRouteNamePathValue(routeName);
+      requireMethodPathValue(method);
+      const budget = new C2CallBudget(callTimeoutMs === 0 ? null : callTimeoutMs);
+      const routeContract = requireRouteContractIdentity(contract);
+      const target = await targetForCall(routeName, routeContract, budget);
+      try {
+        if (target.local !== undefined) return await target.local.transport.callAcquired(routeName, method, encode, budget);
+        const request = encodeHttpUnaryInput(encode, budget);
+        requests += 1;
+        const response = await callResolvedHttpRoute(fetchImpl, target.relayUrl, routeName, routeContract, method, request, headers, budget.remaining() ?? 0, allocator, unknownLengthStrategy, unknownLengthMaxBytes);
+        responses += 1;
+        return observeTransportResponse(response, observe, {
+          path: explicit ? "ExplicitRelay" : "RelayAwareHttp", routeName,
+          relayUrl: target.relayUrl, requests, responses,
+        });
+      } catch (error) { observeFailure(target, error); throw error; }
     },
-
+    stream,
     close(): Promise<void> {
       if (closePromise !== undefined) return closePromise;
       closed = true;
       closePromise = (async () => {
-        routeCache.clear();
-        currentRelayByCacheKey.clear();
-        const closing = [...localTransports.values()].map(transport => transport.close());
-        localTransports.clear();
-        const results = await Promise.all([
-          ...retiredLocalTransports,
-          ...closing.map(pending => pending.then(
-            (): PromiseFulfilledResult<void> => ({ status: "fulfilled", value: undefined }),
-            (reason): PromiseRejectedResult => ({ status: "rejected", reason }),
-          )),
-        ]);
+        await Promise.allSettled([...slots.values()].flatMap(slot => slot.acquiring === undefined ? [] : [slot.acquiring]));
+        for (const local of localTransports.values()) retire(local);
+        slots.clear();
+        const results = await Promise.all(retired);
         for (const result of results) if (result.status === "rejected") throw result.reason;
       })();
       return closePromise;
@@ -1000,22 +1048,11 @@ export function createRelayAwareHttpEncodedTransport<Payload extends C2ResponseP
   };
 }
 
-function encodeHttpUnaryInput(encode: () => C2ByteArray, timeoutMs: number): { payload: C2ByteArray; remaining(): number } {
-  const startedAt = performance.now();
-  const remaining = (): number => {
-    if (timeoutMs === 0) return 0;
-    const budget = timeoutMs - (performance.now() - startedAt);
-    if (budget <= 0) {
-      throw new C2CoreError("call deadline exceeded before dispatch", {
-        message: "call deadline exceeded before dispatch", code: 715,
-        canonicalName: "CallDeadlineExceeded", transportPhase: "pre_dispatch",
-      });
-    }
-    return Math.ceil(budget);
-  };
+function encodeHttpUnaryInput(encode: () => C2ByteArray, budget: C2CallBudget): C2ByteArray {
+  budget.remaining();
   const payload = requireUint8Array(encode(), "encoded input");
-  remaining();
-  return { payload, remaining };
+  budget.remaining();
+  return payload;
 }
 
 function requireUint8Array(value: unknown, label: string): Uint8Array {
@@ -1415,7 +1452,6 @@ const C2_RESERVED_HTTP_HEADER_NAMES = new Set([
   "x-c2-expected-crm-ver",
   "x-c2-expected-abi-hash",
   "x-c2-expected-signature-hash",
-  "x-c2-route-uid",
 ]);
 const C2_MAX_RESPONSE_PAYLOAD_BYTES = 2_147_483_647;
 const C2_MAX_WIRE_TEXT_BYTES = 255;
@@ -1515,24 +1551,11 @@ function requestHeadersForRouteContract(customHeaders: Readonly<Record<string, s
   return headers;
 }
 
-function requestHeadersForResolvedRoute(
-  customHeaders: Readonly<Record<string, string>>,
-  routeContract: C2RouteContractIdentity,
-  route: C2RouteToken,
-): Readonly<Record<string, string>> {
-  const headers = {
-    ...requestHeadersForRouteContract(customHeaders, routeContract),
-  } as Record<string, string>;
-  headers["x-c2-route-uid"] = route.routeUid;
-  return headers;
-}
-
 async function probeResolvedHttpRoute(
   fetchImpl: C2Fetch,
   relayUrl: string,
   routeName: string,
   routeContract: C2RouteContractIdentity,
-  route: C2RelayRouteInfo,
   headers: Readonly<Record<string, string>>,
   timeoutMs: number,
 ): Promise<void> {
@@ -1543,12 +1566,12 @@ async function probeResolvedHttpRoute(
         `${relayUrl}/_probe/${encodePathSegment(routeName)}`,
         {
           method: "GET",
-          headers: requestHeadersForResolvedRoute(headers, routeContract, route),
+          headers: requestHeadersForRouteContract(headers, routeContract),
           signal,
         },
       );
     } catch (error) {
-      throw new C2HttpTransportError(`C-Two HTTP relay probe fetch failed: ${String(error)}`);
+      throw new C2HttpTransportError(`C-Two HTTP relay probe fetch failed: ${String(error)}`, error);
     }
     if (response.status === 200) {
       return;
@@ -1559,7 +1582,7 @@ async function probeResolvedHttpRoute(
     } catch (error) {
       throw new C2HttpTransportError(`C-Two HTTP relay probe body read failed: ${String(error)}`);
     }
-    throw new C2HttpRelayError(response.status, body);
+    throw projectHttpAcquisitionError(response.status, body);
   }, timeoutMs, "C-Two HTTP relay probe");
 }
 
@@ -1568,7 +1591,6 @@ async function callResolvedHttpRoute<Payload extends C2ResponsePayload>(
   relayUrl: string,
   routeName: string,
   routeContract: C2RouteContractIdentity,
-  route: C2RelayRouteInfo,
   method: string,
   requestPayload: Uint8Array,
   headers: Readonly<Record<string, string>>,
@@ -1584,13 +1606,13 @@ async function callResolvedHttpRoute<Payload extends C2ResponsePayload>(
         `${relayUrl}/${encodePathSegment(routeName)}/${encodePathSegment(method)}`,
         {
           method: "POST",
-          headers: requestHeadersForResolvedRoute(headers, routeContract, route),
+          headers: requestHeadersForRouteContract(headers, routeContract),
           body: requestPayload,
           signal,
         },
       );
     } catch (error) {
-      throw new C2HttpTransportError(`C-Two HTTP relay call fetch failed: ${String(error)}`);
+      throw new C2HttpTransportError(`C-Two HTTP relay call fetch failed: ${String(error)}`, error);
     }
     if (response.status === 200) {
       try {
@@ -1620,16 +1642,7 @@ async function callResolvedHttpRoute<Payload extends C2ResponsePayload>(
       throw new C2HttpTransportError(`C-Two HTTP relay call body read failed: ${String(error)}`);
     }
     throw new C2HttpRelayError(response.status, body);
-  }, callTimeoutMs, "C-Two HTTP relay call");
-}
-
-function localEndpointFailure(failure: unknown): boolean {
-  const error = projectNativeError(failure);
-  return error instanceof C2IpcTransportError && (
-    (error.code === 704 && error.details.stage === "route_binding") ||
-    error.code === null || error.code === 702 || error.code === 707 || error.code === 710 ||
-    error.category === "runtime_retired" || error.category === "protocol_version_mismatch"
-  );
+  }, callTimeoutMs, "C-Two HTTP relay call", "dispatch_uncertain");
 }
 
 function observeTransportResponse<Payload extends C2ResponsePayload>(
@@ -1673,9 +1686,9 @@ function normalizeRelayAwareIpcOptions<Payload extends C2ResponsePayload>(value:
   return value;
 }
 
-function selectLocalIpcRoute<Payload extends C2ResponsePayload>(routes: readonly C2RelayRouteInfo[], anchorUrl: string, ipcOptions: C2IpcTransportOptions<Payload> | undefined, excludedRouteTokens: ReadonlySet<string>): C2RelayRouteInfo | undefined {
+function selectLocalIpcRoute<Payload extends C2ResponsePayload>(routes: readonly C2RelayRouteInfo[], anchorUrl: string, ipcOptions: C2IpcTransportOptions<Payload> | undefined, excludedLocalEndpoints: ReadonlySet<string>): C2RelayRouteInfo | undefined {
   if (ipcOptions === undefined || !relayAnchorAllowsLocalIpc(anchorUrl)) return undefined;
-  return routes.find(route => route.ipcAddress !== undefined && route.serverId !== undefined && route.serverInstanceId !== undefined && !excludedRouteTokens.has(routeTokenKey(route)));
+  return routes.find(route => route.ipcAddress !== undefined && route.serverId !== undefined && route.serverInstanceId !== undefined && !localRouteEndpointIsExcluded(route, excludedLocalEndpoints));
 }
 
 function relayAnchorAllowsLocalIpc(anchorUrl: string): boolean {
@@ -1683,9 +1696,16 @@ function relayAnchorAllowsLocalIpc(anchorUrl: string): boolean {
   return hostname === "localhost" || hostname.startsWith("127.") || hostname === "::1" || hostname === "[::1]";
 }
 
-function routeTokenKey(route: C2RouteToken): string { return JSON.stringify([route.routeUid]); }
+function localRouteEndpointKey(route: C2RelayRouteInfo): string {
+  return JSON.stringify([route.ipcAddress, route.serverId, route.serverInstanceId]);
+}
+
+function localRouteEndpointIsExcluded(route: C2RelayRouteInfo, excluded: ReadonlySet<string>): boolean {
+  return route.ipcAddress !== undefined && route.serverId !== undefined && route.serverInstanceId !== undefined && excluded.has(localRouteEndpointKey(route));
+}
 
 function localCandidateFailureIsTerminal(error: unknown): boolean {
+  if (error instanceof C2RouteConflictError) return true;
   return error instanceof C2IpcTransportError && (
     error.category === "protocol_version_mismatch" || error.category === "runtime_retired" ||
     error.code === 709 || error.code === 710 || error.code === 713 || error.code === 715
@@ -1694,7 +1714,6 @@ function localCandidateFailureIsTerminal(error: unknown): boolean {
 
 function samePathFallbackDeniedError(
   routeName: string,
-  route: C2RelayRouteInfo,
   firstCause?: unknown,
 ): C2HttpRelayError {
   const denied = new C2HttpRelayError(
@@ -1705,7 +1724,6 @@ function samePathFallbackDeniedError(
       message: "same-path fallback denied after verified local IPC failure",
       details: {
         route: routeName,
-        route_uid: route.routeUid,
       },
     }),
   );
@@ -1720,7 +1738,7 @@ function resourceNotFoundError(routeName: string): C2HttpRelayError {
       code: 701,
       name: "ResourceNotFound",
       message: `route not found: ${routeName}`,
-      details: { route: routeName },
+      details: { route: routeName, dispatch_phase: "pre_dispatch" },
     }),
   );
 }
@@ -1740,22 +1758,7 @@ function canonicalRelayErrorBody(error: {
   });
 }
 
-function normalizeRelayMaxAttempts(value: number | undefined): number {
-  if (value === undefined) {
-    return 3;
-  }
-  const maxAttempts = 32;
-  if (!Number.isFinite(value) || !Number.isSafeInteger(value) || value < 0 || value > maxAttempts) {
-    throw new Error(`C-Two relay maxAttempts must be a non-negative safe integer no greater than ${maxAttempts}.`);
-  }
-  return Math.max(1, value);
-}
-
-function normalizeRelayRouteCacheTtlMs(value: number | undefined): number {
-  return normalizeNonNegativeSafeIntegerMs(value, "C-Two relay routeCacheTtlMs", 30_000);
-}
-
-function relayRouteCacheKey(routeName: string, contract: C2RouteContractIdentity): string {
+function routeContractKey(routeName: string, contract: C2RouteContractIdentity): string {
   return JSON.stringify([
     routeName,
     contract.namespace,
@@ -1790,6 +1793,7 @@ async function fetchWithTimeout<T>(
   operation: (signal: C2AbortSignal | undefined) => Promise<T>,
   timeoutMs: number,
   label: string,
+  phase: "pre_dispatch" | "dispatch_uncertain" = "pre_dispatch",
 ): Promise<T> {
   if (timeoutMs === 0) {
     return await operation(undefined);
@@ -1798,7 +1802,7 @@ async function fetchWithTimeout<T>(
   const controller = controllerCtor ? new controllerCtor() : undefined;
   let timedOut = false;
   let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
-  const timeoutError = () => new C2HttpTransportError(`${label} timed out after ${timeoutMs}ms.`);
+  const timeoutError = () => callDeadlineError(phase, `${label} timed out after ${timeoutMs}ms.`);
   const timeoutPromise = new Promise<never>((_resolve, reject) => {
     timeoutHandle = setTimeout(() => {
       timedOut = true;
@@ -1819,71 +1823,6 @@ async function fetchWithTimeout<T>(
       clearTimeout(timeoutHandle);
     }
   }
-}
-
-async function resolveRelayRoutesCached(
-  fetchImpl: C2Fetch,
-  anchorUrl: string,
-  routeName: string,
-  contract: C2RouteContractIdentity,
-  headers: Readonly<Record<string, string>>,
-  cache: Map<string, C2RelayRouteCacheEntry>,
-  cacheTtlMs: number,
-  resolveTimeoutMs: number,
-  forceRefresh: boolean,
-): Promise<readonly C2RelayRouteInfo[]> {
-  const cacheKey = relayRouteCacheKey(routeName, contract);
-  if (forceRefresh) {
-    invalidateRelayRouteCache(cache, cacheKey);
-  }
-  const now = Date.now();
-  if (cacheTtlMs > 0) {
-    const cached = cache.get(cacheKey);
-    if (cached) {
-      if (cached.expiresAtMs > now) {
-        return cached.routes;
-      }
-      cache.delete(cacheKey);
-    }
-  }
-  const routes = await resolveRelayRoutes(fetchImpl, anchorUrl, routeName, contract, headers, resolveTimeoutMs);
-  if (cacheTtlMs > 0) {
-    cache.set(cacheKey, {
-      routeName,
-      routes,
-      expiresAtMs: now + cacheTtlMs,
-    });
-  }
-  return routes;
-}
-
-function invalidateRelayRouteCache(cache: Map<string, C2RelayRouteCacheEntry>, cacheKey: string): void {
-  cache.delete(cacheKey);
-}
-
-function orderRelayRoutes(
-  routes: readonly C2RelayRouteInfo[],
-  currentRelayUrl: string | undefined,
-  excludedRoutes: ReadonlySet<string>,
-): readonly C2RelayRouteInfo[] {
-  const available = routes.filter((route) => {
-    const relayUrl = normalizeRelayBaseUrl(route.relayUrl, "C-Two resolved relay URL");
-    return !excludedRoutes.has(relayUrl);
-  });
-  if (!currentRelayUrl) {
-    return available;
-  }
-  const preferred: C2RelayRouteInfo[] = [];
-  const rest: C2RelayRouteInfo[] = [];
-  for (const route of available) {
-    const relayUrl = normalizeRelayBaseUrl(route.relayUrl, "C-Two resolved relay URL");
-    if (relayUrl === currentRelayUrl) {
-      preferred.push(route);
-    } else {
-      rest.push(route);
-    }
-  }
-  return [...preferred, ...rest];
 }
 
 async function resolveRelayRoutes(
@@ -1913,7 +1852,7 @@ async function resolveRelayRoutes(
       } catch (error) {
         throw new C2HttpTransportError(`C-Two relay resolve body read failed: ${String(error)}`);
       }
-      throw new C2HttpRelayError(response.status, body);
+      throw projectHttpAcquisitionError(response.status, body);
     }
     let body: string;
     try {
@@ -1966,7 +1905,6 @@ function normalizeRelayRouteInfo(route: unknown, index: number): C2RelayRouteInf
       stringField(item, "relay_url", index),
       `C-Two relay resolve route ${index} relay_url`,
     ),
-    routeUid: stringField(item, "route_uid", index),
     ipcAddress,
     serverId,
     serverInstanceId,
@@ -1975,7 +1913,6 @@ function normalizeRelayRouteInfo(route: unknown, index: number): C2RelayRouteInf
     crmVer: stringField(item, "crm_ver", index),
     abiHash: stringField(item, "abi_hash", index),
     signatureHash: stringField(item, "signature_hash", index),
-    maxPayloadSize: numberField(item, "max_payload_size", index),
   };
 }
 
@@ -1990,15 +1927,6 @@ function validateRelayRouteContract(route: C2RelayRouteInfo, index: number, rout
   ) {
     throw new Error(`C-Two relay resolve route ${index} does not match the expected CRM contract.`);
   }
-}
-
-function payloadTooLargeError(routeName: string, payloadSize: number, maxPayloadSize: number): C2HttpRelayError {
-  return new C2HttpRelayError(413, JSON.stringify({
-    error: "PayloadTooLarge",
-    route: routeName,
-    payload_size: payloadSize,
-    max_payload_size: maxPayloadSize,
-  }));
 }
 
 function stringField(item: Record<string, unknown>, field: string, index: number): string {
@@ -2020,68 +1948,75 @@ function optionalStringField(item: Record<string, unknown>, field: string, index
   return value;
 }
 
-function numberField(item: Record<string, unknown>, field: string, index: number): number {
-  const value = item[field];
-  if (typeof value !== "number" || !Number.isSafeInteger(value) || value <= 0) {
-    throw new Error(`C-Two relay resolve route ${index} is missing positive integer field ${field}.`);
+function preDispatchRouteCode(error: unknown): number | undefined {
+  if (error instanceof C2IpcTransportError || error instanceof C2CoreError) {
+    return error.transportPhase === "pre_dispatch" ? error.code ?? undefined : undefined;
   }
-  return value;
+  if (error instanceof C2HttpRelayError) {
+    const canonical = parseCanonicalRelayError(error.body);
+    if (canonical !== undefined && (error.transportPhase === "pre_dispatch" || canonical.details.dispatch_phase === "pre_dispatch")) return canonical.code;
+  }
+  return undefined;
 }
 
-function isRetryableResolveError(error: unknown): boolean {
-  if (error instanceof C2HttpTransportError) {
-    return true;
-  }
-  return error instanceof C2HttpRelayError && error.status >= 500 && error.status <= 599;
+function terminalRouteRefusal(error: unknown): boolean {
+  if (error instanceof C2IpcTransportError && (error.category === "protocol_version_mismatch" || error.category === "runtime_retired")) return true;
+  const code = preDispatchRouteCode(error);
+  return code === 710 || code === 713;
 }
 
 function isRetryableRouteError(error: unknown): boolean {
-  if (!(error instanceof C2HttpRelayError)) {
-    return false;
-  }
-  const canonical = parseCanonicalRelayError(error.body);
-  if (canonical === undefined) {
-    return false;
-  }
-  if (error.status === 404 && canonical.name === "ResourceNotFound") {
-    return true;
-  }
-  if (error.status === 409 && canonical.name === "RouteStale") {
-    return true;
-  }
-  return (
-    error.status === 502 &&
-    canonical.name === "ResourceUnavailable" &&
-    canonical.details.dispatch_phase === "pre_dispatch"
-  );
+  return preDispatchRouteCode(error) !== undefined;
+}
+
+function httpConnectFailure(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  const cause = error as Error & { code?: unknown; syscall?: unknown };
+  if (cause.code === "UND_ERR_CONNECT_TIMEOUT") return true;
+  if (cause.syscall === "connect" && (cause.code === "ECONNREFUSED" || cause.code === "ENETUNREACH" || cause.code === "EHOSTUNREACH")) return true;
+  if (cause.syscall === "getaddrinfo" && (cause.code === "ENOTFOUND" || cause.code === "EAI_AGAIN")) return true;
+  return httpConnectFailure(cause.cause);
 }
 
 function parseCanonicalRelayError(
   body: string,
-): { readonly name: string; readonly details: Readonly<Record<string, unknown>> } | undefined {
+): { readonly version: 1; readonly code: number; readonly name: string; readonly message: string; readonly details: Readonly<Record<string, string>> } | undefined {
   try {
     const parsed = JSON.parse(body) as unknown;
     if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
       return undefined;
     }
     const record = parsed as Record<string, unknown>;
-    if (typeof record.name !== "string") {
+    if (record.version !== 1 || !Number.isSafeInteger(record.code) || typeof record.name !== "string" || typeof record.message !== "string") {
       return undefined;
     }
     if (
       typeof record.details !== "object" ||
       record.details === null ||
-      Array.isArray(record.details)
+      Array.isArray(record.details) ||
+      !Object.values(record.details).every(value => typeof value === "string")
     ) {
       return undefined;
     }
     return {
+      version: 1,
+      code: record.code as number,
       name: record.name,
-      details: record.details as Readonly<Record<string, unknown>>,
+      message: record.message,
+      details: record.details as Readonly<Record<string, string>>,
     };
   } catch {
     return undefined;
   }
+}
+
+function projectHttpAcquisitionError(status: number, body: string): Error {
+  const canonical = parseCanonicalRelayError(body);
+  if (status === 409 && canonical?.code === 719 && canonical.name === "RouteConflict" &&
+      canonical.details.dispatch_phase === "pre_dispatch") {
+    return new C2RouteConflictError(canonical.message, canonical.details);
+  }
+  return new C2HttpRelayError(status, body, "pre_dispatch");
 }
 
 function requireRouteContractIdentity(contract: C2ContractIdentity): C2RouteContractIdentity {

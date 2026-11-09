@@ -531,8 +531,8 @@ def _candidate(tmp_path: Path) -> tuple[Path, dict[str, Any]]:
 
 
 @pytest.mark.parametrize("filename", [
-    "portable-matrix-receipt.v2.json",
-    "typescript-real-call-receipt.v2.json",
+    "portable-matrix-receipt.v3.json",
+    "typescript-real-call-receipt.v3.json",
     "package-consumer-receipt.v1.json",
 ])
 def test_manifest_accepts_current_receipt_files(tmp_path: Path, filename: str) -> None:
@@ -545,6 +545,7 @@ def test_manifest_accepts_current_receipt_files(tmp_path: Path, filename: str) -
 @pytest.mark.parametrize("filename", [
     "portable-matrix-receipt.v1.json",
     "typescript-real-call-receipt.v1.json",
+    "typescript-real-call-receipt.v2.json",
 ])
 def test_manifest_rejects_noncurrent_receipt_files(tmp_path: Path, filename: str) -> None:
     root, manifest = _candidate(tmp_path)

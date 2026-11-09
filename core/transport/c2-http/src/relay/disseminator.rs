@@ -34,6 +34,7 @@ impl FullBroadcast {
             crate::relay::peer::PeerMessage::RouteWithdraw { .. } => "/_peer/announce",
             crate::relay::peer::PeerMessage::RelayJoin { .. } => "/_peer/join",
             crate::relay::peer::PeerMessage::RelayLeave { .. } => "/_peer/leave",
+            crate::relay::peer::PeerMessage::RelayForceLeave { .. } => "/_peer/force-leave",
             crate::relay::peer::PeerMessage::Heartbeat { .. } => "/_peer/heartbeat",
             crate::relay::peer::PeerMessage::DigestExchange { .. } => "/_peer/digest",
             crate::relay::peer::PeerMessage::DigestDiff { .. } => "/_peer/digest",

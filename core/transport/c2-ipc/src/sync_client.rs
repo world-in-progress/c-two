@@ -82,7 +82,6 @@ pub(crate) fn call_error_phase(error: &IpcError) -> TransportPhase {
         | IpcError::RouteNotFound(_)
         | IpcError::RouteRemoved { .. }
         | IpcError::RouteClosed { .. }
-        | IpcError::RouteStale { .. }
         | IpcError::MethodNotFound { .. }
         | IpcError::Shm(_)
         | IpcError::Pool(_)
@@ -390,16 +389,6 @@ impl SyncClient {
         self.rt.block_on(self.inner.acquire_route(expected))
     }
 
-    /// Authoritatively acquire one exact route token.
-    pub fn acquire_route_token(
-        &self,
-        expected: &c2_contract::ExpectedRouteContract,
-        route_uid: &str,
-    ) -> Result<RouteBinding, IpcError> {
-        self.rt
-            .block_on(self.inner.acquire_route_token(expected, route_uid))
-    }
-
     /// Acquire under the caller's unchanged absolute connection deadline.
     pub fn acquire_route_with_deadline(
         &self,
@@ -408,18 +397,6 @@ impl SyncClient {
     ) -> Result<RouteBinding, IpcError> {
         self.rt
             .block_on(self.inner.acquire_route_with_deadline(expected, deadline))
-    }
-
-    pub fn acquire_route_token_with_deadline(
-        &self,
-        expected: &c2_contract::ExpectedRouteContract,
-        route_uid: &str,
-        deadline: c2_config::ConnectDeadline,
-    ) -> Result<RouteBinding, IpcError> {
-        self.rt.block_on(
-            self.inner
-                .acquire_route_token_with_deadline(expected, route_uid, deadline),
-        )
     }
 
     /// CRM tag advertised by a route, if present.

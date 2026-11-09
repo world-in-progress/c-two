@@ -361,6 +361,7 @@ def gates(python: str, output: Path, scope: str = FULL_SCOPE, *, target_platform
         raise ValueError(f"Unsupported source platform: {target_platform}")
     executable = "c3.exe" if target_platform == "windows" else "c3"
     retained_cli = output / "cli" / executable
+    attestor = ROOT / "core/target/debug" / ("c2-route-scope-attestor.exe" if target_platform == "windows" else "c2-route-scope-attestor")
     venv_python = ROOT / ".venv" / ("Scripts/python.exe" if target_platform == "windows" else "bin/python")
     def cargo(name: str, manifest: str, *arguments: str) -> Gate:
         return name, ["cargo", "test", "--locked", "--manifest-path", manifest, *arguments], ()
@@ -409,6 +410,7 @@ def gates(python: str, output: Path, scope: str = FULL_SCOPE, *, target_platform
         # feature and integration targets, in the same prepared runner.
         cargo("core-test", "core/Cargo.toml", "--workspace", "--no-fail-fast", "--features", "c2-http/relay"),
         ("cli-build", ["cargo", "build", "--locked", "--manifest-path", "cli/Cargo.toml", "--bins"], ()),
+        ("route-scope-attestor-build", [python, str(ROOT / "tools/dev/build_route_scope_attestor.py")], ("core-dependencies",)),
         cargo("cli-test", "cli/Cargo.toml"),
         # Retain the CLI only after every gate that can relink it has run.
         # Windows relinks are not byte-stable, so a copy taken before cli-test
@@ -463,11 +465,12 @@ def gates(python: str, output: Path, scope: str = FULL_SCOPE, *, target_platform
          ("fastdb-npm-build", "c2-mem-node-tests", "c2-mem-node-package")),
         ("python-suite", [python, str(ROOT / "tools/dev/test_python.py"),
                           "--python", str(venv_python), "--c3", str(retained_cli),
+                          "--route-scope-attestor", str(attestor),
                           "--workers", "2", "--output", str(output / "python-suite"),
                           "--fastdb-package", str(output / "npm/fastdb4ts.tgz"),
                           "--c2-mem-package", str(output / "npm/c2-mem-ffi.tgz"),
                           "--typescript-package", str(output / "npm/typescript.tgz")],
-         ("python-build", "fastdb-npm-build", "c2-mem-node-tests", "cli-artifact", "python310-install", "typescript-packages")),
+         ("python-build", "fastdb-npm-build", "c2-mem-node-tests", "cli-artifact", "python310-install", "typescript-packages", "route-scope-attestor-build")),
     ]
     if target_platform != "windows":
         selected = [gate for gate in selected if gate[0] != "windows-standard-user-consumer"]
@@ -479,11 +482,12 @@ def gates(python: str, output: Path, scope: str = FULL_SCOPE, *, target_platform
                 ("python310-build", ["uv", "sync", "--locked", "--python", "3.10"], ("python310-install",)),
                 ("python310-suite", [python, str(ROOT / "tools/dev/test_python.py"),
                                      "--python", str(python310), "--c3", str(retained_cli),
+                                     "--route-scope-attestor", str(attestor),
                                      "--ordinary-only", "--workers", "2", "--output", str(output / "python310-suite"),
                                      "--fastdb-package", str(output / "npm/fastdb4ts.tgz"),
                                      "--c2-mem-package", str(output / "npm/c2-mem-ffi.tgz"),
                                      "--typescript-package", str(output / "npm/typescript.tgz")],
-                 ("python310-build", "fastdb-npm-build", "c2-mem-node-tests", "cli-artifact", "typescript-packages")),
+                 ("python310-build", "fastdb-npm-build", "c2-mem-node-tests", "cli-artifact", "typescript-packages", "route-scope-attestor-build")),
             ])
     if scope == PYTHON_SCOPE:
         omitted = {"fastdb-rust-test", "core-check", "core-test", "rust-sdk-test",

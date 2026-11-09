@@ -13,6 +13,7 @@ This guide covers the native c3 interface. Configuration is documented in the [c
 - `c3 relay` starts the HTTP relay used for cross-machine discovery.
 - `c3 registry list-routes` lists route names registered with a relay.
 - `c3 registry peers` lists peer relays known by a mesh relay.
+- `c3 registry force-leave` makes a mesh relay forget an unreachable relay.
 - `c3 endpoint inspect/reap/sweep` projects native local endpoint maintenance.
 - `c3 contract` validates/releases `c-two.contract.v2` descriptors and composes complete Rust, Python, or TypeScript project trees.
 
@@ -102,11 +103,11 @@ Useful options:
 
 | Option | Environment | Default | Purpose |
 |---|---|---:|---|
-| `--bind`, `-b` | `C2_RELAY_BIND` | `0.0.0.0:8080` | HTTP listen address. |
+| `--bind`, `-b` | `C2_RELAY_BIND` | `0.0.0.0:8080` | HTTP listen address. Port `0` takes a free port; the `C-Two relay listening at` line prints the bound address. |
 | `--idle-timeout` | `C2_RELAY_IDLE_TIMEOUT` | `60` | Seconds before idle upstream IPC connections are evicted. Use `0` to disable time-based eviction. |
 | `--seeds`, `-s` | `C2_RELAY_SEEDS` | empty | Comma-separated seed relay URLs for mesh mode. |
 | `--relay-id` | `C2_RELAY_ID` | generated | Stable relay identifier for the mesh protocol. |
-| `--advertise-url` | `C2_RELAY_ADVERTISE_URL` | derived | Public URL other relays should use to reach this relay. |
+| `--advertise-url` | `C2_RELAY_ADVERTISE_URL` | derived from the bound address | Public URL other relays should use to reach this relay. |
 | `--ipc-root` | `C2_IPC_ROOT` | `/tmp/c2-v3-<uidhex>` (Unix) | Final owner-controlled endpoint directory; custom directories are application-provisioned, and `0755` is accepted when other identities cannot modify them. Not applicable on Windows, where upstream IPC uses TokenUser-scoped Named Pipes. |
 | `--ipc-pool-enabled <true\|false>` | `C2_IPC_POOL_ENABLED` | Rust resolver | Enable buddy for data-plane upstream IPC; `false` still permits dedicated SHM. |
 | `--ipc-shm-backing-budget-bytes` | `C2_IPC_SHM_BACKING_BUDGET_BYTES` | 8 GiB | Shared upstream buddy/dedicated backing budget. |
@@ -144,7 +145,7 @@ c3 relay --bind 127.0.0.1:8080 --idle-timeout 10 \
   --ipc-live-reassembly-budget-bytes 134217728
 ```
 
-Idle eviction disconnects the relay's cached IPC connection, not the resource server. Reconnect preserves full contract and server/instance identity validation; it does not replay ambiguous data-plane failures. Core relay-aware clients make one route observation followed by at most one pre-dispatch refresh; this bound is fixed and is not configurable through SDK settings. See the [memory policy](../docs/reference/memory-policy.md) for lazy allocation, fallback and retained-owner accounting.
+Idle eviction disconnects the relay's cached IPC connection, not the resource server. Reconnect preserves full contract and server/instance identity validation; it does not replay ambiguous data-plane failures. Before a call hands its input to a transport, Core acquires the client's route again at most once, under that call's deadline, when its target is known to be gone; this bound is fixed and is not configurable through SDK settings. See the [memory policy](../docs/reference/memory-policy.md) for lazy allocation, fallback and retained-owner accounting.
 
 When running normally, `c3 relay` installs a Ctrl+C handler and stops the relay cleanly on interrupt.
 
@@ -176,13 +177,23 @@ List registered routes:
 c3 registry list-routes --relay http://127.0.0.1:8080
 ```
 
+Each line names one registration: the route name, the relay that holds it and its URL, the registration time, and that relay's status as this relay sees it (Alive, Suspect or Dead). A line ends with `route conflict` when more than one live registration of the name exists; new acquisitions of such a name fail with `RouteConflict` until the deployer unregisters one copy. A name whose registrations are all on Suspect or Dead relays stays held: it does not resolve and cannot be registered elsewhere until that relay comes back and withdraws it, or the deployer force-leaves the relay below. A Host that ended without unregistering keeps its name at its relay; withdraw it there with `POST /_admin/unregister` and a JSON body with `name` and `server_id`, and the relay passes the withdrawal on to its peers.
+
 List known mesh peers:
 
 ```bash
 c3 registry peers --relay http://127.0.0.1:8080
 ```
 
-Registry requests use a five-second HTTP timeout. Malformed route or peer responses fail the command with a JSON error. By default, the CLI bypasses system proxy settings for relay inspection unless the relay layer is configured to use proxies.
+Force an unreachable relay to leave the mesh:
+
+```bash
+c3 registry force-leave relay-c --relay http://127.0.0.1:8080
+```
+
+The relay given with `--relay` accepts only a relay it currently sees as Suspect or Dead. It forgets that relay together with its routes and tombstones and passes the declaration on to its live peers; each peer applies it only if it also sees that relay as Suspect or Dead. Relays notice a lost peer at slightly different times, so a relay that still saw it as Alive when the declaration arrived keeps it: check `c3 registry peers` on the other relays and run the command there once they show it as Suspect or Dead. The command prints `Force-left relay-c.` and exits 0. A relay that is still Alive in that relay's view, the relay itself, an unknown relay and an invalid relay ID are refused, and the command prints the relay's reason and exits 1. Force-leave is not a ban: a force-left relay that becomes reachable again joins the relays it still remembers, and after a restart it joins through its seeds. A restarted relay without seeds starts alone, because no relay looks for it any more.
+
+Registry requests use a five-second HTTP timeout. A failed request, a refusal or a malformed response fails the command with an error message and exit code 1. By default, the CLI bypasses system proxy settings for relay inspection unless the relay layer is configured to use proxies.
 
 ## Development
 

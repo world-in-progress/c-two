@@ -134,20 +134,19 @@ fn with_invalid_relay_proxy_env(test: impl FnOnce()) {
     }
 }
 
-fn relay() -> (RelayServer, String) {
-    let probe = TcpListener::bind("127.0.0.1:0").expect("reserve relay port");
-    let address = probe.local_addr().expect("relay address");
-    drop(probe);
-    let relay_url = format!("http://{address}");
-    let relay = RelayServer::start(RelayConfig {
-        bind: address.to_string(),
-        advertise_url: relay_url.clone(),
-        idle_timeout_secs: 0,
-        anti_entropy_interval: std::time::Duration::ZERO,
-        heartbeat_interval: std::time::Duration::ZERO,
-        ..RelayConfig::default()
-    })
+fn relay(context: c2_config::LocalEndpointContext) -> (RelayServer, String) {
+    let relay = RelayServer::start_with_context(
+        RelayConfig {
+            bind: "127.0.0.1:0".into(),
+            idle_timeout_secs: 0,
+            anti_entropy_interval: std::time::Duration::ZERO,
+            heartbeat_interval: std::time::Duration::ZERO,
+            ..RelayConfig::default()
+        },
+        context,
+    )
     .expect("relay starts");
+    let relay_url = format!("http://{}", relay.local_addr());
     (relay, relay_url)
 }
 
@@ -386,27 +385,32 @@ fn malformed_ipc_server() -> MalformedIpcServer {
     }
 }
 
-async fn stale_relay_call(
+async fn missing_route_relay_call(
     State(call_count): State<Arc<AtomicUsize>>,
     Path((route, _method)): Path<(String, String)>,
 ) -> (StatusCode, Json<c2_error::C2ErrorEnvelope>) {
     call_count.fetch_add(1, Ordering::SeqCst);
     (
-        StatusCode::CONFLICT,
+        StatusCode::NOT_FOUND,
         Json(
-            C2Error::new(ErrorCode::RouteStale, "stale route token")
-                .with_details(BTreeMap::from([("route".to_string(), route)]))
+            C2Error::new(ErrorCode::ResourceNotFound, "route no longer found")
+                .with_details(BTreeMap::from([
+                    ("route".to_string(), route),
+                    ("dispatch_phase".to_string(), "pre_dispatch".to_string()),
+                ]))
                 .envelope(),
         ),
     )
 }
 
-fn stale_data_plane_server(call_count: Arc<AtomicUsize>) -> RegistryServer {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("stale data-plane listener");
+fn missing_route_data_plane_server(call_count: Arc<AtomicUsize>) -> RegistryServer {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("missing-route data-plane listener");
     listener
         .set_nonblocking(true)
-        .expect("nonblocking stale data-plane listener");
-    let address = listener.local_addr().expect("stale data-plane address");
+        .expect("nonblocking missing-route data-plane listener");
+    let address = listener
+        .local_addr()
+        .expect("missing-route data-plane address");
     let url = format!("http://{address}");
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
     let (ready_tx, ready_rx) = std::sync::mpsc::channel();
@@ -414,24 +418,24 @@ fn stale_data_plane_server(call_count: Arc<AtomicUsize>) -> RegistryServer {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
-            .expect("stale data-plane runtime");
+            .expect("missing-route data-plane runtime");
         runtime.block_on(async move {
             let listener = tokio::net::TcpListener::from_std(listener)
-                .expect("tokio stale data-plane listener");
+                .expect("tokio missing-route data-plane listener");
             let app = Router::new()
                 .route("/_probe/{route}", get(|| async { StatusCode::OK }))
-                .route("/{route}/{method}", post(stale_relay_call))
+                .route("/{route}/{method}", post(missing_route_relay_call))
                 .with_state(call_count);
-            ready_tx.send(()).expect("stale data-plane ready");
+            ready_tx.send(()).expect("missing-route data-plane ready");
             axum::serve(listener, app)
                 .with_graceful_shutdown(async {
                     let _ = shutdown_rx.await;
                 })
                 .await
-                .expect("stale data-plane serve");
+                .expect("missing-route data-plane serve");
         });
     });
-    ready_rx.recv().expect("stale data-plane readiness");
+    ready_rx.recv().expect("missing-route data-plane readiness");
     RegistryServer {
         url,
         shutdown: Some(shutdown_tx),
@@ -448,7 +452,6 @@ fn local_candidate(
     RelayRouteInfo {
         name: expected.route_name.clone(),
         relay_url: "http://127.0.0.1:9".to_string(),
-        route_uid: "route-uid-1".to_string(),
         ipc_address: Some(address),
         server_id: Some(server_id),
         server_instance_id: Some(server_instance_id),
@@ -487,18 +490,26 @@ fn all_connection_modes_return_the_same_client_surface_and_record_distinct_paths
     let _environment = relay_env_lock();
     fn accepts_client(_: &c2_core::Client) {}
 
-    let (mut relay, relay_url) = relay();
-    let runtime = Runtime::new(runtime_options(
-        unique_name("client-modes"),
-        Some(relay_url.clone()),
-    ))
-    .expect("runtime");
+    let root = tempfile::tempdir().expect("private IPC root");
+    let runtime =
+        Runtime::new(runtime_options(unique_name("client-modes"), None)).expect("runtime");
+    runtime
+        .set_local_endpoint_with_sources(
+            c2_config::LocalEndpointOptions {
+                #[cfg(unix)]
+                unix_root: Some(root.path().to_path_buf()),
+                ..Default::default()
+            },
+            c2_config::ConfigSources::empty(),
+        )
+        .unwrap();
+    let (mut relay, relay_url) = relay(runtime.local_endpoint_context().unwrap());
+    runtime.set_relay_anchor_address(Some(relay_url.clone()));
     let host = runtime.host(HostOptions::default()).expect("host");
     let route_name = unique_name("echo");
     let mut registration = host
         .register(definition(&route_name))
         .expect("route registration");
-    let registered_route_uid = registration.outcome().route_uid.clone();
     let expected = release()
         .expected_route(&route_name)
         .expect("expected route");
@@ -514,7 +525,6 @@ fn all_connection_modes_return_the_same_client_surface_and_record_distinct_paths
         .expect("direct client");
     accepts_client(&direct);
     assert_eq!(direct.observed_path(), ObservedPath::DirectIpc);
-    assert_eq!(direct.observed_route().route_uid, registered_route_uid);
     assert_eq!(direct.expected_route(), &expected);
     assert_eq!(
         direct.call_owned("echo", b"direct").expect("direct call"),
@@ -531,7 +541,7 @@ fn all_connection_modes_return_the_same_client_surface_and_record_distinct_paths
         .expect("explicit relay client");
     accepts_client(&explicit);
     assert_eq!(explicit.observed_path(), ObservedPath::ExplicitRelay);
-    assert_eq!(explicit.observed_route().route_uid, registered_route_uid);
+    assert_eq!(explicit.expected_route(), &expected);
     assert_eq!(
         explicit
             .call_owned("echo", b"explicit")
@@ -547,7 +557,7 @@ fn all_connection_modes_return_the_same_client_surface_and_record_distinct_paths
         relay_aware.observed_path(),
         ObservedPath::RelayAwareLocalIpc
     );
-    assert_eq!(relay_aware.observed_route().route_uid, registered_route_uid);
+    assert_eq!(relay_aware.expected_route(), &expected);
     assert_eq!(
         relay_aware
             .call_owned("echo", b"aware")
@@ -662,24 +672,15 @@ fn route_state_and_terminal_identity_errors_use_the_canonical_registry() {
         (
             IpcError::RouteRemoved {
                 route_name: "route".to_string(),
-                route_uid: Some("uid".to_string()),
             },
             ErrorCode::ResourceRemoved,
         ),
         (
             IpcError::RouteClosed {
                 route_name: "route".to_string(),
-                route_uid: "uid".to_string(),
                 reason: "draining".to_string(),
             },
             ErrorCode::ResourceClosed,
-        ),
-        (
-            IpcError::RouteStale {
-                route_name: "route".to_string(),
-                current_route_uid: "uid".to_string(),
-            },
-            ErrorCode::RouteStale,
         ),
         (
             IpcError::ContractMismatch("wrong release".to_string()),
@@ -707,6 +708,8 @@ fn route_state_and_terminal_identity_errors_use_the_canonical_registry() {
             panic!("route and identity state must normalize semantically");
         };
         assert_eq!(error.code, expected_code);
+        assert!(!error.details.contains_key("route_uid"));
+        assert!(!error.details.contains_key("current_route_uid"));
     }
 }
 
@@ -716,9 +719,8 @@ fn retained_release_identity_is_unchanged_by_route_failures() {
     let retained_ref = release.reference();
     let expected_json = retained_ref.to_canonical_json().expect("reference JSON");
     let _ = normalize_ipc_error(
-        IpcError::RouteStale {
+        IpcError::RouteRemoved {
             route_name: "route".to_string(),
-            current_route_uid: "uid".to_string(),
         },
         c2_core::TransportPhase::PreDispatch,
     );
@@ -844,35 +846,19 @@ fn relay_aware_contract_mismatch_is_terminal_without_fallback_resolution() {
         .expect("local registration");
     let identity = runtime.ensure_server().expect("runtime identity");
     let address = runtime.server_address().expect("server address");
-    // Inspect the server's local route token through a standalone throwaway
-    // client pool. Runtime-owned caches stay private (no public escape
-    // hatch). The inspection releases exactly the acquired client by identity.
-    let inspector_pool = c2_ipc::ClientPool::with_endpoint_context(
-        Duration::from_secs(60),
-        runtime.local_endpoint_context().unwrap(),
-    );
-    let inspector = inspector_pool
-        .acquire(&address, Some(&c2_ipc::ClientIpcConfig::default()))
-        .expect("inspect local route token");
-    let binding = inspector
-        .acquire_route(&actual_expected)
-        .expect("actual route binding");
-
     let mut claimed_expected = actual_expected;
     claimed_expected.crm_name = "DifferentPortableContract".to_string();
     let resolve_count = Arc::new(AtomicUsize::new(0));
-    let mut candidate = local_candidate(
+    let candidate = local_candidate(
         &claimed_expected,
         address.clone(),
         identity.server_id,
         identity.server_instance_id,
     );
-    candidate.route_uid = binding.route_uid().to_string();
     let registry = registry_server(candidate, resolve_count.clone());
     runtime.set_relay_anchor_address(Some(registry.url.clone()));
 
     let result = runtime.connect(claimed_expected, Connect::RelayAware);
-    assert!(inspector_pool.release_if_same(&address, &inspector));
     let Error::Semantic(error) = result.expect_err("contract mismatch must be terminal") else {
         panic!("contract mismatch must be semantic");
     };
@@ -937,7 +923,6 @@ fn relay_aware_selects_an_independent_http_path_when_no_local_candidate_exists()
         RelayRouteInfo {
             name: expected.route_name.clone(),
             relay_url: data_plane.url.clone(),
-            route_uid: "route-uid-http".to_string(),
             ipc_address: None,
             server_id: None,
             server_instance_id: None,
@@ -971,20 +956,19 @@ fn relay_aware_selects_an_independent_http_path_when_no_local_candidate_exists()
 }
 
 #[test]
-fn a_stale_post_is_pre_dispatch_and_the_next_call_refreshes_the_route() {
+fn a_not_found_post_is_pre_dispatch_and_the_next_call_refreshes_the_route() {
     let _environment = relay_env_lock();
     let release = release();
     let expected = release
-        .expected_route(unique_name("stale-once"))
+        .expected_route(unique_name("missing-once"))
         .expect("expected route");
     let call_count = Arc::new(AtomicUsize::new(0));
-    let data_plane = stale_data_plane_server(call_count.clone());
+    let data_plane = missing_route_data_plane_server(call_count.clone());
     let resolve_count = Arc::new(AtomicUsize::new(0));
     let registry = registry_server(
         RelayRouteInfo {
             name: expected.route_name.clone(),
             relay_url: data_plane.url.clone(),
-            route_uid: "route-uid-stale".to_string(),
             ipc_address: None,
             server_id: None,
             server_instance_id: None,
@@ -998,7 +982,7 @@ fn a_stale_post_is_pre_dispatch_and_the_next_call_refreshes_the_route() {
         resolve_count.clone(),
     );
     let runtime = Runtime::new(runtime_options(
-        unique_name("stale-runtime"),
+        unique_name("missing-route-runtime"),
         Some(registry.url.clone()),
     ))
     .expect("runtime");
@@ -1008,11 +992,15 @@ fn a_stale_post_is_pre_dispatch_and_the_next_call_refreshes_the_route() {
 
     let Error::Semantic(error) = client
         .call_owned("echo", b"request")
-        .expect_err("a stale POST must end this logical call")
+        .expect_err("a not-found POST must end this logical call")
     else {
-        panic!("stale route must remain a semantic error");
+        panic!("not-found route must remain a semantic error");
     };
-    assert_eq!(error.code, ErrorCode::RouteStale);
+    assert_eq!(error.code, ErrorCode::ResourceNotFound);
+    assert_eq!(
+        error.details.get("dispatch_phase").map(String::as_str),
+        Some("pre_dispatch")
+    );
     assert_eq!(
         resolve_count.load(Ordering::SeqCst),
         1,
@@ -1025,13 +1013,144 @@ fn a_stale_post_is_pre_dispatch_and_the_next_call_refreshes_the_route() {
     );
     let Error::Semantic(error) = client
         .call_owned("echo", b"next request")
-        .expect_err("the independent call also reaches the stale endpoint")
+        .expect_err("the independent call also reaches the missing-route endpoint")
     else {
-        panic!("stale route must remain a semantic error");
+        panic!("not-found route must remain a semantic error");
     };
-    assert_eq!(error.code, ErrorCode::RouteStale);
+    assert_eq!(error.code, ErrorCode::ResourceNotFound);
     assert_eq!(resolve_count.load(Ordering::SeqCst), 2);
     assert_eq!(call_count.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn only_authoritative_contract_refusal_reacquires_the_http_target() {
+    let _environment = relay_env_lock();
+    for code in [
+        ErrorCode::CallCapacityExceeded,
+        ErrorCode::CallDeadlineExceeded,
+        ErrorCode::IdentityMismatch,
+        ErrorCode::ProtocolViolation,
+        ErrorCode::ContractMismatch,
+    ] {
+        assert_http_refusal_reacquisition(code);
+    }
+}
+
+#[test]
+fn removed_and_closed_pre_dispatch_refusals_reacquire_before_the_next_call() {
+    // Error contracts: "After a pre-dispatch refusal of a missing, removed or
+    // closed route, or of another contract, the connection's next call acquires
+    // the route again by name."
+    let _environment = relay_env_lock();
+    for code in [ErrorCode::ResourceRemoved, ErrorCode::ResourceClosed] {
+        assert_http_refusal_reacquisition(code);
+    }
+}
+
+fn assert_http_refusal_reacquisition(code: ErrorCode) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let (shutdown, stopped) = tokio::sync::oneshot::channel();
+    let (ready, started) = std::sync::mpsc::channel();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let observed = calls.clone();
+    let thread = std::thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async move {
+                let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+                let app = Router::new()
+                    .route("/_probe/{route}", get(|| async { StatusCode::OK }))
+                    .route(
+                        "/{route}/{method}",
+                        post(move || {
+                            observed.fetch_add(1, Ordering::SeqCst);
+                            async move {
+                                (
+                                    match code {
+                                        ErrorCode::ResourceRemoved => StatusCode::GONE,
+                                        ErrorCode::ContractMismatch => StatusCode::CONFLICT,
+                                        _ => StatusCode::SERVICE_UNAVAILABLE,
+                                    },
+                                    Json(
+                                        C2Error::new(code, "pre-dispatch refusal")
+                                            .with_details(BTreeMap::from([(
+                                                "dispatch_phase".into(),
+                                                "pre_dispatch".into(),
+                                            )]))
+                                            .envelope(),
+                                    ),
+                                )
+                            }
+                        }),
+                    );
+                ready.send(()).unwrap();
+                axum::serve(listener, app)
+                    .with_graceful_shutdown(async {
+                        let _ = stopped.await;
+                    })
+                    .await
+                    .unwrap();
+            });
+    });
+    started.recv().unwrap();
+    let data = RegistryServer {
+        url,
+        shutdown: Some(shutdown),
+        thread: Some(thread),
+    };
+    let expected = release().expected_route(unique_name("refusal")).unwrap();
+    let resolves = Arc::new(AtomicUsize::new(0));
+    let registry = registry_server(
+        RelayRouteInfo {
+            name: expected.route_name.clone(),
+            relay_url: data.url.clone(),
+            ipc_address: None,
+            server_id: None,
+            server_instance_id: None,
+            crm_ns: expected.crm_ns.clone(),
+            crm_name: expected.crm_name.clone(),
+            crm_ver: expected.crm_ver.clone(),
+            abi_hash: expected.abi_hash.clone(),
+            signature_hash: expected.signature_hash.clone(),
+            max_payload_size: 1024,
+        },
+        resolves.clone(),
+    );
+    let runtime = Runtime::new(runtime_options(
+        unique_name("refusal-runtime"),
+        Some(registry.url.clone()),
+    ))
+    .unwrap();
+    let client = runtime.connect(expected, Connect::RelayAware).unwrap();
+    for round in 1..=2 {
+        let Error::Semantic(error) = client.call_owned("echo", b"input").unwrap_err() else {
+            panic!("typed refusal")
+        };
+        assert_eq!(error.code, code);
+        assert_eq!(error.details["transport_phase"], "pre_dispatch");
+        assert_eq!(calls.load(Ordering::SeqCst), round, "no business replay");
+        let acquisitions = if matches!(
+            code,
+            ErrorCode::ContractMismatch | ErrorCode::ResourceRemoved | ErrorCode::ResourceClosed
+        ) {
+            round
+        } else {
+            1
+        };
+        assert_eq!(
+            resolves.load(Ordering::SeqCst),
+            acquisitions,
+            "only the route fact invalidates the target: {code:?}"
+        );
+        assert_eq!(
+            runtime.path_counters().relay_aware_relay(),
+            acquisitions as u64
+        );
+    }
 }
 
 #[test]
@@ -1362,7 +1481,6 @@ fn http_probe_error_storage_uses_the_runtime_payload_budget() {
         RelayRouteInfo {
             name: expected.route_name.clone(),
             relay_url: data_plane.url.clone(),
-            route_uid: "probe-budget-route".into(),
             ipc_address: None,
             server_id: None,
             server_instance_id: None,

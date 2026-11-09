@@ -3,7 +3,6 @@ pub use c2_ipc::pool::IpcClientCloseDetail;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RegisterOutcome {
     pub route_name: String,
-    pub route_uid: String,
     pub server_id: String,
     pub server_instance_id: String,
     pub ipc_address: String,
@@ -16,6 +15,8 @@ pub struct RegisterFailureOutcome {
     pub failure_source: String,
     pub error_message: String,
     pub status_code: Option<u16>,
+    /// The relay's canonical refusal, alongside the original status and text.
+    pub semantic_error: Option<c2_error::C2Error>,
     pub rollback: Option<RouteCloseOutcome>,
     pub relay_cleanup_error: Option<RelayCleanupError>,
 }

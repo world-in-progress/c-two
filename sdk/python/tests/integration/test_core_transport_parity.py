@@ -26,7 +26,7 @@ def test_direct_ipc_is_selected_by_the_single_core_client():
         assert proxy.greeting("Core") == "Hello, Core!"
         assert proxy.client._client.mode == "ipc"  # noqa: SLF001
         assert proxy.client.observed_path == "direct_ipc"
-        assert proxy.client.route_uid
+        assert not hasattr(proxy.client, "route_uid")
         counters = _get_default_runtime()._runtime_session.path_counters()  # noqa: SLF001
         assert counters == {
             "direct_ipc": 1,

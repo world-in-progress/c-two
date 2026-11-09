@@ -155,6 +155,7 @@ def suite_steps(options, root: Path) -> list[Step]:
     output = options.output.resolve()
     python = os.path.abspath(os.path.expanduser(options.python))
     c3 = options.c3 or root / ('cli/target/debug/c3.exe' if os.name == 'nt' else 'cli/target/debug/c3')
+    attestor = root / 'core/target/debug' / ('c2-route-scope-attestor.exe' if os.name == 'nt' else 'c2-route-scope-attestor')
     env = child_environment(dict(os.environ), options.tool_path, options.coresdk_lib)
     node = Path(shutil.which('node', path=env['PATH']) or 'node')
     commands = {
@@ -165,6 +166,7 @@ def suite_steps(options, root: Path) -> list[Step]:
         'repo': [os.path.abspath(options.repo_python or python), '-m', 'pytest', '--confcutdir=tests/repo', 'tests/repo', '-q', '-rs', '--timeout=60',
                  f'--basetemp={output / "repo/tmp"}', f'--junitxml={output / "repo/junit.xml"}'],
         'python': [python, 'tools/dev/test_python.py', '--python', python, '--c3', str(c3.resolve()),
+                   '--route-scope-attestor', str(attestor.resolve()),
                    '--output', str(output / 'python/evidence'), '--workers', str(options.workers),
                    '--stage-timeout', str(options.stage_timeout), *package_args(options)],
         'typescript': strict.build_pytest_command(python, 'typescript', output / 'typescript', 1),
@@ -349,6 +351,11 @@ def check(options, env: dict[str, str]) -> dict:
             c3 = options.c3 or ROOT / ('cli/target/debug/c3.exe' if os.name == 'nt' else 'cli/target/debug/c3')
             probe([str(c3), '--version'], env)
             report.setdefault('input_hashes', {}).update({str(c3.resolve()): strict.sha256(c3), info['native']: info['native_sha256']})
+            if 'python' in selected:
+                attestor = ROOT / 'core/target/debug' / ('c2-route-scope-attestor.exe' if os.name == 'nt' else 'c2-route-scope-attestor')
+                if not attestor.is_file():
+                    raise LocalError(f'registration attestor missing: {attestor}; run prepare --suite python')
+                report['input_hashes'][str(attestor)] = strict.sha256(attestor)
             for path in packages(options):
                 if path and not path.is_file():
                     raise LocalError(f'package missing: {path}')
@@ -385,7 +392,7 @@ def execute_steps(steps: list[Step], output: Path, environment: dict[str, str], 
         env = {**environment, 'FASTDB_PAYLOAD_LINK_MODE': step.link_mode}
         print(f'{step.name}: {subprocess.list2cmdline(step.command)}', flush=True)
         if step.name == 'typescript':
-            env.update(CTWO_PYTHON_STAGE_DIR=str(directory), C2_TYPESCRIPT_RECEIPT=str(directory / 'typescript-real-call-receipt.v2.json'),
+            env.update(CTWO_PYTHON_STAGE_DIR=str(directory), C2_TYPESCRIPT_RECEIPT=str(directory / 'typescript-real-call-receipt.v3.json'),
                        C2_TYPESCRIPT_EVIDENCE_STAGE='development')
         # The strict Python subprocess acquires all its own resource leases.
         with ExitStack() as stack:
@@ -436,7 +443,7 @@ def execute_steps(steps: list[Step], output: Path, environment: dict[str, str], 
                     if planned is not None and record['status'] == 'passed':
                         strict.validate_execution(directory, planned, 1)
                         from tools.local_rc.typescript_receipt import load_and_validate_receipt
-                        load_and_validate_receipt(directory / 'typescript-real-call-receipt.v2.json', expected_stage='development')
+                        load_and_validate_receipt(directory / 'typescript-real-call-receipt.v3.json', expected_stage='development')
                 except (subprocess.TimeoutExpired, KeyboardInterrupt) as error:
                     record['status'] = 'cancelled' if isinstance(error, KeyboardInterrupt) else 'timed_out'
                     record['error'] = str(error)
@@ -498,6 +505,8 @@ def preparation_steps(options, staging: Path) -> list[Step]:
                                'source' if suite == 'native' else 'system'))
     if any(s in selected for s in ('cli', 'python', 'typescript')):
         result.append(Step('c3-build', ['cargo', 'build', '--locked', '--manifest-path', 'cli/Cargo.toml', '--bins'], 'source'))
+    if 'python' in selected:
+        result.append(Step('route-scope-attestor-build', [options.python, 'tools/dev/build_route_scope_attestor.py']))
     if any(s in selected for s in ('python', 'typescript', 'native')):
         result.append(Step('python-sync', ['uv', 'sync', '--locked', '--python', options.python], 'source'))
     if 'repo' in selected:

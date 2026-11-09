@@ -155,7 +155,6 @@ mod posix {
     use std::process::{Child, ChildStdin, Command, Stdio};
 
     const ROOT_ENV: &str = "C2_STALLED_PEER_ROOT";
-    const ROUTE_UID_ENV: &str = "C2_STALLED_PEER_ROUTE_UID";
 
     struct PeerProcess {
         child: Child,
@@ -245,7 +244,6 @@ mod posix {
     #[ignore = "run only as the controlled child of sigstop_peer_resumes_and_settles"]
     fn stalled_peer_child() {
         let root = std::env::var(ROOT_ENV).unwrap();
-        let route_uid = std::env::var(ROUTE_UID_ENV).unwrap();
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -261,9 +259,8 @@ mod posix {
                 .unwrap();
             super::super::super::tests::handshake_test_client_with(&mut peer, 0, "").await;
             let descriptor = ValidatedContractDescriptor::from_json(STREAM_DESCRIPTOR).unwrap();
-            let identity = RouteCallIdentity {
+            let identity: RouteCallIdentity = RouteCallIdentity {
                 route_name: "portable".into(),
-                route_uid,
                 crm_ns: descriptor.crm_namespace().into(),
                 crm_name: descriptor.crm_name().into(),
                 crm_ver: descriptor.crm_version().into(),
@@ -388,7 +385,6 @@ mod posix {
                 &descriptor,
             )
             .unwrap();
-        let route_uid = built.route_uid().to_string();
         let reservation = server.reserve_route(built).await.unwrap();
         server.commit_reserved_route(reservation).await.unwrap();
         server.begin_start_attempt().unwrap();
@@ -402,7 +398,6 @@ mod posix {
         let mut child = Command::new(std::env::current_exe().unwrap())
             .args(["--ignored", "--nocapture", "stalled_peer_child"])
             .env(ROOT_ENV, root.path())
-            .env(ROUTE_UID_ENV, route_uid)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()
