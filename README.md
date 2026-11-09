@@ -28,11 +28,11 @@ A **CRM contract** declares the callable methods and their namespace/version. A 
 
 ## Why stateful RPC is different
 
-A stateless service can hand each request to any instance and keeps its state in an external store. A C-Two call always reaches the same resource object and may change its state. The table compares the two.
+A stateless service can hand each request to any instance and keeps its state in an external store. In C-Two a route name stands for one resource's state, and a call goes to the resource registered under that name and may change its state. The table compares the two.
 
 | | Stateless RPC services | C-Two resources |
 | --- | --- | --- |
-| Where a call goes | Any instance of the service; state is usually kept in an external store | The same resource object, which keeps the state |
+| Where a call goes | Any instance of the service; state is usually kept in an external store | The resource registered under the route name, which keeps the state; clients follow the name to its next registration, for example after a restart or on another machine, and the Host that serves it keeps the state continuous |
 | Concurrency | Requests are independent of each other | Methods are writes by default and run one at a time on a resource; methods marked `@cc.read` can run in parallel |
 | After a failure | Calls can be configured to be retried or hedged automatically | A call that may already have run is not retried or replayed automatically; Python and Rust errors report whether it may have run |
 | Shutdown | Usually a grace period, after which in-flight requests are cancelled | New calls are refused; unary calls already sent run to completion and deliver their results, and open server streams end between steps after the items already produced |
@@ -40,7 +40,7 @@ A stateless service can hand each request to any instance and keeps its state in
 
 ## Features
 
-- **Local and remote calls:** same-process calls pass Python objects directly; same-host IPC uses Unix domain sockets or Windows Named Pipes; cross-machine calls go through the HTTP relay. Relay discovery selects a verified local IPC path or an HTTP target, and explicit IPC connections work independently of relay discovery.
+- **Local and remote calls:** same-process calls pass Python objects directly; same-host IPC uses Unix domain sockets or Windows Named Pipes; cross-machine calls go through the HTTP relay. A route name has at most one live registration in a relay mesh; relay discovery resolves it to a verified local IPC path or an HTTP target, and explicit IPC connections work independently of relay discovery.
 - **State and concurrency:** resources keep their state between calls. `@cc.read` and `@cc.write` declare access semantics, with writes as the default. Native route scheduling enforces concurrency and pending-work limits across local and remote invocation.
 - **Payloads and memory:** `@cc.transfer(...)` binds FastDB `Payload` specifications, and ordinary Python values also work between Python peers. IPC moves large payloads through lazy buddy pools, dedicated shared memory, checked chunk transfer and file spill, within memory budgets. `cc.hold()` retains a response's local copy, and registration can select borrowed inputs; both keep only local copies, and release invalidates payload owners and checked views first. See [memory policy](docs/reference/memory-policy.md) and [Python payload usage](docs/reference/python-usage.md).
 - **Server streams:** a method marked `@cc.stream` returns zero or more items for one input. Python and Rust resources produce items one step at a time and hold the route permit only within a step; clients iterate, hold or close the stream. Streams work within one process, over IPC and, for Rust and Python clients, through a relay; generated TypeScript clients consume them over IPC and do not read them through a relay yet. See [Python server streams](docs/reference/python-usage.md#server-streams).
