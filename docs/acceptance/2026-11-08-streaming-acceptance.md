@@ -76,8 +76,8 @@
 
 ## 留给后续的
 
-- 路由身份（ADR 0004，待办“接下来”第 1 项）解决 D5，要在任何包含 IPC 16 的版本发布之前完成，并加回 9b8b 为等那处修复而去掉的 relay-local 首次 acquire 用例。
-- 生成的 TypeScript 经 relay 的流，随 TypeScript 运行时那一批再做（待办第 6 项）。
-- `sdk/python/native/src/runtime_session_ffi.rs` 里还有两类持锁碰 Python 的写法，与 9c3 修好的死锁属同一类，只做了静态核对（待办第 3 项）。
-- 配对基准的收据只给 p99 的比值，第十二节第 7 条的门槛用 p95；`run_matrix` 曾在 Windows 上把一次正常结束的行报成超过等待时限（待办第 7 项的顺带项）。
+- 路由身份（ADR 0004，[验收记录](2026-11-09-route-identity-acceptance.md)）解决 D5，要在任何包含 IPC 16 的版本发布之前完成，并加回 9b8b 为等那处修复而去掉的 relay-local 首次 acquire 用例。
+- 生成的 TypeScript 经 relay 的流，随 TypeScript 运行时那一批再做（待办“TypeScript 与 Node”）。
+- `sdk/python/native/src/runtime_session_ffi.rs` 里还有两类持锁碰 Python 的写法，与 9c3 修好的死锁属同一类，只做了静态核对（待办“按区域的结构调整与重复校验”）。
+- 配对基准的收据只给 p99 的比值，第十二节第 7 条的门槛用 p95；`run_matrix` 曾在 Windows 上把一次正常结束的行报成超过等待时限（待办“发版工具，方案 B”的顺带项）。
 - 经 relay 的流的提前量，以及 Host 关闭返回时空闲连接可能还没关完，仍待维护者决定（待办“待维护者决定”）。

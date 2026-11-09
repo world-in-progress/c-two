@@ -4,7 +4,7 @@ Status refreshed: 2026-11-03.
 
 This page records the direction of C-Two's 0.x line: the current foundation, and the exit criteria of the product capabilities that are not yet built. Open work, its order and its status live only in the [backlog](backlog.md), a Chinese working record.
 
-The latest release is C-Two 0.10.1 with c3 0.6.0. Since then `main` has merged the interface slimming, the defect and dead-code fixes, the removal of the owner subsystem, single-owner shared-memory release and server streams (IPC 16, SHM 4, C/FFI ABI 8, relay mesh 7); they are unreleased and described in the [unreleased notes](../releases/unreleased.md). FastDB is pinned to 0.2.4 (native source `f82fa13adeae2b87a295bf984821c85c44b55a3d`). The Rust SDK, Core and TypeScript bindings keep independent 0.1.0 versions, with no C-Two crates.io or npm publication.
+The latest release is C-Two 0.10.1 with c3 0.6.0. Since then `main` has merged the interface slimming, the defect and dead-code fixes, the removal of the owner subsystem, single-owner shared-memory release, server streams and route name identity (IPC 16, SHM 4, C/FFI ABI 8, relay mesh 7); they are unreleased and described in the [unreleased notes](../releases/unreleased.md). FastDB is pinned to 0.2.4 (native source `f82fa13adeae2b87a295bf984821c85c44b55a3d`). The Rust SDK, Core and TypeScript bindings keep independent 0.1.0 versions, with no C-Two crates.io or npm publication.
 
 `docs/reference/` owns current behavior. [CI and release qualification](../reference/ci-cd.md) distinguishes source validation, package validation and publication; each release retains its exact source and artifact receipts.
 

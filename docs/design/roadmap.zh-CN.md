@@ -4,7 +4,7 @@
 
 本页写 C-Two 0.x 的方向：现有的地基，以及还没做的产品能力各自的完成标准。还没做的事、它们的顺序与进度只记在[待办](backlog.md)里。
 
-最新发版是 C-Two 0.10.1 与 c3 0.6.0。此后 `main` 合入了接口精简、缺陷与死代码修复、删除 owner 子系统、单一属主释放与服务端流（IPC 16、SHM 4、C/FFI ABI 8、relay mesh 7），尚未发版，见[未发布的改动](../releases/unreleased.md)。FastDB 固定 0.2.4（原生源码 `f82fa13adeae2b87a295bf984821c85c44b55a3d`）。Rust SDK、Core 与 TypeScript 绑定各自保持 0.1.0，C-Two 不在 crates.io 或 npm 发布。
+最新发版是 C-Two 0.10.1 与 c3 0.6.0。此后 `main` 合入了接口精简、缺陷与死代码修复、删除 owner 子系统、单一属主释放、服务端流与路由身份（IPC 16、SHM 4、C/FFI ABI 8、relay mesh 7），尚未发版，见[未发布的改动](../releases/unreleased.md)。FastDB 固定 0.2.4（原生源码 `f82fa13adeae2b87a295bf984821c85c44b55a3d`）。Rust SDK、Core 与 TypeScript 绑定各自保持 0.1.0，C-Two 不在 crates.io 或 npm 发布。
 
 `docs/reference/` 负责现行行为。[CI 与发行流程](../reference/ci-cd.md)区分源码验证、包验证与发布；各次发行保留确切源码与产物收据。
 

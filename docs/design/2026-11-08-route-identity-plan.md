@@ -1,8 +1,8 @@
 # 路由身份的执行计划
 
-状态：维护者 2026-11-08 按推荐批准，包括第二节的决定 A 至 F 与第三节的用词；实施中。
+状态：维护者 2026-11-08 按推荐批准，包括第二节的决定 A 至 F 与第三节的用词。七块都已实施并验收，见[验收记录](../acceptance/2026-11-09-route-identity-acceptance.md)；2026-11-09 经 [world-in-progress/c-two#221](https://github.com/world-in-progress/c-two/pull/221) 合入上游 main（`cc59ceee`）。
 
-本计划实施 [ADR 0004](../decisions/0004-route-name-identity.md)，即[待办](backlog.md)“接下来”的第 1 项。依据是 ADR 0004、[单一持有者调研](../research/2026-11-06-single-owner-naming-survey.md)、[流式第二、三阶段验收记录](../acceptance/2026-11-08-streaming-acceptance.md)里的已知问题 D5，以及[闲置驱逐审查](../acceptance/2026-10-10-idle-eviction-regression-audit.md)的六道门禁。这一批要在任何包含 IPC 16 的版本发布之前合入 main；main 从 `a5ab5eaa`（world-in-progress/c-two#219）起已经包含 IPC 16。整合分支 `socu/route-identity` 从上游 main 的 `fd33e140` 切出，它与 `a5ab5eaa` 只差 world-in-progress/c-two#220 的文档。第一节的现状来自对 `a5ab5eaa` 源码的静态阅读，没有运行验证；第七节列出留给各块核实的地方。
+本计划实施 [ADR 0004](../decisions/0004-route-name-identity.md)。依据是 ADR 0004、[单一持有者调研](../research/2026-11-06-single-owner-naming-survey.md)、[流式第二、三阶段验收记录](../acceptance/2026-11-08-streaming-acceptance.md)里的已知问题 D5，以及[闲置驱逐审查](../acceptance/2026-10-10-idle-eviction-regression-audit.md)的六道门禁。这一批要在任何包含 IPC 16 的版本发布之前合入 main；main 从 `a5ab5eaa`（world-in-progress/c-two#219）起已经包含 IPC 16。整合分支 `socu/route-identity` 从上游 main 的 `fd33e140` 切出，它与 `a5ab5eaa` 只差 world-in-progress/c-two#220 的文档。第一节的现状来自对 `a5ab5eaa` 源码的静态阅读，没有运行验证；第七节列出留给各块核实的地方。
 
 ## 一、现状
 
@@ -109,7 +109,7 @@ ADR 0004 的几处用词与[术语表](../../CONTEXT.md)冲突或重复。下面
 
 ### 块 4：代理跟随路由名：生成的 TypeScript 客户端
 
-范围：Node 经 ABI 8 使用 Core 的客户端，IPC 上的跟随来自块 3；ABI 8 的端点上下文现在固定服务器身份，直接 IPC 要接受同一地址上的新服务器实例时，c2-mem-ffi 与 C 头文件随之修改。生成的 TypeScript 传输补上 relay-aware 的部分，规则同块 3：停在当前目标，已知注册结束时于下一次调用之前重新解析，relay-local 与 HTTP 之间可以切换。不改动 TypeScript 运行时的结构，拆包另由待办第 6 项做。
+范围：Node 经 ABI 8 使用 Core 的客户端，IPC 上的跟随来自块 3；ABI 8 的端点上下文现在固定服务器身份，直接 IPC 要接受同一地址上的新服务器实例时，c2-mem-ffi 与 C 头文件随之修改。生成的 TypeScript 传输补上 relay-aware 的部分，规则同块 3：停在当前目标，已知注册结束时于下一次调用之前重新解析，relay-local 与 HTTP 之间可以切换。不改动 TypeScript 运行时的结构，拆包另由待办“TypeScript 与 Node”做。
 
 检查：TypeScript 代码生成与 Node 绑定的测试，Python 里调用生成的 Node 客户端的集成测试与门禁测试；块 3 的真实进程场景在生成的 Node 客户端上跑一遍。
 
@@ -129,7 +129,7 @@ ADR 0004 的几处用词与[术语表](../../CONTEXT.md)冲突或重复。下面
 
 ### 块 6：relay 网格里名字唯一
 
-范围：注册时除了本地，还检查对端：名字已由存活的对端持有，或者仍归一个失联的 relay，都报 `ResourceAlreadyRegistered`，细节写明持有的 relay 与它的状态。失联（Suspect 或 Dead）relay 名下的路由不再删除，不参与解析；名字只由它们持有时，解析报 `ResourceUnavailable`。解析至多返回一次注册，删除按 (registered_at, relay_id) 排序的逻辑。同一个名字在多个 relay 上都有在线注册时（分区愈合之后，或者两个 relay 同时接受了同一个新名字），新的获取在派发前报 719 `RouteConflict`；已有的代理按块 3、块 4 的规则停在它当前的 relay 上，不跨到别的注册。`/_routes`（`c3 registry list-routes`）标出冲突的注册与仍归失联 relay 的路由，relay 在发现冲突与冲突解除时各记一条日志。对端消息与全量同步去掉 route_uid（决定 B）。c2-error 新增 719，Python 加 `RouteConflict` 类、`ERROR_Code` 成员与映射，Rust 与 TypeScript 加映射。按决定 D，在参考文档与 `cli/README.md` 写明 Host 崩溃之后名字怎样回来。顺带改掉 `sdk/python/src/c_two/error.py` 里重复注册错误把 route name 写成 resource name 的 docstring（待办第 5 项）。
+范围：注册时除了本地，还检查对端：名字已由存活的对端持有，或者仍归一个失联的 relay，都报 `ResourceAlreadyRegistered`，细节写明持有的 relay 与它的状态。失联（Suspect 或 Dead）relay 名下的路由不再删除，不参与解析；名字只由它们持有时，解析报 `ResourceUnavailable`。解析至多返回一次注册，删除按 (registered_at, relay_id) 排序的逻辑。同一个名字在多个 relay 上都有在线注册时（分区愈合之后，或者两个 relay 同时接受了同一个新名字），新的获取在派发前报 719 `RouteConflict`；已有的代理按块 3、块 4 的规则停在它当前的 relay 上，不跨到别的注册。`/_routes`（`c3 registry list-routes`）标出冲突的注册与仍归失联 relay 的路由，relay 在发现冲突与冲突解除时各记一条日志。对端消息与全量同步去掉 route_uid（决定 B）。c2-error 新增 719，Python 加 `RouteConflict` 类、`ERROR_Code` 成员与映射，Rust 与 TypeScript 加映射。按决定 D，在参考文档与 `cli/README.md` 写明 Host 崩溃之后名字怎样回来。顺带改掉 `sdk/python/src/c_two/error.py` 里重复注册错误把 route name 写成 resource name 的 docstring（待办“错误类型”）。
 
 检查：route_table、authority、background 与对端处理的单元测试。用真实的 c3 relay：在 A 注册之后，在 B 注册同名被拒绝；停掉 A，B 仍然拒绝、解析报 702，A 回来并由 Host 注销之后 B 可以注册；两个 relay 先各自独立启动、各注册同一个名字、再连成网格，两边新的获取都报 `RouteConflict`，细节列出两次注册，列表标出冲突，已有代理继续调用自己那一份，注销其中一份之后冲突解除，那一份的代理跟到留下的一份；Host 进程被杀之后，用 `/_admin/unregister` 在原 relay 上撤下，名字随即可以在另一个 relay 注册，并确认这次撤下传到了对端。这一块的差异另请一位审查者独立核对（见第六节）。
 
@@ -153,8 +153,8 @@ ADR 0004 的几处用词与[术语表](../../CONTEXT.md)冲突或重复。下面
 
 顺带项：
 
-- 待办第 3 项 relay 小节里“relay-aware 调用没有每次调用的路由回执，`observed_route` 仍是连接时的值”，随块 2、3 解决，届时从待办删掉。
-- 待办第 5 项里 `error.py` 的 docstring，归块 6。
+- 待办“按区域的结构调整与重复校验”的 relay 小节里“relay-aware 调用没有每次调用的路由回执，`observed_route` 仍是连接时的值”，随块 2、3 解决，届时从待办删掉。
+- 待办“错误类型”里 `error.py` 的 docstring，归块 6。
 - `cli/README.md` 里客户端重新解析次数的说法，归块 3。
 - AGENTS.md 的退役表加一行，归块 7：route token（`x-c2-route-uid`、prepare 的 `routeUid`、`ObservedRoute`、`observed_route()`、Python `route_uid`）、704 `RouteStale`、706、711 与按 route UID 排除候选，取代者是代理跟随路由名与 719 `RouteConflict`。
 
