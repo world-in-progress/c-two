@@ -175,7 +175,10 @@ fn wait_until(mut predicate: impl FnMut() -> bool) {
             Instant::now() < deadline,
             "mesh state did not settle within {WAIT:?}"
         );
-        std::thread::yield_now();
+        // Most predicates open a new loopback TCP connection, and peer states
+        // follow heartbeats that take seconds. Polling without a pause used up
+        // Windows' ephemeral ports (WSAENOBUFS) while they settled.
+        std::thread::sleep(Duration::from_millis(10));
     }
 }
 
