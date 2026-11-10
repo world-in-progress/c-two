@@ -289,6 +289,13 @@ pub struct Server {
     /// The single route authority, published and reserved under a short lock.
     dispatcher: RwLock<Dispatcher>,
     shutdown_tx: watch::Sender<bool>,
+    #[cfg(test)]
+    shutdown_signal_pause: parking_lot::Mutex<
+        Option<(
+            tokio::sync::oneshot::Sender<()>,
+            tokio::sync::oneshot::Receiver<()>,
+        )>,
+    >,
     lifecycle_tx: watch::Sender<LifecycleSnapshot>,
     connection_event_source: ConnectionEventSource,
     route_registration: Mutex<()>,
@@ -532,6 +539,8 @@ impl Server {
             endpoint,
             dispatcher: RwLock::new(Dispatcher::new()),
             shutdown_tx,
+            #[cfg(test)]
+            shutdown_signal_pause: parking_lot::Mutex::new(None),
             lifecycle_tx,
             connection_event_source: ConnectionEventSource::new(),
             route_registration: Mutex::new(()),
@@ -2617,10 +2626,21 @@ async fn handle_shutdown_signal(
         FLAG_RESPONSE | FLAG_SIGNAL,
         &encode_shutdown_ack(),
     );
-    // Enqueue the courtesy ACK before closing admission. Completion is observed
-    // through the server shutdown transaction, independently of this write.
-    let _ = writer.queue_control(frame);
+    // Reserve the ACK write before closing admission, but publish it only
+    // after every connection refuses new calls. A reserved control frame
+    // still writes after connection deactivation.
+    let ack = writer.reserve_control();
+    #[cfg(test)]
+    let pause = server.shutdown_signal_pause.lock().take();
+    #[cfg(test)]
+    if let Some((entered, resume)) = pause {
+        let _ = entered.send(());
+        let _ = resume.await;
+    }
     server.request_shutdown_signal();
+    if let Ok(ack) = ack {
+        ack.send(frame);
+    }
     true
 }
 

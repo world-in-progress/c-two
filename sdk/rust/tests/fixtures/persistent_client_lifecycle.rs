@@ -310,7 +310,9 @@ impl FixtureRelay {
                 "c3 readiness: {}",
                 root.display()
             );
-            std::thread::yield_now();
+            // Each readiness probe opens a new loopback TCP connection; pause
+            // so a slow start cannot use up the ephemeral ports.
+            std::thread::sleep(Duration::from_millis(10));
         };
         (relay, url)
     }
