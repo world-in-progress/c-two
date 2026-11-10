@@ -48,6 +48,8 @@ See the [unreleased notes](docs/releases/unreleased.md).
 
 ### Fixed
 
+- Updated mio to 1.2.4 to fix Windows named-pipe use-after-free races that could crash the process with 0xC0000005 or 0xC0000374 when a listener closed or a pipe disconnected.
+- A direct IPC shutdown ACK is now visible only after the server has closed admission to new calls on every connection; previously, a call sent on another connection after the client read the ACK could still be admitted.
 - Large chunked payloads, malformed control frames and acknowledgements, custom IPC roots with many entries, contended listener drops, oversized pool segments, relay mesh versions and registration retries, `c3 registry` on malformed responses, TypeScript NACKs with new error codes, and several silent Python fallbacks. See the [unreleased notes](docs/releases/unreleased.md).
 - A finite call releases its `max_outstanding_calls` slot before its result reaches the caller, so an immediate next call is no longer refused while the limit is full.
 - Generated TypeScript relay-aware clients reuse one local IPC connection per server instance for relay-local calls instead of opening and closing a connection for each call.

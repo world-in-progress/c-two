@@ -6506,6 +6506,70 @@ impl Drop for ShutdownReplyFixture {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_ack_is_visible_only_after_every_connection_refuses_new_calls() {
+    let mut f = ShutdownReplyFixture::start(b"done".to_vec()).await;
+    let (entered, paused) = tokio::sync::oneshot::channel();
+    let (resume, resumed) = tokio::sync::oneshot::channel();
+    *f.server.shutdown_signal_pause.lock() = Some((entered, resumed));
+    // Independent admin controls intentionally have no business handshake.
+    let mut admin = LocalStream::connect(f.server.local_endpoint(), DEFAULT_CONNECT_TIMEOUT)
+        .await
+        .unwrap();
+    admin
+        .write_all(&encode_frame(
+            99,
+            FLAG_SIGNAL,
+            &c2_wire::shutdown_control::encode_shutdown_initiate(),
+        ))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), paused)
+        .await
+        .expect("shutdown reaches the pause before closing admission")
+        .unwrap();
+    assert!(!f.conn.shutdown_requested());
+    let mut first_byte = [0u8; 1];
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), admin.read_exact(&mut first_byte))
+            .await
+            .is_err(),
+        "shutdown ACK must not be visible before admission closes"
+    );
+    resume.send(()).unwrap();
+    let (id, flags, payload) = read_reply_frame(&mut admin).await;
+    assert_eq!(id, 99);
+    assert_eq!(flags, FLAG_SIGNAL | FLAG_RESPONSE);
+    assert_eq!(payload, c2_wire::shutdown_control::encode_shutdown_ack());
+    drop(admin);
+    assert!(f.conn.shutdown_requested());
+    f.peer
+        .write_all(&inline_call_frame(2, "grid", &[]))
+        .await
+        .unwrap();
+    let (id, _, reply) = read_reply_frame(&mut f.peer).await;
+    assert_eq!(id, 2);
+    assert!(matches!(
+        decode_test_call_end(&reply, 0).unwrap().0,
+        TestReply::Error(_)
+    ));
+    assert_eq!(
+        f.calls.load(Ordering::SeqCst),
+        1,
+        "a call sent after the ACK must not enter the resource"
+    );
+    assert!(!f.completed.load(Ordering::SeqCst));
+    f.release();
+    let (id, _, reply) = read_reply_frame(&mut f.peer).await;
+    assert_eq!(id, 1);
+    let (control, consumed) = decode_test_call_end(&reply, 0).unwrap();
+    assert!(matches!(control, TestReply::Success));
+    assert_eq!(&reply[consumed..], b"done");
+    f.runner.take().unwrap().await.unwrap().unwrap();
+    assert_eq!(f.calls.load(Ordering::SeqCst), 1);
+    assert!(f.completed.load(Ordering::SeqCst));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn shutdown_preserves_active_reply_refuses_new_calls_and_fences_lifecycle_hook() {
     for (same_connection, chunked_request) in
         [(false, false), (true, false), (false, true), (true, true)]
