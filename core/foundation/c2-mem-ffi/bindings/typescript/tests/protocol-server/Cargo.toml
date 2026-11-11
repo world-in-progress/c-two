@@ -3,7 +3,6 @@ name = "c2-node-protocol-server"
 version = "0.0.0"
 edition = "2024"
 publish = false
-[workspace]
 [dependencies]
 c2-config = { version = "0.1.0", path = "../../../../../c2-config" }
 c2-contract = { version = "0.1.0", path = "../../../../../c2-contract" }

@@ -1,8 +1,8 @@
 import { runNpm } from './npm-tools.mjs';
-import { runCargo } from './cargo-tools.mjs';
+import { buildProtocolPeer } from './cargo-tools.mjs';
 import { createRequire } from 'node:module';
 import { spawnSync } from 'node:child_process';
-import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, isAbsolute, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -101,13 +101,7 @@ try {
   }
   // The consumer installs only published tarballs. Build the test-owned native
   // peer in the source checkout; no Rust build or sibling link enters the package.
-  const peerRoot = resolve(packageRoot, 'tests/protocol-server');
-  const target = process.env.CARGO_TARGET_DIR ?? resolve(packageRoot, '../../../../target');
-  try {
-    copyFileSync(resolve(packageRoot, '../../../../Cargo.lock'), resolve(peerRoot, 'Cargo.lock'));
-    runCargo(['build', '--offline', '--manifest-path', resolve(peerRoot, 'Cargo.toml'), '--target-dir', target]);
-  } finally { rmSync(resolve(peerRoot, 'Cargo.lock'), { force: true }); }
-  const peer = resolve(target, 'debug', `c2-node-protocol-server${process.platform === 'win32' ? '.exe' : ''}`);
+  const peer = buildProtocolPeer();
   const require = createRequire(resolve(consumerRoot, 'package.json'));
   const ts = require('typescript');
   const source = readFileSync(resolve(packageRoot, '../../../c2-codegen/assets/typescript_transport.ts'), 'utf8');

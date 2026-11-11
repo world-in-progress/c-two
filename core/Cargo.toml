@@ -8,6 +8,9 @@ members = [
     "foundation/c2-error",
     "foundation/c2-mem",
     "foundation/c2-mem-ffi",
+    # The native IPC peer of the Node tests; a member so that it builds from
+    # this lockfile without copying it.
+    "foundation/c2-mem-ffi/bindings/typescript/tests/protocol-server",
     "protocol/c2-wire",
     "transport/c2-ipc",
     "transport/c2-local",

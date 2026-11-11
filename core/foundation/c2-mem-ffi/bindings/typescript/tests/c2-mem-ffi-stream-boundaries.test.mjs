@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
-import {spawn, spawnSync} from 'node:child_process';
-import {copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync} from 'node:fs';
+import {spawn} from 'node:child_process';
+import {mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync} from 'node:fs';
 import {createRequire} from 'node:module';
 import {tmpdir} from 'node:os';
 import {dirname, resolve} from 'node:path';
@@ -8,25 +8,13 @@ import {createInterface} from 'node:readline';
 import {fileURLToPath, pathToFileURL} from 'node:url';
 import test from 'node:test';
 import {createNodeIpcConnector} from '../dist/index.js';
-import {resolveCargo} from '../scripts/cargo-tools.mjs';
+import {buildProtocolPeer} from '../scripts/cargo-tools.mjs';
 
 const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
-const fixture = resolve(packageRoot, 'tests/protocol-server');
-const target = process.env.CARGO_TARGET_DIR ?? resolve(packageRoot, '../../../../target');
 let executable;
 
 async function withPeer(run) {
-  if (executable === undefined) {
-    let built;
-    try {
-      copyFileSync(resolve(packageRoot, '../../../../Cargo.lock'), resolve(fixture, 'Cargo.lock'));
-      built = spawnSync(resolveCargo(), ['build', '--offline', '--manifest-path', resolve(fixture, 'Cargo.toml')], {
-        env: {...process.env, CARGO_TARGET_DIR: target}, encoding: 'utf8', timeout: 120_000,
-      });
-    } finally { rmSync(resolve(fixture, 'Cargo.lock'), {force: true}); }
-    assert.equal(built.status, 0, `${built.error ?? ''}\n${built.stderr}`);
-    executable = resolve(target, 'debug', `c2-node-protocol-server${process.platform === 'win32' ? '.exe' : ''}`);
-  }
+  executable ??= buildProtocolPeer({timeout: 120_000});
   const directory = mkdtempSync(resolve(tmpdir(), 'c2-boundary-'));
   const root = resolve(directory, 'ipc');
   mkdirSync(root, {mode: 0o700});
