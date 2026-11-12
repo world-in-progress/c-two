@@ -1,6 +1,6 @@
 # 文档与 AGENTS.md 重组的执行计划
 
-日期：2026-10-31。输入：分支 `socu/over-defense-batches`（`c4c53c08`）。依据：[接口审查](2026-10-31-api-surface-review.md)第五节用户已同意的 AGENTS.md 重组；用户 2026-10-31 同意先瘦 AGENTS.md、再按 hey-my-buddy 仓库的分法整理 `docs/`，两步都叠在 `socu/over-defense-batches` 上做，上游另开 PR，暂不建嵌套的 AGENTS.md。状态：两步都已完成并验收，第一步合入为 `a86403af`，第二步合入为 `143c11e3`；`CONTEXT.md` 术语表用户 2026-10-31 确认，同一次提交统一了现行文档的用词。fork 全量 CI [41218012397](https://github.com/Dsssyc/c-two/actions/runs/41218012397)（`08b8c65c`）在 Linux、macOS、Windows x64 与 ARM64 上通过。第五节第 1、3 项用户已于 2026-10-31 确认。
+日期：2026-10-31。输入：分支 `socu/over-defense-batches`（`c4c53c08`）。依据：[接口审查](2026-10-31-api-surface-review.md)第五节用户已同意的 AGENTS.md 重组；用户 2026-10-31 同意先瘦 AGENTS.md、再按 reference、decisions、design、acceptance 与 research 的分法整理 `docs/`，两步都叠在 `socu/over-defense-batches` 上做，上游另开 PR，暂不建嵌套的 AGENTS.md。状态：两步都已完成并验收，第一步合入为 `a86403af`，第二步合入为 `143c11e3`；`CONTEXT.md` 术语表用户 2026-10-31 确认，同一次提交统一了现行文档的用词。fork 全量 CI [41218012397](https://github.com/Dsssyc/c-two/actions/runs/41218012397)（`08b8c65c`）在 Linux、macOS、Windows x64 与 ARM64 上通过。第五节第 1、3 项用户已于 2026-10-31 确认。
 
 ## 一、量过的问题
 
@@ -10,7 +10,7 @@
 - **双语文档有两套命名。** `configuration`、`local-endpoint-lifecycle`、`memory-policy` 是 `X.md`（中文）配 `X.en.md`；README 与路线图是 `X.md`（英文）配 `X.zh-CN.md`。`ipc-handshake.md` 只有中文。
 - **被代码、测试或入口文档引用的。** `reports/evidence/`（124 个，AGENTS.md 引用；代码与测试都不按路径读它）；`releases/`（CHANGELOG、各 README、`tests/repo/test_ci_scope.py`）；`images/`（各 README、`tools/dev/generate_banner.py`）；`issues/` 与 `roadmap.md`（`core/runtime/c2-core/tests/error_normalization.rs` 扫描它们，查一个已删除的 crate 名）；两份 0.7.4 报告（`sdk/python/tests/README.md`）。
 
-对照：hey-my-buddy 的 AGENTS.md 有 63 行、19 KB，只写不变量、布局、验证与文档规则；`docs/README.md` 是索引；文档按 `reference`、`decisions`、`design`、`acceptance`、`research` 分放；根目录有术语表 `CONTEXT.md`；文档卫生检查要求相对链接能解析、不出现本机路径。
+对照的做法：AGENTS.md 只写不变量、布局、验证与文档规则；`docs/README.md` 是索引；文档按 `reference`、`decisions`、`design`、`acceptance`、`research` 分放；根目录有术语表 `CONTEXT.md`；文档卫生检查要求相对链接能解析、不出现本机路径。
 
 ## 二、目标结构
 

@@ -64,5 +64,4 @@
 
 ## 下游跟进（由维护者决定）
 
-- **hey-my-buddy：** 导入改到新的子模块，`ConcurrencyMode` 改为字符串。配置收敛之后，它设的 9 个 IPC 覆盖键大多会消失；流式 RPC 的块 4 把其中的 `max_total_chunks` 改名为 `max_inflight_chunk_frames`，不留别名。
-- **toodle 与一个水文模拟后端：** 升级时核对导入；后者用到了 `ConcurrencyMode`，要改为字符串。
+- 已知下游升级时按发行说明迁移：导入改到新的子模块，`ConcurrencyMode` 改为字符串，并跟进配置收敛与流式 RPC 改掉的代码覆盖键（块 4 把 `max_total_chunks` 改名为 `max_inflight_chunk_frames`，不留别名）。

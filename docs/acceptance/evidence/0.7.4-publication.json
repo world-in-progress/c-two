@@ -887,7 +887,7 @@
     "unrelated_locked_worktrees_untouched": true
   },
   "original_handover_files": {
-    "directory": "<hey-my-buddy>/.claude/worktrees/distracted-swirles-0ea20b/tmp/fd-leak-probe",
+    "directory": "<handover directory>",
     "files": {
       "HANDOVER.md": {
         "sha256": "cefdad63775aa4c5a3b9e6c19da3caade57f8c1dbcf9cfbd6ecaac721a5667a6",

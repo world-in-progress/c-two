@@ -37,7 +37,7 @@ C/FFI ABI 6、IPC 14、SHM 3、业务帧、CRM hash、owner-control、端点与�
 - 默认命名空间：最终检查前后 `/tmp/c2-v3-<uidhex>` 与 coordination-v3 的条目名一致。首轮 Core 全量曾留下一对 socket 与 lease（c2-ipc 夹具 `capped_ack_peer` 的地址，Drop 时协调锁被同进程其他测试占用，按设计留给之后回收）；它不是本批引入的，按约定未手工清理。
 - CI：首轮 [Source Validation 40690805433](https://github.com/Dsssyc/c-two/actions/runs/40690805433) 跑在第一版代码上（提交 `728967a9`，即 `f73b5dde` 去掉证据目录），六条源码线的 Core、Rust SDK、native、portable 矩阵与 TypeScript 均通过，只有 Python 普通组的 SDK 边界测试失败（junit 1306 项中唯一失败），已在第二轮修复。确切候选见下表。
 - 确切候选：[Source Validation 40711889990](https://github.com/Dsssyc/c-two/actions/runs/40711889990) 跑在整合提交 `000985b6` 上。第 1 次尝试的 Windows 2022 失败在 c2-mem Node 测试为端点上下文用例现编的 Rust 夹具：编译第三方 crate `windows-sys` 时 rustc 以退出码 2 中止，尚未编到 c2 代码；同一用例在首轮 CI 的 Windows 2022 以及本轮其他 Windows 线上都通过。只重跑该任务后通过，第 2 次尝试 10/10 jobs 成功。六条源码线的适用门禁共 147 个全部通过（Windows 2022、2025 与 ARM64 各 27，Linux x64 与 macOS 各 25，Linux 3.14t 16），每条线的 Python 普通组、portable 矩阵与 TypeScript 组都通过。作业日志不逐条打印测试名：Windows 2022 重跑的日志里能直接看到 dedicated 变体的自然触发回归通过；其余新增用例由各线 core-test 步骤整体通过证明，未下载逐线 run-evidence 逐条核对。
-- Windows：Worker 在 `Dsssyc-x86-PC`（x64）上开发了自然触发回归：先用不读取的对端填满管道写缓冲，再发 prepared 帧并关闭对端。buddy 与 dedicated 两条连续 10 轮共 20 次通过，工作目录已删除。这些只是开发证据；验收以 CI 的 Windows 2022、2025 与 ARM64 为准。
+- Windows：Worker 在一台 Windows 11 x64 测试机上开发了自然触发回归：先用不读取的对端填满管道写缓冲，再发 prepared 帧并关闭对端。buddy 与 dedicated 两条连续 10 轮共 20 次通过，工作目录已删除。这些只是开发证据；验收以 CI 的 Windows 2022、2025 与 ARM64 为准。
 
 ## 已知边界
 
