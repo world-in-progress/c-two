@@ -1,6 +1,6 @@
 # 交互面精简审查
 
-日期：2026-10-31。输入：upstream main `606b8f13`。状态：用户同意 Host 的建议（2026-10-31）。第一、二节与决定 2、3 已实施并验收，2026-11-03 经 [world-in-progress/c-two#215](https://github.com/world-in-progress/c-two/pull/215) 合入上游 main，macOS 并排验证与 fork 全量 CI [41173746331](https://github.com/Dsssyc/c-two/actions/runs/41173746331)（Linux、macOS、Windows x64 与 ARM64）都已通过。第三节的逐项表仍待用户决定；第六节的所有者子系统已决定删除，并入协议批（2026-11-01）。
+日期：2026-10-31。输入：upstream main `606b8f13`。状态：用户同意 Host 的建议（2026-10-31）。第一、二节与决定 2、3 已实施并验收，2026-11-03 经 [world-in-progress/c-two#215](https://github.com/world-in-progress/c-two/pull/215) 合入上游 main，macOS 并排验证与 fork 全量 CI [41173746331](https://github.com/Dsssyc/c-two/actions/runs/41173746331)（Linux、macOS、Windows x64 与 ARM64）都已通过。第三节的逐项表已于 2026-11-13 按 `a68ffcb5` 重新核对，仍待维护者决定；第六节的所有者子系统已决定删除，并入协议批（2026-11-01）。
 
 起因：用户要求按 C-Two 的品味审查各个交互面是否足够精简。理由不只是方便下游开发者：C-Two 不在模型已有的知识里，AI 只能把接口读进上下文，接口越大，越占上下文，也越容易丢掉关键细节，这不利于在 C-Two 之上继续做更复杂的下游应用。流式 RPC 是将来必须有的能力，它新增的接口也按本文的分层与预算来设计。
 
@@ -82,41 +82,84 @@ Python 的布局：
 
 ### 现状
 
-39 个环境变量里：
+2026-11-13 按 main `a68ffcb5` 重新清点：`.env.example` 列出 39 个环境变量，加上 `C2_ENV_FILE` 共 40 个，其中 `C2_IPC_*` 26 个。
 
 - 示例只设置了 `C2_RELAY_ANCHOR_ADDRESS`；CI 只设置了它和 `C2_ENV_FILE`。
-- 大多数 IPC 变量在 Python 测试里只出现一次，都在列举全部变量的配置解析测试 `sdk/python/tests/unit/test_ipc_config.py` 里；在 `docs/configuration.md` 里也只出现一次。
-- 环境变量本身没有下游在用，但同名的代码覆盖键有：有一个下游用了其中 9 个，来得到一个轻量配置（见"下游的实际用法"）。
+- 大多数 IPC 变量在 Python 测试里只出现一次，都在列举全部变量的配置解析测试 `sdk/python/tests/unit/test_ipc_config.py` 里；在 `docs/reference/configuration.md` 里也只出现一次。
+- 已知需要轻量配置的场景只需指定单条消息上限、总内存预算和执行线程数。现有的代码覆盖键还要求部署方了解池、重组段、分片和帧。
 
-它真正想表达的只有三件事：单条消息不大，总内存要小，执行线程要够用。为此它却要懂池、重组段、分片与帧这些内部机制。
+10-31 的草案之后，这些设置已经变了：协议批删掉了心跳与 `C2_IPC_ENDPOINT_PROTOCOL`；缺陷批删掉了 `C2_RELAY_ROUTE_MAX_ATTEMPTS`（H3），并去掉了 `max_execution_workers` 显式值的 64 上限（H12）；流式批把 `max_total_chunks` 改为全服务端的 `max_inflight_chunk_frames`（B8）；载荷缓冲预算取代了 `C2_CALL_RETAINED_INPUT_BUDGET_BYTES`。草案里没有列出 `write_timeout`、`client_idle_timeout`、`max_dedicated_segments` 与 `spill_threshold`，下表补上。
 
 ### 收敛方向
 
 - **不再提供池的开关。** 实测开池不额外占内存，关掉只会变慢。初稿建议让共享内存段自适应大小；量过之后撤回，因为删掉开关这个更小的办法就够了。
 - **`shm_threshold` 改为常量。** 取值按三个平台实测的交叉点定。
-- **用户只表达意图。** 留下的设置是：单条消息上限、内存上限、文件溢出上限、端点根目录与 relay 锚点。帧、分片、重组的各项限制都从它们推导。
-- **定时器与调优常数改为固定常量。**
+- **部署方只表达意图。** 留下的设置是：单条消息上限、内存预算、文件溢出预算、执行线程数、端点根目录与 relay 锚点，以及 `c3 relay` 的部署参数。帧、分片、重组的各项限制都从它们推导。
+- **定时器与调优常数改为固定常量。** 只有不随载荷与规模变化的时限才固定；会随部署变化又推导不出来的，仍经已有的途径暴露。
 
-### 逐项表（草案，待用户决定）
+### 逐项表（2026-11-13 重新核对，待维护者决定）
 
-| 现有设置 | 建议 | 理由 |
+部署与身份，全部保留：
+
+| 设置 | 建议 | 理由 |
 | --- | --- | --- |
-| `C2_RELAY_ANCHOR_ADDRESS`、`C2_ENV_FILE`、`C2_IPC_ROOT` | 保留 | 有使用者，表达的是部署意图 |
-| `max_payload_size` | 保留，作为唯一的单条消息上限 | 有下游在用 |
-| 三个方向预算、`max_reassembly_bytes` | 合并为一个内存上限和一个文件溢出上限 | 用户关心的是总量，不是内部的四个格子 |
-| `max_frame_size`、`chunk_threshold_ratio`、`chunk_size`、`max_total_chunks`、重组段大小与段数 | 从单条消息上限与内存上限推导 | 都是协议内部机制；`max_total_chunks` 还有缺陷 B8 |
-| `pool_enabled`、预热段数、最少保留段数 | 删除 | 开池不额外占内存，关掉只会变慢（实测） |
-| `pool_segment_size`、`max_pool_segments` | 待定：由单条消息上限与内存上限推导，还是留给大数据用户调性能 | 等三个平台的基准再定 |
-| `pool_decay_seconds`、`chunk_gc_interval`、`chunk_assembler_timeout`、`C2_RELAY_ANTI_ENTROPY_INTERVAL`、`C2_REMOTE_PAYLOAD_CHUNK_SIZE`、`C2_RELAY_ROUTE_MAX_ATTEMPTS` | 固定常量 | 没有使用者，是调优常数 |
-| `shm_threshold` | 固定常量 | 交叉点在 8 KB 到 64 KB 之间（macOS 实测），按三个平台的基准定 |
-| `heartbeat_interval`、`heartbeat_timeout` | 随单一属主的详细设计定 | 本机 IPC 上对端死亡会有 EOF；心跳只剩"释放停住的对端占着的许可"这一用处 |
-| `max_pending_requests`（Server 级）、`max_execution_workers` | 待定：与路由级 `ConcurrencyConfig` 的 `max_pending` / `max_workers` 合并 | 同一件事分了两层；后者还有缺陷 H12 |
-| `C2_CALL_MAX_OUTSTANDING`、`C2_CALL_RETAINED_INPUT_BUDGET_BYTES` | 待定：前者删除，后者并入内存上限 | 只有测试在用 |
-| `C2_RELAY_CALL_TIMEOUT` | 待定：并入调用截止时间 | 已有逐次调用的截止时间，这是第二种限制调用时长的方式 |
-| `C2_RELAY_USE_PROXY` | 保留 | 公司网络的代理是真实的部署需要 |
-| relay 服务端的部署参数（bind、seeds、id、advertise url、idle timeout） | 保留 | `c3 relay` 的部署参数 |
+| `C2_ENV_FILE`、`C2_RELAY_ANCHOR_ADDRESS`、`C2_IPC_ROOT` | 保留 | 表达部署意图 |
+| `set_server(server_id=…, startup_timeout=…)` | 保留 | 一个是身份；启动等待随部署而变 |
+| `c3 relay` 的 `--bind`、`--relay-id`、`--advertise-url`、`--seeds` 与对应的环境变量，`C2_RELAY_USE_PROXY` | 保留 | relay 的部署参数；公司网络的代理是真实的部署需要 |
 
-用户决定逐项表后，在同一批里把环境变量、代码覆盖键和文档一起删干净。那个下游的 9 个开关届时多数会消失，它怎么跟进由用户决定。
+单条消息：
+
+| 设置 | 建议 | 理由 |
+| --- | --- | --- |
+| `max_payload_size`（16 GiB） | 保留，作为唯一的单条消息上限 | 部署方要表达的意图之一 |
+| `max_reassembly_bytes`（8 GiB） | 删除，由 `max_payload_size` 得出 | 它限制一次重组的容量（`c2-wire/src/assembler.rs` 的检查），是第二个单条消息上限；默认值还比 `max_payload_size` 小，按代码，走分片的载荷超过 8 GiB 就会在重组时被拒绝，没有实际复现 |
+| `max_frame_size`（2 GiB） | 删除，改为由分片大小得出的协议常量，客户端按同一个常量检查 | 正常路径上的帧不超过一个分片或内联阈值；客户端现在没有帧长上限，"待维护者决定"里的那一项随之解决；控制帧的长度在执行计划里逐一核对 |
+
+内存：
+
+| 设置 | 建议 | 理由 |
+| --- | --- | --- |
+| `shm_backing_budget_bytes`（8 GiB）、`live_reassembly_budget_bytes`（8 GiB）、载荷缓冲预算 `C2_CALL_PAYLOAD_BUFFER_BUDGET_BYTES`（16 GiB） | 合并为每个 Runtime、每个 relay 一个内存预算 | 部署方关心的是 C-Two 一共占多少内存，现在要分别懂三个格子。合并之后不同用途争用同一份预算，一个 Runtime 连接自己时可能互相等待，执行计划里要逐一核对 |
+| `file_backing_budget_bytes`（16 GiB） | 保留，作为文件溢出预算 | 磁盘与内存是两种资源 |
+| `spill_threshold`（0.8） | 固定常量 | 它取观察到的可用内存的比例，本身随机器伸缩；部署方的限制由内存预算表达 |
+| `max_dedicated_segments`（4） | 删除；独占段的个数只受线上协议的段索引范围限制，字节由内存预算约束 | 个数上限按"通常情况"限制了同时在途的独占段，槽位用完时独占段分配失败（`c2-mem/src/pool.rs` 的 `alloc_dedicated`） |
+| `max_inflight_chunk_frames`（512） | 删除计数，在途分片帧的字节计入内存预算 | 槽位用完时请求以 `ResourceUnavailable` 失败；B8 修的就是这一类按通常情况设的上限。重组登记表据它推导的维护阈值改由预算推导 |
+
+池与分片，改为内部常数或推导：
+
+| 设置 | 建议 | 理由 |
+| --- | --- | --- |
+| `pool_enabled`、`pool_prewarm_segments`、`pool_min_retained_segments` | 删除 | 开池不额外占内存，关掉只会变慢（10-31 实测）；预热与保留没有使用者 |
+| `pool_decay_seconds`（60 秒） | 固定常量 | 调优常数 |
+| `pool_segment_size`（256 MiB）、`max_pool_segments`（4）、`reassembly_segment_size`（64 MiB）、`reassembly_max_segments`（4） | 由内存预算推导 | 段的大小与个数现在只被用来压低占用；有了内存预算，可以从它算出。推导方式与默认值看三个平台的基准 |
+| `chunk_size`（128 KiB），Node 的 `requestChunkSize` | 固定常量 | 协议内部机制 |
+| `chunk_threshold_ratio` | 删除 | 已证实没有作用（见待办第 3 项） |
+| `chunk_assembler_timeout`（60 秒）、`chunk_gc_interval`（5 秒） | 固定常量 | 前者从一次重组最后的活动算起（`c2-wire/src/chunk/registry.rs`），不随载荷变大 |
+| `shm_threshold`（4 KiB），Node 的 `requestShmThreshold` | 固定常量，取三个平台实测的交叉点 | macOS 上交叉点在 8 KB 到 64 KB 之间（10-31 实测） |
+| `C2_REMOTE_PAYLOAD_CHUNK_SIZE`（1 MiB） | 固定常量 | 调优常数 |
+
+这两项都改为常量之后，`cc.set_transport_policy(...)` 整个消失。
+
+连接：
+
+| 设置 | 建议 | 理由 |
+| --- | --- | --- |
+| `write_timeout`（30 秒） | 固定常量 | 它限制写一帧（含 flush）的时间；帧不超过一个分片，写不完说明对端停止读取，与载荷大小无关 |
+| `client_idle_timeout`（60 秒）与 `c3 relay` 的 `--idle-timeout` / `C2_RELAY_IDLE_TIMEOUT`（60 秒） | 合为一个固定常量 | 两处是同一件事：没有人引用的缓存连接多久后回收；它只影响重连的开销 |
+
+执行与准入：
+
+| 设置 | 建议 | 理由 |
+| --- | --- | --- |
+| `max_execution_workers`（默认按主机并行度取 4 到 64） | 保留 | 执行线程数是进程的资源，随机器而变；路由的 `max_workers` 表达的是一条路由的语义，两者不重复 |
+| `max_pending_requests`（整个 Server 1024） | 删除计数，把服务端排队请求的本地副本计入内存预算 | 计数按"通常情况"设，又约束不了字节：1024 个大请求照样能占满内存。现在一元请求的本地副本复制出传输之后不计入任何预算（重组预算在复制后释放，c2-server 的预算只管 SHM、文件与重组的 backing），这个计数是唯一的约束，所以要先计入字节，再删计数。它还决定控制回复的槽数，执行计划里另定；路由仍有自己的 `max_pending` |
+| `C2_CALL_MAX_OUTSTANDING`、`set_call_execution_limits(max_outstanding_calls=…)`、`--call-max-outstanding`（1024） | 建议先保留，待维护者决定 | Runtime 在序列化前为带截止时间的一元调用和所有流预留调用槽，relay 的每次转发也占一个槽。它们在调用方结束等待后仍可持有调用槽。现有载荷缓冲预算只计载荷字节，不能约束空载荷调用的在途记录或已打开的流。若要删除这一配置项，先给每笔在途调用的常驻开销建立预算并保持关闭和真实终态的语义 |
+| `C2_RELAY_CALL_TIMEOUT`（300 秒） | 删除；经 relay 的调用与直接 IPC 一样，默认不设截止时间 | 现在没有逐次截止时间的 HTTP 调用 300 秒后失败，并成为派发不确定，同一个调用走直接 IPC 却一直等。逐次调用的截止时间是限制等待的唯一途径 |
+| `C2_RELAY_ANTI_ENTROPY_INTERVAL`（60 秒） | 固定常量 | mesh 的调优常数 |
+
+保留 `C2_CALL_MAX_OUTSTANDING` 则剩 13 个环境变量。设计好在途调用的常驻开销如何入账后，若维护者决定删除该配置项，则剩 12 个。留下的值在 Python、Rust 与 `c3` 里各从哪里设置，在执行计划里定，原则是一个值只有一个入口。同一批顺带处理 R09、R10（EnvCatalog 加载四次）与 C4（客户端池再比一遍 Core 已冻结的配置）。新的两个名字"内存预算"与"文件溢出预算"在决定之后写进术语表，术语表里"调用槽"与"超时"两条提到的设置随之改写。
+
+维护者决定逐项表后，在同一批里把环境变量、代码覆盖键和文档一起删干净。原有 IPC 覆盖保留 `max_payload_size` 与 `max_execution_workers`，内存与文件溢出预算的设置入口另定。
 
 ## 四、错误类型
 
