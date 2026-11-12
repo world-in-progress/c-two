@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import {spawn, spawnSync} from 'node:child_process';
-import {copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync} from 'node:fs';
+import {mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync} from 'node:fs';
 import {createRequire} from 'node:module';
 import {tmpdir} from 'node:os';
 import {dirname, resolve} from 'node:path';
@@ -9,11 +9,9 @@ import {createInterface} from 'node:readline';
 import test from 'node:test';
 import {Worker} from 'node:worker_threads';
 import {createNodeIpcConnector} from '../dist/index.js';
-import {resolveCargo} from '../scripts/cargo-tools.mjs';
+import {buildProtocolPeer} from '../scripts/cargo-tools.mjs';
 
 const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
-const fixture = resolve(packageRoot, 'tests/protocol-server');
-const target = process.env.CARGO_TARGET_DIR ?? resolve(packageRoot, '../../../../target');
 
 function streamInput(mode, count, length = 1) {
   const input = new Uint8Array(6);
@@ -24,14 +22,7 @@ function streamInput(mode, count, length = 1) {
 
 let executable;
 function buildServer() {
-  if (executable) return executable;
-  let result;
-  try {
-    copyFileSync(resolve(packageRoot, '../../../../Cargo.lock'), resolve(fixture, 'Cargo.lock'));
-    result = spawnSync(resolveCargo(), ['build', '--offline', '--manifest-path', resolve(fixture, 'Cargo.toml'), '--target-dir', target], {encoding: 'utf8', timeout: 120_000});
-  } finally { rmSync(resolve(fixture, 'Cargo.lock'), {force: true}); }
-  assert.equal(result.status, 0, `protocol fixture build failed:\n${result.error ?? ''}\n${result.stdout}\n${result.stderr}`);
-  executable = resolve(target, 'debug', `c2-node-protocol-server${process.platform === 'win32' ? '.exe' : ''}`);
+  executable ??= buildProtocolPeer({timeout: 120_000});
   return executable;
 }
 
