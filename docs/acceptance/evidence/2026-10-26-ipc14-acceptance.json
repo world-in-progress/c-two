@@ -451,50 +451,38 @@
   "performance_source": "0893a3b0616cd26df7cdbab90c0a9c72afb97a90; later candidates change tests only",
   "reviews": [
     {
-      "run": "143e6fcd-6b33-4e9e-b7f6-8a6190c4c1cd",
       "scope": "Initial implementation: stale raw peers found and fixed",
       "blocking_findings_remaining": 0,
-      "artifact": "120ef574-7129-4daf-b6bc-69947ed3069e",
       "state": "accepted",
       "checkout_cleanup": "applied"
     },
     {
-      "run": "6ea5b92f-b8a3-4936-ac72-2d12b77065ee",
       "scope": "Raw peer migration recheck",
       "blocking_findings_remaining": 0,
-      "artifact": "f1266755-1d15-45ec-9b79-1ed18fc1bb18",
       "state": "accepted",
       "checkout_cleanup": "applied"
     },
     {
-      "run": "69dc784f-4a56-419e-a30f-eb8ea105e86c",
       "scope": "Windows flush and bounded peer-close",
       "blocking_findings_remaining": 0,
-      "artifact": "21b45b59-17eb-49f3-988a-3c4091dec18b",
       "state": "accepted",
       "checkout_cleanup": "applied"
     },
     {
-      "run": "0efdaaab-f329-4596-bbca-39619bf2af95",
       "scope": "Small max_frame boundary",
       "blocking_findings_remaining": 0,
-      "artifact": "c5287efc-adad-4ed5-be4d-76841f24f21a",
       "state": "accepted",
       "checkout_cleanup": "applied"
     },
     {
-      "run": "2e4c089c-3de8-4b9e-901b-81e4591c93eb",
       "scope": "Private namespace exit fixture",
       "blocking_findings_remaining": 0,
-      "artifact": "f2ce20ca-789a-4ff5-a500-0155246bfa4e",
       "state": "accepted",
       "checkout_cleanup": "applied"
     },
     {
-      "run": "de61efd2-7191-4dc9-a971-9e895e265ee3",
       "scope": "Idle baseline, final968f7d29; Windows skip finding resolved",
       "blocking_findings_remaining": 0,
-      "artifact": "7ed6fec9-e4ac-4eb9-9d92-465566d4fde3",
       "state": "accepted",
       "checkout_cleanup": "applied"
     }
@@ -519,7 +507,7 @@
     "historical_objects_cleaned": false,
     "scope_note": "One local connect_timeout run used default context by mistake; seven tests passed and native exact cleanup completed. Full relay uses clean CI runners."
   },
-  "private_evidence_root": "~/.codex/diagnostics/c2-ipc14-implementation-mxyfpx5g/",
+  "raw_evidence_retained_outside_repo": true,
   "retained_evidence_sha256": {
     "macos-python-performance-raw.json": "272d79663336cf244925c5431d6e04f57e757f62c3242ec15720f89c4c9b3e6e",
     "macos-node-performance-raw.json": "9528c6ca3f9d64dc50f20fa17ee53a17ed8f855f5c8a7f9f30d70a37742940d1",
@@ -537,36 +525,26 @@
   },
   "delivery_acceptance": {
     "rust": {
-      "run": "95393394-fafc-46e1-b221-a1f273ada4d7",
-      "artifact": "4bc936b6-1501-4b6b-8440-27a53dbb9d33",
       "source": "968f7d29153ff23fc967f767d97506823554de1d",
       "host_adjusted": true,
       "checkout_reclaimed": true
     },
     "typescript": {
-      "run": "3ec99a44-3b43-4e1a-93fb-69b47f098b37",
-      "artifact": "73eaf8e1-72c1-4546-9d55-cd4a48794c37",
       "source": "968f7d29153ff23fc967f767d97506823554de1d",
       "host_adjusted": true,
       "checkout_reclaimed": true
     },
     "public-tests": {
-      "run": "97f37e0d-631a-49df-a844-f54dcaeabcaa",
-      "artifact": "7abccd9e-817e-47ca-b3c7-3074570fa251",
       "source": "968f7d29153ff23fc967f767d97506823554de1d",
       "host_adjusted": true,
       "checkout_reclaimed": true
     },
     "docs": {
-      "run": "c7fb7661-c924-47a0-989c-a2c45b711de0",
-      "artifact": "c67a4f58-d83c-40ce-9697-cb9a0339a166",
       "source": "968f7d29153ff23fc967f767d97506823554de1d",
       "host_adjusted": true,
       "checkout_reclaimed": true
     },
     "fixtures": {
-      "run": "de81a34a-9402-408b-9fb3-a74c791e70ba",
-      "artifact": "a9c340e6-a6e8-4007-9361-46b565cdac60",
       "source": "968f7d29153ff23fc967f767d97506823554de1d",
       "host_adjusted": false,
       "checkout_reclaimed": true

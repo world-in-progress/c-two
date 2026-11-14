@@ -38,12 +38,12 @@
 
 ## 独立审查
 
-文档由 hey-my-buddy 0.51.1 在独立 worktree 中更新，Host 核对三份完整差异后原样集成并验收。原 buddy 实现审查任务在队列中超过 15 分钟且未启动执行，已取消、收束并回收工作树，不计作审查证据。
+文档由 Worker 在独立 worktree 中更新，Host 核对三份完整差异后原样集成并验收。原实现审查任务超过 15 分钟未启动执行，已取消、收束并回收工作树，不计作审查证据。
 
-新的独立 Codex 审查者对 `723a9130..fa62f7a3` 固定差异只读复核，未发现 actionable findings；确认旧模块无仓内消费者、其他 buffer 的生产状态未改、实际生命周期断言保留。审查者没有亲自运行测试。仓内引用检查不证明仓外无人 import 或反射查询已删除名称，该低层 Python API 变化已获用户确认。
+新的独立审查者对 `723a9130..fa62f7a3` 固定差异只读复核，未发现 actionable findings；确认旧模块无仓内消费者、其他 buffer 的生产状态未改、实际生命周期断言保留。审查者没有亲自运行测试。仓内引用检查不证明仓外无人 import 或反射查询已删除名称，该低层 Python API 变化已获用户确认。
 
 ## 端点与清理
 
 macOS 在源码导出中只替换本轮默认 socket/coordinator 命名空间，逐文件哈希确认其余内容与候选一致。默认目录、协调目录和按安装日志确认归属的持久连接目录均无 socket/lease 残留。Windows 使用本轮 D 盘目录和短临时目录，验收时 C-Two Named Pipe、lease 文件与本轮进程均为零。历史目录未作为清理对象。
 
-本机两端的 Cargo target、native 安装副本、Node 依赖/构建、FastDB SDK、Go 交叉构建目录及临时可执行文件/包均已清理，Windows 工具链保留。Mac 工作区 `.venv` 中指向本轮导出源码的 editable c-two 已卸载，下次使用需 `uv sync` 重建。仅保留源码清单、命令、原始日志、矩阵收据、独立审查与清理记录于 `~/.codex/diagnostics/c2-shm-retirement-nu3p19cl`；CI 收据按 HTTP byte ranges 提取，不下载整套构建产物。
+本机两端的 Cargo target、native 安装副本、Node 依赖/构建、FastDB SDK、Go 交叉构建目录及临时可执行文件/包均已清理，Windows 工具链保留。Mac 工作区 `.venv` 中指向本轮导出源码的 editable c-two 已卸载，下次使用需 `uv sync` 重建。仅保留源码清单、命令、原始日志、矩阵收据、独立审查与清理记录，存放在仓库之外；CI 收据按 HTTP byte ranges 提取，不下载整套构建产物。

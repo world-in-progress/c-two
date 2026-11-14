@@ -49,4 +49,4 @@ Rust/Python sweep 的错误计数及最后 I/O 原因会恢复；CLI sweep 只�
 
 Python/CLI 复用现有真实权限失败用例检查同一 IoError 投影，原生目标窗口由定向分支测试负责；不为端到端注入增加公开测试开关，也不把组合的分层证据说成 Python 端精确命中该窗口。随后做针对性回归、完整 relay、适用跨语言、三系统和确切候选 GitHub Actions，Windows 优先开发机核未改平台投影；socket/lease 零残留、独立审查后提交。已通过且不受影响的验证不重复跑，产物及时清理；不发版。
 
-独立只读核查使用 hey-my-buddy run `cb5f0be3-0163-4bd4-a14e-e778a864691e`、artifact `6fe2fd5b-6ecb-4c59-aac2-35c5671e2843`，输入为上述基线，仅核源码、历史和既有测试，没有构建或运行。其报告指出直接提前返回会改变复合故障优先级，Host 据此细化为缓存 Result 的顺序方案。完整摘要与证据哈希见[评估记录](evidence/2026-10-26-r17-slot-io-evaluation.json)；原始文本在 `~/.codex/diagnostics/c2-r17-evaluation-yig7hv6m/`。
+独立只读核查的输入为上述基线，仅核源码、历史和既有测试，没有构建或运行。其报告指出直接提前返回会改变复合故障优先级，Host 据此细化为缓存 Result 的顺序方案。完整摘要与证据哈希见[评估记录](evidence/2026-10-26-r17-slot-io-evaluation.json)；原始文本保存在仓库之外。

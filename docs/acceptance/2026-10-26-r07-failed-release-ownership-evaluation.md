@@ -30,7 +30,7 @@ macOS arm64 / Rust 1.91.0 与 Windows 11 x64 build 26200 / Rust 1.99.1 的七个
 
 本轮验证实际内存/carrier/Core 方法，没有启动完整 RPC、Unix listener 或 Named Pipe，也没有执行 Python SDK、Linux 或 Windows ARM64 运行测试。dead-holder 的拒绝语义依据源码，未另造死亡持有者实验。实施验收仍须补齐真实 SHM RPC 与跨语言路径，不能用这些结果替代完整门禁。
 
-每个场景在记录故障后，仅通过本批 pool.destroy/Drop 结束其唯一映射；原生重开同名 SHM 均失败，临时 scope 目录为空并移除。失败场景的遗留重组 charge 只在独立探针进程中，进程随后退出；没有把它写成重试成功。本机清理 416382143 B、Windows 清理 509463053 B 的 target；未使用历史 IPC 目录、inspect/reap 或历史清理。Windows 另读回十份关键源码/probe/lock 哈希，与输入一致。[机器记录](evidence/2026-10-26-r07-evaluation.json)保留摘要与原始文件哈希；源码与日志在 `~/.codex/diagnostics/c2-r07-evaluation-dzwd7ix1/`。
+每个场景在记录故障后，仅通过本批 pool.destroy/Drop 结束其唯一映射；原生重开同名 SHM 均失败，临时 scope 目录为空并移除。失败场景的遗留重组 charge 只在独立探针进程中，进程随后退出；没有把它写成重试成功。本机清理 416382143 B、Windows 清理 509463053 B 的 target；未使用历史 IPC 目录、inspect/reap 或历史清理。Windows 另读回十份关键源码/probe/lock 哈希，与输入一致。[机器记录](evidence/2026-10-26-r07-evaluation.json)保留摘要与原始文件哈希；源码与日志保存在仓库之外。
 
 ## 推荐首批：R07a
 
@@ -59,7 +59,7 @@ Core Held 可另用现有 released 表示逻辑失效、lease Option 表示物�
 
 确认后按以下范围验收：先把真实竞争/poison、错误 pool、返还同一 allocation_id/generation 与两类 lease 的再释放反例纳入现有测试；补 helper 的主/释放双错误、fill 仅一次、错误块不能发布；保留 trim 到 0/1 的原容量、dedicated 退休、file、快照、copy/release 双错误与 dispatch/取消覆盖。dead-holder 必须继续拒绝且不改锁字。随后运行定向、完整 relay、Rust/Python 18 行和 Node 12 行矩阵、真实三系统及确切候选 Actions（含 Windows ARM64/3.14t），本批 socket/lease 零残留，独立审查后提交；Windows 优先开发机，完成即清理构建产物。
 
-独立只读核查使用 hey-my-buddy run `5cc2f3dc-23b6-4250-b055-8c7d724dc5b7`、空补丁 artifact `20b2b746-b6f8-43e4-9c9b-72559d88f1a2`。Host 复核源码/历史并执行上述实验；worker 没有运行实验，不把 Host 结果当作其独立运行证据。报告已接受，工作树已回收；只读环境拒绝过一条需 heredoc 临时文件的计数辅助命令，没有绕过，不影响 Host 的复现及本方案交付。
+独立只读核查交付为空补丁。Host 复核源码/历史并执行上述实验；worker 没有运行实验，不把 Host 结果当作其独立运行证据。报告已接受，工作树已回收；只读环境拒绝过一条需 heredoc 临时文件的计数辅助命令，没有绕过，不影响 Host 的复现及本方案交付。
 
 ## R07a 实施后边界
 

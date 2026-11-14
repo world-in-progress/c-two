@@ -139,7 +139,7 @@
       "url": "https://github.com/Dsssyc/c-two/actions/runs/37914780953"
     }
   ],
-  "astra_review": {
+  "independent_review": {
     "base_sha": "7590977489d1cf920df0f0b676ec02ce6eb3cba5",
     "head_sha": "2a4cb50bdb420b627abe0bce7063e17ac8be9a12",
     "runtime_sha": "4b940f830695f3401571b7edeb2e1d16c7332396",

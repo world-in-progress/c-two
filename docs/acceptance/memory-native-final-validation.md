@@ -42,7 +42,7 @@ Host 下载并核对四个 ZIP 的 GitHub API SHA-256，再逐项核对 `run-evi
 
 ## 审查与范围
 
-Host 拒绝过只统计等待队列而漏掉正在执行任务的计数，也拒绝过独立读取许可标志与计数导致的检查竞争。GPT-6 Sol 修正为锁内一致快照；关闭失败进一步定位到生产时限分配，并保留真实事件驱动的未确认和可重试证明。相关记录见 [取消与回收](memory-request-cancellation.md)、[计数审查](memory-linux-cancellation-tests.md) 和 [关闭屏障](memory-close-barrier-review.md)。Buddy 完成状态没有直接充当验收。
+Host 拒绝过只统计等待队列而漏掉正在执行任务的计数，也拒绝过独立读取许可标志与计数导致的检查竞争。最终采用锁内一致快照；关闭失败进一步定位到生产时限分配，并保留真实事件驱动的未确认和可重试证明。相关记录见 [取消与回收](memory-request-cancellation.md)、[计数审查](memory-linux-cancellation-tests.md) 和 [关闭屏障](memory-close-barrier-review.md)。
 
 基准记录首次/稳态延迟、吞吐、backing 预算峰值及独立 OS RSS。整包临时复制的移除有源码证据；逐处复制字节归因和优化百分比尚未测量，不由 payload 大小或 backing 容量推算。当前分块调用仍需完整重组后交给资源，不是增量消费 API。原始指针逃逸与 FastDB checked owner 的边界保持。
 

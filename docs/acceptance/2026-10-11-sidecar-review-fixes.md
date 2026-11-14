@@ -1,6 +1,6 @@
 # Local sidecar PR review corrections — Windows verification
 
-Reviewed baseline: `916dacf1e0c91ec70bab496b45e0cf24d195e3ad`. This verification used the modified working tree on `codex/local-test-sidecar`; the report's baseline HEAD plus diff/file hashes identify those inputs. The changes affect the local development entry, regressions and documentation. CI workflows and production runtime files are outside this patch.
+Reviewed baseline: `916dacf1e0c91ec70bab496b45e0cf24d195e3ad`. This verification used the modified working tree on a development branch; the report's baseline HEAD plus diff/file hashes identify those inputs. The changes affect the local development entry, regressions and documentation. CI workflows and production runtime files are outside this patch.
 
 ## Corrections
 
@@ -13,15 +13,15 @@ Reviewed baseline: `916dacf1e0c91ec70bab496b45e0cf24d195e3ad`. This verification
 
 | Verification | Result | Retained evidence |
 | --- | --- | --- |
-| New boundary tests before corrections | 10 failed, 1 passed | `D:/c-two-test/sidecar-review-red` |
+| New boundary tests before corrections | 10 failed, 1 passed | `<windows-validation-root>/sidecar-review-red` |
 | Runner and review boundary regressions | 30 passed | `tests/repo/test_local_test_runner.py` and `tests/repo/test_local_test_review.py` |
-| Clean pinned sibling preparation and compiler consumption | Passed; TypeScript 5.9.3 installed, sample compiled and executed | `D:/c-two-test/sidecar-review-clean/evidence/run.json` |
-| Actual `prepare --suite core` | Passed; npm and locked Cargo dependencies prepared | `D:/c-two-test/sidecar-review-core-prepare/run.json` |
-| Actual `run --suite core` | 1589 passed, 0 failed, 2 expected child entrypoints ignored | `D:/c-two-test/sidecar-review-core-run/run.json` |
-| Actual `run --suite repo` | 473 passed, 2 declared Windows skips | `D:/c-two-test/sidecar-review-repo-run/run.json` |
+| Clean pinned sibling preparation and compiler consumption | Passed; TypeScript 5.9.3 installed, sample compiled and executed | `<windows-validation-root>/sidecar-review-clean/evidence/run.json` |
+| Actual `prepare --suite core` | Passed; npm and locked Cargo dependencies prepared | `<windows-validation-root>/sidecar-review-core-prepare/run.json` |
+| Actual `run --suite core` | 1589 passed, 0 failed, 2 expected child entrypoints ignored | `<windows-validation-root>/sidecar-review-core-run/run.json` |
+| Actual `run --suite repo` | 473 passed, 2 declared Windows skips | `<windows-validation-root>/sidecar-review-repo-run/run.json` |
 | Python 3.10 syntax | Passed for entry and changed tests | Source compiled with Python 3.10 without writing bytecode |
 
-The repository run used the prepared repo interpreter, verified official SDK fixtures and the MSVC development environment. Core used Node 22.16 with Node-API 10 and `D:/c-two-test/fastdb-core-sdk/lib`. The reproducible local invocation wrapper is `D:/c-two-test/sidecar-review-entry-proof.py`: run with `repo` or `core`; it loads vcvars64 and invokes the same sidecar main entry. All three main-entry reports confirm equal before/after source identities.
+The repository run used the prepared repo interpreter, verified official SDK fixtures and the MSVC development environment. Core used Node 22.16 with Node-API 10 and `<windows-validation-root>/fastdb-core-sdk/lib`. The reproducible local invocation wrapper is `<windows-validation-root>/sidecar-review-entry-proof.py`: run with `repo` or `core`; it loads vcvars64 and invokes the same sidecar main entry. All three main-entry reports confirm equal before/after source identities.
 
 An initial direct pytest invocation bypassed the sidecar's UTF-8 environment and hit a GBK decode failure while reading a workflow. The subsequent full run through the sidecar passed without changing that workflow test or adding a skip. The two accepted repository skips are the non-PE installer fixture and POSIX virtualenv symlink semantics.
 

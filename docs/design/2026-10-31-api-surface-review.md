@@ -21,31 +21,22 @@ Python 的 79 个名字里，日常接口与监督进程、工具链、诊断用
 
 ## 下游的实际用法
 
-Host 检索了本机已知的下游仓库，只读：
+Host 只读检索了已知的下游：
 
-- **较早的科学计算下游**（约十个仓库）用的是已经退役的 `icrm`、`compo`、`rpc` 一代接口，不受本次改动影响，升级时本来就要迁移。
-- **用当前接口的有三个：**
-  - 一个水文模拟后端：只用日常接口，外加 `ConcurrencyConfig` 与 `ConcurrencyMode`。
-  - `toodle`：只用日常接口。
-  - `hey-my-buddy`：除了日常接口，还用连接事件、端点维护（`set_local_endpoint`、`inspect_endpoint`、`reap_endpoint` 等）、`memory_stats`、`with_call_options`，以及 `set_server` 与 `set_client` 的代码覆盖。
-- **没有下游在用的：** 所有者控制与托管子进程、`infer_crm_from_resource`、资源桥、`cc.Held`、`hold_stats`、Python 侧的契约导出与代码生成函数。hey-my-buddy 调研过 `owner_bound`（`docs/research/2026-10-15-c-two-peer-liveness.md`），并在 ADR-031 里明确不采用。
-- **hey-my-buddy 为了得到一个轻量配置，设了 9 个内部开关**（`src/hey_my_buddy/protocol/rpc_config.py:29-46`）：
-  - 关掉 buddy 池；
-  - 重组段 16 MiB × 2，重组上限 16 MiB；
-  - 分片总数 256；
-  - 执行线程 64（即上限），pending 256；
-  - 载荷 32 MiB，帧 16 MiB。
-  - 它还用 `memory_stats()[scope] is not None` 来判断某个角色是否已经开始 I/O、配置是否还能改（同文件 `:163`）。这说明 C-Two 没有直接回答这个问题的接口。
-- **轻量配置的来由。** 用户说明：池是为大载荷、高频的调用省去开辟内存的开销；hey-my-buddy 是智能体之间的文本通信，本来就不快，消息也有上限，用不上这份性能。Host 在私有 IPC 根下实测，条件是 macOS 27、同一进程里两个 Runtime 经 IPC 调用，取中位数：
+- **较早的科学计算下游**用的是已经退役的 `icrm`、`compo`、`rpc` 一代接口，不受本次改动影响，升级时本来就要迁移。
+- **用当前接口的下游**大多只用日常接口；有一个还用 `ConcurrencyConfig` 与 `ConcurrencyMode`；另一个还用连接事件、端点维护（`set_local_endpoint`、`inspect_endpoint`、`reap_endpoint` 等）、`memory_stats`、`with_call_options`，以及 `set_server` 与 `set_client` 的代码覆盖。
+- **没有下游在用的：** 所有者控制与托管子进程、`infer_crm_from_resource`、资源桥、`cc.Held`、`hold_stats`、Python 侧的契约导出与代码生成函数。有一个下游评估过所有者控制，明确不采用。
+- **有一个下游为了得到轻量配置，设了 9 个内部开关：** 关掉 buddy 池，缩小重组段与重组上限，并限制分片总数、执行线程、pending、单条载荷与帧。它还用 `memory_stats()[scope] is not None` 来判断某个角色是否已经开始 I/O、配置是否还能改。这说明 C-Two 没有直接回答这个问题的接口。
+- **轻量配置的来由。** 用户说明：池是为大载荷、高频的调用省去开辟内存的开销；这个下游的消息小、有上限，也不追求速度，用不上这份性能。Host 在私有 IPC 根下实测，条件是 macOS 27、同一进程里两个 Runtime 经 IPC 调用，取中位数：
 
   | 路径 | 8 KB | 64 KB | 1 MB | SHM 账面峰值 | 进程 RSS 增量 |
   | --- | --- | --- | --- | --- | --- |
   | 开池（默认） | 82 µs | 92 µs | 317 µs | 256.5 MiB | 7.1 MiB |
-  | 关池（hey-my-buddy 现在的设置） | 85 µs | 98 µs | 395 µs | 1.0 MiB | 7.9 MiB |
+  | 关池 | 85 µs | 98 µs | 395 µs | 1.0 MiB | 7.9 MiB |
   | 全部内联（阈值设为 32 MiB） | 68 µs | 147 µs | 1442 µs | 0 | 8.4 MiB |
 
   - 256 MiB 的段是稀疏的：开池以后，进程的 RSS 并没有多出 256 MiB，这个数只记在地址空间与预算账上。Windows 上它是否占用提交额度，没有验证。
-  - 关池对 hey-my-buddy 的代价很小，但也没有让它更轻。它真正需要的是上限：单条消息、帧与重组。
+  - 关池对这个下游的代价很小，但也没有让它更轻。它真正需要的是上限：单条消息、帧与重组。
   - SHM 与内联的交叉点在 8 KB 到 64 KB 之间，默认阈值 4 KiB 偏低。
 
 ## 依据
@@ -95,9 +86,9 @@ Python 的布局：
 
 - 示例只设置了 `C2_RELAY_ANCHOR_ADDRESS`；CI 只设置了它和 `C2_ENV_FILE`。
 - 大多数 IPC 变量在 Python 测试里只出现一次，都在列举全部变量的配置解析测试 `sdk/python/tests/unit/test_ipc_config.py` 里；在 `docs/configuration.md` 里也只出现一次。
-- 环境变量本身没有下游在用，但同名的代码覆盖键有：hey-my-buddy 用了其中 9 个，来得到一个轻量配置（见"下游的实际用法"）。
+- 环境变量本身没有下游在用，但同名的代码覆盖键有：有一个下游用了其中 9 个，来得到一个轻量配置（见"下游的实际用法"）。
 
-它真正想表达的只有三件事：单条消息不超过 32 MiB，总内存要小，执行线程要够用。为此它却要懂池、重组段、分片与帧这些内部机制。
+它真正想表达的只有三件事：单条消息不大，总内存要小，执行线程要够用。为此它却要懂池、重组段、分片与帧这些内部机制。
 
 ### 收敛方向
 
@@ -111,7 +102,7 @@ Python 的布局：
 | 现有设置 | 建议 | 理由 |
 | --- | --- | --- |
 | `C2_RELAY_ANCHOR_ADDRESS`、`C2_ENV_FILE`、`C2_IPC_ROOT` | 保留 | 有使用者，表达的是部署意图 |
-| `max_payload_size` | 保留，作为唯一的单条消息上限 | hey-my-buddy 在用 |
+| `max_payload_size` | 保留，作为唯一的单条消息上限 | 有下游在用 |
 | 三个方向预算、`max_reassembly_bytes` | 合并为一个内存上限和一个文件溢出上限 | 用户关心的是总量，不是内部的四个格子 |
 | `max_frame_size`、`chunk_threshold_ratio`、`chunk_size`、`max_total_chunks`、重组段大小与段数 | 从单条消息上限与内存上限推导 | 都是协议内部机制；`max_total_chunks` 还有缺陷 B8 |
 | `pool_enabled`、预热段数、最少保留段数 | 删除 | 开池不额外占内存，关掉只会变慢（实测） |
@@ -119,13 +110,13 @@ Python 的布局：
 | `pool_decay_seconds`、`chunk_gc_interval`、`chunk_assembler_timeout`、`C2_RELAY_ANTI_ENTROPY_INTERVAL`、`C2_REMOTE_PAYLOAD_CHUNK_SIZE`、`C2_RELAY_ROUTE_MAX_ATTEMPTS` | 固定常量 | 没有使用者，是调优常数 |
 | `shm_threshold` | 固定常量 | 交叉点在 8 KB 到 64 KB 之间（macOS 实测），按三个平台的基准定 |
 | `heartbeat_interval`、`heartbeat_timeout` | 随单一属主的详细设计定 | 本机 IPC 上对端死亡会有 EOF；心跳只剩"释放停住的对端占着的许可"这一用处 |
-| `max_pending_requests`（Server 级）、`max_execution_workers` | 待定：与路由级 `ConcurrencyConfig` 的 `max_pending` / `max_workers` 合并 | 同一件事分了两层；后者还有缺陷 H12，hey-my-buddy 设成了上限 64 |
+| `max_pending_requests`（Server 级）、`max_execution_workers` | 待定：与路由级 `ConcurrencyConfig` 的 `max_pending` / `max_workers` 合并 | 同一件事分了两层；后者还有缺陷 H12 |
 | `C2_CALL_MAX_OUTSTANDING`、`C2_CALL_RETAINED_INPUT_BUDGET_BYTES` | 待定：前者删除，后者并入内存上限 | 只有测试在用 |
 | `C2_RELAY_CALL_TIMEOUT` | 待定：并入调用截止时间 | 已有逐次调用的截止时间，这是第二种限制调用时长的方式 |
 | `C2_RELAY_USE_PROXY` | 保留 | 公司网络的代理是真实的部署需要 |
 | relay 服务端的部署参数（bind、seeds、id、advertise url、idle timeout） | 保留 | `c3 relay` 的部署参数 |
 
-用户决定逐项表后，在同一批里把环境变量、代码覆盖键和文档一起删干净。hey-my-buddy 的 9 个开关届时多数会消失，它怎么跟进由用户决定。
+用户决定逐项表后，在同一批里把环境变量、代码覆盖键和文档一起删干净。那个下游的 9 个开关届时多数会消失，它怎么跟进由用户决定。
 
 ## 四、错误类型
 
@@ -134,7 +125,7 @@ Python 的布局：
 ## 五、用户决定（2026-10-31）
 
 1. 第二节的分层与子模块名：同意。
-2. `ConcurrencyMode` 与 `InputLifetime` 只收字符串字面量（`Literal[...]`），两个枚举类从公开接口中删掉：同意。类型检查照样能发现拼写错误，取值也直接写在签名里。hey-my-buddy 与那个水文模拟后端用到了 `ConcurrencyMode`，升级时要改成字符串。
+2. `ConcurrencyMode` 与 `InputLifetime` 只收字符串字面量（`Literal[...]`），两个枚举类从公开接口中删掉：同意。类型检查照样能发现拼写错误，取值也直接写在签名里。用到 `ConcurrencyMode` 的下游升级时要改成字符串。
 3. **契约推断与资源桥：待用户决定。** Host 建议删除 `infer_crm_from_resource`、`c3 contract infer`、`bridge`、`ResourceBridge` 与 `register(bridge=...)`。理由：没有下游在用；写一个契约类只要几行，而契约是跨语言的身份，应当显式写出，不该从实现的签名里推断；资源桥要做的转换，在资源方法里写一行就能完成。
 
    风险评估：
@@ -142,7 +133,7 @@ Python 的布局：
    - **失去的便利。** 资源桥让已有的领域类不用改动就能注册；推断让人不写契约类，也能从实现导出描述。替代写法：注册一个薄的适配类；或者先写契约类，再用 `c3 contract export`。
    - **与既定立场一致。** 7 月可移植载荷的重新设计已经删掉了旧的推断与资源桥，并写明领域适配归应用自己负责（`docs/issues/contract-release-deferred-capabilities.md` 第 15、55 行）。现存的通用资源桥与推断，是那次删除之后留下的。
    - **删除本身的风险。** 要改四处：注册、服务端对资源的包装、签名一致性检查、借用输入的校验；另外还有 CLI 的一个子命令和相关测试。改的时候要守住：普通的一致性检查不能被一并削弱。借用输入与资源桥不能同用的那条规则，随之消失。
-   - **下游。** 本机已知的下游都没有用。本机之外有没有用户，无从得知，所以按 0.x 的做法，在发行说明里写明迁移方式。
+   - **下游。** 已知的下游都没有用。此外有没有用户，无从得知，所以按 0.x 的做法，在发行说明里写明迁移方式。
 4. 配置项按第三节收敛：同意这个做法；逐项表待用户决定。
 5. AGENTS.md 按下文重组：同意。
 
@@ -159,7 +150,7 @@ Python 的布局：
 - 托管子进程；
 - 在 Python 与 Rust 各约 12 个公开名字，`docs/local-endpoint-lifecycle.md` 的大部分篇幅。
 
-本机已知的下游都没有用，hey-my-buddy 评估后明确不采用。按"没有使用者的能力不留"，可以整体删除；但它是有意建成的能力，删不删由用户决定。在决定之前，分层把它移进 `c_two.owner`，不改它的行为。
+已知的下游都没有用，其中一个评估后明确不采用。按"没有使用者的能力不留"，可以整体删除；但它是有意建成的能力，删不删由用户决定。在决定之前，分层把它移进 `c_two.owner`，不改它的行为。
 
 ## 七、执行计划
 
@@ -204,4 +195,4 @@ T1 与 T2 改的文件互不重叠，可以并行。
 - **错误类型：** 协议批之后。
 - **决定 3 与第六节：** 等用户决定后，另开批次。
 
-下游仓库不在本计划里改动；hey-my-buddy、toodle 与那个水文模拟后端怎样跟进，由用户决定。
+下游仓库不在本计划里改动；各下游怎样跟进，由用户决定。

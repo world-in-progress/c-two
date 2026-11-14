@@ -1,6 +1,6 @@
 # Windows local test sidecar verification
 
-Date: 2026-10-10. Source baseline: `8936c5c98745a87f3c8fbb1e08782228585a519b`. Branch: `codex/local-test-sidecar`. These are Windows development-machine results, not release certification or hosted CI evidence. macOS has not been executed on a real machine.
+Date: 2026-10-10. Source baseline: `8936c5c98745a87f3c8fbb1e08782228585a519b`. Branch: a development branch. These are Windows development-machine results, not release certification or hosted CI evidence. macOS has not been executed on a real machine.
 
 ## Implementation
 
@@ -12,13 +12,13 @@ Preparation built matched FastDB JS/WASM from clean source commit `4f99f86a662b0
 
 | Suite | Result | Evidence directory |
 | --- | --- | --- |
-| Core | 1588 passed, 2 declared HTTP child entrypoints ignored | `D:/c-two-test/sidecar-core-final-4/core` |
-| CLI | 60 passed | `D:/c-two-test/sidecar-all-final-2/cli` |
-| Rust SDK | 18 passed | `D:/c-two-test/sidecar-all-final-2/rust-sdk` |
-| Native SDK | 7 passed | `D:/c-two-test/sidecar-all-final-2/native` |
-| Node bindings | 57 passed, 3 exact platform skips | `D:/c-two-test/sidecar-all-final-2/node` |
-| Complete Python SDK | 1205 passed, 40 exact platform skips | `D:/c-two-test/sidecar-all-final-2/python/evidence` |
-| Repository tools | 460 passed, 2 exact platform skips | `D:/c-two-test/sidecar-repo-final-3/repo` |
+| Core | 1588 passed, 2 declared HTTP child entrypoints ignored | `<windows-validation-root>/sidecar-core-final-4/core` |
+| CLI | 60 passed | `<windows-validation-root>/sidecar-all-final-2/cli` |
+| Rust SDK | 18 passed | `<windows-validation-root>/sidecar-all-final-2/rust-sdk` |
+| Native SDK | 7 passed | `<windows-validation-root>/sidecar-all-final-2/native` |
+| Node bindings | 57 passed, 3 exact platform skips | `<windows-validation-root>/sidecar-all-final-2/node` |
+| Complete Python SDK | 1205 passed, 40 exact platform skips | `<windows-validation-root>/sidecar-all-final-2/python/evidence` |
+| Repository tools | 460 passed, 2 exact platform skips | `<windows-validation-root>/sidecar-repo-final-3/repo` |
 
 Across the final per-suite results, 3395 tests passed, 45 declared platform cases skipped, and 2 parent-invoked Rust HTTP child entrypoints were ignored. These counts combine the retained all-suite stages with the corrected Core and repository reruns; they do not describe a single passing aggregate all-suite command.
 
@@ -28,7 +28,7 @@ Additional focused verification: platform and strict-runner regressions passed 7
 
 ## Failed runs retained and investigated
 
-`D:/c-two-test/sidecar-all-final-2/run.json` remains failed. Its Core stage encountered a Windows pipe-closing error in the test peer, and its repository stage passed 459 cases but failed the negative source-checkout fixture (2 declared platform skips). The final Core rerun passed all 1588 cases with 2 declared child entrypoints ignored, and confirmed cleanup. The final repository rerun passed 460 cases with 2 declared platform skips and confirmed cleanup. Final focused suite reruns are recorded separately; the failed aggregate is not rewritten as passing evidence.
+`<windows-validation-root>/sidecar-all-final-2/run.json` remains failed. Its Core stage encountered a Windows pipe-closing error in the test peer, and its repository stage passed 459 cases but failed the negative source-checkout fixture (2 declared platform skips). The final Core rerun passed all 1588 cases with 2 declared child entrypoints ignored, and confirmed cleanup. The final repository rerun passed 460 cases with 2 declared platform skips and confirmed cleanup. Final focused suite reruns are recorded separately; the failed aggregate is not rewritten as passing evidence.
 
 The repository negative test was reproduced under a temporary directory whose ancestor contained `cli`. Since the production locator searches ancestors, that location did not satisfy the fixture's claimed outside-checkout precondition. The fixture now uses a system temporary directory and verifies that precondition. The reproduced single test failed before the change; all five tests in that file passed after it.
 

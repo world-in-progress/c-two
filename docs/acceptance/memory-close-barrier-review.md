@@ -1,6 +1,6 @@
 # Windows 2025 blocked receive close review
 
-Source: Buddy checkout based on `0075bf9c54ba3a536c5dc1ae2c9bb65be1155648`. Scope: `c2-ipc` close barrier and its focused fixtures. No `c2-local` change.
+Source baseline: `0075bf9c54ba3a536c5dc1ae2c9bb65be1155648`. Scope: `c2-ipc` close barrier and its focused fixtures. No `c2-local` change.
 
 ## Known evidence and cause
 

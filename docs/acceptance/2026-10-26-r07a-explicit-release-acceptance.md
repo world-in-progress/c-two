@@ -31,10 +31,10 @@
 
 验证过程中保留三项纠正记录：Host 起初写错一个既有 Display 前缀，只把测试修正为原 `Pool error`，未改生产文案；Windows 首次混用 Cargo target 导致候选误用旧基线二进制，该结果弃用，改为独立 target；随后发现 Windows 专属关闭探针漏传原生 connect 的 Duration，修正后针对剩余/受影响项验证，生产未改。首轮 CI `40271664346` 因该修正取消，五条源码线已进入共享验证但未完成，不计入验收；此前“尚未进入运行时测试”的进度表述未获逐门禁证据支持，以这里保留的真实时间线为准。最终候选重新执行确切来源的完整门禁，本机和开发机不受影响的通过记录直接复用。
 
-独立生产审查 run `3218a4fc-53fa-4abd-8bfb-fbbee1bec7da`、artifact `20fb0ecc-d21a-44e7-aac3-f31e25fdbbb5`，固定输入 `5811200c`；测试及 API 文档审查 run `dd22dc78-e0bb-4f9d-b553-8d505b47fb23`，固定输入 `d1802806`，均无阻断发现。它们只做静态审查，没有独立运行测试。Host 核对最终六个生产文件除注释外与审查输入一致，最终测试差异仅补 Windows 原生期限参数，并由 Host 及真实 Windows 运行复核。两份报告均接受、工作树回收。GLM-5.3 run `bb842283-2428-4935-aff6-e1a4cefb3482` 仅交付基线测试，Host 拆开竞争/poison、增加原 owner 与真实 RPC 覆盖并执行红绿；该调整后的 artifact 也已接受和回收。
+生产实现与测试及 API 文档分别在固定输入 `5811200c` 和 `d1802806` 上经过独立审查，均无阻断发现。它们只做静态审查，没有独立运行测试。Host 核对最终六个生产文件除注释外与审查输入一致，最终测试差异仅补 Windows 原生期限参数，并由 Host 及真实 Windows 运行复核。两份报告均接受、工作树回收。另有一份基线测试，Host 拆开竞争/poison、增加原 owner 与真实 RPC 覆盖并执行红绿；调整后的测试也已验收，临时工作树已回收。
 
 实际开销：macOS arm64 上，pool 释放 Result 的类型大小从 24 到 104 B，准备 Result 从 96 到 200 B；这是 Rust 类型布局，不能解释为每次调用的额外堆分配，也不是稳定 ABI。成功路径没有新增锁、worker 或 payload 复制；错误对象保留原 pool/分配/预算，既有 Drop 可能多做一次有界 allocator 等待。未测 RPC 性能差异，不声明提速；最终析构仍不能保证接管失败 owner。
 
-本机已清理 target 544680280 B、传输归档 2075476 B。Windows 三次 target 分别清理 420459245 / 289792670 / 411582307 B；最终 temp 仅剩两个空 spill 目录，经清单确认后用原生非递归删除，target/temp/归档均不存在。文本证据与源码留在 `~/.codex/diagnostics/c2-r07a-implementation-1_sjflpb/`；没有保留 wheel、DLL 或 ZIP，没有 inspect/reap 或删除历史目录。本地分支和标签保持；仅本批 fork CI 分支在验收后按确切 SHA 清理。
+本机已清理 target 544680280 B、传输归档 2075476 B。Windows 三次 target 分别清理 420459245 / 289792670 / 411582307 B；最终 temp 仅剩两个空 spill 目录，经清单确认后用原生非递归删除，target/temp/归档均不存在。文本证据与源码保存在仓库之外；没有保留 wheel、DLL 或 ZIP，没有 inspect/reap 或删除历史目录。本地分支和标签保持；仅本批 fork CI 分支在验收后按确切 SHA 清理。
 
 [机器记录](evidence/2026-10-26-r07a-explicit-release-acceptance.json)保留来源、artifact digest、内容哈希核查、平台/审查/清理摘要。只按 Range 下载文本，核 ZIP CRC 和 run-evidence 中的逐文件 SHA-256；GitHub 整包 digest 仅记录，没有宣称对未下载的完整 ZIP 重新计算哈希。R07 的 Core/Held owner 与 pin、consuming/构造回滚及最终 Drop 保持未完成；C04、R35 和两份控制会话重构继续暂缓。

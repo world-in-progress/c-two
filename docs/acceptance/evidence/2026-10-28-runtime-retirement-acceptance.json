@@ -231,9 +231,11 @@
     }
   },
   "review": {
-    "core_run": "ae7a792c-2727-48e3-b67e-0943b0f59d0f",
-    "sdk_run": "a07fa982-ec0c-427d-939b-2f8a2fb242c9",
-    "ci_fixture_run": "82639ea7-6d11-4a20-a19d-24e1e78a2957",
+    "scope": [
+      "core",
+      "sdk",
+      "ci_fixture"
+    ],
     "verdict": "No remaining static blockers; Host runs runtime/CI validation."
   },
   "ci": {
@@ -874,7 +876,7 @@
       "expected_sha": "f747a7c9edd0171293c4f65fa4acefb3dac30b0e",
       "main_or_tags_modified": false
     },
-    "buddy_checkouts": {
+    "review_worktrees": {
       "checked": 7,
       "remaining": []
     },

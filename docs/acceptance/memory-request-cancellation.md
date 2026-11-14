@@ -24,7 +24,7 @@ The executor uses the existing dedicated crash-timeout policy. Its observation l
 
 The implementation and its tests were reviewed independently of Worker completion. Host corrected the dispatch/permit handoff race before integration. Linux and Windows CI then exposed two fixture defects: fault-injection guards named different static locks, and cancellation scenarios inherited a machine-dependent worker count despite stalling six or four callbacks. Those fixtures now share the intended injection lock and declare the required execution capacity while ordinary scenarios remain parallel.
 
-Host also rejected a pool-scoped observer that counted only queued jobs and a later test that read the return flag and count separately. The final test-only observer covers queued and worker-popped jobs through weak references; GPT-6 Sol corrected the observation race with a snapshot under the executor lock and an assertion at the entry-removal transition. See [the focused review](memory-linux-cancellation-tests.md).
+Host also rejected a pool-scoped observer that counted only queued jobs and a later test that read the return flag and count separately. The final test-only observer covers queued and worker-popped jobs through weak references; the observation race is closed by a snapshot under the executor lock and an assertion at the entry-removal transition. See [the focused review](memory-linux-cancellation-tests.md).
 
 Host verification in the integrated tree recorded:
 
@@ -32,7 +32,7 @@ Host verification in the integrated tree recorded:
 - Rebuilt c3 passed the Rust/Python portable tests (25 tests) and generated TypeScript real-call tests (14 tests). Strict validators accepted the exact 18 and 12 receipt rows.
 - Both matrices reference the same c3 bytes: SHA-256 `6cdc59752012aced8ff4faecce4c09f44db479d613b17f80d1ea2029250f4938`.
 
-Commands, exit codes, input diff and raw logs are retained under `/tmp/c2-combined-final-0929/`. The native permission errors inside the Sol Buddy sandbox are recorded separately and are not counted as successful runtime verification. Windows and Linux hosted results must be verified on the pushed source before claiming overall completion.
+Commands, exit codes, input diff and raw logs are retained under `/tmp/c2-combined-final-0929/`. The native permission errors in the isolated validation environment are recorded separately and are not counted as successful runtime verification. Windows and Linux hosted results must be verified on the pushed source before claiming overall completion.
 
 ## Remaining boundaries
 

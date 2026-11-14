@@ -6,7 +6,7 @@
 
 ## 旧测试与改写追溯
 
-最初比较固定在旧基线与 `1c78cd6e5fc49cd97126ec6f5707757cdaf99d6a`：Rust/Python/Node 源码测试定义共 2026 → 2274，1955 个正文保留，55 个修改、9 个改名、7 个删除、255 个新增。这个数量不是参数化后的执行项数。71 个旧可执行定义的修改/改名/删除及相关 helper 已逐项审查，见 [追溯账本](2026-10-03-memory-test-review-ledger.json)。完整 2.9 MB 提取清单保留在 Buddy 固定产物 `3090d647-d384-47df-ae2c-bd7e3ff72662` / 提交 `1495f87790df67f993d3e4bd973d8eef95e38269`，账本记录其 SHA-256；此处只提交审查所需的精简记录。
+最初比较固定在旧基线与 `1c78cd6e5fc49cd97126ec6f5707757cdaf99d6a`：Rust/Python/Node 源码测试定义共 2026 → 2274，1955 个正文保留，55 个修改、9 个改名、7 个删除、255 个新增。这个数量不是参数化后的执行项数。71 个旧可执行定义的修改/改名/删除及相关 helper 已逐项审查，见 [追溯账本](2026-10-03-memory-test-review-ledger.json)。完整 2.9 MB 提取清单保留在提交 `1495f87790df67f993d3e4bd973d8eef95e38269`，账本记录其 SHA-256；此处只提交审查所需的精简记录。
 
 7 个删除涉及旧 spill 启发式、自动 file→SHM promotion、take_handle 和全局客户端 singleton。它们随获准的机制替换而删除，不宣称逐项语义完全等价。其余改写保留或强化旧行为保护。发现的 abort 用例弱化已恢复：保留同一池、确认 allocation count 归零，再禁止扩容/dedicated/file fallback 申请整块 64 KiB。4 个反向 mutation 分别撤销 owner 校验或只退款不 free，均准确触发断言失败；mutation 已恢复且未导入实现。
 
@@ -26,7 +26,7 @@
 | receiver 取消的同步 Drop 突破关闭时限 | 50 ms 关闭在旧候选耗时约 1.01 s；新候选约 1.45 ms 返回 false，保留完整 owner/charge，解锁后 retry true。真实 LocalStream 与 dedicated footer/read_done 对照通过。 |
 | 非法单块 128/1/129 误判容量不足 | 在任何 reservation 前得到 Protocol，合法容量不足仍为 702；不会因预算状态改变分类。 |
 
-合并时保留了同一 allocation guard 内的 incarnation 捕获、同一 release guard 内的 authority 校验，以及严格 abort 原池复用断言。两个修复任务均按最新 sealed artifact 验收；[最终独立关闭交接审查](2026-10-03-final-close-flow-review.md) 对固定 `15578b5` 未发现新增阻塞 finding。该审查是静态证据，与下面动态结果分开。
+合并时保留了同一 allocation guard 内的 incarnation 捕获、同一 release guard 内的 authority 校验，以及严格 abort 原池复用断言。两个修复任务均按最新输出验收；[最终独立关闭交接审查](2026-10-03-final-close-flow-review.md) 对固定 `15578b5` 未发现新增阻塞 finding。该审查是静态证据，与下面动态结果分开。
 
 ## 最终本机结果
 

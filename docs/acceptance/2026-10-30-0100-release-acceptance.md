@@ -43,4 +43,4 @@ fork 上的完整 CI [40900123908](https://github.com/Dsssyc/c-two/actions/runs/
 
 ## 清理
 
-fork 上的 `socu/0100-release-fixes`、`socu/0100-release-fixes-ci` 与 Codex 时期留下的 `socu/r15-expiry-gc-ci`、`socu/076-ci-release-gates` 都已包含在 main 中，按确切 SHA 删除；fork 上 CI 分支的 Actions 缓存一并删除。上游两个 Dependabot 分支按确切 SHA 删除：对应的 [PR #200](https://github.com/world-in-progress/c-two/pull/200) 已合入，[PR #201](https://github.com/world-in-progress/c-two/pull/201) 已关闭、被 #202 取代。本轮的本地工作树、已验收的 Buddy checkout 与构建产物均已清理，旧的 `slimming-batches` worktree 没有未提交内容，随其分支一起删除。第一次尝试的候选及其两次预演留在 Actions 记录里，不用于发布。本记录合入后删除本记录分支。
+fork 上的 `socu/0100-release-fixes`、`socu/0100-release-fixes-ci` 与此前保留的 `socu/r15-expiry-gc-ci`、`socu/076-ci-release-gates` 都已包含在 main 中，按确切 SHA 删除；fork 上 CI 分支的 Actions 缓存一并删除。上游两个 Dependabot 分支按确切 SHA 删除：对应的 [PR #200](https://github.com/world-in-progress/c-two/pull/200) 已合入，[PR #201](https://github.com/world-in-progress/c-two/pull/201) 已关闭、被 #202 取代。本轮的工作树与构建产物均已清理，旧的 `slimming-batches` worktree 没有未提交内容，随其分支一起删除。第一次尝试的候选及其两次预演留在 Actions 记录里，不用于发布。本记录合入后删除本记录分支。

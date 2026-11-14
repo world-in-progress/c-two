@@ -62,4 +62,4 @@
 
 ## 清理
 
-fork 上的 `socu/release-agility-review` 已包含在 main 中，按确切 SHA（`2036a527`）删除；它在 fork 上的 Actions 缓存与上游 PR #208 的缓存一并删除。#206、#207 的分支、worktree 与缓存在各自合入后已清理，诊断与实现用的 Buddy checkout 都已回收。第一次资格验证的两次运行留在 Actions 记录里，没有构建候选。本记录合入后删除本记录分支及其 worktree。
+fork 上的 `socu/release-agility-review` 已包含在 main 中，按确切 SHA（`2036a527`）删除；它在 fork 上的 Actions 缓存与上游 PR #208 的缓存一并删除。#206、#207 的分支、worktree 与缓存在各自合入后已清理，诊断与实现工作树均已回收。第一次资格验证的两次运行留在 Actions 记录里，没有构建候选。本记录合入后删除本记录分支及其 worktree。

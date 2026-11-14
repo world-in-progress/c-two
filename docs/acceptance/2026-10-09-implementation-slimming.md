@@ -138,6 +138,6 @@ Windows `local-platform` 与 `full` 两个 scope 在同一 OS 上重复准备环
 
 ## 本次核验与协作状态
 
-Host 核验了 Git 跟踪体积、测试/实现分类、Cargo 普通依赖树、关键调用者、Python AST 重复、PyO3 字段映射，以及产物副本的 strip/import 实验。原生 6.1 Sol 独立复核传输/内存候选后，Host 再检查实际代码。未运行完整测试，也未以此报告声称任何重构通过。
+Host 核验了 Git 跟踪体积、测试/实现分类、Cargo 普通依赖树、关键调用者、Python AST 重复、PyO3 字段映射，以及产物副本的 strip/import 实验。独立审查复核传输/内存候选后，Host 再检查实际代码。未运行完整测试，也未以此报告声称任何重构通过。
 
-Buddy 使用已安装的 0.27.0 skill。三个只读任务中，传输与构建任务先遇 GLM 429，恢复后遇 `HARNESS_PREMODEL_FAILED`；SDK 任务留下最终审查文本，但因 native shutdown 协议错误未封存交付。Host 将该文本仅作线索并独立核对，不作为已验收 artifact。三个任务按失败记录收尾，并按各自受管工作树清理计划回收；没有把报告文本的 completed 声明当作系统交付成功。
+初次的传输、构建与 SDK 三项只读审查均未完成，工作树已回收。SDK 审查留下的意见只作为线索，Host 另行核对。

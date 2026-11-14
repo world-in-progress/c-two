@@ -7,29 +7,14 @@
     "machine": "arm64"
   },
   "historical_source": {
-    "thread_id": "019e88aa-45f2-74f3-9683-b364bf090f87",
-    "title": "排查闲置续连报错",
-    "url": "codex://threads/019e88aa-45f2-74f3-9683-b364bf090f87",
-    "retrieval": "Direct read_thread tool, selected historical and final review turns; not a claim that every intermediate tool output was reread.",
-    "turns": [
-      {
-        "id": "019e96a6-b1f7-7a00-ae70-61785cf1c18c",
-        "topic": "Reproduced manager then late builder handshake snapshot and local HTTP fallback"
-      },
-      {
-        "id": "019e96b4-93fe-7580-a887-dfe43d18ac9f",
-        "topic": "Shared endpoint and dynamic registration ownership"
-      },
-      {
-        "id": "019e9762-aa9c-7df1-90bd-e327954bb7c0",
-        "topic": "Positive cache cannot confirm later route closure or removal; historical watch-first proposal"
-      },
-      {
-        "id": "019e9a89-be1a-7c42-b0d2-19b2c7349aed",
-        "topic": "Last whole-issue review did not certify the old implementation as complete"
-      }
-    ],
-    "private_business_logs_copied": false
+    "retrieval": "Selected historical discussion and final review were consulted; intermediate evidence was not exhaustively reread.",
+    "private_business_logs_copied": false,
+    "topics": [
+      "Reproduced manager then late builder handshake snapshot and local HTTP fallback",
+      "Shared endpoint and dynamic registration ownership",
+      "Positive cache cannot confirm later route closure or removal; historical watch-first proposal",
+      "Last whole-issue review did not certify the old implementation as complete"
+    ]
   },
   "current_contract": "docs/vision/route-token-endpoint-connection-architecture.md; supersedes the old watch-first correctness framing",
   "findings": {
@@ -191,7 +176,7 @@
   },
   "shared_endpoint_composite_probe": {
     "status": "not_run",
-    "reason": "Native subagent service content check blocked the task before any scratch artifact was created. No retry or runtime success claimed.",
+    "reason": "The independent probe was not created or run.",
     "static_call_chain": [
       "c2-http relay/state.rs:501-550 route semantic verify/exact token error",
       "c2-http relay/conn_pool.rs:689-702 evict exact client without active_requests guard",

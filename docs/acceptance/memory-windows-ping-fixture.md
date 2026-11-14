@@ -43,4 +43,4 @@ CI 日志能确定的只有：windows-2025 / full 的 panic 文本是 `assertion
 
 生产 `ping` / `shutdown` 循环、`exchange` 错误分类、每次尝试上限、admin acknowledgement 校验与 `decode_shutdown_ack` 路径均未改；相对 HEAD 唯一的生产代码形状变化是 `Exchange::Absent` 与 `Exchange::NoReply` 拆成两个 match 分支，其中 seam 调用与注入判断都在 `#[cfg(test)]` 内，非 test 构建下两个分支与原合并分支行为一致。未改 `client.rs` / `tests.rs`，未改 `c2-local` / `c2-config` / `c2-local-security`，未 push / merge / release，未派 peer。
 
-Host 已审查最终固定产物 `23eaf4af-1a55-4331-bce9-178075510afa`：首次 Absent 事件确实来自待测 ping，responder setup-ready 先于该探测，1 s 探测预算保持。集成工作树的控制模块 6/6 项通过，日志 `/tmp/c2-ping-host-verification-0929.log`；真实 Windows 结果仍以随后 CI 为准。
+Host 审查了最终差异：首次 Absent 事件确实来自待测 ping，responder setup-ready 先于该探测，1 s 探测预算保持。集成工作树的控制模块 6/6 项通过，日志 `/tmp/c2-ping-host-verification-0929.log`；真实 Windows 结果仍以随后 CI 为准。

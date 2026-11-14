@@ -203,12 +203,14 @@
     "tag_source": "3f223d658117511073ae549565ad2c49af163a87"
   },
   "reviews": {
-    "r06": "a136cefd-fb94-4b4e-aee8-efd38c293f49",
-    "windows_final_delta": "e2e8be5b-be4d-4274-ad2c-aa372f983bc7",
-    "submitted_windows_evidence": "9c476201-d7c2-47e9-9bf1-3db768cb0db2",
-    "build_provenance": "5a25e296-2adc-4f5f-8672-8e57e01fe04a",
-    "identity_error_patch": "2a3a3e74-9699-43e9-ae03-1bcfde7c998d",
-    "release_gate": "e21b76d5-e02e-470a-8e47-df4ae847d280",
+    "scope": [
+      "r06",
+      "windows_final_delta",
+      "submitted_windows_evidence",
+      "build_provenance",
+      "identity_error_patch",
+      "release_gate"
+    ],
     "identity_test_review_resolution": "Host replaced helper-only test with real public inspect/commit paths and proved the old actual connection mapping fails."
   },
   "cleanup": {
@@ -224,7 +226,7 @@
     "historical_ipc_touched": false,
     "user_evidence_files": 168,
     "user_evidence_manifest_sha256": "c9eb262fc57d0dc55c06bfc8343d31cd4bce3c18d06bdd813f1c4ea35c030513",
-    "retained_other_task_worktree": "~/.codex/worktrees/slimming-batches/c-two",
-    "retention_reason": "Codex archive tool refuses because another task owns this checkout."
+    "retention_reason": "The checkout belonged to another task and was retained.",
+    "retained_unrelated_worktree": true
   }
 }

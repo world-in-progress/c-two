@@ -68,9 +68,9 @@ macOS arm64、Python 3.12.10、Rust 1.91.0、相同编译参数，基线/候选�
 
 六个平台均通过严格 18/18 Rust/Python direct/relay 与 12/12 TypeScript 矩阵收据校验，跨语言组无 skip；Windows 包括原生架构与普通用户消费者。Node 进程、host/relay 进程和 reader 收尾字段全部为 true，新增真实拒绝夹具检查私有 socket/lease 清空。最终源码字节与本机冻结候选一致，后续收尾文档不是新的构建来源。
 
-hey-my-buddy 独立审查覆盖初始实现、旧 fixture 迁移、Windows flush、frame 边界、退出夹具及 idle baseline。审查发现逐项处理，最后 idle 差量复核 `de61efd2-7191-4dc9-a971-9e895e265ee3` 无阻塞。静态审查与实际运行证据分开，所有交付产物由 Host 按固定提交核验后接受；源记录绑定的具体 run/artifact 见机器收据。
+独立审查覆盖初始实现、旧 fixture 迁移、Windows flush、frame 边界、退出夹具及 idle baseline。审查发现逐项处理，最后 idle 差量复核无阻塞。静态审查与实际运行证据分开，所有交付产物由 Host 按固定提交核验后接受。
 
-本机已清理 6,868,225,006 B、Windows 已清理 2,892,516,412 B 的任务产物，合计约 9.76 GB（目录逻辑字节统计，不声称等量物理空间）。Cargo target、验证环境、wheel、Node build/dist/node_modules、传输归档和本批 FastDB symlink 已移除；源码、原始日志、样本、哈希与收据保留于 `~/.codex/diagnostics/c2-ipc14-implementation-mxyfpx5g/`。Windows Rust 工具链保留。
+本机已清理 6,868,225,006 B、Windows 已清理 2,892,516,412 B 的任务产物，合计约 9.76 GB（目录逻辑字节统计，不声称等量物理空间）。Cargo target、验证环境、wheel、Node build/dist/node_modules、传输归档和本批 FastDB symlink 已移除；源码、原始日志、样本、哈希与收据保留在仓库之外。Windows Rust 工具链保留。
 
 没有清理历史对象。一次本机 `connect_timeout` 文件误用了默认上下文，7 项通过并由原生机制清理本批唯一端点，记录为执行范围偏差；其余新夹具明确使用私有 namespace，完整 relay 在干净 CI runner 验证，未再次用全局 `C2_IPC_ROOT` 假定整套 Rust 测试已隔离。
 

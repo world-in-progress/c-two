@@ -48,4 +48,4 @@ Windows 11 x64 开发机实测 127 项通过，1 项 Unix 限定用例不适用�
 
 独立审查修正了 Host 锁/GIL 交错、两条失败早退及示例清理表述；最终生产源码和 CI 接入修复分别完成只读复核。受控并发 register/shutdown 在基线和候选均有同一旧会话换代/hook 归属问题，已[单列待修](2026-10-27-runtime-concurrent-shutdown-followup.md)。本批没有隐含修复这条并发路径。
 
-本次 13 个私有测试目录的 socket/lease 为零；这些目录、本机 Rust targets、临时 Python 环境/缓存、生成 native 库及 Windows 两轮任务目录均已清理。候选归档、临时 index 和专用 CI 分支也已清理；日志与回执保留。历史 namespace、hey-my-buddy 仓库和状态未触碰。应用示例只在确认终态且所有清理检查通过后删除自己新建的私有目录；启动错误仍抛出，关闭未确认或报错时保留目录。
+本次 13 个私有测试目录的 socket/lease 为零；这些目录、本机 Rust targets、临时 Python 环境/缓存、生成 native 库及 Windows 两轮任务目录均已清理。候选归档、临时 index 和专用 CI 分支也已清理；日志与回执保留。历史命名空间及下游应用的源码和状态未改动。应用示例只在确认终态且所有清理检查通过后删除自己新建的私有目录；启动错误仍抛出，关闭未确认或报错时保留目录。

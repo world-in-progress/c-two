@@ -42,6 +42,6 @@ inline 已经是接收任务交出的唯一 Rust Vec，直接移动不借用网�
 
 ## 筛选证据
 
-Host 已核对上述 Core/PyO3/IPC 调用链、原始提交、两种既有构造器、接收端 inline Vec 来源、retention 投影及 native 迟到结果处置。hey-my-buddy 独立只读分析 run `ada7448b-61bb-422f-87c3-c3537bf82963`、最终 artifact `2db9e0dc-5eb5-4bbd-8b66-ca7b9aba2dd7` 得到同一候选，确认服务端没有可以直接删除的重复物化事务；交付补丁为空。这是方案筛选证据，实施候选仍需独立审查。
+Host 已核对上述 Core/PyO3/IPC 调用链、原始提交、两种既有构造器、接收端 inline Vec 来源、retention 投影及 native 迟到结果处置。独立只读分析得到同一候选，确认服务端没有可以直接删除的重复物化事务；交付补丁为空。这是方案筛选证据，实施候选仍需独立审查。
 
 基线新增内容、空响应及幂等释放覆盖通过，现有 lifetime ordering 5 项通过；把非空 Vec 地址连续性改为必需断言后，旧生产路径稳定失败于 `inline bytes must move`。候选沿用同一断言并通过。随后完成针对性回归、完整 relay、Rust/Python/Node 跨语言、三系统、同环境性能、端点零残留及独立实现审查；GitHub Actions 的同一候选 10/10 通过。生产实际净增 7 行、测试净增 30 行；没有测得稳定的端到端提速，具体样本、首轮失败及验证修正保留在验收记录中。

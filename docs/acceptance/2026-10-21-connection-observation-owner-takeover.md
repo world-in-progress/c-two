@@ -159,7 +159,7 @@ owner 类型替换和 OwnerMissing 行为变化仍需确切候选 GitHub Actions
 
 ## 独立审查
 
-本版经 hey-my-buddy 0.50.0 独立只读审查：run `50e336dc-3efb-4e5b-bbc0-b596b9fb985f`，固定输入 `d29a7ec7817e2a1577264f13c6435b7ae5f18165`，artifact `b44a9516-4fc3-40c7-b45e-30dd80033664`。结论无设计阻塞项，明确认可 A/B 不改 wire、C 的 Ready/gate 分离及 scoped owner 协议。Host 已核对输入文档字节、空输出 patch 与上述源码依据，并验收该审查。
+本版经独立只读审查，固定输入为 `d29a7ec7817e2a1577264f13c6435b7ae5f18165`。结论无设计阻塞项，明确认可 A/B 不改 wire、C 的 Ready/gate 分离及 scoped owner 协议。Host 已核对输入文档字节、空输出 patch 与上述源码依据，并验收该审查。
 
 Host 收尾补全了具体公开类型清单、原 start fence、候选 setup 上限、串行槽等待者超时隔离、snapshot 投影等验收约束。上述记录为实施前的设计/静态边界审查，不作为生产实现、构建或平台运行验收；分批实施状态见下文。
 

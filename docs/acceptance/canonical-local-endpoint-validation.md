@@ -33,7 +33,7 @@ Persistent普通断连仍服务，OwnerBound能力在就绪前准备；EOF停止
 
 最终e496默认路径真实压力：10,000新地址，9,500正常、500完整登记后kill+OSwait、100旧凭据阻断、100旧流仍存活时重启；3个只含本次地址的受限轮次、25批、1,478名称访问、400孤儿回收，剩余本次socket/lease均0。循环9.74秒，最慢批次6,902微秒；10ms是调度预算，不是文件系统硬实时承诺。688个源码blob在运行前后核验，driver哈希和实际输出匹配。
 
-Native6.1/high审查固定生产者diff后提出Windows错误字段、未知reap覆盖和不可达空值三个收尾，Host修复并测试。后续Buddy6.1/high核验固定e496收尾，exact finalArtifact2ab5c908-2c23-439c-9a7b-379702e26e3e / integration int-76e2cbee-fb70-4f81-9d95-0f94112c0485 已验收；报告UTF-8 SHA256 fbdf8ea89823e156b990fd200e11eb4b0573b41a91a5a51530241d81a0d6359a。它未验证hosted产物，以下由Host独立检查。
+独立审查从固定实现差异中发现 Windows 错误字段、未知 reap 覆盖和不可达空值三项问题，由 Host 修复并测试。后续独立复核验收了 `e49652e` 的修正；报告 UTF-8 SHA-256 为 fbdf8ea89823e156b990fd200e11eb4b0573b41a91a5a51530241d81a0d6359a。它未验证hosted产物，以下由Host独立检查。
 
 ## 不可变产物与安装消费者
 
@@ -55,4 +55,4 @@ Native6.1/high审查固定生产者diff后提出Windows错误字段、未知reap
 
 [当前接入说明](../reference/local-endpoint-lifecycle.md)与AGENTS/方案只描述自动唯一后端；Buddy指出的四处旧注释/docstring在最终文档提交修正，可执行Python AST不变，Rust改动仅注释。正式构建产物仍绑定e496。
 
-旧/tmp/c_two_ipc数据未删除，未知/损坏/部分初始化对象仍保守拒绝；不承诺任意登记崩溃位置自动恢复。已安装hey-my-buddy接入、正式发布和Windows11桌面验收分别需要证据。下载物、wheel、二进制与构建输出均在/tmp，Git只保留源码/文档和小型摘要；未改原始checkout、main/dev-feature、历史冻结收据。
+旧/tmp/c_two_ipc数据未删除，未知/损坏/部分初始化对象仍保守拒绝；不承诺任意登记崩溃位置自动恢复。已安装的下游应用接入、正式发布和 Windows 11 桌面验收分别需要证据。下载物、wheel、二进制与构建输出均在/tmp，Git只保留源码/文档和小型摘要；未改原始checkout、main/dev-feature、历史冻结收据。

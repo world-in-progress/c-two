@@ -4,7 +4,7 @@ Baseline: `8777e2dd157942fe6f3cc90389763af35f5056bd`. Part of the approved [memo
 
 `ChunkRegistry::finish` now returns a completed file-backed handle directly, preserving the existing logical-length trim. The unused `promote_to_shm` function, module and export are removed. This eliminates the former payload-sized temporary `Vec` and avoids immediately reversing a memory-pressure spill. Buddy, dedicated and file allocation fallback remain available.
 
-The worker's first attempt timed out before sealed delivery. Its continuation delivered artifact `f2c178d8-b162-4188-b4e9-5e9fabd3a144`, with final source `4ae665059fc882e492a23f8014b29625cdf13f7a`. The Host reviewed the whole original-input-to-final-source diff, including changes made before continuation. Integration includes Host corrections below; the worker report alone was not acceptance.
+The initial implementation attempt timed out before completing. The continuation delivered source `4ae665059fc882e492a23f8014b29625cdf13f7a`. The Host reviewed the whole original-input-to-final-source diff, including changes made before continuation. Integration includes Host corrections below; the worker report alone was not acceptance.
 
 ## Ownership review
 

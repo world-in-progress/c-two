@@ -40,6 +40,6 @@ Windows 准备阶段曾将 git 正常 stderr 误作终止异常，已修正私�
 
 ## 独立审查与收尾
 
-hey-my-buddy 0.51.1 的独立实现审查绑定上述候选：run `b9e8aad3-adcc-4d64-a8d4-616576887bb4`，artifact `f9cf60a2-1cd3-4476-8aa6-f1870dbb8052`。审查覆盖直接调用方、公开形状、错误/回收顺序、Windows KernelManaged、文档及原断言，无 actionable findings。Host 已核对固定报告并验收，审查 worktree 已回收。
+独立实现审查绑定上述候选，覆盖直接调用方、公开形状、错误/回收顺序、Windows KernelManaged、文档及原断言，无 actionable findings。Host 已核对固定报告并验收，审查 worktree 已回收。
 
-诊断、脚本和 receipts 保留在 `~/.codex/diagnostics/c2-r32-c09fxvzf/`。Windows 本批隔离根目录及临时目录已删除，回收 2,745,387,816 个逻辑字节，保留原 Rust 工具链；本机 Cargo target、Node 构建目录、Go 临时缓存及包归档已清理。验证所用本地原生库、临时 FastDB CoreSDK 和基线 wheel 环境也已清理；下次本地原生测试需重新构建。实现提交与通过 CI 的候选相同，随后仅补验收文档。历史端点和其他任务 worktree 保持。
+诊断、脚本和 receipts 保留在仓库之外。Windows 本批隔离根目录及临时目录已删除，回收 2,745,387,816 个逻辑字节，保留原 Rust 工具链；本机 Cargo target、Node 构建目录、Go 临时缓存及包归档已清理。验证所用本地原生库、临时 FastDB CoreSDK 和基线 wheel 环境也已清理；下次本地原生测试需重新构建。实现提交与通过 CI 的候选相同，随后仅补验收文档。历史端点和其他任务 worktree 保持。

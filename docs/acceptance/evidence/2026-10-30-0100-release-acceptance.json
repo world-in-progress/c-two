@@ -93,7 +93,7 @@
     "upstream_branches_deleted": ["dependabot/cargo/core/parking_lot-0.13.0", "dependabot/cargo/core/rust-minor-and-patch-a9788e4297"],
     "deletion_rule": "exact SHA lease; fork branches contained in main; upstream branches belong to merged #200 and closed #201",
     "fork_ci_branch_caches_deleted": true,
-    "retired_codex_worktree": "slimming-batches, clean, branch contained in main",
+    "retired_worktree": "clean; branch contained in main",
     "first_attempt_runs_retained_in_actions": true
   }
 }

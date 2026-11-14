@@ -211,8 +211,6 @@
     "mutation_sha256": "66b8859f7f7c26ca6f769b386e89b0ec9004046b1e5d2e152633132cc7c8f56a"
   },
   "source_review": {
-    "model": "gpt-6-astra",
-    "effort": "max",
     "patch_sha256": "a8b019c53227eed5694ac59fd4a143ef9e3d7c1ed185c03f86b9d9f6e50a16eb",
     "findings": [],
     "scope": "source and fixture semantics; runtime/platform evidence audited separately"

@@ -24,7 +24,7 @@ Windows 端点、DACL、listener lease 与属主上下文统一绑定 TokenUser�
 
 R06 的同环境 ABBA 测量使用真实生产扩展、每轮九个样本。32/4096 字节 request/response view 的中位数约由 103–104 ns 变为 100–101 ns；IPC 中位数约为 61.3→56.2 µs 和 119.6→119.4 µs。未观察到开销退化，这些结果不构成普适加速承诺；未增加 payload 复制、线程或 timer。回调重入和 R07 不在本批。
 
-独立审查分别覆盖 R06、Windows 实现、用户提交证据、构建来源和最终错误传播。错误传播审查指出最初 helper-only 测试不足，Host 补成公共 inspect/commit 调用并完成实际旧映射反例。最后一次发布门禁审查通过 hey-my-buddy run `e21b76d5-e02e-470a-8e47-df4ae847d280` 交付，固定产物 `4260880c-c1e3-4549-b608-a4447b83e1ac` 已验收、checkout 已回收；该只读审查不代替发行运行。
+独立审查分别覆盖 R06、Windows 实现、用户提交证据、构建来源和最终错误传播。错误传播审查指出最初 helper-only 测试不足，Host 补成公共 inspect/commit 调用并完成实际旧映射反例。最后一次发布门禁审查的固定产物已验收、checkout 已回收；该只读审查不代替发行运行。
 
 身份错误收尾相对 `6b2b1762` 的实际净量：生产 +40 行、测试 +149 行、文档 +4 行，合计 +193 行；临时 CI 包装的 97 行不进入发行源码。本次追加的验收文档及末尾空行清理另计，不作为运行时收益。
 
@@ -66,4 +66,4 @@ PR 首轮 macOS 的既有 `shutdown_join_retires_socket_after_namespace_gate_con
 
 Windows 用户作用域与身份修复子项生产净增 1455 行、测试净增 1919 行、文档净增 81 行。R06 子项生产净增 4 行、测试净增 236 行、文档净增 61 行；它们是功能与正确性增量，其他已验收的 Python 退役和 inline 移交按各自记录统计。结构化来源、门禁与发布核对见 [evidence](evidence/2026-10-25-090-windows-release-acceptance.json)。
 
-本轮临时 profile、编译产物及已验收 Buddy checkout 均已清理。应用拒绝归档另一个任务拥有的旧 `slimming-batches` worktree，保留其源码和 `socu/076-ci-release-gates` 分支。本验收合入后同步本地、fork 与 upstream，并清理本轮已结束的验证分支；同步不改变已发布包的来源。
+本轮临时 profile、编译产物及已验收的审查检出均已清理。应用拒绝归档另一个任务拥有的旧 `slimming-batches` worktree，保留其源码和 `socu/076-ci-release-gates` 分支。本验收合入后同步本地、fork 与 upstream，并清理本轮已结束的验证分支；同步不改变已发布包的来源。

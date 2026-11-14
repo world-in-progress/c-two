@@ -1,6 +1,5 @@
 # Review Part 1: Optimization Validity & Alignment with sota.md
 
-> Reviewer: Claude Code
 > Date: 2026-03-27
 > Target: `doc/log/relay-qps-optimization.md` (Branch: `autoresearch/python-qps-mar27`)
 > Scope: Phase 1 (Rust relay, 700→9,500 QPS) + Phase 2 (Python ServerV2, 9,500→35,900 QPS)

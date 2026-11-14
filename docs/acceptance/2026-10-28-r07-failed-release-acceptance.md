@@ -1,6 +1,6 @@
 # R07 失败释放与 Prepared 发布界线验收
 
-2026-10-28，R07 按用户批准的[收窄方案](2026-10-28-r07-complete-release-followup.md)（规划提交 `b1ee0e35f830c6a2dfa39ef49318c8f84e5d3c43`）完成并验收关闭。实现经 hey-my-buddy 微任务 `0b9f2da1-03b8-44bf-9b86-dc332bb00c1c` 委派，Worker 依次交付 `f73b5dde`、`af0ae01b`、`c770b18be0263a11362daeb3a69a3326c8955d77`。整合提交 `000985b6417714df80e88fe56c50b1e5445853b8` 由 Host 压平生成：代码与 `c770b18b` 逐字节相同，证据目录按下文精简。本记录及之后的文档提交不作为构建来源；未 bump 版本，未发版。
+2026-10-28，R07 按用户批准的[收窄方案](2026-10-28-r07-complete-release-followup.md)（规划提交 `b1ee0e35f830c6a2dfa39ef49318c8f84e5d3c43`）完成并验收关闭。实现依次交付 `f73b5dde`、`af0ae01b`、`c770b18be0263a11362daeb3a69a3326c8955d77`。整合提交 `000985b6417714df80e88fe56c50b1e5445853b8` 由 Host 压平生成：代码与 `c770b18b` 逐字节相同，证据目录按下文精简。本记录及之后的文档提交不作为构建来源；未 bump 版本，未发版。
 
 ## 改了什么
 
@@ -31,13 +31,13 @@ C/FFI ABI 6、IPC 14、SHM 3、业务帧、CRM hash、owner-control、端点与�
 
 ## 验证
 
-- 审查：Host 读完全部差异；另请一个独立 Opus 子代理只读审查第一版，约 45 万 token、11 条线索，经 Host 复现后采用 5 条（注册表无限重试、pending 锁内重试、拷贝持写锁、测试名实不符与覆盖缺口、过时注释与死代码），其余记为后续或文档。
+- 审查：Host 读完全部差异；另一次独立静态审查在第一版中提出 11 条线索，经 Host 复现后采用 5 条（注册表无限重试、pending 锁内重试、拷贝持写锁、测试名实不符与覆盖缺口、过时注释与死代码），其余记为后续或文档。
 - 定向变异 7 处全部被对应回归抓住：整帧写完后 flush 出错改为本地释放、帧事实改到 flush 之后记录、失效回调改为执行后才标记、未领取回复的真实错误改为继续重试、取消后已发布帧改为本地释放、注册表真实错误改为保留重试、pending 唯一持有者改为交给会重试的 Drop。
 - 本机 macOS 在 `c770b18b` 上，与固定 FastDB `abba785` 并列的检出：Core workspace（含 c2-http/relay）1928 通过、0 失败、5 忽略；Rust SDK 22、Python native 18 通过；Python 普通组 1295 通过，Rust/Python 跨语言与 18 行矩阵 25 通过，矩阵收据 26 通过，Python 3.10 语法 1 通过。普通组另有 3 项只因本机环境未通过：两项 TypeScript 持久 IPC 用例需要预先构建的 Node 依赖；一项 bind 拒绝用例在 `sandbox-exec` 下被剥掉 `DYLD_LIBRARY_PATH`，而本机扩展按 system link 构建。CI 以 source link 构建并准备 Node 依赖，覆盖这三项。
 - 默认命名空间：最终检查前后 `/tmp/c2-v3-<uidhex>` 与 coordination-v3 的条目名一致。首轮 Core 全量曾留下一对 socket 与 lease（c2-ipc 夹具 `capped_ack_peer` 的地址，Drop 时协调锁被同进程其他测试占用，按设计留给之后回收）；它不是本批引入的，按约定未手工清理。
 - CI：首轮 [Source Validation 40690805433](https://github.com/Dsssyc/c-two/actions/runs/40690805433) 跑在第一版代码上（提交 `728967a9`，即 `f73b5dde` 去掉证据目录），六条源码线的 Core、Rust SDK、native、portable 矩阵与 TypeScript 均通过，只有 Python 普通组的 SDK 边界测试失败（junit 1306 项中唯一失败），已在第二轮修复。确切候选见下表。
 - 确切候选：[Source Validation 40711889990](https://github.com/Dsssyc/c-two/actions/runs/40711889990) 跑在整合提交 `000985b6` 上。第 1 次尝试的 Windows 2022 失败在 c2-mem Node 测试为端点上下文用例现编的 Rust 夹具：编译第三方 crate `windows-sys` 时 rustc 以退出码 2 中止，尚未编到 c2 代码；同一用例在首轮 CI 的 Windows 2022 以及本轮其他 Windows 线上都通过。只重跑该任务后通过，第 2 次尝试 10/10 jobs 成功。六条源码线的适用门禁共 147 个全部通过（Windows 2022、2025 与 ARM64 各 27，Linux x64 与 macOS 各 25，Linux 3.14t 16），每条线的 Python 普通组、portable 矩阵与 TypeScript 组都通过。作业日志不逐条打印测试名：Windows 2022 重跑的日志里能直接看到 dedicated 变体的自然触发回归通过；其余新增用例由各线 core-test 步骤整体通过证明，未下载逐线 run-evidence 逐条核对。
-- Windows：Worker 在 `Dsssyc-x86-PC`（x64）上开发了自然触发回归：先用不读取的对端填满管道写缓冲，再发 prepared 帧并关闭对端。buddy 与 dedicated 两条连续 10 轮共 20 次通过，工作目录已删除。这些只是开发证据；验收以 CI 的 Windows 2022、2025 与 ARM64 为准。
+- Windows：Worker 在一台 Windows 11 x64 测试机上开发了自然触发回归：先用不读取的对端填满管道写缓冲，再发 prepared 帧并关闭对端。buddy 与 dedicated 两条连续 10 轮共 20 次通过，工作目录已删除。这些只是开发证据；验收以 CI 的 Windows 2022、2025 与 ARM64 为准。
 
 ## 已知边界
 
@@ -50,6 +50,6 @@ C/FFI ABI 6、IPC 14、SHM 3、业务帧、CRM hash、owner-control、端点与�
 
 ## 证据与清理
 
-仓库内证据目录由 Host 从 Worker 交付的 63 个文件精简为 24 个：红绿回归与修正前后输出、开发中间失败的原始输出、benchmark 补丁与数值、命名空间前后对比、清理记录、检查汇总与第一次 Windows 运行输出。可由 git 推出的 numstat 与逐项 ok 列表不进仓库。Worker 的完整证据保存在 hey-my-buddy 封存产物 `6c5e42c7-6f72-4eb4-807f-2bb3ae4333f4` 中，其累计补丁（基线 `b1ee0e35`，输出 `c770b18b`）SHA-256 为 `c5eed37b8829541fff8e018289760c4bf485f14b2df78c79a29128f7389d0433`。
+仓库内证据目录由 Host 从 Worker 交付的 63 个文件精简为 24 个：红绿回归与修正前后输出、开发中间失败的原始输出、benchmark 补丁与数值、命名空间前后对比、清理记录、检查汇总与第一次 Windows 运行输出。可由 git 推出的 numstat 与逐项 ok 列表不进仓库。完整原始证据保存在仓库之外；累计补丁（基线 `b1ee0e35`，输出 `c770b18b`）SHA-256 为 `c5eed37b8829541fff8e018289760c4bf485f14b2df78c79a29128f7389d0433`。
 
-清理：本机验收检出、Cargo target（约 9.2 GiB 与 2.4 GiB）、CLI target（约 1.2 GiB）、虚拟环境、FastDB 克隆与 Core SDK 均在本记录提交后删除；hey-my-buddy 的 Worker 检出已由 accept 回收，Windows 测试机上的任务目录由 Worker 删除。fork 上本批的两个 CI 分支 `socu/r07-ci-1`（`728967a9`）与 `socu/r07-ci-2`（`000985b6`）按确切 SHA 删除。没有对默认命名空间做 sweep、reap 或手工清理，历史目录未动；本地分支与标签保持。
+清理：本机验收检出、Cargo target（约 9.2 GiB 与 2.4 GiB）、CLI target（约 1.2 GiB）、虚拟环境、FastDB 克隆与 Core SDK 均在本记录提交后删除；实现工作树已回收，Windows 验证目录已删除。fork 上本批的两个 CI 分支 `socu/r07-ci-1`（`728967a9`）与 `socu/r07-ci-2`（`000985b6`）按确切 SHA 删除。没有对默认命名空间做 sweep、reap 或手工清理，历史目录未动；本地分支与标签保持。

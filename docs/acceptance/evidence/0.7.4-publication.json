@@ -879,7 +879,6 @@
   },
   "scoped_branch_worktree_cleanup": {
     "managed_worktree": "archived",
-    "root": "~/.codex/worktrees/c2-0-7-4/c-two",
     "branch": "socu/0.7.4",
     "local_branch_deleted": true,
     "origin_branch_deleted": true,
@@ -887,7 +886,7 @@
     "unrelated_locked_worktrees_untouched": true
   },
   "original_handover_files": {
-    "directory": "<hey-my-buddy>/.claude/worktrees/distracted-swirles-0ea20b/tmp/fd-leak-probe",
+    "directory": "<handover directory>",
     "files": {
       "HANDOVER.md": {
         "sha256": "cefdad63775aa4c5a3b9e6c19da3caade57f8c1dbcf9cfbd6ecaac721a5667a6",
@@ -915,6 +914,7 @@
       }
     }
   },
+  "fd_final_evidence_audit_retained_outside_tree": true,
   "fd_final_evidence_audit_sha256": "e06158f935857e76f1f419bf9a558a9b567bc472eb1786de3ee9ad5fd6888d07",
   "bounds": {
     "rust_sdk": "source-only 0.1.0",
@@ -927,7 +927,7 @@
     "source_sha": "a9111b814fffc6b89684a5c94f90d901659a42b4",
     "removed": [
       {
-        "path": "/tmp/c2-074-astra-probe-target",
+        "path": "<probe-target>",
         "allocated_bytes_before": 1014321152
       },
       {
@@ -971,11 +971,11 @@
         "allocated_bytes_before": 271396864
       },
       {
-        "path": "/tmp/c2-074-astra-baseline-binaries",
+        "path": "<baseline-binaries>",
         "allocated_bytes_before": 14483456
       },
       {
-        "path": "/tmp/c2-074-astra-local-copy",
+        "path": "<validation-copy>",
         "allocated_bytes_before": 438272
       },
       {
@@ -1222,11 +1222,10 @@
     "installed_development_environment_preserved": true,
     "native_import_after_cleanup": "passed",
     "original_handover_unchanged": true,
-    "unrelated_locked_buddy_worktrees_untouched": true,
+    "unrelated_locked_worktrees_untouched": true,
     "retained_records": [
-      "docs/reports/evidence/0.7.4-publication.json",
-      "docs/reports/evidence/0.7.4-fd-leak-regression.json",
-      "docs/reports/evidence/0.7.4-astra-fd-evidence-audit.json"
+      "docs/acceptance/evidence/0.7.4-publication.json",
+      "docs/acceptance/evidence/0.7.4-fd-leak-regression.json"
     ]
   },
   "documentation_followup": {

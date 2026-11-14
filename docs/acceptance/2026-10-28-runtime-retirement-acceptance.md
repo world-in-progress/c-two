@@ -24,7 +24,7 @@ Windows 11 x64 开发机的 Core 6 + 8、池 20 项通过；这部分生产和�
 
 ## 独立审查
 
-Core/IPC 由 hey-my-buddy 的独立 reviewer 检查；首轮的失效 Weak 身份和封池锁期限问题已修正，复审无剩余阻塞。Native/SDK 复审补齐了错误投影重入、raw shutdown 名单锁预算字段、并行 Native 测试隔离，以及两个真实 shutdown observer 的一次换代/hook 交错；最终静态结论无阻塞。CI 两处测试修正另经独立只读审查，确认未放宽断言、未将 callback watchdog 异常混作客户端关闭。审查仅证明静态结论，运行证据由 Host/CI 单独取得；固定 run/artifact 标识在证据 JSON 中。
+Core/IPC 经过独立审查；首轮的失效 Weak 身份和封池锁期限问题已修正，复审无剩余阻塞。Native/SDK 复审补齐了错误投影重入、raw shutdown 名单锁预算字段、并行 Native 测试隔离，以及两个真实 shutdown observer 的一次换代/hook 交错；最终静态结论无阻塞。CI 两处测试修正另经独立只读审查，确认未放宽断言、未将 callback watchdog 异常混作客户端关闭。审查仅证明静态结论，运行证据由 Host 和 CI 单独取得。
 
 ## 实际增量与开销
 
@@ -42,4 +42,4 @@ Core/IPC 由 hey-my-buddy 的独立 reviewer 检查；首轮的失效 Weak 身�
 
 ## 清理与后续范围
 
-已完成的本机首轮 target/env、基线目录及 Windows 源码/env/CMake/target 已清理，日志和回执保留；CI 测试修正的本机补验 target/env 和临时 CoreSDK 也已清理。历史命名空间、本地分支和标签、hey-my-buddy 源码保持原状；两条专用 fork CI 分支已删除，7 份本批 buddy checkout 均已回收，日志和固定产物引用保留。R07 最终 Drop、旧配置/启动错误的回调重入、私有 reset/atexit 和 standalone Bridge 的任意并发重绑仍保持单列。
+已完成的本机首轮 target/env、基线目录及 Windows 源码/env/CMake/target 已清理，日志和回执保留；CI 测试修正的本机补验 target/env 和临时 CoreSDK 也已清理。历史命名空间、本地分支和标签保持原状；两条专用 fork CI 分支已删除，本批 7 个工作树均已回收，日志和回执保留。R07 最终 Drop、旧配置/启动错误的回调重入、私有 reset/atexit 和 standalone Bridge 的任意并发重绑仍保持单列。

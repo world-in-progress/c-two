@@ -34,7 +34,7 @@ PyPI 的受保护环境审批绑定已核对的来源、清单及此前用户的
 
 前一轮 CI 39931323867 的 Linux/macOS/3.14t 通过，三个 Windows 作业的 pytest ordinary 均退出 0，但 strict audit 拒绝新增 Unix wrapper 的未登记 skip。候选把两个平台 wrapper 合并为已含平台分支的一个真实测试，保留全部错误/关闭/清理断言，删除退役 skip 许可项，净减 11 行。没有放宽断言、跳过测试或靠重跑掩盖失败。
 
-hey-my-buddy 0.51.1 的固定产物独立审查已接受：完整实现复核修正 transport_phase 类型说明、服务端 side 和真实边界覆盖；最终测试入口再做两文件只读复核。审查与执行验证分别记录；只读审查未代替本机、开发机或 CI 测试。
+固定产物独立审查已接受：完整实现复核修正 transport_phase 类型说明、服务端 side 和真实边界覆盖；最终测试入口再做两文件只读复核。审查与执行验证分别记录；只读审查未代替本机、开发机或 CI 测试。
 
 ## 实际增量
 
@@ -54,7 +54,7 @@ hey-my-buddy 0.51.1 的固定产物独立审查已接受：完整实现复核修
 
 在源码目录外的全新 Python 3.13.3 环境，从官方 PyPI 只安装二进制 wheel，确认包来自该环境、版本为 0.8.2、未加载 FastDB/NumPy/PyArrow。一个消费者观察三个真实服务的 opened；杀死对端与正常关闭均得到 peer_eof，本地 shutdown 得到 local_close，事件与 snapshot 一致；逻辑代理 close 未伪装成物理关闭。公开 CoreError 捕获、完整字段、copy/pickle、旧接口缺失及 socket/lease 零残留均通过。
 
-日志、摘要和收据保留，已验收的 Buddy checkout 已回收。当前任务的 Cargo target、临时源码归档、输入包、native 扩展及临时 wheel 安装环境已分批清理；最后一次本机清理另移除 45,066,538 字节。原有 Python 开发依赖保留，native 扩展下次使用须重新构建。旧 `slimming-batches` worktree 被应用确认属于另一任务，归档被拒绝，故保留其源码与 `socu/076-ci-release-gates` 分支。本轮已完成的 R16、ShmBuffer、0.8.2 验证分支已清理。历史 IPC 目录不清理、不迁移，只处理本次精确识别的端点。
+日志、摘要和收据保留，已验收的审查检出已回收。当前任务的 Cargo target、临时源码归档、输入包、native 扩展及临时 wheel 安装环境已分批清理；最后一次本机清理另移除 45,066,538 字节。原有 Python 开发依赖保留，native 扩展下次使用须重新构建。旧 `slimming-batches` worktree 被应用确认属于另一任务，归档被拒绝，故保留其源码与 `socu/076-ci-release-gates` 分支。本轮已完成的 R16、ShmBuffer、0.8.2 验证分支已清理。历史 IPC 目录不清理、不迁移，只处理本次精确识别的端点。
 
 用户随后要求紧急释放磁盘空间：确认无活动编译或打开文件后，删除 9 个闲置 Cargo target，按磁盘占用计 2,006,691,840 字节（1.87 GiB），包括旧验证、临时目录及 uv 缓存中的派生产物。源码、Rust 工具链、日志及历史 IPC 记录保留；当时可用空间由约 7.6 GiB 回升到 9.7 GiB。该额外清理与当前实现增量分开记录。
 

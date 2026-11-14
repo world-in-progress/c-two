@@ -186,15 +186,11 @@
   "hash_policy": "Range-downloaded text verified by ZIP CRC and run-evidence SHA-256. Recorded GitHub archive digests are not independently recomputed.",
   "reviews": [
     {
-      "run": "39c3e032-69a2-4843-9016-eae5637ed70a",
       "input": "caa68ca0f391271ca1af8d9497a3a6b0a9688359",
-      "artifact": "10107c3c-7b6a-41ce-80a4-e3d5df25bd00",
       "result": "no blockers, Python annotation nit fixed"
     },
     {
-      "run": "19d62c69-a153-474e-8d99-d5945951e031",
       "input": "26efd744b55ec31f16716a9ca39d9db0f772e916",
-      "artifact": "ecebd83e-1902-4d07-931d-c98254176799",
       "result": "no blockers"
     }
   ],
@@ -212,7 +208,7 @@
     "ci_branch": "socu/r17a-slot-io-ci",
     "ci_branch_deleted_with_expected_sha": "f64afd9ed9aaa96ea7db72e0d3f7e1ca2650844a"
   },
-  "evidence_root": "~/.codex/diagnostics/c2-r17a-implementation-j4rx68ra/",
+  "raw_evidence_retained_outside_repo": true,
   "evidence_hashes": [
     {
       "path": "native-results.json",

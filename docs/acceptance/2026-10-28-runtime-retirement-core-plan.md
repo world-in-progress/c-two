@@ -1,6 +1,6 @@
 # Runtime 退役：迟到连接与 Core 收尾方案
 
-状态：基线反例已完成；按 Opus 5.5 high 两轮复审的 B1–B5、R1–R3 收束，已完成复审，最后文字条件由 Host 落实，用户已确认并完成实施；最终 `f747a7c9` 的三端 Actions 10/10、147/147 适用门禁、零残留、性能和独立审查通过，见[验收记录](2026-10-28-runtime-retirement-acceptance.md)。本文接替上一稿的迟到连接阻塞；完整换代与 hook 顺序一并列明，不批准后再补所有权。
+状态：基线反例已完成；按两轮独立复审的 B1–B5、R1–R3 收束，已完成复审，最后文字条件由 Host 落实，用户已确认并完成实施；最终 `f747a7c9` 的三端 Actions 10/10、147/147 适用门禁、零残留、性能和独立审查通过，见[验收记录](2026-10-28-runtime-retirement-acceptance.md)。本文接替上一稿的迟到连接阻塞；完整换代与 hook 顺序一并列明，不批准后再补所有权。
 
 ## 实证与不变量
 
@@ -80,7 +80,7 @@ Native 仅投影 begin + observe。begin 返回本次观察的原生 deadline �
 
 确认后先保留并跑红当前四项反例，再追加“Preparing 跨 seal、错误已返回但原 owner 未释放、zero/pending 重复观察同一 receipt、同地址新旧 incarnation、worker 创建失败、并发 shutdown、failed-start receipt 保真、hook 重入/换代失败”的既有层级用例。对 record/锁交错使用现有测试 hook，不靠加长 timeout、sleep 赌调度或弱化断言。
 
-完成针对性回归后跑完整 relay、Rust/Python/Node 跨语言、三系统及 GitHub Actions（含 Windows ARM64/3.14t）。Windows 优先开发机；验收包括 retained Held/预算无提前退款、原始 deadline 不重置、正常连接路径没有额外线程/复制，以及 task-owned socket/lease 零残留。性能只测新增 Core/Pool gate 的普通连接开销与关闭期进度，不扩大成全业务 benchmark。历史目录及 hey-my-buddy 仓库不动，验证后删除本批可重建产物，不发版。
+完成针对性回归后跑完整 relay、Rust/Python/Node 跨语言、三系统及 GitHub Actions（含 Windows ARM64/3.14t）。Windows 优先开发机；验收包括 retained Held/预算无提前退款、原始 deadline 不重置、正常连接路径没有额外线程/复制，以及 task-owned socket/lease 零残留。性能只测新增 Core/Pool gate 的普通连接开销与关闭期进度，不扩大成全业务 benchmark。历史目录及下游仓库不动，验证后删除本批可重建产物，不发版。
 
 
 ## 审查后的验收补充

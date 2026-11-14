@@ -75,7 +75,7 @@ Windows 端点约定同时固定 TokenUser 来源、SID 文本和 server_id 编�
 
 以上保留批准时的设计与静态估算；实施后的真实增量、失败处理、性能和完整平台结果以验收记录为准。
 
-独立只读复核使用 hey-my-buddy：Windows 命名与分流 run `874a7ddf-d21e-4fd1-b638-c7e95932a5e2` / artifact `b904c0f1-1c88-4e1f-81c1-ba4962a89415`；方案审查 run `34ee5035-cdb9-4798-95cc-c95824006648` / artifact `0db5d0b7-2e0a-418b-80df-26a4d1f3ca46`。Host 已将 Node 实际 fallback catch、最终 ACK 后开放 heartbeat、固定长度读取、Windows 拒绝发送与等待预算四项要求纳入本方案，并明确未握手 RPC 的接纳围栏。审查没有执行测试，报告已接受，工作树已回收；原始记录保留于 `~/.codex/diagnostics/c2-ipc-version-design-21ir7k2f/`。
+独立只读复核分为 Windows 命名与分流复核和方案审查两份。Host 已将 Node 实际 fallback catch、最终 ACK 后开放 heartbeat、固定长度读取、Windows 拒绝发送与等待预算四项要求纳入本方案，并明确未握手 RPC 的接纳围栏。审查没有执行测试，报告已接受，工作树已回收；原始记录保留在仓库之外。
 
 ## 实施阶段
 
