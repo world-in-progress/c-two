@@ -2182,7 +2182,7 @@ Review before commit:
 **Modify in Toodle only:**
 
 - `docs/11-development-roadmap.md`
-- `docs/13-codex-first-slices.md`
+- The first implementation slices
 - `docs/14-upstream-boundaries.md`
 - `docs/issues/0002-c-two-contract-release-consumption.md`
 - `docs/issues/0003-fastdb-c-two-portable-payload-clean-cut.md`

@@ -103,4 +103,4 @@ The worktree Git index lives outside the allocated checkout
 (`<c-two>/.git/worktrees/checkout5`),
 so no `git add` was attempted for this repair; as instructed, the worktree was
 not touched through the index. This report stays untracked in the delivered
-worktree and the Host integrates it via the sealed patch.
+worktree and the Host integrates the reviewed patch.

@@ -73,7 +73,7 @@ PyPI：https://pypi.org/project/c-two/0.6.0/
 实现及本轮验收已落在 `socu/memory-policy` / [PR #162](https://github.com/world-in-progress/c-two/pull/162)。验证源码为 `abfeaf71deaa9ff4428d0c043ab80e3210746f47`，FastDB 固定 `4f99f86a662b0e950a0dd29800c25a1c9fca4def`；后续文档提交不充当产物源码。
 
 - 统一策略、惰性创建、显式预热、空闲归零与文件 backing 保留已实现，buddy 禁用仍保留其他回退能力。
-- SHM / 文件 / 重组预算贯穿实际所有权；请求取消、held、客户端缓存、关闭及弱 retired 观察经过集成审查。Host 修正了 permit 交接竞争，并由 GPT-6 Sol 收口计数检查与关闭时限问题。
+- SHM / 文件 / 重组预算贯穿实际所有权；请求取消、held、客户端缓存、关闭及弱 retired 观察经过集成审查。Host 修正了 permit 交接竞争，计数检查与关闭时限问题也已收口。
 - 观测及九行基准覆盖小调用、四进程突发、科学计算大消息、强制预算失败；记录延迟、吞吐、backing 高水位与独立 RSS。逐处复制字节归因和改善百分比保留为后续性能测量，不冒充当前证据。
 - Windows 2022 / 2025 各 707 项基础测试、23 项完整门禁、严格 18 / 12 行跨语言收据及九行内存矩阵全部通过。普通与非管理员 wheel 消费、生命周期清理、ZIP / 内部哈希及 c3 字节身份已核验。Linux CI 与候选包构建亦通过。
 

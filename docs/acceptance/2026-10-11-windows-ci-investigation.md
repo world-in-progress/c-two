@@ -25,7 +25,7 @@ Both modified Rust regions are under `cfg(test)`. Production acquisition, close,
 
 Local tests ran on a Windows development host, not the hosted Windows Server 2025 image. Diagnostic processes used the sidecar's owned-process execution and cleanup. The Python environment matching CI used Python 3.12.10 and locked dependencies.
 
-| Verification | Result | Local evidence under `D:/c-two-test/pr181-ci-investigation/` |
+| Verification | Result | Local evidence under `<windows-validation-root>/pr181-ci-investigation/` |
 | --- | --- | --- |
 | New readiness regression before repair | 0 passed, 1 failed as expected | `drain-readiness-red/rust-test/output.log` |
 | c2-ipc library after repair, `cargo test --locked --manifest-path core/Cargo.toml -p c2-ipc --lib` | 203 passed, 0 failed; cleanup confirmed | `drain-library-final/run.json`, `rust-test/output.log` |
@@ -42,4 +42,4 @@ No heap corruption reproduced locally. The code repair addresses the independent
 
 ## Remaining work
 
-Push the local repair to `codex/local-test-sidecar` and inspect the resulting Windows 2025 full run. If heap corruption recurs, retain a native crash dump with its exact source, runner, Python, and native dependency identities. If the drain assertion recurs, inspect probe scheduling relative to the drain deadline before changing production behavior or timeouts.
+Push the local repair to the development branch and inspect the resulting Windows 2025 full run. If heap corruption recurs, retain a native crash dump with its exact source, runner, Python, and native dependency identities. If the drain assertion recurs, inspect probe scheduling relative to the drain deadline before changing production behavior or timeouts.

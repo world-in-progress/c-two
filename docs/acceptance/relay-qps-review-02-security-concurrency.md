@@ -1,6 +1,5 @@
 # Review Part 2: Security & Concurrency Vulnerabilities
 
-> Reviewer: Claude Code
 > Date: 2026-03-27
 > Target: `src/c_two/rpc_v2/server.py`, `src/c_two/rpc_v2/scheduler.py`, `src/c_two/rpc_v2/wire.py`
 > Branch: `autoresearch/python-qps-mar27`

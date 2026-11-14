@@ -1,15 +1,13 @@
-# Runtime 退役完整方案：Opus 5.5 high 复审
+# Runtime 退役完整方案：独立复审
 
 状态：只读复审结束，最终结论为有条件接受；最后的交接规则、hostless 持续收尾及 TransportPhase 条件已由 Host 写入方案。尚无生产实现，待用户确认。接受 review 产物不等于接受或验证生产修复。
 
 ## 输入与证据
 
-- hey-my-buddy skill 0.56.0；用户指定 `claude / anthropic / claude-opus-5-5 / high`。requested、resolved、observed model 回执一致，未修改路由偏好。
-- 宏任务 `macro-d6108004-b1c3-4861-89b5-06b2d786b7c7`；复审微任务 `0ecd7f29-0520-4d9a-84e8-efcfb1add8f1`。
 - 固定只读源码快照 `720ef9ad39d5602ee02974fa510bd96735b297ff`，生产基线 `9e8da3aa` / `e0b5af2d`；快照含 Host 新增基线反例和初稿。
 - 修订稿以完整正文提供给后续重建会话：v4 SHA-256 `357dce88b840acbef938a323470ea8893f91ec30b703f76f8e0aca715cde7d05`，v5 SHA-256 `15797670bf6c4519f9ad258f22f1836e4f205097c434c2d7074f643c4a01ac83`。不把最初工作树中的旧稿误记为后续审查对象。
-- 最终 attempt `b71932ef-3f30-4ba3-982f-20050f13bd26`，artifact `071ba9e0-a99e-40f7-bb0c-16793ca1e86e`。固定输出 commit 等于输入，changedPaths 为空；Host 重算空补丁 SHA-256 为 `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`。
-- Buddy 全程仅作静态审查，无构建或测试。四项真实基线、原生库及反例哈希、预期红灯和实验卫生由 Host 执行并核对，见[基线记录](2026-10-28-runtime-late-connect-baseline.md)。
+- 复审的输出提交与输入一致，未修改文件；Host 重算空补丁 SHA-256 为 `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`。
+- 全程仅作静态审查，无构建或测试。四项真实基线、原生库及反例哈希、预期红灯和实验卫生由 Host 执行并核对，见[基线记录](2026-10-28-runtime-late-connect-baseline.md)。
 
 ## 审查与取舍
 
@@ -27,7 +25,7 @@
 | Host clone 自等 | 先发布结果/通知，再释放 driver 的 Host clone。FailedStart 从 receipt 的 Weak 升级；直接持有 receipt Arc，不依赖可能被裁剪的 map key。 |
 | 不必要扩展 | 不新增 Core current-Host 注册表，不为复用删除 FailedStartShutdownReceipt；新低层入口限定已序列化的明确目标。 |
 
-最后一轮 Opus 明确：R1、R3 已解决，R2 范围收窄没有发现新增无主 owner 的反例；要求补上交接规则、hostless 循环、Weak 目标及 PreDispatch。Host 已落实这些文字条件，未另跑第四轮模型审查。完整方案的实现还需要独立审查与真实回归，不能把本记录当作运行证明。
+最后一轮复审确认：R1、R3 已解决，R2 范围收窄没有发现新增无主 owner 的反例；要求补上交接规则、hostless 循环、Weak 目标及 PreDispatch。Host 已落实这些文字条件，未另跑第四轮独立审查。完整方案的实现还需要独立审查与真实回归，不能把本记录当作运行证明。
 
 ## 基线测试与实施门禁的区别
 

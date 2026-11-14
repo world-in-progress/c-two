@@ -1,6 +1,6 @@
 # Transport memory budget contract
 
-This is the target contract for the approved [memory plan](2026-09-26-memory-policy.md). It incorporates the Buddy design review and Host corrections; it does not claim the implementation already exists. The source baseline is `8777e2dd157942fe6f3cc90389763af35f5056bd`.
+This is the target contract for the approved [memory plan](2026-09-26-memory-policy.md). It incorporates the independent design review and Host corrections; it does not claim the implementation already exists. The source baseline is `8777e2dd157942fe6f3cc90389763af35f5056bd`.
 
 ## Scope and ownership
 
@@ -87,4 +87,4 @@ Expose consistent scope-labelled snapshots through Core/Server and native SDK pr
 
 ## Review provenance
 
-Buddy design goal `64c91424-db52-448e-8b77-e3b018c0d399` first delivered `6ed3e20`, rejected by the Host for unlimited client budgets, process-global config coupling, incorrect static-drop claims and premature accounting release. Corrected source `c54182e` / artifact `ac98f8ba-0473-48cd-9368-9e9ee8fbf79b` was then reviewed. The Host further resolved active-client shutdown, avoided locking RuntimeState during I/O, made reassembly-only scope explicit, removed unproven workload guarantees and nonexistent config-type references, and specified a single guard carrier. This accepted design is not an implementation/test result.
+The first design revision was `6ed3e20`, rejected by the Host for unlimited client budgets, process-global config coupling, incorrect static-drop claims and premature accounting release. The revised source `c54182e` was then reviewed. The Host further resolved active-client shutdown, avoided locking RuntimeState during I/O, made reassembly-only scope explicit, removed unproven workload guarantees and nonexistent config-type references, and specified a single guard carrier. This accepted design is not an implementation/test result.

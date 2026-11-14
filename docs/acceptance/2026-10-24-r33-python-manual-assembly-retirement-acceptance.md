@@ -37,9 +37,9 @@ Windows 开发机检出与确切候选一致，使用 rustc 1.99.1、Python 3.12
 
 ## 独立审查与清理
 
-hey-my-buddy 测试补丁 run `3f0d5489-92c8-42f3-8b87-806e716d26e4`、artifact `8102b5f8-bc03-466d-afa0-76c1d82060d7` 已由 Host 核对、调整上述顺序并实际测试后接受。独立实现审查 run `10cc6170-3e3c-45d4-977a-aba8ed8b4004`、artifact `c32986f7-f160-417e-a2b3-1c8d623e6b87` 绑定确切候选，Standards/Spec 均无 P0–P3 发现；Host 已验收报告并回收两个工作区。独立审查是静态检查，运行结果由 Host 分别核验。
+Worker 交付的测试补丁已由 Host 核对、调整上述顺序并实际测试后接受。独立实现审查绑定确切候选，Standards/Spec 均无 P0–P3 发现；Host 已验收报告并回收两个工作区。独立审查是静态检查，运行结果由 Host 分别核验。
 
-macOS 本批隔离端点及测试临时目录 socket/lease 为 0；Windows 本批 Named Pipe 与所属进程为 0，历史目录未清理或冷切换。本机 Cargo target、target 链接、临时原生扩展、FastDB CoreSDK 和 Go 构建缓存已清理；后续原生测试需重建。Windows 本批 D 盘目录与临时目录已删除，回收 3,063,716,201 个逻辑字节，保留原 Rust 工具链。原始失败/成功日志、源码补丁、哈希和 receipt 留在 `~/.codex/diagnostics/c2-r33-retire-0637wem8/`。
+macOS 本批隔离端点及测试临时目录 socket/lease 为 0；Windows 本批 Named Pipe 与所属进程为 0，历史目录未清理或冷切换。本机 Cargo target、target 链接、临时原生扩展、FastDB CoreSDK 和 Go 构建缓存已清理；后续原生测试需重建。Windows 本批 D 盘目录与临时目录已删除，回收 3,063,716,201 个逻辑字节，保留原 Rust 工具链。原始失败/成功日志、源码补丁、哈希和 receipt 留在仓库之外。
 
 私有准备脚本最初把 FastDB SDK 输出与日志放在同一目录，被现有非空目录检查拒绝；分开目录后准备成功，没有进入或重跑测试。Windows PowerShell 日志按 UTF-16 BOM 解码后完成统计；原字节和哈希保留。Go 模块缓存清理需要先恢复本批目录的 owner 写权限，只处理本批缓存。这些验证/清理接入修正没有改变生产代码或验收条件。
 

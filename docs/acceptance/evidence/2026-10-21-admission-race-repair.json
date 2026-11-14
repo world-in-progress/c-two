@@ -89,10 +89,7 @@
     }
   },
   "review": {
-    "skill_version": "0.50.0",
-    "run_id": "3166d054-f006-40ad-8021-40f0e8bc1780",
     "snapshot": "33552002676a23f82894ad347e70ffd6380fc234",
-    "artifact_id": "87b16c0c-d09b-412d-a9ba-def10eb8d07d",
     "verdict": "accepted; no remaining static blockers"
   },
   "build_artifact": {

@@ -216,7 +216,6 @@
   },
   "schema": "c-two.memory-audit-review-ledger.v1",
   "full_inventory_sha256": "b9ca0b1e8b86b16d9b2aec84895fc7aebd692166038a7f5fd654f8e5794b2140",
-  "full_inventory_artifact": "3090d647-d384-47df-ae2c-bd7e3ff72662",
   "full_inventory_commit": "1495f87790df67f993d3e4bd973d8eef95e38269",
   "changed_old_tests": [
     {

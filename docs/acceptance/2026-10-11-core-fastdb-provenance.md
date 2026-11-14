@@ -10,9 +10,9 @@ All implementation changes are in the development sidecar. No production transpo
 
 ## Windows verification
 
-These checks exercised the uncommitted repair on baseline `efdc684`, with source identities retained in the local reports; documentation was completed after the test runs. The actual FastDB sibling was `D:/c-two-test/fastdb` at `4f99f86a662b0e950a0dd29800c25a1c9fca4def`. Prepare and run both captured 750 source files, empty worktree status and no hidden index flags; their before/after identities matched. C-Two source identities also matched within each run. All final owned-process reports confirmed cleanup.
+These checks exercised the uncommitted repair on baseline `efdc684`, with source identities retained in the local reports; documentation was completed after the test runs. The actual FastDB sibling was `<windows-validation-root>/fastdb` at `4f99f86a662b0e950a0dd29800c25a1c9fca4def`. Prepare and run both captured 750 source files, empty worktree status and no hidden index flags; their before/after identities matched. C-Two source identities also matched within each run. All final owned-process reports confirmed cleanup.
 
-| Check | Result | Evidence under `D:/c-two-test/pr181-core-provenance/` |
+| Check | Result | Evidence under `<windows-validation-root>/pr181-core-provenance/` |
 | --- | --- | --- |
 | Original regression set before implementation | 13 failed, exposing missing source rejection/records | Initial pytest console output |
 | Focused sidecar regressions before adding the hidden-index cases | 70 passed | `focused-3.xml` |
@@ -28,4 +28,4 @@ The regression set covers core/all preflight, preparation rejection, dirty/untra
 
 ## Follow-up
 
-Push the local commit to the existing `codex/local-test-sidecar` PR branch and inspect CI for that exact commit. This report establishes local verification, not hosted CI success. The earlier Windows native heap corruption remains a separate unresolved investigation documented in `2026-10-11-windows-ci-investigation.md`; this source-provenance repair does not claim to fix it.
+Push the local commit to the existing development PR branch and inspect CI for that exact commit. This report establishes local verification, not hosted CI success. The earlier Windows native heap corruption remains a separate unresolved investigation documented in `2026-10-11-windows-ci-investigation.md`; this source-provenance repair does not claim to fix it.

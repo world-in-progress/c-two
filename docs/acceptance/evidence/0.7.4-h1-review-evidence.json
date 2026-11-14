@@ -2,7 +2,6 @@
   "fixture_patch_sha256": "66030c27fe443493a892caba9d7221d768d035879f3edf15c563c1b453961d08",
   "fixed_output_sha": "c539892238c5516fb494e909adfd8aa21b6695a0",
   "fixed_base_sha": "1fab44f7bb3cb1bd41f843a68a4133c917f6b7e9",
-  "artifact_id": "93d97cca-8248-4203-8714-d3d401db6ee0",
   "output_file": {
     "path": "core/transport/c2-http/src/relay/forwarding_tests.rs",
     "sha256": "13b5cd9f941d73d827217c79eb03e5f536b5d29671caf387b2972c6ad2b7b951"
@@ -17,19 +16,19 @@
       "sha256": "a43da4dfa466845e1ed81dec7dc2b7afc03ba063814a439a24a028133b7286cf"
     },
     {
-      "path": "/tmp/c2-074-astra-h1-eager-probe.log",
+      "path": "<review-evidence>/h1-eager-probe.log",
       "sha256": "2d0564b038b34932f9ba56adba746c4e0f13f89af15a2bdbeef486fbe6108b9f"
     },
     {
-      "path": "/tmp/c2-074-astra-h1-public-eager-probe.log",
+      "path": "<review-evidence>/h1-public-eager-probe.log",
       "sha256": "40f0aba98cfa97eb88fcc12fb653047fa4b6920b37f390ed4d72288ec85e7c23"
     },
     {
-      "path": "/tmp/c2-074-astra-h1-core-probe-adaptation.patch",
+      "path": "<review-evidence>/h1-core-probe-adaptation.patch",
       "sha256": "5fd8c70f015021f0df0b15ae7564c6f9d34642c0604398770b26c57821614665"
     },
     {
-      "path": "/tmp/c2-074-astra-h1-public-probe-adaptation.patch",
+      "path": "<review-evidence>/h1-public-probe-adaptation.patch",
       "sha256": "e0352427f5e630eab83e3964234723207738e5fea6f467a1094464d04ad0bcf3"
     },
     {
@@ -76,7 +75,7 @@
     "base_sha": "1fab44f7bb3cb1bd41f843a68a4133c917f6b7e9",
     "path": "core/transport/c2-http/src/relay/forwarding_tests.rs",
     "file_sha256": "6361a7b690ea17fd415852204a6e7c9541d892517bd82f6fcd5251d847710fe8",
-    "patch_path": "/tmp/c2-074-astra-h1-final-reviewed.patch",
+    "patch_path": "<review-evidence>/h1-final-reviewed.patch",
     "patch_sha256": "8a038b3a92f4ca7dcb5f1d823a35901a18bd2ac15a412a5e9d230b5fcdfc74eb",
     "scope": "original fixed output plus Host public eager SDK capacity regression, test-only single file",
     "verified_host_run": "/tmp/c2-074-h1-forwarding-with-eager-host-r5.log",
@@ -86,7 +85,7 @@
   },
   "decision": "Accept the scoped fixture correction with the reviewed public eager SDK capacity regression; final hosted acceptance remains pending. Original Windows reset is retained and not reclassified as an invalid request or proven fully diagnosed incident.",
   "report": {
-    "path": "/tmp/c2-074-astra-h1-review.md",
+    "path": "<review-evidence>/h1-review.md",
     "sha256": "d74995e02f96fae8366354236036257878c1f46a1576391ae8a83a64a5b01d85"
   },
   "final_hosted_pending": {

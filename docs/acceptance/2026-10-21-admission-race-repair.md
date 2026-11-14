@@ -18,9 +18,9 @@
 
 候选让这些测试全部通过。完整并行测试发现新增端点 inspect 夹具使用共享 gate，可能因其他测试持锁返回 WouldBlock；为这些新增夹具选用每测试独立 Unix root，Windows 保留内核端点。零残留断言和期限保持原样。
 
-hey-my-buddy 0.50.0 独立审查发现一个候选回归：普通 A 注销会清退 B 的 provisional scope，导致新精确回滚跳过 B。复用 HTTP final barrier 增加不同名交错测试，先确认候选失败于 `rollback.local_removed`，再限定普通注销的 scope 清退范围。修后测试和完整 Core 回归通过，独立复审没有新的阻塞项。
+独立审查发现一个候选回归：普通 A 注销会清退 B 的 provisional scope，导致新精确回滚跳过 B。复用 HTTP final barrier 增加不同名交错测试，先确认候选失败于 `rollback.local_removed`，再限定普通注销的 scope 清退范围。修后测试和完整 Core 回归通过，独立复审没有新的阻塞项。
 
-审查 run `3166d054-f006-40ad-8021-40f0e8bc1780`；末轮固定源码对象 `33552002676a23f82894ad347e70ffd6380fc234`；artifact `87b16c0c-d09b-412d-a9ba-def10eb8d07d`。Host 核对三份 Rust 文件与末轮输入逐字节相同，末轮输出 patch 为空，并验收该审查。该对象是审查快照，不是分支提交。首轮因 Host 同时调整测试隔离而未完成封存；最终静态审查绑定修正后的固定输入。
+末轮固定源码对象为 `33552002676a23f82894ad347e70ffd6380fc234`。Host 核对三份 Rust 文件与末轮输入逐字节相同，末轮输出 patch 为空，并验收该审查。该对象是审查快照，不是分支提交。首轮因 Host 同时调整测试隔离而未完成；最终静态审查绑定修正后的固定输入。
 
 ## 验证
 
@@ -45,4 +45,4 @@ c3、Python native wheel、Rust owned_child 均由候选构建。FastDB 使用�
 
 验证及复审结束后，删除本次 target、隔离 venv、wheel、CoreSDK 和导出源码中的 native 二进制；保留源码、脚本、日志、hash 和审查收据。隔离协调目录中的 gate/marker 是 namespace 记录，不计作 endpoint 残留，也未删除。
 
-机器结果见[验收证据](evidence/2026-10-21-admission-race-repair.json)。本机详细日志位于 `~/.codex/diagnostics/c2-admission-b-20261021-nzws0ls_`，保留首次失败与最终通过记录。
+机器结果见[验收证据](evidence/2026-10-21-admission-race-repair.json)。本机详细日志保存在仓库之外，保留首次失败与最终通过记录。

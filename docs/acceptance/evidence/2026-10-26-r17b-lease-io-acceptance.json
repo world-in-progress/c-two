@@ -166,20 +166,14 @@
   "hash_policy": "Range-downloaded text verified by ZIP CRC and run-evidence SHA-256. Recorded GitHub archive digests are not independently recomputed.",
   "reviews": [
     {
-      "run": "3df776e0-a78b-4d80-a7d3-a45d179ec9cb",
-      "artifact": "f6b067ad-7ed8-4792-aa16-6af798c31318",
       "input": "41c90f04557deaa76a38035e77e1d25783dffcdd",
       "scope": "call chain and original design"
     },
     {
-      "run": "24d3fd48-f730-4af7-8f14-1e57f8ceee2f",
-      "artifact": "d815b896-c0a6-4c16-bf1c-342e28738e36",
       "input": "26d8504c6302a6b288b2bbdb9f024a642b836246",
       "scope": "implementation and tests, optional Drop coverage identified"
     },
     {
-      "run": "e8e48ec3-bbce-41f8-8ab5-c26b3a574a69",
-      "artifact": "2ecf51af-6fd5-4af7-bac8-2d293fd50ac2",
       "input": "fdc97d0272a9fcfb33d334712b20ab9c5cc8cd10",
       "scope": "Drop coverage and close-error documentation, no new issues"
     }
@@ -201,7 +195,7 @@
       "remote_absent": true
     }
   },
-  "evidence_root": "~/.codex/diagnostics/c2-r17b-implementation-bk8xm7ar/",
+  "raw_evidence_retained_outside_repo": true,
   "evidence_hashes": {
     "native-results.json": "2121e1b46cede83bd940fc868cec132e450a7359b3c81fdbb415ea5c48630f0b",
     "adjacent-results.json": "3a746aea007da035e4e5498193f40b937d23ab0854737922cb011250b05c4585",

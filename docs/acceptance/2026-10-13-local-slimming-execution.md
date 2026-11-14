@@ -27,7 +27,7 @@ R13 随 0.8.0 交付的 SHM prepare/send 子项生产净减 104 行、测试净�
 
 2026-10-26：IPC 版本诊断修缮已单独验收，候选 `968f7d29` 将普通 RPC 握手切换为 14，公开错误保留本端/对端版本；ABI 6、SHM 3、业务帧和独立控制协议保持。生产净增 407、测试净增 1256 行，不计作瘦身收益。完整 relay、Rust/Python/Node、三系统（含 Windows ARM64）、Actions 10/10、端点零残留与独立审查见[验收记录](2026-10-26-ipc14-version-diagnostics-acceptance.md)。未 bump 包版本或发版，构建产物已清理。C04 只读复核没有找到安全且整体净收益明确的替换，继续暂缓。该阶段统计为 17 / 13 / 8 / 1；随后 R07a、R17a 已验收，当前分类以顶部 17 / 15 / 6 / 1 为准。
 
-2026-10-26：R07a 已完成批准范围，实现/测试来源 `b059c02d`、验收记录提交 `dfa03d16`。生产 +134、测试 +427、文档及验收证据 +287 行；非文档净增 561 行，不计瘦身收益。完整 relay、跨语言、三系统及确切候选 Actions 10/10（含 Windows ARM64/3.14t）、端点零残留和独立审查通过，见[验收记录](2026-10-26-r07a-explicit-release-acceptance.md)。R07 为部分完成，Core/Held、consuming、最终 Drop 继续单列；C04、R35 与两份会话重构继续暂缓。构建产物、专用 CI 分支及三份 buddy 工作树已清理，未发版。
+2026-10-26：R07a 已完成批准范围，实现/测试来源 `b059c02d`、验收记录提交 `dfa03d16`。生产 +134、测试 +427、文档及验收证据 +287 行；非文档净增 561 行，不计瘦身收益。完整 relay、跨语言、三系统及确切候选 Actions 10/10（含 Windows ARM64/3.14t）、端点零残留和独立审查通过，见[验收记录](2026-10-26-r07a-explicit-release-acceptance.md)。R07 为部分完成，Core/Held、consuming、最终 Drop 继续单列；C04、R35 与两份会话重构继续暂缓。构建产物、专用 CI 分支及三份工作树已清理，未发版。
 
 2026-10-26：R17a 按单独批准方案完成，生产实现 `9212f3ed`、最终实现/测试来源 `f64afd9e`。生产 +5、测试 +203，非文档净增 208 行，作为正确性修复，不计瘦身收益。基线三项反例、真实三端、完整 relay/跨语言、确切候选 Actions 10/10、端点零残留及独立审查完成，见[验收记录](2026-10-26-r17a-slot-io-acceptance.md)。首轮 Linux 的既有 sweep 夹具竞争经隔离对照后仅调整目录来源，保留全部断言与生产策略。R17 转入部分完成，其他身份验证分类仍待评估；产物及本批 CI 分支清理，未发版。
 
@@ -46,7 +46,7 @@ R13 随 0.8.0 交付的 SHM prepare/send 子项生产净减 104 行、测试净�
 - c2-local `final_lease_stat_io_releases_close_and_drop_leases` 的低频失败根因在测试：探测 lease 的普通 `File` 被并行测试 fork 出的子进程继承，测试只关掉自己那份描述符，flock 留在子进程里，reap 因此报 `Busy`。改用产品现有 `Lease` 显式解锁，并补一条留住复制描述符的确定性回归；默认命名空间里靠 Drop 关闭监听的测试夹具改为临时 root 加显式 `close()` 并断言结果。产品 Drop 不阻塞的设计不变，同地址重绑与预算内 sweep 都会经身份校验回收这类过期条目。实现 `f04cf89e`，仅测试与证据。
 - 生成的 Rust、Python 与 TypeScript 客户端及 TypeScript 传输资产不再静默丢弃解码或 spec 哈希失败后的清理错误：主错误照常返回，清理失败输出警告。Rust 生成代码共用隐藏接缝 `c_two::generated::release_held_after_error`。实现 `d7a74d9a`。
 - SDK 边界测试只检查进入发布扩展的依赖表（含目标专属表与改名依赖），开发依赖不受限；PyO3 层"释放失败时保留 tracking、重试成功或最终放弃后才归还"的真实分配测试恢复。实现 `4b56f16b`，仅测试与开发依赖。
-- 公开文档中的本机主目录与工作目录路径改为占位符（`ae7dde22`）；四个被其他 0.7.4 证据按 SHA-256 钉住的验证文件不再随仓库保留，引用改为指向提交 `8936c5c9` 中未改动的原文件（`ca2da90f`）。发版 PR 之前，R07 Windows 运行输出里测试账户的主目录同样改为 `~`；原路径仍留在 `000985b6` 起的提交历史中。
+- 公开文档中的本机主目录与工作目录路径改为占位符（`ae7dde22`）；四个被其他 0.7.4 证据按 SHA-256 钉住的验证文件不再随仓库保留，原文件的 SHA-256 保留在验收记录中（`ca2da90f`）。发版 PR 之前，R07 Windows 运行输出里测试账户的主目录同样改为 `~`；原路径仍留在 `000985b6` 起的提交历史中。
 
 每项均经 Host 读差异、定向变异与受影响测试验收；并入后的 [Actions 40736828028](https://github.com/Dsssyc/c-two/actions/runs/40736828028) 首次运行 10/10 jobs 通过（候选 `4b56f16b`）。
 
@@ -56,30 +56,30 @@ R13 随 0.8.0 交付的 SHM prepare/send 子项生产净减 104 行、测试净�
 
 上游 Dependabot：[PR #200](https://github.com/world-in-progress/c-two/pull/200)（`/core` 的 rust-minor-and-patch 分组 4 项升级，只改 `core/Cargo.lock`，上游 CI 10 项全过）已按以往分组升级的方式以合并提交 `cff5b491` 并入上游 main；集成分支没有改动 `core/Cargo.lock`，之后合并 main 不会冲突。[PR #201](https://github.com/world-in-progress/c-two/pull/201)（`parking_lot` 0.12.5 → 0.13.0）不能原样合并：它只升级了 `/core`，`cli`、`sdk/rust` 与 `sdk/python/native` 仍用 0.12，依赖图里两个版本的 `Mutex` 类型不兼容而编译失败，那两个工作区的 lockfile 也没有更新，带 `--locked` 的构建因此拒绝；上游六条源码线全部失败。
 
-2026-10-29：hey-my-buddy 更新后补做的两项发版前待办已完成，并按用户确定的版本号准备好 C-Two 0.10.0 / c3 0.6.0 发版候选。
+2026-10-29：补做的两项发版前待办已完成，并按用户确定的版本号准备好 C-Two 0.10.0 / c3 0.6.0 发版候选。
 
 - 依赖与安全（`b995c567`，取代上游 [PR #201](https://github.com/world-in-progress/c-two/pull/201)）：四个 Rust 工作区一起升到 `parking_lot` 0.13。`c2-http` 的 tokio 由 `full` 改为实际用到的 6 个特性，`full` 带入的 tokio `parking_lot` 特性曾使依赖图里出现两份 parking_lot，现在只剩一份。0.13 要求 Rust 1.95，面向用户的 Rust 包都声明 `rust-version = "1.95"`，四份依赖图里声明的最高 rust-version 也正是 1.95。四份 Cargo.lock 的 rustls 升到 0.23.46，`uv.lock` 的 msgpack 升到 1.2.3，修复上游 Dependabot 告警；`parking_lot_core` 0.10 强制要求的 smallvec、redox_syscall、libc 取最低版本，其余依赖不变。0.13 去掉了自动的最终公平性，Host 审计生产代码全部 96 个 loop/while：62 个每轮阻塞等待，其余 34 个都有界，没有依赖该公平性的忙等或紧循环。R07 的 `pending_request_error_does_not_retry_free_under_pending_lock` 只做一次非阻塞 settle，与其他测试共用的 retire executor 锁被占时按设计推迟，因此偶发失败；改为 1 秒内重试，Host 用占锁变异复现了原写法失败、新写法通过，回归变异仍被捕获。Host 在 Rust 1.99、带 FastDB 同级检出的环境中验收：Core 全量（含 c2-codegen）1929、Rust SDK 23、cli 76、native 19、Python 普通组 1274、跨语言矩阵 25 项通过；普通组另 3 项为与 R07 相同的本机环境限制。
-- CI 提速（`eee0fe57`）：ARM64 线每轮约 20 分钟花在从源码编译 Arrow C++ 和 PyArrow 上（pyarrow 24 没有 Windows ARM64 wheel），而 C-Two 只有网格示例用 pyarrow。先试的精确键缓存方案（微任务 `cf917f09`）机制正确，但一次独立审查指出缓存键混入 PATH、镜像版本、Python 与构建工具哈希等常变输入，运行时检查多与工具保证重复，Host 核对后决定精简；返工途中用户决定直接去掉 pyarrow，该微任务取消、结束不验收。网格示例删除没有调用方的 Arrow 文件持久化和从未赋值 Redis 客户端的早期读取方法，`dev`、`examples` 组不再安装 pyarrow，CI 删除 Arrow 检出与构建。Actions [40817116138](https://github.com/Dsssyc/c-two/actions/runs/40817116138)（缓存全冷、仍构建 Arrow）ARM64 线 54 分钟，其中 Arrow 17.2 分钟；最终候选的 [40824590087](https://github.com/Dsssyc/c-two/actions/runs/40824590087) 为 18.9 分钟。稳定节省约 19 分钟：Arrow 构建，以及 `python-build` 从约 150 秒降到 18 秒；其余差额来自同一分支上已热的 Cargo、emsdk 与 FastDB WASM 缓存，冷缓存下的 ARM64 线估计约 35 分钟，未实测。构建并行度：现有两槽各 2 个 job 已占满 4 核，是否值得改为共享 job 池，要先测单独构建的时长，尚未测量。Windows 2022 的偶发夹具编译失败本轮未出现，仍留观察。
+- CI 提速（`eee0fe57`）：ARM64 线每轮约 20 分钟花在从源码编译 Arrow C++ 和 PyArrow 上（pyarrow 24 没有 Windows ARM64 wheel），而 C-Two 只有网格示例用 pyarrow。先试的精确键缓存方案机制正确，但一次独立审查指出缓存键混入 PATH、镜像版本、Python 与构建工具哈希等常变输入，运行时检查多与工具保证重复，Host 核对后决定精简；返工途中用户决定直接去掉 pyarrow，该方案取消、结束不验收。网格示例删除没有调用方的 Arrow 文件持久化和从未赋值 Redis 客户端的早期读取方法，`dev`、`examples` 组不再安装 pyarrow，CI 删除 Arrow 检出与构建。Actions [40817116138](https://github.com/Dsssyc/c-two/actions/runs/40817116138)（缓存全冷、仍构建 Arrow）ARM64 线 54 分钟，其中 Arrow 17.2 分钟；最终候选的 [40824590087](https://github.com/Dsssyc/c-two/actions/runs/40824590087) 为 18.9 分钟。稳定节省约 19 分钟：Arrow 构建，以及 `python-build` 从约 150 秒降到 18 秒；其余差额来自同一分支上已热的 Cargo、emsdk 与 FastDB WASM 缓存，冷缓存下的 ARM64 线估计约 35 分钟，未实测。构建并行度：现有两槽各 2 个 job 已占满 4 核，是否值得改为共享 job 池，要先测单独构建的时长，尚未测量。Windows 2022 的偶发夹具编译失败本轮未出现，仍留观察。
 - 发版准备（`6facfc2e`）：C-Two 0.10.0、c3 0.6.0，两份 lockfile 各只改版本号一行。`docs/releases/0.10.0.md` 汇总自 0.9.0 以来的变更，补入 `unreleased.md` 漏收的 R15 与 R17c；CHANGELOG 增加 0.10.0 条目，`unreleased.md` 指向候选说明。中英文 README、SDK 与 c3 README 和 23 份现行文档切到新版本，补齐中文 README 缺的两句，构建前提写明 Rust 1.95；历史目录未改。
-- 取消的 Arrow 缓存微任务检出含未封存的半成品，hey-my-buddy 拦下了回收，留给用户在控制台清理。
+- 取消的 Arrow 缓存方案的检出含未完成的修改，没有自动删除，留给用户清理。
 
 2026-10-29：经用户授权开始发版，途中暂停，没有上传任何文件。main 首轮 Source Validation（[40857187478](https://github.com/world-in-progress/c-two/actions/runs/40857187478)）有两处已发布版本里就有的测试失败，只重跑失败的 job 后通过；第一次 Release Candidate（[40870564100](https://github.com/world-in-progress/c-two/actions/runs/40870564100)）绑定了这次重跑过的运行，CLI 与 Python 晋升预演都因同一条线有两份完整产物而拒绝。随后在同一来源上重新发起的完整资格验证（[40874415766](https://github.com/world-in-progress/c-two/actions/runs/40874415766)）首轮 10/10 通过，两处测试失败没有再出现。此时 FastDB 发现内存泄漏、将发布 0.2.4。C-Two 在 Python extra（`fastdb4py==0.2.3`）、`c_two._native` 与 c3 静态链接的 FastDB Core（`fastdb-sys` rev `abba785`，只经 c2-codegen 使用）以及 Rust SDK（`fastdb = "=0.2.3"`）三处精确锁定，用户无法自行升级，因此用户决定等 0.2.4 发布后让 0.10.0 依赖它再发。上游 Dependabot [PR #201](https://github.com/world-in-progress/c-two/pull/201) 已关闭，留言指向取代它的 #202。
 
-等待 0.2.4 期间，经用户同意先修掉这次暴露的三处问题，均由路由派出的微任务实现、Host 验收，并入 `socu/0100-release-fixes`：
+等待 0.2.4 期间，经用户同意先修掉这次暴露的三处问题，均由 Worker 实现、Host 验收，并入 `socu/0100-release-fixes`：
 
 - 发布工具（`60059bb3`）：候选构建入口 `find_full_source_validation_run` 原先只读运行与 job 元数据，接受了重跑后成功的运行；晋升核验 `verify_source_validation` 要求每条线恰好一份完整产物，拒绝同一运行。现在两处共用 `require_full_source_artifacts`，入口只列产物元数据，跳过重复产物的运行，并在没有合格运行时说明要重新发起完整运行而不是重跑；两处测试夹具不再给同一运行重复登记产物。Host 运行发布工具测试 496 项通过；去掉入口检查的变异使 10 个新测试与元数据测试失败。顺带项留给下一批：入口报错沿用了“rc-context.json 绑定的运行”的措辞，产物为 0 份时也被说成重跑造成。
 - `c2-codegen` 的 `generated_call_options_consumer`（`f1c6a97e`）：zero-bytes 一段在有期限调用返回后立即断言 `used_operations` 为 0，而 Core 按设计在唤醒调用方之后才归还 permit。现在与 views 一段共用有界等待，零槽位与零期限两段保留立即断言，生产代码不改。Host 用官方 FastDB 0.2.3 CoreSDK 验证：在 `guard.finish(result)` 之后临时插入 50 ms 暂停，原测试在 `main.rs:103` 读到 2 个未归还的 permit 而失败，与 CI 的失败位置相同；修复后的测试加不加暂停都通过。
 - `test_install_c3_powershell.py::test_powershell_selects_native_os_target`（`b0331f6f`、`6ff74cb7`）：失败的是 SysWOW64 参数，即在 ARM64 上模拟运行的 x86 Windows PowerShell（失败那次超时前完成 63 项，按同一来源的收集顺序，第 64 项正是它）。原先子进程限时与 pytest 单项限时都是 30 秒，pytest 先触发，子进程自己的报错出不来。`b0331f6f` 只给 SysWOW64 放宽到 120 秒；随后 fork 上对 `53881d45` 的完整 CI（[40900123908](https://github.com/Dsssyc/c-two/actions/runs/40900123908)）里，ARM64 上三个宿主都比 [40874415766](https://github.com/world-in-progress/c-two/actions/runs/40874415766) 慢约 4 倍（pwsh 4.5→20.1 秒、System32 2.6→9.4 秒、SysWOW64 12.3→49.9 秒），“只有模拟宿主慢”的前提不成立。`6ff74cb7` 改为三个宿主共用一个只防挂死的限时：子进程 180 秒，函数级 pytest-timeout 标记 210 秒，让子进程限时先触发，挂死时报出带命令的超时，而不是中止整个测试会话；慢的那次 ARM64 共享验证步骤用了 50 分钟预算中的 30.6 分钟，三个宿主都挂死也放得下。Host 在 macOS 上复跑（14 passed、3 skipped），并确认三个参数经 pytest-timeout 算出的有效限时都是 210 秒，覆盖命令行的 `--timeout=30`。对 `6ff74cb7` 的完整 CI（[40913057564](https://github.com/Dsssyc/c-two/actions/runs/40913057564)）首轮 10/10 通过，每条线一份完整产物，ARM64 上 pwsh 4.8 秒、System32 2.3 秒、SysWOW64 12.0 秒，共享验证步骤 14.1 分钟。两次 fork CI 里 `generated_call_options_consumer` 在各条线都通过（它是间歇失败，通过不算证明，机制由上面的暂停实验确认）。慢的那次里，跳过 `Add-Type` 的 pwsh 测试只用 0.7–0.9 秒，说明 pwsh 那 20 秒大多花在安装脚本每次在 Windows 上编译 P/Invoke 的 `Add-Type` 上（Windows PowerShell 5.1 没有同次对照，未量），Windows ARM64 用户安装时同样要等；2026-10-30 用户决定安装脚本暂不改。
 
-2026-10-30：FastDB 0.2.4 发布后完成升级（`1b4a9701`），由路由派出的微任务实现、Host 验收，发版前待办至此清空。FastDB 的 tag `v0.2.4` 指向 `f82fa13adeae2b87a295bf984821c85c44b55a3d`；PyPI 上的 35 个 wheel 与 sdist、crates.io 上的 `fastdb` 与 `fastdb-sys`、GitHub release 上的四个 Core SDK 包齐备，Host 下载核对了 release manifest（SHA-256 `8a07ab93409811bb5e11418876ba082594758c2b3b87a766699c447586a9c5bf`，其中记录的源码与 tag 一致）。相对 0.2.3，0.2.4 只改 FastDB 自身数据库、数值列缓存与映射存储的内存释放，portable payload 的 117 个符号 ABI 不变，Rust 与 TypeScript 包只改版本号，因此 C-Two 这边是机械替换：Python extra、两处 Rust 精确锁定、CLI 与原生扩展静态链接的 `fastdb-sys` 源码 rev、`prepare_fastdb_sdk.py` 的 manifest 固定值、CI 与发布工具常量、生成的消费者、测试夹具与现行文档一起改到 0.2.4，历史记录不动。五份 lockfile 只变 FastDB 条目；Worker 的环境写不了 Cargo 的 Git 缓存，CLI 与原生扩展两份由 Host 用同样的 `cargo update -p fastdb -p fastdb-sys` 生成。顺带改掉上一批留下的发布工具措辞：产物份数不对时，报错不再提 rc-context.json，0 份说缺失或过期，多于 1 份才归因于重跑。
+2026-10-30：FastDB 0.2.4 发布后完成升级（`1b4a9701`），由 Worker 实现、Host 验收，发版前待办至此清空。FastDB 的 tag `v0.2.4` 指向 `f82fa13adeae2b87a295bf984821c85c44b55a3d`；PyPI 上的 35 个 wheel 与 sdist、crates.io 上的 `fastdb` 与 `fastdb-sys`、GitHub release 上的四个 Core SDK 包齐备，Host 下载核对了 release manifest（SHA-256 `8a07ab93409811bb5e11418876ba082594758c2b3b87a766699c447586a9c5bf`，其中记录的源码与 tag 一致）。相对 0.2.3，0.2.4 只改 FastDB 自身数据库、数值列缓存与映射存储的内存释放，portable payload 的 117 个符号 ABI 不变，Rust 与 TypeScript 包只改版本号，因此 C-Two 这边是机械替换：Python extra、两处 Rust 精确锁定、CLI 与原生扩展静态链接的 `fastdb-sys` 源码 rev、`prepare_fastdb_sdk.py` 的 manifest 固定值、CI 与发布工具常量、生成的消费者、测试夹具与现行文档一起改到 0.2.4，历史记录不动。五份 lockfile 只变 FastDB 条目；Worker 的环境写不了 Cargo 的 Git 缓存，CLI 与原生扩展两份由 Host 用同样的 `cargo update -p fastdb -p fastdb-sys` 生成。顺带改掉上一批留下的发布工具措辞：产物份数不对时，报错不再提 rc-context.json，0 份说缺失或过期，多于 1 份才归因于重跑。
 
 Host 在 macOS ARM64 上核对：uv.lock 的 36 个 FastDB 文件与 PyPI 的哈希和大小逐一相符，Cargo.lock 的校验和与 crates.io 一致，四个 Rust workspace 的 `cargo metadata --locked` 与 `uv lock --check` 通过；更新后的 `prepare_fastdb_sdk.py` 实际下载并校验了 0.2.4 Core SDK。发布工具测试 640 项通过（另 1 项只在 Windows 上运行）。用 0.2.4 Core SDK 跑 c2-codegen 34 项（含生成的 Rust 与 TypeScript 消费者）与 Rust SDK 23 项；c3 与 Python 原生扩展以源码模式从 `f82fa13` 的检出构建并静态链接，原生测试 19 项通过；Python 普通组 1318 项、Rust/Python portable 矩阵与跨语言 25 项、矩阵收据 26 项通过。普通组的 3 项 owner 生命周期用例先因本机 venv 路径过长、入口脚本经 `/bin/sh` 启动而丢失 `DYLD_LIBRARY_PATH`，直接用解释器重跑后 6 项通过。本机没有构建 FastDB 与 c2-mem 的 TypeScript 包，依赖它们的 Node 用例留给 CI。fork 上对 `1b4a9701` 的完整 CI（[41002689847](https://github.com/Dsssyc/c-two/actions/runs/41002689847)）首轮 10/10 通过，每条线一份完整产物；六条源码线都准备了各自平台的 0.2.4 Core SDK（四个平台包都用到），并安装 `fastdb4py==0.2.4`。
 
-同日经用户授权完成发版：发布前核对文档，补上 0.10.0 发行说明的验证一节、c3 README 的端点目录链接和生命周期指南的 owner 版本说法（`cceecc65`）。PR #203 首轮 10/10 通过后以合并提交合入（`4b1d9161`，内容树与 `cceecc65` 相同）；main 首轮完整资格验证 10/10、每条线一份完整产物，Release Candidate 38 job 成功、1 个既定跳过，两次预演与两次正式发布都一次通过，PyPI 环境按用户授权批准。PyPI 的 36 个文件与 GitHub 的 17 个附件逐一与预演清单相符，发布后从公开渠道安装冒烟通过。发版后 fork 与上游只保留 `main`，本轮工作树、Codex 时期的旧 worktree 与构建产物均已清理；运行编号、摘要与清理范围见[发布验收](2026-10-30-0100-release-acceptance.md)。
+同日经用户授权完成发版：发布前核对文档，补上 0.10.0 发行说明的验证一节、c3 README 的端点目录链接和生命周期指南的 owner 版本说法（`cceecc65`）。PR #203 首轮 10/10 通过后以合并提交合入（`4b1d9161`，内容树与 `cceecc65` 相同）；main 首轮完整资格验证 10/10、每条线一份完整产物，Release Candidate 38 job 成功、1 个既定跳过，两次预演与两次正式发布都一次通过，PyPI 环境按用户授权批准。PyPI 的 36 个文件与 GitHub 的 17 个附件逐一与预演清单相符，发布后从公开渠道安装冒烟通过。发版后 fork 与上游只保留 `main`，本轮工作树、早期的旧 worktree 与构建产物均已清理；运行编号、摘要与清理范围见[发布验收](2026-10-30-0100-release-acceptance.md)。
 
-发版后（2026-10-30）：用户转来的报告，标准输出不是 UTF-8 时 `cc.serve()` 打印启动横幅会抛 `UnicodeEncodeError`，服务以 1 退出，0.9.0 与 0.10.0 都有。横幅用了框线 `─` 与项目符号 `•`，关停提示用了 `…`，都经 `print()` 写到标准输出；Windows 上输出接管道或文件时用系统 ANSI 代码页（cp1252、GBK 等），POSIX 上在非 UTF-8 locale 下都会撞上。关停提示在 `shutdown()` 之前，它抛错时连正常关停都被跳过。CI 与各个测试入口都全局设了 `PYTHONUTF8=1`，所以一直没测出来。Host 在 macOS 上用 `PYTHONIOENCODING` 复现：cp1252 崩在第一行框线，GBK 崩在项目符号。修复（`51cb141e`）由路由派出的微任务实现、Host 验收：固定文字只用 ASCII，三处人读的输出都经同一个私有函数，按标准输出自己的编码以 `backslashreplace` 写出并 flush，编码不了的路由名显示成 `\uXXXX` 转义，接管道时横幅立即可见。新测试在原代码上 5 项失败（单元测试的 cp1252、GBK、ASCII，子进程的 cp1252、GBK），修复后 serve 单元与集成测试 16 项通过；子进程测试去掉 `PYTHONUTF8`，Windows 上另跑系统默认代码页。用到 `cc.serve()` 的 frozen-peer 关停 4 项、owner 生命周期与子进程 7 项、单元测试全集与调度配置 984 项通过。顺带项留给下一批：私有函数里 `sys.stdout is None` 的提前返回与 `print()` 本来的无操作行为重复。用户随即授权发 0.10.1；发版 PR [#206](https://github.com/world-in-progress/c-two/pull/206) 首轮 CI（[41033002408](https://github.com/world-in-progress/c-two/actions/runs/41033002408)）三条 Windows 线通过、新用例在 Windows 默认代码页下真正运行，macOS 与两条 Linux 线失败：Python 套件运行器只接受冻结登记、原因逐字匹配的平台跳过，Windows 默认代码页那一项在 POSIX 上的跳过未登记。原微任务按现有做法把它登记进非 Windows 的平台跳过表，并补上接受与拒绝的运行器测试，其余规则不放宽；Host 复跑仓库测试 941 项通过。首轮失败的运行不重跑，修正后重新跑完整 CI：[41036889359](https://github.com/world-in-progress/c-two/actions/runs/41036889359) 首轮 10/10，PR 以 `028e791d` 合入。
+发版后（2026-10-30）：用户转来的报告，标准输出不是 UTF-8 时 `cc.serve()` 打印启动横幅会抛 `UnicodeEncodeError`，服务以 1 退出，0.9.0 与 0.10.0 都有。横幅用了框线 `─` 与项目符号 `•`，关停提示用了 `…`，都经 `print()` 写到标准输出；Windows 上输出接管道或文件时用系统 ANSI 代码页（cp1252、GBK 等），POSIX 上在非 UTF-8 locale 下都会撞上。关停提示在 `shutdown()` 之前，它抛错时连正常关停都被跳过。CI 与各个测试入口都全局设了 `PYTHONUTF8=1`，所以一直没测出来。Host 在 macOS 上用 `PYTHONIOENCODING` 复现：cp1252 崩在第一行框线，GBK 崩在项目符号。修复（`51cb141e`）由 Worker 实现、Host 验收：固定文字只用 ASCII，三处人读的输出都经同一个私有函数，按标准输出自己的编码以 `backslashreplace` 写出并 flush，编码不了的路由名显示成 `\uXXXX` 转义，接管道时横幅立即可见。新测试在原代码上 5 项失败（单元测试的 cp1252、GBK、ASCII，子进程的 cp1252、GBK），修复后 serve 单元与集成测试 16 项通过；子进程测试去掉 `PYTHONUTF8`，Windows 上另跑系统默认代码页。用到 `cc.serve()` 的 frozen-peer 关停 4 项、owner 生命周期与子进程 7 项、单元测试全集与调度配置 984 项通过。顺带项留给下一批：私有函数里 `sys.stdout is None` 的提前返回与 `print()` 本来的无操作行为重复。用户随即授权发 0.10.1；发版 PR [#206](https://github.com/world-in-progress/c-two/pull/206) 首轮 CI（[41033002408](https://github.com/world-in-progress/c-two/actions/runs/41033002408)）三条 Windows 线通过、新用例在 Windows 默认代码页下真正运行，macOS 与两条 Linux 线失败：Python 套件运行器只接受冻结登记、原因逐字匹配的平台跳过，Windows 默认代码页那一项在 POSIX 上的跳过未登记。原 Worker 按现有做法把它登记进非 Windows 的平台跳过表，并补上接受与拒绝的运行器测试，其余规则不放宽；Host 复跑仓库测试 941 项通过。首轮失败的运行不重跑，修正后重新跑完整 CI：[41036889359](https://github.com/world-in-progress/c-two/actions/runs/41036889359) 首轮 10/10，PR 以 `028e791d` 合入。
 
-0.10.1 的 main 正式资格验证两次都因与改动无关的原因失败：push 触发的 [41039841188](https://github.com/world-in-progress/c-two/actions/runs/41039841188) 在 Windows 2025 上撞上 0.10.0 起就有的偶发失败（`test_runtime_session_lifecycle.py` 第 115 行，第一次 shutdown 完成后，零期限的第二次 shutdown 报 `core_retirement_wait` 超时）；重新发起的 [41044322502](https://github.com/world-in-progress/c-two/actions/runs/41044322502) 在 macOS 上 runner 与 GitHub 失联。用户暂停发版、要求先修这个偶发失败，并另开会话审查发版流程过重的问题。诊断由点名的微任务完成、Host 复现：关停驱动线程在仍持有 RuntimeState 锁时唤醒等待者，普通分支在 return 时先释放 outcome 锁、后释放 RuntimeState 锁，被唤醒的调用方在两次释放之间返回，紧接着的零期限调用拿不到锁；退休分支还在唤醒之后才释放它的 Host 克隆，而 `HostInner::drop` 会再拿这把锁。把旧顺序的空隙拉宽 50 ms，原测试 5/5 失败、错误相同；修复（微任务交付 `685e7174`，在 main 中为 `57d27fc2`）让驱动线程先释放两把锁、退休分支再释放执行器与 Host 克隆、最后唤醒等待者，同样的 50 ms 放在新顺序里 5/5 通过。只改 `drive_shutdown_transaction`（+6/−3 行），不加测试钩子或重试；没有能不加钩子就确定性卡住这个析构间隙的测试，原 Python 测试仍是契约测试。c2-core 测试 274 项、Python 单元测试 974 项通过，出问题的测试文件连续 20 遍无失败。另一个方向（把退休事实移出 RuntimeState 锁）改动面大，且覆盖不到再次发起退休本就需要拿锁的情形，未采用。
+0.10.1 的 main 正式资格验证两次都因与改动无关的原因失败：push 触发的 [41039841188](https://github.com/world-in-progress/c-two/actions/runs/41039841188) 在 Windows 2025 上撞上 0.10.0 起就有的偶发失败（`test_runtime_session_lifecycle.py` 第 115 行，第一次 shutdown 完成后，零期限的第二次 shutdown 报 `core_retirement_wait` 超时）；重新发起的 [41044322502](https://github.com/world-in-progress/c-two/actions/runs/41044322502) 在 macOS 上 runner 与 GitHub 失联。用户暂停发版、要求先修这个偶发失败，并另开会话审查发版流程过重的问题。诊断由 Worker 完成、Host 复现：关停驱动线程在仍持有 RuntimeState 锁时唤醒等待者，普通分支在 return 时先释放 outcome 锁、后释放 RuntimeState 锁，被唤醒的调用方在两次释放之间返回，紧接着的零期限调用拿不到锁；退休分支还在唤醒之后才释放它的 Host 克隆，而 `HostInner::drop` 会再拿这把锁。把旧顺序的空隙拉宽 50 ms，原测试 5/5 失败、错误相同；修复（Worker 交付 `685e7174`，在 main 中为 `57d27fc2`）让驱动线程先释放两把锁、退休分支再释放执行器与 Host 克隆、最后唤醒等待者，同样的 50 ms 放在新顺序里 5/5 通过。只改 `drive_shutdown_transaction`（+6/−3 行），不加测试钩子或重试；没有能不加钩子就确定性卡住这个析构间隙的测试，原 Python 测试仍是契约测试。c2-core 测试 274 项、Python 单元测试 974 项通过，出问题的测试文件连续 20 遍无失败。另一个方向（把退休事实移出 RuntimeState 锁）改动面大，且覆盖不到再次发起退休本就需要拿锁的情形，未采用。
 
 修复经 [PR #207](https://github.com/world-in-progress/c-two/pull/207) 首轮 10/10 后合入（`399286f5`），用户决定等发版流程精简后再发。审查会话量出发版慢的原因，提出的方案 A 经用户批准（见[发版敏捷性审查](../design/2026-10-30-release-agility-review.md)）：发行证据按 Git 内容树绑定，源码线可以单独重跑，候选构建不再等 main 上的完整验证，预演改为环境审批，平台跳过只用一个标记，Windows x64 只留 Server 2025。它新加的 `EncodingWarning` 检查发现 CRM 模板生成与契约导出按平台默认编码读写，一并修掉（`73845204`）。Host 审过差异后开 [PR #208](https://github.com/world-in-progress/c-two/pull/208)，并按 #208 的要求新建 `github-release` 环境，与 `pypi` 一样只允许 `main` 并需要审批。首轮 CI 的 Ubuntu 3.12 线撞上 sccache 读不到缓存后端；两条 Windows 线只有新用例的 cp1252 与 gbk 两个参数失败，测试包装假标准输出时没有指定 `newline`，把换行写成了 CRLF。Host 改正测试（`2036a527`）后首轮 9/9，以 `1a69b78a` 合入。同日按用户授权从 `1a69b78a` 发布 0.10.1：main push 只跑 policy，Release Candidate 合入后立即构建，Python 发布选中 PR #208 对同一内容树的运行作为证据，核对计划后批准 `pypi` 环境；从合入到发布完成 32 分钟，0.10.0 为 65 分钟。PyPI 的 36 个文件与计划逐一相符，冒烟通过；运行编号、核对与清理见[发布验收](2026-10-30-0101-release-acceptance.md)。
 
@@ -101,7 +101,7 @@ Host 在 macOS ARM64 上核对：uv.lock 的 36 个 FastDB 文件与 PyPI 的哈
 
 用户已决定暂不继续 macOS shutdown 测试超时调查；原超时未定位，未实施修复，不计作清单完成项，也不混入下一批瘦身。
 
-本次只读独立复核由 hey-my-buddy run `559a95d0-2ed8-4edc-bea3-9ec69bfb854a`、固定产物 `bd9bd3f9-097b-4eb4-91bc-9f854c0c7946` 完成，源码输入为 `2e9a40d2`，产物无代码改动。Host 复核了 R05/R07/R17/R19/R20 对应调用点、R01 的固定验收记录及本节统计；源码中存在测试不等于本轮执行过测试。
+本次只读独立复核的源码输入为 `2e9a40d2`，产出无代码改动。Host 复核了 R05/R07/R17/R19/R20 对应调用点、R01 的固定验收记录及本节统计；源码中存在测试不等于本轮执行过测试。
 
 ### R13 · SHM 响应准备与发送收敛（2026-10-23，验收及发布完成）
 
@@ -140,7 +140,7 @@ Host 在 macOS ARM64 上核对：uv.lock 的 36 个 FastDB 文件与 PyPI 的哈
 
 确认后的顺序：先在原实现补齐错误回复阻塞和既有释放顺序的行为证据，再迁移单一所有权并收敛重复测试；覆盖取消/panic/断连/timeout、同 key 新代际、buddy/inline/file backing、池锁竞争及 retained reply。完成完整 relay、真实跨语言、macOS/Linux/Windows（Windows 优先开发机）、端点零残留和独立审查；低层 Rust API 变更须对确切候选完成 GitHub Actions 适用跨平台门禁。验证后及时清理产物。
 
-原方案经 hey-my-buddy 0.50.0 独立只读复核，保留释放顺序、GC 时序和测试成本约束。用户随后接受低层 Rust API 与 GC permit 归还时点变化，批准实施。
+原方案经独立只读复核，保留释放顺序、GC 时序和测试成本约束。用户随后接受低层 Rust API 与 GC permit 归还时点变化，批准实施。
 
 实施基线为 `ef7098b16d4ae205fcfd674a8d4669478a6da921`，最终实现及测试候选为 `9839951ece928585a3dc2cf08c6c3716ce15f9ec`。实际生产新增 179、删除 381，净减 202 行；测试新增 346、删除 299，净增 47 行；非文档合计净减 155 行。移除一张表、一把锁、GC 对账和重复路由元数据；没有新增管理器、后台任务或兼容入口。Python 手工 assembler 元数据留在既有 PyO3 owner 内，与 consumed 状态一起移动，高层接口保持。
 
@@ -150,13 +150,13 @@ macOS 完整 Core 分段共 1805 项通过（5 项既有 ignored），含 relay 
 
 [GitHub Actions 39734314720](https://github.com/Dsssyc/c-two/actions/runs/39734314720) 对确切候选完成 9/9 门禁：Linux、macOS、Windows 2022/2025 及 Python 3.14t；FastDB 来源为 `abba785ef2a7d3fbee1bbc608393a3e6c7b042c4`。五个 source 任务均通过各自适用门禁与 Rust/Python 18 行、TypeScript 12 行矩阵。此前候选发现的 PyO3 消费者迁移遗漏及旧源码词串测试已修正后更换候选，未通过重跑相同候选或放宽断言验收。
 
-三轮固定候选及差量的 buddy 独立审查无阻断，Host 已验收并回收审查工作树。Unix 隔离 socket/lease 为零，Windows 本批进程及 C2 命名管道为零；历史目录身份与内容未变。本机约 3.4 GiB、Windows 约 4.2 GiB 构建及临时产物已清理，Windows Rust 工具链保留。本地 HEAD、分支和标签未动，仅向 fork 验证分支推送 CI 候选；两份控制会话重构继续暂缓。
+三轮固定候选及差量的独立审查无阻断，Host 已验收并回收审查工作树。Unix 隔离 socket/lease 为零，Windows 本批进程及 C2 命名管道为零；历史目录身份与内容未变。本机约 3.4 GiB、Windows 约 4.2 GiB 构建及临时产物已清理，Windows Rust 工具链保留。本地 HEAD、分支和标签未动，仅向 fork 验证分支推送 CI 候选；两份控制会话重构继续暂缓。
 
 ## R02 唯一写所有权（2026-10-21，完成）
 
 基线 `a523967b`，实现候选 `2d1b1d1095f3ab6e4d229fb354262bfc25dd113e`。生产代码净增 204 行，测试净增 526 行；属于正确性修复。18 个漏洞反例先在基线被接纳，候选的 21 条编译探针及真实双客户端错池回归通过；本机完整 Core/relay 1716、Rust SDK 19、native 8，Python ordinary/portable/TypeScript 1231/25/14，以及 18/18 Rust/Python、12/12 TypeScript direct/relay 矩阵通过。
 
-[Actions 39523167030](https://github.com/world-in-progress/c-two/actions/runs/39523167030) 对确切候选的 Linux、macOS、Windows 2022/2025、Python 3.14t 门禁全部通过。新版 buddy 多轮独立审查发现均已关闭，最终固定候选复核通过；本批 socket/lease 零残留，历史目录未动，可重建产物已清理。同环境分配微基准增加约 9.6–15.5 ns（4.7%–6.7%），只读 guard/重组中位数变化低于 1%；未声明 RPC 性能提升。完整来源、接口边界、布局开销、审查及实际增量见 [R02 验收记录](2026-10-21-r02-unique-write-ownership-acceptance.md)。
+[Actions 39523167030](https://github.com/world-in-progress/c-two/actions/runs/39523167030) 对确切候选的 Linux、macOS、Windows 2022/2025、Python 3.14t 门禁全部通过。多轮独立审查发现均已关闭，最终固定候选复核通过；本批 socket/lease 零残留，历史目录未动，可重建产物已清理。同环境分配微基准增加约 9.6–15.5 ns（4.7%–6.7%），只读 guard/重组中位数变化低于 1%；未声明 RPC 性能提升。完整来源、接口边界、布局开销、审查及实际增量见 [R02 验收记录](2026-10-21-r02-unique-write-ownership-acceptance.md)。
 
 ## R03 shutdown 发送阶段（2026-10-19，完成）
 
@@ -170,7 +170,7 @@ macOS 完整 Core 分段共 1805 项通过（5 项既有 ignored），含 relay 
 
 [GitHub Actions 39131157512](https://github.com/world-in-progress/c-two/actions/runs/39131157512) 在 attempt 1 对确切候选 `f340d4ec` 完成 9/9 作业。五份源验证收据逐一绑定该 SHA 与 FastDB `4f99f86a662b0e950a0dd29800c25a1c9fca4def`，118 个适用步骤全部 passed：Linux/macOS 各 25、Windows 2022/2025 各 26、Python 3.14t 为 16。四个 full 作业均实际通过 R03 的 EOF、外层超时、发送前重试和 ping 回归；relay 在 Unix 为 416、Windows 为 411，差异仅为原有 5 个 cfg(unix) 用例。五个平台的跨语言矩阵均为 18/18 和 12/12，两个 Windows 普通用户消费者通过，进程与 reader 收尾收据通过。
 
-新版 hey-my-buddy 0.45.3 的固定候选独立只读审查无阻断发现；Host 补做基线补丁重建及候选测试模块一致性核对。实际 socket/lease 零残留，历史 IPC 目录元数据未变；本机验证副本仅替换隔离命名空间，线上验证原始默认路径源码。原始命令、红绿日志、收据、审查、端点验收与 CI 文本证据保留于 `~/.codex/diagnostics/c2-r03-20261018-912ege8c/`。
+固定候选的独立只读审查无阻断发现；Host 补做基线补丁重建及候选测试模块一致性核对。实际 socket/lease 零残留，历史 IPC 目录元数据未变；本机验证副本仅替换隔离命名空间，线上验证原始默认路径源码。原始命令、红绿日志、收据、审查、端点验收与 CI 文本证据保留在仓库之外。
 
 用户要求清理后，已删除 79 个 Cargo 构建目录及散落的 native、dist、打包产物，保留源码、Git、日志与收据。收尾仅复核现有证据并修改文档，没有重跑已通过的测试、重建产物或触发新 CI；下载附件仅在内存核对归档哈希，落盘仅保留 JSON、JUnit 与文本日志。AGENTS.md 已加入测试或工作结束后及时清理无用产物的要求；后续文档提交不是新的实现候选。
 
@@ -178,7 +178,7 @@ macOS 完整 Core 分段共 1805 项通过（5 项既有 ignored），含 relay 
 
 执行基线 `3f030897`，生产候选 `de218272`，独立审查后测试补强 `141668dd`。原共享锁内的 live record 绑定 allocation id 与层级，释放拒绝错误父块、子块和同 backing 同位置旧标识；全链迁移 SHM 3 / IPC 12 / C ABI 5，不留旧格式兼容。保留长度取整、trim 原容量、creator 映射字节计费及原身份、代际与生命周期策略。R02/R07 保持独立。
 
-生产净增 257 行，测试净增 573 行，文档净增 40 行，合计净增 870 行，作为正确性修复成本记录。本机完整 Core 1704 passed（含 relay 416）、Rust SDK 19、native Rust 8；Python ordinary 1206、portable 25、TypeScript 14，严格收据 18/18 与 12/12。既有平台专属跳过由线上适用平台执行。两份原生审查及差量复核和新 skill 0.42.1 的 buddy 只读审查无生产阻断；采纳两条测试建议的 5 行补强以双变异红绿验证，最终 c2-mem 185 项通过。
+生产净增 257 行，测试净增 573 行，文档净增 40 行，合计净增 870 行，作为正确性修复成本记录。本机完整 Core 1704 passed（含 relay 416）、Rust SDK 19、native Rust 8；Python ordinary 1206、portable 25、TypeScript 14，严格收据 18/18 与 12/12。既有平台专属跳过由线上适用平台执行。两份原生审查及差量复核和另一份独立只读审查无生产阻断；采纳两条测试建议的 5 行补强以双变异红绿验证，最终 c2-mem 185 项通过。
 
 默认 256 MiB/4 KiB backing 增加 512 KiB（0.1953%）；wire 描述符和 C block 各增加 8 B。固定 5 轮交替分配微基准中位差 −0.64%～+0.10%，处于本次样本波动内，不声明 RPC 吞吐收益。本次 socket/lease 零残留，历史目录状态未变。最终 [GitHub Actions 38899277267](https://github.com/world-in-progress/c-two/actions/runs/38899277267) 对 `141668dd` 在 attempt 1 全部 9 项通过；已核对五份平台原始日志，包含完整 relay、跨语言矩阵、wheel/IPC memory 和 Windows 普通用户门禁。完整范围、样本和证据见 [R01 记录](2026-10-16-r01-allocation-release-evaluation.md#实施验收2026-10-16完成)。
 
@@ -194,7 +194,7 @@ macOS 完整 Core 分段共 1805 项通过（5 项既有 ignored），含 relay 
 
 独立原生静态审查无阻断性发现，固定补丁 SHA-256 为 `2bcf3cb547405a23a38ca04bc5bc369c3e0693d584763539d08e47f55276d9a7`。历史状态措辞的非阻断建议留作后续；错误文案未改。Host 逐字核对两个生产文件除三处删除外完全一致，服务端 sink、正式 serializer、适配协议、Core 与 Rust 预分配文件同基线一致；811 个跟踪文件逐项核对验证副本与候选，仅含记录中的隔离路径映射。
 
-本批 socket/lease 零残留，历史路径快照未变，未使用 buddy。验证复用已验收且哈希一致的 FastDB/TypeScript 包，C-Two native、CLI 和 Node native 包均从本批隔离源码重建；线上独立构建原始默认路径源码。命令、原始日志、源/包哈希、API 对照、跨语言收据、审查及端点验收位于 `~/.codex/diagnostics/c2-r25-64a02321/`。
+本批 socket/lease 零残留，历史路径快照未变。验证复用已验收且哈希一致的 FastDB/TypeScript 包，C-Two native、CLI 和 Node native 包均从本批隔离源码重建；线上独立构建原始默认路径源码。命令、原始日志、源/包哈希、API 对照、跨语言收据、审查及端点验收保存在仓库之外。
 
 ## 生成 TypeScript Node IPC 工厂退役（2026-10-16，完成）
 
@@ -208,7 +208,7 @@ macOS 完整 Core 分段共 1805 项通过（5 项既有 ignored），含 relay 
 
 本地负对照首次因诊断命令漏传动态库搜索路径而未执行；补齐启动环境后得到四项预期拒绝。首轮 Node 为 58 通过、2 失败，均因隔离副本漏改默认路径正则期望；补齐两处精确映射后全组 60 通过、1 Windows 专属跳过。原日志保留，仓内路径、断言和期限没有修改或放宽。验证复用此前已验收且哈希一致的 FastDB/TypeScript 包，C-Two native 包及生成器均从本批隔离源码重建；线上独立构建原始默认路径源码。
 
-独立原生审查指出的一处旧阶段文档时态已修正，第二次独立复核确认仅文档差异、原审代码与测试补丁逐字一致，无遗留发现；最终补丁 SHA-256 为 `324acea25c5d206d30571fdd3a087a264d7f1db45f08c9a8d8b143201fcd6433`。本批 socket/lease 零残留，历史路径快照未变，未使用 buddy。811 个跟踪文件逐项核对验证副本与候选一致，仅含记录中的隔离路径映射；命令、原始日志、源/包哈希、跨语言收据、两轮审查及端点验收位于 `~/.codex/diagnostics/c2-ts-node-5674d433/`。
+独立原生审查指出的一处旧阶段文档时态已修正，第二次独立复核确认仅文档差异、原审代码与测试补丁逐字一致，无遗留发现；最终补丁 SHA-256 为 `324acea25c5d206d30571fdd3a087a264d7f1db45f08c9a8d8b143201fcd6433`。本批 socket/lease 零残留，历史路径快照未变。811 个跟踪文件逐项核对验证副本与候选一致，仅含记录中的隔离路径映射；命令、原始日志、源/包哈希、跨语言收据、两轮审查及端点验收保存在仓库之外。
 
 ## Python wire/handshake 投影链退役（2026-10-16，完成）
 
@@ -220,7 +220,7 @@ macOS 完整 Core 分段共 1805 项通过（5 项既有 ignored），含 relay 
 
 [GitHub Actions 38858773392](https://github.com/world-in-progress/c-two/actions/runs/38858773392) 绑定上述实现及 FastDB `4f99f86a662b0e950a0dd29800c25a1c9fca4def`，首次运行 9/9 成功。已逐组核对日志：Ubuntu/Python 3.12、macOS 15、Windows 2022/2025 完整门禁，以及 Ubuntu/Python 3.14t 对应门禁；ordinary、portable、TypeScript 分组均通过，两个 Windows 包含普通用户消费者验证。
 
-独立原生只读审查无 actionable findings，固定补丁 SHA-256 为 `135c499470e50f3e9b9e1921abe2a6734b80b6c3c16ca889166cd7465f0f99fe`。本批作用域 socket/lease 零残留，历史路径快照未变，未使用 buddy。隔离副本仅重定向测试默认路径及对应期望；完整命令、产物哈希、API 清单、基线与候选结果、跨语言收据、审查和端点验收位于 `~/.codex/diagnostics/c2-python-wire-6f21c0c3/`。
+独立原生只读审查无 actionable findings，固定补丁 SHA-256 为 `135c499470e50f3e9b9e1921abe2a6734b80b6c3c16ca889166cd7465f0f99fe`。本批作用域 socket/lease 零残留，历史路径快照未变。隔离副本仅重定向测试默认路径及对应期望；完整命令、产物哈希、API 清单、基线与候选结果、跨语言收据、审查和端点验收保存在仓库之外。
 
 ## R30 派生配置状态与缓存诊断收敛（2026-10-16，完成）
 
@@ -232,7 +232,7 @@ macOS 完整 Core 分段共 1805 项通过（5 项既有 ignored），含 relay 
 
 [GitHub Actions 38851142449](https://github.com/world-in-progress/c-two/actions/runs/38851142449) 绑定上述实现及 FastDB `4f99f86a662b0e950a0dd29800c25a1c9fca4def`，首次运行 9/9 成功。已逐组核对日志：Ubuntu/Python 3.12、macOS 15、Windows 2022/2025 完整门禁，以及 Ubuntu/Python 3.14t 对应门禁；ordinary、portable、TypeScript 分组均通过，两个 Windows 包含普通用户消费者验证。
 
-独立原生只读审查无 actionable findings，固定补丁 SHA-256 为 `c7da289b51cf762d2e85ff30b43538c1aade722d9d06e14abac6cb6aaba94c2d`。本批作用域 socket/lease 零残留，历史路径快照未变，未使用 buddy。隔离副本仅重定向测试默认路径及对应期望；完整命令、构建哈希、差分结果、审查、计数和端点收据位于 `~/.codex/diagnostics/c2-r30-derived-0435c3f9/`。
+独立原生只读审查无 actionable findings，固定补丁 SHA-256 为 `c7da289b51cf762d2e85ff30b43538c1aade722d9d06e14abac6cb6aaba94c2d`。本批作用域 socket/lease 零残留，历史路径快照未变。隔离副本仅重定向测试默认路径及对应期望；完整命令、构建哈希、差分结果、审查、计数和端点收据保存在仓库之外。
 
 ## C07 relay namespace 响应单一来源（2026-10-16，完成）
 
@@ -244,7 +244,7 @@ macOS 完整 Core 分段共 1805 项通过（5 项既有 ignored），含 relay 
 
 [GitHub Actions 38842069727](https://github.com/world-in-progress/c-two/actions/runs/38842069727) 绑定上述实现及 FastDB `4f99f86a662b0e950a0dd29800c25a1c9fca4def`，首次运行 9/9 成功。已逐组核对日志：Ubuntu/Python 3.12、macOS 15、Windows 2022/2025 完整门禁，以及 Ubuntu/Python 3.14t 对应门禁；ordinary、portable、TypeScript 分组均通过，两个 Windows 包含普通用户消费者验证。
 
-两次独立原生只读审查完成；第一轮非阻塞建议已加入现有矩阵，最终补丁 `c22b46c6cd486ad4f4a4d1e64d25de2a67de85d5b646b3e22839fc9c14c6939f` 无 actionable findings。本批作用域 socket/lease 均为零，历史路径快照未变，未使用 buddy。隔离副本仅替换本批测试默认路径及对应期望；完整命令、初始失败、构建哈希、审查、计数和端点收据位于 `~/.codex/diagnostics/c2-c07-d9814e51/`。
+两次独立原生只读审查完成；第一轮非阻塞建议已加入现有矩阵，最终补丁 `c22b46c6cd486ad4f4a4d1e64d25de2a67de85d5b646b3e22839fc9c14c6939f` 无 actionable findings。本批作用域 socket/lease 均为零，历史路径快照未变。隔离副本仅替换本批测试默认路径及对应期望；完整命令、初始失败、构建哈希、审查、计数和端点收据保存在仓库之外。
 
 ## R29 call-control 私有写入校验收敛（2026-10-16，完成）
 
@@ -254,7 +254,7 @@ macOS 完整 Core 分段共 1805 项通过（5 项既有 ignored），含 relay 
 
 调整后的完整 wire 143 项先在原生产实现通过。候选本机 macOS 通过 contract 47、wire 143、server 160、IPC 202 + 7、完整 relay 419，共 978 项 Rust 测试；从候选重建 native/CLI 后，Python wire/security、SHM、HTTP/mesh、跨模式和生命周期回归 184 项通过，合计 1162 项，无跳过。独立构建目录中的临时新旧对照覆盖 211 种身份、三档 method index，共 633 组编码及 7596 组缓冲场景；编码字节、错误变体/字段/文案逐字一致，失败缓冲及成功写入前后哨兵均保持。对照探针未进入仓库，未声明性能提升。
 
-独立原生审查无 actionable findings，补丁 SHA-256 为 `bd4f53b8265e6631b1dc45941611a13f1d477b9f7a0749fbfc2ab34926cf8d44`，审查、测试及最终源码一致。Host 逐字核对入站解码、reply 编解码、完整容量 gate、手写 golden 和 IPC client 未改，格式与 diff 检查通过。本批作用域 socket/lease 均为零，无须补做 reap；历史目录快照未变，未使用 buddy。本轮验证限本地 macOS，未新增 hosted CI 证据；隔离副本仅重定向测试默认路径。完整日志、对照结果、构建来源、审查及端点收据位于 `~/.codex/diagnostics/c2-r29-control-d96023b1/`。
+独立原生审查无 actionable findings，补丁 SHA-256 为 `bd4f53b8265e6631b1dc45941611a13f1d477b9f7a0749fbfc2ab34926cf8d44`，审查、测试及最终源码一致。Host 逐字核对入站解码、reply 编解码、完整容量 gate、手写 golden 和 IPC client 未改，格式与 diff 检查通过。本批作用域 socket/lease 均为零，无须补做 reap；历史目录快照未变。本轮验证限本地 macOS，未新增 hosted CI 证据；隔离副本仅重定向测试默认路径。完整日志、对照结果、构建来源、审查及端点收据保存在仓库之外。
 
 ## R34 服务端 peer SHM 状态收敛（2026-10-16，完成）
 
@@ -266,7 +266,7 @@ macOS 完整 Core 分段共 1805 项通过（5 项既有 ignored），含 relay 
 
 实现 `bb024930bcea2f332e357c48935c83769fc96510` 的 [GitHub Actions 38835252206](https://github.com/world-in-progress/c-two/actions/runs/38835252206) 首次运行 9/9 成功，绑定 FastDB `4f99f86a662b0e950a0dd29800c25a1c9fca4def`。五组源码任务日志分别核对 Ubuntu/Python 3.12、Ubuntu/Python 3.14t、macOS 15、Windows 2022/2025 的适用完整门禁，包含两组 Windows 普通用户 wheel 消费者。Linux 原始 Core 日志确认新握手用例实际通过；run-evidence 的源码 SHA 与候选一致。
 
-独立原生审查无 actionable findings，补丁 SHA-256 为 050bdf233fd66f0068601e2b00769fb0ee11647e2f90e28724ce8350fcec269f，测试、审查、线上候选源哈希一致。Host 逐字确认实际映射/读/释放/GC 函数未变；改动区域格式及 diff 检查通过，其他区域既有格式差异未扩展修改。本批所有隔离作用域 socket/lease 为零，无须补做 reap；历史目录身份快照未变，未使用 buddy。隔离副本仅重定向测试默认路径，交付路径不变。完整日志、来源哈希、差量统计、审查及端点收据位于 ~/.codex/diagnostics/c2-r34-32f1f02a/。
+独立原生审查无 actionable findings，补丁 SHA-256 为 050bdf233fd66f0068601e2b00769fb0ee11647e2f90e28724ce8350fcec269f，测试、审查、线上候选源哈希一致。Host 逐字确认实际映射/读/释放/GC 函数未变；改动区域格式及 diff 检查通过，其他区域既有格式差异未扩展修改。本批所有隔离作用域 socket/lease 为零，无须补做 reap；历史目录身份快照未变。隔离副本仅重定向测试默认路径，交付路径不变。完整日志、来源哈希、差量统计、审查及端点收据保存在仓库之外。
 
 ## 取消 Drop 测试夹具修复（2026-10-16，完成）
 
@@ -274,7 +274,7 @@ macOS 完整 Core 分段共 1805 项通过（5 项既有 ignored），含 relay 
 
 基于 `94a26f1b` 的隔离前后副本使用独立 Cargo target。本次新构建基线的原两测试顺序及完整串行 IPC 都通过，说明此前超时具有调度时序性；此前失败日志与线程采样保留，不把本轮表述成确定性红绿复现。候选原两测试顺序 2 passed，完整 IPC（含 test-support）串行与默认并行各 202 + 7 passed，无失败或忽略项。本轮验证范围为本机 macOS 的受影响完整 IPC 套件，没有重新运行 GitHub Actions，也不把上一批 CI 结果计作本补丁的线上验证。
 
-独立原生审查无 actionable findings，确认唯一 gate 安装点运行在多线程 runtime，信号及 panic 解阻塞语义不变。Host 核对补丁 SHA-256 `5c9f2373e711cc497fb21952722a774874535f92d176e14eeee0383d48379b49` 与测试、审查源码一致；改动文件 rustfmt 与 diff 检查通过。全仓 fmt 检查发现其他五个文件的基线既有格式差异，未扩展修复。所有本批作用域 socket/lease 均为零，无须补做 reap；历史目录快照未变，未使用 buddy。命令、完整日志、二进制哈希、审查及零残留收据位于 `~/.codex/diagnostics/c2-receiver-drop-b5871ea7/`。
+独立原生审查无 actionable findings，确认唯一 gate 安装点运行在多线程 runtime，信号及 panic 解阻塞语义不变。Host 核对补丁 SHA-256 `5c9f2373e711cc497fb21952722a774874535f92d176e14eeee0383d48379b49` 与测试、审查源码一致；改动文件 rustfmt 与 diff 检查通过。全仓 fmt 检查发现其他五个文件的基线既有格式差异，未扩展修复。所有本批作用域 socket/lease 均为零，无须补做 reap；历史目录快照未变。命令、完整日志、二进制哈希、审查及零残留收据保存在仓库之外。
 
 ## R13 IPC 拼帧收敛（2026-10-16，完成）
 
@@ -292,7 +292,7 @@ macOS 完整 Core 分段共 1805 项通过（5 项既有 ignored），含 relay 
 
 补充对照曾因两个快照共享 Cargo target 而复用基线二进制；已由旧测试仍在清单中发现并剔除该候选结果，改用独立 target 重建后确认 202 项新清单。原 native/CLI 及性能产物通过符号、嵌入源码路径和哈希核实属于各自版本。独立审查无发现，审查补丁与 CI/验收源码一致。
 
-诊断失败留下的 6 对本批 socket/lease 已按运行记录核实归属和退出状态，再用原生凭据精确 reap；最终本批所有作用域 socket/lease 为零，历史目录快照未变，未使用 buddy。隔离副本仅重定向默认测试目录及对应期望，交付路径不变。完整命令、失败与成功日志、性能原始数据、产物哈希及验收证据保存在 `~/.codex/diagnostics/c2-r13-frame-87df291d/`。
+诊断失败留下的 6 对本批 socket/lease 已按运行记录核实归属和退出状态，再用原生凭据精确 reap；最终本批所有作用域 socket/lease 为零，历史目录快照未变。隔离副本仅重定向默认测试目录及对应期望，交付路径不变。完整命令、失败与成功日志、性能原始数据、产物哈希及验收证据保存在仓库之外。
 
 ## R23 Python bridge 单一会话（2026-10-15，完成）
 
@@ -306,7 +306,7 @@ macOS 完整 Core 分段共 1805 项通过（5 项既有 ignored），含 relay 
 
 本地完整 Python 首轮因验证脚本使用非 editable 安装，52 个显式从源码导入的子进程找不到 native 扩展；逐项核实后改用隔离源码的 editable 安装，确认父子进程加载同一扩展，再运行完整清单通过。首次失败日志与临时目录保留，生产代码和测试断言未改；Git 元数据用例在真实工作树单独执行。GitHub 使用其既有安装流程，未重跑。
 
-独立原生审查无发现；审查补丁、验收源码与 CI 提交一致，扩展、CLI、包与矩阵收据哈希已核对。本批含首次失败目录在内的 socket/lease 零残留，历史目录快照未变，未使用 buddy。隔离副本仅重定向测试默认目录及对应路径期望，交付路径不变；完整命令、日志、产物哈希和验收证据保存在 `~/.codex/diagnostics/c2-r23-d29bbbb7/`。
+独立原生审查无发现；审查补丁、验收源码与 CI 提交一致，扩展、CLI、包与矩阵收据哈希已核对。本批含首次失败目录在内的 socket/lease 零残留，历史目录快照未变。隔离副本仅重定向测试默认目录及对应路径期望，交付路径不变；完整命令、日志、产物哈希和验收证据保存在仓库之外。
 
 ## R31 Held owner 配对（2026-10-15，完成）
 
@@ -314,9 +314,9 @@ macOS 完整 Core 分段共 1805 项通过（5 项既有 ignored），含 relay 
 
 本批相对 `32e1362f`：生产新增 12、删除 34，净减 22 行；测试新增 32、删除 44，净减 12 行；非文档合计净减 34 行。新增 `#[cfg(test)]` 块计入测试，真实 Held 的失败/panic/重复释放测试替换了测试自造的 SdkHeldDropGuard；保留真实 FastDB owner 测试及 Core 复制/释放错误合并覆盖。新增单测先在原实现通过；8 个显式释放/Drop/错误/panic 顺序场景在基线与候选一致，故意调反局部声明顺序的对照在 panic 场景按预期被拒绝，未新增生产抽象或声明性能提升。
 
-本地隔离回归通过 Rust SDK 19 项、Core 生命周期 5 项、生成 Rust 消费者 4 项、完整 c2-http/relay 419 项；Python 157 项（relay/lifetime 131、Git 元数据 1、portable 25），含 18/18 direct/relay 矩阵；矩阵校验器另 26 项通过。独立原生审查无发现，固定审查补丁与验收源码哈希一致；本批 socket/lease 零残留、历史目录快照未变，未使用 buddy。
+本地隔离回归通过 Rust SDK 19 项、Core 生命周期 5 项、生成 Rust 消费者 4 项、完整 c2-http/relay 419 项；Python 157 项（relay/lifetime 131、Git 元数据 1、portable 25），含 18/18 direct/relay 矩阵；矩阵校验器另 26 项通过。独立原生审查无发现，固定审查补丁与验收源码哈希一致；本批 socket/lease 零残留、历史目录快照未变。
 
-本批验证范围为本机 macOS，未新增 hosted CI。隔离副本仅重定向测试默认 socket/协调目录及对应路径期望，交付源码路径不变；顺序探针、负对照、命令、日志、产物哈希及验收证据保存在 `~/.codex/diagnostics/c2-r31-e6591997/`。
+本批验证范围为本机 macOS，未新增 hosted CI。隔离副本仅重定向测试默认 socket/协调目录及对应路径期望，交付源码路径不变；顺序探针、负对照、命令、日志、产物哈希及验收证据保存在仓库之外。
 
 ## R24 旧 transfer buffer 配置链退出（2026-10-15，完成）
 
@@ -326,7 +326,7 @@ macOS 完整 Core 分段共 1805 项通过（5 项既有 ignored），含 relay 
 
 本地隔离通过完整 Rust relay 419 项、Python 351 项（常规 325、Git 元数据 1、portable 25，含 18/18 direct/relay 矩阵及 Python 3.10 语法检查）。[GitHub Actions 38725348808](https://github.com/world-in-progress/c-two/actions/runs/38725348808) 绑定上述实现与 FastDB `4f99f86a662b0e950a0dd29800c25a1c9fca4def`，首次运行 9/9 成功；Ubuntu/Python 3.12、macOS 15、Windows 2022/2025 完整门禁及 Ubuntu/Python 3.14t 对应门禁均已核对日志，Windows 包含普通用户 wheel 消费者验证。
 
-本地 portable 首轮遗漏专用 `C2_PORTABLE_MATRIX_C3_BIN`，夹具在错误的默认产物路径查找 CLI，造成 24 个 setup 错误；补齐变量并固定 CLI 副本后同一矩阵通过，生产代码与测试断言未改，各阶段产物哈希分别留档。独立审查无发现，审查、测试和提交源码一致；本批 socket/lease 零残留、历史目录快照未变，未使用 buddy。隔离副本仅重定向测试默认目录及对应期望，线上使用原路径。完整证据位于 `~/.codex/diagnostics/c2-r24-4b09f0f5/`。
+本地 portable 首轮遗漏专用 `C2_PORTABLE_MATRIX_C3_BIN`，夹具在错误的默认产物路径查找 CLI，造成 24 个 setup 错误；补齐变量并固定 CLI 副本后同一矩阵通过，生产代码与测试断言未改，各阶段产物哈希分别留档。独立审查无发现，审查、测试和提交源码一致；本批 socket/lease 零残留、历史目录快照未变。隔离副本仅重定向测试默认目录及对应期望，线上使用原路径。完整证据保存在仓库之外。
 
 ## R08 IPC 字段解析收敛（2026-10-15，完成）
 
@@ -336,7 +336,7 @@ macOS 完整 Core 分段共 1805 项通过（5 项既有 ignored），含 relay 
 
 42 个字段/错误顺序场景先在原实现通过。首轮表中心跳超时误填 15（等于默认间隔），被原校验正确拒绝后改为合法的 20/45，未放宽断言。本机隔离回归通过配置 135、Core 202、完整 c2-http/relay 419 项；4 个 ignored 入口为父用例实际调用的子进程 fixture。Python 配置、冻结、HTTP/mesh、关闭、benchmark、跨模式、直连与真实闲置回归 242 项通过，归档缺少 Git 元数据的 1 项另在实际工作树通过，共 243 项。
 
-[GitHub Actions 38703304629](https://github.com/world-in-progress/c-two/actions/runs/38703304629) 绑定上述实现及 FastDB `4f99f86a662b0e950a0dd29800c25a1c9fca4def`，9/9 首次运行成功；Ubuntu/Python 3.12、macOS 15、Windows 2022/2025 完整门禁及 Ubuntu/Python 3.14t 对应门禁均已核对日志。独立审查无发现，审查、测试与提交源码哈希一致；本批 socket/lease 零残留、历史目录快照未变，未使用 buddy。隔离副本仅重定向测试默认目录及匹配的路径期望，线上使用原路径。命令、日志、基线对照、产物哈希与验收证据保存在 `~/.codex/diagnostics/c2-r08-bcd260ad/`。
+[GitHub Actions 38703304629](https://github.com/world-in-progress/c-two/actions/runs/38703304629) 绑定上述实现及 FastDB `4f99f86a662b0e950a0dd29800c25a1c9fca4def`，9/9 首次运行成功；Ubuntu/Python 3.12、macOS 15、Windows 2022/2025 完整门禁及 Ubuntu/Python 3.14t 对应门禁均已核对日志。独立审查无发现，审查、测试与提交源码哈希一致；本批 socket/lease 零残留、历史目录快照未变。隔离副本仅重定向测试默认目录及匹配的路径期望，线上使用原路径。命令、日志、基线对照、产物哈希与验收证据保存在仓库之外。
 
 ## C05 Node 端点能力收敛（2026-10-15，完成）
 
@@ -344,9 +344,9 @@ macOS 完整 Core 分段共 1805 项通过（5 项既有 ignored），含 relay 
 
 实现 `1bc6e7415f2497a464d18671963a1f4c146cab2d` 相对 `eebcc539`：生产净减 71 行、测试净减 56 行，非文档合计净减 127 行。现有旧库成功测试改为 ABI 3 提前拒绝和 ABI 4 缺 Unix connect 符号拒绝，保留 ownership/GC/冻结/真实连接用例；使用旧 loader 配 ABI 4 header 的负对照，两项新拒绝断言均失败，候选均通过。未增加运行时抽象或声明性能提升。
 
-本地隔离通过完整 relay 419、FFI 27、Node 59 项及打包安装/类型检查；1 个 Windows 专属用例由线上执行。[GitHub Actions 38693012224](https://github.com/world-in-progress/c-two/actions/runs/38693012224) 绑定上述实现及 FastDB `4f99f86a662b0e950a0dd29800c25a1c9fca4def`，9/9 成功，覆盖 Ubuntu/Python 3.12、Ubuntu/Python 3.14t、macOS 15、Windows 2022/2025 的对应完整门禁。独立审查无发现，审查后源码哈希匹配；本批 socket/lease 零残留，历史目录快照未变，未使用 buddy。后续破坏性 API/ABI 更改的线上跨平台要求已写入 AGENTS.md。
+本地隔离通过完整 relay 419、FFI 27、Node 59 项及打包安装/类型检查；1 个 Windows 专属用例由线上执行。[GitHub Actions 38693012224](https://github.com/world-in-progress/c-two/actions/runs/38693012224) 绑定上述实现及 FastDB `4f99f86a662b0e950a0dd29800c25a1c9fca4def`，9/9 成功，覆盖 Ubuntu/Python 3.12、Ubuntu/Python 3.14t、macOS 15、Windows 2022/2025 的对应完整门禁。独立审查无发现，审查后源码哈希匹配；本批 socket/lease 零残留，历史目录快照未变。后续破坏性 API/ABI 更改的线上跨平台要求已写入 AGENTS.md。
 
-首轮 Node 真实长路径用例因本批显式容器太短，未达到 512 字节前置断言；改用更长的本批容器后该用例通过，生产代码与断言强度未改。隔离副本仅重定向测试默认目录与对应路径期望，线上使用原默认路径。命令、失败/成功日志、负对照、产物哈希、独立审查和端点验收保存在 `~/.codex/diagnostics/c2-c05-8f85ae7c/`；历史 ABI 收据保持原事实。
+首轮 Node 真实长路径用例因本批显式容器太短，未达到 512 字节前置断言；改用更长的本批容器后该用例通过，生产代码与断言强度未改。隔离副本仅重定向测试默认目录与对应路径期望，线上使用原默认路径。命令、失败/成功日志、负对照、产物哈希、独立审查和端点验收保存在仓库之外；历史 ABI 收据保持原事实。
 
 ## R30 override 单一来源续批（2026-10-15，完成）
 
@@ -356,7 +356,7 @@ macOS 完整 Core 分段共 1805 项通过（5 项既有 ignored），含 relay 
 
 候选在本机 macOS 通过配置 135、Core 202、完整 c2-http/relay 419、Rust SDK 18 项，共 774 项；4 个标记 ignored 的 Core 入口是由父用例实际调用的子进程 fixture。Python 配置/RuntimeSession/HTTP/mesh/关闭/跨模式/直连/真实闲置回归 203 项通过，另有 Git 元数据用例在实际工作树通过，共 204 项。CLI/PyO3 构建和 C/FFI crate 检查通过；独立原生审查无发现，审查后源码哈希一致。本批隔离 socket/lease 零残留、历史目录快照未变，未使用 buddy，未新增 hosted CI 证据。
 
-隔离副本只重定向默认 socket/协调记录路径及匹配的测试期望。首次配置测试的两处失败来自遗漏的 3 个旧路径字面量；Rust SDK 首次启动缺少 FastDB 动态库搜索路径，补齐测试环境后验证通过，交付源码和断言强度未改。沿用已验证的本机 C++ 头文件路径和 Python strip=none 构建参数。失败/成功日志、产物哈希、统计及端点验收保存在 `~/.codex/diagnostics/c2-r30-12347302/`。
+隔离副本只重定向默认 socket/协调记录路径及匹配的测试期望。首次配置测试的两处失败来自遗漏的 3 个旧路径字面量；Rust SDK 首次启动缺少 FastDB 动态库搜索路径，补齐测试环境后验证通过，交付源码和断言强度未改。沿用已验证的本机 C++ 头文件路径和 Python strip=none 构建参数。失败/成功日志、产物哈希、统计及端点验收保存在仓库之外。
 
 ## R12 局部续批（2026-10-14，完成）
 
@@ -366,9 +366,9 @@ macOS 完整 Core 分段共 1805 项通过（5 项既有 ignored），含 relay 
 
 实际生产净减 53 行、测试净减 92 行，非文档合计净减 145 行。移除一次完整路由克隆及重复校验，未测量延迟或吞吐收益。以下历史收束数字仍绑定其原提交。
 
-本机 macOS 隔离副本完成 c2-http 全部 419 项测试（含完整 relay）、Python HTTP/mesh/错误/关闭/benchmark/跨模式及直连回归 93 项；归档缺少 Git 元数据的 1 项另在真实工作树通过，共覆盖 Python 清单 94 项。真实 idle 用例保留两轮各至少 62 秒的等待。独立原生审查无发现；审查后源码 SHA256 核对一致。测试只在副本重定向默认 socket root 和协调记录目录，交付源码路径不变；本批 socket/lease 零残留，历史目录快照未变，未使用 buddy。本批未新增 hosted CI 证据。
+本机 macOS 隔离副本完成 c2-http 全部 419 项测试（含完整 relay）、Python HTTP/mesh/错误/关闭/benchmark/跨模式及直连回归 93 项；归档缺少 Git 元数据的 1 项另在真实工作树通过，共覆盖 Python 清单 94 项。真实 idle 用例保留两轮各至少 62 秒的等待。独立原生审查无发现；审查后源码 SHA256 核对一致。测试只在副本重定向默认 socket root 和协调记录目录，交付源码路径不变；本批 socket/lease 零残留，历史目录快照未变。本批未新增 hosted CI 证据。
 
-构建记录：c3 首次构建缺少本机 C++ 标准头文件，通过既有 CPLUS_INCLUDE_PATH 修正。Python 首轮收集遇到 LINKEDIT 对齐错误，独立最小程序复现了 [Rust 调试信息剥离缺陷](https://github.com/rust-lang/rust/issues/157750)；仅测试构建设置 CARGO_PROFILE_RELEASE_STRIP=none 后扩展加载及回归通过，未修改仓库构建策略。原始失败、成功日志、产物哈希和端点验收保存在 `~/.codex/diagnostics/c2-r12-7fc68311/`。
+构建记录：c3 首次构建缺少本机 C++ 标准头文件，通过既有 CPLUS_INCLUDE_PATH 修正。Python 首轮收集遇到 LINKEDIT 对齐错误，独立最小程序复现了 [Rust 调试信息剥离缺陷](https://github.com/rust-lang/rust/issues/157750)；仅测试构建设置 CARGO_PROFILE_RELEASE_STRIP=none 后扩展加载及回归通过，未修改仓库构建策略。原始失败、成功日志、产物哈希和端点验收保存在仓库之外。
 
 <a id="closeout"></a>
 ## 本轮收束（2026-10-14）
@@ -440,11 +440,11 @@ R13 在同一 macOS arm64、CPython 3.13.3、相同依赖与 release 参数下�
 | T01–T07 剩余 | 词串门禁、假 owner、阻塞 readline、重连/GC 负例和默认值证明仍须逐项替换。T02 重复解析器、若干夹具、Digest/FULL_SYNC 顺序与错误码 golden 已收敛；ping 无重试敏感性等有效覆盖保留。 |
 | 本机历史目录 | 末次验收快照中的 12 个空 lease 归属未全部确认；收束时旧根路径已缺失，原因未核实，未记为回收完成。恢复/冷切换未执行，不扩展本次排查或历史回收权限。 |
 
-收束阶段仅整理文档、核对固定提交及既有证据，没有启动运行时、清理历史文件、使用 buddy 或新增下一批实现。以下 B1–B19 保留各批完成当时的记录；其中早期审查工具和当时的平台验证限制属于历史事实，当前状态以上述收束结论为准。
+收束阶段仅整理文档、核对固定提交及既有证据，没有启动运行时、清理历史文件或新增下一批实现。以下 B1–B19 保留各批完成当时的记录；其中早期审查工具和当时的平台验证限制属于历史事实，当前状态以上述收束结论为准。
 
 ## B1–B19 历史实施记录
 
-依据：[二轮复核](2026-10-13-defensive-programming-regression-reassessment.md)。起点为 `2ffe356f15d8ce1c8fad9e08a91ffff808d34dad`，实施分支 `socu/slimming-batches`。用户授权先实施证据充分、保持行为的局部精简；每批完成针对性回归和独立审查。Host 负责实现、验证与最终验收，独立审查通过 buddy 的只读固定快照执行。
+依据：[二轮复核](2026-10-13-defensive-programming-regression-reassessment.md)。起点为 `2ffe356f15d8ce1c8fad9e08a91ffff808d34dad`，实施分支 `socu/slimming-batches`。用户授权先实施证据充分、保持行为的局部精简；每批完成针对性回归和独立审查。Host 负责实现、验证与最终验收，独立审查在只读固定快照上执行。
 
 首轮 B1–B6 已完成，18 个非文档文件新增 7 行、删除 594 行，净减少 587 行；退出 13 项只服务已删除实现的测试。每批均有独立提交、现有行为回归及固定候选独立审查，审查未发现阻塞问题，6 个审查工作树均已验收回收。运行证据来自本机 macOS arm64；未执行 Windows/Linux hosted CI、性能基准或发布，不推导跨平台全面通过或性能收益。relay journal 及 GC 运维日志保持，公开 API/ABI 和 P1 项目仍按下述边界另行推进。
 
@@ -496,7 +496,7 @@ B7/B8 六个子项的首次提交通过了回归与独立审查，但生产/工�
 | B8b | `2949cd719621ae9bb59a74cbb19eff31e5d0c44e` | Rust 140 + Python 107 passed；2 个 ignored 为父用例启动的子进程入口 |
 | B8c | `89e3191d27ae32f85a386a4c36df52d15e9ee1b3` | Python 111 passed / 5 Windows-only skipped |
 
-各批测试次数存在重叠，不相加为独立覆盖总数。B7a 因 buddy 升级围栏改用原生只读代理核对固定 diff/hash；其余 5 项通过 buddy 固定工作树审查，均已验收回收。所有实现提交的非文档内容已与相应审查输入逐文件核对。验证仍限本地 macOS；Windows、free-threading 并发、hosted CI 与发布未由本轮证明。relay journal、Held<T>、P1 修复及公开 API/ABI/错误策略议题仍保持独立。
+各批测试次数存在重叠，不相加为独立覆盖总数。B7a 改用原生只读代理核对固定 diff/hash；其余 5 项通过固定工作树审查，均已验收回收。所有实现提交的非文档内容已与相应审查输入逐文件核对。验证仍限本地 macOS；Windows、free-threading 并发、hosted CI 与发布未由本轮证明。relay journal、Held<T>、P1 修复及公开 API/ABI/错误策略议题仍保持独立。
 
 ### B7：剩余局部精简
 
@@ -514,7 +514,7 @@ B7c 的第三处等待位于 `test_ipc_buddy_reply.py::TestBuddyReply::test_conc
 
 ### B8：私有状态收敛
 
-R31 的独立只读复核 run 为 `eba0201a-513f-4df7-817c-ceee4d7bbc56`，固定输入与本轮规划一致。Host 已复核关键构造/释放/锁路径，验收报告并回收审查工作树。下面三项可按保持现有行为的方案各自落地；没有要求把全部额外测试缺口一次性铺开。
+R31 的独立只读复核固定输入与本轮规划一致。Host 已复核关键构造/释放/锁路径，验收报告并回收审查工作树。下面三项可按保持现有行为的方案各自落地；没有要求把全部额外测试缺口一次性铺开。
 
 | 子项 | 最小设计 | 关键回归与边界 |
 | --- | --- | --- |
@@ -542,11 +542,11 @@ Held<T> 暂不并入 B8。两个 Option 的稳定状态确实配对，但直接�
 
 验证：`CARGO_TARGET_DIR=/tmp/c2-slim-implementation-20261013/target cargo test --manifest-path core/Cargo.toml -p c2-server --lib --locked --offline`：168 passed，0 failed，包含 scheduler FIFO/关闭/取消及 buddy_dispatch_passes_shm_request_to_callback_without_inline_materialization。`rustfmt --check --edition 2024 core/transport/c2-server/src/scheduler.rs` 和 `git diff --check` 通过。日志：`/tmp/c2-slim-implementation-20261013/b1-server.log`。
 
-独立审查 run `87bc99c8-6725-4629-9068-cb946ff8d38f` 未发现需修复问题，Host 已验收并回收审查工作树。审查为静态核验，168 项运行证据由 Host 提供。后续 Python 环境准备遇到本机 clang 缺省 C++ 头搜索路径问题，独立于本批 Rust 回归；最终进程级修复与失败尝试见 B2。
+独立审查未发现需修复问题，Host 已验收并回收审查工作树。审查为静态核验，168 项运行证据由 Host 提供。后续 Python 环境准备遇到本机 clang 缺省 C++ 头搜索路径问题，独立于本批 Rust 回归；最终进程级修复与失败尝试见 B2。
 
 ### B2：Python 构造不变量
 
-B1 实现提交为 `306a922cd256631f80e20dede0b44815b7db90aa`。B2 仅修改 bridge.py 与 payload_plan.py，保留构造器、frozen、公开签名、错误类型/文案和独立 borrowed 门禁；合计新增 1 行、删除 9 行。独立审查快照 `48bfdf16ba814f88d4a04ae94c88fc87176d8580`，run `464176d5-5a81-4183-906b-d85a3f8c9bee`，无 actionable findings，Host 已验收并核对文件一致。
+B1 实现提交为 `306a922cd256631f80e20dede0b44815b7db90aa`。B2 仅修改 bridge.py 与 payload_plan.py，保留构造器、frozen、公开签名、错误类型/文案和独立 borrowed 门禁；合计新增 1 行、删除 9 行。独立审查快照 `48bfdf16ba814f88d4a04ae94c88fc87176d8580`，无 actionable findings，Host 已验收并核对文件一致。
 
 验证：Python 3.13.3；当前工作树的 Python 源码及本地构建的 `_native.cpython-313-darwin.so`。`C2_RELAY_ANCHOR_ADDRESS= uv run --no-sync pytest sdk/python/tests/unit/test_resource_conformance.py sdk/python/tests/unit/test_input_lifetime.py sdk/python/tests/unit/test_portable_payload_runtime.py sdk/python/tests/integration/test_portable_payload_runtime.py -q --timeout=30`：30 passed。初次命令误写不存在的 test_resource_bridge.py，未收集测试；更正后结果日志为 `/tmp/c2-slim-implementation-20261013/b2-python-r2.log`。没有修改或新增测试；并非宣称所有 borrowed 签名组合都已动态覆盖。
 
@@ -554,7 +554,7 @@ B1 实现提交为 `306a922cd256631f80e20dede0b44815b7db90aa`。B2 仅修改 bri
 
 ### B3：生成服务复用已接纳 release
 
-B2 实现提交为 `d4d0e9012a653e2f867dbfe128d28ff707325453`。B3 仅将生成 service_definition 的第二次 contract_release_ref() 改为已有 release.reference()，公开签名和 MethodBinding.index 类型未变。独立审查快照 `704090018e6896f6cfdfa9efdc5a9120f4456c6e`，run `640dc776-b95e-4476-bef5-44b2e356e5e0`，无 actionable findings，Host 已验收并核对文件一致。隐藏的 debug admission probe 仍按实际接纳次数计数，重复工作由两次减为一次；release 模式不维护该计数。
+B2 实现提交为 `d4d0e9012a653e2f867dbfe128d28ff707325453`。B3 仅将生成 service_definition 的第二次 contract_release_ref() 改为已有 release.reference()，公开签名和 MethodBinding.index 类型未变。独立审查快照 `704090018e6896f6cfdfa9efdc5a9120f4456c6e`，无 actionable findings，Host 已验收并核对文件一致。隐藏的 debug admission probe 仍按实际接纳次数计数，重复工作由两次减为一次；release 模式不维护该计数。
 
 验证：`cargo test --manifest-path core/Cargo.toml -p c2-codegen --lib --test generated_rust_sdk --locked --offline`：lib 2 passed、generated Rust SDK 4 passed，含真实生成消费者编译/调用、错误 payload 类型拒绝及 portable fixture 编译。targets.rs 的 rustfmt 和 diff check 通过。日志 `/tmp/c2-slim-implementation-20261013/b3-codegen-r2.log`。生成 Rust 源码一行及其内容哈希预期改变；canonical 合同身份/元数据、公开接口及运行语义保持。
 
@@ -562,7 +562,7 @@ B2 实现提交为 `d4d0e9012a653e2f867dbfe128d28ff707325453`。B3 仅将生成 
 
 ### B4：局部内存与分块不变量
 
-B3 实现提交为 `dcb72f590c6cf6b9172011a8b5798af224975ff7`。本批 4 文件新增 5 行、删除 15 行。bitmap 的循环上下界恒等；空 handle 保留入口首次完整校验；retention 的私有 permit charge 始终包含在同锁域总量中，全域加法通过即保证局部加法不溢出；chunk 只删除未读创建时间，活动时间与全部断言保留。独立审查快照 `a7113e1d863d9b1fdb0fc1df566fd246020b5fb8`，run `4fecae0c-6c4a-43bc-a927-7c1c031a5b3f`，无 actionable findings。Host 已核对全部文件一致、验收并回收审查工作树。
+B3 实现提交为 `dcb72f590c6cf6b9172011a8b5798af224975ff7`。本批 4 文件新增 5 行、删除 15 行。bitmap 的循环上下界恒等；空 handle 保留入口首次完整校验；retention 的私有 permit charge 始终包含在同锁域总量中，全域加法通过即保证局部加法不溢出；chunk 只删除未读创建时间，活动时间与全部断言保留。独立审查快照 `a7113e1d863d9b1fdb0fc1df566fd246020b5fb8`，无 actionable findings。Host 已核对全部文件一致、验收并回收审查工作树。
 
 验证：`cargo test --manifest-path core/Cargo.toml -p c2-mem -p c2-wire --lib --locked --offline`：177 + 146 passed；`cargo test --manifest-path core/Cargo.toml -p c2-server --lib --locked --offline`：168 passed，包含 SHM 无 inline materialization 回归。各命令设置本轮 CARGO_TARGET_DIR、空 C2_ENV_FILE/C2_RELAY_ANCHOR_ADDRESS。4 文件 rustfmt 与 diff check 通过。重建 Python 原生扩展后，B2 同一组 4 文件测试再次 30 passed。日志分别为 `/tmp/c2-slim-implementation-20261013/b4-memory-wire.log`、`b4-server.log`、`b4-python-r2.log`。
 
@@ -570,13 +570,13 @@ Python 原生扩展初次 system mode 重建成功，但默认加载因缺少 li
 
 ### B5：内部孤儿 helper
 
-B4 实现提交为 `b4c2a4ae7a084db00fc073e9e49500bba085ce2e`。本批 4 文件仅删除 123 行，包括 process_guard 的唯一专属测试及两个失去用途的 import；没有新增实现或测试。Host 与独立审查均检查引用、动态加载、导出及活动指导，未发现运行消费者。native config、真实 manifest/receipt 校验和两条实际进程清理路径保留。独立审查快照 `63f3918f05617642d7844de02321220b609961d2`，run `7497f52d-994a-4be0-a67f-8605ef4c2fa3`，无 actionable findings。审查只读沙箱拒绝 here-document 临时文件，因此补充 AST 比对由 Host 执行：扣除明确删除的定义、专属测试和 imports 后，保留 AST 完全相同，候选文件与审查快照字节一致；Host 已验收并回收审查工作树。
+B4 实现提交为 `b4c2a4ae7a084db00fc073e9e49500bba085ce2e`。本批 4 文件仅删除 123 行，包括 process_guard 的唯一专属测试及两个失去用途的 import；没有新增实现或测试。Host 与独立审查均检查引用、动态加载、导出及活动指导，未发现运行消费者。native config、真实 manifest/receipt 校验和两条实际进程清理路径保留。独立审查快照 `63f3918f05617642d7844de02321220b609961d2`，无 actionable findings。审查只读沙箱拒绝 here-document 临时文件，因此补充 AST 比对由 Host 执行：扣除明确删除的定义、专属测试和 imports 后，保留 AST 完全相同，候选文件与审查快照字节一致；Host 已验收并回收审查工作树。
 
 验证：`C2_ENV_FILE= C2_RELAY_ANCHOR_ADDRESS= uv run --no-sync pytest tests/repo/test_local_registry.py tests/repo/test_package_consumers.py tests/repo/test_local_candidate_manifest.py sdk/python/tests/unit/test_ipc_config.py sdk/python/tests/unit/test_runtime_session.py::test_native_runtime_session_projects_client_ipc_overrides_copy sdk/python/tests/unit/test_runtime_session.py::test_native_runtime_session_resolves_client_ipc_config -q --timeout=30`：113 passed，diff check 通过。日志 `/tmp/c2-slim-implementation-20261013/b5-regression.log`，结构比对 `/tmp/c2-slim-implementation-20261013/b5-structure-check.json`。实际 package_consumers.py 与 source_validation.py 字节未变；该结果不宣称 Windows 进程树终止已获动态证明，也不为仓外私有导入建立兼容承诺。
 
 ### B6：退役发布脚本
 
-B5 实现提交为 `77b3d9bd73c2b6163706891d7f2bdd25710ee187`。本批 6 文件只删除 410 行，包括两个旧脚本、12 项专属测试、CI 中两个旧选择和 4 个旧路径断言。两个现行发布 workflow 与 promote_release_candidate.py 相对基线字节未变。独立审查快照 `49a132425f546d6d8262ee6db0fa914f46e3e1b0`，run `0aea2c40-e715-4dc5-8640-23e571806d8e`，无 actionable findings；Host 已核对所有候选路径与快照一致、验收并回收审查工作树。
+B5 实现提交为 `77b3d9bd73c2b6163706891d7f2bdd25710ee187`。本批 6 文件只删除 410 行，包括两个旧脚本、12 项专属测试、CI 中两个旧选择和 4 个旧路径断言。两个现行发布 workflow 与 promote_release_candidate.py 相对基线字节未变。独立审查快照 `49a132425f546d6d8262ee6db0fa914f46e3e1b0`，无 actionable findings；Host 已核对所有候选路径与快照一致、验收并回收审查工作树。
 
 验证按更新后 `.github/workflows/ci.yml` 的 workflow-policy 完整 12 文件选择列表执行，使用 `C2_ENV_FILE= C2_RELAY_ANCHOR_ADDRESS= uv run --no-project --offline --with pytest --with pytest-timeout --with packaging --with pyyaml --with maturin pytest --confcutdir=tests/repo ... -q --timeout=30`：506 passed，0 failed，53.91 秒；唯一 warning 来自故意构造重复 ZIP member 的负例。日志 `/tmp/c2-slim-implementation-20261013/b6-workflow-policy.log`，完整命令 `/tmp/c2-slim-implementation-20261013/b6-regression-command.txt`。包含 fake API 和实际 workflow shell 配合 fake gh 的 promotion 行为测试；本地通过不等于 hosted CI 或真实发布。diff check 通过，活动源码/测试/CI 中已无旧脚本引用。
 
@@ -586,23 +586,23 @@ B5 实现提交为 `77b3d9bd73c2b6163706891d7f2bdd25710ee187`。本批 6 文件�
 
 验证：`cargo test --manifest-path core/Cargo.toml -p c2-ipc --features test-support --lib --tests --locked --offline`：203 + 9 passed；`cargo test --manifest-path core/Cargo.toml -p c2-http --features relay --lib relay::state::tests --locked --offline`：45 passed，含旧 token 拒绝、owner 替换与共享在途调用。rustfmt/diff check 通过。各命令用既有 CARGO_TARGET_DIR 与空 C2_ENV_FILE/C2_RELAY_ANCHOR_ADDRESS；日志 `/tmp/c2-slim-round2-20261013/b7a-baseline.log`、`b7a-ipc.log`、`b7a-relay.log`。后续 Python 验证前已以既有 source mode/CPLUS_INCLUDE_PATH 重建 native，日志 `b7-native-build.log`。
 
-buddy 初始 health 正常，但提交时 launcher 返回 UPGRADE_IN_PROGRESS，未创建 run、未进入路由。按原生只读审查替代，由 `/root/b7a_independent_review`（gpt-6-sol/high）完成独立审查，无 actionable findings。Host 及 reviewer 起止均核对固定 diff SHA256 `5c02f2d9b894edbae86ae1ecafe27e0ccb35f8760ac9976594f1f84a5e029d59` 和两个文件 hash，一致后验收；记录 `b7a-review-manifest.json`、`b7a-independent-review.txt`。审查未执行测试，不将源码等价性结论当运行证据。
+独立审查改由原生只读代理完成，无 actionable findings。Host 及 reviewer 起止均核对固定 diff SHA256 `5c02f2d9b894edbae86ae1ecafe27e0ccb35f8760ac9976594f1f84a5e029d59` 和两个文件 hash，一致后验收；记录 `b7a-review-manifest.json`、`b7a-independent-review.txt`。审查未执行测试，不将源码等价性结论当运行证据。
 
 ### B7b：TypeScript 内部转发
 
-B7a 实现提交为 `e4b947a4c57ccbdc15f07e1f8aed331b5aa8c4c0`。本项唯一实现文件 index.ts，新增 1 行、删除 11 行。独立审查 run `64e48cca-ff00-49bd-86e3-7046d400e398`，固定快照 `f8de43786eda0a2d49542e6ba3f471101d65094d`，无 actionable findings；Host 核对字节一致后验收回收。buddy 此时已恢复为 0.32.0。参数绑定/closure、getter 顺序与次数、this、错误类型与 label、冻结和释放均保持；删除 helper 会改变调试栈帧，不承诺源码反射文本不变。
+B7a 实现提交为 `e4b947a4c57ccbdc15f07e1f8aed331b5aa8c4c0`。本项唯一实现文件 index.ts，新增 1 行、删除 11 行。独立审查固定快照 `f8de43786eda0a2d49542e6ba3f471101d65094d`，无 actionable findings；Host 核对字节一致后验收回收。参数绑定/closure、getter 顺序与次数、this、错误类型与 label、冻结和释放均保持；删除 helper 会改变调试栈帧，不承诺源码反射文本不变。
 
 验证：在 TypeScript 包目录运行 `npm run typecheck` 成功；以既有 CARGO_TARGET_DIR、CARGO_NET_OFFLINE=true 和空 C2_ENV_FILE/C2_RELAY_ANCHOR_ADDRESS 运行 `npm test`，含原生 Rust/C addon 构建：59 passed、0 failed、1 skipped（需要真实 Windows 的 current-SID 测试）。Node v25.8.1、npm 11.11.0。生成 index.d.ts 与删除前逐字节一致，SHA256 `a5f6e769498bbd868f1090a44e3fef7e21ece469e7b7b0e024cd409d7167b0cb`。日志 `/tmp/c2-slim-round2-20261013/b7b-typecheck.log`、`b7b-node.log`，diff check 通过。
 
 ### B7c：就绪等待与测试完成判据
 
-B7b 实现提交为 `d24bc2406d2721cb11d35e4aa17289736c6260cf`。本项 3 文件新增 12 行、删除 16 行；3 处等待移除，4 处伪释放探测移除，并发用例改为同一 20 秒 join 预算、三个 worker 全部退出且各完成 3 次调用，proxy 使用同一关闭路径的 context manager。20 秒仅界定 join，不宣称能取消卡住线程或界定全部注册/teardown。独立审查 run `aa5ba7a6-f648-4e6e-9994-c7beefb73652`，固定快照 `5e80d0fbc731e29863fb0cae59cf4b4a7c4e8486`，无 actionable findings；Host 核对候选字节一致后验收回收。
+B7b 实现提交为 `d24bc2406d2721cb11d35e4aa17289736c6260cf`。本项 3 文件新增 12 行、删除 16 行；3 处等待移除，4 处伪释放探测移除，并发用例改为同一 20 秒 join 预算、三个 worker 全部退出且各完成 3 次调用，proxy 使用同一关闭路径的 context manager。20 秒仅界定 join，不宣称能取消卡住线程或界定全部注册/teardown。独立审查固定快照 `5e80d0fbc731e29863fb0cae59cf4b4a7c4e8486`，无 actionable findings；Host 核对候选字节一致后验收回收。
 
 验证：重建 native 后，原三文件基线 33 passed；保留旧等待加入完成判据后，该并发用例 1 passed；删等待后 `C2_ENV_FILE= C2_RELAY_ANCHOR_ADDRESS= uv run --no-sync pytest sdk/python/tests/integration/test_zero_copy_ipc.py sdk/python/tests/integration/test_ipc_buddy_reply.py sdk/python/tests/integration/test_direct_ipc_control.py -q --timeout=30`：33 passed。另实际调用 benchmark 两个入口（64 byte、2 MiB segment、原有轮次）均完成；只作 smoke，不使用中位耗时作性能结论。c2-server::buddy_dispatch_passes_shm_request_to_callback_without_inline_materialization 定向回归 1 passed。日志位于 `/tmp/c2-slim-round2-20261013/` 的 b7c-baseline.log、b7c-completion-baseline.log、b7c-regression.log、b7c-benchmark-smoke.log、b7-shm.log。diff check 通过。
 
 ### B8a：BorrowedPayload 直接持有
 
-B7c 实现提交为 `b4e916c9aae66a270fc9ec7ed66f41fad0aa01e8`。本项唯一源码 payload.rs 新增 4 行、删除 9 行，删除只有构造 Some 和 Drop take 的 Option 状态；公开借用和生成接口、先失效再析构及 request lease 顺序保持。独立审查 run `36b12c3f-e10a-49a1-8559-fc9ba5582f07`、快照 `26c9c0fad493031c4b21b5ec10d70c4afff1d945`，无 actionable findings，Host 核对字节一致后验收回收。丢弃 invalidation Err 的原策略未改变；顺序等价不等于失效必然成功，也不承诺无 repr 的 Rust 类型布局不变。
+B7c 实现提交为 `b4e916c9aae66a270fc9ec7ed66f41fad0aa01e8`。本项唯一源码 payload.rs 新增 4 行、删除 9 行，删除只有构造 Some 和 Drop take 的 Option 状态；公开借用和生成接口、先失效再析构及 request lease 顺序保持。独立审查快照 `26c9c0fad493031c4b21b5ec10d70c4afff1d945`，无 actionable findings，Host 核对字节一致后验收回收。丢弃 invalidation Err 的原策略未改变；顺序等价不等于失效必然成功，也不承诺无 repr 的 Rust 类型布局不变。
 
 验证：`cargo test --manifest-path sdk/rust/Cargo.toml --all-features --test payload_lifetime --locked --offline`：4 passed；`cargo test --manifest-path core/Cargo.toml -p c2-codegen --test generated_rust_sdk --locked --offline`：4 passed，含真实生成消费者的业务 Err、编码失败和 panic 出口。使用第一轮已验证官方 FastDB SDK 的 system mode、限定的 DYLD_LIBRARY_PATH、既有 target 和空 C2 环境；没有修改依赖。rustfmt/diff check 通过。日志 `/tmp/c2-slim-round2-20261013/b8a-payload-lifetime.log`、`b8a-generated.log`。
 
@@ -612,7 +612,7 @@ B8a 实现提交为 `e9d0650c882fa95dd87d0b21a8ed037683321bed`。生产 session.
 
 验证：Core lib 104、client_modes 15、connect_timeout 5、endpoint_context 12、native_endpoint 4，共 140 passed；endpoint_context 两个 ignored 是由父测试以 --ignored 启动的隔离子进程入口。命令为 `cargo test --manifest-path core/Cargo.toml -p c2-core --lib --test native_endpoint --test client_modes --test endpoint_context --test connect_timeout --locked --offline`，带既有 target 和空 C2 环境。source mode 重建 Python native 后，`uv run --no-sync pytest sdk/python/tests/unit/test_runtime_session.py sdk/python/tests/unit/test_ipc_config.py -q --timeout=30`：107 passed。rustfmt/diff check 通过。日志 `/tmp/c2-slim-round2-20261013/b8b-baseline.log`、`b8b-core.log`、`b8b-native-build.log`、`b8b-python.log`。
 
-独立审查 run `2a590608-7558-458b-a75f-6f2293d5df11`、固定快照 `e46b3ab5dbf8184051b2781f545ae3221b7c007a`，无 actionable findings；Host 核对字节后验收回收。审查保留 endpoint 冻结与 client config 冻结的区别，以及 Python client_ipc_config 原有重新解析投影，未顺带做语义修改。
+独立审查固定快照 `e46b3ab5dbf8184051b2781f545ae3221b7c007a`，无 actionable findings；Host 核对字节后验收回收。审查保留 endpoint 冻结与 client config 冻结的区别，以及 Python client_ipc_config 原有重新解析投影，未顺带做语义修改。
 
 ### B8c：sweep 的配对 owner
 
@@ -622,7 +622,7 @@ B8b 实现提交为 `2949cd719621ae9bb59a74cbb19eff31e5d0c44e`。生产 endpoint
 
 验证：既有 source mode/CPLUS_INCLUDE_PATH/target 下重新构建 Python native 成功；`C2_ENV_FILE= C2_RELAY_ANCHOR_ADDRESS= uv run --no-sync pytest sdk/python/tests/unit/test_endpoint_maintenance.py sdk/python/tests/unit/test_endpoint_context.py -q --timeout=30`：111 passed、5 skipped（Windows named-pipe 平台合同用例）。rustfmt/diff check 通过。日志 `/tmp/c2-slim-round2-20261013/b8c-baseline.log`、`b8c-baseline-r2.log`、`b8c-baseline-r3.log`、`b8c-native-build.log`、`b8c-python.log`；前两次失败不计为通过。本地未执行 Windows 或 free-threading 并发验证。
 
-独立审查 run `4625622f-263e-4d35-ac0b-f1c90b264649`、固定快照 `8bda12ac2b50f490aca9be3a5be3ddb4688ef8a8`，无 actionable findings；Host 核对所有候选字节一致后验收回收。审查为源码证据，与 Host 运行结果分别记录。
+独立审查固定快照 `8bda12ac2b50f490aca9be3a5be3ddb4688ef8a8`，无 actionable findings；Host 核对所有候选字节一致后验收回收。审查为源码证据，与 Host 运行结果分别记录。
 
 ### 测试收敛纠偏
 
@@ -630,7 +630,7 @@ B8b 实现提交为 `2949cd719621ae9bb59a74cbb19eff31e5d0c44e`。生产 endpoint
 
 定向验证：IPC connect_timeout 7 passed（其中表内 10 个场景），Core native_endpoint 3 passed，Python endpoint_maintenance 59 passed，relay state 45 passed；rustfmt/diff check 通过。命令沿用上述 target 和空 C2 环境；日志在 `/tmp/c2-slim-round2-20261013/correction-{ipc-final,config-final,sweep,relay}.log`。测试名和数量因合并变化，不能据此相加或推断覆盖等量。
 
-首次纠偏审查 run `f6c75a41-ff9f-45e7-a9da-04aa74f9e10c` 指出直接删除 IPC 末次结果用例会丢失独有保护，Host 采纳并改为合并用例。重审 run `7262da2f-f19b-40ed-9775-bcac9ca04daf` 因 serverOverloaded 失败，已结案回收，不计通过；随后原生独立代理 `/root/correction_final_independent_review`（gpt-6-sol/high）完成三个测试文件的窄审，无 actionable findings。Host 核对审查起止及最终三文件 diff SHA256 均为 `1c540ef6651b990dbd207fa4dd70f2116d6bf1494ab638ac7ff6348e7b4a3468`；运行证据与源码审查分别记录。
+首次纠偏审查指出直接删除 IPC 末次结果用例会丢失独有保护，Host 采纳并改为合并用例。重审因 serverOverloaded 失败，已结案回收，不计通过；随后原生独立代理完成三个测试文件的窄审，无 actionable findings。Host 核对审查起止及最终三文件 diff SHA256 均为 `1c540ef6651b990dbd207fa4dd70f2116d6bf1494ab638ac7ff6348e7b4a3468`；运行证据与源码审查分别记录。
 
 ## 第三轮：登记与 relay 整体收敛
 
@@ -638,15 +638,15 @@ B8b 实现提交为 `2949cd719621ae9bb59a74cbb19eff31e5d0c44e`。生产 endpoint
 
 R11 基线 `b9936f0aa18bb4319139e2e48fa6f72565cb58b4`，5 个 Rust 文件净减少 191 行（含内嵌测试）。删除 RuntimeRouteSpec、双规格构造及 Session 对账；同一 BuiltRoute 派生一次 relay expected。静态 wire 校验收口到 BuiltRoute 私有构造器，handle 由同一 scheduler 派生；reserve 保留动态状态检查。两个专属失配测试及双规格夹具退出，三个非法输入用例改测构造拒绝，未新增测试框架或公开 API。
 
-R11 验证：Core lib 102、host_routes 5、client_modes 15、Server lib 168 passed；source mode 重建 Python native 后，runtime_session、runtime_session_lifecycle、core_transport_parity 首次 73 passed / 1 skipped（缺少可发现的 c3），构建并用 CTWO_TEST_C3_BIN 指定当前 c3 后 parity 文件 3 passed，补齐该跳过项。独立审查 run `9ede0945-0e80-4da2-b0f7-147cd0e140cd`、输入 `a9924810ca04f8500c6c53af566ee99a518b41f7` 无功能性阻塞；Host 清掉审查/编译器指出的五处失效测试导入后重跑 Core/Server lib，无 warning，并核对除此以外五文件与快照一致，审查已验收回收。日志和固定差异证据在 `/tmp/c2-slim-b9-20261013/r11-*`；本地 macOS 验证不代替 Windows、hosted CI 或二进制 ABI 验证。
+R11 验证：Core lib 102、host_routes 5、client_modes 15、Server lib 168 passed；source mode 重建 Python native 后，runtime_session、runtime_session_lifecycle、core_transport_parity 首次 73 passed / 1 skipped（缺少可发现的 c3），构建并用 CTWO_TEST_C3_BIN 指定当前 c3 后 parity 文件 3 passed，补齐该跳过项。独立审查（输入 `a9924810ca04f8500c6c53af566ee99a518b41f7`）无功能性阻塞；Host 清掉审查/编译器指出的五处失效测试导入后重跑 Core/Server lib，无 warning，并核对除此以外五文件与快照一致，审查已验收回收。日志和固定差异证据在 `/tmp/c2-slim-b9-20261013/r11-*`；本地 macOS 验证不代替 Windows、hosted CI 或二进制 ABI 验证。
 
 R11 实现提交为 `e20a614cd77f817bf33cc2d7fb1b198f73e6ae5d`。R39 在此基础上移除 RouteCommand/execute 及混合成功结果，五种操作仍通过同一个 RouteAuthority 执行，登记/注销使用各自的成功结果；公开结果、错误映射、锁和清理顺序保留。测试迁移调用入口并删除恒定成功标签断言，4 个文件净减少 97 行。
 
-R39 变更前后 `cargo test --manifest-path core/Cargo.toml -p c2-http --features relay --lib --locked --offline` 均 427 passed；重建 c3 并指定 CTWO_TEST_C3_BIN 后 Python core_transport_parity 3 passed。独立审查 run `883a09e3-76ab-49b9-b921-b8627b49450c`、输入 `5cdc6a9a9fa86ecaac25f39b1c9c8f1caa6fa28e` 无 actionable findings；Worker 可选机械对比未执行，Host 已在内存核对五个操作函数体除成功结果名称/unit外一致，并验证四文件与固定快照逐字节相同，审查已验收回收。日志及 manifest 在 `/tmp/c2-slim-b9-20261013/r39-*`；本轮未重建不含 relay server feature 的 Python native。
+R39 变更前后 `cargo test --manifest-path core/Cargo.toml -p c2-http --features relay --lib --locked --offline` 均 427 passed；重建 c3 并指定 CTWO_TEST_C3_BIN 后 Python core_transport_parity 3 passed。独立审查（输入 `5cdc6a9a9fa86ecaac25f39b1c9c8f1caa6fa28e`）无 actionable findings；Worker 可选机械对比未执行，Host 已在内存核对五个操作函数体除成功结果名称/unit外一致，并验证四文件与固定快照逐字节相同，审查已验收回收。日志及 manifest 在 `/tmp/c2-slim-b9-20261013/r39-*`；本轮未重建不含 relay server feature 的 Python native。
 
 R39 实现提交为 `2946340d`。T02 在此基础上删除两个 cfg(test) name-only resolve 入口和专属源码签名检查，迁移 102 处调用：选路/排序/活性/投影走生产 resolve_matching，拒绝写入、撤回和保留状态直接观察存储；沿用现有夹具，6 文件净减少 107 行。Host 在内存核对运行时代码前缀，除 cfg(test) helper 删除与一行注释外逐字节一致。
 
-T02 完整 relay lib 426 passed（退出一个旧源码检查，原为 427）；独立审查 run `78e1abf7-7553-47a3-be6c-521608e22112`、输入 `2bc9e7bd6cde0fa2281358e3ecc1432d86d572a5` 指出三处旧协议拒绝用例丢失隐含 peer 活性断言。Host 按意见显式检查 peer_is_alive，保留存储检查，其中一处替换较弱 has_peer；修后 peer_handlers 27 passed。六文件已核对等于快照加这三处指定断言，审查已验收回收；没有把未执行的 Worker 机械比较当通过。日志及 manifest 在 `/tmp/c2-slim-b9-20261013/t02-*`。
+T02 完整 relay lib 426 passed（退出一个旧源码检查，原为 427）；独立审查（输入 `2bc9e7bd6cde0fa2281358e3ecc1432d86d572a5`）指出三处旧协议拒绝用例丢失隐含 peer 活性断言。Host 按意见显式检查 peer_is_alive，保留存储检查，其中一处替换较弱 has_peer；修后 peer_handlers 27 passed。六文件已核对等于快照加这三处指定断言，审查已验收回收；没有把未执行的 Worker 机械比较当通过。日志及 manifest 在 `/tmp/c2-slim-b9-20261013/t02-*`。
 
 ### B10：IPC overrides 私有投影去重
 
@@ -656,7 +656,7 @@ T02 完整 relay lib 426 passed（退出一个旧源码检查，原为 427）；
 
 首次 `uv run --frozen --offline` 因自动重建 FastDB 缺失 C++ 头文件路径而在测试启动前失败。合并后的 `test_ipc_config.py`、`test_runtime_session.py` 在原已安装扩展上 107 passed；随后使用 source mode、既有共享 target 与 macOS SDK C++ include 路径重新 `uv sync --frozen --offline --reinstall-package c-two` 成功，候选扩展上相同两文件 107 passed，`git diff --check` 通过。Host 将新 helper 内联展开，整份 `config_ffi.rs` 与基线逐字节一致，覆盖字段次序、base/flat 优先级及错误传播的等价核对。
 
-独立审查 run `412874ec-43ab-42e4-a261-c6c9fb62f5d6`、固定输入 `f10e0f0c99f08a137b5ac14d56fcf269e8a1e4f9` 无 actionable findings；Host 已核对三个文件与审查输入的 SHA-256 一致并验收回收。日志、机械对比与 manifest 位于 `/tmp/c2-slim-b10-20261013/r30-*`。验证范围为本地 macOS 的 native 构建与相关 Python 回归。
+独立审查（固定输入 `f10e0f0c99f08a137b5ac14d56fcf269e8a1e4f9`）无 actionable findings；Host 已核对三个文件与审查输入的 SHA-256 一致并验收回收。日志、机械对比与 manifest 位于 `/tmp/c2-slim-b10-20261013/r30-*`。验证范围为本地 macOS 的 native 构建与相关 Python 回归。
 
 ### B11：FULL_SYNC 的接纳与合并收敛
 
@@ -666,7 +666,7 @@ T02 完整 relay lib 426 passed（退出一个旧源码检查，原为 427）；
 
 基线完整 relay lib 426 passed；先只迁移测试、保持原生产实现时，route_table 定向 55 passed；随后候选 `cargo test --manifest-path core/Cargo.toml -p c2-http --features relay --lib --locked --offline` 为 420 passed，`git diff --check` 通过。总数减少 6 项来自六拒绝用例合一及 owner 字段用例并入 roundtrip，原行为场景保留。Host 与独立审查均核对 replacement 提交、tombstone 和 peer 更新后半段与基线逐字节一致。验证范围为本地 macOS 的 c2-http relay feature；未据此声明跨平台或发布通过。
 
-独立审查 run `011ceac7-fa53-4e7b-ad65-49f099058d0c`、固定输入 `bc0993985036e66f3408e82f8a026f890ea8d976` 无 actionable findings；Host 已复核构造不变量、动态状态边界与测试迁移，确认源文件 SHA-256 等于审查输入并验收报告。日志和 manifest 位于 `/tmp/c2-slim-b11-20261013/r28-*`。
+独立审查（固定输入 `bc0993985036e66f3408e82f8a026f890ea8d976`）无 actionable findings；Host 已复核构造不变量、动态状态边界与测试迁移，确认源文件 SHA-256 等于审查输入并验收报告。日志和 manifest 位于 `/tmp/c2-slim-b11-20261013/r28-*`。
 
 ### B12：Digest 消息表示与应用逻辑收敛
 
@@ -676,7 +676,7 @@ HTTP 与两个后台消费位置共用 `RouteAuthority::apply_digest_diff`，继
 
 两项 sender/CRM 拒绝测试合并为两个场景，均放入合法前缀验证整批拒绝；既有删除用例追加相同 digest 在 announce/heartbeat/leave 入口返回 OK 且不改状态的检查。active/deleted hash replay、旧协议、有效应用、URL 和 dead-peer 覆盖保留。测试净减少 10 行，四个非文档文件合计净减少 109 行。
 
-基线完整 relay lib 420 passed；测试先在旧实现上 peer_handlers 26 passed；候选 `cargo test --manifest-path core/Cargo.toml -p c2-http --features relay --lib --locked --offline` 为 419 passed，一项数量差来自两拒绝用例合并。之后仅格式化所改函数，Host 在内存确认空白外内容一致；`git diff --check` 通过。独立审查 run `44f7b584-5124-4cf7-8f10-f77a2afa91f8`、固定输入 `1f280fb7d13234a7d553fcadca962346b29cabfb` 无 actionable findings，四文件与输入 SHA-256 一致并已验收。日志、差量和 manifest 位于 `/tmp/c2-slim-b12-20261013/r28-*`；验证范围为本地 macOS 的 relay feature。
+基线完整 relay lib 420 passed；测试先在旧实现上 peer_handlers 26 passed；候选 `cargo test --manifest-path core/Cargo.toml -p c2-http --features relay --lib --locked --offline` 为 419 passed，一项数量差来自两拒绝用例合并。之后仅格式化所改函数，Host 在内存确认空白外内容一致；`git diff --check` 通过。独立审查（固定输入 `1f280fb7d13234a7d553fcadca962346b29cabfb`）无 actionable findings，四文件与输入 SHA-256 一致并已验收。日志、差量和 manifest 位于 `/tmp/c2-slim-b12-20261013/r28-*`；验证范围为本地 macOS 的 relay feature。
 
 ### B13：私有握手快照与墓碑副本收敛
 
@@ -686,7 +686,7 @@ catalog 的 list/stale lookup/contract mismatch 三套相同夹具合一，保�
 
 Rust 基线 IPC lib 203 + integration 7 + server 168 passed；仅合并测试时 catalog 5 passed；候选 IPC 203 + 7、server 166 passed，减少两项为夹具合并。TypeScript 初次基线因缺少编译器依赖而失败，按锁文件 npm ci --ignore-scripts 后基线/候选 transport contract 均 7 passed，候选严格生成类型检查 1 passed。临时脚本使用两版完整 asset 的真实 decoder 对照 1361 个确定性输入，324 accepted、1037 rejected，保留的元数据或异常类型/完整文案一致；范围包含所有前缀截断、逐字节扰动、超范围 revision 和尾随字节，明确忽略退出的私有 routes 字段，脚本未进仓库。
 
-独立审查 run `578ec828-491e-42dc-ae7a-4efda9de4473`、固定输入 `0401fca2d2aefb4ab9f1852c15b6c5b1bc8ea7a2` 无 actionable findings；Host 已核对三文件 SHA-256、实际回归及私有边界并验收报告，`git diff --check` 通过。日志、对照脚本和 manifest 位于 `/tmp/c2-slim-b13-20261013/r34-*`。验证限本地 macOS；R34 的公开协议面和其他构造优化仍未处理。
+独立审查（固定输入 `0401fca2d2aefb4ab9f1852c15b6c5b1bc8ea7a2`）无 actionable findings；Host 已核对三文件 SHA-256、实际回归及私有边界并验收报告，`git diff --check` 通过。日志、对照脚本和 manifest 位于 `/tmp/c2-slim-b13-20261013/r34-*`。验证限本地 macOS；R34 的公开协议面和其他构造优化仍未处理。
 
 ### B14：R22 基准工具复用既有 SDK 生命周期
 
@@ -700,7 +700,7 @@ Rust 基线 IPC lib 203 + integration 7 + server 168 passed；仅合并测试时
 
 当前 c3 和 Python native 已从本批基线重建。最终 benchmark 13 + examples syntax 9 = 22 passed，无跳过；三个 benchmark 模块另以 Python 3.10 compile 通过。真实 hey 预热报告 496 次、正式 3 次响应，全部 200，单次响应内容为 Hello, Benchmark!，路由及自有 payload 文件已清除。真实 session 探针先调用 manager、后登记 builder，以 idle_timeout=1 的实际 sweeper 约 5 秒后确认驱逐；两条 route identity 保留，8 个并发 builder 调用和 manager 调用通过，最终精确撤回。既有 Rust production_idle_sweeper 回归也为 1 passed，覆盖活跃请求保留和并发共享重连。上述为本地 macOS 正确性证据，不构成吞吐提升或跨平台验收。
 
-首审 run `dea9d4fc-5f4c-450b-95c4-b9d2e91ca51b` 的冻结 anchor 问题已复现并修复；第二轮 run `d3e92af8-c6a5-44f6-9432-b996c0fbca03`、固定输入 `f5be7af91639ec97801352cce50637a05a87b172` 无 actionable findings。Host 核对四文件 SHA-256 与固定输入一致，两份审查报告已验收并回收工作树。`git diff --check` 通过。日志、探针、红绿结果和哈希清单位于 `/tmp/c2-slim-b14-20261013/`。R22 的其他脚本 selector 项不在本批；后续优先回到生产运行时重复逻辑和复杂状态。
+首审指出的冻结 anchor 问题已复现并修复；第二轮（固定输入 `f5be7af91639ec97801352cce50637a05a87b172`）无 actionable findings。Host 核对四文件 SHA-256 与固定输入一致，两份审查报告已验收并回收工作树。`git diff --check` 通过。日志、探针、红绿结果和哈希清单位于 `/tmp/c2-slim-b14-20261013/`。R22 的其他脚本 selector 项不在本批；后续优先回到生产运行时重复逻辑和复杂状态。
 
 ### B15：R30 私有 IPC override 赋值收敛
 
@@ -710,11 +710,11 @@ Rust 基线 IPC lib 203 + integration 7 + server 168 passed；仅合并测试时
 
 候选 c2-config lib 135 passed，relay upstream 实际配置传播及重连 4 passed；重建 Python native 后，`test_ipc_config.py` 与 `test_runtime_session.py` 共 107 passed，合计 246 项通过、无跳过。临时 native 新旧对照包含 server/client 各六组输入：默认值、全部 16 个字段、false/zero/None、有效 override 遇到非法数值或布尔环境值，以及派生溢出；12 组结果及异常类型、完整文案一致。对照脚本未进仓库，验证范围为本地 macOS。
 
-独立审查 run `5bc00a2b-1c0a-4a9f-a6c5-440c2810773e`、固定输入 `b9b455b9f0f39311cb5c1685dd5a5fa2fe799be3` 无 actionable findings。Host 复核源码 SHA-256 与审查输入一致，核对实际回归后验收并回收审查工作树。日志、16 字段清单、差量审计及新旧对照位于 `/tmp/c2-slim-b15-20261013/`。
+独立审查（固定输入 `b9b455b9f0f39311cb5c1685dd5a5fa2fe799be3`）无 actionable findings。Host 复核源码 SHA-256 与审查输入一致，核对实际回归后验收并回收审查工作树。日志、16 字段清单、差量审计及新旧对照位于 `/tmp/c2-slim-b15-20261013/`。
 
 ### B16：测试端点收尾与存量精确回收
 
-执行基线为 `2f518d3ff86cc9ecad270d2d373f185c2238965a`。用户批准修复测试收尾，要求复用现有 close/reap、验收本次端点零残留，本轮不用 buddy。原生 Drop 在 gate 争用时有意释放句柄并保留记录；缺口是部分测试将 Drop 或 runtime 退出当成完整收尾。隔离诊断中，串行 Drop 32 对连接无残留，8 路并行 Drop 256 对留下 50 组 socket/lease；同样并行显式 close 为零，50 组均可用原生凭据精确回收。
+执行基线为 `2f518d3ff86cc9ecad270d2d373f185c2238965a`。用户批准修复测试收尾，要求复用现有 close/reap、验收本次端点零残留。原生 Drop 在 gate 争用时有意释放句柄并保留记录；缺口是部分测试将 Drop 或 runtime 退出当成完整收尾。隔离诊断中，串行 Drop 32 对连接无残留，8 路并行 Drop 256 对留下 50 组 socket/lease；同样并行显式 close 为零，50 组均可用原生凭据精确回收。
 
 `LocalStream::pair` 在连接尝试结束后通过 spawn_blocking 完成既有 close；普通 listener/codec/peer 夹具检查关闭结果，独立 race server 在 runtime 退出前等待 shutdown。deadline Peer 的取消会移交 listener，故在 readiness 保存 credential，在停止并 join 后对该实例有界 reap。真正测试 Drop、进程异常退出和 stale credential 的场景保留。Python namespace 夹具检查完整终态中的 runtime_barrier_error，精确回收并观察 absent；退出没有消费者且构造接口过期的 hello_server 及其专属准备链，共删除 51 行。生产编译的 pair 辅助函数净增 8 行，测试净增 48 行，非文档合计净增 56 行；本批为收尾缺陷修复，未引入测试框架或改变 Core 生命周期策略。
 
@@ -726,7 +726,7 @@ Rust 基线 IPC lib 203 + integration 7 + server 168 passed；仅合并测试时
 
 ### B17：初始化失败的新建 lease 回滚
 
-执行基线为 `6788f5e19db9e6e367b8d41b074603a79e8106ae`。前轮确认初始化在 owner record 写入前失败会留下空 lease；12 个历史文件中仅 2 个能逐项关联到旧测试的 EPERM bind 失败，其余 10 个未确认具体来源。用户批准修复当前初始化回滚，要求只撤回本次新建且身份未变的 lease，保留历史对象回收规则，本轮继续不用 buddy。
+执行基线为 `6788f5e19db9e6e367b8d41b074603a79e8106ae`。前轮确认初始化在 owner record 写入前失败会留下空 lease；12 个历史文件中仅 2 个能逐项关联到旧测试的 EPERM bind 失败，其余 10 个未确认具体来源。用户批准修复当前初始化回滚，要求只撤回本次新建且身份未变的 lease，保留历史对象回收规则。
 
 bind 通过 `O_CREAT | O_EXCL` 区分新建与既有 lease；回滚在原 gate 和文件句柄仍持有时核对目录、gate、lease 身份及原生锁。已成功绑定 socket 时，先由既有 socket guard 撤回，确认路径消失后才撤 lease；未知 socket、替换项及失去原身份的对象继续保留。既有 lease 不获得新文件回滚权限，`reap`/`sweep`、Core 生命周期、公开 API/ABI 均未修改，显式 OFD 解锁保留。中英文生命周期指南说明当前回滚边界；历史验收报告补注新旧行为，未改写旧验证结果。
 
@@ -740,7 +740,7 @@ bind 通过 `O_CREAT | O_EXCL` 区分新建与既有 lease；回滚在原 gate �
 
 ### B18：R14 私有 SHM 分配流程收敛
 
-执行基线为 `e0dda8fa2e8833afb400064c775be57061e37840`。用户确认本批只统一内存池分配流程，保留 GC 时机、错误顺序、预算/压力计数与释放语义；R01/R02、公开 API/ABI、布局和 GC 策略均不在范围内。本轮继续不用 buddy。
+执行基线为 `e0dda8fa2e8833afb400064c775be57061e37840`。用户确认本批只统一内存池分配流程，保留 GC 时机、错误顺序、预算/压力计数与释放语义；R01/R02、公开 API/ABI、布局和 GC 策略均不在范围内。
 
 `pool.rs` 的 `alloc`、`alloc_handle`、`try_alloc_shm` 共用私有 `alloc_shm`，后者由既有 `alloc_buddy` 加入原入口的资格判断形成，保持 reuse → GC 有回收才 retry → 容量允许才 expand → dedicated 的顺序。`alloc` 的提前 dedicated GC 仍在零长度检查前；另两个入口保留原校验顺序，只有 `alloc_handle` 在最终 SHM 失败后尝试 file spill，各自错误投影不变。私有 `into_handle` 按真实 `is_dedicated` 投影，buddy 的 actual_size/generation 与请求 len 分别保留。Host 机械比较确认：五个指定函数外生产代码逐字节一致，共享 tier 原函数体除外层资格判断和缩进外一致，计费、压力、释放函数未修改。
 
@@ -754,7 +754,7 @@ Rust 与 Python 回归后分别比对默认端点目录条目及 inode，新增/
 
 ### B19：R32 Rust 错误码单一声明
 
-执行基线为 `d3fe71bc2bdabbe7de30d0537705b09051ee2b39`。用户批准只收敛错误码声明，保留名称、数值、registry 顺序、repr、公开签名及各入口未知码语义。本轮继续不用 buddy。
+执行基线为 `d3fe71bc2bdabbe7de30d0537705b09051ee2b39`。用户批准只收敛错误码声明，保留名称、数值、registry 顺序、repr、公开签名及各入口未知码语义。
 
 `c2-error/src/lib.rs` 用一个模块私有宏从既有 26 项声明生成同名 enum、同序 registry、穷尽的 name 匹配及 TryFrom。`repr(u16)`、六项 derive 和公开签名保持；未知数值仍返回 `Err(())`，由原调用方分别拒绝或保留上下文后降级。Host 机械核对声明列表逐字一致，ErrorCodeEntry、From 转换、其余生产代码（含完整 wire codec）均未改变。Python 直投、序列化、凭据投影不在本批。
 

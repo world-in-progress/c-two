@@ -43,4 +43,4 @@ Rust 公开 API、C/FFI ABI 5、IPC 12、SHM 3、owner control 1、业务帧、C
 
 ## 本轮分析证据
 
-Host 已检查上述完整调用链、全部 Python/native credential 引用、引入提交及现有回归。hey-my-buddy 0.51.1 的独立只读复核已完成，run `771d4450-4006-4ddb-b619-4d8b21488fb1`，artifact `add90cee-9b53-4b30-95de-c9e5855e355c`，固定输出仍为分析输入提交，patch 为空。复核认可本项范围及净量估算；Host 已采纳 `document=`、Python repr、浅复制变化及区分纯构造与真实 inspect 反例的意见，验收分析交付并回收审查 worktree。分析阶段只编辑方案和清单；用户随后确认了完整实施边界。实施前扩展既有 round-trip 用例，在原生产代码上运行端点单元及集成回归：122 passed、5 个 Windows 专属 skip，隔离端点 socket/lease 残留为零。
+Host 已检查上述完整调用链、全部 Python/native credential 引用、引入提交及现有回归。独立只读复核已完成，固定输出仍为分析输入提交，patch 为空。复核认可本项范围及净量估算；Host 已采纳 `document=`、Python repr、浅复制变化及区分纯构造与真实 inspect 反例的意见，验收分析交付并回收审查 worktree。分析阶段只编辑方案和清单；用户随后确认了完整实施边界。实施前扩展既有 round-trip 用例，在原生产代码上运行端点单元及集成回归：122 passed、5 个 Windows 专属 skip，隔离端点 socket/lease 残留为零。

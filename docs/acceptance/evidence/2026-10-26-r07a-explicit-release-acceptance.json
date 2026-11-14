@@ -156,23 +156,16 @@
   },
   "independent_reviews": [
     {
-      "run": "3218a4fc-53fa-4abd-8bfb-fbbee1bec7da",
-      "artifact": "20fb0ecc-d21a-44e7-aac3-f31e25fdbbb5",
       "input": "5811200c9eb21103b3d7cb5100e3d1cea04f9623",
       "scope": "six production files; no blocking findings; static only"
     },
     {
-      "run": "dd22dc78-e0bb-4f9d-b553-8d505b47fb23",
-      "artifact": "2a35ea4e-1120-43af-885a-4d14693c0895",
       "input": "d18028062fbe52f0392cb32615d8e01cdac4c081",
       "scope": "tests and API docs; no blocking findings; static only"
     }
   ],
   "review_delta": "Final six production bodies match reviewed input excluding comments; Host reviewed Windows teardown Duration argument correction and verified it natively. Both reviews accepted/reclaimed.",
   "baseline_worker": {
-    "run": "bb842283-2428-4935-aff6-e1a4cefb3482",
-    "buddy": "GLM-5.3 / bigmodel-api-2 / high",
-    "artifact": "39787fd1-0468-472f-ab10-56bc1ac352f9",
     "scope": "tests only, not built/run by Worker; Host split contention/poison and extended exact owner/real RPC cases; accepted adjusted target and reclaimed"
   },
   "resolved_validation_issues": [
@@ -209,7 +202,7 @@
     "socket_and_lease_zero": "task-owned real RPC assertions passed; Windows kernel endpoint refused connection after close",
     "shm_cleanup": "private counterexample mappings destroyed and native reopen rejected",
     "historical_directories_touched": false,
-    "source_and_text_evidence_retained_at": "~/.codex/diagnostics/c2-r07a-implementation-1_sjflpb/"
+    "source_and_text_evidence_retained_outside_repo": true
   },
   "remaining": [
     "Core/Held owner and connection pin on failure",

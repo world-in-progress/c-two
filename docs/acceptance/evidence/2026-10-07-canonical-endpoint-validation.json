@@ -917,14 +917,11 @@
     "finite shared-directory EOF deadline with per-batch1 and progress checks"
   ],
   "independent_reviews": {
-    "native_producer_review": "gpt-6.1-sol/high,44paths,3findings repaired before final source",
-    "buddy_run": "d7ed1b98-a9b6-4a12-b0f2-db3270fffd15",
-    "buddy_final_artifact": "2ab5c908-2c23-439c-9a7b-379702e26e3e",
-    "buddy_integration": "int-76e2cbee-fb70-4f81-9d95-0f94112c0485",
-    "buddy_verdict": "accepted bounded source review",
-    "buddy_report_sha256": "fbdf8ea89823e156b990fd200e11eb4b0573b41a91a5a51530241d81a0d6359a",
+    "native_producer_review": "44 paths reviewed; 3 findings resolved before final source",
+    "review_verdict": "accepted bounded source review",
     "pool_callbacks": "all15exactparent9e functions",
-    "limits": "Review did not verify hosted artifact evidence; Host separate validators did."
+    "limits": "Review did not verify hosted artifact evidence; Host separate validators did.",
+    "report_sha256": "fbdf8ea89823e156b990fd200e11eb4b0573b41a91a5a51530241d81a0d6359a"
   },
   "verifier_sha256": {
     "verify_linux_final.py": "7d4ca4f5cc3d3f187c8fab411209502156d75da38fe48533cb319116bbc34115",
@@ -939,6 +936,6 @@
     "incomplete initialization remains fail-closed",
     "OwnerBound private control is non-reconnectable",
     "Windows11 desktop not executed",
-    "installed Buddy runner adoption not demonstrated"
+    "integration with an installed downstream application not demonstrated"
   ]
 }

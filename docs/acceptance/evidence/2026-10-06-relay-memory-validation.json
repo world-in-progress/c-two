@@ -305,9 +305,6 @@
     "final_client_check": "Final client.rs passed rustfmt after sole-owner fix; other10changed Rust files unchanged from prior passed check."
   },
   "review": {
-    "relay_artifact": "4e59ec9a-fd33-46e8-b87b-fffcaee4e61b",
-    "drain_initial_finding_artifact": "b7dc8535-38b2-4434-9f62-cc0a0b3e00d8",
-    "drain_final_review_artifact": "e4b75224-6bd2-439a-a9bc-d1a6df08a64f",
     "owner_fixture_scope": {
       "base": "b49d5c6fde94ec3ec8032a4a76099c7c5492b3fa",
       "changed_paths": [

@@ -105,6 +105,6 @@ python3 /tmp/c2-full-review-1002/probes/carrier-incarnation.py
 
 ## Host 实际验收
 
-Host 审阅固定产物 `e5a99680-b170-4450-80ef-05f6433d5634` / `88fc42016c439210d32b5ccb172fe9afc9902fca` 的完整实现 diff 后，在主整合树运行真实 SHM 验证。`c2-mem` 155 项、`c2-wire` 136 项及 1 项文档测试全部通过，0 ignored；原公开 carrier 反例现在 exit 0，旧 carrier 读与释放均受控拒绝，replacement allocation 保留为 1。日志位于 `/tmp/c2-full-review-1002/carrier-mem-wire.log` 和 `carrier-public-probe.log`，机器收据为 `native-repo-result.json`。
+Host 审阅固定提交 `88fc42016c439210d32b5ccb172fe9afc9902fca` 的完整实现 diff 后，在主整合树运行真实 SHM 验证。`c2-mem` 155 项、`c2-wire` 136 项及 1 项文档测试全部通过，0 ignored；原公开 carrier 反例现在 exit 0，旧 carrier 读与释放均受控拒绝，replacement allocation 保留为 1。日志位于 `/tmp/c2-full-review-1002/carrier-mem-wire.log` 和 `carrier-public-probe.log`，机器收据为 `native-repo-result.json`。
 
 在专属 `c2-close-audit` 探针工作树完成上述 4 个 mutation：去掉 owner 校验分别使 buddy 碰撞、peer authority、Drop 保护失败；只退款不 free 使严格 abort 测试在 allocation count 断言失败。4 次均为预期的单项断言失败（exit 101），没有编译或权限错误。源码在 finally 中逐字恢复，mutation 未导入整合树。机器收据 `/tmp/c2-full-review-1002/carrier-mutation-fixture-result.json` 记录命令、结果及日志。此验收只关闭 carrier 与 abort 覆盖问题，不代表本次完整内存改动已交付。

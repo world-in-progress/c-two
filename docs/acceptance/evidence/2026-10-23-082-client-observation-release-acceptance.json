@@ -48,9 +48,10 @@
     ]
   },
   "reviews": {
-    "tool": "hey-my-buddy 0.51.1",
-    "implementation": "83ebdb7c-5ac3-4362-a050-5fd1c375a9cd",
-    "test_entrypoint": "dddbfeb0-0cfc-4b74-b1f5-821cff960d5b",
+    "scope": [
+      "implementation",
+      "test_entrypoint"
+    ],
     "outcome": "accepted; no unresolved blockers; read-only review distinct from test execution"
   },
   "source_validation": [
@@ -262,7 +263,7 @@
     "urgent_rust_target_directories": 9,
     "urgent_rust_disk_bytes": 2006691840,
     "free_GiB_after_urgent_cleanup": 9.7,
-    "buddy_checkouts": "reclaimed",
+    "review_worktrees": "reclaimed",
     "other_task_worktree": "slimming-batches retained after application ownership refusal",
     "preserved_other_task_branch": "socu/076-ci-release-gates",
     "historical_ipc": "not cleaned or migrated",

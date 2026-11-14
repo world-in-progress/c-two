@@ -410,24 +410,20 @@
   "independent_reviews": [
     {
       "topic": "connection initial",
-      "run_id": "8b201401-b90b-4f71-8d1e-f95308348a98",
       "outcome": "two P2 findings corrected and reproduced before correction"
     },
     {
       "topic": "connection final",
-      "run_id": "4c466140-81c1-44fa-bc7a-df1914254899",
       "input_commit": "7e0f1cac481bb9a7b85daaed11a4e7a7d9c1827b",
       "outcome": "no blocking findings; accepted"
     },
     {
       "topic": "FastDB integration",
-      "run_id": "eb5b1e0a-598c-425e-ad84-b48c010a4d04",
       "input_commit": "9e8285c185c428daf0a1feef8d5e264cadc6c0ca",
       "outcome": "runtime/build integration clear; two active development docs corrected by Host in candidate"
     },
     {
       "topic": "CI fixes",
-      "run_id": "e4a7a46d-68a4-41e7-802f-18e8e2244245",
       "input_commit": "6340dadcc49785d076ed2613e25e58f9a70ee035",
       "outcome": "no blocking findings; accepted; identical implementation tree to CI commit"
     }

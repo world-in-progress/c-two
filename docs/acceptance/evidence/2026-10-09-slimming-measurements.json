@@ -267,20 +267,17 @@
   ],
   "full_test_suites_run": false,
   "production_source_changed": false,
-  "delegation_records": [
+  "review_records": [
     {
       "concern": "transport and memory",
-      "buddy_run": "6d245a05-263f-4165-9da5-22447441f1ca",
       "disposition": "failed and recorded; replaced by a native read-only review plus Host source verification"
     },
     {
       "concern": "SDK and Core projections",
-      "buddy_run": "10050112-b69d-450b-a445-dcaa822b6ab2",
-      "disposition": "native shutdown protocol failure, no sealed artifact; final text treated only as leads independently checked by Host"
+      "disposition": "review did not complete; its notes were treated only as leads independently checked by Host"
     },
     {
       "concern": "dependencies and delivery",
-      "buddy_run": "5aa48d04-e8aa-4d8c-8c29-90dc4f4a392f",
       "disposition": "failed and recorded; inspected by Host"
     }
   ]

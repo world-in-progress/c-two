@@ -200,13 +200,11 @@
     "native_poison_or_identity_relaxed": false
   },
   "independent_static_review": {
-    "run": "5cc2f3dc-23b6-4250-b055-8c7d724dc5b7",
-    "artifact": "20b2b746-b6f8-43e4-9c9b-72559d88f1a2",
     "state": "accepted",
     "checkout_reclaimed": true,
     "worker_ran_probes": false
   },
-  "private_evidence_root": "~/.codex/diagnostics/c2-r07-evaluation-dzwd7ix1/",
+  "raw_evidence_retained_outside_repo": true,
   "evidence_sha256": {
     "source/core/r07-probe/src/main.rs": "be81e9c26c63f5d5b016d7c9b9550ffe818fe11e563a8c7786cceda39223536f",
     "source/core/r07-probe/Cargo.toml": "b3011d4d3efc5a1f6b8c04563a4321cd93650de1734796e7d2b10d1194e79028",

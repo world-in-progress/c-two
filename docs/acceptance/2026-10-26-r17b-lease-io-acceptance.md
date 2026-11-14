@@ -33,10 +33,10 @@ Windows 开发机复用 R17a 已通过的 10 项凭据测试及原生观察探�
 
 仅按 Range 下载文本，核 ZIP CRC 和 run-evidence 中的逐文件 SHA-256；GitHub 整包 digest 仅记录，没有宣称重新计算未下载的完整二进制归档。最后一份证据下载发生一次 SSL 中断，只恢复了文本下载；六线齐全后重新核验通过，没有重跑测试。
 
-独立核查 run `3df776e0-a78b-4d80-a7d3-a45d179ec9cb`、artifact `f6b067ad-7ed8-4792-aa16-6af798c31318` 核查原调用链与历史；实现审查 run `24d3fd48-f730-4af7-8f14-1e57f8ceee2f`、artifact `d815b896-c0a6-4c16-bf1c-342e28738e36`，输入 `26d8504c`，无阻断，提出非阻断 Drop 覆盖建议；Host 补齐后由 run `e8e48ec3-bbce-41f8-8ab5-c26b3a574a69`、artifact `2ecf51af-6fd5-4af7-bac8-2d293fd50ac2` 复核输入 `fdc97d02` 的增量并通过。最终候选树与最后审查输入一致。三次均只读、未独立运行测试，报告已接受，工作树已回收。
+首次独立核查覆盖原调用链与历史；第二次审查实现，输入为 `26d8504c`，无阻断，提出非阻断 Drop 覆盖建议；Host 补齐后，第三次审查复核了 `fdc97d02` 的增量并通过。最终候选树与最后审查输入一致。三次均只读、未独立运行测试，报告已接受，工作树已回收。
 
 Host 未采纳首次核查中“bind I/O 失败应保留本次新建 lease”的测试建议：该建议与原 BindLeaseGuard 在瞬时故障解除后重新核验并撤回新 lease 的行为不符。基线与候选都验证了新 lease 撤回、已有 lease 保留，未改变原回滚条件。
 
-本机两次基线 target 分别清理 157934096 / 157939296 B，候选 target 清理 157940360 B；只保留源码、日志与文本收据，未下载 CI wheel、DLL 或包归档。Windows 未重复构建，无本批新增构建产物。所有新增故障夹具均在分类断言前确认 socket/lease 零残留。历史目录未执行维护，本地分支/标签保持，专用 fork CI 分支按确切 SHA 删除。原始文本证据位于 `~/.codex/diagnostics/c2-r17b-implementation-bk8xm7ar/`。
+本机两次基线 target 分别清理 157934096 / 157939296 B，候选 target 清理 157940360 B；只保留源码、日志与文本收据，未下载 CI wheel、DLL 或包归档。Windows 未重复构建，无本批新增构建产物。所有新增故障夹具均在分类断言前确认 socket/lease 零残留。历史目录未执行维护，本地分支/标签保持，专用 fork CI 分支按确切 SHA 删除。原始文本证据保存在仓库之外。
 
 [机器记录](evidence/2026-10-26-r17b-lease-io-acceptance.json)保存来源、反例、计数、审查、Windows 证据复用及 CI 原始记录核查。R17 的 gate_still_named/gate_entry_is_current、目录 pin 验证等错误折叠继续另批；R07 剩余所有权、C04、R35 和两份控制会话重构保持原暂缓边界。

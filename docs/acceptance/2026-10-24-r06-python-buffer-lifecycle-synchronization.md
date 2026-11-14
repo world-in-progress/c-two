@@ -52,4 +52,4 @@ Python/Rust 公开签名、导出、C/FFI ABI 5、IPC 12、SHM 3、owner control
 
 候选需证明拒绝释放时 invalidator 为 0 次、view 内容及统计保持；解除所有导出后恰好释放一次；迟到 tracking 不恢复 active hold；真实 invalidator 异常对象、附加错误及幂等行为保留。针对性运行 native payload、held/borrowed、统计及快照测试，再完成完整 relay、真实 Rust/Python/Node 跨语言、macOS/Linux/Windows 和确切候选 GitHub Actions，包含 Windows ARM64 与 3.14t。Windows 优先开发机。本批 socket/lease/Named Pipe 零残留、独立实现审查及构建产物及时清理均是出口条件；历史目录不动。
 
-本轮独立只读复核使用 hey-my-buddy：R09 run `42899170-fb69-4925-aa32-770b535ca16b`、R39 run `78d4b6b1-d07b-422c-89a6-51b78e552fe6`、R06 run `801c0643-5fa6-46af-a208-10038864e524`，输入均为固定源码。Host 已核对关键源码和历史，修正了 R09 报告中“错误顺序不变”的判断，选择 R06 复用现有锁的最小方案；局部状态重构不采纳。这些报告没有运行验收结论。
+本轮对 R09、R39、R06 分别进行了独立只读复核，输入均为固定源码。Host 已核对关键源码和历史，修正了 R09 报告中“错误顺序不变”的判断，选择 R06 复用现有锁的最小方案；局部状态重构不采纳。这些报告没有运行验收结论。

@@ -162,4 +162,4 @@ getter 返回的是查询时捕获的凭据，不保证下一时刻仍在监听�
 7. `cc.server_credential()` 直接返回现有生命周期 watch 持有的监听凭据快照；它不证明 listener 仍存活、不授予权限，终态后为 None。服务进程无需 inspect 自己来获取它；第三方观察仍使用 inspect，忙时的 retryable 语义保持。Windows 返回 kernel-managed 凭据，精确文件回收为 not-applicable。
 8. 低层 Rust 新增 reason 枚举项、绑定专用 `EndpointBindCause` 与只读凭据 getter；`ServerFailure.bind_cause` 和 `LocalIoCause::Bind` 改用该载荷，不保留旧载荷兼容。`EndpointIoError` 与 sweep OS 原因形状保持；无 C/FFI ABI、IPC、SHM、业务帧或 owner 控制消息变化。列明实际验证平台、实现来源与 CI 链接，未运行的实验照实标明。
 
-本方案不触碰 hey-my-buddy 仓库或其用户状态，不读取/清理历史 IPC 目录，不新增后台清扫。构建结束清理本批可再生成产物，保留源代码、日志和验收记录。R17c 独立完成原有门禁；C04、R35、两份会话重构和更广 R17 剩余项继续单列。
+本方案不改动下游应用或其状态，不读取或清理历史 IPC 目录，不新增后台清扫。构建结束清理本批可再生成产物，保留源代码、日志和验收记录。R17c 独立完成原有门禁；C04、R35、两份会话重构和更广 R17 剩余项继续单列。

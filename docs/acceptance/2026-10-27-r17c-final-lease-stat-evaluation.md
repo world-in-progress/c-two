@@ -56,4 +56,4 @@ R17 的 gate/context 分类涉及 `gate_entry_is_current`、`gate_still_named`�
 
 R17c 只处理 `unlink_verified` 的末次 lease stat。R17 的 gate/context 分类（包括 `gate_entry_is_current`、`gate_still_named`）、目录 pin、`NamespaceDirectories::same_as`、sweep 中的目录失效分类和 owner context 映射继续单列，R17 整体仍为部分完成。目录检查同时表达真实 I/O 与策略拒绝，owner 层也会再次归类错误，需另行设计。C04、R35、两份控制会话重构和 R07 剩余所有权继续保持原边界。
 
-两轮原生只读复核分别核查了较大的 gate/context 范围，以及本方案的四条直接调用链；后一轮确认本子项可独立成立，并指出早期 `VerifyLeaseStat` 不能代替新故障点。均未执行测试。hey-my-buddy health 返回 `C_TWO_LIFECYCLE` / 命名空间无法验证，本轮没有维护其历史目录，改由原生子代理完成独立复核。
+两轮原生只读复核分别核查了较大的 gate/context 范围，以及本方案的四条直接调用链；后一轮确认本子项可独立成立，并指出早期 `VerifyLeaseStat` 不能代替新故障点。均未执行测试。此次复核未维护历史命名空间。

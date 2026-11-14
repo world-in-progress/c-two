@@ -221,8 +221,8 @@
     "portable_rows": 18,
     "typescript_rows": 12,
     "provenance": {
-      "package": "~/.codex/worktrees/c2-endpoint-lifecycle/c-two/sdk/python/src/c_two/__init__.py",
-      "native": "~/.codex/worktrees/c2-endpoint-lifecycle/c-two/sdk/python/src/c_two/_native.cpython-313-darwin.so",
+      "package": "<checkout>/sdk/python/src/c_two/__init__.py",
+      "native": "<checkout>/sdk/python/src/c_two/_native.cpython-313-darwin.so",
       "build_target_reuse": "/tmp/c2-endpoint-targets/final-2cfd151949de",
       "source_sha": "980acec1bd32d960771e6a4a14a1ba4fc4d786cb",
       "fastdb_sha": "4f99f86a662b0e950a0dd29800c25a1c9fca4def",
@@ -270,8 +270,6 @@
     "test_preservation_final.py": "094dab31b0b14b76f55cefccb3a4ec36538063d3bb37b0d360c8fa95603a938d"
   },
   "independent_review": {
-    "model": "gpt-6.1-sol",
-    "effort": "high",
     "mode": "read-only",
     "confirmed_blockers": 0,
     "checked": [
@@ -289,7 +287,7 @@
     "macOS complete execution source is980acec1, not finalbbfdbf4; subsequent3file diffs are tests only",
     "Linux artifact binds c3 hash and unchanged before/after execution; executable itself is not included in Linux ZIP",
     "Rust totals derive from successful test-result log summaries, not a separate exhaustive collection-ID inventory",
-    "installed hey-my-buddy runner adoption not demonstrated",
+    "integration with an installed downstream application not demonstrated",
     "no formal candidate package publication",
     "Windows11 desktop not executed",
     "unknown historical paths untouched",

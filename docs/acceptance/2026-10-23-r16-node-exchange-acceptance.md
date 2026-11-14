@@ -29,7 +29,7 @@
 
 macOS Python relay/helper 共 54 项通过，其中导出源码缺少 .git 而跳过的元数据检查在原工作区单独补齐。Windows relay/helper 为 53 通过、1 项导出源码的 Git 元数据跳过，真实 hey benchmark 已执行；托管作业从真实 Git 检出运行完整检查。各平台新增背压/关闭场景均未跳过。macOS 与 Windows 的收据分别包含完整 18 行 Rust/Python 和 12 行 Node direct/relay 矩阵。
 
-独立审查首次指出：被关闭的 pending write 若同轮成功兑现，发送循环还会尝试下一片。Host 先补出 writesAfterClose=1 的反例，再用原连接状态加逐片 guard 修复。随后两次冻结复核覆盖完整生产差异和最终三处跨平台测试调整，均无 actionable findings；审查 run 分别为 `810bd31d-a30e-49e1-9adc-04a0873c4c51` 与 `5171c930-223a-4248-8439-6d5d9a53be97`。真实连接夹具和性能实验的 buddy 产物均由 Host 核对后验收，工作树已回收。
+独立审查首次指出：被关闭的 pending write 若同轮成功兑现，发送循环还会尝试下一片。Host 先补出 writesAfterClose=1 的反例，再用原连接状态加逐片 guard 修复。随后两次冻结复核覆盖完整生产差异和最终三处跨平台测试调整，均无 actionable findings。真实连接夹具和性能实验的交付产物均由 Host 核对后验收，工作树已回收。
 
 ## 同环境性能
 
@@ -51,4 +51,4 @@ macOS 全 relay 使用源码导出，仅替换本轮 socket/coordinator 默认�
 
 Windows 开发机的 Node 22.12 只支持 Node-API 9，不能加载原有 Node-API 10 插件；同一插件换为本轮私有 Node 22.23.4 后加载成功。系统链接的 Python 开发扩展按 DLL 查找规则放置匹配 FastDB DLL；缺失的 hey 按既定 v0.1.4 构建。另确认 LongPathsEnabled=0 时普通路径打不开已存在的 264 字符生成文件，改用本轮短临时目录后 14 项 Node 矩阵通过。均为测试环境调整，没有更改机器全局 Node/长路径策略或生产实现。新增背压测试也改为验证真实 socket.isPaused，避免假定暂停后 Named Pipe 的 bytesRead 仍会增长；修订断言在 macOS/Windows 基线均红、候选均绿。
 
-macOS/Windows 清理的本轮构建、安装副本与临时目录逻辑文件体积约 4.9 GiB，不能等同于物理磁盘释放量；Linux 本轮容器已自动删除。Cargo target、native 库、Node dist/依赖、实验构建和临时安装包已删除，Windows 用户工具链保留。主工作区 .venv 中指向临时导出的 c-two editable 安装已卸载，后续使用 uv sync 重建。源码、命令、失败与成功日志、矩阵收据、性能原始样本及来源哈希保留于 `~/.codex/diagnostics/c2-r16-implementation-7q0v09ad`。
+macOS/Windows 清理的本轮构建、安装副本与临时目录逻辑文件体积约 4.9 GiB，不能等同于物理磁盘释放量；Linux 本轮容器已自动删除。Cargo target、native 库、Node dist/依赖、实验构建和临时安装包已删除，Windows 用户工具链保留。主工作区 .venv 中指向临时导出的 c-two editable 安装已卸载，后续使用 uv sync 重建。源码、命令、失败与成功日志、矩阵收据、性能原始样本及来源哈希保留在仓库之外。

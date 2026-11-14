@@ -55,10 +55,10 @@ Linux、Windows 2022 和 Windows 2025 各有严格验证的 18 行 Rust/Python d
 
 每套 Windows full 产物的普通管理员消费者及另建非管理员账户消费者均验证实际 IPC/HTTP 模式、安装 wheel 字节、held 视图失效、4 次 borrowed 输入失效、服务正常关闭及进程/临时目录清理。标准用户 wrapper 还确认账户、工作目录删除和无剩余进程。现有内存矩阵严格检查通过，端点维护未替代 buddy/dedicated/file spill 或 retained lease 的释放权威。
 
-Host 检查真实 diff、聚焦结果及上述原始文件后，由独立 `gpt-6.1-sol/high` 对 7 个实际 ZIP、Linux collection/call reports、Windows job/attempt/receipt/wheel 清理和公开 Python API 做一次只读抽查，未发现确认阻塞项。Buddy 命令退出和看板完成状态只作为执行状态，未用来替代产物验收。
+Host 检查真实 diff、聚焦结果及上述原始文件后，另由独立审查对 7 个实际 ZIP、Linux collection/call reports、Windows job/attempt/receipt/wheel 清理和公开 Python API 做一次只读抽查，未发现确认阻塞项。
 
 ## 交付边界与接入
 
 默认为 Persistent / legacy-v1；Unix 完整登记的 managed 端点可收敛，legacy 的永久 rendezvous 锁继续保留。部分初始化、损坏或未知历史对象保持 `unverified`，未承诺任意持久化窗口崩溃后的自动恢复。本次未删除 `/tmp/c_two_ipc` 的历史文件。
 
-C-Two 的 Rust/Python 接口及真实子进程测试已交付，运行器接入顺序见[说明](../reference/local-endpoint-lifecycle.md)。已安装 hey-my-buddy 采用新接口、正式候选包发布及 Windows 11 桌面验证需要各自的实际证据；本报告不宣称这些已完成。下载物、wheel、二进制及构建输出全部留在 `/tmp`，Git 只保存源码、文档及小型证据摘要。
+C-Two 的 Rust/Python 接口及真实子进程测试已交付，运行器接入顺序见[说明](../reference/local-endpoint-lifecycle.md)。已安装的下游应用采用新接口、正式候选包发布及 Windows 11 桌面验证需要各自的实际证据；本报告不宣称这些已完成。下载物、wheel、二进制及构建输出全部留在 `/tmp`，Git 只保存源码、文档及小型证据摘要。

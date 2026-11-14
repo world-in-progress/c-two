@@ -124,47 +124,29 @@
   },
   "reviews": [
     {
-      "run_id": "26e851ac-5700-4091-b60b-a6d7c1903e58",
-      "input": "d664b18120d6e3b63bd42af3ee240e9dda123e68",
-      "artifact_id": "63ebef74-8d2a-46f6-bb9f-199996193bd6"
+      "input": "d664b18120d6e3b63bd42af3ee240e9dda123e68"
     },
     {
-      "run_id": "18e8cae4-8606-4c04-87de-9dbeef400273",
-      "input": "9fcde4962ab591a4d4a5f732522ddc8335f13137",
-      "artifact_id": "6ad48ed7-9f9b-4bb6-a20a-5cad66bec267"
+      "input": "9fcde4962ab591a4d4a5f732522ddc8335f13137"
     },
     {
-      "run_id": "09226571-8dfe-40a8-b704-483159f379d3",
-      "input": "1bac59797d18f94174792353b6f463672f7ef01d",
-      "artifact_id": "5533389b-70d3-46b5-a9a0-52f78e83cf76"
+      "input": "1bac59797d18f94174792353b6f463672f7ef01d"
     },
     {
-      "run_id": "5139b07a-52c6-411f-9757-30915936462a",
-      "input": "9007c4e25c8ac9393ed56b6ad1489034038c24a2",
-      "artifact_id": "292fafce-66bc-4db0-a11b-71258841927f"
+      "input": "9007c4e25c8ac9393ed56b6ad1489034038c24a2"
     },
     {
-      "run_id": "e7685dd4-f601-437e-9d1d-55c834e1aa32",
-      "input": "9459b0c928e84c4882c5bc506999a14714e39422",
-      "artifact_id": "6931e92f-083e-4082-aa77-d459511dbdf8"
+      "input": "9459b0c928e84c4882c5bc506999a14714e39422"
     },
     {
-      "run_id": "f8bd7c63-356f-4b57-bf29-8d83184e0f34",
-      "input": "90dbc3e038a2585076c00d068701b4060fbc3b64",
-      "artifact_id": "6795c4a1-429f-4f9c-af70-0425ad363136"
+      "input": "90dbc3e038a2585076c00d068701b4060fbc3b64"
     },
     {
-      "run_id": "ea486d0f-4cf2-46a6-b3a7-b30cdabc6522",
-      "input": "ea511c7a00be024134bade2cc3e5a137f06a96fe",
-      "artifact_id": "50574998-6eb3-482c-8264-cbd2d11da5a6"
+      "input": "ea511c7a00be024134bade2cc3e5a137f06a96fe"
     }
   ],
   "review_status": "all listed read-only deliverables accepted; findings repaired; final handoff review has no blockers",
   "slimming_review": {
-    "run_ids": [
-      "d718c5ef-db1d-419c-9a06-54dac6ad37c2",
-      "78141ea1-0d0c-45fd-8ca6-b8a823ecdc99"
-    ],
     "applied": true,
     "actual_production_net": -14,
     "actual_tests_net": -79,
@@ -180,8 +162,6 @@
     ],
     "base": "fe406326bf36ade401b7dd8e764b36ccd8631589",
     "implementation": "b346e2b3303f0a0fa90f90bf68481897fb55e0be",
-    "implementation_review_run_id": "b91cb68f-ca33-475f-b7f2-daa5c0abbca9",
-    "implementation_review_artifact_id": "d601dcc2-ab9d-475f-9619-9565bc99bfa4",
     "platforms": [
       "macOS arm64",
       "Linux aarch64 container"
@@ -377,7 +357,6 @@
     ]
   },
   "execution_deviation": {
-    "cancelled_worker_run": "5d9eadce-b194-4813-a5f1-c4c1f28a60a0",
     "nonisolated_worker_test_outputs_counted_as_acceptance": false,
     "unaccepted_draft_integrated_as_delivered": false
   },

@@ -196,8 +196,6 @@
   "raw_sha256": "20826e6fa4c9f3d0a02ebea8edb7c3ad42d6c8dcc1386d2e15784ea589ec6b56",
   "probe_source_sha256": "09c0e8453460b74b73b587265eba09963154dd9c23bc80099d8573261bc99b0d",
   "review": {
-    "run_id": "aff52710-0be9-4e53-9472-620e643cf39b",
-    "artifact_id": "1321c8d8-1a03-41ee-b8ca-7f48fcfc58e2",
     "scope": "independent static review of call paths, original design and proposed lower-bound cache; no execution by reviewer"
   },
   "validation_notes": [

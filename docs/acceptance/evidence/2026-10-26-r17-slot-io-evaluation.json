@@ -102,19 +102,11 @@
     "Baseline target seams and actual public projection regressions remain implementation gates"
   ],
   "independent_review": {
-    "run": "cb5f0be3-0163-4bd4-a14e-e778a864691e",
-    "artifact": "6fe2fd5b-6ecb-4c59-aac2-35c5671e2843",
     "input": "dfa03d16099ea95e17809bfc4bc7eca1d31ddd98",
-    "buddy": {
-      "effort": "max",
-      "harness": "codex",
-      "model": "gpt-6.1-sol",
-      "provider": "openai"
-    },
     "scope": "static source/history/test audit; no runtime claims",
     "host_refinement": "preserve known socket mismatch priority rather than naive early return on late lease error"
   },
-  "raw_evidence_at": "~/.codex/diagnostics/c2-r17-evaluation-yig7hv6m/",
+  "raw_evidence_retained_outside_repo": true,
   "evidence_sha256": {
     "stat-mechanism-probe.py": "092d685a2e759c32a5b3bc12bf24f2953b63c64f14410b9403593c3b12fc0666",
     "stat-mechanism-result.json": "4876ca5c204e2617c4587b21dec48b7e6a153807a7f246f490be29b7674f67d7",

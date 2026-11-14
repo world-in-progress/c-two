@@ -69,6 +69,6 @@ The dated plans and reviews in `design/` belong to work still in progress; each 
 
 ## Records
 
-- `acceptance/` holds the verification records of completed work, release qualification reports and reviews, with frozen manifests, receipts and logs under `acceptance/evidence/`. Records are not rewritten; later changes update their links only.
+- `acceptance/` holds the verification records of completed work, release qualification reports and reviews, with frozen manifests, receipts and logs under `acceptance/evidence/`. Records preserve the original findings and validation scope. Later changes may repair links and remove private details. Hashes of original evidence still identify the original bytes.
 - `research/` holds notes made before a decision: surveys of other projects and feasibility studies.
 - `releases/` holds the notes for each release; `unreleased.md` collects the changes since the last one.

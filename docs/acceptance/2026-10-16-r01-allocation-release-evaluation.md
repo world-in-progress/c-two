@@ -22,7 +22,7 @@
 
 四次池实验各有一个新建且唯一命名的 SHM 对象。子进程均通过 OS wait 确认退出，owner 原生 Drop 后四个名字再次打开均为 `ENOENT`。实验未创建 socket 或 endpoint lease，没有扫描、清理、重建历史目录。
 
-证据目录：`~/.codex/diagnostics/c2-r01-evaluation-3382b3ba-6cx0jvuu/`，包含 `source-manifest.json`、三个 cargo 探针、`baseline.log`、`current.log`、`pool-probe.log`、环境和带日志 SHA-256 的 `receipt.json`。三个 `cargo run --offline` 均退出 0。两个输入的 `buddy.rs` 与 `spinlock.rs` SHA-256 完全相同；`bitmap.rs` 仅差此前删除的空区间初始化循环。结合两版实跑，可确认这个缺陷在瘦身前已经存在，不能归因于本轮瘦身。
+证据目录保存在仓库之外，包含 `source-manifest.json`、三个 cargo 探针、`baseline.log`、`current.log`、`pool-probe.log`、环境和带日志 SHA-256 的 `receipt.json`。三个 `cargo run --offline` 均退出 0。两个输入的 `buddy.rs` 与 `spinlock.rs` SHA-256 完全相同；`bitmap.rs` 仅差此前删除的空区间初始化循环。结合两版实跑，可确认这个缺陷在瘦身前已经存在，不能归因于本轮瘦身。
 
 ## 原设计与调用链
 
@@ -101,7 +101,7 @@ backing generation 解决段槽位被回收再创建后的旧引用；本次同�
 
 本机隔离完整 Core workspace 为 1704 passed、5 项既有 ignored，含完整 relay 416；Rust SDK 19、native Rust 8。Node 为 55 passed、1 项 Windows 专属 skipped；官方 Python driver 为 ordinary 1206 passed / 5 项 Windows 专属 skipped、portable 25、TypeScript 14，严格核验 18/18 Rust/Python 和 12/12 TypeScript direct/relay 收据，包含持久 IPC 和重连。首次普通套件的 1 项失败来自隔离根对应断言漏替换；补齐副本的严格路径断言后完整 driver 通过。Git/Node 22 预检查和初始构建失败日志均保留，没有修改 runner、期限或放宽断言。
 
-两份原生独立审查和随后两文件差量复核均无生产阻断。按 `hey-my-buddy` 0.42.1 进行只读独立审查，也无生产阻断；其零 id 和不足映射容量两条测试建议以 5 行补入现有用例，形成 `141668dd41871acf1cd0d241ad8c9d6691ff7ce4`。分别移除生产零值检查、容量检查的隔离变异体各有 1 项按预期失败，原实现各通过 1 项，随后真实 c2-mem 185 项再次通过。只读产物为空补丁，Host 核验固定输入与候选 tree 相同后完成精确 artifact 验收。
+两份原生独立审查和随后两文件差量复核均无生产阻断。另一份只读独立审查也无生产阻断；其零 id 和不足映射容量两条测试建议以 5 行补入现有用例，形成 `141668dd41871acf1cd0d241ad8c9d6691ff7ce4`。分别移除生产零值检查、容量检查的隔离变异体各有 1 项按预期失败，原实现各通过 1 项，随后真实 c2-mem 185 项再次通过。只读产物为空补丁，Host 核验固定输入与候选 tree 相同后完成精确 artifact 验收。
 
 对执行基线统计：生产 +371/−114，净增 257 行；测试 +778/−205，净增 573 行；非文档共增 830 行；文档 +52/−12，净增 40 行（含本记录和清单更新），全部净增 870 行。Rust 内联 `cfg(test)` 与测试 hook 按测试统计，consumer-install 脚本计入测试夹具，未将整个 Rust 文件计为生产。
 
@@ -119,4 +119,4 @@ backing generation 解决段槽位被回收再创建后的旧引用；本次同�
 
 本次隔离默认根及各轮私有测试根最终 socket/lease 均为零；历史两个默认根在开始及结束均不存在，没有清理、重建或冷切换。812 个跟踪文件逐一核对，仅在隔离副本替换登记的默认目录及对应严格路径断言。Python 完整运行后仅增加上述 5 行 Rust `cfg(test)`，生产前缀逐字一致；最终 c2-mem 与线上候选覆盖该补强。
 
-证据目录 `~/.codex/diagnostics/c2-r01-zvd34zy6/` 保留基线红绿、完整回归、严格收据、两组变异实验、源码/包/原生二进制哈希、独立审查、性能样本和 `local-acceptance.json`；构建物与本机证据没有加入 Git。
+仓库之外的证据目录保留基线红绿、完整回归、严格收据、两组变异实验、源码/包/原生二进制哈希、独立审查、性能样本和 `local-acceptance.json`；构建物与本机证据没有加入 Git。

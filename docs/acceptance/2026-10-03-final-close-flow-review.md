@@ -113,6 +113,6 @@ nl -ba core/foundation/c2-mem/src/pool.rs | sed -n '610,630p;786,845p'
 nl -ba core/foundation/c2-mem/src/alloc/buddy.rs | sed -n '270,310p'
 ```
 
-一个内部 Codex subagent 仅协助只读核查 wire owner／cleanup 路径，未派 Buddy peer、未写文件、未执行动态测试。主 agent 重读了其关键 release、registry 和 owner 临界区。最终仅新增本中文报告；未实现、改 Host／其他 worker／原始树，未提交、push、PR 或发布。
+一个内部子代理仅协助只读核查 wire owner／cleanup 路径，未再委派、未写文件、未执行动态测试。主 agent 重读了其关键 release、registry 和 owner 临界区。最终仅新增本中文报告；未实现、改 Host／其他 worker／原始树，未提交、push、PR 或发布。
 
 最终文档核验实际执行 `git diff --check`、`git status --short`、`git rev-parse HEAD`，均 exit 0；status 唯一记录是 `?? docs/reports/2026-10-03-final-close-flow-review.md`。另用只读 `python3` 脚本断言固定 HEAD、完整 porcelain status 只含授权文件、`git diff --quiet HEAD --` 返回 0、报告为非空 UTF-8 且无行尾空白，全部成立。另读 `sync_client.rs:535–562` 并用 `rg` 核对表中 wire 测试函数确实存在。这些是文档／范围检查，不是 IPC 动态测试。

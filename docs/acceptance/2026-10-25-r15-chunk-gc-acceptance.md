@@ -80,10 +80,10 @@ RPC 测量复用现有测试 helper，在隔离源码中临时加入 harness；�
 
 每个环境均取得精确 18/18 Rust/Python direct/relay 与 12/12 TypeScript 矩阵收据，并用仓库现有严格校验器复核；跨语言 25＋14 项没有 skip。Windows 包括原生架构和普通用户消费者。上述平台跳过保持原测试选择，本批未新增 skip、调整期限或放宽断言；R15 的 167 项 wire 在五个完整平台均为 0 ignored。本机的新增生产/测试与 CI 来源字节相同，之后的收尾文档不冒充构建来源。
 
-独立实现审查使用 hey-my-buddy 0.52.1：run `6b5bc47c-7897-4f33-b364-4dbadc7930ed`，artifact `7eac0f05-1251-4313-9e35-2c2d7c7c2293`，固定候选与 CI 相同；核对并发/重入下界证明、边界、锁序、原错误/预算/释放及替换测试，没有阻塞发现。Host 已复核并接受空补丁，审查 worktree 已回收。审查为静态阅读，运行测试与性能数据由 Host 另行核验；性能证据另由 run `e072932d-07b6-4ab5-943b-52a54f48038d`、固定空补丁 artifact `401305f9-4bab-401f-951a-cf0320c8c2be` 复核。初轮要求补构建来源和根目录枚举证据，Host 从原始执行记录补齐后复核通过，未重跑。两份审查均已接受并回收工作树。
+独立实现审查的固定候选与 CI 相同；核对并发/重入下界证明、边界、锁序、原错误/预算/释放及替换测试，没有阻塞发现。Host 已复核并接受空补丁，审查 worktree 已回收。审查为静态阅读，运行测试与性能数据由 Host 另行核验；性能证据另经独立复核，产出为空补丁。初轮要求补构建来源和根目录枚举证据，Host 从原始执行记录补齐后复核通过，未重跑。两份审查均已接受并回收工作树。
 
 72 个 RPC 样本均在关闭后核对注册条目、route gate/permit、reassembly 预算归零，socket 和 lease 不存在，再关闭 server/pool；本批临时 socket 根目录剩余 0。registry 样本的 144 个 backing 名在原生 Drop 后重开均为不存在。本机完整 relay 由干净 CI 运行，本机实验只用明确传入的本批目录；没有把 `C2_IPC_ROOT` 当作整组默认命名空间夹具的隔离手段，历史目录未动。
 
-原始测量程序、失败日志、所有样本和构建哈希保留于 `~/.codex/diagnostics/c2-r15-implementation-tvc1q7uv/`。本机 debug/release Cargo target 和四份基准二进制已清理；Windows 本批 target 和临时文件已确认不存在，原工具链保留。未新增永久 benchmark 框架或依赖。本轮没有 bump 版本或发布包。
+原始测量程序、失败日志、所有样本和构建哈希保留在仓库之外。本机 debug/release Cargo target 和四份基准二进制已清理；Windows 本批 target 和临时文件已确认不存在，原工具链保留。未新增永久 benchmark 框架或依赖。本轮没有 bump 版本或发布包。
 
 构建追溯从本会话原始工具调用及返回中提取，结合 Cargo 的 build-finished/编译产物记录复核：基线 Git export → 构建并复制基线二进制 → 仅替换 registry 为候选 → 同参数重建并复制候选 → 四份文件取哈希 → 按固定名称运行采样。收尾逐字节审计保留的 244 个 export 文件，差异仅为候选 registry 与两版相同的临时测试 harness；一次 harness 导入修正还把九个既有测试中的 AtomicUsize 同样写为全限定名，没有生产 server 改动。该追溯是对既有记录的事后核对，不是补跑。原始采样后目录枚举及收尾只读枚举均确认本批 RPC 根目录为 0；构建和采样记录的对应哈希写入[验收收据](evidence/2026-10-25-r15-acceptance.json)。
