@@ -65,13 +65,16 @@ fn definition(route_name: &str) -> ServiceDefinition {
 
 fn native_host(server_id: String) -> (Runtime, c2_core::Host, String) {
     let runtime = Runtime::new(RuntimeOptions {
-        server_id: Some(server_id),
         use_process_relay_anchor: false,
         ..RuntimeOptions::default()
     })
     .unwrap();
     let host = runtime
-        .host(HostOptions::default().without_relay())
+        .host(
+            HostOptions::default()
+                .with_server_id(server_id)
+                .without_relay(),
+        )
         .unwrap();
     let address = runtime.server_address().unwrap();
     (runtime, host, address)
@@ -95,38 +98,36 @@ fn runtime_client_config_freezes_on_valid_config_even_when_connect_fails() {
     .unwrap();
     let absent = format!("ipc://{}", unique_name("absent"));
     let expected = release().expected_route("unused-route").unwrap();
-    let mut overrides = c2_config::ClientIpcConfigOverrides::default();
-    overrides.pool_segment_size = Some(0);
-    runtime
-        .set_client_ipc_overrides(Some(overrides.clone()))
-        .unwrap();
-    let error = runtime
-        .connect(
-            expected.clone(),
-            Connect::DirectIpc {
-                address: absent.clone(),
-            },
-        )
-        .err()
-        .expect("invalid configuration must fail");
-    assert!(error.to_string().contains("pool_segment_size"), "{error}");
+    let memory_patch = |bytes| c2_core::ClientConfigPatch {
+        domain_limits: c2_core::DomainLimitsPatch {
+            memory_budget_bytes: c2_core::ConfigField::Set(bytes),
+            max_outstanding_calls: c2_core::ConfigField::Set(1),
+            ..Default::default()
+        },
+    };
+    assert!(matches!(
+        runtime.update_client_config(memory_patch(0)),
+        Err(c2_core::LifecycleError::Configuration(_))
+    ));
     assert!(!runtime.client_config_frozen());
-    assert!(runtime.outgoing_memory_stats().is_none());
+    assert!(runtime.memory_stats().client.memory.is_none());
 
-    overrides.pool_segment_size = Some(2 * 1024 * 1024);
-    runtime.set_client_ipc_overrides(Some(overrides)).unwrap();
+    runtime
+        .update_client_config(memory_patch(2 * 1024 * 1024))
+        .unwrap();
     assert!(
         runtime
             .connect(expected, Connect::DirectIpc { address: absent })
             .is_err()
     );
     assert!(runtime.client_config_frozen());
-    assert!(runtime.outgoing_memory_stats().is_some());
-    let mut replacement = c2_config::ClientIpcConfigOverrides::default();
-    replacement.pool_enabled = Some(false);
+    assert_eq!(
+        runtime.memory_stats().client.memory.unwrap().limit_bytes,
+        2 * 1024 * 1024
+    );
     assert!(matches!(
-        runtime.set_client_ipc_overrides(Some(replacement)),
-        Err(c2_core::LifecycleError::ClientConfigFrozen)
+        runtime.update_client_config(memory_patch(1024 * 1024)),
+        Err(c2_core::LifecycleError::ConfigFrozen)
     ));
 }
 #[test]

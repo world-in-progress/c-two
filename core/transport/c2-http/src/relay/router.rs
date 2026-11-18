@@ -39,9 +39,7 @@ use crate::relay::state::{RegisterCommitResult, RelayState, UpstreamAcquireError
 use crate::relay::types::{PeerStatus, RouteEntry, RouteResolutionError, UpstreamEndpointKey};
 use crate::send_budget::{SendBufferPlan, SendBuffers, reserve_send_buffers};
 use c2_ipc::IpcClient;
-use c2_mem::retention::{
-    BudgetedBuffer, PayloadBufferBudget, PayloadBufferError, PayloadBufferReservation,
-};
+use c2_mem::{BudgetedBuffer, DomainBudget, MemoryReservation, PayloadBufferError};
 use tokio_util::sync::CancellationToken;
 
 const CONTROL_BODY_LIMIT_BYTES: usize = 64 * 1024;
@@ -184,10 +182,7 @@ fn resource_not_found_response(route_name: &str) -> Response {
     )
 }
 
-fn resource_not_found_response_budgeted(
-    route_name: &str,
-    budget: &PayloadBufferBudget,
-) -> Response {
+fn resource_not_found_response_budgeted(route_name: &str, budget: &DomainBudget) -> Response {
     c2_error_response_with_budget(
         StatusCode::NOT_FOUND,
         c2_error::ErrorCode::ResourceNotFound,
@@ -224,7 +219,7 @@ fn resource_unavailable_response_budgeted(
     route_name: &str,
     message: impl Into<String>,
     dispatch_phase: &str,
-    budget: &PayloadBufferBudget,
+    budget: &DomainBudget,
 ) -> Response {
     c2_error_response_with_budget(
         StatusCode::BAD_GATEWAY,
@@ -250,7 +245,7 @@ fn route_watch_unavailable_response(route_name: &str, reason: impl Into<String>)
 fn route_watch_unavailable_response_budgeted(
     route_name: &str,
     reason: impl Into<String>,
-    budget: &PayloadBufferBudget,
+    budget: &DomainBudget,
 ) -> Response {
     c2_error_response_with_budget(
         StatusCode::SERVICE_UNAVAILABLE,
@@ -305,37 +300,40 @@ impl Write for JsonSize {
 
 /// Reserve the exact serialized body before creating its owned Vec. The Body
 /// carries the reservation through `Bytes` slices and clones until their last
-/// real reference is released.
+/// real reference is released. Admission for an error reply never waits for
+/// memory capacity: `try_reserve_memory` either succeeds immediately or the
+/// relay answers with the bounded static control response, so a full budget
+/// cannot pile up suspended error streams.
 fn budgeted_json_response<T>(
     status: StatusCode,
     payload: T,
-    budget: &PayloadBufferBudget,
+    budget: &DomainBudget,
     dispatch_uncertain: bool,
 ) -> Response
 where
     T: serde::Serialize + Send + 'static,
 {
     let mut size = JsonSize(0);
-    if serde_json::to_writer(&mut size, &payload).is_err()
-        || size.0 > budget.snapshot().limit_bytes
-        || usize::try_from(size.0).is_err()
-    {
+    let admitted = (serde_json::to_writer(&mut size, &payload).is_ok()
+        && usize::try_from(size.0).is_ok())
+    .then(|| budget.try_reserve_memory(size.0).ok())
+    .flatten();
+    let Some(reservation) = admitted else {
+        return if dispatch_uncertain {
+            uncertain_error_control_response()
+        } else {
+            forwarding_capacity_response("", "error response exceeds payload budget")
+        };
+    };
+    let mut data = Vec::with_capacity(size.0 as usize);
+    if serde_json::to_writer(&mut data, &payload).is_err() {
         return if dispatch_uncertain {
             uncertain_error_control_response()
         } else {
             forwarding_capacity_response("", "error response exceeds payload budget")
         };
     }
-    let budget = budget.clone();
-    let body = Body::from_stream(futures::stream::once(async move {
-        let reservation = budget
-            .reserve(size.0)
-            .await
-            .map_err(std::io::Error::other)?;
-        let mut data = Vec::with_capacity(size.0 as usize);
-        serde_json::to_writer(&mut data, &payload).map_err(std::io::Error::other)?;
-        Ok::<Bytes, std::io::Error>(Bytes::from_owner(BudgetedBuffer::new(data, reservation)))
-    }));
+    let body = Bytes::from_owner(BudgetedBuffer::new(data, reservation));
     (
         status,
         [
@@ -347,11 +345,7 @@ where
         .into_response()
 }
 
-fn json_error_response<T>(
-    status: StatusCode,
-    payload: T,
-    budget: Option<&PayloadBufferBudget>,
-) -> Response
+fn json_error_response<T>(status: StatusCode, payload: T, budget: Option<&DomainBudget>) -> Response
 where
     T: serde::Serialize + Send + 'static,
 {
@@ -366,7 +360,7 @@ fn c2_error_response_with_budget<I, K, V>(
     code: c2_error::ErrorCode,
     message: impl Into<String>,
     details: I,
-    budget: &PayloadBufferBudget,
+    budget: &DomainBudget,
 ) -> Response
 where
     I: IntoIterator<Item = (K, V)>,
@@ -414,7 +408,7 @@ fn payload_too_large_response(
     route_name: &str,
     content_length: u64,
     max_payload_size: u64,
-    budget: &PayloadBufferBudget,
+    budget: &DomainBudget,
 ) -> Response {
     json_error_response(
         StatusCode::PAYLOAD_TOO_LARGE,
@@ -431,7 +425,7 @@ fn payload_too_large_response(
 fn unknown_length_too_large_response(
     route_name: &str,
     limit: u64,
-    budget: &PayloadBufferBudget,
+    budget: &DomainBudget,
 ) -> Response {
     json_error_response(
         StatusCode::LENGTH_REQUIRED,
@@ -499,7 +493,7 @@ fn run_data_plane_after_precheck_hook(state: &Arc<RelayState>, route_name: &str)
 fn expected_crm_from_headers(
     route_name: &str,
     headers: &HeaderMap,
-    budget: Option<&PayloadBufferBudget>,
+    budget: Option<&DomainBudget>,
 ) -> ResponseResult<c2_contract::ExpectedRouteContract> {
     let crm_ns = headers
         .get(EXPECTED_CRM_NS_HEADER)
@@ -589,10 +583,7 @@ fn crm_contract_mismatch_response(route_name: &str) -> Response {
     )
 }
 
-fn crm_contract_mismatch_response_budgeted(
-    route_name: &str,
-    budget: &PayloadBufferBudget,
-) -> Response {
+fn crm_contract_mismatch_response_budgeted(route_name: &str, budget: &DomainBudget) -> Response {
     c2_error_response_with_budget(
         StatusCode::CONFLICT,
         c2_error::ErrorCode::ContractMismatch,
@@ -753,7 +744,7 @@ fn validate_expected_crm_for_route(
     state: &RelayState,
     route_name: &str,
     expected: &c2_contract::ExpectedRouteContract,
-    budget: Option<&PayloadBufferBudget>,
+    budget: Option<&DomainBudget>,
 ) -> ResponseResult<RouteEntry> {
     let Some(route) = state.local_route(route_name) else {
         return Err(match budget {
@@ -802,7 +793,6 @@ pub fn build_router(state: Arc<RelayState>) -> Router {
         .layer(DefaultBodyLimit::max(CONTROL_BODY_LIMIT_BYTES));
 
     let data_router = Router::new()
-        .route("/_echo", post(echo_handler))
         .route("/{route_name}/{method_name}", post(call_handler))
         .layer(DefaultBodyLimit::disable());
 
@@ -1686,8 +1676,8 @@ async fn handle_peers(State(state): State<Arc<RelayState>>) -> impl IntoResponse
 
 struct PreparedUnknownInput {
     payload: SegmentedPayload,
-    upload: PayloadBufferReservation,
-    download: PayloadBufferReservation,
+    upload: MemoryReservation,
+    download: MemoryReservation,
 }
 
 impl PreparedUnknownInput {
@@ -1715,7 +1705,7 @@ async fn read_unknown_length_body(
     route_name: &str,
     body: Body,
     max_payload_size: u64,
-    budget: &PayloadBufferBudget,
+    budget: &DomainBudget,
     cancelled: &CancellationToken,
     copy_cap: u64,
 ) -> ResponseResult<Option<PreparedUnknownInput>> {
@@ -1728,32 +1718,35 @@ async fn read_unknown_length_body(
         _ = cancelled.cancelled() => return Ok(None),
         next = source.next() => next,
     } {
-        let chunk = next.map_err(|err| json_error_response(
-            StatusCode::BAD_REQUEST,
-            serde_json::json!({"error":"RequestBodyReadError", "route":route_name, "message":err.to_string()}),
-            Some(budget),
-        ))?;
+        let chunk = match next {
+            Ok(chunk) => chunk,
+            Err(err) => {
+                drop((payload, buffers));
+                return Err(json_error_response(
+                    StatusCode::BAD_REQUEST,
+                    serde_json::json!({"error":"RequestBodyReadError", "route":route_name, "message":err.to_string()}),
+                    Some(budget),
+                )
+                .into());
+            }
+        };
         if chunk.is_empty() {
             continue;
         }
-        let next_len = payload.len().checked_add(chunk.len()).ok_or_else(|| {
-            payload_too_large_response(route_name, u64::MAX, max_payload_size, budget)
-        })?;
-        if next_len as u64 > max_payload_size {
-            return Err(payload_too_large_response(
-                route_name,
-                next_len as u64,
-                max_payload_size,
-                budget,
-            )
-            .into());
+        let next_len = (payload.len() as u64).saturating_add(chunk.len() as u64);
+        if next_len > max_payload_size {
+            drop((payload, buffers));
+            return Err(
+                payload_too_large_response(route_name, next_len, max_payload_size, budget).into(),
+            );
         }
-        if next_len as u64 > limit {
+        if next_len > limit {
+            drop((payload, buffers));
             return Err(unknown_length_too_large_response(route_name, limit, budget).into());
         }
         if buffers.is_none() {
             let plan = SendBufferPlan::new(
-                budget.snapshot().limit_bytes,
+                budget.snapshot().memory.limit_bytes,
                 chunk.len() as u64,
                 copy_cap,
                 copy_cap,
@@ -1775,7 +1768,7 @@ async fn read_unknown_length_body(
             // Neither sending area has been allocated or used yet. Give
             // growing input only the unused part it needs, retaining both
             // directions' minimum progress unit; never wait on these charges.
-            let snapshot = budget.snapshot();
+            let snapshot = budget.snapshot().memory;
             let mut deficit =
                 (chunk.len() as u64).saturating_sub(snapshot.limit_bytes - snapshot.used_bytes);
             let (upload, download) = buffers
@@ -1803,8 +1796,9 @@ async fn read_unknown_length_body(
     let (mut upload, mut download) = match buffers {
         Some(buffers) => buffers,
         None => {
-            let plan = SendBufferPlan::new(budget.snapshot().limit_bytes, 0, copy_cap, copy_cap)
-                .map_err(|error| forwarding_capacity_response(route_name, error.to_string()))?;
+            let plan =
+                SendBufferPlan::new(budget.snapshot().memory.limit_bytes, 0, copy_cap, copy_cap)
+                    .map_err(|error| forwarding_capacity_response(route_name, error.to_string()))?;
             let SendBuffers {
                 input,
                 upload,
@@ -1826,7 +1820,7 @@ async fn read_unknown_length_body(
         .min(payload.len() as u64)
         .saturating_sub(upload.bytes());
     if additional != 0 {
-        let snapshot = budget.snapshot();
+        let snapshot = budget.snapshot().memory;
         let refund = additional
             .saturating_sub(snapshot.limit_bytes.saturating_sub(snapshot.used_bytes))
             .min(download.bytes().saturating_sub(1));
@@ -1835,7 +1829,7 @@ async fn read_unknown_length_body(
                 .split_off(refund)
                 .expect("unused receiving capacity"),
         );
-        let snapshot = budget.snapshot();
+        let snapshot = budget.snapshot().memory;
         let growth = additional.min(snapshot.limit_bytes.saturating_sub(snapshot.used_bytes));
         if growth != 0 {
             match upload.try_grow(growth) {
@@ -1862,7 +1856,7 @@ async fn read_unknown_length_body(
 // the stream closure for the entire response wait.
 struct ReservedIncomingChunk {
     bytes: Bytes,
-    _reservation: Arc<PayloadBufferReservation>,
+    _reservation: Arc<MemoryReservation>,
 }
 
 impl AsRef<[u8]> for ReservedIncomingChunk {
@@ -1874,7 +1868,7 @@ impl AsRef<[u8]> for ReservedIncomingChunk {
 fn known_length_body_stream(
     body: Body,
     content_length: u64,
-    reservation: PayloadBufferReservation,
+    reservation: MemoryReservation,
 ) -> impl futures::Stream<Item = Result<Bytes, axum::Error>> + Send {
     let mut remaining = content_length;
     let mut reservation = (content_length != 0).then(|| Arc::new(reservation));
@@ -1961,7 +1955,7 @@ async fn call_handler(
     headers: HeaderMap,
     body: Body,
 ) -> Response {
-    let budget = state.forwarding.payload_budget();
+    let budget = state.forwarding.budget().clone();
     let expected_crm = match expected_crm_from_headers(&route_name, &headers, Some(&budget)) {
         Ok(expected) => expected,
         Err(response) => return response.into_response(),
@@ -2083,10 +2077,12 @@ async fn finish_early_rejection(
 
 fn forwarding_capacity_response(_route_name: &str, _message: impl Into<String>) -> Response {
     // This fixed control reply has no owned payload buffer. It must remain
-    // deliverable even when B is zero or a legitimate call holds all of B.
-    const BODY: &[u8] = br#"{"version":1,"code":717,"name":"CallCapacityExceeded","message":"relay forwarding capacity exceeded","details":{"dispatch_phase":"pre_dispatch"}}"#;
+    // deliverable even when the memory budget is zero or a legitimate call
+    // holds all of it. Forwarding-slot and memory-capacity refusals are both
+    // pre-dispatch 503s: the call never reached the resource.
+    const BODY: &[u8] = br#"{"version":1,"code":717,"name":"CallCapacityExceeded","message":"relay forwarding capacity exceeded","details":{"stage":"call_execution_admission","dispatch_phase":"pre_dispatch"}}"#;
     (
-        StatusCode::BAD_GATEWAY,
+        StatusCode::SERVICE_UNAVAILABLE,
         [(header::CONTENT_TYPE, "application/json")],
         Body::from(Bytes::from_static(BODY)),
     )
@@ -2111,15 +2107,13 @@ async fn forward_call(
     advertised_route: RouteEntry,
     content_length: Option<u64>,
     body: Body,
-    permit: c2_mem::RetentionPermit,
+    permit: c2_mem::OperationPermit,
     cancelled: CancellationToken,
     server_stream: bool,
 ) -> Response {
-    let budget = state.forwarding.payload_budget();
-    let copy_cap = state
-        .config()
-        .remote_payload_chunk_size
-        .min(state.config().upstream_ipc.chunk_size)
+    let budget = state.forwarding.budget().clone();
+    let copy_cap = c2_config::REMOTE_PAYLOAD_CHUNK_SIZE
+        .min(c2_config::CHUNK_SIZE)
         .max(1);
     let shutdown = state.forwarding.shutdown_token();
     let (input_len, chunks, upload, download): (
@@ -2130,7 +2124,7 @@ async fn forward_call(
     ) = match content_length {
         Some(input_len) => {
             let plan = match SendBufferPlan::new(
-                budget.snapshot().limit_bytes,
+                budget.snapshot().memory.limit_bytes,
                 input_len,
                 copy_cap,
                 copy_cap,
@@ -2203,15 +2197,19 @@ async fn forward_call(
                 (lease, binding, route)
             }
             RequestClient::WatchUnavailable { route, reason } => {
+                drop((chunks, upload, download));
                 return route_watch_unavailable_response_budgeted(&route.name, reason, &budget);
             }
             RequestClient::NotFound => {
+                drop((chunks, upload, download));
                 return resource_not_found_response_budgeted(&route_name, &budget);
             }
             RequestClient::RouteError(error) => {
+                drop((chunks, upload, download));
                 return ipc_route_error_response(&route_name, &error, Some(&budget));
             }
             RequestClient::Unreachable => {
+                drop((chunks, upload, download));
                 return resource_unavailable_response_budgeted(
                     &route_name,
                     format!("relay upstream unavailable: {route_name}"),
@@ -2221,6 +2219,7 @@ async fn forward_call(
             }
         };
     if input_len > current_route.max_payload_size {
+        drop((chunks, upload, download));
         return payload_too_large_response(
             &route_name,
             input_len,
@@ -2233,6 +2232,7 @@ async fn forward_call(
         return StatusCode::NO_CONTENT.into_response();
     }
     if server_stream && shutdown.is_cancelled() {
+        drop((chunks, upload, download));
         return relay_shutdown_refusal(&route_name, &budget);
     }
 
@@ -2259,11 +2259,16 @@ async fn forward_call(
     };
 
     match call_result {
+        // The unary permit and the upstream lease move into the response
+        // body: they are held until the whole body has been transported or
+        // the downstream drops it, never released when this handler returns.
         Ok(ForwardedResponse::Unary(result)) => super::streaming::unary_response(
             result,
             StatusCode::OK,
-            download,
-            budget.clone(),
+            download.into_reusable_window(),
+            permit,
+            lease,
+            state.forwarding.track_body(),
             width,
         ),
         Ok(ForwardedResponse::Stream(stream)) => match super::streaming::stream_response(
@@ -2271,7 +2276,7 @@ async fn forward_call(
             stream,
             lease,
             permit,
-            download,
+            download.into_reusable_window(),
             width,
         ) {
             Ok(response) => response,
@@ -2299,6 +2304,7 @@ async fn forward_call(
             }
             match error {
                 c2_ipc::IpcError::CallRejected(error) => {
+                    drop(download);
                     let error = c2_ipc::IpcError::CallRejected(error);
                     if let Some(reason) = semantic_withdrawal_reason(&error) {
                         drop(lease);
@@ -2320,11 +2326,14 @@ async fn forward_call(
                 c2_ipc::IpcError::CrmError(err_bytes) => super::streaming::unary_response(
                     c2_ipc::ResponseData::Inline(err_bytes),
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    download,
-                    budget.clone(),
+                    download.into_reusable_window(),
+                    permit,
+                    lease,
+                    state.forwarding.track_body(),
                     width,
                 ),
                 error if matches!(phase, c2_ipc::TransportPhase::PreDispatch) => {
+                    drop(download);
                     if let Some(reason) = semantic_withdrawal_reason(&error) {
                         drop(lease);
                         remove_unreachable_route_for_error(
@@ -2343,6 +2352,7 @@ async fn forward_call(
                             if matches!(source.as_ref(), c2_ipc::IpcError::Chunk(c2_ipc::client::ChunkError::Capacity(_)))
                     ) && matches!(phase, c2_ipc::TransportPhase::DispatchUncertain) =>
                 {
+                    drop(download);
                     // Reply admission rejects only this RID; the receiver
                     // keeps serving other calls on the healthy connection.
                     // Dispatch already happened, so replay is still unsafe.
@@ -2354,6 +2364,7 @@ async fn forward_call(
                     )
                 }
                 error => {
+                    drop(download);
                     // The request may already have reached the service. Evict
                     // the failed transport, but never tell the client that
                     // replay is safe.
@@ -2410,7 +2421,7 @@ async fn finish_stream_upload(
     }
 }
 
-fn relay_shutdown_refusal(route: &str, budget: &PayloadBufferBudget) -> Response {
+fn relay_shutdown_refusal(route: &str, budget: &DomainBudget) -> Response {
     ipc_route_error_response(
         route,
         &c2_ipc::IpcError::CallRejected(c2_error::C2Error::new(
@@ -2469,7 +2480,7 @@ async fn acquire_request_client_for_route(
 fn ipc_route_error_response(
     route_name: &str,
     error: &c2_ipc::IpcError,
-    budget: Option<&PayloadBufferBudget>,
+    budget: Option<&DomainBudget>,
 ) -> Response {
     use c2_error::{C2Error, ErrorCode};
     let semantic_error_response =
@@ -2722,18 +2733,6 @@ fn unreachable_route_removal_log_line(
     )
 }
 
-/// `POST /_echo` — echo endpoint for benchmarking the relay itself.
-///
-/// Returns the request body immediately with no IPC round-trip.
-async fn echo_handler(body: Bytes) -> Response {
-    (
-        StatusCode::OK,
-        [("content-type", "application/octet-stream")],
-        body,
-    )
-        .into_response()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2741,7 +2740,6 @@ mod tests {
     use axum::body::{Body, to_bytes};
     use axum::extract::ConnectInfo;
     use axum::http::{Request, StatusCode};
-    use c2_ipc::ClientIpcConfig;
     use c2_server::{
         ConcurrencyMode, CrmCallback, CrmError, ResponseMeta, RouteBuildSpec, SchedulerLimits,
         Server, ServerIdentity, ServerIpcConfig,
@@ -3721,11 +3719,9 @@ mod tests {
             .unwrap() else {
                 panic!("matching namespace must propose direct IPC")
             };
-            let mut ipc = IpcClient::with_endpoint(
-                contexts[index].endpoint(&candidate.address).unwrap(),
-                ClientIpcConfig::default(),
-            )
-            .unwrap();
+            let mut ipc =
+                IpcClient::with_endpoint(contexts[index].endpoint(&candidate.address).unwrap())
+                    .unwrap();
             ipc.connect().await.unwrap();
             assert_eq!(ipc.server_id(), Some(candidate.server_id.as_str()));
             assert_eq!(
@@ -5229,29 +5225,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn data_plane_echo_allows_large_payloads() {
-        let state = test_state();
-        let app = build_router(state);
-        let payload = vec![b'x'; 2 * 1024 * 1024];
-
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/_echo")
-                    .header("content-type", "application/octet-stream")
-                    .body(Body::from(payload.clone()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        assert_eq!(body.len(), payload.len());
-    }
-
-    #[tokio::test]
     async fn relay_rejects_oversized_expect_content_length_without_polling_body() {
         let state = test_state();
         state.with_route_table_mut(|rt| {
@@ -5411,7 +5384,7 @@ mod tests {
             StatusCode::CREATED
         );
 
-        let payload = vec![b'x'; ClientIpcConfig::default().chunk_size as usize + 1];
+        let payload = vec![b'x'; c2_config::CHUNK_SIZE as usize + 1];
         let content_length = payload.len().to_string();
         let route = state.local_route("grid");
         let app = build_router(state.clone());
@@ -5431,8 +5404,12 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
-        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        assert_eq!(&body[..], payload.as_slice());
+        let mut frames = response.into_body().into_data_stream();
+        let mut body = Vec::new();
+        while let Some(frame) = frames.next().await {
+            body.extend_from_slice(&frame.unwrap());
+        }
+        assert_eq!(body, payload);
         let (lease, _, _) = state
             .acquire_upstream_for_route(route.as_ref().unwrap())
             .await
@@ -5448,296 +5425,50 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn relay_reply_capacity_preserves_shared_connection_and_inflight_call() {
-        use futures::FutureExt;
-        use std::sync::atomic::{AtomicUsize, Ordering};
-
-        struct CapacityCallback {
-            calls: [AtomicUsize; 3],
-            blocked_started: tokio::sync::Notify,
-            release: parking_lot::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
-        }
-
-        impl CrmCallback for CapacityCallback {
-            fn invoke(
-                &self,
-                _route_name: &str,
-                method_idx: u16,
-                request: Vec<u8>,
-                _response_pool: Arc<c2_server::ResponsePool>,
-            ) -> Result<ResponseMeta, CrmError> {
-                // Consume through the real owner even when the HTTP request
-                // reached us as SHM. No transport coordinates are discarded.
-                let bytes = request;
-                if bytes != [7; 32] {
-                    return Err(CrmError::InternalError("unexpected request".into()));
-                }
-                self.calls[method_idx as usize].fetch_add(1, Ordering::SeqCst);
-                if method_idx == 1 {
-                    // Take the receiver before blocking; no synchronous guard
-                    // survives the wait, and cleanup can always release us.
-                    let release = self.release.lock().take().ok_or_else(|| {
-                        CrmError::InternalError("blocked call was replayed".into())
-                    })?;
-                    self.blocked_started.notify_one();
-                    release
-                        .recv_timeout(Duration::from_secs(5))
-                        .map_err(|err| {
-                            CrmError::InternalError(format!("barrier release failed: {err}"))
-                        })?;
-                }
-                Ok(ResponseMeta::Inline(vec![
-                    method_idx as u8;
-                    if method_idx == 0 {
-                        2048
-                    } else {
-                        512
-                    }
-                ]))
-            }
-        }
-
-        // Bind HTTP before starting any tasks, so a failed bind needs no
-        // asynchronous cleanup. Exercise the router through a real listener.
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let relay_url = format!("http://{}", listener.local_addr().unwrap());
-        let mut upstream_ipc = ClientIpcConfig::default();
-        upstream_ipc.base.pool_segment_size = 64 * 1024;
-        upstream_ipc.base.max_pool_segments = 2;
-        upstream_ipc.base.reassembly_segment_size = 64 * 1024;
-        upstream_ipc.base.reassembly_max_segments = 2;
-        upstream_ipc.base.live_reassembly_budget_bytes = 1024;
-        upstream_ipc.base.chunk_size = 256;
-        upstream_ipc.shm_threshold = 1;
-        upstream_ipc.validate().unwrap();
-        let state = Arc::new(RelayState::new(
-            Arc::new(c2_config::RelayConfig {
-                upstream_ipc,
-                idle_timeout_secs: 0,
-                advertise_url: relay_url.clone(),
-                ..c2_config::RelayConfig::default()
-            }),
-            Arc::new(crate::relay::test_support::NoopDisseminator),
-        ));
-        let mut server_config = ServerIpcConfig::default();
-        // Both backing budgets are zero, forcing owned replies through the
-        // real chunk fallback (eight 256-byte chunks for the rejected RID).
-        server_config.base.shm_backing_budget_bytes = 0;
-        server_config.base.file_backing_budget_bytes = 0;
-        server_config.base.chunk_size = 256;
-        server_config.shm_threshold = 1;
-        server_config.max_execution_workers = 2;
-        let address = format!(
-            "ipc://relay_reply_capacity_{}_{}",
-            std::process::id(),
-            unique_suffix()
-        );
-        let server = Arc::new(
-            Server::new_with_identity(
-                &address,
-                server_config,
-                ServerIdentity {
-                    server_id: "capacity-server".into(),
-                    server_instance_id: "capacity-instance".into(),
-                },
-            )
-            .unwrap(),
-        );
-        let (release_tx, release_rx) = std::sync::mpsc::channel();
-        let callback = Arc::new(CapacityCallback {
-            calls: std::array::from_fn(|_| AtomicUsize::new(0)),
-            blocked_started: tokio::sync::Notify::new(),
-            release: parking_lot::Mutex::new(Some(release_rx)),
-        });
-        let route = server
-            .build_route(
-                RouteBuildSpec {
-                    name: "grid".into(),
-                    crm_ns: "test.echo".into(),
-                    crm_name: "Echo".into(),
-                    crm_ver: "0.1.0".into(),
-                    abi_hash: TEST_ABI_HASH.into(),
-                    signature_hash: TEST_SIGNATURE_HASH.into(),
-                    method_names: vec!["oversized".into(), "blocked".into(), "ping".into()],
-                    access_map: std::collections::HashMap::new(),
-                    concurrency_mode: ConcurrencyMode::Parallel,
-                    limits: SchedulerLimits::default(),
-                },
-                callback.clone(),
-            )
-            .unwrap();
-        let reservation = server.reserve_route(route).await.unwrap();
-        server.commit_reserved_route(reservation).await.unwrap();
-        let run_server = server.clone();
-        let mut ipc_task = tokio::spawn(async move { run_server.run().await });
-        let (http_stop_tx, http_stop_rx) = tokio::sync::oneshot::channel();
-        let app = build_router(state.clone());
-        let mut http_task = tokio::spawn(async move {
-            axum::serve(listener, app)
-                .with_graceful_shutdown(async {
-                    let _ = http_stop_rx.await;
-                })
-                .await
-        });
-
-        // Run assertions inside a caught future so failures also release the
-        // barrier, retire the upstream, and join both listener tasks.
-        let mut original_client = None;
-        let result = std::panic::AssertUnwindSafe(async {
-            server.wait_until_responsive(Duration::from_secs(2)).await.unwrap();
-            let http = reqwest::Client::builder()
-                .no_proxy()
-                .timeout(Duration::from_secs(3))
-                .build()
-                .unwrap();
-            let registered = http.post(format!("{relay_url}/_register"))
-                .json(&serde_json::json!({
-                    "name": "grid",
-                    "server_id": "capacity-server",
-                    "server_instance_id": "capacity-instance",
-                    "address": address,
-                    "max_payload_size": server.config().max_payload_size,
-                }))
-                .send().await.unwrap();
-            assert_eq!(registered.status(), StatusCode::CREATED);
-            let _ = registered.bytes().await.unwrap();
-            let route = state.local_route("grid").unwrap();
-            let (lease, _) = state.acquire_upstream("grid").await
-                .unwrap_or_else(|_| panic!("initial upstream acquisition failed"));
-            let client = lease.client();
-            original_client = Some(client.clone());
-            drop(lease);
-            let request = |method: &str| {
-                http.post(format!("{relay_url}/grid/{method}"))
-                    .header(EXPECTED_CRM_NS_HEADER, "test.echo")
-                    .header(EXPECTED_CRM_NAME_HEADER, "Echo")
-                    .header(EXPECTED_CRM_VER_HEADER, "0.1.0")
-                    .header(EXPECTED_ABI_HASH_HEADER, TEST_ABI_HASH)
-                    .header(EXPECTED_SIGNATURE_HASH_HEADER, TEST_SIGNATURE_HASH)
-
-                    .body(vec![7; 32])
-            };
-            let blocked = request("blocked").send();
-            tokio::pin!(blocked);
-            tokio::select! {
-                _ = callback.blocked_started.notified() => {}
-                response = &mut blocked => panic!("blocked call completed before barrier: {response:?}"),
-                _ = tokio::time::sleep(Duration::from_secs(3)) => panic!("blocked call did not reach IPC"),
-            }
-            let (lease, _) = state.acquire_upstream("grid").await
-                .unwrap_or_else(|_| panic!("upstream acquisition failed while blocked"));
-            assert!(Arc::ptr_eq(&client, &lease.client()));
-            drop(lease);
-            let rejected = request("oversized").send().await.unwrap();
-            assert_eq!(rejected.status(), StatusCode::BAD_GATEWAY);
-            let envelope = rejected.json::<c2_error::C2ErrorEnvelope>().await.unwrap();
-            assert_eq!(envelope.code, 702);
-            assert_eq!(envelope.name, "ResourceUnavailable");
-            assert_eq!(envelope.details["dispatch_phase"], "dispatch_uncertain");
-            assert_eq!(envelope.details["route"], "grid");
-            assert_eq!(c2_error::C2Error::from_envelope(envelope).unwrap().code,
-                c2_error::ErrorCode::ResourceUnavailable);
-            let budget = state.upstream_memory_snapshot();
-            assert_eq!(budget.reassembly.limit_bytes, 1024);
-            assert_eq!(budget.reassembly.rejected_allocations, 1,
-                "must hit real reply admission, not a synthetic transport error");
-            assert_eq!(budget.reassembly.used_bytes, 0);
-            assert!(budget.shm.peak_bytes > 0, "requests must use real owned SHM");
-            assert_eq!(callback.calls.each_ref().map(|n| n.load(Ordering::SeqCst)), [1, 1, 0]);
-
-            // The original pooled connection must survive, while the other
-            // RID is still in flight. The old generic eviction fails here.
-            let (lease, current_route) = state.acquire_upstream("grid").await
-                .unwrap_or_else(|_| panic!("upstream acquisition failed after capacity rejection"));
-            assert!(Arc::ptr_eq(&client, &lease.client()), "capacity must not evict the shared client");
-            assert!(client.is_connected());
-            assert_eq!(current_route.route_uid, route.route_uid);
-            assert_eq!(UpstreamEndpointKey::from_route(&current_route), UpstreamEndpointKey::from_route(&route));
-            assert!(route_matches_expected_crm(&current_route, &c2_contract::ExpectedRouteContract {
-                route_name: route.name.clone(),
-                crm_ns: route.crm_ns.clone(),
-                crm_name: route.crm_name.clone(),
-                crm_ver: route.crm_ver.clone(),
-                abi_hash: route.abi_hash.clone(),
-                signature_hash: route.signature_hash.clone(),
-            }));
-            drop(lease);
-            release_tx.send(()).unwrap();
-            let completed = blocked.await.unwrap();
-            assert_eq!(completed.status(), StatusCode::OK);
-            assert_eq!(completed.bytes().await.unwrap().as_ref(), &[1; 512]);
-            let ping_address = address.clone();
-            assert!(tokio::task::spawn_blocking(move || {
-                c2_ipc::ping(&ping_address, Duration::from_secs(1))
-            }).await.unwrap().unwrap());
-            let pong = request("ping").send().await.unwrap();
-            assert_eq!(pong.status(), StatusCode::OK);
-            assert_eq!(pong.bytes().await.unwrap().as_ref(), &[2; 512]);
-            let (lease, final_route) = state.acquire_upstream("grid").await
-                .unwrap_or_else(|_| panic!("upstream acquisition failed after subsequent call"));
-            assert!(Arc::ptr_eq(&client, &lease.client()));
-            assert!(client.is_connected());
-            assert_eq!(final_route.route_uid, route.route_uid);
-            drop(lease);
-            assert_eq!(callback.calls.each_ref().map(|n| n.load(Ordering::SeqCst)), [1, 1, 1],
-                "capacity rejection must not replay either dispatched call");
-            assert_eq!(state.upstream_memory_snapshot().reassembly.used_bytes, 0);
-        }).catch_unwind().await;
-
-        let _ = release_tx.send(());
-        if let crate::relay::state::UnregisterResult::Removed {
-            client: Some(client),
-            ..
-        } = state.unregister_upstream("grid", "capacity-server")
-        {
-            client.close_shared().await;
-        }
-        if let Some(client) = original_client {
-            client.close_shared().await;
-        }
-        let _ = http_stop_tx.send(());
-        let ipc_stopped = server.shutdown_and_wait(Duration::from_secs(2)).await;
-        let http_stopped = tokio::time::timeout(Duration::from_secs(2), &mut http_task).await;
-        if http_stopped.is_err() {
-            http_task.abort();
-            let _ = http_task.await;
-        }
-        let ipc_joined = tokio::time::timeout(Duration::from_secs(2), &mut ipc_task).await;
-        if ipc_joined.is_err() {
-            ipc_task.abort();
-            let _ = ipc_task.await;
-        }
-        if let Err(panic) = result {
-            std::panic::resume_unwind(panic);
-        }
-        http_stopped.unwrap().unwrap().unwrap();
-        ipc_stopped.unwrap();
-        ipc_joined.unwrap().unwrap().unwrap();
-    }
-
-    #[tokio::test]
     async fn relay_response_cursor_uses_charged_remote_payload_chunks() {
-        let budget = PayloadBufferBudget::new(3);
+        let budget = crate::payload::memory_only_budget(16);
+        let pool = crate::relay::conn_pool::ConnectionPool::new();
+        let endpoint =
+            UpstreamEndpointKey::new("ipc://cursor", "server-grid", "server-grid-instance");
+        pool.insert(
+            endpoint.clone(),
+            Arc::new(IpcClient::new(endpoint.address()).unwrap()),
+        );
+        let lease = pool
+            .acquire_with(&endpoint, |_| async {
+                unreachable!("cached endpoint expected")
+            })
+            .await
+            .unwrap();
+        let permit = budget.reserve_operation().unwrap();
         let response = super::super::streaming::unary_response(
             c2_ipc::ResponseData::Inline(b"abcdefg".to_vec()),
             StatusCode::OK,
-            budget.try_reserve(3).unwrap(),
-            budget.clone(),
+            budget.try_reserve_memory(3).unwrap().into_reusable_window(),
+            permit,
+            lease,
+            tokio_util::task::TaskTracker::new().token(),
             3,
         );
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(response.headers()[header::CONTENT_LENGTH], "7");
 
+        // Each slice refunds its window capacity when consumed, so the body
+        // streams width-bounded chunks through a window far smaller than the
+        // response and returns the whole reservation when the body ends.
         let mut stream = response.into_body().into_data_stream();
-        let mut chunks = Vec::new();
+        let mut sizes = Vec::new();
+        let mut observed = Vec::new();
         while let Some(next) = stream.next().await {
-            chunks.push(next.expect("body chunk").to_vec());
+            let chunk = next.expect("body chunk");
+            sizes.push(chunk.len());
+            observed.extend_from_slice(&chunk);
         }
 
-        assert_eq!(
-            chunks,
-            vec![b"abc".to_vec(), b"def".to_vec(), b"g".to_vec()]
-        );
+        assert_eq!(sizes, vec![3, 3, 1]);
+        assert_eq!(observed, b"abcdefg");
+        assert_eq!(budget.snapshot().memory.used_bytes, 0);
+        assert_eq!(budget.snapshot().operations.used_operations, 0);
     }
 
     #[tokio::test]
@@ -6372,8 +6103,7 @@ mod tests {
         // Capture the live route identity before removal. The server
         // The directory UID is used only to register the route with the relay.
         // Its later removal is reported publicly by route name.
-        let mut attested =
-            c2_ipc::IpcClient::with_config(&owner_address, ClientIpcConfig::default()).unwrap();
+        let mut attested = c2_ipc::IpcClient::new(&owner_address).unwrap();
         attested
             .connect()
             .await
@@ -6530,8 +6260,7 @@ mod tests {
         );
         let owner_server = start_live_server(&owner_address, "server-grid").await;
 
-        let mut attested =
-            c2_ipc::IpcClient::with_config(&owner_address, ClientIpcConfig::default()).unwrap();
+        let mut attested = c2_ipc::IpcClient::new(&owner_address).unwrap();
         attested
             .connect()
             .await
@@ -6771,9 +6500,7 @@ mod tests {
 
         let mut stale_client = state
             .clients
-            .manage(|| {
-                c2_ipc::IpcClient::with_config(&address, c2_config::ClientIpcConfig::default())
-            })
+            .manage(|| c2_ipc::IpcClient::new(&address))
             .expect("stale snapshot client admission");
         stale_client.connect().await.expect("stale client connects");
         assert!(stale_client.has_route("manager"));
@@ -6866,9 +6593,7 @@ mod tests {
         );
         let server = start_live_server(&address, "server-grid").await;
 
-        let mut attested =
-            c2_ipc::IpcClient::with_config(&address, c2_config::ClientIpcConfig::default())
-                .unwrap();
+        let mut attested = c2_ipc::IpcClient::new(&address).unwrap();
         attested
             .connect()
             .await
@@ -6913,9 +6638,7 @@ mod tests {
 
         let mut stale_data_client = state
             .clients
-            .manage(|| {
-                c2_ipc::IpcClient::with_config(&address, c2_config::ClientIpcConfig::default())
-            })
+            .manage(|| c2_ipc::IpcClient::new(&address))
             .expect("stale data client admission");
         stale_data_client
             .connect()
@@ -7207,12 +6930,13 @@ mod forwarding_admission_tests {
     }
 
     async fn assert_capacity_response(response: Response) {
-        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         let bytes = axum::body::to_bytes(response.into_body(), 4096)
             .await
             .unwrap();
         let error: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(error["code"], 717);
+        assert_eq!(error["details"]["stage"], "call_execution_admission");
         assert_eq!(error["details"]["dispatch_phase"], "pre_dispatch");
         assert_eq!(error["message"], "relay forwarding capacity exceeded");
     }
@@ -7325,7 +7049,7 @@ mod forwarding_admission_tests {
 
     #[tokio::test]
     async fn unknown_length_growth_above_b_rejects_and_refunds() {
-        let budget = PayloadBufferBudget::new(5);
+        let budget = crate::payload::memory_only_budget(5);
         let cancelled = CancellationToken::new();
         let body = Body::from_stream(futures::stream::iter([
             Ok::<_, std::io::Error>(Bytes::from_static(b"abc")),
@@ -7336,19 +7060,19 @@ mod forwarding_admission_tests {
             .err()
             .expect("growth must reject")
             .into_response();
-        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         let response = axum::body::to_bytes(response.into_body(), 4096)
             .await
             .unwrap();
         let error: serde_json::Value = serde_json::from_slice(&response).unwrap();
         assert_eq!(error["details"]["dispatch_phase"], "pre_dispatch");
-        assert_eq!(budget.snapshot().peak_bytes, 5);
-        assert_eq!(budget.snapshot().used_bytes, 0);
+        assert_eq!(budget.snapshot().memory.peak_bytes, 5);
+        assert_eq!(budget.snapshot().memory.used_bytes, 0);
     }
 
     #[tokio::test]
     async fn unknown_length_growth_can_reuse_unused_sending_capacity() {
-        let budget = PayloadBufferBudget::new(1024);
+        let budget = crate::payload::memory_only_budget(1024);
         let cancelled = CancellationToken::new();
         let body = Body::from_stream(futures::stream::iter([
             Ok::<_, std::io::Error>(Bytes::from(vec![1; 100])),
@@ -7361,15 +7085,15 @@ mod forwarding_admission_tests {
         assert_eq!(prepared.len(), 200);
         assert!(prepared.upload.bytes() > 0);
         assert!(prepared.download.bytes() > 0);
-        assert!(budget.snapshot().peak_bytes <= 1024);
-        assert_eq!(budget.snapshot().rejected_allocations, 0);
+        assert!(budget.snapshot().memory.peak_bytes <= 1024);
+        assert_eq!(budget.snapshot().memory.rejected_allocations, 0);
         drop(prepared);
-        assert_eq!(budget.snapshot().used_bytes, 0);
+        assert_eq!(budget.snapshot().memory.used_bytes, 0);
     }
 
     #[tokio::test]
     async fn unknown_length_two_chunks_admit_when_known_length_fits_same_budget() {
-        let budget = PayloadBufferBudget::new(4);
+        let budget = crate::payload::memory_only_budget(4);
         let known_plan = SendBufferPlan::new(4, 2, 2, 2).unwrap();
         let known = reserve_send_buffers(&budget, known_plan, None)
             .await
@@ -7378,7 +7102,7 @@ mod forwarding_admission_tests {
         assert_eq!(known.upload.bytes(), 1);
         assert_eq!(known.download.bytes(), 1);
         drop(known);
-        assert_eq!(budget.snapshot().used_bytes, 0);
+        assert_eq!(budget.snapshot().memory.used_bytes, 0);
 
         let body = Body::from_stream(futures::stream::iter([
             Ok::<_, std::io::Error>(Bytes::from_static(b"a")),
@@ -7392,14 +7116,14 @@ mod forwarding_admission_tests {
         assert_eq!(prepared.len(), 2);
         assert_eq!(prepared.upload.bytes(), 1);
         assert_eq!(prepared.download.bytes(), 1);
-        assert_eq!(budget.snapshot().used_bytes, 4);
+        assert_eq!(budget.snapshot().memory.used_bytes, 4);
         drop(prepared);
-        assert_eq!(budget.snapshot().used_bytes, 0);
+        assert_eq!(budget.snapshot().memory.used_bytes, 0);
     }
 
     #[tokio::test]
     async fn unknown_length_source_fault_stays_body_error_and_refunds_owner() {
-        let budget = PayloadBufferBudget::new(1024);
+        let budget = crate::payload::memory_only_budget(1024);
         let cancelled = CancellationToken::new();
         let body = Body::from_stream(futures::stream::iter([
             Ok(Bytes::from_static(b"abc")),
@@ -7414,19 +7138,19 @@ mod forwarding_admission_tests {
             .expect("source fault must reject")
             .into_response();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        assert_eq!(budget.snapshot().peak_bytes, 5);
         let response = axum::body::to_bytes(response.into_body(), 4096)
             .await
             .unwrap();
+        assert_eq!(budget.snapshot().memory.peak_bytes, response.len() as u64);
         let error: serde_json::Value = serde_json::from_slice(&response).unwrap();
         assert_eq!(error["error"], "RequestBodyReadError");
         drop(response);
-        assert_eq!(budget.snapshot().used_bytes, 0);
+        assert_eq!(budget.snapshot().memory.used_bytes, 0);
     }
 
     #[tokio::test]
     async fn unknown_length_segments_fit_input_and_sending_budget() {
-        let budget = PayloadBufferBudget::new(7);
+        let budget = crate::payload::memory_only_budget(7);
         let cancelled = CancellationToken::new();
         let body = Body::from_stream(futures::stream::iter([
             Ok::<_, std::io::Error>(Bytes::new()),
@@ -7446,12 +7170,12 @@ mod forwarding_admission_tests {
         assert_eq!(segments.len(), 2);
         assert_eq!(segments[0].as_ref(), b"abc");
         assert_eq!(segments[1].as_ref(), b"de");
-        assert_eq!(budget.snapshot().peak_bytes, 7);
-        assert_eq!(budget.snapshot().used_bytes, 5);
+        assert_eq!(budget.snapshot().memory.peak_bytes, 7);
+        assert_eq!(budget.snapshot().memory.used_bytes, 5);
         drop(segments);
-        assert_eq!(budget.snapshot().used_bytes, 0);
+        assert_eq!(budget.snapshot().memory.used_bytes, 0);
 
-        let error_budget = PayloadBufferBudget::new(1024);
+        let error_budget = crate::payload::memory_only_budget(1024);
         let response = read_unknown_length_body(
             "grid",
             Body::from("abcdef"),
@@ -7465,13 +7189,14 @@ mod forwarding_admission_tests {
         .expect("payload limit must reject")
         .into_response();
         assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
-        assert_eq!(error_budget.snapshot().used_bytes, 0);
+        drop(response);
+        assert_eq!(error_budget.snapshot().memory.used_bytes, 0);
     }
 
     #[tokio::test]
     async fn unknown_length_first_segment_wait_cancels_without_dispatch() {
-        let budget = PayloadBufferBudget::new(5);
-        let held = budget.try_reserve(5).unwrap();
+        let budget = crate::payload::memory_only_budget(5);
+        let held = budget.try_reserve_memory(5).unwrap();
         let cancelled = CancellationToken::new();
         let mut read = Box::pin(read_unknown_length_body(
             "grid",
@@ -7482,18 +7207,18 @@ mod forwarding_admission_tests {
             1,
         ));
         assert!(futures::poll!(&mut read).is_pending());
-        assert_eq!(budget.snapshot().used_bytes, 5);
+        assert_eq!(budget.snapshot().memory.used_bytes, 5);
         cancelled.cancel();
         assert!(read.await.unwrap().is_none());
-        assert_eq!(budget.snapshot().used_bytes, 5);
-        assert_eq!(budget.snapshot().rejected_allocations, 0);
+        assert_eq!(budget.snapshot().memory.used_bytes, 5);
+        assert_eq!(budget.snapshot().memory.rejected_allocations, 0);
         drop(held);
-        assert_eq!(budget.snapshot().used_bytes, 0);
+        assert_eq!(budget.snapshot().memory.used_bytes, 0);
     }
 
     #[tokio::test]
     async fn concurrent_partial_unknown_uploads_do_not_wait_on_each_others_growth() {
-        let budget = PayloadBufferBudget::new(10);
+        let budget = crate::payload::memory_only_budget(10);
         let cancelled = CancellationToken::new();
         let (resume_a, paused_a) = tokio::sync::oneshot::channel::<()>();
         let (resume_b, paused_b) = tokio::sync::oneshot::channel::<()>();
@@ -7519,7 +7244,7 @@ mod forwarding_admission_tests {
         ));
         assert!(futures::poll!(&mut read_a).is_pending());
         assert!(futures::poll!(&mut read_b).is_pending());
-        assert_eq!(budget.snapshot().used_bytes, 10);
+        assert_eq!(budget.snapshot().memory.used_bytes, 10);
 
         resume_a.send(()).unwrap();
         let rejected = tokio::time::timeout(Duration::from_secs(1), &mut read_a)
@@ -7528,21 +7253,21 @@ mod forwarding_admission_tests {
             .err()
             .expect("later segment must reject")
             .into_response();
-        assert_eq!(rejected.status(), StatusCode::BAD_GATEWAY);
-        assert_eq!(budget.snapshot().used_bytes, 5);
+        assert_eq!(rejected.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(budget.snapshot().memory.used_bytes, 5);
 
         resume_b.send(()).unwrap();
         let accepted = read_b.await.unwrap().unwrap();
         assert_eq!(accepted.len(), 4);
-        assert_eq!(budget.snapshot().used_bytes, 6);
+        assert_eq!(budget.snapshot().memory.used_bytes, 6);
         drop(accepted);
-        assert_eq!(budget.snapshot().used_bytes, 0);
+        assert_eq!(budget.snapshot().memory.used_bytes, 0);
     }
 
     #[tokio::test]
     async fn known_length_releases_reservation_after_final_real_chunk_owner() {
-        let budget = PayloadBufferBudget::new(5);
-        let reservation = budget.reserve(5).await.unwrap();
+        let budget = crate::payload::memory_only_budget(5);
+        let reservation = budget.try_reserve_memory(5).unwrap();
         let body = Body::from_stream(futures::stream::iter([
             Ok::<_, std::io::Error>(Bytes::from_static(b"abc")),
             Ok(Bytes::from_static(b"de")),
@@ -7550,14 +7275,14 @@ mod forwarding_admission_tests {
         let mut stream = Box::pin(known_length_body_stream(body, 5, reservation));
         let first = stream.next().await.unwrap().unwrap();
         let second = stream.next().await.unwrap().unwrap();
-        assert_eq!(budget.snapshot().used_bytes, 5);
+        assert_eq!(budget.snapshot().memory.used_bytes, 5);
         drop(first);
-        assert_eq!(budget.snapshot().used_bytes, 5);
+        assert_eq!(budget.snapshot().memory.used_bytes, 5);
         let alias = second.slice(..1);
         drop(second);
-        assert_eq!(budget.snapshot().used_bytes, 5);
+        assert_eq!(budget.snapshot().memory.used_bytes, 5);
         drop(alias);
-        assert_eq!(budget.snapshot().used_bytes, 0);
+        assert_eq!(budget.snapshot().memory.used_bytes, 0);
         assert!(stream.next().await.is_none());
     }
 
@@ -7565,7 +7290,7 @@ mod forwarding_admission_tests {
     async fn generated_error_bytes_refund_after_last_slice() {
         use axum::body::HttpBody;
 
-        let budget = PayloadBufferBudget::new(1024);
+        let budget = crate::payload::memory_only_budget(1024);
         let response = budgeted_json_response(
             StatusCode::BAD_REQUEST,
             serde_json::json!({"error": "InvalidContentLength"}),
@@ -7577,7 +7302,7 @@ mod forwarding_admission_tests {
             .unwrap()
             .parse::<u64>()
             .unwrap();
-        assert_eq!(budget.snapshot().used_bytes, 0);
+        assert_eq!(budget.snapshot().memory.used_bytes, advertised_length);
         let mut body = response.into_body();
         let frame = std::future::poll_fn(|cx| std::pin::Pin::new(&mut body).poll_frame(cx))
             .await
@@ -7586,17 +7311,17 @@ mod forwarding_admission_tests {
         let bytes = frame.into_data().unwrap();
         let length = bytes.len() as u64;
         assert_eq!(advertised_length, length);
-        assert_eq!(budget.snapshot().used_bytes, length);
+        assert_eq!(budget.snapshot().memory.used_bytes, length);
         let alias = bytes.slice(..1);
         drop((body, bytes));
-        assert_eq!(budget.snapshot().used_bytes, length);
+        assert_eq!(budget.snapshot().memory.used_bytes, length);
         drop(alias);
-        assert_eq!(budget.snapshot().used_bytes, 0);
+        assert_eq!(budget.snapshot().memory.used_bytes, 0);
     }
 
     #[tokio::test]
     async fn generated_error_that_cannot_fit_preserves_dispatch_uncertainty() {
-        let budget = PayloadBufferBudget::new(0);
+        let budget = crate::payload::memory_only_budget(0);
         let response = resource_unavailable_response_budgeted(
             "grid",
             "upstream failed after dispatch",
@@ -7610,6 +7335,6 @@ mod forwarding_admission_tests {
         let envelope: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(envelope["code"], 702);
         assert_eq!(envelope["details"]["dispatch_phase"], "dispatch_uncertain");
-        assert_eq!(budget.snapshot().used_bytes, 0);
+        assert_eq!(budget.snapshot().memory.used_bytes, 0);
     }
 }

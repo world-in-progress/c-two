@@ -3,9 +3,10 @@ use std::time::{Duration, Instant};
 
 use c2_contract::{ContractRelease, MethodAccess};
 use c2_core::{
-    Connect, ConnectOptions, ConnectionEvent, ConnectionEventWait, EncodedClient, EncodedService,
-    Error, HostOptions, LifecycleError, MethodDefinition, Runtime, RuntimeOptions,
-    RuntimeShutdownReceipt, RuntimeShutdownTarget, ServiceDefinition, recv_connection_event,
+    ClientConfigPatch, ConfigField, Connect, ConnectOptions, ConnectionEvent, ConnectionEventWait,
+    DomainLimitsPatch, EncodedClient, EncodedService, Error, HostOptions, LifecycleError,
+    MethodDefinition, RoleKind, Runtime, RuntimeOptions, RuntimeShutdownReceipt,
+    RuntimeShutdownTarget, ServiceDefinition, recv_connection_event,
 };
 use c2_error::{C2Error, ErrorCode};
 
@@ -46,7 +47,6 @@ struct Fixture {
 impl Fixture {
     fn new() -> Self {
         let runtime = Runtime::new(RuntimeOptions {
-            server_id: Some(format!("retire-{}", uuid::Uuid::new_v4().simple())),
             use_process_relay_anchor: false,
             ..Default::default()
         })
@@ -275,6 +275,10 @@ fn hosted_zero_budget_retirement_keeps_draining_and_rejects_new_work() {
         "active native route guard must drain"
     );
     assert!(receipt.terminal_outcome().is_none());
+    assert!(matches!(
+        runtime.capture_retirement_handoff(),
+        Err(LifecycleError::Configuration(_))
+    ));
     assert_retired(host.register(definition()));
     assert_retired(runtime.host(HostOptions::default().without_relay()));
     assert_retired(runtime.connect(
@@ -400,6 +404,12 @@ fn ordinary_host_shutdown_preserves_runtime_restart_and_reacquire() {
         .host(HostOptions::default().without_relay())
         .unwrap();
     let _new_registration = restarted.register(definition()).unwrap();
+    assert!(matches!(
+        runtime.begin_session_retirement(RuntimeShutdownTarget::Host(&host), Instant::now() + WAIT),
+        Err(LifecycleError::Configuration(_))
+    ));
+    runtime.ensure_active().unwrap();
+    assert!(restarted.is_running());
     let new_client = runtime
         .connect(release().expected_route("echo").unwrap(), mode)
         .unwrap();
@@ -411,8 +421,26 @@ fn ordinary_host_shutdown_preserves_runtime_restart_and_reacquire() {
 fn host_shutdown_preserves_outgoing_finite_calls_until_explicit_retirement() {
     let fixture = Fixture::new();
     let runtime = &fixture.runtime;
+    runtime
+        .update_client_config(ClientConfigPatch {
+            domain_limits: DomainLimitsPatch {
+                memory_budget_bytes: ConfigField::Set(1024 * 1024),
+                file_spill_budget_bytes: ConfigField::Set(512 * 1024),
+                max_outstanding_calls: ConfigField::Set(3),
+            },
+        })
+        .unwrap();
     let host = runtime
-        .host(HostOptions::default().without_relay())
+        .host(
+            HostOptions::default()
+                .without_relay()
+                .with_startup_timeout(WAIT)
+                .with_max_payload_size(512 * 1024)
+                .with_max_execution_workers(2)
+                .with_memory_budget_bytes(2 * 1024 * 1024)
+                .with_file_spill_budget_bytes(128 * 1024)
+                .with_max_outstanding_calls(7),
+        )
         .unwrap();
     let _registration = host.register(definition()).unwrap();
     let peer = Fixture::new();
@@ -437,10 +465,19 @@ fn host_shutdown_preserves_outgoing_finite_calls_until_explicit_retirement() {
         ));
     let payload = vec![0x6b; 256 * 1024];
     let mut held = outgoing.call_held("echo", &payload).unwrap();
+    let hold = runtime.holds_tracker().track(c2_core::LocalCopyMeta {
+        route_name: "echo".into(),
+        method_name: "echo".into(),
+        direction: c2_core::LocalCopyDirection::ClientResponse,
+        bytes: payload.len(),
+    });
     let observation = outgoing.connection_observation().unwrap();
-    let calls = runtime.call_execution_observer();
-    assert!(calls.snapshot().initialized);
-    assert!(!calls.snapshot().closed);
+    let client_domain = runtime.client_domain_observer().unwrap();
+    let server_domain = runtime.server_domain_observer().unwrap();
+    let client_domain_id = client_domain.snapshot().domain_id;
+    let server_domain_id = server_domain.snapshot().domain_id;
+    let original_generation = runtime.memory_stats().server.generation;
+    assert!(!client_domain.snapshot().closed);
 
     let original = host.shutdown();
     assert!(original.runtime_barrier_error.is_none(), "{original:?}");
@@ -449,7 +486,7 @@ fn host_shutdown_preserves_outgoing_finite_calls_until_explicit_retirement() {
         !original.ipc_clients_drained,
         "Host closure has no outgoing drain scope"
     );
-    assert!(!calls.snapshot().closed);
+    assert!(!client_domain.snapshot().closed);
     assert!(observation.snapshot().is_none());
     assert_eq!(
         outgoing.call_owned("echo", b"after-host").unwrap(),
@@ -467,6 +504,10 @@ fn host_shutdown_preserves_outgoing_finite_calls_until_explicit_retirement() {
         b"after-restart"
     );
     assert_eq!(host.shutdown_outcome(), Some(original.clone()));
+    let previous_server_id = runtime.server_id().unwrap();
+    let mut prepared = outgoing.begin_call("echo").unwrap();
+    const PREPARED_BYTES: u64 = 32;
+    prepared.charge_input(PREPARED_BYTES).unwrap();
     let receipt = runtime
         .begin_session_retirement(
             RuntimeShutdownTarget::Host(&restarted),
@@ -474,7 +515,8 @@ fn host_shutdown_preserves_outgoing_finite_calls_until_explicit_retirement() {
         )
         .unwrap();
     completed(&receipt);
-    assert!(calls.snapshot().closed);
+    assert!(client_domain.snapshot().closed);
+    assert!(server_domain.snapshot().closed);
     let Error::Semantic(error) = outgoing
         .call_owned("echo", b"after-retirement")
         .unwrap_err()
@@ -500,15 +542,106 @@ fn host_shutdown_preserves_outgoing_finite_calls_until_explicit_retirement() {
             .unwrap()
             .is_none()
     );
-    assert!(
-        replacement
-            .runtime
-            .memory_stats()
-            .runtime_outgoing
-            .is_none()
+    let handoff = runtime.capture_retirement_handoff().unwrap();
+    replacement
+        .runtime
+        .adopt_retirement_handoff(&handoff)
+        .unwrap();
+    replacement
+        .runtime
+        .adopt_retirement_handoff(&runtime.capture_retirement_handoff().unwrap())
+        .unwrap();
+    assert_eq!(
+        replacement.runtime.client_overrides(),
+        runtime.client_overrides()
+    );
+    assert_eq!(
+        replacement.runtime.server_overrides(),
+        runtime.server_overrides()
+    );
+    assert_eq!(replacement.runtime.server_overrides().server_id, None);
+    let stats = replacement.runtime.memory_stats();
+    assert!(stats.client.memory.is_none());
+    assert!(stats.server.memory.is_none());
+    assert_eq!(stats.retired.len(), 2);
+    let retired_client = &stats.retired[0];
+    let retired_server = &stats.retired[1];
+    assert_eq!(retired_client.role, RoleKind::Client);
+    assert_eq!(retired_client.stats.domain_id, Some(client_domain_id));
+    assert!(retired_client.stats.closed);
+    assert_eq!(
+        retired_client.stats.memory.unwrap().used_bytes,
+        PREPARED_BYTES
+    );
+    assert_eq!(retired_server.role, RoleKind::Server);
+    assert_eq!(retired_server.stats.domain_id, Some(server_domain_id));
+    assert!(retired_server.stats.closed);
+    assert_eq!(retired_server.stats.generation, original_generation + 1);
+    let retired_calls = replacement.runtime.call_execution_snapshot().retired;
+    assert_eq!(retired_calls.len(), 2);
+    assert_eq!(retired_calls[0].stats.used_operations, Some(1));
+    assert_eq!(retired_calls[1].stats.used_operations, Some(0));
+    assert_eq!(stats.holds.active_holds, 1);
+    assert_eq!(stats.holds.total_held_bytes, payload.len());
+    assert_eq!(held.bytes(), payload);
+    drop(prepared);
+    assert_eq!(
+        replacement.runtime.memory_stats().retired[0]
+            .stats
+            .memory
+            .unwrap()
+            .used_bytes,
+        0
+    );
+    assert_eq!(
+        replacement.runtime.call_execution_snapshot().retired[0]
+            .stats
+            .used_operations,
+        Some(0)
     );
     held.invalidate_then_release(|| Ok(())).unwrap();
+    drop(hold);
     assert!(held.bytes().is_empty());
+    assert_eq!(replacement.runtime.memory_stats().holds.active_holds, 0);
+
+    let replacement_host = replacement
+        .runtime
+        .host(HostOptions::default().without_relay())
+        .unwrap();
+    assert_ne!(replacement.runtime.server_id().unwrap(), previous_server_id);
+    let config = replacement.runtime.server_config().unwrap();
+    assert_eq!(config.startup_timeout, WAIT);
+    assert_eq!(config.ipc.max_payload_size, 512 * 1024);
+    assert_eq!(config.ipc.max_execution_workers, 2);
+    assert_eq!(
+        config.domain_limits,
+        runtime.server_config().unwrap().domain_limits
+    );
+    let registration = replacement_host.register(definition()).unwrap();
+    let replacement_client = replacement
+        .runtime
+        .connect(
+            release().expected_route("echo").unwrap(),
+            Connect::DirectIpc {
+                address: replacement_host.local_endpoint().address().into(),
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        replacement_client.call_owned("echo", b"new").unwrap(),
+        b"new"
+    );
+    let fresh_client = replacement
+        .runtime
+        .client_domain_observer()
+        .unwrap()
+        .snapshot();
+    assert_ne!(fresh_client.domain_id, client_domain_id);
+    assert_eq!(fresh_client.memory.limit_bytes, 1024 * 1024);
+    assert_eq!(fresh_client.file_spill.limit_bytes, 512 * 1024);
+    assert_eq!(fresh_client.operations.max_operations, 3);
+    drop(registration);
+    assert!(replacement_host.shutdown().runtime_barrier_error.is_none());
     assert!(peer_host.shutdown().runtime_barrier_error.is_none());
 }
 
@@ -588,7 +721,7 @@ fn retirement_keeps_deadline_and_contract_precedence_without_creating_ipc_pool()
     assert_retired(runtime.connect(expected, mode));
     assert!(!runtime.local_endpoint_frozen());
     assert!(!runtime.client_config_frozen());
-    assert!(runtime.outgoing_memory_stats().is_none());
+    assert!(runtime.memory_stats().client.memory.is_none());
 }
 
 #[test]
@@ -657,6 +790,10 @@ fn client_scope_cannot_report_completion_for_an_undeclared_host() {
     completed(&clients);
     assert!(host.is_running());
     assert!(matches!(
+        fixture.runtime.capture_retirement_handoff(),
+        Err(LifecycleError::Configuration(_))
+    ));
+    assert!(matches!(
         fixture
             .runtime
             .begin_session_retirement(RuntimeShutdownTarget::Host(&host), Instant::now() + WAIT,),
@@ -665,6 +802,7 @@ fn client_scope_cannot_report_completion_for_an_undeclared_host() {
     // Rejection borrows the supplied Host; its owner remains available.
     assert!(host.is_running());
     assert!(host.shutdown().runtime_barrier_error.is_none());
+    fixture.runtime.capture_retirement_handoff().unwrap();
 }
 
 #[test]

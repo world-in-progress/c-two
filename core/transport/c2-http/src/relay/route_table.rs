@@ -1,3 +1,4 @@
+use crate::valid_relay_url;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -969,20 +970,6 @@ fn valid_ipc_address(address: &str) -> bool {
     address
         .strip_prefix("ipc://")
         .is_some_and(|id| c2_config::validate_server_id(id).is_ok())
-}
-
-pub(crate) fn valid_relay_url(url: &str) -> bool {
-    match reqwest::Url::parse(url) {
-        Ok(parsed) => {
-            matches!(parsed.scheme(), "http" | "https")
-                && parsed.host_str().is_some()
-                && parsed.query().is_none()
-                && parsed.fragment().is_none()
-                && parsed.username().is_empty()
-                && parsed.password().is_none()
-        }
-        Err(_) => false,
-    }
 }
 
 fn current_epoch_millis() -> u64 {

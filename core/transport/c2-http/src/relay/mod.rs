@@ -43,6 +43,8 @@ macro_rules! test_commit_registration {
     }};
 }
 
+#[cfg(test)]
+mod admission_tests;
 pub(crate) mod authority;
 pub(crate) mod background;
 pub(crate) mod client_lifecycle;

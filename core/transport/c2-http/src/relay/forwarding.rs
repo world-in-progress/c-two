@@ -16,9 +16,7 @@ use std::sync::{
 };
 use std::task::{Context, Poll};
 
-use c2_config::CallExecutionLimits;
-use c2_mem::retention::PayloadBufferBudget;
-use c2_mem::{RetentionBudget, RetentionError, RetentionPermit, RetentionSnapshot};
+use c2_mem::{DomainBudget, OperationPermit, RetentionError, RetentionSnapshot};
 use parking_lot::Mutex;
 use tokio::sync::Notify;
 use tokio::sync::oneshot;
@@ -26,7 +24,7 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
 pub(crate) struct ForwardingDomain {
-    budget: RetentionBudget,
+    budget: DomainBudget,
     tasks: TaskTracker,
     admission: Mutex<()>,
     streams: Mutex<HashMap<String, Arc<StreamCancellation>>>,
@@ -141,9 +139,12 @@ impl StreamCancellation {
 }
 
 impl ForwardingDomain {
-    pub(crate) fn new(limits: &CallExecutionLimits) -> Self {
+    /// The relay's one shared role domain: its operation slots bound
+    /// forwarding admission and its memory budget backs HTTP request/response
+    /// buffers and every data-plane upstream IPC pool.
+    pub(crate) fn new(budget: DomainBudget) -> Self {
         Self {
-            budget: RetentionBudget::from_call_limits(limits),
+            budget,
             tasks: TaskTracker::new(),
             admission: Mutex::new(()),
             streams: Mutex::new(HashMap::new()),
@@ -159,11 +160,11 @@ impl ForwardingDomain {
     pub(crate) fn spawn<T, F, Fut>(&self, work: F) -> Result<ForwardingWaiter<T>, RetentionError>
     where
         T: Send + 'static,
-        F: FnOnce(RetentionPermit, CancellationToken) -> Fut + Send + 'static,
+        F: FnOnce(OperationPermit, CancellationToken) -> Fut + Send + 'static,
         Fut: Future<Output = T> + Send + 'static,
     {
         let _admission = self.admission.lock();
-        let permit = self.budget.reserve()?;
+        let permit = self.budget.reserve_operation()?;
         let (tx, rx) = oneshot::channel();
         let cancelled = CancellationToken::new();
         let task_cancelled = cancelled.clone();
@@ -184,7 +185,7 @@ impl ForwardingDomain {
 
     pub(crate) fn close(&self) {
         let _admission = self.admission.lock();
-        self.budget.close();
+        self.budget.close_operations();
         self.shutdown.cancel();
         for stream in self.streams.lock().values() {
             stream.cancel(c2_wire::rpc::CancelCause::Lifecycle);
@@ -201,7 +202,7 @@ impl ForwardingDomain {
     ) -> Result<(String, Arc<StreamCancellation>), getrandom::Error> {
         let _admission = self.admission.lock();
         let control = Arc::new(StreamCancellation::new());
-        if self.budget.snapshot().closed {
+        if self.budget.snapshot().operations.closed {
             control.cancel(c2_wire::rpc::CancelCause::Lifecycle);
         }
         let mut streams = self.streams.lock();
@@ -236,21 +237,25 @@ impl ForwardingDomain {
         self.tasks.spawn(work);
     }
 
+    pub(crate) fn track_body(&self) -> tokio_util::task::task_tracker::TaskTrackerToken {
+        self.tasks.token()
+    }
+
     /// Must be called after close; permanent upstream work remains outstanding.
-    /// This observes forwarding tasks. Relay shutdown separately drains the
-    /// bounded native-client lifecycle, including request-only pending cleanup.
-    /// Physical backing retirement remains with IPC RequestReleaseState/retire
-    /// owners and their separate MemoryBudget; zero tasks is not a byte snapshot.
+    /// This observes forwarding tasks and response bodies. Relay shutdown
+    /// separately drains the bounded native-client lifecycle and physical
+    /// backing owners, including request-only pending cleanup.
     pub(crate) async fn drain(&self) {
         self.tasks.wait().await;
     }
 
     pub(crate) fn snapshot(&self) -> RetentionSnapshot {
-        self.budget.snapshot()
+        self.budget.snapshot().operations
     }
 
-    pub(crate) fn payload_budget(&self) -> PayloadBufferBudget {
-        self.budget.payload_budget()
+    /// The relay's single shared role domain.
+    pub(crate) fn budget(&self) -> &DomainBudget {
+        &self.budget
     }
 
     #[cfg(test)]
@@ -282,13 +287,22 @@ impl ForwardingDomain {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use c2_mem::RetentionRejectReason;
+    use c2_config::DomainLimits;
+    use c2_mem::{DomainBudget, RetentionRejectReason};
     use std::sync::Arc;
     use std::time::Duration;
 
+    fn domain(memory: u64, operations: u64) -> ForwardingDomain {
+        ForwardingDomain::new(DomainBudget::from_limits(&DomainLimits {
+            memory_budget_bytes: memory,
+            file_spill_budget_bytes: 0,
+            max_outstanding_calls: operations,
+        }))
+    }
+
     #[tokio::test]
     async fn completed_header_waiter_does_not_cancel_response_ownership() {
-        let domain = ForwardingDomain::new(&CallExecutionLimits::default());
+        let domain = domain(64, u64::MAX);
         let waiter = domain
             .spawn(|_, cancelled| async move { cancelled })
             .unwrap();
@@ -298,7 +312,7 @@ mod tests {
 
     #[tokio::test]
     async fn call_tokens_expire_with_the_original_record_and_shutdown_keeps_cause() {
-        let domain = ForwardingDomain::new(&CallExecutionLimits::default());
+        let domain = domain(64, u64::MAX);
         let (first, first_control) = domain.register_stream().unwrap();
         let (second, second_control) = domain.register_stream().unwrap();
         assert_eq!(first.len(), 32);
@@ -326,10 +340,7 @@ mod tests {
 
     #[tokio::test]
     async fn detached_waiter_keeps_permit_and_drain_observes_actual_task() {
-        let domain = Arc::new(ForwardingDomain::new(&CallExecutionLimits {
-            max_outstanding_calls: 1,
-            payload_buffer_budget_bytes: 32,
-        }));
+        let domain = Arc::new(domain(32, 1));
         let (release, wait) = oneshot::channel();
         let result = domain
             .spawn(|permit, _| async move {
@@ -341,7 +352,7 @@ mod tests {
         assert_eq!(domain.snapshot().used_operations, 1);
         assert_eq!(
             domain.spawn(|_, _| async {}).unwrap_err().reason,
-            RetentionRejectReason::OperationsExhausted
+            RetentionRejectReason::LimitReached
         );
         domain.close();
         assert_eq!(
@@ -358,23 +369,21 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(domain.snapshot().used_operations, 0);
-        assert_eq!(domain.payload_budget().snapshot().used_bytes, 0);
+        assert_eq!(domain.budget().snapshot().memory.used_bytes, 0);
     }
 
     #[tokio::test]
-    async fn zero_payload_budget_still_admits_an_operation_slot() {
-        let domain = ForwardingDomain::new(&CallExecutionLimits {
-            max_outstanding_calls: 2,
-            payload_buffer_budget_bytes: 0,
-        });
+    async fn zero_memory_budget_still_admits_an_operation_slot() {
+        let domain = domain(0, 2);
         let waiter = domain.spawn(|_, _| async {}).unwrap();
         waiter.await.unwrap();
         assert!(matches!(
-            domain.payload_budget().reserve(1).await,
-            Err(c2_mem::retention::PayloadBufferError::TooLarge { .. })
+            domain.budget().reserve_memory(1).await,
+            Err(c2_mem::PayloadBufferError::TooLarge { .. })
         ));
         domain.close();
         domain.drain().await;
         assert_eq!(domain.snapshot().used_operations, 0);
+        assert_eq!(domain.budget().snapshot().memory.used_bytes, 0);
     }
 }

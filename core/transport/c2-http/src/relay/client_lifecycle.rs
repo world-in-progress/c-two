@@ -264,12 +264,7 @@ mod tests {
         for _ in 0..CLIENT_COUNT {
             reserved.push(
                 domain
-                    .manage(|| {
-                        IpcClient::with_config(
-                            "ipc://not-connected",
-                            c2_config::ClientIpcConfig::default(),
-                        )
-                    })
+                    .manage(|| IpcClient::new("ipc://not-connected"))
                     .unwrap(),
             );
         }
@@ -289,10 +284,7 @@ mod tests {
         assert_eq!(domain.outstanding(), 0);
         assert!(
             domain
-                .manage(|| IpcClient::with_config(
-                    "ipc://not-connected",
-                    c2_config::ClientIpcConfig::default()
-                ))
+                .manage(|| IpcClient::new("ipc://not-connected"))
                 .is_err()
         );
     }
@@ -301,9 +293,7 @@ mod tests {
     async fn shutdown_observes_reserved_candidate_until_ownership_is_published() {
         let domain = ClientLifecycle::new();
         let candidate = domain
-            .manage(|| {
-                IpcClient::with_config("ipc://not-connected", c2_config::ClientIpcConfig::default())
-            })
+            .manage(|| IpcClient::new("ipc://not-connected"))
             .unwrap();
         let observer = {
             let domain = domain.clone();

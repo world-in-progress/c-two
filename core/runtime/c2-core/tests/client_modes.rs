@@ -81,9 +81,8 @@ fn definition(route_name: &str) -> ServiceDefinition {
     .expect("definition must match release")
 }
 
-fn runtime_options(server_id: String, relay_url: Option<String>) -> RuntimeOptions {
+fn runtime_options(relay_url: Option<String>) -> RuntimeOptions {
     RuntimeOptions {
-        server_id: Some(server_id),
         relay_anchor_address: relay_url,
         use_process_relay_anchor: false,
         ..RuntimeOptions::default()
@@ -91,11 +90,9 @@ fn runtime_options(server_id: String, relay_url: Option<String>) -> RuntimeOptio
 }
 
 fn endpoint_context() -> c2_config::LocalEndpointContext {
-    c2_config::ConfigResolver::resolve_local_endpoint(
-        Default::default(),
-        c2_config::ConfigSources::from_process(),
-    )
-    .expect("test endpoint context")
+    let catalog = c2_config::EnvCatalog::load(c2_config::ConfigSources::from_process()).unwrap();
+    c2_config::ConfigResolver::resolve_local_endpoint(Default::default(), &catalog)
+        .expect("test endpoint context")
 }
 
 // Every relay-configuration reader and writer in this test process shares
@@ -138,8 +135,6 @@ fn relay(context: c2_config::LocalEndpointContext) -> (RelayServer, String) {
     let relay = RelayServer::start_with_context(
         RelayConfig {
             bind: "127.0.0.1:0".into(),
-            idle_timeout_secs: 0,
-            anti_entropy_interval: std::time::Duration::ZERO,
             heartbeat_interval: std::time::Duration::ZERO,
             ..RelayConfig::default()
         },
@@ -471,8 +466,7 @@ fn relay_aware_connect_without_anchor_ignores_proxy_configuration() {
         let expected = release()
             .expected_route(route_name)
             .expect("expected route");
-        let runtime = Runtime::new(runtime_options(unique_name("no-relay"), None))
-            .expect("runtime without relay");
+        let runtime = Runtime::new(runtime_options(None)).expect("runtime without relay");
 
         let error = runtime
             .connect(expected, Connect::RelayAware)
@@ -491,8 +485,7 @@ fn all_connection_modes_return_the_same_client_surface_and_record_distinct_paths
     fn accepts_client(_: &c2_core::Client) {}
 
     let root = tempfile::tempdir().expect("private IPC root");
-    let runtime =
-        Runtime::new(runtime_options(unique_name("client-modes"), None)).expect("runtime");
+    let runtime = Runtime::new(runtime_options(None)).expect("runtime");
     runtime
         .set_local_endpoint_with_sources(
             c2_config::LocalEndpointOptions {
@@ -583,11 +576,8 @@ fn all_connection_modes_return_the_same_client_surface_and_record_distinct_paths
 
 #[test]
 fn direct_ipc_uses_only_the_supplied_address_and_never_resolves_relay() {
-    let runtime = Runtime::new(runtime_options(
-        unique_name("direct-only"),
-        Some("http://127.0.0.1:9".to_string()),
-    ))
-    .expect("runtime");
+    let runtime =
+        Runtime::new(runtime_options(Some("http://127.0.0.1:9".to_string()))).expect("runtime");
     let expected = release()
         .expected_route(unique_name("missing"))
         .expect("expected route");
@@ -612,8 +602,7 @@ fn direct_ipc_uses_only_the_supplied_address_and_never_resolves_relay() {
 #[test]
 fn explicit_relay_uses_the_http_data_plane_even_when_local_ipc_is_valid() {
     let _environment = relay_env_lock();
-    let runtime =
-        Runtime::new(runtime_options(unique_name("explicit-http"), None)).expect("runtime");
+    let runtime = Runtime::new(runtime_options(None)).expect("runtime");
     let host = runtime
         .host(HostOptions::default().without_relay())
         .expect("host");
@@ -751,11 +740,7 @@ fn relay_aware_rejects_a_fallback_to_the_same_failed_local_candidate() {
         ),
         resolve_count.clone(),
     );
-    let runtime = Runtime::new(runtime_options(
-        unique_name("fallback"),
-        Some(registry.url.clone()),
-    ))
-    .expect("runtime");
+    let runtime = Runtime::new(runtime_options(Some(registry.url.clone()))).expect("runtime");
 
     let Error::Semantic(error) = runtime
         .connect(expected, Connect::RelayAware)
@@ -796,8 +781,7 @@ fn relay_aware_identity_mismatch_is_terminal_without_fallback_resolution() {
     let route_name = unique_name("identity-terminal");
     let expected = release.expected_route(&route_name).expect("expected route");
     let resolve_count = Arc::new(AtomicUsize::new(0));
-    let runtime =
-        Runtime::new(runtime_options(unique_name("identity-host"), None)).expect("runtime");
+    let runtime = Runtime::new(runtime_options(None)).expect("runtime");
     let host = runtime
         .host(HostOptions::default().without_relay())
         .expect("host");
@@ -836,8 +820,7 @@ fn relay_aware_contract_mismatch_is_terminal_without_fallback_resolution() {
     let release = release();
     let route_name = unique_name("contract-terminal");
     let actual_expected = release.expected_route(&route_name).expect("expected route");
-    let runtime =
-        Runtime::new(runtime_options(unique_name("contract-host"), None)).expect("runtime");
+    let runtime = Runtime::new(runtime_options(None)).expect("runtime");
     let host = runtime
         .host(HostOptions::default().without_relay())
         .expect("host");
@@ -888,11 +871,7 @@ fn relay_aware_protocol_violation_is_terminal_without_fallback_resolution() {
         ),
         resolve_count.clone(),
     );
-    let runtime = Runtime::new(runtime_options(
-        unique_name("protocol-runtime"),
-        Some(registry.url.clone()),
-    ))
-    .expect("runtime");
+    let runtime = Runtime::new(runtime_options(Some(registry.url.clone()))).expect("runtime");
 
     let error = runtime
         .connect(expected, Connect::RelayAware)
@@ -935,11 +914,7 @@ fn relay_aware_selects_an_independent_http_path_when_no_local_candidate_exists()
         },
         resolve_count.clone(),
     );
-    let runtime = Runtime::new(runtime_options(
-        unique_name("http-only-runtime"),
-        Some(registry.url.clone()),
-    ))
-    .expect("runtime");
+    let runtime = Runtime::new(runtime_options(Some(registry.url.clone()))).expect("runtime");
 
     let client = runtime
         .connect(expected, Connect::RelayAware)
@@ -981,11 +956,7 @@ fn a_not_found_post_is_pre_dispatch_and_the_next_call_refreshes_the_route() {
         },
         resolve_count.clone(),
     );
-    let runtime = Runtime::new(runtime_options(
-        unique_name("missing-route-runtime"),
-        Some(registry.url.clone()),
-    ))
-    .expect("runtime");
+    let runtime = Runtime::new(runtime_options(Some(registry.url.clone()))).expect("runtime");
     let client = runtime
         .connect(expected, Connect::RelayAware)
         .expect("relay-aware client");
@@ -1120,11 +1091,7 @@ fn assert_http_refusal_reacquisition(code: ErrorCode) {
         },
         resolves.clone(),
     );
-    let runtime = Runtime::new(runtime_options(
-        unique_name("refusal-runtime"),
-        Some(registry.url.clone()),
-    ))
-    .unwrap();
+    let runtime = Runtime::new(runtime_options(Some(registry.url.clone()))).unwrap();
     let client = runtime.connect(expected, Connect::RelayAware).unwrap();
     for round in 1..=2 {
         let Error::Semantic(error) = client.call_owned("echo", b"input").unwrap_err() else {
@@ -1173,7 +1140,7 @@ fn service_error_is_not_replayed() {
     let service = Arc::new(Fails {
         calls: AtomicU64::new(0),
     });
-    let runtime = Runtime::new(runtime_options(unique_name("no-replay"), None)).expect("runtime");
+    let runtime = Runtime::new(runtime_options(None)).expect("runtime");
     let host = runtime.host(HostOptions::default()).expect("host");
     let route_name = unique_name("failure");
     let release = release();
@@ -1226,8 +1193,7 @@ fn hostless_retirement_closes_own_clients_and_isolates_sibling_runtimes_and_loca
     // Runtime construction and client-config resolution read the process
     // environment, so this test joins the file-wide env isolation guard.
     let _environment = relay_env_lock();
-    let server_runtime =
-        Runtime::new(runtime_options(unique_name("iso-server"), None)).expect("server runtime");
+    let server_runtime = Runtime::new(runtime_options(None)).expect("server runtime");
     let host = server_runtime.host(HostOptions::default()).expect("host");
     let route_name = unique_name("iso-echo");
     let mut registration = host
@@ -1238,10 +1204,8 @@ fn hostless_retirement_closes_own_clients_and_isolates_sibling_runtimes_and_loca
         .expected_route(&route_name)
         .expect("expected route");
 
-    let runtime_a =
-        Runtime::new(runtime_options(unique_name("iso-client-a"), None)).expect("runtime a");
-    let runtime_b =
-        Runtime::new(runtime_options(unique_name("iso-client-b"), None)).expect("runtime b");
+    let runtime_a = Runtime::new(runtime_options(None)).expect("runtime a");
+    let runtime_b = Runtime::new(runtime_options(None)).expect("runtime b");
     let client_a = runtime_a
         .connect(
             expected.clone(),
@@ -1337,7 +1301,7 @@ fn first_connection_attempt_freezes_client_config_atomically_before_connect_io()
     // under the RuntimeState lock strictly before any connect I/O, so once
     // the peer has observed the handshake bytes the frozen flag must already
     // be visible, and a setter racing the stalled connect must observe
-    // ClientConfigFrozen instead of starting a second configuration. The
+    // ConfigFrozen instead of starting a second configuration. The
     // first acquire resolves client config from the process environment, so
     // this test joins the file-wide env isolation guard.
     let _environment = relay_env_lock();
@@ -1376,13 +1340,18 @@ fn first_connection_attempt_freezes_client_config_atomically_before_connect_io()
         .recv_timeout(Duration::from_secs(5))
         .expect("freeze-race listener readiness");
 
-    let runtime = Runtime::new(runtime_options(unique_name("freeze-race"), None)).expect("runtime");
+    let runtime = Runtime::new(runtime_options(None)).expect("runtime");
     let expected = release()
         .expected_route(&unique_name("frozen-route"))
         .expect("expected route");
-    // Setters still work before the first connection attempt.
+    let with_memory = |bytes| c2_core::ClientConfigPatch {
+        domain_limits: c2_core::DomainLimitsPatch {
+            memory_budget_bytes: c2_core::ConfigField::Set(bytes),
+            ..Default::default()
+        },
+    };
     runtime
-        .set_client_ipc_overrides(None)
+        .update_client_config(with_memory(1024 * 1024))
         .expect("setter must work before the first connection attempt");
 
     let connect_runtime = runtime.clone();
@@ -1406,11 +1375,14 @@ fn first_connection_attempt_freezes_client_config_atomically_before_connect_io()
         "config must freeze atomically before the first connection attempt performs I/O"
     );
 
-    // The racing setter loses: it may not start a second configuration.
-    let raced = runtime.set_client_ipc_overrides(None);
+    runtime
+        .update_client_config(with_memory(1024 * 1024))
+        .unwrap();
+    // The racing setter cannot change the frozen capacity.
+    let raced = runtime.update_client_config(with_memory(2 * 1024 * 1024));
     assert!(
-        matches!(raced, Err(c2_core::LifecycleError::ClientConfigFrozen)),
-        "setter racing a stalled first connect must observe ClientConfigFrozen, got {raced:?}"
+        matches!(raced, Err(c2_core::LifecycleError::ConfigFrozen)),
+        "setter racing a stalled first connect must observe ConfigFrozen, got {raced:?}"
     );
 
     // Release the stall as a handshake EOF: the first attempt fails and the
@@ -1426,8 +1398,8 @@ fn first_connection_attempt_freezes_client_config_atomically_before_connect_io()
         "the freeze must survive the failed first attempt"
     );
     assert!(matches!(
-        runtime.set_client_ipc_overrides(None),
-        Err(c2_core::LifecycleError::ClientConfigFrozen)
+        runtime.update_client_config(with_memory(2 * 1024 * 1024)),
+        Err(c2_core::LifecycleError::ConfigFrozen)
     ));
     server_thread.join().unwrap();
 }
@@ -1498,18 +1470,16 @@ fn http_probe_error_storage_uses_the_runtime_payload_budget() {
     )
     .unwrap()
     .len() as u64;
-    for limit in [0, error_bytes] {
-        let runtime =
-            Runtime::new(runtime_options(unique_name("probe-budget-runtime"), None)).unwrap();
-        runtime
-            .set_call_execution_limits_with_sources(
-                c2_config::CallExecutionLimitsOverrides {
-                    max_outstanding_calls: Some(1024),
-                    payload_buffer_budget_bytes: Some(limit),
-                },
-                c2_config::ConfigSources::empty(),
-            )
-            .unwrap();
+    for limit in [error_bytes - 1, error_bytes] {
+        let runtime = Runtime::new(runtime_options(None)).unwrap();
+        let with_memory = |bytes| c2_core::ClientConfigPatch {
+            domain_limits: c2_core::DomainLimitsPatch {
+                memory_budget_bytes: c2_core::ConfigField::Set(bytes),
+                max_outstanding_calls: c2_core::ConfigField::Set(1),
+                ..Default::default()
+            },
+        };
+        runtime.update_client_config(with_memory(limit)).unwrap();
         let Error::Semantic(error) = runtime
             .connect_with_options(
                 expected.clone(),
@@ -1522,10 +1492,10 @@ fn http_probe_error_storage_uses_the_runtime_payload_budget() {
         else {
             panic!("semantic probe failure required")
         };
-        let stats = runtime.memory_stats().payload_buffer.unwrap();
+        let stats = runtime.memory_stats().client.memory.unwrap();
         assert_eq!(stats.limit_bytes, limit);
         assert_eq!(stats.used_bytes, 0);
-        if limit == 0 {
+        if limit < error_bytes {
             assert_eq!(error.code, ErrorCode::CallCapacityExceeded);
             assert_eq!(error.details["transport_phase"], "pre_dispatch");
             assert_eq!(stats.rejected_allocations, 1);
@@ -1536,10 +1506,7 @@ fn http_probe_error_storage_uses_the_runtime_payload_budget() {
         }
         assert!(
             matches!(
-                runtime.set_call_execution_limits(c2_config::CallExecutionLimitsOverrides {
-                    max_outstanding_calls: Some(1024),
-                    payload_buffer_budget_bytes: Some(limit + 1),
-                }),
+                runtime.update_client_config(with_memory(limit + 1)),
                 Err(c2_core::LifecycleError::ConfigFrozen)
             ),
             "HTTP acquisition has already used this domain"

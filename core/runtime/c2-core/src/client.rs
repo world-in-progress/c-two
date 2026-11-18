@@ -17,7 +17,7 @@ use crate::{CallScope, CallScopeError, CallState};
 use c2_contract::{ExpectedRouteContract, validate_expected_route_contract};
 use c2_http::client::{HttpCallPhase, RelayAwareHttpClient, RelayLocalIpcCandidate};
 use c2_ipc::{IpcCallError, RouteBinding};
-use c2_mem::retention::{BudgetedBuffer, PayloadBufferBudget};
+use c2_mem::{BudgetedBuffer, DomainBudget};
 
 use crate::session::RelayResolvedConnection;
 use crate::{
@@ -144,7 +144,9 @@ const TERMINAL_REFUSAL: u8 = 2;
 
 enum ClientInner {
     Ipc(PooledIpcClient),
-    Http(RelayAwareHttpClient, Option<Duration>),
+    /// The HTTP data client carries no total call timeout; only the caller's
+    /// original scope deadline bounds a call.
+    Http(RelayAwareHttpClient),
 }
 
 struct PooledIpcClient {
@@ -203,7 +205,7 @@ impl ClientTarget {
     fn new(observed_path: ObservedPath, transport: ClientInner) -> Self {
         let path_default = match &transport {
             ClientInner::Ipc(_) => None,
-            ClientInner::Http(_, default) => *default,
+            ClientInner::Http(_) => None,
         };
         Self {
             observed_path,
@@ -463,11 +465,7 @@ impl Client {
         stream: bool,
     ) -> Result<PreparedCall, Error> {
         let context = self.inner.runtime.call_execution_context()?;
-        let mut preparing = if stream {
-            context.prepare_stream_scope(budget.scope)?
-        } else {
-            context.prepare_scope(budget.scope)?
-        };
+        let mut preparing = context.prepare_scope(budget.scope)?;
         if stream && matches!(&target.transport, ClientInner::Http(..)) {
             preparing = preparing.with_stream_http_headroom();
         }
@@ -514,9 +512,9 @@ impl PreparedCall {
     }
 
     /// Hand off ALREADY PREPARED native-owned data, not a user serializer.
-    /// The factory must produce exactly nbytes bytes. Finite execution keeps
-    /// its native task through real completion; Unlimited drives the same
-    /// transport inline. Both retain B for the actual input owner.
+    /// The factory must produce exactly nbytes bytes. Native execution keeps
+    /// its operation permit through real completion and the memory charge
+    /// follows the actual input owner.
     pub fn encode<M>(mut self, nbytes: usize, materialize: M) -> Result<EncodedCall, Error>
     where
         M: FnOnce() -> Result<Vec<u8>, Error> + Send + 'static,
@@ -656,7 +654,7 @@ impl EncodedCall {
                     )
                     .await
                     .map(StreamTransport::Ipc),
-                    ClientInner::Http(client, _) => call_http_stream(
+                    ClientInner::Http(client) => call_http_stream(
                         client,
                         &method,
                         input,
@@ -731,10 +729,10 @@ impl EncodedCall {
                                     .into_owned_bytes()
                                     .map_err(|error| LifecycleError::ResponseCopy(error).into())
                             }
-                            ClientInner::Http(client, _) => {
+                            ClientInner::Http(client) => {
                                 call_http(client, &method, input, scope, payload_budget)
                                     .await
-                                    .map(BudgetedBuffer::into_vec)
+                                    .map(|buffer| buffer.into_parts().0)
                             }
                         }
                     }
@@ -794,7 +792,7 @@ impl EncodedCall {
                         ClientInner::Ipc(connection) => HeldResponse::from_response_data(
                             call_ipc(connection, &method, input, scope).await?,
                         )?,
-                        ClientInner::Http(client, _) => HeldResponse::from_budgeted_bytes(
+                        ClientInner::Http(client) => HeldResponse::from_budgeted_bytes(
                             call_http(client, &method, input, scope, payload_budget).await?,
                         ),
                     };
@@ -841,7 +839,7 @@ async fn call_ipc_stream(
     method: &str,
     input: BudgetedBuffer,
     scope: CallScope,
-    payload_budget: PayloadBufferBudget,
+    payload_budget: DomainBudget,
     completion_owner: Box<dyn Send>,
     cancellation: c2_ipc::IpcStreamCancellation,
 ) -> Result<c2_ipc::IpcResponseStream, Error> {
@@ -868,7 +866,7 @@ async fn call_http_stream(
     method: &str,
     input: BudgetedBuffer,
     scope: CallScope,
-    payload_budget: PayloadBufferBudget,
+    payload_budget: DomainBudget,
     completion_owner: Box<dyn Send>,
     opening_cancellation: c2_ipc::IpcStreamCancellation,
     cancellation: HttpStreamCancellation,
@@ -952,7 +950,7 @@ async fn call_http(
     method: &str,
     input: BudgetedBuffer,
     scope: CallScope,
-    payload_budget: PayloadBufferBudget,
+    payload_budget: DomainBudget,
 ) -> Result<BudgetedBuffer, Error> {
     let active = scope.clone();
     let deadline = scope.deadline();
@@ -1027,7 +1025,6 @@ pub struct NativeEndpointContext {
 struct EndpointAcquisition {
     runtime: Runtime,
     address: String,
-    config: c2_config::ClientIpcConfig,
     pool: c2_ipc::ClientPool,
     expected_identity: Option<c2_wire::handshake::ServerIdentity>,
 }
@@ -1041,7 +1038,7 @@ impl EndpointAcquisition {
         for index in 0..STALE_POOL_RECONNECT_ATTEMPTS {
             let client = self
                 .pool
-                .acquire_lease_with_deadline(&self.address, Some(&self.config), deadline)
+                .acquire_lease_with_deadline(&self.address, deadline)
                 .map_err(|error| normalize_ipc_error(error, TransportPhase::PreDispatch))?;
             if let Some(expected_identity) = &self.expected_identity {
                 let actual = client
@@ -1085,10 +1082,6 @@ impl NativeEndpointContext {
     pub async fn close(&self) {
         self.source.pool.close_endpoint_scope().await;
     }
-    pub fn config(&self) -> &c2_config::ClientIpcConfig {
-        &self.source.config
-    }
-
     pub fn prepare(
         &self,
         expected: ExpectedRouteContract,
@@ -1115,17 +1108,18 @@ impl Runtime {
         expected_identity: Option<c2_wire::handshake::ServerIdentity>,
         attempt: &crate::ConnectAttempt,
     ) -> Result<NativeEndpointContext, Error> {
-        let (config, domain) = self
+        c2_config::LocalEndpoint::validate_address(address)
+            .map_err(|error| LifecycleError::Configuration(error.to_string()))?;
+        let pool_domain = self
             .ipc_client_domain(attempt.deadline())
             .map_err(|error| normalize_ipc_error(error, TransportPhase::PreDispatch))?;
-        let pool = domain
-            .fork_endpoint_scope(&config, attempt.deadline())
+        let pool = pool_domain
+            .fork_endpoint_scope(attempt.deadline())
             .map_err(|error| normalize_ipc_error(error, TransportPhase::PreDispatch))?;
         Ok(NativeEndpointContext {
             source: Arc::new(EndpointAcquisition {
                 runtime: self.clone(),
                 address: address.into(),
-                config,
                 pool,
                 expected_identity,
             }),
@@ -1161,18 +1155,24 @@ impl Runtime {
             self.ensure_active_with_attempt(attempt)?;
             let acquire = match mode {
                 Connect::DirectIpc { address } => ClientAcquire::Direct { address },
-                Connect::ExplicitRelay { relay_url } => ClientAcquire::Relay {
-                    anchor: relay_url,
-                    settings: self.relay_client_settings_with_deadline(deadline)?,
-                    http_only: true,
-                },
-                Connect::RelayAware => ClientAcquire::Relay {
-                    anchor: self
-                        .effective_relay_anchor_address_with_deadline(deadline)?
-                        .ok_or(LifecycleError::MissingRelayAddress)?,
-                    settings: self.relay_client_settings_with_deadline(deadline)?,
-                    http_only: false,
-                },
+                Connect::ExplicitRelay { relay_url } => {
+                    let (anchor, settings) =
+                        self.relay_business_config_with_deadline(Some(relay_url), deadline)?;
+                    ClientAcquire::Relay {
+                        anchor,
+                        settings,
+                        http_only: true,
+                    }
+                }
+                Connect::RelayAware => {
+                    let (anchor, settings) =
+                        self.relay_business_config_with_deadline(None, deadline)?;
+                    ClientAcquire::Relay {
+                        anchor,
+                        settings,
+                        http_only: false,
+                    }
+                }
             };
             let target = self.acquire_target(&expected, &acquire, deadline)?;
             self.finish_client(expected, acquire, target, deadline)
@@ -1331,10 +1331,7 @@ impl Runtime {
                 } else {
                     ObservedPath::RelayAwareRelay
                 },
-                ClientInner::Http(
-                    client,
-                    relay_default(settings.call_timeout_secs).expect("resolved timeout is valid"),
-                ),
+                ClientInner::Http(client),
             )
         };
         if http_only {
@@ -1343,8 +1340,6 @@ impl Runtime {
                     anchor,
                     expected.clone(),
                     settings.use_proxy,
-                    settings.call_timeout_secs,
-                    settings.remote_payload_chunk_size,
                     deadline,
                 )
                 .map(http);
@@ -1353,8 +1348,6 @@ impl Runtime {
             anchor,
             expected.clone(),
             settings.use_proxy,
-            settings.call_timeout_secs,
-            settings.remote_payload_chunk_size,
             deadline,
         )?;
         self.ensure_active_with_deadline(deadline)?;
@@ -1485,15 +1478,6 @@ fn local_candidate_failure_is_terminal(error: &Error) -> bool {
                     | c2_error::ErrorCode::ProtocolViolation
             )
     )
-}
-
-fn relay_default(seconds: f64) -> Result<Option<Duration>, LifecycleError> {
-    if seconds == 0.0 {
-        return Ok(None);
-    }
-    c2_config::timeout_from_seconds(seconds)
-        .map(Some)
-        .map_err(|_| LifecycleError::Configuration("HTTP call timeout is not representable".into()))
 }
 
 #[cfg(test)]

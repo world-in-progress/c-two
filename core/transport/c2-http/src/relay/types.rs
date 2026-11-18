@@ -373,7 +373,7 @@ impl TryFrom<FullSyncEnvelope> for ValidatedFullSync {
 
         for peer in &envelope.snapshot.peers {
             if !valid_wire_relay_id(&peer.relay_id)
-                || !crate::relay::route_table::valid_relay_url(&peer.url)
+                || !crate::valid_relay_url(&peer.url)
             {
                 return Err(FullSyncValidationError::InvalidPeer {
                     relay_id: peer.relay_id.clone(),
@@ -428,7 +428,7 @@ impl TryFrom<FullSyncEnvelope> for ValidatedFullSync {
 fn valid_full_sync_route(route: &FullSyncRoute) -> bool {
     crate::relay::route_table::valid_route_name(&route.name)
         && valid_wire_relay_id(&route.relay_id)
-        && crate::relay::route_table::valid_relay_url(&route.relay_url)
+        && crate::valid_relay_url(&route.relay_url)
         && crate::relay::route_table::valid_crm_tag(&route.crm_ns, &route.crm_name, &route.crm_ver)
         && c2_contract::validate_contract_hash("abi_hash", &route.abi_hash).is_ok()
         && c2_contract::validate_contract_hash("signature_hash", &route.signature_hash).is_ok()

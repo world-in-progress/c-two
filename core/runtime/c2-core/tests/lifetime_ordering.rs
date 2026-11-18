@@ -2,9 +2,10 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+use c2_config::DomainLimits;
 use c2_core::{HeldResponse, LifecycleError};
 use c2_ipc::ResponseData;
-use c2_mem::{MemPool, PoolConfig};
+use c2_mem::{DomainBudget, MemPool, PoolConfig};
 use parking_lot::{Mutex, RwLock};
 
 #[derive(Clone)]
@@ -172,13 +173,18 @@ fn held_invalidation_error_is_preserved_after_local_cleanup() {
 
 fn local_pool() -> Arc<RwLock<MemPool>> {
     Arc::new(RwLock::new(
-        MemPool::new_with_prefix(
+        MemPool::new_with_prefix_and_budget(
             PoolConfig {
-                buddy_enabled: false,
+                pool_enabled: false,
                 max_dedicated_segments: 0,
                 ..PoolConfig::default()
             },
             format!("/c2-local-{}", uuid::Uuid::new_v4().simple()),
+            DomainBudget::from_limits(&DomainLimits {
+                memory_budget_bytes: 1024,
+                file_spill_budget_bytes: 1024,
+                max_outstanding_calls: 1,
+            }),
         )
         .unwrap(),
     ))
@@ -192,10 +198,10 @@ fn consumed_reassembly_refunds_before_hold_and_does_not_retain_pool() {
     let mut backing = c2_wire::chunk::ReassemblyBacking::admit(pool.clone(), 1, 512).unwrap();
     let bytes = vec![0x5a; 512];
     backing.write_at(0, &bytes).unwrap();
-    assert_eq!(budget.snapshot().reassembly.used_bytes, 512);
+    assert_eq!(budget.snapshot().file_spill.used_bytes, 512);
     let mut held = HeldResponse::from_response_data(ResponseData::Handle(backing)).unwrap();
-    assert_eq!(budget.snapshot().reassembly.used_bytes, 0);
-    assert_eq!(budget.snapshot().file.used_bytes, 0);
+    assert_eq!(budget.snapshot().memory.used_bytes, 0);
+    assert_eq!(budget.snapshot().file_spill.used_bytes, 0);
     drop(pool);
     assert!(
         weak_pool.upgrade().is_none(),
@@ -216,5 +222,5 @@ fn consumption_failure_is_reported_before_a_hold_exists() {
         .err()
         .expect("a consumed backing cannot create another hold");
     assert!(matches!(error, LifecycleError::ResponseCopy(message) if message.contains("released")));
-    assert_eq!(budget.snapshot().reassembly.used_bytes, 0);
+    assert_eq!(budget.snapshot().file_spill.used_bytes, 0);
 }

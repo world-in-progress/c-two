@@ -18,9 +18,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use c2_config::{ClientIpcConfig, RelayConfig};
+use c2_config::{DomainLimits, LocalEndpointContext, RelayConfig};
 use c2_ipc::{IpcClient, IpcError, ResponseData, RouteBinding};
-use c2_mem::{BudgetSnapshot, DedicatedSegment};
+use c2_mem::{DedicatedSegment, DomainBudget, DomainSnapshot};
 use c2_server::{
     ConcurrencyMode, CrmCallback, CrmError, ResponseMeta, RouteBuildSpec, SchedulerLimits, Server,
     ServerIdentity, ServerIpcConfig,
@@ -36,9 +36,8 @@ use super::state::{RegisterCommitResult, RelayState};
 use super::test_support::{NoopDisseminator, TEST_ABI_HASH, TEST_SIGNATURE_HASH};
 use super::types::RouteEntry;
 
-const PAYLOAD_LEN: usize = 8192;
-const CHUNK_SIZE: u64 = 4096;
-const REASSEMBLY_CHARGE: u64 = PAYLOAD_LEN as u64 + (PAYLOAD_LEN as u64).div_ceil(CHUNK_SIZE);
+const PAYLOAD_LEN: usize = 32 * 1024;
+const REPLY_LEN: usize = 2 * c2_config::CHUNK_SIZE as usize;
 const DEADLINE: Duration = Duration::from_secs(10);
 static NEXT_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -76,35 +75,28 @@ fn unique_id() -> String {
     )
 }
 
-fn payload(marker: u8) -> Vec<u8> {
-    (0..PAYLOAD_LEN)
-        .map(|i| marker.wrapping_add(i as u8))
-        .collect()
+fn payload(len: usize, marker: u8) -> Vec<u8> {
+    (0..len).map(|i| marker.wrapping_add(i as u8)).collect()
 }
 
-fn policy(shm: u64, file: u64, reassembly: u64) -> ClientIpcConfig {
-    let mut config = ClientIpcConfig::default();
-    config.base.pool_enabled = false;
-    config.base.pool_prewarm_segments = 0;
-    config.base.chunk_size = CHUNK_SIZE;
-    config.base.shm_backing_budget_bytes = shm;
-    config.base.file_backing_budget_bytes = file;
-    config.base.live_reassembly_budget_bytes = reassembly;
-    config.shm_threshold = 1;
-    config.validate().unwrap();
-    config
+fn budget(memory: u64, file_spill: u64) -> DomainBudget {
+    DomainBudget::from_limits(&DomainLimits {
+        memory_budget_bytes: memory,
+        file_spill_budget_bytes: file_spill,
+        max_outstanding_calls: 64,
+    })
 }
 
-fn state(policy: ClientIpcConfig) -> Arc<RelayState> {
-    Arc::new(RelayState::new(
+fn state(memory: u64, file_spill: u64) -> Arc<RelayState> {
+    Arc::new(RelayState::new_with_budget(
         Arc::new(RelayConfig {
             relay_id: unique_id(),
-            // No wall-clock owner expiry is involved in these tests.
-            idle_timeout_secs: 0,
-            upstream_ipc: policy,
             ..RelayConfig::default()
         }),
         Arc::new(NoopDisseminator),
+        LocalEndpointContext::default_for_platform().unwrap(),
+        budget(memory, file_spill),
+        c2_config::IDLE_CONNECTION_TIMEOUT,
     ))
 }
 
@@ -113,6 +105,7 @@ fn state(policy: ClientIpcConfig) -> Arc<RelayState> {
 /// relay's real receive allocation.
 struct Probe {
     expected: Vec<u8>,
+    reply: Vec<u8>,
     large_reply: bool,
     calls: AtomicUsize,
 }
@@ -135,7 +128,7 @@ impl CrmCallback for Probe {
         }
         self.calls.fetch_add(1, Ordering::SeqCst);
         Ok(ResponseMeta::Inline(if self.large_reply || method == 1 {
-            self.expected.clone()
+            self.reply.clone()
         } else {
             b"ok".to_vec()
         }))
@@ -153,30 +146,23 @@ impl Upstream {
     async fn start(state: &RelayState, name: &str, marker: u8, large_reply: bool) -> Self {
         let id = unique_id();
         let address = format!("ipc://{id}");
-        let mut config = ServerIpcConfig::default();
-        config.base.pool_enabled = false;
-        config.base.pool_prewarm_segments = 0;
-        config.base.chunk_size = CHUNK_SIZE;
-        // Request receive storage belongs to the server, not to the relay.
-        // Denying server response SHM forces real reply reassembly in relay.
-        config.base.shm_backing_budget_bytes = 0;
-        config.base.file_backing_budget_bytes = 4 * PAYLOAD_LEN as u64;
-        config.base.live_reassembly_budget_bytes = 4 * PAYLOAD_LEN as u64;
-        config.shm_threshold = 1;
-        config.validate().unwrap();
+        // This domain can copy a request into local bytes but cannot allocate
+        // the larger SHM reply, forcing real reply reassembly in the relay.
         let server = Arc::new(
-            Server::new_with_identity(
-                &address,
-                config,
+            Server::new_with_identity_endpoint_and_budget(
+                state.endpoint_context().endpoint(&address).unwrap(),
+                ServerIpcConfig::default(),
                 ServerIdentity {
                     server_id: id.clone(),
                     server_instance_id: format!("{id}-i"),
                 },
+                budget(2 * PAYLOAD_LEN as u64, 0),
             )
             .unwrap(),
         );
         let probe = Arc::new(Probe {
-            expected: payload(marker),
+            expected: payload(PAYLOAD_LEN, marker),
+            reply: payload(REPLY_LEN, marker),
             large_reply,
             calls: AtomicUsize::new(0),
         });
@@ -206,7 +192,7 @@ impl Upstream {
             .unwrap();
         // Attestation uses its own real, lazy control-plane connection.
         let mut attestor =
-            IpcClient::with_config(&address, c2_config::ClientIpcConfig::default()).unwrap();
+            IpcClient::with_endpoint(state.endpoint_context().endpoint(&address).unwrap()).unwrap();
         bounded(attestor.connect()).await.unwrap();
         let contract = attestor.route_contract(name).unwrap();
         let attestation = bounded(attestor.attest_route_for_registration(&contract))
@@ -268,7 +254,7 @@ impl Upstream {
             !self.server.is_running(),
             "listener/server task must finish normally"
         );
-        let budget = self.server.memory_budget_snapshot().budget;
+        let budget = self.server.domain_snapshot();
         eprintln!(
             "[relay-memory] {} route={} callbacks={} server-after-join={budget:?}",
             state.relay_id(),
@@ -277,9 +263,9 @@ impl Upstream {
         );
         assert_eq!(
             (
-                budget.shm.used_bytes,
-                budget.file.used_bytes,
-                budget.reassembly.used_bytes
+                budget.memory.used_bytes,
+                budget.file_spill.used_bytes,
+                budget.operations.used_operations
             ),
             (0, 0, 0),
             "callbacks and server shutdown must refund actual receive carriers"
@@ -297,10 +283,10 @@ async fn close(client: &IpcClient) {
     assert!(!client.is_connected());
 }
 
-fn snapshot(state: &RelayState, label: &str) -> BudgetSnapshot {
-    let s = state.upstream_memory_snapshot();
+fn snapshot(state: &RelayState, label: &str) -> DomainSnapshot {
+    let s = state.domain_snapshot();
     eprintln!("[relay-memory] {} {label}: {s:?}", state.relay_id());
-    for cell in [s.shm, s.file, s.reassembly] {
+    for cell in [s.memory, s.file_spill] {
         assert!(cell.peak_bytes <= cell.limit_bytes);
         assert!(cell.used_bytes <= cell.limit_bytes);
     }
@@ -310,7 +296,11 @@ fn snapshot(state: &RelayState, label: &str) -> BudgetSnapshot {
 fn refunded(state: &RelayState) {
     let s = snapshot(state, "refunded");
     assert_eq!(
-        (s.shm.used_bytes, s.file.used_bytes, s.reassembly.used_bytes),
+        (
+            s.memory.used_bytes,
+            s.file_spill.used_bytes,
+            s.operations.used_operations
+        ),
         (0, 0, 0)
     );
 }
@@ -329,10 +319,10 @@ fn expect_inline(response: ResponseData) -> Vec<u8> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn different_upstreams_share_request_budget_and_checked_chunk_fallback() {
+async fn different_upstreams_share_request_budget_and_fall_back_to_inline() {
     // One real dedicated allocation fits exactly; two cannot fit together.
     let charge = DedicatedSegment::required_shm_size(PAYLOAD_LEN).unwrap() as u64;
-    let state = state(policy(charge, 0, 0));
+    let state = state(charge, 0);
     let a = Upstream::start(&state, "a", 17, false).await;
     let b = Upstream::start(&state, "b", 93, false).await;
     assert_ne!(a.entry.ipc_address, b.entry.ipc_address);
@@ -372,7 +362,7 @@ async fn different_upstreams_share_request_budget_and_checked_chunk_fallback() {
     }));
     bounded(ready_rx).await.unwrap();
     let held = snapshot(&state, "request-a-unpublished");
-    assert_eq!(held.shm.used_bytes, charge);
+    assert_eq!(held.memory.used_bytes, charge);
     assert!(
         state
             .evict_idle(0)
@@ -382,9 +372,9 @@ async fn different_upstreams_share_request_budget_and_checked_chunk_fallback() {
     );
     assert_eq!(expect_inline(call(&client_b, &binding_b, &b).await), b"ok");
     let competed = snapshot(&state, "request-b-fallback");
-    assert_eq!(competed.shm.peak_bytes, charge);
-    assert!(competed.shm.rejected_allocations > before.shm.rejected_allocations);
-    assert!(competed.shm.rejected_bytes >= before.shm.rejected_bytes + charge);
+    assert_eq!(competed.memory.peak_bytes, charge);
+    assert!(competed.memory.rejected_allocations > before.memory.rejected_allocations);
+    assert!(competed.memory.rejected_bytes >= before.memory.rejected_bytes + charge);
     body_tx.send(a.probe.expected.clone()).unwrap();
     assert_eq!(
         expect_inline(bounded(pending.join()).await.unwrap().unwrap()),
@@ -398,56 +388,36 @@ async fn different_upstreams_share_request_budget_and_checked_chunk_fallback() {
     refunded(&state);
 }
 
-// Both request storage and response reassembly must charge the same SHM cell,
-// in addition to each role sharing its limits across upstream connections.
+// A real request lease competes with a reply on a distinct connection for
+// the same memory cell. The reply can instead use the relay's file-spill cell.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn unpublished_request_and_reply_reassembly_compete_for_same_shm_budget() {
-    let charge = DedicatedSegment::required_shm_size(PAYLOAD_LEN).unwrap() as u64;
-    let state = state(policy(charge, PAYLOAD_LEN as u64, REASSEMBLY_CHARGE));
+async fn unpublished_request_and_reply_reassembly_compete_for_same_memory_budget() {
+    let reply_charge = DedicatedSegment::required_shm_size(REPLY_LEN).unwrap() as u64;
+    let memory = reply_charge + 8;
+    let state = state(memory, REPLY_LEN as u64);
+    let request_charge = c2_config::PoolConfig::primary_for_budget(memory).segment_size as u64;
     let a = Upstream::start(&state, "request", 23, false).await;
     let b = Upstream::start(&state, "reply", 181, true).await;
-    // Each role individually succeeds with real dedicated SHM storage.
-    let (lease, client, binding) = a.acquire(&state).await;
-    assert_eq!(expect_inline(call(&client, &binding, &a).await), b"ok");
-    drop(lease);
-    close(&state.evict_connection(&a.entry.name).unwrap()).await;
-    refunded(&state);
-    let (lease, client, binding) = b.acquire(&state).await;
-    let before_solo = snapshot(&state, "reply-before-standalone-reassembly");
+    let (lease_b, client_b, binding_b) = b.acquire(&state).await;
     assert_eq!(
         expect_inline(
-            bounded(client.call_bound(&binding, "reply", &[]))
+            bounded(client_b.call_bound(&binding_b, "reply", &[]))
                 .await
                 .unwrap()
         ),
-        b.probe.expected
+        b.probe.reply
     );
-    let standalone = snapshot(&state, "reply-reassembly-alone-uses-SHM");
-    assert_eq!(standalone.shm.peak_bytes, charge);
-    assert_eq!(standalone.shm.used_bytes, 0);
-    assert_eq!(
-        standalone.shm.rejected_allocations,
-        before_solo.shm.rejected_allocations
-    );
-    assert_eq!(standalone.file.used_bytes, 0);
-    assert_eq!(standalone.reassembly.used_bytes, 0);
-    drop(lease);
-    close(&state.evict_connection(&b.entry.name).unwrap()).await;
-    refunded(&state);
+    let standalone = snapshot(&state, "reply-reassembly-alone");
+    assert!(standalone.memory.peak_bytes >= reply_charge);
+    assert_eq!(standalone.file_spill.peak_bytes, 0);
 
     let (lease_a, client_a, binding_a) = a.acquire(&state).await;
-    let (lease_b, client_b, binding_b) = b.acquire(&state).await;
     let (ready_tx, ready_rx) = oneshot::channel();
     let (body_tx, body_rx) = oneshot::channel();
     let pending = PendingCall(tokio::spawn(async move {
         let stream = futures::stream::once(async move {
-            let _ = ready_tx.send(());
-            body_rx.await.map_err(|_| {
-                std::io::Error::new(
-                    std::io::ErrorKind::Interrupted,
-                    "test body producer cancelled",
-                )
-            })
+            ready_tx.send(()).unwrap();
+            body_rx.await.map_err(std::io::Error::other)
         });
         let response = client_a
             .call_bound_sized_stream(&binding_a, "probe", PAYLOAD_LEN as u64, stream)
@@ -457,39 +427,26 @@ async fn unpublished_request_and_reply_reassembly_compete_for_same_shm_budget() 
     }));
     bounded(ready_rx).await.unwrap();
     let held = snapshot(&state, "request-SHM-held-before-reply");
-    assert_eq!(held.shm.used_bytes, charge);
+    assert_eq!(held.memory.used_bytes, request_charge);
     assert_eq!(
         expect_inline(
             bounded(client_b.call_bound(&binding_b, "reply", &[]))
                 .await
                 .unwrap()
         ),
-        b.probe.expected
+        b.probe.reply
     );
-    let overlap = snapshot(
-        &state,
-        "reply-reassembly-file-fallback-competes-with-request",
-    );
-    assert_eq!(overlap.shm.used_bytes, charge);
-    assert_eq!(overlap.shm.peak_bytes, charge);
-    assert_eq!(
-        overlap.shm.rejected_allocations,
-        held.shm.rejected_allocations + 1
-    );
-    assert_eq!(overlap.shm.rejected_bytes, held.shm.rejected_bytes + charge);
-    assert_eq!(overlap.file.peak_bytes, PAYLOAD_LEN as u64);
-    assert_eq!(overlap.reassembly.peak_bytes, REASSEMBLY_CHARGE);
-    assert_eq!(
-        (overlap.file.used_bytes, overlap.reassembly.used_bytes),
-        (0, 0),
-        "the returned Vec does not retain reply reassembly"
-    );
+    let overlap = snapshot(&state, "reply-used-file-spill");
+    assert_eq!(overlap.memory.used_bytes, request_charge);
+    assert!(overlap.memory.rejected_allocations > held.memory.rejected_allocations);
+    assert_eq!(overlap.file_spill.peak_bytes, REPLY_LEN as u64);
+    assert_eq!(overlap.file_spill.used_bytes, 0);
     body_tx.send(a.probe.expected.clone()).unwrap();
     assert_eq!(
         expect_inline(bounded(pending.join()).await.unwrap().unwrap()),
         b"ok"
     );
-    assert_eq!(a.probe.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(a.probe.calls.load(Ordering::SeqCst), 1);
     assert_eq!(b.probe.calls.load(Ordering::SeqCst), 2);
     drop(lease_b);
     a.stop(&state).await;
@@ -497,149 +454,50 @@ async fn unpublished_request_and_reply_reassembly_compete_for_same_shm_budget() 
     refunded(&state);
 }
 
-async fn shared_response_capacity(file_is_tighter: bool) {
-    let one = PAYLOAD_LEN as u64;
-    // Observe real admissions from two distinct upstreams in the same relay
-    // budget domain. A completed call has already copied and refunded its
-    // reassembly backing, so capacity refusal is exercised separately with a
-    // limit below one reply, then checked on both connections.
-    for admits in [true, false] {
-        let limit = if admits { one + one / 2 } else { one / 2 };
-        let state = state(policy(
-            0,
-            if file_is_tighter { limit } else { 2 * one },
-            if file_is_tighter { 2 * one } else { limit },
-        ));
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn upstream_reply_admission_uses_shared_file_spill_and_preserves_healthy_connections() {
+    for file_limit in [REPLY_LEN as u64, 0] {
+        let state = state(64, file_limit);
         let a = Upstream::start(&state, "a", 31, false).await;
         let b = Upstream::start(&state, "b", 149, false).await;
-        assert_ne!(a.entry.ipc_address, b.entry.ipc_address);
-        let (lease_a, client_a, binding_a) = a.acquire(&state).await;
-        let (lease_b, client_b, binding_b) = b.acquire(&state).await;
-        let mut previous = snapshot(&state, "before-response-admission");
-        for (upstream, client, binding) in
-            [(&a, &client_a, &binding_a), (&b, &client_b, &binding_b)]
-        {
-            if admits {
-                assert_eq!(
-                    expect_inline(
-                        bounded(client.call_bound(binding, "reply", &[]))
-                            .await
-                            .unwrap()
-                    ),
-                    upstream.probe.expected
-                );
-            } else {
-                let error = bounded(client.call_bound(binding, "reply", &[]))
-                    .await
-                    .unwrap_err();
+        for upstream in [&a, &b] {
+            let (_lease, client, binding) = upstream.acquire(&state).await;
+            let previous = snapshot(&state, "before-response-admission");
+            let result = bounded(client.call_bound(&binding, "reply", &[])).await;
+            if file_limit == 0 {
                 assert!(
                     matches!(
-                        error,
-                        IpcError::ResponseFailure(inner)
+                        result,
+                        Err(IpcError::ResponseFailure(inner))
                             if matches!(*inner, IpcError::Chunk(c2_ipc::client::ChunkError::Capacity(_)))
                     ),
                     "local reply admission must fail only this call"
                 );
-            }
-            let current = snapshot(&state, "after-response-admission");
-            let (old_cell, cell) = if file_is_tighter {
-                (previous.file, current.file)
-            } else {
-                (previous.reassembly, current.reassembly)
-            };
-            if admits {
-                assert_eq!(current.file.peak_bytes, one);
-                assert_eq!(current.reassembly.peak_bytes, REASSEMBLY_CHARGE);
-                assert_eq!(cell.rejected_allocations, old_cell.rejected_allocations);
-            } else {
-                assert_eq!(cell.rejected_allocations, old_cell.rejected_allocations + 1);
-                let charge = if file_is_tighter {
-                    one
-                } else {
-                    REASSEMBLY_CHARGE
-                };
-                assert_eq!(cell.rejected_bytes, old_cell.rejected_bytes + charge);
                 assert_eq!(
-                    expect_inline(call(client, binding, upstream).await),
-                    b"ok",
-                    "capacity refusal must leave this upstream usable"
+                    expect_inline(call(&client, &binding, upstream).await),
+                    b"ok"
                 );
+            } else {
+                assert_eq!(expect_inline(result.unwrap()), upstream.probe.reply);
             }
-            assert_eq!(
-                (current.file.used_bytes, current.reassembly.used_bytes),
-                (0, 0),
-                "the completed call or failed admission must refund real backing"
-            );
+            let after = snapshot(&state, "after-response-admission");
+            assert_eq!(after.memory.used_bytes, 0);
+            assert_eq!(after.file_spill.used_bytes, 0);
+            assert!(after.memory.rejected_allocations > previous.memory.rejected_allocations);
+            if file_limit == 0 {
+                assert_eq!(
+                    after.file_spill.rejected_allocations,
+                    previous.file_spill.rejected_allocations + 1
+                );
+                assert_eq!(upstream.probe.calls.load(Ordering::SeqCst), 2);
+            } else {
+                assert_eq!(after.file_spill.peak_bytes, REPLY_LEN as u64);
+                assert_eq!(upstream.probe.calls.load(Ordering::SeqCst), 1);
+            }
             assert!(client.is_connected());
-            previous = snapshot(&state, "after-response-health-probe");
         }
-        assert_eq!(
-            a.probe.calls.load(Ordering::SeqCst),
-            if admits { 1 } else { 2 }
-        );
-        assert_eq!(
-            b.probe.calls.load(Ordering::SeqCst),
-            if admits { 1 } else { 2 }
-        );
-        drop((lease_a, lease_b));
         a.stop(&state).await;
         b.stop(&state).await;
-        refunded(&state);
-    }
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn different_upstreams_share_live_reassembly_capacity() {
-    shared_response_capacity(false).await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn different_upstreams_share_file_capacity_and_refund_failed_admission() {
-    shared_response_capacity(true).await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn zero_response_budgets_reject_real_allocation_without_charge_or_replay() {
-    for file_zero in [false, true] {
-        let one = PAYLOAD_LEN as u64;
-        let state = state(policy(
-            0,
-            if file_zero { 0 } else { one },
-            if file_zero { REASSEMBLY_CHARGE } else { 0 },
-        ));
-        let upstream = Upstream::start(&state, "zero", 67, true).await;
-        let (lease, client, binding) = upstream.acquire(&state).await;
-        let before = snapshot(&state, "zero-before-real-call");
-        let error = bounded(client.call_bound(&binding, "probe", &upstream.probe.expected))
-            .await
-            .unwrap_err();
-        assert!(matches!(
-            error,
-            IpcError::ResponseFailure(inner)
-                if matches!(*inner, IpcError::Chunk(c2_ipc::client::ChunkError::Capacity(_)))
-        ));
-        let after = snapshot(&state, "zero-after-real-call");
-        let (before_cell, after_cell) = if file_zero {
-            (before.file, after.file)
-        } else {
-            (before.reassembly, after.reassembly)
-        };
-        assert_eq!(after.shm.peak_bytes, 0);
-        assert!(after.shm.rejected_allocations > before.shm.rejected_allocations);
-        assert_eq!(after_cell.limit_bytes, 0);
-        assert_eq!(
-            after_cell.rejected_allocations,
-            before_cell.rejected_allocations + 1
-        );
-        let charge = if file_zero { one } else { REASSEMBLY_CHARGE };
-        assert_eq!(
-            after_cell.rejected_bytes,
-            before_cell.rejected_bytes + charge
-        );
-        assert_eq!(upstream.probe.calls.load(Ordering::SeqCst), 1);
-        assert!(client.is_connected());
-        drop(lease);
-        upstream.stop(&state).await;
         refunded(&state);
     }
 }
@@ -686,18 +544,18 @@ async fn exercise_http_upload(
     }
     head.push_str("\r\n");
     bounded(upload.write_all(head.as_bytes())).await.unwrap();
-    // Explicit HTTP framing: 64 body bytes of declared 8192, then no more.
+    // Explicit HTTP framing: send 64 of the declared body bytes, then EOF.
     bounded(upload.write_all(&upstream.probe.expected[..64]))
         .await
         .unwrap();
     bounded(async {
-        while state.upstream_memory_snapshot().shm.used_bytes == 0 {
+        while state.domain_snapshot().memory.used_bytes < charge {
             tokio::task::yield_now().await;
         }
     })
     .await;
     let live = snapshot(&state, "HTTP-upload-before-publication");
-    assert_eq!(live.shm.used_bytes, charge);
+    assert_eq!(live.memory.used_bytes, charge);
     assert_eq!(upstream.probe.calls.load(Ordering::SeqCst), 0);
     assert!(
         state
@@ -806,15 +664,12 @@ async fn exercise_http_upload(
     assert!(response.status().is_success(), "{}", response.status());
     assert_eq!(
         bounded(response.bytes()).await.unwrap().as_ref(),
-        upstream.probe.expected
+        upstream.probe.reply
     );
     assert_eq!(upstream.probe.calls.load(Ordering::SeqCst), 1);
     let complete = snapshot(&state, "HTTP-complete-call-consumed-response");
-    assert!(complete.reassembly.peak_bytes >= PAYLOAD_LEN as u64);
-    assert_eq!(
-        (complete.file.used_bytes, complete.reassembly.used_bytes),
-        (0, 0)
-    );
+    assert_eq!(complete.file_spill.peak_bytes, REPLY_LEN as u64);
+    assert_eq!(complete.file_spill.used_bytes, 0);
     let idle = state.evict_idle(0);
     assert_eq!(idle.len(), 1);
     close(&idle.into_iter().next().unwrap().1.unwrap()).await;
@@ -831,15 +686,17 @@ async fn exercise_http_upload(
     assert!(response.status().is_success());
     assert_eq!(
         bounded(response.bytes()).await.unwrap().as_ref(),
-        upstream.probe.expected
+        upstream.probe.reply
     );
     assert_eq!(upstream.probe.calls.load(Ordering::SeqCst), 2);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn actual_http_incomplete_upload_and_completed_call_refund_after_idle_close() {
-    let charge = DedicatedSegment::required_shm_size(PAYLOAD_LEN).unwrap() as u64;
-    let state = state(policy(charge, PAYLOAD_LEN as u64, REASSEMBLY_CHARGE));
+    let charge = DedicatedSegment::required_shm_size(PAYLOAD_LEN).unwrap() as u64
+        + 2 * PAYLOAD_LEN as u64
+        + c2_config::CHUNK_SIZE;
+    let state = state(charge, REPLY_LEN as u64);
     let upstream = Upstream::start(&state, "http", 113, true).await;
     // Keep the original acquired client so an unnoticed eviction/replacement
     // cannot masquerade as survival of the HTTP upload's connection.

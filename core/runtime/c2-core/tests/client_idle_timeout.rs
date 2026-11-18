@@ -8,10 +8,8 @@ use c2_core::{
     ServiceDefinition,
 };
 use c2_error::C2Error;
-use c2_local::{ConnectionEndReason, ConnectionObservation};
 
 const WAIT: Duration = Duration::from_secs(5);
-const IDLE: Duration = Duration::from_millis(60);
 
 struct Echo;
 
@@ -26,12 +24,11 @@ struct Fixture {
     host: Host,
     registration: Registration,
     release: ContractRelease,
-    observer: tokio::runtime::Runtime,
     _root: tempfile::TempDir,
 }
 
 impl Fixture {
-    fn new(idle: Duration) -> Self {
+    fn new() -> Self {
         let root = tempfile::Builder::new().prefix("c2idle").tempdir().unwrap();
         let mut endpoint = LocalEndpointOptions::default();
         #[cfg(unix)]
@@ -40,14 +37,10 @@ impl Fixture {
             std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
             endpoint.unix_root = Some(root.path().to_path_buf());
         }
-        let mut options = RuntimeOptions {
+        let options = RuntimeOptions {
             use_process_relay_anchor: false,
             ..Default::default()
         };
-        options
-            .client_ipc_overrides
-            .get_or_insert_default()
-            .client_idle_timeout_secs = Some(idle.as_secs_f64());
         let runtime = Runtime::new(options).unwrap();
         runtime
             .set_local_endpoint_with_sources(endpoint, ConfigSources::empty())
@@ -84,10 +77,6 @@ impl Fixture {
             host,
             registration,
             release,
-            observer: tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap(),
             _root: root,
         }
     }
@@ -105,12 +94,6 @@ impl Fixture {
             .unwrap();
         assert_eq!(client.call_owned("echo", b"value").unwrap(), b"value");
         client
-    }
-
-    fn closed(&self, observation: &ConnectionObservation, timeout: Duration) -> bool {
-        self.observer
-            .block_on(observation.wait_closed(Some(timeout)))
-            .is_some()
     }
 }
 
@@ -131,62 +114,11 @@ impl Drop for Fixture {
 }
 
 #[test]
-fn configured_idle_timeout_evicts_in_background_and_reconnects() {
-    let fixture = Fixture::new(IDLE);
-    let first = fixture.connect();
-    let observation = first.connection_observation().unwrap();
-    // A live proxy remains usable beyond the configured idle window.
-    assert!(!fixture.closed(&observation, IDLE * 3));
-    assert_eq!(
-        first.call_owned("echo", b"still active").unwrap(),
-        b"still active"
-    );
-    drop(first);
-    // No acquire or explicit sweep drives eviction while waiting.
-    assert!(
-        fixture.closed(&observation, WAIT),
-        "background eviction closed the idle connection"
-    );
-    assert_eq!(
-        observation.snapshot().unwrap().reason(),
-        ConnectionEndReason::LocalClose
-    );
-    let replacement = fixture.connect();
-    assert_ne!(
-        observation.connection_id(),
-        replacement
-            .connection_observation()
-            .unwrap()
-            .connection_id()
-    );
-}
-
-#[test]
-fn configured_idle_timeout_reuses_within_window() {
-    // Keep the idle window larger than the connect operation's budget. This
-    // checks cache reuse without requiring a busy runner to complete IPC in
-    // an arbitrarily short fraction of a second.
-    let fixture = Fixture::new(WAIT * 2);
+fn cached_connection_reuses_within_idle_window() {
+    let fixture = Fixture::new();
     let first = fixture.connect();
     let observation = first.connection_observation().unwrap();
     drop(first);
-    let reused = fixture.connect();
-    assert_eq!(
-        observation.connection_id(),
-        reused.connection_observation().unwrap().connection_id()
-    );
-}
-
-#[test]
-fn configured_zero_idle_timeout_keeps_idle_connection() {
-    let fixture = Fixture::new(Duration::ZERO);
-    let first = fixture.connect();
-    let observation = first.connection_observation().unwrap();
-    drop(first);
-    assert!(
-        !fixture.closed(&observation, IDLE * 3),
-        "zero disables timed eviction"
-    );
     let reused = fixture.connect();
     assert_eq!(
         observation.connection_id(),

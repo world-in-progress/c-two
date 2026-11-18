@@ -938,9 +938,7 @@ mod tests {
     fn insert_and_lookup_ready() {
         let pool = ConnectionPool::new();
         let endpoint = key("ipc://test");
-        let client = Arc::new(
-            IpcClient::with_config("ipc://test", c2_config::ClientIpcConfig::default()).unwrap(),
-        );
+        let client = Arc::new(IpcClient::new("ipc://test").unwrap());
         pool.insert(endpoint.clone(), client);
         assert!(matches!(pool.lookup(&endpoint), CachedClient::Ready { .. }));
     }
@@ -949,10 +947,7 @@ mod tests {
     fn regular_pool_uses_physical_client_liveness() {
         let pool = ConnectionPool::with_owner_lease_duration(None);
         let endpoint = key("ipc://physical");
-        let client = Arc::new(
-            IpcClient::with_config(endpoint.address(), c2_config::ClientIpcConfig::default())
-                .unwrap(),
-        );
+        let client = Arc::new(IpcClient::new(endpoint.address()).unwrap());
         pool.insert(endpoint.clone(), client);
         assert!(matches!(
             pool.lookup(&endpoint),
@@ -1011,19 +1006,12 @@ mod tests {
         let disconnected_key = key("ipc://disconnected");
         let evicted_key = key("ipc://evicted");
         let missing_key = key("ipc://missing");
-        let ready = Arc::new(
-            IpcClient::with_config("ipc://ready", c2_config::ClientIpcConfig::default()).unwrap(),
-        );
+        let ready = Arc::new(IpcClient::new("ipc://ready").unwrap());
         pool.insert(ready_key.clone(), ready);
-        let disconnected = Arc::new(
-            IpcClient::with_config("ipc://disconnected", c2_config::ClientIpcConfig::default())
-                .unwrap(),
-        );
+        let disconnected = Arc::new(IpcClient::new("ipc://disconnected").unwrap());
         pool.insert(disconnected_key.clone(), disconnected);
         pool.set_connected_for_test(&disconnected_key, false);
-        let evicted = Arc::new(
-            IpcClient::with_config("ipc://evicted", c2_config::ClientIpcConfig::default()).unwrap(),
-        );
+        let evicted = Arc::new(IpcClient::new("ipc://evicted").unwrap());
         pool.insert(evicted_key.clone(), evicted);
         pool.evict(&evicted_key);
 
@@ -1061,13 +1049,7 @@ mod tests {
                     let attempts = attempts.clone();
                     async move {
                         attempts.fetch_add(1, Ordering::SeqCst);
-                        let client = Arc::new(
-                            IpcClient::with_config(
-                                endpoint.address(),
-                                c2_config::ClientIpcConfig::default(),
-                            )
-                            .unwrap(),
-                        );
+                        let client = Arc::new(IpcClient::new(endpoint.address()).unwrap());
                         Ok(client)
                     }
                 }
@@ -1094,26 +1076,14 @@ mod tests {
             match initial {
                 SlotState::OwnerOnly => pool.insert_owner(endpoint.clone()),
                 SlotState::Evicted => {
-                    let client = Arc::new(
-                        IpcClient::with_config(
-                            endpoint.address(),
-                            c2_config::ClientIpcConfig::default(),
-                        )
-                        .unwrap(),
-                    );
+                    let client = Arc::new(IpcClient::new(endpoint.address()).unwrap());
                     pool.insert(endpoint.clone(), client);
                     pool.evict(&endpoint);
                 }
                 SlotState::Disconnected | SlotState::Ready => {
                     pool.insert(
                         endpoint.clone(),
-                        Arc::new(
-                            IpcClient::with_config(
-                                endpoint.address(),
-                                c2_config::ClientIpcConfig::default(),
-                            )
-                            .unwrap(),
-                        ),
+                        Arc::new(IpcClient::new(endpoint.address()).unwrap()),
                     );
                     pool.set_connected_for_test(&endpoint, false);
                     if initial == SlotState::Disconnected {
@@ -1134,13 +1104,7 @@ mod tests {
             let attempts = AtomicUsize::new(0);
             let connector = |endpoint: UpstreamEndpointKey| {
                 attempts.fetch_add(1, Ordering::SeqCst);
-                let client = Arc::new(
-                    IpcClient::with_config(
-                        endpoint.address(),
-                        c2_config::ClientIpcConfig::default(),
-                    )
-                    .unwrap(),
-                );
+                let client = Arc::new(IpcClient::new(endpoint.address()).unwrap());
                 std::future::ready(Ok(client))
             };
             let mut waiter_a = Box::pin(pool.acquire_with(&endpoint, &connector));
@@ -1182,10 +1146,7 @@ mod tests {
             }));
             poll_pending(connecting.as_mut());
 
-            let replacement = Arc::new(
-                IpcClient::with_config(endpoint.address(), c2_config::ClientIpcConfig::default())
-                    .unwrap(),
-            );
+            let replacement = Arc::new(IpcClient::new(endpoint.address()).unwrap());
             let attempts = AtomicUsize::new(0);
             let connector = |_| {
                 attempts.fetch_add(1, Ordering::SeqCst);
@@ -1193,10 +1154,7 @@ mod tests {
             };
             let mut waiter = Box::pin(pool.acquire_with(&endpoint, connector));
             let wake = poll_pending(waiter.as_mut());
-            let connected = Arc::new(
-                IpcClient::with_config(endpoint.address(), c2_config::ClientIpcConfig::default())
-                    .unwrap(),
-            );
+            let connected = Arc::new(IpcClient::new(endpoint.address()).unwrap());
             finish_tx
                 .send(if succeed {
                     Ok(connected.clone())
@@ -1266,10 +1224,7 @@ mod tests {
             }));
             poll_pending(current.as_mut());
 
-            let stale_client = Arc::new(
-                IpcClient::with_config(endpoint.address(), c2_config::ClientIpcConfig::default())
-                    .unwrap(),
-            );
+            let stale_client = Arc::new(IpcClient::new(endpoint.address()).unwrap());
             match completion {
                 None => {
                     drop(connecting);
@@ -1295,10 +1250,7 @@ mod tests {
                 SlotState::Reconnecting
             );
             assert!(pool.matches_owner_token(&endpoint, &current_owner));
-            let replacement = Arc::new(
-                IpcClient::with_config(endpoint.address(), c2_config::ClientIpcConfig::default())
-                    .unwrap(),
-            );
+            let replacement = Arc::new(IpcClient::new(endpoint.address()).unwrap());
             assert!(new_tx.send(Ok(replacement.clone())).is_ok());
             let lease = current.await.unwrap();
             assert!(Arc::ptr_eq(&lease.client(), &replacement));
@@ -1322,13 +1274,7 @@ mod tests {
                     async move { rx.await.unwrap() }
                 }));
                 poll_pending(connecting.as_mut());
-                let replacement = Arc::new(
-                    IpcClient::with_config(
-                        endpoint.address(),
-                        c2_config::ClientIpcConfig::default(),
-                    )
-                    .unwrap(),
-                );
+                let replacement = Arc::new(IpcClient::new(endpoint.address()).unwrap());
                 pool.reconnect(&endpoint, replacement.clone());
                 let current_owner = pool.owner_token(&endpoint).unwrap();
                 assert!(Arc::ptr_eq(&old_owner.slot, &current_owner.slot));
@@ -1344,13 +1290,7 @@ mod tests {
                     pool.evict(&endpoint);
                     poll_pending(current.as_mut());
                 }
-                let stale_client = Arc::new(
-                    IpcClient::with_config(
-                        endpoint.address(),
-                        c2_config::ClientIpcConfig::default(),
-                    )
-                    .unwrap(),
-                );
+                let stale_client = Arc::new(IpcClient::new(endpoint.address()).unwrap());
                 match completion {
                     None => drop(connecting),
                     Some(succeed) => {
@@ -1389,9 +1329,7 @@ mod tests {
     fn lookup_returns_disconnected_for_disconnected() {
         let pool = ConnectionPool::new();
         let endpoint = key("ipc://test");
-        let client = Arc::new(
-            IpcClient::with_config("ipc://test", c2_config::ClientIpcConfig::default()).unwrap(),
-        );
+        let client = Arc::new(IpcClient::new("ipc://test").unwrap());
         // Client starts disconnected.
         pool.insert(endpoint.clone(), client);
         pool.set_connected_for_test(&endpoint, false);
@@ -1405,9 +1343,7 @@ mod tests {
     fn evict_and_reconnect() {
         let pool = ConnectionPool::new();
         let endpoint = key("ipc://test");
-        let c1 = Arc::new(
-            IpcClient::with_config("ipc://test", c2_config::ClientIpcConfig::default()).unwrap(),
-        );
+        let c1 = Arc::new(IpcClient::new("ipc://test").unwrap());
         pool.insert(endpoint.clone(), c1);
         pool.evict(&endpoint);
         assert!(matches!(
@@ -1415,9 +1351,7 @@ mod tests {
             CachedClient::Evicted { .. }
         ));
 
-        let c2 = Arc::new(
-            IpcClient::with_config("ipc://test", c2_config::ClientIpcConfig::default()).unwrap(),
-        );
+        let c2 = Arc::new(IpcClient::new("ipc://test").unwrap());
         pool.reconnect(&endpoint, c2);
         assert!(matches!(pool.lookup(&endpoint), CachedClient::Ready { .. }));
     }
@@ -1426,9 +1360,7 @@ mod tests {
     fn remove_deletes_entry() {
         let pool = ConnectionPool::new();
         let endpoint = key("ipc://test");
-        let client = Arc::new(
-            IpcClient::with_config("ipc://test", c2_config::ClientIpcConfig::default()).unwrap(),
-        );
+        let client = Arc::new(IpcClient::new("ipc://test").unwrap());
         pool.insert(endpoint.clone(), client);
         pool.remove(&endpoint);
         assert!(matches!(pool.lookup(&endpoint), CachedClient::Missing));
@@ -1437,9 +1369,7 @@ mod tests {
     #[test]
     fn idle_entries_detects_disconnected() {
         let pool = ConnectionPool::new();
-        let client = Arc::new(
-            IpcClient::with_config("ipc://dead", c2_config::ClientIpcConfig::default()).unwrap(),
-        );
+        let client = Arc::new(IpcClient::new("ipc://dead").unwrap());
         pool.insert(key("ipc://dead"), client);
         pool.set_connected_for_test(&key("ipc://dead"), false);
         assert_eq!(pool.idle_entries(u64::MAX).len(), 1);
@@ -1449,9 +1379,7 @@ mod tests {
     fn idle_entries_do_not_evict_active_connected_client() {
         let pool = ConnectionPool::new();
         let endpoint = key("ipc://active");
-        let client = Arc::new(
-            IpcClient::with_config("ipc://active", c2_config::ClientIpcConfig::default()).unwrap(),
-        );
+        let client = Arc::new(IpcClient::new("ipc://active").unwrap());
         pool.insert(endpoint.clone(), client);
 
         let lease = pool.begin_request_for_test(&endpoint).unwrap();
@@ -1463,9 +1391,7 @@ mod tests {
     fn idle_entries_can_evict_inactive_connected_client() {
         let pool = ConnectionPool::new();
         let endpoint = key("ipc://idle");
-        let client = Arc::new(
-            IpcClient::with_config("ipc://idle", c2_config::ClientIpcConfig::default()).unwrap(),
-        );
+        let client = Arc::new(IpcClient::new("ipc://idle").unwrap());
         pool.insert(endpoint.clone(), client);
 
         assert_eq!(pool.idle_entries(0), vec![endpoint]);
@@ -1475,9 +1401,7 @@ mod tests {
     fn end_request_makes_client_idle_candidate_again() {
         let pool = ConnectionPool::new();
         let endpoint = key("ipc://active");
-        let client = Arc::new(
-            IpcClient::with_config("ipc://active", c2_config::ClientIpcConfig::default()).unwrap(),
-        );
+        let client = Arc::new(IpcClient::new("ipc://active").unwrap());
         pool.insert(endpoint.clone(), client);
 
         let lease = pool.begin_request_for_test(&endpoint).unwrap();
@@ -1490,9 +1414,7 @@ mod tests {
     fn disconnected_client_is_evicted_even_when_not_idle_by_time() {
         let pool = ConnectionPool::new();
         let endpoint = key("ipc://dead");
-        let client = Arc::new(
-            IpcClient::with_config("ipc://dead", c2_config::ClientIpcConfig::default()).unwrap(),
-        );
+        let client = Arc::new(IpcClient::new("ipc://dead").unwrap());
         pool.insert(endpoint.clone(), client);
         pool.set_connected_for_test(&endpoint, false);
 
@@ -1503,10 +1425,7 @@ mod tests {
     fn active_disconnected_client_is_not_evicted_until_request_finishes() {
         let pool = ConnectionPool::new();
         let endpoint = key("ipc://active-dead");
-        let client = Arc::new(
-            IpcClient::with_config("ipc://active-dead", c2_config::ClientIpcConfig::default())
-                .unwrap(),
-        );
+        let client = Arc::new(IpcClient::new("ipc://active-dead").unwrap());
         pool.insert(endpoint.clone(), client.clone());
 
         let lease = pool.begin_request_for_test(&endpoint).unwrap();
@@ -1523,16 +1442,12 @@ mod tests {
         let pool = ConnectionPool::new();
         let old_endpoint = key("ipc://old");
         let new_endpoint = key("ipc://new");
-        let old_client = Arc::new(
-            IpcClient::with_config("ipc://old", c2_config::ClientIpcConfig::default()).unwrap(),
-        );
+        let old_client = Arc::new(IpcClient::new("ipc://old").unwrap());
         pool.insert(old_endpoint.clone(), old_client);
         let old_lease = pool.begin_request_for_test(&old_endpoint).unwrap();
         pool.remove(&old_endpoint);
 
-        let new_client = Arc::new(
-            IpcClient::with_config("ipc://new", c2_config::ClientIpcConfig::default()).unwrap(),
-        );
+        let new_client = Arc::new(IpcClient::new("ipc://new").unwrap());
         pool.insert(new_endpoint.clone(), new_client);
         drop(old_lease);
 
@@ -1544,16 +1459,12 @@ mod tests {
         let pool = ConnectionPool::new();
         let old_endpoint = key("ipc://old");
         let new_endpoint = key("ipc://new");
-        let old_client = Arc::new(
-            IpcClient::with_config("ipc://old", c2_config::ClientIpcConfig::default()).unwrap(),
-        );
+        let old_client = Arc::new(IpcClient::new("ipc://old").unwrap());
         pool.insert(old_endpoint.clone(), old_client);
         let old_lease = pool.begin_request_for_test(&old_endpoint).unwrap();
         pool.remove(&old_endpoint);
 
-        let new_client = Arc::new(
-            IpcClient::with_config("ipc://new", c2_config::ClientIpcConfig::default()).unwrap(),
-        );
+        let new_client = Arc::new(IpcClient::new("ipc://new").unwrap());
         pool.insert(new_endpoint.clone(), new_client);
         let new_lease = pool.begin_request_for_test(&new_endpoint).unwrap();
 
@@ -1569,16 +1480,12 @@ mod tests {
         let pool = ConnectionPool::new();
         let old_endpoint = key("ipc://old");
         let new_endpoint = key("ipc://new");
-        let old_client = Arc::new(
-            IpcClient::with_config("ipc://old", c2_config::ClientIpcConfig::default()).unwrap(),
-        );
+        let old_client = Arc::new(IpcClient::new("ipc://old").unwrap());
         pool.insert(old_endpoint.clone(), old_client);
         let old_lease = pool.begin_request_for_test(&old_endpoint).unwrap();
         pool.remove(&old_endpoint);
 
-        let new_client = Arc::new(
-            IpcClient::with_config("ipc://new", c2_config::ClientIpcConfig::default()).unwrap(),
-        );
+        let new_client = Arc::new(IpcClient::new("ipc://new").unwrap());
         pool.insert(new_endpoint.clone(), new_client);
         assert!(
             pool.evict_client(&new_endpoint, &old_lease.client())
@@ -1594,9 +1501,7 @@ mod tests {
     fn matching_client_evict_removes_current_entry_client() {
         let pool = ConnectionPool::new();
         let endpoint = key("ipc://current");
-        let client = Arc::new(
-            IpcClient::with_config("ipc://current", c2_config::ClientIpcConfig::default()).unwrap(),
-        );
+        let client = Arc::new(IpcClient::new("ipc://current").unwrap());
         pool.insert(endpoint.clone(), client);
         let lease = pool.begin_request_for_test(&endpoint).unwrap();
         assert!(pool.evict_client(&endpoint, &lease.client()).is_some());
@@ -1610,16 +1515,12 @@ mod tests {
     fn stale_client_evict_after_reconnect_does_not_evict_reconnected_client() {
         let pool = ConnectionPool::new();
         let endpoint = key("ipc://old");
-        let old_client = Arc::new(
-            IpcClient::with_config("ipc://old", c2_config::ClientIpcConfig::default()).unwrap(),
-        );
+        let old_client = Arc::new(IpcClient::new("ipc://old").unwrap());
         pool.insert(endpoint.clone(), old_client);
         let old_lease = pool.begin_request_for_test(&endpoint).unwrap();
         assert!(pool.evict_client(&endpoint, &old_lease.client()).is_some());
 
-        let new_client = Arc::new(
-            IpcClient::with_config("ipc://old", c2_config::ClientIpcConfig::default()).unwrap(),
-        );
+        let new_client = Arc::new(IpcClient::new("ipc://old").unwrap());
         pool.reconnect(&endpoint, new_client);
         assert!(pool.evict_client(&endpoint, &old_lease.client()).is_none());
         assert!(matches!(pool.lookup(&endpoint), CachedClient::Ready { .. }));
@@ -1629,15 +1530,11 @@ mod tests {
     fn stale_lease_drop_after_reconnect_does_not_release_new_active_request() {
         let pool = ConnectionPool::new();
         let endpoint = key("ipc://old");
-        let old_client = Arc::new(
-            IpcClient::with_config("ipc://old", c2_config::ClientIpcConfig::default()).unwrap(),
-        );
+        let old_client = Arc::new(IpcClient::new("ipc://old").unwrap());
         pool.insert(endpoint.clone(), old_client);
         let old_lease = pool.begin_request_for_test(&endpoint).unwrap();
 
-        let new_client = Arc::new(
-            IpcClient::with_config("ipc://old", c2_config::ClientIpcConfig::default()).unwrap(),
-        );
+        let new_client = Arc::new(IpcClient::new("ipc://old").unwrap());
         pool.reconnect(&endpoint, new_client);
         assert!(pool.idle_entries(0).is_empty());
 
@@ -1655,16 +1552,12 @@ mod tests {
         let pool = ConnectionPool::new();
         let old_endpoint = key("ipc://old");
         let current_endpoint = key("ipc://current");
-        let old_client = Arc::new(
-            IpcClient::with_config("ipc://old", c2_config::ClientIpcConfig::default()).unwrap(),
-        );
+        let old_client = Arc::new(IpcClient::new("ipc://old").unwrap());
         pool.insert(old_endpoint.clone(), old_client);
         let token = pool.owner_token(&old_endpoint).unwrap();
         pool.remove(&old_endpoint);
 
-        let current_client = Arc::new(
-            IpcClient::with_config("ipc://current", c2_config::ClientIpcConfig::default()).unwrap(),
-        );
+        let current_client = Arc::new(IpcClient::new("ipc://current").unwrap());
         pool.insert(current_endpoint.clone(), current_client.clone());
         assert!(!pool.matches_owner_token(&current_endpoint, &token));
 
@@ -1680,16 +1573,12 @@ mod tests {
     fn owner_token_does_not_match_same_slot_after_reconnect() {
         let pool = ConnectionPool::new();
         let endpoint = key("ipc://old");
-        let old_client = Arc::new(
-            IpcClient::with_config("ipc://old", c2_config::ClientIpcConfig::default()).unwrap(),
-        );
+        let old_client = Arc::new(IpcClient::new("ipc://old").unwrap());
         pool.insert(endpoint.clone(), old_client);
         let token = pool.owner_token(&endpoint).unwrap();
         pool.set_connected_for_test(&endpoint, false);
 
-        let new_client = Arc::new(
-            IpcClient::with_config("ipc://old", c2_config::ClientIpcConfig::default()).unwrap(),
-        );
+        let new_client = Arc::new(IpcClient::new("ipc://old").unwrap());
         pool.reconnect(&endpoint, new_client.clone());
 
         let lease = pool.begin_request_for_test(&endpoint).unwrap();
@@ -1702,16 +1591,12 @@ mod tests {
     fn owner_token_does_not_match_reinsert_with_same_address() {
         let pool = ConnectionPool::new();
         let endpoint = key("ipc://same");
-        let old_client = Arc::new(
-            IpcClient::with_config("ipc://same", c2_config::ClientIpcConfig::default()).unwrap(),
-        );
+        let old_client = Arc::new(IpcClient::new("ipc://same").unwrap());
         pool.insert(endpoint.clone(), old_client);
         let token = pool.owner_token(&endpoint).unwrap();
         pool.remove(&endpoint);
 
-        let new_client = Arc::new(
-            IpcClient::with_config("ipc://same", c2_config::ClientIpcConfig::default()).unwrap(),
-        );
+        let new_client = Arc::new(IpcClient::new("ipc://same").unwrap());
         pool.insert(endpoint.clone(), new_client);
         assert!(!pool.matches_owner_token(&endpoint, &token));
     }
@@ -1720,10 +1605,7 @@ mod tests {
     fn owner_token_does_not_match_after_lease_renewal() {
         let pool = ConnectionPool::new();
         let endpoint = key("ipc://same-slot");
-        let old_client = Arc::new(
-            IpcClient::with_config("ipc://same-slot", c2_config::ClientIpcConfig::default())
-                .unwrap(),
-        );
+        let old_client = Arc::new(IpcClient::new("ipc://same-slot").unwrap());
         pool.insert(endpoint.clone(), old_client);
         let token = pool.owner_token(&endpoint).unwrap();
         assert!(pool.renew_owner_lease(&endpoint, &token));
@@ -1734,10 +1616,7 @@ mod tests {
     fn current_owner_lease_renewal_is_not_stale_token_based() {
         let pool = ConnectionPool::new();
         let endpoint = key("ipc://same-slot");
-        let old_client = Arc::new(
-            IpcClient::with_config("ipc://same-slot", c2_config::ClientIpcConfig::default())
-                .unwrap(),
-        );
+        let old_client = Arc::new(IpcClient::new("ipc://same-slot").unwrap());
         pool.insert(endpoint.clone(), old_client);
         let token = pool.owner_token(&endpoint).unwrap();
         assert!(pool.renew_current_owner_lease(&endpoint));
@@ -1749,9 +1628,7 @@ mod tests {
     fn disabled_owner_lease_deadline_does_not_block_evidence_based_replacement_validation() {
         let pool = ConnectionPool::with_owner_lease_duration(None);
         let endpoint = key("ipc://old");
-        let old_client = Arc::new(
-            IpcClient::with_config("ipc://old", c2_config::ClientIpcConfig::default()).unwrap(),
-        );
+        let old_client = Arc::new(IpcClient::new("ipc://old").unwrap());
         pool.insert(endpoint.clone(), old_client);
         let token = pool.owner_token(&endpoint).unwrap();
         assert!(token.slot.inner.lock().owner_lease_deadline.is_none());
@@ -1772,9 +1649,7 @@ mod tests {
     fn validate_replaceable_owner_token_rejects_active_disconnected_slot() {
         let pool = ConnectionPool::new();
         let endpoint = key("ipc://old");
-        let old_client = Arc::new(
-            IpcClient::with_config("ipc://old", c2_config::ClientIpcConfig::default()).unwrap(),
-        );
+        let old_client = Arc::new(IpcClient::new("ipc://old").unwrap());
         pool.insert(endpoint.clone(), old_client);
         let token = pool.owner_token(&endpoint).unwrap();
         let lease = pool.begin_request_for_test(&endpoint).unwrap();
@@ -1794,9 +1669,7 @@ mod tests {
     async fn concurrent_acquire_after_eviction_shares_one_reconnect() {
         let pool = Arc::new(ConnectionPool::new());
         let endpoint = key("ipc://shared");
-        let client = Arc::new(
-            IpcClient::with_config("ipc://shared", c2_config::ClientIpcConfig::default()).unwrap(),
-        );
+        let client = Arc::new(IpcClient::new("ipc://shared").unwrap());
         pool.insert(endpoint.clone(), client);
         pool.evict(&endpoint);
 
@@ -1812,13 +1685,7 @@ mod tests {
                     let connect_count = connect_count.clone();
                     async move {
                         connect_count.fetch_add(1, Ordering::SeqCst);
-                        let client = Arc::new(
-                            IpcClient::with_config(
-                                endpoint.address(),
-                                c2_config::ClientIpcConfig::default(),
-                            )
-                            .unwrap(),
-                        );
+                        let client = Arc::new(IpcClient::new(endpoint.address()).unwrap());
                         Ok(client)
                     }
                 })
@@ -1845,9 +1712,7 @@ mod tests {
     async fn acquire_after_eviction_retries_one_transient_connector_error() {
         let pool = Arc::new(ConnectionPool::new());
         let endpoint = key("ipc://flaky");
-        let client = Arc::new(
-            IpcClient::with_config("ipc://flaky", c2_config::ClientIpcConfig::default()).unwrap(),
-        );
+        let client = Arc::new(IpcClient::new("ipc://flaky").unwrap());
         pool.insert(endpoint.clone(), client);
         pool.evict(&endpoint);
         let attempts = Arc::new(AtomicUsize::new(0));
@@ -1864,13 +1729,7 @@ mod tests {
                                 "peer reset during idle reconnect",
                             )));
                         }
-                        let client = Arc::new(
-                            IpcClient::with_config(
-                                endpoint.address(),
-                                c2_config::ClientIpcConfig::default(),
-                            )
-                            .unwrap(),
-                        );
+                        let client = Arc::new(IpcClient::new(endpoint.address()).unwrap());
                         Ok(client)
                     }
                 }
@@ -1887,9 +1746,7 @@ mod tests {
     async fn remove_during_reconnect_makes_waiting_acquire_not_found() {
         let pool = Arc::new(ConnectionPool::new());
         let endpoint = key("ipc://removed");
-        let client = Arc::new(
-            IpcClient::with_config("ipc://removed", c2_config::ClientIpcConfig::default()).unwrap(),
-        );
+        let client = Arc::new(IpcClient::new("ipc://removed").unwrap());
         pool.insert(endpoint.clone(), client);
         pool.evict(&endpoint);
 
@@ -1913,13 +1770,7 @@ mod tests {
                         }
                         let rx = finish_rx.lock().await.take().unwrap();
                         rx.await.unwrap();
-                        let client = Arc::new(
-                            IpcClient::with_config(
-                                endpoint.address(),
-                                c2_config::ClientIpcConfig::default(),
-                            )
-                            .unwrap(),
-                        );
+                        let client = Arc::new(IpcClient::new(endpoint.address()).unwrap());
                         Ok(client)
                     }
                 })
@@ -1941,9 +1792,7 @@ mod tests {
         let pool = Arc::new(ConnectionPool::new());
         let old_endpoint = key("ipc://old");
         let new_endpoint = key("ipc://new");
-        let old_client = Arc::new(
-            IpcClient::with_config("ipc://old", c2_config::ClientIpcConfig::default()).unwrap(),
-        );
+        let old_client = Arc::new(IpcClient::new("ipc://old").unwrap());
         pool.insert(old_endpoint.clone(), old_client);
         pool.evict(&old_endpoint);
 
@@ -1967,13 +1816,7 @@ mod tests {
                         }
                         let rx = finish_rx.lock().await.take().unwrap();
                         rx.await.unwrap();
-                        let client = Arc::new(
-                            IpcClient::with_config(
-                                endpoint.address(),
-                                c2_config::ClientIpcConfig::default(),
-                            )
-                            .unwrap(),
-                        );
+                        let client = Arc::new(IpcClient::new(endpoint.address()).unwrap());
                         Ok(client)
                     }
                 })
@@ -1982,9 +1825,7 @@ mod tests {
         };
 
         started_rx.await.unwrap();
-        let replacement = Arc::new(
-            IpcClient::with_config("ipc://new", c2_config::ClientIpcConfig::default()).unwrap(),
-        );
+        let replacement = Arc::new(IpcClient::new("ipc://new").unwrap());
         pool.remove(&old_endpoint);
         pool.insert(new_endpoint.clone(), replacement.clone());
         finish_tx.send(()).unwrap();

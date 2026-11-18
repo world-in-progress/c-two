@@ -33,9 +33,7 @@ fn runtime_shutdown_preserves_dispatched_ipc_call_past_observation_budget() {
             .tempdir()
             .unwrap();
         let runtime = Runtime::new(RuntimeOptions {
-            server_id: Some(format!("inflight-{}", uuid::Uuid::new_v4().simple())),
             use_process_relay_anchor: false,
-            shm_threshold: Some(1),
             ..Default::default()
         })
         .unwrap();
@@ -50,9 +48,7 @@ fn runtime_shutdown_preserves_dispatched_ipc_call_past_observation_budget() {
             )
             .unwrap();
         let peer = Runtime::new(RuntimeOptions {
-            server_id: Some(format!("inflight-peer-{}", uuid::Uuid::new_v4().simple())),
             use_process_relay_anchor: false,
-            shm_threshold: Some(1),
             ..Default::default()
         })
         .unwrap();
@@ -98,7 +94,7 @@ fn runtime_shutdown_preserves_dispatched_ipc_call_past_observation_budget() {
             )
             .unwrap();
         let observation = client.connection_observation().unwrap();
-        let call = std::thread::spawn(move || client.call_owned("echo", &vec![9; 8193]));
+        let call = std::thread::spawn(move || client.call_owned("echo", &vec![9; 32769]));
         started.recv_timeout(WAIT).unwrap();
         let target = if hosted {
             RuntimeShutdownTarget::Host(&host)
@@ -120,7 +116,7 @@ fn runtime_shutdown_preserves_dispatched_ipc_call_past_observation_budget() {
         );
         assert!(observation.snapshot().is_none());
         resume.send(()).unwrap();
-        assert_eq!(call.join().unwrap().unwrap(), vec![9; 8193]);
+        assert_eq!(call.join().unwrap().unwrap(), vec![9; 32769]);
         let repeated = runtime
             .retirement_receipt(Instant::now() + WAIT)
             .unwrap()

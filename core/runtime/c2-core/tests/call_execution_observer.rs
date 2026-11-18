@@ -1,76 +1,77 @@
-//! Public metadata observation requires no endpoint, executor or payload.
-//! Limits belong to each Runtime/domain, not one cumulative process budget.
+//! Public snapshots observe role domains without activating them.
+use c2_contract::ContractRelease;
 use c2_core::{
-    CallExecutionLimitsOverrides, CallExecutionObservation, CallExecutionObserver, ConfigSources,
-    Runtime, RuntimeOptions,
+    ClientConfigPatch, ConfigField, Connect, DomainLimitsPatch, RoleCallExecutionStats, Runtime,
+    RuntimeOptions,
 };
 
-fn assert_read_only_handle(_: &CallExecutionObserver) {}
-
-#[test]
-fn capture_open_uninitialized_domain_without_freezing_policy() {
-    let runtime = Runtime::new(RuntimeOptions::default()).unwrap();
-    let observer = runtime.call_execution_observer();
-    assert_read_only_handle(&observer);
-    assert_eq!(
-        observer.snapshot(),
-        CallExecutionObservation {
-            initialized: false,
-            closed: false,
-            counters: None,
-        }
-    );
-    assert!(observer.is_live());
-    runtime
-        .set_call_execution_limits_with_sources(
-            CallExecutionLimitsOverrides {
-                max_outstanding_calls: Some(1),
-                payload_buffer_budget_bytes: Some(32),
-            },
-            ConfigSources::empty(),
-        )
-        .unwrap();
-    assert_eq!(
+fn attempt_missing_connection(runtime: &Runtime) {
+    let release = ContractRelease::from_descriptor_json(include_bytes!(
+        "../../../../tests/fixtures/contracts/portable-release.contract.json"
+    ))
+    .unwrap();
+    assert!(
         runtime
-            .call_execution_limits_overrides()
-            .max_outstanding_calls,
-        Some(1)
+            .connect(
+                release.expected_route("missing").unwrap(),
+                Connect::DirectIpc {
+                    address: format!("ipc://missing-{}", uuid::Uuid::new_v4().simple()),
+                },
+            )
+            .is_err()
     );
-    // Existing resolved snapshot remains a policy preview, not initialization.
-    assert_eq!(runtime.call_execution_snapshot().unwrap().max_operations, 1);
-    assert!(!observer.snapshot().initialized);
-    runtime
-        .set_call_execution_limits_with_sources(
-            CallExecutionLimitsOverrides {
-                max_outstanding_calls: Some(2),
-                payload_buffer_budget_bytes: Some(64),
-            },
-            ConfigSources::empty(),
-        )
-        .unwrap();
-    assert_eq!(runtime.call_execution_snapshot().unwrap().max_operations, 2);
 }
 
 #[test]
-fn cloned_runtime_shares_domain_distinct_runtime_has_independent_domain() {
+fn observing_a_dormant_domain_does_not_resolve_or_freeze_its_configuration() {
+    let runtime = Runtime::new(RuntimeOptions::default()).unwrap();
+    for slots in [1, 2] {
+        runtime
+            .update_client_config(ClientConfigPatch {
+                domain_limits: DomainLimitsPatch {
+                    max_outstanding_calls: ConfigField::Set(slots),
+                    ..Default::default()
+                },
+            })
+            .unwrap();
+        assert_eq!(
+            runtime.client_overrides().max_outstanding_calls,
+            Some(slots)
+        );
+        assert_eq!(
+            runtime.call_execution_snapshot().client,
+            RoleCallExecutionStats::default()
+        );
+        assert!(runtime.client_domain_observer().is_none());
+        assert!(!runtime.memory_stats().client.frozen);
+    }
+    attempt_missing_connection(&runtime);
+    let snapshot = runtime.call_execution_snapshot();
+    assert_eq!(snapshot.client.max_operations, Some(2));
+    assert_eq!(snapshot.client.used_operations, Some(0));
+    assert_eq!(snapshot.server, RoleCallExecutionStats::default());
+}
+
+#[test]
+fn cloned_runtime_observes_the_same_domain_and_distinct_runtime_observes_its_own() {
     let runtime = Runtime::new(RuntimeOptions::default()).unwrap();
     let clone = runtime.clone();
     let other = Runtime::new(RuntimeOptions::default()).unwrap();
-    let observer = runtime.call_execution_observer();
-    assert!(observer.same_domain(&observer.clone()));
-    assert!(observer.same_domain(&clone.call_execution_observer()));
-    assert!(!observer.same_domain(&other.call_execution_observer()));
+    attempt_missing_connection(&runtime);
+    attempt_missing_connection(&other);
+
+    let domain_id = runtime
+        .memory_stats()
+        .client
+        .domain_id
+        .expect("activated client");
+    assert_eq!(clone.memory_stats().client.domain_id, Some(domain_id));
+    assert_ne!(other.memory_stats().client.domain_id, Some(domain_id));
+
+    let observer = runtime.client_domain_observer().unwrap().downgrade();
     drop(runtime);
-    assert!(observer.is_live());
+    assert_eq!(observer.snapshot().unwrap().domain_id, domain_id);
     drop(clone);
-    assert_eq!(
-        observer.snapshot(),
-        CallExecutionObservation {
-            initialized: false,
-            closed: true,
-            counters: None,
-        }
-    );
-    assert!(!observer.is_live());
-    assert!(other.call_execution_observer().is_live());
+    assert!(!observer.is_alive());
+    assert!(other.client_domain_observer().is_some());
 }

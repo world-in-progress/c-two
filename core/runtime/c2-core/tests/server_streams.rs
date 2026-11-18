@@ -3,13 +3,13 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
-use c2_config::{ConfigSources, LocalEndpointOptions, ServerIpcConfigOverrides};
+use c2_config::{ConfigSources, DomainLimitsOverrides, LocalEndpointOptions};
 use c2_contract::{ContractRelease, MethodAccess};
 use c2_core::{
-    CallExecutionLimitsOverrides, CallOptions, CallTimeout, Client, Connect, CoreResponseStream,
-    EncodedClient, EncodedService, EncodedStream, EncodedStreamItem, EncodedStreamService, Error,
-    Host, HostOptions, LocalObjectStream, MethodDefinition, Registration, Runtime, RuntimeOptions,
-    RuntimeShutdownTarget, ServiceConcurrencyMode, ServiceDefinition,
+    CallOptions, CallTimeout, Client, Connect, CoreResponseStream, EncodedClient, EncodedService,
+    EncodedStream, EncodedStreamItem, EncodedStreamService, Error, Host, HostOptions,
+    LocalObjectStream, MethodDefinition, Registration, RouteConcurrency, Runtime, RuntimeOptions,
+    RuntimeShutdownTarget, ServiceConcurrencyMode, ServiceDefinition, strip_callback_error_phases,
 };
 use c2_error::{C2Error, ErrorCode};
 use c2_http::relay::{RelayConfig, RelayServer};
@@ -53,6 +53,229 @@ impl LocalObjectStream<Arc<Vec<u8>>> for LocalObjects {
         }
         Ok(())
     }
+}
+
+fn with_local_route(options: HostOptions, test: impl FnOnce(&Runtime, &RouteConcurrency)) {
+    struct LocalOnly;
+    impl EncodedService for LocalOnly {
+        fn invoke(&self, _: u16, _: Vec<u8>) -> Result<Vec<u8>, C2Error> {
+            unreachable!("a local object call does not invoke the encoded service")
+        }
+    }
+    impl EncodedStreamService for LocalOnly {
+        fn open_stream(&self, _: u16, _: Vec<u8>) -> Result<Box<dyn EncodedStream>, C2Error> {
+            unreachable!("a local object stream does not open the encoded stream")
+        }
+    }
+
+    let root = tempfile::Builder::new()
+        .prefix("c2-local-objects-")
+        .tempdir()
+        .unwrap();
+    let runtime = Runtime::new(RuntimeOptions {
+        use_process_relay_anchor: false,
+        ..Default::default()
+    })
+    .unwrap();
+    runtime
+        .set_local_endpoint_with_sources(
+            LocalEndpointOptions {
+                #[cfg(unix)]
+                unix_root: Some(root.path().to_path_buf()),
+                ..Default::default()
+            },
+            ConfigSources::empty(),
+        )
+        .unwrap();
+    let host = runtime.host(options.without_relay()).unwrap();
+    let release = ContractRelease::from_descriptor_json(DESCRIPTOR).unwrap();
+    let methods = release
+        .descriptor()
+        .methods()
+        .iter()
+        .enumerate()
+        .map(|(index, method)| MethodDefinition {
+            index: index as u16,
+            name: method.name().into(),
+            access: method.access(),
+        });
+    let registration = host
+        .register(
+            ServiceDefinition::new_stream(
+                &release,
+                release.reference(),
+                &unique("local"),
+                methods,
+                Arc::new(LocalOnly),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    test(&runtime, &registration.route_concurrency());
+    assert!(host.shutdown().runtime_barrier_error.is_none());
+}
+
+fn assert_client_dormant(runtime: &Runtime) {
+    assert_eq!(runtime.memory_stats().client.domain_id, None);
+    assert_eq!(runtime.call_execution_snapshot().client, Default::default());
+}
+
+fn assert_local_admission_refusal(error: C2Error) {
+    assert_eq!(error.code, ErrorCode::CallCapacityExceeded);
+    assert_eq!(error.details["stage"], "call_execution_admission");
+    assert_eq!(error.details["dispatch_phase"], "pre_dispatch");
+}
+
+fn refused_stream(route: &RouteConcurrency) -> C2Error {
+    let error = route
+        .open_local_stream::<(), _>(1, || panic!("a refused stream must not enter its factory"))
+        .err()
+        .expect("server domain must refuse another local stream");
+    let Error::Semantic(error) = error else {
+        panic!("expected canonical local admission refusal, got {error:?}");
+    };
+    error
+}
+
+#[test]
+fn local_unary_and_stream_share_server_admission_through_cleanup() {
+    let options = HostOptions::default()
+        .with_memory_budget_bytes(1024 * 1024)
+        .with_max_outstanding_calls(1);
+    with_local_route(options, |runtime, route| {
+        assert_client_dormant(runtime);
+        let mut unary = route.blocking_acquire(0).unwrap();
+        unary.commit().unwrap();
+        assert_eq!(
+            runtime.call_execution_snapshot().server.used_operations,
+            Some(1)
+        );
+        assert_local_admission_refusal(refused_stream(route));
+        drop(unary);
+
+        let (steps_tx, steps_rx) = mpsc::channel();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let finish_gate = Arc::new(Gate::default());
+        let gate = finish_gate.clone();
+        let stream = route
+            .open_local_stream(1, move || {
+                Ok(Box::new(LocalObjects {
+                    values: vec![Arc::new(vec![5])],
+                    cursor: 0,
+                    steps: steps_tx,
+                    finished: finished_tx,
+                    step_gate: None,
+                    finish_gate: Some(gate),
+                }))
+            })
+            .unwrap();
+        assert_eq!(steps_rx.recv_timeout(WAIT).unwrap(), 0);
+        assert_eq!(stream.next_item().unwrap().unwrap().as_slice(), &[5]);
+        finished_rx.recv_timeout(WAIT).unwrap();
+        assert!(!stream.close_with_timeout(Some(Duration::ZERO)).completed);
+        assert_eq!(
+            runtime.call_execution_snapshot().server.used_operations,
+            Some(1)
+        );
+        assert_local_admission_refusal(route.blocking_acquire(0).unwrap_err().into());
+        assert_local_admission_refusal(refused_stream(route));
+        assert_client_dormant(runtime);
+
+        finish_gate.release();
+        let receipt = stream.close_with_timeout(Some(WAIT));
+        assert!(receipt.completed);
+        assert_eq!(receipt.complete_items, Some(1));
+        assert_eq!(
+            runtime.call_execution_snapshot().server.used_operations,
+            Some(0)
+        );
+        let mut unary = route.blocking_acquire(0).unwrap();
+        unary.commit().unwrap();
+        assert_client_dormant(runtime);
+    });
+}
+
+#[test]
+fn zero_server_memory_refuses_local_unary_and_empty_stream_before_entry() {
+    with_local_route(
+        HostOptions::default().with_memory_budget_bytes(0),
+        |runtime, route| {
+            assert_eq!(
+                runtime.call_execution_snapshot().server.max_operations,
+                Some(0)
+            );
+            assert_local_admission_refusal(route.blocking_acquire(0).unwrap_err().into());
+            assert_local_admission_refusal(refused_stream(route));
+            assert_eq!(route.snapshot().pending, 0);
+            assert_client_dormant(runtime);
+        },
+    );
+}
+
+#[test]
+fn local_callback_errors_preserve_inner_error_without_its_dispatch_phase() {
+    struct FailingStream {
+        step_error: Option<C2Error>,
+        finish_error: Option<C2Error>,
+    }
+    impl LocalObjectStream<()> for FailingStream {
+        fn step(&mut self) -> Result<Option<()>, C2Error> {
+            self.step_error.take().map_or(Ok(None), Err)
+        }
+
+        fn finish(self: Box<Self>) -> Result<(), C2Error> {
+            self.finish_error.map_or(Ok(()), Err)
+        }
+    }
+
+    let expected = C2Error::new(ErrorCode::CallCapacityExceeded, "inner call refused")
+        .with_details(
+            [
+                ("stage".into(), "call_execution_admission".into()),
+                ("route".into(), "downstream".into()),
+            ]
+            .into(),
+        );
+    let mut inner = expected.clone();
+    inner
+        .details
+        .insert("transport_phase".into(), "pre_dispatch".into());
+    inner
+        .details
+        .insert("dispatch_phase".into(), "pre_dispatch".into());
+    with_local_route(HostOptions::default(), |runtime, route| {
+        // The same-process unary adapter applies this Core boundary helper
+        // after entering the resource method under a committed route guard.
+        let mut unary = route.blocking_acquire(0).unwrap();
+        unary.commit().unwrap();
+        let mut unary_error = inner.clone();
+        strip_callback_error_phases(&mut unary_error);
+        assert_eq!(unary_error, expected);
+        drop(unary);
+
+        for (factory_error, step_error, finish_error) in [
+            (Some(inner.clone()), None, None),
+            (None, Some(inner.clone()), None),
+            (None, None, Some(inner.clone())),
+        ] {
+            let stream = route
+                .open_local_stream(1, move || {
+                    if let Some(error) = factory_error {
+                        return Err(error);
+                    }
+                    Ok(Box::new(FailingStream {
+                        step_error,
+                        finish_error,
+                    }))
+                })
+                .unwrap();
+            let Error::Semantic(error) = stream.next_item().expect_err("callback failed") else {
+                panic!("expected semantic callback failure");
+            };
+            assert_eq!(error, expected);
+        }
+        assert_client_dormant(runtime);
+    });
 }
 
 #[test]
@@ -502,7 +725,7 @@ struct Fixture {
     server: Runtime,
     host: Host,
     registration: Option<Registration>,
-    _client_runtime: Runtime,
+    client_runtime: Runtime,
     client: Client,
     connection_events: Option<c2_local::ConnectionEvents>,
     probe: Arc<Probe>,
@@ -544,15 +767,18 @@ impl Fixture {
             .prefix("c2-core-stream-")
             .tempdir()
             .unwrap();
+        let client_limits = DomainLimitsOverrides {
+            max_outstanding_calls: max_calls,
+            memory_budget_bytes: budget_bytes,
+            ..Default::default()
+        };
         let server = Runtime::new(RuntimeOptions {
-            server_id: Some(unique("stream-server")),
+            client_limits: if separate_client {
+                DomainLimitsOverrides::default()
+            } else {
+                client_limits
+            },
             use_process_relay_anchor: false,
-            shm_threshold: Some(1024),
-            server_ipc_overrides: Some(ServerIpcConfigOverrides {
-                max_pending_requests: Some(32),
-                max_execution_workers: Some(workers),
-                ..Default::default()
-            }),
             ..Default::default()
         })
         .unwrap();
@@ -570,8 +796,6 @@ impl Fixture {
             let relay = RelayServer::start_with_context(
                 RelayConfig {
                     bind: "127.0.0.1:0".into(),
-                    idle_timeout_secs: 0,
-                    anti_entropy_interval: Duration::ZERO,
                     heartbeat_interval: Duration::ZERO,
                     ..Default::default()
                 },
@@ -583,20 +807,9 @@ impl Fixture {
         } else {
             None
         };
-        if max_calls.is_some() || budget_bytes.is_some() {
-            server
-                .set_call_execution_limits_with_sources(
-                    CallExecutionLimitsOverrides {
-                        max_outstanding_calls: max_calls,
-                        payload_buffer_budget_bytes: budget_bytes,
-                    },
-                    ConfigSources::empty(),
-                )
-                .unwrap();
-        }
         let client_runtime = if separate_client {
             let peer = Runtime::new(RuntimeOptions {
-                server_id: Some(unique("stream-peer")),
+                client_limits,
                 use_process_relay_anchor: false,
                 ..Default::default()
             })
@@ -625,13 +838,15 @@ impl Fixture {
         });
         let release = ContractRelease::from_descriptor_json(DESCRIPTOR).unwrap();
         let route_name = unique("stream-route");
-        let host = server
-            .host(if use_relay {
-                HostOptions::default()
-            } else {
-                HostOptions::default().without_relay()
-            })
-            .unwrap();
+        let options = HostOptions::default()
+            .with_max_execution_workers(workers)
+            .with_max_outstanding_calls(32);
+        let options = if use_relay {
+            options
+        } else {
+            options.without_relay()
+        };
+        let host = server.host(options).unwrap();
         let registration = host
             .register(
                 ServiceDefinition::new_stream(
@@ -670,7 +885,7 @@ impl Fixture {
             server,
             host,
             registration: Some(registration),
-            _client_runtime: client_runtime,
+            client_runtime,
             client,
             connection_events,
             probe,
@@ -681,6 +896,23 @@ impl Fixture {
             _endpoint_root: root,
             _relay: relay,
         }
+    }
+
+    fn client_memory_in_use(&self) -> u64 {
+        self.client_runtime
+            .memory_stats()
+            .client
+            .memory
+            .unwrap()
+            .used_bytes
+    }
+
+    fn client_operations_in_use(&self) -> u64 {
+        self.client_runtime
+            .call_execution_snapshot()
+            .client
+            .used_operations
+            .unwrap()
     }
 
     fn stream(&self, count: u8, mode: u8) -> CoreResponseStream {
@@ -700,7 +932,7 @@ impl Fixture {
         // A subsequent catalog lookup crosses the dispatcher's publication
         // lock, which shutdown retains until every stream has its cause.
         let error = self
-            ._client_runtime
+            .client_runtime
             .connect_with_options(
                 self.client.expected_route().clone(),
                 Connect::DirectIpc {
@@ -887,23 +1119,9 @@ fn application_question_mark_drops_a_stream_without_waiting_and_refunds_its_slot
         "application failed",
     );
     assert_eq!(fixture.finish_events.recv_timeout(WAIT).unwrap(), 4);
-    assert_eq!(
-        fixture
-            .server
-            .call_execution_snapshot()
-            .unwrap()
-            .used_operations,
-        1
-    );
+    assert_eq!(fixture.client_operations_in_use(), 1);
     fixture.probe.finish_gate.release();
-    observe_until(|| {
-        fixture
-            .server
-            .call_execution_snapshot()
-            .unwrap()
-            .used_operations
-            == 0
-    });
+    observe_until(|| fixture.client_operations_in_use() == 0);
     let mut recovered = fixture.stream(1, 0);
     drop(assert_item(&mut recovered, 1));
     assert!(recovered.next_item().unwrap().is_none());
@@ -983,7 +1201,7 @@ fn same_runtime_inline_item_larger_than_half_budget_does_not_wait_on_itself() {
     assert!(receipt.completed);
     assert!(receipt.terminal.unwrap().is_ok());
     assert_eq!(receipt.complete_items, Some(1));
-    assert_eq!(fixture.server.payload_buffer_stats().unwrap().used_bytes, 0);
+    assert_eq!(fixture.client_memory_in_use(), 0);
 }
 
 #[test]
@@ -1054,7 +1272,7 @@ fn shutdown_during_final_step_reports_its_cancellation_cause() {
 #[test]
 fn unregister_during_cleanup_does_not_rewrite_an_already_natural_end() {
     let mut fixture = Fixture::new(true, 2, ServiceConcurrencyMode::ReadParallel, None, None);
-    let mut stream = fixture.stream(0, 4);
+    let stream = fixture.stream(0, 4);
     assert_eq!(fixture.finish_events.recv_timeout(WAIT).unwrap(), 4);
     let mut registration = fixture.registration.take().unwrap();
     let route = registration.route_concurrency();
@@ -1072,7 +1290,7 @@ fn unregister_during_cleanup_does_not_rewrite_an_already_natural_end() {
 #[test]
 fn shutdown_during_cleanup_does_not_rewrite_an_already_natural_end() {
     let fixture = Fixture::new(true, 2, ServiceConcurrencyMode::ReadParallel, None, None);
-    let mut stream = fixture.stream(0, 4);
+    let stream = fixture.stream(0, 4);
     assert_eq!(fixture.finish_events.recv_timeout(WAIT).unwrap(), 4);
     let retirement = fixture
         .server
@@ -1108,25 +1326,13 @@ fn parked_streams_release_the_execution_worker_for_same_route_unary() {
             && fixture.probe.steps.load(Ordering::SeqCst) >= streams.len()
             && route.snapshot().active_workers == 0
             && route.snapshot().pending == streams.len()
-            && fixture
-                .server
-                .call_execution_snapshot()
-                .unwrap()
-                .used_operations
-                == streams.len() as u64
+            && fixture.client_operations_in_use() == streams.len() as u64
     });
     let short = fixture
         .client
         .with_call_options(CallOptions::with_timeout(CallTimeout::After(WAIT)));
     assert_eq!(short.call_owned("ping", b"").unwrap(), b"pong");
-    assert_eq!(
-        fixture
-            .server
-            .call_execution_snapshot()
-            .unwrap()
-            .used_operations,
-        6
-    );
+    assert_eq!(fixture.client_operations_in_use(), 6);
     for stream in streams.drain(..) {
         let receipt = stream.close_with_timeout(Some(WAIT));
         assert!(receipt.completed);
@@ -1143,7 +1349,7 @@ fn parked_streams_release_the_execution_worker_for_same_route_unary() {
 }
 
 #[test]
-fn one_runtime_budget_counts_receive_copy_and_multiple_client_holds() {
+fn client_domain_counts_receive_copy_and_multiple_stream_holds() {
     let fixture = Fixture::new(
         false,
         2,
@@ -1155,7 +1361,7 @@ fn one_runtime_budget_counts_receive_copy_and_multiple_client_holds() {
     assert_eq!(fixture.encoded_events.recv_timeout(WAIT).unwrap(), (5, 1));
     // The receiver owns the only four-byte B reservation. The gated encoder
     // writes one transport frame directly, with no whole-item Host copy.
-    observe_until(|| fixture.server.payload_buffer_stats().unwrap().used_bytes == 4);
+    observe_until(|| fixture.client_memory_in_use() == 4);
     assert_eq!(
         fixture
             .registration
@@ -1170,11 +1376,11 @@ fn one_runtime_budget_counts_receive_copy_and_multiple_client_holds() {
     let first = assert_item(&mut stream, 1);
     let second = assert_item(&mut stream, 2);
     assert_eq!(fixture.encoded_events.recv_timeout(WAIT).unwrap(), (5, 2));
-    observe_until(|| fixture.server.payload_buffer_stats().unwrap().used_bytes >= 8);
+    observe_until(|| fixture.client_memory_in_use() >= 8);
     // Two holds fill B. The next resource step may produce its domain item,
     // but no frame is encoded until the receiver can reserve the third item.
     observe_until(|| fixture.probe.steps.load(Ordering::SeqCst) >= 3);
-    observe_until(|| fixture.server.payload_buffer_stats().unwrap().used_bytes == 8);
+    observe_until(|| fixture.client_memory_in_use() == 8);
     assert!(fixture.encoded_events.try_recv().is_err());
     let (started, started_rx) = mpsc::channel();
     let (returned, returned_rx) = mpsc::channel();
@@ -1194,12 +1400,12 @@ fn one_runtime_budget_counts_receive_copy_and_multiple_client_holds() {
     assert_eq!(third.bytes(), &[3; 4]);
     drop(second);
     drop(third);
-    let mut stream = waiting.join().unwrap();
+    let stream = waiting.join().unwrap();
     assert!(stream.next_item().unwrap().is_none());
     let receipt = stream.close_with_timeout(Some(WAIT));
     assert!(receipt.completed);
     assert!(receipt.terminal.unwrap().is_ok());
-    observe_until(|| fixture.server.payload_buffer_stats().unwrap().used_bytes == 0);
+    observe_until(|| fixture.client_memory_in_use() == 0);
 }
 
 fn assert_unlimited_item(
@@ -1246,14 +1452,7 @@ fn unlimited_stream_uses_an_operation_slot_until_real_terminal() {
         diagnostics.stage("initial/recv1");
         drop(assert_unlimited_item(&fixture, &mut first, 1));
         diagnostics.stage("initial/slot");
-        assert_eq!(
-            fixture
-                .server
-                .call_execution_snapshot()
-                .unwrap()
-                .used_operations,
-            1
-        );
+        assert_eq!(fixture.client_operations_in_use(), 1);
         diagnostics.stage("refusal");
         let refusal = match fixture.client.begin_stream("echo") {
             Ok(_) => panic!("second unlimited stream must be refused before encoding"),
@@ -1272,14 +1471,7 @@ fn unlimited_stream_uses_an_operation_slot_until_real_terminal() {
             "consumer",
         );
         diagnostics.stage("refund/wait");
-        observe_until(|| {
-            fixture
-                .server
-                .call_execution_snapshot()
-                .unwrap()
-                .used_operations
-                == 0
-        });
+        observe_until(|| fixture.client_operations_in_use() == 0);
         diagnostics.stage("recovery/open");
         let mut recovered = fixture.stream(1, 0);
         diagnostics.stage("recovery/recv1");
@@ -1306,8 +1498,7 @@ fn shutdown_cleans_a_budget_waiter_but_receipt_waits_for_its_current_item() {
     let first = assert_item(&mut stream, 1);
     let second = assert_item(&mut stream, 2);
     observe_until(|| {
-        fixture.probe.steps.load(Ordering::SeqCst) == 3
-            && fixture.server.payload_buffer_stats().unwrap().used_bytes == 8
+        fixture.probe.steps.load(Ordering::SeqCst) == 3 && fixture.client_memory_in_use() == 8
     });
     let receipt = fixture
         .server
@@ -1368,14 +1559,7 @@ fn deadline_only_ends_waiting_and_the_original_stream_can_be_cancelled_later() {
     fixture.probe.step_gate.release();
     assert_eq!(fixture.encoded_events.recv_timeout(WAIT).unwrap(), (3, 1));
     assert_eq!(fixture.probe.finishes.load(Ordering::SeqCst), 0);
-    assert_eq!(
-        fixture
-            .server
-            .call_execution_snapshot()
-            .unwrap()
-            .used_operations,
-        1
-    );
+    assert_eq!(fixture.client_operations_in_use(), 1);
     let receipt = stream.close_with_timeout(Some(WAIT));
     assert!(receipt.completed);
     assert_semantic(
@@ -1536,7 +1720,6 @@ fn http_and_verified_relay_local_ipc_streams_share_core_facade() {
     assert!(stream.close().terminal.unwrap().is_ok());
 
     let unavailable = Runtime::new(RuntimeOptions {
-        server_id: Some(unique("unavailable-anchor-client")),
         relay_anchor_address: Some("http://127.0.0.1:9".into()),
         use_process_relay_anchor: false,
         ..Default::default()
@@ -1658,7 +1841,7 @@ fn explicit_http_multiple_holds_release_b_for_next_item() {
         .unwrap();
     let first = assert_item(&mut stream, 1);
     let second = assert_item(&mut stream, 2);
-    observe_until(|| fixture.server.payload_buffer_stats().unwrap().used_bytes == 8);
+    observe_until(|| fixture.client_memory_in_use() == 8);
     let (started, started_rx) = mpsc::channel();
     let (returned, returned_rx) = mpsc::channel();
     let waiting = std::thread::spawn(move || {
@@ -1683,7 +1866,7 @@ fn explicit_http_multiple_holds_release_b_for_next_item() {
     assert!(receipt.completed);
     assert_eq!(receipt.complete_items, Some(3));
     assert!(receipt.terminal.unwrap().is_ok());
-    observe_until(|| fixture.server.payload_buffer_stats().unwrap().used_bytes == 0);
+    observe_until(|| fixture.client_memory_in_use() == 0);
 }
 
 #[test]
@@ -1717,7 +1900,7 @@ fn explicit_http_close_keeps_cancelled_outcome_when_small_b_is_full() {
     for index in 0..=2 {
         assert_eq!(fixture.step_events.recv_timeout(WAIT).unwrap(), (6, index));
     }
-    assert_eq!(fixture.server.payload_buffer_stats().unwrap().used_bytes, 8);
+    assert_eq!(fixture.client_memory_in_use(), 8);
     assert!(!stream.close_with_timeout(Some(Duration::ZERO)).completed);
     fixture.probe.step_gate.release();
     let receipt = stream.close_with_timeout(Some(WAIT));

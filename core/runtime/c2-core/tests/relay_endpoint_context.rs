@@ -33,7 +33,6 @@ fn expected() -> c2_contract::ExpectedRouteContract {
 
 fn runtime(relay: Option<String>) -> Runtime {
     Runtime::new(RuntimeOptions {
-        server_id: Some("same-owner".into()),
         relay_anchor_address: relay,
         use_process_relay_anchor: false,
         ..Default::default()
@@ -295,8 +294,8 @@ fn http_only_child() {
     assert_eq!(client.observed_path(), ObservedPath::RelayAwareRelay);
     assert_http_call(&client, &fixture);
     assert!(!runtime.local_endpoint_frozen());
-    assert!(!runtime.client_config_frozen());
-    assert!(runtime.outgoing_memory_stats().is_none());
+    assert!(runtime.client_config_frozen());
+    assert!(runtime.memory_stats().client.memory.is_some());
     assert!(runtime.local_endpoint_context().is_err());
     assert!(
         fixture
@@ -422,8 +421,6 @@ mod unix {
         let mut relay = RelayServer::start_with_context(
             RelayConfig {
                 bind: "127.0.0.1:0".into(),
-                idle_timeout_secs: 0,
-                anti_entropy_interval: Duration::ZERO,
                 heartbeat_interval: Duration::ZERO,
                 ..Default::default()
             },
@@ -433,13 +430,19 @@ mod unix {
         let url = format!("http://{}", relay.local_addr());
         let owner_a = runtime(Some(url.clone()));
         at(&owner_a, &roots.a());
-        let host_a = owner_a.host(HostOptions::default()).unwrap();
+        let host_a = owner_a
+            .host(HostOptions::default().with_server_id("same-owner"))
+            .unwrap();
         let registration_a = host_a.register(definition(b'A')).unwrap();
         assert!(registration_a.outcome().relay_registered);
         let owner_b = runtime(None);
         at(&owner_b, &roots.b());
         let host_b = owner_b
-            .host(HostOptions::default().without_relay())
+            .host(
+                HostOptions::default()
+                    .with_server_id("same-owner")
+                    .without_relay(),
+            )
             .unwrap();
         let _registration_b = host_b.register(definition(b'B')).unwrap();
         assert_eq!(
@@ -552,7 +555,7 @@ mod unix {
             assert_eq!(client.observed_path(), ObservedPath::RelayAwareRelay);
             assert_http_call(&client, &fixture);
             assert!(!runtime.local_endpoint_frozen());
-            assert!(runtime.outgoing_memory_stats().is_none());
+            assert!(runtime.memory_stats().client.memory.is_some());
             assert!(
                 fixture
                     .state
@@ -591,8 +594,8 @@ mod unix {
             runtime.local_endpoint_context().unwrap().unix_root(),
             Some(roots.b().as_path())
         );
-        assert!(!runtime.client_config_frozen());
-        assert!(runtime.outgoing_memory_stats().is_none());
+        assert!(runtime.client_config_frozen());
+        assert!(runtime.memory_stats().client.memory.is_some());
         assert!(
             fixture
                 .state
@@ -607,7 +610,13 @@ mod unix {
         assert!(!runtime.local_endpoint_frozen());
         let owner = super::runtime(None);
         at(&owner, &roots.c());
-        let host = owner.host(HostOptions::default().without_relay()).unwrap();
+        let host = owner
+            .host(
+                HostOptions::default()
+                    .with_server_id("same-owner")
+                    .without_relay(),
+            )
+            .unwrap();
         let _registration = host.register(definition(b'C')).unwrap();
         let local = runtime
             .connect(
@@ -742,8 +751,8 @@ mod unix {
             runtime.local_endpoint_context().unwrap().unix_root(),
             Some(root_b.as_path())
         );
-        assert!(runtime.outgoing_memory_stats().is_none());
-        assert!(!runtime.client_config_frozen());
+        assert!(runtime.memory_stats().client.memory.is_some());
+        assert!(runtime.client_config_frozen());
         assert!(
             fixture
                 .state
@@ -761,7 +770,7 @@ mod unix {
         let current = runtime.local_endpoint_context().unwrap();
         assert_eq!(current.unix_root(), Some(root_c.as_path()));
         assert!(!runtime.local_endpoint_frozen());
-        // A real failed local connection attempt still fixes the selected domain.
+        // A real failed local connection attempt still fixes the endpoint context.
         assert!(matches!(
             runtime.connect(
                 expected(),
@@ -806,7 +815,9 @@ mod unix {
         let discovered = runtime.connect(expected(), Connect::RelayAware).unwrap();
         assert_http_call(&discovered, &fixture);
         assert!(!runtime.local_endpoint_frozen());
-        let host = runtime.host(HostOptions::default()).unwrap();
+        let host = runtime
+            .host(HostOptions::default().with_server_id("same-owner"))
+            .unwrap();
         let namespace = host.local_endpoint_context().namespace_id().to_owned();
         let explicit = runtime
             .connect(

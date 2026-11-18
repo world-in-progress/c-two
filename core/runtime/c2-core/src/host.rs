@@ -134,7 +134,17 @@ impl From<SchedulerSnapshot> for RouteConcurrencySnapshot {
 pub enum RouteConcurrencyError {
     Closed,
     Unavailable,
-    Capacity { field: &'static str, limit: usize },
+    Capacity {
+        field: &'static str,
+        limit: usize,
+    },
+    /// The owning Host's server domain has no free operation slot (or its
+    /// memory budget is zero): the same-process direct call never entered the
+    /// resource method. `limit` is the domain's outstanding-call bound.
+    DomainAdmission {
+        limit: u64,
+        used: u64,
+    },
 }
 
 impl fmt::Display for RouteConcurrencyError {
@@ -148,6 +158,10 @@ impl fmt::Display for RouteConcurrencyError {
                     "route concurrency capacity exceeded: {field}={limit}"
                 )
             }
+            Self::DomainAdmission { limit, used } => write!(
+                formatter,
+                "server domain call admission refused: {used} of {limit} slots in use"
+            ),
         }
     }
 }
@@ -169,6 +183,10 @@ impl From<SchedulerAcquireError> for RouteConcurrencyError {
 pub struct RouteConcurrency {
     inner: RouteConcurrencyHandle,
     method_modes: Arc<[MethodMode]>,
+    /// The owning Host's server domain. Every same-process direct call admits
+    /// through one of its operation slots exactly like a remote call, without
+    /// touching the client domain.
+    server_budget: c2_mem::DomainBudget,
 }
 
 impl fmt::Debug for RouteConcurrency {
@@ -185,14 +203,27 @@ impl RouteConcurrency {
         self.inner.snapshot().into()
     }
 
+    /// Reserve one server-domain operation slot immediately, then the route's
+    /// own scheduler admission. The slot is granted or refused on the spot;
+    /// the direct call holds it until its guard drops (the call returns).
+    fn reserve_direct_slot(&self) -> Result<c2_mem::OperationPermit, RouteConcurrencyError> {
+        self.server_budget.reserve_operation().map_err(|error| {
+            RouteConcurrencyError::DomainAdmission {
+                limit: error.max_operations,
+                used: error.used_operations,
+            }
+        })
+    }
+
     pub fn blocking_acquire(
         &self,
         method_index: u16,
     ) -> Result<RouteConcurrencyGuard, RouteConcurrencyError> {
-        self.inner
-            .blocking_acquire(method_index)
-            .map(|inner| RouteConcurrencyGuard { inner })
-            .map_err(RouteConcurrencyError::from)
+        let _permit = self.reserve_direct_slot()?;
+        match self.inner.blocking_acquire(method_index) {
+            Ok(inner) => Ok(RouteConcurrencyGuard { inner, _permit }),
+            Err(error) => Err(RouteConcurrencyError::from(error)),
+        }
     }
 
     pub fn is_unconstrained(&self) -> bool {
@@ -217,6 +248,7 @@ impl RouteConcurrency {
             )
             .into());
         }
+        let permit = self.reserve_direct_slot().map_err(C2Error::from)?;
         let call = self
             .inner
             .begin_local_stream_call(method_index)
@@ -224,9 +256,36 @@ impl RouteConcurrency {
         CoreLocalResponseStream::open(
             call,
             factory,
+            permit,
             #[cfg(test)]
             None,
         )
+    }
+}
+
+/// The server domain refused a same-process direct call before the resource
+/// method ran: canonical 717 with the call-execution admission stage.
+impl From<RouteConcurrencyError> for C2Error {
+    fn from(error: RouteConcurrencyError) -> Self {
+        match error {
+            RouteConcurrencyError::DomainAdmission { limit, used } => C2Error::new(
+                c2_error::ErrorCode::CallCapacityExceeded,
+                format!("server domain call admission refused: {used} of {limit} slots in use"),
+            )
+            .with_details(std::collections::BTreeMap::from([
+                ("stage".to_string(), "call_execution_admission".to_string()),
+                ("dispatch_phase".to_string(), "pre_dispatch".to_string()),
+            ])),
+            RouteConcurrencyError::Closed => {
+                local_stream_scheduler_error(SchedulerAcquireError::Closed)
+            }
+            RouteConcurrencyError::Unavailable => {
+                local_stream_scheduler_error(SchedulerAcquireError::Unavailable)
+            }
+            RouteConcurrencyError::Capacity { field, limit } => {
+                local_stream_scheduler_error(SchedulerAcquireError::Capacity { field, limit })
+            }
+        }
     }
 }
 
@@ -254,6 +313,8 @@ pub(crate) fn local_stream_scheduler_error(error: SchedulerAcquireError) -> C2Er
 
 pub struct RouteConcurrencyGuard {
     inner: SchedulerGuard,
+    /// The direct call's server-domain slot, held until this guard drops.
+    _permit: c2_mem::OperationPermit,
 }
 
 impl RouteConcurrencyGuard {
@@ -610,21 +671,24 @@ fn method_contract_error(path: &str, message: String) -> Error {
     .into()
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 enum RelaySelection {
+    #[default]
     Inherit,
     Disabled,
     Explicit(String),
 }
 
-/// Core host lifecycle options that do not expose transport implementation
-/// types.
-#[derive(Debug, Clone)]
+/// Core host lifecycle options: the complete Host identity, start/stop
+/// budgets, carrying capacity and server-domain limits, plus relay selection.
+/// The server fields are a tri-state patch over the Runtime's accepted server
+/// overrides; every field defaults to `Keep`.
+#[derive(Debug, Clone, Default)]
 pub struct HostOptions {
+    pub server: c2_config::ServerConfigPatch,
     relay: RelaySelection,
     relay_use_proxy: Option<bool>,
-    startup_timeout: Option<Duration>,
-    shutdown_timeout: Duration,
+    shutdown_timeout: Option<Duration>,
     #[cfg(test)]
     startup_gate: Option<Arc<StartupGateForTest>>,
 }
@@ -637,19 +701,6 @@ struct StartupGateForTest {
     thread_join: Option<std::sync::mpsc::SyncSender<std::thread::JoinHandle<()>>>,
     fail_spawn: bool,
     fail_wait_runtime: bool,
-}
-
-impl Default for HostOptions {
-    fn default() -> Self {
-        Self {
-            relay: RelaySelection::Inherit,
-            relay_use_proxy: None,
-            startup_timeout: None,
-            shutdown_timeout: Duration::from_secs(5),
-            #[cfg(test)]
-            startup_gate: None,
-        }
-    }
 }
 
 impl HostOptions {
@@ -668,17 +719,99 @@ impl HostOptions {
         self
     }
 
-    /// Override this Host's startup wait budget. Otherwise inherit Runtime
-    /// configuration, falling back to a finite five-second default.
+    /// Explicit server identity for this Host and every later start of the
+    /// same frozen server role.
+    pub fn with_server_id(mut self, server_id: impl Into<String>) -> Self {
+        self.server.server_id = c2_config::ConfigField::Set(server_id.into());
+        self
+    }
+
+    /// Override this Host's startup wait budget. Otherwise the accepted
+    /// server overrides apply, falling back to a finite five-second default.
     /// Native cleanup after expiry retains its separate shutdown budget.
     pub fn with_startup_timeout(mut self, timeout: Duration) -> Self {
-        self.startup_timeout = Some(timeout);
+        self.server.startup_timeout = c2_config::ConfigField::Set(timeout);
+        self
+    }
+
+    /// Override the Host's single-message carrying bound.
+    pub fn with_max_payload_size(mut self, max_payload_size: u64) -> Self {
+        self.server.max_payload_size = c2_config::ConfigField::Set(max_payload_size);
+        self
+    }
+
+    /// Override the Host's execution worker bound.
+    pub fn with_max_execution_workers(mut self, max_execution_workers: u32) -> Self {
+        self.server.max_execution_workers = c2_config::ConfigField::Set(max_execution_workers);
+        self
+    }
+
+    /// Override the server domain's memory budget.
+    pub fn with_memory_budget_bytes(mut self, bytes: u64) -> Self {
+        self.server.domain_limits.memory_budget_bytes = c2_config::ConfigField::Set(bytes);
+        self
+    }
+
+    /// Override the server domain's file-spill budget.
+    pub fn with_file_spill_budget_bytes(mut self, bytes: u64) -> Self {
+        self.server.domain_limits.file_spill_budget_bytes = c2_config::ConfigField::Set(bytes);
+        self
+    }
+
+    /// Override the server domain's outstanding-call bound.
+    pub fn with_max_outstanding_calls(mut self, calls: u64) -> Self {
+        self.server.domain_limits.max_outstanding_calls = c2_config::ConfigField::Set(calls);
         self
     }
 
     pub fn with_shutdown_timeout(mut self, timeout: Duration) -> Self {
-        self.shutdown_timeout = timeout;
+        self.shutdown_timeout = Some(timeout);
         self
+    }
+
+    pub(crate) fn resolve_settings(
+        &self,
+        catalog: &c2_config::EnvCatalog,
+        frozen: Option<&crate::roles::HostSettings>,
+        inherited_anchor: impl FnOnce() -> Result<Option<String>, LifecycleError>,
+    ) -> Result<crate::roles::HostSettings, LifecycleError> {
+        let relay_anchor_address = match &self.relay {
+            RelaySelection::Inherit => match frozen {
+                Some(settings) => settings.relay_anchor_address.clone(),
+                None => inherited_anchor()?,
+            },
+            RelaySelection::Disabled => None,
+            RelaySelection::Explicit(address) => {
+                Some(crate::session::canonical_relay_anchor_address(address))
+            }
+        };
+        if relay_anchor_address
+            .as_deref()
+            .is_some_and(|anchor| !c2_http::valid_relay_url(anchor))
+        {
+            return Err(LifecycleError::Relay("invalid HTTP relay base URL".into()));
+        }
+        let relay_use_proxy = match (self.relay_use_proxy, frozen) {
+            (_, _) if relay_anchor_address.is_none() => false,
+            (Some(use_proxy), _) => use_proxy,
+            (None, Some(settings)) => settings.relay_use_proxy,
+            (None, None) => {
+                c2_config::ConfigResolver::resolve_relay_client(None, catalog)
+                    .map_err(|error| LifecycleError::Configuration(error.to_string()))?
+                    .use_proxy
+            }
+        };
+        let shutdown_timeout = self
+            .shutdown_timeout
+            .or_else(|| frozen.map(|settings| settings.shutdown_timeout))
+            .unwrap_or(Duration::from_secs(5));
+        c2_config::deadline_after(Instant::now(), shutdown_timeout)
+            .map_err(|error| LifecycleError::Configuration(error.to_string()))?;
+        Ok(crate::roles::HostSettings {
+            relay_anchor_address,
+            relay_use_proxy,
+            shutdown_timeout,
+        })
     }
 }
 
@@ -698,9 +831,12 @@ impl fmt::Debug for Host {
     }
 }
 
-struct HostInner {
+pub(crate) struct HostInner {
     runtime: Runtime,
     server: Arc<Server>,
+    /// The Runtime's server role domain; same-process direct calls admit
+    /// through its operation slots exactly like remote calls.
+    domain_budget: c2_mem::DomainBudget,
     relay_anchor_address: Option<String>,
     relay_use_proxy: bool,
     shutdown_timeout: Duration,
@@ -859,6 +995,14 @@ impl Drop for HostInner {
 }
 
 impl Host {
+    pub(crate) fn inner(&self) -> &Arc<HostInner> {
+        &self.inner
+    }
+
+    pub(crate) fn from_inner(inner: Arc<HostInner>) -> Self {
+        Self { inner }
+    }
+
     pub(crate) fn belongs_to(&self, runtime: &Runtime) -> bool {
         self.inner.runtime.same_instance(runtime)
     }
@@ -901,30 +1045,26 @@ impl Host {
         self.local_endpoint().context()
     }
 
-    /// Read-only memory statistics for this host and its Runtime.
-    ///
-    /// Composes the Runtime's outgoing client domain with the Core host's
-    /// server direction (response pool, reassembly pool, and response
-    /// prewarm). Observation never connects, maps memory, freezes
-    /// configuration, or resets accounting. In-flight transport charges follow
-    /// actual backing lifetime; local holds do not retain this backing.
+    /// Symmetric read-only memory statistics for this host and its Runtime:
+    /// both role domains, retired roles and local holds. Observation never
+    /// connects, maps memory, reads the environment, freezes configuration,
+    /// or resets accounting.
     pub fn memory_stats(&self) -> crate::RuntimeMemoryStats {
-        crate::RuntimeMemoryStats {
-            runtime_outgoing: self.inner.runtime.outgoing_memory_stats(),
-            server: Some(crate::MemoryScopeStats::from_server(
-                self.inner.server.memory_budget_snapshot(),
-            )),
-            payload_buffer: self.inner.runtime.payload_buffer_stats(),
-        }
+        self.inner.runtime.memory_stats()
     }
 
-    /// Read-only observer of this host's server-direction budget.
+    /// Symmetric read-only call-admission snapshot of both role domains.
+    pub fn call_execution_snapshot(&self) -> crate::memory::RuntimeCallExecutionStats {
+        self.inner.runtime.call_execution_snapshot()
+    }
+
+    /// Read-only observer of this host's server-domain accounting.
     ///
-    /// The handle shares only the server accounting counters and resolved
-    /// limits, so a stopped host keeps retained response/reassembly charges
-    /// observable without retaining the Server, its pools, or its callbacks.
-    pub fn server_memory_observer(&self) -> c2_mem::BudgetObserver {
-        self.inner.server.memory_budget_observer()
+    /// The handle shares only the domain counters, so a stopped host keeps
+    /// retained response/reassembly charges observable without retaining the
+    /// Server, its pools, or its callbacks.
+    pub fn server_memory_observer(&self) -> Option<c2_mem::DomainObserver> {
+        self.inner.runtime.server_domain_observer()
     }
 
     pub fn register(&self, definition: ServiceDefinition) -> Result<Registration, Error> {
@@ -965,6 +1105,7 @@ impl Host {
                 .stream_modes
                 .clone()
                 .unwrap_or_else(|| vec![MethodMode::Unary; definition.methods.len()].into()),
+            server_budget: self.inner.domain_budget.clone(),
         };
         let outcome = self.inner.runtime.register_route(
             &self.inner.server,
@@ -1092,39 +1233,79 @@ impl Runtime {
 
     /// Start one Host and deliver that attempt's native cleanup receipt if
     /// startup fails after the concrete HostInner has been constructed.
+    ///
+    /// The Runtime's single Host slot merges concurrent same-configuration
+    /// starts onto one Host, refuses a different effective configuration as
+    /// `ConfigFrozen`, and refuses any restart while the previous close
+    /// transaction has not reached its real terminal outcome. A restart after
+    /// a complete stop reuses the activated server-domain budget — advancing
+    /// its generation and keeping real in-flight accounting — and mints a
+    /// fresh `server_instance_id`.
     pub fn host_with_failed_start_receipt(
         &self,
         options: HostOptions,
         on_failed_start: impl FnOnce(FailedStartShutdownReceipt),
     ) -> Result<Host, Error> {
-        c2_config::deadline_after(Instant::now(), options.shutdown_timeout)
-            .map_err(|error| LifecycleError::Configuration(error.to_string()))?;
-        let startup_timeout = self.freeze_host_options(options.startup_timeout)?;
+        let (result, receipt) = match self.begin_host_start(&options)? {
+            crate::session::HostAdmission::Shared(host) => return Ok(host),
+            crate::session::HostAdmission::Starting(attempt) => attempt.wait(),
+            crate::session::HostAdmission::Granted(admission, attempt) => {
+                let mut receipt = None;
+                let result = self.start_admitted_host(
+                    admission,
+                    #[cfg(test)]
+                    &options,
+                    &mut receipt,
+                );
+                self.complete_host_start(&attempt, result.clone(), receipt.clone());
+                (result, receipt)
+            }
+        };
+        if let Some(receipt) = receipt {
+            on_failed_start(receipt);
+        }
+        result.map_err(Error::from)
+    }
+
+    fn start_admitted_host(
+        &self,
+        admission: crate::session::HostStart,
+        #[cfg(test)] options: &HostOptions,
+        failed_receipt: &mut Option<FailedStartShutdownReceipt>,
+    ) -> Result<Host, LifecycleError> {
+        let startup_timeout = admission.startup_timeout;
         let startup_deadline = c2_config::deadline_after(Instant::now(), startup_timeout)
             .map_err(|error| LifecycleError::Configuration(error.to_string()))?;
-        let identity = self.ensure_server()?;
-        let config = self.server_ipc_config()?;
-        let relay_anchor_address = match options.relay {
-            RelaySelection::Inherit => self.effective_relay_anchor_address()?,
-            RelaySelection::Disabled => None,
-            RelaySelection::Explicit(address) => Some(address),
-        };
-        let relay_use_proxy = match options.relay_use_proxy {
-            Some(use_proxy) => use_proxy,
-            None if relay_anchor_address.is_some() => self.relay_use_proxy()?,
-            None => false,
-        };
+        let identity = admission.identity;
+        let config = admission.ipc;
+        let budget = admission.budget.clone();
+        let crate::roles::HostSettings {
+            relay_anchor_address,
+            relay_use_proxy,
+            shutdown_timeout,
+        } = admission.settings;
         let endpoint = self
-            .freeze_local_endpoint_context()?
+            .freeze_host_endpoint_context(
+                admission
+                    .endpoint_catalog
+                    .as_ref()
+                    .map(|(revision, catalog)| (*revision, catalog)),
+            )?
             .endpoint(&identity.ipc_address)
             .map_err(|error| LifecycleError::Configuration(error.to_string()))?;
         let server_identity = ServerIdentity {
             server_id: identity.server_id,
             server_instance_id: identity.server_instance_id,
         };
-        let server =
-            Server::new_with_identity_and_endpoint(endpoint, config.clone(), server_identity)
-                .map_err(LifecycleError::from)?;
+        // The Runtime's one server-domain budget backs this Host; a restart
+        // passes the retained budget so in-flight accounting survives.
+        let server = Server::new_with_identity_endpoint_and_budget(
+            endpoint,
+            config.clone(),
+            server_identity,
+            budget,
+        )
+        .map_err(LifecycleError::from)?;
         let lifecycle = crate::lifecycle::HostLifecycleCell::new();
         let server = Arc::new(server.with_connection_event_source(self.connection_event_source()));
         let server_runtime = ServerRuntimeBuilder::build(&config)
@@ -1134,9 +1315,10 @@ impl Runtime {
         let inner = Arc::new(HostInner {
             runtime: self.clone(),
             server: Arc::clone(&server),
+            domain_budget: admission.budget,
             relay_anchor_address,
             relay_use_proxy,
-            shutdown_timeout: options.shutdown_timeout,
+            shutdown_timeout,
             route_names: Mutex::new(HashSet::new()),
             thread: Mutex::new(None),
             shutdown_outcome: Mutex::new(None),
@@ -1180,8 +1362,10 @@ impl Runtime {
                 // Let the original HostInner Drop run its Core shutdown after
                 // the transaction is available for independent observation.
                 server.finalize_runtime_stopped();
-                on_failed_start(inner.begin_failed_start_shutdown());
-                return Err(LifecycleError::Server(ServerFailure::new(error.to_string())).into());
+                *failed_receipt = Some(inner.begin_failed_start_shutdown());
+                return Err(LifecycleError::Server(ServerFailure::new(
+                    error.to_string(),
+                )));
             }
         };
         #[cfg(test)]
@@ -1218,8 +1402,8 @@ impl Runtime {
                 // The host thread may already own the accept loop. Signal its
                 // existing shutdown path before returning the startup error.
                 server.request_shutdown_signal_with_reason("shutdown");
-                on_failed_start(inner.begin_failed_start_shutdown());
-                return Err(error.into());
+                *failed_receipt = Some(inner.begin_failed_start_shutdown());
+                return Err(error);
             }
         };
         if let Err(mut error) = wait_runtime.block_on(
@@ -1234,8 +1418,8 @@ impl Runtime {
                     let _ = thread.join();
                 }
             }
-            on_failed_start(inner.begin_failed_start_shutdown());
-            return Err(LifecycleError::from(error).into());
+            *failed_receipt = Some(inner.begin_failed_start_shutdown());
+            return Err(LifecycleError::from(error));
         }
 
         Ok(Host { inner })
@@ -1362,6 +1546,7 @@ impl CrmStreamItem for CoreStreamItem {
 #[cfg(test)]
 mod lifecycle_tests {
     use super::*;
+    use c2_config::{ConfigField, ServerConfigPatch};
     use tokio::io::AsyncReadExt;
 
     fn cancel_local_stream_before_first_commit(shutdown: bool) {
@@ -1423,6 +1608,11 @@ mod lifecycle_tests {
                 invoked.fetch_add(1, Ordering::SeqCst);
                 unreachable!("cancellation before commit must prevent factory entry")
             },
+            host.inner
+                .server
+                .domain_budget()
+                .reserve_operation()
+                .unwrap(),
             Some((entered, blocked)),
         )
         .unwrap();
@@ -1520,20 +1710,11 @@ mod lifecycle_tests {
 
     fn small_shm_host(runtime: &Runtime) -> Host {
         runtime
-            .set_server_options(
-                None,
-                Some(c2_config::ServerIpcConfigOverrides {
-                    pool_segment_size: Some(64 * 1024),
-                    max_pool_segments: Some(1),
-                    pool_prewarm_segments: Some(1),
-                    pool_decay_seconds: Some(60.0),
-                    ..Default::default()
-                }),
-                None,
+            .host(
+                HostOptions::default()
+                    .without_relay()
+                    .with_memory_budget_bytes(256 * 1024),
             )
-            .unwrap();
-        runtime
-            .host(HostOptions::default().without_relay())
             .unwrap()
     }
 
@@ -1608,7 +1789,7 @@ mod lifecycle_tests {
             std::thread::yield_now();
         }
         let before = response_pool.read().stats();
-        assert!(before.buddy_reused_allocs > 0, "test must exercise SHM");
+        assert!(before.buddy_expanded_allocs > 0, "test must exercise SHM");
         let second = vec![0x6b; 32 * 1024];
         assert_eq!(client.call_owned("echo", &second).unwrap(), second);
         assert!(response_pool.read().stats().buddy_reused_allocs > before.buddy_reused_allocs);
@@ -1648,30 +1829,64 @@ mod lifecycle_tests {
     }
 
     #[test]
-    fn host_executor_settles_loans_after_the_business_shutdown_receipt() {
-        use c2_wire::{flags::*, frame::encode_frame};
+    fn host_restart_retains_response_loan_in_the_server_domain_until_release() {
+        use crate::Connect;
+        use c2_ipc::{IpcClient, IpcError};
+        use c2_wire::flags::FLAG_HANDSHAKE;
+        use c2_wire::frame::{decode_frame, encode_frame};
+        use c2_wire::handshake::{
+            CAP_SHM_RESPONSE, VersionPreambleKind, decode_handshake, encode_client_handshake,
+            encode_version_preamble,
+        };
+        use c2_wire::release::{ReleaseBatch, encode_release_frame};
+        use c2_wire::rpc::{
+            self, CallMode, CallStatus, RouteCallIdentity, RpcRecord, ValuePart, ValueStorage,
+        };
+
+        const WAIT: Duration = Duration::from_secs(5);
         let (runtime, root) = receipt_test_runtime();
-        let host = small_shm_host(&runtime);
+        let options = HostOptions::default()
+            .without_relay()
+            .with_memory_budget_bytes(64 * 1024);
+        let first = runtime.host(options.clone()).unwrap();
         let definition = local_echo_definition();
         let expected = definition.expected_route().clone();
-        let registration = host.register(definition).unwrap();
-        let rt = Runtime::server_runtime().unwrap();
-        let mut peer = rt
-            .block_on(c2_local::LocalStream::connect(
-                host.local_endpoint(),
-                Duration::from_secs(5),
-            ))
+        let registration = first.register(definition).unwrap();
+
+        // Keep a real prepared outgoing request charged to the same Runtime.
+        // It is not dispatched, so it cannot account for the server's charge.
+        let outgoing = runtime
+            .connect(
+                expected.clone(),
+                Connect::DirectIpc {
+                    address: first.local_endpoint().address().into(),
+                },
+            )
             .unwrap();
-        let response = rt.block_on(async {
-            use c2_wire::handshake::{
-                CAP_SHM_RESPONSE, VersionPreambleKind, encode_client_handshake,
-                encode_version_preamble,
-            };
+        let outgoing_bytes = vec![0x3c; 64];
+        let prepared = outgoing
+            .begin_call("echo")
+            .unwrap()
+            .encode_vec(outgoing_bytes)
+            .unwrap();
+        let client_before = runtime.memory_stats().client;
+        let client_operations = runtime.call_execution_snapshot().client;
+        assert_eq!(client_before.memory.unwrap().used_bytes, 64);
+        assert_eq!(client_operations.used_operations, Some(1));
+
+        let rt = Runtime::server_runtime().unwrap();
+        // Unary IpcClient calls copy and release before returning. Keep the
+        // actual wire loan on a raw peer so it can outlive Host shutdown.
+        let mut peer = rt
+            .block_on(c2_local::LocalStream::connect(first.local_endpoint(), WAIT))
+            .unwrap();
+        let bytes = vec![0x5a; 48 * 1024];
+        let (pool_prefix, response) = rt.block_on(async {
             peer.write_all(&encode_version_preamble(VersionPreambleKind::Hello))
                 .await
                 .unwrap();
             let mut accepted = [0; 25];
-            tokio::time::timeout(Duration::from_secs(5), peer.read_exact(&mut accepted))
+            tokio::time::timeout(WAIT, peer.read_exact(&mut accepted))
                 .await
                 .unwrap()
                 .unwrap();
@@ -1686,85 +1901,153 @@ mod lifecycle_tests {
             ))
             .await
             .unwrap();
-            read_raw_frame(&mut peer).await;
-            let identity = c2_wire::rpc::RouteCallIdentity {
-                route_name: expected.route_name,
-                crm_ns: expected.crm_ns,
-                crm_name: expected.crm_name,
-                crm_ver: expected.crm_ver,
-                abi_hash: expected.abi_hash,
-                signature_hash: expected.signature_hash,
+            let ack = read_raw_frame(&mut peer).await;
+            let (header, payload) = decode_frame(&ack).unwrap();
+            assert!(header.is_handshake());
+            let handshake = decode_handshake(payload, true).unwrap();
+            assert_ne!(handshake.capability_flags & CAP_SHM_RESPONSE, 0);
+            let identity = RouteCallIdentity {
+                route_name: expected.route_name.clone(),
+                crm_ns: expected.crm_ns.clone(),
+                crm_name: expected.crm_name.clone(),
+                crm_ver: expected.crm_ver.clone(),
+                abi_hash: expected.abi_hash.clone(),
+                signature_hash: expected.signature_hash.clone(),
             };
-            let call = c2_wire::rpc::encode_open_frame(
+            let call = rpc::encode_open_frame(
                 1,
                 &identity,
                 1,
-                c2_wire::rpc::CallMode::Unary,
-                c2_wire::rpc::ValuePart::whole(c2_wire::rpc::ValueStorage::Inline(&vec![
-                    0x5a;
-                    32 * 1024
-                ])),
+                CallMode::Unary,
+                ValuePart::whole(ValueStorage::Inline(&bytes)),
             )
             .unwrap();
             peer.write_all(&call).await.unwrap();
-            read_raw_frame(&mut peer).await
+            (handshake.prefix, read_raw_frame(&mut peer).await)
         });
-        let (header, payload) = c2_wire::frame::decode_frame(&response).unwrap();
-        assert!(
-            header.is_buddy(),
-            "test must retain an actual response loan"
-        );
-        let c2_wire::rpc::RpcRecord::CallEnd {
+        let (header, payload) = decode_frame(&response).unwrap();
+        let RpcRecord::CallEnd {
+            status: CallStatus::Success,
             value:
-                c2_wire::rpc::ValuePart {
-                    storage: c2_wire::rpc::ValueStorage::Shm(descriptor),
+                ValuePart {
+                    storage: ValueStorage::Shm(loan),
                     ..
                 },
             ..
-        } = c2_wire::rpc::decode_rpc_record(&header, payload, Some(c2_wire::rpc::CallMode::Unary))
-            .unwrap()
+        } = rpc::decode_rpc_record(&header, payload, Some(CallMode::Unary)).unwrap()
         else {
-            panic!("expected whole SHM CALL_END");
+            panic!("expected a SHM response loan");
         };
-        assert_eq!(
-            host.inner
-                .server
-                .response_pool_arc()
-                .read()
-                .stats()
-                .alloc_count,
-            1
-        );
-        let outcome = host.shutdown();
+        // A dedicated backing refunds on release while the original Host and
+        // pool are still alive.
+        assert!(loan.is_dedicated);
+        let first_pool = first.inner.server.response_pool_arc();
+        let loan_stats = first_pool.read().stats();
+        assert_eq!(loan_stats.alloc_count, 1);
+        let server_before = runtime.memory_stats().server;
+        let memory_before = server_before.memory.unwrap().used_bytes;
+        assert_eq!(memory_before, loan_stats.dedicated_active_bytes);
+        assert!(memory_before >= bytes.len() as u64);
+        assert_ne!(server_before.domain_id, client_before.domain_id);
+
+        let outcome = first.shutdown();
         assert!(outcome.runtime_barrier_error.is_none(), "{outcome:?}");
-        assert!(host.lifecycle_snapshot().finished);
-        assert!(!host.inner.thread.lock().as_ref().unwrap().is_finished());
-        assert_eq!(host.inner.server.active_connection_count(), 1);
+        assert!(first.lifecycle_snapshot().finished);
+        assert!(!first.inner.thread.lock().as_ref().unwrap().is_finished());
+        assert_eq!(first_pool.read().stats().alloc_count, 1);
+        assert_eq!(runtime.memory_stats().server, server_before);
+
+        let second = runtime.host(options).unwrap();
+        assert!(second.is_running());
+        assert_eq!(first.local_endpoint(), second.local_endpoint());
+        assert_ne!(
+            first.inner.server.server_instance_id(),
+            second.inner.server.server_instance_id(),
+        );
+        let restarted = runtime.memory_stats();
+        assert_eq!(restarted.server.domain_id, server_before.domain_id);
+        assert_eq!(restarted.server.generation, server_before.generation + 1);
+        assert_eq!(restarted.server.memory.unwrap().used_bytes, memory_before);
+        assert_eq!(restarted.client, client_before);
+        assert_eq!(runtime.call_execution_snapshot().client, client_operations);
+
+        let second_registration = second.register(local_echo_definition()).unwrap();
+        let mut new_peer = IpcClient::with_endpoint(second.local_endpoint().clone()).unwrap();
+        let probe = vec![0x3c; 24 * 1024];
+        let binding = rt.block_on(async {
+            tokio::time::timeout(WAIT, async {
+                new_peer.connect().await.unwrap();
+                let binding = new_peer.acquire_route(&expected).await.unwrap();
+                let error = new_peer
+                    .call_bound(&binding, "echo", &probe)
+                    .await
+                    .unwrap_err();
+                let IpcError::CallRejected(error) = error else {
+                    panic!("expected an admission refusal from the new Host, got {error}");
+                };
+                assert_eq!(error.code, c2_error::ErrorCode::ResourceUnavailable);
+                assert_eq!(error.details["stage"], "call_input_admission");
+                binding
+            })
+            .await
+            .unwrap()
+        });
+
+        let mappings =
+            c2_mem::PeerMappingCache::new(c2_config::PoolConfig::default(), pool_prefix).unwrap();
+        let read = mappings
+            .admit(
+                loan.seg_idx,
+                loan.generation,
+                loan.offset,
+                loan.data_size,
+                loan.is_dedicated,
+            )
+            .unwrap();
+        // SAFETY: this reader is pinned and the original peer has not
+        // signalled RELEASE or disconnected.
+        assert_eq!(unsafe { read.copy() }.unwrap(), bytes);
+        drop(read);
         rt.block_on(async {
-            let batch = c2_wire::release::ReleaseBatch::new(&[descriptor.loan_id]).unwrap();
-            peer.write_all(&c2_wire::release::encode_release_frame(&batch, false))
+            let batch = ReleaseBatch::new(&[loan.loan_id]).unwrap();
+            peer.write_all(&encode_release_frame(&batch, false))
                 .await
                 .unwrap();
-            tokio::time::timeout(
-                Duration::from_secs(5),
-                host.inner.server.wait_connections_settled(),
-            )
-            .await
-            .unwrap();
+            tokio::time::timeout(WAIT, first.inner.server.wait_connections_settled())
+                .await
+                .unwrap();
         });
-        let thread = host.inner.thread.lock().take().unwrap();
-        thread.join().unwrap();
+        first.inner.thread.lock().take().unwrap().join().unwrap();
+        assert_eq!(first_pool.read().stats().alloc_count, 0);
+        assert_eq!(runtime.memory_stats().server.memory.unwrap().used_bytes, 0);
+        assert_eq!(runtime.memory_stats().client, client_before);
+        assert_eq!(first.shutdown_outcome(), Some(outcome));
+
+        let response = rt.block_on(async {
+            tokio::time::timeout(WAIT, new_peer.call_bound(&binding, "echo", &probe))
+                .await
+                .unwrap()
+                .unwrap()
+        });
+        assert_eq!(response.into_owned_bytes().unwrap(), probe);
+        drop(prepared);
+        assert_eq!(runtime.memory_stats().client.memory.unwrap().used_bytes, 0);
         assert_eq!(
-            host.inner
-                .server
-                .response_pool_arc()
-                .read()
-                .stats()
-                .alloc_count,
-            0
+            runtime.call_execution_snapshot().client.used_operations,
+            Some(0)
         );
-        assert_eq!(host.shutdown_outcome(), Some(outcome));
-        drop((peer, registration, host, runtime, rt));
+        assert!(second.shutdown().runtime_barrier_error.is_none());
+        drop((
+            new_peer,
+            peer,
+            outgoing,
+            registration,
+            second_registration,
+            first,
+            second,
+            runtime,
+            rt,
+        ));
         close_receipt_root(root);
     }
 
@@ -1789,7 +2072,6 @@ mod lifecycle_tests {
             .tempdir_in("/tmp")
             .unwrap();
         let runtime = Runtime::new(crate::RuntimeOptions {
-            server_id: Some(format!("credential-{}", uuid::Uuid::new_v4().simple())),
             use_process_relay_anchor: false,
             ..Default::default()
         })
@@ -1824,15 +2106,16 @@ mod lifecycle_tests {
             Err(Error::Lifecycle(LifecycleError::Configuration(_)))
         ));
         assert!(runtime.server_id().is_none());
+        assert!(!runtime.server_config_frozen());
         runtime
-            .set_server_options(
-                Some("still-configurable".into()),
-                None,
-                Some(Duration::from_secs(30)),
-            )
+            .update_server_config(ServerConfigPatch {
+                server_id: ConfigField::Set("still-configurable".into()),
+                startup_timeout: ConfigField::Set(Duration::from_secs(30)),
+                ..Default::default()
+            })
             .unwrap();
         assert_eq!(
-            runtime.server_startup_timeout(),
+            runtime.server_overrides().startup_timeout,
             Some(Duration::from_secs(30))
         );
     }
@@ -1847,9 +2130,7 @@ mod lifecycle_tests {
             Err(Error::Lifecycle(LifecycleError::Configuration(_)))
         ));
         assert!(runtime.server_id().is_none());
-        runtime
-            .set_server_options(None, None, Some(Duration::from_secs(5)))
-            .unwrap();
+        assert!(!runtime.server_config_frozen());
 
         let host = runtime
             .host(HostOptions::default().without_relay())
@@ -1887,10 +2168,17 @@ mod lifecycle_tests {
         ] {
             let runtime = Runtime::new(crate::RuntimeOptions {
                 use_process_relay_anchor: false,
-                server_startup_timeout: stored,
                 ..Default::default()
             })
             .unwrap();
+            if let Some(timeout) = stored {
+                runtime
+                    .update_server_config(ServerConfigPatch {
+                        startup_timeout: ConfigField::Set(timeout),
+                        ..Default::default()
+                    })
+                    .unwrap();
+            }
             let (entered, observed) = std::sync::mpsc::sync_channel(1);
             let (proceed, delayed) = std::sync::mpsc::channel();
             let mut options = HostOptions::default().without_relay();
@@ -1909,7 +2197,10 @@ mod lifecycle_tests {
             let worker = std::thread::spawn(move || host_runtime.host(options));
             let server = observed.recv_timeout(Duration::from_secs(10)).unwrap();
             assert!(matches!(
-                runtime.set_server_options(None, None, Some(Duration::from_secs(30))),
+                runtime.update_server_config(ServerConfigPatch {
+                    startup_timeout: ConfigField::Set(Duration::from_secs(30)),
+                    ..Default::default()
+                }),
                 Err(LifecycleError::ConfigFrozen)
             ));
             // Hold the actual host thread before bind until its caller expires.
@@ -1935,10 +2226,8 @@ mod lifecycle_tests {
             assert!(elapsed >= timeout);
             assert!(!server.is_running());
             eprintln!("configured={timeout:?}, elapsed={elapsed:?}, error={error}");
-            assert!(matches!(
-                runtime.set_server_options(None, None, None),
-                Err(LifecycleError::ConfigFrozen)
-            ));
+            assert!(runtime.server_config_frozen());
+            assert_eq!(runtime.server_config().unwrap().startup_timeout, timeout);
             observed_errors.push((error, timeout));
         }
         for (error, expected) in observed_errors {
@@ -1968,7 +2257,6 @@ mod lifecycle_tests {
 
     fn receipt_test_runtime() -> (Runtime, Option<tempfile::TempDir>) {
         let runtime = Runtime::new(crate::RuntimeOptions {
-            server_id: Some(format!("receipt-{}", uuid::Uuid::new_v4().simple())),
             use_process_relay_anchor: false,
             ..Default::default()
         })
@@ -2002,14 +2290,17 @@ mod lifecycle_tests {
         }
     }
 
-    fn launch_failed_attempt(runtime: &Runtime) -> GatedAttempt {
+    fn failed_start_options() -> HostOptions {
+        HostOptions::default()
+            .without_relay()
+            .with_startup_timeout(Duration::from_millis(30))
+            .with_shutdown_timeout(Duration::ZERO)
+    }
+
+    fn launch_gated_attempt(runtime: &Runtime, mut options: HostOptions) -> GatedAttempt {
         let (entered, observed) = std::sync::mpsc::sync_channel(1);
         let (proceed, delayed) = std::sync::mpsc::channel();
         let (join_sender, host_thread) = std::sync::mpsc::sync_channel(1);
-        let mut options = HostOptions::default()
-            .without_relay()
-            .with_startup_timeout(Duration::from_millis(30))
-            .with_shutdown_timeout(Duration::ZERO);
         options.startup_gate = Some(Arc::new(StartupGateForTest {
             entered,
             proceed: Mutex::new(delayed),
@@ -2033,7 +2324,11 @@ mod lifecycle_tests {
         }
     }
 
-    fn failed_attempt(gated: GatedAttempt) -> FailedAttempt {
+    fn launch_failed_attempt(runtime: &Runtime) -> GatedAttempt {
+        launch_gated_attempt(runtime, failed_start_options())
+    }
+
+    fn failed_attempt(gated: GatedAttempt, expected_timeout: Duration) -> FailedAttempt {
         let server = gated
             .observed
             .recv_timeout(Duration::from_secs(10))
@@ -2050,7 +2345,7 @@ mod lifecycle_tests {
                     stage: crate::ServerStartupStage::Readiness,
                     timeout,
                 }
-            ))) if timeout == Duration::from_millis(30)
+            ))) if timeout == expected_timeout
         ));
         FailedAttempt {
             server,
@@ -2090,7 +2385,7 @@ mod lifecycle_tests {
     #[test]
     fn failed_start_runtime_retirement_observes_original_pending_cleanup() {
         let (runtime, directory) = receipt_test_runtime();
-        let attempt = failed_attempt(launch_failed_attempt(&runtime));
+        let attempt = failed_attempt(launch_failed_attempt(&runtime), Duration::from_millis(30));
         let failed_receipt = attempt.receipt.clone();
         let receipt = runtime
             .begin_session_retirement(
@@ -2189,7 +2484,7 @@ mod lifecycle_tests {
     #[test]
     fn failed_first_start_receipt_tracks_pending_terminal_and_error() {
         let (runtime, directory) = receipt_test_runtime();
-        let attempt = failed_attempt(launch_failed_attempt(&runtime));
+        let attempt = failed_attempt(launch_failed_attempt(&runtime), Duration::from_millis(30));
         assert!(runtime.shutdown_pending(&attempt.server));
         let (invalid, completed) = attempt
             .receipt
@@ -2232,12 +2527,16 @@ mod lifecycle_tests {
     #[test]
     fn failed_restart_receipt_does_not_replace_old_host_journal() {
         let (runtime, directory) = receipt_test_runtime();
-        let old_host = runtime
-            .host(HostOptions::default().without_relay())
-            .unwrap();
-        let old_outcome = old_host.shutdown();
+        let options = HostOptions::default()
+            .without_relay()
+            .with_shutdown_timeout(Duration::ZERO);
+        let old_host = runtime.host(options.clone()).unwrap();
+        let old_outcome = old_host.shutdown_with_timeout(Duration::from_secs(5));
         assert!(old_outcome.runtime_barrier_error.is_none());
-        let attempt = failed_attempt(launch_failed_attempt(&runtime));
+        let attempt = failed_attempt(
+            launch_gated_attempt(&runtime, options),
+            Duration::from_secs(5),
+        );
         assert!(runtime.shutdown_pending(&attempt.server));
         assert!(!attempt.receipt.observe_with_timeout(Duration::ZERO).1);
         assert_eq!(old_host.shutdown_outcome(), Some(old_outcome.clone()));
@@ -2251,24 +2550,160 @@ mod lifecycle_tests {
         close_receipt_root(directory);
     }
 
+    fn wait_for_shared_start(runtime: &Runtime) {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while runtime.host_start_waiter_count_for_test() == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "second caller did not join Host startup"
+            );
+            std::thread::yield_now();
+        }
+    }
+
     #[test]
-    fn concurrent_failed_starts_keep_receipts_on_their_own_transactions() {
+    fn concurrent_same_config_starts_share_one_running_host() {
         let (runtime, directory) = receipt_test_runtime();
-        let first = launch_failed_attempt(&runtime);
-        let second = launch_failed_attempt(&runtime);
-        let first = failed_attempt(first);
-        let second = failed_attempt(second);
-        assert!(!Arc::ptr_eq(&first.server, &second.server));
-        assert!(!first.receipt.same_transaction_for_test(&second.receipt));
-        assert!(!first.receipt.observe_with_timeout(Duration::ZERO).1);
-        assert!(!second.receipt.observe_with_timeout(Duration::ZERO).1);
-        let (_, first_receipt) = finish_failed_attempt(first);
-        let (_, second_receipt) = finish_failed_attempt(second);
-        assert!(first_receipt.terminal_outcome().is_some());
-        assert!(second_receipt.terminal_outcome().is_some());
-        drop(first_receipt);
-        drop(second_receipt);
-        drop(runtime);
+        let options = HostOptions::default()
+            .without_relay()
+            .with_server_id(format!("shared-{}", uuid::Uuid::new_v4().simple()))
+            .with_memory_budget_bytes(1 << 20);
+        let first = launch_gated_attempt(&runtime, options.clone());
+        let server = first.observed.recv_timeout(Duration::from_secs(5)).unwrap();
+        let host_thread = first
+            .host_thread
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        let second = {
+            let runtime = runtime.clone();
+            let options = options.clone();
+            std::thread::spawn(move || runtime.host(options))
+        };
+        wait_for_shared_start(&runtime);
+
+        let error = runtime
+            .host(options.with_memory_budget_bytes(2 << 20))
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            Error::Lifecycle(LifecycleError::ConfigFrozen)
+        ));
+        first.proceed.send(()).unwrap();
+        let (first, receipt) = first.caller.join().unwrap();
+        assert!(receipt.is_none());
+        let first = first.unwrap();
+        let second = second.join().unwrap().unwrap();
+        assert!(Arc::ptr_eq(&first.inner, &second.inner));
+        assert!(Arc::ptr_eq(&first.inner.server, &server));
+        let outcome = second.shutdown();
+        assert!(outcome.runtime_barrier_error.is_none(), "{outcome:?}");
+        host_thread.join().unwrap();
+        drop((first, second, server, runtime));
+        close_receipt_root(directory);
+    }
+
+    #[test]
+    fn concurrent_failed_starts_share_the_original_cleanup_receipt() {
+        let (runtime, directory) = receipt_test_runtime();
+        let timeout = Duration::from_secs(5);
+        let options = failed_start_options().with_startup_timeout(timeout);
+        let first = launch_gated_attempt(&runtime, options.clone());
+        let server = first.observed.recv_timeout(timeout).unwrap();
+        let second = {
+            let runtime = runtime.clone();
+            std::thread::spawn(move || {
+                let mut receipt = None;
+                let result = runtime.host_with_failed_start_receipt(options, |observed| {
+                    receipt = Some(observed);
+                });
+                (result, receipt)
+            })
+        };
+        wait_for_shared_start(&runtime);
+        let host_thread = first.host_thread.recv_timeout(timeout).unwrap();
+        let (first_result, first_receipt) = first.caller.join().unwrap();
+        let first_error = first_result.unwrap_err();
+        let first = FailedAttempt {
+            server,
+            proceed: first.proceed,
+            host_thread,
+            receipt: first_receipt.expect("starting caller gets the cleanup receipt"),
+        };
+        let (result, receipt) = second.join().unwrap();
+        assert!(matches!(
+            result,
+            Err(Error::Lifecycle(LifecycleError::StartupTimeout(crate::ServerStartupTimeout {
+                stage: crate::ServerStartupStage::Readiness,
+                timeout: observed,
+            }))) if observed == timeout
+        ));
+        let second_receipt = receipt.expect("merged caller gets the original transaction");
+        assert_eq!(result.unwrap_err().to_string(), first_error.to_string());
+        assert!(first.receipt.same_transaction_for_test(&second_receipt));
+        assert!(!second_receipt.observe_with_timeout(Duration::ZERO).1);
+        let (outcome, first_receipt) = finish_failed_attempt(first);
+        assert_eq!(second_receipt.terminal_outcome(), Some(outcome));
+        drop((first_receipt, second_receipt, runtime));
+        close_receipt_root(directory);
+    }
+
+    #[test]
+    fn host_options_freeze_role_capacity_and_reject_later_change() {
+        let (runtime, directory) = receipt_test_runtime();
+        let server_id = format!("host-capacity-{}", uuid::Uuid::new_v4().simple());
+        let options = HostOptions::default()
+            .without_relay()
+            .with_server_id(&server_id)
+            .with_memory_budget_bytes(1 << 20)
+            .with_file_spill_budget_bytes(2 << 20)
+            .with_max_outstanding_calls(4)
+            .with_max_payload_size(1 << 19)
+            .with_max_execution_workers(3);
+        let first = runtime.host(options.clone()).unwrap();
+        assert_eq!(first.inner.server.server_id(), server_id);
+        assert_eq!(
+            first.local_endpoint().address(),
+            format!("ipc://{server_id}")
+        );
+        let config = runtime.server_config().unwrap();
+        assert_eq!(config.ipc.max_payload_size, 1 << 19);
+        assert_eq!(config.ipc.max_execution_workers, 3);
+        let first_snapshot = runtime.memory_stats().server;
+        assert!(first_snapshot.frozen);
+        assert_eq!(first_snapshot.memory.unwrap().limit_bytes, 1 << 20);
+        assert_eq!(first_snapshot.file_spill.unwrap().limit_bytes, 2 << 20);
+        assert_eq!(
+            runtime.call_execution_snapshot().server.max_operations,
+            Some(4)
+        );
+        assert!(!runtime.memory_stats().client.frozen);
+
+        runtime
+            .update_server_config(ServerConfigPatch::default())
+            .unwrap();
+        let error = runtime
+            .host(options.clone().with_max_outstanding_calls(5))
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            Error::Lifecycle(LifecycleError::ConfigFrozen)
+        ));
+        let outcome = first.shutdown();
+        assert!(outcome.runtime_barrier_error.is_none(), "{outcome:?}");
+        let second = runtime.host(options).unwrap();
+        let second_snapshot = runtime.memory_stats().server;
+        assert_eq!(first_snapshot.domain_id, second_snapshot.domain_id);
+        assert_eq!(first_snapshot.generation + 1, second_snapshot.generation);
+        assert_ne!(
+            first.inner.server.server_instance_id(),
+            second.inner.server.server_instance_id()
+        );
+        assert_eq!(
+            runtime.call_execution_snapshot().server.max_operations,
+            Some(4)
+        );
+        assert!(second.shutdown().runtime_barrier_error.is_none());
+        drop((first, second, runtime));
         close_receipt_root(directory);
     }
 
@@ -2283,15 +2718,14 @@ mod lifecycle_tests {
             }
         }
         let (runtime, directory) = receipt_test_runtime();
-        let mut relay = RelayServer::start_with_context(
+        let mut relay = RelayServer::start_with_context_for_test(
             RelayConfig {
                 bind: "127.0.0.1:0".into(),
-                idle_timeout_secs: 1,
-                anti_entropy_interval: Duration::ZERO,
                 heartbeat_interval: Duration::ZERO,
                 ..Default::default()
             },
             runtime.local_endpoint_context().unwrap(),
+            Duration::from_secs(1),
         )
         .unwrap();
         let url = format!("http://{}", relay.local_addr());
@@ -2396,13 +2830,10 @@ mod lifecycle_tests {
             ..Default::default()
         })
         .unwrap();
-        let host = runtime
-            .host(
-                HostOptions::default()
-                    .without_relay()
-                    .with_shutdown_timeout(Duration::from_millis(100)),
-            )
-            .unwrap();
+        let options = HostOptions::default()
+            .without_relay()
+            .with_shutdown_timeout(Duration::from_millis(100));
+        let host = runtime.host(options.clone()).unwrap();
         let release = ContractRelease::from_descriptor_json(include_bytes!(
             "../../../../tests/fixtures/contracts/portable-release.contract.json"
         ))
@@ -2477,14 +2908,15 @@ mod lifecycle_tests {
             !host.is_running(),
             "listener must already be terminal while relay teardown waits"
         );
-        let restart = runtime
-            .host(HostOptions::default().without_relay())
-            .unwrap_err();
+        let restart = runtime.host(options.clone()).unwrap_err();
         assert!(restart.to_string().contains("pending native teardown"));
         assert!(runtime.clear_server_identity().is_err());
         assert!(
             runtime
-                .set_server_options(Some("forbidden-new-identity".into()), None, None)
+                .update_server_config(ServerConfigPatch {
+                    server_id: ConfigField::Set("forbidden-new-identity".into()),
+                    ..Default::default()
+                })
                 .is_err()
         );
         release_tx.send(()).unwrap();
@@ -2497,9 +2929,7 @@ mod lifecycle_tests {
         assert!(host.shutdown().relay_errors.is_empty());
         drop(registration);
         drop(host);
-        let next = runtime
-            .host(HostOptions::default().without_relay())
-            .unwrap();
+        let next = runtime.host(options).unwrap();
         let _next_registration = next
             .register(
                 ServiceDefinition::new(

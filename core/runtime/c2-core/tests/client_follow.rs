@@ -48,9 +48,8 @@ impl EncodedService for CountingEcho {
     }
 }
 
-fn runtime(root: &std::path::Path, server_id: &str) -> Runtime {
+fn runtime(root: &std::path::Path) -> Runtime {
     let runtime = Runtime::new(RuntimeOptions {
-        server_id: Some(server_id.into()),
         use_process_relay_anchor: false,
         ..Default::default()
     })
@@ -102,10 +101,12 @@ fn peer_end_before_dispatch_follows_once_for_concurrent_views() {
         .tempdir_in(std::env::temp_dir())
         .unwrap();
     let name = format!("follow-{}", uuid::Uuid::new_v4().simple());
-    let server = runtime(root.path(), &name);
-    let host = server.host(HostOptions::default().without_relay()).unwrap();
+    let server = runtime(root.path());
+    let host = server
+        .host(HostOptions::default().with_server_id(&name).without_relay())
+        .unwrap();
     let registration = host.register(definition(1)).unwrap();
-    let consumer = runtime(root.path(), &format!("client-{name}"));
+    let consumer = runtime(root.path());
     let release = ContractRelease::from_descriptor_json(DESCRIPTOR).unwrap();
     let client = consumer
         .connect(
@@ -124,9 +125,9 @@ fn peer_end_before_dispatch_follows_once_for_concurrent_views() {
     assert!(io.block_on(old.wait_closed(Some(WAIT))).is_some());
     drop((registration, host, server));
 
-    let replacement = runtime(root.path(), &name);
+    let replacement = runtime(root.path());
     let host = replacement
-        .host(HostOptions::default().without_relay())
+        .host(HostOptions::default().with_server_id(&name).without_relay())
         .unwrap();
     let _registration = host.register(definition(2)).unwrap();
     let expired = client.with_call_options(CallOptions::with_timeout(CallTimeout::After(
@@ -185,11 +186,13 @@ fn endpoint_identity_is_checked_before_dispatch_while_unpinned_endpoint_follows(
         .tempdir_in(std::env::temp_dir())
         .unwrap();
     let name = format!("follow-{}", uuid::Uuid::new_v4().simple());
-    let server = runtime(root.path(), &name);
-    let host = server.host(HostOptions::default().without_relay()).unwrap();
+    let server = runtime(root.path());
+    let host = server
+        .host(HostOptions::default().with_server_id(&name).without_relay())
+        .unwrap();
     let registration = host.register(definition(1)).unwrap();
     let address = host.local_endpoint().address().to_owned();
-    let consumer = runtime(root.path(), &format!("client-{name}"));
+    let consumer = runtime(root.path());
     let expected = ContractRelease::from_descriptor_json(DESCRIPTOR)
         .unwrap()
         .expected_route("follow")
@@ -217,9 +220,9 @@ fn endpoint_identity_is_checked_before_dispatch_while_unpinned_endpoint_follows(
     assert!(io.block_on(pinned_old.wait_closed(Some(WAIT))).is_some());
     drop((registration, host, server));
 
-    let replacement = runtime(root.path(), &name);
+    let replacement = runtime(root.path());
     let host = replacement
-        .host(HostOptions::default().without_relay())
+        .host(HostOptions::default().with_server_id(&name).without_relay())
         .unwrap();
     let calls = Arc::new(AtomicUsize::new(0));
     let _registration = host
@@ -252,11 +255,13 @@ fn deactivated_endpoint_context_cannot_reacquire_after_peer_end() {
         .tempdir_in(std::env::temp_dir())
         .unwrap();
     let name = format!("follow-{}", uuid::Uuid::new_v4().simple());
-    let server = runtime(root.path(), &name);
-    let host = server.host(HostOptions::default().without_relay()).unwrap();
+    let server = runtime(root.path());
+    let host = server
+        .host(HostOptions::default().with_server_id(&name).without_relay())
+        .unwrap();
     let registration = host.register(definition(1)).unwrap();
     let address = host.local_endpoint().address().to_owned();
-    let consumer = runtime(root.path(), &format!("client-{name}"));
+    let consumer = runtime(root.path());
     let expected = ContractRelease::from_descriptor_json(DESCRIPTOR)
         .unwrap()
         .expected_route("follow")
@@ -273,9 +278,9 @@ fn deactivated_endpoint_context_cannot_reacquire_after_peer_end() {
     assert!(io.block_on(old.wait_closed(Some(WAIT))).is_some());
     drop((registration, host, server));
 
-    let replacement = runtime(root.path(), &name);
+    let replacement = runtime(root.path());
     let host = replacement
-        .host(HostOptions::default().without_relay())
+        .host(HostOptions::default().with_server_id(&name).without_relay())
         .unwrap();
     let calls = Arc::new(AtomicUsize::new(0));
     let _registration = host
@@ -306,7 +311,7 @@ fn malformed_response_frame_does_not_reacquire_a_protocol_failed_connection() {
         .unwrap();
     let name = format!("malformed-{}", uuid::Uuid::new_v4().simple());
     let address = format!("ipc://{name}");
-    let consumer = runtime(root.path(), &format!("client-{name}"));
+    let consumer = runtime(root.path());
     let endpoint = consumer.local_endpoint(&address).unwrap();
     let expected = ContractRelease::from_descriptor_json(DESCRIPTOR)
         .unwrap()

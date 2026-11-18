@@ -18,7 +18,6 @@ pub enum LifecycleError {
     RuntimeRetired,
     ShutdownWaitTimeout { stage: &'static str },
     InvalidServerId(String),
-    ClientConfigFrozen,
     ConfigFrozen,
     DuplicateRoute(String),
     MissingRoute(String),
@@ -41,7 +40,6 @@ impl fmt::Display for LifecycleError {
             }
             Self::InvalidServerId(message) => formatter.write_str(message),
             Self::ConfigFrozen => formatter.write_str("runtime configuration is frozen"),
-            Self::ClientConfigFrozen => formatter.write_str("client IPC configuration is frozen"),
             Self::DuplicateRoute(name) => write!(formatter, "route already registered: {name}"),
             Self::MissingRoute(name) => write!(formatter, "route not registered: {name}"),
             Self::MissingRelayAddress => formatter.write_str("no relay address configured"),
@@ -466,6 +464,19 @@ pub fn normalize_ipc_semantic_bytes(bytes: &[u8]) -> Error {
 }
 
 fn clear_resource_failure_phase(error: &mut C2Error) {
+    strip_callback_error_phases(error);
+}
+
+/// Strip `transport_phase` and `dispatch_phase` from an error that escaped a
+/// local resource method.
+///
+/// A same-process direct call enters the resource before its own transport
+/// accounting applies: an exception the resource raised may already describe
+/// state the resource modified, and inner transport admission details (for
+/// example a downstream call's `pre_dispatch`) never describe this call's
+/// dispatch state. Without this normalization an outer caller could misread a
+/// state-modifying failure as retry-safe `pre_dispatch`.
+pub fn strip_callback_error_phases(error: &mut C2Error) {
     error.details.remove("transport_phase");
     error.details.remove("dispatch_phase");
 }
@@ -606,7 +617,8 @@ pub fn normalize_adapter_failure(phase: AdapterFailurePhase, failure: AdapterFai
 #[cfg(test)]
 mod native_boundary_tests {
     use super::*;
-    use c2_mem::{MemPool, MemoryBudget, PoolConfig};
+    use c2_config::PoolConfig;
+    use c2_mem::{DomainBudget, MemPool};
     use c2_wire::chunk::{config::ChunkConfig, registry::ChunkRegistry};
     use c2_wire::connection::calls::ValueReceive;
     use c2_wire::flags::{FLAG_CHUNKED, FLAG_FIRST_CHUNK, FLAG_RESPONSE, FLAG_RPC_RECORD};
@@ -620,12 +632,16 @@ mod native_boundary_tests {
         data_len: usize,
         file_limit: u64,
         live_limit: u64,
-    ) -> (IpcError, MemoryBudget) {
-        let budget = MemoryBudget::new(0, file_limit, live_limit);
+    ) -> (IpcError, DomainBudget) {
+        let budget = DomainBudget::from_limits(&c2_config::DomainLimits {
+            memory_budget_bytes: live_limit,
+            file_spill_budget_bytes: file_limit,
+            max_outstanding_calls: 0,
+        });
         let pool = Arc::new(RwLock::new(
             MemPool::new_with_prefix_and_budget(
                 PoolConfig {
-                    buddy_enabled: false,
+                    pool_enabled: false,
                     spill_threshold: 0.0,
                     ..PoolConfig::default()
                 },
@@ -655,7 +671,7 @@ mod native_boundary_tests {
         let receive = ValueReceive::first(total_bytes, value.storage.len()).unwrap();
         let (chunks, part_bytes) = receive.geometry().unwrap();
         let failure = registry
-            .insert_reply(1, 9, total_bytes, chunks, part_bytes)
+            .insert_reply(1, 9, total_bytes, chunks, part_bytes, total_size)
             .unwrap_err();
         assert_eq!(registry.active_count(), 0);
         assert_eq!(registry.total_bytes(), 0);
@@ -694,13 +710,20 @@ mod native_boundary_tests {
                         .unwrap();
                     assert_eq!(decoded, *semantic);
                     let snapshot = budget.snapshot();
-                    assert_eq!(snapshot.reassembly.used_bytes, 0);
-                    assert_eq!(snapshot.file.used_bytes, 0);
-                    assert_eq!(snapshot.shm.used_bytes, 0);
+                    assert_eq!(snapshot.memory.used_bytes, 0);
+                    assert_eq!(snapshot.file_spill.used_bytes, 0);
                     if live_limit > 0 {
-                        let tracking_bytes =
-                            total_size.div_ceil(data_len as u64) * std::mem::size_of::<u8>() as u64;
-                        assert_eq!(snapshot.reassembly.peak_bytes, total_size + tracking_bytes);
+                        // The tracking metadata briefly charged the memory
+                        // cell before the zero file-spill cell refused the
+                        // file-backed capacity admission.
+                        let tracking_bytes = total_size.div_ceil(data_len as u64);
+                        assert_eq!(snapshot.memory.peak_bytes, tracking_bytes);
+                        assert_eq!(snapshot.file_spill.rejected_allocations, 1);
+                    } else {
+                        // A zero memory cell refuses before any storage or
+                        // file mapping could be created.
+                        assert_eq!(snapshot.memory.rejected_allocations, 1);
+                        assert_eq!(snapshot.memory.rejected_bytes, total_size);
                     }
                 }
             }
@@ -719,7 +742,7 @@ mod native_boundary_tests {
             };
             assert!(transport.semantic_error().is_none());
             assert!(!transport.is_fallback_eligible());
-            assert_eq!(budget.snapshot().reassembly.rejected_allocations, 0);
+            assert_eq!(budget.snapshot().memory.rejected_allocations, 0);
         }
     }
 
@@ -737,10 +760,9 @@ mod native_boundary_tests {
         assert_eq!(semantic.code, ErrorCode::ResourceUnavailable);
         assert_eq!(semantic.details["stage"], "response_reassembly_admission");
         let snapshot = budget.snapshot();
-        assert_eq!(snapshot.reassembly.rejected_allocations, 1);
-        assert_eq!(snapshot.reassembly.used_bytes, 0);
-        assert_eq!(snapshot.file.used_bytes, 0);
-        assert_eq!(snapshot.shm.used_bytes, 0);
+        assert_eq!(snapshot.memory.rejected_allocations, 1);
+        assert_eq!(snapshot.memory.used_bytes, 0);
+        assert_eq!(snapshot.file_spill.used_bytes, 0);
     }
 
     #[test]

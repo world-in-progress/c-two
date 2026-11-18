@@ -50,6 +50,7 @@ impl<T: Send + 'static> CoreLocalResponseStream<T> {
     pub(crate) fn open<F>(
         call: LocalStreamCall,
         factory: F,
+        domain_permit: c2_mem::OperationPermit,
         #[cfg(test)] before_first_commit: Option<(
             std::sync::mpsc::SyncSender<()>,
             std::sync::mpsc::Receiver<()>,
@@ -71,6 +72,8 @@ impl<T: Send + 'static> CoreLocalResponseStream<T> {
                 before_first_commit,
             )
             .await;
+            // The driver has completed cleanup and released the route slot.
+            drop(domain_permit);
             terminal_tx.send_replace(Some(outcome));
         });
         Ok(Self {
@@ -165,12 +168,19 @@ fn cancelled(cause: StreamCancelCause) -> C2Error {
 }
 
 fn callback<T>(operation: &str, work: impl FnOnce() -> Result<T, C2Error>) -> Result<T, C2Error> {
-    catch_unwind(AssertUnwindSafe(work)).unwrap_or_else(|_| {
-        Err(C2Error::new(
-            ErrorCode::ResourceFunctionExecuting,
-            format!("local stream {operation} panicked"),
-        ))
-    })
+    catch_unwind(AssertUnwindSafe(work))
+        .unwrap_or_else(|_| {
+            Err(C2Error::new(
+                ErrorCode::ResourceFunctionExecuting,
+                format!("local stream {operation} panicked"),
+            ))
+        })
+        .map_err(|mut error| {
+            // The resource method already ran; inner transport admission
+            // details never describe this call's dispatch state.
+            crate::error::strip_callback_error_phases(&mut error);
+            error
+        })
 }
 
 fn step_error(

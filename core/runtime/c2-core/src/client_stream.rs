@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use c2_http::client::{HttpError, HttpResponseStream, HttpStreamCancellation};
 use c2_http::stream_wire::{HttpStreamStatus, HttpStreamTerminal};
 use c2_ipc::{IpcError, IpcResponseStream, IpcStreamCancellation, StreamTerminal};
-use c2_mem::retention::BudgetedBuffer;
+use c2_mem::BudgetedBuffer;
 use c2_wire::rpc::CallStatus;
 use tokio::sync::Mutex;
 
@@ -329,7 +329,7 @@ mod tests {
     use super::*;
     use c2_config::{CallOptions, CallTimeout};
     use c2_error::ErrorCode;
-    use c2_mem::retention::PayloadBufferBudget;
+    use c2_mem::DomainBudget;
     use std::time::Instant;
 
     #[test]
@@ -340,8 +340,11 @@ mod tests {
         )
         .unwrap();
         scope.try_begin_dispatch().unwrap();
-        let budget = PayloadBufferBudget::new(3);
-        let item = BudgetedBuffer::new(vec![1, 2, 3], budget.try_reserve(3).unwrap());
+        let budget = DomainBudget::from_limits(&c2_config::DomainLimits {
+            memory_budget_bytes: 3,
+            ..Default::default()
+        });
+        let item = BudgetedBuffer::new(vec![1, 2, 3], budget.try_reserve_memory(3).unwrap());
         while Instant::now() < scope.deadline().unwrap() {
             std::hint::spin_loop();
         }
@@ -352,6 +355,6 @@ mod tests {
             matches!(error, Error::Semantic(error) if error.code == ErrorCode::CallDeadlineExceeded)
         );
         assert_eq!(scope.state(), CallState::ExpiredDispatchUncertain);
-        assert_eq!(budget.snapshot().used_bytes, 0);
+        assert_eq!(budget.snapshot().memory.used_bytes, 0);
     }
 }

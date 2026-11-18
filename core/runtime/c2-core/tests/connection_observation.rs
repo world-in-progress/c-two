@@ -38,7 +38,6 @@ async fn subscription_has_no_identity_configuration_or_runtime_ownership() {
 fn idle_observer_survives_views_and_does_not_retain_host_or_runtime() {
     let name = format!("observe-{}", std::process::id());
     let runtime = Runtime::new(RuntimeOptions {
-        server_id: Some(name.clone()),
         use_process_relay_anchor: false,
         ..RuntimeOptions::default()
     })
@@ -56,7 +55,11 @@ fn idle_observer_survives_views_and_does_not_retain_host_or_runtime() {
         .unwrap();
     let events = runtime.connection_events();
     let host = runtime
-        .host(HostOptions::default().without_relay())
+        .host(
+            HostOptions::default()
+                .with_server_id(name.clone())
+                .without_relay(),
+        )
         .unwrap();
     let endpoint = host.local_endpoint().clone();
     let release = ContractRelease::from_descriptor_json(DESCRIPTOR).unwrap();

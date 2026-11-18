@@ -211,7 +211,6 @@ fn host_registration_owns_the_server_route_and_idempotent_cleanup() {
     let release = release();
     let route_name = unique_name("host");
     let runtime = Runtime::new(RuntimeOptions {
-        server_id: Some(unique_name("host-server")),
         use_process_relay_anchor: false,
         ..RuntimeOptions::default()
     })
@@ -261,7 +260,6 @@ fn dropping_registration_performs_best_effort_route_cleanup() {
     let release = release();
     let route_name = unique_name("drop");
     let runtime = Runtime::new(RuntimeOptions {
-        server_id: Some(unique_name("drop-server")),
         use_process_relay_anchor: false,
         ..RuntimeOptions::default()
     })
@@ -323,7 +321,6 @@ fn explicitly_nonportable_service_keeps_its_schema_marker_and_uses_the_same_core
     assert!(matches!(error, Error::Contract(_)));
 
     let runtime = Runtime::new(RuntimeOptions {
-        server_id: Some(unique_name("python-only-server")),
         use_process_relay_anchor: false,
         ..RuntimeOptions::default()
     })
@@ -367,7 +364,6 @@ fn nonportable_stream_definition_routes_validated_modes_through_server() {
     )
     .unwrap();
     let runtime = Runtime::new(RuntimeOptions {
-        server_id: Some(unique_name("python-stream-server")),
         use_process_relay_anchor: false,
         ..RuntimeOptions::default()
     })
@@ -384,7 +380,7 @@ fn nonportable_stream_definition_routes_validated_modes_through_server() {
             },
         )
         .unwrap();
-    let mut stream = client
+    let stream = client
         .begin_stream("echo")
         .unwrap()
         .encode_vec(vec![7, 8])
@@ -401,7 +397,6 @@ fn registration_projects_the_core_owned_route_concurrency_state() {
     let release = release();
     let route_name = unique_name("concurrency");
     let runtime = Runtime::new(RuntimeOptions {
-        server_id: Some(unique_name("concurrency-server")),
         use_process_relay_anchor: false,
         ..RuntimeOptions::default()
     })
@@ -439,7 +434,6 @@ fn registration_projects_the_core_owned_route_concurrency_state() {
 fn ordinary_host_shutdown_withdraws_its_actual_registered_relay_route() {
     let root = tempfile::tempdir().expect("private IPC root");
     let runtime = Runtime::new(RuntimeOptions {
-        server_id: Some(unique_name("relay-shutdown-server")),
         use_process_relay_anchor: false,
         ..RuntimeOptions::default()
     })
@@ -457,8 +451,6 @@ fn ordinary_host_shutdown_withdraws_its_actual_registered_relay_route() {
     let mut relay = RelayServer::start_with_context(
         RelayConfig {
             bind: "127.0.0.1:0".into(),
-            idle_timeout_secs: 0,
-            anti_entropy_interval: std::time::Duration::ZERO,
             heartbeat_interval: std::time::Duration::ZERO,
             ..RelayConfig::default()
         },

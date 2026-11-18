@@ -2,9 +2,7 @@
 
 use std::time::Instant;
 
-use c2_mem::retention::{
-    PayloadBufferBudget, PayloadBufferError, PayloadBufferReservation, PayloadBufferSplitError,
-};
+use c2_mem::{DomainBudget, MemoryReservation, PayloadBufferError, ReusableWindow};
 
 use crate::client::HttpError;
 
@@ -16,11 +14,32 @@ pub struct SendBufferPlan {
     download_bytes: u64,
 }
 
-/// Independent move-only owners: no completed direction retains the input.
+/// Independent move-only owners: no completed direction retains the input. The
+/// download area becomes the forwarding [`ReusableWindow`] once its final size
+/// is known; until then it stays a plain reservation so callers may re-slice
+/// it against the remaining domain capacity.
 pub struct SendBuffers {
-    pub input: PayloadBufferReservation,
-    pub upload: PayloadBufferReservation,
-    pub download: PayloadBufferReservation,
+    pub input: MemoryReservation,
+    pub upload: MemoryReservation,
+    pub download: MemoryReservation,
+}
+
+impl SendBuffers {
+    /// Freeze both transport areas: the upload copy window keeps its plain
+    /// reservation, the download area becomes the reusable forwarding window
+    /// that each response slice refunds after the body consumes it.
+    pub fn into_forwarding(self) -> ForwardingBuffers {
+        ForwardingBuffers {
+            upload: self.upload,
+            download: self.download.into_reusable_window(),
+        }
+    }
+}
+
+/// The upload copy window and the reusable download window of one forwarding.
+pub struct ForwardingBuffers {
+    pub upload: MemoryReservation,
+    pub download: ReusableWindow,
 }
 
 impl SendBufferPlan {
@@ -61,10 +80,10 @@ impl SendBufferPlan {
 
     pub fn split(
         self,
-        mut reservation: PayloadBufferReservation,
-    ) -> Result<SendBuffers, PayloadBufferSplitError> {
+        mut reservation: MemoryReservation,
+    ) -> Result<SendBuffers, c2_mem::MemoryReservationError> {
         if reservation.bytes() != self.total_bytes() {
-            return Err(PayloadBufferSplitError {
+            return Err(c2_mem::MemoryReservationError {
                 requested: self.total_bytes(),
                 reserved: reservation.bytes(),
             });
@@ -80,7 +99,7 @@ impl SendBufferPlan {
 }
 
 pub async fn reserve_send_buffers(
-    budget: &PayloadBufferBudget,
+    budget: &DomainBudget,
     plan: SendBufferPlan,
     deadline: Option<Instant>,
 ) -> Result<SendBuffers, HttpError> {
@@ -97,9 +116,13 @@ mod tests {
     use super::*;
     use futures::FutureExt;
 
+    fn budget(limit: u64) -> DomainBudget {
+        crate::payload::memory_only_budget(limit)
+    }
+
     #[test]
     fn both_directions_share_one_small_budget_and_refund_independently() {
-        let budget = PayloadBufferBudget::new(7);
+        let domain = budget(7);
         let plan = SendBufferPlan::new(7, 4, 128, 128).unwrap();
         assert_eq!(
             plan,
@@ -110,15 +133,15 @@ mod tests {
             }
         );
         let buffers = plan
-            .split(budget.try_reserve(plan.total_bytes()).unwrap())
+            .split(domain.try_reserve_memory(plan.total_bytes()).unwrap())
             .unwrap();
-        assert_eq!(budget.snapshot().used_bytes, 7);
+        assert_eq!(domain.snapshot().memory.used_bytes, 7);
         drop(buffers.input);
-        assert_eq!(budget.snapshot().used_bytes, 3);
+        assert_eq!(domain.snapshot().memory.used_bytes, 3);
         drop(buffers.upload);
-        assert_eq!(budget.snapshot().used_bytes, 2);
+        assert_eq!(domain.snapshot().memory.used_bytes, 2);
         drop(buffers.download);
-        assert_eq!(budget.snapshot().used_bytes, 0);
+        assert_eq!(domain.snapshot().memory.used_bytes, 0);
     }
 
     #[test]
@@ -143,16 +166,37 @@ mod tests {
 
     #[tokio::test]
     async fn waiting_for_the_group_never_owns_a_partial_admission() {
-        let budget = PayloadBufferBudget::new(8);
-        let occupied = budget.try_reserve(4).unwrap();
+        let domain = budget(8);
+        let occupied = domain.try_reserve_memory(4).unwrap();
         let plan = SendBufferPlan::new(8, 4, 2, 2).unwrap();
-        let mut waiting = Box::pin(reserve_send_buffers(&budget, plan, None));
+        let mut waiting = Box::pin(reserve_send_buffers(&domain, plan, None));
         assert!(waiting.as_mut().now_or_never().is_none());
-        assert_eq!(budget.snapshot().used_bytes, 4);
+        assert_eq!(domain.snapshot().memory.used_bytes, 4);
         drop(occupied);
         let buffers = waiting.await.unwrap();
-        assert_eq!(budget.snapshot().used_bytes, 8);
+        assert_eq!(domain.snapshot().memory.used_bytes, 8);
         drop(buffers);
-        assert_eq!(budget.snapshot().used_bytes, 0);
+        assert_eq!(domain.snapshot().memory.used_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn download_area_becomes_a_refunding_reusable_window() {
+        let domain = budget(6);
+        let plan = SendBufferPlan::new(6, 4, 2, 4).unwrap();
+        let buffers = reserve_send_buffers(&domain, plan, None).await.unwrap();
+        let forwarding = buffers.into_forwarding();
+        assert_eq!(forwarding.download.capacity(), 1);
+        assert_eq!(domain.snapshot().memory.used_bytes, 2);
+        for _ in 0..2 {
+            let slice = forwarding.download.reserve(1).await.unwrap();
+            assert!(forwarding.download.reserve(1).now_or_never().is_none());
+            drop(slice);
+        }
+        // Refunded window capacity stays reserved by the window itself.
+        assert_eq!(domain.snapshot().memory.used_bytes, 2);
+        drop(forwarding.upload);
+        assert_eq!(domain.snapshot().memory.used_bytes, 1);
+        drop(forwarding.download);
+        assert_eq!(domain.snapshot().memory.used_bytes, 0);
     }
 }

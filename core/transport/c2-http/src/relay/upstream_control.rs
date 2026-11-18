@@ -69,10 +69,7 @@ async fn run_control_watch(state: Arc<RelayState>, key: UpstreamOwnerKey, token:
                 continue;
             }
         };
-        let mut client = match state
-            .clients
-            .manage(|| IpcClient::with_endpoint(endpoint, c2_config::ClientIpcConfig::default()))
-        {
+        let mut client = match state.clients.manage(|| IpcClient::with_endpoint(endpoint)) {
             Ok(client) => client,
             Err(error) => {
                 if state.clients.is_closed() {
@@ -266,13 +263,10 @@ mod tests {
         #[cfg(windows)]
         let context = c2_config::LocalEndpointContext::default_for_platform().unwrap();
         let endpoint = context.endpoint(&address).unwrap();
-        let mut config = c2_server::ServerIpcConfig::default();
-        config.base.pool_enabled = false;
-        config.base.pool_prewarm_segments = 0;
         let server = Arc::new(
             c2_server::Server::new_with_identity_and_endpoint(
                 endpoint.clone(),
-                config,
+                c2_server::ServerIpcConfig::default(),
                 c2_server::ServerIdentity {
                     server_id: id.clone(),
                     server_instance_id: format!("{id}-instance"),
@@ -290,10 +284,7 @@ mod tests {
         let expected = expected_contract_for_route(&route);
         let run_server = server.clone();
         let mut server_task = tokio::spawn(async move { run_server.run().await });
-        let mut ipc_config = c2_config::ClientIpcConfig::default();
-        ipc_config.base.pool_enabled = false;
-        ipc_config.base.pool_prewarm_segments = 0;
-        let mut client = IpcClient::with_endpoint(endpoint, ipc_config).unwrap();
+        let mut client = IpcClient::with_endpoint(endpoint).unwrap();
 
         // Cleanup runs after every assertion failure or bounded step timeout.
         let result = std::panic::AssertUnwindSafe(tokio::time::timeout(STEP, async {
@@ -429,8 +420,7 @@ mod tests {
     #[tokio::test]
     async fn watch_transport_failure_does_not_withdraw_route() {
         let address = "ipc://relay_watch_unconnected";
-        let client =
-            IpcClient::with_config(address, c2_config::ClientIpcConfig::default()).unwrap();
+        let client = IpcClient::new(address).unwrap();
         let route = route_entry("unconnected", address, "unconnected-route".into());
         assert!(matches!(
             client
@@ -482,9 +472,7 @@ mod tests {
                 Arc::new(crate::relay::test_support::NoopDisseminator),
                 context,
             ));
-            let mut config = c2_server::ServerIpcConfig::default();
-            config.base.pool_enabled = false;
-            config.base.pool_prewarm_segments = 0;
+            let config = c2_server::ServerIpcConfig::default();
             let server = Arc::new(
                 c2_server::Server::new_with_identity_and_endpoint(
                     endpoint.clone(),

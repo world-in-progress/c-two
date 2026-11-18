@@ -252,8 +252,8 @@ async fn selected_relay_accepts_larger_unary_and_stream_after_same_contract_rere
     assert_eq!(unary.as_ref(), b"larger result");
     drop(unary);
 
-    let budget = c2_mem::retention::PayloadBufferBudget::new(128);
-    let headroom = budget.try_reserve(1).unwrap();
+    let budget = crate::payload::memory_only_budget(128);
+    let headroom = budget.try_reserve_memory(1).unwrap();
     let control = allowed().with_payload_budget(budget, None);
     let mut stream = client
         .stream_controlled_async(
@@ -404,7 +404,6 @@ async fn live_relay_reregistration_larger_limit_preserves_old_client_unary_and_s
             crate::relay::RelayServer::start_with_context(
                 c2_config::RelayConfig {
                     bind: "127.0.0.1:0".into(),
-                    idle_timeout_secs: 0,
                     ..c2_config::RelayConfig::default()
                 },
                 context,
@@ -479,8 +478,8 @@ async fn live_relay_reregistration_larger_limit_preserves_old_client_unary_and_s
             .as_ref(),
         b"larger result"
     );
-    let budget = c2_mem::retention::PayloadBufferBudget::new(128);
-    let headroom = budget.try_reserve(1).unwrap();
+    let budget = crate::payload::memory_only_budget(128);
+    let headroom = budget.try_reserve_memory(1).unwrap();
     let control = allowed().with_payload_budget(budget, None);
     let mut stream = client
         .stream_controlled_async(
@@ -839,8 +838,8 @@ async fn stream_route_not_found_control_envelope_exceeds_one_byte_business_limit
     let missing = Data::new(Reply::NotFound);
     let server = data_server(&missing).await;
     let registry = registry_with_max_payload_size(&server.url, 1).await;
-    let budget = c2_mem::retention::PayloadBufferBudget::new(4096);
-    let headroom = budget.try_reserve(1).unwrap();
+    let budget = crate::payload::memory_only_budget(4096);
+    let headroom = budget.try_reserve_memory(1).unwrap();
     let control = allowed().with_payload_budget(budget, None);
 
     let error = acquired_client(&registry)
@@ -1085,13 +1084,7 @@ async fn owned_payloads_preserve_content_length_contract_headers_and_contents() 
         &registry.url,
         expected(),
         false,
-        RelayAwareClientConfig {
-            remote_payload_chunk_size: 64 * 1024,
-            // Controlled data transfers ignore this legacy reqwest timeout.
-            // A one-nanosecond setting would expire any legacy exchange.
-            call_timeout_secs: 0.000_000_001,
-            ..Default::default()
-        },
+        RelayAwareClientConfig::default(),
     )
     .unwrap();
     let client = tokio::task::spawn_blocking(move || {
@@ -1284,7 +1277,7 @@ async fn business_response_budget_covers_success_and_crm_before_eof() {
                 } else {
                     acquired
                 };
-                let budget = c2_mem::retention::PayloadBufferBudget::new(RESPONSE_LIMIT);
+                let budget = crate::payload::memory_only_budget(RESPONSE_LIMIT);
                 let control = allowed().with_payload_budget(budget, None);
                 let result = tokio::time::timeout(
                     std::time::Duration::from_secs(2),
@@ -1328,7 +1321,7 @@ async fn relay_control_error_uses_protocol_limit_and_retains_b_charge() {
                 tail: None,
             })
             .await;
-            let budget = c2_mem::retention::PayloadBufferBudget::new(64);
+            let budget = crate::payload::memory_only_budget(64);
             let control = allowed().with_payload_budget(budget.clone(), None);
             let error = client
                 .call_controlled_async("large", Arc::new(vec![1]), &control)
@@ -1340,9 +1333,9 @@ async fn relay_control_error_uses_protocol_limit_and_retains_b_charge() {
             };
             assert_eq!(*actual_status, status.as_u16());
             assert_eq!(body.len(), 9);
-            assert_eq!(budget.snapshot().used_bytes, 9);
+            assert_eq!(budget.snapshot().memory.used_bytes, 9);
             drop(error);
-            assert_eq!(budget.snapshot().used_bytes, 0);
+            assert_eq!(budget.snapshot().memory.used_bytes, 0);
         }
     }
 }
@@ -1365,7 +1358,7 @@ async fn borrowed_legacy_calls_accept_responses_above_registration_limit() {
 
 struct ReservedResponseInput {
     bytes: Vec<u8>,
-    _permit: c2_mem::retention::PayloadBufferReservation,
+    _permit: c2_mem::MemoryReservation,
 }
 
 impl AsRef<[u8]> for ReservedResponseInput {
@@ -1392,10 +1385,10 @@ async fn late_response_completion_keeps_only_actual_request_reader_and_native_dr
         })
         .await;
         let client = Arc::new(client);
-        let budget = c2_mem::retention::PayloadBufferBudget::new(4);
+        let budget = crate::payload::memory_only_budget(4);
         let input = Arc::new(ReservedResponseInput {
             bytes: vec![1; 4],
-            _permit: budget.reserve(4).await.unwrap(),
+            _permit: budget.reserve_memory(4).await.unwrap(),
         });
         let weak = Arc::downgrade(&input);
         let expired = Arc::new(AtomicBool::new(false));
@@ -1439,7 +1432,7 @@ async fn late_response_completion_keeps_only_actual_request_reader_and_native_dr
         );
         if actual_reader.is_some() {
             assert_eq!(
-                budget.snapshot().used_bytes,
+                budget.snapshot().memory.used_bytes,
                 4,
                 "live transport storage remains billed"
             );
@@ -1471,7 +1464,7 @@ async fn late_response_completion_keeps_only_actual_request_reader_and_native_dr
             "dispatched response must not recheck caller deadline"
         );
         assert!(weak.upgrade().is_none());
-        assert_eq!(budget.snapshot().used_bytes, 0);
+        assert_eq!(budget.snapshot().memory.used_bytes, 0);
         assert_eq!(
             calls.load(Ordering::SeqCst),
             2,
@@ -1513,7 +1506,7 @@ fn response_from_chunks(
 
 async fn check_response_reader(status: u16, known_length: bool) {
     let polls = Arc::new(AtomicUsize::new(0));
-    let budget = c2_mem::retention::PayloadBufferBudget::new(RESPONSE_LIMIT);
+    let budget = crate::payload::memory_only_budget(RESPONSE_LIMIT);
     let result = tokio::time::timeout(
         std::time::Duration::from_millis(100),
         crate::payload::read_http_response(
@@ -1577,7 +1570,7 @@ async fn relay_control_error_declared_length_above_protocol_limit_rejects_before
             .await
             .unwrap();
         assert_eq!(response.content_length(), Some(limit + 1));
-        let budget = c2_mem::retention::PayloadBufferBudget::new(64);
+        let budget = crate::payload::memory_only_budget(64);
         let error = crate::payload::read_http_response(response, &budget, None)
             .await
             .unwrap_err();
@@ -1589,7 +1582,7 @@ async fn relay_control_error_declared_length_above_protocol_limit_rejects_before
         assert_eq!(decoded.code, ErrorCode::ProtocolViolation);
         assert_eq!(decoded.details["reason"], "response_payload_too_large");
         assert_eq!(decoded.details["max_payload_size"], limit.to_string());
-        assert_eq!(budget.snapshot().peak_bytes, 0);
+        assert_eq!(budget.snapshot().memory.peak_bytes, 0);
         server.await.unwrap();
     }
 }
@@ -1605,7 +1598,7 @@ async fn response_reader_bounds_chunked_500() {
 #[tokio::test]
 async fn chunked_relay_control_error_respects_b_before_waiting_for_eof() {
     let polls = Arc::new(AtomicUsize::new(0));
-    let budget = c2_mem::retention::PayloadBufferBudget::new(4);
+    let budget = crate::payload::memory_only_budget(4);
     let result = tokio::time::timeout(
         std::time::Duration::from_millis(100),
         crate::payload::read_http_response(
@@ -1623,7 +1616,7 @@ async fn chunked_relay_control_error_respects_b_before_waiting_for_eof() {
     assert_eq!(details.code, ErrorCode::CallCapacityExceeded);
     assert_eq!(details.details["transport_phase"], "dispatch_uncertain");
     assert_eq!(polls.load(Ordering::SeqCst), 2);
-    assert_eq!(budget.snapshot().used_bytes, 0);
+    assert_eq!(budget.snapshot().memory.used_bytes, 0);
 }
 
 #[tokio::test]
@@ -1724,11 +1717,8 @@ async fn response_content_length_metadata_can_exceed_limit_for_legal_empty_body(
     server.await.unwrap();
 }
 
-async fn read_response(
-    response: reqwest::Response,
-) -> Result<c2_mem::retention::BudgetedBuffer, HttpError> {
-    let budget =
-        c2_mem::retention::PayloadBufferBudget::new(c2_config::DEFAULT_PAYLOAD_BUFFER_BUDGET_BYTES);
+async fn read_response(response: reqwest::Response) -> Result<c2_mem::BudgetedBuffer, HttpError> {
+    let budget = crate::payload::memory_only_budget(c2_config::DEFAULT_MEMORY_BUDGET_BYTES);
     crate::payload::read_http_response(response, &budget, None).await
 }
 
@@ -1737,20 +1727,17 @@ async fn completed_request_budget_is_reused_by_its_known_length_response() {
     let data = Data::new(Reply::Echo);
     let server = data_server(&data).await;
     let (registry, _) = registry(&[&server.url], None).await;
-    let budget = c2_mem::retention::PayloadBufferBudget::new(7);
+    let budget = crate::payload::memory_only_budget(7);
     let input = Arc::new(ReservedResponseInput {
         bytes: vec![7; 7],
-        _permit: budget.reserve(7).await.unwrap(),
+        _permit: budget.reserve_memory(7).await.unwrap(),
     });
     let control = allowed().with_payload_budget(budget.clone(), None);
     let client = RelayAwareHttpClient::new(
         &registry.url,
         expected(),
         false,
-        RelayAwareClientConfig {
-            remote_payload_chunk_size: 3,
-            ..Default::default()
-        },
+        RelayAwareClientConfig::default(),
     )
     .unwrap();
     let client = tokio::task::spawn_blocking(move || {
@@ -1769,10 +1756,10 @@ async fn completed_request_budget_is_reused_by_its_known_length_response() {
     .expect("the request's ended reader must not block response admission")
     .unwrap();
     assert_eq!(output.as_ref(), &[7; 7]);
-    assert_eq!(budget.snapshot().used_bytes, 7);
-    assert_eq!(budget.snapshot().peak_bytes, 7);
+    assert_eq!(budget.snapshot().memory.used_bytes, 7);
+    assert_eq!(budget.snapshot().memory.peak_bytes, 7);
     drop(output);
-    assert_eq!(budget.snapshot().used_bytes, 0);
+    assert_eq!(budget.snapshot().memory.used_bytes, 0);
 }
 
 #[tokio::test]
@@ -1840,12 +1827,12 @@ async fn controlled_stream_uses_one_bound_post_and_stream_accept_header() {
         }),
     ))
     .await;
-    let budget = c2_mem::retention::PayloadBufferBudget::new(128);
+    let budget = crate::payload::memory_only_budget(128);
     let input = Arc::new(ReservedResponseInput {
         bytes: b"input".to_vec(),
-        _permit: budget.try_reserve(5).unwrap(),
+        _permit: budget.try_reserve_memory(5).unwrap(),
     });
-    let headroom = budget.try_reserve(1).unwrap();
+    let headroom = budget.try_reserve_memory(1).unwrap();
     let control = allowed().with_payload_budget(budget.clone(), None);
     let relay_control = Arc::new(RelayControlClient::new(&registry.url, false).unwrap());
     let client = RelayAwareHttpClient::new_with_control(

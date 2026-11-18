@@ -330,9 +330,8 @@ impl CallScope {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use c2_config::{CallExecutionLimits, CallTimeout};
-    use c2_mem::retention::PayloadBufferReservation;
-    use c2_mem::{RetentionBudget, RetentionPermit};
+    use c2_config::CallTimeout;
+    use c2_mem::{DomainBudget, MemoryReservation, OperationPermit};
     use std::sync::Barrier;
     use std::sync::atomic::AtomicUsize;
     use std::thread;
@@ -1071,8 +1070,8 @@ mod tests {
 
     struct FakePayloadOwner {
         releases: Arc<AtomicUsize>,
-        _permit: RetentionPermit,
-        _reservation: PayloadBufferReservation,
+        _permit: OperationPermit,
+        _reservation: MemoryReservation,
     }
 
     impl Drop for FakePayloadOwner {
@@ -1085,15 +1084,16 @@ mod tests {
     fn scope_expiry_and_drop_do_not_release_payload_or_refund_budget() {
         let start = Instant::now();
         for (dispatched, expire) in [(false, false), (true, false), (false, true), (true, true)] {
-            let budget = RetentionBudget::from_call_limits(&CallExecutionLimits {
+            let budget = DomainBudget::from_limits(&c2_config::DomainLimits {
                 max_outstanding_calls: 1,
-                payload_buffer_budget_bytes: 64,
+                memory_budget_bytes: 64,
+                ..Default::default()
             });
             let releases = Arc::new(AtomicUsize::new(0));
             let owner = FakePayloadOwner {
                 releases: releases.clone(),
-                _permit: budget.reserve().unwrap(),
-                _reservation: budget.payload_budget().reserve_blocking(64, None).unwrap(),
+                _permit: budget.reserve_operation().unwrap(),
+                _reservation: budget.reserve_memory_blocking(64, None).unwrap(),
             };
             let scope = bounded(start, Duration::from_secs(1));
             let guard = scope.clone();
@@ -1112,16 +1112,16 @@ mod tests {
                 );
                 assert!(scope.complete_success().is_err()); // The late result is still owned below.
             }
-            budget.close();
+            budget.close_operations();
             drop(scope);
             drop(guard);
             assert_eq!(releases.load(Ordering::SeqCst), 0);
-            assert_eq!(budget.snapshot().used_operations, 1);
-            assert_eq!(budget.payload_budget().snapshot().used_bytes, 64);
+            assert_eq!(budget.snapshot().operations.used_operations, 1);
+            assert_eq!(budget.snapshot().memory.used_bytes, 64);
             drop(owner); // Only the true continuation owner releases its payload/charge.
             assert_eq!(releases.load(Ordering::SeqCst), 1);
-            assert_eq!(budget.snapshot().used_operations, 0);
-            assert_eq!(budget.payload_budget().snapshot().used_bytes, 0);
+            assert_eq!(budget.snapshot().operations.used_operations, 0);
+            assert_eq!(budget.snapshot().memory.used_bytes, 0);
         }
     }
 
@@ -1130,11 +1130,15 @@ mod tests {
         let start = Instant::now();
         let scope = bounded(start, Duration::from_secs(1));
         let releases = Arc::new(AtomicUsize::new(0));
-        let budget = RetentionBudget::new(1, 64);
+        let budget = DomainBudget::from_limits(&c2_config::DomainLimits {
+            max_outstanding_calls: 1,
+            memory_budget_bytes: 64,
+            ..Default::default()
+        });
         let owner = FakePayloadOwner {
             releases: releases.clone(),
-            _permit: budget.reserve().unwrap(),
-            _reservation: budget.payload_budget().reserve_blocking(64, None).unwrap(),
+            _permit: budget.reserve_operation().unwrap(),
+            _reservation: budget.reserve_memory_blocking(64, None).unwrap(),
         };
         apply(&scope, Operation::BeginDispatch, start).unwrap();
         apply(&scope, Operation::CompleteSuccess, start).unwrap();
@@ -1144,10 +1148,10 @@ mod tests {
         );
         drop(scope);
         assert_eq!(releases.load(Ordering::SeqCst), 0);
-        assert_eq!(budget.payload_budget().snapshot().used_bytes, 64);
+        assert_eq!(budget.snapshot().memory.used_bytes, 64);
         drop(owner);
         assert_eq!(releases.load(Ordering::SeqCst), 1);
-        assert_eq!(budget.payload_budget().snapshot().used_bytes, 0);
+        assert_eq!(budget.snapshot().memory.used_bytes, 0);
     }
 
     #[test]

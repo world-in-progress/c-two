@@ -13,12 +13,12 @@ use axum::{
     http::StatusCode,
     routing::{get, post},
 };
-use c2_config::{ClientIpcConfigOverrides, ConfigSources, ServerIpcConfigOverrides};
 use c2_contract::{ContractRelease, MethodAccess};
 use c2_core::{
-    CallExecutionLimitsOverrides, CallOptions, CallTimeout, Client, Connect, EncodedClient,
-    EncodedService, Error, Host, HostOptions, LifecycleError, MethodDefinition, Registration,
-    Runtime, RuntimeOptions, ServiceConcurrencyMode, ServiceDefinition,
+    CallOptions, CallTimeout, Client, ClientConfigPatch, ConfigField, Connect,
+    DomainLimitsOverrides, DomainLimitsPatch, EncodedClient, EncodedService, Error, Host,
+    HostOptions, LifecycleError, MethodDefinition, Registration, Runtime, RuntimeOptions,
+    ServiceConcurrencyMode, ServiceDefinition,
 };
 use c2_error::{C2Error, ErrorCode};
 use c2_http::client::RelayRouteInfo;
@@ -118,6 +118,61 @@ enum Carrier {
     Chunk,
 }
 
+impl Carrier {
+    fn payload_size(self) -> usize {
+        match self {
+            Self::Inline => 512,
+            Self::Buddy | Self::Dedicated => 128 * 1024,
+            Self::Chunk => 224 * 1024,
+        }
+    }
+
+    fn memory_limit(self) -> u64 {
+        match self {
+            Self::Inline | Self::Dedicated => 1024 * 1024,
+            // 16 MiB derives a 256 KiB segment, enough for the 128 KiB loan.
+            Self::Buddy => 16 * 1024 * 1024,
+            // The serialized input and a SHM allocation do not fit together.
+            // On the Host a queued chunk leaves less than 224 KiB for assembly,
+            // so the assembler uses file spill before copying into local memory.
+            Self::Chunk => 256 * 1024,
+        }
+    }
+
+    fn idle_client_memory(self) -> u64 {
+        match self {
+            Self::Buddy => 256 * 1024,
+            _ => 0,
+        }
+    }
+}
+
+fn client_patch(memory: u64, slots: u64) -> ClientConfigPatch {
+    ClientConfigPatch {
+        domain_limits: DomainLimitsPatch {
+            memory_budget_bytes: ConfigField::Set(memory),
+            max_outstanding_calls: ConfigField::Set(slots),
+            ..Default::default()
+        },
+    }
+}
+
+fn client_memory(runtime: &Runtime) -> c2_core::MemoryCellStats {
+    runtime.memory_stats().client.memory.unwrap()
+}
+
+fn server_memory(host: &Host) -> c2_core::MemoryCellStats {
+    host.memory_stats().server.memory.unwrap()
+}
+
+fn client_operations(runtime: &Runtime) -> u64 {
+    runtime
+        .call_execution_snapshot()
+        .client
+        .used_operations
+        .unwrap()
+}
+
 struct IpcFixture {
     runtime: Runtime,
     host: Host,
@@ -138,52 +193,34 @@ impl Drop for IpcFixture {
 }
 
 fn fixture(carrier: Carrier) -> IpcFixture {
+    ipc_fixture(carrier, carrier.memory_limit(), carrier.memory_limit(), 16)
+}
+
+fn ipc_fixture(carrier: Carrier, client_memory: u64, server_memory: u64, slots: u64) -> IpcFixture {
     let release = ContractRelease::from_descriptor_json(DESCRIPTOR.as_bytes()).unwrap();
     let route = unique("deadline");
-    let mut server = ServerIpcConfigOverrides {
-        pool_segment_size: Some(1024 * 1024),
-        pool_prewarm_segments: Some(0),
-        pool_min_retained_segments: Some(0),
-        chunk_size: Some(4096),
-        chunk_gc_interval_secs: Some(0.05),
-        ..Default::default()
+    let file_spill = if matches!(carrier, Carrier::Chunk) {
+        512 * 1024
+    } else {
+        0
     };
-    let mut outgoing = ClientIpcConfigOverrides {
-        pool_segment_size: Some(1024 * 1024),
-        pool_prewarm_segments: Some(0),
-        pool_min_retained_segments: Some(0),
-        chunk_size: Some(4096),
-        chunk_gc_interval_secs: Some(0.05),
-        ..Default::default()
-    };
-    match carrier {
-        Carrier::Inline | Carrier::Buddy => {}
-        Carrier::Dedicated => {
-            server.pool_enabled = Some(false);
-            outgoing.pool_enabled = Some(false);
-        }
-        Carrier::Chunk => {
-            server.pool_enabled = Some(false);
-            outgoing.pool_enabled = Some(false);
-            server.shm_backing_budget_bytes = Some(0);
-            outgoing.shm_backing_budget_bytes = Some(0);
-            // Chunk reception still needs legal owned reassembly backing.
-            // SHM stays forbidden; a finite file budget supplies that backing.
-            server.file_backing_budget_bytes = Some(2 * 1024 * 1024);
-            outgoing.file_backing_budget_bytes = Some(2 * 1024 * 1024);
-        }
-    }
     let runtime = Runtime::new(RuntimeOptions {
-        server_id: Some(unique("deadline-host")),
-        server_ipc_overrides: Some(server),
-        client_ipc_overrides: Some(outgoing),
-        shm_threshold: Some(1024),
+        client_limits: DomainLimitsOverrides {
+            memory_budget_bytes: Some(client_memory),
+            file_spill_budget_bytes: Some(file_spill),
+            max_outstanding_calls: Some(slots),
+        },
         use_process_relay_anchor: false,
         ..Default::default()
     })
     .unwrap();
     let host = runtime
-        .host(HostOptions::default().without_relay())
+        .host(
+            HostOptions::default()
+                .without_relay()
+                .with_memory_budget_bytes(server_memory)
+                .with_file_spill_budget_bytes(file_spill),
+        )
         .unwrap();
     let gate = Arc::new(Gate::default());
     let calls = Arc::new(AtomicUsize::new(0));
@@ -235,15 +272,9 @@ fn fixture(carrier: Carrier) -> IpcFixture {
 
 fn check_late_ipc(carrier: Carrier) {
     let fixture = fixture(carrier);
-    let bytes = vec![
-        0xa5;
-        if matches!(carrier, Carrier::Inline) {
-            512
-        } else {
-            128 * 1024
-        }
-    ];
+    let bytes = vec![0xa5; carrier.payload_size()];
     let nbytes = bytes.len() as u64;
+    let idle_client_memory = carrier.idle_client_memory();
     let caller = fixture.client.with_call_options(finite());
     let call = std::thread::spawn(move || {
         let result = caller
@@ -264,16 +295,14 @@ fn check_late_ipc(carrier: Carrier) {
         Ok(_) => panic!("gated call cannot succeed"),
     };
     assert_semantic(error, ErrorCode::CallDeadlineExceeded, "dispatch_uncertain");
-    let snapshot = fixture.runtime.call_execution_snapshot().unwrap();
-    assert_eq!(snapshot.used_operations, 1);
+    let snapshot = fixture.runtime.call_execution_snapshot();
+    assert_eq!(snapshot.client.used_operations, Some(1));
+    assert_eq!(snapshot.server.used_operations, Some(1));
     assert_eq!(
-        fixture.runtime.payload_buffer_stats().unwrap().used_bytes,
-        0
+        client_memory(&fixture.runtime).used_bytes,
+        idle_client_memory
     );
-    assert_eq!(
-        fixture.runtime.clone().call_execution_snapshot().unwrap(),
-        snapshot
-    );
+    assert_eq!(fixture.runtime.clone().call_execution_snapshot(), snapshot);
     // A distinct view on the same native connection must still finish while
     // the timed-out call's transport execution remains live.
     assert_eq!(
@@ -286,52 +315,34 @@ fn check_late_ipc(carrier: Carrier) {
     );
     assert_eq!(fixture.calls.load(Ordering::SeqCst), 2);
     fixture.gate.open();
-    observe_until(|| {
-        fixture
-            .runtime
-            .call_execution_snapshot()
-            .unwrap()
-            .used_operations
-            == 0
-    });
-    assert_eq!(
-        fixture.runtime.payload_buffer_stats().unwrap().used_bytes,
-        0
-    );
-    if matches!(carrier, Carrier::Dedicated | Carrier::Chunk) {
-        // Late held responses are released on execution completion, rather
-        // than leaving the server response handle or reassembly retained.
-        observe_until(|| {
-            let stats = fixture.host.memory_stats().server.unwrap();
-            stats.shm.used_bytes == 0
-                && stats.file.used_bytes == 0
-                && stats.reassembly.used_bytes == 0
-        });
-    }
-    let stats = fixture.host.memory_stats().server.unwrap();
-    let outgoing = fixture.runtime.outgoing_memory_stats().unwrap();
+    observe_until(|| client_operations(&fixture.runtime) == 0);
+    let server_idle = carrier.idle_client_memory();
+    observe_until(|| server_memory(&fixture.host).used_bytes == server_idle);
+
+    let incoming = fixture.host.memory_stats().server;
+    let outgoing = fixture.runtime.memory_stats().client;
+    let incoming_memory = incoming.memory.unwrap();
+    let outgoing_memory = outgoing.memory.unwrap();
+    assert_eq!(outgoing_memory.used_bytes, idle_client_memory);
+    assert_eq!(incoming.file_spill.unwrap().used_bytes, 0);
+    assert_eq!(outgoing.file_spill.unwrap().used_bytes, 0);
     match carrier {
         Carrier::Inline => {
-            assert_eq!(stats.shm.peak_bytes, 0);
-            assert_eq!(stats.reassembly.peak_bytes, 0);
-            assert_eq!(outgoing.shm.peak_bytes, 0);
+            assert!(incoming_memory.peak_bytes <= nbytes + 5);
+            assert_eq!(outgoing_memory.peak_bytes, nbytes);
         }
-        Carrier::Buddy | Carrier::Dedicated => {
-            // No chunk reassembly/file fallback occurred in either direction.
-            assert!(stats.shm.peak_bytes >= nbytes);
-            assert!(outgoing.shm.peak_bytes >= nbytes);
-            assert_eq!(stats.reassembly.peak_bytes, 0);
-            assert_eq!(outgoing.reassembly.peak_bytes, 0);
-            assert_eq!(stats.file.peak_bytes, 0);
-            assert_eq!(outgoing.file.peak_bytes, 0);
+        Carrier::Buddy => {
+            assert_eq!(incoming_memory.used_bytes, 256 * 1024);
+            assert!(outgoing_memory.peak_bytes >= 256 * 1024 + nbytes);
+        }
+        Carrier::Dedicated => {
+            // A 128 KiB loan exceeds each 64 KiB buddy segment. The
+            // serialized input and dedicated loan overlap before dispatch.
+            assert!(outgoing_memory.peak_bytes >= 2 * nbytes);
         }
         Carrier::Chunk => {
-            assert_eq!(stats.shm.peak_bytes, 0);
-            assert_eq!(outgoing.shm.peak_bytes, 0);
-            assert!(stats.reassembly.peak_bytes >= nbytes);
-            assert!(outgoing.reassembly.peak_bytes >= nbytes);
-            assert!(stats.file.peak_bytes >= nbytes);
-            assert!(outgoing.file.peak_bytes >= nbytes);
+            assert!(outgoing_memory.rejected_allocations > 0, "SHM was tried");
+            assert!(incoming.file_spill.unwrap().peak_bytes >= nbytes);
         }
     }
     assert_eq!(
@@ -357,20 +368,11 @@ fn ipc_chunk_late_held_releases_native_reassembly() {
     check_late_ipc(Carrier::Chunk);
 }
 
-fn check_ipc_input_refund_while_reply_waits(carrier: Carrier, options: CallOptions, slots: u64) {
-    let fixture = fixture(carrier);
-    let nbytes = if matches!(carrier, Carrier::Inline) {
-        512
-    } else {
-        128 * 1024
-    };
-    fixture
-        .runtime
-        .set_call_execution_limits(CallExecutionLimitsOverrides {
-            max_outstanding_calls: Some(2),
-            payload_buffer_budget_bytes: Some(nbytes as u64),
-        })
-        .unwrap();
+fn check_ipc_input_refund_while_reply_waits(carrier: Carrier, options: CallOptions) {
+    let nbytes = carrier.payload_size();
+    let server_capacity = carrier.memory_limit().max(2 * nbytes as u64 + 128 * 1024);
+    let fixture = ipc_fixture(carrier, carrier.memory_limit(), server_capacity, 2);
+    let idle_client_memory = carrier.idle_client_memory();
 
     let waiting = fixture.client.with_call_options(options);
     let first = std::thread::spawn(move || waiting.call_owned("echo", &vec![0xa5; nbytes]));
@@ -379,33 +381,23 @@ fn check_ipc_input_refund_while_reply_waits(carrier: Carrier, options: CallOptio
         .recv_timeout(EVENT_WAIT)
         .expect("first request reached the gated resource callback");
 
-    // The server has received and copied A's input, while A is still waiting
-    // for its reply. Its only B charge must already have followed the sent
-    // input owner out of the client, regardless of the IPC carrier.
     assert!(
         !first.is_finished(),
         "the gated reply completed unexpectedly"
     );
-    // Receiving the request can race the sender processing its write receipt.
-    // Observe that receipt's refund while the reply remains behind the gate.
-    observe_until(|| fixture.runtime.payload_buffer_stats().unwrap().used_bytes == 0);
-    let pending = fixture.runtime.call_execution_snapshot().unwrap();
-    assert_eq!(pending.used_operations, slots);
-    assert_eq!(
-        fixture.runtime.payload_buffer_stats().unwrap().used_bytes,
-        0
-    );
+    // Receipt processing can trail callback entry. Wait for the first
+    // serialized input's reservation to end while its operation stays live.
+    observe_until(|| client_memory(&fixture.runtime).used_bytes == idle_client_memory);
+    assert_eq!(client_operations(&fixture.runtime), 1);
 
-    // B needs the entire same budget. Exercise both explicit preparation and
-    // the real encode/dispatch path before allowing A's callback to return.
     let second = fixture
         .client
         .with_call_options(CallOptions::with_timeout(CallTimeout::After(EVENT_WAIT)));
     let mut prepared = second.begin_call("echo").unwrap();
     prepared.charge_input(nbytes as u64).unwrap();
     assert_eq!(
-        fixture.runtime.payload_buffer_stats().unwrap().used_bytes,
-        nbytes as u64
+        client_memory(&fixture.runtime).used_bytes,
+        idle_client_memory + nbytes as u64
     );
     let reply = prepared
         .encode_vec(vec![0x5a; nbytes])
@@ -417,17 +409,10 @@ fn check_ipc_input_refund_while_reply_waits(carrier: Carrier, options: CallOptio
 
     fixture.gate.open();
     assert_eq!(first.join().unwrap().unwrap(), vec![0xa5; nbytes]);
-    observe_until(|| {
-        fixture
-            .runtime
-            .call_execution_snapshot()
-            .unwrap()
-            .used_operations
-            == 0
-    });
+    observe_until(|| client_operations(&fixture.runtime) == 0);
     assert_eq!(
-        fixture.runtime.payload_buffer_stats().unwrap().used_bytes,
-        0
+        client_memory(&fixture.runtime).used_bytes,
+        idle_client_memory
     );
     assert_eq!(fixture.calls.load(Ordering::SeqCst), 2);
 }
@@ -437,9 +422,8 @@ fn ipc_inline_refunds_sent_input_before_reply_for_finite_and_unlimited() {
     check_ipc_input_refund_while_reply_waits(
         Carrier::Inline,
         CallOptions::with_timeout(CallTimeout::After(EVENT_WAIT)),
-        1,
     );
-    check_ipc_input_refund_while_reply_waits(Carrier::Inline, unlimited(), 0);
+    check_ipc_input_refund_while_reply_waits(Carrier::Inline, unlimited());
 }
 
 #[test]
@@ -447,9 +431,8 @@ fn ipc_shm_refunds_sent_input_before_reply_for_finite_and_unlimited() {
     check_ipc_input_refund_while_reply_waits(
         Carrier::Buddy,
         CallOptions::with_timeout(CallTimeout::After(EVENT_WAIT)),
-        1,
     );
-    check_ipc_input_refund_while_reply_waits(Carrier::Buddy, unlimited(), 0);
+    check_ipc_input_refund_while_reply_waits(Carrier::Buddy, unlimited());
 }
 
 #[test]
@@ -457,21 +440,13 @@ fn ipc_chunk_refunds_sent_input_before_reply_for_finite_and_unlimited() {
     check_ipc_input_refund_while_reply_waits(
         Carrier::Chunk,
         CallOptions::with_timeout(CallTimeout::After(EVENT_WAIT)),
-        1,
     );
-    check_ipc_input_refund_while_reply_waits(Carrier::Chunk, unlimited(), 0);
+    check_ipc_input_refund_while_reply_waits(Carrier::Chunk, unlimited());
 }
 
 #[test]
 fn zero_deadline_and_zero_budget_reject_before_serializer_or_business() {
-    let fixture = fixture(Carrier::Inline);
-    fixture
-        .runtime
-        .set_call_execution_limits(CallExecutionLimitsOverrides {
-            max_outstanding_calls: Some(0),
-            payload_buffer_budget_bytes: Some(0),
-        })
-        .unwrap();
+    let fixture = ipc_fixture(Carrier::Inline, 0, 1024 * 1024, 0);
     let zero = fixture
         .client
         .with_call_options(CallOptions::with_timeout(CallTimeout::After(
@@ -489,34 +464,21 @@ fn zero_deadline_and_zero_budget_reject_before_serializer_or_business() {
     };
     assert_semantic(error, ErrorCode::CallCapacityExceeded, "pre_dispatch");
     assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
-    assert_eq!(
-        fixture
-            .runtime
-            .call_execution_snapshot()
-            .unwrap()
-            .used_operations,
-        0
-    );
-    assert_eq!(
+    assert_eq!(client_operations(&fixture.runtime), 0);
+    assert_semantic(
         fixture
             .client
             .with_call_options(unlimited())
             .call_owned("echo", b"")
-            .unwrap(),
-        b""
+            .unwrap_err(),
+        ErrorCode::CallCapacityExceeded,
+        "pre_dispatch",
     );
 }
 
 #[test]
 fn reservation_precedes_serializer_and_byte_rejection_precedes_materialization() {
-    let fixture = fixture(Carrier::Inline);
-    fixture
-        .runtime
-        .set_call_execution_limits(CallExecutionLimitsOverrides {
-            max_outstanding_calls: Some(1),
-            payload_buffer_budget_bytes: Some(8),
-        })
-        .unwrap();
+    let fixture = ipc_fixture(Carrier::Inline, 8, 1024 * 1024, 1);
     let client = fixture.client.with_call_options(finite());
     let mut first = client.begin_call("echo").unwrap();
     first.charge_input(8).unwrap();
@@ -547,14 +509,7 @@ fn reservation_precedes_serializer_and_byte_rejection_precedes_materialization()
     assert_semantic(error, ErrorCode::CallCapacityExceeded, "pre_dispatch");
     assert_eq!(materializations.load(Ordering::SeqCst), 0);
     assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
-    assert_eq!(
-        fixture
-            .runtime
-            .call_execution_snapshot()
-            .unwrap()
-            .used_operations,
-        0
-    );
+    assert_eq!(client_operations(&fixture.runtime), 0);
 }
 
 #[test]
@@ -562,18 +517,8 @@ fn non_send_caller_serializer_keeps_original_deadline_and_never_materializes_exp
     let fixture = fixture(Carrier::Inline);
     let client = fixture.client.with_call_options(finite());
     let prepared = client.begin_call("echo").unwrap();
-    assert_eq!(
-        fixture
-            .runtime
-            .call_execution_snapshot()
-            .unwrap()
-            .used_operations,
-        1
-    );
-    assert_eq!(
-        fixture.runtime.payload_buffer_stats().unwrap().used_bytes,
-        0
-    );
+    assert_eq!(client_operations(&fixture.runtime), 1);
+    assert_eq!(client_memory(&fixture.runtime).used_bytes, 0);
     // This Rc-backed codec is deliberately not Send and is invoked directly
     // on the caller after slot admission. Its synchronous work is not promised
     // to finish by D; only the subsequent native boundary enforces original D.
@@ -600,26 +545,12 @@ fn non_send_caller_serializer_keeps_original_deadline_and_never_materializes_exp
     assert_eq!(codec_state.get(), 1);
     assert_eq!(materializations.load(Ordering::SeqCst), 0);
     assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
-    assert_eq!(
-        fixture
-            .runtime
-            .call_execution_snapshot()
-            .unwrap()
-            .used_operations,
-        0
-    );
+    assert_eq!(client_operations(&fixture.runtime), 0);
 }
 
 #[test]
 fn runtime_clones_and_different_clients_share_outstanding_domain_without_reset() {
-    let fixture = fixture(Carrier::Dedicated);
-    fixture
-        .runtime
-        .set_call_execution_limits(CallExecutionLimitsOverrides {
-            max_outstanding_calls: Some(1),
-            payload_buffer_budget_bytes: Some(256 * 1024),
-        })
-        .unwrap();
+    let fixture = ipc_fixture(Carrier::Dedicated, 1024 * 1024, 1024 * 1024, 1);
     let runtime_clone = fixture.runtime.clone();
     let second = runtime_clone
         .connect(
@@ -645,32 +576,14 @@ fn runtime_clones_and_different_clients_share_outstanding_domain_without_reset()
     assert_semantic(error, ErrorCode::CallCapacityExceeded, "pre_dispatch");
     assert!(
         runtime_clone
-            .set_call_execution_limits(CallExecutionLimitsOverrides {
-                max_outstanding_calls: Some(2),
-                payload_buffer_budget_bytes: Some(256 * 1024),
-            })
+            .update_client_config(client_patch(256 * 1024, 2))
             .is_err()
     );
-    assert_eq!(
-        runtime_clone
-            .call_execution_snapshot()
-            .unwrap()
-            .used_operations,
-        1
-    );
+    assert_eq!(client_operations(&runtime_clone), 1);
     second.close();
-    assert_eq!(
-        fixture.runtime.payload_buffer_stats().unwrap().used_bytes,
-        0
-    );
+    assert_eq!(client_memory(&fixture.runtime).used_bytes, 0);
     fixture.gate.open();
-    observe_until(|| {
-        runtime_clone
-            .call_execution_snapshot()
-            .unwrap()
-            .used_operations
-            == 0
-    });
+    observe_until(|| client_operations(&runtime_clone) == 0);
 }
 
 #[test]
@@ -679,6 +592,11 @@ fn closing_last_client_view_after_timeout_keeps_actual_transport_until_late_held
     // Separate Runtime gives this client its own real connection; the fixture
     // control client cannot keep this connection alive for the continuation.
     let observer = Runtime::new(RuntimeOptions {
+        client_limits: DomainLimitsOverrides {
+            memory_budget_bytes: Some(Carrier::Dedicated.memory_limit()),
+            file_spill_budget_bytes: Some(0),
+            max_outstanding_calls: Some(16),
+        },
         use_process_relay_anchor: false,
         ..Default::default()
     })
@@ -700,14 +618,11 @@ fn closing_last_client_view_after_timeout_keeps_actual_transport_until_late_held
     };
     assert_semantic(error, ErrorCode::CallDeadlineExceeded, "dispatch_uncertain");
     client.close();
-    assert_eq!(
-        observer.call_execution_snapshot().unwrap().used_operations,
-        1
-    );
+    assert_eq!(client_operations(&observer), 1);
     fixture.gate.open();
-    observe_until(|| observer.call_execution_snapshot().unwrap().used_operations == 0);
-    observe_until(|| fixture.host.memory_stats().server.unwrap().shm.used_bytes == 0);
-    assert_eq!(observer.payload_buffer_stats().unwrap().used_bytes, 0);
+    observe_until(|| client_operations(&observer) == 0);
+    observe_until(|| server_memory(&fixture.host).used_bytes == 0);
+    observe_until(|| client_memory(&observer).used_bytes == 0);
 }
 
 #[test]
@@ -740,17 +655,10 @@ fn concurrent_options_views_and_successful_held_ignore_other_deadline() {
     // that this held result's own original timer has passed harmlessly.
     fixture.gate.open();
     assert_eq!(long_caller.join().unwrap().unwrap(), vec![0xa5; 128 * 1024]);
-    observe_until(|| {
-        fixture
-            .runtime
-            .call_execution_snapshot()
-            .unwrap()
-            .used_operations
-            == 0
-    });
-    observe_until(|| fixture.host.memory_stats().server.unwrap().shm.used_bytes == 0);
+    observe_until(|| client_operations(&fixture.runtime) == 0);
+    observe_until(|| server_memory(&fixture.host).used_bytes == 0);
     assert!(
-        fixture.host.memory_stats().server.unwrap().shm.peak_bytes >= bytes.len() as u64,
+        server_memory(&fixture.host).peak_bytes >= bytes.len() as u64,
         "the response must have used dedicated SHM"
     );
     assert_eq!(held.bytes(), bytes);
@@ -766,15 +674,7 @@ fn retirement_seals_calls_without_refunding_the_prepared_owner() {
         ..Default::default()
     })
     .unwrap();
-    runtime
-        .set_call_execution_limits_with_sources(
-            CallExecutionLimitsOverrides {
-                max_outstanding_calls: Some(1),
-                payload_buffer_budget_bytes: Some(8),
-            },
-            ConfigSources::empty(),
-        )
-        .unwrap();
+    runtime.update_client_config(client_patch(8, 1)).unwrap();
     let expected = fixture.client.expected_route().clone();
     let address = fixture.runtime.server_address().unwrap();
     let client = runtime
@@ -797,24 +697,14 @@ fn retirement_seals_calls_without_refunding_the_prepared_owner() {
         .expect("begin client-only retirement")
         .observe_until(retirement_deadline);
     assert!(retirement_completed, "{retirement_outcome:?}");
-    let observed = runtime.clone().call_execution_snapshot().unwrap();
+    let observed = runtime.clone().call_execution_snapshot().client;
     assert!(observed.closed);
-    assert_eq!(observed.used_operations, 1);
-    assert_eq!(runtime.payload_buffer_stats().unwrap().used_bytes, 8);
-    assert!(
-        runtime
-            .set_call_execution_limits(CallExecutionLimitsOverrides {
-                max_outstanding_calls: Some(10),
-                payload_buffer_budget_bytes: Some(100),
-            })
-            .is_err()
-    );
+    assert_eq!(observed.used_operations, Some(1));
+    assert_eq!(client_memory(&runtime).used_bytes, 8);
+    assert!(runtime.update_client_config(client_patch(100, 10)).is_err());
     drop(prepared);
-    assert_eq!(
-        runtime.call_execution_snapshot().unwrap().used_operations,
-        0
-    );
-    assert_eq!(runtime.payload_buffer_stats().unwrap().used_bytes, 0);
+    assert_eq!(client_operations(&runtime), 0);
+    assert_eq!(client_memory(&runtime).used_bytes, 0);
     assert!(matches!(
         runtime.connect(expected, Connect::DirectIpc { address }),
         Err(Error::Lifecycle(LifecycleError::RuntimeRetired))
@@ -841,24 +731,11 @@ fn snapshot_does_not_freeze_limits_and_clones_observe_same_configuration() {
     })
     .unwrap();
     let clone = runtime.clone();
-    let sources = ConfigSources::empty();
-    let initial = runtime.call_execution_snapshot().unwrap();
-    assert_eq!(initial.used_operations, 0);
-    clone
-        .set_call_execution_limits_with_sources(
-            CallExecutionLimitsOverrides {
-                max_outstanding_calls: Some(7),
-                payload_buffer_budget_bytes: Some(11),
-            },
-            sources,
-        )
-        .unwrap();
-    let observed = runtime.call_execution_snapshot().unwrap();
-    assert_eq!(observed.max_operations, 7);
-    assert!(
-        runtime.payload_buffer_stats().is_none(),
-        "observation must not freeze B"
-    );
+    let initial = runtime.call_execution_snapshot();
+    assert_eq!(initial.client.used_operations, None);
+    clone.update_client_config(client_patch(11, 7)).unwrap();
+    assert_eq!(runtime.call_execution_snapshot(), initial);
+    assert!(runtime.memory_stats().client.memory.is_none());
     let host = fixture(Carrier::Inline);
     let client = runtime
         .connect(
@@ -869,9 +746,11 @@ fn snapshot_does_not_freeze_limits_and_clones_observe_same_configuration() {
         )
         .unwrap();
     drop(client.begin_call("echo").unwrap());
-    assert_eq!(runtime.payload_buffer_stats().unwrap().limit_bytes, 11);
-    assert_eq!(runtime.payload_buffer_stats(), clone.payload_buffer_stats());
-    assert_eq!(observed, clone.call_execution_snapshot().unwrap());
+    assert_eq!(client_memory(&runtime).limit_bytes, 11);
+    assert_eq!(runtime.memory_stats().client, clone.memory_stats().client);
+    let observed = runtime.call_execution_snapshot();
+    assert_eq!(observed.client.max_operations, Some(7));
+    assert_eq!(observed, clone.call_execution_snapshot());
 }
 
 struct HttpServer {
@@ -1071,11 +950,8 @@ fn check_http_refresh(expire: bool, uncertain_error: bool, initial_resolve: bool
             "pre_dispatch",
         );
         gate.add_permits(1);
-        assert_eq!(
-            runtime.call_execution_snapshot().unwrap().used_operations,
-            0
-        );
-        assert_eq!(runtime.payload_buffer_stats().unwrap().used_bytes, 0);
+        assert_eq!(client_operations(&runtime), 0);
+        assert_eq!(client_memory(&runtime).used_bytes, 0);
         assert_eq!(first_calls.load(Ordering::SeqCst), 0);
         assert_eq!(next_calls.load(Ordering::SeqCst), 0);
         return;
@@ -1085,10 +961,7 @@ fn check_http_refresh(expire: bool, uncertain_error: bool, initial_resolve: bool
         .unwrap()
         .with_call_options(finite());
     // Initial connect/probe completed independently of this business scope.
-    assert_eq!(
-        runtime.call_execution_snapshot().unwrap().used_operations,
-        0
-    );
+    assert_eq!(client_operations(&runtime), 0);
     let next_call = client.clone();
     let caller = std::thread::spawn(move || client.call_owned("echo", b"original-input"));
     if uncertain_error {
@@ -1110,7 +983,7 @@ fn check_http_refresh(expire: bool, uncertain_error: bool, initial_resolve: bool
         );
         assert_eq!(resolves.load(Ordering::SeqCst), 1);
         assert_eq!(next_calls.load(Ordering::SeqCst), 0);
-        observe_until(|| runtime.payload_buffer_stats().unwrap().used_bytes == 0);
+        observe_until(|| client_memory(&runtime).used_bytes == 0);
 
         // A fresh logical call may resolve the invalidated route. It receives
         // its own absolute D; the prior request has no retained replay copy.
@@ -1126,8 +999,8 @@ fn check_http_refresh(expire: bool, uncertain_error: bool, initial_resolve: bool
             );
             // Acquisition has its own projection of this same D. Unlike a
             // dispatched call it ends at expiry, independently of the server gate.
-            observe_until(|| runtime.call_execution_snapshot().unwrap().used_operations == 0);
-            assert_eq!(runtime.payload_buffer_stats().unwrap().used_bytes, 0);
+            observe_until(|| client_operations(&runtime) == 0);
+            assert_eq!(client_memory(&runtime).used_bytes, 0);
             gate.add_permits(1);
             assert_eq!(next_calls.load(Ordering::SeqCst), 0);
         } else {
@@ -1242,31 +1115,7 @@ async fn http_gated_body(State(state): State<HeldHttpState>, body: Bytes) -> (St
 }
 
 #[test]
-fn http_explicit_unlimited_and_600_seconds_bypass_legacy_total_request_timer() {
-    const CHILD: &str = "C2_CORE_CALL_DEADLINE_POLICY_CHILD";
-    if std::env::var_os(CHILD).is_none() {
-        // Environment policy is exercised in one isolated test process; no
-        // concurrent test in this binary observes the artificially tiny timer.
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "http_explicit_unlimited_and_600_seconds_bypass_legacy_total_request_timer",
-                "--nocapture",
-            ])
-            .env(CHILD, "1")
-            .env("C2_ENV_FILE", "")
-            .env("C2_RELAY_CALL_TIMEOUT", "0.25")
-            .env_remove("C2_RELAY_ANCHOR_ADDRESS")
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "isolated HTTP policy proof failed:\n{}\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        return;
-    }
+fn http_unlimited_and_long_calls_keep_slots_through_another_calls_expiry() {
     let expected = ContractRelease::from_descriptor_json(DESCRIPTOR.as_bytes())
         .unwrap()
         .expected_route(unique("http-held-policy"))
@@ -1312,8 +1161,8 @@ fn http_explicit_unlimited_and_600_seconds_bypass_legacy_total_request_timer() {
     let unlimited = std::thread::spawn(move || forever.call_held("echo", b"unlimited"));
     entered.recv_timeout(EVENT_WAIT).unwrap();
     entered.recv_timeout(EVENT_WAIT).unwrap();
-    // Starting this scope after both POST entry events proves the other
-    // responses remain pending far beyond the old 250ms reqwest total timer.
+    // Start the short scope after both earlier POSTs entered. All three
+    // slots remain owned until the original HTTP responses finish.
     let short = client.with_call_options(finite());
     let timer = std::thread::spawn(move || short.call_owned("echo", b"finite-timer"));
     entered.recv_timeout(EVENT_WAIT).unwrap();
@@ -1323,9 +1172,9 @@ fn http_explicit_unlimited_and_600_seconds_bypass_legacy_total_request_timer() {
         "dispatch_uncertain",
     );
     assert_eq!(
-        runtime.call_execution_snapshot().unwrap().used_operations,
-        2,
-        "Unlimited must not consume a continuation slot; finite and 600s still own theirs"
+        client_operations(&runtime),
+        3,
+        "all dispatched calls must retain their slots past the short deadline"
     );
     gate.add_permits(3);
     let mut long = long.join().unwrap().unwrap();
@@ -1334,6 +1183,6 @@ fn http_explicit_unlimited_and_600_seconds_bypass_legacy_total_request_timer() {
     assert_eq!(unlimited.bytes(), b"unlimited");
     long.invalidate_then_release(|| Ok(())).unwrap();
     unlimited.invalidate_then_release(|| Ok(())).unwrap();
-    observe_until(|| runtime.call_execution_snapshot().unwrap().used_operations == 0);
-    assert_eq!(runtime.payload_buffer_stats().unwrap().used_bytes, 0);
+    observe_until(|| client_operations(&runtime) == 0);
+    assert_eq!(client_memory(&runtime).used_bytes, 0);
 }
