@@ -181,6 +181,13 @@ if sys.argv[1] == "host":
         direct_pull_peak = memory_stats()["server"]["memory"]["peak_bytes"]
         assert direct_pull_peak >= len(DATA), direct_pull_peak
         emit({"status":"direct_pull_sampled", "server_pull_peak_bytes":direct_pull_peak})
+        assert sys.stdin.readline().strip() == "sample_direct_echo"
+        direct_echo_server = memory_stats()["server"]
+        direct_echo_peak = direct_echo_server["memory"]["peak_bytes"]
+        direct_echo_spill = direct_echo_server["file_spill"]["peak_bytes"]
+        assert len(DATA) <= direct_echo_peak < 2 * len(DATA) and direct_echo_spill == 0, direct_echo_server
+        emit({"status":"direct_echo_sampled", "server_echo_peak_bytes":direct_echo_peak,
+              "server_echo_spill_peak_bytes":direct_echo_spill})
         assert sys.stdin.readline().strip() == "stop"
         invalidated = resource.verify_borrowed_inputs()
         server_peak = memory_stats()["server"]["memory"]["peak_bytes"]
@@ -377,6 +384,7 @@ def require_direct_shm_evidence(
     pull_client: dict[str, object],
     pull_host: dict[str, object],
     direct_client: dict[str, object],
+    echo_host: dict[str, object],
     payload_bytes: int,
 ) -> dict[str, int]:
     if pull_client.get("client_pull_peak_bytes") != 0 or pull_client.get("client_spill_peak_bytes") != 0:
@@ -387,11 +395,21 @@ def require_direct_shm_evidence(
             f"server_pull_peak_bytes={server_pull_peak!r}, expected at least {payload_bytes} bytes"
         )
     client_echo_peak = require_memory_peak(direct_client, "client", 2 * payload_bytes)
+    server_echo_peak = echo_host.get("server_echo_peak_bytes")
+    server_echo_spill = echo_host.get("server_echo_spill_peak_bytes")
+    if (type(server_echo_peak) is not int
+            or not (payload_bytes <= server_echo_peak < 2 * payload_bytes)
+            or server_echo_spill != 0):
+        raise RuntimeError(
+            f"direct echo fell back to server reassembly: peak={server_echo_peak!r}, spill={server_echo_spill!r}"
+        )
     return {
         "server_pull_peak_bytes": server_pull_peak,
         "client_pull_peak_bytes": 0,
         "client_spill_peak_bytes": 0,
         "client_echo_peak_bytes": client_echo_peak,
+        "server_echo_peak_bytes": server_echo_peak,
+        "server_echo_spill_peak_bytes": 0,
     }
 
 
@@ -571,6 +589,7 @@ def main() -> int:
                     if pull_sampled.get("status") != "direct_pull_sampled":
                         raise RuntimeError(f"Host direct pull sample failed: {pull_sampled}")
                     direct_result: dict[str, object] | None = None
+                    echo_sampled: dict[str, object] | None = None
                     for mode, address in [("direct", ready["address"]), ("relay", url)]:
                         result = read_result(run([str(python), str(script), "client", address, mode, str(inputs)],
                                                  work, environment))
@@ -582,10 +601,15 @@ def main() -> int:
                         if mode == "direct":
                             direct_payload_bytes = result["payload_bytes"]
                             direct_result = result
+                            host.stdin.write("sample_direct_echo\n")
+                            host.stdin.flush()
+                            echo_sampled = host_result(messages, host_log, timeout=5)
+                            if echo_sampled.get("status") != "direct_echo_sampled":
+                                raise RuntimeError(f"Host direct echo sample failed: {echo_sampled}")
                         receipt["checks"].append(result)
-                    assert direct_result is not None
+                    assert direct_result is not None and echo_sampled is not None
                     receipt["direct_shm_evidence"] = require_direct_shm_evidence(
-                        pull_result, pull_sampled, direct_result, direct_payload_bytes,
+                        pull_result, pull_sampled, direct_result, echo_sampled, direct_payload_bytes,
                     )
                     host.stdin.write("stop\n")
                     host.stdin.flush()
