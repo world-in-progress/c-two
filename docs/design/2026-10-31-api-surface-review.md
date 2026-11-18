@@ -1,6 +1,6 @@
 # 交互面精简审查
 
-日期：2026-10-31。输入：upstream main `606b8f13`。状态：用户同意 Host 的建议（2026-10-31）。第一、二节与决定 2、3 已实施并验收，2026-11-03 经 [world-in-progress/c-two#215](https://github.com/world-in-progress/c-two/pull/215) 合入上游 main，macOS 并排验证与 fork 全量 CI [41173746331](https://github.com/Dsssyc/c-two/actions/runs/41173746331)（Linux、macOS、Windows x64 与 ARM64）都已通过。第三节的逐项表已于 2026-11-16 经维护者批准；第六节的所有者子系统已决定删除，并入协议批（2026-11-01）。
+日期：2026-10-31。输入：upstream main `606b8f13`。状态：用户同意建议（2026-10-31）。第一、二节与决定 2、3 已实施并验收，2026-11-03 经 [world-in-progress/c-two#215](https://github.com/world-in-progress/c-two/pull/215) 合入上游 main，macOS 并排验证与 fork 全量 CI [41173746331](https://github.com/Dsssyc/c-two/actions/runs/41173746331)（Linux、macOS、Windows x64 与 ARM64）都已通过。第三节的逐项表已于 2026-11-16 经维护者批准，并于 2026-11-17 经三平台基准与复合进程审查补订定稿（见[配置收敛执行计划](2026-11-16-config-convergence-plan.md)）；第六节的所有者子系统已决定删除，并入协议批（2026-11-01）。
 
 起因：用户要求按 C-Two 的品味审查各个交互面是否足够精简。理由不只是方便下游开发者：C-Two 不在模型已有的知识里，AI 只能把接口读进上下文，接口越大，越占上下文，也越容易丢掉关键细节，这不利于在 C-Two 之上继续做更复杂的下游应用。流式 RPC 是将来必须有的能力，它新增的接口也按本文的分层与预算来设计。
 
@@ -119,23 +119,23 @@ Python 的布局：
 
 | 设置 | 建议 | 理由 |
 | --- | --- | --- |
-| `shm_backing_budget_bytes`（8 GiB）、`live_reassembly_budget_bytes`（8 GiB）、载荷缓冲预算 `C2_CALL_PAYLOAD_BUFFER_BUDGET_BYTES`（16 GiB） | 合并为每个 Runtime、每个 relay 一个内存预算 | 部署方关心的是 C-Two 一共占多少内存，现在要分别懂三个格子。合并之后不同用途争用同一份预算，一个 Runtime 连接自己时（例如流接收侧按整条条目预留、发送侧写内联帧或分配 backing）可能互相等待，执行计划里要逐一核对进展 |
-| `file_backing_budget_bytes`（16 GiB） | 保留，作为文件溢出预算 | 磁盘与内存是两种资源 |
+| `shm_backing_budget_bytes`（8 GiB）、`live_reassembly_budget_bytes`（8 GiB）、载荷缓冲预算 `C2_CALL_PAYLOAD_BUFFER_BUDGET_BYTES`（16 GiB） | 合并为每个激活角色域（Runtime 的客户端域、Runtime 的 Host 域）与每个 relay 各一个内存预算（2026-11-17 补订） | 部署方关心的是内存上限，不必分别懂三个格子。复合进程在资源回调内发起下游调用（`A -> B -> C`）时，若客户端与 Host 共用同一池，排队的入站请求占满预算会导致回调内的阻塞出站预留永久互等；按角色懒创建独立域可消除跨角色挤占，纯客户端与纯 Host 进程仍只激活一个域 |
+| `file_backing_budget_bytes`（16 GiB） | 保留，作为文件溢出预算（按角色域与 relay 独立） | 磁盘与内存是两种资源；内存预算耗尽时分片重组须能真实回退到文件溢出预算 |
 | `spill_threshold`（0.8） | 固定常量 | 它取观察到的可用内存的比例，本身随机器伸缩；部署方的限制由内存预算表达 |
 | `max_dedicated_segments`（4） | 删除；独占段的个数只受线上协议的段索引范围限制，字节由内存预算约束 | 个数上限按"通常情况"限制了同时在途的独占段，槽位用完时独占段分配失败（`c2-mem/src/pool.rs` 的 `alloc_dedicated`） |
-| `max_inflight_chunk_frames`（512） | 删除计数，在途分片帧及其工作存储计入内存预算 | 槽位用完时请求以 `ResourceUnavailable` 失败；B8 修的就是这一类按通常情况设的上限。重组登记表据它推导的维护阈值改由预算推导，替换时保留拒绝与所有权顺序 |
+| `max_inflight_chunk_frames`（512） | 删除公开计数，在途分片帧及其每请求待拷贝队列节点计入内存预算，内部阻塞拷贝并发度按硬件并行度推导 | 原槽位用完时请求以 `ResourceUnavailable` 失败；改为每请求帧队列并在首片发布重组存储后轮转调度，既兼容窄窗口小分片，又避免每帧派生任务或饿死首片 |
 
 池与分片，改为内部常数或推导：
 
 | 设置 | 建议 | 理由 |
 | --- | --- | --- |
-| `pool_enabled`、`pool_prewarm_segments`、`pool_min_retained_segments` | 删除 | 开池不额外占内存，关掉只会变慢（10-31 实测）；预热与保留没有使用者 |
+| `pool_enabled`、`pool_prewarm_segments`、`pool_min_retained_segments` | 删除 | 开池前未建段不占内存，关掉只会变慢（10-31 实测）；预热与保留没有使用者 |
 | `pool_decay_seconds`（60 秒） | 固定常量 | 调优常数 |
-| `pool_segment_size`（256 MiB）、`max_pool_segments`（4）、`reassembly_segment_size`（64 MiB）、`reassembly_max_segments`（4） | 由内存预算推导 | 段的大小与个数现在只被用来压低占用；有了内存预算，可以从它算出。推导方式与默认值看三个平台的基准 |
+| `pool_segment_size`（256 MiB）、`max_pool_segments`（4）、`reassembly_segment_size`（64 MiB）、`reassembly_max_segments`（4） | 由内存预算推导；主池单段上限收为 `64 MiB`、最多 `16` 段，重组池最多 `4` 段 | 三平台实测确认 Unix 段映射完全稀疏，而 Windows `CreateFileMappingW`（`SEC_COMMIT`）在首次建段时按整段扣减系统提交额度，且 `64 MiB` 与 `256 MiB` 热复用延迟一致（Linux `1 MiB` 载荷下 `64 MiB` 更快），`64 MiB × 16` 保住 `1 GiB` 容量同时将 Windows 单池初始提交额度降低 4 倍 |
 | `chunk_size`（128 KiB），Node 的 `requestChunkSize` | 固定常量 | 协议内部机制 |
 | `chunk_threshold_ratio` | 删除 | 已证实没有作用（见待办第 3 项） |
-| `chunk_assembler_timeout`（60 秒）、`chunk_gc_interval`（5 秒） | 固定常量 | 前者从一次重组最后的活动算起（`c2-wire/src/chunk/registry.rs`），不随载荷变大 |
-| `shm_threshold`（4 KiB），Node 的 `requestShmThreshold` | 固定常量，取三个平台实测的交叉点 | macOS 上交叉点在 8 KB 到 64 KB 之间（10-31 实测） |
+| `chunk_assembler_timeout`（60 秒）、`chunk_gc_interval`（5 秒） | 固定常量 | 前者从一次重组最后的收片或拷贝活动算起，不随载荷变大 |
+| `shm_threshold`（4 KiB），Node 的 `requestShmThreshold` | 固定常量 `16 KiB`（`16384`，严格 `>` 判定） | macOS arm64、Windows 11 x64 与 Linux x86_64 实测共同确认：`<= 16 KiB` 走内联避免小包建段，超过 `16 KiB` 走 SHM |
 | `C2_REMOTE_PAYLOAD_CHUNK_SIZE`（1 MiB） | 固定常量 | 调优常数 |
 
 这两项都改为常量之后，`cc.set_transport_policy(...)` 整个消失。
@@ -151,15 +151,13 @@ Python 的布局：
 
 | 设置 | 建议 | 理由 |
 | --- | --- | --- |
-| `max_execution_workers`（默认按主机并行度取 4 到 64） | 保留 | 执行线程数是进程的资源，随机器而变；路由的 `max_workers` 表达的是一条路由的语义，两者不重复 |
-| `max_pending_requests`（整个 Server 1024） | 删除独立设置；服务端准入并入 Runtime 的统一在途调用上限，排队请求的本地副本计入内存预算（2026-11-16 维护者决定） | 服务端不必维护第二套全局计数，且原计数约束不了大请求字节。现在一元请求的本地副本复制出传输之后不计入任何预算（重组预算在复制后释放，c2-server 的预算只管 SHM、文件与重组的 backing）。实施时先把请求号高水位推进与活动表插入拆开，OPEN 在建调用记录和复制本地副本之前先检查统一在途调用上限，本地副本立即按字节计入内存预算，不足时在进入资源前以 `NotExecuted` 拒绝；控制回复脱离全 Server 共享信号量，改为每条物理连接独立有界（如 `min(max(1, N), 64)`），单连接满额只停用该连接的新准入；路由仍有自己的 `max_pending` |
-| `C2_CALL_MAX_OUTSTANDING`、`set_call_execution_limits(max_outstanding_calls=…)`、`--call-max-outstanding`（默认随内存预算推导） | 保留并统一为每个 Runtime（客户端与 Host 共用）、每个 relay 的唯一在途调用上限（2026-11-16 维护者决定） | 有状态 RPC 在等待者断开或超时后不中止已越过派发边界的一元调用，relay 又把多个客户端复用到同一条上游 IPC 物理连接，0 字节调用与空闲服务端流无法单靠字节预算或文件描述符约束；而内存预算推导不出不同计算开销和抗攻击意图下的并发上限。统一覆盖全部原生调用（含无截止时间的一元调用与服务端流），同进程调用计 1 次、IPC 自连两侧各计 1 次，立即给或立即拒（`717 CallCapacityExceeded`），绝不等待；载荷字节预算保持完整 `M` 不切分。内存预算 `M == 0` 且显式设正数上限时报配置错误，`M == 0` 时上限为 `0`（关闭全部新业务调用，保留拒绝、释放与关闭），`M > 0` 且未显式设置时默认取 `max(64, floor(M / 65536))`。同批闭合 relay 的三处旁路：删除无使用者的公开 `POST /_echo` 及其自测，准入前错误响应改为不等待字节预算的控制回复，`unary_response` 将名额移入响应 `Body` 直至完成或丢弃 |
+| `max_execution_workers`（默认按主机并行度取 4 到 64，显式值须 `>= 1`） | 保留；服务端 Tokio 阻塞线程池按 `max(512, W + C + E + 16)` 显式派生（`C`、`E` 由主机并行度夹在 `4..=64` 推导） | 执行线程数是进程的资源，随机器而变；显式拉高服务端阻塞池并为分片拷贝 `C` 与流编码 `E` 留出独立门控，防止大 `W` 或高并发流饿死底层拷贝 |
+| `max_pending_requests`（整个 Server 1024） | 删除独立设置；服务端准入并入 Host 角色域的在途调用上限，排队请求的本地副本计入 Host 内存预算（2026-11-16 批准，2026-11-17 补订） | 服务端不必维护第二套命名与计数，且原计数约束不了大请求字节。实施时把请求号高水位推进与活动表插入拆开，OPEN 在建调用记录和复制本地副本之前先检查在途调用上限与内存预算，不足时在进入资源前以 `NotExecuted` 拒绝；控制回复脱离全 Server 共享信号量，改为每条物理连接独立有界（`min(max(1, N), 64)`），单连接满额只停用该连接的新准入；路由仍有自己的 `max_pending` |
+| `C2_CALL_MAX_OUTSTANDING`、`set_client`/`set_server` 的 `max_outstanding_calls`、`--call-max-outstanding`（默认随该域内存预算推导） | 保留并统一为每个激活角色域（客户端域、Host 域）与每个 relay 的在途调用上限（2026-11-16 批准，2026-11-17 补订） | 有状态 RPC 在等待者断开或超时后不中止已越过派发边界的一元调用，relay 又把多个客户端复用到同一条上游 IPC 物理连接，0 字节调用与空闲服务端流无法单靠字节预算或文件描述符约束。统一覆盖全部一元调用（含无截止时间调用）与服务端流，同进程直调计入目标 Host 的 `N`（不激活客户端域）并在回调异常出口剥离内层 `pre_dispatch` 标记，IPC 自连由两侧角色域各自计 1 次，立即给或立即拒（`717 CallCapacityExceeded`），绝不等待。该域内存预算 `M == 0` 且显式设正数上限时报配置错误，`M == 0` 时上限为 `0`（关闭该域全部新业务调用，保留拒绝、释放与关闭），`M > 0` 且未显式设置时默认取 `max(64, floor(M / 65536))`。同批闭合 relay 的四处缺口：删除无使用者的公开 `POST /_echo` 及其自测，准入前错误响应改为不等待字节预算的控制回复，`unary_response` 将名额移入响应 `Body` 直至完成或丢弃，多片响应与流的下载窗口在该次转发内循环复用 |
 | `C2_RELAY_CALL_TIMEOUT`（300 秒） | 删除；经 relay 的调用与直接 IPC 一样，默认不设截止时间 | 现在没有逐次截止时间的 HTTP 调用 300 秒后失败，并成为派发不确定，同一个调用走直接 IPC 却一直等。逐次调用的截止时间是限制等待的唯一途径 |
 | `C2_RELAY_ANTI_ENTROPY_INTERVAL`（60 秒） | 固定常量 | mesh 的调优常数 |
 
-按上表收敛后剩 13 个环境变量。留下的值在 Python、Rust 与 `c3` 里各从哪里设置，在执行计划里定，原则是一个值只有一个入口。同一批顺带处理 R09、R10（EnvCatalog 加载四次）与 C4（客户端池再比一遍 Core 已冻结的配置）。新的两个名字"内存预算"与"文件溢出预算"在实施时写进术语表，术语表里"调用槽"专指路由 `max_pending` 限制的容量（与 Runtime、relay 的在途调用上限分开），"超时"一条提到的已删设置随之改写。
-
-维护者决定逐项表后，在同一批里把环境变量、代码覆盖键和文档一起删干净。原有 IPC 覆盖保留 `max_payload_size` 与 `max_execution_workers`，内存与文件溢出预算的设置入口另定。
+按上表收敛后剩 13 个环境变量，全部去掉 `C2_IPC_` / `C2_CALL_PAYLOAD_` 等内部实现前缀（保留 `C2_IPC_ROOT`）；Python 公开代码入口收敛为对称的 `cc.set_client(...)` 与 `cc.set_server(...)`（删掉 `set_transport_policy`、`set_call_execution_limits` 与 `ipc_overrides` 字典），Rust 收敛为 `RuntimeOptions`（客户端域）与 `HostOptions`（Host 域），`c3 relay` 收敛为三项容量标志（见[配置收敛执行计划](2026-11-16-config-convergence-plan.md)）。同一批顺带处理 R09、R10（EnvCatalog 加载四次）与 C4（客户端池再比一遍 Core 已冻结的配置）。新的两个名字"内存预算"与"文件溢出预算"在实施时写进术语表，"超时"一条提到的已删设置随之改写。
 
 ## 四、错误类型
 
