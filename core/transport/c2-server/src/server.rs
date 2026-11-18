@@ -3070,10 +3070,15 @@ impl CopyCoordinatorScope {
             }
         };
         if should_spawn {
+            // Construct the running guard before `tokio::spawn` and move it
+            // into the future so `coordinator_running` is cleared even if the
+            // executor drops the task before its first poll.
+            let running_guard = CoordinatorRunningGuard::new(server.copy_scheduler.clone());
             tokio::spawn(copy_coordinator(
                 Arc::downgrade(server),
                 server.copy_scheduler.clone(),
                 server.copy_permits.clone(),
+                running_guard,
             ));
         }
         Self {
@@ -3096,13 +3101,28 @@ impl Drop for CopyCoordinatorScope {
 }
 
 struct CoordinatorRunningGuard {
-    scheduler: Arc<CopyScheduler>,
+    scheduler: Option<Arc<CopyScheduler>>,
+}
+
+impl CoordinatorRunningGuard {
+    fn new(scheduler: Arc<CopyScheduler>) -> Self {
+        Self {
+            scheduler: Some(scheduler),
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.scheduler = None;
+    }
 }
 
 impl Drop for CoordinatorRunningGuard {
     fn drop(&mut self) {
-        // Clears `coordinator_running` if the executor cancels this task.
-        self.scheduler.state.lock().coordinator_running = false;
+        if let Some(scheduler) = self.scheduler.take() {
+            // Clears `coordinator_running` if the executor cancels or drops
+            // this task (including before its first poll).
+            scheduler.state.lock().coordinator_running = false;
+        }
     }
 }
 
@@ -4280,10 +4300,8 @@ async fn copy_coordinator(
     server: std::sync::Weak<Server>,
     scheduler: Arc<CopyScheduler>,
     permits: Arc<Semaphore>,
+    mut running_guard: CoordinatorRunningGuard,
 ) {
-    let running_guard = CoordinatorRunningGuard {
-        scheduler: scheduler.clone(),
-    };
     loop {
         let work_notified = scheduler.work_notify.notified();
         tokio::pin!(work_notified);
@@ -4304,7 +4322,7 @@ async fn copy_coordinator(
             if state.active_scopes == 0 {
                 state.ready.clear();
                 state.coordinator_running = false;
-                std::mem::forget(running_guard);
+                running_guard.disarm();
                 return;
             }
             !state.ready.is_empty()

@@ -401,13 +401,16 @@ impl Fixture {
         let root = Path::new("/tmp").join(unique("c2-persist"));
         #[cfg(windows)]
         let root = std::env::temp_dir().join(unique("c2-persist"));
-        let mut dir = std::fs::DirBuilder::new();
         #[cfg(unix)]
         {
             use std::os::unix::fs::DirBuilderExt;
-            dir.mode(0o700);
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&root)
+                .unwrap();
         }
-        dir.create(&root).unwrap();
+        #[cfg(not(unix))]
+        std::fs::create_dir(&root).unwrap();
         #[cfg(unix)]
         let context = LocalEndpointContext::with_unix_root(&root).unwrap();
         #[cfg(windows)]

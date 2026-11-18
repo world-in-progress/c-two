@@ -1872,13 +1872,16 @@ mod tests {
             std::process::id(),
             TEST_ID.fetch_add(1, TestOrdering::Relaxed)
         ));
-        let mut builder = std::fs::DirBuilder::new();
         #[cfg(unix)]
         {
             use std::os::unix::fs::DirBuilderExt;
-            builder.mode(0o700);
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&spill_dir)
+                .unwrap();
         }
-        builder.create(&spill_dir).unwrap();
+        #[cfg(not(unix))]
+        std::fs::create_dir(&spill_dir).unwrap();
 
         let budget = domain(TOTAL_CHUNKS as u64, TOTAL_SIZE as u64);
         let pool = Arc::new(RwLock::new(

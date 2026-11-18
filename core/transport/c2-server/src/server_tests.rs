@@ -8835,3 +8835,98 @@ fn executor_shutdown_with_retained_server_arc_closes_accepted_connection() {
         .await;
     });
 }
+
+#[tokio::test]
+async fn normal_scope_exit_drops_scheduler_without_leaking_arc() {
+    let server = chunk_test_server("ipc://normal_scope_exit_no_leak", 4);
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut route = make_host_route(&server, "grid");
+    route.callback = Arc::new(EchoRequestBytes {
+        calls: calls.clone(),
+    });
+    server.register_route(route).await.unwrap();
+    let weak_server = Arc::downgrade(&server);
+    let weak_scheduler = Arc::downgrade(&server.copy_scheduler);
+
+    let (mut peer, stream) = isolated_pair().await;
+    let handler = tokio::spawn(handle_connection(Arc::clone(&server), stream));
+    handshake_test_client(&mut peer).await;
+    peer.write_all(&chunked_call_frame(1, 0, 2, b"ab", "grid"))
+        .await
+        .unwrap();
+    peer.write_all(&chunked_call_frame(1, 1, 2, b"CD", "grid"))
+        .await
+        .unwrap();
+    let (id, _, reply) = read_reply_frame(&mut peer).await;
+    assert_eq!(id, 1);
+    assert_call_end_status(&reply, CallStatus::Success);
+    assert_eq!(&reply[2..], b"abCD");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+    drop(peer);
+    handler.await.unwrap();
+    wait_until("coordinator exits on normal scope drain", || {
+        !server.copy_scheduler.is_coordinator_running()
+    })
+    .await;
+
+    drop(server);
+    assert!(weak_server.upgrade().is_none());
+    assert!(
+        weak_scheduler.upgrade().is_none(),
+        "normal coordinator exit must not leak Arc<CopyScheduler>"
+    );
+}
+
+#[test]
+fn unpolled_coordinator_drop_clears_running_flag_and_allows_restart() {
+    let setup_rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("setup runtime");
+    let server = setup_rt.block_on(async {
+        let server = chunk_test_server("ipc://unpolled_coordinator_drop", 4);
+        let mut route = make_host_route(&server, "grid");
+        route.callback = Arc::new(EchoRequestBytes {
+            calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        });
+        server.register_route(route).await.unwrap();
+        server
+    });
+
+    // `block_on` on a current-thread runtime returns immediately without
+    // polling the newly spawned coordinator task; dropping the runtime then
+    // drops the coordinator future before its first poll.
+    let pre_poll_rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("pre-poll runtime");
+    pre_poll_rt.block_on(async {
+        let scope = CopyCoordinatorScope::enter(&server);
+        assert!(server.copy_scheduler.is_coordinator_running());
+        drop(scope);
+    });
+    drop(pre_poll_rt);
+    assert!(
+        !server.copy_scheduler.is_coordinator_running(),
+        "dropping an unpolled coordinator must reset coordinator_running"
+    );
+
+    setup_rt.block_on(async {
+        let (mut peer, stream) = isolated_pair().await;
+        let handler = tokio::spawn(handle_connection(Arc::clone(&server), stream));
+        handshake_test_client(&mut peer).await;
+        peer.write_all(&chunked_call_frame(1, 0, 2, b"xy", "grid"))
+            .await
+            .unwrap();
+        peer.write_all(&chunked_call_frame(1, 1, 2, b"ZW", "grid"))
+            .await
+            .unwrap();
+        let (id, _, reply) = read_reply_frame(&mut peer).await;
+        assert_eq!(id, 1);
+        assert_call_end_status(&reply, CallStatus::Success);
+        assert_eq!(&reply[2..], b"xyZW");
+        drop(peer);
+        handler.await.unwrap();
+    });
+}
