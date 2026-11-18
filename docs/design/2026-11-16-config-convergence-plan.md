@@ -86,8 +86,8 @@
 ### 3. 段几何与服务端阻塞线程池推导公式
 
 - **段几何由该域内存预算 `M` 确定性推导（`MAX_BUDDY_SEGMENT = 64 MiB`）：**
-  - **主池（请求池 / 响应池）：** 当 `M >= 1 MiB` 时，`max_pool_segments = 16`，`pool_segment_size = clamp_pow2(M / 64, 64 KiB, 64 MiB)`（默认 `M = 16 GiB` 时为 `64 MiB × 16 = 1 GiB`，完整落在对端映射缓存 `255` 槽上限内，且将 Windows 单池首次建段的系统提交额度降低 4 倍）；当 `256 KiB <= M < 1 MiB` 时，`pool_segment_size = 64 KiB`，`max_pool_segments = floor(M / 262144)`（`1..=3` 段，主池总容量不超过 `M / 4`）；当 `M < 256 KiB` 时不建 buddy 段，直接走内联、独占段或分片。
-  - **重组池：** 当 `M >= 1 MiB` 时，`reassembly_max_segments = 4`，`reassembly_segment_size = clamp_pow2(M / 64, 64 KiB, 64 MiB)`；当 `M < 1 MiB` 时不建重组 buddy 段，直接走独占段或文件溢出 `F`。
+  - **主池（请求池 / 响应池）：** 令 `quarter = floor(M / 4)`；当 `M >= 256 KiB`（`quarter >= 64 KiB`）时，`max_pool_segments = min(16, floor(quarter / 65536))`（`M >= 4 MiB` 起为 `16` 段），`pool_segment_size = min(64 MiB, prev_pow2(floor(quarter / max_pool_segments)))`（默认 `M = 16 GiB` 时为 `64 MiB × 16 = 1 GiB`，对一切 `M >= 256 KiB` 严格满足主池总容量 `<= M / 4`，完整落在对端映射缓存 `255` 槽上限内，且将 Windows 单池首次建段的系统提交额度降低 4 倍）；当 `M < 256 KiB` 时不建 buddy 段，直接走内联、独占段或分片。
+  - **重组池：** 令 `sixteenth = floor(M / 16)`；当 `M >= 1 MiB`（`sixteenth >= 64 KiB`）时，`reassembly_max_segments = min(4, floor(sixteenth / 65536))`（`M >= 4 MiB` 起为 `4` 段），`reassembly_segment_size = min(64 MiB, prev_pow2(floor(sixteenth / reassembly_max_segments)))`（默认 `M = 16 GiB` 时为 `64 MiB × 4 = 256 MiB`，对一切 `M >= 1 MiB` 严格满足重组 buddy 容量 `<= M / 16`）；当 `M < 1 MiB` 时不建重组 buddy 段，直接走独占段或文件溢出 `F`。
   - **单次重组上限：** 客户端取对端路由通告的 `route.max_payload_size`，服务端取自身的 `max_payload_size`，删除独立的 `max_reassembly_bytes`。
 - **服务端 Tokio 阻塞线程池与内部拷贝门控由主机并行度 `P` 与 `W` 推导：**
   - 设 `P = available_parallelism()`（取不到时回退 `4`），`W = max_execution_workers`（默认 `clamp(P, 4, 64)`，显式值须 `>= 1`）：

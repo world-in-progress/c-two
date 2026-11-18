@@ -159,7 +159,7 @@ A prepared SHM reply becomes a loan once it enters the loan book before its firs
 
 ## Implementation references
 
-- [Native configuration](../../core/foundation/c2-config/src/memory.rs) and [IPC validation](../../core/foundation/c2-config/src/ipc.rs).
+- [Native configuration](../../core/foundation/c2-config/src/domain.rs) and [IPC validation](../../core/foundation/c2-config/src/ipc.rs).
 - [Budget reservation](../../core/foundation/c2-mem/src/budget.rs), [pool allocation](../../core/foundation/c2-mem/src/pool.rs), [memory pressure](../../core/foundation/c2-mem/src/pressure.rs), [dedicated backing](../../core/foundation/c2-mem/src/dedicated.rs), [buddy segments](../../core/foundation/c2-mem/src/buddy_segment.rs) and [file spill](../../core/foundation/c2-mem/src/spill.rs).
 - [Request transport](../../core/transport/c2-ipc/src/client.rs), [server responses](../../core/transport/c2-server/src/server.rs), [reassembly](../../core/protocol/c2-wire/src/assembler.rs) and [chunk registry](../../core/protocol/c2-wire/src/chunk/registry.rs).
 - [Runtime observations](../../core/runtime/c2-core/src/memory.rs), [native session projection](../../sdk/python/native/src/runtime_session_ffi.rs), [Python IPC overrides](../../sdk/python/src/c_two/config/ipc.py), [native override parsing](../../sdk/python/native/src/config_ffi.rs), [settings](../../sdk/python/src/c_two/config/settings.py) and [HeldResult](../../sdk/python/src/c_two/crm/transferable.py).
