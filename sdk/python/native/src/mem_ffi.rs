@@ -21,8 +21,6 @@ pub struct PyPoolConfig {
     #[pyo3(get)]
     pub segment_size: usize,
     #[pyo3(get)]
-    pub min_block_size: usize,
-    #[pyo3(get)]
     pub max_segments: usize,
     #[pyo3(get)]
     pub max_dedicated_segments: usize,
@@ -39,7 +37,6 @@ impl PyPoolConfig {
     #[new]
     #[pyo3(signature = (
         segment_size = 256 * 1024 * 1024,
-        min_block_size = 4096,
         max_segments = 8,
         max_dedicated_segments = 4,
         buddy_idle_decay_secs = 60.0,
@@ -49,21 +46,12 @@ impl PyPoolConfig {
     #[allow(clippy::too_many_arguments)] // PyO3 signature is the existing Python call boundary.
     fn new(
         segment_size: usize,
-        min_block_size: usize,
         max_segments: usize,
         max_dedicated_segments: usize,
         buddy_idle_decay_secs: f64,
         spill_threshold: f64,
         spill_dir: String,
     ) -> PyResult<Self> {
-        if !min_block_size.is_power_of_two() {
-            return Err(PyValueError::new_err("min_block_size must be a power of 2"));
-        }
-        if segment_size < min_block_size * 2 {
-            return Err(PyValueError::new_err(
-                "segment_size must be at least 2x min_block_size",
-            ));
-        }
         if !segment_size.is_power_of_two() {
             return Err(PyValueError::new_err("segment_size must be a power of 2"));
         }
@@ -75,7 +63,6 @@ impl PyPoolConfig {
         }
         Ok(Self {
             segment_size,
-            min_block_size,
             max_segments,
             max_dedicated_segments,
             buddy_idle_decay_secs,
@@ -86,9 +73,8 @@ impl PyPoolConfig {
 
     fn __repr__(&self) -> String {
         format!(
-            "PoolConfig(segment_size={}, min_block={}, max_seg={}, max_ded={}, spill_threshold={}, spill_dir='{}')",
+            "PoolConfig(segment_size={}, max_seg={}, max_ded={}, spill_threshold={}, spill_dir='{}')",
             self.segment_size,
-            self.min_block_size,
             self.max_segments,
             self.max_dedicated_segments,
             self.spill_threshold,
@@ -119,7 +105,6 @@ impl From<&PyPoolConfig> for PoolConfig {
         // mem facade always builds a default-policy pool.
         PoolConfig {
             segment_size: py.segment_size,
-            min_block_size: py.min_block_size,
             max_segments: py.max_segments,
             max_dedicated_segments: py.max_dedicated_segments,
             buddy_idle_decay_secs: py.buddy_idle_decay_secs,

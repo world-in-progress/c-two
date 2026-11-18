@@ -136,6 +136,10 @@ def _resource_failure(exc, phase):
     from .transferable import _cause_details
     if isinstance(exc, _ResourceFailure):
         return exc
+    if isinstance(exc, error.CoreError) and exc.error_bytes:
+        semantic = error.CCError.deserialize(memoryview(exc.error_bytes))
+        if semantic is not None:
+            return _ResourceFailure(semantic)
     failure = exc if isinstance(exc, error.CCError) else phase(str(exc), details=_cause_details(exc))
     return _ResourceFailure(failure)
 

@@ -15,20 +15,22 @@ import c_two as cc
 
 import c_two.observe
 from c_two.transport.client.util import ping
-from c_two.transport.registry import _get_default_runtime
+from c_two.transport.registry import _get_default_runtime, _reset_default_runtime
 from fastdb4py.payload import BuildPolicy, Builder, CompiledSpec, Payload, PayloadError
 
 
 @pytest.fixture(autouse=True)
 def collect_unreachable_owners():
+    _reset_default_runtime()
+    yield
     # Failed constructor tracebacks can form cycles holding an old session.
     # Collect unreachable owners from earlier tests; live producers remain
     # observable and no native counters or observations are reset here.
     gc.collect()
 
 
-CHUNK_SIZE = 16 * 1024
-REASSEMBLY_SEGMENT_SIZE = 1024 * 1024
+CHUNK_SIZE = 128 * 1024
+MIB = 1024 * 1024
 BLOB = bytes(range(251)) * 800 + b'\x00\xffX'
 BLOB_SPEC = {
     'schema': 'fastdb.payload.v1',
@@ -100,22 +102,22 @@ def _wait_ready(address: str) -> None:
 
 
 def _outgoing_cells(stats: dict) -> dict:
-    outgoing = stats['runtime_outgoing']
-    assert outgoing is not None
-    assert outgoing['role'] == 'runtime_outgoing'
-    assert outgoing['state'] == 'active'
-    return outgoing['cells']
+    client = stats['client']
+    assert client['frozen']
+    return client
 
 
 def _retired_outgoing_cells(stats: dict) -> dict:
-    assert stats['runtime_outgoing'] is None
-    outgoing = [
-        scope for scope in stats['retired']
-        if scope['role'] == 'runtime_outgoing'
-    ]
-    assert len(outgoing) == 1, stats['retired']
-    assert outgoing[0]['state'] == 'retired'
-    return outgoing[0]['cells']
+    assert not stats['client']['frozen']
+    roles = [role for role in stats['retired'] if role['role'] == 'client']
+    assert len(roles) == 1, stats['retired']
+    assert roles[0]['closed']
+    return roles[0]
+
+
+def _configure_file_reassembly() -> None:
+    cc.set_server(memory_budget_bytes=64 * 1024)
+    cc.set_client(memory_budget_bytes=128 * 1024, file_spill_budget_bytes=2 * MIB)
 
 
 @pytest.mark.timeout(60)
@@ -124,38 +126,17 @@ def test_local_hold_outlives_reassembly_backing_and_public_shutdown(tier: str) -
     """Reassembly is released before a local hold; checked views follow the hold."""
     cc.shutdown()
     route = f'memory-budget-{tier}-{uuid.uuid4().hex[:12]}'
-    server_overrides = {
-        'pool_segment_size': REASSEMBLY_SEGMENT_SIZE,
-        'reassembly_segment_size': REASSEMBLY_SEGMENT_SIZE,
-        'max_pool_segments': 1,
-        'reassembly_max_segments': 1,
-        'pool_prewarm_segments': 0,
-        'pool_min_retained_segments': 0,
-        'chunk_size': CHUNK_SIZE,
-        'max_inflight_chunk_frames': 64,
-        'max_reassembly_bytes': REASSEMBLY_SEGMENT_SIZE,
-        'shm_backing_budget_bytes': 0,
-        'file_backing_budget_bytes': 2 * REASSEMBLY_SEGMENT_SIZE,
-        'live_reassembly_budget_bytes': REASSEMBLY_SEGMENT_SIZE,
-    }
-    client_overrides = {
-        **server_overrides,
-        'shm_backing_budget_bytes': (
-            0 if tier == 'file' else 4 * REASSEMBLY_SEGMENT_SIZE
-        ),
-        'file_backing_budget_bytes': (
-            2 * REASSEMBLY_SEGMENT_SIZE if tier == 'file' else 0
-        ),
-        'pool_decay_seconds': 0.0,
-    }
     payload: Payload | None = None
     proxy = None
     held = None
     checked = None
     sequence = None
     try:
-        cc.set_server(ipc_overrides=server_overrides)
-        cc.set_client(ipc_overrides=client_overrides)
+        cc.set_server(memory_budget_bytes=64 * 1024)
+        cc.set_client(
+            memory_budget_bytes=128 * 1024 if tier == 'file' else 16 * MIB,
+            file_spill_budget_bytes=2 * MIB if tier == 'file' else 0,
+        )
         payload = _build_payload()
         cc.register(LargeOutput, LargeOutputResource(payload), name=route)
         address = cc.server_address()
@@ -165,9 +146,8 @@ def test_local_hold_outlives_reassembly_backing_and_public_shutdown(tier: str) -
         proxy = cc.connect(LargeOutput, name=route, address=address)
         assert proxy.client._mode == 'ipc'  # noqa: SLF001
         baseline = _outgoing_cells(cc.observe.memory_stats())
-        baseline_reassembly = baseline['reassembly']['used_bytes']
-        baseline_file = baseline['file']['used_bytes']
-        baseline_shm = baseline['shm']['used_bytes']
+        baseline_memory = baseline['memory']['used_bytes']
+        baseline_file = baseline['file_spill']['used_bytes']
 
         held = cc.hold(proxy.produce)()
         retained = held.value
@@ -184,14 +164,13 @@ def test_local_hold_outlives_reassembly_backing_and_public_shutdown(tier: str) -
         capacity = math.ceil(logical_len / CHUNK_SIZE) * CHUNK_SIZE
         active_stats = cc.observe.memory_stats()
         active = _outgoing_cells(active_stats)
-        assert active['reassembly']['used_bytes'] == baseline_reassembly
-        assert active['reassembly']['peak_bytes'] >= capacity
-        assert active['file']['used_bytes'] == baseline_file
+        assert active['file_spill']['used_bytes'] == baseline_file
         if tier == 'file':
-            assert active['file']['peak_bytes'] >= capacity
-            assert active['shm']['used_bytes'] == baseline_shm
+            assert active['file_spill']['peak_bytes'] >= capacity
+            assert active['memory']['used_bytes'] == baseline_memory
         else:
-            assert active['shm']['peak_bytes'] >= REASSEMBLY_SEGMENT_SIZE
+            assert active['memory']['peak_bytes'] >= capacity
+            assert active['file_spill']['peak_bytes'] == 0
         assert set(active_stats['holds']) == {
             'active_holds', 'total_held_bytes', 'oldest_hold_seconds', 'by_direction',
         }
@@ -205,8 +184,8 @@ def test_local_hold_outlives_reassembly_backing_and_public_shutdown(tier: str) -
 
         cc.shutdown()
         retired = _retired_outgoing_cells(cc.observe.memory_stats())
-        assert retired['reassembly']['used_bytes'] == baseline_reassembly
-        assert retired['file']['used_bytes'] == baseline_file
+        assert retired['memory']['used_bytes'] == baseline_memory
+        assert retired['file_spill']['used_bytes'] == baseline_file
         with checked.acquire() as access:
             assert access.bytes() == BLOB
         cc.close(proxy)
@@ -241,20 +220,19 @@ def test_local_hold_outlives_reassembly_backing_and_public_shutdown(tier: str) -
             after_release = cc.observe.memory_stats()
             retired_after = [
                 scope for scope in after_release['retired']
-                if scope['role'] == 'runtime_outgoing'
+                if scope['role'] == 'client'
             ]
             assert len(retired_after) <= 1
             # A fully drained observer may be pruned. If it remains, every
             # cell must return to its pre-call usage while proxy stays alive.
-            cells = retired_after[0]['cells'] if retired_after else None
+            cells = retired_after[0] if retired_after else None
             drained = (
                 after_release['holds']['active_holds'] == 0
                 and (
                     cells is None
                     or (
-                        cells['reassembly']['used_bytes'] == baseline_reassembly
-                        and cells['file']['used_bytes'] == baseline_file
-                        and cells['shm']['used_bytes'] == baseline_shm
+                        cells['memory']['used_bytes'] == baseline_memory
+                        and cells['file_spill']['used_bytes'] == baseline_file
                     )
                 )
             )
@@ -320,15 +298,7 @@ def test_early_zero_retirement_survives_an_inflight_response() -> None:
             hooks.append('stopped')
 
     try:
-        overrides = {
-            'pool_prewarm_segments': 0,
-            'shm_backing_budget_bytes': 0,
-            'file_backing_budget_bytes': 2 * REASSEMBLY_SEGMENT_SIZE,
-            'live_reassembly_budget_bytes': REASSEMBLY_SEGMENT_SIZE,
-            'chunk_size': CHUNK_SIZE,
-        }
-        cc.set_server(ipc_overrides=overrides)
-        cc.set_client(ipc_overrides=overrides)
+        _configure_file_reassembly()
         payload = _build_payload()
         resource = ObservedBlockedResource(payload, entered, proceed)
         cc.register(ObservedLargeOutput, resource, name=route)
@@ -338,7 +308,7 @@ def test_early_zero_retirement_survives_an_inflight_response() -> None:
         proxy = cc.connect(ObservedLargeOutput, name=route, address=address)
         old_session = _get_default_runtime()._runtime_session  # noqa: SLF001
         initial = _outgoing_cells(cc.observe.memory_stats())
-        assert all(initial[kind]['used_bytes'] == 0 for kind in ('shm', 'file', 'reassembly'))
+        assert all(initial[kind]['used_bytes'] == 0 for kind in ('memory', 'file_spill'))
         assert cc.observe.memory_stats()["holds"]['active_holds'] == 0
 
         def call_held() -> None:
@@ -350,16 +320,9 @@ def test_early_zero_retirement_survives_an_inflight_response() -> None:
         call_thread = threading.Thread(target=call_held, daemon=True)
         call_thread.start()
         assert entered.wait(timeout=5), 'real resource callback never started'
-        observation = old_session.retire_memory_observation()
-        observer.adopt_retired_memory_observation(observation)
-        # Re-adoption must not double-count the same domains or local-copy tracker.
-        observer.adopt_retired_memory_observation(observation)
-        del observation
-        for _ in range(3):
-            early = observer.memory_stats()
-            retired = _retired_outgoing_cells(early)
-            assert all(retired[kind]['used_bytes'] == 0 for kind in ('shm', 'file', 'reassembly'))
-            assert early['holds']['active_holds'] == 0
+        with pytest.raises(cc.error.CoreError, match='retirement must complete'):
+            observer.inherit_retirement(old_session)
+        assert not observer.memory_stats()['retired']
         assert not proceed.is_set()
 
         proceed.set()
@@ -371,15 +334,7 @@ def test_early_zero_retirement_survives_an_inflight_response() -> None:
             checked = sequence.at(0)
         with checked.acquire() as access:
             assert access.bytes() == BLOB
-        late = observer.memory_stats()
-        retired = _retired_outgoing_cells(late)
-        current = _outgoing_cells(cc.observe.memory_stats())
-        for kind in ('shm', 'file', 'reassembly'):
-            assert retired[kind] == current[kind]
-        assert retired['shm']['used_bytes'] == 0
-        assert retired['file']['used_bytes'] == 0
-        assert retired['reassembly']['used_bytes'] == 0
-        assert late['holds']['active_holds'] == cc.observe.memory_stats()["holds"]['active_holds'] == 1
+        assert cc.observe.memory_stats()['holds']['active_holds'] == 1
 
         # A second real callback blocks drain while the first held owner lives.
         entered.clear()
@@ -413,14 +368,16 @@ def test_early_zero_retirement_survives_an_inflight_response() -> None:
         call_outcome.pop('held')
         completed = cc.shutdown(timeout=10)
         assert completed['completed'] is True, completed
+        observer.inherit_retirement(old_session)
+        observer.inherit_retirement(old_session)
         assert hooks == ['stopped']
         assert _get_default_runtime()._runtime_session is not old_session  # noqa: SLF001
         with checked.acquire() as access:
             assert access.bytes() == BLOB
         after_shutdown = observer.memory_stats()
         retired = _retired_outgoing_cells(after_shutdown)
-        assert retired['file']['used_bytes'] == 0
-        assert retired['reassembly']['used_bytes'] == 0
+        assert retired['file_spill']['used_bytes'] == 0
+        assert retired['memory']['used_bytes'] == 0
         assert after_shutdown['holds']['active_holds'] == 1
 
         held.release()
@@ -433,7 +390,7 @@ def test_early_zero_retirement_survives_an_inflight_response() -> None:
         for _ in range(3):
             released = observer.memory_stats()
             cells = _retired_outgoing_cells(released)
-            assert all(cells[kind]['used_bytes'] == 0 for kind in ('shm', 'file', 'reassembly'))
+            assert all(cells[kind]['used_bytes'] == 0 for kind in ('memory', 'file_spill'))
             assert released['holds']['active_holds'] == 0
         # Zero stays observable while old_session/proxy are real producers;
         # the weak bundle disappears only after their final release.
@@ -490,20 +447,7 @@ def test_delivered_response_tracks_hold_after_confirmed_shutdown(monkeypatch) ->
     payload: Payload | None = None
     checked = None
     try:
-        cc.set_server(ipc_overrides={
-            'pool_prewarm_segments': 0,
-            'shm_backing_budget_bytes': 0,
-            'file_backing_budget_bytes': 2 * REASSEMBLY_SEGMENT_SIZE,
-            'live_reassembly_budget_bytes': REASSEMBLY_SEGMENT_SIZE,
-            'chunk_size': CHUNK_SIZE,
-        })
-        cc.set_client(ipc_overrides={
-            'pool_prewarm_segments': 0,
-            'shm_backing_budget_bytes': 0,
-            'file_backing_budget_bytes': 2 * REASSEMBLY_SEGMENT_SIZE,
-            'live_reassembly_budget_bytes': REASSEMBLY_SEGMENT_SIZE,
-            'chunk_size': CHUNK_SIZE,
-        })
+        _configure_file_reassembly()
         payload = _build_payload()
         cc.register(LargeOutput, LargeOutputResource(payload), name=route)
         address = cc.server_address()
@@ -539,8 +483,8 @@ def test_delivered_response_tracks_hold_after_confirmed_shutdown(monkeypatch) ->
         call_thread.start()
         assert decode_entered.wait(timeout=10), 'real response never reached FastDB decoder'
         delivered = _outgoing_cells(cc.observe.memory_stats())
-        assert delivered['file']['used_bytes'] == baseline['file']['used_bytes']
-        assert delivered['reassembly']['used_bytes'] == baseline['reassembly']['used_bytes']
+        assert delivered['file_spill']['used_bytes'] == baseline['file_spill']['used_bytes']
+        assert delivered['memory']['used_bytes'] == baseline['memory']['used_bytes']
         assert cc.observe.memory_stats()["holds"]['active_holds'] == 0
 
         shutdown_thread = threading.Thread(target=shut_down, daemon=True)
@@ -554,8 +498,8 @@ def test_delivered_response_tracks_hold_after_confirmed_shutdown(monkeypatch) ->
         for _ in range(3):
             stats = cc.observe.memory_stats()
             retired = _retired_outgoing_cells(stats)
-            assert retired['file']['used_bytes'] == baseline['file']['used_bytes']
-            assert retired['reassembly']['used_bytes'] == baseline['reassembly']['used_bytes']
+            assert retired['file_spill']['used_bytes'] == baseline['file_spill']['used_bytes']
+            assert retired['memory']['used_bytes'] == baseline['memory']['used_bytes']
             assert stats['holds']['active_holds'] == 0
             assert cc.observe.memory_stats()["holds"]['active_holds'] == 0
 
@@ -610,20 +554,12 @@ def test_failed_public_shutdown_retry_keeps_its_own_local_hold(monkeypatch) -> N
     """
     cc.shutdown()
     route = f'memory-retry-{uuid.uuid4().hex[:12]}'
-    overrides = {
-        'pool_prewarm_segments': 0,
-        'shm_backing_budget_bytes': 0,
-        'file_backing_budget_bytes': 2 * REASSEMBLY_SEGMENT_SIZE,
-        'live_reassembly_budget_bytes': REASSEMBLY_SEGMENT_SIZE,
-        'chunk_size': CHUNK_SIZE,
-    }
     payload: Payload | None = None
     proxy = None
     held = None
     checked = None
     try:
-        cc.set_server(ipc_overrides=overrides)
-        cc.set_client(ipc_overrides=overrides)
+        _configure_file_reassembly()
         payload = _build_payload()
         cc.register(LargeOutput, LargeOutputResource(payload), name=route)
         address = cc.server_address()
@@ -639,8 +575,8 @@ def test_failed_public_shutdown_retry_keeps_its_own_local_hold(monkeypatch) -> N
         with checked.acquire() as access:
             assert access.bytes() == BLOB
         live = _outgoing_cells(cc.observe.memory_stats())
-        assert live['reassembly']['used_bytes'] == baseline['reassembly']['used_bytes']
-        assert live['file']['used_bytes'] == baseline['file']['used_bytes']
+        assert live['memory']['used_bytes'] == baseline['memory']['used_bytes']
+        assert live['file_spill']['used_bytes'] == baseline['file_spill']['used_bytes']
         assert cc.observe.memory_stats()["holds"]['active_holds'] >= 1
 
         old_session = _get_default_runtime()._runtime_session  # noqa: SLF001
@@ -649,7 +585,7 @@ def test_failed_public_shutdown_retry_keeps_its_own_local_hold(monkeypatch) -> N
             raise RuntimeError('injected RuntimeSession construction failure')
 
         # The native class remains real; only this one replacement attempt is
-        # refused after retire_memory_observation() captures the old session.
+        # refused after native retirement reaches its terminal state.
         with monkeypatch.context() as constructor_patch:
             constructor_patch.setattr(type(old_session), '__init__', refuse_replacement)
             with pytest.raises(RuntimeError, match='injected RuntimeSession'):
@@ -657,16 +593,16 @@ def test_failed_public_shutdown_retry_keeps_its_own_local_hold(monkeypatch) -> N
 
         assert _get_default_runtime()._runtime_session is old_session  # noqa: SLF001
         failed = _outgoing_cells(cc.observe.memory_stats())
-        assert failed['reassembly']['used_bytes'] == baseline['reassembly']['used_bytes']
-        assert failed['file']['used_bytes'] == baseline['file']['used_bytes']
+        assert failed['memory']['used_bytes'] == baseline['memory']['used_bytes']
+        assert failed['file_spill']['used_bytes'] == baseline['file_spill']['used_bytes']
         assert cc.observe.memory_stats()["holds"]['active_holds'] >= 1
         with checked.acquire() as access:
             assert access.bytes() == BLOB
 
         cc.shutdown()
         retried = _retired_outgoing_cells(cc.observe.memory_stats())
-        assert retried['reassembly']['used_bytes'] == baseline['reassembly']['used_bytes']
-        assert retried['file']['used_bytes'] == baseline['file']['used_bytes']
+        assert retried['memory']['used_bytes'] == baseline['memory']['used_bytes']
+        assert retried['file_spill']['used_bytes'] == baseline['file_spill']['used_bytes']
         assert cc.observe.memory_stats()["holds"]['active_holds'] >= 1
         assert cc.observe.memory_stats()['holds']['active_holds'] >= 1
         # Both the proxy and its held checked owner remain referenced here.
@@ -682,7 +618,7 @@ def test_failed_public_shutdown_retry_keeps_its_own_local_hold(monkeypatch) -> N
         # old_session and proxy deliberately remain alive. Their zero-valued
         # metadata must stay observable; all physical charges must be gone.
         released = _retired_outgoing_cells(cc.observe.memory_stats())
-        for kind in ('shm', 'file', 'reassembly'):
+        for kind in ('memory', 'file_spill'):
             assert released[kind]['used_bytes'] == baseline[kind]['used_bytes']
     finally:
         if held is not None:

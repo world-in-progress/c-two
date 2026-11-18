@@ -35,32 +35,26 @@ def options(tmp_path, scenario='stopped', control='parallel'):
 
 
 @pytest.mark.parametrize('scenario,expected', [
-    ('hold', (1, 32, 32, 32)),
-    ('fallback_dedicated', (2, 32, 32, 32)),
-    ('fallback_inline', (2, 1, 32, 32)),
-    ('fallback_file', (2, 1, 0, 32)),
-    ('exhausted', (2, 1, 0, 0)),
+    ('hold', (1, 32 * 1024, 32 * 1024, 0)),
+    ('fallback_dedicated', (2, 2048, 32 * 1024, 0)),
+    ('fallback_inline', (2, 768, 32 * 1024, 0)),
+    ('fallback_file', (2, 768, 256, 1024)),
+    ('exhausted', (2, 768, 256, 0)),
 ])
 def test_scenario_budget_geometry(anomaly, tmp_path, scenario, expected):
     config = anomaly.scenario_spec(options(tmp_path, scenario))
-    inflight, server_shm, normal_shm, normal_file = expected
+    inflight, server, client, spill = expected
     assert config['inflight_calls'] == inflight
-    assert config['response_bytes'] == 300 * 1024
-    assert config['server_overrides']['pool_segment_size'] == anomaly.MIB
-    assert config['server_overrides']['max_pool_segments'] == 1
-    assert config['server_overrides']['shm_backing_budget_bytes'] == server_shm * anomaly.MIB
-    assert config['normal_overrides']['shm_backing_budget_bytes'] == normal_shm * anomaly.MIB
-    assert config['normal_overrides']['file_backing_budget_bytes'] == normal_file * anomaly.MIB
-    assert config['abnormal_overrides']['shm_backing_budget_bytes'] == 32 * anomaly.MIB
-    if scenario == 'exhausted':
-        assert config['server_overrides']['live_reassembly_budget_bytes'] == 0
-        assert config['normal_overrides']['live_reassembly_budget_bytes'] == 0
+    assert config['server_options']['memory_budget_bytes'] == server * 1024
+    assert config['normal_options']['memory_budget_bytes'] == client * 1024
+    assert config['normal_options']['file_spill_budget_bytes'] == spill * 1024
 
 
 def memory_snapshot(used=0, fd=8):
-    scope = {'role': 'server', 'cells': {'shm': {'used_bytes': used, 'peak_bytes': used}}}
+    inactive = dict(memory=None, file_spill=None)
+    scope = dict(memory={'used_bytes': used, 'peak_bytes': used}, file_spill=None)
     return {
-        'memory': {'stats': {'runtime_outgoing': None, 'server': scope, 'retired': []}},
+        'memory': {'stats': {'client': inactive, 'server': scope, 'retired': []}},
         'os': {
             'fd_count': {'value': fd}, 'handle_count': {'value': None},
             'mapping_count': {'value': None},
@@ -136,7 +130,6 @@ def install_fake_cc(monkeypatch, anomaly):
     cc = ModuleType('c_two')
     cc._native = SimpleNamespace()
     cc.ConcurrencyConfig = lambda **kwargs: SimpleNamespace(**kwargs)
-    cc.set_transport_policy = lambda **kwargs: None
     cc.set_server = lambda **kwargs: None
     cc.set_client = lambda **kwargs: None
     cc.register = lambda *args, **kwargs: None
@@ -276,11 +269,11 @@ def test_controller_rejects_missing_normal_attempts(anomaly, monkeypatch, tmp_pa
 
 
 @pytest.mark.parametrize('control,during_status,during_error,expected_ok', [
-    ('parallel', 'error', 'memory budget cell exhausted', True),
+    ('parallel', 'error', 'chunked reply reassembly admission failed', True),
     ('parallel', 'success', None, False),
     ('parallel', 'error', 'unrelated failure', False),
     ('alone', 'success', None, True),
-    ('alone', 'error', 'memory budget cell exhausted', False),
+    ('alone', 'error', 'chunked reply reassembly admission failed', False),
 ])
 def test_expected_capacity_failure_is_call_stage_and_parallel_only(
     anomaly, monkeypatch, tmp_path, control, during_status, during_error, expected_ok,
@@ -326,20 +319,14 @@ SCENARIOS = (
 
 
 @pytest.mark.parametrize('scenario', SCENARIOS)
-def test_overrides_match_their_native_role_key_sets(anomaly, tmp_path, scenario):
-    import re
-    source = (ROOT / 'core/foundation/c2-config/src/ipc.rs').read_text(encoding='utf-8')
-    def native_keys(name):
-        body = re.search(rf'pub const {name}:.*?= &\[(.*?)\];', source, re.S).group(1)
-        return set(re.findall(r'"([a-z_]+)"', body))
-    server_keys = native_keys('SERVER_IPC_OVERRIDE_KEYS')
-    client_keys = native_keys('CLIENT_IPC_OVERRIDE_KEYS')
+def test_options_match_their_public_role_signatures(anomaly, tmp_path, scenario):
+    import inspect
+    import c_two as cc
+
     config = anomaly.scenario_spec(options(tmp_path, scenario))
-    assert set(config['server_overrides']) <= server_keys
+    inspect.signature(cc.set_server).bind(**config['server_options'])
     for role in ('normal', 'abnormal'):
-        assert set(config[role + '_overrides']) <= client_keys
-    expected_frame_size = 16 * anomaly.MIB if scenario == 'release_blocked' else 64 * 1024
-    assert config['server_overrides']['max_frame_size'] == expected_frame_size
+        inspect.signature(cc.set_client).bind(**config[role + '_options'])
 
 
 @pytest.mark.parametrize('abnormal_calls', [1, 65, 80, 128])
@@ -347,7 +334,7 @@ def test_release_batch_has_execution_space_for_every_gated_call_and_normal_clien
     args = options(tmp_path, 'release_batch')
     args.abnormal_calls = abnormal_calls
     config = anomaly.scenario_spec(args)
-    assert config['server_overrides']['max_execution_workers'] >= config['inflight_calls'] + 1
+    assert config['server_options']['max_execution_workers'] >= config['inflight_calls'] + 1
     assert config['route_concurrency'] == {'mode': 'parallel', 'max_workers': None, 'max_pending': None}
 
 
@@ -375,18 +362,19 @@ def test_native_config_check_covers_every_scenario_and_role_without_starting_hos
     check_spec.loader.exec_module(check)
     cc = install_fake_cc(monkeypatch, anomaly)
     calls = []
-    def resolve(role, overrides, global_overrides):
-        calls.append((role, overrides, global_overrides))
-        if role == 'client' and 'max_frame_size' in overrides:
-            raise ValueError('server-only option passed to client')
-        return overrides
-    cc._native.resolve_server_ipc_config = lambda **kwargs: resolve('server', **kwargs)
-    cc._native.resolve_client_ipc_config = lambda **kwargs: resolve('client', **kwargs)
+    class Runtime:
+        def set_server(self, **options):
+            calls.append(('server', options))
+
+        def set_client(self, **options):
+            calls.append(('client', options))
+
+    cc.Runtime = Runtime
     cc.register = lambda *args, **kwargs: pytest.fail('config validation started a Host')
     cc.connect = lambda *args, **kwargs: pytest.fail('config validation connected a client')
     report = check.check_configs(80)
     assert report['ok'] is True, report['failures']
-    assert report['native_resolutions_attempted'] == report['native_resolutions_passed'] == 66
+    assert report['native_updates_attempted'] == report['native_updates_passed'] == 66
     assert len(calls) == 66
     assert sum(role == 'server' for role, *_ in calls) == 22
     assert sum(role == 'client' for role, *_ in calls) == 44
@@ -394,4 +382,4 @@ def test_native_config_check_covers_every_scenario_and_role_without_starting_hos
         (scenario, control) for scenario in SCENARIOS for control in ('alone', 'parallel')
     }
     batch = [row for row in report['rows'] if row['scenario'] == 'release_batch']
-    assert all(row['resolved']['server']['max_execution_workers'] == 81 for row in batch)
+    assert all(row['accepted']['server']['max_execution_workers'] == 81 for row in batch)

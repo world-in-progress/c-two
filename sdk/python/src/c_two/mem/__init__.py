@@ -10,7 +10,6 @@ Typical usage::
 
     pool = MemPool(PoolConfig(
         segment_size=256 * 1024 * 1024,
-        min_block_size=4096,
         max_segments=8,
     ))
     alloc = pool.alloc(65536)
@@ -20,13 +19,11 @@ Typical usage::
     del pool
 
 This module also carries the typed shape of :func:`c_two.observe.memory_stats`.
-Those counters describe C-Two-owned payload buffers, IPC backing and live
-reassembly accounting. They are independent scopes, not process RSS, and must never be
-summed and presented as physical memory usage.
+These counters describe role-domain budgets and local holds.
 """
 from __future__ import annotations
 
-from typing import TypedDict
+from typing import Literal, TypedDict
 
 from c_two._native import (
     MemPool,
@@ -35,14 +32,6 @@ from c_two._native import (
     PoolStats,
     cleanup_stale_shm,
 )
-
-
-class MemoryLimits(TypedDict):
-    """Resolved finite limits of one memory scope, in bytes."""
-
-    shm_backing_bytes: int
-    file_backing_bytes: int
-    live_reassembly_bytes: int
 
 
 class MemoryCellStats(TypedDict):
@@ -55,52 +44,47 @@ class MemoryCellStats(TypedDict):
     rejected_bytes: int
 
 
-class MemoryScopeStats(TypedDict):
-    """One scope-labelled budget snapshot.
+class RoleMemoryStats(TypedDict):
+    """Memory accounting for one role. Cells are None until activation."""
 
-    ``role`` is ``"runtime_outgoing"`` for a Runtime's outgoing client domain
-    or ``"server"`` for the server direction. ``state`` is ``"active"`` for
-    the current session's scope or ``"retired"`` for a domain kept observable
-    after ``cc.shutdown()`` while a real owner — an old proxy's native client,
-    an in-flight call, or outstanding backing charge guards — still keeps its
-    accounting alive.
-    """
-
-    role: str
-    state: str
-    limits: MemoryLimits
-    cells: dict[str, MemoryCellStats]
+    domain_id: int | None
+    generation: int
+    frozen: bool
+    closed: bool
+    memory: MemoryCellStats | None
+    file_spill: MemoryCellStats | None
 
 
-class RetiredScopeStats(MemoryScopeStats):
-    """A retired scope report.
+class RetiredRoleMemoryStats(RoleMemoryStats):
+    role: Literal['client', 'server']
 
-    A retired scope stays listed while a real owner keeps its backing
-    accounting alive. Local-copy metadata contributes to ``holds`` separately
-    and never retains an otherwise ownerless backing scope.
-    """
+
+class HoldBucketStats(TypedDict):
+    active_holds: int
+    total_held_bytes: int
+
+
+class HoldDirectionStats(TypedDict):
+    client_response: HoldBucketStats
+    resource_input: HoldBucketStats
+
+
+class HoldStats(HoldBucketStats):
+    oldest_hold_seconds: float | None
+    by_direction: HoldDirectionStats
 
 
 class MemoryStats(TypedDict):
-    """Result shape of :func:`c_two.observe.memory_stats`."""
+    """Read-only role-domain counters and local holds across sessions."""
 
-    runtime_outgoing: MemoryScopeStats | None
-    server: MemoryScopeStats | None
-    retired: list[RetiredScopeStats]
-    payload_buffer: MemoryCellStats | None
-    retired_payload_buffers: list[MemoryCellStats]
-    holds: dict
+    client: RoleMemoryStats
+    server: RoleMemoryStats
+    retired: list[RetiredRoleMemoryStats]
+    holds: HoldStats
 
 
 __all__ = [
-    "MemPool",
-    "PoolAlloc",
-    "PoolConfig",
-    "PoolStats",
-    "cleanup_stale_shm",
-    "MemoryLimits",
-    "MemoryCellStats",
-    "MemoryScopeStats",
-    "RetiredScopeStats",
-    "MemoryStats",
+    "MemPool", "PoolAlloc", "PoolConfig", "PoolStats", "cleanup_stale_shm",
+    "MemoryCellStats", "RoleMemoryStats", "RetiredRoleMemoryStats",
+    "HoldBucketStats", "HoldDirectionStats", "HoldStats", "MemoryStats",
 ]

@@ -415,9 +415,9 @@ def test_late_candidate_cannot_withdraw_or_close_current_owner(lab, private_root
         resolver.close()
 
 
+@pytest.mark.timeout(90)
 def test_background_idle_eviction_then_concurrent_reconnect(lab):
     """Gate 3: background closure precedes four callers sharing one reconnect."""
-    lab.client.set_client(ipc_overrides={"client_idle_timeout": 0.1})
     resource = lab.register("idle")
     proxy = lab.connect("idle")
     original_instance = lab.routes("idle")[0]["server_instance_id"] if lab.anchor is not None else None
@@ -427,13 +427,13 @@ def test_background_idle_eviction_then_concurrent_reconnect(lab):
     active_before = lab.accepted.active("server")
     cc.close(proxy)
     if lab.path == "relay_aware_relay":
-        # The relay's --idle-timeout=1 evicts the business carrier; its
+        # Relay idleness evicts the business carrier; its
         # independent upstream control connection retains route authority.
         wait_state(lambda: lab.accepted.active("server"),
-                   lambda ids: len(active_before - ids) == 1)
+                   lambda ids: len(active_before - ids) == 1, timeout=75)
     else:
         wait_state(lambda: lab.outgoing.ids("closed", "client"),
-                   lambda ids: outgoing_before <= ids)
+                   lambda ids: outgoing_before <= ids, timeout=75)
     assert resource.snapshot() == {"call": 1}
     if lab.anchor is not None:
         routes = lab.wait_route("idle")

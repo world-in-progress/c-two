@@ -27,7 +27,7 @@ def harness():
 
 
 @pytest.mark.parametrize('key,value', [
-    ('pool_enabled', 'false'),
+    ('response_only', 'false'),
     ('memory_stats', 'false'),
     ('require_memory_stats', 1),
     ('allow_unavailable_stats_after_shutdown', 'false'),
@@ -99,7 +99,7 @@ def test_matrix_requires_successful_process_and_complete_identity(
     monkeypatch.setattr(harness.subprocess, 'Popen', CompletedRow)
     monkeypatch.setattr(harness, 'source_commit', lambda: 'fixture')
     args = SimpleNamespace(
-        output_dir=tmp_path, only='idle_small_rpc_default_buddy', python=sys.executable,
+        output_dir=tmp_path, only='idle_small_rpc_roomy_memory', python=sys.executable,
         memory_stats=False, require_memory_stats=False,
         allow_unavailable_stats_after_shutdown=False, child_timeout=2, row_timeout=2,
     )
@@ -177,10 +177,11 @@ def test_failed_and_timed_out_calls_are_persisted(harness, tmp_path):
 
 
 def test_memory_stats_use_only_common_current_fields(harness):
-    scope = {'role': 'server', 'state': 'active', 'limits': {}, 'cells': {}, 'abandoned_releases': 7}
+    scope = dict(domain_id=1, generation=1, frozen=True, closed=False,
+                 memory=None, file_spill=None, abandoned_releases=7)
     holds = {key: 0 for key in ('active_holds', 'total_held_bytes', 'oldest_hold_seconds', 'by_direction')}
     holds['historical_field'] = 99
-    stats = harness.common_memory_stats({'runtime_outgoing': None, 'server': scope, 'retired': [scope], 'holds': holds})
+    stats = harness.common_memory_stats({'client': scope, 'server': scope, 'retired': [dict(scope, role='server')], 'holds': holds})
     assert set(stats['holds']) == {'active_holds', 'total_held_bytes', 'oldest_hold_seconds', 'by_direction'}
     assert 'abandoned_releases' not in stats['server']
     assert 'abandoned_releases' not in stats['retired'][0]
@@ -205,7 +206,7 @@ def test_windows_row_is_assigned_before_resume_and_job_is_closed(harness, monkey
     monkeypatch.setattr(harness, 'row_job', lambda: job)
     monkeypatch.setattr(harness.subprocess, 'Popen', Child)
     monkeypatch.setattr(harness, 'source_commit', lambda: 'fixture')
-    args = SimpleNamespace(output_dir=tmp_path, only='idle_small_rpc_default_buddy',
+    args = SimpleNamespace(output_dir=tmp_path, only='idle_small_rpc_roomy_memory',
         python=sys.executable, memory_stats=False, require_memory_stats=False,
         allow_unavailable_stats_after_shutdown=False, child_timeout=2, row_timeout=2)
     assert harness.run_matrix(args) == 0
@@ -239,7 +240,8 @@ def test_worker_records_every_call_and_only_readies_after_warmup(harness, monkey
     monkeypatch.setattr(harness, 'runtime_provenance', lambda native: {
         'module_path': '/fixture/native', 'sha256': 'a' * 64, 'repo': {'head': 'fixture'},
     })
-    empty = {'runtime_outgoing': None, 'server': None, 'retired': [], 'holds': {
+    inactive = dict(memory=None, file_spill=None)
+    empty = {'client': inactive, 'server': inactive, 'retired': [], 'holds': {
         'active_holds': 0, 'total_held_bytes': 0, 'oldest_hold_seconds': 0, 'by_direction': {},
     }}
     monkeypatch.setattr(harness, 'snapshot_memory_stats', lambda: {'available': True, 'stats': empty})
@@ -302,9 +304,10 @@ def test_worker_failure_before_barrier_keeps_original_report(harness, monkeypatc
 
 
 def test_cleanup_budget_charge_cannot_pass(harness):
-    stats = {'runtime_outgoing': None, 'server': None,
-        'retired': [{'role': 'runtime_outgoing', 'cells': {'file': {'used_bytes': 4096}}}],
+    inactive = dict(memory=None, file_spill=None)
+    stats = {'client': inactive, 'server': inactive,
+        'retired': [{'role': 'client', 'memory': None, 'file_spill': {'used_bytes': 4096}}],
         'holds': {'active_holds': 0}}
     failures = []
     harness.require_no_charges({'available': True, 'stats': stats}, 'cleanup', failures)
-    assert failures and 'runtime_outgoing/file=4096' in failures[0]
+    assert failures and 'client/file_spill=4096' in failures[0]

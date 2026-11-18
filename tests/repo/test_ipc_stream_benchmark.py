@@ -25,7 +25,7 @@ def stream():
 def test_rows_are_candidate_only_and_keep_budget_expectations(stream):
     rows = stream.matrix_rows()
     assert len(rows) == len({row['name'] for row in rows}) == 23
-    zero = next(row for row in rows if row['name'] == 'all_backing_zero')
+    zero = next(row for row in rows if row['name'] == 'reply_backing_exhausted')
     assert [stream.expected_capacity(zero, mode) for mode in stream.MODES] == [True, True, False]
     for row in rows:
         if row.get('budget_offset') is not None:
@@ -33,7 +33,7 @@ def test_rows_are_candidate_only_and_keep_budget_expectations(stream):
                 False, False, row['budget_offset'] < 0]
 
 
-@pytest.mark.parametrize('size', [4095, 4096, 4097, 65535, 65536, 65537, 262144])
+@pytest.mark.parametrize('size', [16383, 16384, 16385, 131071, 131072, 131073, 524288])
 def test_boundaries_use_encoded_size_including_pickle_header(stream, size):
     value = stream.sized_bytes(size, 'boundary')
     assert len(pickle.dumps(value, protocol=4)) == size
@@ -135,15 +135,14 @@ def test_standalone_mixed_diagnostic_is_recomputed_and_rejects_forged_native(str
 
 
 def test_transport_uses_actual_backing_and_stream_budget_peaks(stream):
-    row = dict(no_shm=True)
-    server = {'server': {'cells': {'shm': {'peak_bytes': 0}}}}
-    client = {'runtime_outgoing': {'cells': {'file': {'peak_bytes': 0}, 'reassembly': {'peak_bytes': 0}}},
-              'payload_buffer': {'peak_bytes': 100_000}}
+    row = dict(no_shm=True, file_fallback=True)
+    server = {'server': {'memory': {'limit_bytes': 8192}}}
+    client = {'client': {'memory': {'peak_bytes': 100_000}, 'file_spill': {'peak_bytes': 0}}}
+
     stream.verify_transport(row, 'S', server, client, 100_000, 200_000)
-    with pytest.raises(stream.BenchmarkError, match='file reassembly scenario'):
+    with pytest.raises(stream.BenchmarkError, match='file reassembly not observed'):
         stream.verify_transport(row, 'U', server, client, 100_000, 200_000)
-    client['runtime_outgoing']['cells']['file']['peak_bytes'] = 200_000
-    client['runtime_outgoing']['cells']['reassembly']['peak_bytes'] = 200_000
+    client['client']['file_spill']['peak_bytes'] = 200_000
     stream.verify_transport(row, 'U', server, client, 100_000, 200_000)
-    with pytest.raises(stream.BenchmarkError, match='unexpectedly used unary reassembly'):
+    with pytest.raises(stream.BenchmarkError, match='unexpected client file spill'):
         stream.verify_transport(row, 'S', server, client, 100_000, 200_000)

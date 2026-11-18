@@ -1,4 +1,4 @@
-"""Resolve every anomaly configuration with the installed native parsers.
+"""Validate every anomaly configuration through the installed Runtime setters.
 
 This check does not register a resource, connect a client, or allocate SHM.
 Run in each built baseline/candidate environment before real anomaly runs.
@@ -30,37 +30,34 @@ def check_configs(abnormal_calls: int) -> dict:
                 calls=3, warmup=1, pause_seconds=0.2, call_timeout=30.0,
                 child_timeout=120.0,
             ))
-            row = {'scenario': scenario, 'control': control, 'resolved': {}}
-            for role, resolver in (
-                ('server', _native.resolve_server_ipc_config),
-                ('normal', _native.resolve_client_ipc_config),
-                ('abnormal', _native.resolve_client_ipc_config),
-            ):
+            row = {'scenario': scenario, 'control': control, 'accepted': {}}
+            for role in ('server', 'normal', 'abnormal'):
+                runtime = cc.Runtime()
+                setter = runtime.set_server if role == 'server' else runtime.set_client
+                options = config[role + '_options']
                 try:
-                    row['resolved'][role] = dict(resolver(
-                        overrides=config[role + '_overrides'],
-                        global_overrides={'shm_threshold': config['shm_threshold']},
-                    ))
-                except Exception as exc:
+                    setter(**options)
+                    row['accepted'][role] = options
+                except (TypeError, ValueError, RuntimeError) as exc:
                     failures.append(f'{scenario}/{control}/{role}: {type(exc).__name__}: {exc}')
             route = cc.ConcurrencyConfig(**config['route_concurrency'])
             row['route_concurrency'] = {
                 'mode': route.mode, 'max_workers': route.max_workers,
                 'max_pending': route.max_pending,
             }
-            if scenario == 'release_batch' and 'server' in row['resolved']:
-                resolved_workers = row['resolved']['server']['max_execution_workers']
+            if scenario == 'release_batch' and 'server' in row['accepted']:
+                workers = row['accepted']['server']['max_execution_workers']
                 row['inflight_calls'] = config['inflight_calls']
-                if resolved_workers < config['inflight_calls'] + 1:
-                    failures.append(f'{scenario}/{control}: insufficient resolved execution workers: {resolved_workers}')
+                if workers < config['inflight_calls'] + 1:
+                    failures.append(f'{scenario}/{control}: insufficient execution workers: {workers}')
             rows.append(row)
     return {
         'schema': 'c-two.ipc-anomaly-config-check.v1',
         'source_commit': bench.source_commit(),
         'native': bench.runtime_provenance(_native),
         'abnormal_calls': abnormal_calls, 'scenarios': len(ANOMALIES),
-        'controls_checked': len(rows), 'native_resolutions_attempted': len(rows) * 3,
-        'native_resolutions_passed': sum(len(row['resolved']) for row in rows),
+        'controls_checked': len(rows), 'native_updates_attempted': len(rows) * 3,
+        'native_updates_passed': sum(len(row['accepted']) for row in rows),
         'rows': rows, 'failures': failures, 'ok': not failures,
     }
 

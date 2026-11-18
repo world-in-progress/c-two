@@ -38,7 +38,7 @@ def test_native_shutdown_accepts_zero_and_normal_timeout(timeout: float) -> None
 
     session = RuntimeSession()
     before = session.call_execution_snapshot()
-    assert before['closed'] is False
+    assert before['client']['closed'] is before['server']['closed'] is False
     outcome = dict(session.shutdown(timeout_seconds=timeout))
     assert outcome['completed'] is True
     assert outcome['ipc_clients_drained'] is False
@@ -120,44 +120,6 @@ def test_native_runtime_session_explicit_identity_is_lazy() -> None:
     assert session.server_credential is None  # Allocating an address did not bind.
 
 
-@pytest.mark.parametrize('side', ['server', 'client'])
-def test_native_runtime_session_projects_ipc_overrides_copy(side: str) -> None:
-    from c_two._native import RuntimeSession
-
-    expected = {
-        'write_timeout': 12.5,
-        'max_dedicated_segments': 2,
-        'spill_threshold': 0.5,
-        'pool_enabled': False,
-        'pool_segment_size': 2 * 1024 * 1024,
-        'max_pool_segments': 3,
-        'pool_prewarm_segments': 0,
-        'pool_min_retained_segments': 0,
-        'reassembly_segment_size': 16 * 1024 * 1024,
-        'reassembly_max_segments': 4,
-        'max_inflight_chunk_frames': 128,
-        'chunk_gc_interval': 0.5,
-        'chunk_threshold_ratio': 0.75,
-        'chunk_assembler_timeout': 1.0,
-        'max_reassembly_bytes': 32 * 1024 * 1024,
-        'shm_backing_budget_bytes': 0,
-        'file_backing_budget_bytes': 64 * 1024 * 1024,
-        'live_reassembly_budget_bytes': 0,
-    }
-    overrides = dict(expected, chunk_size=None)
-    option = f'{side}_ipc_overrides'
-    session = RuntimeSession(**{option: overrides})
-
-    projected = getattr(session, option)
-    assert projected == expected
-    assert list(projected) == list(expected)
-
-    overrides['pool_segment_size'] = 4 * 1024 * 1024
-    overrides['reassembly_segment_size'] = 32 * 1024 * 1024
-    projected.clear()
-    assert getattr(session, option) == expected
-
-
 def test_native_runtime_session_rejects_invalid_server_ids() -> None:
     from c_two._native import RuntimeSession
 
@@ -177,16 +139,15 @@ def test_registry_identity_is_native_owned() -> None:
     assert '_address_for_server_id' not in source
 
 
-def test_runtime_session_bridge_preflight_preserves_errors_and_owner(monkeypatch) -> None:
+def test_native_host_start_validates_configuration_without_losing_bridge(monkeypatch) -> None:
     session = RuntimeSession(server_id='bridge-owner', use_process_relay_anchor=False)
-    monkeypatch.setenv('C2_IPC_POOL_SEGMENT_SIZE', 'invalid')
-    monkeypatch.setenv('C2_IPC_POOL_DECAY_SECONDS', 'invalid')
-    for key in ('C2_IPC_POOL_SEGMENT_SIZE', 'C2_IPC_POOL_DECAY_SECONDS'):
-        with pytest.raises(ValueError, match=key):
-            session.ensure_server_bridge()
+    server = session.ensure_server_bridge()
+    for key in ('C2_MAX_PAYLOAD_SIZE', 'C2_MAX_EXECUTION_WORKERS'):
+        monkeypatch.setenv(key, 'invalid')
+        with pytest.raises(RuntimeError, match=key):
+            server.start()
         assert not session.host_started
         monkeypatch.delenv(key)
-    server = session.ensure_server_bridge()
     try:
         assert session.ensure_server_bridge() is server
         server.start()
@@ -211,12 +172,12 @@ def test_failed_server_construction_does_not_publish_identity() -> None:
             return 'pong'
 
     cc.shutdown()
-    cc.set_server(ipc_overrides={'pool_segment_size': 0})
     try:
         with pytest.raises(ValueError):
-            cc.register(BrokenConfigCRM, BrokenConfigImpl(), name='broken-config')
+            cc.set_server(max_payload_size=0)
         assert cc.endpoint.server_id() is None
         assert cc.server_address() is None
+        cc.register(BrokenConfigCRM, BrokenConfigImpl(), name='broken-config')
     finally:
         cc.shutdown()
 
@@ -628,19 +589,6 @@ def test_direct_ipc_acquire_waits_for_dynamic_route_publication() -> None:
         registrar.shutdown()
 
 
-def test_native_runtime_session_resolves_client_ipc_config(monkeypatch) -> None:
-    from c_two._native import RuntimeSession
-
-    monkeypatch.setenv('C2_ENV_FILE', '')
-    monkeypatch.setenv('C2_IPC_REASSEMBLY_SEGMENT_SIZE', str(32 * 1024 * 1024))
-    session = RuntimeSession(
-        client_ipc_overrides={'reassembly_segment_size': 16 * 1024 * 1024},
-    )
-
-    snapshot = session.client_ipc_config
-    assert snapshot['reassembly_segment_size'] == 16 * 1024 * 1024
-
-
 def test_set_client_preserves_pending_server_id_override() -> None:
     import c_two as cc
     import c_two.endpoint
@@ -657,7 +605,7 @@ def test_set_client_preserves_pending_server_id_override() -> None:
     cc.shutdown()
     try:
         cc.set_server(server_id='unit-preserve-server')
-        cc.set_client(ipc_overrides={'reassembly_segment_size': 16 * 1024 * 1024})
+        cc.set_client(memory_budget_bytes=16 * 1024 * 1024)
         cc.register(PreserveCRM, PreserveImpl(), name='preserve-route')
         assert cc.endpoint.server_id() == 'unit-preserve-server'
         assert cc.server_address() == 'ipc://unit-preserve-server'
@@ -665,22 +613,7 @@ def test_set_client_preserves_pending_server_id_override() -> None:
         cc.shutdown()
 
 
-def test_set_server_preserves_pending_client_overrides() -> None:
-    import c_two as cc
-    import c_two.endpoint
-    from c_two.transport.registry import _get_default_runtime
-
-    cc.shutdown()
-    try:
-        cc.set_client(ipc_overrides={'reassembly_segment_size': 16 * 1024 * 1024})
-        cc.set_server(server_id='unit-preserve-client')
-        registry = _get_default_runtime()
-        assert registry._runtime_session.client_ipc_config['reassembly_segment_size'] == 16 * 1024 * 1024  # noqa: SLF001
-    finally:
-        cc.shutdown()
-
-
-def test_set_client_after_direct_ipc_connect_warns() -> None:
+def test_set_client_after_direct_ipc_connect_raises() -> None:
     import pytest
     import c_two as cc
     import c_two.endpoint
@@ -700,8 +633,8 @@ def test_set_client_after_direct_ipc_connect_warns() -> None:
         address = cc.server_address()
         crm = cc.connect(FreezeCRM, name='freeze-route', address=address)
         try:
-            with pytest.warns(UserWarning, match='Client connections already exist'):
-                cc.set_client(ipc_overrides={'reassembly_segment_size': 16 * 1024 * 1024})
+            with pytest.raises(cc.error.CoreError, match='configuration is frozen'):
+                cc.set_client(memory_budget_bytes=19 * 1024 * 1024)
         finally:
             cc.close(crm)
     finally:
@@ -725,7 +658,7 @@ def test_set_client_after_register_preserves_server_identity() -> None:
     try:
         cc.set_server(server_id='unit-after-register')
         cc.register(AfterRegisterCRM, AfterRegisterImpl(), name='after-register-route')
-        cc.set_client(ipc_overrides={'reassembly_segment_size': 16 * 1024 * 1024})
+        cc.set_client(memory_budget_bytes=16 * 1024 * 1024)
         assert cc.endpoint.server_id() == 'unit-after-register'
         assert cc.server_address() == 'ipc://unit-after-register'
         crm = cc.connect(
@@ -738,80 +671,6 @@ def test_set_client_after_register_preserves_server_identity() -> None:
         finally:
             cc.close(crm)
     finally:
-        cc.shutdown()
-
-
-def test_runtime_session_client_config_respects_transport_policy() -> None:
-    import c_two as cc
-    import c_two.endpoint
-    from c_two.transport.registry import _get_default_runtime
-
-    cc.shutdown()
-    try:
-        cc.set_transport_policy(shm_threshold=16384)
-        registry = _get_default_runtime()
-        assert registry._runtime_session.client_ipc_config['shm_threshold'] == 16384  # noqa: SLF001
-    finally:
-        cc.shutdown()
-
-
-def test_set_transport_policy_after_direct_ipc_connect_warns() -> None:
-    import pytest
-    import c_two as cc
-    import c_two.endpoint
-
-    @cc.crm(namespace='cc.test.runtime_session_policy_freeze', version='0.1.0')
-    class PolicyCRM:
-        def ping(self) -> str:
-            ...
-
-    class PolicyImpl:
-        def ping(self) -> str:
-            return 'pong'
-
-    cc.shutdown()
-    try:
-        cc.register(PolicyCRM, PolicyImpl(), name='policy-route')
-        address = cc.server_address()
-        crm = cc.connect(PolicyCRM, name='policy-route', address=address)
-        try:
-            with pytest.warns(UserWarning, match='Active connections exist'):
-                cc.set_transport_policy(shm_threshold=16384)
-        finally:
-            cc.close(crm)
-    finally:
-        cc.shutdown()
-
-
-def test_set_transport_policy_after_client_only_ipc_connect_warns() -> None:
-    import pytest
-    import c_two as cc
-    import c_two.endpoint
-    from c_two.transport import Server
-
-    @cc.crm(namespace='cc.test.runtime_session_policy_client_only', version='0.1.0')
-    class ClientOnlyCRM:
-        def ping(self) -> str:
-            ...
-
-    class ClientOnlyImpl:
-        def ping(self) -> str:
-            return 'pong'
-
-    address = 'ipc://unit_policy_client_only'
-    server = local_server(address)
-    server.register_crm(ClientOnlyCRM, ClientOnlyImpl(), name='policy-client-only')
-    server.start()
-    cc.shutdown()
-    try:
-        crm = cc.connect(ClientOnlyCRM, name='policy-client-only', address=address)
-        try:
-            with pytest.warns(UserWarning, match='Active connections exist'):
-                cc.set_transport_policy(shm_threshold=16384)
-        finally:
-            cc.close(crm)
-    finally:
-        server.shutdown()
         cc.shutdown()
 
 
@@ -843,8 +702,8 @@ def test_set_server_after_client_only_connect_preserves_client_freeze() -> None:
         crm = cc.connect(ServerAfterClientCRM, name='server-after-client', address=address)
         try:
             cc.set_server(server_id='unit-later-server')
-            with pytest.warns(UserWarning, match='Client connections already exist'):
-                cc.set_client(ipc_overrides={'reassembly_segment_size': 16 * 1024 * 1024})
+            with pytest.raises(cc.error.CoreError, match='configuration is frozen'):
+                cc.set_client(memory_budget_bytes=19 * 1024 * 1024)
         finally:
             cc.close(crm)
     finally:
@@ -919,7 +778,7 @@ def test_shutdown_warns_when_native_cleanup_barrier_is_unconfirmed(caplog) -> No
             outcome: dict | None = None,
             *,
             max_outstanding_calls: int | None = None,
-            payload_buffer_budget_bytes: int | None = None,
+            memory_budget_bytes: int | None = None,
             **_kwargs,
         ) -> None:
             self._outcome = outcome if outcome is not None else {'relay_errors': []}
@@ -929,7 +788,7 @@ def test_shutdown_warns_when_native_cleanup_barrier_is_unconfirmed(caplog) -> No
             self._limits = {
                 key: value for key, value in (
                     ('max_outstanding_calls', max_outstanding_calls),
-                    ('payload_buffer_budget_bytes', payload_buffer_budget_bytes),
+                    ('memory_budget_bytes', memory_budget_bytes),
                 ) if value is not None
             }
 
@@ -964,8 +823,9 @@ def test_shutdown_warns_when_native_cleanup_barrier_is_unconfirmed(caplog) -> No
             retired_observations.append(observation)
             return observation
 
-        def adopt_retired_memory_observation(self, observation: object) -> None:
-            self.adopted_observations.append(observation)
+        def inherit_retirement(self, previous) -> None:
+            self._limits = previous._limits
+            self.adopted_observations.append(previous.retire_memory_observation())
 
     def hostless_registry(outcome: dict) -> Runtime:
         registry = Runtime()

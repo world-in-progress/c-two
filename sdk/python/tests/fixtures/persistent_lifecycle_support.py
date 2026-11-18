@@ -197,11 +197,11 @@ class Lab:
             self.client.set_local_endpoint(root=root)
         self.outgoing = Events(self.client)
         if path != "direct_ipc":
-            self.owner = start_relay(idle_timeout=1)
+            self.owner = start_relay()
             self.server.set_relay_anchor(self.owner.url)
             self.anchor = self.owner
             if path == "relay_aware_relay":
-                self.anchor = start_relay(seeds=[self.owner.url], idle_timeout=1)
+                self.anchor = start_relay(seeds=[self.owner.url])
             self.client.set_relay_anchor(self.anchor.url)
         self.accepted = Events(self.server)
         self.server.start()

@@ -112,14 +112,8 @@ def bench_ipc(payload_size: int) -> float:
     _ipc_counter += 1
 
     # 2 GB buddy segments to handle up to 1 GB payloads.
-    cc.set_server(ipc_overrides={
-        'pool_segment_size': 2 * 1024 * 1024 * 1024,
-        'max_pool_segments': 8,
-    })
-    cc.set_client(ipc_overrides={
-        'pool_segment_size': 2 * 1024 * 1024 * 1024,
-        'max_pool_segments': 8,
-    })
+    cc.set_server(memory_budget_bytes=16 * 1024**3)
+    cc.set_client(memory_budget_bytes=16 * 1024**3)
     cc.register(Echo, EchoImpl(), name='echo_ipc')
     address = cc.server_address()
 

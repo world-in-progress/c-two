@@ -57,6 +57,9 @@ impl From<RouteConcurrencySnapshot> for PyRouteConcurrencySnapshot {
 
 fn acquire_error_to_py(py: Python<'_>, err: RouteConcurrencyError) -> PyErr {
     match err {
+        RouteConcurrencyError::DomainAdmission { .. } => {
+            crate::core_error_ffi::core_error_to_py(c2_error::C2Error::from(err).into())
+        }
         RouteConcurrencyError::Closed | RouteConcurrencyError::Unavailable => {
             let code = match err {
                 RouteConcurrencyError::Closed => c2_error::ErrorCode::ResourceClosed,

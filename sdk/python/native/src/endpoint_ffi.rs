@@ -106,7 +106,8 @@ pub(crate) fn resolve_context(
         LocalEndpointOptions {
             unix_root: root.map(Into::into),
         },
-        ConfigSources::from_process(),
+        &c2_config::EnvCatalog::load(ConfigSources::from_process())
+            .map_err(|error| PyValueError::new_err(error.to_string()))?,
     )
     .map_err(|error| PyValueError::new_err(error.to_string()))
 }

@@ -9,22 +9,19 @@ use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyDict, PyList};
 
+use c2_config::{ConfigField, DomainLimitsPatch, ServerConfigPatch};
 use c2_contract::{
     ContractError, ContractRelease, ContractReleaseRef, ExpectedRouteContract, MethodAccess,
     MethodMode, PORTABLE_CONTRACT_SCHEMA, contract_descriptor_sha256_hex,
 };
-use c2_core::memory::{LocalCopyStats, LocalCopyTracker};
 use c2_core::{
-    CallExecutionObserver, Connect, FailedStartShutdownReceipt, Host, HostLifecycleSnapshot,
-    HostOptions, MethodDefinition, RegisterOutcome, Registration, RetiredMemoryObservation,
-    Runtime, RuntimeOptions, RuntimeShutdownReceipt, RuntimeShutdownTarget, ServiceConcurrencyMode,
-    ServiceDefinition, ShutdownOutcome, UnregisterOutcome,
+    ClientConfigPatch, Connect, FailedStartShutdownReceipt, Host, HostLifecycleSnapshot,
+    HostOptions, MethodDefinition, RegisterOutcome, Registration, Runtime, RuntimeOptions,
+    RuntimeShutdownReceipt, RuntimeShutdownTarget, ServiceConcurrencyMode, ServiceDefinition,
+    ShutdownOutcome, UnregisterOutcome,
 };
 
-use crate::config_ffi::{
-    PyConnectAttempt, client_ipc_overrides_to_dict, client_ipc_to_dict, parse_client_ipc_overrides,
-    parse_server_ipc_overrides, server_ipc_overrides_to_dict,
-};
+use crate::config_ffi::{PyConnectAttempt, config_field, config_uint};
 use crate::core_error_ffi::{
     core_error_to_py, lifecycle_error_to_py, relay_cleanup_error_to_dict,
     route_close_outcome_to_dict,
@@ -50,12 +47,7 @@ mod connect_attempt_tests {
     fn retirement_owner_lock_timeout_does_not_seal_or_hold_the_gil() {
         Python::initialize();
         Python::attach(|py| {
-            let session = Py::new(
-                py,
-                PyRuntimeSession::new(None, None, None, None, None, false, None, None, None)
-                    .unwrap(),
-            )
-            .unwrap();
+            let session = Py::new(py, PyRuntimeSession::new(None, None, false).unwrap()).unwrap();
             let borrowed = session.borrow(py);
             let owner = borrowed.host.lock();
             let worker_session = session.clone_ref(py);
@@ -139,12 +131,7 @@ cc.error.CoreError.__init__ = observe_error
             let runtime = globals.get_item("runtime").unwrap().unwrap().unbind();
             // The embedded test crate and installed extension have separate
             // PyType identities. Give the real SDK Runtime this test's native instance.
-            let session = Py::new(
-                py,
-                PyRuntimeSession::new(None, None, None, None, None, false, None, None, None)
-                    .unwrap(),
-            )
-            .unwrap();
+            let session = Py::new(py, PyRuntimeSession::new(None, None, false).unwrap()).unwrap();
             runtime
                 .bind(py)
                 .setattr("_runtime_session", session.clone_ref(py))
@@ -193,9 +180,7 @@ cc.error.CoreError.__init__ = observe_error
     #[test]
     fn relay_override_host_lock_expires_before_owner_releases_and_recovers() {
         Python::initialize();
-        let session = Arc::new(
-            PyRuntimeSession::new(None, None, None, None, None, false, None, None, None).unwrap(),
-        );
+        let session = Arc::new(PyRuntimeSession::new(None, None, false).unwrap());
         let host = session.host.lock();
         let worker_session = session.clone();
         let (done_tx, done_rx) = std::sync::mpsc::channel();
@@ -260,23 +245,9 @@ cc.error.CoreError.__init__ = observe_error
 #[pyclass(name = "RuntimeSession", frozen)]
 pub struct PyRuntimeSession {
     inner: Arc<Runtime>,
-    local_copy_tracker: Arc<LocalCopyTracker>,
     host: Mutex<HostRecord>,
     registrations: Mutex<HashMap<String, Registration>>,
     server_bridge: Mutex<Option<Py<PyAny>>>,
-    /// Retired read-only observations adopted from previous sessions.
-    ///
-    /// Each entry is one retirement event: it holds only weak views of budget
-    /// accounting and local-copy metadata, so a closed session's outstanding
-    /// charges stay observable after `cc.shutdown()` for exactly as long as
-    /// real owners (old proxies, in-flight responses, outstanding holds and
-    /// reservations) keep them alive — never by retaining the retired
-    /// session's Runtime, cache, pools, callbacks, or payloads. Records whose
-    /// last owner is gone are pruned individually on the next observation.
-    retired: Mutex<Vec<Arc<RetiredMemoryObservation>>>,
-    /// Opaque Core observers retain only publication and counter metadata,
-    /// never retired runtimes, transports, services or payload ownership.
-    retired_call_execution: Mutex<Vec<CallExecutionObserver>>,
 }
 
 #[derive(Default)]
@@ -318,25 +289,6 @@ fn shutdown_error_to_py(py: Python<'_>, error: c2_core::LifecycleError, seconds:
         let _ = error.value(py).setattr("timeout_seconds", seconds);
     }
     error
-}
-
-/// Read-only observation bundle passed from a shutting-down session to its
-/// replacement.
-///
-/// The Python registry moves one of these between sessions; it carries no
-/// mutable transport authority and exposes no Python surface at all.
-/// Memory observations use weak handles. Call execution observers retain
-/// only Core-owned counter metadata, including a publication cell for domains
-/// not yet initialized at capture. Neither observer retains runtime authority.
-/// The pending bundle is the one created by the latest retirement event; carried
-/// bundles belong to earlier retirements. Capture is retry-safe: a failed
-/// replacement attempt drops its un-adopted bundle without consuming the old
-/// session's records, and a later retry re-captures everything the session
-/// owns at that moment.
-#[pyclass(name = "RetiredMemoryObservation", frozen)]
-pub struct PyRetiredMemoryObservation {
-    inner: c2_core::RetirementHandoff,
-    call_execution: Vec<CallExecutionObserver>,
 }
 
 impl PyRuntimeSession {
@@ -403,73 +355,6 @@ impl PyRuntimeSession {
         started.map_err(core_error_to_py)
     }
 
-    /// Capture this session's retirement bundle plus every adopted earlier
-    /// one, without consuming the session's records.
-    ///
-    /// Capture is a pure re-read, so it is retry-safe: a replacement that
-    /// fails to construct or adopt leaves the old session — and every
-    /// observation it already carried — exactly where they were, and a later
-    /// retry re-captures the session's own domains and tracker as they exist
-    /// at that moment, including scopes first created after the failed
-    /// attempt. Composition de-duplicates by domain/tracker identity, so a
-    /// session captured twice can never double-count. Capturing never
-    /// connects, maps memory, freezes config, or instantiates a host.
-    fn retire_bundles(&self) -> PyRetiredMemoryObservation {
-        self.prune_retired_call_execution();
-        let pending = Arc::new(RetiredMemoryObservation::new());
-        if let Some(observer) = self.inner.outgoing_memory_observer() {
-            pending.push_scope(c2_core::scope::RUNTIME_OUTGOING, observer);
-        }
-        if let Some(observer) = self.inner.payload_buffer_observer() {
-            pending.push_payload_buffer(observer);
-        }
-        if let Some(host) = self.host.lock().host.as_ref() {
-            pending.push_scope(c2_core::scope::SERVER, host.server_memory_observer());
-        }
-        pending.push_tracker(Arc::clone(&self.local_copy_tracker));
-        PyRetiredMemoryObservation {
-            inner: c2_core::RetirementHandoff::new(pending, self.retired.lock().clone()),
-            call_execution: {
-                let mut observers = self.retired_call_execution.lock().clone();
-                let observer = self.inner.call_execution_observer();
-                if observer.is_live() {
-                    observers.push(observer);
-                }
-                observers
-            },
-        }
-    }
-
-    /// Live retired observations, pruning records whose last owner is gone.
-    ///
-    /// Delegates to the shared Core list-maintenance rule: a record survives
-    /// exactly while a real owner keeps its budget accounting or local-copy
-    /// metadata alive — zero counters alone never prune, because a supported
-    /// producer (an old proxy, an in-flight response) may still publish — and
-    /// an emptied bundle goes away.
-    fn live_retired_observations(&self) -> Vec<Arc<RetiredMemoryObservation>> {
-        self.prune_retired_call_execution();
-        let mut retired = self.retired.lock();
-        RetiredMemoryObservation::retain_live_bundles(&mut retired);
-        retired.clone()
-    }
-
-    fn prune_retired_call_execution(&self) {
-        self.retired_call_execution
-            .lock()
-            .retain(CallExecutionObserver::is_live);
-    }
-
-    /// Local-copy counters across the live tracker and every retired one.
-    fn merged_local_copy_stats(&self) -> LocalCopyStats {
-        let mut stats = self.local_copy_tracker.stats();
-        let retired = self.live_retired_observations();
-        stats.merge(&RetiredMemoryObservation::compose_local_copy_stats(
-            &retired,
-        ));
-        stats
-    }
-
     fn connect_core(
         &self,
         py: Python<'_>,
@@ -512,66 +397,41 @@ impl PyRuntimeSession {
     }
 
     #[new]
-    #[pyo3(signature = (server_id=None, server_ipc_overrides=None, client_ipc_overrides=None, shm_threshold=None, remote_payload_chunk_size=None, use_process_relay_anchor=true, max_outstanding_calls=None, payload_buffer_budget_bytes=None, startup_timeout=None))]
-    #[allow(clippy::too_many_arguments)] // PyO3 signature is the existing Python call boundary.
+    #[pyo3(signature = (*, server_id=None, startup_timeout=None, use_process_relay_anchor=true))]
     fn new(
         server_id: Option<String>,
-        server_ipc_overrides: Option<&Bound<'_, PyAny>>,
-        client_ipc_overrides: Option<&Bound<'_, PyAny>>,
-        shm_threshold: Option<u64>,
-        remote_payload_chunk_size: Option<u64>,
-        use_process_relay_anchor: bool,
-        max_outstanding_calls: Option<u64>,
-        payload_buffer_budget_bytes: Option<u64>,
         startup_timeout: Option<f64>,
+        use_process_relay_anchor: bool,
     ) -> PyResult<Self> {
-        let server_ipc_overrides = server_ipc_overrides
-            .map(|value| parse_server_ipc_overrides(Some(value)))
-            .transpose()?;
-        let client_ipc_overrides = client_ipc_overrides
-            .map(|value| parse_client_ipc_overrides(Some(value)))
-            .transpose()?;
-        let server_startup_timeout = startup_timeout
-            .map(c2_config::timeout_from_seconds)
-            .transpose()
-            .map_err(|error| PyValueError::new_err(error.to_string()))?;
         let inner = Runtime::new(RuntimeOptions {
-            server_id,
-            server_ipc_overrides,
-            server_startup_timeout,
-            client_ipc_overrides,
-            shm_threshold,
-            remote_payload_chunk_size,
-            relay_anchor_address: None,
             use_process_relay_anchor,
+            ..RuntimeOptions::default()
         })
         .map_err(runtime_configuration_error_to_py)?;
-        let call_execution_overrides = c2_config::CallExecutionLimitsOverrides {
-            max_outstanding_calls,
-            payload_buffer_budget_bytes,
-        };
-        if max_outstanding_calls.is_some() || payload_buffer_budget_bytes.is_some() {
+        if server_id.is_some() || startup_timeout.is_some() {
             inner
-                .set_call_execution_limits(call_execution_overrides.clone())
-                .map_err(lifecycle_error_to_py)?;
+                .update_server_config(ServerConfigPatch {
+                    server_id: server_id.map_or(ConfigField::Keep, ConfigField::Set),
+                    startup_timeout: startup_timeout
+                        .map(parse_startup_timeout)
+                        .transpose()?
+                        .map_or(ConfigField::Keep, ConfigField::Set),
+                    ..ServerConfigPatch::default()
+                })
+                .map_err(runtime_configuration_error_to_py)?;
         }
         Ok(Self {
             inner: Arc::new(inner),
-            local_copy_tracker: Arc::new(LocalCopyTracker::default()),
             host: Mutex::new(HostRecord::default()),
             registrations: Mutex::new(HashMap::new()),
             server_bridge: Mutex::new(None),
-            retired: Mutex::new(Vec::new()),
-            retired_call_execution: Mutex::new(Vec::new()),
         })
     }
 
     fn local_copy_tracker(&self) -> PyLocalCopyTracker {
-        PyLocalCopyTracker::from_arc(Arc::clone(&self.local_copy_tracker))
+        PyLocalCopyTracker::from_arc(self.inner.holds_tracker())
     }
 
-    /// Configure Core's local domain; no Python/native copy of root authority.
-    /// An opaque captured context can pin a replacement without process discovery.
     #[pyo3(signature = (*, root=None, context=None))]
     fn set_local_endpoint(
         &self,
@@ -584,21 +444,8 @@ impl PyRuntimeSession {
                     "root and context are mutually exclusive",
                 ));
             }
-            let options = c2_config::LocalEndpointOptions {
-                unix_root: context.inner.unix_root().map(Into::into),
-            };
-            let sources = c2_config::ConfigSources::empty();
-            // A captured choice must still describe this platform scope.
-            // Refuse a user-scope change rather than silently rebasing it.
-            let resolved =
-                c2_config::ConfigResolver::resolve_local_endpoint(options.clone(), sources.clone())
-                    .map_err(|error| PyValueError::new_err(error.to_string()))?;
-            if resolved != context.inner {
-                return Err(PyValueError::new_err(
-                    "captured local endpoint context does not match the current platform scope",
-                ));
-            }
-            self.inner.set_local_endpoint_with_sources(options, sources)
+            self.inner
+                .set_captured_local_endpoint(context.inner.clone())
         } else {
             self.inner
                 .set_local_endpoint(c2_config::LocalEndpointOptions {
@@ -664,185 +511,45 @@ impl PyRuntimeSession {
         Ok(crate::control_ffi::shutdown_outcome_name(outcome))
     }
 
-    fn hold_stats<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        local_copy_stats_dict(py, &self.merged_local_copy_stats())
-    }
-
-    #[pyo3(signature = (*, max_outstanding_calls=None, payload_buffer_budget_bytes=None))]
-    fn set_call_execution_limits(
-        &self,
-        max_outstanding_calls: Option<u64>,
-        payload_buffer_budget_bytes: Option<u64>,
-    ) -> PyResult<()> {
-        let overrides = c2_config::CallExecutionLimitsOverrides {
-            max_outstanding_calls,
-            payload_buffer_budget_bytes,
-        };
-        self.inner
-            .set_call_execution_limits(overrides)
-            .map_err(lifecycle_error_to_py)
-    }
-
-    #[getter]
-    fn call_execution_limits_overrides<'py>(
-        &self,
-        py: Python<'py>,
-    ) -> PyResult<Bound<'py, PyDict>> {
-        let overrides = self.inner.call_execution_limits_overrides();
-        let dict = PyDict::new(py);
-        dict.set_item("max_outstanding_calls", overrides.max_outstanding_calls)?;
-        dict.set_item(
-            "payload_buffer_budget_bytes",
-            overrides.payload_buffer_budget_bytes,
-        )?;
-        Ok(dict)
-    }
-
-    /// Operation slots, including every stream and finite calls that continue
-    /// after caller expiry or session replacement; byte statistics are separate.
-    fn call_execution_snapshot<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let snapshot = self
-            .inner
-            .call_execution_snapshot()
-            .map_err(lifecycle_error_to_py)?;
-        let dict = call_execution_snapshot_dict(py, &snapshot)?;
-        let mut retired = self.retired_call_execution.lock();
-        let mut reports = Vec::new();
-        // Initialization and close publication come from the same Core
-        // authority. An uninitialized open domain stays observable; a closed
-        // domain is retired only after actual owners release all charges.
-        retired.retain(CallExecutionObserver::is_live);
-        for observer in retired.iter() {
-            let observation = observer.snapshot();
-            let report = match observation.counters {
-                Some(snapshot) => call_execution_snapshot_dict(py, &snapshot)?,
-                None => {
-                    let report = PyDict::new(py);
-                    report.set_item("max_operations", py.None())?;
-                    report.set_item("used_operations", 0)?;
-                    report.set_item("peak_operations", 0)?;
-                    report.set_item("rejected_reservations", 0)?;
-                    report.set_item("closed", observation.closed)?;
-                    report
-                }
-            };
-            report.set_item("initialized", observation.initialized)?;
-            report.set_item("state", "retired")?;
-            reports.push(report);
-        }
-        dict.set_item("retired", PyList::new(py, reports)?)?;
-        Ok(dict)
-    }
-
-    /// Read-only, scope-labelled memory-budget snapshot.
-    ///
-    /// Reports C-Two-owned IPC backing and live reassembly accounting for the
-    /// per-Runtime outgoing client domain and the per-server direction, plus
-    /// the Rust-owned retained-buffer (`hold_stats`) counters. Retired domains
-    /// adopted from earlier shutdowns appear in `retired` with the same
-    /// scope-labelled shape while a real owner — an old proxy's native
-    /// client, an in-flight response, an outstanding hold or reservation —
-    /// keeps their accounting alive; records detach once their last owner is
-    /// gone, so repeated empty session swaps never accumulate. Observing this
-    /// never connects, maps memory, freezes client configuration, instantiates
-    /// a host, or resets accounting. `runtime_outgoing`/`server` are ``None``
-    /// until that scope exists (a scope that was never frozen stays
-    /// ``None``).
-    ///
-    /// The budget cells are independent accounting scopes, not process
-    /// RSS; their sum must never be read as physical memory usage.
     fn memory_stats<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let stats = match self.host.lock().host.as_ref() {
-            Some(host) => host.memory_stats(),
-            None => self.inner.memory_stats(),
-        };
+        let stats = self.inner.memory_stats();
         let dict = PyDict::new(py);
-        dict.set_item(
-            "runtime_outgoing",
-            match stats.runtime_outgoing.as_ref() {
-                Some(scope) => {
-                    memory_scope_dict(py, "runtime_outgoing", "active", scope)?.into_any()
-                }
-                None => py.None().into_bound(py),
-            },
-        )?;
-        dict.set_item(
-            "server",
-            match stats.server.as_ref() {
-                Some(scope) => memory_scope_dict(py, "server", "active", scope)?.into_any(),
-                None => py.None().into_bound(py),
-            },
-        )?;
-        let retired = self.live_retired_observations();
-        let retired_list = PyList::new(
-            py,
-            RetiredMemoryObservation::compose_scope_reports(&retired)
-                .iter()
-                .map(|report| memory_scope_dict(py, report.role, "retired", &report.stats))
-                .collect::<PyResult<Vec<_>>>()?,
-        )?;
-        dict.set_item("retired", retired_list)?;
-        dict.set_item(
-            "payload_buffer",
-            match stats.payload_buffer.as_ref() {
-                Some(cell) => memory_cell_dict(py, cell)?.into_any(),
-                None => py.None().into_bound(py),
-            },
-        )?;
-        dict.set_item(
-            "retired_payload_buffers",
-            PyList::new(
-                py,
-                RetiredMemoryObservation::compose_payload_buffer_reports(&retired)
-                    .iter()
-                    .map(|cell| memory_cell_dict(py, cell))
-                    .collect::<PyResult<Vec<_>>>()?,
-            )?,
-        )?;
-        dict.set_item(
-            "holds",
-            local_copy_stats_dict(py, &self.merged_local_copy_stats())?,
-        )?;
+        dict.set_item("client", role_memory_dict(py, &stats.client)?)?;
+        dict.set_item("server", role_memory_dict(py, &stats.server)?)?;
+        let retired = PyList::empty(py);
+        for report in stats.retired {
+            let role = role_memory_dict(py, &report.stats)?;
+            role.set_item("role", report.role.as_str())?;
+            retired.append(role)?;
+        }
+        dict.set_item("retired", retired)?;
+        dict.set_item("holds", local_copy_stats_dict(py, &stats.holds)?)?;
         Ok(dict)
     }
 
-    /// Detach a read-only observation of this session's memory domains.
-    ///
-    /// The process registry calls this before shutting down this session and
-    /// hands the result to its replacement, so charges retained by held data
-    /// and retired budget domains stay observable after `cc.shutdown()`. The
-    /// pending bundle holds only weak views of budget accounting and local-copy
-    /// metadata. Call-execution observers keep only Core publication/counter
-    /// metadata, even when captured before first finite-domain initialization.
-    /// They retain no Runtime, transport, service or payload registry, and
-    /// expose no independent accounting authority. Earlier bundles are carried forward
-    /// unchanged, and this session keeps its own records until the handoff
-    /// succeeds, so a failed replacement never loses them.
-    fn retire_memory_observation(&self) -> PyRetiredMemoryObservation {
-        self.retire_bundles()
+    fn call_execution_snapshot<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let stats = self.inner.call_execution_snapshot();
+        let dict = PyDict::new(py);
+        dict.set_item("client", call_execution_snapshot_dict(py, &stats.client)?)?;
+        dict.set_item("server", call_execution_snapshot_dict(py, &stats.server)?)?;
+        let retired = PyList::empty(py);
+        for report in stats.retired {
+            let role = call_execution_snapshot_dict(py, &report.stats)?;
+            role.set_item("role", report.role.as_str())?;
+            retired.append(role)?;
+        }
+        dict.set_item("retired", retired)?;
+        Ok(dict)
     }
 
-    /// Adopt a retired observation from a previous session.
-    ///
-    /// Every carried bundle is installed as-is, including any that currently
-    /// report zero usage: a zero record stays observable because a supported
-    /// producer of the retired session — an old proxy, an in-flight response
-    /// — may still publish into it, and records are pruned only when their
-    /// last real owner is gone.
-    fn adopt_retired_memory_observation(&self, observation: &PyRetiredMemoryObservation) {
-        let mut retired = self.retired.lock();
-        observation.inner.adopt_into(&mut retired);
-        let mut execution = self.retired_call_execution.lock();
-        execution.retain(CallExecutionObserver::is_live);
-        for observer in &observation.call_execution {
-            if observer.is_live()
-                && !execution
-                    .iter()
-                    .any(|existing| existing.same_domain(observer))
-            {
-                execution.push(observer.clone());
-            }
-        }
+    fn inherit_retirement(&self, previous: &Self) -> PyResult<()> {
+        let handoff = previous
+            .inner
+            .capture_retirement_handoff()
+            .map_err(lifecycle_error_to_py)?;
+        self.inner
+            .adopt_retirement_handoff(&handoff)
+            .map_err(lifecycle_error_to_py)
     }
 
     fn ensure_server<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
@@ -864,7 +571,7 @@ impl PyRuntimeSession {
 
     #[getter]
     fn server_id_override(&self) -> Option<String> {
-        self.inner.server_id_override()
+        self.inner.server_overrides().server_id
     }
 
     #[getter]
@@ -884,45 +591,67 @@ impl PyRuntimeSession {
     }
 
     #[getter]
-    fn server_ipc_overrides<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyDict>>> {
-        self.inner
-            .server_ipc_overrides()
-            .map(|overrides| server_ipc_overrides_to_dict(py, &overrides))
-            .transpose()
-    }
-
-    #[getter]
     fn startup_timeout(&self) -> Option<f64> {
         self.inner
-            .server_startup_timeout()
+            .server_overrides()
+            .startup_timeout
             .map(|timeout| timeout.as_secs_f64())
     }
 
-    #[pyo3(signature = (server_id=None, server_ipc_overrides=None, startup_timeout=None))]
-    fn set_server_options(
+    #[allow(clippy::too_many_arguments)]
+    fn update_server_config(
         &self,
-        server_id: Option<String>,
-        server_ipc_overrides: Option<&Bound<'_, PyAny>>,
-        startup_timeout: Option<f64>,
+        py: Python<'_>,
+        unset: &Bound<'_, PyAny>,
+        server_id: &Bound<'_, PyAny>,
+        startup_timeout: &Bound<'_, PyAny>,
+        max_payload_size: &Bound<'_, PyAny>,
+        max_execution_workers: &Bound<'_, PyAny>,
+        memory_budget_bytes: &Bound<'_, PyAny>,
+        file_spill_budget_bytes: &Bound<'_, PyAny>,
+        max_outstanding_calls: &Bound<'_, PyAny>,
     ) -> PyResult<()> {
-        // Preserve frozen-before-parsing precedence; Core also fences the commit.
-        if self.host.lock().host.is_some() {
-            return Err(PyRuntimeError::new_err(
-                "server options are frozen after the Core host starts",
-            ));
-        }
-        let server_ipc_overrides = server_ipc_overrides
-            .map(|value| parse_server_ipc_overrides(Some(value)))
-            .transpose()?;
-        let startup_timeout = startup_timeout
-            .map(c2_config::timeout_from_seconds)
-            .transpose()
-            .map_err(|error| PyValueError::new_err(error.to_string()))?;
-        self.inner
-            .set_server_options(server_id, server_ipc_overrides, startup_timeout)
-            .map_err(runtime_configuration_error_to_py)?;
-        self.server_bridge.lock().take();
-        Ok(())
+        let patch = ServerConfigPatch {
+            server_id: config_field(server_id, unset, |value| value.extract())?,
+            startup_timeout: config_field(startup_timeout, unset, |value| {
+                parse_startup_timeout(value.extract()?)
+            })?,
+            max_payload_size: config_field(max_payload_size, unset, |value| {
+                config_uint(value, "max_payload_size")
+            })?,
+            max_execution_workers: config_field(max_execution_workers, unset, |value| {
+                config_uint(value, "max_execution_workers")
+            })?,
+            domain_limits: domain_limits_patch(
+                unset,
+                memory_budget_bytes,
+                file_spill_budget_bytes,
+                max_outstanding_calls,
+            )?,
+        };
+        py.detach(|| self.inner.update_server_config(patch))
+            .map_err(runtime_configuration_error_to_py)
+    }
+
+    fn update_client_config(
+        &self,
+        py: Python<'_>,
+        unset: &Bound<'_, PyAny>,
+        memory_budget_bytes: &Bound<'_, PyAny>,
+        file_spill_budget_bytes: &Bound<'_, PyAny>,
+        max_outstanding_calls: &Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        let domain_limits = domain_limits_patch(
+            unset,
+            memory_budget_bytes,
+            file_spill_budget_bytes,
+            max_outstanding_calls,
+        )?;
+        py.detach(|| {
+            self.inner
+                .update_client_config(ClientConfigPatch { domain_limits })
+        })
+        .map_err(runtime_configuration_error_to_py)
     }
 
     #[pyo3(signature = (relay_anchor_address, *, connect_attempt=None))]
@@ -978,48 +707,8 @@ impl PyRuntimeSession {
     }
 
     #[getter]
-    fn remote_payload_chunk_size_override(&self) -> Option<u64> {
-        self.inner.remote_payload_chunk_size_override()
-    }
-
-    #[getter]
-    fn client_ipc_overrides<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyDict>>> {
-        self.inner
-            .client_ipc_overrides()
-            .map(|overrides| client_ipc_overrides_to_dict(py, &overrides))
-            .transpose()
-    }
-
-    #[getter]
-    fn client_ipc_config<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let runtime_overrides = c2_config::RuntimeConfigOverrides {
-            client_ipc: self.inner.client_ipc_overrides().unwrap_or_default(),
-            shm_threshold: self.inner.shm_threshold_override(),
-            ..Default::default()
-        };
-        let resolved = c2_config::ConfigResolver::resolve_client_ipc(
-            runtime_overrides.client_ipc.clone(),
-            runtime_overrides,
-            c2_config::ConfigSources::from_process(),
-        )
-        .map_err(|error| PyValueError::new_err(error.to_string()))?;
-        client_ipc_to_dict(py, &resolved)
-    }
-
-    #[getter]
     fn client_config_frozen(&self) -> bool {
         self.inner.client_config_frozen()
-    }
-
-    fn set_client_ipc_overrides(&self, overrides: Option<&Bound<'_, PyAny>>) -> PyResult<bool> {
-        let overrides = overrides
-            .map(|value| parse_client_ipc_overrides(Some(value)))
-            .transpose()?;
-        match self.inner.set_client_ipc_overrides(overrides) {
-            Ok(()) => Ok(true),
-            Err(c2_core::LifecycleError::ClientConfigFrozen) => Ok(false),
-            Err(error) => Err(lifecycle_error_to_py(error)),
-        }
     }
 
     fn ensure_server_bridge<'py>(slf: PyRef<'py, Self>) -> PyResult<Py<PyAny>> {
@@ -1038,13 +727,6 @@ impl PyRuntimeSession {
         let server = class.call((), Some(&kwargs))?.unbind();
         *slf.server_bridge.lock() = Some(server.clone_ref(py));
         Ok(server)
-    }
-
-    fn _preflight_server_config(&self) -> PyResult<()> {
-        self.inner
-            .server_ipc_config()
-            .map(|_| ())
-            .map_err(runtime_configuration_error_to_py)
     }
 
     fn ensure_host_started(&self, py: Python<'_>) -> PyResult<()> {
@@ -1293,14 +975,6 @@ impl PyRuntimeSession {
         Ok(dict)
     }
 
-    /// Move an unstarted lifecycle into a fully prepared replacement. Rust
-    /// owns the capability transfer; Python never observes or clones it.
-    fn transfer_unstarted_lifecycle_to(&self, replacement: &PyRuntimeSession) -> PyResult<()> {
-        self.inner
-            .transfer_unstarted_lifecycle_to(&replacement.inner)
-            .map_err(lifecycle_error_to_py)
-    }
-
     fn clear_server_identity(&self) -> PyResult<()> {
         if self
             .host
@@ -1430,13 +1104,29 @@ impl PyRuntimeSession {
     }
 }
 
-// `PyRetiredMemoryObservation` intentionally exposes no Python surface: the
-// observation lifecycle is decided by real owners (weak handles detach when
-// the last producer/local-copy owner is gone), so there is no fence to mark and no
-// state to read from Python. It exists only as the opaque handoff token the
-// registry moves between sessions.
-#[pymethods]
-impl PyRetiredMemoryObservation {}
+fn parse_startup_timeout(seconds: f64) -> PyResult<Duration> {
+    c2_config::timeout_from_seconds(seconds)
+        .map_err(|error| PyValueError::new_err(format!("startup_timeout: {error}")))
+}
+
+fn domain_limits_patch(
+    unset: &Bound<'_, PyAny>,
+    memory_budget_bytes: &Bound<'_, PyAny>,
+    file_spill_budget_bytes: &Bound<'_, PyAny>,
+    max_outstanding_calls: &Bound<'_, PyAny>,
+) -> PyResult<DomainLimitsPatch> {
+    Ok(DomainLimitsPatch {
+        memory_budget_bytes: config_field(memory_budget_bytes, unset, |value| {
+            config_uint(value, "memory_budget_bytes")
+        })?,
+        file_spill_budget_bytes: config_field(file_spill_budget_bytes, unset, |value| {
+            config_uint(value, "file_spill_budget_bytes")
+        })?,
+        max_outstanding_calls: config_field(max_outstanding_calls, unset, |value| {
+            config_uint(value, "max_outstanding_calls")
+        })?,
+    })
+}
 
 fn runtime_configuration_error_to_py(error: c2_core::LifecycleError) -> PyErr {
     match error {
@@ -1634,7 +1324,7 @@ fn register_outcome_to_dict<'py>(
 
 fn call_execution_snapshot_dict<'py>(
     py: Python<'py>,
-    snapshot: &c2_core::CallExecutionSnapshot,
+    snapshot: &c2_core::RoleCallExecutionStats,
 ) -> PyResult<Bound<'py, PyDict>> {
     let dict = PyDict::new(py);
     dict.set_item("max_operations", snapshot.max_operations)?;
@@ -1658,28 +1348,31 @@ fn memory_cell_dict<'py>(
     Ok(dict)
 }
 
-fn memory_scope_dict<'py>(
+fn role_memory_dict<'py>(
     py: Python<'py>,
-    role: &str,
-    state: &str,
-    scope: &c2_core::MemoryScopeStats,
+    stats: &c2_core::RoleMemoryStats,
 ) -> PyResult<Bound<'py, PyDict>> {
     let dict = PyDict::new(py);
-    dict.set_item("role", role)?;
-    dict.set_item("state", state)?;
-    let limits = PyDict::new(py);
-    limits.set_item("shm_backing_bytes", scope.limits.shm_backing_budget_bytes)?;
-    limits.set_item("file_backing_bytes", scope.limits.file_backing_budget_bytes)?;
-    limits.set_item(
-        "live_reassembly_bytes",
-        scope.limits.live_reassembly_budget_bytes,
+    dict.set_item("domain_id", stats.domain_id)?;
+    dict.set_item("generation", stats.generation)?;
+    dict.set_item("frozen", stats.frozen)?;
+    dict.set_item("closed", stats.closed)?;
+    dict.set_item(
+        "memory",
+        stats
+            .memory
+            .as_ref()
+            .map(|cell| memory_cell_dict(py, cell))
+            .transpose()?,
     )?;
-    dict.set_item("limits", limits)?;
-    let cells = PyDict::new(py);
-    cells.set_item("shm", memory_cell_dict(py, &scope.shm)?)?;
-    cells.set_item("file", memory_cell_dict(py, &scope.file)?)?;
-    cells.set_item("reassembly", memory_cell_dict(py, &scope.reassembly)?)?;
-    dict.set_item("cells", cells)?;
+    dict.set_item(
+        "file_spill",
+        stats
+            .file_spill
+            .as_ref()
+            .map(|cell| memory_cell_dict(py, cell))
+            .transpose()?,
+    )?;
     Ok(dict)
 }
 
@@ -1751,6 +1444,5 @@ fn lifecycle_snapshot_to_dict<'py>(
 
 pub(crate) fn register_module(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyRuntimeSession>()?;
-    module.add_class::<PyRetiredMemoryObservation>()?;
     Ok(())
 }

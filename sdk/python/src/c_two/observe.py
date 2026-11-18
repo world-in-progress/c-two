@@ -3,8 +3,11 @@ from ._native import (
     ConnectionClosed, ConnectionObservation, ConnectionEvent, ConnectionEvents,
     ConnectionEventsLagged,
 )
-from .transport._snapshots import CallExecutionSnapshot, LifecycleSnapshot, ShutdownOutcome
-from .mem import MemoryStats, MemoryScopeStats, MemoryCellStats, MemoryLimits
+from .transport._snapshots import (
+    CallExecutionSnapshot, LifecycleSnapshot, RetiredRoleCallExecutionStats,
+    RoleCallExecutionStats, ShutdownOutcome,
+)
+from .mem import HoldStats, MemoryCellStats, MemoryStats, RetiredRoleMemoryStats, RoleMemoryStats
 from .transport.client.proxy import connection_observation
 from .transport.registry import (
     connection_events, memory_stats, call_execution_snapshot, lifecycle_snapshot, shutdown_outcome,
@@ -13,7 +16,8 @@ from .transport.registry import (
 __all__ = [
     'connection_events', 'connection_observation', 'ConnectionClosed', 'ConnectionObservation',
     'ConnectionEvent', 'ConnectionEvents', 'ConnectionEventsLagged', 'memory_stats',
-    'MemoryStats', 'MemoryScopeStats', 'MemoryCellStats', 'MemoryLimits',
+    'MemoryStats', 'RoleMemoryStats', 'RetiredRoleMemoryStats', 'MemoryCellStats', 'HoldStats',
     'call_execution_snapshot', 'lifecycle_snapshot', 'shutdown_outcome',
-    'CallExecutionSnapshot', 'LifecycleSnapshot', 'ShutdownOutcome',
+    'CallExecutionSnapshot', 'RoleCallExecutionStats', 'RetiredRoleCallExecutionStats',
+    'LifecycleSnapshot', 'ShutdownOutcome',
 ]

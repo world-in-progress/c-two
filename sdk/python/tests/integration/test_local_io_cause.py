@@ -195,26 +195,20 @@ def test_response_admission_preserves_outer_transport_and_inner_semantic_message
             root = Path({root!r})
             if not {IS_WINDOWS!r}:
                 cc.endpoint.set_local_endpoint(root=str(root))
-            cc.set_server(ipc_overrides={{
-                'pool_enabled': False, 'shm_backing_budget_bytes': 0, 'chunk_size': 65536,
-            }})
-            cc.set_client(ipc_overrides={{
-                'pool_enabled': False, 'shm_backing_budget_bytes': 0, 'chunk_size': 65536,
-                'file_backing_budget_bytes': 1024 * 1024, 'live_reassembly_budget_bytes': 0,
-            }})
-            cc.set_transport_policy(shm_threshold=4096)
+            cc.set_server(memory_budget_bytes=64 * 1024)
+            cc.set_client(memory_budget_bytes=128 * 1024, file_spill_budget_bytes=0)
             class CountedResource(Resource):
                 calls = 0
                 def echo(self, value):
                     self.calls += 1
-                    return value
+                    return 'x' * (256 * 1024) if value == 'large' else value
             resource = CountedResource()
             proxy = None
             try:
                 cc.register(Echo, resource, name='admission')
                 proxy = cc.connect(Echo, name='admission', address=cc.server_address())
                 try:
-                    proxy.echo('x' * (256 * 1024))
+                    proxy.echo('large')
                 except cc.error.ResourceUnavailable as semantic:
                     native = semantic.__cause__
                     report = diagnostic(native)
@@ -238,8 +232,8 @@ def test_response_admission_preserves_outer_transport_and_inner_semantic_message
                 assert proxy.echo('after') == 'after'
                 assert resource.calls == 2
                 assert cc.observe.memory_stats()["holds"]['active_holds'] == 0
-                cells = cc.observe.memory_stats()['runtime_outgoing']['cells']
-                assert all(cells[cell]['used_bytes'] == 0 for cell in ('reassembly', 'file', 'shm'))
+                client = cc.observe.memory_stats()['client']
+                assert client['memory']['used_bytes'] == client['file_spill']['used_bytes'] == 0
             finally:
                 if proxy is not None:
                     cc.close(proxy)

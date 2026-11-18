@@ -162,10 +162,7 @@ class NpHoldEchoCRM:
 # ---------------------------------------------------------------------------
 
 def _ctwo_server(variant: str, n: int, ready_path: str) -> None:
-    cc.set_server(ipc_overrides={
-        'pool_segment_size': 2 * 1024 * 1024 * 1024,
-        'max_pool_segments': 8,
-    })
+    cc.set_server(memory_budget_bytes=16 * 1024**3)
     if variant == 'hold':
         cc.register(INpHoldEcho, NpHoldEchoCRM(n), name='np_echo')
     else:
@@ -196,10 +193,7 @@ def bench_ctwo(n: int, rounds: int, variant: str = 'pickle') -> dict:
 
     try:
         address = _ctwo_wait_ready(ready_path)
-        cc.set_client(ipc_overrides={
-            'pool_segment_size': 2 * 1024 * 1024 * 1024,
-            'max_pool_segments': 8,
-        })
+        cc.set_client(memory_budget_bytes=16 * 1024**3)
 
         if variant == 'hold':
             proxy = cc.connect(INpHoldEcho, name='np_echo', address=address)

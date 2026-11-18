@@ -163,9 +163,8 @@ def emit(value):
     print("C2_WHEEL_RESULT=" + json.dumps(value), flush=True)
 
 facts = origins()
-cc.set_transport_policy(shm_threshold=4096)
 if sys.argv[1] == "host":
-    cc.set_server(ipc_overrides={"pool_segment_size":8 * 1024 * 1024})
+    cc.set_server(memory_budget_bytes=32 * 1024 * 1024)
     cc.set_relay_anchor(sys.argv[2])
     resource = Resource()
     cc.register(Echo, resource, name="wheel-echo",
@@ -178,7 +177,7 @@ if sys.argv[1] == "host":
         cc.shutdown()
     emit({"status":"stopped", "borrowed_inputs_invalidated":invalidated})
 else:
-    cc.set_client(ipc_overrides={"pool_segment_size":8 * 1024 * 1024})
+    cc.set_client(memory_budget_bytes=32 * 1024 * 1024)
     source = build()
     proxy = cc.connect(Echo, name="wheel-echo", address=sys.argv[2])
     try:

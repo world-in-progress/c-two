@@ -25,7 +25,7 @@ warm up before the controller publishes one common barrier timestamp.
 
 Expected-capacity-failure rows (--expect-error-substring) require the CRM
 call to raise an error containing the substring; the stable native phrase is
-"memory budget cell". Success in that mode fails validation, a raised error
+"chunked reply reassembly admission failed". Success in that mode fails validation, a raised error
 without the substring is reported as the wrong error, and an error raised
 while connecting is reported as the wrong stage even when the substring and
 the control ping both match: only a call-stage capacity failure is accepted.
@@ -92,7 +92,7 @@ from ipc_evidence import (
 )
 
 
-BUDGET_ERROR_PHRASE = 'memory budget cell'
+BUDGET_ERROR_PHRASE = 'chunked reply reassembly admission failed'
 
 # Laptop-sized bounds. A worker is a real OS process, so every join and every
 # post-kill drain must terminate; the matrix driver refuses values outside
@@ -102,13 +102,12 @@ MAX_CHILD_TIMEOUT_S = 600.0
 MAX_ROW_TIMEOUT_S = 3600.0
 POST_KILL_DRAIN_TIMEOUT_S = 30.0
 
-# Primary buddy geometry only. It caps the request/response pool and does not
-# bound the separate chunk-reassembly buddy pool or dedicated SHM mappings.
-PRIMARY_MAX_POOL_SEGMENTS = 2
-# Small reassembly geometry for laptop rows: the native defaults are
-# 64 MiB x 4, which no row here needs.
-REASSEMBLY_SEGMENT_BYTES = 8 * 1024 * 1024
-REASSEMBLY_MAX_SEGMENTS = 1
+MIB = 1 << 20
+CONFIG_KEYS = (
+    'client_memory_bytes', 'server_memory_bytes', 'file_spill_budget_bytes',
+    'payload_bytes', 'response_only', 'calls', 'expect_error_substring', 'warmup', 'call_timeout',
+)
+MEDIUM_MEMORY_BUDGET = 128 * MIB
 
 
 def peak_rss_bytes() -> int | None:
@@ -199,34 +198,27 @@ def echo_types(cc):
     class Echo:
         def echo(self, value: bytes) -> bytes: ...
 
+        def reply(self, size: int) -> bytes: ...
+
     class EchoResource:
         def echo(self, value: bytes) -> bytes:
             return value
+
+        def reply(self, size: int) -> bytes:
+            return payload_pattern('c-two-ipc-memory', size)
 
     return Echo, EchoResource
 
 
 def configure(cc, args: argparse.Namespace) -> dict:
-    """Pin laptop-sized primary and chunk-reassembly buddy geometry.
-
-    `max_pool_segments` caps the primary request/response buddy pool only. It
-    does not bound the separate chunk-reassembly buddy pool (native default
-    64 MiB x 4) or dedicated SHM mappings, which are per-allocation. The
-    reassembly geometry is therefore pinned explicitly here and can still be
-    overridden through --ipc-overrides.
-    """
-    overrides = {
-        'pool_enabled': args.pool_enabled,
-        'pool_segment_size': args.segment_size,
-        'max_pool_segments': PRIMARY_MAX_POOL_SEGMENTS,
-        'reassembly_segment_size': REASSEMBLY_SEGMENT_BYTES,
-        'reassembly_max_segments': REASSEMBLY_MAX_SEGMENTS,
-    }
-    overrides.update(args.ipc_overrides)
-    cc.set_transport_policy(shm_threshold=args.shm_threshold)
-    cc.set_server(ipc_overrides=overrides)
-    cc.set_client(ipc_overrides=overrides)
-    return overrides
+    """Select capacity independently for the sender and receiver roles."""
+    server = dict(memory_budget_bytes=args.server_memory_bytes,
+                  file_spill_budget_bytes=args.file_spill_budget_bytes)
+    client = dict(memory_budget_bytes=args.client_memory_bytes,
+                  file_spill_budget_bytes=args.file_spill_budget_bytes)
+    cc.set_server(**server)
+    cc.set_client(**client)
+    return {'client': client, 'server': server}
 
 
 def snapshot_memory_stats() -> dict:
@@ -240,19 +232,29 @@ def snapshot_memory_stats() -> dict:
 
 
 def common_memory_stats(stats: dict) -> dict:
-    """The same current public fields on both inputs; no retired counters."""
-    def scope(value):
-        if value is None:
-            return None
-        return {key: value[key] for key in ('role', 'state', 'limits', 'cells')}
+    """Retain the public role fields and hold counters used in receipts."""
+    def role(value):
+        return {key: value[key] for key in (
+            'domain_id', 'generation', 'frozen', 'closed', 'memory', 'file_spill',
+        )}
     return {
-        'runtime_outgoing': scope(stats['runtime_outgoing']),
-        'server': scope(stats['server']),
-        'retired': [scope(value) for value in stats['retired']],
+        'client': role(stats['client']),
+        'server': role(stats['server']),
+        'retired': [dict(role(value), role=value['role']) for value in stats['retired']],
         'holds': {key: stats['holds'][key] for key in (
             'active_holds', 'total_held_bytes', 'oldest_hold_seconds', 'by_direction',
         )},
     }
+
+
+def budget_cells(stats):
+    roles = [('client', stats['client']), ('server', stats['server'])]
+    roles.extend((entry['role'], entry) for entry in stats['retired'])
+    for role, snapshot in roles:
+        for name in ('memory', 'file_spill'):
+            cell = snapshot[name]
+            if cell is not None:
+                yield role, name, cell
 
 
 def wait_for_release(coord: Path, worker_index: int, timeout: float, log: SampleLog) -> dict:
@@ -320,11 +322,9 @@ def require_no_charges(snapshot: dict, point: str, failures: list[str]) -> None:
     if not memory_stats_usable(snapshot):
         return  # require_snapshot owns unavailable-snapshot enforcement.
     stats = snapshot['stats']
-    scopes = [stats['runtime_outgoing'], stats['server'], *stats['retired']]
     charged = [
-        f"{scope['role']}/{name}={cell['used_bytes']}"
-        for scope in scopes if scope is not None
-        for name, cell in scope['cells'].items() if cell['used_bytes']
+        f"{role}/{name}={cell['used_bytes']}"
+        for role, name, cell in budget_cells(stats) if cell['used_bytes']
     ]
     if charged or stats['holds']['active_holds']:
         failures.append(f'{point}: cleanup retains charges or local holds: {charged}')
@@ -397,16 +397,18 @@ def measure(args: argparse.Namespace) -> dict:
         connected_ns = time.perf_counter_ns() - started
         # One public deadline API is used on both source inputs.
         proxy = cc.with_call_options(client, timeout=args.call_timeout)
+        method = proxy.reply if args.response_only else proxy.echo
+        input_for = len if args.response_only else lambda value: value
         request_id = 0
         if expected is None:
             for _ in range(args.warmup):
-                _, sample = call_sample(log, request_id, proxy.echo, payload, phase='warmup', measurement=False)
+                _, sample = call_sample(log, request_id, lambda value: method(input_for(value)), payload, phase='warmup', measurement=False)
                 request_id += 1
                 if sample['status'] != 'success':
                     raise RuntimeError(f"warmup failed: {sample['error_type']}: {sample['error_message']}")
         barrier = wait_for_release(args.coord_dir, args.worker_index, args.child_timeout, log)
         for _ in range(args.calls):
-            _, sample = call_sample(log, request_id, proxy.echo, payload)
+            _, sample = call_sample(log, request_id, lambda value: method(input_for(value)), payload)
             request_id += 1
             if expected_error is not None and sample['status'] == 'success':
                 failures.setup(f"request {sample['request_id']}: expected capacity error but call succeeded")
@@ -435,7 +437,7 @@ def measure(args: argparse.Namespace) -> dict:
             # Validate hold without mixing this additional call into measured RPCs.
             held_box = []
             def held_call(value):
-                held_box.append(cc.hold(proxy.echo)(value))
+                held_box.append(cc.hold(method)(input_for(value)))
                 return held_box[-1].value
             try:
                 _, sample = call_sample(log, request_id, held_call, payload, phase='hold_validation', measurement=False)
@@ -450,6 +452,12 @@ def measure(args: argparse.Namespace) -> dict:
                 failures.append('benchmark retained a local hold')
         if stats_enabled:
             memory_stats['after_calls'] = snapshot_memory_stats()
+            snapshot = memory_stats['after_calls']
+            if args.response_only and not expected and memory_stats_usable(snapshot):
+                client_stats = snapshot['stats']['client']
+                cell = 'file_spill' if args.file_spill_budget_bytes else 'memory'
+                if client_stats[cell]['peak_bytes'] < len(payload):
+                    failures.setup(f'reply reassembly did not charge the expected {cell} cell')
         os_stats['after_calls'] = process_snapshot()
     except Exception as exc:
         failures.append(f'{type(exc).__name__}: {exc}', getattr(exc, 'category',
@@ -504,10 +512,7 @@ def measure(args: argparse.Namespace) -> dict:
 
 
 def vars_for_config(args: argparse.Namespace) -> dict:
-    return {key: getattr(args, key) for key in (
-        'pool_enabled', 'segment_size', 'payload_bytes', 'shm_threshold', 'calls',
-        'ipc_overrides', 'expect_error_substring', 'warmup', 'call_timeout',
-    )}
+    return {key: getattr(args, key) for key in CONFIG_KEYS}
 
 
 def run_worker(args: argparse.Namespace) -> dict:
@@ -578,15 +583,16 @@ def run_controller(args: argparse.Namespace) -> dict:
     )
     command = [
         args.python, str(Path(__file__).resolve()), '--worker',
-        '--pool-enabled' if args.pool_enabled else '--no-pool-enabled',
-        '--segment-size', str(args.segment_size),
-        '--payload-bytes', str(args.payload_bytes),
-        '--shm-threshold', str(args.shm_threshold), '--calls', str(args.calls),
-        '--ipc-overrides', json.dumps(args.ipc_overrides),
+        '--client-memory-bytes', str(args.client_memory_bytes),
+        '--server-memory-bytes', str(args.server_memory_bytes),
+        '--file-spill-budget-bytes', str(args.file_spill_budget_bytes),
+        '--payload-bytes', str(args.payload_bytes), '--calls', str(args.calls),
         '--output-dir', str(args.output_dir), '--coord-dir', str(args.coord_dir),
         '--warmup', str(args.warmup), '--call-timeout', str(args.call_timeout),
         '--child-timeout', str(args.child_timeout),
     ]
+    if args.response_only:
+        command.append('--response-only')
     if args.expect_error_substring is not None:
         command.extend(['--expect-error-substring', args.expect_error_substring])
     if args.memory_stats:
@@ -814,99 +820,45 @@ def run_controller(args: argparse.Namespace) -> dict:
 
 
 def matrix_rows() -> list[dict]:
-    mib = 2**20
-    return [
-        {
-            'name': 'idle_small_rpc_default_buddy', 'workload': 'idle_small',
-            'config': 'default_buddy',
-            'pool_enabled': True, 'segment_size': 2 * mib, 'payload_bytes': 1,
-            'shm_threshold': 4096, 'calls': 200, 'workers': 1, 'topology': 'shared',
-            'ipc_overrides': {}, 'expect_error_substring': None,
-        },
-        {
-            'name': 'idle_small_rpc_buddy_disabled', 'workload': 'idle_small',
-            'config': 'buddy_disabled',
-            'pool_enabled': False, 'segment_size': 2 * mib, 'payload_bytes': 1,
-            'shm_threshold': 4096, 'calls': 200, 'workers': 1, 'topology': 'shared',
-            'ipc_overrides': {}, 'expect_error_substring': None,
-        },
-        {
-            'name': 'burst4_shared_default_buddy', 'workload': 'burst_shared',
-            'config': 'default_buddy',
-            'pool_enabled': True, 'segment_size': 2 * mib, 'payload_bytes': 64 * 1024,
-            'shm_threshold': 4096, 'calls': 40, 'workers': 4, 'topology': 'shared',
-            'ipc_overrides': {}, 'expect_error_substring': None,
-        },
-        {
-            'name': 'burst4_shared_buddy_disabled', 'workload': 'burst_shared',
-            'config': 'buddy_disabled',
-            'pool_enabled': False, 'segment_size': 2 * mib, 'payload_bytes': 64 * 1024,
-            'shm_threshold': 4096, 'calls': 40, 'workers': 4, 'topology': 'shared',
-            'ipc_overrides': {}, 'expect_error_substring': None,
-        },
-        {
-            'name': 'science_payload_pairs_default_buddy', 'workload': 'science_payload',
-            'config': 'default_buddy',
-            'pool_enabled': True, 'segment_size': 2 * mib, 'payload_bytes': 4 * mib,
-            'shm_threshold': 4096, 'calls': 8, 'workers': 1, 'topology': 'pairs',
-            'ipc_overrides': {}, 'expect_error_substring': None,
-        },
-        {
-            'name': 'science_payload_pairs_buddy_disabled', 'workload': 'science_payload',
-            'config': 'buddy_disabled',
-            'pool_enabled': False, 'segment_size': 2 * mib, 'payload_bytes': 4 * mib,
-            'shm_threshold': 4096, 'calls': 8, 'workers': 1, 'topology': 'pairs',
-            'ipc_overrides': {}, 'expect_error_substring': None,
-        },
-        {
-            'name': 'forced_zero_shm_finite_file', 'workload': 'forced_budget',
-            'config': 'zero_shm_finite_file',
-            'pool_enabled': True, 'segment_size': mib, 'payload_bytes': 2 * mib,
-            'shm_threshold': 64 * 1024, 'calls': 2, 'workers': 1, 'topology': 'shared',
-            'ipc_overrides': {
-                'shm_backing_budget_bytes': 0,
-                'file_backing_budget_bytes': 64 * mib,
-                'live_reassembly_budget_bytes': 64 * mib,
-            },
-            'expect_error_substring': None,
-        },
-        {
-            'name': 'forced_zero_shm_finite_file_buddy_disabled', 'workload': 'forced_budget',
-            'config': 'zero_shm_finite_file_buddy_disabled',
-            'pool_enabled': False, 'segment_size': mib, 'payload_bytes': 2 * mib,
-            'shm_threshold': 64 * 1024, 'calls': 2, 'workers': 1, 'topology': 'shared',
-            'ipc_overrides': {
-                'shm_backing_budget_bytes': 0,
-                'file_backing_budget_bytes': 64 * mib,
-                'live_reassembly_budget_bytes': 64 * mib,
-            },
-            'expect_error_substring': None,
-        },
-        {
-            'name': 'forced_all_backing_zero_expect_capacity_error', 'workload': 'forced_budget',
-            'config': 'all_backing_zero',
-            'pool_enabled': True, 'segment_size': mib, 'payload_bytes': 2 * mib,
-            'shm_threshold': 64 * 1024, 'calls': 1, 'workers': 1, 'topology': 'shared',
-            'ipc_overrides': {
-                'shm_backing_budget_bytes': 0,
-                'file_backing_budget_bytes': 0,
-                'live_reassembly_budget_bytes': 0,
-            },
-            'expect_error_substring': BUDGET_ERROR_PHRASE,
-        },
-    ]
+    rows = []
+    for workload, name, size, calls, workers, topology in (
+        ('idle_small', 'idle_small_rpc', 1, 200, 1, 'shared'),
+        ('burst_shared', 'burst4_shared', 64 * 1024, 40, 4, 'shared'),
+        ('science_payload', 'science_payload_pairs', 4 * MIB, 8, 1, 'pairs'),
+    ):
+        for config, memory in (
+            ('roomy_memory', MEDIUM_MEMORY_BUDGET), ('bounded_memory', 16 * MIB),
+        ):
+            rows.append(dict(
+                name=f'{name}_{config}', workload=workload, config=config,
+                payload_bytes=size, response_only=False, calls=calls, workers=workers, topology=topology,
+                client_memory_bytes=memory, server_memory_bytes=memory,
+                file_spill_budget_bytes=0, expect_error_substring=None,
+            ))
+    for name, client_memory, server_memory, spill, error in (
+        ('reply_file_spill', 96 * 1024, 64 * 1024, MIB, None),
+        ('reply_memory_reassembly', MIB, 64 * 1024, 0, None),
+        ('reply_budget_exhausted', 96 * 1024, 64 * 1024, 0, BUDGET_ERROR_PHRASE),
+    ):
+        rows.append(dict(
+            name=name, workload='response_admission', config=name,
+            payload_bytes=256 * 1024, response_only=True, calls=2, workers=1, topology='shared',
+            client_memory_bytes=client_memory, server_memory_bytes=server_memory,
+            file_spill_budget_bytes=spill, expect_error_substring=error,
+        ))
+    return rows
 
 
 def row_namespace(spec: dict) -> argparse.Namespace:
     return argparse.Namespace(
-        pool_enabled=spec['pool_enabled'],
-        segment_size=spec['segment_size'],
+        client_memory_bytes=spec['client_memory_bytes'],
+        server_memory_bytes=spec['server_memory_bytes'],
+        file_spill_budget_bytes=spec['file_spill_budget_bytes'],
         payload_bytes=spec['payload_bytes'],
-        shm_threshold=spec['shm_threshold'],
+        response_only=spec['response_only'],
         calls=spec['calls'],
         workers=spec['workers'],
         topology=spec['topology'],
-        ipc_overrides=spec['ipc_overrides'],
         expect_error_substring=spec['expect_error_substring'],
         memory_stats=bool(spec.get('memory_stats')),
         require_memory_stats=bool(spec.get('require_memory_stats')),
@@ -965,39 +917,33 @@ def validate_timeout(parser: argparse.ArgumentParser, value: object, name: str, 
         parser.error(f'{name} must be a finite number in (0, {maximum}]; got {value!r}')
 
 
-def validate_counts(
-    parser: argparse.ArgumentParser,
-    calls: object,
-    workers: object,
-    segment_size: object,
-    shm_threshold: object,
-    payload_bytes: object,
-    source: str,
-) -> None:
+def validate_counts(parser, *, calls, workers, client_memory_bytes, server_memory_bytes,
+                    file_spill_budget_bytes, payload_bytes, source):
     label = f'{source} ' if source else ''
     validate_worker_count(parser, workers, f'{label}workers')
     for name, value in (
-        ('calls', calls), ('segment_size', segment_size),
-        ('shm_threshold', shm_threshold), ('payload_bytes', payload_bytes),
+        ('calls', calls), ('client_memory_bytes', client_memory_bytes),
+        ('server_memory_bytes', server_memory_bytes),
+        ('file_spill_budget_bytes', file_spill_budget_bytes), ('payload_bytes', payload_bytes),
     ):
-        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
-            parser.error(f'{label}{name} must be a non-negative integer; got {value!r}')
-    if min(calls, segment_size, shm_threshold) <= 0:
-        parser.error(f'{label}calls/segment_size/shm_threshold must be positive')
+        if type(value) is not int or not 0 <= value < 2**64:
+            parser.error(f'{label}{name} must be an unsigned 64-bit integer; got {value!r}')
+    if calls == 0:
+        parser.error(f'{label}calls must be positive')
 
 
 def validate_row_spec(parser: argparse.ArgumentParser, spec: object) -> None:
     if not isinstance(spec, dict):
         parser.error('--row-spec must be a JSON object')
     required = {
-        'name', 'workload', 'config', 'pool_enabled', 'segment_size', 'payload_bytes',
-        'shm_threshold', 'calls', 'workers', 'topology', 'ipc_overrides', 'expect_error_substring',
-        'python',
+        'name', 'workload', 'config', 'client_memory_bytes', 'server_memory_bytes',
+        'file_spill_budget_bytes', 'payload_bytes', 'response_only', 'calls', 'workers', 'topology',
+        'expect_error_substring', 'python',
     }
     missing = sorted(required - set(spec))
     if missing:
         parser.error(f'--row-spec is missing required keys: {missing}')
-    for key in ('pool_enabled', 'memory_stats', 'require_memory_stats', 'allow_unavailable_stats_after_shutdown'):
+    for key in ('response_only', 'memory_stats', 'require_memory_stats', 'allow_unavailable_stats_after_shutdown'):
         if key in spec and type(spec[key]) is not bool:
             parser.error(f'--row-spec {key} must be a JSON boolean')
     expected = spec['expect_error_substring']
@@ -1007,13 +953,15 @@ def validate_row_spec(parser: argparse.ArgumentParser, spec: object) -> None:
         parser.error('--row-spec python must be a non-empty string')
     if spec['topology'] not in ('shared', 'pairs'):
         parser.error(f"--row-spec topology must be 'shared' or 'pairs'; got {spec['topology']!r}")
-    if not isinstance(spec['ipc_overrides'], dict):
-        parser.error('--row-spec ipc_overrides must be a JSON object')
     if not isinstance(spec['name'], str) or not spec['name']:
         parser.error('--row-spec name must be a non-empty string')
     validate_counts(
-        parser, spec['calls'], spec['workers'], spec['segment_size'],
-        spec['shm_threshold'], spec['payload_bytes'], '--row-spec',
+        parser, calls=spec['calls'],
+        workers=spec['workers'],
+        client_memory_bytes=spec['client_memory_bytes'],
+        server_memory_bytes=spec['server_memory_bytes'],
+        file_spill_budget_bytes=spec['file_spill_budget_bytes'],
+        payload_bytes=spec['payload_bytes'], source='--row-spec',
     )
     validate_timeout(parser, spec.get('child_timeout', 120.0), '--row-spec child_timeout', MAX_CHILD_TIMEOUT_S)
     validate_timeout(parser, spec.get('call_timeout', 30.0), '--row-spec call_timeout', MAX_CHILD_TIMEOUT_S)
@@ -1254,24 +1202,24 @@ def list_rows() -> None:
         print(
             f"{row['name']}\n    workload={row['workload']} config={row['config']} "
             f"payload={row['payload_bytes']}B calls={row['calls']} workers={row['workers']} "
-            f"topology={row['topology']} pool_enabled={row['pool_enabled']} "
-            f"ipc_overrides={json.dumps(row['ipc_overrides'], sort_keys=True)}\n    {expectation}"
+            f"topology={row['topology']} client_memory_bytes={row['client_memory_bytes']} "
+            f"server_memory_bytes={row['server_memory_bytes']} file_spill_budget_bytes={row['file_spill_budget_bytes']}\n    {expectation}"
         )
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--mode', choices=['single', 'matrix', 'anomaly'], default='single')
-    parser.add_argument('--pool-enabled', action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument('--segment-size', type=int, default=2 * 1024 * 1024)
+    parser.add_argument('--client-memory-bytes', type=int, default=MEDIUM_MEMORY_BUDGET)
+    parser.add_argument('--server-memory-bytes', type=int, default=MEDIUM_MEMORY_BUDGET)
+    parser.add_argument('--file-spill-budget-bytes', type=int, default=0)
     parser.add_argument('--payload-bytes', type=int, default=1)
-    parser.add_argument('--shm-threshold', type=int, default=4096)
+    parser.add_argument('--response-only', action='store_true', help='Send the size and generate the payload on the Host')
     parser.add_argument('--calls', type=int, default=200)
     parser.add_argument('--warmup', type=int, default=3, help='Recorded warmup calls before the common start barrier')
     parser.add_argument('--call-timeout', type=float, default=30.0, help='Public per-call deadline; expired attempts stay in raw samples')
     parser.add_argument('--workers', type=int, default=1)
     parser.add_argument('--topology', choices=['shared', 'pairs'], default='shared')
-    parser.add_argument('--ipc-overrides', type=json.loads, default={}, help='Additional native IPC overrides as a JSON object')
     parser.add_argument(
         '--expect-error-substring',
         help='Require the CRM call to raise an error containing this substring '
@@ -1324,14 +1272,17 @@ def main() -> None:
     if args.list_rows:
         list_rows()
         return
-    if not isinstance(args.ipc_overrides, dict):
-        parser.error('--ipc-overrides must be a JSON object')
     if args.expect_error_substring is not None and not args.expect_error_substring.strip():
         parser.error('--expect-error-substring must be a non-empty substring')
     # Every bound is validated before any process is spawned, including for
     # --worker and --row-spec dispatch.
     validate_counts(
-        parser, args.calls, args.workers, args.segment_size, args.shm_threshold, args.payload_bytes, '',
+        parser, calls=args.calls,
+        workers=args.workers,
+        client_memory_bytes=args.client_memory_bytes,
+        server_memory_bytes=args.server_memory_bytes,
+        file_spill_budget_bytes=args.file_spill_budget_bytes,
+        payload_bytes=args.payload_bytes, source='',
     )
     validate_timeout(parser, args.child_timeout, '--child-timeout', MAX_CHILD_TIMEOUT_S)
     validate_timeout(parser, args.row_timeout, '--row-timeout', MAX_ROW_TIMEOUT_S)

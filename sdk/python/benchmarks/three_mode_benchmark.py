@@ -32,8 +32,7 @@ import _relay_support as relay
 from c_two.transport.registry import _reset_default_runtime
 
 # Configurable via CLI --segment-size (bytes)
-_SEGMENT_SIZE: int = 2 * 1024 * 1024 * 1024  # default 2GB
-_MAX_SEGMENTS: int = 8
+_MEMORY_BUDGET_BYTES = 16 * 1024**3
 
 RELAY_CLIENT_REQUEST_BODY_PATH = 'materialized'
 RELAY_RELAY_REQUEST_BODY_PATH = 'streamed_to_upstream_ipc'
@@ -163,12 +162,8 @@ def bench_ipc(payload_size: int) -> float:
     _ipc_counter += 1
     _reset_default_runtime()
 
-    ipc_overrides = {
-        'pool_segment_size': _SEGMENT_SIZE,
-        'max_pool_segments': _MAX_SEGMENTS,
-    }
-    cc.set_server(ipc_overrides=ipc_overrides)
-    cc.set_client(ipc_overrides=ipc_overrides)
+    cc.set_server(memory_budget_bytes=_MEMORY_BUDGET_BYTES)
+    cc.set_client(memory_budget_bytes=_MEMORY_BUDGET_BYTES)
     cc.register(Echo, EchoImpl(), name='echo_ipc')
     address = cc.server_address()
     _wait_sock(address)
@@ -196,12 +191,8 @@ def bench_relay(payload_size: int) -> float | None:
     route_name = f'echo_relay_{os.getpid()}_{_ipc_counter}'
 
     with relay.session(relay_url):
-        ipc_overrides = {
-            'pool_segment_size': _SEGMENT_SIZE,
-            'max_pool_segments': _MAX_SEGMENTS,
-        }
-        cc.set_server(ipc_overrides=ipc_overrides)
-        cc.set_client(ipc_overrides=ipc_overrides)
+        cc.set_server(memory_budget_bytes=_MEMORY_BUDGET_BYTES)
+        cc.set_client(memory_budget_bytes=_MEMORY_BUDGET_BYTES)
         cc.register(Echo, EchoImpl(), name=route_name)
 
         payload = b'\xAB' * payload_size
@@ -233,12 +224,8 @@ def bench_ipc_dict(payload_size: int) -> float | None:
     _ipc_counter += 1
     _reset_default_runtime()
 
-    ipc_overrides = {
-        'pool_segment_size': _SEGMENT_SIZE,
-        'max_pool_segments': _MAX_SEGMENTS,
-    }
-    cc.set_server(ipc_overrides=ipc_overrides)
-    cc.set_client(ipc_overrides=ipc_overrides)
+    cc.set_server(memory_budget_bytes=_MEMORY_BUDGET_BYTES)
+    cc.set_client(memory_budget_bytes=_MEMORY_BUDGET_BYTES)
     cc.register(DictEcho, DictEchoImpl(), name='echo_dict')
     address = cc.server_address()
     _wait_sock(address)
@@ -284,27 +271,24 @@ def _fmt(v: float | None) -> str:
 
 
 def main():
-    global _SEGMENT_SIZE, _MAX_SEGMENTS
+    global _MEMORY_BUDGET_BYTES
 
     parser = argparse.ArgumentParser(description='Three-mode benchmark')
-    parser.add_argument('--segment-size', type=int, default=2 * 1024 * 1024 * 1024,
-                        help='Pool segment size in bytes (default: 2GB)')
-    parser.add_argument('--max-segments', type=int, default=8,
-                        help='Max pool segments (default: 8)')
+    parser.add_argument('--memory-budget-bytes', type=int, default=_MEMORY_BUDGET_BYTES,
+                        help='Memory budget per role, in bytes')
     parser.add_argument('--output', type=str, default=None,
-                        help='Output TSV path (default: auto-named by segment size)')
+                        help='Output TSV path (default: auto-named by memory budget)')
     args = parser.parse_args()
-    _SEGMENT_SIZE = args.segment_size
-    _MAX_SEGMENTS = args.max_segments
+    _MEMORY_BUDGET_BYTES = args.memory_budget_bytes
 
-    seg_label = _human_size(_SEGMENT_SIZE)
+    seg_label = _human_size(_MEMORY_BUDGET_BYTES)
 
     _cleanup()
 
     print('=' * 120)
     print('Three-Mode Benchmark: Thread-local vs IPC vs Relay (HTTP)')
     print(f'Payload types: bytes (identity fast path) | dict (pickle serde)')
-    print(f'Warmup: {WARMUP}  |  Adaptive rounds (100/20/5)  |  Segment: {seg_label}×{_MAX_SEGMENTS}')
+    print(f'Warmup: {WARMUP}  |  Adaptive rounds (100/20/5)  |  Memory per role: {seg_label}')
     print(
         'Relay path: '
         f'{RELAY_TRANSPORT_LABEL} '

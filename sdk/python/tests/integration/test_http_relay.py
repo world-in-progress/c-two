@@ -19,7 +19,6 @@ import c_two as cc
 
 import c_two.endpoint
 from c_two.config.settings import settings
-from c_two._native import resolve_server_ipc_config
 from c_two.error import ResourceNotFound
 from c_two.crm.contract import crm_contract
 from c_two.transport.registry import Runtime, _get_default_runtime, _reset_default_runtime
@@ -29,7 +28,7 @@ from tests.fixtures.ihello import Hello
 from tests.fixtures.counter import Counter, CounterImpl
 from tests.fixtures.route_scope_attestor import attested_registration_scope, route_scope_attestor_binary
 
-DEFAULT_MAX_PAYLOAD_SIZE = int(resolve_server_ipc_config(None, None)['max_payload_size'])
+DEFAULT_MAX_PAYLOAD_SIZE = 16 * 1024**3
 
 
 def _server_instance_id_for(

@@ -25,7 +25,6 @@ from tests.fixtures.portable_interop import FASTDB_REPOSITORY, logical_result_sh
 from tests.fixtures.portable_matrix import (
     CRM_CLASSES,
     DESCRIPTOR_PATHS,
-    IPC_OVERRIDES,
     MatrixArtifacts,
     MatrixRelay,
     RustHost,
@@ -424,14 +423,11 @@ def typescript_artifacts() -> Iterator[TypeScriptArtifacts]:
 @pytest.fixture(autouse=True)
 def _clean_python_runtime() -> Iterator[None]:
     previous_relay = settings._relay_anchor_address  # noqa: SLF001
-    previous_threshold = settings._shm_threshold  # noqa: SLF001
     _reset_default_runtime()
     settings.relay_anchor_address = None
-    settings.shm_threshold = None
     yield
     _reset_default_runtime()
     settings._relay_anchor_address = previous_relay  # noqa: SLF001
-    settings._shm_threshold = previous_threshold  # noqa: SLF001
 
 
 def _route_name(row_id: str) -> str:

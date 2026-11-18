@@ -163,10 +163,7 @@ VARIANTS: dict[str, VariantSpec] = {
 
 def _server_main(variant: str, n: int, ready_path: str) -> None:
     spec = VARIANTS[variant]
-    cc.set_server(ipc_overrides={
-        'pool_segment_size': 2 * 1024 * 1024 * 1024,
-        'max_pool_segments': 8,
-    })
+    cc.set_server(memory_budget_bytes=16 * 1024**3)
     cc.register(spec.contract, spec.resource_factory(n), name='coords')
     addr = cc.server_address() or ''
     with open(ready_path, 'w') as f:
@@ -200,10 +197,7 @@ def run_variant(variant: str, n: int, iters: int, warmup: int) -> dict[str, obje
     try:
         address = _wait_ready(ready_path)
 
-        cc.set_client(ipc_overrides={
-            'pool_segment_size': 2 * 1024 * 1024 * 1024,
-            'max_pool_segments': 8,
-        })
+        cc.set_client(memory_budget_bytes=16 * 1024**3)
         proxy = cc.connect(spec.contract, name='coords', address=address)
         method = proxy.coords
         request = _request_count(n)

@@ -500,7 +500,7 @@ class CRMProxy:
                 f'{type(self._crm).__name__} has no method {method_name!r}',
             )
         if self._scheduler is None:
-            return method(*args)
+            return _invoke_local(method, args)
         method_idx = self._scheduler.method_idx(method_name)
         try:
             guard = self._scheduler.execution_guard(method_idx)
@@ -536,7 +536,7 @@ class CRMProxy:
                 raise ResourceClosed(message, details=details) from exc
             raise
         try:
-            return method(*args)
+            return _invoke_local(method, args)
         finally:
             guard.__exit__(None, None, None)
 
@@ -575,6 +575,29 @@ class CRMProxy:
                 callback()
         finally:
             del shared_target
+
+
+def _invoke_local(method, args):
+    from ...error import CCError, CoreError
+
+    try:
+        return method(*args)
+    except (CCError, CoreError) as exc:
+        # A downstream admission failure describes the inner call only.
+        exc.details = {
+            key: value
+            for key, value in exc.details.items()
+            if key not in ('transport_phase', 'dispatch_phase')
+        }
+        if isinstance(exc, CoreError):
+            exc.transport_phase = None
+            if exc.error_bytes is not None:
+                semantic = CCError.deserialize(memoryview(exc.error_bytes))
+                if semantic is not None:
+                    semantic.details.pop('transport_phase', None)
+                    semantic.details.pop('dispatch_phase', None)
+                exc.error_bytes = CCError.serialize(semantic)
+        raise
 
 
 def _native_call(operation, *args, **kwargs):

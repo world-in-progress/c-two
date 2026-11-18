@@ -21,7 +21,6 @@ def test_default_runtime_shutdown_preserves_its_own_inflight_ipc_call(monkeypatc
     monkeypatch.setattr(registry, '_default_runtime', None)
     monkeypatch.setenv('C2_ENV_FILE', '')
     monkeypatch.setenv('C2_RELAY_ANCHOR_ADDRESS', '')
-    monkeypatch.setattr(settings, '_shm_threshold', None)
     if os.name != 'nt':
         cc.endpoint.set_local_endpoint(root=str(tmp_path))
     entered = threading.Event()
@@ -35,7 +34,6 @@ def test_default_runtime_shutdown_preserves_its_own_inflight_ipc_call(monkeypatc
             return value
 
     name = f'inflight-{uuid.uuid4().hex}'
-    cc.set_transport_policy(shm_threshold=1)
     cc.set_server(server_id=name)
     cc.register(Echo, EchoResource(), name=name)
     proxy = cc.connect(Echo, name=name, address=cc.server_address())

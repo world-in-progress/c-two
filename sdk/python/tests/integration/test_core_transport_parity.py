@@ -153,7 +153,7 @@ def test_low_level_host_shutdown_keeps_outgoing_calls_until_runtime_retirement(
         client.set_local_endpoint(root=str(tmp_path))
     if relay_anchor is not None:
         client.set_relay_anchor(relay_anchor)
-    client.set_call_execution_limits(max_outstanding_calls=4)
+    client.set_client(max_outstanding_calls=4)
     client.start()  # An empty local Host still has a real shutdown receipt.
     old_session = client._runtime_session
     proxy = None
@@ -167,7 +167,7 @@ def test_low_level_host_shutdown_keeps_outgoing_calls_until_runtime_retirement(
             assert old_session.native_lifecycle_snapshot() == {
                 'finished': True, 'listener_closed': True, 'work_drained': True,
             }
-            assert not client.call_execution_snapshot()['closed']
+            assert not client.call_execution_snapshot()['client']['closed']
             assert bounded.add(3, 4) == 7
             bridge.start()
             assert bridge.is_started()

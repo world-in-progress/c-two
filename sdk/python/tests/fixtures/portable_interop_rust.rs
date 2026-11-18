@@ -291,11 +291,14 @@ fn run_host(address: &str, route_name: &str) -> Result<(), Box<dyn Error>> {
         .strip_prefix("ipc://")
         .ok_or("Rust host address must use ipc://")?;
     let runtime = Runtime::new(RuntimeOptions {
-        server_id: Some(server_id.to_string()),
         use_process_relay_anchor: false,
         ..RuntimeOptions::default()
     })?;
-    let host = runtime.host(HostOptions::default().without_relay())?;
+    let host = runtime.host(
+        HostOptions::default()
+            .without_relay()
+            .with_server_id(server_id),
+    )?;
     let counts = Arc::new(Mutex::new(CallCounts::default()));
     let mut registration = host.register(contract::service_definition(
         route_name,

@@ -6,7 +6,7 @@ on:
       baseline_ref:
         description: Baseline source ref
         type: string
-        default: b861f994e9f7294c0f3d4efc096c14f0d7f5c121
+        default: main
       candidate_ref:
         description: Candidate source ref (empty uses dispatch commit)
         type: string

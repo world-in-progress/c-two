@@ -75,11 +75,9 @@ def test_normal_worker_requires_raw_samples_and_success(paired, tmp_path):
 
 
 def test_matrix_rejects_missing_row_and_missing_sample(paired, tmp_path):
-    spec = {'workers': 1, 'calls': 2, 'pool_enabled': True, 'segment_size': 1024,
-            'payload_bytes': 1, 'shm_threshold': 4096, 'ipc_overrides': {},
-            'expect_error_substring': None, 'warmup': 1, 'call_timeout': 30.0}
+    spec = dict(paired.bench.matrix_rows()[0], calls=2, warmup=1, call_timeout=30.0)
     evidence_worker = worker(tmp_path)
-    set_run_config(tmp_path, {key: value for key, value in spec.items() if key != 'workers'})
+    set_run_config(tmp_path, {key: spec[key] for key in paired.bench.CONFIG_KEYS})
     record = {'ok': True, 'row': {'name': paired.NORMAL_ROWS[0]},
               'spec': spec, 'benchmark': {'ok': True,
               'workers': [evidence_worker]}}
@@ -180,24 +178,44 @@ def test_dependency_mismatch_fails_before_any_run(paired, monkeypatch, tmp_path)
         paired.run(options)
 
 
-def test_five_complete_groups_and_alternating_invocations(paired, monkeypatch, tmp_path):
+@pytest.mark.parametrize('expected_baseline', [None, 'b861f994'])
+def test_five_complete_groups_and_alternating_invocations(paired, monkeypatch, tmp_path, expected_baseline):
     options = args(tmp_path, paired)
     options.only = [paired.NORMAL_ROWS[0]]
-    monkeypatch.setattr(paired, 'git_head', lambda root: 'b861f994' if root == options.baseline_root else 'candidate')
+    options.baseline_commit = expected_baseline
+    baseline = 'b861f994' + '1' * 32
+    monkeypatch.setattr(paired, 'git_head', lambda root: baseline if root == options.baseline_root else 'candidate')
     monkeypatch.setattr(paired, 'python_identity', lambda *args: {'dependencies': {'fastdb4py': '0.2.4'}})
     calls = []
+    checked_commits = []
+
     def fake_harness(_options, label, group, kind):
         calls.append((group, label, kind))
         return tmp_path
+
+    def check_matrix(_directory, _selected, commit):
+        checked_commits.append(commit)
+        return {paired.NORMAL_ROWS[0]: [summary()]}
+
     monkeypatch.setattr(paired, 'run_harness', fake_harness)
-    monkeypatch.setattr(paired, 'check_matrix',
-                        lambda directory, selected, commit: {paired.NORMAL_ROWS[0]: [summary()]})
+    monkeypatch.setattr(paired, 'check_matrix', check_matrix)
     result = paired.run(options)
     assert result['ok'] is True
+    assert result['baseline_commit'] == baseline
     assert len(result['groups']) == 5
     assert calls == [(i, label, 'matrix') for i in range(5)
                      for label in paired.paired_order(i)]
+    assert checked_commits == [baseline if label == 'baseline' else 'candidate'
+                               for _, label, _ in calls]
     assert (options.output_dir / 'receipt.json').is_file()
+
+
+def test_explicit_baseline_mismatch_fails_before_any_run(paired, monkeypatch, tmp_path):
+    options = args(tmp_path, paired)
+    monkeypatch.setattr(paired, 'git_head', lambda root: 'different-checkout')
+    monkeypatch.setattr(paired, 'run_harness', lambda *args, **kwargs: pytest.fail('ran despite mismatch'))
+    with pytest.raises(paired.EvidenceError, match='baseline checkout does not match pinned commit'):
+        paired.run(options)
 
 
 def test_row_config_mismatch_fails_pair(paired, monkeypatch, tmp_path):
@@ -245,6 +263,7 @@ def test_workflow_keeps_manual_separate_source_environments():
                          Loader=yaml.BaseLoader)
     assert set(workflow['on']) == {'workflow_dispatch'}
     assert set(workflow['on']['workflow_dispatch']['inputs']) == {'baseline_ref', 'candidate_ref'}
+    assert workflow['on']['workflow_dispatch']['inputs']['baseline_ref']['default'] == 'main'
     assert 'FASTDB_PAYLOAD_LINK_MODE' not in workflow['env']
     assert set(workflow['jobs']['paired']['strategy']['matrix']['os']) == {
         'ubuntu-24.04', 'macos-15', 'windows-2025', 'windows-11-arm'}
@@ -256,6 +275,8 @@ def test_workflow_keeps_manual_separate_source_environments():
     build = next(step['run'] for step in steps if step.get('name', '').startswith('Build separate'))
     assert 'source_mode_environment' in build
     assert "import c_two; from c_two import _native" in build
+    run = next(step['run'] for step in steps if step.get('name', '').startswith('Run exact paired'))
+    assert "'--baseline-commit', subprocess.check_output(['git', 'rev-parse', 'HEAD']" in run
     assert any(step.get('if') == 'always()' and step.get('uses') == 'actions/upload-artifact@v4'
                for step in steps)
 

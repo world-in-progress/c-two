@@ -29,94 +29,59 @@ SPEC = {
     "components": [],
 }
 LARGE_LEN = 256 * 1024
-CHUNK_SIZE = 64 * 1024
+CHUNK_SIZE = 128 * 1024
 
 
 @dataclass(frozen=True)
 class TransportCase:
     name: str
     large: bool
-    prefer_shm: bool
-    shm_budget: int
-    reassembly: str = "none"
+    memory_budget_bytes: int
+    file_spill_budget_bytes: int = 0
 
-    def overrides(self) -> dict[str, int | float | bool]:
+    def limits(self) -> dict[str, int]:
         return {
-            "pool_enabled": False,
-            "pool_prewarm_segments": 0,
-            "pool_min_retained_segments": 0,
-            "spill_threshold": 1.0,
-            "chunk_size": CHUNK_SIZE,
-            "shm_backing_budget_bytes": self.shm_budget,
-            "file_backing_budget_bytes": 8 * 1024 * 1024 if self.reassembly == "file" else 0,
-            "live_reassembly_budget_bytes": 8 * 1024 * 1024,
+            "memory_budget_bytes": self.memory_budget_bytes,
+            "file_spill_budget_bytes": self.file_spill_budget_bytes,
         }
 
 
 TRANSPORT_CASES = (
-    TransportCase("inline", False, True, 8 * 1024 * 1024),
-    TransportCase("shm", True, True, 8 * 1024 * 1024),
-    TransportCase("no-shm-inline", False, True, 0),
-    TransportCase("chunked-file-input", True, True, 0, "file"),
-    TransportCase("chunked-shm-input", True, False, 8 * 1024 * 1024, "shm"),
+    TransportCase("inline", False, 8 * 1024 * 1024),
+    TransportCase("shm", True, 8 * 1024 * 1024),
+    TransportCase("bounded-inline", False, 192 * 1024),
+    TransportCase("chunked-file-input", True, 320 * 1024, 8 * 1024 * 1024),
+    TransportCase("bounded-shm", True, 640 * 1024),
 )
 
 
-def process_environment(overrides=None, ipc_root=None) -> dict[str, str]:
+def process_environment(limits=None, ipc_root=None) -> dict[str, str]:
     environment = {**os.environ, "C2_ENV_FILE": "", "C2_RELAY_ANCHOR_ADDRESS": ""}
     if ipc_root is not None and os.name != "nt":
         environment["C2_IPC_ROOT"] = str(ipc_root)
-    for key, value in (overrides or {}).items():
-        environment[f"C2_IPC_{key.upper()}"] = str(value).lower()
+    for key, value in (limits or {}).items():
+        environment[f"C2_{key.upper()}"] = str(value)
     return environment
 
 
 def assert_transport_stats(case, encoded_len, input_stats, server_stats, client_stats) -> None:
-    """Section 9 matrix: actual backing in both directions, peaks and refunds."""
-    outgoing = client_stats["runtime_outgoing"]["cells"]
-    server = server_stats["server"]["cells"]
-    at_input = input_stats["cells"]
-    if case.large and case.shm_budget == 0:
-        # Actual ITEM_DATA boundaries are already proved by
-        # core/transport/c2-server/src/stream_tests.rs::
-        # inline_encodes_each_granted_chunk_directly_from_the_domain_item.
-        # This matrix checks the complete item and truly unavailable SHM.
-        assert encoded_len > case.overrides()["chunk_size"]
-        assert outgoing["shm"]["peak_bytes"] == 0
-        assert server["shm"]["peak_bytes"] == 0
-    for cells in (outgoing, server, at_input):
-        for kind in ("shm", "file", "reassembly"):
-            assert cells[kind]["used_bytes"] == 0, (case.name, kind, cells)
-            assert cells[kind]["peak_bytes"] <= cells[kind]["limit_bytes"]
-        assert cells["shm"]["limit_bytes"] == case.shm_budget
-    # Stream ITEM_DATA uses the B-reserved Vec, not unary reassembly.
-    assert outgoing["file"]["peak_bytes"] == 0
-    assert outgoing["reassembly"]["peak_bytes"] == 0
-    request_shm = case.large and case.prefer_shm and case.shm_budget > 0
-    if request_shm:
-        assert outgoing["shm"]["peak_bytes"] >= encoded_len
+    """Check role-domain reservation and settlement for both language adapters."""
+    roles = (client_stats["client"], server_stats["server"], input_stats)
+    for role in roles:
+        assert role["frozen"]
+        for key, limit in case.limits().items():
+            cell = role[key.removesuffix("_budget_bytes")]
+            assert cell["limit_bytes"] == limit
+            assert 0 <= cell["used_bytes"] <= cell["peak_bytes"] <= limit
+    assert client_stats["client"]["memory"]["peak_bytes"] >= encoded_len
+    assert client_stats["client"]["file_spill"]["peak_bytes"] == 0
+    assert server_stats["server"]["file_spill"]["used_bytes"] == 0
+    assert input_stats["memory"]["peak_bytes"] >= encoded_len
+    if case.file_spill_budget_bytes:
+        assert encoded_len > CHUNK_SIZE
+        assert server_stats["server"]["file_spill"]["peak_bytes"] >= encoded_len
     else:
-        assert outgoing["shm"]["peak_bytes"] == 0
-    for cells in (at_input, server):
-        if case.reassembly != "none":
-            assert cells["reassembly"]["peak_bytes"] >= encoded_len > CHUNK_SIZE
-        else:
-            assert cells["reassembly"]["peak_bytes"] == 0
-        if case.reassembly == "file":
-            assert cells["file"]["peak_bytes"] >= encoded_len
-        else:
-            assert cells["file"]["peak_bytes"] == 0
-    if case.reassembly == "shm":
-        assert at_input["shm"]["peak_bytes"] >= encoded_len
-    else:
-        assert at_input["shm"]["peak_bytes"] == 0
-    if request_shm or case.reassembly == "shm":
-        assert server["shm"]["peak_bytes"] >= encoded_len
-    else:
-        assert server["shm"]["peak_bytes"] == 0
-    budget = client_stats["payload_buffer"]
-    assert budget["used_bytes"] == 0
-    assert budget["peak_bytes"] >= encoded_len
+        assert server_stats["server"]["file_spill"]["peak_bytes"] == 0
 
 
 @cc.crm(namespace="test.python-rust-stream-matrix", version="0.1.0")
@@ -236,12 +201,12 @@ serde_json = "1"
         finally:
             binary.unlink()
 
-    def client(self, address: str, route: str, shm: bool, large: bool, hold: bool,
-               *, ipc_overrides=None, ipc_root=None) -> dict:
+    def client(self, address: str, route: str, large: bool, hold: bool,
+               *, limits=None, ipc_root=None) -> dict:
         result = subprocess.run(
-            [str(self.binary), "client", address, route, "shm" if shm else "no-shm",
+            [str(self.binary), "client", address, route,
              "large" if large else "inline", "hold" if hold else "materialized"],
-            cwd=self.root, env=process_environment(ipc_overrides, ipc_root),
+            cwd=self.root, env=process_environment(limits, ipc_root),
             capture_output=True, text=True, timeout=60, check=False,
         )
         assert result.returncode == 0, result.stderr
@@ -249,18 +214,18 @@ serde_json = "1"
         assert receipt["items"] == 2 and receipt["path"] == "direct_ipc"
         return receipt
 
-    def host(self, address: str, route: str, shm: bool, large: bool,
-             *, ipc_overrides=None, gated=False, ipc_root=None) -> RustHostProcess:
-        return RustHostProcess(self, address, route, shm, large, ipc_overrides, gated, ipc_root)
+    def host(self, address: str, route: str, large: bool,
+             *, limits=None, gated=False, ipc_root=None) -> RustHostProcess:
+        return RustHostProcess(self, address, route, large, limits, gated, ipc_root)
 
 
 class RustHostProcess:
-    def __init__(self, harness: RustHarness, address: str, route: str, shm: bool, large: bool,
-                 ipc_overrides, gated, ipc_root) -> None:
+    def __init__(self, harness: RustHarness, address: str, route: str, large: bool,
+                 limits, gated, ipc_root) -> None:
         self.process = subprocess.Popen(
-            [str(harness.binary), "gated-host" if gated else "host", address, route, "shm" if shm else "no-shm",
+            [str(harness.binary), "gated-host" if gated else "host", address, route,
              "large" if large else "inline"],
-            cwd=harness.root, env=process_environment(ipc_overrides, ipc_root),
+            cwd=harness.root, env=process_environment(limits, ipc_root),
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, bufsize=1,
         )
@@ -304,8 +269,7 @@ def _gated_python_host(address, route, root, calls, step_entered, release, ready
     runtime = cc.Runtime()
     if os.name != "nt":
         runtime.set_local_endpoint(root=root)
-    runtime.set_transport_policy(shm_threshold=64 * 1024)
-    runtime.set_server(server_id=address.removeprefix("ipc://"), ipc_overrides=overrides)
+    runtime.set_server(server_id=address.removeprefix("ipc://"), **overrides)
 
     class GatedPayloads(PythonHost):
         def echo(self, payload):

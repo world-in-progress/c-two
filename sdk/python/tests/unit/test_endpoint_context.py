@@ -95,9 +95,9 @@ def test_unused_code_root_survives_session_replacement_and_env_change(replace: s
         if {replace!r} == 'shutdown':
             assert cc.shutdown()['completed']
         else:
-            cc.set_transport_policy(shm_threshold=8192)
+            cc.set_client(memory_budget_bytes=8192)
         after = _get_default_runtime()._runtime_session
-        assert after is not before
+        assert (after is before) == ({replace!r} != 'shutdown')
         assert not after.local_endpoint_frozen
         os.environ['C2_IPC_ROOT'] = {other!r}
         assert cc.endpoint.local_endpoint_context().root == {root!r}
@@ -128,7 +128,7 @@ def test_unused_environment_policy_is_still_lazy_after_shutdown() -> None:
     ''', C2_IPC_ROOT='relative')
 
 
-def test_unresolved_policy_survives_transport_policy_replacement() -> None:
+def test_unresolved_policy_survives_role_configuration_and_retirement() -> None:
     # On Windows the root is inapplicable; on Unix it is invalid. Neither
     # platform may resolve it merely to replace an unused native session.
     _run_isolated('''
@@ -138,9 +138,9 @@ def test_unresolved_policy_survives_transport_policy_replacement() -> None:
         from c_two.transport.client import util
         from c_two.transport.registry import _get_default_runtime
         before = _get_default_runtime()._runtime_session
-        cc.set_transport_policy(shm_threshold=8192)
+        cc.set_client(memory_budget_bytes=8192)
         after = _get_default_runtime()._runtime_session
-        assert after is not before
+        assert after is before
         assert not after.local_endpoint_frozen
         for _ in range(2):
             assert cc.shutdown()['completed']
@@ -420,7 +420,7 @@ def test_public_code_override_wins_env_and_dotenv_and_survives_session_replaceme
         assert new is not old
         assert not new.local_endpoint_frozen
         assert cc.endpoint.local_endpoint_context() == captured
-        cc.set_transport_policy(shm_threshold=8192)
+        cc.set_client(memory_budget_bytes=8192)
         assert cc.endpoint.local_endpoint_context() == captured
         cc.endpoint.set_local_endpoint(root=None)
         assert cc.endpoint.local_endpoint_context().root == {file!r}

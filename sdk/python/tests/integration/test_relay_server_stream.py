@@ -102,8 +102,8 @@ def relay_values(start_c3_relay, monkeypatch, request):
     server = cc.Runtime()
     client = cc.Runtime()
     if hasattr(request, "param"):
-        client.set_call_execution_limits(
-            payload_buffer_budget_bytes=request.param,
+        client.set_client(
+            memory_budget_bytes=request.param,
         )
     server.set_relay_anchor(relay.url)
     resource = RelayResource()
@@ -139,7 +139,7 @@ def test_natural_items_and_complete_count(relay_values, count):
     }
     assert stream.close(timeout=0)["complete_items"] == count
     assert resource.events == ["steps-cleanup"]
-    assert client.call_execution_snapshot()["used_operations"] == 0
+    assert client.call_execution_snapshot()["client"]["used_operations"] == 0
 
 
 @pytest.mark.parametrize("method", ["failed_step", "failed_cleanup"])
@@ -227,7 +227,7 @@ def test_held_item_budget_release_allows_continued_delivery(relay_values):
         assert list(stream) == []
         assert stream.close(timeout=None)["complete_items"] == 3
         assert client.memory_stats()["holds"]["active_holds"] == 0
-        assert client.memory_stats()["payload_buffer"]["peak_bytes"] <= 30_000
+        assert client.memory_stats()["client"]["memory"]["peak_bytes"] <= 30_000
     finally:
         if first is not None:
             first.release()
@@ -324,7 +324,7 @@ def test_cross_language_relay_holds_keep_budget_until_release(relay_cross, recor
     relay_cross.start(3, behavior="hold")
     report = record_result(relay_cross, relay_cross.held(), record_property)
     assert report["error"] is None
-    assert report["memory"]["payload_buffer"]["rejected_allocations"] == 0
+    assert report["memory"]["client"]["memory"]["rejected_allocations"] == 0
 
 
 @pytest.mark.timeout(300)

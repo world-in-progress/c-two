@@ -346,9 +346,6 @@ pub(crate) fn lifecycle_error_to_py(error: LifecycleError) -> PyErr {
             LifecycleError::ConfigFrozen => {
                 set_attr(value, "lifecycle_kind", "config_frozen");
             }
-            LifecycleError::ClientConfigFrozen => {
-                set_attr(value, "lifecycle_kind", "client_config_frozen");
-            }
             LifecycleError::DuplicateRoute(route) => {
                 set_attr(value, "lifecycle_kind", "duplicate_route");
                 set_attr(value, "route_name", route);
