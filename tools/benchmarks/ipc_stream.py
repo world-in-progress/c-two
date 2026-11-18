@@ -409,8 +409,12 @@ def verify_transport(row, mode, server, client, item_size, whole_size):
     size = whole_size if mode == 'U' else item_size
     if row['no_shm']:
         check(host['limit_bytes'] < size, 'Host memory could accommodate SHM', SCENARIO_NOT_ESTABLISHED)
-    elif size > THRESHOLD and not expected_capacity(row, mode):
-        check(host['peak_bytes'] >= size, 'Host backing not observable', SCENARIO_NOT_ESTABLISHED)
+    elif not expected_capacity(row, mode):
+        if size > THRESHOLD:
+            check(host['peak_bytes'] >= size, 'Host backing not observable', SCENARIO_NOT_ESTABLISHED)
+        else:
+            check(host['peak_bytes'] < 4096, 'unexpected Host SHM allocation at or below inline threshold',
+                  SCENARIO_NOT_ESTABLISHED)
     if row.get('file_fallback') and mode in ('U', 'Q'):
         check(spill['peak_bytes'] >= size, 'file reassembly not observed', SCENARIO_NOT_ESTABLISHED)
     else:

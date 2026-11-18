@@ -212,7 +212,8 @@ def test_five_complete_groups_and_alternating_invocations(paired, monkeypatch, t
 
 def test_explicit_baseline_mismatch_fails_before_any_run(paired, monkeypatch, tmp_path):
     options = args(tmp_path, paired)
-    monkeypatch.setattr(paired, 'git_head', lambda root: 'different-checkout')
+    options.baseline_commit = 'b861f994' + '1' * 32
+    monkeypatch.setattr(paired, 'git_head', lambda root: 'b861f994' + '2' * 32)
     monkeypatch.setattr(paired, 'run_harness', lambda *args, **kwargs: pytest.fail('ran despite mismatch'))
     with pytest.raises(paired.EvidenceError, match='baseline checkout does not match pinned commit'):
         paired.run(options)
@@ -265,20 +266,66 @@ def test_workflow_keeps_manual_separate_source_environments():
     assert set(workflow['on']['workflow_dispatch']['inputs']) == {'baseline_ref', 'candidate_ref'}
     assert workflow['on']['workflow_dispatch']['inputs']['baseline_ref']['default'] == 'main'
     assert 'FASTDB_PAYLOAD_LINK_MODE' not in workflow['env']
-    assert set(workflow['jobs']['paired']['strategy']['matrix']['os']) == {
+    resolver = workflow['jobs']['resolve-refs']
+    assert resolver['runs-on'] == 'ubuntu-24.04'
+    assert resolver['outputs'] == {
+        'baseline_sha': '${{ steps.commits.outputs.baseline_sha }}',
+        'candidate_sha': '${{ steps.commits.outputs.candidate_sha }}',
+    }
+    assert {step['with']['path']: step['with']['ref'] for step in resolver['steps'] if 'uses' in step} == {
+        'refs/baseline': '${{ inputs.baseline_ref }}',
+        'refs/candidate': '${{ inputs.candidate_ref || github.sha }}',
+    }
+    paired_job = workflow['jobs']['paired']
+    assert paired_job['needs'] == 'resolve-refs'
+    assert set(paired_job['strategy']['matrix']['os']) == {
         'ubuntu-24.04', 'macos-15', 'windows-2025', 'windows-11-arm'}
-    steps = workflow['jobs']['paired']['steps']
-    checkouts = [step['with']['path'] for step in steps if 'with' in step and
-                 step['with'].get('path') in {'baseline/c-two', 'candidate/c-two'}]
-    assert checkouts == ['baseline/c-two', 'candidate/c-two']
+    steps = paired_job['steps']
+    checkouts = {step['with']['path']: step['with']['ref'] for step in steps if 'with' in step and
+                 step['with'].get('path') in {'baseline/c-two', 'candidate/c-two'}}
+    assert checkouts == {
+        'baseline/c-two': '${{ needs.resolve-refs.outputs.baseline_sha }}',
+        'candidate/c-two': '${{ needs.resolve-refs.outputs.candidate_sha }}',
+    }
     assert not any('prepare_fastdb_sdk.py' in step.get('run', '') for step in steps)
     build = next(step['run'] for step in steps if step.get('name', '').startswith('Build separate'))
     assert 'source_mode_environment' in build
     assert "import c_two; from c_two import _native" in build
-    run = next(step['run'] for step in steps if step.get('name', '').startswith('Run exact paired'))
-    assert "'--baseline-commit', subprocess.check_output(['git', 'rev-parse', 'HEAD']" in run
+    step = next(step for step in steps if step.get('name', '').startswith('Run exact paired'))
+    assert step['env']['EXPECTED_BASELINE_SHA'] == '${{ needs.resolve-refs.outputs.baseline_sha }}'
     assert any(step.get('if') == 'always()' and step.get('uses') == 'actions/upload-artifact@v4'
                for step in steps)
+
+
+def test_workflow_passes_resolved_baseline_commit_to_pairing(monkeypatch, tmp_path):
+    workflow = yaml.load((ROOT / '.github/workflows/ipc-memory-paired.yml').read_text(),
+                         Loader=yaml.BaseLoader)
+    step = next(step for step in workflow['jobs']['paired']['steps']
+                if step.get('name', '').startswith('Run exact paired'))
+    baseline_sha = 'b861f994' + '1' * 32
+    monkeypatch.setenv('GITHUB_WORKSPACE', str(tmp_path))
+    monkeypatch.setenv('RUNNER_TEMP', str(tmp_path))
+    monkeypatch.setenv('BASELINE_REF', 'main')
+    monkeypatch.setenv('CANDIDATE_REF', 'candidate')
+    monkeypatch.setenv('EXPECTED_BASELINE_SHA', baseline_sha)
+    commands = []
+    monkeypatch.setattr(subprocess, 'run', lambda command, **kwargs: commands.append(command))
+
+    exec(compile(step['run'], '<paired-workflow-run>', 'exec'), {})
+
+    command, = commands
+    assert command[command.index('--baseline-commit') + 1] == baseline_sha
+
+
+@pytest.mark.parametrize('name', ['reply_file_spill', 'reply_memory_reassembly', 'reply_budget_exhausted'])
+def test_standalone_response_admission_rows_require_memory_stats(paired, name):
+    row = next(row for row in paired.bench.matrix_rows() if row['name'] == name)
+    args = SimpleNamespace(memory_stats=False, require_memory_stats=False,
+                           allow_unavailable_stats_after_shutdown=False, child_timeout=120,
+                           python=sys.executable)
+    spec = paired.bench.build_row_spec(row, args)
+    assert spec['memory_stats'] is True
+    assert spec['require_memory_stats'] is True
 
 
 @pytest.mark.parametrize('side,category,blocking', [

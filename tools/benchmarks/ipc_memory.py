@@ -886,9 +886,10 @@ def run_row(spec: dict) -> dict:
 
 def build_row_spec(table_row: dict, args: argparse.Namespace) -> dict:
     spec = dict(table_row)
+    response_admission = table_row['workload'] == 'response_admission'
     spec.update(
-        memory_stats=args.memory_stats or table_row['workload'] == 'forced_budget',
-        require_memory_stats=args.require_memory_stats or table_row['workload'] == 'forced_budget',
+        memory_stats=args.memory_stats or response_admission,
+        require_memory_stats=args.require_memory_stats or response_admission,
         allow_unavailable_stats_after_shutdown=args.allow_unavailable_stats_after_shutdown,
         child_timeout=args.child_timeout,
         python=args.python,

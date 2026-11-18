@@ -146,3 +146,17 @@ def test_transport_uses_actual_backing_and_stream_budget_peaks(stream):
     stream.verify_transport(row, 'U', server, client, 100_000, 200_000)
     with pytest.raises(stream.BenchmarkError, match='unexpected client file spill'):
         stream.verify_transport(row, 'S', server, client, 100_000, 200_000)
+
+
+def test_inline_threshold_rejects_unexpected_host_shm(stream):
+    row = next(row for row in stream.matrix_rows() if row['name'] == 'threshold_at')
+    size = row['encoded_target']
+    host = {'peak_bytes': 4095}
+    server = {'server': {'memory': host}}
+    client = {'client': {'memory': {'peak_bytes': size}, 'file_spill': {'peak_bytes': 0}}}
+    stream.verify_transport(row, 'S', server, client, size, size * row['count'])
+
+    host['peak_bytes'] = 4096
+    with pytest.raises(stream.BenchmarkError, match='unexpected Host SHM allocation') as error:
+        stream.verify_transport(row, 'S', server, client, size, size * row['count'])
+    assert error.value.category == stream.SCENARIO_NOT_ESTABLISHED

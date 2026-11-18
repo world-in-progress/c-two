@@ -69,6 +69,17 @@ def test_wheel_accepts_exact_fastdb_extra(tmp_path, quote):
     assert metadata["version"] == "0.7.5"
 
 
+@pytest.mark.parametrize("role", ["server", "client"])
+def test_direct_smoke_evidence_requires_a_peak_covering_the_payload(role):
+    smoke = load_smoke()
+    key = f"{role}_memory_peak_bytes"
+    payload_size = 1024 * 1024
+    assert smoke.require_memory_peak({key: payload_size}, role, payload_size) == payload_size
+    for incomplete in ({}, {key: None}, {key: payload_size - 1}):
+        with pytest.raises(RuntimeError, match=key):
+            smoke.require_memory_peak(incomplete, role, payload_size)
+
+
 def test_dead_host_broken_stdin_does_not_leave_relay_alive():
     smoke = load_smoke()
     host = subprocess.Popen([sys.executable, "-c", "pass"], stdin=subprocess.PIPE, text=True)

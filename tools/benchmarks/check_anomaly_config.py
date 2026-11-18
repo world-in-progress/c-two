@@ -45,11 +45,18 @@ def check_configs(abnormal_calls: int) -> dict:
                 'mode': route.mode, 'max_workers': route.max_workers,
                 'max_pending': route.max_pending,
             }
-            if scenario == 'release_batch' and 'server' in row['accepted']:
-                workers = row['accepted']['server']['max_execution_workers']
-                row['inflight_calls'] = config['inflight_calls']
-                if workers < config['inflight_calls'] + 1:
-                    failures.append(f'{scenario}/{control}: insufficient execution workers: {workers}')
+            if scenario == 'release_batch':
+                inflight = config['inflight_calls']
+                row['inflight_calls'] = inflight
+                for role, key, expected in (
+                    ('server', 'max_execution_workers', inflight + 1),
+                    ('server', 'max_outstanding_calls', inflight + 1),
+                    ('abnormal', 'max_outstanding_calls', inflight),
+                ):
+                    if role in row['accepted']:
+                        actual = row['accepted'][role].get(key)
+                        if actual != expected:
+                            failures.append(f'{scenario}/{control}/{role}: {key}={actual}, expected {expected}')
             rows.append(row)
     return {
         'schema': 'c-two.ipc-anomaly-config-check.v1',

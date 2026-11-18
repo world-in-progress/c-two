@@ -1,7 +1,9 @@
 """Anomaly benchmark contracts without starting IPC, SHM, or child processes."""
 from __future__ import annotations
 
+import ast
 import importlib.util
+import inspect
 import json
 import os
 import itertools
@@ -320,21 +322,50 @@ SCENARIOS = (
 
 @pytest.mark.parametrize('scenario', SCENARIOS)
 def test_options_match_their_public_role_signatures(anomaly, tmp_path, scenario):
-    import inspect
-    import c_two as cc
+    source = ROOT / 'sdk/python/src/c_two'
+    registry = ast.parse((source / 'transport/registry.py').read_text(encoding='utf-8'))
+    package = ast.parse((source / '__init__.py').read_text(encoding='utf-8'))
+    runtime = next(node for node in registry.body if isinstance(node, ast.ClassDef) and node.name == 'Runtime')
+    exported = {
+        alias.name for node in package.body
+        if isinstance(node, ast.ImportFrom) and node.level == 1 and node.module == 'transport.registry'
+        for alias in node.names if alias.asname in (None, alias.name)
+    }
+    public_names = next(ast.literal_eval(node.value) for node in package.body
+                        if isinstance(node, ast.Assign) and any(
+                            isinstance(target, ast.Name) and target.id == '__all__' for target in node.targets))
+
+    def signature(body, name, *, method=False):
+        function = next(node for node in body if isinstance(node, ast.FunctionDef) and node.name == name)
+        params = function.args
+        assert [param.arg for param in params.args] == (['self'] if method else [])
+        assert not (params.posonlyargs or params.defaults or params.vararg or params.kwarg)
+        return inspect.Signature([
+            inspect.Parameter(param.arg, inspect.Parameter.KEYWORD_ONLY,
+                              default=ast.unparse(default) if default is not None else inspect.Parameter.empty,
+                              annotation=ast.unparse(param.annotation) if param.annotation is not None
+                              else inspect.Parameter.empty)
+            for param, default in zip(params.kwonlyargs, params.kw_defaults, strict=True)
+        ])
 
     config = anomaly.scenario_spec(options(tmp_path, scenario))
-    inspect.signature(cc.set_server).bind(**config['server_options'])
-    for role in ('normal', 'abnormal'):
-        inspect.signature(cc.set_client).bind(**config[role + '_options'])
+    for name, roles in (('set_server', ('server',)), ('set_client', ('normal', 'abnormal'))):
+        assert name in exported and name in public_names
+        public = signature(registry.body, name)
+        assert list(public.parameters.values()) == list(signature(runtime.body, name, method=True).parameters.values())
+        for role in roles:
+            public.bind(**config[role + '_options'])
 
 
-@pytest.mark.parametrize('abnormal_calls', [1, 65, 80, 128])
+@pytest.mark.parametrize('abnormal_calls', [1, 65, 80, 128, 513])
 def test_release_batch_has_execution_space_for_every_gated_call_and_normal_client(anomaly, tmp_path, abnormal_calls):
     args = options(tmp_path, 'release_batch')
     args.abnormal_calls = abnormal_calls
     config = anomaly.scenario_spec(args)
-    assert config['server_options']['max_execution_workers'] >= config['inflight_calls'] + 1
+    inflight = config['inflight_calls']
+    assert config['server_options']['max_execution_workers'] == inflight + 1
+    assert config['server_options']['max_outstanding_calls'] == inflight + 1
+    assert config['abnormal_options']['max_outstanding_calls'] == inflight
     assert config['route_concurrency'] == {'mode': 'parallel', 'max_workers': None, 'max_pending': None}
 
 
@@ -372,7 +403,7 @@ def test_native_config_check_covers_every_scenario_and_role_without_starting_hos
     cc.Runtime = Runtime
     cc.register = lambda *args, **kwargs: pytest.fail('config validation started a Host')
     cc.connect = lambda *args, **kwargs: pytest.fail('config validation connected a client')
-    report = check.check_configs(80)
+    report = check.check_configs(513)
     assert report['ok'] is True, report['failures']
     assert report['native_updates_attempted'] == report['native_updates_passed'] == 66
     assert len(calls) == 66
@@ -382,4 +413,7 @@ def test_native_config_check_covers_every_scenario_and_role_without_starting_hos
         (scenario, control) for scenario in SCENARIOS for control in ('alone', 'parallel')
     }
     batch = [row for row in report['rows'] if row['scenario'] == 'release_batch']
-    assert all(row['accepted']['server']['max_execution_workers'] == 81 for row in batch)
+    for row in batch:
+        assert row['accepted']['server']['max_execution_workers'] == 514
+        assert row['accepted']['server']['max_outstanding_calls'] == 514
+        assert row['accepted']['abnormal']['max_outstanding_calls'] == 513

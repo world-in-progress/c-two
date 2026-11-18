@@ -610,6 +610,7 @@ def _gate_host(root, work, relay=None, *, late_builder=False, manager_concurrenc
                     server.register(IdleGate, builder, name="builder")
                 return result
         manager = LateManager()
+    session = server._runtime_session
     try:
         server.start()
         for connection_id in connections.snapshot()["active"]:
@@ -617,7 +618,7 @@ def _gate_host(root, work, relay=None, *, late_builder=False, manager_concurrenc
         server.register(IdleGate, manager, name="manager", concurrency=manager_concurrency)
         if not late_builder:
             server.register(IdleGate, builder, name="builder")
-        identity = dict(server._runtime_session.ensure_server())
+        identity = dict(session.ensure_server())
         manager.identity = builder.identity = identity
         yield server, manager, builder, identity, connections
     finally:
@@ -627,8 +628,8 @@ def _gate_host(root, work, relay=None, *, late_builder=False, manager_concurrenc
         assert cleanup["completed"], cleanup
         manager.close()
         builder.close()
-        assert server.call_execution_snapshot()["server"]["used_operations"] == 0
-        memory = server.memory_stats()
+        assert session.call_execution_snapshot()["server"]["used_operations"] == 0
+        memory = session.memory_stats()
         assert memory["holds"]["active_holds"] == 0
         _save_gate(work, "host-cleanup", shutdown=cleanup, memory=memory, connections=connections.snapshot())
         connections.events.close()

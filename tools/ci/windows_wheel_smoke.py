@@ -173,9 +173,12 @@ if sys.argv[1] == "host":
     try:
         assert sys.stdin.readline().strip() == "stop"
         invalidated = resource.verify_borrowed_inputs()
+        server_peak = memory_stats()["server"]["memory"]["peak_bytes"]
+        assert server_peak >= len(DATA), server_peak
     finally:
         cc.shutdown()
-    emit({"status":"stopped", "borrowed_inputs_invalidated":invalidated})
+    emit({"status":"stopped", "borrowed_inputs_invalidated":invalidated,
+          "server_memory_peak_bytes":server_peak})
 else:
     cc.set_client(memory_budget_bytes=32 * 1024 * 1024)
     source = build()
@@ -200,10 +203,15 @@ else:
         finally:
             view.close()
             retained.close()
-        assert memory_stats()["holds"]["active_holds"] == 0
+        stats = memory_stats()
+        assert stats["holds"]["active_holds"] == 0
+        memory = stats["client"]["memory"]
+        client_peak = memory["peak_bytes"] if memory is not None else None
+        if sys.argv[3] == "direct":
+            assert client_peak is not None and client_peak >= len(DATA), client_peak
         emit({**facts, "status":"passed", "transport":sys.argv[3],
               "observed_mode":observed_mode, "payload_bytes":len(DATA),
-              "held_view_invalidated":True})
+              "held_view_invalidated":True, "client_memory_peak_bytes":client_peak})
     finally:
         cc.close(proxy)
         source.close()
@@ -324,6 +332,14 @@ def read_result(output: str) -> dict[str, object]:
     if len(lines) != 1:
         raise RuntimeError(f"Expected one consumer result: {output}")
     return json.loads(lines[0])
+
+
+def require_memory_peak(result: dict[str, object], role: str, payload_bytes: int) -> int:
+    key = f"{role}_memory_peak_bytes"
+    peak = result.get(key)
+    if type(peak) is not int or peak < payload_bytes:
+        raise RuntimeError(f"{key}={peak!r}, expected at least {payload_bytes} bytes")
+    return peak
 
 
 def stop(process: subprocess.Popen[str]) -> str:
@@ -497,13 +513,18 @@ def main() -> int:
                         for info in (fastdb_info, ctwo_info):
                             if result["versions"][info["distribution"]] != info["version"]:
                                 raise RuntimeError(f"Installed version differs from wheel: {result}")
+                        if mode == "direct":
+                            direct_payload_bytes = result["payload_bytes"]
+                            require_memory_peak(result, "client", direct_payload_bytes)
                         receipt["checks"].append(result)
                     host.stdin.write("stop\n")
                     host.stdin.flush()
                     host.wait(timeout=30)
                     stopped = host_result(messages, host_log, timeout=5)
-                    if host.returncode != 0 or stopped != {"status":"stopped", "borrowed_inputs_invalidated":4}:
+                    if (host.returncode != 0 or stopped.get("status") != "stopped"
+                            or stopped.get("borrowed_inputs_invalidated") != 4):
                         raise RuntimeError(f"Host shutdown failed: {stopped}, exit {host.returncode}")
+                    receipt["server_memory_peak_bytes"] = require_memory_peak(stopped, "server", direct_payload_bytes)
                     receipt["cleanup"]["host_orderly_shutdown"] = True
                     receipt["borrowed_inputs_invalidated"] = stopped["borrowed_inputs_invalidated"]
                 finally:

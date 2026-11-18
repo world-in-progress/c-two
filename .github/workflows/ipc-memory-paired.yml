@@ -28,7 +28,34 @@ env:
   PYTHONUTF8: "1"
 
 jobs:
+  resolve-refs:
+    runs-on: ubuntu-24.04
+    outputs:
+      baseline_sha: ${{ steps.commits.outputs.baseline_sha }}
+      candidate_sha: ${{ steps.commits.outputs.candidate_sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: refs/baseline
+          ref: ${{ inputs.baseline_ref }}
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: refs/candidate
+          ref: ${{ inputs.candidate_ref || github.sha }}
+          persist-credentials: false
+      - name: Record source commits
+        id: commits
+        shell: bash
+        run: |
+          for side in baseline candidate; do
+            sha=$(git -C "refs/$side" rev-parse --verify 'HEAD^{commit}')
+            [[ "$sha" =~ ^[0-9a-f]{40}$ ]]
+            printf '%s_sha=%s\n' "$side" "$sha" >> "$GITHUB_OUTPUT"
+          done
+
   paired:
+    needs: resolve-refs
     name: paired (${{ matrix.os }})
     strategy:
       fail-fast: false
@@ -40,12 +67,12 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           path: baseline/c-two
-          ref: ${{ inputs.baseline_ref }}
+          ref: ${{ needs.resolve-refs.outputs.baseline_sha }}
           persist-credentials: false
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           path: candidate/c-two
-          ref: ${{ inputs.candidate_ref || github.sha }}
+          ref: ${{ needs.resolve-refs.outputs.candidate_sha }}
           persist-credentials: false
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -105,8 +132,7 @@ jobs:
           output = pathlib.Path(os.environ['RUNNER_TEMP']) / 'ipc-paired'
           command = [sys.executable, str(candidate / 'tools' / 'benchmarks' / 'ipc_paired.py'),
                      '--baseline-root', str(baseline), '--candidate-root', str(candidate),
-                     '--baseline-commit', subprocess.check_output(['git', 'rev-parse', 'HEAD'],
-                         cwd=baseline, text=True).strip(),
+                     '--baseline-commit', os.environ['EXPECTED_BASELINE_SHA'],
                      '--baseline-ref', os.environ['BASELINE_REF'],
                      '--candidate-ref', os.environ['CANDIDATE_REF'],
                      '--baseline-python', str(interpreter(baseline)),
@@ -114,6 +140,7 @@ jobs:
                      '--output-dir', str(output), '--pairs', '5']
           subprocess.run(command, cwd=candidate, check=True)
         env:
+          EXPECTED_BASELINE_SHA: ${{ needs.resolve-refs.outputs.baseline_sha }}
           BASELINE_REF: ${{ inputs.baseline_ref }}
           CANDIDATE_REF: ${{ inputs.candidate_ref || github.sha }}
       - name: Run candidate unary and stream comparison

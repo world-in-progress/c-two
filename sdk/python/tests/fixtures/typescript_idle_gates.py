@@ -115,6 +115,17 @@ class GateResource:
             payload.close()
 
 
+def assert_node_role_drained(stats: dict) -> None:
+    used_operations = stats["call_execution"]["used_operations"]
+    if stats["frozen"] is True:
+        assert used_operations == "0", stats
+        assert stats["memory"]["used_bytes"] == "0", stats
+    else:
+        assert stats["frozen"] is False, stats
+        assert used_operations is None, stats
+        assert stats["memory"] is None, stats
+
+
 @contextmanager
 def node_gate_client(
     project: tuple[Path, str], work: Path, address: str, ipc_root: str | None,
@@ -165,7 +176,8 @@ def node_gate_client(
             try:
                 if process.poll() is None:
                     cleaned = request("exit")
-                    assert cleaned["ok"] and cleaned["stats"]["call_execution"]["used_operations"] == "0", cleaned
+                    assert cleaned["ok"], cleaned
+                    assert_node_role_drained(cleaned["stats"])
                     process.stdin.close()
                     assert process.wait(timeout=10) == 0
             finally:

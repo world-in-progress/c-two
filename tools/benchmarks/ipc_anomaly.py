@@ -117,6 +117,7 @@ def scenario_spec(args: argparse.Namespace) -> dict:
         # permit available for the normal client while those calls are gated.
         server['max_execution_workers'] = inflight + 1
         server['max_outstanding_calls'] = inflight + 1
+        abnormal['max_outstanding_calls'] = inflight
     if scenario == 'release_busy':
         abnormal_request = 256 * 1024
     if scenario == 'release_blocked':
@@ -522,9 +523,9 @@ def run_anomaly(args: argparse.Namespace) -> dict:
                                f'observed={occupied}, required_at_least={minimum}')
             if args.scenario == 'fallback_dedicated':
                 peak = snapshots['during']['memory']['stats']['server']['memory']['peak_bytes']
-                if peak <= occupied:
+                if peak < occupied + config['response_bytes']:
                     failures.setup('no additional server backing beyond the stopped replies: '
-                                   f'peak={peak}, occupied_before={occupied}')
+                                   f'peak={peak}, occupied_before={occupied}, response_bytes={config["response_bytes"]}')
             if args.scenario == 'fallback_inline' and _cell_peak(normal, 'during', 'memory') < config['response_bytes']:
                 failures.setup('no receive reassembly observed for the forced chunk fallback')
             if args.scenario == 'fallback_file' and _cell_peak(normal, 'during', 'file_spill') < config['response_bytes']:
