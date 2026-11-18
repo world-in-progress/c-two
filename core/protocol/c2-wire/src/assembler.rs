@@ -2,7 +2,7 @@
 //!
 //! Provides a single Rust implementation that writes chunks directly into a unified
 //! [`c2_mem::OwnedAllocation`] (buddy SHM, dedicated SHM, or file-backed mmap).
-//! Its fixed mapping, release authority, and reassembly budget reservation
+//! Its fixed mapping, release authority, and tracking-metadata charge
 //! travel together in one [`ReassemblyBacking`] carrier from admission to release.
 
 use std::sync::Arc;
@@ -22,7 +22,7 @@ use crate::chunk::backing::{ReassemblyBacking, checked_capacity};
 ///
 /// Every exit path is ownership-safe: `finish()` on an incomplete assembly,
 /// `abort()`, and plain drop all release storage through its fixed allocation
-/// owner and then refund the reassembly budget charge exactly once.
+/// owner and then refund the tracking-metadata charge exactly once.
 pub struct ChunkAssembler {
     total_chunks: usize,
     chunk_size: usize,
@@ -36,7 +36,7 @@ pub struct ChunkAssembler {
 }
 
 /// One move-only, checked write range. It pins the original backing and its
-/// reservation even if the registry removes the assembly during the copy.
+/// charge even if the registry removes the assembly during the copy.
 pub struct PreparedChunk {
     backing: Arc<ReassemblyBacking>,
     allocation_address: usize,
@@ -49,6 +49,23 @@ pub struct PreparedChunk {
 pub struct CopiedChunk(PreparedChunk);
 
 impl PreparedChunk {
+    /// Copy into the token's exclusive range using the caller's source owner.
+    pub fn copy_with(
+        self,
+        copy: impl FnOnce(&mut [u8]) -> Result<(), String>,
+    ) -> Result<CopiedChunk, String> {
+        // SAFETY: preparation reserved a disjoint, initialized span of the
+        // mapped backing, which stays alive through the token's Arc.
+        let destination = unsafe {
+            std::slice::from_raw_parts_mut(
+                (self.allocation_address as *mut u8).add(self.offset),
+                self.len,
+            )
+        };
+        copy(destination)?;
+        Ok(CopiedChunk(self))
+    }
+
     pub fn copy_from(self, data: &[u8]) -> Result<CopiedChunk, String> {
         if data.len() != self.len {
             return Err(format!(
@@ -92,7 +109,7 @@ impl ChunkAssembler {
     /// Create a new assembler.
     ///
     /// `pool` is the shared owner pool that allocates the reassembly buffer
-    /// and carries the canonical reassembly budget. `total_chunks` and
+    /// and carries the role-domain budget. `total_chunks` and
     /// `chunk_size` come from the first chunk's header. The per-message byte
     /// limit and geometry are checked
     /// before any budget reservation or allocation.
@@ -100,9 +117,9 @@ impl ChunkAssembler {
         pool: Arc<RwLock<MemPool>>,
         total_chunks: usize,
         chunk_size: usize,
-        max_reassembly_bytes: u64,
+        max_payload_size: u64,
     ) -> Result<Self, ChunkAdmissionError> {
-        let geometry = Self::check_geometry(total_chunks, chunk_size, max_reassembly_bytes)?;
+        let geometry = Self::check_geometry(total_chunks, chunk_size, max_payload_size)?;
         let guard = pool.write();
         Self::new_with_guard(Arc::clone(&pool), guard, geometry)
     }
@@ -110,13 +127,13 @@ impl ChunkAssembler {
     pub(crate) fn check_geometry(
         total_chunks: usize,
         chunk_size: usize,
-        max_reassembly_bytes: u64,
+        max_payload_size: u64,
     ) -> Result<ChunkGeometry, ChunkAdmissionError> {
         let capacity =
             checked_capacity(total_chunks, chunk_size).map_err(ChunkAdmissionError::Protocol)?;
-        if u64::try_from(capacity).map_or(true, |capacity| capacity > max_reassembly_bytes) {
+        if u64::try_from(capacity).map_or(true, |capacity| capacity > max_payload_size) {
             return Err(ChunkAdmissionError::Capacity(format!(
-                "reassembly size {capacity} exceeds limit {max_reassembly_bytes}"
+                "reassembly size {capacity} exceeds limit {max_payload_size}"
             )));
         }
         Ok(ChunkGeometry {
@@ -135,9 +152,9 @@ impl ChunkAssembler {
             total_chunks,
             chunk_size,
         } = geometry;
-        // Each tracking state occupies one byte. Reserve those bytes together with
-        // the payload before allocating either storage, using the same owner
-        // reservation throughout the backing's lifetime.
+        // Each tracking state occupies one byte. The backing reserves exactly
+        // those metadata bytes against the role-domain memory cell and keeps
+        // the charge for the backing's whole lifetime.
         let mut backing = ReassemblyBacking::admit_with_guard(
             pool,
             guard,
@@ -235,7 +252,8 @@ impl ChunkAssembler {
         self.received
     }
 
-    /// The allocated payload and chunk-tracking capacity charged to the budget.
+    /// The allocated payload capacity charged to the budget (the tracking
+    /// metadata is charged separately, one byte per chunk).
     pub fn capacity_bytes(&self) -> u64 {
         self.backing.capacity_bytes()
     }
@@ -249,7 +267,7 @@ impl ChunkAssembler {
     ///
     /// On an incomplete assembly this returns `Err`; the assembler value
     /// drops on that return, releasing storage through its fixed allocation
-    /// owner and refunding the reassembly charge exactly once.
+    /// owner and refunding the tracking-metadata charge exactly once.
     pub fn finish(self) -> Result<ReassemblyBacking, String> {
         if !self.is_complete() {
             return Err(format!(
@@ -287,44 +305,62 @@ impl ChunkAssembler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use c2_mem::MemoryBudget;
-    use c2_mem::budget::BudgetKind;
+    use c2_mem::DomainBudget;
     use c2_mem::config::PoolConfig;
 
+    static NEXT_POOL: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+    fn domain(memory_bytes: u64, file_bytes: u64) -> DomainBudget {
+        DomainBudget::from_limits(&c2_config::DomainLimits {
+            memory_budget_bytes: memory_bytes,
+            file_spill_budget_bytes: file_bytes,
+            max_outstanding_calls: 0,
+        })
+    }
+
+    fn unique_prefix(tag: &str) -> String {
+        let sequence = NEXT_POOL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        format!(
+            "/cc3ab{:04x}{:04x}{tag}",
+            std::process::id() as u16,
+            sequence
+        )
+    }
+
+    fn assembler_pool_config(spill_threshold: f64) -> PoolConfig {
+        PoolConfig {
+            segment_size: 64 * 1024,
+            max_segments: 2,
+            max_dedicated_segments: 2,
+            buddy_idle_decay_secs: 0.0,
+            spill_threshold,
+            spill_dir: std::env::temp_dir().join("c2_asm_test"),
+            ..PoolConfig::default()
+        }
+    }
+
+    /// SHM-first pool (pressure heuristic disabled) with its own domain.
     fn test_pool_arc() -> Arc<RwLock<MemPool>> {
         Arc::new(RwLock::new(
-            MemPool::new(PoolConfig {
-                segment_size: 64 * 1024,
-                min_block_size: 4096,
-                max_segments: 2,
-                max_dedicated_segments: 2,
-
-                buddy_idle_decay_secs: 0.0,
-                spill_threshold: 1.0,
-                spill_dir: std::env::temp_dir().join("c2_asm_test"),
-                ..PoolConfig::default()
-            })
+            MemPool::new_with_prefix_and_budget(
+                assembler_pool_config(1.0),
+                unique_prefix(""),
+                domain(16 * (1 << 20), 1 << 20),
+            )
             .unwrap(),
         ))
     }
 
-    fn budgeted_pool_arc(reassembly_limit: u64) -> (Arc<RwLock<MemPool>>, MemoryBudget) {
-        let budget = MemoryBudget::new(1 << 20, 1 << 20, reassembly_limit);
+    /// Pure file-spill pool: the threshold 0.0 denies every new SHM backing,
+    /// so the file-spill cell tracks capacity bytes exactly and the memory
+    /// cell tracks only the tracking metadata.
+    fn file_pool_arc(memory_bytes: u64, file_bytes: u64) -> (Arc<RwLock<MemPool>>, DomainBudget) {
+        let budget = domain(memory_bytes, file_bytes);
         (
             Arc::new(RwLock::new(
                 MemPool::new_with_prefix_and_budget(
-                    PoolConfig {
-                        segment_size: 64 * 1024,
-                        min_block_size: 4096,
-                        max_segments: 2,
-                        max_dedicated_segments: 2,
-
-                        buddy_idle_decay_secs: 0.0,
-                        spill_threshold: 1.0,
-                        spill_dir: std::env::temp_dir().join("c2_asm_test_budget"),
-                        ..PoolConfig::default()
-                    },
-                    format!("/cc3ab{:08x}", std::process::id()),
+                    assembler_pool_config(0.0),
+                    unique_prefix("file"),
                     budget.clone(),
                 )
                 .unwrap(),
@@ -333,29 +369,23 @@ mod tests {
         )
     }
 
+    fn charged_bytes(budget: &DomainBudget) -> u64 {
+        let snapshot = budget.snapshot();
+        snapshot.memory.used_bytes + snapshot.file_spill.used_bytes
+    }
+
     #[test]
     fn release_file_does_not_wait_for_public_pool_borrow() {
-        let budget = MemoryBudget::new(0, 8192, 8194);
-        let pool = Arc::new(RwLock::new(
-            MemPool::new_with_prefix_and_budget(
-                PoolConfig {
-                    spill_threshold: 0.0,
-                    ..PoolConfig::default()
-                },
-                "assembler-file-release".into(),
-                budget.clone(),
-            )
-            .unwrap(),
-        ));
+        let (pool, budget) = file_pool_arc(8192, 8192);
         let mut asm = ChunkAssembler::new(pool.clone(), 2, 4096, 8192).unwrap();
         assert!(asm.backing.is_file_spill());
         assert!(!asm.feed_chunk(0, &[27; 4096]).unwrap());
-        assert_eq!(budget.snapshot().file.used_bytes, 8192);
-        assert_eq!(budget.snapshot().reassembly.used_bytes, 8194);
+        assert_eq!(budget.snapshot().file_spill.used_bytes, 8192);
+        assert_eq!(budget.snapshot().memory.used_bytes, 2);
         let _reader = pool.read();
         asm.abort();
-        assert_eq!(budget.snapshot().file.used_bytes, 0);
-        assert_eq!(budget.snapshot().reassembly.used_bytes, 0);
+        assert_eq!(budget.snapshot().file_spill.used_bytes, 0);
+        assert_eq!(budget.snapshot().memory.used_bytes, 0);
     }
 
     #[test]
@@ -373,7 +403,7 @@ mod tests {
 
     #[test]
     fn test_multi_chunk_in_order() {
-        let pool = test_pool_arc();
+        let (pool, budget) = file_pool_arc(1 << 20, 1 << 20);
         let mut asm = ChunkAssembler::new(pool.clone(), 3, 8, 8 * (1 << 30)).unwrap();
         assert!(!asm.feed_chunk(0, b"aaaaaaaa").unwrap()); // full
         assert!(!asm.feed_chunk(1, b"bbbbbbbb").unwrap()); // full
@@ -384,9 +414,11 @@ mod tests {
         assert_eq!(&slice[0..8], b"aaaaaaaa");
         assert_eq!(&slice[8..16], b"bbbbbbbb");
         assert_eq!(&slice[16..18], b"cc");
-        // Trim happened but the full capacity stays charged until release.
-        assert_eq!(backing.capacity_bytes(), 27);
+        // Trim happened but the charged capacity and metadata stay until release.
+        assert_eq!(backing.capacity_bytes(), 24);
+        assert_eq!(charged_bytes(&budget), 24 + 3);
         backing.release();
+        assert_eq!(charged_bytes(&budget), 0);
     }
 
     #[test]
@@ -424,15 +456,15 @@ mod tests {
 
     #[test]
     fn prepared_copy_keeps_original_charge_after_assembly_abort() {
-        let (pool, budget) = budgeted_pool_arc(8194);
+        let (pool, budget) = file_pool_arc(8192, 8192);
         let mut asm = ChunkAssembler::new(pool, 2, 4096, 8192).unwrap();
         let token = asm.prepare_chunk(0, 4096).unwrap();
         asm.abort();
-        assert_eq!(budget.snapshot().reassembly.used_bytes, 8194);
+        assert_eq!(charged_bytes(&budget), 8192 + 2);
         let copied = token.copy_from(&[7; 4096]).unwrap();
-        assert_eq!(budget.snapshot().reassembly.used_bytes, 8194);
+        assert_eq!(charged_bytes(&budget), 8192 + 2);
         drop(copied);
-        assert_eq!(budget.snapshot().reassembly.used_bytes, 0);
+        assert_eq!(charged_bytes(&budget), 0);
     }
 
     #[test]
@@ -486,10 +518,7 @@ mod tests {
             let mut backing = asm.finish().unwrap();
             assert_eq!(backing.len(), (total_chunks - 1) * chunk_size + last_size);
             assert_eq!(backing.copy_bytes().unwrap(), chunks.concat());
-            assert_eq!(
-                backing.capacity_bytes(),
-                (total_chunks * (chunk_size + 1)) as u64
-            );
+            assert_eq!(backing.capacity_bytes(), (total_chunks * chunk_size) as u64);
             backing.release();
         }
     }
@@ -513,19 +542,18 @@ mod tests {
 
     #[test]
     fn test_abort_releases_handle_and_charge() {
-        let budget = MemoryBudget::new(1 << 20, 0, 64 * 1024);
+        let budget = domain(1 << 20, 0);
         let pool = Arc::new(RwLock::new(
             MemPool::new_with_prefix_and_budget(
                 PoolConfig {
                     segment_size: 64 * 1024,
-                    min_block_size: 4096,
                     max_segments: 1,
                     min_retained_segments: 1,
                     max_dedicated_segments: 0,
                     spill_threshold: 1.0,
-                    ..PoolConfig::default()
+                    ..assembler_pool_config(1.0)
                 },
-                format!("/cc3abort{:08x}", std::process::id()),
+                unique_prefix("abort"),
                 budget.clone(),
             )
             .unwrap(),
@@ -536,14 +564,20 @@ mod tests {
         assert!(!asm.feed_chunk(0, &[7; 200]).unwrap());
         assert_eq!(asm.received(), 1);
         assert_eq!(asm.written_end(), 200);
-        assert_eq!(asm.capacity_bytes(), 4 * (4096 + 1));
-        assert_eq!(
-            budget.snapshot().cell(BudgetKind::Reassembly).used_bytes,
-            4 * (4096 + 1)
-        );
+        assert_eq!(asm.capacity_bytes(), 4 * 4096);
+        // The memory cell carries the buddy segment's creation charge plus
+        // the four tracking metadata bytes.
+        let charged = budget.snapshot().memory.used_bytes;
+        assert_eq!(charged, pool.read().stats().buddy_data_bytes + 4);
         asm.abort();
-        assert_eq!(budget.snapshot().cell(BudgetKind::Reassembly).used_bytes, 0);
         assert_eq!(pool.read().stats().alloc_count, 0);
+        // The retained idle segment keeps its creation charge; only the
+        // metadata bytes were refunded with the assembly.
+        assert_eq!(
+            budget.snapshot().memory.used_bytes,
+            charged - 4,
+            "the tracking metadata must refund with the assembly"
+        );
         // The only 64 KiB buddy remains mapped. No extra segment, dedicated
         // allocation, or file fallback may hide an unreleased assembly block.
         let before = pool.read().stats();
@@ -559,22 +593,23 @@ mod tests {
         assert_eq!(after.file_spill_allocs, 0);
         guard.release_handle(handle);
         assert_eq!(guard.stats().alloc_count, 0);
-        assert_eq!(budget.snapshot().reassembly.used_bytes, 0);
+        assert_eq!(
+            budget.snapshot().memory.used_bytes,
+            charged - 4,
+            "buddy block reuse takes no new charge"
+        );
     }
 
     #[test]
     fn test_finish_incomplete_fails_and_returns_charge_once() {
-        let (pool, budget) = budgeted_pool_arc(64 * 1024);
+        let (pool, budget) = file_pool_arc(1 << 20, 64 * 1024);
         let mut asm = ChunkAssembler::new(pool.clone(), 3, 8, 8 * (1 << 30)).unwrap();
         asm.feed_chunk(0, b"data").unwrap();
-        assert_eq!(
-            budget.snapshot().cell(BudgetKind::Reassembly).used_bytes,
-            27
-        );
+        assert_eq!(charged_bytes(&budget), 24 + 3);
         let err = asm.finish().unwrap_err();
         assert!(err.contains("incomplete"));
         // The dropped incomplete assembler released storage and refunded.
-        assert_eq!(budget.snapshot().cell(BudgetKind::Reassembly).used_bytes, 0);
+        assert_eq!(charged_bytes(&budget), 0);
         // The pool remains usable for a fresh assembly.
         let fresh = ChunkAssembler::new(pool, 1, 4096, 8 * (1 << 30)).unwrap();
         fresh.abort();
@@ -591,17 +626,19 @@ mod tests {
 
     #[test]
     fn test_zero_chunk_size_rejected_before_charge_or_allocation() {
-        let (pool, budget) = budgeted_pool_arc(64 * 1024);
+        let (pool, budget) = file_pool_arc(1 << 20, 64 * 1024);
         let err = ChunkAssembler::new(pool.clone(), 1, 0, 8 * (1 << 30))
             .unwrap_err()
             .to_string();
         assert!(err.contains("chunk_size must be > 0"));
         // No charge taken and no mapping created.
         let snap = budget.snapshot();
-        assert_eq!(snap.reassembly.used_bytes, 0);
-        assert_eq!(snap.reassembly.rejected_allocations, 0);
+        assert_eq!(snap.memory.used_bytes, 0);
+        assert_eq!(snap.memory.rejected_allocations, 0);
+        assert_eq!(snap.file_spill.used_bytes, 0);
         assert_eq!(pool.read().stats().total_segments, 0);
         assert_eq!(pool.read().stats().dedicated_segments, 0);
+        assert_eq!(pool.read().stats().file_spill_allocs, 0);
     }
 
     #[test]
@@ -615,31 +652,36 @@ mod tests {
 
     #[test]
     fn budget_rejection_leaves_no_mapping_and_reports_cell_and_size() {
-        let (pool, budget) = budgeted_pool_arc(100);
+        let (pool, budget) = file_pool_arc(1 << 20, 100);
         let err = ChunkAssembler::new(pool.clone(), 2, 64, 8 * (1 << 30))
             .unwrap_err()
             .to_string();
         assert!(
-            err.contains("'reassembly'"),
+            err.contains("file spill budget"),
             "error must name the cell: {err}"
         );
-        assert!(err.contains("130"), "error must name the size: {err}");
+        assert!(err.contains("128"), "error must name the size: {err}");
         assert!(err.contains("100"), "error must name the limit: {err}");
 
         // The rejection happened before any mapping: no buddy or dedicated
-        // segments, and only rejection statistics moved.
+        // segments, no file, and only rejection statistics moved. The
+        // metadata charge was taken and refunded.
         let stats = pool.read().stats();
         assert_eq!(stats.total_segments, 0);
         assert_eq!(stats.dedicated_segments, 0);
+        assert_eq!(stats.file_spill_allocs, 0);
         let snap = budget.snapshot();
-        assert_eq!(snap.reassembly.used_bytes, 0);
-        assert_eq!(snap.reassembly.rejected_allocations, 1);
-        assert_eq!(snap.reassembly.rejected_bytes, 130);
+        assert_eq!(snap.memory.used_bytes, 0);
+        assert_eq!(snap.memory.peak_bytes, 2);
+        assert_eq!(snap.memory.rejected_allocations, 0);
+        assert_eq!(snap.file_spill.used_bytes, 0);
+        assert_eq!(snap.file_spill.rejected_allocations, 1);
+        assert_eq!(snap.file_spill.rejected_bytes, 128);
     }
 
     #[test]
     fn finished_backing_keeps_charge_and_pool_alive_after_creators_drop() {
-        let (pool, budget) = budgeted_pool_arc(64 * 1024);
+        let (pool, budget) = file_pool_arc(1 << 20, 64 * 1024);
         let registry_view = pool.clone();
         let mut asm = ChunkAssembler::new(pool, 2, 8, 8 * (1 << 30)).unwrap();
         asm.feed_chunk(0, b"firstttt").unwrap();
@@ -649,17 +691,14 @@ mod tests {
 
         // The registry-equivalent owner (the outer pool Arc handle) is gone;
         // the carrier keeps the pool alive, the content readable, and the
-        // full capacity charged.
+        // full capacity and metadata charged.
         drop(registry_view);
-        assert_eq!(
-            budget.snapshot().cell(BudgetKind::Reassembly).used_bytes,
-            18
-        );
+        assert_eq!(charged_bytes(&budget), 16 + 2);
         assert_eq!(backing.copy_bytes().unwrap(), b"firsttttsec");
         // Idempotent release refunds exactly once.
         backing.release();
         backing.release();
-        assert_eq!(budget.snapshot().cell(BudgetKind::Reassembly).used_bytes, 0);
+        assert_eq!(charged_bytes(&budget), 0);
         assert!(backing.is_released());
     }
 }

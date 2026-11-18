@@ -31,12 +31,6 @@ pub(crate) async fn close_listener(listener: c2_local::LocalListener) {
 
 #[cfg(test)]
 mod client_tests {
-    #[test]
-    fn test_ipc_config_defaults() {
-        let cfg = crate::ClientIpcConfig::default();
-        assert_eq!(cfg.shm_threshold, 4096);
-        assert_eq!(cfg.chunk_size, 131072);
-    }
     use c2_wire::buddy::BUDDY_PAYLOAD_SIZE;
     use c2_wire::flags;
     use c2_wire::frame;
@@ -47,8 +41,7 @@ mod client_tests {
     };
 
     use crate::client::{
-        ClientIpcConfig, IpcClient, RequestTransportKind, choose_request_transport,
-        request_chunk_count,
+        IpcClient, RequestTransportKind, choose_request_transport, request_chunk_count,
     };
 
     const ABI_HASH: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -219,57 +212,17 @@ mod client_tests {
 
     #[test]
     fn canonical_call_transport_selection_is_testable() {
-        // Verify ClientIpcConfig thresholds determine the transport path used by
-        // route-bound IPC calls. This must stay as a pure selector so relay
-        // behavior is not proven only by comments or a live UDS integration test.
-        let cfg = ClientIpcConfig {
-            shm_threshold: 100,
-            base: c2_config::BaseIpcConfig {
-                chunk_size: 500,
-                ..c2_config::BaseIpcConfig::default()
-            },
-            ..ClientIpcConfig::default()
-        };
-
-        // `shm_available` means pool present AND a negotiated CAP_SHM_REQUEST
-        // direction; without negotiation the selector never picks SHM even
-        // for bodies the pool could carry.
-        assert_eq!(
-            choose_request_transport(&cfg, false, 50),
-            RequestTransportKind::Inline
-        );
-        assert_eq!(
-            choose_request_transport(&cfg, true, 50),
-            RequestTransportKind::Inline
-        );
-
-        assert_eq!(
-            choose_request_transport(&cfg, true, 200),
-            RequestTransportKind::Buddy
-        );
-        assert_eq!(
-            choose_request_transport(&cfg, false, 200),
-            RequestTransportKind::Inline
-        );
-
-        assert_eq!(
-            choose_request_transport(&cfg, true, 600),
-            RequestTransportKind::Buddy
-        );
-        assert_eq!(
-            choose_request_transport(&cfg, false, 600),
-            RequestTransportKind::Chunked
-        );
-        assert_eq!(
-            choose_request_transport(&cfg, true, u32::MAX as usize + 1),
-            RequestTransportKind::Chunked,
-            "buddy request metadata cannot represent payload lengths above u32::MAX"
-        );
-
-        // Verify chunk count calculation.
-        let chunk_size = cfg.chunk_size as usize;
-        let total_chunks = request_chunk_count(600, chunk_size).unwrap();
-        assert_eq!(total_chunks, 2); // 600 / 500 = 1.2 -> 2 chunks
+        use c2_config::{CHUNK_SIZE, SHM_THRESHOLD};
+        for (shm, len, expected) in [
+            (true, SHM_THRESHOLD, RequestTransportKind::Inline),
+            (true, SHM_THRESHOLD + 1, RequestTransportKind::Buddy),
+            (false, CHUNK_SIZE, RequestTransportKind::Inline),
+            (false, CHUNK_SIZE + 1, RequestTransportKind::Chunked),
+        ] {
+            assert_eq!(choose_request_transport(shm, len as usize), expected);
+        }
+        let chunk_size = CHUNK_SIZE as usize;
+        assert_eq!(request_chunk_count(chunk_size + 1, chunk_size).unwrap(), 2);
         assert_eq!(
             request_chunk_count(usize::from(u16::MAX) * chunk_size + 1, chunk_size).unwrap(),
             usize::from(u16::MAX) + 1
@@ -277,33 +230,17 @@ mod client_tests {
     }
 
     #[test]
-    fn with_config_owns_request_pool_when_pool_enabled() {
-        let cfg = ClientIpcConfig {
-            shm_threshold: 100,
-            base: c2_config::BaseIpcConfig {
-                pool_enabled: true,
-                pool_segment_size: 65_536,
-                max_pool_segments: 2,
-                ..c2_config::BaseIpcConfig::default()
-            },
-            ..ClientIpcConfig::default()
-        };
-        let client = IpcClient::with_config("ipc://configured", cfg.clone()).unwrap();
-        assert!(client.has_request_pool());
-        assert_eq!(client.config.shm_threshold, cfg.shm_threshold);
-
-        // A disabled buddy pool is still a real pool: it keeps dedicated SHM
-        // requests and the wire prefix alive, only the buddy tiers are off.
-        let mut disabled = cfg;
-        disabled.base.pool_enabled = false;
-        let client = IpcClient::with_config("ipc://configured-no-pool", disabled).unwrap();
-        let pool = client
-            .request_pool()
-            .expect("policy-disabled pool stays live");
-        let pool = pool.read();
-        assert!(!pool.config().buddy_enabled);
-        assert_eq!(pool.segment_count(), 0);
-        assert_eq!(pool.segment_count(), 0);
+    fn request_pool_geometry_is_derived_from_the_domain() {
+        let client = IpcClient::new("ipc://configured").unwrap();
+        assert!(client.request_pool().unwrap().read().config().pool_enabled);
+        let client = IpcClient::with_budget(
+            "ipc://configured-small",
+            crate::tests::memory_budget(64 * 1024),
+        )
+        .unwrap();
+        let pool = client.request_pool().unwrap();
+        assert!(!pool.read().config().pool_enabled);
+        assert_eq!(pool.read().segment_count(), 0);
     }
 
     // ── SyncClient tests ──────────────────────────────────────────────
@@ -319,7 +256,7 @@ mod client_tests {
 
 #[cfg(test)]
 mod endpoint_context_tests {
-    use crate::{ClientIpcConfig, ClientPool, IpcClient};
+    use crate::{ClientPool, IpcClient};
     use c2_config::{LocalEndpointContext, LocalEndpointNamespace};
     use c2_server::{Server, ServerIpcConfig};
     use std::time::Duration;
@@ -328,12 +265,9 @@ mod endpoint_context_tests {
     fn platform_default_and_explicit_constructors_keep_the_same_snapshot() {
         let context = LocalEndpointContext::default_for_platform().unwrap();
         let endpoint = context.endpoint("ipc://context_api").unwrap();
-        let client =
-            IpcClient::with_config(endpoint.address(), ClientIpcConfig::default()).unwrap();
-        let configured =
-            IpcClient::with_config(endpoint.address(), ClientIpcConfig::default()).unwrap();
-        let explicit =
-            IpcClient::with_endpoint(endpoint.clone(), ClientIpcConfig::default()).unwrap();
+        let client = IpcClient::new(endpoint.address()).unwrap();
+        let configured = IpcClient::new(endpoint.address()).unwrap();
+        let explicit = IpcClient::with_endpoint(endpoint.clone()).unwrap();
         assert_eq!(client.local_endpoint().unwrap(), &endpoint);
         assert_eq!(configured.local_endpoint().unwrap(), &endpoint);
         assert_eq!(explicit.local_endpoint().unwrap(), &endpoint);
@@ -350,8 +284,8 @@ mod endpoint_context_tests {
         assert_eq!(default_server.local_endpoint(), &endpoint);
         assert_eq!(identified.local_endpoint(), &endpoint);
         assert_eq!(identified.identity(), server.identity());
-        let pool = ClientPool::with_endpoint_context(Duration::ZERO, context.clone());
-        let default_pool = ClientPool::new(Duration::ZERO);
+        let pool = ClientPool::with_endpoint_context(context.clone());
+        let default_pool = ClientPool::new();
         assert_eq!(pool.endpoint_context().unwrap(), &context);
         assert_eq!(default_pool.endpoint_context().unwrap(), &context);
         #[cfg(windows)]
@@ -377,10 +311,7 @@ mod endpoint_context_tests {
         let b = LocalEndpointContext::with_unix_root(std::path::Path::new("/tmp/ctxb")).unwrap();
         let endpoint = a.endpoint("ipc://same").unwrap();
         assert_ne!(endpoint, b.endpoint(endpoint.address()).unwrap());
-        let config = ClientIpcConfig::default();
-        let budget = c2_mem::MemoryBudget::from_limits(&config.memory_budget_limits());
-        let mut client =
-            IpcClient::with_endpoint_and_shared_budget(endpoint.clone(), config, budget).unwrap();
+        let mut client = IpcClient::with_endpoint(endpoint.clone()).unwrap();
         tokio::runtime::Runtime::new()
             .unwrap()
             .block_on(client.close());
@@ -388,7 +319,7 @@ mod endpoint_context_tests {
         let server =
             Server::new_with_endpoint(endpoint.clone(), ServerIpcConfig::default()).unwrap();
         assert_eq!(server.local_endpoint(), &endpoint);
-        let pool = ClientPool::with_endpoint_context(Duration::ZERO, a.clone());
+        let pool = ClientPool::with_endpoint_context(a.clone());
         for _ in 0..2 {
             let report = pool.close_all(Duration::from_secs(1));
             assert!(report.error.is_none(), "{report:?}");
@@ -396,7 +327,7 @@ mod endpoint_context_tests {
             assert_eq!(pool.endpoint_context().unwrap(), &a);
         }
         assert!(matches!(
-            pool.acquire("http://invalid", None),
+            pool.acquire("http://invalid"),
             Err(crate::IpcError::Config(_))
         ));
         assert_eq!(
@@ -546,11 +477,11 @@ mod endpoint_context_transport_tests {
             server_b.wait_until_ready(WAIT).await.unwrap();
             runs
         });
-        let direct_a = ClientPool::with_endpoint_context(WAIT, endpoint_a.context().clone())
-            .acquire(endpoint_a.address(), None)
+        let direct_a = ClientPool::with_endpoint_context(endpoint_a.context().clone())
+            .acquire(endpoint_a.address())
             .unwrap();
-        let direct_b = ClientPool::with_endpoint_context(WAIT, endpoint_b.context().clone())
-            .acquire(endpoint_b.address(), None)
+        let direct_b = ClientPool::with_endpoint_context(endpoint_b.context().clone())
+            .acquire(endpoint_b.address())
             .unwrap();
         assert_eq!(direct_a.server_identity(), Some(server_a.identity()));
         assert_eq!(direct_b.server_identity(), Some(server_b.identity()));
@@ -559,11 +490,11 @@ mod endpoint_context_transport_tests {
         assert!(ping_with_context(ADDRESS, &a, WAIT).unwrap());
         assert!(ping_with_endpoint(&endpoint_b, WAIT).unwrap());
 
-        let pool_a = ClientPool::with_endpoint_context(Duration::from_secs(30), a.clone());
-        let pool_b = ClientPool::with_endpoint_context(Duration::from_secs(30), b.clone());
-        let cached_a = pool_a.acquire(ADDRESS, None).unwrap();
-        let cached_b = pool_b.acquire(ADDRESS, None).unwrap();
-        let hit_a = pool_a.acquire(ADDRESS, None).unwrap();
+        let pool_a = ClientPool::with_endpoint_context(a.clone());
+        let pool_b = ClientPool::with_endpoint_context(b.clone());
+        let cached_a = pool_a.acquire(ADDRESS).unwrap();
+        let cached_b = pool_b.acquire(ADDRESS).unwrap();
+        let hit_a = pool_a.acquire(ADDRESS).unwrap();
         assert!(Arc::ptr_eq(&cached_a, &hit_a));
         assert_eq!(pool_a.refcount(ADDRESS), 2);
         assert_eq!(pool_b.refcount(ADDRESS), 1);
@@ -580,7 +511,7 @@ mod endpoint_context_transport_tests {
         check_tag(&cached_b, b'B');
         assert_eq!(pool_b.refcount(ADDRESS), 1);
         assert_eq!(pool_a.endpoint_context().unwrap(), &a);
-        let reopened_a = pool_a.acquire(ADDRESS, None).unwrap();
+        let reopened_a = pool_a.acquire(ADDRESS).unwrap();
         assert!(!Arc::ptr_eq(&cached_a, &reopened_a));
         assert_eq!(reopened_a.local_endpoint(), &endpoint_a);
         assert_eq!(reopened_a.server_identity(), Some(server_a.identity()));
@@ -613,10 +544,9 @@ mod endpoint_context_transport_tests {
             server_a.wait_until_ready(WAIT).await.unwrap();
             runner
         });
-        let restarted_client =
-            ClientPool::with_endpoint_context(WAIT, endpoint_a.context().clone())
-                .acquire(endpoint_a.address(), None)
-                .unwrap();
+        let restarted_client = ClientPool::with_endpoint_context(endpoint_a.context().clone())
+            .acquire(endpoint_a.address())
+            .unwrap();
         assert_eq!(
             restarted_client.server_identity(),
             Some(server_a.identity())
@@ -643,4 +573,22 @@ mod endpoint_context_transport_tests {
         });
         assert_eq!(server_b.local_endpoint(), &endpoint_b);
     }
+}
+
+pub(crate) fn memory_budget(memory_budget_bytes: u64) -> c2_mem::DomainBudget {
+    c2_mem::DomainBudget::from_limits(&c2_config::DomainLimits {
+        memory_budget_bytes,
+        max_outstanding_calls: c2_config::default_max_outstanding_calls(memory_budget_bytes),
+        ..Default::default()
+    })
+}
+
+pub(crate) fn download_slice(budget: &c2_mem::DomainBudget, bytes: u64) -> c2_mem::WindowSlice {
+    let window = budget
+        .try_reserve_memory(bytes)
+        .unwrap()
+        .into_reusable_window();
+    futures_util::FutureExt::now_or_never(window.reserve(bytes))
+        .unwrap()
+        .unwrap()
 }

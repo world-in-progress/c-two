@@ -9,9 +9,7 @@ use std::sync::{Arc, OnceLock};
 use c2_mem::MemPool;
 
 use crate::client::stream::{IpcResponseStream, IpcStreamCancellation};
-use crate::client::{
-    ClientIpcConfig, IpcCallControl, IpcClient, IpcError, MethodTable, RouteBinding,
-};
+use crate::client::{IpcCallControl, IpcClient, IpcError, MethodTable, RouteBinding};
 use crate::response::ResponseData;
 
 /// Whether an IPC call failure is proven to precede CRM dispatch.
@@ -189,20 +187,19 @@ const _: () = {
 impl SyncClient {
     /// Connect with a transport-internal pool (pooled-client acquire path).
     ///
-    /// The pool was built from `config` by the caller inside this crate and is
-    /// owned solely by the resulting client. `budget` is the owning cache's shared domain
-    /// context: the pool already charges it and the client's reassembly pool
-    /// charges the same context.
+    /// The pool was built by the caller inside this crate from the shared
+    /// domain budget and is owned solely by the resulting client. `budget` is
+    /// the owning cache's frozen domain: the pool already charges it and the
+    /// client's reassembly pool charges the same context.
     pub(crate) fn connect_transport_pool_attempt_with_deadline(
         endpoint: c2_config::LocalEndpoint,
         pool: Arc<RwLock<MemPool>>,
-        config: ClientIpcConfig,
-        budget: c2_mem::MemoryBudget,
+        budget: c2_mem::DomainBudget,
         deadline: c2_config::ConnectDeadline,
         event_source: Option<&c2_local::ConnectionEventSource>,
     ) -> Result<(Self, Result<(), IpcError>), IpcError> {
         let rt = get_or_create_runtime();
-        let mut client = IpcClient::with_transport_pool(endpoint, pool, config, budget)?;
+        let mut client = IpcClient::with_transport_pool(endpoint, pool, budget)?;
         if let Some(source) = event_source {
             client = client.with_connection_event_source(source.clone());
         }
@@ -305,7 +302,7 @@ impl SyncClient {
         binding: &RouteBinding,
         method_name: &str,
         data: B,
-        budget: c2_mem::retention::PayloadBufferBudget,
+        budget: c2_mem::DomainBudget,
         completion_owner: Box<dyn Send>,
         cancellation: IpcStreamCancellation,
         control: &IpcCallControl,
@@ -326,11 +323,9 @@ impl SyncClient {
             .await
     }
 
-    /// The complete resolved client configuration this connection was created
-    /// from. Used by the owning cache to reject a same-address hit whose
-    /// requested policy differs from the cached connection's policy.
-    pub(crate) fn config(&self) -> &ClientIpcConfig {
-        self.inner.config()
+    /// The frozen role-domain budget this connection's pools charge.
+    pub fn domain_budget(&self) -> &c2_mem::DomainBudget {
+        self.inner.domain_budget()
     }
 
     /// Synchronous close.
@@ -436,7 +431,7 @@ impl SyncClient {
     /// `is_connected()` returns `false` and route-bound calls will fail.
     pub(crate) fn new_unconnected(address: &str) -> Self {
         let rt = get_or_create_runtime();
-        let inner = IpcClient::with_config(address, ClientIpcConfig::default()).unwrap();
+        let inner = IpcClient::new(address).unwrap();
         Self {
             inner,
             rt: rt.handle().clone(),
@@ -547,10 +542,14 @@ pub(crate) mod tests {
 
     #[test]
     fn response_admission_is_dispatch_uncertain_and_not_retry_safe() {
-        let budget = c2_mem::MemoryBudget::new(0, 0, 0);
+        let budget = c2_mem::DomainBudget::from_limits(&c2_config::DomainLimits {
+            memory_budget_bytes: 0,
+            file_spill_budget_bytes: 0,
+            max_outstanding_calls: 0,
+        });
         let pool = Arc::new(parking_lot::RwLock::new(
             MemPool::new_with_prefix_and_budget(
-                c2_mem::PoolConfig::default(),
+                c2_config::PoolConfig::default(),
                 "phase-pure".to_string(),
                 budget,
             )
@@ -558,7 +557,9 @@ pub(crate) mod tests {
         ));
         let registry =
             c2_wire::chunk::ChunkRegistry::new(pool, c2_wire::chunk::ChunkConfig::default());
-        let failure = registry.insert_reply(1, 1, 128, 2, 64).unwrap_err();
+        let failure = registry
+            .insert_reply(1, 1, 128, 2, 64, c2_config::DEFAULT_MAX_PAYLOAD_SIZE)
+            .unwrap_err();
         let error = IpcError::Chunk(failure.into());
         let phase = call_error_phase(&error);
         assert_eq!(phase, TransportPhase::DispatchUncertain);

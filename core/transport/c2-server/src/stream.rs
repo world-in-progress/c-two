@@ -70,7 +70,10 @@ pub(super) fn pause_next_encoding(
     ENCODING_PAUSE.with(|pause| *pause.borrow_mut() = Some((ready, resume)));
 }
 
-async fn await_encoding<T, F>(work: F) -> Result<T, ItemSendError>
+async fn await_encoding<T, F>(
+    encoding_permits: &Arc<Semaphore>,
+    work: F,
+) -> Result<T, ItemSendError>
 where
     T: Send + 'static,
     F: FnOnce() -> T + Send + 'static,
@@ -82,7 +85,18 @@ where
             .recv()
             .expect("encoding controller resumes submission");
     }
-    let task = tokio::task::spawn_blocking(work);
+    // E-gate: acquire one encoding slot before submitting blocking work and
+    // hold the permit until the closure ends, so at most E encodings occupy
+    // blocking threads while copies and listener work keep progressing.
+    let permit = encoding_permits
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|_| ItemSendError::ExecutorStopped)?;
+    let task = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        work()
+    });
     #[cfg(test)]
     ENCODING_QUEUED.with(|observer| {
         if let Some(queued) = observer.borrow_mut().take() {
@@ -194,16 +208,16 @@ async fn acquire_step(
 
 fn crm_error_bytes(error: CrmError) -> Vec<u8> {
     match error {
-        CrmError::UserError(bytes) => {
-            if matches!(C2Error::from_wire_bytes(&bytes), Ok(Some(_))) {
-                bytes
-            } else {
-                error_wire(
-                    ErrorCode::ResourceFunctionExecuting,
-                    "invalid CRM error payload",
-                )
-            }
-        }
+        CrmError::UserError(bytes) => match C2Error::from_wire_bytes(&bytes) {
+            // Re-encode through the bounded path: a resource error envelope
+            // larger than the frame budget is truncated instead of producing
+            // an unbounded inline CALL_END.
+            Ok(Some(error)) => rpc::bounded_call_end_error_bytes(&error),
+            _ => error_wire(
+                ErrorCode::ResourceFunctionExecuting,
+                "invalid CRM error payload",
+            ),
+        },
         CrmError::InternalError(message) => {
             error_wire(ErrorCode::ResourceFunctionExecuting, message)
         }
@@ -239,9 +253,9 @@ async fn write_terminal(
     complete_items: u64,
     error: &[u8],
 ) {
-    if claim_terminal(writer, id, status).is_none() {
+    let Some(_claim) = claim_terminal(writer, id, status) else {
         return;
-    }
+    };
     let value = if status == CallStatus::Success {
         &[][..]
     } else {
@@ -348,19 +362,19 @@ async fn send_item(
     wait_storage(conn, id).await?;
     let use_shm = conn.shm_response_capable() && !conn.is_deactivated();
     let pool = server.response_pool.clone();
-    let threshold = server.config.shm_threshold;
     let (item, prepared) = if use_shm {
-        await_encoding(move || {
+        await_encoding(&server.encoding_permits, move || {
             let mut fill_error = None;
-            let prepared = try_prepare_shm_response(&pool, threshold, item.len(), |dst| {
-                item.write_range(0, dst).map_err(|error| {
-                    fill_error = Some(error);
-                    "stream item encoding failed".to_string()
+            let prepared =
+                try_prepare_shm_response(&pool, c2_config::SHM_THRESHOLD, item.len(), |dst| {
+                    item.write_range(0, dst).map_err(|error| {
+                        fill_error = Some(error);
+                        "stream item encoding failed".to_string()
+                    })
                 })
-            })
-            .map_err(|error| {
-                ItemSendError::Crm(fill_error.unwrap_or(CrmError::InternalError(error)))
-            });
+                .map_err(|error| {
+                    ItemSendError::Crm(fill_error.unwrap_or(CrmError::InternalError(error)))
+                });
             (item, prepared)
         })
         .await?
@@ -394,8 +408,8 @@ async fn send_item(
     // its receiving side already holds the complete-value reservation.
     let mut item = item;
     let frame_limit =
-        usize::try_from(server.config.max_frame_size.saturating_sub(13)).unwrap_or(usize::MAX);
-    let chunk_size = (server.config.chunk_size as usize).min(frame_limit).max(1);
+        usize::try_from(c2_config::MAX_RPC_FRAME_BYTES.saturating_sub(13)).unwrap_or(usize::MAX);
+    let chunk_size = (c2_config::CHUNK_SIZE as usize).min(frame_limit).max(1);
     let mut offset = 0;
     while offset < item.len() {
         let available = wait_storage(conn, id).await?;
@@ -403,7 +417,7 @@ async fn send_item(
             .unwrap_or(usize::MAX)
             .min(chunk_size)
             .min(item.len() - offset);
-        let (returned, bytes) = await_encoding(move || {
+        let (returned, bytes) = await_encoding(&server.encoding_permits, move || {
             let mut bytes = Vec::new();
             bytes
                 .try_reserve_exact(width)
@@ -468,17 +482,16 @@ pub(super) async fn dispatch_stream_call(
     conn: &Connection,
     writer: &Arc<ConnectionWriter>,
     id: u64,
-    request: RequestData,
+    request: OwnedRequestInput,
     admission: ChunkRouteAdmission,
 ) {
     let ChunkRouteAdmission {
         route,
         method_idx,
         mut pending_permit,
-        _pending_permit,
         _flight,
     } = admission;
-    let _call_owners = (_pending_permit, _flight);
+    let _call_owners = _flight;
     let slot = pending_permit.retain_call_slot();
     if conn.is_work_cancelled() {
         return;
@@ -521,7 +534,7 @@ pub(super) async fn dispatch_stream_call(
         let mut route_guard = route_guard;
         let _execution_guard = execution_guard;
         route_guard.commit().map_err(FirstError::Acquire)?;
-        let bytes = request.into_owned_bytes().map_err(FirstError::Input)?;
+        let (bytes, _memory) = request.into_owned_bytes().map_err(FirstError::Input)?;
         let _start = record.data.start_gate.lock();
         if execution_conn.is_work_cancelled()
             || core.stream_state(id).is_none_or(|state| state.cancelled)

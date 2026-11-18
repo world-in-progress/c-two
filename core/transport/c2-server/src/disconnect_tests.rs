@@ -1,5 +1,6 @@
 use super::*;
 use crate::test_support::isolated_pair;
+use c2_config::PoolConfig;
 use std::future::Future;
 use std::io;
 use std::pin::Pin;

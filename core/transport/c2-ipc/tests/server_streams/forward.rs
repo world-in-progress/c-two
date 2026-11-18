@@ -1,6 +1,7 @@
 use super::*;
 use c2_ipc::ForwardRecord;
 use c2_wire::rpc::CancelCause;
+#[cfg(feature = "test-support")]
 use futures_util::FutureExt;
 use futures_util::StreamExt;
 use futures_util::stream;
@@ -66,7 +67,6 @@ impl CrmStreamItem for FailingWriteItem {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn item_write_range_failure_preserves_failed_call_end() {
     let fixture = Harness::start_with_config(ServerIpcConfig {
-        shm_threshold: 1024,
         ..ServerIpcConfig::default()
     })
     .await;
@@ -99,7 +99,7 @@ async fn item_write_range_failure_preserves_failed_call_end() {
     let mut expected = expected_contract();
     expected.route_name = "failing-write".into();
     let binding = fixture.client.acquire_route(&expected).await.unwrap();
-    let budget = PayloadBufferBudget::new(9);
+    let budget = memory_budget(9);
     let mut response = fixture
         .client
         .forward_stream_bound_sized_phased(
@@ -107,7 +107,7 @@ async fn item_write_range_failure_preserves_failed_call_end() {
             "echo",
             1,
             stream::iter([Ok::<_, std::io::Error>(vec![2])]),
-            budget.try_reserve(1).unwrap(),
+            budget.try_reserve_memory(1).unwrap(),
         )
         .await
         .unwrap();
@@ -118,7 +118,7 @@ async fn item_write_range_failure_preserves_failed_call_end() {
             .unwrap(),
         ForwardRecord::ItemBegin { total_bytes: 8 }
     ));
-    let first = tokio::time::timeout(WAIT, response.read_chunk(budget.try_reserve(8).unwrap(), 8))
+    let first = tokio::time::timeout(WAIT, response.read_chunk(download_slice(&budget, 8), 8))
         .await
         .unwrap()
         .unwrap()
@@ -133,7 +133,7 @@ async fn item_write_range_failure_preserves_failed_call_end() {
         ForwardRecord::ItemBegin { total_bytes: 8 }
     ));
     let failed_item =
-        tokio::time::timeout(WAIT, response.read_chunk(budget.try_reserve(8).unwrap(), 8))
+        tokio::time::timeout(WAIT, response.read_chunk(download_slice(&budget, 8), 8))
             .await
             .unwrap();
     assert!(failed_item.is_ok(), "CALL_END is the failed item's outcome");
@@ -159,7 +159,7 @@ async fn item_write_range_failure_preserves_failed_call_end() {
         completed.error.unwrap().code,
         ErrorCode::ResourceFunctionExecuting
     );
-    assert_eq!(budget.snapshot().used_bytes, 0);
+    assert_eq!(budget.snapshot().memory.used_bytes, 0);
     fixture.unary().await;
     fixture.stop().await;
 }
@@ -169,19 +169,24 @@ async fn whole_shm_item_larger_than_copy_window_releases_after_last_chunk() {
     // Block 9b3 requirement 5: one original SHM loan spans all eight copy
     // windows; returned local copies keep their charge until their last owner.
     let fixture = Harness::start_with_config(ServerIpcConfig {
-        shm_threshold: 8,
         ..ServerIpcConfig::default()
     })
     .await;
-    let budget = PayloadBufferBudget::new(9);
-    let send = budget.try_reserve(1).unwrap();
+    const WIDTH: u64 = 4096;
+    const ITEM_SIZE: usize = 32 * 1024;
+    let budget = memory_budget(WIDTH + 1);
+    let window = budget
+        .try_reserve_memory(WIDTH)
+        .unwrap()
+        .into_reusable_window();
+    let send = budget.try_reserve_memory(1).unwrap();
     let mut response = fixture
         .client
         .forward_stream_bound_sized_phased(
             &fixture.binding,
             "echo",
-            3,
-            stream::iter([Ok::<_, std::io::Error>(vec![1, 0, 64])]),
+            4,
+            stream::iter([Ok::<_, std::io::Error>(vec![1, 0, 0, 128])]),
             send,
         )
         .await
@@ -192,19 +197,21 @@ async fn whole_shm_item_larger_than_copy_window_releases_after_last_chunk() {
         .unwrap();
     assert!(matches!(
         first,
-        ForwardRecord::ItemBegin { total_bytes: 64 }
+        ForwardRecord::ItemBegin { total_bytes: 32768 }
     ));
     fixture.unary().await; // Shared connection remains readable while B is held by the caller.
     let pool = fixture.server.response_pool_arc();
     assert_eq!(pool.read().stats().alloc_count, 0);
     let mut output = Vec::new();
     for index in 0..8 {
-        let chunk =
-            tokio::time::timeout(WAIT, response.read_chunk(budget.try_reserve(8).unwrap(), 8))
-                .await
-                .unwrap()
-                .unwrap()
-                .unwrap();
+        let chunk = tokio::time::timeout(
+            WAIT,
+            response.read_chunk(window.reserve(WIDTH).await.unwrap(), WIDTH as usize),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
         output.extend_from_slice(chunk.as_ref());
         // This inline unary is a wire barrier for RELEASE on this same
         // connection, and does not itself allocate response SHM.
@@ -217,12 +224,13 @@ async fn whole_shm_item_larger_than_copy_window_releases_after_last_chunk() {
         let chunk = Arc::new(chunk);
         let last_reader = chunk.clone();
         drop(chunk);
-        assert_eq!(budget.snapshot().used_bytes, 8);
-        assert_eq!(last_reader.as_ref().as_ref(), &[0; 8]);
+        assert_eq!(budget.snapshot().memory.used_bytes, WIDTH);
+        assert_eq!(last_reader.as_ref().as_ref(), &vec![0; WIDTH as usize]);
         drop(last_reader);
-        assert_eq!(budget.snapshot().used_bytes, 0);
+        assert_eq!(budget.snapshot().memory.used_bytes, WIDTH);
     }
-    assert_eq!(output, vec![0; 64]);
+    assert_eq!(output, vec![0; ITEM_SIZE]);
+    drop(window);
     let end = tokio::time::timeout(WAIT, response.next_record())
         .await
         .unwrap()
@@ -236,7 +244,7 @@ async fn whole_shm_item_larger_than_copy_window_releases_after_last_chunk() {
         })
     ));
     assert_eq!(response.completion().await.unwrap().complete_items, 1);
-    assert_eq!(budget.snapshot().used_bytes, 0);
+    assert_eq!(budget.snapshot().memory.used_bytes, 0);
     fixture.stop().await;
 }
 
@@ -245,19 +253,18 @@ async fn consumer_cancel_mid_item_keeps_shared_unary_alive() {
     // Block 9b3 requirement 5: cancelling an unread suffix settles the one
     // original loan, while the already copied prefix belongs to its real owner.
     let fixture = Harness::start_with_config(ServerIpcConfig {
-        shm_threshold: 8,
         ..ServerIpcConfig::default()
     })
     .await;
-    let budget = PayloadBufferBudget::new(9);
+    let budget = memory_budget(9);
     let mut response = fixture
         .client
         .forward_stream_bound_sized_phased(
             &fixture.binding,
             "echo",
-            3,
-            stream::iter([Ok::<_, std::io::Error>(vec![2, 0, 64])]),
-            budget.try_reserve(1).unwrap(),
+            4,
+            stream::iter([Ok::<_, std::io::Error>(vec![2, 0, 0, 128])]),
+            budget.try_reserve_memory(1).unwrap(),
         )
         .await
         .unwrap();
@@ -266,9 +273,9 @@ async fn consumer_cancel_mid_item_keeps_shared_unary_alive() {
             .await
             .unwrap()
             .unwrap(),
-        ForwardRecord::ItemBegin { total_bytes: 64 }
+        ForwardRecord::ItemBegin { total_bytes: 32768 }
     ));
-    let part = tokio::time::timeout(WAIT, response.read_chunk(budget.try_reserve(8).unwrap(), 8))
+    let part = tokio::time::timeout(WAIT, response.read_chunk(download_slice(&budget, 8), 8))
         .await
         .unwrap()
         .unwrap()
@@ -292,20 +299,19 @@ async fn consumer_cancel_mid_item_keeps_shared_unary_alive() {
     assert_eq!(pool.read().stats().alloc_count, 0);
     assert_eq!(last_reader.as_ref().as_ref(), &[0; 8]);
     drop(part);
-    assert_eq!(budget.snapshot().used_bytes, 8);
+    assert_eq!(budget.snapshot().memory.used_bytes, 8);
     drop(last_reader);
-    assert_eq!(budget.snapshot().used_bytes, 0);
+    assert_eq!(budget.snapshot().memory.used_bytes, 0);
     fixture.stop().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn unary_cursor_reads_a_carrier_in_charged_ranges() {
     let fixture = Harness::start_with_config(ServerIpcConfig {
-        shm_threshold: 1,
         ..ServerIpcConfig::default()
     })
     .await;
-    let budget = PayloadBufferBudget::new(4);
+    let budget = memory_budget(4);
     let response = fixture
         .client
         .forward_unary_bound_sized_phased(
@@ -313,37 +319,36 @@ async fn unary_cursor_reads_a_carrier_in_charged_ranges() {
             "ping",
             1,
             stream::iter([Ok::<_, std::io::Error>(vec![7])]),
-            budget.try_reserve(1).unwrap(),
+            budget.try_reserve_memory(1).unwrap(),
         )
         .await
         .unwrap();
     let mut cursor = response.into_cursor();
     assert_eq!(cursor.len(), 4);
     let first = cursor
-        .read_chunk(budget.try_reserve(2).unwrap(), 2)
+        .read_chunk(download_slice(&budget, 2), 2)
         .unwrap()
         .unwrap();
     assert_eq!(first.as_ref(), b"po");
     drop(first);
     let second = cursor
-        .read_chunk(budget.try_reserve(2).unwrap(), 2)
+        .read_chunk(download_slice(&budget, 2), 2)
         .unwrap()
         .unwrap();
     assert_eq!(second.as_ref(), b"ng");
     drop(second);
     assert_eq!(cursor.remaining(), 0);
-    assert_eq!(budget.snapshot().used_bytes, 0);
+    assert_eq!(budget.snapshot().memory.used_bytes, 0);
     fixture.stop().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn inline_item_consumes_each_real_credit_window() {
     let fixture = Harness::start_with_config(ServerIpcConfig {
-        shm_threshold: 1024,
         ..ServerIpcConfig::default()
     })
     .await;
-    let budget = PayloadBufferBudget::new(9);
+    let budget = memory_budget(9);
     let mut response = fixture
         .client
         .forward_stream_bound_sized_phased(
@@ -351,7 +356,7 @@ async fn inline_item_consumes_each_real_credit_window() {
             "echo",
             3,
             stream::iter([Ok::<_, std::io::Error>(vec![1, 0, 32])]),
-            budget.try_reserve(1).unwrap(),
+            budget.try_reserve_memory(1).unwrap(),
         )
         .await
         .unwrap();
@@ -364,12 +369,11 @@ async fn inline_item_consumes_each_real_credit_window() {
     ));
     let mut output = Vec::new();
     for _ in 0..4 {
-        let chunk =
-            tokio::time::timeout(WAIT, response.read_chunk(budget.try_reserve(8).unwrap(), 8))
-                .await
-                .unwrap()
-                .unwrap()
-                .unwrap();
+        let chunk = tokio::time::timeout(WAIT, response.read_chunk(download_slice(&budget, 8), 8))
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
         output.extend_from_slice(chunk.as_ref());
         drop(chunk);
     }
@@ -391,11 +395,10 @@ async fn inline_item_consumes_each_real_credit_window() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn lifecycle_cancel_keeps_current_item_storage_and_cleanup_count() {
     let fixture = Harness::start_with_config(ServerIpcConfig {
-        shm_threshold: 1,
         ..ServerIpcConfig::default()
     })
     .await;
-    let budget = PayloadBufferBudget::new(9);
+    let budget = memory_budget(9);
     let mut response = fixture
         .client
         .forward_stream_bound_sized_phased(
@@ -403,7 +406,7 @@ async fn lifecycle_cancel_keeps_current_item_storage_and_cleanup_count() {
             "echo",
             3,
             stream::iter([Ok::<_, std::io::Error>(vec![2, 0, 32])]),
-            budget.try_reserve(1).unwrap(),
+            budget.try_reserve_memory(1).unwrap(),
         )
         .await
         .unwrap();
@@ -420,12 +423,11 @@ async fn lifecycle_cancel_keeps_current_item_storage_and_cleanup_count() {
         .unwrap();
     let mut output = Vec::new();
     for _ in 0..4 {
-        let chunk =
-            tokio::time::timeout(WAIT, response.read_chunk(budget.try_reserve(8).unwrap(), 8))
-                .await
-                .unwrap()
-                .unwrap()
-                .unwrap();
+        let chunk = tokio::time::timeout(WAIT, response.read_chunk(download_slice(&budget, 8), 8))
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
         output.extend_from_slice(chunk.as_ref());
         drop(chunk);
     }
@@ -446,7 +448,7 @@ async fn lifecycle_cancel_keeps_current_item_storage_and_cleanup_count() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn partial_upload_failure_cancels_only_its_stream() {
     let fixture = Harness::start(2).await;
-    let budget = PayloadBufferBudget::new(1);
+    let budget = memory_budget(1);
     let mut response = fixture
         .client
         .forward_stream_bound_sized_phased(
@@ -457,7 +459,7 @@ async fn partial_upload_failure_cancels_only_its_stream() {
                 Ok(vec![1]),
                 Err(std::io::Error::other("source broke after OPEN")),
             ]),
-            budget.try_reserve(1).unwrap(),
+            budget.try_reserve_memory(1).unwrap(),
         )
         .await
         .unwrap();
@@ -476,11 +478,10 @@ async fn partial_upload_failure_cancels_only_its_stream() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn consumer_escalates_lifecycle_cancel_without_blocking_other_calls() {
     let fixture = Harness::start_with_config(ServerIpcConfig {
-        shm_threshold: 1024,
         ..ServerIpcConfig::default()
     })
     .await;
-    let budget = PayloadBufferBudget::new(9);
+    let budget = memory_budget(9);
     let mut response = fixture
         .client
         .forward_stream_bound_sized_phased(
@@ -488,7 +489,7 @@ async fn consumer_escalates_lifecycle_cancel_without_blocking_other_calls() {
             "echo",
             3,
             stream::iter([Ok::<_, std::io::Error>(vec![2, 0, 32])]),
-            budget.try_reserve(1).unwrap(),
+            budget.try_reserve_memory(1).unwrap(),
         )
         .await
         .unwrap();
@@ -512,22 +513,22 @@ async fn consumer_escalates_lifecycle_cancel_without_blocking_other_calls() {
     fixture.stop().await;
 }
 
+#[cfg(feature = "test-support")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn consumer_cancel_settles_call_end_deferred_behind_shm_copy() {
     let fixture = Harness::start_with_config(ServerIpcConfig {
-        shm_threshold: 1,
         ..ServerIpcConfig::default()
     })
     .await;
-    let budget = PayloadBufferBudget::new(9);
+    let budget = memory_budget(9);
     let mut response = fixture
         .client
         .forward_stream_bound_sized_phased(
             &fixture.binding,
             "echo",
-            3,
-            stream::iter([Ok::<_, std::io::Error>(vec![1, 0, 64])]),
-            budget.try_reserve(1).unwrap(),
+            4,
+            stream::iter([Ok::<_, std::io::Error>(vec![1, 0, 0, 128])]),
+            budget.try_reserve_memory(1).unwrap(),
         )
         .await
         .unwrap();
@@ -536,11 +537,11 @@ async fn consumer_cancel_settles_call_end_deferred_behind_shm_copy() {
             .await
             .unwrap()
             .unwrap(),
-        ForwardRecord::ItemBegin { total_bytes: 64 }
+        ForwardRecord::ItemBegin { total_bytes: 32768 }
     ));
     let cancellation = response.cancellation();
     cancellation.cancel(CancelCause::Lifecycle).unwrap();
-    let mut read = Box::pin(response.read_chunk(budget.try_reserve(8).unwrap(), 8));
+    let mut read = Box::pin(response.read_chunk(download_slice(&budget, 8), 8));
     assert!(read.as_mut().now_or_never().is_none());
     tokio::time::timeout(WAIT, cancellation.wait_deferred_terminal_for_test())
         .await
@@ -554,15 +555,16 @@ async fn consumer_cancel_settles_call_end_deferred_behind_shm_copy() {
     assert_eq!(terminal.complete_items, 1);
     assert_eq!(terminal.status, CallStatus::Failed);
     assert_eq!(terminal.error.unwrap().code, ErrorCode::CallCancelled);
-    assert_eq!(budget.snapshot().used_bytes, 0);
+    assert_eq!(budget.snapshot().memory.used_bytes, 0);
     fixture.unary().await;
     fixture.stop().await;
 }
 
+#[cfg(feature = "test-support")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cancel_before_item_header_suppresses_queued_begin() {
     let fixture = Harness::start(2).await;
-    let budget = PayloadBufferBudget::new(1);
+    let budget = memory_budget(1);
     let mut response = fixture
         .client
         .forward_stream_bound_sized_phased(
@@ -570,7 +572,7 @@ async fn cancel_before_item_header_suppresses_queued_begin() {
             "echo",
             3,
             stream::iter([Ok::<_, std::io::Error>(vec![1, 0, 8])]),
-            budget.try_reserve(1).unwrap(),
+            budget.try_reserve_memory(1).unwrap(),
         )
         .await
         .unwrap();
@@ -599,7 +601,7 @@ async fn begin_arriving_after_consumer_cancel_is_never_announced() {
     let (release_tx, release_rx) = mpsc::channel();
     *fixture.observed.step_entered.lock().unwrap() = Some(entered_tx);
     *fixture.observed.release_step.lock().unwrap() = Some(release_rx);
-    let budget = PayloadBufferBudget::new(1);
+    let budget = memory_budget(1);
     let mut response = fixture
         .client
         .forward_stream_bound_sized_phased(
@@ -607,7 +609,7 @@ async fn begin_arriving_after_consumer_cancel_is_never_announced() {
             "echo",
             3,
             stream::iter([Ok::<_, std::io::Error>(vec![1, 0, 8])]),
-            budget.try_reserve(1).unwrap(),
+            budget.try_reserve_memory(1).unwrap(),
         )
         .await
         .unwrap();
@@ -634,7 +636,7 @@ async fn begin_arriving_after_consumer_cancel_is_never_announced() {
 async fn early_not_executed_stops_a_stalled_request_source() {
     let fixture = Harness::start(2).await;
     assert!(fixture.server.unregister_route("portable").await);
-    let budget = PayloadBufferBudget::new(1);
+    let budget = memory_budget(1);
     let source = stream::once(async { Ok::<_, std::io::Error>(vec![1]) })
         .chain(stream::pending::<Result<Vec<u8>, std::io::Error>>());
     let mut response = tokio::time::timeout(
@@ -644,7 +646,7 @@ async fn early_not_executed_stops_a_stalled_request_source() {
             "echo",
             3,
             source,
-            budget.try_reserve(1).unwrap(),
+            budget.try_reserve_memory(1).unwrap(),
         ),
     )
     .await
@@ -655,6 +657,7 @@ async fn early_not_executed_stops_a_stalled_request_source() {
         .expect("early refusal must wake stalled upload")
         .expect_err("retired route must refuse opening");
     assert_eq!(error.phase(), c2_ipc::TransportPhase::PreDispatch);
+    #[cfg(feature = "test-support")]
     assert_eq!(fixture.client.pending_len_for_test(), 0);
     fixture.stop().await;
 }
@@ -662,7 +665,7 @@ async fn early_not_executed_stops_a_stalled_request_source() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn lifecycle_cancel_before_open_wakes_stalled_upload() {
     let fixture = Harness::start(2).await;
-    let budget = PayloadBufferBudget::new(1);
+    let budget = memory_budget(1);
     let mut response = fixture
         .client
         .forward_stream_bound_sized_phased(
@@ -670,7 +673,7 @@ async fn lifecycle_cancel_before_open_wakes_stalled_upload() {
             "echo",
             3,
             stream::pending::<Result<Vec<u8>, std::io::Error>>(),
-            budget.try_reserve(1).unwrap(),
+            budget.try_reserve_memory(1).unwrap(),
         )
         .await
         .unwrap();
@@ -683,7 +686,7 @@ async fn lifecycle_cancel_before_open_wakes_stalled_upload() {
         .expect("cancellation must wake request source")
         .expect_err("cancelled pre-OPEN upload must not commit headers");
     assert_eq!(error.phase(), c2_ipc::TransportPhase::PreDispatch);
-    assert_eq!(budget.snapshot().used_bytes, 0);
+    assert_eq!(budget.snapshot().memory.used_bytes, 0);
     fixture.unary().await;
     fixture.stop().await;
 }
@@ -691,9 +694,10 @@ async fn lifecycle_cancel_before_open_wakes_stalled_upload() {
 // The request block must exist while the source is incomplete, with no OPEN
 // published. Checking the original pool distinguishes SHM preparation from
 // chunked forwarding, which can otherwise return the same application result.
+#[cfg(feature = "test-support")]
 async fn check_unpublished_forward_shm(unary: bool, cancel: bool) {
     let fixture = Harness::start(2).await;
-    let budget = PayloadBufferBudget::new(1);
+    let budget = memory_budget(1);
     let (polled_tx, polled_rx) = tokio::sync::oneshot::channel();
     let (source_tx, source_rx) = tokio::sync::oneshot::channel::<()>();
     let source =
@@ -707,10 +711,10 @@ async fn check_unpublished_forward_shm(unary: bool, cancel: bool) {
     if unary {
         let client = fixture.client.clone();
         let binding = fixture.binding.clone();
-        let send = budget.try_reserve(1).unwrap();
+        let send = budget.try_reserve_memory(1).unwrap();
         unary_task = Some(tokio::spawn(async move {
             client
-                .forward_unary_bound_sized_phased(&binding, "ping", 8192, source, send)
+                .forward_unary_bound_sized_phased(&binding, "ping", 32768, source, send)
                 .await
         }));
     } else {
@@ -720,9 +724,9 @@ async fn check_unpublished_forward_shm(unary: bool, cancel: bool) {
                 .forward_stream_bound_sized_phased(
                     &fixture.binding,
                     "echo",
-                    8192,
+                    32768,
                     source,
-                    budget.try_reserve(1).unwrap(),
+                    budget.try_reserve_memory(1).unwrap(),
                 )
                 .await
                 .unwrap(),
@@ -762,35 +766,40 @@ async fn check_unpublished_forward_shm(unary: bool, cancel: bool) {
     };
     assert_eq!(error.phase(), c2_ipc::TransportPhase::PreDispatch);
     assert_eq!(pool.read().stats().alloc_count, 0);
-    assert_eq!(budget.snapshot().used_bytes, 0);
+    assert_eq!(budget.snapshot().memory.used_bytes, 0);
     // The forwarding driver drops its send guard before reporting the
     // pre-OPEN failure, so the pending record is already released here.
+    #[cfg(feature = "test-support")]
     assert_eq!(fixture.client.pending_len_for_test(), 0);
     fixture.unary().await;
     fixture.stop().await;
 }
 
+#[cfg(feature = "test-support")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn unary_forward_source_error_releases_unpublished_request_shm() {
     check_unpublished_forward_shm(true, false).await;
 }
 
+#[cfg(feature = "test-support")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn stream_forward_source_error_releases_unpublished_request_shm() {
     check_unpublished_forward_shm(false, false).await;
 }
 
+#[cfg(feature = "test-support")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn stream_forward_cancel_releases_unpublished_request_shm() {
     check_unpublished_forward_shm(false, true).await;
 }
 
+#[cfg(feature = "test-support")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn forward_request_shm_checks_source_eof_and_declared_length_before_open() {
     let fixture = Harness::start(2).await;
-    let budget = PayloadBufferBudget::new(1);
+    let budget = memory_budget(1);
     for unary in [false, true] {
-        for actual in [8191, 8193] {
+        for actual in [32767, 32769] {
             let source = stream::iter([Ok::<_, std::io::Error>(vec![0; actual])]);
             let error = if unary {
                 fixture
@@ -798,9 +807,9 @@ async fn forward_request_shm_checks_source_eof_and_declared_length_before_open()
                     .forward_unary_bound_sized_phased(
                         &fixture.binding,
                         "ping",
-                        8192,
+                        32768,
                         source,
-                        budget.try_reserve(1).unwrap(),
+                        budget.try_reserve_memory(1).unwrap(),
                     )
                     .await
                     .unwrap_err()
@@ -810,9 +819,9 @@ async fn forward_request_shm_checks_source_eof_and_declared_length_before_open()
                     .forward_stream_bound_sized_phased(
                         &fixture.binding,
                         "echo",
-                        8192,
+                        32768,
                         source,
-                        budget.try_reserve(1).unwrap(),
+                        budget.try_reserve_memory(1).unwrap(),
                     )
                     .await
                     .unwrap()
@@ -826,9 +835,10 @@ async fn forward_request_shm_checks_source_eof_and_declared_length_before_open()
             assert_eq!(pool.read().stats().alloc_count, 0);
             // The driver drops its send guard before reporting the pre-OPEN
             // length failure, so this holds by happens-before, not timing.
+            #[cfg(feature = "test-support")]
             assert_eq!(fixture.client.pending_len_for_test(), 0);
             assert_eq!(fixture.observed.opened.load(Ordering::SeqCst), 0);
-            assert_eq!(budget.snapshot().used_bytes, 0);
+            assert_eq!(budget.snapshot().memory.used_bytes, 0);
             fixture.unary().await;
         }
     }
@@ -839,12 +849,12 @@ async fn forward_request_shm_checks_source_eof_and_declared_length_before_open()
         .forward_unary_bound_sized_phased(
             &fixture.binding,
             "ping",
-            8192,
+            32768,
             stream::iter([
-                Ok(vec![0; 8192]),
+                Ok(vec![0; 32768]),
                 Err(std::io::Error::other("error after all bytes")),
             ]),
-            budget.try_reserve(1).unwrap(),
+            budget.try_reserve_memory(1).unwrap(),
         )
         .await
         .unwrap_err();
@@ -856,7 +866,7 @@ async fn forward_request_shm_checks_source_eof_and_declared_length_before_open()
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn forward_request_shm_publishes_after_complete_source() {
     let fixture = Harness::start(2).await;
-    let budget = PayloadBufferBudget::new(1);
+    let budget = memory_budget(1);
     let response = fixture
         .client
         .forward_unary_bound_sized_phased(
@@ -864,7 +874,7 @@ async fn forward_request_shm_publishes_after_complete_source() {
             "ping",
             8192,
             stream::iter([Ok::<_, std::io::Error>(vec![0; 4096]), Ok(vec![0; 4096])]),
-            budget.try_reserve(1).unwrap(),
+            budget.try_reserve_memory(1).unwrap(),
         )
         .await
         .unwrap();
@@ -876,7 +886,7 @@ async fn forward_request_shm_publishes_after_complete_source() {
             "echo",
             8192,
             stream::iter([Ok::<_, std::io::Error>(vec![0; 4096]), Ok(vec![0; 4096])]),
-            budget.try_reserve(1).unwrap(),
+            budget.try_reserve_memory(1).unwrap(),
         )
         .await
         .unwrap();
@@ -890,11 +900,12 @@ async fn forward_request_shm_publishes_after_complete_source() {
         })
     ));
     assert_eq!(fixture.observed.opened.load(Ordering::SeqCst), 1);
-    assert_eq!(budget.snapshot().used_bytes, 0);
+    assert_eq!(budget.snapshot().memory.used_bytes, 0);
     fixture.unary().await;
     fixture.stop().await;
 }
 
+#[cfg(feature = "test-support")]
 #[tokio::test]
 async fn queued_forward_frame_keeps_its_charge_after_deactivation() {
     // On this current-thread executor the upload driver runs from source EOF
@@ -911,7 +922,7 @@ async fn queued_forward_frame_keeps_its_charge_after_deactivation() {
         async move { client.call_bound(&binding, "ping", b"").await }
     });
     wait_for_signal(paused_rx).await;
-    let budget = PayloadBufferBudget::new(1);
+    let budget = memory_budget(1);
     let (eof_tx, eof_rx) = tokio::sync::oneshot::channel();
     let mut eof_tx = Some(eof_tx);
     let mut remaining = Some(vec![7]);
@@ -926,7 +937,7 @@ async fn queued_forward_frame_keeps_its_charge_after_deactivation() {
     let queued = tokio::spawn({
         let client = fixture.client.clone();
         let binding = fixture.binding.clone();
-        let send = budget.try_reserve(1).unwrap();
+        let send = budget.try_reserve_memory(1).unwrap();
         async move {
             client
                 .forward_unary_bound_sized_phased(&binding, "ping", 1, source, send)
@@ -942,7 +953,7 @@ async fn queued_forward_frame_keeps_its_charge_after_deactivation() {
         .unwrap_err();
     assert_eq!(error.phase(), c2_ipc::TransportPhase::PreDispatch);
     assert_eq!(
-        budget.snapshot().used_bytes,
+        budget.snapshot().memory.used_bytes,
         1,
         "queued frame bytes still own their charge after the submit waiter ends"
     );
@@ -954,11 +965,21 @@ async fn queued_forward_frame_keeps_its_charge_after_deactivation() {
         .unwrap();
     assert_eq!(response.into_owned_bytes().unwrap(), b"pong");
     tokio::time::timeout(WAIT, async {
-        while budget.snapshot().used_bytes != 0 {
+        while budget.snapshot().memory.used_bytes != 0 {
             tokio::task::yield_now().await;
         }
     })
     .await
     .unwrap();
     fixture.stop().await;
+}
+
+fn download_slice(budget: &c2_mem::DomainBudget, bytes: u64) -> c2_mem::WindowSlice {
+    let window = budget
+        .try_reserve_memory(bytes)
+        .unwrap()
+        .into_reusable_window();
+    futures_util::FutureExt::now_or_never(window.reserve(bytes))
+        .unwrap()
+        .unwrap()
 }

@@ -32,7 +32,7 @@ pub use config::{PoolAllocation, PoolConfig, PoolStats};
 pub use dedicated::DedicatedSegment;
 pub use handle::{MemHandle, OwnedAllocation};
 pub use peer::{PeerMappingCache, PeerMappingError, PeerRead};
-pub use pool::MemPool;
+pub use pool::{MemPool, ShmMutPin, ShmRefPin};
 pub use segment::ShmRegion;
 pub use spill::{available_physical_memory, create_file_spill};
 pub use window::{ReusableWindow, WindowChunk, WindowReserveFuture, WindowSlice};

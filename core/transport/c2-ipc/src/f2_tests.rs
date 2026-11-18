@@ -158,14 +158,11 @@ async fn isolated_reply_failure(fault: ReplyFault) {
         expect_disconnect_or_eof(&mut stream).await;
         crate::tests::close_listener(listener).await;
     });
-    let mut cfg = config();
-    cfg.base.shm_backing_budget_bytes = 0;
-    if matches!(fault, ReplyFault::Geometry(..)) {
-        cfg.base.live_reassembly_budget_bytes = 0;
-    } else if partial {
-        cfg.base.live_reassembly_budget_bytes = 1536 + 3;
-    }
-    let mut client = IpcClient::with_endpoint(endpoint.endpoint.clone(), cfg).unwrap();
+    let mut client = IpcClient::with_endpoint_and_budget(
+        endpoint.endpoint.clone(),
+        crate::tests::memory_budget(if partial { 64 * 1024 } else { 0 }),
+    )
+    .unwrap();
     client.connect().await.unwrap();
     if matches!(
         fault,
@@ -192,7 +189,16 @@ async fn isolated_reply_failure(fault: ReplyFault) {
     });
     assembly_ready.await.unwrap();
     if partial {
-        eventually(|| client.memory_budget.snapshot().reassembly.used_bytes == 1536 + 3).await;
+        eventually(|| {
+            client
+                .chunk_registry
+                .lock()
+                .as_ref()
+                .unwrap()
+                .active_count()
+                == 1
+        })
+        .await;
     }
     assert_eq!(client.pending_len_for_test(), 2);
     break_reply.send(()).unwrap();
@@ -221,15 +227,8 @@ async fn isolated_reply_failure(fault: ReplyFault) {
         "the other sent call is still waiting"
     );
     assert!(!other.is_finished());
-    assert_eq!(client.memory_budget.snapshot().reassembly.used_bytes, 0);
-    assert_eq!(
-        client
-            .memory_budget
-            .snapshot()
-            .reassembly
-            .rejected_allocations,
-        0
-    );
+    assert_eq!(client.domain_snapshot().memory.used_bytes, 0);
+    assert_eq!(client.budget.snapshot().memory.rejected_allocations, 0);
     finish_other.send(()).unwrap();
     let expected = if partial {
         vec![9; 1536]
@@ -260,7 +259,7 @@ async fn isolated_reply_failure(fault: ReplyFault) {
         &connection
     ));
     assert_eq!(client.pending_len_for_test(), 0);
-    assert_eq!(client.memory_budget.snapshot().reassembly.used_bytes, 0);
+    assert_eq!(client.domain_snapshot().memory.used_bytes, 0);
     assert!(client.close_shared_bounded(WAIT).await);
     timeout(WAIT, peer).await.unwrap().unwrap();
 }
@@ -391,7 +390,7 @@ async fn control_violations_deactivate_but_sent_inline_and_chunked_calls_finish(
         );
         assert!(!first.is_finished() && !second.is_finished());
         assert_eq!(
-            budget.snapshot().file.used_bytes > 0,
+            budget.snapshot().file_spill.used_bytes > 0,
             fault < 2 || fault == 4
         );
         let rejected = client
@@ -410,38 +409,32 @@ async fn control_violations_deactivate_but_sent_inline_and_chunked_calls_finish(
         replies.sort_by_key(Vec::len);
         assert_eq!(replies[0], b"first");
         assert_eq!(replies[1], [&[2; 512][..], &[3; 512][..]].concat());
-        eventually(|| budget.snapshot().file.used_bytes == 0).await;
+        eventually(|| budget.snapshot().file_spill.used_bytes == 0).await;
         assert!(client.close_shared_bounded(WAIT).await);
         timeout(WAIT, peer).await.unwrap().unwrap();
     }
 }
 
 #[tokio::test]
-async fn peer_views_retire_after_the_last_carrier_and_idle_gc() {
+async fn peer_views_keep_only_buddy_mappings_and_retire_on_close() {
     for dedicated in [false, true] {
         let endpoint = Endpoint::new();
-        let (server, runner) = start(
+        let (server, runner) = start_with_server_limits(
             &endpoint,
             Arc::new(Echo),
-            ServerIpcConfig {
-                shm_threshold: 1,
-                base: c2_config::BaseIpcConfig {
-                    pool_enabled: !dedicated,
-                    ..Default::default()
-                },
+            Default::default(),
+            DomainLimits {
+                memory_budget_bytes: if dedicated { 224 * 1024 } else { 1024 * 1024 },
                 ..Default::default()
             },
         )
         .await;
-        let mut cfg = config();
-        cfg.pool_decay_seconds = 1.0;
-        cfg.base.chunk_gc_interval_secs = 0.005;
-        let mut client = IpcClient::with_endpoint(endpoint.endpoint.clone(), cfg).unwrap();
+        let mut client = endpoint.client();
         client.connect().await.unwrap();
         let peer = client.server_pool.lock().clone().unwrap();
         let binding = client.acquire_route(&contract()).await.unwrap();
         let held = client
-            .call_bound(&binding, "echo", &[9; 8193])
+            .call_bound(&binding, "echo", &[9; SHM_THRESHOLD as usize + 1])
             .await
             .unwrap()
             .into_owned_bytes()
@@ -462,47 +455,23 @@ async fn peer_views_retire_after_the_last_carrier_and_idle_gc() {
                 .map_or(0, |cache| cache.mapped_segments()),
             if dedicated { 0 } else { 1 }
         );
-        eventually(|| {
-            peer.read()
-                .cache
-                .as_ref()
-                .map_or(0, |cache| cache.mapped_segments())
-                == 0
-        })
-        .await;
         assert!(client.is_connected());
-        assert_eq!(held, vec![9; 8193]);
+        assert_eq!(held, vec![9; SHM_THRESHOLD as usize + 1]);
         assert_eq!(
             client
-                .call_bound(&binding, "echo", &[8; 8193])
+                .call_bound(&binding, "echo", &[8; SHM_THRESHOLD as usize + 1])
                 .await
                 .unwrap()
                 .into_owned_bytes()
                 .unwrap(),
-            vec![8; 8193],
+            vec![8; SHM_THRESHOLD as usize + 1],
             "a retired peer view can be reopened on the same physical connection"
         );
-        assert_eq!(held, vec![9; 8193]);
+        assert_eq!(held, vec![9; SHM_THRESHOLD as usize + 1]);
         assert!(client.close_shared_bounded(WAIT).await);
+        assert!(peer.read().cache.is_none());
         stop(server, runner).await;
     }
-}
-
-#[tokio::test]
-async fn subnanosecond_gc_interval_keeps_the_five_millisecond_floor() {
-    let endpoint = Endpoint::new();
-    let (server, runner) = start(&endpoint, Arc::new(Echo), ServerIpcConfig::default()).await;
-    let mut cfg = config();
-    cfg.base.chunk_gc_interval_secs = 1e-12; // Duration rounds to zero.
-    cfg.pool_decay_seconds = 0.0;
-    let mut client = IpcClient::with_endpoint(endpoint.endpoint.clone(), cfg).unwrap();
-    client.connect().await.unwrap();
-    let pool = client.request_pool().unwrap();
-    pool.write().ensure_buddy_segments(1).unwrap();
-    eventually(|| pool.read().segment_count() == 0).await;
-    assert!(client.is_connected());
-    assert!(client.close_shared_bounded(WAIT).await);
-    stop(server, runner).await;
 }
 
 #[tokio::test]
@@ -585,9 +554,8 @@ async fn configured_write_timeout_preserves_a_sent_calls_readable_reply() {
         expect_disconnect_or_eof(&mut stream).await;
         crate::tests::close_listener(listener).await;
     });
-    let mut cfg = config();
-    cfg.base.write_timeout_secs = 0.05;
-    let mut client = IpcClient::with_endpoint(endpoint.endpoint.clone(), cfg).unwrap();
+    let mut client = endpoint.client();
+    client.write_timeout = Duration::from_millis(50);
     client.connect().await.unwrap();
     let client = Arc::new(client);
     let other = tokio::spawn({
@@ -686,11 +654,11 @@ async fn untrusted_frame_boundary_fails_all_sent_calls_and_waits_for_peer_end() 
     assert!(!client.is_connected());
     assert_eq!(client.pending_len_for_test(), 0);
     assert!(
-        budget.snapshot().file.used_bytes > 0,
+        budget.snapshot().file_spill.used_bytes > 0,
         "a malformed frame proves no peer end"
     );
     exit.send(()).unwrap();
-    eventually(|| budget.snapshot().file.used_bytes == 0).await;
+    eventually(|| budget.snapshot().file_spill.used_bytes == 0).await;
     assert!(client.close_shared_bounded(WAIT).await);
     timeout(WAIT, peer).await.unwrap().unwrap();
 }
@@ -727,9 +695,7 @@ async fn zero_response_loan_deactivates_with_zero_shm_budget_and_preserves_other
         expect_disconnect_or_eof(&mut stream).await;
         crate::tests::close_listener(listener).await;
     });
-    let mut cfg = config();
-    cfg.base.shm_backing_budget_bytes = 0;
-    let mut client = IpcClient::with_endpoint(endpoint.endpoint.clone(), cfg).unwrap();
+    let mut client = endpoint.client_without_memory();
     client.connect().await.unwrap();
     let client = Arc::new(client);
     let target = tokio::spawn({
@@ -805,7 +771,7 @@ async fn early_chunk_rejection_stops_at_the_frame_boundary_and_preserves_the_con
                 let mut payload = vec![0; second.payload_len()];
                 stream.read_exact(&mut payload).await.unwrap();
                 assert!(
-                    matches!(decode_rpc_record(&second, &payload, None).unwrap(), RpcRecord::OpenContinuation { value: ValuePart { storage: ValueStorage::Inline(bytes), .. } } if bytes == [2; 4096])
+                    matches!(decode_rpc_record(&second, &payload, None).unwrap(), RpcRecord::OpenContinuation { value: ValuePart { storage: ValueStorage::Inline(bytes), .. } } if bytes == [2; CHUNK_SIZE as usize])
                 );
             }
             let (next, _) = read_frame(&mut stream).await;
@@ -823,7 +789,7 @@ async fn early_chunk_rejection_stops_at_the_frame_boundary_and_preserves_the_con
         let connection = client.driver.read().clone().unwrap();
         let client = Arc::new(client);
         let (body, source) = tokio::sync::mpsc::channel(3);
-        body.send(vec![1; 4096]).await.unwrap();
+        body.send(vec![1; CHUNK_SIZE as usize]).await.unwrap();
         let source = futures_util::stream::unfold(source, |mut source| async move {
             source
                 .recv()
@@ -834,7 +800,13 @@ async fn early_chunk_rejection_stops_at_the_frame_boundary_and_preserves_the_con
             let client = client.clone();
             async move {
                 client
-                    .call_chunked_stream_phased(&identity(), 0, 3 * 4096, source)
+                    .call_chunked_stream_phased(
+                        &identity(),
+                        0,
+                        3 * CHUNK_SIZE as usize,
+                        DEFAULT_MAX_PAYLOAD_SIZE,
+                        source,
+                    )
                     .await
             }
         });
@@ -843,7 +815,7 @@ async fn early_chunk_rejection_stops_at_the_frame_boundary_and_preserves_the_con
             let (entered, paused) = oneshot::channel();
             let (resume, resumed) = oneshot::channel();
             client.set_write_prefix_pause_for_test(Some((entered, resumed)));
-            body.send(vec![2; 4096]).await.unwrap();
+            body.send(vec![2; CHUNK_SIZE as usize]).await.unwrap();
             timeout(WAIT, paused).await.unwrap().unwrap();
             eventually(|| client.pending_len_for_test() == 0).await;
             assert!(

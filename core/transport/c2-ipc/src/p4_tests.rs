@@ -1,6 +1,7 @@
 use super::*;
-use c2_config::LocalEndpointContext;
+use c2_config::{CHUNK_SIZE, DomainLimits, LocalEndpointContext, SHM_THRESHOLD};
 use c2_local::LocalListener;
+use c2_mem::DomainBudget;
 use c2_server::{
     ConcurrencyMode, CrmCallback, CrmError, ResponseMeta, RouteBuildSpec, SchedulerLimits, Server,
     ServerIpcConfig,
@@ -48,19 +49,20 @@ impl Endpoint {
         }
     }
     fn client(&self) -> IpcClient {
-        IpcClient::with_endpoint(self.endpoint.clone(), config()).unwrap()
+        IpcClient::with_endpoint(self.endpoint.clone()).unwrap()
     }
-}
-fn config() -> ClientIpcConfig {
-    ClientIpcConfig {
-        base: c2_config::BaseIpcConfig {
-            pool_segment_size: 64 * 1024,
-            max_pool_segments: 2,
-            chunk_size: 4096,
-            ..Default::default()
-        },
-        shm_threshold: 1,
-        ..Default::default()
+    /// Client whose whole domain refuses SHM-style memory reservations;
+    /// requests fall back to inline/chunked transfer.
+    fn client_without_memory(&self) -> IpcClient {
+        IpcClient::with_endpoint_and_budget(
+            self.endpoint.clone(),
+            DomainBudget::from_limits(&DomainLimits {
+                memory_budget_bytes: 0,
+                file_spill_budget_bytes: 0,
+                max_outstanding_calls: 0,
+            }),
+        )
+        .unwrap()
     }
 }
 fn identity() -> RouteCallIdentity {
@@ -315,7 +317,7 @@ async fn response_does_not_release_a_request_loan_and_peer_end_does() {
         .expect("this test requires real request SHM backing");
     assert_eq!(
         client
-            .call_buddy(&identity(), 0, &[7; 8193], None)
+            .call_buddy(&identity(), 0, &[7; 8193], DEFAULT_MAX_PAYLOAD_SIZE, None)
             .await
             .unwrap()
             .into_owned_bytes()
@@ -468,6 +470,7 @@ async fn cancellation_before_writer_publication_releases_ordinary_and_stream_pre
                 0,
                 block,
                 8193,
+                DEFAULT_MAX_PAYLOAD_SIZE,
                 futures_util::stream::iter([Ok::<_, std::io::Error>(vec![3; 8193])]),
             ));
             assert!(futures_util::poll!(call.as_mut()).is_pending());
@@ -475,7 +478,8 @@ async fn cancellation_before_writer_publication_releases_ordinary_and_stream_pre
             drop(call);
         } else {
             let id = identity();
-            let mut call = Box::pin(client.call_buddy(&id, 0, &[3; 8193], None));
+            let mut call =
+                Box::pin(client.call_buddy(&id, 0, &[3; 8193], DEFAULT_MAX_PAYLOAD_SIZE, None));
             assert!(futures_util::poll!(call.as_mut()).is_pending());
             assert_eq!(pool.read().stats().alloc_count, 1);
             drop(call);
@@ -507,11 +511,37 @@ impl CrmCallback for Echo {
 async fn start(
     endpoint: &Endpoint,
     callback: Arc<dyn CrmCallback>,
-    mut config: ServerIpcConfig,
+    config: ServerIpcConfig,
 ) -> (Arc<Server>, tokio::task::JoinHandle<()>) {
-    config.base.pool_segment_size = 64 * 1024;
-    config.base.max_pool_segments = 2;
-    let server = Arc::new(Server::new_with_endpoint(endpoint.endpoint.clone(), config).unwrap());
+    start_with_server_limits(endpoint, callback, config, DomainLimits::default()).await
+}
+
+async fn start_with_server_limits(
+    endpoint: &Endpoint,
+    callback: Arc<dyn CrmCallback>,
+    config: ServerIpcConfig,
+    limits: DomainLimits,
+) -> (Arc<Server>, tokio::task::JoinHandle<()>) {
+    let server = Arc::new(
+        Server::new_with_identity_endpoint_and_budget(
+            endpoint.endpoint.clone(),
+            config,
+            ServerIdentity {
+                server_id: endpoint
+                    .endpoint
+                    .address()
+                    .strip_prefix("ipc://")
+                    .unwrap()
+                    .into(),
+                server_instance_id: format!(
+                    "p4-instance-{}",
+                    CLIENT_CONN_COUNTER.fetch_add(1, Ordering::Relaxed)
+                ),
+            },
+            DomainBudget::from_limits(&limits),
+        )
+        .unwrap(),
+    );
     let id = contract();
     let built = server
         .build_route(
@@ -574,15 +604,7 @@ async fn real_server_releases_request_before_slow_callback() {
         entered: StdMutex::new(Some(entered)),
         gate: (std::sync::Mutex::new(false), std::sync::Condvar::new()),
     });
-    let (server, runner) = start(
-        &endpoint,
-        slow.clone(),
-        ServerIpcConfig {
-            shm_threshold: 1,
-            ..Default::default()
-        },
-    )
-    .await;
+    let (server, runner) = start(&endpoint, slow.clone(), ServerIpcConfig::default()).await;
     let mut client = endpoint.client();
     client.connect().await.unwrap();
     let binding = client.acquire_route(&contract()).await.unwrap();
@@ -591,14 +613,11 @@ async fn real_server_releases_request_before_slow_callback() {
         .ensure_buddy_segments(1)
         .expect("this test requires real request SHM backing");
     let client = Arc::new(client);
+    let request = vec![8; SHM_THRESHOLD as usize + 1];
     let call = tokio::spawn({
         let client = client.clone();
-        async move {
-            client
-                .call_bound(&binding, "echo", &[8; 8193])
-                .await
-                .unwrap()
-        }
+        let request = request.clone();
+        async move { client.call_bound(&binding, "echo", &request).await.unwrap() }
     });
     timeout(WAIT, ready).await.unwrap().unwrap();
     let released = timeout(WAIT, async {
@@ -612,7 +631,7 @@ async fn real_server_releases_request_before_slow_callback() {
     released.expect("client must receive the request release while callback is still blocked");
     assert_eq!(
         call.await.unwrap().into_owned_bytes().unwrap(),
-        vec![8; 8193]
+        vec![8; SHM_THRESHOLD as usize + 1]
     );
     assert!(client.close_shared_bounded(WAIT).await);
     stop(server, runner).await;
@@ -620,57 +639,37 @@ async fn real_server_releases_request_before_slow_callback() {
 
 #[tokio::test]
 async fn real_response_is_released_before_local_copy_is_held_and_close() {
-    for dedicated in [false, true] {
-        let endpoint = Endpoint::new();
-        let mut server_config = ServerIpcConfig {
-            shm_threshold: 1,
-            ..Default::default()
-        };
-        server_config.base.pool_enabled = !dedicated;
-        let (server, runner) = start(&endpoint, Arc::new(Echo), server_config).await;
-        let mut client_config = config();
-        client_config.base.pool_enabled = !dedicated;
-        let mut client =
-            IpcClient::with_endpoint(endpoint.endpoint.clone(), client_config).unwrap();
-        client.connect().await.unwrap();
-        let binding = client.acquire_route(&contract()).await.unwrap();
-        let response = client
-            .call_bound(&binding, "echo", &[5; 8193])
-            .await
-            .unwrap();
-        assert!(
-            matches!(response, ResponseData::Inline(_)),
-            "no transport lease escapes a call"
-        );
-        let held_copy = response.into_owned_bytes().unwrap();
-        let stats = server.response_pool_arc().read().stats();
-        assert!(
-            stats.buddy_expanded_allocs + stats.buddy_reused_allocs + stats.dedicated_allocs > 0,
-            "this test requires an actual server SHM response: {stats:?}"
-        );
-        eventually(|| server.response_pool_arc().read().stats().alloc_count == 0).await;
-        assert!(client.close_shared_bounded(WAIT).await);
-        stop(server, runner).await;
-        assert_eq!(held_copy, vec![5; 8193]);
-    }
+    let endpoint = Endpoint::new();
+    let (server, runner) = start(&endpoint, Arc::new(Echo), ServerIpcConfig::default()).await;
+    let mut client = endpoint.client();
+    client.connect().await.unwrap();
+    let binding = client.acquire_route(&contract()).await.unwrap();
+    let payload = vec![5; SHM_THRESHOLD as usize + 1];
+    let response = client.call_bound(&binding, "echo", &payload).await.unwrap();
+    assert!(
+        matches!(response, ResponseData::Inline(_)),
+        "no transport lease escapes a call"
+    );
+    let held_copy = response.into_owned_bytes().unwrap();
+    let stats = server.response_pool_arc().read().stats();
+    assert!(
+        stats.buddy_expanded_allocs + stats.buddy_reused_allocs + stats.dedicated_allocs > 0,
+        "this test requires an actual server SHM response: {stats:?}"
+    );
+    eventually(|| server.response_pool_arc().read().stats().alloc_count == 0).await;
+    assert!(client.close_shared_bounded(WAIT).await);
+    stop(server, runner).await;
+    assert_eq!(held_copy, payload);
 }
 
 #[tokio::test]
 async fn real_chunk_fallback_returns_reassembly_budget_before_delivery() {
     let endpoint = Endpoint::new();
-    let mut server_config = ServerIpcConfig {
-        shm_threshold: 1,
-        ..Default::default()
-    };
-    server_config.base.shm_backing_budget_bytes = 0;
-    server_config.base.chunk_size = 4096;
-    let (server, runner) = start(&endpoint, Arc::new(Echo), server_config).await;
-    let mut config = config();
-    config.base.shm_backing_budget_bytes = 0;
-    let mut client = IpcClient::with_endpoint(endpoint.endpoint.clone(), config).unwrap();
+    let (server, runner) = start(&endpoint, Arc::new(Echo), ServerIpcConfig::default()).await;
+    let mut client = endpoint.client_without_memory();
     client.connect().await.unwrap();
     let binding = client.acquire_route(&contract()).await.unwrap();
-    let data = vec![9; 8193];
+    let data = vec![9; CHUNK_SIZE as usize + 1];
     assert_eq!(
         client
             .call_bound(&binding, "echo", &data)
@@ -680,8 +679,7 @@ async fn real_chunk_fallback_returns_reassembly_budget_before_delivery() {
             .unwrap(),
         data
     );
-    assert_eq!(client.memory_budget.snapshot().reassembly.used_bytes, 0);
-    assert_eq!(client.memory_budget.snapshot().shm.used_bytes, 0);
+    assert_eq!(client.domain_snapshot().memory.used_bytes, 0);
     assert!(client.close_shared_bounded(WAIT).await);
     stop(server, runner).await;
 }
@@ -729,7 +727,11 @@ async fn cancelling_a_started_shm_write_keeps_the_driver_and_never_replays() {
     *conn.pause.lock() = Some((entered, resumed));
     let caller = tokio::spawn({
         let client = client.clone();
-        async move { client.call_buddy(&identity(), 0, &[7; 8193], None).await }
+        async move {
+            client
+                .call_buddy(&identity(), 0, &[7; 8193], DEFAULT_MAX_PAYLOAD_SIZE, None)
+                .await
+        }
     });
     paused.await.unwrap();
     assert_eq!(pool.read().stats().alloc_count, 1);
@@ -803,11 +805,10 @@ async fn r13_prepared_reply_drop_before_publication_releases_buddy_and_dedicated
 // Retained route, configuration and call-policy regression coverage.
 #[test]
 fn reassembly_pool_unique_prefixes() {
-    let cfg = ClientIpcConfig::default();
-    let budget = c2_mem::MemoryBudget::from_limits(&cfg.memory_budget_limits());
-    let r1 = IpcClient::build_chunk_registry(&cfg, &budget).unwrap();
-    let r2 = IpcClient::build_chunk_registry(&cfg, &budget).unwrap();
-    let r3 = IpcClient::build_chunk_registry(&cfg, &budget).unwrap();
+    let budget = DomainBudget::from_limits(&DomainLimits::default());
+    let r1 = IpcClient::build_chunk_registry(&budget).unwrap();
+    let r2 = IpcClient::build_chunk_registry(&budget).unwrap();
+    let r3 = IpcClient::build_chunk_registry(&budget).unwrap();
     let prefix1 = r1.pool().read().prefix().to_string();
     let prefix2 = r2.pool().read().prefix().to_string();
     let prefix3 = r3.pool().read().prefix().to_string();
@@ -828,8 +829,7 @@ fn client_projects_server_identity() {
         server_id: "identity-server".to_string(),
         server_instance_id: "identity-instance".to_string(),
     };
-    let mut client =
-        IpcClient::with_config("ipc://identity_projection", ClientIpcConfig::default()).unwrap();
+    let mut client = IpcClient::new("ipc://identity_projection").unwrap();
     client.server_identity = Some(identity.clone());
 
     assert_eq!(client.server_identity(), Some(&identity));
@@ -841,9 +841,7 @@ fn client_projects_server_identity() {
 fn route_binding_keeps_expected_contract_after_directory_update() {
     const ABI_HASH: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     const SIG_HASH: &str = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
-    let client =
-        IpcClient::with_config("ipc://route_binding_projection", ClientIpcConfig::default())
-            .unwrap();
+    let client = IpcClient::new("ipc://route_binding_projection").unwrap();
     client.route_directory.write().insert_table(
         "grid".to_string(),
         MethodTable::from_entries(
@@ -917,8 +915,7 @@ fn route_binding_keeps_expected_contract_after_directory_update() {
 fn client_validates_route_crm_contract_from_handshake_metadata() {
     const ABI_HASH: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     const SIG_HASH: &str = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
-    let client =
-        IpcClient::with_config("ipc://contract_projection", ClientIpcConfig::default()).unwrap();
+    let client = IpcClient::new("ipc://contract_projection").unwrap();
     let mut methods = HashMap::new();
     methods.insert("ping".to_string(), 0);
     client.route_directory.write().insert_table(
@@ -930,7 +927,7 @@ fn client_validates_route_crm_contract_from_handshake_metadata() {
             crm_ver: "0.1.0".to_string(),
             abi_hash: ABI_HASH.to_string(),
             signature_hash: SIG_HASH.to_string(),
-            max_payload_size: 1024,
+            max_payload_size: 128 * 1024,
             name_to_idx: methods,
         },
     );
@@ -973,7 +970,7 @@ fn client_validates_route_crm_contract_from_handshake_metadata() {
 async fn client_rejects_request_over_route_payload_limit_before_transport() {
     const ABI_HASH: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     const SIG_HASH: &str = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
-    let client = IpcClient::with_config("ipc://payload_limit", ClientIpcConfig::default()).unwrap();
+    let client = IpcClient::new("ipc://payload_limit").unwrap();
     let mut methods = HashMap::new();
     methods.insert("ping".to_string(), 0);
     client.route_directory.write().insert_table(
@@ -1040,7 +1037,7 @@ async fn client_rejects_path_like_ipc_region_before_connecting() {
         "ipc://bad\nname",
         "tcp://not-ipc",
     ] {
-        let mut client = IpcClient::with_config(address, ClientIpcConfig::default()).unwrap();
+        let mut client = IpcClient::new(address).unwrap();
         let error = client
             .connect()
             .await
@@ -1055,16 +1052,7 @@ async fn client_rejects_path_like_ipc_region_before_connecting() {
 fn cancellation_client(label: &str) -> (IpcClient, RouteBinding, Arc<RwLock<MemPool>>) {
     const ABI_HASH: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     const SIG_HASH: &str = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
-    let cfg = ClientIpcConfig {
-        shm_threshold: 10,
-        base: c2_config::BaseIpcConfig {
-            pool_segment_size: 65_536,
-            max_pool_segments: 1,
-            ..c2_config::BaseIpcConfig::default()
-        },
-        ..ClientIpcConfig::default()
-    };
-    let client = IpcClient::with_config(&format!("ipc://{label}"), cfg).unwrap();
+    let client = IpcClient::new(&format!("ipc://{label}")).unwrap();
     client.negotiated_shm_request.store(true, Ordering::Release);
     let mut methods = HashMap::new();
     methods.insert("ping".to_string(), 0);
@@ -1303,7 +1291,7 @@ async fn cancelled_chunk_sender_finishes_its_stream_and_preserves_other_calls() 
             flags::FLAG_RPC_RECORD | flags::FLAG_CHUNKED | flags::FLAG_FIRST_CHUNK
         );
         assert!(
-            matches!(decode_rpc_record(&first, &body, None).unwrap(), RpcRecord::Open { value: ValuePart { chunk: c2_wire::rpc::ChunkPosition::First { total_bytes }, .. }, .. } if total_bytes == 3 * 4096)
+            matches!(decode_rpc_record(&first, &body, None).unwrap(), RpcRecord::Open { value: ValuePart { chunk: c2_wire::rpc::ChunkPosition::First { total_bytes }, .. }, .. } if total_bytes == 3 * CHUNK_SIZE)
         );
         first_sent.send(()).unwrap();
         let (other, _) = read_frame(&mut stream).await;
@@ -1336,11 +1324,17 @@ async fn cancelled_chunk_sender_finishes_its_stream_and_preserves_other_calls() 
         let client = client.clone();
         async move {
             client
-                .call_chunked_stream_phased(&identity(), 0, 3 * 4096, chunks)
+                .call_chunked_stream_phased(
+                    &identity(),
+                    0,
+                    3 * CHUNK_SIZE as usize,
+                    DEFAULT_MAX_PAYLOAD_SIZE,
+                    chunks,
+                )
                 .await
         }
     });
-    source.send(vec![1; 4096]).await.unwrap();
+    source.send(vec![1; CHUNK_SIZE as usize]).await.unwrap();
     first_seen.await.unwrap();
     caller.abort();
     assert!(caller.await.unwrap_err().is_cancelled());
@@ -1354,7 +1348,7 @@ async fn cancelled_chunk_sender_finishes_its_stream_and_preserves_other_calls() 
             .unwrap(),
         b"other"
     );
-    source.send(vec![2; 8192]).await.unwrap();
+    source.send(vec![2; CHUNK_SIZE as usize * 2]).await.unwrap();
     drop(source);
     completed.await.unwrap();
     assert!(client.is_connected());
@@ -1377,8 +1371,8 @@ enum FramedFault {
 fn publish_file_loan(
     conn: &ClientConnection,
     directory: &std::path::Path,
-) -> (u64, Arc<RwLock<MemPool>>, c2_mem::MemoryBudget) {
-    let budget = c2_mem::MemoryBudget::new(0, 1024 * 1024, 1024 * 1024);
+) -> (u64, Arc<RwLock<MemPool>>, c2_mem::DomainBudget) {
+    let budget = crate::tests::memory_budget(1024);
     let pool = Arc::new(RwLock::new(
         MemPool::new_with_prefix_and_budget(
             c2_mem::PoolConfig {
@@ -1564,9 +1558,11 @@ async fn framed_response_faults_remain_uncertain_and_still_settle_release_record
             }
             crate::tests::close_listener(listener).await;
         });
-        let mut cfg = config();
-        cfg.base.shm_backing_budget_bytes = 0;
-        let mut client = IpcClient::with_endpoint(endpoint.endpoint.clone(), cfg).unwrap();
+        let mut client = IpcClient::with_endpoint_and_budget(
+            endpoint.endpoint.clone(),
+            crate::tests::memory_budget(1024),
+        )
+        .unwrap();
         client.connect().await.unwrap();
         let conn = client.driver.read().clone().unwrap();
         let (loan, _pool, budget) = publish_file_loan(&conn, endpoint._root.path());
@@ -1584,11 +1580,11 @@ async fn framed_response_faults_remain_uncertain_and_still_settle_release_record
             !matches!(fault, FramedFault::ZeroLoan | FramedFault::UnnegotiatedShm),
             "{fault:?}"
         );
-        assert!(budget.snapshot().file.used_bytes > 0);
+        assert!(budget.snapshot().file_spill.used_bytes > 0);
         loan_sent.send(loan).unwrap();
-        eventually(|| budget.snapshot().file.used_bytes == 0).await;
+        eventually(|| budget.snapshot().file_spill.used_bytes == 0).await;
         assert!(client.close_shared_bounded(WAIT).await);
-        assert_eq!(client.memory_budget.snapshot().reassembly.used_bytes, 0);
+        assert_eq!(client.domain_snapshot().memory.used_bytes, 0);
         assert_eq!(
             client
                 .connection_observation()
@@ -1629,7 +1625,7 @@ async fn materialization_failure_is_uncertain_and_refunds_local_backing_once() {
         async move { client.call_inline(&identity(), 0, b"other").await }
     });
     request_sent.await.unwrap();
-    let budget = c2_mem::MemoryBudget::new(0, 1024 * 1024, 1024 * 1024);
+    let budget = crate::tests::memory_budget(1024);
     let pool = Arc::new(RwLock::new(
         MemPool::new_with_prefix_and_budget(
             c2_mem::PoolConfig {
@@ -1649,8 +1645,8 @@ async fn materialization_failure_is_uncertain_and_refunds_local_backing_once() {
         crate::sync_client::call_error_phase(&error),
         crate::TransportPhase::DispatchUncertain
     );
-    assert_eq!(budget.snapshot().reassembly.used_bytes, 0);
-    assert_eq!(budget.snapshot().file.used_bytes, 0);
+    assert_eq!(budget.snapshot().memory.used_bytes, 0);
+    assert_eq!(budget.snapshot().file_spill.used_bytes, 0);
     assert!(client.is_connected());
     assert_eq!(client.pending_len_for_test(), 1);
     assert!(!other.is_finished());
@@ -1687,12 +1683,11 @@ async fn abandoned_waiter_keeps_partial_reply_storage_until_peer_end() {
         drop(stream);
         crate::tests::close_listener(listener).await;
     });
-    let mut cfg = config();
-    cfg.base.shm_backing_budget_bytes = 0;
-    cfg.base.chunk_gc_interval_secs = 0.01;
-    cfg.base.chunk_assembler_timeout_secs = 0.05;
-    cfg.pool_decay_seconds = 0.01;
-    let mut client = IpcClient::with_endpoint(endpoint.endpoint.clone(), cfg).unwrap();
+    let mut client = IpcClient::with_endpoint_and_budget(
+        endpoint.endpoint.clone(),
+        crate::tests::memory_budget(1024),
+    )
+    .unwrap();
     client.connect().await.unwrap();
     let registry = client.chunk_registry.lock().clone().unwrap();
     let weak = Arc::downgrade(registry.pool());
@@ -1702,19 +1697,19 @@ async fn abandoned_waiter_keeps_partial_reply_storage_until_peer_end() {
         let client = client.clone();
         async move { client.call_inline(&identity(), 0, b"partial").await }
     });
-    eventually(|| client.memory_budget.snapshot().file.used_bytes > 0).await;
-    assert!(client.memory_budget.snapshot().reassembly.used_bytes > 0);
+    eventually(|| client.domain_snapshot().file_spill.used_bytes > 0).await;
+    assert_eq!(client.domain_snapshot().memory.used_bytes, 2);
     caller.abort();
     let _ = caller.await;
     assert_eq!(client.pending_len_for_test(), 1);
-    assert!(client.memory_budget.snapshot().file.used_bytes > 0);
-    assert!(client.memory_budget.snapshot().reassembly.used_bytes > 0);
+    assert!(client.domain_snapshot().file_spill.used_bytes > 0);
+    assert_eq!(client.domain_snapshot().memory.used_bytes, 2);
     end_peer.send(()).unwrap();
     peer.await.unwrap();
     eventually(|| client.pending_len_for_test() == 0).await;
     assert!(client.close_shared_bounded(WAIT).await);
-    assert_eq!(client.memory_budget.snapshot().file.used_bytes, 0);
-    assert_eq!(client.memory_budget.snapshot().reassembly.used_bytes, 0);
+    assert_eq!(client.domain_snapshot().file_spill.used_bytes, 0);
+    assert_eq!(client.domain_snapshot().memory.used_bytes, 0);
     eventually(|| weak.upgrade().is_none()).await;
 }
 
@@ -1757,4 +1752,165 @@ async fn inline_unary_has_one_rpc_record_in_each_direction() {
     assert_eq!(result.into_owned_bytes().unwrap(), vec![42]);
     assert!(client.close_shared_bounded(WAIT).await);
     peer.await.unwrap();
+}
+
+#[tokio::test]
+async fn frame_caps_are_checked_before_reading_the_payload() {
+    let mut oversized_handshake = [0; HEADER_SIZE];
+    oversized_handshake[..4].copy_from_slice(&(MAX_HANDSHAKE_FRAME_BYTES as u32 + 1).to_le_bytes());
+    oversized_handshake[12..]
+        .copy_from_slice(&(flags::FLAG_HANDSHAKE | flags::FLAG_RESPONSE).to_le_bytes());
+    expect_fake_peer_handshake_error(
+        encode_version_preamble(VersionPreambleKind::Accepted),
+        Some(oversized_handshake.to_vec()),
+        None,
+    )
+    .await;
+
+    for (control, active, limit) in [
+        (false, false, MAX_RPC_FRAME_BYTES),
+        (true, false, MAX_RPC_FRAME_BYTES),
+        (true, true, MAX_HANDSHAKE_FRAME_BYTES),
+    ] {
+        let endpoint = Endpoint::new();
+        let mut listener = LocalListener::bind(&endpoint.endpoint).unwrap();
+        let peer = tokio::spawn(async move {
+            let mut stream = accept(&mut listener).await;
+            let (request, _) = read_frame(&mut stream).await;
+            let response_flags = flags::FLAG_RESPONSE
+                | if control {
+                    flags::FLAG_CTRL
+                } else {
+                    flags::FLAG_RPC_RECORD
+                };
+            let response_id = request.request_id + u64::from(control && !active);
+            let mut header = Vec::new();
+            header.extend((limit as u32 + 1).to_le_bytes());
+            header.extend(response_id.to_le_bytes());
+            header.extend(response_flags.to_le_bytes());
+            write_malformed_reply(&mut stream, &header).await;
+            expect_disconnect_or_eof(&mut stream).await;
+            crate::tests::close_listener(listener).await;
+        });
+        let mut client = endpoint.client();
+        client.connect().await.unwrap();
+        let observation = client.connection_observation().unwrap();
+        if control {
+            assert!(
+                timeout(WAIT, client.rebuild_route_catalog())
+                    .await
+                    .unwrap()
+                    .is_err()
+            );
+        } else {
+            assert!(
+                timeout(WAIT, client.call_inline(&identity(), 0, b"request"))
+                    .await
+                    .unwrap()
+                    .is_err()
+            );
+        }
+        let closed = observation.wait_closed(Some(WAIT)).await.unwrap();
+        assert_eq!(closed.operation(), "response_frame_size");
+        peer.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn route_catalog_control_reply_can_exceed_the_business_frame_cap() {
+    let endpoint = Endpoint::new();
+    let server =
+        Arc::new(Server::new_with_endpoint(endpoint.endpoint.clone(), Default::default()).unwrap());
+    for route in 0..c2_wire::handshake::MAX_ROUTES {
+        let id = contract();
+        let built = server
+            .build_route(
+                RouteBuildSpec {
+                    name: format!("grid_{route}"),
+                    crm_ns: id.crm_ns,
+                    crm_name: id.crm_name,
+                    crm_ver: id.crm_ver,
+                    abi_hash: id.abi_hash,
+                    signature_hash: id.signature_hash,
+                    method_names: (0..c2_wire::handshake::MAX_METHODS)
+                        .map(|method| format!("method_{method}_{}", "a".repeat(100)))
+                        .collect(),
+                    access_map: HashMap::new(),
+                    concurrency_mode: ConcurrencyMode::Parallel,
+                    limits: SchedulerLimits::default(),
+                },
+                Arc::new(Echo),
+            )
+            .unwrap();
+        let reservation = server.reserve_route(built).await.unwrap();
+        server.commit_reserved_route(reservation).await.unwrap();
+    }
+    let runner = tokio::spawn({
+        let server = server.clone();
+        async move { server.run().await.unwrap() }
+    });
+    server.wait_until_ready(WAIT).await.unwrap();
+    let mut client = endpoint.client();
+    client.connect().await.unwrap();
+    client.rebuild_route_catalog().await.unwrap();
+    assert_eq!(client.route_names().len(), c2_wire::handshake::MAX_ROUTES);
+    let mut expected = contract();
+    expected.route_name = "grid_63".to_owned();
+    let binding = client.acquire_route(&expected).await.unwrap();
+    let method = format!("method_255_{}", "a".repeat(100));
+    let response = client
+        .call_bound(&binding, &method, b"healthy")
+        .await
+        .unwrap();
+    assert_eq!(response.into_owned_bytes().unwrap(), b"healthy");
+    client.close().await;
+    stop(server, runner).await;
+}
+
+#[tokio::test]
+async fn oversized_business_error_preserves_concurrent_calls_on_the_connection() {
+    struct LargeError;
+    impl CrmCallback for LargeError {
+        fn invoke(
+            &self,
+            _: &str,
+            _: u16,
+            data: Vec<u8>,
+            _: Arc<c2_server::ResponsePool>,
+        ) -> Result<ResponseMeta, CrmError> {
+            if data == b"fail" {
+                return Err(CrmError::UserError(
+                    C2Error::new(
+                        ErrorCode::ResourceFunctionExecuting,
+                        "例".repeat(MAX_RPC_FRAME_BYTES as usize),
+                    )
+                    .to_wire_bytes(),
+                ));
+            }
+            Ok(ResponseMeta::Inline(data))
+        }
+    }
+    let endpoint = Endpoint::new();
+    let (server, runner) = start(&endpoint, Arc::new(LargeError), Default::default()).await;
+    let mut client = endpoint.client();
+    client.connect().await.unwrap();
+    let binding = client.acquire_route(&contract()).await.unwrap();
+    let (failed, healthy) = timeout(WAIT, async {
+        tokio::join!(
+            client.call_bound(&binding, "echo", b"fail"),
+            client.call_bound(&binding, "echo", b"healthy")
+        )
+    })
+    .await
+    .unwrap();
+    let IpcError::CrmError(bytes) = failed.unwrap_err() else {
+        panic!("expected original CRM error")
+    };
+    let error = C2Error::from_wire_bytes(&bytes).unwrap().unwrap();
+    assert_eq!(error.code, ErrorCode::ResourceFunctionExecuting);
+    assert_eq!(error.details["truncated"], "true");
+    assert_eq!(healthy.unwrap().into_owned_bytes().unwrap(), b"healthy");
+    assert!(client.is_connected());
+    client.close().await;
+    stop(server, runner).await;
 }

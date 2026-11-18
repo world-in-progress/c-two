@@ -1,4 +1,6 @@
 use super::*;
+use tokio::time::timeout;
+
 use crate::dispatcher::{CrmStream, CrmStreamItem};
 use crate::test_support::isolated_pair;
 use c2_contract::ValidatedContractDescriptor;
@@ -34,11 +36,27 @@ struct Observed {
     finished: AtomicUsize,
     item_bytes: AtomicUsize,
     encoded_ranges: std::sync::Mutex<Vec<(usize, usize)>>,
+    encoding_gate: std::sync::Mutex<Option<Arc<EncodingGate>>>,
     step_entered: std::sync::Mutex<Option<oneshot::Sender<()>>>,
     release_step: std::sync::Mutex<Option<mpsc::Receiver<()>>>,
     unary_entered: std::sync::Mutex<Option<oneshot::Sender<()>>>,
     release_unary: std::sync::Mutex<Option<mpsc::Receiver<()>>>,
     finish_entered: std::sync::Mutex<Option<oneshot::Sender<()>>>,
+}
+
+struct EncodingGate {
+    entered: tokio::sync::mpsc::UnboundedSender<()>,
+    released: tokio::sync::watch::Receiver<bool>,
+}
+
+impl EncodingGate {
+    fn wait(&self) {
+        self.entered.send(()).unwrap();
+        let mut released = self.released.clone();
+        if !*released.borrow() {
+            let _ = futures_executor::block_on(released.changed());
+        }
+    }
 }
 
 impl CrmStream for CounterStream {
@@ -104,6 +122,10 @@ impl CrmStreamItem for CounterItem {
             .lock()
             .unwrap()
             .push((offset, destination.len()));
+        let gate = self.observed.encoding_gate.lock().unwrap().clone();
+        if let Some(gate) = gate {
+            gate.wait();
+        }
         destination.copy_from_slice(&self.data[offset..offset + destination.len()]);
         Ok(())
     }
@@ -112,21 +134,19 @@ impl CrmStreamItem for CounterItem {
 #[tokio::test]
 async fn inline_encodes_each_granted_chunk_directly_from_the_domain_item() {
     let observed = Arc::new(Observed::default());
-    let mut config = ServerIpcConfig::default();
-    config.base.chunk_size = 2;
-    let mut harness = Harness::start(observed.clone(), config, 0).await;
+    let mut harness = Harness::start(observed.clone(), ServerIpcConfig::default(), 0).await;
     harness.open(1, &[1]).await;
     assert!(matches!(
         read_record(&mut harness.peer, CallMode::ServerStream).await,
         SeenRecord::Begin(4)
     ));
     assert!(observed.encoded_ranges.lock().unwrap().is_empty());
-    harness
-        .peer
-        .write_all(&rpc::encode_credit_frame(1, 4, 0).unwrap())
-        .await
-        .unwrap();
     for _ in 0..2 {
+        harness
+            .peer
+            .write_all(&rpc::encode_credit_frame(1, 2, 0).unwrap())
+            .await
+            .unwrap();
         assert!(matches!(
             read_record(&mut harness.peer, CallMode::ServerStream).await,
             SeenRecord::Data(data) if data == [0; 2]
@@ -461,18 +481,48 @@ struct Harness {
 
 impl Harness {
     async fn start(observed: Arc<Observed>, config: ServerIpcConfig, capabilities: u16) -> Self {
+        Self::start_with_timeout(observed, config, capabilities, c2_config::WRITE_TIMEOUT).await
+    }
+
+    async fn start_with_timeout(
+        observed: Arc<Observed>,
+        config: ServerIpcConfig,
+        capabilities: u16,
+        write_timeout: Duration,
+    ) -> Self {
+        Self::start_with_limits(
+            observed,
+            config,
+            capabilities,
+            write_timeout,
+            DomainLimits::default(),
+        )
+        .await
+    }
+
+    async fn start_with_limits(
+        observed: Arc<Observed>,
+        config: ServerIpcConfig,
+        capabilities: u16,
+        write_timeout: Duration,
+        limits: DomainLimits,
+    ) -> Self {
         let descriptor = ValidatedContractDescriptor::from_json(STREAM_DESCRIPTOR).unwrap();
-        let server = Server::new_with_endpoint(
+        let server_id = format!("stream-test-{}", uuid::Uuid::new_v4().simple());
+        let mut server = Server::new_with_identity_endpoint_and_budget(
             c2_config::LocalEndpointContext::default_for_platform()
                 .unwrap()
-                .endpoint(&format!(
-                    "ipc://stream-test-{}",
-                    uuid::Uuid::new_v4().simple()
-                ))
+                .endpoint(&format!("ipc://{server_id}"))
                 .unwrap(),
             config,
+            ServerIdentity {
+                server_id,
+                server_instance_id: uuid::Uuid::new_v4().simple().to_string(),
+            },
+            DomainBudget::from_limits(&limits),
         )
         .unwrap();
+        server.test_write_timeout = write_timeout;
         let server = Arc::new(server);
         let built = server
             .build_stream_route(
@@ -1204,10 +1254,11 @@ async fn cleanup_error_takes_priority_over_cancellation() {
 
 #[tokio::test]
 async fn stream_item_can_use_real_shm_carrier() {
+    let observed = Arc::new(Observed::default());
+    observed.item_bytes.store(32 * 1024, Ordering::SeqCst);
     let mut harness = Harness::start(
-        Arc::new(Observed::default()),
+        observed,
         ServerIpcConfig {
-            shm_threshold: 1,
             ..ServerIpcConfig::default()
         },
         CAP_SHM_RESPONSE,
@@ -1216,7 +1267,7 @@ async fn stream_item_can_use_real_shm_carrier() {
     harness.open(1, &[1]).await;
     assert!(matches!(
         read_record(&mut harness.peer, CallMode::ServerStream).await,
-        SeenRecord::Begin(4)
+        SeenRecord::Begin(32768)
     ));
     harness
         .peer
@@ -1224,7 +1275,7 @@ async fn stream_item_can_use_real_shm_carrier() {
         .await
         .unwrap();
     match read_record(&mut harness.peer, CallMode::ServerStream).await {
-        SeenRecord::ShmData(descriptor) => assert_eq!(descriptor.data_size, 4),
+        SeenRecord::ShmData(descriptor) => assert_eq!(descriptor.data_size, 32768),
         other => panic!("expected SHM ITEM_DATA, got {other:?}"),
     }
     harness
@@ -1307,11 +1358,9 @@ async fn item_write_timeout_preserves_terminal_while_another_stream_keeps_connec
     const SIZE: usize = 8 * 1024 * 1024;
     let observed = Arc::new(Observed::default());
     observed.item_bytes.store(SIZE, Ordering::SeqCst);
-    let mut config = ServerIpcConfig::default();
-    config.base.write_timeout_secs = 0.01;
-    config.base.chunk_size = SIZE as u64;
-    config.max_frame_size = SIZE as u64 + 1024;
-    let mut harness = Harness::start(observed.clone(), config, 0).await;
+    let config = ServerIpcConfig::default();
+    let mut harness =
+        Harness::start_with_timeout(observed.clone(), config, 0, Duration::from_millis(50)).await;
     harness.open(1, &[1]).await;
     assert!(matches!(
         read_record(&mut harness.peer, CallMode::ServerStream).await,
@@ -1342,10 +1391,12 @@ async fn item_write_timeout_preserves_terminal_while_another_stream_keeps_connec
     .unwrap();
     assert!(!conn.is_work_cancelled());
     assert!(conn.core.stream_state(2).is_some());
-    assert!(matches!(
-        read_record(&mut harness.peer, CallMode::ServerStream).await,
-        SeenRecord::Data(data) if data == vec![0; SIZE]
-    ));
+    for _ in 0..SIZE / c2_config::CHUNK_SIZE as usize {
+        assert!(matches!(
+            read_record(&mut harness.peer, CallMode::ServerStream).await,
+            SeenRecord::Data(data) if data == vec![0; c2_config::CHUNK_SIZE as usize]
+        ));
+    }
     harness
         .peer
         .write_all(&rpc::encode_credit_frame(1, 0, 1).unwrap())
@@ -1601,4 +1652,162 @@ async fn unknown_open_mode_and_cancel_cause_deactivate_but_preserve_dispatched_c
         assert_eq!(observed.entries.load(Ordering::SeqCst), 1);
         harness.stop().await;
     }
+}
+
+#[tokio::test]
+async fn zero_memory_refuses_empty_stream_before_call_publication() {
+    let observed = Arc::new(Observed::default());
+    let mut harness = Harness::start_with_limits(
+        observed.clone(),
+        Default::default(),
+        0,
+        c2_config::WRITE_TIMEOUT,
+        DomainLimits {
+            memory_budget_bytes: 0,
+            file_spill_budget_bytes: 4096,
+            max_outstanding_calls: 0,
+        },
+    )
+    .await;
+    harness.open(1, &[]).await;
+    assert!(matches!(
+        read_record(&mut harness.peer, CallMode::ServerStream).await,
+        SeenRecord::End(
+            CallStatus::NotExecuted,
+            None,
+            Some(ErrorCode::CallCapacityExceeded)
+        )
+    ));
+    let conn = harness
+        .server
+        .active_connection(harness.server.active_connection_ids()[0])
+        .unwrap();
+    assert_eq!(conn.calls.lock().active().count(), 0);
+    assert!(matches!(
+        conn.calls.lock().continuation(1),
+        CallLookup::Retired
+    ));
+    assert!(conn.core.stream_state(1).is_none());
+    assert_eq!(observed.entries.load(Ordering::SeqCst), 0);
+    harness.stop().await;
+}
+
+#[test]
+fn resource_and_encoding_slots_do_not_starve_chunk_copy_or_stream_cleanup() {
+    let config = ServerIpcConfig {
+        max_execution_workers: 1,
+        ..Default::default()
+    };
+    let runtime = crate::ServerRuntimeBuilder::build(&config).unwrap();
+    runtime.block_on(async {
+        let observed = Arc::new(Observed::default());
+        let (entered, mut encodings) = tokio::sync::mpsc::unbounded_channel();
+        let (release_encodings, released) = tokio::sync::watch::channel(false);
+        let gate = Arc::new(EncodingGate { entered, released });
+        *observed.encoding_gate.lock().unwrap() = Some(gate.clone());
+        let mut harness = Harness::start(observed.clone(), config, 0).await;
+        let server = harness.server.clone();
+        let conn = server
+            .active_connection(server.active_connection_ids()[0])
+            .unwrap();
+        let count = server.encoding_permits.available_permits() as u64;
+        for id in 1..=count {
+            harness.open(id, &[1]).await;
+            assert!(matches!(
+                read_record(&mut harness.peer, CallMode::ServerStream).await,
+                SeenRecord::Begin(4)
+            ));
+            harness
+                .peer
+                .write_all(&rpc::encode_credit_frame(id, 4, 0).unwrap())
+                .await
+                .unwrap();
+            timeout(Duration::from_secs(5), encodings.recv())
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        assert_eq!(server.encoding_permits.available_permits(), 0);
+
+        let (entered, busy) = oneshot::channel();
+        let (release, released) = mpsc::channel();
+        *observed.unary_entered.lock().unwrap() = Some(entered);
+        *observed.release_unary.lock().unwrap() = Some(released);
+        let busy_id = count + 1;
+        let chunk_id = count + 2;
+        harness
+            .peer
+            .write_all(
+                &rpc::encode_open_frame(
+                    busy_id,
+                    &harness.identity,
+                    0,
+                    CallMode::Unary,
+                    ValuePart::whole(ValueStorage::Inline(b"busy")),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        timeout(Duration::from_secs(5), busy)
+            .await
+            .unwrap()
+            .unwrap();
+        harness
+            .peer
+            .write_all(
+                &rpc::encode_open_frame(
+                    chunk_id,
+                    &harness.identity,
+                    0,
+                    CallMode::Unary,
+                    ValuePart::first(4, ValueStorage::Inline(b"x")),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        for byte in b"yzw" {
+            let part = rpc::encode_value_continuation_frame(
+                chunk_id,
+                RpcRecordKind::Open,
+                ValueStorage::Inline(std::slice::from_ref(byte)),
+            )
+            .unwrap();
+            harness.peer.write_all(&part).await.unwrap();
+        }
+        let assembled = timeout(Duration::from_secs(5), async {
+            loop {
+                if conn
+                    .calls
+                    .lock()
+                    .get(chunk_id)
+                    .is_some_and(|call| !call.is_preparing_input())
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        release.send(()).unwrap();
+        assembled.expect("chunk copies must finish while W and E are both occupied");
+        for _ in 0..2 {
+            assert!(matches!(
+                read_record(&mut harness.peer, CallMode::Unary).await,
+                SeenRecord::End(CallStatus::Success, None, None)
+            ));
+        }
+
+        harness.open(count + 3, &[0]).await;
+        assert!(matches!(
+            read_record(&mut harness.peer, CallMode::ServerStream).await,
+            SeenRecord::End(CallStatus::Success, Some(0), None)
+        ));
+        assert_eq!(observed.finished.load(Ordering::SeqCst), 1);
+        release_encodings.send_replace(true);
+        timeout(Duration::from_secs(5), harness.stop())
+            .await
+            .unwrap();
+    });
 }

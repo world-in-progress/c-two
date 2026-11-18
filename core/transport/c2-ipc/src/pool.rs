@@ -1,118 +1,16 @@
 //! Cache of business references. Each native connection independently owns
 //! its writer, loans and deactivation; cache eviction only stops admission.
-use crate::client::{ClientIpcConfig, IpcError};
+use crate::client::IpcError;
 use crate::sync_client::SyncClient;
-use c2_config::{ConnectDeadline, LocalEndpointContext, MemoryBudgetLimits};
+use c2_config::{ConnectDeadline, DomainLimits, IDLE_CONNECTION_TIMEOUT, LocalEndpointContext};
 use c2_local::ConnectionObservation;
-use c2_mem::{MemPool, PoolConfig};
+use c2_mem::{DomainBudget, DomainSnapshot, MemPool};
 use parking_lot::{Condvar, Mutex, RwLock};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 static CLIENT_POOL_GEN: AtomicU64 = AtomicU64::new(0);
-pub(crate) fn pool_config_from_client_config(cfg: &ClientIpcConfig) -> PoolConfig {
-    // Centralized projection: the pooled-client acquire path must follow the
-    // same buddy policy and client idle window as `with_config`. A disabled
-    // buddy pool is still a real `MemPool` — it keeps serving dedicated SHM
-    // requests and the wire prefix, only the buddy tiers are policy-disabled.
-    cfg.base.primary_pool_config(&cfg.pool_tuning())
-}
-
-/// Structured rejection for a configuration whose memory-budget limits
-/// diverge from an already-frozen domain context.
-fn budget_limits_mismatch(
-    frozen: &MemoryBudgetLimits,
-    requested: &MemoryBudgetLimits,
-    scope: &str,
-) -> IpcError {
-    IpcError::Pool(format!(
-        "client pool memory budget frozen at shm={}, file={}, reassembly={}; refusing {scope} \
-         configuration with divergent limits shm={}, file={}, reassembly={}",
-        frozen.shm_backing_budget_bytes,
-        frozen.file_backing_budget_bytes,
-        frozen.live_reassembly_budget_bytes,
-        requested.shm_backing_budget_bytes,
-        requested.file_backing_budget_bytes,
-        requested.live_reassembly_budget_bytes,
-    ))
-}
-
-/// Structured rejection for a same-address cache hit whose requested resolved
-/// client policy differs from the cached connection's policy.
-///
-/// Budget limits can be equal while transfer behavior still differs (buddy
-/// policy, prewarm, SHM threshold, chunking, reassembly geometry), so the
-/// cache must not silently reuse a connection built from a different resolved
-/// `ClientIpcConfig`. The cached entry is left untouched: existing callers
-/// keep their connection and the caller with the divergent policy gets a
-/// deterministic error instead of a wrong-policy client.
-fn client_policy_mismatch(
-    address: &str,
-    cached: &ClientIpcConfig,
-    requested: &ClientIpcConfig,
-) -> IpcError {
-    let differing = differing_client_policy_fields(cached, requested);
-    IpcError::Pool(format!(
-        "client cache at {address} already holds a connection created from a different resolved \
-         client policy; refusing to reuse it for a divergent configuration (differing fields: \
-         {}). Close the cached connection and reacquire, or request the identical resolved policy.",
-        differing.join(", ")
-    ))
-}
-
-/// Names of the resolved client-policy fields that differ between two configs.
-///
-/// Used in the rejection message so the caller can see exactly which policy
-/// knob changed instead of guessing from a truncated dump.
-fn differing_client_policy_fields(
-    cached: &ClientIpcConfig,
-    requested: &ClientIpcConfig,
-) -> Vec<&'static str> {
-    let mut differing = Vec::new();
-    macro_rules! compare {
-        ($cached:expr, $requested:expr; $($field:ident),+ $(,)?) => {
-            $(if $cached.$field != $requested.$field {
-                differing.push(stringify!($field));
-            })+
-        };
-    }
-    compare!(cached.base, requested.base;
-        pool_enabled,
-        pool_segment_size,
-        max_pool_segments,
-        pool_prewarm_segments,
-        pool_min_retained_segments,
-        reassembly_segment_size,
-        reassembly_max_segments,
-        max_inflight_chunk_frames,
-        chunk_gc_interval_secs,
-        chunk_threshold_ratio,
-        chunk_assembler_timeout_secs,
-        max_reassembly_bytes,
-        chunk_size,
-        shm_backing_budget_bytes,
-        file_backing_budget_bytes,
-        live_reassembly_budget_bytes,
-    );
-    compare!(cached, requested; shm_threshold, pool_decay_seconds, client_idle_timeout_secs);
-    if differing.is_empty() {
-        differing.push("none");
-    }
-    differing
-}
-
-/// Read-only snapshot of a [`ClientPool`]'s shared client memory context.
-///
-/// The pool reports `None` until the first connection attempt freezes the
-/// domain; observing the snapshot never creates the context or connects.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ClientCacheMemorySnapshot {
-    /// Limits the domain budget enforces; frozen at the first attempt.
-    pub limits: MemoryBudgetLimits,
-    /// Consistent view of the three budget cells.
-    pub budget: c2_mem::BudgetSnapshot,
-}
 
 fn connect_lock<'a, T>(
     mutex: &'a Mutex<T>,
@@ -421,14 +319,12 @@ struct CacheState {
     connecting: HashMap<String, Weak<PendingConnection>>,
     epoch: Option<u64>,
     draining: bool,
-    budget: Option<c2_mem::MemoryBudget>,
     records: HashMap<u64, Arc<CloseRecord>>,
     next_record: u64,
 }
 
 struct PendingConnection {
     epoch: u64,
-    config: ClientIpcConfig,
     references: Arc<PoolReferences>,
     result: Mutex<Option<Result<Arc<SyncClient>, IpcError>>>,
     changed: Condvar,
@@ -514,8 +410,8 @@ pub struct ClientPool {
     connection_event_source: Option<c2_local::ConnectionEventSource>,
     state: Arc<Mutex<CacheState>>,
     grace_period: Option<Duration>,
+    budget: DomainBudget,
     sweeper: Mutex<Option<tokio::task::JoinHandle<()>>>,
-    default_config: Mutex<Option<ClientIpcConfig>>,
     drain_gate: Mutex<()>,
 }
 
@@ -567,27 +463,68 @@ impl ClientCloseObservation<'_> {
 }
 
 impl ClientPool {
-    /// Retain unreferenced clients for this duration. None disables timed
-    /// eviction; an explicit zero duration makes them expire immediately.
-    pub fn new(grace_period: impl Into<Option<Duration>>) -> Self {
-        Self::from_endpoint_context(
-            grace_period.into(),
+    /// A cache over this platform's default endpoint context with the fixed
+    /// idle reaping window and a default role-domain budget.
+    pub fn new() -> Self {
+        Self::from_parts(
+            Some(IDLE_CONNECTION_TIMEOUT),
             LocalEndpointContext::default_for_platform().map_err(|error| error.to_string()),
+            DomainBudget::from_limits(&DomainLimits::default()),
         )
     }
-    pub fn with_endpoint_context(
-        grace_period: impl Into<Option<Duration>>,
+    /// A cache over an explicit endpoint context with the fixed idle reaping
+    /// window and a default role-domain budget.
+    pub fn with_endpoint_context(context: LocalEndpointContext) -> Self {
+        Self::from_parts(
+            Some(IDLE_CONNECTION_TIMEOUT),
+            Ok(context),
+            DomainBudget::from_limits(&DomainLimits::default()),
+        )
+    }
+    /// Create a cache with its own role-domain budget from explicit limits.
+    pub fn with_endpoint_context_and_limits(
+        context: LocalEndpointContext,
+        limits: DomainLimits,
+    ) -> Result<Self, IpcError> {
+        limits
+            .validate()
+            .map_err(|error| IpcError::Config(error.to_string()))?;
+        Ok(Self::with_endpoint_context_and_budget(
+            context,
+            DomainBudget::from_limits(&limits),
+        ))
+    }
+
+    /// A cache over an explicit endpoint context whose every connection
+    /// charges the caller's shared domain budget. The budget is frozen here
+    /// and never re-created per attempt.
+    pub fn with_endpoint_context_and_budget(
+        context: LocalEndpointContext,
+        budget: DomainBudget,
+    ) -> Self {
+        Self::from_parts(Some(IDLE_CONNECTION_TIMEOUT), Ok(context), budget)
+    }
+    /// Test-only cache with an explicit idle window (for millisecond-level
+    /// reaping checks). Production callers use the 60-second default.
+    #[cfg(test)]
+    pub(crate) fn with_grace_period_and_context(
+        grace_period: Option<Duration>,
         context: LocalEndpointContext,
     ) -> Self {
-        Self::from_endpoint_context(grace_period.into(), Ok(context))
+        Self::from_parts(
+            grace_period,
+            Ok(context),
+            DomainBudget::from_limits(&DomainLimits::default()),
+        )
     }
     pub fn with_connection_event_source(mut self, source: c2_local::ConnectionEventSource) -> Self {
         self.connection_event_source = Some(source);
         self
     }
-    fn from_endpoint_context(
+    fn from_parts(
         grace_period: Option<Duration>,
         endpoint_context: Result<LocalEndpointContext, String>,
+        budget: DomainBudget,
     ) -> Self {
         Self {
             endpoint_context,
@@ -597,48 +534,41 @@ impl ClientPool {
                 connecting: HashMap::new(),
                 epoch: Some(0),
                 draining: false,
-                budget: None,
                 records: HashMap::new(),
                 next_record: 0,
             })),
             grace_period,
+            budget,
             sweeper: Mutex::new(None),
-            default_config: Mutex::new(None),
             drain_gate: Mutex::new(()),
         }
     }
+    /// The frozen role-domain budget every pooled connection charges.
+    pub fn domain_budget(&self) -> &DomainBudget {
+        &self.budget
+    }
+
+    /// Consistent read-only accounting snapshot of the pool's domain.
+    pub fn domain_snapshot(&self) -> DomainSnapshot {
+        self.budget.snapshot()
+    }
+
     /// A foreign endpoint owns its own physical connections while sharing this
-    /// factory's backing budget. Its retirement cannot seal another endpoint.
+    /// factory's frozen backing budget. Its retirement cannot seal another endpoint.
     #[doc(hidden)]
-    pub fn fork_endpoint_scope(
-        &self,
-        config: &ClientIpcConfig,
-        deadline: ConnectDeadline,
-    ) -> Result<Self, IpcError> {
-        let budget = {
-            let mut state = connect_lock(&self.state, deadline, "pool_scope_wait")?;
+    pub fn fork_endpoint_scope(&self, deadline: ConnectDeadline) -> Result<Self, IpcError> {
+        {
+            let state = connect_lock(&self.state, deadline, "pool_scope_wait")?;
             if state.epoch.is_none() {
                 return Err(IpcError::PoolRetired);
             }
-            let requested = config.memory_budget_limits();
-            let budget = state
-                .budget
-                .get_or_insert_with(|| c2_mem::MemoryBudget::from_limits(&requested))
-                .clone();
-            if budget.limits() != requested {
-                return Err(budget_limits_mismatch(
-                    &budget.limits(),
-                    &requested,
-                    "cache domain",
-                ));
-            }
-            budget
-        };
-        let mut scoped =
-            Self::with_endpoint_context(self.grace_period, self.endpoint_context()?.clone());
+        }
+        let mut scoped = Self::from_parts(
+            self.grace_period,
+            Ok(self.endpoint_context()?.clone()),
+            self.budget.clone(),
+        );
         scoped.connection_event_source = self.connection_event_source.clone();
-        scoped.state.lock().budget = Some(budget);
-        *scoped.default_config.lock() = Some(config.clone());
         Ok(scoped)
     }
 
@@ -682,59 +612,23 @@ impl ClientPool {
             .as_ref()
             .map_err(|error| IpcError::Config(error.clone()))
     }
-    pub fn set_default_config(&self, config: ClientIpcConfig) -> Result<(), IpcError> {
-        let state = self.state.lock();
-        if let Some(budget) = state.budget.as_ref() {
-            let limits = budget.limits();
-            let requested = config.memory_budget_limits();
-            if limits != requested {
-                return Err(budget_limits_mismatch(&limits, &requested, "cache default"));
-            }
-        }
-        *self.default_config.lock() = Some(config);
-        Ok(())
-    }
-    pub fn memory_budget_snapshot(&self) -> Option<ClientCacheMemorySnapshot> {
-        self.state
-            .lock()
-            .budget
-            .as_ref()
-            .map(|budget| ClientCacheMemorySnapshot {
-                limits: budget.limits(),
-                budget: budget.snapshot(),
-            })
-    }
-    pub fn memory_budget_observer(&self) -> Option<c2_mem::BudgetObserver> {
-        self.state
-            .lock()
-            .budget
-            .clone()
-            .map(c2_mem::BudgetObserver::new)
-    }
-    pub fn acquire(
-        &self,
-        address: &str,
-        config: Option<&ClientIpcConfig>,
-    ) -> Result<Arc<SyncClient>, IpcError> {
-        self.acquire_with_deadline(address, config, ConnectDeadline::default())
+    pub fn acquire(&self, address: &str) -> Result<Arc<SyncClient>, IpcError> {
+        self.acquire_with_deadline(address, ConnectDeadline::default())
     }
     pub fn acquire_with_deadline(
         &self,
         address: &str,
-        config: Option<&ClientIpcConfig>,
         deadline: ConnectDeadline,
     ) -> Result<Arc<SyncClient>, IpcError> {
-        self.acquire_lease_with_deadline(address, config, deadline)
+        self.acquire_lease_with_deadline(address, deadline)
             .map(ClientLease::into_client)
     }
     pub fn acquire_lease_with_deadline(
         &self,
         address: &str,
-        config: Option<&ClientIpcConfig>,
         deadline: ConnectDeadline,
     ) -> Result<ClientLease, IpcError> {
         let epoch;
-        let cfg;
         let budget;
         let fresh;
         let pending;
@@ -748,26 +642,12 @@ impl ClientPool {
             state
                 .connecting
                 .retain(|_, pending| pending.strong_count() != 0);
-            cfg = match config {
-                Some(config) => config.clone(),
-                None => connect_lock(&self.default_config, deadline, "pool_config_wait")?
-                    .clone()
-                    .unwrap_or_default(),
-            };
-            let requested = cfg.memory_budget_limits();
-            budget = state
-                .budget
-                .get_or_insert_with(|| c2_mem::MemoryBudget::from_limits(&requested))
-                .clone();
-            let limits = budget.limits();
-            if limits != requested {
-                return Err(budget_limits_mismatch(&limits, &requested, "cache domain"));
-            }
+            // Transport parameters are fixed constants now, so a same-endpoint
+            // cache hit is accepted without any per-config policy comparison.
+            // The frozen budget below is the only shared capacity authority.
+            budget = self.budget.clone();
             if let Some(entry) = state.entries.get(address) {
                 if entry.client.is_connected() && !entry.references.expired(self.grace_period) {
-                    if entry.client.config() != &cfg {
-                        return Err(client_policy_mismatch(address, entry.client.config(), &cfg));
-                    }
                     return Ok(
                         PoolReference::acquire(&entry.references).into_lease(entry.client.clone())
                     );
@@ -781,9 +661,6 @@ impl ClientPool {
                     connecting.epoch == epoch && connecting.result.lock().is_none()
                 })
             {
-                if connecting.config != cfg {
-                    return Err(client_policy_mismatch(address, &connecting.config, &cfg));
-                }
                 let reference = PoolReference::acquire(&connecting.references);
                 drop(state);
                 let client = connecting.wait(deadline)?;
@@ -809,7 +686,6 @@ impl ClientPool {
             };
             pending = Arc::new(PendingConnection {
                 epoch,
-                config: cfg.clone(),
                 references: Arc::new(PoolReferences::new(0, None)),
                 result: Mutex::new(None),
                 changed: Condvar::new(),
@@ -842,7 +718,9 @@ impl ClientPool {
                 let prefix = format!("/cc3c{:08x}{counter:016x}", std::process::id());
                 let pool = Arc::new(RwLock::new(
                     MemPool::new_with_prefix_and_budget(
-                        pool_config_from_client_config(&cfg),
+                        c2_config::PoolConfig::primary_for_budget(
+                            budget.snapshot().memory.limit_bytes,
+                        ),
                         prefix,
                         budget.clone(),
                     )
@@ -851,7 +729,6 @@ impl ClientPool {
                 let (candidate, result) = SyncClient::connect_transport_pool_attempt_with_deadline(
                     endpoint.clone(),
                     pool,
-                    cfg.clone(),
                     budget.clone(),
                     deadline,
                     self.connection_event_source.as_ref(),
@@ -1096,14 +973,20 @@ impl Drop for ClientPool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use c2_config::LocalEndpointContext;
+
+    fn context() -> LocalEndpointContext {
+        LocalEndpointContext::default_for_platform().unwrap()
+    }
     #[test]
     fn test_pool_new() {
-        let pool = ClientPool::new(Duration::from_secs(30));
+        let pool = ClientPool::new();
         assert_eq!(pool.active_count(), 0);
     }
     #[test]
     fn test_pool_grace_period_sweep() {
-        let pool = ClientPool::new(Duration::from_millis(50));
+        let pool =
+            ClientPool::with_grace_period_and_context(Some(Duration::from_millis(50)), context());
 
         // Manually insert a fake entry with ref_count=0 and old release time.
         {
@@ -1127,7 +1010,8 @@ mod tests {
     }
     #[test]
     fn test_pool_grace_period_not_expired() {
-        let pool = ClientPool::new(Duration::from_secs(60));
+        let pool =
+            ClientPool::with_grace_period_and_context(Some(Duration::from_secs(60)), context());
 
         {
             let client = make_disconnected_client();
@@ -1151,7 +1035,7 @@ mod tests {
     }
     #[test]
     fn test_pool_refcount_tracking() {
-        let pool = ClientPool::new(Duration::from_secs(30));
+        let pool = ClientPool::with_endpoint_context(context());
         let addr = "ipc://reftest";
 
         // Insert a fake connected-looking entry for refcount math.
@@ -1181,12 +1065,12 @@ mod tests {
     }
     #[test]
     fn test_pool_release_unknown_address() {
-        let pool = ClientPool::new(Duration::from_secs(30));
+        let pool = ClientPool::with_endpoint_context(context());
         assert!(!pool.release_if_same("ipc://nonexistent", &Arc::new(make_disconnected_client())));
     }
     #[test]
     fn test_pool_release_already_zero() {
-        let pool = ClientPool::new(Duration::from_secs(30));
+        let pool = ClientPool::with_endpoint_context(context());
         let addr = "ipc://zero";
 
         {
@@ -1208,7 +1092,7 @@ mod tests {
     }
     #[test]
     fn discard_if_same_removes_only_the_observed_stale_client() {
-        let pool = ClientPool::new(Duration::from_secs(30));
+        let pool = ClientPool::with_endpoint_context(context());
         let address = "ipc://stale";
         let observed = Arc::new(make_disconnected_client());
         let raced_replacement = Arc::new(make_disconnected_client());
@@ -1228,7 +1112,7 @@ mod tests {
     }
     #[test]
     fn release_if_same_cannot_decrement_a_racing_replacement() {
-        let pool = ClientPool::new(Duration::from_secs(30));
+        let pool = ClientPool::with_endpoint_context(context());
         let address = "ipc://replacement";
         let observed = Arc::new(make_disconnected_client());
         let replacement = Arc::new(make_disconnected_client());
@@ -1248,7 +1132,7 @@ mod tests {
     }
     #[test]
     fn test_pool_close_all_drains_and_reopens_under_new_epoch() {
-        let pool = ClientPool::new(Duration::from_secs(30));
+        let pool = ClientPool::with_endpoint_context(context());
 
         {
             let c1 = make_disconnected_client();
@@ -1284,58 +1168,35 @@ mod tests {
         assert!(!pool.state.lock().draining);
     }
     #[test]
-    fn test_pool_set_default_config() {
-        let pool = ClientPool::new(Duration::from_secs(30));
-        let cfg = ClientIpcConfig {
-            base: c2_config::BaseIpcConfig {
-                chunk_size: 65536,
-                ..c2_config::BaseIpcConfig::default()
-            },
-            shm_threshold: 1024,
-            ..ClientIpcConfig::default()
-        };
-        pool.set_default_config(cfg)
-            .expect("unfrozen pool accepts a default config");
-        // Verify the config is stored (indirectly — acquire would use it).
-        let stored = pool.default_config.lock();
-        assert!(stored.is_some());
-        let c = stored.as_ref().unwrap();
-        assert_eq!(c.shm_threshold, 1024);
-        assert_eq!(c.chunk_size, 65536);
-    }
-    #[test]
-    fn pool_config_from_client_config_uses_max_pool_segments() {
-        let cfg = ClientIpcConfig {
-            base: c2_config::BaseIpcConfig {
-                pool_segment_size: 65_536,
-                max_pool_segments: 3,
-                ..c2_config::BaseIpcConfig::default()
-            },
-            shm_threshold: 1024,
-            ..ClientIpcConfig::default()
-        };
-
-        let pc = pool_config_from_client_config(&cfg);
-
-        assert_eq!(pc.segment_size, 65_536);
-        assert_eq!(pc.max_segments, 3);
-    }
-    #[test]
-    fn pool_config_from_client_config_projects_client_decay() {
-        let cfg = ClientIpcConfig {
-            pool_decay_seconds: 3.25,
-            ..ClientIpcConfig::default()
-        };
-        assert_eq!(
-            pool_config_from_client_config(&cfg).buddy_idle_decay_secs,
-            3.25
+    fn frozen_domain_budget_is_shared_across_forks() {
+        let pool = ClientPool::with_endpoint_context_and_budget(
+            context(),
+            DomainBudget::from_limits(&DomainLimits {
+                memory_budget_bytes: 4096,
+                file_spill_budget_bytes: 0,
+                max_outstanding_calls: 0,
+            }),
         );
+        let scoped = pool
+            .fork_endpoint_scope(ConnectDeadline::default())
+            .unwrap();
+        assert_eq!(
+            pool.domain_snapshot().memory.limit_bytes,
+            scoped.domain_snapshot().memory.limit_bytes
+        );
+        assert_eq!(scoped.domain_snapshot().memory.limit_bytes, 4096);
+        let reservation = scoped
+            .domain_budget()
+            .try_reserve_memory(4096)
+            .expect("whole frozen budget is available");
+        assert!(pool.domain_budget().try_reserve_memory(1).is_err());
+        drop(reservation);
     }
     #[test]
     fn test_client_pool_unique_prefixes() {
         // Verify that successive client MemPool creations get different
         // SHM prefixes via CLIENT_POOL_GEN counter.
-        let pc = PoolConfig::default();
+        let pc = c2_config::PoolConfig::default();
         let c1 = CLIENT_POOL_GEN.fetch_add(1, Ordering::Relaxed) as u32;
         let p1 = format!("/cc3c{:08x}{:08x}", std::process::id(), c1);
         let c2 = CLIENT_POOL_GEN.fetch_add(1, Ordering::Relaxed) as u32;

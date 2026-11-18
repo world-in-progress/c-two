@@ -17,6 +17,18 @@ const MAX_RPC_RECORD_BYTES: usize = u32::MAX as usize - (crate::frame::HEADER_SI
 /// but excludes its own four-byte prefix.
 pub const MAX_CALL_END_PAYLOAD_BYTES: u64 = (MAX_RPC_RECORD_BYTES - 1) as u64;
 
+/// Byte budget for one inline CALL_END C2E1 error payload so the complete
+/// frame never exceeds c2_config::MAX_RPC_FRAME_BYTES. Reserve room for the
+/// frame envelope (12), kind byte, status byte and the server-stream item
+/// count (8).
+pub const MAX_INLINE_CALL_END_ERROR_BYTES: usize =
+    (c2_config::MAX_RPC_FRAME_BYTES as usize).saturating_sub(12 + 1 + 1 + 8);
+
+/// Truncation marker appended to truncated `message` and `details` values of
+/// a bounded CALL_END error. Short and ASCII so it never crosses a char
+/// boundary or grows the payload measurably.
+const CALL_END_TRUNCATION_MARKER: &str = "...[truncated]";
+
 /// Wire encoding failed because a field cannot be represented by IPC 16.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EncodeError {
@@ -919,6 +931,95 @@ fn open_record_prefix<S: AsRef<str>>(
     Ok(out)
 }
 
+/// Largest byte index at or below `index` that is a valid char boundary of
+/// `s`.
+fn floor_char_boundary(s: &str, mut index: usize) -> usize {
+    if index >= s.len() {
+        return s.len();
+    }
+    while index > 0 && !s.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
+}
+
+/// Halve `s` at a valid char boundary and append the truncation marker. The
+/// result is always strictly shorter than an input longer than twice the
+/// marker; shorter inputs collapse to the empty string, so iteration always
+/// makes progress.
+fn truncate_at_char_boundary(s: &str) -> String {
+    if s.len() <= 2 * CALL_END_TRUNCATION_MARKER.len() {
+        return String::new();
+    }
+    let cut = floor_char_boundary(s, s.len() / 2);
+    let mut truncated = String::with_capacity(cut + CALL_END_TRUNCATION_MARKER.len());
+    truncated.push_str(&s[..cut]);
+    truncated.push_str(CALL_END_TRUNCATION_MARKER);
+    truncated
+}
+
+fn marked_truncated(mut error: C2Error) -> C2Error {
+    error
+        .details
+        .insert("truncated".to_string(), "true".to_string());
+    error
+}
+
+/// One bounded-shrinking step: first the largest details value (never the
+/// truncation marker itself), then the message. Returns `None` at the floor
+/// (empty message, no nonempty details values).
+fn truncate_error_once(error: &C2Error) -> Option<C2Error> {
+    let mut details = error.details.clone();
+    let victim = details
+        .iter()
+        .filter(|(key, value)| key.as_str() != "truncated" && !value.is_empty())
+        .max_by_key(|(_, value)| value.len())
+        .map(|(key, _)| key.clone());
+    if let Some(key) = victim {
+        let shrunk = truncate_at_char_boundary(&details[&key]);
+        details.insert(key, shrunk);
+        return Some(marked_truncated(C2Error {
+            code: error.code,
+            message: error.message.clone(),
+            details,
+        }));
+    }
+    if !error.message.is_empty() {
+        return Some(marked_truncated(C2Error {
+            code: error.code,
+            message: truncate_at_char_boundary(&error.message),
+            details,
+        }));
+    }
+    None
+}
+
+/// Encode `error` as C2E1 bytes guaranteed to fit one inline CALL_END frame
+/// (total_len <= c2_config::MAX_RPC_FRAME_BYTES). If the canonical encoding
+/// already fits, it is returned unchanged. Otherwise the original ErrorCode
+/// and name are kept, `message` and `details` values are truncated at valid
+/// UTF-8 char boundaries with a truncation marker, and the result is
+/// re-encoded as a valid C2E1 envelope (adding details key "truncated" =
+/// "true"). Never panics; a pathological input degrades to a minimal valid
+/// C2E1 payload.
+pub fn bounded_call_end_error_bytes(error: &C2Error) -> Vec<u8> {
+    let mut current = error.clone();
+    loop {
+        let bytes = current.to_wire_bytes();
+        if bytes.len() <= MAX_INLINE_CALL_END_ERROR_BYTES {
+            return bytes;
+        }
+        match truncate_error_once(&current) {
+            Some(truncated) => current = truncated,
+            None => {
+                // Floor: an empty message with only the truncation marker is
+                // far below the budget and is always a valid C2E1 payload.
+                return marked_truncated(C2Error::new(error.code, String::new())).to_wire_bytes();
+            }
+        }
+    }
+}
+
 /// Encode CALL_END with mode-dependent metadata. Error bytes are checked once.
 pub fn encode_call_end_frame(
     request_id: u64,
@@ -952,6 +1053,25 @@ pub fn encode_call_end_frame(
     }
     write_value(&mut out, value);
     Ok(out)
+}
+
+/// Convenience: encode a complete inline CALL_END error frame that is always
+/// within the frame budget (uses [`bounded_call_end_error_bytes`]).
+pub fn encode_call_end_error_frame(
+    request_id: u64,
+    mode: CallMode,
+    status: CallStatus,
+    complete_items: u64,
+    error: &C2Error,
+) -> Result<Vec<u8>, EncodeError> {
+    let payload = bounded_call_end_error_bytes(error);
+    encode_call_end_frame(
+        request_id,
+        mode,
+        status,
+        complete_items,
+        ValuePart::whole(ValueStorage::Inline(&payload)),
+    )
 }
 
 /// Encode a subsequent OPEN or CALL_END value chunk without repeating metadata.

@@ -25,8 +25,8 @@ pub use scheduler::{
 };
 pub use server::{
     DIRECT_IPC_SHUTDOWN_REASON, Server, ServerError, ServerFailure, ServerIdentity,
-    ServerLifecycleState, ServerMemorySnapshot, ServerRouteCloseOutcome, ServerShutdownCompletion,
-    ServerStartupStage, ServerStartupTimeout,
+    ServerLifecycleState, ServerRouteCloseOutcome, ServerShutdownCompletion, ServerStartupStage,
+    ServerStartupTimeout,
 };
 
 pub use response::ResponsePool;

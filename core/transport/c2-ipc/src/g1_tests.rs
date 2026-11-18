@@ -43,11 +43,17 @@ async fn close_preserves_started_chunked_upload_and_reply() {
         let client = client.clone();
         async move {
             client
-                .call_chunked_stream_phased(&identity(), 0, 3 * 4096, chunks)
+                .call_chunked_stream_phased(
+                    &identity(),
+                    0,
+                    3 * CHUNK_SIZE as usize,
+                    DEFAULT_MAX_PAYLOAD_SIZE,
+                    chunks,
+                )
                 .await
         }
     });
-    source.send(vec![1; 4096]).await.unwrap();
+    source.send(vec![1; CHUNK_SIZE as usize]).await.unwrap();
     first_seen.await.unwrap();
     assert!(!client.close_shared_bounded(Duration::from_millis(20)).await);
     assert!(!caller.is_finished());
@@ -56,8 +62,8 @@ async fn close_preserves_started_chunked_upload_and_reply() {
         .await
         .unwrap_err();
     assert_eq!(error.phase(), crate::TransportPhase::PreDispatch);
-    source.send(vec![2; 4096]).await.unwrap();
-    source.send(vec![3; 4096]).await.unwrap();
+    source.send(vec![2; CHUNK_SIZE as usize]).await.unwrap();
+    source.send(vec![3; CHUNK_SIZE as usize]).await.unwrap();
     drop(source);
     assert_eq!(
         timeout(WAIT, caller)
@@ -137,19 +143,16 @@ async fn physical_end_releases_peer_mappings_with_retained_client() {
         &endpoint,
         Arc::new(Echo),
         ServerIpcConfig {
-            shm_threshold: 1,
             ..Default::default()
         },
     )
     .await;
-    let mut cfg = config();
-    cfg.pool_decay_seconds = 3600.0;
-    let mut client = IpcClient::with_endpoint(endpoint.endpoint.clone(), cfg).unwrap();
+    let mut client = endpoint.client();
     client.connect().await.unwrap();
     let binding = client.acquire_route(&contract()).await.unwrap();
     let peer = client.server_pool.lock().clone().unwrap();
     let held = client
-        .call_bound(&binding, "echo", &[9; 8193])
+        .call_bound(&binding, "echo", &[9; SHM_THRESHOLD as usize + 1])
         .await
         .unwrap()
         .into_owned_bytes()
@@ -166,6 +169,6 @@ async fn physical_end_releases_peer_mappings_with_retained_client() {
         client.server_pool.lock().is_some(),
         "business metadata is still retained"
     );
-    assert_eq!(held, vec![9; 8193]);
+    assert_eq!(held, vec![9; SHM_THRESHOLD as usize + 1]);
     stop(server, runner).await;
 }

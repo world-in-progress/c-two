@@ -3,35 +3,38 @@
 use std::time::Duration;
 
 /// Configuration for the [`ChunkRegistry`](super::ChunkRegistry).
-///
-/// Typically derived from [`c2_config::BaseIpcConfig`] chunk-related fields.
 #[derive(Debug, Clone)]
 pub struct ChunkConfig {
     /// Timeout for incomplete input assemblies (default 60s). Active replies do not expire.
     pub assembler_timeout: Duration,
     /// GC sweep interval (default 5s). Callers use this to drive their timer.
     pub gc_interval: Duration,
-    /// Early GC threshold derived from `max_inflight_chunk_frames`; it never
-    /// refuses a reassembly by count.
+    /// Early GC scan soft threshold; it never refuses a reassembly by count.
     pub soft_limit: u32,
-    /// Soft limit on in-flight reassembly bytes and hard limit per assembly (default 8 GB).
-    pub max_reassembly_bytes: u64,
+    /// Per-assembly byte cap. The server passes its own max_payload_size;
+    /// clients additionally validate each reply against the route-advertised
+    /// max_payload_size at insert_reply time.
+    pub max_payload_size: u64,
 }
 
 impl Default for ChunkConfig {
     fn default() -> Self {
-        Self::from_base(&c2_config::BaseIpcConfig::default())
+        Self {
+            assembler_timeout: c2_config::CHUNK_ASSEMBLER_TIMEOUT,
+            gc_interval: c2_config::CHUNK_GC_INTERVAL,
+            soft_limit: 512,
+            max_payload_size: c2_config::DEFAULT_MAX_PAYLOAD_SIZE,
+        }
     }
 }
 
 impl ChunkConfig {
-    /// Build a `ChunkConfig` from a [`BaseIpcConfig`](c2_config::BaseIpcConfig).
-    pub fn from_base(cfg: &c2_config::BaseIpcConfig) -> Self {
+    /// Defaults with the given per-assembly byte cap (a server's
+    /// max_payload_size or a route-advertised reply limit).
+    pub fn with_max_payload_size(max_payload_size: u64) -> Self {
         Self {
-            assembler_timeout: Duration::from_secs_f64(cfg.chunk_assembler_timeout_secs),
-            gc_interval: Duration::from_secs_f64(cfg.chunk_gc_interval_secs),
-            soft_limit: cfg.max_inflight_chunk_frames,
-            max_reassembly_bytes: cfg.max_reassembly_bytes,
+            max_payload_size: max_payload_size,
+            ..Self::default()
         }
     }
 }
@@ -46,20 +49,15 @@ mod tests {
         assert_eq!(cfg.assembler_timeout, Duration::from_secs(60));
         assert_eq!(cfg.gc_interval, Duration::from_secs(5));
         assert_eq!(cfg.soft_limit, 512);
+        assert_eq!(cfg.max_payload_size, 16 * (1 << 30));
     }
 
     #[test]
-    fn from_base_config() {
-        let base = c2_config::BaseIpcConfig::default();
-        let cfg = ChunkConfig::from_base(&base);
+    fn with_max_payload_size_keeps_the_default_durations() {
+        let cfg = ChunkConfig::with_max_payload_size(1024);
         assert_eq!(cfg.assembler_timeout, Duration::from_secs(60));
         assert_eq!(cfg.gc_interval, Duration::from_secs(5));
         assert_eq!(cfg.soft_limit, 512);
-        assert_eq!(cfg.max_reassembly_bytes, 8_589_934_592);
-        let base = c2_config::BaseIpcConfig {
-            max_inflight_chunk_frames: 7,
-            ..base
-        };
-        assert_eq!(ChunkConfig::from_base(&base).soft_limit, 7);
+        assert_eq!(cfg.max_payload_size, 1024);
     }
 }

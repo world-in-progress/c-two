@@ -1,6 +1,7 @@
 //! A physical peer end during an admitted SHM item copy preserves call order.
+
 use super::*;
-use c2_mem::retention::PayloadBufferBudget;
+use crate::tests::memory_budget;
 use c2_wire::rpc::{RpcRecord, decode_rpc_record, encode_credit_frame, encode_item_begin_frame};
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::oneshot;
@@ -59,7 +60,7 @@ async fn eof_during_whole_shm_copy_waits_for_item_and_loan_settlement() {
     let mut client = endpoint.client();
     client.connect().await.unwrap();
     let observation = client.connection_observation().unwrap();
-    let budget = PayloadBufferBudget::new(64);
+    let budget = memory_budget(64);
     let owner_dropped = Arc::new(AtomicBool::new(false));
     let mut response = client
         .stream_bound_owned_controlled_phased(
@@ -83,7 +84,7 @@ async fn eof_during_whole_shm_copy_waits_for_item_and_loan_settlement() {
         .await
         .unwrap()
         .expect("the real SHM copy did not reach the gate");
-    assert_eq!(budget.snapshot().used_bytes, 64);
+    assert_eq!(budget.snapshot().memory.used_bytes, 64);
     assert_eq!(shm.pool.read().stats().alloc_count, 1);
 
     drop_peer.send(()).unwrap();
@@ -97,7 +98,7 @@ async fn eof_during_whole_shm_copy_waits_for_item_and_loan_settlement() {
     .expect("read-side EOF did not settle the pending entry");
     assert!(response.try_completion().is_none());
     assert!(!owner_dropped.load(Ordering::Acquire));
-    assert_eq!(budget.snapshot().used_bytes, 64);
+    assert_eq!(budget.snapshot().memory.used_bytes, 64);
     assert!(
         observation.snapshot().is_none(),
         "the physical connection closed while its SHM read was active"
@@ -122,7 +123,7 @@ async fn eof_during_whole_shm_copy_waits_for_item_and_loan_settlement() {
         Err(error) => assert_eq!(error.phase(), crate::TransportPhase::DispatchUncertain),
         Ok(None) => panic!("EOF cannot produce natural stream completion"),
     }
-    assert_eq!(budget.snapshot().used_bytes, 0);
+    assert_eq!(budget.snapshot().memory.used_bytes, 0);
     observation
         .wait_closed(Some(WAIT))
         .await

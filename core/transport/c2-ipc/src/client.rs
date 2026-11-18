@@ -17,7 +17,10 @@ use futures_util::{Stream, StreamExt};
 use tokio::io::AsyncReadExt;
 use tokio::sync::{oneshot, watch};
 
-use c2_config::ConnectDeadline;
+use c2_config::{
+    CHUNK_SIZE, ConnectDeadline, DEFAULT_MAX_PAYLOAD_SIZE, DomainLimits, MAX_HANDSHAKE_FRAME_BYTES,
+    MAX_RPC_FRAME_BYTES, POOL_DECAY_SECONDS, SHM_THRESHOLD, WRITE_TIMEOUT,
+};
 
 // The scope follows each future poll, rather than an OS thread. It projects
 // Core's single deadline into native metadata operations reached by connect;
@@ -138,18 +141,18 @@ use c2_wire::rpc::{
     self, CallMode, CallStatus, ChunkPosition, RpcRecord, RpcRecordKind, ValuePart, ValueStorage,
 };
 
-use c2_mem::config::PoolConfig;
-use c2_mem::retention::{BudgetedBuffer, PayloadBufferBudget};
+use c2_mem::BudgetedBuffer;
 
 #[path = "forward.rs"]
 pub mod forward;
 #[path = "stream.rs"]
 pub mod stream;
-use c2_mem::{MemHandle, MemPool, PeerMappingCache, PeerMappingError, PeerRead, PoolAllocation};
+use c2_mem::{
+    DomainBudget, DomainSnapshot, MemHandle, MemPool, PeerMappingCache, PeerMappingError, PeerRead,
+    PoolAllocation,
+};
 
 use crate::response::{ResponseData, ServerShmResponse};
-
-pub use c2_config::ClientIpcConfig;
 
 const ROUTE_PUBLICATION_LOOKUP_RETRY_DELAYS_MS: &[u64] = &[10, 25, 50, 100, 200];
 
@@ -217,13 +220,18 @@ impl RequestBlock {
     pub(crate) fn write_at(&self, offset: usize, data: &[u8]) -> Result<(), IpcError> {
         let mut slot = self.handle.lock();
         let handle = slot.as_mut().ok_or(IpcError::Closed)?;
-        let pool = self.pool.read();
         let end = offset
             .checked_add(data.len())
             .filter(|end| *end <= self.len)
             .ok_or_else(|| IpcError::Shm("request write exceeds prepared length".into()))?;
-        pool.handle_slice_mut(handle)[offset..end].copy_from_slice(data);
-        Ok(())
+        // Pin the mapping under the pool read guard, then copy outside it: a
+        // slow write never holds the pool lock other owners need.
+        let mut pin = {
+            let pool = self.pool.read();
+            pool.pin_shm_mut(handle).map_err(IpcError::Shm)?
+        };
+        pin.write_at(offset, &data[..end - offset])
+            .map_err(IpcError::Shm)
     }
     fn prepare(&self, conn: &ClientConnection) -> Result<PreparedLoan, IpcError> {
         let handle = self.handle.lock().take().ok_or(IpcError::Closed)?;
@@ -707,6 +715,10 @@ pub(crate) struct PendingResponse {
     pub(crate) state: Arc<StdMutex<SendState>>,
     reply_chunks: Option<ValueReceive>,
     pub(crate) kind: PendingKind,
+    /// Reply-value cap for this call, from the resolved route binding's
+    /// advertised `max_payload_size`. Controls cannot reference a route and
+    /// carry the default bound.
+    pub(crate) max_payload_size: u64,
     upload_stop: Option<watch::Sender<bool>>,
     pub(crate) stream: Option<Arc<stream::StreamReceive>>,
     pub(crate) forward: Option<Arc<forward::ForwardReceive>>,
@@ -855,21 +867,20 @@ pub(crate) enum RequestTransportKind {
     Chunked,
 }
 
-/// Select the transport for one request body.
+/// Select the transport for one request body against the fixed constants.
 ///
 /// `shm_available` means the SHM request direction is genuinely usable for
 /// this connection: a live request pool plus a negotiated `CAP_SHM_REQUEST`
-/// ACK. It is never derived from `pool_enabled` alone (that flag does not
-/// disable dedicated SHM requests).
+/// ACK. It is never derived from the pool's buddy switch alone (that flag
+/// does not disable dedicated SHM requests).
 pub(crate) fn choose_request_transport(
-    config: &ClientIpcConfig,
     shm_available: bool,
     data_len: usize,
 ) -> RequestTransportKind {
     let data_len = u64::try_from(data_len).unwrap_or(u64::MAX);
-    if shm_available && data_len > config.shm_threshold && data_len <= u64::from(u32::MAX) {
+    if shm_available && data_len > SHM_THRESHOLD && data_len <= u64::from(u32::MAX) {
         RequestTransportKind::Buddy
-    } else if data_len > config.chunk_size {
+    } else if data_len > CHUNK_SIZE {
         RequestTransportKind::Chunked
     } else {
         RequestTransportKind::Inline
@@ -974,8 +985,9 @@ pub struct IpcClient {
     connection: RwLock<Option<ConnectionPublisher>>,
     connection_event_source: Option<c2_local::ConnectionEventSource>,
     pub(crate) pool: StdMutex<Option<Arc<RwLock<MemPool>>>>,
-    pub(crate) config: ClientIpcConfig,
-    memory_budget: c2_mem::MemoryBudget,
+    #[cfg(test)]
+    write_timeout: std::time::Duration,
+    pub(crate) budget: DomainBudget,
     pub(crate) chunk_registry: StdMutex<Option<Arc<ChunkRegistry<()>>>>,
     conn_id: u64,
     negotiated_shm_request: AtomicBool,
@@ -985,17 +997,14 @@ static CLIENT_CONN_COUNTER: AtomicU64 = AtomicU64::new(1);
 static CLIENT_OWN_POOL_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 impl IpcClient {
-    /// Config-owned request pool. Always a real `MemPool`: with buddy disabled
-    /// it still serves dedicated SHM requests (and announces the wire prefix),
-    /// only the buddy tiers are policy-disabled. The client's idle window
-    /// (`pool_decay_seconds`) rides in through the role tuning. The pool
-    /// charges `budget`, so a standalone client shares one memory context
-    /// between its request and reassembly pools.
-    fn own_pool_from_config(
-        config: &ClientIpcConfig,
-        budget: &c2_mem::MemoryBudget,
-    ) -> Result<Arc<RwLock<MemPool>>, IpcError> {
-        let pool_config = config.base.primary_pool_config(&config.pool_tuning());
+    /// Budget-owned request pool. Always a real `MemPool`: the primary pool
+    /// geometry is derived from the domain memory budget, and the client's
+    /// idle window is the fixed `POOL_DECAY_SECONDS`. The pool charges
+    /// `budget`, so a standalone client shares one memory context between its
+    /// request and reassembly pools.
+    fn own_pool(budget: &DomainBudget) -> Result<Arc<RwLock<MemPool>>, IpcError> {
+        let pool_config =
+            c2_config::PoolConfig::primary_for_budget(budget.snapshot().memory.limit_bytes);
         let counter = CLIENT_OWN_POOL_COUNTER.fetch_add(1, Ordering::Relaxed) as u32;
         let prefix = format!("/cc3d{:08x}{:08x}", std::process::id(), counter);
         Ok(Arc::new(RwLock::new(
@@ -1007,8 +1016,7 @@ impl IpcClient {
     fn from_parts(
         endpoint: Result<LocalEndpoint, String>,
         pool: Option<Arc<RwLock<MemPool>>>,
-        config: ClientIpcConfig,
-        memory_budget: c2_mem::MemoryBudget,
+        budget: DomainBudget,
         chunk_registry: Option<Arc<ChunkRegistry<()>>>,
     ) -> Self {
         Self {
@@ -1021,11 +1029,12 @@ impl IpcClient {
             connection: RwLock::new(None),
             connection_event_source: None,
             pool: StdMutex::new(pool),
+            #[cfg(test)]
+            write_timeout: WRITE_TIMEOUT,
+            budget,
             chunk_registry: StdMutex::new(chunk_registry),
             conn_id: CLIENT_CONN_COUNTER.fetch_add(1, Ordering::Relaxed),
             negotiated_shm_request: AtomicBool::new(false),
-            config,
-            memory_budget,
         }
     }
 
@@ -1055,51 +1064,59 @@ impl IpcClient {
         self.has_request_pool() && self.negotiated_shm_request.load(Ordering::Acquire)
     }
 
-    /// The complete resolved client configuration this connection was created
-    /// from, frozen at construction.
-    ///
-    /// The cache compares this against every later requested policy so a
-    /// same-address hit can never silently serve a connection built with
-    /// different chunking, threshold, prewarm, or buddy policy. Budget-limit
-    /// equality is tracked separately by the owning domain context.
-    pub(crate) fn config(&self) -> &ClientIpcConfig {
-        &self.config
+    /// The frozen role-domain budget this client's request and reassembly
+    /// pools charge, shared by reference with its owning domain.
+    pub fn domain_budget(&self) -> &DomainBudget {
+        &self.budget
+    }
+
+    /// Consistent read-only accounting snapshot of this client's domain.
+    pub fn domain_snapshot(&self) -> DomainSnapshot {
+        self.budget.snapshot()
     }
 
     /// Build a fresh reassembly registry whose pool charges `budget`.
-    fn build_chunk_registry(
-        config: &ClientIpcConfig,
-        budget: &c2_mem::MemoryBudget,
-    ) -> Result<Arc<ChunkRegistry<()>>, IpcError> {
+    fn build_chunk_registry(budget: &DomainBudget) -> Result<Arc<ChunkRegistry<()>>, IpcError> {
         let counter = REASSEMBLY_POOL_GEN.fetch_add(1, Ordering::Relaxed) as u32;
         let prefix = format!("/cc3a{:08x}{:08x}", std::process::id(), counter);
-        // Reassembly follows the same buddy policy: with buddy disabled the
-        // assembler stores into dedicated SHM (file spill as last resort)
-        // instead of skipping chunked reception. The pool charges the same
-        // shared context as the request pool.
+        // Reassembly geometry is derived from the same domain budget: without
+        // affordable buddy segments the assembler stores into dedicated SHM
+        // (file spill as last resort) instead of skipping chunked reception.
+        // The registry-level reply cap stays the default bound; each call's
+        // effective cap comes from its route binding at insert time.
         let pool = Arc::new(RwLock::new(
             MemPool::new_with_prefix_and_budget(
-                config.base.reassembly_pool_config(&config.pool_tuning()),
+                c2_config::PoolConfig::reassembly_for_budget(budget.snapshot().memory.limit_bytes),
                 prefix,
                 budget.clone(),
             )
             .map_err(IpcError::Config)?,
         ));
-        let chunk_config = ChunkConfig::from_base(config);
+        let chunk_config = ChunkConfig::with_max_payload_size(DEFAULT_MAX_PAYLOAD_SIZE);
         Ok(Arc::new(ChunkRegistry::new(pool, chunk_config)))
     }
 
-    /// Create a new IPC client with a config-owned SHM pool.
-    ///
-    /// This keeps async callers such as the HTTP relay on the canonical
-    /// `IpcClient` API while still allowing large request streams to be written
-    /// directly into client SHM. The pool follows the config's buddy policy:
-    /// dedicated SHM requests stay available when buddy is disabled. One
-    /// finite budget derived from the config is shared by the request pool and
-    /// the reassembly pool for this client's lifetime.
-    pub fn with_config(address: &str, config: ClientIpcConfig) -> Result<Self, IpcError> {
-        let budget = c2_mem::MemoryBudget::from_limits(&config.memory_budget_limits());
-        Self::with_shared_budget(address, config, budget)
+    /// Create a new IPC client from an address with a default role-domain
+    /// budget and its own request and reassembly pools.
+    pub fn new(address: &str) -> Result<Self, IpcError> {
+        Self::with_limits(address, DomainLimits::default())
+    }
+
+    /// Resolve a new role-domain budget from explicit limits.
+    pub fn with_limits(address: &str, limits: DomainLimits) -> Result<Self, IpcError> {
+        limits
+            .validate()
+            .map_err(|error| IpcError::Config(error.to_string()))?;
+        Self::with_budget(address, DomainBudget::from_limits(&limits))
+    }
+
+    /// Create a new IPC client from an address whose pools charge `budget`.
+    pub fn with_budget(address: &str, budget: DomainBudget) -> Result<Self, IpcError> {
+        Self::from_address_and_budget(address, budget)
+    }
+
+    fn from_address_and_budget(address: &str, budget: DomainBudget) -> Result<Self, IpcError> {
+        Self::with_endpoint_and_budget_inner(Self::default_endpoint(address), budget)
     }
 
     /// Publish future physical connections to the owning Runtime's event feed.
@@ -1111,74 +1128,57 @@ impl IpcClient {
         self
     }
 
-    /// Create a new IPC client whose request and reassembly pools both charge
-    /// `budget`.
-    ///
-    /// `budget` is shared by reference with every other pool or client handed
-    /// the same [`c2_mem::MemoryBudget`] clone, so one owning domain (a
-    /// Runtime's outgoing cache, a relay's upstream pool) can bound all of its
-    /// connections with one finite context. The supplied budget is the
-    /// authority for enforcement and observation; config is its input.
-    pub fn with_shared_budget(
-        address: &str,
-        config: ClientIpcConfig,
-        budget: c2_mem::MemoryBudget,
-    ) -> Result<Self, IpcError> {
-        Self::with_budget_endpoint(Self::default_endpoint(address), config, budget)
+    /// Create a client with a frozen endpoint and a default role-domain
+    /// budget. The caller resolves the endpoint context; this transport never
+    /// reads environment roots.
+    pub fn with_endpoint(endpoint: LocalEndpoint) -> Result<Self, IpcError> {
+        Self::with_endpoint_and_budget_inner(
+            Ok(endpoint),
+            DomainBudget::from_limits(&DomainLimits::default()),
+        )
     }
 
-    /// Create a client with a frozen endpoint and a config-owned memory budget.
-    /// The caller resolves the context; this transport never reads environment roots.
-    pub fn with_endpoint(
+    /// Use the given endpoint and the owning domain's shared budget.
+    pub fn with_endpoint_and_budget(
         endpoint: LocalEndpoint,
-        config: ClientIpcConfig,
+        budget: DomainBudget,
     ) -> Result<Self, IpcError> {
-        let budget = c2_mem::MemoryBudget::from_limits(&config.memory_budget_limits());
-        Self::with_endpoint_and_shared_budget(endpoint, config, budget)
+        Self::with_endpoint_and_budget_inner(Ok(endpoint), budget)
     }
 
-    /// Use the given endpoint and the owning domain's shared memory budget.
-    pub fn with_endpoint_and_shared_budget(
-        endpoint: LocalEndpoint,
-        config: ClientIpcConfig,
-        budget: c2_mem::MemoryBudget,
-    ) -> Result<Self, IpcError> {
-        Self::with_budget_endpoint(Ok(endpoint), config, budget)
-    }
-
-    fn with_budget_endpoint(
+    fn with_endpoint_and_budget_inner(
         endpoint: Result<LocalEndpoint, String>,
-        config: ClientIpcConfig,
-        budget: c2_mem::MemoryBudget,
+        budget: DomainBudget,
     ) -> Result<Self, IpcError> {
-        let pool = Self::own_pool_from_config(&config, &budget)?;
-        let registry = Self::build_chunk_registry(&config, &budget)?;
+        let pool = Self::own_pool(&budget)?;
+        let registry = Self::build_chunk_registry(&budget)?;
         Ok(Self::from_parts(
             endpoint,
             Some(pool),
-            config,
             budget,
             Some(registry),
         ))
     }
 
-    /// Create a client around a transport-internal pool built from `config`
-    /// (pooled-client acquire path). The pool is owned solely by the resulting
-    /// client, so connect-time policy validation and explicit prewarm apply
-    /// exactly as for [`with_config`](Self::with_config). `budget` is the
-    /// owning cache's shared domain context; the pool was already created with
-    /// it and the client's reassembly pool charges the same context.
+    /// Create a client around a transport-internal pool (pooled-client
+    /// acquire path). The pool is owned solely by the resulting client and
+    /// must already charge `budget`; the client's reassembly pool charges the
+    /// same shared context.
     pub(crate) fn with_transport_pool(
         endpoint: LocalEndpoint,
         pool: Arc<RwLock<MemPool>>,
-        config: ClientIpcConfig,
-        budget: c2_mem::MemoryBudget,
+        budget: DomainBudget,
     ) -> Result<Self, IpcError> {
-        let registry = Self::build_chunk_registry(&config, &budget)?;
+        assert!(
+            pool.read()
+                .budget()
+                .is_some_and(|pool_budget| pool_budget.domain_id() == budget.domain_id()),
+            "transport pool must carry the client's shared domain budget"
+        );
+        let registry = Self::build_chunk_registry(&budget)?;
         Ok(Self::from_parts(
             Ok(endpoint),
             Some(pool),
-            config,
             budget,
             Some(registry),
         ))
@@ -1197,19 +1197,21 @@ impl IpcClient {
 
     fn begin_call(
         &self,
+        max_payload_size: u64,
     ) -> Result<(SendGuard, oneshot::Receiver<Result<ResponseData, IpcError>>), IpcError> {
-        self.begin_pending(PendingKind::Call(CallMode::Unary))
+        self.begin_pending(PendingKind::Call(CallMode::Unary), max_payload_size)
     }
 
     fn begin_control(
         &self,
     ) -> Result<(SendGuard, oneshot::Receiver<Result<ResponseData, IpcError>>), IpcError> {
-        self.begin_pending(PendingKind::Control)
+        self.begin_pending(PendingKind::Control, DEFAULT_MAX_PAYLOAD_SIZE)
     }
 
     fn begin_pending(
         &self,
         kind: PendingKind,
+        max_payload_size: u64,
     ) -> Result<(SendGuard, oneshot::Receiver<Result<ResponseData, IpcError>>), IpcError> {
         let conn = self.driver.read().clone().ok_or(IpcError::Closed)?;
         let mut pending = self.pending.lock();
@@ -1223,6 +1225,7 @@ impl IpcClient {
             state: state.clone(),
             reply_chunks: None,
             kind,
+            max_payload_size,
             upload_stop: None,
             stream: None,
             forward: None,
@@ -1305,17 +1308,12 @@ impl IpcClient {
         // A reconnect always creates fresh pool incarnations on the same budget.
         let pool = match (reconnect, self.pool.get_mut().take()) {
             (false, Some(pool)) => pool,
-            _ => Self::own_pool_from_config(&self.config, &self.memory_budget)?,
+            _ => Self::own_pool(&self.budget)?,
         };
-        if self.config.pool_prewarm_segments > 0 {
-            pool.write()
-                .ensure_buddy_segments(self.config.pool_prewarm_segments as usize)
-                .map_err(IpcError::Shm)?;
-        }
         *self.pool.get_mut() = Some(pool);
         let registry = match (reconnect, self.chunk_registry.get_mut().take()) {
             (false, Some(registry)) => registry,
-            _ => Self::build_chunk_registry(&self.config, &self.memory_budget)?,
+            _ => Self::build_chunk_registry(&self.budget)?,
         };
         *self.chunk_registry.get_mut() = Some(registry.clone());
         let handshake = with_connect_deadline(deadline, "handshake", async {
@@ -1356,19 +1354,23 @@ impl IpcClient {
         self.server_identity = hs.server_identity;
         *self.server_pool.get_mut() = Some(server_pool.clone());
         retirement.set_peer(server_pool.clone());
-        let conn = ClientConnection::spawn(
-            writer,
-            self.pending.clone(),
-            abort,
-            retirement.clone(),
-            self.config.write_timeout(),
-        );
+        let conn =
+            ClientConnection::spawn(writer, self.pending.clone(), abort, retirement.clone(), {
+                #[cfg(test)]
+                {
+                    self.write_timeout
+                }
+                #[cfg(not(test))]
+                {
+                    WRITE_TIMEOUT
+                }
+            });
         conn.start_gc(
             self.request_pool().unwrap(),
             server_pool.clone(),
             registry.clone(),
             retirement.clone(),
-            self.config.pool_decay_seconds,
+            POOL_DECAY_SECONDS,
         );
         *self.driver.get_mut() = Some(conn.clone());
         tokio::spawn(recv_loop(
@@ -1487,6 +1489,7 @@ impl IpcClient {
             })?;
 
         if total_len < 12
+            || u64::from(total_len) > MAX_HANDSHAKE_FRAME_BYTES
             || hdr.request_id != 0
             || hdr.flags != (flags::FLAG_HANDSHAKE | flags::FLAG_RESPONSE)
         {
@@ -1527,14 +1530,11 @@ impl IpcClient {
         self.negotiated_shm_request
             .store(negotiated_shm_request, Ordering::Release);
 
-        let cfg = PoolConfig {
-            segment_size: 8192,
-            max_segments: c2_config::MAX_IPC_POOL_SEGMENTS as usize,
-            max_dedicated_segments: usize::from(u16::MAX) + 1,
-            buddy_idle_decay_secs: self.config.pool_decay_seconds,
-            ..PoolConfig::default()
-        };
-        let cache = PeerMappingCache::new(cfg, hs.prefix.clone()).map_err(IpcError::Shm)?;
+        let cache = PeerMappingCache::new(
+            c2_config::PoolConfig::peer_cache_config(),
+            hs.prefix.clone(),
+        )
+        .map_err(IpcError::Shm)?;
         Ok((
             hs,
             Arc::new(RwLock::new(ServerPoolState {
@@ -1634,9 +1634,12 @@ impl IpcClient {
 
         IpcCallControl::check_preparation(control).map_err(pre_dispatch_call_error)?;
 
-        match choose_request_transport(&self.config, self.shm_request_available(), data.len()) {
+        match choose_request_transport(self.shm_request_available(), data.len()) {
             RequestTransportKind::Buddy => {
-                match self.call_buddy(&identity, method_idx, data, control).await {
+                match self
+                    .call_buddy(&identity, method_idx, data, max_payload_size, control)
+                    .await
+                {
                     Ok(result) => return Ok(result),
                     Err(error)
                         if error.is_retry_safe()
@@ -1651,17 +1654,17 @@ impl IpcClient {
             }
             RequestTransportKind::Chunked => {
                 return self
-                    .call_chunked(&identity, method_idx, data, control)
+                    .call_chunked(&identity, method_idx, data, max_payload_size, control)
                     .await;
             }
             RequestTransportKind::Inline => {
                 return self
-                    .call_inline_controlled(&identity, method_idx, data, control)
+                    .call_inline_controlled(&identity, method_idx, data, max_payload_size, control)
                     .await;
             }
         }
 
-        self.call_owned_bytes(&identity, method_idx, data, control)
+        self.call_owned_bytes(&identity, method_idx, data, max_payload_size, control)
             .await
     }
 
@@ -1673,16 +1676,18 @@ impl IpcClient {
         identity: &RouteCallIdentity,
         method_idx: u16,
         data: &[u8],
+        max_payload_size: u64,
         control: Option<&IpcCallControl>,
     ) -> Result<ResponseData, crate::IpcCallError> {
-        match choose_request_transport(&self.config, false, data.len()) {
+        match choose_request_transport(false, data.len()) {
             RequestTransportKind::Chunked => {
-                self.call_chunked(identity, method_idx, data, control).await
+                self.call_chunked(identity, method_idx, data, max_payload_size, control)
+                    .await
             }
             // Buddy is unreachable with `shm_available=false`; the inline
             // path is the only remaining owned transport.
             RequestTransportKind::Inline | RequestTransportKind::Buddy => {
-                self.call_inline_controlled(identity, method_idx, data, control)
+                self.call_inline_controlled(identity, method_idx, data, max_payload_size, control)
                     .await
             }
         }
@@ -1782,7 +1787,7 @@ impl IpcClient {
             ))));
         }
         IpcCallControl::check_preparation(Some(control)).map_err(pre_dispatch_call_error)?;
-        if choose_request_transport(&self.config, self.shm_request_available(), data_len)
+        if choose_request_transport(self.shm_request_available(), data_len)
             == RequestTransportKind::Buddy
         {
             let prepared = self.try_alloc_request_block(data_len).and_then(|block| {
@@ -1795,7 +1800,13 @@ impl IpcClient {
                 Ok(Some(block)) => {
                     drop(data);
                     return self
-                        .call_with_prealloc_controlled(&identity, method_idx, &block, Some(control))
+                        .call_with_prealloc_controlled(
+                            &identity,
+                            method_idx,
+                            &block,
+                            max_payload_size,
+                            Some(control),
+                        )
                         .await;
                 }
                 // Only unpublished SHM preparation can select another carrier.
@@ -1803,20 +1814,27 @@ impl IpcClient {
                 Err(error) => return Err(pre_dispatch_call_error(error)),
             }
         }
-        match choose_request_transport(&self.config, false, data_len) {
+        match choose_request_transport(false, data_len) {
             RequestTransportKind::Chunked => {
                 self.call_chunked_stream_controlled(
                     &identity,
                     method_idx,
                     data_len,
                     futures_util::stream::iter([Ok::<_, std::io::Error>(data)]),
+                    max_payload_size,
                     Some(control.clone()),
                 )
                 .await
             }
             RequestTransportKind::Inline | RequestTransportKind::Buddy => {
-                self.call_inline_controlled(&identity, method_idx, data, Some(control))
-                    .await
+                self.call_inline_controlled(
+                    &identity,
+                    method_idx,
+                    data,
+                    max_payload_size,
+                    Some(control),
+                )
+                .await
             }
         }
     }
@@ -1849,7 +1867,7 @@ impl IpcClient {
         method_name: &str,
         data_len: u64,
         chunks: S,
-        payload_budget: Option<&PayloadBufferBudget>,
+        payload_budget: Option<&DomainBudget>,
     ) -> Result<ResponseData, crate::sync_client::IpcCallError>
     where
         S: Stream<Item = Result<B, E>> + Send + 'static,
@@ -1869,6 +1887,7 @@ impl IpcClient {
             method_idx,
             identity,
             data_len,
+            max_payload_size,
             chunks,
             payload_budget,
         )
@@ -1880,8 +1899,9 @@ impl IpcClient {
         method_idx: u16,
         identity: RouteCallIdentity,
         data_len: u64,
+        max_payload_size: u64,
         chunks: S,
-        payload_budget: Option<&PayloadBufferBudget>,
+        payload_budget: Option<&DomainBudget>,
     ) -> Result<ResponseData, crate::sync_client::IpcCallError>
     where
         S: Stream<Item = Result<B, E>> + Send + 'static,
@@ -1890,29 +1910,45 @@ impl IpcClient {
     {
         let data_len = checked_payload_len_usize(data_len).map_err(pre_dispatch_call_error)?;
         if data_len == 0 {
-            return self.call_inline(&identity, method_idx, &[]).await;
+            return self
+                .call_inline_capped(&identity, method_idx, &[], max_payload_size)
+                .await;
         }
 
-        match choose_request_transport(&self.config, self.shm_request_available(), data_len) {
+        match choose_request_transport(self.shm_request_available(), data_len) {
             RequestTransportKind::Buddy => {
                 if let Some(block) = self
                     .try_alloc_request_block(data_len)
                     .map_err(pre_dispatch_call_error)?
                 {
                     return self
-                        .call_buddy_stream(&identity, method_idx, block, data_len, chunks)
+                        .call_buddy_stream(
+                            &identity,
+                            method_idx,
+                            block,
+                            data_len,
+                            max_payload_size,
+                            chunks,
+                        )
                         .await;
                 }
-                match choose_request_transport(&self.config, false, data_len) {
+                match choose_request_transport(false, data_len) {
                     RequestTransportKind::Chunked => {
-                        self.call_chunked_stream_phased(&identity, method_idx, data_len, chunks)
-                            .await
+                        self.call_chunked_stream_phased(
+                            &identity,
+                            method_idx,
+                            data_len,
+                            max_payload_size,
+                            chunks,
+                        )
+                        .await
                     }
                     RequestTransportKind::Inline | RequestTransportKind::Buddy => {
                         self.call_collected_inline(
                             &identity,
                             method_idx,
                             data_len,
+                            max_payload_size,
                             chunks,
                             payload_budget,
                         )
@@ -1921,12 +1957,25 @@ impl IpcClient {
                 }
             }
             RequestTransportKind::Chunked => {
-                self.call_chunked_stream_phased(&identity, method_idx, data_len, chunks)
-                    .await
+                self.call_chunked_stream_phased(
+                    &identity,
+                    method_idx,
+                    data_len,
+                    max_payload_size,
+                    chunks,
+                )
+                .await
             }
             RequestTransportKind::Inline => {
-                self.call_collected_inline(&identity, method_idx, data_len, chunks, payload_budget)
-                    .await
+                self.call_collected_inline(
+                    &identity,
+                    method_idx,
+                    data_len,
+                    max_payload_size,
+                    chunks,
+                    payload_budget,
+                )
+                .await
             }
         }
     }
@@ -1936,8 +1985,9 @@ impl IpcClient {
         identity: &RouteCallIdentity,
         method_idx: u16,
         data_len: usize,
+        max_payload_size: u64,
         chunks: S,
-        payload_budget: Option<&PayloadBufferBudget>,
+        payload_budget: Option<&DomainBudget>,
     ) -> Result<ResponseData, crate::IpcCallError>
     where
         S: Stream<Item = Result<B, E>> + Send + 'static,
@@ -1947,15 +1997,15 @@ impl IpcClient {
         // The source already owns B. Reserve its sending copy before either
         // allocation or polling the source, without waiting on our own input.
         let reservation = payload_budget
-            .map(|budget| budget.try_reserve(data_len as u64))
+            .map(|budget| budget.try_reserve_memory(data_len as u64))
             .transpose()
             .map_err(|error| {
                 pre_dispatch_call_error(IpcError::LocalCallRejected(
                     C2Error::new(ErrorCode::CallCapacityExceeded, error.to_string()).with_details(
-                        std::collections::BTreeMap::from([(
-                            "dispatch_phase".into(),
-                            "pre_dispatch".into(),
-                        )]),
+                        std::collections::BTreeMap::from([
+                            ("dispatch_phase".into(), "pre_dispatch".into()),
+                            ("stage".into(), "payload_buffer_admission".into()),
+                        ]),
                     ),
                 ))
             })?;
@@ -1968,25 +2018,39 @@ impl IpcClient {
                     identity,
                     method_idx,
                     BudgetedBuffer::new(data, reservation),
+                    max_payload_size,
                     None,
                 )
                 .await
             }
             None => {
-                self.call_inline_controlled(identity, method_idx, data, None)
+                self.call_inline_controlled(identity, method_idx, data, max_payload_size, None)
                     .await
             }
         }
     }
 
     /// Inline call path: OPEN metadata and input share one frame.
+    #[cfg(test)]
     pub(crate) async fn call_inline(
         &self,
         identity: &RouteCallIdentity,
         method_idx: u16,
         data: &[u8],
     ) -> Result<ResponseData, crate::IpcCallError> {
-        self.call_inline_controlled(identity, method_idx, data, None)
+        self.call_inline_controlled(identity, method_idx, data, DEFAULT_MAX_PAYLOAD_SIZE, None)
+            .await
+    }
+
+    /// Route-resolved inline path carrying the route's reply-value cap.
+    pub(crate) async fn call_inline_capped(
+        &self,
+        identity: &RouteCallIdentity,
+        method_idx: u16,
+        data: &[u8],
+        max_payload_size: u64,
+    ) -> Result<ResponseData, crate::IpcCallError> {
+        self.call_inline_controlled(identity, method_idx, data, max_payload_size, None)
             .await
     }
 
@@ -1995,10 +2059,13 @@ impl IpcClient {
         identity: &RouteCallIdentity,
         method_idx: u16,
         data: B,
+        max_payload_size: u64,
         control: Option<&IpcCallControl>,
     ) -> Result<ResponseData, crate::IpcCallError> {
         IpcCallControl::check_preparation(control).map_err(pre_dispatch_call_error)?;
-        let (send, mut rx) = self.begin_call().map_err(pre_dispatch_call_error)?;
+        let (send, mut rx) = self
+            .begin_call(max_payload_size)
+            .map_err(pre_dispatch_call_error)?;
         // The draft has no wire identity until the unique writer submits it.
         let bytes = rpc::encode_open_draft_frame(
             identity,
@@ -2032,6 +2099,7 @@ impl IpcClient {
         identity: &RouteCallIdentity,
         method_idx: u16,
         data: &[u8],
+        max_payload_size: u64,
         control: Option<&IpcCallControl>,
     ) -> Result<ResponseData, crate::IpcCallError> {
         let block = self
@@ -2041,7 +2109,7 @@ impl IpcClient {
                 pre_dispatch_call_error(IpcError::Shm("request SHM allocation unavailable".into()))
             })?;
         block.write_at(0, data).map_err(pre_dispatch_call_error)?;
-        self.call_with_prealloc_controlled(identity, method_idx, &block, control)
+        self.call_with_prealloc_controlled(identity, method_idx, &block, max_payload_size, control)
             .await
     }
 
@@ -2065,6 +2133,7 @@ impl IpcClient {
         method_idx: u16,
         block: RequestBlock,
         data_size: usize,
+        max_payload_size: u64,
         chunks: S,
     ) -> Result<ResponseData, crate::sync_client::IpcCallError>
     where
@@ -2113,19 +2182,32 @@ impl IpcClient {
         // Preparation errors above are proven unpublished. Once the actual
         // send function takes over, preserve its existing error classification
         // and conservative ownership of any partially published buddy frame.
-        self.call_with_prealloc(identity, method_idx, &block).await
+        self.call_with_prealloc_capped(identity, method_idx, &block, max_payload_size)
+            .await
     }
 
     /// Publish a filled block through its original pool and physical connection.
     /// The move-only preparation token releases it on cancellation before I/O;
     /// after publication the loan book waits for release or peer end.
+    #[cfg(test)]
     pub(crate) async fn call_with_prealloc(
         &self,
         identity: &RouteCallIdentity,
         method_idx: u16,
         block: &RequestBlock,
     ) -> Result<ResponseData, crate::IpcCallError> {
-        self.call_with_prealloc_controlled(identity, method_idx, block, None)
+        self.call_with_prealloc_capped(identity, method_idx, block, DEFAULT_MAX_PAYLOAD_SIZE)
+            .await
+    }
+
+    pub(crate) async fn call_with_prealloc_capped(
+        &self,
+        identity: &RouteCallIdentity,
+        method_idx: u16,
+        block: &RequestBlock,
+        max_payload_size: u64,
+    ) -> Result<ResponseData, crate::IpcCallError> {
+        self.call_with_prealloc_controlled(identity, method_idx, block, max_payload_size, None)
             .await
     }
 
@@ -2134,10 +2216,13 @@ impl IpcClient {
         identity: &RouteCallIdentity,
         method_idx: u16,
         block: &RequestBlock,
+        max_payload_size: u64,
         control: Option<&IpcCallControl>,
     ) -> Result<ResponseData, crate::IpcCallError> {
         IpcCallControl::check_preparation(control).map_err(pre_dispatch_call_error)?;
-        let (send, mut rx) = self.begin_call().map_err(pre_dispatch_call_error)?;
+        let (send, mut rx) = self
+            .begin_call(max_payload_size)
+            .map_err(pre_dispatch_call_error)?;
         let loan = block.prepare(&send.conn).map_err(pre_dispatch_call_error)?;
         let alloc = block.allocation();
         let descriptor = BuddyPayload {
@@ -2178,6 +2263,7 @@ impl IpcClient {
         identity: &RouteCallIdentity,
         method_idx: u16,
         data: &[u8],
+        max_payload_size: u64,
         control: Option<&IpcCallControl>,
     ) -> Result<ResponseData, crate::IpcCallError> {
         IpcCallControl::check_preparation(control).map_err(pre_dispatch_call_error)?;
@@ -2186,6 +2272,7 @@ impl IpcClient {
             method_idx,
             data.len(),
             futures_util::stream::iter([Ok::<_, std::io::Error>(data.to_vec())]),
+            max_payload_size,
             control.cloned(),
         )
         .await
@@ -2196,6 +2283,7 @@ impl IpcClient {
         identity: &RouteCallIdentity,
         method_idx: u16,
         data_size: usize,
+        max_payload_size: u64,
         chunks: S,
     ) -> Result<ResponseData, crate::IpcCallError>
     where
@@ -2203,8 +2291,15 @@ impl IpcClient {
         B: AsRef<[u8]> + Send + 'static,
         E: Display + Send + 'static,
     {
-        self.call_chunked_stream_controlled(identity, method_idx, data_size, chunks, None)
-            .await
+        self.call_chunked_stream_controlled(
+            identity,
+            method_idx,
+            data_size,
+            chunks,
+            max_payload_size,
+            None,
+        )
+        .await
     }
 
     async fn call_chunked_stream_controlled<S, B, E>(
@@ -2213,6 +2308,7 @@ impl IpcClient {
         method_idx: u16,
         data_size: usize,
         chunks: S,
+        max_payload_size: u64,
         policy: Option<IpcCallControl>,
     ) -> Result<ResponseData, crate::IpcCallError>
     where
@@ -2220,15 +2316,23 @@ impl IpcClient {
         B: AsRef<[u8]> + Send + 'static,
         E: Display + Send + 'static,
     {
-        let chunk_size = self.config.chunk_size as usize;
+        let chunk_size = CHUNK_SIZE as usize;
         let total_chunks =
             request_chunk_count(data_size, chunk_size).map_err(pre_dispatch_call_error)?;
         if total_chunks == 0 {
             return self
-                .call_inline_controlled(identity, method_idx, &[], policy.as_ref())
+                .call_inline_controlled(
+                    identity,
+                    method_idx,
+                    &[],
+                    max_payload_size,
+                    policy.as_ref(),
+                )
                 .await;
         }
-        let (mut send, mut rx) = self.begin_call().map_err(pre_dispatch_call_error)?;
+        let (mut send, mut rx) = self
+            .begin_call(max_payload_size)
+            .map_err(pre_dispatch_call_error)?;
         let conn = send.conn.clone();
         let state = send.state.clone();
         let identity = identity.clone();
@@ -2955,7 +3059,24 @@ pub(crate) fn recv_loop(
                 request_id: u64::from_le_bytes(header[4..12].try_into().unwrap()),
                 flags: u32::from_le_bytes(header[12..].try_into().unwrap()),
             };
-            if hdr.total_len < 12 {
+            // Validate the frame length before allocating any payload buffer.
+            // A control reply (FLAG_CTRL|FLAG_RESPONSE) for an active control
+            // pending may carry a full route catalog, so it is bounded by the
+            // handshake frame bound; every other post-handshake frame is a
+            // business/RPC record bounded by MAX_RPC_FRAME_BYTES.
+            let control_reply = hdr.flags == (flags::FLAG_CTRL | flags::FLAG_RESPONSE) && {
+                let calls = pending.lock();
+                matches!(
+                    calls.get(&hdr.request_id).map(|entry| entry.kind),
+                    Some(PendingKind::Control)
+                )
+            };
+            let frame_cap = if control_reply {
+                MAX_HANDSHAKE_FRAME_BYTES
+            } else {
+                MAX_RPC_FRAME_BYTES
+            };
+            if hdr.total_len < 12 || u64::from(hdr.total_len) > frame_cap {
                 conn.framing_failed("response_frame_size");
                 malformed = true;
                 break;
@@ -3475,8 +3596,9 @@ fn receive_rpc_chunk(
         if call.reply_chunks.is_some() {
             return Err(IpcError::Protocol("duplicate CALL_END first chunk".into()));
         }
+        let max_payload_size = call.max_payload_size;
         call.reply_chunks = Some(receive);
-        Some((total_bytes, geometry))
+        Some((total_bytes, geometry, max_payload_size))
     } else {
         None
     };
@@ -3492,15 +3614,19 @@ fn receive_rpc_chunk(
             .admit(bytes)
             .map_err(|e| IpcError::Protocol(e.into()))?
     };
-    if let Some((total, (count, size))) = geometry {
+    if let Some((total, (count, size), max_payload_size)) = geometry {
         registry
-            .insert_reply(conn_id, rid, total, count, size)
+            .insert_reply(conn_id, rid, total, count, size, max_payload_size)
             .map_err(|error| IpcError::Chunk(error.into()))?;
     }
     let data = match (value.storage, carrier) {
         (ValueStorage::Inline(bytes), None) => std::borrow::Cow::Borrowed(bytes),
         (_, Some(carrier)) => {
-            std::borrow::Cow::Owned(carrier.into_owned_bytes().map_err(IpcError::Shm)?)
+            let copied = carrier.into_owned_bytes().map_err(IpcError::Shm)?;
+            // The copy above is real work on an admitted assembly; keep its
+            // activity timestamp current before feeding the bytes.
+            registry.touch(conn_id, rid);
+            std::borrow::Cow::Owned(copied)
         }
         _ => unreachable!("SHM carrier admitted before sequence validation"),
     };

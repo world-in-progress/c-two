@@ -12,6 +12,46 @@ async fn until(mut predicate: impl FnMut() -> bool) {
     .expect("expected state did not become observable");
 }
 
+async fn read_tagged_record(peer: &mut LocalStream) -> (u64, SeenRecord) {
+    let mut len = [0; 4];
+    tokio::time::timeout(Duration::from_secs(5), peer.read_exact(&mut len))
+        .await
+        .unwrap()
+        .unwrap();
+    let mut body = vec![0; u32::from_le_bytes(len) as usize];
+    tokio::time::timeout(Duration::from_secs(5), peer.read_exact(&mut body))
+        .await
+        .unwrap()
+        .unwrap();
+    let mut bytes = len.to_vec();
+    bytes.extend_from_slice(&body);
+    let (header, payload) = frame::decode_frame(&bytes).unwrap();
+    let id = header.request_id;
+    let mode = if id == 1 {
+        CallMode::ServerStream
+    } else {
+        assert_eq!(id, 2);
+        CallMode::Unary
+    };
+    let seen = match rpc::decode_rpc_record(&header, payload, Some(mode)).unwrap() {
+        RpcRecord::ItemData {
+            value:
+                ValuePart {
+                    storage: ValueStorage::Inline(data),
+                    ..
+                },
+        } => SeenRecord::Data(data.to_vec()),
+        RpcRecord::CallEnd {
+            status,
+            complete_items,
+            error,
+            ..
+        } => SeenRecord::End(status, complete_items, error.map(|e| e.code)),
+        record => panic!("unexpected resumed record for call {id}: {record:?}"),
+    };
+    (id, seen)
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn stopped_local_reads_bound_calls_and_preserve_half_frame_close_truth() {
     // Block 9b3 requirement 3: a real local peer stops reading a large frame.
@@ -25,11 +65,8 @@ async fn stopped_local_reads_bound_calls_and_preserve_half_frame_close_truth() {
     *observed.release_unary.lock().unwrap() = Some(release_unary_rx);
     let mut config = ServerIpcConfig::default();
     config.max_execution_workers = 2;
-    config.max_pending_requests = 2;
-    config.base.write_timeout_secs = 0.01;
-    config.base.chunk_size = STALLED_ITEM_BYTES as u64;
-    config.max_frame_size = STALLED_ITEM_BYTES as u64 + 1024;
-    let mut harness = Harness::start(observed.clone(), config, 0).await;
+    let mut harness =
+        Harness::start_with_timeout(observed.clone(), config, 0, Duration::from_millis(50)).await;
 
     harness.open(1, &[1]).await;
     assert!(matches!(
@@ -72,10 +109,13 @@ async fn stopped_local_reads_bound_calls_and_preserve_half_frame_close_truth() {
     assert!(conn.core.stream_state(1).is_some());
     assert_eq!(conn.calls.lock().active().count(), 2);
     assert!((0..=2).contains(&conn.inflight_count()));
-    assert_eq!(harness.server.pending_requests.available_permits(), 0);
+    assert_eq!(
+        harness.server.domain_snapshot().operations.used_operations,
+        2
+    );
     assert_eq!(
         observed.encoded_ranges.lock().unwrap().as_slice(),
-        &[(0, STALLED_ITEM_BYTES)]
+        &[(0, c2_config::CHUNK_SIZE as usize)]
     );
     assert!(
         !conn.try_close(),
@@ -118,14 +158,16 @@ async fn stopped_local_reads_bound_calls_and_preserve_half_frame_close_truth() {
     assert!(conn.calls.lock().active().count() <= 2);
     assert!(conn.inflight_count() <= 2);
 
-    assert!(matches!(
-        read_record(&mut harness.peer, CallMode::ServerStream).await,
-        SeenRecord::Data(bytes) if bytes.len() == STALLED_ITEM_BYTES
-    ));
-    assert!(matches!(
-        read_record(&mut harness.peer, CallMode::Unary).await,
-        SeenRecord::End(CallStatus::Success, None, None)
-    ));
+    let mut received = 0;
+    let mut unary = false;
+    while received < STALLED_ITEM_BYTES || !unary {
+        match read_tagged_record(&mut harness.peer).await {
+            (1, SeenRecord::Data(bytes)) => received += bytes.len(),
+            (2, SeenRecord::End(CallStatus::Success, None, None)) if !unary => unary = true,
+            other => panic!("unexpected resumed record: {other:?}"),
+        }
+    }
+    assert_eq!(received, STALLED_ITEM_BYTES);
     harness
         .peer
         .write_all(&rpc::encode_credit_frame(1, 0, 1).unwrap())
@@ -200,46 +242,6 @@ mod posix {
         }
     }
 
-    async fn read_tagged_record(peer: &mut LocalStream) -> (u64, SeenRecord) {
-        let mut len = [0; 4];
-        tokio::time::timeout(Duration::from_secs(5), peer.read_exact(&mut len))
-            .await
-            .unwrap()
-            .unwrap();
-        let mut body = vec![0; u32::from_le_bytes(len) as usize];
-        tokio::time::timeout(Duration::from_secs(5), peer.read_exact(&mut body))
-            .await
-            .unwrap()
-            .unwrap();
-        let mut bytes = len.to_vec();
-        bytes.extend_from_slice(&body);
-        let (header, payload) = frame::decode_frame(&bytes).unwrap();
-        let id = header.request_id;
-        let mode = if id == 1 {
-            CallMode::ServerStream
-        } else {
-            assert_eq!(id, 2);
-            CallMode::Unary
-        };
-        let seen = match rpc::decode_rpc_record(&header, payload, Some(mode)).unwrap() {
-            RpcRecord::ItemData {
-                value:
-                    ValuePart {
-                        storage: ValueStorage::Inline(data),
-                        ..
-                    },
-            } => SeenRecord::Data(data.to_vec()),
-            RpcRecord::CallEnd {
-                status,
-                complete_items,
-                error,
-                ..
-            } => SeenRecord::End(status, complete_items, error.map(|e| e.code)),
-            record => panic!("unexpected resumed record for call {id}: {record:?}"),
-        };
-        (id, seen)
-    }
-
     #[test]
     #[ignore = "run only as the controlled child of sigstop_peer_resumes_and_settles"]
     fn stalled_peer_child() {
@@ -303,15 +305,14 @@ mod posix {
             let mut command = String::new();
             std::io::stdin().read_line(&mut command).unwrap();
             assert_eq!(command, "read\n");
-            let mut saw_data = false;
+            let mut received = 0;
             let mut saw_unary = false;
             let mut saw_stream_end = false;
-            for _ in 0..3 {
+            for _ in 0..STALLED_ITEM_BYTES / c2_config::CHUNK_SIZE as usize + 2 {
                 match read_tagged_record(&mut peer).await {
                     (1, SeenRecord::Data(bytes)) => {
-                        assert!(!saw_data);
-                        assert_eq!(bytes.len(), STALLED_ITEM_BYTES);
-                        saw_data = true;
+                        assert_eq!(bytes.len(), c2_config::CHUNK_SIZE as usize);
+                        received += bytes.len();
                     }
                     (2, SeenRecord::End(CallStatus::Success, None, None)) => {
                         assert!(!saw_unary);
@@ -325,13 +326,16 @@ mod posix {
                             Some(ErrorCode::CallCancelled),
                         ),
                     ) => {
-                        assert!(saw_data, "CALL_END cannot overtake its item");
+                        assert_eq!(
+                            received, STALLED_ITEM_BYTES,
+                            "CALL_END cannot overtake its item"
+                        );
                         saw_stream_end = true;
                     }
                     other => panic!("unexpected resumed record: {other:?}"),
                 }
             }
-            assert!(saw_data && saw_unary && saw_stream_end);
+            assert!(saw_unary && saw_stream_end);
             println!("C2_PEER_SETTLED");
             std::io::stdout().flush().unwrap();
         });
@@ -349,10 +353,7 @@ mod posix {
             .unwrap()
             .endpoint("ipc://stalled-peer")
             .unwrap();
-        let mut config = ServerIpcConfig::default();
-        config.base.write_timeout_secs = 30.0;
-        config.base.chunk_size = STALLED_ITEM_BYTES as u64;
-        config.max_frame_size = STALLED_ITEM_BYTES as u64 + 1024;
+        let config = ServerIpcConfig::default();
         let server = Arc::new(Server::new_with_endpoint(endpoint, config).unwrap());
         let observed = Arc::new(Observed::default());
         observed
@@ -444,7 +445,7 @@ mod posix {
         assert!(conn.inflight_count() <= 2);
         assert_eq!(
             observed.encoded_ranges.lock().unwrap().as_slice(),
-            &[(0, STALLED_ITEM_BYTES)]
+            &[(0, c2_config::CHUNK_SIZE as usize)]
         );
         assert!(!conn.try_close());
         release_unary_tx.send(()).unwrap();

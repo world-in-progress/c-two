@@ -63,6 +63,9 @@ enum PreparedRecordKind {
 pub(crate) struct ConnectionWriter {
     queue: mpsc::Sender<Submission>,
     controls: mpsc::UnboundedSender<Submission>,
+    /// This physical connection's own bounded control-reply slots. A peer
+    /// that stops reading exhausts only its own connection; every other
+    /// connection keeps its independent budget.
     control_budget: Arc<Semaphore>,
     pub(crate) conn: Arc<Connection>,
 }
@@ -121,14 +124,16 @@ impl ConnectionWriter {
         write_half: LocalWriteHalf,
         conn: Arc<Connection>,
         write_timeout: Duration,
-        control_budget: Arc<Semaphore>,
+        control_reply_capacity: usize,
     ) -> (Arc<Self>, JoinHandle<()>) {
         let (queue, receiver) = mpsc::channel(QUEUE_CAPACITY);
         let (controls, control_receiver) = mpsc::unbounded_channel();
         let writer = Arc::new(Self {
             queue,
             controls,
-            control_budget,
+            // One bounded control budget per physical connection: exhaustion
+            // ends only this connection with `reply_pending_capacity`.
+            control_budget: Arc::new(Semaphore::new(control_reply_capacity)),
             conn: conn.clone(),
         });
         // Keep the physical retirement owner until the write half has gone.
@@ -997,12 +1002,8 @@ mod tests {
         let (server, mut client) = crate::test_support::isolated_pair().await;
         let (reader, write_half) = server.into_split();
         let conn = Arc::new(Connection::new(1));
-        let (writer, task) = ConnectionWriter::spawn(
-            write_half,
-            conn.clone(),
-            Duration::from_secs(30),
-            Arc::new(Semaphore::new(1024)),
-        );
+        let (writer, task) =
+            ConnectionWriter::spawn(write_half, conn.clone(), Duration::from_secs(30), 1024);
         let bytes = vec![0x5a; 1024 * 1024];
         let expected_len = bytes.len();
         let caller = tokio::spawn({

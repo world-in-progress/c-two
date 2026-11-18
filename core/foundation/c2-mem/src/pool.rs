@@ -17,6 +17,7 @@ use crate::{BudgetError, DomainBudget, MemoryReservation, PayloadBufferError};
 use base64::Engine;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::marker::PhantomData;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -801,6 +802,83 @@ impl MemPool {
         }
     }
 
+    // ── Short-critical-section mapping pins ───────────────────────────
+
+    /// Pin a held SHM handle's mapping for reading without holding a pool
+    /// borrow. Validation and the mapping-owner clone happen inside the
+    /// caller's short pool critical section; the returned guard then keeps
+    /// only the mapping alive, so slow work through
+    /// [`ShmRefPin::as_slice`] never blocks pool writes (for example a
+    /// receive loop's `RELEASE` recycling).
+    pub fn pin_shm_ref<'a>(&self, handle: &'a MemHandle) -> Result<ShmRefPin<'a>, String> {
+        let (mapping, offset) = self.checked_handle_pin(handle)?;
+        Ok(ShmRefPin {
+            mapping,
+            offset,
+            len: handle.len(),
+            owner: PhantomData,
+        })
+    }
+
+    /// Exclusive mapping pin for a held SHM handle. The guard borrows the
+    /// move-only handle exclusively, so the pinned slice excludes every other
+    /// safe access to this allocation while it lives.
+    pub fn pin_shm_mut<'a>(&self, handle: &'a mut MemHandle) -> Result<ShmMutPin<'a>, String> {
+        let (mapping, offset) = self.checked_handle_pin(handle)?;
+        let len = handle.len();
+        Ok(ShmMutPin {
+            mapping,
+            offset,
+            len,
+            owner: PhantomData,
+        })
+    }
+
+    fn checked_handle_pin(
+        &self,
+        handle: &MemHandle,
+    ) -> Result<(Arc<crate::segment::ChargedMapping>, usize), String> {
+        self.validate_handle_owner(handle)?;
+        match &handle.backing {
+            HandleBacking::Shm { allocation, .. } => {
+                self.validate_generation(
+                    allocation.seg_idx,
+                    allocation.generation,
+                    allocation.is_dedicated,
+                )?;
+                if allocation.is_dedicated {
+                    let entry = self
+                        .dedicated
+                        .get(&allocation.seg_idx)
+                        .ok_or("invalid dedicated segment index")?;
+                    let mapping = entry
+                        .segment
+                        .try_pin()
+                        .ok_or("stale or unavailable shared-memory backing generation")?;
+                    Ok((mapping, 0))
+                } else {
+                    let segment = self
+                        .segments
+                        .get(allocation.seg_idx as usize)
+                        .and_then(Option::as_ref)
+                        .ok_or("invalid segment index")?;
+                    let mapping = segment
+                        .try_pin()
+                        .ok_or("stale or unavailable shared-memory backing generation")?;
+                    check_span(
+                        segment.size(),
+                        allocation.offset as usize,
+                        allocation.actual_size as usize,
+                    )?;
+                    Ok((mapping, allocation.offset as usize))
+                }
+            }
+            HandleBacking::FileSpill { .. } => {
+                Err("file-spill handles do not pin a shared-memory mapping".into())
+            }
+        }
+    }
+
     /// Consume the allocation owner. The caller retains this original pool
     /// alongside every local handle or connection loan until release.
     ///
@@ -1060,6 +1138,97 @@ impl PoolAllocation {
                 len,
             },
         }
+    }
+}
+
+/// Read mapping pin returned by [`MemPool::pin_shm_ref`].
+///
+/// The pin holds the mapping owner, not a pool borrow: slow reads through
+/// [`ShmRefPin::as_slice`] run after the pool critical section ended and
+/// never block pool writers. Its lifetime borrows the shared handle, so it
+/// cannot outlive the owner it was pinned for.
+pub struct ShmRefPin<'a> {
+    mapping: Arc<crate::segment::ChargedMapping>,
+    offset: usize,
+    len: usize,
+    owner: PhantomData<&'a MemHandle>,
+}
+
+impl<'a> ShmRefPin<'a> {
+    /// The pinned handle's logical bytes.
+    pub fn as_slice(&self) -> &[u8] {
+        // SAFETY: admission of the handle validated pool identity, backing
+        // generation and the allocation span; the mapping owner pins the
+        // mapping and the handle borrow keeps the owner alive and untrimmed.
+        unsafe {
+            std::slice::from_raw_parts(
+                self.mapping.region.base_ptr().wrapping_add(self.offset),
+                self.len,
+            )
+        }
+    }
+}
+
+/// Exclusive mapping pin returned by [`MemPool::pin_shm_mut`].
+///
+/// Like [`ShmRefPin`] it holds the mapping owner rather than a pool borrow,
+/// so external encoding or byte copies through
+/// [`ShmMutPin::as_mut_slice`] run outside every pool critical section. The
+/// exclusive handle borrow excludes all other safe accesses to this
+/// allocation while the pin lives.
+pub struct ShmMutPin<'a> {
+    mapping: Arc<crate::segment::ChargedMapping>,
+    offset: usize,
+    len: usize,
+    owner: PhantomData<&'a mut MemHandle>,
+}
+
+impl<'a> ShmMutPin<'a> {
+    /// The pinned handle's logical bytes, exclusively.
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        // SAFETY: admission of the handle validated pool identity, backing
+        // generation and the allocation span; the mapping owner pins the
+        // mapping and the exclusive handle borrow excludes other writers and
+        // readers of this allocation.
+        unsafe {
+            std::slice::from_raw_parts_mut(
+                self.mapping.region.base_ptr().wrapping_add(self.offset),
+                self.len,
+            )
+        }
+    }
+
+    /// Copy `data` into the pinned mapping at `offset`.
+    pub fn write_at(&mut self, offset: usize, data: &[u8]) -> Result<(), String> {
+        let end = offset
+            .checked_add(data.len())
+            .ok_or_else(|| "pinned write span overflows the platform range".to_string())?;
+        if end > self.len {
+            return Err(format!(
+                "pinned write span {offset}..{end} is outside the {} byte allocation",
+                self.len
+            ));
+        }
+        self.as_mut_slice()[offset..end].copy_from_slice(data);
+        Ok(())
+    }
+}
+
+impl std::fmt::Debug for ShmRefPin<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ShmRefPin")
+            .field("offset", &self.offset)
+            .field("len", &self.len)
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for ShmMutPin<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ShmMutPin")
+            .field("offset", &self.offset)
+            .field("len", &self.len)
+            .finish_non_exhaustive()
     }
 }
 
@@ -2137,6 +2306,70 @@ mod handle_tests {
             pattern
         );
         pool.release_handle(handle);
+    }
+
+    #[test]
+    fn shm_pins_read_write_outside_the_pool_critical_section() {
+        for size in [4096, 128 * 1024] {
+            let mut pool = MemPool::new(test_config()).unwrap();
+            let mut handle = pool.alloc_shm_handle(size).unwrap();
+            {
+                let mut pin = pool.pin_shm_mut(&mut handle).unwrap();
+                pin.as_mut_slice().fill(0x5a);
+                pin.write_at(0, b"pinned").unwrap();
+                assert!(pin.write_at(size, &[1]).unwrap_err().contains("outside"));
+                assert!(
+                    pin.write_at(usize::MAX, &[1])
+                        .unwrap_err()
+                        .contains("overflows")
+                );
+            }
+            {
+                let pin = pool.pin_shm_ref(&handle).unwrap();
+                assert_eq!(&pin.as_slice()[..6], b"pinned");
+                assert_eq!(pin.as_slice().len(), size);
+                assert_eq!(&pin.as_slice()[6..], &vec![0x5a; size - 6]);
+            }
+            // Reads through a pin stay valid while another allocation takes
+            // and releases a pool write lock.
+            {
+                let pin = pool.pin_shm_ref(&handle).unwrap();
+                let mut other = pool.alloc_shm_handle(4096).unwrap();
+                pool.handle_slice_mut(&mut other).fill(0x33);
+                pool.release_handle(other);
+                assert_eq!(pin.as_slice()[0], b'p');
+            }
+            pool.release_handle(handle);
+        }
+    }
+
+    #[test]
+    fn shm_pins_reject_file_spill_and_foreign_owners() {
+        let dir = std::env::temp_dir().join("c2_pool_pin_spill_test");
+        let mut pool = MemPool::new(PoolConfig {
+            spill_threshold: 0.0,
+            spill_dir: dir.clone(),
+            ..test_config()
+        })
+        .unwrap();
+        let mut handle = pool.alloc_handle(8192).unwrap();
+        if handle.is_file_spill() {
+            assert!(
+                pool.pin_shm_ref(&handle)
+                    .unwrap_err()
+                    .contains("file-spill")
+            );
+            assert!(
+                pool.pin_shm_mut(&mut handle)
+                    .unwrap_err()
+                    .contains("file-spill")
+            );
+        } else {
+            let other = MemPool::new(test_config()).unwrap();
+            assert!(other.pin_shm_ref(&handle).is_err());
+        }
+        pool.release_handle(handle);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

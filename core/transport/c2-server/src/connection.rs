@@ -7,7 +7,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
 use tokio::sync::Notify;
 
-use c2_config::MAX_IPC_POOL_SEGMENTS;
 use c2_local::{ConnectionEndReason, ConnectionObservation, ConnectionPublisher, RemoteReadGuard};
 use c2_mem::PeerMappingCache;
 use c2_mem::config::PoolConfig;
@@ -16,10 +15,6 @@ use c2_wire::connection::{ConnectionCore, ConnectionError, ConnectionSide};
 // ---------------------------------------------------------------------------
 // Peer SHM state (set once during handshake, read concurrently)
 // ---------------------------------------------------------------------------
-
-/// Valid initialization geometry only; the OS mapping supplies the actual
-/// span. This does not allocate or size a peer mapping.
-const MIN_BUDDY_SEGMENT_SIZE: usize = 2 * 4096;
 
 struct PeerShmState {
     cache: Option<Arc<PeerMappingCache>>,
@@ -481,19 +476,9 @@ impl Connection {
     /// Initialise the peer SHM cache from its handshake pool incarnation.
     ///
     /// Dedicated views retire at the last admitted read; buddy views start
-    /// their configured idle window then and retire in the maintenance task.
-    pub(crate) fn init_peer_shm(&self, prefix: String, decay_seconds: f64) -> Result<(), String> {
-        let cfg = PoolConfig {
-            segment_size: MIN_BUDDY_SEGMENT_SIZE,
-            min_block_size: 4096,
-            max_segments: MAX_IPC_POOL_SEGMENTS as usize,
-            max_dedicated_segments: usize::from(u16::MAX) + 1,
-            buddy_idle_decay_secs: decay_seconds,
-            spill_threshold: 1.0,
-            spill_dir: std::env::temp_dir().join("c_two_request_cache"),
-            buddy_enabled: true,
-            min_retained_segments: 0,
-        };
+    /// their idle decay window then and retire in the maintenance task.
+    pub(crate) fn init_peer_shm(&self, prefix: String) -> Result<(), String> {
+        let cfg = PoolConfig::peer_cache_config();
         let cache = PeerMappingCache::new(cfg, prefix)?;
         self.peer_shm.lock().cache = Some(Arc::new(cache));
         Ok(())
@@ -612,7 +597,7 @@ mod tests {
     #[test]
     fn init_peer_shm_initializes_unmapped_peer_cache() {
         let conn = Connection::new(1);
-        conn.init_peer_shm("prefix".into(), 7.5).unwrap();
+        conn.init_peer_shm("prefix".into()).unwrap();
         assert_eq!(conn.peer_mappings().unwrap().mapped_segments(), 0);
     }
 

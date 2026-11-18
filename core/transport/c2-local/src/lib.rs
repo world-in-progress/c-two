@@ -566,7 +566,7 @@ impl LocalStream {
     }
 
     pub async fn write_all(&mut self, bytes: &[u8]) -> io::Result<()> {
-        self.write_all_with_timeout(bytes, c2_config::BaseIpcConfig::default().write_timeout())
+        self.write_all_with_timeout(bytes, c2_config::WRITE_TIMEOUT)
             .await
     }
 
@@ -708,7 +708,7 @@ impl LocalWriteHalf {
         self.abort.clone()
     }
     pub async fn write_all(&mut self, bytes: &[u8]) -> io::Result<()> {
-        self.write_all_with_timeout(bytes, c2_config::BaseIpcConfig::default().write_timeout())
+        self.write_all_with_timeout(bytes, c2_config::WRITE_TIMEOUT)
             .await
     }
 
@@ -901,7 +901,7 @@ mod write_completion_tests {
             &mut writer,
             abort.clone(),
             b"complete frame",
-            c2_config::BaseIpcConfig::default().write_timeout(),
+            c2_config::WRITE_TIMEOUT,
         )
         .await
         .unwrap_err();

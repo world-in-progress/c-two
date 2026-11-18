@@ -75,30 +75,25 @@ async fn normal_client_close_does_not_wait_for_frozen_peer_ack() {
 
 async fn assert_closed_backing_released(explicit_close: bool) {
     let endpoint = Endpoint::new();
-    // Force response reassembly so both local pools have idle SHM backing.
-    let mut server_config = ServerIpcConfig::default();
-    server_config.base.shm_backing_budget_bytes = 0;
-    server_config.base.chunk_size = 4096;
+    let server_config = ServerIpcConfig::default();
     let (server, runner) = start(&endpoint, Arc::new(Echo), server_config).await;
-    let mut cfg = config();
-    cfg.base.pool_prewarm_segments = 1;
-    cfg.base.reassembly_segment_size = cfg.base.pool_segment_size;
-    let mut client = IpcClient::with_endpoint(endpoint.endpoint.clone(), cfg).unwrap();
+    let mut client = endpoint.client();
     client.connect().await.unwrap();
     let binding = client.acquire_route(&contract()).await.unwrap();
     assert_eq!(
         client
-            .call_bound(&binding, "echo", &[5; 8193])
+            .call_bound(&binding, "echo", &[5; SHM_THRESHOLD as usize + 1])
             .await
             .unwrap()
             .into_owned_bytes()
             .unwrap(),
-        vec![5; 8193]
+        vec![5; SHM_THRESHOLD as usize + 1]
     );
     let request = client.request_pool().unwrap();
     let registry = client.chunk_registry.lock().clone().unwrap();
     eventually(|| request.read().stats().alloc_count == 0).await;
     let request_stats = request.read().stats();
+    registry.pool().write().ensure_buddy_segments(1).unwrap();
     let reassembly_stats = registry.pool().read().stats();
     assert_eq!(request_stats.buddy_occupied_bytes, 0);
     assert!(request_stats.buddy_idle_bytes > 0);
@@ -108,7 +103,7 @@ async fn assert_closed_backing_released(explicit_close: bool) {
     let registry_weak = Arc::downgrade(&registry);
     drop(request);
     drop(registry);
-    let budget = client.memory_budget.clone();
+    let budget = client.domain_budget().clone();
     let observation = client.connection_observation().unwrap();
     if explicit_close {
         assert!(client.close_shared_bounded(WAIT).await);
@@ -118,9 +113,9 @@ async fn assert_closed_backing_released(explicit_close: bool) {
     }
     // Retain the business client, but no transport owner may survive its
     // completed close merely to cache empty backing or await another GC poll.
-    assert_eq!(budget.snapshot().shm.used_bytes, 0);
-    assert_eq!(budget.snapshot().file.used_bytes, 0);
-    assert_eq!(budget.snapshot().reassembly.used_bytes, 0);
+    assert_eq!(budget.snapshot().memory.used_bytes, 0);
+    assert_eq!(budget.snapshot().file_spill.used_bytes, 0);
+    assert_eq!(budget.snapshot().memory.used_bytes, 0);
     assert!(request_weak.upgrade().is_none());
     assert!(registry_weak.upgrade().is_none());
     assert!(!client.is_connected());
@@ -163,14 +158,14 @@ async fn dropped_receive_task_preserves_first_cause_and_waits_only_for_remote_re
         pending.clone(),
         abort,
         retirement.clone(),
-        config().write_timeout(),
+        c2_config::WRITE_TIMEOUT,
     );
     let (_loan, pool, budget) = publish_file_loan(&conn, endpoint._root.path());
     let remote = conn
         .core
         .admit_remote_loan(991, Box::new(retirement.clone()))
         .unwrap();
-    let registry = IpcClient::build_chunk_registry(&config(), &budget).unwrap();
+    let registry = IpcClient::build_chunk_registry(&budget).unwrap();
     let peer_pool = Arc::new(RwLock::new(ServerPoolState::from_pool_for_test(
         MemPool::open_peer(c2_mem::PoolConfig::default(), "/p4unused".into()).unwrap(),
     )));
@@ -197,7 +192,7 @@ async fn dropped_receive_task_preserves_first_cause_and_waits_only_for_remote_re
             .is_err(),
         "the admitted read retains the physical stream"
     );
-    assert!(budget.snapshot().file.used_bytes > 0);
+    assert!(budget.snapshot().file_spill.used_bytes > 0);
     remote.finish();
     let closed = observation.wait_closed(Some(WAIT)).await.unwrap();
     assert_eq!(closed.reason(), ConnectionEndReason::ProtocolError);
@@ -208,7 +203,7 @@ async fn dropped_receive_task_preserves_first_cause_and_waits_only_for_remote_re
         0
     );
     assert!(!conn.core.try_close(), "unproved end must preserve L");
-    assert_eq!(budget.snapshot().file.used_bytes, 4096);
+    assert_eq!(budget.snapshot().file_spill.used_bytes, 4096);
     assert!(matches!(
         events.recv().await.unwrap(),
         Some(c2_local::ConnectionEvent::Opened(_))
@@ -226,7 +221,7 @@ async fn dropped_receive_task_preserves_first_cause_and_waits_only_for_remote_re
     // This file-backed fixture proves the live loan book's wiring. The real
     // SHM test below separately proves owner-pool retention after client Drop.
     drop(pool);
-    assert_eq!(budget.snapshot().file.used_bytes, 0);
+    assert_eq!(budget.snapshot().file_spill.used_bytes, 0);
     crate::tests::close_listener(listener).await;
 }
 
@@ -362,14 +357,10 @@ async fn bounded_close_is_honest_while_peer_stops_reading_a_started_frame() {
 }
 
 #[tokio::test]
-async fn idle_client_gc_refunds_real_buddy_segments_and_recreates_a_new_generation() {
+async fn idle_client_backing_can_retire_and_recreate_a_new_generation() {
     let endpoint = Endpoint::new();
     let (server, runner) = start(&endpoint, Arc::new(Echo), ServerIpcConfig::default()).await;
-    let mut cfg = config();
-    cfg.base.max_pool_segments = 1;
-    cfg.base.chunk_gc_interval_secs = 0.01;
-    cfg.pool_decay_seconds = 0.01;
-    let mut client = IpcClient::with_endpoint(endpoint.endpoint.clone(), cfg).unwrap();
+    let mut client = endpoint.client();
     client.connect().await.unwrap();
     let binding = client.acquire_route(&contract()).await.unwrap();
     let pool = client.request_pool().unwrap();
@@ -391,8 +382,10 @@ async fn idle_client_gc_refunds_real_buddy_segments_and_recreates_a_new_generati
             vec![9; 8193]
         );
         drop(block);
-        eventually(|| pool.read().segment_count() == 0).await;
-        assert_eq!(client.memory_budget.snapshot().shm.used_bytes, 0);
+        pool.write().set_idle_backing_retention(false);
+        assert_eq!(pool.read().stats().buddy_idle_bytes, 0);
+        pool.write().set_idle_backing_retention(true);
+        assert_eq!(client.domain_snapshot().memory.used_bytes, 0);
         assert!(client.is_connected());
     }
     assert!(client.close_shared_bounded(WAIT).await);
@@ -439,9 +432,11 @@ async fn published_shm_loan_and_budget_survive_cancellation_close_and_client_dro
                 drop(stream);
                 crate::tests::close_listener(listener).await;
             });
-            let mut cfg = config();
-            cfg.base.pool_enabled = !dedicated;
-            let mut client = IpcClient::with_endpoint(endpoint.endpoint.clone(), cfg).unwrap();
+            let mut client = IpcClient::with_endpoint_and_budget(
+                endpoint.endpoint.clone(),
+                crate::tests::memory_budget(if dedicated { 224 * 1024 } else { 1024 * 1024 }),
+            )
+            .unwrap();
             client.connect().await.unwrap();
             let pool = client.request_pool().unwrap();
             if !dedicated {
@@ -455,7 +450,7 @@ async fn published_shm_loan_and_budget_survive_cancellation_close_and_client_dro
                 .expect("real SHM allocation is required");
             assert_eq!(block.allocation().is_dedicated, dedicated);
             block.write_at(0, &[7; 8193]).unwrap();
-            let budget = client.memory_budget.clone();
+            let budget = client.domain_budget().clone();
             let observation = client.connection_observation().unwrap();
             let client = Arc::new(client);
             let caller = tokio::spawn({
@@ -469,36 +464,37 @@ async fn published_shm_loan_and_budget_survive_cancellation_close_and_client_dro
             assert!(!client.close_shared_bounded(Duration::from_millis(20)).await);
             drop(client);
             assert_eq!(pool.read().stats().alloc_count, 1);
-            assert!(budget.snapshot().shm.used_bytes > 0);
+            assert!(budget.snapshot().memory.used_bytes > 0);
             assert!(observation.snapshot().is_none());
             finish.send(()).unwrap();
             observation.wait_closed(Some(WAIT)).await.unwrap();
             eventually(|| pool.read().stats().alloc_count == 0).await;
             if dedicated {
-                assert_eq!(budget.snapshot().shm.used_bytes, 0);
+                assert_eq!(budget.snapshot().memory.used_bytes, 0);
             }
             peer.await.unwrap();
         }
     }
 }
 
-// Prepared but unpublished blocks keep all 17 original segments occupied.
-// Real c2-server must accept each generation/slot, including index 16.
+// Prepared but unpublished blocks keep all 16 primary segments occupied.
 #[tokio::test]
-async fn prepared_request_owners_reach_peer_segment_index_16_and_remain_budgeted_after_close() {
+async fn prepared_request_owners_fill_primary_pool_and_remain_budgeted_after_close() {
     let endpoint = Endpoint::new();
     let (server, runner) = start(&endpoint, Arc::new(Echo), ServerIpcConfig::default()).await;
-    let mut cfg = config();
-    cfg.base.max_pool_segments = 20;
-    let mut client = IpcClient::with_endpoint(endpoint.endpoint.clone(), cfg).unwrap();
+    let mut client = IpcClient::with_endpoint_and_budget(
+        endpoint.endpoint.clone(),
+        crate::tests::memory_budget(4 * 1024 * 1024),
+    )
+    .unwrap();
     client.connect().await.unwrap();
     let binding = client.acquire_route(&contract()).await.unwrap();
     let pool = client.request_pool().unwrap();
     pool.write()
-        .ensure_buddy_segments(17)
-        .expect("17 real request SHM segments are required");
+        .ensure_buddy_segments(16)
+        .expect("16 real request SHM segments are required");
     let mut blocks = Vec::new();
-    for index in 0..17 {
+    for index in 0..16 {
         let block = client.try_alloc_request_block(64 * 1024).unwrap().unwrap();
         assert_eq!(block.allocation().seg_idx, index);
         block.write_at(0, &vec![index as u8; 64 * 1024]).unwrap();
@@ -520,18 +516,18 @@ async fn prepared_request_owners_reach_peer_segment_index_16_and_remain_budgeted
         .unwrap()
         .into_owned_bytes()
         .unwrap();
-    assert_eq!(bytes, vec![16; 64 * 1024]);
+    assert_eq!(bytes, vec![15; 64 * 1024]);
     drop(last);
     let external = client.try_alloc_request_block(64 * 1024).unwrap().unwrap();
-    let budget = client.memory_budget.clone();
+    let budget = client.domain_budget().clone();
     assert!(client.close_shared_bounded(WAIT).await);
     drop(client);
-    assert!(budget.snapshot().shm.used_bytes > 0);
+    assert!(budget.snapshot().memory.used_bytes > 0);
     assert_eq!(pool.read().stats().alloc_count, 1);
     drop(external);
     assert_eq!(pool.read().stats().alloc_count, 0);
     drop(pool);
-    assert_eq!(budget.snapshot().shm.used_bytes, 0);
+    assert_eq!(budget.snapshot().memory.used_bytes, 0);
     stop(server, runner).await;
 }
 
@@ -737,7 +733,7 @@ async fn admitted_response_error_never_enters_the_buddy_request_fallback() {
         .ensure_buddy_segments(1)
         .expect("real request SHM is required");
     let error = client
-        .call_buddy(&identity(), 0, &[8; 8193], None)
+        .call_buddy(&identity(), 0, &[8; 8193], DEFAULT_MAX_PAYLOAD_SIZE, None)
         .await
         .unwrap_err();
     assert!(matches!(error.source_error(), IpcError::ResponseFailure(_)));
@@ -750,38 +746,41 @@ async fn admitted_response_error_never_enters_the_buddy_request_fallback() {
 #[tokio::test]
 async fn disabled_buddy_chunked_request_reassembles_into_real_dedicated_shm() {
     let endpoint = Endpoint::new();
-    let mut server_config = ServerIpcConfig {
-        shm_threshold: 64 * 1024,
-        ..Default::default()
-    };
-    server_config.base.pool_enabled = false;
-    let (server, runner) = start(&endpoint, Arc::new(Echo), server_config).await;
-    let mut cfg = config();
-    cfg.base.pool_enabled = false;
-    let mut client = IpcClient::with_endpoint(endpoint.endpoint.clone(), cfg).unwrap();
+    const BYTES_LEN: usize = CHUNK_SIZE as usize + 1;
+    let (server, runner) = start_with_server_limits(
+        &endpoint,
+        Arc::new(Echo),
+        Default::default(),
+        DomainLimits {
+            memory_budget_bytes: 768 * 1024,
+            ..Default::default()
+        },
+    )
+    .await;
+    let mut client = endpoint.client();
     client.connect().await.unwrap();
     let binding = client.acquire_route(&contract()).await.unwrap();
     let bytes = client
-        .call_chunked(&binding.table.call_identity(), 0, &[8; 8193], None)
+        .call_chunked(
+            &binding.table.call_identity(),
+            0,
+            &[8; BYTES_LEN],
+            DEFAULT_MAX_PAYLOAD_SIZE,
+            None,
+        )
         .await
         .unwrap()
         .into_owned_bytes()
         .unwrap();
-    assert_eq!(bytes, vec![8; 8193]);
-    let snapshot = server.memory_budget_snapshot().budget;
+    assert_eq!(bytes, vec![8; BYTES_LEN]);
+    let snapshot = server.domain_snapshot();
     assert!(
-        snapshot.shm.peak_bytes >= 8193,
+        snapshot.memory.peak_bytes >= BYTES_LEN as u64,
         "real dedicated reassembly is required: {snapshot:?}"
     );
-    assert_eq!(snapshot.reassembly.used_bytes, 0);
-    assert_eq!(snapshot.shm.used_bytes, 0);
     assert_eq!(
-        snapshot.file.peak_bytes, 0,
+        snapshot.file_spill.peak_bytes, 0,
         "real dedicated reassembly is required; file fallback is not SHM evidence: {snapshot:?}"
-    );
-    assert_eq!(
-        server.response_pool_arc().read().stats().dedicated_allocs,
-        0
     );
     assert!(client.close_shared_bounded(WAIT).await);
     stop(server, runner).await;
@@ -790,39 +789,31 @@ async fn disabled_buddy_chunked_request_reassembles_into_real_dedicated_shm() {
 #[tokio::test]
 async fn disabled_buddy_response_exhaustion_falls_back_to_dedicated_chunk_reassembly() {
     let endpoint = Endpoint::new();
-    let mut server_config = ServerIpcConfig {
-        shm_threshold: 1,
-        ..Default::default()
-    };
-    server_config.base.pool_enabled = false;
-    server_config.base.chunk_size = 4096;
-    let (server, runner) = start(&endpoint, Arc::new(Echo), server_config).await;
-    let response_pool = server.response_pool_arc();
-    let mut held_preparations = Vec::new();
-    for _ in 0..4 {
-        let prepared =
-            c2_server::response::try_prepare_shm_response(&response_pool, 1, 8193, |bytes| {
-                bytes.fill(1);
-                Ok(())
-            })
-            .unwrap()
-            .expect("real dedicated response SHM is required");
-        held_preparations.push(prepared);
-    }
-    assert_eq!(response_pool.read().stats().dedicated_active_count, 4);
-    let mut cfg = config();
-    cfg.base.pool_enabled = false;
-    let mut client = IpcClient::with_endpoint(endpoint.endpoint.clone(), cfg).unwrap();
+    let (server, runner) = start_with_server_limits(
+        &endpoint,
+        Arc::new(LargeEcho),
+        Default::default(),
+        DomainLimits {
+            memory_budget_bytes: 64 * 1024,
+            ..Default::default()
+        },
+    )
+    .await;
+    let mut client = IpcClient::with_endpoint_and_budget(
+        endpoint.endpoint.clone(),
+        crate::tests::memory_budget(768 * 1024),
+    )
+    .unwrap();
     client.connect().await.unwrap();
     let binding = client.acquire_route(&contract()).await.unwrap();
     assert_eq!(
         client
-            .call_inline(&binding.table.call_identity(), 0, &[3; 8193])
+            .call_inline(&binding.table.call_identity(), 0, b"large")
             .await
             .unwrap()
             .into_owned_bytes()
             .unwrap(),
-        vec![3; 8193]
+        vec![3; CHUNK_SIZE as usize + 1]
     );
     let registry = client.chunk_registry.lock().clone().unwrap();
     let stats = registry.pool().read().stats();
@@ -831,11 +822,8 @@ async fn disabled_buddy_response_exhaustion_falls_back_to_dedicated_chunk_reasse
         "reply must reassemble in dedicated SHM: {stats:?}"
     );
     assert_eq!(stats.alloc_count, 0);
-    assert_eq!(client.memory_budget.snapshot().reassembly.used_bytes, 0);
-    assert_eq!(response_pool.read().stats().dedicated_active_count, 4);
+    assert_eq!(client.domain_snapshot().memory.used_bytes, 0);
     assert!(client.close_shared_bounded(WAIT).await);
-    drop(held_preparations);
-    assert_eq!(response_pool.read().stats().alloc_count, 0);
     stop(server, runner).await;
 }
 
@@ -858,31 +846,51 @@ async fn real_lazy_startup_sends_one_byte_without_mapping_buddy_backing() {
     );
     assert_eq!(client.request_pool().unwrap().read().segment_count(), 0);
     assert_eq!(server.response_pool_arc().read().segment_count(), 0);
-    assert_eq!(client.memory_budget.snapshot().shm.used_bytes, 0);
-    assert_eq!(server.memory_budget_snapshot().budget.shm.used_bytes, 0);
+    assert_eq!(client.domain_snapshot().memory.used_bytes, 0);
+    assert_eq!(server.domain_snapshot().memory.used_bytes, 0);
     assert!(client.close_shared_bounded(WAIT).await);
     stop(server, runner).await;
+}
+
+struct LargeEcho;
+
+impl CrmCallback for LargeEcho {
+    fn invoke(
+        &self,
+        _: &str,
+        _: u16,
+        data: Vec<u8>,
+        _: Arc<c2_server::ResponsePool>,
+    ) -> Result<ResponseMeta, CrmError> {
+        Ok(ResponseMeta::Inline(if data == b"large" {
+            vec![3; CHUNK_SIZE as usize + 1]
+        } else {
+            data
+        }))
+    }
 }
 
 #[tokio::test]
 async fn exhausted_reassembly_budget_returns_correlated_error_and_keeps_controls_usable() {
     let endpoint = Endpoint::new();
-    let mut server_config = ServerIpcConfig::default();
-    server_config.base.shm_backing_budget_bytes = 0;
-    server_config.base.chunk_size = 4096;
-    server_config.shm_threshold = 1;
-    let (server, runner) = start(&endpoint, Arc::new(Echo), server_config).await;
-    let mut cfg = config();
-    cfg.base.shm_backing_budget_bytes = 0;
-    cfg.base.live_reassembly_budget_bytes = 0;
-    let mut client = IpcClient::with_endpoint(endpoint.endpoint.clone(), cfg).unwrap();
+    let (server, runner) = start_with_server_limits(
+        &endpoint,
+        Arc::new(LargeEcho),
+        Default::default(),
+        DomainLimits {
+            memory_budget_bytes: 64 * 1024,
+            ..Default::default()
+        },
+    )
+    .await;
+    let mut client = endpoint.client_without_memory();
     client.connect().await.unwrap();
     let binding = client.acquire_route(&contract()).await.unwrap();
     let connection = client.driver.read().clone().unwrap();
     let identity = binding.table.call_identity();
     let (rejected, other) = timeout(WAIT, async {
         tokio::join!(
-            client.call_chunked(&identity, 0, &[3; 8193], None),
+            client.call_inline(&identity, 0, b"large"),
             client.call_bound(&binding, "echo", b"other")
         )
     })
@@ -903,7 +911,7 @@ async fn exhausted_reassembly_budget_returns_correlated_error_and_keeps_controls
         client.driver.read().as_ref().unwrap(),
         &connection
     ));
-    assert_eq!(client.memory_budget.snapshot().reassembly.used_bytes, 0);
+    assert_eq!(client.domain_snapshot().memory.used_bytes, 0);
     client.acquire_route(&contract()).await.unwrap();
     assert_eq!(
         client
@@ -931,17 +939,29 @@ async fn exhausted_reassembly_budget_returns_correlated_error_and_keeps_controls
 #[tokio::test]
 async fn exhausted_request_reassembly_budget_returns_correlated_error_and_keeps_controls_usable() {
     let endpoint = Endpoint::new();
-    let mut server_config = ServerIpcConfig::default();
-    server_config.base.live_reassembly_budget_bytes = 0;
-    let (server, runner) = start(&endpoint, Arc::new(Echo), server_config).await;
-    let mut cfg = config();
-    cfg.base.shm_backing_budget_bytes = 0;
-    let mut client = IpcClient::with_endpoint(endpoint.endpoint.clone(), cfg).unwrap();
+    let (server, runner) = start_with_server_limits(
+        &endpoint,
+        Arc::new(Echo),
+        Default::default(),
+        DomainLimits {
+            memory_budget_bytes: CHUNK_SIZE + 4096,
+            file_spill_budget_bytes: 0,
+            ..Default::default()
+        },
+    )
+    .await;
+    let mut client = endpoint.client_without_memory();
     client.connect().await.unwrap();
     let binding = client.acquire_route(&contract()).await.unwrap();
     let error = timeout(
         WAIT,
-        client.call_chunked(&binding.table.call_identity(), 0, &[3; 8193], None),
+        client.call_chunked(
+            &binding.table.call_identity(),
+            0,
+            &vec![3; CHUNK_SIZE as usize + 1],
+            DEFAULT_MAX_PAYLOAD_SIZE,
+            None,
+        ),
     )
     .await
     .unwrap()
