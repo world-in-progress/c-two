@@ -379,6 +379,7 @@ async fn live_follow_server(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn live_relay_reregistration_larger_limit_preserves_old_client_unary_and_stream() {
+    #[cfg(unix)]
     let root = tempfile::tempdir().unwrap();
     #[cfg(unix)]
     let context = c2_config::LocalEndpointContext::with_unix_root(root.path()).unwrap();

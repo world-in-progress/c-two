@@ -865,28 +865,55 @@ async fn forward_request_shm_checks_source_eof_and_declared_length_before_open()
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn forward_request_shm_publishes_after_complete_source() {
+    const SOURCE_CHUNK_BYTES: usize = 16 * 1024;
+    const REQUEST_BYTES: u64 = 2 * SOURCE_CHUNK_BYTES as u64;
+    assert!(REQUEST_BYTES > c2_config::SHM_THRESHOLD);
+    let budget = memory_budget(256 * 1024);
+    let source = |client: &Arc<IpcClient>| {
+        let idle_client_memory = client.domain_snapshot().memory.used_bytes;
+        let client = client.clone();
+        stream::iter([
+            Ok::<_, std::io::Error>(vec![0; SOURCE_CHUNK_BYTES]),
+            Ok(vec![0; SOURCE_CHUNK_BYTES]),
+        ])
+        .inspect(move |_| {
+            assert!(
+                client.domain_snapshot().memory.used_bytes >= idle_client_memory + REQUEST_BYTES,
+                "forwarded input must have a SHM backing while reading the source"
+            );
+        })
+    };
     let fixture = Harness::start(2).await;
-    let budget = memory_budget(1);
     let response = fixture
         .client
         .forward_unary_bound_sized_phased(
             &fixture.binding,
             "ping",
-            8192,
-            stream::iter([Ok::<_, std::io::Error>(vec![0; 4096]), Ok(vec![0; 4096])]),
-            budget.try_reserve_memory(1).unwrap(),
+            REQUEST_BYTES,
+            source(&fixture.client),
+            budget
+                .try_reserve_memory(SOURCE_CHUNK_BYTES as u64)
+                .unwrap(),
         )
         .await
         .unwrap();
     assert_eq!(response.into_owned_bytes().unwrap(), b"pong");
+    assert_eq!(budget.snapshot().memory.used_bytes, 0);
+    fixture.stop().await;
+
+    // Start with a fresh request pool so a cached mapping cannot satisfy the
+    // allocation assertion for the stream upload.
+    let fixture = Harness::start(2).await;
     let mut response = fixture
         .client
         .forward_stream_bound_sized_phased(
             &fixture.binding,
             "echo",
-            8192,
-            stream::iter([Ok::<_, std::io::Error>(vec![0; 4096]), Ok(vec![0; 4096])]),
-            budget.try_reserve_memory(1).unwrap(),
+            REQUEST_BYTES,
+            source(&fixture.client),
+            budget
+                .try_reserve_memory(SOURCE_CHUNK_BYTES as u64)
+                .unwrap(),
         )
         .await
         .unwrap();
@@ -900,6 +927,7 @@ async fn forward_request_shm_publishes_after_complete_source() {
         })
     ));
     assert_eq!(fixture.observed.opened.load(Ordering::SeqCst), 1);
+    assert!(budget.snapshot().memory.peak_bytes >= SOURCE_CHUNK_BYTES as u64);
     assert_eq!(budget.snapshot().memory.used_bytes, 0);
     fixture.unary().await;
     fixture.stop().await;

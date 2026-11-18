@@ -48,8 +48,8 @@ export function runCargo(args, options = {}) {
 // core/Cargo.lock as committed. Concurrent test files only wait on Cargo's
 // build-directory lock; none of them writes a shared file.
 export function buildProtocolPeer(options = {}) {
+  const target = resolve(options.env?.CARGO_TARGET_DIR ?? process.env.CARGO_TARGET_DIR ?? resolve(coreRoot, 'target'));
   runCargo(['build', '--offline', '--locked', '--manifest-path', resolve(coreRoot, 'Cargo.toml'),
-    '-p', 'c2-node-protocol-server'], options);
-  const target = process.env.CARGO_TARGET_DIR ?? resolve(coreRoot, 'target');
+    '--target-dir', target, '-p', 'c2-node-protocol-server'], options);
   return resolve(target, 'debug', `c2-node-protocol-server${process.platform === 'win32' ? '.exe' : ''}`);
 }

@@ -783,30 +783,46 @@ async fn changed_contract_returns_decodable_not_executed_to_old_stream_binding()
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn deactivation_preserves_admitted_stream_and_local_copy_after_shm_receive() {
+    const ITEM_BYTES: u16 = 32 * 1024;
+    assert!(u64::from(ITEM_BYTES) > c2_config::SHM_THRESHOLD);
+    let [size_lo, size_hi] = ITEM_BYTES.to_le_bytes();
     let fixture = Harness::start_with_config(ServerIpcConfig {
         max_execution_workers: 1,
 
         ..ServerIpcConfig::default()
     })
     .await;
+    let budget = memory_budget(256 * 1024);
     let mut stream = fixture
         .client
-        .stream_bound(&fixture.binding, "echo", &[3, 0, 64], memory_budget(1024))
+        .stream_bound(
+            &fixture.binding,
+            "echo",
+            &[3, 0, size_lo, size_hi],
+            budget.clone(),
+        )
         .await
         .unwrap();
     let first = stream.recv().await.unwrap().unwrap();
-    assert_eq!(first.as_ref(), &[0; 64]);
+    assert_eq!(first.as_ref(), &[0; ITEM_BYTES as usize]);
+    let pool = fixture.server.response_pool_arc();
+    let stats = pool.read().stats();
+    assert!(
+        stats.buddy_reused_allocs + stats.buddy_expanded_allocs + stats.dedicated_allocs > 0,
+        "first stream item did not allocate SHM: {stats:?}"
+    );
+    assert!(budget.snapshot().memory.peak_bytes >= u64::from(ITEM_BYTES));
     fixture.client.deactivate();
-    assert_eq!(first.as_ref(), &[0; 64]);
+    assert_eq!(first.as_ref(), &[0; ITEM_BYTES as usize]);
     for expected in 1..3_u8 {
         let item = stream.recv().await.unwrap().unwrap();
-        assert_eq!(item.as_ref(), &[expected; 64]);
+        assert_eq!(item.as_ref(), &[expected; ITEM_BYTES as usize]);
     }
     assert!(stream.recv().await.unwrap().is_none());
     let terminal = observed_terminal(&stream).await;
     assert_eq!(terminal.status, CallStatus::Success);
     assert_eq!(terminal.complete_items, 3);
-    assert_eq!(first.as_ref(), &[0; 64]);
+    assert_eq!(first.as_ref(), &[0; ITEM_BYTES as usize]);
     fixture.stop().await;
 }
 

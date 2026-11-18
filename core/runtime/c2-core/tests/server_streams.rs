@@ -68,6 +68,7 @@ fn with_local_route(options: HostOptions, test: impl FnOnce(&Runtime, &RouteConc
         }
     }
 
+    #[cfg(unix)]
     let root = tempfile::Builder::new()
         .prefix("c2-local-objects-")
         .tempdir()
@@ -733,6 +734,7 @@ struct Fixture {
     encoded_events: mpsc::Receiver<(u8, usize)>,
     finish_events: mpsc::Receiver<u8>,
     unary_events: mpsc::Receiver<()>,
+    #[cfg(unix)]
     _endpoint_root: tempfile::TempDir,
     _relay: Option<RelayServer>,
 }
@@ -763,6 +765,7 @@ impl Fixture {
         budget_bytes: Option<u64>,
         use_relay: bool,
     ) -> Self {
+        #[cfg(unix)]
         let root = tempfile::Builder::new()
             .prefix("c2-core-stream-")
             .tempdir()
@@ -893,6 +896,7 @@ impl Fixture {
             encoded_events,
             finish_events,
             unary_events,
+            #[cfg(unix)]
             _endpoint_root: root,
             _relay: relay,
         }

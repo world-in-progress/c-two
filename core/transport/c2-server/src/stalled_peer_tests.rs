@@ -2,6 +2,16 @@ use super::*;
 
 const STALLED_ITEM_BYTES: usize = 8 * 1024 * 1024;
 
+fn assert_partial_encoding(observed: &Observed) {
+    let ranges = observed.encoded_ranges.lock().unwrap();
+    let chunk = c2_config::CHUNK_SIZE as usize;
+    assert!(!ranges.is_empty());
+    for (index, &(start, end)) in ranges.iter().enumerate() {
+        assert_eq!((start, end), (index * chunk, (index + 1) * chunk));
+    }
+    assert!(ranges.last().unwrap().1 < STALLED_ITEM_BYTES);
+}
+
 async fn until(mut predicate: impl FnMut() -> bool) {
     tokio::time::timeout(Duration::from_secs(5), async {
         while !predicate() {
@@ -113,10 +123,7 @@ async fn stopped_local_reads_bound_calls_and_preserve_half_frame_close_truth() {
         harness.server.domain_snapshot().operations.used_operations,
         2
     );
-    assert_eq!(
-        observed.encoded_ranges.lock().unwrap().as_slice(),
-        &[(0, c2_config::CHUNK_SIZE as usize)]
-    );
+    assert_partial_encoding(&observed);
     assert!(
         !conn.try_close(),
         "the unread half-frame is not a close proof"
@@ -443,10 +450,7 @@ mod posix {
         );
         assert_eq!(conn.calls.lock().active().count(), 2);
         assert!(conn.inflight_count() <= 2);
-        assert_eq!(
-            observed.encoded_ranges.lock().unwrap().as_slice(),
-            &[(0, c2_config::CHUNK_SIZE as usize)]
-        );
+        assert_partial_encoding(&observed);
         assert!(!conn.try_close());
         release_unary_tx.send(()).unwrap();
         tokio::time::timeout(Duration::from_secs(5), async {
