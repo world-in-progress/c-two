@@ -75,13 +75,13 @@ The output contains C-Two contract/release/composition metadata, the target-spec
 
 ## Configuration
 
-The shared Rust config resolver loads runtime environment variables from `.env` in the current working directory before parsing command-line overrides. Set `C2_ENV_FILE` to load a different file; set `C2_ENV_FILE=""` to disable env-file loading:
+Relay startup and `--dry-run` use the same Rust configuration resolver and capture the environment catalog once per invocation. Set `C2_ENV_FILE` to load a different file from the default `.env` in the current directory, or set it to an empty string to disable file loading.
 
 ```bash
 C2_ENV_FILE=relay.env c3 relay --dry-run
 ```
 
-Command-line flags override environment-backed defaults.
+Resolution order is explicit CLI flags, process environment, the environment file, then defaults. [Configuration](../docs/reference/configuration.md)
 
 Color output follows common terminal conventions:
 
@@ -104,17 +104,13 @@ Useful options:
 | Option | Environment | Default | Purpose |
 |---|---|---:|---|
 | `--bind`, `-b` | `C2_RELAY_BIND` | `0.0.0.0:8080` | HTTP listen address. Port `0` takes a free port; the `C-Two relay listening at` line prints the bound address. |
-| `--idle-timeout` | `C2_RELAY_IDLE_TIMEOUT` | `60` | Seconds before idle upstream IPC connections are evicted. Use `0` to disable time-based eviction. |
 | `--seeds`, `-s` | `C2_RELAY_SEEDS` | empty | Comma-separated seed relay URLs for mesh mode. |
 | `--relay-id` | `C2_RELAY_ID` | generated | Stable relay identifier for the mesh protocol. |
 | `--advertise-url` | `C2_RELAY_ADVERTISE_URL` | derived from the bound address | Public URL other relays should use to reach this relay. |
 | `--ipc-root` | `C2_IPC_ROOT` | `/tmp/c2-v3-<uidhex>` (Unix) | Final owner-controlled endpoint directory; custom directories are application-provisioned, and `0755` is accepted when other identities cannot modify them. Not applicable on Windows, where upstream IPC uses TokenUser-scoped Named Pipes. |
-| `--ipc-pool-enabled <true\|false>` | `C2_IPC_POOL_ENABLED` | Rust resolver | Enable buddy for data-plane upstream IPC; `false` still permits dedicated SHM. |
-| `--ipc-shm-backing-budget-bytes` | `C2_IPC_SHM_BACKING_BUDGET_BYTES` | 8 GiB | Shared upstream buddy/dedicated backing budget. |
-| `--ipc-file-backing-budget-bytes` | `C2_IPC_FILE_BACKING_BUDGET_BYTES` | 16 GiB | Shared upstream file backing budget. |
-| `--ipc-live-reassembly-budget-bytes` | `C2_IPC_LIVE_REASSEMBLY_BUDGET_BYTES` | 8 GiB | Shared upstream reassembly/retention capacity budget. |
-| `--call-max-outstanding` | `C2_CALL_MAX_OUTSTANDING` | 1,024 | Outstanding forwarding transactions; zero refuses all new forwarding. |
-| `--call-payload-buffer-budget-bytes` | `C2_CALL_PAYLOAD_BUFFER_BUDGET_BYTES` | 16 GiB | Shared budget for the request bodies the relay buffers and copies while forwarding; a short budget makes a forward wait, and zero refuses positive input. |
+| `--memory-budget-bytes` | `C2_MEMORY_BUDGET_BYTES` | 16 GiB | Memory for the relay's business forwarding and upstream IPC storage. Zero closes new forwarding admission. |
+| `--file-spill-budget-bytes` | `C2_FILE_SPILL_BUDGET_BYTES` | 16 GiB | Temporary file-backed reassembly capacity. Zero disables file spill. |
+| `--call-max-outstanding` | `C2_CALL_MAX_OUTSTANDING` | 0 if `M == 0`, else `max(64, floor(M / 65536))` | Concurrent forwarding transactions. Zero refuses all new forwarding. |
 | `--upstream`, `-u` | none | empty | Pre-register an upstream as `NAME=SERVER_ID@ADDRESS`. `SERVER_ID` must match the IPC server handshake identity. Repeatable. |
 
 Examples:
@@ -125,27 +121,21 @@ c3 relay --bind 0.0.0.0:8080 --upstream grid=server@ipc://server
 c3 relay --relay-id relay-a --advertise-url http://relay-a:8080 --seeds http://relay-b:8080,http://relay-c:8080
 ```
 
-Use `--dry-run` to validate relay configuration and print the effective values without starting the server:
+Use `--dry-run` to validate configuration and print the effective relay domain budgets and slot limit without starting the server.
 
 ```bash
-c3 relay --bind 127.0.0.1:9999 --idle-timeout 10 --dry-run
+c3 relay --bind 127.0.0.1:9999 --memory-budget-bytes 134217728 --dry-run
 ```
 
-The relay resolves and freezes its own upstream IPC policy at startup; an application's `cc.set_client()` does not configure this separate process. All data-plane upstream request/reassembly pools share the relay's budget, including after idle eviction and reconnect. Zero budgets reject positive reservations, and capacity refusal follows the existing transport error paths. Budget charges remain until storage is actually released. Control registration proof/watch contexts, peer mappings and HTTP buffers are outside this budget. Other IPC fields use the Rust resolver's environment inputs, including `C2_IPC_POOL_PREWARM_SEGMENTS`, `C2_IPC_POOL_MIN_RETAINED_SEGMENTS` and `C2_IPC_POOL_DECAY_SECONDS`. Disabled buddy requires zero prewarm.
-
-Forwarding limits freeze at startup and apply to every business request, including callers with unlimited waits. Known input lengths reserve capacity before request transfer; unknown lengths charge checked growth as bytes arrive. Capacity refusal does not withdraw a route. These limits are independent of the upstream storage budgets and do not measure process RSS.
+The relay freezes one role domain at startup, shared by all business forwards and upstream IPC connections, including reconnects. Its memory budget `M` covers request bodies, forwarding windows and upstream IPC storage. The first reservation may wait for capacity. Pre-admission error replies have a bounded control response if memory is unavailable. A response reuses its reserved download window across slices. Capacity refusal returns HTTP 503 for exhausted call slots and leaves the route registered. A positive call limit with zero memory is invalid. [Relay memory policy](../docs/reference/memory-policy.md#standalone-relay)
 
 Each forwarding transaction owns its input and upstream operation after its HTTP waiter disconnects. Disconnecting cancels nothing for a unary call; for a server stream the relay submits cancellation upstream when the caller drops the response. Ctrl+C closes admission, ends the server streams the relay forwards between their steps with `CallCancelled` naming relay shutdown, and waits for actual forwarding completion and native-client cleanup; unary calls already forwarded still finish. A resource method that never returns, or a stream client that has stopped reading, can keep shutdown pending.
 
 ```bash
-c3 relay --bind 127.0.0.1:8080 --idle-timeout 10 \
-  --ipc-pool-enabled false \
-  --ipc-shm-backing-budget-bytes 134217728 \
-  --ipc-file-backing-budget-bytes 268435456 \
-  --ipc-live-reassembly-budget-bytes 134217728
+c3 relay --bind 127.0.0.1:8080 --memory-budget-bytes 134217728 --file-spill-budget-bytes 268435456 --call-max-outstanding 128
 ```
 
-Idle eviction disconnects the relay's cached IPC connection, not the resource server. Reconnect preserves full contract and server/instance identity validation; it does not replay ambiguous data-plane failures. Before a call hands its input to a transport, Core acquires the client's route again at most once, under that call's deadline, when its target is known to be gone; this bound is fixed and is not configurable through SDK settings. See the [memory policy](../docs/reference/memory-policy.md) for lazy allocation, fallback and retained-owner accounting.
+The relay evicts unreferenced upstream IPC connections after 60 seconds without stopping the Host. Reconnect preserves full contract and server/instance identity validation; it does not replay ambiguous data-plane failures. Before a call hands its input to a transport, Core acquires the client's route again at most once, under that call's deadline, when its target is known to be gone; this bound is fixed and is not configurable through SDK settings. See the [memory policy](../docs/reference/memory-policy.md) for lazy allocation, fallback and retained-owner accounting.
 
 When running normally, `c3 relay` installs a Ctrl+C handler and stops the relay cleanly on interrupt.
 

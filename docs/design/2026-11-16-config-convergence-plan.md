@@ -1,6 +1,6 @@
 # 配置收敛执行计划
 
-日期：2026-11-16（2026-11-17 维护者批准定稿）。依据：[交互面精简审查](2026-10-31-api-surface-review.md)第三节。状态：三平台基准实测、复合进程角色域隔离与服务端阻塞线程池推导均已由维护者确认，进入分块实施。
+日期：2026-11-16（2026-11-17 维护者批准定稿）。依据：[交互面精简审查](2026-10-31-api-surface-review.md)第三节。状态：三平台基准实测、复合进程角色域隔离与服务端阻塞线程池推导均已由维护者确认。块 1–3 的 Core 配置、传输及生命周期实现已纳入当前源码；块 4 的配置模板、术语、参考文档和迁移说明已同步。SDK、CLI、ABI 8 与文档合并后的总门禁仍待完成。
 
 本计划把现有的 40 个环境变量（含 `C2_ENV_FILE`）、三套重复的代码覆盖字典和分散的容量/并发计数，收敛为 **13 个表达部署意图的环境变量**与按角色正交的公开代码/CLI 入口，并在同一批闭合分布式场景下的准入、窗口复用、文件溢出可达性与线程池饥饿缺口，同时清理 `R09`、`R10` 与 `C4`。所有分块仅为实施先后，不保留任何旧名字、别名、字典覆盖键或兼容回退。
 
@@ -132,3 +132,5 @@
 3. **块 3（`c2-http` 与 `c2-core`）：** 删除 `C2_RELAY_CALL_TIMEOUT`、删除 `/_echo`、闭合准入前错误响应不等待、一元响应名额生命周期与多片下载窗口复用；在 `c2-core` 中落地按需懒创建的独立 `client` / `server` 角色域、Core 单 `Host` 状态槽、全调用 `N` 准入、三态合并与同效幂等冻结及对称观测投影。通过 `c2-http` 与 `c2-core` 全量测试（含 `A -> B -> C` 满载无互等、`B -> B` 自连接、`M = 0` 闭锁与 `Host` 重启计费保留测试）。
 4. **块 4（SDK、CLI、ABI 8 与文档）：** 更新 Rust SDK（`RuntimeOptions` / `HostOptions`）、Python SDK（`set_client` / `set_server`、同进程直调计 `Host N` 与剥离内层 `pre_dispatch`、会话轮换原子移交与有类型观测快照）、`c3 relay` CLI、Node ABI 8（无副作用 `stats()` 与移除旧选项）及代码生成模板；同步更新 [`CONTEXT.md`](../../CONTEXT.md)、`AGENTS.md`、`.env.example`、`docs/reference/`（`configuration.md`、`memory-policy.md`、`runtime-lifecycle.md`、`python-usage.md`、`c-abi.md`）、`cli/README.md` 与 `docs/releases/unreleased.md`，删除所有只钉旧配置名的测试。
 5. **总门禁：** 本地跑通 Rust 工作区、Rust SDK、原生嵌入测试、Python 全量测试（含 Python 3.10 语法检查与 18 行跨语言矩阵）、Node ABI 8 测试与仓库文档卫生检查，并在空 `HOME` / 故障注入下核验边界；随后在 GitHub Actions 上跑通 Linux（3.12 / 3.14t）、macOS、Windows x64 与 ARM64 全量 Source Validation 及配对 IPC 基准，保留提交哈希与运行记录。
+
+块 4 的现行入口和诊断字段见[配置参考](../reference/configuration.zh-CN.md)、[内存策略](../reference/memory-policy.md#statistics-and-payload-lifetime)及[未发布变更说明](../releases/unreleased.md#configuration-convergence-breaking)。文档门禁覆盖链接、双语互链、路径和指令大小。跨平台验收以合并后的源码提交及运行记录为准。

@@ -69,7 +69,7 @@ A portable method carries zero or one `Payload` envelope in each direction; C-Tw
 
 `cc.hold(echo.echo)(source)` retains a response as `HeldResult`, which owns a local copy: the transport memory was released right after the copy, so holding never keeps the server's shared memory. Explicit `release()` runs FastDB invalidation once, then frees the local copy; invalidation does not replay and the value stays inaccessible afterwards. Release an additional exported memoryview before retrying an export rejection, which occurs before invalidation. Manually constructed `HeldResult(release_cb=...)` callbacks still run once. Use `with cc.hold(method)(args) as held` for normal scopes and materialize values that must outlive them.
 
-`cc.observe.memory_stats()['holds']` counts these local copies: `active_holds`, `total_held_bytes` (logical bytes, not SHM capacity), `oldest_hold_seconds` and `by_direction`. See [memory policy](memory-policy.md#statistics-and-payload-lifetime) for the backing, reassembly and payload buffer cells and their accounting limits.
+`cc.observe.memory_stats()['holds']` counts these local copies: `active_holds`, `total_held_bytes` (logical bytes, not SHM capacity), `oldest_hold_seconds` and `by_direction`. See [memory policy](memory-policy.md#statistics-and-payload-lifetime) for the role domains’ memory and file spill cells and their accounting limits.
 
 ## Remote connections and deadlines
 
@@ -88,7 +88,7 @@ finally:
 
 Connection `timeout` is one budget in seconds across pool waiting, OS connection, handshake, current route lookup and relay acquisition. Omission or `None` adds no caller deadline; zero expires immediately. A timeout replaces the fixed five-second guards for the OS connection and the handshake, and the namespace gate or pipe wait also runs until it; without one, those guards remain. Negative and non-finite values are rejected. Expiration raises `CallDeadlineExceeded` with `operation=connect`, `transport_phase=pre_dispatch` and the failed `stage`; no resource method has run.
 
-Business-call waiting is independent. `cc.with_call_options` returns a view of an existing connection; its timeout does not become a resource method argument. A call deadline can end caller waiting after dispatch while native work still holds the input until completion. It does not cancel a running resource method or authorize replay. Direct IPC waits indefinitely by default; HTTP uses the configured logical-call budget. Same-process synchronous calls accept inherited or unlimited waiting. See [configuration](configuration.md#call-deadlines-and-admission) for defaults and finite-call admission limits.
+Business-call waiting is independent. `cc.with_call_options` returns a view of an existing connection; its timeout does not become a resource method argument. A call deadline can end caller waiting after dispatch while native work still holds the input until completion. It does not cancel a running resource method or authorize replay. Direct IPC and relay HTTP wait indefinitely by default. Same-process synchronous calls accept inherited or unlimited waiting. See [configuration](configuration.md#call-deadlines-and-admission) for defaults and outstanding-call limits.
 
 A connection follows its route name. When C-Two already knows that the registration it served is gone, because the server process ended or an earlier call was refused before dispatch for a missing, removed or closed route or another contract, the next call acquires the route again by name within its own deadline and goes to the current registration: direct IPC returns to the same address, a relay-aware connection resolves through its relay anchor and may change between local IPC and the relay, and an explicit relay connection stays on HTTP. A call that learns of the change only from its own refusal fails before dispatch and is safe to retry; the next call follows. A same-process connection does the same once its registration is unregistered: the next call goes to a new local registration of the name, or through the relay to a remote one, while calls go straight to the resource as long as the registration stays. The process that serves the name keeps its state continuous; use a different name when callers must notice a different state. Identity and protocol refusals do not start a new acquisition.
 
@@ -105,7 +105,7 @@ session = RuntimeSession(server_id='local-host', use_process_relay_anchor=False)
 server = session.ensure_server_bridge()
 ```
 
-The session owns identity, IPC overrides and relay configuration. `Server(runtime_session, ...)` no longer accepts `bind_address`, `ipc_overrides`, `server_id` or `server_instance_id`; registration, unregister and shutdown no longer accept a replacement session or per-operation relay anchor. Configure independent sessions explicitly rather than inheriting Python process settings. `start()` takes no timeout argument; `shutdown(timeout=...)` retains its Core-owned deadline and completion result. Close the bridge with `shutdown()` when its host is finished.
+`Server(runtime_session, ...)` uses the given session’s Host settings, including server identity, capacity and relay configuration. Registration, unregister and shutdown use that session. Configure independent sessions explicitly. `start()` takes no timeout argument. `shutdown(timeout=...)` observes the Core shutdown receipt. Call `shutdown()` when finished with the Host.
 
 ## Payload lifetimes
 
@@ -161,7 +161,7 @@ with cc.connect(Simulation, name='basin', address='ipc://resource-process') as s
 
 Each `next()` of the generator runs as one resource step: it holds the route permit and the GIL only while it runs, over IPC also an execution worker, and nothing between items. The stream copies the context once when it starts, and creating the generator, every `next()` and its `close()` all run in that one context, so `contextvars` and `decimal` contexts set inside the generator stay with it across workers and do not leak into them. Over IPC each item is encoded inside its step, so the generator may reuse or change an object after yielding it; within the process the consumer receives the yielded object itself. A borrowed input (`input_lifetime='borrowed'`) stays valid until the generator has been closed, then is invalidated and released.
 
-A call returns a `cc.Stream`, an iterator of decoded items. Leaving a `with` block or dropping the stream cancels it without waiting. `close(timeout=30.0)` cancels the stream if it is still running and then waits for the original call to finish: `None` waits without bound and `0` observes once. It returns a dict with `completed`, `error` and `complete_items`; while `completed` is false, the cleanup is still running and a later `close()` can observe it. `error` is the exception the stream ended with, or `None` after a natural end; a stream that the server or a relay ended reports `CallCancelled` naming shutdown, unregistration or relay shutdown. `cc.hold(sim.steps)(parameters)` returns a stream of `HeldResult` items, each keeping its own local copy until released; several holds may coexist, and when they fill the payload buffer budget the next item waits until one is released. A call deadline from `cc.with_call_options` covers the whole iteration and is not reset for each item; its expiry ends only the caller's wait. Every stream holds one `max_outstanding_calls` slot until its real terminal.
+A call returns a `cc.Stream`, an iterator of decoded items. Leaving a `with` block or dropping the stream cancels it without waiting. `close(timeout=30.0)` cancels the stream if it is still running and then waits for the original call to finish: `None` waits without bound and `0` observes once. It returns a dict with `completed`, `error` and `complete_items`; while `completed` is false, the cleanup is still running and a later `close()` can observe it. `error` is the exception the stream ended with, or `None` after a natural end; a stream that the server or a relay ended reports `CallCancelled` naming shutdown, unregistration or relay shutdown. `cc.hold(sim.steps)(parameters)` returns a stream of `HeldResult` items, each keeping its own local copy until released; several holds may coexist, and when they fill the client domain memory budget the next item waits until one is released. A call deadline from `cc.with_call_options` covers the whole iteration and is not reset for each item; its expiry ends only the caller's wait. Every stream holds one `max_outstanding_calls` slot until its real terminal.
 
 Within the registering process, a stream passes the yielded objects themselves, without encoding, and steps under the route's own concurrency limits; a finite call deadline is refused before dispatch. Over IPC, Python and Rust resources and clients stream to each other, and through a relay they stream over HTTP with the same `cc.Stream`, `close` and hold behavior; there a resource can run ahead of a consumer that stops reading by as many items as the HTTP and TCP buffers hold, which for small items can be thousands. [Runtime lifecycle](runtime-lifecycle.md#execution-admission) describes steps, cancellation and shutdown.
 
@@ -190,8 +190,8 @@ Contract export does not select a Runtime. Concurrency modes are `'parallel'`, `
 
 - Authoring: `@cc.crm`, `@cc.read`, `@cc.write`, `@cc.on_shutdown`, `@cc.transfer`, `cc.hold`
 - Calls: `cc.with_call_options` (per-call deadline views, see [remote connections and deadlines](#remote-connections-and-deadlines))
-- Runtime: `cc.Runtime`, whose instance methods include `set_local_endpoint`, `set_server`, `set_client`, `set_transport_policy`, `set_relay_anchor`, `set_call_execution_limits`, `register`, `connect`, `unregister`, `start`, `server_id`, `server_address`, `server_credential`, `local_endpoint_context`, `shutdown`, `connection_events`, `lifecycle_snapshot`, `shutdown_outcome`, `memory_stats` and `call_execution_snapshot`
-- Default Runtime: `cc.register`, `cc.connect`, `cc.unregister`, `cc.serve`, `cc.shutdown`, `cc.server_address`, `cc.endpoint.server_credential`, `cc.set_server`, `cc.set_client`, `cc.set_relay_anchor`, `cc.set_transport_policy`, `cc.endpoint.set_local_endpoint`; `cc.close(proxy)` follows the proxy's own connection
+- Runtime: `cc.Runtime`, whose instance methods include `set_local_endpoint`, `set_server`, `set_client`, `set_relay_anchor`, `register`, `connect`, `unregister`, `start`, `server_id`, `server_address`, `server_credential`, `local_endpoint_context`, `shutdown`, `connection_events`, `lifecycle_snapshot`, `shutdown_outcome`, `memory_stats` and `call_execution_snapshot`
+- Default Runtime: `cc.register`, `cc.connect`, `cc.unregister`, `cc.serve`, `cc.shutdown`, `cc.server_address`, `cc.endpoint.server_credential`, `cc.set_server`, `cc.set_client`, `cc.set_relay_anchor`, `cc.endpoint.set_local_endpoint`; `cc.close(proxy)` follows the proxy's own connection
 - Contracts: `cc.contract.export_descriptor`, `cc.contract.release_ref`, `cc.contract.compile_artifacts`, `cc.contract.diagnostics`
 - Endpoint maintenance: `cc.endpoint.inspect_endpoint`, `cc.endpoint.reap_endpoint`, `cc.endpoint.sweep_endpoints`, `cc.endpoint.EndpointCredential` (immutable native value; explicit JSON import/export)
 - Connection observations: `cc.observe.connection_observation`, `cc.observe.connection_events`, `cc.observe.ConnectionObservation`, `cc.observe.ConnectionClosed`, `cc.observe.ConnectionEvent`, `cc.observe.ConnectionEvents`, `cc.observe.ConnectionEventsLagged`
@@ -202,7 +202,19 @@ Use `cc.set_server(startup_timeout=...)` before registration to choose a native 
 
 After a listener reaches Ready, `cc.endpoint.server_credential() -> cc.endpoint.EndpointCredential | None` returns its native credential from the existing lifecycle watch without inspection or filesystem I/O. It returns `None` before start and after terminal shutdown; a snapshot is not proof of liveness or cleanup authority. See the [lifecycle guide](local-endpoint-lifecycle.md#exact-cleanup-and-bounded-sweeps).
 
-Runtime-scoped IPC policy, call admission limits and relay settings are documented in the [configuration guide](configuration.md).
+`set_client` sets the outgoing role's capacity. `set_server` sets the incoming role's capacity and Host options. Each call updates only the fields it supplies. The second call keeps the memory and slot settings from the first, and the third clears the slot override so the environment or derived default applies.
+
+```python
+cc.set_client(memory_budget_bytes=128 * 1024**2, max_outstanding_calls=128)
+cc.set_client(file_spill_budget_bytes=0)
+cc.set_client(max_outstanding_calls=None)
+
+memory = cc.observe.memory_stats()
+calls = cc.observe.call_execution_snapshot()
+print(memory["client"]["memory"], calls["server"]["used_operations"])
+```
+
+Read the snapshots before starting or connecting to see an inactive role: its byte and call counters are `None`, and observation leaves the role inactive. After a role freezes, an update with the same effective values succeeds. An effective change raises `CoreError.lifecycle_kind == 'config_frozen'`. [Role configuration](configuration.md#role-domains-and-sdk-configuration) · [Diagnostic fields](memory-policy.md#statistics-and-payload-lifetime)
 
 The [lifecycle API guide](local-endpoint-lifecycle.md) specifies observation return values, timeout/end/lag behavior and error outcomes. Its [bind/connect section](local-endpoint-lifecycle.md#bind-and-connect-failures) documents the structured OS fields on public `cc.error.CoreError`. These observations do not prove process exit or authorize replay or cleanup.
 
@@ -235,8 +247,7 @@ import c_two as cc
 
 # Server side
 cc.set_relay_anchor('http://relay-host:8080')
-cc.set_transport_policy(shm_threshold=64 * 1024)
-cc.set_server(ipc_overrides={'pool_segment_size': 2 * 1024 * 1024 * 1024})
+cc.set_server(server_id='my_server', memory_budget_bytes=256 * 1024**2)
 cc.register(Grid, grid_instance, name='grid')
 cc.register(Network, net_instance, name='network')
 cc.serve()
@@ -247,7 +258,7 @@ grid.some_method(arg)
 cc.close(grid)
 
 # Client side, direct IPC
-cc.set_client(ipc_overrides={'pool_segment_size': 2 * 1024 * 1024 * 1024})
+cc.set_client(memory_budget_bytes=128 * 1024**2, max_outstanding_calls=128)
 grid = cc.connect(Grid, name='grid', address='ipc://my_server')
 grid.some_method(arg)
 cc.close(grid)
@@ -277,4 +288,4 @@ Shutdown never fails a unary call already sent: calls in flight on other threads
 
 The deadline passed to remote `connect()` also bounds the SDK's final publication check. If that original deadline expires before publication, connect raises the corresponding deadline error and releases only its own logical client; it does not retry. An otherwise successful connection continues to reuse its pooled client normally. A `runtime_retired` lifecycle error has no I/O cause. HTTP-only use does not create an IPC pool, and shutdown does not promise that every HTTP keepalive socket has physically closed. The Rust low-level Host shutdown/restart lifecycle remains separate and restartable; this permanent retirement applies to the Python SDK Runtime scope.
 
-After completed handoff, configured endpoint selection, transport policy, call limits and relay override retain their existing handoff behavior, while server identity, IPC overrides and startup timeout reset. An existing `connection_events()` subscription observes its original session only; subscribe again for the new session. The return value is the closing session's result, and held payloads retain their own lifetime. An application owns any custom endpoint directory it creates; the Runtime does not remove that directory. The [preflight example](../../examples/python/independent_runtime.py) checks the shutdown outcome before deleting its newly created private directory.
+The session rotates only with `completed=True`. The handoff atomically transfers both roles’ explicit overrides, including `server_id` and `startup_timeout`, and preserves the real usage reported in `retired` and `holds`. An existing `connection_events()` subscription observes its original session only; subscribe again for the new session. The return value is the closing session's result, and held payloads retain their own lifetime. An application owns any custom endpoint directory it creates; the Runtime does not remove that directory. The [preflight example](../../examples/python/independent_runtime.py) checks the shutdown outcome before deleting its newly created private directory.

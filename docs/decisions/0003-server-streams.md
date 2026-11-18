@@ -31,3 +31,7 @@ relay 不上 HTTP/2：请求体一次发完，响应体逐条流式发送，取�
 补记（2026-11-06）：[ADR 0004](0004-route-name-identity.md) 定下路由名是资源状态的唯一身份，代理跟随路由名，重新注册对调用方透明，跨注册的状态延续由 Host 负责。上文不自动重发的两条理由里，“过期路由通常意味着资源换了实例，新实例没有原来的状态”由它取代；“要把输入保留到回复”仍然成立，调用照旧只发一次。
 
 依据：[流式 RPC 设计](../design/2026-11-03-streaming-rpc-design.md)、[流式 RPC 调研](../research/2026-11-03-streaming-rpc-survey.md)、[ADR 0001](0001-single-owner-release.md)。
+
+## Dated note (2026-11-18)
+
+配置收敛以各角色域的内存预算、文件溢出预算和在途调用上限取代原预算配置。客户端先为整条流条目预约内存再发 CREDIT，relay 在一次转发内循环复用已预约的下载窗口。现行字段及计费规则见[配置参考](../reference/configuration.zh-CN.md)和[内存策略](../reference/memory-policy.md)。

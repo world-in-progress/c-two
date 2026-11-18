@@ -60,6 +60,10 @@ _Avoid_: 运行时 or a lowercase runtime for this object (both name C-Two as a 
 The server side of a Runtime: it listens on an IPC endpoint and serves the registered resources.
 _Avoid_: 宿主, server process
 
+**角色域 / role domain**:
+The scope of one role’s memory budget, file spill budget and outstanding-call limit. A Runtime creates its `client` domain for outgoing remote work and its `server` domain for its Host on demand. A standalone relay has a single `relay` domain for forwarding.
+_Avoid_: process-wide budget, connection budget
+
 ### Calls and streams
 
 **一元调用 / unary call**:
@@ -103,7 +107,7 @@ The execution permission one resource step or cleanup takes under the route's co
 _Avoid_: lock, slot
 
 **调用槽 / call slot**:
-The counted capacity an active call occupies for its whole life, limited by `max_pending_requests` and a route's `max_pending`; a single step's worker is counted separately.
+The capacity an active call occupies until its real terminal, charged to the role domain’s outstanding-call limit `N`. A Host also applies each route’s `max_pending` and counts active execution workers separately.
 _Avoid_: worker (for a slot)
 
 **条目需求 / item demand**:
@@ -185,7 +189,7 @@ One piece of a payload sent in several parts; over IPC the receiver puts the pie
 _Avoid_: 分块, fragment, segment
 
 **重组 / reassembly**:
-Putting the chunks of one payload back together on the receiving side, within the reassembly budget.
+Putting the chunks of one payload back together on the receiving side, using the role domain’s memory budget or file spill budget for the backing.
 _Avoid_: 组装, 拼装, assembly
 
 ### Memory and lifetime
@@ -235,12 +239,20 @@ A file-backed buffer used when shared memory is unavailable or over budget.
 _Avoid_: disk cache, swap
 
 **预算 / budget**:
-A finite allowance of bytes or time that one scope may consume, such as the SHM backing bytes of one direction or the wait of one call.
+A finite allowance of bytes or time that one scope may consume, such as the bytes owned by one role domain or the wait of one call.
 _Avoid_: quota; limit (for a budget)
 
-**载荷缓冲预算 / payload buffer budget**:
-The one byte budget of a Runtime or relay for the payload buffers C-Two keeps for calls, such as a call's input before its transport copy and HTTP bodies. It is separate from the IPC backing and reassembly budgets.
-_Avoid_: retained input budget
+**内存预算 / memory budget**:
+`M`, the byte limit for one role domain’s accounted memory, including created SHM backing, in-memory reassembly and payload buffers owned by C-Two. It bounds those charges independently of process RSS.
+_Avoid_: SHM backing budget or payload buffer budget for the whole domain
+
+**文件溢出预算 / file spill budget**:
+`F`, the byte limit on one role domain’s temporary file-backed reassembly.
+_Avoid_: disk quota, file cache
+
+**在途调用上限 / outstanding-call limit**:
+`N`, the number of concurrent business calls or forwards one role domain can admit. A call holds its slot through its real terminal, even after its caller stops waiting.
+_Avoid_: worker limit, deadline-bounded call limit
 
 **释放 / release**:
 Ending a lease, an allocation or a hold. Across processes it travels as a release record on the physical connection; a local release does not mean the pool owner has reclaimed the allocation.
@@ -251,7 +263,7 @@ The absolute end of one bounded operation, such as a connect, a call, a Host sta
 _Avoid_: 期限
 
 **超时 / timeout**:
-A configured or caller-passed duration after which something expires, such as `timeout=`, `startup_timeout` or `C2_RELAY_CALL_TIMEOUT`; a bounded operation computes its deadline from it.
+A configured or caller-passed duration after which something expires, such as `timeout=` or `startup_timeout`; a bounded operation computes its deadline from it.
 _Avoid_: 期限
 
 ### Project

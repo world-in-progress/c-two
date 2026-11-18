@@ -2,6 +2,42 @@
 
 The latest release is [C-Two 0.10.1](0.10.1.md) with the existing c3 0.6.0; its source, publication and cleanup evidence are in the [acceptance record](../acceptance/2026-10-30-0101-release-acceptance.md).
 
+## Configuration convergence (breaking)
+
+Configure capacity per role. A Runtime lazily creates an independent `client` domain on remote business use and a `server` domain on Host startup. A standalone relay creates one `relay` domain. The role's memory budget `M` and file spill budget `F` default to 16 GiB each. Its outstanding-call limit `N` defaults to zero when `M == 0`, and to `max(64, floor(M / 65536))` otherwise. A positive `N` requires positive `M`. Every remote business call, including unlimited unary calls, counts. Same-process Python calls count against the target Host. Direct IPC and relay HTTP use per-call deadlines and default to unlimited waiting.
+
+### Migrate code and deployment
+
+| Previous surface | Current entry |
+| --- | --- |
+| Python `set_transport_policy`, `set_call_execution_limits`, `ipc_overrides`, `BaseIPCOverrides`, `ClientIPCOverrides`, `ServerIPCOverrides` and `settings.shm_threshold` and `settings.remote_payload_chunk_size` | `set_client(memory_budget_bytes=..., file_spill_budget_bytes=..., max_outstanding_calls=...)`. `set_server` accepts the same capacities plus `server_id`, `startup_timeout`, `max_payload_size` and `max_execution_workers`. |
+| Python ignored-setter warnings, including `ClientConfigFrozen` | Omit a field to keep its override, pass `None` to inherit, or pass a value to set it. An effective change after role freeze raises `ConfigFrozen`. An update that resolves to the frozen values succeeds. |
+| Rust `ServerIpcConfigOverrides`, `ClientIpcConfigOverrides`, `CallExecutionLimits`, `CallExecutionLimitsOverrides`, `MemoryBudgetLimits`, server fields on `RuntimeOptions` and `call_timeout_secs` | Use `RuntimeOptions::client_limits` for client capacity, `HostOptions` for Host identity, startup, carrying capacity and server capacity, and per-call timeouts for call waiting. Capacity uses `DomainLimits` and `DomainLimitsPatch`. |
+| Relay flags `--ipc-pool-enabled`, `--ipc-shm-backing-budget-bytes`, `--ipc-file-backing-budget-bytes`, `--ipc-live-reassembly-budget-bytes`, `--call-payload-buffer-budget-bytes` and `--idle-timeout` | Use `--memory-budget-bytes`, `--file-spill-budget-bytes` and `--call-max-outstanding`. `--dry-run` uses the startup resolver and prints the single relay domain's capacity. `--ipc-root` still selects the Unix endpoint directory. |
+| ABI 8 and Node options `requestShmThreshold` and `requestChunkSize` | Rebuild the native library and regenerate TypeScript with matching sources. The optional `memoryBudgetBytes`, `fileSpillBudgetBytes` and `maxOutstandingCalls` configure a connector's client domain. |
+| Diagnostic fields `runtime_outgoing`, `payload_buffer` and `retired_payload_buffers` | `memory_stats()` returns `client`, `server`, `retired` and `holds`, with memory and file spill counters per role. `call_execution_snapshot()` reports call slot counters under `client`, `server` and `retired`. Native `c2_mem_ffi_client_domain_stats` and Node `connector.stats()` project the client role. Observing an inactive role leaves it unfrozen. |
+
+The 13 environment variables are:
+
+- `C2_ENV_FILE`, `C2_RELAY_ANCHOR_ADDRESS`, `C2_IPC_ROOT`
+- `C2_MEMORY_BUDGET_BYTES`, `C2_FILE_SPILL_BUDGET_BYTES`, `C2_CALL_MAX_OUTSTANDING`, `C2_MAX_PAYLOAD_SIZE`, `C2_MAX_EXECUTION_WORKERS`
+- `C2_RELAY_BIND`, `C2_RELAY_ID`, `C2_RELAY_ADVERTISE_URL`, `C2_RELAY_SEEDS`, `C2_RELAY_USE_PROXY`
+
+Move `C2_IPC_MAX_PAYLOAD_SIZE` to `C2_MAX_PAYLOAD_SIZE` and `C2_IPC_MAX_EXECUTION_WORKERS` to `C2_MAX_EXECUTION_WORKERS`. Move `C2_IPC_FILE_BACKING_BUDGET_BYTES` to `C2_FILE_SPILL_BUDGET_BYTES`. Replace `C2_IPC_SHM_BACKING_BUDGET_BYTES` with `C2_MEMORY_BUDGET_BYTES` and size it for the role's combined memory charges.
+
+Delete these 27 other variables. All previous names in this migration are retired without aliases.
+
+- `C2_CALL_PAYLOAD_BUFFER_BUDGET_BYTES`, `C2_IPC_CHUNK_ASSEMBLER_TIMEOUT`, `C2_IPC_CHUNK_GC_INTERVAL`, `C2_IPC_CHUNK_SIZE`, `C2_IPC_CHUNK_THRESHOLD_RATIO`, `C2_IPC_CLIENT_IDLE_TIMEOUT`, `C2_IPC_LIVE_REASSEMBLY_BUDGET_BYTES`
+- `C2_IPC_MAX_DEDICATED_SEGMENTS`, `C2_IPC_MAX_FRAME_SIZE`, `C2_IPC_MAX_INFLIGHT_CHUNK_FRAMES`, `C2_IPC_MAX_PENDING_REQUESTS`, `C2_IPC_MAX_POOL_SEGMENTS`, `C2_IPC_MAX_REASSEMBLY_BYTES`, `C2_IPC_POOL_DECAY_SECONDS`
+- `C2_IPC_POOL_ENABLED`, `C2_IPC_POOL_MIN_RETAINED_SEGMENTS`, `C2_IPC_POOL_PREWARM_SEGMENTS`, `C2_IPC_POOL_SEGMENT_SIZE`, `C2_IPC_REASSEMBLY_MAX_SEGMENTS`, `C2_IPC_REASSEMBLY_SEGMENT_SIZE`, `C2_IPC_SPILL_THRESHOLD`
+- `C2_IPC_WRITE_TIMEOUT`, `C2_RELAY_ANTI_ENTROPY_INTERVAL`, `C2_RELAY_CALL_TIMEOUT`, `C2_RELAY_IDLE_TIMEOUT`, `C2_REMOTE_PAYLOAD_CHUNK_SIZE`, `C2_SHM_THRESHOLD`
+
+Transport thresholds, chunk and frame sizes, idle and write timeouts, and mesh anti-entropy are internal constants. Pool geometry derives from role memory capacity. Core resolves an environment catalog once per role activation or relay startup (R09 and R10); client pools use the Core-frozen configuration without a duplicate policy comparison (C4).
+
+Host restart reuses the server domain and its live charges, advances its generation and uses a new server instance ID. Python session rotation after completed shutdown hands both roles' explicit overrides and retirement accounting to the replacement session. Reassembly can spill directly to the file budget, and server request copies and chunk queues carry memory charges. Relay pre-admission control responses do not wait for memory, and forwarded unary and stream responses reuse their download windows. The relay's `POST /_echo` endpoint has been removed. [Configuration](../reference/configuration.md) · [Memory and diagnostics](../reference/memory-policy.md) · [Runtime lifecycle](../reference/runtime-lifecycle.md)
+
+The sections below record earlier changes in this development cycle. Where those sections describe configuration surfaces retired by convergence, use the migration entries above.
+
 ## Smaller public surface (breaking)
 
 The Python and Rust SDKs now keep only the everyday API at their roots. Everything else moves into three modules, grouped by who uses it. The reasons and measurements are in the [interface review](../design/2026-10-31-api-surface-review.md). Update imports; no aliases or old paths remain.
@@ -191,18 +227,20 @@ Host checks of each block are recorded in the [protocol batch acceptance record]
 
 These changes prepare server streams ([ADR 0003](../decisions/0003-server-streams.md), [design](../design/2026-11-03-streaming-rpc-design.md)); server streams themselves are not available yet. IPC handshake 15, SHM 4, C/FFI ABI 7 and relay mesh 7 are unchanged.
 
-### Renamed settings
+### Intermediate settings
 
-| Before | Now |
+These entries were used before [configuration convergence](#configuration-convergence-breaking).
+
+| Before | At this stage |
 | --- | --- |
 | `retained_input_budget_bytes` in Python `cc.set_call_execution_limits(...)` and Rust `CallExecutionLimits`, `C2_CALL_RETAINED_INPUT_BUDGET_BYTES`, c3 `--call-retained-input-budget-bytes` | `payload_buffer_budget_bytes`, `C2_CALL_PAYLOAD_BUFFER_BUDGET_BYTES`, `--call-payload-buffer-budget-bytes` |
 | IPC override `max_total_chunks`, `C2_IPC_MAX_TOTAL_CHUNKS` | `max_inflight_chunk_frames`, `C2_IPC_MAX_INFLIGHT_CHUNK_FRAMES` |
 
-There are no aliases. The old Python keyword, override key and c3 flag are rejected; the old environment variables are ignored, so rename them where they are set.
+For the final upgrade, apply the [configuration migration](#migrate-code-and-deployment).
 
 ### Behavior
 
-- One payload buffer budget per Runtime and per relay replaces the retained-input budget. It charges a call's owned input until the transport has written or copied it, the HTTP request and response bodies C-Two holds, and the relay's copies of forwarded request bodies, for calls with and without a deadline. 0.10.1 charged only the input that finite-deadline calls kept, until their reply. The relay does not yet charge the upstream responses it sends back. See the [memory policy](../reference/memory-policy.md#payload-buffer-budget).
+- One payload buffer budget per Runtime and per relay replaces the retained-input budget. It charges a call's owned input until the transport has written or copied it, the HTTP request and response bodies C-Two holds, and the relay's copies of forwarded request bodies, for calls with and without a deadline. 0.10.1 charged only the input that finite-deadline calls kept, until their reply. At this stage the relay did not charge its upstream responses. [Configuration convergence](#configuration-convergence-breaking) replaces this budget with role accounting and charged forwarding windows.
 - When the budget is short, a call waits for capacity within its own deadline instead of failing, and a call without a deadline can wait without bound. A request larger than the whole budget, and unknown-length data that grows past its first reservation, fail at once with `CallCapacityExceeded` and `stage=payload_buffer_admission`. A hold of an HTTP response keeps its reservation until it is released.
 - A call's input is released as soon as the transport has written or copied it, not when the reply arrives.
 - `cc.observe.memory_stats()` adds `payload_buffer`, the budget's limit, use, peak and rejections, and `retired_payload_buffers` for earlier sessions. A wait is not counted as a rejection.
@@ -380,7 +418,7 @@ New tests cover the OPEN layout with both modes for whole values and first chunk
 
 ### Behavior
 
-- A Runtime's cache of IPC client connections takes its retention time from the new IPC override `client_idle_timeout` (`C2_IPC_CLIENT_IDLE_TIMEOUT`), 60 seconds by default; `0` disables timed eviction. It was fixed at 60 seconds, while the relay's upstream `idle_timeout` was already configurable.
+- This stage made idle eviction configurable. [Configuration convergence](#configuration-convergence-breaking) sets client and relay upstream eviction to a fixed 60 seconds.
 - A connection that nothing has referenced for that long is now evicted in the background. Before, an expired connection was dropped only when a later connect looked it up, so a process that stopped calling kept its idle connections open. Eviction deactivates the connection as before: calls already sent still finish, and the next call connects again.
 - Callers that acquire the same endpoint at the same time now share one connection attempt; before, each opened its own connection and all but one were closed. Each caller waits within its own deadline, and a failed attempt gives every waiter the same pre-dispatch failure with its native OS error code intact. The same lossless copy now keeps the native code in the errors that a stream's completion and its receiver both report.
 

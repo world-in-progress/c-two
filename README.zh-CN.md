@@ -98,7 +98,7 @@ finally:
 
 同机的其他进程将资源进程的 `cc.server_address()` 传给客户端的 `address` 参数。两端的完整用法见 [IPC 示例](examples/python/ipc_resource.py)。资源进程还可以在注册后取得 `credential = cc.endpoint.server_credential()`，交给它的控制方供之后精确清理，见[生命周期指南](docs/reference/local-endpoint-lifecycle.md)。
 
-`runtime = cc.Runtime()` 让应用分别拥有自己的 Python 配置、路由和原生会话。用 `runtime.set_*()` 配置后，可以调用 `runtime.start()` 等待空 Host 就绪，或用 `runtime.register()` 承载资源。模块函数继续使用默认 Runtime；`cc.serve()` 负责默认 Runtime 的进程信号处理，没有实例版。应用结束时调用 `runtime.shutdown()` 并检查结构化结果；若结果为 pending，再调用 shutdown 观察完成并换代。见[独立 Runtime 示例](examples/python/independent_runtime.py)及 [Python API 指南](docs/reference/python-usage.zh-CN.md#独立的-python-runtime)。
+`runtime = cc.Runtime()` 让应用分别拥有自己的 Python 配置、路由和原生会话。用 `runtime.set_*()` 配置后，可以调用 `runtime.start()` 等待空 Host 就绪，或用 `runtime.register()` 承载资源。模块函数继续使用默认 Runtime；`cc.serve()` 负责默认 Runtime 的进程信号处理，没有实例版。应用结束时调用 `runtime.shutdown()` 并检查结构化结果；若结果为 pending，再调用 shutdown 观察完成并换代。未发布的源码通过 `set_client` 和 `set_server` 分别配置两个角色域，通过 `cc.observe.memory_stats()` 和 `cc.observe.call_execution_snapshot()` 查看两侧。见[独立 Runtime 示例](examples/python/independent_runtime.py)及 [Python API 指南](docs/reference/python-usage.zh-CN.md#独立的-python-runtime)。
 
 使用 relay 时，启动 `c3 relay --bind 0.0.0.0:8300`，在两端设置 `cc.set_relay_anchor('http://relay-host:8300')`，再按名称连接。Relay 独立运行；显式 IPC 地址直接连接端点。
 
