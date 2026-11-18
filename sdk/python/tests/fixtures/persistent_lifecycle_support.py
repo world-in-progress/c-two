@@ -179,6 +179,22 @@ class Events:
     def active(self, side: str) -> set[int]:
         return self.ids("opened", side) - self.ids("closed", side)
 
+    def wait_closed_all(self, side: str, *, timeout: float = 10.0) -> None:
+        """Wait until every opened connection on one side has its Closed event.
+
+        Shutdown returns once its listener, accepted calls and loans drain; an
+        accepted idle connection is closed by that shutdown but publishes its
+        Closed event shortly after the receipt (runtime-lifecycle.md). Block on
+        recv with the remaining deadline instead of draining once.
+        """
+        deadline = time.monotonic() + timeout
+        while self.ids("opened", side) != self.ids("closed", side):
+            remaining = deadline - time.monotonic()
+            assert remaining > 0 and not self.ended, (
+                f"{side} connections did not close: {self.records}"
+            )
+            self.take(timeout=remaining)
+
 
 class Lab:
     def __init__(self, path: str, root: str | None, start_relay):
@@ -309,10 +325,8 @@ class Lab:
         server = self.server.shutdown(timeout=10)
         assert client["completed"], client
         assert server["completed"], server
-        self.outgoing.drain()
-        self.accepted.drain()
         for events, side in ((self.outgoing, "client"), (self.accepted, "server")):
-            assert events.ids("opened", side) == events.ids("closed", side), events.records
+            events.wait_closed_all(side)
             events.source.close()
         self.http.close()
         return {"client": client, "server": server}

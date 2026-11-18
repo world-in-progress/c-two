@@ -11,6 +11,8 @@ const DESCRIPTOR: &[u8] =
 #[test]
 fn nested_not_executed_phase_stops_at_the_resource_a_boundary() {
     let mut fixture = NestedErrorFixture::start(DESCRIPTOR, None);
+    assert!(!fixture.address.is_empty());
+    assert_ne!(fixture.route_a, fixture.route_b);
     fixture.reject_b_before_callback();
 
     let Error::Semantic(inner) = fixture

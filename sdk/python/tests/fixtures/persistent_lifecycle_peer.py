@@ -65,7 +65,10 @@ def serve(route: str, server_id: str, anchor: str, journal: str) -> None:
             elif operation == "stop":
                 resource.release.set()
                 outcome = runtime.shutdown(timeout=10)
-                events.drain()
+                if outcome["completed"]:
+                    events.wait_closed_all("server")
+                else:
+                    events.drain()
                 print(json.dumps({"shutdown": outcome, "calls": resource.snapshot(),
                                   "connections": events.records}), flush=True)
                 return

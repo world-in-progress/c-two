@@ -483,8 +483,10 @@ pub(crate) fn same_file(left: &libc::stat, right: &libc::stat) -> bool {
 
 // macOS spells the thread-local `fchdir` as `pthread_fchdir_np`. The libc
 // crate does not bind it on Apple targets, so it is declared here. The symbol
-// has no equivalent on other Unix systems, so the binding is confined to
-// Apple targets and every other target compiles the fail-closed stub instead.
+// has no equivalent on other Unix systems, so the binding and the helper
+// below exist only on Apple targets; non-macOS binds and connects fail
+// closed with `Unsupported` in their own entry points instead of routing
+// through a per-thread directory here.
 //
 // `pthread_fchdir_np` changes only the calling thread's working directory; the
 // process-wide directory of every other thread is untouched. Callers must
@@ -502,8 +504,9 @@ unsafe extern "C" {
 /// This is a macOS-only primitive. Linux expresses a descriptor-relative bind
 /// through `/proc/self/fd/<fd>` instead, and every other Unix target has no
 /// verified way to make the kernel resolve a socket bind against a descriptor,
-/// so it reports `Unsupported` and the managed bind fails closed rather than
-/// falling back to a path a concurrent rename can redirect.
+/// so those targets fail closed with `Unsupported` in their own bind and
+/// connect entry points rather than falling back to a path a concurrent
+/// rename can redirect.
 #[cfg(target_os = "macos")]
 pub(crate) fn set_thread_directory(fd: libc::c_int) -> io::Result<()> {
     if unsafe { pthread_fchdir_np(fd) } == 0 {
@@ -511,14 +514,6 @@ pub(crate) fn set_thread_directory(fd: libc::c_int) -> io::Result<()> {
     } else {
         Err(io::Error::last_os_error())
     }
-}
-
-#[cfg(not(target_os = "macos"))]
-pub(crate) fn set_thread_directory(_fd: libc::c_int) -> io::Result<()> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "a per-thread working directory is not available on this platform",
-    ))
 }
 
 /// The dirfd-relative socket path to bind, expressed in a form the kernel

@@ -408,8 +408,7 @@ def test_late_candidate_cannot_withdraw_or_close_current_owner(lab, private_root
             cc.close(candidate)
         outcome = client.shutdown(timeout=5)
         assert outcome["completed"], outcome
-        events.drain()
-        assert events.ids("opened", "client") == events.ids("closed", "client")
+        events.wait_closed_all("client", timeout=5)
         events.source.close()
         lab.extra["candidate_cleanup"] = outcome
         resolver.close()

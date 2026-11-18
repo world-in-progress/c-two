@@ -69,6 +69,8 @@ pub struct NestedErrorFixture {
     client_b: Client,
     side_effects: Arc<AtomicU64>,
     b_calls: Arc<AtomicU64>,
+    pub address: String,
+    pub route_a: String,
     pub route_b: String,
 }
 
@@ -147,6 +149,8 @@ impl NestedErrorFixture {
             client_b,
             side_effects,
             b_calls,
+            address,
+            route_a,
             route_b,
         }
     }

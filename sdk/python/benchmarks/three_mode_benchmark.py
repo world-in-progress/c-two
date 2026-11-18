@@ -15,7 +15,7 @@ Results are written to sdk/python/benchmarks/results/ (git-ignored).
 
 Usage:
     C2_RELAY_ANCHOR_ADDRESS= uv run python sdk/python/benchmarks/three_mode_benchmark.py
-    C2_RELAY_ANCHOR_ADDRESS= uv run python sdk/python/benchmarks/three_mode_benchmark.py --segment-size 268435456
+    C2_RELAY_ANCHOR_ADDRESS= uv run python sdk/python/benchmarks/three_mode_benchmark.py --memory-budget-bytes 268435456
 """
 from __future__ import annotations
 
@@ -31,7 +31,7 @@ import c_two as cc
 import _relay_support as relay
 from c_two.transport.registry import _reset_default_runtime
 
-# Configurable via CLI --segment-size (bytes)
+# Configurable via CLI --memory-budget-bytes (bytes)
 _MEMORY_BUDGET_BYTES = 16 * 1024**3
 
 RELAY_CLIENT_REQUEST_BODY_PATH = 'materialized'
