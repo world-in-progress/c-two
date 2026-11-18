@@ -23,7 +23,10 @@ fn partial_range_check_uses_offset_and_length_pairs() {
     assert_partial_ranges(&[(0, chunk)]);
     assert_partial_ranges(&[(0, chunk), (chunk, chunk)]);
     assert!(std::panic::catch_unwind(|| assert_partial_ranges(&[])).is_err());
-    assert!(std::panic::catch_unwind(|| assert_partial_ranges(&[(0, chunk), (chunk, 2 * chunk)])).is_err());
+    assert!(
+        std::panic::catch_unwind(|| assert_partial_ranges(&[(0, chunk), (chunk, 2 * chunk)]))
+            .is_err()
+    );
     let full: Vec<_> = (0..(STALLED_ITEM_BYTES / chunk))
         .map(|index| (index * chunk, chunk))
         .collect();

@@ -76,13 +76,16 @@ struct Relay {
 impl Relay {
     fn start(label: &str, directory: &Path) -> Self {
         let root = directory.join(label);
-        let mut dir = std::fs::DirBuilder::new();
         #[cfg(unix)]
         {
             use std::os::unix::fs::DirBuilderExt;
-            dir.mode(0o700);
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&root)
+                .unwrap();
         }
-        dir.create(&root).unwrap();
+        #[cfg(not(unix))]
+        std::fs::create_dir(&root).unwrap();
         let stdout_path = root.join("c3.stdout.log");
         let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../..")
@@ -376,6 +379,21 @@ fn assert_conflict_log(relay: &Relay, name: &str, action: &str, other: &Relay) {
     assert_eq!(matching.len(), 1, "{log}");
     assert!(matching[0].contains(&relay.id), "{log}");
     assert!(matching[0].contains(&other.id), "{log}");
+}
+
+fn assert_host_shutdown(
+    label: &str,
+    host: &Host,
+    outcome: &c2_core::ShutdownOutcome,
+    relay: &Relay,
+) {
+    if outcome.runtime_barrier_error.is_some() {
+        let stderr = std::fs::read_to_string(relay.root.join("c3.stderr.log")).unwrap_or_default();
+        panic!(
+            "{label} shutdown did not finish: outcome={outcome:?} lifecycle={:?} relay_stderr={stderr}",
+            host.lifecycle_snapshot()
+        );
+    }
 }
 
 fn register(
@@ -691,8 +709,8 @@ fn run_case(explicit: bool) {
     }
     let outcome_a = host_a.shutdown_with_timeout(WAIT);
     let outcome_b = host_b.shutdown_with_timeout(WAIT);
-    assert!(outcome_a.runtime_barrier_error.is_none(), "{outcome_a:?}");
-    assert!(outcome_b.runtime_barrier_error.is_none(), "{outcome_b:?}");
+    assert_host_shutdown("host_a", &host_a, &outcome_a, &a);
+    assert_host_shutdown("host_b", &host_b, &outcome_b, &b);
     for relay in [&a, &b] {
         wait_until(|| routes(relay, &name).is_empty());
     }
@@ -896,8 +914,8 @@ fn run_unavailable_case(explicit: bool, force_leave: bool) {
     }
     let outcome_a = host_a.shutdown_with_timeout(WAIT);
     let outcome_b = host_b.shutdown_with_timeout(WAIT);
-    assert!(outcome_a.runtime_barrier_error.is_none(), "{outcome_a:?}");
-    assert!(outcome_b.runtime_barrier_error.is_none(), "{outcome_b:?}");
+    assert_host_shutdown("host_a", &host_a, &outcome_a, &a);
+    assert_host_shutdown("host_b", &host_b, &outcome_b, &b);
     assert!(outcome_a.route_close_error.is_none() && outcome_a.relay_errors.is_empty());
     assert!(outcome_b.route_close_error.is_none() && outcome_b.relay_errors.is_empty());
     assert!(host_a.lifecycle_snapshot().finished && host_b.lifecycle_snapshot().finished);

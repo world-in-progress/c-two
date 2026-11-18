@@ -372,9 +372,7 @@ impl TryFrom<FullSyncEnvelope> for ValidatedFullSync {
         }
 
         for peer in &envelope.snapshot.peers {
-            if !valid_wire_relay_id(&peer.relay_id)
-                || !crate::valid_relay_url(&peer.url)
-            {
+            if !valid_wire_relay_id(&peer.relay_id) || !crate::valid_relay_url(&peer.url) {
                 return Err(FullSyncValidationError::InvalidPeer {
                     relay_id: peer.relay_id.clone(),
                 });
