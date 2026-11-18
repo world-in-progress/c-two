@@ -93,12 +93,18 @@ DATA = bytes(range(256)) * 4096
 
 @cc.crm(namespace="ci.installed-wheels", version="1.0.0")
 class Echo:
+    @cc.transfer(output=SPEC)
+    def pull(self) -> Payload: ...
+
     @cc.transfer(input=SPEC, output=SPEC)
     def echo(self, payload: Payload) -> Payload: ...
 
 class Resource:
     def __init__(self):
         self.inputs = []
+
+    def pull(self) -> Payload:
+        return build()
 
     def echo(self, payload: Payload) -> Payload:
         self.inputs.append(payload)
@@ -171,6 +177,10 @@ if sys.argv[1] == "host":
                 input_lifetime={"echo":"borrowed"})
     emit({**facts, "address":cc.server_address(), "status":"ready"})
     try:
+        assert sys.stdin.readline().strip() == "sample_direct_pull"
+        direct_pull_peak = memory_stats()["server"]["memory"]["peak_bytes"]
+        assert direct_pull_peak >= len(DATA), direct_pull_peak
+        emit({"status":"direct_pull_sampled", "server_pull_peak_bytes":direct_pull_peak})
         assert sys.stdin.readline().strip() == "stop"
         invalidated = resource.verify_borrowed_inputs()
         server_peak = memory_stats()["server"]["memory"]["peak_bytes"]
@@ -179,6 +189,27 @@ if sys.argv[1] == "host":
         cc.shutdown()
     emit({"status":"stopped", "borrowed_inputs_invalidated":invalidated,
           "server_memory_peak_bytes":server_peak})
+elif sys.argv[1] == "pull":
+    cc.set_client(memory_budget_bytes=32 * 1024 * 1024)
+    proxy = cc.connect(Echo, name="wheel-echo", address=sys.argv[2])
+    try:
+        assert proxy.client._mode == "ipc"
+        pulled = proxy.pull()
+        try:
+            inspect(pulled).close()
+        finally:
+            pulled.close()
+        stats = memory_stats()
+        client_pull_peak = stats["client"]["memory"]["peak_bytes"]
+        client_spill_peak = stats["client"]["file_spill"]["peak_bytes"]
+        assert client_pull_peak == 0 and client_spill_peak == 0, stats
+        emit({**facts, "status":"passed", "transport":"direct_pull",
+              "observed_mode":proxy.client._mode, "payload_bytes":len(DATA),
+              "client_pull_peak_bytes":client_pull_peak,
+              "client_spill_peak_bytes":client_spill_peak})
+    finally:
+        cc.close(proxy)
+        cc.shutdown()
 else:
     cc.set_client(memory_budget_bytes=32 * 1024 * 1024)
     source = build()
@@ -208,7 +239,7 @@ else:
         memory = stats["client"]["memory"]
         client_peak = memory["peak_bytes"] if memory is not None else None
         if sys.argv[3] == "direct":
-            assert client_peak is not None and client_peak >= len(DATA), client_peak
+            assert client_peak is not None and client_peak >= 2 * len(DATA), client_peak
         emit({**facts, "status":"passed", "transport":sys.argv[3],
               "observed_mode":observed_mode, "payload_bytes":len(DATA),
               "held_view_invalidated":True, "client_memory_peak_bytes":client_peak})
@@ -334,12 +365,34 @@ def read_result(output: str) -> dict[str, object]:
     return json.loads(lines[0])
 
 
-def require_memory_peak(result: dict[str, object], role: str, payload_bytes: int) -> int:
+def require_memory_peak(result: dict[str, object], role: str, minimum_bytes: int) -> int:
     key = f"{role}_memory_peak_bytes"
     peak = result.get(key)
-    if type(peak) is not int or peak < payload_bytes:
-        raise RuntimeError(f"{key}={peak!r}, expected at least {payload_bytes} bytes")
+    if type(peak) is not int or peak < minimum_bytes:
+        raise RuntimeError(f"{key}={peak!r}, expected at least {minimum_bytes} bytes")
     return peak
+
+
+def require_direct_shm_evidence(
+    pull_client: dict[str, object],
+    pull_host: dict[str, object],
+    direct_client: dict[str, object],
+    payload_bytes: int,
+) -> dict[str, int]:
+    if pull_client.get("client_pull_peak_bytes") != 0 or pull_client.get("client_spill_peak_bytes") != 0:
+        raise RuntimeError(f"direct pull fell back to client reassembly: {pull_client}")
+    server_pull_peak = pull_host.get("server_pull_peak_bytes")
+    if type(server_pull_peak) is not int or server_pull_peak < payload_bytes:
+        raise RuntimeError(
+            f"server_pull_peak_bytes={server_pull_peak!r}, expected at least {payload_bytes} bytes"
+        )
+    client_echo_peak = require_memory_peak(direct_client, "client", 2 * payload_bytes)
+    return {
+        "server_pull_peak_bytes": server_pull_peak,
+        "client_pull_peak_bytes": 0,
+        "client_spill_peak_bytes": 0,
+        "client_echo_peak_bytes": client_echo_peak,
+    }
 
 
 def stop(process: subprocess.Popen[str]) -> str:
@@ -505,6 +558,19 @@ def main() -> int:
                     if ready.get("status") != "ready":
                         raise RuntimeError(f"Host not ready: {ready}")
                     receipt["host"] = ready
+                    pull_result = read_result(run([str(python), str(script), "pull", ready["address"], str(inputs)],
+                                                  work, environment))
+                    if pull_result.get("status") != "passed" or pull_result["pid"] == ready["pid"]:
+                        raise RuntimeError(f"Invalid direct pull consumer: {pull_result}")
+                    for info in (fastdb_info, ctwo_info):
+                        if pull_result["versions"][info["distribution"]] != info["version"]:
+                            raise RuntimeError(f"Installed version differs from wheel: {pull_result}")
+                    host.stdin.write("sample_direct_pull\n")
+                    host.stdin.flush()
+                    pull_sampled = host_result(messages, host_log, timeout=5)
+                    if pull_sampled.get("status") != "direct_pull_sampled":
+                        raise RuntimeError(f"Host direct pull sample failed: {pull_sampled}")
+                    direct_result: dict[str, object] | None = None
                     for mode, address in [("direct", ready["address"]), ("relay", url)]:
                         result = read_result(run([str(python), str(script), "client", address, mode, str(inputs)],
                                                  work, environment))
@@ -515,8 +581,12 @@ def main() -> int:
                                 raise RuntimeError(f"Installed version differs from wheel: {result}")
                         if mode == "direct":
                             direct_payload_bytes = result["payload_bytes"]
-                            require_memory_peak(result, "client", direct_payload_bytes)
+                            direct_result = result
                         receipt["checks"].append(result)
+                    assert direct_result is not None
+                    receipt["direct_shm_evidence"] = require_direct_shm_evidence(
+                        pull_result, pull_sampled, direct_result, direct_payload_bytes,
+                    )
                     host.stdin.write("stop\n")
                     host.stdin.flush()
                     host.wait(timeout=30)

@@ -4,12 +4,30 @@ const STALLED_ITEM_BYTES: usize = 8 * 1024 * 1024;
 
 fn assert_partial_encoding(observed: &Observed) {
     let ranges = observed.encoded_ranges.lock().unwrap();
+    assert_partial_ranges(ranges.as_slice());
+}
+
+fn assert_partial_ranges(ranges: &[(usize, usize)]) {
     let chunk = c2_config::CHUNK_SIZE as usize;
     assert!(!ranges.is_empty());
-    for (index, &(start, end)) in ranges.iter().enumerate() {
-        assert_eq!((start, end), (index * chunk, (index + 1) * chunk));
+    for (index, &(offset, len)) in ranges.iter().enumerate() {
+        assert_eq!((offset, len), (index * chunk, chunk));
     }
-    assert!(ranges.last().unwrap().1 < STALLED_ITEM_BYTES);
+    let &(last_offset, last_len) = ranges.last().unwrap();
+    assert!(last_offset + last_len < STALLED_ITEM_BYTES);
+}
+
+#[test]
+fn partial_range_check_uses_offset_and_length_pairs() {
+    let chunk = c2_config::CHUNK_SIZE as usize;
+    assert_partial_ranges(&[(0, chunk)]);
+    assert_partial_ranges(&[(0, chunk), (chunk, chunk)]);
+    assert!(std::panic::catch_unwind(|| assert_partial_ranges(&[])).is_err());
+    assert!(std::panic::catch_unwind(|| assert_partial_ranges(&[(0, chunk), (chunk, 2 * chunk)])).is_err());
+    let full: Vec<_> = (0..(STALLED_ITEM_BYTES / chunk))
+        .map(|index| (index * chunk, chunk))
+        .collect();
+    assert!(std::panic::catch_unwind(|| assert_partial_ranges(&full)).is_err());
 }
 
 async fn until(mut predicate: impl FnMut() -> bool) {
