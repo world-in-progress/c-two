@@ -8,17 +8,19 @@
 
 use crate::alloc::BuddyAllocator;
 use crate::buddy_segment::BuddySegment;
-use crate::budget::{BudgetError, BudgetKind, BudgetReservation, MemoryBudget};
 use crate::config::{PoolAllocation, PoolConfig, PoolStats};
 use crate::dedicated::DedicatedSegment;
 use crate::handle::{HandleBacking, MemHandle, OwnedAllocation, OwnedBacking, PoolIncarnation};
 use crate::pressure::{PressureDecision, PressureEngine};
 use crate::spill;
+use crate::{BudgetError, DomainBudget, MemoryReservation, PayloadBufferError};
 use base64::Engine;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+const BUDDY_MIN_BLOCK_SIZE: usize = 4096;
 
 /// Backing-creation failure at a policy-enforced seam.
 ///
@@ -28,7 +30,8 @@ use std::time::{Duration, Instant};
 /// segment does not). Creation failures may also continue through the same
 /// eligible fallback tiers.
 enum BackingError {
-    Budget(BudgetError),
+    Memory(PayloadBufferError),
+    FileSpill(BudgetError),
     Pressure(String),
     Other(String),
 }
@@ -36,7 +39,8 @@ enum BackingError {
 impl BackingError {
     fn into_message(self) -> String {
         match self {
-            BackingError::Budget(e) => e.to_string(),
+            BackingError::Memory(error) => error.to_string(),
+            BackingError::FileSpill(error) => error.to_string(),
             BackingError::Pressure(message) => message,
             BackingError::Other(message) => message,
         }
@@ -76,9 +80,8 @@ pub struct MemPool {
     dedicated_generations: Vec<u32>,
     /// A stopped owner keeps pool identity, but no longer caches empty backing.
     retain_idle_backing: bool,
-    /// Owner-creation budget context. Owner pools always carry one (shared or
-    /// private); peer pools never charge owner-creation budget and carry none.
-    budget: Option<MemoryBudget>,
+    /// Role-domain budget for locally created backings, when attached.
+    budget: Option<DomainBudget>,
     /// Creation-time OS-memory pressure decisions for owner backing seams.
     /// Peer pools never create backings, so theirs stays idle.
     pressure: PressureEngine,
@@ -87,50 +90,46 @@ pub struct MemPool {
 }
 
 impl MemPool {
-    /// Create a new pool. Segments are lazily created on first alloc.
-    ///
-    /// The pool carries a private finite budget built from the canonical
-    /// [`c2_config::MemoryBudgetLimits`] defaults; share one budget across
-    /// pools with [`MemPool::new_with_prefix_and_budget`].
+    /// Create a lazy pool without domain accounting.
     pub fn new(config: PoolConfig) -> Result<Self, String> {
-        let pid = std::process::id();
-        let name_prefix = format!("/cc3b{:08x}", pid);
-        Self::new_with_prefix(config, name_prefix)
+        Self::new_with_prefix(config, Self::default_prefix())
+    }
+
+    /// Create a lazy pool charging new backings to the caller's domain.
+    pub fn new_with_budget(config: PoolConfig, budget: DomainBudget) -> Result<Self, String> {
+        Self::new_with_prefix_and_budget(config, Self::default_prefix(), budget)
+    }
+
+    fn default_prefix() -> String {
+        format!("/cc3b{:08x}", std::process::id())
     }
 
     /// Prefixes travel in the handshake; OS object names are bounded digests.
     const MAX_SHM_PREFIX_LEN: usize = 255;
 
-    /// Create a new pool with a custom name prefix (for testing / multi-pool).
-    ///
-    /// Each pool receives its own private finite budget from the canonical
-    /// limits; pools constructed this way do not share accounting.
     pub fn new_with_prefix(config: PoolConfig, name_prefix: String) -> Result<Self, String> {
-        let name_prefix = format!(
-            "{name_prefix}_{:08x}{}",
-            std::process::id(),
-            uuid::Uuid::new_v4().simple()
-        );
-        Self::with_identity(config, name_prefix, false, Some(Self::private_budget()))
+        Self::with_owner_prefix(config, name_prefix, None)
     }
 
-    /// Create a new owner pool whose backing creation charges a shared budget.
-    ///
-    /// `budget` is shared by reference with every other pool or owner handed
-    /// the same [`MemoryBudget`] clone: buddy expansion, dedicated creation,
-    /// and file spill in this pool all charge the same cells. Existing owner
-    /// constructors keep private budgets, so sharing is always explicit.
     pub fn new_with_prefix_and_budget(
         config: PoolConfig,
         name_prefix: String,
-        budget: MemoryBudget,
+        budget: DomainBudget,
+    ) -> Result<Self, String> {
+        Self::with_owner_prefix(config, name_prefix, Some(budget))
+    }
+
+    fn with_owner_prefix(
+        config: PoolConfig,
+        name_prefix: String,
+        budget: Option<DomainBudget>,
     ) -> Result<Self, String> {
         let name_prefix = format!(
             "{name_prefix}_{:08x}{}",
             std::process::id(),
             uuid::Uuid::new_v4().simple()
         );
-        Self::with_identity(config, name_prefix, false, Some(budget))
+        Self::with_identity(config, name_prefix, false, budget)
     }
 
     /// Validate one producer's advertised pool identity without owning storage.
@@ -141,16 +140,7 @@ impl MemPool {
         Self::with_identity(config, name_prefix, true, None)
     }
 
-    fn private_budget() -> MemoryBudget {
-        MemoryBudget::from_limits(&c2_config::MemoryBudgetLimits::default())
-    }
-
-    /// The pool's backing budget context, if any.
-    ///
-    /// Owner pools always carry one (shared or private); peer pools return
-    /// `None` because peer-opened mappings never acquire owner-creation
-    /// charges.
-    pub fn budget(&self) -> Option<&MemoryBudget> {
+    pub fn budget(&self) -> Option<&DomainBudget> {
         self.budget.as_ref()
     }
 
@@ -158,7 +148,7 @@ impl MemPool {
         config: PoolConfig,
         name_prefix: String,
         is_peer: bool,
-        budget: Option<MemoryBudget>,
+        budget: Option<DomainBudget>,
     ) -> Result<Self, String> {
         if name_prefix.len() > Self::MAX_SHM_PREFIX_LEN {
             return Err(format!(
@@ -187,34 +177,19 @@ impl MemPool {
 
     /// Validate pool configuration, returning Err on invalid values.
     pub fn validate_config(config: &PoolConfig) -> Result<(), String> {
-        if config.min_block_size == 0 || !config.min_block_size.is_power_of_two() {
+        if config.segment_size < 2 * BUDDY_MIN_BLOCK_SIZE {
             return Err(format!(
-                "min_block_size must be a positive power of 2, got {}",
-                config.min_block_size
+                "segment_size ({}) must be at least {} bytes",
+                config.segment_size,
+                2 * BUDDY_MIN_BLOCK_SIZE
             ));
         }
-        // Checked doubling: a wrapped `2 * min_block_size` could otherwise
-        // pass as a small bound and authorize an impossible layout.
-        let min_segment_size = config.min_block_size.checked_mul(2).ok_or_else(|| {
-            format!(
-                "min_block_size ({}) is too large: doubling overflows the platform address space",
-                config.min_block_size
-            )
-        })?;
-        if config.segment_size < min_segment_size {
+        if BuddyAllocator::checked_layout(config.segment_size, BUDDY_MIN_BLOCK_SIZE).is_none() {
             return Err(format!(
-                "segment_size ({}) must be >= 2 * min_block_size ({})",
-                config.segment_size, config.min_block_size
+                "buddy backing geometry unsupported: segment_size {} exceeds the u32 data capacity or the addressable mapping span",
+                config.segment_size,
             ));
         }
-        BuddyAllocator::checked_layout(config.segment_size, config.min_block_size).ok_or_else(
-            || {
-                format!(
-                    "buddy backing geometry unsupported: segment_size {} with min_block {} exceeds the u32 data capacity or the addressable mapping span",
-                    config.segment_size, config.min_block_size
-                )
-            },
-        )?;
         if config.max_segments > u16::MAX as usize + 1 {
             return Err("max_segments exceeds the wire segment-index range".into());
         }
@@ -461,18 +436,12 @@ impl MemPool {
         removed
     }
 
-    /// Ensure a stable set of buddy segments exists before peer advertisement.
-    ///
-    /// Runtime adapters that advertise their client buddy pool in an IPC
-    /// handshake should call this before exposing segment metadata. This avoids
-    /// later lazy allocation from returning a segment index the peer never saw.
-    /// This is also the only prewarm entry point; it is rejected outright when
-    /// the buddy tiers are disabled so a disabled pool never maps buddy memory.
+    /// Create at least `count` buddy segments using normal backing admission.
     pub fn ensure_buddy_segments(&mut self, count: usize) -> Result<(), String> {
         if self.is_peer {
             return Err("cannot create backings in a peer pool".into());
         }
-        if !self.config.buddy_enabled {
+        if !self.config.pool_enabled {
             return Err("cannot prewarm buddy segments while the buddy pool is disabled".into());
         }
         if count > 0 && !self.retain_idle_backing {
@@ -749,8 +718,11 @@ impl MemPool {
             BackingError::Other("file spill size exceeds budget accounting range".into())
         })?;
         let guard = self
-            .reserve_backing(BudgetKind::File, backing_bytes)
-            .map_err(BackingError::Budget)?;
+            .budget
+            .as_ref()
+            .map(|budget| budget.try_reserve_file_spill(backing_bytes))
+            .transpose()
+            .map_err(BackingError::FileSpill)?;
         let (mmap, path) = match spill::create_file_spill(size, &self.config.spill_dir) {
             Ok(created) => created,
             // Guard drops here, releasing the reservation on creation failure.
@@ -850,10 +822,10 @@ impl MemPool {
     // --- Internal methods ---
 
     fn buddy_block_limit(&self) -> usize {
-        if !self.config.buddy_enabled || self.config.max_segments == 0 {
+        if !self.config.pool_enabled || self.config.max_segments == 0 {
             return 0;
         }
-        BuddyAllocator::checked_layout(self.config.segment_size, self.config.min_block_size)
+        BuddyAllocator::checked_layout(self.config.segment_size, BUDDY_MIN_BLOCK_SIZE)
             .expect("validated buddy geometry")
             .data_size
     }
@@ -972,8 +944,8 @@ impl MemPool {
             return Err(BackingError::Pressure(reason));
         }
         let guard = self
-            .reserve_backing(BudgetKind::Shm, backing_bytes)
-            .map_err(BackingError::Budget)?;
+            .reserve_memory(backing_bytes)
+            .map_err(BackingError::Memory)?;
         let name = Self::dedicated_segment_name(&self.name_prefix, idx, generation);
         let segment = DedicatedSegment::create(&name, size)
             .map_err(BackingError::Other)?
@@ -1009,21 +981,11 @@ impl MemPool {
         }
     }
 
-    /// Reserve owner-creation backing bytes against this pool's budget.
-    ///
-    /// Owner pools always carry a budget context (shared or private); peer
-    /// pools carry none and never reach a creation seam. The reservation
-    /// happens before any mapping so a rejection never creates a backing.
-    fn reserve_backing(
-        &self,
-        kind: BudgetKind,
-        bytes: u64,
-    ) -> Result<BudgetReservation, BudgetError> {
-        let budget = self
-            .budget
+    fn reserve_memory(&self, bytes: u64) -> Result<Option<MemoryReservation>, PayloadBufferError> {
+        self.budget
             .as_ref()
-            .expect("owner pools carry a budget; peer pools never create backings");
-        budget.reserve(kind, bytes)
+            .map(|budget| budget.try_reserve_memory(bytes))
+            .transpose()
     }
 
     fn create_segment(&mut self) -> Result<(usize, BuddySegment), BackingError> {
@@ -1047,9 +1009,8 @@ impl MemPool {
 
         let name = Self::buddy_segment_name(&self.name_prefix, idx as u32, generation);
         // Constructor validation guarantees this layout before reservation.
-        let layout =
-            BuddyAllocator::checked_layout(self.config.segment_size, self.config.min_block_size)
-                .expect("validated buddy geometry");
+        let layout = BuddyAllocator::checked_layout(self.config.segment_size, BUDDY_MIN_BLOCK_SIZE)
+            .expect("validated buddy geometry");
         // SHM contains payload bytes only; metadata stays in local memory.
         // Reusing blocks within charged backing takes no new reservation.
         let backing_bytes = layout.total_size as u64;
@@ -1065,11 +1026,10 @@ impl MemPool {
             return Err(BackingError::Pressure(reason));
         }
         let guard = self
-            .reserve_backing(BudgetKind::Shm, backing_bytes)
-            .map_err(BackingError::Budget)?;
+            .reserve_memory(backing_bytes)
+            .map_err(BackingError::Memory)?;
         let segment =
-            match BuddySegment::create(&name, self.config.segment_size, self.config.min_block_size)
-            {
+            match BuddySegment::create(&name, self.config.segment_size, BUDDY_MIN_BLOCK_SIZE) {
                 Ok(segment) => segment.with_budget_guard(guard),
                 // Guard drops here, releasing the reservation on creation failure.
                 Err(e) => return Err(BackingError::Other(e)),
@@ -1131,6 +1091,15 @@ fn validate_duration_secs(name: &str, secs: f64) -> Result<(), String> {
 }
 
 #[cfg(test)]
+fn test_domain(memory_budget_bytes: u64, file_spill_budget_bytes: u64) -> DomainBudget {
+    DomainBudget::from_limits(&c2_config::DomainLimits {
+        memory_budget_bytes,
+        file_spill_budget_bytes,
+        max_outstanding_calls: 0,
+    })
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU32, Ordering as AtOrd};
@@ -1146,7 +1115,6 @@ mod tests {
     fn small_config() -> PoolConfig {
         PoolConfig {
             segment_size: 64 * 1024,
-            min_block_size: 4096,
             max_segments: 4,
             max_dedicated_segments: 2,
 
@@ -1173,10 +1141,10 @@ mod tests {
     #[test]
     fn owned_allocations_keep_mapping_and_original_charge_after_pool_drop() {
         for (buddy, shm) in [(true, 1 << 20), (false, 1 << 20), (false, 0)] {
-            let budget = MemoryBudget::new(shm, 8192, 0);
+            let budget = test_domain(shm, 8192);
             let mut pool = MemPool::new_with_prefix_and_budget(
                 PoolConfig {
-                    buddy_enabled: buddy,
+                    pool_enabled: buddy,
                     spill_threshold: 1.0,
                     ..small_config()
                 },
@@ -1192,24 +1160,24 @@ mod tests {
             drop(pool);
             let live = budget.snapshot();
             assert!(if shm == 0 {
-                live.file.used_bytes >= 8192
+                live.file_spill.used_bytes >= 8192
             } else {
-                live.shm.used_bytes >= 8192
+                live.memory.used_bytes >= 8192
             });
             assert_eq!(owner.as_slice(), &[0x42; 7]);
             drop(owner);
-            assert_eq!(budget.snapshot().file.used_bytes, 0);
-            assert_eq!(budget.snapshot().shm.used_bytes, 0);
+            assert_eq!(budget.snapshot().file_spill.used_bytes, 0);
+            assert_eq!(budget.snapshot().memory.used_bytes, 0);
         }
     }
 
     #[test]
     fn owned_release_preserves_retention_dedicated_slots_and_generations() {
         for buddy in [true, false] {
-            let budget = MemoryBudget::new(1 << 20, 0, 0);
+            let budget = test_domain(1 << 20, 0);
             let mut pool = MemPool::new_with_prefix_and_budget(
                 PoolConfig {
-                    buddy_enabled: buddy,
+                    pool_enabled: buddy,
                     max_segments: 1,
                     min_retained_segments: 0,
                     max_dedicated_segments: 1,
@@ -1226,13 +1194,13 @@ mod tests {
             assert!(pool.alloc_owned(128 * 1024).is_err() || buddy);
             drop(first);
             assert_eq!(pool.stats().alloc_count, 0);
-            assert_eq!(budget.snapshot().shm.used_bytes, 0);
+            assert_eq!(budget.snapshot().memory.used_bytes, 0);
             let next = pool.alloc_owned(4096).unwrap();
             let after = next.shm_allocation().unwrap();
             assert_eq!(before.seg_idx, after.seg_idx);
             assert_eq!(after.generation, before.generation + 1);
             drop(next);
-            assert_eq!(budget.snapshot().shm.used_bytes, 0);
+            assert_eq!(budget.snapshot().memory.used_bytes, 0);
         }
     }
 
@@ -1292,7 +1260,7 @@ mod tests {
     fn mapping_query_reports_release_after_a_valid_generation_snapshot() {
         for buddy in [false, true] {
             let mut pool = test_pool(PoolConfig {
-                buddy_enabled: buddy,
+                pool_enabled: buddy,
                 spill_threshold: 1.0,
                 ..small_config()
             });
@@ -1367,7 +1335,6 @@ mod tests {
         // Use a smaller segment so two 32KB allocs trigger expansion.
         let config = PoolConfig {
             segment_size: 32 * 1024,
-            min_block_size: 4096,
             max_segments: 4,
             max_dedicated_segments: 2,
 
@@ -1388,7 +1355,6 @@ mod tests {
     fn test_dedicated_fallback() {
         let config = PoolConfig {
             segment_size: 32 * 1024,
-            min_block_size: 4096,
             max_segments: 1,
             max_dedicated_segments: 2,
 
@@ -1440,28 +1406,10 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_zero_min_block() {
-        let config = PoolConfig {
-            min_block_size: 0,
-            ..small_config()
-        };
-        assert!(MemPool::validate_config(&config).is_err());
-    }
-
-    #[test]
-    fn test_validate_non_power_of_two_min_block() {
-        let config = PoolConfig {
-            min_block_size: 3000,
-            ..small_config()
-        };
-        assert!(MemPool::validate_config(&config).is_err());
-    }
-
-    #[test]
     fn test_validate_segment_too_small() {
         let config = PoolConfig {
             segment_size: 4096,
-            min_block_size: 4096,
+
             ..small_config()
         };
         assert!(MemPool::validate_config(&config).is_err());
@@ -1511,11 +1459,11 @@ mod tests {
     fn test_gc_buddy_reclaims_trailing_idle() {
         let config = PoolConfig {
             segment_size: 64 * 1024,
-            min_block_size: 4096,
             max_segments: 4,
             max_dedicated_segments: 0,
 
             buddy_idle_decay_secs: 0.0,
+            min_retained_segments: 1,
             ..PoolConfig::default()
         };
         let mut pool = test_pool(config);
@@ -1535,7 +1483,7 @@ mod tests {
         // GC should reclaim trailing idle segments (but keep at least 1).
         let removed = pool.gc_buddy();
         assert!(removed > 0);
-        assert!(pool.segment_count() >= 1);
+        assert_eq!(pool.segment_count(), 1);
 
         // Pool should still be usable.
         let a = pool.alloc(4096).unwrap();
@@ -1546,7 +1494,6 @@ mod tests {
     fn test_gc_buddy_keeps_segment_with_allocs() {
         let config = PoolConfig {
             segment_size: 64 * 1024,
-            min_block_size: 4096,
             max_segments: 4,
             max_dedicated_segments: 0,
 
@@ -1694,7 +1641,6 @@ mod tests {
         // With a large decay window, idle trailing segments should NOT be reclaimed.
         let config = PoolConfig {
             segment_size: 32 * 1024,
-            min_block_size: 4096,
             max_segments: 4,
             max_dedicated_segments: 0,
 
@@ -1718,7 +1664,6 @@ mod tests {
         // With zero decay, idle trailing segments should be reclaimed immediately.
         let config = PoolConfig {
             segment_size: 32 * 1024,
-            min_block_size: 4096,
             max_segments: 4,
             max_dedicated_segments: 0,
 
@@ -1738,8 +1683,7 @@ mod tests {
             "expected at least one idle segment to be reclaimed"
         );
         assert!(pool.segment_count() < seg_before);
-        // gc_buddy always retains at least one segment.
-        assert!(pool.segment_count() >= 1);
+        assert_eq!(pool.segment_count(), 0);
     }
 
     #[test]
@@ -1882,7 +1826,6 @@ mod tests {
         // Pool with 1 small buddy segment, no dedicated, spill disabled.
         let cfg = PoolConfig {
             segment_size: 8192,
-            min_block_size: 4096,
             max_segments: 1,
             max_dedicated_segments: 0,
 
@@ -1915,7 +1858,7 @@ mod tests {
         PoolConfig {
             max_dedicated_segments: 4,
             spill_dir: std::env::temp_dir().join("c2_buddy_disabled_test"),
-            buddy_enabled: false,
+            pool_enabled: false,
             min_retained_segments: 0,
             ..test_config()
         }
@@ -2004,14 +1947,14 @@ mod tests {
     fn gc_buddy_retires_to_zero_when_min_retained_is_zero() {
         let config = PoolConfig {
             segment_size: 64 * 1024,
-            min_block_size: 4096,
             max_segments: 4,
             max_dedicated_segments: 0,
 
             buddy_idle_decay_secs: 0.0,
             spill_threshold: 1.0,
             spill_dir: std::env::temp_dir().join("c2_retire_zero_test"),
-            buddy_enabled: true,
+            prewarm_segments: 0,
+            pool_enabled: true,
             min_retained_segments: 0,
         };
         let mut pool = test_pool(config);
@@ -2042,14 +1985,14 @@ mod tests {
     fn gc_buddy_retires_only_down_to_configured_min() {
         let config = PoolConfig {
             segment_size: 32 * 1024,
-            min_block_size: 4096,
             max_segments: 4,
             max_dedicated_segments: 0,
 
             buddy_idle_decay_secs: 0.0,
             spill_threshold: 1.0,
             spill_dir: std::env::temp_dir().join("c2_retire_min_test"),
-            buddy_enabled: true,
+            prewarm_segments: 0,
+            pool_enabled: true,
             min_retained_segments: 2,
         };
         let mut pool = test_pool(config);
@@ -2074,14 +2017,14 @@ mod tests {
     fn live_allocations_survive_idle_gc() {
         let config = PoolConfig {
             segment_size: 32 * 1024,
-            min_block_size: 4096,
             max_segments: 4,
             max_dedicated_segments: 0,
 
             buddy_idle_decay_secs: 0.0,
             spill_threshold: 1.0,
             spill_dir: std::env::temp_dir().join("c2_live_gc_test"),
-            buddy_enabled: true,
+            prewarm_segments: 0,
+            pool_enabled: true,
             min_retained_segments: 0,
         };
         let mut pool = test_pool(config);
@@ -2144,7 +2087,6 @@ mod handle_tests {
     fn test_config() -> PoolConfig {
         PoolConfig {
             segment_size: 64 * 1024,
-            min_block_size: 4096,
             max_segments: 2,
             max_dedicated_segments: 2,
 
@@ -2321,7 +2263,6 @@ mod budget_tests {
     fn budget_config() -> PoolConfig {
         PoolConfig {
             segment_size: 8192,
-            min_block_size: 4096,
             max_segments: 4,
             max_dedicated_segments: 4,
 
@@ -2333,45 +2274,42 @@ mod budget_tests {
     }
 
     fn buddy_backing(config: &PoolConfig) -> u64 {
-        BuddyAllocator::checked_layout(config.segment_size, config.min_block_size)
+        BuddyAllocator::checked_layout(config.segment_size, BUDDY_MIN_BLOCK_SIZE)
             .expect("test config geometry is supported")
             .total_size as u64
     }
 
-    fn budget_pool(config: PoolConfig, budget: MemoryBudget) -> MemPool {
+    fn budget_pool(config: PoolConfig, budget: DomainBudget) -> MemPool {
         MemPool::new_with_prefix_and_budget(config, unique_prefix(), budget).unwrap()
     }
 
     #[test]
     fn zero_budget_rejects_before_any_mapping() {
         let config = budget_config();
-        let mut pool = budget_pool(
-            config.clone(),
-            MemoryBudget::from_limits(&c2_config::MemoryBudgetLimits::zeroed()),
-        );
+        let mut pool = budget_pool(config.clone(), test_domain(0, 0));
 
         // Prewarm is a creation entry point and must reject before mapping.
         assert!(
             pool.ensure_buddy_segments(1)
                 .unwrap_err()
-                .contains("memory budget cell 'shm'")
+                .contains("memory budget")
         );
         assert_eq!(pool.segment_count(), 0);
         let snap = pool.budget().unwrap().snapshot();
-        assert_eq!(snap.shm.used_bytes, 0);
-        assert_eq!(snap.shm.rejected_allocations, 1);
-        assert_eq!(snap.shm.rejected_bytes, buddy_backing(&config));
+        assert_eq!(snap.memory.used_bytes, 0);
+        assert_eq!(snap.memory.rejected_allocations, 1);
+        assert_eq!(snap.memory.rejected_bytes, buddy_backing(&config));
 
         // alloc falls buddy → dedicated; both charge the same zeroed cell.
-        assert!(
-            pool.alloc(4096)
-                .unwrap_err()
-                .contains("memory budget cell 'shm'")
-        );
+        assert!(pool.alloc(4096).unwrap_err().contains("memory budget"));
         assert_eq!(pool.segment_count(), 0);
         assert!(pool.dedicated.is_empty());
         assert_eq!(
-            pool.budget().unwrap().snapshot().shm.rejected_allocations,
+            pool.budget()
+                .unwrap()
+                .snapshot()
+                .memory
+                .rejected_allocations,
             3
         );
 
@@ -2381,43 +2319,40 @@ mod budget_tests {
         let spill_dir = std::env::temp_dir().join(format!("c2_budget_zero_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&spill_dir);
         spill_config.spill_dir = spill_dir.clone();
-        let mut spiller = budget_pool(
-            spill_config,
-            MemoryBudget::from_limits(&c2_config::MemoryBudgetLimits::zeroed()),
-        );
+        let mut spiller = budget_pool(spill_config, test_domain(0, 0));
         assert!(
             spiller
                 .alloc_handle(4096)
                 .unwrap_err()
-                .contains("memory budget cell 'file'")
+                .contains("file spill budget")
         );
         assert!(
             !spill_dir.exists(),
             "rejected file reservation must not create the spill directory"
         );
         let snap = spiller.budget().unwrap().snapshot();
-        assert_eq!(snap.file.used_bytes, 0);
-        assert_eq!(snap.file.rejected_allocations, 1);
-        assert_eq!(snap.file.rejected_bytes, 4096);
+        assert_eq!(snap.file_spill.used_bytes, 0);
+        assert_eq!(snap.file_spill.rejected_allocations, 1);
+        assert_eq!(snap.file_spill.rejected_bytes, 4096);
     }
 
     #[test]
     fn charges_match_exact_backing_geometry() {
         let config = budget_config();
-        let budget = MemoryBudget::from_limits(&c2_config::MemoryBudgetLimits::default());
+        let budget = DomainBudget::from_limits(&c2_config::DomainLimits::default());
         let mut pool = budget_pool(config.clone(), budget.clone());
 
         // Buddy backing contains only the rounded payload region.
         let block = pool.alloc(4096).unwrap();
         assert!(!block.is_dedicated);
-        assert_eq!(budget.snapshot().shm.used_bytes, buddy_backing(&config));
+        assert_eq!(budget.snapshot().memory.used_bytes, buddy_backing(&config));
 
         // Dedicated: page-aligned payload, exactly the mapped size.
         let dedicated = pool.alloc(20000).unwrap();
         assert!(dedicated.is_dedicated);
         let dedicated_backing = DedicatedSegment::required_shm_size(20000).unwrap() as u64;
         assert_eq!(
-            budget.snapshot().shm.used_bytes,
+            budget.snapshot().memory.used_bytes,
             buddy_backing(&config) + dedicated_backing
         );
 
@@ -2427,15 +2362,15 @@ mod budget_tests {
         let mut spiller = budget_pool(spill_config, budget.clone());
         let handle = spiller.alloc_handle(5000).unwrap();
         assert!(handle.is_file_spill());
-        assert_eq!(budget.snapshot().file.used_bytes, 5000);
+        assert_eq!(budget.snapshot().file_spill.used_bytes, 5000);
         drop(handle);
-        assert_eq!(budget.snapshot().file.used_bytes, 0);
+        assert_eq!(budget.snapshot().file_spill.used_bytes, 0);
     }
 
     #[test]
     fn reused_buddy_blocks_charge_no_new_backing() {
         let config = budget_config();
-        let budget = MemoryBudget::from_limits(&c2_config::MemoryBudgetLimits::default());
+        let budget = DomainBudget::from_limits(&c2_config::DomainLimits::default());
         let mut pool = budget_pool(config.clone(), budget.clone());
         let backing = buddy_backing(&config);
 
@@ -2443,7 +2378,7 @@ mod budget_tests {
         let a = pool.alloc(4096).unwrap();
         let b = pool.alloc(4096).unwrap();
         assert_eq!(pool.segment_count(), 1);
-        assert_eq!(budget.snapshot().shm.used_bytes, backing);
+        assert_eq!(budget.snapshot().memory.used_bytes, backing);
 
         // Freeing then reusing blocks inside the existing segment adds no
         // charge; only a second mapped segment would.
@@ -2451,94 +2386,55 @@ mod budget_tests {
         unsafe { pool.free(&b) }.unwrap();
         let reused = pool.alloc(4096).unwrap();
         assert_eq!(pool.segment_count(), 1);
-        assert_eq!(budget.snapshot().shm.used_bytes, backing);
-        assert_eq!(budget.snapshot().shm.peak_bytes, backing);
+        assert_eq!(budget.snapshot().memory.used_bytes, backing);
+        assert_eq!(budget.snapshot().memory.peak_bytes, backing);
         unsafe { pool.free(&reused) }.unwrap();
     }
 
     #[test]
-    fn shared_budget_spans_owner_pools_and_private_budgets_do_not() {
+    fn shared_budget_spans_owner_pools() {
         let config = budget_config();
         let backing = buddy_backing(&config);
 
         // One shared budget across two owner pools.
-        let shared = MemoryBudget::new(backing * 2, u64::MAX, u64::MAX);
+        let shared = test_domain(backing * 2, u64::MAX);
         let mut pool_a = budget_pool(config.clone(), shared.clone());
         let mut pool_b = budget_pool(config.clone(), shared.clone());
 
         let a = pool_a.alloc(8192).unwrap();
-        assert_eq!(shared.snapshot().shm.used_bytes, backing);
+        assert_eq!(shared.snapshot().memory.used_bytes, backing);
         let b = pool_b.alloc(8192).unwrap();
-        assert_eq!(shared.snapshot().shm.used_bytes, backing * 2);
+        assert_eq!(shared.snapshot().memory.used_bytes, backing * 2);
 
-        // Both cells exhausted: the third expansion is rejected in both pools.
-        assert!(
-            pool_a
-                .alloc(8192)
-                .unwrap_err()
-                .contains("memory budget cell 'shm'")
-        );
-        assert!(
-            pool_b
-                .alloc(8192)
-                .unwrap_err()
-                .contains("memory budget cell 'shm'")
-        );
-        assert_eq!(shared.snapshot().shm.used_bytes, backing * 2);
+        // Each pool tries both SHM tiers against the same full memory budget.
+        assert!(pool_a.alloc(8192).is_err());
+        assert!(pool_b.alloc(8192).is_err());
+        let memory = shared.snapshot().memory;
+        assert_eq!(memory.rejected_allocations, 4);
+        assert_eq!(memory.used_bytes, backing * 2);
         unsafe { pool_a.free(&a) }.unwrap();
         unsafe { pool_b.free(&b) }.unwrap();
-
-        // Existing owner constructors carry distinct private canonical budgets.
-        let mut private_a = MemPool::new_with_prefix(config.clone(), unique_prefix()).unwrap();
-        let mut private_b = MemPool::new_with_prefix(config.clone(), unique_prefix()).unwrap();
-        let a = private_a.alloc(8192).unwrap();
-        assert_eq!(
-            private_a.budget().unwrap().snapshot().shm.used_bytes,
-            backing
-        );
-        assert_eq!(private_b.budget().unwrap().snapshot().shm.used_bytes, 0);
-        let b = private_b.alloc(8192).unwrap();
-        assert_eq!(
-            private_a.budget().unwrap().snapshot().shm.used_bytes,
-            backing
-        );
-        assert_eq!(
-            private_b.budget().unwrap().snapshot().shm.used_bytes,
-            backing
-        );
-        unsafe { private_a.free(&a) }.unwrap();
-        unsafe { private_b.free(&b) }.unwrap();
-
-        // Peer pools never charge owner-creation budget.
-        let peer = MemPool::open_peer(config, unique_prefix()).unwrap();
-        assert!(peer.budget().is_none());
     }
 
     #[test]
-    fn owner_constructors_carry_canonical_private_limits() {
+    fn unbudgeted_owner_and_peer_have_no_domain() {
         let config = budget_config();
-        for pool in [
-            MemPool::new(config.clone()).unwrap(),
-            MemPool::new_with_prefix(config.clone(), unique_prefix()).unwrap(),
-        ] {
-            let budget = pool.budget().expect("owner pools carry a budget");
-            let snap = budget.snapshot();
-            assert_eq!(snap.shm.limit_bytes, 8 * 1024 * 1024 * 1024);
-            assert_eq!(snap.file.limit_bytes, 16 * 1024 * 1024 * 1024);
-            assert_eq!(snap.reassembly.limit_bytes, 8 * 1024 * 1024 * 1024);
-        }
+        let owner = MemPool::new(config.clone()).unwrap();
+        let peer = MemPool::open_peer(config, unique_prefix()).unwrap();
+        assert!(owner.budget().is_none());
+        assert!(peer.budget().is_none());
     }
 
     #[test]
     fn dedicated_release_returns_backing_charge_immediately() {
         let backing = DedicatedSegment::required_shm_size(20_000).unwrap() as u64;
-        let budget = MemoryBudget::new(backing, 0, 0);
+        let budget = test_domain(backing, 0);
         let mut pool = budget_pool(budget_config(), budget.clone());
         let handle = pool.alloc_shm_handle(20_000).unwrap();
         assert!(handle.is_dedicated());
-        assert_eq!(budget.snapshot().shm.used_bytes, backing);
+        assert_eq!(budget.snapshot().memory.used_bytes, backing);
         pool.release_handle(handle);
-        assert_eq!(budget.snapshot().shm.used_bytes, 0);
+        assert_eq!(budget.snapshot().memory.used_bytes, 0);
         assert_eq!(pool.stats().dedicated_segments, 0);
     }
 
@@ -2553,7 +2449,7 @@ mod budget_tests {
         let mut spill_config = config;
         spill_config.spill_threshold = 0.0; // force the file path
         spill_config.spill_dir = not_a_dir.clone();
-        let budget = MemoryBudget::from_limits(&c2_config::MemoryBudgetLimits::default());
+        let budget = DomainBudget::from_limits(&c2_config::DomainLimits::default());
         let mut pool = budget_pool(spill_config, budget.clone());
 
         assert!(
@@ -2564,9 +2460,9 @@ mod budget_tests {
         // The reservation was taken and then returned: used is zero, but the
         // persisted high-water mark proves the charge happened and rolled back.
         let snap = budget.snapshot();
-        assert_eq!(snap.file.used_bytes, 0);
-        assert_eq!(snap.file.peak_bytes, 4096);
-        assert_eq!(snap.file.rejected_allocations, 0);
+        assert_eq!(snap.file_spill.used_bytes, 0);
+        assert_eq!(snap.file_spill.peak_bytes, 4096);
+        assert_eq!(snap.file_spill.rejected_allocations, 0);
 
         let _ = std::fs::remove_file(&not_a_dir);
     }
@@ -2578,23 +2474,23 @@ mod budget_tests {
         let mut config = budget_config();
         config.spill_threshold = 0.0; // force the file path
         config.spill_dir = dir.clone();
-        let budget = MemoryBudget::from_limits(&c2_config::MemoryBudgetLimits::default());
+        let budget = DomainBudget::from_limits(&c2_config::DomainLimits::default());
         let mut pool = budget_pool(config, budget.clone());
 
         let mut handle = pool.alloc_handle(8192).unwrap();
         assert!(handle.is_file_spill());
-        assert_eq!(budget.snapshot().file.used_bytes, 8192);
+        assert_eq!(budget.snapshot().file_spill.used_bytes, 8192);
         pool.handle_slice_mut(&mut handle)[..4].copy_from_slice(b"hold");
 
         // Logical trim must not release the mapping's charge.
         handle.trim_to(4).unwrap();
-        assert_eq!(budget.snapshot().file.used_bytes, 8192);
+        assert_eq!(budget.snapshot().file_spill.used_bytes, 8192);
 
         // Move the handle, then drop the pool entirely.
         let moved = handle;
         drop(pool);
         assert_eq!(
-            budget.snapshot().file.used_bytes,
+            budget.snapshot().file_spill.used_bytes,
             8192,
             "file charge must persist while the mapping is live"
         );
@@ -2603,7 +2499,7 @@ mod budget_tests {
         let mut peer = MemPool::open_peer(budget_config(), "unused-peer-prefix".into()).unwrap();
         assert_eq!(peer.copy_handle_data(&moved).unwrap(), b"hold");
         peer.release_handle(moved);
-        assert_eq!(budget.snapshot().file.used_bytes, 0);
+        assert_eq!(budget.snapshot().file_spill.used_bytes, 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2614,12 +2510,12 @@ mod budget_tests {
         let mut config = budget_config();
         config.spill_dir = dir.clone();
         // Tiny but nonzero budgets: smaller than any eligible backing.
-        let budget = MemoryBudget::new(4095, 4095, 4095);
+        let budget = test_domain(4095, 4095);
         let mut pool = budget_pool(config.clone(), budget.clone());
 
         let error = pool.alloc_handle(4096).unwrap_err();
         assert!(
-            error.contains("memory budget cell 'file'"),
+            error.contains("file spill budget"),
             "terminal capacity error should name the last exhausted cell: {error}"
         );
         // Every tier was attempted and none created a backing.
@@ -2630,10 +2526,10 @@ mod budget_tests {
             "no spill file may be created by a rejected tier"
         );
         let snap = budget.snapshot();
-        assert_eq!(snap.shm.rejected_allocations, 2); // buddy expansion + dedicated
-        assert_eq!(snap.file.rejected_allocations, 1);
-        assert_eq!(snap.shm.used_bytes, 0);
-        assert_eq!(snap.file.used_bytes, 0);
+        assert_eq!(snap.memory.rejected_allocations, 2); // buddy expansion + dedicated
+        assert_eq!(snap.file_spill.rejected_allocations, 1);
+        assert_eq!(snap.memory.used_bytes, 0);
+        assert_eq!(snap.file_spill.used_bytes, 0);
 
         // SHM-only allocation reports a capacity error for transport's
         // existing chunked fallback; it never silently spills.
@@ -2653,7 +2549,7 @@ mod budget_tests {
         // Large enough for a dedicated 4096-byte payload backing, too small
         // for a full buddy segment.
         assert!(dedicated_backing < buddy_backing(&config));
-        let budget = MemoryBudget::new(dedicated_backing, u64::MAX, u64::MAX);
+        let budget = test_domain(dedicated_backing, u64::MAX);
         let mut pool = budget_pool(config, budget.clone());
 
         let alloc = pool.alloc(4096).unwrap();
@@ -2661,7 +2557,7 @@ mod budget_tests {
             alloc.is_dedicated,
             "rejected buddy expansion must fall through to a smaller dedicated backing"
         );
-        assert_eq!(budget.snapshot().shm.used_bytes, dedicated_backing);
+        assert_eq!(budget.snapshot().memory.used_bytes, dedicated_backing);
         assert_eq!(pool.segment_count(), 0);
         unsafe { pool.free(&alloc) }.unwrap();
     }
@@ -2673,25 +2569,68 @@ mod budget_tests {
         let mut config = budget_config();
         config.spill_dir = dir.clone();
         // SHM fully disabled by zero limit; file allowed.
-        let budget = MemoryBudget::new(0, 16 * 1024 * 1024 * 1024, 0);
+        let budget = test_domain(0, 16 * 1024 * 1024 * 1024);
         let mut pool = budget_pool(config, budget.clone());
 
         let handle = pool.alloc_handle(4096).unwrap();
         assert!(handle.is_file_spill());
         let snap = budget.snapshot();
-        assert_eq!(snap.shm.used_bytes, 0);
-        assert_eq!(snap.shm.rejected_allocations, 2); // buddy + dedicated
-        assert_eq!(snap.file.used_bytes, 4096);
-        assert_eq!(snap.file.rejected_allocations, 0);
+        assert_eq!(snap.memory.used_bytes, 0);
+        assert_eq!(snap.memory.rejected_allocations, 2); // buddy + dedicated
+        assert_eq!(snap.file_spill.used_bytes, 4096);
+        assert_eq!(snap.file_spill.rejected_allocations, 0);
         drop(handle);
-        assert_eq!(budget.snapshot().file.used_bytes, 0);
+        assert_eq!(budget.snapshot().file_spill.used_bytes, 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
+    fn a_full_memory_domain_uses_file_spill_only_when_capacity_is_available() {
+        for file_limit in [0, 2 * 4096] {
+            let budget = test_domain(256 * 1024, file_limit);
+            let mut pool = MemPool::new_with_budget(
+                PoolConfig {
+                    spill_threshold: 1.0,
+                    ..PoolConfig::primary_for_budget(256 * 1024)
+                },
+                budget.clone(),
+            )
+            .unwrap();
+            // Exhaust M with payload storage outside the pool, as a caller
+            // holding upstream data can do before trying to reassemble.
+            let held = budget.try_reserve_memory(256 * 1024).unwrap();
+            let owned = pool.alloc_owned(4096);
+            let handle = pool.alloc_handle(4096);
+            if file_limit == 0 {
+                assert!(owned.unwrap_err().contains("file spill budget"));
+                assert!(handle.unwrap_err().contains("file spill budget"));
+            } else {
+                let mut owned = owned.unwrap();
+                let handle = handle.unwrap();
+                assert!(owned.is_file_spill());
+                assert!(handle.is_file_spill());
+                owned.as_mut_slice()[0] = 42;
+                assert_eq!(owned.as_slice()[0], 42);
+                assert_eq!(budget.snapshot().file_spill.used_bytes, 8192);
+                drop(owned);
+                pool.release_handle(handle);
+            }
+            assert_eq!(budget.snapshot().file_spill.used_bytes, 0);
+            assert_eq!(budget.snapshot().memory.used_bytes, held.bytes());
+            assert_eq!(pool.segment_count(), 0);
+            assert_eq!(pool.stats().dedicated_segments, 0);
+            drop(held);
+            assert_eq!(budget.snapshot().memory.used_bytes, 0);
+        }
+    }
+
+    #[test]
     fn teardown_returns_all_charges_and_live_backings_are_not_retired_early() {
-        let config = budget_config();
-        let budget = MemoryBudget::from_limits(&c2_config::MemoryBudgetLimits::default());
+        let config = PoolConfig {
+            min_retained_segments: 1,
+            ..budget_config()
+        };
+        let budget = DomainBudget::from_limits(&c2_config::DomainLimits::default());
         let mut pool = budget_pool(config.clone(), budget.clone());
         let backing = buddy_backing(&config);
 
@@ -2699,28 +2638,28 @@ mod budget_tests {
         let a = pool.alloc(8192).unwrap();
         let b = pool.alloc(8192).unwrap();
         assert_eq!(pool.segment_count(), 2);
-        assert_eq!(budget.snapshot().shm.used_bytes, backing * 2);
+        assert_eq!(budget.snapshot().memory.used_bytes, backing * 2);
         assert_eq!(pool.gc_buddy(), 0);
-        assert_eq!(budget.snapshot().shm.used_bytes, backing * 2);
+        assert_eq!(budget.snapshot().memory.used_bytes, backing * 2);
 
         // Free + GC reclaims the trailing idle segment and returns its charge.
         unsafe { pool.free(&a) }.unwrap();
         unsafe { pool.free(&b) }.unwrap();
         assert_eq!(pool.gc_buddy(), 1);
-        assert_eq!(budget.snapshot().shm.used_bytes, backing);
+        assert_eq!(budget.snapshot().memory.used_bytes, backing);
 
         // The last owner dropping the pool also releases retained backings.
         drop(pool);
-        assert_eq!(budget.snapshot().shm.used_bytes, 0);
+        assert_eq!(budget.snapshot().memory.used_bytes, 0);
 
         // Dedicated release refunds immediately; a file handle can outlive
         // the pool itself and stays charged until its mapping drops.
         let mut pool = budget_pool(config.clone(), budget.clone());
         let d = pool.alloc(20000).unwrap();
         let dedicated_backing = DedicatedSegment::required_shm_size(20000).unwrap() as u64;
-        assert_eq!(budget.snapshot().shm.used_bytes, dedicated_backing);
+        assert_eq!(budget.snapshot().memory.used_bytes, dedicated_backing);
         unsafe { pool.free(&d) }.unwrap();
-        assert_eq!(budget.snapshot().shm.used_bytes, 0);
+        assert_eq!(budget.snapshot().memory.used_bytes, 0);
 
         let mut spill_config = config;
         spill_config.spill_threshold = 0.0;
@@ -2729,16 +2668,15 @@ mod budget_tests {
         let mut spiller = budget_pool(spill_config, budget.clone());
         let handle = spiller.alloc_handle(4096).unwrap();
         drop(spiller);
-        assert_eq!(budget.snapshot().file.used_bytes, 4096);
+        assert_eq!(budget.snapshot().file_spill.used_bytes, 4096);
         drop(handle);
-        assert_eq!(budget.snapshot().file.used_bytes, 0);
+        assert_eq!(budget.snapshot().file_spill.used_bytes, 0);
 
         let snap = budget.snapshot();
-        assert_eq!(snap.shm.used_bytes, 0);
-        assert_eq!(snap.file.used_bytes, 0);
-        assert_eq!(snap.reassembly.used_bytes, 0);
+        assert_eq!(snap.memory.used_bytes, 0);
+        assert_eq!(snap.file_spill.used_bytes, 0);
         assert!(
-            snap.shm.peak_bytes > 0,
+            snap.memory.peak_bytes > 0,
             "peaks persist; counters are never reset"
         );
     }
@@ -2759,7 +2697,6 @@ mod geometry_and_guard_tests {
     fn geometry_config() -> PoolConfig {
         PoolConfig {
             segment_size: 8192,
-            min_block_size: 4096,
             max_segments: 4,
             max_dedicated_segments: 4,
 
@@ -2768,20 +2705,6 @@ mod geometry_and_guard_tests {
             spill_dir: std::env::temp_dir().join("c2_geometry_spill"),
             ..PoolConfig::default()
         }
-    }
-
-    #[test]
-    fn validate_config_rejects_min_block_doubling_overflow() {
-        let mut config = geometry_config();
-        // A power-of-two min block whose doubling wraps usize would previously
-        // compare segment_size against a small wrapped bound.
-        config.min_block_size = usize::MAX / 2 + 1;
-        config.segment_size = usize::MAX;
-        let error = MemPool::validate_config(&config).unwrap_err();
-        assert!(
-            error.contains("doubling overflows"),
-            "unexpected error: {error}"
-        );
     }
 
     #[test]
@@ -2815,7 +2738,7 @@ mod geometry_and_guard_tests {
         for segment_size in sizes {
             let mut config = geometry_config();
             config.segment_size = segment_size;
-            let budget = MemoryBudget::from_limits(&c2_config::MemoryBudgetLimits::default());
+            let budget = DomainBudget::from_limits(&c2_config::DomainLimits::default());
             let error =
                 MemPool::new_with_prefix_and_budget(config, unique_prefix(), budget.clone())
                     .err()
@@ -2826,9 +2749,9 @@ mod geometry_and_guard_tests {
             );
             // No charge was taken and no budget rejection was recorded.
             let snap = budget.snapshot();
-            assert_eq!(snap.shm.used_bytes, 0, "segment_size {segment_size}");
+            assert_eq!(snap.memory.used_bytes, 0, "segment_size {segment_size}");
             assert_eq!(
-                snap.shm.rejected_allocations, 0,
+                snap.memory.rejected_allocations, 0,
                 "segment_size {segment_size}"
             );
         }
@@ -2839,7 +2762,7 @@ mod geometry_and_guard_tests {
         // OS-level probe on this platform: creator teardown must actually
         // remove the named POSIX SHM objects, not just the pool's containers.
         let config = geometry_config();
-        let budget = MemoryBudget::from_limits(&c2_config::MemoryBudgetLimits::default());
+        let budget = DomainBudget::from_limits(&c2_config::DomainLimits::default());
         let mut pool =
             MemPool::new_with_prefix_and_budget(config, unique_prefix(), budget.clone()).unwrap();
 
@@ -2864,7 +2787,7 @@ mod geometry_and_guard_tests {
             DedicatedSegment::open(&dedicated_name, 20000).is_err(),
             "dedicated region {dedicated_name} must not survive owner teardown"
         );
-        assert_eq!(budget.snapshot().shm.used_bytes, 0);
+        assert_eq!(budget.snapshot().memory.used_bytes, 0);
     }
 }
 
@@ -2887,7 +2810,6 @@ mod pressure_seam_tests {
     fn pressure_config() -> PoolConfig {
         PoolConfig {
             segment_size: 8192,
-            min_block_size: 4096,
             max_segments: 4,
             max_dedicated_segments: 4,
 
@@ -2899,7 +2821,7 @@ mod pressure_seam_tests {
     }
 
     fn buddy_total(config: &PoolConfig) -> u64 {
-        BuddyAllocator::checked_layout(config.segment_size, config.min_block_size)
+        BuddyAllocator::checked_layout(config.segment_size, BUDDY_MIN_BLOCK_SIZE)
             .expect("test config geometry is supported")
             .total_size as u64
     }
@@ -2908,8 +2830,8 @@ mod pressure_seam_tests {
         DedicatedSegment::required_shm_size(payload).unwrap() as u64
     }
 
-    fn default_budget() -> MemoryBudget {
-        MemoryBudget::from_limits(&c2_config::MemoryBudgetLimits::default())
+    fn default_budget() -> DomainBudget {
+        DomainBudget::from_limits(&c2_config::DomainLimits::default())
     }
 
     /// Scripted availability (bytes), sample counter, and clock (ms).
@@ -2971,7 +2893,7 @@ mod pressure_seam_tests {
             "a tiny payload must not create the oversized buddy backing under pressure"
         );
         assert_eq!(pool.segment_count(), 0, "buddy backing denied before map");
-        assert_eq!(budget.snapshot().shm.used_bytes, dedicated);
+        assert_eq!(budget.snapshot().memory.used_bytes, dedicated);
         let stats = pool.stats();
         assert_eq!(stats.pressure_denied_backings, 1);
         assert_eq!(stats.dedicated_allocs, 1);
@@ -3062,7 +2984,7 @@ mod pressure_seam_tests {
         assert!(!a.is_dedicated && !b.is_dedicated);
         unsafe { pool.free(&a) }.unwrap();
         unsafe { pool.free(&b) }.unwrap();
-        let charged = budget.snapshot().shm.used_bytes;
+        let charged = budget.snapshot().memory.used_bytes;
         assert_eq!(charged, buddy_total(&config));
 
         // Zero observed availability: reuse of the already-mapped segment is
@@ -3070,7 +2992,7 @@ mod pressure_seam_tests {
         Script::install(&mut pool, 0);
         let reused = pool.alloc(4096).unwrap();
         assert!(!reused.is_dedicated);
-        assert_eq!(budget.snapshot().shm.used_bytes, charged);
+        assert_eq!(budget.snapshot().memory.used_bytes, charged);
         let stats = pool.stats();
         assert_eq!(stats.buddy_reused_allocs, 2);
         assert_eq!(stats.buddy_expanded_allocs, 1);
@@ -3148,7 +3070,7 @@ mod pressure_seam_tests {
     #[test]
     fn pressure_denied_shm_escapes_to_file_backing() {
         let config = pressure_config();
-        let budget = MemoryBudget::new(u64::MAX, u64::MAX, u64::MAX);
+        let budget = test_domain(u64::MAX, u64::MAX);
         let mut pool =
             MemPool::new_with_prefix_and_budget(config, unique_prefix(), budget.clone()).unwrap();
         // A failed (zero) availability observation denies every SHM seam.
@@ -3156,23 +3078,23 @@ mod pressure_seam_tests {
         let handle = pool.alloc_handle(4096).unwrap();
         assert!(handle.is_file_spill());
         assert_eq!(pool.stats().pressure_denied_backings, 2);
-        assert_eq!(budget.snapshot().file.used_bytes, 4096);
+        assert_eq!(budget.snapshot().file_spill.used_bytes, 4096);
         drop(handle);
-        assert_eq!(budget.snapshot().file.used_bytes, 0);
+        assert_eq!(budget.snapshot().file_spill.used_bytes, 0);
     }
 
     #[test]
     fn exhausted_file_backing_yields_a_clear_terminal_failure() {
         let mut config = pressure_config();
         config.spill_threshold = 0.0;
-        let budget = MemoryBudget::new(u64::MAX, 0, u64::MAX);
+        let budget = test_domain(u64::MAX, 0);
         let mut pool =
             MemPool::new_with_prefix_and_budget(config, unique_prefix(), budget).unwrap();
         Script::install(&mut pool, u64::MAX);
 
         let error = pool.alloc_handle(4096).unwrap_err();
         assert!(
-            error.contains("memory budget cell 'file'"),
+            error.contains("file spill budget"),
             "terminal failure should name the exhausted file cell: {error}"
         );
         assert_eq!(pool.segment_count(), 0);

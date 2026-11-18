@@ -1,24 +1,4 @@
-//! Per-call deadline policy and bounded deadline-transaction admission
-//! limits for C-Two 0.7.1.
-//!
-//! [`CallTimeout`] and [`CallOptions`] describe one call's total waiting
-//! budget: `Inherit` resolves from the path's default policy, `Unlimited`
-//! explicitly disables the deadline, and `After(Duration)` bounds the whole
-//! logical call. [`CallExecutionLimits`] carries the canonical finite
-//! admission limits for outstanding calls and locally retained payload
-//! buffers. [`DEFAULT_MAX_OUTSTANDING_CALLS`] and
-//! [`DEFAULT_PAYLOAD_BUFFER_BUDGET_BYTES`] define their defaults.
-//!
-//! This module is pure policy data and checked conversion. It reads no
-//! environment (the `C2_CALL_MAX_OUTSTANDING` and
-//! `C2_CALL_PAYLOAD_BUFFER_BUDGET_BYTES` overrides are wired by
-//! [`crate::ConfigResolver::resolve_call_execution_limits`], not by these
-//! types), starts no runtime, and resolves no transport default: the
-//! HTTP default policy and the `Inherit` resolution both belong to the
-//! future callers that own those paths. A zero value is a finite deadline
-//! that expires immediately and must not dispatch — it is never unlimited,
-//! and a zero admission limit rejects every positive request instead of
-//! disabling the limit.
+//! Caller deadlines for logical calls.
 
 use std::time::Duration;
 
@@ -114,76 +94,10 @@ impl CallOptions {
     }
 }
 
-/// Canonical call admission and payload buffer limits.
-///
-/// Both fields are finite upper bounds: a zero value rejects every positive
-/// request in that dimension, it never means unlimited. The byte limit is
-/// the shared payload buffer budget for a Runtime or relay, not a
-/// preallocation or a process RSS bound. The reservation primitive for the
-/// byte dimension is `c2_mem::retention::PayloadBufferBudget`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct CallExecutionLimits {
-    /// Maximum unfinished bounded deadline transactions per runtime; the
-    /// next admission is rejected before dispatch when exhausted.
-    pub max_outstanding_calls: u64,
-    /// Finite byte budget for locally retained payload buffers.
-    pub payload_buffer_budget_bytes: u64,
-}
-
-/// Default outstanding bounded deadline transactions per runtime.
-pub const DEFAULT_MAX_OUTSTANDING_CALLS: u64 = 1024;
-
-const GIB: u64 = 1 << 30;
-
-/// Default payload buffer budget, matching the current single-message cap.
-pub const DEFAULT_PAYLOAD_BUFFER_BUDGET_BYTES: u64 = 16 * GIB;
-
-impl CallExecutionLimits {
-    /// Limits with both cells at zero: every positive request is rejected.
-    ///
-    /// Useful for tests and for explicitly closing a dimension without
-    /// introducing an unlimited mode.
-    pub const fn zeroed() -> Self {
-        Self {
-            max_outstanding_calls: 0,
-            payload_buffer_budget_bytes: 0,
-        }
-    }
-}
-
-impl Default for CallExecutionLimits {
-    fn default() -> Self {
-        Self {
-            max_outstanding_calls: DEFAULT_MAX_OUTSTANDING_CALLS,
-            payload_buffer_budget_bytes: DEFAULT_PAYLOAD_BUFFER_BUDGET_BYTES,
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::error::Error;
-
-    #[test]
-    fn canonical_defaults_match_the_host_capacity_decision() {
-        let limits = CallExecutionLimits::default();
-        assert_eq!(limits.max_outstanding_calls, 1024);
-        assert_eq!(limits.payload_buffer_budget_bytes, 16 * 1024 * 1024 * 1024);
-        assert_eq!(DEFAULT_MAX_OUTSTANDING_CALLS, 1024);
-        assert_eq!(DEFAULT_PAYLOAD_BUFFER_BUDGET_BYTES, 16 * 1024 * 1024 * 1024);
-    }
-
-    #[test]
-    fn zeroed_limits_are_finite_and_rejective_not_unlimited() {
-        assert_eq!(
-            CallExecutionLimits::zeroed(),
-            CallExecutionLimits {
-                max_outstanding_calls: 0,
-                payload_buffer_budget_bytes: 0,
-            }
-        );
-    }
 
     #[test]
     fn try_after_seconds_accepts_finite_non_negative_values() {

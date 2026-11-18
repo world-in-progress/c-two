@@ -388,7 +388,7 @@ mod tests {
     fn env_map(entries: &[(&str, &str)]) -> crate::EnvMap {
         entries
             .iter()
-            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+            .map(|(key, value)| ((*key).into(), (*value).into()))
             .collect()
     }
 
@@ -617,22 +617,26 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn frozen_context_is_stable_when_environment_changes() {
-        use crate::{ConfigResolver, ConfigSources, EnvFilePolicy, LocalEndpointOptions};
+        use crate::{
+            ConfigResolver, ConfigSources, EnvCatalog, EnvFilePolicy, LocalEndpointOptions,
+        };
 
         let first = ConfigResolver::resolve_local_endpoint(
             LocalEndpointOptions::default(),
-            ConfigSources {
+            &EnvCatalog::load(ConfigSources {
                 env_file: EnvFilePolicy::Disabled,
                 process_env: env_map(&[("C2_IPC_ROOT", "/tmp/c2-snapshot-a")]),
-            },
+            })
+            .unwrap(),
         )
         .unwrap();
         let second = ConfigResolver::resolve_local_endpoint(
             LocalEndpointOptions::default(),
-            ConfigSources {
+            &EnvCatalog::load(ConfigSources {
                 env_file: EnvFilePolicy::Disabled,
                 process_env: env_map(&[("C2_IPC_ROOT", "/tmp/c2-snapshot-b")]),
-            },
+            })
+            .unwrap(),
         )
         .unwrap();
         assert_ne!(first, second);
@@ -716,7 +720,9 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn windows_rejects_unix_root_override_as_not_applicable() {
-        use crate::{ConfigResolver, ConfigSources, EnvFilePolicy, LocalEndpointOptions};
+        use crate::{
+            ConfigResolver, ConfigSources, EnvCatalog, EnvFilePolicy, LocalEndpointOptions,
+        };
 
         let error = LocalEndpointContext::with_unix_root(Path::new("/tmp/c2-it-b")).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
@@ -726,7 +732,7 @@ mod tests {
             LocalEndpointOptions {
                 unix_root: Some(PathBuf::from(r"C:\tmp\app")),
             },
-            ConfigSources::empty(),
+            &EnvCatalog::load(ConfigSources::empty()).unwrap(),
         )
         .unwrap_err();
         assert!(
@@ -736,10 +742,11 @@ mod tests {
 
         let env_error = ConfigResolver::resolve_local_endpoint(
             LocalEndpointOptions::default(),
-            ConfigSources {
+            &EnvCatalog::load(ConfigSources {
                 env_file: EnvFilePolicy::Disabled,
                 process_env: env_map(&[("C2_IPC_ROOT", r"C:\tmp\app")]),
-            },
+            })
+            .unwrap(),
         )
         .unwrap_err();
         assert!(

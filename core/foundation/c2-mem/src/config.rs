@@ -25,7 +25,7 @@ pub struct PoolAllocation {
 /// never whole-process RSS or the OS commit charge. Buddy fields cover the
 /// data region only (allocator metadata is local). Dedicated fields count
 /// live mappings, released locally when the allocation owner is consumed.
-/// File and live-reassembly bytes belong to the budget cells.
+/// File mappings are accounted in the domain file spill budget.
 #[derive(Debug, Clone)]
 pub struct PoolStats {
     /// Live buddy segments (mapped buddy backings).

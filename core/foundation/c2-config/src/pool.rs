@@ -1,65 +1,80 @@
-//! Memory pool configuration.
+//! Pool geometry derived from role-domain memory capacity.
 
-/// Configuration for the memory pool.
+use crate::DEFAULT_MEMORY_BUDGET_BYTES;
+use std::path::PathBuf;
+
+pub const MIN_BUDDY_SEGMENT_BYTES: u64 = 64 * 1024;
+pub const MAX_BUDDY_SEGMENT_BYTES: u64 = 64 * 1024 * 1024;
+pub const PRIMARY_MAX_POOL_SEGMENTS: usize = 16;
+pub const REASSEMBLY_MAX_POOL_SEGMENTS: usize = 4;
+/// The peer cache accepts buddy indices below this bound.
+pub const MAX_IPC_POOL_SEGMENTS: u32 = 255;
+/// Dedicated mappings can use every wire slot.
+pub const MAX_DEDICATED_SEGMENTS: usize = u16::MAX as usize + 1;
+pub const POOL_DECAY_SECONDS: f64 = 60.0;
+pub const SPILL_THRESHOLD: f64 = 0.8;
+
 #[derive(Debug, Clone)]
 pub struct PoolConfig {
-    /// Size of each buddy segment (default 256 MB).
+    /// Whether the buddy pool can reuse and create segments.
+    pub pool_enabled: bool,
     pub segment_size: usize,
-    /// Minimum allocation block (default 4 KB).
-    pub min_block_size: usize,
-    /// Maximum number of buddy segments (default 8).
     pub max_segments: usize,
-    /// Maximum number of dedicated segments (default 4).
     pub max_dedicated_segments: usize,
-    /// Idle decay window for buddy segments (seconds). A buddy segment whose
-    /// `alloc_count` has been zero for at least this duration becomes eligible
-    /// for reclamation by `gc_buddy()`. Only trailing idle segments are popped.
-    pub buddy_idle_decay_secs: f64,
-    /// OS-memory pressure threshold ratio for creating new shared-memory
-    /// backings, evaluated at the buddy-segment and dedicated-backing
-    /// creation seams against each candidate's validated total mapped bytes
-    /// (default 0.8). `0.0` (or any non-positive/non-finite value) forces
-    /// every new SHM mapping away from SHM — file spill where the API has
-    /// that fallback, an explicit error otherwise. `1.0` or greater disables
-    /// the heuristic. Reusing already-mapped buddy blocks is always allowed
-    /// and finite budget limits remain enforced regardless of this value.
+    /// A fraction of available OS memory. Values >= 1 bypass the heuristic.
     pub spill_threshold: f64,
-    /// Directory for spill files, beneath the platform's temporary directory.
-    pub spill_dir: std::path::PathBuf,
-    /// Whether buddy reuse and expansion are allowed. When `false`, every
-    /// allocation API skips the buddy tiers entirely — including reuse of any
-    /// already-cached segments — and goes straight to dedicated SHM (or the
-    /// file-spill fallback where the API has one). Dedicated segments, chunked
-    /// transfer, and file spill stay available; only the buddy tiers are
-    /// policy-disabled. Peer (receive-side) caches ignore this flag because
-    /// they never allocate.
-    pub buddy_enabled: bool,
-    /// Minimum number of trailing buddy segments `gc_buddy()` must retain even
-    /// when they are fully idle (default 1 for direct native users). IPC
-    /// transports project their own `pool_min_retained_segments` setting here,
-    /// whose default 0 allows idle pools to retire back to zero mappings.
-    /// Generation counters, live allocations, and peer safety are unaffected.
+    pub spill_dir: PathBuf,
+    pub prewarm_segments: usize,
     pub min_retained_segments: usize,
+    pub buddy_idle_decay_secs: f64,
 }
 
-impl Default for PoolConfig {
-    fn default() -> Self {
+impl PoolConfig {
+    pub fn primary_for_budget(memory_budget_bytes: u64) -> Self {
+        Self::for_budget_share(memory_budget_bytes / 4, PRIMARY_MAX_POOL_SEGMENTS)
+    }
+
+    pub fn reassembly_for_budget(memory_budget_bytes: u64) -> Self {
+        Self::for_budget_share(memory_budget_bytes / 16, REASSEMBLY_MAX_POOL_SEGMENTS)
+    }
+
+    pub fn peer_cache_config() -> Self {
         Self {
-            segment_size: 256 * 1024 * 1024,
-            min_block_size: 4096,
-            max_segments: 8,
-            max_dedicated_segments: 4,
-            buddy_idle_decay_secs: 60.0,
-            spill_threshold: 0.8,
+            max_segments: MAX_IPC_POOL_SEGMENTS as usize,
+            ..Self::default()
+        }
+    }
+
+    fn for_budget_share(share: u64, segment_cap: usize) -> Self {
+        let pool_enabled = share >= MIN_BUDDY_SEGMENT_BYTES;
+        let max_segments = (share / MIN_BUDDY_SEGMENT_BYTES).clamp(1, segment_cap as u64);
+        let segment_size = if pool_enabled {
+            let per_segment = share / max_segments;
+            (1u64 << per_segment.ilog2()).min(MAX_BUDDY_SEGMENT_BYTES)
+        } else {
+            MIN_BUDDY_SEGMENT_BYTES
+        };
+        Self {
+            pool_enabled,
+            segment_size: segment_size as usize,
+            max_segments: max_segments as usize,
+            max_dedicated_segments: MAX_DEDICATED_SEGMENTS,
+            spill_threshold: SPILL_THRESHOLD,
             spill_dir: default_spill_dir(),
-            buddy_enabled: true,
-            min_retained_segments: 1,
+            prewarm_segments: 0,
+            min_retained_segments: 0,
+            buddy_idle_decay_secs: POOL_DECAY_SECONDS,
         }
     }
 }
 
-/// The single native default used by pool configuration and SDK projections.
-pub fn default_spill_dir() -> std::path::PathBuf {
+impl Default for PoolConfig {
+    fn default() -> Self {
+        Self::primary_for_budget(DEFAULT_MEMORY_BUDGET_BYTES)
+    }
+}
+
+pub fn default_spill_dir() -> PathBuf {
     std::env::temp_dir().join("c_two_spill")
 }
 
@@ -68,17 +83,76 @@ mod tests {
     use super::*;
 
     #[test]
-    fn pool_default_uses_platform_temporary_directory() {
-        assert_eq!(
-            PoolConfig::default().spill_dir,
-            std::env::temp_dir().join("c_two_spill")
-        );
+    fn geometry_crosses_pool_and_segment_boundaries() {
+        let kib = 1024;
+        let mib = kib * kib;
+        for (budget, expected) in [
+            (256 * kib - 1, (false, 64 * kib, 1)),
+            (256 * kib, (true, 64 * kib, 1)),
+            (mib, (true, 64 * kib, 4)),
+            (4 * mib - 1, (true, 64 * kib, 15)),
+            (4 * mib, (true, 64 * kib, 16)),
+            (8 * mib, (true, 128 * kib, 16)),
+            (DEFAULT_MEMORY_BUDGET_BYTES, (true, 64 * mib, 16)),
+        ] {
+            let config = PoolConfig::primary_for_budget(budget);
+            assert_eq!(
+                (
+                    config.pool_enabled,
+                    config.segment_size as u64,
+                    config.max_segments
+                ),
+                expected
+            );
+        }
+        for (budget, expected) in [
+            (mib - 1, (false, 64 * kib, 1)),
+            (mib, (true, 64 * kib, 1)),
+            (2 * mib, (true, 64 * kib, 2)),
+            (4 * mib, (true, 64 * kib, 4)),
+            (DEFAULT_MEMORY_BUDGET_BYTES, (true, 64 * mib, 4)),
+        ] {
+            let config = PoolConfig::reassembly_for_budget(budget);
+            assert_eq!(
+                (
+                    config.pool_enabled,
+                    config.segment_size as u64,
+                    config.max_segments
+                ),
+                expected
+            );
+        }
     }
 
     #[test]
-    fn pool_default_enables_buddy_and_retains_one_segment() {
-        let config = PoolConfig::default();
-        assert!(config.buddy_enabled);
-        assert_eq!(config.min_retained_segments, 1);
+    fn enabled_geometry_fits_its_share_at_rounding_boundaries() {
+        // Each share is monotonic between consecutive segment-count or size transitions.
+        for budget in (1..=16)
+            .flat_map(|count| {
+                (16..=58).flat_map(move |shift| {
+                    let boundary = count * (1u64 << shift);
+                    [boundary - 1, boundary, boundary + 1]
+                })
+            })
+            .chain([0, u64::MAX])
+        {
+            for (config, share) in [
+                (PoolConfig::primary_for_budget(budget), budget / 4),
+                (PoolConfig::reassembly_for_budget(budget), budget / 16),
+            ] {
+                if config.pool_enabled {
+                    assert!(config.segment_size.is_power_of_two());
+                    assert!(
+                        (MIN_BUDDY_SEGMENT_BYTES..=MAX_BUDDY_SEGMENT_BYTES)
+                            .contains(&(config.segment_size as u64))
+                    );
+                    assert!((config.segment_size as u64) * (config.max_segments as u64) <= share);
+                }
+            }
+        }
+        let peer = PoolConfig::peer_cache_config();
+        assert_eq!(peer.max_segments, 255);
+        assert_eq!(peer.max_dedicated_segments, 65_536);
+        assert_eq!(peer.buddy_idle_decay_secs, 60.0);
     }
 }

@@ -1,47 +1,45 @@
-//! Shared configuration types for C-Two.
-//!
-//! This crate is the single source of truth for all configuration structs
-//! used across the C-Two transport layer (IPC, relay, memory pool).
+//! Shared configuration and transport policy for C-Two.
 
 mod call;
 mod connect_options;
+mod domain;
 mod identity;
 mod ipc;
 mod local;
-mod memory;
 mod pool;
 mod relay;
-mod remote;
 mod resolver;
 mod timeout;
 
-pub use call::{
-    CallExecutionLimits, CallOptions, CallTimeout, DEFAULT_MAX_OUTSTANDING_CALLS,
-    DEFAULT_PAYLOAD_BUFFER_BUDGET_BYTES,
-};
+pub use call::{CallOptions, CallTimeout};
 pub use connect_options::{
     ConnectDeadline, ConnectDeadlineExceeded, ConnectOptions, ConnectTimeoutError,
 };
+pub use domain::{
+    ConfigField, DEFAULT_FILE_SPILL_BUDGET_BYTES, DEFAULT_MEMORY_BUDGET_BYTES, DomainLimits,
+    DomainLimitsOverrides, DomainLimitsPatch, default_max_outstanding_calls,
+};
 pub use identity::{validate_relay_id, validate_server_id};
 pub use ipc::{
-    BaseIpcConfig, CLIENT_IPC_OVERRIDE_KEYS, ClientIpcConfig, IPC_RELEASE_BATCH_CAPACITY,
-    MAX_EXECUTION_WORKERS, MAX_IPC_POOL_SEGMENTS, PoolRoleTuning, SERVER_IPC_OVERRIDE_KEYS,
-    ServerIpcConfig,
+    CHUNK_ASSEMBLER_TIMEOUT, CHUNK_GC_INTERVAL, CHUNK_SIZE, DEFAULT_MAX_PAYLOAD_SIZE,
+    DEFAULT_SERVER_STARTUP_TIMEOUT, IDLE_CONNECTION_TIMEOUT, IPC_RELEASE_BATCH_CAPACITY,
+    MAX_HANDSHAKE_FRAME_BYTES, MAX_RPC_FRAME_BYTES, RELAY_ANTI_ENTROPY_INTERVAL,
+    REMOTE_PAYLOAD_CHUNK_SIZE, SHM_THRESHOLD, ServerIpcConfig, WRITE_TIMEOUT, WRITE_TIMEOUT_SECS,
+    default_max_execution_workers,
 };
 pub use local::{
     LocalEndpoint, LocalEndpointContext, LocalEndpointNamespace, LocalEndpointOptions,
     UNIX_NAMESPACE_FORMAT_VERSION,
 };
-pub use memory::MemoryBudgetLimits;
-pub use pool::{PoolConfig, default_spill_dir};
-pub use relay::RelayConfig;
-pub use remote::{
-    DEFAULT_REMOTE_PAYLOAD_CHUNK_SIZE, MAX_REMOTE_PAYLOAD_CHUNK_SIZE,
-    validate_remote_payload_chunk_size,
+pub use pool::{
+    MAX_BUDDY_SEGMENT_BYTES, MAX_DEDICATED_SEGMENTS, MAX_IPC_POOL_SEGMENTS,
+    MIN_BUDDY_SEGMENT_BYTES, POOL_DECAY_SECONDS, PRIMARY_MAX_POOL_SEGMENTS, PoolConfig,
+    REASSEMBLY_MAX_POOL_SEGMENTS, SPILL_THRESHOLD, default_spill_dir,
 };
+pub use relay::RelayConfig;
 pub use resolver::{
-    CallExecutionLimitsOverrides, ClientIpcConfigOverrides, ConfigResolver, ConfigSources,
-    EnvFilePolicy, EnvMap, RelayConfigOverrides, ResolvedRelayClientConfig, ResolvedRelayConfig,
-    RuntimeConfigOverrides, ServerIpcConfigOverrides,
+    ConfigError, ConfigResolver, ConfigSources, EnvCatalog, EnvFilePolicy, EnvMap,
+    RelayConfigOverrides, ResolvedRelayClientConfig, ResolvedServerConfig, ServerConfigOverrides,
+    ServerConfigPatch,
 };
 pub use timeout::{TimeoutError, deadline_after, timeout_from_seconds, validate_timeout};

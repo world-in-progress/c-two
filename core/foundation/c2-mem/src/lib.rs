@@ -16,23 +16,23 @@ pub mod handle;
 pub mod peer;
 pub mod pool;
 mod pressure;
-pub mod retention;
 pub mod segment;
 pub mod spill;
+mod window;
 
 pub use alloc::{Allocation, BuddyAllocator, BuddyLayout};
 pub use buddy_segment::BuddySegment;
 pub use budget::{
-    BudgetCellSnapshot, BudgetError, BudgetKind, BudgetObserver, BudgetObserverWeak,
-    BudgetReservation, BudgetSnapshot, MemoryBudget,
+    BudgetCellSnapshot, BudgetError, BudgetedBuffer, DomainBudget, DomainObserver,
+    DomainObserverWeak, DomainSnapshot, FileSpillReservation, MemoryReservation,
+    MemoryReservationError, OperationPermit, PayloadBufferError, ReserveFuture, RetentionError,
+    RetentionRejectReason, RetentionSnapshot,
 };
 pub use config::{PoolAllocation, PoolConfig, PoolStats};
 pub use dedicated::DedicatedSegment;
 pub use handle::{MemHandle, OwnedAllocation};
 pub use peer::{PeerMappingCache, PeerMappingError, PeerRead};
 pub use pool::MemPool;
-pub use retention::{
-    RetentionBudget, RetentionError, RetentionPermit, RetentionRejectReason, RetentionSnapshot,
-};
 pub use segment::ShmRegion;
 pub use spill::{available_physical_memory, create_file_spill};
+pub use window::{ReusableWindow, WindowChunk, WindowReserveFuture, WindowSlice};

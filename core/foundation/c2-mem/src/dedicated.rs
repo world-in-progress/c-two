@@ -1,6 +1,6 @@
 //! Headerless dedicated SHM for one locally owned allocation.
 
-use crate::budget::BudgetReservation;
+use crate::budget::MemoryReservation;
 use crate::segment::ChargedMapping;
 use crate::segment::ShmRegion;
 use std::sync::{Arc, Mutex};
@@ -70,7 +70,7 @@ impl DedicatedSegment {
         }
     }
 
-    pub(crate) fn with_budget_guard(mut self, guard: BudgetReservation) -> Self {
+    pub(crate) fn with_budget_guard(mut self, guard: Option<MemoryReservation>) -> Self {
         Arc::get_mut(
             self.mapping
                 .get_mut()
@@ -79,7 +79,7 @@ impl DedicatedSegment {
                 .unwrap(),
         )
         .expect("backing not published")
-        .reservation = Some(guard);
+        .reservation = guard;
         self
     }
 
