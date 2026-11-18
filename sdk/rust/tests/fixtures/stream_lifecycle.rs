@@ -10,9 +10,9 @@ use c_two::generated::{
     open_owned,
 };
 use c_two::{
-    CallExecutionLimitsOverrides, Client, ConfigSources, Connect, ContractRelease, Error, Held,
-    Host, HostOptions, Registration, ResponseStream, Runtime, RuntimeOptions,
-    ServiceConcurrencyMode, ServiceDefinition,
+    Client, ConfigSources, Connect, ContractRelease, DomainLimitsOverrides, Error, Held, Host,
+    HostOptions, Registration, ResponseStream, Runtime, RuntimeOptions, ServiceConcurrencyMode,
+    ServiceDefinition,
 };
 use fastdb::{BuildPolicy, Builder, CompiledSpec, Payload};
 
@@ -234,14 +234,10 @@ pub fn text(payload: &Payload) -> String {
         .to_owned()
 }
 
-pub fn runtime(root: &Path, server_id: String) -> Runtime {
+pub fn runtime(root: &Path, client_limits: DomainLimitsOverrides) -> Runtime {
     let runtime = Runtime::new(RuntimeOptions {
-        server_id: Some(server_id),
+        client_limits,
         use_process_relay_anchor: false,
-        server_ipc_overrides: Some(c2_config::ServerIpcConfigOverrides {
-            max_execution_workers: Some(2),
-            ..Default::default()
-        }),
         ..Default::default()
     })
     .unwrap();
@@ -285,17 +281,15 @@ impl Fixture {
                 .create(&root)
                 .unwrap();
         }
-        let server = runtime(&root, unique("stream-host"));
-        let client_runtime = runtime(&root, unique("stream-client"));
-        client_runtime
-            .set_call_execution_limits_with_sources(
-                CallExecutionLimitsOverrides {
-                    max_outstanding_calls: settings.client_slots,
-                    payload_buffer_budget_bytes: settings.client_bytes,
-                },
-                ConfigSources::empty(),
-            )
-            .unwrap();
+        let server = runtime(&root, DomainLimitsOverrides::default());
+        let client_runtime = runtime(
+            &root,
+            DomainLimitsOverrides {
+                max_outstanding_calls: settings.client_slots,
+                memory_budget_bytes: settings.client_bytes,
+                ..Default::default()
+            },
+        );
         let (step_entered, step_events) = mpsc::channel();
         let (cleanup_entered, cleanup_events) = mpsc::channel();
         let (unary_entered, unary_events) = mpsc::channel();
@@ -312,7 +306,14 @@ impl Fixture {
             cleanup_entered,
             unary_entered,
         });
-        let host = server.host(HostOptions::default().without_relay()).unwrap();
+        let host = server
+            .host(
+                HostOptions::default()
+                    .without_relay()
+                    .with_server_id(unique("stream-host"))
+                    .with_max_execution_workers(2),
+            )
+            .unwrap();
         let route = unique("stream-route");
         let release = release();
         let definition = ServiceDefinition::new_stream(
@@ -363,14 +364,16 @@ impl Fixture {
     pub fn used_slots(&self) -> u64 {
         self.client_runtime
             .call_execution_snapshot()
-            .unwrap()
+            .client
             .used_operations
+            .unwrap()
     }
 
     pub fn used_bytes(&self) -> u64 {
         self.client_runtime
             .memory_stats()
-            .payload_buffer
+            .client
+            .memory
             .unwrap()
             .used_bytes
     }

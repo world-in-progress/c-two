@@ -104,7 +104,7 @@ impl Relay {
             binary.display()
         );
         let mut command = Command::new(binary);
-        command.args(["relay", "--bind", "127.0.0.1:0", "--idle-timeout", "0"]);
+        command.args(["relay", "--bind", "127.0.0.1:0"]);
         #[cfg(unix)]
         command.arg("--ipc-root").arg(&root);
         let child = command
@@ -191,8 +191,8 @@ fn retire_clients(runtime: &Runtime) {
     assert!(completed, "{outcome:?}");
     assert!(outcome.ipc_client_close_error.is_none(), "{outcome:?}");
     assert_eq!(
-        runtime.call_execution_snapshot().unwrap().used_operations,
-        0
+        runtime.call_execution_snapshot().client.used_operations,
+        Some(0)
     );
 }
 
@@ -419,9 +419,8 @@ fn definition(
     .unwrap()
 }
 
-fn runtime(root: &Path, relay: &Relay, name: &str) -> Runtime {
+fn runtime(root: &Path, relay: &Relay) -> Runtime {
     let runtime = Runtime::new(c_two::RuntimeOptions {
-        server_id: Some(name.into()),
         relay_anchor_address: Some(relay.url.clone()),
         use_process_relay_anchor: false,
         ..Default::default()
@@ -505,16 +504,20 @@ fn run_case(explicit: bool) {
         std::process::id(),
         if explicit { "http" } else { "local" }
     );
-    let server_a = runtime(&a.root, &a, "mesh-host-a");
-    let server_b = runtime(&b.root, &b, "mesh-host-b");
-    let host_a = server_a.host(HostOptions::default()).unwrap();
-    let host_b = server_b.host(HostOptions::default()).unwrap();
+    let server_a = runtime(&a.root, &a);
+    let server_b = runtime(&b.root, &b);
+    let host_a = server_a
+        .host(HostOptions::default().with_server_id("mesh-host-a"))
+        .unwrap();
+    let host_b = server_b
+        .host(HostOptions::default().with_server_id("mesh-host-b"))
+        .unwrap();
     let calls_a = Arc::new(AtomicUsize::new(0));
     let calls_b = Arc::new(AtomicUsize::new(0));
     let _registration_a = register(&host_a, &release, &name, "A", &calls_a);
     let mut registration_b = register(&host_b, &release, &name, "B", &calls_b);
-    let client_a = runtime(&a.root, &a, "mesh-client-a");
-    let client_b = runtime(&b.root, &b, "mesh-client-b");
+    let client_a = runtime(&a.root, &a);
+    let client_b = runtime(&b.root, &b);
     let old_a = connect(&client_a, &release, &name, &a, explicit).unwrap();
     let old_b = connect(&client_b, &release, &name, &b, explicit).unwrap();
     let initial_path = if explicit {
@@ -798,16 +801,20 @@ fn run_unavailable_case(explicit: bool, force_leave: bool) {
         if explicit { "http" } else { "local" },
         release_method,
     );
-    let server_a = runtime(&a.root, &a, &format!("mesh-unavailable-host-a-{name}"));
-    let server_b = runtime(&b.root, &b, &format!("mesh-unavailable-host-b-{name}"));
-    let host_a = server_a.host(HostOptions::default()).unwrap();
-    let host_b = server_b.host(HostOptions::default()).unwrap();
+    let server_a = runtime(&a.root, &a);
+    let server_b = runtime(&b.root, &b);
+    let host_a = server_a
+        .host(HostOptions::default().with_server_id(format!("mesh-unavailable-host-a-{name}")))
+        .unwrap();
+    let host_b = server_b
+        .host(HostOptions::default().with_server_id(format!("mesh-unavailable-host-b-{name}")))
+        .unwrap();
     let identity_a = server_a.ensure_server().unwrap();
     let identity_b = server_b.ensure_server().unwrap();
     let calls_a = Arc::new(AtomicUsize::new(0));
     let calls_b = Arc::new(AtomicUsize::new(0));
     let mut registration_a = register(&host_a, &release, &name, "A", &calls_a);
-    let client_b = runtime(&b.root, &b, &format!("mesh-unavailable-client-b-{name}"));
+    let client_b = runtime(&b.root, &b);
     let unreachable_listeners = join_without_reachable_peer_urls(&a, &b, &name);
 
     // Gate 8: a name held only by a Suspect or Dead peer yields typed 702 on

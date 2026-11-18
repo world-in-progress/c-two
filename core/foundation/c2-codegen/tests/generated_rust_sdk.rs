@@ -464,11 +464,10 @@ fn require_latest_input_invalidated(escaped_inputs: &Arc<Mutex<Vec<View>>>, expe
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let runtime = c_two::Runtime::new(c_two::RuntimeOptions {
-        server_id: Some(format!("generated-consumer-{}", std::process::id())),
         use_process_relay_anchor: false,
         ..c_two::RuntimeOptions::default()
     })?;
-    let host = runtime.host(c_two::HostOptions::default().without_relay())?;
+    let host = runtime.host(c_two::HostOptions::default().without_relay().with_server_id(format!("generated-consumer-{}", std::process::id())))?;
     let route = format!("generated-echo-{}", std::process::id());
     let wrong_route = format!("generated-wrong-{}", std::process::id());
     let escaped_inputs = Arc::new(Mutex::new(Vec::new()));

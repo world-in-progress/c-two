@@ -89,11 +89,14 @@ C2MemFfiStatus c2_mem_ffi_local_endpoint_context_namespace_id_copy(
  * during new; NULL inherits native configuration. The factory owns one Runtime
  * budget domain across all physical connections and reconnects. Free releases
  * only the factory reference; live endpoints/calls/buffers keep their owners.
- * options_json is a UTF-8 object with optional unsigned requestShmThreshold and
- * requestChunkSize byte counts. These Runtime overrides are fixed by new;
- * omitted values inherit native configuration. Unknown options are rejected. */
+ * options_json is a UTF-8 object with optional memoryBudgetBytes,
+ * fileSpillBudgetBytes and maxOutstandingCalls. Each accepts a JSON u64
+ * integer or a decimal u64 string. Omitted values inherit native
+ * configuration. Unknown options are rejected. */
 C2MemFfiStatus c2_mem_ffi_client_domain_new(const C2MemFfiLocalEndpointContext *context, const char *options_json, C2MemFfiClientDomain **out, C2MemFfiError **error);
 void c2_mem_ffi_client_domain_free(C2MemFfiClientDomain *domain);
+/* Read-only JSON snapshot of the client role. Counters and identifiers are
+ * decimal strings when present, and observing does not activate the role. */
 C2MemFfiStatus c2_mem_ffi_client_domain_stats(const C2MemFfiClientDomain *domain, C2MemFfiResult **out);
 /* new performs no I/O. prepare connects using Rust's sole IPC reader/writer,
  * validates the complete contract and records the reached server identity.

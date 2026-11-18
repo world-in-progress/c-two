@@ -11,7 +11,9 @@
 //! `Unverified` are never written as success.
 
 use anyhow::{Result, anyhow, bail};
-use c2_config::{ConfigResolver, ConfigSources, LocalEndpointContext, LocalEndpointOptions};
+use c2_config::{
+    ConfigResolver, ConfigSources, EnvCatalog, LocalEndpointContext, LocalEndpointOptions,
+};
 use c2_core::{
     ENDPOINT_CREDENTIAL_MAX_BYTES, EndpointCredential, EndpointInspection, EndpointReapResult,
     EndpointSweep, EndpointUnverifiedReason, LocalEndpoint, SweepBatch, SweepBudget,
@@ -434,11 +436,11 @@ impl Report {
 }
 
 fn resolve_context(unix_root: Option<PathBuf>) -> Result<LocalEndpointContext> {
-    ConfigResolver::resolve_local_endpoint(
+    let catalog = EnvCatalog::load(ConfigSources::from_process())?;
+    Ok(ConfigResolver::resolve_local_endpoint(
         LocalEndpointOptions { unix_root },
-        ConfigSources::from_process(),
-    )
-    .map_err(|error| anyhow!("{error}"))
+        &catalog,
+    )?)
 }
 
 fn endpoint_for(context: &LocalEndpointContext, address: &str) -> Result<LocalEndpoint> {

@@ -226,7 +226,7 @@ enum FixtureRelay {
 }
 
 impl FixtureRelay {
-    fn c3(root: &Path, idle: u64, seeds: &[String]) -> (Self, String) {
+    fn c3(root: &Path, seeds: &[String]) -> (Self, String) {
         use std::process::{Command, Stdio};
         let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let target = std::env::var_os("CARGO_TARGET_DIR")
@@ -246,13 +246,7 @@ impl FixtureRelay {
         );
         let stdout_path = root.join(format!("{}.stdout.log", unique("c3")));
         let mut command = Command::new(binary);
-        command.args([
-            "relay",
-            "--bind",
-            "127.0.0.1:0",
-            "--idle-timeout",
-            &idle.to_string(),
-        ]);
+        command.args(["relay", "--bind", "127.0.0.1:0"]);
         if !seeds.is_empty() {
             command.args(["--seeds", &seeds.join(",")]);
         }
@@ -359,15 +353,10 @@ pub struct Fixture {
     finished: bool,
 }
 
-pub fn runtime(root: &Path, server_id: String, relay: Option<String>, idle: f64) -> Runtime {
+fn runtime(root: &Path, relay: Option<String>) -> Runtime {
     let runtime = Runtime::new(RuntimeOptions {
-        server_id: Some(server_id),
         relay_anchor_address: relay,
         use_process_relay_anchor: false,
-        client_ipc_overrides: Some(c2_config::ClientIpcConfigOverrides {
-            client_idle_timeout_secs: Some(idle),
-            ..Default::default()
-        }),
         ..Default::default()
     })
     .unwrap();
@@ -383,32 +372,31 @@ pub fn runtime(root: &Path, server_id: String, relay: Option<String>, idle: f64)
 }
 
 impl Fixture {
-    pub fn new(path: PathKind, idle: f64, relay_idle: u64) -> Self {
-        Self::new_inner(path, idle, relay_idle, false)
+    pub fn new(path: PathKind) -> Self {
+        Self::new_inner(path, None, false)
+    }
+
+    pub fn with_relay_idle_timeout(timeout: Duration) -> Self {
+        Self::new_inner(PathKind::Http, Some(timeout), false)
     }
 
     pub fn with_c3() -> Self {
-        Self::new_inner(PathKind::Http, 0.0, 0, true)
+        Self::new_inner(PathKind::Http, None, true)
     }
 
     pub fn with_c3_path(path: PathKind) -> Self {
         assert_ne!(path, PathKind::Direct);
-        Self::new_inner(path, 0.0, 0, true)
+        Self::new_inner(path, None, true)
     }
 
     pub fn direct_with_unavailable_relay() -> Self {
-        let mut fixture = Self::new(PathKind::Direct, 0.0, 0);
-        fixture.client_runtime = runtime(
-            &fixture.root,
-            unique("persistent-direct-client"),
-            Some("http://127.0.0.1:0".into()),
-            0.0,
-        );
+        let mut fixture = Self::new(PathKind::Direct);
+        fixture.client_runtime = runtime(&fixture.root, Some("http://127.0.0.1:0".into()));
         fixture.client_events = fixture.client_runtime.connection_events();
         fixture
     }
 
-    fn new_inner(path: PathKind, idle: f64, relay_idle: u64, c3: bool) -> Self {
+    fn new_inner(path: PathKind, relay_idle: Option<Duration>, c3: bool) -> Self {
         #[cfg(unix)]
         let root = Path::new("/tmp").join(unique("c2-persist"));
         #[cfg(windows)]
@@ -425,19 +413,18 @@ impl Fixture {
         #[cfg(windows)]
         let context = LocalEndpointContext::default_for_platform().unwrap();
         let (relay, relay_url) = if c3 {
-            let (relay, url) = FixtureRelay::c3(&root, relay_idle, &[]);
+            let (relay, url) = FixtureRelay::c3(&root, &[]);
             (Some(relay), Some(url))
         } else if path != PathKind::Direct {
-            let relay = RelayServer::start_with_context(
-                RelayConfig {
-                    bind: "127.0.0.1:0".into(),
-                    idle_timeout_secs: relay_idle,
-                    anti_entropy_interval: Duration::ZERO,
-                    heartbeat_interval: Duration::ZERO,
-                    ..Default::default()
-                },
-                context.clone(),
-            )
+            let config = RelayConfig {
+                bind: "127.0.0.1:0".into(),
+                heartbeat_interval: Duration::ZERO,
+                ..Default::default()
+            };
+            let relay = match relay_idle {
+                Some(timeout) => RelayServer::start_with_context_for_test(config, context, timeout),
+                None => RelayServer::start_resolved(config, context),
+            }
             .expect("relay starts");
             let url = format!("http://{}", relay.local_addr());
             (Some(FixtureRelay::Embedded(relay)), Some(url))
@@ -445,20 +432,17 @@ impl Fixture {
             (None, None)
         };
         let anchor = (path == PathKind::Http).then(|| HttpAnchor::new(relay_url.as_ref().unwrap()));
-        let server = runtime(&root, unique("persistent-host"), relay_url.clone(), 0.0);
+        let server = runtime(&root, relay_url.clone());
         let server_events = server.connection_events();
         let host_options = if relay.is_some() {
             HostOptions::default()
         } else {
             HostOptions::default().without_relay()
         };
-        let host = server.host(host_options).unwrap();
-        let client_runtime = runtime(
-            &root,
-            unique("persistent-client"),
-            anchor.as_ref().map(|a| a.url.clone()).or(relay_url),
-            idle,
-        );
+        let host = server
+            .host(host_options.with_server_id(unique("persistent-host")))
+            .unwrap();
+        let client_runtime = runtime(&root, anchor.as_ref().map(|a| a.url.clone()).or(relay_url));
         let client_events = client_runtime.connection_events();
         Self {
             path,
@@ -606,7 +590,7 @@ impl Fixture {
     pub fn add_c3_peer(&mut self) -> String {
         assert!(self.secondary_relay.is_none());
         let anchor = self.relay_url().expect("primary c3 relay");
-        let (relay, url) = FixtureRelay::c3(&self.root, 0, &[anchor]);
+        let (relay, url) = FixtureRelay::c3(&self.root, &[anchor]);
         self.secondary_relay = Some(relay);
         url
     }
@@ -663,10 +647,15 @@ impl Fixture {
             relay.stop().unwrap();
         }
         self.anchor.take();
-        if let Ok(snapshot) = self.client_runtime.call_execution_snapshot() {
-            assert_eq!(snapshot.used_operations, 0);
+        if let Some(used) = self
+            .client_runtime
+            .call_execution_snapshot()
+            .client
+            .used_operations
+        {
+            assert_eq!(used, 0);
         }
-        if let Some(stats) = self.client_runtime.memory_stats().payload_buffer {
+        if let Some(stats) = self.client_runtime.memory_stats().client.memory {
             assert_eq!(stats.used_bytes, 0);
         }
         for entry in std::fs::read_dir(&self.root).unwrap() {
@@ -1036,13 +1025,14 @@ pub fn run_resource_process() {
     let relay = std::env::var("C2_PERSISTENT_CHILD_RELAY")
         .ok()
         .filter(|url| !url.is_empty());
-    let server = runtime(&root, id, relay.clone(), 0.0);
+    let server = runtime(&root, relay.clone());
     let connections = server.connection_events();
+    let options = HostOptions::default().with_server_id(id);
     let host = server
         .host(if relay.is_some() {
-            HostOptions::default()
+            options
         } else {
-            HostOptions::default().without_relay()
+            options.without_relay()
         })
         .unwrap();
     let identity = server.ensure_server().unwrap();
@@ -1090,7 +1080,6 @@ pub fn run_resource_process() {
             host.local_endpoint_context()
                 .endpoint(host.local_endpoint().address())
                 .unwrap(),
-            c2_config::ClientIpcConfig::default(),
         )
         .unwrap();
         attestor.connect().await.unwrap();

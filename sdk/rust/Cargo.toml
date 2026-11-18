@@ -22,6 +22,6 @@ fastdb = "=0.2.4"
 c2-ipc = { version = "0.1.0", path = "../../core/transport/c2-ipc" }
 c2-mem = { version = "0.1.0", path = "../../core/foundation/c2-mem" }
 c2-wire = { version = "0.1.0", path = "../../core/protocol/c2-wire" }
-c2-http = { version = "0.1.0", path = "../../core/transport/c2-http", features = ["relay"] }
+c2-http = { version = "0.1.0", path = "../../core/transport/c2-http", features = ["relay", "test-support"] }
 parking_lot = "0.13"
 serde_json = "1"

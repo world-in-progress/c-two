@@ -272,6 +272,28 @@ fn unsigned_option(options: &Value, key: &str) -> Result<Option<u64>, Error> {
         })
         .transpose()
 }
+fn domain_limit_option(options: &Value, key: &str) -> Result<Option<u64>, Error> {
+    let Some(text) = options.get(key).and_then(Value::as_str) else {
+        return unsigned_option(options, key);
+    };
+    if !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit()) {
+        if let Ok(value) = text.parse() {
+            return Ok(Some(value));
+        }
+    }
+    Err(invalid(format!("invalid {key}")))
+}
+
+fn memory_cell_json(cell: c2_core::MemoryCellStats) -> Value {
+    json!({
+        "limit_bytes": cell.limit_bytes.to_string(),
+        "used_bytes": cell.used_bytes.to_string(),
+        "peak_bytes": cell.peak_bytes.to_string(),
+        "rejected_allocations": cell.rejected_allocations.to_string(),
+        "rejected_bytes": cell.rejected_bytes.to_string(),
+    })
+}
+
 fn field(value: &Value, key: &str) -> Result<String, Error> {
     value
         .get(key)
@@ -523,9 +545,19 @@ pub unsafe extern "C" fn c2_mem_ffi_client_domain_new(
     }
     match unsafe {
         native(error, || {
-            let options = parse_options(options, &["requestShmThreshold", "requestChunkSize"])?;
-            let threshold = unsigned_option(&options, "requestShmThreshold")?;
-            let chunk = unsigned_option(&options, "requestChunkSize")?;
+            let options = parse_options(
+                options,
+                &[
+                    "memoryBudgetBytes",
+                    "fileSpillBudgetBytes",
+                    "maxOutstandingCalls",
+                ],
+            )?;
+            let client_limits = c2_config::DomainLimitsOverrides {
+                memory_budget_bytes: domain_limit_option(&options, "memoryBudgetBytes")?,
+                file_spill_budget_bytes: domain_limit_option(&options, "fileSpillBudgetBytes")?,
+                max_outstanding_calls: domain_limit_option(&options, "maxOutstandingCalls")?,
+            };
             let endpoint = if context.is_null() {
                 capture_local_endpoint_context(None)
                     .map_err(|_| invalid("endpoint configuration failed"))?
@@ -534,11 +566,7 @@ pub unsafe extern "C" fn c2_mem_ffi_client_domain_new(
             };
             let runtime = Runtime::new(RuntimeOptions {
                 use_process_relay_anchor: false,
-                shm_threshold: threshold,
-                client_ipc_overrides: chunk.map(|chunk_size| c2_config::ClientIpcConfigOverrides {
-                    chunk_size: Some(chunk_size),
-                    ..Default::default()
-                }),
+                client_limits,
                 ..Default::default()
             })?;
             runtime.set_captured_local_endpoint(endpoint)?;
@@ -570,14 +598,32 @@ pub unsafe extern "C" fn c2_mem_ffi_client_domain_stats(
             return Err(C2MemFfiStatus::NullPointer);
         }
         let runtime = &unsafe { &*domain }.0.runtime;
-        let cell=runtime.payload_buffer_stats().map(|s|json!({"limit_bytes":s.limit_bytes.to_string(),"used_bytes":s.used_bytes.to_string(),"peak_bytes":s.peak_bytes.to_string(),"rejected_allocations":s.rejected_allocations.to_string(),"rejected_bytes":s.rejected_bytes.to_string()}));
-        let slots = runtime
-            .call_execution_snapshot()
-            .map_err(|_| C2MemFfiStatus::PoolError)?;
+        let memory = runtime.memory_stats().client;
+        // An activation racing this read must not populate the call
+        // counters of the dormant role captured by the memory snapshot.
+        let calls = if memory.frozen {
+            runtime.call_execution_snapshot().client
+        } else {
+            Default::default()
+        };
+        let decimal = |value: u64| value.to_string();
+        let stats = json!({
+            "domain_id": memory.domain_id.map(decimal),
+            "generation": memory.generation.to_string(),
+            "frozen": memory.frozen,
+            "closed": memory.closed,
+            "memory": memory.memory.map(memory_cell_json),
+            "file_spill": memory.file_spill.map(memory_cell_json),
+            "call_execution": {
+                "max_operations": calls.max_operations.map(decimal),
+                "used_operations": calls.used_operations.map(decimal),
+                "peak_operations": calls.peak_operations.map(decimal),
+                "rejected_reservations": calls.rejected_reservations.map(decimal),
+                "closed": calls.closed,
+            },
+        });
         unsafe {
-            *out = result(Ok(Output::Json(
-                json!({"payload_buffer":cell,"used_operations":slots.used_operations.to_string()}),
-            )));
+            *out = result(Ok(Output::Json(stats)));
         }
         Ok(())
     })

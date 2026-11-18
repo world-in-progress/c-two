@@ -69,8 +69,9 @@ export interface NativeEndpointOptions {
 }
 
 export interface NativeClientDomainOptions {
-  readonly requestShmThreshold?: number;
-  readonly requestChunkSize?: number;
+  readonly memoryBudgetBytes?: number | bigint;
+  readonly fileSpillBudgetBytes?: number | bigint;
+  readonly maxOutstandingCalls?: number | bigint;
 }
 
 export interface NativeClientDomain {
@@ -381,13 +382,25 @@ function validateConnectTimeout(value: number | undefined): void {
   }
 }
 
+const domainLimitKeys = ["memoryBudgetBytes", "fileSpillBudgetBytes", "maxOutstandingCalls"] as const;
+
+function validateDomainLimit(key: string, value: number | bigint | undefined): void {
+  if (value === undefined) return;
+  const valid = typeof value === "number"
+    ? Number.isSafeInteger(value) && value >= 0
+    : typeof value === "bigint" && value >= 0n && value <= 18446744073709551615n;
+  if (!valid) {
+    throw new C2NodeIpcConnectionError(`C-Two ${key} must be a non-negative safe integer or u64 bigint.`);
+  }
+}
+
 /** One native client domain is shared by every endpoint and reconnect. */
 export function createNodeIpcConnector(options: C2NodeIpcConnectorOptions = {}): C2NodeIpcConnector {
   validateCaptureOptions(options);
   validateConnectTimeout(options.connectTimeoutMs);
   const permitted = new Set([
     "addonPath", "ipcRoot", "endpointContext", "nativeSymbols", "connectTimeoutMs",
-    "requestShmThreshold", "requestChunkSize", "expectedServerIdentity",
+    ...domainLimitKeys, "expectedServerIdentity",
   ]);
   for (const key of Object.keys(options)) {
     if (!permitted.has(key)) throw new C2NodeIpcConnectionError(`C-Two Node IPC connector has unknown option ${key}.`);
@@ -395,14 +408,15 @@ export function createNodeIpcConnector(options: C2NodeIpcConnectorOptions = {}):
   if (options.ipcRoot !== undefined && options.endpointContext !== undefined) {
     throw new C2NodeIpcConnectionError("C-Two ipcRoot and endpointContext options are mutually exclusive.");
   }
+  const domainOptions: NativeClientDomainOptions = Object.fromEntries(domainLimitKeys.flatMap(key => {
+    const value = options[key];
+    validateDomainLimit(key, value);
+    return value === undefined ? [] : [[key, value]];
+  }));
   const symbols = options.nativeSymbols ?? loadBundledC2MemFfiNodeNativeSymbols(options).symbols;
   validateSymbols(symbols);
   const endpointOptions: NativeEndpointOptions = {
     ...(options.expectedServerIdentity === undefined ? {} : { expectedServerIdentity: options.expectedServerIdentity }),
-  };
-  const domainOptions: NativeClientDomainOptions = {
-    ...(options.requestShmThreshold === undefined ? {} : { requestShmThreshold: options.requestShmThreshold }),
-    ...(options.requestChunkSize === undefined ? {} : { requestChunkSize: options.requestChunkSize }),
   };
   const ownership: ConnectorOwnership = { lease: undefined, domain: undefined };
   let attempted = false;
@@ -477,7 +491,26 @@ export function createNodeIpcConnector(options: C2NodeIpcConnectorOptions = {}):
   };
   const connector = Object.freeze(Object.assign(connect, {
     resolveEndpoint,
-    stats(): object { return nativeValue(() => freeze().stats()); },
+    stats(): object {
+      requireOpen();
+      if (failure !== undefined) throw failure;
+      if (ownership.domain !== undefined) return nativeValue(() => ownership.domain!.stats());
+      return {
+        domain_id: null,
+        generation: "0",
+        frozen: false,
+        closed: false,
+        memory: null,
+        file_spill: null,
+        call_execution: {
+          max_operations: null,
+          used_operations: null,
+          peak_operations: null,
+          rejected_reservations: null,
+          closed: false,
+        },
+      };
+    },
     close(): void {
       if (lifetime.closed) return;
       lifetime.closed = true;

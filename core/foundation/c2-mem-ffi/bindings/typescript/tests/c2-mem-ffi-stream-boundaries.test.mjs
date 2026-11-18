@@ -13,7 +13,7 @@ import {buildProtocolPeer} from '../scripts/cargo-tools.mjs';
 const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 let executable;
 
-async function withPeer(run) {
+async function withPeer(run, domainLimits = {}) {
   executable ??= buildProtocolPeer({timeout: 120_000});
   const directory = mkdtempSync(resolve(tmpdir(), 'c2-boundary-'));
   const root = resolve(directory, 'ipc');
@@ -24,7 +24,7 @@ async function withPeer(run) {
   const lines = createInterface({input: child.stdout})[Symbol.asyncIterator]();
   let stderr = '';
   child.stderr.on('data', bytes => { stderr += bytes; });
-  const connector = createNodeIpcConnector(process.platform === 'win32' ? {} : {ipcRoot: root});
+  const connector = createNodeIpcConnector({...domainLimits, ...(process.platform === 'win32' ? {} : {ipcRoot: root})});
   let killed = false;
   try {
     const ready = JSON.parse((await lines.next()).value);
@@ -65,61 +65,54 @@ function input(mode, count, length) {
 
 test('full B reports the stream deadline and CANCEL completes before either hold is released', {timeout: 150_000}, async () => {
   // Requirement 3 / design section 9: holds fill B; deadline is truthful and control does not wait for B.
-  const previous = process.env.C2_CALL_PAYLOAD_BUFFER_BUDGET_BYTES;
-  process.env.C2_CALL_PAYLOAD_BUFFER_BUDGET_BYTES = '8192';
-  try {
-    await withPeer(async ({connector, address, contract, lines, createIpcEncodedTransport, C2IpcTransportError}) => {
-      const transport = createIpcEncodedTransport(address, {connect: connector, callTimeoutMs: 2000});
-      const holds = [];
-      let stream;
-      try {
-        await transport.prepare('echo', contract);
-        stream = transport.stream('echo', contract, 'echo', () => input(6, 3, 4096), bytes => bytes, true);
-        for (let index = 0; index < 2; index++) {
-          const item = await stream.next();
-          assert.equal(item.done, false);
-          holds.push(item.value);
-          assert.ok(item.value.value.every(byte => byte === index));
-          assert.deepEqual(JSON.parse((await lines.next()).value), {kind: 'item_step', index});
-        }
-        assert.equal(connector.stats().payload_buffer.used_bytes, '8192');
-        let settled = false;
-        const pending = stream.next().finally(() => { settled = true; });
-        const expired = assert.rejects(pending, error => {
-          assert.ok(error instanceof C2IpcTransportError);
-          assert.equal(error.code, 715);
-          assert.equal(error.canonicalName, 'CallDeadlineExceeded');
-          assert.equal(error.transportPhase, 'dispatch_uncertain');
-          assert.equal(error.retrySafe, false);
-          return true;
-        });
-        assert.deepEqual(JSON.parse((await lines.next()).value), {kind: 'item_step', index: 2});
-        assert.equal(settled, false, 'the next item waits with B full');
-        assert.equal(connector.stats().payload_buffer.used_bytes, '8192');
-        await expired;
-        const receipt = await stream.close(null);
-        assert.equal(receipt.completed, true, 'CANCEL and CALL_END pass while both holds still fill B');
-        assert.equal(receipt.error.code, 718);
-        assert.equal(receipt.error.canonicalName, 'CallCancelled');
-        assert.equal(receipt.completeItems, 2n);
-        assert.equal(connector.stats().used_operations, '0');
-        assert.equal(connector.stats().payload_buffer.used_bytes, '8192');
-        assert.equal(connector.stats().payload_buffer.rejected_allocations, '0');
-        for (let index = 0; index < holds.length; index++) {
-          assert.ok(holds[index].value.every(byte => byte === index));
-          holds[index].release();
-        }
-        assert.equal(connector.stats().payload_buffer.used_bytes, '0');
-      } finally {
-        if (stream !== undefined) await stream.close(0);
-        for (const held of holds) held.release();
-        await transport.close();
+  await withPeer(async ({connector, address, contract, lines, createIpcEncodedTransport, C2IpcTransportError}) => {
+    const transport = createIpcEncodedTransport(address, {connect: connector, callTimeoutMs: 2000});
+    const holds = [];
+    let stream;
+    try {
+      await transport.prepare('echo', contract);
+      stream = transport.stream('echo', contract, 'echo', () => input(6, 3, 4096), bytes => bytes, true);
+      for (let index = 0; index < 2; index++) {
+        const item = await stream.next();
+        assert.equal(item.done, false);
+        holds.push(item.value);
+        assert.ok(item.value.value.every(byte => byte === index));
+        assert.deepEqual(JSON.parse((await lines.next()).value), {kind: 'item_step', index});
       }
-    });
-  } finally {
-    if (previous === undefined) delete process.env.C2_CALL_PAYLOAD_BUFFER_BUDGET_BYTES;
-    else process.env.C2_CALL_PAYLOAD_BUFFER_BUDGET_BYTES = previous;
-  }
+      assert.equal(connector.stats().memory.used_bytes, '8192');
+      let settled = false;
+      const pending = stream.next().finally(() => { settled = true; });
+      const expired = assert.rejects(pending, error => {
+        assert.ok(error instanceof C2IpcTransportError);
+        assert.equal(error.code, 715);
+        assert.equal(error.canonicalName, 'CallDeadlineExceeded');
+        assert.equal(error.transportPhase, 'dispatch_uncertain');
+        assert.equal(error.retrySafe, false);
+        return true;
+      });
+      assert.deepEqual(JSON.parse((await lines.next()).value), {kind: 'item_step', index: 2});
+      assert.equal(settled, false, 'the next item waits with B full');
+      assert.equal(connector.stats().memory.used_bytes, '8192');
+      await expired;
+      const receipt = await stream.close(null);
+      assert.equal(receipt.completed, true, 'CANCEL and CALL_END pass while both holds still fill B');
+      assert.equal(receipt.error.code, 718);
+      assert.equal(receipt.error.canonicalName, 'CallCancelled');
+      assert.equal(receipt.completeItems, 2n);
+      assert.equal(connector.stats().call_execution.used_operations, '0');
+      assert.equal(connector.stats().memory.used_bytes, '8192');
+      assert.equal(connector.stats().memory.rejected_allocations, '0');
+      for (let index = 0; index < holds.length; index++) {
+        assert.ok(holds[index].value.every(byte => byte === index));
+        holds[index].release();
+      }
+      assert.equal(connector.stats().memory.used_bytes, '0');
+    } finally {
+      if (stream !== undefined) await stream.close(0);
+      for (const held of holds) held.release();
+      await transport.close();
+    }
+  }, {memoryBudgetBytes: 8192});
 });
 
 test('real peer death keeps delivered holds and a known terminal while the open stream becomes uncertain once', {timeout: 150_000}, async () => {
@@ -174,8 +167,8 @@ test('real peer death keeps delivered holds and a known terminal while the open 
         assert.ok(held.value.every(byte => byte === 0));
         held.release();
       }
-      assert.equal(connector.stats().payload_buffer.used_bytes, '0');
-      assert.equal(connector.stats().used_operations, '0');
+      assert.equal(connector.stats().memory.used_bytes, '0');
+      assert.equal(connector.stats().call_execution.used_operations, '0');
     } finally {
       if (interrupted !== undefined) await interrupted.close(0);
       if (completed !== undefined) completed.close();

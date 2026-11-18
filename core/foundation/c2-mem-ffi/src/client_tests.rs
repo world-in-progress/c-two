@@ -94,9 +94,9 @@ struct Fixture {
 }
 impl Fixture {
     fn new(budget: u64) -> Self {
-        Self::with_policy(budget, json!({}))
+        Self::with_limits(json!({"memoryBudgetBytes": budget}))
     }
-    fn with_policy(budget: u64, policy: Value) -> Self {
+    fn with_limits(limits: Value) -> Self {
         let process_state = crate::tests::PROCESS_STATE_LOCK.lock().unwrap();
         assert_eq!(c2_mem_ffi_abi_version(), 8);
         let root = tempfile::tempdir().unwrap();
@@ -149,24 +149,13 @@ impl Fixture {
         };
         let mut domain = ptr::null_mut();
         let mut error = ptr::null_mut();
-        let policy = CString::new(policy.to_string()).unwrap();
+        let options = CString::new(limits.to_string()).unwrap();
         assert_eq!(
             unsafe {
-                c2_mem_ffi_client_domain_new(&context, policy.as_ptr(), &mut domain, &mut error)
+                c2_mem_ffi_client_domain_new(&context, options.as_ptr(), &mut domain, &mut error)
             },
             C2MemFfiStatus::Ok
         );
-        // Set the existing domain's native policy before its first call, without process env mutation.
-        let domain_runtime = unsafe { &*domain }.0.runtime.clone();
-        domain_runtime
-            .set_call_execution_limits_with_sources(
-                c2_core::CallExecutionLimitsOverrides {
-                    payload_buffer_budget_bytes: Some(budget),
-                    ..Default::default()
-                },
-                ConfigSources::empty(),
-            )
-            .unwrap();
         let mut endpoint = ptr::null_mut();
         let address = CString::new(host.local_endpoint().address()).unwrap();
         let options = CString::new("{}").unwrap();
@@ -575,15 +564,123 @@ fn cancelling_input_budget_wait_does_not_wait_for_a_held_item_to_release() {
     );
 }
 
+fn domain_stats(domain: *const C2MemFfiClientDomain) -> Value {
+    let mut result = ptr::null_mut();
+    unsafe {
+        assert_eq!(
+            c2_mem_ffi_client_domain_stats(domain, &mut result),
+            C2MemFfiStatus::Ok
+        );
+        let stats = metadata(result);
+        c2_mem_ffi_result_free(result);
+        stats
+    }
+}
+
 #[test]
-fn factory_transport_policy_is_fixed_before_endpoints_and_reused_on_reconnect() {
-    let mut fixture = Fixture::with_policy(
-        128,
-        json!({"requestShmThreshold": 123, "requestChunkSize": 64}),
+fn client_domain_creation_validates_only_current_limits() {
+    for (options, message) in [
+        (
+            cr#"{"requestShmThreshold":1}"#,
+            "unknown option requestShmThreshold",
+        ),
+        (
+            cr#"{"requestChunkSize":64}"#,
+            "unknown option requestChunkSize",
+        ),
+        (
+            cr#"{"fileSpillBudgetBytes":"18446744073709551616"}"#,
+            "invalid fileSpillBudgetBytes",
+        ),
+        (
+            cr#"{"memoryBudgetBytes":0,"maxOutstandingCalls":1}"#,
+            "must be zero",
+        ),
+    ] {
+        let mut domain = ptr::null_mut();
+        let mut error = ptr::null_mut();
+        unsafe {
+            assert_eq!(
+                c2_mem_ffi_client_domain_new(
+                    ptr::null(),
+                    options.as_ptr(),
+                    &mut domain,
+                    &mut error
+                ),
+                C2MemFfiStatus::InvalidArgument,
+            );
+            assert!(domain.is_null());
+            let details = CStr::from_ptr(c2_mem_ffi_error_parts(error))
+                .to_string_lossy()
+                .into_owned();
+            c2_mem_ffi_error_free(error);
+            assert!(details.contains(message), "{details}");
+        }
+    }
+}
+
+#[test]
+fn client_domain_observation_is_read_only_before_connection() {
+    let mut domain = ptr::null_mut();
+    let mut error = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            c2_mem_ffi_client_domain_new(
+                ptr::null(),
+                cr#"{"memoryBudgetBytes":17}"#.as_ptr(),
+                &mut domain,
+                &mut error,
+            )
+        },
+        C2MemFfiStatus::Ok,
     );
-    let runtime = &unsafe { &*fixture.domain }.0.runtime;
-    assert_eq!(runtime.shm_threshold_override(), Some(123));
-    assert_eq!(runtime.client_ipc_overrides().unwrap().chunk_size, Some(64));
+    assert_eq!(
+        domain_stats(domain),
+        json!({
+            "domain_id": null, "generation": "0", "frozen": false, "closed": false,
+            "memory": null, "file_spill": null, "call_execution": {
+                "max_operations": null, "used_operations": null, "peak_operations": null,
+                "rejected_reservations": null, "closed": false,
+            },
+        })
+    );
+    assert!(!unsafe { &*domain }.0.runtime.client_config_frozen());
+    unsafe {
+        c2_mem_ffi_client_domain_free(domain);
+    }
+}
+
+#[test]
+fn factory_capacity_and_domain_identity_survive_reconnect() {
+    let mut fixture = Fixture::with_limits(json!({
+        "memoryBudgetBytes": 128,
+        "fileSpillBudgetBytes": "18446744073709551615",
+        "maxOutstandingCalls": "18446744073709551615",
+    }));
+    let initial = domain_stats(fixture.domain);
+    let cell = |limit: &str| {
+        json!({
+            "limit_bytes": limit, "used_bytes": "0", "peak_bytes": "0",
+            "rejected_allocations": "0", "rejected_bytes": "0",
+        })
+    };
+    assert!(
+        initial["domain_id"]
+            .as_str()
+            .unwrap()
+            .parse::<u64>()
+            .is_ok()
+    );
+    assert_eq!(
+        initial,
+        json!({
+            "domain_id": initial["domain_id"], "generation": "0", "frozen": true, "closed": false,
+            "memory": cell("128"), "file_spill": cell("18446744073709551615"), "call_execution": {
+                "max_operations": "18446744073709551615", "used_operations": "0",
+                "peak_operations": "0", "rejected_reservations": "0", "closed": false,
+            },
+        })
+    );
     let address = CString::new(fixture.host.local_endpoint().address()).unwrap();
     let release = ContractRelease::from_descriptor_json(DESCRIPTOR).unwrap();
     let expected = release.expected_route("items").unwrap();
@@ -591,12 +688,7 @@ fn factory_transport_policy_is_fixed_before_endpoints_and_reused_on_reconnect() 
     let route = CString::new("items").unwrap();
     let mut connection_ids = Vec::new();
     for _ in 0..2 {
-        let endpoint = unsafe { &*fixture.endpoint };
-        let connection = endpoint.0.connection.lock();
-        let config = connection.as_ref().unwrap().config();
-        assert_eq!(config.shm_threshold, 123);
-        assert_eq!(config.chunk_size, 64);
-        drop(connection);
+        assert_eq!(domain_stats(fixture.domain), initial);
         let prepared = async_result(|c, u| unsafe {
             c2_mem_ffi_endpoint_context_prepare(
                 fixture.endpoint,

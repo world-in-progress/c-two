@@ -117,12 +117,11 @@ const CONSUMER: &str = r##"
 use std::sync::{Arc, Condvar, Mutex};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
-use c_two::{CallOptions, CallTimeout, CallExecutionLimitsOverrides, ConfigSources,
-    Connect, Runtime, RuntimeOptions, HostOptions};
+use c_two::{CallOptions, CallTimeout, Connect, DomainLimitsOverrides, HostOptions, Runtime, RuntimeOptions};
 use c_two::generated::ErrorCode;
 use fastdb::{BuildPolicy, Builder, CompiledSpec, Payload, View};
 #[path = "../generated/rust/c_two_contract.rs"]
-mod contract;
+pub mod contract;
 
 const SPEC: &[u8] = br#"{
   "schema":"fastdb.payload.v1", "profile":"record.v1",
@@ -198,29 +197,33 @@ impl contract::Service for Echo {
         Ok(())
     }
 }
-fn runtime(label: &str, slots: u64, bytes: u64) -> Runtime {
-    let runtime = Runtime::new(RuntimeOptions {
-        server_id: Some(format!("options-{label}-{}", std::process::id())),
+fn runtime(slots: u64, bytes: u64) -> Runtime {
+    Runtime::new(RuntimeOptions {
+        client_limits: DomainLimitsOverrides {
+            max_outstanding_calls: Some(slots),
+            memory_budget_bytes: Some(bytes),
+            ..Default::default()
+        },
         use_process_relay_anchor: false,
         ..Default::default()
-    }).unwrap();
-    runtime.set_call_execution_limits_with_sources(CallExecutionLimitsOverrides {
-        max_outstanding_calls: Some(slots), payload_buffer_budget_bytes: Some(bytes),
-    }, ConfigSources::empty()).unwrap();
-    runtime
+    }).unwrap()
+}
+fn host(runtime: &Runtime, label: &str) -> c_two::Host {
+    runtime.host(HostOptions::default().without_relay()
+        .with_server_id(format!("options-{label}-{}", std::process::id()))).unwrap()
 }
 fn connect(runtime: &Runtime, route: &str) -> contract::ContractClient {
     contract::ContractClient::new(runtime.connect(contract::expected_route(route).unwrap(),
         Connect::DirectIpc { address: runtime.server_address().unwrap() }).unwrap()).unwrap()
 }
 fn assert_idle(runtime: &Runtime) {
-    let snapshot = runtime.call_execution_snapshot().unwrap();
-    assert_eq!(snapshot.used_operations, 0);
-    assert_eq!(runtime.memory_stats().payload_buffer.unwrap().used_bytes, 0);
+    let snapshot = runtime.call_execution_snapshot().client;
+    assert_eq!(snapshot.used_operations, Some(0));
+    assert_eq!(runtime.memory_stats().client.memory.unwrap().used_bytes, 0);
 }
 fn wait_for_idle(runtime: &Runtime) {
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while runtime.call_execution_snapshot().unwrap().used_operations != 0 {
+    while runtime.call_execution_snapshot().client.used_operations != Some(0) {
         assert!(std::time::Instant::now() < deadline, "native input charges did not drain");
         std::thread::sleep(Duration::from_millis(1));
     }
@@ -232,8 +235,8 @@ fn main() {
         ("zero-slots", 0, finite(5000), ErrorCode::CallCapacityExceeded),
         ("expired", 8, finite(0), ErrorCode::CallDeadlineExceeded),
     ] {
-        let runtime = runtime(label, slots, 1 << 20);
-        let host = runtime.host(HostOptions::default().without_relay()).unwrap();
+        let runtime = runtime(slots, 1 << 20);
+        let host = host(&runtime, label);
         let state = Arc::new(State::default());
         let mut registration = host.register(contract::service_definition(label,
             Echo(state.clone())).unwrap()).unwrap();
@@ -253,32 +256,31 @@ fn main() {
         semantic(view.method_3_put(&stale), code);
         assert_eq!(state.calls.load(Ordering::SeqCst), 0);
         assert_idle(&runtime);
-        // Explicit unlimited bypasses operation slots; inherited direct IPC
-        // remains unlimited as well. Both keep business signatures unchanged.
         let source = payload("unlimited");
-        view.with_call_options(CallOptions::with_timeout(CallTimeout::Unlimited))
-            .method_3_put(&source).unwrap();
-        client.method_0_ping().unwrap();
+        let unlimited = view.with_call_options(CallOptions::with_timeout(CallTimeout::Unlimited));
+        if slots == 0 {
+            semantic(unlimited.method_3_put(&source), ErrorCode::CallCapacityExceeded);
+            semantic(client.method_0_ping(), ErrorCode::CallCapacityExceeded);
+        } else {
+            unlimited.method_3_put(&source).unwrap();
+            client.method_0_ping().unwrap();
+        }
         assert_idle(&runtime);
         registration.close().unwrap();
     }
-    // Positive bytes cannot pass a zero payload-buffer budget. Empty input
-    // still works and can hold a portable response with the same policy.
+    // A positive memory budget permits a zero-byte call even if a portable
+    // payload is too large to reserve before serialization.
     {
-        let runtime = runtime("zero-bytes", 8, 0);
-        let host = runtime.host(HostOptions::default().without_relay()).unwrap();
+        let runtime = runtime(8, 1);
+        let host = host(&runtime, "small-memory");
         let state = Arc::new(State::default());
-        let mut registration = host.register(contract::service_definition("zero-bytes",
+        let mut registration = host.register(contract::service_definition("small-memory",
             Echo(state.clone())).unwrap()).unwrap();
-        let client = connect(&runtime, "zero-bytes").with_call_options(finite(5000));
+        let client = connect(&runtime, "small-memory").with_call_options(finite(5000));
         semantic(client.method_1_echo(&payload("bytes")), ErrorCode::CallCapacityExceeded);
         semantic(client.hold_method_1_echo(&payload("bytes")), ErrorCode::CallCapacityExceeded);
         assert_eq!(state.calls.load(Ordering::SeqCst), 0);
         client.method_0_ping().unwrap();
-        let mut held = client.hold_method_2_get().unwrap();
-        let checked = held.value().unwrap().entry_view(0).unwrap();
-        held.release().unwrap();
-        assert_eq!(checked.acquire().unwrap_err().symbol(), "VIEW_INVALIDATED");
         wait_for_idle(&runtime);
         assert_idle(&runtime);
         registration.close().unwrap();
@@ -286,8 +288,8 @@ fn main() {
     // Concurrent views share one connection acquisition, but each call retains
     // its own deadline. Expiring one caller cannot cancel the other view/hold.
     {
-        let runtime = runtime("views", 8, 1 << 20);
-        let host = runtime.host(HostOptions::default().without_relay()).unwrap();
+        let runtime = runtime(8, 1 << 20);
+        let host = host(&runtime, "views");
         let state = Arc::new(State::default());
         let mut registration = host.register(contract::service_definition("views",
             Echo(state.clone())).unwrap().with_concurrency(

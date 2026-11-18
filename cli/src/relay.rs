@@ -4,10 +4,10 @@ use std::time::Duration;
 
 use anyhow::{Result, anyhow};
 use c2_config::{
-    CallExecutionLimitsOverrides, ClientIpcConfigOverrides, ConfigResolver, ConfigSources,
-    LocalEndpointOptions, RelayConfigOverrides, RuntimeConfigOverrides,
+    ConfigResolver, ConfigSources, DomainLimitsOverrides, EnvCatalog, LocalEndpointOptions,
+    RelayConfigOverrides,
 };
-use c2_http::relay::{RelayServer, RelayServerOptions};
+use c2_http::relay::RelayServer;
 use clap::Args;
 
 #[derive(Debug, Args)]
@@ -23,10 +23,6 @@ pub struct RelayArgs {
     #[arg(long = "upstream", short = 'u', value_parser = parse_upstream)]
     pub upstreams: Vec<(String, String, String)>,
 
-    /// Disconnect idle upstream IPC connections after this many seconds. 0 disables eviction.
-    #[arg(long = "idle-timeout")]
-    pub idle_timeout_secs: Option<u64>,
-
     /// Comma-separated seed relay URLs for mesh mode.
     #[arg(long, short = 's', value_delimiter = ',')]
     pub seeds: Vec<String>,
@@ -39,29 +35,17 @@ pub struct RelayArgs {
     #[arg(long = "advertise-url")]
     pub advertise_url: Option<String>,
 
-    /// Enable buddy SHM for data-plane upstream IPC clients.
-    #[arg(long, action = clap::ArgAction::Set)]
-    pub ipc_pool_enabled: Option<bool>,
-
-    /// Shared upstream IPC SHM backing budget in bytes. Zero rejects positive charges.
+    /// Relay memory budget in bytes. Zero closes admission to new calls.
     #[arg(long)]
-    pub ipc_shm_backing_budget_bytes: Option<u64>,
+    pub memory_budget_bytes: Option<u64>,
 
-    /// Shared upstream IPC file backing budget in bytes. Zero rejects positive charges.
+    /// Relay file spill budget in bytes. Zero disables file spill.
     #[arg(long)]
-    pub ipc_file_backing_budget_bytes: Option<u64>,
-
-    /// Shared upstream IPC live reassembly budget in bytes. Zero rejects positive charges.
-    #[arg(long)]
-    pub ipc_live_reassembly_budget_bytes: Option<u64>,
+    pub file_spill_budget_bytes: Option<u64>,
 
     /// Maximum outstanding native forwarding transactions. Zero rejects all calls.
     #[arg(long)]
     pub call_max_outstanding: Option<u64>,
-
-    /// Payload buffer budget in bytes. Zero rejects positive byte admission.
-    #[arg(long)]
-    pub call_payload_buffer_budget_bytes: Option<u64>,
 
     /// Validate and print relay configuration without starting the server.
     #[arg(long, hide = true)]
@@ -92,84 +76,39 @@ pub fn parse_upstream(value: &str) -> Result<(String, String, String), String> {
 }
 
 pub fn run(args: RelayArgs) -> Result<()> {
-    let overrides = RuntimeConfigOverrides {
-        client_ipc: ClientIpcConfigOverrides {
-            pool_enabled: args.ipc_pool_enabled,
-            shm_backing_budget_bytes: args.ipc_shm_backing_budget_bytes,
-            file_backing_budget_bytes: args.ipc_file_backing_budget_bytes,
-            live_reassembly_budget_bytes: args.ipc_live_reassembly_budget_bytes,
-            ..Default::default()
-        },
-        relay: RelayConfigOverrides {
-            bind: args.bind.clone(),
-            relay_id: args.relay_id.clone(),
-            advertise_url: args.advertise_url.clone(),
-            seeds: if args.seeds.is_empty() {
-                None
-            } else {
-                Some(args.seeds.clone())
-            },
-            idle_timeout_secs: args.idle_timeout_secs,
-            ..Default::default()
-        },
-        ..Default::default()
-    };
-    let options = RelayServerOptions {
-        call_execution: CallExecutionLimitsOverrides {
-            max_outstanding_calls: args.call_max_outstanding,
-            payload_buffer_budget_bytes: args.call_payload_buffer_budget_bytes,
-        },
-    };
-    let sources = ConfigSources::from_process();
+    let catalog = EnvCatalog::load(ConfigSources::from_process())?;
     let context = ConfigResolver::resolve_local_endpoint(
         LocalEndpointOptions {
-            unix_root: args.ipc_root.clone(),
+            unix_root: args.ipc_root,
         },
-        sources.clone(),
-    )
-    .map_err(|e| anyhow!("{e}"))?;
-    let resolved =
-        ConfigResolver::resolve_relay_server(overrides, sources).map_err(|e| anyhow!("{e}"))?;
-    let config = resolved.relay;
+        &catalog,
+    )?;
+    let config = ConfigResolver::resolve_relay_server(
+        RelayConfigOverrides {
+            bind: args.bind,
+            relay_id: args.relay_id,
+            advertise_url: args.advertise_url,
+            seeds: (!args.seeds.is_empty()).then_some(args.seeds),
+            domain_limits: DomainLimitsOverrides {
+                memory_budget_bytes: args.memory_budget_bytes,
+                file_spill_budget_bytes: args.file_spill_budget_bytes,
+                max_outstanding_calls: args.call_max_outstanding,
+            },
+            ..Default::default()
+        },
+        &catalog,
+    )?;
 
     if args.dry_run {
-        let limits = ConfigResolver::resolve_call_execution_limits(
-            options.call_execution.clone(),
-            ConfigSources::from_process(),
-        )
-        .map_err(|e| anyhow!("{e}"))?;
+        let limits = config.domain_limits;
+        println!("memory_budget_bytes={}", limits.memory_budget_bytes);
+        println!("file_spill_budget_bytes={}", limits.file_spill_budget_bytes);
         println!("call_max_outstanding={}", limits.max_outstanding_calls);
-        println!(
-            "call_payload_buffer_budget_bytes={}",
-            limits.payload_buffer_budget_bytes
-        );
         println!("local_namespace={}", context.namespace_id());
         println!("bind={}", config.bind);
         println!("relay_id={}", config.relay_id);
         println!("advertise_url={}", config.effective_advertise_url());
-        println!("idle_timeout={}", config.idle_timeout_secs);
         println!("relay_use_proxy={}", config.use_proxy);
-        println!(
-            "remote_payload_chunk_size={}",
-            config.remote_payload_chunk_size
-        );
-        println!("ipc_pool_enabled={}", config.upstream_ipc.pool_enabled);
-        println!(
-            "ipc_pool_prewarm_segments={}",
-            config.upstream_ipc.pool_prewarm_segments
-        );
-        println!(
-            "ipc_shm_backing_budget_bytes={}",
-            config.upstream_ipc.shm_backing_budget_bytes
-        );
-        println!(
-            "ipc_file_backing_budget_bytes={}",
-            config.upstream_ipc.file_backing_budget_bytes
-        );
-        println!(
-            "ipc_live_reassembly_budget_bytes={}",
-            config.upstream_ipc.live_reassembly_budget_bytes
-        );
         for seed in &config.seeds {
             println!("seed={seed}");
         }
@@ -186,7 +125,7 @@ pub fn run(args: RelayArgs) -> Result<()> {
         )
         .init();
 
-    let mut relay = RelayServer::start_with_context_and_options(config, context, options)
+    let mut relay = RelayServer::start_resolved(config, context)
         .map_err(|e| anyhow!("failed to start relay: {e}"))?;
     for (name, server_id, address) in args.upstreams {
         relay

@@ -1,5 +1,5 @@
 //! Real c2-server peer for the Node IPC 16 / ABI 8 gate. No Python or FastDB.
-use c2_config::{ConfigResolver, ConfigSources, LocalEndpointOptions};
+use c2_config::{ConfigResolver, ConfigSources, EnvCatalog, LocalEndpointOptions};
 use c2_contract::ContractRelease;
 use c2_server::{
     ConcurrencyMode, CrmCallback, CrmError, CrmStream, CrmStreamCallback, CrmStreamItem,
@@ -146,11 +146,12 @@ fn emit(value: serde_json::Value) {
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     let args: Vec<_> = std::env::args().skip(1).collect();
+    let catalog = EnvCatalog::load(ConfigSources::empty()).unwrap();
     let context = ConfigResolver::resolve_local_endpoint(
         LocalEndpointOptions {
             unix_root: (args[0] != "-").then(|| args[0].clone().into()),
         },
-        ConfigSources::empty(),
+        &catalog,
     )
     .unwrap();
     let endpoint = context.endpoint(&args[1]).unwrap();

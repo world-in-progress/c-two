@@ -57,7 +57,8 @@ fn two_full_holds(
     let limit = fixture
         .client_runtime
         .memory_stats()
-        .payload_buffer
+        .client
+        .memory
         .unwrap()
         .limit_bytes;
     assert_eq!(fixture.used_bytes(), limit, "two typed holds fill B");
@@ -456,7 +457,7 @@ fn typed_peer_end_preserves_delivered_hold_and_never_replays_the_stream() {
     };
     let client_runtime = fixture::runtime(
         std::path::Path::new(ready["root"].as_str().unwrap()),
-        fixture::unique("peer-end-client"),
+        Default::default(),
     );
     let client = client_runtime
         .connect(
@@ -509,15 +510,16 @@ fn typed_peer_end_preserves_delivered_hold_and_never_replays_the_stream() {
     observe_until(|| {
         client_runtime
             .call_execution_snapshot()
-            .unwrap()
+            .client
             .used_operations
-            == 0
+            == Some(0)
     });
     first.release().unwrap();
     assert_eq!(
         client_runtime
             .memory_stats()
-            .payload_buffer
+            .client
+            .memory
             .unwrap()
             .used_bytes,
         0

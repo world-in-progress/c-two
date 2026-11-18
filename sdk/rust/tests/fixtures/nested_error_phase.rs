@@ -69,8 +69,6 @@ pub struct NestedErrorFixture {
     client_b: Client,
     side_effects: Arc<AtomicU64>,
     b_calls: Arc<AtomicU64>,
-    pub address: String,
-    pub route_a: String,
     pub route_b: String,
 }
 
@@ -81,7 +79,6 @@ impl NestedErrorFixture {
         let route_a = format!("nested-a-{suffix}");
         let route_b = format!("nested-b-{suffix}");
         let runtime = Runtime::new(RuntimeOptions {
-            server_id: Some(format!("nested-errors-{suffix}")),
             use_process_relay_anchor: false,
             ..RuntimeOptions::default()
         })
@@ -97,7 +94,11 @@ impl NestedErrorFixture {
             .set_local_endpoint_with_sources(endpoint, ConfigSources::empty())
             .expect("fixture endpoint");
         let host = runtime
-            .host(HostOptions::default().without_relay())
+            .host(
+                HostOptions::default()
+                    .without_relay()
+                    .with_server_id(format!("nested-errors-{suffix}")),
+            )
             .expect("fixture Host");
         let b_calls = Arc::new(AtomicU64::new(0));
         let registration_b = host
@@ -146,8 +147,6 @@ impl NestedErrorFixture {
             client_b,
             side_effects,
             b_calls,
-            address,
-            route_a,
             route_b,
         }
     }

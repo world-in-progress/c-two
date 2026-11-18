@@ -7,7 +7,7 @@ import {fileURLToPath} from 'node:url';
 import test from 'node:test';
 import * as binding from '../dist/index.js';
 
-test('connector is the single factory facade and transport policy is factory-only', () => {
+test('connector is the single factory facade and domain limits are factory-only', () => {
   assert.equal(binding.createNodeIpcRuntime, undefined);
   const directory = mkdtempSync(join(tmpdir(), 'c2-factory-types-'));
   try {
@@ -18,17 +18,25 @@ test('connector is the single factory facade and transport policy is factory-onl
     writeFileSync(check, `
       import {createNodeIpcConnector, type NativeEndpointOptions, type NativeClientDomainOptions} from ${JSON.stringify(bindings)};
       import type {C2IpcTransportOptions, C2IpcNativeEndpointOptions} from ${JSON.stringify(transport)};
-      const policy: NativeClientDomainOptions = {requestShmThreshold: 1024, requestChunkSize: 64};
-      const connect = createNodeIpcConnector(policy);
+      const limits: NativeClientDomainOptions = {memoryBudgetBytes: 1024n, fileSpillBudgetBytes: 0, maxOutstandingCalls: 64n};
+      const connect = createNodeIpcConnector(limits);
       void connect('ipc://first', 100, {connectTimeoutMs: 50});
-      // @ts-expect-error policy belongs to the factory
-      void connect('ipc://second', 100, {requestShmThreshold: 1024});
-      // @ts-expect-error policy belongs to the factory
-      const endpoint: NativeEndpointOptions = {requestChunkSize: 64};
-      // @ts-expect-error generated connectors do not accept factory policy per connection
-      const generatedEndpoint: C2IpcNativeEndpointOptions = {requestShmThreshold: 1024};
-      // @ts-expect-error generated transports do not own factory policy
-      const generatedTransport: C2IpcTransportOptions = {connect, requestChunkSize: 64};
+      // @ts-expect-error capacity belongs to the factory
+      void connect('ipc://second', 100, {memoryBudgetBytes: 1024});
+      // @ts-expect-error capacity belongs to the factory
+      const endpoint: NativeEndpointOptions = {fileSpillBudgetBytes: 64};
+      // @ts-expect-error generated connectors do not accept capacity per connection
+      const generatedEndpoint: C2IpcNativeEndpointOptions = {maxOutstandingCalls: 1024};
+      // @ts-expect-error generated transports do not own factory capacity
+      const generatedTransport: C2IpcTransportOptions = {connect, memoryBudgetBytes: 64};
+      // @ts-expect-error retired option
+      createNodeIpcConnector({requestShmThreshold: 1024});
+      // @ts-expect-error retired option
+      createNodeIpcConnector({requestChunkSize: 64});
+      // @ts-expect-error retired native factory option
+      const threshold: NativeClientDomainOptions = {requestShmThreshold: 1024};
+      // @ts-expect-error retired native factory option
+      const chunk: NativeClientDomainOptions = {requestChunkSize: 64};
       // @ts-expect-error the duplicate factory facade has been removed
       import type {C2MemFfiNodeRuntime} from ${JSON.stringify(bindings)};
     `);

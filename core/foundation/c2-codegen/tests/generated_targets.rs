@@ -264,7 +264,7 @@ parking_lot = "0.13"
 use c_two_generated_contract_check::contract;
 use c_two::generated::{AdapterFailurePhase, HeldResponse, fastdb_adapter_error};
 use c2_ipc::ResponseData;
-use c2_mem::{MemPool, PoolConfig};
+use c2_mem::{DomainBudget, MemPool, PoolConfig};
 use c2_wire::chunk::backing::ReassemblyBacking;
 use fastdb::{BuildPolicy, Builder, CompiledSpec};
 use parking_lot::RwLock;
@@ -283,8 +283,10 @@ fn main() {
         payload.require_spec_sha256(&[0; 32]).unwrap_err(),
     );
     let bytes = payload.binary_bytes().unwrap();
-    let pool = Arc::new(RwLock::new(MemPool::new(PoolConfig::default()).unwrap()));
-    let budget = pool.read().budget().unwrap().clone();
+    let budget = DomainBudget::from_limits(&c_two::DomainLimits::default());
+    let pool = Arc::new(RwLock::new(
+        MemPool::new_with_budget(PoolConfig::default(), budget.clone()).unwrap(),
+    ));
     let mut backing = ReassemblyBacking::admit(Arc::clone(&pool), 1, bytes.len()).unwrap();
     backing.write_at(0, &bytes).unwrap();
     let response = HeldResponse::from_response_data(ResponseData::Handle(backing)).unwrap();
@@ -293,9 +295,10 @@ fn main() {
         c_two::Error::Semantic(error) => assert_eq!(error, expected),
         error => panic!("primary semantic error was replaced: {error}"),
     }
-    assert_eq!(budget.snapshot().reassembly.used_bytes, 0);
+    assert_eq!(budget.snapshot().file_spill.used_bytes, 0);
     assert_eq!(pool.read().stats().alloc_count, 0);
     drop(pool);
+    assert_eq!(budget.snapshot().memory.used_bytes, 0);
 }
 "##,
     )

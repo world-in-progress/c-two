@@ -26,7 +26,7 @@ function buildServer() {
   return executable;
 }
 
-async function withServer(run) {
+async function withServer(run, domainLimits = {}) {
   const server = buildServer();
   const directory = mkdtempSync(resolve(tmpdir(), 'c2n8-'));
   const root = resolve(directory, 'ipc'); mkdirSync(root, {mode: 0o700});
@@ -35,7 +35,7 @@ async function withServer(run) {
   const lines = createInterface({input: child.stdout})[Symbol.asyncIterator]();
   let stderr = ''; child.stderr.on('data', b => { stderr += b; });
   const closed = new Promise(resolve => child.once('exit', code => resolve(code)));
-  const connector = createNodeIpcConnector(process.platform === 'win32' ? {} : {ipcRoot: root});
+  const connector = createNodeIpcConnector({...domainLimits, ...(process.platform === 'win32' ? {} : {ipcRoot: root})});
   try {
     const ready = JSON.parse((await lines.next()).value);
     assert.equal(ready.kind, 'ready', stderr);
@@ -58,6 +58,24 @@ async function withServer(run) {
     assert.equal(code, 0, stderr);
   }
 }
+
+test('connector reports lossless client domain limits after preparing a route', {timeout: 150_000}, async () => {
+  await withServer(async ({connector, address, contract}) => {
+    assert.equal(connector.stats().frozen, false);
+    const endpoint = await connector(address);
+    try {
+      assert.equal(connector.stats().frozen, false);
+      await endpoint.prepare('echo', contract);
+      const stats = connector.stats();
+      assert.match(stats.domain_id, /^[0-9]+$/);
+      assert.equal(stats.generation, '0');
+      assert.equal(stats.frozen, true);
+      assert.equal(stats.memory.limit_bytes, '18446744073709551615');
+      assert.equal(stats.file_spill.limit_bytes, '0');
+      assert.equal(stats.call_execution.max_operations, '9007199254740993');
+    } finally { await endpoint.close(); }
+  }, {memoryBudgetBytes: 18446744073709551615n, fileSpillBudgetBytes: 0, maxOutstandingCalls: 9007199254740993n});
+});
 
 async function unary(endpoint, contract, bytes) {
   await endpoint.prepare('echo', contract);
@@ -385,37 +403,30 @@ test('ABI 8 cancellation observes pending cleanup, then completes after a host b
 });
 
 test('holding one native item keeps the shared payload budget until release', {timeout: 150_000}, async () => {
-  const previous = process.env.C2_CALL_PAYLOAD_BUFFER_BUDGET_BYTES;
-  process.env.C2_CALL_PAYLOAD_BUFFER_BUDGET_BYTES = '4102';
-  try {
-    await withServer(async ({connector, address, contract, lines}) => {
-      const endpoint = await connector(address);
+  await withServer(async ({connector, address, contract, lines}) => {
+    const endpoint = await connector(address);
+    try {
+      const first = await beginStream(endpoint, contract, 0, 1, 4096);
+      const held = await first.next();
+      assert.ok(held);
+      assert.equal(held.byteLength, 4096);
+      assert.equal(connector.stats().memory.limit_bytes, '4102');
+      assert.equal(connector.stats().memory.used_bytes, '4096');
+      const second = await beginStream(endpoint, contract, 3, 1, 4096);
       try {
-        const first = await beginStream(endpoint, contract, 0, 1, 4096);
-        const held = await first.next();
-        assert.ok(held);
-        assert.equal(held.byteLength, 4096);
-        assert.equal(connector.stats().payload_buffer.limit_bytes, '4102');
-        assert.equal(connector.stats().payload_buffer.used_bytes, '4096');
-        const second = await beginStream(endpoint, contract, 3, 1, 4096);
-        try {
-          const pending = second.next();
-          assert.equal(JSON.parse((await lines.next()).value).kind, 'second_stream_step');
-          assert.equal(connector.stats().payload_buffer.used_bytes, '4096');
-          held.release();
-          const item = await pending;
-          assert.ok(item);
-          assert.equal(item.byteLength, 4096);
-          item.release();
-          assert.equal(await second.next(), null);
-          assert.equal((await second.observe(null)).completeItems, 1n);
-        } finally { second.close(); first.close(); }
-      } finally { await endpoint.close(); }
-    });
-  } finally {
-    if (previous === undefined) delete process.env.C2_CALL_PAYLOAD_BUFFER_BUDGET_BYTES;
-    else process.env.C2_CALL_PAYLOAD_BUFFER_BUDGET_BYTES = previous;
-  }
+        const pending = second.next();
+        assert.equal(JSON.parse((await lines.next()).value).kind, 'second_stream_step');
+        assert.equal(connector.stats().memory.used_bytes, '4096');
+        held.release();
+        const item = await pending;
+        assert.ok(item);
+        assert.equal(item.byteLength, 4096);
+        item.release();
+        assert.equal(await second.next(), null);
+        assert.equal((await second.observe(null)).completeItems, 1n);
+      } finally { second.close(); first.close(); }
+    } finally { await endpoint.close(); }
+  }, {memoryBudgetBytes: 4102});
 });
 
 test('public stream close(0) reports pending cleanup and close(null) observes completion', {timeout: 150_000}, async () => {
@@ -641,131 +652,117 @@ try {
 });
 
 test('multiple public held stream items fill B and releasing one resumes next', {timeout: 150_000}, async () => {
-  const previous = process.env.C2_CALL_PAYLOAD_BUFFER_BUDGET_BYTES;
-  process.env.C2_CALL_PAYLOAD_BUFFER_BUDGET_BYTES = '8192';
-  try {
-    await withServer(async ({connector, address, contract, lines, createIpcEncodedTransport}) => {
-      const transport = createIpcEncodedTransport(address, {connect: connector});
-      const holds = [];
-      try {
-        const stream = transport.stream('echo', contract, 'echo', () => streamInput(6, 3, 4096), bytes => bytes, true);
-        for (let index = 0; index < 2; index++) {
-          const item = await stream.next();
-          assert.equal(item.done, false);
-          holds.push(item.value);
-          assert.equal(item.value.value.byteLength, 4096);
-          assert.ok(item.value.value.every(byte => byte === index));
-          assert.deepEqual(JSON.parse((await lines.next()).value), {kind: 'item_step', index});
-        }
-        assert.equal(connector.stats().payload_buffer.used_bytes, '8192');
-        let settled = false;
-        const pending = stream.next().then(item => { settled = true; return item; });
-        assert.deepEqual(JSON.parse((await lines.next()).value), {kind: 'item_step', index: 2});
-        assert.equal(settled, false);
-        assert.equal(connector.stats().payload_buffer.used_bytes, '8192');
-        holds[0].release();
-        assert.throws(() => holds[0].value, /released/);
-        const resumed = await pending;
-        assert.equal(resumed.done, false);
-        holds.push(resumed.value);
-        assert.ok(resumed.value.value.every(byte => byte === 2));
-        assert.ok(holds[1].value.every(byte => byte === 1));
-        assert.equal(connector.stats().payload_buffer.used_bytes, '8192');
-        holds[1].release();
-        assert.equal(connector.stats().payload_buffer.used_bytes, '4096');
-        resumed.value.release();
-        assert.equal(connector.stats().payload_buffer.used_bytes, '0');
-        assert.deepEqual(await stream.next(), {done: true, value: undefined});
-        assert.deepEqual(await stream.close(null), {completed: true, error: null, completeItems: 3n});
-      } finally {
-        for (const held of holds) held.release();
-        await transport.close();
+  await withServer(async ({connector, address, contract, lines, createIpcEncodedTransport}) => {
+    const transport = createIpcEncodedTransport(address, {connect: connector});
+    const holds = [];
+    try {
+      const stream = transport.stream('echo', contract, 'echo', () => streamInput(6, 3, 4096), bytes => bytes, true);
+      for (let index = 0; index < 2; index++) {
+        const item = await stream.next();
+        assert.equal(item.done, false);
+        holds.push(item.value);
+        assert.equal(item.value.value.byteLength, 4096);
+        assert.ok(item.value.value.every(byte => byte === index));
+        assert.deepEqual(JSON.parse((await lines.next()).value), {kind: 'item_step', index});
       }
-    });
-  } finally {
-    if (previous === undefined) delete process.env.C2_CALL_PAYLOAD_BUFFER_BUDGET_BYTES;
-    else process.env.C2_CALL_PAYLOAD_BUFFER_BUDGET_BYTES = previous;
-  }
+      assert.equal(connector.stats().memory.used_bytes, '8192');
+      let settled = false;
+      const pending = stream.next().then(item => { settled = true; return item; });
+      assert.deepEqual(JSON.parse((await lines.next()).value), {kind: 'item_step', index: 2});
+      assert.equal(settled, false);
+      assert.equal(connector.stats().memory.used_bytes, '8192');
+      holds[0].release();
+      assert.throws(() => holds[0].value, /released/);
+      const resumed = await pending;
+      assert.equal(resumed.done, false);
+      holds.push(resumed.value);
+      assert.ok(resumed.value.value.every(byte => byte === 2));
+      assert.ok(holds[1].value.every(byte => byte === 1));
+      assert.equal(connector.stats().memory.used_bytes, '8192');
+      holds[1].release();
+      assert.equal(connector.stats().memory.used_bytes, '4096');
+      resumed.value.release();
+      assert.equal(connector.stats().memory.used_bytes, '0');
+      assert.deepEqual(await stream.next(), {done: true, value: undefined});
+      assert.deepEqual(await stream.close(null), {completed: true, error: null, completeItems: 3n});
+    } finally {
+      for (const held of holds) held.release();
+      await transport.close();
+    }
+  }, {memoryBudgetBytes: 8192});
 });
 
 test('public holds keep the same native domain charge across distinct connections and reconnect', {timeout: 150_000}, async () => {
-  const previous = process.env.C2_CALL_PAYLOAD_BUFFER_BUDGET_BYTES;
-  process.env.C2_CALL_PAYLOAD_BUFFER_BUDGET_BYTES = '4102';
-  try {
-    await withServer(async ({connector, address, contract, lines, createIpcEncodedTransport}) => {
-      const transports = [];
-      const holds = [];
-      const waitForInputRefund = async () => {
-        const deadline = performance.now() + 10_000;
-        while (performance.now() < deadline) {
-          if (connector.stats().payload_buffer.used_bytes === '4096') return;
-          await new Promise(resolve => setImmediate(resolve));
-        }
-        assert.fail('stream input reservation was not refunded');
-      };
-      const open = async mode => {
-        const endpoint = await connector(address);
-        const binding = await endpoint.prepare('echo', contract);
-        const transport = createIpcEncodedTransport(address, {connect: async () => endpoint});
-        transports.push(transport);
-        const stream = transport.stream('echo', contract, 'echo', () => streamInput(mode, 1, 4096), bytes => bytes, true);
-        return {endpoint, binding, transport, stream};
-      };
-      try {
-        const first = await open(0);
-        const original = (await first.stream.next()).value;
-        holds.push(original);
-        assert.deepEqual(await first.stream.next(), {done: true, value: undefined});
-        assert.equal(connector.stats().payload_buffer.used_bytes, '4096');
-
-        const second = await open(3);
-        assert.notEqual(second.binding.connectionId, first.binding.connectionId);
-        let settled = false;
-        const pending = second.stream.next().then(item => { settled = true; return item; });
-        assert.equal(JSON.parse((await lines.next()).value).kind, 'second_stream_step');
-        // Resource entry can precede the client's input reservation refund.
-        await waitForInputRefund();
-        assert.equal(settled, false);
-        assert.equal(connector.stats().payload_buffer.used_bytes, '4096');
-        await first.transport.close();
-        assert.equal(original.value.byteLength, 4096);
-        assert.ok(original.value.every(byte => byte === 0));
-        assert.equal(connector.stats().payload_buffer.used_bytes, '4096');
-        original.release();
-        const retained = (await pending).value;
-        holds.push(retained);
-        assert.deepEqual(await second.stream.next(), {done: true, value: undefined});
-        await second.transport.close();
-        assert.equal(connector.stats().payload_buffer.used_bytes, '4096');
-
-        const reconnected = await open(3);
-        assert.notEqual(reconnected.binding.connectionId, second.binding.connectionId);
-        let resumed = false;
-        const next = reconnected.stream.next().then(item => { resumed = true; return item; });
-        assert.equal(JSON.parse((await lines.next()).value).kind, 'second_stream_step');
-        await waitForInputRefund();
-        assert.equal(resumed, false);
-        assert.equal(connector.stats().payload_buffer.used_bytes, '4096');
-        assert.equal(retained.value.byteLength, 4096);
-        assert.ok(retained.value.every(byte => byte === 0));
-        retained.release();
-        const last = (await next).value;
-        holds.push(last);
-        assert.equal(last.value.byteLength, 4096);
-        assert.equal(connector.stats().payload_buffer.used_bytes, '4096');
-        last.release();
-        assert.equal(connector.stats().payload_buffer.used_bytes, '0');
-        assert.deepEqual(await reconnected.stream.next(), {done: true, value: undefined});
-        assert.deepEqual(await reconnected.stream.close(null), {completed: true, error: null, completeItems: 1n});
-      } finally {
-        for (const held of holds) held.release();
-        for (const transport of transports) await transport.close();
+  await withServer(async ({connector, address, contract, lines, createIpcEncodedTransport}) => {
+    const transports = [];
+    const holds = [];
+    const waitForInputRefund = async () => {
+      const deadline = performance.now() + 10_000;
+      while (performance.now() < deadline) {
+        if (connector.stats().memory.used_bytes === '4096') return;
+        await new Promise(resolve => setImmediate(resolve));
       }
-    });
-  } finally {
-    if (previous === undefined) delete process.env.C2_CALL_PAYLOAD_BUFFER_BUDGET_BYTES;
-    else process.env.C2_CALL_PAYLOAD_BUFFER_BUDGET_BYTES = previous;
-  }
+      assert.fail('stream input reservation was not refunded');
+    };
+    const open = async mode => {
+      const endpoint = await connector(address);
+      const binding = await endpoint.prepare('echo', contract);
+      const transport = createIpcEncodedTransport(address, {connect: async () => endpoint});
+      transports.push(transport);
+      const stream = transport.stream('echo', contract, 'echo', () => streamInput(mode, 1, 4096), bytes => bytes, true);
+      return {endpoint, binding, transport, stream};
+    };
+    try {
+      const first = await open(0);
+      const original = (await first.stream.next()).value;
+      holds.push(original);
+      assert.deepEqual(await first.stream.next(), {done: true, value: undefined});
+      assert.equal(connector.stats().memory.used_bytes, '4096');
+
+      const second = await open(3);
+      assert.notEqual(second.binding.connectionId, first.binding.connectionId);
+      let settled = false;
+      const pending = second.stream.next().then(item => { settled = true; return item; });
+      assert.equal(JSON.parse((await lines.next()).value).kind, 'second_stream_step');
+      // Resource entry can precede the client's input reservation refund.
+      await waitForInputRefund();
+      assert.equal(settled, false);
+      assert.equal(connector.stats().memory.used_bytes, '4096');
+      await first.transport.close();
+      assert.equal(original.value.byteLength, 4096);
+      assert.ok(original.value.every(byte => byte === 0));
+      assert.equal(connector.stats().memory.used_bytes, '4096');
+      original.release();
+      const retained = (await pending).value;
+      holds.push(retained);
+      assert.deepEqual(await second.stream.next(), {done: true, value: undefined});
+      await second.transport.close();
+      assert.equal(connector.stats().memory.used_bytes, '4096');
+
+      const reconnected = await open(3);
+      assert.notEqual(reconnected.binding.connectionId, second.binding.connectionId);
+      let resumed = false;
+      const next = reconnected.stream.next().then(item => { resumed = true; return item; });
+      assert.equal(JSON.parse((await lines.next()).value).kind, 'second_stream_step');
+      await waitForInputRefund();
+      assert.equal(resumed, false);
+      assert.equal(connector.stats().memory.used_bytes, '4096');
+      assert.equal(retained.value.byteLength, 4096);
+      assert.ok(retained.value.every(byte => byte === 0));
+      retained.release();
+      const last = (await next).value;
+      holds.push(last);
+      assert.equal(last.value.byteLength, 4096);
+      assert.equal(connector.stats().memory.used_bytes, '4096');
+      last.release();
+      assert.equal(connector.stats().memory.used_bytes, '0');
+      assert.deepEqual(await reconnected.stream.next(), {done: true, value: undefined});
+      assert.deepEqual(await reconnected.stream.close(null), {completed: true, error: null, completeItems: 1n});
+    } finally {
+      for (const held of holds) held.release();
+      for (const transport of transports) await transport.close();
+    }
+  }, {memoryBudgetBytes: 4102});
 });
 
 test('a failed first native prepare freezes the factory endpoint root for retries', {
