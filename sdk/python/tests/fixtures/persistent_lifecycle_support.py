@@ -176,8 +176,17 @@ class Events:
         return {event["id"] for event in self.records
                 if event["kind"] == kind and event["side"] == side}
 
+    def _snapshot_ids(self, side: str) -> tuple[set[int], set[int]]:
+        self.drain()
+        opened = {event["id"] for event in self.records
+                  if event["kind"] == "opened" and event["side"] == side}
+        closed = {event["id"] for event in self.records
+                  if event["kind"] == "closed" and event["side"] == side}
+        return opened, closed
+
     def active(self, side: str) -> set[int]:
-        return self.ids("opened", side) - self.ids("closed", side)
+        opened, closed = self._snapshot_ids(side)
+        return opened - closed
 
     def wait_closed_all(self, side: str, *, timeout: float = 10.0) -> None:
         """Wait until every opened connection on one side has its Closed event.
@@ -188,7 +197,10 @@ class Events:
         recv with the remaining deadline instead of draining once.
         """
         deadline = time.monotonic() + timeout
-        while self.ids("opened", side) != self.ids("closed", side):
+        while True:
+            opened, closed = self._snapshot_ids(side)
+            if opened == closed:
+                return
             remaining = deadline - time.monotonic()
             assert remaining > 0 and not self.ended, (
                 f"{side} connections did not close: {self.records}"

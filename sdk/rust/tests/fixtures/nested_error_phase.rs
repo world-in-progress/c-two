@@ -2,13 +2,15 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+#[cfg(test)]
+use c_two::Error;
 use c_two::generated::{
     AdapterFailurePhase, C2Error, EncodedClient, EncodedService, MethodAccess, MethodDefinition,
     ServiceDefinition, adapter_error,
 };
 use c_two::{
-    Client, ConfigSources, Connect, ContractRelease, Error, Host, HostOptions, Registration,
-    Runtime, RuntimeOptions,
+    Client, ConfigSources, Connect, ContractRelease, Host, HostOptions, Registration, Runtime,
+    RuntimeOptions,
 };
 
 struct B {
@@ -65,7 +67,9 @@ pub struct NestedErrorFixture {
     _host: Host,
     _registration_a: Registration,
     registration_b: Registration,
+    #[cfg(test)]
     client_a: Client,
+    #[cfg(test)]
     client_b: Client,
     side_effects: Arc<AtomicU64>,
     b_calls: Arc<AtomicU64>,
@@ -132,6 +136,7 @@ impl NestedErrorFixture {
                 }),
             ))
             .expect("register A");
+        #[cfg(test)]
         let client_a = runtime
             .connect(
                 release.expected_route(&route_a).expect("A contract"),
@@ -140,12 +145,16 @@ impl NestedErrorFixture {
                 },
             )
             .expect("bound A client");
+        #[cfg(not(test))]
+        let _ = &client_b;
         Self {
             _runtime: runtime,
             _host: host,
             _registration_a: registration_a,
             registration_b,
+            #[cfg(test)]
             client_a,
+            #[cfg(test)]
             client_b,
             side_effects,
             b_calls,
@@ -159,10 +168,12 @@ impl NestedErrorFixture {
         self.registration_b.close().expect("remove B route");
     }
 
+    #[cfg(test)]
     pub fn call_b(&self) -> Result<Vec<u8>, Error> {
         self.client_b.call_owned("ping", &[])
     }
 
+    #[cfg(test)]
     pub fn call_a(&self) -> Result<Vec<u8>, Error> {
         self.client_a.call_owned("ping", &[])
     }

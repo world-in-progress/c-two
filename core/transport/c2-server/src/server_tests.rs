@@ -8447,7 +8447,7 @@ async fn narrow_chunks_queue_behind_first_copy_and_refund_their_bytes() {
         assert!(!queue.published);
     }
     drop(active);
-    assert_eq!(server.copy_scheduler.ready.lock().len(), 1);
+    assert_eq!(server.copy_scheduler.ready_len(), 1);
     assert_eq!(
         server.domain_snapshot().memory.used_bytes,
         (payload.len() * (PENDING_FRAME_OVERHEAD + 1)) as u64
@@ -8706,4 +8706,132 @@ async fn exhausted_frame_budget_retires_input_and_discards_late_continuations() 
     drop(hold);
     drop(client);
     handler.await.unwrap();
+}
+
+#[tokio::test]
+async fn cancelling_run_task_alone_preserves_accepted_chunked_call() {
+    let server = Arc::new(
+        test_server_new(
+            &unique_readiness_address("cancel_run_chunked"),
+            ServerIpcConfig::default(),
+        )
+        .unwrap(),
+    );
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut route = make_host_route(&server, "grid");
+    route.callback = Arc::new(EchoRequestBytes {
+        calls: calls.clone(),
+    });
+    server.register_route(route).await.unwrap();
+    let running = Arc::clone(&server);
+    let runner = tokio::spawn(async move { running.run().await });
+    server
+        .wait_until_ready(Duration::from_secs(2))
+        .await
+        .unwrap();
+    let mut peer = LocalStream::connect(server.local_endpoint(), DEFAULT_CONNECT_TIMEOUT)
+        .await
+        .unwrap();
+    handshake_test_client(&mut peer).await;
+
+    let permits = server.copy_permits.available_permits() as u32;
+    let hold = server
+        .copy_permits
+        .clone()
+        .acquire_many_owned(permits)
+        .await
+        .unwrap();
+    peer.write_all(&chunked_call_frame(1, 0, 2, b"abcd", "grid"))
+        .await
+        .unwrap();
+    peer.write_all(&chunked_call_frame(1, 1, 2, b"EFGH", "grid"))
+        .await
+        .unwrap();
+    peer.write_all(&encode_frame(
+        9,
+        FLAG_SIGNAL,
+        &c2_wire::msg_type::PING_BYTES,
+    ))
+    .await
+    .unwrap();
+    assert_eq!(read_reply_frame(&mut peer).await.0, 9);
+    assert_eq!(server.copy_scheduler.ready_len(), 1);
+
+    // Cancel ONLY the accept loop while the executor and accepted connection
+    // stay alive; the connection's scope must keep `copy_coordinator` running.
+    runner.abort();
+    let _ = runner.await;
+    assert!(server.copy_scheduler.is_coordinator_running());
+
+    drop(hold);
+    let (id, _, reply) = read_reply_frame(&mut peer).await;
+    assert_eq!(id, 1);
+    assert_call_end_status(&reply, CallStatus::Success);
+    assert_eq!(&reply[2..], b"abcdEFGH");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+    drop(peer);
+    wait_until("coordinator exits after last connection closes", || {
+        !server.copy_scheduler.is_coordinator_running()
+    })
+    .await;
+}
+
+#[test]
+fn executor_shutdown_with_retained_server_arc_closes_accepted_connection() {
+    let server_rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("server runtime");
+    let client_rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("client runtime");
+
+    let server = server_rt.block_on(async {
+        let server = Arc::new(
+            test_server_new(
+                &unique_readiness_address("executor_teardown"),
+                ServerIpcConfig::default(),
+            )
+            .unwrap(),
+        );
+        server
+            .register_route(make_host_route(&server, "grid"))
+            .await
+            .unwrap();
+        let running = Arc::clone(&server);
+        tokio::spawn(async move { running.run().await });
+        server
+            .wait_until_ready(Duration::from_secs(2))
+            .await
+            .unwrap();
+        server
+    });
+
+    let mut peer = client_rt.block_on(async {
+        let mut peer = LocalStream::connect(server.local_endpoint(), DEFAULT_CONNECT_TIMEOUT)
+            .await
+            .unwrap();
+        handshake_test_client(&mut peer).await;
+        peer
+    });
+
+    // Retain `Arc<Server>` on this stack while tearing down the server executor.
+    server_rt.shutdown_background();
+
+    client_rt.block_on(async {
+        use tokio::io::AsyncReadExt as _;
+        let mut buf = [0u8; 1];
+        let read = tokio::time::timeout(Duration::from_secs(2), peer.read(&mut buf))
+            .await
+            .expect("accepted connection must close promptly when executor shuts down");
+        assert!(matches!(read, Ok(0) | Err(_)), "unexpected read: {read:?}");
+        wait_until(
+            "executor background teardown drops all server tasks",
+            || !server.copy_scheduler.is_coordinator_running() && Arc::strong_count(&server) == 1,
+        )
+        .await;
+    });
 }

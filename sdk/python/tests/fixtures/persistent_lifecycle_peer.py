@@ -9,6 +9,7 @@ import signal
 import subprocess
 import sys
 import threading
+import time
 
 import c_two as cc
 import c_two.endpoint
@@ -64,9 +65,13 @@ def serve(route: str, server_id: str, anchor: str, journal: str) -> None:
                 print(json.dumps({"registered": True, "identity": identity}), flush=True)
             elif operation == "stop":
                 resource.release.set()
+                stop_deadline = time.monotonic() + 10.0
                 outcome = runtime.shutdown(timeout=10)
                 if outcome["completed"]:
-                    events.wait_closed_all("server")
+                    events.wait_closed_all(
+                        "server",
+                        timeout=max(0.0, stop_deadline - time.monotonic()),
+                    )
                 else:
                     events.drain()
                 print(json.dumps({"shutdown": outcome, "calls": resource.snapshot(),

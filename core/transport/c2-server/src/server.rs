@@ -299,11 +299,6 @@ pub struct Server {
     encoding_permits: Arc<Semaphore>,
     /// Round-robin state for C-gated per-request chunk copies.
     copy_scheduler: Arc<CopyScheduler>,
-    /// Shared weak handle so unit tests driving `handle_connection` directly
-    /// without `run_inner` still share at most one coordinator while retaining
-    /// zero strong `JoinHandle` ownership on `Server`.
-    #[cfg(test)]
-    direct_test_coordinator: parking_lot::Mutex<std::sync::Weak<AbortOnDrop>>,
     /// Per-connection control-reply slot budget `Q_ctrl = clamp(N, 1, 64)`.
     control_reply_capacity: usize,
     active_connections: parking_lot::Mutex<HashMap<u64, Arc<Connection>>>,
@@ -569,8 +564,6 @@ impl Server {
             copy_permits,
             encoding_permits,
             copy_scheduler: Arc::new(CopyScheduler::new()),
-            #[cfg(test)]
-            direct_test_coordinator: parking_lot::Mutex::new(std::sync::Weak::new()),
             control_reply_capacity,
             active_connections: parking_lot::Mutex::new(HashMap::new()),
             active_connections_notify: Notify::new(),
@@ -1575,18 +1568,13 @@ impl Server {
         let mut shutdown_rx = self.shutdown_tx.subscribe();
         let (shutdown_done_tx, mut shutdown_done_rx) = mpsc::unbounded_channel();
         let mut shutdown_close_started = false;
-        // C-gated round-robin copies of inbound chunk frames. It outlives the
-        // accept loop's business drain so accepted chunked calls still finish;
-        // at terminal shutdown the coordinator itself is aborted (its spawned
-        // frame workers finish on their own). The guard keeps the handle local
-        // to `run_inner`: `Server` itself must not store a `JoinHandle`, which
-        // would keep a cancelled executor's task state — and with it Windows
-        // IOCP bookkeeping for accepted pipes — alive until the server drops.
-        let mut copy_coordinator_guard = AbortOnDrop(tokio::spawn(copy_coordinator(
-            Arc::downgrade(self),
-            self.copy_scheduler.clone(),
-            self.copy_permits.clone(),
-        )));
+        // C-gated round-robin copies of inbound chunk frames. Both `run_inner`
+        // and each polled `handle_connection` hold a `CopyCoordinatorScope` so
+        // cancelling `run` alone never strands accepted chunked calls, while
+        // `Server` itself retains zero `JoinHandle` (which would pin a
+        // cancelled executor's task and Windows Named Pipe IOCP state until
+        // `Server` drops).
+        let mut copy_coordinator_scope = Some(CopyCoordinatorScope::enter(self));
         let mut listener = Some(listener);
         loop {
             tokio::select! {
@@ -1638,9 +1626,7 @@ impl Server {
                         // business shutdown does not wait for their loans.
                         drop(gc_handle);
                     }
-                    copy_coordinator_guard.0.abort();
-                    let _ = (&mut copy_coordinator_guard.0).await;
-                    self.copy_scheduler.ready.lock().clear();
+                    drop(copy_coordinator_scope.take());
                     match listener_result {
                         Ok(()) => self.set_lifecycle_state(ServerLifecycleState::Stopped),
                         Err(error) => {
@@ -2117,28 +2103,11 @@ fn handle_connection(
         writer_task: None,
     };
     async move {
+        // Declared before `registration` so `RegisteredConnection::drop`
+        // retires calls and removes queued keys before the last scope drops.
+        let _copy_coordinator_scope = CopyCoordinatorScope::enter(&registration.server);
         let mut registration = registration;
         let server = Arc::clone(&registration.server);
-        // Direct unit-test callers drive connections without `run_inner`;
-        // share one coordinator across active test connections via a weak slot
-        // so `CopyScheduler` stays single-consumer while `Server` never holds
-        // a strong `JoinHandle`. `run_inner`-driven connections skip this —
-        // their coordinator is owned by the run loop's local guard.
-        #[cfg(test)]
-        let _copy_coordinator_guard = (!server.run_entered.load(Ordering::Acquire)).then(|| {
-            let mut slot = server.direct_test_coordinator.lock();
-            if let Some(existing) = slot.upgrade() {
-                existing
-            } else {
-                let guard = Arc::new(AbortOnDrop(tokio::spawn(copy_coordinator(
-                    Arc::downgrade(&server),
-                    server.copy_scheduler.clone(),
-                    server.copy_permits.clone(),
-                ))));
-                *slot = Arc::downgrade(&guard);
-                guard
-            }
-        });
         let conn = Arc::clone(&registration.conn);
         let stream = registration
             .stream
@@ -3013,30 +2982,44 @@ impl OwnedRequestInput {
     }
 }
 
-/// Server-wide round-robin queue of requests with copyable frames.
+struct CopySchedulerState {
+    ready: VecDeque<((u64, u64), std::sync::Weak<Connection>)>,
+    active_scopes: usize,
+    coordinator_running: bool,
+}
+
+/// Server-wide round-robin queue of requests with copyable frames, paired with
+/// single-consumer coordinator lifecycle state.
 pub(crate) struct CopyScheduler {
-    ready: parking_lot::Mutex<VecDeque<((u64, u64), std::sync::Weak<Connection>)>>,
-    notify: Notify,
+    state: parking_lot::Mutex<CopySchedulerState>,
+    work_notify: Notify,
+    scope_notify: Notify,
 }
 
 impl CopyScheduler {
     fn new() -> Self {
         Self {
-            ready: parking_lot::Mutex::new(VecDeque::new()),
-            notify: Notify::new(),
+            state: parking_lot::Mutex::new(CopySchedulerState {
+                ready: VecDeque::new(),
+                active_scopes: 0,
+                coordinator_running: false,
+            }),
+            work_notify: Notify::new(),
+            scope_notify: Notify::new(),
         }
     }
 
     fn push_back(&self, conn: &Arc<Connection>, request_id: u64) {
-        self.ready
+        self.state
             .lock()
+            .ready
             .push_back(((conn.conn_id(), request_id), Arc::downgrade(conn)));
-        self.notify.notify_one();
+        self.work_notify.notify_one();
     }
 
     fn pop_front(&self) -> Option<(Arc<Connection>, u64)> {
-        let mut ready = self.ready.lock();
-        while let Some(((_, id), conn)) = ready.pop_front() {
+        let mut state = self.state.lock();
+        while let Some(((_, id), conn)) = state.ready.pop_front() {
             if let Some(conn) = conn.upgrade() {
                 return Some((conn, id));
             }
@@ -3045,26 +3028,81 @@ impl CopyScheduler {
     }
 
     fn remove(&self, key: (u64, u64)) {
-        self.ready.lock().retain(|(queued, _)| *queued != key);
+        self.state.lock().ready.retain(|(queued, _)| *queued != key);
     }
 
+    #[cfg(test)]
     fn is_empty(&self) -> bool {
-        self.ready.lock().is_empty()
+        self.state.lock().ready.is_empty()
+    }
+
+    #[cfg(test)]
+    fn ready_len(&self) -> usize {
+        self.state.lock().ready.len()
+    }
+
+    #[cfg(test)]
+    fn is_coordinator_running(&self) -> bool {
+        self.state.lock().coordinator_running
     }
 }
 
-/// Aborts the spawned copy-coordinator task when the guard drops.
-///
-/// The guard is held by `run_inner` (or, in direct `handle_connection` unit
-/// tests, by the connection future), never by `Server`: a `JoinHandle` stored
-/// on the server object would outlive a cancelled executor and keep the task,
-/// its waker-owned scheduler slot and the Windows IOCP completion bookkeeping
-/// for accepted named pipes referenced until the server itself drops.
-struct AbortOnDrop(tokio::task::JoinHandle<()>);
+/// Scope token held by `Server::run_inner` and every polled `handle_connection`
+/// future. Keeps the single `copy_coordinator` task alive while any accept loop
+/// or active connection can still receive or finish chunked frames, without
+/// storing a `JoinHandle` on `Server` (which would outlive a cancelled executor
+/// and keep Windows IOCP completion bookkeeping for accepted named pipes alive
+/// until `Server` drops).
+struct CopyCoordinatorScope {
+    scheduler: Arc<CopyScheduler>,
+}
 
-impl Drop for AbortOnDrop {
+impl CopyCoordinatorScope {
+    fn enter(server: &Arc<Server>) -> Self {
+        let should_spawn = {
+            let mut state = server.copy_scheduler.state.lock();
+            state.active_scopes += 1;
+            if state.coordinator_running {
+                false
+            } else {
+                state.coordinator_running = true;
+                true
+            }
+        };
+        if should_spawn {
+            tokio::spawn(copy_coordinator(
+                Arc::downgrade(server),
+                server.copy_scheduler.clone(),
+                server.copy_permits.clone(),
+            ));
+        }
+        Self {
+            scheduler: server.copy_scheduler.clone(),
+        }
+    }
+}
+
+impl Drop for CopyCoordinatorScope {
     fn drop(&mut self) {
-        self.0.abort();
+        let last_scope = {
+            let mut state = self.scheduler.state.lock();
+            state.active_scopes -= 1;
+            state.active_scopes == 0
+        };
+        if last_scope {
+            self.scheduler.scope_notify.notify_waiters();
+        }
+    }
+}
+
+struct CoordinatorRunningGuard {
+    scheduler: Arc<CopyScheduler>,
+}
+
+impl Drop for CoordinatorRunningGuard {
+    fn drop(&mut self) {
+        // Clears `coordinator_running` if the executor cancels this task.
+        self.scheduler.state.lock().coordinator_running = false;
     }
 }
 
@@ -4243,14 +4281,49 @@ async fn copy_coordinator(
     scheduler: Arc<CopyScheduler>,
     permits: Arc<Semaphore>,
 ) {
+    let running_guard = CoordinatorRunningGuard {
+        scheduler: scheduler.clone(),
+    };
     loop {
-        let notified = scheduler.notify.notified();
-        if scheduler.is_empty() {
-            notified.await;
+        let work_notified = scheduler.work_notify.notified();
+        tokio::pin!(work_notified);
+        work_notified.as_mut().enable();
+        let scope_notified = scheduler.scope_notify.notified();
+        tokio::pin!(scope_notified);
+        scope_notified.as_mut().enable();
+
+        let has_ready = {
+            let mut state = scheduler.state.lock();
+            while state
+                .ready
+                .front()
+                .is_some_and(|(_, conn)| conn.strong_count() == 0)
+            {
+                state.ready.pop_front();
+            }
+            if state.active_scopes == 0 {
+                state.ready.clear();
+                state.coordinator_running = false;
+                std::mem::forget(running_guard);
+                return;
+            }
+            !state.ready.is_empty()
+        };
+
+        if !has_ready {
+            tokio::select! {
+                _ = &mut work_notified => {}
+                _ = &mut scope_notified => {}
+            }
             continue;
         }
-        let Ok(permit) = permits.clone().acquire_owned().await else {
-            return;
+
+        let permit = tokio::select! {
+            permit = permits.clone().acquire_owned() => match permit {
+                Ok(permit) => permit,
+                Err(_) => return,
+            },
+            _ = &mut scope_notified => continue,
         };
         let Some(server) = server.upgrade() else {
             return;

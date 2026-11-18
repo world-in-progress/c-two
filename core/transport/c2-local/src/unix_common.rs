@@ -484,9 +484,10 @@ pub(crate) fn same_file(left: &libc::stat, right: &libc::stat) -> bool {
 // macOS spells the thread-local `fchdir` as `pthread_fchdir_np`. The libc
 // crate does not bind it on Apple targets, so it is declared here. The symbol
 // has no equivalent on other Unix systems, so the binding and the helper
-// below exist only on Apple targets; non-macOS binds and connects fail
-// closed with `Unsupported` in their own entry points instead of routing
-// through a per-thread directory here.
+// below exist only on Apple targets; Linux binds and connects through
+// `/proc/self/fd/<fd>`, and other Unix targets fail closed with `Unsupported`
+// in their own entry points instead of routing through a per-thread directory
+// here.
 //
 // `pthread_fchdir_np` changes only the calling thread's working directory; the
 // process-wide directory of every other thread is untouched. Callers must
