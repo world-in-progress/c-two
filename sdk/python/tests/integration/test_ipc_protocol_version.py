@@ -5,7 +5,6 @@ import pickle
 import pytest
 import c_two as cc
 import c_two.endpoint
-from c_two.config.settings import settings
 from c_two.error import CoreError, ProtocolViolation
 from c_two.transport.registry import _reset_default_runtime
 from tests.fixtures.ipc_version_peer import ipc_version_peer_binary, running_version_peer
@@ -20,14 +19,11 @@ class VersionContract:
 
 @pytest.fixture(autouse=True)
 def _clean_runtime():
-    previous = settings._relay_anchor_address
     _reset_default_runtime()
-    settings.relay_anchor_address = None
     try:
         yield
     finally:
         _reset_default_runtime()
-        settings._relay_anchor_address = previous
 
 
 @pytest.mark.parametrize(("reply", "peer_version"), [

@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { pathToFileURL } from 'node:url';
 
-import { createNodeIpcConnector } from '@c-two/c2-mem-ffi';
+import { captureLocalIpcEndpointContext, createNodeIpcConnector } from '@c-two/c2-mem-ffi';
 import {
   BuildPolicy,
   Builder,
@@ -51,12 +51,18 @@ function transportFor(responsePayloadAllocator) {
     });
   }
   if (config.mode === 'relay-aware-local-ipc') {
-    return contract.createRelayAwareHttpEncodedTransport(config.endpoint, {
-      observe,
-      ipc: localIpcOptions(responsePayloadAllocator),
-      responsePayloadAllocator,
-      responsePayloadUnknownLengthStrategy: 'buffer',
-    });
+    const context = captureLocalIpcEndpointContext();
+    try {
+      return contract.createRelayAwareHttpEncodedTransport(config.endpoint, {
+        observe,
+        headers: { 'x-c2-local-namespace': context.namespaceId() },
+        ipc: localIpcOptions(responsePayloadAllocator),
+        responsePayloadAllocator,
+        responsePayloadUnknownLengthStrategy: 'buffer',
+      });
+    } finally {
+      context.close();
+    }
   }
   if (config.mode === 'relay-aware-http') {
     return contract.createRelayAwareHttpEncodedTransport(config.endpoint, {

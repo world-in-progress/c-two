@@ -158,7 +158,6 @@ def test_native_local_zero_validation_runs_no_python_callback():
 def test_registry_projects_budget_with_full_expected_contract(timeout, address, method, monkeypatch):
     registry = Runtime()
     captured = []
-    sync_attempts = []
     attempts = []
     native_attempt = _native.ConnectAttempt
 
@@ -177,9 +176,6 @@ def test_registry_projects_budget_with_full_expected_contract(timeout, address, 
         def local_copy_tracker(self):
             return None
 
-        def set_relay_anchor_address(self, address, *, connect_attempt=None):
-            sync_attempts.append(connect_attempt)
-
         def __getattr__(self, name):
             assert name == method
 
@@ -196,7 +192,6 @@ def test_registry_projects_budget_with_full_expected_contract(timeout, address, 
         args = (address, *args)
     assert len(attempts) == 1
     assert captured == [(args, {'connect_attempt': attempts[0]})]
-    assert sync_attempts == ([attempts[0]] if method == 'connect_via_relay' else [])
 
 
 def test_relay_connect_preserves_unmapped_native_exception(monkeypatch):
@@ -206,9 +201,6 @@ def test_relay_connect_preserves_unmapped_native_exception(monkeypatch):
     class Session:
         def local_copy_tracker(self):
             return None
-
-        def set_relay_anchor_address(self, address, *, connect_attempt=None):
-            pass
 
         def connect_via_relay(self, *args, **kwargs):
             raise marker
@@ -349,9 +341,6 @@ def test_connect_snapshots_session_once_for_relay_projection(monkeypatch):
             registry._runtime_session = ReplacedSession()
             return None
 
-        def set_relay_anchor_address(self, address, *, connect_attempt=None):
-            observed.append(connect_attempt)
-
         def connect_via_relay(self, *args, connect_attempt=None):
             observed.append(connect_attempt)
             raise marker
@@ -361,8 +350,8 @@ def test_connect_snapshots_session_once_for_relay_projection(monkeypatch):
     with pytest.raises(cc.error.CoreError, match='projection reached') as failure:
         registry.connect(ConnectContract, name='connect-timeout', timeout=0.5)
     assert failure.value is marker
-    assert len(observed) == 2
-    assert observed[0] is observed[1]
+    assert len(observed) == 1
+    assert observed[0] is not None
 
 
 def test_zero_budget_expires_before_singleton_lookup(monkeypatch):
@@ -433,25 +422,3 @@ def test_expiry_after_python_lock_acquisition_releases_only_new_acquisition():
     assert failure.value.details['stage'] == 'registry_snapshot_wait'
     assert released == [True]
     assert not lock.locked()
-
-
-def test_relay_override_deadline_keeps_canonical_error_before_registry_wrapping():
-    registry = Runtime()
-
-    class Session:
-        def local_copy_tracker(self):
-            return None
-
-        def set_relay_anchor_address(self, address, *, connect_attempt=None):
-            time.sleep(0.06)
-            connect_attempt.check('relay_override_wait')
-
-        def connect_via_relay(self, *args, **kwargs):
-            raise AssertionError('expired override reached relay discovery')
-
-    registry._runtime_session = Session()
-    with pytest.raises(cc.error.CallDeadlineExceeded) as failure:
-        registry.connect(ConnectContract, name='connect-timeout', timeout=0.05)
-    assert failure.value.details['operation'] == 'connect'
-    assert failure.value.details['transport_phase'] == 'pre_dispatch'
-    assert failure.value.details['stage'] == 'relay_override_wait'

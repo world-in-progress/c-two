@@ -22,10 +22,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import c_two as cc
 import _relay_support as relay
 from c_two.crm.contract import CRMContract, crm_contract
-from c_two.transport.registry import _reset_default_runtime
 from tests.fixtures.hello import HelloImpl
 from tests.fixtures.ihello import Hello
 
@@ -86,17 +84,16 @@ def cleanup_stale():
 
 def main():
     cleanup_stale()
-    _reset_default_runtime()
     relay_url = f'http://127.0.0.1:{RELAY_PORT}'
     route_name = f'hello_bench_{os.getpid()}'
 
     try:
-        with relay.session(relay_url):
+        with relay.session(relay_url) as runtime:
             with open(PAYLOAD_FILE, 'wb') as f:
                 f.write(pickle.dumps('Benchmark'))
             try:
-                cc.register(Hello, HelloImpl(), name=route_name)
-                with cc.connect(Hello, name=route_name, address=relay_url):
+                runtime.register(Hello, HelloImpl(), name=route_name)
+                with runtime.connect(Hello, name=route_name, address=relay_url):
                     expected = crm_contract(Hello)
                     expected_header_args = _route_hey_args(expected)
 

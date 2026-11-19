@@ -9,6 +9,5 @@ from .descriptor import (
     release_ref,
 )
 from .methods import rpc_method_names
-from .template import generate_crm_template
 from .payload_plan import DEFAULT_PICKLE_PROTOCOL
 from .transferable import hold, transfer, HeldResult

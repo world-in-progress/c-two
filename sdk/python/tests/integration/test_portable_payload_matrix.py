@@ -14,7 +14,6 @@ import c_two as cc
 import c_two.observe
 
 import c_two.contract
-from c_two.config.settings import settings
 from c_two.error import (
     ContractMismatch,
     ResourceNotFound,
@@ -73,12 +72,9 @@ def matrix_artifacts() -> Iterator[MatrixArtifacts]:
 
 @pytest.fixture(autouse=True)
 def _clean_python_runtime() -> Iterator[None]:
-    previous_relay = settings._relay_anchor_address  # noqa: SLF001
     _reset_default_runtime()
-    settings.relay_anchor_address = None
     yield
     _reset_default_runtime()
-    settings._relay_anchor_address = previous_relay  # noqa: SLF001
 
 
 def _route_name(row_id: str) -> str:

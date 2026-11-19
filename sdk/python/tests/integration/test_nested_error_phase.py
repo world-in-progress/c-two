@@ -13,7 +13,6 @@ import pytest
 import c_two as cc
 import c_two.contract
 import c_two.endpoint
-from c_two.config.settings import settings
 from c_two.error import ResourceRemoved
 from c_two.transport.registry import _reset_default_runtime
 from tests.fixtures.process_control import readline_with_timeout
@@ -23,7 +22,7 @@ REPOSITORY = Path(__file__).resolve().parents[4]
 DESCRIPTOR = REPOSITORY / 'tests/fixtures/contracts/portable-no-payload.contract.json'
 RUST_FIXTURE = REPOSITORY / 'sdk/rust/tests/fixtures/nested_error_phase.rs'
 RUST_MAIN = REPOSITORY / 'sdk/python/tests/fixtures/nested_error_phase_rust.rs'
-TARGET_DIR = REPOSITORY / 'core/target'
+TARGET_DIR = REPOSITORY / os.environ.get('CARGO_TARGET_DIR', 'core/target')
 
 pytestmark = pytest.mark.timeout(300)
 
@@ -67,9 +66,7 @@ def test_python_consumer_does_not_inherit_nested_pre_dispatch(
     assert json.loads(cc.contract.export_descriptor(PortableNoPayload)) == json.loads(
         DESCRIPTOR.read_text(encoding='utf-8')
     )
-    previous_relay = settings._relay_anchor_address  # noqa: SLF001
     _reset_default_runtime()
-    settings.relay_anchor_address = None
     counts = None
     try:
         with tempfile.TemporaryDirectory(prefix='c2-ne-', dir=None if os.name == 'nt' else '/tmp') as root:
@@ -117,5 +114,4 @@ def test_python_consumer_does_not_inherit_nested_pre_dispatch(
                 counts = tuple(map(int, lines[0].split()[1:]))
     finally:
         _reset_default_runtime()
-        settings._relay_anchor_address = previous_relay  # noqa: SLF001
     assert counts == (1, 0), 'A executed once and B never entered its callback'

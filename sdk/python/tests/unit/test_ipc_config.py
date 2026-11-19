@@ -10,7 +10,6 @@ import c_two as cc
 from c_two import _native
 
 import c_two.endpoint
-from c_two.config.settings import settings
 from c_two.error import ResourceNotFound
 from c_two.transport import Server
 from c_two.transport.registry import _get_default_runtime, _reset_default_runtime
@@ -28,11 +27,10 @@ class UnitConfigCRM:
 
 
 @pytest.fixture(autouse=True)
-def _reset_registry_and_settings(monkeypatch):
+def _reset_registry_and_env(monkeypatch):
     _reset_default_runtime()
     monkeypatch.setenv('C2_ENV_FILE', '')
     monkeypatch.setenv('C2_RELAY_ANCHOR_ADDRESS', '')
-    monkeypatch.setattr(settings, '_relay_anchor_address', None)
     yield
     _reset_default_runtime()
 
@@ -86,6 +84,7 @@ class _FakeRuntimeSession:
     paths and invents no default execution policy.
     """
 
+    relay_anchor_address_override = None
     client_config_frozen = False
     server_id = None
     server_id_override = None
@@ -133,9 +132,8 @@ class _FakeRuntimeSession:
         self._limits = previous._limits
         self.adopted_observations.append(_FakeRetiredObservation())
 
-    def set_relay_anchor_address(self, relay_address: str | None, *, connect_attempt=None) -> None:
+    def set_relay_anchor_address(self, relay_address: str | None) -> None:
         self.relay_anchor_address_override = relay_address
-        self.connect_attempt = connect_attempt
 
     def local_copy_tracker(self):
         return None
@@ -157,7 +155,6 @@ def test_relay_resolved_connect_delegates_route_validation_to_runtime_session(mo
             *,
             connect_attempt,
         ):
-            assert connect_attempt is self.connect_attempt
             calls.append((
                 self.relay_anchor_address_override,
                 route_name,
@@ -174,8 +171,8 @@ def test_relay_resolved_connect_delegates_route_validation_to_runtime_session(mo
             pass
 
     with monkeypatch.context() as patch:
-        patch.setattr(settings, 'relay_anchor_address', 'http://registry-relay.test')
         patch.setattr(registry, '_runtime_session', FakeRuntimeSession())
+        registry.set_relay_anchor('http://registry-relay.test')
 
         crm = registry.connect(IUnitConfigCRM, name='unit-route')
 
@@ -216,7 +213,7 @@ def test_route_spy_shutdown_preserves_native_context_and_accepted_limits(monkeyp
 
 def test_relay_resolved_connect_uses_native_session_not_python_relay_client():
     registry = _get_default_runtime()
-    settings.relay_anchor_address = 'http://registry-relay.test'
+    registry.set_relay_anchor('http://registry-relay.test')
 
     with pytest.raises(Exception):
         registry.connect(IUnitConfigCRM, name='unit-route')
@@ -263,14 +260,13 @@ def test_relay_resolved_connect_maps_native_404_to_resource_not_found(monkeypatc
             *,
             connect_attempt,
         ):  # noqa: ARG002
-            assert connect_attempt is self.connect_attempt
             err = RuntimeError('HTTP 404')
             err.status_code = 404
             raise err
 
     with monkeypatch.context() as patch:
-        patch.setattr(settings, 'relay_anchor_address', 'http://registry-relay.test')
         patch.setattr(registry, '_runtime_session', FakeRuntimeSession())
+        registry.set_relay_anchor('http://registry-relay.test')
 
         with pytest.raises(ResourceNotFound, match="Resource 'unit-route' not found"):
             registry.connect(IUnitConfigCRM, name='unit-route')
@@ -319,14 +315,14 @@ def test_relay_settings_do_not_resolve_ipc_env(monkeypatch):
     monkeypatch.setenv('C2_RELAY_ANCHOR_ADDRESS', 'http://127.0.0.1:8080')
     monkeypatch.setenv('C2_MEMORY_BUDGET_BYTES', 'not-a-number')
 
-    assert settings.relay_anchor_address == 'http://127.0.0.1:8080'
+    assert _native.resolve_relay_anchor_address() == 'http://127.0.0.1:8080'
 
 
 def test_relay_anchor_address_resolution_ignores_relay_proxy_policy(monkeypatch):
     monkeypatch.setenv('C2_RELAY_ANCHOR_ADDRESS', 'http://127.0.0.1:8080')
     monkeypatch.setenv('C2_RELAY_USE_PROXY', 'not-a-bool')
 
-    assert settings.relay_anchor_address == 'http://127.0.0.1:8080'
+    assert _native.resolve_relay_anchor_address() == 'http://127.0.0.1:8080'
 
 
 def test_public_relay_anchor_api_replaces_set_relay():

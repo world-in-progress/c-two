@@ -3,9 +3,10 @@ from __future__ import annotations
 
 
 def resolved_relay_url(default: str | None = None) -> str | None:
-    from c_two.config.settings import settings
+    from c_two._native import resolve_relay_anchor_address
 
-    return settings.relay_anchor_address or default
+    address = resolve_relay_anchor_address()
+    return default if address is None else address
 
 
 def ensure_http_relay_url(value: str | None) -> str:

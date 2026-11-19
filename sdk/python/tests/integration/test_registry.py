@@ -15,7 +15,6 @@ import time
 import pytest
 
 import c_two as cc
-from c_two.config.settings import settings
 from c_two.error import ContractMismatch, ResourceAlreadyRegistered, ResourceRemoved
 from c_two.transport.registry import Runtime, _get_default_runtime, _reset_default_runtime
 from c_two.transport.client.proxy import CRMProxy
@@ -86,19 +85,13 @@ class DirectErrorImpl:
 
 @pytest.fixture(autouse=True)
 def _clean_registry(monkeypatch):
-    """Keep the singleton and code relay override local to each test.
-
-    Tests that need a relay set it explicitly. Scoped restoration still runs
-    if native teardown raises, so a failed test cannot export its code override
-    to the next file on the same worker.
-    """
-    with monkeypatch.context() as patch:
-        patch.setattr(settings, 'relay_anchor_address', None)
+    monkeypatch.setenv('C2_ENV_FILE', '')
+    monkeypatch.setenv('C2_RELAY_ANCHOR_ADDRESS', '')
+    _reset_default_runtime()
+    try:
+        yield
+    finally:
         _reset_default_runtime()
-        try:
-            yield
-        finally:
-            _reset_default_runtime()
 
 
 # ------------------------------------------------------------------
@@ -824,44 +817,62 @@ class TestErrors:
 
     def test_unreachable_relay_registration_rolls_back_local_registration(self):
         registry = _get_default_runtime()
-        previous_relay = settings.relay_anchor_address
-        try:
-            registry.set_relay_anchor('http://127.0.0.1:9')
-            with pytest.raises(Exception, match='relay_prepare'):
-                registry.register(Hello, HelloImpl(), name='hello')
+        registry.set_relay_anchor('http://127.0.0.1:9')
+        with pytest.raises(Exception, match='relay_prepare'):
+            registry.register(Hello, HelloImpl(), name='hello')
 
-            assert 'hello' not in registry.names
-            assert registry.server_address() is None
-            assert registry.server_id() is None
-        finally:
-            settings.relay_anchor_address = previous_relay
+        assert 'hello' not in registry.names
+        assert registry.server_address() is None
+        assert registry.server_id() is None
 
     def test_failed_relay_registration_leaves_existing_route_usable(
         self,
         start_c3_relay,
     ):
         registry = _get_default_runtime()
-        previous_relay = settings.relay_anchor_address
         relay = start_c3_relay()
-        try:
-            registry.set_relay_anchor(relay.url)
-            cc.register(Hello, HelloImpl(), name='hello')
-            relay.stop()
-            with pytest.raises(Exception, match='relay_prepare'):
-                registry.register(Counter, CounterImpl(), name='counter')
+        registry.set_relay_anchor(relay.url)
+        cc.register(Hello, HelloImpl(), name='hello')
+        relay.stop()
+        with pytest.raises(Exception, match='relay_prepare'):
+            registry.register(Counter, CounterImpl(), name='counter')
 
-            assert registry.names == ['hello']
-            crm = cc.connect(Hello, name='hello')
-            try:
-                assert crm.greeting('Z') == 'Hello, Z!'
-            finally:
-                cc.close(crm)
+        assert registry.names == ['hello']
+        crm = cc.connect(Hello, name='hello')
+        try:
+            assert crm.greeting('Z') == 'Hello, Z!'
         finally:
-            settings.relay_anchor_address = previous_relay
+            cc.close(crm)
+
+    def test_clear_relay_anchor_restores_environment_and_env_file(
+        self, start_c3_relay, monkeypatch, tmp_path,
+    ):
+        relay = start_c3_relay()
+        registrar = Runtime()
+        registrar.set_relay_anchor(relay.url)
+        try:
+            registrar.register(Hello, HelloImpl(), name='hello')
+            env_file = tmp_path / 'relay.env'
+            env_file.write_text(f'C2_RELAY_ANCHOR_ADDRESS={relay.url}\n', encoding='utf-8')
+            monkeypatch.setenv('C2_ENV_FILE', str(env_file))
+            monkeypatch.setenv('C2_RELAY_ANCHOR_ADDRESS', 'http://127.0.0.1:9')
+            cc.set_relay_anchor('http://127.0.0.1:8')
+            cc.set_relay_anchor(None)
+            assert _get_default_runtime()._runtime_session.relay_anchor_address_override is None
+
+            monkeypatch.setenv('C2_RELAY_ANCHOR_ADDRESS', relay.url)
+            with cc.connect(Hello, name='hello') as crm:
+                assert crm.greeting('Environment') == 'Hello, Environment!'
+
+            assert cc.shutdown()['completed']
+            monkeypatch.delenv('C2_RELAY_ANCHOR_ADDRESS')
+            with cc.connect(Hello, name='hello') as crm:
+                assert crm.greeting('File') == 'Hello, File!'
+        finally:
+            registrar.shutdown()
 
     def test_set_relay_anchor_updates_native_relay_projection_without_python_cache(self):
         registry = Runtime()
-        previous_relay = settings.relay_anchor_address
 
         try:
             registry.set_relay_anchor('http://relay-b.test/')
@@ -871,7 +882,6 @@ class TestErrors:
             assert not hasattr(registry, '_relay_control_address')
         finally:
             registry.shutdown()
-            settings.relay_anchor_address = previous_relay
 
     def test_relay_rejects_duplicate_name_from_second_registry(self, start_c3_relay):
         relay = start_c3_relay()
@@ -879,7 +889,6 @@ class TestErrors:
 
         first = Runtime()
         second = Runtime()
-        previous_relay = settings.relay_anchor_address
         try:
             first.set_relay_anchor(relay_url)
             second.set_relay_anchor(relay_url)
@@ -894,4 +903,3 @@ class TestErrors:
         finally:
             second.shutdown()
             first.shutdown()
-            settings.relay_anchor_address = previous_relay

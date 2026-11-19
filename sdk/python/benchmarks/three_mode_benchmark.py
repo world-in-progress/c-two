@@ -186,18 +186,17 @@ def bench_ipc(payload_size: int) -> float:
 def bench_relay(payload_size: int) -> float | None:
     global _ipc_counter
     _ipc_counter += 1
-    _reset_default_runtime()
     relay_url = f'http://127.0.0.1:{_relay_port}'
     route_name = f'echo_relay_{os.getpid()}_{_ipc_counter}'
 
-    with relay.session(relay_url):
-        cc.set_server(memory_budget_bytes=_MEMORY_BUDGET_BYTES)
-        cc.set_client(memory_budget_bytes=_MEMORY_BUDGET_BYTES)
-        cc.register(Echo, EchoImpl(), name=route_name)
+    with relay.session(relay_url) as runtime:
+        runtime.set_server(memory_budget_bytes=_MEMORY_BUDGET_BYTES)
+        runtime.set_client(memory_budget_bytes=_MEMORY_BUDGET_BYTES)
+        runtime.register(Echo, EchoImpl(), name=route_name)
 
         payload = b'\xAB' * payload_size
         try:
-            with cc.connect(Echo, name=route_name, address=relay_url) as crm:
+            with runtime.connect(Echo, name=route_name, address=relay_url) as crm:
                 return _measure(crm, payload, _rounds(payload_size))
         except Exception as exc:
             print(f'  [relay FAILED: {exc}]', file=sys.stderr)

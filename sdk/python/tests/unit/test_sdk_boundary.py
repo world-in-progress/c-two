@@ -437,20 +437,17 @@ def test_endpoint_admin_facade_only_projects_native_context_and_actions():
 
 
 def test_explicit_ipc_connect_branch_bypasses_relay_facade():
-    source_path = (
-        Path(__file__).resolve().parents[2]
-        / "src"
-        / "c_two"
-        / "transport"
-        / "registry.py"
-    )
-    source = source_path.read_text(encoding="utf-8")
-    ipc_branch = source.split("elif address is not None:", 1)[1].split("else:", 1)[0]
+    import inspect
+
+    from c_two.transport.registry import Runtime
+
+    source = inspect.getsource(Runtime._connect)
+    after_ipc_condition = source.split("elif address is not None:", 1)[1]
+    ipc_branch = after_ipc_condition.split("\n        else:", 1)[0]
 
     assert "runtime_session.acquire_ipc_client" in ipc_branch
     assert "connect_attempt=attempt" in ipc_branch
     forbidden = [
-        "_sync_relay_override",
         "connect_via_relay",
         "connect_explicit_relay_http",
         "ResourceUnavailable",

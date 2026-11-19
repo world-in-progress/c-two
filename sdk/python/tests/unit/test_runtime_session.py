@@ -185,7 +185,7 @@ def test_failed_server_construction_does_not_publish_identity() -> None:
 def test_explicit_ipc_connect_ignores_bad_relay_after_native_identity() -> None:
     import c_two as cc
     import c_two.endpoint
-    from c_two.config import settings
+    from c_two.transport.registry import _reset_default_runtime
 
     @cc.crm(namespace='cc.test.runtime_session_bad_relay', version='0.1.0')
     class BadRelayCRM:
@@ -196,53 +196,48 @@ def test_explicit_ipc_connect_ignores_bad_relay_after_native_identity() -> None:
         def ping(self) -> str:
             return 'pong'
 
-    cc.shutdown()
-    previous = settings.relay_anchor_address
+    _reset_default_runtime()
     try:
-        settings.relay_anchor_address = None
         cc.register(BadRelayCRM, BadRelayImpl(), name='bad-relay-route')
         address = cc.server_address()
         assert address is not None
 
-        settings.relay_anchor_address = 'http://127.0.0.1:9'
-        crm = cc.connect(BadRelayCRM, name='bad-relay-route', address=address)
+        client = cc.Runtime()
+        client.set_relay_anchor('http://127.0.0.1:9')
         try:
-            assert crm.ping() == 'pong'
+            with client.connect(BadRelayCRM, name='bad-relay-route', address=address) as crm:
+                assert crm.ping() == 'pong'
         finally:
-            cc.close(crm)
+            client.shutdown()
     finally:
-        settings.relay_anchor_address = previous
-        cc.shutdown()
+        _reset_default_runtime()
 
 
 def test_name_only_connect_without_relay_ignores_bad_relay_proxy_env(monkeypatch) -> None:
     import c_two as cc
     import c_two.endpoint
-    from c_two.config import settings
+    from c_two.transport.registry import _reset_default_runtime
 
     @cc.crm(namespace='cc.test.runtime_session_no_relay_bad_proxy', version='0.1.0')
     class NoRelayBadProxyCRM:
         def ping(self) -> str:
             ...
 
-    cc.shutdown()
-    previous = settings.relay_anchor_address
+    _reset_default_runtime()
     monkeypatch.setenv('C2_ENV_FILE', '')
     monkeypatch.setenv('C2_RELAY_USE_PROXY', 'not-a-bool')
     monkeypatch.delenv('C2_RELAY_ANCHOR_ADDRESS', raising=False)
     try:
-        settings.relay_anchor_address = None
         with pytest.raises(LookupError, match='not registered locally'):
             cc.connect(NoRelayBadProxyCRM, name='missing-no-relay')
     finally:
-        settings.relay_anchor_address = previous
-        cc.shutdown()
+        _reset_default_runtime()
 
 
 def test_no_relay_register_unregister_ignores_bad_relay_proxy_env(monkeypatch) -> None:
     import c_two as cc
     import c_two.endpoint
-    from c_two.config import settings
+    from c_two.transport.registry import _reset_default_runtime
 
     @cc.crm(namespace='cc.test.runtime_session_bad_proxy_env', version='0.1.0')
     class BadProxyEnvCRM:
@@ -253,12 +248,10 @@ def test_no_relay_register_unregister_ignores_bad_relay_proxy_env(monkeypatch) -
         def ping(self) -> str:
             return 'pong'
 
-    cc.shutdown()
-    previous = settings.relay_anchor_address
+    _reset_default_runtime()
     monkeypatch.setenv('C2_ENV_FILE', '')
     monkeypatch.setenv('C2_RELAY_USE_PROXY', 'not-a-bool')
     try:
-        settings.relay_anchor_address = None
         cc.register(BadProxyEnvCRM, BadProxyEnvImpl(), name='bad-proxy-env')
         address = cc.server_address()
         assert address is not None
@@ -272,8 +265,7 @@ def test_no_relay_register_unregister_ignores_bad_relay_proxy_env(monkeypatch) -
         cc.unregister('bad-proxy-env')
         cc.shutdown()
     finally:
-        settings.relay_anchor_address = previous
-        cc.shutdown()
+        _reset_default_runtime()
 
 
 def test_shutdown_ignores_late_bad_relay_env_file_and_closes_server(
@@ -282,7 +274,7 @@ def test_shutdown_ignores_late_bad_relay_env_file_and_closes_server(
 ) -> None:
     import c_two as cc
     import c_two.endpoint
-    from c_two.config import settings
+    from c_two.transport.registry import _reset_default_runtime
 
     @cc.crm(namespace='cc.test.runtime_session_bad_shutdown_env', version='0.1.0')
     class BadShutdownEnvCRM:
@@ -293,12 +285,10 @@ def test_shutdown_ignores_late_bad_relay_env_file_and_closes_server(
         def ping(self) -> str:
             return 'pong'
 
-    cc.shutdown()
-    previous = settings.relay_anchor_address
+    _reset_default_runtime()
     bad_env_dir = tmp_path / 'env-dir'
     bad_env_dir.mkdir()
     try:
-        settings.relay_anchor_address = None
         cc.register(BadShutdownEnvCRM, BadShutdownEnvImpl(), name='bad-shutdown-env')
         assert cc.server_address() is not None
 
@@ -308,8 +298,7 @@ def test_shutdown_ignores_late_bad_relay_env_file_and_closes_server(
 
         assert cc.server_address() is None
     finally:
-        settings.relay_anchor_address = previous
-        cc.shutdown()
+        _reset_default_runtime()
 
 
 def test_shutdown_ignores_late_bad_relay_proxy_env_and_closes_server(
@@ -317,7 +306,7 @@ def test_shutdown_ignores_late_bad_relay_proxy_env_and_closes_server(
 ) -> None:
     import c_two as cc
     import c_two.endpoint
-    from c_two.config import settings
+    from c_two.transport.registry import _reset_default_runtime
 
     @cc.crm(namespace='cc.test.runtime_session_bad_shutdown_proxy', version='0.1.0')
     class BadShutdownProxyCRM:
@@ -328,23 +317,20 @@ def test_shutdown_ignores_late_bad_relay_proxy_env_and_closes_server(
         def ping(self) -> str:
             return 'pong'
 
-    cc.shutdown()
-    previous = settings.relay_anchor_address
+    _reset_default_runtime()
     try:
         monkeypatch.setenv('C2_ENV_FILE', '')
         monkeypatch.delenv('C2_RELAY_ANCHOR_ADDRESS', raising=False)
-        settings.relay_anchor_address = None
         cc.register(BadShutdownProxyCRM, BadShutdownProxyImpl(), name='bad-shutdown-proxy')
         assert cc.server_address() is not None
 
-        settings.relay_anchor_address = 'http://127.0.0.1:9'
+        monkeypatch.setenv('C2_RELAY_ANCHOR_ADDRESS', 'http://127.0.0.1:9')
         monkeypatch.setenv('C2_RELAY_USE_PROXY', 'not-a-bool')
         cc.shutdown()
 
         assert cc.server_address() is None
     finally:
-        settings.relay_anchor_address = previous
-        cc.shutdown()
+        _reset_default_runtime()
 
 
 def test_failed_first_route_registration_clears_native_identity(monkeypatch) -> None:
@@ -729,25 +715,6 @@ def test_runtime_session_exposes_no_language_owned_http_pool(monkeypatch) -> Non
     assert outcome['runtime_barrier_error'] is None
 
 
-def test_set_relay_anchor_blank_clears_native_override() -> None:
-    from c_two.config.settings import settings
-    from c_two.transport.registry import _get_default_runtime
-
-    registry = _get_default_runtime()
-    previous = settings._relay_anchor_address  # noqa: SLF001
-    try:
-        registry.set_relay_anchor('http://relay.test/')
-        assert registry._runtime_session.relay_anchor_address_override == 'http://relay.test'  # noqa: SLF001
-
-        registry.set_relay_anchor('   ')
-
-        assert settings._relay_anchor_address is None  # noqa: SLF001
-        assert registry._runtime_session.relay_anchor_address_override is None  # noqa: SLF001
-    finally:
-        settings.relay_anchor_address = previous
-        registry.shutdown()
-
-
 def test_registry_restores_native_error_bytes_before_wrapping() -> None:
     from c_two.error import CCError, FallbackDenied
     from c_two.transport.registry import _cc_error_from_native_exception
@@ -781,6 +748,7 @@ def test_shutdown_warns_when_native_cleanup_barrier_is_unconfirmed(caplog) -> No
             memory_budget_bytes: int | None = None,
             **_kwargs,
         ) -> None:
+            self.relay_anchor_address_override = None
             self._outcome = outcome if outcome is not None else {'relay_errors': []}
             self.adopted_observations: list[object] = []
             self.begin_shutdown_timeouts: list[float] = []

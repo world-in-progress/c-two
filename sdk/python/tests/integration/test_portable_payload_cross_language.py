@@ -18,7 +18,6 @@ import c_two as cc
 
 import c_two.contract
 from tests.fixtures.process_control import readline_with_timeout
-from c_two.config.settings import settings
 from c_two.error import ContractMismatch
 from c_two.transport.registry import _reset_default_runtime
 from fastdb4py.payload import Payload, PayloadError
@@ -52,12 +51,9 @@ ROLE_MEMORY_BYTES = 64 * 1024**2
 
 @pytest.fixture(autouse=True)
 def _clean_python_runtime() -> Any:
-    previous_relay = settings._relay_anchor_address  # noqa: SLF001
     _reset_default_runtime()
-    settings.relay_anchor_address = None
     yield
     _reset_default_runtime()
-    settings._relay_anchor_address = previous_relay  # noqa: SLF001
 
 
 def _write_artifacts(root: Path, artifact_set: Any) -> list[dict[str, Any]]:

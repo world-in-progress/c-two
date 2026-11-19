@@ -6,19 +6,16 @@ from pathlib import Path
 import pytest
 
 import c_two as cc
-from c_two.config.settings import settings
 from c_two.transport.registry import _reset_default_runtime
 
 
 @pytest.fixture(autouse=True)
 def clean_runtime():
-    previous_relay = settings.relay_anchor_address
     _reset_default_runtime()
     try:
         yield
     finally:
         _reset_default_runtime()
-        settings.relay_anchor_address = previous_relay
 
 
 def _load_grid(monkeypatch):
@@ -87,18 +84,14 @@ def test_grid_python_payloads_work_direct_ipc_with_bad_relay(monkeypatch):
     address = cc.server_address()
     assert address is not None
 
-    previous_relay = settings.relay_anchor_address
-    settings.relay_anchor_address = 'http://127.0.0.1:9'
+    client = cc.Runtime()
+    client.set_relay_anchor('http://127.0.0.1:9')
     try:
-        grid = cc.connect(GridPython, name='grid-python-ipc', address=address)
+        with client.connect(GridPython, name='grid-python-ipc', address=address) as grid:
+            assert grid.client._mode == 'ipc'  # noqa: SLF001
+            _exercise_grid(grid)
     finally:
-        settings.relay_anchor_address = previous_relay
-
-    try:
-        assert grid.client._mode == 'ipc'  # noqa: SLF001
-        _exercise_grid(grid)
-    finally:
-        cc.close(grid)
+        client.shutdown()
 
 
 def test_grid_python_payloads_work_explicit_http_relay(monkeypatch, start_c3_relay):

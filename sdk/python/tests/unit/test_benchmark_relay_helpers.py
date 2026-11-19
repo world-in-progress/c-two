@@ -15,7 +15,10 @@ from types import ModuleType
 import pytest
 import httpx
 
+import c_two as cc
+
 from c_two.crm.contract import crm_contract
+from c_two.transport.registry import _get_default_runtime, _reset_default_runtime
 from tests.fixtures.http_server import LoopbackHTTPServer
 
 
@@ -39,25 +42,24 @@ def _load_benchmark(script_name: str) -> ModuleType:
     return module
 
 
-def test_relay_session_restores_unset_anchor_after_error(monkeypatch, capsys):
+def test_relay_session_shuts_down_its_runtime_after_error(monkeypatch, capsys):
     import _relay_support as relay
 
-    original = relay.settings._relay_anchor_address
-    monkeypatch.setenv('C2_RELAY_ANCHOR_ADDRESS', 'http://environment:8300')
+    cleaned = []
+
+    def shutdown(runtime):
+        cleaned.append(runtime)
+        return {'completed': True, 'relay_errors': ['withdrawal failed']}
+
     monkeypatch.setattr(relay._NO_PROXY_OPENER, 'open', lambda *a, **kw: nullcontext())
-    monkeypatch.setattr(relay.cc, 'shutdown', lambda: {
-        'completed': True, 'relay_errors': ['withdrawal failed'],
-    })
-    relay.cc.set_relay_anchor('')
-    try:
-        with pytest.raises(ValueError, match='benchmark'):
-            with relay.session('http://127.0.0.1:8300'):
-                raise ValueError('benchmark')
-        assert relay.settings._relay_anchor_address is None
-        assert relay.settings.relay_anchor_address == 'http://environment:8300'
-        assert 'withdrawal failed' in capsys.readouterr().err
-    finally:
-        relay.cc.set_relay_anchor(original or '')
+    monkeypatch.setattr(cc.Runtime, 'shutdown', shutdown)
+    with pytest.raises(ValueError, match='benchmark'):
+        with relay.session('http://127.0.0.1:8300') as runtime:
+            assert runtime._runtime_session.relay_anchor_address_override == 'http://127.0.0.1:8300'
+            raise ValueError('benchmark')
+
+    assert cleaned == [runtime]
+    assert 'withdrawal failed' in capsys.readouterr().err
 
 
 def test_relay_qps_hey_args_include_contract_identity():
@@ -137,17 +139,18 @@ def test_benchmark_http_calls_and_cleanup(script, start_c3_relay, monkeypatch, t
     relay_process = start_c3_relay()
     port = int(relay_process.bind.rsplit(':', 1)[1])
     module = _load_benchmark(script)
-    settings = module.relay.settings
-    original_anchor = settings._relay_anchor_address
-    connect = module.cc.connect
+    _reset_default_runtime()
+    default = _get_default_runtime()
+    connect = cc.Runtime.connect
 
-    def connect_http(*args, **kwargs):
-        proxy = connect(*args, **kwargs)
+    def connect_http(runtime, *args, **kwargs):
+        assert runtime is not default
+        proxy = connect(runtime, *args, **kwargs)
         assert proxy.client.observed_path == 'explicit_relay'
         return proxy
 
-    monkeypatch.setattr(module.cc, 'connect', connect_http)
-    module.cc.set_relay_anchor('http://previous:8300')
+    monkeypatch.setattr(cc.Runtime, 'connect', connect_http)
+    default.set_relay_anchor('http://previous:8300')
     try:
         if script == 'relay_qps_benchmark.py':
             monkeypatch.setattr(module, 'RELAY_PORT', port)
@@ -171,23 +174,21 @@ def test_benchmark_http_calls_and_cleanup(script, start_c3_relay, monkeypatch, t
             monkeypatch.setattr(module, '_rounds', lambda _: 2)
             monkeypatch.setattr(module, 'WARMUP', 1)
             assert module.bench_relay(64) is not None
-        assert settings._relay_anchor_address == 'http://previous:8300'
+        assert _get_default_runtime() is default
+        assert default._runtime_session.relay_anchor_address_override == 'http://previous:8300'
         with httpx.Client(trust_env=False) as http:
             assert http.get(f'{relay_process.url}/_routes').json()['routes'] == []
     finally:
-        module.cc.shutdown()
-        module.cc.set_relay_anchor(original_anchor or '')
-        module._reset_default_runtime()
+        _reset_default_runtime()
 
 
 @pytest.mark.parametrize('body_fails', [False, True])
 def test_relay_session_keeps_anchor_while_native_call_drains(body_fails, start_c3_relay, monkeypatch, capsys):
     module = _load_benchmark('three_mode_benchmark.py')
     relay_process = start_c3_relay()
-    original = module.relay.settings._relay_anchor_address
     started, finish = threading.Event(), threading.Event()
-    shutdown = module.cc.shutdown
-    monkeypatch.setattr(module.cc, 'shutdown', lambda: shutdown(timeout=0.01))
+    shutdown = cc.Runtime.shutdown
+    monkeypatch.setattr(cc.Runtime, 'shutdown', lambda runtime: shutdown(runtime, timeout=0.01))
 
     class BlockingEcho:
         def echo(self, data):
@@ -195,27 +196,29 @@ def test_relay_session_keeps_anchor_while_native_call_drains(body_fails, start_c
             assert finish.wait(5)
             return data
 
+    runtime = None
     with ThreadPoolExecutor(max_workers=1) as pool:
         try:
             error = ValueError if body_fails else RuntimeError
             with pytest.raises(error, match='benchmark'):
-                with module.relay.session(relay_process.url):
-                    module.cc.register(module.Echo, BlockingEcho(), name='draining-echo')
-                    with module.cc.connect(module.Echo, name='draining-echo') as proxy:
+                with module.relay.session(relay_process.url) as runtime:
+                    session = runtime._runtime_session
+                    runtime.register(module.Echo, BlockingEcho(), name='draining-echo')
+                    with runtime.connect(module.Echo, name='draining-echo') as proxy:
                         call = pool.submit(proxy.echo, b'pending')
                         assert started.wait(2)
                         if body_fails:
                             raise ValueError('benchmark')
-            assert module.relay.settings._relay_anchor_address == relay_process.url
+            assert runtime._runtime_session is session
+            assert session.relay_anchor_address_override == relay_process.url
             if body_fails:
-                assert 'anchor retained' in capsys.readouterr().err
+                assert 'shutdown still draining' in capsys.readouterr().err
             finish.set()
             assert call.result(timeout=2) == b'pending'
         finally:
             finish.set()
-            assert shutdown()['completed']
-            module.cc.set_relay_anchor(original or '')
-            module._reset_default_runtime()
+            if runtime is not None:
+                assert shutdown(runtime)['completed']
 
 
 def test_three_mode_relay_large_payload_rows_have_explicit_path_label():

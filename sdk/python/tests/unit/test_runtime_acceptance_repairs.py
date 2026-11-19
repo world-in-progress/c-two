@@ -11,7 +11,6 @@ import pytest
 import c_two as cc
 
 import c_two.observe
-from c_two.config.settings import settings
 from c_two.transport.registry import _get_default_runtime
 
 

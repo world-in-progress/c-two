@@ -8,7 +8,6 @@ from __future__ import annotations
 import pytest
 
 import c_two as cc
-from c_two.config import settings
 from c_two.transport.registry import Runtime
 
 
@@ -42,14 +41,12 @@ class TestUnregisterRelayAbsence:
 
     def setup_method(self):
         self.registry = Runtime()
-        settings.relay_anchor_address = None
 
     def teardown_method(self):
         try:
             self.registry.shutdown()
         except Exception:
             pass
-        settings.relay_anchor_address = None
 
     def test_unregister_no_relay(self):
         """Unregister works when relay calls are no-ops."""
@@ -61,6 +58,7 @@ class TestUnregisterRelayAbsence:
         impl = RelayShutdownCRM()
         self.registry.register(IRelayShutdownCRM, impl, name='test_down')
 
+        self.registry.set_relay_anchor(None)
         with pytest.raises(RuntimeError, match='relay anchor is frozen'):
             self.registry.set_relay_anchor('http://127.0.0.1:9')
 
@@ -71,11 +69,11 @@ class TestUnregisterRelayAbsence:
         self.registry.shutdown()
         assert impl.cleanup_calls == 1
 
-    def test_shutdown_ignores_late_process_relay_setting(self):
+    def test_shutdown_ignores_late_relay_environment(self, monkeypatch):
         """Shutdown uses the Core host's frozen relay projection."""
         impl = RelayShutdownCRM()
         self.registry.register(IRelayShutdownCRM, impl, name='test_sd')
-        settings.relay_anchor_address = 'http://127.0.0.1:9'
+        monkeypatch.setenv('C2_RELAY_ANCHOR_ADDRESS', 'http://127.0.0.1:9')
 
         self.registry.shutdown()
 

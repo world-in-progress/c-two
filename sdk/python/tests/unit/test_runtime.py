@@ -19,7 +19,6 @@ import c_two.endpoint
 
 import c_two.observe
 from c_two._native import RuntimeSession
-from c_two.config.settings import C2Settings, settings
 from c_two.transport import registry
 
 
@@ -44,13 +43,12 @@ class EchoResource:
 
 
 @pytest.fixture(autouse=True)
-def isolated_settings(monkeypatch):
+def isolated_runtime(monkeypatch):
     registry._reset_default_runtime()
     for key in tuple(os.environ):
-        if key.startswith('C2_'):
+        if key.startswith('C2_') and key != 'C2_IPC_ROOT':
             monkeypatch.delenv(key)
     monkeypatch.setenv('C2_ENV_FILE', '')
-    monkeypatch.setattr(settings, '_relay_anchor_address', None)
     yield
     registry._reset_default_runtime()
 
@@ -73,11 +71,16 @@ def runtimes(tmp_path):
         assert {p.name for p in root.iterdir()} <= {'.gate', '.gate.marker'}
 
 
-def test_unconfigured_settings_do_not_read_another_objects_override(monkeypatch):
-    monkeypatch.setenv('C2_RELAY_ANCHOR_ADDRESS', 'http://127.0.0.1:8')
-    first = C2Settings(relay_anchor_address='http://127.0.0.1:9')
-    assert first.relay_anchor_address == 'http://127.0.0.1:9'
-    assert C2Settings().relay_anchor_address == 'http://127.0.0.1:8'
+@pytest.mark.parametrize('address', ['', ' \t\n'])
+def test_set_relay_anchor_rejects_blank_address(address):
+    with pytest.raises(ValueError, match='relay anchor address must not be empty; pass None to clear'):
+        cc.set_relay_anchor(address)
+
+
+@pytest.mark.parametrize('address', [42, b'http://relay.test'])
+def test_set_relay_anchor_rejects_non_string_address(address):
+    with pytest.raises(TypeError, match='relay anchor address must be a str or None'):
+        cc.set_relay_anchor(address)
 
 
 def test_empty_start_uses_native_readiness_and_leaves_directory_owned_by_caller(tmp_path, monkeypatch):
@@ -310,17 +313,21 @@ def test_start_then_failed_registration_preserves_host(runtimes):
 def test_relay_override_rejection_and_session_replacement_are_atomic(runtimes):
     runtime = runtimes[0]
     original = 'http://127.0.0.1:1'
-    runtime.set_relay_anchor(original)
+    runtime.set_relay_anchor(f' {original}/ ')
+    session = runtime._runtime_session
     runtime.start()  # An empty local Host needs no relay registration.
     with pytest.raises(RuntimeError, match='frozen'):
         runtime.set_relay_anchor('http://127.0.0.1:2')
-    assert runtime._settings.relay_anchor_address == original
+    with pytest.raises(RuntimeError, match='frozen'):
+        runtime.set_relay_anchor(None)
+    runtime.set_relay_anchor(f'{original}/')
     assert runtime._runtime_session.relay_anchor_address_override == original
     assert runtime.shutdown()['completed']
+    assert runtime._runtime_session is not session
     assert runtime._runtime_session.relay_anchor_address_override == original
     runtime.start()
     assert runtime._runtime_session.relay_anchor_address_override == original
-    assert settings._relay_anchor_address is None
+    assert runtimes[1]._runtime_session.relay_anchor_address_override is None
 
 
 def test_default_api_and_explicit_runtime_keep_separate_owners(runtimes):

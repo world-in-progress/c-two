@@ -7,7 +7,6 @@ import uuid
 
 import c_two as cc
 import c_two.endpoint
-from c_two.config.settings import settings
 from c_two.transport import registry
 
 

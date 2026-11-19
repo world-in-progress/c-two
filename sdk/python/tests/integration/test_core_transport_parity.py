@@ -3,7 +3,6 @@ from __future__ import annotations
 import pytest
 
 import c_two as cc
-from c_two.config.settings import settings
 from c_two.transport.registry import Runtime, _get_default_runtime, _reset_default_runtime
 from tests.fixtures.hello import HelloImpl
 from tests.fixtures.ihello import Hello
@@ -79,7 +78,6 @@ def test_semantic_error_fields_match_direct_explicit_and_relay_aware(
         def fail(self) -> str:
             raise RuntimeError("portable Python fixture failure")
 
-    previous_anchor = settings._relay_anchor_address  # noqa: SLF001
     relay = start_c3_relay()
     proxies = []
     client_registry = None
@@ -130,7 +128,6 @@ def test_semantic_error_fields_match_direct_explicit_and_relay_aware(
         if client_registry is not None:
             client_registry.shutdown()
         _reset_default_runtime()
-        settings._relay_anchor_address = previous_anchor  # noqa: SLF001
 
 
 @pytest.mark.parametrize('relay_anchor', [None, 'http://127.0.0.1:1'])
