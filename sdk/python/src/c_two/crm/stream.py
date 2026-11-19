@@ -52,8 +52,8 @@ def _resource_execution_failure(exc: BaseException) -> error.CCError:
     cleared; anything else becomes ``ResourceExecutionError``.
     """
     from .transferable import _cause_details, _safe_error_message
-    if isinstance(exc, error.CCBaseError):
-        clean = error._callback_semantic_copy(exc)
+    if issubclass(type(exc), error.CCBaseError):
+        clean = error._callback_semantic_copy(exc)  # type: ignore[arg-type]
         if clean is not None:
             return clean
     return error.ResourceExecutionError(_safe_error_message(exc), details=_cause_details(exc))
@@ -135,8 +135,8 @@ class Stream(Iterator[T], Generic[T]):
             if (
                 self._decoder_classifies
                 and decoding
-                and isinstance(exc, error.SerializationError)
-                and exc.transport_phase is None
+                and issubclass(type(exc), error.SerializationError)
+                and exc.transport_phase is None  # type: ignore[attr-defined]
             ):
                 raise
             raise _client_output_error(exc, decoding=decoding) from exc
@@ -347,7 +347,7 @@ def _build_stream_wrapper(func, input_binding, output_binding):
                 native = client.open_direct_stream(method_name, values)
             except Exception as exc:
                 from ..transport.client.proxy import _LocalRouteClosed
-                if not isinstance(exc, _LocalRouteClosed):
+                if not issubclass(type(exc), _LocalRouteClosed):
                     raise
                 if budget is None:
                     budget = self.client.start_call_budget()

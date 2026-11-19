@@ -3,7 +3,7 @@ use std::error::Error as StdError;
 use std::fmt;
 
 use c2_contract::ContractError;
-use c2_error::{C2Error, C2ErrorEnvelope, ErrorCode};
+use c2_error::{C2Error, ErrorCode};
 use c2_http::client::HttpError;
 use c2_ipc::IpcError;
 use c2_ipc::client::ChunkError;
@@ -554,24 +554,10 @@ pub fn normalize_http_semantic_body(body: &str) -> Error {
 /// Decode an HTTP JSON semantic envelope, mapping malformed envelopes to the
 /// same canonical `ProtocolViolation` semantic error used by IPC.
 pub fn semantic_error_from_http_body(body: &str) -> C2Error {
-    let envelope = match serde_json::from_str::<C2ErrorEnvelope>(body) {
-        Ok(envelope) => envelope,
-        Err(error) => {
-            return protocol_violation(
-                "HTTP semantic error envelope is malformed",
-                "http",
-                &error.to_string(),
-            );
-        }
-    };
-    semantic_error_from_http_envelope(envelope)
-}
-
-pub(crate) fn semantic_error_from_http_envelope(envelope: C2ErrorEnvelope) -> C2Error {
-    match C2Error::from_envelope(envelope) {
+    match C2Error::from_json_bytes(body.as_bytes()) {
         Ok(error) => error,
         Err(error) => protocol_violation(
-            "HTTP semantic error envelope is invalid",
+            "HTTP semantic error envelope is malformed",
             "http",
             &error.to_string(),
         ),

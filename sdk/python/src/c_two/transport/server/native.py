@@ -251,7 +251,7 @@ class NativeServerBridge:
                     descriptor_json,
                 )
             except Exception as exc:
-                semantic = exc.semantic if isinstance(exc, CoreError) else None
+                semantic = exc.semantic if issubclass(type(exc), CoreError) else None  # type: ignore[attr-defined]
                 if semantic is not None:
                     # Keep the canonical relay refusal message; the native
                     # CoreError stays observable as the direct cause.

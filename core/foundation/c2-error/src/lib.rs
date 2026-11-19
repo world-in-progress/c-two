@@ -255,7 +255,7 @@ impl<'de> Deserialize<'de> for C2ErrorEnvelope {
                             details = Some(map.next_value()?);
                         }
                         _ => {
-                            let _ = map.next_value::<serde_json::Value>()?;
+                            let _ = map.next_value::<serde::de::IgnoredAny>()?;
                         }
                     }
                 }
@@ -272,6 +272,248 @@ impl<'de> Deserialize<'de> for C2ErrorEnvelope {
 
         deserializer.deserialize_map(EnvelopeVisitor)
     }
+}
+
+const MAX_ENVELOPE_CONTAINER_DEPTH: usize = 127;
+
+fn validate_canonical_envelope_json(body: &str) -> bool {
+    struct Scanner<'a> {
+        bytes: &'a [u8],
+        index: usize,
+    }
+
+    impl<'a> Scanner<'a> {
+        fn skip_ws(&mut self) {
+            while self.index < self.bytes.len() {
+                match self.bytes[self.index] {
+                    b' ' | b'\t' | b'\n' | b'\r' => self.index += 1,
+                    _ => break,
+                }
+            }
+        }
+
+        fn skip_json_string(&mut self) -> bool {
+            if self.index >= self.bytes.len() || self.bytes[self.index] != b'"' {
+                return false;
+            }
+            self.index += 1;
+            while self.index < self.bytes.len() {
+                let ch = self.bytes[self.index];
+                if ch < 0x20 {
+                    return false;
+                }
+                if ch == b'"' {
+                    self.index += 1;
+                    return true;
+                }
+                if ch == b'\\' {
+                    self.index += 1;
+                    if self.index >= self.bytes.len() {
+                        return false;
+                    }
+                    let esc = self.bytes[self.index];
+                    self.index += 1;
+                    match esc {
+                        b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't' => {}
+                        b'u' => {
+                            let Some(high) = self.read_hex4() else {
+                                return false;
+                            };
+                            if (0xdc00..=0xdfff).contains(&high) {
+                                return false;
+                            }
+                            if (0xd800..=0xdbff).contains(&high) {
+                                if self.index + 2 > self.bytes.len()
+                                    || self.bytes[self.index] != b'\\'
+                                    || self.bytes[self.index + 1] != b'u'
+                                {
+                                    return false;
+                                }
+                                self.index += 2;
+                                let Some(low) = self.read_hex4() else {
+                                    return false;
+                                };
+                                if !(0xdc00..=0xdfff).contains(&low) {
+                                    return false;
+                                }
+                            }
+                        }
+                        _ => return false,
+                    }
+                    continue;
+                }
+                self.index += 1;
+            }
+            false
+        }
+
+        fn read_hex4(&mut self) -> Option<u16> {
+            if self.index + 4 > self.bytes.len() {
+                return None;
+            }
+            let slice = std::str::from_utf8(&self.bytes[self.index..self.index + 4]).ok()?;
+            if !slice.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return None;
+            }
+            let val = u16::from_str_radix(slice, 16).ok()?;
+            self.index += 4;
+            Some(val)
+        }
+
+        fn skip_value(&mut self, container_depth: usize) -> Option<&'a str> {
+            self.skip_ws();
+            if self.index >= self.bytes.len() {
+                return None;
+            }
+            let start = self.index;
+            match self.bytes[self.index] {
+                b'"' => {
+                    if !self.skip_json_string() {
+                        return None;
+                    }
+                    std::str::from_utf8(&self.bytes[start..self.index]).ok()
+                }
+                b'{' => {
+                    let next_depth = container_depth + 1;
+                    if next_depth > MAX_ENVELOPE_CONTAINER_DEPTH {
+                        return None;
+                    }
+                    self.index += 1;
+                    self.skip_ws();
+                    if self.index < self.bytes.len() && self.bytes[self.index] == b'}' {
+                        self.index += 1;
+                        return std::str::from_utf8(&self.bytes[start..self.index]).ok();
+                    }
+                    while self.index < self.bytes.len() {
+                        self.skip_ws();
+                        if !self.skip_json_string() {
+                            return None;
+                        }
+                        self.skip_ws();
+                        if self.index >= self.bytes.len() || self.bytes[self.index] != b':' {
+                            return None;
+                        }
+                        self.index += 1;
+                        self.skip_value(next_depth)?;
+                        self.skip_ws();
+                        if self.index >= self.bytes.len() {
+                            return None;
+                        }
+                        match self.bytes[self.index] {
+                            b'}' => {
+                                self.index += 1;
+                                return std::str::from_utf8(&self.bytes[start..self.index]).ok();
+                            }
+                            b',' => self.index += 1,
+                            _ => return None,
+                        }
+                    }
+                    None
+                }
+                b'[' => {
+                    let next_depth = container_depth + 1;
+                    if next_depth > MAX_ENVELOPE_CONTAINER_DEPTH {
+                        return None;
+                    }
+                    self.index += 1;
+                    self.skip_ws();
+                    if self.index < self.bytes.len() && self.bytes[self.index] == b']' {
+                        self.index += 1;
+                        return std::str::from_utf8(&self.bytes[start..self.index]).ok();
+                    }
+                    while self.index < self.bytes.len() {
+                        self.skip_value(next_depth)?;
+                        self.skip_ws();
+                        if self.index >= self.bytes.len() {
+                            return None;
+                        }
+                        match self.bytes[self.index] {
+                            b']' => {
+                                self.index += 1;
+                                return std::str::from_utf8(&self.bytes[start..self.index]).ok();
+                            }
+                            b',' => self.index += 1,
+                            _ => return None,
+                        }
+                    }
+                    None
+                }
+                _ => {
+                    while self.index < self.bytes.len() {
+                        match self.bytes[self.index] {
+                            b',' | b'}' | b']' | b' ' | b'\t' | b'\n' | b'\r' => break,
+                            _ => self.index += 1,
+                        }
+                    }
+                    if self.index <= start {
+                        return None;
+                    }
+                    let token = std::str::from_utf8(&self.bytes[start..self.index]).ok()?;
+                    if matches!(token, "true" | "false" | "null") {
+                        return Some(token);
+                    }
+                    if !is_rfc8259_number(token) {
+                        return None;
+                    }
+                    token.parse::<f64>().ok().filter(|v| v.is_finite())?;
+                    Some(token)
+                }
+            }
+        }
+    }
+
+    fn is_rfc8259_number(token: &str) -> bool {
+        let bytes = token.as_bytes();
+        let mut i = 0;
+        if i < bytes.len() && bytes[i] == b'-' {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            return false;
+        }
+        if bytes[i] == b'0' {
+            i += 1;
+        } else if bytes[i].is_ascii_digit() {
+            i += 1;
+            while i < bytes.len() && bytes[i].is_ascii_digit() {
+                i += 1;
+            }
+        } else {
+            return false;
+        }
+        if i < bytes.len() && bytes[i] == b'.' {
+            i += 1;
+            if i >= bytes.len() || !bytes[i].is_ascii_digit() {
+                return false;
+            }
+            while i < bytes.len() && bytes[i].is_ascii_digit() {
+                i += 1;
+            }
+        }
+        if i < bytes.len() && (bytes[i] == b'e' || bytes[i] == b'E') {
+            i += 1;
+            if i < bytes.len() && (bytes[i] == b'+' || bytes[i] == b'-') {
+                i += 1;
+            }
+            if i >= bytes.len() || !bytes[i].is_ascii_digit() {
+                return false;
+            }
+            while i < bytes.len() && bytes[i].is_ascii_digit() {
+                i += 1;
+            }
+        }
+        i == bytes.len()
+    }
+
+    let mut scanner = Scanner {
+        bytes: body.as_bytes(),
+        index: 0,
+    };
+    if scanner.skip_value(0).is_none() {
+        return false;
+    }
+    scanner.skip_ws();
+    scanner.index == scanner.bytes.len() && body.trim_start_matches([' ', '\t', '\n', '\r']).starts_with('{')
 }
 
 impl C2Error {
@@ -313,6 +555,11 @@ impl C2Error {
     pub fn from_json_bytes(bytes: &[u8]) -> Result<Self, C2ErrorDecodeError> {
         let body = std::str::from_utf8(bytes)
             .map_err(|error| C2ErrorDecodeError::InvalidJson(error.to_string()))?;
+        if !validate_canonical_envelope_json(body) {
+            return Err(C2ErrorDecodeError::InvalidJson(
+                "non-canonical JSON envelope".to_string(),
+            ));
+        }
         let envelope: C2ErrorEnvelope = serde_json::from_str(body)
             .map_err(|error| C2ErrorDecodeError::InvalidJson(error.to_string()))?;
         Self::from_envelope(envelope)
@@ -695,10 +942,31 @@ mod tests {
                 C2Error::from_json_bytes(raw_invalid).is_err(),
                 "expected C2Error::from_json_bytes rejection for {raw_invalid:?}"
             );
+            let mut wire = b"C2E1".to_vec();
+            wire.extend_from_slice(raw_invalid);
             assert!(
-                serde_json::from_slice::<C2ErrorEnvelope>(raw_invalid).is_err(),
-                "expected serde_json::from_slice::<C2ErrorEnvelope> rejection for {raw_invalid:?}"
+                C2Error::from_wire_bytes(&wire).is_err(),
+                "expected C2Error::from_wire_bytes rejection for {raw_invalid:?}"
             );
         }
+
+        let nested = |layers: usize| {
+            format!(
+                r#"{{"version":1,"code":717,"name":"CallCapacityExceeded","message":"m","details":{{"dispatch_phase":"pre_dispatch"}},"ext":{}{}}}"#,
+                "[".repeat(layers),
+                "]".repeat(layers),
+            )
+        };
+        assert!(C2Error::from_json_bytes(nested(126).as_bytes()).is_ok());
+        assert!(C2Error::from_json_bytes(nested(127).as_bytes()).is_err());
+
+        let with_ext_number = |literal: &str| {
+            format!(
+                r#"{{"version":1,"code":717,"name":"CallCapacityExceeded","message":"m","details":{{"dispatch_phase":"pre_dispatch"}},"ext":{literal}}}"#,
+            )
+        };
+        assert!(C2Error::from_json_bytes(with_ext_number("17976931348623158e292").as_bytes()).is_ok());
+        assert!(C2Error::from_json_bytes(with_ext_number("179769313486231581e291").as_bytes()).is_err());
+        assert!(C2Error::from_json_bytes(with_ext_number("179769313486231590e291").as_bytes()).is_err());
     }
 }

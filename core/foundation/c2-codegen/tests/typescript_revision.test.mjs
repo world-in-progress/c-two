@@ -1135,3 +1135,121 @@ test('corrupt unknown-field UTF-8, BOM, lone surrogates, non-string duplicate de
     await teeClient.close();
   }
 });
+
+test('extension JSON depth/IEEE-754 boundaries and synchronous reader cleanup failures',async()=>{
+  const enc=new TextEncoder();
+  const nestedEnvelope=layers=>enc.encode(
+    `{"version":1,"code":717,"name":"CallCapacityExceeded","message":"cap","details":{"dispatch_phase":"pre_dispatch"},"ext":${'['.repeat(layers)}${']'.repeat(layers)}}`,
+  );
+  const numberEnvelope=lit=>enc.encode(
+    `{"version":1,"code":717,"name":"CallCapacityExceeded","message":"cap","details":{"dispatch_phase":"pre_dispatch"},"ext":${lit}}`,
+  );
+
+  for(const [rawBytes,expectPhase,expectRetrySafe] of [
+    [nestedEnvelope(126),'pre_dispatch',true],
+    [nestedEnvelope(127),'dispatch_uncertain',false],
+    [numberEnvelope('17976931348623158e292'),'pre_dispatch',true],
+    [numberEnvelope('179769313486231581e291'),'dispatch_uncertain',false],
+    [numberEnvelope('179769313486231590e291'),'dispatch_uncertain',false],
+  ]){
+    const client=transport.createRelayAwareHttpEncodedTransport('http://localhost:8300',{
+      fetch:async(url,init)=>{
+        if(url.includes('/_resolve/'))return textReply(200,JSON.stringify([relayRoute()]));
+        if(url.includes('/_probe/'))return relayResponse();
+        assert.equal(init.method,'POST');
+        return new Response(rawBytes,{status:503});
+      },
+    });
+    try{
+      await assert.rejects(client.call('route',contract,'ping',()=>new Uint8Array()),err=>{
+        assert.ok(err instanceof transport.C2HttpRelayError);
+        assert.equal(err.transportPhase,expectPhase);
+        assert.equal(err.retrySafe,expectRetrySafe);
+        return true;
+      });
+    }finally{await client.close()}
+  }
+
+  // 1. Known-length read completes, then releaseLock() throws -> allocator buffer freed once.
+  {
+    let allocated=0,freed=0,step=0;
+    const client=transport.createRelayAwareHttpEncodedTransport('http://localhost:8300',{
+      responsePayloadAllocator(byteLength){
+        allocated++;
+        const backing=new Uint8Array(byteLength);
+        return {view:backing,payload:{bytes:backing,byteLength,release(){freed++;}}};
+      },
+      fetch:async(url,init)=>{
+        if(url.includes('/_resolve/'))return textReply(200,JSON.stringify([relayRoute()]));
+        if(url.includes('/_probe/'))return relayResponse();
+        assert.equal(init.method,'POST');
+        return {
+          status:200,
+          headers:{get(name){return name.toLowerCase()==='content-length'?'2':null}},
+          body:{getReader(){return {
+            async read(){
+              step++;
+              return step===1 ? {done:false,value:Uint8Array.of(7,8)} : {done:true};
+            },
+            releaseLock(){throw new Error('unlock failure after full read');},
+          }}},
+          async arrayBuffer(){throw new Error('must stream');},
+        };
+      },
+    });
+    try{
+      await assert.rejects(client.call('route',contract,'ping',()=>new Uint8Array()),err=>{
+        assert.ok(err instanceof transport.C2HttpTransportError);
+        assert.equal(err.transportPhase,'dispatch_uncertain');
+        assert.match(err.message,/unlock failure after full read/);
+        return true;
+      });
+      assert.deepEqual({allocated,freed},{allocated:1,freed:1});
+    }finally{await client.close()}
+  }
+
+  // 2. Oversized stream with throwing releaseLock() and throwing cancel getter preserves primary error and frees buffer once.
+  for(const badCancelGetter of [false,true]){
+    let allocated=0,freed=0,unlocks=0,step=0;
+    const reader={
+      async read(){
+        step++;
+        return step===1 ? {done:false,value:Uint8Array.of(1,2,3)} : {done:true};
+      },
+      releaseLock(){unlocks++;throw new Error('secondary unlock boom');},
+    };
+    if(badCancelGetter){
+      Object.defineProperty(reader,'cancel',{
+        get(){throw new Error('cancel getter boom');},
+      });
+    }
+    const client=transport.createRelayAwareHttpEncodedTransport('http://localhost:8300',{
+      responsePayloadAllocator(byteLength){
+        allocated++;
+        const backing=new Uint8Array(byteLength);
+        return {view:backing,payload:{bytes:backing,byteLength,release(){freed++;}}};
+      },
+      fetch:async(url,init)=>{
+        if(url.includes('/_resolve/'))return textReply(200,JSON.stringify([relayRoute()]));
+        if(url.includes('/_probe/'))return relayResponse();
+        assert.equal(init.method,'POST');
+        return {
+          status:200,
+          headers:{get(name){return name.toLowerCase()==='content-length'?'2':null}},
+          body:{getReader(){return reader;}},
+          async arrayBuffer(){throw new Error('must stream');},
+        };
+      },
+    });
+    try{
+      await assert.rejects(client.call('route',contract,'ping',()=>new Uint8Array()),err=>{
+        assert.ok(err instanceof transport.C2HttpTransportError);
+        assert.equal(err.transportPhase,'dispatch_uncertain');
+        assert.match(err.message,/exceeded Content-Length/);
+        assert.doesNotMatch(err.message,/boom/);
+        return true;
+      });
+      assert.deepEqual({allocated,freed,unlocks},{allocated:1,freed:1,unlocks:1});
+    }finally{await client.close()}
+  }
+});

@@ -507,8 +507,8 @@ def _build_transfer_wrapper(
                     )
                 else:
                     failure = (
-                        error._callback_semantic_copy(exc)
-                        if isinstance(exc, error.CCBaseError)
+                        error._callback_semantic_copy(exc)  # type: ignore[arg-type]
+                        if issubclass(type(exc), error.CCBaseError)
                         else None
                     )
                     if failure is None:
@@ -870,7 +870,7 @@ def _client_output_error(
 
 def _cause_details(exc: BaseException) -> dict[str, str]:
     payload_error = getattr(sys.modules.get("fastdb4py.payload"), "PayloadError", None)
-    if payload_error is None or not isinstance(exc, payload_error):
+    if not isinstance(payload_error, type) or not issubclass(type(exc), payload_error):
         return {}
 
     fields: dict[str, str] = {}

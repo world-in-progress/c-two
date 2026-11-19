@@ -683,3 +683,48 @@ def test_hybrid_oserror_and_exception_group_preserve_str_getset_and_weakref_pick
         assert restored.message == 'hybrid group'
         assert len(restored.exceptions) == 1
         assert str(restored.exceptions[0]) == 'leaf'
+
+        # Rewritten .args on CCBaseError + ExceptionGroup still clones and clears pre_dispatch.
+        rewritten_grp = _HybridGroupError('rewritten group', [RuntimeError('sub')])
+        rewritten_grp.args = ('custom-single-arg',)
+        rewritten_grp._transport_phase = 'pre_dispatch'  # type: ignore[attr-defined]
+        cleaned_grp = cc_err._post_dispatch_cleanup_error(rewritten_grp)
+        assert cleaned_grp is not rewritten_grp
+        assert isinstance(cleaned_grp, _HybridGroupError)
+        assert cleaned_grp.transport_phase is None
+        assert cleaned_grp.args == ('custom-single-arg',)
+        assert cleaned_grp.message == 'rewritten group'
+        assert len(cleaned_grp.exceptions) == 1
+        for clone in (copy.copy(rewritten_grp), pickle.loads(pickle.dumps(rewritten_grp))):
+            assert isinstance(clone, _HybridGroupError)
+            assert clone is not rewritten_grp
+            assert clone.args == ('custom-single-arg',)
+            assert clone.message == 'rewritten group'
+
+    # Rewritten 1-arg .args on 5-arg UnicodeDecodeError hybrid still clones and clears pre_dispatch;
+    # and if a foreign C tp_new refuses allocation altogether, fallback still returns a fresh
+    # sanitized CCBaseError with __cause__ preserved instead of leaking pre_dispatch.
+    class _UnicodeHybridCCError(CCBaseError, UnicodeDecodeError):
+        pass
+
+    unicode_hybrid = _UnicodeHybridCCError('utf-8', b'\xff', 0, 1, 'bad byte')
+    unicode_hybrid.args = ('rewritten-1-arg',)
+    unicode_hybrid._transport_phase = 'pre_dispatch'  # type: ignore[attr-defined]
+    sanitized_unicode = cc_err._post_dispatch_cleanup_error(unicode_hybrid)
+    assert sanitized_unicode is not unicode_hybrid
+    assert isinstance(sanitized_unicode, _UnicodeHybridCCError)
+    assert sanitized_unicode.transport_phase is None
+
+    orig_clone_fn = cc_err._clone_exception_without_user_hooks
+    try:
+        def _refuse_clone(_exc):
+            raise TypeError('foreign C tp_new layout refusal')
+
+        cc_err._clone_exception_without_user_hooks = _refuse_clone  # type: ignore[assignment]
+        fallback_err = cc_err._post_dispatch_cleanup_error(unicode_hybrid)
+        assert fallback_err is not unicode_hybrid
+        assert type(fallback_err) is CCBaseError
+        assert fallback_err.transport_phase is None
+        assert fallback_err.__cause__ is unicode_hybrid
+    finally:
+        cc_err._clone_exception_without_user_hooks = orig_clone_fn  # type: ignore[assignment]

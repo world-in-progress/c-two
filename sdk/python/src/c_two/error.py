@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import builtins
 from collections.abc import Mapping
 from enum import IntEnum, unique
 from pathlib import PosixPath, PurePosixPath, PureWindowsPath, WindowsPath
@@ -7,6 +8,8 @@ from types import GetSetDescriptorType, MemberDescriptorType
 from typing import Literal
 
 from c_two import _native
+
+_BASE_EXCEPTION_GROUP: type[BaseException] | None = getattr(builtins, 'BaseExceptionGroup', None)
 
 ErrorSide = Literal['client', 'resource']
 ErrorStage = Literal['serialize', 'deserialize', 'from_buffer', 'execute', 'call']
@@ -122,6 +125,12 @@ class CCBaseError(Exception):
                         slot_val = dict(slot_val)
                     slots[name] = slot_val
         raw_args = BaseException.args.__get__(self, cls)
+        if _BASE_EXCEPTION_GROUP is not None and issubclass(cls, _BASE_EXCEPTION_GROUP):
+            group_init = (
+                _BASE_EXCEPTION_GROUP.message.__get__(self, cls),  # type: ignore[attr-defined]
+                _BASE_EXCEPTION_GROUP.exceptions.__get__(self, cls),  # type: ignore[attr-defined]
+            )
+            return _rebuild_error, (cls, raw_args, group_init), (state, slots)
         return _rebuild_error, (cls, raw_args), (state, slots)
 
     def __setstate__(self, state):
@@ -151,12 +160,23 @@ def _solid_exception_base(target: type[BaseException]) -> type[BaseException]:
     return best
 
 
-def _rebuild_error(target: type[CCBaseError], args: tuple) -> CCBaseError:
+def _rebuild_error(
+    target: type[CCBaseError],
+    args: tuple,
+    group_init: tuple[object, object] | None = None,
+) -> CCBaseError:
     solid = _solid_exception_base(target)
-    try:
-        inst = solid.__new__(target)
-    except TypeError:
-        inst = solid.__new__(target, *args)
+    if (
+        group_init is not None
+        and _BASE_EXCEPTION_GROUP is not None
+        and issubclass(target, _BASE_EXCEPTION_GROUP)
+    ):
+        inst = _BASE_EXCEPTION_GROUP.__new__(target, *group_init)
+    else:
+        try:
+            inst = solid.__new__(target)
+        except TypeError:
+            inst = solid.__new__(target, *args)
     BaseException.args.__set__(inst, args)
     return inst  # type: ignore[return-value]
 
@@ -754,10 +774,15 @@ def _clone_exception_without_user_hooks(exc: CCBaseError) -> CCBaseError:
     cls = type(exc)
     raw_args = BaseException.args.__get__(exc, cls)
     solid = _solid_exception_base(cls)
-    try:
-        copied = solid.__new__(cls)
-    except TypeError:
-        copied = solid.__new__(cls, *raw_args)
+    if _BASE_EXCEPTION_GROUP is not None and issubclass(cls, _BASE_EXCEPTION_GROUP):
+        grp_msg = _BASE_EXCEPTION_GROUP.message.__get__(exc, cls)  # type: ignore[attr-defined]
+        grp_excs = _BASE_EXCEPTION_GROUP.exceptions.__get__(exc, cls)  # type: ignore[attr-defined]
+        copied = _BASE_EXCEPTION_GROUP.__new__(cls, grp_msg, grp_excs)
+    else:
+        try:
+            copied = solid.__new__(cls)
+        except TypeError:
+            copied = solid.__new__(cls, *raw_args)
     BaseException.args.__set__(copied, raw_args)
     src_dict = _raw_instance_dict(exc)
     dst_dict = _raw_instance_dict(copied)
@@ -941,7 +966,13 @@ def _post_dispatch_cleanup_error(exc: BaseException) -> BaseException:
             try:
                 copied = _clone_exception_without_user_hooks(exc)  # type: ignore[arg-type]
             except BaseException:
-                return exc
+                try:
+                    fallback_msg = str(exc)
+                except BaseException:
+                    fallback_msg = _DEFAULT_MESSAGE
+                fallback = CCBaseError(fallback_msg)
+                fallback.__cause__ = exc
+                return fallback
             if _details_need_cleanup(raw_details):
                 _raw_set_field(copied, 'details', stripped_details)
             _clear_copied_phase_fields(copied)

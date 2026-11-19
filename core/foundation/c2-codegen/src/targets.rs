@@ -924,7 +924,7 @@ def _safe_error_text(value: Any) -> str:
 
 def _fastdb_cause_details(exc: BaseException) -> dict[str, str]:
     payload_error = getattr(sys.modules.get(\"fastdb4py.payload\"), \"PayloadError\", None)
-    if payload_error is None or not isinstance(exc, payload_error):
+    if not isinstance(payload_error, type) or not issubclass(type(exc), payload_error):
         return {}
     fields: dict[str, str] = {}
     for source, target in (

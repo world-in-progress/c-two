@@ -1929,6 +1929,49 @@ def test_http_call_404_701_contradiction_409_719_reacquire_and_array_float_envel
                 'dispatch_uncertain',
                 1,
             ),
+            (
+                503,
+                (
+                    '{"version":1,"code":717,"name":"CallCapacityExceeded","message":"cap",'
+                    '"details":{"dispatch_phase":"pre_dispatch"},'
+                    f'"ext":{"[" * 126}{"]" * 126}}}'
+                ).encode('utf-8'),
+                CallCapacityExceeded,
+                'pre_dispatch',
+                1,
+            ),
+            (
+                503,
+                (
+                    '{"version":1,"code":717,"name":"CallCapacityExceeded","message":"cap",'
+                    '"details":{"dispatch_phase":"pre_dispatch"},'
+                    f'"ext":{"[" * 127}{"]" * 127}}}'
+                ).encode('utf-8'),
+                ProtocolViolation,
+                'dispatch_uncertain',
+                1,
+            ),
+            (
+                503,
+                b'{"version":1,"code":717,"name":"CallCapacityExceeded","message":"cap","details":{"dispatch_phase":"pre_dispatch"},"ext":17976931348623158e292}',
+                CallCapacityExceeded,
+                'pre_dispatch',
+                1,
+            ),
+            (
+                503,
+                b'{"version":1,"code":717,"name":"CallCapacityExceeded","message":"cap","details":{"dispatch_phase":"pre_dispatch"},"ext":179769313486231581e291}',
+                ProtocolViolation,
+                'dispatch_uncertain',
+                1,
+            ),
+            (
+                503,
+                b'{"version":1,"code":717,"name":"CallCapacityExceeded","message":"cap","details":{"dispatch_phase":"pre_dispatch"},"ext":179769313486231590e291}',
+                ProtocolViolation,
+                'dispatch_uncertain',
+                1,
+            ),
         ):
             state.update(resolves=0, probes=0, posts=0, first_post=(status, body_bytes))
             rt = cc.Runtime()
@@ -1952,3 +1995,142 @@ def test_http_call_404_701_contradiction_409_719_reacquire_and_array_float_envel
         server.server_close()
         worker.join(2)
         assert not worker.is_alive()
+
+
+def test_post_dispatch_prepared_close_exception_group_and_fastdb_hostile_class_getter(tmp_path):
+    """Prepared close never leaks pre_dispatch on rewritten ExceptionGroup, and FastDB cause checks avoid __class__."""
+    import builtins as py_builtins
+    import importlib.util
+    import pickle
+    import fastdb4py.payload  # noqa: F401 - ensure fastdb4py.payload is in sys.modules
+    from c_two.crm.transferable import _build_transfer_wrapper
+    from c_two.crm.payload_plan import no_payload_binding, python_pickle_output_binding
+    from c_two.error import (
+        CCBaseError,
+        CoreError,
+        ErrorCode,
+        ResourceExecutionError,
+        SerializationError,
+    )
+
+    class _HostileClassCoreError(CoreError):
+        @property
+        def __class__(self):  # type: ignore[override]
+            raise RuntimeError('__class__ getter must never execute')
+
+    # 1. Unary resource adapter & resource stream with fastdb4py.payload loaded in sys.modules.
+    runtime = cc.Runtime()
+    if sys.platform != 'win32':
+        ipc_dir = tmp_path / 'hostile_ipc'
+        ipc_dir.mkdir()
+        runtime.set_local_endpoint(root=str(ipc_dir))
+
+    class HostileResource:
+        def echo(self, value):
+            raise _HostileClassCoreError('transport', 'resource unary hostile')
+
+        def steps(self, value):
+            raise _HostileClassCoreError('transport', 'resource stream hostile')
+            yield value
+
+    runtime.register(CodecBoundary, HostileResource(), name='hostile')
+    remote = runtime.connect(CodecBoundary, name='hostile', address=runtime.server_address())
+    try:
+        with pytest.raises(ResourceExecutionError) as u_err:
+            remote.echo('x')
+        assert 'resource unary hostile' in u_err.value.message
+        assert '__class__ getter' not in u_err.value.message
+
+        stream = remote.steps('x')
+        with pytest.raises(ResourceExecutionError) as s_err:
+            next(stream)
+        assert 'resource stream hostile' in s_err.value.message
+        assert '__class__ getter' not in s_err.value.message
+    finally:
+        cc.close(remote)
+        runtime.shutdown()
+
+    # 2. Generated Python ContractClient response release raising _HostileClassCoreError -> code 8 SerializationError.
+    fixture = (
+        Path(__file__).resolve().parents[4]
+        / 'tests/fixtures/contracts/portable-release.contract.json'
+    )
+    compiled = cc.contract.compile_artifacts(fixture.read_bytes(), target='python')
+    out_dir = tmp_path / 'gen_hostile'
+    for artifact in compiled.artifacts:
+        dest = out_dir / artifact.relative_path
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(artifact.bytes)
+    spec = importlib.util.spec_from_file_location('_gen_hostile_mod', out_dir / 'python/c_two_contract.py')
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    req_payload, _ = echo_payload('hello')
+    try:
+        spec.loader.exec_module(module)
+
+        class BadReleaseResponse:
+            def __bytes__(self) -> bytes:
+                return b''
+
+            def release(self) -> None:
+                raise _HostileClassCoreError('lifecycle', 'release hostile')
+
+        class BoundClient:
+            def call(self, _method: str, _request: bytes):
+                return BadReleaseResponse()
+
+        gen_client = module.ContractClient(BoundClient())
+        with pytest.raises(SerializationError) as rel_err:
+            gen_client.method_1_echo(req_payload)
+        assert rel_err.value.code == ErrorCode.ClientOutputFromBuffer
+        assert 'release hostile' in rel_err.value.message
+        assert '__class__ getter' not in rel_err.value.message
+    finally:
+        req_payload.close()
+        sys.modules.pop(spec.name, None)
+
+    # 3. Unary prepared.call() succeeds, then prepared.close() raises CCBaseError + ExceptionGroup with rewritten args.
+    if hasattr(py_builtins, 'ExceptionGroup'):
+        class _RewrittenGroupCloseError(CCBaseError, py_builtins.ExceptionGroup):  # type: ignore[misc]
+            pass
+
+        orig_close_err = _RewrittenGroupCloseError('close group', [ValueError('inner')])
+        orig_close_err.args = ('rewritten-close-arg',)
+        orig_close_err._transport_phase = 'pre_dispatch'  # type: ignore[attr-defined]
+
+        class PreparedCloseBoom:
+            def charge_input(self, _n: int) -> None:
+                return None
+
+            def call(self, _method: str, _data: bytes | None) -> bytes:
+                return pickle.dumps('ok')
+
+            def close(self) -> None:
+                raise orig_close_err
+
+        class UnaryClient:
+            supports_direct_call = False
+            local_copy_tracker = None
+
+            def prepare_call(self, _method: str):
+                return PreparedCloseBoom()
+
+        def unary_fn(self) -> str: ...
+
+        wrapped_unary = _build_transfer_wrapper(
+            unary_fn,
+            input=no_payload_binding(),
+            output=python_pickle_output_binding(unary_fn),
+        )
+
+        class CrmObj:
+            direction = '->'
+            client = UnaryClient()
+
+        with pytest.raises(_RewrittenGroupCloseError) as close_caught:
+            wrapped_unary(CrmObj())
+        assert close_caught.value is not orig_close_err
+        assert close_caught.value.transport_phase is None
+        assert close_caught.value.args == ('rewritten-close-arg',)
+        assert close_caught.value.__cause__ is orig_close_err

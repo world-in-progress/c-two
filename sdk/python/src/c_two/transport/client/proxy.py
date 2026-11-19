@@ -438,7 +438,7 @@ class CRMProxy:
         except Exception as exc:
             from ...error import UnsupportedCallMode
             if (
-                isinstance(exc, UnsupportedCallMode)
+                issubclass(type(exc), UnsupportedCallMode)
                 and self._following_local is not None
                 and self._scheduler is not None
                 and self._scheduler.snapshot().closed
@@ -457,7 +457,7 @@ class CRMProxy:
         except Exception as exc:
             from ...error import ResourceClosed
             if (
-                isinstance(exc, ResourceClosed)
+                issubclass(type(exc), ResourceClosed)
                 and self._following_local is not None
                 and self._scheduler.snapshot().closed
             ):
@@ -500,7 +500,7 @@ class CRMProxy:
         except Exception as exc:
             from ...error import UnsupportedCallMode
             if (
-                isinstance(exc, UnsupportedCallMode)
+                issubclass(type(exc), UnsupportedCallMode)
                 and self._following_local is not None
                 and self._scheduler is not None
                 and self._scheduler.snapshot().closed

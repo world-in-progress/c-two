@@ -183,8 +183,8 @@ fn http_error_parts(err: HttpError) -> (Option<u16>, String, Option<c2_error::C2
 }
 
 fn parse_control_semantic_error(body: &str) -> Option<c2_error::C2Error> {
-    if let Ok(envelope) = serde_json::from_str::<c2_error::C2ErrorEnvelope>(body) {
-        return Some(crate::error::semantic_error_from_http_envelope(envelope));
+    if let Ok(error) = c2_error::C2Error::from_json_bytes(body.as_bytes()) {
+        return Some(error);
     }
     let trimmed = body.trim_start();
     if !trimmed.starts_with('{') && !trimmed.starts_with('[') {

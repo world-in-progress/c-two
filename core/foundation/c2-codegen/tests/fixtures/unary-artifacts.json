@@ -48,9 +48,9 @@
         "sha256": "d25a8e308c803acd08df897279827384fc0de97ea1cacd3323554b94c6b560a3"
       },
       {
-        "bytes": 10815,
+        "bytes": 10835,
         "path": "python/c_two_contract.py",
-        "sha256": "4bd299140c2d57ff44d995f276d28c77be1072fb983bccd34891286e1b4fbf3c"
+        "sha256": "9802d58764d34f422357d29252af64adb91b63f75539635a1878c104e744bf94"
       },
       {
         "bytes": 2700,
@@ -79,9 +79,9 @@
         "sha256": "d25a8e308c803acd08df897279827384fc0de97ea1cacd3323554b94c6b560a3"
       },
       {
-        "bytes": 108894,
+        "bytes": 109796,
         "path": "typescript/c_two_contract.ts",
-        "sha256": "288f84251de7b91317d66e95d48769fa8a8e343b028b6b774fba4215134d7c9a"
+        "sha256": "4839e99a8b40d757015e02eb9fd05a11a12927aa8f78ec0310ae524727269a58"
       },
       {
         "bytes": 2885,
@@ -136,9 +136,9 @@
         "sha256": "a1e05b1f83b46bbe1aec46b91e953fdd12daea6067279e3cf3735d919d59987e"
       },
       {
-        "bytes": 7983,
+        "bytes": 8003,
         "path": "python/c_two_contract.py",
-        "sha256": "66b97457ac85151355992a1a91f68637664fa04eb7f3238c5f87fd70a9b44380"
+        "sha256": "fe0422cd3573741216317896591e34a96e2544a6fd4dfd119c81b4ce78663715"
       }
     ],
     "fixture": "portable-no-payload",
@@ -162,9 +162,9 @@
         "sha256": "a1e05b1f83b46bbe1aec46b91e953fdd12daea6067279e3cf3735d919d59987e"
       },
       {
-        "bytes": 105729,
+        "bytes": 106631,
         "path": "typescript/c_two_contract.ts",
-        "sha256": "2a35d1ab6297f5b0d5af18a045133c03057b38896273191af70fa8a1203a1859"
+        "sha256": "0b6ba4616702916ed994ba49a6b8859b0e331f3ece31ba070b26e9628948f9cd"
       }
     ],
     "fixture": "portable-no-payload",
@@ -219,9 +219,9 @@
         "sha256": "0eeab1f5cdc6bac8ae7880794dd1b2c1f8eaac34e8e63c9139d6c40a266ce10c"
       },
       {
-        "bytes": 9990,
+        "bytes": 10010,
         "path": "python/c_two_contract.py",
-        "sha256": "2e1f56411dbdd80ed3fb6f60e235aec69d465cf3a37d12e2733867a494835272"
+        "sha256": "0eaa868406eb85c25c6ebe9a66dc0021b4cabaf7ab9710f238802626b4720f3f"
       },
       {
         "bytes": 12918,
@@ -250,9 +250,9 @@
         "sha256": "0eeab1f5cdc6bac8ae7880794dd1b2c1f8eaac34e8e63c9139d6c40a266ce10c"
       },
       {
-        "bytes": 108054,
+        "bytes": 108956,
         "path": "typescript/c_two_contract.ts",
-        "sha256": "bdbdd95ef5c6bc25687a75f39d501be9c269e4aa40c257743467b1d2dfc85fda"
+        "sha256": "e5578d5b20b4a49bdfacca63c1c5b8f5119b5883331826e18f732cac35c09270"
       },
       {
         "bytes": 14160,
@@ -312,9 +312,9 @@
         "sha256": "a60647161cc12058cc829fdbaa30f999ffad40888ef24172fe3d4dd86bb4c98d"
       },
       {
-        "bytes": 10001,
+        "bytes": 10021,
         "path": "python/c_two_contract.py",
-        "sha256": "7ad037494077f7d75b81f4742f430120cb82734e1796b52a4abd1364a2e247af"
+        "sha256": "758ebf22b14213289f7d0de8d02682a3b22b948111cad32d29e568e76122f910"
       },
       {
         "bytes": 21249,
@@ -343,9 +343,9 @@
         "sha256": "a60647161cc12058cc829fdbaa30f999ffad40888ef24172fe3d4dd86bb4c98d"
       },
       {
-        "bytes": 108065,
+        "bytes": 108967,
         "path": "typescript/c_two_contract.ts",
-        "sha256": "2959f9293669fff0f5d174e78cd90ed93ae45fc108b4a0856a069e6e191d59d4"
+        "sha256": "3ff4d5b22cbb629bf8c86477a0ab7e380f13753539c02dac6adb5995556fd391"
       },
       {
         "bytes": 22705,

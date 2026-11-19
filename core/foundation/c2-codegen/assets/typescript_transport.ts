@@ -1253,11 +1253,15 @@ async function readHttpArrayBufferResponsePayload(response: C2FetchResponse): Pr
 }
 
 function cancelStreamReaderDetached(reader: C2ReadableStreamReader | undefined, reason: unknown): void {
-  if (reader === undefined || typeof reader.cancel !== "function") {
-    return;
-  }
   try {
-    const pending = reader.cancel(reason);
+    if (reader === undefined || reader === null) {
+      return;
+    }
+    const cancelFn = reader.cancel;
+    if (typeof cancelFn !== "function") {
+      return;
+    }
+    const pending = cancelFn.call(reader, reason);
     if (pending !== undefined && pending !== null && typeof (pending as PromiseLike<unknown>).then === "function") {
       (pending as PromiseLike<unknown>).then(
         () => undefined,
@@ -1269,10 +1273,27 @@ function cancelStreamReaderDetached(reader: C2ReadableStreamReader | undefined, 
   }
 }
 
+function releaseStreamReaderLock(reader: C2ReadableStreamReader | undefined, suppressError: boolean): void {
+  if (reader === undefined || reader === null) {
+    return;
+  }
+  try {
+    const releaseFn = reader.releaseLock;
+    if (typeof releaseFn === "function") {
+      releaseFn.call(reader);
+    }
+  } catch (error) {
+    if (!suppressError) {
+      throw error;
+    }
+  }
+}
+
 async function readBoundedStreamBytes(body: C2ReadableStream, maxBytes: number): Promise<Uint8Array> {
   const chunks: Uint8Array[] = [];
   let byteLength = 0;
   let reader: C2ReadableStreamReader | undefined;
+  let failed = false;
   try {
     reader = body.getReader();
     while (true) {
@@ -1297,10 +1318,11 @@ async function readBoundedStreamBytes(body: C2ReadableStream, maxBytes: number):
       byteLength = nextByteLength;
     }
   } catch (error) {
+    failed = true;
     cancelStreamReaderDetached(reader, error);
     throw error;
   } finally {
-    reader?.releaseLock?.();
+    releaseStreamReaderLock(reader, failed);
   }
   const out = new Uint8Array(byteLength);
   let offset = 0;
@@ -1341,6 +1363,7 @@ function responseContentLength(response: C2FetchResponse): number | undefined {
 async function readAllocatedResponsePayload<Payload extends C2ResponsePayload>(body: C2ReadableStream, byteLength: number, allocator: C2ResponsePayloadAllocator<Payload>): Promise<Payload> {
   const allocated = requireAllocatedResponsePayload<Payload>(allocator(byteLength), byteLength);
   let reader: C2ReadableStreamReader | undefined;
+  let readerUnlocked = false;
   let offset = 0;
   try {
     reader = body.getReader();
@@ -1361,13 +1384,17 @@ async function readAllocatedResponsePayload<Payload extends C2ResponsePayload>(b
     if (offset !== byteLength) {
       throw new Error("C-Two HTTP relay response stream ended before Content-Length bytes were read.");
     }
+    readerUnlocked = true;
+    releaseStreamReaderLock(reader, false);
     return allocated.payload;
   } catch (error) {
-    cancelStreamReaderDetached(reader, error);
+    if (!readerUnlocked) {
+      cancelStreamReaderDetached(reader, error);
+      readerUnlocked = true;
+      releaseStreamReaderLock(reader, true);
+    }
     tryReleaseAllocatedResponsePayload(allocated);
     throw error;
-  } finally {
-    reader?.releaseLock?.();
   }
 }
 
@@ -1379,6 +1406,7 @@ async function readUnknownLengthAllocatedResponsePayload<Payload extends C2Respo
   const chunks: Uint8Array[] = [];
   let byteLength = 0;
   let reader: C2ReadableStreamReader | undefined;
+  let failed = false;
   try {
     reader = body.getReader();
     while (true) {
@@ -1400,10 +1428,11 @@ async function readUnknownLengthAllocatedResponsePayload<Payload extends C2Respo
       byteLength = nextByteLength;
     }
   } catch (error) {
+    failed = true;
     cancelStreamReaderDetached(reader, error);
     throw error;
   } finally {
-    reader?.releaseLock?.();
+    releaseStreamReaderLock(reader, failed);
   }
   const allocated = requireAllocatedResponsePayload<Payload>(allocator(byteLength), byteLength);
   try {
@@ -2255,8 +2284,7 @@ function hasCanonicalEnvelopeTokens(body: string): boolean {
     }
     return false;
   };
-  const skipJsonValue = (depth: number): string | undefined => {
-    if (depth > 128) return undefined;
+  const skipJsonValue = (containerDepth: number): string | undefined => {
     skipWs();
     if (index >= length) return undefined;
     const start = index;
@@ -2265,6 +2293,8 @@ function hasCanonicalEnvelopeTokens(body: string): boolean {
       return readJsonString() === undefined ? undefined : body.slice(start, index);
     }
     if (first === 0x7b) {
+      const nextDepth = containerDepth + 1;
+      if (nextDepth > 127) return undefined;
       index += 1;
       skipWs();
       if (index < length && body.charCodeAt(index) === 0x7d) {
@@ -2277,7 +2307,7 @@ function hasCanonicalEnvelopeTokens(body: string): boolean {
         skipWs();
         if (index >= length || body.charCodeAt(index) !== 0x3a) return undefined;
         index += 1;
-        if (skipJsonValue(depth + 1) === undefined) return undefined;
+        if (skipJsonValue(nextDepth) === undefined) return undefined;
         skipWs();
         if (index >= length) return undefined;
         const sep = body.charCodeAt(index);
@@ -2291,6 +2321,8 @@ function hasCanonicalEnvelopeTokens(body: string): boolean {
       return undefined;
     }
     if (first === 0x5b) {
+      const nextDepth = containerDepth + 1;
+      if (nextDepth > 127) return undefined;
       index += 1;
       skipWs();
       if (index < length && body.charCodeAt(index) === 0x5d) {
@@ -2298,7 +2330,7 @@ function hasCanonicalEnvelopeTokens(body: string): boolean {
         return body.slice(start, index);
       }
       while (index < length) {
-        if (skipJsonValue(depth + 1) === undefined) return undefined;
+        if (skipJsonValue(nextDepth) === undefined) return undefined;
         skipWs();
         if (index >= length) return undefined;
         const sep = body.charCodeAt(index);
