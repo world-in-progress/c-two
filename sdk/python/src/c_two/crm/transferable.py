@@ -12,6 +12,7 @@ from .payload_plan import (
     PayloadBinding,
     PayloadPlanKind,
     _payload_type,
+    decode_stage_of,
     fastdb_payload_binding,
     no_payload_binding,
     python_pickle_input_binding,
@@ -236,7 +237,6 @@ def _build_transfer_wrapper(
     def com_to_crm(*args, _c2_buffer=None, _c2_follow_budget=None):
         stage = "call_crm"
         prepared = None
-        output_hook = "deserialize"
         input_serializer = (
             input.serialize
             if input is not None and input.kind is not PayloadPlanKind.NO_PAYLOAD
@@ -328,7 +328,6 @@ def _build_transfer_wrapper(
             if hasattr(response, "release"):
                 view = memoryview(response)
                 if retained_owner:
-                    output_hook = "scoped_owner"
                     result_ready = False
                     try:
                         result = output_decoder(view)
@@ -386,7 +385,6 @@ def _build_transfer_wrapper(
                         )
                     raise
             elif retained_owner:
-                output_hook = "scoped_owner"
                 view = memoryview(response)
                 try:
                     result = output_decoder(view)
@@ -407,19 +405,34 @@ def _build_transfer_wrapper(
                 return HeldResult(result)
             return result
 
-        except error.CCError:
+        except error.CCBaseError:
+            # Native Core failures (CoreError with or without a semantic
+            # payload) and business CCError instances pass through unchanged;
+            # they are never re-wrapped into a client adapter code.
             raise
         except Exception as exc:
             details = _cause_details(exc)
             if stage == "serialize_input":
-                raise error.ClientSerializeInput(str(exc), details=details) from exc
-            if stage == "call_crm":
-                raise error.ClientCallResource(str(exc), details=details) from exc
+                # The call has not been sent yet: a client input encoding
+                # failure is retry-safe pre-dispatch.
+                raise error.SerializationError(
+                    error.ErrorCode.ClientInputSerializing,
+                    str(exc),
+                    details=details,
+                    transport_phase='pre_dispatch',
+                ) from exc
             if stage == "execute_direct":
-                raise error.ResourceExecuteFunction(str(exc), details=details) from exc
-            if output_hook == "scoped_owner":
-                raise error.ClientOutputFromBuffer(str(exc), details=details) from exc
-            raise error.ClientDeserializeOutput(str(exc), details=details) from exc
+                raise error.ResourceExecutionError(str(exc), details=details) from exc
+            if stage == "call_crm":
+                raise
+            # Output decoding: the failing payload hook decides the code —
+            # opening the buffer view (from_buffer) versus decoding content.
+            code = (
+                error.ErrorCode.ClientOutputFromBuffer
+                if decode_stage_of(exc) == 'from_buffer'
+                else error.ErrorCode.ClientOutputDeserializing
+            )
+            raise error.SerializationError(code, str(exc), details=details) from exc
         finally:
             if prepared is not None:
                 prepared.close()
@@ -440,17 +453,13 @@ def _build_transfer_wrapper(
             if output is not None and output.kind is not PayloadPlanKind.NO_PAYLOAD
             else None
         )
-        input_hook = "deserialize"
         if input_buffer_mode == "borrowed":
-            input_hook = "scoped_owner"
             if input is None or not input.supports_scoped_owner:
                 def input_decoder(_request):
                     raise ValueError(
                         "borrowed input requires an explicit FastDB Payload binding",
                     )
 
-        err = None
-        result = None
         stage = "deserialize_input"
         deserialized_args: tuple[object, ...] = ()
 
@@ -509,53 +518,57 @@ def _build_transfer_wrapper(
             stage = "execute_function"
             result = resource_method(*deserialized_args)
         except Exception as exc:
-            result = None
-            if _release_fn is not None:
-                try:
-                    release_input_buffer()
-                except Exception as cleanup_error:
-                    _attach_cleanup_error(exc, cleanup_error)
-            details = _cause_details(exc)
+            # The input lease must end before the failure crosses the
+            # dispatch boundary; the primary error always leads cleanup.
+            _cleanup_preserving_primary(exc, release_input_buffer)
             if stage == "deserialize_input":
-                if input_hook == "scoped_owner":
-                    err = error.ResourceInputFromBuffer(
-                        str(exc),
-                        details=details,
-                    )
-                else:
-                    err = error.ResourceDeserializeInput(
-                        str(exc),
-                        details=details,
-                    )
-            elif stage == "execute_function":
-                err = error.ResourceExecuteFunction(str(exc), details=details)
-            else:
-                err = error.ResourceSerializeOutput(str(exc), details=details)
+                code = (
+                    error.ErrorCode.ResourceInputFromBuffer
+                    if decode_stage_of(exc) == 'from_buffer'
+                    else error.ErrorCode.ResourceInputDeserializing
+                )
+                raise error.SerializationError(
+                    code, str(exc), details=_cause_details(exc),
+                ) from exc
+            # A business error raised by the resource keeps its semantic
+            # code, message and details; inner dispatch phases describe the
+            # inner call only and are cleared on the fresh projection.
+            clean = (
+                error._callback_semantic_copy(exc)
+                if isinstance(exc, error.CCBaseError)
+                else None
+            )
+            if clean is not None:
+                raise clean from exc
+            raise error.ResourceExecutionError(
+                str(exc), details=_cause_details(exc),
+            ) from exc
 
         serialized_result = b""
-        if err is None and output_serializer is not None:
+        if output_serializer is not None:
             try:
-                stage = "serialize_output"
                 serialized_result = output_serializer(result)
             except Exception as exc:
-                err = error.ResourceSerializeOutput(
+                _cleanup_preserving_primary(exc, release_input_buffer)
+                raise error.SerializationError(
+                    error.ErrorCode.ResourceOutputSerializing,
                     str(exc),
                     details=_cause_details(exc),
-                )
-                serialized_result = b""
+                ) from exc
 
         if _release_fn is not None:
+            # Borrowed inputs invalidate only after their output serialization
+            # completed; this is their single release point.
             try:
                 release_input_buffer()
             except Exception as exc:
-                if err is None:
-                    err = error.ResourceInputFromBuffer(
-                        str(exc),
-                        details=_cause_details(exc),
-                    )
-                    serialized_result = b""
+                raise error.SerializationError(
+                    error.ErrorCode.ResourceInputFromBuffer,
+                    str(exc),
+                    details=_cause_details(exc),
+                ) from exc
 
-        return error.CCError.serialize(err), serialized_result
+        return serialized_result
 
     @wraps(func)
     def transfer_wrapper(*args, **kwargs):

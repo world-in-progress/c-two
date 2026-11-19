@@ -220,11 +220,14 @@ class View:
             "-c",
             (
                 "from fastdb4py.payload import events; "
+                "from c_two.error import ErrorCode, SerializationError; "
                 "import c_two_contract as contract; "
                 "\ntry:\n"
                 "    contract.decode_method_1_echo_output(b'x')\n"
-                "except RuntimeError as error:\n"
-                "    assert str(error) == 'digest guard failed', error\n"
+                "except SerializationError as error:\n"
+                "    assert error.code == ErrorCode.ClientOutputDeserializing, error.code\n"
+                "    assert 'digest guard failed' in error.message, error.message\n"
+                "    assert not error.details, error.details\n"
                 "else:\n"
                 "    raise AssertionError('digest guard unexpectedly succeeded')\n"
                 "assert events == ['open', 'require', 'close'], events\n"

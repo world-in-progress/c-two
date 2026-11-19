@@ -147,11 +147,11 @@ def test_resource_failure_preserves_completed_item(relay_values, method):
     _, _, _, proxy, resource = relay_values
     stream = getattr(proxy, method)()
     assert next(stream) == 0
-    with pytest.raises(error.ResourceExecuteFunction, match="failed"):
+    with pytest.raises(error.ResourceExecutionError, match="failed"):
         next(stream)
     receipt = stream.close()
     assert receipt["completed"] is True
-    assert isinstance(receipt["error"], error.ResourceExecuteFunction)
+    assert isinstance(receipt["error"], error.ResourceExecutionError)
     assert receipt["error"].details.get("transport_phase") is None
     assert receipt["complete_items"] == 1
     assert resource.events == [

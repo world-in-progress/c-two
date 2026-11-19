@@ -34,8 +34,8 @@ fn all_targets_generate_server_stream() {
         "def method_1_echo(self, payload: Payload) -> Stream[Payload]:",
         "def hold_method_1_echo(self, payload: Payload) -> Stream[HeldResult[Payload]]:",
         "self._bound_client.begin_stream(\"echo\")",
-        "prepared.charge_input(payload.execution_report().used_bytes)",
-        "prepared.stream(request)",
+        "_project_call(prepared.charge_input, payload.execution_report().used_bytes)",
+        "_project_call(prepared.stream, request)",
         "Stream._from_encoded(",
         "decode_method_1_echo_output",
     ] {

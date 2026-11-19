@@ -38,12 +38,21 @@ from __future__ import annotations
 import threading
 from typing import Any, Callable, TYPE_CHECKING
 
+from ... import error
+
 if TYPE_CHECKING:
     from ..server.scheduler import Scheduler
 
 
 class _LocalRouteClosed(Exception):
     """Native admission closed before a same-process resource was entered."""
+
+
+def _closed_proxy_error() -> error.ResourceClosed:
+    """Local refusal for an explicitly closed CRM proxy (retry-safe)."""
+    return error.ResourceClosed(
+        'CRM proxy is closed', transport_phase='pre_dispatch',
+    )
 
 
 class _FollowingLocalRoute:
@@ -244,7 +253,7 @@ class CRMProxy:
         if state is None:
             return self
         if self._closed:
-            raise RuntimeError('Proxy is closed')
+            raise _closed_proxy_error()
 
         target = state.target
         if isinstance(target, CRMProxy):
@@ -304,7 +313,7 @@ class CRMProxy:
             current = state.target
             local = current if isinstance(current, tuple) else state.local
         if self._closed:
-            raise RuntimeError('Proxy is closed')
+            raise _closed_proxy_error()
         if not isinstance(current, CRMProxy):
             return self._local_snapshot(*local)
         return self._remote_snapshot(current, budget)
@@ -321,7 +330,7 @@ class CRMProxy:
     def _remote_snapshot(self, remote, budget) -> CRMProxy:
         with self._close_lock:
             if self._closed:
-                raise RuntimeError('Proxy is closed')
+                raise _closed_proxy_error()
             client = self._client
             if client is None:
                 if self._call_timeout is ...:
@@ -372,7 +381,7 @@ class CRMProxy:
         from ..._native import NativeCallOptions
         with self._close_lock:
             if self._closed:
-                raise RuntimeError('Proxy is closed')
+                raise _closed_proxy_error()
             view = object.__new__(type(self))
             for name in self.__slots__:
                 setattr(view, name, getattr(self, name))
@@ -392,7 +401,7 @@ class CRMProxy:
         """Reserve the Core operation before Python input serialization."""
         with self._close_lock:
             if self._closed:
-                raise RuntimeError('Proxy is closed')
+                raise _closed_proxy_error()
         if self._call_budget is not None:
             budget = self._call_budget
             self._call_budget = None
@@ -407,19 +416,21 @@ class CRMProxy:
         """Reserve the native stream call before encoding its input."""
         with self._close_lock:
             if self._closed:
-                raise RuntimeError('Proxy is closed')
+                raise _closed_proxy_error()
         if self._call_budget is not None:
             budget = self._call_budget
             self._call_budget = None
-            return _native_call(self._client.begin_stream_with_budget, method_name, budget)
-        return _native_call(self._client.begin_stream, method_name)
+            return _PreparedStream(
+                _native_call(self._client.begin_stream_with_budget, method_name, budget),
+            )
+        return _PreparedStream(_native_call(self._client.begin_stream, method_name))
 
     def open_direct_stream(self, method_name: str, args: tuple):
         from ..._native import NativeCallOptions
         from ...crm.stream import _ResourceStream
         with self._close_lock:
             if self._closed:
-                raise RuntimeError('Proxy is closed')
+                raise _closed_proxy_error()
         try:
             _native_call((self._call_options or NativeCallOptions()).validate_thread)
         except Exception as exc:
@@ -459,7 +470,7 @@ class CRMProxy:
         """
         with self._close_lock:
             if self._closed:
-                raise RuntimeError('Proxy is closed')
+                raise _closed_proxy_error()
         if self._mode in ('ipc', 'http'):
             return _native_call(self._client.call, method_name, data if data is not None else b'')
         raise NotImplementedError(
@@ -476,7 +487,7 @@ class CRMProxy:
         """
         with self._close_lock:
             if self._closed:
-                raise RuntimeError('Proxy is closed')
+                raise _closed_proxy_error()
         if self._mode != 'thread':
             raise NotImplementedError(
                 'call_direct() only available in thread-local mode',
@@ -503,37 +514,22 @@ class CRMProxy:
             return _invoke_local(method, args)
         method_idx = self._scheduler.method_idx(method_name)
         try:
-            guard = self._scheduler.execution_guard(method_idx)
+            guard = _native_call(self._scheduler.execution_guard, method_idx)
             # Final admission can fail after acquire while Python waits to run.
             # Normalize that native error before entering resource code.
-            guard.__enter__()
-        except RuntimeError as exc:
-            error_bytes = getattr(exc, 'error_bytes', None)
-            if error_bytes is not None:
-                from ...error import CCError, ResourceClosed
-                cc_err = CCError.deserialize(memoryview(error_bytes))
-                if isinstance(cc_err, ResourceClosed) and self._name:
-                    if (
-                        self._following_local is not None
-                        and self._scheduler.snapshot().closed
-                    ):
-                        raise _LocalRouteClosed() from exc
-                    raise ResourceClosed(
-                        f"route {self._name!r} is closed",
-                        details={'route': self._name},
-                    ) from exc
-                if cc_err is not None:
-                    raise cc_err from exc
-            if str(exc) == 'route closed':
-                from ...error import ResourceClosed
-                if (
-                    self._following_local is not None
-                    and self._scheduler.snapshot().closed
-                ):
-                    raise _LocalRouteClosed() from exc
-                details = {'route': self._name} if self._name else {}
-                message = f"route {self._name!r} is closed" if self._name else 'route is closed'
-                raise ResourceClosed(message, details=details) from exc
+            _native_call(guard.__enter__)
+        except error.ResourceClosed as exc:
+            if (
+                self._following_local is not None
+                and self._scheduler.snapshot().closed
+            ):
+                raise _LocalRouteClosed() from exc
+            if self._name:
+                raise error.ResourceClosed(
+                    f"route {self._name!r} is closed",
+                    details={'route': self._name},
+                    transport_phase='pre_dispatch',
+                ) from exc
             raise
         try:
             return _invoke_local(method, args)
@@ -544,8 +540,7 @@ class CRMProxy:
         """Read the current physical IPC connection without acquiring another."""
         with self._close_lock:
             if self._closed:
-                from ...error import ResourceClosed
-                raise ResourceClosed('CRM proxy is closed')
+                raise _closed_proxy_error()
             if self._mode == 'thread' and self._following_local is None:
                 from ...error import UnsupportedCallMode
                 raise UnsupportedCallMode('connection observation requires a physical IPC connection')
@@ -578,42 +573,24 @@ class CRMProxy:
 
 
 def _invoke_local(method, args):
-    from ...error import CCError, CoreError
-
     try:
         return method(*args)
-    except (CCError, CoreError) as exc:
-        # A downstream admission failure describes the inner call only.
-        exc.details = {
-            key: value
-            for key, value in exc.details.items()
-            if key not in ('transport_phase', 'dispatch_phase')
-        }
-        if isinstance(exc, CoreError):
-            exc.transport_phase = None
-            if exc.error_bytes is not None:
-                semantic = CCError.deserialize(memoryview(exc.error_bytes))
-                if semantic is not None:
-                    semantic.details.pop('transport_phase', None)
-                    semantic.details.pop('dispatch_phase', None)
-                exc.error_bytes = CCError.serialize(semantic)
-        raise
+    except error.CoreError as exc:
+        # A downstream admission failure describes the inner call only:
+        # re-raise a clean copy instead of mutating the business's object.
+        raise error._callback_core_copy(exc) from exc
+    except error.CCError as exc:
+        raise error._callback_error_copy(exc) from exc
 
 
 def _native_call(operation, *args, **kwargs):
-    """Keep canonical Core errors and their transport-phase observation."""
+    """Project a native failure's canonical semantic error, if it has one."""
     try:
         return operation(*args, **kwargs)
     except Exception as exc:
-        error_bytes = getattr(exc, 'error_bytes', None)
-        if error_bytes is not None:
-            from ...error import CCError
-            cc_error = CCError.deserialize(memoryview(error_bytes))
-            if cc_error is not None:
-                phase = getattr(exc, 'transport_phase', None)
-                if phase is not None:
-                    cc_error.details['transport_phase'] = phase
-                raise cc_error from exc
+        projected = error._project_native_error(exc)
+        if projected is not None:
+            raise projected from exc
         raise
 
 
@@ -630,6 +607,29 @@ class _PreparedClient:
 
     def charge_input(self, nbytes):
         return _native_call(self._prepared.charge_input, nbytes)
+
+    def close(self):
+        self._prepared.close()
+
+
+class _PreparedStream:
+    """One caller-thread stream preparation projecting native call failures.
+
+    Symmetric to :class:`_PreparedClient`: charging the encoded input and
+    starting the stream surface the same canonical semantic projection as
+    every other native call site instead of a bare ``CoreError``.
+    """
+
+    __slots__ = ('_prepared',)
+
+    def __init__(self, prepared):
+        self._prepared = prepared
+
+    def charge_input(self, nbytes):
+        return _native_call(self._prepared.charge_input, nbytes)
+
+    def stream(self, data=None):
+        return _native_call(self._prepared.stream, data if data is not None else b'')
 
     def close(self):
         self._prepared.close()

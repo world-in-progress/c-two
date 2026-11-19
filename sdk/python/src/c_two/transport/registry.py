@@ -50,7 +50,7 @@ from c_two.error import (
     CCError,
     ResourceNotFound,
     ResourceUnavailable,
-    RegistryUnavailable,
+    _project_native_error,
 )
 from .input_lifetime import _InputLifetime
 from .client.proxy import CRMProxy, _FollowingLocalRoute
@@ -90,13 +90,8 @@ def _is_missing_relay_address(exc: BaseException) -> bool:
 
 
 def _cc_error_from_native_exception(exc: BaseException) -> CCError | None:
-    error_bytes = getattr(exc, "error_bytes", None)
-    if error_bytes is None:
-        return None
-    try:
-        return CCError.deserialize(memoryview(error_bytes))
-    except TypeError:
-        return CCError.deserialize(error_bytes)
+    """Project the canonical semantic error of one native failure."""
+    return _project_native_error(exc)
 
 
 def _connect_native_call(operation, *args, **kwargs):
@@ -532,7 +527,7 @@ class Runtime:
                     local_copy_tracker=local_copy_tracker,
                 )
             else:
-                raise RegistryUnavailable(f"Unsupported relay target mode: {mode!r}")
+                raise RuntimeError(f"Unsupported relay target mode: {mode!r}")
 
         try:
             crm = crm_class()

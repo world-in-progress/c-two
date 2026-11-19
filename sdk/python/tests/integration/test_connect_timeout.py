@@ -141,13 +141,18 @@ def test_stalled_relay_connect_budget_and_recovery(mode, stalled_relay):
         with pytest.raises(recovered_error) as recovered:
             connect(1)
         assert time.monotonic() - started < 1
-        projected = recovered.value if mode == 'explicit' else cc.error.CCError.deserialize(recovered.value.error_bytes)
+        projected = recovered.value if mode == 'explicit' else recovered.value.semantic
         native = recovered.value.__cause__ if mode == 'explicit' else recovered.value
         assert type(native) is cc.error.CoreError
         assert isinstance(projected, cc.error.ResourceNotFound)
         assert projected.message == 'route not found: connect-timeout'
         assert projected.details['route_name'] == 'connect-timeout'
-        assert native.transport_phase == projected.details['transport_phase'] == 'application_detail'
+        # The phase authority ignores the peer's non-canonical detail: neither
+        # the native CoreError nor its projection reports a transport phase,
+        # and the arbitrary application detail survives untouched.
+        assert native.transport_phase is None
+        assert projected.transport_phase is None
+        assert projected.details['transport_phase'] == 'application_detail'
         assert len(paths) > previous_requests
     finally:
         release.set()

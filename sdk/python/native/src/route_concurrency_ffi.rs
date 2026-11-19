@@ -1,6 +1,5 @@
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
-use pyo3::types::PyBytes;
 
 use c2_core::{
     RouteConcurrency, RouteConcurrencyError, RouteConcurrencyGuard, RouteConcurrencySnapshot,
@@ -60,25 +59,18 @@ fn acquire_error_to_py(py: Python<'_>, err: RouteConcurrencyError) -> PyErr {
         RouteConcurrencyError::DomainAdmission { .. } => {
             crate::core_error_ffi::core_error_to_py(c2_error::C2Error::from(err).into())
         }
-        RouteConcurrencyError::Closed | RouteConcurrencyError::Unavailable => {
-            let code = match err {
-                RouteConcurrencyError::Closed => c2_error::ErrorCode::ResourceClosed,
-                _ => c2_error::ErrorCode::ResourceUnavailable,
-            };
-            let message = err.to_string();
-            let exc = PyRuntimeError::new_err(message.clone());
-            let error_bytes = c2_error::C2Error::new(code, message).to_wire_bytes();
-            if let Err(attr_err) = exc
-                .value(py)
-                .setattr("error_bytes", PyBytes::new(py, &error_bytes))
-            {
-                return attr_err;
-            }
-            exc
-        }
-        RouteConcurrencyError::Capacity { field, limit } => PyRuntimeError::new_err(format!(
-            "route concurrency capacity exceeded: {field}={limit}"
-        )),
+        // Route admission refuses the call before the resource runs: project
+        // the canonical semantic error (Closed -> ResourceClosed, Unavailable
+        // and Capacity -> ResourceUnavailable, matching c2-core's host
+        // admission mapping) as a typed c_two.error exception that carries
+        // transport_phase='pre_dispatch'.
+        refusal @ (RouteConcurrencyError::Closed
+        | RouteConcurrencyError::Unavailable
+        | RouteConcurrencyError::Capacity { .. }) => crate::core_error_ffi::semantic_error_to_py(
+            py,
+            c2_error::C2Error::from(refusal),
+            "pre_dispatch",
+        ),
     }
 }
 

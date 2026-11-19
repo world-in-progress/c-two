@@ -291,8 +291,6 @@ def test_error_facade_does_not_reimplement_wire_codec():
     offenders = [needle for needle in forbidden if needle in source]
     assert offenders == []
     assert "_native.error_registry" in source
-    assert "_native.encode_error_wire" in source
-    assert "_native.decode_error_wire_parts" in source
 
 
 def test_registry_does_not_own_generic_relay_or_route_authority():
@@ -451,7 +449,6 @@ def test_explicit_ipc_connect_branch_bypasses_relay_facade():
         "connect_via_relay",
         "connect_explicit_relay_http",
         "ResourceUnavailable",
-        "RegistryUnavailable",
     ]
     offenders = [needle for needle in forbidden if needle in ipc_branch]
     assert offenders == []

@@ -87,10 +87,43 @@ for name, value in {'Payload': Payload, 'CompiledSpec': CompiledSpec,
     setattr(payload_module, name, value)
 sys.modules['fastdb4py'] = fastdb
 sys.modules['fastdb4py.payload'] = payload_module
+
+class CCBaseError(Exception):
+    pass
+
+class ErrorCode:
+    Unknown = 0
+    ResourceInputDeserializing = 1
+    ResourceOutputSerializing = 2
+    ResourceFunctionExecuting = 3
+    ResourceInputFromBuffer = 4
+    ClientInputSerializing = 5
+    ClientOutputDeserializing = 6
+    ClientCallingResource = 7
+    ClientOutputFromBuffer = 8
+
+def SerializationError(code, message=None, details=None, transport_phase=None):
+    error = CCBaseError(f'{int(code)}: {message}')
+    error.code = int(code)
+    error.details = dict(details or {})
+    return error
+
+def _project_native_error(exc):
+    # This consumer never produces semantic CoreErrors; the generated guard
+    # must only depend on the projection hook existing.
+    return None
+
 c_two = types.ModuleType('c_two')
 c_two.Stream = Stream
 c_two.HeldResult = HeldResult
+error_module = types.ModuleType('c_two.error')
+error_module.CCBaseError = CCBaseError
+error_module.ErrorCode = ErrorCode
+error_module.SerializationError = SerializationError
+error_module._project_native_error = _project_native_error
+c_two.error = error_module
 sys.modules['c_two'] = c_two
+sys.modules['c_two.error'] = error_module
 
 spec = importlib.util.spec_from_file_location('contract', sys.argv[1])
 contract = importlib.util.module_from_spec(spec)

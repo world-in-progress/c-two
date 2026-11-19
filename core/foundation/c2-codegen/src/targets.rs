@@ -772,7 +772,8 @@ fn render_python(descriptor: &ValidatedContractDescriptor, methods: &[TargetMeth
          from pathlib import Path\n\
          from types import ModuleType\n\
          from typing import Any, Protocol\n\n\
-         from fastdb4py.payload import Payload\n\n",
+         from fastdb4py.payload import Payload\n\
+         from c_two.error import CCBaseError, ErrorCode, SerializationError, _project_native_error\n\n",
     );
     if has_stream {
         output.push_str("from c_two import HeldResult, Stream\n\n");
@@ -866,6 +867,7 @@ fn render_python(descriptor: &ValidatedContractDescriptor, methods: &[TargetMeth
     {
         output.push('\n');
     }
+    output.push_str(PYTHON_ERROR_HELPERS);
     output.push_str("class BoundClient(Protocol):\n    def call(self, method_name: str, data: bytes) -> Any: ...\n");
     if has_stream {
         output.push_str(
@@ -913,6 +915,62 @@ fn render_python(descriptor: &ValidatedContractDescriptor, methods: &[TargetMeth
     output
 }
 
+const PYTHON_ERROR_HELPERS: &str = "\
+def _fastdb_cause_details(exc: BaseException) -> dict[str, str]:
+    payload_error = getattr(sys.modules.get(\"fastdb4py.payload\"), \"PayloadError\", None)
+    if payload_error is None or not isinstance(exc, payload_error):
+        return {}
+    fields: dict[str, str] = {}
+    for source, target in (
+        (\"code\", \"fastdb_code\"),
+        (\"symbol\", \"fastdb_symbol\"),
+        (\"path\", \"fastdb_path\"),
+        (\"message\", \"fastdb_message\"),
+        (\"details_json\", \"fastdb_details_json\"),
+    ):
+        value = getattr(exc, source, None)
+        if value is not None:
+            fields[target] = str(value)
+    if fields:
+        fields[\"cause_owner\"] = \"fastdb\"
+    return fields
+
+def _serialization_error(code: ErrorCode, exc: BaseException) -> SerializationError:
+    return SerializationError(code, str(exc), details=_fastdb_cause_details(exc))
+
+def _client_input_error(exc: BaseException) -> SerializationError:
+    return SerializationError(
+        ErrorCode.ClientInputSerializing,
+        str(exc),
+        details=_fastdb_cause_details(exc),
+        transport_phase=\"pre_dispatch\",
+    )
+
+def _release_failed_payload(payload: Any) -> None:
+    close = getattr(payload, \"close\", None)
+    if close is None:
+        return
+    try:
+        close()
+    except BaseException as cleanup_error:
+        print(f\"Warning: payload decode cleanup failed: {cleanup_error}\", file=sys.stderr)
+
+def _project_call(operation, *args):
+    \"\"\"Project a native call failure's canonical semantic error, if any.
+
+    A CRMProxy bound client already projects internally; this thin guard
+    keeps custom native bound clients on the same typed-exception surface.
+    \"\"\"
+    try:
+        return operation(*args)
+    except BaseException as exc:
+        projected = _project_native_error(exc)
+        if projected is not None:
+            raise projected from exc
+        raise
+
+";
+
 fn render_python_client_method(output: &mut String, method: &TargetMethod<'_>) {
     if method.mode == MethodMode::ServerStream {
         render_python_stream_client_method(output, method);
@@ -937,7 +995,7 @@ fn render_python_client_method(output: &mut String, method: &TargetMethod<'_>) {
     output.push_str(&format!(
         "\n    def {symbol}(self{parameter}) -> {return_type}:\n\
          \x20       request = {request}\n\
-         \x20       response = self._bound_client.call({}, request)\n\
+         \x20       response = _project_call(self._bound_client.call, {}, request)\n\
          \x20       return decode_{symbol}_output(_copy_and_release_response(response))\n",
         quoted(method.name),
     ));
@@ -966,11 +1024,6 @@ fn render_python_stream_client_method(output: &mut String, method: &TargetMethod
         } else {
             "Stream[Payload]"
         };
-        let charge = if method.input_sha256.is_some() {
-            "            prepared.charge_input(payload.execution_report().used_bytes)\n"
-        } else {
-            ""
-        };
         let invalidator = if held {
             ", invalidator=Payload.invalidate"
         } else {
@@ -978,13 +1031,24 @@ fn render_python_stream_client_method(output: &mut String, method: &TargetMethod
         };
         let held_literal = if held { "True" } else { "False" };
         let method_name = quoted(method.name);
+        let charge_block = if method.input_sha256.is_some() {
+            "\
+             \x20           try:\n\
+             \x20               _project_call(prepared.charge_input, payload.execution_report().used_bytes)\n\
+             \x20           except CCBaseError:\n\
+             \x20               raise\n\
+             \x20           except BaseException as exc:\n\
+             \x20               raise _client_input_error(exc) from exc\n"
+        } else {
+            ""
+        };
         output.push_str(&format!(
             "\n    def {name}(self{parameter}) -> {return_type}:\n\
              \x20       prepared = self._bound_client.begin_stream({method_name})\n\
              \x20       try:\n\
-             {charge}\
+             {charge_block}\
              \x20           request = {request}\n\
-             \x20           native = prepared.stream(request)\n\
+             \x20           native = _project_call(prepared.stream, request)\n\
              \x20           return Stream._from_encoded(native, decode_{symbol}_output, held={held_literal}{invalidator}, tracker=self._bound_client.local_copy_tracker, route_name=self._bound_client.route_name, method_name={method_name})\n\
              \x20       finally:\n\
              \x20           prepared.close()\n",
@@ -1000,28 +1064,75 @@ fn render_python_direction(
 ) {
     let symbol = method_symbol(method.index, method.name);
     if let Some(digest) = digest {
+        // Client-side input encoding is retry-safe pre-dispatch; server-side
+        // output encoding carries code 2.
+        let encode_code = if direction == "input" {
+            "_client_input_error(exc)"
+        } else {
+            "_serialization_error(ErrorCode.ResourceOutputSerializing, exc)"
+        };
+        // The input decoder runs on the resource side (codes 4/1), the output
+        // decoder on the client side (codes 8/6); opening the buffer view is
+        // from_buffer, verifying the payload spec is deserialize.
+        let (from_buffer_code, deserialize_code) = if direction == "input" {
+            (
+                "ErrorCode.ResourceInputFromBuffer",
+                "ErrorCode.ResourceInputDeserializing",
+            )
+        } else {
+            (
+                "ErrorCode.ClientOutputFromBuffer",
+                "ErrorCode.ClientOutputDeserializing",
+            )
+        };
         output.push_str(&format!(
             "def encode_{symbol}_{direction}(payload: Payload) -> bytes:\n\
-             \x20   payload.require_spec_sha256(_PAYLOAD_{digest}.PAYLOAD_SHA256_BYTES)\n\
-             \x20   return payload.binary_bytes()\n\n\
-             def decode_{symbol}_{direction}(data: bytes) -> Payload:\n\
-             \x20   payload = Payload.open_copy(_PAYLOAD_{digest}.compile_spec(), data)\n\
              \x20   try:\n\
              \x20       payload.require_spec_sha256(_PAYLOAD_{digest}.PAYLOAD_SHA256_BYTES)\n\
-             \x20   except BaseException:\n\
-             \x20       try:\n\
-             \x20           payload.close()\n\
-             \x20       except BaseException as cleanup_error:\n\
-             \x20           print(f\"Warning: payload decode cleanup failed: {{cleanup_error}}\", file=sys.stderr)\n\
+             \x20       return payload.binary_bytes()\n\
+             \x20   except CCBaseError:\n\
              \x20       raise\n\
+             \x20   except BaseException as exc:\n\
+             \x20       raise {encode_code} from exc\n\n\
+             def decode_{symbol}_{direction}(data: bytes) -> Payload:\n\
+             \x20   try:\n\
+             \x20       spec = _PAYLOAD_{digest}.compile_spec()\n\
+             \x20   except CCBaseError:\n\
+             \x20       raise\n\
+             \x20   except BaseException as exc:\n\
+             \x20       raise _serialization_error({from_buffer_code}, exc) from exc\n\
+             \x20   try:\n\
+             \x20       payload = Payload.open_copy(spec, data)\n\
+             \x20   except CCBaseError:\n\
+             \x20       raise\n\
+             \x20   except BaseException as exc:\n\
+             \x20       raise _serialization_error({from_buffer_code}, exc) from exc\n\
+             \x20   try:\n\
+             \x20       payload.require_spec_sha256(_PAYLOAD_{digest}.PAYLOAD_SHA256_BYTES)\n\
+             \x20   except CCBaseError:\n\
+             \x20       _release_failed_payload(payload)\n\
+             \x20       raise\n\
+             \x20   except BaseException as exc:\n\
+             \x20       _release_failed_payload(payload)\n\
+             \x20       raise _serialization_error({deserialize_code}, exc) from exc\n\
              \x20   return payload\n\n"
         ));
     } else {
+        let decode_code = if direction == "input" {
+            "ErrorCode.ResourceInputDeserializing"
+        } else {
+            "ErrorCode.ClientOutputDeserializing"
+        };
         output.push_str(&format!(
             "def encode_{symbol}_{direction}() -> bytes:\n\
              \x20   return b\"\"\n\n\
              def decode_{symbol}_{direction}(data: bytes) -> None:\n\
-             \x20   _require_empty_payload({}, {direction:?}, data)\n\n",
+             \x20   try:\n\
+             \x20       _require_empty_payload({}, {direction:?}, data)\n\
+             \x20   except CCBaseError:\n\
+             \x20       raise\n\
+             \x20   except BaseException as exc:\n\
+             \x20       raise _serialization_error({decode_code}, exc) from exc\n\n",
             quoted(method.name),
         ));
     }

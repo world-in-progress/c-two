@@ -1,5 +1,5 @@
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyDict};
+use pyo3::types::PyDict;
 
 use c2_core::{
     Error, LifecycleError, LocalIoCause, RegisterFailureOutcome, RelayCleanupError,
@@ -9,6 +9,9 @@ use c2_core::{
 pyo3::import_exception!(c_two.error, CoreError);
 
 pub(crate) fn core_error_to_py(error: Error) -> PyErr {
+    // The Core authority classifies the dispatch phase once; Python only
+    // reads the projected `_transport_phase` slot.
+    let phase = phase_str(error.transport_phase());
     match error {
         mismatch @ Error::ProtocolVersionMismatch { local, peer } => local_error(
             "protocol_version_mismatch",
@@ -18,7 +21,7 @@ pub(crate) fn core_error_to_py(error: Error) -> PyErr {
                 set_attr(value, "local_protocol_version", local);
                 set_attr(value, "peer_protocol_version", peer);
                 set_attr(value, "transport_kind", "ipc");
-                set_attr(value, "transport_phase", "pre_dispatch");
+                set_attr(value, "_transport_phase", "pre_dispatch");
                 set_attr(value, "fallback_eligible", false);
             },
         ),
@@ -28,19 +31,20 @@ pub(crate) fn core_error_to_py(error: Error) -> PyErr {
                 let value = exception.value(py);
                 set_io_cause(value, None);
                 set_semantic_error(value, &error);
+                set_attr(value, "_transport_phase", phase);
             });
             exception
         }
-        Error::Contract(error) => local_error("contract", error.to_string(), None, |_| {}),
-        Error::Admission(error) => local_error("admission", error.to_string(), None, |_| {}),
+        Error::Contract(error) => local_error("contract", error.to_string(), None, |value| {
+            set_attr(value, "_transport_phase", phase);
+        }),
+        Error::Admission(error) => local_error("admission", error.to_string(), None, |value| {
+            set_attr(value, "_transport_phase", phase);
+        }),
         Error::Transport(error) => {
             let kind = match error.kind() {
                 TransportKind::Ipc => "ipc",
                 TransportKind::Http => "http",
-            };
-            let phase = match error.phase() {
-                TransportPhase::PreDispatch => "pre_dispatch",
-                TransportPhase::DispatchUncertain => "dispatch_uncertain",
             };
             let fallback_eligible = error.is_fallback_eligible();
             local_error(
@@ -49,21 +53,10 @@ pub(crate) fn core_error_to_py(error: Error) -> PyErr {
                 error.local_io_cause(),
                 |value| {
                     set_attr(value, "transport_kind", kind);
-                    set_attr(value, "transport_phase", phase);
+                    set_attr(value, "_transport_phase", phase);
                     set_attr(value, "fallback_eligible", fallback_eligible);
                     if let Some(semantic) = error.semantic_error() {
-                        set_attr(value, "code", u16::from(semantic.code));
-                        set_attr(value, "name", semantic.code.name());
-                        let details = PyDict::new(value.py());
-                        for (key, item) in &semantic.details {
-                            let _ = details.set_item(key, item);
-                        }
-                        set_attr(value, "details", details);
-                        set_attr(
-                            value,
-                            "error_bytes",
-                            PyBytes::new(value.py(), &semantic.to_wire_bytes()),
-                        );
+                        set_semantic_error(value, &semantic);
                     }
                 },
             )
@@ -72,14 +65,55 @@ pub(crate) fn core_error_to_py(error: Error) -> PyErr {
     }
 }
 
+fn phase_str(phase: Option<TransportPhase>) -> Option<&'static str> {
+    phase.map(|phase| match phase {
+        TransportPhase::PreDispatch => "pre_dispatch",
+        TransportPhase::DispatchUncertain => "dispatch_uncertain",
+    })
+}
+
+/// Project one canonical semantic error as a public `c_two.error` exception.
+///
+/// Used by native admission surfaces that refuse a call before any CoreError
+/// family exists; the projection carries the caller-supplied dispatch phase.
+pub(crate) fn semantic_error_to_py(py: Python<'_>, error: c2_error::C2Error, phase: &str) -> PyErr {
+    let factory = py
+        .import("c_two.error")
+        .and_then(|module| module.getattr("CCError"))
+        .and_then(|class| class.getattr("_from_parts"));
+    let factory = match factory {
+        Ok(factory) => factory,
+        Err(err) => return err,
+    };
+    let details = PyDict::new(py);
+    for (key, item) in &error.details {
+        let _ = details.set_item(key, item);
+    }
+    let kwargs = PyDict::new(py);
+    if let Err(err) = kwargs.set_item("transport_phase", phase) {
+        return err;
+    }
+    match factory.call(
+        (
+            u16::from(error.code),
+            error.message.as_str(),
+            details.as_any(),
+        ),
+        Some(&kwargs),
+    ) {
+        Ok(value) => PyErr::from_value(value),
+        Err(err) => err,
+    }
+}
+
+/// Project the immutable semantic snapshot of one CoreError value: the code,
+/// its registry name, the inner semantic message and the diagnostic details.
 fn set_semantic_error(value: &Bound<'_, PyAny>, error: &c2_error::C2Error) {
     set_attr(value, "code", u16::from(error.code));
     set_attr(value, "name", error.code.name());
+    set_attr(value, "semantic_message", error.message.as_str());
     let details = PyDict::new(value.py());
     for (key, item) in &error.details {
-        if key == "transport_phase" {
-            set_attr(value, "transport_phase", item);
-        }
         if key == "fallback_eligible" {
             set_attr(value, "fallback_eligible", item == "true");
         }
@@ -89,11 +123,6 @@ fn set_semantic_error(value: &Bound<'_, PyAny>, error: &c2_error::C2Error) {
         let _ = details.set_item(key, item);
     }
     set_attr(value, "details", details);
-    set_attr(
-        value,
-        "error_bytes",
-        PyBytes::new(value.py(), &error.to_wire_bytes()),
-    );
 }
 
 #[cfg(test)]
@@ -137,6 +166,72 @@ mod tests {
                         .unwrap()
                 );
             }
+        });
+    }
+
+    #[test]
+    fn transport_error_projects_semantic_snapshot_without_wire_bytes() {
+        Python::initialize();
+        Python::attach(|py| {
+            let semantic = c2_error::C2Error::new(
+                c2_error::ErrorCode::ResourceRemoved,
+                "grid withdrawn by owner",
+            )
+            .with_details(std::collections::BTreeMap::from([(
+                "route".into(),
+                "grid".into(),
+            )]));
+            let rejected = c2_ipc::IpcError::LocalCallRejected(semantic.clone());
+            let error = core_error_to_py(c2_core::normalize_ipc_error(
+                c2_ipc::IpcError::ResponseFailure(Box::new(rejected)),
+                TransportPhase::PreDispatch,
+            ));
+            let value = error.value(py);
+            assert_eq!(
+                value.getattr("code").unwrap().extract::<u16>().unwrap(),
+                u16::from(c2_error::ErrorCode::ResourceRemoved)
+            );
+            assert_eq!(
+                value.getattr("name").unwrap().extract::<String>().unwrap(),
+                "ResourceRemoved"
+            );
+            assert_eq!(
+                value
+                    .getattr("semantic_message")
+                    .unwrap()
+                    .extract::<String>()
+                    .unwrap(),
+                "grid withdrawn by owner"
+            );
+            assert_eq!(
+                value
+                    .getattr("transport_phase")
+                    .unwrap()
+                    .extract::<String>()
+                    .unwrap(),
+                "dispatch_uncertain"
+            );
+            let module = py.import("c_two.error").unwrap();
+            let projected = value.getattr("semantic").unwrap();
+            assert!(projected
+                .is_instance(&module.getattr("ResourceRemoved").unwrap())
+                .unwrap());
+            assert_eq!(
+                projected
+                    .getattr("message")
+                    .unwrap()
+                    .extract::<String>()
+                    .unwrap(),
+                "grid withdrawn by owner"
+            );
+            assert_eq!(
+                projected
+                    .getattr("transport_phase")
+                    .unwrap()
+                    .extract::<String>()
+                    .unwrap(),
+                "dispatch_uncertain"
+            );
         });
     }
 
@@ -191,7 +286,7 @@ mod tests {
             for name in [
                 "code",
                 "name",
-                "error_bytes",
+                "semantic_message",
                 "io_operation",
                 "io_kind",
                 "raw_os_error",
@@ -200,6 +295,46 @@ mod tests {
             }
         });
     }
+
+    #[test]
+    fn semantic_error_projection_reads_core_phase_from_semantic_details() {
+        Python::initialize();
+        Python::attach(|py| {
+            let mut semantic = c2_error::C2Error::new(
+                c2_error::ErrorCode::CallDeadlineExceeded,
+                "deadline elapsed before a definitive outcome",
+            );
+            semantic
+                .details
+                .insert("transport_phase".into(), "dispatch_uncertain".into());
+            let error = core_error_to_py(Error::Semantic(semantic));
+            let value = error.value(py);
+            assert_eq!(
+                value
+                    .getattr("transport_phase")
+                    .unwrap()
+                    .extract::<String>()
+                    .unwrap(),
+                "dispatch_uncertain"
+            );
+            let projected = value.getattr("semantic").unwrap();
+            let deadline_class = py
+                .import("c_two.error")
+                .unwrap()
+                .getattr("CallDeadlineExceeded")
+                .unwrap();
+            assert!(projected.is_instance(&deadline_class).unwrap());
+            assert_eq!(
+                projected
+                    .getattr("transport_phase")
+                    .unwrap()
+                    .extract::<String>()
+                    .unwrap(),
+                "dispatch_uncertain"
+            );
+        });
+    }
+
     #[test]
     fn registration_failure_preserves_semantic_error_and_original_receipt() {
         Python::initialize();
@@ -270,14 +405,13 @@ mod tests {
                         .unwrap(),
                     semantic.details
                 );
-                let bytes = value
-                    .getattr("error_bytes")
-                    .unwrap()
-                    .extract::<Vec<u8>>()
-                    .unwrap();
                 assert_eq!(
-                    c2_error::C2Error::from_wire_bytes(&bytes).unwrap().unwrap(),
-                    semantic
+                    value
+                        .getattr("semantic_message")
+                        .unwrap()
+                        .extract::<String>()
+                        .unwrap(),
+                    "canonical relay refusal"
                 );
                 assert_eq!(
                     value
@@ -322,15 +456,68 @@ mod tests {
             }
         });
     }
+
+    #[test]
+    fn semantic_error_to_py_builds_typed_exception_with_phase() {
+        Python::initialize();
+        Python::attach(|py| {
+            let error = semantic_error_to_py(
+                py,
+                c2_error::C2Error::new(c2_error::ErrorCode::ResourceClosed, "route closed")
+                    .with_details(std::collections::BTreeMap::from([(
+                        "route".into(),
+                        "grid".into(),
+                    )])),
+                "pre_dispatch",
+            );
+            let value = error.value(py);
+            let module = py.import("c_two.error").unwrap();
+            assert!(value
+                .is_instance(&module.getattr("ResourceClosed").unwrap())
+                .unwrap());
+            assert_eq!(
+                value
+                    .getattr("message")
+                    .unwrap()
+                    .extract::<String>()
+                    .unwrap(),
+                "route closed"
+            );
+            assert_eq!(
+                value
+                    .getattr("transport_phase")
+                    .unwrap()
+                    .extract::<String>()
+                    .unwrap(),
+                "pre_dispatch"
+            );
+            let details = value.getattr("details").unwrap();
+            assert_eq!(
+                details
+                    .get_item("route")
+                    .unwrap()
+                    .extract::<String>()
+                    .unwrap(),
+                "grid"
+            );
+        });
+    }
 }
 
 pub(crate) fn lifecycle_error_to_py(error: LifecycleError) -> PyErr {
+    let wrapped = Error::Lifecycle(error);
+    let phase = phase_str(wrapped.transport_phase());
+    let Error::Lifecycle(error) = wrapped else {
+        unreachable!("wrapped value stays a lifecycle error");
+    };
     let message = error.to_string();
     local_error(
         "lifecycle",
         message,
         error.local_io_cause(),
-        |value| match &error {
+        |value| {
+            set_attr(value, "_transport_phase", phase);
+            match &error {
             LifecycleError::RuntimeRetired => {
                 set_attr(value, "lifecycle_kind", "runtime_retired");
             }
@@ -408,6 +595,7 @@ pub(crate) fn lifecycle_error_to_py(error: LifecycleError) -> PyErr {
             }
             LifecycleError::Relay(_) => {
                 set_attr(value, "lifecycle_kind", "relay");
+            }
             }
         },
     )

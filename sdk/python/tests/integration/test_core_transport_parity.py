@@ -38,7 +38,7 @@ def test_direct_ipc_is_selected_by_the_single_core_client():
 
 
 def test_semantic_error_fields_are_projected_from_core():
-    from c_two.error import ResourceExecuteFunction
+    from c_two.error import ResourceExecutionError
 
     @cc.crm(namespace="test.core-error", version="0.1.0")
     class Failure:
@@ -56,7 +56,7 @@ def test_semantic_error_fields_are_projected_from_core():
         address=cc.server_address(),
     )
     try:
-        with pytest.raises(ResourceExecuteFunction) as caught:
+        with pytest.raises(ResourceExecutionError) as caught:
             proxy.fail()
         assert caught.value.message.endswith("portable Python fixture failure")
         assert isinstance(caught.value.details, dict)
@@ -67,7 +67,7 @@ def test_semantic_error_fields_are_projected_from_core():
 def test_semantic_error_fields_match_direct_explicit_and_relay_aware(
     start_c3_relay,
 ):
-    from c_two.error import ResourceExecuteFunction
+    from c_two.error import ResourceExecutionError
 
     @cc.crm(namespace="test.core-error-parity", version="0.1.0")
     class Failure:
@@ -104,7 +104,7 @@ def test_semantic_error_fields_match_direct_explicit_and_relay_aware(
         ]
         receipts = []
         for proxy in proxies:
-            with pytest.raises(ResourceExecuteFunction) as caught:
+            with pytest.raises(ResourceExecutionError) as caught:
                 proxy.fail()
             receipts.append(
                 (

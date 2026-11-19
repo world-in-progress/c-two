@@ -125,7 +125,7 @@ def test_plain_crm_local_calls_and_errors_never_import_fastdb(
                 assert proxy.nothing(None) is None
                 try:
                     proxy.fail()
-                except cc.error.ResourceExecuteFunction as exc:
+                except cc.error.ResourceExecutionError as exc:
                     assert 'ordinary failure' in str(exc)
                     assert not exc.details
                 else:
@@ -220,13 +220,15 @@ def test_pickle_ipc_between_processes_without_fastdb(isolated_source):
             assert copied['values'] is not original['values']
             try:
                 proxy.echo(lambda: None)
-            except cc.error.ClientSerializeInput as exc:
+            except cc.error.SerializationError as exc:
+                assert exc.code == cc.error.ErrorCode.ClientInputSerializing
+                assert exc.transport_phase == 'pre_dispatch'
                 assert not exc.details
             else:
                 raise AssertionError('unpicklable input was accepted')
             try:
                 proxy.fail()
-            except cc.error.ResourceExecuteFunction as exc:
+            except cc.error.ResourceExecutionError as exc:
                 assert 'ordinary IPC failure' in str(exc)
                 assert not exc.details
             else:

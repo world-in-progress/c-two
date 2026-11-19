@@ -264,16 +264,9 @@ def _fake_fastdb_binding(
     )
 
 
-@pytest.mark.parametrize(
-    ("held", "expected_error"),
-    [
-        (False, error.ClientDeserializeOutput),
-        (True, error.ClientOutputFromBuffer),
-    ],
-)
+@pytest.mark.parametrize("held", [False, True])
 def test_decode_error_remains_primary_when_response_cleanup_also_fails(
     held: bool,
-    expected_error: type[error.CCError],
 ) -> None:
     response = _FailingReleaseResponse(b"payload")
 
@@ -302,9 +295,12 @@ def test_decode_error_remains_primary_when_response_cleanup_also_fails(
     )
 
     kwargs = {"_c2_buffer": "hold"} if held else {}
-    with pytest.raises(expected_error) as raised:
+    with pytest.raises(error.SerializationError) as raised:
         wrapped(Contract(), **kwargs)
 
+    # A decode-hook failure keeps the deserialize code under hold too; the
+    # from_buffer code is reserved for buffer-view construction failures.
+    assert raised.value.code == error.ErrorCode.ClientOutputDeserializing
     assert "decode failed" in raised.value.message
     assert "local buffer export is active" not in raised.value.message
     assert "local buffer export is active" in str(raised.value.__cause__.__context__)
@@ -389,9 +385,10 @@ def test_post_decode_release_failure_invalidates_unreturned_owner() -> None:
         ),
     )
 
-    with pytest.raises(error.ClientDeserializeOutput, match="local buffer export is active"):
+    with pytest.raises(error.SerializationError, match="local buffer export is active") as raised:
         wrapped(Contract())
 
+    assert raised.value.code == error.ErrorCode.ClientOutputDeserializing
     assert invalidated == [owner]
     assert response.release_calls == 1
 
@@ -434,9 +431,10 @@ def test_retained_tracking_failure_invalidates_owner_then_releases_response() ->
         ),
     )
 
-    with pytest.raises(error.ClientOutputFromBuffer, match="tracking failed"):
+    with pytest.raises(error.SerializationError, match="tracking failed") as raised:
         wrapped(Contract(), _c2_buffer="hold")
 
+    assert raised.value.code == error.ErrorCode.ClientOutputDeserializing
     assert events == ["track", "invalidate", "release"]
 
 
@@ -487,11 +485,13 @@ def test_fastdb_cause_fields_survive_client_input_error_wrapping() -> None:
 
     wrong = build_payload(OTHER_SPEC)
     try:
-        with pytest.raises(error.ClientSerializeInput) as raised:
+        with pytest.raises(error.SerializationError) as raised:
             Echo.echo(Contract(), wrong)
     finally:
         wrong.close()
 
+    assert raised.value.code == error.ErrorCode.ClientInputSerializing
+    assert raised.value.transport_phase == 'pre_dispatch'
     assert raised.value.details == FASTDB_DIGEST_MISMATCH_CAUSE
 
 
@@ -519,13 +519,12 @@ def test_missing_payload_is_classified_at_resource_deserialize_boundary() -> Non
         output=no_payload_binding(),
     )
 
-    error_bytes, result = wrapped(Contract())
-    restored = error.CCError.deserialize(error_bytes)
+    with pytest.raises(error.SerializationError) as raised:
+        wrapped(Contract())
 
     assert decoded_sources == [None]
-    assert result == b""
-    assert isinstance(restored, error.ResourceDeserializeInput)
-    assert "portable payload bytes are missing" in restored.message
+    assert raised.value.code == error.ErrorCode.ResourceInputDeserializing
+    assert "portable payload bytes are missing" in raised.value.message
 
 
 def test_non_fastdb_error_fields_are_not_misattributed_to_fastdb() -> None:
@@ -571,9 +570,11 @@ def test_non_fastdb_error_fields_are_not_misattributed_to_fastdb() -> None:
         output=no_payload_binding(),
     )
 
-    with pytest.raises(error.ClientSerializeInput) as raised:
+    with pytest.raises(error.SerializationError) as raised:
         wrapped(Contract(), object())
 
+    assert raised.value.code == error.ErrorCode.ClientInputSerializing
+    assert raised.value.transport_phase == 'pre_dispatch'
     assert raised.value.details == {}
 
 
@@ -616,11 +617,17 @@ def test_borrowed_checked_owner_invalidates_before_local_request_release(fail_re
         request.release()
 
     try:
-        error_bytes, _output = wrapped(
-            Contract(), request, _release_fn=release_request,
-            _c2_input_buffer_mode='borrowed',
-        )
-        assert bool(error_bytes) is fail_resource
+        if fail_resource:
+            with pytest.raises(error.ResourceExecutionError, match='resource failed'):
+                wrapped(
+                    Contract(), request, _release_fn=release_request,
+                    _c2_input_buffer_mode='borrowed',
+                )
+        else:
+            assert wrapped(
+                Contract(), request, _release_fn=release_request,
+                _c2_input_buffer_mode='borrowed',
+            ) == b''
         assert events == ['resource', 'release_local_request']
         assert payload_value(source) == 7
     finally:

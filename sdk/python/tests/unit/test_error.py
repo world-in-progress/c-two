@@ -1,20 +1,21 @@
 import copy
+import gc
 import pickle
+import weakref
 
 import pytest
 from c_two import _native
 import c_two.error as error
 from c_two.error import (
-    ERROR_Code, CCBaseError, CCError,
-    ResourceDeserializeInput, ResourceInputFromBuffer,
-    ResourceSerializeOutput, ResourceExecuteFunction,
-    ClientSerializeInput, ClientDeserializeOutput, ClientOutputFromBuffer,
-    ClientCallResource,
+    ErrorCode, CCBaseError, CCError, CoreError,
+    ResourceExecutionError, SerializationError,
+    ResourceNotFound,
+    ResourceUnavailable,
     ResourceAlreadyRegistered,
-    RouteConflict,
     ResourceClosed, ResourceRemoved, ContractMismatch, IdentityMismatch,
-    RouteWatchUnavailable, ProtocolViolation, FallbackDenied,
+    ProtocolViolation, FallbackDenied,
     CallDeadlineExceeded, UnsupportedCallMode, CallCapacityExceeded, CallCancelled,
+    RouteConflict,
 )
 
 
@@ -32,33 +33,46 @@ def test_core_error_copy_and_pickle_preserve_structured_fields():
         assert restored.__dict__ == original.__dict__
 
 
-class TestERRORCode:
-    def test_all_values_exist(self):
-        assert ERROR_Code.ERROR_UNKNOWN == 0
-        assert ERROR_Code.ERROR_AT_RESOURCE_INPUT_DESERIALIZING == 1
-        assert ERROR_Code.ERROR_AT_RESOURCE_OUTPUT_SERIALIZING == 2
-        assert ERROR_Code.ERROR_AT_RESOURCE_FUNCTION_EXECUTING == 3
-        assert ERROR_Code.ERROR_AT_RESOURCE_INPUT_FROM_BUFFER == 4
-        assert ERROR_Code.ERROR_AT_CLIENT_INPUT_SERIALIZING == 5
-        assert ERROR_Code.ERROR_AT_CLIENT_OUTPUT_DESERIALIZING == 6
-        assert ERROR_Code.ERROR_AT_CLIENT_CALLING_RESOURCE == 7
-        assert ERROR_Code.ERROR_AT_CLIENT_OUTPUT_FROM_BUFFER == 8
-        assert ERROR_Code.ERROR_RESOURCE_ALREADY_REGISTERED == 703
-        assert ERROR_Code.ERROR_RESOURCE_CLOSED == 707
-        assert ERROR_Code.ERROR_RESOURCE_REMOVED == 708
-        assert ERROR_Code.ERROR_CONTRACT_MISMATCH == 709
-        assert ERROR_Code.ERROR_IDENTITY_MISMATCH == 710
-        assert ERROR_Code.ERROR_ROUTE_WATCH_UNAVAILABLE == 712
-        assert ERROR_Code.ERROR_PROTOCOL_VIOLATION == 713
-        assert ERROR_Code.ERROR_FALLBACK_DENIED == 714
-        assert ERROR_Code.ERROR_CALL_DEADLINE_EXCEEDED == 715
-        assert ERROR_Code.ERROR_UNSUPPORTED_CALL_MODE == 716
-        assert ERROR_Code.ERROR_CALL_CAPACITY_EXCEEDED == 717
-        assert ERROR_Code.ERROR_CALL_CANCELLED == 718
-        assert ERROR_Code.ERROR_ROUTE_CONFLICT == 719
+class TestErrorCode:
+    def test_member_names_match_rust_registry(self):
+        expected = {
+            "Unknown": 0,
+            "ResourceInputDeserializing": 1,
+            "ResourceOutputSerializing": 2,
+            "ResourceFunctionExecuting": 3,
+            "ResourceInputFromBuffer": 4,
+            "ClientInputSerializing": 5,
+            "ClientOutputDeserializing": 6,
+            "ClientCallingResource": 7,
+            "ClientOutputFromBuffer": 8,
+            "ResourceNotFound": 701,
+            "ResourceUnavailable": 702,
+            "ResourceAlreadyRegistered": 703,
+            "RegistryUnavailable": 705,
+            "ResourceClosed": 707,
+            "ResourceRemoved": 708,
+            "ContractMismatch": 709,
+            "IdentityMismatch": 710,
+            "RouteWatchUnavailable": 712,
+            "ProtocolViolation": 713,
+            "FallbackDenied": 714,
+            "CallDeadlineExceeded": 715,
+            "UnsupportedCallMode": 716,
+            "CallCapacityExceeded": 717,
+            "CallCancelled": 718,
+            "RouteConflict": 719,
+        }
+        assert {member.name: member.value for member in ErrorCode} == expected
+
+    def test_members_match_native_registry_exactly(self):
+        native = _native.error_registry()
+        assert len(native) == 25
+        assert set(ErrorCode.__members__) == set(native)
+        for name, (code, _side, _stage) in native.items():
+            assert ErrorCode[name].value == int(code)
 
     def test_has_exactly_25_members(self):
-        assert len(ERROR_Code) == 25
+        assert len(ErrorCode) == 25
 
     def test_retired_errors_are_absent(self):
         retired = (("Route", "Stale", 704), ("Write", "Conflict", 706),
@@ -67,58 +81,58 @@ class TestERRORCode:
             name = "".join(parts)
             assert not hasattr(error, name)
             assert name not in error.__all__
-            assert code not in ERROR_Code._value2member_map_
-        for parts in (("ROUTE", "STALE"), ("WRITE", "CONFLICT"),
-                      ("ROUTE", "CATALOG", "COMPACTED")):
-            name = "ERROR_" + "_".join(parts)
-            assert name not in ERROR_Code.__members__
-        for *parts, _code in retired:
-            name = "".join(parts)
-            with pytest.raises(ImportError):
-                exec(f"from c_two.error import {name}", {})
+            assert code not in ErrorCode._value2member_map_
 
     def test_values_are_unique(self):
-        values = [e.value for e in ERROR_Code]
+        values = [member.value for member in ErrorCode]
         assert len(values) == len(set(values))
 
     def test_is_int_enum(self):
-        assert isinstance(ERROR_Code.ERROR_UNKNOWN, int)
+        assert isinstance(ErrorCode.Unknown, int)
+
+    def test_code_meta_classifies_adapter_codes(self):
+        assert error._CODE_META[int(ErrorCode.ResourceInputDeserializing)] == ('resource', 'deserialize')
+        assert error._CODE_META[int(ErrorCode.ResourceOutputSerializing)] == ('resource', 'serialize')
+        assert error._CODE_META[int(ErrorCode.ResourceFunctionExecuting)] == ('resource', 'execute')
+        assert error._CODE_META[int(ErrorCode.ResourceInputFromBuffer)] == ('resource', 'from_buffer')
+        assert error._CODE_META[int(ErrorCode.ClientInputSerializing)] == ('client', 'serialize')
+        assert error._CODE_META[int(ErrorCode.ClientOutputDeserializing)] == ('client', 'deserialize')
+        assert error._CODE_META[int(ErrorCode.ClientCallingResource)] == ('client', 'call')
+        assert error._CODE_META[int(ErrorCode.ClientOutputFromBuffer)] == ('client', 'from_buffer')
+        for code in (ErrorCode.Unknown, ErrorCode.ResourceClosed, ErrorCode.RouteConflict):
+            assert error._CODE_META[int(code)] == (None, None)
 
 
 class TestCCError:
     def test_default_creation(self):
         err = CCError()
-        assert err.code == ERROR_Code.ERROR_UNKNOWN
+        assert err.code == ErrorCode.Unknown
         assert err.message == 'Error occurred when using C-Two.'
 
     def test_custom_creation(self):
-        err = CCError(code=ERROR_Code.ERROR_AT_RESOURCE_FUNCTION_EXECUTING, message='something broke')
-        assert err.code == ERROR_Code.ERROR_AT_RESOURCE_FUNCTION_EXECUTING
+        err = CCError(code=ErrorCode.ResourceFunctionExecuting, message='something broke')
+        assert err.code == ErrorCode.ResourceFunctionExecuting
         assert err.message == 'something broke'
+
+    def test_explicit_empty_message_is_preserved(self):
+        err = CCError(code=ErrorCode.Unknown, message='')
+        assert err.message == ''
 
     def test_details_creation(self):
         err = CCError(
-            code=ERROR_Code.ERROR_RESOURCE_UNAVAILABLE,
+            code=ErrorCode.ResourceUnavailable,
             message='upstream failed',
             details={'route': 'grid', 'cause_kind': 'TransportIo'},
         )
         assert err.details == {'route': 'grid', 'cause_kind': 'TransportIo'}
 
     def test_str_format(self):
-        err = CCError(code=ERROR_Code.ERROR_AT_RESOURCE_FUNCTION_EXECUTING, message='oops')
-        assert str(err) == 'ERROR_AT_RESOURCE_FUNCTION_EXECUTING: oops'
-
-    def test_str_format_default(self):
-        err = CCError()
-        assert str(err) == 'ERROR_UNKNOWN: Error occurred when using C-Two.'
+        err = CCError(code=ErrorCode.ResourceFunctionExecuting, message='oops')
+        assert str(err) == 'ResourceFunctionExecuting: oops'
 
     def test_repr_format(self):
-        err = CCError(code=ERROR_Code.ERROR_AT_RESOURCE_FUNCTION_EXECUTING, message='oops')
+        err = CCError(code=ErrorCode.ResourceFunctionExecuting, message='oops')
         assert repr(err) == 'CCError(code=3, message=oops, details={})'
-
-    def test_repr_format_default(self):
-        err = CCError()
-        assert repr(err) == 'CCError(code=0, message=Error occurred when using C-Two., details={})'
 
     def test_is_exception(self):
         err = CCError()
@@ -129,441 +143,308 @@ class TestCCError:
         with pytest.raises(CCError):
             raise CCError(message='fail')
 
-
-class TestCCErrorSerialization:
-    def test_round_trip(self):
-        original = CCError(
-            code=ERROR_Code.ERROR_AT_RESOURCE_FUNCTION_EXECUTING,
-            message='test msg',
-            details={'route': 'grid'},
-        )
-        data = CCError.serialize(original)
-        restored = CCError.deserialize(memoryview(data))
-        assert restored is not None
-        assert restored.code == original.code
-        assert restored.message == original.message
-        assert restored.details == {'route': 'grid'}
-
-    def test_serialize_none_returns_empty_bytes(self):
-        assert CCError.serialize(None) == b''
-
-    def test_deserialize_empty_memoryview_returns_none(self):
-        assert CCError.deserialize(memoryview(b'')) is None
-
-    def test_message_with_colons_preserved(self):
-        original = CCError(code=ERROR_Code.ERROR_UNKNOWN, message='host:port:extra')
-        data = CCError.serialize(original)
-        restored = CCError.deserialize(memoryview(data))
-        assert restored is not None
-        assert restored.message == 'host:port:extra'
-
-    def test_serialize_produces_expected_bytes(self):
-        err = CCError(code=ERROR_Code.ERROR_AT_RESOURCE_FUNCTION_EXECUTING, message='hello')
-        assert CCError.serialize(err) == (
-            b'C2E1{"version":1,"code":3,"name":"ResourceFunctionExecuting",'
-            b'"message":"hello","details":{}}'
-        )
-
-    def test_round_trip_default_error(self):
-        original = CCError()
-        data = CCError.serialize(original)
-        restored = CCError.deserialize(memoryview(data))
-        assert restored is not None
-        assert restored.code == ERROR_Code.ERROR_UNKNOWN
-        assert restored.message == original.message
-
-    def test_unknown_numeric_code_deserializes_to_unknown_with_context(self):
-        restored = CCError.deserialize(memoryview(
-            b'C2E1{"version":1,"code":9999,"name":"FutureRouteError",'
-            b'"message":"low-level relay failure","details":{"route":"grid"}}'
-        ))
-        assert restored is not None
-        assert type(restored) is CCError
-        assert restored.code == ERROR_Code.ERROR_UNKNOWN
-        assert restored.message == "Unknown error code 9999 (FutureRouteError): low-level relay failure"
-        assert restored.details["route"] == "grid"
-        assert restored.details["unknown_code"] == "9999"
-        assert restored.details["unknown_name"] == "FutureRouteError"
-
-    @pytest.mark.parametrize(
-        ("payload", "expected_fragment"),
-        [
-            (b"abc:not a number", "Malformed error payload"),
-            (b"3", "Malformed error payload"),
-            (b"\xff", "Malformed error payload"),
-            (b"703:grid exists", "Malformed error payload"),
-        ],
-    )
-    def test_malformed_payload_deserializes_to_unknown(self, payload, expected_fragment):
-        restored = CCError.deserialize(memoryview(payload))
-        assert restored is not None
-        assert type(restored) is CCError
-        assert restored.code == ERROR_Code.ERROR_UNKNOWN
-        assert expected_fragment in restored.message
+    def test_side_and_stage_read_registry_meta(self):
+        err = CCError(code=ErrorCode.ClientOutputFromBuffer)
+        assert err.side == 'client'
+        assert err.stage == 'from_buffer'
+        assert CCError(code=ErrorCode.ResourceFunctionExecuting).side == 'resource'
+        assert CCError(code=ErrorCode.ResourceFunctionExecuting).stage == 'execute'
+        assert CCError(code=ErrorCode.RouteConflict).side is None
+        assert CCError(code=ErrorCode.RouteConflict).stage is None
 
 
-SUBCLASS_PARAMS = [
-    (ResourceDeserializeInput,   ERROR_Code.ERROR_AT_RESOURCE_INPUT_DESERIALIZING,    'deserializing input at resource'),
-    (ResourceInputFromBuffer,    ERROR_Code.ERROR_AT_RESOURCE_INPUT_FROM_BUFFER,      'constructing resource input from buffer'),
-    (ResourceSerializeOutput,    ERROR_Code.ERROR_AT_RESOURCE_OUTPUT_SERIALIZING,     'serializing output at resource'),
-    (ResourceExecuteFunction,    ERROR_Code.ERROR_AT_RESOURCE_FUNCTION_EXECUTING,     'executing function at resource'),
-    (ClientSerializeInput,   ERROR_Code.ERROR_AT_CLIENT_INPUT_SERIALIZING,    'serializing input at client'),
-    (ClientDeserializeOutput,ERROR_Code.ERROR_AT_CLIENT_OUTPUT_DESERIALIZING, 'deserializing output at client'),
-    (ClientOutputFromBuffer,  ERROR_Code.ERROR_AT_CLIENT_OUTPUT_FROM_BUFFER,  'constructing client output from buffer'),
-    (ClientCallResource,       ERROR_Code.ERROR_AT_CLIENT_CALLING_RESOURCE,          'calling resource from client'),
-]
-
-ROUTE_CATALOG_SUBCLASS_PARAMS = [
-    (ResourceClosed, ERROR_Code.ERROR_RESOURCE_CLOSED),
-    (ResourceRemoved, ERROR_Code.ERROR_RESOURCE_REMOVED),
-    (ContractMismatch, ERROR_Code.ERROR_CONTRACT_MISMATCH),
-    (IdentityMismatch, ERROR_Code.ERROR_IDENTITY_MISMATCH),
-    (RouteWatchUnavailable, ERROR_Code.ERROR_ROUTE_WATCH_UNAVAILABLE),
-    (ProtocolViolation, ERROR_Code.ERROR_PROTOCOL_VIOLATION),
-    (FallbackDenied, ERROR_Code.ERROR_FALLBACK_DENIED),
-]
-
-CALL_ERROR_SUBCLASS_PARAMS = [
-    (CallDeadlineExceeded, ERROR_Code.ERROR_CALL_DEADLINE_EXCEEDED),
-    (UnsupportedCallMode, ERROR_Code.ERROR_UNSUPPORTED_CALL_MODE),
-    (CallCapacityExceeded, ERROR_Code.ERROR_CALL_CAPACITY_EXCEEDED),
-    (CallCancelled, ERROR_Code.ERROR_CALL_CANCELLED),
-]
-
-
-class TestErrorSubclasses:
-    @pytest.mark.parametrize("cls,expected_code,desc_fragment", SUBCLASS_PARAMS)
-    def test_correct_error_code(self, cls, expected_code, desc_fragment):
-        err = cls('detail')
-        assert err.code == expected_code
-
-    @pytest.mark.parametrize("cls,expected_code,desc_fragment", SUBCLASS_PARAMS)
-    def test_custom_message_included(self, cls, expected_code, desc_fragment):
-        err = cls('detail')
-        assert 'detail' in err.message
-        assert desc_fragment in err.message
-
-    @pytest.mark.parametrize("cls,expected_code,desc_fragment", SUBCLASS_PARAMS)
-    def test_default_no_message(self, cls, expected_code, desc_fragment):
-        err = cls()
-        assert err.code == expected_code
-        # With no message the ternary yields '', which is falsy so __init__
-        # falls through to the default CCError message.
-        assert isinstance(err.message, str)
-
-    @pytest.mark.parametrize("cls,expected_code,desc_fragment", SUBCLASS_PARAMS)
-    def test_is_cc_error(self, cls, expected_code, desc_fragment):
-        err = cls()
-        assert isinstance(err, CCError)
-        assert isinstance(err, CCBaseError)
-        assert isinstance(err, Exception)
-
-
-class TestRouteCatalogErrorSubclasses:
-    @pytest.mark.parametrize("cls,expected_code", ROUTE_CATALOG_SUBCLASS_PARAMS)
-    def test_correct_error_code(self, cls, expected_code):
-        err = cls('detail', details={'route': 'grid'})
-        assert err.code == expected_code
-        assert err.message == 'detail'
-        assert err.details == {'route': 'grid'}
-
-
-class TestCallErrorSubclasses:
-    @pytest.mark.parametrize("cls,expected_code", CALL_ERROR_SUBCLASS_PARAMS)
-    def test_correct_error_code_message_and_details(self, cls, expected_code):
-        err = cls('bounded call failed', details={'route': 'grid'})
-        assert err.code == expected_code
-        assert err.message == 'bounded call failed'
-        assert err.details == {'route': 'grid'}
-
-    @pytest.mark.parametrize("cls,expected_code", CALL_ERROR_SUBCLASS_PARAMS)
-    def test_default_message(self, cls, expected_code):
-        err = cls()
-        assert err.code == expected_code
-        assert isinstance(err.message, str)
-        assert err.message != ''
-
-    @pytest.mark.parametrize("cls,expected_code", CALL_ERROR_SUBCLASS_PARAMS)
-    def test_is_cc_error(self, cls, expected_code):
-        err = cls()
-        assert isinstance(err, CCError)
-        assert isinstance(err, CCBaseError)
-        assert isinstance(err, Exception)
-
-
-class TestCallDeadlineExceededTransportPhase:
-    def test_phase_property_reads_pre_dispatch_detail(self):
-        err = CallDeadlineExceeded('late', details={'transport_phase': 'pre_dispatch'})
+class TestTransportPhase:
+    def test_phase_from_details_transport_key(self):
+        err = CCError(ErrorCode.CallDeadlineExceeded, 'late', {'transport_phase': 'pre_dispatch'})
         assert err.transport_phase == 'pre_dispatch'
 
-    def test_phase_property_reads_dispatch_uncertain_detail(self):
-        err = CallDeadlineExceeded('late', details={'transport_phase': 'dispatch_uncertain'})
+    def test_phase_from_details_dispatch_key(self):
+        err = CCError(ErrorCode.CallDeadlineExceeded, 'late', {'dispatch_phase': 'dispatch_uncertain'})
         assert err.transport_phase == 'dispatch_uncertain'
 
-    def test_phase_property_is_none_without_detail(self):
-        err = CallDeadlineExceeded('late')
+    def test_phase_none_without_canonical_detail(self):
+        err = CCError(ErrorCode.CallDeadlineExceeded, 'late', {'transport_phase': 'application_detail'})
         assert err.transport_phase is None
 
-    def test_phase_property_is_read_only(self):
-        err = CallDeadlineExceeded('late', details={'transport_phase': 'pre_dispatch'})
+    def test_explicit_phase_wins_over_details(self):
+        err = CCError(
+            ErrorCode.CallDeadlineExceeded, 'late',
+            {'transport_phase': 'dispatch_uncertain'},
+            transport_phase='pre_dispatch',
+        )
+        assert err.transport_phase == 'pre_dispatch'
+
+    def test_later_details_edits_do_not_change_phase(self):
+        err = CCError(ErrorCode.CallDeadlineExceeded, 'late')
+        assert err.transport_phase is None
+        err.details['transport_phase'] = 'pre_dispatch'
+        assert err.transport_phase is None
+
+    def test_invalid_phase_raises_value_error(self):
+        with pytest.raises(ValueError):
+            CCError(ErrorCode.CallDeadlineExceeded, 'late', transport_phase='post_dispatch')
+
+    def test_phase_is_read_only_property(self):
+        err = CCError(ErrorCode.CallDeadlineExceeded, 'late', transport_phase='pre_dispatch')
         with pytest.raises(AttributeError):
             err.transport_phase = 'dispatch_uncertain'
         assert err.transport_phase == 'pre_dispatch'
 
-    def test_phase_property_does_not_rewrite_received_details(self):
-        details = {'transport_phase': 'dispatch_uncertain', 'route': 'grid'}
-        err = CallDeadlineExceeded('late', details=details)
+    def test_phase_not_inferred_from_message_text(self):
+        err = CCError(ErrorCode.CallDeadlineExceeded, 'failed during dispatch_uncertain window')
+        assert err.transport_phase is None
+
+
+class TestCCErrorFromParts:
+    def test_known_code_maps_to_public_subclass(self):
+        err = CCError._from_parts(707, 'route closed', {'route': 'grid'})
+        assert type(err) is ResourceClosed
+        assert err.code == ErrorCode.ResourceClosed
+        assert err.message == 'route closed'
+        assert err.details == {'route': 'grid'}
+
+    def test_unknown_code_degrades_to_unknown_with_detail(self):
+        err = CCError._from_parts(9999, 'low-level relay failure', {'route': 'grid'})
+        assert type(err) is CCError
+        assert err.code == ErrorCode.Unknown
+        assert err.message == 'low-level relay failure'
+        assert err.details['route'] == 'grid'
+        assert err.details['unknown_code'] == '9999'
+
+    def test_unmapped_codes_fall_back_to_base_class(self):
+        for code in (0, 7, 705, 712):
+            err = CCError._from_parts(code, 'x')
+            assert type(err) is CCError
+
+    def test_explicit_phase_is_kept(self):
+        err = CCError._from_parts(715, 'late', transport_phase='dispatch_uncertain')
         assert err.transport_phase == 'dispatch_uncertain'
-        assert err.details == {'transport_phase': 'dispatch_uncertain', 'route': 'grid'}
 
-    def test_phase_not_stored_as_instance_attribute_copy(self):
-        err = CallDeadlineExceeded('late', details={'transport_phase': 'pre_dispatch'})
-        assert 'transport_phase' not in vars(err)
-
-    def test_wire_carries_phase_only_once_as_detail(self):
-        err = CallDeadlineExceeded('late', details={'transport_phase': 'pre_dispatch'})
-        wire = CCError.serialize(err)
-        assert wire.count(b'transport_phase') == 1
-        restored = CCError.deserialize(memoryview(wire))
-        assert isinstance(restored, CallDeadlineExceeded)
-        assert restored.transport_phase == 'pre_dispatch'
-        assert restored.details == {'transport_phase': 'pre_dispatch'}
-
-    def test_wire_omits_phase_when_detail_absent(self):
-        err = CallDeadlineExceeded('late')
-        wire = CCError.serialize(err)
-        assert b'transport_phase' not in wire
-        restored = CCError.deserialize(memoryview(wire))
-        assert isinstance(restored, CallDeadlineExceeded)
-        assert restored.transport_phase is None
+    def test_phase_inferred_from_details_only_when_canonical(self):
+        inferred = CCError._from_parts(715, 'late', {'dispatch_phase': 'pre_dispatch'})
+        assert inferred.transport_phase == 'pre_dispatch'
+        ignored = CCError._from_parts(715, 'late', {'dispatch_phase': 'weird'})
+        assert ignored.transport_phase is None
 
 
-class TestNewCallErrorCodec:
-    @pytest.mark.parametrize("cls,expected_code", CALL_ERROR_SUBCLASS_PARAMS)
-    def test_canonical_native_codec_round_trip(self, cls, expected_code):
-        original = cls('budget exhausted', details={'route': 'grid', 'stage': 'call_deadline'})
-        data = CCError.serialize(original)
-        restored = CCError.deserialize(memoryview(data))
-        assert isinstance(restored, cls)
-        assert restored.code == expected_code
-        assert restored.message == 'budget exhausted'
-        assert restored.details == {'route': 'grid', 'stage': 'call_deadline'}
+class TestCCErrorCopyAndPickle:
+    ROUND_TRIP_CASES = [
+        CCError(ErrorCode.Unknown, 'generic'),
+        CCError(ErrorCode.ClientCallingResource, 'call failed', {'route': 'grid'}),
+        SerializationError(ErrorCode.ClientInputSerializing, 'bad input', transport_phase='pre_dispatch'),
+        SerializationError(ErrorCode.ClientOutputFromBuffer, 'bad view', {'cause_owner': 'fastdb'}),
+        ResourceExecutionError('resource raised'),
+        ResourceClosed('closed', {'route': 'grid'}),
+        CallDeadlineExceeded('late', {'transport_phase': 'dispatch_uncertain'}),
+    ]
 
-    def test_deadline_error_round_trip_keeps_phase_and_details(self):
-        original = CallDeadlineExceeded(
-            'deadline elapsed before a definitive outcome',
-            details={'transport_phase': 'dispatch_uncertain', 'fallback_eligible': 'false'},
-        )
-        wire = CCError.serialize(original)
-        assert wire.startswith(b'C2E1{"version":1,"code":715,"name":"CallDeadlineExceeded"')
-        restored = CCError.deserialize(memoryview(wire))
-        assert isinstance(restored, CallDeadlineExceeded)
-        assert restored.message == 'deadline elapsed before a definitive outcome'
-        assert restored.details == {
-            'transport_phase': 'dispatch_uncertain',
-            'fallback_eligible': 'false',
-        }
-        assert restored.transport_phase == 'dispatch_uncertain'
+    @pytest.mark.parametrize("original", ROUND_TRIP_CASES, ids=lambda c: type(c).__name__)
+    @pytest.mark.parametrize("round_trip", [copy.copy, lambda e: pickle.loads(pickle.dumps(e))],
+                             ids=['copy', 'pickle'])
+    def test_round_trip_preserves_everything(self, original, round_trip):
+        restored = round_trip(original)
+        assert type(restored) is type(original)
+        assert restored is not original
+        assert restored.code == original.code
+        assert restored.message == original.message
+        assert restored.details == original.details
+        assert restored.transport_phase == original.transport_phase
+        assert str(restored) == str(original)
 
-    def test_unsupported_call_mode_round_trip(self):
-        original = UnsupportedCallMode('finite deadline does not support same-process sync')
-        restored = CCError.deserialize(memoryview(CCError.serialize(original)))
-        assert isinstance(restored, UnsupportedCallMode)
-        assert restored.code == ERROR_Code.ERROR_UNSUPPORTED_CALL_MODE
-        assert restored.message == 'finite deadline does not support same-process sync'
-        assert restored.details == {}
-
-    def test_call_capacity_exceeded_round_trip(self):
-        original = CallCapacityExceeded('continuation byte capacity exhausted')
-        restored = CCError.deserialize(memoryview(CCError.serialize(original)))
-        assert isinstance(restored, CallCapacityExceeded)
-        assert restored.code == ERROR_Code.ERROR_CALL_CAPACITY_EXCEEDED
-        assert restored.message == 'continuation byte capacity exhausted'
-        assert restored.details == {}
-
-    def test_call_cancelled_round_trip(self):
-        original = CallCancelled('stream closed', details={'reason': 'client_close'})
-        restored = CCError.deserialize(memoryview(CCError.serialize(original)))
-        assert isinstance(restored, CallCancelled)
-        assert restored.code == ERROR_Code.ERROR_CALL_CANCELLED
-        assert restored.message == 'stream closed'
-        assert restored.details == {'reason': 'client_close'}
+    def test_deeply_nested_subclass_round_trip(self):
+        original = RouteConflict('duplicate', details={'registrations': '[]'})
+        restored = pickle.loads(pickle.dumps(original))
+        assert isinstance(restored, RouteConflict)
+        assert restored.code == ErrorCode.RouteConflict
+        assert restored.details == {'registrations': '[]'}
 
 
-ALL_SUBCLASSES = [
-    error.ResourceDeserializeInput,
-    error.ResourceInputFromBuffer,
-    error.ResourceSerializeOutput,
-    error.ResourceExecuteFunction,
-    error.ClientSerializeInput,
-    error.ClientDeserializeOutput,
-    error.ClientOutputFromBuffer,
-    error.ClientCallResource,
-    error.ResourceClosed,
-    error.ResourceRemoved,
-    error.ContractMismatch,
-    error.IdentityMismatch,
-    error.RouteWatchUnavailable,
-    error.ProtocolViolation,
-    error.FallbackDenied,
-    error.CallDeadlineExceeded,
-    error.UnsupportedCallMode,
-    error.CallCapacityExceeded,
-    error.CallCancelled,
-    error.RouteConflict,
+class TestSerializationError:
+    @pytest.mark.parametrize("code", [
+        ErrorCode.ResourceInputDeserializing,
+        ErrorCode.ResourceOutputSerializing,
+        ErrorCode.ResourceInputFromBuffer,
+        ErrorCode.ClientInputSerializing,
+        ErrorCode.ClientOutputDeserializing,
+        ErrorCode.ClientOutputFromBuffer,
+    ])
+    def test_accepts_the_six_codec_codes(self, code):
+        err = SerializationError(code, 'detail')
+        assert err.code == code
+        assert err.stage in {'serialize', 'deserialize', 'from_buffer'}
+
+    @pytest.mark.parametrize("code", [0, 3, 7, 701, 703, 707, 713, 715, 717, 719])
+    def test_rejects_non_codec_codes(self, code):
+        with pytest.raises(ValueError):
+            SerializationError(code)
+
+    def test_side_and_stage_follow_code(self):
+        assert SerializationError(ErrorCode.ResourceInputFromBuffer).side == 'resource'
+        assert SerializationError(ErrorCode.ResourceInputFromBuffer).stage == 'from_buffer'
+        assert SerializationError(ErrorCode.ClientOutputDeserializing).stage == 'deserialize'
+        assert SerializationError(ErrorCode.ClientInputSerializing).stage == 'serialize'
+
+
+class TestResourceExecutionError:
+    def test_fixed_code(self):
+        err = ResourceExecutionError('boom')
+        assert err.code == ErrorCode.ResourceFunctionExecuting
+        assert int(err.code) == 3
+        assert err.side == 'resource'
+        assert err.stage == 'execute'
+
+    def test_default_message(self):
+        assert ResourceExecutionError().message
+
+
+ROUTE_SUBCLASS_PARAMS = [
+    (ResourceNotFound, 701, 'Resource not found'),
+    (ResourceUnavailable, 702, 'Resource unavailable'),
+    (ResourceAlreadyRegistered, 703, 'Resource already registered'),
+    (ResourceClosed, 707, 'Resource closed'),
+    (ResourceRemoved, 708, 'Resource removed'),
+    (ContractMismatch, 709, 'Contract mismatch'),
+    (IdentityMismatch, 710, 'Identity mismatch'),
+    (ProtocolViolation, 713, 'Protocol violation'),
+    (FallbackDenied, 714, 'Fallback denied'),
+    (CallDeadlineExceeded, 715, 'Call deadline exceeded'),
+    (UnsupportedCallMode, 716, 'Unsupported call mode'),
+    (CallCapacityExceeded, 717, 'Call capacity exceeded'),
+    (CallCancelled, 718, 'Call cancelled'),
+    (RouteConflict, 719, 'Route conflict'),
 ]
 
 
-class TestSubclassDeserialization:
-    @pytest.mark.parametrize("subclass", ALL_SUBCLASSES, ids=lambda c: c.__name__)
-    def test_each_subclass_round_trip(self, subclass):
-        original = subclass(message='test detail')
-        data = CCError.serialize(original)
-        result = CCError.deserialize(memoryview(data))
-        assert isinstance(result, subclass)
-        assert result.code == original.code
-        assert 'test detail' in result.message
+class TestRouteSubclasses:
+    @pytest.mark.parametrize("cls,code,default_message", ROUTE_SUBCLASS_PARAMS)
+    def test_fixed_code_and_default_message(self, cls, code, default_message):
+        err = cls()
+        assert int(err.code) == code
+        assert err.message == default_message
+        assert err.transport_phase is None
 
-    def test_generic_ccerror_round_trip(self):
-        original = CCError(ERROR_Code.ERROR_UNKNOWN, 'generic')
-        data = CCError.serialize(original)
-        result = CCError.deserialize(memoryview(data))
-        assert type(result) is CCError
-        assert result.code == ERROR_Code.ERROR_UNKNOWN
-        assert result.message == 'generic'
+    @pytest.mark.parametrize("cls,code,default_message", ROUTE_SUBCLASS_PARAMS)
+    def test_custom_message_and_details(self, cls, code, default_message):
+        err = cls('detail', details={'route': 'grid'})
+        assert int(err.code) == code
+        assert err.message == 'detail'
+        assert err.details == {'route': 'grid'}
 
-    def test_resource_already_registered_round_trip(self):
-        original = ResourceAlreadyRegistered("Route name already registered: 'grid'")
-        data = CCError.serialize(original)
-        result = CCError.deserialize(memoryview(data))
-        assert isinstance(result, ResourceAlreadyRegistered)
-        assert result.code == ERROR_Code.ERROR_RESOURCE_ALREADY_REGISTERED
-        assert result.message == "Route name already registered: 'grid'"
+    @pytest.mark.parametrize("cls,code,default_message", ROUTE_SUBCLASS_PARAMS)
+    def test_explicit_empty_message_is_kept(self, cls, code, default_message):
+        err = cls('')
+        assert err.message == ''
 
-    def test_route_conflict_round_trip(self):
-        details = {"route": "grid", "dispatch_phase": "pre_dispatch", "registrations": "[]"}
-        original = RouteConflict("duplicate online route", details=details)
-        result = CCError.deserialize(memoryview(CCError.serialize(original)))
-        assert isinstance(result, RouteConflict)
-        assert result.code == ERROR_Code.ERROR_ROUTE_CONFLICT
-        assert result.details == details
+    @pytest.mark.parametrize("cls,code,default_message", ROUTE_SUBCLASS_PARAMS)
+    def test_is_cc_error(self, cls, code, default_message):
+        err = cls()
+        assert isinstance(err, CCError)
+        assert isinstance(err, CCBaseError)
+        assert isinstance(err, Exception)
 
-    def test_from_buffer_errors_round_trip_to_specific_subclasses(self):
-        resource_err = ResourceInputFromBuffer("bad input view")
-        restored_resource = CCError.deserialize(CCError.serialize(resource_err))
-        assert isinstance(restored_resource, ResourceInputFromBuffer)
-        assert restored_resource.code == ERROR_Code.ERROR_AT_RESOURCE_INPUT_FROM_BUFFER
-        assert "constructing resource input from buffer" in restored_resource.message
-        assert "bad input view" in restored_resource.message
-
-        client_err = ClientOutputFromBuffer("bad output view")
-        restored_client = CCError.deserialize(CCError.serialize(client_err))
-        assert isinstance(restored_client, ClientOutputFromBuffer)
-        assert restored_client.code == ERROR_Code.ERROR_AT_CLIENT_OUTPUT_FROM_BUFFER
-        assert "constructing client output from buffer" in restored_client.message
-        assert "bad output view" in restored_client.message
-
-    @pytest.mark.parametrize("subclass", ALL_SUBCLASSES, ids=lambda c: c.__name__)
-    def test_none_message_produces_description(self, subclass):
-        err = subclass(message=None)
-        assert err.message != ''
+    def test_resource_unavailable_detail_parameter(self):
+        err = ResourceUnavailable(detail='relay left the mesh')
+        assert err.message == 'Resource unavailable: relay left the mesh'
 
 
-class TestErrorCodeToClass:
-    def test_code_to_class_registry_complete(self):
-        expected_codes = {code for code in ERROR_Code if code != ERROR_Code.ERROR_UNKNOWN}
-        assert set(error._CODE_TO_CLASS.keys()) == expected_codes
-
-    def test_unknown_code_deserializes_to_base(self):
-        result = CCError.deserialize(memoryview(
-            b'C2E1{"version":1,"code":0,"name":"Unknown","message":"some message","details":{}}'
-        ))
-        assert type(result) is CCError
-        assert result.code == ERROR_Code.ERROR_UNKNOWN
-        assert result.message == 'some message'
-
-
-class TestNativeErrorRegistryParity:
-    def test_python_error_codes_match_native_registry(self):
-        from c_two import _native
-
-        native = _native.error_registry()
+class TestPublicSurface:
+    def test_all_exports_the_standard_surface(self):
         expected = {
-            "ERROR_UNKNOWN": ("Unknown", 0),
-            "ERROR_AT_RESOURCE_INPUT_DESERIALIZING": ("ResourceInputDeserializing", 1),
-            "ERROR_AT_RESOURCE_OUTPUT_SERIALIZING": ("ResourceOutputSerializing", 2),
-            "ERROR_AT_RESOURCE_FUNCTION_EXECUTING": ("ResourceFunctionExecuting", 3),
-            "ERROR_AT_RESOURCE_INPUT_FROM_BUFFER": ("ResourceInputFromBuffer", 4),
-            "ERROR_AT_CLIENT_INPUT_SERIALIZING": ("ClientInputSerializing", 5),
-            "ERROR_AT_CLIENT_OUTPUT_DESERIALIZING": ("ClientOutputDeserializing", 6),
-            "ERROR_AT_CLIENT_CALLING_RESOURCE": ("ClientCallingResource", 7),
-            "ERROR_AT_CLIENT_OUTPUT_FROM_BUFFER": ("ClientOutputFromBuffer", 8),
-            "ERROR_RESOURCE_NOT_FOUND": ("ResourceNotFound", 701),
-            "ERROR_RESOURCE_UNAVAILABLE": ("ResourceUnavailable", 702),
-            "ERROR_RESOURCE_ALREADY_REGISTERED": ("ResourceAlreadyRegistered", 703),
-            "ERROR_REGISTRY_UNAVAILABLE": ("RegistryUnavailable", 705),
-            "ERROR_RESOURCE_CLOSED": ("ResourceClosed", 707),
-            "ERROR_RESOURCE_REMOVED": ("ResourceRemoved", 708),
-            "ERROR_CONTRACT_MISMATCH": ("ContractMismatch", 709),
-            "ERROR_IDENTITY_MISMATCH": ("IdentityMismatch", 710),
-            "ERROR_ROUTE_WATCH_UNAVAILABLE": ("RouteWatchUnavailable", 712),
-            "ERROR_PROTOCOL_VIOLATION": ("ProtocolViolation", 713),
-            "ERROR_FALLBACK_DENIED": ("FallbackDenied", 714),
-            "ERROR_CALL_DEADLINE_EXCEEDED": ("CallDeadlineExceeded", 715),
-            "ERROR_UNSUPPORTED_CALL_MODE": ("UnsupportedCallMode", 716),
-            "ERROR_CALL_CAPACITY_EXCEEDED": ("CallCapacityExceeded", 717),
-            "ERROR_CALL_CANCELLED": ("CallCancelled", 718),
-            "ERROR_ROUTE_CONFLICT": ("RouteConflict", 719),
+            'ErrorCode', 'CCBaseError', 'CoreError', 'CCError',
+            'ResourceExecutionError', 'SerializationError',
+            'ResourceNotFound', 'ResourceUnavailable', 'ResourceAlreadyRegistered',
+            'ResourceClosed', 'ResourceRemoved', 'ContractMismatch', 'IdentityMismatch',
+            'ProtocolViolation', 'FallbackDenied', 'CallDeadlineExceeded',
+            'UnsupportedCallMode', 'CallCapacityExceeded', 'CallCancelled', 'RouteConflict',
         }
+        assert set(error.__all__) == expected
 
-        assert set(ERROR_Code.__members__) == set(expected)
-        for py_name, (native_name, value) in expected.items():
-            assert native[native_name] == value
-            assert ERROR_Code[py_name].value == value
+    def test_code_to_class_covers_mapped_codes(self):
+        mapped = {int(code) for code in ErrorCode} - {0, 7, 705, 712}
+        assert set(error._CODE_TO_CLASS) == mapped
+        assert error._CODE_TO_CLASS[int(ErrorCode.ResourceFunctionExecuting)] is ResourceExecutionError
+        assert error._CODE_TO_CLASS[int(ErrorCode.ResourceInputFromBuffer)] is SerializationError
+        assert error._CODE_TO_CLASS[int(ErrorCode.ResourceClosed)] is ResourceClosed
 
-    def test_native_registry_entries_are_unique_and_exact(self):
-        from c_two import _native
 
-        native = _native.error_registry()
-        assert len(native) == 25
-        names = list(native.keys())
-        values = list(native.values())
-        assert len(set(names)) == len(names)
-        assert len(set(values)) == len(values)
-        assert native["CallDeadlineExceeded"] == 715
-        assert native["UnsupportedCallMode"] == 716
-        assert native["CallCapacityExceeded"] == 717
-        assert native["CallCancelled"] == 718
+class TestCoreErrorSemantic:
+    def _semantic_core(self, **kwargs):
+        core = CoreError('semantic', 'outer diagnostic')
+        core.code = kwargs.get('code', 715)
+        core.name = 'CallDeadlineExceeded'
+        core.details = kwargs.get('details', {'route': 'grid'})
+        core.semantic_message = kwargs.get('semantic_message')
+        core._transport_phase = kwargs.get('phase')
+        return core
 
-    def test_serialize_uses_native_wire_encoder(self, monkeypatch):
-        calls = []
+    def test_none_code_has_no_semantic(self):
+        assert CoreError('transport', 'boom').semantic is None
 
-        def fake_encode(code, message, details):
-            calls.append((code, message, details))
-            return b"C2E1from-native"
+    def test_semantic_builds_fresh_instance_per_call(self):
+        core = self._semantic_core(semantic_message='inner message')
+        first = core.semantic
+        second = core.semantic
+        assert isinstance(first, CallDeadlineExceeded)
+        assert first is not second
+        assert first.message == 'inner message'
+        assert first.details == {'route': 'grid'}
 
-        monkeypatch.setattr(error._native, "encode_error_wire", fake_encode)
+    def test_semantic_falls_back_to_outer_message(self):
+        core = self._semantic_core()
+        assert core.semantic.message == 'outer diagnostic'
 
-        err = CCError(ERROR_Code.ERROR_AT_RESOURCE_FUNCTION_EXECUTING, "boom")
-        assert CCError.serialize(err) == b"C2E1from-native"
-        assert calls == [(3, "boom", {})]
+    def test_semantic_carries_core_phase(self):
+        core = self._semantic_core(semantic_message='inner', phase='dispatch_uncertain')
+        assert core.semantic.transport_phase == 'dispatch_uncertain'
 
-    def test_deserialize_uses_native_wire_decoder_without_python_tobytes(self, monkeypatch):
-        class NoToBytes:
-            def tobytes(self):
-                raise AssertionError("deserialize must not call tobytes")
+    def test_semantic_not_cached_in_core_dict(self):
+        core = self._semantic_core(semantic_message='inner')
+        _ = core.semantic
+        assert 'semantic' not in core.__dict__
+        assert not any(
+            isinstance(value, CCError) for value in core.__dict__.values()
+        )
 
-        calls = []
+    def test_raise_projected_from_core_has_no_reference_cycle(self):
+        refs = {}
 
-        def fake_decode(data):
-            calls.append(data)
-            return (703, "grid exists", {"route": "grid"})
+        def scenario():
+            core = self._semantic_core(semantic_message='inner')
+            projected = core.semantic
+            refs['core'] = weakref.ref(core)
+            refs['projected'] = weakref.ref(projected)
+            try:
+                raise projected from core
+            except CCError as caught:
+                assert caught is projected
+                assert caught.__cause__ is core
+                caught.__traceback__ = None
 
-        monkeypatch.setattr(error._native, "decode_error_wire_parts", fake_decode)
+        scenario()
+        gc.collect()
+        # A one-way projected -> core chain is collectable; only a cycle
+        # (core caching its projection) would keep both alive.
+        assert refs['core']() is None
+        assert refs['projected']() is None
 
-        result = CCError.deserialize(NoToBytes())
-        assert isinstance(result, ResourceAlreadyRegistered)
-        assert result.message == "grid exists"
-        assert result.details == {"route": "grid"}
-        assert len(calls) == 1
-        assert isinstance(calls[0], NoToBytes)
+    def test_semantic_unknown_code_degrades(self):
+        core = self._semantic_core(code=9999)
+        projected = core.semantic
+        assert type(projected) is CCError
+        assert projected.code == ErrorCode.Unknown
+        assert projected.details['unknown_code'] == '9999'
+
+class TestCoreErrorPhaseAuthority:
+    def test_phase_is_read_only_and_native_written(self):
+        core = CoreError('transport', 'boom')
+        assert core.transport_phase is None
+        core._transport_phase = 'pre_dispatch'
+        assert core.transport_phase == 'pre_dispatch'
+        with pytest.raises(AttributeError):
+            core.transport_phase = None
+
+    def test_native_failure_projects_phase(self):
+        with pytest.raises(CoreError) as failure:
+            _native.ConnectAttempt(timeout_seconds=0)
+        assert failure.value.transport_phase == 'pre_dispatch'
+        assert failure.value.semantic.transport_phase == 'pre_dispatch'

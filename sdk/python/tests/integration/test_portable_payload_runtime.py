@@ -287,8 +287,10 @@ def test_direct_ipc_open_copy_hold_borrowed_invalidation_and_no_payload() -> Non
 
         assert proxy.ping() is None
 
-        with pytest.raises(error.ResourceSerializeOutput) as wrong_output_error:
+        with pytest.raises(error.SerializationError) as wrong_output_error:
             proxy.wrong_output()
+        assert wrong_output_error.value.code == error.ErrorCode.ResourceOutputSerializing
+        assert wrong_output_error.value.stage == 'serialize'
         assert wrong_output_error.value.details["cause_owner"] == "fastdb"
         assert wrong_output_error.value.details["fastdb_code"] == "3006"
         assert wrong_output_error.value.details["fastdb_symbol"] == "DIGEST_MISMATCH"

@@ -4,8 +4,10 @@ use serde_json::{Value, json};
 
 #[test]
 fn unary_artifacts_for_all_three_languages_match_the_pre_stream_baseline() {
-    // Captured from ba231cdf with the pinned FastDB 0.2.4 Core SDK. The corpus
-    // includes the shared three-language portable matrix fixtures.
+    // Captured from ba231cdf with the pinned FastDB 0.2.4 Core SDK; the
+    // Python rows were recaptured for the generated SerializationError
+    // normalization. The corpus includes the shared three-language portable
+    // matrix fixtures.
     let baseline: Value =
         serde_json::from_str(include_str!("fixtures/unary-artifacts.json")).unwrap();
     for row in baseline.as_array().unwrap() {

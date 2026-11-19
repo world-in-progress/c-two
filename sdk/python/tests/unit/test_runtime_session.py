@@ -715,20 +715,26 @@ def test_runtime_session_exposes_no_language_owned_http_pool(monkeypatch) -> Non
     assert outcome['runtime_barrier_error'] is None
 
 
-def test_registry_restores_native_error_bytes_before_wrapping() -> None:
-    from c_two.error import CCError, FallbackDenied
+def test_registry_projects_native_semantic_before_wrapping() -> None:
+    from c_two.error import CoreError, FallbackDenied
     from c_two.transport.registry import _cc_error_from_native_exception
 
-    native_exc = RuntimeError('native failure')
-    native_exc.error_bytes = CCError.serialize(FallbackDenied(
-        'same local relay HTTP fallback denied',
-        details={'route': 'grid'},
-    ))
+    native_exc = CoreError('semantic', 'native failure')
+    native_exc.code = 714
+    native_exc.name = 'FallbackDenied'
+    native_exc.details = {'route': 'grid'}
+    native_exc.semantic_message = 'same local relay HTTP fallback denied'
+    native_exc._transport_phase = 'pre_dispatch'
 
     restored = _cc_error_from_native_exception(native_exc)
 
     assert isinstance(restored, FallbackDenied)
+    assert restored.message == 'same local relay HTTP fallback denied'
     assert restored.details == {'route': 'grid'}
+    assert restored.transport_phase == 'pre_dispatch'
+    # Failures without a canonical semantic payload pass through untouched.
+    assert _cc_error_from_native_exception(CoreError('transport', 'io')) is None
+    assert _cc_error_from_native_exception(RuntimeError('plain')) is None
 
 def test_shutdown_warns_when_native_cleanup_barrier_is_unconfirmed(caplog) -> None:
     from c_two._native import LocalEndpointContext, resolve_local_endpoint_context

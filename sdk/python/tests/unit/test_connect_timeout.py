@@ -48,7 +48,7 @@ def test_public_core_error_has_complete_independent_fields(category):
     assert error.args == ('native diagnostic',)
     assert error.category == category
     optional = {
-        'code', 'name', 'error_bytes', 'transport_kind', 'transport_phase',
+        'code', 'name', 'semantic_message', '_transport_phase', 'transport_kind',
         'fallback_eligible', 'route_withdrawal', 'io_operation', 'io_kind',
         'raw_os_error', 'lifecycle_kind', 'startup_stage', 'timeout_seconds',
         'route_name', 'status_code', 'relay_duplicate', 'failure_source',
@@ -68,7 +68,10 @@ def test_public_core_error_annotations_expose_native_literal_values():
     hints = get_type_hints(cc.error.CoreError)
     assert hints['category'] == Literal['semantic', 'contract', 'admission', 'transport', 'lifecycle', 'protocol_version_mismatch']
     assert hints['transport_kind'] == Literal['ipc', 'http'] | None
-    assert hints['transport_phase'] == str | None
+    # transport_phase is a read-only property; the native-written field is
+    # restricted to the two canonical Core dispatch phases.
+    assert hints['_transport_phase'] == Literal['pre_dispatch', 'dispatch_uncertain'] | None
+    assert hints['semantic_message'] == str | None
     assert hints['io_operation'] == Literal['bind', 'connect'] | None
     assert hints['io_kind'] == Literal[
         'permission_denied', 'not_found', 'connection_refused', 'address_in_use', 'other',
@@ -83,7 +86,7 @@ def test_public_core_error_annotations_expose_native_literal_values():
     assert hints['code'] == int | None
     assert hints['local_protocol_version'] == hints['peer_protocol_version'] == int | None
     assert hints['details'] == dict[str, str]
-    assert hints['error_bytes'] == bytes | None
+    assert hints['semantic_message'] == str | None
     assert hints['fallback_eligible'] == hints['route_withdrawal'] == bool | None
 
 
@@ -111,8 +114,15 @@ def test_public_zero_timeout_has_connect_semantics_without_transport(address):
         assert failure.value.transport_phase == 'pre_dispatch'
         assert failure.value.details['operation'] == 'connect'
         assert failure.value.details['stage']
-        assert isinstance(failure.value.__cause__, cc.error.CoreError)
-        assert failure.value.__cause__.error_bytes == cc.error.CCError.serialize(failure.value)
+        cause = failure.value.__cause__
+        assert isinstance(cause, cc.error.CoreError)
+        # The raised error is the fresh semantic projection of its CoreError
+        # cause: same typed snapshot, never a byte round-trip.
+        projected = cause.semantic
+        assert isinstance(projected, cc.error.CallDeadlineExceeded)
+        assert projected.code == failure.value.code
+        assert projected.details == failure.value.details
+        assert projected.transport_phase == failure.value.transport_phase
     finally:
         _reset_default_runtime()
 
@@ -216,14 +226,15 @@ def test_close_rejects_non_proxy():
         cc.close(object())
 
 
-def test_native_deadline_error_round_trip_preserves_connect_details():
+def test_native_deadline_semantic_projection_preserves_connect_details():
     with pytest.raises(cc.error.CoreError) as failure:
         _native.ConnectAttempt(timeout_seconds=0)
     native = failure.value
-    projected = cc.error.CCError.deserialize(native.error_bytes)
+    projected = native.semantic
     assert isinstance(projected, cc.error.CallDeadlineExceeded)
     assert int(projected.code) == native.code == 715
-    assert projected.message == native.message
+    assert native.name == 'CallDeadlineExceeded'
+    assert projected.message == (native.semantic_message or native.message)
     assert projected.details == dict(native.details)
     assert projected.details == {
         'operation': 'connect',

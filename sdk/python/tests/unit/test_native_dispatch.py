@@ -9,12 +9,12 @@ from c_two.transport.server.native import CRMSlot, NativeServerBridge
 
 @pytest.mark.parametrize('registered_stream', [False, True])
 def test_dispatch_uses_registered_mode_after_method_metadata_changes(registered_stream):
-    result = (b'', b'output')
+    stream_result = object()
 
     def method(data, *, _release_fn, _c2_input_buffer_mode):
         assert bytes(data) == b'input'
         assert _c2_input_buffer_mode == 'view'
-        return result
+        return stream_result if registered_stream else b'output'
 
     method.__cc_stream__ = registered_stream
     slot = CRMSlot(
@@ -45,8 +45,44 @@ def test_dispatch_uses_registered_mode_after_method_metadata_changes(registered_
     request = Request(b'input')
     actual = dispatch(slot.name, 0, request)
     if registered_stream:
-        assert actual is result
+        # A stream's running step owns its input; the dispatcher hands the
+        # wrapper's return through untouched and does not release for it.
+        assert actual is stream_result
         assert not request.released
     else:
         assert actual == b'output'
         assert request.released
+
+
+def test_dispatch_rejects_non_bytes_unary_returns():
+    def method(data, *, _release_fn, _c2_input_buffer_mode):
+        return ('not', 'serialized-bytes')
+
+    slot = CRMSlot(
+        name='non-bytes',
+        crm_instance=SimpleNamespace(echo=method),
+        direct_instance=object(),
+        crm_ns='test.dispatch',
+        crm_name='Echo',
+        crm_ver='0.1.0',
+        abi_hash='0' * 64,
+        signature_hash='1' * 64,
+        method_table=SimpleNamespace(_idx_to_name={0: 'echo'}),
+        scheduler=None,
+        methods=['echo'],
+    )
+    slot.build_dispatch_table()
+    dispatch = NativeServerBridge._make_dispatcher(
+        SimpleNamespace(_local_copy_tracker=None), slot.name, slot,
+    )
+
+    class Request(bytearray):
+        released = False
+
+        def release(self):
+            self.released = True
+
+    request = Request(b'input')
+    with pytest.raises(TypeError, match='must return serialized bytes'):
+        dispatch(slot.name, 0, request)
+    assert request.released

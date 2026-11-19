@@ -92,12 +92,37 @@ def test_closed_call_direct_fails_before_entering_resource():
         ),
         method_index={'op': 0},
     )
-    scheduler.execution_guard = Mock(side_effect=RuntimeError('route closed'))
+    scheduler.execution_guard = Mock(
+        side_effect=ResourceClosed('route closed', transport_phase='pre_dispatch'),
+    )
     proxy = CRMProxy.thread_local(resource, name='grid', scheduler=scheduler)
 
     with pytest.raises(ResourceClosed, match="route 'grid' is closed") as exc_info:
         proxy.call_direct('op', ())
     assert exc_info.value.details == {'route': 'grid'}
+    assert exc_info.value.transport_phase == 'pre_dispatch'
+    assert isinstance(exc_info.value.__cause__, ResourceClosed)
+    assert resource.calls == []
+
+
+def test_plain_runtime_error_from_admission_is_not_text_matched():
+    resource = RecordingResource()
+    scheduler = FakeScheduler(
+        snapshot=SimpleNamespace(
+            mode='parallel',
+            max_pending=None,
+            max_workers=None,
+            closed=True,
+            is_unconstrained=False,
+        ),
+        method_index={'op': 0},
+    )
+    scheduler.execution_guard = Mock(side_effect=RuntimeError('route closed'))
+    proxy = CRMProxy.thread_local(resource, name='grid', scheduler=scheduler)
+
+    with pytest.raises(RuntimeError, match='route closed') as exc_info:
+        proxy.call_direct('op', ())
+    assert not isinstance(exc_info.value, ResourceClosed)
     assert resource.calls == []
 
 

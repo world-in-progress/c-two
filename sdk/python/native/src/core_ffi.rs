@@ -734,15 +734,12 @@ fn materialize_python_bytes(py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResul
 }
 
 pub(crate) fn python_error_to_c2(py: Python<'_>, error: PyErr) -> C2Error {
-    if let Ok(error_bytes) = error.value(py).getattr("error_bytes")
-        && let Ok(buffer) = PyBuffer::<u8>::get(&error_bytes)
-    {
-        let mut bytes = vec![0_u8; buffer.len_bytes()];
-        if buffer.copy_to_slice(py, &mut bytes).is_ok()
-            && let Ok(Some(error)) = C2Error::from_wire_bytes(&bytes)
-        {
-            return error;
-        }
+    if let Some(mut semantic) = semantic_payload_from_exception(py, &error) {
+        // A resource callback's error is already canonical: strip any inner
+        // dispatch phase so an inner call's admission detail never leaks into
+        // this call's classification.
+        c2_core::strip_callback_error_phases(&mut semantic);
+        return semantic;
     }
     C2Error::new(ErrorCode::ResourceFunctionExecuting, error.to_string()).with_details(
         BTreeMap::from([
@@ -756,6 +753,55 @@ pub(crate) fn python_error_to_c2(py: Python<'_>, error: PyErr) -> C2Error {
             ),
         ]),
     )
+}
+
+/// Extract the canonical `(code, message, details)` triple directly from a
+/// `c_two.error` exception: a `CCError` (or subclass), or a `CoreError`
+/// carrying a semantic payload. No in-process C2E1 wire round-trip exists.
+fn semantic_payload_from_exception(
+    py: Python<'_>,
+    error: &PyErr,
+) -> Option<C2Error> {
+    let value = error.value(py);
+    let module = py.import("c_two.error").ok()?;
+    let cc_error_class = module.getattr("CCError").ok()?;
+    if value.is_instance(&cc_error_class).ok()? {
+        let code = value.getattr("code").ok()?.extract::<u16>().ok()?;
+        let message = value
+            .getattr("message")
+            .ok()?
+            .extract::<String>()
+            .ok()?;
+        let details = value
+            .getattr("details")
+            .ok()?
+            .extract::<BTreeMap<String, String>>()
+            .ok()?;
+        let code = ErrorCode::try_from(code).ok()?;
+        return Some(C2Error::new(code, message).with_details(details));
+    }
+    let core_error_class = module.getattr("CoreError").ok()?;
+    if value.is_instance(&core_error_class).ok()? {
+        let code = value.getattr("code").ok()?;
+        if code.is_none() {
+            return None;
+        }
+        let code = code.extract::<u16>().ok()?;
+        let message = value
+            .getattr("semantic_message")
+            .ok()?
+            .extract::<Option<String>>()
+            .ok()?
+            .or_else(|| value.getattr("message").ok()?.extract::<String>().ok())?;
+        let details = value
+            .getattr("details")
+            .ok()?
+            .extract::<BTreeMap<String, String>>()
+            .ok()?;
+        let code = ErrorCode::try_from(code).ok()?;
+        return Some(C2Error::new(code, message).with_details(details));
+    }
+    None
 }
 
 #[pyfunction]

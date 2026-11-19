@@ -18,7 +18,7 @@ import c_two as cc
 
 import c_two.contract
 from tests.fixtures.process_control import readline_with_timeout
-from c_two.error import ContractMismatch
+from c_two.error import ContractMismatch, ErrorCode, SerializationError
 from c_two.transport.registry import _reset_default_runtime
 from fastdb4py.payload import Payload, PayloadError
 from tests.fixtures.portable_interop import (
@@ -381,10 +381,13 @@ def test_generated_rust_python_runtime_composition_is_bidirectional() -> None:
                         graph_response,
                         graph=True,
                     )
-                    with pytest.raises(PayloadError) as digest_mismatch:
+                    with pytest.raises(SerializationError) as digest_mismatch:
                         client.method_2_record_roundtrip(graph)
-                    assert digest_mismatch.value.symbol == "DIGEST_MISMATCH"
-                    assert digest_mismatch.value.path == "/payload/spec_sha256"
+                    assert digest_mismatch.value.code == ErrorCode.ClientInputSerializing
+                    assert digest_mismatch.value.transport_phase == "pre_dispatch"
+                    assert digest_mismatch.value.details["fastdb_symbol"] == "DIGEST_MISMATCH"
+                    assert digest_mismatch.value.details["fastdb_path"] == "/payload/spec_sha256"
+                    assert digest_mismatch.value.details["cause_owner"] == "fastdb"
                 finally:
                     graph.close()
 

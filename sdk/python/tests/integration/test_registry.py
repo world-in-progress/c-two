@@ -469,7 +469,7 @@ class TestRegisterConnect:
         cc.register(DirectError, DirectErrorImpl(), name='direct-error')
         crm = cc.connect(DirectError, name='direct-error')
         try:
-            with pytest.raises(cc.error.ResourceExecuteFunction, match='direct resource failed'):
+            with pytest.raises(cc.error.ResourceExecutionError, match='direct resource failed'):
                 crm.fail()
         finally:
             cc.close(crm)
@@ -486,7 +486,7 @@ class TestRegisterConnect:
         cc.register(Hello, resource, name='hello')
         crm = cc.connect(Hello, name='hello')
         try:
-            with pytest.raises(cc.error.ResourceExecuteFunction, match='route closed'):
+            with pytest.raises(cc.error.ResourceExecutionError, match='route closed'):
                 crm.greeting('World')
             assert resource.calls == 1
             assert crm.client.observed_path == 'thread_local'
@@ -610,8 +610,9 @@ class TestRegisterConnect:
         crm = cc.connect(Hello, name='hello')
         snapshot = crm.client.resolve_for_call(crm.client.start_call_budget())
         cc.close(crm)
-        with pytest.raises(RuntimeError, match='Proxy is closed'):
+        with pytest.raises(cc.error.ResourceClosed, match='CRM proxy is closed') as refused:
             snapshot.call_direct('greeting', ('grid',))
+        assert refused.value.transport_phase == 'pre_dispatch'
 
     def test_unregister(self):
         cc.register(Hello, HelloImpl(), name='hello')

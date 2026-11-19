@@ -8,7 +8,7 @@ from functools import wraps
 from typing import Generic, TypeVar, TypedDict, get_args, get_origin
 
 from .. import error
-from .payload_plan import PayloadPlanKind
+from .payload_plan import PayloadPlanKind, decode_stage_of
 
 T = TypeVar('T')
 
@@ -32,6 +32,42 @@ def stream_item_annotation(annotation):
 def _native_call(operation, *args, **kwargs):
     from ..transport.client.proxy import _native_call as call
     return call(operation, *args, **kwargs)
+
+
+def _client_output_decode_error(exc: BaseException) -> error.SerializationError:
+    """Classify a stream item decode failure by its actually failing hook."""
+    code = (
+        error.ErrorCode.ClientOutputFromBuffer
+        if decode_stage_of(exc) == 'from_buffer'
+        else error.ErrorCode.ClientOutputDeserializing
+    )
+    from .transferable import _cause_details
+    return error.SerializationError(code, str(exc), details=_cause_details(exc))
+
+
+def _resource_input_decode_error(exc: BaseException) -> error.SerializationError:
+    code = (
+        error.ErrorCode.ResourceInputFromBuffer
+        if decode_stage_of(exc) == 'from_buffer'
+        else error.ErrorCode.ResourceInputDeserializing
+    )
+    from .transferable import _cause_details
+    return error.SerializationError(code, str(exc), details=_cause_details(exc))
+
+
+def _resource_execution_failure(exc: BaseException) -> error.CCError:
+    """Project an exception escaping resource stream code for the dispatch.
+
+    A business ``CCError`` (or a ``CoreError`` semantic payload) keeps its
+    code, message and details on a fresh instance with inner dispatch phases
+    cleared; anything else becomes ``ResourceExecutionError``.
+    """
+    from .transferable import _cause_details
+    if isinstance(exc, error.CCBaseError):
+        clean = error._callback_semantic_copy(exc)
+        if clean is not None:
+            return clean
+    return error.ResourceExecutionError(str(exc), details=_cause_details(exc))
 
 
 class Stream(Iterator[T], Generic[T]):
@@ -59,7 +95,7 @@ class Stream(Iterator[T], Generic[T]):
 
     def __next__(self) -> T:
         from .transferable import (
-            HeldResult, _cause_details, _cleanup_preserving_primary,
+            HeldResult, _cleanup_preserving_primary,
             _invalidate_and_release_held_response, _release_view_and_response,
         )
         item = _native_call(self._native.next_item)
@@ -97,21 +133,19 @@ class Stream(Iterator[T], Generic[T]):
                 _cleanup_preserving_primary(exc, lambda: _release_view_and_response(view, item))
             if isinstance(exc, error.CCBaseError):
                 raise
-            phase = error.ClientOutputFromBuffer if self._held else error.ClientDeserializeOutput
-            raise phase(str(exc), details=_cause_details(exc)) from exc
+            raise _client_output_decode_error(exc) from exc
         _release_view_and_response(view, item)
         return value
 
     def close(self, timeout: float | None = 30.0) -> StreamCloseReceipt:
         receipt = _native_call(self._native.close, timeout)
         failure = receipt['error']
-        if failure is not None and getattr(failure, 'error_bytes', None) is not None:
-            canonical = error.CCError.deserialize(memoryview(failure.error_bytes))
-            if canonical is not None:
-                phase = getattr(failure, 'transport_phase', None)
-                if phase is not None:
-                    canonical.details['transport_phase'] = phase
-                receipt['error'] = canonical
+        if failure is not None:
+            projected = error._project_native_error(failure)
+            if projected is not None:
+                # Keep the native CoreError observable as the direct cause.
+                projected.__cause__ = failure
+                receipt['error'] = projected
         return receipt
 
     def __enter__(self) -> Stream[T]:
@@ -124,24 +158,6 @@ class Stream(Iterator[T], Generic[T]):
         native = getattr(self, '_native', None)
         if native is not None:
             native.cancel()
-
-
-class _ResourceFailure(Exception):
-    def __init__(self, failure):
-        super().__init__(str(failure))
-        self.error_bytes = error.CCError.serialize(failure)
-
-
-def _resource_failure(exc, phase):
-    from .transferable import _cause_details
-    if isinstance(exc, _ResourceFailure):
-        return exc
-    if isinstance(exc, error.CoreError) and exc.error_bytes:
-        semantic = error.CCError.deserialize(memoryview(exc.error_bytes))
-        if semantic is not None:
-            return _ResourceFailure(semantic)
-    failure = exc if isinstance(exc, error.CCError) else phase(str(exc), details=_cause_details(exc))
-    return _ResourceFailure(failure)
 
 
 class _ResourceStream:
@@ -180,12 +196,11 @@ class _ResourceStream:
             if not self._borrowed:
                 self._release_request()
         except BaseException as exc:
-            phase = error.ResourceInputFromBuffer if self._borrowed else error.ResourceDeserializeInput
-            raise _resource_failure(exc, phase) from exc
+            raise _resource_input_decode_error(exc) from exc
         try:
             self._iterator = iter(self._factory(*self._args))
         except BaseException as exc:
-            raise _resource_failure(exc, error.ResourceExecuteFunction) from exc
+            raise _resource_execution_failure(exc) from exc
         self._factory = None
 
     def step(self):
@@ -197,14 +212,19 @@ class _ResourceStream:
         except StopIteration:
             return False, None
         except BaseException as exc:
-            raise _resource_failure(exc, error.ResourceExecuteFunction) from exc
+            raise _resource_execution_failure(exc) from exc
         if self._encoded:
             try:
                 value = self._output.serialize(value)
                 if type(value) is not bytes:
                     raise TypeError('stream codec must produce immutable bytes')
             except BaseException as exc:
-                raise _resource_failure(exc, error.ResourceSerializeOutput) from exc
+                from .transferable import _cause_details
+                raise error.SerializationError(
+                    error.ErrorCode.ResourceOutputSerializing,
+                    str(exc),
+                    details=_cause_details(exc),
+                ) from exc
         return True, value
 
     def _release_request(self):
@@ -218,7 +238,7 @@ class _ResourceStream:
         return self._context.run(self._cleanup)
 
     def _cleanup(self):
-        from .transferable import _attach_cleanup_error
+        from .transferable import _attach_cleanup_error, _cause_details
         failure = None
         iterator = self._iterator
         self._iterator = None
@@ -228,7 +248,7 @@ class _ResourceStream:
                 if close is not None:
                     close()
         except BaseException as exc:
-            failure = _resource_failure(exc, error.ResourceExecuteFunction)
+            failure = _resource_execution_failure(exc)
         finally:
             del iterator
         try:
@@ -236,7 +256,11 @@ class _ResourceStream:
                 for value in self._args:
                     self._input.invalidate(value)
         except BaseException as exc:
-            cleanup = _resource_failure(exc, error.ResourceInputFromBuffer)
+            cleanup = error.SerializationError(
+                error.ErrorCode.ResourceInputFromBuffer,
+                str(exc),
+                details=_cause_details(exc),
+            )
             if failure is None:
                 failure = cleanup
             else:
@@ -245,7 +269,11 @@ class _ResourceStream:
             self._release_request()
         except BaseException as exc:
             if failure is None:
-                failure = _resource_failure(exc, error.ResourceInputFromBuffer)
+                failure = error.SerializationError(
+                    error.ErrorCode.ResourceInputFromBuffer,
+                    str(exc),
+                    details=_cause_details(exc),
+                )
             else:
                 _attach_cleanup_error(failure, exc)
         self._args = ()
@@ -307,7 +335,12 @@ def _build_stream_wrapper(func, input_binding, output_binding):
                 raise
             except BaseException as exc:
                 from .transferable import _cause_details
-                raise error.ClientSerializeInput(str(exc), details=_cause_details(exc)) from exc
+                raise error.SerializationError(
+                    error.ErrorCode.ClientInputSerializing,
+                    str(exc),
+                    details=_cause_details(exc),
+                    transport_phase='pre_dispatch',
+                ) from exc
             native = _native_call(prepared.stream, data)
         finally:
             prepared.close()

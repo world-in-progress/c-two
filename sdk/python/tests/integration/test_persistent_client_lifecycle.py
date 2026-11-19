@@ -317,7 +317,7 @@ def test_stateful_resource_failure_is_not_replayed(lab):
     proxy = lab.connect("stateful")
     lab.assert_reply(proxy.call("before"), resource, "before")
     connections = lab.outgoing.ids("opened", "client")
-    with pytest.raises(cc.error.ResourceExecuteFunction, match="committed once") as failed:
+    with pytest.raises(cc.error.ResourceExecutionError, match="committed once") as failed:
         proxy.commit_then_fail()
     assert "transport_phase" not in failed.value.details
     assert "dispatch_phase" not in failed.value.details
@@ -622,6 +622,55 @@ def test_peer_eof_is_uncertain_and_existing_proxy_follows_new_registration(lab, 
         if new is not None:
             lab.extra["new_cleanup"] = new.close()
         lab.extra["old_cleanup"] = old.close()
+
+
+def test_unary_upstream_crash_reads_dispatch_uncertain_through_unified_phase(lab, private_root, tmp_path):
+    """A unary call dispatched before an upstream crash keeps its native failure.
+
+    Direct IPC surfaces the CoreError itself; a relayed call surfaces the
+    relay's canonical ResourceUnavailable semantic. Both read the same
+    dispatch-uncertain verdict through the unified ``transport_phase``.
+    """
+    name = lab.name("unary-crash")
+    server_id = f"persistent-unary-{uuid.uuid4().hex}"
+    anchor = lab.owner.url if lab.owner is not None else ""
+    old = Peer(name, server_id, anchor, tmp_path / "unary-old.calls", private_root)
+    running = None
+    try:
+        lab.address = old.identity["ipc_address"]
+        lab.identity = old.identity
+        proxy = lab.connect("unary-crash")
+        completed = proxy.call("settled")
+        assert completed["server_instance_id"] == old.identity["server_instance_id"]
+        with ThreadPoolExecutor(max_workers=1) as threads:
+            running = threads.submit(proxy.blocked)
+            wait_state(
+                lambda: old.command("snapshot")["calls"].get("blocked"),
+                lambda entered: entered == 1,
+            )
+            lab.extra["old_killed"] = old.kill()
+            with pytest.raises(cc.error.CCBaseError) as uncertain:
+                running.result(10)
+            running = None
+        failure = uncertain.value
+        lab.extra["unary_failure"] = {
+            "type": type(failure).__name__,
+            "phase": failure.transport_phase,
+            "details": dict(getattr(failure, "details", {})),
+        }
+        assert failure.transport_phase == "dispatch_uncertain", failure
+        if lab.path == "relay_aware_relay":
+            assert isinstance(failure, cc.error.ResourceUnavailable)
+        else:
+            # The native CoreError passes through unwrapped: no client-side
+            # adapter code swallows a dispatch-uncertain transport fact.
+            assert type(failure) is cc.error.CoreError
+            assert failure.category == "transport"
+        assert [record["method"] for record in old.journal_records()] == ["call", "blocked"]
+    finally:
+        if running is not None:
+            running.cancel()
+        lab.extra["old_unary_cleanup"] = old.close()
 
 
 @pytest.mark.parametrize("lab", ["direct_ipc"], indirect=True)

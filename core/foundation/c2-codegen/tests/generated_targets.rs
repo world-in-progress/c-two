@@ -436,6 +436,42 @@ for name, value in {"Payload": Payload, "CompiledSpec": CompiledSpec,
     setattr(payload, name, value)
 sys.modules[package.__name__] = package
 sys.modules[payload.__name__] = payload
+
+class CCBaseError(Exception):
+    pass
+
+class ErrorCode:
+    Unknown = 0
+    ResourceInputDeserializing = 1
+    ResourceOutputSerializing = 2
+    ResourceFunctionExecuting = 3
+    ResourceInputFromBuffer = 4
+    ClientInputSerializing = 5
+    ClientOutputDeserializing = 6
+    ClientCallingResource = 7
+    ClientOutputFromBuffer = 8
+
+def SerializationError(code, message=None, details=None, transport_phase=None):
+    error = CCBaseError(f"{int(code)}: {message}")
+    error.code = int(code)
+    error.details = dict(details or {})
+    error.stage = transport_phase
+    return error
+
+def _project_native_error(exc):
+    # This consumer never produces semantic CoreErrors; the generated guard
+    # must only depend on the projection hook existing.
+    return None
+
+c_two = types.ModuleType("c_two")
+error_module = types.ModuleType("c_two.error")
+error_module.CCBaseError = CCBaseError
+error_module.ErrorCode = ErrorCode
+error_module.SerializationError = SerializationError
+error_module._project_native_error = _project_native_error
+c_two.error = error_module
+sys.modules["c_two"] = c_two
+sys.modules["c_two.error"] = error_module
 spec = importlib.util.spec_from_file_location("contract", sys.argv[1])
 contract = importlib.util.module_from_spec(spec)
 sys.modules["contract"] = contract
@@ -472,7 +508,10 @@ with contextlib.redirect_stderr(stderr):
     try:
         contract.decode_method_1_echo_output(b"response")
     except BaseException as error:
-        assert error is primary, error
+        # The decode failure is normalized to SerializationError (client
+        # output deserializing) without discarding or replacing the primary.
+        assert isinstance(error, CCBaseError) and error.code == 6, error
+        assert error.__cause__ is primary, error
     else:
         raise AssertionError("missing digest failure")
 assert events == ["payload:close"], events

@@ -54,7 +54,9 @@ def test_chunked_response_capacity_is_canonical_and_resource_executes_once() -> 
         assert native.code == 702
         assert native.transport_phase == 'dispatch_uncertain'
         assert native.fallback_eligible is False
-        assert isinstance(cc.error.CCError.deserialize(memoryview(native.error_bytes)), cc.error.ResourceUnavailable)
+        assert isinstance(native.semantic, cc.error.ResourceUnavailable)
+        assert native.semantic.transport_phase == 'dispatch_uncertain'
+        assert native.semantic.message == error.message
         # Both control traffic and an unrelated small CRM reply remain usable.
         assert ping(address, timeout=0.5)
         assert proxy.calls() == 1
