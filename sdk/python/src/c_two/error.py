@@ -14,7 +14,7 @@ TransportPhase = Literal['pre_dispatch', 'dispatch_uncertain']
 _PHASE_VALUES = ('pre_dispatch', 'dispatch_uncertain')
 _CALLBACK_DETAIL_KEYS = ('transport_phase', 'dispatch_phase', 'fallback_eligible', 'route_withdrawal')
 _SKIPPED_EXCEPTION_DESCRIPTORS = frozenset({
-    '__dict__', 'args', '__traceback__', '__context__', '__cause__', '__suppress_context__',
+    '__dict__', '__weakref__', 'args', '__traceback__', '__context__', '__cause__', '__suppress_context__',
 })
 _BASE_EXCEPTION_DICT = vars(BaseException)['__dict__']
 _DEFAULT_MESSAGE = 'Error occurred when using C-Two.'
@@ -100,6 +100,8 @@ class CCBaseError(Exception):
                     try:
                         slot_val = member.__get__(self, cls)
                     except (AttributeError, ValueError):
+                        continue
+                    if is_builtin and slot_val is None:
                         continue
                     if name == 'details' and isinstance(slot_val, Mapping):
                         slot_val = dict(slot_val)
@@ -669,6 +671,12 @@ def _clone_exception_without_user_hooks(exc: CCBaseError) -> CCBaseError:
                     slot_val = member.__get__(exc, cls)
                 except (AttributeError, ValueError):
                     continue
+                if is_builtin and slot_val is None:
+                    try:
+                        if member.__get__(copied, cls) is None:
+                            continue
+                    except (AttributeError, ValueError):
+                        continue
                 try:
                     member.__set__(copied, slot_val)
                 except (AttributeError, TypeError, ValueError):

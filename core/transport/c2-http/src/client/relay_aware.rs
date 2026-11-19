@@ -683,10 +683,11 @@ fn relay_rejection_is_pre_dispatch(error: &HttpError) -> bool {
         return false;
     };
     c2_error::C2Error::from_envelope(envelope).is_ok_and(|error| {
-        error
-            .details
-            .get("dispatch_phase")
-            .is_some_and(|phase| phase == "pre_dispatch")
+        error.code != c2_error::ErrorCode::Unknown
+            && error
+                .details
+                .get("dispatch_phase")
+                .is_some_and(|phase| phase == "pre_dispatch")
     })
 }
 
@@ -1269,6 +1270,22 @@ mod tests {
                 413,
                 "<html>Request Entity Too Large</html>".to_string()
             )),
+            HttpCallPhase::DispatchUncertain
+        );
+
+        let mut conflict_504 =
+            canonical_error_json(719, "RouteConflict", "gateway timeout", "grid");
+        conflict_504["details"]["dispatch_phase"] = json!("pre_dispatch");
+        assert_eq!(
+            http_call_error_phase(&HttpError::ServerError(504, conflict_504.to_string())),
+            HttpCallPhase::DispatchUncertain
+        );
+
+        let mut unknown_future =
+            canonical_error_json(720, "FutureRefusal", "unrecognized code", "grid");
+        unknown_future["details"]["dispatch_phase"] = json!("pre_dispatch");
+        assert_eq!(
+            http_call_error_phase(&HttpError::ServerError(503, unknown_future.to_string())),
             HttpCallPhase::DispatchUncertain
         );
 

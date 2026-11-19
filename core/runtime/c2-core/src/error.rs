@@ -482,6 +482,7 @@ fn normalize_http_call_semantic_bytes(bytes: &[u8], status: u16, phase: Transpor
                     .details
                     .insert("transport_phase".into(), "dispatch_uncertain".into());
             } else if phase == TransportPhase::PreDispatch
+                && semantic.code != ErrorCode::Unknown
                 && semantic
                     .details
                     .get("dispatch_phase")
@@ -490,6 +491,10 @@ fn normalize_http_call_semantic_bytes(bytes: &[u8], status: u16, phase: Transpor
                 semantic
                     .details
                     .insert("transport_phase".into(), "pre_dispatch".into());
+            } else if semantic.code == ErrorCode::Unknown {
+                semantic
+                    .details
+                    .insert("transport_phase".into(), "dispatch_uncertain".into());
             }
             return Error::Semantic(semantic);
         }

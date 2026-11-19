@@ -1253,6 +1253,10 @@ fn render_typescript(
         ));
     }
     output.push('\n');
+    debug_assert!(
+        TYPESCRIPT_TRANSPORT_SOURCE.contains(&render_typescript_error_code_table()),
+        "typescript_transport.ts C2_ERROR_CODE_NAMES drifted from c2_error::ErrorCode::registry()"
+    );
     output.push_str(TYPESCRIPT_TRANSPORT_SOURCE);
     output.push_str(
         r#"
@@ -1591,6 +1595,29 @@ fn method_symbol(index: usize, name: &str) -> String {
         }
     }
     symbol
+}
+
+fn render_typescript_error_code_table() -> String {
+    let mut table = String::from("const C2_ERROR_CODE_NAMES: Readonly<Record<number, string>> = Object.freeze({\n");
+    for entry in c2_error::ErrorCode::registry() {
+        table.push_str(&format!("  {}: {},\n", u16::from(entry.code), quoted(entry.name)));
+    }
+    table.push_str("});");
+    table
+}
+
+#[cfg(test)]
+mod registry_sync_tests {
+    use super::{TYPESCRIPT_TRANSPORT_SOURCE, render_typescript_error_code_table};
+
+    #[test]
+    fn typescript_transport_error_code_table_matches_canonical_registry() {
+        let expected = render_typescript_error_code_table();
+        assert!(
+            TYPESCRIPT_TRANSPORT_SOURCE.contains(&expected),
+            "assets/typescript_transport.ts C2_ERROR_CODE_NAMES must match c2_error::ErrorCode::registry(); expected:\n{expected}"
+        );
+    }
 }
 
 #[cfg(test)]

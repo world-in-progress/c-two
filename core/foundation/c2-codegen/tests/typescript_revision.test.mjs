@@ -616,7 +616,7 @@ test('invalid UTF-8 inside HTTP JSON envelope never grants retrySafe or RouteCon
       assert.ok(err instanceof transport.C2HttpRelayError);
       assert.equal(err.status,413);
       assert.equal(err.hasVerifiedUtf8Body,false);
-      assert.equal(err.transportPhase,undefined);
+      assert.equal(err.transportPhase,'dispatch_uncertain');
       assert.equal(err.retrySafe,false);
       return true;
     });
@@ -662,13 +662,38 @@ test('compressed HTTP route table and error responses succeed while acquisition 
       if(url.includes('/_probe/')){probes++;return relayResponse()}
       assert.equal(init.method,'POST');
       posts++;
+      if(posts===1){
+        const errBytes=new TextEncoder().encode(JSON.stringify({
+          version:1,code:717,name:'CallCapacityExceeded',message:'compressed capacity refusal payload',
+          details:{dispatch_phase:'pre_dispatch',padding:'x'.repeat(120)},
+        }));
+        const gzErr=gzipSync(errBytes);
+        assert.ok(gzErr.byteLength<errBytes.byteLength);
+        return {
+          status:413,
+          headers:{get(name){
+            const k=name.toLowerCase();
+            if(k==='content-encoding')return 'gzip';
+            if(k==='content-length')return String(gzErr.byteLength);
+            return null;
+          }},
+          async arrayBuffer(){return errBytes.slice().buffer},
+        };
+      }
       return relayResponse(200,Uint8Array.of(42));
     },
   });
   try{
+    await assert.rejects(client.call('route',contract,'ping',()=>new Uint8Array()),err=>{
+      assert.ok(err instanceof transport.C2HttpRelayError);
+      assert.equal(err.status,413);
+      assert.equal(err.transportPhase,'pre_dispatch');
+      assert.equal(err.retrySafe,true);
+      return true;
+    });
     const res=await client.call('route',contract,'ping',()=>new Uint8Array());
     assert.equal(res[0],42);
-    assert.deepEqual({resolves,probes,posts},{resolves:1,probes:1,posts:1});
+    assert.deepEqual({resolves,probes,posts},{resolves:1,probes:1,posts:2});
   }finally{await client.close()}
 
   let badResolvePosts=0;
@@ -732,8 +757,65 @@ test('probe 719 with bogus dispatch_uncertain stops selection and mismatched cod
     await assert.rejects(mismatchClient.call('route',contract,'ping',()=>new Uint8Array()),err=>{
       assert.ok(err instanceof transport.C2HttpRelayError);
       assert.equal(err.status,413);
+      assert.equal(err.transportPhase,'dispatch_uncertain');
       assert.equal(err.retrySafe,false);
       return true;
     });
   }finally{await mismatchClient.close()}
+
+  // 409 vs 504 on business POST with identical canonical 719 pre_dispatch body:
+  // 409 is pre-dispatch and invalidates target; 504 is dispatch_uncertain and keeps target.
+  const conflictBody=JSON.stringify({
+    version:1,code:719,name:'RouteConflict',message:'conflict on call',
+    details:{route:'route',dispatch_phase:'pre_dispatch'},
+  });
+  for(const [status,expectPhase,expectRetrySafe,expectResolves] of [
+    [409,'pre_dispatch',true,2],
+    [504,'dispatch_uncertain',false,1],
+  ]){
+    let resolves2=0,probes2=0,posts2=0;
+    const statusClient=transport.createRelayAwareHttpEncodedTransport('http://localhost:8300',{
+      fetch:async(url,init)=>{
+        if(url.includes('/_resolve/')){resolves2++;return textReply(200,JSON.stringify([relayRoute()]))}
+        if(url.includes('/_probe/')){probes2++;return relayResponse()}
+        assert.equal(init.method,'POST');
+        posts2++;
+        return posts2===1 ? textReply(status,conflictBody) : relayResponse(200,Uint8Array.of(7));
+      },
+    });
+    try{
+      await assert.rejects(statusClient.call('route',contract,'ping',()=>new Uint8Array()),err=>{
+        assert.ok(err instanceof transport.C2HttpRelayError);
+        assert.equal(err.status,status);
+        assert.equal(err.transportPhase,expectPhase);
+        assert.equal(err.retrySafe,expectRetrySafe);
+        return true;
+      });
+      const ok=await statusClient.call('route',contract,'ping',()=>new Uint8Array());
+      assert.equal(ok[0],7);
+      assert.deepEqual({resolves2,probes2,posts2},{resolves2:expectResolves,probes2:expectResolves,posts2:2});
+    }finally{await statusClient.close()}
+  }
+
+  // Unknown future u16 code (720) on HTTP 503 business POST is dispatch_uncertain (retrySafe=false).
+  const futureClient=transport.createRelayAwareHttpEncodedTransport('http://localhost:8300',{
+    fetch:async(url,init)=>{
+      if(url.includes('/_resolve/'))return textReply(200,JSON.stringify([relayRoute()]));
+      if(url.includes('/_probe/'))return relayResponse();
+      assert.equal(init.method,'POST');
+      return textReply(503,JSON.stringify({
+        version:1,code:720,name:'FutureRefusal',message:'future code',
+        details:{dispatch_phase:'pre_dispatch'},
+      }));
+    },
+  });
+  try{
+    await assert.rejects(futureClient.call('route',contract,'ping',()=>new Uint8Array()),err=>{
+      assert.ok(err instanceof transport.C2HttpRelayError);
+      assert.equal(err.status,503);
+      assert.equal(err.transportPhase,'dispatch_uncertain');
+      assert.equal(err.retrySafe,false);
+      return true;
+    });
+  }finally{await futureClient.close()}
 });

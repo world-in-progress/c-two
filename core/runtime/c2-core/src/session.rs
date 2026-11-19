@@ -174,16 +174,32 @@ fn http_error_parts(err: HttpError) -> (Option<u16>, String, Option<c2_error::C2
     let message = err.to_string();
     match err {
         HttpError::ServerError(status_code, body) => {
-            // Control failures can also be plain text. Preserve that original
-            // failure regardless of whether it carries a semantic envelope.
-            let semantic_error = match serde_json::from_str::<c2_error::C2ErrorEnvelope>(&body) {
-                Ok(envelope) => Some(crate::error::semantic_error_from_http_envelope(envelope)),
-                Err(_) => None,
-            };
+            let semantic_error = parse_control_semantic_error(&body);
             (Some(status_code), body, semantic_error)
         }
         HttpError::LocalCallRejected(error) => (None, message, Some(error)),
         _ => (None, message, None),
+    }
+}
+
+fn parse_control_semantic_error(body: &str) -> Option<c2_error::C2Error> {
+    if let Ok(envelope) = serde_json::from_str::<c2_error::C2ErrorEnvelope>(body) {
+        return Some(crate::error::semantic_error_from_http_envelope(envelope));
+    }
+    let trimmed = body.trim_start();
+    if !trimmed.starts_with('{') {
+        // Plain-text control responses keep semantic_error = None.
+        return None;
+    }
+    match serde_json::from_str::<serde_json::Value>(trimmed) {
+        Ok(serde_json::Value::Object(map))
+            if !map.contains_key("version") && !map.contains_key("code") =>
+        {
+            // Non-C2E1 control payloads such as LocalEndpointNamespaceMismatch
+            // preserve their control message and HTTP status without fabricating 703 or 713.
+            None
+        }
+        _ => Some(crate::error::semantic_error_from_http_body(body)),
     }
 }
 

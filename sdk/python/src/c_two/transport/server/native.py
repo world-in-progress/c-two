@@ -25,7 +25,7 @@ from ...crm.methods import rpc_method_names
 from ...crm.meta import MethodAccess, get_method_access, get_shutdown_method
 from ...crm.payload_plan import PayloadPlanKind
 from ...crm.transferable import _cleanup_preserving_primary, _release_view_and_response
-from ...error import CoreError, ResourceAlreadyRegistered
+from ...error import CoreError
 from ..input_lifetime import (
     _InputLifetime,
     normalize_input_lifetime_map,
@@ -252,15 +252,6 @@ class NativeServerBridge:
                 )
             except Exception as exc:
                 semantic = exc.semantic if isinstance(exc, CoreError) else None
-                if (
-                    semantic is None
-                    and getattr(exc, 'status_code', None) == 409
-                    and getattr(exc, 'relay_duplicate', False)
-                ):
-                    raise ResourceAlreadyRegistered(
-                        f'Route name already registered with relay: {routing_name!r}',
-                        details=getattr(exc, 'details', None),
-                    ) from exc
                 if semantic is not None:
                     # Keep the canonical relay refusal message; the native
                     # CoreError stays observable as the direct cause.
@@ -268,8 +259,6 @@ class NativeServerBridge:
                         raise semantic from exc
                     finally:
                         del semantic
-                if getattr(exc, 'status_code', None) == 409:
-                    raise ValueError(str(exc)) from exc
                 raise
             slot.scheduler = Scheduler(native_concurrency, method_index)
             self._slots[routing_name] = slot

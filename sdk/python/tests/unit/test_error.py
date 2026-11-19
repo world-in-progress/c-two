@@ -513,3 +513,77 @@ def test_real_native_failure_projection_releases_both_errors_without_gc(operatio
     finally:
         if gc_was_enabled:
             gc.enable()
+
+
+class _DiskCoreError(CoreError, OSError):
+    def __init__(self, message: str):
+        CoreError.__init__(self, 'transport', message)
+        self.raw_os_error = 5
+        self.io_operation = 'connect'
+        self._transport_phase = 'pre_dispatch'
+        self.details = {'dispatch_phase': 'pre_dispatch', 'biz': 'core-io'}
+        self.errno = 5
+        self.strerror = 'Input/output error'
+        self.filename = 'disk.sock'
+
+
+class _BlockingClosedError(ResourceClosed, BlockingIOError):
+    def __init__(self, message: str):
+        ResourceClosed.__init__(
+            self,
+            message,
+            details={'dispatch_phase': 'pre_dispatch', 'biz': 'blocking'},
+            transport_phase='pre_dispatch',
+        )
+        self.errno = 11
+        self.characters_written = 4096
+
+
+def test_hybrid_oserror_and_exception_group_preserve_str_getset_and_weakref_pickle():
+    import copy
+    import pickle
+    import weakref
+    from c_two import error as cc_err
+
+    disk_core = _DiskCoreError('disk core failure')
+    expected_str = str(disk_core)
+    assert expected_str.endswith("'disk.sock'")
+    assert '-> None' not in expected_str
+
+    cleaned_core = cc_err._post_dispatch_cleanup_error(disk_core)
+    for clone in (copy.copy(disk_core), pickle.loads(pickle.dumps(disk_core)), cleaned_core):
+        assert isinstance(clone, _DiskCoreError)
+        assert clone is not disk_core
+        assert str(clone) == expected_str
+        assert clone.filename == 'disk.sock'
+        assert clone.filename2 is None
+        assert clone.raw_os_error == 5
+        assert clone.io_operation == 'connect'
+        assert clone.errno == 5
+    assert cleaned_core.transport_phase is None
+    assert cleaned_core.details == {'biz': 'core-io'}
+
+    blocking = _BlockingClosedError('partial write before close')
+    cleaned_blocking = cc_err._callback_error_copy(blocking)
+    for clone in (copy.copy(blocking), pickle.loads(pickle.dumps(blocking)), cleaned_blocking):
+        assert isinstance(clone, _BlockingClosedError)
+        assert clone.code == ErrorCode.ResourceClosed
+        assert clone.characters_written == 4096
+        assert str(clone) == str(blocking)
+    assert cleaned_blocking.transport_phase is None
+    assert cleaned_blocking.details == {'biz': 'blocking'}
+
+    if hasattr(__builtins__, 'ExceptionGroup') or 'ExceptionGroup' in dir(__builtins__):
+        exc_group_cls = ExceptionGroup  # type: ignore[name-defined]
+
+        class _HybridGroupError(CCBaseError, exc_group_cls):
+            pass
+
+        grp = _HybridGroupError('hybrid group', [ValueError('leaf')])
+        live_ref = weakref.ref(grp)
+        assert live_ref() is grp
+        restored = pickle.loads(pickle.dumps(grp))
+        assert isinstance(restored, _HybridGroupError)
+        assert restored.message == 'hybrid group'
+        assert len(restored.exceptions) == 1
+        assert str(restored.exceptions[0]) == 'leaf'

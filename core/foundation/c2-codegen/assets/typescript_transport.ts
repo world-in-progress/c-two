@@ -210,6 +210,7 @@ interface C2RelayRouteInfo {
 
 const C2_STRICT_UTF8_DECODER = new TextDecoder("utf-8", { fatal: true });
 const C2_LOSSY_UTF8_DECODER = new TextDecoder("utf-8");
+const C2_PRE_DISPATCH_HTTP_STATUSES = new Set([404, 406, 409, 410, 413, 429, 502, 503]);
 
 function decodeHttpErrorBody(raw: string | Uint8Array): { readonly body: string; readonly validUtf8: boolean } {
   if (typeof raw === "string") {
@@ -222,10 +223,27 @@ function decodeHttpErrorBody(raw: string | Uint8Array): { readonly body: string;
   }
 }
 
+function resolveHttpCallRelayErrorPhase(
+  status: number,
+  decoded: { readonly body: string; readonly validUtf8: boolean },
+): "pre_dispatch" | "dispatch_uncertain" {
+  if (!decoded.validUtf8 || !C2_PRE_DISPATCH_HTTP_STATUSES.has(status)) {
+    return "dispatch_uncertain";
+  }
+  const canonical = parseCanonicalRelayError(decoded.body);
+  if (canonical === undefined || canonical.code === 0) {
+    return "dispatch_uncertain";
+  }
+  if ((status === 404 && canonical.code === 701) || canonical.details.dispatch_phase === "pre_dispatch") {
+    return "pre_dispatch";
+  }
+  return "dispatch_uncertain";
+}
+
 export class C2HttpRelayError extends Error {
   readonly status: number;
   readonly body: string;
-  readonly transportPhase?: "pre_dispatch" | "dispatch_uncertain";
+  readonly transportPhase: "pre_dispatch" | "dispatch_uncertain";
   readonly #validUtf8: boolean;
   constructor(status: number, body: string | Uint8Array, transportPhase?: "pre_dispatch" | "dispatch_uncertain") {
     const decoded = decodeHttpErrorBody(body);
@@ -234,9 +252,7 @@ export class C2HttpRelayError extends Error {
     Object.setPrototypeOf(this, C2HttpRelayError.prototype);
     this.status = status;
     this.body = decoded.body;
-    if (transportPhase !== undefined) {
-      this.transportPhase = transportPhase;
-    }
+    this.transportPhase = transportPhase ?? resolveHttpCallRelayErrorPhase(status, decoded);
     this.#validUtf8 = decoded.validUtf8;
   }
   get hasVerifiedUtf8Body(): boolean {
@@ -1194,14 +1210,50 @@ async function readHttpSuccessResponsePayload<Payload extends C2ResponsePayload>
 
 async function readHttpArrayBufferResponsePayload(response: C2FetchResponse): Promise<Uint8Array> {
   const contentLength = responseContentLength(response);
+  const identityEncoding = responseHasIdentityContentEncoding(response);
+  if (!identityEncoding && response.body !== undefined && response.body !== null) {
+    return await readBoundedStreamBytes(response.body, C2_MAX_RESPONSE_PAYLOAD_BYTES);
+  }
   const payload = new Uint8Array(await response.arrayBuffer());
   if (payload.byteLength > C2_MAX_RESPONSE_PAYLOAD_BYTES) {
     throw new Error(`C-Two HTTP relay response body must be no greater than ${C2_MAX_RESPONSE_PAYLOAD_BYTES} bytes.`);
   }
-  if (contentLength !== undefined && responseHasIdentityContentEncoding(response) && payload.byteLength !== contentLength) {
+  if (contentLength !== undefined && identityEncoding && payload.byteLength !== contentLength) {
     throw new Error("C-Two HTTP relay response body byte length does not match Content-Length.");
   }
   return payload;
+}
+
+async function readBoundedStreamBytes(body: C2ReadableStream, maxBytes: number): Promise<Uint8Array> {
+  const chunks: Uint8Array[] = [];
+  let byteLength = 0;
+  const reader = body.getReader();
+  try {
+    while (true) {
+      const chunk = await reader.read();
+      if (chunk.done) {
+        break;
+      }
+      if (chunk.value === undefined || chunk.value.byteLength === 0) {
+        continue;
+      }
+      const nextByteLength = byteLength + chunk.value.byteLength;
+      if (!Number.isSafeInteger(nextByteLength) || nextByteLength > maxBytes) {
+        throw new Error(`C-Two HTTP relay response body must be no greater than ${maxBytes} bytes.`);
+      }
+      chunks.push(chunk.value.slice());
+      byteLength = nextByteLength;
+    }
+  } finally {
+    reader?.releaseLock?.();
+  }
+  const out = new Uint8Array(byteLength);
+  let offset = 0;
+  for (const chunk of chunks) {
+    out.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return out;
 }
 
 function responseHasIdentityContentEncoding(response: C2FetchResponse): boolean {
@@ -1997,14 +2049,18 @@ function optionalStringField(item: Record<string, unknown>, field: string, index
 
 function preDispatchRouteCode(error: unknown): number | undefined {
   if (error instanceof C2IpcTransportError || error instanceof C2CoreError) {
-    return error.transportPhase === "pre_dispatch" ? error.code ?? undefined : undefined;
+    return error.transportPhase === "pre_dispatch" && error.code !== null && error.code !== undefined && error.code !== 0
+      ? error.code
+      : undefined;
   }
   if (error instanceof C2HttpRelayError) {
-    if (!error.hasVerifiedUtf8Body) {
+    if (!error.hasVerifiedUtf8Body || error.transportPhase !== "pre_dispatch") {
       return undefined;
     }
     const canonical = parseCanonicalRelayError(error.body);
-    if (canonical !== undefined && (error.transportPhase === "pre_dispatch" || canonical.details.dispatch_phase === "pre_dispatch")) return canonical.code;
+    if (canonical !== undefined && canonical.code !== 0) {
+      return canonical.code;
+    }
   }
   return undefined;
 }
@@ -2065,11 +2121,14 @@ function parseCanonicalRelayError(
       return undefined;
     }
     const record = parsed as Record<string, unknown>;
-    if (record.version !== 1 || !Number.isSafeInteger(record.code) || typeof record.name !== "string" || typeof record.message !== "string") {
-      return undefined;
-    }
-    const expectedName = C2_ERROR_CODE_NAMES[record.code as number];
-    if (expectedName === undefined || record.name !== expectedName) {
+    if (
+      record.version !== 1 ||
+      !Number.isSafeInteger(record.code) ||
+      (record.code as number) < 0 ||
+      (record.code as number) > 65535 ||
+      typeof record.name !== "string" ||
+      typeof record.message !== "string"
+    ) {
       return undefined;
     }
     if (
@@ -2080,12 +2139,34 @@ function parseCanonicalRelayError(
     ) {
       return undefined;
     }
+    const rawCode = record.code as number;
+    const rawDetails = record.details as Readonly<Record<string, string>>;
+    const expectedName = C2_ERROR_CODE_NAMES[rawCode];
+    if (expectedName !== undefined) {
+      if (record.name !== expectedName) {
+        return undefined;
+      }
+      return {
+        version: 1,
+        code: rawCode,
+        name: record.name,
+        message: record.message,
+        details: rawDetails,
+      };
+    }
+    const degradedDetails: Record<string, string> = { ...rawDetails };
+    if (degradedDetails.unknown_code === undefined) {
+      degradedDetails.unknown_code = String(rawCode);
+    }
+    if (degradedDetails.unknown_name === undefined) {
+      degradedDetails.unknown_name = record.name;
+    }
     return {
       version: 1,
-      code: record.code as number,
-      name: record.name,
-      message: record.message,
-      details: record.details as Readonly<Record<string, string>>,
+      code: 0,
+      name: "Unknown",
+      message: `Unknown error code ${rawCode} (${record.name}): ${record.message}`,
+      details: degradedDetails,
     };
   } catch {
     return undefined;

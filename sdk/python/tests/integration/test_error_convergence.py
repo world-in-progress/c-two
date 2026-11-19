@@ -354,22 +354,23 @@ class TestPreparedStreamProjection:
         assert refused.value is typed
         assert refused.value.__cause__ is None
 
-    def test_charge_capacity_e2e_projects_pre_dispatch(self):
+    def test_charge_capacity_e2e_projects_pre_dispatch(self, tmp_path):
         """A real FastDB stream charge over budget reaches the caller typed."""
-        from c_two.transport.registry import _reset_default_runtime
         from tests.fixtures.stream_python import StreamPayloads, blob_payload
 
         class PayloadStepsResource:
             def steps(self, payload):
                 yield payload
 
-        _reset_default_runtime()
-        cc.set_client(memory_budget_bytes=8 * 1024)
+        runtime = cc.Runtime()
+        if sys.platform != 'win32':
+            runtime.set_local_endpoint(root=str(tmp_path))
+        runtime.set_client(memory_budget_bytes=8 * 1024)
         proxy = source = None
         try:
-            cc.register(StreamPayloads, PayloadStepsResource(), name='charge-budget')
-            proxy = cc.connect(
-                StreamPayloads, name='charge-budget', address=cc.server_address(),
+            runtime.register(StreamPayloads, PayloadStepsResource(), name='charge-budget')
+            proxy = runtime.connect(
+                StreamPayloads, name='charge-budget', address=runtime.server_address(),
             )
             source = blob_payload(b'x' * 64 * 1024)
             with pytest.raises(CallCapacityExceeded) as refused:
@@ -387,7 +388,7 @@ class TestPreparedStreamProjection:
                 source.close()
             if proxy is not None:
                 cc.close(proxy)
-            _reset_default_runtime()
+            runtime.shutdown()
 
 
 class _ProjectionBound:
@@ -1555,18 +1556,6 @@ def test_http_probe_conflict_without_wire_phase_and_corrupt_utf8_on_acquire():
         assert not worker.is_alive()
 
 
-class _DiskCoreError(CoreError, OSError):
-    def __init__(self, message: str):
-        CoreError.__init__(self, 'transport', message)
-        self.raw_os_error = 5
-        self.io_operation = 'connect'
-        self._transport_phase = 'pre_dispatch'
-        self.details = {'dispatch_phase': 'pre_dispatch', 'biz': 'core-io'}
-        self.errno = 5
-        self.strerror = 'Input/output error'
-        self.filename = 'disk.sock'
-
-
 class _BlockingClosedError(ResourceClosed, BlockingIOError):
     def __init__(self, message: str):
         ResourceClosed.__init__(
@@ -1585,44 +1574,11 @@ class _NoDictClosedError(ResourceClosed):
         raise AttributeError('instance __dict__ is hidden')
 
 
-def test_coreerror_oserror_blockingio_and_nodict_stream_wrap_cancel(tmp_path):
-    import copy
-    import json
-    import pickle
-    import threading
-    from http.server import BaseHTTPRequestHandler
-    from c_two import error as cc_err
+def test_nodict_stream_wrap_cancels_once_and_blocking_callback_preserves_getset(tmp_path):
     from c_two.crm.payload_plan import no_payload_binding, python_pickle_output_binding
     from c_two.crm.transferable import _build_transfer_wrapper
-    from c_two.error import ProtocolViolation
-    from tests.fixtures.http_server import LoopbackHTTPServer
 
-    # 1. CoreError + OSError preserves C layout & CoreError diagnostics across copy, pickle & cleanup.
-    disk_core = _DiskCoreError('disk core failure')
-    for clone in (copy.copy(disk_core), pickle.loads(pickle.dumps(disk_core))):
-        assert isinstance(clone, _DiskCoreError)
-        assert clone.raw_os_error == 5
-        assert clone.io_operation == 'connect'
-        assert clone.errno == 5
-        assert clone.filename == 'disk.sock'
-
-    cleaned_core = cc_err._post_dispatch_cleanup_error(disk_core)
-    assert isinstance(cleaned_core, _DiskCoreError)
-    assert cleaned_core is not disk_core
-    assert cleaned_core.transport_phase is None
-    assert cleaned_core.raw_os_error == 5
-    assert cleaned_core.io_operation == 'connect'
-    assert cleaned_core.errno == 5
-    assert cleaned_core.filename == 'disk.sock'
-    assert cleaned_core.details == {'biz': 'core-io'}
-
-    # 2. ResourceClosed + BlockingIOError preserves getset descriptor characters_written across all 3 paths.
     blocking = _BlockingClosedError('partial write before close')
-    for clone in (copy.copy(blocking), pickle.loads(pickle.dumps(blocking))):
-        assert isinstance(clone, _BlockingClosedError)
-        assert clone.code == ErrorCode.ResourceClosed
-        assert clone.characters_written == 4096
-
     runtime = cc.Runtime()
     if sys.platform != 'win32':
         ipc_dir = tmp_path / 'ipc'
@@ -1644,13 +1600,13 @@ def test_coreerror_oserror_blockingio_and_nodict_stream_wrap_cancel(tmp_path):
         assert cb_err.value is not blocking
         assert cb_err.value.transport_phase is None
         assert cb_err.value.characters_written == 4096
+        assert str(cb_err.value) == str(blocking)
         assert cb_err.value.details == {'biz': 'blocking'}
         assert blocking.transport_phase == 'pre_dispatch'
     finally:
         cc.close(local)
         runtime.shutdown()
 
-    # 3. Stream wrapper metadata error with hidden __dict__ still cancels native stream once & sanitizes phase.
     fixture = (
         Path(__file__).resolve().parents[4]
         / 'core/foundation/c2-contract/tests/fixtures/server-stream.contract.json'
@@ -1707,6 +1663,11 @@ def test_coreerror_oserror_blockingio_and_nodict_stream_wrap_cancel(tmp_path):
         assert gen_wrap_err.value.details == {'biz': 'nodict'}
         assert holder['last'].cancel_calls == 1
 
+        with pytest.raises(_NoDictClosedError) as gen_hold_wrap_err:
+            gen_client.hold_method_1_echo(req_payload)
+        assert gen_hold_wrap_err.value.transport_phase is None
+        assert holder['last'].cancel_calls == 1
+
         def crm_stream_fn(self) -> Iterator[str]: ...
         crm_stream_fn.__cc_stream__ = True
 
@@ -1729,10 +1690,28 @@ def test_coreerror_oserror_blockingio_and_nodict_stream_wrap_cancel(tmp_path):
         req_payload.close()
         sys.modules.pop(spec.name, None)
 
-    # 4. Corrupt UTF-8 409 on POST /_register surfaces ProtocolViolation(713), never ResourceAlreadyRegistered.
-    class BadRegisterRelay(BaseHTTPRequestHandler):
+
+def test_register_409_namespace_mismatch_and_malformed_envelopes_never_fake_duplicate(tmp_path):
+    import json
+    import threading
+    from http.server import BaseHTTPRequestHandler
+    from c_two.error import ProtocolViolation, ResourceAlreadyRegistered
+    from tests.fixtures.http_server import LoopbackHTTPServer
+
+    mode = {'kind': 'namespace'}
+
+    class RegisterRelay(BaseHTTPRequestHandler):
         def do_POST(self):
-            body = b'{"version":1,"code":719,"name":"RouteConflict","message":"bad \xff byte","details":{}}'
+            _ = self.rfile.read(int(self.headers.get('Content-Length', '0')))
+            if mode['kind'] == 'namespace':
+                body = json.dumps({
+                    'error': 'LocalEndpointNamespaceMismatch',
+                    'message': 'resource and relay local endpoint namespaces differ',
+                }).encode('utf-8')
+            elif mode['kind'] == 'truncated_json':
+                body = b'{"version":1,"code":703'
+            else:
+                body = b'{"version":1,"code":719,"name":"RouteConflict","message":"bad \xff byte","details":{}}'
             self.send_response(409)
             self.send_header('Content-Type', 'application/json')
             self.send_header('Content-Length', str(len(body)))
@@ -1742,7 +1721,14 @@ def test_coreerror_oserror_blockingio_and_nodict_stream_wrap_cancel(tmp_path):
         def log_message(self, *_args):
             pass
 
-    server = LoopbackHTTPServer(('127.0.0.1', 0), BadRegisterRelay)
+    class Resource:
+        def echo(self, value):
+            return value
+
+        def steps(self, value):
+            yield value
+
+    server = LoopbackHTTPServer(('127.0.0.1', 0), RegisterRelay)
     server.daemon_threads = False
     worker = threading.Thread(target=server.serve_forever)
     worker.start()
@@ -1753,12 +1739,29 @@ def test_coreerror_oserror_blockingio_and_nodict_stream_wrap_cancel(tmp_path):
         reg_runtime.set_local_endpoint(root=str(reg_dir))
     reg_runtime.set_relay_anchor(f'http://127.0.0.1:{server.server_port}')
     try:
-        with pytest.raises(ProtocolViolation) as reg_err:
-            reg_runtime.register(CodecBoundary, Resource(), name='corrupt-reg')
-        assert reg_err.value.code == ErrorCode.ProtocolViolation
-        assert isinstance(reg_err.value.__cause__, CoreError)
-        assert reg_err.value.__cause__.status_code == 409
-        assert reg_err.value.__cause__.relay_duplicate is False
+        # 1. LocalEndpointNamespaceMismatch keeps CoreError(status_code=409, relay_duplicate=False, rollback).
+        mode['kind'] = 'namespace'
+        with pytest.raises(CoreError) as ns_err:
+            reg_runtime.register(CodecBoundary, Resource(), name='ns-mismatch')
+        assert not isinstance(ns_err.value, ResourceAlreadyRegistered)
+        assert ns_err.value.lifecycle_kind == 'register_failure'
+        assert ns_err.value.status_code == 409
+        assert ns_err.value.relay_duplicate is False
+        assert ns_err.value.semantic is None
+        assert 'LocalEndpointNamespaceMismatch' in ns_err.value.message
+        assert ns_err.value.rollback is not None
+        assert ns_err.value.rollback['closed_reason'] == 'registration_rollback'
+
+        # 2. Truncated JSON envelope and corrupt UTF-8 409 both project ProtocolViolation(713).
+        for kind in ('truncated_json', 'corrupt_utf8'):
+            mode['kind'] = kind
+            with pytest.raises(ProtocolViolation) as bad_err:
+                reg_runtime.register(CodecBoundary, Resource(), name=f'bad-{kind}')
+            assert bad_err.value.code == ErrorCode.ProtocolViolation
+            assert isinstance(bad_err.value.__cause__, CoreError)
+            assert bad_err.value.__cause__.status_code == 409
+            assert bad_err.value.__cause__.relay_duplicate is False
+            assert bad_err.value.__cause__.rollback is not None
     finally:
         reg_runtime.shutdown()
         server.shutdown()

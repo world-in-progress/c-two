@@ -586,7 +586,7 @@ pub(crate) fn lifecycle_error_to_py(error: LifecycleError) -> PyErr {
                         set_attr(
                             value,
                             "relay_duplicate",
-                            failure.semantic_error.as_ref().is_none_or(|error| {
+                            failure.semantic_error.as_ref().is_some_and(|error| {
                                 error.code == c2_error::ErrorCode::ResourceAlreadyRegistered
                             }),
                         );
