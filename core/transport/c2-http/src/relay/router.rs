@@ -2487,8 +2487,17 @@ fn ipc_route_error_response(
     budget: Option<&DomainBudget>,
 ) -> Response {
     use c2_error::{C2Error, ErrorCode};
-    let semantic_error_response =
-        |status, error: C2Error| json_error_response(status, error.envelope(), budget);
+    let semantic_error_response = |status, mut error: C2Error| {
+        error
+            .details
+            .insert("dispatch_phase".into(), "pre_dispatch".into());
+        if error.details.contains_key("transport_phase") {
+            error
+                .details
+                .insert("transport_phase".into(), "pre_dispatch".into());
+        }
+        json_error_response(status, error.envelope(), budget)
+    };
 
     match error {
         c2_ipc::IpcError::CallRejected(error) => {
@@ -2502,11 +2511,7 @@ fn ipc_route_error_response(
                 | ErrorCode::CallCapacityExceeded => StatusCode::SERVICE_UNAVAILABLE,
                 _ => StatusCode::BAD_GATEWAY,
             };
-            let mut projected = error.clone();
-            projected
-                .details
-                .insert("dispatch_phase".into(), "pre_dispatch".into());
-            semantic_error_response(status, projected)
+            semantic_error_response(status, error.clone())
         }
         c2_ipc::IpcError::LocalCallRejected(error) => {
             semantic_error_response(StatusCode::SERVICE_UNAVAILABLE, error.clone())
@@ -2525,10 +2530,7 @@ fn ipc_route_error_response(
                 ErrorCode::ResourceRemoved,
                 format!("route removed: {route_name}"),
             )
-            .with_details(BTreeMap::from([
-                ("route".into(), route_name.clone()),
-                ("dispatch_phase".into(), "pre_dispatch".into()),
-            ])),
+            .with_details(BTreeMap::from([("route".into(), route_name.clone())])),
         ),
         c2_ipc::IpcError::RouteClosed { route_name, reason } => semantic_error_response(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -2539,14 +2541,12 @@ fn ipc_route_error_response(
             .with_details(BTreeMap::from([
                 ("route".into(), route_name.clone()),
                 ("reason".into(), reason.clone()),
-                ("dispatch_phase".into(), "pre_dispatch".into()),
             ])),
         ),
         c2_ipc::IpcError::ContractMismatch(message) => semantic_error_response(
             StatusCode::CONFLICT,
             C2Error::new(ErrorCode::ContractMismatch, message.clone()).with_details(
                 BTreeMap::from([
-                    ("dispatch_phase".to_string(), "pre_dispatch".to_string()),
                     ("route".to_string(), route_name.to_string()),
                     ("transport".to_string(), "ipc".to_string()),
                 ]),
@@ -2976,35 +2976,40 @@ mod tests {
                 StatusCode::BAD_GATEWAY,
                 ErrorCode::ProtocolViolation,
             ),
+            (
+                c2_ipc::IpcError::LocalCallRejected(c2_error::C2Error::new(
+                    ErrorCode::CallCapacityExceeded,
+                    "full",
+                )),
+                StatusCode::SERVICE_UNAVAILABLE,
+                ErrorCode::CallCapacityExceeded,
+            ),
         ];
 
         for (error, expected_status, expected_code) in cases {
-            let response = ipc_route_error_response("grid", &error, None);
-            assert_eq!(response.status(), expected_status, "error={error}");
-            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
-            assert_eq!(
-                body["code"],
-                u16::from(expected_code),
-                "unexpected code for error={error}"
-            );
-            assert_eq!(
-                body["name"],
-                expected_code.name(),
-                "unexpected name for error={error}"
-            );
-            if matches!(
-                expected_code,
-                ErrorCode::ResourceRemoved
-                    | ErrorCode::ResourceClosed
-                    | ErrorCode::ContractMismatch
-            ) {
+            for business in [false, true] {
+                let budget = crate::payload::memory_only_budget(64 * 1024);
+                let response =
+                    ipc_route_error_response("grid", &error, business.then_some(&budget));
+                assert_eq!(response.status(), expected_status, "error={error}");
+                let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+                let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(
+                    body["code"],
+                    u16::from(expected_code),
+                    "unexpected code for error={error}"
+                );
+                assert_eq!(
+                    body["name"],
+                    expected_code.name(),
+                    "unexpected name for error={error}"
+                );
                 assert_eq!(body["details"]["dispatch_phase"], "pre_dispatch");
+                assert_ne!(
+                    body["name"], "ResourceUnavailable",
+                    "semantic error was flattened: {error}"
+                );
             }
-            assert_ne!(
-                body["name"], "ResourceUnavailable",
-                "semantic error was flattened: {error}"
-            );
         }
 
         let response =
@@ -3038,19 +3043,39 @@ mod tests {
         ] {
             let original = C2Error::new(code, format!("rejected: {}", code.name()))
                 .with_details(BTreeMap::from([("source".into(), "server".into())]));
-            let response = ipc_route_error_response(
-                "grid",
-                &c2_ipc::IpcError::CallRejected(original.clone()),
-                None,
-            );
-            assert_eq!(response.status(), status, "code={code:?}");
+            for business in [false, true] {
+                let budget = crate::payload::memory_only_budget(64 * 1024);
+                let response = ipc_route_error_response(
+                    "grid",
+                    &c2_ipc::IpcError::CallRejected(original.clone()),
+                    business.then_some(&budget),
+                );
+                assert_eq!(response.status(), status, "code={code:?}");
+                let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+                let envelope: c2_error::C2ErrorEnvelope = serde_json::from_slice(&body).unwrap();
+                let projected = C2Error::from_envelope(envelope).unwrap();
+                assert_eq!(projected.code, original.code);
+                assert_eq!(projected.message, original.message);
+                assert_eq!(projected.details["source"], "server");
+                assert_eq!(projected.details["dispatch_phase"], "pre_dispatch");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn ipc_rejection_overrides_nested_transport_phase_with_or_without_budget() {
+        let error = c2_ipc::IpcError::LocalCallRejected(
+            c2_error::C2Error::new(c2_error::ErrorCode::CallCapacityExceeded, "full").with_details(
+                BTreeMap::from([("transport_phase".into(), "dispatch_uncertain".into())]),
+            ),
+        );
+        for business in [false, true] {
+            let budget = crate::payload::memory_only_budget(64 * 1024);
+            let response = ipc_route_error_response("grid", &error, business.then_some(&budget));
             let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-            let envelope: c2_error::C2ErrorEnvelope = serde_json::from_slice(&body).unwrap();
-            let projected = C2Error::from_envelope(envelope).unwrap();
-            assert_eq!(projected.code, original.code);
-            assert_eq!(projected.message, original.message);
-            assert_eq!(projected.details["source"], "server");
-            assert_eq!(projected.details["dispatch_phase"], "pre_dispatch");
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["details"]["dispatch_phase"], "pre_dispatch");
+            assert_eq!(body["details"]["transport_phase"], "pre_dispatch");
         }
     }
 

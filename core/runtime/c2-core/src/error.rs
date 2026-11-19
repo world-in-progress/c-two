@@ -362,10 +362,11 @@ pub fn normalize_ipc_error(error: IpcError, phase: TransportPhase) -> Error {
             [("route", route_name), ("reason", reason)],
         ),
         IpcError::ContractMismatch(message) => Error::Semantic(
-            C2Error::new(ErrorCode::ContractMismatch, message).with_details(BTreeMap::from([(
-                "transport".to_string(),
-                "ipc".to_string(),
-            )])),
+            C2Error::new(ErrorCode::ContractMismatch, message).with_details(BTreeMap::from([
+                ("transport".into(), "ipc".into()),
+                ("transport_phase".into(), "pre_dispatch".into()),
+                ("dispatch_phase".into(), "pre_dispatch".into()),
+            ])),
         ),
         IpcError::IdentityMismatch {
             expected_server_id,
@@ -847,6 +848,21 @@ mod native_boundary_tests {
         ] {
             assert_eq!(error.transport_phase(), expected, "{error:?}");
         }
+    }
+
+    #[test]
+    fn ipc_contract_mismatch_is_pre_dispatch() {
+        let error = normalize_ipc_error(
+            IpcError::ContractMismatch("wrong contract".into()),
+            TransportPhase::PreDispatch,
+        );
+        assert_eq!(error.transport_phase(), Some(TransportPhase::PreDispatch));
+        let Error::Semantic(error) = error else {
+            panic!("semantic contract error")
+        };
+        assert_eq!(error.details["transport"], "ipc");
+        assert_eq!(error.details["dispatch_phase"], "pre_dispatch");
+        assert_eq!(error.details["transport_phase"], "pre_dispatch");
     }
 
     #[test]

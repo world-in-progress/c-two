@@ -30,8 +30,10 @@ fn generated_python_stream_client_reserves_before_encoding_and_decodes_each_item
 
 const CONSUMER: &str = r#"
 import importlib.util
+import gc
 import sys
 import types
+import weakref
 
 events = []
 
@@ -106,11 +108,18 @@ def SerializationError(code, message=None, details=None, transport_phase=None):
     error = CCBaseError(f'{int(code)}: {message}')
     error.code = int(code)
     error.details = dict(details or {})
+    error.transport_phase = transport_phase
     return error
 
+class NativeFailure(Exception):
+    pass
+
+projected_refs = []
 def _project_native_error(exc):
-    # This consumer never produces semantic CoreErrors; the generated guard
-    # must only depend on the projection hook existing.
+    if isinstance(exc, NativeFailure):
+        projected = CCBaseError('projected')
+        projected_refs.append(weakref.ref(projected))
+        return projected
     return None
 
 c_two = types.ModuleType('c_two')
@@ -172,4 +181,107 @@ assert ('wrap', True, Bound.local_copy_tracker, 'generated-stream', 'echo') in e
 held[0].release()
 assert events[-1] == ('invalidate', b'first'), events
 assert events.count('close') == 1, events
+
+# Projection must not retain the projected exception through its own frame.
+gc.disable()
+def fail_begin(method):
+    raise NativeFailure('begin')
+bound = Bound()
+bound.begin_stream = fail_begin
+try:
+    contract.ContractClient(bound).method_1_echo(Payload())
+except CCBaseError as error:
+    assert isinstance(error.__cause__, NativeFailure)
+else:
+    raise AssertionError('begin_stream failure was not projected')
+assert projected_refs[-1]() is None
+gc.enable()
+
+class FailingPrepared(Prepared):
+    def stream(self, data):
+        raise NativeFailure('stream')
+    def close(self):
+        raise RuntimeError('close failed')
+bound.begin_stream = lambda method: FailingPrepared()
+try:
+    contract.ContractClient(bound).method_1_echo(Payload())
+except CCBaseError as error:
+    assert isinstance(error.__cause__, NativeFailure)
+    if sys.version_info >= (3, 11):
+        assert any('close failed' in note for note in error.__notes__)
+else:
+    raise AssertionError('stream failure was replaced')
+
+class ClosingPrepared(Prepared):
+    def close(self):
+        raise RuntimeError('close failed')
+bound.begin_stream = lambda method: ClosingPrepared()
+try:
+    contract.ContractClient(bound).method_1_echo(Payload())
+except RuntimeError as error:
+    assert str(error) == 'close failed'
+else:
+    raise AssertionError('close failure disappeared')
+try:
+    raise LookupError('outer exception')
+except LookupError:
+    try:
+        contract.ContractClient(bound).method_1_echo(Payload())
+    except RuntimeError as error:
+        assert str(error) == 'close failed'
+    else:
+        raise AssertionError('outer exception hid close failure')
+
+original_invalidate = Payload.invalidate
+def bad_invalidate(self):
+    raise ValueError('invalidating failed')
+Payload.invalidate = bad_invalidate
+try:
+    contract._invalidate_payload(Payload())
+except CCBaseError as error:
+    assert error.code == ErrorCode.ClientOutputFromBuffer
+    assert isinstance(error.__cause__, ValueError)
+else:
+    raise AssertionError('invalidation failure disappeared')
+Payload.invalidate = original_invalidate
+
+# Payload hooks are classified at this adapter boundary, while native charge
+# failures retain their original error and phase.
+nested = CCBaseError('nested call')
+nested.transport_phase = 'pre_dispatch'
+class BadReport(Payload):
+    def execution_report(self):
+        raise nested
+bound.begin_stream = lambda method: Prepared()
+try:
+    contract.ContractClient(bound).method_1_echo(BadReport())
+except CCBaseError as error:
+    assert error is not nested and error.__cause__ is nested
+    assert error.code == ErrorCode.ClientInputSerializing
+    assert error.transport_phase == 'pre_dispatch'
+else:
+    raise AssertionError('report failure was not classified')
+
+class RejectCharge(Prepared):
+    def charge_input(self, size):
+        raise nested
+bound.begin_stream = lambda method: RejectCharge()
+try:
+    contract.ContractClient(bound).method_1_echo(Payload())
+except CCBaseError as error:
+    assert error is nested
+else:
+    raise AssertionError('native charge failure disappeared')
+
+def nested_invalidate(self):
+    raise nested
+Payload.invalidate = nested_invalidate
+try:
+    contract._invalidate_payload(Payload())
+except CCBaseError as error:
+    assert error is not nested and error.__cause__ is nested
+    assert error.code == ErrorCode.ClientOutputFromBuffer and error.transport_phase is None
+else:
+    raise AssertionError('nested invalidation failure was not classified')
+Payload.invalidate = original_invalidate
 "#;

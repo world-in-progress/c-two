@@ -607,6 +607,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failure_records_are_uncertain_for_receive_and_close() {
+        for transport_phase in [None, Some("dispatch_uncertain"), Some("pre_dispatch")] {
+            let mut error =
+                c2_error::C2Error::new(c2_error::ErrorCode::ClientCallingResource, "failed");
+            error
+                .details
+                .insert("dispatch_phase".into(), "dispatch_uncertain".into());
+            if let Some(phase) = transport_phase {
+                error.details.insert("transport_phase".into(), phase.into());
+            }
+            let payload = error.to_wire_bytes();
+            let mut body =
+                encode_header(HttpStreamRecordKind::Failure, payload.len() as u64).to_vec();
+            body.extend_from_slice(&payload);
+            let router = Router::new().route(
+                "/call",
+                post(move || {
+                    let body = body.clone();
+                    async move { body }
+                }),
+            );
+            let (base, server) = serve(router).await;
+            let client = reqwest::Client::new();
+            let response = client.post(format!("{base}/call")).send().await.unwrap();
+            let mut stream = HttpResponseStream::start(
+                response,
+                client,
+                base,
+                "token".into(),
+                crate::payload::memory_only_budget(4096),
+                4096,
+                Box::new(()),
+                HttpStreamCancellation::new(),
+            );
+            for result in [
+                stream.recv().await.map(|_| ()),
+                stream.completion_after_cancel().await.map(|_| ()),
+            ] {
+                let Err(HttpError::LocalCallRejected(error)) = result else {
+                    panic!("expected failure")
+                };
+                assert_eq!(error.details["dispatch_phase"], "dispatch_uncertain");
+                assert_eq!(error.details["transport_phase"], "dispatch_uncertain");
+                assert_eq!(
+                    error.code,
+                    if transport_phase == Some("pre_dispatch") {
+                        c2_error::ErrorCode::ProtocolViolation
+                    } else {
+                        c2_error::ErrorCode::ClientCallingResource
+                    }
+                );
+            }
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
     async fn shared_sequences_preserve_partial_failure_and_reject_malformed_items() {
         #[derive(serde::Deserialize)]
         struct Sequence {

@@ -29,13 +29,19 @@ pub fn fastdb_cause_details(error: &PayloadError) -> BTreeMap<String, String> {
 /// Convert an official FastDB error at one generated-adapter phase into the
 /// canonical C-Two semantic error registry.
 pub fn fastdb_adapter_error(phase: AdapterFailurePhase, error: PayloadError) -> C2Error {
-    normalize_adapter_failure(
+    let mut projected = normalize_adapter_failure(
         phase,
         AdapterFailure::Local {
             message: error.message().to_string(),
             details: fastdb_cause_details(&error),
         },
-    )
+    );
+    if matches!(phase, AdapterFailurePhase::ClientInputSerializing) {
+        projected
+            .details
+            .insert("transport_phase".into(), "pre_dispatch".into());
+    }
+    projected
 }
 
 /// Preserve a semantic C-Two error exactly, or classify a local SDK error at

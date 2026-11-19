@@ -357,18 +357,29 @@ pub fn encode_failure(error: &C2Error) -> Result<Vec<u8>, HttpStreamWireError> {
 
 /// Counts the complete FAILURE record without allocating its output bytes.
 pub fn failure_record_len(error: &C2Error) -> Result<usize, HttpStreamWireError> {
-    if error.details.get("dispatch_phase").map(String::as_str) != Some("dispatch_uncertain") {
+    if !valid_failure_phase(error) {
         return Err(HttpStreamWireError::InvalidFailurePhase);
     }
     record_len(error_wire_len(error)?)
 }
 
 pub fn decode_failure(payload: &[u8]) -> Result<C2Error, HttpStreamWireError> {
-    let error = decode_error(payload)?;
-    if error.details.get("dispatch_phase").map(String::as_str) != Some("dispatch_uncertain") {
+    let mut error = decode_error(payload)?;
+    if !valid_failure_phase(&error) {
         return Err(HttpStreamWireError::InvalidFailurePhase);
     }
+    error
+        .details
+        .insert("transport_phase".into(), "dispatch_uncertain".into());
     Ok(error)
+}
+
+fn valid_failure_phase(error: &C2Error) -> bool {
+    error.details.get("dispatch_phase").map(String::as_str) == Some("dispatch_uncertain")
+        && error
+            .details
+            .get("transport_phase")
+            .is_none_or(|phase| phase == "dispatch_uncertain")
 }
 
 #[cfg(test)]
@@ -548,7 +559,7 @@ mod tests {
 
     #[test]
     fn failure_has_uncertain_phase_and_no_count() {
-        let uncertain = error(ErrorCode::ClientCallingResource, Some("dispatch_uncertain"));
+        let mut uncertain = error(ErrorCode::ClientCallingResource, Some("dispatch_uncertain"));
         let record = encode_failure(&uncertain).unwrap();
         assert_eq!(failure_record_len(&uncertain).unwrap(), record.len());
         let header: [u8; RECORD_HEADER_LEN] = record[..RECORD_HEADER_LEN].try_into().unwrap();
@@ -556,9 +567,25 @@ mod tests {
             decode_header(header).unwrap().0,
             HttpStreamRecordKind::Failure
         );
+        uncertain
+            .details
+            .insert("transport_phase".into(), "dispatch_uncertain".into());
         assert_eq!(
             decode_failure(&record[RECORD_HEADER_LEN..]).unwrap(),
             uncertain
+        );
+        uncertain
+            .details
+            .insert("transport_phase".into(), "pre_dispatch".into());
+        assert_eq!(
+            failure_record_len(&uncertain),
+            Err(HttpStreamWireError::InvalidFailurePhase)
+        );
+        let mut payload = Vec::new();
+        write_error(&mut payload, &uncertain);
+        assert_eq!(
+            decode_failure(&payload),
+            Err(HttpStreamWireError::InvalidFailurePhase)
         );
         assert_eq!(
             encode_failure(&error(
@@ -641,8 +668,10 @@ mod tests {
                 }
                 HttpStreamRecordKind::Failure => {
                     let value = decode_failure(&record[RECORD_HEADER_LEN..]).unwrap();
-                    assert_eq!(failure_record_len(&value).unwrap(), record.len());
-                    assert_eq!(encode_failure(&value).unwrap(), record, "{}", row.name);
+                    assert_eq!(value.details["transport_phase"], "dispatch_uncertain");
+                    let original = decode_error(&record[RECORD_HEADER_LEN..]).unwrap();
+                    assert_eq!(failure_record_len(&original).unwrap(), record.len());
+                    assert_eq!(encode_failure(&original).unwrap(), record, "{}", row.name);
                 }
             }
         }

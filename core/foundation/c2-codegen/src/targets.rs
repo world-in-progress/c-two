@@ -879,20 +879,20 @@ fn render_python(descriptor: &ValidatedContractDescriptor, methods: &[TargetMeth
     output.push_str(
         "\n\
          def _copy_and_release_response(response: Any) -> bytes:\n\
+         \x20   primary = None\n\
          \x20   try:\n\
-         \x20       data = bytes(response)\n\
-         \x20   except BaseException:\n\
-         \x20       release = getattr(response, \"release\", None)\n\
-         \x20       if release is not None:\n\
-         \x20           try:\n\
-         \x20               release()\n\
-         \x20           except BaseException as cleanup_error:\n\
-         \x20               print(f\"Warning: response copy cleanup failed: {cleanup_error}\", file=sys.stderr)\n\
+         \x20       try:\n\
+         \x20           return bytes(response)\n\
+         \x20       except BaseException as exc:\n\
+         \x20           raise _serialization_error(ErrorCode.ClientOutputFromBuffer, exc) from exc\n\
+         \x20   except BaseException as exc:\n\
+         \x20       primary = exc\n\
          \x20       raise\n\
-         \x20   release = getattr(response, \"release\", None)\n\
-         \x20   if release is not None:\n\
-         \x20       release()\n\
-         \x20   return data\n\n\
+         \x20   finally:\n\
+         \x20       try:\n\
+         \x20           _release_response(response, primary)\n\
+         \x20       finally:\n\
+         \x20           primary = None\n\n\
          class ContractClient:\n\
          \x20   def __init__(self, bound_client: BoundClient) -> None:\n\
          \x20       self._bound_client = bound_client\n",
@@ -947,13 +947,48 @@ def _client_input_error(exc: BaseException) -> SerializationError:
     )
 
 def _release_failed_payload(payload: Any) -> None:
-    close = getattr(payload, \"close\", None)
-    if close is None:
-        return
     try:
-        close()
+        close = getattr(payload, \"close\", None)
+        if close is not None:
+            close()
     except BaseException as cleanup_error:
-        print(f\"Warning: payload decode cleanup failed: {cleanup_error}\", file=sys.stderr)
+        try:
+            print(f\"Warning: payload decode cleanup failed: {cleanup_error}\", file=sys.stderr)
+        except BaseException:
+            pass
+
+def _note_cleanup_failure(primary: BaseException, cleanup_error: BaseException) -> None:
+    try:
+        add_note = getattr(primary, \"add_note\", None)
+        if add_note is not None:
+            add_note(f\"Cleanup failed: {cleanup_error}\")
+    except BaseException:
+        pass
+
+def _close_prepared(prepared: Any, primary: BaseException | None) -> None:
+    try:
+        prepared.close()
+    except BaseException as cleanup_error:
+        if primary is None:
+            raise
+        _note_cleanup_failure(primary, cleanup_error)
+
+def _release_response(response: Any, primary: BaseException | None) -> None:
+    try:
+        release = getattr(response, \"release\", None)
+        if release is not None:
+            release()
+    except BaseException as exc:
+        if primary is not None:
+            _note_cleanup_failure(primary, exc)
+        else:
+            raise _serialization_error(ErrorCode.ClientOutputFromBuffer, exc) from exc
+
+def _invalidate_payload(value: Payload) -> None:
+    try:
+        Payload.invalidate(value)
+    except BaseException as exc:
+        raise _serialization_error(ErrorCode.ClientOutputFromBuffer, exc) from exc
 
 def _project_call(operation, *args):
     \"\"\"Project a native call failure's canonical semantic error, if any.
@@ -966,7 +1001,11 @@ def _project_call(operation, *args):
     except BaseException as exc:
         projected = _project_native_error(exc)
         if projected is not None:
-            raise projected from exc
+            try:
+                raise projected from exc
+            finally:
+                projected = None
+                exc = None
         raise
 
 ";
@@ -1025,7 +1064,7 @@ fn render_python_stream_client_method(output: &mut String, method: &TargetMethod
             "Stream[Payload]"
         };
         let invalidator = if held {
-            ", invalidator=Payload.invalidate"
+            ", invalidator=_invalidate_payload"
         } else {
             ""
         };
@@ -1034,24 +1073,30 @@ fn render_python_stream_client_method(output: &mut String, method: &TargetMethod
         let charge_block = if method.input_sha256.is_some() {
             "\
              \x20           try:\n\
-             \x20               _project_call(prepared.charge_input, payload.execution_report().used_bytes)\n\
-             \x20           except CCBaseError:\n\
-             \x20               raise\n\
+             \x20               used_bytes = payload.execution_report().used_bytes\n\
              \x20           except BaseException as exc:\n\
-             \x20               raise _client_input_error(exc) from exc\n"
+             \x20               raise _client_input_error(exc) from exc\n\
+             \x20           _project_call(prepared.charge_input, used_bytes)\n"
         } else {
             ""
         };
         output.push_str(&format!(
             "\n    def {name}(self{parameter}) -> {return_type}:\n\
-             \x20       prepared = self._bound_client.begin_stream({method_name})\n\
+             \x20       prepared = _project_call(self._bound_client.begin_stream, {method_name})\n\
+             \x20       primary = None\n\
              \x20       try:\n\
              {charge_block}\
              \x20           request = {request}\n\
              \x20           native = _project_call(prepared.stream, request)\n\
              \x20           return Stream._from_encoded(native, decode_{symbol}_output, held={held_literal}{invalidator}, tracker=self._bound_client.local_copy_tracker, route_name=self._bound_client.route_name, method_name={method_name})\n\
+             \x20       except BaseException as exc:\n\
+             \x20           primary = exc\n\
+             \x20           raise\n\
              \x20       finally:\n\
-             \x20           prepared.close()\n",
+             \x20           try:\n\
+             \x20               _close_prepared(prepared, primary)\n\
+             \x20           finally:\n\
+             \x20               primary = None\n",
         ));
     }
 }
@@ -1090,28 +1135,19 @@ fn render_python_direction(
              \x20   try:\n\
              \x20       payload.require_spec_sha256(_PAYLOAD_{digest}.PAYLOAD_SHA256_BYTES)\n\
              \x20       return payload.binary_bytes()\n\
-             \x20   except CCBaseError:\n\
-             \x20       raise\n\
              \x20   except BaseException as exc:\n\
              \x20       raise {encode_code} from exc\n\n\
              def decode_{symbol}_{direction}(data: bytes) -> Payload:\n\
              \x20   try:\n\
              \x20       spec = _PAYLOAD_{digest}.compile_spec()\n\
-             \x20   except CCBaseError:\n\
-             \x20       raise\n\
              \x20   except BaseException as exc:\n\
              \x20       raise _serialization_error({from_buffer_code}, exc) from exc\n\
              \x20   try:\n\
              \x20       payload = Payload.open_copy(spec, data)\n\
-             \x20   except CCBaseError:\n\
-             \x20       raise\n\
              \x20   except BaseException as exc:\n\
              \x20       raise _serialization_error({from_buffer_code}, exc) from exc\n\
              \x20   try:\n\
              \x20       payload.require_spec_sha256(_PAYLOAD_{digest}.PAYLOAD_SHA256_BYTES)\n\
-             \x20   except CCBaseError:\n\
-             \x20       _release_failed_payload(payload)\n\
-             \x20       raise\n\
              \x20   except BaseException as exc:\n\
              \x20       _release_failed_payload(payload)\n\
              \x20       raise _serialization_error({deserialize_code}, exc) from exc\n\
@@ -1129,8 +1165,6 @@ fn render_python_direction(
              def decode_{symbol}_{direction}(data: bytes) -> None:\n\
              \x20   try:\n\
              \x20       _require_empty_payload({}, {direction:?}, data)\n\
-             \x20   except CCBaseError:\n\
-             \x20       raise\n\
              \x20   except BaseException as exc:\n\
              \x20       raise _serialization_error({decode_code}, exc) from exc\n\n",
             quoted(method.name),

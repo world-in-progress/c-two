@@ -182,6 +182,22 @@ fn launch(
     user: *mut std::ffi::c_void,
     future: impl Future<Output = Result<Output, Error>> + Send + 'static,
 ) -> C2MemFfiStatus {
+    launch_scoped(None, complete, user, future)
+}
+fn launch_call(
+    call: Arc<Call>,
+    complete: C2MemFfiComplete,
+    user: *mut std::ffi::c_void,
+    future: impl Future<Output = Result<Output, Error>> + Send + 'static,
+) -> C2MemFfiStatus {
+    launch_scoped(Some(call), complete, user, future)
+}
+fn launch_scoped(
+    call: Option<Arc<Call>>,
+    complete: C2MemFfiComplete,
+    user: *mut std::ffi::c_void,
+    future: impl Future<Output = Result<Output, Error>> + Send + 'static,
+) -> C2MemFfiStatus {
     let Some(complete) = complete else {
         return C2MemFfiStatus::NullPointer;
     };
@@ -190,7 +206,7 @@ fn launch(
         Ok(handle) => handle,
         Err(error) => {
             unsafe {
-                complete(user as *mut _, result(Err(error)));
+                complete(user as *mut _, scoped_result(Err(error), call.as_deref()));
             }
             return C2MemFfiStatus::Ok;
         }
@@ -201,12 +217,25 @@ fn launch(
             .await
             .unwrap_or_else(|_| Err(invalid("native client operation panicked")));
         unsafe {
-            complete(user as *mut _, result(output));
+            complete(user as *mut _, scoped_result(output, call.as_deref()));
         }
     });
     C2MemFfiStatus::Ok
 }
+fn scoped_result(output: Result<Output, Error>, call: Option<&Call>) -> *mut C2MemFfiResult {
+    match (output, call) {
+        (Err(error), Some(call)) => result(Ok(Output::Error(call_error_value(call, &error)))),
+        (output, _) => result(output),
+    }
+}
 unsafe fn native<T>(
+    error: *mut *mut C2MemFfiError,
+    action: impl FnOnce() -> Result<T, Error>,
+) -> Result<T, C2MemFfiStatus> {
+    unsafe { native_with_call(None, error, action) }
+}
+unsafe fn native_with_call<T>(
+    call: Option<&Call>,
     error: *mut *mut C2MemFfiError,
     action: impl FnOnce() -> Result<T, Error>,
 ) -> Result<T, C2MemFfiStatus> {
@@ -222,7 +251,10 @@ unsafe fn native<T>(
         Ok(value) => Ok(value),
         Err(cause) => {
             unsafe {
-                *error = owned_error(error_value(&cause));
+                *error = owned_error(match call {
+                    Some(call) => call_error_value(call, &cause),
+                    None => error_value(&cause),
+                });
             }
             Err(C2MemFfiStatus::InvalidArgument)
         }
@@ -422,10 +454,10 @@ impl Call {
         let mut state = self.state.lock();
         if !state.dispatched && !state.busy && !state.ready {
             state.prepared.take();
-            state.error = Some(error_value(&refused(
-                ErrorCode::CallCancelled,
-                "stream cancelled before dispatch",
-            )));
+            state.error = Some(call_error_value(
+                self,
+                &refused(ErrorCode::CallCancelled, "stream cancelled before dispatch"),
+            ));
             state.ready = true;
             let _ = self.scope.complete_failure();
         }
@@ -500,7 +532,7 @@ impl Call {
                 .terminal
                 .and_then(Result::err)
                 .as_ref()
-                .map(error_value);
+                .map(|error| call_error_value(self, error));
             Ok(Output::Json(
                 json!({"completed":receipt.completed,"error":error,"completeItems":receipt.complete_items.map(|v|v.to_string())}),
             ))
@@ -870,7 +902,7 @@ pub unsafe extern "C" fn c2_mem_ffi_call_charge_input(
         }
         prepared
     };
-    launch(complete, user, async move {
+    launch_call(call.clone(), complete, user, async move {
         let mut prepared = prepared?;
         let cancelled = call.changed.notified();
         tokio::pin!(cancelled);
@@ -891,10 +923,10 @@ pub unsafe extern "C" fn c2_mem_ffi_call_charge_input(
         state.busy = false;
         if call.cancelled.load(Ordering::Acquire) {
             state.ready = true;
-            state.error = Some(error_value(&refused(
-                ErrorCode::CallCancelled,
-                "stream cancelled before dispatch",
-            )));
+            state.error = Some(call_error_value(
+                &call,
+                &refused(ErrorCode::CallCancelled, "stream cancelled before dispatch"),
+            ));
             let _ = call.scope.complete_failure();
             call.changed.notify_waiters();
             return charged.map(|_| Output::Empty);
@@ -907,7 +939,7 @@ pub unsafe extern "C" fn c2_mem_ffi_call_charge_input(
             }
             Err(error) => {
                 state.ready = true;
-                state.error = Some(error_value(&error));
+                state.error = Some(call_error_value(&call, &error));
                 call.changed.notify_waiters();
                 Err(error)
             }
@@ -942,7 +974,7 @@ pub unsafe extern "C" fn c2_mem_ffi_call_dispatch(
     } else {
         unsafe { std::slice::from_raw_parts(data, len) }.to_vec()
     };
-    launch(complete, user, async move {
+    launch_call(call.clone(), complete, user, async move {
         let original = call.clone();
         // The record owns the actual opening/outcome after the caller's wait
         // expires. No task or input is aborted and expiry never sends CANCEL.
@@ -1031,11 +1063,11 @@ pub unsafe extern "C" fn c2_mem_ffi_call_next(
     }
     let call = unsafe { &*call }.0.clone();
     if call.next_active.swap(true, Ordering::AcqRel) {
-        return launch(complete, user, async {
+        return launch_call(call.clone(), complete, user, async {
             Err(invalid("concurrent next on one stream"))
         });
     }
-    launch(complete, user, async move {
+    launch_call(call.clone(), complete, user, async move {
         struct Active(Arc<Call>);
         impl Drop for Active {
             fn drop(&mut self) {
@@ -1097,7 +1129,9 @@ pub unsafe extern "C" fn c2_mem_ffi_call_observe(
     let call = unsafe { &*call }.0.clone();
     let limit = timeout(limit);
     call.cancel();
-    launch(complete, user, async move { call.observe(limit).await })
+    launch_call(call.clone(), complete, user, async move {
+        call.observe(limit).await
+    })
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn c2_mem_ffi_call_check_deadline(
@@ -1107,7 +1141,8 @@ pub unsafe extern "C" fn c2_mem_ffi_call_check_deadline(
     if call.is_null() {
         return C2MemFfiStatus::NullPointer;
     }
-    match unsafe { native(error, || (*call).0.check_deadline()) } {
+    let call = unsafe { &*call };
+    match unsafe { native_with_call(Some(call.0.as_ref()), error, || call.0.check_deadline()) } {
         Ok(()) => C2MemFfiStatus::Ok,
         Err(status) => status,
     }

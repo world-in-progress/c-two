@@ -48,7 +48,7 @@ def test_public_core_error_has_complete_independent_fields(category):
     assert error.args == ('native diagnostic',)
     assert error.category == category
     optional = {
-        'code', 'name', 'semantic_message', '_transport_phase', 'transport_kind',
+        'code', 'name', 'semantic_message', '_semantic_snapshot', '_transport_phase', 'transport_kind',
         'fallback_eligible', 'route_withdrawal', 'io_operation', 'io_kind',
         'raw_os_error', 'lifecycle_kind', 'startup_stage', 'timeout_seconds',
         'route_name', 'status_code', 'relay_duplicate', 'failure_source',

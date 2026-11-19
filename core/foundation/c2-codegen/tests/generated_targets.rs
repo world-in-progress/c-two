@@ -409,9 +409,17 @@ import io
 import sys
 import types
 
-primary = ValueError("primary decode failed")
+class PayloadError(Exception):
+    code = 42
+    symbol = "DIGEST_MISMATCH"
+    path = "payload.field"
+    message = "primary decode failed"
+    details_json = '{"reason":"test"}'
+
+primary = PayloadError("primary decode failed")
 cleanup = RuntimeError("payload cleanup failed")
 events = []
+fail_open = False
 class CompiledSpec:
     @staticmethod
     def compile(*args, **kwargs):
@@ -419,6 +427,8 @@ class CompiledSpec:
 class Payload:
     @staticmethod
     def open_copy(*args, **kwargs):
+        if fail_open:
+            raise primary
         return Payload()
     def require_spec_sha256(self, expected):
         raise primary
@@ -432,7 +442,7 @@ payload = types.ModuleType("fastdb4py.payload")
 for name, value in {"Payload": Payload, "CompiledSpec": CompiledSpec,
                     "Builder": type("Builder", (), {}), "View": type("View", (), {}),
                     "GraphIdentity": type("GraphIdentity", (), {}),
-                    "ObjectHandle": type("ObjectHandle", (), {}), "PayloadError": Exception}.items():
+                    "ObjectHandle": type("ObjectHandle", (), {}), "PayloadError": PayloadError}.items():
     setattr(payload, name, value)
 sys.modules[package.__name__] = package
 sys.modules[payload.__name__] = payload
@@ -495,12 +505,24 @@ for fail_copy in (True, False):
         try:
             contract._copy_and_release_response(Response(fail_copy))
         except BaseException as error:
-            assert error is (primary if fail_copy else cleanup), error
+            assert isinstance(error, CCBaseError) and error.code == 8, error
+            assert error.__cause__ is (primary if fail_copy else cleanup), error
+            if fail_copy and hasattr(error, "__notes__"):
+                assert any("payload cleanup failed" in note for note in error.__notes__)
         else:
             raise AssertionError("missing response failure")
     assert events == ["response:release"], events
-    warning = stderr.getvalue()
-    assert (warning.count("Warning:") == 1 and "payload cleanup failed" in warning) if fail_copy else not warning, warning
+    assert not stderr.getvalue(), stderr.getvalue()
+
+try:
+    raise LookupError("outer exception")
+except LookupError:
+    try:
+        contract._copy_and_release_response(Response(False))
+    except CCBaseError as error:
+        assert error.code == 8 and error.__cause__ is cleanup
+    else:
+        raise AssertionError("outer exception hid release failure")
 
 events.clear()
 stderr = io.StringIO()
@@ -512,10 +534,97 @@ with contextlib.redirect_stderr(stderr):
         # output deserializing) without discarding or replacing the primary.
         assert isinstance(error, CCBaseError) and error.code == 6, error
         assert error.__cause__ is primary, error
+        assert error.details == {"cause_owner": "fastdb", "fastdb_code": "42",
+                                 "fastdb_symbol": "DIGEST_MISMATCH", "fastdb_path": "payload.field",
+                                 "fastdb_message": "primary decode failed", "fastdb_details_json": '{"reason":"test"}'}
     else:
         raise AssertionError("missing digest failure")
 assert events == ["payload:close"], events
 assert stderr.getvalue().count("Warning:") == 1 and "payload cleanup failed" in stderr.getvalue(), stderr.getvalue()
+
+for direction, expected in (("input", 1), ("output", 6)):
+    with contextlib.redirect_stderr(io.StringIO()):
+        try:
+            getattr(contract, "decode_method_1_echo_" + direction)(b"response")
+        except CCBaseError as error:
+            assert error.code == expected and error.__cause__ is primary
+            assert error.details["fastdb_symbol"] == "DIGEST_MISMATCH"
+        else:
+            raise AssertionError("missing validation failure")
+fail_open = True
+for direction, expected in (("input", 4), ("output", 8)):
+    try:
+        getattr(contract, "decode_method_1_echo_" + direction)(b"response")
+    except CCBaseError as error:
+        assert error.code == expected and error.__cause__ is primary
+        assert error.details["fastdb_symbol"] == "DIGEST_MISMATCH"
+    else:
+        raise AssertionError("missing open failure")
+
+# An inner C-Two error belongs to the current adapter boundary, so its
+# transport phase stays on the cause rather than leaking to this call.
+nested = CCBaseError("nested failure")
+nested.stage = "pre_dispatch"
+primary = nested
+fail_open = False
+def check_boundary(operation, code, phase=None):
+    try:
+        operation()
+    except CCBaseError as error:
+        assert error is not nested and error.__cause__ is nested, error
+        assert error.code == code and error.stage == phase, (error.code, error.stage)
+    else:
+        raise AssertionError("nested error escaped classification")
+
+for direction, code, phase in (("input", 5, "pre_dispatch"), ("output", 2, None)):
+    check_boundary(lambda: getattr(contract, "encode_method_1_echo_" + direction)(Payload()), code, phase)
+class BadBinary(Payload):
+    def require_spec_sha256(self, expected):
+        pass
+    def binary_bytes(self):
+        raise nested
+for direction, code, phase in (("input", 5, "pre_dispatch"), ("output", 2, None)):
+    check_boundary(lambda: getattr(contract, "encode_method_1_echo_" + direction)(BadBinary()), code, phase)
+
+payload_names = [name for name in vars(contract) if name.startswith("_PAYLOAD_")]
+assert payload_names
+original_modules = {name: getattr(contract, name) for name in payload_names}
+class BadSpec:
+    PAYLOAD_SHA256_BYTES = b""
+    @staticmethod
+    def compile_spec():
+        raise nested
+for name in payload_names:
+    setattr(contract, name, BadSpec)
+for direction, code in (("input", 4), ("output", 8)):
+    check_boundary(lambda: getattr(contract, "decode_method_1_echo_" + direction)(b"x"), code)
+for name, module in original_modules.items():
+    setattr(contract, name, module)
+fail_open = True
+for direction, code in (("input", 4), ("output", 8)):
+    check_boundary(lambda: getattr(contract, "decode_method_1_echo_" + direction)(b"x"), code)
+fail_open = False
+for direction, code in (("input", 1), ("output", 6)):
+    with contextlib.redirect_stderr(io.StringIO()):
+        check_boundary(lambda: getattr(contract, "decode_method_1_echo_" + direction)(b"x"), code)
+
+class NestedResponse:
+    def __init__(self, read_failure):
+        self.read_failure = read_failure
+    def __bytes__(self):
+        if self.read_failure:
+            raise nested
+        return b"response"
+    def release(self):
+        if not self.read_failure:
+            raise nested
+for read_failure in (False, True):
+    check_boundary(lambda: contract._copy_and_release_response(NestedResponse(read_failure)), 8)
+
+def fail_empty(*args):
+    raise nested
+contract._require_empty_payload = fail_empty
+check_boundary(lambda: contract.decode_method_0_ping_output(b"x"), 6)
 "#;
     let output = Command::new(if cfg!(windows) { "python" } else { "python3" })
         .args(["-c", script])

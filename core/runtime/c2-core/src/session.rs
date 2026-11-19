@@ -1545,50 +1545,17 @@ impl Runtime {
     }
 
     pub fn set_relay_anchor_address(&self, relay_anchor_address: Option<String>) {
-        self.set_relay_anchor_address_with_deadline(
-            relay_anchor_address,
-            ConnectDeadline::default(),
-        )
-        .expect("unbounded relay override cannot expire");
-    }
-
-    #[doc(hidden)]
-    pub fn set_relay_anchor_address_with_attempt(
-        &self,
-        relay_anchor_address: Option<String>,
-        attempt: &crate::ConnectAttempt,
-    ) -> Result<(), crate::Error> {
-        self.set_relay_anchor_address_with_deadline(relay_anchor_address, attempt.deadline())
-    }
-
-    fn set_relay_anchor_address_with_deadline(
-        &self,
-        relay_anchor_address: Option<String>,
-        deadline: ConnectDeadline,
-    ) -> Result<(), crate::Error> {
-        let mut state = connect_state_lock(&self.state, deadline, "relay_override_wait")?;
+        let mut state = self.state.lock();
         let relay_anchor_address =
             relay_anchor_address.map(|addr| canonical_relay_anchor_address(&addr));
         if state.relay_anchor_address_override != relay_anchor_address {
             state.relay_projection = None;
         }
         state.relay_anchor_address_override = relay_anchor_address;
-        Ok(())
     }
 
     pub fn relay_anchor_address_override(&self) -> Option<String> {
         self.state.lock().relay_anchor_address_override.clone()
-    }
-
-    #[doc(hidden)]
-    pub fn relay_anchor_address_override_with_attempt(
-        &self,
-        attempt: &crate::ConnectAttempt,
-    ) -> Result<Option<String>, crate::Error> {
-        Ok(attempt
-            .lock(&self.state, "relay_override_wait")?
-            .relay_anchor_address_override
-            .clone())
     }
 
     /// Atomically move the unstarted server lifecycle to a prepared Runtime.
@@ -2948,50 +2915,6 @@ mod tests {
         BuiltRoute, ConcurrencyMode, CrmCallback, CrmError, ResponseMeta, RouteBuildSpec,
         SchedulerLimits,
     };
-
-    #[test]
-    fn connect_attempt_relay_override_wait_is_bounded_and_recovers() {
-        let runtime = Runtime::new(RuntimeOptions::default()).unwrap();
-        let state = runtime.state.lock();
-        let worker_runtime = runtime.clone();
-        let (done_tx, done_rx) = std::sync::mpsc::channel();
-        let worker = std::thread::spawn(move || {
-            let attempt = crate::ConnectAttempt::start(
-                c2_config::ConnectOptions::new().with_timeout(Duration::from_millis(100)),
-            )
-            .unwrap();
-            let result = worker_runtime
-                .set_relay_anchor_address_with_attempt(Some("http://relay.test".into()), &attempt);
-            done_tx.send(result).unwrap();
-        });
-        // The owner keeps RuntimeState locked until the worker completes.
-        // The watchdog allows thread scheduling without replacing the real
-        // 100ms connect budget or allowing completion after lock release.
-        let result = done_rx.recv_timeout(Duration::from_secs(2));
-        let relay_override = state.relay_anchor_address_override.clone();
-        drop(state);
-        worker.join().unwrap();
-        let result = result.expect("connect must expire while RuntimeState remains locked");
-        let crate::Error::Semantic(error) = result.unwrap_err() else {
-            panic!("canonical deadline")
-        };
-        assert_eq!(error.code, c2_error::ErrorCode::CallDeadlineExceeded);
-        assert_eq!(error.details["stage"], "relay_override_wait");
-        assert_eq!(relay_override, None);
-        let recovered = crate::ConnectAttempt::start(c2_config::ConnectOptions::new()).unwrap();
-        runtime
-            .set_relay_anchor_address_with_attempt(Some("http://relay.test/".into()), &recovered)
-            .unwrap();
-        assert_eq!(
-            runtime
-                .relay_anchor_address_override_with_attempt(&recovered)
-                .unwrap()
-                .as_deref(),
-            Some("http://relay.test")
-        );
-        assert!(!runtime.client_config_frozen());
-        assert_eq!(runtime.path_counters().direct_ipc(), 0);
-    }
 
     #[test]
     fn connect_deadline_runtime_waits_are_bounded_in_all_modes() {

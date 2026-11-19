@@ -510,6 +510,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     let client = contract::ContractClient::new(core_client)?;
     client.method_0_ping()?;
+    let wrong = wrong_payload();
+    let error = client.method_1_echo(&wrong).err().expect("wrong input must fail before dispatch");
+    assert_eq!(error.transport_phase(), Some(c_two::TransportPhase::PreDispatch));
+    let c_two::Error::Semantic(error) = error else { panic!("expected input serialization error") };
+    assert_eq!(error.code, c_two::generated::ErrorCode::ClientInputSerializing);
+    assert_eq!(error.details["fastdb_symbol"], "DIGEST_MISMATCH");
+    wrong.invalidate()?;
+    let error = client.method_1_echo(&wrong).err().expect("invalidated input must fail during charge");
+    assert_eq!(error.transport_phase(), Some(c_two::TransportPhase::PreDispatch));
+    let c_two::Error::Semantic(error) = error else { panic!("expected input serialization error") };
+    assert_eq!(error.code, c_two::generated::ErrorCode::ClientInputSerializing);
+    assert!(escaped_inputs.lock().unwrap().is_empty());
     let source = payload("owned")?;
     let response = client.method_1_echo(&source)?;
     require_latest_input_invalidated(&escaped_inputs, 1);
