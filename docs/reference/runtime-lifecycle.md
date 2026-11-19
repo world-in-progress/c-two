@@ -18,7 +18,6 @@ The Python transport layer is a thin orchestration shell around a Rust-native co
 | `wire.py` | `MethodTable` for Python resource method dispatch |
 | `server/native.py` | `NativeServerBridge` exported as `Server` |
 | `server/scheduler.py` | `ConcurrencyConfig` facade plus thin native route-concurrency adapter for same-process direct calls |
-| `server/reply.py` | `unpack_icrm_result` and `wrap_error` |
 | `client/proxy.py` | `CRMProxy` for thread-local, IPC, and HTTP modes |
 | `client/util.py` | Thin native-backed `ping()` and `shutdown()` probes for direct IPC |
 

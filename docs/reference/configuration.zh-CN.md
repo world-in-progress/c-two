@@ -13,7 +13,7 @@ Rust Core 按 **显式代码或 CLI 覆盖 > 进程环境变量 > `.env` > 默�
 | 环境变量 | 默认值 | 显式入口或用途 |
 | --- | --- | --- |
 | `C2_ENV_FILE` | 当前目录的 `.env` | 进程环境或 Rust `ConfigSources` |
-| `C2_RELAY_ANCHOR_ADDRESS` | 未设置，仅直接 IPC | `cc.set_relay_anchor(address)` / `Runtime.set_relay_anchor`，Rust `RuntimeOptions` / `HostOptions` |
+| `C2_RELAY_ANCHOR_ADDRESS` | 未设置，仅直接 IPC | `cc.set_relay_anchor(address)` / `Runtime.set_relay_anchor`（传 `None` 清除代码覆盖，空白字符串抛 `ValueError`），Rust `RuntimeOptions` / `HostOptions` |
 | `C2_IPC_ROOT` | Unix `/tmp/c2-v3-<uidhex>` | `cc.endpoint.set_local_endpoint(root=...)`、Rust `LocalEndpointOptions`、c3 `--ipc-root`。Windows 使用命名管道。 |
 | `C2_MEMORY_BUDGET_BYTES` | 每个已激活的域 16 GiB | `memory_budget_bytes`、`--memory-budget-bytes` |
 | `C2_FILE_SPILL_BUDGET_BYTES` | 每个已激活的域 16 GiB | `file_spill_budget_bytes`、`--file-spill-budget-bytes`。0 禁用文件溢出。 |

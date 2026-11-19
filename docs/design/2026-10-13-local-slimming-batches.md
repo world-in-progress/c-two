@@ -1,6 +1,6 @@
 # C-Two 局部精简的暂缓项与条目边界
 
-当前待办以[待办清单](backlog.md)为准；各批实现、发布与验证保留在[执行记录](../acceptance/2026-10-13-local-slimming-execution.md)。下表保留原评估的暂缓理由与范围，后续调整按[2026-10-31 复审](2026-10-31-over-defense-review.md)和待办推进。2026-11-03 核对：复审之后的几批顺带了结了以下各项，已从下面两张表里删去或改写：C02 讨论的 RequestLease 已不存在（借出在帧接纳时建立，复制之后、资源方法之前释放）；R35 与两份所有者控制会话重构随自动心跳与所有者子系统的删除（[ADR 0002](../decisions/0002-remove-owner-subsystem.md)）不复存在；R07 剩下的再评估条件、R13 剩下的取消路径、R19 与 R34 已完成。
+当前待办以[待办清单](backlog.md)为准；各批实现、发布与验证保留在[执行记录](../acceptance/2026-10-13-local-slimming-execution.md)。下表保留原评估的暂缓理由与范围，后续调整按[2026-10-31 复审](2026-10-31-over-defense-review.md)和待办推进。2026-11-03 核对：复审之后的几批顺带了结了以下各项，已从下面两张表里删去或改写：C02 讨论的 RequestLease 已不存在（借出在帧接纳时建立，复制之后、资源方法之前释放）；R35 与两份所有者控制会话重构随自动心跳与所有者子系统的删除（[ADR 0002](../decisions/0002-remove-owner-subsystem.md)）不复存在；R07 剩下的再评估条件、R13 剩下的取消路径、R19 与 R34 已完成。2026-11-19 核对：R21 经维护者定夺整链退役（删除 `c_two.crm.template` 及模板测试夹具），已移出暂缓表；R32 的 Python↔PyO3 结构化错误无环投影、Python `ErrorCode` 收敛及 R33 孤立的 `server/reply.py`（`wrap_error`、`unpack_resource_result`）已随[错误类型与残留接口收敛计划](2026-11-19-error-and-api-convergence-plan.md)完成。
 
 ### 继续暂缓、不单独开批的项目
 
@@ -11,7 +11,6 @@
 | C01 · 私有不可变合同 | 同一本地值的语法重验可删约 18–25 行；受检构造器、六个访问接口和调用点迁移预计使生产代码净增约 20–40 行，测试还需迁移。远端合同、live token、UID/revision、实例与重连校验仍有职责。 | 有独立的公开 Rust 接口设计目标；不能为局部去重改公开字段。 |
 | R14 · handle 只读校验复用 | 私有只读指针 helper 预计使生产减 40–55 行；补齐无效空 handle、allocation 长度、过期世代与错误顺序后，整体预计只减 0–35 行。原始指针借用边界也增加审查负担。 | 与有证据的所有权修复自然合并时再评估；不单独引入 CheckedSpan、缓存或锁证明框架。 |
 | C07 · Python direction/结果形状 | 服务端假 CRM 实例与双向 wrapper 的重新设计需要明确 callable 协议，并处理公开 direction、直接调用、自定义带 binding 方法及测试迁移。整体净收益未证明。普通未包装继承方法不满足 descriptor binding 接纳，不能误称已有正式可运行能力。 | 先决定公开 Python 调用约定；不混入已完成的 HTTP namespace 子项，也不重新把任意自定义编码器作为正式 portable 能力。 |
-| R21 · Resource 模板链 | 生成器仍输出装饰并继承 CRM 的旧模型，AST fallback 读取未保存的 ast_node。整链可毛删约 613 行，但会撤销公开模板生成能力；现有 c2-codegen 不提供等价 Resource skeleton。 | 单独决定修复工具或退役功能；不能把工具层删除记为生产运行时收益。 |
 
 该轮筛选已做调用链、引入历史和独立原生只读复核，只形成暂缓结论，没有形成这些项目的候选实现或性能收益证据。
 
@@ -38,12 +37,12 @@
 | R22 剩余 | benchmark selector、旧 sweep 和测量标签仅为工具整理。已完成的 SDK 登记/撤回与强制 HTTP 实跑保持。 |
 | R25 剩余 | 三个旧 call_prepared 入口已退役；FastDB 正式路径、Python-only pickle、Core bytes、服务端 sink、Rust 预分配及当前 client/scheduler 适配边界保留。2026-10-24 在 `ed6c761a` 复核后继续暂缓：native 调度状态已集中，剩余 prepare_call 探测与 Closed 回退承担既有适配职责；收窄协议最多局部减约 13 行，六个 call-only fixture 及错误接纳覆盖预计使测试增 30–80 行，整体净增且须改变公开 Python 行为。R23 bridge、R24 旧 buffer 参数链已完成。 |
 | R26 | relay journal 明确保留；旧快照及删除原因有独有信息，未来 watch/list history 尚未退役，也没有支持删除的成本测量。 |
-| R33 · 旧 Python 手工分片投影 | 已按[批准方案](../acceptance/2026-10-24-r33-python-manual-assembly-retirement.md)退役 `c_two.mem.ChunkAssembler`、`c_two.mem.MemHandle` 及对应 `_native` 导出，不留兼容。实现 `921b48ee` 生产净减 271 行、测试净减 215 行，合计净减 486 行。基线覆盖、完整 relay、真实 Rust/Python/Node、Windows 开发机、GitHub Actions 首轮 10/10（含 Windows ARM64 与 3.14t）、本批端点零残留及独立审查见[验收记录](../acceptance/2026-10-24-r33-python-manual-assembly-retirement-acceptance.md)。Rust registry/assembler/backing、Rust 公开 API、MemPool 公开能力、预算/释放、C/FFI ABI 和协议保持；R06/R07 未混入。本子项已随 0.9.0 发布，R33 仍为部分完成。 |
-| R29、R32、R33 剩余 | codegen 同次缓存/typed projection、结构化错误内部序列化、Python 错误常量及孤立 wrap_error。0.8.2 的公开 CoreError 是现有错误链投影，不代表 R32 内部错误转换收敛已经完成。R32 凭据子项已按[单一原生投影方案](../acceptance/2026-10-23-r32-native-endpoint-credential.md)验收：实现 `60656603`，生产净减 66、测试净增 14，合计净减 52 行；完整回归、三系统、GitHub Actions 10/10、端点零残留及独立审查见[验收记录](../acceptance/2026-10-23-r32-native-endpoint-credential-acceptance.md)。剩余错误投影在 `3e575acb` 上复核后继续暂缓：完整迁移包含调度错误和服务端反向转换，涉及至少 6 个生产、9 个测试文件，预计生产减 10–30、测试增 30–60 行；保留 error_bytes 就无法退出编码，替换该公开字段也只惠及错误路径，尚无性能证据。生成 release 复用、call-control 写入去重和 Rust 错误码单一声明已完成；Transport 内外层错误、外部 JSON/wire 与错误顺序保留，不混入无关 API 删除。 |
+| R33 · 旧 Python 手工分片投影与孤立回包封装 | 已按[批准方案](../acceptance/2026-10-24-r33-python-manual-assembly-retirement.md)退役 `c_two.mem.ChunkAssembler`、`c_two.mem.MemHandle` 及对应 `_native` 导出，不留兼容。实现 `921b48ee` 生产净减 271 行、测试净减 215 行，合计净减 486 行。基线覆盖、完整 relay、真实 Rust/Python/Node、Windows 开发机、GitHub Actions 首轮 10/10（含 Windows ARM64 与 3.14t）、本批端点零残留及独立审查见[验收记录](../acceptance/2026-10-24-r33-python-manual-assembly-retirement-acceptance.md)。Rust registry/assembler/backing、Rust 公开 API、MemPool 公开能力、预算/释放、C/FFI ABI 和协议保持；R06/R07 未混入。孤立的 `server/reply.py`（`wrap_error`、`unpack_resource_result`）已随 2026-11-19 错误收敛一并删除，R33 至此全部完成。 |
+| R29、R32 剩余 | R32 凭据子项已按[单一原生投影方案](../acceptance/2026-10-23-r32-native-endpoint-credential.md)验收（实现 `60656603`，净减 52 行，见[验收记录](../acceptance/2026-10-23-r32-native-endpoint-credential-acceptance.md)）；Python `ErrorCode` 单一注册表生成、`CoreError.semantic` 无环投影与消除 Python↔PyO3 进程内 `C2E1` 字节往返（删除 `CoreError.error_bytes`、`CCError.serialize/deserialize`、`_native.encode_error_wire/decode_error_wire_parts`）已随[错误类型与残留接口收敛计划](2026-11-19-error-and-api-convergence-plan.md)完成。剩余范围仅含 R29（codegen 同次缓存与 typed projection）及纯 Rust 内部 `c2-core`↔`c2-server`/`c2-ipc` 回调面的 `CrmError::UserError(Vec<u8>)`（归入[待办](backlog.md)第 2 项“服务端回调面”统一裁决）。 |
 | R34、R35 | 已了结：peer SHM 私有副本已退出，RouteAck 随协议批退役；R35 随协议批整项删除自动心跳而不复存在。C05 ABI 4 完整端点能力子项已完成；SyncClient 的预分配 API 后来作为死代码在缺陷与死代码批删除。 |
 | R36、R38、R39、C06 剩余 | 已完成的死状态、不可达尾部和 readiness 后等待不再重开；真实等待、维护 EOF/错误退出、操作错误映射和外部 chunk 配置接纳仍有职责。2026-10-24 复核 R39：操作专属成功结果已完成，reap 必需 proof 约减 6 行、HTTP body 复用约减 7–10 行，不单独开批；专属错误表示约持平至增 5 行，当前映射保留。 |
 | T01–T07 剩余 | 源码词串门禁、假 owner、阻塞读取、重连/GC 负例及默认值证明，随对应正确性事项替换；不为测试行数牺牲行为覆盖。已迁移的真实生命周期、协议边界和手写 golden 不回退。 |
-| 已完成且无新剩余子项 | R11 登记事实、R27 FIFO 后的死计数、R30 已批准配置子项、R31 owner/冻结事实配对、R37 旧发布脚本等，维持各批验收状态。 |
+| 已完成且无新剩余子项 | R11 登记事实、R21 Resource 模板链退役、R27 FIFO 后的死计数、R30 已批准配置子项、R31 owner/冻结事实配对、R37 旧发布脚本等，维持各批验收状态。 |
 | 本机历史目录 | 不清理、不重建、不冷切换，也不将未知路径消失认定为原生回收成功。新实验仅处理本次自己创建且可精确识别的资源。 |
 
 后续破坏性 API/ABI/协议变更继续要求对确切实现提交运行 GitHub Actions 的适用 Linux、macOS、Windows x64/ARM64 门禁；协议变更不保留旧表示兼容。生产代码与测试一起核算净收益，每项完成针对性回归、完整 relay、适用跨语言验证、端点零残留和独立审查后再推进，验证后及时清理构建产物。已通过且不受影响的验证不重复运行。2026-10-16 的纯文档收束没有触发新 CI；后续修复各自记录验证与审查。

@@ -195,7 +195,7 @@ Contract export does not select a Runtime. Concurrency modes are `'parallel'`, `
 - Contracts: `cc.contract.export_descriptor`, `cc.contract.release_ref`, `cc.contract.compile_artifacts`, `cc.contract.diagnostics`
 - Endpoint maintenance: `cc.endpoint.inspect_endpoint`, `cc.endpoint.reap_endpoint`, `cc.endpoint.sweep_endpoints`, `cc.endpoint.EndpointCredential` (immutable native value; explicit JSON import/export)
 - Connection observations: `cc.observe.connection_observation`, `cc.observe.connection_events`, `cc.observe.ConnectionObservation`, `cc.observe.ConnectionClosed`, `cc.observe.ConnectionEvent`, `cc.observe.ConnectionEvents`, `cc.observe.ConnectionEventsLagged`
-- Errors: `cc.error.CoreError` (structured local/Core errors), `cc.error.CCError` (semantic errors), with common `cc.error.CCBaseError`
+- Errors: `cc.error.ErrorCode`, `cc.error.CoreError` (structured local/Core errors with read-only `semantic`), `cc.error.CCError` (semantic errors with `side` and `stage`, including `ResourceExecutionError`, `SerializationError` and the route/protocol subclasses), and common `cc.error.CCBaseError` (read-only `transport_phase`)
 - Monitoring: `cc.observe.memory_stats`, `cc.observe.call_execution_snapshot`, `cc.observe.lifecycle_snapshot`, `cc.observe.shutdown_outcome` (read-only)
 
 Use `cc.set_server(startup_timeout=...)` before registration to choose a native startup wait. Startup expiry has `CoreError.lifecycle_kind == 'startup_timeout'`, `startup_stage` and `timeout_seconds`; see [startup configuration and errors](configuration.md#server-startup-timeout).

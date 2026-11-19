@@ -1,8 +1,8 @@
 # 错误类型与残留接口收敛执行计划
 
-日期：2026-11-19（维护者批准定稿）。依据：[交互面精简审查](2026-10-31-api-surface-review.md)第四节、[待办](backlog.md)第 3 项及待维护者决定（`G8`、`R21`）、[瘦身账本](2026-10-13-local-slimming-batches.md)（`R21`、`R32`、`R33`）。状态：实施中。
+日期：2026-11-19（维护者批准定稿）。依据：[交互面精简审查](2026-10-31-api-surface-review.md)第四节、[待办](backlog.md)原第 3 项与待维护者决定（`G8`、`R21`）、[瘦身账本](2026-10-13-local-slimming-batches.md)（`R21`、`R32`、`R33`）。状态：本机实现与测试通过，待独立审查与全平台门禁验证。
 
-本计划在 `C-Two 0.11.0` 与 `c3 0.7.0` 发版前完成最后一批破坏性接口收敛：保留 `C2E1` v1 线格式与 `c2-error::ErrorCode` 数值身份，在 Core 建立 `(side, stage)` 与派发阶段（`transport_phase`）的唯一派生权威；校正 `c2-server` 误用码 `1 / 2 / 3` 的传输与容量拒绝；把 Python `c_two.error` 的 8 个 `一侧 × 阶段` 笛卡尔积类与无生产者的 `705 / 712` 子类收敛为可据以行动的 18 个公开异常类与标准 `ErrorCode`；连根删除 Python↔PyO3 进程内 `C2E1` 字节往返（`CoreError.error_bytes`、`CCError.serialize/deserialize`、`server/reply.py`）；同时整块退役残留的 `c_two.config`（`G8`）与输出旧模型的 `generate_crm_template`（`R21`）。所有分阶段仅为实施顺序，不保留任何旧名字、兼容别名或双轨分支。
+本计划在 `C-Two 0.11.0` 与 `c3 0.7.0` 发版前完成最后一批破坏性接口收敛：保留 `C2E1` v1 线格式与 `c2-error::ErrorCode` 数值身份，在 Core 建立 `(side, stage)` 与派发阶段（`transport_phase`）的唯一派生权威；校正 `c2-server` 误用码 `1 / 2 / 3` 的传输与容量拒绝；把 Python `c_two.error` 的 8 个 `一侧 × 阶段` 笛卡尔积类与无生产者的 `705 / 712` 子类收敛为可据以行动的 19 个公开异常类与标准 `ErrorCode`；连根删除 Python↔PyO3 进程内 `C2E1` 字节往返（`CoreError.error_bytes`、`CCError.serialize/deserialize`、`server/reply.py`）；同时整块退役残留的 `c_two.config`（`G8`）与输出旧模型的 `generate_crm_template`（`R21`）。所有分阶段仅为实施顺序，不保留任何旧名字、兼容别名或双轨分支。
 
 ## 一、核心设计与边界
 
@@ -26,13 +26,13 @@
 
 - **标准 `ErrorCode` 枚举：** 删除 `ERROR_Code`、手工 `_NATIVE_TO_PY_ERROR_NAMES` 与各子类硬编码的 `ERROR_CODE = 7xx` 整数字面量；由 `_native.error_registry()` 直接生成 `ErrorCode(IntEnum)`，成员名与 `c2-error::ErrorCode` 完全一致（如 `ErrorCode.Unknown`、`ErrorCode.ResourceFunctionExecuting`、`ErrorCode.ResourceNotFound`）。
 - **跨家族只读 `transport_phase`：** 在 `CCBaseError` 上提供只读属性 `transport_phase: Literal['pre_dispatch', 'dispatch_uncertain'] | None`。`CoreError` 由原生权威写入内部槽位（同步调整 PyO3 构造逻辑，不再向只读 property 调 `setattr` 忽略失败）；`CCError` 读取经 Core 归一或本地派发前阶段显式赋予的阶段，绝不从任意自定义文本推断。
-- **收敛为 18 个公开异常类：**
+- **收敛为 19 个公开异常类：**
   - 基础与底层：`CCBaseError`、`CoreError`、`CCError`（暴露 `code: ErrorCode`、`message: str`、`details: dict[str, str]` 以及由原生注册表派生的只读 `side: Literal['client', 'resource'] | None` 与 `stage: Literal['serialize', 'deserialize', 'from_buffer', 'execute', 'call'] | None`）。
   - 执行与编解码（取代原 8 个 `一侧 × 阶段` 类，原类名全部删除）：
     1. `ResourceExecutionError(CCError)`：固定 `ErrorCode.ResourceFunctionExecuting`（码 `3`，`side='resource'`，`stage='execute'`），表达资源方法、流生成器或资源清理自身抛出的异常。
     2. `SerializationError(CCError)`：仅接受编解码与缓冲区视图相关的 6 个码（`1 ResourceInputDeserializing`、`2 ResourceOutputSerializing`、`4 ResourceInputFromBuffer`、`5 ClientInputSerializing`、`6 ClientOutputDeserializing`、`8 ClientOutputFromBuffer`，传入其他码抛 `ValueError`），由 `side` 与 `stage` 严格区分 `serialize`、`deserialize` 与 `from_buffer`。客户端在本次调用尚未进入传输前发生输入编码失败（码 `5`）时携带 `transport_phase='pre_dispatch'`；若码 `5` 由已进入的资源嵌套调用转抛，服务端与同进程出口照常剥离内层阶段，外层 `transport_phase` 为 `None`。
     3. 码 `7 ClientCallingResource` 不设独立子类，按码映射落回基类 `CCError`（`side='client'`，`stage='call'`）。
-  - 路由、准入与协议子类（保留 13 个可据以行动的子类，收回 `705 RegistryUnavailable` 与 `712 RouteWatchUnavailable` 落回基类 `CCError`）：
+  - 路由、准入与协议子类（保留 14 个可据以行动的子类，收回 `705 RegistryUnavailable` 与 `712 RouteWatchUnavailable` 落回基类 `CCError`）：
     `ResourceNotFound`（701）、`ResourceUnavailable`（702）、`ResourceAlreadyRegistered`（703）、`ResourceClosed`（707）、`ResourceRemoved`（708）、`ContractMismatch`（709）、`IdentityMismatch`（710）、`ProtocolViolation`（713）、`FallbackDenied`（714）、`CallDeadlineExceeded`（715）、`UnsupportedCallMode`（716）、`CallCapacityExceeded`（717）、`CallCancelled`（718）、`RouteConflict`（719）。`registry.py` 中不可达的未知 target mode 分支改为内部 `RuntimeError`。
 - **对齐客户端与服务端异常边界（含生成 Python 客户端）：**
   - 一元客户端包装器（`crm/transferable.py`）在准备、计费与调用阶段与流式（`crm/stream.py`）一致放行 `CCBaseError`（不再把无语义码的 `CoreError` 包进码 `7` 或码 `5`）。

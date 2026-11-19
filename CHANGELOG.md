@@ -26,6 +26,8 @@ See the [unreleased notes](docs/releases/unreleased.md).
 - Breaking: generated TypeScript clients call the Rust client through C/FFI ABI 8, which replaces 7, so regenerate them and rebuild the Node binding. Unary calls issued on one connection without awaiting now run concurrently instead of one after another.
 - Breaking: clients follow the route name ([ADR 0004](docs/decisions/0004-route-name-identity.md)). A route registered again at the same endpoint or relay serves existing clients without an error, and a client whose target is known to be gone acquires the route again before its next call; calls already sent are never replayed. IPC 16, C/FFI ABI 8 and relay mesh 7 no longer carry route UIDs, so upgrade the SDKs, c3 relays and the Node binding together and regenerate TypeScript clients.
 - Breaking: a relay mesh holds at most one live registration of a name. A name stays with an unreachable relay, which answers resolution with `ResourceUnavailable` and registration elsewhere with `ResourceAlreadyRegistered`, until that relay withdraws it or the deployer forces it to leave.
+- Breaking: Python `c_two.error` converges onto `ErrorCode` (matching Rust variant names), `ResourceExecutionError` (code 3), `SerializationError` (codes 1, 2, 4, 5, 6 and 8, with `side` and `stage`) and 14 routing, admission and protocol subclasses; both `CoreError` and `CCError` expose a read-only `CCBaseError.transport_phase` matching Rust `c_two::Error::transport_phase()`, and `CoreError.semantic` replaces `CoreError.error_bytes`.
+- Breaking: `set_relay_anchor(None)` clears a Runtime's relay-anchor override and blank strings raise `ValueError`.
 
 ### Added
 
@@ -45,6 +47,7 @@ See the [unreleased notes](docs/releases/unreleased.md).
 - `cc.Held`, `cc.hold_stats()`, the public `ConcurrencyMode` and `InputLifetime` enums (use string values), and the default namespace and version of `@cc.crm`.
 - Contract inference (`infer_crm_from_resource`, `c3 contract infer`) and the resource bridge (`cc.bridge`, `cc.ResourceBridge`, `register(bridge=...)`).
 - Route UIDs on client surfaces (Python `route_uid`, Rust `ObservedRoute` and `observed_route()`, `x-c2-route-uid`), the error codes 704 `RouteStale`, 706 and 711, which are never assigned again, the shared relay resolution cache, and the generated TypeScript options `maxAttempts` and `routeCacheTtlMs`.
+- Python `c_two.config` (`C2Settings`, `settings`), `generate_crm_template`, `ERROR_Code`, the eight `side × stage` error subclasses and `RegistryUnavailable` / `RouteWatchUnavailable` subclasses, `CoreError.error_bytes`, `CCError.serialize` / `deserialize`, `_native.encode_error_wire` / `decode_error_wire_parts` and `c_two.transport.server.reply`.
 
 ### Fixed
 
@@ -60,6 +63,7 @@ See the [unreleased notes](docs/releases/unreleased.md).
 - Releasing a held response no longer deadlocks with another thread that exports a buffer of the same response.
 - A request that a relay is still connecting upstream for when it withdraws the route reports `ResourceNotFound` instead of `ResourceUnavailable`, and one for a replaced route goes to the current registration.
 - `c3 relay --bind` with port `0` takes a free port, advertises it and prints it in its `listening at` line; before, it advertised and printed port 0.
+- `c2-server` reports pre-dispatch unknown-method and request record or storage refusals as `ProtocolViolation` (713, NotExecuted) instead of codes 3 or 1, and post-execution unary response capacity exhaustion as `CallCapacityExceeded` (717, Failed) instead of code 2; outer transport phases take precedence in Core, Python and C ABI 8, unary Python clients pass non-semantic `CoreError` instances through unchanged, and closed `CRMProxy` handles fail locally with `ResourceClosed`.
 
 ## [0.10.1] — companion c3 0.6.0
 

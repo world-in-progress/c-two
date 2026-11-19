@@ -13,7 +13,7 @@ The capacity variables apply independently to each active role domain. `M` is th
 | Environment variable | Default | Explicit entry or purpose |
 | --- | --- | --- |
 | `C2_ENV_FILE` | Current directory's `.env` | Process environment or Rust `ConfigSources` |
-| `C2_RELAY_ANCHOR_ADDRESS` | Unset, direct IPC | `cc.set_relay_anchor(address)` / `Runtime.set_relay_anchor`, Rust `RuntimeOptions` / `HostOptions` |
+| `C2_RELAY_ANCHOR_ADDRESS` | Unset, direct IPC | `cc.set_relay_anchor(address)` / `Runtime.set_relay_anchor` (`None` clears the code override; blank strings raise `ValueError`), Rust `RuntimeOptions` / `HostOptions` |
 | `C2_IPC_ROOT` | Unix `/tmp/c2-v3-<uidhex>` | `cc.endpoint.set_local_endpoint(root=...)`, Rust `LocalEndpointOptions`, c3 `--ipc-root`. Windows uses named pipes. |
 | `C2_MEMORY_BUDGET_BYTES` | 16 GiB per active domain | `memory_budget_bytes`, `--memory-budget-bytes` |
 | `C2_FILE_SPILL_BUDGET_BYTES` | 16 GiB per active domain | `file_spill_budget_bytes`, `--file-spill-budget-bytes`. Zero disables file spill. |

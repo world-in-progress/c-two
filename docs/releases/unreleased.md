@@ -36,7 +36,30 @@ Transport thresholds, chunk and frame sizes, idle and write timeouts, and mesh a
 
 Host restart reuses the server domain and its live charges, advances its generation and uses a new server instance ID. Python session rotation after completed shutdown hands both roles' explicit overrides and retirement accounting to the replacement session. Reassembly can spill directly to the file budget, and server request copies and chunk queues carry memory charges. Relay pre-admission control responses do not wait for memory, and forwarded unary and stream responses reuse their download windows. The relay's `POST /_echo` endpoint has been removed. [Configuration](../reference/configuration.md) · [Memory and diagnostics](../reference/memory-policy.md) · [Runtime lifecycle](../reference/runtime-lifecycle.md)
 
-The sections below record earlier changes in this development cycle. Where those sections describe configuration surfaces retired by convergence, use the migration entries above.
+The sections below record earlier changes in this development cycle. Where those sections describe configuration or error surfaces retired by later convergence, use the migration entries above.
+
+## Error surface and residual API convergence (breaking)
+
+Python's `c_two.error` hierarchy, cross-language `transport_phase` projection, server pre-dispatch and capacity error attribution, and the residual `c_two.config` and `generate_crm_template` helpers converge before `0.11.0`. The `C2E1` v1 wire format and `ErrorCode` numeric values (`0`, `1..=8`, `701..=719`, with `704`, `706` and `711` permanently retired) are unchanged.
+
+### Migrate code
+
+| Previous surface | Current entry |
+| --- | --- |
+| Python `ERROR_Code` (`ERROR_*` members) and subclass `ERROR_CODE` constants | `c_two.error.ErrorCode` (`IntEnum` generated from `_native.error_registry()`, matching Rust variant names such as `ErrorCode.CallCancelled`) |
+| Python `ResourceExecuteFunction` | `ResourceExecutionError` (`ErrorCode.ResourceFunctionExecuting`, code `3`, `side='resource'`, `stage='execute'`) |
+| Python `ResourceDeserializeInput`, `ResourceSerializeOutput`, `ResourceInputFromBuffer`, `ClientSerializeInput`, `ClientDeserializeOutput` and `ClientOutputFromBuffer` | `SerializationError` (codes `1, 2, 4, 5, 6, 8`), with read-only `side` (`'client'` or `'resource'`) and `stage` (`'serialize'`, `'deserialize'` or `'from_buffer'`) |
+| Python `ClientCallResource`, `RegistryUnavailable` and `RouteWatchUnavailable` subclasses | Base `CCError` with `ErrorCode.ClientCallingResource` (`7`), `ErrorCode.RegistryUnavailable` (`705`) or `ErrorCode.RouteWatchUnavailable` (`712`) |
+| `CoreError.error_bytes`, `CCError.serialize()`, `CCError.deserialize()`, `_native.encode_error_wire()`, `_native.decode_error_wire_parts()` and `c_two.transport.server.reply` | `CoreError.semantic` constructs a fresh typed `CCError` without an in-process wire round-trip; only IPC and HTTP transports encode or decode `C2E1` |
+| `c_two.config` (`C2Settings`, `settings`) | `RuntimeSession` owns configuration overrides; `cc.set_relay_anchor(None)` / `Runtime.set_relay_anchor(None)` clears the code override and blank strings raise `ValueError` |
+| `c_two.crm.generate_crm_template` and `c_two.crm.template` | Removed; write plain resource classes directly |
+
+### Behavior
+
+- Python `CoreError` and `CCError` both inherit a read-only `CCBaseError.transport_phase` (`'pre_dispatch'`, `'dispatch_uncertain'` or `None`) matching Rust `c_two::Error::transport_phase(&self) -> Option<TransportPhase>`, and the Rust `c_two` crate root re-exports `ErrorCode`, `ErrorSide`, `ErrorStage`, `C2Error` and `TransportPhase`.
+- Outer transport facts take precedence in Core, Python and C ABI 8 (`c2-mem-ffi`), including call-scoped pre-dispatch lifecycle errors; errors escaping a resource method that already ran strip inner `transport_phase` and `dispatch_phase` entries onto fresh projections without mutating caller exceptions.
+- `c2-server` reports pre-dispatch unknown-method and request record or storage refusals as `ProtocolViolation` (`713`, `NotExecuted`) instead of codes `3` or `1`, and post-execution unary response capacity exhaustion as `CallCapacityExceeded` (`717`, `Failed`) instead of code `2`. Relay business calls refused with `RouteWatchUnavailable` (`712`, HTTP 503) before upstream dispatch include `dispatch_phase=pre_dispatch`.
+- Unary Python client wrappers pass non-semantic `CoreError` instances through unchanged like streams, Python and generated `ContractClient` hooks separate `from_buffer` from `deserialize` by the failing operation while preserving resource `CCError` codes and FastDB cause details, and explicitly closed `CRMProxy` handles fail locally with `ResourceClosed` (`transport_phase='pre_dispatch'`). [Errors](../reference/errors.md) · [Configuration](../reference/configuration.md)
 
 ## Smaller public surface (breaking)
 
@@ -201,7 +224,7 @@ IPC handshake 15, SHM 4, C/FFI ABI 7 and relay mesh protocol 7 replace 14, 3, 6 
 Found by the strict comparison against 0.10.1 and not listed above:
 
 - Python:
-  - `BaseIPCOverrides`, `ServerIPCOverrides` and `ClientIPCOverrides` live in `c_two.config`; `InputLifetimeLike`, `CoreError.body` and `Server.get_slot_info` are removed, `CoreError.lifecycle_kind` no longer lists `relay_duplicate_route`, `relay_http` or `held_response_copy`, and a proxy's tracker is `local_copy_tracker` (was `lease_tracker`).
+  - `BaseIPCOverrides`, `ServerIPCOverrides` and `ClientIPCOverrides` moved out of the root before configuration convergence removed them; `InputLifetimeLike`, `CoreError.body` and `Server.get_slot_info` are removed, `CoreError.lifecycle_kind` no longer lists `relay_duplicate_route`, `relay_http` or `held_response_copy`, and a proxy's tracker is `local_copy_tracker` (was `lease_tracker`).
   - `c_two.mem`: `PoolAlloc.allocation_id` and `PoolStats.dedicated_pending_free_bytes` are removed; `max_dedicated_segments` above 65536 is rejected; a dedicated segment no longer has a 64-byte header.
 - Rust: `Held::release` consumes the value even when invalidation fails or panics, and a later call returns `Ok`. `LifecycleError::HeldResponseCopy` is removed and `HeldResponseRelease` carries one required `invalidation_error`. `Runtime::shutdown_without_host` is removed; `Runtime::begin_session_retirement` with `RuntimeShutdownTarget::ClientsOnly` retires a Runtime that has no Host. `c_two::observe::ConnectionClosed::is_peer_end()` reports whether the peer ended the connection. The Core crate `c2-mem` changes its low-level API: `free_at` takes the allocation level instead of the data size and allocation ID, `release_handle` panics on a handle from another pool, `BuddySegment::allocator()` panics on a peer segment, and `destroy`, `gc_dedicated`, `SegmentHeader` and `ShmSpinlock` are removed. `c2-config`'s `CallTimeoutError` is replaced by `TimeoutError`, shared by every waiting budget. Receivers read a peer's blocks through `PeerMappingCache`; `MemPool::ensure_peer_segment`, `ensure_peer_dedicated`, `open_dedicated_at`, `validate_data_at`, `copy_data_at` and `data_ptr_at` are removed, and `MemPool::open_peer` only validates a peer's pool identity.
 - TypeScript: options accept an explicit `undefined` for `ipcAddress`, `serverId`, `serverInstanceId`, the two `observe` callbacks and `C2Fetch.signal`.
@@ -291,7 +314,7 @@ The IPC transport now carries server streams. The server sends each item as ITEM
 
 ### Behavior
 
-- The canonical error registry adds `CallCancelled` (718), with the Python class `CallCancelled` and `ERROR_Code.ERROR_CALL_CANCELLED`. It reports a server stream whose cancellation has finished.
+- The canonical error registry adds `CallCancelled` (718), with the Python class `CallCancelled` and `ErrorCode.CallCancelled`. It reports a server stream whose cancellation has finished.
 - A frame write that exceeds `write_timeout` still deactivates the connection, but a call record that the writer has already accepted keeps writing, and the call's later chunks and its reply follow that frame's real result. A chunked unary reply is therefore no longer cut off by a write that was slow but finished.
 - Rust Core names chunked values with chunk instead of fragment: `FLAG_CHUNKED`, `FLAG_FIRST_CHUNK`, `ChunkPosition` and the `ValuePart::chunk` field replace `FLAG_FRAGMENTED`, `FLAG_FIRST_FRAGMENT`, `FragmentPosition` and `ValuePart::fragment`. The wire bits are unchanged.
 
