@@ -2013,7 +2013,7 @@ function parseCanonicalRelayError(
 function projectHttpAcquisitionError(status: number, body: string): Error {
   const canonical = parseCanonicalRelayError(body);
   if (status === 409 && canonical?.code === 719 && canonical.name === "RouteConflict" &&
-      canonical.details.dispatch_phase === "pre_dispatch") {
+      (canonical.details.dispatch_phase === undefined || canonical.details.dispatch_phase === "pre_dispatch")) {
     return new C2RouteConflictError(canonical.message, canonical.details);
   }
   return new C2HttpRelayError(status, body, "pre_dispatch");

@@ -15,7 +15,6 @@ import c_two.contract
 import c_two.endpoint
 from c_two.error import ResourceRemoved
 from c_two.transport.registry import _reset_default_runtime
-from tests.conftest import c3_binary, free_tcp_port, wait_for_relay
 from tests.fixtures.process_control import readline_with_timeout
 
 
@@ -63,6 +62,7 @@ def nested_error_rust_host_binary(tmp_path_factory):
 
 def test_python_consumer_does_not_inherit_nested_pre_dispatch(
     nested_error_rust_host_binary,
+    start_c3_relay,
 ):
     assert json.loads(cc.contract.export_descriptor(PortableNoPayload)) == json.loads(
         DESCRIPTOR.read_text(encoding='utf-8')
@@ -73,25 +73,9 @@ def test_python_consumer_does_not_inherit_nested_pre_dispatch(
         with tempfile.TemporaryDirectory(prefix='c2-ne-', dir=None if os.name == 'nt' else '/tmp') as root:
             if os.name != 'nt':
                 cc.endpoint.set_local_endpoint(root=root)
-            port = free_tcp_port()
-            relay_url = f'http://127.0.0.1:{port}'
-            relay_args = [str(c3_binary()), 'relay', '--bind', f'127.0.0.1:{port}']
-            if os.name != 'nt':
-                relay_args.extend(['--ipc-root', root])
-            relay = subprocess.Popen(
-                relay_args,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                env={
-                    **os.environ,
-                    'C2_ENV_FILE': '',
-                    'NO_PROXY': '127.0.0.1,localhost',
-                    'no_proxy': '127.0.0.1,localhost',
-                },
-            )
+            relay = start_c3_relay(ipc_root=root)
+            relay_url = relay.url
             try:
-                wait_for_relay(relay_url, timeout=10, proc=relay)
                 process = subprocess.Popen(
                     [str(nested_error_rust_host_binary), str(DESCRIPTOR), root, relay_url],
                     stdin=subprocess.PIPE,
@@ -142,13 +126,7 @@ def test_python_consumer_does_not_inherit_nested_pre_dispatch(
                     assert len(lines) == 1 and lines[0].startswith('COUNTS '), (stdout, stderr)
                     counts = tuple(map(int, lines[0].split()[1:]))
             finally:
-                if relay.poll() is None:
-                    relay.terminate()
-                    try:
-                        relay.wait(timeout=10)
-                    except subprocess.TimeoutExpired:
-                        relay.kill()
-                        relay.wait(timeout=5)
+                relay.stop()
     finally:
         _reset_default_runtime()
     assert counts == (2, 0), 'A executed twice (IPC and HTTP) and B never entered its callback'

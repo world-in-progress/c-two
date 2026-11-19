@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import copy as _copy
 from collections.abc import Mapping
 from enum import IntEnum, unique
 from types import MemberDescriptorType
@@ -525,57 +524,111 @@ def _strip_callback_phases(details: Mapping[str, str]) -> dict[str, str]:
     }
 
 
+def _clone_exception_without_user_hooks(exc: CCBaseError) -> CCBaseError:
+    """Allocate a fresh exception copy without invoking subclass hooks.
+
+    User ``__copy__``, ``__reduce__``, ``__getattr__`` and ``__setattr__``
+    overrides must never run while Core/SDK sanitizes an error escaping an
+    already-dispatched operation, or a subclass hook could substitute a
+    ``pre_dispatch`` exception or return ``self``.
+    """
+    cls = type(exc)
+    raw_args = BaseException.args.__get__(exc, cls)
+    copied = BaseException.__new__(cls, *raw_args)
+    BaseException.args.__set__(copied, raw_args)
+    src_dict = object.__getattribute__(exc, '__dict__')
+    dst_dict = object.__getattribute__(copied, '__dict__')
+    dst_dict.update(src_dict)
+    raw_notes = dst_dict.get('__notes__')
+    if isinstance(raw_notes, list):
+        dst_dict['__notes__'] = raw_notes.copy()
+    for base in cls.__mro__:
+        if base is CCBaseError or base is BaseException:
+            break
+        for member in vars(base).values():
+            if isinstance(member, MemberDescriptorType):
+                try:
+                    slot_val = member.__get__(exc, cls)
+                except AttributeError:
+                    continue
+                member.__set__(copied, slot_val)
+    return copied
+
+
+def _safe_strip_callback_details(exc: CCBaseError) -> dict[str, str]:
+    raw = object.__getattribute__(exc, '__dict__').get('details')
+    if isinstance(raw, Mapping):
+        return {
+            key: value
+            for key, value in dict.items(raw)
+            if key not in _CALLBACK_DETAIL_KEYS
+        } if type(raw) is dict else _strip_callback_phases(raw)
+    return {}
+
+
 def _callback_error_copy(exc: CCError) -> CCError:
     """Fresh copy of an error escaping a resource callback.
 
     Keeps the subclass instance state (attributes and custom slots), code,
-    message and business details; clears inner call-control details and phase.
+    message and business details; clears inner call-control details and phase
+    without running user copy hooks.
     """
-    copied = _copy.copy(exc)
-    copied.details = _strip_callback_phases(exc.details)
-    copied._transport_phase = None
-    return copied
+    copied = _clone_exception_without_user_hooks(exc)
+    dst_dict = object.__getattribute__(copied, '__dict__')
+    dst_dict['details'] = _safe_strip_callback_details(exc)
+    dst_dict['_transport_phase'] = None
+    return copied  # type: ignore[return-value]
 
 
 def _callback_core_copy(core: CoreError) -> CoreError:
     """Fresh ``CoreError`` copy for a same-process resource callback re-raise.
 
     Keeps the structured native facts, drops the outer-inapplicable inner
-    dispatch phase, fallback eligibility and inner phase details.
+    dispatch phase, fallback eligibility and inner phase details without
+    running user copy hooks.
     """
-    copied = _copy.copy(core)
-    copied.details = _strip_callback_phases(core.details)
-    copied._transport_phase = None
-    copied.fallback_eligible = None
-    copied.route_withdrawal = None
-    snapshot = getattr(core, '_semantic_snapshot', None)
+    copied = _clone_exception_without_user_hooks(core)
+    src_dict = object.__getattribute__(core, '__dict__')
+    dst_dict = object.__getattribute__(copied, '__dict__')
+    dst_dict['details'] = _safe_strip_callback_details(core)
+    dst_dict['_transport_phase'] = None
+    dst_dict['fallback_eligible'] = None
+    dst_dict['route_withdrawal'] = None
+    snapshot = src_dict.get('_semantic_snapshot')
     if snapshot is not None:
         code, message, entries, _ = snapshot
-        copied._semantic_snapshot = (
+        dst_dict['_semantic_snapshot'] = (
             code,
             message,
             tuple((key, value) for key, value in entries if key not in _CALLBACK_DETAIL_KEYS),
             None,
         )
-    return copied
+    return copied  # type: ignore[return-value]
 
 
 def _post_dispatch_cleanup_error(exc: BaseException) -> BaseException:
     """Sanitize a cleanup failure raised after call/stream dispatch succeeded."""
     if isinstance(exc, CoreError):
+        src_dict = object.__getattribute__(exc, '__dict__')
+        raw_details = src_dict.get('details')
+        has_control_detail = isinstance(raw_details, Mapping) and any(
+            key in raw_details for key in _CALLBACK_DETAIL_KEYS
+        )
         if (
-            exc.transport_phase is not None
-            or exc.fallback_eligible is not None
-            or exc.route_withdrawal is not None
-            or any(key in exc.details for key in _CALLBACK_DETAIL_KEYS)
+            src_dict.get('_transport_phase') is not None
+            or src_dict.get('fallback_eligible') is not None
+            or src_dict.get('route_withdrawal') is not None
+            or has_control_detail
         ):
             return _callback_core_copy(exc)
         return exc
     if isinstance(exc, CCError):
-        if (
-            exc.transport_phase is not None
-            or any(key in exc.details for key in _CALLBACK_DETAIL_KEYS)
-        ):
+        src_dict = object.__getattribute__(exc, '__dict__')
+        raw_details = src_dict.get('details')
+        has_control_detail = isinstance(raw_details, Mapping) and any(
+            key in raw_details for key in _CALLBACK_DETAIL_KEYS
+        )
+        if src_dict.get('_transport_phase') is not None or has_control_detail:
             return _callback_error_copy(exc)
     return exc
 

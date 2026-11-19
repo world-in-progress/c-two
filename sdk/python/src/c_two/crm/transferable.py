@@ -31,7 +31,7 @@ class HeldResult(Generic[R]):
 
     __slots__ = (
         "_value", "_release_cb", "_invalidate_cb", "_released", "_buffer",
-        "_native_response", "_release_attempted",
+        "_native_response", "_source_buffer", "_release_attempted",
     )
 
     def __init__(
@@ -47,6 +47,7 @@ class HeldResult(Generic[R]):
         self._buffer = buffer
         self._released = False
         self._native_response: object | None = None
+        self._source_buffer: object | None = None
         self._release_attempted = False
 
     @property
@@ -92,6 +93,15 @@ class HeldResult(Generic[R]):
         if view is not None:
             try:
                 view.release()
+            except BaseException as exc:
+                if first_error is None:
+                    first_error = exc
+                else:
+                    _attach_cleanup_error(first_error, exc)
+        source, self._source_buffer = self._source_buffer, None
+        if source is not None:
+            try:
+                _release_response(source)
             except BaseException as exc:
                 if first_error is None:
                     first_error = exc
@@ -343,11 +353,12 @@ def _build_transfer_wrapper(
             decoded = False
             decoding = False
             try:
-                native_response = hasattr(response, "release")
+                native_response = _is_native_response_owner(response)
+                releasable_response = native_response or callable(getattr(response, "release", None))
                 if output_decoder is None:
                     _release_response(response)
                     return HeldResult(None) if _c2_buffer == "hold" else None
-                if native_response or retained_owner:
+                if releasable_response or retained_owner:
                     view = memoryview(response)
                 decoding = True
                 result = output_decoder(view if view is not None else response)
@@ -364,6 +375,8 @@ def _build_transfer_wrapper(
                     held = HeldResult(result, buffer=view, invalidate_cb=output.invalidate)
                     if native_response:
                         held._native_response = response
+                    elif releasable_response:
+                        held._source_buffer = response
                     return held
             except BaseException as exc:
                 if decoded and output is not None and output.invalidate is not None:
@@ -378,7 +391,7 @@ def _build_transfer_wrapper(
                     )
                 raise _client_output_error(exc, decoding=decoding) from exc
 
-            if native_response:
+            if releasable_response:
                 try:
                     _release_view_and_response(view, response)
                 except BaseException as exc:
@@ -481,7 +494,7 @@ def _build_transfer_wrapper(
             stage = "execute_function"
             result = resource_method(*deserialized_args)
         except BaseException as exc:
-            failure: BaseException = exc
+            failure: BaseException | None = exc
             try:
                 if stage == "deserialize_input":
                     code = (
@@ -493,31 +506,29 @@ def _build_transfer_wrapper(
                         code, _safe_error_message(exc), details=_cause_details(exc),
                     )
                 else:
-                    projected = (
+                    failure = (
                         error._callback_semantic_copy(exc)
                         if isinstance(exc, error.CCBaseError)
                         else None
                     )
-                    failure = (
-                        projected
-                        if projected is not None
-                        else error.ResourceExecutionError(
+                    if failure is None:
+                        failure = error.ResourceExecutionError(
                             _safe_error_message(exc), details=_cause_details(exc),
                         )
-                    )
                 raise failure from exc
             finally:
                 try:
-                    _cleanup_preserving_primary(failure, release_input_buffer)
+                    if failure is not None:
+                        _cleanup_preserving_primary(failure, release_input_buffer)
                 finally:
-                    del failure
+                    failure = None
 
         serialized_result = b""
         if output_serializer is not None:
             try:
                 serialized_result = output_serializer(result)
             except BaseException as exc:
-                failure: BaseException = exc
+                failure = exc
                 try:
                     failure = error.SerializationError(
                         error.ErrorCode.ResourceOutputSerializing,
@@ -529,7 +540,7 @@ def _build_transfer_wrapper(
                     try:
                         _cleanup_preserving_primary(failure, release_input_buffer)
                     finally:
-                        del failure
+                        failure = None
 
         if _release_fn is not None or input_buffer_mode == "borrowed":
             # Borrowed inputs invalidate only after their output serialization
@@ -682,6 +693,15 @@ def _resolved_hints(func: Callable[..., object]) -> dict[str, Any]:
         return dict(getattr(func, "__annotations__", {}))
 
 
+def _is_native_response_owner(response: object) -> bool:
+    return (
+        not isinstance(response, memoryview)
+        and hasattr(response, "release")
+        and hasattr(response, "is_released")
+        and hasattr(response, "invalidate_then_release")
+    )
+
+
 def _release_response(response: object) -> None:
     release = getattr(response, "release", None)
     if callable(release):
@@ -766,20 +786,24 @@ def _close_prepared_handle(
     primary: BaseException | None,
     dispatched: bool,
 ) -> None:
-    if primary is not None:
-        _cleanup_preserving_primary(primary, prepared.close)
-        return
     try:
-        prepared.close()
-    except BaseException as cleanup_error:
-        if dispatched:
-            cleaned = error._post_dispatch_cleanup_error(cleanup_error)
-            if cleaned is not cleanup_error:
-                try:
-                    raise cleaned from cleanup_error
-                finally:
-                    del cleaned, cleanup_error
-        raise
+        if primary is not None:
+            _cleanup_preserving_primary(primary, prepared.close)
+            return
+        try:
+            prepared.close()
+        except BaseException as cleanup_error:
+            if dispatched:
+                cleaned = error._post_dispatch_cleanup_error(cleanup_error)
+                if cleaned is not cleanup_error:
+                    try:
+                        raise cleaned from cleanup_error
+                    finally:
+                        cleaned = None
+                        cleanup_error = None
+            raise
+    finally:
+        primary = None
 
 
 def _cleanup_preserving_primary(
@@ -789,9 +813,13 @@ def _cleanup_preserving_primary(
     try:
         cleanup()
     except BaseException as cleanup_error:
-        _attach_cleanup_error(primary, cleanup_error)
+        try:
+            _attach_cleanup_error(primary, cleanup_error)
+        finally:
+            cleanup_error = None
     finally:
-        del primary
+        primary = None
+        cleanup = None  # type: ignore[assignment]
 
 
 def _attach_cleanup_error(primary: BaseException, cleanup: BaseException) -> None:

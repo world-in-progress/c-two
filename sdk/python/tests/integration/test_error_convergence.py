@@ -1087,3 +1087,245 @@ def test_custom_plain_bytes_stream_hold_releases_cleanly():
     with pytest.raises(RuntimeError, match='no longer accessible'):
         _ = held.unsafe_buffer
 
+
+class _HijackingCopyError(ResourceClosed):
+    __slots__ = ('tag',)
+
+    def __init__(self, tag: str):
+        super().__init__('executed failure', details={'transport_phase': 'pre_dispatch', 'keep': '1'})
+        self.tag = tag
+
+    def __copy__(self):
+        raise ResourceClosed('hijacked pre_dispatch', transport_phase='pre_dispatch')
+
+
+class _SelfReturningCopyError(ResourceClosed):
+    def __copy__(self):
+        return self
+
+
+def test_hostile_custom_copy_hooks_cannot_hijack_phase_or_self_link(tmp_path):
+    import copy
+
+    hijack = _HijackingCopyError('slot-ok')
+    with pytest.raises(ResourceClosed, match='hijacked pre_dispatch'):
+        copy.copy(hijack)
+
+    self_return = _SelfReturningCopyError(
+        'self failure',
+        details={'transport_phase': 'pre_dispatch', 'keep': '2'},
+        transport_phase='pre_dispatch',
+    )
+    assert copy.copy(self_return) is self_return
+
+    calls = 0
+    current = {'err': hijack}
+
+    class Resource:
+        def echo(self, value):
+            nonlocal calls
+            calls += 1
+            raise current['err']
+
+        def steps(self, value):
+            yield self.echo(value)
+
+    runtime = cc.Runtime()
+    if sys.platform != 'win32':
+        runtime.set_local_endpoint(root=str(tmp_path))
+    runtime.register(CodecBoundary, Resource(), name='hostile-copy')
+    local = runtime.connect(CodecBoundary, name='hostile-copy')
+    ipc = runtime.connect(CodecBoundary, name='hostile-copy', address=runtime.server_address())
+    try:
+        for original in (hijack, self_return):
+            current['err'] = original
+            with pytest.raises(type(original)) as local_err:
+                local.echo(None)
+            assert local_err.value is not original
+            assert local_err.value.__cause__ is original
+            assert local_err.value.__cause__ is not local_err.value
+            assert local_err.value.transport_phase is None
+            assert 'transport_phase' not in local_err.value.details
+            assert original.transport_phase == 'pre_dispatch'
+            assert original.details['transport_phase'] == 'pre_dispatch'
+            if isinstance(local_err.value, _HijackingCopyError):
+                assert local_err.value.tag == 'slot-ok'
+
+            with pytest.raises(ResourceClosed) as ipc_err:
+                ipc.echo(None)
+            assert ipc_err.value.transport_phase is None
+            assert 'transport_phase' not in ipc_err.value.details
+        assert calls == 4
+    finally:
+        cc.close(ipc)
+        cc.close(local)
+        runtime.shutdown()
+
+
+def test_production_error_paths_release_without_cyclic_gc():
+    import gc
+    import weakref
+    from c_two.crm.payload_plan import no_payload_binding, python_pickle_output_binding
+    from c_two.crm.transferable import _build_transfer_wrapper
+
+    def op(self) -> str: ...
+
+    wrapped = _build_transfer_wrapper(
+        op,
+        input=no_payload_binding(),
+        output=python_pickle_output_binding(op),
+    )
+
+    class ServerResource:
+        def op(self) -> str:
+            raise ResourceClosed('callback closed', transport_phase='pre_dispatch')
+
+    class ServerContract:
+        direction = '<-'
+        resource = ServerResource()
+
+    class DualFailingPrepared:
+        def call(self, _method, _args):
+            raise ResourceNotFound('dispatch failed', transport_phase='pre_dispatch')
+
+        def close(self):
+            raise RuntimeError('close also failed')
+
+    class DualFailingClient:
+        supports_direct_call = False
+
+        def prepare_call(self, _method):
+            return DualFailingPrepared()
+
+    class ClientContract:
+        direction = '->'
+        client = DualFailingClient()
+
+    was_enabled = gc.isenabled()
+    gc.collect()
+    gc.disable()
+    try:
+        server_ref = None
+        try:
+            wrapped(ServerContract())
+        except ResourceClosed as err:
+            server_ref = weakref.ref(err)
+            err = None
+        assert server_ref is not None and server_ref() is None
+
+        dual_ref = None
+        try:
+            wrapped(ClientContract())
+        except ResourceNotFound as err:
+            dual_ref = weakref.ref(err)
+            err = None
+        assert dual_ref is not None and dual_ref() is None
+    finally:
+        if was_enabled:
+            gc.enable()
+
+
+def test_held_memoryview_stream_and_undelivered_stream_cancel(tmp_path):
+    fixture = (
+        Path(__file__).resolve().parents[4]
+        / 'core/foundation/c2-contract/tests/fixtures/server-stream.contract.json'
+    )
+    compiled = cc.contract.compile_artifacts(fixture.read_bytes(), target='python')
+    out_dir = tmp_path / 'gen_mv_stream'
+    for artifact in compiled.artifacts:
+        dest = out_dir / artifact.relative_path
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(artifact.bytes)
+    module_path = out_dir / 'python/c_two_contract.py'
+    spec = importlib.util.spec_from_file_location('_gen_mv_stream_mod', module_path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    try:
+        spec.loader.exec_module(module)
+        req_payload, _ = echo_payload('req')
+        reply_payload, _ = echo_payload('mv-ok')
+        backing = bytearray(reply_payload.binary_bytes())
+        mv_item = memoryview(backing)
+        stream_holder: dict[str, _FakeNativeStream] = {}
+        fail_close = {'active': False}
+
+        class Prepared:
+            def charge_input(self, _n: int) -> None:
+                return None
+
+            def stream(self, _data: bytes):
+                ns = _FakeNativeStream([mv_item])
+                stream_holder['last'] = ns
+                return ns
+
+            def close(self) -> None:
+                if fail_close['active']:
+                    raise ResourceClosed('close boom', transport_phase='pre_dispatch')
+
+        class Bound:
+            local_copy_tracker = None
+            route_name = 'mv-route'
+
+            def begin_stream(self, _method: str):
+                return Prepared()
+
+            def call(self, _method: str, _data: bytes) -> bytes:
+                return b''
+
+        try:
+            from fastdb4py.payload import PayloadError
+
+            client = module.ContractClient(Bound())
+            held_stream = client.hold_method_1_echo(req_payload)
+            held = next(held_stream)
+            unwrapped = held.value
+            assert unwrapped.binary_bytes() == bytes(backing)
+            held.release()
+            with pytest.raises(PayloadError):
+                unwrapped.entry_view(0)
+            with pytest.raises(RuntimeError, match='no longer accessible'):
+                _ = held.value
+            # Both child memoryview and source memoryview are released so bytearray can resize.
+            backing.append(0)
+
+            # Undelivered stream is cancelled when prepared.close() fails on both generated & CRM wrappers.
+            fail_close['active'] = True
+            with pytest.raises(ResourceClosed) as gen_close_err:
+                client.method_1_echo(req_payload)
+            assert gen_close_err.value.transport_phase is None
+            assert stream_holder['last'].cancelled is True
+
+            from c_two.crm.payload_plan import no_payload_binding, python_pickle_output_binding
+            from c_two.crm.transferable import _build_transfer_wrapper
+
+            def crm_stream_fn(self) -> Iterator[str]: ...
+            crm_stream_fn.__cc_stream__ = True
+
+            wrapped_crm_stream = _build_transfer_wrapper(
+                crm_stream_fn,
+                input=no_payload_binding(),
+                output=python_pickle_output_binding(crm_stream_fn),
+            )
+
+            class CrmClient:
+                supports_direct_call = False
+                local_copy_tracker = None
+                route_name = 'crm-cancel-route'
+
+                def begin_stream(self, _method: str):
+                    return Prepared()
+
+            class CrmInstance:
+                direction = '->'
+                client = CrmClient()
+
+            with pytest.raises(ResourceClosed) as crm_close_err:
+                wrapped_crm_stream(CrmInstance())
+            assert crm_close_err.value.transport_phase is None
+            assert stream_holder['last'].cancelled is True
+        finally:
+            reply_payload.close()
+            req_payload.close()
+    finally:
+        sys.modules.pop(spec.name, None)

@@ -255,6 +255,7 @@ def start_c3_relay() -> Iterator[Callable[..., RelayProcess]]:
         actual_port: int,
         relay_id: str | None = None,
         seeds: list[str] | None = None,
+        ipc_root: str | Path | None = None,
     ) -> RelayProcess:
         bind = f'127.0.0.1:{actual_port}'
         url = f'http://127.0.0.1:{actual_port}'
@@ -263,6 +264,8 @@ def start_c3_relay() -> Iterator[Callable[..., RelayProcess]]:
             args.extend(['--relay-id', relay_id])
         if seeds:
             args.extend(['--seeds', ','.join(seeds)])
+        if ipc_root is not None and os.name != 'nt':
+            args.extend(['--ipc-root', str(ipc_root)])
 
         env = os.environ.copy()
         env['C2_ENV_FILE'] = ''
@@ -309,6 +312,7 @@ def start_c3_relay() -> Iterator[Callable[..., RelayProcess]]:
         port: int | None = None,
         relay_id: str | None = None,
         seeds: list[str] | None = None,
+        ipc_root: str | Path | None = None,
     ) -> RelayProcess:
         last_error: AssertionError | None = None
         attempts = 1 if port is not None else 5
@@ -319,6 +323,7 @@ def start_c3_relay() -> Iterator[Callable[..., RelayProcess]]:
                     actual_port=actual_port,
                     relay_id=relay_id,
                     seeds=seeds,
+                    ipc_root=ipc_root,
                 )
             except AssertionError as exc:
                 last_error = exc
@@ -332,9 +337,15 @@ def start_c3_relay() -> Iterator[Callable[..., RelayProcess]]:
         port: int | None = None,
         relay_id: str | None = None,
         seeds: list[str] | None = None,
+        ipc_root: str | Path | None = None,
     ) -> RelayProcess:
         with _relay_start_lock():
-            return _start_locked(port=port, relay_id=relay_id, seeds=seeds)
+            return _start_locked(
+                port=port,
+                relay_id=relay_id,
+                seeds=seeds,
+                ipc_root=ipc_root,
+            )
 
     yield _start
 

@@ -87,7 +87,8 @@ class Stream(Iterator[T], Generic[T]):
     def __next__(self) -> T:
         from .transferable import (
             HeldResult, _cleanup_preserving_primary, _client_output_error,
-            _invalidate_and_release_held_response, _release_view_and_response,
+            _invalidate_and_release_held_response, _is_native_response_owner,
+            _release_view_and_response,
         )
         item = _native_call(self._native.next_item)
         # Native returns a presence flag for object streams, since None is a value.
@@ -116,8 +117,10 @@ class Stream(Iterator[T], Generic[T]):
                     item.track_retained(self._tracker, self._route_name,
                                         self._method_name, 'client_response')
                 result = HeldResult(value, buffer=view, invalidate_cb=self._invalidator)
-                if hasattr(item, 'release'):
+                if _is_native_response_owner(item):
                     result._native_response = item
+                elif callable(getattr(item, 'release', None)):
+                    result._source_buffer = item
                 return result
         except BaseException as exc:
             if not checking_deadline:
@@ -295,6 +298,21 @@ class _ResourceStream:
                 del failure
 
 
+def _cancel_unclaimed_stream(native: object, primary: BaseException) -> None:
+    from .transferable import _attach_cleanup_error
+    try:
+        cancel = getattr(native, 'cancel', None)
+        if callable(cancel):
+            _native_call(cancel)
+    except BaseException as cancel_error:
+        try:
+            _attach_cleanup_error(primary, cancel_error)
+        finally:
+            cancel_error = None
+    finally:
+        primary = None
+
+
 def _build_stream_wrapper(func, input_binding, output_binding):
     signature = inspect.signature(func)
     method_name = func.__name__
@@ -343,6 +361,9 @@ def _build_stream_wrapper(func, input_binding, output_binding):
         prepared = client.begin_stream(method_name)
         primary = None
         dispatched = False
+        native = None
+        stream_obj = None
+        delivered = False
         try:
             if input_binding.kind is PayloadPlanKind.FASTDB:
                 try:
@@ -356,19 +377,33 @@ def _build_stream_wrapper(func, input_binding, output_binding):
                 raise _client_input_error(exc) from exc
             dispatched = True
             native = _native_call(prepared.stream, data)
+            stream_obj = Stream._from_encoded(
+                native, output_binding.deserialize, held=_c2_buffer == 'hold',
+                tracker=client.local_copy_tracker, route_name=client.route_name,
+                method_name=method_name, invalidator=output_binding.invalidate,
+            )
         except BaseException as exc:
             primary = exc
             raise
         finally:
             try:
                 _close_prepared_handle(prepared, primary, dispatched)
+                if primary is None:
+                    delivered = True
+            except BaseException as close_exc:
+                stream_obj = None
+                if native is not None and not delivered:
+                    try:
+                        _cancel_unclaimed_stream(native, close_exc)
+                    finally:
+                        close_exc = None
+                raise
             finally:
-                del primary
-        return Stream._from_encoded(
-            native, output_binding.deserialize, held=_c2_buffer == 'hold',
-            tracker=client.local_copy_tracker, route_name=client.route_name,
-            method_name=method_name, invalidator=output_binding.invalidate,
-        )
+                if native is not None and not delivered and primary is not None:
+                    stream_obj = None
+                    _cancel_unclaimed_stream(native, primary)
+                primary = None
+        return stream_obj
 
     invoke._input_payload_binding = input_binding
     invoke._output_payload_binding = output_binding

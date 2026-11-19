@@ -671,8 +671,12 @@ fn terminal_route_refusal(err: &HttpError) -> bool {
 
 fn relay_rejection_is_pre_dispatch(error: &HttpError) -> bool {
     let body = match error {
-        HttpError::ResponseError(404 | 406 | 409 | 410 | 429 | 502 | 503, body) => body.as_ref(),
-        HttpError::ServerError(404 | 406 | 409 | 410 | 429 | 502 | 503, body) => body.as_bytes(),
+        HttpError::ResponseError(404 | 406 | 409 | 410 | 413 | 429 | 502 | 503, body) => {
+            body.as_ref()
+        }
+        HttpError::ServerError(404 | 406 | 409 | 410 | 413 | 429 | 502 | 503, body) => {
+            body.as_bytes()
+        }
         _ => return false,
     };
     let Ok(envelope) = serde_json::from_slice::<c2_error::C2ErrorEnvelope>(body) else {
@@ -1255,6 +1259,17 @@ mod tests {
         assert_eq!(
             http_call_error_phase(&HttpError::ServerError(502, capacity_rejected.to_string())),
             HttpCallPhase::PreDispatch
+        );
+        assert_eq!(
+            http_call_error_phase(&HttpError::ServerError(413, capacity_rejected.to_string())),
+            HttpCallPhase::PreDispatch
+        );
+        assert_eq!(
+            http_call_error_phase(&HttpError::ServerError(
+                413,
+                "<html>Request Entity Too Large</html>".to_string()
+            )),
+            HttpCallPhase::DispatchUncertain
         );
 
         let mut failed_after_callback = rejected.clone();

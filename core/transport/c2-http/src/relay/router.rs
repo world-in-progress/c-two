@@ -170,6 +170,33 @@ fn route_resolution_error_response(name: &str, error: RouteResolutionError) -> R
     )
 }
 
+fn probe_route_conflict_response(name: &str, error: RouteResolutionError) -> Response {
+    let RouteResolutionError::Conflict(registrations) = error else {
+        unreachable!("probe conflict helper handles RouteResolutionError::Conflict only");
+    };
+    c2_error_response(
+        StatusCode::CONFLICT,
+        c2_error::ErrorCode::RouteConflict,
+        format!("{}: {name}", c2_error::ErrorCode::RouteConflict.name()),
+        [
+            ("route", name.into()),
+            (
+                "registrations",
+                serde_json::to_string(&registrations).expect("registration metadata serializes"),
+            ),
+        ],
+    )
+}
+
+fn probe_resource_not_found_response(route_name: &str) -> Response {
+    c2_error_response(
+        StatusCode::NOT_FOUND,
+        c2_error::ErrorCode::ResourceNotFound,
+        format!("route not found: {route_name}"),
+        [("route", route_name.to_string())],
+    )
+}
+
 fn resource_not_found_response(route_name: &str) -> Response {
     c2_error_response(
         StatusCode::NOT_FOUND,
@@ -403,15 +430,18 @@ fn payload_too_large_response(
     max_payload_size: u64,
     budget: &DomainBudget,
 ) -> Response {
-    json_error_response(
+    c2_error_response_with_budget(
         StatusCode::PAYLOAD_TOO_LARGE,
-        serde_json::json!({
-            "error": "PayloadTooLarge",
-            "route": route_name,
-            "content_length": content_length,
-            "max_payload_size": max_payload_size,
-        }),
-        Some(budget),
+        c2_error::ErrorCode::CallCapacityExceeded,
+        format!("request payload size {content_length} exceeds max_payload_size {max_payload_size}"),
+        [
+            ("route", route_name.to_string()),
+            ("reason", "PayloadTooLarge".to_string()),
+            ("content_length", content_length.to_string()),
+            ("max_payload_size", max_payload_size.to_string()),
+            ("dispatch_phase", "pre_dispatch".to_string()),
+        ],
+        budget,
     )
 }
 
@@ -745,7 +775,7 @@ fn validate_expected_crm_for_route(
     let Some(route) = state.local_route(route_name) else {
         return Err(match budget {
             Some(budget) => resource_not_found_response_budgeted(route_name, budget),
-            None => resource_not_found_response(route_name),
+            None => probe_resource_not_found_response(route_name),
         }
         .into());
     };
@@ -1913,7 +1943,7 @@ async fn handle_probe_in_context(
         Err(response) => return response.into_response(),
     };
     if let Err(error @ RouteResolutionError::Conflict(_)) = state.resolve_matching(&expected_crm) {
-        return route_resolution_error_response(&route_name, error);
+        return probe_route_conflict_response(&route_name, error);
     }
     let advertised_route =
         match validate_expected_crm_for_route(&state, &route_name, &expected_crm, None) {
@@ -1931,7 +1961,7 @@ async fn handle_probe_in_context(
         RequestClient::WatchUnavailable { route, reason } => {
             route_watch_unavailable_response(&route.name, reason)
         }
-        RequestClient::NotFound => resource_not_found_response(&route_name),
+        RequestClient::NotFound => probe_resource_not_found_response(&route_name),
         RequestClient::RouteError(error) => ipc_route_error_response(&route_name, &error, None),
         RequestClient::Unreachable => resource_unavailable_response(
             &route_name,
@@ -5326,9 +5356,12 @@ mod tests {
         assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(payload["error"], "PayloadTooLarge");
-        assert_eq!(payload["content_length"], 5);
-        assert_eq!(payload["max_payload_size"], 4);
+        assert_eq!(payload["code"], 717);
+        assert_eq!(payload["name"], "CallCapacityExceeded");
+        assert_eq!(payload["details"]["reason"], "PayloadTooLarge");
+        assert_eq!(payload["details"]["content_length"], "5");
+        assert_eq!(payload["details"]["max_payload_size"], "4");
+        assert_eq!(payload["details"]["dispatch_phase"], "pre_dispatch");
     }
 
     #[tokio::test]
@@ -5787,7 +5820,9 @@ mod tests {
             let error: serde_json::Value =
                 serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
                     .unwrap();
-            assert_eq!(error["max_payload_size"], 3);
+            assert_eq!(error["code"], 717);
+            assert_eq!(error["details"]["max_payload_size"], "3");
+            assert_eq!(error["details"]["dispatch_phase"], "pre_dispatch");
             assert_eq!(
                 calls.load(Ordering::SeqCst),
                 0,
@@ -6168,6 +6203,119 @@ mod tests {
         assert_eq!(post_body["details"]["dispatch_phase"], "pre_dispatch");
 
         shutdown_live_server(&owner_server).await;
+    }
+
+    #[tokio::test]
+    async fn probe_catalog_missing_and_conflict_omit_dispatch_phase_while_resolve_and_post_keep_it()
+    {
+        let state = test_state();
+
+        // 1. Route missing from relay catalog: probe 701 has no dispatch_phase;
+        //    resolve 701 and business POST 701 both carry pre_dispatch.
+        let (probe_status, probe_body) = get_probe_response(state.clone(), "missing-grid").await;
+        assert_eq!(probe_status, StatusCode::NOT_FOUND);
+        let probe_json: serde_json::Value = serde_json::from_slice(&probe_body).unwrap();
+        assert_eq!(probe_json["code"], 701);
+        assert!(probe_json["details"].get("dispatch_phase").is_none());
+
+        let resolve_resp = build_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!(
+                        "/_resolve/missing-grid?crm_ns=test.echo&crm_name=Echo&crm_ver=0.1.0&abi_hash={TEST_ABI_HASH}&signature_hash={TEST_SIGNATURE_HASH}"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resolve_resp.status(), StatusCode::NOT_FOUND);
+        let resolve_bytes = to_bytes(resolve_resp.into_body(), usize::MAX).await.unwrap();
+        let resolve_json: serde_json::Value = serde_json::from_slice(&resolve_bytes).unwrap();
+        assert_eq!(resolve_json["code"], 701);
+        assert_eq!(resolve_json["details"]["dispatch_phase"], "pre_dispatch");
+
+        let (post_status, post_body) =
+            post_call_response(state.clone(), "missing-grid", "ping").await;
+        assert_eq!(post_status, StatusCode::NOT_FOUND);
+        let post_json: serde_json::Value = serde_json::from_slice(&post_body).unwrap();
+        assert_eq!(post_json["code"], 701);
+        assert_eq!(post_json["details"]["dispatch_phase"], "pre_dispatch");
+
+        // 2. Two live registrations in mesh conflict: probe 719 omits dispatch_phase;
+        //    resolve 719 keeps pre_dispatch.
+        state.register_peer(crate::relay::types::PeerInfo {
+            relay_id: "peer-b".into(),
+            url: "http://127.0.0.1:18082".into(),
+            route_count: 1,
+            last_heartbeat: std::time::Instant::now(),
+            status: PeerStatus::Alive,
+        });
+        state.with_route_table_mut(|table| {
+            assert!(table.register_route(RouteEntry {
+                name: "conflict-grid".into(),
+                relay_id: "test-relay".into(),
+                relay_url: "http://127.0.0.1:18081".into(),
+                server_id: Some("srv-a".into()),
+                server_instance_id: Some("srv-a-inst".into()),
+                ipc_address: Some("ipc://srv-a".into()),
+                crm_ns: "test.echo".into(),
+                crm_name: "Echo".into(),
+                crm_ver: "0.1.0".into(),
+                abi_hash: TEST_ABI_HASH.into(),
+                signature_hash: TEST_SIGNATURE_HASH.into(),
+                max_payload_size: 1024,
+                route_uid: Some("uid-a".into()),
+                locality: Locality::Local,
+                registered_at: 1.0,
+            }));
+            assert!(table.register_route(RouteEntry {
+                name: "conflict-grid".into(),
+                relay_id: "peer-b".into(),
+                relay_url: "http://127.0.0.1:18082".into(),
+                server_id: None,
+                server_instance_id: None,
+                ipc_address: None,
+                crm_ns: "test.echo".into(),
+                crm_name: "Echo".into(),
+                crm_ver: "0.1.0".into(),
+                abi_hash: TEST_ABI_HASH.into(),
+                signature_hash: TEST_SIGNATURE_HASH.into(),
+                max_payload_size: 1024,
+                route_uid: None,
+                locality: Locality::Peer,
+                registered_at: 2.0,
+            }));
+        });
+
+        let (conflict_probe_status, conflict_probe_body) =
+            get_probe_response(state.clone(), "conflict-grid").await;
+        assert_eq!(conflict_probe_status, StatusCode::CONFLICT);
+        let conflict_probe_json: serde_json::Value =
+            serde_json::from_slice(&conflict_probe_body).unwrap();
+        assert_eq!(conflict_probe_json["code"], 719);
+        assert!(conflict_probe_json["details"].get("dispatch_phase").is_none());
+
+        let conflict_resolve = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!(
+                        "/_resolve/conflict-grid?crm_ns=test.echo&crm_name=Echo&crm_ver=0.1.0&abi_hash={TEST_ABI_HASH}&signature_hash={TEST_SIGNATURE_HASH}"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(conflict_resolve.status(), StatusCode::CONFLICT);
+        let conflict_resolve_bytes =
+            to_bytes(conflict_resolve.into_body(), usize::MAX).await.unwrap();
+        let conflict_resolve_json: serde_json::Value =
+            serde_json::from_slice(&conflict_resolve_bytes).unwrap();
+        assert_eq!(conflict_resolve_json["code"], 719);
+        assert_eq!(conflict_resolve_json["details"]["dispatch_phase"], "pre_dispatch");
     }
 
     #[tokio::test]

@@ -973,30 +973,55 @@ def _note_cleanup_failure(primary: BaseException, cleanup_error: BaseException) 
 
 def _close_prepared(prepared: Any, primary: BaseException | None, dispatched: bool = False) -> None:
     try:
-        prepared.close()
-    except BaseException as cleanup_error:
-        if primary is None:
-            if dispatched:
-                cleaned = _post_dispatch_cleanup_error(cleanup_error)
-                if cleaned is not cleanup_error:
-                    try:
-                        raise cleaned from cleanup_error
-                    finally:
-                        cleaned = None
-                        cleanup_error = None
-            raise
-        _note_cleanup_failure(primary, cleanup_error)
+        try:
+            prepared.close()
+        except BaseException as cleanup_error:
+            if primary is None:
+                if dispatched:
+                    cleaned = _post_dispatch_cleanup_error(cleanup_error)
+                    if cleaned is not cleanup_error:
+                        try:
+                            raise cleaned from cleanup_error
+                        finally:
+                            cleaned = None
+                            cleanup_error = None
+                raise
+            try:
+                _note_cleanup_failure(primary, cleanup_error)
+            finally:
+                cleanup_error = None
+    finally:
+        primary = None
+
+def _cancel_unclaimed_stream(native: Any, primary: BaseException) -> None:
+    try:
+        cancel = getattr(native, \"cancel\", None)
+        if callable(cancel):
+            _project_call(cancel)
+    except BaseException as cancel_error:
+        try:
+            _note_cleanup_failure(primary, cancel_error)
+        finally:
+            cancel_error = None
+    finally:
+        primary = None
 
 def _release_response(response: Any, primary: BaseException | None) -> None:
     try:
-        release = getattr(response, \"release\", None)
-        if release is not None:
-            release()
-    except BaseException as exc:
-        if primary is not None:
-            _note_cleanup_failure(primary, exc)
-        else:
-            raise _serialization_error(ErrorCode.ClientOutputFromBuffer, exc) from exc
+        try:
+            release = getattr(response, \"release\", None)
+            if release is not None:
+                release()
+        except BaseException as exc:
+            if primary is not None:
+                try:
+                    _note_cleanup_failure(primary, exc)
+                finally:
+                    exc = None
+            else:
+                raise _serialization_error(ErrorCode.ClientOutputFromBuffer, exc) from exc
+    finally:
+        primary = None
 
 def _project_call(operation, *args):
     \"\"\"Project a native call failure's canonical semantic error, if any.
@@ -1093,20 +1118,37 @@ fn render_python_stream_client_method(output: &mut String, method: &TargetMethod
              \x20       prepared = _project_call(self._bound_client.begin_stream, {method_name})\n\
              \x20       primary = None\n\
              \x20       dispatched = False\n\
+             \x20       native = None\n\
+             \x20       stream_obj = None\n\
+             \x20       delivered = False\n\
              \x20       try:\n\
              {charge_block}\
              \x20           request = {request}\n\
              \x20           dispatched = True\n\
              \x20           native = _project_call(prepared.stream, request)\n\
-             \x20           return Stream._from_encoded(native, decode_{symbol}_output, held={held_literal}{invalidator}, tracker=self._bound_client.local_copy_tracker, route_name=self._bound_client.route_name, method_name={method_name}, decoder_classifies=True)\n\
+             \x20           stream_obj = Stream._from_encoded(native, decode_{symbol}_output, held={held_literal}{invalidator}, tracker=self._bound_client.local_copy_tracker, route_name=self._bound_client.route_name, method_name={method_name}, decoder_classifies=True)\n\
              \x20       except BaseException as exc:\n\
              \x20           primary = exc\n\
              \x20           raise\n\
              \x20       finally:\n\
              \x20           try:\n\
              \x20               _close_prepared(prepared, primary, dispatched)\n\
+             \x20               if primary is None:\n\
+             \x20                   delivered = True\n\
+             \x20           except BaseException as close_exc:\n\
+             \x20               stream_obj = None\n\
+             \x20               if native is not None and not delivered:\n\
+             \x20                   try:\n\
+             \x20                       _cancel_unclaimed_stream(native, close_exc)\n\
+             \x20                   finally:\n\
+             \x20                       close_exc = None\n\
+             \x20               raise\n\
              \x20           finally:\n\
-             \x20               primary = None\n",
+             \x20               if native is not None and not delivered and primary is not None:\n\
+             \x20                   stream_obj = None\n\
+             \x20                   _cancel_unclaimed_stream(native, primary)\n\
+             \x20               primary = None\n\
+             \x20       return stream_obj\n",
         ));
     }
 }
