@@ -97,13 +97,15 @@ fn refused(code: ErrorCode, message: impl Into<String>) -> Error {
 }
 fn error_value(error: &Error) -> Value {
     let mut value = json!({"message": error.to_string()});
+    if let Some(phase) = error.transport_phase() {
+        value["transportPhase"] = json!(match phase {
+            TransportPhase::PreDispatch => "pre_dispatch",
+            TransportPhase::DispatchUncertain => "dispatch_uncertain",
+        });
+    }
     let semantic = match error {
         Error::Semantic(error) => Some(error),
         Error::Transport(error) => {
-            value["transportPhase"] = json!(match error.phase() {
-                TransportPhase::PreDispatch => "pre_dispatch",
-                TransportPhase::DispatchUncertain => "dispatch_uncertain",
-            });
             value["category"] = json!(match error.kind() {
                 c2_core::TransportKind::Ipc => "ipc",
                 c2_core::TransportKind::Http => "http",
@@ -112,33 +114,21 @@ fn error_value(error: &Error) -> Value {
         }
         Error::ProtocolVersionMismatch { local, peer } => {
             value["category"] = json!("protocol_version_mismatch");
-            value["transportPhase"] = json!("pre_dispatch");
             value["localProtocolVersion"] = json!(local);
             value["peerProtocolVersion"] = json!(peer);
             None
         }
         Error::Lifecycle(LifecycleError::RuntimeRetired) => {
-            value["transportPhase"] = json!("pre_dispatch");
             value["category"] = json!("runtime_retired");
             None
         }
-        Error::Lifecycle(LifecycleError::ResponseCopy(_)) => {
-            value["transportPhase"] = json!("dispatch_uncertain");
-            None
-        }
-        Error::Contract(_) | Error::Admission(_) | Error::Lifecycle(_) => {
-            value["transportPhase"] = json!("pre_dispatch");
-            None
-        }
+        Error::Contract(_) | Error::Admission(_) | Error::Lifecycle(_) => None,
     };
     if let Some(error) = semantic {
         value["message"] = json!(error.message);
         value["code"] = json!(error.code as u32);
         value["canonicalName"] = json!(error.code.name());
         value["details"] = json!(error.details);
-        if let Some(phase) = error.details.get("transport_phase") {
-            value["transportPhase"] = json!(phase);
-        }
     }
     if let Some(cause) = error.local_io_cause() {
         value["ioOperation"] = json!(cause.operation());
@@ -158,14 +148,6 @@ fn call_error_value(call: &Call, error: &Error) -> Value {
         )
     {
         value["transportPhase"] = json!("dispatch_uncertain");
-    }
-    if value.get("transportPhase").is_none()
-        && matches!(
-            call.scope.state(),
-            CallState::PreDispatch | CallState::FailedPreDispatch | CallState::ExpiredPreDispatch
-        )
-    {
-        value["transportPhase"] = json!("pre_dispatch");
     }
     value
 }

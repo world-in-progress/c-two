@@ -5,8 +5,46 @@ use serde::{Deserialize, Serialize};
 const ERROR_WIRE_MAGIC: &[u8; 4] = b"C2E1";
 pub const ERROR_WIRE_VERSION: u16 = 1;
 
+/// Which side of a call produced an adapter error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ErrorSide {
+    Client,
+    Resource,
+}
+
+impl ErrorSide {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Client => "client",
+            Self::Resource => "resource",
+        }
+    }
+}
+
+/// The operation that produced an adapter error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ErrorStage {
+    Serialize,
+    Deserialize,
+    FromBuffer,
+    Execute,
+    Call,
+}
+
+impl ErrorStage {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Serialize => "serialize",
+            Self::Deserialize => "deserialize",
+            Self::FromBuffer => "from_buffer",
+            Self::Execute => "execute",
+            Self::Call => "call",
+        }
+    }
+}
+
 macro_rules! define_error_codes {
-    ($($variant:ident = $value:literal),+ $(,)?) => {
+    ($($variant:ident = $value:literal $(=> ($side:ident, $stage:ident))?),+ $(,)?) => {
         #[repr(u16)]
         #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
         pub enum ErrorCode {
@@ -17,6 +55,8 @@ macro_rules! define_error_codes {
             $(ErrorCodeEntry {
                 code: ErrorCode::$variant,
                 name: stringify!($variant),
+                side: ErrorCode::$variant.side(),
+                stage: ErrorCode::$variant.stage(),
             },)+
         ];
 
@@ -24,6 +64,20 @@ macro_rules! define_error_codes {
             pub fn name(self) -> &'static str {
                 match self {
                     $(Self::$variant => stringify!($variant),)+
+                }
+            }
+
+            pub const fn side(self) -> Option<ErrorSide> {
+                match self {
+                    $($(Self::$variant => Some(ErrorSide::$side),)?)+
+                    _ => None,
+                }
+            }
+
+            pub const fn stage(self) -> Option<ErrorStage> {
+                match self {
+                    $($(Self::$variant => Some(ErrorStage::$stage),)?)+
+                    _ => None,
                 }
             }
 
@@ -48,14 +102,14 @@ macro_rules! define_error_codes {
 // Permanently retired: 704 RouteStale, 706 WriteConflict, 711 RouteCatalogCompacted. Never reassign.
 define_error_codes! {
     Unknown = 0,
-    ResourceInputDeserializing = 1,
-    ResourceOutputSerializing = 2,
-    ResourceFunctionExecuting = 3,
-    ResourceInputFromBuffer = 4,
-    ClientInputSerializing = 5,
-    ClientOutputDeserializing = 6,
-    ClientCallingResource = 7,
-    ClientOutputFromBuffer = 8,
+    ResourceInputDeserializing = 1 => (Resource, Deserialize),
+    ResourceOutputSerializing = 2 => (Resource, Serialize),
+    ResourceFunctionExecuting = 3 => (Resource, Execute),
+    ResourceInputFromBuffer = 4 => (Resource, FromBuffer),
+    ClientInputSerializing = 5 => (Client, Serialize),
+    ClientOutputDeserializing = 6 => (Client, Deserialize),
+    ClientCallingResource = 7 => (Client, Call),
+    ClientOutputFromBuffer = 8 => (Client, FromBuffer),
     ResourceNotFound = 701,
     ResourceUnavailable = 702,
     ResourceAlreadyRegistered = 703,
@@ -78,6 +132,8 @@ define_error_codes! {
 pub struct ErrorCodeEntry {
     pub code: ErrorCode,
     pub name: &'static str,
+    pub side: Option<ErrorSide>,
+    pub stage: Option<ErrorStage>,
 }
 
 impl From<ErrorCode> for u16 {
@@ -242,7 +298,7 @@ impl std::error::Error for C2Error {}
 
 #[cfg(test)]
 mod tests {
-    use super::{C2Error, C2ErrorEnvelope, ErrorCode};
+    use super::{C2Error, C2ErrorEnvelope, ErrorCode, ErrorSide, ErrorStage};
     use std::collections::BTreeMap;
 
     #[test]
@@ -307,6 +363,36 @@ mod tests {
     }
 
     #[test]
+    fn error_registry_classifies_only_adapter_codes() {
+        use ErrorSide::{Client, Resource};
+        use ErrorStage::{Call, Deserialize, Execute, FromBuffer, Serialize};
+
+        let expected = [
+            (Resource, Deserialize, "resource", "deserialize"),
+            (Resource, Serialize, "resource", "serialize"),
+            (Resource, Execute, "resource", "execute"),
+            (Resource, FromBuffer, "resource", "from_buffer"),
+            (Client, Serialize, "client", "serialize"),
+            (Client, Deserialize, "client", "deserialize"),
+            (Client, Call, "client", "call"),
+            (Client, FromBuffer, "client", "from_buffer"),
+        ];
+        for entry in ErrorCode::registry() {
+            let value = u16::from(entry.code);
+            if (1..=8).contains(&value) {
+                let (side, stage, side_name, stage_name) = expected[usize::from(value - 1)];
+                assert_eq!((entry.side, entry.stage), (Some(side), Some(stage)));
+                assert_eq!(side.as_str(), side_name);
+                assert_eq!(stage.as_str(), stage_name);
+            } else {
+                assert_eq!((entry.side, entry.stage), (None, None));
+            }
+            assert_eq!(entry.code.side(), entry.side);
+            assert_eq!(entry.code.stage(), entry.stage);
+        }
+    }
+
+    #[test]
     fn c2_error_display_uses_code_name_and_message() {
         let err = C2Error::new(ErrorCode::ResourceAlreadyRegistered, "grid exists");
         assert_eq!(err.to_string(), "ResourceAlreadyRegistered: grid exists");
@@ -314,10 +400,10 @@ mod tests {
 
     #[test]
     fn wire_encode_matches_canonical_error_wire_format() {
-        let err = C2Error::new(ErrorCode::ResourceAlreadyRegistered, "grid exists");
+        let err = C2Error::new(ErrorCode::ResourceInputDeserializing, "invalid input");
         assert_eq!(
             err.to_wire_bytes(),
-            br#"C2E1{"version":1,"code":703,"name":"ResourceAlreadyRegistered","message":"grid exists","details":{}}"#
+            br#"C2E1{"version":1,"code":1,"name":"ResourceInputDeserializing","message":"invalid input","details":{}}"#
         );
     }
 

@@ -280,6 +280,7 @@ version = "0.0.0"
 dependencies = [
  "c2-config",
  "c2-contract",
+ "c2-error",
  "c2-server",
  "serde_json",
  "tokio",

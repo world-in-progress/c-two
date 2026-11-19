@@ -216,6 +216,31 @@ pub enum Error {
 }
 
 impl Error {
+    /// The dispatch phase of this call, when established by Core.
+    pub fn transport_phase(&self) -> Option<TransportPhase> {
+        match self {
+            Self::ProtocolVersionMismatch { .. }
+            | Self::Contract(_)
+            | Self::Admission(_)
+            | Self::Lifecycle(LifecycleError::RuntimeRetired) => Some(TransportPhase::PreDispatch),
+            Self::Transport(error) => Some(error.phase()),
+            Self::Lifecycle(LifecycleError::ResponseCopy(_)) => {
+                Some(TransportPhase::DispatchUncertain)
+            }
+            Self::Lifecycle(_) => None,
+            Self::Semantic(error) => match error
+                .details
+                .get("transport_phase")
+                .or_else(|| error.details.get("dispatch_phase"))
+                .map(String::as_str)
+            {
+                Some("pre_dispatch") => Some(TransportPhase::PreDispatch),
+                Some("dispatch_uncertain") => Some(TransportPhase::DispatchUncertain),
+                _ => None,
+            },
+        }
+    }
+
     pub fn local_io_cause(&self) -> Option<LocalIoCause> {
         match self {
             Self::Transport(error) => error.local_io_cause(),
@@ -792,6 +817,98 @@ mod native_boundary_tests {
                     ErrorCode::ResourceUnavailable
                 );
             }
+        }
+    }
+
+    #[test]
+    fn transport_phase_classifies_core_error_families() {
+        use TransportPhase::{DispatchUncertain, PreDispatch};
+
+        let invalid_contract = ContractError::Empty { field: "route" };
+        for (error, expected) in [
+            (
+                Error::ProtocolVersionMismatch {
+                    local: 16,
+                    peer: 15,
+                },
+                Some(PreDispatch),
+            ),
+            (Error::Contract(invalid_contract.clone()), Some(PreDispatch)),
+            (Error::Admission(invalid_contract), Some(PreDispatch)),
+            (LifecycleError::RuntimeRetired.into(), Some(PreDispatch)),
+            (
+                LifecycleError::ResponseCopy("copy failed".into()).into(),
+                Some(DispatchUncertain),
+            ),
+            (
+                LifecycleError::Configuration("invalid host option".into()).into(),
+                None,
+            ),
+        ] {
+            assert_eq!(error.transport_phase(), expected, "{error:?}");
+        }
+    }
+
+    #[test]
+    fn semantic_transport_phase_uses_only_canonical_values() {
+        let details = BTreeMap::from([
+            ("transport_phase".into(), "dispatch_uncertain".into()),
+            ("dispatch_phase".into(), "pre_dispatch".into()),
+        ]);
+        let mut error =
+            C2Error::new(ErrorCode::ResourceUnavailable, "forwarding failed").with_details(details);
+        assert_eq!(
+            Error::Semantic(error.clone()).transport_phase(),
+            Some(TransportPhase::DispatchUncertain)
+        );
+
+        error
+            .details
+            .insert("transport_phase".into(), "PRE_DISPATCH".into());
+        assert_eq!(Error::Semantic(error).transport_phase(), None);
+    }
+
+    #[test]
+    fn http_call_errors_project_the_phase_of_this_dispatch() {
+        for (status, code, dispatch_phase, expected) in [
+            (
+                503,
+                ErrorCode::RouteWatchUnavailable,
+                "pre_dispatch",
+                Some(TransportPhase::PreDispatch),
+            ),
+            (
+                502,
+                ErrorCode::ResourceUnavailable,
+                "dispatch_uncertain",
+                Some(TransportPhase::DispatchUncertain),
+            ),
+            (
+                500,
+                ErrorCode::ResourceFunctionExecuting,
+                "pre_dispatch",
+                None,
+            ),
+        ] {
+            let mut semantic = C2Error::new(code, "relay call failed");
+            semantic
+                .details
+                .insert("dispatch_phase".into(), dispatch_phase.into());
+            if status == 500 {
+                semantic
+                    .details
+                    .insert("transport_phase".into(), dispatch_phase.into());
+            }
+            let body = serde_json::to_string(&semantic.envelope()).unwrap();
+            let error = normalize_http_error(
+                HttpError::ServerError(status, body),
+                TransportPhase::PreDispatch,
+            );
+            assert_eq!(error.transport_phase(), expected, "{error:?}");
+            let Error::Semantic(actual) = error else {
+                panic!("expected a semantic error");
+            };
+            assert_eq!(actual.code, code);
         }
     }
 

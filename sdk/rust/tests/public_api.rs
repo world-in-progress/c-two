@@ -7,11 +7,12 @@ use std::time::Duration;
 
 use c_two::contract::ContractReleaseRef;
 use c_two::generated::{
-    C2Error, EncodedClient, EncodedService, ErrorCode, MethodAccess, MethodDefinition,
-    ServiceDefinition, fastdb_cause_details,
+    EncodedClient, EncodedService, MethodAccess, MethodDefinition, ServiceDefinition,
+    fastdb_cause_details,
 };
 use c_two::{
-    Connect, ContractRelease, Error, HostOptions, Runtime, RuntimeOptions, ServiceConcurrencyMode,
+    C2Error, Connect, ContractRelease, Error, ErrorCode, ErrorSide, ErrorStage, HostOptions,
+    Runtime, RuntimeOptions, ServiceConcurrencyMode,
 };
 use c2_http::relay::{RelayConfig, RelayServer};
 use fastdb::{BuildPolicy, Builder, CompiledSpec};
@@ -410,6 +411,8 @@ fn semantic_error_fields_match_the_cross_language_fixture_shape() {
     };
     assert_eq!(u16::from(error.code), 3);
     assert_eq!(error.code.name(), "ResourceFunctionExecuting");
+    assert_eq!(error.code.side(), Some(ErrorSide::Resource));
+    assert_eq!(error.code.stage(), Some(ErrorStage::Execute));
     assert_eq!(error.message, "portable Python fixture failure");
     assert_eq!(
         error.details,

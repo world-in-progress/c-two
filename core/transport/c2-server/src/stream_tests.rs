@@ -1642,7 +1642,7 @@ async fn unknown_open_mode_and_cancel_cause_deactivate_but_preserve_dispatched_c
                     ..
                 } => {
                     assert_eq!(id, 2);
-                    assert_eq!(error.code, ErrorCode::ResourceInputDeserializing);
+                    assert_eq!(error.code, ErrorCode::ProtocolViolation);
                     assert!(!refusal);
                     refusal = true;
                 }

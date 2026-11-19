@@ -880,6 +880,26 @@ mod tests {
     // budget-boundary tests keep FINITE or their own explicit deadlines.
     const INJECTION_BUDGET: Duration = Duration::from_secs(10);
 
+    #[test]
+    fn guard_errors_never_claim_a_retry_safe_internal_failure() {
+        let internal = guard_error(CallScopeError::InvalidState {
+            state: CallState::Succeeded,
+        });
+        assert_eq!(internal.code, ErrorCode::ClientCallingResource);
+        assert_eq!(internal.details["fallback_eligible"], "false");
+        assert_eq!(internal.details["route_withdrawal"], "false");
+        assert_eq!(Error::Semantic(internal).transport_phase(), None);
+
+        for phase in [
+            TransportPhase::PreDispatch,
+            TransportPhase::DispatchUncertain,
+        ] {
+            let deadline = guard_error(CallScopeError::DeadlineExceeded { phase });
+            assert_eq!(deadline.code, ErrorCode::CallDeadlineExceeded);
+            assert_eq!(Error::Semantic(deadline).transport_phase(), Some(phase));
+        }
+    }
+
     fn context(slots: u64, bytes: u64) -> CallExecutionContext {
         CallExecutionContext::new(c2_mem::DomainBudget::from_limits(
             &c2_config::DomainLimits {

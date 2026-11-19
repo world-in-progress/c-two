@@ -1796,7 +1796,7 @@ async fn same_error_code_distinguishes_admission_from_resource_failure() {
         ) -> Result<ResponseMeta, CrmError> {
             self.0.fetch_add(1, Ordering::SeqCst);
             Err(CrmError::UserError(error_wire(
-                ErrorCode::ResourceFunctionExecuting,
+                ErrorCode::ProtocolViolation,
                 "resource failed after entry",
             )))
         }
@@ -1822,7 +1822,7 @@ async fn same_error_code_distinguishes_admission_from_resource_failure() {
     assert_call_end_status(&refused_reply, c2_wire::rpc::CallStatus::NotExecuted);
     assert_eq!(
         reply_error_code(&refused_reply),
-        ErrorCode::ResourceFunctionExecuting
+        ErrorCode::ProtocolViolation
     );
     assert_eq!(calls.load(Ordering::SeqCst), 0);
 
@@ -1838,7 +1838,7 @@ async fn same_error_code_distinguishes_admission_from_resource_failure() {
     assert_call_end_status(&failed_reply, c2_wire::rpc::CallStatus::Failed);
     assert_eq!(
         reply_error_code(&failed_reply),
-        ErrorCode::ResourceFunctionExecuting
+        ErrorCode::ProtocolViolation
     );
     assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
@@ -4265,10 +4265,7 @@ async fn assert_bad_call_isolated(flags: u32, payload: &[u8], deactivates: bool)
             break body;
         }
     };
-    assert_eq!(
-        reply_error_code(&reply),
-        ErrorCode::ResourceInputDeserializing
-    );
+    assert_eq!(reply_error_code(&reply), ErrorCode::ProtocolViolation);
     assert_call_end_status(&reply, c2_wire::rpc::CallStatus::NotExecuted);
     assert_eq!(conn.core.is_deactivated(), deactivates);
     assert_eq!(conn.inflight_count(), 1, "accepted call remains queued");
@@ -7683,12 +7680,10 @@ async fn response_write_buffer_capacity_failure_reports_executed_output_error() 
     f.release();
     let (id, _, reply) = read_reply_frame(&mut f.peer).await;
     assert_eq!(id, 1);
+    assert_call_end_status(&reply, CallStatus::Failed);
     assert!(f.completed.load(Ordering::SeqCst));
     assert_eq!(f.calls.load(Ordering::SeqCst), 1);
-    assert_eq!(
-        reply_error_code(&reply),
-        ErrorCode::ResourceOutputSerializing
-    );
+    assert_eq!(reply_error_code(&reply), ErrorCode::CallCapacityExceeded);
     assert!(reply_error_message(&reply).contains("write buffer allocation failure"));
     f.server.request_shutdown_signal();
     f.runner.take().unwrap().await.unwrap().unwrap();

@@ -251,7 +251,11 @@ fn route_watch_unavailable_response_budgeted(
         StatusCode::SERVICE_UNAVAILABLE,
         c2_error::ErrorCode::RouteWatchUnavailable,
         format!("route watch unavailable for {route_name}"),
-        [("route", route_name.to_string()), ("reason", reason.into())],
+        [
+            ("route", route_name.to_string()),
+            ("reason", reason.into()),
+            ("dispatch_phase", "pre_dispatch".to_string()),
+        ],
         budget,
     )
 }
@@ -2750,9 +2754,9 @@ mod tests {
     use tower::ServiceExt;
 
     use crate::relay::test_support::{
-        register_echo_route, reserve_echo_route, shutdown_live_server, start_live_server,
-        start_live_server_with_identity_and_contracts, start_live_server_with_routes,
-        test_state_for_client,
+        NoopDisseminator, register_echo_route, reserve_echo_route, shutdown_live_server,
+        start_live_server, start_live_server_with_identity_and_contracts,
+        start_live_server_with_routes, test_state_for_client,
     };
     use crate::relay::types::{Locality, RouteEntry, RouteInfo};
 
@@ -6584,16 +6588,44 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn relay_probe_does_not_trust_cached_data_plane_after_control_watch_unavailable() {
-        let state = test_state_for_client();
+    async fn relay_watch_unavailability_refuses_calls_before_dispatch() {
+        #[cfg(unix)]
+        let root = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        let context = c2_config::LocalEndpointContext::with_unix_root(root.path()).unwrap();
+        #[cfg(windows)]
+        let context = c2_config::LocalEndpointContext::default_for_platform().unwrap();
+        let state = Arc::new(RelayState::new_with_context(
+            Arc::new(c2_config::RelayConfig::default()),
+            Arc::new(NoopDisseminator),
+            context.clone(),
+        ));
         let address = format!(
             "ipc://relay_watch_unavailable_cached_probe_{}_{}",
             std::process::id(),
             unique_suffix()
         );
-        let server = start_live_server(&address, "server-grid").await;
+        let endpoint = context.endpoint(&address).unwrap();
+        let server = Arc::new(
+            Server::new_with_identity_and_endpoint(
+                endpoint.clone(),
+                ServerIpcConfig::default(),
+                ServerIdentity {
+                    server_id: "server-grid".into(),
+                    server_instance_id: "server-grid-instance".into(),
+                },
+            )
+            .unwrap(),
+        );
+        register_echo_route(&server, "grid").await;
+        let running = server.clone();
+        tokio::spawn(async move { running.run().await.unwrap() });
+        server
+            .wait_until_responsive(Duration::from_secs(2))
+            .await
+            .unwrap();
 
-        let mut attested = c2_ipc::IpcClient::new(&address).unwrap();
+        let mut attested = c2_ipc::IpcClient::with_endpoint(endpoint.clone()).unwrap();
         attested
             .connect()
             .await
@@ -6638,14 +6670,15 @@ mod tests {
 
         let mut stale_data_client = state
             .clients
-            .manage(|| c2_ipc::IpcClient::new(&address))
+            .manage(|| c2_ipc::IpcClient::with_endpoint(endpoint))
             .expect("stale data client admission");
         stale_data_client
             .connect()
             .await
             .expect("stale data-plane client connects");
         stale_data_client.close().await;
-        state.reconnect("grid", stale_data_client.into_shared());
+        let stale_data_client = stale_data_client.into_shared();
+        state.reconnect("grid", stale_data_client.clone());
 
         let route = state.local_route("grid").expect("relay route registered");
         let key = crate::relay::upstream_control::owner_key_for_route(&route)
@@ -6655,11 +6688,39 @@ mod tests {
         let (status, body) = get_probe_response(state.clone(), "grid").await;
 
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-        let body = String::from_utf8(body).unwrap();
-        assert!(
-            body.contains("RouteWatchUnavailable"),
-            "watch-unavailable route must not be reported as generic success or route removal: {body}"
+        let probe: c2_error::C2ErrorEnvelope = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            probe.code,
+            c2_error::ErrorCode::RouteWatchUnavailable as u16
         );
+        assert!(!probe.details.contains_key("dispatch_phase"));
+
+        for accept in ["application/octet-stream", crate::stream_wire::MEDIA_TYPE] {
+            // The preceding refusal evicted the closed carrier.
+            state.reconnect("grid", stale_data_client.clone());
+            let response = build_router(state.clone())
+                .oneshot(
+                    add_expected_echo_headers(
+                        Request::builder()
+                            .method("POST")
+                            .uri("/grid/ping")
+                            .header(header::ACCEPT, accept)
+                            .header(header::CONTENT_TYPE, "application/octet-stream"),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let refusal: c2_error::C2ErrorEnvelope = serde_json::from_slice(&body).unwrap();
+            assert_eq!(
+                refusal.code,
+                c2_error::ErrorCode::RouteWatchUnavailable as u16
+            );
+            assert_eq!(refusal.details["dispatch_phase"], "pre_dispatch");
+        }
         assert!(
             state.local_route("grid").is_some(),
             "watch unavailability alone must not withdraw the route"

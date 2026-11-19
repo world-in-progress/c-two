@@ -94,9 +94,15 @@ impl CrmStream for BytesStream {
         }
         if self.mode != 7 && self.cursor >= self.count {
             if self.mode == 1 {
-                return Err(CrmError::InternalError(
-                    "node fixture stream failure".into(),
-                ));
+                let error = c2_error::C2Error::new(
+                    c2_error::ErrorCode::ResourceFunctionExecuting,
+                    "node fixture stream failure",
+                )
+                .with_details(std::collections::BTreeMap::from([(
+                    "transport_phase".into(),
+                    "pre_dispatch".into(),
+                )]));
+                return Err(CrmError::UserError(error.to_wire_bytes()));
             }
             return Ok(None);
         }

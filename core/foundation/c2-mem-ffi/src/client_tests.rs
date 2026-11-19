@@ -6,6 +6,23 @@ use c2_core::{
 };
 use std::sync::mpsc;
 
+#[test]
+fn error_value_keeps_outer_transport_phase_when_semantic_details_disagree() {
+    let semantic =
+        C2Error::new(ErrorCode::CallCapacityExceeded, "receive budget exhausted").with_details(
+            std::collections::BTreeMap::from([("transport_phase".into(), "pre_dispatch".into())]),
+        );
+    let error = c2_core::normalize_ipc_error(
+        c2_ipc::IpcError::ResponseFailure(Box::new(c2_ipc::IpcError::LocalCallRejected(semantic))),
+        TransportPhase::DispatchUncertain,
+    );
+
+    let value = error_value(&error);
+    assert_eq!(value["transportPhase"], "dispatch_uncertain");
+    assert_eq!(value["details"]["transport_phase"], "pre_dispatch");
+    assert_eq!(value["code"], ErrorCode::CallCapacityExceeded as u32);
+}
+
 const DESCRIPTOR: &[u8] =
     include_bytes!("../../c2-contract/tests/fixtures/server-stream.contract.json");
 const WAIT: Duration = Duration::from_secs(10);

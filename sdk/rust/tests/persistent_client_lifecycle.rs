@@ -2,8 +2,8 @@
 #[path = "fixtures/persistent_client_lifecycle.rs"]
 mod fixture;
 
-use c_two::CallOptions;
 use c_two::generated::EncodedClient;
+use c_two::{CallOptions, TransportPhase};
 use fixture::{Fixture, PathKind, WAIT, observe_until};
 use std::sync::{Arc, Barrier};
 use std::time::Duration;
@@ -13,12 +13,8 @@ fn assert_pre_dispatch_route_refusal(error: c_two::Error, code: fixture::ErrorCo
         panic!("expected route refusal: {error:?}")
     };
     assert_eq!(
-        semantic
-            .details
-            .get("transport_phase")
-            .or_else(|| semantic.details.get("dispatch_phase"))
-            .map(String::as_str),
-        Some("pre_dispatch"),
+        error.transport_phase(),
+        Some(TransportPhase::PreDispatch),
         "{semantic:?}"
     );
     assert!(!semantic.details.contains_key("route_uid"));
@@ -1134,12 +1130,11 @@ fn resource_error(path: PathKind) {
     let route = fixture.register("service-error");
     let client = fixture.connect(&route);
     let physical = fixture.outgoing_ids();
-    fixture::assert_semantic(
-        client
-            .call_owned("echo", &fixture::encode("fail"))
-            .unwrap_err(),
-        fixture::ErrorCode::ResourceFunctionExecuting,
-    );
+    let error = client
+        .call_owned("echo", &fixture::encode("fail"))
+        .unwrap_err();
+    assert_eq!(error.transport_phase(), None);
+    fixture::assert_semantic(error, fixture::ErrorCode::ResourceFunctionExecuting);
     assert_eq!(route.calls(), 1);
     fixture.call(&client, &route, "caller-next-call");
     assert_eq!(route.calls(), 2);
