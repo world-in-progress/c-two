@@ -473,24 +473,21 @@ mod tests {
                                 };
                                 assert_eq!(payload, expected);
                                 // A reply the probe never read costs one more
-                                // attempt, so writing it is best effort; once
-                                // written, retain the pipe until the client
-                                // closes after consuming the reply.
-                                if stream
-                                    .write_all(&frame::encode_frame(
-                                        0,
-                                        FLAG_SIGNAL | FLAG_RESPONSE,
-                                        &reply,
-                                    ))
-                                    .await
-                                    .is_ok()
+                                // attempt, so writing it is best effort; write
+                                // raw bytes without `LocalStream::write_all`'s
+                                // Windows zero-byte flush probe (which can
+                                // race a fast client's close) and retain the
+                                // pipe until the client closes after reading.
+                                if tokio::io::AsyncWriteExt::write_all(
+                                    &mut stream,
+                                    &frame::encode_frame(0, FLAG_SIGNAL | FLAG_RESPONSE, &reply),
+                                )
+                                .await
+                                .is_ok()
                                 {
                                     tokio::select! {
                                         _ = &mut stop_rx => break,
-                                        _ = wait_for_peer_close(
-                                            &mut stream,
-                                            Duration::from_millis(200),
-                                        ) => {}
+                                        _ = wait_for_peer_close(&mut stream, FIXTURE_BUDGET) => {}
                                     }
                                 }
                             }
@@ -663,8 +660,11 @@ mod tests {
         let mut stream = listener.accept().await.unwrap();
         let (_, request) = read_reply(&mut stream).await.unwrap();
         assert_eq!(request, encode_shutdown_initiate());
-        stream
-            .write_all(&frame::encode_frame(0, flags, reply))
+        // Write the reply bytes directly without `LocalStream::write_all`'s
+        // Windows zero-byte flush probe: the client can consume the frame and
+        // close its pipe before that flush runs, and `wait_for_peer_close`
+        // below already synchronizes with the peer's post-read close.
+        tokio::io::AsyncWriteExt::write_all(&mut stream, &frame::encode_frame(0, flags, reply))
             .await
             .unwrap();
         wait_for_peer_close(&mut stream, FIXTURE_BUDGET).await;

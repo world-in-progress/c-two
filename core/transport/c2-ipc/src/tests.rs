@@ -259,6 +259,7 @@ mod endpoint_context_tests {
     use crate::{ClientPool, IpcClient};
     use c2_config::{LocalEndpointContext, LocalEndpointNamespace};
     use c2_server::{Server, ServerIpcConfig};
+    #[cfg(unix)]
     use std::time::Duration;
 
     #[test]
