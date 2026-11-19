@@ -23,6 +23,54 @@ fn error_value_keeps_outer_transport_phase_when_semantic_details_disagree() {
     assert_eq!(value["code"], ErrorCode::CallCapacityExceeded as u32);
 }
 
+#[test]
+fn call_error_value_uses_scope_phase_only_for_lifecycle_errors() {
+    let call = Call {
+        state: Mutex::new(CallData {
+            prepared: None,
+            charged: 0,
+            busy: false,
+            dispatched: false,
+            ready: false,
+            stream: None,
+            unary: None,
+            dispatch_target: None,
+            error: None,
+            consumer_done: false,
+        }),
+        scope: CallScope::new(CallOptions::with_timeout(CallTimeout::Unlimited), None).unwrap(),
+        stream_mode: false,
+        cancellation: IpcStreamCancellation::new(),
+        cancelled: AtomicBool::new(false),
+        next_active: AtomicBool::new(false),
+        changed: Notify::new(),
+    };
+    let configuration = invalid("invalid call configuration");
+    let resource_failure =
+        C2Error::new(ErrorCode::ResourceFunctionExecuting, "resource failed").into();
+    assert!(error_value(&configuration).get("transportPhase").is_none());
+    assert_eq!(
+        call_error_value(&call, &configuration)["transportPhase"],
+        "pre_dispatch"
+    );
+    assert!(
+        call_error_value(&call, &resource_failure)
+            .get("transportPhase")
+            .is_none()
+    );
+
+    call.scope.try_begin_dispatch().unwrap();
+    assert_eq!(
+        call_error_value(&call, &configuration)["transportPhase"],
+        "dispatch_uncertain"
+    );
+    assert!(
+        call_error_value(&call, &resource_failure)
+            .get("transportPhase")
+            .is_none()
+    );
+}
+
 const DESCRIPTOR: &[u8] =
     include_bytes!("../../c2-contract/tests/fixtures/server-stream.contract.json");
 const WAIT: Duration = Duration::from_secs(10);

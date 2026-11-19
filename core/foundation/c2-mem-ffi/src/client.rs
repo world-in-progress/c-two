@@ -139,15 +139,17 @@ fn error_value(error: &Error) -> Value {
 }
 fn call_error_value(call: &Call, error: &Error) -> Value {
     let mut value = error_value(error);
-    if matches!(error, Error::Lifecycle(_))
-        && matches!(
-            call.scope.state(),
+    if matches!(error, Error::Lifecycle(_)) {
+        let phase = match call.scope.state() {
+            CallState::PreDispatch
+            | CallState::FailedPreDispatch
+            | CallState::ExpiredPreDispatch => "pre_dispatch",
             CallState::Dispatched
-                | CallState::FailedDispatchUncertain
-                | CallState::ExpiredDispatchUncertain
-        )
-    {
-        value["transportPhase"] = json!("dispatch_uncertain");
+            | CallState::FailedDispatchUncertain
+            | CallState::ExpiredDispatchUncertain => "dispatch_uncertain",
+            CallState::Succeeded => return value,
+        };
+        value["transportPhase"] = json!(phase);
     }
     value
 }
