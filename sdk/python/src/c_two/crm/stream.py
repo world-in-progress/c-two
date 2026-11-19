@@ -34,17 +34,6 @@ def _native_call(operation, *args, **kwargs):
     return call(operation, *args, **kwargs)
 
 
-def _client_output_decode_error(exc: BaseException) -> error.SerializationError:
-    """Classify a stream item decode failure by its actually failing hook."""
-    code = (
-        error.ErrorCode.ClientOutputFromBuffer
-        if decode_stage_of(exc) == 'from_buffer'
-        else error.ErrorCode.ClientOutputDeserializing
-    )
-    from .transferable import _cause_details
-    return error.SerializationError(code, str(exc), details=_cause_details(exc))
-
-
 def _resource_input_decode_error(exc: BaseException) -> error.SerializationError:
     code = (
         error.ErrorCode.ResourceInputFromBuffer
@@ -95,7 +84,7 @@ class Stream(Iterator[T], Generic[T]):
 
     def __next__(self) -> T:
         from .transferable import (
-            HeldResult, _cleanup_preserving_primary,
+            HeldResult, _cleanup_preserving_primary, _client_output_error,
             _invalidate_and_release_held_response, _release_view_and_response,
         )
         item = _native_call(self._native.next_item)
@@ -107,11 +96,15 @@ class Stream(Iterator[T], Generic[T]):
             return HeldResult(value) if self._held else value
         if item is None:
             raise StopIteration
-        view = memoryview(item)
+        view = None
+        decoding = False
         decoded = False
         checking_deadline = False
         try:
+            view = memoryview(item)
+            decoding = True
             value = self._decoder(view)
+            decoding = False
             decoded = True
             checking_deadline = True
             _native_call(self._native.check_deadline)
@@ -131,10 +124,16 @@ class Stream(Iterator[T], Generic[T]):
                     view, item, self._invalidator, value))
             else:
                 _cleanup_preserving_primary(exc, lambda: _release_view_and_response(view, item))
-            if isinstance(exc, error.CCBaseError):
+            if checking_deadline:
                 raise
-            raise _client_output_decode_error(exc) from exc
-        _release_view_and_response(view, item)
+            raise _client_output_error(exc, decoding=decoding) from exc
+        try:
+            _release_view_and_response(view, item)
+        except BaseException as exc:
+            _cleanup_preserving_primary(exc, lambda: _native_call(self._native.cancel))
+            if self._invalidator is not None:
+                _cleanup_preserving_primary(exc, lambda: self._invalidator(value))
+            raise _client_output_error(exc) from exc
         return value
 
     def close(self, timeout: float | None = 30.0) -> StreamCloseReceipt:
@@ -265,6 +264,7 @@ class _ResourceStream:
                 failure = cleanup
             else:
                 _attach_cleanup_error(failure, cleanup)
+            del cleanup
         try:
             self._release_request()
         except BaseException as exc:
@@ -279,7 +279,10 @@ class _ResourceStream:
         self._args = ()
         self._factory = None
         if failure is not None:
-            raise failure
+            try:
+                raise failure
+            finally:
+                del failure
 
 
 def _build_stream_wrapper(func, input_binding, output_binding):
@@ -325,25 +328,33 @@ def _build_stream_wrapper(func, input_binding, output_binding):
                     _c2_follow_budget=budget, **kwargs,
                 )
             return Stream._from_objects(native, held=_c2_buffer == 'hold')
+        from .transferable import _cleanup_preserving_primary, _client_input_error
+
         prepared = client.begin_stream(method_name)
+        primary = None
         try:
+            if input_binding.kind is PayloadPlanKind.FASTDB:
+                try:
+                    nbytes = values[0].execution_report().used_bytes
+                except BaseException as exc:
+                    raise _client_input_error(exc) from exc
+                prepared.charge_input(nbytes)
             try:
-                if input_binding.kind is PayloadPlanKind.FASTDB:
-                    prepared.charge_input(values[0].execution_report().used_bytes)
                 data = input_binding.serialize(*values) if input_binding.serialize is not None else b''
-            except error.CCBaseError:
-                raise
             except BaseException as exc:
-                from .transferable import _cause_details
-                raise error.SerializationError(
-                    error.ErrorCode.ClientInputSerializing,
-                    str(exc),
-                    details=_cause_details(exc),
-                    transport_phase='pre_dispatch',
-                ) from exc
+                raise _client_input_error(exc) from exc
             native = _native_call(prepared.stream, data)
+        except BaseException as exc:
+            primary = exc
+            raise
         finally:
-            prepared.close()
+            try:
+                if primary is None:
+                    prepared.close()
+                else:
+                    _cleanup_preserving_primary(primary, prepared.close)
+            finally:
+                del primary
         return Stream._from_encoded(
             native, output_binding.deserialize, held=_c2_buffer == 'hold',
             tracker=client.local_copy_tracker, route_name=client.route_name,

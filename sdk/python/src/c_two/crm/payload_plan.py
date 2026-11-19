@@ -197,8 +197,10 @@ def fastdb_payload_binding(
         try:
             owner.require_spec_sha256(digest)
         except BaseException as exc:
+            from .transferable import _cleanup_preserving_primary
+
             _tag_decode_stage(exc, DECODE_STAGE_DESERIALIZE)
-            owner.close()
+            _cleanup_preserving_primary(exc, owner.close)
             raise
         return owner
 

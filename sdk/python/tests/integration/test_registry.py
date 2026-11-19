@@ -259,6 +259,7 @@ class TestRegisterConnect:
             with pytest.raises(cc.error.ResourceClosed, match="route 'hello' is closed") as failure:
                 crm.greeting('World')
             assert failure.value.details == {'route': 'hello'}
+            assert failure.value.transport_phase == 'pre_dispatch'
             assert resource.calls == 1
         finally:
             cc.close(crm)
@@ -511,13 +512,16 @@ class TestRegisterConnect:
         with pytest.raises(ValueError, match='decorate it with @cc.crm'):
             cc.connect(UndecoratedHello, name='hello')
 
-    def test_connect_ipc(self):
-        """IPC connect via explicit address returns ipc-mode proxy."""
+    @pytest.mark.parametrize('relay_address', ['', 'http://127.0.0.1:9'])
+    def test_connect_ipc(self, relay_address, monkeypatch):
+        """Explicit IPC works with an unset or unavailable relay."""
         cc.register(Hello, HelloImpl(), name='hello')
         addr = cc.server_address()
         assert addr is not None
 
-        crm = cc.connect(Hello, name='hello', address=addr)
+        monkeypatch.setenv('C2_RELAY_ANCHOR_ADDRESS', relay_address)
+        client = Runtime()
+        crm = client.connect(Hello, name='hello', address=addr)
         try:
             assert crm.client.supports_direct_call is False
             assert crm.client._mode == 'ipc'
@@ -525,6 +529,7 @@ class TestRegisterConnect:
             assert result == 'Hello, IPC!'
         finally:
             cc.close(crm)
+            client.shutdown()
 
     def test_connect_ipc_rejects_crm_contract_mismatch(self):
         cc.register(Hello, HelloImpl(), name='hello')

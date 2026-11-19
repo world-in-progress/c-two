@@ -24,6 +24,7 @@ from ...crm.contract import (
 from ...crm.methods import rpc_method_names
 from ...crm.meta import MethodAccess, get_method_access, get_shutdown_method
 from ...crm.payload_plan import PayloadPlanKind
+from ...crm.transferable import _cleanup_preserving_primary, _release_view_and_response
 from ...error import CoreError, ResourceAlreadyRegistered
 from ..input_lifetime import (
     _InputLifetime,
@@ -263,7 +264,10 @@ class NativeServerBridge:
                 if semantic is not None:
                     # Keep the canonical relay refusal message; the native
                     # CoreError stays observable as the direct cause.
-                    raise semantic from exc
+                    try:
+                        raise semantic from exc
+                    finally:
+                        del semantic
                 if getattr(exc, 'status_code', None) == 409:
                     raise ValueError(str(exc)) from exc
                 raise
@@ -463,9 +467,8 @@ class NativeServerBridge:
             def release_fn():
                 nonlocal released
                 if not released:
-                    mv.release()
-                    request_buf.release()
                     released = True
+                    _release_view_and_response(mv, request_buf)
 
             if is_stream:
                 if buffer_mode == 'borrowed' and local_copy_tracker is not None:
@@ -498,11 +501,11 @@ class NativeServerBridge:
                         _release_fn=release_fn,
                         _c2_input_buffer_mode=buffer_mode,
                     )
-                except Exception:
+                except BaseException as exc:
                     if not released:
-                        release_fn()
+                        _cleanup_preserving_primary(exc, release_fn)
                     raise
-                if buffer_mode == 'borrowed' and not released:
+                if not released:
                     release_fn()
 
             # 3. crm_to_com returns serialized bytes (or None for an empty

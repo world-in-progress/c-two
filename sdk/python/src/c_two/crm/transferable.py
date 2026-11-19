@@ -71,6 +71,9 @@ class HeldResult(Generic[R]):
         if self._released:
             return
 
+        self._release_python_buffer()
+
+    def _release_python_buffer(self) -> None:
         self._released = True
         release_cb = self._release_cb
         invalidate_cb = self._invalidate_cb
@@ -85,19 +88,28 @@ class HeldResult(Generic[R]):
                 invalidate_cb(value)
             except BaseException as exc:
                 first_error = exc
+        view, self._buffer = self._buffer, None
+        if view is not None:
+            try:
+                view.release()
+            except BaseException as exc:
+                if first_error is None:
+                    first_error = exc
+                else:
+                    _attach_cleanup_error(first_error, exc)
         try:
             if release_cb is not None:
                 release_cb()
         except BaseException as exc:
             if first_error is None:
-                first_error = exc
-            else:
-                _attach_cleanup_error(first_error, exc)
-        finally:
-            self._buffer = None
+                raise
+            _attach_cleanup_error(first_error, exc)
 
         if first_error is not None:
-            raise first_error
+            try:
+                raise _client_output_error(first_error) from first_error
+            finally:
+                del first_error
 
     def _release_native_response(self) -> None:
         response = self._native_response
@@ -130,7 +142,10 @@ class HeldResult(Generic[R]):
                 self._native_response = None
 
         if first_error is not None:
-            raise first_error
+            try:
+                raise _client_output_error(first_error) from first_error
+            finally:
+                del first_error
 
     def __enter__(self) -> HeldResult[R]:
         return self
@@ -235,8 +250,8 @@ def _build_transfer_wrapper(
     method_signature = inspect.signature(func)
 
     def com_to_crm(*args, _c2_buffer=None, _c2_follow_budget=None):
-        stage = "call_crm"
         prepared = None
+        primary = None
         input_serializer = (
             input.serialize
             if input is not None and input.kind is not PayloadPlanKind.NO_PAYLOAD
@@ -269,34 +284,28 @@ def _build_transfer_wrapper(
                     client = client.snapshot_followed_target(target)
         budget = _c2_follow_budget
 
+        request = args[1:] if len(args) > 1 else None
+        if getattr(client, "supports_direct_call", False):
+            from ..transport.client.proxy import _LocalRouteClosed
+            try:
+                result = client.call_direct(method_name, request or ())
+            except _LocalRouteClosed:
+                if budget is None:
+                    budget = crm.client.start_call_budget()
+                return com_to_crm(
+                    *args, _c2_buffer=_c2_buffer, _c2_follow_budget=budget,
+                )
+            except error.CCBaseError:
+                raise
+            except Exception as exc:
+                raise error.ResourceExecutionError(str(exc), details=_cause_details(exc)) from exc
+            return HeldResult(result) if _c2_buffer == "hold" else result
+
+        # Reserve before running Python serializer hooks; native preparation owns D.
+        prepare_call = getattr(client, "prepare_call", None)
+        if callable(prepare_call):
+            prepared = prepare_call(method_name)
         try:
-            request = args[1:] if len(args) > 1 else None
-
-            if getattr(client, "supports_direct_call", False):
-                stage = "execute_direct"
-                try:
-                    result = client.call_direct(method_name, request or ())
-                except Exception as exc:
-                    from ..transport.client.proxy import _LocalRouteClosed
-                    if not isinstance(exc, _LocalRouteClosed):
-                        raise
-                    if budget is None:
-                        budget = crm.client.start_call_budget()
-                    return com_to_crm(
-                        *args, _c2_buffer=_c2_buffer,
-                        _c2_follow_budget=budget,
-                    )
-                if _c2_buffer == "hold":
-                    return HeldResult(result)
-                return result
-
-            # Both bound calls and CRM.method(instance, ...) enter here. Reserve
-            # before running Python serializer hooks; native preparation owns D.
-            prepare_call = getattr(client, "prepare_call", None)
-            if callable(prepare_call):
-                prepared = prepare_call(method_name)
-
-            stage = "serialize_input"
             if (
                 prepared is not None
                 and input is not None
@@ -304,138 +313,87 @@ def _build_transfer_wrapper(
                 and request is not None
                 and len(request) == 1
             ):
-                if isinstance(request[0], _payload_type(required=True)):
-                    # Metadata may reject an invalid owner and belongs to the
-                    # same input-error boundary as the serializer itself.
-                    prepared.charge_input(request[0].execution_report().used_bytes)
-            serialized_args = (
-                input_serializer(*request)
-                if request is not None and input_serializer is not None
-                else None
-            )
+                try:
+                    nbytes = (
+                        request[0].execution_report().used_bytes
+                        if isinstance(request[0], _payload_type(required=True))
+                        else None
+                    )
+                except BaseException as exc:
+                    raise _client_input_error(exc) from exc
+                if nbytes is not None:
+                    prepared.charge_input(nbytes)
+            try:
+                serialized_args = (
+                    input_serializer(*request)
+                    if request is not None and input_serializer is not None
+                    else None
+                )
+            except BaseException as exc:
+                raise _client_input_error(exc) from exc
 
-            stage = "call_crm"
             call_client = client if prepared is None else prepared
             response = call_client.call(method_name, serialized_args)
 
-            stage = "deserialize_output"
-            if output_decoder is None:
-                _release_response(response)
-                if _c2_buffer == "hold":
-                    return HeldResult(None)
-                return None
-
-            if hasattr(response, "release"):
-                view = memoryview(response)
+            view = None
+            decoded = False
+            decoding = False
+            try:
+                native_response = hasattr(response, "release")
+                if output_decoder is None:
+                    _release_response(response)
+                    return HeldResult(None) if _c2_buffer == "hold" else None
+                if native_response or retained_owner:
+                    view = memoryview(response)
+                decoding = True
+                result = output_decoder(view if view is not None else response)
+                decoding = False
+                decoded = True
                 if retained_owner:
-                    result_ready = False
-                    try:
-                        result = output_decoder(view)
-                        result_ready = True
-                        if hasattr(response, "track_retained"):
-                            tracker = getattr(client, "local_copy_tracker", None)
-                            if tracker is not None:
-                                response.track_retained(
-                                    tracker,
-                                    getattr(client, "route_name", ""),
-                                    method_name,
-                                    "client_response",
-                                )
-                    except BaseException as exc:
-                        if (
-                            result_ready
-                            and output is not None
-                            and output.invalidate is not None
-                        ):
-                            _cleanup_preserving_primary(
-                                exc,
-                                lambda: _invalidate_and_release_held_response(
-                                    view,
-                                    response,
-                                    output.invalidate,
-                                    result,
-                                ),
+                    if hasattr(response, "track_retained"):
+                        tracker = getattr(client, "local_copy_tracker", None)
+                        if tracker is not None:
+                            response.track_retained(
+                                tracker, getattr(client, "route_name", ""),
+                                method_name, "client_response",
                             )
-                        else:
-                            _cleanup_preserving_primary(
-                                exc,
-                                lambda: _release_view_and_response(view, response),
-                            )
-                        raise
-
                     held = HeldResult(result, buffer=view, invalidate_cb=output.invalidate)
-                    held._native_response = response
+                    if native_response:
+                        held._native_response = response
                     return held
-
-                try:
-                    result = output_decoder(view)
-                except BaseException as exc:
+            except BaseException as exc:
+                if decoded and output is not None and output.invalidate is not None:
                     _cleanup_preserving_primary(
-                        exc,
-                        lambda: _release_view_and_response(view, response),
+                        exc, lambda: _invalidate_and_release_held_response(
+                            view, response, output.invalidate, result,
+                        ),
                     )
-                    raise
+                elif output_decoder is not None:
+                    _cleanup_preserving_primary(
+                        exc, lambda: _release_view_and_response(view, response),
+                    )
+                raise _client_output_error(exc, decoding=decoding) from exc
+
+            if native_response:
                 try:
                     _release_view_and_response(view, response)
                 except BaseException as exc:
                     if output is not None and output.invalidate is not None:
-                        _cleanup_preserving_primary(
-                            exc,
-                            lambda: output.invalidate(result),
-                        )
-                    raise
-            elif retained_owner:
-                view = memoryview(response)
-                try:
-                    result = output_decoder(view)
-                except BaseException as exc:
-                    _cleanup_preserving_primary(exc, view.release)
-                    raise
-
-                return HeldResult(
-                    result,
-                    view.release,
-                    buffer=view,
-                    invalidate_cb=output.invalidate,
-                )
-            else:
-                result = output_decoder(response)
-
-            if _c2_buffer == "hold":
-                return HeldResult(result)
-            return result
-
-        except error.CCBaseError:
-            # Native Core failures (CoreError with or without a semantic
-            # payload) and business CCError instances pass through unchanged;
-            # they are never re-wrapped into a client adapter code.
+                        _cleanup_preserving_primary(exc, lambda: output.invalidate(result))
+                    raise _client_output_error(exc) from exc
+            return HeldResult(result) if _c2_buffer == "hold" else result
+        except BaseException as exc:
+            primary = exc
             raise
-        except Exception as exc:
-            details = _cause_details(exc)
-            if stage == "serialize_input":
-                # The call has not been sent yet: a client input encoding
-                # failure is retry-safe pre-dispatch.
-                raise error.SerializationError(
-                    error.ErrorCode.ClientInputSerializing,
-                    str(exc),
-                    details=details,
-                    transport_phase='pre_dispatch',
-                ) from exc
-            if stage == "execute_direct":
-                raise error.ResourceExecutionError(str(exc), details=details) from exc
-            if stage == "call_crm":
-                raise
-            # Output decoding: the failing payload hook decides the code —
-            # opening the buffer view (from_buffer) versus decoding content.
-            code = (
-                error.ErrorCode.ClientOutputFromBuffer
-                if decode_stage_of(exc) == 'from_buffer'
-                else error.ErrorCode.ClientOutputDeserializing
-            )
-            raise error.SerializationError(code, str(exc), details=details) from exc
         finally:
-            if prepared is not None:
-                prepared.close()
+            try:
+                if prepared is not None:
+                    if primary is None:
+                        prepared.close()
+                    else:
+                        _cleanup_preserving_primary(primary, prepared.close)
+            finally:
+                del primary
 
     def crm_to_com(
         *args,
@@ -464,14 +422,15 @@ def _build_transfer_wrapper(
         deserialized_args: tuple[object, ...] = ()
 
         def release_input_buffer() -> None:
-            nonlocal _release_fn
+            nonlocal _release_fn, deserialized_args
             first_error: BaseException | None = None
             if (
                 input_buffer_mode == "borrowed"
                 and input is not None
                 and input.invalidate is not None
             ):
-                for value in deserialized_args:
+                values, deserialized_args = deserialized_args, ()
+                for value in values:
                     try:
                         input.invalidate(value)
                     except BaseException as exc:
@@ -488,7 +447,10 @@ def _build_transfer_wrapper(
                     else:
                         _attach_cleanup_error(first_error, exc)
             if first_error is not None:
-                raise first_error
+                try:
+                    raise first_error
+                finally:
+                    del first_error
 
         try:
             if len(args) < 1:
@@ -517,51 +479,54 @@ def _build_transfer_wrapper(
 
             stage = "execute_function"
             result = resource_method(*deserialized_args)
-        except Exception as exc:
-            # The input lease must end before the failure crosses the
-            # dispatch boundary; the primary error always leads cleanup.
-            _cleanup_preserving_primary(exc, release_input_buffer)
+        except BaseException as exc:
             if stage == "deserialize_input":
                 code = (
                     error.ErrorCode.ResourceInputFromBuffer
                     if decode_stage_of(exc) == 'from_buffer'
                     else error.ErrorCode.ResourceInputDeserializing
                 )
-                raise error.SerializationError(
-                    code, str(exc), details=_cause_details(exc),
-                ) from exc
-            # A business error raised by the resource keeps its semantic
-            # code, message and details; inner dispatch phases describe the
-            # inner call only and are cleared on the fresh projection.
-            clean = (
-                error._callback_semantic_copy(exc)
-                if isinstance(exc, error.CCBaseError)
-                else None
-            )
-            if clean is not None:
-                raise clean from exc
-            raise error.ResourceExecutionError(
-                str(exc), details=_cause_details(exc),
-            ) from exc
+                failure = error.SerializationError(code, str(exc), details=_cause_details(exc))
+            else:
+                failure = (
+                    error._callback_semantic_copy(exc)
+                    if isinstance(exc, error.CCBaseError)
+                    else None
+                )
+                if failure is None:
+                    failure = error.ResourceExecutionError(str(exc), details=_cause_details(exc))
+            try:
+                raise failure from exc
+            finally:
+                try:
+                    _cleanup_preserving_primary(failure, release_input_buffer)
+                finally:
+                    del failure
 
         serialized_result = b""
         if output_serializer is not None:
             try:
                 serialized_result = output_serializer(result)
-            except Exception as exc:
-                _cleanup_preserving_primary(exc, release_input_buffer)
-                raise error.SerializationError(
+            except BaseException as exc:
+                failure = error.SerializationError(
                     error.ErrorCode.ResourceOutputSerializing,
                     str(exc),
                     details=_cause_details(exc),
-                ) from exc
+                )
+                try:
+                    raise failure from exc
+                finally:
+                    try:
+                        _cleanup_preserving_primary(failure, release_input_buffer)
+                    finally:
+                        del failure
 
-        if _release_fn is not None:
+        if _release_fn is not None or input_buffer_mode == "borrowed":
             # Borrowed inputs invalidate only after their output serialization
             # completed; this is their single release point.
             try:
                 release_input_buffer()
-            except Exception as exc:
+            except BaseException as exc:
                 raise error.SerializationError(
                     error.ErrorCode.ResourceInputFromBuffer,
                     str(exc),
@@ -713,10 +678,11 @@ def _release_response(response: object) -> None:
         release()
 
 
-def _release_view_and_response(view: memoryview, response: object) -> None:
+def _release_view_and_response(view: memoryview | None, response: object) -> None:
     first_error: BaseException | None = None
     try:
-        view.release()
+        if view is not None:
+            view.release()
     except BaseException as exc:
         first_error = exc
     try:
@@ -727,18 +693,22 @@ def _release_view_and_response(view: memoryview, response: object) -> None:
         else:
             _attach_cleanup_error(first_error, exc)
     if first_error is not None:
-        raise first_error
+        try:
+            raise first_error
+        finally:
+            del first_error
 
 
 def _invalidate_and_release_held_response(
-    view: memoryview,
+    view: memoryview | None,
     response: object,
     invalidator: Callable[[object], None],
     value: object,
 ) -> None:
     first_error: BaseException | None = None
     try:
-        view.release()
+        if view is not None:
+            view.release()
     except BaseException as exc:
         first_error = exc
 
@@ -768,7 +738,10 @@ def _invalidate_and_release_held_response(
                 _attach_cleanup_error(first_error, exc)
 
     if first_error is not None:
-        raise first_error
+        try:
+            raise first_error
+        finally:
+            del first_error
 
 
 def _cleanup_preserving_primary(
@@ -779,6 +752,8 @@ def _cleanup_preserving_primary(
         cleanup()
     except BaseException as cleanup_error:
         _attach_cleanup_error(primary, cleanup_error)
+    finally:
+        del primary
 
 
 def _attach_cleanup_error(primary: BaseException, cleanup: BaseException) -> None:
@@ -804,6 +779,26 @@ def _attach_cleanup_error(primary: BaseException, cleanup: BaseException) -> Non
         BaseException.add_note(
             primary, f"C-Two cleanup also failed: {type(cleanup).__name__}: {cleanup}",
         )
+
+
+def _client_input_error(exc: BaseException) -> error.SerializationError:
+    return error.SerializationError(
+        error.ErrorCode.ClientInputSerializing,
+        str(exc),
+        details=_cause_details(exc),
+        transport_phase='pre_dispatch',
+    )
+
+
+def _client_output_error(
+    exc: BaseException, *, decoding: bool = False,
+) -> error.SerializationError:
+    code = error.ErrorCode.ClientOutputFromBuffer
+    if decoding and decode_stage_of(exc) != 'from_buffer':
+        code = error.ErrorCode.ClientOutputDeserializing
+    return error.SerializationError(
+        code, str(exc), details=_cause_details(exc), transport_phase=None,
+    )
 
 
 def _cause_details(exc: BaseException) -> dict[str, str]:

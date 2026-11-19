@@ -102,8 +102,12 @@ class TestHeldResultBasic:
 
         held = HeldResult('value')
         held._native_response = Response()
-        with pytest.raises(BufferError, match='another export'):
+        from c_two.error import ErrorCode, SerializationError
+
+        with pytest.raises(SerializationError, match='another export') as failure:
             held.release()
+        assert failure.value.code == ErrorCode.ClientOutputFromBuffer
+        assert isinstance(failure.value.__cause__, BufferError)
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter('always')
             held.__del__()
@@ -168,8 +172,12 @@ class TestHeldResultBasic:
             invalidate_cb=invalidate,
         )
 
-        with pytest.raises(RuntimeError, match='invalidate failed'):
+        from c_two.error import ErrorCode, SerializationError
+
+        with pytest.raises(SerializationError, match='invalidate failed') as failure:
             held.release()
+        assert failure.value.code == ErrorCode.ClientOutputFromBuffer
+        assert failure.value.transport_phase is None
 
         assert events == ['invalidate', 'release']
         with pytest.raises(RuntimeError, match='no longer accessible'):
@@ -197,16 +205,19 @@ class TestHeldResultBasic:
                 raise RuntimeError('cleanup failed')
 
         held = HeldResult('value', release_cb=release, invalidate_cb=invalidate)
-        with pytest.raises(ValueError, match='invalidator failed') as raised:
+        from c_two.error import SerializationError
+
+        with pytest.raises(SerializationError, match='invalidator failed') as raised:
             held.release()
-        assert raised.value.__cause__ is original
-        assert isinstance(raised.value.__context__, RuntimeError)
-        assert str(raised.value.__context__) == 'cleanup failed'
-        assert isinstance(raised.value.__context__.__context__, OSError)
-        assert raised.value.__context__.__context__.__context__ is original_context
+        primary = raised.value.__cause__
+        assert isinstance(primary, ValueError)
+        assert primary.__cause__ is original
+        assert isinstance(primary.__context__, RuntimeError)
+        assert str(primary.__context__) == 'cleanup failed'
+        assert isinstance(primary.__context__.__context__, OSError)
+        assert primary.__context__.__context__.__context__ is original_context
         if sys.version_info >= (3, 11):
-            assert 'cleanup failed' in ''.join(traceback.format_exception(raised.value))
-            assert any('cleanup failed' in note for note in raised.value.__notes__)
+            assert any('cleanup failed' in note for note in primary.__notes__)
         held.release()
         assert calls == ['invalidate', 'release']
 

@@ -1,6 +1,7 @@
 """Phase-3 error convergence coverage: decode stages, closed proxies, generated clients."""
 from __future__ import annotations
 
+from collections.abc import Iterator
 import importlib.util
 import json
 from pathlib import Path
@@ -16,9 +17,8 @@ from c_two.error import (
     CCBaseError, CCError, CallCapacityExceeded, CallDeadlineExceeded, CoreError,
     ErrorCode, ResourceClosed, ResourceNotFound, SerializationError,
 )
-from fastdb4py.payload import BuildPolicy, Builder, CompiledSpec
-
 pytest.importorskip("fastdb4py.payload")
+from fastdb4py.payload import BuildPolicy, Builder, CompiledSpec
 
 ECHO_SPEC = {
     "schema": "fastdb.payload.v1",
@@ -269,6 +269,7 @@ def _semantic_core(code: ErrorCode, message: str, details=None) -> CoreError:
     core.details = dict(details or {})
     core.semantic_message = message
     core._transport_phase = 'pre_dispatch'
+    core._semantic_snapshot = (int(code), message, tuple(core.details.items()), core.transport_phase)
     return core
 
 
@@ -460,3 +461,162 @@ class TestGeneratedContractClientStreamProjection:
             client.method_1_echo(payload)
         assert refused.value is typed
         assert refused.value.__cause__ is None
+
+
+@cc.crm(namespace='test.codec_error_boundaries', version='0.1.0')
+class CodecBoundary:
+    def echo(self, value: object) -> object: ...
+
+    @cc.stream
+    def steps(self, value: object) -> Iterator[object]: ...
+
+
+class _CodecBoundaryResource:
+    def __init__(self):
+        self.calls = 0
+
+    def echo(self, value):
+        self.calls += 1
+        return _OutputReconstruction()
+
+    def steps(self, value):
+        yield self.echo(value)
+
+
+_closed_connection = None
+
+
+def _call_closed_connection():
+    return _closed_connection.echo(None)
+
+
+class _OutputReconstruction:
+    def __reduce__(self):
+        return _call_closed_connection, ()
+
+
+class _InputReduction:
+    def __reduce__(self):
+        _call_closed_connection()
+
+
+@pytest.mark.parametrize('method', ['echo', 'steps'])
+def test_pickle_hooks_cannot_leak_downstream_dispatch_phase(method, monkeypatch):
+    runtime = cc.Runtime()
+    resource = _CodecBoundaryResource()
+    runtime.register(CodecBoundary, resource, name='codec-boundary')
+    closed = runtime.connect(CodecBoundary, name='codec-boundary')
+    cc.close(closed)
+    monkeypatch.setattr(sys.modules[__name__], '_closed_connection', closed)
+    ipc = runtime.connect(CodecBoundary, name='codec-boundary', address=runtime.server_address())
+    try:
+        call = getattr(ipc, method)
+        with pytest.raises(SerializationError) as encoded:
+            call(_InputReduction())
+        assert encoded.value.code == ErrorCode.ClientInputSerializing
+        assert encoded.value.transport_phase == 'pre_dispatch'
+        assert isinstance(encoded.value.__cause__, ResourceClosed)
+        assert resource.calls == 0
+
+        stream = call(None) if method == 'steps' else None
+        try:
+            with pytest.raises(SerializationError) as decoded:
+                if stream is None:
+                    call(None)
+                else:
+                    next(stream)
+            assert decoded.value.code == ErrorCode.ClientOutputDeserializing
+            assert decoded.value.transport_phase is None
+            assert isinstance(decoded.value.__cause__, ResourceClosed)
+            assert decoded.value.__cause__.transport_phase == 'pre_dispatch'
+            assert resource.calls == 1
+        finally:
+            if stream is not None:
+                assert stream.close()['completed']
+    finally:
+        cc.close(ipc)
+        runtime.shutdown()
+
+
+@pytest.mark.parametrize('method', ['echo', 'steps'])
+@pytest.mark.parametrize('use_core_error', [False, True])
+def test_resource_error_projection_matches_local_and_ipc(method, use_core_error, monkeypatch):
+    from c_two import _native
+
+    controls = {
+        'transport_phase': 'pre_dispatch', 'dispatch_phase': 'pre_dispatch',
+        'fallback_eligible': 'true', 'route_withdrawal': 'true',
+    }
+    if use_core_error:
+        with pytest.raises(CoreError) as caught:
+            _native.ConnectAttempt(timeout_seconds=0)
+        primary = caught.value
+        expected = primary.semantic
+        primary.code = int(ErrorCode.ResourceClosed)
+        primary.semantic_message = 'changed diagnostic'
+        primary.details.update(controls)
+    else:
+        primary = CallDeadlineExceeded('business', details={**controls, 'marker': 'keep'})
+        expected = CallDeadlineExceeded('business', details={'marker': 'keep'})
+
+    def fail(value):
+        raise primary
+
+    runtime = cc.Runtime()
+    resource = _CodecBoundaryResource()
+    monkeypatch.setattr(resource, 'echo', fail)
+    runtime.register(CodecBoundary, resource, name='resource-error')
+    local = runtime.connect(CodecBoundary, name='resource-error')
+    ipc = runtime.connect(CodecBoundary, name='resource-error', address=runtime.server_address())
+    try:
+        for proxy in (local, ipc):
+            stream = proxy.steps(None) if method == 'steps' else None
+            try:
+                with pytest.raises(CallDeadlineExceeded) as caught:
+                    if stream is None:
+                        proxy.echo(None)
+                    else:
+                        next(stream)
+                projected = caught.value
+                assert projected.transport_phase is None
+                assert projected.message == expected.message
+                assert projected.details == {
+                    key: value for key, value in expected.details.items() if key not in controls
+                }
+                if proxy is local and method == 'echo':
+                    assert projected.__cause__ is primary
+                    if isinstance(primary, CoreError):
+                        assert primary.fallback_eligible is False
+                elif isinstance(projected.__cause__, CoreError):
+                    assert projected.__cause__.fallback_eligible is None
+                    assert projected.__cause__.route_withdrawal is None
+            finally:
+                if stream is not None:
+                    assert stream.close()['completed']
+    finally:
+        cc.close(ipc)
+        cc.close(local)
+        runtime.shutdown()
+
+
+def test_stream_buffer_open_failure_releases_item_and_cancels():
+    class BrokenBuffer:
+        release_calls = 0
+
+        def release(self):
+            self.release_calls += 1
+
+    item = BrokenBuffer()
+    native = _FakeNativeStream([item])
+    stream = Stream._from_encoded(native, pickle_should_not_decode)
+    with pytest.raises(SerializationError) as failure:
+        next(stream)
+    assert failure.value.code == ErrorCode.ClientOutputFromBuffer
+    assert failure.value.transport_phase is None
+    assert isinstance(failure.value.__cause__, TypeError)
+    assert native.cancelled
+    assert item.release_calls == 1
+
+
+def pickle_should_not_decode(_value):
+    raise AssertionError('could not open the stream item buffer')

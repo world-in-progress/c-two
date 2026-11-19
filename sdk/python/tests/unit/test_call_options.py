@@ -219,6 +219,9 @@ def test_entry_refusal_preserves_canonical_phase_and_never_serializes(error_clas
             core.details = dict(refusal.details)
             core.semantic_message = refusal.message
             core._transport_phase = 'pre_dispatch'
+            core._semantic_snapshot = (
+                core.code, refusal.message, tuple(core.details.items()), core.transport_phase,
+            )
             raise core
 
     connection = OptionsContract()
@@ -304,16 +307,11 @@ def test_report_failure_uses_serializer_boundary_and_releases_preparation(portab
         raise primary
 
     monkeypatch.setattr(Payload, 'execution_report', fail_report)
-    expected = cc.error.CallCapacityExceeded if canonical else cc.error.SerializationError
-    with pytest.raises(expected) as failure:
+    with pytest.raises(cc.error.SerializationError) as failure:
         invoke(connection, source)
-    if canonical:
-        assert failure.value is primary
-        assert failure.value.transport_phase == 'pre_dispatch'
-    else:
-        assert failure.value.code == cc.error.ErrorCode.ClientInputSerializing
-        assert failure.value.transport_phase == 'pre_dispatch'
-        assert failure.value.__cause__ is primary
+    assert failure.value.code == cc.error.ErrorCode.ClientInputSerializing
+    assert failure.value.transport_phase == 'pre_dispatch'
+    assert failure.value.__cause__ is primary
     assert native.operations == native.bytes == 0
     assert [stage for stage, _ in events] == ['close']
 
@@ -343,3 +341,51 @@ def test_closed_remote_view_refusal_is_pre_dispatch_and_never_serializes(invoke)
     assert failure.value.message == 'CRM proxy is closed'
     assert failure.value.transport_phase == 'pre_dispatch'
     assert events == []
+
+
+@pytest.mark.parametrize('stream', [False, True], ids=['unary', 'stream'])
+def test_prepared_close_keeps_native_dispatch_failure_as_primary(stream):
+    from collections.abc import Iterator
+
+    from c_two.crm.payload_plan import no_payload_binding, python_pickle_output_binding
+    from c_two.crm.transferable import _build_transfer_wrapper
+
+    dispatched = cc.error.ResourceClosed('route closed', transport_phase='pre_dispatch')
+    close_calls = []
+
+    class PreparedCall:
+        def call(self, _method, _data):
+            raise dispatched
+
+        def stream(self, _data):
+            raise dispatched
+
+        def close(self):
+            close_calls.append('close')
+            raise RuntimeError('close failed')
+
+    class Client:
+        supports_direct_call = False
+
+        def prepare_call(self, _method):
+            return PreparedCall()
+
+        begin_stream = prepare_call
+
+    class Contract:
+        direction = '->'
+        client = Client()
+
+    def fetch(self) -> object: ...
+    def steps(self) -> Iterator[object]: ...
+
+    method = cc.stream(steps) if stream else fetch
+    wrapped = _build_transfer_wrapper(
+        method, input=no_payload_binding(), output=python_pickle_output_binding(method),
+    )
+    with pytest.raises(cc.error.ResourceClosed) as caught:
+        wrapped(Contract())
+    assert caught.value is dispatched
+    assert caught.value.transport_phase == 'pre_dispatch'
+    assert str(caught.value.__context__) == 'close failed'
+    assert close_calls == ['close']

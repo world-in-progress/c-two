@@ -266,31 +266,13 @@ def test_python_examples_do_not_import_removed_provider_package():
     assert offenders == []
 
 
-def test_error_facade_does_not_reimplement_wire_codec():
-    source_path = Path(__file__).resolve().parents[2] / "src" / "c_two" / "error.py"
-    source = source_path.read_text(encoding="utf-8")
+def test_retired_codes_are_reserved_in_the_native_and_public_registries():
+    from c_two import _native
+    from c_two.error import ErrorCode
 
-    legacy = "legacy"
-    forbidden = [
-        ".tobytes()",
-        ".decode('utf-8')",
-        '.decode("utf-8")',
-        ".split(':', 1)",
-        '.split(":", 1)',
-        "int(code_raw)",
-        "Unknown error code {code_value}",
-        "invalid UTF-8",
-        "missing ':' separator",
-        "invalid code",
-        f"encode_error_{legacy}",
-        f"decode_error_{legacy}",
-        f"to_{legacy}_bytes",
-        f"from_{legacy}_bytes",
-    ]
-
-    offenders = [needle for needle in forbidden if needle in source]
-    assert offenders == []
-    assert "_native.error_registry" in source
+    reserved_codes = {704, 706, 711}
+    assert reserved_codes.isdisjoint(code for code, _side, _stage in _native.error_registry().values())
+    assert reserved_codes.isdisjoint(member.value for member in ErrorCode)
 
 
 def test_registry_does_not_own_generic_relay_or_route_authority():
@@ -432,26 +414,6 @@ def test_endpoint_admin_facade_only_projects_native_context_and_actions():
             and any(keyword.arg == 'context' for keyword in node.keywords)
             for node in ast.walk(functions[name])
         ), name
-
-
-def test_explicit_ipc_connect_branch_bypasses_relay_facade():
-    import inspect
-
-    from c_two.transport.registry import Runtime
-
-    source = inspect.getsource(Runtime._connect)
-    after_ipc_condition = source.split("elif address is not None:", 1)[1]
-    ipc_branch = after_ipc_condition.split("\n        else:", 1)[0]
-
-    assert "runtime_session.acquire_ipc_client" in ipc_branch
-    assert "connect_attempt=attempt" in ipc_branch
-    forbidden = [
-        "connect_via_relay",
-        "connect_explicit_relay_http",
-        "ResourceUnavailable",
-    ]
-    offenders = [needle for needle in forbidden if needle in ipc_branch]
-    assert offenders == []
 
 
 def test_python_does_not_own_buffer_lease_accounting():

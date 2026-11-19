@@ -344,8 +344,10 @@ def test_native_held_export_rejection_allows_later_local_release() -> None:
         output=_fake_fastdb_binding(deserialize=lambda source: owner, invalidate=invalidated.append),
     )
     held = wrapped(Contract(), _c2_buffer="hold")
-    with pytest.raises(BufferError, match="another export"):
+    with pytest.raises(error.SerializationError, match="another export") as failure:
         held.release()
+    assert failure.value.code == error.ErrorCode.ClientOutputFromBuffer
+    assert isinstance(failure.value.__cause__, BufferError)
     assert held.value is owner
     assert invalidated == []
     response.export_active = False
@@ -388,7 +390,7 @@ def test_post_decode_release_failure_invalidates_unreturned_owner() -> None:
     with pytest.raises(error.SerializationError, match="local buffer export is active") as raised:
         wrapped(Contract())
 
-    assert raised.value.code == error.ErrorCode.ClientOutputDeserializing
+    assert raised.value.code == error.ErrorCode.ClientOutputFromBuffer
     assert invalidated == [owner]
     assert response.release_calls == 1
 
@@ -434,7 +436,7 @@ def test_retained_tracking_failure_invalidates_owner_then_releases_response() ->
     with pytest.raises(error.SerializationError, match="tracking failed") as raised:
         wrapped(Contract(), _c2_buffer="hold")
 
-    assert raised.value.code == error.ErrorCode.ClientOutputDeserializing
+    assert raised.value.code == error.ErrorCode.ClientOutputFromBuffer
     assert events == ["track", "invalidate", "release"]
 
 
@@ -635,3 +637,103 @@ def test_borrowed_checked_owner_invalidates_before_local_request_release(fail_re
         for value in retained.values():
             value.close()
         source.close()
+
+
+def test_spec_failure_keeps_fastdb_cause_when_owner_close_also_fails(monkeypatch):
+    import sys
+
+    from c_two.crm.payload_plan import fastdb_payload_binding
+
+    binding = fastdb_payload_binding(RECORD_SPEC, label='test.verify-and-close')
+    wrong = build_payload(OTHER_SPEC)
+    close_calls = []
+
+    class Owner:
+        def require_spec_sha256(self, digest):
+            wrong.require_spec_sha256(digest)
+
+        def close(self):
+            close_calls.append('close')
+            raise OSError('cannot close owner')
+
+    monkeypatch.setattr(Payload, 'open_copy', staticmethod(lambda *_args: Owner()))
+
+    class Contract:
+        direction = '->'
+
+        class client:
+            @staticmethod
+            def call(_method, _data):
+                return b'payload'
+
+    def fetch(self) -> Payload: ...
+
+    wrapped = _build_transfer_wrapper(fetch, input=no_payload_binding(), output=binding)
+    try:
+        with pytest.raises(error.SerializationError) as raised:
+            wrapped(Contract())
+        primary = raised.value.__cause__
+        assert raised.value.code == error.ErrorCode.ClientOutputDeserializing
+        assert raised.value.transport_phase is None
+        assert isinstance(primary, PayloadError)
+        assert raised.value.details == FASTDB_DIGEST_MISMATCH_CAUSE
+        assert close_calls == ['close']
+        if sys.version_info >= (3, 11):
+            assert any('cannot close owner' in note for note in primary.__notes__)
+    finally:
+        wrong.close()
+
+
+@pytest.mark.parametrize('core_error', [False, True])
+def test_borrowed_cleanup_failure_preserves_original_business_exception(core_error):
+    from c_two import _native
+
+    if core_error:
+        with pytest.raises(error.CoreError) as caught:
+            _native.ConnectAttempt(timeout_seconds=0)
+        original = caught.value
+        fault_type = error.CallDeadlineExceeded
+        expected_details = error._strip_callback_phases(original.semantic.details)
+    else:
+        original = error.ResourceClosed('business failure', {'marker': 'preserve'})
+        fault_type = error.ResourceClosed
+        expected_details = original.details.copy()
+
+    prior_context = RuntimeError('prior context')
+    original.__context__ = prior_context
+    original.__notes__ = ['business note']
+    cleanup_calls = []
+
+    def invalidate(_value):
+        cleanup_calls.append('invalidate')
+        raise OSError('invalidation failed')
+
+    def release_request():
+        cleanup_calls.append('release')
+        raise OSError('release failed')
+
+    class Resource:
+        def consume(self, value):
+            raise original
+
+    class Contract:
+        direction = '<-'
+        resource = Resource()
+
+    def consume(self, value: Payload) -> None: ...
+
+    wrapped = _build_transfer_wrapper(
+        consume, input=_fake_fastdb_binding(deserialize=lambda _data: object(), invalidate=invalidate),
+        output=no_payload_binding(),
+    )
+    with pytest.raises(fault_type) as caught:
+        wrapped(Contract(), b'payload', _release_fn=release_request, _c2_input_buffer_mode='borrowed')
+
+    assert cleanup_calls == ['invalidate', 'release']
+    assert caught.value.__cause__ is original
+    assert caught.value.details == expected_details
+    assert caught.value.transport_phase is None
+    assert isinstance(caught.value.__context__, OSError)
+    assert 'invalidation failed' in str(caught.value.__context__)
+    assert original.__context__ is prior_context
+    assert original.__notes__ == ['business note']

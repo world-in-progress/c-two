@@ -285,6 +285,7 @@ class CRMProxy:
                     raise ResourceClosed(
                         f"route {state.name!r} is closed",
                         details={'route': state.name},
+                        transport_phase='pre_dispatch',
                     ) from exc
                 target = connection.client
                 try:
@@ -302,6 +303,7 @@ class CRMProxy:
                         raise ResourceClosed(
                             f"route {state.name!r} is closed",
                             details={'route': state.name},
+                            transport_phase='pre_dispatch',
                         )
                     with state.lock:
                         state.local = (target._crm, target._scheduler)
@@ -578,7 +580,7 @@ def _invoke_local(method, args):
     except error.CoreError as exc:
         # A downstream admission failure describes the inner call only:
         # re-raise a clean copy instead of mutating the business's object.
-        raise error._callback_core_copy(exc) from exc
+        raise (error._callback_semantic_copy(exc) or error._callback_core_copy(exc)) from exc
     except error.CCError as exc:
         raise error._callback_error_copy(exc) from exc
 
@@ -590,7 +592,10 @@ def _native_call(operation, *args, **kwargs):
     except Exception as exc:
         projected = error._project_native_error(exc)
         if projected is not None:
-            raise projected from exc
+            try:
+                raise projected from exc
+            finally:
+                del projected
         raise
 
 

@@ -100,7 +100,10 @@ def _connect_native_call(operation, *args, **kwargs):
         return operation(*args, **kwargs)
     except Exception as exc:
         if (cc_err := _cc_error_from_native_exception(exc)) is not None:
-            raise cc_err from exc
+            try:
+                raise cc_err from exc
+            finally:
+                del cc_err
         raise
 
 
@@ -458,7 +461,10 @@ class Runtime:
                 )
             except Exception as exc:
                 if (cc_err := _cc_error_from_native_exception(exc)) is not None:
-                    raise cc_err from exc
+                    try:
+                        raise cc_err from exc
+                    finally:
+                        del cc_err
                 status = _relay_control_error_status(exc)
                 if status == 404:
                     raise ResourceNotFound(f"Resource '{name}' not found") from exc
@@ -482,7 +488,10 @@ class Runtime:
                 )
             except Exception as exc:
                 if (cc_err := _cc_error_from_native_exception(exc)) is not None:
-                    raise cc_err from exc
+                    try:
+                        raise cc_err from exc
+                    finally:
+                        del cc_err
                 raise
             proxy = CRMProxy.ipc(
                 client,
@@ -499,7 +508,10 @@ class Runtime:
                 )
             except Exception as exc:
                 if (cc_err := _cc_error_from_native_exception(exc)) is not None:
-                    raise cc_err from exc
+                    try:
+                        raise cc_err from exc
+                    finally:
+                        del cc_err
                 if _is_missing_relay_address(exc):
                     raise LookupError(
                         f'Name {name!r} is not registered locally '

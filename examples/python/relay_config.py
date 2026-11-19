@@ -3,6 +3,7 @@ from __future__ import annotations
 
 
 def resolved_relay_url(default: str | None = None) -> str | None:
+    """Resolve the environment default when the example has no explicit URL."""
     from c_two._native import resolve_relay_anchor_address
 
     address = resolve_relay_anchor_address()

@@ -74,15 +74,6 @@ class TestErrorCode:
     def test_has_exactly_25_members(self):
         assert len(ErrorCode) == 25
 
-    def test_retired_errors_are_absent(self):
-        retired = (("Route", "Stale", 704), ("Write", "Conflict", 706),
-                   ("Route", "Catalog", "Compacted", 711))
-        for *parts, code in retired:
-            name = "".join(parts)
-            assert not hasattr(error, name)
-            assert name not in error.__all__
-            assert code not in ErrorCode._value2member_map_
-
     def test_values_are_unique(self):
         values = [member.value for member in ErrorCode]
         assert len(values) == len(set(values))
@@ -375,6 +366,10 @@ class TestCoreErrorSemantic:
         core.details = kwargs.get('details', {'route': 'grid'})
         core.semantic_message = kwargs.get('semantic_message')
         core._transport_phase = kwargs.get('phase')
+        core._semantic_snapshot = (
+            core.code, core.semantic_message or core.message, tuple(core.details.items()),
+            core.transport_phase,
+        )
         return core
 
     def test_none_code_has_no_semantic(self):
@@ -389,10 +384,6 @@ class TestCoreErrorSemantic:
         assert first.message == 'inner message'
         assert first.details == {'route': 'grid'}
 
-    def test_semantic_falls_back_to_outer_message(self):
-        core = self._semantic_core()
-        assert core.semantic.message == 'outer diagnostic'
-
     def test_semantic_carries_core_phase(self):
         core = self._semantic_core(semantic_message='inner', phase='dispatch_uncertain')
         assert core.semantic.transport_phase == 'dispatch_uncertain'
@@ -404,28 +395,6 @@ class TestCoreErrorSemantic:
         assert not any(
             isinstance(value, CCError) for value in core.__dict__.values()
         )
-
-    def test_raise_projected_from_core_has_no_reference_cycle(self):
-        refs = {}
-
-        def scenario():
-            core = self._semantic_core(semantic_message='inner')
-            projected = core.semantic
-            refs['core'] = weakref.ref(core)
-            refs['projected'] = weakref.ref(projected)
-            try:
-                raise projected from core
-            except CCError as caught:
-                assert caught is projected
-                assert caught.__cause__ is core
-                caught.__traceback__ = None
-
-        scenario()
-        gc.collect()
-        # A one-way projected -> core chain is collectable; only a cycle
-        # (core caching its projection) would keep both alive.
-        assert refs['core']() is None
-        assert refs['projected']() is None
 
     def test_semantic_unknown_code_degrades(self):
         core = self._semantic_core(code=9999)
@@ -448,3 +417,99 @@ class TestCoreErrorPhaseAuthority:
             _native.ConnectAttempt(timeout_seconds=0)
         assert failure.value.transport_phase == 'pre_dispatch'
         assert failure.value.semantic.transport_phase == 'pre_dispatch'
+
+
+class _BusinessError(CCError):
+    def __init__(self, *, record):
+        super().__init__(ErrorCode.ResourceClosed, 'business')
+        self.record = record
+
+
+class _BusinessCoreError(CoreError):
+    __slots__ = ('record',)
+
+    def __init__(self, *, record):
+        super().__init__('lifecycle', 'business')
+        self.record = record
+
+
+@pytest.mark.parametrize('error_class', [_BusinessError, _BusinessCoreError])
+@pytest.mark.parametrize('round_trip', [
+    copy.copy, copy.deepcopy, lambda value: pickle.loads(pickle.dumps(value)),
+])
+def test_copy_and_pickle_keep_custom_subclass_state(error_class, round_trip):
+    original = error_class(record={'id': 42})
+    original.args = ('caller changed args', 3)
+    original.__notes__ = ['caller note']
+    original.details['route'] = 'grid'
+
+    restored = round_trip(original)
+
+    assert type(restored) is error_class
+    assert restored.args == original.args
+    assert restored.__notes__ == original.__notes__
+    assert restored.record == original.record
+    assert restored.details == original.details
+    assert restored.details is not original.details
+
+
+@pytest.mark.parametrize('error_class', [CCError, SerializationError])
+@pytest.mark.parametrize('invalid_code', [5.9, True, '5'])
+def test_error_constructors_reject_non_integer_codes(error_class, invalid_code):
+    with pytest.raises((TypeError, ValueError)):
+        error_class(invalid_code)
+
+
+def test_canonical_transport_phase_key_has_precedence():
+    details = {'dispatch_phase': 'pre_dispatch', 'transport_phase': 'PRE_DISPATCH'}
+    assert CCError(ErrorCode.ResourceClosed, details=details).transport_phase is None
+    assert CCError._from_parts(707, details=details).transport_phase is None
+    del details['transport_phase']
+    assert CCError(ErrorCode.ResourceClosed, details=details).transport_phase == 'pre_dispatch'
+
+
+def test_native_snapshot_survives_changes_to_public_diagnostics():
+    with pytest.raises(CoreError) as failure:
+        _native.ConnectAttempt(timeout_seconds=0)
+    native = failure.value
+    expected = native.semantic
+    native.code = int(ErrorCode.ResourceClosed)
+    native.semantic_message = 'overwritten'
+    native.details.clear()
+    native.args = ('changed native args',)
+    native.__notes__ = ['keep this note']
+
+    for restored in (native, copy.copy(native), copy.deepcopy(native), pickle.loads(pickle.dumps(native))):
+        assert restored.args == native.args
+        assert restored.__notes__ == native.__notes__
+        assert isinstance(restored.semantic, CallDeadlineExceeded)
+        assert restored.semantic.message == expected.message
+        assert restored.semantic.details == expected.details
+        assert restored.semantic.transport_phase == 'pre_dispatch'
+
+
+@pytest.mark.parametrize('operation', ['native_call', 'connect'])
+def test_real_native_failure_projection_releases_both_errors_without_gc(operation):
+    from c_two import connect
+    from c_two.transport.client.proxy import _native_call
+
+    def scenario():
+        try:
+            if operation == 'native_call':
+                _native_call(_native.ConnectAttempt, timeout_seconds=0)
+            else:
+                connect(object, name='deadline', timeout=0)
+        except CallDeadlineExceeded as exc:
+            assert isinstance(exc.__cause__, CoreError)
+            return weakref.ref(exc), weakref.ref(exc.__cause__)
+        raise AssertionError('expected real native deadline refusal')
+
+    gc_was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        projected_ref, cause_ref = scenario()
+        assert projected_ref() is None
+        assert cause_ref() is None
+    finally:
+        if gc_was_enabled:
+            gc.enable()

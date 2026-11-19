@@ -203,8 +203,10 @@ def test_local_hold_outlives_reassembly_backing_and_public_shutdown(tier: str) -
 
         exported = memoryview(held.unsafe_buffer)
         try:
-            with pytest.raises(BufferError):
+            with pytest.raises(cc.error.SerializationError) as failure:
                 held.release()
+            assert failure.value.code == cc.error.ErrorCode.ClientOutputFromBuffer
+            assert isinstance(failure.value.__cause__, BufferError)
             assert held.value is retained
             with checked.acquire() as access:
                 assert access.bytes() == BLOB

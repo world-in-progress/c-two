@@ -42,17 +42,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         '--relay-url',
         type=_relay_url,
-        default=resolved_relay_url(DEFAULT_RELAY_URL),
+        default=None,
         help=(
             'HTTP relay URL used for name resolution '
             f'(default: C2_RELAY_ANCHOR_ADDRESS or {DEFAULT_RELAY_URL}).'
         ),
     )
     args = parser.parse_args(argv)
-    try:
-        args.relay_url = ensure_http_relay_url(args.relay_url)
-    except ValueError as exc:
-        parser.error(str(exc))
+    if args.relay_url is None:
+        try:
+            args.relay_url = ensure_http_relay_url(resolved_relay_url(DEFAULT_RELAY_URL))
+        except ValueError as exc:
+            parser.error(str(exc))
     return args
 
 

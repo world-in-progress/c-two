@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from enum import IntEnum, unique
+from types import MemberDescriptorType
 from typing import Literal
 
 from c_two import _native
@@ -11,7 +12,7 @@ ErrorStage = Literal['serialize', 'deserialize', 'from_buffer', 'execute', 'call
 TransportPhase = Literal['pre_dispatch', 'dispatch_uncertain']
 
 _PHASE_VALUES = ('pre_dispatch', 'dispatch_uncertain')
-_PHASE_DETAIL_KEYS = ('transport_phase', 'dispatch_phase')
+_CALLBACK_DETAIL_KEYS = ('transport_phase', 'dispatch_phase', 'fallback_eligible', 'route_withdrawal')
 _DEFAULT_MESSAGE = 'Error occurred when using C-Two.'
 _UNSET = object()
 
@@ -27,10 +28,10 @@ def _validated_phase(value: object) -> TransportPhase | None:
 
 def _phase_from_details(details: Mapping[str, str]) -> TransportPhase | None:
     """Adopt a phase only from an exact canonical details entry."""
-    for key in _PHASE_DETAIL_KEYS:
-        value = details.get(key)
-        if value in _PHASE_VALUES:
-            return value  # type: ignore[return-value]
+    key = 'transport_phase' if 'transport_phase' in details else 'dispatch_phase'
+    value = details.get(key)
+    if value in _PHASE_VALUES:
+        return value  # type: ignore[return-value]
     return None
 
 
@@ -66,14 +67,36 @@ class CCBaseError(Exception):
         """
         return getattr(self, '_transport_phase', None)
 
+    def __reduce__(self):
+        state = vars(self).copy()
+        if 'details' in state:
+            state['details'] = state['details'].copy()
+        slots = {}
+        for cls in type(self).__mro__:
+            if cls is CCBaseError:
+                break
+            for name, member in vars(cls).items():
+                if isinstance(member, MemberDescriptorType) and hasattr(self, name):
+                    slots[name] = getattr(self, name)
+        return _rebuild_error, (type(self), self.args), (state, slots)
+
+    def __setstate__(self, state):
+        attributes, slots = state
+        self.__dict__.update(attributes)
+        for name, value in slots.items():
+            setattr(self, name, value)
+
+
+def _rebuild_error(target: type[CCBaseError], args: tuple) -> CCBaseError:
+    return Exception.__new__(target, *args)
+
 
 class CoreError(CCBaseError, RuntimeError):
     """Structured failure populated by the native Core runtime.
 
     ``message`` retains the outer Core diagnostic. When the failure carries a
-    canonical semantic error, ``code``/``name``/``details`` hold its snapshot
-    and ``semantic_message`` keeps the inner semantic message; the ``semantic``
-    property projects an independent public exception from that snapshot.
+    canonical semantic error, the public fields expose its diagnostics and
+    ``semantic`` projects a public exception from a separate immutable snapshot.
     Fields without a native value remain None.
     """
 
@@ -83,6 +106,7 @@ class CoreError(CCBaseError, RuntimeError):
     name: str | None
     details: dict[str, str]
     semantic_message: str | None
+    _semantic_snapshot: tuple[int, str, tuple[tuple[str, str], ...], TransportPhase | None] | None
     _transport_phase: TransportPhase | None
     transport_kind: Literal['ipc', 'http'] | None
     # Semantic errors preserve the peer's arbitrary diagnostic detail.
@@ -134,6 +158,7 @@ class CoreError(CCBaseError, RuntimeError):
         self.name = None
         self.details = {}
         self.semantic_message = None
+        self._semantic_snapshot = None
         self._transport_phase = None
         self.transport_kind = None
         self.fallback_eligible = None
@@ -161,25 +186,13 @@ class CoreError(CCBaseError, RuntimeError):
 
         Each call constructs a fresh exception from the immutable snapshot
         (code, semantic message, details and this error's dispatch phase).
-        Nothing is cached on this ``CoreError``, so ``raise projected from
-        core_error`` never creates a reference cycle.
+        The ``CoreError`` keeps no reference to the projected exception.
         """
-        if self.code is None:
+        snapshot = getattr(self, '_semantic_snapshot', None)
+        if snapshot is None:
             return None
-        message = (
-            self.semantic_message
-            if self.semantic_message is not None
-            else self.message
-        )
-        return CCError._from_parts(
-            int(self.code),
-            message,
-            dict(self.details),
-            transport_phase=self.transport_phase,
-        )
-
-    def __reduce__(self):
-        return type(self), (self.category, self.message), self.__dict__
+        code, message, details, phase = snapshot
+        return CCError._from_parts(code, message, dict(details), transport_phase=phase)
 
 
 def _build_error(
@@ -199,21 +212,10 @@ def _build_error(
     return error
 
 
-def _rebuild_error(
-    target: type[CCError],
-    code_int: int,
-    message: str,
-    details: Mapping[str, str],
-    phase: TransportPhase | None,
-) -> CCError:
-    """Pickle/copy reconstruction entry preserving the exact public class."""
-    try:
-        code = ErrorCode(int(code_int))
-    except ValueError:
-        code = ErrorCode.Unknown
-        details = dict(details)
-        details['unknown_code'] = str(int(code_int))
-    return _build_error(target, code, message, dict(details), _validated_phase(phase))
+def _checked_error_code(code: ErrorCode | int) -> ErrorCode:
+    if not isinstance(code, ErrorCode) and type(code) is not int:
+        raise TypeError(f'code must be an ErrorCode or int, got {type(code).__name__}')
+    return ErrorCode(code)
 
 
 class CCError(CCBaseError):
@@ -238,13 +240,13 @@ class CCError(CCBaseError):
 
     def __init__(
         self,
-        code: ErrorCode = ErrorCode.Unknown,
+        code: ErrorCode | int = ErrorCode.Unknown,
         message: str | None = None,
         details: Mapping[str, str] | None = None,
         *,
         transport_phase: TransportPhase | None | object = _UNSET,
     ):
-        self.code = code if isinstance(code, ErrorCode) else ErrorCode(int(code))
+        self.code = _checked_error_code(code)
         self.message = _DEFAULT_MESSAGE if message is None else message
         self.details = dict(details or {})
         if transport_phase is _UNSET:
@@ -291,12 +293,6 @@ class CCError(CCBaseError):
             phase = transport_phase
         target = _CODE_TO_CLASS.get(int(code), CCError)
         return _build_error(target, code, message, details, _validated_phase(phase))
-
-    def __reduce__(self):
-        return (
-            _rebuild_error,
-            (type(self), int(self.code), self.message, dict(self.details), self._transport_phase),
-        )
 
     def __str__(self):
         return f'{self.code.name}: {self.message}'
@@ -358,13 +354,14 @@ class SerializationError(CCError):
 
     def __init__(
         self,
-        code: ErrorCode = ErrorCode.ClientInputSerializing,
+        code: ErrorCode | int = ErrorCode.ClientInputSerializing,
         message: str | None = None,
         details: Mapping[str, str] | None = None,
         *,
         transport_phase: TransportPhase | None | object = _UNSET,
     ):
-        if int(code) not in self._CODEC_CODES:
+        code = _checked_error_code(code)
+        if code not in self._CODEC_CODES:
             raise ValueError(
                 f'SerializationError requires one of the codec codes '
                 f'{sorted(self._CODEC_CODES)}, got {int(code)}',
@@ -517,11 +514,11 @@ _CODE_TO_CLASS: dict[int, type[CCError]] = {
 
 
 def _strip_callback_phases(details: Mapping[str, str]) -> dict[str, str]:
-    """Drop inner dispatch-phase details that never describe this call."""
+    """Drop control details belonging to the inner call."""
     return {
         key: value
         for key, value in details.items()
-        if key not in _PHASE_DETAIL_KEYS
+        if key not in _CALLBACK_DETAIL_KEYS
     }
 
 
@@ -529,7 +526,7 @@ def _callback_error_copy(exc: CCError) -> CCError:
     """Fresh copy of an error escaping a resource callback.
 
     Keeps the class, code, message and business details; clears the inner
-    dispatch phases that describe the inner call only.
+    control details that describe the inner call only.
     """
     return _build_error(
         type(exc),
@@ -551,6 +548,8 @@ def _callback_core_copy(core: CoreError) -> CoreError:
     copy.details = _strip_callback_phases(core.details)
     copy._transport_phase = None
     copy.fallback_eligible = None
+    copy.route_withdrawal = None
+    copy._semantic_snapshot = None
     return copy
 
 

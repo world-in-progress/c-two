@@ -725,6 +725,10 @@ def test_registry_projects_native_semantic_before_wrapping() -> None:
     native_exc.details = {'route': 'grid'}
     native_exc.semantic_message = 'same local relay HTTP fallback denied'
     native_exc._transport_phase = 'pre_dispatch'
+    native_exc._semantic_snapshot = (
+        native_exc.code, native_exc.semantic_message, tuple(native_exc.details.items()),
+        native_exc.transport_phase,
+    )
 
     restored = _cc_error_from_native_exception(native_exc)
 

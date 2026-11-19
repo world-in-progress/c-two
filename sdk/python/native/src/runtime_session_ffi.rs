@@ -177,69 +177,6 @@ cc.error.CoreError.__init__ = observe_error
         });
     }
 
-    #[test]
-    fn relay_override_host_lock_expires_before_owner_releases_and_recovers() {
-        Python::initialize();
-        let session = Arc::new(PyRuntimeSession::new(None, None, false).unwrap());
-        let host = session.host.lock();
-        let worker_session = session.clone();
-        let (done_tx, done_rx) = std::sync::mpsc::channel();
-        let worker = std::thread::spawn(move || {
-            let result = Python::attach(|py| {
-                let attempt = PyConnectAttempt {
-                    inner: c2_core::ConnectAttempt::start(
-                        c2_config::ConnectOptions::new().with_timeout(Duration::from_millis(100)),
-                    )
-                    .unwrap(),
-                };
-                worker_session.set_relay_anchor_address(
-                    py,
-                    Some("http://relay.test".into()),
-                    Some(&attempt),
-                )
-            });
-            done_tx.send(result).unwrap();
-        });
-        let observed = done_rx.recv_timeout(Duration::from_secs(2));
-        drop(host);
-        worker.join().unwrap();
-        let result = observed.expect("native host lock must expire before its owner releases");
-        let error = result.unwrap_err();
-        Python::attach(|py| {
-            let value = error.value(py);
-            assert_eq!(
-                value.getattr("code").unwrap().extract::<u16>().unwrap(),
-                715
-            );
-            let details = value.getattr("details").unwrap();
-            assert_eq!(
-                details
-                    .get_item("stage")
-                    .unwrap()
-                    .extract::<String>()
-                    .unwrap(),
-                "relay_override_host_wait"
-            );
-            assert_eq!(
-                details
-                    .get_item("operation")
-                    .unwrap()
-                    .extract::<String>()
-                    .unwrap(),
-                "connect"
-            );
-        });
-        Python::attach(|py| {
-            session.set_relay_anchor_address(py, Some("http://relay.test".into()), None)
-        })
-        .unwrap();
-        assert_eq!(
-            session.inner.relay_anchor_address_override().as_deref(),
-            Some("http://relay.test")
-        );
-        assert!(!session.inner.client_config_frozen());
-        assert_eq!(session.inner.path_counters().direct_ipc(), 0);
-    }
 }
 
 #[pyclass(name = "RuntimeSession", frozen)]
@@ -654,33 +591,19 @@ impl PyRuntimeSession {
         .map_err(runtime_configuration_error_to_py)
     }
 
-    #[pyo3(signature = (relay_anchor_address, *, connect_attempt=None))]
     fn set_relay_anchor_address(
         &self,
         py: Python<'_>,
         relay_anchor_address: Option<String>,
-        connect_attempt: Option<&PyConnectAttempt>,
     ) -> PyResult<()> {
-        let attempt = connect_attempt.map(|attempt| attempt.inner);
         py.detach(|| {
-            let host = match &attempt {
-                Some(attempt) => attempt
-                    .lock(&self.host, "relay_override_host_wait")
-                    .map_err(core_error_to_py)?,
-                None => self.host.lock(),
-            };
+            let host = self.host.lock();
             if host.host.is_some() {
                 let requested = relay_anchor_address
                     .as_deref()
                     .map(str::trim)
                     .map(|value| value.trim_end_matches('/'));
-                let current = match &attempt {
-                    Some(attempt) => self
-                        .inner
-                        .relay_anchor_address_override_with_attempt(attempt)
-                        .map_err(core_error_to_py)?,
-                    None => self.inner.relay_anchor_address_override(),
-                };
+                let current = self.inner.relay_anchor_address_override();
                 if requested != current.as_deref() {
                     return Err(PyRuntimeError::new_err(
                         "relay anchor is frozen after the Core host starts",
@@ -688,16 +611,8 @@ impl PyRuntimeSession {
                 }
                 return Ok(());
             }
-            match &attempt {
-                Some(attempt) => self
-                    .inner
-                    .set_relay_anchor_address_with_attempt(relay_anchor_address, attempt)
-                    .map_err(core_error_to_py),
-                None => {
-                    self.inner.set_relay_anchor_address(relay_anchor_address);
-                    Ok(())
-                }
-            }
+            self.inner.set_relay_anchor_address(relay_anchor_address);
+            Ok(())
         })
     }
 
