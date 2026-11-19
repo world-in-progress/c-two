@@ -79,7 +79,16 @@ pub struct NestedErrorFixture {
 }
 
 impl NestedErrorFixture {
+    #[allow(dead_code)]
     pub fn start(descriptor: &[u8], unix_root: Option<&Path>) -> Self {
+        Self::start_with_relay(descriptor, unix_root, None)
+    }
+
+    pub fn start_with_relay(
+        descriptor: &[u8],
+        unix_root: Option<&Path>,
+        relay_url: Option<&str>,
+    ) -> Self {
         let release = ContractRelease::from_descriptor_json(descriptor).expect("valid descriptor");
         let suffix = std::process::id();
         let route_a = format!("nested-a-{suffix}");
@@ -99,13 +108,14 @@ impl NestedErrorFixture {
         runtime
             .set_local_endpoint_with_sources(endpoint, ConfigSources::empty())
             .expect("fixture endpoint");
-        let host = runtime
-            .host(
-                HostOptions::default()
-                    .without_relay()
-                    .with_server_id(format!("nested-errors-{suffix}")),
-            )
-            .expect("fixture Host");
+        let host_options = match relay_url {
+            Some(url) => HostOptions::default()
+                .with_relay_anchor_address(url)
+                .with_relay_use_proxy(false),
+            None => HostOptions::default().without_relay(),
+        }
+        .with_server_id(format!("nested-errors-{suffix}"));
+        let host = runtime.host(host_options).expect("fixture Host");
         let b_calls = Arc::new(AtomicU64::new(0));
         let registration_b = host
             .register(definition(

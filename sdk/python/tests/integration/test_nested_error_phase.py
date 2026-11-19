@@ -15,6 +15,7 @@ import c_two.contract
 import c_two.endpoint
 from c_two.error import ResourceRemoved
 from c_two.transport.registry import _reset_default_runtime
+from tests.conftest import c3_binary, free_tcp_port, wait_for_relay
 from tests.fixtures.process_control import readline_with_timeout
 
 
@@ -72,46 +73,82 @@ def test_python_consumer_does_not_inherit_nested_pre_dispatch(
         with tempfile.TemporaryDirectory(prefix='c2-ne-', dir=None if os.name == 'nt' else '/tmp') as root:
             if os.name != 'nt':
                 cc.endpoint.set_local_endpoint(root=root)
-            process = subprocess.Popen(
-                [str(nested_error_rust_host_binary), str(DESCRIPTOR), root],
-                stdin=subprocess.PIPE,
+            port = free_tcp_port()
+            relay_url = f'http://127.0.0.1:{port}'
+            relay_args = [str(c3_binary()), 'relay', '--bind', f'127.0.0.1:{port}']
+            if os.name != 'nt':
+                relay_args.extend(['--ipc-root', root])
+            relay = subprocess.Popen(
+                relay_args,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
-                bufsize=1,
+                env={
+                    **os.environ,
+                    'C2_ENV_FILE': '',
+                    'NO_PROXY': '127.0.0.1,localhost',
+                    'no_proxy': '127.0.0.1,localhost',
+                },
             )
             try:
-                assert process.stdout is not None
-                ready = readline_with_timeout(process.stdout, 20).split()
-                assert len(ready) == 4 and ready[0] == 'READY', ready
-                _, address, route_a, route_b = ready
-                client = cc.connect(PortableNoPayload, name=route_a, address=address)
+                wait_for_relay(relay_url, timeout=10, proc=relay)
+                process = subprocess.Popen(
+                    [str(nested_error_rust_host_binary), str(DESCRIPTOR), root, relay_url],
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    bufsize=1,
+                    env={
+                        **os.environ,
+                        'NO_PROXY': '127.0.0.1,localhost',
+                        'no_proxy': '127.0.0.1,localhost',
+                    },
+                )
                 try:
-                    with pytest.raises(ResourceRemoved) as failure:
-                        client.ping()
-                    error = failure.value
-                    assert error.details['route'] == route_b
-                    assert 'route_uid' not in error.details
-                    assert 'transport_phase' not in error.details
-                    assert 'dispatch_phase' not in error.details
-                    assert 'fallback_eligible' not in error.details
-                    cause = error.__cause__
-                    assert cause is not None
-                    assert cause.transport_phase is None
-                    assert cause.fallback_eligible is None
+                    assert process.stdout is not None
+                    ready = readline_with_timeout(process.stdout, 20).split()
+                    assert len(ready) == 4 and ready[0] == 'READY', ready
+                    _, address, route_a, route_b = ready
+                    for target_address in (address, relay_url):
+                        client = cc.connect(PortableNoPayload, name=route_a, address=target_address)
+                        try:
+                            with pytest.raises(ResourceRemoved) as failure:
+                                client.ping()
+                            error = failure.value
+                            assert error.transport_phase is None
+                            assert error.details['route'] == route_b
+                            assert 'route_uid' not in error.details
+                            assert 'transport_phase' not in error.details
+                            assert 'dispatch_phase' not in error.details
+                            assert 'fallback_eligible' not in error.details
+                            assert 'route_withdrawal' not in error.details
+                            cause = error.__cause__
+                            assert cause is not None
+                            assert cause.transport_phase is None
+                            assert cause.fallback_eligible is None
+                            assert cause.route_withdrawal is None
+                        finally:
+                            cc.close(client)
                 finally:
-                    cc.close(client)
+                    try:
+                        stdout, stderr = process.communicate(input='\n', timeout=20)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        stdout, stderr = process.communicate()
+                        raise AssertionError(f'Rust host did not stop: {stdout}\n{stderr}')
+                    assert process.returncode == 0, (stdout, stderr)
+                    lines = stdout.splitlines()
+                    assert len(lines) == 1 and lines[0].startswith('COUNTS '), (stdout, stderr)
+                    counts = tuple(map(int, lines[0].split()[1:]))
             finally:
-                try:
-                    stdout, stderr = process.communicate(input='\n', timeout=20)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    stdout, stderr = process.communicate()
-                    raise AssertionError(f'Rust host did not stop: {stdout}\n{stderr}')
-                assert process.returncode == 0, (stdout, stderr)
-                lines = stdout.splitlines()
-                assert len(lines) == 1 and lines[0].startswith('COUNTS '), (stdout, stderr)
-                counts = tuple(map(int, lines[0].split()[1:]))
+                if relay.poll() is None:
+                    relay.terminate()
+                    try:
+                        relay.wait(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        relay.kill()
+                        relay.wait(timeout=5)
     finally:
         _reset_default_runtime()
-    assert counts == (1, 0), 'A executed once and B never entered its callback'
+    assert counts == (2, 0), 'A executed twice (IPC and HTTP) and B never entered its callback'

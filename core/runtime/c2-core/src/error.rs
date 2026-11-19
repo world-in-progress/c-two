@@ -467,6 +467,15 @@ fn normalize_http_call_semantic_body(body: &str, status: u16, phase: TransportPh
     if let Error::Semantic(semantic) = &mut error {
         if status == 500 {
             clear_resource_failure_phase(semantic);
+        } else if phase == TransportPhase::DispatchUncertain
+            || semantic
+                .details
+                .get("dispatch_phase")
+                .is_some_and(|phase| phase == "dispatch_uncertain")
+        {
+            semantic
+                .details
+                .insert("transport_phase".into(), "dispatch_uncertain".into());
         } else if phase == TransportPhase::PreDispatch
             && semantic
                 .details
@@ -493,18 +502,17 @@ fn clear_resource_failure_phase(error: &mut C2Error) {
     strip_callback_error_phases(error);
 }
 
-/// Strip `transport_phase` and `dispatch_phase` from an error that escaped a
-/// local resource method.
+/// Strip inner call-control entries from an error that escaped a resource method.
 ///
-/// A same-process direct call enters the resource before its own transport
-/// accounting applies: an exception the resource raised may already describe
-/// state the resource modified, and inner transport admission details (for
-/// example a downstream call's `pre_dispatch`) never describe this call's
-/// dispatch state. Without this normalization an outer caller could misread a
-/// state-modifying failure as retry-safe `pre_dispatch`.
+/// A resource callback that already entered execution may have modified state,
+/// and inner transport admission or route-control details (such as a downstream
+/// call's `pre_dispatch`, `fallback_eligible` or `route_withdrawal`) never
+/// describe this outer call.
 pub fn strip_callback_error_phases(error: &mut C2Error) {
     error.details.remove("transport_phase");
     error.details.remove("dispatch_phase");
+    error.details.remove("fallback_eligible");
+    error.details.remove("route_withdrawal");
 }
 
 /// Decode canonical C2E1 bytes, mapping malformed envelopes to the canonical
@@ -633,7 +641,12 @@ pub enum AdapterFailure {
 
 pub fn normalize_adapter_failure(phase: AdapterFailurePhase, failure: AdapterFailure) -> C2Error {
     match failure {
-        AdapterFailure::Semantic(error) => error,
+        AdapterFailure::Semantic(mut error) => {
+            if matches!(phase, AdapterFailurePhase::ResourceFunctionExecuting) {
+                strip_callback_error_phases(&mut error);
+            }
+            error
+        }
         AdapterFailure::Local { message, details } => {
             C2Error::new(phase.error_code(), message).with_details(details)
         }
@@ -985,5 +998,71 @@ mod native_boundary_tests {
         };
         assert_eq!(actual.phase, TransportPhase::DispatchUncertain);
         assert_eq!(actual.semantic_error, Some(source));
+    }
+
+    #[test]
+    fn http_dispatch_uncertain_reply_overrides_inner_pre_dispatch_transport_phase() {
+        let semantic = C2Error::new(ErrorCode::ResourceUnavailable, "upstream dropped")
+            .with_details(BTreeMap::from([
+                ("dispatch_phase".into(), "dispatch_uncertain".into()),
+                ("transport_phase".into(), "pre_dispatch".into()),
+            ]));
+        let body = serde_json::to_string(&semantic.envelope()).unwrap();
+        let raw_bytes = body.clone().into_bytes();
+        let budget = c2_mem::DomainBudget::from_limits(&c2_config::DomainLimits {
+            memory_budget_bytes: (raw_bytes.capacity().max(1)) as u64,
+            ..Default::default()
+        });
+        let reservation = budget
+            .try_reserve_memory(raw_bytes.capacity() as u64)
+            .unwrap();
+        for error in [
+            normalize_http_error(
+                HttpError::ServerError(502, body),
+                TransportPhase::DispatchUncertain,
+            ),
+            normalize_http_error(
+                HttpError::ResponseError(502, c2_mem::BudgetedBuffer::new(raw_bytes, reservation)),
+                TransportPhase::DispatchUncertain,
+            ),
+        ] {
+            assert_eq!(error.transport_phase(), Some(TransportPhase::DispatchUncertain));
+            let Error::Semantic(actual) = error else {
+                panic!("expected semantic error");
+            };
+            assert_eq!(actual.details["transport_phase"], "dispatch_uncertain");
+        }
+    }
+
+    #[test]
+    fn executed_resource_error_boundaries_strip_all_four_control_keys() {
+        let controls = BTreeMap::from([
+            ("transport_phase".to_string(), "pre_dispatch".to_string()),
+            ("dispatch_phase".to_string(), "pre_dispatch".to_string()),
+            ("fallback_eligible".to_string(), "true".to_string()),
+            ("route_withdrawal".to_string(), "true".to_string()),
+            ("route".to_string(), "downstream".to_string()),
+        ]);
+        let inner = C2Error::new(ErrorCode::ResourceRemoved, "downstream gone")
+            .with_details(controls);
+
+        let adapted = normalize_adapter_failure(
+            AdapterFailurePhase::ResourceFunctionExecuting,
+            AdapterFailure::Semantic(inner.clone()),
+        );
+        assert_eq!(adapted.details, BTreeMap::from([("route".into(), "downstream".into())]));
+
+        let Error::Semantic(ipc_failed) = normalize_ipc_semantic_bytes(&inner.to_wire_bytes()) else {
+            panic!("expected semantic error");
+        };
+        assert_eq!(ipc_failed.details, BTreeMap::from([("route".into(), "downstream".into())]));
+
+        let http_body = serde_json::to_string(&inner.envelope()).unwrap();
+        let Error::Semantic(http_failed) =
+            normalize_http_error(HttpError::ServerError(500, http_body), TransportPhase::DispatchUncertain)
+        else {
+            panic!("expected semantic error");
+        };
+        assert_eq!(http_failed.details, BTreeMap::from([("route".into(), "downstream".into())]));
     }
 }

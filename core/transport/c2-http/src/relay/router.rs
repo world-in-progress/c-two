@@ -196,22 +196,11 @@ fn resource_not_found_response_budgeted(route_name: &str, budget: &DomainBudget)
 }
 
 fn resource_unavailable_response(route_name: &str, message: impl Into<String>) -> Response {
-    resource_unavailable_response_with_phase(route_name, message, "pre_dispatch")
-}
-
-fn resource_unavailable_response_with_phase(
-    route_name: &str,
-    message: impl Into<String>,
-    dispatch_phase: &str,
-) -> Response {
     c2_error_response(
         StatusCode::BAD_GATEWAY,
         c2_error::ErrorCode::ResourceUnavailable,
         message,
-        [
-            ("route", route_name.to_string()),
-            ("dispatch_phase", dispatch_phase.to_string()),
-        ],
+        [("route", route_name.to_string())],
     )
 }
 
@@ -592,7 +581,10 @@ fn crm_contract_mismatch_response_budgeted(route_name: &str, budget: &DomainBudg
         StatusCode::CONFLICT,
         c2_error::ErrorCode::ContractMismatch,
         format!("CRM contract mismatch for route {route_name}"),
-        [("route", route_name.to_string())],
+        [
+            ("route", route_name.to_string()),
+            ("dispatch_phase", "pre_dispatch".to_string()),
+        ],
         budget,
     )
 }
@@ -2488,13 +2480,18 @@ fn ipc_route_error_response(
 ) -> Response {
     use c2_error::{C2Error, ErrorCode};
     let semantic_error_response = |status, mut error: C2Error| {
-        error
-            .details
-            .insert("dispatch_phase".into(), "pre_dispatch".into());
-        if error.details.contains_key("transport_phase") {
+        if budget.is_some() {
             error
                 .details
-                .insert("transport_phase".into(), "pre_dispatch".into());
+                .insert("dispatch_phase".into(), "pre_dispatch".into());
+            if error.details.contains_key("transport_phase") {
+                error
+                    .details
+                    .insert("transport_phase".into(), "pre_dispatch".into());
+            }
+        } else {
+            error.details.remove("dispatch_phase");
+            error.details.remove("transport_phase");
         }
         json_error_response(status, error.envelope(), budget)
     };
@@ -3004,7 +3001,12 @@ mod tests {
                     expected_code.name(),
                     "unexpected name for error={error}"
                 );
-                assert_eq!(body["details"]["dispatch_phase"], "pre_dispatch");
+                if business {
+                    assert_eq!(body["details"]["dispatch_phase"], "pre_dispatch");
+                } else {
+                    assert!(body["details"].get("dispatch_phase").is_none());
+                    assert!(body["details"].get("transport_phase").is_none());
+                }
                 assert_ne!(
                     body["name"], "ResourceUnavailable",
                     "semantic error was flattened: {error}"
@@ -3018,7 +3020,21 @@ mod tests {
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(body["name"], "ResourceUnavailable");
-        assert_eq!(body["details"]["dispatch_phase"], "pre_dispatch");
+        assert!(body["details"].get("dispatch_phase").is_none());
+
+        let budget = crate::payload::memory_only_budget(64 * 1024);
+        let business_response = ipc_route_error_response(
+            "grid",
+            &c2_ipc::IpcError::Config("offline".into()),
+            Some(&budget),
+        );
+        assert_eq!(business_response.status(), StatusCode::BAD_GATEWAY);
+        let business_body = to_bytes(business_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let business_body: serde_json::Value = serde_json::from_slice(&business_body).unwrap();
+        assert_eq!(business_body["name"], "ResourceUnavailable");
+        assert_eq!(business_body["details"]["dispatch_phase"], "pre_dispatch");
     }
 
     #[tokio::test]
@@ -3057,7 +3073,11 @@ mod tests {
                 assert_eq!(projected.code, original.code);
                 assert_eq!(projected.message, original.message);
                 assert_eq!(projected.details["source"], "server");
-                assert_eq!(projected.details["dispatch_phase"], "pre_dispatch");
+                if business {
+                    assert_eq!(projected.details["dispatch_phase"], "pre_dispatch");
+                } else {
+                    assert!(!projected.details.contains_key("dispatch_phase"));
+                }
             }
         }
     }
@@ -3074,8 +3094,13 @@ mod tests {
             let response = ipc_route_error_response("grid", &error, business.then_some(&budget));
             let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
             let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
-            assert_eq!(body["details"]["dispatch_phase"], "pre_dispatch");
-            assert_eq!(body["details"]["transport_phase"], "pre_dispatch");
+            if business {
+                assert_eq!(body["details"]["dispatch_phase"], "pre_dispatch");
+                assert_eq!(body["details"]["transport_phase"], "pre_dispatch");
+            } else {
+                assert!(body["details"].get("dispatch_phase").is_none());
+                assert!(body["details"].get("transport_phase").is_none());
+            }
         }
     }
 
@@ -6107,6 +6132,8 @@ mod tests {
         assert_eq!(body["name"], "ResourceNotFound");
         assert_eq!(body["message"], "route not found: grid");
         assert_eq!(body["details"]["route"], "grid");
+        assert!(body["details"].get("dispatch_phase").is_none());
+        assert!(body["details"].get("transport_phase").is_none());
         assert!(
             state.local_route("grid").is_none(),
             "never-found upstream route is semantic withdrawal evidence"
@@ -6115,6 +6142,30 @@ mod tests {
             get_resolve_with_crm_tag(state.clone(), "grid", "test.echo", "Echo", "0.1.0").await,
             StatusCode::NOT_FOUND
         );
+
+        match test_commit_registration!(
+            &state,
+            "grid".into(),
+            "server-grid".into(),
+            "server-grid-instance".into(),
+            owner_address.clone(),
+            "test.echo".into(),
+            "Echo".into(),
+            "0.1.0".into(),
+            TEST_ABI_HASH.into(),
+            TEST_SIGNATURE_HASH.into(),
+            1024,
+            "grid-never-served-uid-business".into(),
+            None,
+        ) {
+            RegisterCommitResult::Registered { .. } => {}
+            _ => panic!("unexpected registration result for business POST check"),
+        }
+        let (post_status, post_body) = post_call_response(state.clone(), "grid", "ping").await;
+        assert_eq!(post_status, StatusCode::NOT_FOUND);
+        let post_body: serde_json::Value = serde_json::from_slice(&post_body).unwrap();
+        assert_eq!(post_body["code"], 701);
+        assert_eq!(post_body["details"]["dispatch_phase"], "pre_dispatch");
 
         shutdown_live_server(&owner_server).await;
     }

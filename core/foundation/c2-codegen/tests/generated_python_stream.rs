@@ -70,8 +70,9 @@ class HeldResult:
 class Stream:
     @classmethod
     def _from_encoded(cls, native, decoder, *, held=False, invalidator=None,
-                      tracker=None, route_name='', method_name=''):
-        events.append(('wrap', held, tracker, route_name, method_name))
+                      tracker=None, route_name='', method_name='',
+                      decoder_classifies=False):
+        events.append(('wrap', held, tracker, route_name, method_name, decoder_classifies))
         values = [decoder(data) for data in native]
         if held:
             values = [HeldResult(value, invalidator) for value in values]
@@ -122,6 +123,13 @@ def _project_native_error(exc):
         return projected
     return None
 
+def _post_dispatch_cleanup_error(exc):
+    if getattr(exc, 'transport_phase', None) is not None:
+        cleaned = CCBaseError(str(exc))
+        cleaned.transport_phase = None
+        return cleaned
+    return exc
+
 c_two = types.ModuleType('c_two')
 c_two.Stream = Stream
 c_two.HeldResult = HeldResult
@@ -129,6 +137,7 @@ error_module = types.ModuleType('c_two.error')
 error_module.CCBaseError = CCBaseError
 error_module.ErrorCode = ErrorCode
 error_module.SerializationError = SerializationError
+error_module._post_dispatch_cleanup_error = _post_dispatch_cleanup_error
 error_module._project_native_error = _project_native_error
 c_two.error = error_module
 sys.modules['c_two'] = c_two
@@ -170,14 +179,15 @@ assert [item.data for item in items] == [b'first', b'second']
 assert events[:5] == [('begin', 'echo'), 'size', ('charge', 5), 'digest', 'encode'], events
 assert events[5:8] == [
     ('stream', b'input'),
-    ('wrap', False, Bound.local_copy_tracker, 'generated-stream', 'echo'),
+    ('wrap', False, Bound.local_copy_tracker, 'generated-stream', 'echo', True),
     ('decode', b'first'),
 ], events
 assert events[-1] == 'close', events
 events.clear()
 held = client.hold_method_1_echo(Payload())
 assert [item.value.data for item in held] == [b'first', b'second']
-assert ('wrap', True, Bound.local_copy_tracker, 'generated-stream', 'echo') in events, events
+assert ('wrap', True, Bound.local_copy_tracker, 'generated-stream', 'echo', True) in events, events
+assert held[0].invalidator is Payload.invalidate
 held[0].release()
 assert events[-1] == ('invalidate', b'first'), events
 assert events.count('close') == 1, events
@@ -232,18 +242,22 @@ except LookupError:
     else:
         raise AssertionError('outer exception hid close failure')
 
-original_invalidate = Payload.invalidate
-def bad_invalidate(self):
-    raise ValueError('invalidating failed')
-Payload.invalidate = bad_invalidate
+# Post-dispatch close() failure must strip stale pre_dispatch markers while
+# preserving the cleanup error as __cause__.
+class PostDispatchClosePhase(Prepared):
+    def close(self):
+        err = CCBaseError('close after stream')
+        err.transport_phase = 'pre_dispatch'
+        raise err
+bound.begin_stream = lambda method: PostDispatchClosePhase()
 try:
-    contract._invalidate_payload(Payload())
+    contract.ContractClient(bound).method_1_echo(Payload())
 except CCBaseError as error:
-    assert error.code == ErrorCode.ClientOutputFromBuffer
-    assert isinstance(error.__cause__, ValueError)
+    assert error.transport_phase is None
+    assert isinstance(error.__cause__, CCBaseError)
+    assert error.__cause__.transport_phase == 'pre_dispatch'
 else:
-    raise AssertionError('invalidation failure disappeared')
-Payload.invalidate = original_invalidate
+    raise AssertionError('post-dispatch close failure disappeared')
 
 # Payload hooks are classified at this adapter boundary, while native charge
 # failures retain their original error and phase.
@@ -272,16 +286,4 @@ except CCBaseError as error:
     assert error is nested
 else:
     raise AssertionError('native charge failure disappeared')
-
-def nested_invalidate(self):
-    raise nested
-Payload.invalidate = nested_invalidate
-try:
-    contract._invalidate_payload(Payload())
-except CCBaseError as error:
-    assert error is not nested and error.__cause__ is nested
-    assert error.code == ErrorCode.ClientOutputFromBuffer and error.transport_phase is None
-else:
-    raise AssertionError('nested invalidation failure was not classified')
-Payload.invalidate = original_invalidate
 "#;

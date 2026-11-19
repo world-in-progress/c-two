@@ -8,7 +8,9 @@ use nested_error_phase::NestedErrorFixture;
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = std::env::args().collect::<Vec<_>>();
     let descriptor = std::fs::read(&args[1])?;
-    let mut fixture = NestedErrorFixture::start(&descriptor, Some(Path::new(&args[2])));
+    let relay_url = args.get(3).map(String::as_str);
+    let mut fixture =
+        NestedErrorFixture::start_with_relay(&descriptor, Some(Path::new(&args[2])), relay_url);
     fixture.reject_b_before_callback();
     println!(
         "READY {} {} {}",

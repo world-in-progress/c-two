@@ -221,9 +221,11 @@ fn prepare_terminal(
                 .ok_or(HttpStreamWireError::InvalidTerminal(
                     "Failed requires a C2E1 error",
                 ))?;
-            // A resource outcome does not inherit a nested call's transport phase.
+            // A resource outcome does not inherit inner call-control entries.
             error.details.remove("transport_phase");
             error.details.remove("dispatch_phase");
+            error.details.remove("fallback_eligible");
+            error.details.remove("route_withdrawal");
             Ok(PreparedTerminal::Failed(count, error))
         }
         HttpStreamStatus::NotExecuted => {
@@ -317,7 +319,7 @@ pub fn decode_terminal(payload: &[u8]) -> Result<HttpStreamTerminal, HttpStreamW
                     .ok_or(HttpStreamWireError::InvalidTerminal(
                         "Failed requires eight count bytes",
                     ))?;
-            let error = decode_error(error)?;
+            let mut error = decode_error(error)?;
             if error.details.contains_key("transport_phase")
                 || error.details.contains_key("dispatch_phase")
             {
@@ -325,6 +327,8 @@ pub fn decode_terminal(payload: &[u8]) -> Result<HttpStreamTerminal, HttpStreamW
                     "Failed resource error carries a transport phase",
                 ));
             }
+            error.details.remove("fallback_eligible");
+            error.details.remove("route_withdrawal");
             Ok(HttpStreamTerminal {
                 status: HttpStreamStatus::Failed,
                 complete_items: Some(u64::from_le_bytes(*count)),
@@ -500,6 +504,12 @@ mod tests {
         inner
             .details
             .insert("transport_phase".into(), "pre_dispatch".into());
+        inner
+            .details
+            .insert("fallback_eligible".into(), "true".into());
+        inner
+            .details
+            .insert("route_withdrawal".into(), "true".into());
         let terminal = HttpStreamTerminal {
             status: HttpStreamStatus::Failed,
             complete_items: Some(1),
@@ -508,13 +518,15 @@ mod tests {
         let record = encode_terminal(&terminal).unwrap();
         assert_eq!(terminal_record_len(&terminal).unwrap(), record.len());
         let decoded = decode_terminal(&record[RECORD_HEADER_LEN..]).unwrap();
-        assert!(
-            !decoded
-                .error
-                .unwrap()
-                .details
-                .contains_key("dispatch_phase")
-        );
+        let details = decoded.error.unwrap().details;
+        for forbidden in [
+            "dispatch_phase",
+            "transport_phase",
+            "fallback_eligible",
+            "route_withdrawal",
+        ] {
+            assert!(!details.contains_key(forbidden), "leaked {forbidden}");
+        }
     }
 
     #[test]

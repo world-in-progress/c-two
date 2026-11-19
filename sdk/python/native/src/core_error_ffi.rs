@@ -30,7 +30,7 @@ pub(crate) fn core_error_to_py(error: Error) -> PyErr {
             Python::attach(|py| {
                 let value = exception.value(py);
                 set_io_cause(value, None);
-                set_semantic_error(value, &error, phase);
+                set_semantic_error(value, &error, phase, true);
                 set_attr(value, "_transport_phase", phase);
             });
             exception
@@ -56,7 +56,7 @@ pub(crate) fn core_error_to_py(error: Error) -> PyErr {
                     set_attr(value, "_transport_phase", phase);
                     set_attr(value, "fallback_eligible", fallback_eligible);
                     if let Some(semantic) = error.semantic_error() {
-                        set_semantic_error(value, &semantic, phase);
+                        set_semantic_error(value, &semantic, phase, false);
                     }
                 },
             )
@@ -108,7 +108,12 @@ pub(crate) fn semantic_error_to_py(py: Python<'_>, error: c2_error::C2Error, pha
 
 /// Project the immutable semantic snapshot of one CoreError value: the code,
 /// its registry name, the inner semantic message and the diagnostic details.
-fn set_semantic_error(value: &Bound<'_, PyAny>, error: &c2_error::C2Error, phase: Option<&str>) {
+fn set_semantic_error(
+    value: &Bound<'_, PyAny>,
+    error: &c2_error::C2Error,
+    phase: Option<&str>,
+    promote_control_details: bool,
+) {
     if let Ok(entries) = PyTuple::new(
         value.py(),
         error.details.iter().map(|(key, item)| (key.as_str(), item.as_str())),
@@ -124,11 +129,13 @@ fn set_semantic_error(value: &Bound<'_, PyAny>, error: &c2_error::C2Error, phase
     set_attr(value, "semantic_message", error.message.as_str());
     let details = PyDict::new(value.py());
     for (key, item) in &error.details {
-        if key == "fallback_eligible" {
-            set_attr(value, "fallback_eligible", item == "true");
-        }
-        if key == "route_withdrawal" {
-            set_attr(value, "route_withdrawal", item == "true");
+        if promote_control_details && phase.is_some() {
+            if key == "fallback_eligible" {
+                set_attr(value, "fallback_eligible", item == "true");
+            }
+            if key == "route_withdrawal" {
+                set_attr(value, "route_withdrawal", item == "true");
+            }
         }
         let _ = details.set_item(key, item);
     }
@@ -560,7 +567,7 @@ pub(crate) fn lifecycle_error_to_py(error: LifecycleError) -> PyErr {
                 set_attr(value, "failure_source", &failure.failure_source);
                 set_attr(value, "route_name", &failure.route_name);
                 if let Some(semantic_error) = &failure.semantic_error {
-                    set_semantic_error(value, semantic_error, phase);
+                    set_semantic_error(value, semantic_error, phase, false);
                 }
                 if let Ok(details) = register_failure_to_dict(value.py(), failure) {
                     set_attr(value, "registration_failure", details.clone());

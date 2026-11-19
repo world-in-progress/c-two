@@ -18,7 +18,7 @@ from c_two.error import (
     ErrorCode, ResourceClosed, ResourceNotFound, SerializationError,
 )
 pytest.importorskip("fastdb4py.payload")
-from fastdb4py.payload import BuildPolicy, Builder, CompiledSpec
+from fastdb4py.payload import BuildPolicy, Builder, CompiledSpec, Payload
 
 ECHO_SPEC = {
     "schema": "fastdb.payload.v1",
@@ -620,3 +620,470 @@ def test_stream_buffer_open_failure_releases_item_and_cancels():
 
 def pickle_should_not_decode(_value):
     raise AssertionError('could not open the stream item buffer')
+
+
+@cc.crm(namespace='test.error-convergence.borrowed', version='0.1.0')
+class _BorrowedFailureContract:
+    @cc.transfer(input=ECHO_SPEC)
+    def fail_unary(self, payload: Payload) -> None: ...
+
+    @cc.stream
+    @cc.transfer(input=ECHO_SPEC, output=ECHO_SPEC)
+    def fail_stream(self, payload: Payload) -> Iterator[Payload]: ...
+
+
+class _BorrowedFailureResource:
+    def __init__(self) -> None:
+        self.saved_unary = None
+        self.saved_stream = None
+
+    def fail_unary(self, payload: Payload) -> None:
+        self.saved_unary = payload
+        raise ValueError(10**5000)
+
+    def fail_stream(self, payload: Payload) -> Iterator[Payload]:
+        self.saved_stream = payload
+        raise ValueError(10**5000)
+        yield payload  # pragma: no cover
+
+
+def test_borrowed_input_invalidated_when_resource_raises_unprintable_exception(tmp_path):
+    from fastdb4py.payload import Payload, PayloadError
+    from c_two.error import ResourceExecutionError
+
+    # Ensure Python's int string conversion limit triggers on 10**5000.
+    previous_limit = sys.get_int_max_str_digits()
+    sys.set_int_max_str_digits(4300)
+    runtime = cc.Runtime()
+    if sys.platform != 'win32':
+        runtime.set_local_endpoint(root=str(tmp_path))
+    resource = _BorrowedFailureResource()
+    runtime.register(
+        _BorrowedFailureContract,
+        resource,
+        name='borrowed-unprintable',
+        input_lifetime={'fail_unary': 'borrowed', 'fail_stream': 'borrowed'},
+    )
+    proxy = runtime.connect(
+        _BorrowedFailureContract,
+        name='borrowed-unprintable',
+        address=runtime.server_address(),
+    )
+    payload_a, _ = echo_payload('alpha')
+    payload_b, _ = echo_payload('beta')
+    assert isinstance(payload_a, Payload)
+    try:
+        with pytest.raises(ResourceExecutionError) as unary_err:
+            proxy.fail_unary(payload_a)
+        assert unary_err.value.code == ErrorCode.ResourceFunctionExecuting
+        assert unary_err.value.transport_phase is None
+        assert resource.saved_unary is not None
+        with pytest.raises(PayloadError):
+            resource.saved_unary.entry_view(0)
+
+        stream = proxy.fail_stream(payload_b)
+        try:
+            with pytest.raises(ResourceExecutionError) as stream_err:
+                next(stream)
+            assert stream_err.value.code == ErrorCode.ResourceFunctionExecuting
+            assert stream_err.value.transport_phase is None
+        finally:
+            assert stream.close()['completed']
+        assert resource.saved_stream is not None
+        with pytest.raises(PayloadError):
+            resource.saved_stream.entry_view(0)
+    finally:
+        sys.set_int_max_str_digits(previous_limit)
+        payload_a.close()
+        payload_b.close()
+        cc.close(proxy)
+        runtime.shutdown()
+
+
+def test_unprintable_output_decode_error_cannot_leak_inner_pre_dispatch():
+    from c_two.crm.payload_plan import PayloadBinding, PayloadPlanKind
+    from c_two.crm.transferable import _build_transfer_wrapper
+
+    class HostileDecodeError(Exception):
+        def __str__(self) -> str:
+            raise ResourceClosed('inner pre_dispatch', transport_phase='pre_dispatch')
+
+    def bad_decode(_data):
+        raise HostileDecodeError('ignored')
+
+    binding = PayloadBinding(
+        kind=PayloadPlanKind.PYTHON_PICKLE,
+        serialize=lambda value: b'ok',
+        deserialize=bad_decode,
+    )
+
+    def unary_op(self): ...
+
+    wrapped_unary = _build_transfer_wrapper(unary_op, output=binding)
+
+    class FakeClient:
+        supports_direct_call = False
+
+        def call(self, _method, _args):
+            return b'payload'
+
+    class FakeCrm:
+        direction = '->'
+        client = FakeClient()
+
+    with pytest.raises(SerializationError) as unary_caught:
+        wrapped_unary(FakeCrm())
+    assert unary_caught.value.code == ErrorCode.ClientOutputDeserializing
+    assert unary_caught.value.transport_phase is None
+    assert isinstance(unary_caught.value.__cause__, HostileDecodeError)
+
+    stream = Stream._from_encoded(_FakeNativeStream([b'payload']), bad_decode)
+    with pytest.raises(SerializationError) as stream_caught:
+        next(stream)
+    assert stream_caught.value.code == ErrorCode.ClientOutputDeserializing
+    assert stream_caught.value.transport_phase is None
+    assert isinstance(stream_caught.value.__cause__, HostileDecodeError)
+
+
+def test_generated_python_stream_client_real_sdk_fastdb_errors_not_double_wrapped(
+    tmp_path, monkeypatch,
+):
+    from fastdb4py.payload import Payload, PayloadError
+
+    fixture = (
+        Path(__file__).resolve().parents[4]
+        / 'core/foundation/c2-contract/tests/fixtures/server-stream.contract.json'
+    )
+    compiled = cc.contract.compile_artifacts(fixture.read_bytes(), target='python')
+    out_dir = tmp_path / 'generated_stream'
+    for artifact in compiled.artifacts:
+        dest = out_dir / artifact.relative_path
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(artifact.bytes)
+    module_path = out_dir / 'python/c_two_contract.py'
+    spec = importlib.util.spec_from_file_location('_gen_stream_real_sdk', module_path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    try:
+        spec.loader.exec_module(module)
+        request_payload, _ = echo_payload('request')
+        valid_payload, _ = echo_payload('reply')
+        valid_bytes = valid_payload.binary_bytes()
+
+        other_spec = CompiledSpec.compile(
+            json.dumps(
+                {
+                    'schema': 'fastdb.payload.v1',
+                    'profile': 'record.v1',
+                    'entries': [
+                        {'id': 'value', 'cardinality': 'one', 'type': {'kind': 'u16', 'nullable': False}},
+                    ],
+                    'components': [],
+                },
+                separators=(',', ':'),
+            ).encode()
+        )
+        other_builder = Builder.create(other_spec)
+        other_builder.entry_begin(0, 1).value_u16(9)
+        other_plan = other_builder.freeze()
+        wrong_payload = other_plan.execute(BuildPolicy.ALLOW_STAGING).payload
+        wrong_bytes = wrong_payload.binary_bytes()
+        other_plan.close()
+        other_builder.close()
+        other_spec.close()
+
+        next_items: list[bytes] = []
+
+        class Prepared:
+            def charge_input(self, _nbytes: int) -> None:
+                return None
+
+            def stream(self, _data: bytes):
+                return _FakeNativeStream(next_items)
+
+            def close(self) -> None:
+                return None
+
+        class Bound:
+            local_copy_tracker = None
+            route_name = 'generated-real-sdk'
+
+            def begin_stream(self, _method: str):
+                return Prepared()
+
+            def call(self, _method: str, _data: bytes) -> bytes:
+                return b''
+
+        client = module.ContractClient(Bound())
+        expected_fastdb_keys = {
+            'cause_owner',
+            'fastdb_code',
+            'fastdb_symbol',
+            'fastdb_path',
+            'fastdb_message',
+            'fastdb_details_json',
+        }
+
+        try:
+            # 1. Corrupt item bytes on both regular and hold_* stream -> code 8 + all 6 FastDB keys.
+            for opener in (client.method_1_echo, client.hold_method_1_echo):
+                next_items[:] = [b'\x00corrupt-fastdb-item']
+                stream = opener(request_payload)
+                with pytest.raises(SerializationError) as corrupt_err:
+                    next(stream)
+                assert corrupt_err.value.code == ErrorCode.ClientOutputFromBuffer
+                assert corrupt_err.value.transport_phase is None
+                assert isinstance(corrupt_err.value.__cause__, PayloadError)
+                assert expected_fastdb_keys <= corrupt_err.value.details.keys()
+                assert corrupt_err.value.details['cause_owner'] == 'fastdb'
+
+            # 2a. Wrong-spec binary rejected in Payload.open_copy -> code 8 + all 6 FastDB keys.
+            next_items[:] = [wrong_bytes]
+            stream = client.method_1_echo(request_payload)
+            with pytest.raises(SerializationError) as wrong_open_err:
+                next(stream)
+            assert wrong_open_err.value.code == ErrorCode.ClientOutputFromBuffer
+            assert wrong_open_err.value.transport_phase is None
+            assert isinstance(wrong_open_err.value.__cause__, PayloadError)
+            assert expected_fastdb_keys <= wrong_open_err.value.details.keys()
+
+            # 2b. require_spec_sha256 mismatch after open_copy -> code 6 + all 6 FastDB keys.
+            payload_mod_name = next(name for name in vars(module) if name.startswith('_PAYLOAD_'))
+            payload_mod = getattr(module, payload_mod_name)
+            next_items[:] = [valid_bytes]
+            stream = client.method_1_echo(request_payload)
+            monkeypatch.setattr(payload_mod, 'PAYLOAD_SHA256_BYTES', b'\x00' * 32)
+            with pytest.raises(SerializationError) as mismatch_err:
+                next(stream)
+            assert mismatch_err.value.code == ErrorCode.ClientOutputDeserializing
+            assert mismatch_err.value.transport_phase is None
+            assert isinstance(mismatch_err.value.__cause__, PayloadError)
+            assert expected_fastdb_keys <= mismatch_err.value.details.keys()
+            monkeypatch.undo()
+
+            # 3. HeldResult.release() with real PayloadError from Payload.invalidate -> code 8 + all 6 FastDB keys.
+            closed_sample, _ = echo_payload('closed')
+            closed_sample.close()
+            try:
+                closed_sample.entry_view(0)
+            except PayloadError as captured_payload_error:
+                real_payload_error = captured_payload_error
+            else:
+                raise AssertionError('expected PayloadError from closed payload')
+
+            original_invalidate = Payload.invalidate
+
+            def failing_invalidate(self):
+                original_invalidate(self)
+                raise real_payload_error
+
+            monkeypatch.setattr(Payload, 'invalidate', failing_invalidate)
+            # Re-bind ContractClient method against updated Payload.invalidate
+            next_items[:] = [valid_bytes]
+            held_stream = client.hold_method_1_echo(request_payload)
+            held_item = next(held_stream)
+            assert isinstance(held_item, cc.HeldResult)
+            with pytest.raises(SerializationError) as release_err:
+                held_item.release()
+            assert release_err.value.code == ErrorCode.ClientOutputFromBuffer
+            assert release_err.value.transport_phase is None
+            assert release_err.value.__cause__ is real_payload_error
+            assert expected_fastdb_keys <= release_err.value.details.keys()
+            assert release_err.value.details['cause_owner'] == 'fastdb'
+        finally:
+            wrong_payload.close()
+            valid_payload.close()
+            request_payload.close()
+    finally:
+        sys.modules.pop(spec.name, None)
+
+
+def test_post_dispatch_prepared_close_failure_strips_pre_dispatch_markers():
+    from c_two.crm.payload_plan import no_payload_binding, python_pickle_output_binding
+    from c_two.crm.transferable import _build_transfer_wrapper
+    import pickle
+
+    cleanup_cause = ResourceClosed(
+        'handle closed after dispatch',
+        details={
+            'transport_phase': 'pre_dispatch',
+            'dispatch_phase': 'pre_dispatch',
+            'fallback_eligible': 'true',
+            'route_withdrawal': 'true',
+            'marker': 'keep',
+        },
+        transport_phase='pre_dispatch',
+    )
+
+    class PreparedUnary:
+        def call(self, _method, _data):
+            return pickle.dumps('ok')
+
+        def close(self):
+            raise cleanup_cause
+
+    class UnaryClient:
+        supports_direct_call = False
+
+        def prepare_call(self, _method):
+            return PreparedUnary()
+
+    class UnaryCrm:
+        direction = '->'
+        client = UnaryClient()
+
+    def unary_fn(self) -> str: ...
+
+    wrapped_unary = _build_transfer_wrapper(
+        unary_fn,
+        input=no_payload_binding(),
+        output=python_pickle_output_binding(unary_fn),
+    )
+    with pytest.raises(ResourceClosed) as unary_err:
+        wrapped_unary(UnaryCrm())
+    assert unary_err.value is not cleanup_cause
+    assert unary_err.value.__cause__ is cleanup_cause
+    assert unary_err.value.transport_phase is None
+    assert unary_err.value.details == {'marker': 'keep'}
+
+    class PreparedStream:
+        def stream(self, _data):
+            return _FakeNativeStream([])
+
+        def close(self):
+            raise cleanup_cause
+
+    class StreamClient:
+        supports_direct_call = False
+        local_copy_tracker = None
+        route_name = 'post-dispatch-stream'
+
+        def begin_stream(self, _method):
+            return PreparedStream()
+
+    class StreamCrm:
+        direction = '->'
+        client = StreamClient()
+
+    def stream_fn(self) -> Iterator[str]: ...
+    stream_fn.__cc_stream__ = True
+
+    wrapped_stream = _build_transfer_wrapper(
+        stream_fn,
+        input=no_payload_binding(),
+        output=python_pickle_output_binding(stream_fn),
+    )
+    with pytest.raises(ResourceClosed) as stream_err:
+        wrapped_stream(StreamCrm())
+    assert stream_err.value is not cleanup_cause
+    assert stream_err.value.__cause__ is cleanup_cause
+    assert stream_err.value.transport_phase is None
+    assert stream_err.value.details == {'marker': 'keep'}
+
+
+class _BatchClosedError(ResourceClosed):
+    __slots__ = ('batch',)
+
+    def __init__(self, batch: int, message: str, details: dict[str, str]):
+        super().__init__(message, details=details, transport_phase='pre_dispatch')
+        self.batch = batch
+
+    def __str__(self) -> str:
+        return f'batch={self.batch}:{self.message}'
+
+
+def test_local_and_ipc_unary_cancelled_error_and_custom_slot_subclass(tmp_path):
+    import asyncio
+    from c_two.error import ResourceExecutionError
+
+    mode = {'kind': 'cancel'}
+
+    class Resource:
+        def echo(self, value):
+            if mode['kind'] == 'cancel':
+                raise asyncio.CancelledError('cancelled inside resource')
+            raise _BatchClosedError(
+                42,
+                'closed batch',
+                {
+                    'transport_phase': 'pre_dispatch',
+                    'dispatch_phase': 'pre_dispatch',
+                    'fallback_eligible': 'true',
+                    'route_withdrawal': 'true',
+                    'marker': 'retained',
+                },
+            )
+
+        def steps(self, value):
+            yield self.echo(value)
+
+    runtime = cc.Runtime()
+    if sys.platform != 'win32':
+        runtime.set_local_endpoint(root=str(tmp_path))
+    runtime.register(CodecBoundary, Resource(), name='local-parity')
+    local = runtime.connect(CodecBoundary, name='local-parity')
+    ipc = runtime.connect(CodecBoundary, name='local-parity', address=runtime.server_address())
+    try:
+        # 1. asyncio.CancelledError becomes ResourceExecutionError(3) across local & IPC unary and streams.
+        for proxy in (local, ipc):
+            with pytest.raises(ResourceExecutionError) as unary_cancel:
+                proxy.echo(None)
+            assert unary_cancel.value.code == ErrorCode.ResourceFunctionExecuting
+            assert unary_cancel.value.transport_phase is None
+            if proxy is local:
+                assert isinstance(unary_cancel.value.__cause__, asyncio.CancelledError)
+
+            stream = proxy.steps(None)
+            try:
+                with pytest.raises(ResourceExecutionError) as stream_cancel:
+                    next(stream)
+                assert stream_cancel.value.code == ErrorCode.ResourceFunctionExecuting
+                assert stream_cancel.value.transport_phase is None
+            finally:
+                assert stream.close()['completed']
+
+        # 2. Custom CCError subclass with __slots__ preserves slot state on local unary and clears controls.
+        mode['kind'] = 'batch'
+        with pytest.raises(_BatchClosedError) as slot_err:
+            local.echo(None)
+        assert slot_err.value.batch == 42
+        assert str(slot_err.value) == 'batch=42:closed batch'
+        assert slot_err.value.transport_phase is None
+        assert slot_err.value.details == {'marker': 'retained'}
+
+        stream = local.steps(None)
+        try:
+            with pytest.raises(ResourceClosed) as local_stream_err:
+                next(stream)
+            assert local_stream_err.value.transport_phase is None
+            assert local_stream_err.value.details == {'marker': 'retained'}
+        finally:
+            assert stream.close()['completed']
+    finally:
+        cc.close(ipc)
+        cc.close(local)
+        runtime.shutdown()
+
+
+def test_custom_plain_bytes_stream_hold_releases_cleanly():
+    invalidated: list[bytes] = []
+    stream = Stream._from_encoded(
+        _FakeNativeStream([b'plain-bytes-item']),
+        bytes,
+        held=True,
+        tracker=object(),
+        route_name='plain-stream',
+        method_name='items',
+        invalidator=invalidated.append,
+    )
+    held = next(stream)
+    assert held.value == b'plain-bytes-item'
+    assert bytes(held.unsafe_buffer) == b'plain-bytes-item'
+    held.release()
+    assert invalidated == [b'plain-bytes-item']
+    with pytest.raises(RuntimeError, match='no longer accessible'):
+        _ = held.value
+    with pytest.raises(RuntimeError, match='no longer accessible'):
+        _ = held.unsafe_buffer
+

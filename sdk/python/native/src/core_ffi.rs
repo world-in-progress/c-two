@@ -736,11 +736,9 @@ fn materialize_python_bytes(py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResul
 pub(crate) fn python_error_to_c2(py: Python<'_>, error: PyErr) -> C2Error {
     if let Some(mut semantic) = semantic_payload_from_exception(py, &error) {
         // A resource callback's error is already canonical: strip any inner
-        // dispatch phase so an inner call's admission detail never leaks into
-        // this call's classification.
+        // call-control detail so downstream admission or routing flags never
+        // leak into this call's classification.
         c2_core::strip_callback_error_phases(&mut semantic);
-        semantic.details.remove("fallback_eligible");
-        semantic.details.remove("route_withdrawal");
         return semantic;
     }
     C2Error::new(ErrorCode::ResourceFunctionExecuting, error.to_string()).with_details(

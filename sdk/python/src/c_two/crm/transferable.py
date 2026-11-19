@@ -184,7 +184,7 @@ class HeldResult(Generic[R]):
         except BaseException as cleanup_error:
             if not _is_finalizing():
                 _warn(
-                    f"HeldResult final release failed: {cleanup_error}",
+                    f"HeldResult final release failed: {_safe_error_message(cleanup_error)}",
                     ResourceWarning,
                     stacklevel=2,
                 )
@@ -252,6 +252,7 @@ def _build_transfer_wrapper(
     def com_to_crm(*args, _c2_buffer=None, _c2_follow_budget=None):
         prepared = None
         primary = None
+        dispatched = False
         input_serializer = (
             input.serialize
             if input is not None and input.kind is not PayloadPlanKind.NO_PAYLOAD
@@ -298,7 +299,9 @@ def _build_transfer_wrapper(
             except error.CCBaseError:
                 raise
             except Exception as exc:
-                raise error.ResourceExecutionError(str(exc), details=_cause_details(exc)) from exc
+                raise error.ResourceExecutionError(
+                    _safe_error_message(exc), details=_cause_details(exc),
+                ) from exc
             return HeldResult(result) if _c2_buffer == "hold" else result
 
         # Reserve before running Python serializer hooks; native preparation owns D.
@@ -333,6 +336,7 @@ def _build_transfer_wrapper(
                 raise _client_input_error(exc) from exc
 
             call_client = client if prepared is None else prepared
+            dispatched = True
             response = call_client.call(method_name, serialized_args)
 
             view = None
@@ -388,10 +392,7 @@ def _build_transfer_wrapper(
         finally:
             try:
                 if prepared is not None:
-                    if primary is None:
-                        prepared.close()
-                    else:
-                        _cleanup_preserving_primary(primary, prepared.close)
+                    _close_prepared_handle(prepared, primary, dispatched)
             finally:
                 del primary
 
@@ -480,22 +481,30 @@ def _build_transfer_wrapper(
             stage = "execute_function"
             result = resource_method(*deserialized_args)
         except BaseException as exc:
-            if stage == "deserialize_input":
-                code = (
-                    error.ErrorCode.ResourceInputFromBuffer
-                    if decode_stage_of(exc) == 'from_buffer'
-                    else error.ErrorCode.ResourceInputDeserializing
-                )
-                failure = error.SerializationError(code, str(exc), details=_cause_details(exc))
-            else:
-                failure = (
-                    error._callback_semantic_copy(exc)
-                    if isinstance(exc, error.CCBaseError)
-                    else None
-                )
-                if failure is None:
-                    failure = error.ResourceExecutionError(str(exc), details=_cause_details(exc))
+            failure: BaseException = exc
             try:
+                if stage == "deserialize_input":
+                    code = (
+                        error.ErrorCode.ResourceInputFromBuffer
+                        if decode_stage_of(exc) == 'from_buffer'
+                        else error.ErrorCode.ResourceInputDeserializing
+                    )
+                    failure = error.SerializationError(
+                        code, _safe_error_message(exc), details=_cause_details(exc),
+                    )
+                else:
+                    projected = (
+                        error._callback_semantic_copy(exc)
+                        if isinstance(exc, error.CCBaseError)
+                        else None
+                    )
+                    failure = (
+                        projected
+                        if projected is not None
+                        else error.ResourceExecutionError(
+                            _safe_error_message(exc), details=_cause_details(exc),
+                        )
+                    )
                 raise failure from exc
             finally:
                 try:
@@ -508,12 +517,13 @@ def _build_transfer_wrapper(
             try:
                 serialized_result = output_serializer(result)
             except BaseException as exc:
-                failure = error.SerializationError(
-                    error.ErrorCode.ResourceOutputSerializing,
-                    str(exc),
-                    details=_cause_details(exc),
-                )
+                failure: BaseException = exc
                 try:
+                    failure = error.SerializationError(
+                        error.ErrorCode.ResourceOutputSerializing,
+                        _safe_error_message(exc),
+                        details=_cause_details(exc),
+                    )
                     raise failure from exc
                 finally:
                     try:
@@ -529,7 +539,7 @@ def _build_transfer_wrapper(
             except BaseException as exc:
                 raise error.SerializationError(
                     error.ErrorCode.ResourceInputFromBuffer,
-                    str(exc),
+                    _safe_error_message(exc),
                     details=_cause_details(exc),
                 ) from exc
 
@@ -744,6 +754,34 @@ def _invalidate_and_release_held_response(
             del first_error
 
 
+def _safe_error_message(value: object) -> str:
+    try:
+        return str(value)
+    except BaseException:
+        return f"<{type(value).__qualname__}: unprintable value>"
+
+
+def _close_prepared_handle(
+    prepared: Any,
+    primary: BaseException | None,
+    dispatched: bool,
+) -> None:
+    if primary is not None:
+        _cleanup_preserving_primary(primary, prepared.close)
+        return
+    try:
+        prepared.close()
+    except BaseException as cleanup_error:
+        if dispatched:
+            cleaned = error._post_dispatch_cleanup_error(cleanup_error)
+            if cleaned is not cleanup_error:
+                try:
+                    raise cleaned from cleanup_error
+                finally:
+                    del cleaned, cleanup_error
+        raise
+
+
 def _cleanup_preserving_primary(
     primary: BaseException,
     cleanup: Callable[[], None],
@@ -777,14 +815,15 @@ def _attach_cleanup_error(primary: BaseException, cleanup: BaseException) -> Non
     primary.__context__ = cleanup
     if sys.version_info >= (3, 11):
         BaseException.add_note(
-            primary, f"C-Two cleanup also failed: {type(cleanup).__name__}: {cleanup}",
+            primary,
+            f"C-Two cleanup also failed: {type(cleanup).__name__}: {_safe_error_message(cleanup)}",
         )
 
 
 def _client_input_error(exc: BaseException) -> error.SerializationError:
     return error.SerializationError(
         error.ErrorCode.ClientInputSerializing,
-        str(exc),
+        _safe_error_message(exc),
         details=_cause_details(exc),
         transport_phase='pre_dispatch',
     )
@@ -797,7 +836,7 @@ def _client_output_error(
     if decoding and decode_stage_of(exc) != 'from_buffer':
         code = error.ErrorCode.ClientOutputDeserializing
     return error.SerializationError(
-        code, str(exc), details=_cause_details(exc), transport_phase=None,
+        code, _safe_error_message(exc), details=_cause_details(exc), transport_phase=None,
     )
 
 
@@ -816,7 +855,7 @@ def _cause_details(exc: BaseException) -> dict[str, str]:
     ):
         value = getattr(exc, source, None)
         if value is not None:
-            fields[target] = str(value)
+            fields[target] = _safe_error_message(value)
     if fields:
         fields["cause_owner"] = "fastdb"
     return fields

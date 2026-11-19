@@ -773,7 +773,7 @@ fn render_python(descriptor: &ValidatedContractDescriptor, methods: &[TargetMeth
          from types import ModuleType\n\
          from typing import Any, Protocol\n\n\
          from fastdb4py.payload import Payload\n\
-         from c_two.error import CCBaseError, ErrorCode, SerializationError, _project_native_error\n\n",
+         from c_two.error import CCBaseError, ErrorCode, SerializationError, _post_dispatch_cleanup_error, _project_native_error\n\n",
     );
     if has_stream {
         output.push_str("from c_two import HeldResult, Stream\n\n");
@@ -916,6 +916,12 @@ fn render_python(descriptor: &ValidatedContractDescriptor, methods: &[TargetMeth
 }
 
 const PYTHON_ERROR_HELPERS: &str = "\
+def _safe_error_text(value: Any) -> str:
+    try:
+        return str(value)
+    except BaseException:
+        return f\"<{type(value).__qualname__}: unprintable value>\"
+
 def _fastdb_cause_details(exc: BaseException) -> dict[str, str]:
     payload_error = getattr(sys.modules.get(\"fastdb4py.payload\"), \"PayloadError\", None)
     if payload_error is None or not isinstance(exc, payload_error):
@@ -930,18 +936,18 @@ def _fastdb_cause_details(exc: BaseException) -> dict[str, str]:
     ):
         value = getattr(exc, source, None)
         if value is not None:
-            fields[target] = str(value)
+            fields[target] = _safe_error_text(value)
     if fields:
         fields[\"cause_owner\"] = \"fastdb\"
     return fields
 
 def _serialization_error(code: ErrorCode, exc: BaseException) -> SerializationError:
-    return SerializationError(code, str(exc), details=_fastdb_cause_details(exc))
+    return SerializationError(code, _safe_error_text(exc), details=_fastdb_cause_details(exc))
 
 def _client_input_error(exc: BaseException) -> SerializationError:
     return SerializationError(
         ErrorCode.ClientInputSerializing,
-        str(exc),
+        _safe_error_text(exc),
         details=_fastdb_cause_details(exc),
         transport_phase=\"pre_dispatch\",
     )
@@ -953,7 +959,7 @@ def _release_failed_payload(payload: Any) -> None:
             close()
     except BaseException as cleanup_error:
         try:
-            print(f\"Warning: payload decode cleanup failed: {cleanup_error}\", file=sys.stderr)
+            print(f\"Warning: payload decode cleanup failed: {_safe_error_text(cleanup_error)}\", file=sys.stderr)
         except BaseException:
             pass
 
@@ -961,15 +967,23 @@ def _note_cleanup_failure(primary: BaseException, cleanup_error: BaseException) 
     try:
         add_note = getattr(primary, \"add_note\", None)
         if add_note is not None:
-            add_note(f\"Cleanup failed: {cleanup_error}\")
+            add_note(f\"Cleanup failed: {_safe_error_text(cleanup_error)}\")
     except BaseException:
         pass
 
-def _close_prepared(prepared: Any, primary: BaseException | None) -> None:
+def _close_prepared(prepared: Any, primary: BaseException | None, dispatched: bool = False) -> None:
     try:
         prepared.close()
     except BaseException as cleanup_error:
         if primary is None:
+            if dispatched:
+                cleaned = _post_dispatch_cleanup_error(cleanup_error)
+                if cleaned is not cleanup_error:
+                    try:
+                        raise cleaned from cleanup_error
+                    finally:
+                        cleaned = None
+                        cleanup_error = None
             raise
         _note_cleanup_failure(primary, cleanup_error)
 
@@ -983,12 +997,6 @@ def _release_response(response: Any, primary: BaseException | None) -> None:
             _note_cleanup_failure(primary, exc)
         else:
             raise _serialization_error(ErrorCode.ClientOutputFromBuffer, exc) from exc
-
-def _invalidate_payload(value: Payload) -> None:
-    try:
-        Payload.invalidate(value)
-    except BaseException as exc:
-        raise _serialization_error(ErrorCode.ClientOutputFromBuffer, exc) from exc
 
 def _project_call(operation, *args):
     \"\"\"Project a native call failure's canonical semantic error, if any.
@@ -1064,7 +1072,7 @@ fn render_python_stream_client_method(output: &mut String, method: &TargetMethod
             "Stream[Payload]"
         };
         let invalidator = if held {
-            ", invalidator=_invalidate_payload"
+            ", invalidator=Payload.invalidate"
         } else {
             ""
         };
@@ -1084,17 +1092,19 @@ fn render_python_stream_client_method(output: &mut String, method: &TargetMethod
             "\n    def {name}(self{parameter}) -> {return_type}:\n\
              \x20       prepared = _project_call(self._bound_client.begin_stream, {method_name})\n\
              \x20       primary = None\n\
+             \x20       dispatched = False\n\
              \x20       try:\n\
              {charge_block}\
              \x20           request = {request}\n\
+             \x20           dispatched = True\n\
              \x20           native = _project_call(prepared.stream, request)\n\
-             \x20           return Stream._from_encoded(native, decode_{symbol}_output, held={held_literal}{invalidator}, tracker=self._bound_client.local_copy_tracker, route_name=self._bound_client.route_name, method_name={method_name})\n\
+             \x20           return Stream._from_encoded(native, decode_{symbol}_output, held={held_literal}{invalidator}, tracker=self._bound_client.local_copy_tracker, route_name=self._bound_client.route_name, method_name={method_name}, decoder_classifies=True)\n\
              \x20       except BaseException as exc:\n\
              \x20           primary = exc\n\
              \x20           raise\n\
              \x20       finally:\n\
              \x20           try:\n\
-             \x20               _close_prepared(prepared, primary)\n\
+             \x20               _close_prepared(prepared, primary, dispatched)\n\
              \x20           finally:\n\
              \x20               primary = None\n",
         ));

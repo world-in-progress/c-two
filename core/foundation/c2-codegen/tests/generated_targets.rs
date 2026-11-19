@@ -478,6 +478,7 @@ error_module = types.ModuleType("c_two.error")
 error_module.CCBaseError = CCBaseError
 error_module.ErrorCode = ErrorCode
 error_module.SerializationError = SerializationError
+error_module._post_dispatch_cleanup_error = lambda exc: exc
 error_module._project_native_error = _project_native_error
 c_two.error = error_module
 sys.modules["c_two"] = c_two

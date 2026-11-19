@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy as _copy
 from collections.abc import Mapping
 from enum import IntEnum, unique
 from types import MemberDescriptorType
@@ -71,6 +72,8 @@ class CCBaseError(Exception):
         state = vars(self).copy()
         if 'details' in state:
             state['details'] = state['details'].copy()
+        if '__notes__' in state and isinstance(state['__notes__'], list):
+            state['__notes__'] = state['__notes__'].copy()
         slots = {}
         for cls in type(self).__mro__:
             if cls is CCBaseError:
@@ -525,16 +528,13 @@ def _strip_callback_phases(details: Mapping[str, str]) -> dict[str, str]:
 def _callback_error_copy(exc: CCError) -> CCError:
     """Fresh copy of an error escaping a resource callback.
 
-    Keeps the class, code, message and business details; clears the inner
-    control details that describe the inner call only.
+    Keeps the subclass instance state (attributes and custom slots), code,
+    message and business details; clears inner call-control details and phase.
     """
-    return _build_error(
-        type(exc),
-        exc.code,
-        exc.message,
-        _strip_callback_phases(exc.details),
-        None,
-    )
+    copied = _copy.copy(exc)
+    copied.details = _strip_callback_phases(exc.details)
+    copied._transport_phase = None
+    return copied
 
 
 def _callback_core_copy(core: CoreError) -> CoreError:
@@ -543,14 +543,41 @@ def _callback_core_copy(core: CoreError) -> CoreError:
     Keeps the structured native facts, drops the outer-inapplicable inner
     dispatch phase, fallback eligibility and inner phase details.
     """
-    copy = CoreError(core.category, core.message)
-    copy.__dict__.update(core.__dict__)
-    copy.details = _strip_callback_phases(core.details)
-    copy._transport_phase = None
-    copy.fallback_eligible = None
-    copy.route_withdrawal = None
-    copy._semantic_snapshot = None
-    return copy
+    copied = _copy.copy(core)
+    copied.details = _strip_callback_phases(core.details)
+    copied._transport_phase = None
+    copied.fallback_eligible = None
+    copied.route_withdrawal = None
+    snapshot = getattr(core, '_semantic_snapshot', None)
+    if snapshot is not None:
+        code, message, entries, _ = snapshot
+        copied._semantic_snapshot = (
+            code,
+            message,
+            tuple((key, value) for key, value in entries if key not in _CALLBACK_DETAIL_KEYS),
+            None,
+        )
+    return copied
+
+
+def _post_dispatch_cleanup_error(exc: BaseException) -> BaseException:
+    """Sanitize a cleanup failure raised after call/stream dispatch succeeded."""
+    if isinstance(exc, CoreError):
+        if (
+            exc.transport_phase is not None
+            or exc.fallback_eligible is not None
+            or exc.route_withdrawal is not None
+            or any(key in exc.details for key in _CALLBACK_DETAIL_KEYS)
+        ):
+            return _callback_core_copy(exc)
+        return exc
+    if isinstance(exc, CCError):
+        if (
+            exc.transport_phase is not None
+            or any(key in exc.details for key in _CALLBACK_DETAIL_KEYS)
+        ):
+            return _callback_error_copy(exc)
+    return exc
 
 
 def _callback_semantic_copy(exc: CCBaseError) -> CCError | None:
