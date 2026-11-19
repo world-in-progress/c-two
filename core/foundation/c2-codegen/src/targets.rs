@@ -1105,11 +1105,11 @@ fn render_python_stream_client_method(output: &mut String, method: &TargetMethod
         let method_name = quoted(method.name);
         let charge_block = if method.input_sha256.is_some() {
             "\
-             \x20           try:\n\
-             \x20               used_bytes = payload.execution_report().used_bytes\n\
-             \x20           except BaseException as exc:\n\
-             \x20               raise _client_input_error(exc) from exc\n\
-             \x20           _project_call(prepared.charge_input, used_bytes)\n"
+             \x20               try:\n\
+             \x20                   used_bytes = payload.execution_report().used_bytes\n\
+             \x20               except BaseException as exc:\n\
+             \x20                   raise _client_input_error(exc) from exc\n\
+             \x20               _project_call(prepared.charge_input, used_bytes)\n"
         } else {
             ""
         };
@@ -1118,46 +1118,51 @@ fn render_python_stream_client_method(output: &mut String, method: &TargetMethod
              \x20       prepared = _project_call(self._bound_client.begin_stream, {method_name})\n\
              \x20       primary = None\n\
              \x20       dispatched = False\n\
-             \x20       native = None\n\
+             \x20       unclaimed = None\n\
              \x20       try:\n\
+             \x20           try:\n\
              {charge_block}\
-             \x20           request = {request}\n\
-             \x20           dispatched = True\n\
-             \x20           native = _project_call(prepared.stream, request)\n\
-             \x20       except BaseException as exc:\n\
-             \x20           primary = exc\n\
-             \x20           raise\n\
+             \x20               request = {request}\n\
+             \x20               dispatched = True\n\
+             \x20               unclaimed = _project_call(prepared.stream, request)\n\
+             \x20           except BaseException as exc:\n\
+             \x20               primary = exc\n\
+             \x20               raise\n\
+             \x20           finally:\n\
+             \x20               try:\n\
+             \x20                   _close_prepared(prepared, primary, dispatched)\n\
+             \x20               except BaseException as close_exc:\n\
+             \x20                   if primary is None:\n\
+             \x20                       primary = close_exc\n\
+             \x20                   close_exc = None\n\
+             \x20                   raise\n\
+             \x20           try:\n\
+             \x20               stream_obj = Stream._from_encoded(unclaimed, decode_{symbol}_output, held={held_literal}{invalidator}, tracker=self._bound_client.local_copy_tracker, route_name=self._bound_client.route_name, method_name={method_name}, decoder_classifies=True)\n\
+             \x20           except BaseException as wrap_exc:\n\
+             \x20               primary = wrap_exc\n\
+             \x20               clean = _post_dispatch_cleanup_error(wrap_exc)\n\
+             \x20               primary = clean\n\
+             \x20               try:\n\
+             \x20                   if clean is not wrap_exc:\n\
+             \x20                       raise clean from wrap_exc\n\
+             \x20                   raise\n\
+             \x20               finally:\n\
+             \x20                   clean = None\n\
+             \x20                   wrap_exc = None\n\
+             \x20           unclaimed = None\n\
+             \x20           return stream_obj\n\
              \x20       finally:\n\
              \x20           try:\n\
-             \x20               _close_prepared(prepared, primary, dispatched)\n\
-             \x20           except BaseException as close_exc:\n\
-             \x20               if native is not None and primary is None:\n\
-             \x20                   try:\n\
-             \x20                       _cancel_unclaimed_stream(native, close_exc)\n\
-             \x20                   finally:\n\
-             \x20                       native = None\n\
-             \x20                       close_exc = None\n\
-             \x20               raise\n\
+             \x20               if unclaimed is not None:\n\
+             \x20                   if primary is not None:\n\
+             \x20                       _cancel_unclaimed_stream(unclaimed, primary)\n\
+             \x20                   else:\n\
+             \x20                       cancel = getattr(unclaimed, 'cancel', None)\n\
+             \x20                       if callable(cancel):\n\
+             \x20                           cancel()\n\
              \x20           finally:\n\
-             \x20               if native is not None and primary is not None:\n\
-             \x20                   try:\n\
-             \x20                       _cancel_unclaimed_stream(native, primary)\n\
-             \x20                   finally:\n\
-             \x20                       native = None\n\
-             \x20               primary = None\n\
-             \x20       try:\n\
-             \x20           return Stream._from_encoded(native, decode_{symbol}_output, held={held_literal}{invalidator}, tracker=self._bound_client.local_copy_tracker, route_name=self._bound_client.route_name, method_name={method_name}, decoder_classifies=True)\n\
-             \x20       except BaseException as wrap_exc:\n\
-             \x20           clean = _post_dispatch_cleanup_error(wrap_exc)\n\
-             \x20           try:\n\
-             \x20               _cancel_unclaimed_stream(native, clean)\n\
-             \x20               if clean is not wrap_exc:\n\
-             \x20                   raise clean from wrap_exc\n\
-             \x20               raise\n\
-             \x20           finally:\n\
-             \x20               native = None\n\
-             \x20               clean = None\n\
-             \x20               wrap_exc = None\n",
+             \x20               unclaimed = None\n\
+             \x20               primary = None\n",
         ));
     }
 }

@@ -506,7 +506,7 @@ for(const code of [705,715])test(`HTTP pre-dispatch ${code} keeps its current ta
   const client=transport.createRelayAwareHttpEncodedTransport('http://localhost:8300',{fetch:async(url)=>{
     if(url.includes('/_resolve/')){resolves++;return textReply(200,JSON.stringify([relayRoute()]))}
     if(url.includes('/_probe/'))return relayResponse();
-    if(++posts===2)return relayResponse(503,new Uint8Array(),{version:1,code,name:code===715?'CallDeadlineExceeded':'ResourceOverloaded',message:'refused',details:{dispatch_phase:'pre_dispatch'}});
+    if(++posts===2)return relayResponse(503,new Uint8Array(),{version:1,code,name:code===715?'CallDeadlineExceeded':'RegistryUnavailable',message:'refused',details:{dispatch_phase:'pre_dispatch'}});
     return relayResponse();
   }});
   await client.call('route',contract,'ping',()=>new Uint8Array());
@@ -636,4 +636,104 @@ test('invalid UTF-8 inside HTTP JSON envelope never grants retrySafe or RouteCon
       return true;
     });
   }finally{await acqClient.close()}
+});
+
+test('compressed HTTP route table and error responses succeed while acquisition failures stay pre_dispatch',async()=>{
+  const {gzipSync}=await import('node:zlib');
+  const routeBytes=new TextEncoder().encode(JSON.stringify([relayRoute()]));
+  const compressed=gzipSync(routeBytes);
+  assert.ok(compressed.byteLength<routeBytes.byteLength);
+  let resolves=0,probes=0,posts=0;
+  const client=transport.createRelayAwareHttpEncodedTransport('http://localhost:8300',{
+    fetch:async(url,init)=>{
+      if(url.includes('/_resolve/')){
+        resolves++;
+        return {
+          status:200,
+          headers:{get(name){
+            const k=name.toLowerCase();
+            if(k==='content-encoding')return 'gzip';
+            if(k==='content-length')return String(compressed.byteLength);
+            return null;
+          }},
+          async arrayBuffer(){return routeBytes.slice().buffer},
+        };
+      }
+      if(url.includes('/_probe/')){probes++;return relayResponse()}
+      assert.equal(init.method,'POST');
+      posts++;
+      return relayResponse(200,Uint8Array.of(42));
+    },
+  });
+  try{
+    const res=await client.call('route',contract,'ping',()=>new Uint8Array());
+    assert.equal(res[0],42);
+    assert.deepEqual({resolves,probes,posts},{resolves:1,probes:1,posts:1});
+  }finally{await client.close()}
+
+  let badResolvePosts=0;
+  const badResolveClient=transport.createRelayAwareHttpEncodedTransport('http://localhost:8300',{
+    fetch:async(_url,init)=>{
+      if(init.method==='POST')badResolvePosts++;
+      return new Response(Uint8Array.of(0x5b,0xff,0x5d),{status:200});
+    },
+  });
+  try{
+    await assert.rejects(badResolveClient.call('route',contract,'ping',()=>new Uint8Array()),err=>{
+      assert.ok(err instanceof transport.C2HttpTransportError);
+      assert.equal(err.transportPhase,'pre_dispatch');
+      assert.equal(err.retrySafe,true);
+      return true;
+    });
+    assert.equal(badResolvePosts,0);
+  }finally{await badResolveClient.close()}
+});
+
+test('probe 719 with bogus dispatch_uncertain stops selection and mismatched code/name denies retrySafe',async()=>{
+  const routes=[relayRoute(1),relayRoute(2)];
+  let resolves=0,probes=0,posts=0;
+  const conflictClient=transport.createRelayAwareHttpEncodedTransport('http://localhost:8300',{
+    fetch:async(url,init)=>{
+      if(url.includes('/_resolve/')){resolves++;return textReply(200,JSON.stringify(routes))}
+      if(url.includes('/_probe/')){
+        probes++;
+        return textReply(409,JSON.stringify({
+          version:1,code:719,name:'RouteConflict',message:'conflict',
+          details:{route:'route',dispatch_phase:'dispatch_uncertain',keep:'1'},
+        }));
+      }
+      if(init.method==='POST')posts++;
+      return relayResponse();
+    },
+  });
+  try{
+    await assert.rejects(conflictClient.call('route',contract,'ping',()=>new Uint8Array()),err=>{
+      assert.ok(err instanceof transport.C2RouteConflictError);
+      assert.equal(err.transportPhase,'pre_dispatch');
+      assert.equal(err.retrySafe,true);
+      assert.deepEqual(err.details,{route:'route',keep:'1'});
+      return true;
+    });
+    assert.deepEqual({resolves,probes,posts},{resolves:1,probes:1,posts:0});
+  }finally{await conflictClient.close()}
+
+  const mismatchClient=transport.createRelayAwareHttpEncodedTransport('http://localhost:8300',{
+    fetch:async(url,init)=>{
+      if(url.includes('/_resolve/'))return textReply(200,JSON.stringify([relayRoute()]));
+      if(url.includes('/_probe/'))return relayResponse();
+      assert.equal(init.method,'POST');
+      return textReply(413,JSON.stringify({
+        version:1,code:717,name:'ResourceNotFound',message:'mismatched envelope',
+        details:{dispatch_phase:'pre_dispatch'},
+      }));
+    },
+  });
+  try{
+    await assert.rejects(mismatchClient.call('route',contract,'ping',()=>new Uint8Array()),err=>{
+      assert.ok(err instanceof transport.C2HttpRelayError);
+      assert.equal(err.status,413);
+      assert.equal(err.retrySafe,false);
+      return true;
+    });
+  }finally{await mismatchClient.close()}
 });

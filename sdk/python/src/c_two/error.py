@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from enum import IntEnum, unique
-from types import MemberDescriptorType
+from types import GetSetDescriptorType, MemberDescriptorType
 from typing import Literal
 
 from c_two import _native
@@ -13,8 +13,20 @@ TransportPhase = Literal['pre_dispatch', 'dispatch_uncertain']
 
 _PHASE_VALUES = ('pre_dispatch', 'dispatch_uncertain')
 _CALLBACK_DETAIL_KEYS = ('transport_phase', 'dispatch_phase', 'fallback_eligible', 'route_withdrawal')
+_SKIPPED_EXCEPTION_DESCRIPTORS = frozenset({
+    '__dict__', 'args', '__traceback__', '__context__', '__cause__', '__suppress_context__',
+})
+_BASE_EXCEPTION_DICT = vars(BaseException)['__dict__']
 _DEFAULT_MESSAGE = 'Error occurred when using C-Two.'
 _UNSET = object()
+
+
+def _raw_instance_dict(exc: BaseException) -> dict[str, object]:
+    try:
+        raw = _BASE_EXCEPTION_DICT.__get__(exc, type(exc))  # type: ignore[union-attr]
+    except BaseException:
+        return {}
+    return raw if isinstance(raw, dict) else {}
 
 
 def _validated_phase(value: object) -> TransportPhase | None:
@@ -65,32 +77,48 @@ class CCBaseError(Exception):
         Read-only; only ``'pre_dispatch'``, ``'dispatch_uncertain'`` and
         ``None`` are valid. Never inferred from arbitrary message text.
         """
-        return getattr(self, '_transport_phase', None)
+        return _raw_get_field(self, '_transport_phase')  # type: ignore[return-value]
 
     def __reduce__(self):
-        state = vars(self).copy()
+        cls = type(self)
+        state = _raw_instance_dict(self).copy()
         if 'details' in state and isinstance(state['details'], Mapping):
             state['details'] = dict(state['details'])
         if '__notes__' in state and isinstance(state['__notes__'], list):
             state['__notes__'] = state['__notes__'].copy()
         slots = {}
-        for cls in type(self).__mro__:
-            if cls is BaseException or cls is object:
+        for base in cls.__mro__:
+            if base is BaseException or base is object:
                 break
-            for name, member in vars(cls).items():
-                if name in ('args', '__traceback__', '__context__', '__cause__'):
+            is_builtin = base.__module__ == 'builtins'
+            for name, member in vars(base).items():
+                if name in _SKIPPED_EXCEPTION_DESCRIPTORS or name in slots:
                     continue
-                if isinstance(member, MemberDescriptorType) and hasattr(self, name):
-                    slot_val = getattr(self, name)
+                if isinstance(member, MemberDescriptorType) or (
+                    is_builtin and isinstance(member, GetSetDescriptorType)
+                ):
+                    try:
+                        slot_val = member.__get__(self, cls)
+                    except (AttributeError, ValueError):
+                        continue
                     if name == 'details' and isinstance(slot_val, Mapping):
                         slot_val = dict(slot_val)
                     slots[name] = slot_val
-        return _rebuild_error, (type(self), self.args), (state, slots)
+        raw_args = BaseException.args.__get__(self, cls)
+        return _rebuild_error, (cls, raw_args), (state, slots)
 
     def __setstate__(self, state):
         attributes, slots = state
-        self.__dict__.update(attributes)
+        _raw_instance_dict(self).update(attributes)
+        cls = type(self)
         for name, value in slots.items():
+            descr = _raw_data_descriptor(cls, name)
+            if descr is not None:
+                try:
+                    descr.__set__(self, value)
+                    continue
+                except (AttributeError, TypeError, ValueError):
+                    continue
             try:
                 setattr(self, name, value)
             except (AttributeError, TypeError, ValueError):
@@ -98,10 +126,12 @@ class CCBaseError(Exception):
 
 
 def _solid_exception_base(target: type[BaseException]) -> type[BaseException]:
+    best: type[BaseException] = BaseException
     for base in target.__mro__:
         if base.__module__ == 'builtins' and issubclass(base, BaseException):
-            return base
-    return BaseException
+            if base.__basicsize__ > best.__basicsize__ or best is BaseException:
+                best = base
+    return best
 
 
 def _rebuild_error(target: type[CCBaseError], args: tuple) -> CCBaseError:
@@ -545,6 +575,18 @@ def _strip_callback_phases(details: Mapping[str, str]) -> dict[str, str]:
     }
 
 
+def _raw_data_descriptor(cls: type, name: str) -> MemberDescriptorType | GetSetDescriptorType | None:
+    for base in cls.__mro__:
+        if base is BaseException or base is object:
+            break
+        member = vars(base).get(name)
+        if isinstance(member, MemberDescriptorType):
+            return member
+        if base.__module__ == 'builtins' and isinstance(member, GetSetDescriptorType):
+            return member
+    return None
+
+
 def _raw_slot_descriptor(cls: type, name: str) -> MemberDescriptorType | None:
     for base in cls.__mro__:
         if base is BaseException or base is object:
@@ -562,12 +604,12 @@ def _raw_get_field(exc: BaseException, name: str, default: object = None) -> obj
             return slot.__get__(exc, type(exc))
         except AttributeError:
             return default
-    return object.__getattribute__(exc, '__dict__').get(name, default)
+    return _raw_instance_dict(exc).get(name, default)
 
 
 def _raw_set_field(exc: BaseException, name: str, value: object) -> None:
     slot = _raw_slot_descriptor(type(exc), name)
-    inst_dict = object.__getattribute__(exc, '__dict__')
+    inst_dict = _raw_instance_dict(exc)
     if slot is not None:
         slot.__set__(exc, value)
         inst_dict.pop(name, None)
@@ -580,7 +622,7 @@ def _clear_copied_phase_fields(copied: CCBaseError) -> None:
     public_slot = _raw_slot_descriptor(type(copied), 'transport_phase')
     if public_slot is not None:
         public_slot.__set__(copied, None)
-    object.__getattribute__(copied, '__dict__').pop('transport_phase', None)
+    _raw_instance_dict(copied).pop('transport_phase', None)
 
 
 def _details_need_cleanup(raw_details: object) -> bool:
@@ -607,8 +649,8 @@ def _clone_exception_without_user_hooks(exc: CCBaseError) -> CCBaseError:
     except TypeError:
         copied = solid.__new__(cls, *raw_args)
     BaseException.args.__set__(copied, raw_args)
-    src_dict = object.__getattribute__(exc, '__dict__')
-    dst_dict = object.__getattribute__(copied, '__dict__')
+    src_dict = _raw_instance_dict(exc)
+    dst_dict = _raw_instance_dict(copied)
     dst_dict.update(src_dict)
     raw_notes = dst_dict.get('__notes__')
     if isinstance(raw_notes, list):
@@ -616,13 +658,16 @@ def _clone_exception_without_user_hooks(exc: CCBaseError) -> CCBaseError:
     for base in cls.__mro__:
         if base is BaseException or base is object:
             break
+        is_builtin = base.__module__ == 'builtins'
         for name, member in vars(base).items():
-            if name in ('args', '__traceback__', '__context__', '__cause__'):
+            if name in _SKIPPED_EXCEPTION_DESCRIPTORS:
                 continue
-            if isinstance(member, MemberDescriptorType):
+            if isinstance(member, MemberDescriptorType) or (
+                is_builtin and isinstance(member, GetSetDescriptorType)
+            ):
                 try:
                     slot_val = member.__get__(exc, cls)
-                except AttributeError:
+                except (AttributeError, ValueError):
                     continue
                 try:
                     member.__set__(copied, slot_val)
@@ -701,6 +746,7 @@ def _callback_core_copy(core: CoreError) -> CoreError:
             raw_cat if isinstance(raw_cat, str) else 'transport',  # type: ignore[arg-type]
             raw_msg if isinstance(raw_msg, str) else _DEFAULT_MESSAGE,
         )
+        _raw_instance_dict(copied).update(_raw_instance_dict(core))
     _raw_set_field(copied, 'details', stripped_details)
     _clear_copied_phase_fields(copied)
     _raw_set_field(copied, 'fallback_eligible', None)
@@ -716,7 +762,7 @@ def _post_dispatch_cleanup_error(exc: BaseException) -> BaseException:
         public_slot = _raw_slot_descriptor(type(exc), 'transport_phase')
         has_public_phase = (
             (public_slot is not None and _raw_get_field(exc, 'transport_phase') is not None)
-            or 'transport_phase' in object.__getattribute__(exc, '__dict__')
+            or 'transport_phase' in _raw_instance_dict(exc)
         )
         if (
             _raw_get_field(exc, '_transport_phase') is not None
@@ -732,7 +778,7 @@ def _post_dispatch_cleanup_error(exc: BaseException) -> BaseException:
         public_slot = _raw_slot_descriptor(type(exc), 'transport_phase')
         has_public_phase = (
             (public_slot is not None and _raw_get_field(exc, 'transport_phase') is not None)
-            or 'transport_phase' in object.__getattribute__(exc, '__dict__')
+            or 'transport_phase' in _raw_instance_dict(exc)
         )
         if (
             _raw_get_field(exc, '_transport_phase') is not None
@@ -750,8 +796,10 @@ def _callback_semantic_copy(exc: CCBaseError) -> CCError | None:
     is copied with inner dispatch phases cleared.
     """
     if isinstance(exc, CoreError):
-        projected = exc.semantic
-        if projected is not None:
+        snapshot = _raw_get_field(exc, '_semantic_snapshot')
+        if isinstance(snapshot, tuple) and len(snapshot) == 4:
+            code, message, details, _ = snapshot
+            projected = CCError._from_parts(code, message, dict(details), transport_phase=None)
             return _callback_error_copy(projected)
         return None
     if isinstance(exc, CCError):

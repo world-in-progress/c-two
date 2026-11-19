@@ -1553,3 +1553,215 @@ def test_http_probe_conflict_without_wire_phase_and_corrupt_utf8_on_acquire():
         server.server_close()
         worker.join(2)
         assert not worker.is_alive()
+
+
+class _DiskCoreError(CoreError, OSError):
+    def __init__(self, message: str):
+        CoreError.__init__(self, 'transport', message)
+        self.raw_os_error = 5
+        self.io_operation = 'connect'
+        self._transport_phase = 'pre_dispatch'
+        self.details = {'dispatch_phase': 'pre_dispatch', 'biz': 'core-io'}
+        self.errno = 5
+        self.strerror = 'Input/output error'
+        self.filename = 'disk.sock'
+
+
+class _BlockingClosedError(ResourceClosed, BlockingIOError):
+    def __init__(self, message: str):
+        ResourceClosed.__init__(
+            self,
+            message,
+            details={'dispatch_phase': 'pre_dispatch', 'biz': 'blocking'},
+            transport_phase='pre_dispatch',
+        )
+        self.errno = 11
+        self.characters_written = 4096
+
+
+class _NoDictClosedError(ResourceClosed):
+    @property
+    def __dict__(self):  # type: ignore[override]
+        raise AttributeError('instance __dict__ is hidden')
+
+
+def test_coreerror_oserror_blockingio_and_nodict_stream_wrap_cancel(tmp_path):
+    import copy
+    import json
+    import pickle
+    import threading
+    from http.server import BaseHTTPRequestHandler
+    from c_two import error as cc_err
+    from c_two.crm.payload_plan import no_payload_binding, python_pickle_output_binding
+    from c_two.crm.transferable import _build_transfer_wrapper
+    from c_two.error import ProtocolViolation
+    from tests.fixtures.http_server import LoopbackHTTPServer
+
+    # 1. CoreError + OSError preserves C layout & CoreError diagnostics across copy, pickle & cleanup.
+    disk_core = _DiskCoreError('disk core failure')
+    for clone in (copy.copy(disk_core), pickle.loads(pickle.dumps(disk_core))):
+        assert isinstance(clone, _DiskCoreError)
+        assert clone.raw_os_error == 5
+        assert clone.io_operation == 'connect'
+        assert clone.errno == 5
+        assert clone.filename == 'disk.sock'
+
+    cleaned_core = cc_err._post_dispatch_cleanup_error(disk_core)
+    assert isinstance(cleaned_core, _DiskCoreError)
+    assert cleaned_core is not disk_core
+    assert cleaned_core.transport_phase is None
+    assert cleaned_core.raw_os_error == 5
+    assert cleaned_core.io_operation == 'connect'
+    assert cleaned_core.errno == 5
+    assert cleaned_core.filename == 'disk.sock'
+    assert cleaned_core.details == {'biz': 'core-io'}
+
+    # 2. ResourceClosed + BlockingIOError preserves getset descriptor characters_written across all 3 paths.
+    blocking = _BlockingClosedError('partial write before close')
+    for clone in (copy.copy(blocking), pickle.loads(pickle.dumps(blocking))):
+        assert isinstance(clone, _BlockingClosedError)
+        assert clone.code == ErrorCode.ResourceClosed
+        assert clone.characters_written == 4096
+
+    runtime = cc.Runtime()
+    if sys.platform != 'win32':
+        ipc_dir = tmp_path / 'ipc'
+        ipc_dir.mkdir()
+        runtime.set_local_endpoint(root=str(ipc_dir))
+
+    class Resource:
+        def echo(self, value):
+            raise blocking
+
+        def steps(self, value):
+            yield value
+
+    runtime.register(CodecBoundary, Resource(), name='blocking-io')
+    local = runtime.connect(CodecBoundary, name='blocking-io')
+    try:
+        with pytest.raises(_BlockingClosedError) as cb_err:
+            local.echo(None)
+        assert cb_err.value is not blocking
+        assert cb_err.value.transport_phase is None
+        assert cb_err.value.characters_written == 4096
+        assert cb_err.value.details == {'biz': 'blocking'}
+        assert blocking.transport_phase == 'pre_dispatch'
+    finally:
+        cc.close(local)
+        runtime.shutdown()
+
+    # 3. Stream wrapper metadata error with hidden __dict__ still cancels native stream once & sanitizes phase.
+    fixture = (
+        Path(__file__).resolve().parents[4]
+        / 'core/foundation/c2-contract/tests/fixtures/server-stream.contract.json'
+    )
+    compiled = cc.contract.compile_artifacts(fixture.read_bytes(), target='python')
+    out_dir = tmp_path / 'gen_nodict'
+    for artifact in compiled.artifacts:
+        dest = out_dir / artifact.relative_path
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(artifact.bytes)
+    spec = importlib.util.spec_from_file_location('_gen_nodict_mod', out_dir / 'python/c_two_contract.py')
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    req_payload, _ = echo_payload('req')
+    try:
+        spec.loader.exec_module(module)
+        holder: dict[str, _FakeNativeStream] = {}
+
+        class Prepared:
+            def charge_input(self, _n: int) -> None:
+                return None
+
+            def stream(self, _data: bytes):
+                ns = _FakeNativeStream([])
+                holder['last'] = ns
+                return ns
+
+            def close(self) -> None:
+                return None
+
+        class BrokenTrackerClient:
+            supports_direct_call = False
+            route_name = 'nodict-route'
+
+            @property
+            def local_copy_tracker(self):
+                raise _NoDictClosedError(
+                    'tracker boom',
+                    details={'dispatch_phase': 'pre_dispatch', 'biz': 'nodict'},
+                    transport_phase='pre_dispatch',
+                )
+
+            def begin_stream(self, _method: str):
+                return Prepared()
+
+            def call(self, _method: str, _data: bytes) -> bytes:
+                return b''
+
+        gen_client = module.ContractClient(BrokenTrackerClient())
+        with pytest.raises(_NoDictClosedError) as gen_wrap_err:
+            gen_client.method_1_echo(req_payload)
+        assert gen_wrap_err.value.transport_phase is None
+        assert gen_wrap_err.value.details == {'biz': 'nodict'}
+        assert holder['last'].cancel_calls == 1
+
+        def crm_stream_fn(self) -> Iterator[str]: ...
+        crm_stream_fn.__cc_stream__ = True
+
+        wrapped_crm = _build_transfer_wrapper(
+            crm_stream_fn,
+            input=no_payload_binding(),
+            output=python_pickle_output_binding(crm_stream_fn),
+        )
+
+        class CrmInstance:
+            direction = '->'
+            client = BrokenTrackerClient()
+
+        with pytest.raises(_NoDictClosedError) as crm_wrap_err:
+            wrapped_crm(CrmInstance())
+        assert crm_wrap_err.value.transport_phase is None
+        assert crm_wrap_err.value.details == {'biz': 'nodict'}
+        assert holder['last'].cancel_calls == 1
+    finally:
+        req_payload.close()
+        sys.modules.pop(spec.name, None)
+
+    # 4. Corrupt UTF-8 409 on POST /_register surfaces ProtocolViolation(713), never ResourceAlreadyRegistered.
+    class BadRegisterRelay(BaseHTTPRequestHandler):
+        def do_POST(self):
+            body = b'{"version":1,"code":719,"name":"RouteConflict","message":"bad \xff byte","details":{}}'
+            self.send_response(409)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *_args):
+            pass
+
+    server = LoopbackHTTPServer(('127.0.0.1', 0), BadRegisterRelay)
+    server.daemon_threads = False
+    worker = threading.Thread(target=server.serve_forever)
+    worker.start()
+    reg_runtime = cc.Runtime()
+    if sys.platform != 'win32':
+        reg_dir = tmp_path / 'reg_ipc'
+        reg_dir.mkdir()
+        reg_runtime.set_local_endpoint(root=str(reg_dir))
+    reg_runtime.set_relay_anchor(f'http://127.0.0.1:{server.server_port}')
+    try:
+        with pytest.raises(ProtocolViolation) as reg_err:
+            reg_runtime.register(CodecBoundary, Resource(), name='corrupt-reg')
+        assert reg_err.value.code == ErrorCode.ProtocolViolation
+        assert isinstance(reg_err.value.__cause__, CoreError)
+        assert reg_err.value.__cause__.status_code == 409
+        assert reg_err.value.__cause__.relay_duplicate is False
+    finally:
+        reg_runtime.shutdown()
+        server.shutdown()
+        server.server_close()
+        worker.join(2)
+        assert not worker.is_alive()

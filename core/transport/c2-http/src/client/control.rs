@@ -416,14 +416,31 @@ impl RelayControlClient {
 async fn read_strict_control_error(status: u16, resp: reqwest::Response) -> HttpError {
     let bytes = match resp.bytes().await {
         Ok(bytes) => bytes,
-        Err(error) => return HttpError::Request(error),
+        Err(error) => return malformed_control_error(status, "error_body_read_failed", &error),
     };
     match String::from_utf8(bytes.to_vec()) {
         Ok(text) => HttpError::ServerError(status, text),
-        Err(error) => {
-            HttpError::ServerError(status, format!("invalid UTF-8 HTTP error body: {error}"))
-        }
+        Err(error) => malformed_control_error(status, "error_body_invalid_utf8", &error),
     }
+}
+
+fn malformed_control_error(
+    status: u16,
+    reason: &'static str,
+    cause: &impl std::fmt::Display,
+) -> HttpError {
+    let error = c2_error::C2Error::new(
+        c2_error::ErrorCode::ProtocolViolation,
+        format!("HTTP control error body is malformed: {cause}"),
+    )
+    .with_details(std::collections::BTreeMap::from([
+        ("transport".into(), "http".into()),
+        ("reason".into(), reason.into()),
+    ]));
+    HttpError::ServerError(
+        status,
+        serde_json::to_string(&error.envelope()).expect("canonical error envelope is serializable"),
+    )
 }
 
 #[cfg(test)]
@@ -695,33 +712,96 @@ mod tests {
             .unwrap_err();
         match resolve_err {
             HttpError::ServerError(409, body) => {
-                assert!(
-                    body.starts_with("invalid UTF-8 HTTP error body:"),
-                    "unexpected resolve error body: {body}"
-                );
-                assert!(
-                    serde_json::from_str::<c2_error::C2ErrorEnvelope>(&body).is_err(),
-                    "corrupt UTF-8 body must never parse as a canonical envelope: {body}"
+                let envelope: c2_error::C2ErrorEnvelope =
+                    serde_json::from_str(&body).expect("malformed control body emits 713 envelope");
+                let parsed = c2_error::C2Error::from_envelope(envelope).unwrap();
+                assert_eq!(parsed.code, c2_error::ErrorCode::ProtocolViolation);
+                assert_eq!(
+                    parsed.details.get("reason").map(String::as_str),
+                    Some("error_body_invalid_utf8")
                 );
             }
             other => panic!("unexpected resolve error: {other}"),
         }
 
         let post_err = client
-            .post_json_once("/_register", &serde_json::json!({"name": "r"}), &[200])
+            .post_json_with_retry("/_register", &serde_json::json!({"name": "r"}), &[200])
             .await
             .unwrap_err();
         match post_err {
             HttpError::ServerError(409, body) => {
-                assert!(
-                    body.starts_with("invalid UTF-8 HTTP error body:"),
-                    "unexpected post error body: {body}"
+                let envelope: c2_error::C2ErrorEnvelope = serde_json::from_str(&body).unwrap();
+                let parsed = c2_error::C2Error::from_envelope(envelope).unwrap();
+                assert_eq!(parsed.code, c2_error::ErrorCode::ProtocolViolation);
+                assert_eq!(
+                    parsed.details.get("reason").map(String::as_str),
+                    Some("error_body_invalid_utf8")
                 );
-                assert!(serde_json::from_str::<c2_error::C2ErrorEnvelope>(&body).is_err());
             }
             other => panic!("unexpected post error: {other}"),
         }
 
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn truncated_4xx_control_error_keeps_status_and_does_not_retry() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&requests);
+        let server = tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                seen.fetch_add(1, Ordering::SeqCst);
+                let mut buf = [0_u8; 2048];
+                let _ = stream.read(&mut buf).await;
+                let _ = stream
+                    .write_all(
+                        b"HTTP/1.1 409 Conflict\r\nContent-Type: application/json\r\nContent-Length: 512\r\nConnection: close\r\n\r\n{\"version\":",
+                    )
+                    .await;
+                let _ = stream.shutdown().await;
+            }
+        });
+
+        let client = RelayControlClient::new_with_config(
+            &format!("http://{addr}"),
+            false,
+            RelayControlClientConfig {
+                timeout: Duration::from_secs(2),
+                retry_attempts: 3,
+                retry_delay: Duration::from_millis(5),
+            },
+        )
+        .unwrap();
+        let err = client
+            .post_json_with_retry("/_register", &serde_json::json!({"name": "r"}), &[200])
+            .await
+            .unwrap_err();
+        server.abort();
+
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            1,
+            "received 4xx headers must not retry even when error body is truncated"
+        );
+        match err {
+            HttpError::ServerError(409, body) => {
+                let envelope: c2_error::C2ErrorEnvelope = serde_json::from_str(&body).unwrap();
+                let parsed = c2_error::C2Error::from_envelope(envelope).unwrap();
+                assert_eq!(parsed.code, c2_error::ErrorCode::ProtocolViolation);
+                assert_eq!(
+                    parsed.details.get("reason").map(String::as_str),
+                    Some("error_body_read_failed")
+                );
+            }
+            other => panic!("expected ServerError(409, ...), got {other}"),
+        }
     }
 }

@@ -250,12 +250,12 @@ export class C2HttpRelayError extends Error {
 export class C2HttpTransportError extends Error {
   readonly cannotConnect: boolean;
   readonly transportPhase: "pre_dispatch" | "dispatch_uncertain";
-  constructor(message: string, cause?: unknown) {
+  constructor(message: string, cause?: unknown, transportPhase?: "pre_dispatch" | "dispatch_uncertain") {
     super(`C-Two HTTP transport error: ${message}`, cause === undefined ? undefined : { cause });
     this.name = "C2HttpTransportError";
     Object.setPrototypeOf(this, C2HttpTransportError.prototype);
     this.cannotConnect = httpConnectFailure(cause);
-    this.transportPhase = this.cannotConnect ? "pre_dispatch" : "dispatch_uncertain";
+    this.transportPhase = transportPhase ?? (this.cannotConnect ? "pre_dispatch" : "dispatch_uncertain");
   }
   get retrySafe(): boolean { return this.transportPhase === "pre_dispatch"; }
 }
@@ -900,7 +900,7 @@ function createRelayTransport<Payload extends C2ResponsePayload>(baseUrl: string
   const observeFailure = (target: C2RelayTarget<Payload>, failure: unknown): void => {
     const error = projectNativeError(failure);
     const code = preDispatchRouteCode(error);
-    if (code === 701 || code === 707 || code === 708 || code === 709) target.needsAcquire = true;
+    if (code === 701 || code === 707 || code === 708 || code === 709 || code === 719) target.needsAcquire = true;
     if (terminalRouteRefusal(error)) target.terminal = error;
     if (error instanceof C2HttpTransportError && error.cannotConnect) target.needsAcquire = true;
     if (target.local !== undefined && error instanceof C2IpcTransportError && error.code === 707 && error.transportPhase === "pre_dispatch" && error.details.route === undefined) {
@@ -1170,7 +1170,8 @@ async function readHttpSuccessResponsePayload<Payload extends C2ResponsePayload>
   unknownLengthMaxBytes: number,
 ): Promise<Payload> {
   if (allocator !== undefined) {
-    const contentLength = responseContentLength(response);
+    const wireContentLength = responseContentLength(response);
+    const contentLength = responseHasIdentityContentEncoding(response) ? wireContentLength : undefined;
     if (contentLength === undefined) {
       if (unknownLengthStrategy !== "buffer") {
         throw new Error("C-Two HTTP relay response Content-Length is required when responsePayloadAllocator is configured.");
@@ -1194,10 +1195,22 @@ async function readHttpSuccessResponsePayload<Payload extends C2ResponsePayload>
 async function readHttpArrayBufferResponsePayload(response: C2FetchResponse): Promise<Uint8Array> {
   const contentLength = responseContentLength(response);
   const payload = new Uint8Array(await response.arrayBuffer());
-  if (contentLength !== undefined && payload.byteLength !== contentLength) {
+  if (payload.byteLength > C2_MAX_RESPONSE_PAYLOAD_BYTES) {
+    throw new Error(`C-Two HTTP relay response body must be no greater than ${C2_MAX_RESPONSE_PAYLOAD_BYTES} bytes.`);
+  }
+  if (contentLength !== undefined && responseHasIdentityContentEncoding(response) && payload.byteLength !== contentLength) {
     throw new Error("C-Two HTTP relay response body byte length does not match Content-Length.");
   }
   return payload;
+}
+
+function responseHasIdentityContentEncoding(response: C2FetchResponse): boolean {
+  const rawValue = response.headers?.get("content-encoding");
+  if (rawValue === undefined || rawValue === null) {
+    return true;
+  }
+  const normalized = rawValue.trim().toLowerCase();
+  return normalized.length === 0 || normalized === "identity";
 }
 
 function responseContentLength(response: C2FetchResponse): number | undefined {
@@ -1593,7 +1606,7 @@ async function probeResolvedHttpRoute(
         },
       );
     } catch (error) {
-      throw new C2HttpTransportError(`C-Two HTTP relay probe fetch failed: ${String(error)}`, error);
+      throw new C2HttpTransportError(`C-Two HTTP relay probe fetch failed: ${String(error)}`, error, "pre_dispatch");
     }
     if (response.status === 200) {
       return;
@@ -1602,7 +1615,7 @@ async function probeResolvedHttpRoute(
     try {
       bodyBytes = await readHttpArrayBufferResponsePayload(response);
     } catch (error) {
-      throw new C2HttpTransportError(`C-Two HTTP relay probe body read failed: ${String(error)}`);
+      throw new C2HttpTransportError(`C-Two HTTP relay probe body read failed: ${String(error)}`, error, "pre_dispatch");
     }
     throw projectHttpAcquisitionError(response.status, bodyBytes);
   }, timeoutMs, "C-Two HTTP relay probe");
@@ -1748,6 +1761,7 @@ function samePathFallbackDeniedError(
         route: routeName,
       },
     }),
+    "pre_dispatch",
   );
   if (firstCause !== undefined) denied.cause = firstCause;
   return denied;
@@ -1762,6 +1776,7 @@ function resourceNotFoundError(routeName: string): C2HttpRelayError {
       message: `route not found: ${routeName}`,
       details: { route: routeName, dispatch_phase: "pre_dispatch" },
     }),
+    "pre_dispatch",
   );
 }
 
@@ -1865,14 +1880,14 @@ async function resolveRelayRoutes(
         signal,
       });
     } catch (error) {
-      throw new C2HttpTransportError(`C-Two relay resolve fetch failed: ${String(error)}`);
+      throw new C2HttpTransportError(`C-Two relay resolve fetch failed: ${String(error)}`, error, "pre_dispatch");
     }
     if (response.status !== 200) {
       let bodyBytes: Uint8Array;
       try {
         bodyBytes = await readHttpArrayBufferResponsePayload(response);
       } catch (error) {
-        throw new C2HttpTransportError(`C-Two relay resolve body read failed: ${String(error)}`);
+        throw new C2HttpTransportError(`C-Two relay resolve body read failed: ${String(error)}`, error, "pre_dispatch");
       }
       throw projectHttpAcquisitionError(response.status, bodyBytes);
     }
@@ -1880,31 +1895,35 @@ async function resolveRelayRoutes(
     try {
       bodyBytes = await readHttpArrayBufferResponsePayload(response);
     } catch (error) {
-      throw new C2HttpTransportError(`C-Two relay resolve body read failed: ${String(error)}`);
+      throw new C2HttpTransportError(`C-Two relay resolve body read failed: ${String(error)}`, error, "pre_dispatch");
     }
     let body: string;
     try {
       body = C2_STRICT_UTF8_DECODER.decode(bodyBytes);
     } catch (error) {
-      throw new C2HttpTransportError(`C-Two relay resolve returned invalid UTF-8: ${String(error)}`);
+      throw new C2HttpTransportError(`C-Two relay resolve returned invalid UTF-8: ${String(error)}`, error, "pre_dispatch");
     }
     let payload: unknown;
     try {
       payload = JSON.parse(body) as unknown;
     } catch (error) {
-      throw new C2HttpTransportError(`C-Two relay resolve returned invalid JSON: ${String(error)}`);
+      throw new C2HttpTransportError(`C-Two relay resolve returned invalid JSON: ${String(error)}`, error, "pre_dispatch");
     }
     if (!Array.isArray(payload)) {
-      throw new C2HttpTransportError("C-Two relay resolve returned a non-array route response.");
+      throw new C2HttpTransportError("C-Two relay resolve returned a non-array route response.", undefined, "pre_dispatch");
     }
     let routes: C2RelayRouteInfo[];
     try {
       routes = payload.map((route, index) => normalizeRelayRouteInfo(route, index));
     } catch (error) {
-      throw new C2HttpTransportError(`C-Two relay resolve payload shape invalid: ${String(error)}`);
+      throw new C2HttpTransportError(`C-Two relay resolve payload shape invalid: ${String(error)}`, error, "pre_dispatch");
     }
-    for (let index = 0; index < routes.length; index += 1) {
-      validateRelayRouteContract(routes[index], index, routeName, contract);
+    try {
+      for (let index = 0; index < routes.length; index += 1) {
+        validateRelayRouteContract(routes[index], index, routeName, contract);
+      }
+    } catch (error) {
+      throw new C2HttpTransportError(`C-Two relay resolve contract invalid: ${String(error)}`, error, "pre_dispatch");
     }
     return routes;
   }, resolveTimeoutMs, "C-Two relay resolve");
@@ -2009,6 +2028,34 @@ function httpConnectFailure(error: unknown): boolean {
   return httpConnectFailure(cause.cause);
 }
 
+const C2_ERROR_CODE_NAMES: Readonly<Record<number, string>> = Object.freeze({
+  0: "Unknown",
+  1: "ResourceInputDeserializing",
+  2: "ResourceOutputSerializing",
+  3: "ResourceFunctionExecuting",
+  4: "ResourceInputFromBuffer",
+  5: "ClientInputSerializing",
+  6: "ClientOutputDeserializing",
+  7: "ClientCallingResource",
+  8: "ClientOutputFromBuffer",
+  701: "ResourceNotFound",
+  702: "ResourceUnavailable",
+  703: "ResourceAlreadyRegistered",
+  705: "RegistryUnavailable",
+  707: "ResourceClosed",
+  708: "ResourceRemoved",
+  709: "ContractMismatch",
+  710: "IdentityMismatch",
+  712: "RouteWatchUnavailable",
+  713: "ProtocolViolation",
+  714: "FallbackDenied",
+  715: "CallDeadlineExceeded",
+  716: "UnsupportedCallMode",
+  717: "CallCapacityExceeded",
+  718: "CallCancelled",
+  719: "RouteConflict",
+});
+
 function parseCanonicalRelayError(
   body: string,
 ): { readonly version: 1; readonly code: number; readonly name: string; readonly message: string; readonly details: Readonly<Record<string, string>> } | undefined {
@@ -2019,6 +2066,10 @@ function parseCanonicalRelayError(
     }
     const record = parsed as Record<string, unknown>;
     if (record.version !== 1 || !Number.isSafeInteger(record.code) || typeof record.name !== "string" || typeof record.message !== "string") {
+      return undefined;
+    }
+    const expectedName = C2_ERROR_CODE_NAMES[record.code as number];
+    if (expectedName === undefined || record.name !== expectedName) {
       return undefined;
     }
     if (
@@ -2041,13 +2092,23 @@ function parseCanonicalRelayError(
   }
 }
 
+function sanitizeAcquisitionDetails(details: Readonly<Record<string, string>>): Readonly<Record<string, string>> {
+  const out: Record<string, string> = {};
+  for (const [key, value] of Object.entries(details)) {
+    if ((key === "dispatch_phase" || key === "transport_phase") && value !== "pre_dispatch") {
+      continue;
+    }
+    out[key] = value;
+  }
+  return out;
+}
+
 function projectHttpAcquisitionError(status: number, rawBody: string | Uint8Array): Error {
   const decoded = decodeHttpErrorBody(rawBody);
   if (decoded.validUtf8) {
     const canonical = parseCanonicalRelayError(decoded.body);
-    if (status === 409 && canonical?.code === 719 && canonical.name === "RouteConflict" &&
-        (canonical.details.dispatch_phase === undefined || canonical.details.dispatch_phase === "pre_dispatch")) {
-      return new C2RouteConflictError(canonical.message, canonical.details);
+    if (status === 409 && canonical?.code === 719) {
+      return new C2RouteConflictError(canonical.message, sanitizeAcquisitionDetails(canonical.details));
     }
   }
   return new C2HttpRelayError(status, rawBody, "pre_dispatch");

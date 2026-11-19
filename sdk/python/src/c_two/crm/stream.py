@@ -361,58 +361,63 @@ def _build_stream_wrapper(func, input_binding, output_binding):
         prepared = client.begin_stream(method_name)
         primary = None
         dispatched = False
-        native = None
+        unclaimed = None
         try:
-            if input_binding.kind is PayloadPlanKind.FASTDB:
+            try:
+                if input_binding.kind is PayloadPlanKind.FASTDB:
+                    try:
+                        nbytes = values[0].execution_report().used_bytes
+                    except BaseException as exc:
+                        raise _client_input_error(exc) from exc
+                    prepared.charge_input(nbytes)
                 try:
-                    nbytes = values[0].execution_report().used_bytes
+                    data = input_binding.serialize(*values) if input_binding.serialize is not None else b''
                 except BaseException as exc:
                     raise _client_input_error(exc) from exc
-                prepared.charge_input(nbytes)
-            try:
-                data = input_binding.serialize(*values) if input_binding.serialize is not None else b''
+                dispatched = True
+                unclaimed = _native_call(prepared.stream, data)
             except BaseException as exc:
-                raise _client_input_error(exc) from exc
-            dispatched = True
-            native = _native_call(prepared.stream, data)
-        except BaseException as exc:
-            primary = exc
-            raise
+                primary = exc
+                raise
+            finally:
+                try:
+                    _close_prepared_handle(prepared, primary, dispatched)
+                except BaseException as close_exc:
+                    if primary is None:
+                        primary = close_exc
+                    close_exc = None
+                    raise
+            try:
+                stream_obj = Stream._from_encoded(
+                    unclaimed, output_binding.deserialize, held=_c2_buffer == 'hold',
+                    tracker=client.local_copy_tracker, route_name=client.route_name,
+                    method_name=method_name, invalidator=output_binding.invalidate,
+                )
+            except BaseException as wrap_exc:
+                primary = wrap_exc
+                clean = error._post_dispatch_cleanup_error(wrap_exc)
+                primary = clean
+                try:
+                    if clean is not wrap_exc:
+                        raise clean from wrap_exc
+                    raise
+                finally:
+                    clean = None
+                    wrap_exc = None
+            unclaimed = None
+            return stream_obj
         finally:
             try:
-                _close_prepared_handle(prepared, primary, dispatched)
-            except BaseException as close_exc:
-                if native is not None and primary is None:
-                    try:
-                        _cancel_unclaimed_stream(native, close_exc)
-                    finally:
-                        native = None
-                        close_exc = None
-                raise
+                if unclaimed is not None:
+                    if primary is not None:
+                        _cancel_unclaimed_stream(unclaimed, primary)
+                    else:
+                        cancel = getattr(unclaimed, 'cancel', None)
+                        if callable(cancel):
+                            cancel()
             finally:
-                if native is not None and primary is not None:
-                    try:
-                        _cancel_unclaimed_stream(native, primary)
-                    finally:
-                        native = None
+                unclaimed = None
                 primary = None
-        try:
-            return Stream._from_encoded(
-                native, output_binding.deserialize, held=_c2_buffer == 'hold',
-                tracker=client.local_copy_tracker, route_name=client.route_name,
-                method_name=method_name, invalidator=output_binding.invalidate,
-            )
-        except BaseException as wrap_exc:
-            clean = error._post_dispatch_cleanup_error(wrap_exc)
-            try:
-                _cancel_unclaimed_stream(native, clean)
-                if clean is not wrap_exc:
-                    raise clean from wrap_exc
-                raise
-            finally:
-                native = None
-                clean = None
-                wrap_exc = None
 
     invoke._input_payload_binding = input_binding
     invoke._output_payload_binding = output_binding
