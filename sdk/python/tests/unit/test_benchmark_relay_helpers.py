@@ -167,7 +167,7 @@ def test_benchmark_http_calls_and_cleanup(script, start_c3_relay, monkeypatch, t
             assert not payload.exists()
         else:
             monkeypatch.setattr(module, '_relay_port', port)
-            monkeypatch.setattr(module, '_SEGMENT_SIZE', 1024 * 1024)
+            monkeypatch.setattr(module, '_MEMORY_BUDGET_BYTES', 1024 * 1024)
             monkeypatch.setattr(module, '_rounds', lambda _: 2)
             monkeypatch.setattr(module, 'WARMUP', 1)
             assert module.bench_relay(64) is not None

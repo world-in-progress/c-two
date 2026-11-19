@@ -5,11 +5,11 @@ async fn loan_one_item(harness: &mut Harness, id: u64) -> BuddyPayload {
     harness.open(id, &[1]).await;
     assert!(matches!(
         read_record(&mut harness.peer, CallMode::ServerStream).await,
-        SeenRecord::Begin(4096)
+        SeenRecord::Begin(32768)
     ));
     harness
         .peer
-        .write_all(&rpc::encode_credit_frame(id, 4096, 0).unwrap())
+        .write_all(&rpc::encode_credit_frame(id, 32768, 0).unwrap())
         .await
         .unwrap();
     let SeenRecord::ShmData(loan) = read_record(&mut harness.peer, CallMode::ServerStream).await
@@ -34,15 +34,10 @@ async fn connected_peer_without_release_keeps_original_loan_past_maintenance_and
     // reclaim a connected peer's loan, even after the stream's terminal. Only
     // its real RELEASE or read-side peer end settles the original allocation.
     let observed = Arc::new(Observed::default());
-    observed.item_bytes.store(4096, Ordering::SeqCst);
-    let mut config = ServerIpcConfig {
-        shm_threshold: 1,
-        pool_decay_seconds: 0.0,
+    observed.item_bytes.store(32768, Ordering::SeqCst);
+    let config = ServerIpcConfig {
         ..ServerIpcConfig::default()
     };
-    config.base.pool_segment_size = 8192;
-    config.base.max_pool_segments = 1;
-    config.base.spill_threshold = 1.0;
     let mut harness = Harness::start(observed, config, CAP_SHM_RESPONSE).await;
     let first = loan_one_item(&mut harness, 1).await;
     let pool = harness.server.response_pool_arc();
@@ -61,7 +56,7 @@ async fn connected_peer_without_release_keeps_original_loan_past_maintenance_and
         assert_eq!(pool.inner.write().gc_buddy(), 0);
         assert_eq!(harness.server.chunk_registry.gc_sweep().expired, 0);
         assert_eq!(pool.read().stats().alloc_count, 1);
-        assert_eq!(pool.read().stats().buddy_occupied_bytes, 4096);
+        assert_eq!(pool.read().stats().buddy_occupied_bytes, 32768);
         assert!(!conn.is_deactivated());
     }
     tokio::time::resume();
@@ -95,7 +90,7 @@ async fn connected_peer_without_release_keeps_original_loan_past_maintenance_and
     harness.open(3, &[1]).await;
     assert!(matches!(
         read_record(&mut harness.peer, CallMode::ServerStream).await,
-        SeenRecord::Begin(4096)
+        SeenRecord::Begin(32768)
     ));
     assert_eq!(pool.read().stats().alloc_count, 1);
     harness

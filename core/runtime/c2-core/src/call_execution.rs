@@ -14,7 +14,8 @@
 //! preparation takes a slot, so tasks are bounded by their owning domains;
 //! there is no per-call thread, timer task, abort, or blocking-task pool.
 //! Unlimited unary calls drive the future inline on the same runtime, with
-//! neither a deadline timer, a continuation task, nor an operation slot.
+//! neither a deadline timer nor a continuation task, while still holding one
+//! client-domain operation slot until completion.
 //! Every server stream has one operation slot, including unlimited streams.
 //! Their owned input still uses B. Closing call-slot admissions leaves B available to
 //! already dispatched calls. Transports must be cooperative async
@@ -35,15 +36,13 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use std::time::Instant;
 
-use c2_config::CallExecutionLimits;
 #[cfg(test)]
 use c2_config::CallOptions;
 use c2_error::{C2Error, ErrorCode};
-use c2_mem::retention::{
-    BudgetedBuffer, PayloadBufferBudget, PayloadBufferError, PayloadBufferReservation,
-    PayloadBufferSnapshot,
+use c2_mem::{
+    BudgetedBuffer, DomainBudget, MemoryReservation, OperationPermit, PayloadBufferError,
+    RetentionError,
 };
-use c2_mem::{RetentionBudget, RetentionError, RetentionPermit, RetentionSnapshot};
 use futures_util::FutureExt;
 use parking_lot::{Condvar, Mutex};
 use tokio::runtime::{Builder, Handle, Runtime};
@@ -51,109 +50,26 @@ use tokio::runtime::{Builder, Handle, Runtime};
 use crate::client::{CallDispatchTarget, CallRecordOutcome};
 use crate::{CallScope, CallScopeError, CallState, Error, LifecycleError, TransportPhase};
 
-/// Pure metadata observation of one Runtime's call-operation domain.
-///
-/// Capturing or reading this handle never resolves configuration or creates
-/// an executor. It can outlive the Runtime and retains only accounting state,
-/// never a session, transport, payload, service or permission to execute calls.
-/// Different Runtime instances have independent domains and limits.
-#[derive(Clone, Debug)]
-pub struct CallExecutionObserver {
-    state: Arc<Mutex<ObservationState>>,
-}
-
-#[derive(Debug, Default)]
-struct ObservationState {
-    budget: Option<RetentionBudget>,
-    closed: bool,
-}
-
-/// One consistent metadata observation. An uninitialized open domain remains
-/// live: the first payload use may still establish its accounting budget.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct CallExecutionObservation {
-    pub initialized: bool,
-    pub closed: bool,
-    pub counters: Option<crate::CallExecutionSnapshot>,
-}
-
-impl CallExecutionObserver {
-    pub(crate) fn new() -> Self {
-        Self {
-            state: Arc::new(Mutex::new(ObservationState::default())),
-        }
-    }
-
-    /// Read counters only; never reads process environment or .env and never
-    /// changes configuration, admission or owner lifetimes.
-    pub fn snapshot(&self) -> CallExecutionObservation {
-        let state = self.state.lock();
-        CallExecutionObservation {
-            initialized: state.budget.is_some(),
-            closed: state.closed,
-            counters: state.budget.as_ref().map(RetentionBudget::snapshot),
-        }
-    }
-
-    /// Retired metadata may be discarded only after closure and real release
-    /// of every operation and payload byte. Open, uninitialized domains are live.
-    pub fn is_live(&self) -> bool {
-        let state = self.state.lock();
-        !state.closed
-            || state.budget.as_ref().is_some_and(|budget| {
-                budget.snapshot().used_operations != 0
-                    || budget.payload_budget().snapshot().used_bytes != 0
-            })
-    }
-
-    pub fn same_domain(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.state, &other.state)
-    }
-
-    // RuntimeState's lock serializes publication with configuration/closure.
-    // The nested metadata lock makes a captured-before-freeze observer see
-    // either the complete new budget or the prior uninitialized state.
-    pub(crate) fn publish(&self, context: &CallExecutionContext) {
-        let mut state = self.state.lock();
-        debug_assert!(state.budget.is_none());
-        if state.closed {
-            context.close();
-        }
-        state.budget = Some(context.budget.clone());
-    }
-
-    pub(crate) fn close(&self) {
-        let mut state = self.state.lock();
-        if let Some(budget) = &state.budget {
-            budget.close();
-        }
-        state.closed = true;
-    }
-
-    pub(crate) fn is_closed(&self) -> bool {
-        self.state.lock().closed
-    }
-}
-
 #[derive(Clone, Debug)]
 pub(crate) struct CallExecutionContext {
-    budget: RetentionBudget,
+    budget: DomainBudget,
 }
 
 impl CallExecutionContext {
-    /// Limits are already resolved by c2-config; no defaults/env policy here.
-    pub(crate) fn new(limits: &CallExecutionLimits) -> Self {
-        Self {
-            budget: RetentionBudget::from_call_limits(limits),
-        }
+    /// The Runtime's frozen client role domain; every remote call — with or
+    /// without a deadline, unary or stream — admits through its slots and
+    /// charges its payload buffers.
+    pub(crate) fn new(budget: DomainBudget) -> Self {
+        Self { budget }
     }
 
-    pub(crate) fn payload_budget(&self) -> PayloadBufferBudget {
-        self.budget.payload_budget()
+    pub(crate) fn payload_budget(&self) -> DomainBudget {
+        self.budget.clone()
     }
 
-    pub(crate) fn payload_snapshot(&self) -> PayloadBufferSnapshot {
-        self.payload_budget().snapshot()
+    #[cfg(test)]
+    pub(crate) fn payload_snapshot(&self) -> c2_mem::BudgetCellSnapshot {
+        self.budget.snapshot().memory
     }
 
     #[cfg(test)]
@@ -171,32 +87,23 @@ impl CallExecutionContext {
         options: CallOptions,
         path_default: Option<Duration>,
     ) -> Result<PreparingCall, Error> {
-        self.prepare_stream_scope(CallScope::new(options, path_default).map_err(scope_error)?)
+        self.prepare_scope(CallScope::new(options, path_default).map_err(scope_error)?)
     }
 
     /// The Client establishes its scope at entry, before first-domain config
     /// resolution/metadata waits. Admission checks that original D afterwards.
     pub(crate) fn prepare_scope(&self, scope: CallScope) -> Result<PreparingCall, Error> {
-        self.prepare_scope_for(scope, false)
-    }
-
-    pub(crate) fn prepare_stream_scope(&self, scope: CallScope) -> Result<PreparingCall, Error> {
-        self.prepare_scope_for(scope, true)
-    }
-
-    fn prepare_scope_for(&self, scope: CallScope, stream: bool) -> Result<PreparingCall, Error> {
         scope.check_pre_dispatch().map_err(scope_error)?;
-        // Reserve before SDK serialization. Unlimited unary has no operation
-        // slot; every stream has one. Input still reserves B in either case.
-        let permit = if stream || scope.deadline().is_some() {
-            Some(
-                self.budget
-                    .reserve()
-                    .map_err(|error| settle_failure(&scope, admission_error(error)))?,
-            )
-        } else {
-            None
-        };
+        // Reserve before SDK serialization: every remote call — unary or
+        // stream, with or without a deadline — occupies one client-domain
+        // operation slot until its real terminal outcome. A closed or
+        // exhausted domain (M == 0 implies N == 0) rejects even zero-byte
+        // no-deadline calls here, before any serialization.
+        let permit = Some(
+            self.budget
+                .reserve_operation()
+                .map_err(|error| settle_failure(&scope, admission_error(error)))?,
+        );
         scope.check_pre_dispatch().map_err(scope_error)?;
         Ok(PreparingCall {
             scope,
@@ -207,22 +114,26 @@ impl CallExecutionContext {
         })
     }
 
-    /// Stops new finite-unary and stream slots. Already admitted calls may still
-    /// reserve B for their real storage; this does not cancel work or refund.
+    /// Stops new call slots. Already admitted calls may still reserve memory
+    /// for their real storage; this does not cancel work or refund.
+    #[cfg(test)]
     pub(crate) fn close(&self) {
-        self.budget.close();
+        self.budget.close_operations();
     }
 
-    pub(crate) fn snapshot(&self) -> RetentionSnapshot {
-        self.budget.snapshot()
+    #[cfg(test)]
+    pub(crate) fn snapshot(&self) -> c2_mem::RetentionSnapshot {
+        self.budget.snapshot().operations
     }
 }
 
 pub(crate) struct PreparingCall {
     scope: CallScope,
-    permit: Option<RetentionPermit>,
-    payload_budget: PayloadBufferBudget,
-    input_reservation: Option<PayloadBufferReservation>,
+    /// Always `Some` after admission; the stream path moves it into the
+    /// receive record, every other path keeps it until the task completes.
+    permit: Option<OperationPermit>,
+    payload_budget: DomainBudget,
+    input_reservation: Option<MemoryReservation>,
     stream_http_headroom: u64,
 }
 
@@ -238,13 +149,11 @@ impl PreparingCall {
 
     /// The original stream receive record owns its call slot until it publishes
     /// a real terminal, even after an opening waiter or facade leaves.
-    pub(crate) fn take_stream_permit(&mut self) -> RetentionPermit {
-        self.permit
-            .take()
-            .expect("stream preparation reserved a slot")
+    pub(crate) fn take_stream_permit(&mut self) -> OperationPermit {
+        self.permit.take().expect("admission reserved a call slot")
     }
 
-    pub(crate) fn payload_budget(&self) -> PayloadBufferBudget {
+    pub(crate) fn payload_budget(&self) -> DomainBudget {
         self.payload_budget.clone()
     }
 
@@ -278,7 +187,7 @@ impl PreparingCall {
         } else {
             self.input_reservation = Some(
                 self.payload_budget
-                    .reserve_blocking(nbytes, self.scope.deadline())
+                    .reserve_memory_blocking(nbytes, self.scope.deadline())
                     .map_err(|error| settle_failure(&self.scope, payload_admission_error(error)))?,
             );
         }
@@ -305,11 +214,11 @@ impl PreparingCall {
         let reservation = match self.scope.deadline() {
             Some(deadline) => tokio::time::timeout_at(
                 tokio::time::Instant::from_std(deadline),
-                self.payload_budget.reserve(nbytes),
+                self.payload_budget.reserve_memory(nbytes),
             )
             .await
             .unwrap_or(Err(PayloadBufferError::DeadlineExceeded)),
-            None => self.payload_budget.reserve(nbytes).await,
+            None => self.payload_budget.reserve_memory(nbytes).await,
         }
         .map_err(|error| settle_failure(&self.scope, payload_admission_error(error)))?;
         self.input_reservation = Some(reservation);
@@ -541,7 +450,7 @@ impl PreparingCall {
                     "native transport or materializer panicked",
                 )),
             };
-            // A finite unary call releases its slot before publishing a
+            // A unary call releases its slot before publishing a
             // result. A stream transferred its slot to the receive record.
             drop(operation);
             // The input reservation follows its actual last reader, including
@@ -550,15 +459,11 @@ impl PreparingCall {
             guard.finish(result);
         };
         let started = catch_unwind(AssertUnwindSafe(|| {
-            if matches!(shared.mode, CompletionMode::OriginalRecord { .. })
-                || shared.scope.deadline().is_some()
-            {
-                // Dropping a Tokio JoinHandle detaches; never abort on timeout.
-                drop(handle.spawn(task));
-            } else {
-                // No background continuation or timer for Unlimited.
-                handle.block_on(task);
-            }
+            // Every call now owns an operation slot, so every call runs as a
+            // detached task: an unlimited unary no longer blocks the caller's
+            // thread on transport completion. Dropping a JoinHandle detaches;
+            // never abort on timeout.
+            drop(handle.spawn(task));
         }));
         if started.is_err() {
             // Task guard normally already settled during unwind. This also
@@ -863,7 +768,7 @@ fn admission_error(error: RetentionError) -> Error {
             .insert("admission_reason".into(), format!("{:?}", error.reason));
         semantic
             .details
-            .insert("requested_bytes".into(), error.requested_bytes.to_string());
+            .insert("used_operations".into(), error.used_operations.to_string());
     }
     error_out
 }
@@ -976,10 +881,13 @@ mod tests {
     const INJECTION_BUDGET: Duration = Duration::from_secs(10);
 
     fn context(slots: u64, bytes: u64) -> CallExecutionContext {
-        CallExecutionContext::new(&CallExecutionLimits {
-            max_outstanding_calls: slots,
-            payload_buffer_budget_bytes: bytes,
-        })
+        CallExecutionContext::new(c2_mem::DomainBudget::from_limits(
+            &c2_config::DomainLimits {
+                memory_budget_bytes: bytes,
+                max_outstanding_calls: slots,
+                ..Default::default()
+            },
+        ))
     }
 
     fn prepare(context: &CallExecutionContext) -> PreparingCall {
@@ -1556,62 +1464,63 @@ mod tests {
     }
 
     #[test]
-    fn unlimited_and_inherit_none_bypass_operation_slots_but_charge_input() {
-        let context = context(0, 4);
-        // An un-driven current-thread runtime makes any accidental background
-        // spawn observable: execute must finish the future before returning.
-        let runtime = Builder::new_current_thread().enable_all().build().unwrap();
-        let caller = thread::current().id();
-        for closed in [false, true] {
-            if closed {
-                context.close();
-            }
-            for (options, path_default) in [
-                (
-                    CallOptions::with_timeout(CallTimeout::Unlimited),
-                    Some(Duration::ZERO),
-                ),
-                (CallOptions::new(), None), // Default direct IPC policy.
-            ] {
-                let mut preparing = context.prepare(options, path_default).unwrap();
-                let scope = preparing.scope().clone();
-                assert_eq!(scope.deadline(), None);
-                preparing.charge_input(4).unwrap();
-                assert_eq!(context.payload_snapshot().used_bytes, 4);
-                assert_eq!(context.snapshot().used_operations, 0);
-                let handle = runtime.handle().clone();
-                let call = preparing
-                    .execute_on(
-                        4,
-                        move || {
-                            assert_eq!(thread::current().id(), caller);
-                            Ok(vec![8; 4])
-                        },
-                        move |input, scope| async move {
-                            assert_eq!(thread::current().id(), caller);
-                            scope.try_begin_dispatch().map_err(scope_error)?;
-                            tokio::task::yield_now().await;
-                            assert_eq!(thread::current().id(), caller);
-                            // A real escaping body owner keeps B until its
-                            // final reference, without consuming a call slot.
-                            let body: Arc<dyn AsRef<[u8]> + Send + Sync> = Arc::new(input);
-                            Ok(body)
-                        },
-                        || Ok(handle),
-                    )
-                    .unwrap();
-                assert_eq!(
-                    scope.state(),
-                    CallState::Succeeded,
-                    "background continuation was created"
-                );
-                assert_eq!(context.payload_snapshot().used_bytes, 4);
-                let body = call.wait().unwrap();
-                assert_eq!(body.as_ref().as_ref(), &[8; 4]);
-                assert_eq!(context.payload_snapshot().used_bytes, 4);
-                drop(body);
-                assert_eq!(context.payload_snapshot().used_bytes, 0);
-            }
+    fn unlimited_and_inherit_none_reserve_operation_slots_and_charge_input() {
+        let context = context(1, 4);
+        for (options, path_default) in [
+            (
+                CallOptions::with_timeout(CallTimeout::Unlimited),
+                Some(Duration::ZERO),
+            ),
+            (CallOptions::new(), None), // Default direct IPC policy.
+        ] {
+            let mut preparing = context.prepare(options, path_default).unwrap();
+            let scope = preparing.scope().clone();
+            assert_eq!(scope.deadline(), None);
+            // A no-deadline unary call occupies the domain's single slot
+            // until its real terminal outcome.
+            assert_eq!(context.snapshot().used_operations, 1);
+            assert!(context.prepare(options, path_default).is_err());
+            preparing.charge_input(4).unwrap();
+            assert_eq!(context.payload_snapshot().used_bytes, 4);
+            let call = preparing
+                .execute(
+                    4,
+                    || Ok(vec![8; 4]),
+                    move |input, scope| async move {
+                        scope.try_begin_dispatch().map_err(scope_error)?;
+                        tokio::task::yield_now().await;
+                        // A real escaping body owner keeps its memory charge
+                        // until the final reference, after the slot was
+                        // already released.
+                        let body: Arc<dyn AsRef<[u8]> + Send + Sync> = Arc::new(input);
+                        Ok(body)
+                    },
+                )
+                .unwrap();
+            let body = call.wait().unwrap();
+            assert_eq!(body.as_ref().as_ref(), &[8; 4]);
+            eventually(|| context.snapshot().used_operations == 0);
+            assert_eq!(context.payload_snapshot().used_bytes, 4);
+            drop(body);
+            assert_eq!(context.payload_snapshot().used_bytes, 0);
+        }
+        // Admission runs through the same slots: a closed domain refuses
+        // no-deadline unary calls too.
+        context.close();
+        for (options, path_default) in [
+            (
+                CallOptions::with_timeout(CallTimeout::Unlimited),
+                Some(Duration::ZERO),
+            ),
+            (CallOptions::new(), None), // Default direct IPC policy.
+        ] {
+            let error = context.prepare(options, path_default).err().unwrap();
+            semantic(
+                &error,
+                ErrorCode::CallCapacityExceeded,
+                "pre_dispatch",
+                "call_execution_admission",
+            );
         }
     }
 
@@ -1935,7 +1844,9 @@ mod native_record_tests {
 
     #[test]
     fn original_stream_record_is_observable_after_the_callers_deadline() {
-        let context = CallExecutionContext::new(&CallExecutionLimits::default());
+        let context = CallExecutionContext::new(c2_mem::DomainBudget::from_limits(
+            &c2_config::DomainLimits::default(),
+        ));
         let preparing = context
             .prepare_stream(
                 CallOptions::with_timeout(CallTimeout::After(Duration::from_millis(100))),
@@ -1997,7 +1908,9 @@ mod native_record_tests {
     fn original_record_keeps_first_selected_target_with_a_failed_result() {
         use crate::client::{CallDispatchTarget, IpcCallTarget, ObservedPath};
 
-        let context = CallExecutionContext::new(&CallExecutionLimits::default());
+        let context = CallExecutionContext::new(c2_mem::DomainBudget::from_limits(
+            &c2_config::DomainLimits::default(),
+        ));
         let preparing = context.prepare(CallOptions::default(), None).unwrap();
         let selected = CallDispatchTarget {
             path: ObservedPath::DirectIpc,

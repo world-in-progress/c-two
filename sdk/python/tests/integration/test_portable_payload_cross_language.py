@@ -47,30 +47,17 @@ TARGET_DIR = REPOSITORY / os.environ.get("CARGO_TARGET_DIR", "core/target")
 
 pytestmark = pytest.mark.timeout(300)
 
-IPC_OVERRIDES = {
-    "pool_segment_size": 1024 * 1024,
-    "max_pool_segments": 1,
-    "reassembly_segment_size": 1024 * 1024,
-    "reassembly_max_segments": 1,
-    "max_inflight_chunk_frames": 32,
-    "chunk_gc_interval": 1.0,
-    "chunk_assembler_timeout": 10.0,
-    "max_reassembly_bytes": 16 * 1024 * 1024,
-    "chunk_size": 64 * 1024,
-}
+ROLE_MEMORY_BYTES = 64 * 1024**2
 
 
 @pytest.fixture(autouse=True)
 def _clean_python_runtime() -> Any:
     previous_relay = settings._relay_anchor_address  # noqa: SLF001
-    previous_threshold = settings._shm_threshold  # noqa: SLF001
     _reset_default_runtime()
     settings.relay_anchor_address = None
-    settings.shm_threshold = None
     yield
     _reset_default_runtime()
     settings._relay_anchor_address = previous_relay  # noqa: SLF001
-    settings._shm_threshold = previous_threshold  # noqa: SLF001
 
 
 def _write_artifacts(root: Path, artifact_set: Any) -> list[dict[str, Any]]:
@@ -279,11 +266,10 @@ def _run_rust_client(
 
 def _configure_python_runtime(*, server: bool, client: bool) -> None:
     _reset_default_runtime()
-    cc.set_transport_policy(shm_threshold=1)
     if server:
-        cc.set_server(ipc_overrides=IPC_OVERRIDES)
+        cc.set_server(memory_budget_bytes=ROLE_MEMORY_BYTES)
     if client:
-        cc.set_client(ipc_overrides=IPC_OVERRIDES)
+        cc.set_client(memory_budget_bytes=ROLE_MEMORY_BYTES)
 
 
 def _assert_python_response_lifetime(

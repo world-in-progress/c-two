@@ -2,7 +2,7 @@
 //! records; the consumer supplies a charged copy window before each read.
 
 use super::*;
-use c2_mem::retention::PayloadBufferReservation;
+use c2_mem::{MemoryReservation, WindowChunk, WindowSlice};
 use tokio::sync::{Notify, oneshot};
 
 #[derive(Debug, Clone)]
@@ -13,33 +13,33 @@ pub enum ForwardRecord {
 
 struct PendingRead {
     bytes: Vec<u8>,
-    reservation: PayloadBufferReservation,
+    slice: WindowSlice,
     window: usize,
     tx: oneshot::Sender<ReadyRead>,
 }
 
 enum ReadyRead {
-    Inline(BudgetedBuffer),
-    Shm(PayloadBufferReservation, usize),
+    Inline(WindowChunk),
+    Shm(WindowSlice, usize),
     Terminal,
 }
 
-// The consumer owns both the real read carrier and its charged copy window.
+// The consumer owns both the real read carrier and its granted copy window.
 // Preparing this step never borrows the mapping; its synchronous copy runs
 // after the call-state lock has been released.
 struct ShmCopyStep {
     carrier: ServerShmResponse,
     offset: usize,
-    reservation: PayloadBufferReservation,
+    slice: WindowSlice,
     window: usize,
 }
 
 impl ShmCopyStep {
-    fn copy(self) -> (ServerShmResponse, Result<BudgetedBuffer, IpcError>) {
+    fn copy(self) -> (ServerShmResponse, Result<WindowChunk, IpcError>) {
         let Self {
             carrier,
             offset,
-            mut reservation,
+            slice,
             window,
         } = self;
         let result = (|| {
@@ -47,19 +47,16 @@ impl ShmCopyStep {
             bytes.try_reserve_exact(window).map_err(|e| {
                 IpcError::Io(std::io::Error::new(std::io::ErrorKind::OutOfMemory, e))
             })?;
-            if bytes.capacity() as u64 > reservation.bytes() {
+            if bytes.capacity() as u64 > slice.bytes() {
                 return Err(IpcError::Config(
-                    "response copy allocation exceeds reservation".into(),
+                    "response copy allocation exceeds window slice".into(),
                 ));
             }
             bytes.resize(window, 0);
             carrier
                 .copy_range_into(offset, &mut bytes)
                 .map_err(IpcError::Shm)?;
-            let charge = reservation
-                .split_off(bytes.capacity() as u64)
-                .expect("charged window");
-            Ok(BudgetedBuffer::new(bytes, charge))
+            Ok(slice.into_buffer(bytes))
         })();
         (carrier, result)
     }
@@ -215,13 +212,28 @@ impl IpcForwardStream {
         }
     }
 
-    /// Copy one charged slice. `None` means a real terminal interrupted this
+    /// Copy one granted slice. `None` means a real terminal interrupted this
     /// item; `next_record` returns that CALL_END without losing its outcome.
+    ///
+    /// A relay loops one [`c2_mem::ReusableWindow`] for a whole forwarded
+    /// response: reserve a slice, read it, drop the returned chunk, then
+    /// re-reserve the same capacity for the next slice:
+    ///
+    /// ```text
+    /// let window = reservation.into_reusable_window();
+    /// loop {
+    ///     let slice = window.reserve(window.capacity()).await?;
+    ///     match stream.read_chunk(slice, max_bytes).await? {
+    ///         Some(chunk) => forward(chunk.as_ref()),
+    ///         None => break,
+    ///     }
+    /// }
+    /// ```
     pub async fn read_chunk(
         &mut self,
-        reservation: PayloadBufferReservation,
+        slice: WindowSlice,
         max_bytes: usize,
-    ) -> Result<Option<BudgetedBuffer>, crate::IpcCallError> {
+    ) -> Result<Option<WindowChunk>, crate::IpcCallError> {
         let (copy, receiver) = {
             let mut state = self.call.state.lock();
             if state.cancel == Some(rpc::CancelCause::Consumer) {
@@ -235,7 +247,7 @@ impl IpcForwardStream {
                 dispatch_uncertain_call_error(IpcError::Protocol("no active forwarded item".into()))
             })?;
             let remaining = total - state.copied;
-            let window = remaining.min(reservation.bytes()).min(max_bytes as u64) as usize;
+            let window = remaining.min(slice.bytes()).min(max_bytes as u64) as usize;
             if window == 0 {
                 return Err(dispatch_uncertain_call_error(IpcError::Config(
                     "positive response copy window required".into(),
@@ -245,7 +257,7 @@ impl IpcForwardStream {
                 (
                     Some(
                         self.call
-                            .prepare_copy_locked(&mut state, reservation, window)
+                            .prepare_copy_locked(&mut state, slice, window)
                             .map_err(dispatch_uncertain_call_error)?,
                     ),
                     None,
@@ -264,13 +276,13 @@ impl IpcForwardStream {
                         e,
                     )))
                 })?;
-                if bytes.capacity() as u64 > reservation.bytes() {
+                if bytes.capacity() as u64 > slice.bytes() {
                     return Err(dispatch_uncertain_call_error(IpcError::Config(
-                        "response copy allocation exceeds reservation".into(),
+                        "response copy allocation exceeds window slice".into(),
                     )));
                 }
                 state.pending = Some(PendingRead {
-                    reservation,
+                    slice,
                     bytes,
                     window,
                     tx,
@@ -298,11 +310,11 @@ impl IpcForwardStream {
             .map_err(|_| dispatch_uncertain_call_error(IpcError::Closed))?
         {
             ReadyRead::Inline(bytes) => Ok(Some(bytes)),
-            ReadyRead::Shm(reservation, window) => {
+            ReadyRead::Shm(slice, window) => {
                 let copy = {
                     let mut state = self.call.state.lock();
                     self.call
-                        .prepare_copy_locked(&mut state, reservation, window)
+                        .prepare_copy_locked(&mut state, slice, window)
                         .map_err(dispatch_uncertain_call_error)?
                 };
                 self.call
@@ -507,15 +519,15 @@ impl ForwardReceive {
             };
             if let Some(pending) = state.pending.take() {
                 let PendingRead {
-                    reservation,
+                    slice,
                     bytes,
                     window,
                     tx,
                 } = pending;
                 // End the old allocation before waking a consumer that can
-                // allocate a new copy under this same reservation.
+                // allocate a new copy under this same window slice.
                 drop(bytes);
-                if tx.send(ReadyRead::Shm(reservation, window)).is_err() {
+                if tx.send(ReadyRead::Shm(slice, window)).is_err() {
                     state.carrier.take();
                 }
             }
@@ -542,20 +554,15 @@ impl ForwardReceive {
                 .stream_state(id)
                 .is_some_and(|flow| flow.admitted_bytes == flow.total_bytes.unwrap_or(0));
             if pending.bytes.len() == pending.window || complete {
-                let mut pending = state.pending.take().expect("charged read");
+                let pending = state.pending.take().expect("charged read");
                 state.copied += pending.bytes.len() as u64;
                 if complete {
                     self.conn.core.stream_finish_item(id).map_err(core_error)?;
                     state.total = None;
                 }
-                let charge = pending
-                    .reservation
-                    .split_off(pending.bytes.capacity() as u64)
-                    .expect("charged window");
-                let _ = pending.tx.send(ReadyRead::Inline(BudgetedBuffer::new(
-                    pending.bytes,
-                    charge,
-                )));
+                let _ = pending
+                    .tx
+                    .send(ReadyRead::Inline(pending.slice.into_buffer(pending.bytes)));
             }
         }
         drop(state);
@@ -566,7 +573,7 @@ impl ForwardReceive {
     fn prepare_copy_locked(
         &self,
         state: &mut ForwardState,
-        reservation: PayloadBufferReservation,
+        slice: WindowSlice,
         window: usize,
     ) -> Result<ShmCopyStep, IpcError> {
         if state.cancel == Some(rpc::CancelCause::Consumer) {
@@ -585,12 +592,12 @@ impl ForwardReceive {
         Ok(ShmCopyStep {
             carrier,
             offset: state.copied as usize,
-            reservation,
+            slice,
             window,
         })
     }
 
-    fn copy_carrier(&self, step: ShmCopyStep) -> Result<BudgetedBuffer, IpcError> {
+    fn copy_carrier(&self, step: ShmCopyStep) -> Result<WindowChunk, IpcError> {
         let window = step.window;
         // No state lock or await spans this bounded mapping borrow and copy.
         let (carrier, mut result) = step.copy();
@@ -641,6 +648,9 @@ impl ForwardReceive {
 
     pub(crate) fn finish(&self, terminal: stream::StreamTerminal, entry: PendingResponse) {
         let mut state = self.state.lock();
+        if state.ended {
+            return;
+        }
         if state.copying
             || (state.carrier.is_some() && state.cancel != Some(rpc::CancelCause::Consumer))
         {
@@ -679,13 +689,10 @@ impl ForwardReceive {
                 state.copied = 0;
                 if let Some(pending) = state.pending.take() {
                     let PendingRead {
-                        bytes,
-                        reservation,
-                        tx,
-                        ..
+                        bytes, slice, tx, ..
                     } = pending;
                     drop(bytes);
-                    drop(reservation);
+                    drop(slice);
                     state.interrupted_item = tx.send(ReadyRead::Terminal).is_err();
                 } else {
                     state.interrupted_item = true;
@@ -760,7 +767,7 @@ impl IpcClient {
         method_name: &str,
         data_len: u64,
         chunks: S,
-        send_reservation: PayloadBufferReservation,
+        send_reservation: MemoryReservation,
     ) -> Result<IpcForwardStream, crate::IpcCallError>
     where
         S: Stream<Item = Result<B, E>> + Send + 'static,
@@ -780,12 +787,9 @@ impl IpcClient {
             .forward_request_block(data_size)
             .map_err(pre_dispatch_call_error)?;
         let (send, mut rx) = self
-            .begin_pending(PendingKind::Call(CallMode::ServerStream))
+            .begin_pending(PendingKind::Call(CallMode::ServerStream), limit)
             .map_err(pre_dispatch_call_error)?;
-        let (call, mut stream) = ForwardReceive::new(
-            send.conn.clone(),
-            limit.min(self.config.max_reassembly_bytes),
-        );
+        let (call, mut stream) = ForwardReceive::new(send.conn.clone(), limit);
         let (upload_stop, stop_upload) = watch::channel(false);
         *call.upload_stop.lock() = Some(upload_stop.clone());
         {
@@ -868,7 +872,7 @@ impl IpcClient {
         method_name: &str,
         data_len: u64,
         chunks: S,
-        send_reservation: PayloadBufferReservation,
+        send_reservation: MemoryReservation,
     ) -> Result<ResponseData, crate::IpcCallError>
     where
         S: Stream<Item = Result<B, E>> + Send + 'static,
@@ -888,7 +892,7 @@ impl IpcClient {
             .forward_request_block(data_size)
             .map_err(pre_dispatch_call_error)?;
         let (send, rx) = self
-            .begin_pending(PendingKind::Call(CallMode::Unary))
+            .begin_pending(PendingKind::Call(CallMode::Unary), limit)
             .map_err(pre_dispatch_call_error)?;
         let metadata_len = rpc::encoded_open_metadata_len(&identity)
             .map_err(|e| pre_dispatch_call_error(IpcError::Protocol(e.to_string())))?;
@@ -935,7 +939,7 @@ impl IpcClient {
     }
 
     fn forward_request_block(&self, data_size: usize) -> Result<Option<RequestBlock>, IpcError> {
-        if choose_request_transport(&self.config, self.shm_request_available(), data_size)
+        if choose_request_transport(self.shm_request_available(), data_size)
             == RequestTransportKind::Buddy
         {
             self.try_alloc_request_block(data_size)
@@ -954,7 +958,7 @@ impl IpcClient {
             return Ok(0);
         }
         let frame_room = (u32::MAX as usize).saturating_sub(12 + metadata_len + 8);
-        let size = (self.config.chunk_size as usize)
+        let size = (c2_config::CHUNK_SIZE as usize)
             .min(frame_room)
             .min(charged.min(usize::MAX as u64) as usize);
         if size == 0 {
@@ -974,7 +978,7 @@ impl IpcClient {
         request_block: Option<RequestBlock>,
         chunks: S,
         mut stop_upload: watch::Receiver<bool>,
-        send_reservation: PayloadBufferReservation,
+        send_reservation: MemoryReservation,
     ) -> Result<(), IpcError>
     where
         S: Stream<Item = Result<B, E>> + Send,

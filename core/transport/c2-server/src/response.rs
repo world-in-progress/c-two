@@ -109,7 +109,6 @@ mod tests {
             MemPool::new_with_prefix(
                 PoolConfig {
                     segment_size: 64 * 1024,
-                    min_block_size: 4096,
                     max_segments: 1,
                     max_dedicated_segments: 1,
                     buddy_idle_decay_secs: 60.0,
@@ -204,7 +203,6 @@ mod tests {
             MemPool::new_with_prefix(
                 PoolConfig {
                     segment_size: 64 * 1024,
-                    min_block_size: 4096,
                     max_segments: 0,
                     max_dedicated_segments: 0,
                     buddy_idle_decay_secs: 60.0,

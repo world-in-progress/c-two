@@ -76,13 +76,16 @@ struct Relay {
 impl Relay {
     fn start(label: &str, directory: &Path) -> Self {
         let root = directory.join(label);
-        let mut dir = std::fs::DirBuilder::new();
         #[cfg(unix)]
         {
             use std::os::unix::fs::DirBuilderExt;
-            dir.mode(0o700);
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&root)
+                .unwrap();
         }
-        dir.create(&root).unwrap();
+        #[cfg(not(unix))]
+        std::fs::create_dir(&root).unwrap();
         let stdout_path = root.join("c3.stdout.log");
         let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../..")
@@ -104,7 +107,7 @@ impl Relay {
             binary.display()
         );
         let mut command = Command::new(binary);
-        command.args(["relay", "--bind", "127.0.0.1:0", "--idle-timeout", "0"]);
+        command.args(["relay", "--bind", "127.0.0.1:0"]);
         #[cfg(unix)]
         command.arg("--ipc-root").arg(&root);
         let child = command
@@ -191,8 +194,8 @@ fn retire_clients(runtime: &Runtime) {
     assert!(completed, "{outcome:?}");
     assert!(outcome.ipc_client_close_error.is_none(), "{outcome:?}");
     assert_eq!(
-        runtime.call_execution_snapshot().unwrap().used_operations,
-        0
+        runtime.call_execution_snapshot().client.used_operations,
+        Some(0)
     );
 }
 
@@ -378,6 +381,21 @@ fn assert_conflict_log(relay: &Relay, name: &str, action: &str, other: &Relay) {
     assert!(matching[0].contains(&other.id), "{log}");
 }
 
+fn assert_host_shutdown(
+    label: &str,
+    host: &Host,
+    outcome: &c2_core::ShutdownOutcome,
+    relay: &Relay,
+) {
+    if outcome.runtime_barrier_error.is_some() {
+        let stderr = std::fs::read_to_string(relay.root.join("c3.stderr.log")).unwrap_or_default();
+        panic!(
+            "{label} shutdown did not finish: outcome={outcome:?} lifecycle={:?} relay_stderr={stderr}",
+            host.lifecycle_snapshot()
+        );
+    }
+}
+
 fn register(
     host: &Host,
     release: &ContractRelease,
@@ -419,9 +437,8 @@ fn definition(
     .unwrap()
 }
 
-fn runtime(root: &Path, relay: &Relay, name: &str) -> Runtime {
+fn runtime(root: &Path, relay: &Relay) -> Runtime {
     let runtime = Runtime::new(c_two::RuntimeOptions {
-        server_id: Some(name.into()),
         relay_anchor_address: Some(relay.url.clone()),
         use_process_relay_anchor: false,
         ..Default::default()
@@ -505,16 +522,20 @@ fn run_case(explicit: bool) {
         std::process::id(),
         if explicit { "http" } else { "local" }
     );
-    let server_a = runtime(&a.root, &a, "mesh-host-a");
-    let server_b = runtime(&b.root, &b, "mesh-host-b");
-    let host_a = server_a.host(HostOptions::default()).unwrap();
-    let host_b = server_b.host(HostOptions::default()).unwrap();
+    let server_a = runtime(&a.root, &a);
+    let server_b = runtime(&b.root, &b);
+    let host_a = server_a
+        .host(HostOptions::default().with_server_id("mesh-host-a"))
+        .unwrap();
+    let host_b = server_b
+        .host(HostOptions::default().with_server_id("mesh-host-b"))
+        .unwrap();
     let calls_a = Arc::new(AtomicUsize::new(0));
     let calls_b = Arc::new(AtomicUsize::new(0));
     let _registration_a = register(&host_a, &release, &name, "A", &calls_a);
     let mut registration_b = register(&host_b, &release, &name, "B", &calls_b);
-    let client_a = runtime(&a.root, &a, "mesh-client-a");
-    let client_b = runtime(&b.root, &b, "mesh-client-b");
+    let client_a = runtime(&a.root, &a);
+    let client_b = runtime(&b.root, &b);
     let old_a = connect(&client_a, &release, &name, &a, explicit).unwrap();
     let old_b = connect(&client_b, &release, &name, &b, explicit).unwrap();
     let initial_path = if explicit {
@@ -688,8 +709,8 @@ fn run_case(explicit: bool) {
     }
     let outcome_a = host_a.shutdown_with_timeout(WAIT);
     let outcome_b = host_b.shutdown_with_timeout(WAIT);
-    assert!(outcome_a.runtime_barrier_error.is_none(), "{outcome_a:?}");
-    assert!(outcome_b.runtime_barrier_error.is_none(), "{outcome_b:?}");
+    assert_host_shutdown("host_a", &host_a, &outcome_a, &a);
+    assert_host_shutdown("host_b", &host_b, &outcome_b, &b);
     for relay in [&a, &b] {
         wait_until(|| routes(relay, &name).is_empty());
     }
@@ -798,16 +819,20 @@ fn run_unavailable_case(explicit: bool, force_leave: bool) {
         if explicit { "http" } else { "local" },
         release_method,
     );
-    let server_a = runtime(&a.root, &a, &format!("mesh-unavailable-host-a-{name}"));
-    let server_b = runtime(&b.root, &b, &format!("mesh-unavailable-host-b-{name}"));
-    let host_a = server_a.host(HostOptions::default()).unwrap();
-    let host_b = server_b.host(HostOptions::default()).unwrap();
+    let server_a = runtime(&a.root, &a);
+    let server_b = runtime(&b.root, &b);
+    let host_a = server_a
+        .host(HostOptions::default().with_server_id(format!("mesh-unavailable-host-a-{name}")))
+        .unwrap();
+    let host_b = server_b
+        .host(HostOptions::default().with_server_id(format!("mesh-unavailable-host-b-{name}")))
+        .unwrap();
     let identity_a = server_a.ensure_server().unwrap();
     let identity_b = server_b.ensure_server().unwrap();
     let calls_a = Arc::new(AtomicUsize::new(0));
     let calls_b = Arc::new(AtomicUsize::new(0));
     let mut registration_a = register(&host_a, &release, &name, "A", &calls_a);
-    let client_b = runtime(&b.root, &b, &format!("mesh-unavailable-client-b-{name}"));
+    let client_b = runtime(&b.root, &b);
     let unreachable_listeners = join_without_reachable_peer_urls(&a, &b, &name);
 
     // Gate 8: a name held only by a Suspect or Dead peer yields typed 702 on
@@ -889,8 +914,8 @@ fn run_unavailable_case(explicit: bool, force_leave: bool) {
     }
     let outcome_a = host_a.shutdown_with_timeout(WAIT);
     let outcome_b = host_b.shutdown_with_timeout(WAIT);
-    assert!(outcome_a.runtime_barrier_error.is_none(), "{outcome_a:?}");
-    assert!(outcome_b.runtime_barrier_error.is_none(), "{outcome_b:?}");
+    assert_host_shutdown("host_a", &host_a, &outcome_a, &a);
+    assert_host_shutdown("host_b", &host_b, &outcome_b, &b);
     assert!(outcome_a.route_close_error.is_none() && outcome_a.relay_errors.is_empty());
     assert!(outcome_b.route_close_error.is_none() && outcome_b.relay_errors.is_empty());
     assert!(host_a.lifecycle_snapshot().finished && host_b.lifecycle_snapshot().finished);

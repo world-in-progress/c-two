@@ -1,9 +1,10 @@
 //! Readable stream failures stay local to the original call and its owners.
+
 use super::*;
 use crate::IpcStreamCancellation;
 use crate::StreamTerminal;
+use crate::tests::memory_budget;
 use c2_error::{C2Error, ErrorCode};
-use c2_mem::retention::PayloadBufferBudget;
 use c2_wire::rpc::{
     encode_call_end_frame, encode_cancel_frame, encode_credit_frame, encode_item_begin_frame,
     encode_item_data_frame,
@@ -57,7 +58,7 @@ async fn check_shm_item_copy(cancel_during_copy: bool) {
             }
             self.0.recv().unwrap();
             self.1 = true;
-            Ok(Some(Box::new(vec![7_u8; 64])))
+            Ok(Some(Box::new(vec![7_u8; 32 * 1024])))
         }
         fn finish(self: Box<Self>) -> Result<(), CrmError> {
             Ok(())
@@ -81,7 +82,6 @@ async fn check_shm_item_copy(cancel_during_copy: bool) {
         Server::new_with_endpoint(
             endpoint.endpoint.clone(),
             ServerIpcConfig {
-                shm_threshold: 1,
                 ..ServerIpcConfig::default()
             },
         )
@@ -124,7 +124,7 @@ async fn check_shm_item_copy(cancel_during_copy: bool) {
             &binding,
             "echo",
             Vec::new(),
-            PayloadBufferBudget::new(1024),
+            memory_budget(32 * 1024),
             Box::new(OperationOwner(owner_dropped.clone())),
             IpcStreamCancellation::new(),
             &IpcCallControl::new(|| Ok(())),
@@ -184,7 +184,10 @@ async fn check_shm_item_copy(cancel_during_copy: bool) {
         assert_eq!(terminal.error.unwrap().code, ErrorCode::CallCancelled);
         assert!(response.recv().await.is_err());
     } else {
-        assert_eq!(response.recv().await.unwrap().unwrap().as_ref(), &[7; 64]);
+        assert_eq!(
+            response.recv().await.unwrap().unwrap().as_ref(),
+            &vec![7; 32 * 1024]
+        );
         assert!(response.recv().await.unwrap().is_none());
         assert_eq!(response.completion().await.unwrap().complete_items, 1);
     }
@@ -238,7 +241,7 @@ async fn cancellation_and_zero_observation_do_not_wait_for_brief_receive_state_l
     let mut client = endpoint.client();
     client.connect().await.unwrap();
     let response = client
-        .stream_bound(&binding(), "items", b"", PayloadBufferBudget::new(8))
+        .stream_bound(&binding(), "items", b"", memory_budget(8))
         .await
         .unwrap();
     let call = response.receive_call_for_test();
@@ -303,7 +306,7 @@ async fn opening_abandonment_intent_attaches_before_request_publication() {
             &binding(),
             "items",
             Vec::new(),
-            PayloadBufferBudget::new(8),
+            memory_budget(8),
             Box::new(()),
             cancellation,
             &control,
@@ -334,7 +337,7 @@ fn large_binding() -> RouteBinding {
             index: 0,
         }],
         identity(),
-        16 * 1024,
+        DEFAULT_MAX_PAYLOAD_SIZE,
     ))
 }
 
@@ -442,7 +445,7 @@ async fn bad_terminal(fault: u8) {
     let mut client = endpoint.client();
     client.connect().await.unwrap();
     let mut response = client
-        .stream_bound(&binding(), "items", b"", PayloadBufferBudget::new(16))
+        .stream_bound(&binding(), "items", b"", memory_budget(16))
         .await
         .unwrap();
     if fault != 2 {
@@ -522,7 +525,7 @@ async fn complete_item_before_end(peer_ends: bool) {
     });
     let mut client = endpoint.client();
     client.connect().await.unwrap();
-    let budget = PayloadBufferBudget::new(7);
+    let budget = memory_budget(7);
     let mut response = client
         .stream_bound(&binding(), "items", b"", budget.clone())
         .await
@@ -549,7 +552,7 @@ async fn complete_item_before_end(peer_ends: bool) {
     assert_eq!(second.as_ref(), b"defg");
     assert!(timeout(WAIT, response.recv()).await.unwrap().is_err());
     drop((first, second));
-    assert_eq!(budget.snapshot().used_bytes, 0);
+    assert_eq!(budget.snapshot().memory.used_bytes, 0);
     assert!(client.close_shared_bounded(WAIT).await);
     peer.await.unwrap();
 }
@@ -602,7 +605,7 @@ async fn check_cancel_natural_eof_race(terminal_before_eof: bool) {
     client.connect().await.unwrap();
     let observation = client.connection_observation().unwrap();
     let mut response = client
-        .stream_bound(&binding(), "items", b"", PayloadBufferBudget::new(16))
+        .stream_bound(&binding(), "items", b"", memory_budget(16))
         .await
         .unwrap();
     let first = timeout(WAIT, response.recv())
@@ -770,11 +773,11 @@ async fn chunked_stream_open_prefers_early_not_executed_over_upload_failure() {
             decode_rpc_record(&open, &payload, None).unwrap(),
             RpcRecord::Open {
                 value: ValuePart {
-                    chunk: ChunkPosition::First { total_bytes: 8192 },
-                    ..
+                    chunk: ChunkPosition::First { total_bytes },
+                    storage: ValueStorage::Inline(data),
                 },
                 ..
-            }
+            } if total_bytes == 2 * CHUNK_SIZE && data.len() == CHUNK_SIZE as usize
         ));
         first_seen.send(open.request_id).unwrap();
         terminal_requested.await.unwrap();
@@ -796,9 +799,7 @@ async fn chunked_stream_open_prefers_early_not_executed_over_upload_failure() {
         crate::tests::close_listener(listener).await;
     });
 
-    let mut cfg = config();
-    cfg.base.shm_backing_budget_bytes = 0;
-    let mut client = IpcClient::with_endpoint(endpoint.endpoint.clone(), cfg).unwrap();
+    let mut client = endpoint.client_without_memory();
     client.connect().await.unwrap();
     let client = Arc::new(client);
     let (first_paused, first_ready) = oneshot::channel();
@@ -811,8 +812,8 @@ async fn chunked_stream_open_prefers_early_not_executed_over_upload_failure() {
                 .stream_bound(
                     &large_binding(),
                     "items",
-                    &[7; 8192],
-                    PayloadBufferBudget::new(8192),
+                    &vec![7; CHUNK_SIZE as usize * 2],
+                    memory_budget(8192),
                 )
                 .await
         }
@@ -890,9 +891,7 @@ async fn early_failed_end_keeps_complete_item_in_original_stream() {
         crate::tests::close_listener(listener).await;
     });
 
-    let mut cfg = config();
-    cfg.base.shm_backing_budget_bytes = 0;
-    let mut client = IpcClient::with_endpoint(endpoint.endpoint.clone(), cfg).unwrap();
+    let mut client = endpoint.client_without_memory();
     client.connect().await.unwrap();
     let client = Arc::new(client);
     let (first_paused, first_ready) = oneshot::channel();
@@ -905,8 +904,8 @@ async fn early_failed_end_keeps_complete_item_in_original_stream() {
                 .stream_bound(
                     &large_binding(),
                     "items",
-                    &[7; 8192],
-                    PayloadBufferBudget::new(8192),
+                    &vec![7; CHUNK_SIZE as usize * 2],
+                    memory_budget(8192),
                 )
                 .await
         }

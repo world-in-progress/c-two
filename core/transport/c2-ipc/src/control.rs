@@ -350,6 +350,16 @@ mod tests {
     /// The probe budget under test, unchanged from the CI assertion.
     const PROBE_BUDGET: Duration = Duration::from_secs(1);
 
+    /// Retain a mock server stream until the one-exchange control client reads
+    /// the reply and closes its end. On Windows Named Pipes, dropping the
+    /// server handle immediately after `write_all` can tear down the pipe
+    /// instance before the peer's `ReadFile`, discarding unread reply bytes
+    /// and surfacing `Exchange::DispatchUncertain` (`Unconfirmed`).
+    async fn wait_for_peer_close(stream: &mut LocalStream, budget: Duration) {
+        let mut byte = [0_u8; 1];
+        let _ = tokio::time::timeout(budget, stream.read(&mut byte)).await;
+    }
+
     fn address(label: &str) -> String {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let sequence = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -463,14 +473,23 @@ mod tests {
                                 };
                                 assert_eq!(payload, expected);
                                 // A reply the probe never read costs one more
-                                // attempt, so writing it is best effort.
-                                let _ = stream
-                                    .write_all(&frame::encode_frame(
-                                        0,
-                                        FLAG_SIGNAL | FLAG_RESPONSE,
-                                        &reply,
-                                    ))
-                                    .await;
+                                // attempt, so writing it is best effort; write
+                                // raw bytes without `LocalStream::write_all`'s
+                                // Windows zero-byte flush probe (which can
+                                // race a fast client's close) and retain the
+                                // pipe until the client closes after reading.
+                                if tokio::io::AsyncWriteExt::write_all(
+                                    &mut stream,
+                                    &frame::encode_frame(0, FLAG_SIGNAL | FLAG_RESPONSE, &reply),
+                                )
+                                .await
+                                .is_ok()
+                                {
+                                    tokio::select! {
+                                        _ = &mut stop_rx => break,
+                                        _ = wait_for_peer_close(&mut stream, FIXTURE_BUDGET) => {}
+                                    }
+                                }
                             }
                         }
                     }
@@ -641,10 +660,14 @@ mod tests {
         let mut stream = listener.accept().await.unwrap();
         let (_, request) = read_reply(&mut stream).await.unwrap();
         assert_eq!(request, encode_shutdown_initiate());
-        stream
-            .write_all(&frame::encode_frame(0, flags, reply))
+        // Write the reply bytes directly without `LocalStream::write_all`'s
+        // Windows zero-byte flush probe: the client can consume the frame and
+        // close its pipe before that flush runs, and `wait_for_peer_close`
+        // below already synchronizes with the peer's post-read close.
+        tokio::io::AsyncWriteExt::write_all(&mut stream, &frame::encode_frame(0, flags, reply))
             .await
             .unwrap();
+        wait_for_peer_close(&mut stream, FIXTURE_BUDGET).await;
         drop(stream);
         let result = shutdown.await.unwrap();
         crate::tests::close_listener(listener).await;

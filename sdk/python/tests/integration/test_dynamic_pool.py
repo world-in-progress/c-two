@@ -1,13 +1,4 @@
-"""Integration tests for dynamic SHM pool expansion (IPC).
-
-Tests verify end-to-end behaviour when the buddy pool's initial segment is
-exhausted and new segments are lazily created by the client and opened by the
-server.  Uses a small ``pool_segment_size`` (64 KB) so expansion is triggered
-with manageable payload sizes (~50-300 KB).
-
-Naming convention for SHM segments:
-    {prefix}_b{seg_idx:04x}   — deterministic from pool prefix + segment index
-"""
+"""Direct IPC with budget-derived buddy geometry and larger dedicated allocations."""
 
 from __future__ import annotations
 
@@ -21,7 +12,6 @@ import pytest
 from tests.fixtures import local_server
 
 import c_two as cc
-from c_two.config import ServerIPCOverrides
 from c_two.transport.client.util import ping
 from c_two.transport.server import Server
 
@@ -77,27 +67,10 @@ def _wait_for_server(addr: str, timeout: float = 5.0) -> None:
     raise TimeoutError(f'Server {addr} did not start within {timeout}s')
 
 
-def _pool_overrides(max_segs: int = 4) -> ServerIPCOverrides:
-    return {
-        'pool_segment_size': _SEG_SIZE,
-        'max_pool_segments': max_segs,
-    }
-
-
-def _setup(
-    addr: str | None = None,
-    ipc_overrides: ServerIPCOverrides | None = None,
-):
-    """Spin up a Server + SOTA proxy for IPoolTest CRM.
-
-    Returns ``(addr, server, proxy)``.
-    """
-    if addr is None:
-        addr = f'ipc://{_unique_region()}'
-    if ipc_overrides is None:
-        ipc_overrides = _pool_overrides()
-
-    server = local_server(addr, ipc_overrides=ipc_overrides)
+def _setup(memory_budget_bytes: int = 4 * 1024**2):
+    """Run a direct IPC pair with a 64 KiB primary segment size."""
+    addr = f'ipc://{_unique_region()}'
+    server = local_server(addr, memory_budget_bytes=memory_budget_bytes)
     server.register_crm(IPoolTest, PoolTestCRM(), name='pool')
     server.start()
     _wait_for_server(addr)
@@ -126,8 +99,7 @@ class TestPoolExpandsOnLargeAlloc:
     """A ~100 KB payload with 64 KB segments must trigger expansion."""
 
     def test_pool_expands_on_large_alloc(self):
-        ipc_overrides = _pool_overrides(max_segs=4)
-        addr, server, proxy = _setup(ipc_overrides=ipc_overrides)
+        addr, server, proxy = _setup(4 * 4 * _SEG_SIZE)
         try:
             payload = b'\xAB' * 100_000  # ~100 KB, exceeds single 64 KB seg
             result = proxy.echo(payload)
@@ -147,8 +119,7 @@ class TestMultiSegmentConcurrentCalls:
     must expand under contention from several threads."""
 
     def test_multi_segment_concurrent_calls(self):
-        ipc_overrides = _pool_overrides(max_segs=8)
-        addr, server, proxy = _setup(ipc_overrides=ipc_overrides)
+        addr, server, proxy = _setup(8 * 4 * _SEG_SIZE)
         try:
             num_workers = 6
             payload_size = 50_000  # each > half a 64 KB segment
@@ -180,8 +151,7 @@ class TestServerLazyOpensNewSegments:
     The server must lazy-open segments it didn't see at handshake time."""
 
     def test_server_lazy_opens_new_segments(self):
-        ipc_overrides = _pool_overrides(max_segs=8)
-        addr, server, proxy = _setup(ipc_overrides=ipc_overrides)
+        addr, server, proxy = _setup(8 * 4 * _SEG_SIZE)
         try:
             # Escalating payloads: fits within Rust client's buddy pool.
             sizes = [10_000, 30_000, 50_000, 70_000]
@@ -204,8 +174,7 @@ class TestExpansionDoesNotExceedMaxSegments:
     pool is full."""
 
     def test_expansion_does_not_exceed_max_segments(self):
-        ipc_overrides = _pool_overrides(max_segs=2)
-        addr, server, proxy = _setup(ipc_overrides=ipc_overrides)
+        addr, server, proxy = _setup(2 * 4 * _SEG_SIZE)
         try:
             payload = b'\xEF' * 80_000  # Within buddy pool range
             result = proxy.echo(payload)

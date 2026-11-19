@@ -80,7 +80,7 @@ impl<T> Drop for Held<T> {
 mod tests {
     use super::*;
     use c2_ipc::ResponseData;
-    use c2_mem::{MemPool, PoolConfig};
+    use c2_mem::{DomainBudget, MemPool, PoolConfig};
     use c2_wire::chunk::backing::ReassemblyBacking;
     use parking_lot::RwLock;
     use std::cell::Cell;
@@ -102,7 +102,13 @@ mod tests {
 
     #[test]
     fn invalidator_unwind_releases_response_before_value_drop() {
-        let pool = Arc::new(RwLock::new(MemPool::new(PoolConfig::default()).unwrap()));
+        let pool = Arc::new(RwLock::new(
+            MemPool::new_with_budget(
+                PoolConfig::default(),
+                DomainBudget::from_limits(&crate::DomainLimits::default()),
+            )
+            .unwrap(),
+        ));
         let mut backing = ReassemblyBacking::admit(Arc::clone(&pool), 1, 512).unwrap();
         backing.write_at(0, &[7; 512]).unwrap();
         let response = HeldResponse::from_response_data(ResponseData::Handle(backing)).unwrap();

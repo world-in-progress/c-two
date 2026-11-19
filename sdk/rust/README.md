@@ -13,7 +13,26 @@ This source-only package has no crates.io release. It reuses `c2-contract` for r
 
 This guide describes the current source-only SDK, whose independent version remains 0.1.0. It requires Rust 1.95 or newer and uses IPC 16, SHM 4 and C/FFI ABI 8 with the Python SDK and c3 built from the same source. It cannot interoperate with published 0.10.x builds; see the [unreleased changes](../../docs/releases/unreleased.md). Rust `c2-core` owns shutdown drain transactions and local endpoint maintenance. SDKs use the one OS endpoint derived by `LocalEndpoint::from_address`; there is no backend selector. See [lifecycle integration](../../docs/reference/local-endpoint-lifecycle.md). Use matching builds and local endpoint configuration for clients, hosts and relays.
 
-[IPC memory policy](../../docs/reference/memory-policy.md) is also shared Core behavior: lazy buddy allocation, idle decay, finite direction-scoped backing/reassembly budgets and checked transport fallback. Endpoint closure does not release retained payload owners or their budgets.
+A Runtime resolves its client and server role domains independently. Use `RuntimeOptions::client_limits` for client capacity and `RuntimeOptions` for the local endpoint and discovery. Put the Host's identity, startup timeout, carrying limits and server capacity on `HostOptions`. Each role freezes on first use and accepts subsequent changes with the same effective settings. [Configuration](../../docs/reference/configuration.md#role-domains-and-sdk-configuration)
+
+```rust
+use c_two::{HostOptions, Runtime, RuntimeOptions};
+
+let mut runtime_options = RuntimeOptions::default();
+runtime_options.client_limits.memory_budget_bytes = Some(128 * 1024 * 1024);
+runtime_options.client_limits.max_outstanding_calls = Some(128);
+let runtime = Runtime::new(runtime_options)?;
+
+let host_options = HostOptions::default()
+    .with_server_id("grid-host")
+    .with_max_payload_size(64 * 1024 * 1024)
+    .with_memory_budget_bytes(256 * 1024 * 1024)
+    .with_file_spill_budget_bytes(512 * 1024 * 1024)
+    .with_max_outstanding_calls(256);
+let host = runtime.host(host_options)?;
+```
+
+Idle buddy mappings are reclaimed automatically. Capacity is charged to the role that owns the storage and released with its owner. [Memory policy](../../docs/reference/memory-policy.md)
 
 Connection acquisition accepts an optional total budget through `Runtime::connect_with_options(expected, mode, ConnectOptions::new().with_timeout(Duration::from_millis(100)))`. Omitted options add no caller deadline. The budget spans pool waits, connection, handshake, live route lookup and relay discovery. Expiration returns `CallDeadlineExceeded` with `operation=connect` and `transport_phase=pre_dispatch`. Business-call options remain independent; see [connection configuration](../../docs/reference/configuration.md#connection-deadlines).
 
@@ -33,6 +52,8 @@ The crate root contains the Runtime, Host, client, registration and call types, 
 | --- | --- |
 | `Client::connection_observation()` / generated client method | Returns the current physical IPC observation. `snapshot()` reads its terminal record; async `wait_closed(Option<Duration>)` waits without retaining the connection. Thread-local and HTTP clients reject this operation. After the client follows its route to a new connection, an observation taken earlier still reports the old connection's end. |
 | `Client::observed_path()` | Reports the path of the client's current target. A client follows its route name: when its target is known to be gone, the next call acquires the route again before sending ([route bindings](../../docs/reference/contracts-and-routing.md#route-bindings-lookup-and-fallback)), which may change this path; views made with `with_call_options` share the target. |
+| `Runtime::memory_stats()` | Read-only `client`, `server`, `retired` and `holds` statistics, including the associated Host's memory and file spill cells. |
+| `Runtime::call_execution_snapshot()` | Read-only `client`, `server` and `retired` call slot statistics. Observing either snapshot leaves inactive roles unfrozen. |
 | `Runtime::connection_events()` | Subscribes to future outgoing and accepted IPC connections without starting a host. Values expose `ConnectionSide`; async `recv(&self)` returns `Ok(None)` at end. `close()` wakes this subscriber only; lag or concurrent consumers return `ConnectionEventsError`. |
 | `Host::endpoint_credential()` | Returns `Option<EndpointCredential>` from the existing lifecycle watch. Ready/Stopping retain the listener snapshot; terminal states clear it. No inspect, filesystem I/O or gate lock; a snapshot proves neither liveness nor cleanup authority. |
 | `Error::local_io_cause()` | Returns `Option<LocalIoCause>` for bind/connect failures. `Bind(EndpointBindCause { error, unverified_reason })` preserves OS details or the typed binding refusal; `Connect(EndpointIoError)` keeps its OS cause. `error()` still returns the unchanged `EndpointIoError`. |

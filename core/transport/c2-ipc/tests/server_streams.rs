@@ -8,8 +8,7 @@ use std::time::Duration;
 use c2_config::LocalEndpointContext;
 use c2_contract::{ExpectedRouteContract, ValidatedContractDescriptor};
 use c2_error::ErrorCode;
-use c2_ipc::{ClientIpcConfig, IpcClient, IpcResponseStream, RouteBinding, StreamTerminal};
-use c2_mem::retention::PayloadBufferBudget;
+use c2_ipc::{IpcClient, IpcResponseStream, RouteBinding, StreamTerminal};
 use c2_server::{
     ConcurrencyMode, CrmCallback, CrmError, CrmStream, CrmStreamCallback, CrmStreamItem,
     ResponseMeta, ResponsePool, RouteBuildSpec, SchedulerLimits, Server, ServerIpcConfig,
@@ -93,7 +92,10 @@ impl CrmStreamCallback for ScriptedCallback {
             item_count: request.first().copied().unwrap_or_default() as usize,
             fail_step: request.get(1) == Some(&1),
             fail_finish: request.get(1) == Some(&2),
-            item_bytes: request.get(2).copied().map_or(8, usize::from),
+            item_bytes: request.get(2..4).map_or_else(
+                || request.get(2).copied().map_or(8, usize::from),
+                |width| u16::from_le_bytes(width.try_into().unwrap()) as usize,
+            ),
             produced: 0,
         }))
     }
@@ -212,7 +214,7 @@ impl Harness {
             None => tokio::spawn(serving),
         };
         server.wait_until_ready(WAIT).await.unwrap();
-        let mut client = IpcClient::with_endpoint(endpoint, ClientIpcConfig::default()).unwrap();
+        let mut client = IpcClient::with_endpoint(endpoint).unwrap();
         client.connect().await.unwrap();
         let binding = client.acquire_route(&expected_contract()).await.unwrap();
         let client = Arc::new(client);
@@ -268,12 +270,7 @@ fn server_executor_teardown_reports_peer_end_as_dispatch_uncertain() {
                 .await;
         let mut stream = fixture
             .client
-            .stream_bound(
-                &fixture.binding,
-                "echo",
-                &[6],
-                PayloadBufferBudget::new(1024),
-            )
+            .stream_bound(&fixture.binding, "echo", &[6], memory_budget(1024))
             .await
             .unwrap();
         wait_for_steps(&fixture.observed, 2).await;
@@ -343,12 +340,7 @@ async fn zero_one_and_multiple_items_have_exact_terminal_counts() {
     for count in [0_u8, 1, 4] {
         let mut stream = fixture
             .client
-            .stream_bound(
-                &fixture.binding,
-                "echo",
-                &[count],
-                PayloadBufferBudget::new(1024),
-            )
+            .stream_bound(&fixture.binding, "echo", &[count], memory_budget(1024))
             .await
             .unwrap();
         for expected in 0..count {
@@ -370,7 +362,7 @@ async fn zero_one_and_multiple_items_have_exact_terminal_counts() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn zero_length_items_need_no_storage_credit_but_keep_demand_and_counts() {
     let fixture = Harness::start(1).await;
-    let budget = PayloadBufferBudget::new(0);
+    let budget = memory_budget(0);
     let mut stream = fixture
         .client
         .stream_bound(&fixture.binding, "echo", &[3, 0, 0], budget.clone())
@@ -392,7 +384,7 @@ async fn zero_length_items_need_no_storage_credit_but_keep_demand_and_counts() {
             .is_none()
     );
     assert_eq!(observed_terminal(&stream).await.complete_items, 3);
-    assert_eq!(budget.snapshot().used_bytes, 0);
+    assert_eq!(budget.snapshot().memory.used_bytes, 0);
     fixture.unary().await;
     fixture.stop().await;
 }
@@ -403,12 +395,7 @@ async fn resource_and_cleanup_errors_follow_only_complete_items() {
     for failure in [1_u8, 2] {
         let mut stream = fixture
             .client
-            .stream_bound(
-                &fixture.binding,
-                "echo",
-                &[2, failure],
-                PayloadBufferBudget::new(1024),
-            )
+            .stream_bound(&fixture.binding, "echo", &[2, failure], memory_budget(1024))
             .await
             .unwrap();
         for expected in 0..2_u8 {
@@ -442,12 +429,7 @@ async fn waiting_resource_step_does_not_hold_an_execution_worker() {
         streams.push(
             fixture
                 .client
-                .stream_bound(
-                    &fixture.binding,
-                    "echo",
-                    &[10],
-                    PayloadBufferBudget::new(1024),
-                )
+                .stream_bound(&fixture.binding, "echo", &[10], memory_budget(1024))
                 .await
                 .unwrap(),
         );
@@ -493,12 +475,7 @@ async fn cancel_during_running_step_waits_for_step_and_cleanup_once() {
     *fixture.observed.release_step.lock().unwrap() = Some(release_rx);
     let stream = fixture
         .client
-        .stream_bound(
-            &fixture.binding,
-            "echo",
-            &[10],
-            PayloadBufferBudget::new(1024),
-        )
+        .stream_bound(&fixture.binding, "echo", &[10], memory_budget(1024))
         .await
         .unwrap();
     wait_for_signal(entered_rx).await;
@@ -525,12 +502,7 @@ async fn local_delivery_grants_one_step_ahead_without_waiting_for_recv() {
     let fixture = Harness::start(1).await;
     let mut stream = fixture
         .client
-        .stream_bound(
-            &fixture.binding,
-            "echo",
-            &[6],
-            PayloadBufferBudget::new(1024),
-        )
+        .stream_bound(&fixture.binding, "echo", &[6], memory_budget(1024))
         .await
         .unwrap();
     wait_for_steps(&fixture.observed, 2).await;
@@ -569,7 +541,7 @@ async fn local_delivery_grants_one_step_ahead_without_waiting_for_recv() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn budget_wait_preserves_other_calls_and_resumes_after_a_local_copy_drops() {
     let fixture = Harness::start(1).await;
-    let budget = PayloadBufferBudget::new(16);
+    let budget = memory_budget(16);
     let mut stream = fixture
         .client
         .stream_bound(&fixture.binding, "echo", &[4], budget.clone())
@@ -580,7 +552,7 @@ async fn budget_wait_preserves_other_calls_and_resumes_after_a_local_copy_drops(
     assert_eq!(first.as_ref(), &[0; 8]);
     assert_eq!(second.as_ref(), &[1; 8]);
     wait_for_steps(&fixture.observed, 3).await;
-    assert_eq!(budget.snapshot().used_bytes, 16);
+    assert_eq!(budget.snapshot().memory.used_bytes, 16);
     fixture.unary().await;
     assert_eq!(
         fixture
@@ -611,7 +583,7 @@ async fn budget_wait_preserves_other_calls_and_resumes_after_a_local_copy_drops(
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cancel_while_second_item_waits_for_budget_does_not_wait_for_the_held_copy() {
     let fixture = Harness::start(1).await;
-    let budget = PayloadBufferBudget::new(8);
+    let budget = memory_budget(8);
     let mut stream = fixture
         .client
         .stream_bound(&fixture.binding, "echo", &[4], budget.clone())
@@ -620,7 +592,7 @@ async fn cancel_while_second_item_waits_for_budget_does_not_wait_for_the_held_co
     let first = stream.recv().await.unwrap().unwrap();
     assert_eq!(first.as_ref(), &[0; 8]);
     wait_for_steps(&fixture.observed, 2).await;
-    assert_eq!(budget.snapshot().used_bytes, 8);
+    assert_eq!(budget.snapshot().memory.used_bytes, 8);
     stream.cancel().unwrap();
     let terminal = tokio::time::timeout(WAIT, stream.completion())
         .await
@@ -631,7 +603,7 @@ async fn cancel_while_second_item_waits_for_budget_does_not_wait_for_the_held_co
     assert_eq!(first.as_ref(), &[0; 8]);
     fixture.unary().await;
     drop(first);
-    assert_eq!(budget.snapshot().used_bytes, 0);
+    assert_eq!(budget.snapshot().memory.used_bytes, 0);
     fixture.stop().await;
 }
 
@@ -644,12 +616,9 @@ async fn item_larger_than_entire_budget_fails_locally_and_keeps_call_until_clean
     *fixture.observed.release_finish.lock().unwrap() = Some(release_rx);
     let mut stream = tokio::time::timeout(
         WAIT,
-        fixture.client.stream_bound(
-            &fixture.binding,
-            "echo",
-            &[3, 0, 9],
-            PayloadBufferBudget::new(8),
-        ),
+        fixture
+            .client
+            .stream_bound(&fixture.binding, "echo", &[3, 0, 9], memory_budget(8)),
     )
     .await
     .expect("stream OPEN did not submit")
@@ -663,6 +632,7 @@ async fn item_larger_than_entire_budget_fails_locally_and_keeps_call_until_clean
         "{error:?}"
     );
     wait_for_signal(entered_rx).await;
+    #[cfg(feature = "test-support")]
     assert_eq!(fixture.client.pending_len_for_test(), 1);
     release_tx.send(()).unwrap();
     let terminal = stream
@@ -672,6 +642,7 @@ async fn item_larger_than_entire_budget_fails_locally_and_keeps_call_until_clean
     assert_eq!(terminal.status, CallStatus::Failed);
     assert_eq!(terminal.error.unwrap().code, ErrorCode::CallCancelled);
     assert!(format!("{:?}", stream.recv().await.unwrap_err()).contains("CallCapacityExceeded"));
+    #[cfg(feature = "test-support")]
     assert_eq!(fixture.client.pending_len_for_test(), 0);
     fixture.unary().await;
     fixture.stop().await;
@@ -690,12 +661,7 @@ async fn cancel_before_first_resource_step_is_not_executed() {
     wait_for_signal(entered_rx).await;
     let stream = fixture
         .client
-        .stream_bound(
-            &fixture.binding,
-            "echo",
-            &[3],
-            PayloadBufferBudget::new(1024),
-        )
+        .stream_bound(&fixture.binding, "echo", &[3], memory_budget(1024))
         .await
         .unwrap();
     stream.cancel().unwrap();
@@ -719,12 +685,7 @@ async fn late_cancel_does_not_rewrite_successful_terminal() {
     let fixture = Harness::start(1).await;
     let stream = fixture
         .client
-        .stream_bound(
-            &fixture.binding,
-            "echo",
-            &[0],
-            PayloadBufferBudget::new(1024),
-        )
+        .stream_bound(&fixture.binding, "echo", &[0], memory_budget(1024))
         .await
         .unwrap();
     let terminal = observed_terminal(&stream).await;
@@ -746,12 +707,7 @@ async fn removed_route_returns_decodable_not_executed_to_old_stream_binding() {
     assert!(fixture.server.unregister_route("portable").await);
     let result = fixture
         .client
-        .stream_bound(
-            &fixture.binding,
-            "echo",
-            &[1],
-            PayloadBufferBudget::new(1024),
-        )
+        .stream_bound(&fixture.binding, "echo", &[1], memory_budget(1024))
         .await;
     match result {
         Ok(stream) => {
@@ -804,12 +760,7 @@ async fn changed_contract_returns_decodable_not_executed_to_old_stream_binding()
 
     let result = fixture
         .client
-        .stream_bound(
-            &fixture.binding,
-            "echo",
-            &[1],
-            PayloadBufferBudget::new(1024),
-        )
+        .stream_bound(&fixture.binding, "echo", &[1], memory_budget(1024))
         .await;
     match result {
         Ok(stream) => {
@@ -832,34 +783,53 @@ async fn changed_contract_returns_decodable_not_executed_to_old_stream_binding()
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn deactivation_preserves_admitted_stream_and_local_copy_after_shm_receive() {
+    const ITEM_BYTES: u16 = 32 * 1024;
+    assert!(u64::from(ITEM_BYTES) > c2_config::SHM_THRESHOLD);
+    let [size_lo, size_hi] = ITEM_BYTES.to_le_bytes();
     let fixture = Harness::start_with_config(ServerIpcConfig {
         max_execution_workers: 1,
-        shm_threshold: 1,
+
         ..ServerIpcConfig::default()
     })
     .await;
+    let budget = memory_budget(256 * 1024);
     let mut stream = fixture
         .client
         .stream_bound(
             &fixture.binding,
             "echo",
-            &[3, 0, 64],
-            PayloadBufferBudget::new(1024),
+            &[3, 0, size_lo, size_hi],
+            budget.clone(),
         )
         .await
         .unwrap();
     let first = stream.recv().await.unwrap().unwrap();
-    assert_eq!(first.as_ref(), &[0; 64]);
+    assert_eq!(first.as_ref(), &[0; ITEM_BYTES as usize]);
+    let pool = fixture.server.response_pool_arc();
+    let stats = pool.read().stats();
+    assert!(
+        stats.buddy_reused_allocs + stats.buddy_expanded_allocs + stats.dedicated_allocs > 0,
+        "first stream item did not allocate SHM: {stats:?}"
+    );
+    assert!(budget.snapshot().memory.peak_bytes >= u64::from(ITEM_BYTES));
     fixture.client.deactivate();
-    assert_eq!(first.as_ref(), &[0; 64]);
+    assert_eq!(first.as_ref(), &[0; ITEM_BYTES as usize]);
     for expected in 1..3_u8 {
         let item = stream.recv().await.unwrap().unwrap();
-        assert_eq!(item.as_ref(), &[expected; 64]);
+        assert_eq!(item.as_ref(), &[expected; ITEM_BYTES as usize]);
     }
     assert!(stream.recv().await.unwrap().is_none());
     let terminal = observed_terminal(&stream).await;
     assert_eq!(terminal.status, CallStatus::Success);
     assert_eq!(terminal.complete_items, 3);
-    assert_eq!(first.as_ref(), &[0; 64]);
+    assert_eq!(first.as_ref(), &[0; ITEM_BYTES as usize]);
     fixture.stop().await;
+}
+
+fn memory_budget(memory_budget_bytes: u64) -> c2_mem::DomainBudget {
+    c2_mem::DomainBudget::from_limits(&c2_config::DomainLimits {
+        memory_budget_bytes,
+        max_outstanding_calls: c2_config::default_max_outstanding_calls(memory_budget_bytes),
+        ..Default::default()
+    })
 }

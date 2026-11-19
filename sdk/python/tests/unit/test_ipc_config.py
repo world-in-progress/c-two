@@ -1,10 +1,8 @@
-"""Unit tests for the Python IPC override facade."""
+"""Tests for Host identity and relay configuration projections."""
 from __future__ import annotations
 
 import inspect
-from collections import UserDict
 from pathlib import Path
-from typing import get_type_hints
 
 import pytest
 
@@ -12,8 +10,6 @@ import c_two as cc
 from c_two import _native
 
 import c_two.endpoint
-import c_two.config as config
-import c_two.config.ipc as ipc_config
 from c_two.config.settings import settings
 from c_two.error import ResourceNotFound
 from c_two.transport import Server
@@ -33,608 +29,12 @@ class UnitConfigCRM:
 
 @pytest.fixture(autouse=True)
 def _reset_registry_and_settings(monkeypatch):
-    cc.shutdown()
     _reset_default_runtime()
-    settings.relay_anchor_address = None
-    settings.shm_threshold = None
-    settings.remote_payload_chunk_size = None
     monkeypatch.setenv('C2_ENV_FILE', '')
-    for key in (
-        'C2_SHM_THRESHOLD',
-        'C2_REMOTE_PAYLOAD_CHUNK_SIZE',
-        'C2_IPC_POOL_SEGMENT_SIZE',
-        'C2_IPC_REASSEMBLY_SEGMENT_SIZE',
-        'C2_IPC_POOL_PREWARM_SEGMENTS',
-        'C2_IPC_POOL_MIN_RETAINED_SEGMENTS',
-        'C2_IPC_POOL_DECAY_SECONDS',
-        'C2_IPC_MAX_TOTAL_CHUNKS',
-        'C2_IPC_MAX_INFLIGHT_CHUNK_FRAMES',
-        'C2_IPC_SHM_BACKING_BUDGET_BYTES',
-        'C2_IPC_FILE_BACKING_BUDGET_BYTES',
-        'C2_IPC_LIVE_REASSEMBLY_BUDGET_BYTES',
-        'C2_RELAY_ANCHOR_ADDRESS',
-        'C2_RELAY_USE_PROXY',
-    ):
-        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv('C2_RELAY_ANCHOR_ADDRESS', '')
+    monkeypatch.setattr(settings, '_relay_anchor_address', None)
     yield
-    try:
-        cc.shutdown()
-        _reset_default_runtime()
-    finally:
-        settings.relay_anchor_address = None
-        settings.shm_threshold = None
-        settings.remote_payload_chunk_size = None
-
-
-def test_public_config_exports_only_override_schemas():
-    removed = {
-        'BaseIPCConfig',
-        'ServerIPCConfig',
-        'ClientIPCConfig',
-        'build_server_config',
-        'build_client_config',
-    }
-    for name in removed:
-        assert not hasattr(config, name)
-
-    assert hasattr(config, 'BaseIPCOverrides')
-    assert hasattr(config, 'ServerIPCOverrides')
-    assert hasattr(config, 'ClientIPCOverrides')
-
-
-def test_ipc_module_exports_only_override_schemas():
-    assert set(ipc_config.__all__) == {
-        'BaseIPCOverrides',
-        'ServerIPCOverrides',
-        'ClientIPCOverrides',
-    }
-
-
-def test_override_schemas_are_typed_and_do_not_include_derived_or_global_fields():
-    base = get_type_hints(config.BaseIPCOverrides)
-    server = get_type_hints(config.ServerIPCOverrides)
-    client = get_type_hints(config.ClientIPCOverrides)
-
-    assert base['pool_enabled'] is bool
-    assert base['write_timeout'] is float
-    assert base['max_dedicated_segments'] is int
-    assert base['spill_threshold'] is float
-    assert base['pool_segment_size'] is int
-    assert base['pool_prewarm_segments'] is int
-    assert base['pool_min_retained_segments'] is int
-    assert base['chunk_gc_interval'] is float
-    assert base['shm_backing_budget_bytes'] is int
-    assert base['file_backing_budget_bytes'] is int
-    assert base['live_reassembly_budget_bytes'] is int
-    assert server['max_pending_requests'] is int
-    assert server['max_execution_workers'] is int
-    assert server['pool_decay_seconds'] is float
-    assert client['reassembly_segment_size'] is int
-    assert client['pool_decay_seconds'] is float
-
-    for hints in (base, server, client):
-        assert 'shm_threshold' not in hints
-        assert 'max_pool_memory' not in hints
-
-
-def test_server_config_uses_env_for_ipc_defaults(monkeypatch):
-    monkeypatch.setenv('C2_IPC_POOL_SEGMENT_SIZE', str(2 * 1024 * 1024))
-
-    server_config = _native.resolve_server_ipc_config(None, None)
-    assert server_config['pool_segment_size'] == 2 * 1024 * 1024
-
-
-def test_server_config_uses_env_for_global_transport_policy(monkeypatch):
-    monkeypatch.setenv('C2_SHM_THRESHOLD', '8192')
-
-    server_config = _native.resolve_server_ipc_config(None, None)
-    assert server_config['shm_threshold'] == 8192
-
-
-def test_transport_policy_override_beats_env(monkeypatch):
-    monkeypatch.setenv('C2_SHM_THRESHOLD', '8192')
-
-    cc.set_transport_policy(shm_threshold=16384)
-
-    server_config = _native.resolve_server_ipc_config(None, settings._shm_overrides())
-    assert server_config['shm_threshold'] == 16384
-
-
-def test_remote_payload_chunk_size_resolves_from_env_and_policy(monkeypatch):
-    monkeypatch.setenv('C2_REMOTE_PAYLOAD_CHUNK_SIZE', '2097152')
-
-    from c_two._native import resolve_remote_payload_chunk_size
-
-    assert resolve_remote_payload_chunk_size() == 2_097_152
-    assert settings.remote_payload_chunk_size == 2_097_152
-
-    cc.set_transport_policy(remote_payload_chunk_size=1_048_576)
-    registry = _get_default_runtime()
-
-    assert settings.remote_payload_chunk_size == 1_048_576
-    assert registry._runtime_session.remote_payload_chunk_size_override == 1_048_576  # noqa: SLF001
-
-
-def test_transport_policy_updates_preserve_unspecified_overrides():
-    cc.set_transport_policy(shm_threshold=8192)
-    cc.set_transport_policy(remote_payload_chunk_size=1_048_576)
-    registry = _get_default_runtime()
-
-    assert settings.shm_threshold == 8192
-    assert settings.remote_payload_chunk_size == 1_048_576
-    assert registry._runtime_session.client_ipc_config['shm_threshold'] == 8192  # noqa: SLF001
-    assert registry._runtime_session.remote_payload_chunk_size_override == 1_048_576  # noqa: SLF001
-
-    cc.set_transport_policy(shm_threshold=None)
-    registry = _get_default_runtime()
-
-    assert registry._runtime_session.client_ipc_config['shm_threshold'] == 4096  # noqa: SLF001
-    assert registry._runtime_session.remote_payload_chunk_size_override == 1_048_576  # noqa: SLF001
-
-
-def test_remote_payload_chunk_size_zero_rejected(monkeypatch):
-    monkeypatch.setenv('C2_REMOTE_PAYLOAD_CHUNK_SIZE', '0')
-
-    from c_two._native import resolve_remote_payload_chunk_size
-
-    with pytest.raises(ValueError, match='C2_REMOTE_PAYLOAD_CHUNK_SIZE'):
-        resolve_remote_payload_chunk_size()
-
-    monkeypatch.delenv('C2_REMOTE_PAYLOAD_CHUNK_SIZE')
-    with pytest.raises(ValueError, match='C2_REMOTE_PAYLOAD_CHUNK_SIZE'):
-        cc.set_transport_policy(remote_payload_chunk_size=0)
-
-
-def test_shm_override_helper_only_contains_shm_threshold():
-    settings.shm_threshold = 4096
-    assert settings._shm_overrides() == {'shm_threshold': 4096}  # noqa: SLF001
-
-
-def test_server_ipc_overrides_beat_env(monkeypatch):
-    monkeypatch.setenv('C2_IPC_POOL_SEGMENT_SIZE', str(2 * 1024 * 1024))
-
-    server_config = _native.resolve_server_ipc_config({'pool_segment_size': 4 * 1024 * 1024}, None)
-    assert server_config['pool_segment_size'] == 4 * 1024 * 1024
-
-
-def test_server_execution_workers_env_and_override(monkeypatch):
-    monkeypatch.setenv('C2_IPC_MAX_EXECUTION_WORKERS', '9')
-
-    server_config = _native.resolve_server_ipc_config(None, None)
-    assert server_config['max_execution_workers'] == 9
-
-    override_server_config = _native.resolve_server_ipc_config({'max_execution_workers': 7}, None)
-    assert override_server_config['max_execution_workers'] == 7
-
-
-def test_server_execution_workers_zero_rejected(monkeypatch):
-    monkeypatch.setenv('C2_IPC_MAX_EXECUTION_WORKERS', '0')
-
-    with pytest.raises(ValueError, match='max_execution_workers'):
-        _native.resolve_server_ipc_config(None, None)
-
-    monkeypatch.delenv('C2_IPC_MAX_EXECUTION_WORKERS')
-    with pytest.raises(ValueError, match='max_execution_workers'):
-        _native.resolve_server_ipc_config({'max_execution_workers': 0}, None)
-
-
-def test_server_execution_workers_explicit_values_above_default_cap(monkeypatch):
-    monkeypatch.setenv('C2_IPC_MAX_EXECUTION_WORKERS', '65')
-
-    assert _native.resolve_server_ipc_config(None, None)['max_execution_workers'] == 65
-
-    monkeypatch.delenv('C2_IPC_MAX_EXECUTION_WORKERS')
-    assert _native.resolve_server_ipc_config(
-        {'max_execution_workers': 128}, None,
-    )['max_execution_workers'] == 128
-
-
-GIB = 1024 ** 3
-U64_MAX = 2 ** 64 - 1
-
-
-def test_resolved_ipc_config_exposes_canonical_memory_budget_defaults():
-    native = _native
-
-    server_cfg = native.resolve_server_ipc_config(None, None)
-    client_cfg = native.resolve_client_ipc_config(None, None)
-
-    for cfg in (server_cfg, client_cfg):
-        assert cfg['shm_backing_budget_bytes'] == 8 * GIB
-        assert cfg['file_backing_budget_bytes'] == 16 * GIB
-        assert cfg['live_reassembly_budget_bytes'] == 8 * GIB
-
-
-@pytest.mark.parametrize(
-    'budgets',
-    [(3 * GIB, 5 * GIB, GIB), (0, 0, 0), (U64_MAX, U64_MAX, U64_MAX)],
-    ids=['explicit', 'zero', 'u64-max'],
-)
-def test_ipc_overrides_roundtrip_memory_budget_bytes(budgets):
-    native = _native
-    overrides = {
-        'shm_backing_budget_bytes': budgets[0],
-        'file_backing_budget_bytes': budgets[1],
-        'live_reassembly_budget_bytes': budgets[2],
-    }
-
-    server_cfg = native.resolve_server_ipc_config(overrides, None)
-    client_cfg = native.resolve_client_ipc_config(overrides, None)
-
-    for cfg in (server_cfg, client_cfg):
-        assert {key: cfg[key] for key in overrides} == overrides
-
-
-_COMMON_IPC_FIELDS = (
-    ('pool_enabled', 'C2_IPC_POOL_ENABLED', True, False),
-    ('pool_segment_size', 'C2_IPC_POOL_SEGMENT_SIZE', 131072, 262144),
-    ('max_pool_segments', 'C2_IPC_MAX_POOL_SEGMENTS', 2, 3),
-    ('pool_prewarm_segments', 'C2_IPC_POOL_PREWARM_SEGMENTS', 1, 0),
-    ('pool_min_retained_segments', 'C2_IPC_POOL_MIN_RETAINED_SEGMENTS', 2, 0),
-    ('reassembly_segment_size', 'C2_IPC_REASSEMBLY_SEGMENT_SIZE', 65536, 131072),
-    ('reassembly_max_segments', 'C2_IPC_REASSEMBLY_MAX_SEGMENTS', 3, 2),
-    ('max_inflight_chunk_frames', 'C2_IPC_MAX_INFLIGHT_CHUNK_FRAMES', 8192, 16384),
-    ('chunk_gc_interval', 'C2_IPC_CHUNK_GC_INTERVAL', 2.5, 5.0),
-    ('chunk_threshold_ratio', 'C2_IPC_CHUNK_THRESHOLD_RATIO', 0.5, 0.75),
-    ('chunk_assembler_timeout', 'C2_IPC_CHUNK_ASSEMBLER_TIMEOUT', 30.0, 60.0),
-    ('max_reassembly_bytes', 'C2_IPC_MAX_REASSEMBLY_BYTES', 1048576, 2097152),
-    ('chunk_size', 'C2_IPC_CHUNK_SIZE', 65536, 131072),
-    ('shm_backing_budget_bytes', 'C2_IPC_SHM_BACKING_BUDGET_BYTES', GIB, 0),
-    ('file_backing_budget_bytes', 'C2_IPC_FILE_BACKING_BUDGET_BYTES', 2 * GIB, 0),
-    ('live_reassembly_budget_bytes', 'C2_IPC_LIVE_REASSEMBLY_BUDGET_BYTES', 4 * GIB, 0),
-    ('pool_decay_seconds', 'C2_IPC_POOL_DECAY_SECONDS', 12.5, 7.5),
-)
-_SERVER_IPC_FIELDS = (
-    ('max_frame_size', 'C2_IPC_MAX_FRAME_SIZE', 1048576, 2097152),
-    ('max_payload_size', 'C2_IPC_MAX_PAYLOAD_SIZE', 1048576, 2097152),
-    ('max_pending_requests', 'C2_IPC_MAX_PENDING_REQUESTS', 7, 11),
-    ('max_execution_workers', 'C2_IPC_MAX_EXECUTION_WORKERS', 9, 7),
-)
-
-
-@pytest.mark.parametrize('role', ('server', 'client'))
-def test_retired_chunk_capacity_override_is_rejected_and_env_ignored(monkeypatch, role):
-    resolve = getattr(_native, f'resolve_{role}_ipc_config')
-    monkeypatch.setenv('C2_IPC_MAX_TOTAL_CHUNKS', 'invalid')
-    cfg = resolve(None, None)
-    assert cfg['max_inflight_chunk_frames'] == 512
-    assert 'max_total_chunks' not in cfg
-
-    with pytest.raises(ValueError, match='max_total_chunks'):
-        resolve({'max_total_chunks': 2}, None)
-
-
-@pytest.mark.parametrize('role', ('server', 'client'))
-def test_new_chunk_capacity_rejects_zero(monkeypatch, role):
-    resolve = getattr(_native, f'resolve_{role}_ipc_config')
-    with pytest.raises(ValueError, match='max_inflight_chunk_frames'):
-        resolve({'max_inflight_chunk_frames': 0}, None)
-
-    monkeypatch.setenv('C2_IPC_MAX_INFLIGHT_CHUNK_FRAMES', '0')
-    with pytest.raises(ValueError, match='max_inflight_chunk_frames'):
-        resolve(None, None)
-
-
-@pytest.mark.parametrize(
-    'role,field,key,env_value,override_value',
-    [(role, *case) for role in ('server', 'client') for case in _COMMON_IPC_FIELDS]
-    + [('server', *case) for case in _SERVER_IPC_FIELDS],
-)
-def test_ipc_field_precedence_and_overridden_invalid_env(
-    monkeypatch, role, field, key, env_value, override_value,
-):
-    resolve = getattr(_native, f'resolve_{role}_ipc_config')
-    monkeypatch.setenv(key, str(env_value))
-    assert resolve(None, None)[field] == env_value
-    assert resolve({field: override_value}, None)[field] == override_value
-
-    monkeypatch.setenv(key, 'invalid')
-    for overrides in (None, {field: override_value}):
-        with pytest.raises(ValueError, match=key):
-            resolve(overrides, None)
-
-
-@pytest.mark.parametrize('role', ('server', 'client'))
-def test_ipc_env_errors_precede_derivation_and_final_validation(monkeypatch, role):
-    resolve = getattr(_native, f'resolve_{role}_ipc_config')
-    overrides = {'pool_segment_size': 2 ** 64 - 1}
-    monkeypatch.setenv('C2_IPC_POOL_SEGMENT_SIZE', 'invalid')
-    monkeypatch.setenv('C2_IPC_POOL_DECAY_SECONDS', 'invalid')
-    with pytest.raises(ValueError, match='C2_IPC_POOL_SEGMENT_SIZE'):
-        resolve(overrides, None)
-    monkeypatch.delenv('C2_IPC_POOL_SEGMENT_SIZE')
-    with pytest.raises(ValueError, match='C2_IPC_POOL_DECAY_SECONDS'):
-        resolve(overrides, None)
-    monkeypatch.delenv('C2_IPC_POOL_DECAY_SECONDS')
-    with pytest.raises(ValueError, match='max_pool_memory derived value overflowed'):
-        resolve(overrides, None)
-    with pytest.raises(ValueError, match='pool_segment_size must be > 0'):
-        resolve({'pool_segment_size': 0}, None)
-
-
-@pytest.mark.parametrize('role', ('server', 'client'))
-def test_ipc_segment_roundup_beyond_u32_is_rejected(role):
-    resolve = getattr(_native, f'resolve_{role}_ipc_config')
-    with pytest.raises(ValueError, match='pool_segment_size'):
-        resolve({'pool_segment_size': 2 ** 31 + 1}, None)
-
-
-def test_memory_budget_negative_and_overflow_overrides_rejected_by_native():
-    native = _native
-
-    for bad_value in (-1, 2 ** 64):
-        with pytest.raises(OverflowError):
-            native.resolve_client_ipc_config(
-                {'shm_backing_budget_bytes': bad_value}, None
-            )
-        with pytest.raises(OverflowError):
-            native.resolve_server_ipc_config(
-                {'live_reassembly_budget_bytes': bad_value}, None
-            )
-
-
-def test_memory_budget_invalid_env_value_rejected_by_native(monkeypatch):
-    native = _native
-
-    for key, bad_value in (
-        ('C2_IPC_SHM_BACKING_BUDGET_BYTES', '-1'),
-        ('C2_IPC_FILE_BACKING_BUDGET_BYTES', str(2 ** 64)),
-        ('C2_IPC_LIVE_REASSEMBLY_BUDGET_BYTES', 'not-a-number'),
-    ):
-        monkeypatch.setenv(key, bad_value)
-        with pytest.raises(ValueError, match=key):
-            native.resolve_server_ipc_config(None, None)
-        with pytest.raises(ValueError, match=key):
-            native.resolve_client_ipc_config(None, None)
-        monkeypatch.delenv(key)
-
-
-def test_client_session_projects_memory_budget_overrides():
-    cc.set_client(ipc_overrides={'shm_backing_budget_bytes': 2 * GIB})
-    registry = _get_default_runtime()
-
-    client_config = registry._runtime_session.client_ipc_config  # noqa: SLF001
-    assert client_config['shm_backing_budget_bytes'] == 2 * GIB
-    assert client_config['file_backing_budget_bytes'] == 16 * GIB
-
-
-@pytest.mark.parametrize('side', ('server', 'client'))
-def test_ipc_write_and_pool_policy_roundtrip_from_env_through_typed_override(
-    monkeypatch, side,
-):
-    monkeypatch.setenv('C2_IPC_WRITE_TIMEOUT', '41.5')
-    monkeypatch.setenv('C2_IPC_MAX_DEDICATED_SEGMENTS', '9')
-    monkeypatch.setenv('C2_IPC_SPILL_THRESHOLD', '0.65')
-    resolved = getattr(_native, f'resolve_{side}_ipc_config')
-    assert {key: resolved(None, None)[key] for key in (
-        'write_timeout', 'max_dedicated_segments', 'spill_threshold',
-    )} == {
-        'write_timeout': 41.5,
-        'max_dedicated_segments': 9,
-        'spill_threshold': 0.65,
-    }
-
-    overrides: config.ServerIPCOverrides | config.ClientIPCOverrides = {
-        'write_timeout': 2.5,
-        'max_dedicated_segments': 0,
-        'spill_threshold': 0.0,
-    }
-    session = _native.RuntimeSession(**{f'{side}_ipc_overrides': overrides})
-    assert getattr(session, f'{side}_ipc_overrides') == overrides
-    effective = (
-        resolved(overrides, None) if side == 'server' else session.client_ipc_config
-    )
-    assert {key: effective[key] for key in overrides} == overrides
-
-
-def test_server_config_projects_memory_budget_env(monkeypatch):
-    monkeypatch.setenv('C2_IPC_FILE_BACKING_BUDGET_BYTES', str(32 * GIB))
-
-    server_config = _native.resolve_server_ipc_config(None, None)
-    assert server_config['file_backing_budget_bytes'] == 32 * GIB
-    assert server_config['shm_backing_budget_bytes'] == 8 * GIB
-
-
-def test_client_ipc_overrides_beat_env(monkeypatch):
-    monkeypatch.setenv('C2_IPC_REASSEMBLY_SEGMENT_SIZE', str(32 * 1024 * 1024))
-
-    cc.set_client(ipc_overrides={'reassembly_segment_size': 16 * 1024 * 1024})
-    registry = _get_default_runtime()
-
-    assert registry._runtime_session.client_ipc_config['reassembly_segment_size'] == 16 * 1024 * 1024  # noqa: SLF001
-
-
-def test_client_pool_decay_defaults_and_projects_into_resolved_config():
-    native = _native
-
-    client_cfg = native.resolve_client_ipc_config(None, None)
-    assert client_cfg['pool_decay_seconds'] == 60.0
-
-    client_cfg = native.resolve_client_ipc_config({'pool_decay_seconds': 2.5}, None)
-    assert client_cfg['pool_decay_seconds'] == 2.5
-
-
-def test_client_pool_decay_zero_is_immediate_retirement_and_negative_is_rejected():
-    native = _native
-
-    client_cfg = native.resolve_client_ipc_config({'pool_decay_seconds': 0.0}, None)
-    assert client_cfg['pool_decay_seconds'] == 0.0
-
-    with pytest.raises(ValueError, match='pool_decay_seconds'):
-        native.resolve_client_ipc_config({'pool_decay_seconds': -1.0}, None)
-
-
-def test_buddy_policy_defaults_are_lazy_and_retire_to_zero():
-    native = _native
-
-    server_cfg = native.resolve_server_ipc_config(None, None)
-    client_cfg = native.resolve_client_ipc_config(None, None)
-
-    for cfg in (server_cfg, client_cfg):
-        assert cfg['pool_enabled'] is True
-        assert cfg['pool_prewarm_segments'] == 0
-        assert cfg['pool_min_retained_segments'] == 0
-
-
-def test_buddy_policy_overrides_beat_env(monkeypatch):
-    monkeypatch.setenv('C2_IPC_POOL_PREWARM_SEGMENTS', '1')
-    monkeypatch.setenv('C2_IPC_POOL_MIN_RETAINED_SEGMENTS', '1')
-
-    server_config = _native.resolve_server_ipc_config({'pool_prewarm_segments': 2, 'pool_min_retained_segments': 3}, None)
-    assert server_config['pool_prewarm_segments'] == 2
-    assert server_config['pool_min_retained_segments'] == 3
-
-    native = _native
-    client_cfg = native.resolve_client_ipc_config(
-        {'pool_prewarm_segments': 0, 'pool_min_retained_segments': 2}, None
-    )
-    assert client_cfg['pool_prewarm_segments'] == 0
-    assert client_cfg['pool_min_retained_segments'] == 2
-
-
-def test_prewarm_with_buddy_disabled_is_rejected_by_native():
-    native = _native
-
-    with pytest.raises(ValueError, match='pool_prewarm_segments'):
-        native.resolve_server_ipc_config(
-            {'pool_enabled': False, 'pool_prewarm_segments': 1}, None
-        )
-
-    with pytest.raises(ValueError, match='pool_prewarm_segments'):
-        native.resolve_client_ipc_config(
-            {'pool_enabled': False, 'pool_prewarm_segments': 1}, None
-        )
-
-
-def test_prewarm_exceeding_max_pool_segments_is_rejected_by_native():
-    native = _native
-
-    with pytest.raises(ValueError, match='pool_prewarm_segments'):
-        native.resolve_server_ipc_config(
-            {'max_pool_segments': 2, 'pool_prewarm_segments': 3}, None
-        )
-
-
-def test_min_retained_exceeding_limits_is_rejected_by_native():
-    native = _native
-
-    with pytest.raises(ValueError, match='pool_min_retained_segments'):
-        native.resolve_client_ipc_config(
-            {'max_pool_segments': 2, 'pool_min_retained_segments': 3}, None
-        )
-
-    with pytest.raises(ValueError, match='reassembly_max_segments'):
-        native.resolve_client_ipc_config(
-            {'reassembly_max_segments': 2, 'pool_min_retained_segments': 3}, None
-        )
-
-
-@pytest.mark.parametrize('key', ['shm_threshold'])
-def test_forbidden_server_ipc_override_fields_are_rejected_by_native(key):
-    with pytest.raises(ValueError, match='shm_threshold is a global transport policy'):
-        cc.set_server(ipc_overrides={key: 1})
-
-
-@pytest.mark.parametrize('key', ['shm_threshold'])
-def test_forbidden_client_ipc_override_fields_are_rejected_by_native(key):
-    with pytest.raises(ValueError, match='shm_threshold is a global transport policy'):
-        cc.set_client(ipc_overrides={key: 1})
-
-
-def test_removed_max_pool_memory_override_is_rejected_by_native():
-    with pytest.raises(ValueError, match='unknown IPC override option: max_pool_memory'):
-        cc.set_server(ipc_overrides={'max_pool_memory': 1024})
-
-    with pytest.raises(ValueError, match='unknown IPC override option: max_pool_memory'):
-        cc.set_client(ipc_overrides={'max_pool_memory': 1024})
-
-
-def test_native_resolver_treats_max_pool_memory_as_unknown_override():
-    native = _native
-
-    with pytest.raises(ValueError, match='unknown IPC override option: max_pool_memory'):
-        native.resolve_server_ipc_config({'max_pool_memory': 1024}, None)
-
-    with pytest.raises(ValueError, match='unknown IPC override option: max_pool_memory'):
-        native.resolve_client_ipc_config({'max_pool_memory': 1024}, None)
-
-
-@pytest.mark.parametrize('segment_size, segments, total', (
-    (268_435_456, 4, 1_073_741_824),
-    (131_072, 3, 393_216),
-    (524_288, 5, 2_621_440),
-))
-def test_native_resolver_accepts_mapping_subclasses(segment_size, segments, total):
-    native = _native
-    overrides = UserDict({'pool_segment_size': segment_size, 'max_pool_segments': segments})
-
-    server_cfg = native.resolve_server_ipc_config(overrides, None)
-    client_cfg = native.resolve_client_ipc_config(overrides, None)
-
-    for cfg in (server_cfg, client_cfg):
-        assert cfg['pool_segment_size'] == segment_size
-        assert cfg['max_pool_segments'] == segments
-        assert cfg['max_pool_memory'] == total
-
-
-def test_unknown_ipc_override_field_is_rejected_by_native():
-    with pytest.raises(ValueError, match='unknown IPC override option: not_real'):
-        _native.resolve_server_ipc_config({'not_real': 1}, None)
-
-    with pytest.raises(ValueError, match='unknown IPC override option: not_real'):
-        cc.set_server(ipc_overrides={'not_real': 1})
-
-    with pytest.raises(ValueError, match='unknown IPC override option: not_real'):
-        cc.set_client(ipc_overrides={'not_real': 1})
-
-
-def test_ipc_overrides_must_be_mapping_native_error():
-    with pytest.raises(TypeError, match='ipc_overrides must be a mapping'):
-        cc.set_server(ipc_overrides=object())  # type: ignore[arg-type]
-
-    with pytest.raises(TypeError, match='ipc_overrides must be a mapping'):
-        cc.set_client(ipc_overrides=object())  # type: ignore[arg-type]
-
-
-def test_ipc_override_keys_must_be_strings_native_error():
-    with pytest.raises(TypeError, match='IPC override option names must be strings'):
-        cc.set_client(ipc_overrides={1: 4096})  # type: ignore[dict-item]
-
-
-def test_ipc_override_non_string_keys_are_shape_errors_before_semantic_errors():
-    with pytest.raises(TypeError, match='IPC override option names must be strings'):
-        cc.set_client(
-            ipc_overrides={  # type: ignore[dict-item]
-                1: 4096,
-                'shm_threshold': 1,
-            },
-        )
-
-
-def test_high_level_ipc_overrides_are_copied_when_set():
-    overrides = {'pool_segment_size': 2 * 1024 * 1024}
-    cc.set_server(ipc_overrides=overrides)
-    overrides['pool_segment_size'] = 4 * 1024 * 1024
-
-    registry = _get_default_runtime()
-    assert registry._runtime_session.server_ipc_overrides == {
-        'pool_segment_size': 2 * 1024 * 1024,
-    }  # noqa: SLF001
-
-
-def test_ipc_override_mapping_is_snapshotted_by_native():
-    overrides = UserDict({
-        'pool_segment_size': 2 * 1024 * 1024,
-        'chunk_size': None,
-    })
-
-    cc.set_server(ipc_overrides=overrides)  # type: ignore[arg-type]
-    overrides['pool_segment_size'] = 4 * 1024 * 1024
-
-    registry = _get_default_runtime()
-    assert registry._runtime_session.server_ipc_overrides == {
-        'pool_segment_size': 2 * 1024 * 1024,
-    }  # noqa: SLF001
+    _reset_default_runtime()
 
 
 def test_server_id_override_drives_auto_address():
@@ -689,14 +89,12 @@ class _FakeRuntimeSession:
     client_config_frozen = False
     server_id = None
     server_id_override = None
-    server_ipc_overrides = None
-    client_ipc_overrides = None
 
     def __init__(
         self,
         *,
         max_outstanding_calls: int | None = None,
-        payload_buffer_budget_bytes: int | None = None,
+        memory_budget_bytes: int | None = None,
         **_kwargs,
     ) -> None:
         from c_two._native import resolve_local_endpoint_context
@@ -705,7 +103,7 @@ class _FakeRuntimeSession:
         self._limits = {
             key: value for key, value in (
                 ('max_outstanding_calls', max_outstanding_calls),
-                ('payload_buffer_budget_bytes', payload_buffer_budget_bytes),
+                ('memory_budget_bytes', memory_budget_bytes),
             ) if value is not None
         }
         self.adopted_observations: list[_FakeRetiredObservation] = []
@@ -731,11 +129,9 @@ class _FakeRuntimeSession:
     def observe(self):
         return {'completed': True, 'relay_errors': [], 'route_outcomes': []}
 
-    def retire_memory_observation(self) -> _FakeRetiredObservation:
-        return _FakeRetiredObservation()
-
-    def adopt_retired_memory_observation(self, observation: _FakeRetiredObservation) -> None:
-        self.adopted_observations.append(observation)
+    def inherit_retirement(self, previous: _FakeRuntimeSession) -> None:
+        self._limits = previous._limits
+        self.adopted_observations.append(_FakeRetiredObservation())
 
     def set_relay_anchor_address(self, relay_address: str | None, *, connect_attempt=None) -> None:
         self.relay_anchor_address_override = relay_address
@@ -801,7 +197,7 @@ def test_relay_resolved_connect_delegates_route_validation_to_runtime_session(mo
 def test_route_spy_shutdown_preserves_native_context_and_accepted_limits(monkeypatch):
     registry = _get_default_runtime()
     installed = _FakeRuntimeSession(
-        max_outstanding_calls=7, payload_buffer_budget_bytes=8192,
+        max_outstanding_calls=7, memory_budget_bytes=8192,
     )
     captured = installed.local_endpoint_context()
 
@@ -812,7 +208,7 @@ def test_route_spy_shutdown_preserves_native_context_and_accepted_limits(monkeyp
         assert replacement is not installed
         assert replacement.local_endpoint_context() is captured
         assert replacement.call_execution_limits_overrides == {
-            'max_outstanding_calls': 7, 'payload_buffer_budget_bytes': 8192,
+            'max_outstanding_calls': 7, 'memory_budget_bytes': 8192,
         }
         assert len(replacement.adopted_observations) == 1
         assert isinstance(replacement.adopted_observations[0], _FakeRetiredObservation)
@@ -912,7 +308,7 @@ def test_proxy_policy_reads_env_file(tmp_path, monkeypatch):
 
 def test_proxy_policy_does_not_resolve_ipc_env(monkeypatch):
     monkeypatch.setenv('C2_RELAY_USE_PROXY', '1')
-    monkeypatch.setenv('C2_IPC_POOL_SEGMENT_SIZE', 'not-a-number')
+    monkeypatch.setenv('C2_MEMORY_BUDGET_BYTES', 'not-a-number')
 
     from c_two._native import resolve_relay_use_proxy
 
@@ -921,7 +317,7 @@ def test_proxy_policy_does_not_resolve_ipc_env(monkeypatch):
 
 def test_relay_settings_do_not_resolve_ipc_env(monkeypatch):
     monkeypatch.setenv('C2_RELAY_ANCHOR_ADDRESS', 'http://127.0.0.1:8080')
-    monkeypatch.setenv('C2_IPC_POOL_SEGMENT_SIZE', 'not-a-number')
+    monkeypatch.setenv('C2_MEMORY_BUDGET_BYTES', 'not-a-number')
 
     assert settings.relay_anchor_address == 'http://127.0.0.1:8080'
 
@@ -929,20 +325,6 @@ def test_relay_settings_do_not_resolve_ipc_env(monkeypatch):
 def test_relay_anchor_address_resolution_ignores_relay_proxy_policy(monkeypatch):
     monkeypatch.setenv('C2_RELAY_ANCHOR_ADDRESS', 'http://127.0.0.1:8080')
     monkeypatch.setenv('C2_RELAY_USE_PROXY', 'not-a-bool')
-
-    assert settings.relay_anchor_address == 'http://127.0.0.1:8080'
-
-
-def test_shm_threshold_resolution_does_not_parse_ipc_env(monkeypatch):
-    monkeypatch.setenv('C2_SHM_THRESHOLD', '8192')
-    monkeypatch.setenv('C2_IPC_POOL_SEGMENT_SIZE', 'not-a-number')
-
-    assert settings.shm_threshold == 8192
-
-
-def test_relay_anchor_env_replaces_old_relay_address_env(monkeypatch):
-    monkeypatch.setenv('C2_RELAY_ANCHOR_ADDRESS', 'http://127.0.0.1:8080')
-    monkeypatch.setenv('C2_RELAY_ADDRESS', 'http://old-relay.test:8080')
 
     assert settings.relay_anchor_address == 'http://127.0.0.1:8080'
 

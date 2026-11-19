@@ -31,7 +31,7 @@ const SIGNATURE_HASH: &str = "abcdef0123456789abcdef0123456789abcdef0123456789ab
 static ADDRESS_SEQ: AtomicU64 = AtomicU64::new(0);
 
 fn test_pool(peer: &Peer) -> ClientPool {
-    ClientPool::with_endpoint_context(Duration::from_secs(60), peer.context.clone())
+    ClientPool::with_endpoint_context(peer.context.clone())
 }
 
 fn expected() -> ExpectedRouteContract {
@@ -273,18 +273,18 @@ fn assert_deadline(error: IpcError, stage: &str) {
 
 #[test]
 fn zero_timeout_expires_before_endpoint_resolution_or_cache_mutation() {
-    let pool = ClientPool::new(Duration::from_secs(60));
+    let pool = ClientPool::new();
     // A malformed address would fail endpoint resolution if any OS acquisition
     // began. The immediate deadline must take precedence without freezing the
     // first-connect memory domain or adding a cache reference.
     let error = pool
-        .acquire_lease_with_deadline("not-an-ipc-address", None, deadline(Duration::ZERO))
+        .acquire_lease_with_deadline("not-an-ipc-address", deadline(Duration::ZERO))
         .err()
         .expect("zero timeout must expire immediately");
     assert_deadline(error, "pool_wait");
     assert_eq!(pool.active_count(), 0);
     assert_eq!(pool.refcount("not-an-ipc-address"), 0);
-    assert!(pool.memory_budget_observer().is_none());
+    assert_eq!(pool.domain_snapshot().memory.used_bytes, 0);
 }
 
 #[test]
@@ -307,7 +307,7 @@ fn first_handshake_timeout_cannot_publish_late_client_and_next_connect_recovers(
     let pool = test_pool(&peer);
     let started = Instant::now();
     let error = pool
-        .acquire_with_deadline(&peer.address, None, deadline(Duration::from_millis(100)))
+        .acquire_with_deadline(&peer.address, deadline(Duration::from_millis(100)))
         .err()
         .expect("nonresponding handshake must expire");
     assert_deadline(error, "handshake");
@@ -324,7 +324,7 @@ fn first_handshake_timeout_cannot_publish_late_client_and_next_connect_recovers(
         "late handshake must not enter cache"
     );
     let recovered = pool
-        .acquire_with_deadline(&peer.address, None, deadline(Duration::from_secs(2)))
+        .acquire_with_deadline(&peer.address, deadline(Duration::from_secs(2)))
         .unwrap();
     assert!(recovered.is_connected());
     assert_eq!(pool.refcount(&peer.address), 1);
@@ -335,7 +335,7 @@ fn first_handshake_timeout_cannot_publish_late_client_and_next_connect_recovers(
 }
 
 #[test]
-fn prewarmed_handshake_timeout_settles_budget_and_recovers_without_pool_drain() {
+fn handshake_timeout_keeps_budget_cold_and_recovers_without_pool_drain() {
     let (resume, resumed) = oneshot::channel();
     let (closed_tx, closed_rx) = mpsc::channel();
     let business = Arc::new(AtomicUsize::new(0));
@@ -371,41 +371,31 @@ fn prewarmed_handshake_timeout_settles_budget_and_recovers_without_pool_drain() 
         std::future::pending::<()>().await;
     });
     let pool = test_pool(&peer);
-    let mut cfg = c2_ipc::ClientIpcConfig::default();
-    cfg.base.pool_segment_size = 1024 * 1024;
-    cfg.base.max_pool_segments = 1;
-    cfg.base.pool_prewarm_segments = 1;
-    cfg.base.shm_backing_budget_bytes = 1_536_000;
     let started = Instant::now();
     let error = pool
-        .acquire_with_deadline(
-            &peer.address,
-            Some(&cfg),
-            deadline(Duration::from_millis(100)),
-        )
+        .acquire_with_deadline(&peer.address, deadline(Duration::from_millis(100)))
         .err()
-        .expect("paused prewarmed handshake must expire");
+        .expect("paused handshake must expire");
     assert_deadline(error, "handshake");
     assert!(started.elapsed() < Duration::from_millis(300));
     assert_eq!(pool.refcount(&peer.address), 0);
     assert!(!pool.has_client(&peer.address));
-    let observer = pool.memory_budget_observer().unwrap();
+    let observer = pool.domain_budget().observe();
     closed_rx.recv_timeout(Duration::from_secs(2)).unwrap();
     // One ordinary maintenance pass also prunes completed records. It must
     // release the real charge without close_all, budget reset, or new config.
     pool.sweep_expired();
     let settled = observer.snapshot();
-    assert_eq!(settled.shm.used_bytes, 0);
-    assert!(settled.shm.peak_bytes >= 1024 * 1024);
-    assert_eq!(settled.shm.limit_bytes, 1_536_000);
+    assert_eq!(settled.memory.used_bytes, 0);
+    assert_eq!(settled.memory.peak_bytes, 0);
+    assert_eq!(
+        settled.memory.limit_bytes,
+        c2_config::DEFAULT_MEMORY_BUDGET_BYTES
+    );
     assert_eq!(business.load(Ordering::SeqCst), 0);
     resume.send(()).unwrap();
     let lease = pool
-        .acquire_lease_with_deadline(
-            &peer.address,
-            Some(&cfg),
-            deadline(Duration::from_millis(100)),
-        )
+        .acquire_lease_with_deadline(&peer.address, deadline(Duration::from_millis(100)))
         .unwrap();
     let recovered = lease.client().clone();
     assert!(recovered.is_connected());
@@ -417,7 +407,7 @@ fn prewarmed_handshake_timeout_settles_budget_and_recovers_without_pool_drain() 
     assert_eq!(recovered.pending_len_for_test(), 0);
     drop(lease);
     assert_eq!(pool.refcount(&peer.address), 0);
-    assert_eq!(observer.snapshot().shm.rejected_allocations, 0);
+    assert_eq!(observer.snapshot().memory.rejected_allocations, 0);
     // Teardown happens only after recovery and all assertions above pass.
     peer.finish();
     let report = pool.close_all(Duration::from_secs(2));
@@ -425,7 +415,7 @@ fn prewarmed_handshake_timeout_settles_budget_and_recovers_without_pool_drain() 
         report.error.is_none() && report.unconfirmed.is_empty(),
         "{report:?}"
     );
-    assert_eq!(observer.snapshot().shm.used_bytes, 0);
+    assert_eq!(observer.snapshot().memory.used_bytes, 0);
     assert!(!recovered.is_connected());
 }
 
@@ -448,10 +438,10 @@ fn cached_client_route_timeout_keeps_pending_until_late_reply_and_preserves_heal
         std::future::pending::<()>().await;
     });
     let pool = test_pool(&peer);
-    let original = pool.acquire(&peer.address, None).unwrap();
+    let original = pool.acquire(&peer.address).unwrap();
     assert!(pool.release_if_same(&peer.address, &original));
     let cached = pool
-        .acquire_with_deadline(&peer.address, None, deadline(Duration::from_secs(2)))
+        .acquire_with_deadline(&peer.address, deadline(Duration::from_secs(2)))
         .unwrap();
     assert!(
         Arc::ptr_eq(&original, &cached),
@@ -474,7 +464,7 @@ fn cached_client_route_timeout_keeps_pending_until_late_reply_and_preserves_heal
     resume.send(()).unwrap();
     late_rx.recv_timeout(Duration::from_secs(2)).unwrap();
     let recovered = pool
-        .acquire_with_deadline(&peer.address, None, deadline(Duration::from_secs(2)))
+        .acquire_with_deadline(&peer.address, deadline(Duration::from_secs(2)))
         .unwrap();
     assert!(Arc::ptr_eq(&recovered, &original));
     let binding = recovered
@@ -508,9 +498,7 @@ fn handshake_and_route_lookup_consume_one_absolute_budget() {
     });
     let pool = test_pool(&peer);
     let budget = deadline(Duration::from_millis(350));
-    let client = pool
-        .acquire_with_deadline(&peer.address, None, budget)
-        .unwrap();
+    let client = pool.acquire_with_deadline(&peer.address, budget).unwrap();
     let started = Instant::now();
     let error = client
         .acquire_route_with_deadline(&expected(), budget)
@@ -559,7 +547,7 @@ fn transient_handshake_retry_keeps_original_budget() {
     let budget = deadline(Duration::from_millis(350));
     let started = Instant::now();
     let error = pool
-        .acquire_with_deadline(&peer.address, None, budget)
+        .acquire_with_deadline(&peer.address, budget)
         .err()
         .expect("retry shares the original deadline");
     assert_deadline(error, "handshake");
@@ -632,7 +620,7 @@ fn route_acquisition_respects_deadlines_and_last_lookup_result() {
             }
         });
         let pool = test_pool(&peer);
-        let client = pool.acquire(&peer.address, None).unwrap();
+        let client = pool.acquire(&peer.address).unwrap();
         let budget = deadline(Duration::from_millis(timeout_ms));
         let started = Instant::now();
         let result = client.acquire_route_with_deadline(&expected(), budget);

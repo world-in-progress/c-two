@@ -16,7 +16,6 @@ import pytest
 
 import c_two as cc
 import c_two.endpoint
-from c_two._native import resolve_server_ipc_config
 from c_two.crm.contract import crm_contract
 from tests.fixtures.persistent_lifecycle_support import Lifecycle
 from tests.fixtures.route_identity_host import Host
@@ -103,7 +102,7 @@ def mesh(monkeypatch, request, tmp_path):
             body = {"name": name, "server_id": host.identity["server_id"],
                     "server_instance_id": host.identity["server_instance_id"],
                     "address": host.identity["ipc_address"],
-                    "max_payload_size": int(resolve_server_ipc_config(None, None)["max_payload_size"]),
+                    "max_payload_size": 16 * 1024**3,
                     **{key: getattr(contract, key) for key in (
                         "crm_ns", "crm_name", "crm_ver", "abi_hash", "signature_hash",
                     )}}

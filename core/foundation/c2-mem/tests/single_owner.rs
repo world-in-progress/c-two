@@ -7,7 +7,6 @@ const SEGMENT_SIZE: usize = 32 * 1024;
 fn config() -> PoolConfig {
     PoolConfig {
         segment_size: SEGMENT_SIZE,
-        min_block_size: 4096,
         max_segments: 1,
         max_dedicated_segments: 1,
         buddy_idle_decay_secs: 0.0,

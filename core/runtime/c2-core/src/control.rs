@@ -1,5 +1,6 @@
 use c2_config::{
-    ConfigResolver, ConfigSources, LocalEndpoint, LocalEndpointContext, LocalEndpointOptions,
+    ConfigResolver, ConfigSources, EnvCatalog, LocalEndpoint, LocalEndpointContext,
+    LocalEndpointOptions,
 };
 use std::time::{Duration, Instant};
 
@@ -9,7 +10,8 @@ use crate::{DirectIpcShutdownOutcome, LifecycleError, Runtime};
 fn process_context() -> Result<LocalEndpointContext, LifecycleError> {
     ConfigResolver::resolve_local_endpoint(
         LocalEndpointOptions::default(),
-        ConfigSources::from_process(),
+        &EnvCatalog::load(ConfigSources::from_process())
+            .map_err(|error| LifecycleError::Configuration(error.to_string()))?,
     )
     .map_err(|error| LifecycleError::Configuration(error.to_string()))
 }

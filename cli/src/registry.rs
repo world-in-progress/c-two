@@ -1,5 +1,5 @@
 use anyhow::{Result, anyhow};
-use c2_config::{ConfigResolver, ConfigSources};
+use c2_config::{ConfigResolver, ConfigSources, EnvCatalog};
 use clap::{Args, Subcommand};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
@@ -169,7 +169,8 @@ fn get_json<T: DeserializeOwned>(relay: &str, path: &str) -> Result<T> {
 }
 
 fn resolve_relay_use_proxy(sources: ConfigSources) -> Result<bool> {
-    ConfigResolver::resolve_relay_use_proxy(sources).map_err(|e| anyhow!("{e}"))
+    let catalog = EnvCatalog::load(sources)?;
+    Ok(ConfigResolver::resolve_relay_client(None, &catalog)?.use_proxy)
 }
 
 fn list_routes(relay: &str) -> Result<()> {
@@ -237,10 +238,10 @@ mod tests {
         let use_proxy = resolve_relay_use_proxy(ConfigSources {
             env_file: c2_config::EnvFilePolicy::Disabled,
             process_env: [
-                ("C2_RELAY_USE_PROXY".to_string(), "1".to_string()),
+                ("C2_RELAY_USE_PROXY".to_string(), "1".into()),
                 (
-                    "C2_RELAY_IDLE_TIMEOUT".to_string(),
-                    "not-a-number".to_string(),
+                    "C2_MEMORY_BUDGET_BYTES".to_string(),
+                    "not-a-number".into(),
                 ),
             ]
             .into_iter()

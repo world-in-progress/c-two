@@ -89,7 +89,7 @@ class CoreError(CCBaseError, RuntimeError):
     local_protocol_version: int | None
     peer_protocol_version: int | None
     lifecycle_kind: Literal[
-        'invalid_server_id', 'config_frozen', 'client_config_frozen',
+        'invalid_server_id', 'config_frozen',
         'duplicate_route', 'missing_route', 'missing_relay_address',
         'register_failure',
         'held_response_release', 'response_copy',

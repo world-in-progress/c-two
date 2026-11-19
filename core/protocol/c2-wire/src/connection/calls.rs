@@ -102,18 +102,39 @@ impl<T> Default for CallTable<T> {
     }
 }
 impl<T> CallTable<T> {
-    /// The receive loop invokes this before route or storage admission.
-    pub fn open(&mut self, id: u64, data: T) -> Result<Arc<CallRecord<T>>, &'static str> {
+    /// Advance the request-ID high-water mark for a new OPEN without
+    /// creating an active record. A pre-admission refusal still advances the
+    /// mark so late continuations of the refused ID land on Retired and are
+    /// dropped cleanly.
+    pub fn advance_open(&mut self, id: u64) -> Result<(), &'static str> {
         if id == 0 || id <= self.high_open {
             return Err("OPEN request ID is not increasing");
         }
         self.high_open = id;
+        Ok(())
+    }
+
+    /// Insert the active record for an ID whose high-water mark was already
+    /// advanced (id == high_open, not already active).
+    pub fn insert_open(&mut self, id: u64, data: T) -> Result<Arc<CallRecord<T>>, &'static str> {
+        if id == 0 || id != self.high_open {
+            return Err("OPEN request ID is not increasing");
+        }
+        if self.active.contains_key(&id) {
+            return Err("OPEN request ID already active");
+        }
         let call = Arc::new(CallRecord {
             phase: AtomicU8::new(CallPhase::PreparingInput as u8),
             data,
         });
         self.active.insert(id, call.clone());
         Ok(call)
+    }
+
+    /// Combined advance and insert for callers that admit an OPEN in one step.
+    pub fn open(&mut self, id: u64, data: T) -> Result<Arc<CallRecord<T>>, &'static str> {
+        self.advance_open(id)?;
+        self.insert_open(id, data)
     }
     pub fn get(&self, id: u64) -> Option<Arc<CallRecord<T>>> {
         self.active.get(&id).cloned()
@@ -189,6 +210,45 @@ mod tests {
         assert!(next.enter_resource());
         assert_eq!(next.reject_before_execution(), None);
         assert_eq!(next.finish_execution(false), Some(CallStatus::Failed));
+    }
+    #[test]
+    fn advance_open_then_insert_open_publishes_the_same_record() {
+        let mut table = CallTable::default();
+        assert!(table.advance_open(5).is_ok());
+        let call = table.insert_open(5, ()).unwrap();
+        assert!(call.is_preparing_input());
+        assert!(table.advance_open(5).is_err());
+        assert!(table.advance_open(4).is_err());
+        assert!(table.advance_open(0).is_err());
+        assert!(matches!(table.continuation(5), CallLookup::Active(_)));
+        // A second insert for the advanced ID is refused.
+        assert!(table.insert_open(5, ()).is_err());
+        // An insert without a fresh advance is refused.
+        assert!(table.insert_open(6, ()).is_err());
+        let next = table.open(6, ()).unwrap();
+        assert!(next.queue());
+    }
+    #[test]
+    fn refused_advance_keeps_continuations_retired_and_blocks_foreign_inserts() {
+        let mut table = CallTable::default();
+        assert!(table.advance_open(5).is_ok());
+        // No active record exists, but continuations of the advanced ID are
+        // Retired, never Future.
+        assert!(matches!(table.continuation(5), CallLookup::Retired));
+        assert!(matches!(table.continuation(6), CallLookup::Future));
+        // Inserting a different ID without advancing it first is refused.
+        assert!(matches!(
+            table.insert_open(4, ()),
+            Err("OPEN request ID is not increasing")
+        ));
+        assert!(matches!(
+            table.insert_open(6, ()),
+            Err("OPEN request ID is not increasing")
+        ));
+        // The advanced ID itself can still publish its record.
+        assert!(table.insert_open(5, ()).is_ok());
+        // A late insert for an older ID stays refused.
+        assert!(table.insert_open(4, ()).is_err());
     }
     #[test]
     fn receive_positions_are_assigned_before_parallel_completion() {

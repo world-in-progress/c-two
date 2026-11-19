@@ -41,8 +41,6 @@ fn relay(context: c2_config::LocalEndpointContext) -> (RelayServer, String) {
     let relay = RelayServer::start_with_context(
         RelayConfig {
             bind: "127.0.0.1:0".into(),
-            idle_timeout_secs: 0,
-            anti_entropy_interval: Duration::ZERO,
             heartbeat_interval: Duration::ZERO,
             ..RelayConfig::default()
         },
@@ -100,7 +98,6 @@ fn host_shutdown_closes_route_acquisition_and_retains_typed_relay_local_cause() 
         c2_config::LocalEndpointContext::default_for_platform().expect("default endpoint context");
     let (mut relay, relay_url) = relay(endpoint_context);
     let owner = Runtime::new(RuntimeOptions {
-        server_id: Some(unique_name("route-shutdown-owner")),
         relay_anchor_address: Some(relay_url.clone()),
         use_process_relay_anchor: false,
         ..RuntimeOptions::default()
@@ -141,7 +138,6 @@ fn host_shutdown_closes_route_acquisition_and_retains_typed_relay_local_cause() 
         .expect("register route");
 
     let client_runtime = Runtime::new(RuntimeOptions {
-        server_id: Some(unique_name("route-shutdown-client")),
         relay_anchor_address: Some(relay_url),
         use_process_relay_anchor: false,
         ..RuntimeOptions::default()

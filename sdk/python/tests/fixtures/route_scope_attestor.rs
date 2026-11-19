@@ -1,7 +1,7 @@
 //! Test-only IPC attestation for compare-remove relay control cases.
 use std::path::Path;
 
-use c2_config::{ClientIpcConfig, LocalEndpointContext};
+use c2_config::LocalEndpointContext;
 use c2_ipc::IpcClient;
 
 #[tokio::main(flavor = "current_thread")]
@@ -15,11 +15,7 @@ async fn main() {
     } else {
         LocalEndpointContext::with_unix_root(Path::new(&root)).unwrap()
     };
-    let mut client = IpcClient::with_endpoint(
-        context.endpoint(&address).unwrap(),
-        ClientIpcConfig::default(),
-    )
-    .unwrap();
+    let mut client = IpcClient::with_endpoint(context.endpoint(&address).unwrap()).unwrap();
     client.connect().await.unwrap();
     let expected = client
         .route_contract(&route_name)

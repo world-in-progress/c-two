@@ -17,9 +17,6 @@ fn canonical_base_url(base_url: &str) -> String {
 struct PoolEntry {
     client: Arc<HttpClient>,
     references: Arc<PoolReferences>,
-    use_proxy: bool,
-    timeout_secs: f64,
-    remote_payload_chunk_size: u64,
 }
 
 /// A lease can release its exact entry without waiting for the pool map lock.
@@ -90,13 +87,11 @@ impl Drop for HttpPoolLease {
 
 /// Reference-counted pool of [`HttpClient`] instances.
 ///
-/// Clients connecting to the same relay URL share a single
-/// `HttpClient` (and its underlying connection pool).  When all
-/// references are released, the client is kept for a grace period
-/// before being destroyed.
+/// Clients connecting to the same relay URL and proxy policy share a single
+/// `HttpClient` (and its underlying connection pool).  When all references
+/// are released, the client is kept for the idle grace period before being
+/// destroyed.
 pub struct HttpClientPool {
-    // Controlled calls have a separate no-total-timeout view. Ordinary calls
-    // retain their configured policy, including when both views are live.
     entries: Mutex<HashMap<(String, bool), PoolEntry>>,
     grace_period: Duration,
     default_max_connections: usize,
@@ -113,11 +108,13 @@ const _: () = {
 };
 
 impl HttpClientPool {
-    /// Create a new pool with the given grace period.
-    pub fn new(grace_secs: f64) -> Self {
+    /// Create a new pool with the given idle grace period. Production pools
+    /// recycle idle HTTP connections on [`c2_config::IDLE_CONNECTION_TIMEOUT`];
+    /// tests may construct shorter periods.
+    fn new(grace: Duration) -> Self {
         Self {
             entries: Mutex::new(HashMap::new()),
-            grace_period: Duration::from_secs_f64(grace_secs),
+            grace_period: grace,
             default_max_connections: 100,
         }
     }
@@ -126,85 +123,36 @@ impl HttpClientPool {
         &self,
         base_url: &str,
         use_proxy: bool,
-        timeout_secs: f64,
-        remote_payload_chunk_size: u64,
-        controlled: bool,
         deadline: c2_config::ConnectDeadline,
     ) -> Result<HttpPoolLease, HttpError> {
-        self.acquire_view(
-            base_url,
-            use_proxy,
-            if controlled { 0.0 } else { timeout_secs },
-            remote_payload_chunk_size,
-            controlled,
-            deadline,
-        )
-        .map(|(client, references)| HttpPoolLease { client, references })
+        self.acquire_view(base_url, use_proxy, deadline)
+            .map(|(client, references)| HttpPoolLease { client, references })
     }
 
     fn acquire_view(
         &self,
         base_url: &str,
         use_proxy: bool,
-        timeout_secs: f64,
-        remote_payload_chunk_size: u64,
-        controlled: bool,
         deadline: c2_config::ConnectDeadline,
     ) -> Result<(Arc<HttpClient>, Arc<PoolReferences>), HttpError> {
         super::connect_deadline::check(deadline, "relay_pool_acquire")?;
-        crate::payload::validate_remote_payload_chunk_size(remote_payload_chunk_size)?;
-        let key = (canonical_base_url(base_url), controlled);
+        let key = (canonical_base_url(base_url), use_proxy);
 
         let mut entries =
             super::connect_deadline::lock(&self.entries, deadline, "relay_pool_acquire")?;
         entries.retain(|_, entry| !entry.references.expired(self.grace_period));
 
-        if let Some(entry) = entries.get_mut(&key) {
-            if entry.use_proxy == use_proxy
-                && entry.timeout_secs == timeout_secs
-                && entry.remote_payload_chunk_size == remote_payload_chunk_size
-            {
-                entry.references.acquire();
-                return Ok((Arc::clone(&entry.client), Arc::clone(&entry.references)));
-            }
-            if entry.references.count.load(Ordering::Acquire) > 0 && entry.use_proxy != use_proxy {
-                return Err(HttpError::Transport(format!(
-                    "active pooled HTTP client for {base_url} has proxy policy mismatch"
-                )));
-            }
-            if entry.references.count.load(Ordering::Acquire) > 0
-                && entry.timeout_secs != timeout_secs
-            {
-                return Err(HttpError::Transport(format!(
-                    "active pooled HTTP client for {base_url} has timeout policy mismatch"
-                )));
-            }
-            if entry.references.count.load(Ordering::Acquire) > 0
-                && entry.remote_payload_chunk_size != remote_payload_chunk_size
-            {
-                return Err(HttpError::Transport(format!(
-                    "active pooled HTTP client for {base_url} has remote payload chunk policy mismatch"
-                )));
-            }
+        if let Some(entry) = entries.get(&key) {
+            entry.references.acquire();
+            return Ok((Arc::clone(&entry.client), Arc::clone(&entry.references)));
         }
 
         // Create a new client (lock held — HttpClient::new is fast).
-        let client = Arc::new(if controlled {
-            HttpClient::new_controlled(
-                &key.0,
-                self.default_max_connections,
-                use_proxy,
-                remote_payload_chunk_size,
-            )?
-        } else {
-            HttpClient::new_with_transport_policy(
-                &key.0,
-                timeout_secs,
-                self.default_max_connections,
-                use_proxy,
-                remote_payload_chunk_size,
-            )?
-        });
+        let client = Arc::new(HttpClient::new(
+            &key.0,
+            self.default_max_connections,
+            use_proxy,
+        )?);
 
         super::connect_deadline::check(deadline, "relay_pool_acquire")?;
         let references = Arc::new(PoolReferences::new());
@@ -213,9 +161,6 @@ impl HttpClientPool {
             PoolEntry {
                 client: Arc::clone(&client),
                 references: Arc::clone(&references),
-                use_proxy,
-                timeout_secs,
-                remote_payload_chunk_size,
             },
         );
 
@@ -242,10 +187,13 @@ impl HttpClientPool {
 
     /// Reference count for a specific URL.
     pub fn refcount(&self, base_url: &str) -> usize {
-        self.entries
-            .lock()
-            .get(&(canonical_base_url(base_url), false))
-            .map_or(0, |e| e.references.count.load(Ordering::Acquire))
+        let entries = self.entries.lock();
+        let url = canonical_base_url(base_url);
+        [false, true]
+            .into_iter()
+            .filter_map(|use_proxy| entries.get(&(url.clone(), use_proxy)))
+            .map(|entry| entry.references.count.load(Ordering::Acquire))
+            .sum()
     }
 }
 
@@ -256,7 +204,7 @@ static GLOBAL_HTTP_POOL: OnceLock<HttpClientPool> = OnceLock::new();
 impl HttpClientPool {
     /// Return the process-level singleton.
     pub fn instance() -> &'static HttpClientPool {
-        GLOBAL_HTTP_POOL.get_or_init(|| HttpClientPool::new(60.0))
+        GLOBAL_HTTP_POOL.get_or_init(|| HttpClientPool::new(c2_config::IDLE_CONNECTION_TIMEOUT))
     }
 }
 
@@ -266,50 +214,18 @@ impl HttpClientPool {
 mod tests {
     use super::*;
 
-    fn lease(
-        pool: &HttpClientPool,
-        url: &str,
-        use_proxy: bool,
-        timeout_secs: f64,
-        remote_payload_chunk_size: u64,
-        controlled: bool,
-    ) -> HttpPoolLease {
-        pool.acquire_lease(
-            url,
-            use_proxy,
-            timeout_secs,
-            remote_payload_chunk_size,
-            controlled,
-            c2_config::ConnectDeadline::default(),
-        )
-        .unwrap()
+    fn lease(pool: &HttpClientPool, url: &str, use_proxy: bool) -> HttpPoolLease {
+        pool.acquire_lease(url, use_proxy, c2_config::ConnectDeadline::default())
+            .unwrap()
     }
 
     #[test]
     fn connect_lease_release_cannot_decrement_replacement_client() {
-        let pool = HttpClientPool::new(60.0);
+        let pool = HttpClientPool::new(Duration::from_secs(60));
         let url = "http://localhost:9986";
-        let old = pool
-            .acquire_lease(
-                url,
-                false,
-                300.0,
-                1024,
-                false,
-                c2_config::ConnectDeadline::default(),
-            )
-            .unwrap();
+        let old = lease(&pool, url, false);
         pool.shutdown_all();
-        let replacement = pool
-            .acquire_lease(
-                url,
-                false,
-                300.0,
-                1024,
-                false,
-                c2_config::ConnectDeadline::default(),
-            )
-            .unwrap();
+        let replacement = lease(&pool, url, false);
         assert!(!Arc::ptr_eq(&old.client, &replacement.client));
         drop(old);
         assert_eq!(pool.refcount(url), 1);
@@ -319,18 +235,9 @@ mod tests {
 
     #[test]
     fn connect_lease_release_does_not_wait_for_pool_lock() {
-        let pool = HttpClientPool::new(60.0);
+        let pool = HttpClientPool::new(Duration::from_secs(60));
         let url = "http://localhost:9987";
-        let lease = pool
-            .acquire_lease(
-                url,
-                false,
-                300.0,
-                1024,
-                false,
-                c2_config::ConnectDeadline::default(),
-            )
-            .unwrap();
+        let lease = lease(&pool, url, false);
         let held = pool.entries.lock();
         let (released_tx, released_rx) = std::sync::mpsc::channel();
         let releaser = std::thread::spawn(move || {
@@ -353,7 +260,7 @@ mod tests {
 
     #[test]
     fn connect_pool_wait_is_bounded_and_does_not_publish() {
-        let pool = Arc::new(HttpClientPool::new(60.0));
+        let pool = Arc::new(HttpClientPool::new(Duration::from_secs(60)));
         let held = pool.entries.lock();
         let waiter_pool = Arc::clone(&pool);
         let waiter = std::thread::spawn(move || {
@@ -363,7 +270,7 @@ mod tests {
             .unwrap();
             let start = Instant::now();
             let error = waiter_pool
-                .acquire_lease("http://localhost:9988", false, 300.0, 1024, false, deadline)
+                .acquire_lease("http://localhost:9988", false, deadline)
                 .err()
                 .expect("pool lock must expire");
             assert!(start.elapsed() < Duration::from_millis(500));
@@ -378,59 +285,15 @@ mod tests {
         waiter.join().unwrap();
         assert!(held.is_empty());
         drop(held);
-        let client = lease(&pool, "http://localhost:9988", false, 300.0, 1024, false);
+        let client = lease(&pool, "http://localhost:9988", false);
         assert_eq!(pool.refcount("http://localhost:9988"), 1);
         drop(client);
         assert_eq!(pool.refcount("http://localhost:9988"), 0);
     }
 
     #[test]
-    fn controlled_view_coexists_with_live_ordinary_timeout_policy() {
-        let pool = HttpClientPool::new(60.0);
-        let url = "http://localhost:9989";
-        let ordinary = lease(&pool, url, false, 300.0, 1024, false);
-        let controlled = lease(&pool, url, false, 300.0, 1024, true);
-        let controlled_again = lease(&pool, url, false, 300.0, 1024, true);
-        let ordinary_again = lease(&pool, url, false, 300.0, 1024, false);
-
-        assert!(!Arc::ptr_eq(&ordinary.client, &controlled.client));
-        assert!(Arc::ptr_eq(&controlled.client, &controlled_again.client));
-        assert!(Arc::ptr_eq(&ordinary.client, &ordinary_again.client));
-        assert_eq!(pool.refcount(url), 2);
-        assert_eq!(
-            pool.entries.lock()[&(url.to_string(), true)]
-                .references
-                .count
-                .load(Ordering::Acquire),
-            2
-        );
-
-        drop(controlled);
-        drop(controlled_again);
-        assert_eq!(
-            pool.refcount(url),
-            2,
-            "controlled release must not release ordinary leases"
-        );
-        assert_eq!(
-            pool.entries.lock()[&(url.to_string(), true)]
-                .references
-                .count
-                .load(Ordering::Acquire),
-            0
-        );
-        assert_eq!(
-            pool.entries.lock()[&(url.to_string(), false)].timeout_secs,
-            300.0
-        );
-        drop(ordinary);
-        drop(ordinary_again);
-        assert_eq!(pool.refcount(url), 0);
-    }
-
-    #[test]
     fn test_pool_new() {
-        let pool = HttpClientPool::new(30.0);
+        let pool = HttpClientPool::new(Duration::from_secs(30));
         assert_eq!(pool.active_count(), 0);
     }
 
@@ -442,11 +305,19 @@ mod tests {
     }
 
     #[test]
-    fn trailing_slash_variants_share_one_pool_entry() {
-        let pool = HttpClientPool::new(60.0);
+    fn singleton_recycles_idle_connections_on_the_shared_idle_timeout() {
+        assert_eq!(
+            HttpClientPool::instance().grace_period,
+            c2_config::IDLE_CONNECTION_TIMEOUT
+        );
+    }
 
-        let first = lease(&pool, "http://localhost:9998", false, 300.0, 1024, false);
-        let second = lease(&pool, "http://localhost:9998/", false, 300.0, 1024, false);
+    #[test]
+    fn trailing_slash_variants_share_one_pool_entry() {
+        let pool = HttpClientPool::new(Duration::from_secs(60));
+
+        let first = lease(&pool, "http://localhost:9998", false);
+        let second = lease(&pool, "http://localhost:9998/", false);
 
         assert!(Arc::ptr_eq(&first.client, &second.client));
         assert_eq!(pool.active_count(), 1);
@@ -460,123 +331,43 @@ mod tests {
     }
 
     #[test]
-    fn active_proxy_policy_mismatch_is_rejected_without_refcount_change() {
-        let pool = HttpClientPool::new(60.0);
+    fn proxy_policies_use_independent_pool_entries() {
+        let pool = HttpClientPool::new(Duration::from_secs(60));
         let url = "http://localhost:9995";
 
-        let _client = lease(&pool, url, false, 300.0, 1024, false);
-        let err = match pool.acquire_lease(
-            url,
-            true,
-            300.0,
-            1024,
-            false,
-            c2_config::ConnectDeadline::default(),
-        ) {
-            Ok(_) => panic!("active client with different proxy policy must be rejected"),
-            Err(err) => err,
-        };
-
-        assert!(
-            err.to_string().contains("proxy policy mismatch"),
-            "unexpected error: {err}"
-        );
+        let direct = lease(&pool, url, false);
+        let proxied = lease(&pool, url, true);
+        let same_policy = lease(&pool, url, true);
+        assert!(!Arc::ptr_eq(&direct.client, &proxied.client));
+        assert!(Arc::ptr_eq(&proxied.client, &same_policy.client));
+        assert_eq!(pool.active_count(), 2);
+        assert_eq!(pool.refcount(url), 3);
+        drop((proxied, same_policy));
         assert_eq!(pool.refcount(url), 1);
     }
 
     #[test]
-    fn released_proxy_policy_mismatch_replaces_idle_entry() {
-        let pool = HttpClientPool::new(60.0);
+    fn released_entry_is_reused_for_its_own_proxy_policy() {
+        let pool = HttpClientPool::new(Duration::from_secs(60));
         let url = "http://localhost:9994";
 
-        let first = lease(&pool, url, false, 300.0, 1024, false);
+        let first = lease(&pool, url, false);
         let first_client = Arc::clone(&first.client);
         drop(first);
 
-        let second = lease(&pool, url, true, 300.0, 1024, false);
-
-        assert!(
-            !Arc::ptr_eq(&first_client, &second.client),
-            "idle entry with stale proxy policy should be replaced"
-        );
-        assert_eq!(pool.refcount(url), 1);
-    }
-
-    #[test]
-    fn active_timeout_policy_mismatch_is_rejected_without_refcount_change() {
-        let pool = HttpClientPool::new(60.0);
-        let url = "http://localhost:9993";
-
-        let _client = lease(&pool, url, false, 300.0, 1_048_576, false);
-        let err = match pool.acquire_lease(
-            url,
-            false,
-            900.0,
-            1_048_576,
-            false,
-            c2_config::ConnectDeadline::default(),
-        ) {
-            Ok(_) => panic!("active client with different timeout policy must be rejected"),
-            Err(err) => err,
-        };
-
-        assert!(
-            err.to_string().contains("timeout policy mismatch"),
-            "unexpected error: {err}"
-        );
-        assert_eq!(pool.refcount(url), 1);
-    }
-
-    #[test]
-    fn active_remote_payload_chunk_policy_mismatch_is_rejected_without_refcount_change() {
-        let pool = HttpClientPool::new(60.0);
-        let url = "http://localhost:9994";
-
-        let _client = lease(&pool, url, false, 300.0, 1_048_576, false);
-        let err = match pool.acquire_lease(
-            url,
-            false,
-            300.0,
-            2_097_152,
-            false,
-            c2_config::ConnectDeadline::default(),
-        ) {
-            Ok(_) => panic!("active client with different remote chunk policy must be rejected"),
-            Err(err) => err,
-        };
-
-        assert!(
-            err.to_string()
-                .contains("remote payload chunk policy mismatch"),
-            "unexpected error: {err}"
-        );
-        assert_eq!(pool.refcount(url), 1);
-    }
-
-    #[test]
-    fn released_timeout_policy_mismatch_replaces_idle_entry() {
-        let pool = HttpClientPool::new(60.0);
-        let url = "http://localhost:9992";
-
-        let first = lease(&pool, url, false, 300.0, 1_048_576, false);
-        let first_client = Arc::clone(&first.client);
-        drop(first);
-
-        let second = lease(&pool, url, false, 900.0, 1_048_576, false);
-
-        assert!(
-            !Arc::ptr_eq(&first_client, &second.client),
-            "idle entry with stale timeout policy should be replaced"
-        );
-        assert_eq!(pool.refcount(url), 1);
+        let proxied = lease(&pool, url, true);
+        let direct = lease(&pool, url, false);
+        assert!(!Arc::ptr_eq(&first_client, &proxied.client));
+        assert!(Arc::ptr_eq(&first_client, &direct.client));
+        assert_eq!(pool.refcount(url), 2);
     }
 
     #[test]
     fn test_pool_sweep_expired() {
-        let pool = HttpClientPool::new(0.0); // zero grace
+        let pool = HttpClientPool::new(Duration::ZERO); // zero grace
 
         let url = "http://localhost:9998";
-        let client = lease(&pool, url, false, 300.0, 1024, false);
+        let client = lease(&pool, url, false);
         drop(client);
 
         // After release with zero grace, sweep should remove it.
@@ -587,9 +378,9 @@ mod tests {
 
     #[test]
     fn test_pool_shutdown_all() {
-        let pool = HttpClientPool::new(60.0);
-        let _c1 = lease(&pool, "http://localhost:9997", false, 300.0, 1024, false);
-        let _c2 = lease(&pool, "http://localhost:9996", false, 300.0, 1024, false);
+        let pool = HttpClientPool::new(Duration::from_secs(60));
+        let _c1 = lease(&pool, "http://localhost:9997", false);
+        let _c2 = lease(&pool, "http://localhost:9996", false);
         assert_eq!(pool.active_count(), 2);
 
         pool.shutdown_all();

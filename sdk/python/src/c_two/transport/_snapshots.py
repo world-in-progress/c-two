@@ -34,21 +34,22 @@ class ShutdownOutcome(TypedDict):
     completed: bool
 
 
-class CallExecutionCounters(TypedDict):
+class RoleCallExecutionStats(TypedDict):
     max_operations: int | None
-    used_operations: int
-    peak_operations: int
-    rejected_reservations: int
+    used_operations: int | None
+    peak_operations: int | None
+    rejected_reservations: int | None
     closed: bool
 
 
-class RetiredCallExecutionSnapshot(CallExecutionCounters):
-    initialized: bool
-    state: Literal['retired']
+class RetiredRoleCallExecutionStats(RoleCallExecutionStats):
+    role: Literal['client', 'server']
 
 
-class CallExecutionSnapshot(CallExecutionCounters):
-    retired: list[RetiredCallExecutionSnapshot]
+class CallExecutionSnapshot(TypedDict):
+    client: RoleCallExecutionStats
+    server: RoleCallExecutionStats
+    retired: list[RetiredRoleCallExecutionStats]
 
 
 class LifecycleSnapshot(TypedDict):

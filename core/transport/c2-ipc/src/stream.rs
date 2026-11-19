@@ -5,7 +5,7 @@
 //! the next demand. A second item can then be receiving or awaiting delivery.
 
 use super::*;
-use c2_mem::retention::PayloadBufferReservation;
+use c2_mem::{DomainBudget, MemoryReservation};
 use std::sync::Weak;
 use tokio::sync::{Notify, mpsc};
 
@@ -77,7 +77,7 @@ pub struct StreamTerminal {
 
 struct ItemBuffer {
     bytes: Vec<u8>,
-    reservation: PayloadBufferReservation,
+    reservation: MemoryReservation,
 }
 
 #[derive(Default)]
@@ -104,7 +104,7 @@ pub(crate) struct StreamReceive {
     // The caller's operation slot stays with the original receive record.
     // It is released before the terminal is made observable.
     completion_owner: StdMutex<Option<Box<dyn Send>>>,
-    budget: PayloadBufferBudget,
+    budget: DomainBudget,
     conn: Arc<ClientConnection>,
     output: mpsc::Sender<BudgetedBuffer>,
     changed: Notify,
@@ -329,7 +329,7 @@ impl StreamReceive {
 
     fn new(
         conn: Arc<ClientConnection>,
-        budget: PayloadBufferBudget,
+        budget: DomainBudget,
         max_item_bytes: u64,
         completion_owner: Box<dyn Send>,
         opening_cancellation: Option<IpcStreamCancellation>,
@@ -466,7 +466,10 @@ impl StreamReceive {
             return Ok(());
         }
         if total == 0 {
-            let reservation = self.budget.try_reserve(0).expect("zero-byte reservation");
+            let reservation = self
+                .budget
+                .try_reserve_memory(0)
+                .expect("zero-byte reservation");
             self.start_delivery(BudgetedBuffer::new(Vec::new(), reservation));
             return Ok(());
         }
@@ -485,7 +488,7 @@ impl StreamReceive {
                     return;
                 }
                 tokio::select! {
-                    reservation = call.budget.reserve(total) => break reservation,
+                    reservation = call.budget.reserve_memory(total) => break reservation,
                     _ = &mut changed => {}
                 }
             };
@@ -906,12 +909,18 @@ mod receive_boundary_tests {
             let producer_state = state.clone();
             let producer_terminal = terminal.clone();
             let producer_local_error = local_error.clone();
-            let budget = PayloadBufferBudget::new(3);
+            let budget = DomainBudget::from_limits(&c2_config::DomainLimits {
+                memory_budget_bytes: 3,
+                file_spill_budget_bytes: 0,
+                max_outstanding_calls: 0,
+            });
             let producer_budget = budget.clone();
             let producer = std::thread::spawn(move || {
                 delivery_allowed.recv().unwrap();
-                let item =
-                    BudgetedBuffer::new(b"abc".to_vec(), producer_budget.try_reserve(3).unwrap());
+                let item = BudgetedBuffer::new(
+                    b"abc".to_vec(),
+                    producer_budget.try_reserve_memory(3).unwrap(),
+                );
                 output.try_send(item).unwrap();
                 let mut state = producer_state.lock();
                 state.ended = producer_terminal.is_some() || producer_local_error.is_none();
@@ -934,7 +943,7 @@ mod receive_boundary_tests {
                 .expect("queued item");
             assert_eq!(item.as_ref(), b"abc");
             drop(item);
-            assert_eq!(budget.snapshot().used_bytes, 0);
+            assert_eq!(budget.snapshot().memory.used_bytes, 0);
 
             let terminal_result = receive_after_empty(&mut state.lock(), &mut input)
                 .expect("terminal follows the last item");
@@ -977,7 +986,7 @@ impl IpcClient {
         binding: &RouteBinding,
         method_name: &str,
         data: &[u8],
-        budget: PayloadBufferBudget,
+        budget: DomainBudget,
     ) -> Result<IpcResponseStream, crate::IpcCallError> {
         self.stream_bound_inner(binding, method_name, data, budget, Box::new(()), None, None)
             .await
@@ -990,7 +999,7 @@ impl IpcClient {
         binding: &RouteBinding,
         method_name: &str,
         data: B,
-        budget: PayloadBufferBudget,
+        budget: DomainBudget,
         completion_owner: Box<dyn Send>,
         cancellation: IpcStreamCancellation,
         control: &IpcCallControl,
@@ -1015,7 +1024,7 @@ impl IpcClient {
         binding: &RouteBinding,
         method_name: &str,
         data: B,
-        budget: PayloadBufferBudget,
+        budget: DomainBudget,
         completion_owner: Box<dyn Send>,
         cancellation: Option<IpcStreamCancellation>,
         control: Option<&IpcCallControl>,
@@ -1033,12 +1042,12 @@ impl IpcClient {
         }
         IpcCallControl::check_preparation(control).map_err(pre_dispatch_call_error)?;
         let (send, mut rx) = self
-            .begin_pending(PendingKind::Call(CallMode::ServerStream))
+            .begin_pending(PendingKind::Call(CallMode::ServerStream), limit)
             .map_err(pre_dispatch_call_error)?;
         let (call, stream) = StreamReceive::new(
             send.conn.clone(),
             budget,
-            limit.min(self.config.max_reassembly_bytes),
+            limit,
             completion_owner,
             cancellation,
         );
@@ -1053,11 +1062,8 @@ impl IpcClient {
             entry.stream = Some(call);
         }
         let result = async {
-            if choose_request_transport(
-                &self.config,
-                self.shm_request_available(),
-                data.as_ref().len(),
-            ) == RequestTransportKind::Buddy
+            if choose_request_transport(self.shm_request_available(), data.as_ref().len())
+                == RequestTransportKind::Buddy
             {
                 if let Some(block) = self.try_alloc_request_block(data.as_ref().len())? {
                     block.write_at(0, data.as_ref())?;
@@ -1089,7 +1095,7 @@ impl IpcClient {
                         .await;
                 }
             }
-            let size = self.config.chunk_size as usize;
+            let size = c2_config::CHUNK_SIZE as usize;
             if data.as_ref().len() > size {
                 for (part, bytes) in data.as_ref().chunks(size).enumerate() {
                     if *stop_upload.borrow() {

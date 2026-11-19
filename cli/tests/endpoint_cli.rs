@@ -173,7 +173,6 @@ impl TestNamespace {
 #[cfg(unix)]
 fn host_at(address: &str, root: &std::path::Path) -> c2_core::Host {
     let runtime = c2_core::Runtime::new(c2_core::RuntimeOptions {
-        server_id: Some(address.strip_prefix("ipc://").unwrap().to_owned()),
         use_process_relay_anchor: false,
         ..Default::default()
     })
@@ -184,7 +183,11 @@ fn host_at(address: &str, root: &std::path::Path) -> c2_core::Host {
         })
         .unwrap();
     runtime
-        .host(c2_core::HostOptions::default().without_relay())
+        .host(
+            c2_core::HostOptions::default()
+                .without_relay()
+                .with_server_id(address.strip_prefix("ipc://").unwrap()),
+        )
         .unwrap()
 }
 

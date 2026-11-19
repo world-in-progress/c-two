@@ -9,6 +9,7 @@ description = "C-Two HTTP transport layer (client + relay server)"
 
 [features]
 default = []
+test-support = []
 relay = [
     "dep:axum",
     "dep:http-body",

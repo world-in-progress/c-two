@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use c2_config::DomainLimits;
 use c2_contract::{ContractError, ContractLimitMetric};
 use c2_core::{
     AdapterFailure, AdapterFailurePhase, Error, ExternalCause, Runtime, RuntimeOptions,
@@ -9,6 +10,18 @@ use c2_core::{
 use c2_error::{C2Error, ErrorCode};
 use c2_http::client::HttpError;
 use c2_ipc::IpcError;
+use c2_mem::{BudgetedBuffer, DomainBudget};
+
+fn budgeted_body(bytes: Vec<u8>) -> (DomainBudget, BudgetedBuffer) {
+    let size = bytes.capacity() as u64;
+    let budget = DomainBudget::from_limits(&DomainLimits {
+        memory_budget_bytes: size,
+        file_spill_budget_bytes: 0,
+        max_outstanding_calls: 1,
+    });
+    let reservation = budget.try_reserve_memory(size).unwrap();
+    (budget, BudgetedBuffer::new(bytes, reservation))
+}
 
 #[test]
 fn public_core_types_compile_from_the_new_import() {
@@ -111,8 +124,6 @@ fn relay_rejection_projects_pre_dispatch_for_any_canonical_code() {
 
 #[test]
 fn resource_failure_phase_is_hop_local_for_ipc_and_http_binary_and_json() {
-    use c2_mem::retention::{BudgetedBuffer, PayloadBufferBudget};
-
     let nested = C2Error::new(ErrorCode::ResourceRemoved, "B refused the call").with_details(
         BTreeMap::from([
             ("route".into(), "B".into()),
@@ -122,18 +133,9 @@ fn resource_failure_phase_is_hop_local_for_ipc_and_http_binary_and_json() {
         ]),
     );
     let wire = nested.to_wire_bytes();
-    let budget = PayloadBufferBudget::new(wire.capacity() as u64);
-    let reservation = budget
-        .reserve_blocking(wire.capacity() as u64, None)
-        .unwrap();
-    let http_binary = BudgetedBuffer::new(wire.clone(), reservation);
+    let (budget, http_binary) = budgeted_body(wire.clone());
     let body = serde_json::to_string(&nested.envelope()).unwrap();
-    let json_bytes = body.clone().into_bytes();
-    let json_budget = PayloadBufferBudget::new(json_bytes.capacity() as u64);
-    let reservation = json_budget
-        .reserve_blocking(json_bytes.capacity() as u64, None)
-        .unwrap();
-    let http_json = BudgetedBuffer::new(json_bytes, reservation);
+    let (json_budget, http_json) = budgeted_body(body.clone().into_bytes());
 
     for actual in [
         normalize_ipc_error(IpcError::CrmError(wire), TransportPhase::DispatchUncertain),
@@ -160,8 +162,8 @@ fn resource_failure_phase_is_hop_local_for_ipc_and_http_binary_and_json() {
         assert!(!actual.details.contains_key("dispatch_phase"));
         assert!(!actual.details.contains_key("transport_phase"));
     }
-    assert_eq!(budget.snapshot().used_bytes, 0);
-    assert_eq!(json_budget.snapshot().used_bytes, 0);
+    assert_eq!(budget.snapshot().memory.used_bytes, 0);
+    assert_eq!(json_budget.snapshot().memory.used_bytes, 0);
 }
 
 #[test]
@@ -345,9 +347,7 @@ fn relay_payload_capacity_refusal_projects_pre_dispatch_without_retrying() {
 
 #[test]
 fn non_utf8_http_error_refunds_its_received_buffer_after_canonical_refusal() {
-    use c2_mem::retention::{BudgetedBuffer, PayloadBufferBudget};
-    let budget = PayloadBufferBudget::new(1);
-    let body = BudgetedBuffer::new(vec![0xff], budget.reserve_blocking(1, None).unwrap());
+    let (budget, body) = budgeted_body(vec![0xff]);
     let Error::Semantic(error) = normalize_http_error(
         HttpError::ResponseError(502, body),
         TransportPhase::DispatchUncertain,
@@ -355,7 +355,7 @@ fn non_utf8_http_error_refunds_its_received_buffer_after_canonical_refusal() {
         panic!("canonical malformed-envelope error required")
     };
     assert_eq!(error.code, ErrorCode::ProtocolViolation);
-    assert_eq!(budget.snapshot().used_bytes, 0);
+    assert_eq!(budget.snapshot().memory.used_bytes, 0);
 }
 
 #[test]

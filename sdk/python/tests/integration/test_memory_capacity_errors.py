@@ -30,18 +30,12 @@ class ProducerResource:
         return self.executions
 
 
-@pytest.mark.parametrize('failure', ['reassembly', 'backing'])
-def test_chunked_response_capacity_is_canonical_and_resource_executes_once(failure: str) -> None:
-    cc.shutdown()
-    cc.set_server(ipc_overrides={
-        'pool_enabled': False, 'shm_backing_budget_bytes': 0, 'chunk_size': 65536,
-    })
-    cc.set_client(ipc_overrides={
-        'pool_enabled': False, 'shm_backing_budget_bytes': 0, 'chunk_size': 65536,
-        'file_backing_budget_bytes': 1024 * 1024 if failure == 'reassembly' else 0,
-        'live_reassembly_budget_bytes': 0 if failure == 'reassembly' else 1024 * 1024,
-    })
-    cc.set_transport_policy(shm_threshold=4096)
+def test_chunked_response_capacity_is_canonical_and_resource_executes_once() -> None:
+    from c_two.transport.registry import _reset_default_runtime
+
+    _reset_default_runtime()
+    cc.set_server(memory_budget_bytes=64 * 1024)
+    cc.set_client(memory_budget_bytes=128 * 1024, file_spill_budget_bytes=0)
     resource = ProducerResource()
     proxy = None
     try:
@@ -64,18 +58,12 @@ def test_chunked_response_capacity_is_canonical_and_resource_executes_once(failu
         # Both control traffic and an unrelated small CRM reply remain usable.
         assert ping(address, timeout=0.5)
         assert proxy.calls() == 1
-        cells = cc.observe.memory_stats()['runtime_outgoing']['cells']
-        assert cells['reassembly']['used_bytes'] == 0
-        assert cells['file']['used_bytes'] == 0
-        assert cells['shm']['used_bytes'] == 0
-        assert cc.observe.memory_stats()["holds"]['active_holds'] == 0
-        if failure == 'reassembly':
-            assert cells['reassembly']['rejected_allocations'] >= 1
-        else:
-            # Reservation succeeded, then storage allocation failed: the
-            # admission guard must refund that already acquired charge.
-            assert cells['reassembly']['peak_bytes'] > 0
+        stats = cc.observe.memory_stats()
+        assert stats['client']['memory']['used_bytes'] == 0
+        assert stats['client']['memory']['rejected_allocations'] >= 1
+        assert stats['client']['file_spill']['used_bytes'] == 0
+        assert stats['holds']['active_holds'] == 0
     finally:
         if proxy is not None:
             cc.close(proxy)
-        cc.shutdown()
+        _reset_default_runtime()

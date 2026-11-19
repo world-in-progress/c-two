@@ -11,9 +11,10 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use axum::serve::Listener;
-use c2_config::{CallExecutionLimits, ClientIpcConfig, LocalEndpointContext, RelayConfig};
+use c2_config::{DomainLimits, LocalEndpointContext, RelayConfig};
 use c2_contract::ValidatedContractDescriptor;
 use c2_ipc::IpcClient;
+use c2_mem::DomainBudget;
 use c2_server::{
     ConcurrencyMode, CrmCallback, CrmError, CrmStream, CrmStreamCallback, CrmStreamItem,
     ResponseMeta, ResponsePool, RouteBuildSpec, SchedulerLimits, Server, ServerIdentity,
@@ -489,11 +490,11 @@ async fn forward_frames_real_peer_resets_while_read_is_pending() {
 }
 
 impl Fixture {
-    async fn start(shm: bool, budget_bytes: u64) -> Self {
-        Self::start_with_frame_tap(shm, budget_bytes, None).await
+    async fn start(budget_bytes: u64) -> Self {
+        Self::start_with_frame_tap(budget_bytes, None).await
     }
 
-    async fn start_with_frame_tap(shm: bool, budget_bytes: u64, frames: Option<RpcFrames>) -> Self {
+    async fn start_with_frame_tap(budget_bytes: u64, frames: Option<RpcFrames>) -> Self {
         let ordinal = NEXT.fetch_add(1, Ordering::SeqCst);
         let id = format!("b8-{}-{ordinal}", std::process::id());
         let address = format!("ipc://{id}");
@@ -505,11 +506,6 @@ impl Fixture {
         let context = LocalEndpointContext::default_for_platform().unwrap();
         let descriptor = ValidatedContractDescriptor::from_json(DESCRIPTOR).unwrap();
         let mut server_config = ServerIpcConfig::default();
-        server_config.base.pool_enabled = false;
-        server_config.base.pool_prewarm_segments = 0;
-        server_config.base.chunk_size = 4096;
-        server_config.base.shm_backing_budget_bytes = if shm { 16 * 1024 * 1024 } else { 0 };
-        server_config.shm_threshold = if shm { 1 } else { 1 << 30 };
         server_config.max_execution_workers = 4;
         let endpoint = context.endpoint(&address).unwrap();
         let server = Arc::new(
@@ -585,29 +581,24 @@ impl Fixture {
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let socket = listener.local_addr().unwrap();
-        let mut client_config = ClientIpcConfig::default();
-        client_config.base.pool_enabled = false;
-        client_config.base.pool_prewarm_segments = 0;
-        client_config.base.chunk_size = 4096;
-        client_config.base.shm_backing_budget_bytes = if shm { 16 * 1024 * 1024 } else { 0 };
-        client_config.shm_threshold = if shm { 1 } else { 1 << 30 };
-        let state = Arc::new(RelayState::new_with_execution_limits(
+        let state = Arc::new(RelayState::new_with_budget(
             Arc::new(RelayConfig {
                 relay_id: format!("relay-{id}"),
                 advertise_url: format!("http://{socket}"),
-                idle_timeout_secs: 0,
-                upstream_ipc: client_config,
-                remote_payload_chunk_size: 4096,
                 ..RelayConfig::default()
             }),
             Arc::new(NoopDisseminator),
             context,
-            CallExecutionLimits {
+            DomainBudget::from_limits(&DomainLimits {
+                memory_budget_bytes: budget_bytes,
+                file_spill_budget_bytes: 0,
                 max_outstanding_calls: 4,
-                payload_buffer_budget_bytes: budget_bytes,
-            },
+            }),
+            // The old fixture disabled the owner lease (idle_timeout_secs: 0);
+            // a saturating duration leaves the lease deadline unset the same way.
+            Duration::MAX,
         ));
-        let mut attestor = IpcClient::with_endpoint(endpoint, ClientIpcConfig::default()).unwrap();
+        let mut attestor = IpcClient::with_endpoint(endpoint).unwrap();
         bounded(attestor.connect()).await.unwrap();
         let expected = c2_contract::ExpectedRouteContract {
             route_name: "portable".into(),
@@ -721,7 +712,13 @@ impl Fixture {
             .unwrap();
         bounded(self.server_task).await.unwrap().unwrap();
         assert_eq!(
-            self.state.forwarding.payload_budget().snapshot().used_bytes,
+            self.state
+                .forwarding
+                .budget()
+                .clone()
+                .snapshot()
+                .memory
+                .used_bytes,
             0
         );
     }
@@ -759,8 +756,8 @@ fn parse_records(body: &[u8], expected_count: usize, item_size: usize) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn item_write_range_failure_keeps_real_terminal_and_http_ends_normally() {
-    for shm in [false, true] {
-        let fixture = Fixture::start(shm, 64 * 1024).await;
+    {
+        let fixture = Fixture::start(64 * 1024).await;
         fixture
             .observed
             .fail_second_item
@@ -815,7 +812,7 @@ async fn item_write_range_failure_keeps_real_terminal_and_http_ends_normally() {
             .to_str()
             .unwrap()
             .to_owned();
-        let budget = c2_mem::retention::PayloadBufferBudget::new(16 * 1024);
+        let budget = crate::payload::memory_only_budget(16 * 1024);
         let mut receiver = crate::client::HttpResponseStream::start(
             response,
             reqwest::Client::builder().no_proxy().build().unwrap(),
@@ -836,10 +833,10 @@ async fn item_write_range_failure_keeps_real_terminal_and_http_ends_normally() {
         assert!(error.message.contains("relay range write failed"));
         let terminal = bounded(receiver.completion()).await.unwrap();
         assert_eq!(terminal.complete_items, Some(1));
-        assert_eq!(budget.snapshot().used_bytes, 8192);
+        assert_eq!(budget.snapshot().memory.used_bytes, 8192);
         assert_eq!(held.as_ref(), &[0; 8192]);
         drop(held);
-        assert_eq!(budget.snapshot().used_bytes, 0);
+        assert_eq!(budget.snapshot().memory.used_bytes, 0);
         assert_eq!(fixture.observed.finished.load(Ordering::SeqCst), 2);
         drop(receiver);
         fixture.stop().await;
@@ -849,7 +846,7 @@ async fn item_write_range_failure_keeps_real_terminal_and_http_ends_normally() {
 // ADR 0004 removes route UID from relay calls and probes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn retired_header_is_ignored_for_unary_and_stream_calls() {
-    let fixture = Fixture::start(false, 256 * 1024).await;
+    let fixture = Fixture::start(256 * 1024).await;
     let retired_header = "x-c2-route-uid";
     for headers in [
         vec![],
@@ -878,8 +875,8 @@ async fn retired_header_is_ignored_for_unary_and_stream_calls() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn one_hop_real_http_stream_inline_and_whole_shm() {
-    for shm in [false, true] {
-        let fixture = Fixture::start(shm, 256 * 1024).await;
+    {
+        let fixture = Fixture::start(256 * 1024).await;
         for (count, size) in [(0, 0), (1, 0), (3, 64), (2, 128 * 1024)] {
             let response = bounded(fixture.request(count, size).send()).await.unwrap();
             assert_eq!(response.status(), 200);
@@ -890,20 +887,12 @@ async fn one_hop_real_http_stream_inline_and_whole_shm() {
         }
         assert_eq!(fixture.observed.opened.load(Ordering::SeqCst), 4);
         assert_eq!(fixture.observed.finished.load(Ordering::SeqCst), 4);
-        let peak_shm = fixture
-            .server
-            .memory_budget_snapshot()
-            .budget
-            .shm
-            .peak_bytes;
-        if shm {
-            assert!(
-                peak_shm >= 128 * 1024,
-                "large item must use actual SHM backing"
-            );
-        } else {
-            assert_eq!(peak_shm, 0, "inline case must not allocate SHM backing");
-        }
+        // The fixed server projection sends a 128-KiB item through actual SHM
+        // backing while small items stay inline in the same exchange.
+        assert!(
+            fixture.server.domain_snapshot().memory.peak_bytes >= 128 * 1024,
+            "large item must use actual SHM backing"
+        );
         fixture.stop().await;
     }
 }
@@ -987,13 +976,12 @@ impl Consumer {
 }
 
 async fn slow_reader_case(
-    shm: bool,
     repetition: usize,
     count: u32,
     size: u32,
     pause_limit: Duration,
 ) -> serde_json::Value {
-    let mut fixture = Fixture::start(shm, 256 * 1024).await;
+    let mut fixture = Fixture::start(256 * 1024).await;
     let response = bounded(fixture.request(count, size).send()).await.unwrap();
     assert_eq!(response.status(), 200);
     assert_eq!(response.headers()["content-type"], stream_wire::MEDIA_TYPE);
@@ -1047,15 +1035,15 @@ async fn slow_reader_case(
     assert!(consumer.buffer.is_empty());
     assert_eq!(fixture.observed.finished.load(Ordering::SeqCst), 1);
     let record = serde_json::json!({
-        "carrier": if shm { "whole_shm" } else { "inline" },
+        "carrier": "fixed_domain_projection",
         "repetition": repetition,
         "item_bytes": size, "items": count,
         "pause_safety_cap_seconds": pause_limit.as_secs(),
         "relay_budget_bytes": fixture.budget_bytes,
-        "relay_copy_window_bytes": 4096,
-        "server_ipc_chunk_bytes": 4096,
-        "upstream_ipc_chunk_bytes": 4096,
-        "remote_payload_chunk_bytes": 4096,
+        "relay_copy_window_bytes": c2_config::REMOTE_PAYLOAD_CHUNK_SIZE.min(c2_config::CHUNK_SIZE),
+        "server_ipc_chunk_bytes": c2_config::CHUNK_SIZE,
+        "upstream_ipc_chunk_bytes": c2_config::CHUNK_SIZE,
+        "remote_payload_chunk_bytes": c2_config::REMOTE_PAYLOAD_CHUNK_SIZE,
         "tcp_write_pending_observed": stalled,
         "source_naturally_exhausted_while_reader_paused": natural,
         "P_at_pause_boundary": at_pause,
@@ -1064,7 +1052,7 @@ async fn slow_reader_case(
         "max_read_sample_P_minus_C": consumer.max_ahead,
         "backpressure_peak_P_minus_C": (!natural && stalled).then(|| fixture.observed.peak_ahead.load(Ordering::SeqCst)),
         "natural_exhaustion_P_minus_C": natural.then_some(at_pause),
-        "server_shm_peak_bytes": fixture.server.memory_budget_snapshot().budget.shm.peak_bytes,
+        "server_memory_peak_bytes": fixture.server.domain_snapshot().memory.peak_bytes,
         "final_P": fixture.observed.produced.load(Ordering::SeqCst),
         "final_C": consumer.complete,
     });
@@ -1078,8 +1066,8 @@ async fn slow_reader_large_items_stall_tcp_and_bound_producer_distance() {
     // A strict distance below the finite source length rules out exhausting
     // the source into HTTP buffers and mistaking that for backpressure.
     const COUNT: u32 = 64;
-    for shm in [false, true] {
-        let record = slow_reader_case(shm, 0, COUNT, 128 * 1024, WAIT).await;
+    {
+        let record = slow_reader_case(0, COUNT, 128 * 1024, WAIT).await;
         assert!(record["tcp_write_pending_observed"].as_bool().unwrap());
         let ahead = record["max_event_P_minus_C"].as_u64().unwrap();
         assert!(
@@ -1107,13 +1095,9 @@ async fn slow_reader_large_items_stall_tcp_and_bound_producer_distance() {
 #[ignore = "on-demand slow-reader measurement; run command is in the adjacent test comments"]
 async fn slow_reader_records_real_tcp_stall_and_producer_distance() {
     let mut records = Vec::new();
-    for shm in [false, true] {
-        for repetition in 0..2 {
-            for (count, size) in [(200_000_u32, 0_u32), (100_000, 64), (512, 128 * 1024)] {
-                records.push(
-                    slow_reader_case(shm, repetition, count, size, Duration::from_secs(120)).await,
-                );
-            }
+    for repetition in 0..2 {
+        for (count, size) in [(200_000_u32, 0_u32), (100_000, 64), (512, 128 * 1024)] {
+            records.push(slow_reader_case(repetition, count, size, Duration::from_secs(120)).await);
         }
     }
     let output = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -1131,6 +1115,17 @@ async fn slow_reader_records_real_tcp_stall_and_producer_distance() {
     })).unwrap()).unwrap();
 }
 
+// The forwarding admission plan splits B into input + upload + download; the
+// download window takes the remainder up to the fixed copy cap and stays
+// charged while any of its response Bytes survive.
+fn download_window(budget_bytes: u64, input_len: u64) -> u64 {
+    let upload = input_len
+        .min((budget_bytes - input_len) / 2)
+        .max(u64::from(input_len != 0));
+    (budget_bytes - input_len - upload)
+        .min(c2_config::REMOTE_PAYLOAD_CHUNK_SIZE.min(c2_config::CHUNK_SIZE))
+}
+
 async fn wait_for_admission(state: &RelayState) {
     bounded(async {
         loop {
@@ -1145,14 +1140,14 @@ async fn wait_for_admission(state: &RelayState) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn budget_wait_precedes_upstream_lease_then_reconnects_after_idle_evict() {
-    let fixture = Fixture::start(false, 32 * 1024).await;
+    let fixture = Fixture::start(32 * 1024).await;
     let (lease, _, _) = bounded(fixture.state.acquire_upstream_for_route(&fixture.entry))
         .await
         .unwrap_or_else(|_| panic!("live pooled upstream acquire failed"));
     let old_client = lease.client();
     drop(lease);
-    let budget = fixture.state.forwarding.payload_budget();
-    let held = budget.try_reserve(fixture.budget_bytes).unwrap();
+    let budget = fixture.state.forwarding.budget().clone();
+    let held = budget.try_reserve_memory(fixture.budget_bytes).unwrap();
     let request = fixture.request(1, 64);
     let pending = tokio::spawn(async move { request.send().await.unwrap() });
     wait_for_admission(&fixture.state).await;
@@ -1185,9 +1180,9 @@ async fn budget_wait_precedes_upstream_lease_then_reconnects_after_idle_evict() 
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn budget_wait_rechecks_route_before_any_dispatch() {
-    let fixture = Fixture::start(false, 32 * 1024).await;
-    let budget = fixture.state.forwarding.payload_budget();
-    let held = budget.try_reserve(fixture.budget_bytes).unwrap();
+    let fixture = Fixture::start(32 * 1024).await;
+    let budget = fixture.state.forwarding.budget().clone();
+    let held = budget.try_reserve_memory(fixture.budget_bytes).unwrap();
     let request = fixture.request(1, 64);
     let pending = tokio::spawn(async move { request.send().await.unwrap() });
     wait_for_admission(&fixture.state).await;
@@ -1211,13 +1206,13 @@ async fn budget_wait_rechecks_route_before_any_dispatch() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn dropping_body_while_next_pull_waits_for_b_cancels_and_preserves_shared_unary() {
+async fn stream_recycles_its_window_at_full_memory_and_body_drop_preserves_shared_unary() {
     use axum::body::{Body, HttpBody};
     use axum::http::Request;
     use tower::ServiceExt;
 
-    for shm in [false, true] {
-        let fixture = Fixture::start(shm, 32 * 1024).await;
+    {
+        let fixture = Fixture::start(32 * 1024).await;
         let input = [1_u32.to_le_bytes(), (128 * 1024_u32).to_le_bytes()].concat();
         let request = Request::builder()
             .method("POST")
@@ -1262,10 +1257,13 @@ async fn dropping_body_while_next_pull_waits_for_b_cancels_and_preserves_shared_
         .unwrap()
         .into_data()
         .unwrap();
+        // The first data frame carries a whole download window of the item.
+        let width = download_window(fixture.budget_bytes, 8);
         assert_eq!(
             stream_wire::decode_header(data_header.as_ref().try_into().unwrap()).unwrap(),
-            (HttpStreamRecordKind::ItemData, 4096)
+            (HttpStreamRecordKind::ItemData, width)
         );
+        drop((header, data_header));
         let first = bounded(std::future::poll_fn(|cx| {
             Pin::new(&mut body).poll_frame(cx)
         }))
@@ -1274,19 +1272,51 @@ async fn dropping_body_while_next_pull_waits_for_b_cancels_and_preserves_shared_
         .unwrap()
         .into_data()
         .unwrap();
-        assert_eq!(first.len(), 4096);
+        assert_eq!(first.len(), width as usize);
         assert_eq!(fixture.observed.finished.load(Ordering::SeqCst), 0);
-        let budget = fixture.state.forwarding.payload_budget();
-        let used = budget.snapshot().used_bytes;
-        let held = budget.try_reserve(fixture.budget_bytes - used).unwrap();
+        let budget = fixture.state.forwarding.budget().clone();
+        let used = budget.snapshot().memory.used_bytes;
+        let held = budget
+            .try_reserve_memory(fixture.budget_bytes - used)
+            .unwrap();
+        assert_eq!(budget.snapshot().memory.used_bytes, fixture.budget_bytes);
         {
             let waiting = std::future::poll_fn(|cx| Pin::new(&mut body).poll_frame(cx));
             tokio::pin!(waiting);
             assert!(
                 matches!(futures::poll!(&mut waiting), Poll::Pending),
-                "the next Body poll must wait for B before another IPC read"
+                "the next Body poll must wait while the first frame owns the window"
             );
         }
+        drop(first);
+        let second_header = bounded(std::future::poll_fn(|cx| {
+            Pin::new(&mut body).poll_frame(cx)
+        }))
+        .await
+        .unwrap()
+        .unwrap()
+        .into_data()
+        .unwrap();
+        assert_eq!(
+            stream_wire::decode_header(second_header.as_ref().try_into().unwrap()).unwrap(),
+            (HttpStreamRecordKind::ItemData, width)
+        );
+        drop(second_header);
+        let second = bounded(std::future::poll_fn(|cx| {
+            Pin::new(&mut body).poll_frame(cx)
+        }))
+        .await
+        .unwrap()
+        .unwrap()
+        .into_data()
+        .unwrap();
+        assert_eq!(second.len(), width as usize);
+        assert_eq!(budget.snapshot().memory.used_bytes, fixture.budget_bytes);
+        let mut waiting = Box::pin(std::future::poll_fn(|cx| {
+            Pin::new(&mut body).poll_frame(cx)
+        }));
+        assert!(futures::poll!(&mut waiting).is_pending());
+        drop(waiting);
         drop(body); // The driver must see abandonment while its IPC pull is pending.
         let (lease, binding, _) = bounded(fixture.state.acquire_upstream_for_route(&fixture.entry))
             .await
@@ -1297,10 +1327,10 @@ async fn dropping_body_while_next_pull_waits_for_b_cancels_and_preserves_shared_
         assert_eq!(unary.into_owned_bytes().unwrap(), b"pong");
         drop(lease);
         drop(held);
-        drop(first);
+        drop(second);
         bounded(async {
             while fixture.observed.finished.load(Ordering::SeqCst) != 1
-                || fixture.state.upstream_memory_snapshot().shm.used_bytes != 0
+                || fixture.state.domain_snapshot().memory.used_bytes != 0
             {
                 tokio::task::yield_now().await;
             }
@@ -1316,9 +1346,9 @@ async fn abandoned_budget_wait_stops_before_ipc_dispatch() {
     use axum::http::Request;
     use tower::ServiceExt;
 
-    let fixture = Fixture::start(false, 32 * 1024).await;
-    let budget = fixture.state.forwarding.payload_budget();
-    let held = budget.try_reserve(fixture.budget_bytes).unwrap();
+    let fixture = Fixture::start(32 * 1024).await;
+    let budget = fixture.state.forwarding.budget().clone();
+    let held = budget.try_reserve_memory(fixture.budget_bytes).unwrap();
     let input = [1_u32.to_le_bytes(), 64_u32.to_le_bytes()].concat();
     let request = Request::builder()
         .method("POST")
@@ -1359,7 +1389,10 @@ async fn cancelled_stream_terminal_is_delivered_while_another_http_response_fill
     use c2_error::ErrorCode;
     use tower::ServiceExt;
 
-    let fixture = Fixture::start(false, 32 * 1024).await;
+    // Both forwarded calls must fit concurrently: each keeps its download
+    // window charged while its response Bytes survive, and each window
+    // saturates at the fixed copy cap.
+    let fixture = Fixture::start(2 * 128 * 1024 + 64).await;
     let stream_request = Request::builder()
         .method("POST")
         .uri("/portable/echo")
@@ -1410,6 +1443,7 @@ async fn cancelled_stream_terminal_is_delivered_while_another_http_response_fill
         stream_wire::decode_header(data_header.as_ref().try_into().unwrap()).unwrap(),
         (HttpStreamRecordKind::ItemData, 64)
     );
+    drop(data_header);
     let item = bounded(std::future::poll_fn(|cx| {
         Pin::new(&mut stream_body).poll_frame(cx)
     }))
@@ -1455,8 +1489,10 @@ async fn cancelled_stream_terminal_is_delivered_while_another_http_response_fill
         retained.iter().map(|chunk| chunk.len()).sum::<usize>(),
         32 * 1024
     );
-    let budget = fixture.state.forwarding.payload_budget();
-    assert_eq!(budget.snapshot().used_bytes, fixture.budget_bytes);
+    let budget = fixture.state.forwarding.budget().clone();
+    // Both download windows are fully charged; only the two calls' refunded
+    // input and upload copies (64 bytes) are missing from B.
+    assert_eq!(budget.snapshot().memory.used_bytes, 2 * 128 * 1024);
 
     let cancel = Request::builder()
         .method("DELETE")
@@ -1484,7 +1520,7 @@ async fn cancelled_stream_terminal_is_delivered_while_another_http_response_fill
     assert_eq!(terminal.status, HttpStreamStatus::Failed);
     assert_eq!(terminal.complete_items, Some(1));
     assert_eq!(terminal.error.unwrap().code, ErrorCode::CallCancelled);
-    assert_eq!(budget.snapshot().used_bytes, fixture.budget_bytes);
+    assert_eq!(budget.snapshot().memory.used_bytes, 2 * 128 * 1024);
     assert!(
         retained
             .iter()
@@ -1498,7 +1534,8 @@ async fn cancelled_stream_terminal_is_delivered_while_another_http_response_fill
         .is_none()
     );
     drop(retained);
-    assert_eq!(budget.snapshot().used_bytes, 0);
+    drop(terminal_record);
+    assert_eq!(budget.snapshot().memory.used_bytes, 0);
     fixture.stop().await;
 }
 
@@ -1507,7 +1544,7 @@ async fn abandoned_data_header_refunds_its_payload_before_blocked_cleanup() {
     use axum::body::{Body, HttpBody};
     use axum::http::Request;
     use tower::ServiceExt;
-    let fixture = Fixture::start(false, 16 * 1024).await;
+    let fixture = Fixture::start(16 * 1024).await;
     let gate = Arc::new(FinishGate {
         entered: std::sync::Barrier::new(2),
         release: std::sync::Barrier::new(2),
@@ -1557,10 +1594,14 @@ async fn abandoned_data_header_refunds_its_payload_before_blocked_cleanup() {
         fixture
             .state
             .forwarding
-            .payload_budget()
+            .budget()
+            .clone()
             .snapshot()
+            .memory
             .used_bytes,
-        4096
+        // The whole download window stays charged while the response body
+        // keeps its issued slices alive against the blocked cleanup.
+        download_window(fixture.budget_bytes, 8)
     );
     let release = ReleaseFinish(gate.clone());
     drop(body);
@@ -1570,8 +1611,10 @@ async fn abandoned_data_header_refunds_its_payload_before_blocked_cleanup() {
         fixture
             .state
             .forwarding
-            .payload_budget()
+            .budget()
+            .clone()
             .snapshot()
+            .memory
             .used_bytes,
         0,
         "an abandoned local payload must not stay charged through unrelated cleanup"
@@ -1585,8 +1628,8 @@ async fn token_cancel_after_lifecycle_cancel_finishes_without_another_copy_windo
     use axum::body::{Body, HttpBody};
     use axum::http::Request;
     use tower::ServiceExt;
-    for shm in [false, true] {
-        let fixture = Fixture::start(shm, 32 * 1024).await;
+    {
+        let fixture = Fixture::start(32 * 1024).await;
         let request = Request::builder()
             .method("POST")
             .uri("/portable/echo")
@@ -1612,7 +1655,7 @@ async fn token_cancel_after_lifecycle_cancel_finishes_without_another_copy_windo
             .unwrap()
             .to_owned();
         let mut body = response.into_body();
-        // BEGIN, DATA header, then the first charged 4096-byte payload.
+        // BEGIN, DATA header, then the first charged download-window payload.
         for _ in 0..2 {
             bounded(std::future::poll_fn(|cx| {
                 Pin::new(&mut body).poll_frame(cx)
@@ -1629,10 +1672,13 @@ async fn token_cancel_after_lifecycle_cancel_finishes_without_another_copy_windo
         .unwrap()
         .into_data()
         .unwrap();
-        assert_eq!(retained.len(), 4096);
-        let budget = fixture.state.forwarding.payload_budget();
+        assert_eq!(
+            retained.len(),
+            download_window(fixture.budget_bytes, 8) as usize
+        );
+        let budget = fixture.state.forwarding.budget().clone();
         let other = budget
-            .try_reserve(fixture.budget_bytes - budget.snapshot().used_bytes)
+            .try_reserve_memory(fixture.budget_bytes - budget.snapshot().memory.used_bytes)
             .unwrap();
         {
             let waiting = std::future::poll_fn(|cx| Pin::new(&mut body).poll_frame(cx));
@@ -1661,8 +1707,10 @@ async fn token_cancel_after_lifecycle_cancel_finishes_without_another_copy_windo
             let terminal = stream_wire::decode_terminal(&record[9..]).unwrap();
             assert_eq!(terminal.status, HttpStreamStatus::Failed);
             assert!(terminal.error.unwrap().message.contains("relay shutdown"));
-            assert_eq!(terminal.complete_items, Some(u64::from(shm)));
-            assert_eq!(budget.snapshot().used_bytes, fixture.budget_bytes);
+            // The fixed projection carries a 128-KiB item through SHM backing,
+            // so the completed item is observed before the cancel boundary.
+            assert_eq!(terminal.complete_items, Some(1));
+            assert_eq!(budget.snapshot().memory.used_bytes, fixture.budget_bytes);
         }
         drop(other);
         drop(retained);
@@ -1678,7 +1726,7 @@ async fn mismatched_http_call_modes_are_not_executed_and_keep_upstream() {
         RelayAwareHttpClient,
     };
     use c2_error::ErrorCode;
-    let fixture = Fixture::start(false, 64 * 1024).await;
+    let fixture = Fixture::start(64 * 1024).await;
     let (lease, _, _) = bounded(fixture.state.acquire_upstream_for_route(&fixture.entry))
         .await
         .unwrap_or_else(|_| panic!("upstream acquire failed"));
@@ -1769,7 +1817,7 @@ async fn mismatched_http_call_modes_are_not_executed_and_keep_upstream() {
     }))
     .await
     .unwrap();
-    let budget = c2_mem::retention::PayloadBufferBudget::new(64 * 1024);
+    let budget = crate::payload::memory_only_budget(64 * 1024);
     let control =
         HttpCallControl::new(|| Ok(()), || Ok(())).with_payload_budget(budget.clone(), None);
     let error = bounded(client.call_controlled_async(
@@ -1794,7 +1842,7 @@ async fn mismatched_http_call_modes_are_not_executed_and_keep_upstream() {
     let mut stream = bounded(client.stream_controlled_async(
         "ping",
         Arc::new(Vec::<u8>::new()),
-        budget.try_reserve(1).unwrap(),
+        budget.try_reserve_memory(1).unwrap(),
         Box::new(()),
         HttpStreamCancellation::new(),
         &control,
@@ -1843,8 +1891,8 @@ async fn stream_body_last_bytes_reference_refunds_b() {
     use tower::ServiceExt;
 
     const LEN: usize = 4096;
-    for shm in [false, true] {
-        let fixture = Fixture::start(shm, 32 * 1024).await;
+    {
+        let fixture = Fixture::start(32 * 1024).await;
         let request = Request::builder()
             .method("POST")
             .uri("/portable/echo")
@@ -1884,17 +1932,21 @@ async fn stream_body_last_bytes_reference_refunds_b() {
         assert_eq!(terminal.status, HttpStreamStatus::Success);
         assert_eq!(terminal.complete_items, Some(1));
         assert!(bounded(body.next()).await.is_none());
-        drop(body);
+        drop((body, begin, header, end));
         fixture.state.forwarding.close();
-        bounded(fixture.state.forwarding.drain()).await;
-        let budget = fixture.state.forwarding.payload_budget();
-        assert_eq!(fixture.state.forwarding.snapshot().used_operations, 0);
-        assert_eq!(budget.snapshot().used_bytes, LEN as u64);
+        let mut drain = Box::pin(fixture.state.forwarding.drain());
+        assert!(futures::poll!(&mut drain).is_pending());
+        let budget = fixture.state.forwarding.budget().clone();
+        let width = download_window(fixture.budget_bytes, 8);
+        assert_eq!(fixture.state.forwarding.snapshot().used_operations, 1);
+        assert_eq!(budget.snapshot().memory.used_bytes, width);
         drop(clone);
-        assert_eq!(budget.snapshot().used_bytes, LEN as u64);
+        assert_eq!(budget.snapshot().memory.used_bytes, width);
         assert_eq!(slice.as_ref(), &[0; 5]);
         drop(slice);
-        assert_eq!(budget.snapshot().used_bytes, 0);
+        bounded(drain).await;
+        assert_eq!(fixture.state.forwarding.snapshot().used_operations, 0);
+        assert_eq!(budget.snapshot().memory.used_bytes, 0);
         fixture.stop().await;
     }
 }
@@ -1908,9 +1960,8 @@ async fn relay_oversized_item_keeps_real_terminal_and_refunds_b() {
         RelayAwareHttpClient,
     };
     use c2_error::ErrorCode;
-    use c2_mem::retention::PayloadBufferBudget;
 
-    let fixture = Fixture::start(true, 64 * 1024).await;
+    let fixture = Fixture::start(64 * 1024).await;
     let gate = Arc::new(FinishGate {
         entered: std::sync::Barrier::new(2),
         release: std::sync::Barrier::new(2),
@@ -1939,13 +1990,13 @@ async fn relay_oversized_item_keeps_real_terminal_and_refunds_b() {
     }))
     .await
     .unwrap();
-    let budget = PayloadBufferBudget::new(4096);
+    let budget = crate::payload::memory_only_budget(4096);
     let control =
         HttpCallControl::new(|| Ok(()), || Ok(())).with_payload_budget(budget.clone(), None);
     let mut stream = bounded(client.stream_controlled_async(
         "echo",
         Arc::new([1u32.to_le_bytes(), 8192u32.to_le_bytes()].concat()),
-        budget.try_reserve(1).unwrap(),
+        budget.try_reserve_memory(1).unwrap(),
         Box::new(()),
         HttpStreamCancellation::new(),
         &control,
@@ -1975,8 +2026,8 @@ async fn relay_oversized_item_keeps_real_terminal_and_refunds_b() {
     }
     assert_eq!(fixture.observed.produced.load(Ordering::SeqCst), 1);
     assert_eq!(fixture.observed.finished.load(Ordering::SeqCst), 1);
-    assert_eq!(budget.snapshot().used_bytes, 0);
-    assert_eq!(budget.snapshot().rejected_allocations, 1);
+    assert_eq!(budget.snapshot().memory.used_bytes, 0);
+    assert_eq!(budget.snapshot().memory.rejected_allocations, 1);
     drop(stream);
     drop(client);
     fixture.stop().await;
@@ -1990,7 +2041,7 @@ async fn relay_unary_upstream_has_one_open_one_call_end_no_credit() {
     use c2_wire::rpc::RpcRecordKind;
 
     let frames = RpcFrames::default();
-    let fixture = Fixture::start_with_frame_tap(false, 64 * 1024, Some(frames.clone())).await;
+    let fixture = Fixture::start_with_frame_tap(64 * 1024, Some(frames.clone())).await;
     let response = bounded(
         fixture
             .method_request("ping", false)

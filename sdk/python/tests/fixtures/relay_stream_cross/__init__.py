@@ -178,8 +178,8 @@ class Session:
                 "--items", str(count), "--ending", ending,
             ])
             assert self.host.read() == {"event": "ready", "address": address}
-            self.runtime.set_call_execution_limits(
-                payload_buffer_budget_bytes=(2 if behavior == "hold" else 3) * ITEM_BYTES,
+            self.runtime.set_client(
+                memory_budget_bytes=(2 if behavior == "hold" else 3) * ITEM_BYTES,
             )
             self.proxy = self.runtime.connect(Portable, name=route, address=self.relay.url)
             assert self.proxy.client.observed_path == "explicit_relay"
@@ -218,9 +218,9 @@ class Session:
                 assert isinstance(terminal, error.ResourceExecuteFunction)
                 assert str(terminal) == str(failure)
                 assert terminal.details == failure.details
-        assert self.runtime.call_execution_snapshot()["used_operations"] == 0
+        assert self.runtime.call_execution_snapshot()["client"]["used_operations"] == 0
         stats = self.runtime.memory_stats()
-        assert stats["payload_buffer"]["used_bytes"] == 0
+        assert stats["client"]["memory"]["used_bytes"] == 0
         return {
             "delivered": delivered, "complete_items": receipt["complete_items"],
             "error": None if failure is None else {
@@ -250,7 +250,7 @@ class Session:
             full = self.client.read()
             assert full["event"] == "holds-full"
             self.resource_stats("produced-three")
-            assert full["memory"]["payload_buffer"]["used_bytes"] == 2 * ITEM_BYTES
+            assert full["memory"]["client"]["memory"]["used_bytes"] == 2 * ITEM_BYTES
             self.client.send("release")
             return self._rust_done()
         first = second = third = None
@@ -274,7 +274,7 @@ class Session:
             _inspect_item(second.value, 1)
             full = self.runtime.memory_stats()
             assert full["holds"]["active_holds"] == 2
-            assert full["payload_buffer"]["used_bytes"] == 2 * ITEM_BYTES
+            assert full["client"]["memory"]["used_bytes"] == 2 * ITEM_BYTES
             worker = threading.Thread(target=receive, daemon=True)
             worker.start()
             started.wait(timeout=10)
@@ -289,7 +289,7 @@ class Session:
             _inspect_item(third.value, 2)
             after_one_release = self.runtime.memory_stats()
             assert after_one_release["holds"]["active_holds"] == 2
-            assert after_one_release["payload_buffer"]["used_bytes"] == 2 * ITEM_BYTES
+            assert after_one_release["client"]["memory"]["used_bytes"] == 2 * ITEM_BYTES
             second.release()
             third.release()
             assert list(self.stream) == []

@@ -18,10 +18,11 @@ pub mod observe;
 pub use c2_contract::ContractRelease;
 pub use c2_core::CoreStreamCloseReceipt as StreamCloseReceipt;
 pub use c2_core::{
-    CallExecutionLimits, CallExecutionLimitsOverrides, CallOptions, CallTimeout, Client,
-    ConfigSources, Connect, ConnectOptions, EnvFilePolicy, EnvMap, Host, HostOptions,
-    LifecycleError, Registration, RouteConcurrency, RouteConcurrencyError, RouteConcurrencyGuard,
-    Runtime, RuntimeOptions, ServerFailure, ServerStartupStage, ServerStartupTimeout,
+    CallOptions, CallTimeout, Client, ClientConfigPatch, ConfigField, ConfigSources, Connect,
+    ConnectOptions, DomainLimits, DomainLimitsOverrides, DomainLimitsPatch, EnvCatalog,
+    EnvFilePolicy, EnvMap, Host, HostOptions, LifecycleError, Registration, RouteConcurrency,
+    RouteConcurrencyError, RouteConcurrencyGuard, Runtime, RuntimeOptions, ServerConfigOverrides,
+    ServerConfigPatch, ServerFailure, ServerStartupStage, ServerStartupTimeout,
     ServiceConcurrencyMode, ServiceDefinition,
 };
 pub use error::Error;

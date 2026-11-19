@@ -79,10 +79,9 @@ fn encoding_waits(shm: bool, shutdown: ShutdownPoint) {
         .build()
         .unwrap();
     let observed = Arc::new(Observed::default());
-    let mut config = ServerIpcConfig::default();
-    if shm {
-        config.shm_threshold = 1;
-    }
+    let width = if shm { 32 * 1024 } else { 4 };
+    observed.item_bytes.store(width, Ordering::SeqCst);
+    let config = ServerIpcConfig::default();
     let (server, identity) = registered_server(observed.clone(), config);
     let (server_stream, mut peer) = peer_runtime.block_on(isolated_pair());
     let (_, write_half) = server_stream.into_split();
@@ -93,12 +92,16 @@ fn encoding_waits(shm: bool, shutdown: ShutdownPoint) {
         ConnectionWriter::spawn(
             write_half,
             conn.clone(),
-            server.config.write_timeout(),
-            server.control_reply_budget.clone(),
+            c2_config::WRITE_TIMEOUT,
+            server.control_reply_capacity,
         )
     });
     *conn.rpc_writer.lock() = Some(Arc::downgrade(&writer));
-    let call = conn.calls.lock().open(1, ServerCall::default()).unwrap();
+    let data = ServerCall {
+        _operation: Some(server.domain_budget().reserve_operation().unwrap()),
+        ..ServerCall::default()
+    };
+    let call = conn.calls.lock().open(1, data).unwrap();
     conn.core.stream_open(1).unwrap();
     let route = reserve_accepted_route_execution(&server, &identity, 1, CallMode::ServerStream)
         .unwrap_or_else(|_| panic!("stream route admission failed"));
@@ -111,7 +114,6 @@ fn encoding_waits(shm: bool, shutdown: ShutdownPoint) {
         route: route.route,
         method_idx: 1,
         pending_permit: route.pending_permit,
-        _pending_permit: server.try_acquire_pending_request().unwrap(),
         _flight: crate::connection::FlightGuard::new(&conn),
     };
 
@@ -124,7 +126,7 @@ fn encoding_waits(shm: bool, shutdown: ShutdownPoint) {
             &conn,
             &writer,
             1,
-            RequestData::Inline(vec![1]),
+            OwnedRequestInput::unreserved(RequestData::Inline(vec![1])),
             admission,
         ));
         assert_eq!(observed.entries.load(Ordering::SeqCst), 0);
@@ -177,18 +179,18 @@ fn encoding_waits(shm: bool, shutdown: ShutdownPoint) {
             &dispatch_conn,
             &dispatch_writer,
             1,
-            RequestData::Inline(vec![1]),
+            OwnedRequestInput::unreserved(RequestData::Inline(vec![1])),
             admission,
         ));
         dispatch_done_tx.send(()).unwrap();
     });
     assert!(matches!(
         peer_runtime.block_on(read_record(&mut peer, CallMode::ServerStream)),
-        SeenRecord::Begin(4)
+        SeenRecord::Begin(bytes) if bytes == width as u64
     ));
 
     if stop_executor {
-        conn.core.stream_credit(1, 4, 0).unwrap();
+        conn.core.stream_credit(1, width as u64, 0).unwrap();
         conn.writer_wake.notify_waiters();
         encoding_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         assert!(observed.encoded_ranges.lock().unwrap().is_empty());
@@ -236,10 +238,8 @@ fn encoding_waits(shm: bool, shutdown: ShutdownPoint) {
         assert_eq!(observed.finished.load(Ordering::SeqCst), 0);
         assert!(conn.calls.lock().get(1).is_none());
         assert!(conn.core.stream_state(1).is_none());
-        assert_eq!(
-            server.pending_requests.available_permits(),
-            server.config.max_pending_requests as usize
-        );
+        drop(call);
+        assert_eq!(server.domain_snapshot().operations.used_operations, 0);
         return;
     }
 
@@ -252,7 +252,7 @@ fn encoding_waits(shm: bool, shutdown: ShutdownPoint) {
     blocker_entered_rx
         .recv_timeout(Duration::from_secs(5))
         .unwrap();
-    conn.core.stream_credit(1, 4, 0).unwrap();
+    conn.core.stream_credit(1, width as u64, 0).unwrap();
     conn.writer_wake.notify_waiters();
     encoding_rx.recv_timeout(Duration::from_secs(5)).unwrap();
     assert!(observed.encoded_ranges.lock().unwrap().is_empty());
@@ -265,7 +265,7 @@ fn encoding_waits(shm: bool, shutdown: ShutdownPoint) {
     match peer_runtime.block_on(read_record(&mut peer, CallMode::ServerStream)) {
         SeenRecord::Data(bytes) if !shm => assert_eq!(bytes, [0; 4]),
         SeenRecord::ShmData(loan) if shm => {
-            assert_eq!(loan.data_size, 4);
+            assert_eq!(loan.data_size as usize, width);
             let release = encode_release_frame(&ReleaseBatch::new(&[loan.loan_id]).unwrap(), false);
             let (header, payload) = frame::decode_frame(&release).unwrap();
             let outcome = conn.core.receive_release(&header, payload);

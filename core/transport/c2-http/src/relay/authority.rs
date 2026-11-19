@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use c2_contract::{ExpectedRouteContract, MAX_WIRE_TEXT_BYTES};
-use c2_ipc::{ClientIpcConfig, IpcClient};
+use c2_ipc::IpcClient;
 
 use crate::relay::conn_pool::{
     CachedClient, OwnerReplaceError, OwnerReplacementEvidence, OwnerToken,
@@ -1011,7 +1011,7 @@ impl<'a> RouteAuthority<'a> {
         let Ok(mut client) = self
             .state
             .clients
-            .manage(|| IpcClient::with_endpoint(endpoint, ClientIpcConfig::default()))
+            .manage(|| IpcClient::with_endpoint(endpoint))
         else {
             // Local lifecycle or client-construction failure is not evidence
             // that the captured upstream owner is dead.

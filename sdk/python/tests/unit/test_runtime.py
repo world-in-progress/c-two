@@ -50,9 +50,7 @@ def isolated_settings(monkeypatch):
         if key.startswith('C2_'):
             monkeypatch.delenv(key)
     monkeypatch.setenv('C2_ENV_FILE', '')
-    monkeypatch.setenv('C2_SHM_THRESHOLD', '8192')
-    for key in ('_shm_threshold', '_remote_payload_chunk_size', '_relay_anchor_address'):
-        monkeypatch.setattr(settings, key, None)
+    monkeypatch.setattr(settings, '_relay_anchor_address', None)
     yield
     registry._reset_default_runtime()
 
@@ -75,41 +73,11 @@ def runtimes(tmp_path):
         assert {p.name for p in root.iterdir()} <= {'.gate', '.gate.marker'}
 
 
-def test_unconfigured_settings_do_not_read_another_objects_override():
-    settings.shm_threshold = 16384
-    assert C2Settings().shm_threshold == 8192
-
-
-def test_new_runtime_does_not_copy_another_runtimes_transport_override(runtimes):
-    first, second = runtimes
-    first.set_transport_policy(shm_threshold=16384)
-    second.set_transport_policy(remote_payload_chunk_size=2048)
-    assert first._runtime_session.client_ipc_config['shm_threshold'] == 16384
-    assert second._runtime_session.client_ipc_config['shm_threshold'] == 8192
-    assert settings._shm_threshold is None
-    assert registry._default_runtime is None
-
-
-@pytest.mark.parametrize('global_threshold,session_threshold,valid', [
-    (16384, 4096, True),
-    (4096, 16384, False),
-])
-def test_bridge_preflight_uses_its_own_native_transport_policy(global_threshold, session_threshold, valid):
-    settings.shm_threshold = global_threshold
-    session = RuntimeSession(
-        shm_threshold=session_threshold,
-        server_ipc_overrides={'max_frame_size': 8192},
-        use_process_relay_anchor=False,
-    )
-    try:
-        if valid:
-            session.ensure_server_bridge()
-        else:
-            with pytest.raises(ValueError, match='shm_threshold'):
-                session.ensure_server_bridge()
-    finally:
-        assert not session.host_started
-        assert session.shutdown()['completed']
+def test_unconfigured_settings_do_not_read_another_objects_override(monkeypatch):
+    monkeypatch.setenv('C2_RELAY_ANCHOR_ADDRESS', 'http://127.0.0.1:8')
+    first = C2Settings(relay_anchor_address='http://127.0.0.1:9')
+    assert first.relay_anchor_address == 'http://127.0.0.1:9'
+    assert C2Settings().relay_anchor_address == 'http://127.0.0.1:8'
 
 
 def test_empty_start_uses_native_readiness_and_leaves_directory_owned_by_caller(tmp_path, monkeypatch):
@@ -360,11 +328,11 @@ def test_default_api_and_explicit_runtime_keep_separate_owners(runtimes):
     context = runtime.local_endpoint_context()
     if context.root is not None:
         cc.endpoint.set_local_endpoint(root=context.root)
-    cc.set_transport_policy(shm_threshold=16384)
+    cc.set_server(memory_budget_bytes=16384)
     cc.register(Echo, EchoResource('default:'), name='same')
     runtime.register(Echo, EchoResource('explicit:'), name='same')
-    assert registry._get_default_runtime()._runtime_session.client_ipc_config['shm_threshold'] == 16384
-    assert runtime._runtime_session.client_ipc_config['shm_threshold'] == 8192
+    assert cc.observe.memory_stats()['server']['memory']['limit_bytes'] == 16384
+    assert runtime.memory_stats()['server']['memory']['limit_bytes'] == 16 * 1024**3
     with cc.connect(Echo, name='same') as default_proxy:
         with runtime.connect(Echo, name='same') as explicit_proxy:
             assert default_proxy.echo('x') == 'default:x'

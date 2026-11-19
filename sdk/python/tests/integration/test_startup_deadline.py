@@ -7,6 +7,7 @@ import tempfile
 
 import pytest
 
+import c_two as cc
 from c_two import _native
 from tests.integration.test_local_io_cause import COMMON
 from tests.unit.test_endpoint_context import _run_isolated
@@ -46,13 +47,15 @@ def test_invalid_startup_timeout_does_not_mutate_configuration(invalid: float) -
     with pytest.raises(ValueError):
         _native.RuntimeSession(startup_timeout=invalid, use_process_relay_anchor=False)
     session = _native.RuntimeSession(server_id='startup-config', startup_timeout=0.25, use_process_relay_anchor=False)
+    runtime = cc.Runtime()
+    runtime._runtime_session = session
     try:
         with pytest.raises(ValueError):
-            session.set_server_options('changed', None, invalid)
+            runtime.set_server(server_id='changed', startup_timeout=invalid)
         assert session.server_id_override == 'startup-config'
         assert session.startup_timeout == 0.25
         assert session.server_id is None
-        session.set_server_options(startup_timeout=None)
+        runtime.set_server(startup_timeout=None)
         assert session.startup_timeout is None
     finally:
         assert session.shutdown()['completed']
@@ -69,7 +72,7 @@ if {sys.platform!r} != 'win32':
 try:
     cc.set_server(startup_timeout=0)
     old = _get_default_runtime()._runtime_session
-    cc.set_transport_policy(shm_threshold=128)
+    assert cc.shutdown()['completed']
     current = _get_default_runtime()._runtime_session
     assert current is not old and current.startup_timeout == 0
     try:
@@ -82,7 +85,7 @@ try:
     assert cc.server_address() is None
     assert current.ensure_server_bridge().names == []
     try:
-        current.set_server_options(startup_timeout=30)
+        cc.set_server(startup_timeout=30)
     except cc.error.CoreError as error:
         assert error.lifecycle_kind == 'config_frozen'
     else:
@@ -95,9 +98,8 @@ if {sys.platform!r} != 'win32':
 try:
     cc.set_server(startup_timeout=30)
     cc.register(Echo, Resource(), name='startup')
-    running = _get_default_runtime()._runtime_session
     try:
-        running.set_server_options('bad/id', {{'unknown': True}}, float('nan'))
+        cc.set_server(startup_timeout=1)
     except RuntimeError as error:
         assert 'frozen' in str(error)
     else:
@@ -113,9 +115,8 @@ assert all(not entry.is_socket() and not entry.name.endswith('.lease') for entry
 def test_invalid_ipc_configuration_precedes_zero_startup_budget() -> None:
     _run_isolated(COMMON + '''
 try:
-    cc.set_server(ipc_overrides={'pool_segment_size': 0}, startup_timeout=0)
     try:
-        cc.register(Echo, Resource(), name='startup')
+        cc.set_server(max_payload_size=0, startup_timeout=0)
     except ValueError:
         pass
     else:

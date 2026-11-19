@@ -48,8 +48,8 @@ def _wait_for_server(address: str, timeout: float = 5.0) -> None:
     raise TimeoutError(f'Server at {address} not ready after {timeout}s')
 
 
-def _hello_server(address: str, *, ipc_overrides=None) -> Server:
-    server = local_server(address, ipc_overrides=ipc_overrides)
+def _hello_server(address: str) -> Server:
+    server = local_server(address)
     server.register_crm(Hello, HelloImpl(), name='hello')
     return server
 
@@ -74,7 +74,6 @@ def server_small_shm(monkeypatch):
     """Server with small SHM threshold (forces inline path more often)."""
     addr = f'ipc://{_unique_region("small")}'
     monkeypatch.setenv('C2_ENV_FILE', '')
-    monkeypatch.setenv('C2_SHM_THRESHOLD', '16')
     server = _hello_server(addr)
     server.start()
     _wait_for_server(addr)

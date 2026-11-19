@@ -340,7 +340,7 @@ fn valid_active_route_fields(
 ) -> bool {
     crate::relay::route_table::valid_route_name(name)
         && valid_wire_relay_id(relay_id)
-        && crate::relay::route_table::valid_relay_url(relay_url)
+        && crate::valid_relay_url(relay_url)
         && crate::relay::route_table::valid_crm_tag(crm_ns, crm_name, crm_ver)
         && c2_contract::validate_contract_hash("abi_hash", abi_hash).is_ok()
         && c2_contract::validate_contract_hash("signature_hash", signature_hash).is_ok()

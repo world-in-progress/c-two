@@ -552,7 +552,6 @@ class TestServerNameCollision:
         bridge = object.__new__(NativeServerBridge)
         bridge._slots = {}  # noqa: SLF001
         bridge._slots_lock = __import__('threading').Lock()  # noqa: SLF001
-        bridge._shm_threshold = 1024  # noqa: SLF001
         def fake_create(_crm_class, crm_instance):
             return crm_instance
 

@@ -115,6 +115,17 @@ class GateResource:
             payload.close()
 
 
+def assert_node_role_drained(stats: dict) -> None:
+    used_operations = stats["call_execution"]["used_operations"]
+    if stats["frozen"] is True:
+        assert used_operations == "0", stats
+        assert stats["memory"]["used_bytes"] == "0", stats
+    else:
+        assert stats["frozen"] is False, stats
+        assert used_operations is None, stats
+        assert stats["memory"] is None, stats
+
+
 @contextmanager
 def node_gate_client(
     project: tuple[Path, str], work: Path, address: str, ipc_root: str | None,
@@ -165,7 +176,8 @@ def node_gate_client(
             try:
                 if process.poll() is None:
                     cleaned = request("exit")
-                    assert cleaned["ok"] and cleaned["stats"]["used_operations"] == "0", cleaned
+                    assert cleaned["ok"], cleaned
+                    assert_node_role_drained(cleaned["stats"])
                     process.stdin.close()
                     assert process.wait(timeout=10) == 0
             finally:
@@ -214,8 +226,8 @@ class AcceptedConnections:
             "source_ended": self.ended,
         }
 
-    def wait_closed(self, candidates: set[int]) -> int:
-        deadline = time.monotonic() + 8
+    def wait_closed(self, candidates: set[int], *, timeout: float = 8) -> int:
+        deadline = time.monotonic() + timeout
         while True:
             self.snapshot()
             closed = candidates.intersection(self.closed)
@@ -326,7 +338,9 @@ def _resource_main(config: dict[str, Any]) -> None:
 
     session = RuntimeSession(server_id=config["server_id"], use_process_relay_anchor=False)
     if config["max_payload_size"] is not None:
-        session.set_server_options(config["server_id"], {"max_payload_size": config["max_payload_size"]})
+        runtime = cc.Runtime()
+        runtime._runtime_session = session
+        runtime.set_server(max_payload_size=config["max_payload_size"])
     if config["relay"]:
         session.set_relay_anchor_address(config["relay"])
     server = session.ensure_server_bridge()
@@ -367,7 +381,7 @@ def _resource_main(config: dict[str, Any]) -> None:
                 assert cleanup["completed"], cleanup
                 for item in resources.values():
                     item.close()
-                assert session.call_execution_snapshot()["used_operations"] == 0
+                assert session.call_execution_snapshot()["server"]["used_operations"] == 0
                 memory = session.memory_stats()
                 assert memory["holds"]["active_holds"] == 0
                 print(json.dumps({"ok": True, "shutdown": cleanup, "memory": memory, "connections": connections.snapshot()}), flush=True)

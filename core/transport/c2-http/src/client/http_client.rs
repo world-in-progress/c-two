@@ -1,8 +1,7 @@
 //! HTTP client for CRM calls through a relay server.
 
-use c2_mem::retention::{BudgetedBuffer, PayloadBufferBudget, PayloadBufferReservation};
+use c2_mem::{BudgetedBuffer, DomainBudget, MemoryReservation};
 use std::sync::{Arc, OnceLock};
-use std::time::{Duration, Instant};
 
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use reqwest::header::CONTENT_LENGTH;
@@ -127,12 +126,13 @@ pub enum HttpError {
 
 /// Synchronous + async HTTP client for CRM relay calls.
 ///
-/// Uses `reqwest::Client` internally with connection pooling.
+/// Uses `reqwest::Client` internally with connection pooling. The data-plane
+/// client carries no total call timeout: only the caller's explicit
+/// `CallScope` / `CallOptions` deadline bounds a call.
 pub struct HttpClient {
     client: reqwest::Client,
     probe_client: reqwest::Client,
     base_url: String,
-    remote_payload_chunk_size: u64,
 }
 
 /// Shared owner of a controlled call's read-only input.
@@ -159,14 +159,13 @@ impl HttpCallInput<'_> {
 
     async fn into_body(
         self,
-        chunk_size: u64,
-        budget: &PayloadBufferBudget,
-        deadline: Option<Instant>,
+        budget: &DomainBudget,
+        deadline: Option<std::time::Instant>,
         input_charged: bool,
     ) -> Result<reqwest::Body, HttpError> {
         match self {
             Self::Borrowed(data) => {
-                crate::payload::reqwest_body_from_payload(data, chunk_size, budget, deadline).await
+                crate::payload::reqwest_body_from_payload(data, budget, deadline).await
             }
             Self::Owned(data) => {
                 let owner = if input_charged {
@@ -184,7 +183,7 @@ impl HttpCallInput<'_> {
                         _reservation: reservation,
                     })
                 };
-                crate::payload::reqwest_body_from_owned_payload(owner, chunk_size)
+                crate::payload::reqwest_body_from_owned_payload(owner)
             }
         }
     }
@@ -192,7 +191,7 @@ impl HttpCallInput<'_> {
 
 struct ReservedInput {
     data: HttpInputOwner,
-    _reservation: PayloadBufferReservation,
+    _reservation: MemoryReservation,
 }
 impl AsRef<[u8]> for ReservedInput {
     fn as_ref(&self) -> &[u8] {
@@ -201,96 +200,27 @@ impl AsRef<[u8]> for ReservedInput {
 }
 
 impl HttpClient {
-    #[cfg(test)]
-    fn new_with_proxy_policy(
-        base_url: &str,
-        timeout_secs: f64,
-        max_connections: usize,
-        use_proxy: bool,
-    ) -> Result<Self, HttpError> {
-        Self::new_with_transport_policy(
-            base_url,
-            timeout_secs,
-            max_connections,
-            use_proxy,
-            c2_config::DEFAULT_REMOTE_PAYLOAD_CHUNK_SIZE,
-        )
-    }
-
-    /// Create a new client with explicit proxy and remote payload batching policy.
-    pub fn new_with_transport_policy(
-        base_url: &str,
-        timeout_secs: f64,
-        max_connections: usize,
-        use_proxy: bool,
-        remote_payload_chunk_size: u64,
-    ) -> Result<Self, HttpError> {
-        Self::new_with_policy(
-            base_url,
-            timeout_secs,
-            max_connections,
-            use_proxy,
-            remote_payload_chunk_size,
-            false,
-        )
-    }
-
-    pub(crate) fn new_controlled(
-        base_url: &str,
-        max_connections: usize,
-        use_proxy: bool,
-        remote_payload_chunk_size: u64,
-    ) -> Result<Self, HttpError> {
-        Self::new_with_policy(
-            base_url,
-            0.0,
-            max_connections,
-            use_proxy,
-            remote_payload_chunk_size,
-            true,
-        )
-    }
-
-    fn new_with_policy(
-        base_url: &str,
-        timeout_secs: f64,
-        max_connections: usize,
-        use_proxy: bool,
-        remote_payload_chunk_size: u64,
-        controlled: bool,
-    ) -> Result<Self, HttpError> {
-        if !timeout_secs.is_finite() || timeout_secs < 0.0 {
-            return Err(HttpError::Transport(
-                "HTTP call timeout must be finite and >= 0".to_string(),
-            ));
-        }
-        crate::payload::validate_remote_payload_chunk_size(remote_payload_chunk_size)?;
-        let mut builder = crate::relay_client_builder_with_proxy(use_proxy)
-            .pool_max_idle_per_host(max_connections);
-        if timeout_secs > 0.0 {
-            builder = builder.timeout(Duration::from_secs_f64(timeout_secs));
-        }
-        if controlled {
-            // Core owns the logical deadline. No upload/total timeout or hidden
-            // POST replay may bypass the per-call dispatch guard.
-            builder = builder
-                .retry(reqwest::retry::never())
-                .redirect(reqwest::redirect::Policy::none());
-        }
-        let client = builder
+    /// Create a new client with an explicit proxy policy. The data-plane
+    /// client has no total/upload timeout, no hidden POST replay and no
+    /// redirects: inherited defaults, explicit deadlines and Unlimited belong
+    /// to the caller's scope.
+    pub fn new(base_url: &str, max_connections: usize, use_proxy: bool) -> Result<Self, HttpError> {
+        let client = crate::relay_client_builder_with_proxy(use_proxy)
+            .pool_max_idle_per_host(max_connections)
+            .retry(reqwest::retry::never())
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|e| HttpError::Transport(e.to_string()))?;
         // Probes are control-plane operations with an independent safety timeout.
         // Waiting for them never resets the owner's original absolute deadline.
         let probe_client = crate::relay_client_builder_with_proxy(use_proxy)
-            .timeout(Duration::from_secs(5))
+            .timeout(std::time::Duration::from_secs(5))
             .build()
             .map_err(|e| HttpError::Transport(e.to_string()))?;
         Ok(Self {
             client,
             probe_client,
             base_url: base_url.trim_end_matches('/').to_owned(),
-            remote_payload_chunk_size,
         })
     }
 
@@ -299,7 +229,7 @@ impl HttpClient {
         expected: &ExpectedRouteContract,
         method_name: &str,
         data: HttpCallInput<'_>,
-        budget: &PayloadBufferBudget,
+        budget: &DomainBudget,
         control: Option<&HttpCallControl>,
     ) -> Result<BudgetedBuffer, HttpError> {
         let url = format!(
@@ -313,7 +243,6 @@ impl HttpClient {
         super::call_control::check_active(control)?;
         let body = data
             .into_body(
-                self.remote_payload_chunk_size,
                 budget,
                 deadline,
                 control.is_some_and(|control| control.payload_budget().is_some()),
@@ -348,8 +277,8 @@ impl HttpClient {
         expected: &ExpectedRouteContract,
         method_name: &str,
         data: HttpCallInput<'_>,
-        budget: &PayloadBufferBudget,
-        send_headroom: PayloadBufferReservation,
+        budget: &DomainBudget,
+        send_headroom: MemoryReservation,
         completion_owner: Box<dyn Send>,
         cancellation: HttpStreamCancellation,
         control: &HttpCallControl,
@@ -364,7 +293,6 @@ impl HttpClient {
         control.check_active()?;
         let body = data
             .into_body(
-                self.remote_payload_chunk_size,
                 budget,
                 control.deadline(),
                 control.payload_budget().is_some(),
@@ -449,7 +377,7 @@ impl HttpClient {
     pub(crate) async fn probe_route_async(
         &self,
         expected: &ExpectedRouteContract,
-        budget: &PayloadBufferBudget,
+        budget: &DomainBudget,
     ) -> Result<(), HttpError> {
         let url = format!(
             "{}/_probe/{}",
@@ -477,10 +405,6 @@ impl HttpClient {
     /// Base URL of this client.
     pub fn base_url(&self) -> &str {
         &self.base_url
-    }
-
-    pub fn remote_payload_chunk_size(&self) -> u64 {
-        self.remote_payload_chunk_size
     }
 }
 
@@ -566,7 +490,7 @@ mod tests {
 
     #[tokio::test]
     async fn prepared_owned_body_guard_returns_intact_local_error_before_network() {
-        let client = HttpClient::new_controlled("http://127.0.0.1:9", 100, false, 3).unwrap();
+        let client = HttpClient::new("http://127.0.0.1:9", 100, false).unwrap();
         let expected = ExpectedRouteContract {
             route_name: "grid".into(),
             crm_ns: "test.grid".into(),
@@ -602,7 +526,7 @@ mod tests {
                 &expected,
                 "step",
                 input,
-                &PayloadBufferBudget::new(1024),
+                &crate::payload::memory_only_budget(1024),
                 Some(&control),
             )
             .await
@@ -615,45 +539,12 @@ mod tests {
     }
 
     #[test]
-    fn controlled_data_client_has_no_total_timeout_while_probe_remains_bounded() {
-        let controlled =
-            HttpClient::new_controlled("http://localhost:9988", 100, false, 1024).unwrap();
-        let legacy =
-            HttpClient::new_with_transport_policy("http://localhost:9988", 300.0, 100, false, 1024)
-                .unwrap();
+    fn data_client_has_no_total_timeout_while_probe_remains_bounded() {
+        let client = HttpClient::new("http://localhost:9988", 100, false).unwrap();
         // reqwest's Client Debug projects its actual configured TotalTimeout
         // (reqwest 0.12.28 RequestConfig::fmt_as_field), not a local policy copy.
-        assert!(!format!("{:?}", controlled.client).contains("TotalTimeout"));
-        assert!(format!("{:?}", controlled.probe_client).contains("TotalTimeout"));
-        assert!(format!("{:?}", legacy.client).contains("TotalTimeout"));
-    }
-
-    #[test]
-    fn zero_timeout_is_accepted_to_disable_total_call_timeout() {
-        let client = HttpClient::new_with_proxy_policy("http://localhost:9991", 0.0, 100, false)
-            .expect("zero timeout should be accepted");
-
-        assert_eq!(client.base_url(), "http://localhost:9991");
-    }
-
-    #[test]
-    fn invalid_timeout_is_rejected_without_panic() {
-        for timeout in [-1.0, f64::NAN, f64::INFINITY] {
-            let err = match HttpClient::new_with_proxy_policy(
-                "http://localhost:9990",
-                timeout,
-                100,
-                false,
-            ) {
-                Ok(_) => panic!("invalid timeout should fail"),
-                Err(err) => err,
-            };
-
-            assert!(
-                err.to_string().contains("timeout"),
-                "unexpected error for {timeout}: {err}"
-            );
-        }
+        assert!(!format!("{:?}", client.client).contains("TotalTimeout"));
+        assert!(format!("{:?}", client.probe_client).contains("TotalTimeout"));
     }
 
     #[test]

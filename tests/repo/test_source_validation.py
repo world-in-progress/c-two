@@ -104,7 +104,7 @@ def test_timeout_reaps_independent_session_owned_by_nested_driver(tmp_path, driv
             "    return original_spawn(command, *args, **kwargs)\n"
             "matrix.subprocess.Popen = spawn\n"
             f"matrix.run_matrix(SimpleNamespace(output_dir=Path({str(tmp_path / 'nested')!r}), "
-            "only='idle_small_rpc_default_buddy', python=sys.executable, memory_stats=False, "
+            "only='idle_small_rpc_roomy_memory', python=sys.executable, memory_stats=False, "
             "require_memory_stats=False, allow_unavailable_stats_after_shutdown=False, "
             "child_timeout=60, row_timeout=60))\n"
         )

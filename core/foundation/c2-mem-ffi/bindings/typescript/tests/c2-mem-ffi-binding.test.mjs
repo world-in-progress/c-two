@@ -39,9 +39,41 @@ function fixture() {
   return {symbols, events, domain, nativeContext, nativeEndpoint, nativeCall};
 }
 
+test('stats observes the inactive client role without capturing its context', () => {
+  const {symbols, events} = fixture();
+  const connector = createNodeIpcConnector({nativeSymbols: symbols, memoryBudgetBytes: 128});
+  assert.deepEqual(connector.stats(), {
+    domain_id: null, generation: '0', frozen: false, closed: false,
+    memory: null, file_spill: null, call_execution: {
+      max_operations: null, used_operations: null, peak_operations: null,
+      rejected_reservations: null, closed: false,
+    },
+  });
+  assert.deepEqual(events, ['version']);
+  connector.close();
+  assert.throws(() => connector.stats(), /closed/);
+});
+
+test('domain limits reject invalid JS values and are unavailable on endpoints', async () => {
+  const {symbols, events} = fixture();
+  const connector = createNodeIpcConnector({nativeSymbols: symbols});
+  for (const key of ['memoryBudgetBytes', 'fileSpillBudgetBytes', 'maxOutstandingCalls']) {
+    for (const value of [-1, 0.5, NaN, Infinity, 2 ** 53, -1n, 2n ** 64n, null, '1']) {
+      assert.throws(() => createNodeIpcConnector({nativeSymbols: symbols, [key]: value}), new RegExp(key));
+    }
+    await assert.rejects(connector('ipc://one', undefined, {[key]: 1}), new RegExp(`unknown option ${key}`));
+  }
+  for (const key of ['requestShmThreshold', 'requestChunkSize']) {
+    assert.throws(() => createNodeIpcConnector({nativeSymbols: symbols, [key]: 1}), new RegExp(`unknown option ${key}`));
+    await assert.rejects(connector('ipc://one', undefined, {[key]: 1}), new RegExp(`unknown option ${key}`));
+  }
+  assert.deepEqual(events, ['version']);
+  connector.close();
+});
+
 test('ABI 8 connector retains one native domain across endpoint reconnects', async () => {
   const {symbols, events, nativeContext} = fixture();
-  const connect = createNodeIpcConnector({nativeSymbols: symbols, ipcRoot: '/one', requestChunkSize: 128});
+  const connect = createNodeIpcConnector({nativeSymbols: symbols, ipcRoot: '/one', memoryBudgetBytes: 128});
   assert.equal(connect.resolveEndpoint('ipc://first'), '/one/first');
   assert.equal(events.filter(e => Array.isArray(e) && e[0] === 'domain').length, 0, 'query does not freeze');
   const first = await connect('ipc://one', 250);
@@ -50,7 +82,7 @@ test('ABI 8 connector retains one native domain across endpoint reconnects', asy
   assert.notEqual(first, second);
   assert.equal(events.filter(e => Array.isArray(e) && e[0] === 'domain').length, 1);
   assert.equal(events.find(e => Array.isArray(e) && e[0] === 'domain')[1], nativeContext);
-  assert.deepEqual(events.find(e => Array.isArray(e) && e[0] === 'domain')[2], {requestChunkSize: 128});
+  assert.deepEqual(events.find(e => Array.isArray(e) && e[0] === 'domain')[2], {memoryBudgetBytes: 128});
   assert.deepEqual(events.filter(e => Array.isArray(e) && e[0] === 'endpoint').map(e => e.slice(1)), [
     ['ipc://one', {connectTimeoutMs: 250}],
     ['ipc://two', {connectTimeoutMs: 500}],
@@ -65,7 +97,7 @@ test('ABI 8 connector retains one native domain across endpoint reconnects', asy
 test('per-transport native options override factory defaults and explicit timeout wins', async () => {
   const {symbols, events} = fixture();
   const connect = createNodeIpcConnector({
-    nativeSymbols: symbols, connectTimeoutMs: 100, requestChunkSize: 64,
+    nativeSymbols: symbols, connectTimeoutMs: 100, memoryBudgetBytes: 64,
     expectedServerIdentity: {serverId: 'factory', serverInstanceId: 'i'},
   });
   await connect('ipc://route', 300, {
@@ -120,12 +152,13 @@ test('connection snapshots preserve the observed identity and native end reason'
   } finally { connect.close(); }
 });
 
-test('factory transport policy is captured once before any endpoint can choose it', async () => {
+test('factory domain limits are captured once for all endpoints', async () => {
   const {symbols, events} = fixture();
-  const options = {nativeSymbols: symbols, requestShmThreshold: 1, requestChunkSize: 64};
+  const options = {nativeSymbols: symbols, memoryBudgetBytes: 4096n, fileSpillBudgetBytes: 0, maxOutstandingCalls: 64};
   const connect = createNodeIpcConnector(options);
-  options.requestShmThreshold = 4096;
-  options.requestChunkSize = 128;
+  options.memoryBudgetBytes = 8192n;
+  options.fileSpillBudgetBytes = 128;
+  options.maxOutstandingCalls = 4;
   try {
     const first = await connect('ipc://first');
     const second = await connect('ipc://second');
@@ -133,7 +166,7 @@ test('factory transport policy is captured once before any endpoint can choose i
     await second.prepare('two', {});
     const domains = events.filter(e => Array.isArray(e) && e[0] === 'domain');
     assert.equal(domains.length, 1);
-    assert.deepEqual(domains[0][2], {requestShmThreshold: 1, requestChunkSize: 64});
+    assert.deepEqual(domains[0][2], {memoryBudgetBytes: 4096n, fileSpillBudgetBytes: 0, maxOutstandingCalls: 64});
     assert.deepEqual(events.filter(e => Array.isArray(e) && e[0] === 'endpoint').map(e => e[2]), [{}, {}]);
   } finally { connect.close(); }
 });
@@ -187,6 +220,7 @@ test('first capture failure is retained and a new connector can retry', async ()
   const connect = createNodeIpcConnector({nativeSymbols: symbols});
   await assert.rejects(() => connect('ipc://x'), /capture failed/);
   await assert.rejects(() => connect('ipc://x'), /capture failed/);
+  assert.throws(() => connect.stats(), /capture failed/);
   assert.equal(captures, 1);
   connect.close();
 });

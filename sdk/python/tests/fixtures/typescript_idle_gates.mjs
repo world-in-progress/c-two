@@ -185,8 +185,14 @@ try {
       for (const item of retainedItems.values()) item.dispose();
       await Promise.all([...transports.values()].map(state => state.transport.close?.()));
       const stats = connector.stats();
-      assert.equal(stats.used_operations, '0');
-      assert.equal(stats.payload_buffer?.used_bytes ?? '0', '0');
+      if (stats.frozen === true) {
+        assert.equal(stats.call_execution.used_operations, '0');
+        assert.equal(stats.memory.used_bytes, '0');
+      } else {
+        assert.equal(stats.frozen, false);
+        assert.equal(stats.call_execution.used_operations, null);
+        assert.equal(stats.memory, null);
+      }
       connector.close();
       reply({ok: true, stats});
       break;

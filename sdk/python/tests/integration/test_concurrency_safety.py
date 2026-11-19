@@ -94,11 +94,7 @@ class TestConcurrentCallSafety:
     def test_32_threads_concurrent_echo(self):
         """32 threads making concurrent echo calls via a shared proxy."""
         addr = _next_addr()
-        ipc_overrides = {
-            'pool_segment_size': 1 << 20,  # 1MB
-            'max_pool_segments': 2,
-        }
-        server = local_server(addr, ipc_overrides=ipc_overrides)
+        server = local_server(addr, memory_budget_bytes=64 * 1024**2)
         server.register_crm(IEcho, EchoImpl(), name='echo')
         server.start()
         _wait_for_server(addr)
@@ -138,11 +134,7 @@ class TestConcurrentCallSafety:
     def test_concurrent_calls_different_sizes(self):
         """Concurrent calls with varied payload sizes (inline + buddy paths)."""
         addr = _next_addr()
-        ipc_overrides = {
-            'pool_segment_size': 1 << 20,
-            'max_pool_segments': 2,
-        }
-        server = local_server(addr, ipc_overrides=ipc_overrides)
+        server = local_server(addr, memory_budget_bytes=64 * 1024**2)
         server.register_crm(IEcho, EchoImpl(), name='echo')
         server.start()
         _wait_for_server(addr)
@@ -204,11 +196,7 @@ class TestDoubleShutdown:
 
     def test_server_double_shutdown(self):
         addr = _next_addr()
-        ipc_overrides = {
-            'pool_segment_size': 65536,
-            'max_pool_segments': 1,
-        }
-        server = local_server(addr, ipc_overrides=ipc_overrides)
+        server = local_server(addr, memory_budget_bytes=64 * 1024**2)
         server.register_crm(IEcho, EchoImpl(), name='echo')
         server.start()
         _wait_for_server(addr)
@@ -223,10 +211,7 @@ class TestSOTAAPIConcurrency:
 
     def test_concurrent_connect_close_cycles(self):
         """Multiple threads rapidly connect/use/close the same CRM."""
-        cc.set_server(ipc_overrides={
-            'pool_segment_size': 1 << 20,
-            'max_pool_segments': 2,
-        })
+        cc.set_server(memory_budget_bytes=64 * 1024**2)
         cc.register(IEcho, EchoImpl(), name='echo_conc')
 
         try:

@@ -1,7 +1,7 @@
-"""Benchmark: chunked streaming transfer vs normal single-frame transfer.
+"""Benchmark: IPC echo latency under a role memory budget.
 
 Compares latency and throughput across payload sizes from 4 KB to 1 GB,
-covering both the normal path and the chunked path.
+using Core-managed SHM and message fragmentation.
 
 Usage:
     uv run python sdk/python/benchmarks/chunked_benchmark.py [--max-mb 512]
@@ -42,7 +42,8 @@ class BenchChunkImpl:
 # Constants
 # ---------------------------------------------------------------------------
 
-SEGMENT_SIZE = 256 * 1024 * 1024  # 256 MB (default IPCConfig)
+KIB = 1024
+MIB = KIB * KIB
 
 
 def bench_one(
@@ -88,14 +89,10 @@ def main() -> None:
 
     _reset_default_runtime()
 
-    cc.set_server(ipc_overrides={
-        'pool_segment_size': SEGMENT_SIZE,
-        'max_pool_segments': 4,
-    })
-    cc.set_client(ipc_overrides={
-        'pool_segment_size': SEGMENT_SIZE,
-        'max_pool_segments': 4,
-    })
+    # Leave room for both input serialization and its backing.
+    memory_budget = max(64 * MIB, 3 * args.max_mb * MIB)
+    cc.set_server(memory_budget_bytes=memory_budget)
+    cc.set_client(memory_budget_bytes=memory_budget)
     cc.register(BenchChunk, BenchChunkImpl(), name='bench')
     address = cc.server_address()
 
@@ -111,36 +108,16 @@ def main() -> None:
     max_kb = args.max_mb * 1024
     sizes_kb = [s for s in sizes_kb if s <= max_kb]
 
-    # Add boundary sizes around the chunk threshold.
-    seg_size = SEGMENT_SIZE
-    threshold = int(seg_size * 0.9)
-    chunk_size = seg_size // 2
-    boundary_kb = [
-        threshold // 1024 - 1,   # just below threshold
-        threshold // 1024 + 1,   # just above threshold (single extra chunk)
-        seg_size // 1024,        # exactly 1 segment
-        seg_size // 1024 * 2,    # 2 segments worth
-    ]
-    for bk in boundary_kb:
-        if bk > 0 and bk <= max_kb and bk not in sizes_kb:
-            sizes_kb.append(bk)
-    sizes_kb.sort()
-
-    # Header
-    print()
-    print(f'  pool_segment_size : {seg_size:>12,} bytes ({seg_size // (1024*1024)} MB)')
-    print(f'  chunk_threshold   : {threshold:>12,} bytes')
-    print(f'  chunk_size        : {chunk_size:>12,} bytes ({chunk_size // (1024*1024)} MB)')
-    print()
-    header = f'{"Payload":>12}  {"Mode":>8}  {"Min(ms)":>10}  {"Median(ms)":>10}  {"Max(ms)":>10}  {"Throughput":>14}'
+    sizes_kb = sorted(set(sizes_kb) | {size for size in (16, 17, 128, 129, max_kb)
+                                     if 0 < size <= max_kb})
+    print(f'  Memory budget per role: {memory_budget:,} bytes')
+    header = f'{"Payload":>12}  {"Min(ms)":>10}  {"Median(ms)":>10}  {"Max(ms)":>10}  {"Throughput":>14}'
     print(header)
     print('-' * len(header))
 
     results = []
     for size_kb in sizes_kb:
         payload_bytes = size_kb * 1024
-        is_chunked = payload_bytes > threshold
-        mode = 'chunked' if is_chunked else 'normal'
 
         # Fewer repeats for very large payloads.
         repeats = 3 if payload_bytes >= 256 * 1024 * 1024 else 5
@@ -156,7 +133,7 @@ def main() -> None:
         tp_str = f'{stats["throughput_mbps"]:.1f} MB/s'
 
         print(
-            f'{size_str:>12}  {mode:>8}  '
+            f'{size_str:>12}  '
             f'{stats["min_ms"]:>10.2f}  {stats["median_ms"]:>10.2f}  '
             f'{stats["max_ms"]:>10.2f}  {tp_str:>14}'
         )

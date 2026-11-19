@@ -28,7 +28,7 @@ let nodeConnector;
 let nodeConnectorClosed = false;
 
 function localIpcOptions(responsePayloadAllocator) {
-  nodeConnector ??= createNodeIpcConnector({requestChunkSize: 64 * 1024});
+  nodeConnector ??= createNodeIpcConnector();
   return {
     connect: nodeConnector,
     responsePayloadAllocator,

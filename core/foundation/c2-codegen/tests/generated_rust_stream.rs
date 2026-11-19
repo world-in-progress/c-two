@@ -78,7 +78,7 @@ use std::sync::{Arc, Mutex};
 use fastdb::{BuildPolicy, Builder, CompiledSpec, Payload, View};
 
 #[path = "../generated/rust/c_two_contract.rs"]
-mod contract;
+pub mod contract;
 
 const SPEC: &[u8] = br#"{
   "schema": "fastdb.payload.v1",
@@ -165,11 +165,10 @@ impl contract::Service for Resource {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let runtime = c_two::Runtime::new(c_two::RuntimeOptions {
-        server_id: Some(format!("generated-stream-{}", std::process::id())),
         use_process_relay_anchor: false,
         ..c_two::RuntimeOptions::default()
     })?;
-    let host = runtime.host(c_two::HostOptions::default().without_relay())?;
+    let host = runtime.host(c_two::HostOptions::default().without_relay().with_server_id(format!("generated-stream-{}", std::process::id())))?;
     let route = format!("generated-stream-route-{}", std::process::id());
     let escaped_inputs = Arc::new(Mutex::new(Vec::new()));
     let mut registration = host.register(contract::service_definition(

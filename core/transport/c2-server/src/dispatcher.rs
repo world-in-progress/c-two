@@ -108,15 +108,26 @@ impl PreparedShmResponse {
         &mut self,
         write_into: impl FnOnce(&mut [u8]) -> Result<(), String>,
     ) -> Result<(), String> {
-        let pool = self.pool.read();
-        let handle = self.handle.as_mut().expect("live prepared owner");
-        write_into(pool.handle_slice_mut(handle))
+        // Pin the mapping without holding a pool guard: the pin owns the
+        // mapping Arc, so an external `write_range` callback can no longer
+        // block pool writes (for example a RELEASE recycling a block).
+        let mut pin = {
+            let pool = self.pool.read();
+            let handle = self.handle.as_mut().expect("live prepared owner");
+            pool.pin_shm_mut(handle)
+                .map_err(|error| format!("prepared response pin failed: {error}"))?
+        };
+        write_into(pin.as_mut_slice())
     }
 
     pub(crate) fn copy_logical_bytes(&self) -> Result<Vec<u8>, String> {
-        let pool = self.pool.read();
-        let handle = self.handle.as_ref().expect("live prepared owner");
-        Ok(pool.handle_slice(handle)[..self.data_size as usize].to_vec())
+        let pin = {
+            let pool = self.pool.read();
+            let handle = self.handle.as_ref().expect("live prepared owner");
+            pool.pin_shm_ref(handle)
+                .map_err(|error| format!("prepared response pin failed: {error}"))?
+        };
+        Ok(pin.as_slice()[..self.data_size as usize].to_vec())
     }
 
     pub(crate) fn release(&mut self) {
@@ -176,6 +187,19 @@ impl PeerShmRequest {
             )
             .map_err(|error| error.to_string())?;
         Ok(Self { read, loan })
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.read.len()
+    }
+
+    pub(crate) fn copy_into(self, destination: &mut [u8]) -> Result<(), String> {
+        let Self { read, loan } = self;
+        // SAFETY: the original connection loan keeps the pinned bytes immutable.
+        let result = unsafe { read.copy_into(destination) };
+        drop(read);
+        loan.finish();
+        result
     }
 
     /// Copy the request bytes out of the peer's published block.
@@ -624,7 +648,6 @@ mod tests {
     fn request_pool_config() -> PoolConfig {
         PoolConfig {
             segment_size: 64 * 1024,
-            min_block_size: 4096,
             max_segments: 1,
             max_dedicated_segments: 2,
             spill_threshold: 0.8,
@@ -634,9 +657,10 @@ mod tests {
 
     fn request_test_pool() -> MemPool {
         let suffix = REQUEST_POOL_SEQ.fetch_add(1, Ordering::Relaxed);
-        MemPool::new_with_prefix(
+        MemPool::new_with_prefix_and_budget(
             request_pool_config(),
             format!("/c2rq{:08x}{suffix:04x}", std::process::id()),
+            c2_mem::DomainBudget::from_limits(&c2_config::DomainLimits::default()),
         )
         .unwrap()
     }

@@ -16,7 +16,6 @@ const TIMEOUT: Duration = Duration::from_secs(5);
 
 fn runtime() -> Runtime {
     Runtime::new(RuntimeOptions {
-        server_id: Some("same-server".into()),
         use_process_relay_anchor: false,
         ..Default::default()
     })
@@ -39,17 +38,16 @@ fn release() -> ContractRelease {
 fn default_query_preserves_native_name_and_does_not_freeze_any_domain() {
     let runtime = default_runtime();
     let expected = LocalEndpointContext::default_for_platform().unwrap();
-    let address = runtime.ensure_server().unwrap().ipc_address;
-    assert_eq!(address, "ipc://same-server");
+    let address = "ipc://same-server";
     assert_eq!(runtime.local_endpoint_context().unwrap(), expected);
     assert_eq!(
-        runtime.local_endpoint(&address).unwrap(),
-        c2_core::LocalEndpoint::from_address(&address).unwrap()
+        runtime.local_endpoint(address).unwrap(),
+        c2_core::LocalEndpoint::from_address(address).unwrap()
     );
     assert!(!runtime.local_endpoint_frozen());
     assert!(!runtime.client_config_frozen());
-    assert!(runtime.outgoing_memory_stats().is_none());
-    assert!(runtime.outgoing_memory_observer().is_none());
+    assert!(runtime.memory_stats().client.memory.is_none());
+    assert!(runtime.client_domain_observer().is_none());
     let retirement_deadline = std::time::Instant::now() + TIMEOUT;
     let (retirement_outcome, retirement_completed) = runtime
         .begin_session_retirement(
@@ -60,7 +58,7 @@ fn default_query_preserves_native_name_and_does_not_freeze_any_domain() {
         .observe_until(retirement_deadline);
     assert!(retirement_completed, "{retirement_outcome:?}");
     assert!(!runtime.local_endpoint_frozen());
-    assert!(runtime.outgoing_memory_stats().is_none());
+    assert!(runtime.memory_stats().client.memory.is_none());
 }
 
 #[test]
@@ -80,7 +78,7 @@ fn default_context_admin_freeze_and_same_context_noop_are_platform_neutral() {
         .unwrap();
     assert_eq!(runtime.local_endpoint_context().unwrap(), context);
     assert!(!runtime.client_config_frozen());
-    assert!(runtime.outgoing_memory_stats().is_none());
+    assert!(runtime.memory_stats().client.memory.is_none());
 }
 
 #[test]
@@ -132,7 +130,7 @@ fn http_only_runtime_does_not_resolve_invalid_local_root() {
 fn http_only_process_child() {
     let runtime = runtime();
     runtime.ensure_server().unwrap();
-    assert!(runtime.outgoing_memory_stats().is_none());
+    assert!(runtime.memory_stats().client.memory.is_none());
     // An unsupported HTTP URL is rejected without network I/O. The actual
     // ExplicitRelay path still resolves its client settings and control client.
     let error = runtime
@@ -146,7 +144,7 @@ fn http_only_process_child() {
     assert!(!error.to_string().contains("local endpoint"), "{error}");
     assert!(!runtime.local_endpoint_frozen());
     assert!(!runtime.client_config_frozen());
-    assert!(runtime.outgoing_memory_stats().is_none());
+    assert!(runtime.memory_stats().client.memory.is_none());
     assert!(runtime.local_endpoint_context().is_err());
 }
 
@@ -271,11 +269,12 @@ mod unix {
         let runtime = runtime();
         at_root(&runtime, &missing);
         runtime
-            .set_client_ipc_overrides(Some(c2_config::ClientIpcConfigOverrides {
-                pool_enabled: Some(false),
-                shm_backing_budget_bytes: Some(12345),
-                ..Default::default()
-            }))
+            .update_client_config(c2_core::ClientConfigPatch {
+                domain_limits: c2_core::DomainLimitsPatch {
+                    memory_budget_bytes: c2_core::ConfigField::Set(12345),
+                    ..Default::default()
+                },
+            })
             .unwrap();
         let connect = || {
             runtime.connect(
@@ -289,16 +288,16 @@ mod unix {
         assert!(!missing.exists());
         assert!(runtime.local_endpoint_frozen());
         assert!(runtime.client_config_frozen());
-        let observer = runtime.outgoing_memory_observer().unwrap();
-        assert_eq!(observer.limits().shm_backing_budget_bytes, 12345);
+        let observer = runtime.client_domain_observer().unwrap();
+        assert_eq!(observer.snapshot().memory.limit_bytes, 12345);
         assert_eq!(
             runtime.set_local_endpoint(options(&other)),
             Err(LifecycleError::ConfigFrozen)
         );
         at_root(&runtime, &missing.join("."));
         assert!(matches!(
-            runtime.set_client_ipc_overrides(None),
-            Err(LifecycleError::ClientConfigFrozen)
+            runtime.update_client_config(c2_core::ClientConfigPatch::inherit_all()),
+            Err(LifecycleError::ConfigFrozen)
         ));
         let retirement_deadline = std::time::Instant::now() + TIMEOUT;
         let (retirement_outcome, retirement_completed) = runtime
@@ -311,9 +310,12 @@ mod unix {
         assert!(retirement_completed, "{retirement_outcome:?}");
         assert!(connect().is_err());
         assert!(
-            observer
-                .downgrade()
-                .ptr_eq(&runtime.outgoing_memory_observer().unwrap().downgrade())
+            observer.snapshot().domain_id
+                == runtime
+                    .client_domain_observer()
+                    .unwrap()
+                    .snapshot()
+                    .domain_id
         );
         assert_eq!(
             runtime.local_endpoint_context().unwrap().unix_root(),
@@ -383,7 +385,7 @@ mod unix {
             .ping_direct_ipc("ipc://absent", Duration::ZERO)
             .unwrap();
         assert_eq!(runtime.local_endpoint_context().unwrap(), original);
-        assert!(runtime.outgoing_memory_stats().is_none());
+        assert!(runtime.memory_stats().client.memory.is_none());
     }
 
     struct Tagged(u8);
@@ -432,30 +434,18 @@ mod unix {
     }
 
     fn two_domains_and_restart(a: &Path, b: &Path, process_fixture: bool) {
-        let memory_runtime = |live_budget| {
+        let memory_runtime = |memory_budget_bytes| {
             Runtime::new(RuntimeOptions {
-                server_id: Some("same-server".into()),
+                client_limits: c2_core::DomainLimitsOverrides {
+                    memory_budget_bytes: Some(memory_budget_bytes),
+                    ..Default::default()
+                },
                 use_process_relay_anchor: false,
-                shm_threshold: Some(1024),
-                server_ipc_overrides: Some(c2_config::ServerIpcConfigOverrides {
-                    pool_segment_size: Some(64 * 1024),
-                    reassembly_segment_size: Some(64 * 1024),
-                    shm_backing_budget_bytes: Some(0),
-                    file_backing_budget_bytes: Some(0),
-                    chunk_size: Some(8 * 1024),
-                    ..Default::default()
-                }),
-                client_ipc_overrides: Some(c2_config::ClientIpcConfigOverrides {
-                    pool_segment_size: Some(64 * 1024),
-                    reassembly_segment_size: Some(64 * 1024),
-                    shm_backing_budget_bytes: Some(1024 * 1024),
-                    live_reassembly_budget_bytes: Some(live_budget),
-                    ..Default::default()
-                }),
                 ..Default::default()
             })
             .unwrap()
         };
+        // Both sizes derive a 64 KiB buddy segment and different role limits.
         let runtime_a = memory_runtime(1024 * 1024);
         let runtime_b = memory_runtime(2 * 1024 * 1024);
         if !process_fixture {
@@ -463,10 +453,18 @@ mod unix {
         }
         at_root(&runtime_b, b);
         let host_a = runtime_a
-            .host(HostOptions::default().without_relay())
+            .host(
+                HostOptions::default()
+                    .with_server_id("same-server")
+                    .without_relay(),
+            )
             .unwrap();
         let host_b = runtime_b
-            .host(HostOptions::default().without_relay())
+            .host(
+                HostOptions::default()
+                    .with_server_id("same-server")
+                    .without_relay(),
+            )
             .unwrap();
         let _route_a = host_a.register(definition(b'A')).unwrap();
         let _route_b = host_b.register(definition(b'B')).unwrap();
@@ -509,19 +507,15 @@ mod unix {
 
         // An explicitly scoped native pool projects the actual handshake
         // identities and retains one cache domain for the same logical address.
-        let pool_a = c2_ipc::ClientPool::with_endpoint_context(
-            TIMEOUT,
-            runtime_a.local_endpoint_context().unwrap(),
-        );
-        let pool_b = c2_ipc::ClientPool::with_endpoint_context(
-            TIMEOUT,
-            runtime_b.local_endpoint_context().unwrap(),
-        );
-        let pooled_a = pool_a.acquire("ipc://same-server", None).unwrap();
-        let pooled_b = pool_b.acquire("ipc://same-server", None).unwrap();
+        let pool_a =
+            c2_ipc::ClientPool::with_endpoint_context(runtime_a.local_endpoint_context().unwrap());
+        let pool_b =
+            c2_ipc::ClientPool::with_endpoint_context(runtime_b.local_endpoint_context().unwrap());
+        let pooled_a = pool_a.acquire("ipc://same-server").unwrap();
+        let pooled_b = pool_b.acquire("ipc://same-server").unwrap();
         assert!(Arc::ptr_eq(
             &pooled_a,
-            &pool_a.acquire("ipc://same-server", None).unwrap()
+            &pool_a.acquire("ipc://same-server").unwrap()
         ));
         assert!(!Arc::ptr_eq(&pooled_a, &pooled_b));
         assert_eq!(
@@ -561,29 +555,20 @@ mod unix {
         assert!(pool_a.close_all(TIMEOUT).error.is_none());
         assert!(pool_b.close_all(TIMEOUT).error.is_none());
 
-        let outgoing_a = runtime_a.outgoing_memory_observer().unwrap();
-        let outgoing_b = runtime_b.outgoing_memory_observer().unwrap();
-        assert_eq!(
-            outgoing_a.limits().live_reassembly_budget_bytes,
-            1024 * 1024
-        );
-        assert_eq!(
-            outgoing_b.limits().live_reassembly_budget_bytes,
-            2 * 1024 * 1024
-        );
+        let outgoing_a = runtime_a.client_domain_observer().unwrap();
+        let outgoing_b = runtime_b.client_domain_observer().unwrap();
+        assert_eq!(outgoing_a.snapshot().memory.limit_bytes, 1024 * 1024);
+        assert_eq!(outgoing_b.snapshot().memory.limit_bytes, 2 * 1024 * 1024);
         let payload = vec![42; 32 * 1024];
         let mut held = client_a.call_held("echo", &payload).unwrap();
         assert_eq!(held.bytes(), [&[b'A'], payload.as_slice()].concat());
-        let copied = outgoing_a.snapshot().reassembly;
-        assert!(
-            copied.peak_bytes >= payload.len() as u64,
-            "the response must use outgoing-domain reassembly"
-        );
-        assert_eq!(
-            copied.used_bytes, 0,
-            "the local hold must not retain reassembly"
-        );
-        assert!(!outgoing_a.downgrade().ptr_eq(&outgoing_b.downgrade()));
+        // One 64 KiB segment remains resident for reuse after releasing the SHM
+        // loan, while the held value independently owns the copied response.
+        let outgoing = outgoing_a.snapshot();
+        assert_eq!(outgoing.memory.used_bytes, 64 * 1024);
+        assert!(outgoing.memory.peak_bytes >= outgoing.memory.used_bytes + payload.len() as u64);
+        assert_eq!(outgoing.file_spill.used_bytes, 0);
+        assert_ne!(outgoing.domain_id, outgoing_b.snapshot().domain_id);
         let endpoint = host_a.local_endpoint().clone();
         let old_identity = runtime_a.ensure_server().unwrap();
 
@@ -617,11 +602,14 @@ mod unix {
         );
         let outcome = host_a.shutdown();
         assert!(outcome.runtime_barrier_error.is_none(), "{outcome:?}");
-        assert_eq!(outgoing_a.snapshot().reassembly.used_bytes, 0);
-        assert!(outgoing_a.snapshot().shm.used_bytes > 0);
+        assert_eq!(outgoing_a.snapshot().memory.used_bytes, 64 * 1024);
         runtime_a.clear_server_identity().unwrap();
         let restarted = runtime_a
-            .host(HostOptions::default().without_relay())
+            .host(
+                HostOptions::default()
+                    .with_server_id("same-server")
+                    .without_relay(),
+            )
             .unwrap();
         let _new_route = restarted.register(definition(b'C')).unwrap();
         assert_eq!(restarted.local_endpoint(), &endpoint);
@@ -634,21 +622,28 @@ mod unix {
             b"Cnew"
         );
         assert_eq!(client_b.call_owned("echo", b"live").unwrap(), b"Blive");
-        assert!(
-            outgoing_a
-                .downgrade()
-                .ptr_eq(&runtime_a.outgoing_memory_observer().unwrap().downgrade())
+        assert_eq!(
+            outgoing_a.snapshot().domain_id,
+            runtime_a
+                .client_domain_observer()
+                .unwrap()
+                .snapshot()
+                .domain_id
         );
-        assert!(
-            outgoing_b
-                .downgrade()
-                .ptr_eq(&runtime_b.outgoing_memory_observer().unwrap().downgrade())
+        assert_eq!(
+            outgoing_b.snapshot().domain_id,
+            runtime_b
+                .client_domain_observer()
+                .unwrap()
+                .snapshot()
+                .domain_id
         );
-        assert_eq!(outgoing_a.snapshot().reassembly.used_bytes, 0);
         assert_eq!(held.bytes(), [&[b'A'], payload.as_slice()].concat());
+        // Reacquisition deactivates the old transport and releases its idle
+        // backing. The already returned local hold still owns its response.
+        assert_eq!(outgoing_a.snapshot().memory.used_bytes, 0);
         held.invalidate_then_release(|| Ok(())).unwrap();
         assert!(held.bytes().is_empty());
-        assert_eq!(outgoing_a.snapshot().reassembly.used_bytes, 0);
         assert!(restarted.shutdown().runtime_barrier_error.is_none());
         assert!(host_b.shutdown().runtime_barrier_error.is_none());
     }

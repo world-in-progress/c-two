@@ -25,10 +25,10 @@ use crate::relay::peer::{PeerEnvelope, PeerMessage};
 use crate::relay::router;
 use crate::relay::state::{RegisterCommitResult, RelayState, UnregisterResult};
 use c2_config::{
-    CallExecutionLimitsOverrides, ConfigResolver, ConfigSources, LocalEndpointContext,
+    ConfigResolver, ConfigSources, DomainLimitsOverrides, EnvCatalog, LocalEndpointContext,
     LocalEndpointOptions, RelayConfig,
 };
-use c2_ipc::{ClientIpcConfig, IpcClient};
+use c2_ipc::IpcClient;
 
 const REGISTER_ATTESTATION_CONNECT_ATTEMPTS: usize = 3;
 const REGISTER_ATTESTATION_RETRY_DELAY: Duration = Duration::from_millis(20);
@@ -175,9 +175,8 @@ pub(super) async fn connect_register_attestation_client(
 ) -> Result<crate::relay::client_lifecycle::ManagedClient, c2_ipc::IpcError> {
     for attempt in 1..=REGISTER_ATTESTATION_CONNECT_ATTEMPTS {
         // Attestation uses private memory accounting and the frozen relay endpoint namespace.
-        let config = ClientIpcConfig::default();
         let endpoint = context.endpoint(address).map_err(c2_ipc::IpcError::Io)?;
-        let mut client = clients.manage(|| IpcClient::with_endpoint(endpoint, config))?;
+        let mut client = clients.manage(|| IpcClient::with_endpoint(endpoint))?;
         match client.connect().await {
             Ok(()) => return Ok(client),
             Err(err)
@@ -192,12 +191,12 @@ pub(super) async fn connect_register_attestation_client(
     unreachable!("register attestation connect loop always returns");
 }
 
-/// Typed startup overrides for the Relay's bounded forwarding domain.
+/// Typed startup overrides for the relay's single role domain. Code
+/// overrides take precedence over the `C2_*` environment and `.env` values
+/// and are frozen with the domain before the listener becomes ready.
 #[derive(Debug, Clone, Default)]
 pub struct RelayServerOptions {
-    /// Code overrides take precedence over C2_CALL_* environment and .env values.
-    /// Zero rejects positive admission; limits are frozen before readiness.
-    pub call_execution: CallExecutionLimitsOverrides,
+    pub domain_limits: DomainLimitsOverrides,
 }
 
 /// Relay server with a synchronous control API.
@@ -223,7 +222,13 @@ impl RelayServer {
 
     /// Observe the frozen forwarding domain without changing admission or owners.
     pub fn call_execution_snapshot(&self) -> c2_mem::RetentionSnapshot {
-        self.state.forwarding.snapshot()
+        self.state.call_execution_snapshot()
+    }
+
+    /// Observe the relay's single shared role domain. Purely read-only: never
+    /// connects, maps, or resets accounting.
+    pub fn domain_snapshot(&self) -> c2_mem::DomainSnapshot {
+        self.state.domain_snapshot()
     }
 
     /// Start the relay server on a background thread.
@@ -235,12 +240,14 @@ impl RelayServer {
         config: RelayConfig,
         options: RelayServerOptions,
     ) -> Result<Self, String> {
-        let context = ConfigResolver::resolve_local_endpoint(
-            LocalEndpointOptions::default(),
-            ConfigSources::from_process(),
-        )
-        .map_err(|error| format!("Invalid relay local endpoint configuration: {error}"))?;
-        Self::start_with_context_and_options(config, context, options)
+        // One catalog per startup resolves the local endpoint and the relay
+        // role domain together; the environment is never re-read afterwards.
+        let catalog = EnvCatalog::load(ConfigSources::from_process())
+            .map_err(|error| format!("Invalid relay environment configuration: {error}"))?;
+        let context =
+            ConfigResolver::resolve_local_endpoint(LocalEndpointOptions::default(), &catalog)
+                .map_err(|error| format!("Invalid relay local endpoint configuration: {error}"))?;
+        Self::start_with_context_catalog_and_options(config, context, &catalog, options)
     }
 
     /// Start with the caller's immutable native endpoint context.
@@ -252,15 +259,50 @@ impl RelayServer {
     }
 
     pub fn start_with_context_and_options(
-        mut config: RelayConfig,
+        config: RelayConfig,
         context: LocalEndpointContext,
         options: RelayServerOptions,
     ) -> Result<Self, String> {
-        let limits = ConfigResolver::resolve_call_execution_limits(
-            options.call_execution,
-            ConfigSources::from_process(),
-        )
-        .map_err(|error| format!("Invalid relay call execution configuration: {error}"))?;
+        let catalog = EnvCatalog::load(ConfigSources::from_process())
+            .map_err(|error| format!("Invalid relay environment configuration: {error}"))?;
+        Self::start_with_context_catalog_and_options(config, context, &catalog, options)
+    }
+
+    fn start_with_context_catalog_and_options(
+        mut config: RelayConfig,
+        context: LocalEndpointContext,
+        catalog: &EnvCatalog,
+        options: RelayServerOptions,
+    ) -> Result<Self, String> {
+        config.domain_limits =
+            ConfigResolver::resolve_domain_limits(&options.domain_limits, catalog)
+                .map_err(|error| format!("Invalid relay domain capacity configuration: {error}"))?;
+        Self::start_resolved(config, context)
+    }
+
+    /// Start with the configuration and endpoint resolved by the caller's catalog.
+    pub fn start_resolved(
+        config: RelayConfig,
+        context: LocalEndpointContext,
+    ) -> Result<Self, String> {
+        Self::start_with_idle_timeout(config, context, c2_config::IDLE_CONNECTION_TIMEOUT)
+    }
+
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn start_with_context_for_test(
+        config: RelayConfig,
+        context: LocalEndpointContext,
+        idle_timeout: Duration,
+    ) -> Result<Self, String> {
+        Self::start_with_idle_timeout(config, context, idle_timeout)
+    }
+
+    fn start_with_idle_timeout(
+        mut config: RelayConfig,
+        context: LocalEndpointContext,
+        idle_timeout: Duration,
+    ) -> Result<Self, String> {
         config
             .validate()
             .map_err(|e| format!("Invalid relay config: {e}"))?;
@@ -276,7 +318,7 @@ impl RelayServer {
             .map_err(|error| format!("Failed to read relay listener address: {error}"))?;
         config.bind = local_addr.to_string();
         let effective_advertise_url = config.effective_advertise_url();
-        if !crate::relay::route_table::valid_relay_url(&effective_advertise_url) {
+        if !crate::valid_relay_url(&effective_advertise_url) {
             return Err(format!(
                 "Invalid relay advertise_url '{}': must be an http(s) URL with a host",
                 effective_advertise_url
@@ -286,21 +328,22 @@ impl RelayServer {
             .set_nonblocking(true)
             .map_err(|error| format!("Failed to make relay listener nonblocking: {error}"))?;
 
+        let domain_budget = c2_mem::DomainBudget::from_limits(&config.domain_limits);
         let config = Arc::new(config);
         let disseminator: Arc<dyn crate::relay::disseminator::Disseminator> = Arc::new(
             crate::relay::disseminator::FullBroadcast::with_proxy_policy(config.use_proxy),
         );
-        let state = Arc::new(RelayState::new_with_execution_limits(
+        let state = Arc::new(RelayState::new_with_budget(
             config.clone(),
             disseminator,
             context,
-            limits,
+            domain_budget,
+            idle_timeout,
         ));
 
         let (cmd_tx, cmd_rx) = mpsc::channel::<Command>(64);
         let (ready_tx, ready_rx) = oneshot::channel::<Result<(), String>>();
 
-        let idle_timeout_secs = config.idle_timeout_secs;
         let server_state = state.clone();
         let cancel = CancellationToken::new();
         let cancel_clone = cancel.clone();
@@ -319,8 +362,8 @@ impl RelayServer {
                         server_state,
                         cmd_rx,
                         ready_tx,
-                        idle_timeout_secs,
                         cancel_clone,
+                        idle_timeout,
                     )
                     .await;
                 });
@@ -424,8 +467,8 @@ impl RelayServer {
         state: Arc<RelayState>,
         mut cmd_rx: mpsc::Receiver<Command>,
         ready_tx: oneshot::Sender<Result<(), String>>,
-        idle_timeout_secs: u64,
         cancel: CancellationToken,
+        idle_timeout: Duration,
     ) {
         let app = router::build_router(state.clone());
 
@@ -454,7 +497,7 @@ impl RelayServer {
             let _ = http_stopped.await;
         });
         let mut server = tokio::spawn(std::future::IntoFuture::into_future(server));
-        let sweeper = Self::idle_sweeper(state.clone(), idle_timeout_secs);
+        let sweeper = Self::idle_sweeper(state.clone(), idle_timeout);
 
         let http_finished = tokio::select! {
             _ = &mut server => true,
@@ -496,23 +539,13 @@ impl RelayServer {
         let _ = client_observer.await;
     }
 
-    /// Periodically evict upstream connections that have been idle
-    /// longer than `idle_timeout_secs`.
-    async fn idle_sweeper(state: Arc<RelayState>, idle_timeout_secs: u64) {
-        // When idle_timeout is 0, still sweep for dead connections every 30s.
-        let check_interval = if idle_timeout_secs == 0 {
-            30
-        } else {
-            std::cmp::max(idle_timeout_secs / 10, 5)
-        };
-        let mut interval = tokio::time::interval(Duration::from_secs(check_interval));
-        // idle_timeout_ms = u64::MAX means time-based eviction never fires,
-        // but is_connected() checks still catch dead connections.
-        let idle_timeout_ms = if idle_timeout_secs == 0 {
-            u64::MAX
-        } else {
-            idle_timeout_secs * 1000
-        };
+    /// Periodically evict upstream connections that have been idle longer
+    /// than the shared idle timeout. Tests may pass a shorter duration.
+    pub(crate) async fn idle_sweeper(state: Arc<RelayState>, idle_timeout: Duration) {
+        let check_interval =
+            std::cmp::max(idle_timeout / 10, Duration::from_secs(5)).max(Duration::from_secs(1));
+        let mut interval = tokio::time::interval(check_interval);
+        let idle_timeout_ms = idle_timeout.as_millis().min(u128::from(u64::MAX)) as u64;
 
         loop {
             interval.tick().await;
@@ -893,7 +926,7 @@ mod tests {
         start_live_server_with_identity_and_contracts, start_live_server_with_routes,
     };
     use crate::relay::types::PeerSnapshot;
-    use c2_ipc::{ClientIpcConfig, IpcClient};
+    use c2_ipc::IpcClient;
 
     static NEXT_IPC_SUFFIX: AtomicU64 = AtomicU64::new(0);
 
@@ -988,6 +1021,38 @@ mod tests {
             format!("http://{address}")
         );
         assert_healthy(address);
+        relay.stop().unwrap();
+    }
+
+    #[test]
+    fn resolved_startup_uses_the_callers_endpoint_and_domain_limits() {
+        let (_root, context) = port_test_context();
+        let namespace = context.namespace_id().to_owned();
+        let limits = c2_config::DomainLimits {
+            memory_budget_bytes: 4096,
+            file_spill_budget_bytes: 8192,
+            max_outstanding_calls: 3,
+        };
+        let mut relay = RelayServer::start_resolved(
+            RelayConfig {
+                bind: "127.0.0.1:0".into(),
+                domain_limits: limits.clone(),
+                ..Default::default()
+            },
+            context,
+        )
+        .unwrap();
+        assert_eq!(relay.state.endpoint_context().namespace_id(), namespace);
+        let domain = relay.domain_snapshot();
+        assert_eq!(domain.memory.limit_bytes, limits.memory_budget_bytes);
+        assert_eq!(
+            domain.file_spill.limit_bytes,
+            limits.file_spill_budget_bytes
+        );
+        assert_eq!(
+            domain.operations.max_operations,
+            limits.max_outstanding_calls
+        );
         relay.stop().unwrap();
     }
 
@@ -1265,27 +1330,6 @@ mod tests {
             .shutdown_and_wait(std::time::Duration::from_secs(5))
             .await;
         let _ = server_task.await;
-    }
-
-    #[test]
-    fn relay_start_rejects_idle_timeout_millisecond_overflow() {
-        let config = RelayConfig {
-            bind: "127.0.0.1:0".to_string(),
-            idle_timeout_secs: u64::MAX,
-            ..RelayConfig::default()
-        };
-
-        let err = match RelayServer::start(config) {
-            Ok(mut server) => {
-                let _ = server.stop();
-                panic!("invalid relay config should fail");
-            }
-            Err(err) => err,
-        };
-
-        assert!(err.contains("Invalid relay config"));
-        assert!(err.contains("idle_timeout_secs"));
-        assert!(err.contains("milliseconds"));
     }
 
     #[test]
@@ -1789,7 +1833,6 @@ mod tests {
         let state = Arc::new(RelayState::new_with_context(
             Arc::new(RelayConfig {
                 relay_id: id.clone(),
-                idle_timeout_secs: 1,
                 ..RelayConfig::default()
             }),
             Arc::new(NoopDisseminator),
@@ -1799,7 +1842,7 @@ mod tests {
         let mut observer = tokio::spawn(async move { clients.run().await });
         let sweeper_state = state.clone();
         let mut sweeper = tokio::spawn(async move {
-            RelayServer::idle_sweeper(sweeper_state, 1).await;
+            RelayServer::idle_sweeper(sweeper_state, Duration::from_secs(1)).await;
         });
 
         let body = std::panic::AssertUnwindSafe(async {
@@ -1814,11 +1857,8 @@ mod tests {
             // The first route is attested and committed before the data-plane
             // connection is acquired. Registering builder afterward must use
             // that same endpoint connection and acquire its newly published route.
-            let mut attestor = IpcClient::with_endpoint(
-                endpoint_context.endpoint(&address).unwrap(),
-                ClientIpcConfig::default(),
-            )
-            .unwrap();
+            let mut attestor =
+                IpcClient::with_endpoint(endpoint_context.endpoint(&address).unwrap()).unwrap();
             attestor.connect().await.unwrap();
             let manager_contract = attestor.route_contract("manager").unwrap();
             let manager_binding = attestor

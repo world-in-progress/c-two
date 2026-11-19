@@ -2,7 +2,8 @@ use super::*;
 use crate::flags::{FLAG_CTRL, FLAG_RESPONSE, FLAG_RPC_RECORD};
 use crate::frame::decode_frame;
 use crate::release::{ReleaseBatch, encode_release_frame};
-use c2_mem::{MemoryBudget, config::PoolConfig};
+use c2_config::DomainLimits;
+use c2_mem::{DomainBudget, config::PoolConfig};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 fn established(side: ConnectionSide) -> ConnectionCore {
@@ -132,11 +133,15 @@ fn stream_registration_requires_handshake_and_live_admission() {
 
 // File-backed move-only handles let the control-plane algorithm exercise real
 // allocation ownership without requiring OS SHM. SHM integration is separate.
-fn allocation() -> (Arc<RwLock<MemPool>>, MemoryBudget, MemHandle) {
-    let budget = MemoryBudget::new(0, 4096, 0);
+fn allocation() -> (Arc<RwLock<MemPool>>, DomainBudget, MemHandle) {
+    let budget = DomainBudget::from_limits(&DomainLimits {
+        memory_budget_bytes: 0,
+        file_spill_budget_bytes: 4096,
+        max_outstanding_calls: 0,
+    });
     let mut pool = MemPool::new_with_prefix_and_budget(
         PoolConfig {
-            buddy_enabled: false,
+            pool_enabled: false,
             min_retained_segments: 0,
             max_segments: 0,
             max_dedicated_segments: 0,
@@ -156,7 +161,7 @@ fn receive(core: &ConnectionCore, ids: &[u64], response: bool) -> ReleaseOutcome
     core.receive_release(&header, payload)
 }
 
-fn published(core: &ConnectionCore) -> (u64, MemoryBudget, WriteBatch) {
+fn published(core: &ConnectionCore) -> (u64, DomainBudget, WriteBatch) {
     let (pool, budget, handle) = allocation();
     let loan = core.prepare_loan(pool, handle).unwrap();
     let id = loan.id();
@@ -174,12 +179,12 @@ fn publication_fast_release_and_write_completion_settle_once() {
     let (id, budget, mut write) = published(&core);
     let outcome = receive(&core, &[id], true);
     assert!(outcome.error.is_none());
-    assert_eq!(budget.snapshot().file.used_bytes, 512);
+    assert_eq!(budget.snapshot().file_spill.used_bytes, 512);
     outcome.reclaims.release();
-    assert_eq!(budget.snapshot().file.used_bytes, 0);
+    assert_eq!(budget.snapshot().file_spill.used_bytes, 0);
     write.frame_completed();
     write.flush_completed();
-    assert_eq!(budget.snapshot().file.used_bytes, 0);
+    assert_eq!(budget.snapshot().file_spill.used_bytes, 0);
 }
 
 #[test]
@@ -192,7 +197,7 @@ fn cancellation_before_first_write_releases_the_prepared_owner() {
         .unwrap()
         .unwrap();
     drop(write);
-    assert_eq!(budget.snapshot().file.used_bytes, 0);
+    assert_eq!(budget.snapshot().file_spill.used_bytes, 0);
     assert!(!core.is_deactivated());
 }
 
@@ -204,12 +209,12 @@ fn flush_failure_after_complete_frame_retains_until_peer_end() {
     write.write_failed();
     drop(write);
     assert!(core.is_deactivated());
-    assert_eq!(budget.snapshot().file.used_bytes, 512);
+    assert_eq!(budget.snapshot().file_spill.used_bytes, 512);
     let reclaims = core.peer_end();
     assert!(!core.try_close());
     reclaims.release();
     assert!(core.try_close());
-    assert_eq!(budget.snapshot().file.used_bytes, 0);
+    assert_eq!(budget.snapshot().file_spill.used_bytes, 0);
 }
 
 #[test]
@@ -266,16 +271,16 @@ fn zero_unknown_duplicate_unpublished_and_cross_connection_ids_deactivate() {
         );
         assert!(core.is_deactivated());
         outcome.reclaims.release();
-        assert_eq!(pending_budget.snapshot().file.used_bytes, 0);
+        assert_eq!(pending_budget.snapshot().file_spill.used_bytes, 0);
         assert_eq!(
-            budget.snapshot().file.used_bytes,
+            budget.snapshot().file_spill.used_bytes,
             if invalid == "duplicate" { 0 } else { 512 }
         );
-        assert_eq!(other_budget.snapshot().file.used_bytes, 512);
+        assert_eq!(other_budget.snapshot().file_spill.used_bytes, 512);
         core.peer_end().release();
         other.peer_end().release();
-        assert_eq!(budget.snapshot().file.used_bytes, 0);
-        assert_eq!(other_budget.snapshot().file.used_bytes, 0);
+        assert_eq!(budget.snapshot().file_spill.used_bytes, 0);
+        assert_eq!(other_budget.snapshot().file_spill.used_bytes, 0);
         drop(pending);
     }
 }
@@ -305,7 +310,7 @@ fn malformed_release_deactivates_without_settling_published_loans() {
         ));
         outcome.reclaims.release();
         assert!(core.is_deactivated());
-        assert_eq!(budget.snapshot().file.used_bytes, 512, "{malformed}");
+        assert_eq!(budget.snapshot().file_spill.used_bytes, 512, "{malformed}");
         core.peer_end().release();
     }
 }
@@ -321,7 +326,7 @@ fn process_sequence_is_unique_across_connections_and_both_directions() {
             assert!(ids.insert(loan.id()));
             assert_ne!(loan.id(), 0);
             drop(loan);
-            assert_eq!(budget.snapshot().file.used_bytes, 0);
+            assert_eq!(budget.snapshot().file_spill.used_bytes, 0);
         }
     }
 }
@@ -348,11 +353,11 @@ fn sequence_exhaustion_issues_last_u64_then_stops_without_wrapping() {
         Err(ConnectionError::LoanIdExhausted)
     ));
     assert_eq!(sequence.load(Ordering::Relaxed), u64::MAX);
-    assert_eq!(rejected.snapshot().file.used_bytes, 0);
+    assert_eq!(rejected.snapshot().file_spill.used_bytes, 0);
     assert!(core.is_deactivated());
-    assert_eq!(retained.snapshot().file.used_bytes, 512);
+    assert_eq!(retained.snapshot().file_spill.used_bytes, 512);
     receive(&core, &[u64::MAX], true).reclaims.release();
-    assert_eq!(retained.snapshot().file.used_bytes, 0);
+    assert_eq!(retained.snapshot().file_spill.used_bytes, 0);
 }
 
 #[test]
@@ -368,7 +373,7 @@ fn deactivation_between_reservation_and_io_revokes_unpublished_owner() {
     assert!(!core.try_close()); // actual allocator release has not completed
     assert_eq!(write.begin_io(), Err(ConnectionError::Deactivated));
     reclaims.release();
-    assert_eq!(budget.snapshot().file.used_bytes, 0);
+    assert_eq!(budget.snapshot().file_spill.used_bytes, 0);
     assert!(!core.try_close());
     drop(write);
     assert!(core.try_close());
@@ -377,7 +382,7 @@ fn deactivation_between_reservation_and_io_revokes_unpublished_owner() {
         core.prepare_loan(pool, handle),
         Err(ConnectionError::Closed)
     ));
-    assert_eq!(rejected.snapshot().file.used_bytes, 0);
+    assert_eq!(rejected.snapshot().file_spill.used_bytes, 0);
 }
 
 #[test]
@@ -389,7 +394,7 @@ fn partial_write_cancellation_keeps_loans_and_never_replays_release_prefix() {
     write.frame_completed(); // prefix complete; business frame may be partial
     drop(write);
     assert!(core.is_deactivated());
-    assert_eq!(budget.snapshot().file.used_bytes, 512);
+    assert_eq!(budget.snapshot().file_spill.used_bytes, 512);
     assert!(matches!(
         core.begin_write(WriteRequest::Releases),
         Err(ConnectionError::WriterBroken)
@@ -397,7 +402,7 @@ fn partial_write_cancellation_keeps_loans_and_never_replays_release_prefix() {
     let outcome = receive(&core, &[id], true);
     assert!(outcome.error.is_none());
     outcome.reclaims.release();
-    assert_eq!(budget.snapshot().file.used_bytes, 0);
+    assert_eq!(budget.snapshot().file_spill.used_bytes, 0);
     assert!(core.try_close());
 }
 
@@ -549,7 +554,7 @@ fn peer_end_reclaims_l_but_close_waits_for_actual_remote_read_guard() {
         )
         .unwrap();
     core.peer_end().release();
-    assert_eq!(budget.snapshot().file.used_bytes, 0);
+    assert_eq!(budget.snapshot().file_spill.used_bytes, 0);
     assert!(!core.try_close());
     node.finish();
     assert_eq!(ended.load(Ordering::SeqCst), 1);
@@ -585,7 +590,7 @@ fn peer_end_before_first_write_fences_publication() {
     core.peer_end().release();
     assert_eq!(write.begin_io(), Err(ConnectionError::PeerEnded));
     drop(write);
-    assert_eq!(budget.snapshot().file.used_bytes, 0);
+    assert_eq!(budget.snapshot().file_spill.used_bytes, 0);
 }
 
 #[test]
@@ -616,10 +621,10 @@ fn release_reclaims_do_not_take_pool_lock_in_the_receive_state_machine() {
     worker.join().unwrap();
     let outcome = received_while_pool_busy.expect("receive waited for an allocator lock");
     assert!(outcome.error.is_none());
-    assert_eq!(budget.snapshot().file.used_bytes, 512);
+    assert_eq!(budget.snapshot().file_spill.used_bytes, 512);
     outcome.reclaims.release();
     assert!(core.try_close());
-    assert_eq!(budget.snapshot().file.used_bytes, 0);
+    assert_eq!(budget.snapshot().file_spill.used_bytes, 0);
 }
 
 #[test]
@@ -644,7 +649,7 @@ fn release_write_completion_and_peer_end_race_without_double_reclaim() {
     write.flush_completed();
     receiver.join().unwrap();
     end.join().unwrap();
-    assert_eq!(budget.snapshot().file.used_bytes, 0);
+    assert_eq!(budget.snapshot().file_spill.used_bytes, 0);
     assert!(core.try_close());
 }
 
@@ -740,10 +745,10 @@ fn invalid_id_mid_batch_keeps_prior_settlement_and_leaves_later_loan_live() {
         Some(ConnectionError::ProtocolViolation(_))
     ));
     outcome.reclaims.release();
-    assert_eq!(first_budget.snapshot().file.used_bytes, 0);
-    assert_eq!(second_budget.snapshot().file.used_bytes, 512);
+    assert_eq!(first_budget.snapshot().file_spill.used_bytes, 0);
+    assert_eq!(second_budget.snapshot().file_spill.used_bytes, 512);
     core.peer_end().release();
-    assert_eq!(second_budget.snapshot().file.used_bytes, 0);
+    assert_eq!(second_budget.snapshot().file_spill.used_bytes, 0);
 }
 
 #[test]
@@ -779,9 +784,9 @@ fn exhausted_queue_reservation_deactivates_before_accepting_another_read() {
     core.shared.state.lock().inflight_releases = 0;
     assert!(core.is_deactivated());
     assert_eq!(core.shared.state.lock().remote_reads, 0);
-    assert_eq!(budget.snapshot().file.used_bytes, 512);
+    assert_eq!(budget.snapshot().file_spill.used_bytes, 512);
     receive(&core, &[id], true).reclaims.release();
-    assert_eq!(budget.snapshot().file.used_bytes, 0);
+    assert_eq!(budget.snapshot().file_spill.used_bytes, 0);
 }
 
 #[test]
@@ -792,7 +797,7 @@ fn handshake_fence_and_zero_remote_id_stop_admission() {
         core.prepare_loan(pool, handle),
         Err(ConnectionError::BeforeHandshake)
     ));
-    assert_eq!(budget.snapshot().file.used_bytes, 0);
+    assert_eq!(budget.snapshot().file_spill.used_bytes, 0);
     core.finish_handshake().unwrap();
     assert!(matches!(
         core.admit_remote_loan(0, Box::new(())),
@@ -807,12 +812,15 @@ fn handshake_fence_and_zero_remote_id_stop_admission() {
     assert!(other.is_deactivated());
 }
 
-fn shm_allocation() -> (Arc<RwLock<MemPool>>, MemoryBudget, MemHandle) {
-    let budget = MemoryBudget::new(64 * 1024, 0, 0);
+fn shm_allocation() -> (Arc<RwLock<MemPool>>, DomainBudget, MemHandle) {
+    let budget = DomainBudget::from_limits(&DomainLimits {
+        memory_budget_bytes: 1 << 20,
+        file_spill_budget_bytes: 0,
+        max_outstanding_calls: 0,
+    });
     let mut pool = MemPool::new_with_prefix_and_budget(
         PoolConfig {
             segment_size: 64 * 1024,
-            min_block_size: 4096,
             max_segments: 1,
             min_retained_segments: 0,
             max_dedicated_segments: 0,
@@ -874,9 +882,9 @@ fn final_core_drop_does_not_free_unconfirmed_shm_from_a_live_original_pool() {
     write.flush_completed();
     drop(core); // no release record or peer-end proof
     assert_eq!(pool.read().stats().alloc_count, 1);
-    assert_eq!(budget.snapshot().shm.used_bytes, 64 * 1024);
+    assert_eq!(budget.snapshot().memory.used_bytes, 64 * 1024);
     drop(pool); // actual pool teardown is allowed to end the retained backing
-    assert_eq!(budget.snapshot().shm.used_bytes, 0);
+    assert_eq!(budget.snapshot().memory.used_bytes, 0);
 }
 
 #[test]
@@ -921,9 +929,9 @@ fn review_cancellation_during_flush_keeps_uncertain_loan_and_deactivates() {
     write.frame_completed();
     drop(write); // cancelled before the final flush outcome is known
     assert!(core.is_deactivated());
-    assert_eq!(budget.snapshot().file.used_bytes, 512);
+    assert_eq!(budget.snapshot().file_spill.used_bytes, 512);
     core.peer_end().release();
-    assert_eq!(budget.snapshot().file.used_bytes, 0);
+    assert_eq!(budget.snapshot().file_spill.used_bytes, 0);
 }
 
 #[test]
@@ -1002,7 +1010,7 @@ fn deadline_deactivation_keeps_the_whole_started_batch_until_flush() {
     assert_eq!(write.frame_count(), 2);
     core.deactivate().release(); // the driver records a caller timeout
     receive(&core, &[id], false).reclaims.release();
-    assert_eq!(budget.snapshot().file.used_bytes, 0);
+    assert_eq!(budget.snapshot().file_spill.used_bytes, 0);
     for _ in 0..2 {
         let control = core.prepare_control_frame().unwrap();
         assert!(matches!(
@@ -1050,13 +1058,13 @@ fn failed_batch_blocks_all_later_frames_but_still_settles_loans() {
             core.prepare_control_frame(),
             Err(ConnectionError::WriterBroken)
         ));
-        assert_eq!(budget.snapshot().file.used_bytes, 512);
+        assert_eq!(budget.snapshot().file_spill.used_bytes, 512);
         if peer_end {
             core.peer_end().release();
         } else {
             receive(&core, &[id], false).reclaims.release();
         }
-        assert_eq!(budget.snapshot().file.used_bytes, 0);
+        assert_eq!(budget.snapshot().file_spill.used_bytes, 0);
         assert!(core.try_close());
     }
 }

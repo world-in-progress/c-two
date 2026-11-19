@@ -1,13 +1,16 @@
 use super::*;
+use crate::tests::download_slice;
+use crate::tests::memory_budget;
 use c2_config::LocalEndpointContext;
 use c2_contract::ValidatedContractDescriptor;
-use c2_mem::retention::PayloadBufferBudget;
 use c2_server::{
     ConcurrencyMode, CrmCallback, CrmError, CrmStream, CrmStreamCallback, CrmStreamItem,
     ResponseMeta, ResponsePool, RouteBuildSpec, SchedulerLimits, Server, ServerIpcConfig,
 };
 use futures_util::FutureExt;
 use std::time::Duration;
+
+const ITEM_SIZE: usize = 32 * 1024;
 
 const WAIT: Duration = Duration::from_secs(5);
 
@@ -40,7 +43,7 @@ impl CrmStream for Items {
         if std::mem::replace(&mut self.0, true) {
             Ok(None)
         } else {
-            Ok(Some(Box::new(vec![7_u8; 64])))
+            Ok(Some(Box::new(vec![7_u8; ITEM_SIZE])))
         }
     }
     fn finish(self: Box<Self>) -> Result<(), CrmError> {
@@ -91,7 +94,6 @@ impl Harness {
             Server::new_with_endpoint(
                 endpoint.clone(),
                 ServerIpcConfig {
-                    shm_threshold: 1,
                     ..Default::default()
                 },
             )
@@ -123,7 +125,7 @@ impl Harness {
             async move { server.run().await.unwrap() }
         });
         server.wait_until_ready(WAIT).await.unwrap();
-        let mut client = IpcClient::with_endpoint(endpoint, ClientIpcConfig::default()).unwrap();
+        let mut client = IpcClient::with_endpoint(endpoint).unwrap();
         client.connect().await.unwrap();
         let binding = client.acquire_route(&expected).await.unwrap();
         Self {
@@ -135,7 +137,7 @@ impl Harness {
         }
     }
     async fn stream(&self) -> IpcForwardStream {
-        let budget = PayloadBufferBudget::new(1);
+        let budget = memory_budget(1);
         let mut stream = self
             .client
             .forward_stream_bound_sized_phased(
@@ -143,13 +145,13 @@ impl Harness {
                 "echo",
                 0,
                 futures_util::stream::empty::<Result<Vec<u8>, std::io::Error>>(),
-                budget.try_reserve(1).unwrap(),
+                budget.try_reserve_memory(1).unwrap(),
             )
             .await
             .unwrap();
         assert!(matches!(
             stream.next_record().await.unwrap(),
-            ForwardRecord::ItemBegin { total_bytes: 64 }
+            ForwardRecord::ItemBegin { total_bytes } if total_bytes == ITEM_SIZE as u64
         ));
         stream
     }
@@ -231,8 +233,8 @@ async fn consumer_cancel_between_shm_ready_and_copy_preparation_is_a_call_error(
     let harness = Harness::start().await;
     let mut response = harness.stream().await;
     let call = response.call.clone();
-    let budget = PayloadBufferBudget::new(8);
-    let mut read = Box::pin(response.read_chunk(budget.try_reserve(8).unwrap(), 8));
+    let budget = memory_budget(8);
+    let mut read = Box::pin(response.read_chunk(download_slice(&budget, 8), 8));
     assert!(read.as_mut().now_or_never().is_none());
     tokio::time::timeout(WAIT, async {
         loop {
@@ -249,7 +251,7 @@ async fn consumer_cancel_between_shm_ready_and_copy_preparation_is_a_call_error(
     .unwrap();
     call.cancel(rpc::CancelCause::Consumer).unwrap();
     assert!(read.await.is_err());
-    assert_eq!(budget.snapshot().used_bytes, 0);
+    assert_eq!(budget.snapshot().memory.used_bytes, 0);
     tokio::time::timeout(WAIT, response.completion())
         .await
         .unwrap()
@@ -261,9 +263,9 @@ async fn consumer_cancel_between_shm_ready_and_copy_preparation_is_a_call_error(
 async fn terminal_during_owned_copy(consumer_first: bool) {
     let harness = Harness::start().await;
     let mut response = harness.stream().await;
-    let budget = PayloadBufferBudget::new(8);
+    let budget = memory_budget(8);
     let first = response
-        .read_chunk(budget.try_reserve(8).unwrap(), 8)
+        .read_chunk(download_slice(&budget, 8), 8)
         .await
         .unwrap()
         .unwrap();
@@ -273,7 +275,7 @@ async fn terminal_during_owned_copy(consumer_first: bool) {
     let step = {
         let mut state = call.state.lock();
         let step = call
-            .prepare_copy_locked(&mut state, budget.try_reserve(8).unwrap(), 8)
+            .prepare_copy_locked(&mut state, download_slice(&budget, 8), 8)
             .unwrap();
         assert!(state.copying);
         assert!(state.carrier.is_none());
@@ -319,7 +321,7 @@ async fn terminal_during_owned_copy(consumer_first: bool) {
         .unwrap();
     assert_eq!(last_read, [7]);
     assert!(call.copy_carrier(step).is_err());
-    assert_eq!(budget.snapshot().used_bytes, 0);
+    assert_eq!(budget.snapshot().memory.used_bytes, 0);
     let terminal = response.completion().await.unwrap();
     assert_eq!(terminal.status, CallStatus::Failed);
     assert_eq!(terminal.complete_items, 1);
@@ -343,23 +345,23 @@ async fn consumer_cancel_after_deferred_call_end_keeps_owned_copy_live() {
 async fn physical_failure_waits_for_owned_shm_copy_to_end() {
     let harness = Harness::start().await;
     let mut response = harness.stream().await;
-    let budget = PayloadBufferBudget::new(8);
+    let budget = memory_budget(8);
     drop(
         response
-            .read_chunk(budget.try_reserve(8).unwrap(), 8)
+            .read_chunk(download_slice(&budget, 8), 8)
             .await
             .unwrap()
             .unwrap(),
     );
     let call = response.call.clone();
     let step = call
-        .prepare_copy_locked(&mut call.state.lock(), budget.try_reserve(8).unwrap(), 8)
+        .prepare_copy_locked(&mut call.state.lock(), download_slice(&budget, 8), 8)
         .unwrap();
     call.transport_failed(IpcError::Closed);
     assert!(response.completion().now_or_never().is_none());
     assert!(call.state.lock().deferred_failure.is_some());
     assert!(call.copy_carrier(step).is_err());
-    assert_eq!(budget.snapshot().used_bytes, 0);
+    assert_eq!(budget.snapshot().memory.used_bytes, 0);
     let error = response.completion().await.unwrap_err();
     assert_eq!(error.phase(), crate::TransportPhase::DispatchUncertain);
     drop(response);
@@ -370,10 +372,13 @@ async fn physical_failure_waits_for_owned_shm_copy_to_end() {
 async fn successful_call_end_and_later_failure_wait_for_final_owned_copy() {
     let harness = Harness::start().await;
     let mut response = harness.stream().await;
-    let budget = PayloadBufferBudget::new(56);
+    let budget = memory_budget((ITEM_SIZE - 8) as u64);
     drop(
         response
-            .read_chunk(budget.try_reserve(56).unwrap(), 56)
+            .read_chunk(
+                download_slice(&budget, (ITEM_SIZE - 8) as u64),
+                ITEM_SIZE - 8,
+            )
             .await
             .unwrap()
             .unwrap(),
@@ -382,7 +387,7 @@ async fn successful_call_end_and_later_failure_wait_for_final_owned_copy() {
     let step = {
         let mut state = call.state.lock();
         let step = call
-            .prepare_copy_locked(&mut state, budget.try_reserve(8).unwrap(), 8)
+            .prepare_copy_locked(&mut state, download_slice(&budget, 8), 8)
             .unwrap();
         // Admit the next demand while the final range is still owned locally;
         // the peer can then report its real natural end through the reader.
@@ -410,7 +415,7 @@ async fn successful_call_end_and_later_failure_wait_for_final_owned_copy() {
     assert_eq!(terminal.status, CallStatus::Success);
     assert_eq!(terminal.complete_items, 1);
     drop(last);
-    assert_eq!(budget.snapshot().used_bytes, 0);
+    assert_eq!(budget.snapshot().memory.used_bytes, 0);
     drop(response);
     harness.stop().await;
 }

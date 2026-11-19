@@ -11,7 +11,9 @@ import pytest
 
 import c_two as cc
 from tests.fixtures.route_identity_mesh_support import wait_state
-from tests.fixtures.typescript_idle_gates import AcceptedConnections, GateResource, IdleGate, node_gate_client
+from tests.fixtures.typescript_idle_gates import (
+    AcceptedConnections, GateResource, IdleGate, assert_node_role_drained, node_gate_client,
+)
 from tests.integration.test_route_identity_mesh import mesh
 from tests.integration.test_typescript_persistent_ipc import idle_node_project, persistent_node_project
 
@@ -40,7 +42,7 @@ def _host(root: str | None, relay_url: str, *, registered: bool = True) -> Itera
         resource.release.set()
         receipt = runtime.shutdown(timeout=10)
         assert receipt["completed"], receipt
-        assert session.call_execution_snapshot()["used_operations"] == 0
+        assert session.call_execution_snapshot()["server"]["used_operations"] == 0
         memory = session.memory_stats()
         assert memory["holds"]["active_holds"] == 0
         opened = connections.snapshot()["opened"]
@@ -76,8 +78,7 @@ def _identity(result: dict, identity: dict, path: str, count: int) -> None:
 def _cleaned(work: Path) -> None:
     receipt = json.loads((work / "node-gates-cleanup.json").read_text(encoding="utf-8"))
     assert receipt["exit_code"] == 0, receipt
-    assert receipt["stats"]["used_operations"] == "0", receipt
-    assert (receipt["stats"].get("payload_buffer") or {}).get("used_bytes", "0") == "0", receipt
+    assert_node_role_drained(receipt["stats"])
     assert all(word not in json.dumps(receipt) for word in ("routeUid", "route_uid", "revision")), receipt
 
 

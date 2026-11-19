@@ -1,4 +1,4 @@
-use c2_mem::retention::PayloadBufferBudget;
+use c2_mem::DomainBudget;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -14,7 +14,7 @@ use super::HttpError;
 /// owned task must continue driving a dispatched call even if its waiter leaves.
 #[derive(Clone)]
 pub struct HttpCallControl {
-    payload_budget: Option<PayloadBufferBudget>,
+    payload_budget: Option<DomainBudget>,
     deadline: Option<Instant>,
     before_attempt: Arc<dyn Fn() -> Result<(), C2Error> + Send + Sync>,
     before_dispatch: Arc<dyn Fn() -> Result<(), C2Error> + Send + Sync>,
@@ -39,17 +39,13 @@ impl HttpCallControl {
 
     /// Runtime-owned payload domain and the call's original absolute deadline.
     /// The controlled input already carries its reservation in this domain.
-    pub fn with_payload_budget(
-        mut self,
-        budget: PayloadBufferBudget,
-        deadline: Option<Instant>,
-    ) -> Self {
+    pub fn with_payload_budget(mut self, budget: DomainBudget, deadline: Option<Instant>) -> Self {
         self.payload_budget = Some(budget);
         self.deadline = deadline;
         self
     }
 
-    pub(crate) fn payload_budget(&self) -> Option<&PayloadBufferBudget> {
+    pub(crate) fn payload_budget(&self) -> Option<&DomainBudget> {
         self.payload_budget.as_ref()
     }
 

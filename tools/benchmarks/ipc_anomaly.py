@@ -91,43 +91,38 @@ def wait_for_entered(coord: Path, expected: int, timeout: float, children=(), ti
 
 
 def scenario_spec(args: argparse.Namespace) -> dict:
-    """Fixed geometry is identical on both inputs and in both controls."""
-    common = {
-        'pool_enabled': True, 'pool_segment_size': MIB, 'max_pool_segments': 1,
-        'pool_min_retained_segments': 1, 'pool_decay_seconds': 0,
-        'reassembly_segment_size': MIB, 'reassembly_max_segments': 1,
-        'shm_backing_budget_bytes': 32 * MIB, 'file_backing_budget_bytes': 32 * MIB,
-        'live_reassembly_budget_bytes': 32 * MIB, 'chunk_size': 32 * 1024,
-    }
-    server = dict(common, max_frame_size=64 * 1024)
+    """Use identical role limits in each scenario's two controls."""
+    common = {'memory_budget_bytes': 32 * MIB, 'file_spill_budget_bytes': 0}
+    server = dict(common)
     normal, abnormal = dict(common), dict(common)
     scenario = args.scenario
-    response = 300 * 1024  # rounded to 512 KiB in the 1 MiB buddy geometry
+    response = 300 * 1024
     request = 1024
     abnormal_response, abnormal_request = response, request
     inflight = 1
     if scenario.startswith('fallback_') or scenario == 'exhausted':
-        inflight = 2  # two responses consume both 512 KiB buddy blocks
-        if scenario != 'fallback_dedicated':
-            server['shm_backing_budget_bytes'] = MIB
+        # Two stopped readers hold more than 600 KiB of dedicated replies.
+        # 768 KiB leaves room for admission of a short request, while it
+        # forces the next 300 KiB response to be fragmented.
+        inflight = 2
+        server['memory_budget_bytes'] = (2 * MIB if scenario == 'fallback_dedicated' else 768 * 1024)
         if scenario in ('fallback_file', 'exhausted'):
-            normal['shm_backing_budget_bytes'] = 0
-        if scenario == 'exhausted':
-            for overrides in (server, normal):
-                overrides['file_backing_budget_bytes'] = 0
-                overrides['live_reassembly_budget_bytes'] = 0
+            normal['memory_budget_bytes'] = 256 * 1024
+        if scenario == 'fallback_file':
+            normal['file_spill_budget_bytes'] = MIB
     if scenario == 'release_batch':
         inflight = max(65, args.abnormal_calls)
-        abnormal_response = 8192
+        abnormal_response = 48 * 1024
         # Every gated call needs an execution permit at once; keep a separate
         # permit available for the normal client while those calls are gated.
         server['max_execution_workers'] = inflight + 1
+        server['max_outstanding_calls'] = inflight + 1
+        abnormal['max_outstanding_calls'] = inflight
     if scenario == 'release_busy':
         abnormal_request = 256 * 1024
     if scenario == 'release_blocked':
         abnormal_response = 8 * MIB
-        server['max_frame_size'] = 16 * MIB
-        server['shm_backing_budget_bytes'] = 0  # force one large stream frame
+        server['memory_budget_bytes'] = 2 * MIB  # force a fragmented response
     return {
         'scenario': scenario, 'control': args.control, 'calls': args.calls,
         'warmup': args.warmup, 'abnormal_calls': args.abnormal_calls,
@@ -136,8 +131,8 @@ def scenario_spec(args: argparse.Namespace) -> dict:
         'response_bytes': response, 'request_bytes': request,
         'abnormal_response_bytes': abnormal_response,
         'abnormal_request_bytes': abnormal_request,
-        'shm_threshold': 4096, 'server_overrides': server,
-        'normal_overrides': normal, 'abnormal_overrides': abnormal,
+        'server_options': server,
+        'normal_options': normal, 'abnormal_options': abnormal,
         'route_concurrency': {'mode': 'parallel', 'max_workers': None, 'max_pending': None},
     }
 
@@ -207,8 +202,7 @@ def anomaly_worker(spec: dict) -> dict:
     client = None
     holds = []
     try:
-        cc.set_transport_policy(shm_threshold=config['shm_threshold'])
-        cc.set_client(ipc_overrides=config[role + '_overrides'])
+        cc.set_client(**config[role + '_options'])
         Exchange, _ = workload_types(cc, coord, config)
         client = cc.connect(Exchange, name='exchange', address=spec['address'], timeout=config['call_timeout'])
         proxy = cc.with_call_options(client, timeout=config['call_timeout'])
@@ -327,11 +321,9 @@ def anomaly_worker(spec: dict) -> dict:
 def budget_usage(snapshot: dict) -> dict:
     stats = snapshot['memory']['stats']
     result = {}
-    for scope in [stats['runtime_outgoing'], stats['server'], *stats['retired']]:
-        if scope is not None:
-            for cell, value in scope['cells'].items():
-                key = scope['role'] + '/' + cell
-                result[key] = result.get(key, 0) + value['used_bytes']
+    for role, name, cell in bench.budget_cells(stats):
+        key = f'{role}/{name}'
+        result[key] = result.get(key, 0) + cell['used_bytes']
     return result
 
 
@@ -372,8 +364,8 @@ def _finish_child(proc, role: str, timeout: float, log: SampleLog) -> dict:
 
 def _cell_peak(worker: dict, phase: str, cell: str) -> int:
     stats = worker['snapshots'][phase]['memory']['stats']
-    scope = stats['runtime_outgoing']
-    return scope['cells'][cell]['peak_bytes'] if scope is not None else 0
+    snapshot = stats['client'][cell]
+    return snapshot['peak_bytes'] if snapshot is not None else 0
 
 
 def run_anomaly(args: argparse.Namespace) -> dict:
@@ -413,8 +405,7 @@ def run_anomaly(args: argparse.Namespace) -> dict:
             snapshot('progress-' + str(len(snapshots)))
             last_snapshot = time.perf_counter()
     try:
-        cc.set_transport_policy(shm_threshold=config['shm_threshold'])
-        cc.set_server(ipc_overrides=config['server_overrides'])
+        cc.set_server(**config['server_options'])
         Exchange, Resource = workload_types(cc, coord, config)
         cc.register(Exchange, Resource(), name='exchange', concurrency=cc.ConcurrencyConfig(**config['route_concurrency']))
         address = cc.server_address()
@@ -525,18 +516,19 @@ def run_anomaly(args: argparse.Namespace) -> dict:
                 expected = None
             check_worker(worker, output, False, provenance['source_commit'], expected, config, failures)
         if args.control == 'parallel' and args.scenario.startswith('fallback_'):
-            occupied = snapshots['interference_ready']['memory']['stats']['server']['cells']['shm']['used_bytes']
-            if occupied < MIB:
-                failures.setup('stopped responses did not create the required full buddy backing: '
-                               f'observed={occupied}, required_at_least={MIB}')
+            occupied = snapshots['interference_ready']['memory']['stats']['server']['memory']['used_bytes']
+            minimum = config['inflight_calls'] * config['abnormal_response_bytes']
+            if occupied < minimum:
+                failures.setup('stopped responses did not establish budget pressure: '
+                               f'observed={occupied}, required_at_least={minimum}')
             if args.scenario == 'fallback_dedicated':
-                peak = snapshots['during']['memory']['stats']['server']['cells']['shm']['peak_bytes']
-                if peak <= occupied:
-                    failures.setup('no dedicated SHM backing beyond the full buddy segment: '
-                                   f'peak={peak}, occupied_before={occupied}')
-            if args.scenario == 'fallback_inline' and _cell_peak(normal, 'during', 'reassembly') == 0:
+                peak = snapshots['during']['memory']['stats']['server']['memory']['peak_bytes']
+                if peak < occupied + config['response_bytes']:
+                    failures.setup('no additional server backing beyond the stopped replies: '
+                                   f'peak={peak}, occupied_before={occupied}, response_bytes={config["response_bytes"]}')
+            if args.scenario == 'fallback_inline' and _cell_peak(normal, 'during', 'memory') < config['response_bytes']:
                 failures.setup('no receive reassembly observed for the forced chunk fallback')
-            if args.scenario == 'fallback_file' and _cell_peak(normal, 'during', 'file') == 0:
+            if args.scenario == 'fallback_file' and _cell_peak(normal, 'during', 'file_spill') < config['response_bytes']:
                 failures.setup('no receiver file backing observed for forced file reassembly')
         expected_hash = provenance['sha256']
         if not expected_hash or not provenance['module_path'] or not provenance['source_commit']:

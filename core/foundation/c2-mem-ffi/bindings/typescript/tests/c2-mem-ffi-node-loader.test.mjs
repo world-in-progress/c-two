@@ -51,27 +51,41 @@ test('bundled ABI 8 loader resolves the packaged native library', () => {
   assert.equal(typeof symbols.createClientDomain, 'function');
 });
 
-test('native client domains validate factory policy before any endpoint exists', () => {
+test('native addon validates client limits before any endpoint exists', () => {
   const {symbols} = loadBundledC2MemFfiNodeNativeSymbols();
   const context = symbols.captureEndpointContext(null);
   try {
-    for (const policy of [{requestChunkSize: '64'}, {requestShmThreshold: -1}, {requestChunkSize: 64, unknown: 1}]) {
+    for (const [options, message] of [
+      [[], /must be an object/],
+      [{requestChunkSize: 64}, /unknown option requestChunkSize/],
+      [{requestShmThreshold: 1024}, /unknown option requestShmThreshold/],
+      [{unknown: 1}, /unknown option unknown/],
+      [{memoryBudgetBytes: 2 ** 53}, /memoryBudgetBytes/],
+      [{fileSpillBudgetBytes: 2n ** 64n}, /fileSpillBudgetBytes/],
+      [{maxOutstandingCalls: -1n}, /maxOutstandingCalls/],
+      [{memoryBudgetBytes: 0n, maxOutstandingCalls: 1}, /must be zero/],
+    ]) {
       let domain;
       try {
-        assert.throws(() => { domain = symbols.createClientDomain(context, policy); }, /requestChunkSize|requestShmThreshold|unknown/);
+        assert.throws(() => { domain = symbols.createClientDomain(context, options); }, message);
       } finally { domain?.close(); }
     }
   } finally { context.close(); }
 });
 
-test('native endpoints reject transport policy that belongs to their client domain', () => {
+test('native endpoints reject options that belong to their client domain', () => {
   const {symbols} = loadBundledC2MemFfiNodeNativeSymbols();
   const context = symbols.captureEndpointContext(null);
-  const domain = symbols.createClientDomain(context, {requestChunkSize: 64, requestShmThreshold: 1024});
+  const domain = symbols.createClientDomain(context, {
+    memoryBudgetBytes: 18446744073709551615n,
+    fileSpillBudgetBytes: 0,
+    maxOutstandingCalls: 64n,
+  });
   try {
-    for (const options of [{requestChunkSize: 128}, {requestShmThreshold: 2048}]) {
-      assert.throws(() => domain.createEndpoint('ipc://factory-policy', options), /unknown option request/);
+    for (const key of ['memoryBudgetBytes', 'fileSpillBudgetBytes', 'maxOutstandingCalls']) {
+      assert.throws(() => domain.createEndpoint('ipc://factory-policy', {[key]: 1}), new RegExp(`unknown option ${key}`));
     }
+    assert.equal(domain.stats().frozen, false, 'endpoint creation performs no connection');
   } finally { domain.close(); context.close(); }
 });
 

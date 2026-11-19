@@ -176,8 +176,36 @@ class Events:
         return {event["id"] for event in self.records
                 if event["kind"] == kind and event["side"] == side}
 
+    def _snapshot_ids(self, side: str) -> tuple[set[int], set[int]]:
+        self.drain()
+        opened = {event["id"] for event in self.records
+                  if event["kind"] == "opened" and event["side"] == side}
+        closed = {event["id"] for event in self.records
+                  if event["kind"] == "closed" and event["side"] == side}
+        return opened, closed
+
     def active(self, side: str) -> set[int]:
-        return self.ids("opened", side) - self.ids("closed", side)
+        opened, closed = self._snapshot_ids(side)
+        return opened - closed
+
+    def wait_closed_all(self, side: str, *, timeout: float = 10.0) -> None:
+        """Wait until every opened connection on one side has its Closed event.
+
+        Shutdown returns once its listener, accepted calls and loans drain; an
+        accepted idle connection is closed by that shutdown but publishes its
+        Closed event shortly after the receipt (runtime-lifecycle.md). Block on
+        recv with the remaining deadline instead of draining once.
+        """
+        deadline = time.monotonic() + timeout
+        while True:
+            opened, closed = self._snapshot_ids(side)
+            if opened == closed:
+                return
+            remaining = deadline - time.monotonic()
+            assert remaining > 0 and not self.ended, (
+                f"{side} connections did not close: {self.records}"
+            )
+            self.take(timeout=remaining)
 
 
 class Lab:
@@ -197,11 +225,11 @@ class Lab:
             self.client.set_local_endpoint(root=root)
         self.outgoing = Events(self.client)
         if path != "direct_ipc":
-            self.owner = start_relay(idle_timeout=1)
+            self.owner = start_relay()
             self.server.set_relay_anchor(self.owner.url)
             self.anchor = self.owner
             if path == "relay_aware_relay":
-                self.anchor = start_relay(seeds=[self.owner.url], idle_timeout=1)
+                self.anchor = start_relay(seeds=[self.owner.url])
             self.client.set_relay_anchor(self.anchor.url)
         self.accepted = Events(self.server)
         self.server.start()
@@ -309,10 +337,8 @@ class Lab:
         server = self.server.shutdown(timeout=10)
         assert client["completed"], client
         assert server["completed"], server
-        self.outgoing.drain()
-        self.accepted.drain()
         for events, side in ((self.outgoing, "client"), (self.accepted, "server")):
-            assert events.ids("opened", side) == events.ids("closed", side), events.records
+            events.wait_closed_all(side)
             events.source.close()
         self.http.close()
         return {"client": client, "server": server}

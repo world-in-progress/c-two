@@ -312,7 +312,7 @@ def test_generated_node_relay_local_late_route_reuses_physical_connection(
         else:
             monkeypatch.delenv("C2_IPC_ROOT", raising=False)
         monkeypatch.setenv("C2_RELAY_ANCHOR_ADDRESS", "")
-        relay = start_c3_relay(idle_timeout=0)
+        relay = start_c3_relay()
         server = cc.Runtime()
         server.set_local_endpoint(root=local_root)
         server.set_relay_anchor(relay.url)
@@ -366,7 +366,7 @@ def test_generated_node_relay_local_rebuilds_after_endpoint_deactivation(
         else:
             monkeypatch.delenv("C2_IPC_ROOT", raising=False)
         monkeypatch.setenv("C2_RELAY_ANCHOR_ADDRESS", "")
-        relay = start_c3_relay(idle_timeout=0)
+        relay = start_c3_relay()
         server = cc.Runtime()
         server.set_local_endpoint(root=local_root)
         server.set_relay_anchor(relay.url)
@@ -429,7 +429,6 @@ def node_gate_root(monkeypatch):
             monkeypatch.setenv("C2_IPC_ROOT", ipc_root)
         monkeypatch.setenv("C2_ENV_FILE", "")
         monkeypatch.setenv("C2_RELAY_ANCHOR_ADDRESS", "")
-        monkeypatch.setenv("C2_IPC_CLIENT_IDLE_TIMEOUT", "0")
         yield ipc_root
         assert not list(Path(root).glob("*.lease"))
         assert not any(path.is_socket() for path in Path(root).iterdir())
@@ -481,7 +480,7 @@ def test_generated_node_closed_route_keeps_dispatched_sibling_and_first_cause(
     from tests.fixtures.typescript_idle_gates import GateResource, IdleGate, node_gate_client
     from concurrent.futures import ThreadPoolExecutor
 
-    relay = start_c3_relay(idle_timeout=0) if mode != "direct" else None
+    relay = start_c3_relay() if mode != "direct" else None
     server = cc.Runtime()
     server.set_local_endpoint(root=node_gate_root)
     if relay:
@@ -611,6 +610,7 @@ def _gate_host(root, work, relay=None, *, late_builder=False, manager_concurrenc
                     server.register(IdleGate, builder, name="builder")
                 return result
         manager = LateManager()
+    session = server._runtime_session
     try:
         server.start()
         for connection_id in connections.snapshot()["active"]:
@@ -618,7 +618,7 @@ def _gate_host(root, work, relay=None, *, late_builder=False, manager_concurrenc
         server.register(IdleGate, manager, name="manager", concurrency=manager_concurrency)
         if not late_builder:
             server.register(IdleGate, builder, name="builder")
-        identity = dict(server._runtime_session.ensure_server())
+        identity = dict(session.ensure_server())
         manager.identity = builder.identity = identity
         yield server, manager, builder, identity, connections
     finally:
@@ -628,8 +628,8 @@ def _gate_host(root, work, relay=None, *, late_builder=False, manager_concurrenc
         assert cleanup["completed"], cleanup
         manager.close()
         builder.close()
-        assert server.call_execution_snapshot()["used_operations"] == 0
-        memory = server.memory_stats()
+        assert session.call_execution_snapshot()["server"]["used_operations"] == 0
+        memory = session.memory_stats()
         assert memory["holds"]["active_holds"] == 0
         _save_gate(work, "host-cleanup", shutdown=cleanup, memory=memory, connections=connections.snapshot())
         connections.events.close()
@@ -641,7 +641,7 @@ def test_generated_node_http_late_route_reuses_upstream_connection(
     """Gate 1 HTTP: persistent manager sees late builder on the same upstream."""
     from tests.fixtures.typescript_idle_gates import node_gate_client
 
-    relay = start_c3_relay(idle_timeout=0)
+    relay = start_c3_relay()
     try:
         with _gate_host(node_gate_root, tmp_path, relay, late_builder=True) as (server, manager, builder, identity, connections):
             with node_gate_client(idle_node_project, tmp_path, relay.url, node_gate_root, mode="http", portable=True) as node:
@@ -668,6 +668,7 @@ def test_generated_node_http_late_route_reuses_upstream_connection(
         relay.stop()
 
 
+@pytest.mark.timeout(180)
 @pytest.mark.parametrize("mode", ["direct", "relay-local"])
 def test_generated_node_background_idle_eviction_and_concurrent_reconnect(
     idle_node_project, node_gate_root, start_c3_relay, tmp_path, monkeypatch, mode,
@@ -680,8 +681,7 @@ def test_generated_node_background_idle_eviction_and_concurrent_reconnect(
     """
     from tests.fixtures.typescript_idle_gates import node_gate_client
 
-    monkeypatch.setenv("C2_IPC_CLIENT_IDLE_TIMEOUT", "0.05")
-    relay = start_c3_relay(idle_timeout=0) if mode != "direct" else None
+    relay = start_c3_relay() if mode != "direct" else None
     try:
         with _gate_host(node_gate_root, tmp_path, relay) as (server, manager, builder, identity, connections):
             scheduler = server._runtime_session.ensure_server_bridge().get_local_slot_info("manager")[1]
@@ -705,7 +705,7 @@ def test_generated_node_background_idle_eviction_and_concurrent_reconnect(
                 before_idle = connections.snapshot()
                 old = set(before_idle["opened"]) - set(baseline["opened"])
                 assert len(old) == 1, (baseline, before_idle, refused)
-                closed_id = connections.wait_closed(old)
+                closed_id = connections.wait_closed(old, timeout=75)
                 assert manager.calls == builder.calls == 0
                 assert not scheduler.snapshot().closed
                 after_idle = connections.snapshot()
@@ -727,20 +727,21 @@ def test_generated_node_background_idle_eviction_and_concurrent_reconnect(
             relay.stop()
 
 
+@pytest.mark.timeout(180)
 def test_generated_node_http_relay_idle_eviction_preserves_route(
     idle_node_project, node_gate_root, start_c3_relay, tmp_path,
 ):
     """Gate 3 HTTP: relay idle eviction preserves registration and route UID."""
     from tests.fixtures.typescript_idle_gates import node_gate_client
 
-    relay = start_c3_relay(idle_timeout=1)
+    relay = start_c3_relay()
     try:
         with _gate_host(node_gate_root, tmp_path, relay) as (server, manager, builder, identity, connections):
             with node_gate_client(idle_node_project, tmp_path, relay.url, node_gate_root, mode="http", portable=True) as node:
                 first = node()
                 _gate_identity(first, identity, "RelayAwareHttp")
                 initial = connections.snapshot()
-                closed = connections.wait_closed(set(initial["active"]))
+                closed = connections.wait_closed(set(initial["active"]), timeout=75)
                 idle = connections.snapshot()
                 assert manager.calls == 1 and builder.calls == 0
                 rebuilt = _ok(node("call-many", count=8))
@@ -837,7 +838,7 @@ def test_generated_node_deadline_keeps_current_target(
     """A caller's expired wait leaves its already selected target usable."""
     from tests.fixtures.typescript_idle_gates import node_gate_client
 
-    relay = start_c3_relay(idle_timeout=0) if mode != "direct" else None
+    relay = start_c3_relay() if mode != "direct" else None
     try:
         with _gate_host(node_gate_root, tmp_path, relay) as (server, manager, _builder, identity, _connections):
             address = server.server_address() if relay is None else relay.url
@@ -877,7 +878,7 @@ def test_generated_node_capacity_refusal_keeps_current_target(
     """A full route admission slot refuses only that call; the target stays selected."""
     from tests.fixtures.typescript_idle_gates import node_gate_client
 
-    relay = start_c3_relay(idle_timeout=0) if mode != "direct" else None
+    relay = start_c3_relay() if mode != "direct" else None
     try:
         with _gate_host(node_gate_root, tmp_path, relay,
                         manager_concurrency=cc.ConcurrencyConfig(mode="parallel", max_pending=1)) as (
@@ -924,7 +925,7 @@ def test_generated_node_deadline_during_reacquisition_never_dispatches(
     """A waiter that expires at real relay resolution never sends its input."""
     from tests.fixtures.typescript_idle_gates import GateResource, IdleGate, node_gate_client
 
-    relay = start_c3_relay(idle_timeout=0)
+    relay = start_c3_relay()
     replacement = GateResource()
     try:
         with _gate_host(node_gate_root, tmp_path, relay) as (server, manager, _builder, identity, _connections):
@@ -971,7 +972,7 @@ def test_generated_node_call_time_route_change_does_not_end_sibling(
     """
     from tests.fixtures.typescript_idle_gates import GateResource, IdleGate, node_gate_client
 
-    relay = start_c3_relay(idle_timeout=0) if mode != "direct" else None
+    relay = start_c3_relay() if mode != "direct" else None
     replacement = GateResource()
     try:
         with _gate_host(node_gate_root, tmp_path, relay) as (server, manager, builder, identity, connections):
@@ -1052,7 +1053,7 @@ def test_generated_node_real_peer_end_is_uncertain_without_replay(
     import uuid
     from tests.fixtures.typescript_idle_gates import GateProcess, node_gate_client
 
-    relay = start_c3_relay(idle_timeout=0) if mode != "direct" else None
+    relay = start_c3_relay() if mode != "direct" else None
     server_id = f"node-cut-{uuid.uuid4().hex}"
     try:
         with GateProcess(tmp_path, node_gate_root, server_id, relay.url if relay else None, "old") as old:
@@ -1230,7 +1231,7 @@ def test_generated_node_new_stream_follows_restarted_host_without_replaying_old_
     import uuid
     from tests.fixtures.typescript_idle_gates import GateProcess, node_gate_client
 
-    relay = start_c3_relay(idle_timeout=0) if mode == "relay-local" else None
+    relay = start_c3_relay() if mode == "relay-local" else None
     server_id = f"node-stream-restart-{uuid.uuid4().hex}"
     try:
         with GateProcess(tmp_path, node_gate_root, server_id, relay.url if relay else None, "old") as old:
@@ -1288,10 +1289,10 @@ def test_generated_node_reacquires_route_on_another_relay(
             monkeypatch.setenv("C2_IPC_ROOT", root)
 
     set_ipc_root(host_a_root)
-    relay_a = start_c3_relay(relay_id=f"node-a-{uuid.uuid4().hex}", idle_timeout=0)
+    relay_a = start_c3_relay(relay_id=f"node-a-{uuid.uuid4().hex}")
     set_ipc_root(host_b_root)
     relay_b = start_c3_relay(
-        relay_id=f"node-b-{uuid.uuid4().hex}", seeds=[relay_a.url], idle_timeout=0,
+        relay_id=f"node-b-{uuid.uuid4().hex}", seeds=[relay_a.url],
     )
     contract = crm_contract(IdleGate)
     query = urllib.parse.urlencode({
@@ -1391,7 +1392,7 @@ def test_generated_node_http_reregistration_uses_current_payload_limit(
     input_path.write_bytes(payload.binary_bytes())
     input_builder.close()
     assert input_path.stat().st_size > old_limit
-    relay = start_c3_relay(idle_timeout=0)
+    relay = start_c3_relay()
     try:
         with GateProcess(tmp_path, str(host_root) if os.name != "nt" else None,
                          f"node-payload-old-{uuid.uuid4().hex}", relay.url, "old",
@@ -1434,7 +1435,7 @@ def test_generated_node_old_candidate_cannot_discard_restarted_relay_owner(
     import uuid
     from tests.fixtures.typescript_idle_gates import GateProcess, node_gate_client
 
-    relay = start_c3_relay(idle_timeout=0)
+    relay = start_c3_relay()
     server_id = f"node-owner-{uuid.uuid4().hex}"
     try:
         with GateProcess(tmp_path, node_gate_root, server_id, relay.url, "old") as old:

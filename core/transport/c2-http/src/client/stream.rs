@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use bytes::Bytes;
-use c2_mem::retention::{BudgetedBuffer, PayloadBufferBudget, PayloadBufferReservation};
+use c2_mem::{BudgetedBuffer, DomainBudget, MemoryReservation};
 use tokio::sync::{Notify, mpsc, watch};
 
 use super::HttpError;
@@ -95,7 +95,7 @@ impl HttpResponseStream {
         client: reqwest::Client,
         base_url: String,
         token: String,
-        budget: PayloadBufferBudget,
+        budget: DomainBudget,
         max_item_size: u64,
         completion_owner: Box<dyn Send>,
         cancellation: HttpStreamCancellation,
@@ -296,7 +296,7 @@ struct ReceivingItem<'a> {
     total: usize,
     received: usize,
     bytes: Vec<u8>,
-    reservation: Option<PayloadBufferReservation>,
+    reservation: Option<MemoryReservation>,
     slot: Option<mpsc::Permit<'a, BudgetedBuffer>>,
     discarding: bool,
 }
@@ -324,7 +324,7 @@ fn protocol_failure(message: impl Into<String>) -> ObservedOutcome {
 
 async fn drive(
     response: reqwest::Response,
-    budget: PayloadBufferBudget,
+    budget: DomainBudget,
     max_item_size: u64,
     items: mpsc::Sender<BudgetedBuffer>,
     local_error: watch::Sender<Option<c2_error::C2Error>>,
@@ -389,7 +389,7 @@ async fn drive(
                     if let Some(slot) = slot {
                         slot.send(BudgetedBuffer::new(
                             Vec::new(),
-                            budget.try_reserve(0).expect("zero-byte item"),
+                            budget.try_reserve_memory(0).expect("zero-byte item"),
                         ));
                     }
                     continue;
@@ -419,7 +419,7 @@ async fn drive(
                     // before copying its first data byte; a terminal after the
                     // begin can therefore be observed without waiting on B.
                     let reservation = tokio::select! {
-                        reservation = budget.reserve(item.total as u64) => Some(reservation),
+                        reservation = budget.reserve_memory(item.total as u64) => Some(reservation),
                         _ = cancellation.wait() => None,
                     };
                     match reservation {
@@ -640,7 +640,7 @@ mod tests {
             let (base, server) = serve(router).await;
             let client = reqwest::Client::new();
             let response = client.post(format!("{base}/call")).send().await.unwrap();
-            let budget = PayloadBufferBudget::new(32);
+            let budget = crate::payload::memory_only_budget(32);
             let mut stream = HttpResponseStream::start(
                 response,
                 client,
@@ -684,7 +684,7 @@ mod tests {
                 );
             }
             assert_eq!(
-                budget.snapshot().used_bytes,
+                budget.snapshot().memory.used_bytes,
                 held.iter()
                     .map(|item| item.as_ref().len() as u64)
                     .sum::<u64>(),
@@ -692,7 +692,7 @@ mod tests {
                 sequence.name
             );
             drop(held);
-            assert_eq!(budget.snapshot().used_bytes, 0);
+            assert_eq!(budget.snapshot().memory.used_bytes, 0);
             server.abort();
         }
     }
@@ -701,7 +701,7 @@ mod tests {
     fn item_published_after_empty_is_delivered_before_its_terminal() {
         use std::sync::Barrier;
         for status in [HttpStreamStatus::Success, HttpStreamStatus::Failed] {
-            let budget = PayloadBufferBudget::new(8);
+            let budget = crate::payload::memory_only_budget(8);
             let (items_tx, items) = mpsc::channel(1);
             let (outcome_tx, outcome) = watch::channel(None);
             let (_local_error_tx, local_error) = watch::channel(None);
@@ -722,7 +722,7 @@ mod tests {
                     items_tx
                         .blocking_send(BudgetedBuffer::new(
                             vec![42; 8],
-                            budget.try_reserve(8).unwrap(),
+                            budget.try_reserve_memory(8).unwrap(),
                         ))
                         .unwrap();
                     outcome_tx
@@ -761,7 +761,7 @@ mod tests {
                 _ => unreachable!(),
             }
             worker.join().unwrap();
-            assert_eq!(budget.snapshot().used_bytes, 0);
+            assert_eq!(budget.snapshot().memory.used_bytes, 0);
         }
     }
 
@@ -782,7 +782,7 @@ mod tests {
             let (base, server) = serve(router).await;
             let client = reqwest::Client::new();
             let response = client.post(format!("{base}/call")).send().await.unwrap();
-            let budget = PayloadBufferBudget::new(0);
+            let budget = crate::payload::memory_only_budget(0);
             let stream = HttpResponseStream::start(
                 response,
                 client,
@@ -805,7 +805,7 @@ mod tests {
             );
             assert_eq!(error.details["transport_phase"], "dispatch_uncertain");
             assert_eq!(error.details["dispatch_phase"], "dispatch_uncertain");
-            assert_eq!(budget.snapshot().rejected_allocations, 0);
+            assert_eq!(budget.snapshot().memory.rejected_allocations, 0);
             server.abort();
         }
     }
@@ -839,7 +839,7 @@ mod tests {
                 client,
                 base,
                 "0123456789abcdef0123456789abcdef".into(),
-                PayloadBufferBudget::new(4096),
+                crate::payload::memory_only_budget(4096),
                 4096,
                 Box::new(()),
                 HttpStreamCancellation::new(),
@@ -883,7 +883,7 @@ mod tests {
             client,
             base,
             "0123456789abcdef0123456789abcdef".into(),
-            PayloadBufferBudget::new(4096),
+            crate::payload::memory_only_budget(4096),
             4096,
             Box::new(()),
             HttpStreamCancellation::new(),
@@ -926,7 +926,7 @@ mod tests {
         let (base, server) = serve(router).await;
         let client = reqwest::Client::new();
         let response = client.post(format!("{base}/call")).send().await.unwrap();
-        let budget = PayloadBufferBudget::new(12);
+        let budget = crate::payload::memory_only_budget(12);
         let mut stream = HttpResponseStream::start(
             response,
             client,
@@ -941,12 +941,12 @@ mod tests {
         assert_eq!(first.as_ref(), b"one");
         let second = stream.recv().await.unwrap().unwrap();
         assert_eq!(second.as_ref(), b"two");
-        assert_eq!(budget.snapshot().used_bytes, 6);
+        assert_eq!(budget.snapshot().memory.used_bytes, 6);
         drop(first);
         drop(second);
         assert!(stream.recv().await.unwrap().is_none());
         assert_eq!(stream.completion().await.unwrap().complete_items, Some(2));
-        assert_eq!(budget.snapshot().used_bytes, 0);
+        assert_eq!(budget.snapshot().memory.used_bytes, 0);
         server.abort();
     }
 
@@ -968,7 +968,7 @@ mod tests {
         let (base, server) = serve(router).await;
         let client = reqwest::Client::new();
         let response = client.post(format!("{base}/call")).send().await.unwrap();
-        let budget = PayloadBufferBudget::new(1);
+        let budget = crate::payload::memory_only_budget(1);
         let mut stream = HttpResponseStream::start(
             response,
             client,
@@ -981,7 +981,7 @@ mod tests {
         );
         assert!(stream.recv().await.unwrap().is_none());
         assert_eq!(stream.completion().await.unwrap().complete_items, Some(0));
-        assert_eq!(budget.snapshot().used_bytes, 0);
+        assert_eq!(budget.snapshot().memory.used_bytes, 0);
         server.abort();
     }
 
@@ -1007,7 +1007,7 @@ mod tests {
         let (base, server) = serve(router).await;
         let client = reqwest::Client::new();
         let response = client.post(format!("{base}/call")).send().await.unwrap();
-        let budget = PayloadBufferBudget::new(16);
+        let budget = crate::payload::memory_only_budget(16);
         let mut stream = HttpResponseStream::start(
             response,
             client,
@@ -1022,9 +1022,9 @@ mod tests {
         assert_eq!(first.as_ref(), b"one");
         assert!(matches!(stream.recv().await, Err(HttpError::Transport(_))));
         assert_eq!(first.as_ref(), b"one");
-        assert_eq!(budget.snapshot().used_bytes, 3);
+        assert_eq!(budget.snapshot().memory.used_bytes, 3);
         drop(first);
-        assert_eq!(budget.snapshot().used_bytes, 0);
+        assert_eq!(budget.snapshot().memory.used_bytes, 0);
         server.abort();
     }
 
@@ -1054,7 +1054,7 @@ mod tests {
             client,
             base,
             "0123456789abcdef0123456789abcdef".into(),
-            PayloadBufferBudget::new(1),
+            crate::payload::memory_only_budget(1),
             128,
             Box::new(()),
             HttpStreamCancellation::new(),
@@ -1124,7 +1124,7 @@ mod tests {
             client,
             base,
             "0123456789abcdef0123456789abcdef".into(),
-            PayloadBufferBudget::new(128),
+            crate::payload::memory_only_budget(128),
             128,
             Box::new(()),
             cancellation.clone(),
@@ -1212,7 +1212,7 @@ mod tests {
             client,
             base,
             "0123456789abcdef0123456789abcdef".into(),
-            PayloadBufferBudget::new(8),
+            crate::payload::memory_only_budget(8),
             128,
             Box::new(()),
             cancellation.clone(),
@@ -1256,7 +1256,7 @@ mod tests {
         let (base, server) = serve(router).await;
         let client = reqwest::Client::new();
         let response = client.post(format!("{base}/call")).send().await.unwrap();
-        let budget = PayloadBufferBudget::new(16);
+        let budget = crate::payload::memory_only_budget(16);
         let mut stream = HttpResponseStream::start(
             response,
             client,
@@ -1275,7 +1275,7 @@ mod tests {
         })
         .await
         .unwrap();
-        assert_eq!(budget.snapshot().used_bytes, 16);
+        assert_eq!(budget.snapshot().memory.used_bytes, 16);
         stream.cancel();
         let terminal = tokio::time::timeout(
             std::time::Duration::from_secs(2),
@@ -1290,9 +1290,9 @@ mod tests {
             c2_error::ErrorCode::CallCancelled
         );
         assert_eq!(held.as_ref(), &[7; 8]);
-        assert_eq!(budget.snapshot().used_bytes, 8);
+        assert_eq!(budget.snapshot().memory.used_bytes, 8);
         drop(held);
-        assert_eq!(budget.snapshot().used_bytes, 0);
+        assert_eq!(budget.snapshot().memory.used_bytes, 0);
         server.abort();
     }
 }

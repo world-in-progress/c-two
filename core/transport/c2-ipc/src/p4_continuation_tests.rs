@@ -1,4 +1,5 @@
 use super::*;
+use crate::tests::memory_budget;
 
 #[tokio::test]
 async fn incomplete_call_end_waits_for_peer_end_while_other_calls_finish() {
@@ -24,9 +25,7 @@ async fn incomplete_call_end_waits_for_peer_end_while_other_calls_finish() {
         drop(stream);
         crate::tests::close_listener(listener).await;
     });
-    let mut cfg = config();
-    cfg.shm_threshold = u64::MAX;
-    let mut client = IpcClient::with_endpoint(endpoint.endpoint.clone(), cfg).unwrap();
+    let mut client = endpoint.client();
     client.connect().await.unwrap();
     let client = Arc::new(client);
     let incomplete = tokio::spawn({
@@ -102,9 +101,7 @@ async fn rejected_reply_discards_late_chunks_and_preserves_other_calls() {
             expect_disconnect_or_eof(&mut stream).await;
             crate::tests::close_listener(listener).await;
         });
-        let mut cfg = config();
-        cfg.base.live_reassembly_budget_bytes = 0;
-        let mut client = IpcClient::with_endpoint(endpoint.endpoint.clone(), cfg).unwrap();
+        let mut client = endpoint.client_without_memory();
         client.connect().await.unwrap();
         let connection = client.driver.read().clone().unwrap();
         let client = Arc::new(client);
@@ -140,7 +137,7 @@ async fn rejected_reply_discards_late_chunks_and_preserves_other_calls() {
             b"after"
         );
         assert_eq!(client.pending_len_for_test(), 0);
-        assert_eq!(client.memory_budget.snapshot().reassembly.used_bytes, 0);
+        assert_eq!(client.domain_snapshot().memory.used_bytes, 0);
         send_unknown.send(()).unwrap();
         assert_eq!(
             client
@@ -229,10 +226,7 @@ async fn writer_assigns_monotonic_ids_after_input_preparation() {
         (b.request_id, control.request_id, a.request_id)
     });
 
-    let mut cfg = config();
-    cfg.shm_threshold = 1024;
-    cfg.base.chunk_size = 1024;
-    let mut client = IpcClient::with_endpoint(endpoint.endpoint.clone(), cfg).unwrap();
+    let mut client = endpoint.client();
     client.connect().await.unwrap();
     let binding = cached_binding(&client);
     let client = Arc::new(client);
@@ -299,9 +293,7 @@ async fn writer_rejection_preserves_error_and_connection_for_zero_inline_and_chu
     let endpoint = Endpoint::new();
     let calls = Arc::new(CountEcho(AtomicU64::new(0)));
     let (server, runner) = start(&endpoint, calls.clone(), ServerIpcConfig::default()).await;
-    let mut cfg = config();
-    cfg.base.shm_backing_budget_bytes = 0;
-    let mut client = IpcClient::with_endpoint(endpoint.endpoint.clone(), cfg).unwrap();
+    let mut client = endpoint.client_without_memory();
     client.connect().await.unwrap();
     let binding = client.acquire_route(&contract()).await.unwrap();
     let expected =
@@ -373,9 +365,7 @@ async fn deactivation_distinguishes_unpublished_calls_from_started_dispatch() {
             expect_disconnect_or_eof(&mut stream).await;
             crate::tests::close_listener(listener).await;
         });
-        let mut cfg = config();
-        cfg.base.shm_backing_budget_bytes = 0;
-        let mut client = IpcClient::with_endpoint(endpoint.endpoint.clone(), cfg).unwrap();
+        let mut client = endpoint.client_without_memory();
         client.connect().await.unwrap();
         let binding = cached_binding(&client);
         let client = Arc::new(client);
@@ -444,9 +434,11 @@ async fn deactivation_before_shm_dispatch_reports_pre_dispatch_and_releases_its_
             expect_disconnect_or_eof(&mut stream).await;
             crate::tests::close_listener(listener).await;
         });
-        let mut cfg = config();
-        cfg.base.pool_enabled = !dedicated;
-        let mut client = IpcClient::with_endpoint(endpoint.endpoint.clone(), cfg).unwrap();
+        let mut client = IpcClient::with_endpoint_and_budget(
+            endpoint.endpoint.clone(),
+            crate::tests::memory_budget(if dedicated { 224 * 1024 } else { 1024 * 1024 }),
+        )
+        .unwrap();
         client.connect().await.unwrap();
         let binding = cached_binding(&client);
         let pool = client.request_pool().unwrap();
@@ -465,7 +457,7 @@ async fn deactivation_before_shm_dispatch_reports_pre_dispatch_and_releases_its_
             async move { client.call_inline(&identity(), 0, b"first").await }
         });
         paused.await.unwrap();
-        let data = vec![3; 8193];
+        let data = vec![3; SHM_THRESHOLD as usize + 1];
         let mut queued = Box::pin(client.call_bound_phased(&binding, "echo", &data));
         assert!(futures_util::poll!(queued.as_mut()).is_pending());
         assert_eq!(
@@ -505,9 +497,11 @@ async fn writer_rejection_after_real_buddy_or_dedicated_preparation_releases_blo
         let endpoint = Endpoint::new();
         let calls = Arc::new(CountEcho(AtomicU64::new(0)));
         let (server, runner) = start(&endpoint, calls.clone(), ServerIpcConfig::default()).await;
-        let mut cfg = config();
-        cfg.base.pool_enabled = !dedicated;
-        let mut client = IpcClient::with_endpoint(endpoint.endpoint.clone(), cfg).unwrap();
+        let mut client = IpcClient::with_endpoint_and_budget(
+            endpoint.endpoint.clone(),
+            crate::tests::memory_budget(if dedicated { 224 * 1024 } else { 1024 * 1024 }),
+        )
+        .unwrap();
         client.connect().await.unwrap();
         let binding = client.acquire_route(&contract()).await.unwrap();
         let pool = client.request_pool().unwrap();
@@ -544,7 +538,12 @@ async fn writer_rejection_after_real_buddy_or_dedicated_preparation_releases_blo
             }
         });
         let error = client
-            .call_bound_controlled_phased(&binding, "echo", &[3; 8193], &control)
+            .call_bound_controlled_phased(
+                &binding,
+                "echo",
+                &[3; SHM_THRESHOLD as usize + 1],
+                &control,
+            )
             .await
             .unwrap_err();
         assert_eq!(error.phase(), crate::TransportPhase::PreDispatch);
@@ -578,9 +577,7 @@ async fn expired_scope_after_first_chunk_does_not_recheck_dispatch_and_invokes_o
     let endpoint = Endpoint::new();
     let calls = Arc::new(CountEcho(AtomicU64::new(0)));
     let (server, runner) = start(&endpoint, calls.clone(), ServerIpcConfig::default()).await;
-    let mut cfg = config();
-    cfg.base.shm_backing_budget_bytes = 0;
-    let mut client = IpcClient::with_endpoint(endpoint.endpoint.clone(), cfg).unwrap();
+    let mut client = endpoint.client_without_memory();
     client.connect().await.unwrap();
     let binding = client.acquire_route(&contract()).await.unwrap();
     let expired = Arc::new(AtomicBool::new(false));
@@ -609,7 +606,7 @@ async fn expired_scope_after_first_chunk_does_not_recheck_dispatch_and_invokes_o
             async move {
                 if step == 0 {
                     Some((
-                        Ok::<_, std::io::Error>(vec![1; 4096]),
+                        Ok::<_, std::io::Error>(vec![1; CHUNK_SIZE as usize]),
                         (1, signal, remaining),
                     ))
                 } else {
@@ -635,8 +632,9 @@ async fn expired_scope_after_first_chunk_does_not_recheck_dispatch_and_invokes_o
                 .call_chunked_stream_controlled(
                     &acquired_identity,
                     method_idx,
-                    8193,
+                    CHUNK_SIZE as usize * 2 + 1,
                     stream,
+                    DEFAULT_MAX_PAYLOAD_SIZE,
                     Some(control),
                 )
                 .await;
@@ -645,11 +643,16 @@ async fn expired_scope_after_first_chunk_does_not_recheck_dispatch_and_invokes_o
     });
     timeout(WAIT, first_done).await.unwrap().unwrap();
     expired.store(true, Ordering::SeqCst);
-    more.send(vec![2; 4096]).unwrap();
+    more.send(vec![2; CHUNK_SIZE as usize]).unwrap();
     more.send(vec![3]).unwrap();
     drop(more);
     let (client, binding, result) = timeout(WAIT, call).await.unwrap().unwrap();
-    let expected = [vec![1; 4096], vec![2; 4096], vec![3]].concat();
+    let expected = [
+        vec![1; CHUNK_SIZE as usize],
+        vec![2; CHUNK_SIZE as usize],
+        vec![3],
+    ]
+    .concat();
     assert_eq!(result.unwrap().into_owned_bytes().unwrap(), expected);
     assert_eq!(checks.load(Ordering::SeqCst), 1);
     assert_eq!(calls.0.load(Ordering::SeqCst), 1);
@@ -673,9 +676,7 @@ async fn source_failures_before_publication_leave_unrelated_calls_healthy() {
         let endpoint = Endpoint::new();
         let calls = Arc::new(CountEcho(AtomicU64::new(0)));
         let (server, runner) = start(&endpoint, calls.clone(), ServerIpcConfig::default()).await;
-        let mut cfg = config();
-        cfg.base.shm_backing_budget_bytes = 0;
-        let mut client = IpcClient::with_endpoint(endpoint.endpoint.clone(), cfg).unwrap();
+        let mut client = endpoint.client_without_memory();
         client.connect().await.unwrap();
         let binding = client.acquire_route(&contract()).await.unwrap();
         let items: Vec<Result<Vec<u8>, std::io::Error>> = if source_error {
@@ -732,16 +733,17 @@ async fn source_error_after_first_chunk_is_uncertain_and_records_request_source(
         );
         crate::tests::close_listener(listener).await;
     });
-    let mut cfg = config();
-    cfg.base.shm_backing_budget_bytes = 0;
-    let mut client = IpcClient::with_endpoint(endpoint.endpoint.clone(), cfg).unwrap();
+    let mut client = endpoint.client_without_memory();
     client.connect().await.unwrap();
     let binding = cached_binding(&client);
     let observation = client.connection_observation().unwrap();
     let (gate, opened) = oneshot::channel::<()>();
     let source = futures_util::stream::unfold((0u8, Some(opened)), |(step, gate)| async move {
         if step == 0 {
-            Some((Ok::<_, std::io::Error>(vec![1; 4096]), (1, gate)))
+            Some((
+                Ok::<_, std::io::Error>(vec![1; CHUNK_SIZE as usize]),
+                (1, gate),
+            ))
         } else if step == 1 {
             gate.unwrap().await.unwrap();
             Some((Err(std::io::Error::other("late source failure")), (2, None)))
@@ -751,7 +753,7 @@ async fn source_error_after_first_chunk_is_uncertain_and_records_request_source(
     });
     let call = tokio::spawn(async move {
         let error = client
-            .call_bound_sized_stream_phased(&binding, "echo", 8193, source, None)
+            .call_bound_sized_stream_phased(&binding, "echo", CHUNK_SIZE * 2 + 1, source, None)
             .await
             .unwrap_err();
         (client, error)
@@ -936,11 +938,11 @@ async fn sync_client_controlled_async_call_uses_caller_runtime_without_nested_bl
     let context = LocalEndpointContext::with_unix_root(endpoint._root.path()).unwrap();
     #[cfg(windows)]
     let context = LocalEndpointContext::default_for_platform().unwrap();
-    let pool = Arc::new(crate::ClientPool::with_endpoint_context(WAIT, context));
+    let pool = Arc::new(crate::ClientPool::with_endpoint_context(context));
     let address = endpoint.endpoint.address().to_string();
     let client = tokio::task::spawn_blocking({
         let pool = pool.clone();
-        move || pool.acquire(&address, Some(&config())).unwrap()
+        move || pool.acquire(&address).unwrap()
     })
     .await
     .unwrap();
@@ -974,18 +976,16 @@ async fn sync_client_controlled_async_call_uses_caller_runtime_without_nested_bl
 
 #[tokio::test]
 async fn inline_stream_copy_reserves_before_polling_its_charged_source() {
-    use c2_mem::retention::{BudgetedBuffer, PayloadBufferBudget};
+    use c2_mem::BudgetedBuffer;
 
     let endpoint = Endpoint::new();
     let calls = Arc::new(CountEcho(AtomicU64::new(0)));
     let (server, runner) = start(&endpoint, calls.clone(), ServerIpcConfig::default()).await;
-    let mut cfg = config();
-    cfg.shm_threshold = u64::MAX;
-    let mut client = IpcClient::with_endpoint(endpoint.endpoint.clone(), cfg).unwrap();
+    let mut client = endpoint.client();
     client.connect().await.unwrap();
     let binding = client.acquire_route(&contract()).await.unwrap();
-    let budget = PayloadBufferBudget::new(4);
-    let source = BudgetedBuffer::new(vec![3; 4], budget.try_reserve(4).unwrap());
+    let budget = memory_budget(4);
+    let source = BudgetedBuffer::new(vec![3; 4], budget.try_reserve_memory(4).unwrap());
     let polls = Arc::new(AtomicU64::new(0));
     let polled = polls.clone();
     let source = futures_util::stream::iter([Ok::<_, std::io::Error>(source)]).inspect(move |_| {
@@ -1002,10 +1002,10 @@ async fn inline_stream_copy_reserves_before_polling_its_charged_source() {
     );
     assert_eq!(polls.load(Ordering::SeqCst), 0);
     assert_eq!(calls.0.load(Ordering::SeqCst), 0);
-    assert_eq!(budget.snapshot().used_bytes, 0);
-    assert_eq!(budget.snapshot().peak_bytes, 4);
-    assert_eq!(budget.snapshot().rejected_allocations, 1);
-    assert_eq!(budget.snapshot().rejected_bytes, 4);
+    assert_eq!(budget.snapshot().memory.used_bytes, 0);
+    assert_eq!(budget.snapshot().memory.peak_bytes, 4);
+    assert_eq!(budget.snapshot().memory.rejected_allocations, 1);
+    assert_eq!(budget.snapshot().memory.rejected_bytes, 4);
     assert!(client.is_connected());
     assert_eq!(
         client
@@ -1022,18 +1022,16 @@ async fn inline_stream_copy_reserves_before_polling_its_charged_source() {
 
 #[tokio::test]
 async fn owned_input_survives_unpublished_shm_fallback_without_an_extra_copy() {
-    use c2_mem::retention::{BudgetedBuffer, PayloadBufferBudget};
+    use c2_mem::BudgetedBuffer;
 
     let endpoint = Endpoint::new();
     let calls = Arc::new(CountEcho(AtomicU64::new(0)));
     let (server, runner) = start(&endpoint, calls.clone(), ServerIpcConfig::default()).await;
-    let mut cfg = config();
-    cfg.base.shm_backing_budget_bytes = 0;
-    let mut client = IpcClient::with_endpoint(endpoint.endpoint.clone(), cfg).unwrap();
+    let mut client = endpoint.client_without_memory();
     client.connect().await.unwrap();
     let binding = client.acquire_route(&contract()).await.unwrap();
-    let budget = PayloadBufferBudget::new(8193);
-    let input = BudgetedBuffer::new(vec![7; 8193], budget.try_reserve(8193).unwrap());
+    let budget = memory_budget(8193);
+    let input = BudgetedBuffer::new(vec![7; 8193], budget.try_reserve_memory(8193).unwrap());
     let dispatches = Arc::new(AtomicU64::new(0));
     let counted = dispatches.clone();
     let control = IpcCallControl::new(move || {
@@ -1047,10 +1045,10 @@ async fn owned_input_survives_unpublished_shm_fallback_without_an_extra_copy() {
     assert_eq!(reply.into_owned_bytes().unwrap(), vec![7; 8193]);
     assert_eq!(dispatches.load(Ordering::SeqCst), 1);
     assert_eq!(calls.0.load(Ordering::SeqCst), 1);
-    assert_eq!(budget.snapshot().used_bytes, 0);
-    assert_eq!(budget.snapshot().peak_bytes, 8193);
-    assert_eq!(budget.snapshot().rejected_allocations, 0);
-    assert_eq!(client.memory_budget.snapshot().shm.used_bytes, 0);
+    assert_eq!(budget.snapshot().memory.used_bytes, 0);
+    assert_eq!(budget.snapshot().memory.peak_bytes, 8193);
+    assert_eq!(budget.snapshot().memory.rejected_allocations, 0);
+    assert_eq!(client.domain_snapshot().memory.used_bytes, 0);
     assert!(client.close_shared_bounded(WAIT).await);
     stop(server, runner).await;
 }
@@ -1121,9 +1119,7 @@ async fn source_error_terminal_receipt_race(rejected: bool) {
         expect_disconnect_or_eof(&mut stream).await;
         crate::tests::close_listener(listener).await;
     });
-    let mut cfg = config();
-    cfg.base.shm_backing_budget_bytes = 0;
-    let mut client = IpcClient::with_endpoint(endpoint.endpoint.clone(), cfg).unwrap();
+    let mut client = endpoint.client_without_memory();
     client.connect().await.unwrap();
     let binding = cached_binding(&client);
     let client = Arc::new(client);
@@ -1135,7 +1131,7 @@ async fn source_error_terminal_receipt_race(rejected: bool) {
     let source =
         futures_util::stream::unfold((0, Some(source_error)), move |(step, error)| async move {
             if step < sent_parts {
-                Some((Ok(vec![1; 4096]), (step + 1, error)))
+                Some((Ok(vec![1; CHUNK_SIZE as usize]), (step + 1, error)))
             } else {
                 error.map(|error| (Err(error), (step + 1, None)))
             }
@@ -1144,7 +1140,7 @@ async fn source_error_terminal_receipt_race(rejected: bool) {
         let client = client.clone();
         async move {
             client
-                .call_bound_sized_stream_phased(&binding, "echo", 8192, source, None)
+                .call_bound_sized_stream_phased(&binding, "echo", CHUNK_SIZE * 2, source, None)
                 .await
         }
     });

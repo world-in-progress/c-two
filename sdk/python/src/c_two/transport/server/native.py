@@ -144,9 +144,6 @@ class NativeServerBridge:
         *,
         local_copy_tracker: object | None = None,
     ) -> None:
-        # Keep config failures at bridge construction, before CRM binding work.
-        runtime_session._preflight_server_config()
-
         self._slots: dict[str, CRMSlot] = {}
         self._slots_lock = threading.Lock()
 

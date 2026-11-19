@@ -33,7 +33,7 @@ class PeerResource:
 @pytest.fixture(autouse=True)
 def isolated_runtime(tmp_path, monkeypatch):
     _reset_default_runtime()
-    for name in ('_relay_anchor_address', '_shm_threshold', '_remote_payload_chunk_size'):
+    for name in ('_relay_anchor_address',):
         monkeypatch.setattr(settings, name, None)
     monkeypatch.setenv('C2_RELAY_ANCHOR_ADDRESS', '')
     monkeypatch.delenv('C2_IPC_ROOT', raising=False)
@@ -203,10 +203,10 @@ def finish_startup_connections(events):
 def test_idle_client_end_notifies_server(terminate, reconfigure):
     events = cc.observe.connection_events()
     if reconfigure:
-        cc.set_transport_policy(shm_threshold=8192, remote_payload_chunk_size=8192)
+        cc.set_client(memory_budget_bytes=8192)
         assert events.recv(0.0) is None
         runtime = _get_default_runtime()._runtime_session
-        assert runtime.client_ipc_config['shm_threshold'] == 8192
+        assert runtime.memory_stats()['client']['memory'] is None
         assert not runtime.client_config_frozen
         assert runtime.server_address is None
     cc.register(ObservationPeer, PeerResource(), name='peer')

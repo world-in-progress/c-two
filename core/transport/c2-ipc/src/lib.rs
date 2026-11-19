@@ -27,15 +27,12 @@ mod tests;
 pub use c2_local::{ConnectionClosed, ConnectionEndReason, ConnectionObservation};
 pub use client::forward::{ForwardRecord, IpcForwardCancellation, IpcForwardStream};
 pub use client::stream::{IpcResponseStream, IpcStreamCancellation, StreamTerminal};
-pub use client::{
-    ClientIpcConfig, IpcCallControl, IpcClient, IpcError, MethodTable, RouteBinding,
-    ServerPoolState,
-};
+pub use client::{IpcCallControl, IpcClient, IpcError, MethodTable, RouteBinding, ServerPoolState};
 pub use control::{
     DirectIpcShutdownOutcome, local_endpoint_from_ipc_address, ping, ping_with_context,
     ping_with_endpoint, shutdown, shutdown_with_context, shutdown_with_endpoint,
 };
-pub use pool::{ClientCacheMemorySnapshot, ClientPool};
+pub use pool::ClientPool;
 pub use response::{ResponseCursor, ResponseData, ServerShmResponse};
 #[doc(hidden)]
 pub use sync_client::shared_io_handle;

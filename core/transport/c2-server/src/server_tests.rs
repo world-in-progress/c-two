@@ -1,5 +1,6 @@
 use super::*;
 use crate::test_support::isolated_pair;
+use c2_config::PoolConfig;
 use c2_wire::buddy::{BuddyPayload, encode_buddy_payload};
 use c2_wire::flags::FLAG_BUDDY;
 use std::collections::HashMap;
@@ -48,6 +49,27 @@ fn test_parse_local_endpoint(address: &str) -> Result<LocalEndpoint, ServerError
 
 fn test_server_new(address: &str, config: ServerIpcConfig) -> Result<Server, ServerError> {
     Server::new_with_endpoint(test_parse_local_endpoint(address)?, config)
+}
+
+fn test_server_with_limits(address: &str, config: ServerIpcConfig, limits: DomainLimits) -> Server {
+    Server::new_with_identity_endpoint_and_budget(
+        test_parse_local_endpoint(address).unwrap(),
+        config,
+        ServerIdentity {
+            server_id: server_id_from_ipc_address(address).unwrap(),
+            server_instance_id: uuid::Uuid::new_v4().simple().to_string(),
+        },
+        DomainBudget::from_limits(&limits),
+    )
+    .unwrap()
+}
+
+fn operation_limit(server: &Server) -> usize {
+    server.domain_snapshot().operations.max_operations as usize
+}
+
+fn available_operations(server: &Server) -> usize {
+    operation_limit(server) - server.domain_snapshot().operations.used_operations as usize
 }
 
 fn test_server_with_identity(
@@ -218,7 +240,6 @@ fn small_response_pool(label: &str) -> crate::ResponsePool {
         MemPool::new_with_prefix(
             PoolConfig {
                 segment_size: 64 * 1024,
-                min_block_size: 4096,
                 max_segments: 1,
                 max_dedicated_segments: 1,
                 ..PoolConfig::default()
@@ -236,13 +257,7 @@ async fn closed_writer() -> Arc<ConnectionWriter> {
     let (_reader, write_half) = server.into_split();
     let conn = Arc::new(Connection::new(0));
     conn.set_handshake_done(true).unwrap();
-    ConnectionWriter::spawn(
-        write_half,
-        conn,
-        Duration::from_secs(30),
-        Arc::new(Semaphore::new(1024)),
-    )
-    .0
+    ConnectionWriter::spawn(write_half, conn, Duration::from_secs(30), 1024).0
 }
 
 async fn endpoint_connects(endpoint: &LocalEndpoint) -> bool {
@@ -822,25 +837,26 @@ async fn same_server_can_start_again_after_shutdown() {
 }
 
 fn retained_backing_server(label: &str) -> Arc<Server> {
-    let mut config = ServerIpcConfig::default();
-    config.base.pool_segment_size = 64 * 1024;
-    config.base.reassembly_segment_size = 64 * 1024;
-    config.base.pool_prewarm_segments = 1;
-    config.base.pool_min_retained_segments = 1;
-    config.pool_decay_seconds = 3600.0;
-    Arc::new(test_server_new(&unique_readiness_address(label), config).unwrap())
+    Arc::new(test_server_with_limits(
+        &unique_readiness_address(label),
+        Default::default(),
+        DomainLimits {
+            memory_budget_bytes: 1024 * 1024,
+            ..Default::default()
+        },
+    ))
 }
 
 #[tokio::test]
-async fn stopped_server_releases_idle_backing_before_terminal_and_rewarms_on_restart() {
+async fn stopped_server_releases_idle_backing_before_terminal_and_restarts_cold() {
     let server = retained_backing_server("retired_idle_backing");
-    let observer = server.memory_budget_observer();
+    let observer = server.domain_budget().observe();
     let reassembly = server.chunk_registry.pool();
-    assert_eq!(observer.snapshot().shm.used_bytes, 0);
+    assert_eq!(observer.snapshot().memory.used_bytes, 0);
     assert_eq!(server.response_pool.read().segment_count(), 0);
     let handle = reassembly.write().alloc_shm_handle(4096).unwrap();
     reassembly.write().release_handle(handle);
-    assert_eq!(observer.snapshot().shm.used_bytes, 64 * 1024);
+    assert_eq!(observer.snapshot().memory.used_bytes, 64 * 1024);
     let runner = {
         let server = server.clone();
         tokio::spawn(async move { server.run().await })
@@ -849,24 +865,29 @@ async fn stopped_server_releases_idle_backing_before_terminal_and_rewarms_on_res
         .wait_until_ready(Duration::from_secs(5))
         .await
         .unwrap();
-    assert_eq!(observer.snapshot().shm.used_bytes, 2 * 64 * 1024);
-    let generation = server.response_pool.read().segment_generation(0).unwrap();
+    let handle = server
+        .response_pool
+        .inner
+        .write()
+        .alloc_shm_handle(4096)
+        .unwrap();
+    server.response_pool.inner.write().release_handle(handle);
+    assert_eq!(observer.snapshot().memory.used_bytes, 128 * 1024);
     server
         .shutdown_and_wait(Duration::from_secs(5))
         .await
         .unwrap();
     // Keep Server, response-pool metadata and reassembly-pool metadata alive.
     // Its terminal watch must already prove idle backing was actually unmapped.
-    assert_eq!(observer.snapshot().shm.used_bytes, 0);
-    assert_eq!(observer.snapshot().file.used_bytes, 0);
-    assert_eq!(observer.snapshot().reassembly.used_bytes, 0);
+    assert_eq!(observer.snapshot().memory.used_bytes, 0);
+    assert_eq!(observer.snapshot().file_spill.used_bytes, 0);
+    assert_eq!(observer.snapshot().memory.used_bytes, 0);
     assert_eq!(server.response_pool.read().stats().buddy_idle_bytes, 0);
     assert_eq!(reassembly.read().stats().buddy_idle_bytes, 0);
     runner.await.unwrap().unwrap();
 
     server.begin_start_attempt().unwrap();
-    assert_eq!(observer.snapshot().shm.used_bytes, 64 * 1024);
-    assert!(server.response_pool.read().segment_generation(0).unwrap() > generation);
+    assert_eq!(observer.snapshot().memory.used_bytes, 0);
     let runner = {
         let server = server.clone();
         tokio::spawn(async move { server.run().await })
@@ -879,19 +900,19 @@ async fn stopped_server_releases_idle_backing_before_terminal_and_rewarms_on_res
         .shutdown_and_wait(Duration::from_secs(5))
         .await
         .unwrap();
-    assert_eq!(observer.snapshot().shm.used_bytes, 0);
+    assert_eq!(observer.snapshot().memory.used_bytes, 0);
     runner.await.unwrap().unwrap();
 }
 
 #[tokio::test]
 async fn stopped_server_keeps_live_backing_until_its_original_allocations_release() {
     let server = retained_backing_server("retired_live_backing");
-    let observer = server.memory_budget_observer();
+    let observer = server.domain_budget().observe();
     let response = server.response_pool_arc();
     let reassembly = server.chunk_registry.pool();
     let response_handle = response.inner.write().alloc_shm_handle(4096).unwrap();
     let reassembly_handle = reassembly.write().alloc_shm_handle(4096).unwrap();
-    let charged = observer.snapshot().shm.used_bytes;
+    let charged = observer.snapshot().memory.used_bytes;
     assert_eq!(charged, 2 * 64 * 1024);
     let runner = {
         let server = server.clone();
@@ -905,17 +926,17 @@ async fn stopped_server_keeps_live_backing_until_its_original_allocations_releas
         .shutdown_and_wait(Duration::from_secs(5))
         .await
         .unwrap();
-    assert_eq!(observer.snapshot().shm.used_bytes, charged);
+    assert_eq!(observer.snapshot().memory.used_bytes, charged);
     assert_eq!(response.read().handle_slice(&response_handle).len(), 4096);
     assert_eq!(
         reassembly.read().handle_slice(&reassembly_handle).len(),
         4096
     );
     response.inner.write().release_handle(response_handle);
-    assert_eq!(observer.snapshot().shm.used_bytes, 64 * 1024);
+    assert_eq!(observer.snapshot().memory.used_bytes, 64 * 1024);
     reassembly.write().release_handle(reassembly_handle);
     // No GC tick, Server Drop or extra shutdown call is needed to refund it.
-    assert_eq!(observer.snapshot().shm.used_bytes, 0);
+    assert_eq!(observer.snapshot().memory.used_bytes, 0);
     runner.await.unwrap().unwrap();
 }
 
@@ -1165,7 +1186,7 @@ async fn reserved_route_pending_cannot_activate_after_generation_change() {
     let fixture = admission_fixture();
     let server = &fixture.server;
     let route = admission_route(server, "grid", ConcurrencyMode::Parallel).await;
-    let mut identity = call_identity("grid");
+    let identity = call_identity("grid");
     let request = reserve_accepted_route_execution(server, &identity, 0, CallMode::Unary)
         .ok()
         .expect("route reservation");
@@ -1198,7 +1219,7 @@ async fn admission_global_queue_rejects_old_route_guard() {
         pending,
         &conn,
         1,
-        RequestData::Inline(vec![]),
+        OwnedRequestInput::unreserved(RequestData::Inline(vec![])),
         |_| panic!("old global waiter must not invoke the resource"),
     ));
     assert!(admission_poll_once(request.as_mut()).await.is_pending());
@@ -1234,7 +1255,7 @@ async fn admission_global_queue_rejects_old_route_guard() {
         pending,
         &conn,
         2,
-        RequestData::Inline(vec![]),
+        OwnedRequestInput::unreserved(RequestData::Inline(vec![])),
         |_| Ok(ResponseMeta::Inline(vec![])),
     )
     .await
@@ -2059,7 +2080,6 @@ fn route_waiters_do_not_occupy_blocking_execution_threads() {
 
     let config = ServerIpcConfig {
         max_execution_workers: 2,
-        max_pending_requests: 8,
         ..ServerIpcConfig::default()
     };
     let rt = ServerRuntimeBuilder::build(&config).unwrap();
@@ -2207,7 +2227,6 @@ fn unregister_closes_admission_before_waiting_on_blocking_pool_drain() {
 
     let config = ServerIpcConfig {
         max_execution_workers: 1,
-        max_pending_requests: 8,
         ..ServerIpcConfig::default()
     };
     let rt = ServerRuntimeBuilder::build(&config).unwrap();
@@ -2706,7 +2725,7 @@ async fn connection_close_cancels_request_waiting_for_server_execution_slot() {
         let conn = server
             .active_connection(observation.connection_id())
             .unwrap();
-        let available = server.pending_requests.available_permits();
+        let available = available_operations(&server);
         for (rid, route) in [(1, "grid_a"), (2, "grid_b")] {
             let frame = inline_call_frame(rid, route, &[]);
             peer.as_mut().unwrap().write_all(&frame).await.unwrap();
@@ -2718,8 +2737,7 @@ async fn connection_close_cancels_request_waiting_for_server_execution_slot() {
             }
         }
         wait_until("route B queued behind the active callback", || {
-            conn.inflight_count() == 2
-                && server.pending_requests.available_permits() == available - 2
+            conn.inflight_count() == 2 && available_operations(&server) == available - 2
         })
         .await;
 
@@ -2751,8 +2769,7 @@ async fn connection_close_cancels_request_waiting_for_server_execution_slot() {
         assert_eq!(server.active_connection_count(), 1);
         drop(peer);
         wait_until("deactivated connection cancels only queued work", || {
-            conn.inflight_count() == 1
-                && server.pending_requests.available_permits() == available - 1
+            conn.inflight_count() == 1 && available_operations(&server) == available - 1
         })
         .await;
         assert_eq!(route_b_started.load(Ordering::SeqCst), 0);
@@ -2783,7 +2800,7 @@ async fn connection_close_cancels_request_waiting_for_server_execution_slot() {
             .unwrap();
         assert_eq!(closed.reason(), reason);
         wait_until("drain returns the original pending permits", || {
-            server.pending_requests.available_permits() == available
+            available_operations(&server) == available
         })
         .await;
         assert_eq!(conn.inflight_count(), 0);
@@ -2886,11 +2903,17 @@ async fn inline_dispatch_rejects_when_server_pending_capacity_is_exhausted() {
     }
 
     let config = ServerIpcConfig {
-        max_pending_requests: 1,
         max_execution_workers: 2,
         ..ServerIpcConfig::default()
     };
-    let server = Arc::new(test_server_new("ipc://server_pending_limit", config).unwrap());
+    let server = Arc::new(test_server_with_limits(
+        "ipc://server_pending_limit",
+        config,
+        DomainLimits {
+            max_outstanding_calls: 1,
+            ..Default::default()
+        },
+    ));
 
     let started = Arc::new(AtomicUsize::new(0));
     let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
@@ -2951,7 +2974,10 @@ async fn inline_dispatch_rejects_when_server_pending_capacity_is_exhausted() {
         }
     };
 
-    assert!(reply.contains("max_pending_requests=1"), "{reply}");
+    assert!(
+        reply.contains("all 1 operation slots are in use"),
+        "{reply}"
+    );
     assert_eq!(started.load(Ordering::SeqCst), 1);
 
     {
@@ -3196,23 +3222,6 @@ async fn connection_accepted_after_shutdown_rejects_non_shutdown_frame_without_b
         .await
         .expect("post-shutdown non-shutdown frame must close without waiting for body")
         .expect("handler completes");
-}
-
-#[test]
-fn chunk_processing_permit_is_bounded_by_max_inflight_chunk_frames() {
-    let config = ServerIpcConfig {
-        base: c2_config::BaseIpcConfig {
-            max_inflight_chunk_frames: 1,
-            ..c2_config::BaseIpcConfig::default()
-        },
-        ..ServerIpcConfig::default()
-    };
-    let server = test_server_new("ipc://chunk_processing_limit", config).unwrap();
-
-    let first = server.try_acquire_chunk_processing_permit().unwrap();
-    assert_eq!(server.try_acquire_chunk_processing_permit().unwrap_err(), 1);
-    drop(first);
-    assert!(server.try_acquire_chunk_processing_permit().is_ok());
 }
 
 // -- shutdown --
@@ -3551,19 +3560,15 @@ async fn standalone_shutdown_ack_survives_delayed_read_until_peer_closes() {
 #[tokio::test]
 async fn standalone_shutdown_ack_peer_wait_uses_configured_write_budget() {
     for already_stopping in [false, true] {
-        let server = Arc::new(
-            test_server_new(
-                &unique_readiness_address("shutdown_ack_budget"),
-                ServerIpcConfig {
-                    base: c2_config::BaseIpcConfig {
-                        write_timeout_secs: 0.05,
-                        ..Default::default()
-                    },
-                    ..Default::default()
-                },
-            )
-            .unwrap(),
-        );
+        let mut server = test_server_new(
+            &unique_readiness_address("shutdown_ack_budget"),
+            ServerIpcConfig {
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        server.test_write_timeout = Duration::from_millis(50);
+        let server = Arc::new(server);
         if already_stopping {
             server.request_shutdown_signal();
         }
@@ -3787,16 +3792,17 @@ async fn unrecoverable_server_read_closes_with_published_loan_in_original_pool()
 
     let directory = tempfile::tempdir().unwrap();
     let pool = Arc::new(parking_lot::RwLock::new(
-        MemPool::new_with_prefix(
+        MemPool::new_with_prefix_and_budget(
             PoolConfig {
                 max_segments: 0,
                 max_dedicated_segments: 0,
                 min_retained_segments: 0,
-                buddy_enabled: false,
+                pool_enabled: false,
                 spill_dir: directory.path().to_path_buf(),
                 ..PoolConfig::default()
             },
             unique_response_pool_prefix("unread_loan"),
+            DomainBudget::from_limits(&DomainLimits::default()),
         )
         .unwrap(),
     ));
@@ -3815,7 +3821,12 @@ async fn unrecoverable_server_read_closes_with_published_loan_in_original_pool()
     batch.frame_completed();
     batch.flush_completed();
     assert_eq!(
-        pool.read().budget().unwrap().snapshot().file.used_bytes,
+        pool.read()
+            .budget()
+            .unwrap()
+            .snapshot()
+            .file_spill
+            .used_bytes,
         4096
     );
 
@@ -3832,7 +3843,12 @@ async fn unrecoverable_server_read_closes_with_published_loan_in_original_pool()
         "the published loan is still recorded"
     );
     assert_eq!(
-        pool.read().budget().unwrap().snapshot().file.used_bytes,
+        pool.read()
+            .budget()
+            .unwrap()
+            .snapshot()
+            .file_spill
+            .used_bytes,
         4096
     );
     drop(conn);
@@ -3917,7 +3933,6 @@ async fn raw_buddy_request_releases_before_blocked_callback_completes() {
     let mut pool = MemPool::new_with_prefix(
         PoolConfig {
             segment_size: 64 * 1024,
-            min_block_size: 4096,
             max_segments: 1,
             max_dedicated_segments: 1,
             ..PoolConfig::default()
@@ -4000,7 +4015,6 @@ async fn raw_buddy_mapping_failure_still_queues_release() {
     let mut pool = MemPool::new_with_prefix(
         PoolConfig {
             segment_size: 64 * 1024,
-            min_block_size: 4096,
             max_segments: 1,
             ..PoolConfig::default()
         },
@@ -4046,8 +4060,7 @@ async fn raw_response_loan_settlement(release_frame: bool, shutdown_before_relea
     use c2_wire::release::{ReleaseBatch, encode_release_frame};
     use std::sync::atomic::AtomicUsize;
 
-    let mut config = ServerIpcConfig::default();
-    config.shm_threshold = 1;
+    let config = ServerIpcConfig::default();
     let server =
         Arc::new(test_server_new(&unique_readiness_address("raw_response_loan"), config).unwrap());
     let mut route = make_host_route(&server, "grid");
@@ -4069,7 +4082,7 @@ async fn raw_response_loan_settlement(release_frame: bool, shutdown_before_relea
         .unwrap();
     let ack = handshake_test_client_with(&mut client, CAP_SHM_RESPONSE, "").await;
     assert_ne!(ack.capability_flags & CAP_SHM_RESPONSE, 0);
-    let expected = b"response loan bytes".repeat(512);
+    let expected = b"response loan bytes".repeat(2048);
     client
         .write_all(&inline_call_frame(91, "grid", &expected))
         .await
@@ -4169,12 +4182,8 @@ async fn response_write_failure_keeps_published_loan_until_peer_end() {
     let call = conn.calls.lock().open(93, ServerCall::default()).unwrap();
     assert!(call.queue());
     assert!(call.enter_resource());
-    let (writer, writer_task) = ConnectionWriter::spawn(
-        half,
-        Arc::clone(&conn),
-        Duration::from_secs(30),
-        Arc::new(Semaphore::new(1024)),
-    );
+    let (writer, writer_task) =
+        ConnectionWriter::spawn(half, Arc::clone(&conn), Duration::from_secs(30), 1024);
 
     let result = send_response_meta(
         &pool,
@@ -4418,19 +4427,18 @@ fn value_chunk_call_frame(
     }
 }
 
-fn chunk_test_server(address: &str, max_inflight_chunk_frames: u32) -> Arc<Server> {
-    let mut config = ServerIpcConfig::default();
-    config.base.max_inflight_chunk_frames = max_inflight_chunk_frames;
-    Arc::new(test_server_new(address, config).unwrap())
+fn chunk_test_server(address: &str, copies: usize) -> Arc<Server> {
+    let config = ServerIpcConfig::default();
+    let mut server = test_server_new(address, config).unwrap();
+    server.copy_permits = Arc::new(Semaphore::new(copies));
+    Arc::new(server)
 }
 
-async fn assert_early_chunk_refusal_preserves_connection(processing_capacity: bool) {
+async fn assert_early_chunk_refusal_preserves_connection() {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     let mut config = ServerIpcConfig::default();
-    config.base.max_inflight_chunk_frames = 2;
-    config.base.max_reassembly_bytes = if processing_capacity { 1024 } else { 64 };
-    config.base.chunk_assembler_timeout_secs = 0.02;
+    config.max_payload_size = 64;
     let server = Arc::new(test_server_new("ipc://early_chunk_refusal", config).unwrap());
     let calls = Arc::new(AtomicUsize::new(0));
     let mut route = make_host_route(&server, "grid");
@@ -4442,17 +4450,6 @@ async fn assert_early_chunk_refusal_preserves_connection(processing_capacity: bo
     let (mut client, stream) = isolated_pair().await;
     let handler = tokio::spawn(handle_connection(Arc::clone(&server), stream));
     handshake_test_client(&mut client).await;
-    let occupied = if processing_capacity {
-        Some(
-            server
-                .chunk_processing_permits
-                .clone()
-                .try_acquire_many_owned(2)
-                .unwrap(),
-        )
-    } else {
-        None
-    };
     client
         .write_all(&chunked_call_frame(61, 0, 6, &[0x11; 32], "grid"))
         .await
@@ -4462,7 +4459,6 @@ async fn assert_early_chunk_refusal_preserves_connection(processing_capacity: bo
     assert_eq!(flags, c2_wire::flags::FLAG_RPC_RECORD | FLAG_RESPONSE);
     assert_call_end_status(&reply, c2_wire::rpc::CallStatus::NotExecuted);
     assert_eq!(calls.load(Ordering::SeqCst), 0);
-    drop(occupied);
 
     // The refused record has no retained tombstone. High-water rejects its
     // later chunks even after the old assembler timeout and GC pass.
@@ -4489,30 +4485,31 @@ async fn assert_early_chunk_refusal_preserves_connection(processing_capacity: bo
     assert_eq!(&next[2..], b"next");
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     assert_eq!(server.chunk_registry.active_count(), 0);
-    assert_eq!(server.chunk_processing_permits.available_permits(), 2);
     drop(client);
     handler.await.unwrap();
 }
 
 #[tokio::test]
 async fn reassembly_size_refusal_discards_late_chunks_and_preserves_connection() {
-    assert_early_chunk_refusal_preserves_connection(false).await;
-}
-
-#[tokio::test]
-async fn chunk_processing_refusal_discards_late_chunks_and_preserves_connection() {
-    assert_early_chunk_refusal_preserves_connection(true).await;
+    assert_early_chunk_refusal_preserves_connection().await;
 }
 
 #[tokio::test]
 async fn gc_late_chunk_still_reports_to_the_waiting_call() {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    let mut config = ServerIpcConfig::default();
-    config.base.chunk_assembler_timeout_secs = 0.05;
-    config.base.chunk_gc_interval_secs = 0.005;
-    let server =
-        Arc::new(test_server_new(&unique_readiness_address("gc_late_call_probe"), config).unwrap());
+    let config = ServerIpcConfig::default();
+    let mut server =
+        test_server_new(&unique_readiness_address("gc_late_call_probe"), config).unwrap();
+    server.chunk_registry = Arc::new(c2_wire::chunk::ChunkRegistry::new(
+        server.chunk_registry.pool().clone(),
+        c2_wire::chunk::ChunkConfig {
+            assembler_timeout: Duration::from_millis(50),
+            gc_interval: Duration::from_millis(5),
+            ..Default::default()
+        },
+    ));
+    let server = Arc::new(server);
     let calls = Arc::new(AtomicUsize::new(0));
     let mut route = make_host_route(&server, "grid");
     route.callback = Arc::new(EchoRequestBytes {
@@ -4625,7 +4622,12 @@ async fn forced_chunked_100_mib_request_succeeds_above_inflight_chunk_limit() {
         max_payload_size: PAYLOAD_SIZE as u64,
         ..Default::default()
     };
-    assert!(u32::from(TOTAL_CHUNKS) > config.max_inflight_chunk_frames);
+    assert!(
+        usize::from(TOTAL_CHUNKS)
+            > crate::runtime::derive_blocking_pool(&config)
+                .unwrap()
+                .copy_permits
+    );
     let server = Arc::new(test_server_new("ipc://chunked_100_mib", config).unwrap());
     let mut route = make_host_route(&server, "grid");
     route.callback = Arc::new(VerifyLargeRequest);
@@ -4654,8 +4656,10 @@ async fn forced_chunked_100_mib_request_succeeds_above_inflight_chunk_limit() {
                 String::from_utf8_lossy(&payload)
             );
             wait_until("chunk processing drain", || {
-                server.chunk_processing_permits.available_permits()
-                    == server.config.max_inflight_chunk_frames as usize
+                server.copy_permits.available_permits()
+                    == crate::runtime::derive_blocking_pool(&server.config)
+                        .unwrap()
+                        .copy_permits
             })
             .await;
         }
@@ -4804,9 +4808,15 @@ async fn first_chunk_write_precedes_later_unary_on_same_connection() {
 
 #[tokio::test]
 async fn incomplete_first_chunk_holds_server_pending_capacity() {
-    let mut config = ServerIpcConfig::default();
-    config.max_pending_requests = 1;
-    let server = Arc::new(test_server_new("ipc://chunk_pending_capacity", config).unwrap());
+    let config = ServerIpcConfig::default();
+    let server = Arc::new(test_server_with_limits(
+        "ipc://chunk_pending_capacity",
+        config,
+        DomainLimits {
+            max_outstanding_calls: 1,
+            ..Default::default()
+        },
+    ));
     server
         .register_route(make_host_route(&server, "grid"))
         .await
@@ -4829,14 +4839,31 @@ async fn incomplete_first_chunk_holds_server_pending_capacity() {
         .await
         .unwrap();
     assert_eq!(read_reply_frame(&mut client).await.0, 3);
-    assert_eq!(server.pending_requests.available_permits(), 0);
+    assert_eq!(available_operations(&server), 0);
     client
-        .write_all(&inline_call_frame(2, "grid", b"second"))
+        .write_all(&chunked_call_frame(2, 0, 2, b"second", "grid"))
         .await
         .unwrap();
     let (id, _, reply) = read_reply_frame(&mut client).await;
     assert_eq!(id, 2);
-    assert!(reply_error_message(&reply).contains("max_pending_requests=1"));
+    let (TestReply::Error(error), _) = decode_test_call_end(&reply, 0).unwrap() else {
+        panic!("expected refused second OPEN");
+    };
+    let error = C2Error::from_wire_bytes(&error).unwrap().unwrap();
+    assert_eq!(error.code, ErrorCode::CallCapacityExceeded);
+    assert_eq!(error.details["stage"], "call_execution_admission");
+    let conn = server
+        .active_connection(server.active_connection_ids()[0])
+        .unwrap();
+    assert!(matches!(
+        conn.calls.lock().continuation(2),
+        CallLookup::Retired
+    ));
+    assert_eq!(conn.calls.lock().active().count(), 1);
+    client
+        .write_all(&chunked_call_frame(2, 1, 2, b"-late!", "grid"))
+        .await
+        .unwrap();
     drop(backing);
     client
         .write_all(&chunked_call_frame(1, 1, 2, b"-done", "grid"))
@@ -4849,7 +4876,7 @@ async fn incomplete_first_chunk_holds_server_pending_capacity() {
         TestReply::Success
     ));
     wait_until("chunk pending slot returned", || {
-        server.pending_requests.available_permits() == 1
+        available_operations(&server) == 1
     })
     .await;
     drop(client);
@@ -4939,12 +4966,8 @@ async fn handshake_ack_intersects_offer_with_native_reachability() {
         let (_reader, write_half) = stream.into_split();
         let conn = Arc::new(Connection::new(41));
         conn.set_native_shm_reachable(native);
-        let (writer, writer_task) = ConnectionWriter::spawn(
-            write_half,
-            Arc::clone(&conn),
-            Duration::from_secs(30),
-            Arc::new(Semaphore::new(1024)),
-        );
+        let (writer, writer_task) =
+            ConnectionWriter::spawn(write_half, Arc::clone(&conn), Duration::from_secs(30), 1024);
 
         let handshake =
             c2_wire::handshake::encode_client_handshake(base_caps | offer, "shm-ack-prefix")
@@ -5008,17 +5031,8 @@ async fn version_fence_connection() -> (Arc<Server>, LocalStream, LocalStream) {
 #[tokio::test]
 async fn handshake_version_mismatch_returns_fixed_preamble() {
     let local = HANDSHAKE_VERSION;
-    for (max_frame, peer) in [
-        (u32::MAX, 1),
-        (u32::MAX, local + 1),
-        (u32::MAX, u32::MAX),
-        (526, local + 1),
-    ] {
-        let (mut server, mut client, stream) = version_fence_connection().await;
-        let config = &mut Arc::get_mut(&mut server).unwrap().config;
-        config.max_frame_size = u64::from(max_frame);
-        config.shm_threshold = config.shm_threshold.min(config.max_frame_size);
-        config.validate().unwrap();
+    for peer in [1, local + 1, u32::MAX] {
+        let (server, mut client, stream) = version_fence_connection().await;
         let handler = tokio::spawn(handle_connection(server, stream));
         let mut hello = *b"\x15\0\0\0\0\0\0\0\0\0\0\0\x04\0\0\0C2IP\x01\0\0\0\0";
         hello[21..].copy_from_slice(&peer.to_le_bytes());
@@ -5039,20 +5053,16 @@ async fn handshake_version_mismatch_returns_fixed_preamble() {
 
 #[tokio::test]
 async fn invalid_preamble_headers_are_rejected_without_reading_payload() {
-    for (max_frame, length, rid, flags) in [
-        (u32::MAX, 20u32, 0u64, FLAG_HANDSHAKE),
-        (u32::MAX, 21, 1, FLAG_HANDSHAKE),
-        (u32::MAX, 21, 0, FLAG_HANDSHAKE | FLAG_RESPONSE),
-        (u32::MAX, 21, 0, FLAG_HANDSHAKE | FLAG_CTRL),
-        (u32::MAX, 21, 0, FLAG_RESPONSE),
-        (u32::MAX, 21, 0, 0),
-        (526, 527, 0, FLAG_SIGNAL),
+    for (length, rid, flags) in [
+        (20u32, 0u64, FLAG_HANDSHAKE),
+        (21, 1, FLAG_HANDSHAKE),
+        (21, 0, FLAG_HANDSHAKE | FLAG_RESPONSE),
+        (21, 0, FLAG_HANDSHAKE | FLAG_CTRL),
+        (21, 0, FLAG_RESPONSE),
+        (21, 0, 0),
+        (MAX_HANDSHAKE_FRAME_BYTES as u32 + 1, 0, FLAG_SIGNAL),
     ] {
-        let (mut server, mut client, stream) = version_fence_connection().await;
-        let config = &mut Arc::get_mut(&mut server).unwrap().config;
-        config.max_frame_size = u64::from(max_frame);
-        config.shm_threshold = config.shm_threshold.min(config.max_frame_size);
-        config.validate().unwrap();
+        let (server, mut client, stream) = version_fence_connection().await;
         let handler = tokio::spawn(handle_connection(server, stream));
         let mut header = [0u8; 16];
         header[..4].copy_from_slice(&length.to_le_bytes());
@@ -5468,12 +5478,8 @@ async fn responses_without_shm_negotiation_keep_owned_framing_and_release() {
             let call = conn.calls.lock().open(7, ServerCall::default()).unwrap();
             assert!(call.queue());
             assert!(call.enter_resource());
-            let (writer, writer_task) = ConnectionWriter::spawn(
-                half,
-                Arc::clone(&conn),
-                Duration::from_secs(30),
-                Arc::new(Semaphore::new(1024)),
-            );
+            let (writer, writer_task) =
+                ConnectionWriter::spawn(half, Arc::clone(&conn), Duration::from_secs(30), 1024);
             let receive = async {
                 let mut assembled = Vec::new();
                 let chunks = if size > 1024 { size.div_ceil(4096) } else { 1 };
@@ -5560,8 +5566,7 @@ async fn route_refusal_settles_later_chunks_once_and_releases_state() {
     // The refused call record leaves no assembly or permit.
     let conn_id = server.active_connection_ids()[0];
     wait_until("call record released after refusal", || {
-        server.chunk_registry.active_count() == 0
-            && server.chunk_processing_permits.available_permits() == 3
+        server.chunk_registry.active_count() == 0 && server.copy_permits.available_permits() == 3
     })
     .await;
     assert!(!server.chunk_registry.contains(conn_id, 88));
@@ -5608,7 +5613,7 @@ async fn disconnect_cancels_parked_first_chunk_and_releases_permits() {
             .expect("write chunk frame");
     }
     wait_until("chunk frames parked behind backing allocation", || {
-        server.chunk_processing_permits.available_permits() == 0
+        server.copy_permits.available_permits() == 2
     })
     .await;
     let conn_id = server.active_connection_ids()[0];
@@ -5622,24 +5627,20 @@ async fn disconnect_cancels_parked_first_chunk_and_releases_permits() {
         "blocked original copy retains route admission"
     );
     assert_eq!(
-        server.pending_requests.available_permits(),
-        server.config.max_pending_requests as usize - 1,
+        available_operations(&server),
+        operation_limit(&server) - 1,
         "blocked original copy retains its server call slot"
     );
     drop(backing);
     handler.await.expect("connection handler completes");
 
     wait_until("disconnect released call record and permits", || {
-        server.chunk_registry.active_count() == 0
-            && server.chunk_processing_permits.available_permits() == 3
+        server.chunk_registry.active_count() == 0 && server.copy_permits.available_permits() == 3
     })
     .await;
     assert!(!server.chunk_registry.contains(conn_id, 99));
     assert_eq!(scheduler.snapshot().pending, 0);
-    assert_eq!(
-        server.pending_requests.available_permits(),
-        server.config.max_pending_requests as usize
-    );
+    assert_eq!(available_operations(&server), operation_limit(&server));
 }
 
 /// An incomplete chunked request that expires on the assembler timeout must
@@ -5650,17 +5651,22 @@ async fn disconnect_cancels_parked_first_chunk_and_releases_permits() {
 async fn assembler_timeout_releases_charge_and_route_capacity_then_serves_again() {
     use std::sync::atomic::AtomicUsize;
 
-    let mut config = ServerIpcConfig::default();
-    config.base.max_inflight_chunk_frames = 3;
-    config.base.chunk_assembler_timeout_secs = 0.05;
-    config.base.chunk_gc_interval_secs = 0.01;
-    let server = Arc::new(
-        test_server_new(
-            &unique_readiness_address("chunked_ordering_timeout"),
-            config,
-        )
-        .unwrap(),
-    );
+    let config = ServerIpcConfig::default();
+    let mut server = test_server_new(
+        &unique_readiness_address("chunked_ordering_timeout"),
+        config,
+    )
+    .unwrap();
+    server.copy_permits = Arc::new(Semaphore::new(3));
+    server.chunk_registry = Arc::new(c2_wire::chunk::ChunkRegistry::new(
+        server.chunk_registry.pool().clone(),
+        c2_wire::chunk::ChunkConfig {
+            assembler_timeout: Duration::from_millis(50),
+            gc_interval: Duration::from_millis(5),
+            ..Default::default()
+        },
+    ));
+    let server = Arc::new(server);
     let calls = Arc::new(AtomicUsize::new(0));
     let mut route = make_host_route(&server, "grid");
     let scheduler = Scheduler::with_admission(
@@ -5706,7 +5712,7 @@ async fn assembler_timeout_releases_charge_and_route_capacity_then_serves_again(
         "incomplete assembly registered with route admission",
         || {
             server.chunk_registry.active_count() == 1
-                && server.chunk_processing_permits.available_permits() == 3
+                && server.copy_permits.available_permits() == 3
         },
     )
     .await;
@@ -5739,7 +5745,7 @@ async fn assembler_timeout_releases_charge_and_route_capacity_then_serves_again(
 
     assert_eq!(server.chunk_registry.active_count(), 0);
     assert!(!server.chunk_registry.contains(conn_id, 55));
-    assert_eq!(server.chunk_processing_permits.available_permits(), 3);
+    assert_eq!(server.copy_permits.available_permits(), 3);
     assert!(scheduler.try_acquire(0).is_ok());
     assert_eq!(calls.load(Ordering::SeqCst), 0);
 
@@ -5900,8 +5906,7 @@ async fn duplicate_open_preserves_original_assembly_and_only_terminal() {
     assert_eq!(&reply_payload[32 + 2..], &[0x33; 32]);
 
     wait_until("original assembly released after completion", || {
-        server.chunk_registry.active_count() == 0
-            && server.chunk_processing_permits.available_permits() == 3
+        server.chunk_registry.active_count() == 0 && server.copy_permits.available_permits() == 3
     })
     .await;
     assert!(!server.chunk_registry.contains(conn_id, 82));
@@ -5940,7 +5945,7 @@ async fn ping_is_served_while_chunk_processing_capacity_is_exhausted() {
         .await
         .expect("write first input chunk");
     wait_until("the only chunk-processing permit is held", || {
-        server.chunk_processing_permits.available_permits() == 0
+        server.copy_permits.available_permits() == 0
     })
     .await;
     assert_eq!(server.chunk_registry.active_count(), 0);
@@ -5963,7 +5968,7 @@ async fn ping_is_served_while_chunk_processing_capacity_is_exhausted() {
     // Release backing allocation: the same request completes with its bytes.
     drop(backing);
     wait_until("first input chunk finishes copying", || {
-        server.chunk_processing_permits.available_permits() == 1
+        server.copy_permits.available_permits() == 1
     })
     .await;
     client
@@ -5979,7 +5984,7 @@ async fn ping_is_served_while_chunk_processing_capacity_is_exhausted() {
     }
     assert_eq!(&reply_payload[consumed..], data.as_slice());
     assert_eq!(calls.load(Ordering::SeqCst), 1);
-    assert_eq!(server.chunk_processing_permits.available_permits(), 1);
+    assert_eq!(server.copy_permits.available_permits(), 1);
     assert_eq!(server.chunk_registry.active_count(), 0);
 
     drop(client);
@@ -6021,12 +6026,8 @@ async fn smart_reply_without_shm_capacity_sends_complete_ordered_chunks() {
     let call = conn.calls.lock().open(7, ServerCall::default()).unwrap();
     assert!(call.queue());
     assert!(call.enter_resource());
-    let (writer, writer_task) = ConnectionWriter::spawn(
-        half,
-        Arc::clone(&conn),
-        Duration::from_secs(30),
-        Arc::new(Semaphore::new(1024)),
-    );
+    let (writer, writer_task) =
+        ConnectionWriter::spawn(half, Arc::clone(&conn), Duration::from_secs(30), 1024);
     let receive = async {
         let mut received = 0usize;
         for (idx, expected) in payload.chunks(4096).enumerate() {
@@ -6085,76 +6086,47 @@ async fn inline_response_over_max_payload_is_rejected_before_transport() {
 }
 
 #[test]
-fn server_pools_and_prewarm_share_one_budget_context() {
-    let base = c2_config::BaseIpcConfig {
-        pool_segment_size: 64 * 1024,
-        max_pool_segments: 2,
-        pool_prewarm_segments: 1,
-        ..c2_config::BaseIpcConfig::default()
-    };
-    let config = ServerIpcConfig {
-        base,
-        ..ServerIpcConfig::default()
-    };
-    let server = test_server_new("ipc://server_budget_share", config).unwrap();
-
-    let snapshot = server.memory_budget_snapshot();
-    assert_eq!(ServerMemorySnapshot::SCOPE, "server");
-    assert_eq!(
-        snapshot.limits.shm_backing_budget_bytes,
-        c2_config::MemoryBudgetLimits::default().shm_backing_budget_bytes
-    );
-    assert_eq!(snapshot.budget.shm.used_bytes, 0);
-    assert_eq!(server.response_pool.read().segment_count(), 0);
+fn server_pools_start_cold_and_share_one_budget_context() {
+    let server = test_server_new("ipc://server_budget_share", Default::default()).unwrap();
     server.begin_start_attempt().unwrap();
-    let snapshot = server.memory_budget_snapshot();
-    assert_eq!(snapshot.budget.shm.used_bytes, 64 * 1024);
-
-    // Both owner pools report the same accounting object.
-    let response_pool = server.response_pool_arc();
-    assert_eq!(
-        response_pool.read().budget().unwrap().snapshot(),
-        snapshot.budget
-    );
-    assert_eq!(
+    let snapshot = server.domain_snapshot();
+    assert_eq!(snapshot.memory.used_bytes, 0);
+    for budget in [
+        server.response_pool.read().budget().unwrap().clone(),
         server
             .chunk_registry
             .pool()
             .read()
             .budget()
             .unwrap()
-            .snapshot(),
-        snapshot.budget
-    );
-
-    // Observing twice is stable and never resets usage.
-    assert_eq!(server.memory_budget_snapshot(), snapshot);
+            .clone(),
+    ] {
+        assert_eq!(budget.domain_id(), snapshot.domain_id);
+    }
 }
 
 /// A server configured with zero shm backing admits no server-side
 /// mapping, while the snapshot still reports the resolved zero limits.
 #[test]
-fn server_zero_shm_budget_admits_no_backing_and_reports_zero_limits() {
-    let base = c2_config::BaseIpcConfig {
-        pool_segment_size: 64 * 1024,
-        max_pool_segments: 2,
-        shm_backing_budget_bytes: 0,
-        file_backing_budget_bytes: 0,
-        ..c2_config::BaseIpcConfig::default()
-    };
-    let server = test_server_new(
+fn server_zero_memory_budget_admits_no_mapping() {
+    let server = test_server_with_limits(
         "ipc://server_budget_zero",
-        ServerIpcConfig {
-            base,
-            ..ServerIpcConfig::default()
+        Default::default(),
+        DomainLimits {
+            memory_budget_bytes: 0,
+            file_spill_budget_bytes: 0,
+            max_outstanding_calls: 0,
         },
-    )
-    .unwrap();
-    let snapshot = server.memory_budget_snapshot();
-    assert_eq!(snapshot.limits.shm_backing_budget_bytes, 0);
-    assert_eq!(snapshot.limits.file_backing_budget_bytes, 0);
-    assert_eq!(snapshot.budget.shm.used_bytes, 0);
-    assert_eq!(server.response_pool_arc().read().segment_count(), 0);
+    );
+    assert_eq!(server.domain_snapshot().memory.limit_bytes, 0);
+    assert!(
+        server
+            .response_pool
+            .inner
+            .write()
+            .alloc_shm_handle(16 * 1024)
+            .is_err()
+    );
 }
 
 /// A retained server budget observer must outlive the Server and report
@@ -6163,55 +6135,24 @@ fn server_zero_shm_budget_admits_no_backing_and_reports_zero_limits() {
 /// the handle carries counters only, never the Server or its pools.
 #[test]
 fn server_budget_observer_outlives_the_server_and_tracks_retained_charges() {
-    let base = c2_config::BaseIpcConfig {
-        pool_segment_size: 64 * 1024,
-        max_pool_segments: 2,
-        ..c2_config::BaseIpcConfig::default()
-    };
-    let config = ServerIpcConfig {
-        base,
-        // Retire an idle segment at the next explicit GC so the release
-        // is deterministic without sleeping.
-        pool_decay_seconds: 0.0,
-        ..ServerIpcConfig::default()
-    };
-    let server = test_server_new("ipc://server_budget_observer", config).unwrap();
-    let observer = server.memory_budget_observer();
-    assert_eq!(
-        observer.limits(),
-        server.memory_budget_snapshot().limits,
-        "the observer must carry the server's resolved limits"
+    let server = test_server_with_limits(
+        "ipc://server_budget_observer",
+        Default::default(),
+        DomainLimits {
+            memory_budget_bytes: 128 * 1024,
+            ..Default::default()
+        },
     );
-
-    let response_pool = server.response_pool_arc();
-    let handle = response_pool
-        .inner
-        .write()
-        .alloc_handle(4096)
-        .expect("response allocation");
-    let charged = observer.used_bytes();
-    assert!(
-        charged > 0,
-        "a mapped response segment must charge the observed budget"
-    );
-    assert_eq!(
-        server.memory_budget_snapshot().budget.shm.used_bytes,
-        observer.snapshot().shm.used_bytes,
-        "observer and live snapshot must share one accounting object"
-    );
-
-    // The Server can be dropped while the outstanding response owner
-    // keeps the mapping (and its observed charge) alive.
+    let observer = server.domain_budget().observe();
+    let pool = server.response_pool_arc();
+    let handle = pool.inner.write().alloc_shm_handle(4096).unwrap();
+    assert!(handle.is_dedicated());
+    let charged = observer.snapshot().memory.used_bytes;
+    assert!(charged > 0);
     drop(server);
-    assert_eq!(observer.used_bytes(), charged);
-
-    response_pool.inner.write().release_handle(handle);
-    response_pool.inner.write().gc_buddy();
-    assert_eq!(
-        observer.used_bytes(),
-        0,
-        "the retained observer must see the charge return after release"
-    );
+    assert_eq!(observer.snapshot().memory.used_bytes, charged);
+    pool.inner.write().release_handle(handle);
+    assert_eq!(observer.snapshot().memory.used_bytes, 0);
 }
 
 // -- handshake extraction --
@@ -6400,13 +6341,13 @@ impl ShutdownReplyFixture {
         Self::start_with_outcome(response, chunked, false).await
     }
     async fn start_with_outcome(response: Vec<u8>, chunked: bool, fail: bool) -> Self {
-        Self::start_with_config(response, chunked, fail, ServerIpcConfig::default()).await
+        Self::start_with_timeout(response, chunked, fail, c2_config::WRITE_TIMEOUT).await
     }
-    async fn start_with_config(
+    async fn start_with_timeout(
         response: Vec<u8>,
         chunked: bool,
         fail: bool,
-        config: ServerIpcConfig,
+        write_timeout: Duration,
     ) -> Self {
         struct Callback {
             calls: Arc<std::sync::atomic::AtomicUsize>,
@@ -6436,8 +6377,13 @@ impl ShutdownReplyFixture {
                 }
             }
         }
-        let server =
-            Arc::new(test_server_new(&unique_readiness_address("shutdown_reply"), config).unwrap());
+        let mut server = test_server_new(
+            &unique_readiness_address("shutdown_reply"),
+            Default::default(),
+        )
+        .unwrap();
+        server.test_write_timeout = write_timeout;
+        let server = Arc::new(server);
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
@@ -6530,9 +6476,12 @@ async fn shutdown_ack_is_visible_only_after_every_connection_refuses_new_calls()
     assert!(!f.conn.shutdown_requested());
     let mut first_byte = [0u8; 1];
     assert!(
-        tokio::time::timeout(Duration::from_millis(200), admin.read_exact(&mut first_byte))
-            .await
-            .is_err(),
+        tokio::time::timeout(
+            Duration::from_millis(200),
+            admin.read_exact(&mut first_byte)
+        )
+        .await
+        .is_err(),
         "shutdown ACK must not be visible before admission closes"
     );
     resume.send(()).unwrap();
@@ -6850,7 +6799,7 @@ async fn saturated_writer_preserves_business_errors_capacity_replies_and_other_c
     use std::num::NonZeroUsize;
     use std::sync::atomic::AtomicUsize;
     const CALLS: u64 = 80;
-    const BYTES: usize = 512 * 1024;
+    const BYTES: usize = c2_config::CHUNK_SIZE as usize;
     struct Replies(Arc<AtomicUsize>);
     impl CrmCallback for Replies {
         fn invoke(
@@ -6871,11 +6820,15 @@ async fn saturated_writer_preserves_business_errors_capacity_replies_and_other_c
             }
         }
     }
-    let mut config = ServerIpcConfig::default();
-    config.shm_threshold = 1024 * 1024;
-    config.max_pending_requests = 128;
-    let server =
-        Arc::new(test_server_new(&unique_readiness_address("full_writer"), config).unwrap());
+    let config = ServerIpcConfig::default();
+    let server = Arc::new(test_server_with_limits(
+        &unique_readiness_address("full_writer"),
+        config,
+        DomainLimits {
+            max_outstanding_calls: 128,
+            ..Default::default()
+        },
+    ));
     let calls = Arc::new(AtomicUsize::new(0));
     let mut route = make_host_route(&server, "grid");
     route.scheduler = Arc::new(Scheduler::with_admission(
@@ -6930,7 +6883,7 @@ async fn saturated_writer_preserves_business_errors_capacity_replies_and_other_c
         "one blocked frame and a full 64-entry queue must retain drain ownership"
     );
     assert!(
-        server.pending_requests.available_permits() <= 128 - 65,
+        available_operations(&server) <= 128 - 65,
         "pending admission covers replies waiting for the writer"
     );
     let business_error = c2_wire::rpc::encode_open_frame(
@@ -6959,7 +6912,10 @@ async fn saturated_writer_preserves_business_errors_capacity_replies_and_other_c
     assert!(!conn.is_deactivated());
     let mut received = std::collections::HashSet::new();
     for _ in 0..CALLS + 3 {
-        let (id, flags, payload) = read_reply_frame(&mut peer).await;
+        let (id, flags, payload) =
+            tokio::time::timeout(Duration::from_secs(5), read_reply_frame(&mut peer))
+                .await
+                .expect("queued reply did not settle");
         assert!(received.insert(id), "one outcome per accepted call");
         if id == 103 {
             assert_eq!(flags, FLAG_RESPONSE | FLAG_SIGNAL);
@@ -6995,7 +6951,7 @@ async fn saturated_writer_preserves_business_errors_capacity_replies_and_other_c
     .unwrap();
     assert_eq!(read_reply_frame(&mut peer).await.0, 104);
     wait_until("reply drain returns all pending permits", || {
-        server.pending_requests.available_permits() == 128
+        available_operations(&server) == 128
     })
     .await;
     drop(occupied);
@@ -7051,7 +7007,6 @@ async fn rejected_acquire_releases_materialized_request_on_its_original_connecti
     for len in [128, 65537] {
         let config = PoolConfig {
             segment_size: 65536,
-            min_block_size: 128,
             max_segments: 1,
             max_dedicated_segments: 1,
             min_retained_segments: 0,
@@ -7060,8 +7015,12 @@ async fn rejected_acquire_releases_materialized_request_on_its_original_connecti
             ..Default::default()
         };
         let owner = Arc::new(parking_lot::RwLock::new(
-            MemPool::new_with_prefix(config.clone(), unique_response_pool_prefix("rejected"))
-                .unwrap(),
+            MemPool::new_with_prefix_and_budget(
+                config.clone(),
+                unique_response_pool_prefix("rejected"),
+                DomainBudget::from_limits(&DomainLimits::default()),
+            )
+            .unwrap(),
         ));
         let budget = owner.read().budget().unwrap().clone();
         let baseline = budget.snapshot();
@@ -7084,15 +7043,10 @@ async fn rejected_acquire_releases_materialized_request_on_its_original_connecti
         let conn = Arc::new(Connection::new(71));
         conn.install_remote_read_guard(stream.retain_for_remote_read());
         conn.set_handshake_done(true).unwrap();
-        conn.init_peer_shm(owner.read().prefix().into(), 0.0)
-            .unwrap();
+        conn.init_peer_shm(owner.read().prefix().into()).unwrap();
         let (reader, half) = stream.into_split();
-        let (_writer, driver) = ConnectionWriter::spawn(
-            half,
-            conn.clone(),
-            Duration::from_secs(30),
-            Arc::new(Semaphore::new(16)),
-        );
+        let (_writer, driver) =
+            ConnectionWriter::spawn(half, conn.clone(), Duration::from_secs(30), 16);
         let request = admit_peer_request(
             &conn,
             BuddyPayload {
@@ -7103,7 +7057,6 @@ async fn rejected_acquire_releases_materialized_request_on_its_original_connecti
                 is_dedicated: allocation.is_dedicated,
                 loan_id: id,
             },
-            &budget,
         )
         .unwrap();
         let scheduler = Scheduler::with_limits(
@@ -7125,7 +7078,7 @@ async fn rejected_acquire_releases_materialized_request_on_its_original_connecti
             pending,
             &conn,
             1,
-            request,
+            OwnedRequestInput::unreserved(request),
             move |_| {
                 invoked.store(true, Ordering::SeqCst);
                 Ok(ResponseMeta::Empty)
@@ -7154,14 +7107,14 @@ async fn rejected_acquire_releases_materialized_request_on_its_original_connecti
         assert_eq!(owner.read().stats().alloc_count, 0);
         owner.write().gc_buddy();
         let after = budget.snapshot();
-        assert_eq!(after.shm.used_bytes, baseline.shm.used_bytes);
-        assert_eq!(after.file.used_bytes, baseline.file.used_bytes);
-        assert_eq!(after.reassembly.used_bytes, baseline.reassembly.used_bytes);
+        assert_eq!(after.memory.used_bytes, baseline.memory.used_bytes);
+        assert_eq!(after.file_spill.used_bytes, baseline.file_spill.used_bytes);
+        assert_eq!(after.memory.used_bytes, baseline.memory.used_bytes);
         let cache = conn.peer_mappings().unwrap();
-        if !allocation.is_dedicated {
-            cache.gc_idle();
-        }
-        assert_eq!(cache.mapped_segments(), 0);
+        assert_eq!(
+            cache.mapped_segments(),
+            usize::from(!allocation.is_dedicated)
+        );
         conn.end(ConnectionEndReason::LocalClose, "test_done");
         driver.await.unwrap();
         drop(reader);
@@ -7210,12 +7163,8 @@ async fn windows_overlapped_flush_peer_close_keeps_buddy_and_dedicated_allocatio
         .await
         .unwrap()
         .unwrap();
-        let (writer, driver) = ConnectionWriter::spawn(
-            half,
-            conn.clone(),
-            Duration::from_secs(30),
-            Arc::new(Semaphore::new(16)),
-        );
+        let (writer, driver) =
+            ConnectionWriter::spawn(half, conn.clone(), Duration::from_secs(30), 16);
         let mut send = Box::pin(send_prepared_shm_response(&writer, 73, prepared, 64 * 1024));
         tokio::select! {
             result = &mut send => panic!("full non-reading Named Pipe must keep response pending: {result:?}"),
@@ -7263,12 +7212,13 @@ async fn windows_overlapped_flush_peer_close_keeps_buddy_and_dedicated_allocatio
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn shutdown_keeps_listener_until_timed_out_response_writer_finishes() {
     const SIZE: usize = 512 * 1024;
-    let mut config = ServerIpcConfig::default();
-    config.base.write_timeout_secs = 0.01;
-    config.shm_threshold = 1024 * 1024;
-    config.base.chunk_size = 1024 * 1024;
-    let mut f =
-        ShutdownReplyFixture::start_with_config(vec![0x46; SIZE], false, false, config).await;
+    let mut f = ShutdownReplyFixture::start_with_timeout(
+        vec![0x46; SIZE],
+        false,
+        false,
+        Duration::from_millis(50),
+    )
+    .await;
     f.server.request_shutdown_signal();
     f.release();
     wait_until("configured response write timeout elapsed", || {
@@ -7283,23 +7233,28 @@ async fn shutdown_keeps_listener_until_timed_out_response_writer_finishes() {
         "a timed-out waiter cannot end the native response flush or close the listener"
     );
     assert!(f.server.endpoint_credential().is_some());
-    let (id, _, payload) = read_reply_frame(&mut f.peer).await;
-    assert_eq!(id, 1);
-    let (control, used) = decode_test_call_end(&payload, 0).unwrap();
-    assert!(matches!(control, TestReply::Success));
-    assert_eq!(payload[used..], vec![0x46; SIZE]);
+    let mut received = 0;
+    while received < SIZE {
+        let (id, flags, payload) = read_reply_frame(&mut f.peer).await;
+        assert_eq!(id, 1);
+        let (_, bytes) = inline_success_part(flags, &payload);
+        assert!(bytes.iter().all(|byte| *byte == 0x46));
+        received += bytes.len();
+    }
+    assert_eq!(received, SIZE);
     f.runner.take().unwrap().await.unwrap().unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn write_timeout_preserves_remaining_unary_call_end_chunks() {
     const SIZE: usize = 8 * 1024 * 1024;
-    let mut config = ServerIpcConfig::default();
-    config.base.write_timeout_secs = 0.01;
-    config.shm_threshold = 1024;
-    config.base.chunk_size = 256 * 1024;
-    let mut f =
-        ShutdownReplyFixture::start_with_config(vec![0x46; SIZE], false, false, config).await;
+    let mut f = ShutdownReplyFixture::start_with_timeout(
+        vec![0x46; SIZE],
+        false,
+        false,
+        Duration::from_millis(50),
+    )
+    .await;
     f.server.request_shutdown_signal();
     f.release();
     // Withhold all reads until a submitted chunk exceeds the write deadline.
@@ -7347,12 +7302,8 @@ async fn deactivated_connection_returns_unpublished_shm_response_as_owned_reply(
         assert!(call.enter_resource());
         let flight = crate::connection::FlightGuard::new(&conn);
         conn.end(ConnectionEndReason::ProtocolError, "invalid_release");
-        let (writer, driver) = ConnectionWriter::spawn(
-            half,
-            conn.clone(),
-            Duration::from_secs(30),
-            Arc::new(Semaphore::new(16)),
-        );
+        let (writer, driver) =
+            ConnectionWriter::spawn(half, conn.clone(), Duration::from_secs(30), 16);
         let send = send_prepared_shm_response(&writer, 91, prepared, 16384);
         let receive = async {
             let mut bytes = Vec::new();
@@ -7387,14 +7338,9 @@ async fn deactivated_connection_returns_unpublished_shm_response_as_owned_reply(
 }
 
 #[tokio::test]
-async fn idle_peer_request_views_retire_while_shutdown_keeps_an_unreleased_response() {
-    for len in [8192, 65537] {
-        let mut config = ServerIpcConfig::default();
-        config.pool_decay_seconds = 0.03;
-        config.base.chunk_gc_interval_secs = 0.005;
-        config.base.pool_segment_size = 65536;
-        config.base.max_pool_segments = 1;
-        config.shm_threshold = 1024;
+async fn peer_request_views_keep_their_normal_lifetime_while_shutdown_retains_the_reply() {
+    for len in [32768, 65537] {
+        let config = ServerIpcConfig::default();
         let server =
             Arc::new(test_server_new(&unique_readiness_address("idle_peer_gc"), config).unwrap());
         let mut route = make_host_route(&server, "grid");
@@ -7453,7 +7399,7 @@ async fn idle_peer_request_views_retire_while_shutdown_keeps_an_unreleased_respo
         assert_call_end_status(&response, c2_wire::rpc::CallStatus::Success);
         let (response, _) = c2_wire::buddy::decode_buddy_payload(&response[2..]).unwrap();
         assert_eq!(response.data_size as usize, len);
-        assert_eq!(response.is_dedicated, len > 65536);
+        assert!(!response.is_dedicated);
         server.request_shutdown_signal();
         runner.await.unwrap().unwrap();
         assert_eq!(server.lifecycle_state(), ServerLifecycleState::Stopped);
@@ -7462,11 +7408,7 @@ async fn idle_peer_request_views_retire_while_shutdown_keeps_an_unreleased_respo
             1,
             "unreleased response keeps the original driver"
         );
-        wait_until(
-            "maintenance retires idle request views without another call",
-            || cache.mapped_segments() == 0,
-        )
-        .await;
+        assert_eq!(cache.mapped_segments(), usize::from(len <= 65536));
         let release = c2_wire::release::ReleaseBatch::new(&[response.loan_id]).unwrap();
         peer.write_all(&c2_wire::release::encode_release_frame(&release, false))
             .await
@@ -7480,10 +7422,16 @@ async fn idle_peer_request_views_retire_while_shutdown_keeps_an_unreleased_respo
 
 #[tokio::test]
 async fn zero_business_pending_budget_keeps_control_and_capacity_replies() {
-    let mut config = ServerIpcConfig::default();
-    config.max_pending_requests = 0;
-    let server =
-        Arc::new(test_server_new(&unique_readiness_address("zero_pending"), config).unwrap());
+    let config = ServerIpcConfig::default();
+    let server = Arc::new(test_server_with_limits(
+        &unique_readiness_address("zero_pending"),
+        config,
+        DomainLimits {
+            memory_budget_bytes: 0,
+            max_outstanding_calls: 0,
+            ..Default::default()
+        },
+    ));
     server
         .register_route(make_host_route(&server, "grid"))
         .await
@@ -7505,7 +7453,7 @@ async fn zero_business_pending_budget_keeps_control_and_capacity_replies() {
     let TestReply::Error(error) = decode_test_call_end(&payload, 0).unwrap().0 else {
         panic!("zero business budget must reject the call");
     };
-    assert!(String::from_utf8_lossy(&error).contains("max_pending_requests=0"));
+    assert!(String::from_utf8_lossy(&error).contains("all 0 operation slots are in use"));
     peer.write_all(&encode_frame(
         2,
         FLAG_SIGNAL,
@@ -7761,7 +7709,6 @@ async fn buddy_chunk_continuations_survive_deactivation_and_shutdown() {
             let mut pool = MemPool::new_with_prefix(
                 PoolConfig {
                     segment_size: 64 * 1024,
-                    min_block_size: 4096,
                     max_segments: 1,
                     ..Default::default()
                 },
@@ -8135,9 +8082,7 @@ async fn incomplete_call_end_preserves_running_queued_calls_and_releases() {
             Ok(ResponseMeta::Inline(data))
         }
     }
-    let mut config = ServerIpcConfig::default();
-    config.shm_threshold = 0;
-    config.base.chunk_size = 256;
+    let config = ServerIpcConfig::default();
     let server = Arc::new(test_server_new("ipc://partial-call-end", config).unwrap());
     let conn = Arc::new(Connection::new(151));
     conn.set_handshake_done(true).unwrap();
@@ -8180,7 +8125,7 @@ async fn incomplete_call_end_preserves_running_queued_calls_and_releases() {
     });
     let scheduler = route.scheduler.clone();
     server.register_route(route).await.unwrap();
-    let (stream, mut peer) = tokio::io::duplex(4096);
+    let (stream, mut peer) = tokio::io::duplex(c2_config::CHUNK_SIZE as usize + 128);
     let (entered, first_written) = tokio::sync::oneshot::channel();
     let (resume, resumed) = tokio::sync::oneshot::channel();
     let (writer, driver) = ConnectionWriter::spawn_test_stream(
@@ -8223,7 +8168,10 @@ async fn incomplete_call_end_preserves_running_queued_calls_and_releases() {
                 &conn,
                 &writer,
                 1,
-                Ok(ResponseMeta::Inline(vec![42; 1024])),
+                Ok(ResponseMeta::Inline(vec![
+                    42;
+                    c2_config::CHUNK_SIZE as usize + 1
+                ])),
             )
             .await;
         }
@@ -8318,7 +8266,6 @@ async fn mode_refused_shm_open_and_retired_continuation_release_original_loans()
         let mut pool = MemPool::new_with_prefix(
             PoolConfig {
                 segment_size: 64 * 1024,
-                min_block_size: 4096,
                 max_segments: 1,
                 ..Default::default()
             },
@@ -8417,4 +8364,569 @@ async fn mode_refused_shm_open_and_retired_continuation_release_original_loans()
         drop(peer);
         handler.await.unwrap();
     }
+}
+
+#[tokio::test]
+async fn frame_caps_reject_header_only_oversize_before_reading_payload() {
+    for established in [false, true] {
+        let (server, mut client, stream) = version_fence_connection().await;
+        let handler = tokio::spawn(handle_connection(server, stream));
+        let (cap, id, flags) = if established {
+            handshake_test_client(&mut client).await;
+            (MAX_RPC_FRAME_BYTES, 1u64, c2_wire::flags::FLAG_RPC_RECORD)
+        } else {
+            client
+                .write_all(&encode_version_preamble(VersionPreambleKind::Hello))
+                .await
+                .unwrap();
+            let mut ack = [0; 25];
+            client.read_exact(&mut ack).await.unwrap();
+            assert_eq!(ack, encode_version_preamble(VersionPreambleKind::Accepted));
+            (MAX_HANDSHAKE_FRAME_BYTES, 0, FLAG_HANDSHAKE)
+        };
+        let mut prefix = Vec::new();
+        prefix.extend((cap as u32 + 1).to_le_bytes());
+        prefix.extend(id.to_le_bytes());
+        prefix.extend(flags.to_le_bytes());
+        client.write_all(&prefix).await.unwrap();
+        let read = tokio::time::timeout(Duration::from_secs(2), client.read(&mut [0])).await;
+        assert!(
+            matches!(read, Ok(Ok(0) | Err(_))),
+            "server kept waiting for a payload: {read:?}"
+        );
+        handler.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn narrow_chunks_queue_behind_first_copy_and_refund_their_bytes() {
+    let server = chunk_test_server("ipc://narrow_chunk_budget", 4);
+    let mut route = make_host_route(&server, "grid");
+    let invoked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    route.callback = Arc::new(EchoRequestBytes {
+        calls: invoked.clone(),
+    });
+    server.register_route(route).await.unwrap();
+    let (mut peer, stream) = isolated_pair().await;
+    let handler = tokio::spawn(handle_connection(server.clone(), stream));
+    handshake_test_client(&mut peer).await;
+    let conn = server
+        .active_connection(server.active_connection_ids()[0])
+        .unwrap();
+    let hold = server
+        .copy_permits
+        .clone()
+        .acquire_many_owned(4)
+        .await
+        .unwrap();
+    let payload = (0u8..100).collect::<Vec<_>>();
+    for (index, byte) in payload.iter().enumerate() {
+        peer.write_all(&value_chunk_call_frame(
+            1,
+            index as u16,
+            payload.len() as u64,
+            &[*byte],
+            "grid",
+        ))
+        .await
+        .unwrap();
+    }
+    peer.write_all(&encode_frame(
+        7,
+        FLAG_SIGNAL,
+        &c2_wire::msg_type::PING_BYTES,
+    ))
+    .await
+    .unwrap();
+    assert_eq!(read_reply_frame(&mut peer).await.0, 7);
+    let active = conn.calls.lock().get(1).unwrap();
+    {
+        let input = active.data.input.lock();
+        let queue = input.as_ref().unwrap().copy.lock();
+        assert_eq!(queue.queue.len(), payload.len());
+        assert!(!queue.published);
+    }
+    drop(active);
+    assert_eq!(server.copy_scheduler.ready_len(), 1);
+    assert_eq!(
+        server.domain_snapshot().memory.used_bytes,
+        (payload.len() * (PENDING_FRAME_OVERHEAD + 1)) as u64
+    );
+    drop(hold);
+    let (id, _, result) = read_reply_frame(&mut peer).await;
+    assert_eq!(id, 1);
+    assert_call_end_status(&result, CallStatus::Success);
+    assert_eq!(&result[2..], payload);
+    assert_eq!(invoked.load(Ordering::SeqCst), 1);
+    assert_eq!(server.chunk_registry.active_count(), 0);
+    let idle = server.chunk_registry.pool().read().stats().buddy_idle_bytes;
+    assert_eq!(server.domain_snapshot().memory.used_bytes, idle);
+    drop(peer);
+    handler.await.unwrap();
+}
+
+#[tokio::test]
+async fn slow_response_encoding_does_not_block_the_readers_release() {
+    let server =
+        Arc::new(test_server_new("ipc://slow_response_encoding", Default::default()).unwrap());
+    let mut route = make_host_route(&server, "grid");
+    route.callback = Arc::new(EchoRequestBytes {
+        calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+    });
+    server.register_route(route).await.unwrap();
+    let (mut peer, stream) = isolated_pair().await;
+    let handler = tokio::spawn(handle_connection(server.clone(), stream));
+    handshake_test_client_with(&mut peer, CAP_SHM_RESPONSE, "").await;
+    let bytes = vec![8; 32 * 1024];
+    peer.write_all(&inline_call_frame(1, "grid", &bytes))
+        .await
+        .unwrap();
+    let (_, _, response) = read_reply_frame(&mut peer).await;
+    let (owner, _) = c2_wire::buddy::decode_buddy_payload(&response[2..]).unwrap();
+    let pool = server.response_pool_arc();
+    let (entered_tx, entered) = tokio::sync::oneshot::channel();
+    let (resume, resume_rx) = std::sync::mpsc::channel();
+    let image = pool.clone();
+    let encode = tokio::task::spawn_blocking(move || {
+        crate::response::try_prepare_shm_response(
+            &image,
+            c2_config::SHM_THRESHOLD,
+            bytes.len(),
+            |destination| {
+                entered_tx.send(()).unwrap();
+                resume_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                destination.copy_from_slice(&bytes);
+                Ok(())
+            },
+        )
+        .unwrap()
+        .unwrap()
+    });
+    entered.await.unwrap();
+    peer.write_all(&c2_wire::release::encode_release_frame(
+        &c2_wire::release::ReleaseBatch::new(&[owner.loan_id]).unwrap(),
+        false,
+    ))
+    .await
+    .unwrap();
+    peer.write_all(&encode_frame(
+        2,
+        FLAG_SIGNAL,
+        &c2_wire::msg_type::PING_BYTES,
+    ))
+    .await
+    .unwrap();
+    let observed = tokio::time::timeout(Duration::from_secs(2), read_reply_frame(&mut peer)).await;
+    resume.send(()).unwrap();
+    let prepared = encode.await.unwrap();
+    assert_eq!(observed.unwrap().0, 2);
+    assert_eq!(pool.read().stats().alloc_count, 1);
+    assert_eq!(prepared.copy_logical_bytes().unwrap(), vec![8; 32 * 1024]);
+    drop(prepared);
+    drop(peer);
+    handler.await.unwrap();
+}
+
+#[tokio::test]
+async fn a_saturated_control_writer_only_deactivates_its_own_connection() {
+    let server = Arc::new(test_server_with_limits(
+        "ipc://isolated_control_writer",
+        Default::default(),
+        DomainLimits {
+            max_outstanding_calls: 1,
+            ..Default::default()
+        },
+    ));
+    server
+        .register_route(make_host_route(&server, "grid"))
+        .await
+        .unwrap();
+    for index in 1..MAX_ROUTES {
+        let mut route = make_host_route(&server, &format!("grid_{index}"));
+        route.method_modes = vec![CallMode::Unary; c2_wire::handshake::MAX_METHODS];
+        route.method_names = (0..c2_wire::handshake::MAX_METHODS)
+            .map(|method| format!("method_{method}_{}", "a".repeat(196)))
+            .collect();
+        server.register_route(route).await.unwrap();
+    }
+
+    let events = server.connection_events();
+    let (mut slow, stream) = isolated_pair().await;
+    let slow_handler = tokio::spawn(handle_connection(server.clone(), stream));
+    handshake_test_client(&mut slow).await;
+    let c2_local::ConnectionEvent::Opened(observation) = events.recv().await.unwrap().unwrap()
+    else {
+        panic!("expected the slow connection");
+    };
+    let slow_conn = server
+        .active_connection(observation.connection_id())
+        .unwrap();
+    assert_eq!(server.control_reply_capacity, 1);
+    let list_all = c2_wire::route_catalog_control::encode_route_list_request(
+        &c2_wire::route_catalog_control::RouteListRequest {
+            selector: c2_wire::route_catalog_control::RouteSelector::All,
+        },
+    )
+    .unwrap();
+    // The full catalog exceeds the native socket or pipe buffer. The peer
+    // sends another control request while withholding all response reads.
+    let mut controls = encode_frame(60, FLAG_CTRL, &list_all);
+    controls.extend(encode_frame(
+        61,
+        FLAG_SIGNAL,
+        &c2_wire::msg_type::PING_BYTES,
+    ));
+    slow.write_all(&controls).await.unwrap();
+    wait_until("slow connection control budget exhausted", || {
+        slow_conn.is_deactivated()
+    })
+    .await;
+
+    let (mut healthy, stream) = isolated_pair().await;
+    let healthy_handler = tokio::spawn(handle_connection(server.clone(), stream));
+    handshake_test_client(&mut healthy).await;
+    let request = c2_wire::route_catalog_control::encode_route_list_request(
+        &c2_wire::route_catalog_control::RouteListRequest {
+            selector: c2_wire::route_catalog_control::RouteSelector::RouteName {
+                route_name: "grid".into(),
+            },
+        },
+    )
+    .unwrap();
+    healthy
+        .write_all(&encode_frame(1, FLAG_CTRL, &request))
+        .await
+        .unwrap();
+    let (_, _, directory) = read_reply_frame(&mut healthy).await;
+    assert_eq!(
+        c2_wire::route_catalog_control::decode_route_list_response(&directory)
+            .unwrap()
+            .routes
+            .len(),
+        1
+    );
+    healthy
+        .write_all(&inline_call_frame(2, "grid", b"healthy"))
+        .await
+        .unwrap();
+    let (id, _, result) = read_reply_frame(&mut healthy).await;
+    assert_eq!(id, 2);
+    assert_call_end_status(&result, CallStatus::Success);
+
+    drop(slow);
+    drop(healthy);
+    slow_handler.await.unwrap();
+    let closed = observation
+        .wait_closed(Some(Duration::from_secs(2)))
+        .await
+        .unwrap();
+    assert_eq!(closed.operation(), "reply_pending_capacity");
+    healthy_handler.await.unwrap();
+}
+
+#[tokio::test]
+async fn exhausted_frame_budget_retires_input_and_discards_late_continuations() {
+    let frame_charge = (PENDING_FRAME_OVERHEAD + 1) as u64;
+    let server = Arc::new(test_server_with_limits(
+        "ipc://frame_budget_retirement",
+        Default::default(),
+        DomainLimits {
+            memory_budget_bytes: frame_charge * 2 - 1,
+            max_outstanding_calls: 8,
+            ..Default::default()
+        },
+    ));
+    server
+        .register_route(make_host_route(&server, "grid"))
+        .await
+        .unwrap();
+    let (mut client, stream) = isolated_pair().await;
+    let handler = tokio::spawn(handle_connection(server.clone(), stream));
+    handshake_test_client(&mut client).await;
+    let permits = server.copy_permits.available_permits() as u32;
+    let hold = server
+        .copy_permits
+        .clone()
+        .acquire_many_owned(permits)
+        .await
+        .unwrap();
+    client
+        .write_all(&value_chunk_call_frame(1, 0, 3, b"a", "grid"))
+        .await
+        .unwrap();
+    client
+        .write_all(&encode_frame(
+            4,
+            FLAG_SIGNAL,
+            &c2_wire::msg_type::PING_BYTES,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(read_reply_frame(&mut client).await.0, 4);
+    assert_eq!(server.domain_snapshot().memory.used_bytes, frame_charge);
+
+    client
+        .write_all(&value_chunk_call_frame(1, 1, 3, b"b", "grid"))
+        .await
+        .unwrap();
+    let (id, _, reply) = read_reply_frame(&mut client).await;
+    assert_eq!(id, 1);
+    assert_call_end_status(&reply, CallStatus::NotExecuted);
+    let (TestReply::Error(wire), _) = decode_test_call_end(&reply, 0).unwrap() else {
+        panic!("expected frame admission refusal");
+    };
+    let error = C2Error::from_wire_bytes(&wire).unwrap().unwrap();
+    assert_eq!(error.code, ErrorCode::ResourceUnavailable);
+    assert_eq!(error.details["stage"], "call_input_admission");
+
+    client
+        .write_all(&value_chunk_call_frame(1, 2, 3, b"c", "grid"))
+        .await
+        .unwrap();
+    client
+        .write_all(&encode_frame(
+            5,
+            FLAG_SIGNAL,
+            &c2_wire::msg_type::PING_BYTES,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(read_reply_frame(&mut client).await.0, 5);
+    assert_eq!(server.domain_snapshot().memory.used_bytes, 0);
+    assert_eq!(server.domain_snapshot().operations.used_operations, 0);
+    assert!(server.copy_scheduler.is_empty());
+    let conn = server
+        .active_connection(server.active_connection_ids()[0])
+        .unwrap();
+    assert!(matches!(
+        conn.calls.lock().continuation(1),
+        CallLookup::Retired
+    ));
+    assert_eq!(conn.calls.lock().active().count(), 0);
+    drop(hold);
+    drop(client);
+    handler.await.unwrap();
+}
+
+#[tokio::test]
+async fn cancelling_run_task_alone_preserves_accepted_chunked_call() {
+    let server = Arc::new(
+        test_server_new(
+            &unique_readiness_address("cancel_run_chunked"),
+            ServerIpcConfig::default(),
+        )
+        .unwrap(),
+    );
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut route = make_host_route(&server, "grid");
+    route.callback = Arc::new(EchoRequestBytes {
+        calls: calls.clone(),
+    });
+    server.register_route(route).await.unwrap();
+    let running = Arc::clone(&server);
+    let runner = tokio::spawn(async move { running.run().await });
+    server
+        .wait_until_ready(Duration::from_secs(2))
+        .await
+        .unwrap();
+    let mut peer = LocalStream::connect(server.local_endpoint(), DEFAULT_CONNECT_TIMEOUT)
+        .await
+        .unwrap();
+    handshake_test_client(&mut peer).await;
+
+    let permits = server.copy_permits.available_permits() as u32;
+    let hold = server
+        .copy_permits
+        .clone()
+        .acquire_many_owned(permits)
+        .await
+        .unwrap();
+    peer.write_all(&chunked_call_frame(1, 0, 2, b"abcd", "grid"))
+        .await
+        .unwrap();
+    peer.write_all(&chunked_call_frame(1, 1, 2, b"EFGH", "grid"))
+        .await
+        .unwrap();
+    peer.write_all(&encode_frame(
+        9,
+        FLAG_SIGNAL,
+        &c2_wire::msg_type::PING_BYTES,
+    ))
+    .await
+    .unwrap();
+    assert_eq!(read_reply_frame(&mut peer).await.0, 9);
+    assert_eq!(server.copy_scheduler.ready_len(), 1);
+
+    // Cancel ONLY the accept loop while the executor and accepted connection
+    // stay alive; the connection's scope must keep `copy_coordinator` running.
+    runner.abort();
+    let _ = runner.await;
+    assert!(server.copy_scheduler.is_coordinator_running());
+
+    drop(hold);
+    let (id, _, reply) = read_reply_frame(&mut peer).await;
+    assert_eq!(id, 1);
+    assert_call_end_status(&reply, CallStatus::Success);
+    assert_eq!(&reply[2..], b"abcdEFGH");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+    drop(peer);
+    wait_until("coordinator exits after last connection closes", || {
+        !server.copy_scheduler.is_coordinator_running()
+    })
+    .await;
+}
+
+#[test]
+fn executor_shutdown_with_retained_server_arc_closes_accepted_connection() {
+    let server_rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("server runtime");
+    let client_rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("client runtime");
+
+    let server = server_rt.block_on(async {
+        let server = Arc::new(
+            test_server_new(
+                &unique_readiness_address("executor_teardown"),
+                ServerIpcConfig::default(),
+            )
+            .unwrap(),
+        );
+        server
+            .register_route(make_host_route(&server, "grid"))
+            .await
+            .unwrap();
+        let running = Arc::clone(&server);
+        tokio::spawn(async move { running.run().await });
+        server
+            .wait_until_ready(Duration::from_secs(2))
+            .await
+            .unwrap();
+        server
+    });
+
+    let mut peer = client_rt.block_on(async {
+        let mut peer = LocalStream::connect(server.local_endpoint(), DEFAULT_CONNECT_TIMEOUT)
+            .await
+            .unwrap();
+        handshake_test_client(&mut peer).await;
+        peer
+    });
+
+    // Retain `Arc<Server>` on this stack while tearing down the server executor.
+    server_rt.shutdown_background();
+
+    client_rt.block_on(async {
+        use tokio::io::AsyncReadExt as _;
+        let mut buf = [0u8; 1];
+        let read = tokio::time::timeout(Duration::from_secs(2), peer.read(&mut buf))
+            .await
+            .expect("accepted connection must close promptly when executor shuts down");
+        assert!(matches!(read, Ok(0) | Err(_)), "unexpected read: {read:?}");
+        wait_until(
+            "executor background teardown drops all server tasks",
+            || !server.copy_scheduler.is_coordinator_running() && Arc::strong_count(&server) == 1,
+        )
+        .await;
+    });
+}
+
+#[tokio::test]
+async fn normal_scope_exit_drops_scheduler_without_leaking_arc() {
+    let server = chunk_test_server("ipc://normal_scope_exit_no_leak", 4);
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut route = make_host_route(&server, "grid");
+    route.callback = Arc::new(EchoRequestBytes {
+        calls: calls.clone(),
+    });
+    server.register_route(route).await.unwrap();
+    let weak_server = Arc::downgrade(&server);
+    let weak_scheduler = Arc::downgrade(&server.copy_scheduler);
+
+    let (mut peer, stream) = isolated_pair().await;
+    let handler = tokio::spawn(handle_connection(Arc::clone(&server), stream));
+    handshake_test_client(&mut peer).await;
+    peer.write_all(&chunked_call_frame(1, 0, 2, b"ab", "grid"))
+        .await
+        .unwrap();
+    peer.write_all(&chunked_call_frame(1, 1, 2, b"CD", "grid"))
+        .await
+        .unwrap();
+    let (id, _, reply) = read_reply_frame(&mut peer).await;
+    assert_eq!(id, 1);
+    assert_call_end_status(&reply, CallStatus::Success);
+    assert_eq!(&reply[2..], b"abCD");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+    drop(peer);
+    handler.await.unwrap();
+    wait_until("coordinator exits on normal scope drain", || {
+        !server.copy_scheduler.is_coordinator_running()
+    })
+    .await;
+
+    drop(server);
+    assert!(weak_server.upgrade().is_none());
+    assert!(
+        weak_scheduler.upgrade().is_none(),
+        "normal coordinator exit must not leak Arc<CopyScheduler>"
+    );
+}
+
+#[test]
+fn unpolled_coordinator_drop_clears_running_flag_and_allows_restart() {
+    let setup_rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("setup runtime");
+    let server = setup_rt.block_on(async {
+        let server = chunk_test_server("ipc://unpolled_coordinator_drop", 4);
+        let mut route = make_host_route(&server, "grid");
+        route.callback = Arc::new(EchoRequestBytes {
+            calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        });
+        server.register_route(route).await.unwrap();
+        server
+    });
+
+    // `block_on` on a current-thread runtime returns immediately without
+    // polling the newly spawned coordinator task; dropping the runtime then
+    // drops the coordinator future before its first poll.
+    let pre_poll_rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("pre-poll runtime");
+    pre_poll_rt.block_on(async {
+        let scope = CopyCoordinatorScope::enter(&server);
+        assert!(server.copy_scheduler.is_coordinator_running());
+        drop(scope);
+    });
+    drop(pre_poll_rt);
+    assert!(
+        !server.copy_scheduler.is_coordinator_running(),
+        "dropping an unpolled coordinator must reset coordinator_running"
+    );
+
+    setup_rt.block_on(async {
+        let (mut peer, stream) = isolated_pair().await;
+        let handler = tokio::spawn(handle_connection(Arc::clone(&server), stream));
+        handshake_test_client(&mut peer).await;
+        peer.write_all(&chunked_call_frame(1, 0, 2, b"xy", "grid"))
+            .await
+            .unwrap();
+        peer.write_all(&chunked_call_frame(1, 1, 2, b"ZW", "grid"))
+            .await
+            .unwrap();
+        let (id, _, reply) = read_reply_frame(&mut peer).await;
+        assert_eq!(id, 1);
+        assert_call_end_status(&reply, CallStatus::Success);
+        assert_eq!(&reply[2..], b"xyZW");
+        drop(peer);
+        handler.await.unwrap();
+    });
 }

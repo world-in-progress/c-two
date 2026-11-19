@@ -9,9 +9,10 @@ use axum::{
 };
 use c2_error::{C2Error, ErrorCode};
 use c2_ipc::{ForwardRecord, IpcForwardStream, ResponseData};
-use c2_mem::retention::{PayloadBufferBudget, PayloadBufferReservation};
+use c2_mem::{OperationPermit, ReusableWindow};
 use c2_wire::rpc::{CallStatus, CancelCause};
 use tokio::sync::{mpsc, oneshot};
+use tokio_util::task::task_tracker::TaskTrackerToken;
 
 use super::{conn_pool::UpstreamLease, forwarding::StreamCancellation, state::RelayState};
 use crate::stream_wire::{self, HttpStreamRecordKind, HttpStreamStatus, HttpStreamTerminal};
@@ -22,6 +23,8 @@ struct PullBody {
     requests: mpsc::Sender<oneshot::Sender<PullReply>>,
     cancellation: Arc<StreamCancellation>,
     finished: bool,
+    hold: Arc<ResponseHold>,
+    _window: Arc<ReusableWindow>,
 }
 
 impl Drop for PullBody {
@@ -32,32 +35,77 @@ impl Drop for PullBody {
     }
 }
 
+/// Body, outbound frames and upstream work share the forwarding token.
+struct ResponseHold {
+    _permit: OperationPermit,
+    _lease: UpstreamLease,
+    _tracked: TaskTrackerToken,
+}
+
+struct ResponseChunk<T> {
+    bytes: T,
+    _hold: Arc<ResponseHold>,
+}
+
+impl<T: AsRef<[u8]>> AsRef<[u8]> for ResponseChunk<T> {
+    fn as_ref(&self) -> &[u8] {
+        self.bytes.as_ref()
+    }
+}
+
+fn owned_response_bytes<T: AsRef<[u8]> + Send + 'static>(
+    bytes: T,
+    hold: &Arc<ResponseHold>,
+) -> Bytes {
+    Bytes::from_owner(ResponseChunk {
+        bytes,
+        _hold: hold.clone(),
+    })
+}
+
+/// Stream one admitted unary response through its reusable download window.
+///
+/// The forwarding `OperationPermit` and the upstream connection lease live in
+/// the response body's own state: they are released only after the entire
+/// body has been written or the downstream disconnect drops the body, never
+/// when the forwarding handler returns. Each pulled slice reserves from and
+/// refunds the same [`ReusableWindow`], so a response far larger than the
+/// window still never re-applies to the relay's shared memory budget; the
+/// window returns its whole reservation to the domain when the body ends.
 pub(crate) fn unary_response(
     data: ResponseData,
     status: StatusCode,
-    first: PayloadBufferReservation,
-    budget: PayloadBufferBudget,
+    download: ReusableWindow,
+    permit: OperationPermit,
+    lease: UpstreamLease,
+    tracked: TaskTrackerToken,
     width: usize,
 ) -> Response {
     let length = data.len();
+    let hold = Arc::new(ResponseHold {
+        _permit: permit,
+        _lease: lease,
+        _tracked: tracked,
+    });
     let body = Body::from_stream(futures::stream::unfold(
-        (data.into_cursor(), Some(first), budget),
-        move |(mut cursor, mut first, budget)| async move {
+        (data.into_cursor(), download, hold),
+        move |(mut cursor, window, hold)| async move {
             if cursor.remaining() == 0 {
                 return None;
             }
-            let reservation = match first.take() {
-                Some(reservation) => Ok(reservation),
-                None => budget.reserve((cursor.remaining().min(width)) as u64).await,
-            };
-            let chunk = match reservation {
-                Ok(reservation) => cursor
-                    .read_chunk(reservation, width)
-                    .map(|chunk| Bytes::from_owner(chunk.expect("nonempty response cursor")))
-                    .map_err(std::io::Error::other),
-                Err(error) => Err(std::io::Error::other(error)),
-            };
-            Some((chunk, (cursor, first, budget)))
+            let want = (cursor.remaining().min(width)) as u64;
+            let result = async {
+                let slice = window.reserve(want).await.map_err(std::io::Error::other)?;
+                cursor
+                    .read_chunk(slice, width)
+                    .map_err(std::io::Error::other)?
+                    .map(|chunk| owned_response_bytes(chunk, &hold))
+                    .ok_or_else(|| {
+                        std::io::Error::other("unary response cursor ended before its length")
+                    })
+            }
+            .await;
+            Some((result, (cursor, window, hold)))
         },
     ));
     (
@@ -75,8 +123,8 @@ pub(crate) fn stream_response(
     state: Arc<RelayState>,
     stream: IpcForwardStream,
     lease: UpstreamLease,
-    permit: c2_mem::RetentionPermit,
-    first: PayloadBufferReservation,
+    permit: OperationPermit,
+    download: ReusableWindow,
     width: usize,
 ) -> Result<Response, getrandom::Error> {
     let (token, cancellation) = match state.forwarding.register_stream() {
@@ -92,10 +140,18 @@ pub(crate) fn stream_response(
         }
     };
     let (requests, receiver) = mpsc::channel(1);
+    let hold = Arc::new(ResponseHold {
+        _permit: permit,
+        _lease: lease,
+        _tracked: state.forwarding.track_body(),
+    });
+    let download = Arc::new(download);
     let body_state = PullBody {
         requests,
         cancellation: cancellation.clone(),
         finished: false,
+        hold: hold.clone(),
+        _window: download.clone(),
     };
     let body = Body::from_stream(futures::stream::unfold(body_state, |mut body| async move {
         if body.finished {
@@ -108,7 +164,7 @@ pub(crate) fn stream_response(
         let result = match response.await {
             Ok(Ok((bytes, finished))) => {
                 body.finished = finished;
-                Ok(bytes)
+                Ok(owned_response_bytes(bytes, &body.hold))
             }
             Ok(Err(error)) => {
                 body.finished = true;
@@ -124,18 +180,9 @@ pub(crate) fn stream_response(
     let work_state = state.clone();
     let work_token = token.clone();
     state.forwarding.spawn_driver(async move {
-        drive_stream(
-            stream,
-            cancellation,
-            receiver,
-            first,
-            work_state.forwarding.payload_budget(),
-            width,
-        )
-        .await;
+        drive_stream(stream, cancellation, receiver, download, width).await;
         work_state.forwarding.remove_stream(&work_token);
-        drop(lease);
-        drop(permit);
+        drop(hold);
     });
     Ok((
         StatusCode::OK,
@@ -155,14 +202,13 @@ async fn drive_stream(
     mut stream: IpcForwardStream,
     cancellation: Arc<StreamCancellation>,
     mut requests: mpsc::Receiver<oneshot::Sender<PullReply>>,
-    first: PayloadBufferReservation,
-    budget: PayloadBufferBudget,
+    window: Arc<ReusableWindow>,
     width: usize,
 ) {
     let upstream_cancel = stream.cancellation();
     let mut observed_cancel = false;
     let mut observed_consumer = false;
-    let mut first = Some(first);
+    let mut window = Some(window);
     let mut remaining = 0;
     let mut pending_data = None;
     let mut terminal = false;
@@ -189,8 +235,7 @@ async fn drive_stream(
             &mut stream,
             &mut remaining,
             &mut pending_data,
-            &mut first,
-            &budget,
+            &mut window,
             width,
             &cancellation,
         ));
@@ -213,8 +258,8 @@ async fn drive_stream(
                     if cause == CancelCause::Consumer && !data_open {
                         drop(pull);
                         break match stream.completion().await {
-                            Ok(terminal) => terminal_frame(terminal, &mut first),
-                            Err(error) => failure_frame(error, &mut first),
+                            Ok(terminal) => terminal_frame(terminal, &mut window),
+                            Err(error) => failure_frame(error, &mut window),
                         };
                     }
                 }
@@ -224,8 +269,8 @@ async fn drive_stream(
                     if !data_open {
                         drop(pull);
                         break match stream.completion().await {
-                            Ok(terminal) => terminal_frame(terminal, &mut first),
-                            Err(error) => failure_frame(error, &mut first),
+                            Ok(terminal) => terminal_frame(terminal, &mut window),
+                            Err(error) => failure_frame(error, &mut window),
                         };
                     }
                 }
@@ -241,7 +286,7 @@ async fn drive_stream(
     // No downstream reader remains for these local bytes. Their lifetime
     // ends before waiting for the resource's independent cleanup.
     drop(pending_data.take());
-    drop(first.take());
+    drop(window.take());
     if !terminal {
         // Consumer abandonment can follow lifecycle cancellation. That second
         // intent discards this call's data while retaining the original cause.
@@ -252,9 +297,9 @@ async fn drive_stream(
 
 fn terminal_frame(
     terminal: c2_ipc::StreamTerminal,
-    first: &mut Option<PayloadBufferReservation>,
+    window: &mut Option<Arc<ReusableWindow>>,
 ) -> PullReply {
-    first.take();
+    window.take();
     let status = match terminal.status {
         CallStatus::Success => HttpStreamStatus::Success,
         CallStatus::Failed => HttpStreamStatus::Failed,
@@ -272,9 +317,9 @@ fn terminal_frame(
 
 fn failure_frame(
     error: impl std::fmt::Display,
-    first: &mut Option<PayloadBufferReservation>,
+    window: &mut Option<Arc<ReusableWindow>>,
 ) -> PullReply {
-    first.take();
+    window.take();
     let error = C2Error::new(ErrorCode::ResourceUnavailable, error.to_string()).with_details(
         std::collections::BTreeMap::from([("dispatch_phase".into(), "dispatch_uncertain".into())]),
     );
@@ -286,8 +331,7 @@ async fn pull_frame(
     stream: &mut IpcForwardStream,
     remaining: &mut u64,
     pending_data: &mut Option<Bytes>,
-    first: &mut Option<PayloadBufferReservation>,
-    budget: &PayloadBufferBudget,
+    window: &mut Option<Arc<ReusableWindow>>,
     width: usize,
     cancellation: &StreamCancellation,
 ) -> PullReply {
@@ -298,19 +342,23 @@ async fn pull_frame(
     }
     if cancellation.is_consumer_requested() {
         return match stream.completion().await {
-            Ok(terminal) => terminal_frame(terminal, first),
-            Err(error) => failure_frame(error, first),
+            Ok(terminal) => terminal_frame(terminal, window),
+            Err(error) => failure_frame(error, window),
         };
     }
     if *remaining != 0 {
-        let reservation = match first.take() {
-            Some(reservation) => reservation,
-            None => budget
-                .reserve((*remaining).min(width as u64))
-                .await
-                .map_err(std::io::Error::other)?,
+        // Every slice of this forwarded response loops through the entry
+        // reservation: capacity returns to the window when the previous
+        // chunk's Bytes drop, and the domain sees the whole window back only
+        // when the response ends.
+        let want = (*remaining).min(width as u64);
+        let slice = match window.as_mut() {
+            Some(window) => window.reserve(want).await.map_err(std::io::Error::other)?,
+            None => {
+                return failure_frame("forwarding window already released", window);
+            }
         };
-        match stream.read_chunk(reservation, width).await {
+        match stream.read_chunk(slice, width).await {
             Ok(Some(bytes)) => {
                 let length = bytes.as_ref().len() as u64;
                 *remaining -= length;
@@ -330,11 +378,11 @@ async fn pull_frame(
                 // actual outcome, rather than manufacturing a transport loss.
                 if cancellation.cause().is_some() {
                     return match stream.completion().await {
-                        Ok(terminal) => terminal_frame(terminal, first),
-                        Err(error) => failure_frame(error, first),
+                        Ok(terminal) => terminal_frame(terminal, window),
+                        Err(error) => failure_frame(error, window),
                     };
                 }
-                return failure_frame(error, first);
+                return failure_frame(error, window);
             }
         }
     }
@@ -346,7 +394,7 @@ async fn pull_frame(
                 false,
             ))
         }
-        Ok(ForwardRecord::CallEnd(terminal)) => terminal_frame(terminal, first),
-        Err(error) => failure_frame(error, first),
+        Ok(ForwardRecord::CallEnd(terminal)) => terminal_frame(terminal, window),
+        Err(error) => failure_frame(error, window),
     }
 }

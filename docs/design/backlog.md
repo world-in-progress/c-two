@@ -14,13 +14,12 @@
    - **服务端回调面：** `CrmCallback` 与流回调都收一个 `ResponsePool`，生产实现（`core/runtime/c2-core/src/host.rs`）全部不用，流的 SHM 编码也由服务端自己取池；内存策略文档仍承诺它是低层回调直接填充响应的扩展点。先裁决是否保留这个外部扩展点，撤下就一并收回参数、公开 helper 与 `ShmAlloc` 分支。排在流式块 7、8 之后（2026-11-05 架构审查）。
    - **契约、代码生成与 CLI：** H1、H4、H6、H8（用校验过的构造器加私有字段，取代 C01）、H9；R29 等剩下的 codegen 同次缓存与 typed projection。
    - **测试：** Rust SDK 的测试夹具在 `/tmp` 下为每个测试建私有端点根（`c2-sdk-*`、`c2-sdk-stream-*`、`c2-persist-*`），用完不删，2026-11-09 本机已积累约 750 个，每个只剩 `.gate` 与 `.gate.marker`；改为测试结束时删除，并像 Python 的 `mesh` 夹具那样先核对没有留下套接字与租约。路由身份块 7 的测试还留下三处小问题：Rust 持久客户端夹具打印子进程事件时去掉 `route_uid`，存下的事件里仍有，只是为了让日志看起来没有 route UID，应删掉这段处理；Python 的 `mesh` 夹具按测试名决定是否记录清理回执，回执应由测试自己记录；Python 与 Node 的门禁 8 强制离开用例在旧持有者撤下并重新加入之后才获取，Rust 的用例在旧持有者仍失联时获取。Python 与 Node 的 relay-local 获取可以照 Rust 的做，2026-11-09 用临时测试在 Python 上核对过；两者的 HTTP 获取要经被阻断的通告地址，在这套夹具里做不到，Rust 的用例只隔断对端的联系地址，覆盖了这一点。
-3. **配置收敛**（[接口审查](2026-10-31-api-surface-review.md)第三节）：逐项表定下之后进行。与 B8、H3、H7、H12、C4 交叉，R09、R10 的 EnvCatalog 多次加载一并处理。`chunk_threshold_ratio`（`C2_IPC_CHUNK_THRESHOLD_RATIO`）已证实没有作用：只在 c2-config 里解析与校验，c2-ipc 只在比较两份客户端池配置时用到它，分片判断不读它；连同环境变量、Python 字段与测试一起删除。
-4. **错误类型**（接口审查第四节）：协议批之后。R32、R33 等剩下的结构化错误内部序列化、Python 错误常量与孤立的 `wrap_error`。
-5. **TypeScript 与 Node：** 流式块 7 已让 Node 经 C/FFI ABI 8 调用 Rust Core 的客户端，R16 剩下的 Node→Core 投影迁移随之完成；还没做的是解码不透明的响应 allocator。2026-11-05 的架构审查补了两项，都排在流式块 8 之后：一是生成的 TypeScript 文件内嵌整份 transport，契约不变也要随 IPC 或 ABI 升级重新生成，应把运行时拆成独立的 `sdk/typescript` 包，生成器只输出契约胶水；二是 `core/foundation/c2-mem-ffi` 名为 foundation 层，块 7 之后实际依赖 c2-core、c2-ipc、c2-contract 与 c2-error，工作区里没有别的 crate 依赖它，Python 也不用它，只服务 Node，应把它的原生库与 TypeScript 绑定一起归入 `sdk/typescript`，按客户端的职责改名，仍出一个动态库，同步 loader、C 头文件、npm 包与 CI 路径。原流式块 8b（生成的 TypeScript 经 relay 的 HTTP 流）2026-11-05 经维护者同意移到这一批，免得先在生成的 transport 里手写一遍、重构时再改；在此之前，生成的 TypeScript 客户端经 relay 的 HTTP 调用流方法，照旧在派发前报 `UnsupportedCallMode`，经直接 IPC 照常可用。Node 作为后端客户端维持（维护者 2026-11-05）；Node 能加载原生插件，它的 HTTP 路径也可以像 IPC 一样经 ABI 8 走 Rust 客户端，TypeScript 里不再手写这套机制，这是 Host 的推论，留到这一批设计时定。
-6. **发版工具，方案 B**（[发版敏捷性审查](2026-10-30-release-agility-review.md)第三、四节）：与产品代码无关，可以随时插入。旧候选三件套（D16）与它们的自测已于 2026-11-09 删除；`artifact_manifest.py` 里只有晋升脚本还在用的五个函数留下，移到了 `.github/scripts/safe_zip.py`，D9 的简化仍待做。还剩的先后（2026-11-05 架构审查定的）：先把仍在用的两种回执迁到 `tools/testing`（`tools/dev/test_python.py` 与正式矩阵还在调用），之后删掉 `tools/local_rc`；把 Unix 跨 UID 验证并入 Source Validation，再删 `local-endpoint-validation.yml`（D15），那个工作流的理由还写着已由 ADR 0002 退役的 owner 机制。B1 候选重整、B2 其余的删减（D8–D11、D15）、B3 FastDB 版本只写一处、B5 精简各条线的 gate、B6 修 `PROBE_BUDGET` 的偶发失败。顺带修配对基准的两处：收据只给 p99 的比值，而流式设计第十二节第 7 条的门槛用 p95，补上 p95；`run_matrix` 在行控制器退出时若看到 Windows Job 仍计着一个活进程，就把这一行报成超过等待时限并改写真实退出码，也不记下剩下的是哪个进程（流式 run 42349023784 的 Windows x64 作业出现过一次，那一行 200 次调用全部成功、清理完整），要记下这个进程并如实报告。
-7. **路线图上的其余产品能力**（完成标准见[路线图](roadmap.zh-CN.md#产品能力)）：官方不可变的包分发、契约兼容、调用元数据与准入钩子、dry-run、async unary、遥测与背压、可发布的 TypeScript SDK、发现与命名空间治理。顺序待维护者定。
-8. **文档里的协作流程用词**（2026-11-04 维护者同意）：设计文档里用 Host、Worker、微任务、看板、委派块、任务书指协作流程，约 60 处，分布在 9 份设计文档里；仓库外的读者不知道它们指谁，Host 还与术语表里的 Host 撞名，worker 与执行 worker 撞名。改为不写角色，例如“Host 建议”只写“建议”。指拍板者的“用户”改为“维护者”，约 120 处；“开发者”在这里指 C-Two 的使用者，不用来指维护者。验收记录只按[文档索引](../README.md#records)修复链接或移除隐私信息。
-9. **下一次发版：** 维护者 2026-11-09 定为 C-Two 0.11.0 与 c3 0.7.0，排在第 3 项配置收敛与第 4 项错误类型之后，免得用户迁移两次。发版时：根 README 的状态段与安装段里的版本号和 c3 链接、SDK README 与 `cli/README.md` 里的版本说明（IPC 14、SHM 3、ABI 6）改为发版时的版本，现在是 IPC 16、SHM 4、C/FFI ABI 8 与 mesh 7；`docs/releases/unreleased.md` 现在按批次分节，改写成一份 0.11.0 说明，升级要做的事集中写在开头；`CHANGELOG.md` 的 [Unreleased] 里 IPC 15 与 IPC 16、C/FFI ABI 7 与 ABI 8 各合成一条。IPC 15 与 ABI 7 没有发布过，所以都从 0.10.1 的版本直接写到发版时的版本。c3 0.7.0 是 world-in-progress/c-two#208 之后第一次经 `cli-release.yml` 发布。
+3. **错误类型**（接口审查第四节）：协议批之后。R32、R33 等剩下的结构化错误内部序列化、Python 错误常量与孤立的 `wrap_error`。
+4. **TypeScript 与 Node：** 流式块 7 已让 Node 经 C/FFI ABI 8 调用 Rust Core 的客户端，R16 剩下的 Node→Core 投影迁移随之完成；还没做的是解码不透明的响应 allocator。2026-11-05 的架构审查补了两项，都排在流式块 8 之后：一是生成的 TypeScript 文件内嵌整份 transport，契约不变也要随 IPC 或 ABI 升级重新生成，应把运行时拆成独立的 `sdk/typescript` 包，生成器只输出契约胶水；二是 `core/foundation/c2-mem-ffi` 名为 foundation 层，块 7 之后实际依赖 c2-core、c2-ipc、c2-contract 与 c2-error，工作区里没有别的 crate 依赖它，Python 也不用它，只服务 Node，应把它的原生库与 TypeScript 绑定一起归入 `sdk/typescript`，按客户端的职责改名，仍出一个动态库，同步 loader、C 头文件、npm 包与 CI 路径。原流式块 8b（生成的 TypeScript 经 relay 的 HTTP 流）2026-11-05 经维护者同意移到这一批，免得先在生成的 transport 里手写一遍、重构时再改；在此之前，生成的 TypeScript 客户端经 relay 的 HTTP 调用流方法，照旧在派发前报 `UnsupportedCallMode`，经直接 IPC 照常可用。Node 作为后端客户端维持（维护者 2026-11-05）；Node 能加载原生插件，它的 HTTP 路径也可以像 IPC 一样经 ABI 8 走 Rust 客户端，TypeScript 里不再手写这套机制，这是 Host 的推论，留到这一批设计时定。
+5. **发版工具，方案 B**（[发版敏捷性审查](2026-10-30-release-agility-review.md)第三、四节）：与产品代码无关，可以随时插入。旧候选三件套（D16）与它们的自测已于 2026-11-09 删除；`artifact_manifest.py` 里只有晋升脚本还在用的五个函数留下，移到了 `.github/scripts/safe_zip.py`，D9 的简化仍待做。还剩的先后（2026-11-05 架构审查定的）：先把仍在用的两种回执迁到 `tools/testing`（`tools/dev/test_python.py` 与正式矩阵还在调用），之后删掉 `tools/local_rc`；把 Unix 跨 UID 验证并入 Source Validation，再删 `local-endpoint-validation.yml`（D15），那个工作流的理由还写着已由 ADR 0002 退役的 owner 机制。B1 候选重整、B2 其余的删减（D8–D11、D15）、B3 FastDB 版本只写一处、B5 精简各条线的 gate、B6 修 `PROBE_BUDGET` 的偶发失败。顺带修配对基准的两处：收据只给 p99 的比值，而流式设计第十二节第 7 条的门槛用 p95，补上 p95；`run_matrix` 在行控制器退出时若看到 Windows Job 仍计着一个活进程，就把这一行报成超过等待时限并改写真实退出码，也不记下剩下的是哪个进程（流式 run 42349023784 的 Windows x64 作业出现过一次，那一行 200 次调用全部成功、清理完整），要记下这个进程并如实报告。
+6. **路线图上的其余产品能力**（完成标准见[路线图](roadmap.zh-CN.md#产品能力)）：官方不可变的包分发、契约兼容、调用元数据与准入钩子、dry-run、async unary、遥测与背压、可发布的 TypeScript SDK、发现与命名空间治理。顺序待维护者定。
+7. **文档里的协作流程用词**（2026-11-04 维护者同意）：设计文档里用 Host、Worker、微任务、看板、委派块、任务书指协作流程，约 60 处，分布在 9 份设计文档里；仓库外的读者不知道它们指谁，Host 还与术语表里的 Host 撞名，worker 与执行 worker 撞名。改为不写角色，例如“Host 建议”只写“建议”。指拍板者的“用户”改为“维护者”，约 120 处；“开发者”在这里指 C-Two 的使用者，不用来指维护者。验收记录只按[文档索引](../README.md#records)修复链接或移除隐私信息。
+8. **下一次发版：** 维护者 2026-11-09 定为 C-Two 0.11.0 与 c3 0.7.0，排在已完成的[配置收敛验收](../acceptance/2026-11-18-config-convergence-acceptance.md)与第 3 项错误类型之后，免得用户迁移两次。发版时：根 README 的状态段与安装段里的版本号和 c3 链接、SDK README 与 `cli/README.md` 里的版本说明（IPC 14、SHM 3、ABI 6）改为发版时的版本，现在是 IPC 16、SHM 4、C/FFI ABI 8 与 mesh 7；`docs/releases/unreleased.md` 现在按批次分节，改写成一份 0.11.0 说明，升级要做的事集中写在开头；`CHANGELOG.md` 的 [Unreleased] 里 IPC 15 与 IPC 16、C/FFI ABI 7 与 ABI 8 各合成一条。IPC 15 与 ABI 7 没有发布过，所以都从 0.10.1 的版本直接写到发版时的版本。c3 0.7.0 是 world-in-progress/c-two#208 之后第一次经 `cli-release.yml` 发布。
 
 各批一并删除只钉源码文本或已删名字的测试（复审第六节）；复审附录里各区未裁决的待议项，实施到对应区域时再定。[瘦身账本](2026-10-13-local-slimming-batches.md)暂缓表与条目边界表里的其余各项仍按账本写明的条件。
 
@@ -34,6 +33,7 @@
 
 - `c2-mem-ffi` 的 `Endpoint::deactivate`（`core/foundation/c2-mem-ffi/src/client.rs` 约 298 行）用 `try_lock` 取连接，锁被占时跳过这条连接的停用，并发的 prepare 可能在停用之后再建一次连接（2026-11-09 审查发现），要核实。
 - Windows 测试机的整夜循环（3 份并排，每份 4 个逻辑 CPU）里还有两处 c2-server 测试在负载下偶发失败，要逐个核实是测试的时限还是产品行为：`stopped_local_reads_bound_calls_and_preserve_half_frame_close_truth` 在 `stalled_peer_tests.rs:133` 写入时遇到 BrokenPipe（Windows 错误 232，管道正在关闭），`assembler_timeout_releases_charge_and_route_capacity_then_serves_again` 在 `server_tests.rs:5759` 断言失败（55 对 6）。升级 mio 之前的 1750 轮里分别失败 9 次与 3 次，之后的 8177 轮里分别是 68 次与 14 次，比率没有显著变化。前者集中在掩码 F0（CPU 4–7）那一份：两轮分别是 9 次里 9 次、68 次里 62 次，原因没有查。c2-core 的 `server_streams` 在升级前的 1751 轮里有 3 次服务端启动在 5 秒的 Responsiveness 阶段超时、2 次本地连接超时，升级后的 8177 轮里没有再出现，推测与 mio 的缺陷同源。
+- 配置收敛第一轮 fork CI（run [44323008313](https://github.com/Dsssyc/c-two/actions/runs/44323008313)，`c1533151`）里，`windows-11-arm` 上的 `sdk/rust/tests/route_identity_mesh.rs` 出现过一次 `host_a.shutdown_with_timeout(WAIT)` 屏障超时；Windows 11 x64 上含并发负载连续复跑 49 轮与后续两轮全平台 CI 均未再现（[验收记录](../acceptance/2026-11-18-config-convergence-acceptance.md)）。测试侧已补上断言失败时打印 `host.lifecycle_snapshot()` 与 `c3.stderr.log` 的诊断，再出现时按诊断取证。
 
 ## 不排期
 
@@ -50,18 +50,16 @@
 
 ## 待维护者决定
 
-- 配置项的逐项表。
 - relay 轮询的间隔（复审建议秒级，不做成配置）。
 - `/_admin/unregister` 有没有人手动使用（F7）。路由身份计划的决定 D（2026-11-08 批准）把它定为 Host 崩溃之后部署方在原 relay 上撤下名字的途径，它因此保留；第 3 项里注销 202/204/404 的区分仍待答复。
 - `crm.client = <对象>` 与 `HeldResult(release_cb=…)` 算不算扩展点（G2）。
 - `c_two.config.settings` 的直接写入是否受支持（G8）。
 - R21：Resource 模板生成器输出的仍是装饰并继承 CRM 的旧模型，c2-codegen 没有等价的 Resource 骨架；修好这个工具，还是退役这项功能（约 613 行）。
 - 发版方案 B 的决定 3、7。
-- IPC 客户端收内联帧没有可配置的长度上限：`recv_loop` 只检查帧长不小于帧头，随后照帧头的 u32 `total_len` 分配；服务端有 `max_frame_size`，客户端没有对应的设置。对端是经身份校验的同一用户进程，2026-11-05 块 8 计划阶段才发现。要不要给客户端对称的上限，或者由握手告知，待定。
 - 经 relay 的流的提前量：HTTP 不传 CREDIT，relay 只在 HTTP 库要下一段正文时才向上游要下一条，消费方停止读取后，资源还能多推进 HTTP 与 TCP 缓冲装得下的那么多条。块 8 的实测（macOS 本机回环、一跳、B=256 KiB）：64 字节条目最多 5179 步，128 KiB 条目 10 步，空条目在 20 万条内一直推进到底。第十二节第 5 条预想的是“多推进几步”。文档已照实写明，并建议需要逐步等消费方的流走直接 IPC；要不要给 HTTP 加一条按条目的需求通道，待定。
 - TypeScript 的浏览器端：[终局架构](endgame-architecture.md)设想 Web 与 Node 消费同一契约，维护者 2026-11-05 认为 Web 端的做法存疑，需要讨论。若要支持，可以把 Rust 里不碰 I/O 的部分（编解码、调用终态与截止时间、路由解析）编成 wasm，fastdb4ts 已经带一个 wasm 模块；IPC 做不进 wasm。
 - Host 关闭返回时，没有调用、没有借出的已接受连接可能还没关完：块 9b17 在受控复现里看到 shutdown 无错误、`finished` 为真，约 97 ms 后这条连接才发布 `Closed`（`server_shutdown`）。现行文档只把监听、调用与借出算进关闭完成，所以测试改为等事件到齐。要不要让 shutdown 也等空闲连接关完，待定。
 
 ## 下游跟进（由维护者决定）
 
-- 已知下游升级时按发行说明迁移：导入改到新的子模块，`ConcurrencyMode` 改为字符串，并跟进配置收敛与流式 RPC 改掉的代码覆盖键（块 4 把 `max_total_chunks` 改名为 `max_inflight_chunk_frames`，不留别名）。
+- 已知下游升级时按发行说明迁移：导入改到新的子模块，`ConcurrencyMode` 改为字符串，并按[配置迁移说明](../releases/unreleased.md#migrate-code-and-deployment)改用角色域配置入口。

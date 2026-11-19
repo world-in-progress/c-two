@@ -20,7 +20,8 @@ use c2_http::client::{
 };
 use c2_server::{BuiltRoute, ServerLifecycleState, ServerRouteCloseOutcome};
 
-use crate::call_execution::{CallExecutionContext, CallExecutionObserver};
+use crate::call_execution::CallExecutionContext;
+use crate::memory::role_call_stats;
 use crate::{
     LifecycleError, RegisterFailureOutcome, RegisterOutcome, RelayCleanupError, RouteCloseOutcome,
     ShutdownOutcome, UnregisterOutcome,
@@ -43,15 +44,6 @@ fn unlimited_lifecycle_error(error: crate::Error) -> LifecycleError {
         crate::Error::Lifecycle(error) => error,
         _ => unreachable!("unlimited metadata projection cannot expire or dispatch"),
     }
-}
-
-fn validate_startup_timeout(timeout: Option<Duration>) -> Result<(), LifecycleError> {
-    if timeout.is_some_and(|timeout| c2_config::deadline_after(Instant::now(), timeout).is_err()) {
-        return Err(LifecycleError::Configuration(
-            "startup_timeout exceeds the monotonic clock range".into(),
-        ));
-    }
-    Ok(())
 }
 
 fn connect_stage_check(deadline: ConnectDeadline, stage: &'static str) -> Result<(), crate::Error> {
@@ -86,9 +78,6 @@ fn shutdown_lock<'a, T>(
         .ok_or(LifecycleError::ShutdownWaitTimeout { stage })
 }
 
-pub type ServerIpcConfigOverrides = c2_config::ServerIpcConfigOverrides;
-pub type ClientIpcConfigOverrides = c2_config::ClientIpcConfigOverrides;
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeIdentity {
     pub server_id: String,
@@ -96,15 +85,14 @@ pub struct RuntimeIdentity {
     pub ipc_address: String,
 }
 
+/// Client-role configuration only: every Host identity, carrying-capacity
+/// and server-domain setting belongs to [`crate::HostOptions`].
 #[derive(Debug, Clone)]
 pub struct RuntimeOptions {
-    pub server_id: Option<String>,
-    pub server_ipc_overrides: Option<ServerIpcConfigOverrides>,
-    /// Startup wait budget inherited by HostOptions without an explicit override.
-    pub server_startup_timeout: Option<Duration>,
-    pub client_ipc_overrides: Option<ClientIpcConfigOverrides>,
-    pub shm_threshold: Option<u64>,
-    pub remote_payload_chunk_size: Option<u64>,
+    /// Client-domain capacity code overrides, applied before the domain's
+    /// first freeze.
+    pub client_limits: c2_config::DomainLimitsOverrides,
+    pub local_endpoint: c2_config::LocalEndpointOptions,
     pub relay_anchor_address: Option<String>,
     pub use_process_relay_anchor: bool,
 }
@@ -112,16 +100,64 @@ pub struct RuntimeOptions {
 impl Default for RuntimeOptions {
     fn default() -> Self {
         Self {
-            server_id: None,
-            server_ipc_overrides: None,
-            server_startup_timeout: None,
-            client_ipc_overrides: None,
-            shm_threshold: None,
-            remote_payload_chunk_size: None,
+            client_limits: Default::default(),
+            local_endpoint: Default::default(),
             relay_anchor_address: None,
             use_process_relay_anchor: true,
         }
     }
+}
+
+/// The current Host and its startup or shutdown transaction are owned by the
+/// Runtime. Weak running handles let the last Host owner initiate normal drain.
+#[derive(Default)]
+enum HostSlot {
+    #[default]
+    Vacant,
+    Starting(Arc<HostStartup>),
+    Running {
+        inner: Weak<crate::host::HostInner>,
+        server: Weak<c2_server::Server>,
+    },
+}
+
+type HostStartOutcome = (
+    Result<crate::Host, LifecycleError>,
+    Option<FailedStartShutdownReceipt>,
+);
+
+#[derive(Default)]
+pub(crate) struct HostStartup {
+    result: Mutex<Option<HostStartOutcome>>,
+    completed: Condvar,
+}
+
+impl HostStartup {
+    pub(crate) fn wait(&self) -> HostStartOutcome {
+        let mut result = self.result.lock();
+        while result.is_none() {
+            self.completed.wait(&mut result);
+        }
+        result
+            .as_ref()
+            .expect("completed start owns an outcome")
+            .clone()
+    }
+}
+
+pub(crate) enum HostAdmission {
+    Shared(crate::Host),
+    Starting(Arc<HostStartup>),
+    Granted(HostStart, Arc<HostStartup>),
+}
+
+pub(crate) struct HostStart {
+    pub identity: RuntimeIdentity,
+    pub ipc: c2_config::ServerIpcConfig,
+    pub budget: c2_mem::DomainBudget,
+    pub startup_timeout: Duration,
+    pub settings: crate::roles::HostSettings,
+    pub endpoint_catalog: Option<(u64, c2_config::EnvCatalog)>,
 }
 
 fn registration_rollback_outcome(route_name: &str, local_removed: bool) -> RouteCloseOutcome {
@@ -369,38 +405,33 @@ impl FailedStartShutdownReceipt {
 
 struct RuntimeState {
     connection_event_source: c2_local::ConnectionEventSource,
-    server_id_override: Option<String>,
-    server_ipc_overrides: Option<ServerIpcConfigOverrides>,
-    server_startup_timeout: Option<Duration>,
-    client_ipc_overrides: Option<ClientIpcConfigOverrides>,
-    shm_threshold: Option<u64>,
-    remote_payload_chunk_size: Option<u64>,
-    call_execution_overrides: c2_config::CallExecutionLimitsOverrides,
-    call_execution_sources: Option<c2_config::ConfigSources>,
-    call_execution_revision: u64,
-    call_execution: Option<CallExecutionContext>,
-    call_execution_observer: CallExecutionObserver,
-    client_config_revision: u64,
+    /// The lazily frozen client role domain: frozen by the first valid remote
+    /// business connection or call, never by Host startup or relay control.
+    client_domain: crate::roles::RoleDomain,
+    /// The lazily frozen server role domain: frozen by the first Host start;
+    /// a Host restart reuses its budget with real in-flight accounting intact.
+    server_role: crate::roles::ServerRole,
+    host_slot: HostSlot,
     local_endpoint_options: c2_config::LocalEndpointOptions,
     local_endpoint_sources: Option<c2_config::ConfigSources>,
     local_endpoint_revision: u64,
     frozen_local_endpoint: Option<c2_config::LocalEndpointContext>,
     /// Accepted domain inherited from a used session, still configurable until I/O.
     inherited_local_endpoint: Option<c2_config::LocalEndpointContext>,
-    /// Resolved client IPC config fixed by the first valid connection
-    /// attempt. Later acquires reuse it verbatim so one Runtime can never
-    /// run two competing client configurations.
-    frozen_client_config: Option<c2_config::ClientIpcConfig>,
-    /// Outgoing IPC cache in one immutable endpoint domain. Created on first
-    /// acquire so HTTP-only Runtimes need no local platform scope. Clones share
-    /// it; distinct Runtimes are isolated, and drains never replace the pool.
+    /// Outgoing IPC cache in one immutable endpoint domain, charging the
+    /// client role budget. Created on first acquire so HTTP-only Runtimes need
+    /// no local platform scope. Clones share it; distinct Runtimes are
+    /// isolated, and drains never replace the pool.
     client_pool: Option<Arc<c2_ipc::ClientPool>>,
     identity: Option<RuntimeIdentity>,
     relay_anchor_address_override: Option<String>,
     use_process_relay_anchor: bool,
     relay_projection: Option<RelayProjection>,
     path_counters: PathCounters,
-    lifecycle_frozen: bool,
+    /// Retired role accounting adopted from earlier sessions of a rotation.
+    retired: crate::memory::RetiredRoles,
+    /// Local hold metadata of this session.
+    holds: Arc<crate::memory::LocalCopyTracker>,
     shutdown_transactions: HashMap<String, Arc<ShutdownTransaction>>,
     retirement: Option<Arc<ShutdownTransaction>>,
     registration_scopes: HashMap<String, HashMap<String, RelayRegistrationScope>>,
@@ -429,6 +460,10 @@ pub(crate) enum RelayResolvedConnection {
     },
 }
 
+fn pending_host_teardown() -> LifecycleError {
+    LifecycleError::Configuration("pending native teardown must finish before starting a new Host or resetting server identity".into())
+}
+
 impl RuntimeState {
     fn ensure_active(&self) -> Result<(), LifecycleError> {
         if self.retirement.is_some() {
@@ -437,14 +472,16 @@ impl RuntimeState {
         Ok(())
     }
 
-    fn ensure_no_pending_teardown(&self) -> Result<(), LifecycleError> {
-        self.ensure_active()?;
-        if self
-            .shutdown_transactions
+    fn has_pending_shutdown(&self) -> bool {
+        self.shutdown_transactions
             .values()
             .any(|transaction| transaction.outcome.lock().outcome.is_none())
-        {
-            return Err(LifecycleError::Configuration("pending native teardown must finish before starting a new Host or resetting server identity".into()));
+    }
+
+    fn ensure_no_pending_teardown(&self) -> Result<(), LifecycleError> {
+        self.ensure_active()?;
+        if self.has_pending_shutdown() {
+            return Err(pending_host_teardown());
         }
         Ok(())
     }
@@ -454,7 +491,9 @@ impl Drop for RuntimeState {
     fn drop(&mut self) {
         // Observers retain accounting metadata alone. Closing on last session
         // owner drop does not refund surviving real input/preparation owners.
-        self.call_execution_observer.close();
+        // The last session owner permanently retires both role domains.
+        self.client_domain.close_operations();
+        self.server_role.close_operations();
     }
 }
 
@@ -568,6 +607,20 @@ impl Runtime {
         if let Some(transaction) = &state.retirement {
             return observe_existing(transaction);
         }
+        match &state.host_slot {
+            HostSlot::Starting(_) => return Err(pending_host_teardown()),
+            HostSlot::Running { server, .. }
+                if required_server
+                    .as_ref()
+                    .is_some_and(|target| !Weak::ptr_eq(target, server))
+                    && server.upgrade().is_some_and(|current| current.is_running()) =>
+            {
+                return Err(LifecycleError::Configuration(
+                    "shutdown target is outside the current Host scope".into(),
+                ));
+            }
+            _ => {}
+        }
         let key = work
             .server
             .as_ref()
@@ -594,7 +647,8 @@ impl Runtime {
             if progress.outcome.is_none() {
                 execution.seed = seal.map(|seal| seal.commit());
                 progress.retirement = Some(execution);
-                state.call_execution_observer.close();
+                state.client_domain.close_operations();
+                state.server_role.close_operations();
                 state.retirement = Some(transaction.clone());
                 return Ok(RuntimeShutdownReceipt {
                     transaction: transaction.clone(),
@@ -626,9 +680,76 @@ impl Runtime {
                 state.shutdown_transactions.insert(key, transaction.clone());
             }
         }
-        state.call_execution_observer.close();
+        // Permanent retirement closes both role domains' call admission.
+        state.client_domain.close_operations();
+        state.server_role.close_operations();
         state.retirement = Some(transaction.clone());
         Ok(RuntimeShutdownReceipt { transaction })
+    }
+
+    /// Capture this session's retirement handoff for a replacement session:
+    /// both roles' explicit code-override intent (an auto-generated server id
+    /// never travels as an override), the weak observers of this session's
+    /// own two domains, and every earlier adopted retired record. Capture is
+    /// retry-safe and does not consume the records.
+    pub fn capture_retirement_handoff(
+        &self,
+    ) -> Result<crate::memory::RetirementHandoff, LifecycleError> {
+        let state = self.state.lock();
+        if !state
+            .retirement
+            .as_ref()
+            .is_some_and(|transaction| transaction.outcome.lock().outcome.is_some())
+        {
+            return Err(LifecycleError::Configuration(
+                "retirement must complete before capturing a Runtime handoff".into(),
+            ));
+        }
+        let host_unsettled = match &state.host_slot {
+            HostSlot::Starting(_) => true,
+            HostSlot::Running { server, .. } => server.upgrade().is_some_and(|server| {
+                let key = format!("{}:{:p}", server.server_instance_id(), server.as_ref());
+                server.is_running() || !state.shutdown_transactions.contains_key(&key)
+            }),
+            HostSlot::Vacant => false,
+        };
+        if host_unsettled || state.has_pending_shutdown() {
+            return Err(pending_host_teardown());
+        }
+        let mut roles: Vec<crate::roles::RetiredRoleObserver> = Vec::new();
+        roles.extend(state.client_domain.retire_observer(crate::RoleKind::Client));
+        roles.extend(state.server_role.retire_observer());
+        let (adopted_roles, adopted_trackers) = state.retired.capture();
+        roles.extend(adopted_roles);
+        let trackers = std::iter::once(state.holds.observer())
+            .chain(adopted_trackers)
+            .collect();
+        Ok(crate::memory::RetirementHandoff::new(
+            roles,
+            trackers,
+            *state.client_domain.overrides(),
+            state.server_role.overrides().clone(),
+        ))
+    }
+
+    /// Adopt a captured retirement handoff: install both roles' explicit
+    /// code-override intent and merge the retired records into this fresh
+    /// session's observation list.
+    pub fn adopt_retirement_handoff(
+        &self,
+        handoff: &crate::memory::RetirementHandoff,
+    ) -> Result<(), LifecycleError> {
+        let mut state = self.state.lock();
+        state.ensure_active()?;
+        if state.client_domain.frozen() || state.server_role.frozen() {
+            return Err(LifecycleError::ConfigFrozen);
+        }
+        let (client_overrides, server_overrides) = handoff.override_intent();
+        state.client_domain.adopt_overrides(*client_overrides);
+        state.server_role.adopt_overrides(server_overrides.clone());
+        state.identity = None;
+        handoff.adopt_into(&mut state.retired);
+        Ok(())
     }
 
     /// Subscribe to future outgoing and accepted IPC connections without starting a host or
@@ -642,31 +763,21 @@ impl Runtime {
     }
 
     pub fn new(options: RuntimeOptions) -> Result<Self, LifecycleError> {
-        if let Some(server_id) = options.server_id.as_deref() {
-            validate_server_id(server_id)?;
+        let mut client_domain = crate::roles::RoleDomain::new(options.client_limits);
+        if options.client_limits != c2_config::DomainLimitsOverrides::default() {
+            client_domain.update(c2_config::DomainLimitsPatch::default())?;
         }
-        validate_startup_timeout(options.server_startup_timeout)?;
         Ok(Self {
             state: Arc::new(Mutex::new(RuntimeState {
                 connection_event_source: c2_local::ConnectionEventSource::new(),
-                server_id_override: options.server_id,
-                server_ipc_overrides: options.server_ipc_overrides,
-                server_startup_timeout: options.server_startup_timeout,
-                client_ipc_overrides: options.client_ipc_overrides,
-                shm_threshold: options.shm_threshold,
-                remote_payload_chunk_size: options.remote_payload_chunk_size,
-                call_execution_overrides: Default::default(),
-                call_execution_sources: None,
-                call_execution_revision: 0,
-                call_execution: None,
-                call_execution_observer: CallExecutionObserver::new(),
-                client_config_revision: 0,
-                local_endpoint_options: Default::default(),
+                client_domain,
+                server_role: crate::roles::ServerRole::new(Default::default()),
+                host_slot: HostSlot::default(),
+                local_endpoint_options: options.local_endpoint,
                 local_endpoint_sources: None,
                 local_endpoint_revision: 0,
                 frozen_local_endpoint: None,
                 inherited_local_endpoint: None,
-                frozen_client_config: None,
                 client_pool: None,
                 identity: None,
                 relay_anchor_address_override: options
@@ -675,7 +786,8 @@ impl Runtime {
                 use_process_relay_anchor: options.use_process_relay_anchor,
                 relay_projection: None,
                 path_counters: PathCounters::default(),
-                lifecycle_frozen: false,
+                retired: Default::default(),
+                holds: Arc::new(crate::memory::LocalCopyTracker::new()),
                 shutdown_transactions: HashMap::new(),
                 retirement: None,
                 registration_scopes: HashMap::new(),
@@ -687,141 +799,86 @@ impl Runtime {
         })
     }
 
-    /// Configure the call domain before its first payload use: a business call
-    /// or HTTP acquisition. Clones and every Client share
-    /// the one domain; teardown never replaces it or launders live charges.
-    pub fn set_call_execution_limits(
+    /// Tri-state incremental update of the client role configuration.
+    ///
+    /// `Keep` retains the previously accepted override of a field (a later
+    /// memory-only change never washes away an explicitly set call limit),
+    /// `Inherit` clears the field's override back to environment/defaults, and
+    /// `Set` installs a new value. The complete candidate resolves and
+    /// validates atomically: one invalid field changes nothing. Once the
+    /// client domain has frozen, only a fully identical effective
+    /// configuration remains an idempotent success; any difference is
+    /// `LifecycleError::ConfigFrozen` — there is no silent-ignore path.
+    pub fn update_client_config(
         &self,
-        overrides: c2_config::CallExecutionLimitsOverrides,
+        patch: crate::roles::ClientConfigPatch,
     ) -> Result<(), LifecycleError> {
-        self.configure_call_execution_limits(overrides, None)
-    }
-
-    /// Deterministic resolver inputs replace process discovery for this domain.
-    pub fn set_call_execution_limits_with_sources(
-        &self,
-        overrides: c2_config::CallExecutionLimitsOverrides,
-        sources: c2_config::ConfigSources,
-    ) -> Result<(), LifecycleError> {
-        self.configure_call_execution_limits(overrides, Some(sources))
-    }
-
-    fn configure_call_execution_limits(
-        &self,
-        overrides: c2_config::CallExecutionLimitsOverrides,
-        sources: Option<c2_config::ConfigSources>,
-    ) -> Result<(), LifecycleError> {
-        let limits = resolve_call_execution_limits(overrides.clone(), sources.clone())?;
         let mut state = self.state.lock();
-        if let Some(context) = &state.call_execution {
-            let snapshot = context.snapshot();
-            return if snapshot.max_operations == limits.max_outstanding_calls
-                && context.payload_snapshot().limit_bytes == limits.payload_buffer_budget_bytes
-            {
-                // Record accepted optional code inputs, even for an idempotent
-                // setter. The frozen budget and its live charges stay intact.
-                state.call_execution_overrides = overrides;
-                state.call_execution_sources = sources;
-                Ok(()) // Idempotent configuration, never replace this domain.
-            } else {
-                Err(LifecycleError::ConfigFrozen)
-            };
+        state.ensure_active()?;
+        state.client_domain.update(patch.domain_limits)
+    }
+
+    /// Tri-state incremental update of the server role configuration: Host
+    /// identity, startup timeout, carrying capacity and server-domain limits.
+    /// The same freeze contract as [`Self::update_client_config`] applies
+    /// through the first Host start.
+    pub fn update_server_config(
+        &self,
+        patch: c2_config::ServerConfigPatch,
+    ) -> Result<(), LifecycleError> {
+        let mut state = self.state.lock();
+        state.ensure_active()?;
+        state.ensure_no_pending_teardown()?;
+        let old_id = state.server_role.overrides().server_id.clone();
+        state.server_role.update(patch)?;
+        if !state.server_role.frozen() && state.server_role.overrides().server_id != old_id {
+            state.identity = None;
         }
-        if state.call_execution_observer.is_closed() {
-            return Err(LifecycleError::ConfigFrozen);
-        }
-        state.call_execution_overrides = overrides;
-        state.call_execution_sources = sources;
-        state.call_execution_revision += 1;
         Ok(())
     }
 
-    /// Consistent read-only operation-slot counters. Before first call this
-    /// resolves policy without freezing or constructing an executor. It counts
-    /// finite-unary and stream owners, including continuations after caller timeout;
-    /// response-storage observations stay in outgoing_memory_observer().
-    pub fn call_execution_snapshot(&self) -> Result<crate::CallExecutionSnapshot, LifecycleError> {
-        Ok(self.resolve_call_execution_context(false)?.snapshot())
+    /// Whether the client role domain has frozen (first remote business
+    /// connection or call).
+    pub fn client_config_frozen(&self) -> bool {
+        self.state.lock().client_domain.frozen()
     }
 
-    /// Observe the frozen B domain without creating one or retaining producer
-    /// authority. A retired session may still have live storage owners.
-    pub fn payload_buffer_observer(&self) -> Option<c2_mem::retention::PayloadBufferObserverWeak> {
+    /// Whether the server role domain has frozen (first Host start).
+    pub fn server_config_frozen(&self) -> bool {
+        self.state.lock().server_role.frozen()
+    }
+
+    /// Symmetric read-only call-admission snapshot of both role domains plus
+    /// retired roles. Never reads the environment, creates a domain, or
+    /// freezes configuration.
+    pub fn call_execution_snapshot(&self) -> crate::memory::RuntimeCallExecutionStats {
+        self.role_stats_snapshot().call_execution
+    }
+
+    /// Observe the frozen client domain without creating one or retaining
+    /// producer authority. A retired session may still have live owners.
+    pub fn client_domain_observer(&self) -> Option<c2_mem::DomainObserver> {
         self.state
             .lock()
-            .call_execution
-            .as_ref()
-            .map(|context| context.payload_budget().downgrade())
+            .client_domain
+            .budget()
+            .map(c2_mem::DomainBudget::observe)
     }
 
-    pub fn payload_buffer_stats(&self) -> Option<crate::MemoryCellStats> {
-        self.state
-            .lock()
-            .call_execution
-            .as_ref()
-            .map(|context| crate::MemoryCellStats::from_payload_buffer(context.payload_snapshot()))
-    }
-
-    /// Capture pure metadata for this Runtime's independent domain, including
-    /// future first-call initialization. This neither resolves nor freezes policy.
-    pub fn call_execution_observer(&self) -> CallExecutionObserver {
-        self.state.lock().call_execution_observer.clone()
-    }
-
-    /// Last accepted optional code inputs, without resolving defaults or
-    /// environment. This is not a second copy of the effective domain limits.
-    pub fn call_execution_limits_overrides(&self) -> c2_config::CallExecutionLimitsOverrides {
-        self.state.lock().call_execution_overrides.clone()
+    /// This session's local-hold metadata tracker. SDKs record their holds
+    /// here so `memory_stats().holds` stays observable.
+    #[doc(hidden)]
+    pub fn holds_tracker(&self) -> Arc<crate::memory::LocalCopyTracker> {
+        self.state.lock().holds.clone()
     }
 
     pub(crate) fn call_execution_context(&self) -> Result<CallExecutionContext, LifecycleError> {
-        self.resolve_call_execution_context(true)
-    }
-
-    fn resolve_call_execution_context(
-        &self,
-        freeze: bool,
-    ) -> Result<CallExecutionContext, LifecycleError> {
-        self.resolve_call_execution_context_with_lock(freeze, || Ok(self.state.lock()))
-    }
-
-    fn resolve_call_execution_context_with_lock<'a, E: From<LifecycleError>>(
-        &'a self,
-        freeze: bool,
-        lock: impl Fn() -> Result<parking_lot::MutexGuard<'a, RuntimeState>, E>,
-    ) -> Result<CallExecutionContext, E> {
-        loop {
-            let (overrides, sources, revision) = {
-                let state = lock()?;
-                if let Some(context) = &state.call_execution {
-                    return Ok(context.clone());
-                }
-                (
-                    state.call_execution_overrides.clone(),
-                    state.call_execution_sources.clone(),
-                    state.call_execution_revision,
-                )
-            };
-            // Environment/.env I/O outside runtime metadata, just as for the
-            // existing configuration domains. A racing setter wins by revision.
-            let resolved = resolve_call_execution_limits(overrides, sources);
-            let mut state = lock()?;
-            if let Some(context) = &state.call_execution {
-                return Ok(context.clone());
-            }
-            if state.call_execution_revision != revision {
-                continue;
-            }
-            let context = CallExecutionContext::new(&resolved.map_err(E::from)?);
-            if state.call_execution_observer.is_closed() {
-                context.close();
-            }
-            if freeze {
-                state.call_execution_observer.publish(&context);
-                state.call_execution = Some(context.clone());
-            }
-            return Ok(context);
+        let mut state = self.state.lock();
+        if let Some(budget) = state.client_domain.budget() {
+            return Ok(CallExecutionContext::new(budget.clone()));
         }
+        state.ensure_active()?;
+        Ok(CallExecutionContext::new(state.client_domain.freeze()?))
     }
 
     /// Configure local endpoints without binding, connecting, or freezing memory policy.
@@ -973,6 +1030,16 @@ impl Runtime {
         captured: Option<&c2_config::LocalEndpointContext>,
         deadline: ConnectDeadline,
     ) -> Result<Option<c2_config::LocalEndpointContext>, crate::Error> {
+        self.resolve_local_endpoint_for_acquire(freeze, captured, deadline, None)
+    }
+
+    fn resolve_local_endpoint_for_acquire(
+        &self,
+        freeze: bool,
+        captured: Option<&c2_config::LocalEndpointContext>,
+        deadline: ConnectDeadline,
+        activation_catalog: Option<(u64, &c2_config::EnvCatalog)>,
+    ) -> Result<Option<c2_config::LocalEndpointContext>, crate::Error> {
         let accepts = |context: &c2_config::LocalEndpointContext| {
             captured.is_none_or(|captured| captured == context)
         };
@@ -997,7 +1064,13 @@ impl Runtime {
                     state.local_endpoint_revision,
                 )
             };
-            let resolved = resolve_local_endpoint(options, sources);
+            let resolved = match (sources, activation_catalog) {
+                (None, Some((activation_revision, catalog))) if activation_revision == revision => {
+                    c2_config::ConfigResolver::resolve_local_endpoint(options, catalog)
+                        .map_err(|error| LifecycleError::Configuration(error.to_string()))
+                }
+                (sources, _) => resolve_local_endpoint(options, sources),
+            };
             let mut state = connect_state_lock(&self.state, deadline, "runtime_context_wait")?;
             if let Some(context) = &state.frozen_local_endpoint {
                 return Ok(accepts(context).then(|| context.clone()));
@@ -1026,11 +1099,14 @@ impl Runtime {
         if let Some(identity) = &state.identity {
             return Ok(identity.clone());
         }
-
-        let server_id = match state.server_id_override.clone() {
-            Some(server_id) => server_id,
-            None => auto_server_id(),
-        };
+        // The frozen server role pins the identity; before the first Host
+        // start the Runtime mints the auto identity the freeze will adopt.
+        let server_id = state
+            .server_role
+            .resolved()
+            .and_then(|frozen| frozen.server_id.clone())
+            .or_else(|| state.server_role.overrides().server_id.clone())
+            .unwrap_or_else(auto_server_id);
         validate_server_id(&server_id)?;
         let identity = RuntimeIdentity {
             ipc_address: ipc_address_for_server_id(&server_id),
@@ -1049,10 +1125,6 @@ impl Runtime {
             .map(|identity| identity.server_id.clone())
     }
 
-    pub fn server_id_override(&self) -> Option<String> {
-        self.state.lock().server_id_override.clone()
-    }
-
     pub fn server_address(&self) -> Option<String> {
         self.state
             .lock()
@@ -1061,63 +1133,30 @@ impl Runtime {
             .map(|identity| identity.ipc_address.clone())
     }
 
-    pub fn server_ipc_overrides(&self) -> Option<ServerIpcConfigOverrides> {
-        self.state.lock().server_ipc_overrides.clone()
+    /// The frozen server-role configuration, once a Host has started.
+    pub fn server_config(&self) -> Option<c2_config::ResolvedServerConfig> {
+        let state = self.state.lock();
+        state
+            .server_role
+            .resolved()
+            .map(|frozen| c2_config::ResolvedServerConfig {
+                server_id: frozen.server_id.clone(),
+                startup_timeout: frozen.startup_timeout,
+                ipc: frozen.ipc,
+                domain_limits: frozen.domain_limits,
+            })
     }
 
-    pub fn server_startup_timeout(&self) -> Option<Duration> {
-        self.state.lock().server_startup_timeout
+    /// Accepted server-role code overrides without resolving defaults or the
+    /// environment.
+    pub fn server_overrides(&self) -> c2_config::ServerConfigOverrides {
+        self.state.lock().server_role.overrides().clone()
     }
 
-    pub fn set_server_options(
-        &self,
-        server_id: Option<String>,
-        server_ipc_overrides: Option<ServerIpcConfigOverrides>,
-        startup_timeout: Option<Duration>,
-    ) -> Result<(), LifecycleError> {
-        if let Some(server_id) = server_id.as_deref() {
-            validate_server_id(server_id)?;
-        }
-        validate_startup_timeout(startup_timeout)?;
-        let mut state = self.state.lock();
-        state.ensure_no_pending_teardown()?;
-        if state.lifecycle_frozen {
-            return Err(LifecycleError::ConfigFrozen);
-        }
-        state.server_id_override = server_id;
-        state.server_ipc_overrides = server_ipc_overrides;
-        state.server_startup_timeout = startup_timeout;
-        state.identity = None;
-        Ok(())
-    }
-
-    pub fn client_ipc_overrides(&self) -> Option<ClientIpcConfigOverrides> {
-        self.state.lock().client_ipc_overrides.clone()
-    }
-
-    pub fn set_client_ipc_overrides(
-        &self,
-        overrides: Option<ClientIpcConfigOverrides>,
-    ) -> Result<(), LifecycleError> {
-        let mut state = self.state.lock();
-        if state.frozen_client_config.is_some() {
-            return Err(LifecycleError::ClientConfigFrozen);
-        }
-        state.client_ipc_overrides = overrides;
-        state.client_config_revision += 1;
-        Ok(())
-    }
-
-    pub fn shm_threshold_override(&self) -> Option<u64> {
-        self.state.lock().shm_threshold
-    }
-
-    pub fn remote_payload_chunk_size_override(&self) -> Option<u64> {
-        self.state.lock().remote_payload_chunk_size
-    }
-
-    pub fn client_config_frozen(&self) -> bool {
-        self.state.lock().frozen_client_config.is_some()
+    /// Accepted client-domain code overrides without resolving defaults or
+    /// the environment.
+    pub fn client_overrides(&self) -> c2_config::DomainLimitsOverrides {
+        self.state.lock().client_domain.overrides().clone()
     }
 
     pub fn path_counters(&self) -> PathCounters {
@@ -1138,39 +1177,196 @@ impl Runtime {
         Ok(client)
     }
 
-    /// Read-only snapshot of this Runtime's outgoing client memory domain.
-    ///
-    /// `None` until the first valid connection attempt freezes the domain;
-    /// observing it never connects, maps memory, or freezes configuration.
-    /// Charges retained by completed or held data stay observable across a
-    /// shutdown for as long as the Runtime (or any budget guard) exists.
-    pub fn outgoing_memory_stats(&self) -> Option<crate::MemoryScopeStats> {
-        let pool = self.state.lock().client_pool.clone()?;
-        pool.memory_budget_snapshot()
-            .map(|snapshot| crate::MemoryScopeStats::from_budget(snapshot.limits, snapshot.budget))
-    }
-
-    /// Read-only observer of this Runtime's frozen outgoing client domain.
-    ///
-    /// `None` until the first connection attempt freezes the domain. The
-    /// returned handle shares only the domain counters and resolved limits, so
-    /// a retired Runtime keeps charges held by outstanding owners observable
-    /// without retaining the cache, connections, or pools. Observing never
-    /// connects, maps memory, or freezes configuration.
-    pub fn outgoing_memory_observer(&self) -> Option<c2_mem::BudgetObserver> {
-        let pool = self.state.lock().client_pool.clone()?;
-        pool.memory_budget_observer()
-    }
-
-    /// Read-only memory statistics for this Runtime without a host.
-    ///
-    /// The server scope is reported by [`Host::memory_stats`](crate::Host::memory_stats),
-    /// which composes this outgoing scope with its server direction.
+    /// Symmetric read-only memory statistics for this Runtime: the `client`
+    /// and `server` role domains, retired roles still owned by real in-flight
+    /// work, and local holds. Observation never reads the environment,
+    /// creates a domain, or freezes configuration.
     pub fn memory_stats(&self) -> crate::RuntimeMemoryStats {
-        crate::RuntimeMemoryStats {
-            runtime_outgoing: self.outgoing_memory_stats(),
-            server: None,
-            payload_buffer: self.payload_buffer_stats(),
+        self.role_stats_snapshot().memory
+    }
+
+    /// Read-only observer of the frozen server role domain.
+    pub fn server_domain_observer(&self) -> Option<c2_mem::DomainObserver> {
+        self.state
+            .lock()
+            .server_role
+            .budget()
+            .map(c2_mem::DomainBudget::observe)
+    }
+
+    /// Admit one Host start through the single Host slot.
+    ///
+    /// Concurrent same-configuration starts merge onto the running Host; a
+    /// different effective configuration is refused as `ConfigFrozen` by the
+    /// frozen server role; a still-draining previous Host refuses new starts
+    /// until its original close transaction reaches a real terminal outcome.
+    pub(crate) fn begin_host_start(
+        &self,
+        options: &crate::HostOptions,
+    ) -> Result<HostAdmission, LifecycleError> {
+        let mut state = self.state.lock();
+        state.ensure_no_pending_teardown()?;
+        let mut running_host = None;
+        let mut starting = None;
+        match &state.host_slot {
+            HostSlot::Vacant => {}
+            HostSlot::Starting(attempt) => starting = Some(attempt.clone()),
+            HostSlot::Running { inner, server } => {
+                if let Some(server) = server.upgrade() {
+                    let key = format!("{}:{:p}", server.server_instance_id(), server.as_ref());
+                    if !state.shutdown_transactions.contains_key(&key) {
+                        if inner.strong_count() == 0 || !server.is_ready() {
+                            return Err(pending_host_teardown());
+                        }
+                        running_host = Some(inner.clone());
+                    } else if server.is_running() {
+                        return Err(pending_host_teardown());
+                    }
+                }
+            }
+        }
+
+        let previous_identity = state.identity.clone();
+        let relay_override = state.relay_anchor_address_override.clone();
+        let use_process_relay_anchor = state.use_process_relay_anchor;
+        #[cfg(test)]
+        let forced_relay_error = state.forced_relay_config_error.clone();
+        let freeze = state.server_role.start(
+            options.server.clone(),
+            || {
+                previous_identity
+                    .as_ref()
+                    .map(|identity| identity.server_id.clone())
+                    .unwrap_or_else(auto_server_id)
+            },
+            |catalog, frozen| {
+                options.resolve_settings(catalog, frozen, || {
+                    #[cfg(test)]
+                    if let Some(message) = forced_relay_error {
+                        return Err(LifecycleError::Relay(message));
+                    }
+                    if relay_override.is_some() || !use_process_relay_anchor {
+                        return Ok(relay_override);
+                    }
+                    c2_config::ConfigResolver::resolve_relay_anchor_address(catalog)
+                        .map(|anchor| {
+                            anchor.map(|address| canonical_relay_anchor_address(&address))
+                        })
+                        .map_err(|error| LifecycleError::Relay(error.to_string()))
+                })
+            },
+        )?;
+        if let Some(attempt) = starting {
+            return Ok(HostAdmission::Starting(attempt));
+        }
+        if let Some(inner) = running_host {
+            return inner
+                .upgrade()
+                .map(|inner| HostAdmission::Shared(crate::Host::from_inner(inner)))
+                .ok_or_else(pending_host_teardown);
+        }
+
+        let server_id = freeze
+            .config
+            .server_id
+            .expect("Host start materializes a server id");
+        let prior_instance_id = previous_identity
+            .filter(|identity| !freeze.restart && identity.server_id == server_id)
+            .map(|identity| identity.server_instance_id);
+        let identity = RuntimeIdentity {
+            ipc_address: ipc_address_for_server_id(&server_id),
+            server_id,
+            server_instance_id: prior_instance_id.unwrap_or_else(auto_server_instance_id),
+        };
+        state.identity = Some(identity.clone());
+        let endpoint_catalog = if freeze.restart {
+            state.server_role.advance_generation();
+            None
+        } else {
+            Some((
+                state.local_endpoint_revision,
+                state
+                    .server_role
+                    .catalog_ref()
+                    .expect("newly frozen server role")
+                    .clone(),
+            ))
+        };
+        let attempt = Arc::new(HostStartup::default());
+        state.host_slot = HostSlot::Starting(attempt.clone());
+        Ok(HostAdmission::Granted(
+            HostStart {
+                identity,
+                ipc: freeze.config.ipc,
+                budget: freeze.budget,
+                startup_timeout: freeze.config.startup_timeout,
+                settings: freeze.settings,
+                endpoint_catalog,
+            },
+            attempt,
+        ))
+    }
+
+    pub(crate) fn complete_host_start(
+        &self,
+        attempt: &HostStartup,
+        result: Result<crate::Host, LifecycleError>,
+        receipt: Option<FailedStartShutdownReceipt>,
+    ) {
+        let mut state = self.state.lock();
+        state.host_slot = if let Ok(host) = &result {
+            HostSlot::Running {
+                inner: Arc::downgrade(host.inner()),
+                server: host.retirement_server(),
+            }
+        } else {
+            HostSlot::Vacant
+        };
+        *attempt.result.lock() = Some((result, receipt));
+        attempt.completed.notify_all();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn host_start_waiter_count_for_test(&self) -> usize {
+        match &self.state.lock().host_slot {
+            HostSlot::Starting(attempt) => Arc::strong_count(attempt).saturating_sub(2),
+            _ => 0,
+        }
+    }
+
+    pub(crate) fn freeze_host_endpoint_context(
+        &self,
+        activation_catalog: Option<(u64, &c2_config::EnvCatalog)>,
+    ) -> Result<c2_config::LocalEndpointContext, LifecycleError> {
+        self.resolve_local_endpoint_for_acquire(
+            true,
+            None,
+            ConnectDeadline::default(),
+            activation_catalog,
+        )
+        .map(|context| context.expect("unconditional context resolution"))
+        .map_err(unlimited_lifecycle_error)
+    }
+
+    pub(crate) fn role_stats_snapshot(&self) -> crate::memory::RoleStatsBundle {
+        let state = self.state.lock();
+        let client = state.client_domain.stats();
+        let server = state.server_role.stats();
+        let (retired_memory, retired_calls) = state.retired.reports();
+        let mut holds = state.holds.stats();
+        holds.merge(&state.retired.local_copy_stats());
+        crate::memory::RoleStatsBundle {
+            memory: crate::RuntimeMemoryStats {
+                client: crate::memory::RoleMemoryStats::from_role(&client),
+                server: crate::memory::RoleMemoryStats::from_role(&server),
+                retired: retired_memory,
+                holds,
+            },
+            call_execution: crate::memory::RuntimeCallExecutionStats {
+                client: role_call_stats(&client),
+                server: role_call_stats(&server),
+                retired: retired_calls,
+            },
         }
     }
 
@@ -1180,7 +1376,7 @@ impl Runtime {
     /// lock before any connection I/O: the first valid connection attempt —
     /// including one that later fails — fixes the config for this Runtime's
     /// lifetime, and a setter racing a stalled first connect observes
-    /// `LifecycleError::ClientConfigFrozen` instead of producing a second
+    /// `LifecycleError::ConfigFrozen` instead of producing a second
     /// configuration. The connect itself runs outside the state lock through
     /// the cache's epoch fence.
     pub(crate) fn acquire_ipc_client_with_deadline(
@@ -1188,77 +1384,82 @@ impl Runtime {
         address: &str,
         deadline: ConnectDeadline,
     ) -> Result<c2_ipc::pool::ClientLease, c2_ipc::IpcError> {
-        let (config, pool) = self.ipc_client_domain(deadline)?;
-        pool.acquire_lease_with_deadline(address, Some(&config), deadline)
+        c2_config::LocalEndpoint::validate_address(address)
+            .map_err(|error| c2_ipc::IpcError::Config(error.to_string()))?;
+        self.ipc_client_domain(deadline)?
+            .acquire_lease_with_deadline(address, deadline)
     }
 
+    /// Freeze the client role domain and return its budget together with the
+    /// outgoing IPC pool charging it. The pool is created on first acquire so
+    /// HTTP-only Runtimes need no local platform scope; clones share it, and
+    /// drains never replace it.
     pub(crate) fn ipc_client_domain(
         &self,
         deadline: ConnectDeadline,
-    ) -> Result<(c2_config::ClientIpcConfig, Arc<c2_ipc::ClientPool>), c2_ipc::IpcError> {
-        let context = self
-            .resolve_local_endpoint_context_with_deadline(true, None, deadline)
-            .map_err(connect_error_to_ipc)?
-            .expect("unconditional context resolution");
-        let (config, pool) = loop {
-            let (overrides, revision) = {
-                let mut state = connect_state_lock(&self.state, deadline, "runtime_config_wait")
-                    .map_err(connect_error_to_ipc)?;
-                state
-                    .ensure_active()
-                    .map_err(|_| c2_ipc::IpcError::PoolRetired)?;
-                if let Some(config) = state.frozen_client_config.clone() {
-                    let events = state.connection_event_source.clone();
-                    let pool = state
-                        .client_pool
-                        .get_or_insert_with(|| {
-                            Arc::new(
-                                c2_ipc::ClientPool::with_endpoint_context(
-                                    config.client_idle_timeout(),
-                                    context.clone(),
-                                )
-                                .with_connection_event_source(events),
-                            )
-                        })
-                        .clone();
-                    break (config, pool);
-                }
-                (
-                    c2_config::RuntimeConfigOverrides {
-                        client_ipc: state.client_ipc_overrides.clone().unwrap_or_default(),
-                        shm_threshold: state.shm_threshold,
-                        ..Default::default()
-                    },
-                    state.client_config_revision,
-                )
-            };
-            let resolved = resolve_client_config(overrides);
+    ) -> Result<Arc<c2_ipc::ClientPool>, c2_ipc::IpcError> {
+        let (budget, activation_catalog) = {
             let mut state = connect_state_lock(&self.state, deadline, "runtime_config_wait")
                 .map_err(connect_error_to_ipc)?;
             state
                 .ensure_active()
                 .map_err(|_| c2_ipc::IpcError::PoolRetired)?;
-            if state.client_config_revision != revision || state.frozen_client_config.is_some() {
-                continue;
+            if let Some(budget) = state.client_domain.budget() {
+                (budget.clone(), None)
+            } else {
+                let budget = state
+                    .client_domain
+                    .freeze()
+                    .map_err(|error| c2_ipc::IpcError::Config(error.to_string()))?;
+                let catalog = state
+                    .client_domain
+                    .catalog_ref()
+                    .expect("just captured")
+                    .clone();
+                (budget, Some((state.local_endpoint_revision, catalog)))
             }
-            let config = resolved.map_err(|error| c2_ipc::IpcError::Config(error.to_string()))?;
-            state.frozen_client_config = Some(config.clone());
-            let events = state.connection_event_source.clone();
-            let pool = state
-                .client_pool
-                .get_or_insert_with(|| {
-                    Arc::new(
-                        c2_ipc::ClientPool::with_endpoint_context(
-                            config.client_idle_timeout(),
-                            context.clone(),
-                        )
-                        .with_connection_event_source(events),
-                    )
-                })
-                .clone();
-            break (config, pool);
         };
-        Ok((config, pool))
+        // Reuse a catalog only within the same activation attempt. An earlier
+        // HTTP acquisition may have frozen capacity before the IPC endpoint
+        // was selected, so later local I/O resolves current endpoint inputs.
+        let context = self
+            .resolve_local_endpoint_for_acquire(
+                true,
+                None,
+                deadline,
+                activation_catalog
+                    .as_ref()
+                    .map(|(revision, catalog)| (*revision, catalog)),
+            )
+            .map_err(connect_error_to_ipc)?
+            .expect("unconditional context resolution");
+        let mut state = connect_state_lock(&self.state, deadline, "runtime_config_wait")
+            .map_err(connect_error_to_ipc)?;
+        state
+            .ensure_active()
+            .map_err(|_| c2_ipc::IpcError::PoolRetired)?;
+        let events = state.connection_event_source.clone();
+        Ok(state
+            .client_pool
+            .get_or_insert_with(|| {
+                Arc::new(
+                    c2_ipc::ClientPool::with_endpoint_context_and_budget(context, budget)
+                        .with_connection_event_source(events),
+                )
+            })
+            .clone())
+    }
+
+    /// The client role domain's budget for HTTP data clients; freezes the
+    /// client domain on first use exactly like the IPC pool path.
+    pub(crate) fn client_domain_budget_with_deadline(
+        &self,
+        deadline: ConnectDeadline,
+    ) -> Result<c2_mem::DomainBudget, crate::Error> {
+        let mut state = connect_state_lock(&self.state, deadline, "runtime_config_wait")?;
+        state.ensure_active()?;
+        let budget = state.client_domain.freeze()?;
+        Ok(budget)
     }
 
     pub(crate) fn discard_ipc_client_with_deadline(
@@ -1279,50 +1480,61 @@ impl Runtime {
         connect_stage_check(deadline, "pool_discard")
     }
 
-    /// Resolve this Runtime's server IPC configuration without starting a Host.
+    /// Resolve this Runtime's server IPC configuration without starting a
+    /// Host. Never freezes the server role and never reads the environment
+    /// once frozen; before the first Host start it resolves the accepted
+    /// overrides truthfully.
     pub fn server_ipc_config(&self) -> Result<c2_config::ServerIpcConfig, LifecycleError> {
-        let runtime_overrides = c2_config::RuntimeConfigOverrides {
-            server_ipc: self.server_ipc_overrides().unwrap_or_default(),
-            shm_threshold: self.shm_threshold_override(),
-            ..Default::default()
-        };
-        c2_config::ConfigResolver::resolve_server_ipc(
-            runtime_overrides.server_ipc.clone(),
-            runtime_overrides,
-            c2_config::ConfigSources::from_process(),
-        )
-        .map_err(|error| LifecycleError::Configuration(error.to_string()))
-    }
-
-    pub(crate) fn relay_client_settings_with_deadline(
-        &self,
-        deadline: ConnectDeadline,
-    ) -> Result<c2_config::ResolvedRelayClientConfig, crate::Error> {
-        let sources = c2_config::ConfigSources::from_process();
-        connect_stage_check(deadline, "relay_config")?;
-        #[cfg(test)]
-        if let Some(message) = connect_state_lock(&self.state, deadline, "relay_config")?
-            .forced_relay_config_error
-            .clone()
-        {
-            return Err(LifecycleError::Relay(message).into());
+        let state = self.state.lock();
+        if let Some(frozen) = state.server_role.resolved() {
+            return Ok(frozen.ipc);
         }
-        let config = c2_config::ConfigResolver::resolve_relay_client(
-            connect_state_lock(&self.state, deadline, "relay_config")?.remote_payload_chunk_size,
-            sources,
-        )
-        .map_err(|error| LifecycleError::Configuration(error.to_string()))?;
-        connect_stage_check(deadline, "relay_config")?;
-        Ok(config)
-    }
-
-    pub(crate) fn relay_use_proxy(&self) -> Result<bool, LifecycleError> {
-        #[cfg(test)]
-        if let Some(message) = self.state.lock().forced_relay_config_error.clone() {
-            return Err(LifecycleError::Relay(message));
-        }
-        c2_config::ConfigResolver::resolve_relay_use_proxy(c2_config::ConfigSources::from_process())
+        let catalog = c2_config::EnvCatalog::load(c2_config::ConfigSources::from_process())
+            .map_err(|error| LifecycleError::Configuration(error.to_string()))?;
+        c2_config::ConfigResolver::resolve_server(state.server_role.overrides(), &catalog)
+            .map(|resolved| resolved.ipc)
             .map_err(|error| LifecycleError::Configuration(error.to_string()))
+    }
+
+    pub(crate) fn relay_business_config_with_deadline(
+        &self,
+        explicit_anchor: Option<String>,
+        deadline: ConnectDeadline,
+    ) -> Result<(String, c2_config::ResolvedRelayClientConfig), crate::Error> {
+        let mut state = connect_state_lock(&self.state, deadline, "relay_config")?;
+        state.ensure_active()?;
+        #[cfg(test)]
+        if let Some(message) = &state.forced_relay_config_error {
+            return Err(LifecycleError::Relay(message.clone()).into());
+        }
+        let configured_anchor =
+            explicit_anchor.or_else(|| state.relay_anchor_address_override.clone());
+        if configured_anchor.is_none() && !state.use_process_relay_anchor {
+            return Err(LifecycleError::MissingRelayAddress.into());
+        }
+        let catalog = match state.client_domain.catalog_ref() {
+            Some(catalog) => catalog.clone(),
+            None => c2_config::EnvCatalog::load(c2_config::ConfigSources::from_process())
+                .map_err(|error| LifecycleError::Configuration(error.to_string()))?,
+        };
+        let anchor = match configured_anchor {
+            Some(anchor) => anchor,
+            None => c2_config::ConfigResolver::resolve_relay_anchor_address(&catalog)
+                .map_err(|error| LifecycleError::Relay(error.to_string()))?
+                .ok_or(LifecycleError::MissingRelayAddress)?,
+        };
+        let anchor = canonical_relay_anchor_address(&anchor);
+        if !c2_http::valid_relay_url(&anchor) {
+            return Err(crate::normalize_http_error(
+                HttpError::InvalidInput("invalid HTTP relay base URL".into()),
+                crate::TransportPhase::PreDispatch,
+            ));
+        }
+        let settings = c2_config::ConfigResolver::resolve_relay_client(None, &catalog)
+            .map_err(|error| LifecycleError::Configuration(error.to_string()))?;
+        connect_stage_check(deadline, "relay_config")?;
+        state.client_domain.freeze_with_catalog(catalog)?;
+        Ok((anchor, settings))
     }
 
     pub fn clear_server_identity(&self) -> Result<(), LifecycleError> {
@@ -1397,12 +1609,12 @@ impl Runtime {
         let transfer = |source: &mut RuntimeState, target: &mut RuntimeState| {
             source.ensure_no_pending_teardown()?;
             target.ensure_no_pending_teardown()?;
-            if source.lifecycle_frozen || source.frozen_client_config.is_some() {
+            if source.server_role.frozen() || source.client_domain.frozen() {
                 return Err(LifecycleError::Configuration(
                     "cannot transfer lifecycle after Runtime use".into(),
                 ));
             }
-            if target.lifecycle_frozen || target.frozen_client_config.is_some() {
+            if target.server_role.frozen() || target.client_domain.frozen() {
                 return Err(LifecycleError::Configuration(
                     "replacement Runtime already owns a lifecycle".into(),
                 ));
@@ -1426,20 +1638,6 @@ impl Runtime {
     /// running as active callbacks drain.
     pub fn has_pending_teardown(&self) -> bool {
         self.state.lock().ensure_no_pending_teardown().is_err()
-    }
-
-    pub(crate) fn freeze_host_options(
-        &self,
-        startup_timeout: Option<Duration>,
-    ) -> Result<Duration, LifecycleError> {
-        let mut state = self.state.lock();
-        state.ensure_no_pending_teardown()?;
-        let startup_timeout = startup_timeout
-            .or(state.server_startup_timeout)
-            .unwrap_or(Duration::from_secs(5));
-        validate_startup_timeout(Some(startup_timeout))?;
-        state.lifecycle_frozen = true;
-        Ok(startup_timeout)
     }
 
     pub fn effective_relay_anchor_address(&self) -> Result<Option<String>, LifecycleError> {
@@ -1471,10 +1669,10 @@ impl Runtime {
         if !use_process_relay_anchor {
             return Ok(None);
         }
-        c2_config::ConfigResolver::resolve_relay_anchor_address(
-            c2_config::ConfigSources::from_process(),
-        )
-        .map_err(|e| LifecycleError::Relay(e.to_string()).into())
+        let catalog = c2_config::EnvCatalog::load(c2_config::ConfigSources::from_process())
+            .map_err(|e| LifecycleError::Relay(e.to_string()))?;
+        c2_config::ConfigResolver::resolve_relay_anchor_address(&catalog)
+            .map_err(|e| LifecycleError::Relay(e.to_string()).into())
     }
 
     #[cfg(test)]
@@ -1489,7 +1687,12 @@ impl Runtime {
         relay_anchor_address: Option<&str>,
         relay_use_proxy: bool,
     ) -> Result<RegisterOutcome, LifecycleError> {
-        let identity = self.ensure_server()?;
+        self.ensure_active()?;
+        let identity = RuntimeIdentity {
+            server_id: server.server_id().to_owned(),
+            server_instance_id: server.server_instance_id().to_owned(),
+            ipc_address: server.local_endpoint().address().to_owned(),
+        };
         let route_name = route.name().to_string();
         let route_uid = route.route_uid().to_string();
         let registration_scope = RelayRegistrationScope {
@@ -2419,8 +2622,6 @@ impl Runtime {
         relay_anchor_address: &str,
         expected: ExpectedRouteContract,
         relay_use_proxy: bool,
-        call_timeout_secs: f64,
-        remote_payload_chunk_size: u64,
         deadline: ConnectDeadline,
     ) -> Result<RelayResolvedConnection, crate::Error> {
         connect_stage_check(deadline, "relay_acquire")?;
@@ -2433,16 +2634,15 @@ impl Runtime {
             frozen_context.as_ref(),
             deadline,
         )?;
-        let client = RelayAwareHttpClient::new_with_control(
+        let client = RelayAwareHttpClient::new_with_control_and_budget(
             Arc::clone(&projection.control),
             expected,
             projection.relay_use_proxy,
             RelayAwareClientConfig {
                 // One observation followed by at most one pre-dispatch refresh.
                 max_attempts: 2,
-                call_timeout_secs,
-                remote_payload_chunk_size,
             },
+            self.client_domain_budget_with_deadline(deadline)?,
         )
         .map_err(|error| crate::normalize_http_error(error, crate::TransportPhase::PreDispatch))?;
         let client = self.project_relay_client_context_with_deadline(client, true, deadline)?;
@@ -2497,21 +2697,18 @@ impl Runtime {
         relay_url: &str,
         expected: ExpectedRouteContract,
         relay_use_proxy: bool,
-        call_timeout_secs: f64,
-        remote_payload_chunk_size: u64,
         deadline: ConnectDeadline,
     ) -> Result<RelayAwareHttpClient, crate::Error> {
         connect_stage_check(deadline, "relay_acquire")?;
-        let client = RelayAwareHttpClient::new(
+        let client = RelayAwareHttpClient::new_with_budget(
             relay_url,
             expected,
             relay_use_proxy,
             RelayAwareClientConfig {
                 // One observation followed by at most one pre-dispatch refresh.
                 max_attempts: 2,
-                call_timeout_secs,
-                remote_payload_chunk_size,
             },
+            self.client_domain_budget_with_deadline(deadline)?,
         )
         .map_err(|error| crate::normalize_http_error(error, crate::TransportPhase::PreDispatch))?;
         let client = self
@@ -2533,12 +2730,6 @@ impl Runtime {
         prefer_local_ipc: bool,
         deadline: ConnectDeadline,
     ) -> Result<RelayAwareHttpClient, crate::Error> {
-        // HTTP acquisition can receive an error body before a business call.
-        // It starts the same frozen B domain, with the original connect budget.
-        let payload = self.resolve_call_execution_context_with_lock(true, || {
-            connect_state_lock(&self.state, deadline, "runtime_payload_budget_wait")
-        })?;
-        let client = client.with_payload_buffer_budget(payload.payload_budget());
         let frozen = connect_state_lock(&self.state, deadline, "runtime_relay_wait")?
             .frozen_local_endpoint
             .clone();
@@ -2715,52 +2906,39 @@ impl Runtime {
     ) -> Result<Option<String>, LifecycleError> {
         match relay_anchor_address {
             Some(address) => Ok(Some(address.to_string())),
-            None => self.effective_relay_anchor_address(),
+            None => {
+                let state = self.state.lock();
+                if let Some(settings) = state.server_role.host_settings() {
+                    return Ok(settings.relay_anchor_address.clone());
+                }
+                drop(state);
+                self.effective_relay_anchor_address()
+            }
         }
     }
 }
 
-fn canonical_relay_anchor_address(address: &str) -> String {
+pub(crate) fn canonical_relay_anchor_address(address: &str) -> String {
     address.trim().trim_end_matches('/').to_string()
-}
-
-fn resolve_call_execution_limits(
-    overrides: c2_config::CallExecutionLimitsOverrides,
-    sources: Option<c2_config::ConfigSources>,
-) -> Result<c2_config::CallExecutionLimits, LifecycleError> {
-    c2_config::ConfigResolver::resolve_call_execution_limits(
-        overrides,
-        sources.unwrap_or_else(c2_config::ConfigSources::from_process),
-    )
-    .map_err(|error| LifecycleError::Configuration(error.to_string()))
 }
 
 fn resolve_local_endpoint(
     options: c2_config::LocalEndpointOptions,
     sources: Option<c2_config::ConfigSources>,
 ) -> Result<c2_config::LocalEndpointContext, LifecycleError> {
-    c2_config::ConfigResolver::resolve_local_endpoint(
-        options,
-        sources.unwrap_or_else(c2_config::ConfigSources::from_process),
-    )
-    .map_err(|error| LifecycleError::Configuration(error.to_string()))
-}
-
-/// Resolve from a metadata snapshot, outside the Runtime lock.
-fn resolve_client_config(
-    runtime_overrides: c2_config::RuntimeConfigOverrides,
-) -> Result<c2_config::ClientIpcConfig, LifecycleError> {
-    c2_config::ConfigResolver::resolve_client_ipc(
-        runtime_overrides.client_ipc.clone(),
-        runtime_overrides,
-        c2_config::ConfigSources::from_process(),
-    )
-    .map_err(|error| LifecycleError::Configuration(error.to_string()))
+    let catalog =
+        c2_config::EnvCatalog::load(sources.unwrap_or_else(c2_config::ConfigSources::from_process))
+            .map_err(|error| LifecycleError::Configuration(error.to_string()))?;
+    c2_config::ConfigResolver::resolve_local_endpoint(options, &catalog)
+        .map_err(|error| LifecycleError::Configuration(error.to_string()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use c2_config::{
+        CallOptions, CallTimeout, ConfigField, DomainLimitsOverrides, DomainLimitsPatch,
+    };
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
@@ -2870,27 +3048,23 @@ mod tests {
         assert_eq!(runtime.path_counters(), PathCounters::default());
     }
 
-    fn observer_runtime() -> Runtime {
-        let runtime = Runtime::new(RuntimeOptions::default()).unwrap();
-        runtime
-            .set_call_execution_limits_with_sources(
-                c2_config::CallExecutionLimitsOverrides {
-                    max_outstanding_calls: Some(8),
-                    payload_buffer_budget_bytes: Some(256),
-                },
-                c2_config::ConfigSources::empty(),
-            )
-            .unwrap();
-        runtime
+    fn client_runtime(memory: u64, calls: u64) -> Runtime {
+        Runtime::new(RuntimeOptions {
+            client_limits: DomainLimitsOverrides {
+                memory_budget_bytes: Some(memory),
+                file_spill_budget_bytes: Some(0),
+                max_outstanding_calls: Some(calls),
+            },
+            use_process_relay_anchor: false,
+            ..Default::default()
+        })
+        .unwrap()
     }
 
     #[test]
-    fn call_execution_observer_captured_before_concurrent_initialization_sees_actual_domain() {
-        use c2_config::{CallOptions, CallTimeout};
-        let runtime = observer_runtime();
-        let observer = runtime.call_execution_observer();
-        assert!(!observer.snapshot().initialized);
-        assert!(observer.is_live());
+    fn concurrent_client_activation_shares_one_domain_and_its_charges() {
+        let runtime = client_runtime(256, 8);
+        assert!(runtime.client_domain_observer().is_none());
         let barrier = Arc::new(std::sync::Barrier::new(8));
         let threads = (0..8)
             .map(|_| {
@@ -2899,12 +3073,7 @@ mod tests {
                 std::thread::spawn(move || {
                     barrier.wait();
                     let context = runtime.call_execution_context().unwrap();
-                    let mut call = context
-                        .prepare(
-                            CallOptions::with_timeout(CallTimeout::After(Duration::from_secs(10))),
-                            None,
-                        )
-                        .unwrap();
+                    let mut call = context.prepare(CallOptions::new(), None).unwrap();
                     call.charge_input(32).unwrap();
                     call
                 })
@@ -2914,36 +3083,28 @@ mod tests {
             .into_iter()
             .map(|thread| thread.join().unwrap())
             .collect::<Vec<_>>();
-        let observed = observer.snapshot();
-        assert!(observed.initialized);
-        assert!(!observed.closed);
-        let counters = observed.counters.unwrap();
-        assert_eq!(counters.used_operations, 8);
+        let observer = runtime.client_domain_observer().unwrap();
+        let snapshot = observer.snapshot();
+        assert_eq!(snapshot.operations.used_operations, 8);
+        assert_eq!(snapshot.memory.used_bytes, 256);
         assert_eq!(
-            runtime
-                .payload_buffer_observer()
-                .unwrap()
-                .snapshot()
-                .unwrap()
-                .used_bytes,
-            256
+            runtime.call_execution_snapshot().client.used_operations,
+            Some(8),
         );
-        assert_eq!(counters, runtime.call_execution_snapshot().unwrap());
-        assert!(observer.same_domain(&runtime.clone().call_execution_observer()));
+        assert_eq!(
+            runtime.memory_stats().client.domain_id,
+            Some(snapshot.domain_id)
+        );
         drop(calls);
-        assert_eq!(observer.snapshot().counters.unwrap().used_operations, 0);
-        assert!(observer.is_live());
+        assert_eq!(observer.snapshot().operations.used_operations, 0);
     }
 
     #[test]
-    fn call_execution_observer_preserves_actual_input_after_runtime_drop_without_retaining_session()
-    {
-        use c2_config::{CallOptions, CallTimeout};
-        let runtime = observer_runtime();
+    fn weak_domain_observer_sees_actual_input_after_runtime_drop() {
+        let runtime = client_runtime(256, 8);
         let weak_session = Arc::downgrade(&runtime.state);
-        let observer = runtime.call_execution_observer();
         let context = runtime.call_execution_context().unwrap();
-        let payload_observer = runtime.payload_buffer_observer().unwrap();
+        let observer = runtime.client_domain_observer().unwrap().downgrade();
         let input = context
             .prepare(
                 CallOptions::with_timeout(CallTimeout::After(Duration::from_secs(10))),
@@ -2965,159 +3126,54 @@ mod tests {
             .unwrap();
         drop(context);
         drop(runtime);
-        // Last RuntimeState is gone: no service/transport/cache can be kept
-        // alive by the observer. Its budget metadata still sees the real Vec.
         assert!(weak_session.upgrade().is_none());
         assert_eq!(input.as_ref().as_ref(), &[7; 32]);
-        // Outcome publication wakes wait() before the native task drops its
-        // operation owner. Observe that real cleanup before checking its refund.
-        let until = Instant::now() + Duration::from_secs(10);
-        while observer.snapshot().counters.unwrap().used_operations != 0 {
-            assert!(
-                Instant::now() < until,
-                "native operation owner did not finish"
-            );
-            std::thread::yield_now();
-        }
-        let observation = observer.snapshot();
+        let observation = observer.snapshot().expect("input keeps the charge live");
         assert!(observation.closed);
-        let counters = observation.counters.unwrap();
-        assert!(counters.closed);
-        assert_eq!(counters.used_operations, 0);
-        assert_eq!(payload_observer.snapshot().unwrap().used_bytes, 32);
-        assert!(observer.is_live());
+        assert_eq!(observation.operations.used_operations, 0);
+        assert_eq!(observation.memory.used_bytes, 32);
         drop(input);
         let until = Instant::now() + Duration::from_secs(10);
-        while observer.is_live() {
+        while observer.is_alive() {
             assert!(
                 Instant::now() < until,
                 "real input owner did not release its charge"
             );
             std::thread::yield_now();
         }
-        let counters = observer.snapshot().counters.unwrap();
-        assert_eq!(counters.used_operations, 0);
-        assert_eq!(payload_observer.snapshot().unwrap().used_bytes, 0);
-        assert!(counters.closed);
     }
 
     #[test]
-    fn call_execution_observer_freeze_shutdown_race_always_publishes_closed_budget() {
+    fn client_activation_racing_retirement_cannot_leave_open_admission() {
         for _ in 0..32 {
-            let runtime = observer_runtime();
-            let observer = runtime.call_execution_observer();
+            let runtime = client_runtime(256, 8);
             let barrier = Arc::new(std::sync::Barrier::new(2));
             let initializing = {
                 let runtime = runtime.clone();
                 let barrier = barrier.clone();
                 std::thread::spawn(move || {
                     barrier.wait();
-                    runtime.call_execution_context().unwrap()
+                    runtime.call_execution_context()
                 })
             };
             barrier.wait();
-            let retirement_deadline = std::time::Instant::now() + Duration::from_secs(1);
-            let (retirement_outcome, retirement_completed) = runtime
-                .begin_session_retirement(
-                    crate::RuntimeShutdownTarget::ClientsOnly,
-                    retirement_deadline,
-                )
-                .expect("begin client-only retirement")
-                .observe_until(retirement_deadline);
-            assert!(retirement_completed, "{retirement_outcome:?}");
-            let context = initializing.join().unwrap();
-            assert!(context.snapshot().closed);
-            let observed = observer.snapshot();
-            assert!(observed.initialized && observed.closed);
-            assert!(observed.counters.unwrap().closed);
-            assert!(!observer.is_live());
+            let deadline = Instant::now() + Duration::from_secs(1);
+            let (outcome, completed) = runtime
+                .begin_session_retirement(crate::RuntimeShutdownTarget::ClientsOnly, deadline)
+                .unwrap()
+                .observe_until(deadline);
+            assert!(completed, "{outcome:?}");
+            match initializing.join().unwrap() {
+                Ok(context) => {
+                    assert!(context.snapshot().closed);
+                    assert!(runtime.call_execution_snapshot().client.closed);
+                }
+                Err(error) => {
+                    assert_eq!(error, LifecycleError::RuntimeRetired);
+                    assert!(runtime.client_domain_observer().is_none());
+                }
+            }
         }
-    }
-
-    #[test]
-    fn call_execution_observer_never_resolves_or_freezes_configuration() {
-        let runtime = observer_runtime();
-        // Invalid resolver data proves observer reads do not invoke resolution.
-        runtime.state.lock().call_execution_sources = Some(c2_config::ConfigSources {
-            env_file: c2_config::EnvFilePolicy::Disabled,
-            process_env: c2_config::EnvMap::from([(
-                "C2_CALL_MAX_OUTSTANDING".into(),
-                "invalid".into(),
-            )]),
-        });
-        runtime.state.lock().call_execution_overrides = Default::default();
-        let observer = runtime.call_execution_observer();
-        assert!(observer.is_live());
-        assert_eq!(observer.snapshot().counters, None);
-        assert!(runtime.call_execution_snapshot().is_err());
-        assert!(runtime.state.lock().call_execution.is_none());
-        runtime
-            .set_call_execution_limits_with_sources(
-                c2_config::CallExecutionLimitsOverrides {
-                    max_outstanding_calls: Some(3),
-                    payload_buffer_budget_bytes: Some(64),
-                },
-                c2_config::ConfigSources::empty(),
-            )
-            .unwrap();
-        assert!(!observer.snapshot().initialized);
-    }
-
-    #[test]
-    fn call_execution_accepted_overrides_update_idempotently_without_replacing_budget() {
-        let runtime = observer_runtime();
-        let mut call = runtime
-            .call_execution_context()
-            .unwrap()
-            .prepare(
-                c2_config::CallOptions::with_timeout(c2_config::CallTimeout::After(
-                    Duration::from_secs(10),
-                )),
-                None,
-            )
-            .unwrap();
-        call.charge_input(32).unwrap();
-        let observer = runtime.call_execution_observer();
-        let sources = c2_config::ConfigSources {
-            env_file: c2_config::EnvFilePolicy::Disabled,
-            process_env: c2_config::EnvMap::from([
-                ("C2_CALL_MAX_OUTSTANDING".into(), "8".into()),
-                ("C2_CALL_PAYLOAD_BUFFER_BUDGET_BYTES".into(), "256".into()),
-            ]),
-        };
-        runtime
-            .set_call_execution_limits_with_sources(Default::default(), sources)
-            .unwrap();
-        let accepted = runtime.call_execution_limits_overrides();
-        assert_eq!(accepted.max_outstanding_calls, None);
-        assert_eq!(accepted.payload_buffer_budget_bytes, None);
-        assert_eq!(observer.snapshot().counters.unwrap().max_operations, 8);
-        assert_eq!(
-            runtime
-                .payload_buffer_observer()
-                .unwrap()
-                .snapshot()
-                .unwrap()
-                .used_bytes,
-            32
-        );
-        assert!(
-            runtime
-                .set_call_execution_limits_with_sources(
-                    c2_config::CallExecutionLimitsOverrides {
-                        max_outstanding_calls: Some(9),
-                        payload_buffer_budget_bytes: None,
-                    },
-                    c2_config::ConfigSources::empty(),
-                )
-                .is_err()
-        );
-        assert_eq!(
-            runtime
-                .call_execution_limits_overrides()
-                .max_outstanding_calls,
-            None
-        );
     }
 
     #[test]
@@ -3138,7 +3194,7 @@ mod tests {
         assert!(!replacement.local_endpoint_frozen());
         assert!(replacement.local_endpoint_context().is_err());
         assert!(!replacement.local_endpoint_frozen());
-        assert!(replacement.outgoing_memory_stats().is_none());
+        assert!(!replacement.memory_stats().client.frozen);
         let expected = c2_contract::ContractRelease::from_descriptor_json(include_bytes!(
             "../../../../tests/fixtures/contracts/portable-release.contract.json"
         ))
@@ -3252,7 +3308,8 @@ mod tests {
             assert!(!client.allows_local_ipc());
             assert!(client.local_ipc_context().is_none());
             assert!(!runtime.local_endpoint_frozen());
-            assert!(runtime.outgoing_memory_stats().is_none());
+            let stats = runtime.memory_stats();
+            assert!(!stats.client.frozen && !stats.server.frozen);
         }
     }
 
@@ -3317,7 +3374,7 @@ mod tests {
                 .is_ok_and(|context| context.is_some())
         );
         assert_eq!(runtime.local_endpoint_context().unwrap(), current);
-        assert!(runtime.outgoing_memory_stats().is_none());
+        assert!(!runtime.memory_stats().client.frozen);
         assert!(
             runtime
                 .set_local_endpoint_with_sources(
@@ -3353,7 +3410,7 @@ mod tests {
                 .is_ok_and(|context| context.is_some())
         );
         assert!(!runtime.local_endpoint_frozen());
-        assert!(runtime.outgoing_memory_stats().is_none());
+        assert!(!runtime.memory_stats().client.frozen);
         runtime
             .set_local_endpoint_with_sources(
                 c2_config::LocalEndpointOptions::default(),
@@ -3407,185 +3464,116 @@ mod tests {
                 assert!(!runtime.local_endpoint_frozen());
                 assert_ne!(runtime.local_endpoint_context().unwrap(), captured);
             }
-            assert!(runtime.outgoing_memory_stats().is_none());
+            assert!(!runtime.memory_stats().client.frozen);
         }
     }
 
     #[test]
-    fn call_execution_snapshot_resolves_sources_without_freezing() {
-        use c2_config::{CallExecutionLimitsOverrides, ConfigSources, EnvMap};
-        let runtime = Runtime::new(RuntimeOptions::default()).unwrap();
+    fn role_snapshots_leave_configuration_mutable_until_activation() {
+        let runtime = client_runtime(256, 8);
+        let memory = runtime.memory_stats();
+        assert!(!memory.client.frozen && !memory.server.frozen);
+        assert!(memory.client.memory.is_none() && memory.server.memory.is_none());
+        let calls = runtime.call_execution_snapshot();
+        assert_eq!(calls.client.max_operations, None);
+        assert_eq!(calls.server.max_operations, None);
+
         runtime
-            .set_call_execution_limits_with_sources(
-                CallExecutionLimitsOverrides::default(),
-                ConfigSources {
-                    env_file: c2_config::EnvFilePolicy::Disabled,
-                    process_env: EnvMap::from([
-                        ("C2_CALL_MAX_OUTSTANDING".into(), "3".into()),
-                        ("C2_CALL_PAYLOAD_BUFFER_BUDGET_BYTES".into(), "17".into()),
-                    ]),
+            .update_client_config(crate::ClientConfigPatch {
+                domain_limits: DomainLimitsPatch {
+                    memory_budget_bytes: ConfigField::Set(32),
+                    ..Default::default()
                 },
-            )
+            })
             .unwrap();
-        let snapshot = runtime.call_execution_snapshot().unwrap();
-        assert_eq!(snapshot.max_operations, 3);
-        let payload = runtime
-            .resolve_call_execution_context(false)
-            .unwrap()
-            .payload_snapshot();
-        assert_eq!((payload.limit_bytes, payload.used_bytes), (17, 0));
-        assert_eq!(snapshot.used_operations, 0);
-        // Observation did not freeze: a later typed override wins.
-        runtime
-            .set_call_execution_limits_with_sources(
-                CallExecutionLimitsOverrides {
-                    max_outstanding_calls: Some(1),
-                    payload_buffer_budget_bytes: Some(32),
-                },
-                ConfigSources::empty(),
-            )
-            .unwrap();
-        assert_eq!(runtime.call_execution_snapshot().unwrap().max_operations, 1);
+        assert!(!runtime.memory_stats().client.frozen);
+        runtime.call_execution_context().unwrap();
+        assert_eq!(
+            runtime.memory_stats().client.memory.unwrap().limit_bytes,
+            32
+        );
+        assert_eq!(
+            runtime.call_execution_snapshot().client.max_operations,
+            Some(8)
+        );
+        assert!(!runtime.memory_stats().server.frozen);
     }
 
     #[test]
-    fn call_execution_clones_freeze_one_domain_without_laundering_live_permits() {
-        use c2_config::{CallExecutionLimitsOverrides, CallOptions, CallTimeout, ConfigSources};
-        let runtime = Runtime::new(RuntimeOptions::default()).unwrap();
-        let overrides = CallExecutionLimitsOverrides {
-            max_outstanding_calls: Some(1),
-            payload_buffer_budget_bytes: Some(32),
-        };
-        runtime
-            .set_call_execution_limits_with_sources(overrides.clone(), ConfigSources::empty())
-            .unwrap();
+    fn idempotent_client_updates_keep_live_permits_and_reject_changes() {
+        let runtime = client_runtime(32, 1);
         let clone = runtime.clone();
         let context = runtime.call_execution_context().unwrap();
-        let mut call = context
-            .prepare(
-                CallOptions::with_timeout(CallTimeout::After(Duration::from_secs(10))),
-                None,
-            )
-            .unwrap();
+        let mut call = context.prepare(CallOptions::new(), None).unwrap();
         call.charge_input(32).unwrap();
-        assert_eq!(
-            clone
-                .payload_buffer_observer()
-                .unwrap()
-                .snapshot()
-                .unwrap()
-                .used_bytes,
-            32
-        );
+        let before = clone.memory_stats().client;
         clone
-            .set_call_execution_limits_with_sources(overrides, ConfigSources::empty())
-            .unwrap();
-        assert_eq!(clone.call_execution_snapshot().unwrap().used_operations, 1);
-        assert_eq!(
-            clone.set_call_execution_limits_with_sources(
-                CallExecutionLimitsOverrides {
-                    max_outstanding_calls: Some(2),
-                    payload_buffer_budget_bytes: Some(64)
+            .update_client_config(crate::ClientConfigPatch {
+                domain_limits: DomainLimitsPatch {
+                    max_outstanding_calls: ConfigField::Set(1),
+                    ..Default::default()
                 },
-                ConfigSources::empty(),
-            ),
-            Err(LifecycleError::ConfigFrozen)
+            })
+            .unwrap();
+        assert_eq!(clone.memory_stats().client, before);
+        assert_eq!(
+            clone.call_execution_snapshot().client.used_operations,
+            Some(1)
         );
+        assert_eq!(
+            clone.update_client_config(crate::ClientConfigPatch {
+                domain_limits: DomainLimitsPatch {
+                    memory_budget_bytes: ConfigField::Set(64),
+                    max_outstanding_calls: ConfigField::Set(2),
+                    ..Default::default()
+                },
+            }),
+            Err(LifecycleError::ConfigFrozen),
+        );
+        assert_eq!(clone.client_overrides().max_outstanding_calls, Some(1));
         assert!(
             clone
                 .call_execution_context()
                 .unwrap()
-                .prepare(
-                    CallOptions::with_timeout(CallTimeout::After(Duration::from_secs(10))),
-                    None
-                )
+                .prepare(CallOptions::new(), None)
                 .is_err()
         );
         drop(call);
-        assert_eq!(clone.call_execution_snapshot().unwrap().used_operations, 0);
+        assert_eq!(
+            clone.call_execution_snapshot().client.used_operations,
+            Some(0)
+        );
+        assert_eq!(clone.memory_stats().client.memory.unwrap().used_bytes, 0);
     }
 
     #[test]
-    fn call_execution_shutdown_closes_admission_and_keeps_actual_charge() {
-        use c2_config::{CallExecutionLimitsOverrides, CallOptions, CallTimeout, ConfigSources};
-        let runtime = Runtime::new(RuntimeOptions::default()).unwrap();
-        runtime
-            .set_call_execution_limits_with_sources(
-                CallExecutionLimitsOverrides {
-                    max_outstanding_calls: Some(1),
-                    payload_buffer_budget_bytes: Some(32),
-                },
-                ConfigSources::empty(),
-            )
-            .unwrap();
+    fn client_retirement_closes_admission_and_keeps_actual_charge() {
+        let runtime = client_runtime(32, 1);
         let context = runtime.call_execution_context().unwrap();
-        let observer = runtime.call_execution_observer();
-        let mut call = context
-            .prepare(
-                CallOptions::with_timeout(CallTimeout::After(Duration::from_secs(10))),
-                None,
-            )
-            .unwrap();
+        let mut call = context.prepare(CallOptions::new(), None).unwrap();
         call.charge_input(32).unwrap();
-        let retirement_deadline = std::time::Instant::now() + Duration::from_secs(1);
-        let (retirement_outcome, retirement_completed) = runtime
-            .begin_session_retirement(
-                crate::RuntimeShutdownTarget::ClientsOnly,
-                retirement_deadline,
-            )
-            .expect("begin client-only retirement")
-            .observe_until(retirement_deadline);
-        assert!(retirement_completed, "{retirement_outcome:?}");
-        let snapshot = runtime.call_execution_snapshot().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let (outcome, completed) = runtime
+            .begin_session_retirement(crate::RuntimeShutdownTarget::ClientsOnly, deadline)
+            .unwrap()
+            .observe_until(deadline);
+        assert!(completed, "{outcome:?}");
+        let snapshot = runtime.call_execution_snapshot().client;
         assert!(snapshot.closed);
-        assert_eq!(snapshot.used_operations, 1);
-        assert_eq!(
-            runtime
-                .payload_buffer_observer()
-                .unwrap()
-                .snapshot()
-                .unwrap()
-                .used_bytes,
-            32
-        );
-        assert_eq!(observer.snapshot().counters, Some(snapshot));
-        assert!(observer.is_live());
+        assert_eq!(snapshot.used_operations, Some(1));
+        assert_eq!(runtime.memory_stats().client.memory.unwrap().used_bytes, 32);
+        assert!(context.prepare(CallOptions::new(), None).is_err());
         assert!(
             context
-                .prepare(
-                    CallOptions::with_timeout(CallTimeout::After(Duration::from_secs(10))),
-                    None
-                )
+                .prepare(CallOptions::with_timeout(CallTimeout::Unlimited), None)
                 .is_err()
         );
-        // Explicit Unlimited stays uncharged even in the closed finite domain.
-        let unlimited = context
-            .prepare(
-                CallOptions::with_timeout(CallTimeout::Unlimited),
-                Some(Duration::from_secs(1)),
-            )
-            .unwrap();
-        drop(unlimited);
-        assert_eq!(
-            runtime
-                .payload_buffer_observer()
-                .unwrap()
-                .snapshot()
-                .unwrap()
-                .used_bytes,
-            32
-        );
         drop(call);
+        assert_eq!(runtime.memory_stats().client.memory.unwrap().used_bytes, 0);
         assert_eq!(
-            runtime
-                .payload_buffer_observer()
-                .unwrap()
-                .snapshot()
-                .unwrap()
-                .used_bytes,
-            0
+            runtime.call_execution_snapshot().client.used_operations,
+            Some(0)
         );
-        assert!(!observer.is_live());
     }
 
     static TEST_ID: AtomicU64 = AtomicU64::new(0);
@@ -3680,50 +3668,19 @@ mod tests {
     }
 
     #[test]
-    fn explicit_server_id_derives_ipc_address() {
-        let session = Runtime::new(RuntimeOptions {
-            server_startup_timeout: None,
-            server_id: Some("unit-server".to_string()),
-            server_ipc_overrides: None,
-            client_ipc_overrides: None,
-            shm_threshold: None,
-            remote_payload_chunk_size: None,
-            relay_anchor_address: None,
-            use_process_relay_anchor: true,
-        })
-        .expect("session should accept valid server id");
-
-        assert_eq!(session.server_id(), None);
-        assert_eq!(session.server_address(), None);
-
-        let identity = session.ensure_server().expect("ensure server");
-        assert_eq!(identity.server_id, "unit-server");
-        assert_eq!(identity.ipc_address, "ipc://unit-server");
-        assert_eq!(session.server_id().as_deref(), Some("unit-server"));
-        assert_eq!(
-            session.server_address().as_deref(),
-            Some("ipc://unit-server")
-        );
-    }
-
-    #[test]
-    fn invalid_server_id_is_rejected() {
+    fn invalid_host_server_id_is_rejected_before_freeze() {
+        let runtime = Runtime::new(RuntimeOptions::default()).unwrap();
         for bad in ["", " ", "bad/name", "bad\\name", ".", "..", "bad\nid"] {
-            let err = Runtime::new(RuntimeOptions {
-                server_startup_timeout: None,
-                server_id: Some(bad.to_string()),
-                server_ipc_overrides: None,
-                client_ipc_overrides: None,
-                shm_threshold: None,
-                remote_payload_chunk_size: None,
-                relay_anchor_address: None,
-                use_process_relay_anchor: true,
-            })
-            .expect_err("invalid server id should be rejected");
-            assert!(
-                err.to_string().contains("server_id"),
-                "unexpected error: {err}"
-            );
+            let error = runtime
+                .host(
+                    crate::HostOptions::default()
+                        .with_server_id(bad)
+                        .without_relay(),
+                )
+                .expect_err("invalid server id should be rejected");
+            assert!(error.to_string().contains("server_id"), "{error}");
+            assert!(!runtime.server_config_frozen());
+            assert!(runtime.server_id().is_none());
         }
     }
 
@@ -3739,81 +3696,6 @@ mod tests {
             format!("ipc://{}", identity.server_id)
         );
         assert_eq!(session.ensure_server().expect("idempotent"), identity);
-    }
-
-    #[test]
-    fn clear_server_identity_preserves_explicit_override() {
-        let session = Runtime::new(RuntimeOptions {
-            server_startup_timeout: None,
-            server_id: Some("unit-retry".to_string()),
-            server_ipc_overrides: None,
-            client_ipc_overrides: None,
-            shm_threshold: None,
-            remote_payload_chunk_size: None,
-            relay_anchor_address: None,
-            use_process_relay_anchor: true,
-        })
-        .expect("session should accept valid server id");
-
-        let first = session.ensure_server().expect("ensure server");
-        assert_eq!(first.server_id, "unit-retry");
-        session.clear_server_identity().unwrap();
-        assert_eq!(session.server_id(), None);
-        assert_eq!(session.server_address(), None);
-
-        let second = session.ensure_server().expect("ensure server again");
-        assert_eq!(second.server_id, "unit-retry");
-        assert_eq!(second.ipc_address, "ipc://unit-retry");
-    }
-
-    #[test]
-    fn server_ipc_overrides_are_session_owned() {
-        let overrides = ServerIpcConfigOverrides {
-            pool_segment_size: Some(2 * 1024 * 1024),
-            max_pool_segments: Some(2),
-            ..Default::default()
-        };
-        let session = Runtime::new(RuntimeOptions {
-            server_startup_timeout: None,
-            server_id: Some("unit-server-overrides".to_string()),
-            server_ipc_overrides: Some(overrides),
-            client_ipc_overrides: None,
-            shm_threshold: None,
-            remote_payload_chunk_size: None,
-            relay_anchor_address: None,
-            use_process_relay_anchor: true,
-        })
-        .expect("session should accept valid options");
-
-        let projected = session
-            .server_ipc_overrides()
-            .expect("overrides should be stored");
-        assert_eq!(projected.pool_segment_size, Some(2 * 1024 * 1024));
-        assert_eq!(projected.max_pool_segments, Some(2));
-    }
-
-    #[test]
-    fn client_ipc_overrides_are_session_owned() {
-        let overrides = ClientIpcConfigOverrides {
-            reassembly_segment_size: Some(16 * 1024 * 1024),
-            ..Default::default()
-        };
-        let session = Runtime::new(RuntimeOptions {
-            server_startup_timeout: None,
-            server_id: None,
-            server_ipc_overrides: None,
-            client_ipc_overrides: Some(overrides),
-            shm_threshold: None,
-            remote_payload_chunk_size: None,
-            relay_anchor_address: None,
-            use_process_relay_anchor: true,
-        })
-        .expect("session should accept valid options");
-
-        let projected = session
-            .client_ipc_overrides()
-            .expect("overrides should be stored");
-        assert_eq!(projected.reassembly_segment_size, Some(16 * 1024 * 1024));
     }
 
     #[test]
@@ -3866,7 +3748,6 @@ mod tests {
     #[test]
     fn unregister_missing_route_reports_missing_route() {
         let session = Runtime::new(RuntimeOptions {
-            server_id: Some(unique_route_name("missing-session")),
             use_process_relay_anchor: false,
             ..Default::default()
         })
@@ -3945,7 +3826,6 @@ mod tests {
     fn unregister_relay_failure_returns_structured_outcome_after_local_remove() {
         let route_name = unique_route_name("relay-fail-route");
         let session = Runtime::new(RuntimeOptions {
-            server_id: Some(unique_route_name("relay-fail-session")),
             use_process_relay_anchor: false,
             ..Default::default()
         })
@@ -3980,7 +3860,6 @@ mod tests {
 
         let route_name = unique_route_name("relay-commit-gate");
         let session = Runtime::new(RuntimeOptions {
-            server_id: Some(unique_route_name("relay-commit-session")),
             use_process_relay_anchor: false,
             ..Default::default()
         })
@@ -4124,7 +4003,6 @@ mod tests {
 
         let route_name = unique_route_name("relay-final-fail");
         let session = Runtime::new(RuntimeOptions {
-            server_id: Some(unique_route_name("relay-final-fail-session")),
             use_process_relay_anchor: false,
             ..Default::default()
         })
@@ -4326,7 +4204,6 @@ mod tests {
 
         let route_name = unique_route_name("relay-publish-gate");
         let session = Runtime::new(RuntimeOptions {
-            server_id: Some(unique_route_name("relay-publish-gate-session")),
             use_process_relay_anchor: false,
             ..Default::default()
         })
@@ -4425,7 +4302,6 @@ mod tests {
         let first = unique_route_name("shutdown-a");
         let second = unique_route_name("shutdown-b");
         let session = Runtime::new(RuntimeOptions {
-            server_id: Some(unique_route_name("shutdown-session")),
             use_process_relay_anchor: false,
             ..Default::default()
         })
@@ -4462,7 +4338,6 @@ mod tests {
         let second = unique_route_name("shutdown-close-b");
         let session = Arc::new(
             Runtime::new(RuntimeOptions {
-                server_id: Some(unique_route_name("shutdown-close-session")),
                 use_process_relay_anchor: false,
                 ..Default::default()
             })
@@ -4551,7 +4426,6 @@ mod tests {
     #[test]
     fn host_without_relay_does_not_resolve_unrelated_relay_configuration() {
         let session = Runtime::new(RuntimeOptions {
-            server_id: Some(unique_route_name("host-no-relay-config")),
             use_process_relay_anchor: false,
             ..RuntimeOptions::default()
         })
@@ -4884,143 +4758,56 @@ mod tests {
         assert_eq!(session.shutdown_observation(&server), Some(outcome));
     }
 
-    // ── Read-only memory-budget snapshots ────────────────────────────────
-
     #[test]
-    fn runtime_memory_stats_observe_without_freezing_and_track_outgoing_domain() {
-        let session = Runtime::new(RuntimeOptions {
-            server_startup_timeout: None,
-            server_id: None,
-            server_ipc_overrides: None,
-            client_ipc_overrides: Some(ClientIpcConfigOverrides {
-                shm_backing_budget_bytes: Some(4096),
-                file_backing_budget_bytes: Some(0),
-                live_reassembly_budget_bytes: Some(2048),
-                ..Default::default()
-            }),
-            shm_threshold: None,
-            remote_payload_chunk_size: None,
-            relay_anchor_address: None,
-            use_process_relay_anchor: false,
-        })
-        .expect("runtime");
+    fn failed_remote_acquire_freezes_only_its_client_domain() {
+        let runtime = client_runtime(4096, 4);
+        assert!(!runtime.memory_stats().client.frozen);
+        assert!(runtime.client_domain_observer().is_none());
 
-        // Observing an unused Runtime must not create or freeze a context.
-        let stats = session.memory_stats();
-        assert!(stats.runtime_outgoing.is_none());
-        assert!(stats.server.is_none());
-        assert!(!session.client_config_frozen());
-        assert!(session.outgoing_memory_observer().is_none());
-
-        // A failed first attempt still freezes the domain limits atomically.
+        let address = format!("ipc://{}", unique_route_name("absent-memory-domain"));
         assert!(
-            session
-                .acquire_ipc_client_with_deadline(
-                    "ipc://nonexistent_runtime_memory_domain",
-                    ConnectDeadline::default()
-                )
+            runtime
+                .acquire_ipc_client_with_deadline(&address, ConnectDeadline::default())
                 .is_err(),
             "no server is listening on this address"
         );
-        assert!(session.client_config_frozen());
-
-        let stats = session.memory_stats();
-        let outgoing = stats
-            .runtime_outgoing
-            .expect("a frozen domain is observable");
-        assert_eq!(outgoing.limits.shm_backing_budget_bytes, 4096);
-        assert_eq!(outgoing.limits.file_backing_budget_bytes, 0);
-        assert_eq!(outgoing.limits.live_reassembly_budget_bytes, 2048);
-        assert_eq!(outgoing.shm.used_bytes, 0);
-        assert_eq!(outgoing.file.used_bytes, 0);
-        assert_eq!(outgoing.reassembly.used_bytes, 0);
-        assert_eq!(outgoing.shm.peak_bytes, 0);
-        assert_eq!(outgoing.shm.rejected_allocations, 0);
-
-        // The retired-observation handle carries the same limits and counters
-        // without touching the live cache again.
-        let observer = session
-            .outgoing_memory_observer()
-            .expect("the frozen domain is observable");
-        assert_eq!(observer.limits(), outgoing.limits);
-        assert_eq!(observer.used_bytes(), 0);
+        let stats = runtime.memory_stats();
+        assert!(stats.client.frozen);
+        assert!(!stats.server.frozen);
+        let memory = stats.client.memory.unwrap();
+        assert_eq!(memory.limit_bytes, 4096);
+        assert_eq!(memory.used_bytes, 0);
+        assert_eq!(memory.peak_bytes, 0);
+        assert_eq!(memory.rejected_allocations, 0);
+        assert_eq!(stats.client.file_spill.unwrap().limit_bytes, 0);
+        let observed = runtime.client_domain_observer().unwrap().snapshot();
+        assert_eq!(stats.client.domain_id, Some(observed.domain_id));
+        assert_eq!(observed.operations.max_operations, 4);
     }
 
     #[test]
-    fn outgoing_domain_observer_outlives_runtime_shutdown_without_touching_others() {
-        let runtime_a = Runtime::new(RuntimeOptions {
-            server_startup_timeout: None,
-            server_id: None,
-            server_ipc_overrides: None,
-            client_ipc_overrides: Some(ClientIpcConfigOverrides {
-                shm_backing_budget_bytes: Some(1111),
-                ..Default::default()
-            }),
-            shm_threshold: None,
-            remote_payload_chunk_size: None,
-            relay_anchor_address: None,
-            use_process_relay_anchor: false,
-        })
-        .expect("runtime a");
-        let runtime_b = Runtime::new(RuntimeOptions {
-            server_startup_timeout: None,
-            server_id: None,
-            server_ipc_overrides: None,
-            client_ipc_overrides: Some(ClientIpcConfigOverrides {
-                shm_backing_budget_bytes: Some(2222),
-                ..Default::default()
-            }),
-            shm_threshold: None,
-            remote_payload_chunk_size: None,
-            relay_anchor_address: None,
-            use_process_relay_anchor: false,
-        })
-        .expect("runtime b");
+    fn retiring_one_runtime_domain_does_not_affect_another() {
+        let runtime_a = client_runtime(1111, 1);
+        let runtime_b = client_runtime(2222, 2);
+        runtime_a.call_execution_context().unwrap();
+        runtime_b.call_execution_context().unwrap();
+        let a = runtime_a.client_domain_observer().unwrap();
+        let b = runtime_b.memory_stats().client;
+        assert_ne!(Some(a.snapshot().domain_id), b.domain_id);
 
-        let _ = runtime_a.acquire_ipc_client_with_deadline(
-            "ipc://nonexistent_runtime_a",
-            ConnectDeadline::default(),
-        );
-        let _ = runtime_b.acquire_ipc_client_with_deadline(
-            "ipc://nonexistent_runtime_b",
-            ConnectDeadline::default(),
-        );
-        let a = runtime_a
-            .memory_stats()
-            .runtime_outgoing
-            .expect("runtime a domain");
-        let b = runtime_b
-            .memory_stats()
-            .runtime_outgoing
-            .expect("runtime b domain");
-        assert_eq!(a.limits.shm_backing_budget_bytes, 1111);
-        assert_eq!(b.limits.shm_backing_budget_bytes, 2222);
-
-        // A retired observation taken before shutdown keeps reporting exactly
-        // its own domain after the Runtime is gone.
-        let retired_a = runtime_a
-            .outgoing_memory_observer()
-            .expect("runtime a observer");
-
-        // Shutting one Runtime must not reset or change the other's domain.
-        let retirement_deadline = std::time::Instant::now() + Duration::from_secs(2);
-        let (outcome, retirement_completed) = runtime_a
-            .begin_session_retirement(
-                crate::RuntimeShutdownTarget::ClientsOnly,
-                retirement_deadline,
-            )
-            .expect("begin client-only retirement")
-            .observe_until(retirement_deadline);
-        assert!(retirement_completed, "{outcome:?}");
-        assert!(outcome.ipc_clients_drained);
-        assert_eq!(retired_a.limits(), a.limits);
-        assert_eq!(retired_a.used_bytes(), 0);
-        let b_after = runtime_b
-            .memory_stats()
-            .runtime_outgoing
-            .expect("runtime b domain stays observable");
-        assert_eq!(b_after.limits.shm_backing_budget_bytes, 2222);
-        assert_eq!(b_after.shm.limit_bytes, 2222);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let (outcome, completed) = runtime_a
+            .begin_session_retirement(crate::RuntimeShutdownTarget::ClientsOnly, deadline)
+            .unwrap()
+            .observe_until(deadline);
+        assert!(completed && outcome.ipc_clients_drained, "{outcome:?}");
+        drop(runtime_a);
+        let retired = a.snapshot();
+        assert!(retired.closed);
+        assert_eq!(retired.memory.limit_bytes, 1111);
+        assert_eq!(retired.memory.used_bytes, 0);
+        assert_eq!(runtime_b.memory_stats().client, b);
+        assert!(!b.closed);
     }
 }
 
@@ -5034,7 +4821,6 @@ mod retirement_tests {
 
     fn hosted_runtime() -> (Runtime, Host, Option<tempfile::TempDir>) {
         let runtime = Runtime::new(RuntimeOptions {
-            server_id: Some(format!("retire-unit-{}", uuid::Uuid::new_v4().simple())),
             use_process_relay_anchor: false,
             ..Default::default()
         })

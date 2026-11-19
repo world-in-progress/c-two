@@ -10,9 +10,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 #[cfg(test)]
-use c2_config::{ConfigResolver, ConfigSources, LocalEndpointOptions};
+use c2_config::{ConfigResolver, ConfigSources, DomainLimits, EnvCatalog, LocalEndpointOptions};
 use c2_config::{LocalEndpointContext, RelayConfig};
 use c2_ipc::{IpcClient, RouteBinding};
+use c2_mem::DomainBudget;
 use parking_lot::RwLock;
 use parking_lot::RwLockWriteGuard;
 
@@ -97,28 +98,16 @@ pub struct RelayState {
     endpoint_context: LocalEndpointContext,
     default_endpoint_namespace: bool,
     disseminator: Arc<dyn crate::relay::disseminator::Disseminator>,
-    /// One shared memory context for every data-plane upstream `IpcClient`
-    /// this relay owns. Each connection's request and reassembly pools charge
-    /// this budget, so the upstream pool cannot double the relay's finite
-    /// limits by opening more connections. Short-lived registration/owner
-    /// probes keep their own explicit private contexts; this context is the
-    /// relay process's own, never a process-global cache.
-    ///
-    /// Config scope: `config.upstream_ipc` is the complete resolved policy
-    /// frozen at startup. First connections and reconnects clone that policy
-    /// and this same budget; acquisition never reloads the environment.
-    /// Control-plane attestation/watch clients use private lazy memory
-    /// contexts with the same frozen endpoint namespace and do not charge this data-plane budget.
-    upstream_memory_budget: c2_mem::MemoryBudget,
+    /// One shared role domain for the whole relay: the forwarding admission
+    /// slots and memory buffers plus every data-plane upstream `IpcClient`'s
+    /// request and reassembly pools charge this same budget, so opening more
+    /// upstream connections cannot multiply the relay's finite limits.
+    /// Short-lived registration/owner probes keep their own explicit private
+    /// accounting; this domain is the relay process's own, never a
+    /// process-global cache.
+    domain_budget: DomainBudget,
     pub(crate) forwarding: crate::relay::forwarding::ForwardingDomain,
     pub(crate) clients: Arc<crate::relay::client_lifecycle::ClientLifecycle>,
-}
-
-fn owner_lease_duration(config: &RelayConfig) -> Option<Duration> {
-    match config.idle_timeout_secs {
-        0 => None,
-        seconds => Some(Duration::from_secs(seconds)),
-    }
 }
 
 #[derive(Clone)]
@@ -199,43 +188,42 @@ impl RelayState {
         config: Arc<RelayConfig>,
         disseminator: Arc<dyn crate::relay::disseminator::Disseminator>,
     ) -> Self {
-        let context = ConfigResolver::resolve_local_endpoint(
-            LocalEndpointOptions::default(),
-            ConfigSources::from_process(),
-        )
-        .expect("invalid relay local endpoint configuration");
+        let catalog = EnvCatalog::load(ConfigSources::from_process())
+            .expect("invalid relay local endpoint configuration");
+        let context =
+            ConfigResolver::resolve_local_endpoint(LocalEndpointOptions::default(), &catalog)
+                .expect("invalid relay local endpoint configuration");
         Self::new_with_context(config, disseminator, context)
     }
 
-    /// Test constructor with explicit default execution limits.
+    /// Test constructor with the default relay role domain.
     #[cfg(test)]
     pub fn new_with_context(
         config: Arc<RelayConfig>,
         disseminator: Arc<dyn crate::relay::disseminator::Disseminator>,
         endpoint_context: LocalEndpointContext,
     ) -> Self {
-        Self::new_with_execution_limits(
+        Self::new_with_budget(
             config,
             disseminator,
             endpoint_context,
-            c2_config::CallExecutionLimits::default(),
+            DomainBudget::from_limits(&DomainLimits::default()),
+            c2_config::IDLE_CONNECTION_TIMEOUT,
         )
     }
 
-    pub(crate) fn new_with_execution_limits(
+    pub(crate) fn new_with_budget(
         config: Arc<RelayConfig>,
         disseminator: Arc<dyn crate::relay::disseminator::Disseminator>,
         endpoint_context: LocalEndpointContext,
-        limits: c2_config::CallExecutionLimits,
+        budget: DomainBudget,
+        owner_idle_timeout: Duration,
     ) -> Self {
         let default_endpoint_namespace = LocalEndpointContext::default_for_platform()
             .is_ok_and(|default| default == endpoint_context);
-        let owner_lease_duration = owner_lease_duration(&config);
-        let upstream_memory_budget =
-            c2_mem::MemoryBudget::from_limits(&config.upstream_ipc.memory_budget_limits());
         Self {
             route_table: RwLock::new(RouteTable::new(config.relay_id.clone())),
-            conn_pool: ConnectionPool::with_owner_lease_duration(owner_lease_duration),
+            conn_pool: ConnectionPool::with_owner_lease_duration(Some(owner_idle_timeout)),
             upstream_controls: RwLock::new(UpstreamControls::default()),
             #[cfg(test)]
             registration_watch_seam: parking_lot::Mutex::new(None),
@@ -251,19 +239,22 @@ impl RelayState {
             config,
             endpoint_context,
             default_endpoint_namespace,
-            upstream_memory_budget,
-            forwarding: crate::relay::forwarding::ForwardingDomain::new(&limits),
+            domain_budget: budget.clone(),
+            forwarding: crate::relay::forwarding::ForwardingDomain::new(budget),
             clients: crate::relay::client_lifecycle::ClientLifecycle::new(),
         }
     }
 
-    /// Read-only snapshot of the relay's shared upstream memory context.
+    /// Read-only snapshot of the relay's single shared role domain.
     ///
-    /// Observing this never connects, maps, or resets accounting. Test-only
-    /// because the relay has no public stats surface yet.
-    #[cfg(test)]
-    pub fn upstream_memory_snapshot(&self) -> c2_mem::BudgetSnapshot {
-        self.upstream_memory_budget.snapshot()
+    /// Observing this never connects, maps, or resets accounting.
+    pub fn domain_snapshot(&self) -> c2_mem::DomainSnapshot {
+        self.domain_budget.snapshot()
+    }
+
+    /// Read-only projection of the forwarding admission slots.
+    pub fn call_execution_snapshot(&self) -> c2_mem::RetentionSnapshot {
+        self.forwarding.snapshot()
     }
 
     pub fn disseminator(&self) -> &Arc<dyn crate::relay::disseminator::Disseminator> {
@@ -459,11 +450,10 @@ impl RelayState {
         };
         let route_name = expected.name.clone();
         let expected_for_connect = expected.clone();
-        // Every data-plane connection (including reconnects) uses the frozen
-        // resolved policy and the relay's one shared upstream memory context.
-        // `with_endpoint_and_shared_budget` validates the pair before connection I/O.
-        let upstream_ipc = self.config.upstream_ipc.clone();
-        let upstream_memory_budget = self.upstream_memory_budget.clone();
+        // Every data-plane connection (including reconnects) charges the
+        // relay's one shared role domain; acquisition never reloads the
+        // environment.
+        let domain_budget = self.domain_budget.clone();
         let endpoint_context = self.endpoint_context.clone();
         let clients = self.clients.clone();
 
@@ -472,8 +462,7 @@ impl RelayState {
             .acquire_with(&endpoint_key, move |endpoint| {
                 let expected = expected_for_connect.clone();
                 let route_name = route_name.clone();
-                let upstream_ipc = upstream_ipc.clone();
-                let upstream_memory_budget = upstream_memory_budget.clone();
+                let domain_budget = domain_budget.clone();
                 let endpoint_context = endpoint_context.clone();
                 let clients = clients.clone();
                 async move {
@@ -496,11 +485,9 @@ impl RelayState {
                         )));
                     }
                     let endpoint = endpoint_context.endpoint(endpoint.address()).map_err(c2_ipc::IpcError::Io)?;
-                    let mut client = clients.manage(|| IpcClient::with_endpoint_and_shared_budget(
-                        endpoint,
-                        upstream_ipc,
-                        upstream_memory_budget,
-                    ))?;
+                    let mut client = clients.manage(|| {
+                        IpcClient::with_endpoint_and_budget(endpoint, domain_budget.clone())
+                    })?;
                     client.connect().await?;
                     if client.server_id() != expected.server_id.as_deref()
                         || client.server_instance_id() != expected.server_instance_id.as_deref()
@@ -1131,7 +1118,6 @@ impl RelayState {
 mod tests {
     use super::*;
     use crate::relay::authority::{OwnerReplacement, RegisterPreparation};
-    use c2_config::ClientIpcConfig;
 
     const TEST_CRM_NS: &str = "test.relay";
     const TEST_CRM_NAME: &str = "RelayGrid";
@@ -1386,11 +1372,7 @@ mod tests {
         }
 
         fn client(&self) -> IpcClient {
-            IpcClient::with_endpoint(
-                self.server.local_endpoint().clone(),
-                ClientIpcConfig::default(),
-            )
-            .unwrap()
+            IpcClient::with_endpoint(self.server.local_endpoint().clone()).unwrap()
         }
 
         fn release(&mut self, index: usize) {
@@ -1841,259 +1823,24 @@ mod tests {
     }
 
     #[test]
-    fn relay_upstream_memory_context_starts_idle_with_canonical_limits() {
+    fn relay_upstream_domain_starts_idle_with_canonical_limits() {
         let state = RelayState::new(test_config(), null_disseminator());
-        let snapshot = state.upstream_memory_snapshot();
-        let limits = ClientIpcConfig::default().memory_budget_limits();
-        assert_eq!(snapshot.shm.limit_bytes, limits.shm_backing_budget_bytes);
-        assert_eq!(snapshot.file.limit_bytes, limits.file_backing_budget_bytes);
+        let snapshot = state.domain_snapshot();
+        let limits = DomainLimits::default();
+        assert_eq!(snapshot.memory.limit_bytes, limits.memory_budget_bytes);
         assert_eq!(
-            snapshot.reassembly.limit_bytes,
-            limits.live_reassembly_budget_bytes
+            snapshot.file_spill.limit_bytes,
+            limits.file_spill_budget_bytes
         );
-        assert_eq!(snapshot.shm.used_bytes, 0);
-        assert_eq!(snapshot.file.used_bytes, 0);
-        assert_eq!(snapshot.reassembly.used_bytes, 0);
+        assert_eq!(
+            snapshot.operations.max_operations,
+            limits.max_outstanding_calls
+        );
+        assert_eq!(snapshot.memory.used_bytes, 0);
+        assert_eq!(snapshot.file_spill.used_bytes, 0);
+        assert_eq!(snapshot.operations.used_operations, 0);
         // Observation is read-only and stable.
-        assert_eq!(state.upstream_memory_snapshot(), snapshot);
-    }
-
-    #[test]
-    fn relay_upstream_ipc_invalid_policy_is_rejected_before_bind() {
-        let mut config = RelayConfig {
-            bind: "invalid-bind".into(),
-            ..RelayConfig::default()
-        };
-        config.upstream_ipc.base.pool_enabled = false;
-        config.upstream_ipc.base.pool_prewarm_segments = 1;
-        let err = match crate::relay::RelayServer::start(config) {
-            Err(err) => err,
-            Ok(mut relay) => {
-                let _ = relay.stop();
-                panic!("invalid upstream policy must reject relay startup");
-            }
-        };
-        assert!(err.contains("upstream_ipc"), "{err}");
-        assert!(err.contains("pool_prewarm_segments"), "{err}");
-        assert!(!err.contains("Invalid bind address"), "{err}");
-    }
-
-    struct RequestBytesProbe;
-
-    impl c2_server::CrmCallback for RequestBytesProbe {
-        fn invoke(
-            &self,
-            _route_name: &str,
-            _method_idx: u16,
-            request: Vec<u8>,
-            _response_pool: Arc<c2_server::ResponsePool>,
-        ) -> Result<c2_server::ResponseMeta, c2_server::CrmError> {
-            assert_eq!(request, [7; 32]);
-            Ok(c2_server::ResponseMeta::Inline(b"accepted".to_vec()))
-        }
-    }
-
-    // Assert policy at the live server boundary and charges on the relay's
-    // context, rather than adding an IPC config getter solely for tests.
-    async fn exercise_resolved_upstream_ipc(buddy: bool, prewarm: u32, zero_budget: bool) {
-        use c2_config::{ConfigResolver, ConfigSources, RuntimeConfigOverrides};
-        use c2_server::{
-            ConcurrencyMode, RouteBuildSpec, SchedulerLimits, Server, ServerIpcConfig,
-        };
-
-        let mut overrides = RuntimeConfigOverrides::default();
-        overrides.client_ipc.pool_enabled = Some(buddy);
-        overrides.client_ipc.pool_prewarm_segments = Some(prewarm);
-        overrides.client_ipc.pool_segment_size = Some(65536);
-        overrides.client_ipc.max_pool_segments = Some(2);
-        overrides.client_ipc.chunk_size = Some(16);
-        overrides.client_ipc.shm_backing_budget_bytes =
-            Some(if zero_budget { 0 } else { 1_048_576 });
-        overrides.client_ipc.file_backing_budget_bytes = Some(if zero_budget { 0 } else { 32768 });
-        overrides.client_ipc.live_reassembly_budget_bytes =
-            Some(if zero_budget { 0 } else { 16384 });
-        // A 32-byte request must use the configured SHM/fallback path, whereas
-        // the default 4096-byte threshold would send it inline.
-        overrides.shm_threshold = Some(1);
-        let config = ConfigResolver::resolve_relay_server(overrides, ConfigSources::empty())
-            .unwrap()
-            .relay;
-        let state = RelayState::new(Arc::new(config), null_disseminator());
-        let address = format!(
-            "ipc://relay_policy_{}_{}_{}",
-            std::process::id(),
-            u8::from(buddy),
-            u8::from(zero_budget)
-        );
-        let server = Arc::new(
-            Server::new_with_identity(
-                &address,
-                ServerIpcConfig::default(),
-                c2_server::ServerIdentity {
-                    server_id: "policy-server".into(),
-                    server_instance_id: "policy-instance".into(),
-                },
-            )
-            .unwrap(),
-        );
-        let route = server
-            .build_route(
-                RouteBuildSpec {
-                    name: "grid".into(),
-                    crm_ns: TEST_CRM_NS.into(),
-                    crm_name: TEST_CRM_NAME.into(),
-                    crm_ver: TEST_CRM_VER.into(),
-                    abi_hash: TEST_ABI_HASH.into(),
-                    signature_hash: TEST_SIGNATURE_HASH.into(),
-                    method_names: vec!["probe".into()],
-                    access_map: HashMap::new(),
-                    concurrency_mode: ConcurrencyMode::ReadParallel,
-                    limits: SchedulerLimits::default(),
-                },
-                Arc::new(RequestBytesProbe),
-            )
-            .unwrap();
-        let reservation = server.reserve_route(route).await.unwrap();
-        server.commit_reserved_route(reservation).await.unwrap();
-        let run_server = server.clone();
-        let task = tokio::spawn(async move { run_server.run().await });
-        server
-            .wait_until_responsive(Duration::from_secs(2))
-            .await
-            .unwrap();
-
-        // Registration attestation is a private lazy default client. It must
-        // remain usable even when the data-plane budget is zero.
-        let mut probe =
-            IpcClient::with_config(&address, c2_config::ClientIpcConfig::default()).unwrap();
-        probe.connect().await.unwrap();
-        let contract = probe.route_contract("grid").unwrap();
-        let attestation = probe
-            .attest_route_for_registration(&contract)
-            .await
-            .unwrap();
-        let entry = match test_commit_registration!(
-            &state,
-            "grid".into(),
-            "policy-server".into(),
-            "policy-instance".into(),
-            address.clone(),
-            TEST_CRM_NS.into(),
-            TEST_CRM_NAME.into(),
-            TEST_CRM_VER.into(),
-            TEST_ABI_HASH.into(),
-            TEST_SIGNATURE_HASH.into(),
-            attestation.max_payload_size,
-            attestation.route_uid,
-            None,
-        ) {
-            RegisterCommitResult::Registered { entry } => entry,
-            _ => panic!("live route registration failed"),
-        };
-        probe.close().await;
-        assert_eq!(state.upstream_memory_snapshot().shm.used_bytes, 0);
-
-        // A live charge on this exact context must survive connection creation
-        // and reconnect; creating another budget would lose this accounting.
-        let _charge = if zero_budget {
-            None
-        } else {
-            Some(
-                state
-                    .upstream_memory_budget
-                    .reserve(c2_mem::BudgetKind::File, 1)
-                    .unwrap(),
-            )
-        };
-        let mut previous = None;
-        for _ in 0..2 {
-            let (lease, binding, _) = match state.acquire_upstream_for_route(&entry).await {
-                Ok(acquired) => acquired,
-                Err(_) => panic!("resolved IPC policy must acquire a real client"),
-            };
-            if let Some(old) = previous.take() {
-                assert!(
-                    !Arc::ptr_eq(&old, &lease.client()),
-                    "eviction must reacquire a fresh client"
-                );
-            }
-            let snapshot = state.upstream_memory_snapshot();
-            if prewarm > 0 {
-                assert!(
-                    snapshot.shm.used_bytes > 0,
-                    "real client must prewarm the shared context"
-                );
-            }
-            assert_eq!(snapshot.file.used_bytes, u64::from(!zero_budget));
-            let response = lease
-                .client()
-                .call_bound(&binding, "probe", &[7; 32])
-                .await
-                .unwrap();
-            assert_eq!(response.into_owned_bytes().unwrap(), b"accepted");
-            let snapshot = state.upstream_memory_snapshot();
-            assert_eq!(
-                snapshot.shm.limit_bytes,
-                if zero_budget { 0 } else { 1_048_576 }
-            );
-            assert_eq!(
-                snapshot.file.limit_bytes,
-                if zero_budget { 0 } else { 32768 }
-            );
-            assert_eq!(
-                snapshot.reassembly.limit_bytes,
-                if zero_budget { 0 } else { 16384 }
-            );
-            if zero_budget {
-                assert!(
-                    snapshot.shm.rejected_allocations > 0,
-                    "request must attempt the configured finite context"
-                );
-            } else {
-                assert!(
-                    snapshot.shm.peak_bytes > 0,
-                    "live client must charge the relay budget"
-                );
-            }
-            previous = Some(lease.client().clone());
-            drop(lease);
-            state.evict_connection("grid").unwrap().close_shared().await;
-        }
-        server
-            .shutdown_and_wait(Duration::from_secs(2))
-            .await
-            .unwrap();
-        task.await.unwrap().unwrap();
-    }
-
-    #[tokio::test]
-    async fn relay_upstream_ipc_acquired_client_uses_prewarm_and_shared_budget() {
-        tokio::time::timeout(
-            Duration::from_secs(10),
-            exercise_resolved_upstream_ipc(true, 1, false),
-        )
-        .await
-        .expect("live IPC regression must finish within ten seconds");
-    }
-
-    #[tokio::test]
-    async fn relay_upstream_ipc_acquired_client_disables_buddy_on_reconnect() {
-        tokio::time::timeout(
-            Duration::from_secs(10),
-            exercise_resolved_upstream_ipc(false, 0, false),
-        )
-        .await
-        .expect("live IPC regression must finish within ten seconds");
-    }
-
-    #[tokio::test]
-    async fn relay_upstream_ipc_acquired_client_obeys_zero_budget() {
-        tokio::time::timeout(
-            Duration::from_secs(10),
-            exercise_resolved_upstream_ipc(false, 0, true),
-        )
-        .await
-        .expect("live IPC regression must finish within ten seconds");
+        assert_eq!(state.domain_snapshot(), snapshot);
     }
 
     struct NullDisseminator;
@@ -2338,9 +2085,7 @@ mod tests {
     #[test]
     fn register_and_resolve_upstream() {
         let state = RelayState::new(test_config(), null_disseminator());
-        let client = Arc::new(
-            IpcClient::with_config("ipc://grid", c2_config::ClientIpcConfig::default()).unwrap(),
-        );
+        let client = Arc::new(IpcClient::new("ipc://grid").unwrap());
         let registered = register_local(&state, "grid", "server-grid", "ipc://grid", client);
         let routes = state
             .resolve_matching(&expected_contract_for_route(&registered))
@@ -2388,9 +2133,7 @@ mod tests {
     #[test]
     fn local_routes_on_same_endpoint_share_one_owner_slot() {
         let state = RelayState::new(test_config(), null_disseminator());
-        let manager = Arc::new(
-            IpcClient::with_config("ipc://shared", c2_config::ClientIpcConfig::default()).unwrap(),
-        );
+        let manager = Arc::new(IpcClient::new("ipc://shared").unwrap());
         register_local_with_contract(
             &state,
             "manager",
@@ -2400,9 +2143,7 @@ mod tests {
             TEST_ROUTE_CONTRACT,
             manager,
         );
-        let builder = Arc::new(
-            IpcClient::with_config("ipc://shared", c2_config::ClientIpcConfig::default()).unwrap(),
-        );
+        let builder = Arc::new(IpcClient::new("ipc://shared").unwrap());
         register_local_with_contract(
             &state,
             "builder",
@@ -2428,13 +2169,9 @@ mod tests {
     #[test]
     fn unregister_one_route_keeps_shared_endpoint_for_remaining_routes() {
         let state = RelayState::new(test_config(), null_disseminator());
-        let manager = Arc::new(
-            IpcClient::with_config("ipc://shared", c2_config::ClientIpcConfig::default()).unwrap(),
-        );
+        let manager = Arc::new(IpcClient::new("ipc://shared").unwrap());
         register_local(&state, "manager", "server-grid", "ipc://shared", manager);
-        let builder = Arc::new(
-            IpcClient::with_config("ipc://shared", c2_config::ClientIpcConfig::default()).unwrap(),
-        );
+        let builder = Arc::new(IpcClient::new("ipc://shared").unwrap());
         register_local(&state, "builder", "server-grid", "ipc://shared", builder);
 
         assert!(matches!(
@@ -2464,10 +2201,7 @@ mod tests {
             "grid",
             "server-grid",
             "ipc://grid",
-            Arc::new(
-                IpcClient::with_config("ipc://grid", c2_config::ClientIpcConfig::default())
-                    .unwrap(),
-            ),
+            Arc::new(IpcClient::new("ipc://grid").unwrap()),
         );
         let key = upstream_control::owner_key_for_route(&entry).unwrap();
         state.mark_upstream_control_watch_unavailable(&key, "watch stream closed");
@@ -2565,9 +2299,7 @@ mod tests {
     #[test]
     fn unregister_upstream() {
         let state = RelayState::new(test_config(), null_disseminator());
-        let client = Arc::new(
-            IpcClient::with_config("ipc://grid", c2_config::ClientIpcConfig::default()).unwrap(),
-        );
+        let client = Arc::new(IpcClient::new("ipc://grid").unwrap());
         register_local(&state, "grid", "server-grid", "ipc://grid", client);
         assert!(matches!(
             state.unregister_upstream("grid", "server-grid"),
@@ -2579,9 +2311,7 @@ mod tests {
     #[test]
     fn unregister_upstream_rejects_wrong_server_id() {
         let state = RelayState::new(test_config(), null_disseminator());
-        let client = Arc::new(
-            IpcClient::with_config("ipc://grid", c2_config::ClientIpcConfig::default()).unwrap(),
-        );
+        let client = Arc::new(IpcClient::new("ipc://grid").unwrap());
         register_local(&state, "grid", "server-grid", "ipc://grid", client);
 
         assert!(matches!(
@@ -2634,9 +2364,7 @@ mod tests {
         // would silently demote a Local route (with ipc_address) to a Peer
         // route (without ipc_address) and break local IPC dispatch.
         let state = RelayState::new(test_config(), null_disseminator());
-        let client = Arc::new(
-            IpcClient::with_config("ipc://grid", c2_config::ClientIpcConfig::default()).unwrap(),
-        );
+        let client = Arc::new(IpcClient::new("ipc://grid").unwrap());
         register_local(&state, "grid", "server-grid", "ipc://grid", client);
 
         // Echo of our own route arriving via DigestDiff with our relay_id.
@@ -2673,9 +2401,7 @@ mod tests {
     #[test]
     fn unregister_peer_route_does_not_remove_local_route() {
         let state = RelayState::new(test_config(), null_disseminator());
-        let client = Arc::new(
-            IpcClient::with_config("ipc://grid", c2_config::ClientIpcConfig::default()).unwrap(),
-        );
+        let client = Arc::new(IpcClient::new("ipc://grid").unwrap());
         register_local(&state, "grid", "server-grid", "ipc://grid", client);
 
         let result = RouteAuthority::new(&state).withdraw_peer(
@@ -2693,9 +2419,7 @@ mod tests {
     #[test]
     fn unregister_peer_does_not_remove_local_routes() {
         let state = RelayState::new(test_config(), null_disseminator());
-        let client = Arc::new(
-            IpcClient::with_config("ipc://grid", c2_config::ClientIpcConfig::default()).unwrap(),
-        );
+        let client = Arc::new(IpcClient::new("ipc://grid").unwrap());
         register_local(&state, "grid", "server-grid", "ipc://grid", client);
 
         state.unregister_peer("test-relay");
@@ -2852,9 +2576,7 @@ mod tests {
     #[tokio::test]
     async fn replacement_proof_can_replace_same_slot_only_while_still_evicted() {
         let state = RelayState::new(test_config(), null_disseminator());
-        let old = Arc::new(
-            IpcClient::with_config("ipc://old", c2_config::ClientIpcConfig::default()).unwrap(),
-        );
+        let old = Arc::new(IpcClient::new("ipc://old").unwrap());
         register_local_with_contract(
             &state,
             "grid",
@@ -2892,9 +2614,7 @@ mod tests {
     #[tokio::test]
     async fn route_replacement_keeps_old_endpoint_when_other_routes_still_reference_it() {
         let state = RelayState::new(test_config(), null_disseminator());
-        let manager = Arc::new(
-            IpcClient::with_config("ipc://old", c2_config::ClientIpcConfig::default()).unwrap(),
-        );
+        let manager = Arc::new(IpcClient::new("ipc://old").unwrap());
         register_local_with_contract(
             &state,
             "manager",
@@ -2904,9 +2624,7 @@ mod tests {
             TEST_ROUTE_CONTRACT,
             manager,
         );
-        let builder = Arc::new(
-            IpcClient::with_config("ipc://old", c2_config::ClientIpcConfig::default()).unwrap(),
-        );
+        let builder = Arc::new(IpcClient::new("ipc://old").unwrap());
         register_local_with_contract(
             &state,
             "builder",
@@ -2954,9 +2672,7 @@ mod tests {
     #[tokio::test]
     async fn replacement_proof_does_not_match_re_registered_same_address_owner() {
         let state = RelayState::new(test_config(), null_disseminator());
-        let old = Arc::new(
-            IpcClient::with_config("ipc://same", c2_config::ClientIpcConfig::default()).unwrap(),
-        );
+        let old = Arc::new(IpcClient::new("ipc://same").unwrap());
         register_local(&state, "grid", "server-old", "ipc://same", old);
         state.evict_connection("grid");
         let replacement_proof = confirmed_dead_replacement(
@@ -2972,9 +2688,7 @@ mod tests {
             UnregisterResult::Removed { .. }
         ));
 
-        let new_same_address = Arc::new(
-            IpcClient::with_config("ipc://same", c2_config::ClientIpcConfig::default()).unwrap(),
-        );
+        let new_same_address = Arc::new(IpcClient::new("ipc://same").unwrap());
         register_local(
             &state,
             "grid",
@@ -3011,9 +2725,7 @@ mod tests {
     #[tokio::test]
     async fn replacement_proof_is_rejected_after_same_owner_lease_renewal() {
         let state = RelayState::new(test_config(), null_disseminator());
-        let old = Arc::new(
-            IpcClient::with_config("ipc://old", c2_config::ClientIpcConfig::default()).unwrap(),
-        );
+        let old = Arc::new(IpcClient::new("ipc://old").unwrap());
         register_local_with_contract(
             &state,
             "grid",
@@ -3081,9 +2793,7 @@ mod tests {
     #[test]
     fn owner_lease_renewal_is_not_peer_visible_route_state() {
         let state = RelayState::new(test_config(), null_disseminator());
-        let old = Arc::new(
-            IpcClient::with_config("ipc://old", c2_config::ClientIpcConfig::default()).unwrap(),
-        );
+        let old = Arc::new(IpcClient::new("ipc://old").unwrap());
         register_local(&state, "grid", "server-old", "ipc://old", old);
 
         let before_snapshot =
@@ -3102,9 +2812,7 @@ mod tests {
     #[test]
     fn stale_unreachable_removal_does_not_delete_new_same_address_owner_with_different_tag() {
         let state = RelayState::new(test_config(), null_disseminator());
-        let old = Arc::new(
-            IpcClient::with_config("ipc://same", c2_config::ClientIpcConfig::default()).unwrap(),
-        );
+        let old = Arc::new(IpcClient::new("ipc://same").unwrap());
         register_local_with_contract(
             &state,
             "grid",
@@ -3126,9 +2834,7 @@ mod tests {
             UnregisterResult::Removed { .. }
         ));
 
-        let new_same_address = Arc::new(
-            IpcClient::with_config("ipc://same", c2_config::ClientIpcConfig::default()).unwrap(),
-        );
+        let new_same_address = Arc::new(IpcClient::new("ipc://same").unwrap());
         register_local_with_contract(
             &state,
             "grid",
@@ -3176,10 +2882,7 @@ mod tests {
     #[test]
     fn replacement_proof_cannot_replace_reconnected_owner_slot() {
         let state = RelayState::new(test_config(), null_disseminator());
-        let old = Arc::new(
-            IpcClient::with_config("ipc://same-slot", c2_config::ClientIpcConfig::default())
-                .unwrap(),
-        );
+        let old = Arc::new(IpcClient::new("ipc://same-slot").unwrap());
         register_local(&state, "grid", "server-old", "ipc://same-slot", old);
         state.evict_connection("grid");
         let replacement_proof = tokio::runtime::Builder::new_current_thread()
@@ -3194,10 +2897,7 @@ mod tests {
                 "ipc://replacement",
             ));
 
-        let reconnected_old = Arc::new(
-            IpcClient::with_config("ipc://same-slot", c2_config::ClientIpcConfig::default())
-                .unwrap(),
-        );
+        let reconnected_old = Arc::new(IpcClient::new("ipc://same-slot").unwrap());
         state.reconnect("grid", reconnected_old);
 
         let result = test_commit_registration!(
@@ -3231,9 +2931,7 @@ mod tests {
     #[test]
     fn same_server_registration_is_idempotent_without_repairing_evicted_client() {
         let state = RelayState::new(test_config(), null_disseminator());
-        let original = Arc::new(
-            IpcClient::with_config("ipc://grid", c2_config::ClientIpcConfig::default()).unwrap(),
-        );
+        let original = Arc::new(IpcClient::new("ipc://grid").unwrap());
         register_local_with_contract(
             &state,
             "grid",
@@ -3271,9 +2969,7 @@ mod tests {
     #[test]
     fn same_owner_registration_rejects_contract_change_without_new_instance() {
         let state = RelayState::new(test_config(), null_disseminator());
-        let original = Arc::new(
-            IpcClient::with_config("ipc://grid", c2_config::ClientIpcConfig::default()).unwrap(),
-        );
+        let original = Arc::new(IpcClient::new("ipc://grid").unwrap());
         register_local(&state, "grid", "server-grid", "ipc://grid", original);
 
         let result = test_commit_registration!(
@@ -3305,9 +3001,7 @@ mod tests {
     #[test]
     fn same_server_new_instance_refreshes_local_route_owner_slot() {
         let state = RelayState::new(test_config(), null_disseminator());
-        let original = Arc::new(
-            IpcClient::with_config("ipc://grid", c2_config::ClientIpcConfig::default()).unwrap(),
-        );
+        let original = Arc::new(IpcClient::new("ipc://grid").unwrap());
         register_local_with_instance(
             &state,
             "grid",
@@ -3355,9 +3049,7 @@ mod tests {
     #[test]
     fn same_server_registration_with_different_address_conflicts() {
         let state = RelayState::new(test_config(), null_disseminator());
-        let original = Arc::new(
-            IpcClient::with_config("ipc://old", c2_config::ClientIpcConfig::default()).unwrap(),
-        );
+        let original = Arc::new(IpcClient::new("ipc://old").unwrap());
         register_local(&state, "grid", "server-grid", "ipc://old", original);
 
         let result = test_commit_registration!(
@@ -3388,9 +3080,7 @@ mod tests {
     #[tokio::test]
     async fn acquire_after_unregister_reports_not_found() {
         let state = RelayState::new(test_config(), null_disseminator());
-        let client = Arc::new(
-            IpcClient::with_config("ipc://grid", c2_config::ClientIpcConfig::default()).unwrap(),
-        );
+        let client = Arc::new(IpcClient::new("ipc://grid").unwrap());
         register_local(&state, "grid", "server-grid", "ipc://grid", client);
 
         assert!(matches!(
@@ -3407,9 +3097,7 @@ mod tests {
     #[tokio::test]
     async fn same_server_register_does_not_repair_evicted_slot() {
         let state = RelayState::new(test_config(), null_disseminator());
-        let original = Arc::new(
-            IpcClient::with_config("ipc://grid", c2_config::ClientIpcConfig::default()).unwrap(),
-        );
+        let original = Arc::new(IpcClient::new("ipc://grid").unwrap());
         register_local_with_contract(
             &state,
             "grid",

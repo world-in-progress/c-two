@@ -128,7 +128,7 @@ def test_native_stream_then_unary_preserves_input_and_terminal(
         }
         assert resource.cleanups == 1
         assert view.echo(b'after') == b'after'
-        assert runtime.call_execution_snapshot()['used_operations'] == 0
+        assert runtime.call_execution_snapshot()['client']['used_operations'] == 0
     finally:
         if stream is not None:
             stream.close()

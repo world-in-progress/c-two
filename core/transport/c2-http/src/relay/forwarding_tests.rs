@@ -10,8 +10,9 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::http::StatusCode;
-use c2_config::{CallExecutionLimits, ClientIpcConfig, LocalEndpointContext, RelayConfig};
+use c2_config::{DomainLimits, LocalEndpointContext, RelayConfig};
 use c2_ipc::{IpcClient, RouteBinding};
+use c2_mem::DomainBudget;
 use c2_server::{
     ConcurrencyMode, CrmCallback, CrmError, ResponseMeta, RouteBuildSpec, SchedulerLimits, Server,
     ServerIdentity, ServerIpcConfig,
@@ -27,6 +28,8 @@ use super::test_support::{NoopDisseminator, TEST_ABI_HASH, TEST_SIGNATURE_HASH};
 use super::types::RouteEntry;
 
 const INPUT_LEN: usize = 8192;
+const CHUNKED_INPUT_LEN: usize = c2_config::CHUNK_SIZE as usize + INPUT_LEN;
+const FILE_REPLY_LEN: usize = 2 * c2_config::CHUNK_SIZE as usize;
 const STEP: Duration = Duration::from_secs(10);
 static NEXT_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -80,32 +83,36 @@ fn forwarding_budget(carrier: Carrier, input_len: usize) -> u64 {
     input_len as u64 + 2 * copy_window(carrier)
 }
 
-fn policy(carrier: Carrier) -> ClientIpcConfig {
-    let mut config = ClientIpcConfig::default();
-    config.base.pool_segment_size = 64 * 1024;
-    config.base.max_pool_segments = 1;
-    config.base.pool_enabled = carrier == Carrier::Buddy;
-    config.base.pool_prewarm_segments = 0;
-    config.base.chunk_size = copy_window(carrier);
-    config.base.shm_backing_budget_bytes = if matches!(carrier, Carrier::Buddy | Carrier::Dedicated)
-    {
-        1024 * 1024
-    } else {
-        0
+fn concurrent_forwarding_budget(input_len: usize) -> u64 {
+    let copy_cap = c2_config::REMOTE_PAYLOAD_CHUNK_SIZE.min(c2_config::CHUNK_SIZE);
+    2 * (input_len as u64 + input_len.min(copy_cap as usize) as u64 + copy_cap)
+}
+
+// The forwarding admission plan splits B into input + upload + download with
+// the upload copy capped at the input length and half the remainder; the
+// download window keeps whatever budget is left (SendBufferPlan).
+fn download_window(carrier: Carrier, input_len: usize) -> u64 {
+    let budget = forwarding_budget(carrier, input_len);
+    let input = input_len as u64;
+    let upload = input.min((budget - input) / 2).max(u64::from(input != 0));
+    budget - input - upload
+}
+
+// A domain sized so the derived response pool keeps its buddy tiers (pooled
+// SHM replies) or drops below the minimum buddy segment (dedicated replies).
+fn server_budget(carrier: Carrier) -> DomainBudget {
+    let memory_budget_bytes = match carrier {
+        Carrier::Buddy => 1024 * 1024,
+        Carrier::Dedicated => 224 * 1024,
+        Carrier::File => 64 * 1024,
+        Carrier::Chunked => 512 * 1024,
+        Carrier::Inline => return DomainBudget::from_limits(&DomainLimits::default()),
     };
-    config.base.file_backing_budget_bytes = if carrier == Carrier::File {
-        4 * INPUT_LEN as u64
-    } else {
-        0
-    };
-    config.base.live_reassembly_budget_bytes = 4 * INPUT_LEN as u64;
-    config.shm_threshold = if carrier == Carrier::Inline {
-        64 * 1024
-    } else {
-        1
-    };
-    config.validate().unwrap();
-    config
+    DomainBudget::from_limits(&DomainLimits {
+        memory_budget_bytes,
+        file_spill_budget_bytes: 0,
+        max_outstanding_calls: 64,
+    })
 }
 
 struct Probe {
@@ -139,29 +146,22 @@ impl CrmCallback for Probe {
         if method != 1 || matches!(self.carrier, Carrier::Inline | Carrier::Chunked) {
             return Ok(ResponseMeta::Inline(vec![method as u8; 32]));
         }
+        if self.carrier == Carrier::File {
+            return Ok(ResponseMeta::Inline(vec![1; FILE_REPLY_LEN]));
+        }
         *self.response_pool.lock() = Some(response_pool.clone());
-        if matches!(self.carrier, Carrier::Buddy | Carrier::Dedicated) {
-            let prepared = c2_server::response::try_prepare_shm_response(
-                &response_pool,
-                1,
-                INPUT_LEN,
-                |output| {
-                    output.fill(1);
-                    Ok(())
-                },
-            )
+        let prepared =
+            c2_server::response::try_prepare_shm_response(&response_pool, 1, INPUT_LEN, |output| {
+                output.fill(1);
+                Ok(())
+            })
             .map_err(CrmError::InternalError)?
             .expect("selected SHM response carrier must actually allocate");
-            self.response_kind.store(
-                if prepared.is_dedicated() { 3 } else { 2 },
-                Ordering::SeqCst,
-            );
-            Ok(ResponseMeta::ShmAlloc(prepared))
-        } else {
-            // The server cannot allocate SHM; production framing selects
-            // chunked delivery, whose relay receive owner must use file spill.
-            Ok(ResponseMeta::Inline(vec![1; INPUT_LEN]))
-        }
+        self.response_kind.store(
+            if prepared.is_dedicated() { 3 } else { 2 },
+            Ordering::SeqCst,
+        );
+        Ok(ResponseMeta::ShmAlloc(prepared))
     }
 }
 
@@ -647,7 +647,7 @@ mod early_rejection {
                 assert_eq!(server.bytes.load(Ordering::SeqCst), 4);
                 assert_eq!(bounded(stream.read(&mut [0])).await.unwrap(), 0, "reset after a refusal is a failure");
                 assert_eq!(server.state.forwarding.snapshot().used_operations, 0);
-                assert_eq!(server.state.forwarding.payload_budget().snapshot().used_bytes, 0);
+                assert_eq!(server.state.forwarding.budget().clone().snapshot().memory.used_bytes, 0);
             }).catch_unwind().await;
             server.stop().await;
             if let Err(panic) = result {
@@ -838,17 +838,19 @@ async fn capacity_rejection_case(kind: CapacityRequest) {
             .as_ref()
             .map(|listener| listener.local_addr().unwrap())
             .unwrap_or_else(|| "127.0.0.1:9".parse().unwrap());
-        let state = Arc::new(RelayState::new_with_execution_limits(
+        let state = Arc::new(RelayState::new_with_budget(
             Arc::new(RelayConfig {
                 relay_id: "capacity-http-test".into(),
                 ..RelayConfig::default()
             }),
             Arc::new(NoopDisseminator),
             LocalEndpointContext::default_for_platform().unwrap(),
-            CallExecutionLimits {
+            DomainBudget::from_limits(&DomainLimits {
+                memory_budget_bytes: input_len as u64,
+                file_spill_budget_bytes: 0,
                 max_outstanding_calls: operations,
-                payload_buffer_budget_bytes: input_len as u64,
-            },
+            }),
+            c2_config::IDLE_CONNECTION_TIMEOUT,
         ));
         let entry = RouteEntry {
             name: "grid".into(),
@@ -990,7 +992,7 @@ async fn capacity_rejection_case(kind: CapacityRequest) {
                     let HttpError::ResponseError(status, body) = error.source_error() else {
                         panic!("eager SDK call lost the production capacity response: {error:?}");
                     };
-                    assert_eq!(*status, 502);
+                    assert_eq!(*status, 503);
                     envelope = serde_json::from_slice(body.as_ref()).unwrap();
                     assert_eq!(envelope["code"], 717);
                     assert_eq!(envelope["details"]["dispatch_phase"], "pre_dispatch");
@@ -1009,7 +1011,7 @@ async fn capacity_rejection_case(kind: CapacityRequest) {
             } else if network {
                 let reply = request_capacity_rejection(socket, input_len).await;
                 assert!(
-                    reply.starts_with(b"HTTP/1.1 502 "),
+                    reply.starts_with(b"HTTP/1.1 503 "),
                     "{}",
                     String::from_utf8_lossy(&reply)
                 );
@@ -1088,7 +1090,7 @@ async fn capacity_rejection_case(kind: CapacityRequest) {
                 let response = bounded(app.oneshot(request.body(body).unwrap()))
                     .await
                     .unwrap();
-                assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+                assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
                 if eager {
                     assert_eq!(frames.load(Ordering::SeqCst), input_len / (64 * 1024));
                     assert_eq!(
@@ -1119,7 +1121,16 @@ async fn capacity_rejection_case(kind: CapacityRequest) {
                 state.forwarding.snapshot().used_operations,
                 if freed { 0 } else { 1 }
             );
-            assert_eq!(state.forwarding.payload_budget().snapshot().used_bytes, 0);
+            assert_eq!(
+                state
+                    .forwarding
+                    .budget()
+                    .clone()
+                    .snapshot()
+                    .memory
+                    .used_bytes,
+                0
+            );
             assert!(state.local_route("grid").is_some());
         })
         .catch_unwind()
@@ -1145,7 +1156,16 @@ async fn capacity_rejection_case(kind: CapacityRequest) {
                 .unwrap();
         }
         assert_eq!(state.forwarding.snapshot().used_operations, 0);
-        assert_eq!(state.forwarding.payload_budget().snapshot().used_bytes, 0);
+        assert_eq!(
+            state
+                .forwarding
+                .budget()
+                .clone()
+                .snapshot()
+                .memory
+                .used_bytes,
+            0
+        );
         if let Err(panic) = result {
             std::panic::resume_unwind(panic);
         }
@@ -1239,45 +1259,43 @@ impl Fixture {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let socket = listener.local_addr().unwrap();
         let url = format!("http://{socket}");
-        let state = Arc::new(RelayState::new_with_execution_limits(
+        let state = Arc::new(RelayState::new_with_budget(
             Arc::new(RelayConfig {
                 relay_id: unique_id(),
-                idle_timeout_secs: 0,
                 advertise_url: url.clone(),
-                upstream_ipc: policy(carrier),
                 ..RelayConfig::default()
             }),
             Arc::new(NoopDisseminator),
             LocalEndpointContext::default_for_platform().unwrap(),
-            CallExecutionLimits {
+            DomainBudget::from_limits(&DomainLimits {
+                memory_budget_bytes: bytes,
+                file_spill_budget_bytes: if carrier == Carrier::File {
+                    FILE_REPLY_LEN as u64 + 64
+                } else {
+                    0
+                },
                 max_outstanding_calls: operations,
-                payload_buffer_budget_bytes: bytes,
-            },
+            }),
+            // Drive expiry explicitly in tests that evict an idle connection.
+            Duration::MAX,
         ));
         let id = unique_id();
         let address = format!("ipc://{id}");
         let mut config = ServerIpcConfig::default();
-        config.base = policy(carrier).base;
-        // Chunked requests still receive real backing on the server; only
-        // relay request backing is denied to force the streaming wire path.
-        if carrier == Carrier::Chunked {
-            config.base.file_backing_budget_bytes = 4 * INPUT_LEN as u64;
-        }
         config.max_execution_workers = 4;
-        config.shm_threshold = if matches!(carrier, Carrier::Inline | Carrier::Chunked) {
-            64 * 1024
-        } else {
-            1
-        };
         config.validate().unwrap();
         let server = Arc::new(
-            Server::new_with_identity(
-                &address,
+            Server::new_with_identity_endpoint_and_budget(
+                LocalEndpointContext::default_for_platform()
+                    .unwrap()
+                    .endpoint(&address)
+                    .unwrap(),
                 config,
                 ServerIdentity {
                     server_id: id.clone(),
                     server_instance_id: format!("{id}-instance"),
                 },
+                server_budget(carrier),
             )
             .unwrap(),
         );
@@ -1434,13 +1452,9 @@ enum WithdrawalRequest {
 
 async fn withdrawn_route_during_acquire(request: WithdrawalRequest, pause: WithdrawalPause) {
     const LEN: usize = 32;
-    let mut fixture = Fixture::start_with_input_len(
-        Carrier::Inline,
-        2,
-        2 * forwarding_budget(Carrier::Inline, LEN),
-        LEN,
-    )
-    .await;
+    let mut fixture =
+        Fixture::start_with_input_len(Carrier::Inline, 2, concurrent_forwarding_budget(LEN), LEN)
+            .await;
     let mut resume = None;
     let result = AssertUnwindSafe(async {
         bounded(fixture.state.stop_upstream_controls()).await;
@@ -1631,12 +1645,8 @@ async fn withdrawn_route_during_stream_acquire_preserves_inflight_reply() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn evicted_upstream_preserves_forwarded_reply_and_reconnects_new_request() {
-    let mut fixture = Fixture::start(
-        Carrier::Inline,
-        2,
-        2 * forwarding_budget(Carrier::Inline, INPUT_LEN),
-    )
-    .await;
+    let mut fixture =
+        Fixture::start(Carrier::Inline, 2, concurrent_forwarding_budget(INPUT_LEN)).await;
     let result = AssertUnwindSafe(async {
         let socket = fixture.socket;
         let old_head = fixture.head("target", &format!("Content-Length: {INPUT_LEN}"));
@@ -1839,8 +1849,10 @@ async fn real_http_capacity_freed_during_rejected_upload_never_dispatches() {
             fixture
                 .state
                 .forwarding
-                .payload_budget()
+                .budget()
+                .clone()
                 .snapshot()
+                .memory
                 .used_bytes
                 == 0
         })
@@ -1850,7 +1862,7 @@ async fn real_http_capacity_freed_during_rejected_upload_never_dispatches() {
             .await
             .unwrap();
         let reply = bounded(read_framed_reply(&mut rejected)).await.unwrap();
-        assert!(reply.starts_with(b"HTTP/1.1 502 "));
+        assert!(reply.starts_with(b"HTTP/1.1 503 "));
         let end = reply
             .windows(4)
             .position(|part| part == b"\r\n\r\n")
@@ -1864,8 +1876,10 @@ async fn real_http_capacity_freed_during_rejected_upload_never_dispatches() {
             fixture
                 .state
                 .forwarding
-                .payload_budget()
+                .budget()
+                .clone()
                 .snapshot()
+                .memory
                 .used_bytes,
             0
         );
@@ -1894,36 +1908,47 @@ async fn real_http_capacity_freed_during_rejected_upload_never_dispatches() {
 }
 
 async fn disconnected_response_case(carrier: Carrier, operations: u64) {
-    let bytes = forwarding_budget(carrier, INPUT_LEN);
-    let download_charge = copy_window(carrier);
-    let mut fixture = Fixture::start(carrier, operations, bytes).await;
+    let input_len = if carrier == Carrier::Chunked {
+        CHUNKED_INPUT_LEN
+    } else {
+        INPUT_LEN
+    };
+    let bytes = forwarding_budget(carrier, input_len);
+    let download_charge = download_window(carrier, input_len);
+    let mut fixture = Fixture::start_with_input_len(carrier, operations, bytes, input_len).await;
     let client = fixture.client.clone();
     let binding = fixture.binding.clone();
+    let force_chunk = (carrier == Carrier::Chunked).then(|| {
+        fixture
+            .state
+            .forwarding
+            .budget()
+            .try_reserve_memory(bytes)
+            .unwrap()
+    });
     let mut other = tokio::spawn(async move {
         client
-            .call_bound_phased(&binding, "other", &vec![7; INPUT_LEN])
+            .call_bound_phased(&binding, "other", &vec![7; input_len])
             .await
     });
     let mut other_joined = false;
     let result = AssertUnwindSafe(async {
         bounded(fixture.probe.entered[0].notified()).await;
+        drop(force_chunk);
         let mut upload = bounded(tokio::net::TcpStream::connect(fixture.socket)).await.unwrap();
-        bounded(upload.write_all(fixture.head("target", &format!("Content-Length: {INPUT_LEN}")).as_bytes())).await.unwrap();
-        bounded(upload.write_all(&vec![7; INPUT_LEN])).await.unwrap();
+        bounded(upload.write_all(fixture.head("target", &format!("Content-Length: {input_len}")).as_bytes())).await.unwrap();
+        bounded(upload.write_all(&vec![7; input_len])).await.unwrap();
         bounded(fixture.probe.entered[1].notified()).await;
         let admitted = fixture.state.forwarding.snapshot();
         assert_eq!(admitted.used_operations, 1);
-        eventually(|| fixture.state.forwarding.payload_budget().snapshot().used_bytes == download_charge).await;
-        if carrier == Carrier::File {
-            assert_eq!(fixture.state.upstream_memory_snapshot().reassembly.peak_bytes, 0, "only the later response may charge relay receive reassembly");
-        }
+        eventually(|| fixture.state.forwarding.budget().clone().snapshot().memory.used_bytes == download_charge).await;
         let detached = fixture.state.forwarding.detached_waiters();
         drop(upload); // Real HTTP/1 socket disconnection, after complete upload.
         eventually(|| fixture.state.forwarding.detached_waiters() > detached).await;
-        assert_eq!((fixture.state.forwarding.snapshot().used_operations, fixture.state.forwarding.payload_budget().snapshot().used_bytes), (1, download_charge));
+        assert_eq!((fixture.state.forwarding.snapshot().used_operations, fixture.state.forwarding.budget().clone().snapshot().memory.used_bytes), (1, download_charge));
         assert!(fixture.client.is_connected(), "HTTP waiter drop must preserve original shared IPC incarnation");
-        let rejected = fixture.request_capacity_rejection(INPUT_LEN).await;
-        assert!(rejected.starts_with(b"HTTP/1.1 502 "), "capacity rejects before upstream dispatch: {}", String::from_utf8_lossy(&rejected));
+        let rejected = fixture.request_capacity_rejection(input_len).await;
+        assert!(rejected.starts_with(b"HTTP/1.1 503 "), "capacity rejects before upstream dispatch: {}", String::from_utf8_lossy(&rejected));
         assert!(String::from_utf8_lossy(&rejected).contains("pre_dispatch"));
         assert_eq!(fixture.probe.calls[2].load(Ordering::SeqCst), 0);
         assert!(fixture.state.local_route("grid").is_some(), "capacity or disconnect must not withdraw route");
@@ -1939,26 +1964,25 @@ async fn disconnected_response_case(carrier: Carrier, operations: u64) {
         let other_reply = other_result.unwrap().unwrap();
         assert_eq!(other_reply.into_owned_bytes().unwrap(), vec![0; 32], "already-in-flight other RID must succeed on same IPC client");
         assert!(fixture.client.is_connected());
-        let ping = bounded(fixture.client.call_bound_phased(&fixture.binding, "ping", &[7; INPUT_LEN])).await.unwrap();
+        let ping = bounded(fixture.client.call_bound_phased(&fixture.binding, "ping", &vec![7; input_len])).await.unwrap();
         assert_eq!(ping.into_owned_bytes().unwrap(), vec![2; 32], "same client ping must succeed without reconnect");
         let (lease, _, _) = bounded(fixture.state.acquire_upstream_for_route(&fixture.entry)).await.unwrap_or_else(|_| panic!("same pooled client acquire failed"));
         assert!(Arc::ptr_eq(&lease.client(), &fixture.client), "liveness cannot be masked by reconnecting");
         drop(lease);
-        assert_eq!((fixture.state.forwarding.snapshot().used_operations, fixture.state.forwarding.payload_budget().snapshot().used_bytes), (0, 0));
+        assert_eq!((fixture.state.forwarding.snapshot().used_operations, fixture.state.forwarding.budget().clone().snapshot().memory.used_bytes), (0, 0));
         assert_eq!(fixture.probe.calls.each_ref().map(|c| c.load(Ordering::SeqCst)), [1, 1, 1]);
         if matches!(carrier, Carrier::Buddy | Carrier::Dedicated) {
             assert_eq!(fixture.probe.response_kind.load(Ordering::SeqCst), if carrier == Carrier::Buddy { 2 } else { 3 });
             let pool = fixture.probe.response_pool.lock().as_ref().unwrap().clone();
             eventually(|| pool.read().stats().alloc_count == 0).await;
             if carrier == Carrier::Dedicated {
-                eventually(|| fixture.server.memory_budget_snapshot().budget.shm.used_bytes == 0).await;
+                eventually(|| fixture.server.domain_snapshot().memory.used_bytes == 0).await;
             }
         }
-        let memory = fixture.state.upstream_memory_snapshot();
-        assert_eq!((memory.file.used_bytes, memory.reassembly.used_bytes), (0, 0), "late reply carrier must really release before shutdown");
+        let memory = fixture.state.domain_snapshot();
+        assert_eq!((memory.memory.used_bytes, memory.file_spill.used_bytes), (0, 0), "late reply carrier must really release before shutdown");
         if carrier == Carrier::File {
-            assert!(memory.file.peak_bytes >= INPUT_LEN as u64, "actual late reply must exercise file/reassembly carrier");
-            assert!(memory.reassembly.peak_bytes >= INPUT_LEN as u64);
+            assert_eq!(memory.file_spill.peak_bytes, FILE_REPLY_LEN as u64);
         }
         eprintln!("[relay-forwarding] carrier={carrier:?} limit_operations={operations} detached={} retention={:?} memory={memory:?} callbacks={:?}", fixture.state.forwarding.detached_waiters(), fixture.state.forwarding.snapshot(), fixture.probe.calls.each_ref().map(|c| c.load(Ordering::SeqCst)));
     }).catch_unwind().await;
@@ -2030,17 +2054,17 @@ async fn h1_partial_upload_source_fault_refunds_without_dispatch_or_withdrawal()
             } else {
                 bounded(upload.write_all(&[7; 8])).await.unwrap();
             }
-            let expected_charge = if unknown {
-                8 + 8 + copy_window(Carrier::Inline)
-            } else {
-                2 * INPUT_LEN as u64 + copy_window(Carrier::Inline)
-            };
+            // Both framings admit the input plus both direction windows
+            // atomically; with this fixture's budget that is the whole B.
+            let expected_charge = forwarding_budget(Carrier::Inline, INPUT_LEN);
             eventually(|| {
                 fixture
                     .state
                     .forwarding
-                    .payload_budget()
+                    .budget()
+                    .clone()
                     .snapshot()
+                    .memory
                     .used_bytes
                     == expected_charge
             })
@@ -2096,8 +2120,10 @@ async fn h1_partial_upload_source_fault_refunds_without_dispatch_or_withdrawal()
                 fixture
                     .state
                     .forwarding
-                    .payload_budget()
+                    .budget()
+                    .clone()
                     .snapshot()
+                    .memory
                     .used_bytes,
                 0
             );
@@ -2149,8 +2175,10 @@ async fn h1_unknown_chunk_growth_rejects_before_takeover_and_dispatch() {
             fixture
                 .state
                 .forwarding
-                .payload_budget()
+                .budget()
+                .clone()
                 .snapshot()
+                .memory
                 .used_bytes
                 == 10
         })
@@ -2160,14 +2188,14 @@ async fn h1_unknown_chunk_growth_rejects_before_takeover_and_dispatch() {
             .unwrap();
         let reply = bounded(read_framed_reply(&mut upload)).await.unwrap();
         assert!(
-            reply.starts_with(b"HTTP/1.1 502 "),
+            reply.starts_with(b"HTTP/1.1 503 "),
             "actual incremental capacity rejection: {}",
             String::from_utf8_lossy(&reply)
         );
         assert!(String::from_utf8_lossy(&reply).contains("pre_dispatch"));
         eventually(|| fixture.state.forwarding.snapshot().used_operations == 0).await;
         let retention = fixture.state.forwarding.snapshot();
-        let payload = fixture.state.forwarding.payload_budget().snapshot();
+        let payload = fixture.state.forwarding.budget().clone().snapshot().memory;
         assert_eq!((payload.used_bytes, payload.peak_bytes), (0, 10));
         assert_eq!(retention.rejected_reservations, 0);
         assert!(payload.rejected_allocations > 0);
@@ -2188,43 +2216,62 @@ async fn h1_unknown_chunk_growth_rejects_before_takeover_and_dispatch() {
     }
 }
 
-// Genuine source failure after a complete first IPC chunk is distinct from a
-// detached waiter with complete input. The native transport may legitimately
-// abort this incomplete shared stream; no test fills in the missing chunk.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn h1_chunked_upstream_source_fault_is_dispatch_uncertain_and_reclaims_actual_owner() {
-    let fixture = Fixture::start(
+async fn h1_chunked_source_fault_reclaims_the_published_ipc_transaction() {
+    let length = CHUNKED_INPUT_LEN;
+    let fixture = Fixture::start_with_input_len(
         Carrier::Chunked,
         1,
-        forwarding_budget(Carrier::Chunked, INPUT_LEN),
+        forwarding_budget(Carrier::Chunked, length),
+        length,
     )
     .await;
     let result = AssertUnwindSafe(async {
-        assert_eq!(fixture.server.memory_budget_snapshot().budget.reassembly.used_bytes, 0);
         let before_faults = fixture.state.forwarding.published_source_faults();
-        let mut upload = bounded(tokio::net::TcpStream::connect(fixture.socket)).await.unwrap();
-        bounded(upload.write_all(fixture.head("target", &format!("Content-Length: {INPUT_LEN}")).as_bytes())).await.unwrap();
-        bounded(upload.write_all(&[7; INPUT_LEN / 2])).await.unwrap();
-        // This charge belongs to the real server ChunkRegistry. It can only
-        // exist after the first actual IPC chunk reaches the upstream reader.
-        eventually(|| fixture.server.memory_budget_snapshot().budget.reassembly.used_bytes == INPUT_LEN as u64 + 2).await;
+        let mut upload = bounded(tokio::net::TcpStream::connect(fixture.socket))
+            .await
+            .unwrap();
+        bounded(
+            upload.write_all(
+                fixture
+                    .head("target", &format!("Content-Length: {length}"))
+                    .as_bytes(),
+            ),
+        )
+        .await
+        .unwrap();
+        bounded(upload.write_all(&vec![7; length / 2]))
+            .await
+            .unwrap();
+        // Only a real received OPEN creates an upstream reassembly backing.
+        eventually(|| fixture.server.domain_snapshot().memory.used_bytes >= length as u64).await;
         assert_eq!(fixture.probe.calls[1].load(Ordering::SeqCst), 0);
-        assert_eq!((fixture.state.forwarding.snapshot().used_operations, fixture.state.forwarding.payload_budget().snapshot().used_bytes), (1, forwarding_budget(Carrier::Chunked, INPUT_LEN)));
+        assert_eq!(fixture.state.forwarding.snapshot().used_operations, 1);
+
         bounded(upload.shutdown()).await.unwrap();
         let mut wire_reply = Vec::new();
         if let Err(error) = bounded(upload.read_to_end(&mut wire_reply)).await {
-            assert!(matches!(error.kind(), std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted | std::io::ErrorKind::UnexpectedEof), "unexpected H1 fault observation: {error}");
+            assert!(
+                matches!(
+                    error.kind(),
+                    std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::ConnectionAborted
+                        | std::io::ErrorKind::UnexpectedEof
+                ),
+                "unexpected HTTP fault: {error}"
+            );
         }
-        eventually(|| fixture.state.forwarding.published_source_faults() == before_faults + 1).await;
+        eventually(|| fixture.state.forwarding.published_source_faults() == before_faults + 1)
+            .await;
         eventually(|| fixture.state.forwarding.snapshot().used_operations == 0).await;
-        assert_eq!(fixture.state.forwarding.payload_budget().snapshot().used_bytes, 0);
-        assert_eq!(fixture.probe.calls[1].load(Ordering::SeqCst), 0, "incomplete input must not invoke resource");
-        assert!(fixture.state.local_route("grid").is_some(), "real transport fault must not withdraw route");
-        assert!(!fixture.client.is_connected(), "incomplete published IPC transaction uses real connection failure, not deadline cancellation");
-        eventually(|| fixture.server.memory_budget_snapshot().budget.reassembly.used_bytes == 0).await;
-        assert_eq!(fixture.server.memory_budget_snapshot().budget.file.used_bytes, 0);
-        eprintln!("[relay-forwarding] actual first-chunk source failure dispatch_uncertain={} retention={:?} server={:?} HTTP={}", fixture.state.forwarding.published_source_faults(), fixture.state.forwarding.snapshot(), fixture.server.memory_budget_snapshot(), String::from_utf8_lossy(&wire_reply));
-    }).catch_unwind().await;
+        eventually(|| fixture.state.domain_snapshot().memory.used_bytes == 0).await;
+        assert_eq!(fixture.probe.calls[1].load(Ordering::SeqCst), 0);
+        assert!(fixture.state.local_route("grid").is_some());
+        assert!(!fixture.client.is_connected());
+        eventually(|| fixture.server.domain_snapshot().memory.used_bytes == 0).await;
+    })
+    .catch_unwind()
+    .await;
     fixture.stop().await;
     if let Err(panic) = result {
         std::panic::resume_unwind(panic);
@@ -2281,13 +2328,13 @@ async fn disconnect_during_ipc_write_preserves_same_client(pause_point: WriterPa
         eventually(|| fixture.state.forwarding.detached_waiters() > before).await;
         let held = fixture.state.forwarding.snapshot();
         assert_eq!(held.used_operations, 1);
-        let held_payload = fixture.state.forwarding.payload_budget().snapshot();
+        let held_payload = fixture.state.forwarding.budget().clone().snapshot().memory;
         assert_eq!(held_payload.used_bytes, 2 * LEN as u64, "upload and download windows stay charged while the native writer is parked");
         assert_eq!(held_payload.peak_bytes, 3 * LEN as u64, "input and both direction windows are atomically charged under B");
         assert_eq!(fixture.client.pending_len_for_test(), 2);
         assert!(fixture.client.is_connected(), "waiter departure must preserve the started IPC write");
         let rejected = fixture.request_capacity_rejection(LEN).await;
-        assert!(rejected.starts_with(b"HTTP/1.1 502 "));
+        assert!(rejected.starts_with(b"HTTP/1.1 503 "));
         assert!(String::from_utf8_lossy(&rejected).contains("pre_dispatch"));
         assert_eq!(fixture.probe.calls[2].load(Ordering::SeqCst), 0, "exhausted slot rejects dispatch while target owner remains");
         fixture.release(0);
@@ -2295,16 +2342,16 @@ async fn disconnect_during_ipc_write_preserves_same_client(pause_point: WriterPa
         other_joined = true;
         assert_eq!(other_result.unwrap().unwrap().into_owned_bytes().unwrap(), vec![0; 32], "already-dispatched RID must finish before the target writer resumes");
         assert!(fixture.client.is_connected());
-        assert_eq!((fixture.state.forwarding.snapshot().used_operations, fixture.state.forwarding.payload_budget().snapshot().used_bytes), (1, 2 * LEN as u64));
+        assert_eq!((fixture.state.forwarding.snapshot().used_operations, fixture.state.forwarding.budget().clone().snapshot().memory.used_bytes), (1, 2 * LEN as u64));
         write_release.take().unwrap().send(()).unwrap();
         bounded(fixture.probe.entered[1].notified()).await;
-        eventually(|| fixture.state.forwarding.payload_budget().snapshot().used_bytes == LEN as u64).await;
+        eventually(|| fixture.state.forwarding.budget().clone().snapshot().memory.used_bytes == LEN as u64).await;
         assert_eq!(fixture.state.forwarding.snapshot().used_operations, 1, "reply is still blocked with only its download window charged");
         assert_eq!(fixture.probe.calls[1].load(Ordering::SeqCst), 1, "complete input reaches real upstream callback once after the writer resumes");
         fixture.release(1);
         eventually(|| fixture.state.forwarding.snapshot().used_operations == 0).await;
         eventually(|| fixture.client.pending_len_for_test() == 0).await;
-        assert_eq!(fixture.state.forwarding.payload_budget().snapshot().used_bytes, 0);
+        assert_eq!(fixture.state.forwarding.budget().clone().snapshot().memory.used_bytes, 0);
         let ping = bounded(fixture.client.call_bound_phased(&fixture.binding, "ping", &[7; LEN])).await.unwrap();
         assert_eq!(ping.into_owned_bytes().unwrap(), vec![2; 32]);
         let current = fixture.state.local_route("grid").expect("HTTP disconnect must not withdraw route");
@@ -2313,7 +2360,7 @@ async fn disconnect_during_ipc_write_preserves_same_client(pause_point: WriterPa
         assert!(Arc::ptr_eq(&lease.client(), &fixture.client), "same-client ping cannot be concealed by reconnecting");
         drop(lease);
         assert_eq!(fixture.probe.calls.each_ref().map(|calls| calls.load(Ordering::SeqCst)), [1, 1, 1]);
-        assert_eq!(fixture.state.upstream_memory_snapshot().reassembly.used_bytes, 0);
+        assert_eq!(fixture.state.domain_snapshot().memory.used_bytes, 0);
         let bytes_written_before_pause = match pause_point {
             WriterPausePoint::BeforeFirstByte => 0,
             WriterPausePoint::AfterEightBytePrefix => 8,
@@ -2351,7 +2398,7 @@ async fn unary_body_last_bytes_reference_refunds_download_window() {
     const LEN: usize = 32;
     let mut fixture = Fixture::start_with_input_len(Carrier::Inline, 1, 3 * LEN as u64, LEN).await;
     fixture.release(1);
-    let budget = fixture.state.forwarding.payload_budget();
+    let budget = fixture.state.forwarding.budget().clone();
     let result = AssertUnwindSafe(async {
         let mut request = axum::http::Request::builder()
             .method("POST")
@@ -2369,8 +2416,8 @@ async fn unary_body_last_bytes_reference_refunds_download_window() {
         .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(response.headers()["content-length"], LEN.to_string());
-        assert_eq!(fixture.state.forwarding.snapshot().used_operations, 0);
-        assert_eq!(budget.snapshot().used_bytes, LEN as u64);
+        assert_eq!(fixture.state.forwarding.snapshot().used_operations, 1);
+        assert_eq!(budget.snapshot().memory.used_bytes, LEN as u64);
         let mut body = response.into_body().into_data_stream();
         let bytes = bounded(body.next()).await.unwrap().unwrap();
         assert_eq!(bytes.as_ref(), &[1; LEN]);
@@ -2379,20 +2426,22 @@ async fn unary_body_last_bytes_reference_refunds_download_window() {
         drop(bytes);
         assert!(bounded(body.next()).await.is_none());
         drop(body);
+        assert_eq!(fixture.state.forwarding.snapshot().used_operations, 1);
         assert_eq!(
-            budget.snapshot().used_bytes,
+            budget.snapshot().memory.used_bytes,
             LEN as u64,
             "completed Body must leave its copied storage charged to surviving Bytes"
         );
         drop(clone);
         assert_eq!(
-            budget.snapshot().used_bytes,
+            budget.snapshot().memory.used_bytes,
             LEN as u64,
             "a slice retains the complete original allocation"
         );
         drop(slice);
+        assert_eq!(fixture.state.forwarding.snapshot().used_operations, 0);
         assert_eq!(
-            budget.snapshot().used_bytes,
+            budget.snapshot().memory.used_bytes,
             0,
             "the final Bytes reference refunds its unique reservation"
         );
@@ -2422,13 +2471,9 @@ async fn h1_disconnect_after_real_eight_byte_ipc_prefix_preserves_same_client() 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn eviction_during_ipc_frame_write_finishes_old_http_reply_and_reconnects() {
     const LEN: usize = 32;
-    let mut fixture = Fixture::start_with_input_len(
-        Carrier::Inline,
-        2,
-        2 * forwarding_budget(Carrier::Inline, LEN),
-        LEN,
-    )
-    .await;
+    let mut fixture =
+        Fixture::start_with_input_len(Carrier::Inline, 2, concurrent_forwarding_budget(LEN), LEN)
+            .await;
     let (acquired_tx, acquired_rx) = oneshot::channel();
     let (resume_tx, resume_rx) = oneshot::channel();
     let mut resume = Some(resume_tx);
@@ -2555,10 +2600,12 @@ async fn h1_admitted_unknown_upload_can_finish_after_operation_admission_closes(
             fixture
                 .state
                 .forwarding
-                .payload_budget()
+                .budget()
+                .clone()
                 .snapshot()
+                .memory
                 .used_bytes
-                == 8 + 8 + copy_window(Carrier::Inline)
+                == forwarding_budget(Carrier::Inline, INPUT_LEN)
         })
         .await;
         assert_eq!(fixture.state.forwarding.snapshot().used_operations, 1);
@@ -2593,10 +2640,12 @@ async fn h1_admitted_unknown_upload_can_finish_after_operation_admission_closes(
             fixture
                 .state
                 .forwarding
-                .payload_budget()
+                .budget()
+                .clone()
                 .snapshot()
+                .memory
                 .used_bytes
-                == copy_window(Carrier::Inline)
+                == download_window(Carrier::Inline, INPUT_LEN)
         })
         .await;
         fixture.release(1);
@@ -2607,16 +2656,18 @@ async fn h1_admitted_unknown_upload_can_finish_after_operation_admission_closes(
             String::from_utf8_lossy(&reply)
         );
         bounded(fixture.state.forwarding.drain()).await;
-        eventually(|| fixture.state.forwarding.payload_budget().snapshot().used_bytes == 0).await;
+        eventually(|| fixture.state.forwarding.budget().clone().snapshot().memory.used_bytes == 0).await;
         let refunded = fixture.state.forwarding.snapshot();
-        let refunded_payload = fixture.state.forwarding.payload_budget().snapshot();
+        let refunded_payload = fixture.state.forwarding.budget().clone().snapshot().memory;
         assert_eq!(
             (
                 refunded.used_operations,
                 refunded_payload.used_bytes,
                 refunded_payload.peak_bytes
             ),
-            (0, 0, 2 * INPUT_LEN as u64 + copy_window(Carrier::Inline))
+            // First-segment admission reserves input and both direction
+            // windows atomically, which under B is the whole budget.
+            (0, 0, forwarding_budget(Carrier::Inline, INPUT_LEN))
         );
         assert_eq!(
             fixture.state.forwarding.source_faults(true),

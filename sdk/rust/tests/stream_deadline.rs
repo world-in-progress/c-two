@@ -60,13 +60,16 @@ fn decode(response: HeldResponse) -> Result<u8, Error> {
 #[test]
 fn typed_item_decoder_does_not_escape_the_original_iteration_deadline() {
     let runtime = Runtime::new(RuntimeOptions {
-        server_id: Some(format!("rust-stream-decoder-{}", std::process::id())),
         use_process_relay_anchor: false,
         ..Default::default()
     })
     .unwrap();
     let host = runtime
-        .host(HostOptions::default().without_relay())
+        .host(
+            HostOptions::default()
+                .without_relay()
+                .with_server_id(format!("rust-stream-decoder-{}", std::process::id())),
+        )
         .unwrap();
     let release = ContractRelease::from_descriptor_json(DESCRIPTOR).unwrap();
     let route = "decoder";

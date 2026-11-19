@@ -69,7 +69,7 @@ finally:
 
 `cc.hold(echo.echo)(source)` 将响应保留为 `HeldResult`，它持有一份本地副本：复制完成后传输内存就已释放，所以 hold 不会占住服务端的共享内存。显式 `release()` 让载荷所有者失效一次，再释放本地副本；失效操作不会重放，此后该值不可访问。如果导出被拒绝，先释放额外导出的 memoryview 再重试；拒绝发生在失效操作之前。手工构造的 `HeldResult(release_cb=...)` 回调仍只运行一次。常规作用域使用 `with cc.hold(method)(args) as held`，需要超出作用域存活的值应实体化。
 
-`cc.observe.memory_stats()['holds']` 统计这些本地副本：`active_holds`、`total_held_bytes`（逻辑字节，不是 SHM 容量）、`oldest_hold_seconds` 与 `by_direction`。backing、重组与载荷缓冲预算的各项及其核算边界见[内存策略](memory-policy.md#statistics-and-payload-lifetime)。
+`cc.observe.memory_stats()['holds']` 统计这些本地副本：`active_holds`、`total_held_bytes`（逻辑字节，不是 SHM 容量）、`oldest_hold_seconds` 与 `by_direction`。各角色的内存和文件溢出预算及其核算边界见[内存策略](memory-policy.md#statistics-and-payload-lifetime)。
 
 ## 远程连接与截止时间
 
@@ -88,7 +88,7 @@ finally:
 
 连接的 `timeout` 是以秒为单位的单一预算，覆盖连接池等待、操作系统连接、握手、当前路由查找和 relay 获取。省略或传入 `None` 不设置调用方截止时间；零会立即过期。给了 `timeout` 时，它取代操作系统连接与握手各自固定的 5 秒守卫，命名空间门锁或命名管道的等待也以它为限；不给时保留这些守卫。负数和非有限值会被拒绝。过期时抛出 `CallDeadlineExceeded`，包含 `operation=connect`、`transport_phase=pre_dispatch` 及失败的 `stage`；资源方法尚未执行。
 
-业务调用的等待独立于连接等待。`cc.with_call_options` 返回现有连接的视图；其超时不会成为资源方法参数。调用截止时间可能在分派后结束调用方等待，此时原生任务仍持有输入直到完成。它不会取消正在运行的资源方法，也不允许重放。直接 IPC 默认无限等待；HTTP 使用已配置的逻辑调用预算。同进程同步调用接受继承的等待上限或无限等待。默认值和有限调用准入限制见[配置](configuration.zh-CN.md#调用等待与准入)。
+业务调用的等待独立于连接等待。`cc.with_call_options` 返回现有连接的视图；其超时不会成为资源方法参数。调用截止时间可能在分派后结束调用方等待，此时原生任务仍持有输入直到完成。它不会取消正在运行的资源方法，也不允许重放。直接 IPC 和 relay HTTP 默认均无限等待。同进程同步调用接受继承的等待上限或无限等待。默认值和在途调用准入限制见[配置](configuration.zh-CN.md#调用等待与准入)。
 
 连接跟随路由名。C-Two 已经知道它所服务的那次注册不在了时（服务进程结束，或者之前的调用因路由不存在、已撤下、已关闭或契约不同而在派发前被拒），下一次调用在自己的截止时间内按名字重新获取路由，发往当前的注册：直接 IPC 回到原地址，经 relay 的连接通过 relay 锚点重新解析，可能在本地 IPC 与 relay 之间切换，显式 relay 连接仍走 HTTP。只能从这次调用自己的拒绝得知变化时，这次调用在派发前失败、可以安全重试，下一次调用才跟过去。同进程连接在注册被注销后也一样：下一次调用发往这个名字新的本地注册，或者经 relay 发往远程的注册；注册还在时，调用直接进入资源。服务这个名字的进程负责状态的延续；要让调用方察觉状态变了，就换一个名字。身份与协议的拒绝不会引起重新获取。
 
@@ -105,7 +105,7 @@ session = RuntimeSession(server_id='local-host', use_process_relay_anchor=False)
 server = session.ensure_server_bridge()
 ```
 
-会话拥有身份、IPC 覆盖值和 relay 配置。`Server(runtime_session, ...)` 不再接受 `bind_address`、`ipc_overrides`、`server_id` 或 `server_instance_id`；注册、注销及关闭也不再接受替换会话或按操作指定的 relay anchor。独立会话应显式配置，而非继承 Python 进程设置。`start()` 不接受超时参数；`shutdown(timeout=...)` 保留 Core 拥有的截止时间及完成结果。Host 用完后通过 `shutdown()` 关闭桥接对象。
+`Server(runtime_session, ...)` 使用给定会话的 Host 设置，包括服务端身份、容量及 relay 配置。注册、注销和关闭均使用该会话。请显式配置独立会话。`start()` 不接受超时参数，`shutdown(timeout=...)` 观察 Core 的关闭回执。Host 用完后调用 `shutdown()`。
 
 ## 载荷生命周期
 
@@ -161,7 +161,7 @@ with cc.connect(Simulation, name='basin', address='ipc://resource-process') as s
 
 生成器的每一次 `next()` 是一个资源推进：只在推进期间持有路由许可与 GIL，经 IPC 时还持有一个执行 worker，条目之间什么都不占。一条流开始时复制一次 context，建立生成器、每次 `next()` 与最后的 `close()` 都在这一个 context 里运行，所以生成器里设置的 `contextvars` 与 `decimal` context 跨 worker 跟着它走，也不会漏进 worker 自己的 context。经 IPC 时每条条目在它的推进里编码，生成器 yield 之后可以复用或修改同一个对象；在同一进程里，消费方拿到的就是 yield 出来的那个对象。借用的输入（`input_lifetime='borrowed'`）一直有效，到生成器关闭之后才先失效、再释放。
 
-调用返回一个 `cc.Stream`，迭代得到解码后的条目。离开 `with` 块或丢弃这个对象会取消它，不等待。`close(timeout=30.0)` 在流还在运行时先取消，再等原调用结束：`None` 一直等，`0` 只观察一次。它返回一个 dict，含 `completed`、`error` 与 `complete_items`；`completed` 为 False 时清理还在进行，之后可以再调用 `close()` 观察。`error` 是这条流结束时的异常，自然结束时为 `None`；服务端或 relay 结束的流报 `CallCancelled`，消息写明是 shutdown、注销还是 relay 关闭。`cc.hold(sim.steps)(parameters)` 返回由 `HeldResult` 组成的流，每条各自保留本地副本直到释放；多份 hold 可以同时存在，用满载荷缓冲预算时，下一条等到某一份释放。`cc.with_call_options` 给的截止时间涵盖整条迭代，不为每条重置；到期只结束调用方的等待。每条流占一个 `max_outstanding_calls` 名额，直到它的真实终态。
+调用返回一个 `cc.Stream`，迭代得到解码后的条目。离开 `with` 块或丢弃这个对象会取消它，不等待。`close(timeout=30.0)` 在流还在运行时先取消，再等原调用结束：`None` 一直等，`0` 只观察一次。它返回一个 dict，含 `completed`、`error` 与 `complete_items`；`completed` 为 False 时清理还在进行，之后可以再调用 `close()` 观察。`error` 是这条流结束时的异常，自然结束时为 `None`；服务端或 relay 结束的流报 `CallCancelled`，消息写明是 shutdown、注销还是 relay 关闭。`cc.hold(sim.steps)(parameters)` 返回由 `HeldResult` 组成的流，每条各自保留本地副本直到释放；多份 hold 可以同时存在，用满客户端域的内存预算时，下一条等到某一份释放。`cc.with_call_options` 给的截止时间涵盖整条迭代，不为每条重置；到期只结束调用方的等待。每条流占一个 `max_outstanding_calls` 名额，直到它的真实终态。
 
 在注册资源的进程里，流直接传递 yield 出来的对象，不编码，按路由自己的并发限制推进；有限的调用截止时间在派发前被拒绝。经 IPC 时，Python 与 Rust 的资源和客户端可以互相开流；经 relay 时它们经 HTTP 开流，`cc.Stream`、`close` 与 hold 的行为相同。经 relay 时，消费方停止读取后，资源最多还能多推进 HTTP 与 TCP 缓冲装得下的那么多条，小条目可达数千条。推进、取消与 shutdown 见 [Runtime 生命周期](runtime-lifecycle.md#execution-admission)。
 
@@ -190,8 +190,8 @@ use fastdb::Payload;
 
 - 编写契约：`@cc.crm`、`@cc.read`、`@cc.write`、`@cc.on_shutdown`、`@cc.transfer`、`cc.hold`
 - 调用：`cc.with_call_options`（按调用设置截止时间的视图，见[远程连接与截止时间](#远程连接与截止时间)）
-- Runtime：`cc.Runtime`，其实例方法包括 `set_local_endpoint`、`set_server`、`set_client`、`set_transport_policy`、`set_relay_anchor`、`set_call_execution_limits`、`register`、`connect`、`unregister`、`start`、`server_id`、`server_address`、`server_credential`、`local_endpoint_context`、`shutdown`、`connection_events`、`lifecycle_snapshot`、`shutdown_outcome`、`memory_stats` 和 `call_execution_snapshot`
-- 默认 Runtime：`cc.register`、`cc.connect`、`cc.unregister`、`cc.serve`、`cc.shutdown`、`cc.server_address`、`cc.endpoint.server_credential`、`cc.set_server`、`cc.set_client`、`cc.set_relay_anchor`、`cc.set_transport_policy`、`cc.endpoint.set_local_endpoint`；`cc.close(proxy)` 跟随代理自身的连接
+- Runtime：`cc.Runtime`，其实例方法包括 `set_local_endpoint`、`set_server`、`set_client`、`set_relay_anchor`、`register`、`connect`、`unregister`、`start`、`server_id`、`server_address`、`server_credential`、`local_endpoint_context`、`shutdown`、`connection_events`、`lifecycle_snapshot`、`shutdown_outcome`、`memory_stats` 和 `call_execution_snapshot`
+- 默认 Runtime：`cc.register`、`cc.connect`、`cc.unregister`、`cc.serve`、`cc.shutdown`、`cc.server_address`、`cc.endpoint.server_credential`、`cc.set_server`、`cc.set_client`、`cc.set_relay_anchor`、`cc.endpoint.set_local_endpoint`；`cc.close(proxy)` 跟随代理自身的连接
 - 契约：`cc.contract.export_descriptor`、`cc.contract.release_ref`、`cc.contract.compile_artifacts`、`cc.contract.diagnostics`
 - 端点维护：`cc.endpoint.inspect_endpoint`、`cc.endpoint.reap_endpoint`、`cc.endpoint.sweep_endpoints`、`cc.endpoint.EndpointCredential`（不可变的原生值；显式 JSON 导入/导出）
 - 连接观察：`cc.observe.connection_observation`、`cc.observe.connection_events`、`cc.observe.ConnectionObservation`、`cc.observe.ConnectionClosed`、`cc.observe.ConnectionEvent`、`cc.observe.ConnectionEvents`、`cc.observe.ConnectionEventsLagged`
@@ -202,7 +202,19 @@ use fastdb::Payload;
 
 监听器达到 Ready 后，`cc.endpoint.server_credential() -> cc.endpoint.EndpointCredential | None` 从现有生命周期观察器返回其原生凭据，无需检查或文件系统 I/O。启动前以及终止关闭后返回 `None`；快照不能证明服务仍存活，也不能授予清理权限。参见[生命周期指南](local-endpoint-lifecycle.md#exact-cleanup-and-bounded-sweeps)。
 
-Runtime 范围内的 IPC 策略、调用准入限制及 relay 设置见[配置指南](configuration.zh-CN.md)。
+`set_client` 设置出站角色域的容量，`set_server` 设置入站角色域的容量和 Host 参数。每次调用仅修改显式传入的字段。下面的第二次调用保留第一次设置的内存和调用槽上限，第三次调用清除调用槽覆盖，恢复环境或推导值。
+
+```python
+cc.set_client(memory_budget_bytes=128 * 1024**2, max_outstanding_calls=128)
+cc.set_client(file_spill_budget_bytes=0)
+cc.set_client(max_outstanding_calls=None)
+
+memory = cc.observe.memory_stats()
+calls = cc.observe.call_execution_snapshot()
+print(memory["client"]["memory"], calls["server"]["used_operations"])
+```
+
+快照可在启动或连接前读取。未激活角色的字节计数和调用槽计数返回 `None`，观察不会激活角色。冻结后仍可提交有效值相同的更新，改变有效值会报 `CoreError.lifecycle_kind == 'config_frozen'`。见[角色域配置](configuration.zh-CN.md#角色域与-sdk-配置)和[诊断字段](memory-policy.md#statistics-and-payload-lifetime)。
 
 [生命周期 API 指南](local-endpoint-lifecycle.md)规定观察返回值、超时/结束/滞后行为以及错误结果。其中的[绑定/连接章节](local-endpoint-lifecycle.md#bind-and-connect-failures)记录公共 `cc.error.CoreError` 上的结构化操作系统字段。这些观察不能证明进程退出，也不能授权重放或清理。
 
@@ -235,8 +247,7 @@ import c_two as cc
 
 # Server side
 cc.set_relay_anchor('http://relay-host:8080')
-cc.set_transport_policy(shm_threshold=64 * 1024)
-cc.set_server(ipc_overrides={'pool_segment_size': 2 * 1024 * 1024 * 1024})
+cc.set_server(server_id='my_server', memory_budget_bytes=256 * 1024**2)
 cc.register(Grid, grid_instance, name='grid')
 cc.register(Network, net_instance, name='network')
 cc.serve()
@@ -247,7 +258,7 @@ grid.some_method(arg)
 cc.close(grid)
 
 # Client side, direct IPC
-cc.set_client(ipc_overrides={'pool_segment_size': 2 * 1024 * 1024 * 1024})
+cc.set_client(memory_budget_bytes=128 * 1024**2, max_outstanding_calls=128)
 grid = cc.connect(Grid, name='grid', address='ipc://my_server')
 grid.some_method(arg)
 cc.close(grid)
@@ -265,7 +276,7 @@ cc.shutdown()
 
 ### 独立的 Python Runtime
 
-`cc.Runtime()` 在一个原生会话之上创建独立的 Python 绑定。它的 `set_*`、`register`、`connect`、`unregister` 和 `shutdown` 方法与模块级函数签名相同。模块函数使用另一个默认 Runtime。每个显式实例的代码覆盖值初始为空；进程环境和 `.env` 仍是共享配置来源，由 Core 在通常的冻结点解析。不同 Runtime 需要不同设置时，使用各自的实例 setter。独立性意味着在同一进程内分别拥有路由、连接、观察及配置。
+`cc.Runtime()` 在一个原生会话之上创建独立的 Python 绑定。它的 `set_*`、`register`、`connect`、`unregister` 和 `shutdown` 方法与模块级函数签名相同。模块函数使用另一个默认 Runtime。每个显式实例的代码覆盖值初始为空；进程环境和 `.env` 仍是共享配置来源，由 Core 在各角色激活时各解析一次。不同 Runtime 需要不同设置时，使用各自的实例 setter。独立性意味着在同一进程内分别拥有路由、连接、观察及配置。
 
 `runtime.start()` 启动未注册 CRM 的 Host，并等待原生就绪及现有 IPC PING/PONG。随后 `runtime.register()` 使用该 Host。没有显式地址时，`runtime.connect()` 仅搜索该实例的本地路由；跨实例 IPC 调用应使用 `address=other.server_address()`，并采用相同的 Unix 端点上下文。`cc.close(proxy)`、代理的上下文管理器、`cc.hold()` 和 `cc.with_call_options()` 均跟随创建该代理的 Runtime。显式实例没有 `serve()` 方法，也没有自动信号或 atexit 清理；`cc.serve()` 处理模块级默认 Runtime。
 
@@ -277,4 +288,4 @@ cc.shutdown()
 
 传给远程 `connect()` 的截止时间也约束 SDK 最终发布检查。若原截止时间在发布前到期，connect 抛出对应的截止时间错误，仅释放自身的逻辑客户端，且不重试。其他情况下成功的连接继续正常复用其池化客户端。`runtime_retired` 生命周期错误没有 I/O 原因。仅使用 HTTP 不会创建 IPC 池，shutdown 也不保证每个 HTTP keepalive 套接字都已物理关闭。Rust 底层 Host 的关闭/重启生命周期仍独立且可重启；永久退役仅适用于 Python SDK Runtime 作用域。
 
-完成交接后，已配置的端点选择、传输策略、调用限制和 relay 覆盖值保留现有交接行为，而服务端身份、IPC 覆盖值和启动超时会重置。现有的 `connection_events()` 订阅只观察原会话；新会话需要重新订阅。返回值是正在关闭的会话的结果；已保留的载荷继续遵循自身的生命周期。应用拥有自己创建的任何自定义端点目录；Runtime 不会移除该目录。[预检示例](../../examples/python/independent_runtime.py)在删除新建的私有目录前检查关闭结果。
+只有 `completed=True` 时才交接会话。交接原子移交客户端与服务端的显式覆盖，包括 `server_id` 和 `startup_timeout`，并保留 `retired` 与 `holds` 中的实际占用。 现有的 `connection_events()` 订阅只观察原会话；新会话需要重新订阅。返回值是正在关闭的会话的结果；已保留的载荷继续遵循自身的生命周期。应用拥有自己创建的任何自定义端点目录；Runtime 不会移除该目录。[预检示例](../../examples/python/independent_runtime.py)在删除新建的私有目录前检查关闭结果。

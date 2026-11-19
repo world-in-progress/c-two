@@ -1,6 +1,6 @@
 //! Relay-aware HTTP client with acquisition-time route selection.
 
-use c2_mem::retention::{BudgetedBuffer, PayloadBufferBudget, PayloadBufferReservation};
+use c2_mem::{BudgetedBuffer, DomainBudget, MemoryReservation};
 use std::net::IpAddr;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -72,17 +72,11 @@ impl std::error::Error for HttpCallError {
 #[derive(Debug, Clone, Copy)]
 pub struct RelayAwareClientConfig {
     pub max_attempts: usize,
-    pub call_timeout_secs: f64,
-    pub remote_payload_chunk_size: u64,
 }
 
 impl Default for RelayAwareClientConfig {
     fn default() -> Self {
-        Self {
-            max_attempts: 3,
-            call_timeout_secs: 300.0,
-            remote_payload_chunk_size: c2_config::DEFAULT_REMOTE_PAYLOAD_CHUNK_SIZE,
-        }
+        Self { max_attempts: 3 }
     }
 }
 
@@ -114,7 +108,7 @@ impl RelayResolvedTarget {
 }
 
 pub struct RelayAwareHttpClient {
-    payload_budget: PayloadBufferBudget,
+    payload_budget: DomainBudget,
     control: Arc<RelayControlClient>,
     pool: &'static HttpClientPool,
     expected: ExpectedRouteContract,
@@ -134,8 +128,25 @@ impl RelayAwareHttpClient {
         use_proxy: bool,
         config: RelayAwareClientConfig,
     ) -> Result<Self, HttpError> {
+        Self::new_with_budget(
+            relay_url,
+            expected,
+            use_proxy,
+            config,
+            DomainBudget::from_limits(&c2_config::DomainLimits::default()),
+        )
+    }
+
+    /// Use the caller's role domain for calls and HTTP probe errors.
+    pub fn new_with_budget(
+        relay_url: &str,
+        expected: ExpectedRouteContract,
+        use_proxy: bool,
+        config: RelayAwareClientConfig,
+        budget: DomainBudget,
+    ) -> Result<Self, HttpError> {
         let control = Arc::new(RelayControlClient::new(relay_url, use_proxy)?);
-        Self::new_with_control(control, expected, use_proxy, config)
+        Self::new_with_control_and_budget(control, expected, use_proxy, config, budget)
     }
 
     pub fn new_with_control(
@@ -144,14 +155,29 @@ impl RelayAwareHttpClient {
         use_proxy: bool,
         config: RelayAwareClientConfig,
     ) -> Result<Self, HttpError> {
+        Self::new_with_control_and_budget(
+            control,
+            expected,
+            use_proxy,
+            config,
+            DomainBudget::from_limits(&c2_config::DomainLimits::default()),
+        )
+    }
+
+    /// Use a shared control client and the caller's role domain.
+    pub fn new_with_control_and_budget(
+        control: Arc<RelayControlClient>,
+        expected: ExpectedRouteContract,
+        use_proxy: bool,
+        config: RelayAwareClientConfig,
+        budget: DomainBudget,
+    ) -> Result<Self, HttpError> {
         c2_contract::validate_expected_route_contract(&expected)
             .map_err(|err| HttpError::InvalidInput(err.to_string()))?;
         // HTTP construction must not require a local logon SID or resolve an IPC
         // root. Local selection derives the platform default lazily.
         Ok(Self {
-            payload_budget: PayloadBufferBudget::new(
-                c2_config::DEFAULT_PAYLOAD_BUFFER_BUDGET_BYTES,
-            ),
+            payload_budget: budget,
             local_endpoint_context: None,
             default_local_endpoint_context: OnceLock::new(),
             http_only: false,
@@ -163,12 +189,6 @@ impl RelayAwareHttpClient {
             config,
             current: Mutex::new(None),
         })
-    }
-
-    /// Use the Runtime's one payload domain for calls and HTTP probe errors.
-    pub fn with_payload_buffer_budget(mut self, budget: PayloadBufferBudget) -> Self {
-        self.payload_budget = budget;
-        self
     }
 
     /// Project the context whose endpoints the caller can open. Namespace agreement
@@ -246,7 +266,7 @@ impl RelayAwareHttpClient {
         &self,
         method_name: &str,
         data: HttpInputOwner,
-        send_headroom: PayloadBufferReservation,
+        send_headroom: MemoryReservation,
         completion_owner: Box<dyn Send>,
         cancellation: HttpStreamCancellation,
         control: &HttpCallControl,
@@ -268,7 +288,7 @@ impl RelayAwareHttpClient {
         &self,
         method_name: &str,
         data: HttpInputOwner,
-        send_headroom: PayloadBufferReservation,
+        send_headroom: MemoryReservation,
         completion_owner: Box<dyn Send>,
         cancellation: HttpStreamCancellation,
         control: &HttpCallControl,
@@ -487,7 +507,7 @@ impl RelayAwareHttpClient {
     ) -> Result<Vec<u8>, HttpError> {
         self.call_inner_async(method_name, HttpCallInput::Borrowed(data), None)
             .await
-            .map(BudgetedBuffer::into_vec)
+            .map(|buffer| buffer.into_parts().0)
     }
 
     async fn call_inner_async(
@@ -584,14 +604,7 @@ impl RelayAwareHttpClient {
         deadline: c2_config::ConnectDeadline,
     ) -> Result<RelayPoolGuard, HttpError> {
         check_active(control)?;
-        let client = self.pool.acquire_lease(
-            relay_url,
-            self.use_proxy,
-            self.config.call_timeout_secs,
-            self.config.remote_payload_chunk_size,
-            control.is_some(),
-            deadline,
-        );
+        let client = self.pool.acquire_lease(relay_url, self.use_proxy, deadline);
         // The mutex/build wait is complete; rejection also drops the acquired lease.
         check_active(control)?;
         super::connect_deadline::check(deadline, "relay_pool_acquire")?;
@@ -1219,8 +1232,8 @@ mod tests {
             HttpCallPhase::PreDispatch
         );
         let bytes = unsupported.to_string().into_bytes();
-        let budget = PayloadBufferBudget::new(bytes.capacity() as u64);
-        let reservation = budget.try_reserve(bytes.capacity() as u64).unwrap();
+        let budget = crate::payload::memory_only_budget(bytes.capacity() as u64);
+        let reservation = budget.try_reserve_memory(bytes.capacity() as u64).unwrap();
         assert_eq!(
             http_call_error_phase(&HttpError::ResponseError(
                 406,
@@ -1263,9 +1276,9 @@ mod tests {
                 let bytes = canonical_error_json(701, "ResourceNotFound", "user error", "grid")
                     .to_string()
                     .into_bytes();
-                let budget = PayloadBufferBudget::new(bytes.capacity() as u64);
+                let budget = crate::payload::memory_only_budget(bytes.capacity() as u64);
                 let reservation = budget
-                    .reserve_blocking(bytes.capacity() as u64, None)
+                    .reserve_memory_blocking(bytes.capacity() as u64, None)
                     .unwrap();
                 BudgetedBuffer::new(bytes, reservation)
             }),
@@ -2679,7 +2692,6 @@ mod tests {
         use crate::stream_wire::{
             self, HttpStreamRecordKind, HttpStreamStatus, HttpStreamTerminal,
         };
-        use c2_mem::retention::RetentionBudget;
         use std::future::Future;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::sync::oneshot;
@@ -2767,6 +2779,14 @@ mod tests {
             }
         }
 
+        fn forwarding_test_domain(memory: u64, operations: u64) -> c2_mem::DomainBudget {
+            c2_mem::DomainBudget::from_limits(&c2_config::DomainLimits {
+                memory_budget_bytes: memory,
+                file_spill_budget_bytes: 0,
+                max_outstanding_calls: operations,
+            })
+        }
+
         fn item(bytes: &[u8]) -> Vec<u8> {
             let mut record = stream_wire::encode_item_begin(bytes.len() as u64).to_vec();
             record.extend_from_slice(&stream_wire::encode_header(
@@ -2812,15 +2832,15 @@ mod tests {
             prefix.extend_from_slice(b"par");
             let mut peer = peer(prefix, Vec::new(), None).await;
             let (client, registry) = client_for(&peer).await;
-            let retention = RetentionBudget::new(1, 64);
-            let budget = retention.payload_budget();
+            let retention = forwarding_test_domain(64, 1);
+            let budget = retention.clone();
             let control = HttpCallControl::new(|| Ok(()), || Ok(()))
                 .with_payload_budget(budget.clone(), None);
             let mut stream = bounded(client.stream_controlled_async(
                 "step",
                 Arc::new(Vec::<u8>::new()),
-                budget.try_reserve(1).unwrap(),
-                Box::new(retention.reserve().unwrap()),
+                budget.try_reserve_memory(1).unwrap(),
+                Box::new(retention.reserve_operation().unwrap()),
                 HttpStreamCancellation::new(),
                 &control,
             ))
@@ -2830,12 +2850,12 @@ mod tests {
             let kept = bounded(stream.recv()).await.unwrap().unwrap();
             assert_eq!(kept.as_ref(), b"kept");
             bounded(async {
-                while budget.snapshot().used_bytes != 12 {
+                while budget.snapshot().memory.used_bytes != 12 {
                     tokio::task::yield_now().await;
                 }
             })
             .await;
-            assert_eq!(retention.snapshot().used_operations, 1);
+            assert_eq!(retention.snapshot().operations.used_operations, 1);
             peer.end.take().unwrap().send(()).unwrap();
             bounded(&mut peer.task).await.unwrap();
             let error = bounded(stream.recv()).await.unwrap_err();
@@ -2853,10 +2873,10 @@ mod tests {
                 HttpCallPhase::DispatchUncertain
             );
             assert_eq!(kept.as_ref(), b"kept");
-            assert_eq!(budget.snapshot().used_bytes, 4);
-            assert_eq!(retention.snapshot().used_operations, 0);
+            assert_eq!(budget.snapshot().memory.used_bytes, 4);
+            assert_eq!(retention.snapshot().operations.used_operations, 0);
             drop(kept);
-            assert_eq!(budget.snapshot().used_bytes, 0);
+            assert_eq!(budget.snapshot().memory.used_bytes, 0);
             registry.abort();
         }
 
@@ -2875,15 +2895,15 @@ mod tests {
             let declared = prefix.len() + tail.len() + 1;
             let mut peer = peer(prefix, tail, Some(declared)).await;
             let (client, registry) = client_for(&peer).await;
-            let retention = RetentionBudget::new(1, 64);
-            let budget = retention.payload_budget();
+            let retention = forwarding_test_domain(64, 1);
+            let budget = retention.clone();
             let control = HttpCallControl::new(|| Ok(()), || Ok(()))
                 .with_payload_budget(budget.clone(), None);
             let mut stream = bounded(client.stream_controlled_async(
                 "step",
                 Arc::new(Vec::<u8>::new()),
-                budget.try_reserve(1).unwrap(),
-                Box::new(retention.reserve().unwrap()),
+                budget.try_reserve_memory(1).unwrap(),
+                Box::new(retention.reserve_operation().unwrap()),
                 HttpStreamCancellation::new(),
                 &control,
             ))
@@ -2900,10 +2920,10 @@ mod tests {
             assert!(terminal.error.is_none());
             assert!(bounded(stream.recv()).await.unwrap().is_none());
             assert_eq!(kept.as_ref(), b"kept");
-            assert_eq!(budget.snapshot().used_bytes, 4);
-            assert_eq!(retention.snapshot().used_operations, 0);
+            assert_eq!(budget.snapshot().memory.used_bytes, 4);
+            assert_eq!(retention.snapshot().operations.used_operations, 0);
             drop(kept);
-            assert_eq!(budget.snapshot().used_bytes, 0);
+            assert_eq!(budget.snapshot().memory.used_bytes, 0);
             registry.abort();
         }
 
@@ -2933,15 +2953,15 @@ mod tests {
             assert!(declared < prefix.len() + tail.len());
             let mut peer = peer(prefix, tail, Some(declared)).await;
             let (client, registry) = client_for(&peer).await;
-            let retention = RetentionBudget::new(1, 64);
-            let budget = retention.payload_budget();
+            let retention = forwarding_test_domain(64, 1);
+            let budget = retention.clone();
             let control = HttpCallControl::new(|| Ok(()), || Ok(()))
                 .with_payload_budget(budget.clone(), None);
             let mut stream = bounded(client.stream_controlled_async(
                 "step",
                 Arc::new(Vec::<u8>::new()),
-                budget.try_reserve(1).unwrap(),
-                Box::new(retention.reserve().unwrap()),
+                budget.try_reserve_memory(1).unwrap(),
+                Box::new(retention.reserve_operation().unwrap()),
                 HttpStreamCancellation::new(),
                 &control,
             ))
@@ -2955,10 +2975,10 @@ mod tests {
             let error = bounded(stream.recv()).await.unwrap_err();
             let terminal = bounded(stream.completion()).await.unwrap_err();
             assert_eq!(kept.as_ref(), b"kept");
-            assert_eq!(budget.snapshot().used_bytes, 4);
-            assert_eq!(retention.snapshot().used_operations, 0);
+            assert_eq!(budget.snapshot().memory.used_bytes, 4);
+            assert_eq!(retention.snapshot().operations.used_operations, 0);
             drop(kept);
-            assert_eq!(budget.snapshot().used_bytes, 0);
+            assert_eq!(budget.snapshot().memory.used_bytes, 0);
             registry.abort();
             let expected = if truncate_item {
                 "HTTP stream ended mid ITEM_DATA"

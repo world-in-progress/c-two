@@ -1,146 +1,75 @@
-# C-Two configuration
+# Configuration and defaults
 
-This guide owns process, IPC, relay, concurrency and lifecycle configuration; Rust `c2-config` owns defaults, environment resolution and validation, SDKs provide code overrides, and c3 provides command-line overrides.
-
-English · [简体中文](configuration.zh-CN.md)
+[简体中文](configuration.zh-CN.md)
 
 ## Configuration sources and freezing
 
-IPC tuning values follow one rule: every `ipc_overrides` key `name` has the environment variable `C2_IPC_<NAME>` (upper case), resolved by the precedence below. A budget for a single operation is a parameter of that call, such as `connect(timeout=...)` or `shutdown(timeout=...)`.
+Rust Core resolves settings in this order: **explicit code or CLI > process environment > `.env` > defaults**. By default it reads `.env` in the current directory. Set `C2_ENV_FILE` in the process environment to select a different file or set it to an empty string to disable file loading. Rust can select sources explicitly with `ConfigSources`. Each role activation captures one `EnvCatalog` for its resolution. Relay startup and `--dry-run` use the same resolver and each reads one catalog. [Environment template](../../.env.example)
 
-Precedence is **explicit code or CLI > process environment > `.env` > Rust defaults**. The default environment file is `.env` in the current working directory. Set `C2_ENV_FILE` to another file, or to an empty string to disable file loading. [`.env.example`](../../.env.example) contains the environment reference.
+## Environment variables
 
-```bash
-cp .env.example .env
-C2_ENV_FILE=./runtime.env python resource.py
-C2_ENV_FILE= python resource.py
-```
+The capacity variables apply independently to each active role domain. `M` is the memory budget in bytes, `F` the file spill budget in bytes, and `N` the outstanding-call limit.
 
-```powershell
-$env:C2_ENV_FILE = '.\runtime.env'
-python resource.py
-$env:C2_ENV_FILE = ''
-```
+| Environment variable | Default | Explicit entry or purpose |
+| --- | --- | --- |
+| `C2_ENV_FILE` | Current directory's `.env` | Process environment or Rust `ConfigSources` |
+| `C2_RELAY_ANCHOR_ADDRESS` | Unset, direct IPC | `cc.set_relay_anchor(address)` / `Runtime.set_relay_anchor`, Rust `RuntimeOptions` / `HostOptions` |
+| `C2_IPC_ROOT` | Unix `/tmp/c2-v3-<uidhex>` | `cc.endpoint.set_local_endpoint(root=...)`, Rust `LocalEndpointOptions`, c3 `--ipc-root`. Windows uses named pipes. |
+| `C2_MEMORY_BUDGET_BYTES` | 16 GiB per active domain | `memory_budget_bytes`, `--memory-budget-bytes` |
+| `C2_FILE_SPILL_BUDGET_BYTES` | 16 GiB per active domain | `file_spill_budget_bytes`, `--file-spill-budget-bytes`. Zero disables file spill. |
+| `C2_CALL_MAX_OUTSTANDING` | 0 if `M == 0`, otherwise `max(64, floor(M / 65536))` | `max_outstanding_calls`, `--call-max-outstanding` |
+| `C2_MAX_PAYLOAD_SIZE` | 16 GiB | Host's single-payload limit, `max_payload_size` must be positive |
+| `C2_MAX_EXECUTION_WORKERS` | Host parallelism clamped to 4–64, with fallback parallelism 4 | Host's `max_execution_workers`. An explicit value must be at least 1 and may exceed 64. |
+| `C2_RELAY_BIND` | `0.0.0.0:8080` | `c3 relay --bind` / `-b` |
+| `C2_RELAY_ID` | Generated | `c3 relay --relay-id` |
+| `C2_RELAY_ADVERTISE_URL` | Derived from the actual bind address | `c3 relay --advertise-url` |
+| `C2_RELAY_SEEDS` | Empty | `c3 relay --seeds` / `-s`, comma-separated relay URLs |
+| `C2_RELAY_USE_PROXY` | `false` | Opt in to process HTTP proxy settings for relay traffic. Rust `HostOptions::with_relay_use_proxy` can override it. |
 
-Set Runtime policy before registering resources or connecting clients. Each native configuration domain freezes when first used: local endpoints on the first bind/connect attempt, including a failed attempt; call admission on the first remote business call. Queries do not freeze configuration. Later environment changes do not alter a frozen choice.
+When `M == 0`, the role refuses positive memory reservations and all new business calls, including empty calls and streams. An explicit positive `N` with zero `M` is a configuration error. With positive `M`, an explicit `N`, including 0, takes precedence over the derived default. Refusals, releases and shutdown drain can still proceed with admission closed. [Memory policy](memory-policy.md)
 
-Python exposes `cc.Runtime()` for an independently configured instance. The module-level functions use the default Runtime; each explicit instance owns its code overrides and native session and does not copy the default Runtime's overrides. All instances still read the same process environment and `.env` through the native resolver. Configure a particular instance with `runtime.set_*()` before its freeze point instead of changing `os.environ` to target one Runtime. `None` retains each setter's existing clear/inherit meaning.
+## Role domains and SDK configuration
 
-## SDK and transport configuration
+A Core Runtime creates its `client` domain at the first remote business connection or call attempt and its `server` domain on the first Host start attempt, including startup that fails after freezing. Starting a Host or registering and unregistering its routes through a relay leaves the business client domain inactive. Python `thread_local` calls count against the target Host's `N`. If a process hosts a resource that calls a downstream resource remotely, the two roles have separate budgets and slots. When both inherit the same `M`, their combined accounting limit is `2M`. Process RSS includes other memory.
 
-`cc.set_server(...)` sets server identity, IPC overrides and lifecycle policy. `cc.set_client(...)` sets client IPC overrides. `cc.set_transport_policy(...)` controls the default Runtime transport policy; `runtime.set_transport_policy(...)` configures that explicit instance.
+Python `cc.set_client` and `cc.set_server` accept the three capacity fields in the table. `cc.set_server` also accepts `server_id`, `startup_timeout`, `max_payload_size` and `max_execution_workers`. Identity and startup timeout have code entries only. Use the corresponding methods on an explicit `cc.Runtime()` to configure that instance. In Rust, `RuntimeOptions` owns client capacity, local endpoint and discovery options. `HostOptions` owns server identity, startup, carrying limits and server capacity. A Node connector owns a Core Runtime with a client domain only and accepts the three capacity options described in the [C ABI](c-abi.md#client-domain-endpoints-and-calls).
 
-```python
-import c_two as cc
+Updates merge field by field. Omission (`Keep`, Python `_UNSET`) keeps the accepted code override. `Inherit` (Python `None`) clears it so the environment and default apply. `Set` supplies an explicit value. Core validates and commits the complete candidate together. Changing `M` keeps an explicit `N` unless the same update clears or replaces it.
 
-cc.set_transport_policy(
-    shm_threshold=64 * 1024,
-    remote_payload_chunk_size=1024 * 1024,
-)
-cc.set_server(
-    server_id='my-server',
-    startup_timeout=30.0,
-    ipc_overrides={'max_payload_size': 64 * 1024 * 1024, 'pool_enabled': False},
-)
-cc.set_client(ipc_overrides={'pool_enabled': False})
-```
+After a role freezes, Core resolves setter updates against that role's captured sources. An update with identical effective settings succeeds, including an empty update and reuse of an automatically chosen `server_id`. A change to any effective setting raises the typed `ConfigFrozen` error. The other role can still be configured before it freezes. [Runtime lifecycle](runtime-lifecycle.md)
 
-Typed overrides are `BaseIPCOverrides`, `ServerIPCOverrides` and `ClientIPCOverrides`. Server-only fields are rejected as client overrides. Native parsing validates all keys and values.
-
-| Purpose | Code entry point | Environment | Default |
-| --- | --- | --- | --- |
-| Relay registration and discovery | `cc.set_relay_anchor(url)` | `C2_RELAY_ANCHOR_ADDRESS` | No relay |
-| Server startup wait | `cc.set_server(startup_timeout=...)` | — | 5 seconds |
-| SHM/inline threshold | `cc.set_transport_policy(shm_threshold=...)` | `C2_SHM_THRESHOLD` | 4 KiB |
-| Remote payload batch size | `cc.set_transport_policy(remote_payload_chunk_size=...)` | `C2_REMOTE_PAYLOAD_CHUNK_SIZE` | 1 MiB |
-| Server frame limit | `set_server(ipc_overrides={'max_frame_size': ...})` | `C2_IPC_MAX_FRAME_SIZE` | 2 GiB |
-| Logical payload limit | `set_server(ipc_overrides={'max_payload_size': ...})` | `C2_IPC_MAX_PAYLOAD_SIZE` | 16 GiB |
-| Pending requests across the server | `set_server(ipc_overrides={'max_pending_requests': ...})` | `C2_IPC_MAX_PENDING_REQUESTS` | 1,024 |
-| Resource execution threads | `set_server(ipc_overrides={'max_execution_workers': ...})` | `C2_IPC_MAX_EXECUTION_WORKERS` | Default uses host parallelism clamped to 4–64; explicit values must be positive and are not capped to 4–64 |
-
-An explicit `address='ipc://...'` uses local IPC independently of relay discovery. The relay anchor handles registration and discovery; HTTP calls use the relay URL selected by resolution. Remote batch size controls C-Two payload batches, without specifying TCP packets or HTTP frames.
-
-A Node connector from `createNodeIpcConnector` fixes its client settings when it is created. Its `requestShmThreshold` and `requestChunkSize` options set the SHM threshold and the client `chunk_size`; every other setting, including the payload buffer budget and `C2_CALL_MAX_OUTSTANDING`, comes from the environment, as for a Runtime without overrides.
+An explicit `ipc://` address uses direct IPC independently of the relay anchor. Route discovery may select a different relay for HTTP calls. [Contracts and routing](contracts-and-routing.md#relay-discovery-and-forwarding)
 
 ## Server startup timeout
 
-`cc.set_server(startup_timeout=seconds)` configures the Core startup wait before the first registration. The native `RuntimeSession` constructor and `set_server_options` accept the same keyword. Values must be finite, non-negative seconds representable by the native clock; zero expires immediately. Omitted/`None` selects the existing finite five-second default, not unlimited waiting. This default bounds unattended startup; it is not a performance guarantee for a busy runner. Applications should choose their deployment budget explicitly.
-
-Core owns and freezes server configuration on the first Host start attempt, including failure. `runtime.start()` is also a first Host attempt, even with no CRM. The setting survives pre-use RuntimeSession replacement by `set_transport_policy`. `cc.shutdown()` or explicit `runtime.shutdown()` creates a configurable fresh session when it consumes a completed result. After pending, call SDK shutdown again; background completion alone does not replace the session. Rust resolution is explicit `HostOptions::with_startup_timeout` > `RuntimeOptions::server_startup_timeout` > five seconds. Readiness and its direct IPC ping share the wait budget. Configuration/contract validation precedes this wait, and cleanup after expiry retains its separate shutdown budget, so this is not a total wall-clock limit on `cc.register()` or `runtime.start()`.
-
-Startup expiry raises public `c_two.error.CoreError` with `category='lifecycle'`, `lifecycle_kind='startup_timeout'`, `startup_stage` (`readiness` or `responsiveness`) and `timeout_seconds`. Its `io_operation`, `io_kind` and `raw_os_error` are `None`. Local bind failures retain their original structured OS cause and no longer carry the misleading `config error` message prefix. These diagnostics do not authorize retry or endpoint cleanup. See the [public error field table](local-endpoint-lifecycle.md#public-structured-python-errors) for types and value ranges.
-
-## IPC memory and chunks
-
-Set the following fields through the appropriate endpoint's `ipc_overrides`. Allocation, accounting and fallback behavior are described in the [memory policy](memory-policy.md).
-
-| Override | Environment | Default | Meaning |
-| --- | --- | --- | --- |
-| `pool_enabled` | `C2_IPC_POOL_ENABLED` | `true` | Enable or disable the buddy SHM pool; dedicated SHM remains available |
-| `pool_segment_size` | `C2_IPC_POOL_SEGMENT_SIZE` | 256 MiB | Buddy pool segment size in bytes |
-| `max_pool_segments` | `C2_IPC_MAX_POOL_SEGMENTS` | 4 | Maximum buddy pool segments, from 1 to 255 |
-| `pool_prewarm_segments` | `C2_IPC_POOL_PREWARM_SEGMENTS` | 0 | Buddy segments mapped eagerly at startup; 0 keeps allocation lazy |
-| `pool_min_retained_segments` | `C2_IPC_POOL_MIN_RETAINED_SEGMENTS` | 0 | Minimum idle buddy segments kept after reclamation |
-| `pool_decay_seconds` | `C2_IPC_POOL_DECAY_SECONDS` | 60 seconds | Idle segment decay time in seconds |
-| `shm_backing_budget_bytes` | `C2_IPC_SHM_BACKING_BUDGET_BYTES` | 8 GiB | Byte budget for locally created buddy and dedicated SHM backing |
-| `file_backing_budget_bytes` | `C2_IPC_FILE_BACKING_BUDGET_BYTES` | 16 GiB | Byte budget for locally created file backing |
-| `live_reassembly_budget_bytes` | `C2_IPC_LIVE_REASSEMBLY_BUDGET_BYTES` | 8 GiB | Byte budget for incomplete and retained reassembly capacity |
-| `reassembly_segment_size` | `C2_IPC_REASSEMBLY_SEGMENT_SIZE` | 64 MiB | Reassembly pool segment size in bytes |
-| `reassembly_max_segments` | `C2_IPC_REASSEMBLY_MAX_SEGMENTS` | 4 | Maximum reassembly pool segments, from 1 to 255 |
-| `max_inflight_chunk_frames` | `C2_IPC_MAX_INFLIGHT_CHUNK_FRAMES` | 512 | Server-wide limit on chunk frames processed at once; a chunk that finds no free slot fails its request with `ResourceUnavailable`. When that many reassemblies are in flight, admitting another first sweeps expired assemblies; the sweep never rejects |
-| `chunk_size` | `C2_IPC_CHUNK_SIZE` | 128 KiB | Individual chunk size in bytes |
-| `chunk_threshold_ratio` | `C2_IPC_CHUNK_THRESHOLD_RATIO` | 0.9 | Configured fraction of maximum frame size; accepted and validated, but not currently used by transport selection |
-| `chunk_assembler_timeout` | `C2_IPC_CHUNK_ASSEMBLER_TIMEOUT` | 60 seconds | Incomplete chunk-reassembly timeout in seconds |
-| `chunk_gc_interval` | `C2_IPC_CHUNK_GC_INTERVAL` | 5 seconds | Chunk garbage-collection sweep interval in seconds |
-| `max_reassembly_bytes` | `C2_IPC_MAX_REASSEMBLY_BYTES` | 8 GiB | Maximum reassembly buffer memory in bytes |
-| `write_timeout` | `C2_IPC_WRITE_TIMEOUT` | 30 seconds | Seconds one frame write may take before its connection is deactivated |
-| `client_idle_timeout` | `C2_IPC_CLIENT_IDLE_TIMEOUT` | 60 seconds | Seconds a Runtime keeps a cached client connection that nothing references before it evicts the connection in the background; `0` disables timed eviction |
-| `max_dedicated_segments` | `C2_IPC_MAX_DEDICATED_SEGMENTS` | 4 | Dedicated SHM segments one pool keeps at once, up to 65536 |
-| `spill_threshold` | `C2_IPC_SPILL_THRESHOLD` | 0.8 | Fraction of observed available memory that new SHM backing may reach, from 0 to 1; 1 disables the check |
-
-Pool segment capacity and the per-message payload limit are independent. Rounding `pool_segment_size` up to a power of two must fit in u32, so its maximum is 2 GiB. Disabling the buddy pool still permits dedicated SHM, checked chunk transfer and file spill. A zero backing or reassembly budget rejects positive reservations; `pool_decay_seconds=0` reclaims idle segments on the next maintenance pass.
-
-`cc.observe.memory_stats()` observes native memory domains, and `cc.observe.memory_stats()["holds"]` observes SDK leases. These are accounting snapshots, without measuring total process RSS.
+Set the native startup wait with `cc.set_server(startup_timeout=...)` in seconds or Rust `HostOptions::with_startup_timeout`. The default is five seconds. Use finite non-negative seconds in Python. Zero expires immediately. Readiness and its direct IPC ping share that budget. Configuration and contract validation precede the wait, and cleanup after expiry has its own shutdown budget. Startup expiry projects as `CoreError.lifecycle_kind == 'startup_timeout'` with `startup_stage` (`readiness` or `responsiveness`) and `timeout_seconds`. [Runtime lifecycle](runtime-lifecycle.md#startup-and-readiness)
 
 ## Relay and c3
 
-Relay runs as a separate process with its own upstream IPC configuration. An application's `cc.set_client()` does not configure c3.
+A standalone relay resolves one `relay` domain at startup. Its memory, file spill and call slots cover business forwarding and its upstream IPC storage across physical connections and reconnects. `c3 relay --dry-run` validates and prints the effective `M`, `F` and `N` without listening. `--upstream` (`-u`) accepts a route and its upstream identity on the CLI only. [c3 relay](../../cli/README.md#relay)
 
-```bash
-c3 relay --bind 127.0.0.1:8300 --ipc-pool-enabled false
-```
+## Fixed transport constants
 
-```dotenv
-C2_RELAY_BIND=127.0.0.1:8300
-C2_IPC_POOL_ENABLED=false
-C2_RELAY_IDLE_TIMEOUT=60
-```
+| Constant | Value | Use |
+| --- | --- | --- |
+| `SHM_THRESHOLD` | 16 KiB | IPC payloads at or below this size are inline. Larger payloads can use SHM. |
+| `CHUNK_SIZE` | 128 KiB | Standard IPC chunk size. A narrow relay upload window can send shorter valid chunks. |
+| `REMOTE_PAYLOAD_CHUNK_SIZE` | 1 MiB | HTTP payload batching. TCP packet and HTTP frame boundaries are independent. |
+| `MAX_HANDSHAKE_FRAME_BYTES` | 8 MiB | Handshake frame bound, covering up to 64 routes with 256 methods each. |
+| `MAX_RPC_FRAME_BYTES` | 1 MiB | Symmetric RPC frame bound, including chunks, route catalogs and bounded error payloads. |
+| `WRITE_TIMEOUT` | 30 s | Write and flush budget for one frame. |
+| `IDLE_CONNECTION_TIMEOUT` | 60 s | Idle client and relay upstream connection eviction. |
+| `POOL_DECAY_SECONDS` | 60 s | Idle buddy segment reclamation. Zero prewarmed and zero minimum retained segments. |
+| `CHUNK_ASSEMBLER_TIMEOUT` | 60 s | From last chunk enqueue or copy activity while input remains incomplete. |
+| `CHUNK_GC_INTERVAL` | 5 s | Scan interval for expired reassemblies. |
+| `RELAY_ANTI_ENTROPY_INTERVAL` | 60 s | Relay mesh anti-entropy interval. |
+| `SPILL_THRESHOLD` | 0.8 | Available-memory heuristic for new SHM mappings. |
 
-| Purpose | CLI | Environment | Default |
-| --- | --- | --- | --- |
-| HTTP listener | `--bind` | `C2_RELAY_BIND` | `0.0.0.0:8080` |
-| Relay identity | `--relay-id` | `C2_RELAY_ID` | Generated `<hostname>_<pid>_<first 8 UUID characters>` |
-| Advertised URL | `--advertise-url` | `C2_RELAY_ADVERTISE_URL` | Derived from the bound address |
-| Mesh seeds | `--seeds` | `C2_RELAY_SEEDS` | Empty |
-| Upstream IPC idle disconnect | `--idle-timeout` | `C2_RELAY_IDLE_TIMEOUT` | 60 seconds; `0` disables timed eviction |
-| Forwarding transaction count | `--call-max-outstanding` | `C2_CALL_MAX_OUTSTANDING` | 1,024 per relay |
-| Payload buffer budget | `--call-payload-buffer-budget-bytes` | `C2_CALL_PAYLOAD_BUFFER_BUDGET_BYTES` | 16 GiB per relay |
-| System HTTP proxy | — | `C2_RELAY_USE_PROXY` | `false` |
-| Anti-entropy interval | — | `C2_RELAY_ANTI_ENTROPY_INTERVAL` | 60 seconds; `0` disables anti-entropy |
+## Segment geometry and server threads
 
-The relay binds its listener before anything else starts. With port `0` it takes a free port, derives the advertised URL from the address it actually bound, and `c3 relay` prints that address in its `C-Two relay listening at` line; any other port derives the same URL as before.
+The request and response main pools each derive their geometry from `B = floor(M / 4)` with a maximum of 16 segments. The reassembly pool uses `B = floor(M / 16)` with a maximum of 4. In each case the number of segments is `min(max_segments, floor(B / 65536))`. If that is zero, skip buddy allocation. Otherwise each segment is `min(MAX_BUDDY_SEGMENT, prev_pow2(floor(B / segment_count)))`, where `prev_pow2` rounds down to the largest power of two and `MAX_BUDDY_SEGMENT = 64 MiB`. Buddy capacity stays within its share of `M` and both pools charge actual backing to that domain. At the default `M`, the main pool is at most 16 × 64 MiB and the reassembly pool 4 × 64 MiB. Below 256 KiB for the main pool or 1 MiB for the reassembly pool, use the applicable inline, dedicated SHM, chunk or file fallback. A single reassembly is bounded by the route's advertised `max_payload_size` on the client and the Host's own value on the server.
 
-`remote_payload_chunk_size` is the single remote-body batching policy, resolved by Rust from the typed transport override or `C2_REMOTE_PAYLOAD_CHUNK_SIZE`. It defaults to 1 MiB and accepts positive values up to 128 MiB. Relay HTTP uses it for outbound request bodies, and a relay copies each response or stream-item slice out of its upstream carrier in at most the lesser of this size and the upstream IPC `chunk_size`; `C2_IPC_CHUNK_SIZE` independently controls IPC wire chunks and reassembly. The remote value does not specify TCP packets or HTTP frame boundaries.
-
-Before a call hands its input to a transport, Core acquires the client's route again at most once, under that call's deadline, when its target is known to be gone; this bound is fixed and is not configurable through SDK settings.
-
-Pre-register upstreams as `--upstream NAME=SERVER_ID@ADDRESS`; `SERVER_ID` must match the IPC handshake. See the [c3 guide](../../cli/README.md) for upstream budgets, mesh and dry-run options.
-
-Relay freezes forwarding limits at startup and applies them to all forwarded business calls, including calls with unlimited caller waiting. A zero count limit rejects new forwards; a zero payload buffer budget rejects every positive reservation. A known-length request body is reserved once before it is read; when the budget is short, the forward waits until capacity is released or the HTTP caller disconnects. An unknown-length body reserves its first part the same way, and later growth that finds no capacity fails at once. Capacity refusal preserves the route. These limits are independent of upstream IPC backing and reassembly budgets and do not measure process RSS; the [memory policy](memory-policy.md#payload-buffer-budget) lists what the payload buffer budget charges.
-
-Relay capacity rejection is fixed before business admission. Every refusal the relay sends before it reads a request body, whether for a contract, identity or route mismatch, an invalid or oversized declared length, a rejected request format or capacity, first discards the body frame by frame within its declared length and one two-second deadline, so that a client still sending the body receives the refusal rather than a reset connection. Disposal does not aggregate the payload, decode it, invoke a resource or retry admission, and capacity released during disposal does not change a capacity refusal. Bodies of requests with Expect or of unknown length are not read. Read faults, excess bytes and the timeout preserve the original refusal. An incomplete or faulty transport can still prevent the client from receiving it.
-
-After an HTTP caller disconnects, an already-dispatched forward keeps its upstream connection until actual completion; its request body is released once it has been copied upstream. Relay shutdown stops admission, ends the server streams it forwards between their steps with `CallCancelled` naming relay shutdown, and waits for forwarding and native client cleanup; unary calls already forwarded still finish. A resource method that never returns, or a stream client that has stopped reading, continues to occupy its slot and delays shutdown.
+Let `P` be host parallelism (fallback 4), `W` the configured `max_execution_workers`, and `C = E = clamp(P, 4, 64)` the incoming chunk copy and stream item encoding concurrency limits. The server runs two asynchronous I/O threads and sets Tokio's blocking thread limit to `T = max(512, W + C + E + 16)` with checked addition. Permits are acquired before blocking work is submitted and held until it returns, leaving at least 16 threads for listener startup, shutdown and cleanup.
 
 ## Local endpoint directories
 
@@ -174,44 +103,6 @@ Expiration returns `CallDeadlineExceeded` with `operation=connect`, `transport_p
 
 ## Call deadlines and admission
 
-| Setting | Entry point | Default | Meaning |
-| --- | --- | --- | --- |
-| Per-call waiting | `cc.with_call_options(proxy, timeout=...)` | Transport default | Caller waiting budget for one remote business call |
-| Logical relay call deadline | `C2_RELAY_CALL_TIMEOUT` | 300 seconds; `0` means unlimited | Relay HTTP CRM call timeout in seconds; 0 disables the reqwest total timeout |
-| Outstanding finite-deadline calls | `cc.set_call_execution_limits(max_outstanding_calls=...)` / `C2_CALL_MAX_OUTSTANDING` | 1,024 per Runtime | Maximum unfinished calls with a finite deadline, including calls that continue after their caller's deadline, plus every server stream until its real terminal |
-| Payload buffer budget | `payload_buffer_budget_bytes=...` / `C2_CALL_PAYLOAD_BUFFER_BUDGET_BYTES` | 16 GiB per Runtime | Byte budget for the payload buffers C-Two keeps for calls with and without a deadline; see [memory policy](memory-policy.md#payload-buffer-budget) |
+Both direct IPC and relay HTTP business calls wait without a deadline by default. In Python, `cc.with_call_options(proxy, timeout=...)` bounds one logical call, including any route reacquisition, or use `None` for no deadline. Zero expires before dispatch; negative and non-finite values are rejected. Synchronous same-process calls accept inherited or unlimited waiting. Connection deadlines are independent.
 
-Direct IPC waits indefinitely by default; an HTTP budget covers one logical call and its route reacquisition. `timeout=None` explicitly waits indefinitely; `0` expires before dispatch. Negative and non-finite values are rejected. Same-process synchronous calls accept inherited or unlimited waiting only.
-
-Expiry ends the caller's wait, while a dispatched native transaction may continue to its real end; its input was already released when the transport copied it. A call deadline alone does not withdraw a relay route or invalidate an already acquired held response owner. The deadline error distinguishes expiry before dispatch from an uncertain dispatched call; do not replay a call after the latter outcome.
-
-A zero finite-call count rejects every new finite call and every new server stream; unary calls without a deadline are not counted. A zero payload buffer budget rejects every positive reservation, for calls with and without a deadline. When the budget is short, a call waits for capacity within its own deadline; the [memory policy](memory-policy.md#payload-buffer-budget) describes what the budget charges and when a reservation fails at once. `cc.observe.call_execution_snapshot()` observes the call slots of active and retired domains, and `cc.observe.memory_stats()['payload_buffer']` observes the budget's bytes and rejections. Examples and error phases are in the [deadline guide](../releases/0.7.1.md#per-call-deadlines-for-remote-calls).
-
-## Concurrency and lifecycle
-
-`@cc.read` and `@cc.write` declare access semantics; writes are the default. Registration's `cc.ConcurrencyConfig` sets the route mode, `max_pending` and `max_workers`. The native route handle governs both same-process calls and remote dispatch. See the [Python SDK guide](python-usage.md).
-
-Server `max_pending_requests` uses one semaphore for all connections, counting complete remote calls awaiting or using execution capacity; it is not multiplied by the connection count. `max_execution_workers` caps active remote callbacks separately. The route's own `max_pending` and `max_workers` limits are shared with same-process calls. See [execution admission](runtime-lifecycle.md#execution-admission).
-
-After acquiring the Python instance lock, `cc.shutdown(timeout=...)` uses one deadline for Native Host, Core and pool lock waits and drain observation. The instance-lock wait is outside that deadline; expiry does not cancel an already-started native drain. Listener closure and work drain are separate observations; `cc.observe.memory_stats()` counts the local copies retained by holds. See the [lifecycle guide](local-endpoint-lifecycle.md).
-
-## Native configuration authority
-
-Paths: `sdk/python/src/c_two/config/`, `core/foundation/c2-config/`
-
-Unified configuration is resolved by the Rust `c2-config` resolver. Python stores SDK code-level overrides and asks the native resolver for environment, `.env`, and default values. Relay server configuration belongs to the standalone Rust `c3 relay` runtime.
-
-| File | Purpose |
-| --- | --- |
-| `settings.py` | `C2Settings` facade for Runtime-owned code overrides such as relay anchor and transport policy |
-| `ipc.py` | Typed override schemas: `BaseIPCOverrides`, `ServerIPCOverrides`, `ClientIPCOverrides`; Rust owns defaults and validation |
-
-IPC override key validation belongs to Rust/native config parsing. Python `ipc.py` may expose typed override schemas and forward mappings, but it must not keep allowed-key or forbidden-key validation tables.
-
-Do not reintroduce Python-side default validation for IPC or relay internals. SDKs should provide typed override facades and leave environment/default resolution to Rust.
-
-Scheduler-related config follows the same boundary. Python may expose `ConcurrencyConfig` and SDK-level enums, but Rust now owns the resolved route concurrency handle, including mode, `max_pending`, `max_workers`, and close state. Python must pass the full typed config into Rust, then treat the native handle as the source of truth for both same-process direct calls and remote dispatch. Do not keep a second Python-owned scheduler state or hidden default policy alive after registration.
-
-Do not add environment variables for values that can be derived from existing canonical settings.
-
-Runtime identity, pools, and transaction projections follow the [Runtime authority](runtime-lifecycle.md#runtime-authority-and-python-bindings).
+Expiry ends caller waiting. A dispatched call may still run to its real terminal, holding its call slot until then. Retry only a pre-dispatch failure. All remote unary and streaming calls count against `N` regardless of deadline. See [execution admission](runtime-lifecycle.md#execution-admission) and [diagnostic snapshots](memory-policy.md#statistics-and-payload-lifetime).

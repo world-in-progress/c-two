@@ -59,7 +59,7 @@ fn valid_peer_relay_id(relay_id: &str) -> bool {
 }
 
 fn valid_peer_relay_url(url: &str) -> bool {
-    crate::relay::route_table::valid_relay_url(url)
+    crate::valid_relay_url(url)
 }
 
 /// POST /_peer/announce — receive RouteAnnounce or RouteWithdraw

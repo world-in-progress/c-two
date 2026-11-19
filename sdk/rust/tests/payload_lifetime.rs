@@ -2,7 +2,7 @@ use c_two::generated::{
     HeldResponse, open_borrowed, open_held, open_owned, release_held_after_error,
 };
 use c2_ipc::ResponseData;
-use c2_mem::{MemPool, PoolConfig};
+use c2_mem::{DomainBudget, MemPool, PoolConfig};
 use c2_wire::chunk::backing::ReassemblyBacking;
 use fastdb::{BuildPolicy, Builder, CompiledSpec, Payload};
 use parking_lot::RwLock;
@@ -120,18 +120,25 @@ fn held_open_failure_preserves_original_payload_error_after_transport_release() 
     let spec = CompiledSpec::compile(VALUE_SPEC).expect("compile value spec");
     let invalid_bytes = [0xa5; 512];
     let expected = open_owned(&spec, &invalid_bytes).expect_err("invalid payload");
-    let pool = Arc::new(RwLock::new(MemPool::new(PoolConfig::default()).unwrap()));
+    let pool = Arc::new(RwLock::new(
+        MemPool::new_with_budget(
+            PoolConfig::default(),
+            DomainBudget::from_limits(&c_two::DomainLimits::default()),
+        )
+        .unwrap(),
+    ));
     let budget = pool.read().budget().unwrap().clone();
     let mut backing = ReassemblyBacking::admit(Arc::clone(&pool), 1, invalid_bytes.len()).unwrap();
     backing.write_at(0, &invalid_bytes).unwrap();
     let response = HeldResponse::from_response_data(ResponseData::Handle(backing)).unwrap();
     assert_eq!(pool.read().stats().alloc_count, 0);
-    assert_eq!(budget.snapshot().reassembly.used_bytes, 0);
+    assert_eq!(budget.snapshot().file_spill.used_bytes, 0);
 
     let error = open_held(&spec, response).err().expect("invalid payload");
     assert_eq!(error.symbol(), expected.symbol());
     assert_eq!(error.message(), expected.message());
     drop(pool);
+    assert_eq!(budget.snapshot().memory.used_bytes, 0);
 }
 
 #[test]
@@ -147,11 +154,14 @@ fn held_local_value_survives_file_spill_release_and_pool_drop() {
 fn check_held_local_copy_after_reassembly_release(buddy: bool) {
     let (spec, source) = value_payload(19);
     let bytes = source.binary_bytes().unwrap();
-    let mut pool = MemPool::new(PoolConfig {
-        segment_size: 64 * 1024,
-        spill_threshold: if buddy { 1.0 } else { 0.0 },
-        ..PoolConfig::default()
-    })
+    let mut pool = MemPool::new_with_budget(
+        PoolConfig {
+            segment_size: 64 * 1024,
+            spill_threshold: if buddy { 1.0 } else { 0.0 },
+            ..PoolConfig::default()
+        },
+        DomainBudget::from_limits(&c_two::DomainLimits::default()),
+    )
     .unwrap();
     if buddy {
         // Warm a real SHM slot without fallback, so an unavailable mapping is
@@ -172,7 +182,7 @@ fn check_held_local_copy_after_reassembly_release(buddy: bool) {
     assert_eq!(pool.read().stats().alloc_count, u32::from(buddy));
     let response = HeldResponse::from_response_data(ResponseData::Handle(backing)).unwrap();
     assert_eq!(pool.read().stats().alloc_count, 0);
-    assert_eq!(budget.snapshot().reassembly.used_bytes, 0);
+    assert_eq!(budget.snapshot().file_spill.used_bytes, 0);
     if let Some(path) = spill_path {
         assert!(
             !path.exists(),
@@ -205,7 +215,8 @@ fn check_held_local_copy_after_reassembly_release(buddy: bool) {
         clone.entry_view(0).unwrap_err().symbol(),
         "VIEW_INVALIDATED"
     );
-    assert_eq!(budget.snapshot().reassembly.used_bytes, 0);
+    assert_eq!(budget.snapshot().memory.used_bytes, 0);
+    assert_eq!(budget.snapshot().file_spill.used_bytes, 0);
 }
 
 #[test]

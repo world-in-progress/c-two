@@ -1,6 +1,8 @@
 //! C ABI for native client domains, IPC endpoints, calls and local buffers.
 
-use c2_config::{ConfigResolver, ConfigSources, LocalEndpointContext, LocalEndpointOptions};
+use c2_config::{
+    ConfigResolver, ConfigSources, EnvCatalog, LocalEndpointContext, LocalEndpointOptions,
+};
 use std::ffi::CStr;
 use std::os::raw::c_char;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -98,7 +100,8 @@ fn capture_local_endpoint_context(
     } else {
         ConfigSources::from_process()
     };
-    ConfigResolver::resolve_local_endpoint(LocalEndpointOptions { unix_root }, sources)
+    let catalog = EnvCatalog::load(sources).map_err(|_| C2MemFfiStatus::InvalidArgument)?;
+    ConfigResolver::resolve_local_endpoint(LocalEndpointOptions { unix_root }, &catalog)
         .map_err(|_| C2MemFfiStatus::InvalidArgument)
 }
 

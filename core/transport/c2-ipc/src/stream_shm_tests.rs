@@ -1,5 +1,7 @@
 //! Whole SHM stream admission, original-connection settlement and EOF.
+
 use super::*;
+use crate::tests::memory_budget;
 use c2_wire::buddy::BuddyPayload;
 use c2_wire::connection::{ConnectionCore, ConnectionSide, WriteRequest};
 
@@ -212,9 +214,9 @@ async fn rejected_shm_settles_on_original_connection(fault: InvalidShm) {
     let mut client = endpoint.client();
     client.connect().await.unwrap();
     let client = Arc::new(client);
-    let budget = PayloadBufferBudget::new(64);
+    let budget = memory_budget(64);
     let occupied =
-        matches!(fault, InvalidShm::WithoutStorage).then(|| budget.try_reserve(64).unwrap());
+        matches!(fault, InvalidShm::WithoutStorage).then(|| budget.try_reserve_memory(64).unwrap());
     let mut stream = client
         .stream_bound(&binding(), "items", b"", budget.clone())
         .await
@@ -263,7 +265,7 @@ async fn rejected_shm_settles_on_original_connection(fault: InvalidShm) {
     assert_eq!(shm.pool.read().stats().alloc_count, 0);
     timeout(WAIT, stream.completion()).await.unwrap().unwrap();
     drop(occupied);
-    assert_eq!(budget.snapshot().used_bytes, 0);
+    assert_eq!(budget.snapshot().memory.used_bytes, 0);
     client.close_shared().await;
     peer.await.unwrap();
     assert!(

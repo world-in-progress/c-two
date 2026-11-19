@@ -13,10 +13,25 @@ pub mod relay;
 
 /// Build a relay client builder with an explicit proxy policy.
 pub fn relay_client_builder_with_proxy(use_proxy: bool) -> reqwest::ClientBuilder {
-    let builder = reqwest::Client::builder();
+    let builder = reqwest::Client::builder().pool_idle_timeout(c2_config::IDLE_CONNECTION_TIMEOUT);
     if use_proxy {
         builder
     } else {
         builder.no_proxy()
+    }
+}
+
+/// Validate a relay base URL before opening a business or control path.
+pub fn valid_relay_url(url: &str) -> bool {
+    match reqwest::Url::parse(url) {
+        Ok(parsed) => {
+            matches!(parsed.scheme(), "http" | "https")
+                && parsed.host_str().is_some()
+                && parsed.query().is_none()
+                && parsed.fragment().is_none()
+                && parsed.username().is_empty()
+                && parsed.password().is_none()
+        }
+        Err(_) => false,
     }
 }

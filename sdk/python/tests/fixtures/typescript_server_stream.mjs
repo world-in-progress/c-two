@@ -128,7 +128,7 @@ async function concurrentClient(client) {
     const after = await endpoint.prepare(config.route, generated.CONTRACT);
     assert.equal(after.connectionId, binding.connectionId);
     assert.equal(connections, 1);
-    assert.equal(connector.stats().used_operations, '0');
+    assert.equal(connector.stats().call_execution.used_operations, '0');
     console.log(JSON.stringify({scenario: config.scenario, connections, connectionId: String(binding.connectionId)}));
   } finally {
     for (const stream of streams) await stream.close(0);

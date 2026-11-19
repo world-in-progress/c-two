@@ -11,7 +11,10 @@ use tower::ServiceExt;
 
 use super::authority::RouteAuthority;
 use super::disseminator::{Disseminator, FullBroadcast};
-use super::peer::{PROTOCOL_VERSION, PeerEnvelope, PeerMessage, validate_route_state_envelope};
+use super::peer::{
+    DigestEntry, PROTOCOL_VERSION, PeerEnvelope, PeerMessage, ValidatedRouteStateEnvelope,
+    validate_route_state_envelope,
+};
 use super::router::build_router;
 use super::state::RelayState;
 use super::test_support::{TEST_ABI_HASH, TEST_SIGNATURE_HASH};
@@ -433,7 +436,6 @@ async fn force_leave_seed_rejoin_adopts_the_seeds_current_view() {
                 advertise_url: "http://127.0.0.1:1".into(),
                 seeds: vec![url],
                 heartbeat_interval: Duration::ZERO,
-                anti_entropy_interval: Duration::ZERO,
                 dead_peer_probe_interval: Duration::ZERO,
                 seed_retry_interval: Duration::ZERO,
                 ..Default::default()
@@ -446,12 +448,17 @@ async fn force_leave_seed_rejoin_adopts_the_seeds_current_view() {
             .unwrap();
         assert!(joiner.list_peers().is_empty());
         let cancel = tokio_util::sync::CancellationToken::new();
-        let mut tasks = super::background::spawn_background_tasks(joiner.clone(), cancel.clone());
-        // Only seed join and tombstone GC are enabled; await the one-shot join.
-        tokio::time::timeout(Duration::from_secs(5), tasks.remove(0))
-            .await
-            .unwrap()
-            .unwrap();
+        let tasks = super::background::spawn_background_tasks(joiner.clone(), cancel.clone());
+        // Anti-entropy is always spawned (fixed 60s interval, first real tick
+        // after a full interval), so the one-shot seed join is observed by its
+        // effect rather than by task-list position.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !joiner.has_peer("relay-b") {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("seed bootstrap join must complete");
         assert!(joiner.has_peer("relay-b"));
         assert_eq!(joiner.has_peer("relay-c"), seed_remembers_target);
         assert_eq!(
@@ -533,7 +540,6 @@ impl MeshRelay {
                 advertise_url: url.clone(),
                 heartbeat_interval: Duration::from_millis(80),
                 heartbeat_miss_threshold: 5,
-                anti_entropy_interval: Duration::from_millis(50),
                 dead_peer_probe_interval: Duration::from_millis(40),
                 seed_retry_interval: Duration::from_millis(40),
                 seeds,
@@ -786,8 +792,52 @@ async fn force_leave_three_relay_mesh(c_has_seed: bool) {
 
     // The same relay resumes at its original URL with its existing state.
     // Only production probes, seed retries and anti-entropy may restore it.
+    // C's dead-peer probes rejoin a and b first (they re-learn relay-c as a
+    // live peer through the production join handler); the mesh anti-entropy
+    // interval is the fixed 60s constant, so drive one production digest
+    // exchange per survivor instead of sleeping a whole interval.
     let restored_at = Instant::now();
     c.restore_network().await;
+    eventually(|| {
+        [&a, &b]
+            .iter()
+            .all(|node| node.state.peer_is_alive("relay-c"))
+    })
+    .await;
+    for node in [&a, &b] {
+        let digest: Vec<DigestEntry> = node
+            .state
+            .route_digest()
+            .into_iter()
+            .map(|((name, relay_id, deleted), hash)| DigestEntry {
+                name,
+                relay_id,
+                deleted,
+                hash,
+            })
+            .collect();
+        let reply = http
+            .post(format!("{}/_peer/digest", c.url))
+            .json(&PeerEnvelope::new(
+                node.state.relay_id(),
+                PeerMessage::DigestExchange { digest },
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(reply.status(), StatusCode::OK);
+        let reply: PeerEnvelope = reply.json().await.unwrap();
+        let ValidatedRouteStateEnvelope::DigestDiff(entries) =
+            validate_route_state_envelope(reply, Some("relay-c")).unwrap()
+        else {
+            panic!("digest exchange must answer a diff");
+        };
+        for entry in entries {
+            RouteAuthority::new(&node.state)
+                .apply_digest_diff("relay-c", entry)
+                .unwrap();
+        }
+    }
     eventually(|| {
         [&a, &b].iter().all(|node| {
             ["grid", "still"].iter().all(|name| {
@@ -913,7 +963,6 @@ async fn force_leave_dead_peer_probe_rejoins_before_digest_without_merging_snaps
             relay_id: "relay-c".into(),
             advertise_url: "http://relay-c:8080".into(),
             heartbeat_interval: Duration::ZERO,
-            anti_entropy_interval: Duration::ZERO,
             dead_peer_probe_interval: Duration::from_millis(10),
             ..Default::default()
         }),

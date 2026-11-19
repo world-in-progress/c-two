@@ -20,7 +20,6 @@ import tempfile
 import threading
 import time
 import traceback
-from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import ipc_memory as bench
@@ -32,8 +31,8 @@ from ipc_evidence import (
 ROOT = Path(__file__).resolve().parents[2]
 MODES = ('U', 'Q', 'S')
 MIB = 1 << 20
-FRAME_BYTES = 64 * 1024
-THRESHOLD = 4096
+FRAME_BYTES = 128 * 1024
+THRESHOLD = 16 * 1024
 SCHEMA = 'c-two.ipc-stream-benchmark.v1'
 
 
@@ -43,12 +42,12 @@ def matrix_rows() -> list[dict]:
         ('small', 1, 200, 1), ('burst', 64 * 1024, 40, 4),
         ('science', 4 * MIB, 8, 1), ('file_fallback', 2 * MIB, 2, 1),
     ):
-        for buddy in (True, False):
-            rows.append(dict(name=f'{name}_{"buddy" if buddy else "no_buddy"}',
-                             size=size, count=count, workers=workers, buddy=buddy,
-                             no_shm=name == 'file_fallback'))
-    rows.append(dict(name='all_backing_zero', size=2 * MIB, count=1, no_shm=True,
-                     zero_backing=True))
+        for profile in ('roomy', 'bounded'):
+            rows.append(dict(name=f'{name}_{profile}', size=size, count=count,
+                             workers=workers, profile=profile, no_shm=name == 'file_fallback',
+                             file_fallback=name == 'file_fallback'))
+    rows.append(dict(name='reply_backing_exhausted', size=2 * MIB, count=1, no_shm=True,
+                     exhaust_reassembly=True))
     for name, target, no_shm in (
         ('threshold_below', THRESHOLD - 1, False),
         ('threshold_at', THRESHOLD, False), ('threshold_above', THRESHOLD + 1, False),
@@ -64,7 +63,7 @@ def matrix_rows() -> list[dict]:
         dict(name='fastdb_array', size=4 * MIB, count=8, codec='array'),
         dict(name='fastdb_mixed', size=64 * 1024, count=40, codec='mixed'),
     ])
-    return [{**dict(workers=1, buddy=True, no_shm=False, codec='pickle'), **row}
+    return [{**dict(workers=1, profile='roomy', no_shm=False, codec='pickle'), **row}
             for row in rows]
 
 
@@ -79,16 +78,15 @@ def sized_bytes(encoded_size: int, tag: str) -> bytes:
 
 
 def expected_capacity(row: dict, mode: str) -> bool:
-    return bool((row.get('zero_backing') and mode in ('U', 'Q'))
+    return bool((row.get('exhaust_reassembly') and mode in ('U', 'Q'))
                 or (mode == 'S' and row.get('budget_offset', 0) < 0))
 
 
 def auxiliary_rows():
-    common = dict(workers=1, buddy=True, codec='pickle', size=4 * MIB, count=32,
-                  kind='mixed', backing_budget=256 * MIB)
+    common = dict(workers=1, profile='roomy', codec='pickle', size=4 * MIB, count=32, kind='mixed')
     return [dict(common, name='mixed_shm', no_shm=False),
             dict(common, name='mixed_no_shm', no_shm=True),
-            dict(name='hold_resume', workers=1, buddy=True, no_shm=False, codec='pickle',
+            dict(name='hold_resume', workers=1, profile='roomy', no_shm=False, codec='pickle',
                  size=64 * 1024, count=4, kind='hold')]
 
 
@@ -256,21 +254,21 @@ class Content:
 def configure(runtime, row, ipc_root, data):
     if os.name != 'nt':
         runtime.set_local_endpoint(root=str(ipc_root))
-    overrides = {'chunk_size': FRAME_BYTES}
-    if row['no_shm']:
-        backing = row.get('backing_budget', 64 * MIB)
-        overrides.update(shm_backing_budget_bytes=0, file_backing_budget_bytes=backing,
-                         live_reassembly_budget_bytes=backing)
-    if row.get('zero_backing'):
-        overrides.update(file_backing_budget_bytes=0, live_reassembly_budget_bytes=0)
-    bench.configure(runtime, SimpleNamespace(pool_enabled=row['buddy'], segment_size=2 * MIB,
-                                             shm_threshold=THRESHOLD, ipc_overrides=overrides))
-    budget = 256 * MIB
+    roomy = row['profile'] == 'roomy'
+    host_budget = 8 * 1024 if row['no_shm'] else (256 if roomy else 64) * MIB
+    memory_budget = (256 if roomy else 64) * MIB
+    file_spill_budget = 0
+    item_size = max(data['encoded_sizes'], default=0)
+    if row.get('file_fallback') or row.get('exhaust_reassembly'):
+        # Whole stream items fit while rounded unary reassembly requires more.
+        memory_budget = item_size + (4096 if roomy else 0)
+        file_spill_budget = 8 * MIB if row.get('file_fallback') else 0
     if 'budget_offset' in row:
-        budget = data['encoded_sizes'][0] + row['budget_offset']
+        memory_budget = item_size + row['budget_offset']
     if row.get('kind') == 'hold':
-        budget = 2 * data['encoded_sizes'][0]
-    runtime.set_call_execution_limits(payload_buffer_budget_bytes=budget)
+        memory_budget = 2 * item_size
+    runtime.set_server(memory_budget_bytes=host_budget, file_spill_budget_bytes=0)
+    runtime.set_client(memory_budget_bytes=memory_budget, file_spill_budget_bytes=file_spill_budget)
 
 
 def verify_value(value, digest: str, portable: bool) -> None:
@@ -333,7 +331,10 @@ def execute(row, data, proxy, mode, log, request_id, *, measurement=True):
                                           measurement=measurement, integrity_ok=False))
         run['observed_error'] = {'type': type(exc).__name__, 'message': str(exc),
                                  'phase': getattr(exc, 'transport_phase', None)}
-        run['capacity_error'] = isinstance(exc, error.CallCapacityExceeded) or 'memory budget cell' in str(exc)
+        run['capacity_error'] = isinstance(exc, error.CallCapacityExceeded) or (
+            isinstance(exc, error.ResourceUnavailable)
+            and exc.details.get('stage') == 'response_reassembly_admission'
+        )
         if not run['capacity_error']:
             raise
     finally:
@@ -368,29 +369,17 @@ def provenance():
 
 
 def assert_refunded(stats):
-    scopes = [stats['runtime_outgoing'], stats['server'], *stats['retired']]
-    for scope in scopes:
-        if scope is not None:
-            for name, cell in scope['cells'].items():
-                check(cell['used_bytes'] == 0, f'cleanup retains {scope["role"]}/{name}: {cell}')
-    for cell in [stats['payload_buffer'], *stats['retired_payload_buffers']]:
-        if cell is not None:
-            check(cell['used_bytes'] == 0, f'cleanup retains payload buffer: {cell}')
+    for role, name, cell in bench.budget_cells(stats):
+        check(cell['used_bytes'] == 0, f'cleanup retains {role}/{name}: {cell}')
     check(stats['holds']['active_holds'] == stats['holds']['total_held_bytes'] == 0,
           'cleanup retains holds')
 
 
 def memory_snapshot(runtime):
-    snapshot = dict(runtime.memory_stats())
-    scopes = [snapshot['runtime_outgoing'], snapshot['server'], *snapshot['retired']]
-    cells = [snapshot['payload_buffer'], *snapshot['retired_payload_buffers']]
-    for scope in scopes:
-        if scope is not None:
-            cells.extend(scope['cells'].values())
-    for cell in cells:
-        if cell is not None:
-            check(0 <= cell['used_bytes'] <= cell['peak_bytes'] <= cell['limit_bytes'],
-                  f'budget exceeds configured limit: {cell}')
+    snapshot = runtime.memory_stats()
+    for role, name, cell in bench.budget_cells(snapshot):
+        check(0 <= cell['used_bytes'] <= cell['peak_bytes'] <= cell['limit_bytes'],
+              f'{role}/{name} exceeds configured limit: {cell}')
     return snapshot
 
 
@@ -412,23 +401,26 @@ def overlapping(samples, large_runs):
 
 
 def verify_transport(row, mode, server, client, item_size, whole_size):
-    """Establish the configured transport with existing budget peaks, not inference from RSS."""
-    shm_peak = server['server']['cells']['shm']['peak_bytes']
-    outgoing = client['runtime_outgoing']['cells']
+    """Check that budget evidence matches the selected workload and capacity."""
+    host = server['server']['memory']
+    client_role = client['client']
+    memory = client_role['memory']
+    spill = client_role['file_spill']
     size = whole_size if mode == 'U' else item_size
-    capacity = expected_capacity(row, mode)
     if row['no_shm']:
-        check(shm_peak == 0, 'SHM-unavailable scenario used SHM', SCENARIO_NOT_ESTABLISHED)
-        if not capacity and mode in ('U', 'Q') and size > FRAME_BYTES:
-            check(outgoing['file']['peak_bytes'] > 0
-                  and outgoing['reassembly']['peak_bytes'] >= size,
-                  'file reassembly scenario not established', SCENARIO_NOT_ESTABLISHED)
-    elif not capacity:
-        check((shm_peak > 0) == (size > THRESHOLD), 'SHM threshold scenario not established', SCENARIO_NOT_ESTABLISHED)
-    if mode == 'S' and not capacity:
-        check(outgoing['file']['peak_bytes'] == outgoing['reassembly']['peak_bytes'] == 0,
-              'stream unexpectedly used unary reassembly')
-        check(client['payload_buffer']['peak_bytes'] >= item_size, 'stream B reservation not observable')
+        check(host['limit_bytes'] < size, 'Host memory could accommodate SHM', SCENARIO_NOT_ESTABLISHED)
+    elif not expected_capacity(row, mode):
+        if size > THRESHOLD:
+            check(host['peak_bytes'] >= size, 'Host backing not observable', SCENARIO_NOT_ESTABLISHED)
+        else:
+            check(host['peak_bytes'] < 4096, 'unexpected Host SHM allocation at or below inline threshold',
+                  SCENARIO_NOT_ESTABLISHED)
+    if row.get('file_fallback') and mode in ('U', 'Q'):
+        check(spill['peak_bytes'] >= size, 'file reassembly not observed', SCENARIO_NOT_ESTABLISHED)
+    else:
+        check(spill['peak_bytes'] == 0, 'unexpected client file spill')
+    if mode == 'S' and not expected_capacity(row, mode):
+        check(memory['peak_bytes'] >= item_size, 'stream item reservation not observable')
 
 
 def mixed_group(row, data, proxy, mode, log, job_id, output, timeout):
@@ -514,8 +506,8 @@ def hold_diagnostic(row, data, proxy, runtime, log, timeout):
     try:
         held.extend([next(stream), next(stream)])
         full = memory_snapshot(runtime)
-        check(full['payload_buffer']['used_bytes'] == full['payload_buffer']['limit_bytes']
-              == 2 * data['encoded_sizes'][0], 'two holds did not fill B')
+        check(full['client']['memory']['used_bytes'] == full['client']['memory']['limit_bytes']
+              == 2 * data['encoded_sizes'][0], 'two holds did not fill client memory')
         check(full['holds']['active_holds'] == 2, 'two holds not observable')
 
         def take():
@@ -531,7 +523,7 @@ def hold_diagnostic(row, data, proxy, runtime, log, timeout):
         while proxy.progress() < 3:
             check(time.perf_counter() < deadline, 'third resource step not established', SCENARIO_NOT_ESTABLISHED)
             time.sleep(0.005)
-        check(not finished.is_set(), 'third item crossed a full B')
+        check(not finished.is_set(), 'third item crossed a full client memory budget')
         log.event('hold_budget_full', memory=full, produced=proxy.progress())
         first = held.pop(0)
         check(hashlib.sha256(first.value).hexdigest() == data['digests'][0], 'first held item differs')
@@ -557,8 +549,8 @@ def hold_diagnostic(row, data, proxy, runtime, log, timeout):
         terminal = stream.close(timeout=timeout)
         check(terminal == dict(completed=True, error=None, complete_items=4), 'hold terminal differs')
         after = memory_snapshot(runtime)
-        check(after['payload_buffer']['used_bytes'] == 0
-              and after['payload_buffer']['rejected_allocations'] == 0
+        check(after['client']['memory']['used_bytes'] == 0
+              and after['client']['memory']['rejected_allocations'] == 0
               and after['holds']['active_holds'] == 0, 'hold resume rejected or retained data')
         return dict(mode='S', full=full, after=after, terminal=terminal)
     finally:
@@ -776,10 +768,10 @@ def verify_phase(report, directory, row, groups, modes, expected_commit):
                   'hold terminal differs')
             full, after = run['full'], run['after']
             check(full['holds']['active_holds'] == 2
-                  and full['payload_buffer']['used_bytes'] == full['payload_buffer']['limit_bytes']
+                  and full['client']['memory']['used_bytes'] == full['client']['memory']['limit_bytes']
                   == 2 * report['encoded_sizes'][0], 'hold saturation not established')
-            check(after['payload_buffer']['used_bytes'] == after['holds']['active_holds']
-                  == after['payload_buffer']['rejected_allocations'] == 0, 'hold release did not settle')
+            check(after['client']['memory']['used_bytes'] == after['holds']['active_holds']
+                  == after['client']['memory']['rejected_allocations'] == 0, 'hold release did not settle')
             return dict(full=full, after=after, terminal=run['terminal'])
         if kind == 'mixed':
             for mode in modes:

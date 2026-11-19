@@ -1,7 +1,7 @@
 //! Public native context tests, including descriptor-relative long paths.
 #![cfg(unix)]
 
-use c2_config::{ConfigResolver, ConfigSources, EnvFilePolicy, LocalEndpointOptions};
+use c2_config::{ConfigResolver, ConfigSources, EnvCatalog, EnvFilePolicy, LocalEndpointOptions};
 use c2_local::{
     DEFAULT_CONNECT_TIMEOUT, EndpointCredential, EndpointInspection, EndpointReapResult,
     EndpointSweep, LocalEndpoint, LocalEndpointContext, LocalListener, LocalStream, SweepBudget,
@@ -234,12 +234,15 @@ fn endpoint_context_child_fixture() {
     if action == "codec-environment" {
         // This exact fixture is the only test in an isolated child. No runtime
         // or other environment-reading application threads have been started.
-        let sources = || ConfigSources {
-            env_file: EnvFilePolicy::Disabled,
-            process_env: std::env::vars().collect(),
+        let sources = || {
+            EnvCatalog::load(ConfigSources {
+                env_file: EnvFilePolicy::Disabled,
+                ..ConfigSources::from_process()
+            })
+            .unwrap()
         };
         let captured =
-            ConfigResolver::resolve_local_endpoint(LocalEndpointOptions::default(), sources())
+            ConfigResolver::resolve_local_endpoint(LocalEndpointOptions::default(), &sources())
                 .unwrap();
         assert_eq!(captured.unix_root(), Some(Path::new(&root)));
         let endpoint = captured.endpoint(ADDRESS).unwrap();
@@ -256,7 +259,7 @@ fn endpoint_context_child_fixture() {
             std::env::set_var("C2_IPC_ROOT", &other);
         }
         assert_eq!(
-            ConfigResolver::resolve_local_endpoint(LocalEndpointOptions::default(), sources())
+            ConfigResolver::resolve_local_endpoint(LocalEndpointOptions::default(), &sources())
                 .unwrap(),
             context(Path::new(&other))
         );

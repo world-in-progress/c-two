@@ -57,7 +57,6 @@ async fn public_stop_fences_real_http_registration_control_watch_publication() {
             .unwrap();
         let config = RelayConfig {
             bind: "127.0.0.1:0".into(),
-            idle_timeout_secs: 0,
             ..RelayConfig::default()
         };
         let running = tokio::task::spawn_blocking(move || {
@@ -236,7 +235,6 @@ async fn replacement_acquire_reuses_healthy_client_and_exact_close_stays_isolate
             .unwrap();
         let config = RelayConfig {
             bind: "127.0.0.1:0".into(),
-            idle_timeout_secs: 0,
             ..RelayConfig::default()
         };
         let register_address = address.clone();
@@ -249,7 +247,6 @@ async fn replacement_acquire_reuses_healthy_client_and_exact_close_stays_isolate
         })
         .await
         .unwrap();
-        let socket = running.local_addr();
         let state = running.state_for_test();
         relay = Some(running);
         // Keep the controlled table transition independent of watch delivery.

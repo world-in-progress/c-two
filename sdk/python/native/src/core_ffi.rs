@@ -975,22 +975,25 @@ mod payload_tests {
     fn response_copy_releases_reassembly_before_local_hold() {
         Python::initialize();
         Python::attach(|py| {
+            let budget = c2_mem::DomainBudget::from_limits(&c2_config::DomainLimits::default());
             let pool = Arc::new(parking_lot::RwLock::new(
-                c2_mem::MemPool::new(c2_mem::PoolConfig {
-                    segment_size: 65536,
-                    min_block_size: 4096,
-                    ..Default::default()
-                })
+                c2_mem::MemPool::new_with_budget(
+                    c2_mem::PoolConfig {
+                        pool_enabled: false,
+                        spill_threshold: 1.0,
+                        ..Default::default()
+                    },
+                    budget.clone(),
+                )
                 .unwrap(),
             ));
-            let budget = pool.read().budget().unwrap().clone();
             let mut backing =
                 c2_wire::chunk::backing::ReassemblyBacking::admit(pool.clone(), 1, 512).unwrap();
             backing.write_at(0, &[b'r'; 512]).unwrap();
-            assert_eq!(budget.snapshot().reassembly.used_bytes, 512);
+            assert!(budget.snapshot().memory.used_bytes >= 512);
             let held =
                 HeldResponse::from_response_data(c2_ipc::ResponseData::Handle(backing)).unwrap();
-            assert_eq!(budget.snapshot().reassembly.used_bytes, 0);
+            assert_eq!(budget.snapshot().memory.used_bytes, 0);
             assert_eq!(pool.read().stats().alloc_count, 0);
             let owner = PyCoreResponse::new(held);
             let tracker = tracker();

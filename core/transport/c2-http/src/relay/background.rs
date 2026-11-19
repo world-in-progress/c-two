@@ -41,7 +41,7 @@ pub fn spawn_background_tasks(
         handles.push(tokio::spawn(failure_detection_loop(s, c)));
     }
 
-    if !config.anti_entropy_interval.is_zero() {
+    {
         let s = state.clone();
         let c = cancel.clone();
         handles.push(tokio::spawn(anti_entropy_loop(s, c)));
@@ -129,9 +129,7 @@ fn tombstone_retention(state: &RelayState) -> Duration {
     const MIN_RETENTION: Duration = Duration::from_secs(600);
     let alive_peer_count = state.with_route_table(|rt| rt.alive_peers().len()).max(1);
     let rounds = alive_peer_count.saturating_mul(2).min(u32::MAX as usize) as u32;
-    let anti_entropy_window = state
-        .config()
-        .anti_entropy_interval
+    let anti_entropy_window = c2_config::RELAY_ANTI_ENTROPY_INTERVAL
         .checked_mul(rounds)
         .unwrap_or(Duration::MAX);
     MIN_RETENTION.max(anti_entropy_window)
@@ -179,7 +177,7 @@ async fn failure_detection_loop(state: Arc<RelayState>, cancel: CancellationToke
 
 /// Round-robin anti-entropy digest exchange with one alive peer per tick.
 async fn anti_entropy_loop(state: Arc<RelayState>, cancel: CancellationToken) {
-    let interval = state.config().anti_entropy_interval;
+    let interval = c2_config::RELAY_ANTI_ENTROPY_INTERVAL;
     let mut ticker = tokio::time::interval(interval);
     ticker.tick().await;
     let mut round_robin_idx: usize = 0;
@@ -396,7 +394,6 @@ mod tests {
             Arc::new(c2_config::RelayConfig {
                 seeds: vec![seed],
                 heartbeat_interval: Duration::ZERO,
-                anti_entropy_interval: Duration::ZERO,
                 dead_peer_probe_interval: Duration::ZERO,
                 seed_retry_interval: Duration::ZERO,
                 ..Default::default()
@@ -404,11 +401,17 @@ mod tests {
             Arc::new(crate::relay::test_support::NoopDisseminator),
         ));
         let cancel = CancellationToken::new();
-        let mut handles = spawn_background_tasks(state, cancel.clone());
-        tokio::time::timeout(Duration::from_secs(2), handles.remove(0))
-            .await
-            .unwrap()
-            .unwrap();
+        let handles = spawn_background_tasks(state, cancel.clone());
+        // Anti-entropy is always spawned (fixed 60s interval, first real tick
+        // after a full interval), so the one-shot seed join is observed by its
+        // effect rather than by task-list position.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while joins.load(Ordering::SeqCst) < 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("seed bootstrap must join exactly once");
         assert_eq!(joins.load(Ordering::SeqCst), 1);
         cancel.cancel();
         for handle in handles {

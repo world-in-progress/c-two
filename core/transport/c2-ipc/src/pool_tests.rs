@@ -101,7 +101,7 @@ impl Serving {
     }
 
     fn pool(&self, grace: Duration) -> ClientPool {
-        ClientPool::with_endpoint_context(grace, self.context.clone())
+        ClientPool::with_grace_period_and_context(Some(grace), self.context.clone())
     }
 
     fn closed(&self, client: &SyncClient) -> ConnectionClosed {
@@ -139,7 +139,7 @@ fn eviction_deactivates_physical_connection_after_pending_work() {
     });
     let events = serving.servers[0].connection_events();
     let pool = serving.pool(Duration::ZERO);
-    let client = pool.acquire(&address, None).unwrap();
+    let client = pool.acquire(&address).unwrap();
     let observation = serving.runtime.block_on(async {
         match tokio::time::timeout(WAIT, events.recv())
             .await
@@ -166,12 +166,12 @@ fn eviction_deactivates_physical_connection_after_pending_work() {
 
 #[test]
 fn seal_guard_is_reversible_and_deadline_waits_are_bounded() {
-    let pool = ClientPool::new(WAIT);
+    let pool = ClientPool::new();
     let before = pool.state.lock().epoch;
     drop(pool.prepare_seal(Instant::now() + WAIT).unwrap());
     assert_eq!(pool.state.lock().epoch, before);
     assert!(matches!(
-        pool.acquire("http://invalid", None),
+        pool.acquire("http://invalid"),
         Err(IpcError::Config(_))
     ));
 
@@ -182,7 +182,7 @@ fn seal_guard_is_reversible_and_deadline_waits_are_bounded() {
             .unwrap();
     let start = Instant::now();
     let error = pool
-        .acquire_lease_with_deadline("ipc://blocked", None, deadline)
+        .acquire_lease_with_deadline("ipc://blocked", deadline)
         .err()
         .expect("state lock wait must expire");
     assert!(start.elapsed() < Duration::from_secs(1), "{error:?}");
@@ -191,7 +191,7 @@ fn seal_guard_is_reversible_and_deadline_waits_are_bounded() {
 
     let seed = pool.prepare_seal(Instant::now() + WAIT).unwrap().commit();
     assert!(matches!(
-        pool.acquire("ipc://sealed", None),
+        pool.acquire("ipc://sealed"),
         Err(IpcError::PoolRetired)
     ));
     let mut observed = pool.observe_closes();
@@ -199,15 +199,15 @@ fn seal_guard_is_reversible_and_deadline_waits_are_bounded() {
     let report = observed.close_all(Duration::from_millis(20));
     assert!(report.error.is_none(), "{report:?}");
     assert!(matches!(
-        pool.acquire("ipc://sealed", None),
+        pool.acquire("ipc://sealed"),
         Err(IpcError::PoolRetired)
     ));
 }
 
 #[test]
 fn close_observation_seed_is_pool_bound_and_consumed_once() {
-    let first = ClientPool::new(WAIT);
-    let second = ClientPool::new(WAIT);
+    let first = ClientPool::new();
+    let second = ClientPool::new();
     let seed = first.prepare_seal(Instant::now() + WAIT).unwrap().commit();
     let mut wrong = second.observe_closes();
     assert!(
@@ -256,7 +256,7 @@ fn original_native_abnormal_end_survives_timeout_and_late_seed_merge() {
     });
     ready_rx.recv_timeout(WAIT).unwrap();
     let pool = serving.pool(WAIT);
-    let client = pool.acquire(&address, None).unwrap();
+    let client = pool.acquire(&address).unwrap();
     let native = client.connection_observation().unwrap();
 
     // Keep the original native observation while removing the business cache
@@ -338,7 +338,7 @@ fn in_flight_connect_is_fenced(sealed: bool) {
     let acquiring = {
         let pool = pool.clone();
         let address = address.clone();
-        thread::spawn(move || pool.acquire(&address, None))
+        thread::spawn(move || pool.acquire(&address))
     };
     request_rx.recv_timeout(WAIT).unwrap();
     let mut observed = pool.observe_closes();
@@ -519,7 +519,7 @@ fn concurrent_acquires(
             let barrier = barrier.clone();
             thread::spawn(move || {
                 barrier.wait();
-                pool.acquire_lease_with_deadline(&address, None, ConnectDeadline::default())
+                pool.acquire_lease_with_deadline(&address, ConnectDeadline::default())
             })
         })
         .collect();
@@ -564,15 +564,9 @@ fn concurrent_empty_pool_acquires_share_one_connection() {
     wait_for_connect_references(&pool, address, 8);
     assert_eq!(peer.connections(), 1);
 
-    let divergent = ClientIpcConfig {
-        shm_threshold: ClientIpcConfig::default().shm_threshold + 1,
-        ..Default::default()
-    };
-    let error = pool.acquire(address, Some(&divergent)).err().unwrap();
-    assert!(matches!(error, IpcError::Pool(_)) && error.to_string().contains("shm_threshold"));
     // Another address remains usable while this address's handshake is held.
     let other_address = serving.start("independent_connect");
-    let other = pool.acquire(&other_address, None).unwrap();
+    let other = pool.acquire(&other_address).unwrap();
     assert!(other.is_connected());
     assert!(pool.release_if_same(&other_address, &other));
 
@@ -643,8 +637,8 @@ fn shared_connect_failure_retains_native_io_cause() {
     let link = root.path().join("link");
     std::os::unix::fs::symlink(root.path(), &link).unwrap();
     let context = LocalEndpointContext::with_unix_root(&link).unwrap();
-    let pool = ClientPool::with_endpoint_context(None, context);
-    let failure = pool.acquire("ipc://native_cause", None).err().unwrap();
+    let pool = ClientPool::with_grace_period_and_context(None, context);
+    let failure = pool.acquire("ipc://native_cause").err().unwrap();
     let shared = crate::client::stream::clone_observation_error(&failure);
     let (IpcError::Connect(original), IpcError::Connect(copy)) = (&failure, &shared) else {
         panic!("expected the same pre-dispatch connection failure: {failure:?}, {shared:?}");
@@ -672,7 +666,6 @@ fn connect_waiter_deadline_preserves_shared_attempt() {
         move || {
             pool.acquire_lease_with_deadline(
                 address,
-                None,
                 ConnectDeadline::start(ConnectOptions::new().with_timeout(Duration::from_secs(1)))
                     .unwrap(),
             )
@@ -714,7 +707,7 @@ fn concurrent_drains_serialize_and_reject_acquires_with_aggregate_deadline() {
     let pool = Arc::new(serving.pool(WAIT));
     let mut retained = Vec::new();
     for address in [&a, &b] {
-        let client = pool.acquire(address, None).unwrap();
+        let client = pool.acquire(address).unwrap();
         let native = client.connection_observation().unwrap();
         let mut state = pool.state.lock();
         state.entries.remove(address).unwrap();
@@ -733,7 +726,7 @@ fn concurrent_drains_serialize_and_reject_acquires_with_aggregate_deadline() {
         thread::yield_now();
     }
     assert!(pool.state.lock().draining, "first drain started");
-    assert!(matches!(pool.acquire(&a, None), Err(IpcError::Pool(_))));
+    assert!(matches!(pool.acquire(&a), Err(IpcError::Pool(_))));
     let second = pool.close_all(Duration::from_millis(20));
     assert!(
         second
@@ -760,16 +753,16 @@ fn real_expiry_discard_and_drain_close_exact_connections() {
     let b = serving.start("pool_b");
     let pool = serving.pool(Duration::from_millis(20));
     let first = pool
-        .acquire_lease_with_deadline(&a, None, ConnectDeadline::default())
+        .acquire_lease_with_deadline(&a, ConnectDeadline::default())
         .unwrap();
     let first_client = first.client().clone();
     let active = pool
-        .acquire_lease_with_deadline(&b, None, ConnectDeadline::default())
+        .acquire_lease_with_deadline(&b, ConnectDeadline::default())
         .unwrap();
     drop(first);
     thread::sleep(Duration::from_millis(30));
     let replacement = pool
-        .acquire_lease_with_deadline(&a, None, ConnectDeadline::default())
+        .acquire_lease_with_deadline(&a, ConnectDeadline::default())
         .unwrap();
     assert!(!Arc::ptr_eq(&first_client, replacement.client()));
     assert_eq!(
@@ -786,7 +779,7 @@ fn real_expiry_discard_and_drain_close_exact_connections() {
     assert!(active.is_connected());
 
     let idle = pool
-        .acquire_lease_with_deadline(&a, None, ConnectDeadline::default())
+        .acquire_lease_with_deadline(&a, ConnectDeadline::default())
         .unwrap();
     let idle_client = idle.client().clone();
     drop(idle);
@@ -809,7 +802,7 @@ fn real_expiry_discard_and_drain_close_exact_connections() {
         ConnectionEndReason::LocalClose
     );
     let fresh = pool
-        .acquire_lease_with_deadline(&b, None, ConnectDeadline::default())
+        .acquire_lease_with_deadline(&b, ConnectDeadline::default())
         .unwrap();
     assert!(!Arc::ptr_eq(active.client(), fresh.client()));
     assert!(pool.close_all(WAIT).error.is_none());
@@ -822,10 +815,10 @@ fn close_all_closes_active_and_idle_connections_then_opens_fresh_epoch() {
     let b = serving.start("close_idle");
     let pool = serving.pool(WAIT);
     let active = pool
-        .acquire_lease_with_deadline(&a, None, ConnectDeadline::default())
+        .acquire_lease_with_deadline(&a, ConnectDeadline::default())
         .unwrap();
     let idle = pool
-        .acquire_lease_with_deadline(&b, None, ConnectDeadline::default())
+        .acquire_lease_with_deadline(&b, ConnectDeadline::default())
         .unwrap();
     let idle_client = idle.client().clone();
     drop(idle);
@@ -846,7 +839,7 @@ fn close_all_closes_active_and_idle_connections_then_opens_fresh_epoch() {
         ConnectionEndReason::LocalClose
     );
     let fresh = pool
-        .acquire_lease_with_deadline(&a, None, ConnectDeadline::default())
+        .acquire_lease_with_deadline(&a, ConnectDeadline::default())
         .unwrap();
     assert!(!Arc::ptr_eq(active.client(), fresh.client()));
     assert!(pool.close_all(WAIT).error.is_none());
@@ -857,97 +850,31 @@ fn finite_budget_is_shared_within_one_cache_and_isolated_across_caches() {
     let mut serving = Serving::new();
     let a = serving.start("budget_a");
     let b = serving.start("budget_b");
-    let config = ClientIpcConfig {
-        base: c2_config::BaseIpcConfig {
-            shm_backing_budget_bytes: 65_536,
-            file_backing_budget_bytes: 32_768,
-            live_reassembly_budget_bytes: 16_384,
-            ..Default::default()
-        },
-        ..Default::default()
-    };
-    let pool = serving.pool(WAIT);
-    let first = pool
-        .acquire_lease_with_deadline(&a, Some(&config), ConnectDeadline::default())
-        .unwrap();
-    let second = pool
-        .acquire_lease_with_deadline(&b, Some(&config), ConnectDeadline::default())
-        .unwrap();
-    assert_eq!(pool.active_count(), 2);
-    let observer = pool.memory_budget_observer().unwrap();
-    assert_eq!(observer.limits(), config.memory_budget_limits());
+    let budget = DomainBudget::from_limits(&DomainLimits {
+        memory_budget_bytes: 65_536,
+        file_spill_budget_bytes: 32_768,
+        max_outstanding_calls: 4,
+    });
+    let pool =
+        ClientPool::with_endpoint_context_and_budget(serving.context.clone(), budget.clone());
+    let first = pool.acquire(&a).unwrap();
+    let second = pool.acquire(&b).unwrap();
     assert!(first.is_connected() && second.is_connected());
-
     let other = serving.pool(WAIT);
-    let independent = other
-        .acquire_lease_with_deadline(&a, Some(&config), ConnectDeadline::default())
-        .unwrap();
+    let independent = other.acquire(&a).unwrap();
     assert!(independent.is_connected());
-    assert!(
-        !observer
-            .downgrade()
-            .ptr_eq(&other.memory_budget_observer().unwrap().downgrade())
+    assert_ne!(
+        pool.domain_snapshot().domain_id,
+        other.domain_snapshot().domain_id
     );
-    let shared_budget = pool.state.lock().budget.clone().unwrap();
-    let reservation = shared_budget
-        .reserve(c2_mem::BudgetKind::File, 32_768)
-        .unwrap();
-    assert_eq!(observer.snapshot().file.used_bytes, 32_768);
-    assert!(shared_budget.reserve(c2_mem::BudgetKind::File, 1).is_err());
-    let independent_budget = other.state.lock().budget.clone().unwrap();
-    let independent_reservation = independent_budget
-        .reserve(c2_mem::BudgetKind::File, 32_768)
-        .unwrap();
-    drop(independent_reservation);
+    let reservation = budget.try_reserve_file_spill(32_768).unwrap();
+    assert_eq!(pool.domain_snapshot().file_spill.used_bytes, 32_768);
+    assert!(pool.domain_budget().try_reserve_file_spill(1).is_err());
+    assert_eq!(other.domain_snapshot().file_spill.used_bytes, 0);
     drop(reservation);
+    assert_eq!(pool.close_all(WAIT).detached, 2);
+    assert_eq!(pool.domain_snapshot().file_spill.used_bytes, 0);
     assert!(other.close_all(WAIT).error.is_none());
-
-    let mut changed = config.clone();
-    changed.base.shm_backing_budget_bytes += 1;
-    assert!(pool.set_default_config(changed.clone()).is_err());
-    assert!(pool.acquire(&a, Some(&changed)).is_err());
-    let report = pool.close_all(WAIT);
-    assert_eq!(report.detached, 2, "{report:?}");
-    assert_eq!(
-        pool.memory_budget_observer().unwrap().snapshot(),
-        observer.snapshot()
-    );
-}
-
-#[test]
-fn cache_hit_requires_full_resolved_policy() {
-    let mut serving = Serving::new();
-    let address = serving.start("policy");
-    let pool = serving.pool(WAIT);
-    let config = ClientIpcConfig::default();
-    let first = pool.acquire(&address, Some(&config)).unwrap();
-    assert!(Arc::ptr_eq(
-        &first,
-        &pool.acquire(&address, Some(&config)).unwrap()
-    ));
-    let mut variants = Vec::new();
-    let mut threshold = config.clone();
-    threshold.shm_threshold += 1;
-    variants.push(("shm_threshold", threshold));
-    let mut chunk = config.clone();
-    chunk.base.chunk_size += 1;
-    variants.push(("chunk_size", chunk));
-    let mut decay = config.clone();
-    decay.pool_decay_seconds += 1.0;
-    variants.push(("pool_decay_seconds", decay));
-    for (field, requested) in variants {
-        assert_eq!(
-            requested.memory_budget_limits(),
-            config.memory_budget_limits()
-        );
-        let error = pool.acquire(&address, Some(&requested)).err().unwrap();
-        assert!(error.to_string().contains(field), "{error:?}");
-        assert!(Arc::ptr_eq(
-            &first,
-            &pool.acquire(&address, Some(&config)).unwrap()
-        ));
-    }
-    assert_eq!(pool.close_all(WAIT).detached, 1);
 }
 
 struct Echo;
@@ -1010,11 +937,9 @@ fn registration_attestation_accepts_committed_closed_route() {
         .block_on(server.wait_until_responsive(WAIT))
         .unwrap();
     serving.servers.push(Arc::clone(&server));
-    let mut client = crate::client::IpcClient::with_endpoint(
-        serving.context.endpoint(address).unwrap(),
-        ClientIpcConfig::default(),
-    )
-    .unwrap();
+    let mut client =
+        crate::client::IpcClient::with_endpoint(serving.context.endpoint(address).unwrap())
+            .unwrap();
     serving.runtime.block_on(async {
         client.connect().await.unwrap();
         assert!(matches!(
@@ -1111,7 +1036,7 @@ fn retired_pool_client_preserves_sent_reply(discard: bool, force_close: bool) {
     serving.servers.push(server);
 
     let pool = serving.pool(WAIT);
-    let old = pool.acquire(address, None).unwrap();
+    let old = pool.acquire(address).unwrap();
     let old_binding = old.acquire_route(&expected).unwrap();
     let old_observation = old.connection_observation().unwrap();
     let old_call = {
@@ -1125,7 +1050,7 @@ fn retired_pool_client_preserves_sent_reply(discard: bool, force_close: bool) {
         old.deactivate();
     }
     assert!(!old.is_connected());
-    let replacement = pool.acquire(address, None).unwrap();
+    let replacement = pool.acquire(address).unwrap();
     assert!(!Arc::ptr_eq(&old, &replacement));
     let new_binding = replacement.acquire_route(&expected).unwrap();
     assert_eq!(

@@ -1,11 +1,11 @@
 use crate::LifecycleError;
-use c2_mem::retention::{BudgetedBuffer, PayloadBufferReservation};
+use c2_mem::{BudgetedBuffer, MemoryReservation};
 
 /// Local response bytes owned independently of transport storage or connections.
 /// SDKs invalidate their checked payload owner before ending this local buffer.
 pub struct HeldResponse {
     bytes: Vec<u8>,
-    reservation: Option<PayloadBufferReservation>,
+    reservation: Option<MemoryReservation>,
     released: bool,
 }
 
@@ -68,21 +68,24 @@ impl HeldResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use c2_mem::retention::PayloadBufferBudget;
+    use c2_mem::DomainBudget;
     use std::cell::Cell;
 
     #[test]
-    fn http_hold_keeps_b_until_invalidation_and_buffer_release() {
-        let budget = PayloadBufferBudget::new(4);
-        let bytes = BudgetedBuffer::new(vec![1; 4], budget.reserve_blocking(4, None).unwrap());
+    fn http_hold_keeps_memory_charged_through_invalidation() {
+        let budget = DomainBudget::from_limits(&c2_config::DomainLimits {
+            memory_budget_bytes: 4,
+            ..Default::default()
+        });
+        let bytes = BudgetedBuffer::new(vec![1; 4], budget.try_reserve_memory(4).unwrap());
         let mut held = HeldResponse::from_budgeted_bytes(bytes);
-        assert_eq!(budget.snapshot().used_bytes, 4);
+        assert_eq!(budget.snapshot().memory.used_bytes, 4);
         held.invalidate_then_release(|| {
-            assert_eq!(budget.snapshot().used_bytes, 4);
+            assert_eq!(budget.snapshot().memory.used_bytes, 4);
             Ok(())
         })
         .unwrap();
-        assert_eq!(budget.snapshot().used_bytes, 0);
+        assert_eq!(budget.snapshot().memory.used_bytes, 0);
     }
 
     #[test]

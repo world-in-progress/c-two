@@ -2,11 +2,15 @@
 //! Keep the expected headers and bodies independent of the production codec.
 
 use crate::buddy::BuddyPayload;
+use crate::frame::decode_frame;
 use crate::rpc::{
-    CallMode, CallStatus, CancelCause, RouteCallIdentity, RpcRecordKind, ValuePart, ValueStorage,
-    encode_call_end_frame, encode_cancel_frame, encode_credit_frame, encode_item_begin_frame,
-    encode_item_data_frame, encode_open_frame, encode_value_continuation_frame,
+    CallMode, CallStatus, CancelCause, MAX_INLINE_CALL_END_ERROR_BYTES, RouteCallIdentity,
+    RpcRecordKind, ValuePart, ValueStorage, bounded_call_end_error_bytes, decode_rpc_record,
+    encode_call_end_error_frame, encode_call_end_frame, encode_cancel_frame, encode_credit_frame,
+    encode_item_begin_frame, encode_item_data_frame, encode_open_frame,
+    encode_value_continuation_frame,
 };
+use c2_error::{C2Error, ErrorCode};
 
 const REQUEST_ID: u64 = 0x0807_0605_0403_0201;
 const RID_BYTES: [u8; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
@@ -321,4 +325,96 @@ fn credit_and_both_cancel_causes_match_whole_frames() {
             frame([0x0e, 0, 0, 0], [0, 0x10, 0, 0], &[5, byte]),
         );
     }
+}
+
+#[test]
+fn bounded_call_end_error_returns_small_errors_byte_identical() {
+    let error = C2Error::new(ErrorCode::CallCancelled, "cancelled");
+    assert_eq!(
+        bounded_call_end_error_bytes(&error),
+        error.to_wire_bytes(),
+        "a fitting error must never be re-encoded"
+    );
+    let detailed = C2Error::new(ErrorCode::RouteConflict, "duplicate online route").with_details(
+        std::collections::BTreeMap::from([
+            ("route".to_string(), "grid".to_string()),
+            ("cause_kind".to_string(), "TransportIo".to_string()),
+        ]),
+    );
+    assert_eq!(
+        bounded_call_end_error_bytes(&detailed),
+        detailed.to_wire_bytes()
+    );
+}
+
+#[test]
+fn oversized_call_end_error_is_truncated_into_the_frame_budget() {
+    let error = C2Error::new(ErrorCode::CallCancelled, "x".repeat(2 * 1024 * 1024 + 7))
+        .with_details(std::collections::BTreeMap::from([
+            ("big".to_string(), "y".repeat(64 * 1024)),
+            ("small".to_string(), "kept".to_string()),
+        ]));
+    let bytes = bounded_call_end_error_bytes(&error);
+    assert!(bytes.len() <= MAX_INLINE_CALL_END_ERROR_BYTES);
+    let decoded = C2Error::from_wire_bytes(&bytes).unwrap().unwrap();
+    assert_eq!(decoded.code, ErrorCode::CallCancelled);
+    assert_eq!(decoded.code.name(), error.code.name());
+    assert_eq!(
+        decoded.details.get("truncated").map(String::as_str),
+        Some("true")
+    );
+
+    let frame = encode_call_end_error_frame(
+        REQUEST_ID,
+        CallMode::ServerStream,
+        CallStatus::Failed,
+        12,
+        &error,
+    )
+    .unwrap();
+    let (header, payload) = decode_frame(&frame).unwrap();
+    assert!(
+        u64::from(header.total_len) <= c2_config::MAX_RPC_FRAME_BYTES,
+        "total_len {} exceeds the frame budget",
+        header.total_len
+    );
+    // The bounded frame decodes through the production record codec.
+    let record = decode_rpc_record(&header, payload, Some(CallMode::ServerStream)).unwrap();
+    let crate::rpc::RpcRecord::CallEnd {
+        status,
+        complete_items,
+        error: decoded_error,
+        ..
+    } = record
+    else {
+        panic!("expected CALL_END");
+    };
+    assert_eq!(status, CallStatus::Failed);
+    assert_eq!(complete_items, Some(12));
+    let decoded_error = decoded_error.expect("error must decode");
+    assert_eq!(decoded_error.code, ErrorCode::CallCancelled);
+    assert_eq!(
+        decoded_error.details.get("truncated").map(String::as_str),
+        Some("true")
+    );
+    // The decoded message is valid UTF-8/JSON by construction; the marker
+    // proves the truncation happened through the bounded path.
+    assert!(decoded_error.message.ends_with("...[truncated]"));
+}
+
+#[test]
+fn multibyte_call_end_error_truncation_preserves_char_boundaries() {
+    let error = C2Error::new(ErrorCode::CallCancelled, "失".repeat(600_000));
+    let bytes = bounded_call_end_error_bytes(&error);
+    assert!(bytes.len() <= MAX_INLINE_CALL_END_ERROR_BYTES);
+    let decoded = C2Error::from_wire_bytes(&bytes).unwrap().unwrap();
+    assert_eq!(decoded.code, ErrorCode::CallCancelled);
+    assert_eq!(decoded.code.name(), error.code.name());
+    // Decoding yields a valid String, so every cut landed on a char boundary.
+    assert!(decoded.message.ends_with("...[truncated]"));
+    assert!(decoded.message.len() < 3 * 600_000);
+    assert_eq!(
+        decoded.details.get("truncated").map(String::as_str),
+        Some("true")
+    );
 }

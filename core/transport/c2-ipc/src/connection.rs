@@ -6,7 +6,7 @@ use c2_local::{
     AbortHandle, ConnectionEndReason, ConnectionPublisher, LocalReadHalf, LocalWriteHalf,
     RemoteReadGuard,
 };
-use c2_mem::{MemPool, retention::PayloadBufferReservation};
+use c2_mem::{MemPool, MemoryReservation};
 use c2_wire::{
     chunk::ChunkRegistry,
     connection::{
@@ -55,7 +55,7 @@ struct Submission {
     bytes: Vec<u8>,
     // The queue and writer own the actual frame even when its submit waiter
     // ends before publication. Keep its payload charge with those bytes.
-    _payload_owner: Option<Arc<PayloadBufferReservation>>,
+    _payload_owner: Option<Arc<MemoryReservation>>,
     request: Arc<Mutex<Option<WriteRequest>>>,
     state: Arc<Mutex<SendState>>,
     policy: Option<IpcCallControl>,
@@ -529,7 +529,7 @@ impl ClientConnection {
         request: WriteRequest,
         state: Arc<Mutex<SendState>>,
         policy: Option<IpcCallControl>,
-        payload_owner: Arc<PayloadBufferReservation>,
+        payload_owner: Arc<MemoryReservation>,
     ) -> Result<(), IpcError> {
         self.submit_with_owner(bytes, request, state, policy, Some(payload_owner))
             .await
@@ -541,7 +541,7 @@ impl ClientConnection {
         request: WriteRequest,
         state: Arc<Mutex<SendState>>,
         policy: Option<IpcCallControl>,
-        payload_owner: Option<Arc<PayloadBufferReservation>>,
+        payload_owner: Option<Arc<MemoryReservation>>,
     ) -> Result<(), IpcError> {
         // Subscribe before waiting for queue capacity. Deactivation must wake
         // unpublished calls even while the writer and all 64 queue slots stall.

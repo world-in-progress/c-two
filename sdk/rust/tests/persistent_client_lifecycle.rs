@@ -4,8 +4,9 @@ mod fixture;
 
 use c_two::CallOptions;
 use c_two::generated::EncodedClient;
-use fixture::{Fixture, PathKind, observe_until};
+use fixture::{Fixture, PathKind, WAIT, observe_until};
 use std::sync::{Arc, Barrier};
+use std::time::Duration;
 
 fn assert_pre_dispatch_route_refusal(error: c_two::Error, code: fixture::ErrorCode) {
     let c_two::Error::Semantic(ref semantic) = error else {
@@ -43,7 +44,7 @@ fn persistent_relay_http_sees_later_builder() {
 }
 
 fn late_builder(path: PathKind) {
-    let fixture = Fixture::new(path, 0.0, 0);
+    let fixture = Fixture::new(path);
     let manager = fixture.register("manager");
     let manager_client = fixture.connect(&manager);
     fixture.call(&manager_client, &manager, "manager-before-builder");
@@ -94,14 +95,21 @@ fn relay_local_idle_eviction_retains_route_and_coalesces_concurrent_reconnects()
 }
 
 fn sdk_idle(path: PathKind) {
-    let fixture = Fixture::new(path, 0.05, 0);
+    let fixture = Fixture::new(path);
     let route = fixture.register("idle");
     let client = fixture.connect(&route);
     fixture.call(&client, &route, "before-eviction");
     let old = client.connection_observation().unwrap();
     assert!(old.snapshot().is_none());
     drop(client);
-    observe_until(|| old.snapshot().is_some());
+    let deadline = std::time::Instant::now() + c2_config::IDLE_CONNECTION_TIMEOUT + WAIT;
+    while old.snapshot().is_none() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "client did not evict idle connection"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
     assert!(!route.registration.is_closed());
     assert_eq!(route.calls(), 1);
     let barrier = Arc::new(Barrier::new(8));
@@ -160,7 +168,7 @@ fn relay_http_closed_probe_rejects_acquire_and_preserves_entered_call() {
 }
 
 fn route_authority(path: PathKind) {
-    let fixture = Fixture::new(path, 0.0, 0);
+    let fixture = Fixture::new(path);
     let mut route = fixture.register("authority");
     let old = fixture.connect(&route);
     let entered_client = old.clone();
@@ -269,7 +277,7 @@ fn route_authority(path: PathKind) {
 // the registration, and the old proxy reaches the current resource.
 #[test]
 fn relay_local_removed_and_reregistered_routes_preserve_old_binding() {
-    let fixture = Fixture::new(PathKind::Local, 0.0, 0);
+    let fixture = Fixture::new(PathKind::Local);
     let mut route = fixture.register("replacement");
     let old = fixture.connect(&route);
     fixture.call(&old, &route, "before-removal");
@@ -301,7 +309,7 @@ fn relay_local_removed_and_reregistered_routes_preserve_old_binding() {
 
 #[test]
 fn relay_local_first_acquire_uses_current_registration() {
-    let fixture = Fixture::new(PathKind::Local, 0.0, 0);
+    let fixture = Fixture::new(PathKind::Local);
     let mut route = fixture.register("current-resolution");
     let old = fixture.connect(&route);
     fixture.call(&old, &route, "initial-resolution");
@@ -331,7 +339,7 @@ fn relay_local_real_process_same_endpoint_reregistration_uses_current_resource()
 }
 
 fn real_process_same_endpoint_reregistration(path: PathKind) {
-    let fixture = Fixture::new(path, 0.0, 0);
+    let fixture = Fixture::new(path);
     let mut peer = fixture::ResourceProcess::start(&fixture, &fixture::unique("same-endpoint"));
     let old = peer.connect(&fixture);
     let old_connection = old.connection_observation().unwrap();
@@ -410,7 +418,7 @@ fn relay_local_route_errors_preserve_other_route_inflight_call_and_carrier() {
 }
 
 fn route_errors_are_local(path: PathKind) {
-    let fixture = Fixture::new(path, 0.0, 0);
+    let fixture = Fixture::new(path);
     let a = fixture.register("a");
     let mut b = fixture.register("b");
     let a_client = fixture.connect(&a);
@@ -486,7 +494,7 @@ fn route_errors_are_local(path: PathKind) {
 // no callback runs after relay withdrawal.
 #[test]
 fn relay_http_removed_route_refuses_acquire_and_old_call() {
-    let fixture = Fixture::new(PathKind::Http, 0.0, 0);
+    let fixture = Fixture::new(PathKind::Http);
     let mut route = fixture.register("removed-http");
     let old = fixture.connect(&route);
     fixture.call(&old, &route, "before-removal");
@@ -557,7 +565,7 @@ fn relay_http_other_acquire_does_not_change_old_proxy_target() {
 #[test]
 fn relay_http_idle_eviction_retains_route_and_coalesces_concurrent_reconnects() {
     use c_two::observe::ConnectionEvent;
-    let fixture = Fixture::new(PathKind::Http, 0.0, 1);
+    let fixture = Fixture::with_relay_idle_timeout(Duration::from_secs(1));
     let route = fixture.register("idle-http");
     let client = fixture.connect(&route);
     fixture.call(&client, &route, "before-eviction");
@@ -647,7 +655,7 @@ fn relay_http_peer_end_preserves_delivered_item_and_existing_proxy_follows() {
 }
 fn peer_end_and_recovery(path: PathKind) {
     let fixture = if path == PathKind::Direct {
-        Fixture::new(path, 0.0, 0)
+        Fixture::new(path)
     } else {
         Fixture::with_c3_path(path)
     };
@@ -825,7 +833,7 @@ fn direct_late_old_result_and_terminal_preserve_restarted_target() {
     // ADR 0004: "注册结束时正在进行的调用照旧报完成或派发不确定，从不重放".
     // The public SDK item decoder is the response-delivery seam: all native
     // I/O is real, and the old stream still observes its original terminal.
-    let fixture = Fixture::new(PathKind::Direct, 0.0, 0);
+    let fixture = Fixture::new(PathKind::Direct);
     let id = fixture::unique("late-direct");
     let mut peer = fixture::ResourceProcess::start(&fixture, &id);
     let client = peer.connect(&fixture);
@@ -1013,7 +1021,7 @@ fn c3_mesh_follow(explicit: bool) {
 #[test]
 fn relay_http_route_errors_preserve_other_route_inflight_call_and_carrier() {
     use c_two::observe::ConnectionEvent;
-    let fixture = Fixture::new(PathKind::Http, 0.0, 0);
+    let fixture = Fixture::new(PathKind::Http);
     let a = fixture.register("a-http");
     let mut b = fixture.register("closed-b-http");
     let mut token = fixture.register("stale-b-http");
@@ -1122,7 +1130,7 @@ fn relay_http_resource_error_is_terminal_without_replay_or_reconnect() {
     resource_error(PathKind::Http);
 }
 fn resource_error(path: PathKind) {
-    let fixture = Fixture::new(path, 0.0, 0);
+    let fixture = Fixture::new(path);
     let route = fixture.register("service-error");
     let client = fixture.connect(&route);
     let physical = fixture.outgoing_ids();
@@ -1158,7 +1166,7 @@ fn relay_http_known_terminals_and_items_survive_later_peer_end() {
     known_terminal(PathKind::Http);
 }
 fn known_terminal(path: PathKind) {
-    let fixture = Fixture::new(path, 0.0, 0);
+    let fixture = Fixture::new(path);
     let mut peer = fixture::ResourceProcess::start(&fixture, &fixture::unique("known-end"));
     let client = peer.connect(&fixture);
     let mut success = fixture::open_stream(&client, "complete");

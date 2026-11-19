@@ -45,7 +45,6 @@ from typing import TYPE_CHECKING, TypeVar
 from c_two.crm.contract import CRMContract, crm_contract, crm_contract_identity
 from c_two.crm.conformance import validate_resource_conformance
 from c_two.crm.meta import _SHUTDOWN_ATTR, get_shutdown_method
-from c_two.config.ipc import ClientIPCOverrides, ServerIPCOverrides
 from c_two.mem import MemoryStats
 from c_two.config.settings import C2Settings, _clean_optional_str, settings
 from c_two.error import (
@@ -65,7 +64,11 @@ if TYPE_CHECKING:
 
 CRM = TypeVar('CRM')
 log = logging.getLogger(__name__)
-_UNSET = object()
+class _Unset:
+    pass
+
+
+_UNSET = _Unset()
 
 
 def _print_serve_message(message: str) -> None:
@@ -76,17 +79,6 @@ def _print_serve_message(message: str) -> None:
     encoding = getattr(stdout, 'encoding', None) or 'utf-8'
     message = message.encode(encoding, errors='backslashreplace').decode(encoding)
     print(message, file=stdout, flush=True)
-
-
-def _runtime_session_kwargs_from_settings(settings: C2Settings) -> dict[str, int]:
-    kwargs: dict[str, int] = {}
-    shm_overrides = settings._shm_overrides()  # noqa: SLF001
-    if 'shm_threshold' in shm_overrides:
-        kwargs['shm_threshold'] = shm_overrides['shm_threshold']
-    remote_chunk_size = settings._remote_payload_chunk_size_override()  # noqa: SLF001
-    if remote_chunk_size is not None:
-        kwargs['remote_payload_chunk_size'] = remote_chunk_size
-    return kwargs
 
 
 def _relay_control_error_status(exc: BaseException) -> int | None:
@@ -186,7 +178,7 @@ class Runtime:
         self._lock = threading.Lock()
         self._settings = code_overrides
         self._server: Server | None = None
-        self._runtime_session = RuntimeSession(**_runtime_session_kwargs_from_settings(code_overrides))
+        self._runtime_session = RuntimeSession()
 
     # ------------------------------------------------------------------
     # Public API
@@ -199,19 +191,6 @@ class Runtime:
         with self._lock:
             self._runtime_session.set_local_endpoint(root=root)
 
-    def set_call_execution_limits(
-        self,
-        *,
-        max_outstanding_calls: int | None = None,
-        payload_buffer_budget_bytes: int | None = None,
-    ) -> None:
-        """Set native call limits before business calls or HTTP acquisition."""
-        with self._lock:
-            self._runtime_session.set_call_execution_limits(
-                max_outstanding_calls=max_outstanding_calls,
-                payload_buffer_budget_bytes=payload_buffer_budget_bytes,
-            )
-
     def set_relay_anchor(self, address: str) -> None:
         """Set the relay anchor address for name resolution.
 
@@ -222,172 +201,44 @@ class Runtime:
             self._runtime_session.set_relay_anchor_address(requested)
             self._settings._relay_anchor_address = requested  # noqa: SLF001
 
-    def set_transport_policy(
-        self,
-        *,
-        shm_threshold: int | None | object = _UNSET,
-        remote_payload_chunk_size: int | None | object = _UNSET,
-    ) -> None:
-        """Set this Runtime's transport policy before use."""
-        with self._lock:
-            if self._server is not None or self._runtime_session.client_config_frozen:
-                import warnings
-                warnings.warn(
-                    'Active connections exist, set_transport_policy() ignored. '
-                    'Call set_transport_policy() before register()/connect().',
-                    UserWarning,
-                    stacklevel=3,
-                )
-                return
-            runtime_session = self._runtime_session
-            retired = runtime_session.retired
-            if not retired:
-                previous_threshold = self._settings._shm_threshold  # noqa: SLF001
-                previous_chunk_size = self._settings._remote_payload_chunk_size_override()  # noqa: SLF001
-                try:
-                    if shm_threshold is not _UNSET:
-                        self._settings.shm_threshold = shm_threshold  # type: ignore[assignment]
-                    if remote_payload_chunk_size is not _UNSET:
-                        self._settings.remote_payload_chunk_size = remote_payload_chunk_size  # type: ignore[assignment]
-                    old_session, _retired_observation = self._swap_runtime_session(
-                        preserve_server_identity=True,
-                    )
-                except Exception:
-                    self._settings.shm_threshold = previous_threshold
-                    self._settings.remote_payload_chunk_size = previous_chunk_size
-                    raise
-
-        if retired:
-            return runtime_session.check_active()
-
-        # Close the replaced session's client-only barrier outside the lock.
-        # The retirement observation needs no fence: it observes through weak
-        # handles, so its records stay reportable exactly while real owners
-        # (old proxies, in-flight responses, outstanding holds) keep the old
-        # session's accounting and local-copy metadata alive.
-        self._close_replaced_session(old_session)
-
-    def _swap_runtime_session(self, *, preserve_server_identity: bool):
-        """Retire the current session and publish its replacement atomically.
-
-        Must be called with ``self._lock`` held. Returns
-        ``(old_session, retired_observation)``.
-
-        The retirement observation is a pure re-capture that consumes nothing,
-        so a replacement that fails to construct or adopt leaves the old
-        session — and every observation it already carried — exactly as it
-        was, and a later retry re-captures the session's own domains and
-        tracker as they exist at that moment. The replacement adopts the
-        pending bundle and every earlier one in the same critical section that
-        publishes it, so the public session never shows a window in which
-        retired charges silently disappeared. Observation lifetime needs no
-        fence here: records stay reportable exactly while real owners keep
-        the old session's accounting and local-copy metadata alive.
-        """
-        runtime_session = self._runtime_session
-        retired_observation = runtime_session.retire_memory_observation()
-        kwargs = {
-            **_runtime_session_kwargs_from_settings(self._settings),
-            **runtime_session.call_execution_limits_overrides,
-        }
-        if preserve_server_identity:
-            kwargs = {
-                'server_id': (
-                    runtime_session.server_id
-                    or runtime_session.server_id_override
-                ),
-                'server_ipc_overrides': runtime_session.server_ipc_overrides,
-                'startup_timeout': runtime_session.startup_timeout,
-                'client_ipc_overrides': runtime_session.client_ipc_overrides,
-                **kwargs,
-            }
-        new_session = runtime_session.__class__(**kwargs)
-        # Core inherits lazy sources or the accepted domain without local lookup.
-        new_session.inherit_local_endpoint_selection(runtime_session)
-        new_session.adopt_retired_memory_observation(retired_observation)
-        new_session.set_relay_anchor_address(self._settings._relay_anchor_address)  # noqa: SLF001
-        if preserve_server_identity:
-            runtime_session.transfer_unstarted_lifecycle_to(new_session)
-        self._runtime_session = new_session
+    def _swap_runtime_session(self) -> None:
+        """Publish a replacement after completed retirement, under the binding lock."""
+        previous = self._runtime_session
+        replacement = type(previous)()
+        replacement.inherit_local_endpoint_selection(previous)
+        replacement.inherit_retirement(previous)
+        replacement.set_relay_anchor_address(self._settings._relay_anchor_address)
+        self._runtime_session = replacement
         self._server = None
-        return runtime_session, retired_observation
-
-    def _close_replaced_session(self, old_session) -> None:
-        """Drive a replaced session's bounded client-only close barrier.
-
-        This releases the old session's outgoing IPC cache and runtime
-        barrier. Memory retirement observes through weak handles. Finite-call
-        retirement holds only Core counter metadata, including initialization
-        and close publication. It never retains a Runtime or refunds unfinished
-        input ownership as part of this close.
-        """
-        try:
-            old_session.begin_shutdown().observe()
-        except Exception:
-            log.warning(
-                'Error shutting down replaced RuntimeSession', exc_info=True,
-            )
 
     def set_server(
         self,
         *,
-        server_id: str | None = None,
-        ipc_overrides: ServerIPCOverrides | Mapping[str, object] | None = None,
-        startup_timeout: float | None = None,
+        server_id: str | None | _Unset = _UNSET,
+        startup_timeout: float | None | _Unset = _UNSET,
+        max_payload_size: int | None | _Unset = _UNSET,
+        max_execution_workers: int | None | _Unset = _UNSET,
+        memory_budget_bytes: int | None | _Unset = _UNSET,
+        file_spill_budget_bytes: int | None | _Unset = _UNSET,
+        max_outstanding_calls: int | None | _Unset = _UNSET,
     ) -> None:
-        """Configure IPC server and its native lifecycle. Call before register().
-
-        Parameters
-        ----------
-        server_id:
-            Explicit server identity.
-        ipc_overrides:
-            Typed server IPC override mapping.
-        startup_timeout:
-            Native startup wait budget in seconds. ``None`` uses Rust's
-            five-second default; zero expires immediately. Must be finite
-            and non-negative. Cleanup after expiry has its own shutdown budget.
-        """
-        with self._lock:
-            if self._server is not None:
-                if startup_timeout is not None:
-                    self._runtime_session.set_server_options(
-                        server_id, ipc_overrides, startup_timeout,
-                    )
-                import warnings
-                warnings.warn(
-                    'Server already started, set_server() ignored. '
-                    'Call set_server() before register().',
-                    UserWarning,
-                    stacklevel=3,
-                )
-                return
-            self._runtime_session.set_server_options(server_id, ipc_overrides, startup_timeout)
+        """Update Host configuration. Omitted fields keep their overrides; None inherits."""
+        self._runtime_session.update_server_config(
+            _UNSET, server_id, startup_timeout, max_payload_size, max_execution_workers,
+            memory_budget_bytes, file_spill_budget_bytes, max_outstanding_calls,
+        )
 
     def set_client(
         self,
         *,
-        ipc_overrides: ClientIPCOverrides | Mapping[str, object] | None = None,
+        memory_budget_bytes: int | None | _Unset = _UNSET,
+        file_spill_budget_bytes: int | None | _Unset = _UNSET,
+        max_outstanding_calls: int | None | _Unset = _UNSET,
     ) -> None:
-        """Configure IPC client. Must be called before connect()."""
-        with self._lock:
-            if self._runtime_session.client_config_frozen:
-                import warnings
-                warnings.warn(
-                    'Client connections already exist, set_client() ignored. '
-                    'Call set_client() before connect().',
-                    UserWarning,
-                    stacklevel=3,
-                )
-                return
-            if not self._runtime_session.set_client_ipc_overrides(ipc_overrides):
-                import warnings
-                warnings.warn(
-                    'Client connections already exist, set_client() ignored. '
-                    'Call set_client() before connect().',
-                    UserWarning,
-                    stacklevel=3,
-                )
+        """Update client capacity. Omitted fields keep their overrides; None inherits."""
+        self._runtime_session.update_client_config(
+            _UNSET, memory_budget_bytes, file_spill_budget_bytes, max_outstanding_calls,
+        )
 
     def _ensure_server_bridge(self) -> Server:
         # Called under the existing instance lock, by register and empty start.
@@ -426,17 +277,13 @@ class Runtime:
         with self._lock:
             return self._runtime_session.connection_events()
 
-
     def memory_stats(self) -> MemoryStats:
-        """Observe C-Two-owned IPC backing and live reassembly charges, not RSS.
-
-        The shm, file and reassembly budget cells are independent accounting
-        scopes and must never be summed as physical memory usage.
-        """
-        return dict(self._runtime_session.memory_stats())
+        """Observe role-domain memory and local holds."""
+        return self._runtime_session.memory_stats()
 
     def call_execution_snapshot(self) -> CallExecutionSnapshot:
-        return dict(self._runtime_session.call_execution_snapshot())
+        """Observe role-domain operation slots."""
+        return self._runtime_session.call_execution_snapshot()
 
     def register(
         self,
@@ -773,7 +620,7 @@ class Runtime:
         slots = []
         with self._lock:
             if self._runtime_session is runtime_session:
-                self._swap_runtime_session(preserve_server_identity=False)
+                self._swap_runtime_session()
                 if server is not None:
                     slots = server._take_shutdown_slots(outcome)
                 if self._serve_stop is not None:
@@ -992,41 +839,40 @@ def set_local_endpoint(*, root: str | None = None) -> None:
     _get_default_runtime().set_local_endpoint(root=root)
 
 
-def set_transport_policy(
-    *,
-    shm_threshold: int | None | object = _UNSET,
-    remote_payload_chunk_size: int | None | object = _UNSET,
-) -> None:
-    """Set process transport policy. Call before register()/connect()."""
-    _get_default_runtime().set_transport_policy(
-        shm_threshold=shm_threshold,
-        remote_payload_chunk_size=remote_payload_chunk_size,
-    )
-
-
 def set_server(
     *,
-    server_id: str | None = None,
-    ipc_overrides: ServerIPCOverrides | Mapping[str, object] | None = None,
-    startup_timeout: float | None = None,
+    server_id: str | None | _Unset = _UNSET,
+    startup_timeout: float | None | _Unset = _UNSET,
+    max_payload_size: int | None | _Unset = _UNSET,
+    max_execution_workers: int | None | _Unset = _UNSET,
+    memory_budget_bytes: int | None | _Unset = _UNSET,
+    file_spill_budget_bytes: int | None | _Unset = _UNSET,
+    max_outstanding_calls: int | None | _Unset = _UNSET,
 ) -> None:
-    """Configure IPC server and its native lifecycle. Call before register().
-
-    See :meth:`Runtime.set_server`.
-    """
+    """Update the default Runtime's Host configuration."""
     _get_default_runtime().set_server(
         server_id=server_id,
-        ipc_overrides=ipc_overrides,
         startup_timeout=startup_timeout,
+        max_payload_size=max_payload_size,
+        max_execution_workers=max_execution_workers,
+        memory_budget_bytes=memory_budget_bytes,
+        file_spill_budget_bytes=file_spill_budget_bytes,
+        max_outstanding_calls=max_outstanding_calls,
     )
 
 
 def set_client(
     *,
-    ipc_overrides: ClientIPCOverrides | Mapping[str, object] | None = None,
+    memory_budget_bytes: int | None | _Unset = _UNSET,
+    file_spill_budget_bytes: int | None | _Unset = _UNSET,
+    max_outstanding_calls: int | None | _Unset = _UNSET,
 ) -> None:
-    """Configure IPC client. Call before connect()."""
-    _get_default_runtime().set_client(ipc_overrides=ipc_overrides)
+    """Update the default Runtime's client capacity."""
+    _get_default_runtime().set_client(
+        memory_budget_bytes=memory_budget_bytes,
+        file_spill_budget_bytes=file_spill_budget_bytes,
+        max_outstanding_calls=max_outstanding_calls,
+    )
 
 
 def set_relay_anchor(address: str) -> None:
@@ -1151,65 +997,13 @@ def serve(
     )
 
 
-def set_call_execution_limits(
-    *,
-    max_outstanding_calls: int | None = None,
-    payload_buffer_budget_bytes: int | None = None,
-) -> None:
-    """Set Core call limits before the first business call or HTTP acquisition.
-
-    Each ``None`` inherits native environment and default policy. Zero rejects
-    positive byte admission. Snapshot observations and direct IPC connections
-    do not freeze it; HTTP acquisition starts the shared payload domain.
-    Limits are per Runtime/domain and shared by its call views.
-    """
-    _get_default_runtime().set_call_execution_limits(
-        max_outstanding_calls=max_outstanding_calls,
-        payload_buffer_budget_bytes=payload_buffer_budget_bytes,
-    )
-
-
 def call_execution_snapshot() -> CallExecutionSnapshot:
-    """Observe native call slots without freezing admission policy.
-
-    Counts finite unary calls and all server streams through their real terminal,
-    including work continuing after caller expiry. ``retired`` reports earlier
-    sessions while their native operations or payload owners remain alive.
-    Each Runtime has its own admission domain; payload byte accounting and
-    allocation rejection counters live in ``memory_stats()['payload_buffer']``.
-    """
+    """Observe client, server and retired operation slots without activating either role."""
     return _get_default_runtime().call_execution_snapshot()
 
 
 def memory_stats() -> MemoryStats:
-    """Return read-only, scope-labelled transport memory budget statistics.
-
-    Returns a small mapping with two independent scopes:
-
-    - ``runtime_outgoing``: this process Runtime's outgoing client domain.
-      Every cached connection's request pool and reassembly pool charges this
-      one budget. ``None`` until the first connection attempt freezes the
-      domain; observing the snapshot never freezes it.
-    - ``server``: the server direction of this process Core host (response
-      pool, reassembly pool, and response prewarm). ``None`` while no host
-      exists.
-
-    Each scope maps ``limits`` to the three resolved limit keys
-    (``shm_backing_bytes``, ``file_backing_bytes``,
-    ``live_reassembly_bytes``) and ``cells`` to ``shm``/``file``/
-    ``reassembly`` cells with ``limit_bytes``, ``used_bytes``,
-    ``peak_bytes``, ``rejected_allocations`` and ``rejected_bytes``.
-
-    ``retired`` lists backing domains from earlier sessions while an old
-    native client, in-flight call or backing charge still owns the accounting.
-    Entries carry ``state="retired"`` and detach after their last owner drops.
-    Observation retains no Runtime, cache, pool, callback or payload.
-
-    ``holds`` reports local-copy logical bytes and counts by direction,
-    composed across live and retired local-copy trackers. A hold keeps no
-    transport backing domain alive. These counters are not process RSS;
-    never sum the independent backing and reassembly cells as RAM usage.
-    """
+    """Observe client, server and retired memory budgets and local holds."""
     return _get_default_runtime().memory_stats()
 
 

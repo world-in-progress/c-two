@@ -164,11 +164,11 @@ fn test_context() -> &'static c_two::endpoint::LocalEndpointContext {
 
 fn test_runtime(options: RuntimeOptions) -> Result<Runtime, c_two::LifecycleError> {
     let runtime = Runtime::new(options)?;
-    let mut endpoint_options = c_two::endpoint::LocalEndpointOptions::default();
-    #[cfg(unix)]
-    {
-        endpoint_options.unix_root = test_context().unix_root().map(Path::to_path_buf);
-    }
+    let endpoint_options = c_two::endpoint::LocalEndpointOptions {
+        #[cfg(unix)]
+        unix_root: test_context().unix_root().map(Path::to_path_buf),
+        ..Default::default()
+    };
     runtime.set_local_endpoint_with_sources(endpoint_options, c_two::ConfigSources::empty())?;
     Ok(runtime)
 }
@@ -201,11 +201,9 @@ fn definition(route_name: &str) -> ServiceDefinition {
 }
 
 fn relay() -> (RelayServer, String) {
-    let relay = RelayServer::start_with_context(
+    let relay = RelayServer::start_resolved(
         RelayConfig {
             bind: "127.0.0.1:0".into(),
-            idle_timeout_secs: 0,
-            anti_entropy_interval: std::time::Duration::ZERO,
             heartbeat_interval: std::time::Duration::ZERO,
             ..RelayConfig::default()
         },
@@ -263,13 +261,14 @@ fn one_client_type_covers_direct_explicit_relay_and_relay_aware_calls() {
 
     let (mut relay, relay_url) = relay();
     let runtime = test_runtime(RuntimeOptions {
-        server_id: Some(unique_name("rust-sdk")),
         relay_anchor_address: Some(relay_url.clone()),
         use_process_relay_anchor: false,
         ..RuntimeOptions::default()
     })
     .expect("runtime");
-    let host = runtime.host(HostOptions::default()).expect("host");
+    let host = runtime
+        .host(HostOptions::default().with_server_id(unique_name("rust-sdk")))
+        .expect("host");
     let route_name = unique_name("echo");
     let mut registration = host
         .register(definition(&route_name))
@@ -339,13 +338,16 @@ fn one_client_type_covers_direct_explicit_relay_and_relay_aware_calls() {
 #[test]
 fn registration_projects_the_core_owned_route_concurrency() {
     let runtime = test_runtime(RuntimeOptions {
-        server_id: Some(unique_name("rust-sdk-concurrency")),
         use_process_relay_anchor: false,
         ..RuntimeOptions::default()
     })
     .expect("runtime");
     let host = runtime
-        .host(HostOptions::default().without_relay())
+        .host(
+            HostOptions::default()
+                .without_relay()
+                .with_server_id(unique_name("rust-sdk-concurrency")),
+        )
         .expect("host");
     let route_name = unique_name("concurrency");
     let mut registration = host
@@ -374,13 +376,16 @@ fn registration_projects_the_core_owned_route_concurrency() {
 #[test]
 fn semantic_error_fields_match_the_cross_language_fixture_shape() {
     let runtime = test_runtime(RuntimeOptions {
-        server_id: Some(unique_name("semantic")),
         use_process_relay_anchor: false,
         ..RuntimeOptions::default()
     })
     .expect("runtime");
     let host = runtime
-        .host(HostOptions::default().without_relay())
+        .host(
+            HostOptions::default()
+                .without_relay()
+                .with_server_id(unique_name("semantic")),
+        )
         .expect("host");
     let route_name = unique_name("semantic");
     let _registration = host
@@ -625,42 +630,121 @@ fn direct_shutdown_receipt_finishes_while_held_checked_view_stays_live() {
 }
 
 #[test]
-fn finite_call_configuration_is_consumed_through_the_sdk_facade() {
-    use c_two::observe::CallExecutionSnapshot;
+fn client_and_host_freeze_only_their_own_role() {
+    use c_two::observe::{RuntimeCallExecutionStats, RuntimeMemoryStats};
     use c_two::{
-        CallExecutionLimits, CallExecutionLimitsOverrides, CallOptions, CallTimeout, ConfigSources,
-        EnvFilePolicy, EnvMap,
+        ClientConfigPatch, ConfigField, DomainLimitsPatch, LifecycleError, ServerConfigPatch,
     };
 
-    let runtime = test_runtime(RuntimeOptions::default()).unwrap();
-    runtime
-        .set_call_execution_limits_with_sources(
-            CallExecutionLimitsOverrides::default(),
-            ConfigSources {
-                env_file: EnvFilePolicy::Disabled,
-                process_env: EnvMap::from([
-                    ("C2_CALL_MAX_OUTSTANDING".into(), "3".into()),
-                    ("C2_CALL_PAYLOAD_BUFFER_BUDGET_BYTES".into(), "17".into()),
-                ]),
+    let host_runtime = test_runtime(RuntimeOptions {
+        use_process_relay_anchor: false,
+        ..Default::default()
+    })
+    .unwrap();
+    let client_runtime = test_runtime(RuntimeOptions {
+        use_process_relay_anchor: false,
+        ..Default::default()
+    })
+    .unwrap();
+    let limits = |memory_budget_bytes, max_outstanding_calls| DomainLimitsPatch {
+        memory_budget_bytes,
+        max_outstanding_calls,
+        ..Default::default()
+    };
+    let client_patch = |memory, calls| ClientConfigPatch {
+        domain_limits: limits(memory, calls),
+    };
+    let server_patch = |memory, calls| ServerConfigPatch {
+        domain_limits: limits(memory, calls),
+        ..Default::default()
+    };
+    use ConfigField::{Inherit, Keep, Set};
+
+    client_runtime
+        .update_client_config(client_patch(Set(512), Set(3)))
+        .unwrap();
+    client_runtime
+        .update_client_config(client_patch(Set(1024), Keep))
+        .unwrap();
+
+    host_runtime
+        .update_server_config(server_patch(Set(512), Set(5)))
+        .unwrap();
+    host_runtime
+        .update_server_config(server_patch(Set(1024), Keep))
+        .unwrap();
+
+    let before: RuntimeMemoryStats = client_runtime.memory_stats();
+    assert!(!before.client.frozen && !before.server.frozen);
+    assert!(before.client.memory.is_none());
+    assert!(
+        client_runtime
+            .call_execution_snapshot()
+            .client
+            .max_operations
+            .is_none()
+    );
+
+    let host = host_runtime
+        .host(HostOptions::default().without_relay())
+        .unwrap();
+    let route = unique_name("role-config");
+    let _registration = host.register(definition(&route)).unwrap();
+    let _client = client_runtime
+        .connect(
+            release().expected_route(&route).unwrap(),
+            Connect::DirectIpc {
+                address: host.local_endpoint().address().into(),
             },
         )
         .unwrap();
-    let snapshot: CallExecutionSnapshot = runtime.call_execution_snapshot().unwrap();
-    assert_eq!(snapshot.max_operations, 3);
-    assert_eq!(snapshot.used_operations, 0);
-    // Observation leaves configuration mutable; the Runtime clone sees the same policy.
-    let limits = CallExecutionLimits::zeroed();
-    runtime
-        .clone()
-        .set_call_execution_limits_with_sources(
-            CallExecutionLimitsOverrides {
-                max_outstanding_calls: Some(limits.max_outstanding_calls),
-                payload_buffer_budget_bytes: Some(limits.payload_buffer_budget_bytes),
-            },
-            ConfigSources::empty(),
-        )
+
+    let host_memory: RuntimeMemoryStats = host.memory_stats();
+    let host_calls: RuntimeCallExecutionStats = host.call_execution_snapshot();
+    assert!(host_memory.server.frozen && !host_memory.client.frozen);
+    assert_eq!(host_memory.server.memory.unwrap().limit_bytes, 1024);
+    assert_eq!(host_calls.server.max_operations, Some(5));
+    assert_eq!(host_calls.client.max_operations, None);
+
+    let client_memory = client_runtime.memory_stats();
+    let client_calls = client_runtime.call_execution_snapshot();
+    assert!(client_memory.client.frozen && !client_memory.server.frozen);
+    assert_eq!(client_memory.client.memory.unwrap().limit_bytes, 1024);
+    assert_eq!(client_calls.client.max_operations, Some(3));
+    assert_eq!(client_calls.server.max_operations, None);
+    assert!(client_memory.retired.is_empty() && client_calls.retired.is_empty());
+    assert_eq!(client_memory.holds.active_holds, 0);
+
+    client_runtime
+        .update_client_config(client_patch(Set(1024), Set(3)))
         .unwrap();
-    assert_eq!(runtime.call_execution_snapshot().unwrap().max_operations, 0);
+    host_runtime
+        .update_server_config(server_patch(Set(1024), Set(5)))
+        .unwrap();
+    assert_eq!(
+        client_runtime.update_client_config(client_patch(Keep, Set(4))),
+        Err(LifecycleError::ConfigFrozen)
+    );
+    assert_eq!(
+        host_runtime.update_server_config(server_patch(Set(2048), Keep)),
+        Err(LifecycleError::ConfigFrozen)
+    );
+
+    let unfrozen = test_runtime(RuntimeOptions::default()).unwrap();
+    unfrozen
+        .update_client_config(client_patch(Set(1024), Set(3)))
+        .unwrap();
+    unfrozen
+        .update_client_config(client_patch(Inherit, Keep))
+        .unwrap();
+    assert_eq!(unfrozen.client_overrides().memory_budget_bytes, None);
+    assert_eq!(unfrozen.client_overrides().max_outstanding_calls, Some(3));
+}
+
+#[test]
+fn sdk_call_timeout_options_resolve_the_caller_deadline() {
+    use c_two::{CallOptions, CallTimeout};
+
     assert_eq!(CallOptions::new().timeout(), CallTimeout::Inherit);
     assert_eq!(
         CallOptions::with_timeout(CallTimeout::Unlimited)
@@ -671,30 +755,6 @@ fn finite_call_configuration_is_consumed_through_the_sdk_facade() {
         CallTimeout::try_after_seconds(0.0).unwrap(),
         CallTimeout::After(Duration::ZERO)
     );
-}
-
-#[test]
-fn inflight_chunk_frames_configuration_uses_the_core_resolver() {
-    for capacity in [0, 1, 7] {
-        let runtime = test_runtime(RuntimeOptions {
-            server_ipc_overrides: Some(c2_config::ServerIpcConfigOverrides {
-                max_inflight_chunk_frames: Some(capacity),
-                ..Default::default()
-            }),
-            ..Default::default()
-        })
-        .unwrap();
-        match runtime.server_ipc_config() {
-            Ok(config) => {
-                assert_ne!(capacity, 0, "zero frame capacity must be rejected");
-                assert_eq!(config.max_inflight_chunk_frames, capacity);
-            }
-            Err(c_two::LifecycleError::Configuration(message)) if capacity == 0 => {
-                assert!(message.contains("max_inflight_chunk_frames"));
-            }
-            Err(error) => panic!("{error}"),
-        }
-    }
 }
 
 #[cfg(unix)]
@@ -813,22 +873,16 @@ fn preparation_fixture(
     c_two::Client,
     Arc<AtomicU64>,
 ) {
-    use c_two::{CallExecutionLimitsOverrides, ConfigSources};
     let runtime = test_runtime(RuntimeOptions {
-        server_id: Some(unique_name("sdk-preparation")),
         use_process_relay_anchor: false,
+        client_limits: c_two::DomainLimitsOverrides {
+            max_outstanding_calls: Some(slots),
+            memory_budget_bytes: Some(bytes),
+            ..Default::default()
+        },
         ..RuntimeOptions::default()
     })
     .unwrap();
-    runtime
-        .set_call_execution_limits_with_sources(
-            CallExecutionLimitsOverrides {
-                max_outstanding_calls: Some(slots),
-                payload_buffer_budget_bytes: Some(bytes),
-            },
-            ConfigSources::empty(),
-        )
-        .unwrap();
     let host = runtime
         .host(HostOptions::default().without_relay())
         .unwrap();
@@ -904,32 +958,30 @@ fn sdk_preparation_rejects_zero_deadline_and_capacity_before_factories_and_busin
     assert_eq!(factories.load(Ordering::SeqCst), 0);
     assert_eq!(calls.load(Ordering::SeqCst), 0);
     assert_eq!(
-        runtime.call_execution_snapshot().unwrap().used_operations,
-        0
+        runtime.call_execution_snapshot().client.used_operations,
+        Some(0)
     );
-    assert_eq!(
-        client
-            .with_call_options(CallOptions::with_timeout(CallTimeout::Unlimited))
-            .begin_call("echo")
-            .unwrap()
-            .encode_vec(Vec::new())
-            .unwrap()
-            .call_owned()
-            .unwrap(),
-        Vec::<u8>::new()
-    );
-    assert_eq!(calls.load(Ordering::SeqCst), 1);
-    assert_eq!(
-        runtime.call_execution_snapshot().unwrap().used_operations,
-        0
-    );
+    for options in [
+        CallOptions::new(),
+        CallOptions::with_timeout(CallTimeout::Unlimited),
+    ] {
+        assert_call_error(
+            client
+                .with_call_options(options)
+                .begin_call("echo")
+                .err()
+                .unwrap(),
+            ErrorCode::CallCapacityExceeded,
+        );
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
     registration.close().unwrap();
 }
 
 #[test]
 fn sdk_preparation_charges_before_copy_and_keeps_the_original_serialization_deadline() {
     use c_two::{
-        CallExecutionLimitsOverrides, CallOptions, CallTimeout, ConfigSources, LifecycleError,
+        CallOptions, CallTimeout, ClientConfigPatch, ConfigField, DomainLimitsPatch, LifecycleError,
     };
     let (runtime, _host, mut registration, client, calls) = preparation_fixture(1, 8);
     let finite = client.with_call_options(CallOptions::with_timeout(CallTimeout::After(
@@ -954,8 +1006,8 @@ fn sdk_preparation_charges_before_copy_and_keeps_the_original_serialization_dead
     )));
     let mut prepared = delayed.begin_call("echo").unwrap();
     assert_eq!(
-        runtime.call_execution_snapshot().unwrap().used_operations,
-        1
+        runtime.call_execution_snapshot().client.used_operations,
+        Some(1)
     );
     // Borrowed/non-Send serializers stay on the caller; their elapsed time still spends this call's D.
     std::thread::sleep(Duration::from_millis(30));
@@ -965,19 +1017,18 @@ fn sdk_preparation_charges_before_copy_and_keeps_the_original_serialization_dead
     );
     drop(prepared);
     assert_eq!(
-        runtime.call_execution_snapshot().unwrap().used_operations,
-        0
+        runtime.call_execution_snapshot().client.used_operations,
+        Some(0)
     );
-    assert_eq!(runtime.payload_buffer_stats().unwrap().used_bytes, 0);
+    assert_eq!(runtime.memory_stats().client.memory.unwrap().used_bytes, 0);
     assert_eq!(calls.load(Ordering::SeqCst), 0);
     assert_eq!(
-        runtime.set_call_execution_limits_with_sources(
-            CallExecutionLimitsOverrides {
-                max_outstanding_calls: Some(2),
-                payload_buffer_budget_bytes: Some(8)
+        runtime.update_client_config(ClientConfigPatch {
+            domain_limits: DomainLimitsPatch {
+                max_outstanding_calls: ConfigField::Set(2),
+                ..Default::default()
             },
-            ConfigSources::empty(),
-        ),
+        }),
         Err(LifecycleError::ConfigFrozen)
     );
     registration.close().unwrap();

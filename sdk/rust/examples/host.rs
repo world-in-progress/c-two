@@ -27,11 +27,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let release = ContractRelease::from_descriptor_json(DESCRIPTOR.as_bytes())?;
     let route_name = format!("rust-sdk-host-example-{}", std::process::id());
     let runtime = Runtime::new(RuntimeOptions {
-        server_id: Some(format!("rust-sdk-host-{}", std::process::id())),
         use_process_relay_anchor: false,
         ..RuntimeOptions::default()
     })?;
-    let host = runtime.host(HostOptions::default().without_relay())?;
+    let host = runtime.host(
+        HostOptions::default()
+            .without_relay()
+            .with_server_id(format!("rust-sdk-host-{}", std::process::id())),
+    )?;
     let mut registration = host.register(ServiceDefinition::new(
         &release,
         release.reference(),

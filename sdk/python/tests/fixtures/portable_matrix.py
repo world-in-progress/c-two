@@ -66,17 +66,7 @@ CRM_CLASSES = {
     "record-v1": PortableRecord,
     "object-graph-v1": PortableObjectGraph,
 }
-IPC_OVERRIDES = {
-    "pool_segment_size": 1024 * 1024,
-    "max_pool_segments": 1,
-    "reassembly_segment_size": 1024 * 1024,
-    "reassembly_max_segments": 1,
-    "max_inflight_chunk_frames": 32,
-    "chunk_gc_interval": 1.0,
-    "chunk_assembler_timeout": 10.0,
-    "max_reassembly_bytes": 16 * 1024 * 1024,
-    "chunk_size": 64 * 1024,
-}
+ROLE_MEMORY_BYTES = 64 * 1024**2
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 
@@ -515,8 +505,6 @@ class MatrixRelay:
                 f"matrix-relay-{hashlib.sha256(row_id.encode()).hexdigest()[:12]}",
                 "--advertise-url",
                 self.url,
-                "--idle-timeout",
-                "0",
             ],
             cwd=REPOSITORY,
             env=_process_environment(),
@@ -697,14 +685,12 @@ def configure_python_runtime(
 ) -> None:
     _reset_default_runtime()
     settings.relay_anchor_address = None
-    settings.shm_threshold = None
-    cc.set_transport_policy(shm_threshold=1)
     if relay_url is not None:
         cc.set_relay_anchor(relay_url)
     if server:
-        cc.set_server(ipc_overrides=IPC_OVERRIDES)
+        cc.set_server(memory_budget_bytes=ROLE_MEMORY_BYTES)
     if client:
-        cc.set_client(ipc_overrides=IPC_OVERRIDES)
+        cc.set_client(memory_budget_bytes=ROLE_MEMORY_BYTES)
 
 
 class NoPayloadResource:

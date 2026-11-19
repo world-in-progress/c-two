@@ -20,21 +20,14 @@ import time
 
 if str(Path(__file__).resolve().parent) not in sys.path:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
+import ipc_memory as bench
 from ipc_evidence import (
     BenchmarkError, CORRECTNESS_FAILURE, Failures, TOOL_FAILURE, failure_message,
     failure_parts, run_owned,
 )
 
-BASELINE_HEAD = 'b861f994e9f7294c0f3d4efc096c14f0d7f5c121'
-NORMAL_ROWS = (
-    'idle_small_rpc_default_buddy', 'idle_small_rpc_buddy_disabled',
-    'burst4_shared_default_buddy', 'burst4_shared_buddy_disabled',
-    'science_payload_pairs_default_buddy', 'science_payload_pairs_buddy_disabled',
-)
-BUDGET_ROWS = (
-    'forced_zero_shm_finite_file', 'forced_zero_shm_finite_file_buddy_disabled',
-    'forced_all_backing_zero_expect_capacity_error',
-)
+NORMAL_ROWS = tuple(row['name'] for row in bench.matrix_rows() if not row['response_only'])
+BUDGET_ROWS = tuple(row['name'] for row in bench.matrix_rows() if row['response_only'])
 ANOMALIES = (
     'hold', 'slow', 'stopped', 'fallback_dedicated', 'fallback_inline',
     'fallback_file', 'exhausted', 'release_idle', 'release_busy',
@@ -239,10 +232,7 @@ def check_matrix(directory: Path, expected: set[str],
                        if key not in ('python', 'output_dir')}
         require(isinstance(workers, list) and len(workers) == spec.get('workers'),
                 f'worker count mismatch: {name}')
-        config_keys = ('pool_enabled', 'segment_size', 'payload_bytes', 'shm_threshold',
-                       'calls', 'ipc_overrides', 'expect_error_substring', 'warmup',
-                       'call_timeout')
-        worker_config = {key: spec[key] for key in config_keys}
+        worker_config = {key: spec[key] for key in bench.CONFIG_KEYS}
         result[name] = [check_worker(worker, directory, name in NORMAL_ROWS,
                                      expected_commit, spec['calls'], worker_config, row_failures)
                         for worker in workers]
@@ -392,7 +382,9 @@ def run(args) -> dict:
         require(root.is_dir() and python.is_file(), f'missing source root or interpreter: {root}, {python}')
     baseline_head = git_head(args.baseline_root)
     candidate_head = git_head(args.candidate_root)
-    require(baseline_head.startswith(args.baseline_commit), 'baseline checkout does not match pinned commit')
+    if args.baseline_commit:
+        require(baseline_head.startswith(args.baseline_commit),
+                'baseline checkout does not match pinned commit')
     baseline_fastdb = args.baseline_root.parent / 'fastdb'
     candidate_fastdb = args.candidate_root.parent / 'fastdb'
     require(baseline_fastdb.is_dir() == candidate_fastdb.is_dir(),
@@ -491,7 +483,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ('baseline-root', 'candidate-root', 'baseline-python', 'candidate-python', 'output-dir'):
         parser.add_argument('--' + name, type=Path, required=True)
-    parser.add_argument('--baseline-commit', default=BASELINE_HEAD)
+    parser.add_argument('--baseline-commit', help='Optional expected commit or prefix for the baseline checkout')
     parser.add_argument('--baseline-ref')
     parser.add_argument('--candidate-ref')
     parser.add_argument('--pairs', type=int, default=5)

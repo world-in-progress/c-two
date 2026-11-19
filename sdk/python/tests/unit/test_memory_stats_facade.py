@@ -1,18 +1,4 @@
-"""Read-only transport memory-stats facade (``cc.observe.memory_stats``).
-
-The counters are Rust-owned: the Python surface only projects the native
-snapshot and must never keep its own counters. The three budget cells are
-C-Two-owned IPC backing/live-reassembly accounting, not process RSS.
-
-The retirement tests here prove the owner-lifetime observation contract: a
-retirement record stores only weak views of budget accounting and local-copy
-metadata, so it stays reportable exactly while a real owner — an old proxy's
-native client or tracker handle, an in-flight response, an outstanding hold
-or charge guard — keeps that metadata alive. Zero counters never prune a
-record (a supported producer may still publish), records detach when their
-last owner is gone, repeated empty session swaps never accumulate, and the
-public surface exposes no way to create charges or synthetic holds.
-"""
+"""Native holds and retired role reports remain observable while owned."""
 from __future__ import annotations
 
 import json
@@ -21,15 +7,7 @@ import time
 
 import pytest
 
-from c_two.config.settings import settings
-from c_two.mem import (
-    MemoryCellStats,
-    MemoryLimits,
-    MemoryScopeStats,
-    MemoryStats,
-    RetiredScopeStats,
-)
-from c_two.transport.registry import Runtime, _reset_default_runtime
+from c_two.transport.registry import _reset_default_runtime
 
 import c_two as cc
 
@@ -49,9 +27,7 @@ def _clean_registry():
     by another test file must never leak into these assertions.
     """
     _reset_default_runtime()
-    settings.shm_threshold = None
     yield
-    settings.shm_threshold = None
     _reset_default_runtime()
 
 
@@ -94,105 +70,6 @@ def _track_retained_local_copy(session, *, bytes_: int = 64):
     )
 
 
-def test_memory_stats_is_observable_without_freezing_an_unused_runtime() -> None:
-    first = cc.observe.memory_stats()
-    second = cc.observe.memory_stats()
-
-    assert isinstance(first, dict)
-    assert set(first) == set(MemoryStats.__annotations__)
-    # Observing an unused Runtime must not create or freeze a client domain.
-    assert first['runtime_outgoing'] is None
-    assert second['runtime_outgoing'] is None
-    assert first['server'] is None
-    assert first['payload_buffer'] is None
-    assert isinstance(first['retired_payload_buffers'], list)
-    # A fresh process has no retired domains; a shared test process may still
-    # report owner-backed retired domains from earlier tests, but the shape is
-    # always an explicit list with scope labels.
-    assert isinstance(first['retired'], list)
-    assert all(
-        {'role', 'state', 'limits', 'cells'} <= set(scope)
-        for scope in first['retired']
-    )
-    # The retained-buffer counters stay Rust-owned and are composed, not
-    # duplicated, into the snapshot.
-    assert set(first['holds']) == {
-        'active_holds', 'total_held_bytes', 'oldest_hold_seconds', 'by_direction'
-    }
-    assert 'not process RSS' in ' '.join(cc.observe.memory_stats.__doc__.split())
-
-
-def test_memory_stats_typed_shape_is_declared_for_the_public_facade() -> None:
-    from c_two import _native
-
-    assert set(_native.RuntimeSession().memory_stats()) == set(MemoryStats.__annotations__)
-    # The typed facade is annotation-only, so this asserts the declared keys
-    # stay aligned with the documented native shape.
-    assert set(MemoryLimits.__annotations__) == {
-        'shm_backing_bytes',
-        'file_backing_bytes',
-        'live_reassembly_bytes',
-    }
-    assert set(MemoryCellStats.__annotations__) == {
-        'limit_bytes',
-        'used_bytes',
-        'peak_bytes',
-        'rejected_allocations',
-        'rejected_bytes',
-    }
-    scope_fields = {'role', 'state', 'limits', 'cells'}
-    assert set(MemoryScopeStats.__annotations__) == scope_fields
-    assert set(RetiredScopeStats.__annotations__) == scope_fields
-    assert set(MemoryStats.__annotations__) == {
-        'runtime_outgoing',
-        'server',
-        'retired',
-        'payload_buffer',
-        'retired_payload_buffers',
-        'holds',
-    }
-
-
-def test_retired_observation_surface_has_no_track_or_reserve_escape() -> None:
-    """The public observation surface is read-only and opaque.
-
-    The retired-observation wrapper handed between sessions must not expose
-    any way to create charges (``reserve``) or synthetic holds (``track``),
-    and it offers no lifecycle surface at all: the observation lifetime is
-    decided by real owners inside Rust. The native module never exposes the
-    mutable budget or observer Rust types at all.
-    """
-    from c_two import _native
-
-    session = _native.RuntimeSession()
-    observation = session.retire_memory_observation()
-
-    surface = {name for name in dir(observation) if not name.startswith('_')}
-    assert surface == set(), f'observation must be opaque, saw {surface!r}'
-    for forbidden in (
-        'track',
-        'track_retained',
-        'reserve',
-        'push_scope',
-        'push_tracker',
-        'prune',
-        'prune_detached',
-        'prune_confirmed_drained',
-        'mark_close_confirmed',
-        'close_confirmed',
-        'scope_reports',
-        'local_copy_stats',
-    ):
-        assert forbidden not in surface, f'observation must not expose {forbidden!r}'
-
-    for scope in session.memory_stats()['retired']:
-        assert isinstance(scope, dict)
-
-    # No mutable Rust accounting handle is projected to Python at all.
-    assert not hasattr(_native, 'MemoryBudget')
-    assert not hasattr(_native, 'BudgetObserver')
-
-
 def test_native_retirement_keeps_retained_local_copy_metadata_across_sessions() -> None:
     """The session handoff keeps Rust-owned local-copy metadata observable.
 
@@ -206,10 +83,10 @@ def test_native_retirement_keeps_retained_local_copy_metadata_across_sessions() 
 
     first = _native.RuntimeSession()
     local_copy = _track_retained_local_copy(first)
-    observation = first.retire_memory_observation()
+    assert first.begin_shutdown().observe()["completed"]
 
     replacement = _native.RuntimeSession()
-    replacement.adopt_retired_memory_observation(observation)
+    replacement.inherit_retirement(first)
 
     assert replacement.memory_stats()["holds"]['active_holds'] == 1
     assert replacement.memory_stats()['holds']['active_holds'] == 1
@@ -244,10 +121,10 @@ def test_zero_retirement_keeps_a_late_hold_visible_while_a_producer_owns_the_tra
     first = _native.RuntimeSession()
     producer_tracker = first.local_copy_tracker()
     # Counters are zero and no hold exists at capture time.
-    observation = first.retire_memory_observation()
+    assert first.begin_shutdown().observe()["completed"]
 
     replacement = _native.RuntimeSession()
-    replacement.adopt_retired_memory_observation(observation)
+    replacement.inherit_retirement(first)
     assert replacement.memory_stats()["holds"]['active_holds'] == 0
 
     # The retired session wrapper drops, then repeated snapshots must not
@@ -290,13 +167,10 @@ def test_old_proxy_tracker_publishes_a_hold_after_public_shutdown() -> None:
 
     session = _native.RuntimeSession()
     proxy_tracker = session.local_copy_tracker()
-    observation = session.retire_memory_observation()
-
-    # Public shutdown: the registry swaps in a replacement that adopts the
-    # observation and then drops the old session wrapper.
-    del session
+    assert session.begin_shutdown().observe()['completed']
     replacement = _native.RuntimeSession()
-    replacement.adopt_retired_memory_observation(observation)
+    replacement.inherit_retirement(session)
+    del session
 
     for _ in range(3):
         stats = replacement.memory_stats()
@@ -319,157 +193,6 @@ def test_old_proxy_tracker_publishes_a_hold_after_public_shutdown() -> None:
     # The proxy itself goes away; the observation record detaches with it.
     del proxy_tracker
     assert replacement.memory_stats()['retired'] == []
-
-
-def test_failed_session_replacement_preserves_previous_and_own_observations() -> None:
-    """A replacement that never materializes must not lose retired records.
-
-    Retiring is a pure re-capture that consumes nothing, so a replacement
-    construction that fails afterwards leaves the old session current and
-    exactly as observable as before — and a later successful retry still
-    carries the old session's own charges and holds, including scopes that
-    only came into existence after the failed attempt.
-    """
-    from c_two import _native
-
-    first = _native.RuntimeSession()
-    local_copy = _track_retained_local_copy(first)
-    handoff = first.retire_memory_observation()
-    second = _native.RuntimeSession()
-    second.adopt_retired_memory_observation(handoff)
-    assert second.memory_stats()["holds"]['active_holds'] == 1
-
-    # The next swap captures again, but the replacement construction fails
-    # and the captured wrapper is dropped without ever being adopted.
-    dropped = second.retire_memory_observation()
-    del dropped
-    assert second.memory_stats()["holds"]['active_holds'] == 1, (
-        'a failed replacement must leave the previous observations intact'
-    )
-    assert second.memory_stats()['holds']['active_holds'] == 1
-
-    # The session continues working and publishes another hold after the
-    # failed attempt; the retry's fresh capture must include it.
-    own_local_copy = _track_retained_local_copy(second, bytes_=96)
-    retry_handoff = second.retire_memory_observation()
-    third = _native.RuntimeSession()
-    third.adopt_retired_memory_observation(retry_handoff)
-    assert third.memory_stats()["holds"]['active_holds'] == 2, (
-        'a successful retry after a failed replacement must carry the old '
-        'session\'s own holds'
-    )
-    assert third.memory_stats()['holds']['total_held_bytes'] == 64 + 96
-
-    local_copy.release()
-    own_local_copy.release()
-    assert third.memory_stats()["holds"]['active_holds'] == 0
-
-    # The registry-level ordering: a session class whose next construction
-    # fails (an invalid replacement policy) keeps the installed session and
-    # its already-adopted observations untouched.
-    class FailingSwapSession:
-        client_config_frozen = False
-        server_id = None
-        server_id_override = None
-        server_ipc_overrides = None
-        startup_timeout = None
-        client_ipc_overrides = None
-        fail_next_construction = False
-
-        def __init__(self, **_kwargs) -> None:
-            if type(self).fail_next_construction:
-                raise RuntimeError('invalid replacement policy')
-
-        @property
-        def call_execution_limits_overrides(self) -> dict[str, int]:
-            # No explicit limits were accepted by this installed session.
-            # Let the swap reach the deliberately failing constructor.
-            return {}
-
-        retired = False
-
-        def check_active(self, connect_attempt=None) -> None:  # noqa: ARG002
-            return None
-
-        def retire_memory_observation(self):
-            return _StubObservation()
-
-        def adopt_retired_memory_observation(self, observation) -> None:  # noqa: ARG002
-            pass
-
-    class _StubObservation:
-        pass
-
-    registry = Runtime()
-    installed = FailingSwapSession()
-    registry._runtime_session = installed  # noqa: SLF001
-    registry._server = None  # noqa: SLF001
-
-    FailingSwapSession.fail_next_construction = True
-    try:
-        settings.shm_threshold = 8192
-        with pytest.raises(RuntimeError, match='invalid replacement policy'):
-            registry.set_transport_policy(shm_threshold=8192)
-    finally:
-        FailingSwapSession.fail_next_construction = False
-        settings.shm_threshold = None
-
-    assert registry._runtime_session is installed  # noqa: SLF001
-
-
-def test_failed_native_replacement_retry_carries_own_holds_through_the_registry(monkeypatch) -> None:
-    """Failed swap → old session continues → successful swap keeps own holds.
-
-    The failed attempt must not consume the old session's own observation:
-    after a failed replacement construction (invalid policy value) the old
-    session stays installed with its hold observable, and the successful
-    retry swaps in a replacement that still reports it.
-    """
-    from c_two import _native
-    from c_two.transport import registry as registry_module
-
-    first = _native.RuntimeSession()
-    local_copy = _track_retained_local_copy(first)
-
-    registry = Runtime()
-    registry._runtime_session = first  # noqa: SLF001
-    registry._server = None  # noqa: SLF001
-
-    calls = {'count': 0}
-    original_kwargs = registry_module._runtime_session_kwargs_from_settings
-
-    def invalid_then_valid_kwargs(code_overrides):
-        calls['count'] += 1
-        kwargs = dict(original_kwargs(code_overrides))
-        if calls['count'] == 1:
-            kwargs['server_id'] = 'bad/name'
-        return kwargs
-
-    monkeypatch.setattr(
-        registry_module, '_runtime_session_kwargs_from_settings', invalid_then_valid_kwargs,
-    )
-
-    settings.shm_threshold = 8192
-    try:
-        # Preserve-identity swap forwards the old session's server identity,
-        # so the invalid id fails exactly the first replacement construction.
-        with pytest.raises(ValueError, match='server_id'):
-            registry.set_transport_policy(shm_threshold=8192)
-        assert registry._runtime_session is first  # noqa: SLF001
-        assert registry._runtime_session.memory_stats()["holds"]['active_holds'] == 1
-
-        registry.set_transport_policy(shm_threshold=4096)
-        replacement = registry._runtime_session  # noqa: SLF001
-        assert replacement is not first
-        assert replacement.memory_stats()["holds"]['active_holds'] == 1, (
-            'the successful retry must carry the old session\'s own holds'
-        )
-        assert replacement.memory_stats()['holds']['total_held_bytes'] == 64
-    finally:
-        settings.shm_threshold = None
-        registry._runtime_session.shutdown()  # noqa: SLF001
-        local_copy.release()
-        _reset_default_runtime()
 
 
 @pytest.mark.timeout(120)
@@ -509,7 +232,6 @@ def test_repeated_shutdown_swaps_with_one_hold_do_not_grow_retired_records(scope
     observe_api = cc.observe if scope == 'default' else api
     if os.name != 'nt':
         endpoint_api.set_local_endpoint(root=str(tmp_path))
-    api.set_transport_policy(shm_threshold=1)
     proxy = None
     try:
         api.register(HoldEcho, HoldEchoResource(), name='mem-stats-swap-hold')
@@ -522,13 +244,13 @@ def test_repeated_shutdown_swaps_with_one_hold_do_not_grow_retired_records(scope
         held = cc.hold(proxy.echo)(_build_payload())
         try:
             before = observe_api.memory_stats()
-            assert before['runtime_outgoing'] is not None
+            assert before['client']['frozen']
             assert before['holds']['active_holds'] >= 1
 
             for swap in range(3):
                 api.shutdown()
                 after = observe_api.memory_stats()
-                assert after['runtime_outgoing'] is None
+                assert after['client']['memory'] is None
                 # The hold must survive every swap.
                 assert observe_api.memory_stats()["holds"]['active_holds'] >= 1, (
                     'retained hold metadata must not disappear across api.shutdown()'
@@ -540,13 +262,13 @@ def test_repeated_shutdown_swaps_with_one_hold_do_not_grow_retired_records(scope
                 # session, so repeated swaps never accumulate records.
                 outgoing = [
                     scope for scope in after['retired']
-                    if scope['role'] == 'runtime_outgoing'
+                    if scope['role'] == 'client'
                 ]
                 assert len(outgoing) == 1, (
                     f'swap {swap}: expected one owner-backed retired record, '
                     f'saw {after["retired"]!r}'
                 )
-                assert outgoing[0]['state'] == 'retired'
+                assert outgoing[0]['closed']
         finally:
             held.release()
 
@@ -561,7 +283,7 @@ def test_repeated_shutdown_swaps_with_one_hold_do_not_grow_retired_records(scope
             drained = observe_api.memory_stats()
             retired = [
                 scope for scope in drained['retired']
-                if scope['role'] == 'runtime_outgoing'
+                if scope['role'] == 'client'
             ]
             if not retired or time.monotonic() >= deadline:
                 break
@@ -570,7 +292,6 @@ def test_repeated_shutdown_swaps_with_one_hold_do_not_grow_retired_records(scope
         assert drained['holds']['active_holds'] == 0
         assert drained['holds']['total_held_bytes'] == 0
     finally:
-        settings.shm_threshold = None
         if proxy is not None:
             cc.close(proxy)
             proxy = None

@@ -4,8 +4,10 @@
 //! Host completion is reported by `HostLifecycleSnapshot::finished`.
 
 pub use c2_core::{
-    CallExecutionObservation, CallExecutionObserver, CallExecutionSnapshot, ConnectionClosed,
-    ConnectionEndReason, ConnectionEvent, ConnectionEvents, ConnectionEventsError,
-    ConnectionObservation, ConnectionSide, HostLifecycleSnapshot, MemoryCellStats,
-    MemoryScopeStats, ObservedPath, PathCounters, RouteConcurrencySnapshot, RuntimeMemoryStats,
+    ConnectionClosed, ConnectionEndReason, ConnectionEvent, ConnectionEvents,
+    ConnectionEventsError, ConnectionObservation, ConnectionSide, HostLifecycleSnapshot,
+    LocalCopyBucketStats, LocalCopyDirection, LocalCopyStats, MemoryCellStats, ObservedPath,
+    PathCounters, RetiredCallExecutionReport, RetiredRoleObserver, RetiredRoleReport,
+    RoleCallExecutionStats, RoleKind, RoleMemoryStats, RouteConcurrencySnapshot,
+    RuntimeCallExecutionStats, RuntimeMemoryStats,
 };

@@ -346,8 +346,8 @@ def test_runtime_endpoint_and_accepted_budget_authority_are_native():
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
     }
     assert 'self._runtime_session.set_local_endpoint' in calls
-    assert 'self._runtime_session.set_call_execution_limits' in calls
-    assert 'new_session.inherit_local_endpoint_selection' in calls
+    assert 'self._runtime_session.update_client_config' in calls
+    assert 'replacement.inherit_local_endpoint_selection' in calls
     swap = next(
         node for node in ast.walk(tree)
         if isinstance(node, ast.FunctionDef) and node.name == '_swap_runtime_session'
@@ -356,12 +356,12 @@ def test_runtime_endpoint_and_accepted_budget_authority_are_native():
         node for node in ast.walk(swap)
         if isinstance(node, ast.Call)
         and isinstance(node.func, ast.Attribute)
-        and _attribute_name(node.func) == 'new_session.inherit_local_endpoint_selection'
+        and _attribute_name(node.func) == 'replacement.inherit_local_endpoint_selection'
     ]
     assert len(inheritance) == 1
     assert len(inheritance[0].args) == 1
     assert isinstance(inheritance[0].args[0], ast.Name)
-    assert inheritance[0].args[0].id == 'runtime_session'
+    assert inheritance[0].args[0].id == 'previous'
     # Swapping inherits Core's lazy/accepted selection without resolving a
     # context, re-reading configuration, or deriving OS paths in Python.
     swap_calls = {
@@ -380,18 +380,12 @@ def test_runtime_endpoint_and_accepted_budget_authority_are_native():
         and node.attr != 'inherit_local_endpoint_selection'
         for node in ast.walk(swap)
     )
-    assert any(
-        isinstance(node, ast.Attribute)
-        and node.attr == 'call_execution_limits_overrides'
-        and isinstance(node.value, ast.Name)
-        and node.value.id == 'runtime_session'
-        and isinstance(node.ctx, ast.Load)
-        for node in ast.walk(tree)
-    )
+    assert 'replacement.inherit_retirement' in calls
 
     native = (root / 'sdk/python/native/src/runtime_session_ffi.rs').read_text(encoding='utf-8')
-    getter = _rust_compact(_rust_function(native, 'call_execution_limits_overrides'))
-    assert 'letoverrides=self.inner.call_execution_limits_overrides();' in getter
+    handoff = _rust_compact(_rust_function(native, 'inherit_retirement'))
+    assert 'previous.inner.capture_retirement_handoff()' in handoff
+    assert 'self.inner.adopt_retirement_handoff(&handoff)' in handoff
     context = _rust_compact(_rust_function(native, 'local_endpoint_context'))
     assert 'self.inner.local_endpoint_context()' in context
     inheritance_native = _rust_compact(_rust_function(native, 'inherit_local_endpoint_selection'))
@@ -719,27 +713,11 @@ def test_core_python_response_bridge_does_not_accept_shm_coordinate_tuples():
     assert offenders == []
 
 
-def test_python_ipc_config_facade_does_not_validate_override_keys():
+def test_python_ipc_config_facade_has_no_override_schema():
     root = Path(__file__).resolve().parents[2] / "src" / "c_two"
-    ipc_source = (root / "config" / "ipc.py").read_text(encoding="utf-8")
-    registry_source = (root / "transport" / "registry.py").read_text(encoding="utf-8")
-
-    forbidden = [
-        "_SERVER_KEYS",
-        "_CLIENT_KEYS",
-        "_FORBIDDEN_IPC_KEYS",
-        "_clean_ipc_overrides",
-        "_normalize_server_ipc_overrides",
-        "_normalize_client_ipc_overrides",
-        "unknown IPC override",
-        "shm_threshold is a global transport policy",
-    ]
-    offenders = [
-        needle
-        for needle in forbidden
-        if needle in ipc_source or needle in registry_source
-    ]
-    assert offenders == []
+    assert not (root / "config" / "ipc.py").exists()
+    source = (root / "transport" / "registry.py").read_text(encoding="utf-8")
+    assert "ipc_overrides" not in source
 
 
 def test_python_route_concurrency_wrapper_does_not_expose_public_close_authority():
@@ -924,7 +902,8 @@ def test_route_table_direct_mutations_validate_tombstones_and_private_identity()
     compact = _rust_compact(source)
     _rust_function(source, 'valid_tombstone')
     _rust_function(source, 'valid_server_instance_id')
-    _rust_function(source, 'valid_relay_url')
+    assert 'use crate::valid_relay_url;' in source
+    _rust_function((route_table.parents[1] / 'lib.rs').read_text(encoding='utf-8'), 'valid_relay_url')
     assert 'self.valid_tombstone(&tombstone)' in compact
     assert 'valid_relay_url(&entry.relay_url)' in compact
     assert 'valid_relay_url(&url)' in compact

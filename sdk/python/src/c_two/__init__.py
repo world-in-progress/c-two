@@ -17,7 +17,6 @@ from .transport.server.scheduler import ConcurrencyConfig
 from .transport.registry import (
     Runtime, register, connect, close, unregister, serve, shutdown,
     server_address, set_relay_anchor, set_server, set_client,
-    set_transport_policy, set_call_execution_limits,
 )
 
 from . import endpoint, observe, contract
@@ -51,6 +50,4 @@ __all__ = [
     'observe',
     'contract',
     '__version__',
-    'set_transport_policy',
-    'set_call_execution_limits',
 ]

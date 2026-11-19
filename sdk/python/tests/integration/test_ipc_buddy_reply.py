@@ -48,7 +48,7 @@ class TestBuddyReply:
     def test_large_payload_roundtrip(self):
         """Large payload (1MB) goes through buddy SHM response path."""
         proxy = self._setup_ipc()
-        data = os.urandom(1024 * 1024)  # 1 MB — above 4KB shm_threshold
+        data = os.urandom(1024 * 1024)  # 1 MiB exceeds the 16 KiB SHM threshold
         result = proxy.echo(data)
         assert result == data
         cc.close(proxy)

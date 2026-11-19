@@ -4,7 +4,7 @@
 //! (block splitting/merging).
 
 use crate::alloc::BuddyAllocator;
-use crate::budget::BudgetReservation;
+use crate::budget::MemoryReservation;
 use crate::segment::ChargedMapping;
 use crate::segment::ShmRegion;
 use std::sync::{Arc, Mutex};
@@ -36,7 +36,7 @@ impl BuddySegment {
     /// overflow, spans beyond one addressable `isize` mapping) return an
     /// error before any region is created. The caller that created this
     /// backing is responsible for reserving `layout.total_size` bytes in a
-    /// [`crate::budget::MemoryBudget`] and attaching the guard with
+    /// [`crate::DomainBudget`] and attaching the guard with
     /// [`BuddySegment::with_budget_guard`]; this raw creator stays
     /// budget-free.
     pub fn create(name: &str, size: usize, min_block: usize) -> Result<Self, String> {
@@ -89,7 +89,7 @@ impl BuddySegment {
     ///
     /// The pool attaches this once after budgeted creation and before
     /// publishing the backing.
-    pub(crate) fn with_budget_guard(mut self, guard: BudgetReservation) -> Self {
+    pub(crate) fn with_budget_guard(mut self, guard: Option<MemoryReservation>) -> Self {
         Arc::get_mut(
             self.cache
                 .get_mut()
@@ -99,7 +99,7 @@ impl BuddySegment {
                 .unwrap(),
         )
         .expect("backing not published")
-        .reservation = Some(guard);
+        .reservation = guard;
         self
     }
 

@@ -114,12 +114,11 @@ class NodePythonHost(PythonHost):
 
 
 class NodeRustHost:
-    def __init__(self, harness, address, route, transport, ending, count, ipc_overrides, ipc_root):
+    def __init__(self, harness, address, route, transport, ending, count, limits, ipc_root):
         self.process = subprocess.Popen(
             [str(harness.binary), "host", address, route,
-             "shm" if transport.prefer_shm else "no-shm",
              "large" if transport.large else "inline", "--items", str(count), "--ending", ending],
-            cwd=harness.root, env=process_environment(ipc_overrides, ipc_root),
+            cwd=harness.root, env=process_environment(limits, ipc_root),
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, bufsize=1,
         )
@@ -170,7 +169,7 @@ def test_generated_node_streams_from_real_hosts(
             server.register(Portable, resource, name=route)
             assert server.server_address() == address
         else:
-            rust_host = rust_stream_harness.host(address, route, True, large)
+            rust_host = rust_stream_harness.host(address, route, large)
         config = tmp_path / "node-config.json"
         config.write_text(json.dumps({
             "address": address, "route": route, "hold": held, "inputPath": str(input_path),
@@ -223,37 +222,19 @@ def _node_config(root, payload_relative, tmp_path, address, route, **options):
     return destination, input_path.stat().st_size
 
 
-def _assert_node_carriers(case, encoded_len, input_stats, server_stats, node_stats, count):
-    """Matrix B: observe resource backing; ABI 8 exposes B and slots, not client IPC cells."""
-    at_input = input_stats["cells"]
-    server = server_stats["server"]["cells"]
-    for cells in (at_input, server):
-        for kind in ("shm", "file", "reassembly"):
-            assert cells[kind]["used_bytes"] == 0, (case.name, kind, cells)
-            assert cells[kind]["peak_bytes"] <= cells[kind]["limit_bytes"]
-        assert cells["shm"]["limit_bytes"] == case.shm_budget
-    if case.large:
-        assert encoded_len > CHUNK_SIZE
-    for cells in (at_input, server):
-        if case.reassembly != "none":
-            assert cells["reassembly"]["peak_bytes"] >= encoded_len
-        else:
-            assert cells["reassembly"]["peak_bytes"] == 0
-        if case.reassembly == "file":
-            assert cells["file"]["peak_bytes"] >= encoded_len
-        else:
-            assert cells["file"]["peak_bytes"] == 0
-    if case.reassembly == "shm":
-        assert at_input["shm"]["peak_bytes"] >= encoded_len
+def _assert_node_carriers(case, encoded_len, input_stats, server_stats, node_stats):
+    host = server_stats["server"]
+    assert host["memory"]["limit_bytes"] == case.memory_budget_bytes
+    assert host["file_spill"]["limit_bytes"] == case.file_spill_budget_bytes
+    assert host["file_spill"]["used_bytes"] == 0
+    assert input_stats["memory"]["peak_bytes"] >= encoded_len
+    if case.file_spill_budget_bytes:
+        assert host["file_spill"]["peak_bytes"] >= encoded_len
     else:
-        assert at_input["shm"]["peak_bytes"] == 0
-    if case.reassembly == "shm" or (case.name == "shm" and count > 0):
-        assert server["shm"]["peak_bytes"] >= encoded_len
-    else:
-        assert server["shm"]["peak_bytes"] == 0
-    assert int(node_stats["payload_buffer"]["used_bytes"]) == 0
-    assert int(node_stats["payload_buffer"]["peak_bytes"]) >= encoded_len
-    assert node_stats["used_operations"] == "0"
+        assert host["file_spill"]["peak_bytes"] == 0
+    assert int(node_stats["memory"]["peak_bytes"]) >= encoded_len
+    assert int(node_stats["file_spill"]["used_bytes"]) == 0
+    assert node_stats["call_execution"]["used_operations"] == "0"
 
 
 _NODE_MATRIX_ROWS = list(product(
@@ -285,9 +266,8 @@ def test_generated_node_stream_transport_matrix(
     fail = ending != "success"
     route = f"node-carrier-{os.getpid()}-{tmp_path.name}"
     address = f"ipc://c2_node_carrier_{os.getpid()}_{tmp_path.name}"
-    threshold = 64 * 1024 if transport.prefer_shm else 1 << 30
-    overrides = transport.overrides()
-    node_options = {"requestShmThreshold": threshold, "requestChunkSize": CHUNK_SIZE}
+    overrides = transport.limits()
+    node_options = {}
     if os.name != "nt":
         node_options["ipcRoot"] = str(ipc_root)
     config, encoded_len = _node_config(
@@ -301,8 +281,7 @@ def test_generated_node_stream_transport_matrix(
             server = cc.Runtime()
             if os.name != "nt":
                 server.set_local_endpoint(root=str(ipc_root))
-            server.set_transport_policy(shm_threshold=threshold)
-            server.set_server(server_id=address.removeprefix("ipc://"), ipc_overrides=overrides)
+            server.set_server(server_id=address.removeprefix("ipc://"), **overrides)
             resource = ObservedNodePythonHost(transport.large, count, fail)
             resource.observe_input = lambda: server.memory_stats()["server"]
             server.register(Portable, resource, name=route)
@@ -327,7 +306,7 @@ def test_generated_node_stream_transport_matrix(
         else:
             stats = rust_host.stats()
             input_stats, server_stats = stats["input"], stats["memory"]
-        _assert_node_carriers(transport, encoded_len, input_stats, server_stats, receipt["stats"], count)
+        _assert_node_carriers(transport, encoded_len, input_stats, server_stats, receipt["stats"])
         if rust_host is not None:
             rust_host.stop()
             rust_host = None
@@ -412,7 +391,7 @@ def test_generated_contract_client_connection_concurrency(
     server = cc.Runtime()
     if os.name != "nt":
         server.set_local_endpoint(root=str(ipc_root))
-    server.set_server(server_id=address.removeprefix("ipc://"), ipc_overrides={"max_execution_workers": 4})
+    server.set_server(server_id=address.removeprefix("ipc://"), max_execution_workers=4)
     resource = InterleavedNodeResource() if scenario == "interleave" else ConcurrentUnaryNodeResource()
     child = None
     try:

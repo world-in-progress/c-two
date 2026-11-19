@@ -5,9 +5,8 @@ use std::time::Duration;
 /// Configuration for the relay server.
 #[derive(Debug, Clone)]
 pub struct RelayConfig {
-    /// Fully resolved data-plane upstream IPC policy, frozen at relay startup.
-    /// Attestation/watch clients keep private, lazy default contexts outside this budget.
-    pub upstream_ipc: crate::ClientIpcConfig,
+    /// Capacity shared by this relay's data plane.
+    pub domain_limits: crate::DomainLimits,
     /// HTTP bind address (e.g. "0.0.0.0:8080").
     pub bind: String,
     /// Stable relay identifier. Default: "{hostname}_{pid}_{uuid8}".
@@ -17,10 +16,6 @@ pub struct RelayConfig {
     pub advertise_url: String,
     /// Seed relay URLs for mesh bootstrap. Empty = standalone mode.
     pub seeds: Vec<String>,
-    /// Upstream idle-connection timeout. 0 = disabled.
-    pub idle_timeout_secs: u64,
-    /// Anti-entropy digest exchange interval. 0 = disabled.
-    pub anti_entropy_interval: Duration,
     /// Heartbeat interval for peer liveness. 0 = disabled.
     pub heartbeat_interval: Duration,
     /// Consecutive heartbeat misses before marking peer Dead.
@@ -31,46 +26,31 @@ pub struct RelayConfig {
     pub seed_retry_interval: Duration,
     /// Whether relay HTTP clients should honor system HTTP proxy variables.
     pub use_proxy: bool,
-    /// Target maximum payload chunk size for remote transport streams.
-    ///
-    /// This controls C-Two's protocol-independent remote payload batching. It
-    /// does not guarantee concrete TCP packets, HTTP/1 chunks, or HTTP/2 DATA
-    /// frames have the same size.
-    pub remote_payload_chunk_size: u64,
 }
 
 impl Default for RelayConfig {
     fn default() -> Self {
         Self {
-            upstream_ipc: crate::ClientIpcConfig::default(),
+            domain_limits: crate::DomainLimits::default(),
             bind: "0.0.0.0:8080".into(),
             relay_id: Self::generate_relay_id(),
             advertise_url: String::new(),
             seeds: Vec::new(),
-            idle_timeout_secs: 60,
-            anti_entropy_interval: Duration::from_secs(60),
             heartbeat_interval: Duration::from_secs(5),
             heartbeat_miss_threshold: 3,
             dead_peer_probe_interval: Duration::from_secs(30),
             seed_retry_interval: Duration::from_secs(10),
             use_proxy: false,
-            remote_payload_chunk_size: crate::DEFAULT_REMOTE_PAYLOAD_CHUNK_SIZE,
         }
     }
 }
 
 impl RelayConfig {
     pub fn validate(&self) -> Result<(), String> {
-        self.upstream_ipc
-            .validate()
-            .map_err(|reason| format!("upstream_ipc {reason}"))?;
         crate::validate_relay_id(&self.relay_id)?;
-        if self.idle_timeout_secs != 0 && self.idle_timeout_secs.checked_mul(1000).is_none() {
-            return Err("idle_timeout_secs must fit in milliseconds".into());
-        }
-        crate::validate_remote_payload_chunk_size(self.remote_payload_chunk_size)
-            .map_err(|reason| format!("remote_payload_chunk_size {reason}"))?;
-        Ok(())
+        self.domain_limits
+            .validate()
+            .map_err(|error| error.to_string())
     }
 
     pub fn generate_relay_id() -> String {
@@ -138,21 +118,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn idle_timeout_must_fit_milliseconds() {
-        let config = RelayConfig {
-            idle_timeout_secs: u64::MAX,
-            ..RelayConfig::default()
-        };
-
-        let err = config
-            .validate()
-            .expect_err("idle timeout should reject millisecond overflow");
-
-        assert!(err.contains("idle_timeout_secs"));
-        assert!(err.contains("milliseconds"));
-    }
-
-    #[test]
     fn relay_config_rejects_invalid_relay_id() {
         let config = RelayConfig {
             relay_id: "bad\nrelay".to_string(),
@@ -164,21 +129,6 @@ mod tests {
             .expect_err("relay config should reject invalid relay_id");
 
         assert!(err.contains("relay_id"));
-    }
-
-    #[test]
-    fn relay_config_rejects_invalid_remote_payload_chunk_size() {
-        let config = RelayConfig {
-            remote_payload_chunk_size: 0,
-            ..RelayConfig::default()
-        };
-
-        let err = config
-            .validate()
-            .expect_err("zero remote chunk size should fail");
-
-        assert!(err.contains("remote_payload_chunk_size"));
-        assert!(err.contains("> 0"));
     }
 
     #[test]
@@ -198,23 +148,5 @@ mod tests {
         assert!(!relay_id.contains('/'));
         assert!(!relay_id.contains('\n'));
         crate::validate_relay_id(&relay_id).unwrap();
-    }
-
-    #[test]
-    fn relay_config_validates_upstream_ipc_and_accepts_zero_budgets() {
-        let mut config = RelayConfig::default();
-        config.upstream_ipc.base.pool_enabled = false;
-        config.upstream_ipc.base.shm_backing_budget_bytes = 0;
-        config.upstream_ipc.base.file_backing_budget_bytes = 0;
-        config.upstream_ipc.base.live_reassembly_budget_bytes = 0;
-        config
-            .validate()
-            .expect("zero budgets are finite valid limits");
-        config.upstream_ipc.base.pool_prewarm_segments = 1;
-        let err = config
-            .validate()
-            .expect_err("disabled buddy cannot prewarm");
-        assert!(err.contains("upstream_ipc"), "{err}");
-        assert!(err.contains("pool_prewarm_segments"), "{err}");
     }
 }

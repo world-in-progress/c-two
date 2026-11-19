@@ -288,15 +288,17 @@ fn run_host(
         .strip_prefix("ipc://")
         .ok_or("Rust host address must use ipc://")?;
     let runtime = Runtime::new(RuntimeOptions {
-        server_id: Some(server_id.to_string()),
         use_process_relay_anchor: false,
         ..RuntimeOptions::default()
     })?;
     let host_options = match relay_url {
         Some(relay_url) => HostOptions::default()
+            .with_server_id(server_id)
             .with_relay_anchor_address(relay_url)
             .with_relay_use_proxy(false),
-        None => HostOptions::default().without_relay(),
+        None => HostOptions::default()
+            .without_relay()
+            .with_server_id(server_id),
     };
     let host = runtime.host(host_options)?;
     let calls = Arc::new(AtomicUsize::new(0));

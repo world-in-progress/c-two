@@ -3,8 +3,7 @@
 
 use std::sync::Arc;
 
-use c2_mem::retention::{BudgetedBuffer, PayloadBufferReservation};
-use c2_mem::{PeerMappingError, PeerRead};
+use c2_mem::{PeerMappingError, PeerRead, WindowChunk, WindowSlice};
 use c2_wire::{buddy::BuddyPayload, chunk::ReassemblyBacking, connection::RemoteLoan};
 use parking_lot::RwLock;
 
@@ -101,15 +100,19 @@ impl ResponseCursor {
         self.len - self.offset
     }
 
+    /// Copy one slice through the caller's flow-control window. `slice` is
+    /// the granted capacity for this chunk: the copy takes at most its bytes,
+    /// and the returned [`WindowChunk`] refunds that capacity to the window
+    /// when it drops.
     pub fn read_chunk(
         &mut self,
-        mut reservation: PayloadBufferReservation,
+        slice: WindowSlice,
         max_bytes: usize,
-    ) -> Result<Option<BudgetedBuffer>, crate::client::IpcError> {
+    ) -> Result<Option<WindowChunk>, crate::client::IpcError> {
         let take = self
             .remaining()
             .min(max_bytes)
-            .min(usize::try_from(reservation.bytes()).unwrap_or(usize::MAX));
+            .min(usize::try_from(slice.bytes()).unwrap_or(usize::MAX));
         if take == 0 {
             if self.remaining() == 0 {
                 return Ok(None);
@@ -119,11 +122,6 @@ impl ResponseCursor {
             ));
         }
         let mut bytes = vec![0; take];
-        if bytes.capacity() as u64 > reservation.bytes() {
-            return Err(crate::client::IpcError::Config(
-                "response copy allocation exceeds reservation".into(),
-            ));
-        }
         match self.data.as_ref().expect("live response cursor") {
             ResponseData::Inline(source) => {
                 bytes.copy_from_slice(&source[self.offset..self.offset + take])
@@ -141,10 +139,11 @@ impl ResponseCursor {
         if self.remaining() == 0 {
             self.data.take();
         }
-        let charge = reservation
-            .split_off(bytes.capacity() as u64)
-            .expect("bounded by reservation");
-        Ok(Some(BudgetedBuffer::new(bytes, charge)))
+        debug_assert!(
+            bytes.capacity() as u64 <= slice.bytes(),
+            "chunk allocation exceeds its window slice"
+        );
+        Ok(Some(slice.into_buffer(bytes)))
     }
 }
 

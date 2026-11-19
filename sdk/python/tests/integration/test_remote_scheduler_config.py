@@ -17,7 +17,6 @@ from c_two.transport.server.scheduler import ConcurrencyConfig
 @pytest.fixture(autouse=True)
 def _clean_env_and_registry(monkeypatch):
     previous_override_relay = settings._relay_anchor_address  # noqa: SLF001
-    previous_override_shm_threshold = settings._shm_threshold  # noqa: SLF001
     settings.relay_anchor_address = None
     monkeypatch.delenv('C2_RELAY_ANCHOR_ADDRESS', raising=False)
     try:
@@ -30,7 +29,6 @@ def _clean_env_and_registry(monkeypatch):
             _reset_default_runtime()
         finally:
             settings._relay_anchor_address = previous_override_relay  # noqa: SLF001
-            settings._shm_threshold = previous_override_shm_threshold  # noqa: SLF001
 
 
 def _direct_client(crm_type: type, name: str):

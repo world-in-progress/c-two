@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use memmap2::MmapMut;
 
-use crate::budget::BudgetReservation;
+use crate::budget::FileSpillReservation;
 
 /// The mapping closes before its backing file. On Windows the file carries
 /// DELETE_ON_CLOSE, so normal drop and process termination both remove it.
@@ -22,7 +22,7 @@ pub struct SpillMapping {
     /// mapping is unmapped and the file handle closed: the charge returns
     /// exactly when the backing is released, surviving any handle movement or
     /// logical-length trim in between.
-    _budget_guard: Option<BudgetReservation>,
+    _budget_guard: Option<FileSpillReservation>,
 }
 
 impl std::ops::Deref for SpillMapping {
@@ -44,8 +44,8 @@ impl SpillMapping {
     ///
     /// The pool attaches this once after budgeted creation and before
     /// publishing the mapping.
-    pub(crate) fn with_budget_guard(mut self, guard: BudgetReservation) -> Self {
-        self._budget_guard = Some(guard);
+    pub(crate) fn with_budget_guard(mut self, guard: Option<FileSpillReservation>) -> Self {
+        self._budget_guard = guard;
         self
     }
 }

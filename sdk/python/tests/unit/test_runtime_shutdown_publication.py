@@ -287,7 +287,7 @@ def test_retirement_entry_errors_allow_runtime_observation(runtimes, monkeypatch
             elif operation == 'register':
                 runtime.register(Echo, EchoResource('late:'), name='late')
             else:
-                runtime.set_transport_policy(shm_threshold=16384)
+                runtime.set_client(memory_budget_bytes=16384)
         _assert_retired(caught.value)
     assert runtime._runtime_session is session
     assert runtime.shutdown()['completed']

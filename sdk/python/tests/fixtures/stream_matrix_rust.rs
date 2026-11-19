@@ -63,16 +63,18 @@ fn cell(value: c_two::observe::MemoryCellStats) -> Value {
     })
 }
 
-fn scope(value: c_two::observe::MemoryScopeStats) -> Value {
-    json!({"cells": {"shm": cell(value.shm), "file": cell(value.file),
-                     "reassembly": cell(value.reassembly)}})
+fn role(value: c_two::observe::RoleMemoryStats) -> Value {
+    json!({
+        "domain_id": value.domain_id, "generation": value.generation,
+        "frozen": value.frozen, "closed": value.closed,
+        "memory": value.memory.map(cell), "file_spill": value.file_spill.map(cell),
+    })
 }
 
 fn memory_stats(stats: c_two::observe::RuntimeMemoryStats) -> Value {
     json!({
-        "runtime_outgoing": stats.runtime_outgoing.map(scope),
-        "server": stats.server.map(scope),
-        "payload_buffer": stats.payload_buffer.map(cell),
+        "client": role(stats.client),
+        "server": role(stats.server),
     })
 }
 
@@ -146,7 +148,7 @@ impl EncodedStreamService for Resource {
         let input = Payload::open_copy(&spec, &request, &OpenOptions::default()).unwrap();
         inspect(&input, self.large).unwrap();
         let calls = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
-        *self.input_stats.lock().unwrap() = Some(scope(self.host.memory_stats().server.unwrap()));
+        *self.input_stats.lock().unwrap() = Some(role(self.host.memory_stats().server));
         if self.gated {
             println!("CALL calls={calls}");
             std::io::stdout().flush().unwrap();
@@ -210,19 +212,18 @@ impl EncodedStream for MatrixItems {
     }
 }
 
-fn runtime(server_id: Option<String>, shm: bool) -> Result<Runtime, c_two::LifecycleError> {
-    Runtime::new(RuntimeOptions {
-        server_id,
-        shm_threshold: Some(if shm { 64 * 1024 } else { 1 << 30 }),
+fn runtime(memory_budget_bytes: Option<u64>) -> Result<Runtime, c_two::LifecycleError> {
+    let mut options = RuntimeOptions {
         use_process_relay_anchor: false,
         ..RuntimeOptions::default()
-    })
+    };
+    options.client_limits.memory_budget_bytes = memory_budget_bytes;
+    Runtime::new(options)
 }
 
 fn host(
     address: &str,
     route: &str,
-    shm: bool,
     large: bool,
     gated: bool,
     outcome: StreamOutcome,
@@ -230,8 +231,12 @@ fn host(
     let server_id = address
         .strip_prefix("ipc://")
         .ok_or("expected IPC address")?;
-    let runtime = runtime(Some(server_id.into()), shm)?;
-    let host = runtime.host(HostOptions::default().without_relay())?;
+    let runtime = runtime(None)?;
+    let host = runtime.host(
+        HostOptions::default()
+            .without_relay()
+            .with_server_id(server_id),
+    )?;
     let release = ContractRelease::from_descriptor_json(DESCRIPTOR)?;
     let calls = Arc::new(AtomicUsize::new(0));
     let input_stats = Arc::new(Mutex::new(None));
@@ -289,14 +294,8 @@ fn host(
     Ok(())
 }
 
-fn client(
-    address: &str,
-    route: &str,
-    shm: bool,
-    large: bool,
-    held: bool,
-) -> Result<(), Box<dyn Error>> {
-    let runtime = runtime(None, shm)?;
+fn client(address: &str, route: &str, large: bool, held: bool) -> Result<(), Box<dyn Error>> {
+    let runtime = runtime(None)?;
     let release = ContractRelease::from_descriptor_json(DESCRIPTOR)?;
     let connection = runtime.connect(
         release.expected_route(route)?,
@@ -344,9 +343,11 @@ fn client(
             .encode_vec(Vec::new())?
             .call_owned()?,
     );
-    assert_eq!(runtime.call_execution_snapshot()?.used_operations, 0);
+    assert_eq!(
+        runtime.call_execution_snapshot().client.used_operations,
+        Some(0)
+    );
     let stats = memory_stats(runtime.memory_stats());
-    assert_eq!(stats["payload_buffer"]["used_bytes"], 0);
     println!(
         "{}",
         json!({"items": 2, "path": "direct_ipc", "memory": stats,
@@ -366,7 +367,6 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
     let address = args.next().ok_or("missing address")?;
     let route = args.next().ok_or("missing route")?;
-    let shm = args.next().ok_or("missing shm")? == "shm";
     let large = args.next().ok_or("missing size")? == "large";
     let mut args = args.peekable();
     let held = if matches!(
@@ -379,9 +379,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     };
     let outcome = StreamOutcome::parse(args)?;
     match mode.as_str() {
-        "host" => host(&address, &route, shm, large, false, outcome),
-        "gated-host" => host(&address, &route, shm, large, true, outcome),
-        "client" => client(&address, &route, shm, large, held),
+        "host" => host(&address, &route, large, false, outcome),
+        "gated-host" => host(&address, &route, large, true, outcome),
+        "client" => client(&address, &route, large, held),
         _ => Err("unknown mode".into()),
     }
 }
@@ -531,8 +531,12 @@ mod relay {
     pub fn host(args: Vec<String>) -> Result<(), Box<dyn Error>> {
         let address = &args[0];
         let route = &args[1];
-        let runtime = runtime(Some(address.strip_prefix("ipc://").unwrap().into()), true)?;
-        let host = runtime.host(HostOptions::default().with_relay_anchor_address(&args[2]))?;
+        let runtime = runtime(None)?;
+        let host = runtime.host(
+            HostOptions::default()
+                .with_server_id(address.strip_prefix("ipc://").unwrap())
+                .with_relay_anchor_address(&args[2]),
+        )?;
         let release = ContractRelease::from_descriptor_json(DESCRIPTOR)?;
         let outcome = StreamOutcome::parse(args[3..].iter().cloned())?;
         let counts = Arc::new((Mutex::new(Counts::default()), Condvar::new()));
@@ -621,17 +625,13 @@ mod relay {
     }
 
     pub fn client(args: Vec<String>) -> Result<(), Box<dyn Error>> {
-        let runtime = runtime(None, true)?;
         let behavior = args[3].as_str();
         let budget = if behavior == "hold" {
             2 * ITEM_BYTES
         } else {
             3 * ITEM_BYTES
         };
-        runtime.set_call_execution_limits(c_two::CallExecutionLimitsOverrides {
-            payload_buffer_budget_bytes: Some(budget as u64),
-            ..Default::default()
-        })?;
+        let runtime = runtime(Some(budget as u64))?;
         let release = ContractRelease::from_descriptor_json(DESCRIPTOR)?;
         let connection = runtime.connect(
             release.expected_route(&args[1])?,
@@ -658,7 +658,7 @@ mod relay {
             inspect_item(first.value().unwrap(), 0);
             inspect_item(second.value().unwrap(), 1);
             let full = memory_stats(runtime.memory_stats());
-            assert_eq!(full["payload_buffer"]["used_bytes"], budget);
+            assert_eq!(full["client"]["memory"]["used_bytes"], budget);
             let (started, ready) = mpsc::sync_channel(0);
             let (done, result) = mpsc::channel();
             let worker = std::thread::spawn(move || {
@@ -677,7 +677,7 @@ mod relay {
             inspect_item(third.value().unwrap(), 2);
             inspect_item(second.value().unwrap(), 1);
             let after_one_release = memory_stats(runtime.memory_stats());
-            assert_eq!(after_one_release["payload_buffer"]["used_bytes"], budget);
+            assert_eq!(after_one_release["client"]["memory"]["used_bytes"], budget);
             second.release()?;
             third.release()?;
             assert!(stream.next().is_none());
@@ -716,8 +716,11 @@ mod relay {
         assert_eq!(delivered, args[2].parse::<usize>()?);
         assert_eq!(receipt.complete_items, Some(delivered as u64));
         let stats = memory_stats(runtime.memory_stats());
-        assert_eq!(stats["payload_buffer"]["used_bytes"], 0);
-        assert_eq!(runtime.call_execution_snapshot()?.used_operations, 0);
+        assert_eq!(stats["client"]["memory"]["used_bytes"], 0);
+        assert_eq!(
+            runtime.call_execution_snapshot().client.used_operations,
+            Some(0)
+        );
         emit(
             json!({"event": "done", "delivered": delivered, "complete_items": receipt.complete_items,
                     "error": terminal, "memory": stats, "holds": holds, "path": "explicit_relay"}),

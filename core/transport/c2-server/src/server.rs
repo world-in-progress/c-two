@@ -6,7 +6,7 @@
 //! Dispatcher publication uses a short synchronous lock. Contract preparation,
 //! payload allocation/copy, callbacks and asynchronous I/O happen outside it.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
@@ -25,10 +25,9 @@ use tracing::{debug, info, warn};
 /// platform segment-name derivation.
 static RESPONSE_POOL_GEN: AtomicU64 = AtomicU64::new(0);
 
+use c2_config::{DomainLimits, MAX_HANDSHAKE_FRAME_BYTES, MAX_RPC_FRAME_BYTES};
 use c2_error::{C2Error, ErrorCode};
-#[cfg(test)]
-use c2_mem::config::PoolConfig;
-use c2_mem::{MemPool, MemoryBudget};
+use c2_mem::{DomainBudget, MemPool, MemoryReservation, OperationPermit};
 use c2_wire::buddy::BuddyPayload;
 use c2_wire::chunk::{ChunkAdmissionError, ChunkRequest};
 use c2_wire::connection::calls::{CallLookup, ValueReceive};
@@ -80,8 +79,11 @@ const SHUTDOWN_INITIATE_FRAME_BODY_LEN: u32 =
 const POST_SHUTDOWN_DUPLICATE_INITIATE_READ_TIMEOUT_MS: u64 = 100;
 /// Default journal reason for an explicit direct IPC shutdown transaction.
 pub const DIRECT_IPC_SHUTDOWN_REASON: &str = "direct_ipc_shutdown";
+/// Bound an inline CALL_END error payload so the complete frame stays within
+/// [`c2_config::MAX_RPC_FRAME_BYTES`]; UTF-8-safe truncation preserves the
+/// error code and name.
 fn error_wire(code: ErrorCode, message: impl Into<String>) -> Vec<u8> {
-    C2Error::new(code, message).to_wire_bytes()
+    rpc::bounded_call_end_error_bytes(&C2Error::new(code, message))
 }
 
 // ---------------------------------------------------------------------------
@@ -256,27 +258,6 @@ pub struct ServerShutdownCompletion {
     pub runtime_error: Option<String>,
 }
 
-/// Read-only snapshot of the server direction's shared memory budget.
-///
-/// The three cells are C-Two-owned accounting scopes — owner-created SHM
-/// backing, owner-created file backing, and live reassembly capacity — not
-/// process RSS. Their sum must never be presented as physical memory usage.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ServerMemorySnapshot {
-    /// Resolved limits the server budget enforces.
-    pub limits: c2_config::MemoryBudgetLimits,
-    /// Consistent view of the three budget cells.
-    pub budget: c2_mem::BudgetSnapshot,
-}
-
-impl ServerMemorySnapshot {
-    /// Scope label for the server direction.
-    ///
-    /// Use this to distinguish the server response/reassembly role from a
-    /// Runtime's outgoing client role when reporting more than one scope.
-    pub const SCOPE: &'static str = "server";
-}
-
 /// The main IPC server.
 ///
 /// Binds a local OS endpoint, accepts connections, and dispatches CRM calls through
@@ -286,6 +267,8 @@ pub struct Server {
     identity: ServerIdentity,
     config: ServerIpcConfig,
     endpoint: LocalEndpoint,
+    #[cfg(test)]
+    test_write_timeout: Duration,
     /// The single route authority, published and reserved under a short lock.
     dispatcher: RwLock<Dispatcher>,
     shutdown_tx: watch::Sender<bool>,
@@ -304,15 +287,20 @@ pub struct Server {
     /// **parking_lot sync RwLock** — guards SHM memory pool; blocking `.read()`
     /// / `.write()` (no `.await`).  Safe to hold briefly inside tokio tasks.
     response_pool: Arc<crate::ResponsePool>,
-    /// Shared transport memory context charged by the response pool, the
-    /// reassembly pool inside `chunk_registry`, and response prewarm. One
-    /// server direction, one budget; it owns only accounting counters and is
-    /// never reset by shutdown.
-    memory_budget: MemoryBudget,
+    /// Shared role-domain budget charged by the response pool, the reassembly
+    /// pool inside `chunk_registry`, input copies and per-frame admission.
+    /// One server direction, one budget; it owns only accounting counters and
+    /// is never reset by shutdown.
+    domain_budget: DomainBudget,
     admission: Arc<AdmissionGate>,
-    pending_requests: Arc<Semaphore>,
-    control_reply_budget: Arc<Semaphore>,
-    chunk_processing_permits: Arc<Semaphore>,
+    /// Inbound chunk-copy concurrency gate (`C = clamp(P, 4, 64)`).
+    copy_permits: Arc<Semaphore>,
+    /// Stream item encoding concurrency gate (`E = clamp(P, 4, 64)`).
+    encoding_permits: Arc<Semaphore>,
+    /// Round-robin state for C-gated per-request chunk copies.
+    copy_scheduler: Arc<CopyScheduler>,
+    /// Per-connection control-reply slot budget `Q_ctrl = clamp(N, 1, 64)`.
+    control_reply_capacity: usize,
     active_connections: parking_lot::Mutex<HashMap<u64, Arc<Connection>>>,
     active_connections_notify: Notify,
     shutdown_route_outcomes: parking_lot::Mutex<Vec<ServerRouteCloseOutcome>>,
@@ -404,6 +392,13 @@ impl Drop for PendingRouteReservation {
 }
 
 impl Server {
+    fn write_timeout(&self) -> Duration {
+        #[cfg(test)]
+        return self.test_write_timeout;
+        #[cfg(not(test))]
+        c2_config::WRITE_TIMEOUT
+    }
+
     /// Create a new server for the given IPC address.
     ///
     /// Address format: `ipc://region_id`
@@ -447,15 +442,32 @@ impl Server {
         config: ServerIpcConfig,
         identity: ServerIdentity,
     ) -> Result<Self, ServerError> {
-        config.validate().map_err(ServerError::Config)?;
+        let budget = DomainBudget::from_limits(&DomainLimits::default());
+        Self::new_with_identity_endpoint_and_budget(endpoint, config, identity, budget)
+    }
+
+    /// Construct with an explicit role-domain budget.
+    ///
+    /// A Host restart passes its retained [`DomainBudget`] here so in-flight
+    /// accounting survives the new incarnation instead of starting at zero;
+    /// plain constructors mint a fresh default-limits domain.
+    pub fn new_with_identity_endpoint_and_budget(
+        endpoint: LocalEndpoint,
+        config: ServerIpcConfig,
+        identity: ServerIdentity,
+        budget: DomainBudget,
+    ) -> Result<Self, ServerError> {
+        config
+            .validate()
+            .map_err(|error| ServerError::Config(error.to_string()))?;
         validate_server_identity(&identity)?;
         // One server direction, one finite budget: the response pool, the
-        // chunk-reassembly pool, and response prewarm all charge the same
-        // context, so the server cannot double its configured cap by owning
-        // two pools. The context owns only accounting counters and is never
-        // reset by shutdown; charges retained by outstanding response data
-        // stay observable.
-        let memory_budget = MemoryBudget::from_limits(&config.memory_budget_limits());
+        // chunk-reassembly pool, input copies and per-frame admission all
+        // charge the same domain, so the server cannot double its configured
+        // cap by owning two pools. The domain owns only accounting counters
+        // and is never reset by shutdown; charges retained by outstanding
+        // response data stay observable.
+        let memory_limit = budget.snapshot().memory.limit_bytes;
         let reassembly_pool = {
             let pid = std::process::id();
             let ra_gen = RESPONSE_POOL_GEN.fetch_add(1, Ordering::Relaxed) as u32;
@@ -463,11 +475,9 @@ impl Server {
             // Centralized projection: reassembly follows the same buddy policy
             // as every other pool role (disabled buddy → dedicated/file storage).
             MemPool::new_with_prefix_and_budget(
-                config
-                    .base
-                    .reassembly_pool_config(&config.reassembly_pool_tuning()),
+                c2_mem::config::PoolConfig::reassembly_for_budget(memory_limit),
                 prefix,
-                memory_budget.clone(),
+                budget.clone(),
             )
             .map_err(ServerError::Config)?
         };
@@ -475,6 +485,7 @@ impl Server {
             endpoint,
             config,
             identity,
+            budget,
             Arc::new(parking_lot::RwLock::new(reassembly_pool)),
             Arc::new(AdmissionGate::new()),
         )
@@ -484,19 +495,16 @@ impl Server {
         endpoint: LocalEndpoint,
         config: ServerIpcConfig,
         identity: ServerIdentity,
+        budget: DomainBudget,
         reassembly_pool: Arc<parking_lot::RwLock<MemPool>>,
         admission: Arc<AdmissionGate>,
     ) -> Result<Self, ServerError> {
         let (shutdown_tx, _) = watch::channel(false);
         // The injected test pool and the production reassembly pool both
-        // carry the server's accounting authority. Derive the response-pool
-        // budget from that exact owner so both directions share one context.
-        let memory_budget = reassembly_pool
-            .read()
-            .budget()
-            .cloned()
-            .ok_or_else(|| ServerError::Config("reassembly pool has no owner budget".into()))?;
-        let chunk_config = c2_wire::chunk::ChunkConfig::from_base(&config);
+        // charge the caller's domain budget, so both directions share one
+        // accounting authority.
+        let chunk_config =
+            c2_wire::chunk::ChunkConfig::with_max_payload_size(config.max_payload_size);
         let chunk_registry = Arc::new(c2_wire::chunk::ChunkRegistry::new(
             reassembly_pool,
             chunk_config,
@@ -507,12 +515,11 @@ impl Server {
             let prefix = format!("/cc3r{:08x}{:08x}", pid, generation as u32);
             // Centralized projection: the response pool keeps dedicated SHM
             // replies available even when the buddy tiers are disabled.
+            let memory_limit = budget.snapshot().memory.limit_bytes;
             MemPool::new_with_prefix_and_budget(
-                config
-                    .base
-                    .primary_pool_config(&config.response_pool_tuning()),
+                c2_mem::config::PoolConfig::primary_for_budget(memory_limit),
                 prefix,
-                memory_budget.clone(),
+                budget.clone(),
             )
             .map_err(ServerError::Config)?
         };
@@ -520,12 +527,16 @@ impl Server {
             state: ServerLifecycleState::Initialized,
             credential: None,
         });
-        let pending_requests = Arc::new(Semaphore::new(config.max_pending_requests as usize));
-        // Even a zero business budget must leave one control reply slot.
-        let control_reply_budget =
-            Arc::new(Semaphore::new(config.max_pending_requests.max(1) as usize));
-        let chunk_processing_permits =
-            Arc::new(Semaphore::new(config.max_inflight_chunk_frames as usize));
+        // C/E gates and the writer's per-connection control budget all derive
+        // from the same pool derivation the runtime builder uses.
+        let derivation = crate::runtime::derive_blocking_pool(&config).map_err(ServerError::Io)?;
+        let copy_permits = Arc::new(Semaphore::new(derivation.copy_permits));
+        let encoding_permits = Arc::new(Semaphore::new(derivation.encoding_permits));
+        // Q_ctrl = min(max(1, N_server), 64): bounded, connection-local
+        // control/rejection replies. Even a closed domain (N = 0) keeps one
+        // slot so refusals themselves can drain.
+        let control_reply_capacity =
+            budget.snapshot().operations.max_operations.clamp(1, 64) as usize;
         let execution_scheduler = Scheduler::with_admission(
             crate::scheduler::ConcurrencyMode::Parallel,
             HashMap::new(),
@@ -537,6 +548,8 @@ impl Server {
             identity,
             config,
             endpoint,
+            #[cfg(test)]
+            test_write_timeout: c2_config::WRITE_TIMEOUT,
             dispatcher: RwLock::new(Dispatcher::new()),
             shutdown_tx,
             #[cfg(test)]
@@ -546,11 +559,12 @@ impl Server {
             route_registration: Mutex::new(()),
             chunk_registry,
             response_pool: Arc::new(crate::ResponsePool::new(response_pool)),
-            memory_budget,
+            domain_budget: budget,
             admission,
-            pending_requests,
-            control_reply_budget,
-            chunk_processing_permits,
+            copy_permits,
+            encoding_permits,
+            copy_scheduler: Arc::new(CopyScheduler::new()),
+            control_reply_capacity,
             active_connections: parking_lot::Mutex::new(HashMap::new()),
             active_connections_notify: Notify::new(),
             shutdown_route_outcomes: parking_lot::Mutex::new(Vec::new()),
@@ -570,24 +584,6 @@ impl Server {
     /// Subscribe from now on without starting the server or resolving config.
     pub fn connection_events(&self) -> ConnectionEvents {
         self.connection_event_source.subscribe()
-    }
-
-    fn try_acquire_pending_request(&self) -> Result<OwnedSemaphorePermit, u32> {
-        self.pending_requests
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| self.config.max_pending_requests)
-    }
-
-    fn try_acquire_chunk_processing_permit(&self) -> Result<OwnedSemaphorePermit, u32> {
-        self.chunk_processing_permits
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| self.config.max_inflight_chunk_frames)
-    }
-
-    fn settle_chunk_request(&self, request: &ChunkRequest<()>) -> bool {
-        self.chunk_registry.settle(request)
     }
 
     fn cleanup_chunk_requests_for_connection(&self, conn_id: u64) {
@@ -1194,19 +1190,6 @@ impl Server {
             | ServerLifecycleState::Stopped
             | ServerLifecycleState::Failed(_) => {
                 self.set_idle_backing_retention(true);
-                if self.config.pool_prewarm_segments > 0 {
-                    let prewarm = self
-                        .response_pool
-                        .inner
-                        .write()
-                        .ensure_buddy_segments(self.config.pool_prewarm_segments as usize);
-                    if let Err(error) = prewarm {
-                        self.set_idle_backing_retention(false);
-                        return Err(ServerError::Config(format!(
-                            "response pool prewarm: {error}"
-                        )));
-                    }
-                }
                 if !matches!(self.lifecycle_state(), ServerLifecycleState::Initialized)
                     || registration.is_closed()
                 {
@@ -1416,31 +1399,25 @@ impl Server {
         Arc::clone(&self.response_pool)
     }
 
-    /// Read-only snapshot of the server direction's shared memory budget.
+    /// The server direction's role-domain budget.
     ///
-    /// This never allocates, maps, connects, or resets accounting: observing
-    /// the server memory context does not change its limits or usage. Charges
-    /// retained by outstanding response or reassembly data stay visible until
-    /// their backing is released.
-    pub fn memory_budget_snapshot(&self) -> ServerMemorySnapshot {
-        ServerMemorySnapshot {
-            limits: self.config.memory_budget_limits(),
-            budget: self.memory_budget.snapshot(),
-        }
+    /// The handle shares only accounting counters; observing it never
+    /// allocates, maps, connects, or resets anything.
+    pub fn domain_budget(&self) -> &c2_mem::DomainBudget {
+        &self.domain_budget
     }
 
-    /// Read-only observer of the server direction's shared budget.
+    /// Read-only snapshot of the server direction's role-domain budget.
     ///
-    /// The handle shares only the accounting counters and resolved limits, so
-    /// a stopped server keeps its retained response/reassembly charges
-    /// observable without retaining pools, connections, or callbacks.
-    pub fn memory_budget_observer(&self) -> c2_mem::BudgetObserver {
-        c2_mem::BudgetObserver::new(self.memory_budget.clone())
+    /// Charges retained by outstanding response or reassembly data stay
+    /// visible until their backing is released.
+    pub fn domain_snapshot(&self) -> c2_mem::DomainSnapshot {
+        self.domain_budget.snapshot()
     }
 
-    /// Return the configured response SHM threshold.
+    /// Return the fixed response SHM threshold.
     pub fn response_shm_threshold(&self) -> u64 {
-        self.config.shm_threshold
+        c2_config::SHM_THRESHOLD
     }
 
     /// Return the configured maximum logical response payload size.
@@ -1591,6 +1568,13 @@ impl Server {
         let mut shutdown_rx = self.shutdown_tx.subscribe();
         let (shutdown_done_tx, mut shutdown_done_rx) = mpsc::unbounded_channel();
         let mut shutdown_close_started = false;
+        // C-gated round-robin copies of inbound chunk frames. Both `run_inner`
+        // and each polled `handle_connection` hold a `CopyCoordinatorScope` so
+        // cancelling `run` alone never strands accepted chunked calls, while
+        // `Server` itself retains zero `JoinHandle` (which would pin a
+        // cancelled executor's task and Windows Named Pipe IOCP state until
+        // `Server` drops).
+        let mut copy_coordinator_scope = Some(CopyCoordinatorScope::enter(self));
         let mut listener = Some(listener);
         loop {
             tokio::select! {
@@ -1642,6 +1626,7 @@ impl Server {
                         // business shutdown does not wait for their loans.
                         drop(gc_handle);
                     }
+                    drop(copy_coordinator_scope.take());
                     match listener_result {
                         Ok(()) => self.set_lifecycle_state(ServerLifecycleState::Stopped),
                         Err(error) => {
@@ -2023,7 +2008,7 @@ async fn handle_post_shutdown_connection(
             FLAG_RESPONSE | FLAG_SIGNAL,
             &encode_shutdown_ack(),
         );
-        let deadline = tokio::time::Instant::now() + server.config.write_timeout();
+        let deadline = tokio::time::Instant::now() + server.write_timeout();
         let _ = tokio::time::timeout_at(deadline, async {
             tokio::io::AsyncWriteExt::write_all(&mut write_half, &ack).await?;
             tokio::io::AsyncWriteExt::flush(&mut write_half).await
@@ -2118,6 +2103,9 @@ fn handle_connection(
         writer_task: None,
     };
     async move {
+        // Declared before `registration` so `RegisteredConnection::drop`
+        // retires calls and removes queued keys before the last scope drops.
+        let _copy_coordinator_scope = CopyCoordinatorScope::enter(&registration.server);
         let mut registration = registration;
         let server = Arc::clone(&registration.server);
         let conn = Arc::clone(&registration.conn);
@@ -2162,8 +2150,8 @@ fn handle_connection(
         let (writer, writer_task) = ConnectionWriter::spawn(
             write_half,
             Arc::clone(&conn),
-            server.config.write_timeout(),
-            server.control_reply_budget.clone(),
+            server.write_timeout(),
+            server.control_reply_capacity,
         );
         registration.writer_task = Some(writer_task);
         *conn.rpc_writer.lock() = Some(Arc::downgrade(&writer));
@@ -2199,7 +2187,7 @@ async fn receive_connection(
     shutdown_rx: &mut watch::Receiver<bool>,
 ) {
     let conn_id = conn.conn_id();
-    let max_frame = server.config.max_frame_size;
+    let max_frame = MAX_RPC_FRAME_BYTES;
     let mut read_failed = false;
 
     'frames: loop {
@@ -2359,7 +2347,7 @@ async fn receive_connection(
                 payload.first().and_then(|&b| MsgType::from_byte(b)),
                 Some(MsgType::ShutdownClient)
             ) {
-                let deadline = tokio::time::Instant::now() + server.config.write_timeout();
+                let deadline = tokio::time::Instant::now() + server.write_timeout();
                 let initiated = handle_shutdown_signal(server, payload, request_id, writer).await;
                 if initiated && !conn.handshake_done() {
                     // Adapter flush does not prove that a Named Pipe peer
@@ -2524,7 +2512,7 @@ async fn negotiate_handshake(
     let (header, _) = decode_frame_body(body, total_len)
         .map_err(|error| ServerError::Protocol(format!("handshake metadata header: {error}")))?;
     if total_len < FRAME_FIXED_BODY_LEN
-        || u64::from(total_len) > server.config.max_frame_size
+        || u64::from(total_len) > MAX_HANDSHAKE_FRAME_BYTES
         || header.request_id != 0
         || header.flags != FLAG_HANDSHAKE
     {
@@ -2548,7 +2536,7 @@ async fn handle_handshake(
         .map_err(|e| ServerError::Protocol(format!("handshake decode: {e:?}")))?;
 
     // Frames identify peer backings by pool incarnation, index and generation.
-    conn.init_peer_shm(client_hs.prefix, server.config.pool_decay_seconds)
+    conn.init_peer_shm(client_hs.prefix)
         .map_err(ServerError::Protocol)?;
 
     conn.set_chunked_capable(true);
@@ -2873,6 +2861,10 @@ pub(crate) struct ServerCall {
     admission: CallMutex<Option<ChunkRouteAdmission>>,
     start_gate: CallMutex<()>,
     stream: CallMutex<Option<StreamCallControl>>,
+    /// The call's role-domain operation permit (N admission). It drops with
+    /// the record at the call's real terminal outcome — unary reply claimed or
+    /// finished, stream cleanup plus terminal, or connection retirement.
+    _operation: Option<OperationPermit>,
 }
 
 struct StreamCallControl {
@@ -2909,12 +2901,12 @@ fn submit_stream_cancel(
         .as_ref()
         .and_then(std::sync::Weak::upgrade);
     if let Some(writer) = writer {
-        if let Some(status) = claim_terminal(&writer, id, CallStatus::NotExecuted) {
+        if let Some(claim) = claim_terminal(&writer, id, CallStatus::NotExecuted) {
             let error = error_wire(ErrorCode::CallCancelled, cause.message());
             let frame = rpc::encode_call_end_frame(
                 id,
                 CallMode::ServerStream,
-                status,
+                claim.status,
                 0,
                 ValuePart::whole(ValueStorage::Inline(&error)),
             )
@@ -2928,15 +2920,216 @@ fn submit_stream_cancel(
 }
 struct ServerInput {
     receive: ValueReceive,
+    queue_key: (u64, u64),
+    scheduler: Arc<CopyScheduler>,
     request: ChunkRequest<()>,
     registry: Arc<c2_wire::chunk::ChunkRegistry<()>>,
+    /// This request's pending-copy queue and its copy-scheduling state.
+    copy: CallMutex<PendingCopyQueue>,
+}
+
+impl Drop for ServerInput {
+    fn drop(&mut self) {
+        self.scheduler.remove(self.queue_key);
+        self.registry.settle(&self.request);
+    }
+}
+
+/// One decoded chunk frame awaiting its C-gated blocking copy. `_memory`
+/// covers the frame's inline payload bytes plus this queue node's storage
+/// overhead and is released immediately after the copy.
+pub(crate) struct PendingChunkFrame {
+    chunk_idx: usize,
+    first_geometry: Option<(u64, usize, usize)>,
+    data: Result<RequestData, String>,
+    _memory: MemoryReservation,
+}
+
+/// Queue-node storage overhead charged together with each frame's inline
+/// payload bytes at frame admission.
+pub(crate) const PENDING_FRAME_OVERHEAD: usize = std::mem::size_of::<PendingChunkFrame>();
+
+/// Per-request pending-copy state. Continuations that arrive before the first
+/// copy published the reassembly storage are only buffered here; they never
+/// enter the ready queue, so they cannot exhaust blocking threads waiting on
+/// `wait_ready`.
+pub(crate) struct PendingCopyQueue {
+    queue: VecDeque<PendingChunkFrame>,
+    /// The first frame's copy completed `registry.allocate_request`.
+    published: bool,
+    /// Scheduled in the ready queue or being copied by a worker.
+    readied: bool,
+    /// Terminal: dispatched to the resource, refused, or discarded.
+    finished: bool,
+}
+
+/// The request bytes plus the role-domain reservation that covers the local
+/// copy. The reservation drops together with the owned `Vec<u8>` — after the
+/// callback returns or a pre-execution refusal discards the data.
+pub(crate) struct OwnedRequestInput {
+    data: RequestData,
+    memory: Option<MemoryReservation>,
+}
+
+impl OwnedRequestInput {
+    #[cfg(test)]
+    fn unreserved(data: RequestData) -> Self {
+        Self { data, memory: None }
+    }
+
+    pub(crate) fn into_owned_bytes(self) -> Result<(Vec<u8>, Option<MemoryReservation>), String> {
+        Ok((self.data.into_owned_bytes()?, self.memory))
+    }
+}
+
+struct CopySchedulerState {
+    ready: VecDeque<((u64, u64), std::sync::Weak<Connection>)>,
+    active_scopes: usize,
+    coordinator_running: bool,
+}
+
+/// Server-wide round-robin queue of requests with copyable frames, paired with
+/// single-consumer coordinator lifecycle state.
+pub(crate) struct CopyScheduler {
+    state: parking_lot::Mutex<CopySchedulerState>,
+    work_notify: Notify,
+    scope_notify: Notify,
+}
+
+impl CopyScheduler {
+    fn new() -> Self {
+        Self {
+            state: parking_lot::Mutex::new(CopySchedulerState {
+                ready: VecDeque::new(),
+                active_scopes: 0,
+                coordinator_running: false,
+            }),
+            work_notify: Notify::new(),
+            scope_notify: Notify::new(),
+        }
+    }
+
+    fn push_back(&self, conn: &Arc<Connection>, request_id: u64) {
+        self.state
+            .lock()
+            .ready
+            .push_back(((conn.conn_id(), request_id), Arc::downgrade(conn)));
+        self.work_notify.notify_one();
+    }
+
+    fn pop_front(&self) -> Option<(Arc<Connection>, u64)> {
+        let mut state = self.state.lock();
+        while let Some(((_, id), conn)) = state.ready.pop_front() {
+            if let Some(conn) = conn.upgrade() {
+                return Some((conn, id));
+            }
+        }
+        None
+    }
+
+    fn remove(&self, key: (u64, u64)) {
+        self.state.lock().ready.retain(|(queued, _)| *queued != key);
+    }
+
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.state.lock().ready.is_empty()
+    }
+
+    #[cfg(test)]
+    fn ready_len(&self) -> usize {
+        self.state.lock().ready.len()
+    }
+
+    #[cfg(test)]
+    fn is_coordinator_running(&self) -> bool {
+        self.state.lock().coordinator_running
+    }
+}
+
+/// Scope token held by `Server::run_inner` and every polled `handle_connection`
+/// future. Keeps the single `copy_coordinator` task alive while any accept loop
+/// or active connection can still receive or finish chunked frames, without
+/// storing a `JoinHandle` on `Server` (which would outlive a cancelled executor
+/// and keep Windows IOCP completion bookkeeping for accepted named pipes alive
+/// until `Server` drops).
+struct CopyCoordinatorScope {
+    scheduler: Arc<CopyScheduler>,
+}
+
+impl CopyCoordinatorScope {
+    fn enter(server: &Arc<Server>) -> Self {
+        let should_spawn = {
+            let mut state = server.copy_scheduler.state.lock();
+            state.active_scopes += 1;
+            if state.coordinator_running {
+                false
+            } else {
+                state.coordinator_running = true;
+                true
+            }
+        };
+        if should_spawn {
+            // Construct the running guard before `tokio::spawn` and move it
+            // into the future so `coordinator_running` is cleared even if the
+            // executor drops the task before its first poll.
+            let running_guard = CoordinatorRunningGuard::new(server.copy_scheduler.clone());
+            tokio::spawn(copy_coordinator(
+                Arc::downgrade(server),
+                server.copy_scheduler.clone(),
+                server.copy_permits.clone(),
+                running_guard,
+            ));
+        }
+        Self {
+            scheduler: server.copy_scheduler.clone(),
+        }
+    }
+}
+
+impl Drop for CopyCoordinatorScope {
+    fn drop(&mut self) {
+        let last_scope = {
+            let mut state = self.scheduler.state.lock();
+            state.active_scopes -= 1;
+            state.active_scopes == 0
+        };
+        if last_scope {
+            self.scheduler.scope_notify.notify_waiters();
+        }
+    }
+}
+
+struct CoordinatorRunningGuard {
+    scheduler: Option<Arc<CopyScheduler>>,
+}
+
+impl CoordinatorRunningGuard {
+    fn new(scheduler: Arc<CopyScheduler>) -> Self {
+        Self {
+            scheduler: Some(scheduler),
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.scheduler = None;
+    }
+}
+
+impl Drop for CoordinatorRunningGuard {
+    fn drop(&mut self) {
+        if let Some(scheduler) = self.scheduler.take() {
+            // Clears `coordinator_running` if the executor cancels or drops
+            // this task (including before its first poll).
+            scheduler.state.lock().coordinator_running = false;
+        }
+    }
 }
 
 pub(crate) struct ChunkRouteAdmission {
     route: Arc<CrmRoute>,
     method_idx: u16,
     pending_permit: SchedulerPendingPermit,
-    _pending_permit: OwnedSemaphorePermit,
     // A partially received request keeps the connection open between chunks.
     _flight: crate::connection::FlightGuard,
 }
@@ -2954,22 +3147,60 @@ pub(crate) fn retire_connection_calls(conn: &Connection) {
     for (id, call) in calls.active() {
         conn.core.stream_retire(id);
         let input = call.data.input.lock().take();
-        if let Some(input) = input {
-            input.registry.settle(&input.request);
-        }
+        drop(input);
     }
     drop(calls);
 }
 
-fn request_storage(
-    server: &Server,
-    conn: &Arc<Connection>,
-    value: ValueStorage<'_>,
-) -> Result<RequestData, String> {
+fn request_storage(conn: &Arc<Connection>, value: ValueStorage<'_>) -> Result<RequestData, String> {
     match value {
         ValueStorage::Inline(bytes) => Ok(RequestData::Inline(bytes.to_vec())),
-        ValueStorage::Shm(descriptor) => {
-            admit_peer_request(conn, descriptor, &server.memory_budget)
+        ValueStorage::Shm(descriptor) => admit_peer_request(conn, descriptor),
+    }
+}
+
+fn release_request_storage(conn: &Arc<Connection>, value: ValueStorage<'_>) {
+    if let ValueStorage::Shm(descriptor) = value {
+        drop(admit_peer_request(conn, descriptor));
+    }
+}
+
+/// A refusal for an OPEN whose request-ID high-water mark already advanced
+/// but whose active record is not inserted. No call record exists to claim,
+/// and late continuations of this ID are dropped by the high-water mark.
+async fn queue_open_refusal(writer: &Arc<ConnectionWriter>, request_id: u64, error: &C2Error) {
+    write_error_record(
+        writer,
+        request_id,
+        CallStatus::NotExecuted,
+        &rpc::bounded_call_end_error_bytes(error),
+        true,
+    )
+    .await;
+}
+
+/// Enqueue one frame into a request's pending-copy queue and re-ready the
+/// request per the publication rules: a request joins the server-wide ready
+/// queue only once its first frame published the reassembly storage, and a
+/// request whose queue emptied waits for the next continuation to re-ready it.
+fn enqueue_copy_frame(server: &Server, conn: &Arc<Connection>, id: u64, frame: PendingChunkFrame) {
+    let call = match conn.calls.lock().get(id) {
+        Some(call) => call,
+        None => return,
+    };
+    {
+        let input_guard = call.data.input.lock();
+        let Some(input) = input_guard.as_ref() else {
+            return;
+        };
+        let mut queue = input.copy.lock();
+        if queue.finished {
+            return;
+        }
+        queue.queue.push_back(frame);
+        if queue.published && !queue.readied {
+            queue.readied = true;
+            server.copy_scheduler.push_back(conn, id);
         }
     }
 }
@@ -2985,18 +3216,31 @@ async fn handle_rpc_record(
     let new_open = payload.first() == Some(&(RpcRecordKind::Open as u8))
         && (header.flags & c2_wire::flags::FLAG_CHUNKED == 0
             || header.flags & c2_wire::flags::FLAG_FIRST_CHUNK != 0);
-    // Identity history is advanced before any route, capacity or storage refusal.
-    let (new_call, duplicate) = if new_open {
-        match conn.calls.lock().open(id, ServerCall::default()) {
-            Ok(call) => (Some(call), false),
-            Err(_) => (None, true),
+    // Identity history is advanced before any route, capacity or storage
+    // refusal; the active record is inserted only after admission completes.
+    let (mark_advanced, duplicate) = if new_open {
+        match conn.calls.lock().advance_open(id) {
+            Ok(()) => (true, false),
+            Err(_) => (false, true),
         }
     } else {
-        (None, false)
+        (false, false)
     };
     if header.flags & c2_wire::flags::FLAG_BUDDY != 0 && !conn.shm_request_capable() {
         // No descriptor may open a mapping in a direction never negotiated.
-        if duplicate
+        if mark_advanced {
+            // A new OPEN (mark advanced, no record yet) is refused without a
+            // call record; the connection keeps serving other calls.
+            queue_open_refusal(
+                writer,
+                id,
+                &C2Error::new(
+                    ErrorCode::ProtocolViolation,
+                    "SHM request direction was not negotiated; request was not executed",
+                ),
+            )
+            .await;
+        } else if duplicate
             || !queue_rejection(
                 writer,
                 id,
@@ -3018,7 +3262,7 @@ async fn handle_rpc_record(
         Ok(record) => record,
         Err(failure) => {
             if let Some(descriptor) = failure.carrier {
-                drop(request_storage(server, conn, ValueStorage::Shm(descriptor)));
+                drop(request_storage(conn, ValueStorage::Shm(descriptor)));
             }
             if failure.error == frame::DecodeError::ZeroLoanId
                 || matches!(
@@ -3034,8 +3278,16 @@ async fn handle_rpc_record(
             {
                 conn.end(ConnectionEndReason::ProtocolError, "rpc_record_admission");
             }
-            if new_call.is_some() {
-                queue_input_error(writer, id, failure.error.to_string()).await;
+            if mark_advanced {
+                queue_open_refusal(
+                    writer,
+                    id,
+                    &C2Error::new(
+                        ErrorCode::ResourceInputDeserializing,
+                        failure.error.to_string(),
+                    ),
+                )
+                .await;
             } else if !duplicate {
                 conn.end(ConnectionEndReason::ProtocolError, "rpc_record_decode");
             }
@@ -3044,7 +3296,7 @@ async fn handle_rpc_record(
     };
     if duplicate {
         if let RpcRecord::Open { value, .. } = record {
-            drop(request_storage(server, conn, value.storage));
+            release_request_storage(conn, value.storage);
         }
         conn.end(ConnectionEndReason::ProtocolError, "duplicate_open");
         return;
@@ -3095,181 +3347,17 @@ async fn handle_rpc_record(
             mode,
             value,
         } => {
-            let call = new_call.expect("first OPEN published before admission");
-            let flight = crate::connection::FlightGuard::new(conn);
-            let data = request_storage(server, conn, value.storage);
-            if conn.is_deactivated() || conn.shutdown_requested() {
-                drop(data);
-                queue_rejection(
-                    writer,
-                    id,
-                    &error_wire(
-                        ErrorCode::ResourceClosed,
-                        "connection admission is closed; request was not executed",
-                    ),
-                )
-                .await;
-                return;
-            }
-            let route = match reserve_accepted_route_execution(server, &identity, method_idx, mode)
-            {
-                Ok(route) => route,
-                Err(error) => {
-                    drop(data);
-                    queue_route_admission_error(writer, id, error).await;
-                    return;
-                }
-            };
-            let input_size = match value.chunk {
-                ChunkPosition::Whole => value.storage.len(),
-                ChunkPosition::First { total_bytes } => total_bytes,
-                ChunkPosition::Continuation => unreachable!("OPEN first record"),
-            };
-            if input_size > server.config.max_payload_size {
-                drop(data);
-                drop(route);
-                queue_rejection(
-                    writer,
-                    id,
-                    &error_wire(
-                        ErrorCode::ResourceUnavailable,
-                        format!(
-                            "request payload size {input_size} exceeds max_payload_size {}",
-                            server.config.max_payload_size
-                        ),
-                    ),
-                )
-                .await;
-                return;
-            }
-            let pending = match server.try_acquire_pending_request() {
-                Ok(pending) => pending,
-                Err(limit) => {
-                    drop(data);
-                    drop(route);
-                    queue_server_pending_capacity_error(writer, id, limit).await;
-                    return;
-                }
-            };
-            let admission = ChunkRouteAdmission {
-                route: route.route,
-                method_idx,
-                pending_permit: route.pending_permit,
-                _pending_permit: pending,
-                _flight: flight,
-            };
-            let stream_mode =
-                admission.route.method_modes[method_idx as usize] == CallMode::ServerStream;
-            if stream_mode {
-                let admitted = {
-                    let _publication = server.dispatcher.read();
-                    if admission.route.scheduler.route_admission_state()
-                        == RouteAdmissionState::Closed
-                        || conn.shutdown_requested()
-                        || server.admission.lock().is_closed()
-                    {
-                        Err("stream route closed before publication".to_string())
-                    } else {
-                        conn.core
-                            .stream_open(id)
-                            .map_err(|error| error.to_string())
-                            .map(|()| {
-                                *call.data.stream.lock() = Some(StreamCallControl {
-                                    route_uid: admission.route.route_uid.clone(),
-                                    cancellation: None,
-                                });
-                            })
-                    }
-                };
-                if let Err(error) = admitted {
-                    drop(data);
-                    drop(admission);
-                    queue_rejection(writer, id, &error_wire(ErrorCode::ResourceClosed, error))
-                        .await;
-                    return;
-                }
-            }
-            match value.chunk {
-                ChunkPosition::Whole => {
-                    let request = match data {
-                        Ok(request) => request,
-                        Err(error) => {
-                            queue_input_error(writer, id, error).await;
-                            return;
-                        }
-                    };
-                    call.queue();
-                    let server = server.clone();
-                    let conn = conn.clone();
-                    let writer = writer.clone();
-                    tokio::spawn(async move {
-                        dispatch_complete_call(&server, &conn, &writer, id, request, admission)
-                            .await;
-                    });
-                }
-                ChunkPosition::First { total_bytes } => {
-                    let mut receive = ValueReceive::first(total_bytes, value.storage.len())
-                        .expect("checked first value length");
-                    let geometry = match receive.geometry() {
-                        Ok(geometry) => geometry,
-                        Err(error) => {
-                            drop(data);
-                            queue_input_error(writer, id, error.into()).await;
-                            return;
-                        }
-                    };
-                    let index = receive
-                        .admit(value.storage.len())
-                        .expect("first part matches itself");
-                    let request = server.chunk_registry.begin_frame(conn.conn_id(), id);
-                    *call.data.admission.lock() = Some(admission);
-                    if let Err((error, _)) = server.chunk_registry.prepare_request(&request, ()) {
-                        drop(data);
-                        queue_input_error(writer, id, error.to_string()).await;
-                        return;
-                    }
-                    *call.data.input.lock() = Some(ServerInput {
-                        receive,
-                        request: request.clone(),
-                        registry: server.chunk_registry.clone(),
-                    });
-                    let permit = match server.try_acquire_chunk_processing_permit() {
-                        Ok(permit) => permit,
-                        Err(limit) => {
-                            drop(data);
-                            queue_chunk_processing_capacity_error(
-                                server, writer, id, &request, limit,
-                            )
-                            .await;
-                            return;
-                        }
-                    };
-                    spawn_chunked_call(
-                        server,
-                        conn,
-                        id,
-                        writer,
-                        permit,
-                        ChunkFrame {
-                            chunk_idx: index,
-                            first_geometry: Some(geometry),
-                            data,
-                        },
-                        request,
-                    );
-                }
-                ChunkPosition::Continuation => unreachable!("OPEN first record"),
-            }
+            handle_open_record(server, conn, writer, id, identity, method_idx, mode, value).await;
         }
         RpcRecord::OpenContinuation { value } => {
             let lookup = conn.calls.lock().continuation(id);
             let call = match lookup {
                 CallLookup::Retired => {
-                    drop(request_storage(server, conn, value.storage));
+                    release_request_storage(conn, value.storage);
                     return;
                 }
                 CallLookup::Future => {
-                    drop(request_storage(server, conn, value.storage));
+                    release_request_storage(conn, value.storage);
                     conn.end(
                         ConnectionEndReason::ProtocolError,
                         "future_open_continuation",
@@ -3278,6 +3366,8 @@ async fn handle_rpc_record(
                 }
                 CallLookup::Active(call) => call,
             };
+            // Refresh assembly activity before validating this part.
+            server.chunk_registry.touch(conn.conn_id(), id);
             let next = {
                 let mut input = call.data.input.lock();
                 input
@@ -3290,11 +3380,10 @@ async fn handle_rpc_record(
                             .map(|index| (input.request.clone(), index))
                     })
             };
-            let data = request_storage(server, conn, value.storage);
-            let (request, index) = match next {
+            let (_request, index) = match next {
                 Ok(next) => next,
                 Err(error) => {
-                    drop(data);
+                    release_request_storage(conn, value.storage);
                     if !queue_input_error(writer, id, error.into()).await {
                         conn.end(
                             ConnectionEndReason::ProtocolError,
@@ -3304,27 +3393,36 @@ async fn handle_rpc_record(
                     return;
                 }
             };
-            let permit = match server.try_acquire_chunk_processing_permit() {
-                Ok(permit) => permit,
-                Err(limit) => {
-                    drop(data);
-                    queue_chunk_processing_capacity_error(server, writer, id, &request, limit)
-                        .await;
+            // Charge the frame's inline payload bytes plus the queue node
+            // before copying any inline bytes out of the receive buffer.
+            let inline_len = match value.storage {
+                ValueStorage::Inline(bytes) => bytes.len() as u64,
+                ValueStorage::Shm(_) => 0,
+            };
+            let frame_charge = inline_len + PENDING_FRAME_OVERHEAD as u64;
+            let reservation = match server.domain_budget.try_reserve_memory(frame_charge) {
+                Ok(reservation) => reservation,
+                Err(error) => {
+                    release_request_storage(conn, value.storage);
+                    // Frame admission failed: one refusal settles the
+                    // reassembly and retires the call; later frames of
+                    // this ID take the Retired path above.
+                    let error = input_admission_error("frame admission", frame_charge, &error);
+                    queue_rejection(writer, id, &rpc::bounded_call_end_error_bytes(&error)).await;
                     return;
                 }
             };
-            spawn_chunked_call(
+            let data = request_storage(conn, value.storage);
+            enqueue_copy_frame(
                 server,
                 conn,
                 id,
-                writer,
-                permit,
-                ChunkFrame {
+                PendingChunkFrame {
                     chunk_idx: index,
                     first_geometry: None,
                     data,
+                    _memory: reservation,
                 },
-                request,
             );
         }
         _ => conn.end(
@@ -3332,6 +3430,312 @@ async fn handle_rpc_record(
             "unsupported_request_record",
         ),
     }
+}
+
+/// The OPEN admission path. The request-ID high-water mark is already
+/// advanced by the caller; this function performs decode-independent
+/// admission — direction/deactivation checks, route+contract+mode
+/// validation, payload bound, N admission, then M admission per chunk
+/// position — and inserts the active call record only once admission
+/// completed. Every refusal before the insert releases any admitted peer
+/// SHM, the route reservation and the operation permit.
+#[allow(clippy::too_many_arguments)]
+async fn handle_open_record(
+    server: &Arc<Server>,
+    conn: &Arc<Connection>,
+    writer: &Arc<ConnectionWriter>,
+    id: u64,
+    identity: RouteCallIdentity,
+    method_idx: u16,
+    mode: CallMode,
+    value: rpc::ValuePart<'_>,
+) {
+    let flight = crate::connection::FlightGuard::new(conn);
+    if conn.is_deactivated() || conn.shutdown_requested() {
+        release_request_storage(conn, value.storage);
+        queue_open_refusal(
+            writer,
+            id,
+            &C2Error::new(
+                ErrorCode::ResourceClosed,
+                "connection admission is closed; request was not executed",
+            ),
+        )
+        .await;
+        return;
+    }
+    let route = match reserve_accepted_route_execution(server, &identity, method_idx, mode) {
+        Ok(route) => route,
+        Err(error) => {
+            release_request_storage(conn, value.storage);
+            queue_open_refusal(writer, id, &route_admission_error(error)).await;
+            return;
+        }
+    };
+    let input_size = match value.chunk {
+        ChunkPosition::Whole => value.storage.len(),
+        ChunkPosition::First { total_bytes } => total_bytes,
+        ChunkPosition::Continuation => unreachable!("OPEN first record"),
+    };
+    if input_size > server.config.max_payload_size {
+        release_request_storage(conn, value.storage);
+        drop(route);
+        queue_open_refusal(
+            writer,
+            id,
+            &C2Error::new(
+                ErrorCode::ResourceUnavailable,
+                format!(
+                    "request payload size {input_size} exceeds max_payload_size {}",
+                    server.config.max_payload_size
+                ),
+            ),
+        )
+        .await;
+        return;
+    }
+    // N admission: the permit follows the call to its real terminal outcome
+    // through the inserted call record.
+    let operation = match server.domain_budget.reserve_operation() {
+        Ok(operation) => operation,
+        Err(error) => {
+            release_request_storage(conn, value.storage);
+            drop(route);
+            let reason = match error.reason {
+                c2_mem::RetentionRejectReason::Closed => "closed",
+                c2_mem::RetentionRejectReason::LimitReached => "limit_reached",
+            };
+            queue_open_refusal(
+                writer,
+                id,
+                &C2Error::new(
+                    ErrorCode::CallCapacityExceeded,
+                    format!("server call admission rejected the request: {error}"),
+                )
+                .with_details(std::collections::BTreeMap::from([
+                    ("stage".to_string(), "call_execution_admission".to_string()),
+                    ("reason".to_string(), reason.to_string()),
+                    ("used".to_string(), error.used_operations.to_string()),
+                    ("max".to_string(), error.max_operations.to_string()),
+                    ("request_id".to_string(), id.to_string()),
+                ])),
+            )
+            .await;
+            return;
+        }
+    };
+    let admission = ChunkRouteAdmission {
+        route: route.route,
+        method_idx,
+        pending_permit: route.pending_permit,
+        _flight: flight,
+    };
+    let stream_mode = admission.route.method_modes[method_idx as usize] == CallMode::ServerStream;
+    if stream_mode {
+        let admitted = {
+            let _publication = server.dispatcher.read();
+            if admission.route.scheduler.route_admission_state() == RouteAdmissionState::Closed
+                || conn.shutdown_requested()
+                || server.admission.lock().is_closed()
+            {
+                Err("stream route closed before publication".to_owned())
+            } else {
+                conn.core.stream_open(id).map_err(|error| error.to_string())
+            }
+        };
+        if let Err(error) = admitted {
+            release_request_storage(conn, value.storage);
+            drop(admission);
+            drop(operation);
+            queue_open_refusal(
+                writer,
+                id,
+                &C2Error::new(ErrorCode::ResourceClosed, error.to_string()),
+            )
+            .await;
+            return;
+        }
+    }
+    match value.chunk {
+        ChunkPosition::Whole => {
+            // M admission for the whole request before any inline copy.
+            let reservation = match server.domain_budget.try_reserve_memory(input_size) {
+                Ok(reservation) => reservation,
+                Err(error) => {
+                    release_request_storage(conn, value.storage);
+                    drop(admission);
+                    drop(operation);
+                    if stream_mode {
+                        conn.core.stream_retire(id);
+                    }
+                    let error = input_admission_error("call input admission", input_size, &error);
+                    queue_open_refusal(writer, id, &error).await;
+                    return;
+                }
+            };
+            let data = match request_storage(conn, value.storage) {
+                Ok(data) => data,
+                Err(error) => {
+                    drop(reservation);
+                    drop(admission);
+                    drop(operation);
+                    if stream_mode {
+                        conn.core.stream_retire(id);
+                    }
+                    queue_open_refusal(
+                        writer,
+                        id,
+                        &C2Error::new(ErrorCode::ResourceInputDeserializing, error),
+                    )
+                    .await;
+                    return;
+                }
+            };
+            let call = insert_admitted_call(conn, id, operation, stream_mode, &admission);
+            call.queue();
+            let input = OwnedRequestInput {
+                data,
+                memory: Some(reservation),
+            };
+            let server = server.clone();
+            let conn = conn.clone();
+            let writer = writer.clone();
+            tokio::spawn(async move {
+                dispatch_complete_call(&server, &conn, &writer, id, input, admission).await;
+            });
+        }
+        ChunkPosition::First { total_bytes } => {
+            let first_inline = match value.storage {
+                ValueStorage::Inline(bytes) => bytes.len() as u64,
+                ValueStorage::Shm(_) => 0,
+            };
+            let frame_charge = first_inline + PENDING_FRAME_OVERHEAD as u64;
+            let reservation = match server.domain_budget.try_reserve_memory(frame_charge) {
+                Ok(reservation) => reservation,
+                Err(error) => {
+                    release_request_storage(conn, value.storage);
+                    drop(admission);
+                    drop(operation);
+                    if stream_mode {
+                        conn.core.stream_retire(id);
+                    }
+                    let error = input_admission_error("frame admission", frame_charge, &error);
+                    queue_open_refusal(writer, id, &error).await;
+                    return;
+                }
+            };
+            let mut receive = ValueReceive::first(total_bytes, value.storage.len())
+                .expect("checked first value length");
+            let geometry = match receive.geometry() {
+                Ok(geometry) => geometry,
+                Err(error) => {
+                    drop(reservation);
+                    release_request_storage(conn, value.storage);
+                    drop(admission);
+                    drop(operation);
+                    if stream_mode {
+                        conn.core.stream_retire(id);
+                    }
+                    queue_open_refusal(
+                        writer,
+                        id,
+                        &C2Error::new(ErrorCode::ResourceInputDeserializing, error),
+                    )
+                    .await;
+                    return;
+                }
+            };
+            let index = receive
+                .admit(value.storage.len())
+                .expect("first part matches itself");
+            let data = request_storage(conn, value.storage);
+            let request = server.chunk_registry.begin_frame(conn.conn_id(), id);
+            let call = insert_admitted_call(conn, id, operation, stream_mode, &admission);
+            *call.data.admission.lock() = Some(admission);
+            if let Err((error, _)) = server.chunk_registry.prepare_request(&request, ()) {
+                drop(reservation);
+                drop(data);
+                queue_input_error(writer, id, error.to_string()).await;
+                return;
+            }
+            let mut input = call.data.input.lock();
+            *input = Some(ServerInput {
+                receive,
+                queue_key: (conn.conn_id(), id),
+                scheduler: server.copy_scheduler.clone(),
+                request: request.clone(),
+                registry: server.chunk_registry.clone(),
+                copy: CallMutex::new(PendingCopyQueue {
+                    queue: [PendingChunkFrame {
+                        chunk_idx: index,
+                        first_geometry: Some((total_bytes, geometry.0, geometry.1)),
+                        data,
+                        _memory: reservation,
+                    }]
+                    .into_iter()
+                    .collect(),
+                    published: false,
+                    readied: true,
+                    finished: false,
+                }),
+            });
+            // The first frame enters the ready queue immediately: its copy
+            // publishes the reassembly storage via `registry.allocate_request`.
+            server.copy_scheduler.push_back(conn, id);
+        }
+        ChunkPosition::Continuation => unreachable!("OPEN first record"),
+    }
+}
+
+/// Insert the active call record once admission completed, carrying the
+/// operation permit and, for stream calls, the publication control.
+fn insert_admitted_call(
+    conn: &Arc<Connection>,
+    id: u64,
+    operation: OperationPermit,
+    stream_mode: bool,
+    admission: &ChunkRouteAdmission,
+) -> Arc<c2_wire::connection::calls::CallRecord<ServerCall>> {
+    let call = ServerCall {
+        _operation: Some(operation),
+        ..ServerCall::default()
+    };
+    if stream_mode {
+        *call.stream.lock() = Some(StreamCallControl {
+            route_uid: admission.route.route_uid.clone(),
+            cancellation: None,
+        });
+    }
+    conn.calls
+        .lock()
+        .insert_open(id, call)
+        .expect("admitted OPEN follows the advanced high-water mark")
+}
+
+/// A `ResourceUnavailable` call-input admission error with stage details.
+fn input_admission_error(
+    admission: &str,
+    requested: u64,
+    error: &c2_mem::PayloadBufferError,
+) -> C2Error {
+    let mut details = std::collections::BTreeMap::from([
+        ("stage".to_string(), "call_input_admission".to_string()),
+        ("requested".to_string(), requested.to_string()),
+    ]);
+    match error {
+        c2_mem::PayloadBufferError::TooLarge { limit, .. } => {
+            details.insert("limit".into(), limit.to_string());
+        }
+        c2_mem::PayloadBufferError::InsufficientCapacity { available, .. } => {
+            details.insert("available".into(), available.to_string());
+        }
+        c2_mem::PayloadBufferError::DeadlineExceeded => {}
+    }
+    C2Error::new(
+        ErrorCode::ResourceUnavailable,
+        format!("server {admission} failed: {error}"),
+    )
+    .with_details(details)
 }
 
 enum RouteAdmissionError {
@@ -3361,7 +3765,7 @@ async fn execute_route_request<F>(
     route_pending_permit: SchedulerPendingPermit,
     conn: &Connection,
     request_id: u64,
-    request: RequestData,
+    input: OwnedRequestInput,
     f: F,
 ) -> Result<ResponseMeta, RouteExecutionError>
 where
@@ -3371,12 +3775,12 @@ where
         result = route_pending_permit.async_activate() => match result {
             Ok(guard) => guard,
             Err(err) => {
-                drop(request);
+                drop(input);
                 return Err(RouteExecutionError::Acquire(err));
             }
         },
         _ = conn.wait_work_cancelled() => {
-            drop(request);
+            drop(input);
             return Err(RouteExecutionError::Acquire(SchedulerAcquireError::Closed));
         }
     };
@@ -3384,25 +3788,25 @@ where
         result = execution_scheduler.async_acquire_accepted(0, route_guard.admission_generation()) => match result {
             Ok(guard) => guard,
             Err(err) => {
-                drop(request);
+                drop(input);
                 return Err(RouteExecutionError::Acquire(err));
             }
         },
         err = route_guard.wait_rejected() => {
-            drop(request);
+            drop(input);
             return Err(RouteExecutionError::Acquire(err));
         },
         _ = conn.wait_work_cancelled() => {
-            drop(request);
+            drop(input);
             return Err(RouteExecutionError::Acquire(SchedulerAcquireError::Closed));
         }
     };
     if let Err(err) = route_guard.check_admission() {
-        drop(request);
+        drop(input);
         return Err(RouteExecutionError::Acquire(err));
     }
     if conn.is_work_cancelled() {
-        drop(request);
+        drop(input);
         return Err(RouteExecutionError::Acquire(SchedulerAcquireError::Closed));
     }
 
@@ -3415,10 +3819,12 @@ where
         let mut route_guard = route_guard;
         let _execution_guard = execution_guard;
         if let Err(err) = route_guard.commit() {
-            drop(request);
+            drop(input);
             return Err(RouteExecutionError::Acquire(err));
         }
-        let bytes = request
+        // `input` owns the local-copy memory reservation; it drops after the
+        // callback returns or a pre-execution refusal discards the data.
+        let (bytes, _memory) = input
             .into_owned_bytes()
             .map_err(RouteExecutionError::Input)?;
         if !record.enter_resource() {
@@ -3510,16 +3916,16 @@ async fn send_route_execution_result(
     match result {
         Ok(meta) => {
             // The unique terminal owner also owns any pre-write encoding error.
-            if claim_terminal(writer, request_id, CallStatus::Success).is_none() {
+            let Some(_claim) = claim_terminal(writer, request_id, CallStatus::Success) else {
                 return;
-            }
+            };
             if let Err(error) = send_response_meta(
                 &server.response_pool,
                 writer,
                 request_id,
                 meta,
-                server.config.shm_threshold,
-                server.config.chunk_size as usize,
+                c2_config::SHM_THRESHOLD,
+                c2_config::CHUNK_SIZE as usize,
                 server.config.max_payload_size,
                 conn.shm_response_capable(),
             )
@@ -3553,7 +3959,18 @@ async fn send_route_execution_result(
                 RouteExecutionError::Input(message) => {
                     error_wire(ErrorCode::ResourceInputDeserializing, message)
                 }
-                RouteExecutionError::Crm(CrmError::UserError(bytes)) => bytes,
+                RouteExecutionError::Crm(CrmError::UserError(bytes)) => {
+                    // Re-encode the resource's envelope through the bounded
+                    // path so an oversized user error cannot produce an
+                    // unbounded inline CALL_END frame.
+                    match C2Error::from_wire_bytes(&bytes) {
+                        Ok(Some(error)) => rpc::bounded_call_end_error_bytes(&error),
+                        _ => error_wire(
+                            ErrorCode::ResourceFunctionExecuting,
+                            "invalid CRM error payload",
+                        ),
+                    }
+                }
                 RouteExecutionError::Crm(CrmError::InternalError(message)) => {
                     error_wire(ErrorCode::ResourceFunctionExecuting, message)
                 }
@@ -3570,14 +3987,14 @@ async fn send_route_execution_result(
                     )
                 }
             };
-            if let Some(status) = claim_terminal(writer, request_id, status) {
-                write_error_record(writer, request_id, status, &bytes, false).await;
+            if let Some(claim) = claim_terminal(writer, request_id, status) {
+                write_error_record(writer, request_id, claim.status, &bytes, false).await;
             }
         }
     }
 }
 
-fn route_admission_reply(err: RouteAdmissionError) -> Vec<u8> {
+fn route_admission_error(err: RouteAdmissionError) -> C2Error {
     let mut details = std::collections::BTreeMap::new();
     let (code, message) = match err {
         RouteAdmissionError::RouteNotFound(name) => {
@@ -3652,24 +4069,10 @@ fn route_admission_reply(err: RouteAdmissionError) -> Vec<u8> {
             )
         }
     };
-    C2Error::new(code, message)
-        .with_details(details)
-        .to_wire_bytes()
+    C2Error::new(code, message).with_details(details)
 }
 
-async fn queue_route_admission_error(
-    writer: &Arc<ConnectionWriter>,
-    request_id: u64,
-    err: RouteAdmissionError,
-) {
-    queue_rejection(writer, request_id, &route_admission_reply(err)).await;
-}
-
-fn admit_peer_request(
-    conn: &Arc<Connection>,
-    bp: BuddyPayload,
-    _budget: &MemoryBudget,
-) -> Result<RequestData, String> {
+fn admit_peer_request(conn: &Arc<Connection>, bp: BuddyPayload) -> Result<RequestData, String> {
     let cache = conn
         .peer_mappings()
         .ok_or_else(|| "peer pool not initialised".to_string())?;
@@ -3692,11 +4095,11 @@ async fn dispatch_complete_call(
     conn: &Connection,
     writer: &Arc<ConnectionWriter>,
     request_id: u64,
-    request: RequestData,
+    input: OwnedRequestInput,
     admission: ChunkRouteAdmission,
 ) {
     if admission.route.method_modes[admission.method_idx as usize] == CallMode::ServerStream {
-        stream::dispatch_stream_call(server, conn, writer, request_id, request, admission).await;
+        stream::dispatch_stream_call(server, conn, writer, request_id, input, admission).await;
         return;
     }
     let callback = admission.route.callback.clone();
@@ -3708,7 +4111,7 @@ async fn dispatch_complete_call(
         admission.pending_permit,
         conn,
         request_id,
-        request,
+        input,
         move |request| callback.invoke(&name, method_idx, request, response_pool),
     )
     .await;
@@ -3718,14 +4121,6 @@ async fn dispatch_complete_call(
 // ---------------------------------------------------------------------------
 // CRM call dispatch — chunked reassembly
 // ---------------------------------------------------------------------------
-
-/// One decoded chunk frame. The first frame's admission is already in the
-/// call record; continuations retain that exact record instead of a key lookup.
-struct ChunkFrame {
-    chunk_idx: usize,
-    first_geometry: Option<(usize, usize)>,
-    data: Result<RequestData, String>,
-}
 
 /// Cancellation owns the same call record as refusal, GC and copying. Dropping
 /// an unstarted task cannot leave an admitted call slot or revive another call.
@@ -3744,76 +4139,23 @@ impl Drop for ChunkTaskGuard {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn spawn_chunked_call(
-    server: &Arc<Server>,
-    conn: &Arc<Connection>,
-    request_id: u64,
-    writer: &Arc<ConnectionWriter>,
-    chunk_processing_permit: OwnedSemaphorePermit,
-    frame: ChunkFrame,
-    request: ChunkRequest<()>,
-) {
-    // Construct the guard before spawn: cancellation before the first poll also
-    // retires the original admission. There is no second ordering table.
-    let Some(call) = conn.calls.lock().get(request_id) else {
-        return;
-    };
-    let guard = ChunkTaskGuard {
-        _call: call,
-        registry: server.chunk_registry.clone(),
-        request: request.clone(),
-        armed: true,
-    };
-    let srv = server.clone();
-    let cn = conn.clone();
-    let wr = writer.clone();
-    let flight = crate::connection::FlightGuard::new(conn);
-    tokio::spawn(async move {
-        let _flight = flight;
-        dispatch_chunked_call_guarded(
-            &srv,
-            &cn,
-            request_id,
-            &wr,
-            chunk_processing_permit,
-            frame,
-            request,
-            guard,
-        )
-        .await;
-    });
-}
-
-async fn fail_chunked_request(
-    server: &Server,
-    writer: &Arc<ConnectionWriter>,
-    request_id: u64,
-    request: &ChunkRequest<()>,
-    code: ErrorCode,
-    message: String,
-) {
-    if server.settle_chunk_request(request) {
-        write_reply(writer, request_id, &error_wire(code, message)).await;
-    }
-}
-
 /// Work returns the original call's execution/reply ownership. A refused
 /// outcome already owns the error reply before its frame capacity is released.
 enum ChunkCopyOutcome {
     Incomplete,
-    Complete(c2_wire::assembler::ChunkAssembler),
+    Complete(OwnedRequestInput),
     Refused(Vec<u8>),
     Discarded,
 }
 
-// Field order settles the call and drops unread source data before returning
-// capacity, including when the worker unwinds.
+// Field order settles the call and drops unread source data (releasing both
+// the peer SHM loan and the frame's memory reservation) before the C permit
+// is returned, including when the worker unwinds.
 struct ChunkCopyWork {
     guard: ChunkTaskGuard,
-    frame: ChunkFrame,
+    frame: PendingChunkFrame,
     _call: Arc<c2_wire::connection::calls::CallRecord<ServerCall>>,
-    _frame_permit: OwnedSemaphorePermit,
+    _copy_permit: OwnedSemaphorePermit,
 }
 
 fn refuse_chunk_copy(
@@ -3832,9 +4174,10 @@ fn refuse_chunk_copy(
 fn copy_chunked_frame(
     registry: Arc<c2_wire::chunk::ChunkRegistry<()>>,
     request: ChunkRequest<()>,
-    frame: ChunkFrame,
-    frame_permit: OwnedSemaphorePermit,
+    frame: PendingChunkFrame,
+    copy_permit: OwnedSemaphorePermit,
     call: Arc<c2_wire::connection::calls::CallRecord<ServerCall>>,
+    budget: DomainBudget,
 ) -> ChunkCopyOutcome {
     let work_call = call.clone();
     let mut work = ChunkCopyWork {
@@ -3846,10 +4189,12 @@ fn copy_chunked_frame(
             armed: true,
         },
         frame,
-        _frame_permit: frame_permit,
+        _copy_permit: copy_permit,
     };
-    if let Some((total_chunks, chunk_size)) = work.frame.first_geometry {
-        if let Err(error) = registry.allocate_request(&request, total_chunks, chunk_size) {
+    if let Some((total_size, total_chunks, chunk_size)) = work.frame.first_geometry {
+        if let Err(error) =
+            registry.allocate_request(&request, total_size, total_chunks, chunk_size)
+        {
             let code = match error {
                 ChunkAdmissionError::Capacity(_) => ErrorCode::ResourceUnavailable,
                 _ => ErrorCode::ProtocolViolation,
@@ -3863,13 +4208,16 @@ fn copy_chunked_frame(
         }
     }
     let copied = (|| {
-        let data = work
-            .frame
-            .data
-            .and_then(RequestData::into_owned_bytes)
-            .map_err(|e| format!("chunked call SHM read failed: {e}"))?;
-        let prepared = registry.prepare_chunk(&request, work.frame.chunk_idx, data.len())?;
-        let copied = prepared.copy_from(&data)?;
+        let copied = match work.frame.data? {
+            RequestData::Inline(data) => registry
+                .prepare_chunk(&request, work.frame.chunk_idx, data.len())?
+                .copy_from(&data)?,
+            RequestData::Shm(peer) => registry
+                .prepare_chunk(&request, work.frame.chunk_idx, peer.len())?
+                .copy_with(|destination| peer.copy_into(destination))?,
+            RequestData::Handle(_) => unreachable!("reassembled data cannot be a chunk frame"),
+        };
+        drop(work.frame._memory);
         registry.commit_chunk(&request, copied)
     })();
     let complete = match copied {
@@ -3880,7 +4228,18 @@ fn copy_chunked_frame(
     };
     if complete {
         match registry.take_request(&request) {
-            Ok((assembler, ())) => ChunkCopyOutcome::Complete(assembler),
+            Ok((assembler, ())) => {
+                match assembler
+                    .finish()
+                    .map_err(|message| C2Error::new(ErrorCode::ResourceUnavailable, message))
+                    .and_then(|backing| owned_reassembly_input(&budget, backing))
+                {
+                    Ok(input) => ChunkCopyOutcome::Complete(input),
+                    Err(error) => {
+                        ChunkCopyOutcome::Refused(rpc::bounded_call_end_error_bytes(&error))
+                    }
+                }
+            }
             Err(error) => {
                 refuse_chunk_copy(&registry, &request, ErrorCode::ResourceUnavailable, error)
             }
@@ -3891,88 +4250,203 @@ fn copy_chunked_frame(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn dispatch_chunked_call_guarded(
-    server: &Server,
-    conn: &Arc<Connection>,
-    request_id: u64,
-    writer: &Arc<ConnectionWriter>,
-    chunk_processing_permit: OwnedSemaphorePermit,
-    frame: ChunkFrame,
-    request: ChunkRequest<()>,
-    mut guard: ChunkTaskGuard,
-) {
-    if frame.first_geometry.is_none() {
-        let ready = tokio::select! {
-            ready = request.wait_ready() => ready,
-            _ = conn.wait_work_cancelled() => return,
-        };
-        if !ready {
-            fail_chunked_request(
-                server,
-                writer,
-                request_id,
-                &request,
-                ErrorCode::ResourceUnavailable,
-                "chunked call chunk feed failed: no assembly".into(),
-            )
-            .await;
-            return;
+/// Charge the completed reassembly's local copy to the server domain and pair
+/// it with the backing. Buddy/file backings reserve before the `Vec` copy
+/// happens inside dispatch; a dedicated segment may first release its own
+/// charge (copy, `release`, retry) when the reservation raced its occupancy.
+fn owned_reassembly_input(
+    budget: &DomainBudget,
+    mut backing: c2_wire::chunk::ReassemblyBacking,
+) -> Result<OwnedRequestInput, C2Error> {
+    let len = backing.len() as u64;
+    let limit = budget.snapshot().memory.limit_bytes;
+    match budget.try_reserve_memory(len) {
+        Ok(reservation) => Ok(OwnedRequestInput {
+            data: RequestData::Handle(backing),
+            memory: Some(reservation),
+        }),
+        Err(error) => {
+            if backing.is_dedicated() && len <= limit {
+                let bytes = backing.copy_bytes().map_err(|message| {
+                    C2Error::new(ErrorCode::ResourceUnavailable, message).with_details(
+                        std::collections::BTreeMap::from([(
+                            "stage".to_string(),
+                            "call_input_admission".to_string(),
+                        )]),
+                    )
+                })?;
+                backing.release();
+                match budget.try_reserve_memory(len) {
+                    Ok(reservation) => Ok(OwnedRequestInput {
+                        data: RequestData::Inline(bytes),
+                        memory: Some(reservation),
+                    }),
+                    Err(error) => Err(input_admission_error("local copy admission", len, &error)),
+                }
+            } else {
+                Err(input_admission_error("local copy admission", len, &error))
+            }
         }
     }
-    if request.is_settled() || conn.is_work_cancelled() {
-        return;
+}
+
+/// The coordinator of the server-wide C-gated round-robin copy scheduling.
+/// It pops ready requests from [`CopyScheduler`] and spawns one C-permit
+/// worker per frame; a worker that leaves frames behind pushes its request to
+/// the back of the ready queue (round robin). Continuations that arrived
+/// before the first copy published the reassembly storage never enter the
+/// ready queue, so they cannot occupy blocking threads waiting on storage.
+async fn copy_coordinator(
+    server: std::sync::Weak<Server>,
+    scheduler: Arc<CopyScheduler>,
+    permits: Arc<Semaphore>,
+    mut running_guard: CoordinatorRunningGuard,
+) {
+    loop {
+        let work_notified = scheduler.work_notify.notified();
+        tokio::pin!(work_notified);
+        work_notified.as_mut().enable();
+        let scope_notified = scheduler.scope_notify.notified();
+        tokio::pin!(scope_notified);
+        scope_notified.as_mut().enable();
+
+        let has_ready = {
+            let mut state = scheduler.state.lock();
+            while state
+                .ready
+                .front()
+                .is_some_and(|(_, conn)| conn.strong_count() == 0)
+            {
+                state.ready.pop_front();
+            }
+            if state.active_scopes == 0 {
+                state.ready.clear();
+                state.coordinator_running = false;
+                running_guard.disarm();
+                return;
+            }
+            !state.ready.is_empty()
+        };
+
+        if !has_ready {
+            tokio::select! {
+                _ = &mut work_notified => {}
+                _ = &mut scope_notified => {}
+            }
+            continue;
+        }
+
+        let permit = tokio::select! {
+            permit = permits.clone().acquire_owned() => match permit {
+                Ok(permit) => permit,
+                Err(_) => return,
+            },
+            _ = &mut scope_notified => continue,
+        };
+        let Some(server) = server.upgrade() else {
+            return;
+        };
+        if let Some((conn, id)) = scheduler.pop_front() {
+            tokio::spawn(async move { run_copy_frame(&server, &conn, id, permit).await });
+        }
     }
-    let call = guard._call.clone();
+}
+
+/// Copy exactly one queued frame of one request, then re-schedule per the
+/// round-robin rules and, on completion, dispatch the assembled call.
+async fn run_copy_frame(
+    server: &Arc<Server>,
+    conn: &Arc<Connection>,
+    id: u64,
+    permit: OwnedSemaphorePermit,
+) {
+    let writer = conn
+        .rpc_writer
+        .lock()
+        .as_ref()
+        .and_then(std::sync::Weak::upgrade);
+    let Some(writer) = writer else {
+        return;
+    };
+    let Some(call) = conn.calls.lock().get(id) else {
+        return;
+    };
+    let work = {
+        let input_guard = call.data.input.lock();
+        let input = input_guard.as_ref();
+        let mut queue = input.map(|input| input.copy.lock());
+        match (input, queue.as_deref_mut()) {
+            (Some(input), Some(queue)) if !queue.finished => queue
+                .queue
+                .pop_front()
+                .map(|frame| (input.request.clone(), frame)),
+            _ => None,
+        }
+    };
+    let Some((request, frame)) = work else {
+        return;
+    };
+    let was_first = frame.first_geometry.is_some();
+    let _flight = crate::connection::FlightGuard::new(conn);
     let registry = server.chunk_registry.clone();
-    let copying_request = request.clone();
     let copying_call = call.clone();
+    let copying_request = request.clone();
+    let budget = server.domain_budget.clone();
     let copying = tokio::task::spawn_blocking(move || {
         copy_chunked_frame(
             registry,
             copying_request,
             frame,
-            chunk_processing_permit,
+            permit,
             copying_call,
+            budget,
         )
     });
     let copied = tokio::select! {
         result = copying => result.expect("chunk copy task panicked"),
         _ = conn.wait_work_cancelled() => return,
     };
-    // Failed work and completed input already own their original reply right.
-    guard.armed = false;
-    let assembler = match copied {
-        ChunkCopyOutcome::Incomplete | ChunkCopyOutcome::Discarded => return,
+    match copied {
+        ChunkCopyOutcome::Incomplete => {
+            let input = call.data.input.lock();
+            if let Some(input) = input.as_ref() {
+                let mut queue = input.copy.lock();
+                if was_first {
+                    queue.published = true;
+                }
+                queue.readied = !queue.queue.is_empty() && !queue.finished;
+                if queue.readied {
+                    server.copy_scheduler.push_back(conn, id);
+                } else if queue.queue.is_empty() {
+                    queue.queue = VecDeque::new();
+                }
+            }
+        }
+        ChunkCopyOutcome::Discarded => {}
         ChunkCopyOutcome::Refused(reply) => {
-            write_reply(writer, request_id, &reply).await;
-            return;
+            finish_copy_queue(&call);
+            write_reply(&writer, id, &reply).await;
         }
-        ChunkCopyOutcome::Complete(assembler) => assembler,
-    };
-    let request = assembler
-        .finish()
-        .map(RequestData::Handle)
-        .map_err(|error| format!("chunked call reassembly finish failed: {error}"));
-    let request = match request {
-        Ok(request) => request,
-        Err(message) => {
-            write_reply(
-                writer,
-                request_id,
-                &error_wire(ErrorCode::ResourceUnavailable, message),
-            )
-            .await;
-            return;
+        ChunkCopyOutcome::Complete(input) => {
+            finish_copy_queue(&call);
+            if !call.queue() {
+                return;
+            }
+            let Some(admission) = call.data.admission.lock().take() else {
+                return;
+            };
+            dispatch_complete_call(server, conn, &writer, id, input, admission).await;
         }
-    };
-    if !call.queue() {
-        return;
     }
-    let Some(admission) = call.data.admission.lock().take() else {
-        return;
-    };
-    dispatch_complete_call(server, conn, writer, request_id, request, admission).await;
+}
+
+/// Mark a request's pending-copy queue terminal: leftover frames drop with
+/// their reservations, and late continuations stop entering the queue.
+fn finish_copy_queue(call: &Arc<c2_wire::connection::calls::CallRecord<ServerCall>>) {
+    let input_guard = call.data.input.lock();
+    if let Some(input) = input_guard.as_ref() {
+        input.copy.lock().finished = true;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -4046,41 +4520,12 @@ fn response_write_error(context: &str, error: std::io::Error) -> ResponseSendErr
     }
 }
 
-async fn queue_server_pending_capacity_error(
-    writer: &Arc<ConnectionWriter>,
-    request_id: u64,
-    limit: u32,
-) {
-    let msg = format!("server execution capacity exceeded: max_pending_requests={limit}");
-    queue_rejection(
-        writer,
-        request_id,
-        &error_wire(ErrorCode::ResourceUnavailable, msg),
-    )
-    .await;
+struct TerminalClaim {
+    status: CallStatus,
+    _call: Arc<c2_wire::connection::calls::CallRecord<ServerCall>>,
 }
 
-async fn queue_chunk_processing_capacity_error(
-    server: &Server,
-    writer: &Arc<ConnectionWriter>,
-    request_id: u64,
-    request: &ChunkRequest<()>,
-    limit: u32,
-) {
-    if !server.settle_chunk_request(request) {
-        return;
-    }
-    let msg =
-        format!("server chunk processing capacity exceeded: max_inflight_chunk_frames={limit}");
-    queue_rejection(
-        writer,
-        request_id,
-        &error_wire(ErrorCode::ResourceUnavailable, msg),
-    )
-    .await;
-}
-
-fn claim_terminal(writer: &ConnectionWriter, id: u64, status: CallStatus) -> Option<CallStatus> {
+fn claim_terminal(writer: &ConnectionWriter, id: u64, status: CallStatus) -> Option<TerminalClaim> {
     let (status, retired) = {
         let mut calls = writer.conn.calls.lock();
         let call = calls.get(id)?;
@@ -4094,12 +4539,12 @@ fn claim_terminal(writer: &ConnectionWriter, id: u64, status: CallStatus) -> Opt
     let call = &retired;
     // Retire storage outside the table lock. Copy tokens retain actual owners.
     let input = call.data.input.lock().take();
-    if let Some(input) = input {
-        input.registry.settle(&input.request);
-    }
-    drop(retired);
+    drop(input);
     writer.conn.core.stream_retire(id);
-    Some(status)
+    Some(TerminalClaim {
+        status,
+        _call: retired,
+    })
 }
 
 async fn write_error_record(
@@ -4133,13 +4578,13 @@ async fn write_error_record(
 }
 
 async fn write_reply(writer: &Arc<ConnectionWriter>, request_id: u64, error: &[u8]) {
-    if let Some(status) = claim_terminal(writer, request_id, CallStatus::NotExecuted) {
-        write_error_record(writer, request_id, status, error, false).await;
+    if let Some(claim) = claim_terminal(writer, request_id, CallStatus::NotExecuted) {
+        write_error_record(writer, request_id, claim.status, error, false).await;
     }
 }
 async fn queue_rejection(writer: &Arc<ConnectionWriter>, request_id: u64, error: &[u8]) -> bool {
-    if let Some(status) = claim_terminal(writer, request_id, CallStatus::NotExecuted) {
-        write_error_record(writer, request_id, status, error, true).await;
+    if let Some(claim) = claim_terminal(writer, request_id, CallStatus::NotExecuted) {
+        write_error_record(writer, request_id, claim.status, error, true).await;
         true
     } else {
         false

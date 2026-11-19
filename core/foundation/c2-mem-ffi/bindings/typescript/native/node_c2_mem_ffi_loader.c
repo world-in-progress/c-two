@@ -8,6 +8,7 @@
 #include <dlfcn.h>
 #include <pthread.h>
 #endif
+#include <inttypes.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -640,6 +641,53 @@ static napi_value call_method(napi_env env, napi_callback_info info) {
     }
     return async_status(env, operation, st, promise);
 }
+static char *domain_options_json(napi_env env, napi_value options) {
+    napi_valuetype type;
+    if (!ok(napi_typeof(env, options, &type))) return NULL;
+    bool is_array = false;
+    if (type == napi_object && !ok(napi_is_array(env, options, &is_array))) return NULL;
+    if (type != napi_object || is_array) {
+        bad(env, "Factory options must be an object.");
+        return NULL;
+    }
+
+    napi_value keys, normalized;
+    uint32_t count;
+    if (!ok(napi_get_all_property_names(env, options, napi_key_own_only,
+            napi_key_enumerable | napi_key_skip_symbols, napi_key_numbers_to_strings, &keys)) ||
+        !ok(napi_get_array_length(env, keys, &count)) ||
+        !ok(napi_create_object(env, &normalized))) return NULL;
+    for (uint32_t i = 0; i < count; ++i) {
+        napi_value key, value;
+        if (!ok(napi_get_element(env, keys, i, &key))) return NULL;
+        char *name = string(env, key, "Factory option names must be strings.");
+        if (name == NULL) return NULL;
+        bool known = strcmp(name, "memoryBudgetBytes") == 0 ||
+            strcmp(name, "fileSpillBudgetBytes") == 0 ||
+            strcmp(name, "maxOutstandingCalls") == 0;
+        char message[128];
+        if (!known) {
+            snprintf(message, sizeof(message), "unknown option %s", name);
+            free(name);
+            bad(env, message);
+            return NULL;
+        }
+        snprintf(message, sizeof(message), "%s must be a non-negative safe integer or u64 bigint.", name);
+        free(name);
+        if (!ok(napi_get_property(env, options, key, &value)) ||
+            !ok(napi_typeof(env, value, &type))) return NULL;
+        if (type == napi_undefined) continue;
+
+        uint64_t limit;
+        if (!uint64(env, value, &limit, message)) return NULL;
+        char decimal[21];
+        snprintf(decimal, sizeof(decimal), "%" PRIu64, limit);
+        napi_value encoded = js_string(env, decimal);
+        if (encoded == NULL || !ok(napi_set_property(env, normalized, key, encoded))) return NULL;
+    }
+    return json_string(env, normalized, "Factory options must be an object.");
+}
+
 static napi_value domain_cb(napi_env env, napi_callback_info info) {
     size_t argc = 2; napi_value argv[2]; Symbols *s = NULL;
     if (!args(env, info, &argc, argv, NULL, (void **)&s)) return NULL;
@@ -651,7 +699,7 @@ static napi_value domain_cb(napi_env env, napi_callback_info info) {
         if (owner->s != s) return bad(env, "Context belongs to another native library.");
         context = owner->ptr;
     }
-    char *options = json_string(env, argv[1], "Factory options must be an object.");
+    char *options = domain_options_json(env, argv[1]);
     if (options == NULL) return NULL;
     C2MemFfiClientDomain *domain = NULL; C2MemFfiError *error = NULL;
     C2MemFfiStatus st = s->domain_new(context, options, &domain, &error);
