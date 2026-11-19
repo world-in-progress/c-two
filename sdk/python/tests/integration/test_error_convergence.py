@@ -2134,3 +2134,70 @@ def test_post_dispatch_prepared_close_exception_group_and_fastdb_hostile_class_g
         assert close_caught.value.transport_phase is None
         assert close_caught.value.args == ('rewritten-close-arg',)
         assert close_caught.value.__cause__ is orig_close_err
+
+    # 4. Bare CCBaseError and custom CCBaseError forwarding inner pre_dispatch raised inside
+    # a stateful resource method project to ResourceExecutionError(3, transport_phase=None)
+    # identically across same-process unary, IPC unary, and stream calls.
+    from c_two.error import ResourceClosed
+
+    class _WrappedDownstreamError(CCBaseError):
+        def __init__(self, inner: CCBaseError):
+            super().__init__('business wrapper around downstream refusal')
+            self.inner = inner
+
+        @property
+        def transport_phase(self):  # type: ignore[override]
+            return self.inner.transport_phase
+
+    for make_exc in (
+        lambda: CCBaseError('bare base error after state mutation'),
+        lambda: _WrappedDownstreamError(ResourceClosed('inner closed', transport_phase='pre_dispatch')),
+    ):
+        mutations = {'local_unary': 0, 'ipc_unary': 0, 'stream': 0}
+
+        class StatefulBaseResource:
+            def __init__(self, tag: str):
+                self.tag = tag
+
+            def echo(self, value):
+                mutations[self.tag] += 1
+                raise make_exc()
+
+            def steps(self, value):
+                mutations['stream'] += 1
+                raise make_exc()
+                yield value
+
+        rt = cc.Runtime()
+        if sys.platform != 'win32':
+            base_dir = tmp_path / f'base_ipc_{id(make_exc)}'
+            base_dir.mkdir()
+            rt.set_local_endpoint(root=str(base_dir))
+        rt.register(CodecBoundary, StatefulBaseResource('local_unary'), name='local-base')
+        rt.register(CodecBoundary, StatefulBaseResource('ipc_unary'), name='ipc-base')
+        local_proxy = rt.connect(CodecBoundary, name='local-base')
+        ipc_proxy = rt.connect(CodecBoundary, name='ipc-base', address=rt.server_address())
+        try:
+            with pytest.raises(ResourceExecutionError) as local_u:
+                local_proxy.echo('go')
+            assert local_u.value.code == ErrorCode.ResourceFunctionExecuting
+            assert local_u.value.transport_phase is None
+            assert isinstance(local_u.value.__cause__, CCBaseError)
+            assert mutations['local_unary'] == 1
+
+            with pytest.raises(ResourceExecutionError) as ipc_u:
+                ipc_proxy.echo('go')
+            assert ipc_u.value.code == ErrorCode.ResourceFunctionExecuting
+            assert ipc_u.value.transport_phase is None
+            assert mutations['ipc_unary'] == 1
+
+            s = local_proxy.steps('go')
+            with pytest.raises(ResourceExecutionError) as local_s:
+                next(s)
+            assert local_s.value.code == ErrorCode.ResourceFunctionExecuting
+            assert local_s.value.transport_phase is None
+            assert mutations['stream'] == 1
+        finally:
+            cc.close(local_proxy)
+            cc.close(ipc_proxy)
+            rt.shutdown()

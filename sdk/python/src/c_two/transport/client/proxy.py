@@ -577,13 +577,20 @@ class CRMProxy:
 def _invoke_local(method, args):
     try:
         return method(*args)
-    except error.CoreError as exc:
-        # A downstream admission failure describes the inner call only:
-        # re-raise a clean copy instead of mutating the business's object.
-        raise (error._callback_semantic_copy(exc) or error._callback_core_copy(exc)) from exc
-    except error.CCError as exc:
-        raise error._callback_error_copy(exc) from exc
-    except Exception:
+    except Exception as exc:
+        cls = type(exc)
+        if issubclass(cls, error.CoreError):
+            # A downstream admission failure describes the inner call only:
+            # re-raise a clean copy instead of mutating the business's object.
+            raise (error._callback_semantic_copy(exc) or error._callback_core_copy(exc)) from exc  # type: ignore[arg-type]
+        if issubclass(cls, error.CCError):
+            raise error._callback_error_copy(exc) from exc  # type: ignore[arg-type]
+        if issubclass(cls, error.CCBaseError):
+            from ...crm.transferable import _cause_details, _safe_error_message
+            raise error.ResourceExecutionError(
+                _safe_error_message(exc),
+                details=_cause_details(exc),
+            ) from exc
         raise
     except BaseException as exc:
         from ...crm.transferable import _cause_details, _safe_error_message

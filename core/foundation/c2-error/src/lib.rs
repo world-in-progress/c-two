@@ -516,6 +516,73 @@ fn validate_canonical_envelope_json(body: &str) -> bool {
     scanner.index == scanner.bytes.len() && body.trim_start_matches([' ', '\t', '\n', '\r']).starts_with('{')
 }
 
+impl C2ErrorEnvelope {
+    pub fn from_canonical_json_bytes(bytes: &[u8]) -> Result<Self, C2ErrorDecodeError> {
+        let body = std::str::from_utf8(bytes)
+            .map_err(|error| C2ErrorDecodeError::InvalidJson(error.to_string()))?;
+        if !validate_canonical_envelope_json(body) {
+            return Err(C2ErrorDecodeError::InvalidJson(
+                "non-canonical JSON envelope".to_string(),
+            ));
+        }
+        serde_json::from_str(body)
+            .map_err(|error| C2ErrorDecodeError::InvalidJson(error.to_string()))
+    }
+
+    pub fn from_wrapped_json_bytes(
+        bytes: &[u8],
+        wrapper_key: &str,
+    ) -> Result<Self, C2ErrorDecodeError> {
+        let body = std::str::from_utf8(bytes)
+            .map_err(|error| C2ErrorDecodeError::InvalidJson(error.to_string()))?;
+        let trimmed = body.trim_matches([' ', '\t', '\n', '\r']);
+        let Some(rest) = trimmed.strip_prefix('{') else {
+            return Err(C2ErrorDecodeError::InvalidJson(
+                "expected JSON object".to_string(),
+            ));
+        };
+        let Some(rest) = rest.strip_suffix('}') else {
+            return Err(C2ErrorDecodeError::InvalidJson(
+                "unterminated JSON object".to_string(),
+            ));
+        };
+        let rest = rest.trim_matches([' ', '\t', '\n', '\r']);
+        if !rest.starts_with('"') {
+            return Err(C2ErrorDecodeError::InvalidJson(
+                "missing wrapper field".to_string(),
+            ));
+        }
+        let mut idx = 1;
+        let rbytes = rest.as_bytes();
+        while idx < rbytes.len() {
+            match rbytes[idx] {
+                b'\\' => idx += 2,
+                b'"' => break,
+                _ => idx += 1,
+            }
+        }
+        if idx >= rbytes.len() || rbytes[idx] != b'"' {
+            return Err(C2ErrorDecodeError::InvalidJson(
+                "unterminated wrapper key".to_string(),
+            ));
+        }
+        let parsed_key: String = serde_json::from_str(&rest[..=idx])
+            .map_err(|error| C2ErrorDecodeError::InvalidJson(error.to_string()))?;
+        if parsed_key != wrapper_key {
+            return Err(C2ErrorDecodeError::InvalidJson(format!(
+                "unexpected wrapper field {parsed_key}"
+            )));
+        }
+        let after_key = rest[idx + 1..].trim_start_matches([' ', '\t', '\n', '\r']);
+        let Some(inner) = after_key.strip_prefix(':') else {
+            return Err(C2ErrorDecodeError::InvalidJson(
+                "missing ':' after wrapper key".to_string(),
+            ));
+        };
+        Self::from_canonical_json_bytes(inner.as_bytes())
+    }
+}
+
 impl C2Error {
     pub fn new(code: ErrorCode, message: impl Into<String>) -> Self {
         Self {
@@ -553,15 +620,7 @@ impl C2Error {
     }
 
     pub fn from_json_bytes(bytes: &[u8]) -> Result<Self, C2ErrorDecodeError> {
-        let body = std::str::from_utf8(bytes)
-            .map_err(|error| C2ErrorDecodeError::InvalidJson(error.to_string()))?;
-        if !validate_canonical_envelope_json(body) {
-            return Err(C2ErrorDecodeError::InvalidJson(
-                "non-canonical JSON envelope".to_string(),
-            ));
-        }
-        let envelope: C2ErrorEnvelope = serde_json::from_str(body)
-            .map_err(|error| C2ErrorDecodeError::InvalidJson(error.to_string()))?;
+        let envelope = C2ErrorEnvelope::from_canonical_json_bytes(bytes)?;
         Self::from_envelope(envelope)
     }
 

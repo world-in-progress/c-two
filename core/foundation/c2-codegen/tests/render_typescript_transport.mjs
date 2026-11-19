@@ -71,14 +71,20 @@ function findFastDbLibraryLocations(root) {
   return undefined;
 }
 
-function prependEnvPaths(env, key, dirs) {
+export function prependEnvPaths(env, key, dirs) {
   if (dirs.length === 0) return;
   const existing = env[key] ?? '';
-  const parts = existing ? existing.split(delimiter) : [];
-  const prefix = dirs.filter(dir => !parts.includes(dir));
-  if (prefix.length > 0) {
-    env[key] = existing ? `${prefix.join(delimiter)}${delimiter}${existing}` : prefix.join(delimiter);
+  const parts = existing ? existing.split(delimiter).filter(Boolean) : [];
+  const desired = [];
+  const seen = new Set();
+  for (const dir of dirs) {
+    if (!seen.has(dir)) {
+      seen.add(dir);
+      desired.push(dir);
+    }
   }
+  const remaining = parts.filter(part => !seen.has(part));
+  env[key] = [...desired, ...remaining].join(delimiter);
 }
 
 function buildFastDbEnvironment() {

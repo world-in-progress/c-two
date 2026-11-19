@@ -4,8 +4,9 @@ import {mkdtempSync,writeFileSync,rmSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {fileURLToPath,pathToFileURL} from 'node:url';
+import {delimiter} from 'node:path';
 import test from 'node:test';
-import {writeRenderedTypescriptTransport} from './render_typescript_transport.mjs';
+import {prependEnvPaths,writeRenderedTypescriptTransport} from './render_typescript_transport.mjs';
 
 const directory=mkdtempSync(join(tmpdir(),'c2-ts-revision-'));
 let transport;
@@ -1252,4 +1253,50 @@ test('extension JSON depth/IEEE-754 boundaries and synchronous reader cleanup fa
       assert.deepEqual({allocated,freed,unlocks},{allocated:1,freed:1,unlocks:1});
     }finally{await client.close()}
   }
+
+  // 3. Declared Content-Length: 0 with responsePayloadAllocator rejects non-empty body and frees buffer,
+  // while genuinely empty stream succeeds.
+  for(const [bodyBytes,shouldReject] of [
+    [Uint8Array.of(99),true],
+    [new Uint8Array(0),false],
+  ]){
+    let allocated=0,freed=0;
+    let capturedResponse;
+    const zeroClient=transport.createRelayAwareHttpEncodedTransport('http://localhost:8300',{
+      responsePayloadAllocator(byteLength){
+        allocated++;
+        const backing=new Uint8Array(byteLength);
+        return {view:backing,payload:{bytes:backing,byteLength,release(){freed++;}}};
+      },
+      fetch:async(url,init)=>{
+        if(url.includes('/_resolve/'))return textReply(200,JSON.stringify([relayRoute()]));
+        if(url.includes('/_probe/'))return relayResponse();
+        assert.equal(init.method,'POST');
+        capturedResponse=new Response(bodyBytes,{status:200,headers:{'content-length':'0'}});
+        return capturedResponse;
+      },
+    });
+    try{
+      if(shouldReject){
+        await assert.rejects(zeroClient.call('route',contract,'ping',()=>new Uint8Array()),err=>{
+          assert.ok(err instanceof transport.C2HttpTransportError);
+          assert.equal(err.transportPhase,'dispatch_uncertain');
+          assert.equal(err.retrySafe,false);
+          assert.match(err.message,/exceeded Content-Length/);
+          return true;
+        });
+        assert.equal(capturedResponse.bodyUsed,true);
+        assert.deepEqual({allocated,freed},{allocated:1,freed:1});
+      }else{
+        const ok=await zeroClient.call('route',contract,'ping',()=>new Uint8Array());
+        assert.equal(ok.byteLength,0);
+        assert.deepEqual({allocated,freed},{allocated:1,freed:0});
+      }
+    }finally{await zeroClient.close()}
+  }
+
+  // 4. Selected CoreSDK directory moves ahead of older entries in loader path env.
+  const fakeEnv={DYLD_LIBRARY_PATH:`/old/lib${delimiter}/selected/lib`};
+  prependEnvPaths(fakeEnv,'DYLD_LIBRARY_PATH',['/selected/lib']);
+  assert.equal(fakeEnv.DYLD_LIBRARY_PATH,`/selected/lib${delimiter}/old/lib`);
 });

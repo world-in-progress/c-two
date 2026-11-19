@@ -1226,7 +1226,10 @@ async function readHttpSuccessResponsePayload<Payload extends C2ResponsePayload>
       return await readUnknownLengthAllocatedResponsePayload(response.body, allocator, unknownLengthMaxBytes);
     }
     if (contentLength === 0) {
-      return requireAllocatedResponsePayload<Payload>(allocator(0), 0).payload;
+      if (response.body === undefined || response.body === null) {
+        return requireAllocatedResponsePayload<Payload>(allocator(0), 0).payload;
+      }
+      return await readAllocatedResponsePayload(response.body, 0, allocator);
     }
     if (response.body === undefined || response.body === null) {
       throw new Error("C-Two HTTP relay response body stream is required when responsePayloadAllocator is configured.");
