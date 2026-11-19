@@ -23,6 +23,7 @@ const receipt={completed:true,error:null,completeItems:0n};
 const nativeTarget={...binding,path:'DirectIpc'};
 const nextTurn=()=>new Promise(resolve=>setImmediate(resolve));
 function deferred(){let resolve;const promise=new Promise(r=>{resolve=r});return {promise,resolve};}
+const textReply=(status,body)=>({status,async arrayBuffer(){return new TextEncoder().encode(body).buffer}});
 
 test('719 resolve is typed, pre-dispatch, and a later acquisition can succeed',async()=>{
   const registrations='[{"relay_id":"a","relay_url":"http://localhost:8301","registered_at":1,"relay_status":"Alive"}]';
@@ -33,10 +34,10 @@ test('719 resolve is typed, pre-dispatch, and a later acquisition can succeed',a
     if(url.includes('/_resolve/')){
       resolves++;
       return resolves===1
-        ? {status:409,async text(){return JSON.stringify({version:1,code:719,name:'RouteConflict',message:'conflict',details})}}
-        : {status:200,async text(){return JSON.stringify([route])}};
+        ? textReply(409,JSON.stringify({version:1,code:719,name:'RouteConflict',message:'conflict',details}))
+        : textReply(200,JSON.stringify([route]));
     }
-    if(url.includes('/_probe/')){probes++;return {status:200,async text(){return ''}}}
+    if(url.includes('/_probe/')){probes++;return textReply(200,'')}
     posts++;return {status:200,async arrayBuffer(){return Uint8Array.of(8).buffer}};
   };
   const client=transport.createRelayAwareHttpEncodedTransport('http://localhost:8300',{fetch});
@@ -61,7 +62,7 @@ test('719 resolution parses a complete canonical error once',async()=>{
   const details={route:'route',dispatch_phase:'pre_dispatch',registrations:'[]'};
   const body=JSON.stringify({version:1,code:719,name:'RouteConflict',message:'conflict',details});
   const client=transport.createRelayAwareHttpEncodedTransport('http://localhost:8300',{
-    fetch:async()=>({status:409,async text(){return body}}),
+    fetch:async()=>textReply(409,body),
   });
   const originalParse=JSON.parse;
   let parses=0;
@@ -86,7 +87,7 @@ test('719 with invalid canonical fields keeps the HTTP relay error',async()=>{
   ]){
     const body=JSON.stringify({version:1,code:719,name:'RouteConflict',...invalid});
     const client=transport.createRelayAwareHttpEncodedTransport('http://localhost:8300',{
-      fetch:async()=>({status:409,async text(){return body}}),
+      fetch:async()=>textReply(409,body),
     });
     try{
       await assert.rejects(client.call('route',contract,'ping',()=>new Uint8Array()),error=>{
@@ -125,14 +126,14 @@ test('native 719 projection has the same typed error',async()=>{
 });
 
 test('719 probe stops acquisition before trying another registration',async()=>{
-  const details={route:'route',dispatch_phase:'pre_dispatch',registrations:'[]'};
+  const details={route:'route'};
   const routes=[8301,8302].map(port=>({name:'route',relay_url:`http://localhost:${port}`,crm_ns:'test',crm_name:'Test',crm_ver:'0.1.0',abi_hash:hash,signature_hash:hash,max_payload_size:100}));
   let resolves=0,probes=0,posts=0;
   const fetch=async(url)=>{
-    if(url.includes('/_resolve/')){resolves++;return {status:200,async text(){return JSON.stringify(routes)}}}
+    if(url.includes('/_resolve/')){resolves++;return textReply(200,JSON.stringify(routes))}
     if(url.includes('/_probe/')){
       probes++;
-      return {status:409,async text(){return JSON.stringify({version:1,code:719,name:'RouteConflict',message:'conflict',details})}};
+      return textReply(409,JSON.stringify({version:1,code:719,name:'RouteConflict',message:'conflict',details}));
     }
     posts++;throw Error('unexpected POST');
   };
@@ -186,7 +187,7 @@ for (const relayLocal of [false, true]) for (const stream of [false, true]) {
           callTimeoutMs: 10, ipc: {connect: async () => endpoint},
           fetch: async url => {
             assert.ok(url.includes('/_resolve/'));
-            return {status: 200, async text() { return JSON.stringify([relayRoute(1, true)]); }};
+            return textReply(200, JSON.stringify([relayRoute(1, true)]));
           },
         })
       : transport.createIpcEncodedTransport('ipc://deadline', {connect: async () => endpoint, callTimeoutMs: 10});
@@ -273,7 +274,7 @@ test('FallbackDenied retains first local IPC cause across two failed acquisition
   });
   const routes=['a','b'].map((id,index)=>({name:'route',relay_url:`http://localhost:${8301+index}`,ipc_address:`ipc://${id}`,server_id:id,server_instance_id:'i',crm_ns:'test',crm_name:'Test',crm_ver:'0.1.0',abi_hash:hash,signature_hash:hash,max_payload_size:100}));
   let posts=0;const attempts=[];
-  const fetch=async(_url,init)=>{if(init.method==='POST')posts++;return {status:200,async text(){return JSON.stringify(routes)},async arrayBuffer(){return new ArrayBuffer(0)}}};
+  const fetch=async(_url,init)=>{if(init.method==='POST')posts++;return textReply(200,JSON.stringify(routes))};
   const connect=async address=>({connectionSnapshot(){return null},async prepare(){const index=address==='ipc://a'?0:1;attempts.push(index);throw failures[index]},beginCall(){throw Error('unexpected dispatch')},async close(){},deactivate(){}});
   const client=transport.createRelayAwareHttpEncodedTransport('http://localhost:8300',{fetch,ipc:{connect}});
   await assert.rejects(client.call('route',contract,'ping',()=>new Uint8Array()),error=>{
@@ -291,7 +292,7 @@ test('fresh resolve excludes the same failed local endpoint identity',async()=>{
   failure.nativeDetails={message:'refused',transportPhase:'pre_dispatch',category:'ipc',ioOperation:'connect',ioKind:'ConnectionRefused'};
   const route={name:'route',relay_url:'http://localhost:8301',ipc_address:'ipc://same',server_id:'s',server_instance_id:'i',crm_ns:'test',crm_name:'Test',crm_ver:'0.1.0',abi_hash:hash,signature_hash:hash,max_payload_size:100};
   let resolves=0,connects=0,posts=0;
-  const fetch=async(_url,init)=>{if(init.method==='POST')posts++;else resolves++;return {status:200,async text(){return JSON.stringify([route])},async arrayBuffer(){return new ArrayBuffer(0)}}};
+  const fetch=async(_url,init)=>{if(init.method==='POST')posts++;else resolves++;return textReply(200,JSON.stringify([route]))};
   const connect=async()=>{connects++;return {connectionSnapshot(){return null},async prepare(){throw failure},beginCall(){throw Error('unexpected dispatch')},async close(){},deactivate(){}}};
   const client=transport.createRelayAwareHttpEncodedTransport('http://localhost:8300',{fetch,ipc:{connect}});
   await assert.rejects(client.call('route',contract,'ping',()=>new Uint8Array()),error=>{
@@ -313,9 +314,9 @@ for (const response of ['empty', 'not-found']) test(`empty fresh resolve retains
   const fetch=async(_url,init)=>{
     if(init.method==='POST'){posts++;throw Error('unexpected POST')}
     resolves++;
-    if(resolves===1)return {status:200,async text(){return JSON.stringify([route])}};
-    return response==='empty' ? {status:200,async text(){return '[]'}} :
-      {status:404,async text(){return JSON.stringify({version:1,code:701,name:'ResourceNotFound',message:'missing',details:{dispatch_phase:'pre_dispatch'}})}};
+    if(resolves===1)return textReply(200,JSON.stringify([route]));
+    return response==='empty' ? textReply(200,'[]') :
+      textReply(404,JSON.stringify({version:1,code:701,name:'ResourceNotFound',message:'missing',details:{dispatch_phase:'pre_dispatch'}}));
   };
   const connect=async()=>({connectionSnapshot(){return null},async prepare(){throw first},beginCall(){throw Error('unexpected dispatch')},async close(){},deactivate(){}});
   const client=transport.createRelayAwareHttpEncodedTransport('http://localhost:8300',{fetch,ipc:{connect}});
@@ -334,10 +335,10 @@ test('canonical 701 POST invalidates its target without replaying that call',asy
   const route={name:'route',relay_url:'http://localhost:8301',crm_ns:'test',crm_name:'Test',crm_ver:'0.1.0',abi_hash:hash,signature_hash:hash,max_payload_size:100};
   let resolves=0,posts=0,encodes=0;
   const fetch=async(url,init)=>{
-    if(url.includes('/_resolve/')){resolves++;return {status:200,async text(){return JSON.stringify([route])}}}
-    if(url.includes('/_probe/'))return {status:200,async text(){return ''}};
+    if(url.includes('/_resolve/')){resolves++;return textReply(200,JSON.stringify([route]))}
+    if(url.includes('/_probe/'))return textReply(200,'');
     posts++;
-    if(posts===1)return {status:404,async text(){return JSON.stringify({version:1,code:701,name:'ResourceNotFound',message:'missing',details:{dispatch_phase:'pre_dispatch'}})}};
+    if(posts===1)return textReply(404,JSON.stringify({version:1,code:701,name:'ResourceNotFound',message:'missing',details:{dispatch_phase:'pre_dispatch'}}));
     return {status:200,async arrayBuffer(){return Uint8Array.of(8).buffer}};
   };
   const client=transport.createRelayAwareHttpEncodedTransport('http://localhost:8300',{fetch});
@@ -354,7 +355,7 @@ for(const path of ['direct','relay-local'])test(`${path} close accepts 214748364
   const call={cancel(){},async chargeInput(){},async dispatch(){return nativeTarget},async next(){return null},async observe(ms){observes++;assert.ok(ms>2147483000);return receipt},checkDeadline(){},close(){}};
   const endpoint={connectionSnapshot(){return null},async prepare(){await opened.promise;return binding},beginCall(){return call},deactivate(){},async close(){}};
   const route={name:'route',relay_url:'http://localhost:8301',ipc_address:'ipc://local',server_id:'s',server_instance_id:'i',crm_ns:'test',crm_name:'Test',crm_ver:'0.1.0',abi_hash:hash,signature_hash:hash,max_payload_size:100};
-  const client=path==='direct'?transport.createIpcEncodedTransport('ipc://close',{connect:async()=>endpoint}):transport.createRelayAwareHttpEncodedTransport('http://localhost:8300',{ipc:{connect:async()=>endpoint},fetch:async()=>({status:200,async text(){return JSON.stringify([route])},async arrayBuffer(){return new ArrayBuffer(0)}})});
+  const client=path==='direct'?transport.createIpcEncodedTransport('ipc://close',{connect:async()=>endpoint}):transport.createRelayAwareHttpEncodedTransport('http://localhost:8300',{ipc:{connect:async()=>endpoint},fetch:async()=>textReply(200,JSON.stringify([route]))});
   let clock=0,id=0;const timers=new Map();
   const originalTimeout=globalThis.setTimeout,originalClear=globalThis.clearTimeout;
   const nowDescriptor=Object.getOwnPropertyDescriptor(performance,'now');
@@ -414,7 +415,11 @@ for(const relayAware of [false,true])test(`HTTP unary encoding uses its original
   const descriptor=Object.getOwnPropertyDescriptor(performance,'now');
   Object.defineProperty(performance,'now',{configurable:true,value:()=>clock});
   const routes=[{name:'route',relay_url:'http://localhost:8301',crm_ns:'test',crm_name:'Test',crm_ver:'0.1.0',abi_hash:hash,signature_hash:hash,max_payload_size:100}];
-  const fetch=async(_url,init)=>{fetches++;if(init.method==='POST')posts++;return {status:200,async text(){return JSON.stringify(routes)},async arrayBuffer(){return new ArrayBuffer(0)}}};
+  const fetch=async(url,init)=>{
+    fetches++;
+    if(init.method==='POST')posts++;
+    return url.includes('/_probe/') ? textReply(200,'') : textReply(200,JSON.stringify(routes));
+  };
   const factory=relayAware?transport.createRelayAwareHttpEncodedTransport:transport.createHttpRelayEncodedTransport;
   const client=factory('http://localhost:8300',{fetch,callTimeoutMs:10});
   try {
@@ -435,9 +440,11 @@ for(const relayAware of [false,true])test(`HTTP pre-dispatch probes never restar
     if(init.method==='POST'){posts++;throw Error('expired input must not dispatch')}
     if(url.includes('/_probe/')){
       probes++;clock+=probes===1?4:5;
-      return {status:probes===1?404:200,async text(){return JSON.stringify({version:1,code:701,name:'ResourceNotFound',message:'missing',details:{dispatch_phase:'pre_dispatch'}})},async arrayBuffer(){return new ArrayBuffer(0)}};
+      return probes===1
+        ? textReply(404,JSON.stringify({version:1,code:701,name:'ResourceNotFound',message:'missing'}))
+        : textReply(200,'');
     }
-    clock+=2;return {status:200,async text(){return JSON.stringify(routes)},async arrayBuffer(){return new ArrayBuffer(0)}};
+    clock+=2;return textReply(200,JSON.stringify(routes));
   };
   const factory=relayAware?transport.createRelayAwareHttpEncodedTransport:transport.createHttpRelayEncodedTransport;
   const client=factory('http://localhost:8300',{fetch,callTimeoutMs:10});
@@ -456,14 +463,15 @@ function relayRoute(id = 1, local = false) {
     ...(local?{ipc_address:`ipc://s${id}`,server_id:`s${id}`,server_instance_id:`i${id}`} : {}),
     crm_ns:'test',crm_name:'Test',crm_ver:'0.1.0',abi_hash:hash,signature_hash:hash,max_payload_size:1};
 }
-function relayResponse(status = 200, value = Uint8Array.of(9), details = {}) {
-  return {status, async arrayBuffer(){return value.buffer}, async text(){return JSON.stringify(details)}};
+function relayResponse(status = 200, value = Uint8Array.of(9), details = undefined) {
+  const raw = details !== undefined ? new TextEncoder().encode(JSON.stringify(details)) : value;
+  return {status, async arrayBuffer(){return raw.slice().buffer}};
 }
 for(const explicit of [false,true]) test(`relay target is acquired once and keeps only its URL (explicit=${explicit})`,async()=>{
   let resolves=0,probes=0,posts=0;
   const factory=explicit?transport.createHttpRelayEncodedTransport:transport.createRelayAwareHttpEncodedTransport;
   const client=factory('http://localhost:8300',{fetch:async(url,init)=>{
-    if(url.includes('/_resolve/')){resolves++;return {status:200,async text(){return JSON.stringify([relayRoute()])}}}
+    if(url.includes('/_resolve/')){resolves++;return textReply(200,JSON.stringify([relayRoute()]))}
     if(url.includes('/_probe/')){probes++;return relayResponse()}
     posts++;assert.equal(init.body.length,4);return relayResponse();
   }});
@@ -477,7 +485,7 @@ for(const explicit of [false,true]) test(`HTTP refusal follows on the next call 
   const urls=[];
   const factory=explicit?transport.createHttpRelayEncodedTransport:transport.createRelayAwareHttpEncodedTransport;
   const client=factory('http://localhost:8300',{fetch:async(url,init)=>{
-    if(url.includes('/_resolve/')){resolves++;return {status:200,async text(){return JSON.stringify([relayRoute(selected)])}}}
+    if(url.includes('/_resolve/')){resolves++;return textReply(200,JSON.stringify([relayRoute(selected)]))}
     if(url.includes('/_probe/')){probes++;return relayResponse()}
     posts++;urls.push(url);
     if(posts===2)return relayResponse(404,new Uint8Array(),{version:1,code:701,name:'ResourceNotFound',message:'gone',details:{dispatch_phase:'pre_dispatch'}});
@@ -496,7 +504,7 @@ for(const explicit of [false,true]) test(`HTTP refusal follows on the next call 
 for(const code of [705,715])test(`HTTP pre-dispatch ${code} keeps its current target`,async()=>{
   let resolves=0,posts=0;
   const client=transport.createRelayAwareHttpEncodedTransport('http://localhost:8300',{fetch:async(url)=>{
-    if(url.includes('/_resolve/')){resolves++;return {status:200,async text(){return JSON.stringify([relayRoute()])}}}
+    if(url.includes('/_resolve/')){resolves++;return textReply(200,JSON.stringify([relayRoute()]))}
     if(url.includes('/_probe/'))return relayResponse();
     if(++posts===2)return relayResponse(503,new Uint8Array(),{version:1,code,name:code===715?'CallDeadlineExceeded':'ResourceOverloaded',message:'refused',details:{dispatch_phase:'pre_dispatch'}});
     return relayResponse();
@@ -511,7 +519,7 @@ for(const code of [705,715])test(`HTTP pre-dispatch ${code} keeps its current ta
 test('eight concurrent calls share one target acquisition',async()=>{
   const reached=deferred(), release=deferred();let resolves=0,posts=0;
   const client=transport.createRelayAwareHttpEncodedTransport('http://localhost:8300',{fetch:async(url)=>{
-    if(url.includes('/_resolve/')){resolves++;reached.resolve();await release.promise;return {status:200,async text(){return JSON.stringify([relayRoute()])}}}
+    if(url.includes('/_resolve/')){resolves++;reached.resolve();await release.promise;return textReply(200,JSON.stringify([relayRoute()]))}
     if(url.includes('/_probe/'))return relayResponse();posts++;return relayResponse();
   }});
   const calls=Array.from({length:8},()=>client.call('route',contract,'ping',()=>new Uint8Array()));
@@ -524,7 +532,7 @@ test('relay-local observes peer end before preparing with the old identity',asyn
   const observed=[];
   const client=transport.createRelayAwareHttpEncodedTransport('http://localhost:8300',{
     observe:x=>observed.push(x),
-    fetch:async(url)=>{assert.ok(url.includes('/_resolve/'));resolves++;return {status:200,async text(){return JSON.stringify([relayRoute(generation,true)])}}},
+    fetch:async(url)=>{assert.ok(url.includes('/_resolve/'));resolves++;return textReply(200,JSON.stringify([relayRoute(generation,true)]))},
     ipc:{connect:async(_address,_timeout,options)=>{
       connections++;const own=generation;const binding={serverId:`s${own}`,serverInstanceId:`i${own}`,connectionId:String(own)};
       return {async prepare(){preparations.push(own);return binding},
@@ -548,7 +556,7 @@ test('HTTP acquisition consumes the original call deadline before encoding',asyn
   const client=transport.createRelayAwareHttpEncodedTransport('http://localhost:8300',{callTimeoutMs:10,fetch:async(url,init)=>{
     if(init.method==='POST')posts++;
     if(url.includes('/_resolve/'))clock+=11;
-    return {status:200,async text(){return JSON.stringify([relayRoute()])},async arrayBuffer(){return new ArrayBuffer(0)}};
+    return textReply(200,JSON.stringify([relayRoute()]));
   }});
   try {
     await assert.rejects(client.call('route',contract,'ping',()=>{encoded++;return new Uint8Array()}),e=>e.code===715&&e.transportPhase==='pre_dispatch');
@@ -578,4 +586,54 @@ test('late response keeps its own dispatch identity after a newer response',asyn
   firstReleased.resolve();await old;
   assert.deepEqual(observations.map(o=>o.serverInstanceId),['actual-2','actual-1']);
   await client.close();
+});
+
+test('invalid UTF-8 inside HTTP JSON envelope never grants retrySafe or RouteConflict',async()=>{
+  const enc=new TextEncoder();
+  const buildCorruptEnvelope=(code,name,withPreDispatch)=>{
+    const prefix=enc.encode(`{"version":1,"code":${code},"name":"${name}","message":"bad `);
+    const suffix=enc.encode(withPreDispatch
+      ? ' byte","details":{"dispatch_phase":"pre_dispatch"}}'
+      : ' byte","details":{"route":"route"}}');
+    const out=new Uint8Array(prefix.length+1+suffix.length);
+    out.set(prefix,0);
+    out[prefix.length]=0xff;
+    out.set(suffix,prefix.length+1);
+    return out;
+  };
+
+  const postBytes=buildCorruptEnvelope(717,'CallCapacityExceeded',true);
+  const postClient=transport.createRelayAwareHttpEncodedTransport('http://localhost:8300',{
+    fetch:async(url,init)=>{
+      if(url.includes('/_resolve/'))return new Response(JSON.stringify([relayRoute()]),{status:200});
+      if(url.includes('/_probe/'))return new Response('',{status:200});
+      assert.equal(init.method,'POST');
+      return new Response(postBytes,{status:413});
+    },
+  });
+  try{
+    await assert.rejects(postClient.call('route',contract,'ping',()=>new Uint8Array()),err=>{
+      assert.ok(err instanceof transport.C2HttpRelayError);
+      assert.equal(err.status,413);
+      assert.equal(err.hasVerifiedUtf8Body,false);
+      assert.equal(err.transportPhase,undefined);
+      assert.equal(err.retrySafe,false);
+      return true;
+    });
+  }finally{await postClient.close()}
+
+  const conflictBytes=buildCorruptEnvelope(719,'RouteConflict',true);
+  const acqClient=transport.createRelayAwareHttpEncodedTransport('http://localhost:8300',{
+    fetch:async()=>new Response(conflictBytes,{status:409}),
+  });
+  try{
+    await assert.rejects(acqClient.call('route',contract,'ping',()=>new Uint8Array()),err=>{
+      assert.ok(err instanceof transport.C2HttpRelayError);
+      assert.equal(err instanceof transport.C2RouteConflictError,false);
+      assert.equal(err.hasVerifiedUtf8Body,false);
+      assert.equal(err.transportPhase,'pre_dispatch');
+      assert.equal(err.retrySafe,false);
+      return true;
+    });
+  }finally{await acqClient.close()}
 });

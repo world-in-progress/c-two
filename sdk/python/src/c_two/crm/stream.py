@@ -67,7 +67,6 @@ class Stream(Iterator[T], Generic[T]):
                       route_name='', method_name='', invalidator=None,
                       decoder_classifies=False):
         stream = cls.__new__(cls)
-        stream._native = native_stream
         stream._decoder = decoder
         stream._held = held
         stream._tracker = tracker
@@ -75,6 +74,7 @@ class Stream(Iterator[T], Generic[T]):
         stream._method_name = method_name
         stream._invalidator = invalidator
         stream._decoder_classifies = decoder_classifies
+        stream._native = native_stream
         return stream
 
     @classmethod
@@ -362,8 +362,6 @@ def _build_stream_wrapper(func, input_binding, output_binding):
         primary = None
         dispatched = False
         native = None
-        stream_obj = None
-        delivered = False
         try:
             if input_binding.kind is PayloadPlanKind.FASTDB:
                 try:
@@ -377,33 +375,44 @@ def _build_stream_wrapper(func, input_binding, output_binding):
                 raise _client_input_error(exc) from exc
             dispatched = True
             native = _native_call(prepared.stream, data)
-            stream_obj = Stream._from_encoded(
-                native, output_binding.deserialize, held=_c2_buffer == 'hold',
-                tracker=client.local_copy_tracker, route_name=client.route_name,
-                method_name=method_name, invalidator=output_binding.invalidate,
-            )
         except BaseException as exc:
             primary = exc
             raise
         finally:
             try:
                 _close_prepared_handle(prepared, primary, dispatched)
-                if primary is None:
-                    delivered = True
             except BaseException as close_exc:
-                stream_obj = None
-                if native is not None and not delivered:
+                if native is not None and primary is None:
                     try:
                         _cancel_unclaimed_stream(native, close_exc)
                     finally:
+                        native = None
                         close_exc = None
                 raise
             finally:
-                if native is not None and not delivered and primary is not None:
-                    stream_obj = None
-                    _cancel_unclaimed_stream(native, primary)
+                if native is not None and primary is not None:
+                    try:
+                        _cancel_unclaimed_stream(native, primary)
+                    finally:
+                        native = None
                 primary = None
-        return stream_obj
+        try:
+            return Stream._from_encoded(
+                native, output_binding.deserialize, held=_c2_buffer == 'hold',
+                tracker=client.local_copy_tracker, route_name=client.route_name,
+                method_name=method_name, invalidator=output_binding.invalidate,
+            )
+        except BaseException as wrap_exc:
+            clean = error._post_dispatch_cleanup_error(wrap_exc)
+            try:
+                _cancel_unclaimed_stream(native, clean)
+                if clean is not wrap_exc:
+                    raise clean from wrap_exc
+                raise
+            finally:
+                native = None
+                clean = None
+                wrap_exc = None
 
     invoke._input_payload_binding = input_binding
     invoke._output_payload_binding = output_binding

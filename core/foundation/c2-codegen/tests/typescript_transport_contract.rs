@@ -399,10 +399,14 @@ test('deadline during dispatch retains native call for later observation', async
 
 test('relay-aware canonical 701 POST is returned once and the next call resolves again', async () => {
   let resolves=0, posts=0;
-  const reply=(status,text,bytes=new Uint8Array())=>({
-    status, headers:{get(name){return name==='content-length'?String(bytes.length):null}},
-    async text(){return text}, async arrayBuffer(){return bytes.buffer},
-  });
+  const utf8=new TextEncoder();
+  const reply=(status,text,bytes)=>{
+    const raw=bytes??utf8.encode(text);
+    return {
+      status, headers:{get(name){return name==='content-length'?String(raw.byteLength):null}},
+      async arrayBuffer(){return raw.slice().buffer},
+    };
+  };
   const route=()=>({
     name:'route',relay_url:'http://localhost:8301',
     crm_ns:'test',crm_name:'Test',crm_ver:'0.1.0',abi_hash:hash,signature_hash:hash,
@@ -438,7 +442,7 @@ test('same-path fallback denial retains typed first native cause', async () => {
     crm_ns:'test',crm_name:'Test',crm_ver:'0.1.0',abi_hash:hash,signature_hash:hash,max_payload_size:100};
   const fetch=async (_url,init)=>{
     if(init.method==='POST') posts++;
-    return {status:200, async text(){return JSON.stringify([route])}, async arrayBuffer(){return new ArrayBuffer(0)}};
+    return {status:200, async arrayBuffer(){return new TextEncoder().encode(JSON.stringify([route])).buffer}};
   };
   const connect=async()=>({
     connectionSnapshot(){return null}, async prepare(){throw nativeFailure}, beginCall(){throw Error('unexpected dispatch')},
@@ -474,7 +478,7 @@ test('relay local trust and deadline failures never select another candidate', a
       crm_ns:'test',crm_name:'Test',crm_ver:'0.1.0',abi_hash:hash,signature_hash:hash,max_payload_size:100};
     const fetch=async (_url,init)=>{
       if(init.method==='POST') posts++; else resolves++;
-      return {status:200,async text(){return JSON.stringify(alternatives?[route,{...route,ipc_address:undefined,server_id:undefined,server_instance_id:undefined}]:[route])},async arrayBuffer(){return new ArrayBuffer(0)}};
+      return {status:200,async arrayBuffer(){return new TextEncoder().encode(JSON.stringify(alternatives?[route,{...route,ipc_address:undefined,server_id:undefined,server_instance_id:undefined}]:[route])).buffer}};
     };
     const endpoint={connectionSnapshot(){return null}, async prepare(){throw failure},beginCall(){throw Error('unexpected dispatch')},async close(){if(closeFails)throw cleanup},deactivate(){}};
     const transport=createRelayAwareHttpEncodedTransport('http://localhost:8300',{fetch,ipc:{connect:async()=>endpoint}});
@@ -490,7 +494,7 @@ test('relay-aware close zero does not wait for route resolution', async () => {
   const route={name:'route',relay_url:'http://localhost:8301',
     ipc_address:'ipc://local',server_id:'s',server_instance_id:'i',
     crm_ns:'test',crm_name:'Test',crm_ver:'0.1.0',abi_hash:hash,signature_hash:hash,max_payload_size:100};
-  const fetch=async()=>{await gate;return {status:200,async text(){return JSON.stringify([route])},async arrayBuffer(){return new ArrayBuffer(0)}}};
+  const fetch=async()=>{await gate;return {status:200,async arrayBuffer(){return new TextEncoder().encode(JSON.stringify([route])).buffer}}};
   const call={async chargeInput(){},async dispatch(){dispatched++;return nativeTarget},async next(){return null},cancel(){},
     async observe(){return {completed:true,error:null,completeItems:0n}},checkDeadline(){},close(){}};
   const endpoint={connectionSnapshot(){return null}, async prepare(){return {serverId:'s',serverInstanceId:'i',connectionId:1n}},

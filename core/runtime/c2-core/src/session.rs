@@ -1525,10 +1525,9 @@ impl Runtime {
         };
         let anchor = canonical_relay_anchor_address(&anchor);
         if !c2_http::valid_relay_url(&anchor) {
-            return Err(crate::normalize_http_error(
-                HttpError::InvalidInput("invalid HTTP relay base URL".into()),
-                crate::TransportPhase::PreDispatch,
-            ));
+            return Err(normalize_http_acquire_error(HttpError::InvalidInput(
+                "invalid HTTP relay base URL".into(),
+            )));
         }
         let settings = c2_config::ConfigResolver::resolve_relay_client(None, &catalog)
             .map_err(|error| LifecycleError::Configuration(error.to_string()))?;
@@ -2611,13 +2610,12 @@ impl Runtime {
             },
             self.client_domain_budget_with_deadline(deadline)?,
         )
-        .map_err(|error| crate::normalize_http_error(error, crate::TransportPhase::PreDispatch))?;
+        .map_err(normalize_http_acquire_error)?;
         let client = self.project_relay_client_context_with_deadline(client, true, deadline)?;
         match client
             .resolve_target_with_deadline(deadline)
-            .map_err(|error| {
-                crate::normalize_http_error(error, crate::TransportPhase::PreDispatch)
-            })? {
+            .map_err(normalize_http_acquire_error)?
+        {
             RelayResolvedTarget::Ipc { candidate } => {
                 let context = client
                     .local_ipc_context()
@@ -2641,9 +2639,8 @@ impl Runtime {
         connect_stage_check(deadline, "relay_acquire")?;
         match client
             .resolve_target_after_local_ipc_failures_with_deadline(failed_candidates, deadline)
-            .map_err(|error| {
-                crate::normalize_http_error(error, crate::TransportPhase::PreDispatch)
-            })? {
+            .map_err(normalize_http_acquire_error)?
+        {
             RelayResolvedTarget::Ipc { candidate } => {
                 let context = client
                     .local_ipc_context()
@@ -2677,15 +2674,14 @@ impl Runtime {
             },
             self.client_domain_budget_with_deadline(deadline)?,
         )
-        .map_err(|error| crate::normalize_http_error(error, crate::TransportPhase::PreDispatch))?;
+        .map_err(normalize_http_acquire_error)?;
         let client = self
             .project_relay_client_context_with_deadline(client, false, deadline)?
             .with_http_only();
         match client
             .resolve_http_target_with_deadline(deadline)
-            .map_err(|error| {
-                crate::normalize_http_error(error, crate::TransportPhase::PreDispatch)
-            })? {
+            .map_err(normalize_http_acquire_error)?
+        {
             RelayResolvedTarget::Http { .. } => Ok(client),
             RelayResolvedTarget::Ipc { .. } => unreachable!("HTTP relay connect returned IPC"),
         }
@@ -2746,9 +2742,8 @@ impl Runtime {
         let client = client.with_http_only();
         match client
             .resolve_http_target_with_deadline(deadline)
-            .map_err(|error| {
-                crate::normalize_http_error(error, crate::TransportPhase::PreDispatch)
-            })? {
+            .map_err(normalize_http_acquire_error)?
+        {
             RelayResolvedTarget::Http { .. } => Ok(RelayResolvedConnection::Http { client }),
             RelayResolvedTarget::Ipc { .. } => {
                 unreachable!("HTTP-only reconciliation returned IPC")
@@ -2898,6 +2893,23 @@ fn resolve_local_endpoint(
             .map_err(|error| LifecycleError::Configuration(error.to_string()))?;
     c2_config::ConfigResolver::resolve_local_endpoint(options, &catalog)
         .map_err(|error| LifecycleError::Configuration(error.to_string()))
+}
+
+fn normalize_http_acquire_error(error: HttpError) -> crate::Error {
+    let mut normalized = crate::normalize_http_error(error, crate::TransportPhase::PreDispatch);
+    if let crate::Error::Semantic(semantic) = &mut normalized {
+        if semantic
+            .details
+            .get("dispatch_phase")
+            .is_some_and(|phase| phase != "pre_dispatch")
+        {
+            semantic.details.remove("dispatch_phase");
+        }
+        semantic
+            .details
+            .insert("transport_phase".into(), "pre_dispatch".into());
+    }
+    normalized
 }
 
 #[cfg(test)]

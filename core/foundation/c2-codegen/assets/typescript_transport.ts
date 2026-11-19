@@ -163,7 +163,6 @@ export interface C2FetchResponse {
   readonly headers?: C2FetchHeaders;
   readonly body?: C2ReadableStream | null;
   arrayBuffer(): Promise<ArrayBufferLike>;
-  text(): Promise<string>;
 }
 
 export interface C2AbortSignal {
@@ -209,11 +208,39 @@ interface C2RelayRouteInfo {
   readonly signatureHash: string;
 }
 
+const C2_STRICT_UTF8_DECODER = new TextDecoder("utf-8", { fatal: true });
+const C2_LOSSY_UTF8_DECODER = new TextDecoder("utf-8");
+
+function decodeHttpErrorBody(raw: string | Uint8Array): { readonly body: string; readonly validUtf8: boolean } {
+  if (typeof raw === "string") {
+    return { body: raw, validUtf8: true };
+  }
+  try {
+    return { body: C2_STRICT_UTF8_DECODER.decode(raw), validUtf8: true };
+  } catch {
+    return { body: C2_LOSSY_UTF8_DECODER.decode(raw), validUtf8: false };
+  }
+}
+
 export class C2HttpRelayError extends Error {
-  constructor(readonly status: number, readonly body: string, readonly transportPhase?: "pre_dispatch" | "dispatch_uncertain") {
-    super(`C-Two HTTP relay call failed with status ${status}: ${body}`);
+  readonly status: number;
+  readonly body: string;
+  readonly transportPhase?: "pre_dispatch" | "dispatch_uncertain";
+  readonly #validUtf8: boolean;
+  constructor(status: number, body: string | Uint8Array, transportPhase?: "pre_dispatch" | "dispatch_uncertain") {
+    const decoded = decodeHttpErrorBody(body);
+    super(`C-Two HTTP relay call failed with status ${status}: ${decoded.body}`);
     this.name = "C2HttpRelayError";
     Object.setPrototypeOf(this, C2HttpRelayError.prototype);
+    this.status = status;
+    this.body = decoded.body;
+    if (transportPhase !== undefined) {
+      this.transportPhase = transportPhase;
+    }
+    this.#validUtf8 = decoded.validUtf8;
+  }
+  get hasVerifiedUtf8Body(): boolean {
+    return this.#validUtf8;
   }
   get retrySafe(): boolean {
     return isRetryableRouteError(this);
@@ -1173,11 +1200,6 @@ async function readHttpArrayBufferResponsePayload(response: C2FetchResponse): Pr
   return payload;
 }
 
-async function readHttpTextResponseBody(response: C2FetchResponse): Promise<string> {
-  responseContentLength(response);
-  return await response.text();
-}
-
 function responseContentLength(response: C2FetchResponse): number | undefined {
   const rawValue = response.headers?.get("content-length");
   if (rawValue === undefined || rawValue === null) {
@@ -1576,13 +1598,13 @@ async function probeResolvedHttpRoute(
     if (response.status === 200) {
       return;
     }
-    let body = "";
+    let bodyBytes: Uint8Array;
     try {
-      body = await readHttpTextResponseBody(response);
+      bodyBytes = await readHttpArrayBufferResponsePayload(response);
     } catch (error) {
       throw new C2HttpTransportError(`C-Two HTTP relay probe body read failed: ${String(error)}`);
     }
-    throw projectHttpAcquisitionError(response.status, body);
+    throw projectHttpAcquisitionError(response.status, bodyBytes);
   }, timeoutMs, "C-Two HTTP relay probe");
 }
 
@@ -1635,13 +1657,13 @@ async function callResolvedHttpRoute<Payload extends C2ResponsePayload>(
       }
       throw new C2CrmMethodError(errorPayload);
     }
-    let body = "";
+    let bodyBytes: Uint8Array;
     try {
-      body = await readHttpTextResponseBody(response);
+      bodyBytes = await readHttpArrayBufferResponsePayload(response);
     } catch (error) {
       throw new C2HttpTransportError(`C-Two HTTP relay call body read failed: ${String(error)}`);
     }
-    throw new C2HttpRelayError(response.status, body);
+    throw new C2HttpRelayError(response.status, bodyBytes);
   }, callTimeoutMs, "C-Two HTTP relay call", "dispatch_uncertain");
 }
 
@@ -1846,19 +1868,25 @@ async function resolveRelayRoutes(
       throw new C2HttpTransportError(`C-Two relay resolve fetch failed: ${String(error)}`);
     }
     if (response.status !== 200) {
-      let body = "";
+      let bodyBytes: Uint8Array;
       try {
-        body = await readHttpTextResponseBody(response);
+        bodyBytes = await readHttpArrayBufferResponsePayload(response);
       } catch (error) {
         throw new C2HttpTransportError(`C-Two relay resolve body read failed: ${String(error)}`);
       }
-      throw projectHttpAcquisitionError(response.status, body);
+      throw projectHttpAcquisitionError(response.status, bodyBytes);
+    }
+    let bodyBytes: Uint8Array;
+    try {
+      bodyBytes = await readHttpArrayBufferResponsePayload(response);
+    } catch (error) {
+      throw new C2HttpTransportError(`C-Two relay resolve body read failed: ${String(error)}`);
     }
     let body: string;
     try {
-      body = await readHttpTextResponseBody(response);
+      body = C2_STRICT_UTF8_DECODER.decode(bodyBytes);
     } catch (error) {
-      throw new C2HttpTransportError(`C-Two relay resolve body read failed: ${String(error)}`);
+      throw new C2HttpTransportError(`C-Two relay resolve returned invalid UTF-8: ${String(error)}`);
     }
     let payload: unknown;
     try {
@@ -1953,6 +1981,9 @@ function preDispatchRouteCode(error: unknown): number | undefined {
     return error.transportPhase === "pre_dispatch" ? error.code ?? undefined : undefined;
   }
   if (error instanceof C2HttpRelayError) {
+    if (!error.hasVerifiedUtf8Body) {
+      return undefined;
+    }
     const canonical = parseCanonicalRelayError(error.body);
     if (canonical !== undefined && (error.transportPhase === "pre_dispatch" || canonical.details.dispatch_phase === "pre_dispatch")) return canonical.code;
   }
@@ -2010,13 +2041,16 @@ function parseCanonicalRelayError(
   }
 }
 
-function projectHttpAcquisitionError(status: number, body: string): Error {
-  const canonical = parseCanonicalRelayError(body);
-  if (status === 409 && canonical?.code === 719 && canonical.name === "RouteConflict" &&
-      (canonical.details.dispatch_phase === undefined || canonical.details.dispatch_phase === "pre_dispatch")) {
-    return new C2RouteConflictError(canonical.message, canonical.details);
+function projectHttpAcquisitionError(status: number, rawBody: string | Uint8Array): Error {
+  const decoded = decodeHttpErrorBody(rawBody);
+  if (decoded.validUtf8) {
+    const canonical = parseCanonicalRelayError(decoded.body);
+    if (status === 409 && canonical?.code === 719 && canonical.name === "RouteConflict" &&
+        (canonical.details.dispatch_phase === undefined || canonical.details.dispatch_phase === "pre_dispatch")) {
+      return new C2RouteConflictError(canonical.message, canonical.details);
+    }
   }
-  return new C2HttpRelayError(status, body, "pre_dispatch");
+  return new C2HttpRelayError(status, rawBody, "pre_dispatch");
 }
 
 function requireRouteContractIdentity(contract: C2ContractIdentity): C2RouteContractIdentity {

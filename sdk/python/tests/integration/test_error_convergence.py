@@ -49,6 +49,7 @@ class _FakeNativeStream:
     def __init__(self, items):
         self._items = list(items)
         self.cancelled = False
+        self.cancel_calls = 0
 
     def next_item(self):
         if not self._items:
@@ -60,6 +61,7 @@ class _FakeNativeStream:
 
     def cancel(self):
         self.cancelled = True
+        self.cancel_calls += 1
 
     def close(self, timeout=None):
         return {'completed': True, 'error': None, 'complete_items': 0}
@@ -1289,12 +1291,13 @@ def test_held_memoryview_stream_and_undelivered_stream_cancel(tmp_path):
             # Both child memoryview and source memoryview are released so bytearray can resize.
             backing.append(0)
 
-            # Undelivered stream is cancelled when prepared.close() fails on both generated & CRM wrappers.
+            # Undelivered stream is cancelled exactly once when prepared.close() fails.
             fail_close['active'] = True
             with pytest.raises(ResourceClosed) as gen_close_err:
                 client.method_1_echo(req_payload)
             assert gen_close_err.value.transport_phase is None
             assert stream_holder['last'].cancelled is True
+            assert stream_holder['last'].cancel_calls == 1
 
             from c_two.crm.payload_plan import no_payload_binding, python_pickle_output_binding
             from c_two.crm.transferable import _build_transfer_wrapper
@@ -1324,8 +1327,229 @@ def test_held_memoryview_stream_and_undelivered_stream_cancel(tmp_path):
                 wrapped_crm_stream(CrmInstance())
             assert crm_close_err.value.transport_phase is None
             assert stream_holder['last'].cancelled is True
+            assert stream_holder['last'].cancel_calls == 1
         finally:
             reply_payload.close()
             req_payload.close()
     finally:
         sys.modules.pop(spec.name, None)
+
+
+class _EvilDetailsDict(dict):
+    def items(self):
+        raise RuntimeError('EvilDetailsDict.items must not run')
+
+    def __iter__(self):
+        raise RuntimeError('EvilDetailsDict.__iter__ must not run')
+
+    def __contains__(self, _key):
+        raise RuntimeError('EvilDetailsDict.__contains__ must not run')
+
+
+class _SlottedControlClosed(ResourceClosed):
+    __slots__ = ('details', '_transport_phase', 'custom')
+
+    def __init__(self, message: str, details: dict[str, str], custom: str):
+        super().__init__(message, details=details, transport_phase='pre_dispatch')
+        self.details = _EvilDetailsDict(details)
+        self.custom = custom
+
+
+class _DomainIOClosed(ResourceClosed, OSError):
+    __slots__ = ('custom_io',)
+
+    def __init__(self, message: str, details: dict[str, str]):
+        super().__init__(message, details=details, transport_phase='pre_dispatch')
+        self.errno = 5
+        self.strerror = 'Input/output error'
+        self.filename = 'grid.bin'
+        self.custom_io = 'io-slot'
+
+
+def test_slotted_control_fields_evil_dict_and_oserror_multiple_inheritance(tmp_path):
+    import copy
+    import pickle
+    from c_two import error as cc_err
+
+    slotted = _SlottedControlClosed(
+        'slotted closed',
+        {
+            'transport_phase': 'pre_dispatch',
+            'dispatch_phase': 'pre_dispatch',
+            'biz': 'kept',
+        },
+        'slot-tag',
+    )
+    assert slotted.transport_phase == 'pre_dispatch'
+
+    cleaned_post = cc_err._post_dispatch_cleanup_error(slotted)
+    assert isinstance(cleaned_post, _SlottedControlClosed)
+    assert cleaned_post is not slotted
+    assert cleaned_post.transport_phase is None
+    assert type(cleaned_post.details) is dict
+    assert cleaned_post.details == {'biz': 'kept'}
+    assert cleaned_post.custom == 'slot-tag'
+    assert slotted.transport_phase == 'pre_dispatch'
+
+    domain_io = _DomainIOClosed(
+        'disk gone',
+        {'dispatch_phase': 'pre_dispatch', 'biz': 'io-kept'},
+    )
+    copied_io = copy.copy(domain_io)
+    pickled_io = pickle.loads(pickle.dumps(domain_io))
+    for clone in (copied_io, pickled_io):
+        assert isinstance(clone, _DomainIOClosed)
+        assert clone.code == ErrorCode.ResourceClosed
+        assert clone.errno == 5
+        assert clone.filename == 'grid.bin'
+        assert clone.custom_io == 'io-slot'
+
+    executed = 0
+    current = {'err': slotted}
+
+    class Resource:
+        def echo(self, value):
+            nonlocal executed
+            executed += 1
+            raise current['err']
+
+        def steps(self, value):
+            yield self.echo(value)
+
+    runtime = cc.Runtime()
+    if sys.platform != 'win32':
+        runtime.set_local_endpoint(root=str(tmp_path))
+    runtime.register(CodecBoundary, Resource(), name='slot-and-io')
+    local = runtime.connect(CodecBoundary, name='slot-and-io')
+    ipc = runtime.connect(CodecBoundary, name='slot-and-io', address=runtime.server_address())
+    try:
+        with pytest.raises(_SlottedControlClosed) as local_slot:
+            local.echo(None)
+        assert executed == 1
+        assert local_slot.value is not slotted
+        assert local_slot.value.transport_phase is None
+        assert type(local_slot.value.details) is dict
+        assert local_slot.value.details == {'biz': 'kept'}
+        assert local_slot.value.custom == 'slot-tag'
+        assert slotted.transport_phase == 'pre_dispatch'
+
+        with pytest.raises(ResourceClosed) as ipc_slot:
+            ipc.echo(None)
+        assert executed == 2
+        assert ipc_slot.value.code == ErrorCode.ResourceClosed
+        assert ipc_slot.value.transport_phase is None
+        assert ipc_slot.value.details == {'biz': 'kept'}
+
+        current['err'] = domain_io
+        with pytest.raises(_DomainIOClosed) as local_io:
+            local.echo(None)
+        assert executed == 3
+        assert local_io.value is not domain_io
+        assert local_io.value.code == ErrorCode.ResourceClosed
+        assert local_io.value.errno == 5
+        assert local_io.value.filename == 'grid.bin'
+        assert local_io.value.custom_io == 'io-slot'
+        assert local_io.value.transport_phase is None
+        assert local_io.value.details == {'biz': 'io-kept'}
+        assert domain_io.transport_phase == 'pre_dispatch'
+
+        with pytest.raises(ResourceClosed) as ipc_io:
+            ipc.echo(None)
+        assert executed == 4
+        assert ipc_io.value.code == ErrorCode.ResourceClosed
+        assert ipc_io.value.transport_phase is None
+        assert ipc_io.value.details == {'biz': 'io-kept'}
+    finally:
+        cc.close(ipc)
+        cc.close(local)
+        runtime.shutdown()
+
+
+def test_http_probe_conflict_without_wire_phase_and_corrupt_utf8_on_acquire():
+    import json
+    import threading
+    from http.server import BaseHTTPRequestHandler
+    from c_two.crm.contract import crm_contract
+    from c_two.error import CoreError, ProtocolViolation, RouteConflict
+    from tests.fixtures.http_server import LoopbackHTTPServer
+
+    crm_ns, crm_name, crm_ver, abi_hash, signature_hash = crm_contract(CodecBoundary).native_args()
+    posts: list[str] = []
+    server_url_box: dict[str, str] = {}
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path.startswith('/_resolve/probe-conflict'):
+                body = json.dumps([{
+                    'name': 'probe-conflict',
+                    'relay_url': server_url_box['url'],
+                    'crm_ns': crm_ns,
+                    'crm_name': crm_name,
+                    'crm_ver': crm_ver,
+                    'abi_hash': abi_hash,
+                    'signature_hash': signature_hash,
+                    'max_payload_size': 1024,
+                }]).encode('utf-8')
+                self.send_response(200)
+            elif self.path.startswith('/_probe/probe-conflict'):
+                # Wire probe response intentionally omits dispatch_phase.
+                body = json.dumps({
+                    'version': 1,
+                    'code': 719,
+                    'name': 'RouteConflict',
+                    'message': 'concurrent registration conflict',
+                    'details': {'route': 'probe-conflict'},
+                }).encode('utf-8')
+                self.send_response(409)
+            elif self.path.startswith('/_resolve/corrupt-utf8'):
+                body = (
+                    b'{"version":1,"code":719,"name":"RouteConflict",'
+                    b'"message":"bad \xff byte","details":{"dispatch_phase":"pre_dispatch"}}'
+                )
+                self.send_response(409)
+            else:
+                body = b'{}'
+                self.send_response(404)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_POST(self):
+            posts.append(self.path)
+            self.send_response(500)
+            self.end_headers()
+
+        def log_message(self, *_args):
+            pass
+
+    server = LoopbackHTTPServer(('127.0.0.1', 0), Handler)
+    server.daemon_threads = False
+    server_url = f'http://127.0.0.1:{server.server_port}'
+    server_url_box['url'] = server_url
+    worker = threading.Thread(target=server.serve_forever)
+    worker.start()
+    runtime = cc.Runtime()
+    runtime.set_relay_anchor(server_url)
+    try:
+        for kwargs in ({'address': server_url}, {}):
+            with pytest.raises(RouteConflict) as conflict_err:
+                runtime.connect(CodecBoundary, name='probe-conflict', timeout=2.0, **kwargs)
+            assert conflict_err.value.code == ErrorCode.RouteConflict
+            assert conflict_err.value.transport_phase == 'pre_dispatch'
+            assert isinstance(conflict_err.value.__cause__, CoreError)
+            assert conflict_err.value.__cause__.transport_phase == 'pre_dispatch'
+
+            with pytest.raises(ProtocolViolation) as corrupt_err:
+                runtime.connect(CodecBoundary, name='corrupt-utf8', timeout=2.0, **kwargs)
+            assert corrupt_err.value.code == ErrorCode.ProtocolViolation
+            assert corrupt_err.value.transport_phase == 'pre_dispatch'
+            assert isinstance(corrupt_err.value.__cause__, CoreError)
+            assert corrupt_err.value.__cause__.transport_phase == 'pre_dispatch'
+        assert posts == []
+    finally:
+        runtime.shutdown()
+        server.shutdown()
+        server.server_close()
+        worker.join(2)
+        assert not worker.is_alive()

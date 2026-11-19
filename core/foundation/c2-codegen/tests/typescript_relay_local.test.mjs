@@ -31,12 +31,12 @@ function client(options = {}) {
     async fetch(url, init) {
       assert.equal(init.method,'GET','a local failure must not POST to the same endpoint');
       const route = decodeURIComponent(new URL(url).pathname.split('/').pop());
-      return {status:200, async text() {return JSON.stringify([{
+      return {status:200, async arrayBuffer() {return new TextEncoder().encode(JSON.stringify([{
         name:route,relay_url:'http://localhost:8300',
         ipc_address:'ipc://server',server_id:'s',server_instance_id:'i',
         crm_ns:contract.namespace,crm_name:contract.name,crm_ver:contract.version,
         abi_hash:hash,signature_hash:hash,max_payload_size:1024,
-      }])}};
+      }])).buffer}};
     },
     ipc:{async connect(_address,_timeout,nativeOptions) {
       const id = ++state.connections;

@@ -81,10 +81,10 @@ test('HTTP call and observation use route name and contract without a route UID'
     crm_ns:contract.namespace,crm_name:contract.name,crm_ver:contract.version,
     abi_hash:hash,signature_hash:hash,max_payload_size:100};
   const fetch = async (url, init) => {
-    if (url.includes('/_resolve/')) return {status:200,async text(){return JSON.stringify([route])}};
+    if (url.includes('/_resolve/')) return {status:200,async arrayBuffer(){return new TextEncoder().encode(JSON.stringify([route])).buffer}};
     if (url.includes('/_probe/')) {
       assert.equal(retiredHeader in init.headers, false);
-      return {status:200,async text(){return ''}};
+      return {status:200,async arrayBuffer(){return new ArrayBuffer(0)}};
     }
     assert.equal(init.method, 'POST');
     assert.equal(retiredHeader in init.headers, false);

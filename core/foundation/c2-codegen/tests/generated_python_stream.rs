@@ -177,12 +177,13 @@ events.clear()
 items = client.method_1_echo(Payload())
 assert [item.data for item in items] == [b'first', b'second']
 assert events[:5] == [('begin', 'echo'), 'size', ('charge', 5), 'digest', 'encode'], events
-assert events[5:8] == [
+assert events[5:9] == [
     ('stream', b'input'),
+    'close',
     ('wrap', False, Bound.local_copy_tracker, 'generated-stream', 'echo', True),
     ('decode', b'first'),
 ], events
-assert events[-1] == 'close', events
+assert events.count('close') == 1, events
 events.clear()
 held = client.hold_method_1_echo(Payload())
 assert [item.value.data for item in held] == [b'first', b'second']
@@ -222,14 +223,30 @@ except CCBaseError as error:
 else:
     raise AssertionError('stream failure was replaced')
 
+class CancelCountingNative(list):
+    def __init__(self, items):
+        super().__init__(items)
+        self.cancel_calls = 0
+    def cancel(self):
+        self.cancel_calls += 1
+
+last_unclaimed = None
 class ClosingPrepared(Prepared):
+    def stream(self, data):
+        global last_unclaimed
+        events.append(('stream', data))
+        last_unclaimed = CancelCountingNative([b'first', b'second'])
+        return last_unclaimed
     def close(self):
         raise RuntimeError('close failed')
+events.clear()
 bound.begin_stream = lambda method: ClosingPrepared()
 try:
     contract.ContractClient(bound).method_1_echo(Payload())
 except RuntimeError as error:
     assert str(error) == 'close failed'
+    assert last_unclaimed is not None and last_unclaimed.cancel_calls == 1
+    assert not any(isinstance(ev, tuple) and ev[0] == 'wrap' for ev in events), events
 else:
     raise AssertionError('close failure disappeared')
 try:

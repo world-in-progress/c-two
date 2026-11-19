@@ -339,14 +339,7 @@ impl RelayControlClient {
                 .json::<Vec<RelayRouteInfo>>()
                 .await
                 .map_err(|e| HttpError::Transport(e.to_string()))?,
-            404 => {
-                let text = resp.text().await.unwrap_or_default();
-                return Err(HttpError::ServerError(404, text));
-            }
-            code => {
-                let text = resp.text().await.unwrap_or_default();
-                return Err(HttpError::ServerError(code, text));
-            }
+            code => return Err(read_strict_control_error(code, resp).await),
         };
         Ok(RelayResolvedRoutes {
             routes,
@@ -416,8 +409,20 @@ impl RelayControlClient {
         if success_codes.contains(&status) {
             return Ok(());
         }
-        let text = resp.text().await.unwrap_or_default();
-        Err(HttpError::ServerError(status, text))
+        Err(read_strict_control_error(status, resp).await)
+    }
+}
+
+async fn read_strict_control_error(status: u16, resp: reqwest::Response) -> HttpError {
+    let bytes = match resp.bytes().await {
+        Ok(bytes) => bytes,
+        Err(error) => return HttpError::Request(error),
+    };
+    match String::from_utf8(bytes.to_vec()) {
+        Ok(text) => HttpError::ServerError(status, text),
+        Err(error) => {
+            HttpError::ServerError(status, format!("invalid UTF-8 HTTP error body: {error}"))
+        }
     }
 }
 
@@ -648,5 +653,75 @@ mod tests {
             }
             other => panic!("unexpected error: {other}"),
         }
+    }
+
+    #[cfg(feature = "relay")]
+    #[tokio::test]
+    async fn non_utf8_control_error_body_is_not_lossily_repaired_into_json() {
+        use axum::{
+            Router,
+            http::StatusCode,
+            routing::{get, post},
+        };
+
+        let corrupt = b"{\"version\":1,\"code\":719,\"name\":\"RouteConflict\",\"message\":\"bad \xff byte\",\"details\":{\"dispatch_phase\":\"pre_dispatch\"}}".to_vec();
+        let corrupt_get = corrupt.clone();
+        let corrupt_post = corrupt;
+        let app = Router::new()
+            .route(
+                "/_resolve/{*name}",
+                get(move || {
+                    let body = corrupt_get.clone();
+                    async move { (StatusCode::CONFLICT, body) }
+                }),
+            )
+            .route(
+                "/_register",
+                post(move || {
+                    let body = corrupt_post.clone();
+                    async move { (StatusCode::CONFLICT, body) }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let client = RelayControlClient::new(&format!("http://{addr}"), false).unwrap();
+        let resolve_err = client
+            .resolve_matching_async(&expected_contract())
+            .await
+            .unwrap_err();
+        match resolve_err {
+            HttpError::ServerError(409, body) => {
+                assert!(
+                    body.starts_with("invalid UTF-8 HTTP error body:"),
+                    "unexpected resolve error body: {body}"
+                );
+                assert!(
+                    serde_json::from_str::<c2_error::C2ErrorEnvelope>(&body).is_err(),
+                    "corrupt UTF-8 body must never parse as a canonical envelope: {body}"
+                );
+            }
+            other => panic!("unexpected resolve error: {other}"),
+        }
+
+        let post_err = client
+            .post_json_once("/_register", &serde_json::json!({"name": "r"}), &[200])
+            .await
+            .unwrap_err();
+        match post_err {
+            HttpError::ServerError(409, body) => {
+                assert!(
+                    body.starts_with("invalid UTF-8 HTTP error body:"),
+                    "unexpected post error body: {body}"
+                );
+                assert!(serde_json::from_str::<c2_error::C2ErrorEnvelope>(&body).is_err());
+            }
+            other => panic!("unexpected post error: {other}"),
+        }
+
+        server.abort();
     }
 }

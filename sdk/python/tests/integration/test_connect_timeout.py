@@ -71,7 +71,11 @@ def stalled_relay():
             body = json.dumps({
                 'version': 1, 'code': 701, 'name': 'ResourceNotFound',
                 'message': 'route not found: connect-timeout',
-                'details': {'transport_phase': 'application_detail', 'route_name': 'connect-timeout'},
+                'details': {
+                    'transport_phase': 'application_detail',
+                    'custom_detail': 'preserved',
+                    'route_name': 'connect-timeout',
+                },
             }).encode()
             self.send_response(404)
             self.send_header('Content-Type', 'application/json')
@@ -147,12 +151,12 @@ def test_stalled_relay_connect_budget_and_recovery(mode, stalled_relay):
         assert isinstance(projected, cc.error.ResourceNotFound)
         assert projected.message == 'route not found: connect-timeout'
         assert projected.details['route_name'] == 'connect-timeout'
-        # The phase authority ignores the peer's non-canonical detail: neither
-        # the native CoreError nor its projection reports a transport phase,
-        # and the arbitrary application detail survives untouched.
-        assert native.transport_phase is None
-        assert projected.transport_phase is None
-        assert projected.details['transport_phase'] == 'application_detail'
+        # Local acquisition facts take precedence over bogus peer phase keys,
+        # while arbitrary peer diagnostic details survive untouched.
+        assert native.transport_phase == 'pre_dispatch'
+        assert projected.transport_phase == 'pre_dispatch'
+        assert projected.details['transport_phase'] == 'pre_dispatch'
+        assert projected.details['custom_detail'] == 'preserved'
         assert len(paths) > previous_requests
     finally:
         release.set()
