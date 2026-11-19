@@ -151,6 +151,7 @@ export interface C2FetchHeaders {
 
 export interface C2ReadableStreamReader {
   read(): Promise<{ done: boolean; value?: C2ByteArray }>;
+  cancel?(reason?: unknown): Promise<unknown> | void;
   releaseLock?(): void;
 }
 
@@ -232,6 +233,12 @@ function resolveHttpCallRelayErrorPhase(
   }
   const canonical = parseCanonicalRelayError(decoded.body);
   if (canonical === undefined || canonical.code === 0) {
+    return "dispatch_uncertain";
+  }
+  if (canonical.details.dispatch_phase !== undefined && canonical.details.dispatch_phase !== "pre_dispatch") {
+    return "dispatch_uncertain";
+  }
+  if (canonical.details.transport_phase !== undefined && canonical.details.transport_phase !== "pre_dispatch") {
     return "dispatch_uncertain";
   }
   if ((status === 404 && canonical.code === 701) || canonical.details.dispatch_phase === "pre_dispatch") {
@@ -1224,26 +1231,47 @@ async function readHttpArrayBufferResponsePayload(response: C2FetchResponse): Pr
   return payload;
 }
 
+async function cancelStreamReaderQuietly(reader: C2ReadableStreamReader | undefined, reason: unknown): Promise<void> {
+  if (reader === undefined || typeof reader.cancel !== "function") {
+    return;
+  }
+  try {
+    await reader.cancel(reason);
+  } catch {
+    // Preserve the primary protocol or size error.
+  }
+}
+
 async function readBoundedStreamBytes(body: C2ReadableStream, maxBytes: number): Promise<Uint8Array> {
   const chunks: Uint8Array[] = [];
   let byteLength = 0;
-  const reader = body.getReader();
+  let reader: C2ReadableStreamReader | undefined;
   try {
+    reader = body.getReader();
     while (true) {
       const chunk = await reader.read();
       if (chunk.done) {
         break;
       }
-      if (chunk.value === undefined || chunk.value.byteLength === 0) {
+      if (chunk.value === undefined) {
+        continue;
+      }
+      if (!(chunk.value instanceof Uint8Array)) {
+        throw new Error("C-Two HTTP relay response stream chunk must be a Uint8Array.");
+      }
+      if (chunk.value.byteLength === 0) {
         continue;
       }
       const nextByteLength = byteLength + chunk.value.byteLength;
       if (!Number.isSafeInteger(nextByteLength) || nextByteLength > maxBytes) {
         throw new Error(`C-Two HTTP relay response body must be no greater than ${maxBytes} bytes.`);
       }
-      chunks.push(chunk.value.slice());
+      chunks.push(new Uint8Array(chunk.value));
       byteLength = nextByteLength;
     }
+  } catch (error) {
+    await cancelStreamReaderQuietly(reader, error);
+    throw error;
   } finally {
     reader?.releaseLock?.();
   }
@@ -1308,6 +1336,7 @@ async function readAllocatedResponsePayload<Payload extends C2ResponsePayload>(b
     }
     return allocated.payload;
   } catch (error) {
+    await cancelStreamReaderQuietly(reader, error);
     tryReleaseAllocatedResponsePayload(allocated);
     throw error;
   } finally {
@@ -1320,7 +1349,7 @@ async function readUnknownLengthAllocatedResponsePayload<Payload extends C2Respo
   allocator: C2ResponsePayloadAllocator<Payload>,
   maxBytes: number,
 ): Promise<Payload> {
-  const chunks: C2ByteArray[] = [];
+  const chunks: Uint8Array[] = [];
   let byteLength = 0;
   let reader: C2ReadableStreamReader | undefined;
   try {
@@ -1340,9 +1369,12 @@ async function readUnknownLengthAllocatedResponsePayload<Payload extends C2Respo
       if (nextByteLength > maxBytes) {
         throw new Error(`C-Two HTTP relay unknown-length response exceeded responsePayloadUnknownLengthMaxBytes (${maxBytes}).`);
       }
-      chunks.push(chunk.value.slice());
+      chunks.push(new Uint8Array(chunk.value));
       byteLength = nextByteLength;
     }
+  } catch (error) {
+    await cancelStreamReaderQuietly(reader, error);
+    throw error;
   } finally {
     reader?.releaseLock?.();
   }
@@ -2084,37 +2116,144 @@ function httpConnectFailure(error: unknown): boolean {
   return httpConnectFailure(cause.cause);
 }
 
-const C2_ERROR_CODE_NAMES: Readonly<Record<number, string>> = Object.freeze({
-  0: "Unknown",
-  1: "ResourceInputDeserializing",
-  2: "ResourceOutputSerializing",
-  3: "ResourceFunctionExecuting",
-  4: "ResourceInputFromBuffer",
-  5: "ClientInputSerializing",
-  6: "ClientOutputDeserializing",
-  7: "ClientCallingResource",
-  8: "ClientOutputFromBuffer",
-  701: "ResourceNotFound",
-  702: "ResourceUnavailable",
-  703: "ResourceAlreadyRegistered",
-  705: "RegistryUnavailable",
-  707: "ResourceClosed",
-  708: "ResourceRemoved",
-  709: "ContractMismatch",
-  710: "IdentityMismatch",
-  712: "RouteWatchUnavailable",
-  713: "ProtocolViolation",
-  714: "FallbackDenied",
-  715: "CallDeadlineExceeded",
-  716: "UnsupportedCallMode",
-  717: "CallCapacityExceeded",
-  718: "CallCancelled",
-  719: "RouteConflict",
-});
+const C2_ERROR_CODE_NAMES: Readonly<Record<number, string>> = /* __C2_GENERATED_ERROR_CODE_NAMES__ */ Object.freeze({});
+
+function hasCanonicalEnvelopeTokens(body: string): boolean {
+  let index = 0;
+  const length = body.length;
+  const skipWs = (): void => {
+    while (index < length) {
+      const ch = body.charCodeAt(index);
+      if (ch !== 0x20 && ch !== 0x09 && ch !== 0x0a && ch !== 0x0d) break;
+      index += 1;
+    }
+  };
+  const readJsonString = (): string | undefined => {
+    if (index >= length || body.charCodeAt(index) !== 0x22) return undefined;
+    const contentStart = index + 1;
+    index = contentStart;
+    let decoded = "";
+    let chunkStart = contentStart;
+    while (index < length) {
+      const ch = body.charCodeAt(index);
+      if (ch < 0x20) return undefined;
+      if (ch === 0x22) {
+        const result = chunkStart === contentStart
+          ? body.slice(contentStart, index)
+          : decoded + body.slice(chunkStart, index);
+        index += 1;
+        return result;
+      }
+      if (ch === 0x5c) {
+        decoded += body.slice(chunkStart, index);
+        index += 1;
+        if (index >= length) return undefined;
+        const esc = body.charCodeAt(index);
+        index += 1;
+        switch (esc) {
+          case 0x22: decoded += "\""; break;
+          case 0x5c: decoded += "\\"; break;
+          case 0x2f: decoded += "/"; break;
+          case 0x62: decoded += "\b"; break;
+          case 0x66: decoded += "\f"; break;
+          case 0x6e: decoded += "\n"; break;
+          case 0x72: decoded += "\r"; break;
+          case 0x74: decoded += "\t"; break;
+          case 0x75: {
+            if (index + 4 > length) return undefined;
+            const hex = body.slice(index, index + 4);
+            if (!/^[0-9a-fA-F]{4}$/.test(hex)) return undefined;
+            decoded += String.fromCharCode(parseInt(hex, 16));
+            index += 4;
+            break;
+          }
+          default:
+            return undefined;
+        }
+        chunkStart = index;
+        continue;
+      }
+      index += 1;
+    }
+    return undefined;
+  };
+  const skipJsonValue = (): string | undefined => {
+    skipWs();
+    if (index >= length) return undefined;
+    const start = index;
+    const first = body.charCodeAt(index);
+    if (first === 0x22) {
+      return readJsonString() === undefined ? undefined : body.slice(start, index);
+    }
+    if (first === 0x7b || first === 0x5b) {
+      let depth = 0;
+      while (index < length) {
+        const ch = body.charCodeAt(index);
+        if (ch === 0x22) {
+          if (readJsonString() === undefined) return undefined;
+          continue;
+        }
+        if (ch === 0x7b || ch === 0x5b) depth += 1;
+        else if (ch === 0x7d || ch === 0x5d) {
+          depth -= 1;
+          index += 1;
+          if (depth === 0) return body.slice(start, index);
+          continue;
+        }
+        index += 1;
+      }
+      return undefined;
+    }
+    while (index < length) {
+      const ch = body.charCodeAt(index);
+      if (ch === 0x2c || ch === 0x7d || ch === 0x5d || ch === 0x20 || ch === 0x09 || ch === 0x0a || ch === 0x0d) {
+        break;
+      }
+      index += 1;
+    }
+    return index > start ? body.slice(start, index) : undefined;
+  };
+  skipWs();
+  if (index >= length || body.charCodeAt(index) !== 0x7b) return false;
+  index += 1;
+  const requiredKeys = new Set(["version", "code", "name", "message", "details"]);
+  const seenRequired = new Set<string>();
+  while (index < length) {
+    skipWs();
+    if (index < length && body.charCodeAt(index) === 0x7d) {
+      index += 1;
+      skipWs();
+      return index === length && seenRequired.size === requiredKeys.size;
+    }
+    const key = readJsonString();
+    if (key === undefined) return false;
+    skipWs();
+    if (index >= length || body.charCodeAt(index) !== 0x3a) return false;
+    index += 1;
+    const rawToken = skipJsonValue();
+    if (rawToken === undefined) return false;
+    if (requiredKeys.has(key)) {
+      if (seenRequired.has(key)) return false;
+      if ((key === "version" || key === "code") && !/^(?:0|[1-9][0-9]*)$/.test(rawToken)) {
+        return false;
+      }
+      seenRequired.add(key);
+    }
+    skipWs();
+    if (index < length && body.charCodeAt(index) === 0x2c) {
+      index += 1;
+      continue;
+    }
+  }
+  return false;
+}
 
 function parseCanonicalRelayError(
   body: string,
 ): { readonly version: 1; readonly code: number; readonly name: string; readonly message: string; readonly details: Readonly<Record<string, string>> } | undefined {
+  if (!hasCanonicalEnvelopeTokens(body)) {
+    return undefined;
+  }
   try {
     const parsed = JSON.parse(body) as unknown;
     if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {

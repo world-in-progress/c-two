@@ -187,7 +187,7 @@ fn parse_control_semantic_error(body: &str) -> Option<c2_error::C2Error> {
         return Some(crate::error::semantic_error_from_http_envelope(envelope));
     }
     let trimmed = body.trim_start();
-    if !trimmed.starts_with('{') {
+    if !trimmed.starts_with('{') && !trimmed.starts_with('[') {
         // Plain-text control responses keep semantic_error = None.
         return None;
     }

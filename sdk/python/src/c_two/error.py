@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from enum import IntEnum, unique
+from pathlib import PosixPath, PurePosixPath, PureWindowsPath, WindowsPath
 from types import GetSetDescriptorType, MemberDescriptorType
 from typing import Literal
 
@@ -86,10 +87,24 @@ class CCBaseError(Exception):
             state['details'] = dict(state['details'])
         if '__notes__' in state and isinstance(state['__notes__'], list):
             state['__notes__'] = state['__notes__'].copy()
-        slots = {}
+        slots = _extract_oserror_slots(self) if isinstance(self, OSError) else {}
         for base in cls.__mro__:
             if base is BaseException or base is object:
                 break
+            if base is OSError:
+                # OSError C member pointers (NULL vs explicit None) are captured
+                # above; still collect OSError getset descriptors such as characters_written.
+                for name, member in vars(base).items():
+                    if name in _SKIPPED_EXCEPTION_DESCRIPTORS or name in slots:
+                        continue
+                    if isinstance(member, GetSetDescriptorType):
+                        try:
+                            slot_val = member.__get__(self, cls)
+                        except (AttributeError, ValueError):
+                            continue
+                        if slot_val is not None:
+                            slots[name] = slot_val
+                continue
             is_builtin = base.__module__ == 'builtins'
             for name, member in vars(base).items():
                 if name in _SKIPPED_EXCEPTION_DESCRIPTORS or name in slots:
@@ -635,6 +650,92 @@ def _details_need_cleanup(raw_details: object) -> bool:
     return isinstance(raw_details, Mapping)
 
 
+_OSERROR_MEMBER_NAMES: tuple[str, ...] = (
+    ('errno', 'strerror', 'filename', 'filename2', 'winerror')
+    if hasattr(OSError, 'winerror')
+    else ('errno', 'strerror', 'filename', 'filename2')
+)
+_SAFE_OSERROR_SCALAR_TYPES: tuple[type, ...] = (
+    int,
+    float,
+    bool,
+    str,
+    bytes,
+    bytearray,
+    type(None),
+    ErrorCode,
+    PurePosixPath,
+    PureWindowsPath,
+    PosixPath,
+    WindowsPath,
+)
+
+
+def _is_safe_oserror_value(val: object, depth: int = 0) -> bool:
+    cls = type(val)
+    if cls in _SAFE_OSERROR_SCALAR_TYPES:
+        return True
+    if depth >= 4:
+        return False
+    if cls in (tuple, list, set, frozenset):
+        return all(_is_safe_oserror_value(item, depth + 1) for item in val)  # type: ignore[attr-defined]
+    if cls is dict:
+        return all(
+            _is_safe_oserror_value(k, depth + 1) and _is_safe_oserror_value(v, depth + 1)
+            for k, v in dict.items(val)
+        )
+    return False
+
+
+def _extract_oserror_slots(exc: OSError) -> dict[str, object]:
+    """Preserve C ``PyOSErrorObject`` ``NULL`` vs explicit ``None`` fields."""
+    cls = type(exc)
+    vals: dict[str, object] = {}
+    for field in _OSERROR_MEMBER_NAMES:
+        try:
+            vals[field] = getattr(OSError, field).__get__(exc, cls)
+        except AttributeError:
+            continue
+    out = {field: val for field, val in vals.items() if val is not None}
+    if not any(val is None for val in vals.values()):
+        return out
+    raw_args = BaseException.args.__get__(exc, cls)
+    if len(raw_args) == 2:
+        try:
+            reduced = OSError.__reduce__(exc)
+        except BaseException:
+            reduced = ()
+        if isinstance(reduced, tuple) and len(reduced) >= 2 and isinstance(reduced[1], tuple):
+            rargs = reduced[1]
+            if len(rargs) >= 3:
+                out['filename'] = rargs[2]
+                if len(rargs) >= 5:
+                    out['filename2'] = rargs[4]
+    if not all(_is_safe_oserror_value(val) for val in vals.values()):
+        return out
+    args_are_safe = all(_is_safe_oserror_value(arg) for arg in raw_args)
+    if 'filename' not in out and not args_are_safe:
+        return out
+    safe_args = raw_args if args_are_safe else ()
+    actual_str = OSError.__str__(exc)
+    core_fields = [f for f in ('errno', 'strerror', 'filename', 'filename2') if f in vals]
+    for mask in range(1 << len(core_fields)):
+        candidate = dict(out)
+        for idx, field in enumerate(core_fields):
+            if vals[field] is None and (mask & (1 << idx)):
+                candidate[field] = None
+        probe = OSError.__new__(OSError)
+        BaseException.args.__set__(probe, safe_args)
+        for key, val in candidate.items():
+            try:
+                getattr(OSError, key).__set__(probe, val)
+            except (AttributeError, TypeError, ValueError):
+                continue
+        if OSError.__str__(probe) == actual_str:
+            return candidate
+    return out
+
+
 def _clone_exception_without_user_hooks(exc: CCBaseError) -> CCBaseError:
     """Allocate a fresh exception copy without invoking subclass hooks.
 
@@ -657,9 +758,30 @@ def _clone_exception_without_user_hooks(exc: CCBaseError) -> CCBaseError:
     raw_notes = dst_dict.get('__notes__')
     if isinstance(raw_notes, list):
         dst_dict['__notes__'] = raw_notes.copy()
+    if isinstance(exc, OSError):
+        for key, val in _extract_oserror_slots(exc).items():
+            try:
+                getattr(OSError, key).__set__(copied, val)
+            except (AttributeError, TypeError, ValueError):
+                continue
     for base in cls.__mro__:
         if base is BaseException or base is object:
             break
+        if base is OSError:
+            for name, member in vars(base).items():
+                if name in _SKIPPED_EXCEPTION_DESCRIPTORS:
+                    continue
+                if isinstance(member, GetSetDescriptorType):
+                    try:
+                        slot_val = member.__get__(exc, cls)
+                    except (AttributeError, ValueError):
+                        continue
+                    if slot_val is not None:
+                        try:
+                            member.__set__(copied, slot_val)
+                        except (AttributeError, TypeError, ValueError):
+                            continue
+            continue
         is_builtin = base.__module__ == 'builtins'
         for name, member in vars(base).items():
             if name in _SKIPPED_EXCEPTION_DESCRIPTORS:

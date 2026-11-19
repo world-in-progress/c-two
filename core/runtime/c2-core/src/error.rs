@@ -472,26 +472,26 @@ fn normalize_http_call_semantic_bytes(bytes: &[u8], status: u16, phase: Transpor
         Ok(mut semantic) => {
             if status == 500 {
                 clear_resource_failure_phase(&mut semantic);
-            } else if phase == TransportPhase::DispatchUncertain
-                || semantic
-                    .details
-                    .get("dispatch_phase")
-                    .is_some_and(|phase| phase == "dispatch_uncertain")
-            {
-                semantic
-                    .details
-                    .insert("transport_phase".into(), "dispatch_uncertain".into());
             } else if phase == TransportPhase::PreDispatch
                 && semantic.code != ErrorCode::Unknown
                 && semantic
                     .details
                     .get("dispatch_phase")
-                    .is_some_and(|phase| phase == "pre_dispatch")
+                    .is_none_or(|phase| phase == "pre_dispatch")
+                && semantic
+                    .details
+                    .get("transport_phase")
+                    .is_none_or(|phase| phase == "pre_dispatch")
+                && ((status == 404 && semantic.code == ErrorCode::ResourceNotFound)
+                    || semantic
+                        .details
+                        .get("dispatch_phase")
+                        .is_some_and(|phase| phase == "pre_dispatch"))
             {
                 semantic
                     .details
                     .insert("transport_phase".into(), "pre_dispatch".into());
-            } else if semantic.code == ErrorCode::Unknown {
+            } else {
                 semantic
                     .details
                     .insert("transport_phase".into(), "dispatch_uncertain".into());

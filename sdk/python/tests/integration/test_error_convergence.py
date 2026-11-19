@@ -1710,6 +1710,8 @@ def test_register_409_namespace_mismatch_and_malformed_envelopes_never_fake_dupl
                 }).encode('utf-8')
             elif mode['kind'] == 'truncated_json':
                 body = b'{"version":1,"code":703'
+            elif mode['kind'] == 'json_array':
+                body = json.dumps([1, 703, 'ResourceAlreadyRegistered', 'array dup', {}]).encode('utf-8')
             else:
                 body = b'{"version":1,"code":719,"name":"RouteConflict","message":"bad \xff byte","details":{}}'
             self.send_response(409)
@@ -1752,8 +1754,8 @@ def test_register_409_namespace_mismatch_and_malformed_envelopes_never_fake_dupl
         assert ns_err.value.rollback is not None
         assert ns_err.value.rollback['closed_reason'] == 'registration_rollback'
 
-        # 2. Truncated JSON envelope and corrupt UTF-8 409 both project ProtocolViolation(713).
-        for kind in ('truncated_json', 'corrupt_utf8'):
+        # 2. Truncated JSON, JSON array, and corrupt UTF-8 409 all project ProtocolViolation(713).
+        for kind in ('truncated_json', 'json_array', 'corrupt_utf8'):
             mode['kind'] = kind
             with pytest.raises(ProtocolViolation) as bad_err:
                 reg_runtime.register(CodecBoundary, Resource(), name=f'bad-{kind}')
@@ -1764,6 +1766,160 @@ def test_register_409_namespace_mismatch_and_malformed_envelopes_never_fake_dupl
             assert bad_err.value.__cause__.rollback is not None
     finally:
         reg_runtime.shutdown()
+        server.shutdown()
+        server.server_close()
+        worker.join(2)
+        assert not worker.is_alive()
+
+
+def test_http_call_404_701_contradiction_409_719_reacquire_and_array_float_envelopes():
+    """HTTP business calls align phase and re-acquisition across 404/701, 409/719, arrays and floats."""
+    import json
+    import pickle
+    import threading
+    from http.server import BaseHTTPRequestHandler
+    from c_two.crm.contract import crm_contract
+    from c_two.error import ProtocolViolation, ResourceNotFound, RouteConflict
+    from tests.fixtures.http_server import LoopbackHTTPServer
+
+    crm_ns, crm_name, crm_ver, abi_hash, signature_hash = crm_contract(CodecBoundary).native_args()
+    state = {
+        'resolves': 0,
+        'probes': 0,
+        'posts': 0,
+        'first_post': (404, b'{}'),
+    }
+
+    class CallRelay(BaseHTTPRequestHandler):
+        def do_GET(self):
+            if '/_resolve/' in self.path:
+                state['resolves'] += 1
+                body = json.dumps([{
+                    'name': 'route',
+                    'relay_url': f'http://127.0.0.1:{self.server.server_port}',
+                    'crm_ns': crm_ns,
+                    'crm_name': crm_name,
+                    'crm_ver': crm_ver,
+                    'abi_hash': abi_hash,
+                    'signature_hash': signature_hash,
+                    'max_payload_size': 65536,
+                }]).encode('utf-8')
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json')
+                self.send_header('Content-Length', str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            if '/_probe/' in self.path:
+                state['probes'] += 1
+                self.send_response(200)
+                self.send_header('Content-Length', '0')
+                self.end_headers()
+                return
+            self.send_response(404)
+            self.end_headers()
+
+        def do_POST(self):
+            _ = self.rfile.read(int(self.headers.get('Content-Length', '0')))
+            state['posts'] += 1
+            if state['posts'] == 1:
+                status, body = state['first_post']
+                self.send_response(status)
+                self.send_header('Content-Type', 'application/json')
+                self.send_header('Content-Length', str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            reply = pickle.dumps('ok')
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/octet-stream')
+            self.send_header('Content-Length', str(len(reply)))
+            self.end_headers()
+            self.wfile.write(reply)
+
+        def log_message(self, *_args):
+            pass
+
+    server = LoopbackHTTPServer(('127.0.0.1', 0), CallRelay)
+    server.daemon_threads = False
+    worker = threading.Thread(target=server.serve_forever)
+    worker.start()
+    try:
+        for status, body_bytes, expected_cls, expected_phase, expected_resolves in (
+            (
+                404,
+                json.dumps({
+                    'version': 1,
+                    'code': 701,
+                    'name': 'ResourceNotFound',
+                    'message': 'missing',
+                    'details': {},
+                }).encode('utf-8'),
+                ResourceNotFound,
+                'pre_dispatch',
+                2,
+            ),
+            (
+                404,
+                json.dumps({
+                    'version': 1,
+                    'code': 701,
+                    'name': 'ResourceNotFound',
+                    'message': 'missing',
+                    'details': {'dispatch_phase': 'dispatch_uncertain'},
+                }).encode('utf-8'),
+                ResourceNotFound,
+                'dispatch_uncertain',
+                1,
+            ),
+            (
+                409,
+                json.dumps({
+                    'version': 1,
+                    'code': 719,
+                    'name': 'RouteConflict',
+                    'message': 'conflict on call',
+                    'details': {'route': 'route', 'dispatch_phase': 'pre_dispatch'},
+                }).encode('utf-8'),
+                RouteConflict,
+                'pre_dispatch',
+                2,
+            ),
+            (
+                503,
+                json.dumps([
+                    1, 717, 'CallCapacityExceeded', 'array', {'dispatch_phase': 'pre_dispatch'},
+                ]).encode('utf-8'),
+                ProtocolViolation,
+                'dispatch_uncertain',
+                1,
+            ),
+            (
+                503,
+                b'{"version":1,"code":717.0,"name":"CallCapacityExceeded","message":"float","details":{"dispatch_phase":"pre_dispatch"}}',
+                ProtocolViolation,
+                'dispatch_uncertain',
+                1,
+            ),
+        ):
+            state.update(resolves=0, probes=0, posts=0, first_post=(status, body_bytes))
+            rt = cc.Runtime()
+            rt.set_relay_anchor(f'http://127.0.0.1:{server.server_port}')
+            proxy = rt.connect(CodecBoundary, name='route')
+            try:
+                with pytest.raises(expected_cls) as call_err:
+                    proxy.echo('hello')
+                assert call_err.value.transport_phase == expected_phase
+                assert proxy.echo('hello') == 'ok'
+                assert (state['resolves'], state['probes'], state['posts']) == (
+                    expected_resolves,
+                    expected_resolves,
+                    2,
+                )
+            finally:
+                cc.close(proxy)
+                rt.shutdown()
+    finally:
         server.shutdown()
         server.server_close()
         worker.join(2)

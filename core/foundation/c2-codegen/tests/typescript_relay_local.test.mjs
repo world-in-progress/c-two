@@ -5,12 +5,13 @@ import { join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { spawnSync } from 'node:child_process';
 import test from 'node:test';
+import { writeRenderedTypescriptTransport } from './render_typescript_transport.mjs';
 
 const directory = mkdtempSync(join(tmpdir(), 'c2-relay-local-'));
 let api;
 try {
   writeFileSync(join(directory, 'package.json'), '{"type":"module"}');
-  const source = fileURLToPath(new URL('../assets/typescript_transport.ts', import.meta.url));
+  const source = writeRenderedTypescriptTransport(directory);
   const compiler = fileURLToPath(new URL('../../c2-mem-ffi/bindings/typescript/node_modules/typescript/bin/tsc', import.meta.url));
   const compiled = spawnSync(process.execPath, [compiler, '--strict', '--exactOptionalPropertyTypes',
     '--target', 'ES2022', '--module', 'ES2022', '--moduleResolution', 'Bundler', '--lib', 'ES2022,DOM',

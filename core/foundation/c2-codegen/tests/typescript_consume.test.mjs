@@ -5,11 +5,12 @@ import { join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { spawnSync } from 'node:child_process';
 import test from 'node:test';
+import { writeRenderedTypescriptTransport } from './render_typescript_transport.mjs';
 
 async function transportModule() {
   const directory = mkdtempSync(join(tmpdir(), 'c2-consume-'));
   try {
-    const source = fileURLToPath(new URL('../assets/typescript_transport.ts', import.meta.url));
+    const source = writeRenderedTypescriptTransport(directory);
     const localCompiler = fileURLToPath(new URL('../../c2-mem-ffi/bindings/typescript/node_modules/typescript/bin/tsc', import.meta.url));
     const compiler = existsSync(localCompiler) ? process.execPath : process.env.C2_TYPESCRIPT_TSC ?? 'tsc';
     writeFileSync(join(directory, 'package.json'), '{"type":"module"}');
@@ -17,7 +18,7 @@ async function transportModule() {
       ...(existsSync(localCompiler) ? [localCompiler] : []),
       '--strict', '--exactOptionalPropertyTypes', '--target', 'ES2022', '--module', 'ES2022',
       '--moduleResolution', 'Bundler', '--lib', 'ES2022,DOM',
-      '--rootDir', fileURLToPath(new URL('../assets/', import.meta.url)),
+      '--rootDir', directory,
       '--outDir', directory, '--typeRoots', join(directory, 'node_modules', '@types'), source,
     ], {encoding:'utf8'});
     assert.equal(compile.status, 0, compile.stdout + compile.stderr);

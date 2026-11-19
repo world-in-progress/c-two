@@ -515,6 +515,9 @@ def test_real_native_failure_projection_releases_both_errors_without_gc(operatio
             gc.enable()
 
 
+import builtins as _py_builtins
+
+
 class _DiskCoreError(CoreError, OSError):
     def __init__(self, message: str):
         CoreError.__init__(self, 'transport', message)
@@ -525,6 +528,11 @@ class _DiskCoreError(CoreError, OSError):
         self.errno = 5
         self.strerror = 'Input/output error'
         self.filename = 'disk.sock'
+
+
+class _PlainHybridOSError(CCBaseError, OSError):
+    def __init__(self, *args: object):
+        OSError.__init__(self, *args)
 
 
 class _BlockingClosedError(ResourceClosed, BlockingIOError):
@@ -539,9 +547,18 @@ class _BlockingClosedError(ResourceClosed, BlockingIOError):
         self.characters_written = 4096
 
 
+_EXC_GROUP_BASE = getattr(_py_builtins, 'ExceptionGroup', Exception)
+
+
+class _HybridGroupError(CCBaseError, _EXC_GROUP_BASE):  # type: ignore[misc,valid-type]
+    pass
+
+
 def test_hybrid_oserror_and_exception_group_preserve_str_getset_and_weakref_pickle():
     import copy
+    from pathlib import PurePosixPath
     import pickle
+    import sys
     import weakref
     from c_two import error as cc_err
 
@@ -563,6 +580,35 @@ def test_hybrid_oserror_and_exception_group_preserve_str_getset_and_weakref_pick
     assert cleaned_core.transport_phase is None
     assert cleaned_core.details == {'biz': 'core-io'}
 
+    # Explicit filename2=None (including PurePosixPath filename) preserves ' -> None'.
+    disk_explicit_fn2 = _DiskCoreError('disk rename failure')
+    disk_explicit_fn2.filename = PurePosixPath('/tmp/source.sock')
+    disk_explicit_fn2.filename2 = None
+    explicit_fn2_str = str(disk_explicit_fn2)
+    assert explicit_fn2_str.endswith(' -> None')
+    cleaned_fn2 = cc_err._post_dispatch_cleanup_error(disk_explicit_fn2)
+    for clone in (
+        copy.copy(disk_explicit_fn2),
+        pickle.loads(pickle.dumps(disk_explicit_fn2)),
+        cleaned_fn2,
+    ):
+        assert isinstance(clone, _DiskCoreError)
+        assert str(clone) == explicit_fn2_str
+        assert clone.filename == PurePosixPath('/tmp/source.sock')
+        assert clone.filename2 is None
+    assert cleaned_fn2.transport_phase is None
+
+    # Explicit None errno in OSError(None, 'failure') preserves '[Errno None] failure'.
+    plain_none = _PlainHybridOSError(None, 'failure')
+    assert str(plain_none) == '[Errno None] failure'
+    for clone in (
+        copy.copy(plain_none),
+        pickle.loads(pickle.dumps(plain_none)),
+        cc_err._post_dispatch_cleanup_error(plain_none),
+    ):
+        assert isinstance(clone, _PlainHybridOSError)
+        assert str(clone) == '[Errno None] failure'
+
     blocking = _BlockingClosedError('partial write before close')
     cleaned_blocking = cc_err._callback_error_copy(blocking)
     for clone in (copy.copy(blocking), pickle.loads(pickle.dumps(blocking)), cleaned_blocking):
@@ -573,12 +619,8 @@ def test_hybrid_oserror_and_exception_group_preserve_str_getset_and_weakref_pick
     assert cleaned_blocking.transport_phase is None
     assert cleaned_blocking.details == {'biz': 'blocking'}
 
-    if hasattr(__builtins__, 'ExceptionGroup') or 'ExceptionGroup' in dir(__builtins__):
-        exc_group_cls = ExceptionGroup  # type: ignore[name-defined]
-
-        class _HybridGroupError(CCBaseError, exc_group_cls):
-            pass
-
+    if sys.version_info >= (3, 11):
+        assert hasattr(_py_builtins, 'ExceptionGroup')
         grp = _HybridGroupError('hybrid group', [ValueError('leaf')])
         live_ref = weakref.ref(grp)
         assert live_ref() is grp

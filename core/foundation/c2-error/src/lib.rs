@@ -189,13 +189,89 @@ impl fmt::Display for C2ErrorDecodeError {
 
 impl std::error::Error for C2ErrorDecodeError {}
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct C2ErrorEnvelope {
     pub version: u16,
     pub code: u16,
     pub name: String,
     pub message: String,
     pub details: BTreeMap<String, String>,
+}
+
+impl<'de> Deserialize<'de> for C2ErrorEnvelope {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct EnvelopeVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for EnvelopeVisitor {
+            type Value = C2ErrorEnvelope;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a C2 error JSON object")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                let mut version: Option<u16> = None;
+                let mut code: Option<u16> = None;
+                let mut name: Option<String> = None;
+                let mut message: Option<String> = None;
+                let mut details: Option<BTreeMap<String, String>> = None;
+
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "version" => {
+                            if version.is_some() {
+                                return Err(serde::de::Error::duplicate_field("version"));
+                            }
+                            version = Some(map.next_value()?);
+                        }
+                        "code" => {
+                            if code.is_some() {
+                                return Err(serde::de::Error::duplicate_field("code"));
+                            }
+                            code = Some(map.next_value()?);
+                        }
+                        "name" => {
+                            if name.is_some() {
+                                return Err(serde::de::Error::duplicate_field("name"));
+                            }
+                            name = Some(map.next_value()?);
+                        }
+                        "message" => {
+                            if message.is_some() {
+                                return Err(serde::de::Error::duplicate_field("message"));
+                            }
+                            message = Some(map.next_value()?);
+                        }
+                        "details" => {
+                            if details.is_some() {
+                                return Err(serde::de::Error::duplicate_field("details"));
+                            }
+                            details = Some(map.next_value()?);
+                        }
+                        _ => {
+                            let _ = map.next_value::<serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+
+                Ok(C2ErrorEnvelope {
+                    version: version.ok_or_else(|| serde::de::Error::missing_field("version"))?,
+                    code: code.ok_or_else(|| serde::de::Error::missing_field("code"))?,
+                    name: name.ok_or_else(|| serde::de::Error::missing_field("name"))?,
+                    message: message.ok_or_else(|| serde::de::Error::missing_field("message"))?,
+                    details: details.ok_or_else(|| serde::de::Error::missing_field("details"))?,
+                })
+            }
+        }
+
+        deserializer.deserialize_map(EnvelopeVisitor)
+    }
 }
 
 impl C2Error {
@@ -576,6 +652,27 @@ mod tests {
             assert_eq!(u16::from(decoded.code), expected);
             assert_eq!(decoded.message, "bounded call budget exhausted");
             assert!(decoded.details.is_empty());
+        }
+    }
+
+    #[test]
+    fn envelope_json_rejects_arrays_floats_and_duplicate_fields() {
+        for invalid in [
+            r#"[1,717,"CallCapacityExceeded","msg",{"dispatch_phase":"pre_dispatch"}]"#,
+            r#"{"version":1,"code":717.0,"name":"CallCapacityExceeded","message":"m","details":{}}"#,
+            r#"{"version":1.0,"code":717,"name":"CallCapacityExceeded","message":"m","details":{}}"#,
+            r#"{"version":1,"code":717,"code":717,"name":"CallCapacityExceeded","message":"m","details":{}}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<C2ErrorEnvelope>(invalid).is_err(),
+                "expected C2ErrorEnvelope JSON rejection for {invalid}"
+            );
+            let mut wire = b"C2E1".to_vec();
+            wire.extend_from_slice(invalid.as_bytes());
+            assert!(
+                C2Error::from_wire_bytes(&wire).is_err(),
+                "expected C2E1 wire rejection for {invalid}"
+            );
         }
     }
 }

@@ -1253,11 +1253,7 @@ fn render_typescript(
         ));
     }
     output.push('\n');
-    debug_assert!(
-        TYPESCRIPT_TRANSPORT_SOURCE.contains(&render_typescript_error_code_table()),
-        "typescript_transport.ts C2_ERROR_CODE_NAMES drifted from c2_error::ErrorCode::registry()"
-    );
-    output.push_str(TYPESCRIPT_TRANSPORT_SOURCE);
+    output.push_str(&render_typescript_transport_source());
     output.push_str(
         r#"
 
@@ -1597,26 +1593,41 @@ fn method_symbol(index: usize, name: &str) -> String {
     symbol
 }
 
+const TS_ERROR_CODE_PLACEHOLDER: &str =
+    "/* __C2_GENERATED_ERROR_CODE_NAMES__ */ Object.freeze({})";
+
+fn render_typescript_transport_source() -> String {
+    let generated_table = render_typescript_error_code_table();
+    let rendered = TYPESCRIPT_TRANSPORT_SOURCE.replace(TS_ERROR_CODE_PLACEHOLDER, &generated_table);
+    assert_ne!(
+        rendered, TYPESCRIPT_TRANSPORT_SOURCE,
+        "assets/typescript_transport.ts is missing TS_ERROR_CODE_PLACEHOLDER"
+    );
+    rendered
+}
+
 fn render_typescript_error_code_table() -> String {
-    let mut table = String::from("const C2_ERROR_CODE_NAMES: Readonly<Record<number, string>> = Object.freeze({\n");
+    let mut table = String::from("Object.freeze({\n");
     for entry in c2_error::ErrorCode::registry() {
         table.push_str(&format!("  {}: {},\n", u16::from(entry.code), quoted(entry.name)));
     }
-    table.push_str("});");
+    table.push_str("})");
     table
 }
 
 #[cfg(test)]
 mod registry_sync_tests {
-    use super::{TYPESCRIPT_TRANSPORT_SOURCE, render_typescript_error_code_table};
+    use super::{
+        TS_ERROR_CODE_PLACEHOLDER, TYPESCRIPT_TRANSPORT_SOURCE, render_typescript_error_code_table,
+        render_typescript_transport_source,
+    };
 
     #[test]
-    fn typescript_transport_error_code_table_matches_canonical_registry() {
-        let expected = render_typescript_error_code_table();
-        assert!(
-            TYPESCRIPT_TRANSPORT_SOURCE.contains(&expected),
-            "assets/typescript_transport.ts C2_ERROR_CODE_NAMES must match c2_error::ErrorCode::registry(); expected:\n{expected}"
-        );
+    fn typescript_transport_injects_generated_error_code_table() {
+        assert!(TYPESCRIPT_TRANSPORT_SOURCE.contains(TS_ERROR_CODE_PLACEHOLDER));
+        let rendered = render_typescript_transport_source();
+        assert!(!rendered.contains("__C2_GENERATED_ERROR_CODE_NAMES__"));
+        assert!(rendered.contains(&render_typescript_error_code_table()));
     }
 }
 

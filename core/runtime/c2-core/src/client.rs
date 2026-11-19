@@ -264,9 +264,8 @@ impl ClientTarget {
             {
                 use c2_error::ErrorCode::*;
                 let fact = match semantic.code {
-                    ResourceNotFound | ResourceRemoved | ResourceClosed | ContractMismatch => {
-                        NEEDS_ACQUIRE
-                    }
+                    ResourceNotFound | ResourceRemoved | ResourceClosed | ContractMismatch
+                    | RouteConflict => NEEDS_ACQUIRE,
                     IdentityMismatch | ProtocolViolation => TERMINAL_REFUSAL,
                     _ => 0,
                 };

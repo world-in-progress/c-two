@@ -5,14 +5,15 @@ import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {fileURLToPath,pathToFileURL} from 'node:url';
 import test from 'node:test';
+import {writeRenderedTypescriptTransport} from './render_typescript_transport.mjs';
 
 const directory=mkdtempSync(join(tmpdir(),'c2-ts-revision-'));
 let transport;
 try {
   writeFileSync(join(directory,'package.json'),'{"type":"module"}');
   const compiler=fileURLToPath(new URL('../../c2-mem-ffi/bindings/typescript/node_modules/typescript/bin/tsc',import.meta.url));
-  const source=fileURLToPath(new URL('../assets/typescript_transport.ts',import.meta.url));
-  const result=spawnSync(process.execPath,[compiler,'--strict','--target','ES2022','--module','ES2022','--moduleResolution','Bundler','--lib','ES2022,DOM','--rootDir',fileURLToPath(new URL('../assets',import.meta.url)),'--outDir',directory,'--typeRoots',join(directory,'node_modules','@types'),source],{encoding:'utf8'});
+  const source=writeRenderedTypescriptTransport(directory);
+  const result=spawnSync(process.execPath,[compiler,'--strict','--exactOptionalPropertyTypes','--target','ES2022','--module','ES2022','--moduleResolution','Bundler','--lib','ES2022,DOM','--rootDir',directory,'--outDir',directory,'--typeRoots',join(directory,'node_modules','@types'),source],{encoding:'utf8'});
   assert.equal(result.status,0,result.stdout+result.stderr);
   transport=await import(pathToFileURL(join(directory,'typescript_transport.js')));
 } finally {rmSync(directory,{recursive:true,force:true});}
@@ -818,4 +819,210 @@ test('probe 719 with bogus dispatch_uncertain stops selection and mismatched cod
       return true;
     });
   }finally{await futureClient.close()}
+});
+
+test('streaming compressed reader copies reused Node Buffer chunks and cancels on size refusal',async()=>{
+  function reusedBufferBody(values, tracker){
+    const shared=Buffer.alloc(1);
+    let idx=0;
+    return {
+      getReader(){
+        return {
+          async read(){
+            if(idx>=values.length)return {done:true};
+            shared[0]=values[idx++];
+            return {done:false,value:shared};
+          },
+          async cancel(reason){
+            tracker.cancels.push(reason);
+            if(tracker.throwOnCancel)throw new Error('secondary cancel error');
+          },
+          releaseLock(){tracker.releases++;},
+        };
+      },
+    };
+  }
+
+  // Default streaming path (content-encoding: gzip forces getReader() path).
+  const defaultTracker={cancels:[],releases:0};
+  const defaultClient=transport.createRelayAwareHttpEncodedTransport('http://localhost:8300',{
+    fetch:async(url,init)=>{
+      if(url.includes('/_resolve/'))return textReply(200,JSON.stringify([relayRoute()]));
+      if(url.includes('/_probe/'))return relayResponse();
+      assert.equal(init.method,'POST');
+      return {
+        status:200,
+        headers:{get(name){
+          const k=name.toLowerCase();
+          if(k==='content-encoding')return 'gzip';
+          if(k==='content-length')return '1';
+          return null;
+        }},
+        body:reusedBufferBody([1,2],defaultTracker),
+        async arrayBuffer(){throw new Error('must read from streaming body');},
+      };
+    },
+  });
+  try{
+    const res=await defaultClient.call('route',contract,'ping',()=>new Uint8Array());
+    assert.deepEqual(Array.from(res),[1,2]);
+    assert.equal(defaultTracker.cancels.length,0);
+    assert.equal(defaultTracker.releases,1);
+  }finally{await defaultClient.close()}
+
+  // Unknown-length responsePayloadAllocator streaming path also copies reused Buffer chunks.
+  const allocTracker={cancels:[],releases:0};
+  const allocClient=transport.createRelayAwareHttpEncodedTransport('http://localhost:8300',{
+    responsePayloadAllocator(byteLength){
+      const backing=new Uint8Array(byteLength);
+      return {view:backing,payload:{bytes:backing,byteLength,release(){}}};
+    },
+    responsePayloadUnknownLengthStrategy:'buffer',
+    responsePayloadUnknownLengthMaxBytes:8,
+    fetch:async(url,init)=>{
+      if(url.includes('/_resolve/'))return textReply(200,JSON.stringify([relayRoute()]));
+      if(url.includes('/_probe/'))return relayResponse();
+      assert.equal(init.method,'POST');
+      return {
+        status:200,
+        headers:{get(name){return name.toLowerCase()==='content-encoding'?'gzip':null}},
+        body:reusedBufferBody([1,2],allocTracker),
+        async arrayBuffer(){throw new Error('must read from streaming body');},
+      };
+    },
+  });
+  try{
+    const res=await allocClient.call('route',contract,'ping',()=>new Uint8Array());
+    assert.deepEqual(Array.from(res.bytes),[1,2]);
+    assert.equal(allocTracker.cancels.length,0);
+    assert.equal(allocTracker.releases,1);
+  }finally{await allocClient.close()}
+
+  // Oversized streaming responses cancel the reader and preserve the primary size error
+  // across default compressed streaming, unknown-length allocator streaming, and known-length allocator streaming.
+  for(const mode of ['default_gzip','allocator_unknown','allocator_known']){
+    const overTracker={cancels:[],releases:0,throwOnCancel:true,freed:0};
+    let step=0;
+    const oversizedChunk=Object.create(Uint8Array.prototype,{byteLength:{value:2_147_483_647}});
+    const overBody={
+      getReader(){
+        return {
+          async read(){
+            step++;
+            if(mode==='default_gzip'){
+              if(step===1)return {done:false,value:Uint8Array.of(1)};
+              if(step===2)return {done:false,value:oversizedChunk};
+              return {done:true};
+            }
+            if(step<=3)return {done:false,value:Uint8Array.of(step)};
+            return {done:true};
+          },
+          async cancel(reason){
+            overTracker.cancels.push(reason);
+            if(overTracker.throwOnCancel)throw new Error('secondary cancel error');
+          },
+          releaseLock(){overTracker.releases++;},
+        };
+      },
+    };
+    const overClient=transport.createRelayAwareHttpEncodedTransport('http://localhost:8300',{
+      ...(mode==='default_gzip' ? {} : {
+        responsePayloadAllocator(byteLength){
+          const backing=new Uint8Array(byteLength);
+          return {view:backing,payload:{bytes:backing,byteLength,release(){overTracker.freed++;}}};
+        },
+        responsePayloadUnknownLengthStrategy:'buffer',
+        responsePayloadUnknownLengthMaxBytes:2,
+      }),
+      fetch:async(url,init)=>{
+        if(url.includes('/_resolve/'))return textReply(200,JSON.stringify([relayRoute()]));
+        if(url.includes('/_probe/'))return relayResponse();
+        assert.equal(init.method,'POST');
+        return {
+          status:200,
+          headers:{get(name){
+            const k=name.toLowerCase();
+            if(mode==='allocator_known')return k==='content-length'?'2':null;
+            return k==='content-encoding'?'gzip':null;
+          }},
+          body:overBody,
+          async arrayBuffer(){throw new Error('must read from streaming body');},
+        };
+      },
+    });
+    try{
+      await assert.rejects(overClient.call('route',contract,'ping',()=>new Uint8Array()),err=>{
+        assert.ok(err instanceof transport.C2HttpTransportError);
+        assert.equal(err.transportPhase,'dispatch_uncertain');
+        assert.equal(err.retrySafe,false);
+        assert.match(err.message,/exceeded|no greater than/);
+        return true;
+      });
+      assert.equal(overTracker.cancels.length,1,mode);
+      assert.equal(overTracker.releases,1,mode);
+      if(mode==='allocator_known')assert.equal(overTracker.freed,1);
+    }finally{await overClient.close()}
+  }
+});
+
+test('non-canonical JSON array or float-code envelopes and contradictory 404/701 stay dispatch_uncertain',async()=>{
+  for(const rawBody of [
+    JSON.stringify([1,717,'CallCapacityExceeded','array envelope',{dispatch_phase:'pre_dispatch'}]),
+    '{"version":1,"code":717.0,"name":"CallCapacityExceeded","message":"float code","details":{"dispatch_phase":"pre_dispatch"}}',
+    '{"version":1.0,"code":717,"name":"CallCapacityExceeded","message":"float version","details":{"dispatch_phase":"pre_dispatch"}}',
+    '{"version":1,"code":717,"code":717,"name":"CallCapacityExceeded","message":"dup","details":{"dispatch_phase":"pre_dispatch"}}',
+  ]){
+    let resolves=0,probes=0,posts=0;
+    const client=transport.createRelayAwareHttpEncodedTransport('http://localhost:8300',{
+      fetch:async(url,init)=>{
+        if(url.includes('/_resolve/')){resolves++;return textReply(200,JSON.stringify([relayRoute()]))}
+        if(url.includes('/_probe/')){probes++;return relayResponse()}
+        assert.equal(init.method,'POST');
+        posts++;
+        return posts===1 ? textReply(503,rawBody) : relayResponse(200,Uint8Array.of(9));
+      },
+    });
+    try{
+      await assert.rejects(client.call('route',contract,'ping',()=>new Uint8Array()),err=>{
+        assert.ok(err instanceof transport.C2HttpRelayError);
+        assert.equal(err.transportPhase,'dispatch_uncertain');
+        assert.equal(err.retrySafe,false);
+        return true;
+      });
+      const ok=await client.call('route',contract,'ping',()=>new Uint8Array());
+      assert.equal(ok[0],9);
+      assert.deepEqual({resolves,probes,posts},{resolves:1,probes:1,posts:2});
+    }finally{await client.close()}
+  }
+
+  // 404 + canonical 701 without phase details is pre_dispatch and triggers re-acquisition;
+  // 404 + canonical 701 with contradictory dispatch_phase='dispatch_uncertain' stays dispatch_uncertain and reuses target.
+  for(const [details,expectPhase,expectRetrySafe,expectResolves] of [
+    [{},'pre_dispatch',true,2],
+    [{dispatch_phase:'dispatch_uncertain'},'dispatch_uncertain',false,1],
+  ]){
+    let resolves=0,probes=0,posts=0;
+    const body=JSON.stringify({version:1,code:701,name:'ResourceNotFound',message:'missing',details});
+    const client=transport.createRelayAwareHttpEncodedTransport('http://localhost:8300',{
+      fetch:async(url,init)=>{
+        if(url.includes('/_resolve/')){resolves++;return textReply(200,JSON.stringify([relayRoute()]))}
+        if(url.includes('/_probe/')){probes++;return relayResponse()}
+        assert.equal(init.method,'POST');
+        posts++;
+        return posts===1 ? textReply(404,body) : relayResponse(200,Uint8Array.of(11));
+      },
+    });
+    try{
+      await assert.rejects(client.call('route',contract,'ping',()=>new Uint8Array()),err=>{
+        assert.ok(err instanceof transport.C2HttpRelayError);
+        assert.equal(err.status,404);
+        assert.equal(err.transportPhase,expectPhase);
+        assert.equal(err.retrySafe,expectRetrySafe);
+        return true;
+      });
+      const ok=await client.call('route',contract,'ping',()=>new Uint8Array());
+      assert.equal(ok[0],11);
+      assert.deepEqual({resolves,probes,posts},{resolves:expectResolves,probes:expectResolves,posts:2});
+    }finally{await client.close()}
+  }
 });
