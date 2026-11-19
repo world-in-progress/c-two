@@ -87,7 +87,7 @@ class CCBaseError(Exception):
             state['details'] = dict(state['details'])
         if '__notes__' in state and isinstance(state['__notes__'], list):
             state['__notes__'] = state['__notes__'].copy()
-        slots = _extract_oserror_slots(self) if isinstance(self, OSError) else {}
+        slots = _extract_oserror_slots(self) if issubclass(cls, OSError) else {}
         for base in cls.__mro__:
             if base is BaseException or base is object:
                 break
@@ -717,7 +717,10 @@ def _extract_oserror_slots(exc: OSError) -> dict[str, object]:
     if 'filename' not in out and not args_are_safe:
         return out
     safe_args = raw_args if args_are_safe else ()
-    actual_str = OSError.__str__(exc)
+    try:
+        actual_str = OSError.__str__(exc)
+    except BaseException:
+        return out
     core_fields = [f for f in ('errno', 'strerror', 'filename', 'filename2') if f in vals]
     for mask in range(1 << len(core_fields)):
         candidate = dict(out)
@@ -731,7 +734,11 @@ def _extract_oserror_slots(exc: OSError) -> dict[str, object]:
                 getattr(OSError, key).__set__(probe, val)
             except (AttributeError, TypeError, ValueError):
                 continue
-        if OSError.__str__(probe) == actual_str:
+        try:
+            probe_str = OSError.__str__(probe)
+        except BaseException:
+            continue
+        if probe_str == actual_str:
             return candidate
     return out
 
@@ -758,7 +765,7 @@ def _clone_exception_without_user_hooks(exc: CCBaseError) -> CCBaseError:
     raw_notes = dst_dict.get('__notes__')
     if isinstance(raw_notes, list):
         dst_dict['__notes__'] = raw_notes.copy()
-    if isinstance(exc, OSError):
+    if issubclass(cls, OSError):
         for key, val in _extract_oserror_slots(exc).items():
             try:
                 getattr(OSError, key).__set__(copied, val)
@@ -887,9 +894,10 @@ def _callback_core_copy(core: CoreError) -> CoreError:
 
 def _post_dispatch_cleanup_error(exc: BaseException) -> BaseException:
     """Sanitize a cleanup failure raised after call/stream dispatch succeeded."""
-    if isinstance(exc, CoreError):
+    cls = type(exc)
+    if issubclass(cls, CoreError):
         raw_details = _raw_get_field(exc, 'details')
-        public_slot = _raw_slot_descriptor(type(exc), 'transport_phase')
+        public_slot = _raw_slot_descriptor(cls, 'transport_phase')
         has_public_phase = (
             (public_slot is not None and _raw_get_field(exc, 'transport_phase') is not None)
             or 'transport_phase' in _raw_instance_dict(exc)
@@ -901,11 +909,11 @@ def _post_dispatch_cleanup_error(exc: BaseException) -> BaseException:
             or _raw_get_field(exc, 'route_withdrawal') is not None
             or _details_need_cleanup(raw_details)
         ):
-            return _callback_core_copy(exc)
+            return _callback_core_copy(exc)  # type: ignore[arg-type]
         return exc
-    if isinstance(exc, CCError):
+    if issubclass(cls, CCError):
         raw_details = _raw_get_field(exc, 'details')
-        public_slot = _raw_slot_descriptor(type(exc), 'transport_phase')
+        public_slot = _raw_slot_descriptor(cls, 'transport_phase')
         has_public_phase = (
             (public_slot is not None and _raw_get_field(exc, 'transport_phase') is not None)
             or 'transport_phase' in _raw_instance_dict(exc)
@@ -915,7 +923,29 @@ def _post_dispatch_cleanup_error(exc: BaseException) -> BaseException:
             or has_public_phase
             or _details_need_cleanup(raw_details)
         ):
-            return _callback_error_copy(exc)
+            return _callback_error_copy(exc)  # type: ignore[arg-type]
+        return exc
+    if issubclass(cls, CCBaseError):
+        raw_details = _raw_get_field(exc, 'details')
+        public_slot = _raw_slot_descriptor(cls, 'transport_phase')
+        has_public_phase = (
+            (public_slot is not None and _raw_get_field(exc, 'transport_phase') is not None)
+            or 'transport_phase' in _raw_instance_dict(exc)
+        )
+        if (
+            _raw_get_field(exc, '_transport_phase') is not None
+            or has_public_phase
+            or _details_need_cleanup(raw_details)
+        ):
+            stripped_details = _safe_strip_callback_details(exc)  # type: ignore[arg-type]
+            try:
+                copied = _clone_exception_without_user_hooks(exc)  # type: ignore[arg-type]
+            except BaseException:
+                return exc
+            if _details_need_cleanup(raw_details):
+                _raw_set_field(copied, 'details', stripped_details)
+            _clear_copied_phase_fields(copied)
+            return copied
     return exc
 
 
@@ -925,15 +955,16 @@ def _callback_semantic_copy(exc: CCBaseError) -> CCError | None:
     A ``CoreError`` projects its semantic snapshot first; a plain ``CCError``
     is copied with inner dispatch phases cleared.
     """
-    if isinstance(exc, CoreError):
+    cls = type(exc)
+    if issubclass(cls, CoreError):
         snapshot = _raw_get_field(exc, '_semantic_snapshot')
         if isinstance(snapshot, tuple) and len(snapshot) == 4:
             code, message, details, _ = snapshot
             projected = CCError._from_parts(code, message, dict(details), transport_phase=None)
             return _callback_error_copy(projected)
         return None
-    if isinstance(exc, CCError):
-        return _callback_error_copy(exc)
+    if issubclass(cls, CCError):
+        return _callback_error_copy(exc)  # type: ignore[arg-type]
     return None
 
 
@@ -945,8 +976,8 @@ def _project_native_error(exc: BaseException) -> CCError | None:
     ``CoreError`` without one, and any other exception, projects ``None`` so
     callers re-raise the original.
     """
-    if isinstance(exc, CoreError):
-        return exc.semantic
+    if issubclass(type(exc), CoreError):
+        return exc.semantic  # type: ignore[attr-defined]
     return None
 
 

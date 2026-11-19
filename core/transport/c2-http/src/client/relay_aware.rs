@@ -646,10 +646,7 @@ fn route_not_found(err: &HttpError) -> bool {
     if status != 404 {
         return false;
     }
-    let Ok(envelope) = serde_json::from_slice::<c2_error::C2ErrorEnvelope>(body) else {
-        return false;
-    };
-    c2_error::C2Error::from_envelope(envelope).is_ok_and(|error| {
+    c2_error::C2Error::from_json_bytes(body).is_ok_and(|error| {
         error.code == c2_error::ErrorCode::ResourceNotFound
             && error
                 .details
@@ -668,10 +665,7 @@ fn terminal_route_refusal(err: &HttpError) -> bool {
         HttpError::ResponseError(_, body) => body.as_ref(),
         _ => return false,
     };
-    let Ok(envelope) = serde_json::from_slice::<c2_error::C2ErrorEnvelope>(body) else {
-        return false;
-    };
-    c2_error::C2Error::from_envelope(envelope).is_ok_and(|error| {
+    c2_error::C2Error::from_json_bytes(body).is_ok_and(|error| {
         matches!(
             error.code,
             c2_error::ErrorCode::RouteConflict
@@ -692,10 +686,7 @@ fn relay_rejection_is_pre_dispatch(error: &HttpError) -> bool {
         }
         _ => return false,
     };
-    let Ok(envelope) = serde_json::from_slice::<c2_error::C2ErrorEnvelope>(body) else {
-        return false;
-    };
-    c2_error::C2Error::from_envelope(envelope).is_ok_and(|error| {
+    c2_error::C2Error::from_json_bytes(body).is_ok_and(|error| {
         error.code != c2_error::ErrorCode::Unknown
             && error
                 .details
@@ -3091,6 +3082,22 @@ mod tests {
             response_error(
                 503,
                 br#"[1,717,"CallCapacityExceeded","array",{"dispatch_phase":"pre_dispatch"}]"#,
+            ),
+            response_error(
+                404,
+                b"{\"version\":1,\"code\":701,\"name\":\"ResourceNotFound\",\"message\":\"missing\",\"details\":{},\"extra\":\"bad\xff\"}",
+            ),
+            response_error(
+                503,
+                b"\xef\xbb\xbf{\"version\":1,\"code\":717,\"name\":\"CallCapacityExceeded\",\"message\":\"cap\",\"details\":{\"dispatch_phase\":\"pre_dispatch\"}}",
+            ),
+            response_error(
+                503,
+                b"{\"version\":1,\"code\":717,\"name\":\"CallCapacityExceeded\",\"message\":\"bad \\ud800\",\"details\":{\"dispatch_phase\":\"pre_dispatch\"}}",
+            ),
+            response_error(
+                503,
+                b"{\"version\":1,\"code\":717,\"name\":\"CallCapacityExceeded\",\"message\":\"cap\",\"details\":{\"k\":1,\"k\":\"ok\",\"dispatch_phase\":\"pre_dispatch\"}}",
             ),
         ] {
             assert_eq!(

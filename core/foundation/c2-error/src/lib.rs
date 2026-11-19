@@ -255,7 +255,7 @@ impl<'de> Deserialize<'de> for C2ErrorEnvelope {
                             details = Some(map.next_value()?);
                         }
                         _ => {
-                            let _ = map.next_value::<serde::de::IgnoredAny>()?;
+                            let _ = map.next_value::<serde_json::Value>()?;
                         }
                     }
                 }
@@ -310,6 +310,14 @@ impl C2Error {
         out
     }
 
+    pub fn from_json_bytes(bytes: &[u8]) -> Result<Self, C2ErrorDecodeError> {
+        let body = std::str::from_utf8(bytes)
+            .map_err(|error| C2ErrorDecodeError::InvalidJson(error.to_string()))?;
+        let envelope: C2ErrorEnvelope = serde_json::from_str(body)
+            .map_err(|error| C2ErrorDecodeError::InvalidJson(error.to_string()))?;
+        Self::from_envelope(envelope)
+    }
+
     pub fn from_envelope(envelope: C2ErrorEnvelope) -> Result<Self, C2ErrorDecodeError> {
         if envelope.version != ERROR_WIRE_VERSION {
             return Err(C2ErrorDecodeError::UnsupportedVersion(envelope.version));
@@ -358,9 +366,7 @@ impl C2Error {
         let Some(payload) = data.strip_prefix(ERROR_WIRE_MAGIC) else {
             return Err(C2ErrorDecodeError::MissingMagic);
         };
-        let envelope: C2ErrorEnvelope = serde_json::from_slice(payload)
-            .map_err(|err| C2ErrorDecodeError::InvalidJson(err.to_string()))?;
-        Ok(Some(Self::from_envelope(envelope)?))
+        Ok(Some(Self::from_json_bytes(payload)?))
     }
 }
 
@@ -672,6 +678,26 @@ mod tests {
             assert!(
                 C2Error::from_wire_bytes(&wire).is_err(),
                 "expected C2E1 wire rejection for {invalid}"
+            );
+            assert!(
+                C2Error::from_json_bytes(invalid.as_bytes()).is_err(),
+                "expected JSON bytes rejection for {invalid}"
+            );
+        }
+
+        for raw_invalid in [
+            &b"{\"version\":1,\"code\":701,\"name\":\"ResourceNotFound\",\"message\":\"m\",\"details\":{},\"extra\":\"bad\xff\"}"[..],
+            &b"\xef\xbb\xbf{\"version\":1,\"code\":717,\"name\":\"CallCapacityExceeded\",\"message\":\"m\",\"details\":{\"dispatch_phase\":\"pre_dispatch\"}}"[..],
+            &b"{\"version\":1,\"code\":717,\"name\":\"CallCapacityExceeded\",\"message\":\"bad \\ud800\",\"details\":{\"dispatch_phase\":\"pre_dispatch\"}}"[..],
+            &b"{\"version\":1,\"code\":717,\"name\":\"CallCapacityExceeded\",\"message\":\"m\",\"details\":{\"k\":1,\"k\":\"ok\",\"dispatch_phase\":\"pre_dispatch\"}}"[..],
+        ] {
+            assert!(
+                C2Error::from_json_bytes(raw_invalid).is_err(),
+                "expected C2Error::from_json_bytes rejection for {raw_invalid:?}"
+            );
+            assert!(
+                serde_json::from_slice::<C2ErrorEnvelope>(raw_invalid).is_err(),
+                "expected serde_json::from_slice::<C2ErrorEnvelope> rejection for {raw_invalid:?}"
             );
         }
     }

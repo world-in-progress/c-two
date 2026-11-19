@@ -1026,3 +1026,112 @@ test('non-canonical JSON array or float-code envelopes and contradictory 404/701
     }finally{await client.close()}
   }
 });
+
+test('corrupt unknown-field UTF-8, BOM, lone surrogates, non-string duplicate details, and pending tee() cancel',async()=>{
+  const enc=new TextEncoder();
+  const concatBytes=(...parts)=>{
+    const total=parts.reduce((acc,p)=>acc+p.byteLength,0);
+    const out=new Uint8Array(total);
+    let offset=0;
+    for(const p of parts){out.set(p,offset);offset+=p.byteLength;}
+    return out;
+  };
+  const sharedRawCorpus=[
+    [
+      404,
+      concatBytes(
+        enc.encode('{"version":1,"code":701,"name":"ResourceNotFound","message":"missing","details":{},"extra":"bad'),
+        Uint8Array.of(0xff),
+        enc.encode('"}'),
+      ),
+    ],
+    [
+      503,
+      concatBytes(
+        Uint8Array.of(0xef,0xbb,0xbf),
+        enc.encode('{"version":1,"code":717,"name":"CallCapacityExceeded","message":"cap","details":{"dispatch_phase":"pre_dispatch"}}'),
+      ),
+    ],
+    [
+      503,
+      enc.encode('{"version":1,"code":717,"name":"CallCapacityExceeded","message":"bad \\ud800","details":{"dispatch_phase":"pre_dispatch"}}'),
+    ],
+    [
+      503,
+      enc.encode('{"version":1,"code":717,"name":"CallCapacityExceeded","message":"cap","details":{"k":1,"k":"ok","dispatch_phase":"pre_dispatch"}}'),
+    ],
+  ];
+
+  for(const [status,rawBytes] of sharedRawCorpus){
+    let resolves=0,probes=0,posts=0;
+    const client=transport.createRelayAwareHttpEncodedTransport('http://localhost:8300',{
+      fetch:async(url,init)=>{
+        if(url.includes('/_resolve/')){resolves++;return textReply(200,JSON.stringify([relayRoute()]))}
+        if(url.includes('/_probe/')){probes++;return relayResponse()}
+        assert.equal(init.method,'POST');
+        posts++;
+        return posts===1 ? new Response(rawBytes,{status}) : relayResponse(200,Uint8Array.of(13));
+      },
+    });
+    try{
+      await assert.rejects(client.call('route',contract,'ping',()=>new Uint8Array()),err=>{
+        assert.ok(err instanceof transport.C2HttpRelayError);
+        assert.equal(err.status,status);
+        assert.equal(err.transportPhase,'dispatch_uncertain');
+        assert.equal(err.retrySafe,false);
+        return true;
+      });
+      const ok=await client.call('route',contract,'ping',()=>new Uint8Array());
+      assert.equal(ok[0],13);
+      assert.deepEqual({resolves,probes,posts},{resolves:1,probes:1,posts:2});
+    }finally{await client.close()}
+  }
+
+  // Native WHATWG ReadableStream.tee(): when sibling branch b2 stays uncancelled,
+  // b1's reader.cancel() returns a never-resolving Promise until b2 cancels.
+  // Exceeding Content-Length must still release the allocator buffer and reader lock
+  // immediately and surface the Content-Length error before a 140 ms call deadline fires.
+  const sourceStream=new ReadableStream({
+    start(controller){
+      controller.enqueue(Uint8Array.of(1,2,3));
+    },
+  });
+  const [branch1,branch2]=sourceStream.tee();
+  let allocatedFreed=0;
+  const teeClient=transport.createRelayAwareHttpEncodedTransport('http://localhost:8300',{
+    callTimeoutMs:140,
+    responsePayloadAllocator(byteLength){
+      const backing=new Uint8Array(byteLength);
+      return {view:backing,payload:{bytes:backing,byteLength,release(){allocatedFreed++;}}};
+    },
+    fetch:async(url,init)=>{
+      if(url.includes('/_resolve/'))return textReply(200,JSON.stringify([relayRoute()]));
+      if(url.includes('/_probe/'))return relayResponse();
+      assert.equal(init.method,'POST');
+      return {
+        status:200,
+        headers:{get(name){return name.toLowerCase()==='content-length'?'2':null}},
+        body:branch1,
+        async arrayBuffer(){throw new Error('must read from streaming body');},
+      };
+    },
+  });
+  try{
+    await assert.rejects(
+      teeClient.call('route',contract,'ping',()=>new Uint8Array()),
+      err=>{
+        assert.ok(err instanceof transport.C2HttpTransportError);
+        assert.equal(err instanceof transport.C2CoreError,false);
+        assert.equal(err.transportPhase,'dispatch_uncertain');
+        assert.equal(err.retrySafe,false);
+        assert.match(err.message,/exceeded Content-Length/);
+        return true;
+      },
+    );
+    assert.equal(branch1.locked,false,'reader lock must be released before sibling tee branch cancels');
+    assert.equal(allocatedFreed,1,'allocated buffer must be freed before sibling tee branch cancels');
+  }finally{
+    await branch2.cancel();
+    await teeClient.close();
+  }
+});

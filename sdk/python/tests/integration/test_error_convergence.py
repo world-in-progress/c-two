@@ -1901,6 +1901,34 @@ def test_http_call_404_701_contradiction_409_719_reacquire_and_array_float_envel
                 'dispatch_uncertain',
                 1,
             ),
+            (
+                404,
+                b'{"version":1,"code":701,"name":"ResourceNotFound","message":"missing","details":{},"extra":"bad\xff"}',
+                ProtocolViolation,
+                'dispatch_uncertain',
+                1,
+            ),
+            (
+                503,
+                b'\xef\xbb\xbf{"version":1,"code":717,"name":"CallCapacityExceeded","message":"cap","details":{"dispatch_phase":"pre_dispatch"}}',
+                ProtocolViolation,
+                'dispatch_uncertain',
+                1,
+            ),
+            (
+                503,
+                b'{"version":1,"code":717,"name":"CallCapacityExceeded","message":"bad \\ud800","details":{"dispatch_phase":"pre_dispatch"}}',
+                ProtocolViolation,
+                'dispatch_uncertain',
+                1,
+            ),
+            (
+                503,
+                b'{"version":1,"code":717,"name":"CallCapacityExceeded","message":"cap","details":{"k":1,"k":"ok","dispatch_phase":"pre_dispatch"}}',
+                ProtocolViolation,
+                'dispatch_uncertain',
+                1,
+            ),
         ):
             state.update(resolves=0, probes=0, posts=0, first_post=(status, body_bytes))
             rt = cc.Runtime()

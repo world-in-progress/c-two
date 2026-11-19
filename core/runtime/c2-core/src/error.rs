@@ -458,16 +458,7 @@ pub fn normalize_http_error(error: HttpError, phase: TransportPhase) -> Error {
 }
 
 fn normalize_http_call_semantic_bytes(bytes: &[u8], status: u16, phase: TransportPhase) -> Error {
-    let parsed = match std::str::from_utf8(bytes) {
-        Ok(body) => match serde_json::from_str::<C2ErrorEnvelope>(body) {
-            Ok(envelope) => match C2Error::from_envelope(envelope) {
-                Ok(error) => Ok(error),
-                Err(error) => Err(error.to_string()),
-            },
-            Err(error) => Err(error.to_string()),
-        },
-        Err(error) => Err(error.to_string()),
-    };
+    let parsed = C2Error::from_json_bytes(bytes).map_err(|error| error.to_string());
     let mut semantic = match parsed {
         Ok(mut semantic) => {
             if status == 500 {

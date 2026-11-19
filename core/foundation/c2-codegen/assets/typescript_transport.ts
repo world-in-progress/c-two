@@ -209,19 +209,38 @@ interface C2RelayRouteInfo {
   readonly signatureHash: string;
 }
 
-const C2_STRICT_UTF8_DECODER = new TextDecoder("utf-8", { fatal: true });
+const C2_STRICT_UTF8_DECODER = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
 const C2_LOSSY_UTF8_DECODER = new TextDecoder("utf-8");
 const C2_PRE_DISPATCH_HTTP_STATUSES = new Set([404, 406, 409, 410, 413, 429, 502, 503]);
 
+function isWellFormedUnicodeString(value: string): boolean {
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index);
+    if (code >= 0xd800 && code <= 0xdbff) {
+      if (index + 1 >= value.length) return false;
+      const low = value.charCodeAt(index + 1);
+      if (low < 0xdc00 || low > 0xdfff) return false;
+      index += 1;
+    } else if (code >= 0xdc00 && code <= 0xdfff) {
+      return false;
+    }
+  }
+  return true;
+}
+
 function decodeHttpErrorBody(raw: string | Uint8Array): { readonly body: string; readonly validUtf8: boolean } {
   if (typeof raw === "string") {
-    return { body: raw, validUtf8: true };
+    return { body: raw, validUtf8: isWellFormedUnicodeString(raw) };
   }
   try {
     return { body: C2_STRICT_UTF8_DECODER.decode(raw), validUtf8: true };
   } catch {
     return { body: C2_LOSSY_UTF8_DECODER.decode(raw), validUtf8: false };
   }
+}
+
+function ownDetail(details: Readonly<Record<string, string>>, key: string): string | undefined {
+  return Object.prototype.hasOwnProperty.call(details, key) ? details[key] : undefined;
 }
 
 function resolveHttpCallRelayErrorPhase(
@@ -235,13 +254,15 @@ function resolveHttpCallRelayErrorPhase(
   if (canonical === undefined || canonical.code === 0) {
     return "dispatch_uncertain";
   }
-  if (canonical.details.dispatch_phase !== undefined && canonical.details.dispatch_phase !== "pre_dispatch") {
+  const dispatchPhase = ownDetail(canonical.details, "dispatch_phase");
+  const transportPhase = ownDetail(canonical.details, "transport_phase");
+  if (dispatchPhase !== undefined && dispatchPhase !== "pre_dispatch") {
     return "dispatch_uncertain";
   }
-  if (canonical.details.transport_phase !== undefined && canonical.details.transport_phase !== "pre_dispatch") {
+  if (transportPhase !== undefined && transportPhase !== "pre_dispatch") {
     return "dispatch_uncertain";
   }
-  if ((status === 404 && canonical.code === 701) || canonical.details.dispatch_phase === "pre_dispatch") {
+  if ((status === 404 && canonical.code === 701) || dispatchPhase === "pre_dispatch") {
     return "pre_dispatch";
   }
   return "dispatch_uncertain";
@@ -1231,12 +1252,18 @@ async function readHttpArrayBufferResponsePayload(response: C2FetchResponse): Pr
   return payload;
 }
 
-async function cancelStreamReaderQuietly(reader: C2ReadableStreamReader | undefined, reason: unknown): Promise<void> {
+function cancelStreamReaderDetached(reader: C2ReadableStreamReader | undefined, reason: unknown): void {
   if (reader === undefined || typeof reader.cancel !== "function") {
     return;
   }
   try {
-    await reader.cancel(reason);
+    const pending = reader.cancel(reason);
+    if (pending !== undefined && pending !== null && typeof (pending as PromiseLike<unknown>).then === "function") {
+      (pending as PromiseLike<unknown>).then(
+        () => undefined,
+        () => undefined,
+      );
+    }
   } catch {
     // Preserve the primary protocol or size error.
   }
@@ -1270,7 +1297,7 @@ async function readBoundedStreamBytes(body: C2ReadableStream, maxBytes: number):
       byteLength = nextByteLength;
     }
   } catch (error) {
-    await cancelStreamReaderQuietly(reader, error);
+    cancelStreamReaderDetached(reader, error);
     throw error;
   } finally {
     reader?.releaseLock?.();
@@ -1336,7 +1363,7 @@ async function readAllocatedResponsePayload<Payload extends C2ResponsePayload>(b
     }
     return allocated.payload;
   } catch (error) {
-    await cancelStreamReaderQuietly(reader, error);
+    cancelStreamReaderDetached(reader, error);
     tryReleaseAllocatedResponsePayload(allocated);
     throw error;
   } finally {
@@ -1373,7 +1400,7 @@ async function readUnknownLengthAllocatedResponsePayload<Payload extends C2Respo
       byteLength = nextByteLength;
     }
   } catch (error) {
-    await cancelStreamReaderQuietly(reader, error);
+    cancelStreamReaderDetached(reader, error);
     throw error;
   } finally {
     reader?.releaseLock?.();
@@ -2137,6 +2164,14 @@ function hasCanonicalEnvelopeTokens(body: string): boolean {
     while (index < length) {
       const ch = body.charCodeAt(index);
       if (ch < 0x20) return undefined;
+      if (ch >= 0xd800 && ch <= 0xdbff) {
+        if (index + 1 >= length) return undefined;
+        const low = body.charCodeAt(index + 1);
+        if (low < 0xdc00 || low > 0xdfff) return undefined;
+        index += 2;
+        continue;
+      }
+      if (ch >= 0xdc00 && ch <= 0xdfff) return undefined;
       if (ch === 0x22) {
         const result = chunkStart === contentStart
           ? body.slice(contentStart, index)
@@ -2163,8 +2198,22 @@ function hasCanonicalEnvelopeTokens(body: string): boolean {
             if (index + 4 > length) return undefined;
             const hex = body.slice(index, index + 4);
             if (!/^[0-9a-fA-F]{4}$/.test(hex)) return undefined;
-            decoded += String.fromCharCode(parseInt(hex, 16));
+            const high = parseInt(hex, 16);
             index += 4;
+            if (high >= 0xdc00 && high <= 0xdfff) return undefined;
+            if (high >= 0xd800 && high <= 0xdbff) {
+              if (index + 6 > length || body.charCodeAt(index) !== 0x5c || body.charCodeAt(index + 1) !== 0x75) {
+                return undefined;
+              }
+              const lowHex = body.slice(index + 2, index + 6);
+              if (!/^[0-9a-fA-F]{4}$/.test(lowHex)) return undefined;
+              const low = parseInt(lowHex, 16);
+              if (low < 0xdc00 || low > 0xdfff) return undefined;
+              decoded += String.fromCharCode(high, low);
+              index += 6;
+            } else {
+              decoded += String.fromCharCode(high);
+            }
             break;
           }
           default:
@@ -2177,7 +2226,37 @@ function hasCanonicalEnvelopeTokens(body: string): boolean {
     }
     return undefined;
   };
-  const skipJsonValue = (): string | undefined => {
+  const readStringMap = (): boolean => {
+    skipWs();
+    if (index >= length || body.charCodeAt(index) !== 0x7b) return false;
+    index += 1;
+    skipWs();
+    if (index < length && body.charCodeAt(index) === 0x7d) {
+      index += 1;
+      return true;
+    }
+    while (index < length) {
+      skipWs();
+      if (readJsonString() === undefined) return false;
+      skipWs();
+      if (index >= length || body.charCodeAt(index) !== 0x3a) return false;
+      index += 1;
+      skipWs();
+      if (readJsonString() === undefined) return false;
+      skipWs();
+      if (index >= length) return false;
+      const sep = body.charCodeAt(index);
+      if (sep === 0x7d) {
+        index += 1;
+        return true;
+      }
+      if (sep !== 0x2c) return false;
+      index += 1;
+    }
+    return false;
+  };
+  const skipJsonValue = (depth: number): string | undefined => {
+    if (depth > 128) return undefined;
     skipWs();
     if (index >= length) return undefined;
     const start = index;
@@ -2185,21 +2264,49 @@ function hasCanonicalEnvelopeTokens(body: string): boolean {
     if (first === 0x22) {
       return readJsonString() === undefined ? undefined : body.slice(start, index);
     }
-    if (first === 0x7b || first === 0x5b) {
-      let depth = 0;
+    if (first === 0x7b) {
+      index += 1;
+      skipWs();
+      if (index < length && body.charCodeAt(index) === 0x7d) {
+        index += 1;
+        return body.slice(start, index);
+      }
       while (index < length) {
-        const ch = body.charCodeAt(index);
-        if (ch === 0x22) {
-          if (readJsonString() === undefined) return undefined;
-          continue;
-        }
-        if (ch === 0x7b || ch === 0x5b) depth += 1;
-        else if (ch === 0x7d || ch === 0x5d) {
-          depth -= 1;
+        skipWs();
+        if (readJsonString() === undefined) return undefined;
+        skipWs();
+        if (index >= length || body.charCodeAt(index) !== 0x3a) return undefined;
+        index += 1;
+        if (skipJsonValue(depth + 1) === undefined) return undefined;
+        skipWs();
+        if (index >= length) return undefined;
+        const sep = body.charCodeAt(index);
+        if (sep === 0x7d) {
           index += 1;
-          if (depth === 0) return body.slice(start, index);
-          continue;
+          return body.slice(start, index);
         }
+        if (sep !== 0x2c) return undefined;
+        index += 1;
+      }
+      return undefined;
+    }
+    if (first === 0x5b) {
+      index += 1;
+      skipWs();
+      if (index < length && body.charCodeAt(index) === 0x5d) {
+        index += 1;
+        return body.slice(start, index);
+      }
+      while (index < length) {
+        if (skipJsonValue(depth + 1) === undefined) return undefined;
+        skipWs();
+        if (index >= length) return undefined;
+        const sep = body.charCodeAt(index);
+        if (sep === 0x5d) {
+          index += 1;
+          return body.slice(start, index);
+        }
+        if (sep !== 0x2c) return undefined;
         index += 1;
       }
       return undefined;
@@ -2211,39 +2318,57 @@ function hasCanonicalEnvelopeTokens(body: string): boolean {
       }
       index += 1;
     }
-    return index > start ? body.slice(start, index) : undefined;
+    if (index <= start) return undefined;
+    const token = body.slice(start, index);
+    if (token === "true" || token === "false" || token === "null") {
+      return token;
+    }
+    if (!/^-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?$/.test(token)) {
+      return undefined;
+    }
+    return Number.isFinite(Number(token)) ? token : undefined;
   };
   skipWs();
   if (index >= length || body.charCodeAt(index) !== 0x7b) return false;
   index += 1;
+  skipWs();
+  if (index < length && body.charCodeAt(index) === 0x7d) return false;
   const requiredKeys = new Set(["version", "code", "name", "message", "details"]);
   const seenRequired = new Set<string>();
   while (index < length) {
     skipWs();
-    if (index < length && body.charCodeAt(index) === 0x7d) {
-      index += 1;
-      skipWs();
-      return index === length && seenRequired.size === requiredKeys.size;
-    }
     const key = readJsonString();
     if (key === undefined) return false;
     skipWs();
     if (index >= length || body.charCodeAt(index) !== 0x3a) return false;
     index += 1;
-    const rawToken = skipJsonValue();
-    if (rawToken === undefined) return false;
     if (requiredKeys.has(key)) {
       if (seenRequired.has(key)) return false;
-      if ((key === "version" || key === "code") && !/^(?:0|[1-9][0-9]*)$/.test(rawToken)) {
-        return false;
+      if (key === "details") {
+        if (!readStringMap()) return false;
+      } else if (key === "name" || key === "message") {
+        skipWs();
+        if (readJsonString() === undefined) return false;
+      } else {
+        const rawToken = skipJsonValue(1);
+        if (rawToken === undefined || !/^(?:0|[1-9][0-9]*)$/.test(rawToken)) {
+          return false;
+        }
       }
       seenRequired.add(key);
+    } else if (skipJsonValue(1) === undefined) {
+      return false;
     }
     skipWs();
-    if (index < length && body.charCodeAt(index) === 0x2c) {
+    if (index >= length) return false;
+    const sep = body.charCodeAt(index);
+    if (sep === 0x7d) {
       index += 1;
-      continue;
+      skipWs();
+      return index === length && seenRequired.size === requiredKeys.size;
     }
+    if (sep !== 0x2c) return false;
+    index += 1;
   }
   return false;
 }
@@ -2273,14 +2398,15 @@ function parseCanonicalRelayError(
     if (
       typeof record.details !== "object" ||
       record.details === null ||
-      Array.isArray(record.details) ||
-      !Object.values(record.details).every(value => typeof value === "string")
+      Array.isArray(record.details)
     ) {
       return undefined;
     }
     const rawCode = record.code as number;
     const rawDetails = record.details as Readonly<Record<string, string>>;
-    const expectedName = C2_ERROR_CODE_NAMES[rawCode];
+    const expectedName = Object.prototype.hasOwnProperty.call(C2_ERROR_CODE_NAMES, rawCode)
+      ? C2_ERROR_CODE_NAMES[rawCode]
+      : undefined;
     if (expectedName !== undefined) {
       if (record.name !== expectedName) {
         return undefined;
@@ -2294,10 +2420,10 @@ function parseCanonicalRelayError(
       };
     }
     const degradedDetails: Record<string, string> = { ...rawDetails };
-    if (degradedDetails.unknown_code === undefined) {
+    if (ownDetail(degradedDetails, "unknown_code") === undefined) {
       degradedDetails.unknown_code = String(rawCode);
     }
-    if (degradedDetails.unknown_name === undefined) {
+    if (ownDetail(degradedDetails, "unknown_name") === undefined) {
       degradedDetails.unknown_name = record.name;
     }
     return {

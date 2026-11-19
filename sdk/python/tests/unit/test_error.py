@@ -533,6 +533,23 @@ class _DiskCoreError(CoreError, OSError):
 class _PlainHybridOSError(CCBaseError, OSError):
     def __init__(self, *args: object):
         OSError.__init__(self, *args)
+        self._transport_phase = 'pre_dispatch'
+
+
+class _PlainCoreOSError(CoreError, OSError):
+    def __init__(self, *args: object):
+        CoreError.__init__(self, 'transport', 'core oserror')
+        OSError.__init__(self, *args)
+        self._transport_phase = 'pre_dispatch'
+
+    def __str__(self) -> str:
+        return OSError.__str__(self)
+
+
+class _HostileClassAttrCoreError(CoreError):
+    @property
+    def __class__(self):  # type: ignore[override]
+        raise RuntimeError('user __class__ getter must never run')
 
 
 class _BlockingClosedError(ResourceClosed, BlockingIOError):
@@ -598,16 +615,53 @@ def test_hybrid_oserror_and_exception_group_preserve_str_getset_and_weakref_pick
         assert clone.filename2 is None
     assert cleaned_fn2.transport_phase is None
 
-    # Explicit None errno in OSError(None, 'failure') preserves '[Errno None] failure'.
-    plain_none = _PlainHybridOSError(None, 'failure')
-    assert str(plain_none) == '[Errno None] failure'
+    # Explicit None errno in OSError(None, 'failure') preserves '[Errno None] failure'
+    # across real clone paths (CoreError+OSError and CCBaseError+OSError with transport_phase).
+    for cls in (_PlainCoreOSError, _PlainHybridOSError):
+        plain_none = cls(None, 'failure')
+        assert str(plain_none) == '[Errno None] failure'
+        assert plain_none.transport_phase == 'pre_dispatch'
+        cleaned_plain = cc_err._post_dispatch_cleanup_error(plain_none)
+        assert cleaned_plain is not plain_none
+        assert cleaned_plain.transport_phase is None
+        for clone in (
+            copy.copy(plain_none),
+            pickle.loads(pickle.dumps(plain_none)),
+            cleaned_plain,
+        ):
+            assert type(clone) is cls
+            assert clone is not plain_none
+            assert str(clone) == '[Errno None] failure'
+
+    # Oversized int errno (>4300 digits) never fails copy/pickle/cleanup or degrades subclass.
+    huge_errno_err = _DiskCoreError('huge errno')
+    huge_errno_err.errno = 10**5000
+    cleaned_huge = cc_err._post_dispatch_cleanup_error(huge_errno_err)
     for clone in (
-        copy.copy(plain_none),
-        pickle.loads(pickle.dumps(plain_none)),
-        cc_err._post_dispatch_cleanup_error(plain_none),
+        copy.copy(huge_errno_err),
+        pickle.loads(pickle.dumps(huge_errno_err)),
+        cleaned_huge,
     ):
-        assert isinstance(clone, _PlainHybridOSError)
-        assert str(clone) == '[Errno None] failure'
+        assert type(clone) is _DiskCoreError
+        assert clone is not huge_errno_err
+        assert clone.errno == 10**5000
+    assert cleaned_huge.transport_phase is None
+
+    # Non-OSError CoreError subclass overriding __class__ never invokes its getter.
+    hostile_cls_err = _HostileClassAttrCoreError('transport', 'hostile class attr')
+    hostile_cls_err._transport_phase = 'pre_dispatch'
+    cleaned_hostile = cc_err._post_dispatch_cleanup_error(hostile_cls_err)
+    assert cleaned_hostile is not hostile_cls_err
+    assert type(cleaned_hostile) is _HostileClassAttrCoreError
+    assert cleaned_hostile.transport_phase is None
+    for clone in (
+        copy.copy(hostile_cls_err),
+        pickle.loads(pickle.dumps(hostile_cls_err)),
+    ):
+        assert type(clone) is _HostileClassAttrCoreError
+        assert clone is not hostile_cls_err
+    assert cc_err._callback_semantic_copy(hostile_cls_err) is None
+    assert cc_err._project_native_error(hostile_cls_err) is None
 
     blocking = _BlockingClosedError('partial write before close')
     cleaned_blocking = cc_err._callback_error_copy(blocking)
