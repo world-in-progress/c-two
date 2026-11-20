@@ -167,6 +167,21 @@ A call returns a `cc.Stream`, an iterator of decoded items. Leaving a `with` blo
 
 Within the registering process, a stream passes the yielded objects themselves, without encoding, and steps under the route's own concurrency limits; a finite call deadline is refused before dispatch. Over IPC, Python and Rust resources and clients stream to each other, and through a relay they stream over HTTP with the same `cc.Stream`, `close` and hold behavior; there a resource can run ahead of a consumer that stops reading by as many items as the HTTP and TCP buffers hold, which for small items can be thousands. [Runtime lifecycle](runtime-lifecycle.md#execution-admission) describes steps, cancellation and shutdown.
 
+## Resident simulation pattern
+
+CRM methods default to `@cc.write`. Under `ConcurrencyConfig(mode='read_parallel', max_workers=...)`, writes execute exclusively while concurrent reads share up to `max_workers` permits (still serialized around queued writes). For long-running stateful simulations that must remain responsive to state inspection, parameter interventions and live subscribers while advancing, do not block inside a single long-lived `@cc.write` step call. Instead:
+
+- Run the simulation's time-stepping loop in a background thread owned by the resource, synchronizing internal state updates at step boundaries.
+- Register the route with `ConcurrencyConfig(mode='read_parallel', max_workers=...)` so concurrent observers do not serialize behind one another.
+- Keep contract methods short: expose `@cc.read` for snapshot queries, `@cc.write` for queueing interventions into the stepping loop, and `@cc.stream` combined with `@cc.read` for pushing published state frames. Ensure each stream `next()` step finishes promptly on its own or exits via an application-side signal before `unregister()` / `shutdown()` — Core drains any currently executing stream step before Python invokes `@cc.on_shutdown`, so `@cc.on_shutdown` performs final cleanup rather than waking an indefinitely blocked step.
+- For what-if branching from live state, clone the resource state in application code, register the temporary branch under a new route name with `register()`, and call `unregister()` once the branch finishes; active streams and concurrent calls on the primary route continue unaffected.
+
+See [resident_simulation.py](../../examples/python/resident_simulation.py) for a complete runnable example covering background stepping, live streaming, interventions, dynamic branch registration and clean shutdown.
+
+### Deployment layering for web frontends
+
+`c3 relay` is an internal routing fabric for C-Two peers, not a public browser-facing API; web browsers run inside a sandbox that cannot use local IPC or host a relay. When a web UI needs to inspect, steer or subscribe to a resident resource, place a Python backend gateway (BFF) on the application tier that connects to resources with standard `cc.connect(...)` over direct IPC or `c3 relay`, and expose HTTP or WebSocket endpoints from that gateway to browsers.
+
 ## Entry points
 
 ### Python SDK

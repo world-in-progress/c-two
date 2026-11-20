@@ -343,15 +343,25 @@ class NativeServerBridge:
         self._runtime_session.ensure_host_started()
 
     def shutdown(self, *, timeout: float = 30.0) -> ShutdownOutcome:
+        with self._slots_lock:
+            observed_slots = dict(self._slots)
         outcome = dict(self._runtime_session.shutdown(
             timeout_seconds=float(timeout),
         ))
 
-        for slot in self._take_shutdown_slots(outcome):
+        for slot in self._take_shutdown_slots(
+            outcome,
+            expected_slots=observed_slots,
+        ):
             self._invoke_shutdown(slot)
         return outcome
 
-    def _take_shutdown_slots(self, outcome: dict[str, Any]) -> list[CRMSlot]:
+    def _take_shutdown_slots(
+        self,
+        outcome: dict[str, Any],
+        *,
+        expected_slots: dict[str, CRMSlot] | None = None,
+    ) -> list[CRMSlot]:
         """Consume the native journal once; the caller invokes hooks outside locks."""
         if not outcome['completed']:
             return []
@@ -360,6 +370,10 @@ class NativeServerBridge:
         with self._slots_lock:
             for name, close in close_by_route.items():
                 if _close_outcome_is_hook_safe(close):
+                    if expected_slots is not None:
+                        expected = expected_slots.get(name)
+                        if expected is None or self._slots.get(name) is not expected:
+                            continue
                     slot = self._slots.pop(name, None)
                     if slot is not None:
                         removed_slots.append(slot)
