@@ -1,0 +1,109 @@
+{
+  "version": "0.11.0",
+  "cli_version": "0.7.0",
+  "cli_tag": "c3-v0.7.0",
+  "cli_published": true,
+  "published_date": "2026-11-20",
+  "source_sha": "50be9a7966d6c8381715809440d69502c3cee5de",
+  "source_tree": "8796bd2ef5dacf7c145bdf3e511172b4111ac063",
+  "pull_request": "https://github.com/world-in-progress/c-two/pull/232",
+  "pull_request_head": "b413e89d12a65594d28a6599ab4953dfdfc63c15",
+  "protocols": {
+    "ipc": 16,
+    "shm": 4,
+    "c_ffi_abi": 8,
+    "relay_mesh": 7,
+    "unix_namespace_disk_format": 3,
+    "unix_credential_schema": 4,
+    "error_wire": "C2E1-v1"
+  },
+  "fastdb": {
+    "version": "0.2.4",
+    "source_sha": "f82fa13adeae2b87a295bf984821c85c44b55a3d",
+    "sdist_sha256": "edaf8855b848cf6c4129f59c69d4236ec4198aa507af65cc134246e2e7f67c33"
+  },
+  "source_validation": {
+    "selected": {
+      "run_id": 44722552798,
+      "run_url": "https://github.com/world-in-progress/c-two/actions/runs/44722552798",
+      "event": "pull_request",
+      "tested_sha": "b413e89d12a65594d28a6599ab4953dfdfc63c15",
+      "tree_sha": "8796bd2ef5dacf7c145bdf3e511172b4111ac063",
+      "jobs_passed": 9,
+      "job_attempts": {
+        "source (macos-15, py3.12)": 1,
+        "source (ubuntu-24.04, py3.12)": 1,
+        "source (ubuntu-24.04, py3.14t)": 1,
+        "source (windows-11-arm, py3.12)": 1,
+        "source (windows-2025, py3.12)": 1,
+        "workflow policy": 1
+      },
+      "full_artifacts_per_lane": 1
+    },
+    "main_push": {
+      "run_id": 44729149514,
+      "run_url": "https://github.com/world-in-progress/c-two/actions/runs/44729149514",
+      "source": "50be9a7966d6c8381715809440d69502c3cee5de",
+      "attempt": 1,
+      "scope": "workflow policy only; source lanes skipped via same-tree PR evidence"
+    }
+  },
+  "release_candidate": {
+    "run_id": 44729160630,
+    "run_url": "https://github.com/world-in-progress/c-two/actions/runs/44729160630",
+    "source": "50be9a7966d6c8381715809440d69502c3cee5de",
+    "successful_jobs": 38,
+    "expected_skipped_jobs": [
+      "linux (aarch64-unknown-linux-gnu) / sdist"
+    ],
+    "manifest_sha256": "87a9d8e2f6e2b7d7a19ff9992eab7ecff2023d90140cb4bcdbb0e84f95e82d08"
+  },
+  "promotion": {
+    "cli": {
+      "run_id": 44732649732,
+      "run_url": "https://github.com/world-in-progress/c-two/actions/runs/44732649732",
+      "result": "success",
+      "environment": "github-release"
+    },
+    "python": {
+      "run_id": 44732655064,
+      "run_url": "https://github.com/world-in-progress/c-two/actions/runs/44732655064",
+      "result": "success",
+      "environment": "pypi"
+    }
+  },
+  "timing_utc": {
+    "pr_merged_at": "2026-11-20T11:37:40Z",
+    "release_candidate_completed_at": "2026-11-20T12:02:35Z",
+    "cli_published_at": "2026-11-20T12:10:10Z",
+    "pypi_uploaded_at": "2026-11-20T12:11:36Z",
+    "python_release_completed_at": "2026-11-20T12:12:37Z",
+    "merge_to_dual_publication_minutes": 35
+  },
+  "publication": {
+    "github_release_url": "https://github.com/world-in-progress/c-two/releases/tag/c3-v0.7.0",
+    "github_release_assets": 17,
+    "github_release_sizes_matched": true,
+    "pypi_url": "https://pypi.org/project/c-two/0.11.0/",
+    "python_files": 36,
+    "wheels": 35,
+    "windows_arm64_wheels": 5,
+    "sdist": 1,
+    "yanked": 0,
+    "pypi_sha256_all_matched": true
+  },
+  "post_release_smoke": {
+    "environment": "macOS arm64, CPython 3.13.3",
+    "c3_binary": {
+      "asset": "c3-aarch64-apple-darwin",
+      "sha256_verified": true,
+      "version_output": "c3 0.7.0",
+      "dry_run_ok": true
+    },
+    "pypi_install": {
+      "spec": "c-two[fastdb]==0.11.0",
+      "fastdb4py_version": "0.2.4",
+      "ipc_unary_hold_stream_shutdown_ok": true
+    }
+  }
+}
