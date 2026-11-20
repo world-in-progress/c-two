@@ -168,7 +168,9 @@ export interface C2FetchResponse {
 
 export interface C2AbortSignal {
   readonly aborted: boolean;
+  readonly reason?: unknown;
   addEventListener(type: "abort", listener: () => void, options?: { readonly once?: boolean }): void;
+  removeEventListener?(type: "abort", listener: () => void): void;
 }
 
 export type C2Fetch = (
@@ -773,10 +775,10 @@ function createIpcTargetTransport<Payload extends C2ResponsePayload>(address: st
       const response = await call.next();
       if (response === null) throw new C2IpcTransportError("C-Two unary call ended without a response.");
       responses += 1;
-      let result: Payload;
-      try { result = copyResponsePayloadToAllocator(response, allocator); }
+      let delivery: C2PendingResponseDelivery<Payload>;
+      try { delivery = copyResponsePayloadToAllocator(response, allocator); }
       finally { if (allocator !== undefined) response.release(); }
-      return observeTransportResponse(result, observe, {
+      return observeTransportResponse(delivery, observe, {
         path: observationPath === "RelayAwareLocalIpc" ? observationPath : target.path, routeName,
         serverId: target.serverId, serverInstanceId: target.serverInstanceId,
         connectionId: String(target.connectionId),
@@ -1095,9 +1097,9 @@ function createRelayTransport<Payload extends C2ResponsePayload>(baseUrl: string
         if (target.local !== undefined) return await target.local.transport.callAcquired(routeName, method, encode, budget);
         const request = encodeHttpUnaryInput(encode, budget);
         requests += 1;
-        const response = await callResolvedHttpRoute(fetchImpl, target.relayUrl, routeName, routeContract, method, request, headers, budget.remaining() ?? 0, allocator, unknownLengthStrategy, unknownLengthMaxBytes);
+        const delivery = await callResolvedHttpRoute(fetchImpl, target.relayUrl, routeName, routeContract, method, request, headers, budget.remaining() ?? 0, allocator, unknownLengthStrategy, unknownLengthMaxBytes);
         responses += 1;
-        return observeTransportResponse(response, observe, {
+        return observeTransportResponse(delivery, observe, {
           path: explicit ? "ExplicitRelay" : "RelayAwareHttp", routeName,
           relayUrl: target.relayUrl, requests, responses,
         });
@@ -1190,17 +1192,46 @@ function retainableResponsePayload(value: C2ResponsePayload): C2ResponsePayload 
   return value;
 }
 
+interface C2PendingResponseDelivery<Payload extends C2ResponsePayload> {
+  readonly payload: Payload;
+  release(): void;
+}
+
+function makePlainDelivery<Payload extends C2ResponsePayload>(payload: Payload): C2PendingResponseDelivery<Payload> {
+  let released = false;
+  return {
+    payload,
+    release() {
+      if (released) return;
+      released = true;
+      tryReleaseResponsePayload(payload);
+    },
+  };
+}
+
+function makeAllocatedDelivery<Payload extends C2ResponsePayload>(allocated: C2AllocatedResponsePayload<Payload>): C2PendingResponseDelivery<Payload> {
+  let released = false;
+  return {
+    payload: allocated.payload,
+    release() {
+      if (released) return;
+      released = true;
+      tryReleaseAllocatedResponsePayload(allocated);
+    },
+  };
+}
+
 function copyResponsePayloadToAllocator<Payload extends C2ResponsePayload>(
   payload: Uint8Array,
   allocator: C2ResponsePayloadAllocator<Payload> | undefined,
-): Payload {
+): C2PendingResponseDelivery<Payload> {
   if (allocator === undefined) {
-    return payload as Payload;
+    return makePlainDelivery(payload as Payload);
   }
   const allocated = requireAllocatedResponsePayload<Payload>(allocator(payload.byteLength), payload.byteLength);
   try {
     allocated.view.set(payload);
-    return allocated.payload;
+    return makeAllocatedDelivery(allocated);
   } catch (error) {
     tryReleaseAllocatedResponsePayload(allocated);
     throw error;
@@ -1212,7 +1243,8 @@ async function readHttpSuccessResponsePayload<Payload extends C2ResponsePayload>
   allocator: C2ResponsePayloadAllocator<Payload> | undefined,
   unknownLengthStrategy: C2ResponsePayloadUnknownLengthStrategy,
   unknownLengthMaxBytes: number,
-): Promise<Payload> {
+  signal?: C2AbortSignal,
+): Promise<C2PendingResponseDelivery<Payload>> {
   if (allocator !== undefined) {
     const wireContentLength = responseContentLength(response);
     const contentLength = responseHasIdentityContentEncoding(response) ? wireContentLength : undefined;
@@ -1223,27 +1255,34 @@ async function readHttpSuccessResponsePayload<Payload extends C2ResponsePayload>
       if (response.body === undefined || response.body === null) {
         throw new Error("C-Two HTTP relay response body stream is required when responsePayloadAllocator is configured.");
       }
-      return await readUnknownLengthAllocatedResponsePayload(response.body, allocator, unknownLengthMaxBytes);
+      return await readUnknownLengthAllocatedResponsePayload(response.body, allocator, unknownLengthMaxBytes, signal);
     }
     if (contentLength === 0) {
       if (response.body === undefined || response.body === null) {
-        return requireAllocatedResponsePayload<Payload>(allocator(0), 0).payload;
+        const actualBytes = new Uint8Array(await response.arrayBuffer());
+        if (signal?.aborted) {
+          throw abortReason(signal);
+        }
+        if (actualBytes.byteLength !== 0) {
+          throw new Error("C-Two HTTP relay response body byte length does not match Content-Length.");
+        }
+        return makeAllocatedDelivery(requireAllocatedResponsePayload<Payload>(allocator(0), 0));
       }
-      return await readAllocatedResponsePayload(response.body, 0, allocator);
+      return await readAllocatedResponsePayload(response.body, 0, allocator, signal);
     }
     if (response.body === undefined || response.body === null) {
       throw new Error("C-Two HTTP relay response body stream is required when responsePayloadAllocator is configured.");
     }
-    return await readAllocatedResponsePayload(response.body, contentLength, allocator);
+    return await readAllocatedResponsePayload(response.body, contentLength, allocator, signal);
   }
-  return await readHttpArrayBufferResponsePayload(response) as Payload;
+  return makePlainDelivery(await readHttpArrayBufferResponsePayload(response, signal) as Payload);
 }
 
-async function readHttpArrayBufferResponsePayload(response: C2FetchResponse): Promise<Uint8Array> {
+async function readHttpArrayBufferResponsePayload(response: C2FetchResponse, signal?: C2AbortSignal): Promise<Uint8Array> {
   const contentLength = responseContentLength(response);
   const identityEncoding = responseHasIdentityContentEncoding(response);
   if (!identityEncoding && response.body !== undefined && response.body !== null) {
-    return await readBoundedStreamBytes(response.body, C2_MAX_RESPONSE_PAYLOAD_BYTES);
+    return await readBoundedStreamBytes(response.body, C2_MAX_RESPONSE_PAYLOAD_BYTES, signal);
   }
   const payload = new Uint8Array(await response.arrayBuffer());
   if (payload.byteLength > C2_MAX_RESPONSE_PAYLOAD_BYTES) {
@@ -1253,6 +1292,46 @@ async function readHttpArrayBufferResponsePayload(response: C2FetchResponse): Pr
     throw new Error("C-Two HTTP relay response body byte length does not match Content-Length.");
   }
   return payload;
+}
+
+function abortReason(signal: C2AbortSignal): unknown {
+  return signal.reason ?? new Error("C-Two HTTP relay response read aborted.");
+}
+
+function createStreamAbortGuard(
+  signal: C2AbortSignal | undefined,
+  onAbortCleanup: (reason: unknown) => void,
+): {
+  readChunk: (reader: C2ReadableStreamReader) => Promise<{ done: boolean; value?: C2ByteArray }>;
+  dispose: () => void;
+} {
+  if (signal === undefined) {
+    return {
+      readChunk: (reader) => reader.read(),
+      dispose: () => undefined,
+    };
+  }
+  let rejectAbort: ((reason: unknown) => void) | undefined;
+  const abortPromise = new Promise<never>((_resolve, reject) => {
+    rejectAbort = reject;
+  });
+  abortPromise.catch(() => undefined);
+  const handleAbort = () => {
+    const reason = abortReason(signal);
+    onAbortCleanup(reason);
+    rejectAbort?.(reason);
+  };
+  if (signal.aborted) {
+    handleAbort();
+  } else {
+    signal.addEventListener("abort", handleAbort, { once: true });
+  }
+  return {
+    readChunk: (reader) => Promise.race([reader.read(), abortPromise]),
+    dispose: () => {
+      signal.removeEventListener?.("abort", handleAbort);
+    },
+  };
 }
 
 function cancelStreamReaderDetached(reader: C2ReadableStreamReader | undefined, reason: unknown): void {
@@ -1292,15 +1371,25 @@ function releaseStreamReaderLock(reader: C2ReadableStreamReader | undefined, sup
   }
 }
 
-async function readBoundedStreamBytes(body: C2ReadableStream, maxBytes: number): Promise<Uint8Array> {
+async function readBoundedStreamBytes(body: C2ReadableStream, maxBytes: number, signal?: C2AbortSignal): Promise<Uint8Array> {
+  if (signal?.aborted) {
+    throw abortReason(signal);
+  }
   const chunks: Uint8Array[] = [];
   let byteLength = 0;
   let reader: C2ReadableStreamReader | undefined;
-  let failed = false;
+  let readerCleanedUp = false;
+  const cleanupReaderOnFailure = (reason: unknown) => {
+    if (readerCleanedUp) return;
+    readerCleanedUp = true;
+    cancelStreamReaderDetached(reader, reason);
+    releaseStreamReaderLock(reader, true);
+  };
+  const abortGuard = createStreamAbortGuard(signal, cleanupReaderOnFailure);
   try {
     reader = body.getReader();
     while (true) {
-      const chunk = await reader.read();
+      const chunk = await abortGuard.readChunk(reader);
       if (chunk.done) {
         break;
       }
@@ -1320,12 +1409,13 @@ async function readBoundedStreamBytes(body: C2ReadableStream, maxBytes: number):
       chunks.push(new Uint8Array(chunk.value));
       byteLength = nextByteLength;
     }
+    readerCleanedUp = true;
+    releaseStreamReaderLock(reader, false);
   } catch (error) {
-    failed = true;
-    cancelStreamReaderDetached(reader, error);
+    cleanupReaderOnFailure(error);
     throw error;
   } finally {
-    releaseStreamReaderLock(reader, failed);
+    abortGuard.dispose();
   }
   const out = new Uint8Array(byteLength);
   let offset = 0;
@@ -1363,15 +1453,34 @@ function responseContentLength(response: C2FetchResponse): number | undefined {
   return value;
 }
 
-async function readAllocatedResponsePayload<Payload extends C2ResponsePayload>(body: C2ReadableStream, byteLength: number, allocator: C2ResponsePayloadAllocator<Payload>): Promise<Payload> {
+async function readAllocatedResponsePayload<Payload extends C2ResponsePayload>(
+  body: C2ReadableStream,
+  byteLength: number,
+  allocator: C2ResponsePayloadAllocator<Payload>,
+  signal?: C2AbortSignal,
+): Promise<C2PendingResponseDelivery<Payload>> {
+  if (signal?.aborted) {
+    throw abortReason(signal);
+  }
   const allocated = requireAllocatedResponsePayload<Payload>(allocator(byteLength), byteLength);
+  const delivery = makeAllocatedDelivery(allocated);
   let reader: C2ReadableStreamReader | undefined;
-  let readerUnlocked = false;
+  let readerCleanedUp = false;
   let offset = 0;
+  const cleanupReaderOnFailure = (reason: unknown) => {
+    if (readerCleanedUp) return;
+    readerCleanedUp = true;
+    cancelStreamReaderDetached(reader, reason);
+    releaseStreamReaderLock(reader, true);
+  };
+  const abortGuard = createStreamAbortGuard(signal, (reason) => {
+    cleanupReaderOnFailure(reason);
+    delivery.release();
+  });
   try {
     reader = body.getReader();
     while (true) {
-      const chunk = await reader.read();
+      const chunk = await abortGuard.readChunk(reader);
       if (chunk.done) {
         break;
       }
@@ -1387,17 +1496,15 @@ async function readAllocatedResponsePayload<Payload extends C2ResponsePayload>(b
     if (offset !== byteLength) {
       throw new Error("C-Two HTTP relay response stream ended before Content-Length bytes were read.");
     }
-    readerUnlocked = true;
+    readerCleanedUp = true;
     releaseStreamReaderLock(reader, false);
-    return allocated.payload;
+    return delivery;
   } catch (error) {
-    if (!readerUnlocked) {
-      cancelStreamReaderDetached(reader, error);
-      readerUnlocked = true;
-      releaseStreamReaderLock(reader, true);
-    }
-    tryReleaseAllocatedResponsePayload(allocated);
+    cleanupReaderOnFailure(error);
+    delivery.release();
     throw error;
+  } finally {
+    abortGuard.dispose();
   }
 }
 
@@ -1405,15 +1512,26 @@ async function readUnknownLengthAllocatedResponsePayload<Payload extends C2Respo
   body: C2ReadableStream,
   allocator: C2ResponsePayloadAllocator<Payload>,
   maxBytes: number,
-): Promise<Payload> {
+  signal?: C2AbortSignal,
+): Promise<C2PendingResponseDelivery<Payload>> {
+  if (signal?.aborted) {
+    throw abortReason(signal);
+  }
   const chunks: Uint8Array[] = [];
   let byteLength = 0;
   let reader: C2ReadableStreamReader | undefined;
-  let failed = false;
+  let readerCleanedUp = false;
+  const cleanupReaderOnFailure = (reason: unknown) => {
+    if (readerCleanedUp) return;
+    readerCleanedUp = true;
+    cancelStreamReaderDetached(reader, reason);
+    releaseStreamReaderLock(reader, true);
+  };
+  const abortGuard = createStreamAbortGuard(signal, cleanupReaderOnFailure);
   try {
     reader = body.getReader();
     while (true) {
-      const chunk = await reader.read();
+      const chunk = await abortGuard.readChunk(reader);
       if (chunk.done) {
         break;
       }
@@ -1430,12 +1548,16 @@ async function readUnknownLengthAllocatedResponsePayload<Payload extends C2Respo
       chunks.push(new Uint8Array(chunk.value));
       byteLength = nextByteLength;
     }
+    readerCleanedUp = true;
+    releaseStreamReaderLock(reader, false);
   } catch (error) {
-    failed = true;
-    cancelStreamReaderDetached(reader, error);
+    cleanupReaderOnFailure(error);
     throw error;
   } finally {
-    releaseStreamReaderLock(reader, failed);
+    abortGuard.dispose();
+  }
+  if (signal?.aborted) {
+    throw abortReason(signal);
   }
   const allocated = requireAllocatedResponsePayload<Payload>(allocator(byteLength), byteLength);
   try {
@@ -1444,7 +1566,7 @@ async function readUnknownLengthAllocatedResponsePayload<Payload extends C2Respo
       allocated.view.set(chunk, offset);
       offset += chunk.byteLength;
     }
-    return allocated.payload;
+    return makeAllocatedDelivery(allocated);
   } catch (error) {
     tryReleaseAllocatedResponsePayload(allocated);
     throw error;
@@ -1756,7 +1878,7 @@ async function probeResolvedHttpRoute(
     }
     let bodyBytes: Uint8Array;
     try {
-      bodyBytes = await readHttpArrayBufferResponsePayload(response);
+      bodyBytes = await readHttpArrayBufferResponsePayload(response, signal);
     } catch (error) {
       throw new C2HttpTransportError(`C-Two HTTP relay probe body read failed: ${String(error)}`, error, "pre_dispatch");
     }
@@ -1776,66 +1898,73 @@ async function callResolvedHttpRoute<Payload extends C2ResponsePayload>(
   responsePayloadAllocator: C2ResponsePayloadAllocator<Payload> | undefined,
   responsePayloadUnknownLengthStrategy: C2ResponsePayloadUnknownLengthStrategy,
   responsePayloadUnknownLengthMaxBytes: number,
-): Promise<Payload> {
-  return await fetchWithTimeout(async (signal) => {
-    let response: C2FetchResponse;
-    try {
-      response = await fetchImpl(
-        `${relayUrl}/${encodePathSegment(routeName)}/${encodePathSegment(method)}`,
-        {
-          method: "POST",
-          headers: requestHeadersForRouteContract(headers, routeContract),
-          body: requestPayload,
-          signal,
-        },
-      );
-    } catch (error) {
-      throw new C2HttpTransportError(`C-Two HTTP relay call fetch failed: ${String(error)}`, error);
-    }
-    if (response.status === 200) {
+): Promise<C2PendingResponseDelivery<Payload>> {
+  return await fetchWithTimeout(
+    async (signal) => {
+      let response: C2FetchResponse;
       try {
-        return await readHttpSuccessResponsePayload(
-          response,
-          responsePayloadAllocator,
-          responsePayloadUnknownLengthStrategy,
-          responsePayloadUnknownLengthMaxBytes,
+        response = await fetchImpl(
+          `${relayUrl}/${encodePathSegment(routeName)}/${encodePathSegment(method)}`,
+          {
+            method: "POST",
+            headers: requestHeadersForRouteContract(headers, routeContract),
+            body: requestPayload,
+            signal,
+          },
         );
       } catch (error) {
-        throw new C2HttpTransportError(`C-Two HTTP relay call body read failed: ${String(error)}`);
+        throw new C2HttpTransportError(`C-Two HTTP relay call fetch failed: ${String(error)}`, error);
       }
-    }
-    if (response.status === 500) {
-      let errorPayload: Uint8Array;
+      if (response.status === 200) {
+        try {
+          return await readHttpSuccessResponsePayload(
+            response,
+            responsePayloadAllocator,
+            responsePayloadUnknownLengthStrategy,
+            responsePayloadUnknownLengthMaxBytes,
+            signal,
+          );
+        } catch (error) {
+          throw new C2HttpTransportError(`C-Two HTTP relay call body read failed: ${String(error)}`);
+        }
+      }
+      if (response.status === 500) {
+        let errorPayload: Uint8Array;
+        try {
+          errorPayload = await readHttpArrayBufferResponsePayload(response, signal);
+        } catch (error) {
+          throw new C2HttpTransportError(`C-Two HTTP relay call body read failed: ${String(error)}`);
+        }
+        throw new C2CrmMethodError(errorPayload);
+      }
+      let bodyBytes: Uint8Array;
       try {
-        errorPayload = await readHttpArrayBufferResponsePayload(response);
+        bodyBytes = await readHttpArrayBufferResponsePayload(response, signal);
       } catch (error) {
         throw new C2HttpTransportError(`C-Two HTTP relay call body read failed: ${String(error)}`);
       }
-      throw new C2CrmMethodError(errorPayload);
-    }
-    let bodyBytes: Uint8Array;
-    try {
-      bodyBytes = await readHttpArrayBufferResponsePayload(response);
-    } catch (error) {
-      throw new C2HttpTransportError(`C-Two HTTP relay call body read failed: ${String(error)}`);
-    }
-    throw new C2HttpRelayError(response.status, bodyBytes);
-  }, callTimeoutMs, "C-Two HTTP relay call", "dispatch_uncertain");
+      throw new C2HttpRelayError(response.status, bodyBytes);
+    },
+    callTimeoutMs,
+    "C-Two HTTP relay call",
+    "dispatch_uncertain",
+    (lateDelivery) => lateDelivery.release(),
+  );
 }
 
 function observeTransportResponse<Payload extends C2ResponsePayload>(
-  response: Payload,
+  delivery: C2PendingResponseDelivery<Payload>,
   observe: C2TransportObserver | undefined,
   observation: C2TransportObservation,
 ): Payload {
   if (observe === undefined) {
-    return response;
+    return delivery.payload;
   }
   try {
     observe(Object.freeze({ ...observation }));
-    return response;
+    return delivery.payload;
   } catch (error) {
-    tryReleaseResponsePayload(response);
+    delivery.release();
     throw error;
   }
 }
@@ -1974,6 +2103,7 @@ async function fetchWithTimeout<T>(
   timeoutMs: number,
   label: string,
   phase: "pre_dispatch" | "dispatch_uncertain" = "pre_dispatch",
+  onLateResult?: (value: T) => void,
 ): Promise<T> {
   if (timeoutMs === 0) {
     return await operation(undefined);
@@ -1991,8 +2121,23 @@ async function fetchWithTimeout<T>(
       reject(error);
     }, timeoutMs);
   });
+  const opPromise = operation(controller?.signal);
+  if (onLateResult !== undefined) {
+    void opPromise.then(
+      (value) => {
+        if (timedOut) {
+          try {
+            onLateResult(value);
+          } catch {
+            // Ignore late cleanup failures after timeout rejection.
+          }
+        }
+      },
+      () => undefined,
+    );
+  }
   try {
-    return await Promise.race([operation(controller?.signal), timeoutPromise]);
+    return await Promise.race([opPromise, timeoutPromise]);
   } catch (error) {
     if (timedOut) {
       throw timeoutError();

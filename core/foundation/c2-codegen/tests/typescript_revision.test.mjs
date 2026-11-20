@@ -1299,4 +1299,140 @@ test('extension JSON depth/IEEE-754 boundaries and synchronous reader cleanup fa
   const fakeEnv={DYLD_LIBRARY_PATH:`/old/lib${delimiter}/selected/lib`};
   prependEnvPaths(fakeEnv,'DYLD_LIBRARY_PATH',['/selected/lib']);
   assert.equal(fakeEnv.DYLD_LIBRARY_PATH,`/selected/lib${delimiter}/old/lib`);
+
+  // 5. Bodyless C2FetchResponse (body omitted, arrayBuffer() provided) with Content-Length: 0
+  // verifies actual arrayBuffer() byteLength before delivering 0-byte allocation.
+  for(const [bufBytes,shouldReject] of [
+    [Uint8Array.of(7),true],
+    [new Uint8Array(0),false],
+  ]){
+    let allocated=0,freed=0;
+    const bodylessClient=transport.createRelayAwareHttpEncodedTransport('http://localhost:8300',{
+      responsePayloadAllocator(byteLength){
+        allocated++;
+        const backing=new Uint8Array(byteLength);
+        return {view:backing,payload:backing,release(){freed++;}};
+      },
+      fetch:async(url,init)=>{
+        if(url.includes('/_resolve/'))return textReply(200,JSON.stringify([relayRoute()]));
+        if(url.includes('/_probe/'))return relayResponse();
+        assert.equal(init.method,'POST');
+        return {
+          status:200,
+          headers:{get(name){return name.toLowerCase()==='content-length'?'0':null}},
+          async arrayBuffer(){return bufBytes.slice().buffer;},
+        };
+      },
+    });
+    try{
+      if(shouldReject){
+        await assert.rejects(bodylessClient.call('route',contract,'ping',()=>new Uint8Array()),err=>{
+          assert.ok(err instanceof transport.C2HttpTransportError);
+          assert.equal(err.transportPhase,'dispatch_uncertain');
+          assert.equal(err.retrySafe,false);
+          assert.match(err.message,/does not match Content-Length/);
+          return true;
+        });
+        assert.deepEqual({allocated,freed},{allocated:0,freed:0});
+      }else{
+        const ok=await bodylessClient.call('route',contract,'ping',()=>new Uint8Array());
+        assert.equal(ok.byteLength,0);
+        assert.deepEqual({allocated,freed},{allocated:1,freed:0});
+      }
+    }finally{await bodylessClient.close()}
+  }
+
+  // 6. Delayed-EOF zero-length ReadableStream finishing after callTimeoutMs releases its allocation once.
+  {
+    let allocated=0,freed=0,finishEof;
+    const eofGate=new Promise(r=>{finishEof=r;});
+    const slowZeroBody=new ReadableStream({
+      async pull(controller){
+        await eofGate;
+        controller.close();
+      },
+    });
+    const slowClient=transport.createRelayAwareHttpEncodedTransport('http://localhost:8300',{
+      callTimeoutMs:20,
+      responsePayloadAllocator(byteLength){
+        allocated++;
+        const backing=new Uint8Array(byteLength);
+        return {view:backing,payload:backing,release(){freed++;}};
+      },
+      fetch:async(url,init)=>{
+        if(url.includes('/_resolve/'))return textReply(200,JSON.stringify([relayRoute()]));
+        if(url.includes('/_probe/'))return relayResponse();
+        assert.equal(init.method,'POST');
+        return {
+          status:200,
+          headers:{get(name){return name.toLowerCase()==='content-length'?'0':null}},
+          body:slowZeroBody,
+          async arrayBuffer(){throw new Error('must stream');},
+        };
+      },
+    });
+    try{
+      await assert.rejects(slowClient.call('route',contract,'ping',()=>new Uint8Array()),err=>{
+        assert.ok(err instanceof transport.C2CoreError);
+        assert.equal(err.code,715);
+        assert.equal(err.transportPhase,'dispatch_uncertain');
+        return true;
+      });
+      assert.deepEqual({allocated,freed},{allocated:1,freed:1});
+      finishEof();
+      await nextTurn();
+      await nextTurn();
+      assert.deepEqual({allocated,freed},{allocated:1,freed:1});
+    }finally{await slowClient.close()}
+  }
+
+  // 7. Allocator record-level release() runs once when observe() throws on both HTTP and IPC.
+  {
+    let httpAllocated=0,httpFreed=0;
+    const obsHttp=transport.createRelayAwareHttpEncodedTransport('http://localhost:8300',{
+      responsePayloadAllocator(byteLength){
+        httpAllocated++;
+        const backing=new Uint8Array(byteLength);
+        return {view:backing,payload:backing,release(){httpFreed++;}};
+      },
+      observe(){throw new Error('observer boom');},
+      fetch:async(url,init)=>{
+        if(url.includes('/_resolve/'))return textReply(200,JSON.stringify([relayRoute()]));
+        if(url.includes('/_probe/'))return relayResponse();
+        assert.equal(init.method,'POST');
+        return new Response(Uint8Array.of(5,6),{status:200,headers:{'content-length':'2'}});
+      },
+    });
+    try{
+      await assert.rejects(obsHttp.call('route',contract,'ping',()=>new Uint8Array()),/observer boom/);
+      assert.deepEqual({httpAllocated,httpFreed},{httpAllocated:1,httpFreed:1});
+    }finally{await obsHttp.close()}
+
+    let ipcAllocated=0,ipcFreed=0,nativeFreed=0;
+    const endpoint={
+      connectionSnapshot(){return null},
+      async prepare(){return binding},
+      beginCall(){return {
+        async chargeInput(){},
+        async dispatch(){return nativeTarget},
+        async next(){const b=Uint8Array.of(9);b.release=()=>{nativeFreed++};return b},
+        checkDeadline(){},cancel(){},close(){},
+        async observe(){return receipt},
+      }},
+      deactivate(){},async close(){},
+    };
+    const obsIpc=transport.createIpcEncodedTransport('ipc://obs',{
+      connect:async()=>endpoint,
+      responsePayloadAllocator(byteLength){
+        ipcAllocated++;
+        const backing=new Uint8Array(byteLength);
+        return {view:backing,payload:backing,release(){ipcFreed++;}};
+      },
+      observe(){throw new Error('ipc observer boom');},
+    });
+    try{
+      await assert.rejects(obsIpc.call('route',contract,'ping',()=>new Uint8Array()),/ipc observer boom/);
+      assert.deepEqual({ipcAllocated,ipcFreed,nativeFreed},{ipcAllocated:1,ipcFreed:1,nativeFreed:1});
+    }finally{await obsIpc.close()}
+  }
 });

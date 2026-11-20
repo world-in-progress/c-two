@@ -94,8 +94,9 @@ function buildFastDbEnvironment() {
     const dir = resolve(env.FASTDB_PAYLOAD_SYSTEM_LIB_DIR);
     env.FASTDB_PAYLOAD_SYSTEM_LIB_DIR = dir;
     runtimeDirs = [dir];
-  } else if (!env.FASTDB_CORE_SDK_DIR) {
+  } else {
     const discovered =
+      (env.FASTDB_CORE_SDK_DIR ? findFastDbLibraryLocations(resolve(env.FASTDB_CORE_SDK_DIR)) : undefined) ??
       findFastDbLibraryLocations(resolve(repoRoot, '.venv')) ??
       findFastDbLibraryLocations(resolve(repoRoot, '..', 'fastdb', 'build'));
     if (discovered !== undefined) {

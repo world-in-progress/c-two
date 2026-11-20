@@ -2201,3 +2201,165 @@ def test_post_dispatch_prepared_close_exception_group_and_fastdb_hostile_class_g
             cc.close(local_proxy)
             cc.close(ipc_proxy)
             rt.shutdown()
+
+    # 5. Prepared handle close() raising _WrappedDownstreamError after call()/stream() dispatch
+    # across hand-written unary, hand-written stream, generated stream and generated hold_* stream;
+    # plus ResourceClosed subclass overriding @property transport_phase inside a local resource.
+    prop_getter_calls = 0
+
+    class _ForwardingClosed(ResourceClosed):
+        def __init__(self):
+            super().__init__('closed with property override', details={'biz': 'kept'})
+
+        @property
+        def transport_phase(self):  # type: ignore[override]
+            nonlocal prop_getter_calls
+            prop_getter_calls += 1
+            return 'pre_dispatch'
+
+    local_closed_runs = 0
+
+    class ClosedPropertyResource:
+        def echo(self, value):
+            nonlocal local_closed_runs
+            local_closed_runs += 1
+            raise _ForwardingClosed()
+
+        def steps(self, value):
+            yield value
+
+    rt2 = cc.Runtime()
+    rt2.register(CodecBoundary, ClosedPropertyResource(), name='closed-prop')
+    prop_proxy = rt2.connect(CodecBoundary, name='closed-prop')
+    try:
+        with pytest.raises(ResourceClosed) as prop_err:
+            prop_proxy.echo('go')
+        assert prop_getter_calls == 0
+        assert type(prop_err.value) is ResourceClosed
+        assert prop_err.value.code == ErrorCode.ResourceClosed
+        assert prop_err.value.transport_phase is None
+        assert prop_err.value.details == {'biz': 'kept'}
+        assert isinstance(prop_err.value.__cause__, _ForwardingClosed)
+        assert local_closed_runs == 1
+    finally:
+        cc.close(prop_proxy)
+        rt2.shutdown()
+
+    def make_wrapped_close_err():
+        return _WrappedDownstreamError(ResourceClosed('inner closed', transport_phase='pre_dispatch'))
+
+    # 5a. Hand-written unary close() after call()
+    w_unary_err = make_wrapped_close_err()
+
+    class WrappedCloseUnaryPrepared:
+        def charge_input(self, _n: int) -> None:
+            return None
+
+        def call(self, _method: str, _data: bytes | None) -> bytes:
+            return pickle.dumps('ok')
+
+        def close(self) -> None:
+            raise w_unary_err
+
+    class WrappedCloseClient:
+        supports_direct_call = False
+        local_copy_tracker = None
+        route_name = 'wrapped-close'
+
+        def prepare_call(self, _method: str):
+            return WrappedCloseUnaryPrepared()
+
+        def begin_stream(self, _method: str):
+            return WrappedCloseStreamPrepared()
+
+    def hw_unary(self) -> str: ...
+    def hw_stream(self) -> Iterator[str]: ...
+    hw_stream.__cc_stream__ = True
+
+    class WrappedCrm:
+        direction = '->'
+        client = WrappedCloseClient()
+
+    wrapped_hw_unary = _build_transfer_wrapper(
+        hw_unary, input=no_payload_binding(), output=python_pickle_output_binding(hw_unary),
+    )
+    with pytest.raises(CCBaseError) as hw_u_caught:
+        wrapped_hw_unary(WrappedCrm())
+    assert hw_u_caught.value is not w_unary_err
+    assert hw_u_caught.value.transport_phase is None
+    assert hw_u_caught.value.__cause__ is w_unary_err
+
+    # 5b. Hand-written stream close() after stream()
+    w_stream_err = make_wrapped_close_err()
+
+    class WrappedCloseStreamPrepared:
+        def charge_input(self, _n: int) -> None:
+            return None
+
+        def stream(self, _data: bytes | None):
+            return _FakeNativeStream([])
+
+        def close(self) -> None:
+            raise w_stream_err
+
+    wrapped_hw_stream = _build_transfer_wrapper(
+        hw_stream, input=no_payload_binding(), output=python_pickle_output_binding(hw_stream),
+    )
+    with pytest.raises(CCBaseError) as hw_s_caught:
+        wrapped_hw_stream(WrappedCrm())
+    assert hw_s_caught.value is not w_stream_err
+    assert hw_s_caught.value.transport_phase is None
+    assert hw_s_caught.value.__cause__ is w_stream_err
+
+    # 5c & 5d. Generated ContractClient stream and hold_* stream close() after stream()
+    stream_fixture = (
+        Path(__file__).resolve().parents[4]
+        / 'core/foundation/c2-contract/tests/fixtures/server-stream.contract.json'
+    )
+    compiled_stream = cc.contract.compile_artifacts(stream_fixture.read_bytes(), target='python')
+    gen_stream_dir = tmp_path / 'gen_wrapped_close'
+    for artifact in compiled_stream.artifacts:
+        dest = gen_stream_dir / artifact.relative_path
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(artifact.bytes)
+    gspec = importlib.util.spec_from_file_location(
+        '_gen_wrapped_close_mod', gen_stream_dir / 'python/c_two_contract.py',
+    )
+    assert gspec is not None and gspec.loader is not None
+    gmod = importlib.util.module_from_spec(gspec)
+    sys.modules[gspec.name] = gmod
+    gpayload, _ = echo_payload('stream-in')
+    try:
+        gspec.loader.exec_module(gmod)
+        for method_attr in ('method_1_echo', 'hold_method_1_echo'):
+            gen_close_err = make_wrapped_close_err()
+
+            class GenStreamPrepared:
+                def charge_input(self, _n: int) -> None:
+                    return None
+
+                def stream(self, _data: bytes):
+                    return _FakeNativeStream([])
+
+                def close(self) -> None:
+                    raise gen_close_err
+
+            class GenStreamBound:
+                local_copy_tracker = None
+                route_name = 'gen-stream'
+
+                def begin_stream(self, _method: str):
+                    return GenStreamPrepared()
+
+                def call(self, _method: str, _data: bytes) -> bytes:
+                    return b''
+
+            gen_sc = gmod.ContractClient(GenStreamBound())
+            with pytest.raises(CCBaseError) as gs_caught:
+                getattr(gen_sc, method_attr)(gpayload)
+            assert gs_caught.value is not gen_close_err
+            assert gs_caught.value.transport_phase is None
+            assert gs_caught.value.__cause__ is gen_close_err
+    finally:
+        gpayload.close()
+        sys.modules.pop(gspec.name, None)
