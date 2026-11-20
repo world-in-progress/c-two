@@ -4,7 +4,7 @@
 
 本页写 C-Two 0.x 的方向：现有的地基，以及还没做的产品能力各自的完成标准。还没做的事、它们的顺序与进度只记在[待办](backlog.md)里。
 
-当前发版候选是 C-Two 0.11.0 与 c3 0.7.0（IPC 16、SHM 4、C/FFI ABI 8、relay mesh 7），整合了接口精简、删除 owner 子系统、单一属主释放、服务端流、路由名身份、按角色划分的 `(M, F, N)` 配置收敛与错误体系收敛，见 [0.11.0 发布说明](../releases/0.11.0.md)。FastDB 固定 0.2.4（原生源码 `f82fa13adeae2b87a295bf984821c85c44b55a3d`）。Rust SDK、Core 与 TypeScript 绑定各自保持 0.1.0，C-Two 不在 crates.io 或 npm 发布。
+当前已发布的版本是 [C-Two 0.11.0](https://pypi.org/project/c-two/0.11.0/) 与 [c3 0.7.0](https://github.com/world-in-progress/c-two/releases/tag/c3-v0.7.0)（来源 `50be9a7966d6c8381715809440d69502c3cee5de`；IPC 16、SHM 4、C/FFI ABI 8、relay mesh 7），整合了接口精简、删除 owner 子系统、单一属主释放、服务端流、路由名身份、按角色划分的 `(M, F, N)` 配置收敛与错误体系收敛，见 [0.11.0 发布说明](../releases/0.11.0.md)与 [0.11.0 验收记录](../acceptance/2026-11-20-0110-release-acceptance.md)。FastDB 固定 0.2.4（原生源码 `f82fa13adeae2b87a295bf984821c85c44b55a3d`）。Rust SDK、Core 与 TypeScript 绑定各自保持 0.1.0，C-Two 不在 crates.io 或 npm 发布。
 
 `docs/reference/` 负责现行行为。[CI 与发行流程](../reference/ci-cd.md)区分源码验证、包验证与发布；各次发行保留确切源码与产物收据。
 

@@ -4,9 +4,9 @@ This reference owns the Windows native transport, memory, endpoint identity, and
 
 Windows development machines can use the [shared local test sidecar](local-development-testing.md), which reuses the macOS/Unix Python executor with native Windows process and file-lock adapters. Its development reports are separate from the historical hosted and formal release evidence below.
 
-## C-Two 0.11.0 release (candidate)
+## C-Two 0.11.0 release (2026-11-20)
 
-C-Two 0.11.0 / c3 0.7.0 updates `mio` to 1.2.4 to fix Windows Named Pipe immediate-failure use-after-free races (`0xC0000005` / `0xC0000374`) during listener close and pipe disconnect, defers server post-peer-close write errors (`109` / `232`) to the reader so `DISCONNECT` wins over a failed reply flush, discards unread request bodies on relays before sending pre-dispatch refusals so Windows clients receive the refusal instead of a connection reset, and adopts IPC 16, SHM 4, C/FFI ABI 8, relay mesh 7 and per-role `(M, F, N)` budgets; see the [0.11.0 release notes](../releases/0.11.0.md).
+C-Two 0.11.0 / c3 0.7.0 (`50be9a7966d6c8381715809440d69502c3cee5de`) updates `mio` to 1.2.4 to fix a Windows Named Pipe use-after-free race confirmed by crash dump (`0xC0000005` during listener close and pipe disconnect; three earlier dump-less `0xC0000374` events remain separately tracked in the backlog), defers server post-peer-close write errors (`109` / `232`) to the reader so `DISCONNECT` wins over a failed reply flush, discards unread request bodies on relays before sending pre-dispatch refusals so Windows clients receive the refusal instead of a connection reset, and adopts IPC 16, SHM 4, C/FFI ABI 8, relay mesh 7 and per-role `(M, F, N)` budgets; see the [0.11.0 release notes](../releases/0.11.0.md) and [0.11.0 acceptance record](../acceptance/2026-11-20-0110-release-acceptance.md).
 
 ## C-Two 0.10.1 release (2026-10-30)
 

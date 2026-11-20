@@ -10,7 +10,7 @@ See the [unreleased notes](docs/releases/unreleased.md).
 
 ## [0.11.0] — companion c3 0.7.0
 
-Candidate; see the [0.11.0 release notes](docs/releases/0.11.0.md).
+Published 2026-11-20. See the [0.11.0 release notes](docs/releases/0.11.0.md) and [release acceptance record](docs/acceptance/2026-11-20-0110-release-acceptance.md).
 
 ### Changed
 
