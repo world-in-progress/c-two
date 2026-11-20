@@ -195,7 +195,7 @@ use fastdb::Payload;
 - 契约：`cc.contract.export_descriptor`、`cc.contract.release_ref`、`cc.contract.compile_artifacts`、`cc.contract.diagnostics`
 - 端点维护：`cc.endpoint.inspect_endpoint`、`cc.endpoint.reap_endpoint`、`cc.endpoint.sweep_endpoints`、`cc.endpoint.EndpointCredential`（不可变的原生值；显式 JSON 导入/导出）
 - 连接观察：`cc.observe.connection_observation`、`cc.observe.connection_events`、`cc.observe.ConnectionObservation`、`cc.observe.ConnectionClosed`、`cc.observe.ConnectionEvent`、`cc.observe.ConnectionEvents`、`cc.observe.ConnectionEventsLagged`
-- 错误：`cc.error.CoreError`（结构化本地/Core 错误）、`cc.error.CCError`（语义错误），共同基类为 `cc.error.CCBaseError`
+- 错误：`cc.error.ErrorCode`、`cc.error.CoreError`（结构化本地/Core 错误，含只读 `semantic`）、`cc.error.CCError`（语义错误，含 `side` 与 `stage`，包括 `ResourceExecutionError`、`SerializationError` 及路由/协议子类），共同基类 `cc.error.CCBaseError`（暴露只读 `transport_phase`）
 - 监控：`cc.observe.memory_stats`、`cc.observe.call_execution_snapshot`、`cc.observe.lifecycle_snapshot`、`cc.observe.shutdown_outcome`（只读）
 
 在注册前使用 `cc.set_server(startup_timeout=...)` 选择原生启动等待。启动超时包含 `CoreError.lifecycle_kind == 'startup_timeout'`、`startup_stage` 和 `timeout_seconds`；参见[启动配置与错误](configuration.zh-CN.md#服务启动超时)。

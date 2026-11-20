@@ -215,7 +215,7 @@ class Session:
             if failure is None:
                 assert terminal is None
             else:
-                assert isinstance(terminal, error.ResourceExecuteFunction)
+                assert isinstance(terminal, error.ResourceExecutionError)
                 assert str(terminal) == str(failure)
                 assert terminal.details == failure.details
         assert self.runtime.call_execution_snapshot()["client"]["used_operations"] == 0
@@ -241,7 +241,7 @@ class Session:
                 finally:
                     item.close()
                 delivered += 1
-        except error.ResourceExecuteFunction as exc:
+        except error.ResourceExecutionError as exc:
             failure = exc
         return self._python_done(delivered, failure)
 

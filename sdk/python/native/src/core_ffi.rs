@@ -734,15 +734,12 @@ fn materialize_python_bytes(py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResul
 }
 
 pub(crate) fn python_error_to_c2(py: Python<'_>, error: PyErr) -> C2Error {
-    if let Ok(error_bytes) = error.value(py).getattr("error_bytes")
-        && let Ok(buffer) = PyBuffer::<u8>::get(&error_bytes)
-    {
-        let mut bytes = vec![0_u8; buffer.len_bytes()];
-        if buffer.copy_to_slice(py, &mut bytes).is_ok()
-            && let Ok(Some(error)) = C2Error::from_wire_bytes(&bytes)
-        {
-            return error;
-        }
+    if let Some(mut semantic) = semantic_payload_from_exception(py, &error) {
+        // A resource callback's error is already canonical: strip any inner
+        // call-control detail so downstream admission or routing flags never
+        // leak into this call's classification.
+        c2_core::strip_callback_error_phases(&mut semantic);
+        return semantic;
     }
     C2Error::new(ErrorCode::ResourceFunctionExecuting, error.to_string()).with_details(
         BTreeMap::from([
@@ -756,6 +753,42 @@ pub(crate) fn python_error_to_c2(py: Python<'_>, error: PyErr) -> C2Error {
             ),
         ]),
     )
+}
+
+/// Extract the canonical `(code, message, details)` triple directly from a
+/// `c_two.error` exception: a `CCError` (or subclass), or a `CoreError`
+/// carrying a semantic payload. No in-process C2E1 wire round-trip exists.
+fn semantic_payload_from_exception(py: Python<'_>, error: &PyErr) -> Option<C2Error> {
+    let value = error.value(py);
+    let module = py.import("c_two.error").ok()?;
+    let cc_error_class = module.getattr("CCError").ok()?;
+    if value.is_instance(&cc_error_class).ok()? {
+        let code = value.getattr("code").ok()?.extract::<u16>().ok()?;
+        let message = value
+            .getattr("message")
+            .ok()?
+            .extract::<String>()
+            .ok()?;
+        let details = value
+            .getattr("details")
+            .ok()?
+            .extract::<BTreeMap<String, String>>()
+            .ok()?;
+        let code = ErrorCode::try_from(code).ok()?;
+        return Some(C2Error::new(code, message).with_details(details));
+    }
+    let core_error_class = module.getattr("CoreError").ok()?;
+    if value.is_instance(&core_error_class).ok()? {
+        type SemanticSnapshot = (u16, String, Vec<(String, String)>, Option<String>);
+        let (code, message, entries, _) = value
+            .getattr("_semantic_snapshot")
+            .ok()?
+            .extract::<Option<SemanticSnapshot>>()
+            .ok()??;
+        let code = ErrorCode::try_from(code).ok()?;
+        return Some(C2Error::new(code, message).with_details(entries.into_iter().collect()));
+    }
+    None
 }
 
 #[pyfunction]
@@ -872,6 +905,41 @@ mod payload_tests {
             c"payload_test",
         )
         .unwrap()
+    }
+
+    #[test]
+    fn callback_keeps_native_semantic_snapshot_and_drops_inner_controls() {
+        Python::initialize();
+        Python::attach(|py| {
+            let detail_pairs = [
+                ("transport_phase", "pre_dispatch"),
+                ("dispatch_phase", "pre_dispatch"),
+                ("fallback_eligible", "true"),
+                ("route_withdrawal", "true"),
+                ("marker", "keep"),
+            ];
+            let semantic = C2Error::new(ErrorCode::CallDeadlineExceeded, "native refusal")
+                .with_details(
+                    detail_pairs.into_iter()
+                        .map(|(key, value)| (key.to_owned(), value.to_owned()))
+                        .collect(),
+                );
+            let error = core_error_to_py(c2_core::Error::Semantic(semantic));
+            let value = error.value(py);
+            value
+                .setattr("code", u16::from(ErrorCode::ResourceClosed))
+                .unwrap();
+            value.setattr("semantic_message", "changed diagnostic").unwrap();
+            value.setattr("details", PyDict::new(py)).unwrap();
+
+            let callback_error = python_error_to_c2(py, error);
+            assert_eq!(callback_error.code, ErrorCode::CallDeadlineExceeded);
+            assert_eq!(callback_error.message, "native refusal");
+            assert_eq!(
+                callback_error.details,
+                BTreeMap::from([("marker".into(), "keep".into())]),
+            );
+        });
     }
 
     fn pause_once(

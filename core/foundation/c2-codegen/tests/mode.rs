@@ -33,14 +33,19 @@ fn all_targets_generate_server_stream() {
     for required in [
         "def method_1_echo(self, payload: Payload) -> Stream[Payload]:",
         "def hold_method_1_echo(self, payload: Payload) -> Stream[HeldResult[Payload]]:",
-        "self._bound_client.begin_stream(\"echo\")",
-        "prepared.charge_input(payload.execution_report().used_bytes)",
-        "prepared.stream(request)",
+        "_project_call(self._bound_client.begin_stream, \"echo\")",
+        "used_bytes = payload.execution_report().used_bytes",
+        "_project_call(prepared.charge_input, used_bytes)",
+        "_project_call(prepared.stream, request)",
+        "_close_prepared(prepared, primary, dispatched)",
+        "invalidator=Payload.invalidate",
+        "decoder_classifies=True",
         "Stream._from_encoded(",
         "decode_method_1_echo_output",
     ] {
         assert!(source.contains(required), "missing {required:?}");
     }
+    assert!(!source.contains("def _invalidate_payload("));
     assert!(source.contains("def method_0_ping(self) -> None:"));
 
     let typescript = compile_contract_artifacts(

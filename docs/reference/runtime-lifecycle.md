@@ -18,7 +18,6 @@ The Python transport layer is a thin orchestration shell around a Rust-native co
 | `wire.py` | `MethodTable` for Python resource method dispatch |
 | `server/native.py` | `NativeServerBridge` exported as `Server` |
 | `server/scheduler.py` | `ConcurrencyConfig` facade plus thin native route-concurrency adapter for same-process direct calls |
-| `server/reply.py` | `unpack_icrm_result` and `wrap_error` |
 | `client/proxy.py` | `CRMProxy` for thread-local, IPC, and HTTP modes |
 | `client/util.py` | Thin native-backed `ping()` and `shutdown()` probes for direct IPC |
 
@@ -60,7 +59,7 @@ Registration reserves a route before publishing it. The native commit gate keeps
 
 ## Connection deadlines
 
-Optional connection deadlines belong to Core. `cc.connect(..., timeout=...)` creates one native `ConnectAttempt` before SDK binding locks; the same absolute deadline covers singleton/registry/local-slot/relay override waits, pools, OS connection, handshake and live route/relay acquisition. SDKs project the attempt and never restart its budget, implement their own timer or leave a waiting thread after returning. Omitted/None retains existing phase guards; zero expires before transport. A deadline replaces the fixed five-second OS connection and handshake guards and also bounds the namespace gate or pipe wait; generated TypeScript passes its `connectTimeoutMs` through the ABI 8 endpoint context options. A business call's deadline also covers acquiring its client's route again before the input is handed to a transport; see [route bindings and fallback](contracts-and-routing.md#route-bindings-lookup-and-fallback). Connect expiry uses `CallDeadlineExceeded` with `operation=connect`, `transport_phase=pre_dispatch` and `stage`; it cannot execute or replay a business method. Preserve healthy shared clients on waiter expiry and isolate partial control writes.
+Optional connection deadlines belong to Core. `cc.connect(..., timeout=...)` creates one native `ConnectAttempt` before SDK binding locks; the same absolute deadline covers singleton/registry/local-slot waits, pools, OS connection, handshake and live route/relay acquisition. SDKs project the attempt and never restart its budget, implement their own timer or leave a waiting thread after returning. Omitted/None retains existing phase guards; zero expires before transport. A deadline replaces the fixed five-second OS connection and handshake guards and also bounds the namespace gate or pipe wait; generated TypeScript passes its `connectTimeoutMs` through the ABI 8 endpoint context options. A business call's deadline also covers acquiring its client's route again before the input is handed to a transport; see [route bindings and fallback](contracts-and-routing.md#route-bindings-lookup-and-fallback). Connect expiry uses `CallDeadlineExceeded` with `operation=connect`, `transport_phase=pre_dispatch` and `stage`; it cannot execute or replay a business method. Preserve healthy shared clients on waiter expiry and isolate partial control writes.
 
 ## Startup and readiness
 

@@ -1,8 +1,7 @@
 #[path = "fixtures/nested_error_phase.rs"]
 mod fixture;
 
-use c_two::Error;
-use c_two::generated::ErrorCode;
+use c_two::{Error, ErrorCode, TransportPhase};
 use fixture::NestedErrorFixture;
 
 const DESCRIPTOR: &[u8] =
@@ -15,10 +14,11 @@ fn nested_not_executed_phase_stops_at_the_resource_a_boundary() {
     assert_ne!(fixture.route_a, fixture.route_b);
     fixture.reject_b_before_callback();
 
-    let Error::Semantic(inner) = fixture
+    let inner = fixture
         .call_b()
-        .expect_err("B must refuse before its callback")
-    else {
+        .expect_err("B must refuse before its callback");
+    assert_eq!(inner.transport_phase(), Some(TransportPhase::PreDispatch));
+    let Error::Semantic(inner) = inner else {
         panic!("B must return a semantic admission refusal");
     };
     assert_eq!(inner.code, ErrorCode::ResourceRemoved);
@@ -27,7 +27,9 @@ fn nested_not_executed_phase_stops_at_the_resource_a_boundary() {
     assert_eq!(inner.details["dispatch_phase"], "pre_dispatch");
     assert_eq!(fixture.counts(), (0, 0));
 
-    let Error::Semantic(outer) = fixture.call_a().expect_err("A must propagate B's refusal") else {
+    let outer = fixture.call_a().expect_err("A must propagate B's refusal");
+    assert_eq!(outer.transport_phase(), None);
+    let Error::Semantic(outer) = outer else {
         panic!("A's failure must remain semantic");
     };
     assert_eq!(

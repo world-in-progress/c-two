@@ -46,12 +46,11 @@ from c_two.crm.contract import CRMContract, crm_contract, crm_contract_identity
 from c_two.crm.conformance import validate_resource_conformance
 from c_two.crm.meta import _SHUTDOWN_ATTR, get_shutdown_method
 from c_two.mem import MemoryStats
-from c_two.config.settings import C2Settings, _clean_optional_str, settings
 from c_two.error import (
     CCError,
     ResourceNotFound,
     ResourceUnavailable,
-    RegistryUnavailable,
+    _project_native_error,
 )
 from .input_lifetime import _InputLifetime
 from .client.proxy import CRMProxy, _FollowingLocalRoute
@@ -91,13 +90,8 @@ def _is_missing_relay_address(exc: BaseException) -> bool:
 
 
 def _cc_error_from_native_exception(exc: BaseException) -> CCError | None:
-    error_bytes = getattr(exc, "error_bytes", None)
-    if error_bytes is None:
-        return None
-    try:
-        return CCError.deserialize(memoryview(error_bytes))
-    except TypeError:
-        return CCError.deserialize(error_bytes)
+    """Project the canonical semantic error of one native failure."""
+    return _project_native_error(exc)
 
 
 def _connect_native_call(operation, *args, **kwargs):
@@ -106,7 +100,10 @@ def _connect_native_call(operation, *args, **kwargs):
         return operation(*args, **kwargs)
     except Exception as exc:
         if (cc_err := _cc_error_from_native_exception(exc)) is not None:
-            raise cc_err from exc
+            try:
+                raise cc_err from exc
+            finally:
+                del cc_err
         raise
 
 
@@ -164,19 +161,9 @@ class Runtime:
     """
 
     def __init__(self) -> None:
-        self._initialize(C2Settings())
-
-    @classmethod
-    def _with_settings(cls, code_overrides: C2Settings) -> Runtime:
-        instance = cls.__new__(cls)
-        instance._initialize(code_overrides)
-        return instance
-
-    def _initialize(self, code_overrides: C2Settings) -> None:
         from c_two._native import RuntimeSession
 
         self._lock = threading.Lock()
-        self._settings = code_overrides
         self._server: Server | None = None
         self._runtime_session = RuntimeSession()
 
@@ -191,15 +178,16 @@ class Runtime:
         with self._lock:
             self._runtime_session.set_local_endpoint(root=root)
 
-    def set_relay_anchor(self, address: str) -> None:
-        """Set the relay anchor address for name resolution.
-
-        Convenience wrapper — equivalent to setting ``C2_RELAY_ANCHOR_ADDRESS``.
-        """
-        requested = _clean_optional_str(address)
+    def set_relay_anchor(self, address: str | None) -> None:
+        """Set the relay anchor override or clear it with None."""
+        if isinstance(address, str):
+            address = address.strip()
+            if not address:
+                raise ValueError('relay anchor address must not be empty; pass None to clear')
+        elif address is not None:
+            raise TypeError('relay anchor address must be a str or None')
         with self._lock:
-            self._runtime_session.set_relay_anchor_address(requested)
-            self._settings._relay_anchor_address = requested  # noqa: SLF001
+            self._runtime_session.set_relay_anchor_address(address)
 
     def _swap_runtime_session(self) -> None:
         """Publish a replacement after completed retirement, under the binding lock."""
@@ -207,7 +195,7 @@ class Runtime:
         replacement = type(previous)()
         replacement.inherit_local_endpoint_selection(previous)
         replacement.inherit_retirement(previous)
-        replacement.set_relay_anchor_address(self._settings._relay_anchor_address)
+        replacement.set_relay_anchor_address(previous.relay_anchor_address_override)
         self._runtime_session = replacement
         self._server = None
 
@@ -264,7 +252,6 @@ class Runtime:
     def start(self) -> None:
         """Start this instance's Host and await its native readiness/PONG."""
         with self._active_binding():
-            self._sync_relay_override()
             self._ensure_server_bridge().start()
 
     def local_endpoint_context(self):
@@ -345,7 +332,6 @@ class Runtime:
         with self._active_binding():
             created_server = False
             try:
-                self._sync_relay_override()
                 # Lazy-init server on first registration. Native identity is
                 # cleared if Python server bridge construction fails, so invalid
                 # server config does not leave a visible server id/address.
@@ -475,7 +461,10 @@ class Runtime:
                 )
             except Exception as exc:
                 if (cc_err := _cc_error_from_native_exception(exc)) is not None:
-                    raise cc_err from exc
+                    try:
+                        raise cc_err from exc
+                    finally:
+                        del cc_err
                 status = _relay_control_error_status(exc)
                 if status == 404:
                     raise ResourceNotFound(f"Resource '{name}' not found") from exc
@@ -499,7 +488,10 @@ class Runtime:
                 )
             except Exception as exc:
                 if (cc_err := _cc_error_from_native_exception(exc)) is not None:
-                    raise cc_err from exc
+                    try:
+                        raise cc_err from exc
+                    finally:
+                        del cc_err
                 raise
             proxy = CRMProxy.ipc(
                 client,
@@ -509,8 +501,6 @@ class Runtime:
             )
         else:
             try:
-                with _connect_lock(self._lock, attempt, 'registry_relay_wait'):
-                    self._sync_relay_override(connect_attempt=attempt, runtime_session=runtime_session)
                 client = runtime_session.connect_via_relay(
                     name,
                     *expected_contract.native_args(),
@@ -518,7 +508,10 @@ class Runtime:
                 )
             except Exception as exc:
                 if (cc_err := _cc_error_from_native_exception(exc)) is not None:
-                    raise cc_err from exc
+                    try:
+                        raise cc_err from exc
+                    finally:
+                        del cc_err
                 if _is_missing_relay_address(exc):
                     raise LookupError(
                         f'Name {name!r} is not registered locally '
@@ -546,7 +539,7 @@ class Runtime:
                     local_copy_tracker=local_copy_tracker,
                 )
             else:
-                raise RegistryUnavailable(f"Unsupported relay target mode: {mode!r}")
+                raise RuntimeError(f"Unsupported relay target mode: {mode!r}")
 
         try:
             crm = crm_class()
@@ -788,15 +781,6 @@ class Runtime:
         """Read the current native Host terminal outcome, if any."""
         return self._runtime_session.native_terminal_outcome()
 
-    def _sync_relay_override(self, connect_attempt=None, *, runtime_session=None) -> None:
-        session = self._runtime_session if runtime_session is None else runtime_session
-        if connect_attempt is None:
-            session.set_relay_anchor_address(self._settings._relay_anchor_address)  # noqa: SLF001
-        else:
-            session.set_relay_anchor_address(
-                self._settings._relay_anchor_address, connect_attempt=connect_attempt,  # noqa: SLF001
-            )
-
 
 # ------------------------------------------------------------------
 # Module-level API (delegates to the default Runtime)
@@ -811,7 +795,7 @@ def _get_default_runtime(*, connect_attempt=None) -> Runtime:
     if _default_runtime is None:
         with _connect_lock(_default_runtime_lock, connect_attempt, 'registry_init_wait'):
             if _default_runtime is None:
-                _default_runtime = Runtime._with_settings(settings)
+                _default_runtime = Runtime()
     if connect_attempt is not None:
         _connect_native_call(connect_attempt.check, 'registry_init')
     return _default_runtime
@@ -875,8 +859,8 @@ def set_client(
     )
 
 
-def set_relay_anchor(address: str) -> None:
-    """Set the relay anchor address for name resolution."""
+def set_relay_anchor(address: str | None) -> None:
+    """Set the default Runtime relay anchor override or clear it with None."""
     _get_default_runtime().set_relay_anchor(address)
 
 

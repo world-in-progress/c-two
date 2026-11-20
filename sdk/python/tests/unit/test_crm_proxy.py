@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import pytest
 
+from c_two.error import ResourceClosed
 from c_two.transport.client.proxy import CRMProxy
 
 
@@ -87,8 +88,9 @@ class TestThreadLocalProxy:
     def test_call_after_terminate_raises(self):
         proxy = CRMProxy.thread_local(_DummyCRM())
         proxy.terminate()
-        with pytest.raises(RuntimeError, match='closed'):
+        with pytest.raises(ResourceClosed, match='CRM proxy is closed') as failure:
             proxy.call_direct('greet', ('x',))
+        assert failure.value.transport_phase == 'pre_dispatch'
 
     def test_closed_proxy_hasattr_is_false(self):
         proxy = CRMProxy.thread_local(_DummyCRM())
@@ -146,5 +148,6 @@ class TestIPCProxy:
     def test_call_after_terminate_raises(self):
         proxy = CRMProxy.ipc(_MockClient(), 'ns')
         proxy.terminate()
-        with pytest.raises(RuntimeError, match='closed'):
+        with pytest.raises(ResourceClosed, match='CRM proxy is closed') as failure:
             proxy.call('method', b'data')
+        assert failure.value.transport_phase == 'pre_dispatch'

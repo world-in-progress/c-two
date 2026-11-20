@@ -24,7 +24,8 @@ from ...crm.contract import (
 from ...crm.methods import rpc_method_names
 from ...crm.meta import MethodAccess, get_method_access, get_shutdown_method
 from ...crm.payload_plan import PayloadPlanKind
-from ...error import CCError, ResourceAlreadyRegistered
+from ...crm.transferable import _cleanup_preserving_primary, _release_view_and_response
+from ...error import CoreError
 from ..input_lifetime import (
     _InputLifetime,
     normalize_input_lifetime_map,
@@ -33,22 +34,8 @@ from ..input_lifetime import (
 from .._snapshots import LifecycleSnapshot, ShutdownOutcome
 from ..wire import MethodTable
 from .scheduler import ConcurrencyConfig, Scheduler
-from .reply import unpack_resource_result
 
 logger = logging.getLogger(__name__)
-
-
-class CrmCallError(Exception):
-    """Raised by the dispatch callable when a CRM method returns an error.
-
-    The ``error_bytes`` attribute carries the serialized CCError so the
-    Rust ``PyCrmCallback`` can forward them as ``CrmError::UserError``
-    without losing the binary format.
-    """
-
-    def __init__(self, error_bytes: bytes) -> None:
-        super().__init__(f'CRM error ({len(error_bytes)} bytes)')
-        self.error_bytes = error_bytes
 
 
 @dataclass
@@ -264,22 +251,14 @@ class NativeServerBridge:
                     descriptor_json,
                 )
             except Exception as exc:
-                if (
-                    getattr(exc, 'status_code', None) == 409
-                    and getattr(exc, 'relay_duplicate', False)
-                ):
-                    raise ResourceAlreadyRegistered(
-                        f'Route name already registered with relay: {routing_name!r}',
-                        details=getattr(exc, 'details', None),
-                    ) from exc
-                error_bytes = getattr(exc, 'error_bytes', None)
-                if error_bytes is not None:
-                    semantic_error = CCError.deserialize(memoryview(error_bytes))
-                    assert semantic_error is not None, 'native registration error must carry a canonical error'
-                    semantic_error.message = str(exc)
-                    raise semantic_error from exc
-                if getattr(exc, 'status_code', None) == 409:
-                    raise ValueError(str(exc)) from exc
+                semantic = exc.semantic if issubclass(type(exc), CoreError) else None  # type: ignore[attr-defined]
+                if semantic is not None:
+                    # Keep the canonical relay refusal message; the native
+                    # CoreError stays observable as the direct cause.
+                    try:
+                        raise semantic from exc
+                    finally:
+                        del semantic
                 raise
             slot.scheduler = Scheduler(native_concurrency, method_index)
             self._slots[routing_name] = slot
@@ -477,9 +456,8 @@ class NativeServerBridge:
             def release_fn():
                 nonlocal released
                 if not released:
-                    mv.release()
-                    request_buf.release()
                     released = True
+                    _release_view_and_response(mv, request_buf)
 
             if is_stream:
                 if buffer_mode == 'borrowed' and local_copy_tracker is not None:
@@ -512,19 +490,25 @@ class NativeServerBridge:
                         _release_fn=release_fn,
                         _c2_input_buffer_mode=buffer_mode,
                     )
-                except Exception:
+                except BaseException as exc:
                     if not released:
-                        release_fn()
+                        _cleanup_preserving_primary(exc, release_fn)
                     raise
-                if buffer_mode == 'borrowed' and not released:
+                if not released:
                     release_fn()
 
-            # 3. Unpack result
-            res_part, err_part = unpack_resource_result(result)
-            if err_part:
-                raise CrmCallError(err_part)
-            if not res_part:
+            # 3. crm_to_com returns serialized bytes (or None for an empty
+            # response); failures raise a CCError that python_error_to_c2
+            # forwards canonically. Any other return type is a broken wrapper.
+            if result is None:
                 return None
-            return res_part
+            if isinstance(result, (bytes, bytearray, memoryview)):
+                if not result:
+                    return None
+                return result
+            raise TypeError(
+                f'CRM method {method_name!r} must return serialized bytes or '
+                f'None, got {type(result).__name__}',
+            )
 
         return dispatch

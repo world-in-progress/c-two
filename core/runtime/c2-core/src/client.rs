@@ -259,18 +259,13 @@ impl ClientTarget {
 
     pub(crate) fn observe_error(&self, error: &Error) {
         match error {
-            Error::Semantic(error)
-                if error
-                    .details
-                    .get("transport_phase")
-                    .or_else(|| error.details.get("dispatch_phase"))
-                    .is_some_and(|phase| phase == "pre_dispatch") =>
+            Error::Semantic(semantic)
+                if error.transport_phase() == Some(TransportPhase::PreDispatch) =>
             {
                 use c2_error::ErrorCode::*;
-                let fact = match error.code {
-                    ResourceNotFound | ResourceRemoved | ResourceClosed | ContractMismatch => {
-                        NEEDS_ACQUIRE
-                    }
+                let fact = match semantic.code {
+                    ResourceNotFound | ResourceRemoved | ResourceClosed | ContractMismatch
+                    | RouteConflict => NEEDS_ACQUIRE,
                     IdentityMismatch | ProtocolViolation => TERMINAL_REFUSAL,
                     _ => 0,
                 };

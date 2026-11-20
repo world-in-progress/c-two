@@ -333,6 +333,30 @@ mod tests {
     use std::time::Instant;
 
     #[test]
+    fn decoded_http_failure_keeps_uncertain_phase_in_core() {
+        let mut failure = c2_error::C2Error::new(ErrorCode::ClientCallingResource, "stream failed");
+        failure
+            .details
+            .insert("dispatch_phase".into(), "dispatch_uncertain".into());
+        for phase in [None, Some("dispatch_uncertain")] {
+            let mut source = failure.clone();
+            if let Some(phase) = phase {
+                source
+                    .details
+                    .insert("transport_phase".into(), phase.into());
+            }
+            let decoded = c2_http::stream_wire::decode_failure(&source.to_wire_bytes()).unwrap();
+            // Both StreamTransport::recv and StreamTransport::completion use
+            // this same normalization after the HTTP receiver reports failure.
+            let error = normalize_http_stream_error(HttpError::LocalCallRejected(decoded));
+            assert_eq!(
+                error.transport_phase(),
+                Some(TransportPhase::DispatchUncertain)
+            );
+        }
+    }
+
+    #[test]
     fn item_ready_after_absolute_deadline_is_refunded_without_cancellation() {
         let scope = CallScope::new(
             CallOptions::with_timeout(CallTimeout::After(Duration::from_millis(20))),

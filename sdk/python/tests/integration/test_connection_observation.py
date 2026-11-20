@@ -15,7 +15,6 @@ import pytest
 import c_two as cc
 import c_two.endpoint
 import c_two.observe
-from c_two.config.settings import settings
 from c_two.transport.registry import _get_default_runtime, _reset_default_runtime
 from tests.fixtures.process_control import python_process_options, readline_with_timeout
 
@@ -33,8 +32,6 @@ class PeerResource:
 @pytest.fixture(autouse=True)
 def isolated_runtime(tmp_path, monkeypatch):
     _reset_default_runtime()
-    for name in ('_relay_anchor_address',):
-        monkeypatch.setattr(settings, name, None)
     monkeypatch.setenv('C2_RELAY_ANCHOR_ADDRESS', '')
     monkeypatch.delenv('C2_IPC_ROOT', raising=False)
     if os.name != 'nt':

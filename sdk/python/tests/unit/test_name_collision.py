@@ -14,7 +14,6 @@ import pytest
 from tests.fixtures import local_server
 
 import c_two as cc
-from c_two.config import settings
 from c_two.transport import ConcurrencyConfig
 from c_two.transport.registry import _get_default_runtime, _reset_default_runtime
 from c_two.transport.server.native import CRMSlot, NativeServerBridge
@@ -583,10 +582,8 @@ class TestRegistryNameCollision:
     def _clean_registry(self):
         """Reset the global registry before/after each test."""
         _reset_default_runtime()
-        settings.relay_anchor_address = None
         yield
         _reset_default_runtime()
-        settings.relay_anchor_address = None
 
     def test_duplicate_name_raises(self):
         registry = _get_default_runtime()

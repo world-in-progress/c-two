@@ -9,26 +9,22 @@ import pytest
 
 import c_two as cc
 
-from c_two.config import settings
 from c_two.transport.registry import _get_default_runtime, _reset_default_runtime
 from c_two.transport.server.scheduler import ConcurrencyConfig
 
 
 @pytest.fixture(autouse=True)
 def _clean_env_and_registry(monkeypatch):
-    previous_override_relay = settings._relay_anchor_address  # noqa: SLF001
-    settings.relay_anchor_address = None
+    monkeypatch.setenv('C2_ENV_FILE', '')
     monkeypatch.delenv('C2_RELAY_ANCHOR_ADDRESS', raising=False)
+    _reset_default_runtime()
     try:
         # Start each scheduler test with fresh server configuration.
         assert cc.shutdown()['completed']
         yield
     finally:
-        try:
-            assert cc.shutdown()['completed']
-            _reset_default_runtime()
-        finally:
-            settings._relay_anchor_address = previous_override_relay  # noqa: SLF001
+        assert cc.shutdown()['completed']
+        _reset_default_runtime()
 
 
 def _direct_client(crm_type: type, name: str):
@@ -294,7 +290,6 @@ def test_remote_ipc_scheduler_direct_address_ignores_bad_relay(monkeypatch):
     assert direct_address.startswith('ipc://')
 
     monkeypatch.setenv('C2_RELAY_ANCHOR_ADDRESS', 'http://127.0.0.1:9')
-    settings.relay_anchor_address = None
 
     client = cc.connect(
         RemoteSchedulerProbe,

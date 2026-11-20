@@ -296,7 +296,7 @@ def check(options, env: dict[str, str]) -> dict:
             report['tools']['node']['napi'] = napi
         except (ValueError, OSError, strict.RunnerError, LocalError) as error:
             report['errors'].append(str(error))
-    needs_sdk = any(s in selected_suites(options.suite) for s in ('core', 'rust-sdk', 'python', 'typescript'))
+    needs_sdk = any(s in selected_suites(options.suite) for s in ('core', 'rust-sdk', 'node', 'python', 'typescript'))
     if needs_sdk and options.action != 'prepare':
         library = options.coresdk_lib / core_library_name(sys.platform) if options.coresdk_lib else None
         if library is None or not library.is_file():
@@ -486,7 +486,7 @@ def preparation_steps(options, staging: Path) -> list[Step]:
     env = child_environment(dict(os.environ), options.tool_path, options.coresdk_lib)
     selected = selected_suites(options.suite)
     result = []
-    if options.coresdk_lib is None and any(s in selected for s in ('core', 'rust-sdk', 'python', 'typescript')):
+    if options.coresdk_lib is None and any(s in selected for s in ('core', 'rust-sdk', 'node', 'python', 'typescript')):
         options.coresdk_lib = staging / 'coresdk/lib'
         result.append(Step('coresdk', [options.python, '.github/scripts/prepare_fastdb_sdk.py', '--output', str(staging / 'coresdk')]))
     if 'core' in selected:

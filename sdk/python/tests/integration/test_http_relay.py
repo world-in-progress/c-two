@@ -18,7 +18,6 @@ import httpx
 import c_two as cc
 
 import c_two.endpoint
-from c_two.config.settings import settings
 from c_two.error import ResourceNotFound
 from c_two.crm.contract import crm_contract
 from c_two.transport.registry import Runtime, _get_default_runtime, _reset_default_runtime
@@ -363,13 +362,11 @@ class TestCcConnectHttp:
         name = 'runtime/session/env-relay-connect'
         relay = start_c3_relay()
         relay_url = relay.url
-        previous_relay = settings.relay_anchor_address
         registrar = Runtime()
         resolver = Runtime()
         crm = None
         try:
             monkeypatch.setenv('C2_RELAY_ANCHOR_ADDRESS', relay_url)
-            settings.relay_anchor_address = None
             registrar.register(Hello, HelloImpl(), name=name)
             assert registrar.server_address() is not None
 
@@ -380,15 +377,12 @@ class TestCcConnectHttp:
             if crm is not None:
                 cc.close(crm)
             resolver.shutdown()
-            settings.relay_anchor_address = previous_relay
             registrar.shutdown()
-            settings.relay_anchor_address = previous_relay
 
     def test_no_address_connect_uses_runtime_session_relay_projection(self, start_c3_relay):
         name = 'runtime/session/relay-connect'
         relay = start_c3_relay()
         relay_url = relay.url
-        previous_relay = settings.relay_anchor_address
         registrar = Runtime()
         resolver = Runtime()
         crm = None
@@ -405,15 +399,12 @@ class TestCcConnectHttp:
             if crm is not None:
                 cc.close(crm)
             resolver.shutdown()
-            settings.relay_anchor_address = previous_relay
             registrar.shutdown()
-            settings.relay_anchor_address = previous_relay
 
     def test_name_only_connect_uses_verified_ipc_for_local_anchor(self, start_c3_relay):
         name = 'identity/verified/local-ipc'
         relay = start_c3_relay()
         relay_url = relay.url
-        previous_relay = settings.relay_anchor_address
         registrar = Runtime()
         resolver = Runtime()
         crm = None
@@ -430,15 +421,12 @@ class TestCcConnectHttp:
             if crm is not None:
                 cc.close(crm)
             resolver.shutdown()
-            settings.relay_anchor_address = previous_relay
             registrar.shutdown()
-            settings.relay_anchor_address = previous_relay
 
     def test_relay_local_ipc_contract_mismatch_does_not_fallback_to_http(self, start_c3_relay):
         name = 'identity/local-ipc-contract-mismatch'
         relay = start_c3_relay()
         relay_url = relay.url
-        previous_relay = settings.relay_anchor_address
         registrar = Runtime()
         resolver = Runtime()
         try:
@@ -477,13 +465,10 @@ class TestCcConnectHttp:
                 assert 'CRM contract mismatch' in resp.text
         finally:
             resolver.shutdown()
-            settings.relay_anchor_address = previous_relay
             registrar.shutdown()
-            settings.relay_anchor_address = previous_relay
 
     def test_no_address_relay_connect_maps_missing_route_to_resource_not_found(self, start_c3_relay):
         relay = start_c3_relay()
-        previous_relay = settings.relay_anchor_address
         registry = Runtime()
         try:
             registry.set_relay_anchor(relay.url)
@@ -491,7 +476,6 @@ class TestCcConnectHttp:
                 registry.connect(Hello, name='missing-route')
         finally:
             registry.shutdown()
-            settings.relay_anchor_address = previous_relay
 
     def test_relay_traffic_bypasses_system_proxy(self, monkeypatch, start_c3_relay):
         """All relay HTTP traffic must ignore HTTP_PROXY by default.
@@ -515,7 +499,6 @@ class TestCcConnectHttp:
         name = 'proxy/bypass/test'
         relay = start_c3_relay()
         relay_url = relay.url
-        previous_relay = settings.relay_anchor_address
         registrar = Runtime()
         resolver = Runtime()
         crm = None
@@ -533,9 +516,7 @@ class TestCcConnectHttp:
             if crm is not None:
                 cc.close(crm)
             resolver.shutdown()
-            settings.relay_anchor_address = previous_relay
             registrar.shutdown()
-            settings.relay_anchor_address = previous_relay
 
 
 # ---------------------------------------------------------------------------

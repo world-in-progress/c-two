@@ -20,15 +20,21 @@ use crate::stream_wire::{self, HttpStreamRecordKind, HttpStreamStatus, HttpStrea
 type PullReply = Result<(Bytes, bool), std::io::Error>;
 
 struct PullBody {
-    requests: mpsc::Sender<oneshot::Sender<PullReply>>,
+    window: Option<Arc<ReusableWindow>>,
+    requests: Option<mpsc::Sender<oneshot::Sender<PullReply>>>,
     cancellation: Arc<StreamCancellation>,
     finished: bool,
     hold: Arc<ResponseHold>,
-    _window: Arc<ReusableWindow>,
 }
 
 impl Drop for PullBody {
     fn drop(&mut self) {
+        // Release the body's window handle and close `requests` before
+        // recording consumer cancellation, so `drive_stream` observes
+        // `requests.is_closed()` and drops its own window before cancelling
+        // upstream while still recording `Consumer` as the first cause.
+        self.window.take();
+        self.requests.take();
         if !self.finished {
             self.cancellation.cancel(CancelCause::Consumer);
         }
@@ -147,18 +153,21 @@ pub(crate) fn stream_response(
     });
     let download = Arc::new(download);
     let body_state = PullBody {
-        requests,
+        window: Some(download.clone()),
+        requests: Some(requests),
         cancellation: cancellation.clone(),
         finished: false,
         hold: hold.clone(),
-        _window: download.clone(),
     };
     let body = Body::from_stream(futures::stream::unfold(body_state, |mut body| async move {
         if body.finished {
             return None;
         }
         let (reply, response) = oneshot::channel();
-        if body.requests.send(reply).await.is_err() {
+        let Some(requests) = body.requests.as_ref() else {
+            return None;
+        };
+        if requests.send(reply).await.is_err() {
             return None;
         }
         let result = match response.await {
@@ -216,70 +225,103 @@ async fn drive_stream(
         let request = tokio::select! {
             biased;
             cause = cancellation.requested(), if !observed_cancel => {
+                if requests.is_closed() {
+                    break;
+                }
                 observed_cancel = true;
                 observed_consumer = cause == CancelCause::Consumer;
                 let _ = upstream_cancel.cancel(cause);
                 continue;
             }
             _ = cancellation.wait_consumer_requested(), if observed_cancel && !observed_consumer => {
+                if requests.is_closed() {
+                    break;
+                }
                 observed_consumer = true;
                 let _ = upstream_cancel.cancel(CancelCause::Consumer);
                 continue;
             }
-            request = requests.recv() => match request { Some(request) => request, None => break },
+            request = requests.recv() => match request {
+                Some(request) if request.is_closed() => {
+                    // The body poll future dropped its oneshot before PullBody
+                    // finished dropping `_window` and `requests`. Wait for the
+                    // channel to close so `_window` is gone before cancelling upstream.
+                    while requests.recv().await.is_some() {}
+                    break;
+                }
+                Some(request) => request,
+                None => break,
+            },
         };
         // A single pull can be interrupted to submit cancellation, without a
         // second reader or an eager loop requesting the next payload chunk.
         let data_open = pending_data.is_some();
-        let mut pull = Box::pin(pull_frame(
-            &mut stream,
-            &mut remaining,
-            &mut pending_data,
-            &mut window,
-            width,
-            &cancellation,
-        ));
-        let result = loop {
-            tokio::select! {
-                biased;
-                next = requests.recv() => {
-                    // Body polls are serial: no second pull can be issued
-                    // until this reply is sent. Closing its sender is a real
-                    // abandonment even when token cancellation was already
-                    // observed or a library-owned Bytes still fills B.
-                    debug_assert!(next.is_none());
-                    let _ = upstream_cancel.cancel(CancelCause::Consumer);
-                    break 'body;
-                }
-                cause = cancellation.requested(), if !observed_cancel => {
-                    observed_cancel = true;
-                    observed_consumer = cause == CancelCause::Consumer;
-                    let _ = upstream_cancel.cancel(cause);
-                    if cause == CancelCause::Consumer && !data_open {
-                        drop(pull);
-                        break match stream.completion().await {
-                            Ok(terminal) => terminal_frame(terminal, &mut window),
-                            Err(error) => failure_frame(error, &mut window),
-                        };
+        let result = {
+            let mut pull = Box::pin(pull_frame(
+                &mut stream,
+                &mut remaining,
+                &mut pending_data,
+                &mut window,
+                width,
+                &cancellation,
+            ));
+            loop {
+                tokio::select! {
+                    biased;
+                    next = requests.recv() => {
+                        // Body polls are serial: no second pull can be issued
+                        // until this reply is sent. Closing its sender is a real
+                        // abandonment even when token cancellation was already
+                        // observed or a library-owned Bytes still fills B.
+                        // Break first so `pull`, `pending_data`, and `window` all
+                        // drop before sending the upstream consumer cancel.
+                        debug_assert!(next.is_none());
+                        break 'body;
                     }
-                }
-                _ = cancellation.wait_consumer_requested(), if observed_cancel && !observed_consumer => {
-                    observed_consumer = true;
-                    let _ = upstream_cancel.cancel(CancelCause::Consumer);
-                    if !data_open {
-                        drop(pull);
-                        break match stream.completion().await {
-                            Ok(terminal) => terminal_frame(terminal, &mut window),
-                            Err(error) => failure_frame(error, &mut window),
-                        };
+                    cause = cancellation.requested(), if !observed_cancel => {
+                        observed_cancel = true;
+                        observed_consumer = cause == CancelCause::Consumer;
+                        let _ = upstream_cancel.cancel(cause);
+                        if cause == CancelCause::Consumer && !data_open {
+                            drop(pull);
+                            window.take();
+                            break match stream.completion().await {
+                                Ok(terminal) => terminal_frame(terminal, &mut window),
+                                Err(error) => failure_frame(error, &mut window),
+                            };
+                        }
                     }
+                    _ = cancellation.wait_consumer_requested(), if observed_cancel && !observed_consumer => {
+                        observed_consumer = true;
+                        let _ = upstream_cancel.cancel(CancelCause::Consumer);
+                        if !data_open {
+                            drop(pull);
+                            window.take();
+                            break match stream.completion().await {
+                                Ok(terminal) => terminal_frame(terminal, &mut window),
+                                Err(error) => failure_frame(error, &mut window),
+                            };
+                        }
+                    }
+                    result = &mut pull => break result,
                 }
-                result = &mut pull => break result,
             }
         };
         terminal = result.as_ref().is_ok_and(|(_, ended)| *ended);
         let failed = result.is_err();
-        if request.send(result).is_err() || failed || terminal {
+        if let Err(unsent) = request.send(result) {
+            drop(unsent);
+            drop(pending_data.take());
+            drop(window.take());
+            if !terminal {
+                // `response` dropped before `PullBody` finished dropping `_window`
+                // and `requests`. Wait for `requests` to close so `_window` is
+                // released before cancelling upstream.
+                while requests.recv().await.is_some() {}
+            }
+            break;
+        }
+        if failed || terminal {
             break;
         }
     }
@@ -288,6 +330,9 @@ async fn drive_stream(
     drop(pending_data.take());
     drop(window.take());
     if !terminal {
+        if let Some(cause) = (!observed_cancel).then(|| cancellation.cause()).flatten() {
+            let _ = upstream_cancel.cancel(cause);
+        }
         // Consumer abandonment can follow lifecycle cancellation. That second
         // intent discards this call's data while retaining the original cause.
         let _ = upstream_cancel.cancel(CancelCause::Consumer);

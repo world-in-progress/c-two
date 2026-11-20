@@ -6,6 +6,71 @@ use c2_core::{
 };
 use std::sync::mpsc;
 
+#[test]
+fn error_value_keeps_outer_transport_phase_when_semantic_details_disagree() {
+    let semantic =
+        C2Error::new(ErrorCode::CallCapacityExceeded, "receive budget exhausted").with_details(
+            std::collections::BTreeMap::from([("transport_phase".into(), "pre_dispatch".into())]),
+        );
+    let error = c2_core::normalize_ipc_error(
+        c2_ipc::IpcError::ResponseFailure(Box::new(c2_ipc::IpcError::LocalCallRejected(semantic))),
+        TransportPhase::DispatchUncertain,
+    );
+
+    let value = error_value(&error);
+    assert_eq!(value["transportPhase"], "dispatch_uncertain");
+    assert_eq!(value["details"]["transport_phase"], "pre_dispatch");
+    assert_eq!(value["code"], ErrorCode::CallCapacityExceeded as u32);
+}
+
+#[test]
+fn call_error_value_uses_scope_phase_only_for_lifecycle_errors() {
+    let call = Call {
+        state: Mutex::new(CallData {
+            prepared: None,
+            charged: 0,
+            busy: false,
+            dispatched: false,
+            ready: false,
+            stream: None,
+            unary: None,
+            dispatch_target: None,
+            error: None,
+            consumer_done: false,
+        }),
+        scope: CallScope::new(CallOptions::with_timeout(CallTimeout::Unlimited), None).unwrap(),
+        stream_mode: false,
+        cancellation: IpcStreamCancellation::new(),
+        cancelled: AtomicBool::new(false),
+        next_active: AtomicBool::new(false),
+        changed: Notify::new(),
+    };
+    let configuration = invalid("invalid call configuration");
+    let resource_failure =
+        C2Error::new(ErrorCode::ResourceFunctionExecuting, "resource failed").into();
+    assert!(error_value(&configuration).get("transportPhase").is_none());
+    assert_eq!(
+        call_error_value(&call, &configuration)["transportPhase"],
+        "pre_dispatch"
+    );
+    assert!(
+        call_error_value(&call, &resource_failure)
+            .get("transportPhase")
+            .is_none()
+    );
+
+    call.scope.try_begin_dispatch().unwrap();
+    assert_eq!(
+        call_error_value(&call, &configuration)["transportPhase"],
+        "dispatch_uncertain"
+    );
+    assert!(
+        call_error_value(&call, &resource_failure)
+            .get("transportPhase")
+            .is_none()
+    );
+}
+
 const DESCRIPTOR: &[u8] =
     include_bytes!("../../c2-contract/tests/fixtures/server-stream.contract.json");
 const WAIT: Duration = Duration::from_secs(10);
@@ -30,6 +95,8 @@ struct Items {
     fail: bool,
 }
 struct Item(u8);
+static STREAM_GATE: (std::sync::Mutex<u8>, std::sync::Condvar) =
+    (std::sync::Mutex::new(0), std::sync::Condvar::new());
 impl EncodedStreamItem for Item {
     fn len(&self) -> usize {
         4
@@ -41,6 +108,15 @@ impl EncodedStreamItem for Item {
 }
 impl EncodedStream for Items {
     fn step(&mut self) -> Result<Option<Box<dyn EncodedStreamItem>>, C2Error> {
+        if self.count == u8::MAX && self.cursor == 0 {
+            let (lock, changed) = &STREAM_GATE;
+            let mut state = lock.lock().unwrap();
+            *state = 1;
+            changed.notify_all();
+            while *state != 2 {
+                state = changed.wait(state).unwrap();
+            }
+        }
         if self.cursor == self.count {
             return if self.fail {
                 Err(C2Error::new(
@@ -542,6 +618,18 @@ fn cancelling_input_budget_wait_does_not_wait_for_a_held_item_to_release() {
         C2MemFfiStatus::Ok
     );
     assert!(unsafe { &*second }.0.state.lock().busy);
+    let duplicate = async_result(|c, u| unsafe { c2_mem_ffi_call_charge_input(second, 2, c, u) });
+    unsafe {
+        assert!(!(*duplicate).error.is_null());
+        let failure: Value = serde_json::from_str(
+            CStr::from_ptr(c2_mem_ffi_error_parts((*duplicate).error))
+                .to_str()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(failure["transportPhase"], "pre_dispatch");
+        c2_mem_ffi_result_free(duplicate);
+    }
     unsafe {
         c2_mem_ffi_call_cancel(second);
     }
@@ -562,6 +650,62 @@ fn cancelling_input_budget_wait_does_not_wait_for_a_held_item_to_release() {
         timely,
         "cancellation must wake input-budget admission without another hold release"
     );
+}
+
+#[test]
+fn concurrent_next_reports_dispatch_uncertainty_through_abi_callback() {
+    struct ReleaseGate;
+    impl Drop for ReleaseGate {
+        fn drop(&mut self) {
+            let (lock, changed) = &STREAM_GATE;
+            *lock.lock().unwrap() = 2;
+            changed.notify_all();
+        }
+    }
+    let fixture = Fixture::new(64);
+    *STREAM_GATE.0.lock().unwrap() = 0;
+    let gate = ReleaseGate;
+    let call = fixture.call("echo", &[u8::MAX, 0], true);
+    let (tx, rx) = mpsc::channel::<usize>();
+    assert_eq!(
+        unsafe { c2_mem_ffi_call_next(call, Some(complete), Box::into_raw(Box::new(tx)).cast()) },
+        C2MemFfiStatus::Ok
+    );
+    {
+        let state = STREAM_GATE.0.lock().unwrap();
+        let (state, _) = STREAM_GATE
+            .1
+            .wait_timeout_while(state, WAIT, |state| *state != 1)
+            .unwrap();
+        let started = *state == 1;
+        drop(state);
+        assert!(started, "resource step did not start");
+    }
+    let duplicate = async_result(|c, u| unsafe { c2_mem_ffi_call_next(call, c, u) });
+    unsafe {
+        assert!(!(*duplicate).error.is_null());
+        let failure: Value = serde_json::from_str(
+            CStr::from_ptr(c2_mem_ffi_error_parts((*duplicate).error))
+                .to_str()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(failure["transportPhase"], "dispatch_uncertain");
+        assert!(
+            failure["message"]
+                .as_str()
+                .unwrap()
+                .contains("concurrent next")
+        );
+        c2_mem_ffi_result_free(duplicate);
+    }
+    drop(gate);
+    let first = rx.recv_timeout(WAIT).unwrap() as *mut C2MemFfiResult;
+    unsafe {
+        success(first);
+        c2_mem_ffi_result_free(first);
+        c2_mem_ffi_call_free(call);
+    }
 }
 
 fn domain_stats(domain: *const C2MemFfiClientDomain) -> Value {

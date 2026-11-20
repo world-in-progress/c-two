@@ -42,7 +42,7 @@ Context preserves the original OS kind/code while outer directory-policy rejecti
 
 ## Public structured Python errors
 
-Catch `c_two.error.CoreError` directly. It is a `CCBaseError` and a `RuntimeError`; `CCError` remains the separate canonical semantic-error family. Catch `CCBaseError` to handle both families, or `CCError` when only semantic errors should bypass a call-stage wrapper. `_native.CoreError` is removed. There is no top-level alias or replacement error wrapper.
+Catch `c_two.error.CoreError` directly. It is a `CCBaseError` and a `RuntimeError`; `CCError` remains the separate canonical semantic-error family, and both expose read-only `transport_phase` (`pre_dispatch`, `dispatch_uncertain` or `None`) from `CCBaseError`. Catch `CCBaseError` to handle both families, or `CCError` for semantic errors. `_native.CoreError` is removed. There is no top-level alias or replacement error wrapper.
 
 ```python
 from c_two.error import CoreError
@@ -61,21 +61,21 @@ Every instance has the annotated fields below. Optional fields default to `None`
 | --- | --- |
 | `category` | `semantic`, `contract`, `admission`, `transport`, `lifecycle`, `protocol_version_mismatch` |
 | `message` | `str`, outer Core diagnostic |
-| `code`, `name` | `int` / `str` or `None`; a matched pair from the canonical `c2-error` registry (the codes in `error.ERROR_Code`, with Rust variant names) |
+| `code`, `name` | `int` / `str` or `None`; a matched pair from the canonical `c2-error` registry (the codes in `error.ErrorCode`, with Rust variant names) |
 | `details` | `dict[str, str]`, canonical semantic context; keys depend on the error |
-| `error_bytes` | `bytes` or `None`, canonical semantic error bytes; its inner message can differ from `message` |
+| `semantic_message` | `str` or `None`, inner semantic error message when `code` is set; the read-only `semantic` property projects a fresh typed `CCError` from `(code, semantic_message, details, transport_phase)` without creating a reference cycle |
 | `transport_kind` | `ipc`, `http` or `None` |
-| `transport_phase` | `str` or `None`; Core transport failures use `pre_dispatch` (before business dispatch) or `dispatch_uncertain` (peer execution is unknown). Semantic errors preserve an arbitrary peer-provided detail; it is not a trusted transport classification |
+| `transport_phase` | read-only property (`pre_dispatch`, `dispatch_uncertain` or `None`, backed by `_transport_phase`); established by Core from outer transport facts or normalized pre-dispatch/relay details |
 | `fallback_eligible`, `route_withdrawal` | `bool` or `None`, existing Core classifications; not independent permission to replay a request |
 | `io_operation` | `bind`, `connect` or `None` |
 | `io_kind` | `permission_denied`, `not_found`, `connection_refused`, `address_in_use`, `other` or `None` |
 | `raw_os_error` | `int` or `None`; original errno/Win32 code, absent for refusals without a native code and for non-I/O failures |
 | `endpoint_unverified_reason` | `unsafe-directory`, `symlink`, `unexpected-object`, `foreign-owner`, `missing-ownership`, `invalid-ownership`, `invalid-record`, `record-mismatch`, `coordinator-missing`, `coordinator-replaced`, `initialization-incomplete`, `unsupported-namespace-format` or `None`; only unverifiable bind failures, shared with inspection reason strings |
-| `local_protocol_version`, `peer_protocol_version` | `int` or `None`; the two RPC handshake versions, nonzero only for `category='protocol_version_mismatch'` (for example local 14, peer 15), `None` on every other error |
-| `lifecycle_kind` | `invalid_server_id`, `config_frozen`, `client_config_frozen`, `duplicate_route`, `missing_route`, `relay_duplicate_route`, `missing_relay_address`, `relay_http`, `register_failure`, `held_response_copy`, `held_response_release`, `response_copy`, `configuration`, `server`, `startup_timeout`, `runtime_retired`, `shutdown_wait_timeout`, `relay` or `None` |
+| `local_protocol_version`, `peer_protocol_version` | `int` or `None`; the two RPC handshake versions, nonzero only for `category='protocol_version_mismatch'` (for example local 16, peer 15), `None` on every other error |
+| `lifecycle_kind` | `invalid_server_id`, `config_frozen`, `duplicate_route`, `missing_route`, `missing_relay_address`, `register_failure`, `held_response_release`, `response_copy`, `configuration`, `server`, `startup_timeout`, `runtime_retired`, `shutdown_wait_timeout`, `relay` or `None` |
 | `startup_stage` | `readiness`, `responsiveness` or `None` |
 | `timeout_seconds` | `float` or `None`, configured startup or shutdown budget in seconds |
-| `route_name`, `body` | `str` or `None`, affected route or HTTP response diagnostic |
+| `route_name` | `str` or `None`, affected route |
 | `status_code` | `int` or `None`, HTTP status (including 409 for duplicate registration) |
 | `relay_duplicate` | `bool` or `None`, relay duplicate-registration classification |
 | `failure_source` | `relay_projection`, `relay_prepare`, `commit`, `relay_register`, `route_open` or `None` |
@@ -83,7 +83,7 @@ Every instance has the annotated fields below. Optional fields default to `None`
 
 `registration_failure` contains `route_name`, `failure_source`, `error_message`, nullable `status_code`, `rollback` and `relay_cleanup_error`. `rollback` contains `route_name`, `local_removed`, `active_drained`, `closed_reason` and `close_error`; `relay_cleanup_error` contains `route_name`, nullable `status_code` and `message`. These outcomes report the original transaction; observing them does not repeat cleanup. Ordinary imports do not load FastDB or NumPy.
 
-A peer that negotiates a different RPC handshake version raises `CoreError` with `category='protocol_version_mismatch'`, `transport_kind='ipc'`, `transport_phase='pre_dispatch'` and `fallback_eligible=False`; `code`, `name`, `error_bytes` and the three OS-cause fields stay `None`. The mismatch is a terminal fact with no route or HTTP fallback and no retry, and malformed/truncated preambles keep the ordinary transport/protocol classifications instead of fabricating a peer version. See the [handshake spec](ipc-handshake.md).
+A peer that negotiates a different RPC handshake version raises `CoreError` with `category='protocol_version_mismatch'`, `transport_kind='ipc'`, `transport_phase='pre_dispatch'` and `fallback_eligible=False`; `code`, `name`, `semantic_message` (`semantic` is `None`) and the three OS-cause fields stay `None`. The mismatch is a terminal fact with no route or HTTP fallback and no retry, and malformed/truncated preambles keep the ordinary transport/protocol classifications instead of fabricating a peer version. See the [handshake spec](ipc-handshake.md).
 
 ## Admin shutdown
 

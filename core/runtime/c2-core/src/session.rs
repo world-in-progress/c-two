@@ -174,16 +174,32 @@ fn http_error_parts(err: HttpError) -> (Option<u16>, String, Option<c2_error::C2
     let message = err.to_string();
     match err {
         HttpError::ServerError(status_code, body) => {
-            // Control failures can also be plain text. Preserve that original
-            // failure regardless of whether it carries a semantic envelope.
-            let semantic_error = match serde_json::from_str::<c2_error::C2ErrorEnvelope>(&body) {
-                Ok(envelope) => Some(crate::error::semantic_error_from_http_envelope(envelope)),
-                Err(_) => None,
-            };
+            let semantic_error = parse_control_semantic_error(&body);
             (Some(status_code), body, semantic_error)
         }
         HttpError::LocalCallRejected(error) => (None, message, Some(error)),
         _ => (None, message, None),
+    }
+}
+
+fn parse_control_semantic_error(body: &str) -> Option<c2_error::C2Error> {
+    if let Ok(error) = c2_error::C2Error::from_json_bytes(body.as_bytes()) {
+        return Some(error);
+    }
+    let trimmed = body.trim_start();
+    if !trimmed.starts_with('{') && !trimmed.starts_with('[') {
+        // Plain-text control responses keep semantic_error = None.
+        return None;
+    }
+    match serde_json::from_str::<serde_json::Value>(trimmed) {
+        Ok(serde_json::Value::Object(map))
+            if !map.contains_key("version") && !map.contains_key("code") =>
+        {
+            // Non-C2E1 control payloads such as LocalEndpointNamespaceMismatch
+            // preserve their control message and HTTP status without fabricating 703 or 713.
+            None
+        }
+        _ => Some(crate::error::semantic_error_from_http_body(body)),
     }
 }
 
@@ -1525,10 +1541,9 @@ impl Runtime {
         };
         let anchor = canonical_relay_anchor_address(&anchor);
         if !c2_http::valid_relay_url(&anchor) {
-            return Err(crate::normalize_http_error(
-                HttpError::InvalidInput("invalid HTTP relay base URL".into()),
-                crate::TransportPhase::PreDispatch,
-            ));
+            return Err(normalize_http_acquire_error(HttpError::InvalidInput(
+                "invalid HTTP relay base URL".into(),
+            )));
         }
         let settings = c2_config::ConfigResolver::resolve_relay_client(None, &catalog)
             .map_err(|error| LifecycleError::Configuration(error.to_string()))?;
@@ -1545,50 +1560,17 @@ impl Runtime {
     }
 
     pub fn set_relay_anchor_address(&self, relay_anchor_address: Option<String>) {
-        self.set_relay_anchor_address_with_deadline(
-            relay_anchor_address,
-            ConnectDeadline::default(),
-        )
-        .expect("unbounded relay override cannot expire");
-    }
-
-    #[doc(hidden)]
-    pub fn set_relay_anchor_address_with_attempt(
-        &self,
-        relay_anchor_address: Option<String>,
-        attempt: &crate::ConnectAttempt,
-    ) -> Result<(), crate::Error> {
-        self.set_relay_anchor_address_with_deadline(relay_anchor_address, attempt.deadline())
-    }
-
-    fn set_relay_anchor_address_with_deadline(
-        &self,
-        relay_anchor_address: Option<String>,
-        deadline: ConnectDeadline,
-    ) -> Result<(), crate::Error> {
-        let mut state = connect_state_lock(&self.state, deadline, "relay_override_wait")?;
+        let mut state = self.state.lock();
         let relay_anchor_address =
             relay_anchor_address.map(|addr| canonical_relay_anchor_address(&addr));
         if state.relay_anchor_address_override != relay_anchor_address {
             state.relay_projection = None;
         }
         state.relay_anchor_address_override = relay_anchor_address;
-        Ok(())
     }
 
     pub fn relay_anchor_address_override(&self) -> Option<String> {
         self.state.lock().relay_anchor_address_override.clone()
-    }
-
-    #[doc(hidden)]
-    pub fn relay_anchor_address_override_with_attempt(
-        &self,
-        attempt: &crate::ConnectAttempt,
-    ) -> Result<Option<String>, crate::Error> {
-        Ok(attempt
-            .lock(&self.state, "relay_override_wait")?
-            .relay_anchor_address_override
-            .clone())
     }
 
     /// Atomically move the unstarted server lifecycle to a prepared Runtime.
@@ -2644,13 +2626,12 @@ impl Runtime {
             },
             self.client_domain_budget_with_deadline(deadline)?,
         )
-        .map_err(|error| crate::normalize_http_error(error, crate::TransportPhase::PreDispatch))?;
+        .map_err(normalize_http_acquire_error)?;
         let client = self.project_relay_client_context_with_deadline(client, true, deadline)?;
         match client
             .resolve_target_with_deadline(deadline)
-            .map_err(|error| {
-                crate::normalize_http_error(error, crate::TransportPhase::PreDispatch)
-            })? {
+            .map_err(normalize_http_acquire_error)?
+        {
             RelayResolvedTarget::Ipc { candidate } => {
                 let context = client
                     .local_ipc_context()
@@ -2674,9 +2655,8 @@ impl Runtime {
         connect_stage_check(deadline, "relay_acquire")?;
         match client
             .resolve_target_after_local_ipc_failures_with_deadline(failed_candidates, deadline)
-            .map_err(|error| {
-                crate::normalize_http_error(error, crate::TransportPhase::PreDispatch)
-            })? {
+            .map_err(normalize_http_acquire_error)?
+        {
             RelayResolvedTarget::Ipc { candidate } => {
                 let context = client
                     .local_ipc_context()
@@ -2710,15 +2690,14 @@ impl Runtime {
             },
             self.client_domain_budget_with_deadline(deadline)?,
         )
-        .map_err(|error| crate::normalize_http_error(error, crate::TransportPhase::PreDispatch))?;
+        .map_err(normalize_http_acquire_error)?;
         let client = self
             .project_relay_client_context_with_deadline(client, false, deadline)?
             .with_http_only();
         match client
             .resolve_http_target_with_deadline(deadline)
-            .map_err(|error| {
-                crate::normalize_http_error(error, crate::TransportPhase::PreDispatch)
-            })? {
+            .map_err(normalize_http_acquire_error)?
+        {
             RelayResolvedTarget::Http { .. } => Ok(client),
             RelayResolvedTarget::Ipc { .. } => unreachable!("HTTP relay connect returned IPC"),
         }
@@ -2779,9 +2758,8 @@ impl Runtime {
         let client = client.with_http_only();
         match client
             .resolve_http_target_with_deadline(deadline)
-            .map_err(|error| {
-                crate::normalize_http_error(error, crate::TransportPhase::PreDispatch)
-            })? {
+            .map_err(normalize_http_acquire_error)?
+        {
             RelayResolvedTarget::Http { .. } => Ok(RelayResolvedConnection::Http { client }),
             RelayResolvedTarget::Ipc { .. } => {
                 unreachable!("HTTP-only reconciliation returned IPC")
@@ -2933,6 +2911,23 @@ fn resolve_local_endpoint(
         .map_err(|error| LifecycleError::Configuration(error.to_string()))
 }
 
+fn normalize_http_acquire_error(error: HttpError) -> crate::Error {
+    let mut normalized = crate::normalize_http_error(error, crate::TransportPhase::PreDispatch);
+    if let crate::Error::Semantic(semantic) = &mut normalized {
+        if semantic
+            .details
+            .get("dispatch_phase")
+            .is_some_and(|phase| phase != "pre_dispatch")
+        {
+            semantic.details.remove("dispatch_phase");
+        }
+        semantic
+            .details
+            .insert("transport_phase".into(), "pre_dispatch".into());
+    }
+    normalized
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2948,50 +2943,6 @@ mod tests {
         BuiltRoute, ConcurrencyMode, CrmCallback, CrmError, ResponseMeta, RouteBuildSpec,
         SchedulerLimits,
     };
-
-    #[test]
-    fn connect_attempt_relay_override_wait_is_bounded_and_recovers() {
-        let runtime = Runtime::new(RuntimeOptions::default()).unwrap();
-        let state = runtime.state.lock();
-        let worker_runtime = runtime.clone();
-        let (done_tx, done_rx) = std::sync::mpsc::channel();
-        let worker = std::thread::spawn(move || {
-            let attempt = crate::ConnectAttempt::start(
-                c2_config::ConnectOptions::new().with_timeout(Duration::from_millis(100)),
-            )
-            .unwrap();
-            let result = worker_runtime
-                .set_relay_anchor_address_with_attempt(Some("http://relay.test".into()), &attempt);
-            done_tx.send(result).unwrap();
-        });
-        // The owner keeps RuntimeState locked until the worker completes.
-        // The watchdog allows thread scheduling without replacing the real
-        // 100ms connect budget or allowing completion after lock release.
-        let result = done_rx.recv_timeout(Duration::from_secs(2));
-        let relay_override = state.relay_anchor_address_override.clone();
-        drop(state);
-        worker.join().unwrap();
-        let result = result.expect("connect must expire while RuntimeState remains locked");
-        let crate::Error::Semantic(error) = result.unwrap_err() else {
-            panic!("canonical deadline")
-        };
-        assert_eq!(error.code, c2_error::ErrorCode::CallDeadlineExceeded);
-        assert_eq!(error.details["stage"], "relay_override_wait");
-        assert_eq!(relay_override, None);
-        let recovered = crate::ConnectAttempt::start(c2_config::ConnectOptions::new()).unwrap();
-        runtime
-            .set_relay_anchor_address_with_attempt(Some("http://relay.test/".into()), &recovered)
-            .unwrap();
-        assert_eq!(
-            runtime
-                .relay_anchor_address_override_with_attempt(&recovered)
-                .unwrap()
-                .as_deref(),
-            Some("http://relay.test")
-        );
-        assert!(!runtime.client_config_frozen());
-        assert_eq!(runtime.path_counters().direct_ipc(), 0);
-    }
 
     #[test]
     fn connect_deadline_runtime_waits_are_bounded_in_all_modes() {

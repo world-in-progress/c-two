@@ -1349,9 +1349,12 @@ impl Drop for ResourceProcess {
 
 pub fn assert_uncertain(error: Error) {
     println!("C2_PERSISTENT_UNCERTAIN {error:?}");
+    assert_eq!(
+        error.transport_phase(),
+        Some(c_two::TransportPhase::DispatchUncertain)
+    );
     match error {
         Error::Transport(error) => {
-            assert_eq!(error.phase(), c2_core::TransportPhase::DispatchUncertain);
             assert!(!error.is_fallback_eligible());
         }
         Error::Semantic(error) => {

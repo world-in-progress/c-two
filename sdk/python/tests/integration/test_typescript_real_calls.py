@@ -17,7 +17,6 @@ from typing import Any, Iterator
 import pytest
 
 import c_two as cc
-from c_two.config.settings import settings
 from c_two.transport.registry import _reset_default_runtime
 from tests.fixtures.ipc_version_peer import ipc_version_peer_binary, running_version_peer
 from tests.fixtures.typescript_project import write_node_tsconfig
@@ -422,12 +421,9 @@ def typescript_artifacts() -> Iterator[TypeScriptArtifacts]:
 
 @pytest.fixture(autouse=True)
 def _clean_python_runtime() -> Iterator[None]:
-    previous_relay = settings._relay_anchor_address  # noqa: SLF001
     _reset_default_runtime()
-    settings.relay_anchor_address = None
     yield
     _reset_default_runtime()
-    settings._relay_anchor_address = previous_relay  # noqa: SLF001
 
 
 def _route_name(row_id: str) -> str:

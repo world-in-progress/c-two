@@ -789,8 +789,10 @@ def test_report_or_invalid_owner_error_keeps_input_classification_and_zero_charg
             raise ValueError('report failed')
         monkeypatch.setattr(Payload, 'execution_report', report_error)
     try:
-        with pytest.raises(cc.error.ClientSerializeInput) as failure:
+        with pytest.raises(cc.error.SerializationError) as failure:
             invoke(view, source)
+        assert failure.value.code == cc.error.ErrorCode.ClientInputSerializing
+        assert failure.value.transport_phase == 'pre_dispatch'
         if invalid_owner:
             assert failure.value.details['cause_owner'] == 'fastdb'
             assert failure.value.details['fastdb_symbol']
@@ -803,13 +805,14 @@ def test_report_or_invalid_owner_error_keeps_input_classification_and_zero_charg
         cc.close(view)
 
 
-def test_closed_view_is_call_resource_error_before_serializer(ipc_connection, invoke):
+def test_closed_view_refuses_pre_dispatch_before_serializer(ipc_connection, invoke):
     connection, resource = ipc_connection
     view = cc.with_call_options(connection, timeout=1)
     cc.close(view)
     SlowPickle.caller_threads = []
-    with pytest.raises(cc.error.ClientCallResource):
+    with pytest.raises(cc.error.ResourceClosed, match='CRM proxy is closed') as refused:
         invoke(view, SlowPickle())
+    assert refused.value.transport_phase == 'pre_dispatch'
     assert SlowPickle.caller_threads == []
     assert resource.calls == 0
     assert cc.observe.call_execution_snapshot()['client']['used_operations'] == 0

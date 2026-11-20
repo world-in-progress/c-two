@@ -12,6 +12,30 @@ from types import ModuleType
 DEFAULT_PICKLE_PROTOCOL = 4
 SerializedPayload = bytes | bytearray | memoryview
 
+# Marker attribute distinguishing which payload hook actually failed: opening
+# the FastDB payload buffer (``from_buffer``) versus verifying/decoding the
+# payload content (``deserialize``). Wrappers read it to pick the precise
+# error code instead of guessing from the retention mode.
+DECODE_STAGE_ATTRIBUTE = '_c2_decode_stage'
+DECODE_STAGE_FROM_BUFFER = 'from_buffer'
+DECODE_STAGE_DESERIALIZE = 'deserialize'
+
+
+def _tag_decode_stage(exc: BaseException, stage: str) -> None:
+    try:
+        setattr(exc, DECODE_STAGE_ATTRIBUTE, stage)
+    except (AttributeError, TypeError):  # pragma: no cover - exotic builtins
+        pass
+
+
+def decode_stage_of(exc: BaseException) -> str:
+    """The failing payload hook for one decode exception.
+
+    Defaults to ``'deserialize'``: bindings without a buffer-opening step
+    (plain pickle) always fail while decoding content.
+    """
+    return getattr(exc, DECODE_STAGE_ATTRIBUTE, DECODE_STAGE_DESERIALIZE)
+
 
 def _fastdb_payload_module() -> ModuleType:
     try:
@@ -165,11 +189,18 @@ def fastdb_payload_binding(
     ) -> Payload:
         if data is None:
             raise TypeError(f"{label} requires payload bytes, got None.")
-        owner = Payload.open_copy(compiled, bytes(data))
+        try:
+            owner = Payload.open_copy(compiled, bytes(data))
+        except BaseException as exc:
+            _tag_decode_stage(exc, DECODE_STAGE_FROM_BUFFER)
+            raise
         try:
             owner.require_spec_sha256(digest)
-        except BaseException:
-            owner.close()
+        except BaseException as exc:
+            from .transferable import _cleanup_preserving_primary
+
+            _tag_decode_stage(exc, DECODE_STAGE_DESERIALIZE)
+            _cleanup_preserving_primary(exc, owner.close)
             raise
         return owner
 

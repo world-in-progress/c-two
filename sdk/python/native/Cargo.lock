@@ -58,6 +58,7 @@ name = "c2-codegen"
 version = "0.1.0"
 dependencies = [
  "c2-contract",
+ "c2-error",
  "fastdb",
  "rustix",
  "serde_json",

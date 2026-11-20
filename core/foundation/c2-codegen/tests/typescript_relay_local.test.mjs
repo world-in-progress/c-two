@@ -5,12 +5,13 @@ import { join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { spawnSync } from 'node:child_process';
 import test from 'node:test';
+import { writeRenderedTypescriptTransport } from './render_typescript_transport.mjs';
 
 const directory = mkdtempSync(join(tmpdir(), 'c2-relay-local-'));
 let api;
 try {
   writeFileSync(join(directory, 'package.json'), '{"type":"module"}');
-  const source = fileURLToPath(new URL('../assets/typescript_transport.ts', import.meta.url));
+  const source = writeRenderedTypescriptTransport(directory);
   const compiler = fileURLToPath(new URL('../../c2-mem-ffi/bindings/typescript/node_modules/typescript/bin/tsc', import.meta.url));
   const compiled = spawnSync(process.execPath, [compiler, '--strict', '--exactOptionalPropertyTypes',
     '--target', 'ES2022', '--module', 'ES2022', '--moduleResolution', 'Bundler', '--lib', 'ES2022,DOM',
@@ -31,12 +32,12 @@ function client(options = {}) {
     async fetch(url, init) {
       assert.equal(init.method,'GET','a local failure must not POST to the same endpoint');
       const route = decodeURIComponent(new URL(url).pathname.split('/').pop());
-      return {status:200, async text() {return JSON.stringify([{
+      return {status:200, async arrayBuffer() {return new TextEncoder().encode(JSON.stringify([{
         name:route,relay_url:'http://localhost:8300',
         ipc_address:'ipc://server',server_id:'s',server_instance_id:'i',
         crm_ns:contract.namespace,crm_name:contract.name,crm_ver:contract.version,
         abi_hash:hash,signature_hash:hash,max_payload_size:1024,
-      }])}};
+      }])).buffer}};
     },
     ipc:{async connect(_address,_timeout,nativeOptions) {
       const id = ++state.connections;

@@ -1,66 +1,111 @@
 from __future__ import annotations
+
+import copy
 from collections.abc import Mapping
 from enum import IntEnum, unique
 from typing import Literal
 
 from c_two import _native
 
-_NATIVE_TO_PY_ERROR_NAMES = {
-    "Unknown": "ERROR_UNKNOWN",
-    "ResourceInputDeserializing": "ERROR_AT_RESOURCE_INPUT_DESERIALIZING",
-    "ResourceOutputSerializing": "ERROR_AT_RESOURCE_OUTPUT_SERIALIZING",
-    "ResourceFunctionExecuting": "ERROR_AT_RESOURCE_FUNCTION_EXECUTING",
-    "ResourceInputFromBuffer": "ERROR_AT_RESOURCE_INPUT_FROM_BUFFER",
-    "ClientInputSerializing": "ERROR_AT_CLIENT_INPUT_SERIALIZING",
-    "ClientOutputDeserializing": "ERROR_AT_CLIENT_OUTPUT_DESERIALIZING",
-    "ClientCallingResource": "ERROR_AT_CLIENT_CALLING_RESOURCE",
-    "ClientOutputFromBuffer": "ERROR_AT_CLIENT_OUTPUT_FROM_BUFFER",
-    "ResourceNotFound": "ERROR_RESOURCE_NOT_FOUND",
-    "ResourceUnavailable": "ERROR_RESOURCE_UNAVAILABLE",
-    "ResourceAlreadyRegistered": "ERROR_RESOURCE_ALREADY_REGISTERED",
-    "RegistryUnavailable": "ERROR_REGISTRY_UNAVAILABLE",
-    "ResourceClosed": "ERROR_RESOURCE_CLOSED",
-    "ResourceRemoved": "ERROR_RESOURCE_REMOVED",
-    "ContractMismatch": "ERROR_CONTRACT_MISMATCH",
-    "IdentityMismatch": "ERROR_IDENTITY_MISMATCH",
-    "RouteWatchUnavailable": "ERROR_ROUTE_WATCH_UNAVAILABLE",
-    "ProtocolViolation": "ERROR_PROTOCOL_VIOLATION",
-    "FallbackDenied": "ERROR_FALLBACK_DENIED",
-    "CallDeadlineExceeded": "ERROR_CALL_DEADLINE_EXCEEDED",
-    "UnsupportedCallMode": "ERROR_UNSUPPORTED_CALL_MODE",
-    "CallCapacityExceeded": "ERROR_CALL_CAPACITY_EXCEEDED",
-    "CallCancelled": "ERROR_CALL_CANCELLED",
-    "RouteConflict": "ERROR_ROUTE_CONFLICT",
-}
+ErrorSide = Literal['client', 'resource']
+ErrorStage = Literal['serialize', 'deserialize', 'from_buffer', 'execute', 'call']
+TransportPhase = Literal['pre_dispatch', 'dispatch_uncertain']
+
+_PHASE_VALUES = ('pre_dispatch', 'dispatch_uncertain')
+_CALLBACK_DETAIL_KEYS = ('transport_phase', 'dispatch_phase', 'fallback_eligible', 'route_withdrawal')
+_DEFAULT_MESSAGE = 'Error occurred when using C-Two.'
+_UNSET = object()
 
 
-def _load_error_code_members() -> dict[str, int]:
+def _validated_phase(value: object) -> TransportPhase | None:
+    """Accept only the two canonical Core dispatch phases (or ``None``)."""
+    if value is None or value in _PHASE_VALUES:
+        return value  # type: ignore[return-value]
+    raise ValueError(
+        f'transport_phase must be one of {_PHASE_VALUES} or None, got {value!r}',
+    )
+
+
+def _phase_from_details(details: Mapping[str, str]) -> TransportPhase | None:
+    """Adopt a phase only from an exact canonical details entry."""
+    key = 'transport_phase' if 'transport_phase' in details else 'dispatch_phase'
+    value = details.get(key)
+    if value in _PHASE_VALUES:
+        return value  # type: ignore[return-value]
+    return None
+
+
+def _load_error_code_members() -> (
+    tuple[dict[str, int], dict[int, tuple[ErrorSide | None, ErrorStage | None]]]
+):
     registry = _native.error_registry()
-    missing = sorted(set(_NATIVE_TO_PY_ERROR_NAMES) - set(registry))
-    extra = sorted(set(registry) - set(_NATIVE_TO_PY_ERROR_NAMES))
-    if missing or extra:
-        raise RuntimeError(
-            "Rust error registry does not match Python facade mapping "
-            f"(missing={missing}, extra={extra})"
-        )
-    return {
-        py_name: int(registry[native_name])
-        for native_name, py_name in _NATIVE_TO_PY_ERROR_NAMES.items()
-    }
+    members: dict[str, int] = {}
+    meta: dict[int, tuple[ErrorSide | None, ErrorStage | None]] = {}
+    for name, (code, side, stage) in registry.items():
+        code = int(code)
+        members[name] = code
+        meta[code] = (side, stage)
+    return members, meta
 
 
-ERROR_Code = unique(IntEnum("ERROR_Code", _load_error_code_members()))
+_ERROR_CODE_MEMBERS, _CODE_META = _load_error_code_members()
+
+#: Standard error codes, generated from the native Rust registry so Python
+#: and Rust share one numeric identity and member naming.
+ErrorCode = unique(IntEnum('ErrorCode', _ERROR_CODE_MEMBERS))
+
 
 class CCBaseError(Exception):
     """Base class for all C-Two-related errors."""
+
+    @property
+    def transport_phase(self) -> TransportPhase | None:
+        """Dispatch phase established for this error, when Core knows one.
+
+        Read-only; only ``'pre_dispatch'``, ``'dispatch_uncertain'`` and
+        ``None`` are valid. Never inferred from arbitrary message text.
+        """
+        return getattr(self, '_transport_phase', None)
+
+    def __reduce__(self):
+        state = self.__dict__.copy()
+        if isinstance(state.get('details'), Mapping):
+            state['details'] = dict(state['details'])
+        if isinstance(state.get('__notes__'), list):
+            state['__notes__'] = list(state['__notes__'])
+        slots: dict[str, object] = {}
+        for base in type(self).__mro__:
+            raw_slots = base.__dict__.get('__slots__', ())
+            slot_names = (raw_slots,) if isinstance(raw_slots, str) else raw_slots
+            for name in slot_names:
+                if name not in ('__dict__', '__weakref__') and name not in slots and hasattr(self, name):
+                    val = getattr(self, name)
+                    if name == '__notes__' and isinstance(val, list):
+                        val = list(val)
+                    slots[name] = val
+        return _rebuild_error, (type(self), self.args), (state, slots)
+
+    def __setstate__(self, state):
+        attrs, slots = state
+        self.__dict__.update(attrs)
+        for name, value in slots.items():
+            setattr(self, name, value)
+
+
+def _rebuild_error(target: type[CCBaseError], args: tuple) -> CCBaseError:
+    """Pickle/copy reconstruction preserving the concrete exception class."""
+    inst = Exception.__new__(target)
+    inst.args = args
+    return inst
 
 
 class CoreError(CCBaseError, RuntimeError):
     """Structured failure populated by the native Core runtime.
 
-    ``message`` retains the outer Core diagnostic. When present,
-    ``error_bytes`` contains the canonical semantic error, whose message can
-    differ from that diagnostic. Fields without a native value remain None.
+    ``message`` retains the outer Core diagnostic. When the failure carries a
+    canonical semantic error, the public fields expose its diagnostics and
+    ``semantic`` projects a public exception from a separate immutable snapshot.
+    Fields without a native value remain None.
     """
 
     category: Literal['semantic', 'contract', 'admission', 'transport', 'lifecycle', 'protocol_version_mismatch']
@@ -68,10 +113,11 @@ class CoreError(CCBaseError, RuntimeError):
     code: int | None
     name: str | None
     details: dict[str, str]
-    error_bytes: bytes | None
+    semantic_message: str | None
+    _semantic_snapshot: tuple[int, str, tuple[tuple[str, str], ...], TransportPhase | None] | None
+    _transport_phase: TransportPhase | None
     transport_kind: Literal['ipc', 'http'] | None
     # Semantic errors preserve the peer's arbitrary diagnostic detail.
-    transport_phase: str | None
     fallback_eligible: bool | None
     route_withdrawal: bool | None
     io_operation: Literal['bind', 'connect'] | None
@@ -119,9 +165,10 @@ class CoreError(CCBaseError, RuntimeError):
         self.code = None
         self.name = None
         self.details = {}
-        self.error_bytes = None
+        self.semantic_message = None
+        self._semantic_snapshot = None
+        self._transport_phase = None
         self.transport_kind = None
-        self.transport_phase = None
         self.fallback_eligible = None
         self.route_withdrawal = None
         self.io_operation = None
@@ -141,326 +188,491 @@ class CoreError(CCBaseError, RuntimeError):
         self.rollback = None
         self.relay_cleanup_error = None
 
-    def __reduce__(self):
-        return type(self), (self.category, self.message), self.__dict__
+    @property
+    def semantic(self) -> CCError | None:
+        """Independent projection of the canonical semantic error, if any.
+
+        Each call constructs a fresh exception from the immutable snapshot
+        (code, semantic message, details and this error's dispatch phase).
+        The ``CoreError`` keeps no reference to the projected exception.
+        """
+        snapshot = self._semantic_snapshot
+        if not isinstance(snapshot, tuple) or len(snapshot) != 4:
+            return None
+        code, message, details, phase = snapshot
+        return CCError._from_parts(
+            int(code),
+            message,
+            dict(details),
+            transport_phase=phase,
+        )
+
+
+def _build_error(
+    target: type[CCError],
+    code: ErrorCode,
+    message: str,
+    details: dict[str, str],
+    phase: TransportPhase | None,
+) -> CCError:
+    """Construct one exception instance without running ``__init__``."""
+    error = Exception.__new__(target)
+    error.code = code
+    error.message = message
+    error.details = details
+    error._transport_phase = phase
+    error.args = (code, message)
+    return error
+
+
+def _checked_error_code(code: ErrorCode | int) -> ErrorCode:
+    if not isinstance(code, ErrorCode) and type(code) is not int:
+        raise TypeError(f'code must be an ErrorCode or int, got {type(code).__name__}')
+    return ErrorCode(code)
 
 
 class CCError(CCBaseError):
     """
     General error class for C-Two.
-    
+
     Parameters:
-        code (ERROR_Code): The error code representing the type of error.
-        message (str | None): Optional custom error message. Defaults to a generic message.
-        details (Mapping[str, str] | None): Optional machine-readable diagnostic context.
+        code (ErrorCode): The error code representing the type of error.
+        message (str | None): Optional custom error message; an explicit
+            empty string is kept, the default ``None`` uses the generic text.
+        details (Mapping[str, str] | None): Optional machine-readable
+            diagnostic context.
+        transport_phase (TransportPhase | None): The Core-established
+            dispatch phase. When not passed, it is adopted only from an exact
+            canonical ``transport_phase``/``dispatch_phase`` details entry;
+            later edits to ``details`` never change ``transport_phase``.
     """
-    
-    code: ERROR_Code
-    message: str | None
+
+    code: ErrorCode
+    message: str
     details: dict[str, str]
 
     def __init__(
         self,
-        code: ERROR_Code = ERROR_Code.ERROR_UNKNOWN,
+        code: ErrorCode | int = ErrorCode.Unknown,
         message: str | None = None,
         details: Mapping[str, str] | None = None,
+        *,
+        transport_phase: TransportPhase | None | object = _UNSET,
     ):
-        self.code = code
-        self.message = message or 'Error occurred when using C-Two.'
-        self.details = dict(details or {})
+        resolved_code = _checked_error_code(code)
+        resolved_message = _DEFAULT_MESSAGE if message is None else message
+        resolved_details = dict(details or {})
+        resolved_phase = (
+            _validated_phase(_phase_from_details(resolved_details))
+            if transport_phase is _UNSET
+            else _validated_phase(transport_phase)
+        )
+        self.code = resolved_code
+        self.message = resolved_message
+        self.details = resolved_details
+        self._transport_phase = resolved_phase
+        self.args = (resolved_code, resolved_message)
+
+    @property
+    def side(self) -> ErrorSide | None:
+        """Adapter side from the native error registry, when classified."""
+        return _CODE_META.get(int(self.code), (None, None))[0]
+
+    @property
+    def stage(self) -> ErrorStage | None:
+        """Adapter stage from the native error registry, when classified."""
+        return _CODE_META.get(int(self.code), (None, None))[1]
+
+    @classmethod
+    def _from_parts(
+        cls,
+        code_int: int,
+        message: str | None = None,
+        details: Mapping[str, str] | None = None,
+        *,
+        transport_phase: TransportPhase | None | object = _UNSET,
+    ) -> CCError:
+        """Build the exception for one canonical semantic snapshot.
+
+        The class is selected by the registry mapping; an unknown code
+        degrades to ``ErrorCode.Unknown`` and records the raw code in
+        ``details['unknown_code']``.
+        """
+        details = dict(details or {})
+        try:
+            code = ErrorCode(int(code_int))
+        except ValueError:
+            code = ErrorCode.Unknown
+            details['unknown_code'] = str(int(code_int))
+        if message is None:
+            message = _DEFAULT_MESSAGE
+        phase = _phase_from_details(details) if transport_phase is _UNSET else transport_phase
+        target = _CODE_TO_CLASS.get(int(code), CCError)
+        return _build_error(target, code, message, details, _validated_phase(phase))
 
     def __str__(self):
         return f'{self.code.name}: {self.message}'
-    
+
     def __repr__(self):
-        return f'CCError(code={self.code}, message={self.message}, details={self.details})'
+        return f'CCError(code={int(self.code)}, message={self.message}, details={self.details})'
 
-    @staticmethod
-    def serialize(err: 'CCError' | None) -> bytes:
-        """
-        Serialize the error to canonical C-Two error wire bytes.
-        """
-        if err is None:
-            return b''
 
-        message = err.message or 'Error occurred when using C-Two.'
-        return _native.encode_error_wire(int(err.code), message, err.details)
+class _FixedCodeError(CCError):
+    """A public subclass bound to one registry code and default message."""
 
-    @staticmethod
-    def deserialize(data) -> 'CCError' | None:
-        """
-        Deserialize canonical C-Two error wire bytes to a Python error object.
-        """
-        try:
-            decoded = _native.decode_error_wire_parts(data)
-        except ValueError as exc:
-            return CCError(
-                code=ERROR_Code.ERROR_UNKNOWN,
-                message=f'Malformed error payload: {exc}',
-                details={'decode_error': str(exc)},
+    _code: ErrorCode
+    _default_message: str
+
+    def __init__(
+        self,
+        message: str | None = None,
+        details: Mapping[str, str] | None = None,
+        *,
+        transport_phase: TransportPhase | None | object = _UNSET,
+    ):
+        super().__init__(
+            self._code,
+            message if message is not None else self._default_message,
+            details,
+            transport_phase=transport_phase,
+        )
+
+
+class ResourceExecutionError(_FixedCodeError):
+    """A resource method, stream generator or resource cleanup raised.
+
+    Fixed to ``ErrorCode.ResourceFunctionExecuting`` (code 3,
+    ``side='resource'``, ``stage='execute'``).
+    """
+
+    _code = ErrorCode.ResourceFunctionExecuting
+    _default_message = 'Error occurred when executing function at resource'
+
+
+class SerializationError(CCError):
+    """Codec or payload buffer-view failure at one serialization stage.
+
+    Accepts only the six codec/buffer codes — 1 ``ResourceInputDeserializing``,
+    2 ``ResourceOutputSerializing``, 4 ``ResourceInputFromBuffer``,
+    5 ``ClientInputSerializing``, 6 ``ClientOutputDeserializing`` and
+    8 ``ClientOutputFromBuffer`` — and rejects any other code with
+    ``ValueError``. ``side`` and ``stage`` distinguish the failing stage.
+    """
+
+    _CODEC_CODES: frozenset[int] = frozenset({
+        int(ErrorCode.ResourceInputDeserializing),
+        int(ErrorCode.ResourceOutputSerializing),
+        int(ErrorCode.ResourceInputFromBuffer),
+        int(ErrorCode.ClientInputSerializing),
+        int(ErrorCode.ClientOutputDeserializing),
+        int(ErrorCode.ClientOutputFromBuffer),
+    })
+
+    def __init__(
+        self,
+        code: ErrorCode | int = ErrorCode.ClientInputSerializing,
+        message: str | None = None,
+        details: Mapping[str, str] | None = None,
+        *,
+        transport_phase: TransportPhase | None | object = _UNSET,
+    ):
+        code = _checked_error_code(code)
+        if code not in self._CODEC_CODES:
+            raise ValueError(
+                f'SerializationError requires one of the codec codes '
+                f'{sorted(self._CODEC_CODES)}, got {int(code)}',
             )
+        super().__init__(code, message, details, transport_phase=transport_phase)
 
-        if decoded is None:
-            return None
 
-        code_value, message, details = decoded
-        try:
-            code = ERROR_Code(code_value)
-        except ValueError:
-            code = ERROR_Code.ERROR_UNKNOWN
-        subclass = _CODE_TO_CLASS.get(code, CCError)
-        obj = Exception.__new__(subclass)
-        obj.code = code
-        obj.message = message or 'Error occurred when using C-Two.'
-        obj.details = dict(details or {})
-        return obj
-
-class ResourceDeserializeInput(CCError):
-    def __init__(self, message: str | None = None, details: Mapping[str, str] | None = None):
-        message = 'Error occurred when deserializing input at resource' + (f':\n{message}' if message else '')
-        super().__init__(code=ERROR_Code.ERROR_AT_RESOURCE_INPUT_DESERIALIZING, message=message, details=details)
-
-class ResourceInputFromBuffer(CCError):
-    def __init__(self, message: str | None = None, details: Mapping[str, str] | None = None):
-        message = 'Error occurred when constructing resource input from buffer' + (f':\n{message}' if message else '')
-        super().__init__(code=ERROR_Code.ERROR_AT_RESOURCE_INPUT_FROM_BUFFER, message=message, details=details)
-
-class ResourceSerializeOutput(CCError):
-    def __init__(self, message: str | None = None, details: Mapping[str, str] | None = None):
-        message = 'Error occurred when serializing output at resource' + (f':\n{message}' if message else '')
-        super().__init__(code=ERROR_Code.ERROR_AT_RESOURCE_OUTPUT_SERIALIZING, message=message, details=details)
-
-class ResourceExecuteFunction(CCError):
-    def __init__(self, message: str | None = None, details: Mapping[str, str] | None = None):
-        message = 'Error occurred when executing function at resource' + (f':\n{message}' if message else '')
-        super().__init__(code=ERROR_Code.ERROR_AT_RESOURCE_FUNCTION_EXECUTING, message=message, details=details)
-
-class ClientSerializeInput(CCError):
-    def __init__(self, message: str | None = None, details: Mapping[str, str] | None = None):
-        message = 'Error occurred when serializing input at client' + (f':\n{message}' if message else '')
-        super().__init__(code=ERROR_Code.ERROR_AT_CLIENT_INPUT_SERIALIZING, message=message, details=details)
-
-class ClientDeserializeOutput(CCError):
-    def __init__(self, message: str | None = None, details: Mapping[str, str] | None = None):
-        message = 'Error occurred when deserializing output at client' + (f':\n{message}' if message else '')
-        super().__init__(code=ERROR_Code.ERROR_AT_CLIENT_OUTPUT_DESERIALIZING, message=message, details=details)
-
-class ClientOutputFromBuffer(CCError):
-    def __init__(self, message: str | None = None, details: Mapping[str, str] | None = None):
-        message = 'Error occurred when constructing client output from buffer' + (f':\n{message}' if message else '')
-        super().__init__(code=ERROR_Code.ERROR_AT_CLIENT_OUTPUT_FROM_BUFFER, message=message, details=details)
-
-class ClientCallResource(CCError):
-    def __init__(self, message: str | None = None, details: Mapping[str, str] | None = None):
-        message = 'Error occurred when calling resource from client' + (f':\n{message}' if message else '')
-        super().__init__(code=ERROR_Code.ERROR_AT_CLIENT_CALLING_RESOURCE, message=message, details=details)
-
-class ResourceNotFound(CCError):
+class ResourceNotFound(_FixedCodeError):
     """Raised when a named resource cannot be resolved by any relay."""
-    ERROR_CODE = 701
 
-    def __init__(self, message: str | None = None, details: Mapping[str, str] | None = None):
-        super().__init__(code=ERROR_Code.ERROR_RESOURCE_NOT_FOUND, message=message or 'Resource not found', details=details)
+    _code = ErrorCode.ResourceNotFound
+    _default_message = 'Resource not found'
 
-class ResourceUnavailable(CCError):
+
+class ResourceUnavailable(_FixedCodeError):
     """Raised when a resource exists but is not reachable."""
-    ERROR_CODE = 702
+
+    _code = ErrorCode.ResourceUnavailable
+    _default_message = 'Resource unavailable'
 
     def __init__(
         self,
         message: str | None = None,
         detail: str | None = None,
         details: Mapping[str, str] | None = None,
+        *,
+        transport_phase: TransportPhase | None | object = _UNSET,
     ):
-        msg = message or 'Resource unavailable'
+        resolved = message if message is not None else self._default_message
         if detail:
-            msg = f'{msg}: {detail}'
-        super().__init__(code=ERROR_Code.ERROR_RESOURCE_UNAVAILABLE, message=msg, details=details)
+            resolved = f'{resolved}: {detail}'
+        super().__init__(resolved, details, transport_phase=transport_phase)
 
-class ResourceAlreadyRegistered(CCError):
+
+class ResourceAlreadyRegistered(_FixedCodeError):
     """Raised when a relay rejects duplicate registration for a route name."""
-    ERROR_CODE = 703
 
-    def __init__(self, message: str | None = None, details: Mapping[str, str] | None = None):
-        super().__init__(
-            code=ERROR_Code.ERROR_RESOURCE_ALREADY_REGISTERED,
-            message=message or 'Resource already registered',
-            details=details,
-        )
+    _code = ErrorCode.ResourceAlreadyRegistered
+    _default_message = 'Resource already registered'
 
-class RegistryUnavailable(CCError):
-    """Raised when no relay is available for name resolution."""
-    ERROR_CODE = 705
 
-    def __init__(self, message: str | None = None, details: Mapping[str, str] | None = None):
-        super().__init__(code=ERROR_Code.ERROR_REGISTRY_UNAVAILABLE, message=message or 'Registry unavailable', details=details)
-
-class ResourceClosed(CCError):
+class ResourceClosed(_FixedCodeError):
     """Raised when a route exists but no longer accepts new calls."""
-    ERROR_CODE = 707
 
-    def __init__(self, message: str | None = None, details: Mapping[str, str] | None = None):
-        super().__init__(code=ERROR_Code.ERROR_RESOURCE_CLOSED, message=message or 'Resource closed', details=details)
+    _code = ErrorCode.ResourceClosed
+    _default_message = 'Resource closed'
 
-class ResourceRemoved(CCError):
+
+class ResourceRemoved(_FixedCodeError):
     """Raised when a previously observed route was removed."""
-    ERROR_CODE = 708
 
-    def __init__(self, message: str | None = None, details: Mapping[str, str] | None = None):
-        super().__init__(code=ERROR_Code.ERROR_RESOURCE_REMOVED, message=message or 'Resource removed', details=details)
+    _code = ErrorCode.ResourceRemoved
+    _default_message = 'Resource removed'
 
-class ContractMismatch(CCError):
+
+class ContractMismatch(_FixedCodeError):
     """Raised when route contract metadata does not match the expected CRM."""
-    ERROR_CODE = 709
 
-    def __init__(self, message: str | None = None, details: Mapping[str, str] | None = None):
-        super().__init__(code=ERROR_Code.ERROR_CONTRACT_MISMATCH, message=message or 'Contract mismatch', details=details)
+    _code = ErrorCode.ContractMismatch
+    _default_message = 'Contract mismatch'
 
-class IdentityMismatch(CCError):
+
+class IdentityMismatch(_FixedCodeError):
     """Raised when the actual server identity does not match the expected owner."""
-    ERROR_CODE = 710
 
-    def __init__(self, message: str | None = None, details: Mapping[str, str] | None = None):
-        super().__init__(code=ERROR_Code.ERROR_IDENTITY_MISMATCH, message=message or 'Identity mismatch', details=details)
+    _code = ErrorCode.IdentityMismatch
+    _default_message = 'Identity mismatch'
 
-class RouteWatchUnavailable(CCError):
-    """Raised when route state cannot be trusted because the watch is unavailable."""
-    ERROR_CODE = 712
 
-    def __init__(self, message: str | None = None, details: Mapping[str, str] | None = None):
-        super().__init__(code=ERROR_Code.ERROR_ROUTE_WATCH_UNAVAILABLE, message=message or 'Route watch unavailable', details=details)
-
-class ProtocolViolation(CCError):
+class ProtocolViolation(_FixedCodeError):
     """Raised when a peer sends invalid C-Two protocol data."""
-    ERROR_CODE = 713
 
-    def __init__(self, message: str | None = None, details: Mapping[str, str] | None = None):
-        super().__init__(code=ERROR_Code.ERROR_PROTOCOL_VIOLATION, message=message or 'Protocol violation', details=details)
+    _code = ErrorCode.ProtocolViolation
+    _default_message = 'Protocol violation'
 
-class FallbackDenied(CCError):
+
+class FallbackDenied(_FixedCodeError):
     """Raised when a fallback route would retry the same failed local path."""
-    ERROR_CODE = 714
 
-    def __init__(self, message: str | None = None, details: Mapping[str, str] | None = None):
-        super().__init__(code=ERROR_Code.ERROR_FALLBACK_DENIED, message=message or 'Fallback denied', details=details)
+    _code = ErrorCode.FallbackDenied
+    _default_message = 'Fallback denied'
 
-class CallDeadlineExceeded(CCError):
+
+class CallDeadlineExceeded(_FixedCodeError):
     """Raised when a bounded call deadline elapsed without a definitive outcome.
 
-    The peer Core reports the observed ``transport_phase`` detail, either
-    ``pre_dispatch`` or ``dispatch_uncertain``. This class only projects the
-    received detail; it never infers a phase from the message text and never
-    rewrites received details.
+    The peer Core reports the observed dispatch phase through
+    ``transport_phase`` (``pre_dispatch`` or ``dispatch_uncertain``). This
+    class only projects the received detail; it never infers a phase from
+    message text and never rewrites received details.
     """
-    ERROR_CODE = 715
 
-    def __init__(self, message: str | None = None, details: Mapping[str, str] | None = None):
-        super().__init__(
-            code=ERROR_Code.ERROR_CALL_DEADLINE_EXCEEDED,
-            message=message or 'Call deadline exceeded',
-            details=details,
-        )
+    _code = ErrorCode.CallDeadlineExceeded
+    _default_message = 'Call deadline exceeded'
 
-    @property
-    def transport_phase(self) -> str | None:
-        """Read-only view of ``details['transport_phase']``; ``None`` when absent."""
-        return self.details.get('transport_phase')
 
-class UnsupportedCallMode(CCError):
+class UnsupportedCallMode(_FixedCodeError):
     """Raised when a call mode cannot honor the requested semantics, such as a
     finite deadline that does not support same-process synchronous dispatch."""
-    ERROR_CODE = 716
 
-    def __init__(self, message: str | None = None, details: Mapping[str, str] | None = None):
-        super().__init__(
-            code=ERROR_Code.ERROR_UNSUPPORTED_CALL_MODE,
-            message=message or 'Unsupported call mode',
-            details=details,
-        )
+    _code = ErrorCode.UnsupportedCallMode
+    _default_message = 'Unsupported call mode'
 
-class CallCapacityExceeded(CCError):
+
+class CallCapacityExceeded(_FixedCodeError):
     """Raised when a bounded continuation budget is exhausted, such as
     continuation slots or byte capacity."""
-    ERROR_CODE = 717
 
-    def __init__(self, message: str | None = None, details: Mapping[str, str] | None = None):
-        super().__init__(
-            code=ERROR_Code.ERROR_CALL_CAPACITY_EXCEEDED,
-            message=message or 'Call capacity exceeded',
-            details=details,
-        )
+    _code = ErrorCode.CallCapacityExceeded
+    _default_message = 'Call capacity exceeded'
 
-class CallCancelled(CCError):
+
+class CallCancelled(_FixedCodeError):
     """Raised when a server stream's cancellation has completed."""
-    ERROR_CODE = 718
 
-    def __init__(self, message: str | None = None, details: Mapping[str, str] | None = None):
-        super().__init__(
-            code=ERROR_Code.ERROR_CALL_CANCELLED,
-            message=message or 'Call cancelled',
-            details=details,
-        )
+    _code = ErrorCode.CallCancelled
+    _default_message = 'Call cancelled'
 
-class RouteConflict(CCError):
+
+class RouteConflict(_FixedCodeError):
     """Raised when multiple online registrations hold one route name."""
-    ERROR_CODE = 719
 
-    def __init__(self, message: str | None = None, details: Mapping[str, str] | None = None):
-        super().__init__(
-            code=ERROR_Code.ERROR_ROUTE_CONFLICT,
-            message=message or 'Route conflict',
-            details=details,
-        )
+    _code = ErrorCode.RouteConflict
+    _default_message = 'Route conflict'
 
-_CODE_TO_CLASS: dict[int, type] = {
-    ERROR_Code.ERROR_AT_RESOURCE_INPUT_DESERIALIZING: ResourceDeserializeInput,
-    ERROR_Code.ERROR_AT_RESOURCE_INPUT_FROM_BUFFER:    ResourceInputFromBuffer,
-    ERROR_Code.ERROR_AT_RESOURCE_OUTPUT_SERIALIZING:  ResourceSerializeOutput,
-    ERROR_Code.ERROR_AT_RESOURCE_FUNCTION_EXECUTING:  ResourceExecuteFunction,
-    ERROR_Code.ERROR_AT_CLIENT_INPUT_SERIALIZING:     ClientSerializeInput,
-    ERROR_Code.ERROR_AT_CLIENT_OUTPUT_DESERIALIZING:  ClientDeserializeOutput,
-    ERROR_Code.ERROR_AT_CLIENT_OUTPUT_FROM_BUFFER:    ClientOutputFromBuffer,
-    ERROR_Code.ERROR_AT_CLIENT_CALLING_RESOURCE:      ClientCallResource,
-    ERROR_Code.ERROR_RESOURCE_NOT_FOUND:               ResourceNotFound,
-    ERROR_Code.ERROR_RESOURCE_UNAVAILABLE:             ResourceUnavailable,
-    ERROR_Code.ERROR_RESOURCE_ALREADY_REGISTERED:      ResourceAlreadyRegistered,
-    ERROR_Code.ERROR_REGISTRY_UNAVAILABLE:             RegistryUnavailable,
-    ERROR_Code.ERROR_RESOURCE_CLOSED:                  ResourceClosed,
-    ERROR_Code.ERROR_RESOURCE_REMOVED:                 ResourceRemoved,
-    ERROR_Code.ERROR_CONTRACT_MISMATCH:                ContractMismatch,
-    ERROR_Code.ERROR_IDENTITY_MISMATCH:                IdentityMismatch,
-    ERROR_Code.ERROR_ROUTE_WATCH_UNAVAILABLE:          RouteWatchUnavailable,
-    ERROR_Code.ERROR_PROTOCOL_VIOLATION:               ProtocolViolation,
-    ERROR_Code.ERROR_FALLBACK_DENIED:                  FallbackDenied,
-    ERROR_Code.ERROR_CALL_DEADLINE_EXCEEDED:           CallDeadlineExceeded,
-    ERROR_Code.ERROR_UNSUPPORTED_CALL_MODE:            UnsupportedCallMode,
-    ERROR_Code.ERROR_CALL_CAPACITY_EXCEEDED:           CallCapacityExceeded,
-    ERROR_Code.ERROR_CALL_CANCELLED:                   CallCancelled,
-    ERROR_Code.ERROR_ROUTE_CONFLICT:                   RouteConflict,
+
+_CODE_TO_CLASS: dict[int, type[CCError]] = {
+    int(ErrorCode.ResourceInputDeserializing): SerializationError,
+    int(ErrorCode.ResourceOutputSerializing): SerializationError,
+    int(ErrorCode.ResourceInputFromBuffer): SerializationError,
+    int(ErrorCode.ResourceFunctionExecuting): ResourceExecutionError,
+    int(ErrorCode.ClientInputSerializing): SerializationError,
+    int(ErrorCode.ClientOutputDeserializing): SerializationError,
+    int(ErrorCode.ClientOutputFromBuffer): SerializationError,
+    int(ErrorCode.ResourceNotFound): ResourceNotFound,
+    int(ErrorCode.ResourceUnavailable): ResourceUnavailable,
+    int(ErrorCode.ResourceAlreadyRegistered): ResourceAlreadyRegistered,
+    int(ErrorCode.ResourceClosed): ResourceClosed,
+    int(ErrorCode.ResourceRemoved): ResourceRemoved,
+    int(ErrorCode.ContractMismatch): ContractMismatch,
+    int(ErrorCode.IdentityMismatch): IdentityMismatch,
+    int(ErrorCode.ProtocolViolation): ProtocolViolation,
+    int(ErrorCode.FallbackDenied): FallbackDenied,
+    int(ErrorCode.CallDeadlineExceeded): CallDeadlineExceeded,
+    int(ErrorCode.UnsupportedCallMode): UnsupportedCallMode,
+    int(ErrorCode.CallCapacityExceeded): CallCapacityExceeded,
+    int(ErrorCode.CallCancelled): CallCancelled,
+    int(ErrorCode.RouteConflict): RouteConflict,
 }
 
 
+def _strip_callback_phases(details: object) -> dict[str, str]:
+    """Drop inner call-control details that never describe the outer call."""
+    if not isinstance(details, Mapping):
+        return {}
+    return {
+        key: value
+        for key, value in details.items()
+        if key not in _CALLBACK_DETAIL_KEYS
+    }
+
+
+def _has_callback_detail_keys(details: object) -> bool:
+    if not isinstance(details, Mapping):
+        return False
+    return any(key in details for key in _CALLBACK_DETAIL_KEYS)
+
+
+def _strip_snapshot_controls(
+    snapshot: tuple[int, str, tuple[tuple[str, str], ...], TransportPhase | None] | None,
+) -> tuple[int, str, tuple[tuple[str, str], ...], TransportPhase | None] | None:
+    if not isinstance(snapshot, tuple) or len(snapshot) != 4:
+        return None
+    code, message, entries, _ = snapshot
+    cleaned = tuple(
+        (key, value)
+        for key, value in entries
+        if key not in _CALLBACK_DETAIL_KEYS
+    )
+    return (code, message, cleaned, None)
+
+
+def _snapshot_has_controls(
+    snapshot: tuple[int, str, tuple[tuple[str, str], ...], TransportPhase | None] | None,
+) -> bool:
+    if not isinstance(snapshot, tuple) or len(snapshot) != 4:
+        return False
+    _, _, entries, phase = snapshot
+    if phase is not None:
+        return True
+    return any(key in _CALLBACK_DETAIL_KEYS for key, _ in entries)
+
+
+def _callback_error_copy(exc: CCError) -> CCError:
+    """Fresh copy of a ``CCError`` escaping a resource callback.
+
+    Keeps the subclass, code, message and business details; clears inner
+    dispatch phases and call-control details without mutating the original.
+    """
+    stripped_details = _strip_callback_phases(getattr(exc, 'details', {}))
+    copied = copy.copy(exc)
+    copied.details = stripped_details
+    copied._transport_phase = None
+    if isinstance(copied.__dict__.get('__notes__'), list):
+        copied.__dict__['__notes__'] = list(copied.__dict__['__notes__'])
+    return copied
+
+
+def _callback_core_copy(core: CoreError) -> CoreError:
+    """Fresh ``CoreError`` copy for a same-process resource callback re-raise.
+
+    Keeps the structured native facts, drops the outer-inapplicable inner
+    dispatch phase, fallback eligibility, route withdrawal and phase details.
+    """
+    copied = copy.copy(core)
+    copied.details = _strip_callback_phases(getattr(core, 'details', {}))
+    copied._transport_phase = None
+    copied.fallback_eligible = None
+    copied.route_withdrawal = None
+    copied._semantic_snapshot = _strip_snapshot_controls(core._semantic_snapshot)
+    if isinstance(copied.__dict__.get('__notes__'), list):
+        copied.__dict__['__notes__'] = list(copied.__dict__['__notes__'])
+    return copied
+
+
+def _post_dispatch_cleanup_error(exc: BaseException) -> BaseException:
+    """Strip inner call-control phases from a cleanup failure after dispatch."""
+    if isinstance(exc, CoreError):
+        if (
+            exc.transport_phase is not None
+            or exc.fallback_eligible is not None
+            or exc.route_withdrawal is not None
+            or _has_callback_detail_keys(exc.details)
+            or _snapshot_has_controls(exc._semantic_snapshot)
+        ):
+            return _callback_core_copy(exc)
+        return exc
+    if isinstance(exc, CCError):
+        if exc.transport_phase is not None or _has_callback_detail_keys(exc.details):
+            return _callback_error_copy(exc)
+        return exc
+    if isinstance(exc, CCBaseError):
+        details = getattr(exc, 'details', None)
+        if exc.transport_phase is not None or _has_callback_detail_keys(details):
+            copied = copy.copy(exc)
+            if _has_callback_detail_keys(details):
+                copied.details = _strip_callback_phases(details)  # type: ignore[attr-defined]
+            copied._transport_phase = None  # type: ignore[attr-defined]
+            return copied
+    return exc
+
+
+def _callback_semantic_copy(exc: CCBaseError) -> CCError | None:
+    """Semantic projection of a callback error, or ``None``.
+
+    A ``CoreError`` projects its semantic snapshot first; a plain ``CCError``
+    is copied with inner dispatch phases cleared.
+    """
+    if isinstance(exc, CoreError):
+        projected = exc.semantic
+        if projected is not None:
+            return _callback_error_copy(projected)
+        return None
+    if isinstance(exc, CCError):
+        return _callback_error_copy(exc)
+    return None
+
+
+def _project_native_error(exc: BaseException) -> CCError | None:
+    """The unified native semantic projection shared by every SDK call site.
+
+    A native ``CoreError`` carrying a canonical semantic error projects a
+    fresh typed exception (with the Core-established dispatch phase); a
+    ``CoreError`` without one, and any other exception, projects ``None`` so
+    callers re-raise the original.
+    """
+    if isinstance(exc, CoreError):
+        return exc.semantic
+    return None
+
+
 __all__ = [
+    'ErrorCode',
     'CCBaseError',
     'CoreError',
     'CCError',
-    'ResourceDeserializeInput',
-    'ResourceInputFromBuffer',
-    'ResourceSerializeOutput',
-    'ResourceExecuteFunction',
-    'ClientSerializeInput',
-    'ClientDeserializeOutput',
-    'ClientOutputFromBuffer',
-    'ClientCallResource',
+    'ResourceExecutionError',
+    'SerializationError',
     'ResourceNotFound',
     'ResourceUnavailable',
     'ResourceAlreadyRegistered',
-    'RegistryUnavailable',
     'ResourceClosed',
     'ResourceRemoved',
     'ContractMismatch',
     'IdentityMismatch',
-    'RouteWatchUnavailable',
     'ProtocolViolation',
     'FallbackDenied',
     'CallDeadlineExceeded',
@@ -468,5 +680,4 @@ __all__ = [
     'CallCapacityExceeded',
     'CallCancelled',
     'RouteConflict',
-    'ERROR_Code',
 ]

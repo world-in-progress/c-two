@@ -4,15 +4,17 @@ import {mkdtempSync,writeFileSync,rmSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {fileURLToPath,pathToFileURL} from 'node:url';
+import {delimiter} from 'node:path';
 import test from 'node:test';
+import {buildFastDbEnvironment,prependEnvPaths,writeRenderedTypescriptTransport} from './render_typescript_transport.mjs';
 
 const directory=mkdtempSync(join(tmpdir(),'c2-ts-revision-'));
 let transport;
 try {
   writeFileSync(join(directory,'package.json'),'{"type":"module"}');
   const compiler=fileURLToPath(new URL('../../c2-mem-ffi/bindings/typescript/node_modules/typescript/bin/tsc',import.meta.url));
-  const source=fileURLToPath(new URL('../assets/typescript_transport.ts',import.meta.url));
-  const result=spawnSync(process.execPath,[compiler,'--strict','--target','ES2022','--module','ES2022','--moduleResolution','Bundler','--lib','ES2022,DOM','--rootDir',fileURLToPath(new URL('../assets',import.meta.url)),'--outDir',directory,'--typeRoots',join(directory,'node_modules','@types'),source],{encoding:'utf8'});
+  const source=writeRenderedTypescriptTransport(directory);
+  const result=spawnSync(process.execPath,[compiler,'--strict','--exactOptionalPropertyTypes','--target','ES2022','--module','ES2022','--moduleResolution','Bundler','--lib','ES2022,DOM','--rootDir',directory,'--outDir',directory,'--typeRoots',join(directory,'node_modules','@types'),source],{encoding:'utf8'});
   assert.equal(result.status,0,result.stdout+result.stderr);
   transport=await import(pathToFileURL(join(directory,'typescript_transport.js')));
 } finally {rmSync(directory,{recursive:true,force:true});}
@@ -23,6 +25,7 @@ const receipt={completed:true,error:null,completeItems:0n};
 const nativeTarget={...binding,path:'DirectIpc'};
 const nextTurn=()=>new Promise(resolve=>setImmediate(resolve));
 function deferred(){let resolve;const promise=new Promise(r=>{resolve=r});return {promise,resolve};}
+const textReply=(status,body)=>({status,async arrayBuffer(){return new TextEncoder().encode(body).buffer}});
 
 test('719 resolve is typed, pre-dispatch, and a later acquisition can succeed',async()=>{
   const registrations='[{"relay_id":"a","relay_url":"http://localhost:8301","registered_at":1,"relay_status":"Alive"}]';
@@ -33,10 +36,10 @@ test('719 resolve is typed, pre-dispatch, and a later acquisition can succeed',a
     if(url.includes('/_resolve/')){
       resolves++;
       return resolves===1
-        ? {status:409,async text(){return JSON.stringify({version:1,code:719,name:'RouteConflict',message:'conflict',details})}}
-        : {status:200,async text(){return JSON.stringify([route])}};
+        ? textReply(409,JSON.stringify({version:1,code:719,name:'RouteConflict',message:'conflict',details}))
+        : textReply(200,JSON.stringify([route]));
     }
-    if(url.includes('/_probe/')){probes++;return {status:200,async text(){return ''}}}
+    if(url.includes('/_probe/')){probes++;return textReply(200,'')}
     posts++;return {status:200,async arrayBuffer(){return Uint8Array.of(8).buffer}};
   };
   const client=transport.createRelayAwareHttpEncodedTransport('http://localhost:8300',{fetch});
@@ -61,7 +64,7 @@ test('719 resolution parses a complete canonical error once',async()=>{
   const details={route:'route',dispatch_phase:'pre_dispatch',registrations:'[]'};
   const body=JSON.stringify({version:1,code:719,name:'RouteConflict',message:'conflict',details});
   const client=transport.createRelayAwareHttpEncodedTransport('http://localhost:8300',{
-    fetch:async()=>({status:409,async text(){return body}}),
+    fetch:async()=>textReply(409,body),
   });
   const originalParse=JSON.parse;
   let parses=0;
@@ -86,7 +89,7 @@ test('719 with invalid canonical fields keeps the HTTP relay error',async()=>{
   ]){
     const body=JSON.stringify({version:1,code:719,name:'RouteConflict',...invalid});
     const client=transport.createRelayAwareHttpEncodedTransport('http://localhost:8300',{
-      fetch:async()=>({status:409,async text(){return body}}),
+      fetch:async()=>textReply(409,body),
     });
     try{
       await assert.rejects(client.call('route',contract,'ping',()=>new Uint8Array()),error=>{
@@ -125,14 +128,14 @@ test('native 719 projection has the same typed error',async()=>{
 });
 
 test('719 probe stops acquisition before trying another registration',async()=>{
-  const details={route:'route',dispatch_phase:'pre_dispatch',registrations:'[]'};
+  const details={route:'route'};
   const routes=[8301,8302].map(port=>({name:'route',relay_url:`http://localhost:${port}`,crm_ns:'test',crm_name:'Test',crm_ver:'0.1.0',abi_hash:hash,signature_hash:hash,max_payload_size:100}));
   let resolves=0,probes=0,posts=0;
   const fetch=async(url)=>{
-    if(url.includes('/_resolve/')){resolves++;return {status:200,async text(){return JSON.stringify(routes)}}}
+    if(url.includes('/_resolve/')){resolves++;return textReply(200,JSON.stringify(routes))}
     if(url.includes('/_probe/')){
       probes++;
-      return {status:409,async text(){return JSON.stringify({version:1,code:719,name:'RouteConflict',message:'conflict',details})}};
+      return textReply(409,JSON.stringify({version:1,code:719,name:'RouteConflict',message:'conflict',details}));
     }
     posts++;throw Error('unexpected POST');
   };
@@ -186,7 +189,7 @@ for (const relayLocal of [false, true]) for (const stream of [false, true]) {
           callTimeoutMs: 10, ipc: {connect: async () => endpoint},
           fetch: async url => {
             assert.ok(url.includes('/_resolve/'));
-            return {status: 200, async text() { return JSON.stringify([relayRoute(1, true)]); }};
+            return textReply(200, JSON.stringify([relayRoute(1, true)]));
           },
         })
       : transport.createIpcEncodedTransport('ipc://deadline', {connect: async () => endpoint, callTimeoutMs: 10});
@@ -273,7 +276,7 @@ test('FallbackDenied retains first local IPC cause across two failed acquisition
   });
   const routes=['a','b'].map((id,index)=>({name:'route',relay_url:`http://localhost:${8301+index}`,ipc_address:`ipc://${id}`,server_id:id,server_instance_id:'i',crm_ns:'test',crm_name:'Test',crm_ver:'0.1.0',abi_hash:hash,signature_hash:hash,max_payload_size:100}));
   let posts=0;const attempts=[];
-  const fetch=async(_url,init)=>{if(init.method==='POST')posts++;return {status:200,async text(){return JSON.stringify(routes)},async arrayBuffer(){return new ArrayBuffer(0)}}};
+  const fetch=async(_url,init)=>{if(init.method==='POST')posts++;return textReply(200,JSON.stringify(routes))};
   const connect=async address=>({connectionSnapshot(){return null},async prepare(){const index=address==='ipc://a'?0:1;attempts.push(index);throw failures[index]},beginCall(){throw Error('unexpected dispatch')},async close(){},deactivate(){}});
   const client=transport.createRelayAwareHttpEncodedTransport('http://localhost:8300',{fetch,ipc:{connect}});
   await assert.rejects(client.call('route',contract,'ping',()=>new Uint8Array()),error=>{
@@ -291,7 +294,7 @@ test('fresh resolve excludes the same failed local endpoint identity',async()=>{
   failure.nativeDetails={message:'refused',transportPhase:'pre_dispatch',category:'ipc',ioOperation:'connect',ioKind:'ConnectionRefused'};
   const route={name:'route',relay_url:'http://localhost:8301',ipc_address:'ipc://same',server_id:'s',server_instance_id:'i',crm_ns:'test',crm_name:'Test',crm_ver:'0.1.0',abi_hash:hash,signature_hash:hash,max_payload_size:100};
   let resolves=0,connects=0,posts=0;
-  const fetch=async(_url,init)=>{if(init.method==='POST')posts++;else resolves++;return {status:200,async text(){return JSON.stringify([route])},async arrayBuffer(){return new ArrayBuffer(0)}}};
+  const fetch=async(_url,init)=>{if(init.method==='POST')posts++;else resolves++;return textReply(200,JSON.stringify([route]))};
   const connect=async()=>{connects++;return {connectionSnapshot(){return null},async prepare(){throw failure},beginCall(){throw Error('unexpected dispatch')},async close(){},deactivate(){}}};
   const client=transport.createRelayAwareHttpEncodedTransport('http://localhost:8300',{fetch,ipc:{connect}});
   await assert.rejects(client.call('route',contract,'ping',()=>new Uint8Array()),error=>{
@@ -313,9 +316,9 @@ for (const response of ['empty', 'not-found']) test(`empty fresh resolve retains
   const fetch=async(_url,init)=>{
     if(init.method==='POST'){posts++;throw Error('unexpected POST')}
     resolves++;
-    if(resolves===1)return {status:200,async text(){return JSON.stringify([route])}};
-    return response==='empty' ? {status:200,async text(){return '[]'}} :
-      {status:404,async text(){return JSON.stringify({version:1,code:701,name:'ResourceNotFound',message:'missing',details:{dispatch_phase:'pre_dispatch'}})}};
+    if(resolves===1)return textReply(200,JSON.stringify([route]));
+    return response==='empty' ? textReply(200,'[]') :
+      textReply(404,JSON.stringify({version:1,code:701,name:'ResourceNotFound',message:'missing',details:{dispatch_phase:'pre_dispatch'}}));
   };
   const connect=async()=>({connectionSnapshot(){return null},async prepare(){throw first},beginCall(){throw Error('unexpected dispatch')},async close(){},deactivate(){}});
   const client=transport.createRelayAwareHttpEncodedTransport('http://localhost:8300',{fetch,ipc:{connect}});
@@ -334,10 +337,10 @@ test('canonical 701 POST invalidates its target without replaying that call',asy
   const route={name:'route',relay_url:'http://localhost:8301',crm_ns:'test',crm_name:'Test',crm_ver:'0.1.0',abi_hash:hash,signature_hash:hash,max_payload_size:100};
   let resolves=0,posts=0,encodes=0;
   const fetch=async(url,init)=>{
-    if(url.includes('/_resolve/')){resolves++;return {status:200,async text(){return JSON.stringify([route])}}}
-    if(url.includes('/_probe/'))return {status:200,async text(){return ''}};
+    if(url.includes('/_resolve/')){resolves++;return textReply(200,JSON.stringify([route]))}
+    if(url.includes('/_probe/'))return textReply(200,'');
     posts++;
-    if(posts===1)return {status:404,async text(){return JSON.stringify({version:1,code:701,name:'ResourceNotFound',message:'missing',details:{dispatch_phase:'pre_dispatch'}})}};
+    if(posts===1)return textReply(404,JSON.stringify({version:1,code:701,name:'ResourceNotFound',message:'missing',details:{dispatch_phase:'pre_dispatch'}}));
     return {status:200,async arrayBuffer(){return Uint8Array.of(8).buffer}};
   };
   const client=transport.createRelayAwareHttpEncodedTransport('http://localhost:8300',{fetch});
@@ -354,7 +357,7 @@ for(const path of ['direct','relay-local'])test(`${path} close accepts 214748364
   const call={cancel(){},async chargeInput(){},async dispatch(){return nativeTarget},async next(){return null},async observe(ms){observes++;assert.ok(ms>2147483000);return receipt},checkDeadline(){},close(){}};
   const endpoint={connectionSnapshot(){return null},async prepare(){await opened.promise;return binding},beginCall(){return call},deactivate(){},async close(){}};
   const route={name:'route',relay_url:'http://localhost:8301',ipc_address:'ipc://local',server_id:'s',server_instance_id:'i',crm_ns:'test',crm_name:'Test',crm_ver:'0.1.0',abi_hash:hash,signature_hash:hash,max_payload_size:100};
-  const client=path==='direct'?transport.createIpcEncodedTransport('ipc://close',{connect:async()=>endpoint}):transport.createRelayAwareHttpEncodedTransport('http://localhost:8300',{ipc:{connect:async()=>endpoint},fetch:async()=>({status:200,async text(){return JSON.stringify([route])},async arrayBuffer(){return new ArrayBuffer(0)}})});
+  const client=path==='direct'?transport.createIpcEncodedTransport('ipc://close',{connect:async()=>endpoint}):transport.createRelayAwareHttpEncodedTransport('http://localhost:8300',{ipc:{connect:async()=>endpoint},fetch:async()=>textReply(200,JSON.stringify([route]))});
   let clock=0,id=0;const timers=new Map();
   const originalTimeout=globalThis.setTimeout,originalClear=globalThis.clearTimeout;
   const nowDescriptor=Object.getOwnPropertyDescriptor(performance,'now');
@@ -414,7 +417,11 @@ for(const relayAware of [false,true])test(`HTTP unary encoding uses its original
   const descriptor=Object.getOwnPropertyDescriptor(performance,'now');
   Object.defineProperty(performance,'now',{configurable:true,value:()=>clock});
   const routes=[{name:'route',relay_url:'http://localhost:8301',crm_ns:'test',crm_name:'Test',crm_ver:'0.1.0',abi_hash:hash,signature_hash:hash,max_payload_size:100}];
-  const fetch=async(_url,init)=>{fetches++;if(init.method==='POST')posts++;return {status:200,async text(){return JSON.stringify(routes)},async arrayBuffer(){return new ArrayBuffer(0)}}};
+  const fetch=async(url,init)=>{
+    fetches++;
+    if(init.method==='POST')posts++;
+    return url.includes('/_probe/') ? textReply(200,'') : textReply(200,JSON.stringify(routes));
+  };
   const factory=relayAware?transport.createRelayAwareHttpEncodedTransport:transport.createHttpRelayEncodedTransport;
   const client=factory('http://localhost:8300',{fetch,callTimeoutMs:10});
   try {
@@ -435,9 +442,11 @@ for(const relayAware of [false,true])test(`HTTP pre-dispatch probes never restar
     if(init.method==='POST'){posts++;throw Error('expired input must not dispatch')}
     if(url.includes('/_probe/')){
       probes++;clock+=probes===1?4:5;
-      return {status:probes===1?404:200,async text(){return JSON.stringify({version:1,code:701,name:'ResourceNotFound',message:'missing',details:{dispatch_phase:'pre_dispatch'}})},async arrayBuffer(){return new ArrayBuffer(0)}};
+      return probes===1
+        ? textReply(404,JSON.stringify({version:1,code:701,name:'ResourceNotFound',message:'missing'}))
+        : textReply(200,'');
     }
-    clock+=2;return {status:200,async text(){return JSON.stringify(routes)},async arrayBuffer(){return new ArrayBuffer(0)}};
+    clock+=2;return textReply(200,JSON.stringify(routes));
   };
   const factory=relayAware?transport.createRelayAwareHttpEncodedTransport:transport.createHttpRelayEncodedTransport;
   const client=factory('http://localhost:8300',{fetch,callTimeoutMs:10});
@@ -456,14 +465,15 @@ function relayRoute(id = 1, local = false) {
     ...(local?{ipc_address:`ipc://s${id}`,server_id:`s${id}`,server_instance_id:`i${id}`} : {}),
     crm_ns:'test',crm_name:'Test',crm_ver:'0.1.0',abi_hash:hash,signature_hash:hash,max_payload_size:1};
 }
-function relayResponse(status = 200, value = Uint8Array.of(9), details = {}) {
-  return {status, async arrayBuffer(){return value.buffer}, async text(){return JSON.stringify(details)}};
+function relayResponse(status = 200, value = Uint8Array.of(9), details = undefined) {
+  const raw = details !== undefined ? new TextEncoder().encode(JSON.stringify(details)) : value;
+  return {status, async arrayBuffer(){return raw.slice().buffer}};
 }
 for(const explicit of [false,true]) test(`relay target is acquired once and keeps only its URL (explicit=${explicit})`,async()=>{
   let resolves=0,probes=0,posts=0;
   const factory=explicit?transport.createHttpRelayEncodedTransport:transport.createRelayAwareHttpEncodedTransport;
   const client=factory('http://localhost:8300',{fetch:async(url,init)=>{
-    if(url.includes('/_resolve/')){resolves++;return {status:200,async text(){return JSON.stringify([relayRoute()])}}}
+    if(url.includes('/_resolve/')){resolves++;return textReply(200,JSON.stringify([relayRoute()]))}
     if(url.includes('/_probe/')){probes++;return relayResponse()}
     posts++;assert.equal(init.body.length,4);return relayResponse();
   }});
@@ -477,7 +487,7 @@ for(const explicit of [false,true]) test(`HTTP refusal follows on the next call 
   const urls=[];
   const factory=explicit?transport.createHttpRelayEncodedTransport:transport.createRelayAwareHttpEncodedTransport;
   const client=factory('http://localhost:8300',{fetch:async(url,init)=>{
-    if(url.includes('/_resolve/')){resolves++;return {status:200,async text(){return JSON.stringify([relayRoute(selected)])}}}
+    if(url.includes('/_resolve/')){resolves++;return textReply(200,JSON.stringify([relayRoute(selected)]))}
     if(url.includes('/_probe/')){probes++;return relayResponse()}
     posts++;urls.push(url);
     if(posts===2)return relayResponse(404,new Uint8Array(),{version:1,code:701,name:'ResourceNotFound',message:'gone',details:{dispatch_phase:'pre_dispatch'}});
@@ -496,9 +506,9 @@ for(const explicit of [false,true]) test(`HTTP refusal follows on the next call 
 for(const code of [705,715])test(`HTTP pre-dispatch ${code} keeps its current target`,async()=>{
   let resolves=0,posts=0;
   const client=transport.createRelayAwareHttpEncodedTransport('http://localhost:8300',{fetch:async(url)=>{
-    if(url.includes('/_resolve/')){resolves++;return {status:200,async text(){return JSON.stringify([relayRoute()])}}}
+    if(url.includes('/_resolve/')){resolves++;return textReply(200,JSON.stringify([relayRoute()]))}
     if(url.includes('/_probe/'))return relayResponse();
-    if(++posts===2)return relayResponse(503,new Uint8Array(),{version:1,code,name:code===715?'CallDeadlineExceeded':'ResourceOverloaded',message:'refused',details:{dispatch_phase:'pre_dispatch'}});
+    if(++posts===2)return relayResponse(503,new Uint8Array(),{version:1,code,name:code===715?'CallDeadlineExceeded':'RegistryUnavailable',message:'refused',details:{dispatch_phase:'pre_dispatch'}});
     return relayResponse();
   }});
   await client.call('route',contract,'ping',()=>new Uint8Array());
@@ -511,7 +521,7 @@ for(const code of [705,715])test(`HTTP pre-dispatch ${code} keeps its current ta
 test('eight concurrent calls share one target acquisition',async()=>{
   const reached=deferred(), release=deferred();let resolves=0,posts=0;
   const client=transport.createRelayAwareHttpEncodedTransport('http://localhost:8300',{fetch:async(url)=>{
-    if(url.includes('/_resolve/')){resolves++;reached.resolve();await release.promise;return {status:200,async text(){return JSON.stringify([relayRoute()])}}}
+    if(url.includes('/_resolve/')){resolves++;reached.resolve();await release.promise;return textReply(200,JSON.stringify([relayRoute()]))}
     if(url.includes('/_probe/'))return relayResponse();posts++;return relayResponse();
   }});
   const calls=Array.from({length:8},()=>client.call('route',contract,'ping',()=>new Uint8Array()));
@@ -524,7 +534,7 @@ test('relay-local observes peer end before preparing with the old identity',asyn
   const observed=[];
   const client=transport.createRelayAwareHttpEncodedTransport('http://localhost:8300',{
     observe:x=>observed.push(x),
-    fetch:async(url)=>{assert.ok(url.includes('/_resolve/'));resolves++;return {status:200,async text(){return JSON.stringify([relayRoute(generation,true)])}}},
+    fetch:async(url)=>{assert.ok(url.includes('/_resolve/'));resolves++;return textReply(200,JSON.stringify([relayRoute(generation,true)]))},
     ipc:{connect:async(_address,_timeout,options)=>{
       connections++;const own=generation;const binding={serverId:`s${own}`,serverInstanceId:`i${own}`,connectionId:String(own)};
       return {async prepare(){preparations.push(own);return binding},
@@ -548,7 +558,7 @@ test('HTTP acquisition consumes the original call deadline before encoding',asyn
   const client=transport.createRelayAwareHttpEncodedTransport('http://localhost:8300',{callTimeoutMs:10,fetch:async(url,init)=>{
     if(init.method==='POST')posts++;
     if(url.includes('/_resolve/'))clock+=11;
-    return {status:200,async text(){return JSON.stringify([relayRoute()])},async arrayBuffer(){return new ArrayBuffer(0)}};
+    return textReply(200,JSON.stringify([relayRoute()]));
   }});
   try {
     await assert.rejects(client.call('route',contract,'ping',()=>{encoded++;return new Uint8Array()}),e=>e.code===715&&e.transportPhase==='pre_dispatch');
@@ -578,4 +588,1602 @@ test('late response keeps its own dispatch identity after a newer response',asyn
   firstReleased.resolve();await old;
   assert.deepEqual(observations.map(o=>o.serverInstanceId),['actual-2','actual-1']);
   await client.close();
+});
+
+test('invalid UTF-8 inside HTTP JSON envelope never grants retrySafe or RouteConflict',async()=>{
+  const enc=new TextEncoder();
+  const buildCorruptEnvelope=(code,name,withPreDispatch)=>{
+    const prefix=enc.encode(`{"version":1,"code":${code},"name":"${name}","message":"bad `);
+    const suffix=enc.encode(withPreDispatch
+      ? ' byte","details":{"dispatch_phase":"pre_dispatch"}}'
+      : ' byte","details":{"route":"route"}}');
+    const out=new Uint8Array(prefix.length+1+suffix.length);
+    out.set(prefix,0);
+    out[prefix.length]=0xff;
+    out.set(suffix,prefix.length+1);
+    return out;
+  };
+
+  const postBytes=buildCorruptEnvelope(717,'CallCapacityExceeded',true);
+  const postClient=transport.createRelayAwareHttpEncodedTransport('http://localhost:8300',{
+    fetch:async(url,init)=>{
+      if(url.includes('/_resolve/'))return new Response(JSON.stringify([relayRoute()]),{status:200});
+      if(url.includes('/_probe/'))return new Response('',{status:200});
+      assert.equal(init.method,'POST');
+      return new Response(postBytes,{status:413});
+    },
+  });
+  try{
+    await assert.rejects(postClient.call('route',contract,'ping',()=>new Uint8Array()),err=>{
+      assert.ok(err instanceof transport.C2HttpRelayError);
+      assert.equal(err.status,413);
+      assert.equal(err.hasVerifiedUtf8Body,false);
+      assert.equal(err.transportPhase,'dispatch_uncertain');
+      assert.equal(err.retrySafe,false);
+      return true;
+    });
+  }finally{await postClient.close()}
+
+  const conflictBytes=buildCorruptEnvelope(719,'RouteConflict',true);
+  const acqClient=transport.createRelayAwareHttpEncodedTransport('http://localhost:8300',{
+    fetch:async()=>new Response(conflictBytes,{status:409}),
+  });
+  try{
+    await assert.rejects(acqClient.call('route',contract,'ping',()=>new Uint8Array()),err=>{
+      assert.ok(err instanceof transport.C2HttpRelayError);
+      assert.equal(err instanceof transport.C2RouteConflictError,false);
+      assert.equal(err.hasVerifiedUtf8Body,false);
+      assert.equal(err.transportPhase,'pre_dispatch');
+      assert.equal(err.retrySafe,false);
+      return true;
+    });
+  }finally{await acqClient.close()}
+});
+
+test('compressed HTTP route table and error responses succeed while acquisition failures stay pre_dispatch',async()=>{
+  const {gzipSync}=await import('node:zlib');
+  const routeBytes=new TextEncoder().encode(JSON.stringify([relayRoute()]));
+  const compressed=gzipSync(routeBytes);
+  assert.ok(compressed.byteLength<routeBytes.byteLength);
+  let resolves=0,probes=0,posts=0;
+  const client=transport.createRelayAwareHttpEncodedTransport('http://localhost:8300',{
+    fetch:async(url,init)=>{
+      if(url.includes('/_resolve/')){
+        resolves++;
+        return {
+          status:200,
+          headers:{get(name){
+            const k=name.toLowerCase();
+            if(k==='content-encoding')return 'gzip';
+            if(k==='content-length')return String(compressed.byteLength);
+            return null;
+          }},
+          async arrayBuffer(){return routeBytes.slice().buffer},
+        };
+      }
+      if(url.includes('/_probe/')){probes++;return relayResponse()}
+      assert.equal(init.method,'POST');
+      posts++;
+      if(posts===1){
+        const errBytes=new TextEncoder().encode(JSON.stringify({
+          version:1,code:717,name:'CallCapacityExceeded',message:'compressed capacity refusal payload',
+          details:{dispatch_phase:'pre_dispatch',padding:'x'.repeat(120)},
+        }));
+        const gzErr=gzipSync(errBytes);
+        assert.ok(gzErr.byteLength<errBytes.byteLength);
+        return {
+          status:413,
+          headers:{get(name){
+            const k=name.toLowerCase();
+            if(k==='content-encoding')return 'gzip';
+            if(k==='content-length')return String(gzErr.byteLength);
+            return null;
+          }},
+          async arrayBuffer(){return errBytes.slice().buffer},
+        };
+      }
+      return relayResponse(200,Uint8Array.of(42));
+    },
+  });
+  try{
+    await assert.rejects(client.call('route',contract,'ping',()=>new Uint8Array()),err=>{
+      assert.ok(err instanceof transport.C2HttpRelayError);
+      assert.equal(err.status,413);
+      assert.equal(err.transportPhase,'pre_dispatch');
+      assert.equal(err.retrySafe,true);
+      return true;
+    });
+    const res=await client.call('route',contract,'ping',()=>new Uint8Array());
+    assert.equal(res[0],42);
+    assert.deepEqual({resolves,probes,posts},{resolves:1,probes:1,posts:2});
+  }finally{await client.close()}
+
+  let badResolvePosts=0;
+  const badResolveClient=transport.createRelayAwareHttpEncodedTransport('http://localhost:8300',{
+    fetch:async(_url,init)=>{
+      if(init.method==='POST')badResolvePosts++;
+      return new Response(Uint8Array.of(0x5b,0xff,0x5d),{status:200});
+    },
+  });
+  try{
+    await assert.rejects(badResolveClient.call('route',contract,'ping',()=>new Uint8Array()),err=>{
+      assert.ok(err instanceof transport.C2HttpTransportError);
+      assert.equal(err.transportPhase,'pre_dispatch');
+      assert.equal(err.retrySafe,true);
+      return true;
+    });
+    assert.equal(badResolvePosts,0);
+  }finally{await badResolveClient.close()}
+});
+
+test('probe 719 with bogus dispatch_uncertain stops selection and mismatched code/name denies retrySafe',async()=>{
+  const routes=[relayRoute(1),relayRoute(2)];
+  let resolves=0,probes=0,posts=0;
+  const conflictClient=transport.createRelayAwareHttpEncodedTransport('http://localhost:8300',{
+    fetch:async(url,init)=>{
+      if(url.includes('/_resolve/')){resolves++;return textReply(200,JSON.stringify(routes))}
+      if(url.includes('/_probe/')){
+        probes++;
+        return textReply(409,JSON.stringify({
+          version:1,code:719,name:'RouteConflict',message:'conflict',
+          details:{route:'route',dispatch_phase:'dispatch_uncertain',keep:'1'},
+        }));
+      }
+      if(init.method==='POST')posts++;
+      return relayResponse();
+    },
+  });
+  try{
+    await assert.rejects(conflictClient.call('route',contract,'ping',()=>new Uint8Array()),err=>{
+      assert.ok(err instanceof transport.C2RouteConflictError);
+      assert.equal(err.transportPhase,'pre_dispatch');
+      assert.equal(err.retrySafe,true);
+      assert.deepEqual(err.details,{route:'route',keep:'1'});
+      return true;
+    });
+    assert.deepEqual({resolves,probes,posts},{resolves:1,probes:1,posts:0});
+  }finally{await conflictClient.close()}
+
+  const mismatchClient=transport.createRelayAwareHttpEncodedTransport('http://localhost:8300',{
+    fetch:async(url,init)=>{
+      if(url.includes('/_resolve/'))return textReply(200,JSON.stringify([relayRoute()]));
+      if(url.includes('/_probe/'))return relayResponse();
+      assert.equal(init.method,'POST');
+      return textReply(413,JSON.stringify({
+        version:1,code:717,name:'ResourceNotFound',message:'mismatched envelope',
+        details:{dispatch_phase:'pre_dispatch'},
+      }));
+    },
+  });
+  try{
+    await assert.rejects(mismatchClient.call('route',contract,'ping',()=>new Uint8Array()),err=>{
+      assert.ok(err instanceof transport.C2HttpRelayError);
+      assert.equal(err.status,413);
+      assert.equal(err.transportPhase,'dispatch_uncertain');
+      assert.equal(err.retrySafe,false);
+      return true;
+    });
+  }finally{await mismatchClient.close()}
+
+  // 409 vs 504 on business POST with identical canonical 719 pre_dispatch body:
+  // 409 is pre-dispatch and invalidates target; 504 is dispatch_uncertain and keeps target.
+  const conflictBody=JSON.stringify({
+    version:1,code:719,name:'RouteConflict',message:'conflict on call',
+    details:{route:'route',dispatch_phase:'pre_dispatch'},
+  });
+  for(const [status,expectPhase,expectRetrySafe,expectResolves] of [
+    [409,'pre_dispatch',true,2],
+    [504,'dispatch_uncertain',false,1],
+  ]){
+    let resolves2=0,probes2=0,posts2=0;
+    const statusClient=transport.createRelayAwareHttpEncodedTransport('http://localhost:8300',{
+      fetch:async(url,init)=>{
+        if(url.includes('/_resolve/')){resolves2++;return textReply(200,JSON.stringify([relayRoute()]))}
+        if(url.includes('/_probe/')){probes2++;return relayResponse()}
+        assert.equal(init.method,'POST');
+        posts2++;
+        return posts2===1 ? textReply(status,conflictBody) : relayResponse(200,Uint8Array.of(7));
+      },
+    });
+    try{
+      await assert.rejects(statusClient.call('route',contract,'ping',()=>new Uint8Array()),err=>{
+        assert.ok(err instanceof transport.C2HttpRelayError);
+        assert.equal(err.status,status);
+        assert.equal(err.transportPhase,expectPhase);
+        assert.equal(err.retrySafe,expectRetrySafe);
+        return true;
+      });
+      const ok=await statusClient.call('route',contract,'ping',()=>new Uint8Array());
+      assert.equal(ok[0],7);
+      assert.deepEqual({resolves2,probes2,posts2},{resolves2:expectResolves,probes2:expectResolves,posts2:2});
+    }finally{await statusClient.close()}
+  }
+
+  // Unknown future u16 code (720) on HTTP 503 business POST is dispatch_uncertain (retrySafe=false).
+  const futureClient=transport.createRelayAwareHttpEncodedTransport('http://localhost:8300',{
+    fetch:async(url,init)=>{
+      if(url.includes('/_resolve/'))return textReply(200,JSON.stringify([relayRoute()]));
+      if(url.includes('/_probe/'))return relayResponse();
+      assert.equal(init.method,'POST');
+      return textReply(503,JSON.stringify({
+        version:1,code:720,name:'FutureRefusal',message:'future code',
+        details:{dispatch_phase:'pre_dispatch'},
+      }));
+    },
+  });
+  try{
+    await assert.rejects(futureClient.call('route',contract,'ping',()=>new Uint8Array()),err=>{
+      assert.ok(err instanceof transport.C2HttpRelayError);
+      assert.equal(err.status,503);
+      assert.equal(err.transportPhase,'dispatch_uncertain');
+      assert.equal(err.retrySafe,false);
+      return true;
+    });
+  }finally{await futureClient.close()}
+});
+
+test('streaming compressed reader copies reused Node Buffer chunks and cancels on size refusal',async()=>{
+  function reusedBufferBody(values, tracker){
+    const shared=Buffer.alloc(1);
+    let idx=0;
+    return {
+      getReader(){
+        return {
+          async read(){
+            if(idx>=values.length)return {done:true};
+            shared[0]=values[idx++];
+            return {done:false,value:shared};
+          },
+          async cancel(reason){
+            tracker.cancels.push(reason);
+            if(tracker.throwOnCancel)throw new Error('secondary cancel error');
+          },
+          releaseLock(){tracker.releases++;},
+        };
+      },
+    };
+  }
+
+  // Default streaming path (content-encoding: gzip forces getReader() path).
+  const defaultTracker={cancels:[],releases:0};
+  const defaultClient=transport.createRelayAwareHttpEncodedTransport('http://localhost:8300',{
+    fetch:async(url,init)=>{
+      if(url.includes('/_resolve/'))return textReply(200,JSON.stringify([relayRoute()]));
+      if(url.includes('/_probe/'))return relayResponse();
+      assert.equal(init.method,'POST');
+      return {
+        status:200,
+        headers:{get(name){
+          const k=name.toLowerCase();
+          if(k==='content-encoding')return 'gzip';
+          if(k==='content-length')return '1';
+          return null;
+        }},
+        body:reusedBufferBody([1,2],defaultTracker),
+        async arrayBuffer(){throw new Error('must read from streaming body');},
+      };
+    },
+  });
+  try{
+    const res=await defaultClient.call('route',contract,'ping',()=>new Uint8Array());
+    assert.deepEqual(Array.from(res),[1,2]);
+    assert.equal(defaultTracker.cancels.length,0);
+    assert.equal(defaultTracker.releases,1);
+  }finally{await defaultClient.close()}
+
+  // Unknown-length responsePayloadAllocator streaming path also copies reused Buffer chunks.
+  const allocTracker={cancels:[],releases:0};
+  const allocClient=transport.createRelayAwareHttpEncodedTransport('http://localhost:8300',{
+    responsePayloadAllocator(byteLength){
+      const backing=new Uint8Array(byteLength);
+      return {view:backing,payload:{bytes:backing,byteLength,release(){}}};
+    },
+    responsePayloadUnknownLengthStrategy:'buffer',
+    responsePayloadUnknownLengthMaxBytes:8,
+    fetch:async(url,init)=>{
+      if(url.includes('/_resolve/'))return textReply(200,JSON.stringify([relayRoute()]));
+      if(url.includes('/_probe/'))return relayResponse();
+      assert.equal(init.method,'POST');
+      return {
+        status:200,
+        headers:{get(name){return name.toLowerCase()==='content-encoding'?'gzip':null}},
+        body:reusedBufferBody([1,2],allocTracker),
+        async arrayBuffer(){throw new Error('must read from streaming body');},
+      };
+    },
+  });
+  try{
+    const res=await allocClient.call('route',contract,'ping',()=>new Uint8Array());
+    assert.deepEqual(Array.from(res.bytes),[1,2]);
+    assert.equal(allocTracker.cancels.length,0);
+    assert.equal(allocTracker.releases,1);
+  }finally{await allocClient.close()}
+
+  // Oversized streaming responses cancel the reader and preserve the primary size error
+  // across default compressed streaming, unknown-length allocator streaming, and known-length allocator streaming.
+  for(const mode of ['default_gzip','allocator_unknown','allocator_known']){
+    const overTracker={cancels:[],releases:0,throwOnCancel:true,freed:0};
+    let step=0;
+    const oversizedChunk=Object.create(Uint8Array.prototype,{byteLength:{value:2_147_483_647}});
+    const overBody={
+      getReader(){
+        return {
+          async read(){
+            step++;
+            if(mode==='default_gzip'){
+              if(step===1)return {done:false,value:Uint8Array.of(1)};
+              if(step===2)return {done:false,value:oversizedChunk};
+              return {done:true};
+            }
+            if(step<=3)return {done:false,value:Uint8Array.of(step)};
+            return {done:true};
+          },
+          async cancel(reason){
+            overTracker.cancels.push(reason);
+            if(overTracker.throwOnCancel)throw new Error('secondary cancel error');
+          },
+          releaseLock(){overTracker.releases++;},
+        };
+      },
+    };
+    const overClient=transport.createRelayAwareHttpEncodedTransport('http://localhost:8300',{
+      ...(mode==='default_gzip' ? {} : {
+        responsePayloadAllocator(byteLength){
+          const backing=new Uint8Array(byteLength);
+          return {view:backing,payload:{bytes:backing,byteLength,release(){overTracker.freed++;}}};
+        },
+        responsePayloadUnknownLengthStrategy:'buffer',
+        responsePayloadUnknownLengthMaxBytes:2,
+      }),
+      fetch:async(url,init)=>{
+        if(url.includes('/_resolve/'))return textReply(200,JSON.stringify([relayRoute()]));
+        if(url.includes('/_probe/'))return relayResponse();
+        assert.equal(init.method,'POST');
+        return {
+          status:200,
+          headers:{get(name){
+            const k=name.toLowerCase();
+            if(mode==='allocator_known')return k==='content-length'?'2':null;
+            return k==='content-encoding'?'gzip':null;
+          }},
+          body:overBody,
+          async arrayBuffer(){throw new Error('must read from streaming body');},
+        };
+      },
+    });
+    try{
+      await assert.rejects(overClient.call('route',contract,'ping',()=>new Uint8Array()),err=>{
+        assert.ok(err instanceof transport.C2HttpTransportError);
+        assert.equal(err.transportPhase,'dispatch_uncertain');
+        assert.equal(err.retrySafe,false);
+        assert.match(err.message,/exceeded|no greater than/);
+        return true;
+      });
+      assert.equal(overTracker.cancels.length,1,mode);
+      assert.equal(overTracker.releases,1,mode);
+      if(mode==='allocator_known')assert.equal(overTracker.freed,1);
+    }finally{await overClient.close()}
+  }
+});
+
+test('non-canonical JSON array envelopes and contradictory 404/701 stay dispatch_uncertain',async()=>{
+  for(const rawBody of [
+    JSON.stringify([1,717,'CallCapacityExceeded','array envelope',{dispatch_phase:'pre_dispatch'}]),
+    '{"version":1,"code":717.5,"name":"CallCapacityExceeded","message":"float code","details":{"dispatch_phase":"pre_dispatch"}}',
+  ]){
+    let resolves=0,probes=0,posts=0;
+    const client=transport.createRelayAwareHttpEncodedTransport('http://localhost:8300',{
+      fetch:async(url,init)=>{
+        if(url.includes('/_resolve/')){resolves++;return textReply(200,JSON.stringify([relayRoute()]))}
+        if(url.includes('/_probe/')){probes++;return relayResponse()}
+        assert.equal(init.method,'POST');
+        posts++;
+        return posts===1 ? textReply(503,rawBody) : relayResponse(200,Uint8Array.of(9));
+      },
+    });
+    try{
+      await assert.rejects(client.call('route',contract,'ping',()=>new Uint8Array()),err=>{
+        assert.ok(err instanceof transport.C2HttpRelayError);
+        assert.equal(err.transportPhase,'dispatch_uncertain');
+        assert.equal(err.retrySafe,false);
+        return true;
+      });
+      const ok=await client.call('route',contract,'ping',()=>new Uint8Array());
+      assert.equal(ok[0],9);
+      assert.deepEqual({resolves,probes,posts},{resolves:1,probes:1,posts:2});
+    }finally{await client.close()}
+  }
+
+  // 404 + canonical 701 without phase details is pre_dispatch and triggers re-acquisition;
+  // 404 + canonical 701 with contradictory dispatch_phase='dispatch_uncertain' stays dispatch_uncertain and reuses target.
+  for(const [details,expectPhase,expectRetrySafe,expectResolves] of [
+    [{},'pre_dispatch',true,2],
+    [{dispatch_phase:'dispatch_uncertain'},'dispatch_uncertain',false,1],
+  ]){
+    let resolves=0,probes=0,posts=0;
+    const body=JSON.stringify({version:1,code:701,name:'ResourceNotFound',message:'missing',details});
+    const client=transport.createRelayAwareHttpEncodedTransport('http://localhost:8300',{
+      fetch:async(url,init)=>{
+        if(url.includes('/_resolve/')){resolves++;return textReply(200,JSON.stringify([relayRoute()]))}
+        if(url.includes('/_probe/')){probes++;return relayResponse()}
+        assert.equal(init.method,'POST');
+        posts++;
+        return posts===1 ? textReply(404,body) : relayResponse(200,Uint8Array.of(11));
+      },
+    });
+    try{
+      await assert.rejects(client.call('route',contract,'ping',()=>new Uint8Array()),err=>{
+        assert.ok(err instanceof transport.C2HttpRelayError);
+        assert.equal(err.status,404);
+        assert.equal(err.transportPhase,expectPhase);
+        assert.equal(err.retrySafe,expectRetrySafe);
+        return true;
+      });
+      const ok=await client.call('route',contract,'ping',()=>new Uint8Array());
+      assert.equal(ok[0],11);
+      assert.deepEqual({resolves,probes,posts},{resolves:expectResolves,probes:expectResolves,posts:2});
+    }finally{await client.close()}
+  }
+});
+
+test('corrupt unknown-field UTF-8, BOM, non-string details, and pending tee() cancel',async()=>{
+  const enc=new TextEncoder();
+  const concatBytes=(...parts)=>{
+    const total=parts.reduce((acc,p)=>acc+p.byteLength,0);
+    const out=new Uint8Array(total);
+    let offset=0;
+    for(const p of parts){out.set(p,offset);offset+=p.byteLength;}
+    return out;
+  };
+  const sharedRawCorpus=[
+    [
+      404,
+      concatBytes(
+        enc.encode('{"version":1,"code":701,"name":"ResourceNotFound","message":"missing","details":{},"extra":"bad'),
+        Uint8Array.of(0xff),
+        enc.encode('"}'),
+      ),
+    ],
+    [
+      503,
+      concatBytes(
+        Uint8Array.of(0xef,0xbb,0xbf),
+        enc.encode('{"version":1,"code":717,"name":"CallCapacityExceeded","message":"cap","details":{"dispatch_phase":"pre_dispatch"}}'),
+      ),
+    ],
+    [
+      503,
+      enc.encode('{"version":1,"code":717,"name":"CallCapacityExceeded","message":"cap","details":{"k":1,"dispatch_phase":"pre_dispatch"}}'),
+    ],
+  ];
+
+  for(const [status,rawBytes] of sharedRawCorpus){
+    let resolves=0,probes=0,posts=0;
+    const client=transport.createRelayAwareHttpEncodedTransport('http://localhost:8300',{
+      fetch:async(url,init)=>{
+        if(url.includes('/_resolve/')){resolves++;return textReply(200,JSON.stringify([relayRoute()]))}
+        if(url.includes('/_probe/')){probes++;return relayResponse()}
+        assert.equal(init.method,'POST');
+        posts++;
+        return posts===1 ? new Response(rawBytes,{status}) : relayResponse(200,Uint8Array.of(13));
+      },
+    });
+    try{
+      await assert.rejects(client.call('route',contract,'ping',()=>new Uint8Array()),err=>{
+        assert.ok(err instanceof transport.C2HttpRelayError);
+        assert.equal(err.status,status);
+        assert.equal(err.transportPhase,'dispatch_uncertain');
+        assert.equal(err.retrySafe,false);
+        return true;
+      });
+      const ok=await client.call('route',contract,'ping',()=>new Uint8Array());
+      assert.equal(ok[0],13);
+      assert.deepEqual({resolves,probes,posts},{resolves:1,probes:1,posts:2});
+    }finally{await client.close()}
+  }
+
+  // Native WHATWG ReadableStream.tee(): when sibling branch b2 stays uncancelled,
+  // b1's reader.cancel() returns a never-resolving Promise until b2 cancels.
+  // Exceeding Content-Length must still release the allocator buffer and reader lock
+  // immediately and surface the Content-Length error before a 140 ms call deadline fires.
+  const sourceStream=new ReadableStream({
+    start(controller){
+      controller.enqueue(Uint8Array.of(1,2,3));
+    },
+  });
+  const [branch1,branch2]=sourceStream.tee();
+  let allocatedFreed=0;
+  const teeClient=transport.createRelayAwareHttpEncodedTransport('http://localhost:8300',{
+    callTimeoutMs:140,
+    responsePayloadAllocator(byteLength){
+      const backing=new Uint8Array(byteLength);
+      return {view:backing,payload:{bytes:backing,byteLength,release(){allocatedFreed++;}}};
+    },
+    fetch:async(url,init)=>{
+      if(url.includes('/_resolve/'))return textReply(200,JSON.stringify([relayRoute()]));
+      if(url.includes('/_probe/'))return relayResponse();
+      assert.equal(init.method,'POST');
+      return {
+        status:200,
+        headers:{get(name){return name.toLowerCase()==='content-length'?'2':null}},
+        body:branch1,
+        async arrayBuffer(){throw new Error('must read from streaming body');},
+      };
+    },
+  });
+  try{
+    await assert.rejects(
+      teeClient.call('route',contract,'ping',()=>new Uint8Array()),
+      err=>{
+        assert.ok(err instanceof transport.C2HttpTransportError);
+        assert.equal(err instanceof transport.C2CoreError,false);
+        assert.equal(err.transportPhase,'dispatch_uncertain');
+        assert.equal(err.retrySafe,false);
+        assert.match(err.message,/exceeded Content-Length/);
+        return true;
+      },
+    );
+    assert.equal(branch1.locked,false,'reader lock must be released before sibling tee branch cancels');
+    assert.equal(allocatedFreed,1,'allocated buffer must be freed before sibling tee branch cancels');
+  }finally{
+    await branch2.cancel();
+    await teeClient.close();
+  }
+});
+
+test('streaming reader cleanup, allocator lifecycle, post-dispatch isolation and fallback abort',async()=>{
+  // 1. Known-length read completes, then releaseLock() throws -> allocator buffer freed once.
+  {
+    let allocated=0,freed=0,step=0;
+    const client=transport.createRelayAwareHttpEncodedTransport('http://localhost:8300',{
+      responsePayloadAllocator(byteLength){
+        allocated++;
+        const backing=new Uint8Array(byteLength);
+        return {view:backing,payload:{bytes:backing,byteLength,release(){freed++;}}};
+      },
+      fetch:async(url,init)=>{
+        if(url.includes('/_resolve/'))return textReply(200,JSON.stringify([relayRoute()]));
+        if(url.includes('/_probe/'))return relayResponse();
+        assert.equal(init.method,'POST');
+        return {
+          status:200,
+          headers:{get(name){return name.toLowerCase()==='content-length'?'2':null}},
+          body:{getReader(){return {
+            async read(){
+              step++;
+              return step===1 ? {done:false,value:Uint8Array.of(7,8)} : {done:true};
+            },
+            releaseLock(){throw new Error('unlock failure after full read');},
+          }}},
+          async arrayBuffer(){throw new Error('must stream');},
+        };
+      },
+    });
+    try{
+      await assert.rejects(client.call('route',contract,'ping',()=>new Uint8Array()),err=>{
+        assert.ok(err instanceof transport.C2HttpTransportError);
+        assert.equal(err.transportPhase,'dispatch_uncertain');
+        assert.match(err.message,/unlock failure after full read/);
+        return true;
+      });
+      assert.deepEqual({allocated,freed},{allocated:1,freed:1});
+    }finally{await client.close()}
+  }
+
+  // 2. Oversized stream with throwing releaseLock() and throwing cancel getter preserves primary error and frees buffer once.
+  for(const badCancelGetter of [false,true]){
+    let allocated=0,freed=0,unlocks=0,step=0;
+    const reader={
+      async read(){
+        step++;
+        return step===1 ? {done:false,value:Uint8Array.of(1,2,3)} : {done:true};
+      },
+      releaseLock(){unlocks++;throw new Error('secondary unlock boom');},
+    };
+    if(badCancelGetter){
+      Object.defineProperty(reader,'cancel',{
+        get(){throw new Error('cancel getter boom');},
+      });
+    }
+    const client=transport.createRelayAwareHttpEncodedTransport('http://localhost:8300',{
+      responsePayloadAllocator(byteLength){
+        allocated++;
+        const backing=new Uint8Array(byteLength);
+        return {view:backing,payload:{bytes:backing,byteLength,release(){freed++;}}};
+      },
+      fetch:async(url,init)=>{
+        if(url.includes('/_resolve/'))return textReply(200,JSON.stringify([relayRoute()]));
+        if(url.includes('/_probe/'))return relayResponse();
+        assert.equal(init.method,'POST');
+        return {
+          status:200,
+          headers:{get(name){return name.toLowerCase()==='content-length'?'2':null}},
+          body:{getReader(){return reader;}},
+          async arrayBuffer(){throw new Error('must stream');},
+        };
+      },
+    });
+    try{
+      await assert.rejects(client.call('route',contract,'ping',()=>new Uint8Array()),err=>{
+        assert.ok(err instanceof transport.C2HttpTransportError);
+        assert.equal(err.transportPhase,'dispatch_uncertain');
+        assert.match(err.message,/exceeded Content-Length/);
+        assert.doesNotMatch(err.message,/boom/);
+        return true;
+      });
+      assert.deepEqual({allocated,freed,unlocks},{allocated:1,freed:1,unlocks:1});
+    }finally{await client.close()}
+  }
+
+  // 3. Declared Content-Length: 0 with responsePayloadAllocator rejects non-empty body and frees buffer,
+  // while genuinely empty stream succeeds.
+  for(const [bodyBytes,shouldReject] of [
+    [Uint8Array.of(99),true],
+    [new Uint8Array(0),false],
+  ]){
+    let allocated=0,freed=0;
+    let capturedResponse;
+    const zeroClient=transport.createRelayAwareHttpEncodedTransport('http://localhost:8300',{
+      responsePayloadAllocator(byteLength){
+        allocated++;
+        const backing=new Uint8Array(byteLength);
+        return {view:backing,payload:{bytes:backing,byteLength,release(){freed++;}}};
+      },
+      fetch:async(url,init)=>{
+        if(url.includes('/_resolve/'))return textReply(200,JSON.stringify([relayRoute()]));
+        if(url.includes('/_probe/'))return relayResponse();
+        assert.equal(init.method,'POST');
+        capturedResponse=new Response(bodyBytes,{status:200,headers:{'content-length':'0'}});
+        return capturedResponse;
+      },
+    });
+    try{
+      if(shouldReject){
+        await assert.rejects(zeroClient.call('route',contract,'ping',()=>new Uint8Array()),err=>{
+          assert.ok(err instanceof transport.C2HttpTransportError);
+          assert.equal(err.transportPhase,'dispatch_uncertain');
+          assert.equal(err.retrySafe,false);
+          assert.match(err.message,/exceeded Content-Length/);
+          return true;
+        });
+        assert.equal(capturedResponse.bodyUsed,true);
+        assert.deepEqual({allocated,freed},{allocated:1,freed:1});
+      }else{
+        const ok=await zeroClient.call('route',contract,'ping',()=>new Uint8Array());
+        assert.equal(ok.byteLength,0);
+        assert.deepEqual({allocated,freed},{allocated:1,freed:0});
+      }
+    }finally{await zeroClient.close()}
+  }
+
+  // 4. Selected CoreSDK directory moves ahead of older entries in loader path env.
+  const fakeEnv={DYLD_LIBRARY_PATH:`/old/lib${delimiter}/selected/lib`};
+  prependEnvPaths(fakeEnv,'DYLD_LIBRARY_PATH',['/selected/lib']);
+  assert.equal(fakeEnv.DYLD_LIBRARY_PATH,`/selected/lib${delimiter}/old/lib`);
+
+  // 5. Bodyless C2FetchResponse (body omitted, arrayBuffer() provided) with Content-Length: 0
+  // verifies actual arrayBuffer() byteLength before delivering 0-byte allocation.
+  for(const [bufBytes,shouldReject] of [
+    [Uint8Array.of(7),true],
+    [new Uint8Array(0),false],
+  ]){
+    let allocated=0,freed=0;
+    const bodylessClient=transport.createRelayAwareHttpEncodedTransport('http://localhost:8300',{
+      responsePayloadAllocator(byteLength){
+        allocated++;
+        const backing=new Uint8Array(byteLength);
+        return {view:backing,payload:backing,release(){freed++;}};
+      },
+      fetch:async(url,init)=>{
+        if(url.includes('/_resolve/'))return textReply(200,JSON.stringify([relayRoute()]));
+        if(url.includes('/_probe/'))return relayResponse();
+        assert.equal(init.method,'POST');
+        return {
+          status:200,
+          headers:{get(name){return name.toLowerCase()==='content-length'?'0':null}},
+          async arrayBuffer(){return bufBytes.slice().buffer;},
+        };
+      },
+    });
+    try{
+      if(shouldReject){
+        await assert.rejects(bodylessClient.call('route',contract,'ping',()=>new Uint8Array()),err=>{
+          assert.ok(err instanceof transport.C2HttpTransportError);
+          assert.equal(err.transportPhase,'dispatch_uncertain');
+          assert.equal(err.retrySafe,false);
+          assert.match(err.message,/does not match Content-Length/);
+          return true;
+        });
+        assert.deepEqual({allocated,freed},{allocated:0,freed:0});
+      }else{
+        const ok=await bodylessClient.call('route',contract,'ping',()=>new Uint8Array());
+        assert.equal(ok.byteLength,0);
+        assert.deepEqual({allocated,freed},{allocated:1,freed:0});
+      }
+    }finally{await bodylessClient.close()}
+  }
+
+  // 6. Delayed-EOF zero-length ReadableStream finishing after callTimeoutMs releases its allocation once.
+  {
+    let allocated=0,freed=0,finishEof;
+    const eofGate=new Promise(r=>{finishEof=r;});
+    const slowZeroBody=new ReadableStream({
+      async pull(controller){
+        await eofGate;
+        controller.close();
+      },
+    });
+    const slowClient=transport.createRelayAwareHttpEncodedTransport('http://localhost:8300',{
+      callTimeoutMs:20,
+      responsePayloadAllocator(byteLength){
+        allocated++;
+        const backing=new Uint8Array(byteLength);
+        return {view:backing,payload:backing,release(){freed++;}};
+      },
+      fetch:async(url,init)=>{
+        if(url.includes('/_resolve/'))return textReply(200,JSON.stringify([relayRoute()]));
+        if(url.includes('/_probe/'))return relayResponse();
+        assert.equal(init.method,'POST');
+        return {
+          status:200,
+          headers:{get(name){return name.toLowerCase()==='content-length'?'0':null}},
+          body:slowZeroBody,
+          async arrayBuffer(){throw new Error('must stream');},
+        };
+      },
+    });
+    try{
+      await assert.rejects(slowClient.call('route',contract,'ping',()=>new Uint8Array()),err=>{
+        assert.ok(err instanceof transport.C2CoreError);
+        assert.equal(err.code,715);
+        assert.equal(err.transportPhase,'dispatch_uncertain');
+        return true;
+      });
+      assert.deepEqual({allocated,freed},{allocated:1,freed:1});
+      finishEof();
+      await nextTurn();
+      await nextTurn();
+      assert.deepEqual({allocated,freed},{allocated:1,freed:1});
+    }finally{await slowClient.close()}
+  }
+
+  // 7. Allocator record-level release() runs once when observe() throws on both HTTP and IPC.
+  {
+    let httpAllocated=0,httpFreed=0;
+    const obsHttp=transport.createRelayAwareHttpEncodedTransport('http://localhost:8300',{
+      responsePayloadAllocator(byteLength){
+        httpAllocated++;
+        const backing=new Uint8Array(byteLength);
+        return {view:backing,payload:backing,release(){httpFreed++;}};
+      },
+      observe(){throw new Error('observer boom');},
+      fetch:async(url,init)=>{
+        if(url.includes('/_resolve/'))return textReply(200,JSON.stringify([relayRoute()]));
+        if(url.includes('/_probe/'))return relayResponse();
+        assert.equal(init.method,'POST');
+        return new Response(Uint8Array.of(5,6),{status:200,headers:{'content-length':'2'}});
+      },
+    });
+    try{
+      await assert.rejects(obsHttp.call('route',contract,'ping',()=>new Uint8Array()),/observer boom/);
+      assert.deepEqual({httpAllocated,httpFreed},{httpAllocated:1,httpFreed:1});
+    }finally{await obsHttp.close()}
+
+    let ipcAllocated=0,ipcFreed=0,nativeFreed=0;
+    const endpoint={
+      connectionSnapshot(){return null},
+      async prepare(){return binding},
+      beginCall(){return {
+        async chargeInput(){},
+        async dispatch(){return nativeTarget},
+        async next(){const b=Uint8Array.of(9);b.release=()=>{nativeFreed++};return b},
+        checkDeadline(){},cancel(){},close(){},
+        async observe(){return receipt},
+      }},
+      deactivate(){},async close(){},
+    };
+    const obsIpc=transport.createIpcEncodedTransport('ipc://obs',{
+      connect:async()=>endpoint,
+      responsePayloadAllocator(byteLength){
+        ipcAllocated++;
+        const backing=new Uint8Array(byteLength);
+        return {view:backing,payload:backing,release(){ipcFreed++;}};
+      },
+      observe(){throw new Error('ipc observer boom');},
+    });
+    try{
+      await assert.rejects(obsIpc.call('route',contract,'ping',()=>new Uint8Array()),/ipc observer boom/);
+      assert.deepEqual({ipcAllocated,ipcFreed,nativeFreed},{ipcAllocated:1,ipcFreed:1,nativeFreed:1});
+    }finally{await obsIpc.close()}
+  }
+
+  // 8. Fixed-length HTTP response reads allocated.payload getter ONLY AFTER view is populated (delivering [10, 20], not [0, 0]).
+  {
+    let getterReads=0,freed=0;
+    const snapHttp=transport.createRelayAwareHttpEncodedTransport('http://localhost:8300',{
+      responsePayloadAllocator(byteLength){
+        const view=new Uint8Array(byteLength);
+        return {
+          view,
+          get payload(){
+            getterReads++;
+            return view.slice();
+          },
+          release(){freed++;},
+        };
+      },
+      fetch:async(url,init)=>{
+        if(url.includes('/_resolve/'))return textReply(200,JSON.stringify([relayRoute()]));
+        if(url.includes('/_probe/'))return relayResponse();
+        assert.equal(init.method,'POST');
+        return new Response(Uint8Array.of(10,20),{status:200,headers:{'content-length':'2'}});
+      },
+    });
+    try{
+      const delivered=await snapHttp.call('route',contract,'ping',()=>new Uint8Array());
+      assert.deepEqual([...delivered],[10,20]);
+      assert.equal(getterReads,1);
+      assert.equal(freed,0);
+    }finally{await snapHttp.close()}
+
+    let badPayloadFreed=0;
+    const badSnapHttp=transport.createRelayAwareHttpEncodedTransport('http://localhost:8300',{
+      responsePayloadAllocator(byteLength){
+        const view=new Uint8Array(byteLength);
+        return {
+          view,
+          get payload(){throw new Error('getter failed after fill');},
+          release(){badPayloadFreed++;},
+        };
+      },
+      fetch:async(url,init)=>{
+        if(url.includes('/_resolve/'))return textReply(200,JSON.stringify([relayRoute()]));
+        if(url.includes('/_probe/'))return relayResponse();
+        assert.equal(init.method,'POST');
+        return new Response(Uint8Array.of(10,20),{status:200,headers:{'content-length':'2'}});
+      },
+    });
+    try{
+      await assert.rejects(badSnapHttp.call('route',contract,'ping',()=>new Uint8Array()),err=>{
+        assert.ok(err instanceof transport.C2HttpTransportError);
+        assert.equal(err.retrySafe,false);
+        return true;
+      });
+      assert.equal(badPayloadFreed,1);
+    }finally{await badSnapHttp.close()}
+  }
+
+  // 9. Stream enqueuing final chunk on abort never writes after allocator release, and per-chunk abort guard does not retain chunks before EOF under GC.
+  {
+    let allocated=0,freed=0,writesAfterRelease=0;
+    const abortChunkClient=transport.createRelayAwareHttpEncodedTransport('http://localhost:8300',{
+      callTimeoutMs:20,
+      responsePayloadAllocator(byteLength){
+        allocated++;
+        const raw=new Uint8Array(byteLength);
+        const view=new Uint8Array(raw.buffer);
+        view.set=(src,off)=>{
+          if(freed>0)writesAfterRelease++;
+          Uint8Array.prototype.set.call(raw,src,off);
+        };
+        return {view,payload:raw,release(){freed++;}};
+      },
+      fetch:async(url,init)=>{
+        if(url.includes('/_resolve/'))return textReply(200,JSON.stringify([relayRoute()]));
+        if(url.includes('/_probe/'))return relayResponse();
+        const body=new ReadableStream({
+          start(controller){
+            init.signal?.addEventListener('abort',()=>{
+              try{controller.enqueue(Uint8Array.of(10,20));controller.close();}catch{}
+            },{once:true});
+          },
+        });
+        return {
+          status:200,
+          headers:{get(n){return n.toLowerCase()==='content-length'?'2':null;}},
+          body,
+          async arrayBuffer(){throw new Error('must stream');},
+        };
+      },
+    });
+    try{
+      await assert.rejects(abortChunkClient.call('route',contract,'ping',()=>new Uint8Array()),err=>{
+        assert.ok(err instanceof transport.C2CoreError);
+        assert.equal(err.code,715);
+        return true;
+      });
+      await nextTurn();
+      await nextTurn();
+      assert.deepEqual({allocated,freed,writesAfterRelease},{allocated:1,freed:1,writesAfterRelease:0});
+    }finally{await abortChunkClient.close()}
+
+    const v8=await import('node:v8');
+    const vm=await import('node:vm');
+    v8.setFlagsFromString('--expose_gc');
+    const forceGc=vm.runInNewContext('gc');
+    const refs=[];
+    let sent=0;
+    let releaseLastChunk;
+    const lastGate=new Promise(r=>{releaseLastChunk=r;});
+    const gcBody=new ReadableStream({
+      async pull(controller){
+        if(sent<24){
+          const chunk=new Uint8Array(1024);
+          chunk[0]=sent;
+          refs.push(new WeakRef(chunk));
+          sent++;
+          controller.enqueue(chunk);
+          return;
+        }
+        await lastGate;
+        controller.close();
+      },
+    });
+    const gcClient=transport.createRelayAwareHttpEncodedTransport('http://localhost:8300',{
+      callTimeoutMs:5000,
+      responsePayloadAllocator(byteLength){
+        const view=new Uint8Array(byteLength);
+        return {view,payload:view};
+      },
+      fetch:async(url)=>{
+        if(url.includes('/_resolve/'))return textReply(200,JSON.stringify([relayRoute()]));
+        if(url.includes('/_probe/'))return relayResponse();
+        return {
+          status:200,
+          headers:{get(n){return n.toLowerCase()==='content-length'?String(24*1024):null;}},
+          body:gcBody,
+          async arrayBuffer(){throw new Error('must stream');},
+        };
+      },
+    });
+    try{
+      const pendingCall=gcClient.call('route',contract,'ping',()=>new Uint8Array());
+      while(sent<24){await nextTurn();}
+      await new Promise(r=>setTimeout(r,10));
+      forceGc();
+      await nextTurn();
+      forceGc();
+      const aliveBeforeEof=refs.filter(r=>r.deref()!==undefined).length;
+      assert.ok(aliveBeforeEof<=2,`expected early chunks collected before EOF, got ${aliveBeforeEof}/24 alive`);
+      releaseLastChunk();
+      const result=await pendingCall;
+      assert.equal(result.byteLength,24*1024);
+    }finally{await gcClient.close()}
+  }
+
+  // 10. IPC cleanup failures (response.release() throw, call.close() throw, and dual copy+release throw) release allocator once and preserve first error.
+  {
+    for(const mode of ['release-throw','close-throw','dual-copy-and-release-throw']){
+      let allocated=0,freed=0,closedCalls=0;
+      const copyBoom=new Error('primary copy failure');
+      const releaseBoom=new Error('native release failure');
+      const closeBoom=new Error('call close failure');
+      const ep={
+        connectionSnapshot(){return null},
+        async prepare(){return binding},
+        beginCall(){return {
+          async chargeInput(){},
+          async dispatch(){return nativeTarget},
+          async next(){
+            const b=Uint8Array.of(7,8);
+            b.release=()=>{
+              if(mode==='release-throw'||mode==='dual-copy-and-release-throw')throw releaseBoom;
+            };
+            return b;
+          },
+          checkDeadline(){},cancel(){},
+          close(){
+            closedCalls++;
+            if(mode==='close-throw')throw closeBoom;
+          },
+          async observe(){return receipt},
+        }},
+        deactivate(){},async close(){},
+      };
+      const ipcClean=transport.createIpcEncodedTransport('ipc://clean',{
+        connect:async()=>ep,
+        responsePayloadAllocator(byteLength){
+          allocated++;
+          const backing=new Uint8Array(byteLength);
+          const view=new Uint8Array(backing.buffer);
+          if(mode==='dual-copy-and-release-throw'){
+            view.set=()=>{throw copyBoom;};
+          }
+          return {view,payload:backing,release(){freed++;}};
+        },
+      });
+      try{
+        const expectedErr=mode==='dual-copy-and-release-throw'?copyBoom:mode==='release-throw'?releaseBoom:closeBoom;
+        await assert.rejects(ipcClean.call('route',contract,'ping',()=>new Uint8Array()),err=>err===expectedErr);
+        assert.deepEqual({mode,allocated,freed,closedCalls},{mode,allocated:1,freed:1,closedCalls:1});
+      }finally{await ipcClean.close()}
+    }
+  }
+
+  // 11. Observer callback throwing inner 713/pre_dispatch never grants retrySafe=true and never poisons route target on HTTP or relay-aware local IPC.
+  {
+    let postCount=0,httpAlloc=0,httpFree=0,throwOnFirst=true;
+    const inner713=new transport.C2CoreError('inner protocol error',{
+      message:'inner protocol error',
+      code:713,
+      canonicalName:'ProtocolViolation',
+      transportPhase:'pre_dispatch',
+      details:{dispatch_phase:'pre_dispatch',inner:'1'},
+    });
+    assert.equal(inner713.retrySafe,true);
+    const isoHttp=transport.createRelayAwareHttpEncodedTransport('http://localhost:8300',{
+      responsePayloadAllocator(byteLength){
+        httpAlloc++;
+        const view=new Uint8Array(byteLength);
+        return {view,payload:view,release(){httpFree++;}};
+      },
+      observe(){
+        if(throwOnFirst){
+          throwOnFirst=false;
+          throw inner713;
+        }
+      },
+      fetch:async(url,init)=>{
+        if(url.includes('/_resolve/'))return textReply(200,JSON.stringify([relayRoute()]));
+        if(url.includes('/_probe/'))return relayResponse();
+        assert.equal(init.method,'POST');
+        postCount++;
+        return new Response(Uint8Array.of(postCount),{status:200,headers:{'content-length':'1'}});
+      },
+    });
+    try{
+      await assert.rejects(isoHttp.call('route',contract,'ping',()=>new Uint8Array()),err=>{
+        assert.ok(err instanceof transport.C2CoreError);
+        assert.notEqual(err,inner713);
+        assert.equal(err.code,713);
+        assert.equal(err.transportPhase,null);
+        assert.equal(err.retrySafe,false);
+        assert.equal(err.cause,inner713);
+        assert.deepEqual(err.details,{inner:'1'});
+        return true;
+      });
+      assert.deepEqual({postCount,httpAlloc,httpFree},{postCount:1,httpAlloc:1,httpFree:1});
+      const second=await isoHttp.call('route',contract,'ping',()=>new Uint8Array());
+      assert.deepEqual([...second],[2]);
+      assert.equal(postCount,2);
+    }finally{await isoHttp.close()}
+
+    let ipcPosts=0,throwIpcFirst=true;
+    const localBinding={serverId:'s1',serverInstanceId:'i1',connectionId:1n};
+    const localEp={
+      connectionSnapshot(){return null},
+      async prepare(){return localBinding},
+      beginCall(){return {
+        async chargeInput(){},
+        async dispatch(){ipcPosts++;return {...localBinding,path:'RelayAwareLocalIpc'};},
+        async next(){const b=Uint8Array.of(ipcPosts);b.release=()=>{};return b;},
+        checkDeadline(){},cancel(){},close(){},
+        async observe(){return receipt},
+      }},
+      deactivate(){},async close(){},
+    };
+    const isoLocal=transport.createRelayAwareHttpEncodedTransport('http://localhost:8300',{
+      ipc:{connect:async()=>localEp},
+      observe(){
+        if(throwIpcFirst){
+          throwIpcFirst=false;
+          throw inner713;
+        }
+      },
+      fetch:async(url)=>{
+        if(url.includes('/_resolve/')){
+          return textReply(200,JSON.stringify([relayRoute(1,true)]));
+        }
+        throw new Error(`unexpected HTTP fetch: ${url}`);
+      },
+    });
+    try{
+      await assert.rejects(isoLocal.call('route',contract,'ping',()=>new Uint8Array()),err=>{
+        assert.ok(err instanceof transport.C2CoreError);
+        assert.equal(err.retrySafe,false);
+        assert.equal(err.transportPhase,null);
+        assert.equal(err.cause,inner713);
+        return true;
+      });
+      const secondLocal=await isoLocal.call('route',contract,'ping',()=>new Uint8Array());
+      assert.deepEqual([...secondLocal],[2]);
+      assert.equal(ipcPosts,2);
+    }finally{await isoLocal.close()}
+  }
+
+  // 12. Explicit FASTDB_CORE_SDK_DIR pointing to a directory without FastDB libraries fails loudly rather than silently falling back.
+  {
+    const noLibDir=fileURLToPath(new URL('./fixtures',import.meta.url));
+    assert.throws(
+      ()=>buildFastDbEnvironment({FASTDB_CORE_SDK_DIR:noLibDir}),
+      /FASTDB_CORE_SDK_DIR does not contain a matching FastDB library/,
+    );
+  }
+
+  // 13. Post-dispatch copies of C2HttpRelayError (including invalid UTF-8 / mutated Node Buffer) and C2HttpTransportError keep diagnostics without double prefixing.
+  {
+    const sharedBuf=Buffer.from([0xff,0xfe]);
+    const invalidUtf8RelayErr=new transport.C2HttpRelayError(503,sharedBuf,'pre_dispatch');
+    assert.equal(invalidUtf8RelayErr.hasVerifiedUtf8Body,false);
+    sharedBuf[0]=0x41;
+    sharedBuf[1]=0x42;
+    const innerHttpTransErr=new transport.C2HttpTransportError('connect failed',{code:'ECONNREFUSED'},'pre_dispatch');
+    const obsQueue=[invalidUtf8RelayErr,innerHttpTransErr];
+    const p2Ep={
+      connectionSnapshot(){return null},
+      async prepare(){return binding},
+      beginCall(){return {
+        async chargeInput(){},
+        async dispatch(){return nativeTarget},
+        async next(){const b=Uint8Array.of(1);b.release=()=>{};return b;},
+        checkDeadline(){},cancel(){},close(){},
+        async observe(){return receipt},
+      }},
+      deactivate(){},async close(){},
+    };
+    const p2Ipc=transport.createIpcEncodedTransport('ipc://p2',{
+      connect:async()=>p2Ep,
+      observe(){throw obsQueue.shift();},
+    });
+    try{
+      await assert.rejects(p2Ipc.call('route',contract,'ping',()=>new Uint8Array()),err=>{
+        assert.ok(err instanceof transport.C2HttpRelayError);
+        assert.equal(err.cause,invalidUtf8RelayErr);
+        assert.equal(err.retrySafe,false);
+        assert.equal(err.hasVerifiedUtf8Body,false);
+        assert.notEqual(err.body,'AB');
+        return true;
+      });
+      await assert.rejects(p2Ipc.call('route',contract,'ping',()=>new Uint8Array()),err=>{
+        assert.ok(err instanceof transport.C2HttpTransportError);
+        assert.equal(err.cause,innerHttpTransErr);
+        assert.equal(err.retrySafe,false);
+        assert.equal(err.message,'C-Two HTTP transport error: connect failed');
+        return true;
+      });
+    }finally{await p2Ipc.close()}
+  }
+
+  // 14. Stream decode failure & HTTP input encode failure never poison target; reused runtime_retired error still terminates target when thrown by real transport.
+  {
+    let streamDispatches=0;
+    const inner713=new transport.C2CoreError('decode 713',{
+      message:'decode 713',
+      code:713,
+      canonicalName:'ProtocolViolation',
+      transportPhase:'pre_dispatch',
+    });
+    const localBinding={serverId:'s1',serverInstanceId:'i1',connectionId:1n};
+    const streamEp={
+      connectionSnapshot(){return null},
+      async prepare(){return localBinding},
+      beginCall(_route,_method,serverStream){
+        let yielded=false;
+        return {
+          async chargeInput(){},
+          async dispatch(){streamDispatches++;return {...localBinding,path:'RelayAwareLocalIpc'};},
+          async next(){
+            if(!serverStream){const b=Uint8Array.of(99);b.release=()=>{};return b;}
+            if(yielded)return null;
+            yielded=true;
+            const b=Uint8Array.of(42);b.release=()=>{};return b;
+          },
+          checkDeadline(){},cancel(){},close(){},
+          async observe(){return receipt},
+        };
+      },
+      deactivate(){},async close(){},
+    };
+    const streamClient=transport.createRelayAwareHttpEncodedTransport('http://localhost:8300',{
+      ipc:{connect:async()=>streamEp},
+      fetch:async(url)=>{
+        if(url.includes('/_resolve/'))return textReply(200,JSON.stringify([relayRoute(1,true)]));
+        throw new Error(`unexpected HTTP: ${url}`);
+      },
+    });
+    try{
+      const s=streamClient.stream('route',contract,'steps',()=>new Uint8Array(),()=>{throw inner713;});
+      await assert.rejects(s.next(),err=>{
+        assert.ok(err instanceof transport.C2CoreError);
+        assert.equal(err.retrySafe,false);
+        assert.equal(err.transportPhase,null);
+        assert.equal(err.cause,inner713);
+        return true;
+      });
+      await s.close();
+      const followUp=await streamClient.call('route',contract,'ping',()=>new Uint8Array());
+      assert.deepEqual([...followUp],[99]);
+      assert.equal(streamDispatches,2);
+    }finally{await streamClient.close()}
+
+    // HTTP input encode throwing inner 713 does not poison target for subsequent call.
+    let httpPosts=0;
+    const encHttp=transport.createRelayAwareHttpEncodedTransport('http://localhost:8300',{
+      fetch:async(url,init)=>{
+        if(url.includes('/_resolve/'))return textReply(200,JSON.stringify([relayRoute()]));
+        if(url.includes('/_probe/'))return relayResponse();
+        assert.equal(init.method,'POST');
+        httpPosts++;
+        return new Response(Uint8Array.of(7),{status:200,headers:{'content-length':'1'}});
+      },
+    });
+    try{
+      await assert.rejects(encHttp.call('route',contract,'ping',()=>{throw inner713;}),err=>err===inner713);
+      assert.equal(httpPosts,0);
+      const ok=await encHttp.call('route',contract,'ping',()=>new Uint8Array());
+      assert.deepEqual([...ok],[7]);
+      assert.equal(httpPosts,1);
+    }finally{await encHttp.close()}
+
+    // Reused runtime_retired error thrown first by observe() and then by real transport beginCall still marks target terminal on the transport failure.
+    const sharedRetired=new transport.C2IpcTransportError('retired',{
+      message:'retired',
+      category:'runtime_retired',
+      transportPhase:'pre_dispatch',
+    });
+    let callIdx=0,realBeginCalls=0;
+    const reusedEp={
+      connectionSnapshot(){return null},
+      async prepare(){return localBinding},
+      beginCall(){
+        realBeginCalls++;
+        if(realBeginCalls>=2)throw sharedRetired;
+        return {
+          async chargeInput(){},
+          async dispatch(){return {...localBinding,path:'RelayAwareLocalIpc'};},
+          async next(){const b=Uint8Array.of(1);b.release=()=>{};return b;},
+          checkDeadline(){},cancel(){},close(){},
+          async observe(){return receipt},
+        };
+      },
+      deactivate(){},async close(){},
+    };
+    const reusedClient=transport.createRelayAwareHttpEncodedTransport('http://localhost:8300',{
+      ipc:{connect:async()=>reusedEp},
+      observe(){
+        if(callIdx++===0)throw sharedRetired;
+      },
+      fetch:async(url)=>{
+        if(url.includes('/_resolve/'))return textReply(200,JSON.stringify([relayRoute(1,true)]));
+        throw new Error(`unexpected HTTP: ${url}`);
+      },
+    });
+    try{
+      // Call 1: observe() throws sharedRetired -> sanitized, target stays open.
+      await assert.rejects(reusedClient.call('route',contract,'ping',()=>new Uint8Array()),err=>{
+        assert.equal(err.retrySafe,false);
+        assert.equal(err.cause,sharedRetired);
+        return true;
+      });
+      assert.equal(realBeginCalls,1);
+      // Call 2: beginCall() throws sharedRetired -> real transport refusal, marks target terminal!
+      await assert.rejects(reusedClient.call('route',contract,'ping',()=>new Uint8Array()),err=>err===sharedRetired);
+      assert.equal(realBeginCalls,2);
+      // Call 3: target is terminal -> immediately rejects with sharedRetired without calling beginCall again!
+      await assert.rejects(reusedClient.call('route',contract,'ping',()=>new Uint8Array()),err=>err===sharedRetired);
+      assert.equal(realBeginCalls,2);
+    }finally{await reusedClient.close()}
+  }
+
+  // 15. Without global AbortController, fixed-length reader deadline returns 715 promptly; and invalid payload byteLength releases first owner once.
+  {
+    const savedAbortController=globalThis.AbortController;
+    let unblockStream;
+    const streamGate=new Promise(r=>{unblockStream=r;});
+    let noCtrlAlloc=0,noCtrlFree=0;
+    try{
+      globalThis.AbortController=undefined;
+      const noCtrlClient=transport.createRelayAwareHttpEncodedTransport('http://localhost:8300',{
+        callTimeoutMs:35,
+        responsePayloadAllocator(byteLength){
+          noCtrlAlloc++;
+          const view=new Uint8Array(byteLength);
+          return {view,payload:view,release(){noCtrlFree++;}};
+        },
+        fetch:async(url)=>{
+          if(url.includes('/_resolve/'))return textReply(200,JSON.stringify([relayRoute()]));
+          if(url.includes('/_probe/'))return relayResponse();
+          return {
+            status:200,
+            headers:{get(n){return n.toLowerCase()==='content-length'?'4':null;}},
+            body:new ReadableStream({async pull(c){await streamGate;c.close();}}),
+            async arrayBuffer(){throw new Error('must stream');},
+          };
+        },
+      });
+      try{
+        const t0=performance.now();
+        await assert.rejects(noCtrlClient.call('route',contract,'ping',()=>new Uint8Array()),err=>{
+          assert.ok(err instanceof transport.C2CoreError);
+          assert.equal(err.code,715);
+          return true;
+        });
+        const elapsed=performance.now()-t0;
+        assert.ok(elapsed<95,`expected prompt 35ms timeout without AbortController, took ${elapsed.toFixed(1)}ms`);
+        assert.deepEqual({noCtrlAlloc,noCtrlFree},{noCtrlAlloc:1,noCtrlFree:1});
+      }finally{
+        unblockStream();
+        await noCtrlClient.close();
+      }
+    }finally{
+      globalThis.AbortController=savedAbortController;
+    }
+
+    let ownerCreations=0;
+    const ownerReleases=[];
+    const oneOwnerHttp=transport.createRelayAwareHttpEncodedTransport('http://localhost:8300',{
+      responsePayloadAllocator(byteLength){
+        const view=new Uint8Array(byteLength);
+        return {
+          view,
+          get payload(){
+            const id=++ownerCreations;
+            return {
+              get byteLength(){throw new Error(`byteLength boom #${id}`);},
+              release(){ownerReleases.push(id);},
+            };
+          },
+        };
+      },
+      fetch:async(url)=>{
+        if(url.includes('/_resolve/'))return textReply(200,JSON.stringify([relayRoute()]));
+        if(url.includes('/_probe/'))return relayResponse();
+        return new Response(Uint8Array.of(1,2),{status:200,headers:{'content-length':'2'}});
+      },
+    });
+    try{
+      await assert.rejects(oneOwnerHttp.call('route',contract,'ping',()=>new Uint8Array()),err=>{
+        assert.ok(err instanceof transport.C2HttpTransportError);
+        assert.equal(err.retrySafe,false);
+        return true;
+      });
+      assert.equal(ownerCreations,1);
+      assert.deepEqual(ownerReleases,[1]);
+    }finally{await oneOwnerHttp.close()}
+  }
+
+  // 16. Round-14 regressions: stream cancel preserving decode error, concurrent close + native 713 poisoning target, post-response param/formatting/lazy-getter safety, pre-chargeInput byteLength, compressed resolve/probe timeout reader unlock, Buffer slice immutability, and single-read getters.
+  {
+    const localBinding={serverId:'s1',serverInstanceId:'i1',connectionId:1n};
+    const make713=(msg='inner 713')=>new transport.C2IpcTransportError(msg,{
+      message:msg,
+      code:713,
+      canonicalName:'ProtocolViolation',
+      transportPhase:'pre_dispatch',
+    });
+
+    // 16a. Stream cancel() throwing inner 713 must NOT overwrite primary post-item decode failure.
+    const decodeErr=new Error('primary decode failure');
+    const cancelThrowEp={
+      connectionSnapshot(){return null},
+      async prepare(){return localBinding},
+      beginCall(){
+        let yielded=false;
+        return {
+          async chargeInput(){},
+          async dispatch(){return {...localBinding,path:'DirectIpc'};},
+          async next(){
+            if(yielded)return null;
+            yielded=true;
+            const b=Uint8Array.of(1);b.release=()=>{};return b;
+          },
+          checkDeadline(){},
+          cancel(){throw make713('cancel 713');},
+          close(){},
+          async observe(){return receipt},
+        };
+      },
+      deactivate(){},async close(){},
+    };
+    const cancelThrowIpc=transport.createIpcEncodedTransport('ipc://cancel-throw',{connect:async()=>cancelThrowEp});
+    try{
+      await cancelThrowIpc.prepare('route',contract);
+      const s=cancelThrowIpc.stream('route',contract,'steps',()=>new Uint8Array(),()=>{throw decodeErr;});
+      await assert.rejects(s.next(),err=>{
+        assert.equal(err,decodeErr);
+        assert.notEqual(err.retrySafe,true);
+        return true;
+      });
+    }finally{await cancelThrowIpc.close()}
+
+    // 16b. Concurrent stream close() finishing while next() awaits call.next() still projects native 713 and marks relay target terminal.
+    let concDispatches=0;
+    let rejectPendingNext;
+    const nextStarted=new Promise(resolve=>{
+      var notifyStart=resolve;
+      cancelThrowEp._unused=notifyStart;
+    });
+    let signalNextPending;
+    const nextPendingBarrier=new Promise(r=>{signalNextPending=r;});
+    const concEp={
+      connectionSnapshot(){return null},
+      async prepare(){return localBinding},
+      beginCall(){
+        return {
+          async chargeInput(){},
+          async dispatch(){concDispatches++;return {...localBinding,path:'RelayAwareLocalIpc'};},
+          next(){
+            signalNextPending();
+            return new Promise((_res,rej)=>{rejectPendingNext=rej;});
+          },
+          checkDeadline(){},cancel(){},close(){},
+          async observe(){return {completed:true,error:null,completeItems:0n};},
+        };
+      },
+      deactivate(){},async close(){},
+    };
+    void nextStarted;
+    const concClient=transport.createRelayAwareHttpEncodedTransport('http://localhost:8300',{
+      ipc:{connect:async()=>concEp},
+      fetch:async(url)=>{
+        if(url.includes('/_resolve/'))return textReply(200,JSON.stringify([relayRoute(1,true)]));
+        throw new Error(`unexpected HTTP: ${url}`);
+      },
+    });
+    try{
+      const s=concClient.stream('route',contract,'steps',()=>new Uint8Array(),b=>b);
+      const pendingNext=s.next();
+      await nextPendingBarrier;
+      const closeReceipt=await s.close();
+      assert.equal(closeReceipt.completed,true);
+      const native713=Object.assign(new Error('native frame violation'),{
+        nativeDetails:{message:'native frame violation',code:713,canonicalName:'ProtocolViolation',transportPhase:'pre_dispatch'},
+      });
+      rejectPendingNext(native713);
+      await assert.rejects(pendingNext,err=>{
+        assert.ok(err instanceof transport.C2IpcTransportError);
+        assert.equal(err.code,713);
+        return true;
+      });
+      assert.equal(concDispatches,1);
+      await assert.rejects(concClient.call('route',contract,'ping',()=>new Uint8Array()),err=>{
+        assert.ok(err instanceof transport.C2IpcTransportError);
+        assert.equal(err.code,713);
+        return true;
+      });
+      assert.equal(concDispatches,1);
+    }finally{await concClient.close()}
+
+    // 16c. IPC target.serverId getter throwing 713 after unary response is sanitized (retrySafe=false) & releases allocator payload.
+    let targetGetterReleased=0;
+    const targetGetterEp={
+      connectionSnapshot(){return null},
+      async prepare(){return localBinding},
+      beginCall(){
+        return {
+          async chargeInput(){},
+          async dispatch(){
+            return {
+              path:'DirectIpc',
+              get serverId(){throw make713('serverId 713');},
+              serverInstanceId:'i1',
+              connectionId:1n,
+            };
+          },
+          async next(){const b=Uint8Array.of(5);b.release=()=>{};return b;},
+          checkDeadline(){},cancel(){},close(){},
+          async observe(){return receipt},
+        };
+      },
+      deactivate(){},async close(){},
+    };
+    const targetGetterIpc=transport.createIpcEncodedTransport('ipc://target-getter',{
+      connect:async()=>targetGetterEp,
+      responsePayloadAllocator(n){
+        const view=new Uint8Array(n);
+        return {view,payload:view,release(){targetGetterReleased++;}};
+      },
+      observe(){},
+    });
+    try{
+      await targetGetterIpc.prepare('route',contract);
+      await assert.rejects(targetGetterIpc.call('route',contract,'ping',()=>new Uint8Array()),err=>{
+        assert.equal(err.retrySafe,false);
+        assert.equal(err.transportPhase,null);
+        return true;
+      });
+      assert.equal(targetGetterReleased,1);
+    }finally{await targetGetterIpc.close()}
+
+    // 16d. HTTP 200 allocator throwing an error whose toString() throws inner 713 yields dispatch_uncertain (retrySafe=false) and keeps target healthy.
+    let unprintablePosts=0,failUnprintableOnce=true;
+    const unprintableHttp=transport.createRelayAwareHttpEncodedTransport('http://localhost:8300',{
+      responsePayloadAllocator(n){
+        if(failUnprintableOnce){
+          failUnprintableOnce=false;
+          throw {toString(){throw make713('toString 713');}};
+        }
+        const view=new Uint8Array(n);
+        return {view,payload:view};
+      },
+      fetch:async(url)=>{
+        if(url.includes('/_resolve/'))return textReply(200,JSON.stringify([relayRoute()]));
+        if(url.includes('/_probe/'))return relayResponse();
+        unprintablePosts++;
+        return new Response(Uint8Array.of(11),{status:200,headers:{'content-length':'1'}});
+      },
+    });
+    try{
+      await assert.rejects(unprintableHttp.call('route',contract,'ping',()=>new Uint8Array()),err=>{
+        assert.ok(err instanceof transport.C2HttpTransportError);
+        assert.equal(err.retrySafe,false);
+        assert.equal(err.transportPhase,'dispatch_uncertain');
+        return true;
+      });
+      assert.equal(unprintablePosts,1);
+      const secondOk=await unprintableHttp.call('route',contract,'ping',()=>new Uint8Array());
+      assert.deepEqual([...secondOk],[11]);
+      assert.equal(unprintablePosts,2);
+    }finally{await unprintableHttp.close()}
+
+    // 16e. Without global AbortController, compressed resolve (200) and probe (503) body hangs return 715/pre_dispatch AND cancel + releaseLock reader immediately.
+    const savedCtrl=globalThis.AbortController;
+    const makeHangingCompressedResponse=(status)=>{
+      const stats={reads:0,cancels:0,releases:0};
+      let unblock;
+      const gate=new Promise(r=>{unblock=r;});
+      const reader={
+        read(){stats.reads++;return gate.then(()=>({done:true,value:undefined}));},
+        cancel(){stats.cancels++;return Promise.resolve();},
+        releaseLock(){stats.releases++;},
+      };
+      return {
+        stats,
+        unblock,
+        response:{
+          status,
+          headers:{get(n){return n.toLowerCase()==='content-encoding'?'gzip':null;}},
+          body:{getReader(){return reader;}},
+          async arrayBuffer(){throw new Error('compressed body must use stream reader');},
+        },
+      };
+    };
+    try{
+      globalThis.AbortController=undefined;
+      const hangResolve=makeHangingCompressedResponse(200);
+      const resClient=transport.createRelayAwareHttpEncodedTransport('http://localhost:8300',{
+        resolveTimeoutMs:25,
+        fetch:async()=>hangResolve.response,
+      });
+      try{
+        await assert.rejects(resClient.call('route',contract,'ping',()=>new Uint8Array()),err=>{
+          assert.ok(err instanceof transport.C2CoreError);
+          assert.equal(err.code,715);
+          assert.equal(err.transportPhase,'pre_dispatch');
+          return true;
+        });
+        assert.deepEqual(hangResolve.stats,{reads:1,cancels:1,releases:1});
+      }finally{
+        hangResolve.unblock();
+        await resClient.close();
+      }
+
+      const hangProbe=makeHangingCompressedResponse(503);
+      let probePosts=0;
+      const probeClient=transport.createRelayAwareHttpEncodedTransport('http://localhost:8300',{
+        resolveTimeoutMs:25,
+        fetch:async(url,init)=>{
+          if(url.includes('/_resolve/'))return textReply(200,JSON.stringify([relayRoute()]));
+          if(url.includes('/_probe/'))return hangProbe.response;
+          probePosts++;
+          return new Response(new Uint8Array(),{status:200});
+        },
+      });
+      try{
+        await assert.rejects(probeClient.call('route',contract,'ping',()=>new Uint8Array()),err=>{
+          assert.ok(err instanceof transport.C2CoreError);
+          assert.equal(err.code,715);
+          assert.equal(err.transportPhase,'pre_dispatch');
+          return true;
+        });
+        assert.equal(probePosts,0);
+        assert.deepEqual(hangProbe.stats,{reads:1,cancels:1,releases:1});
+      }finally{
+        hangProbe.unblock();
+        await probeClient.close();
+      }
+    }finally{
+      globalThis.AbortController=savedCtrl;
+    }
+  }
 });

@@ -170,6 +170,33 @@ fn route_resolution_error_response(name: &str, error: RouteResolutionError) -> R
     )
 }
 
+fn probe_route_conflict_response(name: &str, error: RouteResolutionError) -> Response {
+    let RouteResolutionError::Conflict(registrations) = error else {
+        unreachable!("probe conflict helper handles RouteResolutionError::Conflict only");
+    };
+    c2_error_response(
+        StatusCode::CONFLICT,
+        c2_error::ErrorCode::RouteConflict,
+        format!("{}: {name}", c2_error::ErrorCode::RouteConflict.name()),
+        [
+            ("route", name.into()),
+            (
+                "registrations",
+                serde_json::to_string(&registrations).expect("registration metadata serializes"),
+            ),
+        ],
+    )
+}
+
+fn probe_resource_not_found_response(route_name: &str) -> Response {
+    c2_error_response(
+        StatusCode::NOT_FOUND,
+        c2_error::ErrorCode::ResourceNotFound,
+        format!("route not found: {route_name}"),
+        [("route", route_name.to_string())],
+    )
+}
+
 fn resource_not_found_response(route_name: &str) -> Response {
     c2_error_response(
         StatusCode::NOT_FOUND,
@@ -196,22 +223,11 @@ fn resource_not_found_response_budgeted(route_name: &str, budget: &DomainBudget)
 }
 
 fn resource_unavailable_response(route_name: &str, message: impl Into<String>) -> Response {
-    resource_unavailable_response_with_phase(route_name, message, "pre_dispatch")
-}
-
-fn resource_unavailable_response_with_phase(
-    route_name: &str,
-    message: impl Into<String>,
-    dispatch_phase: &str,
-) -> Response {
     c2_error_response(
         StatusCode::BAD_GATEWAY,
         c2_error::ErrorCode::ResourceUnavailable,
         message,
-        [
-            ("route", route_name.to_string()),
-            ("dispatch_phase", dispatch_phase.to_string()),
-        ],
+        [("route", route_name.to_string())],
     )
 }
 
@@ -251,7 +267,11 @@ fn route_watch_unavailable_response_budgeted(
         StatusCode::SERVICE_UNAVAILABLE,
         c2_error::ErrorCode::RouteWatchUnavailable,
         format!("route watch unavailable for {route_name}"),
-        [("route", route_name.to_string()), ("reason", reason.into())],
+        [
+            ("route", route_name.to_string()),
+            ("reason", reason.into()),
+            ("dispatch_phase", "pre_dispatch".to_string()),
+        ],
         budget,
     )
 }
@@ -410,15 +430,18 @@ fn payload_too_large_response(
     max_payload_size: u64,
     budget: &DomainBudget,
 ) -> Response {
-    json_error_response(
+    c2_error_response_with_budget(
         StatusCode::PAYLOAD_TOO_LARGE,
-        serde_json::json!({
-            "error": "PayloadTooLarge",
-            "route": route_name,
-            "content_length": content_length,
-            "max_payload_size": max_payload_size,
-        }),
-        Some(budget),
+        c2_error::ErrorCode::CallCapacityExceeded,
+        format!("request payload size {content_length} exceeds max_payload_size {max_payload_size}"),
+        [
+            ("route", route_name.to_string()),
+            ("reason", "PayloadTooLarge".to_string()),
+            ("content_length", content_length.to_string()),
+            ("max_payload_size", max_payload_size.to_string()),
+            ("dispatch_phase", "pre_dispatch".to_string()),
+        ],
+        budget,
     )
 }
 
@@ -588,7 +611,10 @@ fn crm_contract_mismatch_response_budgeted(route_name: &str, budget: &DomainBudg
         StatusCode::CONFLICT,
         c2_error::ErrorCode::ContractMismatch,
         format!("CRM contract mismatch for route {route_name}"),
-        [("route", route_name.to_string())],
+        [
+            ("route", route_name.to_string()),
+            ("dispatch_phase", "pre_dispatch".to_string()),
+        ],
         budget,
     )
 }
@@ -749,7 +775,7 @@ fn validate_expected_crm_for_route(
     let Some(route) = state.local_route(route_name) else {
         return Err(match budget {
             Some(budget) => resource_not_found_response_budgeted(route_name, budget),
-            None => resource_not_found_response(route_name),
+            None => probe_resource_not_found_response(route_name),
         }
         .into());
     };
@@ -1917,7 +1943,7 @@ async fn handle_probe_in_context(
         Err(response) => return response.into_response(),
     };
     if let Err(error @ RouteResolutionError::Conflict(_)) = state.resolve_matching(&expected_crm) {
-        return route_resolution_error_response(&route_name, error);
+        return probe_route_conflict_response(&route_name, error);
     }
     let advertised_route =
         match validate_expected_crm_for_route(&state, &route_name, &expected_crm, None) {
@@ -1935,7 +1961,7 @@ async fn handle_probe_in_context(
         RequestClient::WatchUnavailable { route, reason } => {
             route_watch_unavailable_response(&route.name, reason)
         }
-        RequestClient::NotFound => resource_not_found_response(&route_name),
+        RequestClient::NotFound => probe_resource_not_found_response(&route_name),
         RequestClient::RouteError(error) => ipc_route_error_response(&route_name, &error, None),
         RequestClient::Unreachable => resource_unavailable_response(
             &route_name,
@@ -2483,8 +2509,22 @@ fn ipc_route_error_response(
     budget: Option<&DomainBudget>,
 ) -> Response {
     use c2_error::{C2Error, ErrorCode};
-    let semantic_error_response =
-        |status, error: C2Error| json_error_response(status, error.envelope(), budget);
+    let semantic_error_response = |status, mut error: C2Error| {
+        if budget.is_some() {
+            error
+                .details
+                .insert("dispatch_phase".into(), "pre_dispatch".into());
+            if error.details.contains_key("transport_phase") {
+                error
+                    .details
+                    .insert("transport_phase".into(), "pre_dispatch".into());
+            }
+        } else {
+            error.details.remove("dispatch_phase");
+            error.details.remove("transport_phase");
+        }
+        json_error_response(status, error.envelope(), budget)
+    };
 
     match error {
         c2_ipc::IpcError::CallRejected(error) => {
@@ -2498,11 +2538,7 @@ fn ipc_route_error_response(
                 | ErrorCode::CallCapacityExceeded => StatusCode::SERVICE_UNAVAILABLE,
                 _ => StatusCode::BAD_GATEWAY,
             };
-            let mut projected = error.clone();
-            projected
-                .details
-                .insert("dispatch_phase".into(), "pre_dispatch".into());
-            semantic_error_response(status, projected)
+            semantic_error_response(status, error.clone())
         }
         c2_ipc::IpcError::LocalCallRejected(error) => {
             semantic_error_response(StatusCode::SERVICE_UNAVAILABLE, error.clone())
@@ -2521,10 +2557,7 @@ fn ipc_route_error_response(
                 ErrorCode::ResourceRemoved,
                 format!("route removed: {route_name}"),
             )
-            .with_details(BTreeMap::from([
-                ("route".into(), route_name.clone()),
-                ("dispatch_phase".into(), "pre_dispatch".into()),
-            ])),
+            .with_details(BTreeMap::from([("route".into(), route_name.clone())])),
         ),
         c2_ipc::IpcError::RouteClosed { route_name, reason } => semantic_error_response(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -2535,14 +2568,12 @@ fn ipc_route_error_response(
             .with_details(BTreeMap::from([
                 ("route".into(), route_name.clone()),
                 ("reason".into(), reason.clone()),
-                ("dispatch_phase".into(), "pre_dispatch".into()),
             ])),
         ),
         c2_ipc::IpcError::ContractMismatch(message) => semantic_error_response(
             StatusCode::CONFLICT,
             C2Error::new(ErrorCode::ContractMismatch, message.clone()).with_details(
                 BTreeMap::from([
-                    ("dispatch_phase".to_string(), "pre_dispatch".to_string()),
                     ("route".to_string(), route_name.to_string()),
                     ("transport".to_string(), "ipc".to_string()),
                 ]),
@@ -2750,9 +2781,9 @@ mod tests {
     use tower::ServiceExt;
 
     use crate::relay::test_support::{
-        register_echo_route, reserve_echo_route, shutdown_live_server, start_live_server,
-        start_live_server_with_identity_and_contracts, start_live_server_with_routes,
-        test_state_for_client,
+        NoopDisseminator, register_echo_route, reserve_echo_route, shutdown_live_server,
+        start_live_server, start_live_server_with_identity_and_contracts,
+        start_live_server_with_routes, test_state_for_client,
     };
     use crate::relay::types::{Locality, RouteEntry, RouteInfo};
 
@@ -2972,35 +3003,45 @@ mod tests {
                 StatusCode::BAD_GATEWAY,
                 ErrorCode::ProtocolViolation,
             ),
+            (
+                c2_ipc::IpcError::LocalCallRejected(c2_error::C2Error::new(
+                    ErrorCode::CallCapacityExceeded,
+                    "full",
+                )),
+                StatusCode::SERVICE_UNAVAILABLE,
+                ErrorCode::CallCapacityExceeded,
+            ),
         ];
 
         for (error, expected_status, expected_code) in cases {
-            let response = ipc_route_error_response("grid", &error, None);
-            assert_eq!(response.status(), expected_status, "error={error}");
-            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
-            assert_eq!(
-                body["code"],
-                u16::from(expected_code),
-                "unexpected code for error={error}"
-            );
-            assert_eq!(
-                body["name"],
-                expected_code.name(),
-                "unexpected name for error={error}"
-            );
-            if matches!(
-                expected_code,
-                ErrorCode::ResourceRemoved
-                    | ErrorCode::ResourceClosed
-                    | ErrorCode::ContractMismatch
-            ) {
-                assert_eq!(body["details"]["dispatch_phase"], "pre_dispatch");
+            for business in [false, true] {
+                let budget = crate::payload::memory_only_budget(64 * 1024);
+                let response =
+                    ipc_route_error_response("grid", &error, business.then_some(&budget));
+                assert_eq!(response.status(), expected_status, "error={error}");
+                let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+                let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(
+                    body["code"],
+                    u16::from(expected_code),
+                    "unexpected code for error={error}"
+                );
+                assert_eq!(
+                    body["name"],
+                    expected_code.name(),
+                    "unexpected name for error={error}"
+                );
+                if business {
+                    assert_eq!(body["details"]["dispatch_phase"], "pre_dispatch");
+                } else {
+                    assert!(body["details"].get("dispatch_phase").is_none());
+                    assert!(body["details"].get("transport_phase").is_none());
+                }
+                assert_ne!(
+                    body["name"], "ResourceUnavailable",
+                    "semantic error was flattened: {error}"
+                );
             }
-            assert_ne!(
-                body["name"], "ResourceUnavailable",
-                "semantic error was flattened: {error}"
-            );
         }
 
         let response =
@@ -3009,7 +3050,21 @@ mod tests {
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(body["name"], "ResourceUnavailable");
-        assert_eq!(body["details"]["dispatch_phase"], "pre_dispatch");
+        assert!(body["details"].get("dispatch_phase").is_none());
+
+        let budget = crate::payload::memory_only_budget(64 * 1024);
+        let business_response = ipc_route_error_response(
+            "grid",
+            &c2_ipc::IpcError::Config("offline".into()),
+            Some(&budget),
+        );
+        assert_eq!(business_response.status(), StatusCode::BAD_GATEWAY);
+        let business_body = to_bytes(business_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let business_body: serde_json::Value = serde_json::from_slice(&business_body).unwrap();
+        assert_eq!(business_body["name"], "ResourceUnavailable");
+        assert_eq!(business_body["details"]["dispatch_phase"], "pre_dispatch");
     }
 
     #[tokio::test]
@@ -3034,19 +3089,48 @@ mod tests {
         ] {
             let original = C2Error::new(code, format!("rejected: {}", code.name()))
                 .with_details(BTreeMap::from([("source".into(), "server".into())]));
-            let response = ipc_route_error_response(
-                "grid",
-                &c2_ipc::IpcError::CallRejected(original.clone()),
-                None,
-            );
-            assert_eq!(response.status(), status, "code={code:?}");
+            for business in [false, true] {
+                let budget = crate::payload::memory_only_budget(64 * 1024);
+                let response = ipc_route_error_response(
+                    "grid",
+                    &c2_ipc::IpcError::CallRejected(original.clone()),
+                    business.then_some(&budget),
+                );
+                assert_eq!(response.status(), status, "code={code:?}");
+                let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+                let envelope: c2_error::C2ErrorEnvelope = serde_json::from_slice(&body).unwrap();
+                let projected = C2Error::from_envelope(envelope).unwrap();
+                assert_eq!(projected.code, original.code);
+                assert_eq!(projected.message, original.message);
+                assert_eq!(projected.details["source"], "server");
+                if business {
+                    assert_eq!(projected.details["dispatch_phase"], "pre_dispatch");
+                } else {
+                    assert!(!projected.details.contains_key("dispatch_phase"));
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn ipc_rejection_overrides_nested_transport_phase_with_or_without_budget() {
+        let error = c2_ipc::IpcError::LocalCallRejected(
+            c2_error::C2Error::new(c2_error::ErrorCode::CallCapacityExceeded, "full").with_details(
+                BTreeMap::from([("transport_phase".into(), "dispatch_uncertain".into())]),
+            ),
+        );
+        for business in [false, true] {
+            let budget = crate::payload::memory_only_budget(64 * 1024);
+            let response = ipc_route_error_response("grid", &error, business.then_some(&budget));
             let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-            let envelope: c2_error::C2ErrorEnvelope = serde_json::from_slice(&body).unwrap();
-            let projected = C2Error::from_envelope(envelope).unwrap();
-            assert_eq!(projected.code, original.code);
-            assert_eq!(projected.message, original.message);
-            assert_eq!(projected.details["source"], "server");
-            assert_eq!(projected.details["dispatch_phase"], "pre_dispatch");
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            if business {
+                assert_eq!(body["details"]["dispatch_phase"], "pre_dispatch");
+                assert_eq!(body["details"]["transport_phase"], "pre_dispatch");
+            } else {
+                assert!(body["details"].get("dispatch_phase").is_none());
+                assert!(body["details"].get("transport_phase").is_none());
+            }
         }
     }
 
@@ -5272,9 +5356,12 @@ mod tests {
         assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(payload["error"], "PayloadTooLarge");
-        assert_eq!(payload["content_length"], 5);
-        assert_eq!(payload["max_payload_size"], 4);
+        assert_eq!(payload["code"], 717);
+        assert_eq!(payload["name"], "CallCapacityExceeded");
+        assert_eq!(payload["details"]["reason"], "PayloadTooLarge");
+        assert_eq!(payload["details"]["content_length"], "5");
+        assert_eq!(payload["details"]["max_payload_size"], "4");
+        assert_eq!(payload["details"]["dispatch_phase"], "pre_dispatch");
     }
 
     #[tokio::test]
@@ -5733,7 +5820,9 @@ mod tests {
             let error: serde_json::Value =
                 serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
                     .unwrap();
-            assert_eq!(error["max_payload_size"], 3);
+            assert_eq!(error["code"], 717);
+            assert_eq!(error["details"]["max_payload_size"], "3");
+            assert_eq!(error["details"]["dispatch_phase"], "pre_dispatch");
             assert_eq!(
                 calls.load(Ordering::SeqCst),
                 0,
@@ -6078,6 +6167,8 @@ mod tests {
         assert_eq!(body["name"], "ResourceNotFound");
         assert_eq!(body["message"], "route not found: grid");
         assert_eq!(body["details"]["route"], "grid");
+        assert!(body["details"].get("dispatch_phase").is_none());
+        assert!(body["details"].get("transport_phase").is_none());
         assert!(
             state.local_route("grid").is_none(),
             "never-found upstream route is semantic withdrawal evidence"
@@ -6087,7 +6178,144 @@ mod tests {
             StatusCode::NOT_FOUND
         );
 
+        match test_commit_registration!(
+            &state,
+            "grid".into(),
+            "server-grid".into(),
+            "server-grid-instance".into(),
+            owner_address.clone(),
+            "test.echo".into(),
+            "Echo".into(),
+            "0.1.0".into(),
+            TEST_ABI_HASH.into(),
+            TEST_SIGNATURE_HASH.into(),
+            1024,
+            "grid-never-served-uid-business".into(),
+            None,
+        ) {
+            RegisterCommitResult::Registered { .. } => {}
+            _ => panic!("unexpected registration result for business POST check"),
+        }
+        let (post_status, post_body) = post_call_response(state.clone(), "grid", "ping").await;
+        assert_eq!(post_status, StatusCode::NOT_FOUND);
+        let post_body: serde_json::Value = serde_json::from_slice(&post_body).unwrap();
+        assert_eq!(post_body["code"], 701);
+        assert_eq!(post_body["details"]["dispatch_phase"], "pre_dispatch");
+
         shutdown_live_server(&owner_server).await;
+    }
+
+    #[tokio::test]
+    async fn probe_catalog_missing_and_conflict_omit_dispatch_phase_while_resolve_and_post_keep_it()
+    {
+        let state = test_state();
+
+        // 1. Route missing from relay catalog: probe 701 has no dispatch_phase;
+        //    resolve 701 and business POST 701 both carry pre_dispatch.
+        let (probe_status, probe_body) = get_probe_response(state.clone(), "missing-grid").await;
+        assert_eq!(probe_status, StatusCode::NOT_FOUND);
+        let probe_json: serde_json::Value = serde_json::from_slice(&probe_body).unwrap();
+        assert_eq!(probe_json["code"], 701);
+        assert!(probe_json["details"].get("dispatch_phase").is_none());
+
+        let resolve_resp = build_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!(
+                        "/_resolve/missing-grid?crm_ns=test.echo&crm_name=Echo&crm_ver=0.1.0&abi_hash={TEST_ABI_HASH}&signature_hash={TEST_SIGNATURE_HASH}"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resolve_resp.status(), StatusCode::NOT_FOUND);
+        let resolve_bytes = to_bytes(resolve_resp.into_body(), usize::MAX).await.unwrap();
+        let resolve_json: serde_json::Value = serde_json::from_slice(&resolve_bytes).unwrap();
+        assert_eq!(resolve_json["code"], 701);
+        assert_eq!(resolve_json["details"]["dispatch_phase"], "pre_dispatch");
+
+        let (post_status, post_body) =
+            post_call_response(state.clone(), "missing-grid", "ping").await;
+        assert_eq!(post_status, StatusCode::NOT_FOUND);
+        let post_json: serde_json::Value = serde_json::from_slice(&post_body).unwrap();
+        assert_eq!(post_json["code"], 701);
+        assert_eq!(post_json["details"]["dispatch_phase"], "pre_dispatch");
+
+        // 2. Two live registrations in mesh conflict: probe 719 omits dispatch_phase;
+        //    resolve 719 keeps pre_dispatch.
+        state.register_peer(crate::relay::types::PeerInfo {
+            relay_id: "peer-b".into(),
+            url: "http://127.0.0.1:18082".into(),
+            route_count: 1,
+            last_heartbeat: std::time::Instant::now(),
+            status: PeerStatus::Alive,
+        });
+        state.with_route_table_mut(|table| {
+            assert!(table.register_route(RouteEntry {
+                name: "conflict-grid".into(),
+                relay_id: "test-relay".into(),
+                relay_url: "http://127.0.0.1:18081".into(),
+                server_id: Some("srv-a".into()),
+                server_instance_id: Some("srv-a-inst".into()),
+                ipc_address: Some("ipc://srv-a".into()),
+                crm_ns: "test.echo".into(),
+                crm_name: "Echo".into(),
+                crm_ver: "0.1.0".into(),
+                abi_hash: TEST_ABI_HASH.into(),
+                signature_hash: TEST_SIGNATURE_HASH.into(),
+                max_payload_size: 1024,
+                route_uid: Some("uid-a".into()),
+                locality: Locality::Local,
+                registered_at: 1.0,
+            }));
+            assert!(table.register_route(RouteEntry {
+                name: "conflict-grid".into(),
+                relay_id: "peer-b".into(),
+                relay_url: "http://127.0.0.1:18082".into(),
+                server_id: None,
+                server_instance_id: None,
+                ipc_address: None,
+                crm_ns: "test.echo".into(),
+                crm_name: "Echo".into(),
+                crm_ver: "0.1.0".into(),
+                abi_hash: TEST_ABI_HASH.into(),
+                signature_hash: TEST_SIGNATURE_HASH.into(),
+                max_payload_size: 1024,
+                route_uid: None,
+                locality: Locality::Peer,
+                registered_at: 2.0,
+            }));
+        });
+
+        let (conflict_probe_status, conflict_probe_body) =
+            get_probe_response(state.clone(), "conflict-grid").await;
+        assert_eq!(conflict_probe_status, StatusCode::CONFLICT);
+        let conflict_probe_json: serde_json::Value =
+            serde_json::from_slice(&conflict_probe_body).unwrap();
+        assert_eq!(conflict_probe_json["code"], 719);
+        assert!(conflict_probe_json["details"].get("dispatch_phase").is_none());
+
+        let conflict_resolve = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!(
+                        "/_resolve/conflict-grid?crm_ns=test.echo&crm_name=Echo&crm_ver=0.1.0&abi_hash={TEST_ABI_HASH}&signature_hash={TEST_SIGNATURE_HASH}"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(conflict_resolve.status(), StatusCode::CONFLICT);
+        let conflict_resolve_bytes =
+            to_bytes(conflict_resolve.into_body(), usize::MAX).await.unwrap();
+        let conflict_resolve_json: serde_json::Value =
+            serde_json::from_slice(&conflict_resolve_bytes).unwrap();
+        assert_eq!(conflict_resolve_json["code"], 719);
+        assert_eq!(conflict_resolve_json["details"]["dispatch_phase"], "pre_dispatch");
     }
 
     #[tokio::test]
@@ -6584,16 +6812,44 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn relay_probe_does_not_trust_cached_data_plane_after_control_watch_unavailable() {
-        let state = test_state_for_client();
+    async fn relay_watch_unavailability_refuses_calls_before_dispatch() {
+        #[cfg(unix)]
+        let root = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        let context = c2_config::LocalEndpointContext::with_unix_root(root.path()).unwrap();
+        #[cfg(windows)]
+        let context = c2_config::LocalEndpointContext::default_for_platform().unwrap();
+        let state = Arc::new(RelayState::new_with_context(
+            Arc::new(c2_config::RelayConfig::default()),
+            Arc::new(NoopDisseminator),
+            context.clone(),
+        ));
         let address = format!(
             "ipc://relay_watch_unavailable_cached_probe_{}_{}",
             std::process::id(),
             unique_suffix()
         );
-        let server = start_live_server(&address, "server-grid").await;
+        let endpoint = context.endpoint(&address).unwrap();
+        let server = Arc::new(
+            Server::new_with_identity_and_endpoint(
+                endpoint.clone(),
+                ServerIpcConfig::default(),
+                ServerIdentity {
+                    server_id: "server-grid".into(),
+                    server_instance_id: "server-grid-instance".into(),
+                },
+            )
+            .unwrap(),
+        );
+        register_echo_route(&server, "grid").await;
+        let running = server.clone();
+        tokio::spawn(async move { running.run().await.unwrap() });
+        server
+            .wait_until_responsive(Duration::from_secs(2))
+            .await
+            .unwrap();
 
-        let mut attested = c2_ipc::IpcClient::new(&address).unwrap();
+        let mut attested = c2_ipc::IpcClient::with_endpoint(endpoint.clone()).unwrap();
         attested
             .connect()
             .await
@@ -6638,14 +6894,15 @@ mod tests {
 
         let mut stale_data_client = state
             .clients
-            .manage(|| c2_ipc::IpcClient::new(&address))
+            .manage(|| c2_ipc::IpcClient::with_endpoint(endpoint))
             .expect("stale data client admission");
         stale_data_client
             .connect()
             .await
             .expect("stale data-plane client connects");
         stale_data_client.close().await;
-        state.reconnect("grid", stale_data_client.into_shared());
+        let stale_data_client = stale_data_client.into_shared();
+        state.reconnect("grid", stale_data_client.clone());
 
         let route = state.local_route("grid").expect("relay route registered");
         let key = crate::relay::upstream_control::owner_key_for_route(&route)
@@ -6655,11 +6912,39 @@ mod tests {
         let (status, body) = get_probe_response(state.clone(), "grid").await;
 
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-        let body = String::from_utf8(body).unwrap();
-        assert!(
-            body.contains("RouteWatchUnavailable"),
-            "watch-unavailable route must not be reported as generic success or route removal: {body}"
+        let probe: c2_error::C2ErrorEnvelope = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            probe.code,
+            c2_error::ErrorCode::RouteWatchUnavailable as u16
         );
+        assert!(!probe.details.contains_key("dispatch_phase"));
+
+        for accept in ["application/octet-stream", crate::stream_wire::MEDIA_TYPE] {
+            // The preceding refusal evicted the closed carrier.
+            state.reconnect("grid", stale_data_client.clone());
+            let response = build_router(state.clone())
+                .oneshot(
+                    add_expected_echo_headers(
+                        Request::builder()
+                            .method("POST")
+                            .uri("/grid/ping")
+                            .header(header::ACCEPT, accept)
+                            .header(header::CONTENT_TYPE, "application/octet-stream"),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let refusal: c2_error::C2ErrorEnvelope = serde_json::from_slice(&body).unwrap();
+            assert_eq!(
+                refusal.code,
+                c2_error::ErrorCode::RouteWatchUnavailable as u16
+            );
+            assert_eq!(refusal.details["dispatch_phase"], "pre_dispatch");
+        }
         assert!(
             state.local_route("grid").is_some(),
             "watch unavailability alone must not withdraw the route"

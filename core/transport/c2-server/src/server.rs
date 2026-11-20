@@ -3282,10 +3282,7 @@ async fn handle_rpc_record(
                 queue_open_refusal(
                     writer,
                     id,
-                    &C2Error::new(
-                        ErrorCode::ResourceInputDeserializing,
-                        failure.error.to_string(),
-                    ),
+                    &C2Error::new(ErrorCode::ProtocolViolation, failure.error.to_string()),
                 )
                 .await;
             } else if !duplicate {
@@ -3585,7 +3582,7 @@ async fn handle_open_record(
                     queue_open_refusal(
                         writer,
                         id,
-                        &C2Error::new(ErrorCode::ResourceInputDeserializing, error),
+                        &C2Error::new(ErrorCode::ProtocolViolation, error),
                     )
                     .await;
                     return;
@@ -3639,7 +3636,7 @@ async fn handle_open_record(
                     queue_open_refusal(
                         writer,
                         id,
-                        &C2Error::new(ErrorCode::ResourceInputDeserializing, error),
+                        &C2Error::new(ErrorCode::ProtocolViolation, error),
                     )
                     .await;
                     return;
@@ -3932,13 +3929,22 @@ async fn send_route_execution_result(
             .await
             {
                 match error {
-                    ResponseSendError::UserVisible(message)
-                    | ResponseSendError::Capacity(message) => {
+                    ResponseSendError::UserVisible(message) => {
                         write_error_record(
                             writer,
                             request_id,
                             CallStatus::Failed,
                             &error_wire(ErrorCode::ResourceOutputSerializing, message),
+                            false,
+                        )
+                        .await;
+                    }
+                    ResponseSendError::Capacity(message) => {
+                        write_error_record(
+                            writer,
+                            request_id,
+                            CallStatus::Failed,
+                            &error_wire(ErrorCode::CallCapacityExceeded, message),
                             false,
                         )
                         .await;
@@ -3957,7 +3963,7 @@ async fn send_route_execution_result(
             };
             let bytes = match error {
                 RouteExecutionError::Input(message) => {
-                    error_wire(ErrorCode::ResourceInputDeserializing, message)
+                    error_wire(ErrorCode::ProtocolViolation, message)
                 }
                 RouteExecutionError::Crm(CrmError::UserError(bytes)) => {
                     // Re-encode the resource's envelope through the bounded
@@ -4026,7 +4032,7 @@ fn route_admission_error(err: RouteAdmissionError) -> C2Error {
             details.insert("route".into(), route_name.clone());
             details.insert("method_idx".into(), method_idx.to_string());
             (
-                ErrorCode::ResourceFunctionExecuting,
+                ErrorCode::ProtocolViolation,
                 format!("unknown method index {method_idx} for route {route_name}"),
             )
         }
@@ -4460,7 +4466,7 @@ async fn queue_input_error(writer: &Arc<ConnectionWriter>, request_id: u64, erro
     queue_rejection(
         writer,
         request_id,
-        &error_wire(ErrorCode::ResourceInputDeserializing, error),
+        &error_wire(ErrorCode::ProtocolViolation, error),
     )
     .await
 }

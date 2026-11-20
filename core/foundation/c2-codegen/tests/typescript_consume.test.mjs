@@ -5,11 +5,12 @@ import { join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { spawnSync } from 'node:child_process';
 import test from 'node:test';
+import { writeRenderedTypescriptTransport } from './render_typescript_transport.mjs';
 
 async function transportModule() {
   const directory = mkdtempSync(join(tmpdir(), 'c2-consume-'));
   try {
-    const source = fileURLToPath(new URL('../assets/typescript_transport.ts', import.meta.url));
+    const source = writeRenderedTypescriptTransport(directory);
     const localCompiler = fileURLToPath(new URL('../../c2-mem-ffi/bindings/typescript/node_modules/typescript/bin/tsc', import.meta.url));
     const compiler = existsSync(localCompiler) ? process.execPath : process.env.C2_TYPESCRIPT_TSC ?? 'tsc';
     writeFileSync(join(directory, 'package.json'), '{"type":"module"}');
@@ -17,7 +18,7 @@ async function transportModule() {
       ...(existsSync(localCompiler) ? [localCompiler] : []),
       '--strict', '--exactOptionalPropertyTypes', '--target', 'ES2022', '--module', 'ES2022',
       '--moduleResolution', 'Bundler', '--lib', 'ES2022,DOM',
-      '--rootDir', fileURLToPath(new URL('../assets/', import.meta.url)),
+      '--rootDir', directory,
       '--outDir', directory, '--typeRoots', join(directory, 'node_modules', '@types'), source,
     ], {encoding:'utf8'});
     assert.equal(compile.status, 0, compile.stdout + compile.stderr);
@@ -81,10 +82,10 @@ test('HTTP call and observation use route name and contract without a route UID'
     crm_ns:contract.namespace,crm_name:contract.name,crm_ver:contract.version,
     abi_hash:hash,signature_hash:hash,max_payload_size:100};
   const fetch = async (url, init) => {
-    if (url.includes('/_resolve/')) return {status:200,async text(){return JSON.stringify([route])}};
+    if (url.includes('/_resolve/')) return {status:200,async arrayBuffer(){return new TextEncoder().encode(JSON.stringify([route])).buffer}};
     if (url.includes('/_probe/')) {
       assert.equal(retiredHeader in init.headers, false);
-      return {status:200,async text(){return ''}};
+      return {status:200,async arrayBuffer(){return new ArrayBuffer(0)}};
     }
     assert.equal(init.method, 'POST');
     assert.equal(retiredHeader in init.headers, false);

@@ -8,7 +8,7 @@ from functools import wraps
 from typing import Generic, TypeVar, TypedDict, get_args, get_origin
 
 from .. import error
-from .payload_plan import PayloadPlanKind
+from .payload_plan import PayloadPlanKind, decode_stage_of
 
 T = TypeVar('T')
 
@@ -34,20 +34,47 @@ def _native_call(operation, *args, **kwargs):
     return call(operation, *args, **kwargs)
 
 
+def _resource_input_decode_error(exc: BaseException) -> error.SerializationError:
+    code = (
+        error.ErrorCode.ResourceInputFromBuffer
+        if decode_stage_of(exc) == 'from_buffer'
+        else error.ErrorCode.ResourceInputDeserializing
+    )
+    from .transferable import _cause_details, _safe_error_message
+    return error.SerializationError(code, _safe_error_message(exc), details=_cause_details(exc))
+
+
+def _resource_execution_failure(exc: BaseException) -> error.CCError:
+    """Project an exception escaping resource stream code for the dispatch.
+
+    A business ``CCError`` (or a ``CoreError`` semantic payload) keeps its
+    code, message and details on a fresh instance with inner dispatch phases
+    cleared; anything else becomes ``ResourceExecutionError``.
+    """
+    from .transferable import _cause_details, _safe_error_message
+    if issubclass(type(exc), error.CCBaseError):
+        clean = error._callback_semantic_copy(exc)  # type: ignore[arg-type]
+        if clean is not None:
+            return clean
+    return error.ResourceExecutionError(_safe_error_message(exc), details=_cause_details(exc))
+
+
 class Stream(Iterator[T], Generic[T]):
     """Iterate complete items from one native call; close observes its cleanup."""
 
     @classmethod
     def _from_encoded(cls, native_stream, decoder, *, held=False, tracker=None,
-                      route_name='', method_name='', invalidator=None):
+                      route_name='', method_name='', invalidator=None,
+                      decoder_classifies=False):
         stream = cls.__new__(cls)
-        stream._native = native_stream
         stream._decoder = decoder
         stream._held = held
         stream._tracker = tracker
         stream._route_name = route_name
         stream._method_name = method_name
         stream._invalidator = invalidator
+        stream._decoder_classifies = decoder_classifies
+        stream._native = native_stream
         return stream
 
     @classmethod
@@ -59,8 +86,9 @@ class Stream(Iterator[T], Generic[T]):
 
     def __next__(self) -> T:
         from .transferable import (
-            HeldResult, _cause_details, _cleanup_preserving_primary,
-            _invalidate_and_release_held_response, _release_view_and_response,
+            HeldResult, _cleanup_preserving_primary, _client_output_error,
+            _invalidate_and_release_held_response, _is_native_response_owner,
+            _release_view_and_response,
         )
         item = _native_call(self._native.next_item)
         # Native returns a presence flag for object streams, since None is a value.
@@ -71,21 +99,28 @@ class Stream(Iterator[T], Generic[T]):
             return HeldResult(value) if self._held else value
         if item is None:
             raise StopIteration
-        view = memoryview(item)
+        view = None
+        decoding = False
         decoded = False
         checking_deadline = False
         try:
+            view = memoryview(item)
+            decoding = True
             value = self._decoder(view)
+            decoding = False
             decoded = True
             checking_deadline = True
             _native_call(self._native.check_deadline)
             checking_deadline = False
             if self._held:
-                if self._tracker is not None:
+                if self._tracker is not None and hasattr(item, 'track_retained'):
                     item.track_retained(self._tracker, self._route_name,
                                         self._method_name, 'client_response')
                 result = HeldResult(value, buffer=view, invalidate_cb=self._invalidator)
-                result._native_response = item
+                if _is_native_response_owner(item):
+                    result._native_response = item
+                elif callable(getattr(item, 'release', None)):
+                    result._source_buffer = item
                 return result
         except BaseException as exc:
             if not checking_deadline:
@@ -95,23 +130,34 @@ class Stream(Iterator[T], Generic[T]):
                     view, item, self._invalidator, value))
             else:
                 _cleanup_preserving_primary(exc, lambda: _release_view_and_response(view, item))
-            if isinstance(exc, error.CCBaseError):
+            if checking_deadline:
                 raise
-            phase = error.ClientOutputFromBuffer if self._held else error.ClientDeserializeOutput
-            raise phase(str(exc), details=_cause_details(exc)) from exc
-        _release_view_and_response(view, item)
+            if (
+                self._decoder_classifies
+                and decoding
+                and issubclass(type(exc), error.SerializationError)
+                and exc.transport_phase is None  # type: ignore[attr-defined]
+            ):
+                raise
+            raise _client_output_error(exc, decoding=decoding) from exc
+        try:
+            _release_view_and_response(view, item)
+        except BaseException as exc:
+            _cleanup_preserving_primary(exc, lambda: _native_call(self._native.cancel))
+            if self._invalidator is not None:
+                _cleanup_preserving_primary(exc, lambda: self._invalidator(value))
+            raise _client_output_error(exc) from exc
         return value
 
     def close(self, timeout: float | None = 30.0) -> StreamCloseReceipt:
         receipt = _native_call(self._native.close, timeout)
         failure = receipt['error']
-        if failure is not None and getattr(failure, 'error_bytes', None) is not None:
-            canonical = error.CCError.deserialize(memoryview(failure.error_bytes))
-            if canonical is not None:
-                phase = getattr(failure, 'transport_phase', None)
-                if phase is not None:
-                    canonical.details['transport_phase'] = phase
-                receipt['error'] = canonical
+        if failure is not None:
+            projected = error._project_native_error(failure)
+            if projected is not None:
+                # Keep the native CoreError observable as the direct cause.
+                projected.__cause__ = failure
+                receipt['error'] = projected
         return receipt
 
     def __enter__(self) -> Stream[T]:
@@ -124,24 +170,6 @@ class Stream(Iterator[T], Generic[T]):
         native = getattr(self, '_native', None)
         if native is not None:
             native.cancel()
-
-
-class _ResourceFailure(Exception):
-    def __init__(self, failure):
-        super().__init__(str(failure))
-        self.error_bytes = error.CCError.serialize(failure)
-
-
-def _resource_failure(exc, phase):
-    from .transferable import _cause_details
-    if isinstance(exc, _ResourceFailure):
-        return exc
-    if isinstance(exc, error.CoreError) and exc.error_bytes:
-        semantic = error.CCError.deserialize(memoryview(exc.error_bytes))
-        if semantic is not None:
-            return _ResourceFailure(semantic)
-    failure = exc if isinstance(exc, error.CCError) else phase(str(exc), details=_cause_details(exc))
-    return _ResourceFailure(failure)
 
 
 class _ResourceStream:
@@ -180,12 +208,11 @@ class _ResourceStream:
             if not self._borrowed:
                 self._release_request()
         except BaseException as exc:
-            phase = error.ResourceInputFromBuffer if self._borrowed else error.ResourceDeserializeInput
-            raise _resource_failure(exc, phase) from exc
+            raise _resource_input_decode_error(exc) from exc
         try:
             self._iterator = iter(self._factory(*self._args))
         except BaseException as exc:
-            raise _resource_failure(exc, error.ResourceExecuteFunction) from exc
+            raise _resource_execution_failure(exc) from exc
         self._factory = None
 
     def step(self):
@@ -197,14 +224,19 @@ class _ResourceStream:
         except StopIteration:
             return False, None
         except BaseException as exc:
-            raise _resource_failure(exc, error.ResourceExecuteFunction) from exc
+            raise _resource_execution_failure(exc) from exc
         if self._encoded:
             try:
                 value = self._output.serialize(value)
                 if type(value) is not bytes:
                     raise TypeError('stream codec must produce immutable bytes')
             except BaseException as exc:
-                raise _resource_failure(exc, error.ResourceSerializeOutput) from exc
+                from .transferable import _cause_details, _safe_error_message
+                raise error.SerializationError(
+                    error.ErrorCode.ResourceOutputSerializing,
+                    _safe_error_message(exc),
+                    details=_cause_details(exc),
+                ) from exc
         return True, value
 
     def _release_request(self):
@@ -218,7 +250,7 @@ class _ResourceStream:
         return self._context.run(self._cleanup)
 
     def _cleanup(self):
-        from .transferable import _attach_cleanup_error
+        from .transferable import _attach_cleanup_error, _cause_details, _safe_error_message
         failure = None
         iterator = self._iterator
         self._iterator = None
@@ -228,7 +260,7 @@ class _ResourceStream:
                 if close is not None:
                     close()
         except BaseException as exc:
-            failure = _resource_failure(exc, error.ResourceExecuteFunction)
+            failure = _resource_execution_failure(exc)
         finally:
             del iterator
         try:
@@ -236,22 +268,49 @@ class _ResourceStream:
                 for value in self._args:
                     self._input.invalidate(value)
         except BaseException as exc:
-            cleanup = _resource_failure(exc, error.ResourceInputFromBuffer)
+            cleanup = error.SerializationError(
+                error.ErrorCode.ResourceInputFromBuffer,
+                _safe_error_message(exc),
+                details=_cause_details(exc),
+            )
             if failure is None:
                 failure = cleanup
             else:
                 _attach_cleanup_error(failure, cleanup)
+            del cleanup
         try:
             self._release_request()
         except BaseException as exc:
             if failure is None:
-                failure = _resource_failure(exc, error.ResourceInputFromBuffer)
+                failure = error.SerializationError(
+                    error.ErrorCode.ResourceInputFromBuffer,
+                    _safe_error_message(exc),
+                    details=_cause_details(exc),
+                )
             else:
                 _attach_cleanup_error(failure, exc)
         self._args = ()
         self._factory = None
         if failure is not None:
-            raise failure
+            try:
+                raise failure
+            finally:
+                del failure
+
+
+def _cancel_unclaimed_stream(native: object, primary: BaseException) -> None:
+    from .transferable import _attach_cleanup_error
+    try:
+        cancel = getattr(native, 'cancel', None)
+        if callable(cancel):
+            _native_call(cancel)
+    except BaseException as cancel_error:
+        try:
+            _attach_cleanup_error(primary, cancel_error)
+        finally:
+            cancel_error = None
+    finally:
+        primary = None
 
 
 def _build_stream_wrapper(func, input_binding, output_binding):
@@ -288,7 +347,7 @@ def _build_stream_wrapper(func, input_binding, output_binding):
                 native = client.open_direct_stream(method_name, values)
             except Exception as exc:
                 from ..transport.client.proxy import _LocalRouteClosed
-                if not isinstance(exc, _LocalRouteClosed):
+                if not issubclass(type(exc), _LocalRouteClosed):
                     raise
                 if budget is None:
                     budget = self.client.start_call_budget()
@@ -297,25 +356,68 @@ def _build_stream_wrapper(func, input_binding, output_binding):
                     _c2_follow_budget=budget, **kwargs,
                 )
             return Stream._from_objects(native, held=_c2_buffer == 'hold')
+        from .transferable import _client_input_error, _close_prepared_handle
+
         prepared = client.begin_stream(method_name)
+        primary = None
+        dispatched = False
+        unclaimed = None
         try:
             try:
                 if input_binding.kind is PayloadPlanKind.FASTDB:
-                    prepared.charge_input(values[0].execution_report().used_bytes)
-                data = input_binding.serialize(*values) if input_binding.serialize is not None else b''
-            except error.CCBaseError:
-                raise
+                    try:
+                        nbytes = values[0].execution_report().used_bytes
+                    except BaseException as exc:
+                        raise _client_input_error(exc) from exc
+                    prepared.charge_input(nbytes)
+                try:
+                    data = input_binding.serialize(*values) if input_binding.serialize is not None else b''
+                except BaseException as exc:
+                    raise _client_input_error(exc) from exc
+                dispatched = True
+                unclaimed = _native_call(prepared.stream, data)
             except BaseException as exc:
-                from .transferable import _cause_details
-                raise error.ClientSerializeInput(str(exc), details=_cause_details(exc)) from exc
-            native = _native_call(prepared.stream, data)
+                primary = exc
+                raise
+            finally:
+                try:
+                    _close_prepared_handle(prepared, primary, dispatched)
+                except BaseException as close_exc:
+                    if primary is None:
+                        primary = close_exc
+                    close_exc = None
+                    raise
+            try:
+                stream_obj = Stream._from_encoded(
+                    unclaimed, output_binding.deserialize, held=_c2_buffer == 'hold',
+                    tracker=client.local_copy_tracker, route_name=client.route_name,
+                    method_name=method_name, invalidator=output_binding.invalidate,
+                )
+            except BaseException as wrap_exc:
+                primary = wrap_exc
+                clean = error._post_dispatch_cleanup_error(wrap_exc)
+                primary = clean
+                try:
+                    if clean is not wrap_exc:
+                        raise clean from wrap_exc
+                    raise
+                finally:
+                    clean = None
+                    wrap_exc = None
+            unclaimed = None
+            return stream_obj
         finally:
-            prepared.close()
-        return Stream._from_encoded(
-            native, output_binding.deserialize, held=_c2_buffer == 'hold',
-            tracker=client.local_copy_tracker, route_name=client.route_name,
-            method_name=method_name, invalidator=output_binding.invalidate,
-        )
+            try:
+                if unclaimed is not None:
+                    if primary is not None:
+                        _cancel_unclaimed_stream(unclaimed, primary)
+                    else:
+                        cancel = getattr(unclaimed, 'cancel', None)
+                        if callable(cancel):
+                            cancel()
+            finally:
+                unclaimed = None
+                primary = None
 
     invoke._input_payload_binding = input_binding
     invoke._output_payload_binding = output_binding

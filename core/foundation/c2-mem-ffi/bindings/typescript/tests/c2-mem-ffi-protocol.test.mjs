@@ -246,12 +246,14 @@ test('ABI 8 stream retains completed item count after a resource error', {timeou
       try {
         await takeItem(call, 1, 0);
         await takeItem(call, 1, 1);
-        await assert.rejects(() => call.next(), /fixture stream failure/);
+        await assert.rejects(() => call.next(), error =>
+          error.code === 3 && error.transportPhase === undefined &&
+          /fixture stream failure/.test(error.message));
         const receipt = await call.observe(null);
         assert.equal(receipt.completed, true);
         assert.equal(receipt.completeItems, 2n);
         assert.match(receipt.error.message, /fixture stream failure/);
-        assert.equal(typeof receipt.error.nativeDetails, 'object');
+        assert.equal(receipt.error.nativeDetails.transportPhase, undefined);
       } finally { call.close(); }
     } finally { await endpoint.close(); }
   });

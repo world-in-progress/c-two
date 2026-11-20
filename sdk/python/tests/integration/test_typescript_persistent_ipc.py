@@ -135,7 +135,12 @@ def persistent_node_project(tmp_path_factory: pytest.TempPathFactory) -> Iterato
             destination.parent.mkdir(parents=True, exist_ok=True)
             destination.write_bytes(artifact.bytes)
         generated = root / "generated" / name / "typescript/c_two_contract.ts"
-        assert TS_SOURCE.read_text(encoding="utf-8") in generated.read_text(encoding="utf-8"), "native codegen must be rebuilt from this checkout"
+        generated_text = generated.read_text(encoding="utf-8")
+        ts_prefix, ts_suffix = TS_SOURCE.read_text(encoding="utf-8").split(
+            "/* __C2_GENERATED_ERROR_CODE_NAMES__ */ Object.freeze({})", 1,
+        )
+        assert ts_prefix in generated_text and ts_suffix in generated_text, "native codegen must be rebuilt from this checkout"
+        assert "__C2_GENERATED_ERROR_CODE_NAMES__" not in generated_text
     write_node_tsconfig(root)
     _run([node, str(tsc), "--project", str(root / "tsconfig.json")], root, "compile")
     shutil.copyfile(NODE_FIXTURE, root / NODE_FIXTURE.name)

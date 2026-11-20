@@ -103,8 +103,10 @@ def test_decode_failure_cancels_while_caller_keeps_stream(monkeypatch, tmp_path)
         runtime.register(Values, Resource(), name='decode')
         proxy = runtime.connect(Values, name='decode', address=runtime.server_address())
         stream = proxy.steps()
-        with pytest.raises(error.ClientDeserializeOutput, match='decode failed'):
+        with pytest.raises(error.SerializationError, match='decode failed') as decode_failure:
             next(stream)
+        assert int(decode_failure.value.code) == 6
+        assert decode_failure.value.stage == 'deserialize'
         assert cleaned.wait(5), 'decode failure must submit cancellation without relying on GC'
         receipt = stream.close(timeout=None)
         assert receipt['completed']
@@ -245,14 +247,38 @@ def test_direct_ipc_error_after_complete_item_preserves_count(direct_values, met
     _, _, proxy, resource = direct_values
     stream = getattr(proxy, method)()
     assert next(stream) == 0
-    with pytest.raises(error.ResourceExecuteFunction) as raised:
+    with pytest.raises(error.ResourceExecutionError) as raised:
         next(stream)
     assert "failed" in str(raised.value)
     receipt = stream.close()
     assert receipt["completed"] is True
-    assert isinstance(receipt["error"], error.ResourceExecuteFunction)
+    assert isinstance(receipt["error"], error.ResourceExecutionError)
     assert receipt["complete_items"] == 1
     assert resource.events[-1] in ("step-finally", "cleanup-start")
+
+
+def test_zero_deadline_stream_refusal_is_typed_pre_dispatch(direct_values):
+    """A stream entry refusal surfaces as the named deadline subclass.
+
+    The native semantic CoreError stays observable as ``__cause__`` and the
+    unified ``transport_phase`` reads ``pre_dispatch``: the stream never
+    entered the resource and never serialized its input.
+    """
+    _, client, proxy, resource = direct_values
+    view = cc.with_call_options(proxy, timeout=0)
+    try:
+        with pytest.raises(error.CallDeadlineExceeded) as refused:
+            view.steps(3)
+        stream_error = refused.value
+        native = stream_error.__cause__
+        assert type(native) is error.CoreError
+        assert native.category == "semantic"
+        assert int(native.code) == 715
+        assert stream_error.transport_phase == native.transport_phase == "pre_dispatch"
+        assert resource.events == []
+        assert client.call_execution_snapshot()["client"]["used_operations"] == 0
+    finally:
+        cc.close(view)
 
 
 def test_yielded_stream_does_not_occupy_route_worker_or_block_unary(direct_values):

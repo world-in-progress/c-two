@@ -217,11 +217,12 @@ def test_response_admission_preserves_outer_transport_and_inner_semantic_message
                     assert native.transport_phase == 'dispatch_uncertain'
                     assert native.fallback_eligible is False
                     assert native.message == str(native) and native.message != semantic.message
-                    inner = cc.error.CCError.deserialize(native.error_bytes)
+                    inner = native.semantic
                     assert inner.message == semantic.message
                     assert inner.code == native.code == semantic.code
                     assert inner.details == native.details == semantic.details
-                    assert cc.error.CCError.serialize(inner) == native.error_bytes
+                    assert inner is not semantic
+                    assert inner.transport_phase == 'dispatch_uncertain'
                     assert all(getattr(native, field) is None for field in (
                         'io_operation', 'io_kind', 'raw_os_error', 'lifecycle_kind',
                         'endpoint_unverified_reason',

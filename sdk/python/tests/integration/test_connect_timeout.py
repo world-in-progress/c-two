@@ -71,7 +71,11 @@ def stalled_relay():
             body = json.dumps({
                 'version': 1, 'code': 701, 'name': 'ResourceNotFound',
                 'message': 'route not found: connect-timeout',
-                'details': {'transport_phase': 'application_detail', 'route_name': 'connect-timeout'},
+                'details': {
+                    'transport_phase': 'application_detail',
+                    'custom_detail': 'preserved',
+                    'route_name': 'connect-timeout',
+                },
             }).encode()
             self.send_response(404)
             self.send_header('Content-Type', 'application/json')
@@ -141,13 +145,18 @@ def test_stalled_relay_connect_budget_and_recovery(mode, stalled_relay):
         with pytest.raises(recovered_error) as recovered:
             connect(1)
         assert time.monotonic() - started < 1
-        projected = recovered.value if mode == 'explicit' else cc.error.CCError.deserialize(recovered.value.error_bytes)
+        projected = recovered.value if mode == 'explicit' else recovered.value.semantic
         native = recovered.value.__cause__ if mode == 'explicit' else recovered.value
         assert type(native) is cc.error.CoreError
         assert isinstance(projected, cc.error.ResourceNotFound)
         assert projected.message == 'route not found: connect-timeout'
         assert projected.details['route_name'] == 'connect-timeout'
-        assert native.transport_phase == projected.details['transport_phase'] == 'application_detail'
+        # Local acquisition facts take precedence over bogus peer phase keys,
+        # while arbitrary peer diagnostic details survive untouched.
+        assert native.transport_phase == 'pre_dispatch'
+        assert projected.transport_phase == 'pre_dispatch'
+        assert projected.details['transport_phase'] == 'pre_dispatch'
+        assert projected.details['custom_detail'] == 'preserved'
         assert len(paths) > previous_requests
     finally:
         release.set()

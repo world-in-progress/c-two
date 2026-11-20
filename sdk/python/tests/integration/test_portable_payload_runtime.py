@@ -287,8 +287,10 @@ def test_direct_ipc_open_copy_hold_borrowed_invalidation_and_no_payload() -> Non
 
         assert proxy.ping() is None
 
-        with pytest.raises(error.ResourceSerializeOutput) as wrong_output_error:
+        with pytest.raises(error.SerializationError) as wrong_output_error:
             proxy.wrong_output()
+        assert wrong_output_error.value.code == error.ErrorCode.ResourceOutputSerializing
+        assert wrong_output_error.value.stage == 'serialize'
         assert wrong_output_error.value.details["cause_owner"] == "fastdb"
         assert wrong_output_error.value.details["fastdb_code"] == "3006"
         assert wrong_output_error.value.details["fastdb_symbol"] == "DIGEST_MISMATCH"
@@ -306,3 +308,89 @@ def test_direct_ipc_open_copy_hold_borrowed_invalidation_and_no_payload() -> Non
         cc.close(proxy)
         for output in resource.outputs:
             output.close()
+
+
+@pytest.mark.parametrize('stage', ['resource', 'serialize'])
+def test_ipc_borrowed_input_invalidates_once_on_cancellation(stage, monkeypatch):
+    from asyncio import CancelledError
+
+    class CancellingEcho(EchoResource):
+        def save_borrowed(self, payload: Payload) -> Payload:
+            self.saved = payload
+            if stage == 'resource':
+                raise CancelledError('resource cancelled')
+            return payload
+
+    resource = CancellingEcho()
+    invalidated = []
+    binary_bytes = Payload.binary_bytes
+    invalidate = Payload.invalidate
+
+    def cancel_serialization(payload):
+        if payload is resource.saved:
+            assert read_value(payload) == 7
+            raise CancelledError('serialization cancelled')
+        return binary_bytes(payload)
+
+    def record_invalidation(payload):
+        if payload is resource.saved:
+            invalidated.append(payload)
+        invalidate(payload)
+
+    monkeypatch.setattr(Payload, 'binary_bytes', cancel_serialization)
+    monkeypatch.setattr(Payload, 'invalidate', record_invalidation)
+    cc.register(Echo, resource, name='borrowed-cancellation',
+                input_lifetime={'save_borrowed': 'borrowed'})
+    proxy = cc.connect(Echo, name='borrowed-cancellation', address=cc.server_address())
+    source = build_payload()
+    try:
+        failure_type, expected_code = (
+            (error.ResourceExecutionError, error.ErrorCode.ResourceFunctionExecuting)
+            if stage == 'resource'
+            else (error.SerializationError, error.ErrorCode.ResourceOutputSerializing)
+        )
+        with pytest.raises(failure_type, match='cancelled') as caught:
+            proxy.save_borrowed(source)
+        assert caught.value.code == expected_code
+        assert len(invalidated) == 1 and invalidated[0] is resource.saved
+        with pytest.raises(PayloadError) as failure:
+            resource.saved.entry_view(0)
+        assert failure.value.symbol == 'VIEW_INVALIDATED'
+        assert cc.observe.memory_stats()['holds']['active_holds'] == 0
+        assert read_value(source) == 7
+    finally:
+        source.close()
+        cc.close(proxy)
+        if resource.saved is not None:
+            resource.saved.close()
+
+
+def test_held_native_invalidation_failure_has_output_buffer_stage(monkeypatch):
+    primary = error.ResourceClosed('invalidation refused', transport_phase='pre_dispatch')
+
+    def fail(_payload):
+        raise primary
+
+    cc.register(Echo, EchoResource(), name='held-invalidation')
+    proxy = cc.connect(Echo, name='held-invalidation', address=cc.server_address())
+    source = build_payload()
+    held = None
+    try:
+        held = cc.hold(proxy.echo)(source)
+        retained = held.value
+        monkeypatch.setattr(Payload, 'invalidate', fail)
+        with pytest.raises(error.SerializationError) as caught:
+            held.release()
+        assert caught.value.code == error.ErrorCode.ClientOutputFromBuffer
+        assert caught.value.transport_phase is None
+        assert caught.value.__cause__ is primary
+        assert cc.observe.memory_stats()['holds']['active_holds'] == 0
+        with pytest.raises(RuntimeError, match='no longer accessible'):
+            _ = held.value
+        held.release()
+        retained.close()
+    finally:
+        if held is not None:
+            held.release()
+        source.close()
+        cc.close(proxy)

@@ -383,6 +383,7 @@ jobs:
             npm run --prefix ../fastdb/ts/fastdb4ts build:wasm
           fi
           npm run --prefix ../fastdb/ts/fastdb4ts build
+          cargo fetch --locked --manifest-path core/Cargo.toml
           npm test --prefix core/foundation/c2-mem-ffi/bindings/typescript
           git -C ../fastdb diff --exit-code -- ts/fastdb4ts/src/wasm
           {

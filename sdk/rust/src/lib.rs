@@ -23,8 +23,9 @@ pub use c2_core::{
     EnvFilePolicy, EnvMap, Host, HostOptions, LifecycleError, Registration, RouteConcurrency,
     RouteConcurrencyError, RouteConcurrencyGuard, Runtime, RuntimeOptions, ServerConfigOverrides,
     ServerConfigPatch, ServerFailure, ServerStartupStage, ServerStartupTimeout,
-    ServiceConcurrencyMode, ServiceDefinition,
+    ServiceConcurrencyMode, ServiceDefinition, TransportPhase,
 };
+pub use c2_error::{C2Error, ErrorCode, ErrorSide, ErrorStage};
 pub use error::Error;
 pub use held::Held;
 pub use stream::ResponseStream;

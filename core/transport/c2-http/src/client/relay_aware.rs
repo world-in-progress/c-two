@@ -643,10 +643,20 @@ fn route_not_found(err: &HttpError) -> bool {
         HttpError::ResponseError(status, body) => (*status, body.as_ref()),
         _ => return false,
     };
-    let Ok(body) = std::str::from_utf8(body) else {
+    if status != 404 {
         return false;
-    };
-    status == 404 && relay_error_code_is(body, c2_error::ErrorCode::ResourceNotFound)
+    }
+    c2_error::C2Error::from_json_bytes(body).is_ok_and(|error| {
+        error.code == c2_error::ErrorCode::ResourceNotFound
+            && error
+                .details
+                .get("dispatch_phase")
+                .is_none_or(|phase| phase == "pre_dispatch")
+            && error
+                .details
+                .get("transport_phase")
+                .is_none_or(|phase| phase == "pre_dispatch")
+    })
 }
 
 fn terminal_route_refusal(err: &HttpError) -> bool {
@@ -655,10 +665,7 @@ fn terminal_route_refusal(err: &HttpError) -> bool {
         HttpError::ResponseError(_, body) => body.as_ref(),
         _ => return false,
     };
-    let Ok(envelope) = serde_json::from_slice::<c2_error::C2ErrorEnvelope>(body) else {
-        return false;
-    };
-    c2_error::C2Error::from_envelope(envelope).is_ok_and(|error| {
+    c2_error::C2Error::from_json_bytes(body).is_ok_and(|error| {
         matches!(
             error.code,
             c2_error::ErrorCode::RouteConflict
@@ -671,18 +678,24 @@ fn terminal_route_refusal(err: &HttpError) -> bool {
 
 fn relay_rejection_is_pre_dispatch(error: &HttpError) -> bool {
     let body = match error {
-        HttpError::ResponseError(404 | 406 | 409 | 410 | 429 | 502 | 503, body) => body.as_ref(),
-        HttpError::ServerError(404 | 406 | 409 | 410 | 429 | 502 | 503, body) => body.as_bytes(),
+        HttpError::ResponseError(404 | 406 | 409 | 410 | 413 | 429 | 502 | 503, body) => {
+            body.as_ref()
+        }
+        HttpError::ServerError(404 | 406 | 409 | 410 | 413 | 429 | 502 | 503, body) => {
+            body.as_bytes()
+        }
         _ => return false,
     };
-    let Ok(envelope) = serde_json::from_slice::<c2_error::C2ErrorEnvelope>(body) else {
-        return false;
-    };
-    c2_error::C2Error::from_envelope(envelope).is_ok_and(|error| {
-        error
-            .details
-            .get("dispatch_phase")
-            .is_some_and(|phase| phase == "pre_dispatch")
+    c2_error::C2Error::from_json_bytes(body).is_ok_and(|error| {
+        error.code != c2_error::ErrorCode::Unknown
+            && error
+                .details
+                .get("dispatch_phase")
+                .is_some_and(|phase| phase == "pre_dispatch")
+            && error
+                .details
+                .get("transport_phase")
+                .is_none_or(|phase| phase == "pre_dispatch")
     })
 }
 
@@ -704,6 +717,7 @@ fn http_call_error_phase(error: &HttpError) -> HttpCallPhase {
     }
 }
 
+#[cfg(test)]
 fn relay_error_code_is(body: &str, expected: c2_error::ErrorCode) -> bool {
     let Ok(envelope) = serde_json::from_str::<c2_error::C2ErrorEnvelope>(body) else {
         return false;
@@ -1255,6 +1269,33 @@ mod tests {
         assert_eq!(
             http_call_error_phase(&HttpError::ServerError(502, capacity_rejected.to_string())),
             HttpCallPhase::PreDispatch
+        );
+        assert_eq!(
+            http_call_error_phase(&HttpError::ServerError(413, capacity_rejected.to_string())),
+            HttpCallPhase::PreDispatch
+        );
+        assert_eq!(
+            http_call_error_phase(&HttpError::ServerError(
+                413,
+                "<html>Request Entity Too Large</html>".to_string()
+            )),
+            HttpCallPhase::DispatchUncertain
+        );
+
+        let mut conflict_504 =
+            canonical_error_json(719, "RouteConflict", "gateway timeout", "grid");
+        conflict_504["details"]["dispatch_phase"] = json!("pre_dispatch");
+        assert_eq!(
+            http_call_error_phase(&HttpError::ServerError(504, conflict_504.to_string())),
+            HttpCallPhase::DispatchUncertain
+        );
+
+        let mut unknown_future =
+            canonical_error_json(720, "FutureRefusal", "unrecognized code", "grid");
+        unknown_future["details"]["dispatch_phase"] = json!("pre_dispatch");
+        assert_eq!(
+            http_call_error_phase(&HttpError::ServerError(503, unknown_future.to_string())),
+            HttpCallPhase::DispatchUncertain
         );
 
         let mut failed_after_callback = rejected.clone();
@@ -3011,6 +3052,59 @@ mod tests {
         #[tokio::test]
         async fn short_content_length_mid_call_end_is_dispatch_uncertain() {
             truncated_response_is_dispatch_uncertain(false).await;
+        }
+    }
+
+    #[test]
+    fn http_call_error_phase_rejects_contradictory_404_and_array_envelopes() {
+        fn response_error(status: u16, body: &[u8]) -> HttpError {
+            let bytes = body.to_vec();
+            let budget = crate::payload::memory_only_budget(bytes.capacity().max(1) as u64);
+            let reservation = budget.try_reserve_memory(bytes.capacity() as u64).unwrap();
+            HttpError::ResponseError(status, BudgetedBuffer::new(bytes, reservation))
+        }
+
+        let ok_404 = response_error(
+            404,
+            br#"{"version":1,"code":701,"name":"ResourceNotFound","message":"missing","details":{}}"#,
+        );
+        assert_eq!(http_call_error_phase(&ok_404), HttpCallPhase::PreDispatch);
+
+        for uncertain in [
+            response_error(
+                404,
+                br#"{"version":1,"code":701,"name":"ResourceNotFound","message":"missing","details":{"dispatch_phase":"dispatch_uncertain"}}"#,
+            ),
+            response_error(
+                404,
+                br#"{"version":1,"code":701,"name":"ResourceNotFound","message":"missing","details":{"transport_phase":"dispatch_uncertain"}}"#,
+            ),
+            response_error(
+                503,
+                br#"[1,717,"CallCapacityExceeded","array",{"dispatch_phase":"pre_dispatch"}]"#,
+            ),
+            response_error(
+                404,
+                b"{\"version\":1,\"code\":701,\"name\":\"ResourceNotFound\",\"message\":\"missing\",\"details\":{},\"extra\":\"bad\xff\"}",
+            ),
+            response_error(
+                503,
+                b"\xef\xbb\xbf{\"version\":1,\"code\":717,\"name\":\"CallCapacityExceeded\",\"message\":\"cap\",\"details\":{\"dispatch_phase\":\"pre_dispatch\"}}",
+            ),
+            response_error(
+                503,
+                b"{\"version\":1,\"code\":717,\"name\":\"CallCapacityExceeded\",\"message\":\"bad \\ud800\",\"details\":{\"dispatch_phase\":\"pre_dispatch\"}}",
+            ),
+            response_error(
+                503,
+                b"{\"version\":1,\"code\":717,\"name\":\"CallCapacityExceeded\",\"message\":\"cap\",\"details\":{\"k\":1,\"k\":\"ok\",\"dispatch_phase\":\"pre_dispatch\"}}",
+            ),
+        ] {
+            assert_eq!(
+                http_call_error_phase(&uncertain),
+                HttpCallPhase::DispatchUncertain,
+                "expected DispatchUncertain for {uncertain:?}"
+            );
         }
     }
 }

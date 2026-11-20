@@ -179,3 +179,19 @@ def test_relay_client_env_file(tmp_path):
 
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == "relay_url=http://127.0.0.1:9137"
+
+
+@pytest.mark.parametrize('script', ['relay_client.py', 'relay_resource.py'])
+def test_explicit_relay_url_bypasses_invalid_env_file(script, tmp_path):
+    env_file = tmp_path / '.env'
+    env_file.write_text('C2_RELAY_ANCHOR_ADDRESS="unterminated\n', encoding='utf-8')
+    env = {'C2_ENV_FILE': str(env_file)}
+    url = 'http://127.0.0.1:9140'
+
+    explicit = _parse_args(script, ['--relay-url', url], env=env)
+    assert explicit.returncode == 0, explicit.stderr
+    assert f'relay_url={url}' in explicit.stdout.splitlines()
+
+    default = _parse_args(script, [], env=env)
+    assert default.returncode == 2
+    assert 'failed to parse env file' in default.stderr

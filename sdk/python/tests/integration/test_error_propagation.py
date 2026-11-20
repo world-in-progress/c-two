@@ -2,7 +2,7 @@
 Comprehensive error propagation tests for the c-two RPC framework.
 
 Verifies that every error type is correctly classified, propagated as a single
-layer (no re-wrapping), and deserialized to proper subclass types.
+layer (no re-wrapping), and projected to proper subclass types.
 """
 import time
 import threading
@@ -12,12 +12,10 @@ import pytest
 from tests.fixtures import local_server
 
 import c_two as cc
-from c_two.transport.server import Server
 from c_two.transport.client.util import ping
 from c_two.error import (
-    ERROR_Code, CCBaseError, CCError,
-    ResourceDeserializeInput, ResourceSerializeOutput, ResourceExecuteFunction,
-    ClientSerializeInput, ClientDeserializeOutput, ClientCallResource,
+    ErrorCode, CCBaseError, CCError, CoreError,
+    ResourceExecutionError, SerializationError, ResourceClosed, ResourceRemoved,
 )
 from tests.fixtures.hello import HelloImpl
 from tests.fixtures.ihello import Hello, HelloData
@@ -76,46 +74,49 @@ def error_server():
 # ---------------------------------------------------------------------------
 # Class 1 — CRM execution errors
 # ---------------------------------------------------------------------------
-class TestResourceExecuteFunction:
-    """Errors raised inside a CRM method should surface as ResourceExecuteFunction."""
+class TestResourceExecutionError:
+    """Plain exceptions raised inside a CRM method surface as ResourceExecutionError."""
 
     def test_value_error_in_crm(self, error_server):
         with cc.connect(Hello, name='hello', address=error_server) as crm:
-            with pytest.raises(ResourceExecuteFunction) as exc_info:
+            with pytest.raises(ResourceExecutionError) as exc_info:
                 crm.add(1, 2)
             err = exc_info.value
-            assert err.code == ERROR_Code.ERROR_AT_RESOURCE_FUNCTION_EXECUTING
+            assert err.code == ErrorCode.ResourceFunctionExecuting
             assert 'division by zero' in str(err)
+            assert err.transport_phase is None
 
     def test_type_error_in_crm(self, error_server):
         with cc.connect(Hello, name='hello', address=error_server) as crm:
-            with pytest.raises(ResourceExecuteFunction) as exc_info:
+            with pytest.raises(ResourceExecutionError) as exc_info:
                 crm.greeting('test')
             assert 'name must be str' in str(exc_info.value)
 
     def test_runtime_error_in_crm(self, error_server):
         with cc.connect(Hello, name='hello', address=error_server) as crm:
-            with pytest.raises(ResourceExecuteFunction) as exc_info:
+            with pytest.raises(ResourceExecutionError) as exc_info:
                 crm.get_data(1)
             assert 'database unavailable' in str(exc_info.value)
 
     def test_error_is_proper_subclass(self, error_server):
         with cc.connect(Hello, name='hello', address=error_server) as crm:
-            with pytest.raises(ResourceExecuteFunction) as exc_info:
+            with pytest.raises(ResourceExecutionError) as exc_info:
                 crm.add(1, 2)
             err = exc_info.value
-            assert isinstance(err, ResourceExecuteFunction)
             assert isinstance(err, CCError)
             assert isinstance(err, CCBaseError)
             assert isinstance(err, Exception)
+            assert err.side == 'resource'
+            assert err.stage == 'execute'
 
     def test_no_multi_layer_wrapping(self, error_server):
         """Server-side CRM errors must NOT be re-wrapped into a client error."""
         with cc.connect(Hello, name='hello', address=error_server) as crm:
-            with pytest.raises(ResourceExecuteFunction) as exc_info:
+            with pytest.raises(ResourceExecutionError) as exc_info:
                 crm.add(1, 2)
-            err_str = str(exc_info.value)
-            assert 'ERROR_AT_COMPO' not in err_str
+            err = exc_info.value
+            assert int(err.code) == 3
+            assert err.code != ErrorCode.ClientOutputDeserializing
 
     def test_error_propagates_through_connect_crm(self, error_server):
         """connect_crm must NOT swallow exceptions — they must reach the caller."""
@@ -125,7 +126,74 @@ class TestResourceExecuteFunction:
 
 
 # ---------------------------------------------------------------------------
-# Class 2 — Client errors
+# Class 2 — Business CCError preservation across transports
+# ---------------------------------------------------------------------------
+class BusinessHello(Hello):
+    def add(self, a: int, b: int) -> int:
+        raise ResourceRemoved('grid withdrawn by owner', details={
+            'route': 'grid', 'reason': 'owner_withdrawal',
+        })
+
+    def greeting(self, name: str) -> str:
+        raise ResourceRemoved('grid withdrawn by owner', details={
+            'route': 'grid', 'reason': 'owner_withdrawal',
+        })
+
+    def get_data(self, id: int) -> HelloData:
+        raise ResourceRemoved('grid withdrawn by owner', details={
+            'route': 'grid', 'reason': 'owner_withdrawal',
+        })
+
+
+@pytest.fixture
+def business_server():
+    address = f'ipc://business_test_{_next_id()}'
+    server = local_server(address)
+    server.register_crm(Hello, BusinessHello(), name='hello')
+    server.start()
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        try:
+            if ping(address, timeout=0.5):
+                break
+        except Exception:
+            pass
+        time.sleep(0.05)
+    yield address
+    server.shutdown()
+
+
+class TestBusinessErrorPreservation:
+    def test_named_ccerror_keeps_type_and_details_over_ipc(self, business_server):
+        with cc.connect(Hello, name='hello', address=business_server) as crm:
+            with pytest.raises(ResourceRemoved) as exc_info:
+                crm.add(1, 2)
+            err = exc_info.value
+            assert int(err.code) == 708
+            assert err.message == 'grid withdrawn by owner'
+            assert err.details == {'route': 'grid', 'reason': 'owner_withdrawal'}
+            assert err.transport_phase is None
+
+    def test_named_ccerror_keeps_type_through_same_process_call(self):
+        from c_two.transport.client.proxy import CRMProxy
+
+        crm = Hello()
+        crm.client = CRMProxy.thread_local(BusinessHello(), name='hello')
+        with pytest.raises(ResourceRemoved) as exc_info:
+            crm.add(1, 2)
+        err = exc_info.value
+        assert err.message == 'grid withdrawn by owner'
+        assert err.details['reason'] == 'owner_withdrawal'
+        assert err.transport_phase is None
+        # The business-created original exception object is never mutated.
+        original = exc_info.value.__cause__
+        assert original is not None
+        assert original.transport_phase is None
+        assert original.details == {'route': 'grid', 'reason': 'owner_withdrawal'}
+
+
+# ---------------------------------------------------------------------------
+# Class 3 — Client errors
 # ---------------------------------------------------------------------------
 class TestClientError:
     """Errors triggered by client connectivity problems."""
@@ -142,69 +210,31 @@ class TestClientError:
 
 
 # ---------------------------------------------------------------------------
-# Class 3 — Error serialization round-trips
+# Class 4 — Error round-trips (copy/pickle)
 # ---------------------------------------------------------------------------
-ALL_SUBCLASSES = [
-    ResourceDeserializeInput, ResourceSerializeOutput, ResourceExecuteFunction,
-    ClientSerializeInput, ClientDeserializeOutput, ClientCallResource,
+ROUND_TRIP_CASES = [
+    CCError(ErrorCode.Unknown, 'generic failure'),
+    CCError(ErrorCode.ClientCallingResource, 'call failed', {'route': 'grid'}),
+    ResourceExecutionError('resource raised'),
+    SerializationError(ErrorCode.ResourceInputDeserializing, 'bad input'),
+    SerializationError(ErrorCode.ClientOutputFromBuffer, 'bad view', {'cause_owner': 'fastdb'}),
+    ResourceClosed('route closed', {'route': 'grid'}),
+    ResourceRemoved('withdrawn'),
 ]
 
 
-class TestErrorDeserialization:
-    """Verify serialize → deserialize returns the proper subclass."""
+class TestErrorRoundTrips:
+    @pytest.mark.parametrize('original', ROUND_TRIP_CASES, ids=lambda c: type(c).__name__)
+    def test_copy_and_pickle_preserve_type_and_payload(self, original):
+        import copy
+        import pickle
 
-    def test_crm_execute_function_round_trip(self):
-        original = ResourceExecuteFunction('test msg')
-        data = CCError.serialize(original)
-        restored = CCError.deserialize(memoryview(data))
-        assert isinstance(restored, ResourceExecuteFunction)
-        assert restored.code == ERROR_Code.ERROR_AT_RESOURCE_FUNCTION_EXECUTING
-        assert 'test msg' in restored.message
-
-    def test_crm_deserialize_input_round_trip(self):
-        original = ResourceDeserializeInput('bad payload')
-        data = CCError.serialize(original)
-        restored = CCError.deserialize(memoryview(data))
-        assert isinstance(restored, ResourceDeserializeInput)
-        assert restored.code == ERROR_Code.ERROR_AT_RESOURCE_INPUT_DESERIALIZING
-        assert 'bad payload' in restored.message
-
-    @pytest.mark.parametrize('subclass', ALL_SUBCLASSES, ids=lambda c: c.__name__)
-    def test_all_error_types_round_trip(self, subclass):
-        original = subclass('round-trip detail')
-        data = CCError.serialize(original)
-        restored = CCError.deserialize(memoryview(data))
-        assert isinstance(restored, subclass)
-        assert restored.code == original.code
-        assert 'round-trip detail' in restored.message
-
-    def test_unknown_code_returns_ccerror(self):
-        """An unrecognised numeric code should deserialize as plain CCError."""
-        raw = CCError.serialize(CCError(ERROR_Code.ERROR_UNKNOWN, "mysterious failure"))
-        restored = CCError.deserialize(memoryview(raw))
-        assert type(restored) is CCError
-        assert restored.code == ERROR_Code.ERROR_UNKNOWN
-        assert restored.message == 'mysterious failure'
-
-
-# ---------------------------------------------------------------------------
-# Class 4 — Error constructor contracts
-# ---------------------------------------------------------------------------
-class TestErrorConstructors:
-    """Validate that subclass constructors behave correctly with None / custom messages."""
-
-    @pytest.mark.parametrize('subclass', ALL_SUBCLASSES, ids=lambda c: c.__name__)
-    def test_none_message_has_description(self, subclass):
-        err = subclass(message=None)
-        assert err.message, f'{subclass.__name__} with message=None produced empty message'
-        assert len(err.message) > 0
-
-    @pytest.mark.parametrize('subclass', ALL_SUBCLASSES, ids=lambda c: c.__name__)
-    def test_message_preserves_detail(self, subclass):
-        err = subclass(message='detail')
-        assert 'detail' in err.message
-        # The description prefix must also be present (not overwritten by detail)
-        assert 'Error occurred' in err.message
+        for restored in (copy.copy(original), pickle.loads(pickle.dumps(original))):
+            assert type(restored) is type(original)
+            assert restored.code == original.code
+            assert restored.message == original.message
+            assert restored.details == original.details
+            assert restored.transport_phase == original.transport_phase
 
 
 # ---------------------------------------------------------------------------
@@ -214,31 +244,23 @@ class TestSingleLayerPropagation:
     """End-to-end tests ensuring errors propagate as a single layer."""
 
     def test_server_error_single_layer(self, error_server):
-        """Error string should be exactly 2 lines: code+description and original error."""
+        """The error string is one line: code name plus the original message."""
         with cc.connect(Hello, name='hello', address=error_server) as crm:
-            with pytest.raises(ResourceExecuteFunction) as exc_info:
+            with pytest.raises(ResourceExecutionError) as exc_info:
                 crm.add(1, 2)
-            lines = str(exc_info.value).strip().splitlines()
-            # Line 1: "ERROR_AT_RESOURCE_FUNCTION_EXECUTING: Error occurred when executing function at CRM:"
-            # Line 2: "division by zero"
-            assert len(lines) == 2, (
-                f'Expected 2-line error (single layer), got {len(lines)} lines:\n'
-                + '\n'.join(lines)
-            )
+            assert str(exc_info.value) == 'ResourceFunctionExecuting: division by zero'
 
     def test_error_code_correct(self, error_server):
-        """Error code must be CRM_FUNCTION_EXECUTING, not OUTPUT_SERIALIZING."""
+        """Error code must be ResourceFunctionExecuting, not a codec code."""
         with cc.connect(Hello, name='hello', address=error_server) as crm:
-            with pytest.raises(ResourceExecuteFunction) as exc_info:
+            with pytest.raises(ResourceExecutionError) as exc_info:
                 crm.add(1, 2)
-            assert exc_info.value.code == ERROR_Code.ERROR_AT_RESOURCE_FUNCTION_EXECUTING
-            assert exc_info.value.code != ERROR_Code.ERROR_AT_RESOURCE_OUTPUT_SERIALIZING
+            assert exc_info.value.code == ErrorCode.ResourceFunctionExecuting
+            assert exc_info.value.code != ErrorCode.ResourceOutputSerializing
 
     def test_original_error_info_preserved(self, error_server):
-        """The original exception message must survive serialization round-trip."""
+        """The original exception message survives without being prefixed."""
         with cc.connect(Hello, name='hello', address=error_server) as crm:
-            with pytest.raises(ResourceExecuteFunction) as exc_info:
+            with pytest.raises(ResourceExecutionError) as exc_info:
                 crm.greeting('test')
-            msg = exc_info.value.message
-            assert 'name must be str' in msg
-            assert 'executing function at resource' in msg
+            assert exc_info.value.message == 'name must be str'

@@ -10,7 +10,7 @@ import c_two as cc
 from c_two.crm.contract import CRMContract
 from c_two.transport import registry
 from c_two.transport.client.proxy import CRMProxy
-from .test_runtime import Echo, EchoResource, isolated_settings, runtimes  # noqa: F401
+from .test_runtime import Echo, EchoResource, isolated_runtime, runtimes  # noqa: F401
 
 
 def _share_endpoint(server, client):

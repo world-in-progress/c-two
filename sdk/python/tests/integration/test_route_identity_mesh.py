@@ -216,7 +216,9 @@ def test_peer_registration_rejects_second_host(mesh):
     assert rejected["error"] == "ResourceAlreadyRegistered"
     assert rejected["details"], "canonical relay registration details must survive the Core receipt"
     _holders(rejected["details"], {a.relay_id})
-    assert rejected["message"] == f"Route name already registered with relay: {name!r}"
+    # The canonical relay refusal message survives the Core receipt; the SDK
+    # never overwrites it with its own outer diagnostic.
+    assert rejected["message"] == f"route already registered: {name}"
     assert rejected["native"]["status_code"] == 409
     assert rejected["native"]["failure_source"] == "relay_prepare"
     rollback = rejected["native"]["rollback"]

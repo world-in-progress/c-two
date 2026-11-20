@@ -73,7 +73,12 @@ def node_stream_project(tmp_path_factory):
         destination.parent.mkdir(parents=True, exist_ok=True)
         destination.write_bytes(artifact.bytes)
     generated = root / "generated/typescript/c_two_contract.ts"
-    assert TS_SOURCE.read_text(encoding="utf-8") in generated.read_text(encoding="utf-8"), "rebuild C-Two native codegen from this checkout"
+    generated_text = generated.read_text(encoding="utf-8")
+    ts_prefix, ts_suffix = TS_SOURCE.read_text(encoding="utf-8").split(
+        "/* __C2_GENERATED_ERROR_CODE_NAMES__ */ Object.freeze({})", 1,
+    )
+    assert ts_prefix in generated_text and ts_suffix in generated_text, "rebuild C-Two native codegen from this checkout"
+    assert "__C2_GENERATED_ERROR_CODE_NAMES__" not in generated_text
     payload_sources = list((root / "generated/typescript/payloads").glob("*/*.ts"))
     assert len(payload_sources) == 1
     write_node_tsconfig(root)

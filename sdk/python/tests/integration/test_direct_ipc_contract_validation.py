@@ -5,7 +5,6 @@ from collections.abc import Callable
 import pytest
 
 import c_two as cc
-from c_two.config.settings import settings
 from c_two.crm.contract import crm_contract
 from c_two.error import ContractMismatch
 from c_two.transport.registry import _get_default_runtime, _reset_default_runtime
@@ -13,12 +12,9 @@ from c_two.transport.registry import _get_default_runtime, _reset_default_runtim
 
 @pytest.fixture(autouse=True)
 def _clean_registry():
-    previous_relay = settings.relay_anchor_address
-    settings.relay_anchor_address = None
     _reset_default_runtime()
     yield
     _reset_default_runtime()
-    settings.relay_anchor_address = previous_relay
 
 
 class CountingResource:
@@ -133,10 +129,13 @@ def test_explicit_direct_ipc_rejects_same_tag_contract_fingerprint_mismatch_with
     address = cc.server_address()
     assert address is not None
 
-    settings.relay_anchor_address = "http://127.0.0.1:9"
-
-    with pytest.raises(ContractMismatch, match="CRM contract mismatch"):
-        cc.connect(client_contract, name="grid", address=address)
+    client = cc.Runtime()
+    client.set_relay_anchor("http://127.0.0.1:9")
+    try:
+        with pytest.raises(ContractMismatch, match="CRM contract mismatch"):
+            client.connect(client_contract, name="grid", address=address)
+    finally:
+        client.shutdown()
 
     assert resource.calls == []
 
@@ -147,13 +146,13 @@ def test_direct_ipc_connect_succeeds_with_bad_relay_setting_when_contract_matche
     address = cc.server_address()
     assert address is not None
 
-    settings.relay_anchor_address = "http://127.0.0.1:9"
-
-    proxy = cc.connect(contract, name="grid", address=address)
+    client = cc.Runtime()
+    client.set_relay_anchor("http://127.0.0.1:9")
     try:
-        assert proxy.echo("ok") == "ok"
+        with client.connect(contract, name="grid", address=address) as proxy:
+            assert proxy.echo("ok") == "ok"
     finally:
-        cc.close(proxy)
+        client.shutdown()
 
 
 def test_runtime_session_rejects_direct_ipc_expected_contract_missing_or_malformed_hashes():

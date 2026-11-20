@@ -21,8 +21,8 @@ from urllib.request import ProxyHandler, Request, build_opener
 
 from typing import Literal
 import c_two as cc
+import c_two.endpoint
 from tests.fixtures.process_control import portable_command, readline_with_timeout
-from c_two.config.settings import settings
 from c_two.transport.registry import _reset_default_runtime
 from fastdb4py.payload import Payload, PayloadError, View
 
@@ -627,12 +627,16 @@ def wait_for_contract_resolution(
         }
     )
     url = f"{relay_url}/_resolve/{quote(route_name, safe='')}?{query}"
+    request = Request(
+        url,
+        headers={"x-c2-local-namespace": cc.endpoint.local_endpoint_context().namespace_id},
+    )
     opener = build_opener(ProxyHandler({}))
     deadline = time.monotonic() + 10
     last_error: Exception | None = None
     while time.monotonic() < deadline:
         try:
-            with opener.open(url, timeout=1) as response:
+            with opener.open(request, timeout=1) as response:
                 routes = json.loads(response.read())
             if len(routes) == 1:
                 route = routes[0]
@@ -684,7 +688,6 @@ def configure_python_runtime(
     relay_url: str | None,
 ) -> None:
     _reset_default_runtime()
-    settings.relay_anchor_address = None
     if relay_url is not None:
         cc.set_relay_anchor(relay_url)
     if server:

@@ -78,15 +78,15 @@ def test_registration_canonical_error_preserves_type_details_and_receipt(
         error = refused.value
         assert int(error.code) == code
         assert error.details == details
-        if code == 703:
-            assert error.message == f"Route name already registered with relay: {route!r}"
-        else:
-            assert error.message == f"registration failed at relay_prepare: {body.decode()}"
+        # A canonical semantic refusal keeps its own message: the outer
+        # lifecycle diagnostic never overwrites it, including for 703.
+        assert error.message == "canonical registration refusal"
         native = error.__cause__
         assert native.category == "lifecycle"
         assert native.status_code == status
         assert native.code == code
         assert native.name == name
+        assert native.semantic_message == "canonical registration refusal"
         assert native.details == details
         receipt = native.registration_failure
         assert receipt["failure_source"] == "relay_prepare"

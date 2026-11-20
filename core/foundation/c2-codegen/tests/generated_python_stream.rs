@@ -30,8 +30,10 @@ fn generated_python_stream_client_reserves_before_encoding_and_decodes_each_item
 
 const CONSUMER: &str = r#"
 import importlib.util
+import gc
 import sys
 import types
+import weakref
 
 events = []
 
@@ -68,8 +70,9 @@ class HeldResult:
 class Stream:
     @classmethod
     def _from_encoded(cls, native, decoder, *, held=False, invalidator=None,
-                      tracker=None, route_name='', method_name=''):
-        events.append(('wrap', held, tracker, route_name, method_name))
+                      tracker=None, route_name='', method_name='',
+                      decoder_classifies=False):
+        events.append(('wrap', held, tracker, route_name, method_name, decoder_classifies))
         values = [decoder(data) for data in native]
         if held:
             values = [HeldResult(value, invalidator) for value in values]
@@ -87,10 +90,58 @@ for name, value in {'Payload': Payload, 'CompiledSpec': CompiledSpec,
     setattr(payload_module, name, value)
 sys.modules['fastdb4py'] = fastdb
 sys.modules['fastdb4py.payload'] = payload_module
+
+class CCBaseError(Exception):
+    pass
+
+class ErrorCode:
+    Unknown = 0
+    ResourceInputDeserializing = 1
+    ResourceOutputSerializing = 2
+    ResourceFunctionExecuting = 3
+    ResourceInputFromBuffer = 4
+    ClientInputSerializing = 5
+    ClientOutputDeserializing = 6
+    ClientCallingResource = 7
+    ClientOutputFromBuffer = 8
+
+def SerializationError(code, message=None, details=None, transport_phase=None):
+    error = CCBaseError(f'{int(code)}: {message}')
+    error.code = int(code)
+    error.details = dict(details or {})
+    error.transport_phase = transport_phase
+    return error
+
+class NativeFailure(Exception):
+    pass
+
+projected_refs = []
+def _project_native_error(exc):
+    if isinstance(exc, NativeFailure):
+        projected = CCBaseError('projected')
+        projected_refs.append(weakref.ref(projected))
+        return projected
+    return None
+
+def _post_dispatch_cleanup_error(exc):
+    if getattr(exc, 'transport_phase', None) is not None:
+        cleaned = CCBaseError(str(exc))
+        cleaned.transport_phase = None
+        return cleaned
+    return exc
+
 c_two = types.ModuleType('c_two')
 c_two.Stream = Stream
 c_two.HeldResult = HeldResult
+error_module = types.ModuleType('c_two.error')
+error_module.CCBaseError = CCBaseError
+error_module.ErrorCode = ErrorCode
+error_module.SerializationError = SerializationError
+error_module._post_dispatch_cleanup_error = _post_dispatch_cleanup_error
+error_module._project_native_error = _project_native_error
+c_two.error = error_module
 sys.modules['c_two'] = c_two
+sys.modules['c_two.error'] = error_module
 
 spec = importlib.util.spec_from_file_location('contract', sys.argv[1])
 contract = importlib.util.module_from_spec(spec)
@@ -126,17 +177,130 @@ events.clear()
 items = client.method_1_echo(Payload())
 assert [item.data for item in items] == [b'first', b'second']
 assert events[:5] == [('begin', 'echo'), 'size', ('charge', 5), 'digest', 'encode'], events
-assert events[5:8] == [
+assert events[5:9] == [
     ('stream', b'input'),
-    ('wrap', False, Bound.local_copy_tracker, 'generated-stream', 'echo'),
+    'close',
+    ('wrap', False, Bound.local_copy_tracker, 'generated-stream', 'echo', True),
     ('decode', b'first'),
 ], events
-assert events[-1] == 'close', events
+assert events.count('close') == 1, events
 events.clear()
 held = client.hold_method_1_echo(Payload())
 assert [item.value.data for item in held] == [b'first', b'second']
-assert ('wrap', True, Bound.local_copy_tracker, 'generated-stream', 'echo') in events, events
+assert ('wrap', True, Bound.local_copy_tracker, 'generated-stream', 'echo', True) in events, events
+assert held[0].invalidator is Payload.invalidate
 held[0].release()
 assert events[-1] == ('invalidate', b'first'), events
 assert events.count('close') == 1, events
+
+# Projection must not retain the projected exception through its own frame.
+gc.disable()
+def fail_begin(method):
+    raise NativeFailure('begin')
+bound = Bound()
+bound.begin_stream = fail_begin
+try:
+    contract.ContractClient(bound).method_1_echo(Payload())
+except CCBaseError as error:
+    assert isinstance(error.__cause__, NativeFailure)
+else:
+    raise AssertionError('begin_stream failure was not projected')
+assert projected_refs[-1]() is None
+gc.enable()
+
+class FailingPrepared(Prepared):
+    def stream(self, data):
+        raise NativeFailure('stream')
+    def close(self):
+        raise RuntimeError('close failed')
+bound.begin_stream = lambda method: FailingPrepared()
+try:
+    contract.ContractClient(bound).method_1_echo(Payload())
+except CCBaseError as error:
+    assert isinstance(error.__cause__, NativeFailure)
+    if sys.version_info >= (3, 11):
+        assert any('close failed' in note for note in error.__notes__)
+else:
+    raise AssertionError('stream failure was replaced')
+
+class CancelCountingNative(list):
+    def __init__(self, items):
+        super().__init__(items)
+        self.cancel_calls = 0
+    def cancel(self):
+        self.cancel_calls += 1
+
+last_unclaimed = None
+class ClosingPrepared(Prepared):
+    def stream(self, data):
+        global last_unclaimed
+        events.append(('stream', data))
+        last_unclaimed = CancelCountingNative([b'first', b'second'])
+        return last_unclaimed
+    def close(self):
+        raise RuntimeError('close failed')
+events.clear()
+bound.begin_stream = lambda method: ClosingPrepared()
+try:
+    contract.ContractClient(bound).method_1_echo(Payload())
+except RuntimeError as error:
+    assert str(error) == 'close failed'
+    assert last_unclaimed is not None and last_unclaimed.cancel_calls == 1
+    assert not any(isinstance(ev, tuple) and ev[0] == 'wrap' for ev in events), events
+else:
+    raise AssertionError('close failure disappeared')
+try:
+    raise LookupError('outer exception')
+except LookupError:
+    try:
+        contract.ContractClient(bound).method_1_echo(Payload())
+    except RuntimeError as error:
+        assert str(error) == 'close failed'
+    else:
+        raise AssertionError('outer exception hid close failure')
+
+# Post-dispatch close() failure must strip stale pre_dispatch markers while
+# preserving the cleanup error as __cause__.
+class PostDispatchClosePhase(Prepared):
+    def close(self):
+        err = CCBaseError('close after stream')
+        err.transport_phase = 'pre_dispatch'
+        raise err
+bound.begin_stream = lambda method: PostDispatchClosePhase()
+try:
+    contract.ContractClient(bound).method_1_echo(Payload())
+except CCBaseError as error:
+    assert error.transport_phase is None
+    assert isinstance(error.__cause__, CCBaseError)
+    assert error.__cause__.transport_phase == 'pre_dispatch'
+else:
+    raise AssertionError('post-dispatch close failure disappeared')
+
+# Payload hooks are classified at this adapter boundary, while native charge
+# failures retain their original error and phase.
+nested = CCBaseError('nested call')
+nested.transport_phase = 'pre_dispatch'
+class BadReport(Payload):
+    def execution_report(self):
+        raise nested
+bound.begin_stream = lambda method: Prepared()
+try:
+    contract.ContractClient(bound).method_1_echo(BadReport())
+except CCBaseError as error:
+    assert error is not nested and error.__cause__ is nested
+    assert error.code == ErrorCode.ClientInputSerializing
+    assert error.transport_phase == 'pre_dispatch'
+else:
+    raise AssertionError('report failure was not classified')
+
+class RejectCharge(Prepared):
+    def charge_input(self, size):
+        raise nested
+bound.begin_stream = lambda method: RejectCharge()
+try:
+    contract.ContractClient(bound).method_1_echo(Payload())
+except CCBaseError as error:
+    assert error is nested
+else:
+    raise AssertionError('native charge failure disappeared')
 "#;

@@ -162,7 +162,9 @@ pub fn encode_route_nack(nack: &RouteNack) -> Result<Vec<u8>, String> {
 
 pub fn decode_route_nack(payload: &[u8]) -> Result<RouteNack, String> {
     let body = split_tag(payload, MsgType::RouteNack)?;
-    let nack: RouteNack = serde_json::from_slice(body).map_err(|err| err.to_string())?;
+    let error = C2ErrorEnvelope::from_wrapped_json_bytes(body, "error")
+        .map_err(|err| err.to_string())?;
+    let nack = RouteNack { error };
     validate_route_nack(&nack)?;
     Ok(nack)
 }
@@ -354,5 +356,25 @@ mod state_tests {
             );
         }
         assert!(serde_json::from_value::<RouteStateReasonWire>(serde_json::Value::Null).is_err());
+    }
+
+    #[test]
+    fn route_nack_enforces_canonical_envelope_depth_and_number_bounds() {
+        let make_nack = |ext: &str| {
+            let mut raw = vec![MsgType::RouteNack.as_byte()];
+            raw.extend_from_slice(
+                format!(
+                    r#"{{"error":{{"version":1,"code":709,"name":"ContractMismatch","message":"m","details":{{}},"ext":{ext}}}}}"#,
+                )
+                .as_bytes(),
+            );
+            raw
+        };
+        let nested = |n: usize| format!("{}{}", "[".repeat(n), "]".repeat(n));
+        assert!(decode_route_nack(&make_nack(&nested(126))).is_ok());
+        assert!(decode_route_nack(&make_nack(&nested(127))).is_err());
+        assert!(decode_route_nack(&make_nack("17976931348623158e292")).is_ok());
+        assert!(decode_route_nack(&make_nack("179769313486231581e291")).is_err());
+        assert!(decode_route_nack(&make_nack("179769313486231590e291")).is_err());
     }
 }

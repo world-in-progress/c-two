@@ -75,11 +75,14 @@ fn transport_embedding_preserves_contract_release_payload_and_other_language_byt
             let actual = set.get(path).unwrap();
             if target == ContractCodegenTarget::TypeScript {
                 if path == "typescript/c_two_contract.ts" {
-                    assert!(
-                        std::str::from_utf8(actual.bytes())
-                            .unwrap()
-                            .contains(TRANSPORT)
-                    );
+                    let actual_str = std::str::from_utf8(actual.bytes()).unwrap();
+                    let (prefix, suffix) = TRANSPORT
+                        .split_once("/* __C2_GENERATED_ERROR_CODE_NAMES__ */ Object.freeze({})")
+                        .expect("error-code placeholder in typescript_transport.ts");
+                    assert!(actual_str.contains(prefix));
+                    assert!(actual_str.contains(suffix));
+                    assert!(!actual_str.contains("__C2_GENERATED_ERROR_CODE_NAMES__"));
+                    assert!(actual_str.contains("719: \"RouteConflict\""));
                     continue;
                 }
                 // The composition manifest includes the changed source's hash and byte count.
@@ -147,8 +150,31 @@ fn native_transport_facade_behaves_under_node() {
         compiler.display()
     );
     std::fs::write(root.join("package.json"), r#"{"type":"module"}"#).unwrap();
+    let descriptor =
+        include_str!("../../../../tests/fixtures/contracts/portable-no-payload.contract.json");
+    let release = ContractRelease::from_descriptor_json(descriptor.as_bytes()).unwrap();
+    let generated_set = compile_contract_artifacts(
+        &release,
+        ContractCodegenTarget::TypeScript,
+        &Default::default(),
+    )
+    .unwrap();
+    let generated_contract = std::str::from_utf8(
+        generated_set
+            .get("typescript/c_two_contract.ts")
+            .unwrap()
+            .bytes(),
+    )
+    .unwrap();
+    assert!(!generated_contract.contains("__C2_GENERATED_ERROR_CODE_NAMES__"));
+    let transport_start = generated_contract
+        .find("export interface C2ContractIdentity {")
+        .expect("transport section start");
+    let (rendered_transport, _) = generated_contract[transport_start..]
+        .split_once("\n\nexport interface C2FastDbCauseFields")
+        .expect("contract transport boundary");
     let asset = root.join("typescript_transport.ts");
-    std::fs::write(&asset, format!("{TRANSPORT}\nconst unaryTransportSmoke: C2EncodedClientTransport = {{ async call() {{ return new Uint8Array(); }} }};\nvoid unaryTransportSmoke;\n")).unwrap();
+    std::fs::write(&asset, format!("{rendered_transport}\nconst unaryTransportSmoke: C2EncodedClientTransport = {{ async call() {{ return new Uint8Array(); }} }};\nvoid unaryTransportSmoke;\n")).unwrap();
     let compile = Command::new("node")
         .arg(&compiler)
         .args([
@@ -399,10 +425,14 @@ test('deadline during dispatch retains native call for later observation', async
 
 test('relay-aware canonical 701 POST is returned once and the next call resolves again', async () => {
   let resolves=0, posts=0;
-  const reply=(status,text,bytes=new Uint8Array())=>({
-    status, headers:{get(name){return name==='content-length'?String(bytes.length):null}},
-    async text(){return text}, async arrayBuffer(){return bytes.buffer},
-  });
+  const utf8=new TextEncoder();
+  const reply=(status,text,bytes)=>{
+    const raw=bytes??utf8.encode(text);
+    return {
+      status, headers:{get(name){return name==='content-length'?String(raw.byteLength):null}},
+      async arrayBuffer(){return raw.slice().buffer},
+    };
+  };
   const route=()=>({
     name:'route',relay_url:'http://localhost:8301',
     crm_ns:'test',crm_name:'Test',crm_ver:'0.1.0',abi_hash:hash,signature_hash:hash,
@@ -438,7 +468,7 @@ test('same-path fallback denial retains typed first native cause', async () => {
     crm_ns:'test',crm_name:'Test',crm_ver:'0.1.0',abi_hash:hash,signature_hash:hash,max_payload_size:100};
   const fetch=async (_url,init)=>{
     if(init.method==='POST') posts++;
-    return {status:200, async text(){return JSON.stringify([route])}, async arrayBuffer(){return new ArrayBuffer(0)}};
+    return {status:200, async arrayBuffer(){return new TextEncoder().encode(JSON.stringify([route])).buffer}};
   };
   const connect=async()=>({
     connectionSnapshot(){return null}, async prepare(){throw nativeFailure}, beginCall(){throw Error('unexpected dispatch')},
@@ -474,7 +504,7 @@ test('relay local trust and deadline failures never select another candidate', a
       crm_ns:'test',crm_name:'Test',crm_ver:'0.1.0',abi_hash:hash,signature_hash:hash,max_payload_size:100};
     const fetch=async (_url,init)=>{
       if(init.method==='POST') posts++; else resolves++;
-      return {status:200,async text(){return JSON.stringify(alternatives?[route,{...route,ipc_address:undefined,server_id:undefined,server_instance_id:undefined}]:[route])},async arrayBuffer(){return new ArrayBuffer(0)}};
+      return {status:200,async arrayBuffer(){return new TextEncoder().encode(JSON.stringify(alternatives?[route,{...route,ipc_address:undefined,server_id:undefined,server_instance_id:undefined}]:[route])).buffer}};
     };
     const endpoint={connectionSnapshot(){return null}, async prepare(){throw failure},beginCall(){throw Error('unexpected dispatch')},async close(){if(closeFails)throw cleanup},deactivate(){}};
     const transport=createRelayAwareHttpEncodedTransport('http://localhost:8300',{fetch,ipc:{connect:async()=>endpoint}});
@@ -490,7 +520,7 @@ test('relay-aware close zero does not wait for route resolution', async () => {
   const route={name:'route',relay_url:'http://localhost:8301',
     ipc_address:'ipc://local',server_id:'s',server_instance_id:'i',
     crm_ns:'test',crm_name:'Test',crm_ver:'0.1.0',abi_hash:hash,signature_hash:hash,max_payload_size:100};
-  const fetch=async()=>{await gate;return {status:200,async text(){return JSON.stringify([route])},async arrayBuffer(){return new ArrayBuffer(0)}}};
+  const fetch=async()=>{await gate;return {status:200,async arrayBuffer(){return new TextEncoder().encode(JSON.stringify([route])).buffer}}};
   const call={async chargeInput(){},async dispatch(){dispatched++;return nativeTarget},async next(){return null},cancel(){},
     async observe(){return {completed:true,error:null,completeItems:0n}},checkDeadline(){},close(){}};
   const endpoint={connectionSnapshot(){return null}, async prepare(){return {serverId:'s',serverInstanceId:'i',connectionId:1n}},
@@ -524,6 +554,37 @@ test('collecting the public stream while next waits only submits cancellation', 
   assert.equal(beforeResult,1,'a pending next must not keep the public facade alive');
   assert.ok(cancelled>0);
   await transport.close();
+});
+
+test('generated artifact error-code table validates canonical HTTP relay envelopes at runtime', async () => {
+  const route={name:'route',relay_url:'http://localhost:8301',
+    crm_ns:'test',crm_name:'Test',crm_ver:'0.1.0',abi_hash:hash,signature_hash:hash,max_payload_size:100};
+  const reply=(status,body)=>({status,async arrayBuffer(){return new TextEncoder().encode(body).buffer}});
+  for (const [status,body,expectPhase,expectRetry] of [
+    [503, JSON.stringify({version:1,code:717,name:'CallCapacityExceeded',message:'cap',details:{dispatch_phase:'pre_dispatch'}}), 'pre_dispatch', true],
+    [503, JSON.stringify({version:1,code:717,name:'ResourceNotFound',message:'wrong',details:{dispatch_phase:'pre_dispatch'}}), 'dispatch_uncertain', false],
+    [503, '{"version":1,"code":717.5,"name":"CallCapacityExceeded","message":"float","details":{"dispatch_phase":"pre_dispatch"}}', 'dispatch_uncertain', false],
+    [503, JSON.stringify([1,717,'CallCapacityExceeded','array',{dispatch_phase:'pre_dispatch'}]), 'dispatch_uncertain', false],
+    [503, JSON.stringify({version:1,code:720,name:'FutureCode',message:'future',details:{dispatch_phase:'pre_dispatch'}}), 'dispatch_uncertain', false],
+  ]) {
+    const transport=createRelayAwareHttpEncodedTransport('http://localhost:8300',{
+      fetch:async(url,init)=>{
+        if(url.includes('/_resolve/')) return reply(200, JSON.stringify([route]));
+        if(url.includes('/_probe/')) return reply(200, '');
+        assert.equal(init.method, 'POST');
+        return reply(status, body);
+      },
+    });
+    try {
+      await assert.rejects(transport.call('route',contract,'ping',()=>new Uint8Array()), err => {
+        assert.equal(err.transportPhase, expectPhase);
+        assert.equal(err.retrySafe, expectRetry);
+        return true;
+      });
+    } finally {
+      await transport.close();
+    }
+  }
 });
 "#).unwrap();
     let run = Command::new("node")

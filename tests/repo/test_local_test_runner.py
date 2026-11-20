@@ -240,4 +240,6 @@ def test_prepare_fetches_node_fixture_lock_for_every_consumer(tmp_path, monkeypa
     assert len(fetches) == 1
     assert fetches[0].command == ['cargo', 'fetch', '--locked', '--manifest-path', 'core/Cargo.toml']
     names = [step.name for step in steps]
+    if suite == 'node':
+        assert 'coresdk' in names
     assert names.index(fetches[0].name) < names.index('c2-mem-npm') < names.index('c2-mem-build')

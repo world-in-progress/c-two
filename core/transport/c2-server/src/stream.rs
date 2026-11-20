@@ -573,7 +573,7 @@ pub(super) async fn dispatch_stream_call(
             queue_rejection(
                 writer,
                 id,
-                &error_wire(ErrorCode::ResourceInputDeserializing, message),
+                &error_wire(ErrorCode::ProtocolViolation, message),
             )
             .await;
             return;

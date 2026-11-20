@@ -1,5 +1,6 @@
 import pytest
 
+from c_two import error
 from c_two.crm.payload_plan import PayloadBinding, PayloadPlanKind, no_payload_binding
 from c_two.crm.transferable import _build_transfer_wrapper
 from c_two.transport.server.native import CRMSlot
@@ -61,14 +62,14 @@ def test_borrowed_transfer_wrapper_rejects_non_fdb_payload_binding():
     )
     released = []
 
-    err_bytes, payload = wrapped(
-        Contract(),
-        memoryview(b'payload'),
-        _release_fn=lambda: released.append(True),
-        _c2_input_buffer_mode='borrowed',
-    )
+    with pytest.raises(error.SerializationError) as raised:
+        wrapped(
+            Contract(),
+            memoryview(b'payload'),
+            _release_fn=lambda: released.append(True),
+            _c2_input_buffer_mode='borrowed',
+        )
 
     assert released == [True]
-    assert payload == b''
-    assert b'constructing resource input from buffer' in err_bytes
-    assert b'explicit FastDB Payload binding' in err_bytes
+    assert raised.value.code == error.ErrorCode.ResourceInputDeserializing
+    assert 'explicit FastDB Payload binding' in raised.value.message

@@ -48,7 +48,7 @@ def test_public_core_error_has_complete_independent_fields(category):
     assert error.args == ('native diagnostic',)
     assert error.category == category
     optional = {
-        'code', 'name', 'error_bytes', 'transport_kind', 'transport_phase',
+        'code', 'name', 'semantic_message', '_semantic_snapshot', '_transport_phase', 'transport_kind',
         'fallback_eligible', 'route_withdrawal', 'io_operation', 'io_kind',
         'raw_os_error', 'lifecycle_kind', 'startup_stage', 'timeout_seconds',
         'route_name', 'status_code', 'relay_duplicate', 'failure_source',
@@ -68,7 +68,10 @@ def test_public_core_error_annotations_expose_native_literal_values():
     hints = get_type_hints(cc.error.CoreError)
     assert hints['category'] == Literal['semantic', 'contract', 'admission', 'transport', 'lifecycle', 'protocol_version_mismatch']
     assert hints['transport_kind'] == Literal['ipc', 'http'] | None
-    assert hints['transport_phase'] == str | None
+    # transport_phase is a read-only property; the native-written field is
+    # restricted to the two canonical Core dispatch phases.
+    assert hints['_transport_phase'] == Literal['pre_dispatch', 'dispatch_uncertain'] | None
+    assert hints['semantic_message'] == str | None
     assert hints['io_operation'] == Literal['bind', 'connect'] | None
     assert hints['io_kind'] == Literal[
         'permission_denied', 'not_found', 'connection_refused', 'address_in_use', 'other',
@@ -83,7 +86,7 @@ def test_public_core_error_annotations_expose_native_literal_values():
     assert hints['code'] == int | None
     assert hints['local_protocol_version'] == hints['peer_protocol_version'] == int | None
     assert hints['details'] == dict[str, str]
-    assert hints['error_bytes'] == bytes | None
+    assert hints['semantic_message'] == str | None
     assert hints['fallback_eligible'] == hints['route_withdrawal'] == bool | None
 
 
@@ -111,8 +114,15 @@ def test_public_zero_timeout_has_connect_semantics_without_transport(address):
         assert failure.value.transport_phase == 'pre_dispatch'
         assert failure.value.details['operation'] == 'connect'
         assert failure.value.details['stage']
-        assert isinstance(failure.value.__cause__, cc.error.CoreError)
-        assert failure.value.__cause__.error_bytes == cc.error.CCError.serialize(failure.value)
+        cause = failure.value.__cause__
+        assert isinstance(cause, cc.error.CoreError)
+        # The raised error is the fresh semantic projection of its CoreError
+        # cause: same typed snapshot, never a byte round-trip.
+        projected = cause.semantic
+        assert isinstance(projected, cc.error.CallDeadlineExceeded)
+        assert projected.code == failure.value.code
+        assert projected.details == failure.value.details
+        assert projected.transport_phase == failure.value.transport_phase
     finally:
         _reset_default_runtime()
 
@@ -158,7 +168,6 @@ def test_native_local_zero_validation_runs_no_python_callback():
 def test_registry_projects_budget_with_full_expected_contract(timeout, address, method, monkeypatch):
     registry = Runtime()
     captured = []
-    sync_attempts = []
     attempts = []
     native_attempt = _native.ConnectAttempt
 
@@ -177,9 +186,6 @@ def test_registry_projects_budget_with_full_expected_contract(timeout, address, 
         def local_copy_tracker(self):
             return None
 
-        def set_relay_anchor_address(self, address, *, connect_attempt=None):
-            sync_attempts.append(connect_attempt)
-
         def __getattr__(self, name):
             assert name == method
 
@@ -196,7 +202,6 @@ def test_registry_projects_budget_with_full_expected_contract(timeout, address, 
         args = (address, *args)
     assert len(attempts) == 1
     assert captured == [(args, {'connect_attempt': attempts[0]})]
-    assert sync_attempts == ([attempts[0]] if method == 'connect_via_relay' else [])
 
 
 def test_relay_connect_preserves_unmapped_native_exception(monkeypatch):
@@ -206,9 +211,6 @@ def test_relay_connect_preserves_unmapped_native_exception(monkeypatch):
     class Session:
         def local_copy_tracker(self):
             return None
-
-        def set_relay_anchor_address(self, address, *, connect_attempt=None):
-            pass
 
         def connect_via_relay(self, *args, **kwargs):
             raise marker
@@ -224,14 +226,15 @@ def test_close_rejects_non_proxy():
         cc.close(object())
 
 
-def test_native_deadline_error_round_trip_preserves_connect_details():
+def test_native_deadline_semantic_projection_preserves_connect_details():
     with pytest.raises(cc.error.CoreError) as failure:
         _native.ConnectAttempt(timeout_seconds=0)
     native = failure.value
-    projected = cc.error.CCError.deserialize(native.error_bytes)
+    projected = native.semantic
     assert isinstance(projected, cc.error.CallDeadlineExceeded)
     assert int(projected.code) == native.code == 715
-    assert projected.message == native.message
+    assert native.name == 'CallDeadlineExceeded'
+    assert projected.message == (native.semantic_message or native.message)
     assert projected.details == dict(native.details)
     assert projected.details == {
         'operation': 'connect',
@@ -349,9 +352,6 @@ def test_connect_snapshots_session_once_for_relay_projection(monkeypatch):
             registry._runtime_session = ReplacedSession()
             return None
 
-        def set_relay_anchor_address(self, address, *, connect_attempt=None):
-            observed.append(connect_attempt)
-
         def connect_via_relay(self, *args, connect_attempt=None):
             observed.append(connect_attempt)
             raise marker
@@ -361,8 +361,8 @@ def test_connect_snapshots_session_once_for_relay_projection(monkeypatch):
     with pytest.raises(cc.error.CoreError, match='projection reached') as failure:
         registry.connect(ConnectContract, name='connect-timeout', timeout=0.5)
     assert failure.value is marker
-    assert len(observed) == 2
-    assert observed[0] is observed[1]
+    assert len(observed) == 1
+    assert observed[0] is not None
 
 
 def test_zero_budget_expires_before_singleton_lookup(monkeypatch):
@@ -433,25 +433,3 @@ def test_expiry_after_python_lock_acquisition_releases_only_new_acquisition():
     assert failure.value.details['stage'] == 'registry_snapshot_wait'
     assert released == [True]
     assert not lock.locked()
-
-
-def test_relay_override_deadline_keeps_canonical_error_before_registry_wrapping():
-    registry = Runtime()
-
-    class Session:
-        def local_copy_tracker(self):
-            return None
-
-        def set_relay_anchor_address(self, address, *, connect_attempt=None):
-            time.sleep(0.06)
-            connect_attempt.check('relay_override_wait')
-
-        def connect_via_relay(self, *args, **kwargs):
-            raise AssertionError('expired override reached relay discovery')
-
-    registry._runtime_session = Session()
-    with pytest.raises(cc.error.CallDeadlineExceeded) as failure:
-        registry.connect(ConnectContract, name='connect-timeout', timeout=0.05)
-    assert failure.value.details['operation'] == 'connect'
-    assert failure.value.details['transport_phase'] == 'pre_dispatch'
-    assert failure.value.details['stage'] == 'relay_override_wait'

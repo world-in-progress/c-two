@@ -19,12 +19,13 @@ A response is a `NativeBuffer`, a `Uint8Array` over a local Rust-owned copy: the
 `loadBundledC2MemFfiNodeNativeSymbols()` loads the packaged native library and `resolveBundledC2MemFfiNodeNativeLibraryPath()` returns its path. `loadC2MemFfiNodeNativeSymbols(libraryPath)` accepts an explicit external library built with **ABI version 8**. The addon checks the native ABI before loading any other symbol, so an older library is rejected with a version error rather than a missing symbol. The addon, TypeScript facade and native library must be built as a matching set.
 
 ```bash
+cargo fetch --locked --manifest-path ../../../../Cargo.toml
 npm ci
 npm test
 npm run pack:check
 ```
 
-`npm test` builds the TypeScript, Rust library and Node addon before running native tests. `npm run pack:check` verifies the package file inventory and installs the exact local tarball into a separate ESM consumer, which checks types, bundled library loading and a verified IPC call to a native peer. The archive contains `dist/index.js`, `dist/index.d.ts`, the `.node` addon, the target native library, this README and `package.json`. This is a local package check, not a registry publication.
+`npm test` builds the TypeScript, Rust library and Node addon before running native tests, and compiles the generated TypeScript transport regression suite through `c2-codegen` (requiring a fetched `core/Cargo.toml` cache and `FASTDB_PAYLOAD_LINK_MODE=system` with `FASTDB_PAYLOAD_SYSTEM_LIB_DIR` pointing at the verified FastDB CoreSDK library directory when no local `.venv` or sibling FastDB build is present). `npm run pack:check` verifies the package file inventory and installs the exact local tarball into a separate ESM consumer, which checks types, bundled library loading and a verified IPC call to a native peer. The archive contains `dist/index.js`, `dist/index.d.ts`, the `.node` addon, the target native library, this README and `package.json`. This is a local package check, not a registry publication.
 
 The scripts launch child JavaScript through `process.execPath`. TypeScript can be overridden using `TSC_JS` or `TSC`; Cargo can be overridden using `CARGO` or resolved through `CARGO_HOME`, the user's `.cargo/bin`, and then `PATH`. Windows builds require the target MSVC tools to be installed; `node-gyp` selects the matching Node headers and import library.
 
