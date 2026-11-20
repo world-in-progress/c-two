@@ -36,7 +36,7 @@ Python `cc.set_client` 与 `cc.set_server` 接受表中的三个容量字段。`
 
 更新逐字段合并。省略参数（`Keep`，Python `_UNSET`）保留已接受的代码覆盖。`Inherit`（Python `None`）清除该字段的覆盖，恢复环境变量和默认值。`Set` 写入显式值。Core 校验整个候选配置并原子提交。修改 `M` 会保留显式 `N`，除非同一次更新清除或替换它。
 
-角色冻结后，Core 使用该域冻结时捕获的来源解析更新。有效配置相同即成功，包括空更新和沿用自动选择的 `server_id`。任何有效值变化都会报类型化 `ConfigFrozen` 错误。另一角色仍可在自身冻结前配置。见 [Runtime 生命周期](runtime-lifecycle.md)。
+角色冻结后，Core 使用该域冻结时捕获的来源解析更新。非法候选配置会先报配置校验错误；有效配置相同即成功，包括空更新和沿用自动选择的 `server_id`。任何通过校验但改变已冻结有效值的更新会报 Rust `LifecycleError::ConfigFrozen`（Python 投影为 `c_two.error.CoreError` 且 `lifecycle_kind == 'config_frozen'`，不存在独立的 `ConfigFrozen` Python 异常类）。另一角色仍可在自身冻结前配置。见 [Runtime 生命周期](runtime-lifecycle.md)。
 
 显式 `ipc://` 地址独立于 relay 锚点，直接使用本地 IPC。路由发现可为 HTTP 调用选择其他 relay。见[契约与路由](contracts-and-routing.md#relay-discovery-and-forwarding)。
 
@@ -55,8 +55,8 @@ Python `cc.set_client` 与 `cc.set_server` 接受表中的三个容量字段。`
 | `SHM_THRESHOLD` | 16 KiB | IPC 载荷小于或等于此值时走内联，更大的载荷可以使用 SHM。 |
 | `CHUNK_SIZE` | 128 KiB | 标准 IPC 分片大小，relay 上传窗口较窄时可发送合法短片。 |
 | `REMOTE_PAYLOAD_CHUNK_SIZE` | 1 MiB | HTTP 载荷分批大小。TCP 包和 HTTP 帧边界各自独立。 |
-| `MAX_HANDSHAKE_FRAME_BYTES` | 8 MiB | 握手帧上限，覆盖最多 64 条路由、每条最多 256 个方法。 |
-| `MAX_RPC_FRAME_BYTES` | 1 MiB | 双向 RPC 帧上限，覆盖分片、路由目录和有界错误载荷。 |
+| `MAX_HANDSHAKE_FRAME_BYTES` | 8 MiB | 握手帧上限（也用于匹配在途控制请求的路由目录回复），覆盖最多 64 条路由、每条最多 256 个方法。 |
+| `MAX_RPC_FRAME_BYTES` | 1 MiB | 双向 RPC 帧上限，覆盖分片和有界内联错误载荷。 |
 | `WRITE_TIMEOUT` | 30 s | 单帧写入和 flush 的预算。 |
 | `IDLE_CONNECTION_TIMEOUT` | 60 s | 客户端和 relay 上游连接的空闲驱逐时间。 |
 | `POOL_DECAY_SECONDS` | 60 s | 空闲 buddy 段的回收时间，预热和最小保留段数均为 0。 |
@@ -80,7 +80,7 @@ Python `cc.set_client` 与 `cc.set_server` 接受表中的三个容量字段。`
 
 Unix root 是最终端点目录，实际 socket 位于 `<root>/<32 字符标识>`。自定义目录由应用预建，允许 `0755`：当前用户持有目录，具备读、写、遍历权限，组和其他用户没有写权限。默认目录由 C-Two 创建为 `0700`。Socket 在开始监听前设置并核实为 `0600`。路径允许中文和空格，绑定、连接与探测通过目录句柄定位短名称，目录长度受文件系统限制。C-Two 只管理自身端点、租约及协调文件，不修改已有目录权限、不递归创建父目录、不删除应用目录或无关文件。
 
-macOS 默认端点命名空间的 gate/marker/lease 协调记录放在 `confstr(_CS_DARWIN_USER_DIR)/c2-ipc-coordination-v3`，与 `/tmp/c2-v3-<uidhex>` 下的 socket 分离；默认目录的别名共用同一协调器。两个默认目录均随 namespace 磁盘格式 3 改名。非默认自定义 root 与 Linux 保持同目录布局。默认目录中的 `v3` 取自 namespace 磁盘格式版本；自定义 root 不追加版本名。不同格式各用自己的默认目录，旧默认目录无需同名冷切换。显式共享同一自定义物理 root 不受支持；若出现 `unsupported-namespace-format`，须在全部旧进程退出并禁止重启、完整离线归档该 root 后重建。协调记录与精确回收规则见[生命周期指南](local-endpoint-lifecycle.md)。
+macOS 默认端点命名空间的 gate/marker/lease 协调记录放在 `confstr(_CS_DARWIN_USER_DIR)/c2-ipc-coordination-v3`，与 `/tmp/c2-v3-<uidhex>` 下的 socket 分离；默认目录的别名共用同一协调器。两个默认目录均随 namespace 磁盘格式 3 改名。非默认自定义 root 与 Linux 保持同目录布局。默认目录中的 `v3` 取自 namespace 磁盘格式版本；自定义 root 不追加版本名。不同格式各用自己的默认目录，旧默认目录无需同名冷切换。不同磁盘格式不得显式共用同一自定义物理 root；若出现 `unsupported-namespace-format`，须在全部旧进程退出并禁止重启、完整离线归档该 root 后重建。协调记录与精确回收规则见[生命周期指南](local-endpoint-lifecycle.md)。
 
 macOS 会额外拒绝允许修改目录内容、属性或权限的扩展 ACL 条目，包括继承条目；只读、遍历和 deny 条目可用。
 
@@ -103,6 +103,6 @@ cc.endpoint.set_local_endpoint(root=str(ipc_dir))
 
 ## 调用等待与准入
 
-直接 IPC 和 relay HTTP 业务调用默认均无截止时间。Python 使用 `cc.with_call_options(proxy, timeout=...)` 限制一次逻辑调用的等待，包括重新获取路由，或传入 `None` 表示无限等待。0 在派发前到期，负数和非有限值无效。同进程同步调用接受继承的等待设置或无限等待。连接截止时间独立设置。
+Rust 与 Python 的直接 IPC 和 relay HTTP 业务调用，以及生成的 TypeScript 直接 IPC 调用，默认均无截止时间。生成的 TypeScript 显式 relay 与 relay-aware 传输默认将 `callTimeoutMs` 设为 `300000` 毫秒（包括后者选中本机 IPC 的调用），传入 `callTimeoutMs: 0` 才取消默认期限。Python 使用 `cc.with_call_options(proxy, timeout=...)` 限制一次逻辑调用的等待，包括重新获取路由，或传入 `None` 表示无限等待。0 在派发前到期，负数和非有限值无效。同进程同步调用接受继承的等待设置或无限等待。连接截止时间独立设置。
 
 到期结束调用方等待。已派发的调用可继续到真实终态，调用槽随之释放。只有派发前的失败可以安全重试。全部远端一元调用与服务端流均计入 `N`，包括无截止时间的调用。见[执行准入](runtime-lifecycle.md#execution-admission)和[诊断快照](memory-policy.md#statistics-and-payload-lifetime)。

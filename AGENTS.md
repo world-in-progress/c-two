@@ -88,8 +88,9 @@ uv run python examples/python/local.py
 uv run python examples/python/ipc_resource.py
 uv run python examples/python/ipc_client.py <address>
 
-# Relay mesh example, three terminals
-python tools/dev/c3_tool.py --build --link
+# Relay mesh example, three terminals (with shared CARGO_TARGET_DIR above, build c3 into it and add to PATH;
+# or run `python tools/dev/c3_tool.py --build --link` without CARGO_TARGET_DIR set)
+cargo build --manifest-path cli/Cargo.toml && export PATH="$CARGO_TARGET_DIR/debug:$PATH"
 c3 relay --bind 0.0.0.0:8300
 uv run python examples/python/relay_mesh/resource.py
 uv run python examples/python/relay_mesh/client.py
@@ -160,7 +161,7 @@ Retired surfaces have no compatibility aliases; names of still-supported interna
 | Python configuration defaults and validation tables, duplicate scheduler state | Rust `c2-config` validates defaults and overrides; the native route-concurrency handle owns scheduling. |
 | Runtime context manager, `Runtime.serve()`, global Runtime registry, automatic endpoint directory deletion | Call explicit Runtime startup/shutdown; `cc.serve()` owns signals only for the default Runtime, and applications own custom directories. |
 | Python pending/closed cleanup state, extra cleanup transactions, historical-outcome scans | Observe the concrete attempt’s original native `ShutdownTransaction` receipt. |
-| Python startup timers, readiness polling, `os.path.exists(socket_path)`, `_started`, `config error` on `ServerError::Failed` | Use native lifecycle projection and `RustServer.start_and_wait()`; preserve typed startup failures. |
+| Python startup timers, readiness polling, `os.path.exists(socket_path)`, `_started`, `config error` on `ServerError::Failed` | Use native lifecycle projection and `RuntimeSession.ensure_host_started()`; preserve typed startup failures. |
 | `_native.CoreError`, legacy-named error codec APIs, Python error-wire parsers, `ERROR_Code`, `CCError.serialize` / `deserialize`, `_native.encode_error_wire` / `decode_error_wire_parts`, `CoreError.error_bytes`, `server/reply.py` (`wrap_error`, `unpack_resource_result`) | Use `c_two.error.ErrorCode`, `CoreError.semantic`, `CCBaseError.transport_phase` and the native canonical error registry; Rust transports own `C2E1` wire encoding/decoding. |
 | Python `side × stage` error classes (`ResourceDeserializeInput`, `ResourceInputFromBuffer`, `ResourceSerializeOutput`, `ResourceExecuteFunction`, `ClientSerializeInput`, `ClientDeserializeOutput`, `ClientOutputFromBuffer`, `ClientCallResource`) and `RegistryUnavailable` / `RouteWatchUnavailable` subclasses | Use `ResourceExecutionError` (code 3) and `SerializationError` (codes 1, 2, 4, 5, 6, 8 with `side` and `stage`); codes 7, 705 and 712 project to `CCError`. |
 | Name-only relay resolve/probe/call and Python or route-name-only relay IPC trust | Validate `ExpectedRouteContract` plus native server and server-instance identity. |
@@ -185,7 +186,7 @@ Retired surfaces have no compatibility aliases; names of still-supported interna
 | `PyShmBuffer`, `c_two._native.ShmBuffer`, Python wire codecs and handshake objects | Use native Core buffer owners; Python `wire.py` retains `MethodTable` and the five existing native contract projections remain available. |
 | `call_execution_snapshot()` byte fields `max_retained_bytes`, `used_retained_bytes` and `peak_retained_bytes` | Role memory is in `memory_stats()`; the snapshot reports call slots only. |
 | Python response-pool access, SHM coordinate tuples, threshold-based response dispatch and `bytes(memoryview)` transport conversion | Return serialized bytes or buffer-protocol data and leave native payload limits and transport allocation to `c2-server`. |
-| Python `c_two.config` (`C2Settings`, `settings`), `generate_crm_template`, `set_transport_policy`, `set_call_execution_limits`, `ipc_overrides`, `BaseIPCOverrides` / `ServerIPCOverrides` / `ClientIPCOverrides`, silent `ClientConfigFrozen` warnings | `set_client` and `set_server` raise `ConfigFrozen` on effective changes after their role freezes. `set_relay_anchor` (`None` clears) raises `RuntimeError` on changes after Host startup. Author plain resource classes directly. Transport constants belong to Core. |
+| Python `c_two.config` (`C2Settings`, `settings`), `generate_crm_template`, `set_transport_policy`, `set_call_execution_limits`, `ipc_overrides`, `BaseIPCOverrides` / `ServerIPCOverrides` / `ClientIPCOverrides`, silent `ClientConfigFrozen` warnings | `set_client` and `set_server` raise `CoreError` (`lifecycle_kind='config_frozen'`) on effective changes after their role freezes. `set_relay_anchor` (`None` clears) raises `RuntimeError` on changes after Host startup. Author plain resource classes directly. Transport constants belong to Core. |
 | Rust `ServerIpcConfigOverrides` / `ClientIpcConfigOverrides`, `CallExecutionLimits` / `CallExecutionLimitsOverrides`, `MemoryBudgetLimits`, Server fields on `RuntimeOptions`, `call_timeout_secs` | `RuntimeOptions` for client capacity, `HostOptions` for server identity and capacity, `DomainLimits` / `DomainLimitsPatch` for role limits, and per-call deadlines. |
 | c3 `--ipc-pool-enabled`, `--ipc-shm-backing-budget-bytes`, `--ipc-file-backing-budget-bytes`, `--ipc-live-reassembly-budget-bytes`, `--call-payload-buffer-budget-bytes`, `--idle-timeout` | `--memory-budget-bytes`, `--file-spill-budget-bytes`, `--call-max-outstanding`. Keep `--ipc-root` for Unix endpoints. |
 | ABI 8 `requestShmThreshold` / `requestChunkSize` | Client capacity options `memoryBudgetBytes`, `fileSpillBudgetBytes`, `maxOutstandingCalls`. |
@@ -194,7 +195,7 @@ Retired surfaces have no compatibility aliases; names of still-supported interna
 | `C2_IPC_MAX_EXECUTION_WORKERS`, `C2_IPC_MAX_PAYLOAD_SIZE`, `C2_IPC_MAX_PENDING_REQUESTS`, `C2_IPC_MAX_REASSEMBLY_BYTES`, `C2_IPC_MAX_INFLIGHT_CHUNK_FRAMES` | Use `C2_MAX_EXECUTION_WORKERS`, `C2_MAX_PAYLOAD_SIZE` and `C2_CALL_MAX_OUTSTANDING`. Reassembly follows the payload limit. Queued chunks charge role memory. |
 | `C2_IPC_POOL_ENABLED`, `C2_IPC_POOL_SEGMENT_SIZE`, `C2_IPC_MAX_POOL_SEGMENTS`, `C2_IPC_POOL_DECAY_SECONDS`, `C2_IPC_POOL_PREWARM_SEGMENTS`, `C2_IPC_POOL_MIN_RETAINED_SEGMENTS`, `C2_IPC_REASSEMBLY_SEGMENT_SIZE`, `C2_IPC_REASSEMBLY_MAX_SEGMENTS`, `C2_IPC_MAX_DEDICATED_SEGMENTS` | Core derives geometry from role memory and fixes pool maintenance. |
 | `C2_SHM_THRESHOLD`, `C2_IPC_SPILL_THRESHOLD`, `C2_IPC_MAX_FRAME_SIZE`, `C2_IPC_CHUNK_SIZE`, `C2_IPC_CHUNK_THRESHOLD_RATIO`, `C2_IPC_CHUNK_ASSEMBLER_TIMEOUT`, `C2_IPC_CHUNK_GC_INTERVAL`, `C2_IPC_WRITE_TIMEOUT`, `C2_IPC_CLIENT_IDLE_TIMEOUT`, `C2_RELAY_IDLE_TIMEOUT`, `C2_RELAY_ANTI_ENTROPY_INTERVAL`, `C2_REMOTE_PAYLOAD_CHUNK_SIZE` | Core fixes frame, chunk and transport policy. See [configuration](docs/reference/configuration.md#fixed-transport-constants). |
-| `C2_RELAY_CALL_TIMEOUT` | Set per-call deadlines. See the [environment migration](docs/releases/unreleased.md#configuration-convergence-breaking). |
+| `C2_RELAY_CALL_TIMEOUT` | Set per-call deadlines. See the [environment migration](docs/releases/0.11.0.md#configuration-and-capacity). |
 
 ## Documentation rules and routing
 

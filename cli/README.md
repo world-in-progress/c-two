@@ -1,6 +1,6 @@
 # C-Two CLI (C3)
 
-C3 **0.6.0** accompanies C-Two **0.10.x**, sharing its IPC handshake 14, Unix namespace format 3 and endpoint maintenance behavior. See the [release notes](../docs/releases/0.10.0.md).
+C3 **0.7.0** accompanies C-Two **0.11.x**, sharing its IPC 16, SHM 4, relay mesh 7, Unix namespace format 3 and endpoint maintenance behavior. See the [0.11.0 release notes](../docs/releases/0.11.0.md).
 
 Python does not own CLI behavior; do not add command behavior under `sdk/python/src/c_two`. `cli/` contains the Rust crate for `c3`, the native C-Two command-line interface. It starts relay servers and inspects relay registry state for C-Two deployments.
 
@@ -71,6 +71,8 @@ c3 contract codegen typescript echo.contract.json --out-dir generated-typescript
 
 The output contains C-Two contract/release/composition metadata, the target-specific C-Two adapter, and FastDB Core-owned payload modules. All three targets generate server-stream methods. The TypeScript target generates clients only: `method_{index}_{name}` returns a `C2ResponseStream`, and `hold_method_{index}_{name}` yields each item as a `C2HeldResult`. Generation is fail-closed: invalid or colliding paths, hash mismatches, FastDB errors, and existing destinations produce no partial winning tree. There is no separate payload sidecar input.
 
+`c3 contract export` and `c3 contract diagnose` accept `--python` (resolved in order `--python` → process environment `C2_PYTHON` → `python3`), repeatable `--method` filters, `--out` (default stdout) and `--pretty`; `release-ref` also accepts `--pretty`, and `validate`, `release-ref` and `codegen` accept `-` as the descriptor path to read JSON from stdin.
+
 `c3 contract diagnose` reports methods that remain Python-only. Portable payload structure is authored explicitly with `@cc.transfer(...)`.
 
 ## Configuration
@@ -83,11 +85,11 @@ C2_ENV_FILE=relay.env c3 relay --dry-run
 
 Resolution order is explicit CLI flags, process environment, the environment file, then defaults. [Configuration](../docs/reference/configuration.md)
 
-Color output follows common terminal conventions:
+Color output follows common terminal conventions (checked in priority order):
 
 - `NO_COLOR` disables the colored banner.
 - `CLICOLOR=0` disables the colored banner.
-- `CLICOLOR_FORCE=1` forces banner color even when stdout is not a terminal, unless `NO_COLOR` is also set.
+- Any set `CLICOLOR_FORCE` forces banner color even when stdout is not a terminal, unless `NO_COLOR` or `CLICOLOR=0` is set.
 
 ## Relay
 
@@ -121,7 +123,7 @@ c3 relay --bind 0.0.0.0:8080 --upstream grid=server@ipc://server
 c3 relay --relay-id relay-a --advertise-url http://relay-a:8080 --seeds http://relay-b:8080,http://relay-c:8080
 ```
 
-Use `--dry-run` to validate configuration and print the effective relay domain budgets and slot limit without starting the server.
+Use `--dry-run` to validate and print the resolved configuration and effective relay domain budgets and slot limit without starting the server. It exits right after config resolution and does not bind the listen socket (port `0` still prints as `0`), run startup checks on `--advertise-url`, or register `--upstream` entries.
 
 ```bash
 c3 relay --bind 127.0.0.1:9999 --memory-budget-bytes 134217728 --dry-run
@@ -151,11 +153,11 @@ c3 endpoint reap ipc://this-run-server --credential endpoint-credential.json
 c3 endpoint sweep --address ipc://this-run-server --max-entries 64 --max-ms 10 --max-batches 64
 ```
 
-Inspect, reap and sweep accept `--ipc-root` (or `C2_IPC_ROOT`) to address endpoints in a custom final Unix directory. The application provisions it with current-user ownership, read/write/traverse access and no write access for other identities; `0755` is accepted, while default directories are created `0700`. The CLI captures the endpoint context with the inspection and reap operates strictly on that captured context, so a credential from one root never touches an object under another. Custom-root routes discovered through a relay answer over HTTP when the relay's local namespace does not match; the namespace hint is a routing-domain signal, not an authentication credential. On Windows these commands keep their TokenUser-scoped Named Pipe behavior and `--ipc-root` is rejected as not applicable.
+Inspect and sweep accept `--ipc-root` (or `C2_IPC_ROOT`) to select a custom final Unix directory; `reap` always operates on the endpoint context recorded inside the credential file, and passing `--ipc-root` to `reap` only checks that it matches that recorded context before touching anything. The application provisions custom directories with current-user ownership, read/write/traverse access and no write access for other identities; `0755` is accepted, while default directories are created `0700`. The CLI captures the endpoint context with the inspection, so a credential from one root never touches an object under another. Custom-root routes discovered through a relay answer over HTTP when the relay's local namespace does not match; the namespace hint is a routing-domain signal, not an authentication credential. On Windows these commands keep their TokenUser-scoped Named Pipe behavior and `--ipc-root` is rejected as not applicable.
 
-Unix endpoints use namespace disk format 3 and credential schema 4 without `device`. Default directory names include the disk format version; custom roots gain no suffix. Old default directories remain untouched, and old Unix credential schemas are rejected. Upgrade local SDKs, c3 and Node consumers together; follow the [0.10.0 migration notes](../docs/releases/0.10.0.md) before rebuilding a custom root that reports `unsupported-namespace-format`.
+Unix endpoints use namespace disk format 3 and credential schema 4 without `device`. Default directory names include the disk format version; custom roots gain no suffix. Old default directories remain untouched, and old Unix credential schemas are rejected. Upgrade local SDKs, c3 and Node consumers together; follow the [0.11.0 migration notes](../docs/releases/0.11.0.md) (and [0.10.0 notes](../docs/releases/0.10.0.md) before rebuilding a custom root from pre-0.10 formats that reports `unsupported-namespace-format`).
 
-Inspect reports observation, not process liveness. Reap refuses stale or unverified objects. Keep sweep addresses scoped to the current run; report completion only when CLI JSON `sweep.roundComplete` is true, not merely when the batch limit is reached. The millisecond budget is a scheduling target, not hard real-time filesystem behavior. Windows reports kernel-managed/not-applicable cleanup. See the [lifecycle guide](../docs/reference/local-endpoint-lifecycle.md); do not remove unknown historical directories based on age, PID or connection failure.
+Inspect reports observation, not process liveness. Reap refuses stale or unverified objects. `sweep` accepts repeatable `--address` flags to scope cleanup to specific addresses of the current run (omitting `--address` sweeps the entire selected namespace); report completion only when CLI JSON `sweep.roundComplete` is true — if the batch limit is reached before the round completes, `c3 endpoint sweep` exits with code 1. The millisecond budget is a scheduling target, not hard real-time filesystem behavior. Windows reports kernel-managed/not-applicable cleanup. See the [lifecycle guide](../docs/reference/local-endpoint-lifecycle.md); do not remove unknown historical directories based on age, PID or connection failure.
 
 ## Registry
 
@@ -183,7 +185,7 @@ c3 registry force-leave relay-c --relay http://127.0.0.1:8080
 
 The relay given with `--relay` accepts only a relay it currently sees as Suspect or Dead. It forgets that relay together with its routes and tombstones and passes the declaration on to its live peers; each peer applies it only if it also sees that relay as Suspect or Dead. Relays notice a lost peer at slightly different times, so a relay that still saw it as Alive when the declaration arrived keeps it: check `c3 registry peers` on the other relays and run the command there once they show it as Suspect or Dead. The command prints `Force-left relay-c.` and exits 0. A relay that is still Alive in that relay's view, the relay itself, an unknown relay and an invalid relay ID are refused, and the command prints the relay's reason and exits 1. Force-leave is not a ban: a force-left relay that becomes reachable again joins the relays it still remembers, and after a restart it joins through its seeds. A restarted relay without seeds starts alone, because no relay looks for it any more.
 
-Registry requests use a five-second HTTP timeout. A failed request, a refusal or a malformed response fails the command with an error message and exit code 1. By default, the CLI bypasses system proxy settings for relay inspection unless the relay layer is configured to use proxies.
+Registry requests use a five-second HTTP timeout. A failed request, a refusal or a malformed response fails the command with an error message and exit code 1. By default, the CLI bypasses system proxy settings for relay inspection unless `C2_RELAY_USE_PROXY` is enabled in the invoking `c3` process environment or `.env`.
 
 ## Development
 
@@ -221,7 +223,7 @@ uv run --python 3.11 --group banner tools/dev/generate_banner.py
 
 ## Release
 
-The coordinated [c3 0.6.0 release entry](https://github.com/world-in-progress/c-two/releases/tag/c3-v0.6.0) uses the following binary target convention. Installation and checksum verification are in the [Windows guide](../docs/reference/windows-native-usage.md):
+The coordinated [c3 0.7.0 release entry](https://github.com/world-in-progress/c-two/releases/tag/c3-v0.7.0) uses the following binary target convention. Installation and checksum verification are in the [Windows guide](../docs/reference/windows-native-usage.md):
 
 - `x86_64-unknown-linux-gnu`
 - `aarch64-unknown-linux-gnu`
@@ -235,13 +237,13 @@ Unix assets are named `c3-${target}`; Windows uses `c3-${target}.exe`. Each has 
 ### Linux / macOS
 
 ```bash
-curl -fsSL https://github.com/world-in-progress/c-two/releases/latest/download/c3-installer.sh | sh -s -- --version 0.6.0
+curl -fsSL https://github.com/world-in-progress/c-two/releases/latest/download/c3-installer.sh | sh -s -- --version 0.7.0
 ```
 
 The installer detects Linux/macOS and x86_64/aarch64. It defaults to `/usr/local/bin` as root or `~/.local/bin` otherwise. Select another directory:
 
 ```bash
-curl -fsSL https://github.com/world-in-progress/c-two/releases/latest/download/c3-installer.sh | sh -s -- --version 0.6.0 --bin-dir "$HOME/bin"
+curl -fsSL https://github.com/world-in-progress/c-two/releases/latest/download/c3-installer.sh | sh -s -- --version 0.7.0 --bin-dir "$HOME/bin"
 ```
 
 ### Windows x64 / ARM64
@@ -250,7 +252,7 @@ Download the PowerShell installer and select the coordinated version explicitly:
 
 ```powershell
 Invoke-WebRequest -UseBasicParsing -Uri 'https://github.com/world-in-progress/c-two/releases/latest/download/c3-installer.ps1' -OutFile .\c3-installer.ps1
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\c3-installer.ps1 -Version 0.6.0
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\c3-installer.ps1 -Version 0.7.0
 $env:PATH = "$env:LOCALAPPDATA\Programs\c3;$env:PATH"
 c3.exe --version
 ```

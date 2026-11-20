@@ -24,10 +24,10 @@ If the selected bin directory is not already on `PATH`, the tool prints the exac
 
 ### Local Single-Process
 
-`local.py` demonstrates local registration and thread-local calls in one Python process. It does not use IPC addresses or relay configuration.
+`local.py` demonstrates local registration and thread-local calls in one Python process. It does not configure IPC addresses or a relay anchor itself; if `C2_RELAY_ANCHOR_ADDRESS` is set in your shell or `.env`, prefix the command with `C2_RELAY_ANCHOR_ADDRESS=` to keep registration local:
 
 ```bash
-uv run python examples/python/local.py
+C2_RELAY_ANCHOR_ADDRESS= uv run python examples/python/local.py
 ```
 
 ### Independent Runtime preflight

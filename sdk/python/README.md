@@ -2,14 +2,14 @@
 
 C-Two exposes stateful Python resources through typed CRM contracts over same-process calls, local IPC, or an external HTTP relay. This package projects the shared Rust runtime into Python.
 
-Python C-Two **0.10.1** pairs with c3 **0.6.0**. See the [0.10.0 release and migration notes](https://github.com/world-in-progress/c-two/blob/main/docs/releases/0.10.0.md) and the [0.10.1 patch notes](https://github.com/world-in-progress/c-two/blob/main/docs/releases/0.10.1.md).
+Python C-Two **0.11.0** pairs with c3 **0.7.0**. See the [0.11.0 release and migration notes](https://github.com/world-in-progress/c-two/blob/main/docs/releases/0.11.0.md).
 
 Install the matching published versions:
 
 ```bash
-uv pip install 'c-two==0.10.1'
+uv pip install 'c-two==0.11.0'
 # Only for FastDB Payload contracts:
-uv pip install 'c-two[fastdb]==0.10.1'
+uv pip install 'c-two[fastdb]==0.11.0'
 ```
 
 The base package has no Python runtime dependencies. Ordinary CRM definition, registration, direct/IPC/relay calls and errors do not load FastDB or NumPy. The `fastdb` extra pins `fastdb4py==0.2.4`; using FastDB payloads without it reports the extra to install. The exact pin selects the validated 0.x binding instead of allowing an untested later native interface.
@@ -20,11 +20,11 @@ Local IPC uses Unix domain sockets or TokenUser-scoped Windows Named Pipes. Unix
 
 `cc.set_server(startup_timeout=30.0)` sets the native startup wait before registration. Omitted/`None` retains the finite five-second default; zero expires immediately. Startup expiry is identified by `CoreError.lifecycle_kind == 'startup_timeout'`, with `startup_stage` and `timeout_seconds`; bind I/O failures keep their OS fields without a configuration-error label. See [server startup deadlines](https://github.com/world-in-progress/c-two/blob/main/docs/reference/configuration.md#server-startup-timeout) for freezing and cleanup semantics.
 
-IPC uses lazy buddy pools, idle decay and finite backing/reassembly budgets; `pool_enabled=False` skips buddy. `cc.observe.memory_stats()` observes native accounting; held responses and borrowed inputs keep local copies, released right after the copy from transport memory. The standalone relay has its own upstream policy. See the [memory guide](https://github.com/world-in-progress/c-two/blob/main/docs/reference/memory-policy.md).
+IPC uses lazy buddy pools derived from each role's memory capacity (`set_client` / `set_server`: `memory_budget_bytes`, `file_spill_budget_bytes`, `max_outstanding_calls`). `cc.observe.memory_stats()` reports `client`, `server`, `retired` and `holds` accounting; held responses and borrowed inputs keep local copies, released right after the copy from transport memory. The standalone relay has its own `relay` role domain. See the [memory guide](https://github.com/world-in-progress/c-two/blob/main/docs/reference/memory-policy.md).
 
 Use `cc.observe.connection_events()` for one cancellable, bounded stream of incoming and outgoing physical IPC events, tagged by `side`. `ConnectionObservation.snapshot()` retains late inspection; its old blocking `wait_closed()` is removed. Physical observations work without a pending call. Bind/connect failures preserve `io_kind`, `raw_os_error` and `io_operation` on public `cc.error.CoreError`. These features share the Rust implementation on macOS, Linux and Windows x64 and ARM64; see the lifecycle guide for API examples.
 
-`cc.endpoint.server_credential() -> EndpointCredential | None` reads the listener's lifecycle snapshot without inspection or a gate lock. `CoreError.endpoint_unverified_reason` reports unverifiable Unix binds; Unix credentials use schema 4 without `device`, and default endpoint directories carry namespace disk format 3. `cc.Runtime()` creates independent Python bindings and native sessions: configure and shut down an explicit instance through its methods, while `cc.serve()` handles signals only for the module-level default runtime. See the [independent runtime example](https://github.com/world-in-progress/c-two/blob/main/examples/python/independent_runtime.py). IPC handshake 14 and namespace format 3 do not interoperate with 0.9.x, so upgrade SDKs, c3 and Node consumers together; the [release notes](https://github.com/world-in-progress/c-two/blob/main/docs/releases/0.10.0.md) cover snapshot semantics and custom-root migration.
+`cc.endpoint.server_credential() -> EndpointCredential | None` reads the listener's lifecycle snapshot without inspection or a gate lock. `CoreError.endpoint_unverified_reason` reports unverifiable Unix binds; Unix credentials use schema 4 without `device`, and default endpoint directories carry namespace disk format 3. `cc.Runtime()` creates independent Python bindings and native sessions: configure and shut down an explicit instance through its methods, while `cc.serve()` handles signals only for the module-level default runtime. See the [independent runtime example](https://github.com/world-in-progress/c-two/blob/main/examples/python/independent_runtime.py). IPC 16, SHM 4, C/FFI ABI 8 and relay mesh 7 do not interoperate with 0.10.x, so upgrade SDKs, c3 and Node consumers together and regenerate contract clients; the [0.11.0 release notes](https://github.com/world-in-progress/c-two/blob/main/docs/releases/0.11.0.md) cover migration from 0.10.x.
 
 ## Development
 
@@ -64,11 +64,12 @@ Relay-dependent tests and examples require the standalone `c3` binary. From a so
 FASTDB_PAYLOAD_LINK_MODE=source python tools/dev/c3_tool.py --build --link
 ```
 
-The Python SDK does not embed or start a relay server. Start the standalone Rust relay with `c3 relay`, Docker Compose, or orchestration such as Kubernetes, then point Python code at its relay anchor with `C2_RELAY_ANCHOR_ADDRESS` or `cc.set_relay_anchor()`. The anchor is used for registration and name resolution. Remote HTTP calls still use the resolved route's `relay_url` directly, and local direct IPC is selected only for a loopback/local anchor. Relay-aware clients preflight routes before the first call and may refresh a stale route once. Ambiguous data-plane failures are not replayed.
+The Python SDK does not embed or start a relay server. Start the standalone Rust relay with `c3 relay`, Docker Compose, or orchestration such as Kubernetes, then point Python code at its relay anchor with `C2_RELAY_ANCHOR_ADDRESS` or `cc.set_relay_anchor()`. The anchor is used for registration and name resolution. Remote HTTP calls still use the resolved route's `relay_url` directly, and local direct IPC is selected only for a loopback/local anchor. Relay-aware clients resolve the route name on connect and, when their current target is known to be gone, re-acquire the route by name before the next call within that call's deadline. Ambiguous data-plane failures are not replayed.
 
 After the source-mode build, configure the absolute Core SDK library directory for Rust consumers spawned by interoperability tests. The full Python suite requires `hey` v0.1.4 on PATH (`go install github.com/rakyll/hey@v0.1.4`). Follow the development setup in the repository README and [Windows guide](https://github.com/world-in-progress/c-two/blob/main/docs/reference/windows-native-usage.md) for platform-specific loader paths and test prerequisites. Keep the existing extension build while running the Python tests:
 
 ```bash
+python tools/dev/build_route_scope_attestor.py
 C2_RELAY_ANCHOR_ADDRESS= uv run --no-sync pytest sdk/python/tests -q --timeout=30
 ```
 

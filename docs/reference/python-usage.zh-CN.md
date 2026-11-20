@@ -1,10 +1,10 @@
 # Python SDK 用法
 
-本指南说明 C-Two 0.10.1 / c3 0.6.0 的 Python SDK 用法，包括 CRM 编写、调用、可移植的 FastDB 0.2.4 载荷和 Runtime 所有权。
+本指南说明 C-Two 0.11.0 / c3 0.7.0 的 Python SDK 用法，包括 CRM 编写、调用、服务端流、可移植的 FastDB 0.2.4 载荷和 Runtime 所有权。
 
 [English](python-usage.md) · 简体中文
 
-[0.10.0 发布说明](../releases/0.10.0.md)介绍从 0.9.x 迁移的事项，包括 `cc.Runtime()`、`cc.endpoint.server_credential()`、Unix schema 4 和额外的绑定原因。CRM 契约通过同进程调用、本地 IPC 和 HTTP relay 暴露有状态资源；可移植 Python 载荷使用可选的 FastDB 0.2.4 extra。安装步骤及可运行的入门示例见[快速开始](../../README.md#quickstart)。
+[0.11.0 发布说明](../releases/0.11.0.md)介绍从 0.10.x 迁移的事项，包括 IPC 16、SHM 4、服务端流、路由名身份、按角色划分的容量配置和收敛后的错误体系。CRM 契约通过同进程调用、本地 IPC 和 HTTP relay 暴露有状态资源；可移植 Python 载荷使用可选的 FastDB 0.2.4 extra。安装步骤及可运行的入门示例见[快速开始](../../README.zh-CN.md#快速开始)。
 
 ## 可移植载荷（FastDB）
 
@@ -56,7 +56,8 @@ class EchoResource:
 cc.register(Echo, EchoResource(), name='echo')
 source = build_value(7)
 try:
-    with cc.connect(Echo, name='echo') as echo:
+    # 传入 cc.server_address() 走本地 IPC；省略 address 则走同进程直调。
+    with cc.connect(Echo, name='echo', address=cc.server_address()) as echo:
         result = echo.echo(source)
         result.close()
 finally:
@@ -67,9 +68,9 @@ finally:
 
 可移植方法在每个方向携带零个或一个 `Payload` 封套；C-Two 将每个嵌套规格作为不透明 JSON 值嵌入，且不重新解释它。没有明确绑定的方法仍可使用普通 Python 值进行仅限 Python 的原型开发，但可移植描述符导出与代码生成会诊断并拒绝这些方法。
 
-`cc.hold(echo.echo)(source)` 将响应保留为 `HeldResult`，它持有一份本地副本：复制完成后传输内存就已释放，所以 hold 不会占住服务端的共享内存。显式 `release()` 让载荷所有者失效一次，再释放本地副本；失效操作不会重放，此后该值不可访问。如果导出被拒绝，先释放额外导出的 memoryview 再重试；拒绝发生在失效操作之前。手工构造的 `HeldResult(release_cb=...)` 回调仍只运行一次。常规作用域使用 `with cc.hold(method)(args) as held`，需要超出作用域存活的值应实体化。
+经 IPC 或 relay HTTP 调用时，`cc.hold(echo.echo)(source)` 将解码后的响应保留为 `HeldResult`，它持有一份本地副本：复制完成后传输内存就已释放，所以 hold 不会占住服务端的共享内存。显式 `release()` 让载荷所有者失效一次，再释放本地副本；失效操作不会重放，此后该值不可访问。如果导出被拒绝，先释放额外导出的 memoryview 再重试；拒绝发生在失效操作之前。在同进程直调路径（注册同一 Runtime 且省略 `address`）上，`cc.hold()` 只返回包装原 Python 对象的 `HeldResult(result)`，不经过传输复制，释放包装也不会使原 FastDB 对象失效或计入 `holds`。手工构造的 `HeldResult(release_cb=...)` 回调仍只运行一次。常规作用域使用 `with cc.hold(method)(args) as held`，需要超出作用域存活的值应实体化。
 
-`cc.observe.memory_stats()['holds']` 统计这些本地副本：`active_holds`、`total_held_bytes`（逻辑字节，不是 SHM 容量）、`oldest_hold_seconds` 与 `by_direction`。各角色的内存和文件溢出预算及其核算边界见[内存策略](memory-policy.md#statistics-and-payload-lifetime)。
+`cc.observe.memory_stats()['holds']` 统计经传输解码的本地副本：`active_holds`、`total_held_bytes`（逻辑字节，不是 SHM 容量）、`oldest_hold_seconds` 与 `by_direction`。各角色的内存和文件溢出预算及其核算边界见[内存策略](memory-policy.md#statistics-and-payload-lifetime)。
 
 ## 远程连接与截止时间
 
@@ -88,11 +89,11 @@ finally:
 
 连接的 `timeout` 是以秒为单位的单一预算，覆盖连接池等待、操作系统连接、握手、当前路由查找和 relay 获取。省略或传入 `None` 不设置调用方截止时间；零会立即过期。给了 `timeout` 时，它取代操作系统连接与握手各自固定的 5 秒守卫，命名空间门锁或命名管道的等待也以它为限；不给时保留这些守卫。负数和非有限值会被拒绝。过期时抛出 `CallDeadlineExceeded`，包含 `operation=connect`、`transport_phase=pre_dispatch` 及失败的 `stage`；资源方法尚未执行。
 
-业务调用的等待独立于连接等待。`cc.with_call_options` 返回现有连接的视图；其超时不会成为资源方法参数。调用截止时间可能在分派后结束调用方等待，此时原生任务仍持有输入直到完成。它不会取消正在运行的资源方法，也不允许重放。直接 IPC 和 relay HTTP 默认均无限等待。同进程同步调用接受继承的等待上限或无限等待。默认值和在途调用准入限制见[配置](configuration.zh-CN.md#调用等待与准入)。
+业务调用的等待独立于连接等待。`cc.with_call_options` 返回现有连接的视图；其超时不会成为资源方法参数。调用截止时间可能在派发后结束调用方等待：已派发的调用会继续占用 `max_outstanding_calls` 调用槽直到真实终态，但请求的发送存储和 IPC SHM 借出在传输写出或拷贝完请求后即可更早释放。超时不会取消正在运行的资源方法，也不允许重放。直接 IPC 和 relay HTTP 默认均无限等待。同进程同步调用接受继承的等待上限或无限等待。默认值和在途调用准入限制见[配置](configuration.zh-CN.md#调用等待与准入)。
 
 连接跟随路由名。C-Two 已经知道它所服务的那次注册不在了时（服务进程结束，或者之前的调用因路由不存在、已撤下、已关闭或契约不同而在派发前被拒），下一次调用在自己的截止时间内按名字重新获取路由，发往当前的注册：直接 IPC 回到原地址，经 relay 的连接通过 relay 锚点重新解析，可能在本地 IPC 与 relay 之间切换，显式 relay 连接仍走 HTTP。只能从这次调用自己的拒绝得知变化时，这次调用在派发前失败、可以安全重试，下一次调用才跟过去。同进程连接在注册被注销后也一样：下一次调用发往这个名字新的本地注册，或者经 relay 发往远程的注册；注册还在时，调用直接进入资源。服务这个名字的进程负责状态的延续；要让调用方察觉状态变了，就换一个名字。身份与协议的拒绝不会引起重新获取。
 
-共享一个 IPC 域的 Unix 进程使用相同的已配置根目录（`cc.endpoint.set_local_endpoint(root=...)` 或 `C2_IPC_ROOT`）。应用负责创建自定义根目录；在确认所有权及免受其他用户修改的保护后，可以接受 `0755`。默认权限为 `0700`，套接字权限为 `0600`。Windows 在跨登录会话时使用 TokenUser 范围内的 Named Pipe，并拒绝 Unix 根目录覆盖值。原生连接要求同一用户且服务端完整性级别至少为 Medium；跨会话载荷自动避开无法访问的 Local 映射。C-Two 0.10.0 将 RPC 握手从 13 升至 14，并在前面增加永久固定的版本前导信息，因此通信双方应一起升级。两个版本都实现固定前导信息但版本不同时，会抛出 `CoreError`，其中 `category='protocol_version_mismatch'`，`local_protocol_version` / `peer_protocol_version` 非零（其他错误中均为 `None`）；与 0.9.x 混用时仍是一般连接或协议失败。参见 [0.10.0 迁移说明](../releases/0.10.0.md)及[握手规格](ipc-handshake.md)，以及[端点配置](configuration.zh-CN.md#本地端点位置与平台差异)和[生命周期管理](local-endpoint-lifecycle.md)。
+共享一个 IPC 域的 Unix 进程使用相同的已配置根目录（`cc.endpoint.set_local_endpoint(root=...)` 或 `C2_IPC_ROOT`）。应用负责创建自定义根目录；在确认所有权及免受其他用户修改的保护后，可以接受 `0755`。默认权限为 `0700`，套接字权限为 `0600`。Windows 在跨登录会话时使用 TokenUser 范围内的 Named Pipe，并拒绝 Unix 根目录覆盖值。原生连接要求同一用户且服务端完整性级别至少为 Medium；跨会话载荷自动避开无法访问的 Local 映射。C-Two 0.11.0 在 0.10.0 引入的永久固定版本前导信息之后使用 RPC IPC 握手 16，因此通信双方应一起升级。两个版本都实现固定前导信息但版本不同时，会抛出 `CoreError`，其中 `category='protocol_version_mismatch'`，`local_protocol_version` / `peer_protocol_version` 非零（其他错误中均为 `None`）；与 0.9.x 混用时仍是一般连接或协议失败。参见 [0.11.0 迁移说明](../releases/0.11.0.md)及[握手规格](ipc-handshake.md)，以及[端点配置](configuration.zh-CN.md#本地端点位置与平台差异)和[生命周期管理](local-endpoint-lifecycle.md)。
 
 ## 底层服务端桥接
 
@@ -109,12 +110,13 @@ server = session.ensure_server_bridge()
 
 ## 载荷生命周期
 
-已经证实的可移植接收路径打开的是**由副本支持**的载荷所有者。`cc.hold()` 是生命周期契约，不构成零拷贝声明：它一同保留响应的本地副本与载荷所有者，并保证释放本地副本*之前*，先让载荷所有者及其受检查的视图失效。
+已经证实的远程可移植接收路径打开的是**由副本支持**的载荷所有者。经远程传输时，`cc.hold()` 是生命周期契约，不构成零拷贝声明：它一同保留响应的本地副本与载荷所有者，并保证释放本地副本*之前*，先让载荷所有者及其受检查的视图失效（同进程直调路径上，`cc.hold()` 只用 `HeldResult(result)` 包装原 Python 对象，没有传输副本也不会触发 FastDB 失效）。
 
 ```python
-with cc.hold(echo.echo)(source) as held:
-    payload = held.value                    # FastDB Payload owner; checked views stay valid
-    ...
+with cc.connect(Echo, name='echo', address=cc.server_address()) as echo:
+    with cc.hold(echo.echo)(source) as held:
+        payload = held.value                    # FastDB Payload owner; checked views stay valid
+        ...
 # leaving the block (or held.release()) invalidates the payload owner and checked views, then frees the local copy
 ```
 
@@ -159,9 +161,9 @@ with cc.connect(Simulation, name='basin', address='ipc://resource-process') as s
     outcome = results.close()
 ```
 
-生成器的每一次 `next()` 是一个资源推进：只在推进期间持有路由许可与 GIL，经 IPC 时还持有一个执行 worker，条目之间什么都不占。一条流开始时复制一次 context，建立生成器、每次 `next()` 与最后的 `close()` 都在这一个 context 里运行，所以生成器里设置的 `contextvars` 与 `decimal` context 跨 worker 跟着它走，也不会漏进 worker 自己的 context。经 IPC 时每条条目在它的推进里编码，生成器 yield 之后可以复用或修改同一个对象；在同一进程里，消费方拿到的就是 yield 出来的那个对象。借用的输入（`input_lifetime='borrowed'`）一直有效，到生成器关闭之后才先失效、再释放。
+生成器的每一次 `next()` 是一个资源推进：只在推进期间持有路由许可与 GIL，经 IPC 时还持有一个执行 worker，条目之间什么都不占。一条流开始时复制一次 context，建立生成器、每次 `next()` 与最后的 `close()` 都在这一个 context 里运行，所以生成器里设置的 `contextvars` 与 `decimal` context 跨 worker 跟着它走，也不会漏进 worker 自己的 context。经 IPC 时每条条目在它的推进里编码，生成器 yield 之后可以复用或修改同一个对象；在同一进程里，消费方拿到的就是 yield 出来的那个对象。经传输解码且以 `cc.register(..., input_lifetime={'steps': 'borrowed'})` 注册时，借用的输入一直有效，到生成器关闭之后才先失效、再释放（同进程直调直接传递调用方对象，不做借用输入失效）。
 
-调用返回一个 `cc.Stream`，迭代得到解码后的条目。离开 `with` 块或丢弃这个对象会取消它，不等待。`close(timeout=30.0)` 在流还在运行时先取消，再等原调用结束：`None` 一直等，`0` 只观察一次。它返回一个 dict，含 `completed`、`error` 与 `complete_items`；`completed` 为 False 时清理还在进行，之后可以再调用 `close()` 观察。`error` 是这条流结束时的异常，自然结束时为 `None`；服务端或 relay 结束的流报 `CallCancelled`，消息写明是 shutdown、注销还是 relay 关闭。`cc.hold(sim.steps)(parameters)` 返回由 `HeldResult` 组成的流，每条各自保留本地副本直到释放；多份 hold 可以同时存在，用满客户端域的内存预算时，下一条等到某一份释放。`cc.with_call_options` 给的截止时间涵盖整条迭代，不为每条重置；到期只结束调用方的等待。每条流占一个 `max_outstanding_calls` 名额，直到它的真实终态。
+调用返回一个 `cc.Stream`，迭代得到解码后的条目。离开 `with` 块或丢弃这个对象会取消它，不等待。`close(timeout=30.0)` 在流还在运行时先取消，再等原调用结束：`None` 一直等，`0` 只观察一次。它返回一个 dict，含 `completed`、`error` 与 `complete_items`；`completed` 为 False 时清理还在进行，之后可以再调用 `close()` 观察。`error` 是这条流结束时的异常，自然结束时为 `None`；服务端或 relay 结束的流报 `CallCancelled`，消息写明是 shutdown、注销还是 relay 关闭。经 IPC 或 relay HTTP 时，`cc.hold(sim.steps)(parameters)` 返回由 `HeldResult` 组成的流，每条各自保留本地副本直到释放；多份 hold 可以同时存在，用满客户端域的内存预算时，下一条等到某一份释放（同进程直调路径上，每条只以 `HeldResult(item)` 包装原对象，不经传输复制也不计入 `holds`）。`cc.with_call_options` 给的截止时间涵盖整条迭代，不为每条重置；到期只结束调用方的等待。每条流占一个 `max_outstanding_calls` 名额，直到它的真实终态。
 
 在注册资源的进程里，流直接传递 yield 出来的对象，不编码，按路由自己的并发限制推进；有限的调用截止时间在派发前被拒绝。经 IPC 时，Python 与 Rust 的资源和客户端可以互相开流；经 relay 时它们经 HTTP 开流，`cc.Stream`、`close` 与 hold 的行为相同。经 relay 时，消费方停止读取后，资源最多还能多推进 HTTP 与 TCP 缓冲装得下的那么多条，小条目可达数千条。推进、取消与 shutdown 见 [Runtime 生命周期](runtime-lifecycle.md#execution-admission)。
 
@@ -169,7 +171,7 @@ with cc.connect(Simulation, name='basin', address='ipc://resource-process') as s
 
 ### Python SDK
 
-`c_two` 根模块只容纳日常 API：契约装饰器、`hold` / `HeldResult`、register / connect / close / unregister / serve / shutdown、`server_address`、`with_call_options`、各 setter、`Runtime`、`ConcurrencyConfig` 和 `error`。端点维护、诊断与契约工具分别位于 `c_two.endpoint`、`c_two.observe` 和 `c_two.contract`；Rust SDK 在 `c_two::` 下使用相同的三个模块。不要为这些能力新增根模块名称、别名或第二种拼写；并发模式和输入生命周期等选项值使用字符串字面量。
+`c_two` 根模块只容纳日常 API：契约装饰器（`crm`、`read`、`write`、`stream`、`transfer`、`on_shutdown`）、`Stream` / `StreamCloseReceipt`、`hold` / `HeldResult`、register / connect / close / unregister / serve / shutdown、`server_address`、`with_call_options`、各 setter、`Runtime`、`ConcurrencyConfig` 和 `error`。端点维护、诊断与契约工具分别位于 `c_two.endpoint`、`c_two.observe` 和 `c_two.contract`；Rust SDK 在 `c_two::` 下使用相同的三个模块。不要为这些能力新增根模块名称、别名或第二种拼写；并发模式和输入生命周期等选项值使用字符串字面量。
 
 应用以 `import c_two as cc` 开始。需要时导入专用模块：
 
@@ -188,12 +190,12 @@ use fastdb::Payload;
 
 契约导出不选择 Runtime。并发模式为 `'parallel'`、`'exclusive'` 和 `'read_parallel'`；注册输入生命周期为 `'materialized'` 和 `'borrowed'`。
 
-- 编写契约：`@cc.crm`、`@cc.read`、`@cc.write`、`@cc.on_shutdown`、`@cc.transfer`、`cc.hold`
+- 编写契约：`@cc.crm`、`@cc.read`、`@cc.write`、`@cc.stream`、`@cc.on_shutdown`、`@cc.transfer`、`cc.hold`、`cc.HeldResult`、`cc.Stream`、`cc.StreamCloseReceipt`
 - 调用：`cc.with_call_options`（按调用设置截止时间的视图，见[远程连接与截止时间](#远程连接与截止时间)）
 - Runtime：`cc.Runtime`，其实例方法包括 `set_local_endpoint`、`set_server`、`set_client`、`set_relay_anchor`、`register`、`connect`、`unregister`、`start`、`server_id`、`server_address`、`server_credential`、`local_endpoint_context`、`shutdown`、`connection_events`、`lifecycle_snapshot`、`shutdown_outcome`、`memory_stats` 和 `call_execution_snapshot`
-- 默认 Runtime：`cc.register`、`cc.connect`、`cc.unregister`、`cc.serve`、`cc.shutdown`、`cc.server_address`、`cc.endpoint.server_credential`、`cc.set_server`、`cc.set_client`、`cc.set_relay_anchor`、`cc.endpoint.set_local_endpoint`；`cc.close(proxy)` 跟随代理自身的连接
+- 默认 Runtime：`cc.register`、`cc.connect`、`cc.unregister`、`cc.serve`、`cc.shutdown`、`cc.server_address`、`cc.endpoint.server_credential`、`cc.endpoint.server_id`、`cc.set_server`、`cc.set_client`、`cc.set_relay_anchor`、`cc.endpoint.set_local_endpoint`；`cc.close(proxy)` 跟随代理自身的连接
 - 契约：`cc.contract.export_descriptor`、`cc.contract.release_ref`、`cc.contract.compile_artifacts`、`cc.contract.diagnostics`
-- 端点维护：`cc.endpoint.inspect_endpoint`、`cc.endpoint.reap_endpoint`、`cc.endpoint.sweep_endpoints`、`cc.endpoint.EndpointCredential`（不可变的原生值；显式 JSON 导入/导出）
+- 端点维护：`cc.endpoint.inspect_endpoint`、`cc.endpoint.reap_endpoint`、`cc.endpoint.sweep_endpoints`、`cc.endpoint.local_endpoint_context`、`cc.endpoint.LocalEndpointContext`、`cc.endpoint.EndpointCredential`（不可变的原生值；显式 JSON 导入/导出）
 - 连接观察：`cc.observe.connection_observation`、`cc.observe.connection_events`、`cc.observe.ConnectionObservation`、`cc.observe.ConnectionClosed`、`cc.observe.ConnectionEvent`、`cc.observe.ConnectionEvents`、`cc.observe.ConnectionEventsLagged`
 - 错误：`cc.error.ErrorCode`、`cc.error.CoreError`（结构化本地/Core 错误，含只读 `semantic`）、`cc.error.CCError`（语义错误，含 `side` 与 `stage`，包括 `ResourceExecutionError`、`SerializationError` 及路由/协议子类），共同基类 `cc.error.CCBaseError`（暴露只读 `transport_phase`）
 - 监控：`cc.observe.memory_stats`、`cc.observe.call_execution_snapshot`、`cc.observe.lifecycle_snapshot`、`cc.observe.shutdown_outcome`（只读）
@@ -220,7 +222,7 @@ print(memory["client"]["memory"], calls["server"]["used_operations"])
 
 ### CRM 契约、客户端与名称
 
-CRM 契约类是接口，其方法体为 `...`。`@cc.crm()` 要求 `namespace` 和 `version`；契约类名不加 `I` 前缀。资源实现是以领域命名的普通类，例如 `NestedGrid` 或 `PostgresVectorLayer`；生成代码可以使用 `{ContractName}Impl`。可传输类使用 `GridAttribute` 等描述性数据名称。
+CRM 契约类是接口，其方法体为 `...`。`@cc.crm()` 要求 `namespace` 和 `version`；契约类名不加 `I` 前缀。资源实现是以领域命名的普通类，例如 `NestedGrid` 或 `PostgresVectorLayer`；生成代码可以使用 `{ContractName}Impl`。仅在 Python 对端之间传递的数据类型使用 `GridAttribute` 等描述性领域名称。
 
 ```python
 @cc.crm(namespace='cc.demo', version='0.1.0')
@@ -278,9 +280,9 @@ cc.shutdown()
 
 `cc.Runtime()` 在一个原生会话之上创建独立的 Python 绑定。它的 `set_*`、`register`、`connect`、`unregister` 和 `shutdown` 方法与模块级函数签名相同。模块函数使用另一个默认 Runtime。每个显式实例的代码覆盖值初始为空；进程环境和 `.env` 仍是共享配置来源，由 Core 在各角色激活时各解析一次。不同 Runtime 需要不同设置时，使用各自的实例 setter。独立性意味着在同一进程内分别拥有路由、连接、观察及配置。
 
-`runtime.start()` 启动未注册 CRM 的 Host，并等待原生就绪及现有 IPC PING/PONG。随后 `runtime.register()` 使用该 Host。没有显式地址时，`runtime.connect()` 仅搜索该实例的本地路由；跨实例 IPC 调用应使用 `address=other.server_address()`，并采用相同的 Unix 端点上下文。`cc.close(proxy)`、代理的上下文管理器、`cc.hold()` 和 `cc.with_call_options()` 均跟随创建该代理的 Runtime。显式实例没有 `serve()` 方法，也没有自动信号或 atexit 清理；`cc.serve()` 处理模块级默认 Runtime。
+`runtime.start()` 启动未注册 CRM 的 Host，并等待原生就绪及现有 IPC PING/PONG。随后 `runtime.register()` 使用该 Host。没有显式地址时，`runtime.connect()` 先搜索该实例的本地路由，本地未命中时再经该实例配置的 relay 锚点按名解析；不经 relay 做跨实例直连 IPC 调用时，使用 `address=other.server_address()` 并采用相同的 Unix 端点上下文。`cc.close(proxy)`、代理的上下文管理器、`cc.hold()` 和 `cc.with_call_options()` 均跟随创建该代理的 Runtime。显式实例没有 `serve()` 方法，也没有自动信号或 atexit 清理；`cc.serve()` 处理模块级默认 Runtime。
 
-调用 `runtime.shutdown(timeout=...)` 会为该 SDK 会话启动 Core Runtime 唯一且永久的退役作用域；模块级 `cc.shutdown()` 对默认 Runtime 执行相同操作。该作用域封闭 Core 客户端池，并停止接受新的注册、启动和远程连接任务。待定观察保留旧会话及其槽位；Core 此后自行完成也不会替换它们。应再次调用 SDK shutdown，消费已完成的回执并进行会话交接。零或较短的等待预算只限制当前调用方的观察，不取消驱动任务。如果交接退役之前截止时间到期，shutdown 抛出 `CoreError`，包含 `lifecycle_kind='shutdown_wait_timeout'`、`details.stage` 和 `timeout_seconds`；这不是待定回执。Python 的数值转换在取得 SDK 实例锁前发生。等待取得该锁不计入 shutdown 截止时间；取得锁后，Native Host、Core 与连接池等待共用一个绝对截止时间。关闭错误投影和关闭回调在 Python 绑定锁外运行。回调在会话替换后运行；如果构造替换会话失败，原始槽位及日志仍可用。
+调用 `runtime.shutdown(timeout=...)` 会为该 SDK 会话启动 Core Runtime 唯一且永久的退役作用域；模块级 `cc.shutdown()` 对默认 Runtime 执行相同操作。该作用域封闭 Core 客户端池，并停止接受新的注册、启动和远程连接任务。待定观察保留旧会话及其槽位；Core 此后自行完成也不会替换它们。应再次调用 SDK shutdown，消费已完成的回执并进行会话交接。零或较短的等待预算只限制当前调用方的观察，不取消驱动任务。如果交接退役之前截止时间到期，shutdown 抛出 `CoreError`，包含 `lifecycle_kind='shutdown_wait_timeout'`、`details.stage` 和 `timeout_seconds`；这不是待定回执。`shutdown()` 先取得 SDK 实例锁并调用原生 `begin_shutdown(timeout_seconds=...)`（完成超时参数校验与启动退役观察），释放该锁后再调用 `observe()`，使观察等待、关闭错误投影和关闭回调都在 Python 绑定锁外运行；启动退役后，Native Host、Core 与连接池等待共用一个绝对截止时间。回调在会话替换后运行；如果构造替换会话失败，原始槽位及日志仍可用。
 
 关闭从不让已发出的一元调用失败：其他线程上的在途调用照常完成并拿到结果，它们还在执行时，关闭报告 `completed=False`。这个 Runtime 作为资源方的服务端流是例外：关闭在两步之间结束它，先交付已产出的条目，再执行清理，最后以写明 shutdown 的 `CallCancelled` 结束；关闭要等这次清理结束才算完成。这个 Runtime 作为客户端消费的流不会被它自己的关闭结束，要显式关闭或丢弃。一个没设调用期限、在等一个停住的服务端的线程会继续等下去，而 Python 退出前会等所有非守护线程；这类调用请用 `cc.with_call_options(timeout=...)` 设期限。
 
