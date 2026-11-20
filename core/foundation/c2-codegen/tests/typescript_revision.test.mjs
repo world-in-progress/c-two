@@ -6,7 +6,7 @@ import {join} from 'node:path';
 import {fileURLToPath,pathToFileURL} from 'node:url';
 import {delimiter} from 'node:path';
 import test from 'node:test';
-import {prependEnvPaths,writeRenderedTypescriptTransport} from './render_typescript_transport.mjs';
+import {buildFastDbEnvironment,prependEnvPaths,writeRenderedTypescriptTransport} from './render_typescript_transport.mjs';
 
 const directory=mkdtempSync(join(tmpdir(),'c2-ts-revision-'));
 let transport;
@@ -1434,5 +1434,312 @@ test('extension JSON depth/IEEE-754 boundaries and synchronous reader cleanup fa
       await assert.rejects(obsIpc.call('route',contract,'ping',()=>new Uint8Array()),/ipc observer boom/);
       assert.deepEqual({ipcAllocated,ipcFreed,nativeFreed},{ipcAllocated:1,ipcFreed:1,nativeFreed:1});
     }finally{await obsIpc.close()}
+  }
+
+  // 8. Fixed-length HTTP response reads allocated.payload getter ONLY AFTER view is populated (delivering [10, 20], not [0, 0]).
+  {
+    let getterReads=0,freed=0;
+    const snapHttp=transport.createRelayAwareHttpEncodedTransport('http://localhost:8300',{
+      responsePayloadAllocator(byteLength){
+        const view=new Uint8Array(byteLength);
+        return {
+          view,
+          get payload(){
+            getterReads++;
+            return view.slice();
+          },
+          release(){freed++;},
+        };
+      },
+      fetch:async(url,init)=>{
+        if(url.includes('/_resolve/'))return textReply(200,JSON.stringify([relayRoute()]));
+        if(url.includes('/_probe/'))return relayResponse();
+        assert.equal(init.method,'POST');
+        return new Response(Uint8Array.of(10,20),{status:200,headers:{'content-length':'2'}});
+      },
+    });
+    try{
+      const delivered=await snapHttp.call('route',contract,'ping',()=>new Uint8Array());
+      assert.deepEqual([...delivered],[10,20]);
+      assert.equal(getterReads,1);
+      assert.equal(freed,0);
+    }finally{await snapHttp.close()}
+
+    let badPayloadFreed=0;
+    const badSnapHttp=transport.createRelayAwareHttpEncodedTransport('http://localhost:8300',{
+      responsePayloadAllocator(byteLength){
+        const view=new Uint8Array(byteLength);
+        return {
+          view,
+          get payload(){throw new Error('getter failed after fill');},
+          release(){badPayloadFreed++;},
+        };
+      },
+      fetch:async(url,init)=>{
+        if(url.includes('/_resolve/'))return textReply(200,JSON.stringify([relayRoute()]));
+        if(url.includes('/_probe/'))return relayResponse();
+        assert.equal(init.method,'POST');
+        return new Response(Uint8Array.of(10,20),{status:200,headers:{'content-length':'2'}});
+      },
+    });
+    try{
+      await assert.rejects(badSnapHttp.call('route',contract,'ping',()=>new Uint8Array()),err=>{
+        assert.ok(err instanceof transport.C2HttpTransportError);
+        assert.equal(err.retrySafe,false);
+        return true;
+      });
+      assert.equal(badPayloadFreed,1);
+    }finally{await badSnapHttp.close()}
+  }
+
+  // 9. Stream enqueuing final chunk on abort never writes after allocator release, and per-chunk abort guard does not retain chunks before EOF under GC.
+  {
+    let allocated=0,freed=0,writesAfterRelease=0;
+    const abortChunkClient=transport.createRelayAwareHttpEncodedTransport('http://localhost:8300',{
+      callTimeoutMs:20,
+      responsePayloadAllocator(byteLength){
+        allocated++;
+        const raw=new Uint8Array(byteLength);
+        const view=new Uint8Array(raw.buffer);
+        view.set=(src,off)=>{
+          if(freed>0)writesAfterRelease++;
+          Uint8Array.prototype.set.call(raw,src,off);
+        };
+        return {view,payload:raw,release(){freed++;}};
+      },
+      fetch:async(url,init)=>{
+        if(url.includes('/_resolve/'))return textReply(200,JSON.stringify([relayRoute()]));
+        if(url.includes('/_probe/'))return relayResponse();
+        const body=new ReadableStream({
+          start(controller){
+            init.signal?.addEventListener('abort',()=>{
+              try{controller.enqueue(Uint8Array.of(10,20));controller.close();}catch{}
+            },{once:true});
+          },
+        });
+        return {
+          status:200,
+          headers:{get(n){return n.toLowerCase()==='content-length'?'2':null;}},
+          body,
+          async arrayBuffer(){throw new Error('must stream');},
+        };
+      },
+    });
+    try{
+      await assert.rejects(abortChunkClient.call('route',contract,'ping',()=>new Uint8Array()),err=>{
+        assert.ok(err instanceof transport.C2CoreError);
+        assert.equal(err.code,715);
+        return true;
+      });
+      await nextTurn();
+      await nextTurn();
+      assert.deepEqual({allocated,freed,writesAfterRelease},{allocated:1,freed:1,writesAfterRelease:0});
+    }finally{await abortChunkClient.close()}
+
+    const v8=await import('node:v8');
+    const vm=await import('node:vm');
+    v8.setFlagsFromString('--expose_gc');
+    const forceGc=vm.runInNewContext('gc');
+    const refs=[];
+    let sent=0;
+    let releaseLastChunk;
+    const lastGate=new Promise(r=>{releaseLastChunk=r;});
+    const gcBody=new ReadableStream({
+      async pull(controller){
+        if(sent<24){
+          const chunk=new Uint8Array(1024);
+          chunk[0]=sent;
+          refs.push(new WeakRef(chunk));
+          sent++;
+          controller.enqueue(chunk);
+          return;
+        }
+        await lastGate;
+        controller.close();
+      },
+    });
+    const gcClient=transport.createRelayAwareHttpEncodedTransport('http://localhost:8300',{
+      callTimeoutMs:5000,
+      responsePayloadAllocator(byteLength){
+        const view=new Uint8Array(byteLength);
+        return {view,payload:view};
+      },
+      fetch:async(url)=>{
+        if(url.includes('/_resolve/'))return textReply(200,JSON.stringify([relayRoute()]));
+        if(url.includes('/_probe/'))return relayResponse();
+        return {
+          status:200,
+          headers:{get(n){return n.toLowerCase()==='content-length'?String(24*1024):null;}},
+          body:gcBody,
+          async arrayBuffer(){throw new Error('must stream');},
+        };
+      },
+    });
+    try{
+      const pendingCall=gcClient.call('route',contract,'ping',()=>new Uint8Array());
+      while(sent<24){await nextTurn();}
+      await new Promise(r=>setTimeout(r,10));
+      forceGc();
+      await nextTurn();
+      forceGc();
+      const aliveBeforeEof=refs.filter(r=>r.deref()!==undefined).length;
+      assert.ok(aliveBeforeEof<=2,`expected early chunks collected before EOF, got ${aliveBeforeEof}/24 alive`);
+      releaseLastChunk();
+      const result=await pendingCall;
+      assert.equal(result.byteLength,24*1024);
+    }finally{await gcClient.close()}
+  }
+
+  // 10. IPC cleanup failures (response.release() throw, call.close() throw, and dual copy+release throw) release allocator once and preserve first error.
+  {
+    for(const mode of ['release-throw','close-throw','dual-copy-and-release-throw']){
+      let allocated=0,freed=0,closedCalls=0;
+      const copyBoom=new Error('primary copy failure');
+      const releaseBoom=new Error('native release failure');
+      const closeBoom=new Error('call close failure');
+      const ep={
+        connectionSnapshot(){return null},
+        async prepare(){return binding},
+        beginCall(){return {
+          async chargeInput(){},
+          async dispatch(){return nativeTarget},
+          async next(){
+            const b=Uint8Array.of(7,8);
+            b.release=()=>{
+              if(mode==='release-throw'||mode==='dual-copy-and-release-throw')throw releaseBoom;
+            };
+            return b;
+          },
+          checkDeadline(){},cancel(){},
+          close(){
+            closedCalls++;
+            if(mode==='close-throw')throw closeBoom;
+          },
+          async observe(){return receipt},
+        }},
+        deactivate(){},async close(){},
+      };
+      const ipcClean=transport.createIpcEncodedTransport('ipc://clean',{
+        connect:async()=>ep,
+        responsePayloadAllocator(byteLength){
+          allocated++;
+          const backing=new Uint8Array(byteLength);
+          const view=new Uint8Array(backing.buffer);
+          if(mode==='dual-copy-and-release-throw'){
+            view.set=()=>{throw copyBoom;};
+          }
+          return {view,payload:backing,release(){freed++;}};
+        },
+      });
+      try{
+        const expectedErr=mode==='dual-copy-and-release-throw'?copyBoom:mode==='release-throw'?releaseBoom:closeBoom;
+        await assert.rejects(ipcClean.call('route',contract,'ping',()=>new Uint8Array()),err=>err===expectedErr);
+        assert.deepEqual({mode,allocated,freed,closedCalls},{mode,allocated:1,freed:1,closedCalls:1});
+      }finally{await ipcClean.close()}
+    }
+  }
+
+  // 11. Observer callback throwing inner 713/pre_dispatch never grants retrySafe=true and never poisons route target on HTTP or relay-aware local IPC.
+  {
+    let postCount=0,httpAlloc=0,httpFree=0,throwOnFirst=true;
+    const inner713=new transport.C2CoreError('inner protocol error',{
+      message:'inner protocol error',
+      code:713,
+      canonicalName:'ProtocolViolation',
+      transportPhase:'pre_dispatch',
+      details:{dispatch_phase:'pre_dispatch',inner:'1'},
+    });
+    assert.equal(inner713.retrySafe,true);
+    const isoHttp=transport.createRelayAwareHttpEncodedTransport('http://localhost:8300',{
+      responsePayloadAllocator(byteLength){
+        httpAlloc++;
+        const view=new Uint8Array(byteLength);
+        return {view,payload:view,release(){httpFree++;}};
+      },
+      observe(){
+        if(throwOnFirst){
+          throwOnFirst=false;
+          throw inner713;
+        }
+      },
+      fetch:async(url,init)=>{
+        if(url.includes('/_resolve/'))return textReply(200,JSON.stringify([relayRoute()]));
+        if(url.includes('/_probe/'))return relayResponse();
+        assert.equal(init.method,'POST');
+        postCount++;
+        return new Response(Uint8Array.of(postCount),{status:200,headers:{'content-length':'1'}});
+      },
+    });
+    try{
+      await assert.rejects(isoHttp.call('route',contract,'ping',()=>new Uint8Array()),err=>{
+        assert.ok(err instanceof transport.C2CoreError);
+        assert.notEqual(err,inner713);
+        assert.equal(err.code,713);
+        assert.equal(err.transportPhase,null);
+        assert.equal(err.retrySafe,false);
+        assert.equal(err.cause,inner713);
+        assert.deepEqual(err.details,{inner:'1'});
+        return true;
+      });
+      assert.deepEqual({postCount,httpAlloc,httpFree},{postCount:1,httpAlloc:1,httpFree:1});
+      const second=await isoHttp.call('route',contract,'ping',()=>new Uint8Array());
+      assert.deepEqual([...second],[2]);
+      assert.equal(postCount,2);
+    }finally{await isoHttp.close()}
+
+    let ipcPosts=0,throwIpcFirst=true;
+    const localBinding={serverId:'s1',serverInstanceId:'i1',connectionId:1n};
+    const localEp={
+      connectionSnapshot(){return null},
+      async prepare(){return localBinding},
+      beginCall(){return {
+        async chargeInput(){},
+        async dispatch(){ipcPosts++;return {...localBinding,path:'RelayAwareLocalIpc'};},
+        async next(){const b=Uint8Array.of(ipcPosts);b.release=()=>{};return b;},
+        checkDeadline(){},cancel(){},close(){},
+        async observe(){return receipt},
+      }},
+      deactivate(){},async close(){},
+    };
+    const isoLocal=transport.createRelayAwareHttpEncodedTransport('http://localhost:8300',{
+      ipc:{connect:async()=>localEp},
+      observe(){
+        if(throwIpcFirst){
+          throwIpcFirst=false;
+          throw inner713;
+        }
+      },
+      fetch:async(url)=>{
+        if(url.includes('/_resolve/')){
+          return textReply(200,JSON.stringify([relayRoute(1,true)]));
+        }
+        throw new Error(`unexpected HTTP fetch: ${url}`);
+      },
+    });
+    try{
+      await assert.rejects(isoLocal.call('route',contract,'ping',()=>new Uint8Array()),err=>{
+        assert.ok(err instanceof transport.C2CoreError);
+        assert.equal(err.retrySafe,false);
+        assert.equal(err.transportPhase,null);
+        assert.equal(err.cause,inner713);
+        return true;
+      });
+      const secondLocal=await isoLocal.call('route',contract,'ping',()=>new Uint8Array());
+      assert.deepEqual([...secondLocal],[2]);
+      assert.equal(ipcPosts,2);
+    }finally{await isoLocal.close()}
+  }
+
+  // 12. Explicit FASTDB_CORE_SDK_DIR pointing to an empty directory fails loudly rather than silently falling back.
+  {
+    const emptySdkDir=mkdtempSync(join(tmpdir(),'c2-empty-fastdb-sdk-'));
+    try{
+      assert.throws(
+        ()=>buildFastDbEnvironment({FASTDB_CORE_SDK_DIR:emptySdkDir}),
+        /FASTDB_CORE_SDK_DIR does not contain a matching FastDB library/,
+      );
+    }finally{
+      rmSync(emptySdkDir,{recursive:true,force:true});
+    }
   }
 });

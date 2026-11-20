@@ -2229,6 +2229,10 @@ def test_post_dispatch_prepared_close_exception_group_and_fastdb_hostile_class_g
             yield value
 
     rt2 = cc.Runtime()
+    if sys.platform != 'win32':
+        prop_dir = tmp_path / 'closed_prop_ipc'
+        prop_dir.mkdir()
+        rt2.set_local_endpoint(root=str(prop_dir))
     rt2.register(CodecBoundary, ClosedPropertyResource(), name='closed-prop')
     prop_proxy = rt2.connect(CodecBoundary, name='closed-prop')
     try:
@@ -2363,3 +2367,248 @@ def test_post_dispatch_prepared_close_exception_group_and_fastdb_hostile_class_g
     finally:
         gpayload.close()
         sys.modules.pop(gspec.name, None)
+
+    # 6. Post-BaseException MRO mixin, unhashable metaclass + hostile __class__ attribute,
+    # CoreError semantic slot cycle prevention, and diagnostic preservation on rebuild.
+    import gc
+    import weakref
+    from c_two.error import CoreError
+
+    class _PostBaseMixin:
+        details = {
+            'dispatch_phase': 'pre_dispatch',
+            'fallback_eligible': 'true',
+            'biz': 'from-mixin',
+        }
+
+    class _MixinClosedError(ResourceClosed, _PostBaseMixin):
+        def __init__(self):
+            Exception.__init__(self, 'mixin closed')
+            self.code = ErrorCode.ResourceClosed
+            self.message = 'mixin closed'
+            self._transport_phase = 'pre_dispatch'
+
+    class _HostileAttr:
+        @property
+        def __class__(self):  # type: ignore[override]
+            raise RuntimeError('__class__ accessed during descriptor check')
+
+    class _UnhashableErrorMeta(type):
+        __hash__ = None  # type: ignore[assignment]
+
+        def __eq__(cls, other: object) -> bool:
+            return cls is other
+
+    class _UnhashableClosed(ResourceClosed, metaclass=_UnhashableErrorMeta):
+        marker = _HostileAttr()
+
+        def __init__(self):
+            super().__init__(
+                'unhashable closed',
+                details={'dispatch_phase': 'pre_dispatch', 'biz': 'unhashable-kept'},
+                transport_phase='pre_dispatch',
+            )
+
+    class _SetterDetailsClosed(ResourceClosed):
+        def __init__(self):
+            self._stored: dict[str, str] = {}
+            super().__init__(
+                'setter closed',
+                details={'batch': '7', 'transport_phase': 'pre_dispatch'},
+            )
+
+        @property
+        def details(self) -> dict[str, str]:  # type: ignore[override]
+            return self._stored
+
+        @details.setter
+        def details(self, value: dict[str, str]) -> None:
+            self._stored = dict(value)
+
+    for idx, make_cls_err in enumerate((_MixinClosedError, _UnhashableClosed, _SetterDetailsClosed)):
+        expected_biz = (
+            {'biz': 'from-mixin'}
+            if idx == 0
+            else {'biz': 'unhashable-kept'}
+            if idx == 1
+            else {'batch': '7'}
+        )
+
+        class EdgeSemanticResource:
+            def echo(self, value):
+                raise make_cls_err()
+
+            def steps(self, value):
+                yield value
+
+        rt_edge = cc.Runtime()
+        if sys.platform != 'win32':
+            edge_dir = tmp_path / f'edge_sem_{idx}'
+            edge_dir.mkdir()
+            rt_edge.set_local_endpoint(root=str(edge_dir))
+        rt_edge.register(CodecBoundary, EdgeSemanticResource(), name=f'edge-{idx}')
+        edge_proxy = rt_edge.connect(CodecBoundary, name=f'edge-{idx}')
+        try:
+            with pytest.raises(ResourceClosed) as edge_caught:
+                edge_proxy.echo('go')
+            assert edge_caught.value.code == ErrorCode.ResourceClosed
+            assert edge_caught.value.transport_phase is None
+            assert edge_caught.value.details == expected_biz
+        finally:
+            cc.close(edge_proxy)
+            rt_edge.shutdown()
+
+    # 6b. CoreError subclass shadowing semantic via __slots__ in prepared.close() after dispatch
+    # through generated ContractClient (both unary _project_call and stream _close_prepared):
+    # never projects ResourceClosed(pre_dispatch) and forms zero refcycle under gc.disable().
+    from c_two.error import _post_dispatch_cleanup_error
+
+    class _SlottedSemanticCore(CoreError):
+        __slots__ = ('semantic',)
+
+    unary_fixture = Path(__file__).resolve().parents[4] / 'tests/fixtures/contracts/portable-release.contract.json'
+    compiled_unary = cc.contract.compile_artifacts(unary_fixture.read_bytes(), target='python')
+    gen_unary_dir = tmp_path / 'gen_slotted_sem_core'
+    for artifact in compiled_unary.artifacts:
+        dest = gen_unary_dir / artifact.relative_path
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(artifact.bytes)
+    uspec = importlib.util.spec_from_file_location(
+        '_gen_slotted_sem_mod', gen_unary_dir / 'python/c_two_contract.py',
+    )
+    assert uspec is not None and uspec.loader is not None
+    umod = importlib.util.module_from_spec(uspec)
+    sys.modules[uspec.name] = umod
+    upayload_in, _ = echo_payload('in')
+    upayload_out, _ = echo_payload('out')
+    out_bytes = bytes(upayload_out.binary_bytes())
+    try:
+        uspec.loader.exec_module(umod)
+        gc_was_enabled = gc.isenabled()
+        gc.disable()
+        try:
+            def run_slotted_semantic_close():
+                inner_sem = ResourceClosed('shadowed pre_dispatch', transport_phase='pre_dispatch')
+                slotted_core = _SlottedSemanticCore('transport', 'close failed after reply')
+                slotted_core.semantic = inner_sem  # type: ignore[misc]
+                core_ref = weakref.ref(slotted_core)
+                sem_ref = weakref.ref(inner_sem)
+
+                class StreamSlottedPrepared:
+                    def __init__(self, err: CoreError):
+                        self._err = err
+
+                    def charge_input(self, _n: int) -> None:
+                        return None
+
+                    def stream(self, _data: bytes):
+                        return _FakeNativeStream([])
+
+                    def _pop_err(self) -> CoreError:
+                        err = self._err
+                        self._err = None  # type: ignore[assignment]
+                        return err
+
+                    def close(self) -> None:
+                        raise self._pop_err()
+
+                class StreamSlottedBound:
+                    local_copy_tracker = None
+                    route_name = 'slotted-stream'
+
+                    def __init__(self, err: CoreError):
+                        self._err = err
+
+                    def begin_stream(self, _method: str):
+                        err = self._err
+                        self._err = None  # type: ignore[assignment]
+                        return StreamSlottedPrepared(err)
+
+                    def call(self, _method: str, _data: bytes) -> bytes:
+                        return b''
+
+                gen_stream_client = gmod.ContractClient(StreamSlottedBound(slotted_core))
+                try:
+                    gen_stream_client.method_1_echo(upayload_in)
+                    raise AssertionError('expected CoreError')
+                except CoreError as caught_core:
+                    assert type(caught_core) is CoreError
+                    assert caught_core.transport_phase is None
+                    assert caught_core.semantic is None
+
+                # Also exercise uncleaned _SlottedSemanticCore reaching unary ContractClient._project_call
+                inner_sem2 = ResourceClosed('direct shadowed pre_dispatch', transport_phase='pre_dispatch')
+                slotted_core2 = _SlottedSemanticCore('transport', 'direct pre-cleaned close')
+                slotted_core2.semantic = inner_sem2  # type: ignore[misc]
+                core_ref2 = weakref.ref(slotted_core2)
+                sem_ref2 = weakref.ref(inner_sem2)
+
+                class RawSlottedBound:
+                    def __init__(self, err: CoreError):
+                        self._err = err
+
+                    def _pop_err(self) -> CoreError:
+                        err = self._err
+                        self._err = None  # type: ignore[assignment]
+                        return err
+
+                    def call(self, _method: str, _data: bytes) -> bytes:
+                        raise self._pop_err()
+
+                gen_uc2 = umod.ContractClient(RawSlottedBound(slotted_core2))
+                try:
+                    gen_uc2.method_1_echo(upayload_in)
+                    raise AssertionError('expected _SlottedSemanticCore')
+                except CoreError as raw_caught:
+                    assert raw_caught is slotted_core2
+                    assert raw_caught.transport_phase is None
+
+                del inner_sem, slotted_core, gen_stream_client, inner_sem2, slotted_core2, gen_uc2
+                return core_ref, sem_ref, core_ref2, sem_ref2
+
+            core_ref, sem_ref, core_ref2, sem_ref2 = run_slotted_semantic_close()
+            assert core_ref() is None
+            assert sem_ref() is None
+            assert core_ref2() is None
+            assert sem_ref2() is None
+        finally:
+            if gc_was_enabled:
+                gc.enable()
+    finally:
+        upayload_in.close()
+        upayload_out.close()
+        sys.modules.pop(uspec.name, None)
+
+    # 6c. Slotted CoreError diagnostic preservation and bare CCBaseError details preservation on rebuild.
+
+    class _SlottedDiagCore(CoreError):
+        __slots__ = ('io_kind', 'raw_os_error')
+
+        @property
+        def transport_phase(self):  # type: ignore[override]
+            return 'pre_dispatch'
+
+    diag_core = _SlottedDiagCore('transport', 'bind permission denied')
+    diag_core.io_kind = 'permission_denied'
+    diag_core.raw_os_error = 13
+    diag_core.details = {'dispatch_phase': 'pre_dispatch', 'path': '/tmp/sock'}
+    rebuilt_core = _post_dispatch_cleanup_error(diag_core)
+    assert type(rebuilt_core) is CoreError
+    assert rebuilt_core.transport_phase is None
+    assert rebuilt_core.io_kind == 'permission_denied'
+    assert rebuilt_core.raw_os_error == 13
+    assert rebuilt_core.details == {'path': '/tmp/sock'}
+    assert rebuilt_core.__cause__ is diag_core
+
+    class _DetailsBaseError(CCBaseError):
+        @property
+        def transport_phase(self):  # type: ignore[override]
+            return 'pre_dispatch'
+
+    base_with_details = _DetailsBaseError('base cleanup error')
+    base_with_details.details = {'biz': 'base-kept', 'transport_phase': 'pre_dispatch'}  # type: ignore[attr-defined]
+    rebuilt_base = _post_dispatch_cleanup_error(base_with_details)
+    assert type(rebuilt_base) is CCBaseError
+    assert rebuilt_base.transport_phase is None
+    assert rebuilt_base.details == {'biz': 'base-kept'}  # type: ignore[attr-defined]
+    assert rebuilt_base.__cause__ is base_with_details

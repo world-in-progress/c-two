@@ -87,16 +87,24 @@ export function prependEnvPaths(env, key, dirs) {
   env[key] = [...desired, ...remaining].join(delimiter);
 }
 
-function buildFastDbEnvironment() {
-  const env = { ...process.env };
+export function buildFastDbEnvironment(baseEnv = process.env) {
+  const env = { ...baseEnv };
   let runtimeDirs = [];
   if (env.FASTDB_PAYLOAD_SYSTEM_LIB_DIR) {
     const dir = resolve(env.FASTDB_PAYLOAD_SYSTEM_LIB_DIR);
     env.FASTDB_PAYLOAD_SYSTEM_LIB_DIR = dir;
     runtimeDirs = [dir];
+  } else if (env.FASTDB_CORE_SDK_DIR) {
+    const sdkRoot = resolve(env.FASTDB_CORE_SDK_DIR);
+    const discovered = findFastDbLibraryLocations(sdkRoot);
+    if (discovered === undefined) {
+      throw new Error(`FASTDB_CORE_SDK_DIR does not contain a matching FastDB library: ${sdkRoot}`);
+    }
+    env.FASTDB_PAYLOAD_LINK_MODE = 'system';
+    env.FASTDB_PAYLOAD_SYSTEM_LIB_DIR = discovered.linkDir;
+    runtimeDirs = discovered.runtimeDirs;
   } else {
     const discovered =
-      (env.FASTDB_CORE_SDK_DIR ? findFastDbLibraryLocations(resolve(env.FASTDB_CORE_SDK_DIR)) : undefined) ??
       findFastDbLibraryLocations(resolve(repoRoot, '.venv')) ??
       findFastDbLibraryLocations(resolve(repoRoot, '..', 'fastdb', 'build'));
     if (discovered !== undefined) {

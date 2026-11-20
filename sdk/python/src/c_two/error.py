@@ -18,7 +18,7 @@ TransportPhase = Literal['pre_dispatch', 'dispatch_uncertain']
 _PHASE_VALUES = ('pre_dispatch', 'dispatch_uncertain')
 _CALLBACK_DETAIL_KEYS = ('transport_phase', 'dispatch_phase', 'fallback_eligible', 'route_withdrawal')
 _SKIPPED_EXCEPTION_DESCRIPTORS = frozenset({
-    '__dict__', '__weakref__', 'args', '__traceback__', '__context__', '__cause__', '__suppress_context__',
+    '__dict__', '__weakref__', '__notes__', 'args', '__traceback__', '__context__', '__cause__', '__suppress_context__',
 })
 _BASE_EXCEPTION_DICT = vars(BaseException)['__dict__']
 _DEFAULT_MESSAGE = 'Error occurred when using C-Two.'
@@ -30,7 +30,7 @@ def _raw_instance_dict(exc: BaseException) -> dict[str, object]:
         raw = _BASE_EXCEPTION_DICT.__get__(exc, type(exc))  # type: ignore[union-attr]
     except BaseException:
         return {}
-    return raw if isinstance(raw, dict) else {}
+    return raw if issubclass(type(raw), dict) else {}
 
 
 def _validated_phase(value: object) -> TransportPhase | None:
@@ -92,7 +92,7 @@ class CCBaseError(Exception):
             state['__notes__'] = state['__notes__'].copy()
         slots = _extract_oserror_slots(self) if issubclass(cls, OSError) else {}
         for base in cls.__mro__:
-            if base is BaseException or base is object:
+            if base is object:
                 break
             if base is OSError:
                 # OSError C member pointers (NULL vs explicit None) are captured
@@ -100,7 +100,7 @@ class CCBaseError(Exception):
                 for name, member in vars(base).items():
                     if name in _SKIPPED_EXCEPTION_DESCRIPTORS or name in slots:
                         continue
-                    if isinstance(member, GetSetDescriptorType):
+                    if type(member) is GetSetDescriptorType:
                         try:
                             slot_val = member.__get__(self, cls)
                         except (AttributeError, ValueError):
@@ -112,8 +112,8 @@ class CCBaseError(Exception):
             for name, member in vars(base).items():
                 if name in _SKIPPED_EXCEPTION_DESCRIPTORS or name in slots:
                     continue
-                if isinstance(member, MemberDescriptorType) or (
-                    is_builtin and isinstance(member, GetSetDescriptorType)
+                if type(member) is MemberDescriptorType or (
+                    is_builtin and type(member) is GetSetDescriptorType
                 ):
                     try:
                         slot_val = member.__get__(self, cls)
@@ -278,11 +278,7 @@ class CoreError(CCBaseError, RuntimeError):
         (code, semantic message, details and this error's dispatch phase).
         The ``CoreError`` keeps no reference to the projected exception.
         """
-        snapshot = getattr(self, '_semantic_snapshot', None)
-        if snapshot is None:
-            return None
-        code, message, details, phase = snapshot
-        return CCError._from_parts(code, message, dict(details), transport_phase=phase)
+        return _project_core_semantic_snapshot(self)
 
 
 def _build_error(
@@ -294,6 +290,7 @@ def _build_error(
 ) -> CCError:
     """Construct one exception instance without running ``__init__``."""
     error = Exception.__new__(target)
+    _raw_instance_dict(error)['_cc_canonical_state'] = (code, message, dict(details))
     error.code = code
     error.message = message
     error.details = details
@@ -336,13 +333,22 @@ class CCError(CCBaseError):
         *,
         transport_phase: TransportPhase | None | object = _UNSET,
     ):
-        self.code = _checked_error_code(code)
-        self.message = _DEFAULT_MESSAGE if message is None else message
-        self.details = dict(details or {})
+        resolved_code = _checked_error_code(code)
+        resolved_message = _DEFAULT_MESSAGE if message is None else message
+        resolved_details = dict(details or {})
         if transport_phase is _UNSET:
-            transport_phase = _phase_from_details(self.details)
-        self._transport_phase = _validated_phase(transport_phase)
-        self.args = (self.code, self.message)
+            transport_phase = _phase_from_details(resolved_details)
+        resolved_phase = _validated_phase(transport_phase)
+        _raw_instance_dict(self)['_cc_canonical_state'] = (
+            resolved_code,
+            resolved_message,
+            dict(resolved_details),
+        )
+        self.code = resolved_code
+        self.message = resolved_message
+        self.details = resolved_details
+        self._transport_phase = resolved_phase
+        self.args = (resolved_code, resolved_message)
 
     @property
     def side(self) -> ErrorSide | None:
@@ -612,24 +618,41 @@ def _strip_callback_phases(details: Mapping[str, str]) -> dict[str, str]:
     }
 
 
+def _is_same_type_in(candidate: type, types: tuple[type, ...]) -> bool:
+    for item in types:
+        if candidate is item:
+            return True
+    return False
+
+
+def _is_mapping_without_instance_hooks(value: object) -> bool:
+    cls = type(value)
+    if issubclass(cls, dict):
+        return True
+    try:
+        return issubclass(cls, Mapping)
+    except BaseException:
+        return False
+
+
 def _raw_data_descriptor(cls: type, name: str) -> MemberDescriptorType | GetSetDescriptorType | None:
     for base in cls.__mro__:
-        if base is BaseException or base is object:
+        if base is object:
             break
         member = vars(base).get(name)
-        if isinstance(member, MemberDescriptorType):
+        if type(member) is MemberDescriptorType:
             return member
-        if base.__module__ == 'builtins' and isinstance(member, GetSetDescriptorType):
+        if base.__module__ == 'builtins' and type(member) is GetSetDescriptorType:
             return member
     return None
 
 
 def _raw_slot_descriptor(cls: type, name: str) -> MemberDescriptorType | None:
     for base in cls.__mro__:
-        if base is BaseException or base is object:
+        if base is object:
             break
         member = vars(base).get(name)
-        if isinstance(member, MemberDescriptorType):
+        if type(member) is MemberDescriptorType:
             return member
     return None
 
@@ -663,11 +686,12 @@ def _clear_copied_phase_fields(copied: CCBaseError) -> None:
 
 
 def _details_need_cleanup(raw_details: object) -> bool:
-    if isinstance(raw_details, dict):
-        if type(raw_details) is not dict:
+    cls = type(raw_details)
+    if issubclass(cls, dict):
+        if cls is not dict:
             return True
-        return any(dict.__contains__(raw_details, key) for key in _CALLBACK_DETAIL_KEYS)
-    return isinstance(raw_details, Mapping)
+        return any(dict.__contains__(raw_details, key) for key in _CALLBACK_DETAIL_KEYS)  # type: ignore[arg-type]
+    return _is_mapping_without_instance_hooks(raw_details)
 
 
 _OSERROR_MEMBER_NAMES: tuple[str, ...] = (
@@ -689,20 +713,21 @@ _SAFE_OSERROR_SCALAR_TYPES: tuple[type, ...] = (
     PosixPath,
     WindowsPath,
 )
+_SAFE_OSERROR_CONTAINER_TYPES: tuple[type, ...] = (tuple, list, set, frozenset)
 
 
 def _is_safe_oserror_value(val: object, depth: int = 0) -> bool:
     cls = type(val)
-    if cls in _SAFE_OSERROR_SCALAR_TYPES:
+    if _is_same_type_in(cls, _SAFE_OSERROR_SCALAR_TYPES):
         return True
     if depth >= 4:
         return False
-    if cls in (tuple, list, set, frozenset):
+    if _is_same_type_in(cls, _SAFE_OSERROR_CONTAINER_TYPES):
         return all(_is_safe_oserror_value(item, depth + 1) for item in val)  # type: ignore[attr-defined]
     if cls is dict:
         return all(
             _is_safe_oserror_value(k, depth + 1) and _is_safe_oserror_value(v, depth + 1)
-            for k, v in dict.items(val)
+            for k, v in dict.items(val)  # type: ignore[arg-type]
         )
     return False
 
@@ -725,7 +750,7 @@ def _extract_oserror_slots(exc: OSError) -> dict[str, object]:
             reduced = OSError.__reduce__(exc)
         except BaseException:
             reduced = ()
-        if isinstance(reduced, tuple) and len(reduced) >= 2 and isinstance(reduced[1], tuple):
+        if type(reduced) is tuple and len(reduced) >= 2 and type(reduced[1]) is tuple:
             rargs = reduced[1]
             if len(rargs) >= 3:
                 out['filename'] = rargs[2]
@@ -788,7 +813,7 @@ def _clone_exception_without_user_hooks(exc: CCBaseError) -> CCBaseError:
     dst_dict = _raw_instance_dict(copied)
     dst_dict.update(src_dict)
     raw_notes = dst_dict.get('__notes__')
-    if isinstance(raw_notes, list):
+    if type(raw_notes) is list:
         dst_dict['__notes__'] = raw_notes.copy()
     if issubclass(cls, OSError):
         for key, val in _extract_oserror_slots(exc).items():
@@ -797,13 +822,13 @@ def _clone_exception_without_user_hooks(exc: CCBaseError) -> CCBaseError:
             except (AttributeError, TypeError, ValueError):
                 continue
     for base in cls.__mro__:
-        if base is BaseException or base is object:
+        if base is object:
             break
         if base is OSError:
             for name, member in vars(base).items():
                 if name in _SKIPPED_EXCEPTION_DESCRIPTORS:
                     continue
-                if isinstance(member, GetSetDescriptorType):
+                if type(member) is GetSetDescriptorType:
                     try:
                         slot_val = member.__get__(exc, cls)
                     except (AttributeError, ValueError):
@@ -818,8 +843,8 @@ def _clone_exception_without_user_hooks(exc: CCBaseError) -> CCBaseError:
         for name, member in vars(base).items():
             if name in _SKIPPED_EXCEPTION_DESCRIPTORS:
                 continue
-            if isinstance(member, MemberDescriptorType) or (
-                is_builtin and isinstance(member, GetSetDescriptorType)
+            if type(member) is MemberDescriptorType or (
+                is_builtin and type(member) is GetSetDescriptorType
             ):
                 try:
                     slot_val = member.__get__(exc, cls)
@@ -838,55 +863,79 @@ def _clone_exception_without_user_hooks(exc: CCBaseError) -> CCBaseError:
     return copied  # type: ignore[return-value]
 
 
+_STANDARD_ERROR_CLASSES_TUPLE: tuple[type, ...] = tuple(
+    dict.fromkeys([
+        CCBaseError,
+        CoreError,
+        CCError,
+        _FixedCodeError,
+        *_CODE_TO_CLASS.values(),
+    ]),
+)
+_BASE_DATA_CONTROL_NAMES: frozenset[str] = frozenset({
+    '_transport_phase',
+    'details',
+})
+_CORE_DATA_CONTROL_NAMES: frozenset[str] = _BASE_DATA_CONTROL_NAMES | frozenset({
+    'fallback_eligible',
+    'route_withdrawal',
+    '_semantic_snapshot',
+})
+
+
+def _extract_canonical_details(exc: CCBaseError) -> tuple[object, bool]:
+    raw = _raw_get_field(exc, 'details', _UNSET)
+    if raw is not _UNSET:
+        return raw, True
+    state = _raw_instance_dict(exc).get('_cc_canonical_state')
+    if type(state) is tuple and len(state) == 3:
+        return state[2], True
+    for base in type(exc).__mro__:
+        if base is object:
+            break
+        if _is_same_type_in(base, _STANDARD_ERROR_CLASSES_TUPLE) or base.__module__ == 'builtins':
+            continue
+        member = vars(base).get('details', _UNSET)
+        if member is not _UNSET and type(member) is dict:
+            return member, True
+    return None, False
+
+
 def _safe_strip_callback_details(exc: CCBaseError) -> dict[str, str]:
-    raw = _raw_get_field(exc, 'details')
-    if isinstance(raw, dict):
+    raw, has_details = _extract_canonical_details(exc)
+    if not has_details:
+        return {}
+    if issubclass(type(raw), dict):
         return {
             key: value
-            for key, value in dict.items(raw)
+            for key, value in dict.items(raw)  # type: ignore[arg-type]
             if key not in _CALLBACK_DETAIL_KEYS
         }
-    if isinstance(raw, Mapping):
+    if _is_mapping_without_instance_hooks(raw):
         try:
-            return _strip_callback_phases(raw)
+            return _strip_callback_phases(raw)  # type: ignore[arg-type]
         except BaseException:
             return {}
     return {}
 
 
-_STANDARD_ERROR_CLASSES: frozenset[type] = frozenset({
-    CCBaseError,
-    CoreError,
-    CCError,
-    _FixedCodeError,
-    *_CODE_TO_CLASS.values(),
-})
-_BASE_CONTROL_NAMES: frozenset[str] = frozenset({
-    'transport_phase',
-    '_transport_phase',
-    'details',
-})
-_CORE_CONTROL_NAMES: frozenset[str] = _BASE_CONTROL_NAMES | frozenset({
-    'fallback_eligible',
-    'route_withdrawal',
-    '_semantic_snapshot',
-    'semantic',
-})
-
-
 def _has_custom_control_descriptor(cls: type, *, check_core_flags: bool = False) -> bool:
-    """True when a subclass overrides control attributes or attribute lookup."""
-    names = _CORE_CONTROL_NAMES if check_core_flags else _BASE_CONTROL_NAMES
+    """True when any class in the full MRO overrides control attributes or attribute lookup."""
+    data_names = _CORE_DATA_CONTROL_NAMES if check_core_flags else _BASE_DATA_CONTROL_NAMES
     for base in cls.__mro__:
-        if base is BaseException or base is object:
+        if base is object:
             break
-        if base in _STANDARD_ERROR_CLASSES or base.__module__ == 'builtins':
+        if _is_same_type_in(base, _STANDARD_ERROR_CLASSES_TUPLE) or base.__module__ == 'builtins':
             continue
         namespace = vars(base)
         if '__getattribute__' in namespace or '__getattr__' in namespace:
             return True
-        for name in names:
-            if name in namespace and not isinstance(namespace[name], MemberDescriptorType):
+        if 'transport_phase' in namespace:
+            return True
+        if check_core_flags and 'semantic' in namespace:
+            return True
+        for name in data_names:
+            if name in namespace and type(namespace[name]) is not MemberDescriptorType:
                 return True
     return False
 
@@ -899,10 +948,41 @@ def _has_instance_phase_value(cls: type, exc: BaseException) -> bool:
     )
 
 
+def _semantic_snapshot_needs_cleanup(core: CoreError) -> bool:
+    snapshot = _raw_get_field(core, '_semantic_snapshot')
+    if type(snapshot) is not tuple or len(snapshot) != 4:
+        return False
+    _, _, entries, phase = snapshot
+    if phase is not None:
+        return True
+    if type(entries) is tuple:
+        for entry in entries:
+            if type(entry) is tuple and len(entry) == 2 and entry[0] in _CALLBACK_DETAIL_KEYS:
+                return True
+    return False
+
+
+def _project_core_semantic_snapshot(core: CoreError) -> CCError | None:
+    snapshot = _raw_get_field(core, '_semantic_snapshot')
+    if type(snapshot) is not tuple or len(snapshot) != 4:
+        return None
+    code, message, details, phase = snapshot
+    if not _is_same_type_in(type(code), (int, ErrorCode)) or not issubclass(type(message), str):
+        return None
+    try:
+        detail_map = dict(details)  # type: ignore[arg-type]
+    except BaseException:
+        detail_map = {}
+    return CCError._from_parts(int(code), str(message), detail_map, transport_phase=phase)  # type: ignore[arg-type]
+
+
 def _safe_exception_message(exc: BaseException) -> str:
-    raw_msg = _raw_get_field(exc, 'message', None)
-    if isinstance(raw_msg, str):
-        return raw_msg
+    raw_msg = _raw_get_field(exc, 'message', _UNSET)
+    if raw_msg is not _UNSET and issubclass(type(raw_msg), str):
+        return str(raw_msg)
+    state = _raw_instance_dict(exc).get('_cc_canonical_state')
+    if type(state) is tuple and len(state) == 3 and issubclass(type(state[1]), str):
+        return str(state[1])
     try:
         return BaseException.__str__(exc)
     except BaseException:
@@ -913,7 +993,7 @@ def _rebuild_standard_cc_error(
     exc: CCError,
     stripped_details: dict[str, str],
 ) -> CCError:
-    raw_code = _raw_get_field(exc, 'code', None)
+    raw_code = _raw_get_field(exc, 'code', _UNSET)
     code: ErrorCode | None = None
     if type(raw_code) is ErrorCode:
         code = raw_code
@@ -923,7 +1003,13 @@ def _rebuild_standard_cc_error(
         except ValueError:
             code = ErrorCode.Unknown
     if code is None:
+        state = _raw_instance_dict(exc).get('_cc_canonical_state')
+        if type(state) is tuple and len(state) == 3 and type(state[0]) is ErrorCode:
+            code = state[0]
+    if code is None:
         for base in type(exc).__mro__:
+            if base is object:
+                break
             cand = vars(base).get('_code')
             if type(cand) is ErrorCode:
                 code = cand
@@ -943,20 +1029,55 @@ def _rebuild_standard_cc_error(
     return rebuilt
 
 
+_CORE_REBUILD_EXCLUDED_KEYS: frozenset[str] = frozenset({
+    'category',
+    'message',
+    'details',
+    'transport_phase',
+    '_transport_phase',
+    'fallback_eligible',
+    'route_withdrawal',
+    '_semantic_snapshot',
+    'semantic',
+    '_cc_canonical_state',
+})
+
+
 def _rebuild_standard_core_error(
     core: CoreError,
     stripped_details: dict[str, str],
     cleaned_snapshot: tuple[int, str, tuple[tuple[str, str], ...], TransportPhase | None] | None,
 ) -> CoreError:
+    cls = type(core)
     raw_cat = _raw_get_field(core, 'category', 'transport')
     rebuilt = CoreError(
-        raw_cat if type(raw_cat) is str else 'transport',  # type: ignore[arg-type]
+        str(raw_cat) if issubclass(type(raw_cat), str) else 'transport',  # type: ignore[arg-type]
         _safe_exception_message(core),
     )
     inst_dict = _raw_instance_dict(rebuilt)
-    for key, val in _raw_instance_dict(core).items():
-        if key not in ('transport_phase', '_transport_phase', 'fallback_eligible', 'route_withdrawal'):
-            inst_dict[key] = val
+    seen_slots: set[str] = set()
+    for base in cls.__mro__:
+        if base is object:
+            break
+        for name, member in vars(base).items():
+            if (
+                name in seen_slots
+                or name in _SKIPPED_EXCEPTION_DESCRIPTORS
+                or name in _CORE_REBUILD_EXCLUDED_KEYS
+            ):
+                continue
+            if type(member) is MemberDescriptorType:
+                seen_slots.add(name)
+                try:
+                    inst_dict[name] = member.__get__(core, cls)
+                except (AttributeError, ValueError):
+                    continue
+    for key, val in dict.items(_raw_instance_dict(core)):
+        if key not in _CORE_REBUILD_EXCLUDED_KEYS and key not in seen_slots:
+            if key == '__notes__' and type(val) is list:
+                inst_dict[key] = val.copy()
+            else:
+                inst_dict[key] = val
     inst_dict['details'] = stripped_details
     inst_dict['_transport_phase'] = None
     inst_dict['fallback_eligible'] = None
@@ -972,7 +1093,7 @@ def _callback_error_copy(exc: CCError) -> CCError:
     Keeps the subclass instance state (attributes and custom slots), code,
     message and business details; clears inner call-control details and phase
     without running user copy hooks. If an exotic custom layout refuses raw
-    allocation or overrides ``transport_phase`` via a descriptor, preserves the
+    allocation or overrides control attributes via a descriptor, preserves the
     canonical semantic code, message and details on the standard public
     exception class rather than downgrading to code 3 or leaking ``pre_dispatch``.
     """
@@ -981,6 +1102,10 @@ def _callback_error_copy(exc: CCError) -> CCError:
         try:
             copied = _clone_exception_without_user_hooks(exc)
             _raw_set_field(copied, 'details', stripped_details)
+            copied_dict = _raw_instance_dict(copied)
+            state = copied_dict.get('_cc_canonical_state')
+            if type(state) is tuple and len(state) == 3:
+                copied_dict['_cc_canonical_state'] = (state[0], state[1], dict(stripped_details))
             _clear_copied_phase_fields(copied)
             return copied  # type: ignore[return-value]
         except BaseException:
@@ -998,14 +1123,20 @@ def _callback_core_copy(core: CoreError) -> CoreError:
     stripped_details = _safe_strip_callback_details(core)
     snapshot = _raw_get_field(core, '_semantic_snapshot')
     cleaned_snapshot = None
-    if isinstance(snapshot, tuple) and len(snapshot) == 4:
+    if type(snapshot) is tuple and len(snapshot) == 4:
         code, message, entries, _ = snapshot
-        cleaned_snapshot = (
-            code,
-            message,
-            tuple((key, value) for key, value in entries if key not in _CALLBACK_DETAIL_KEYS),
-            None,
+        cleaned_entries = (
+            tuple(
+                (key, value)
+                for entry in entries
+                if type(entry) is tuple and len(entry) == 2
+                for key, value in (entry,)
+                if key not in _CALLBACK_DETAIL_KEYS
+            )
+            if type(entries) is tuple
+            else ()
         )
+        cleaned_snapshot = (code, message, cleaned_entries, None)
     if not _has_custom_control_descriptor(type(core), check_core_flags=True):
         try:
             copied = _clone_exception_without_user_hooks(core)
@@ -1024,19 +1155,20 @@ def _post_dispatch_cleanup_error(exc: BaseException) -> BaseException:
     """Sanitize a cleanup failure raised after call/stream dispatch succeeded."""
     cls = type(exc)
     if issubclass(cls, CoreError):
-        raw_details = _raw_get_field(exc, 'details')
+        raw_details, _ = _extract_canonical_details(exc)
         if (
             _raw_get_field(exc, '_transport_phase') is not None
             or _has_instance_phase_value(cls, exc)
             or _has_custom_control_descriptor(cls, check_core_flags=True)
             or _raw_get_field(exc, 'fallback_eligible') is not None
             or _raw_get_field(exc, 'route_withdrawal') is not None
+            or _semantic_snapshot_needs_cleanup(exc)
             or _details_need_cleanup(raw_details)
         ):
             return _callback_core_copy(exc)  # type: ignore[arg-type]
         return exc
     if issubclass(cls, CCError):
-        raw_details = _raw_get_field(exc, 'details')
+        raw_details, _ = _extract_canonical_details(exc)
         if (
             _raw_get_field(exc, '_transport_phase') is not None
             or _has_instance_phase_value(cls, exc)
@@ -1046,7 +1178,7 @@ def _post_dispatch_cleanup_error(exc: BaseException) -> BaseException:
             return _callback_error_copy(exc)  # type: ignore[arg-type]
         return exc
     if issubclass(cls, CCBaseError):
-        raw_details = _raw_get_field(exc, 'details')
+        raw_details, has_details = _extract_canonical_details(exc)
         has_custom_desc = _has_custom_control_descriptor(cls)
         if (
             _raw_get_field(exc, '_transport_phase') is not None
@@ -1065,6 +1197,8 @@ def _post_dispatch_cleanup_error(exc: BaseException) -> BaseException:
                 except BaseException:
                     pass
             fallback = CCBaseError(_safe_exception_message(exc))
+            if has_details:
+                _raw_instance_dict(fallback)['details'] = stripped_details
             fallback.__cause__ = exc
             return fallback
     return exc
@@ -1078,10 +1212,8 @@ def _callback_semantic_copy(exc: CCBaseError) -> CCError | None:
     """
     cls = type(exc)
     if issubclass(cls, CoreError):
-        snapshot = _raw_get_field(exc, '_semantic_snapshot')
-        if isinstance(snapshot, tuple) and len(snapshot) == 4:
-            code, message, details, _ = snapshot
-            projected = CCError._from_parts(code, message, dict(details), transport_phase=None)
+        projected = _project_core_semantic_snapshot(exc)  # type: ignore[arg-type]
+        if projected is not None:
             return _callback_error_copy(projected)
         return None
     if issubclass(cls, CCError):
@@ -1098,7 +1230,7 @@ def _project_native_error(exc: BaseException) -> CCError | None:
     callers re-raise the original.
     """
     if issubclass(type(exc), CoreError):
-        return exc.semantic  # type: ignore[attr-defined]
+        return _project_core_semantic_snapshot(exc)  # type: ignore[arg-type]
     return None
 
 
