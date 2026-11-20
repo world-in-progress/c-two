@@ -274,18 +274,25 @@ export class C2HttpRelayError extends Error {
   readonly status: number;
   readonly body: string;
   readonly transportPhase: "pre_dispatch" | "dispatch_uncertain";
+  readonly #status: number;
+  readonly #decodedBody: string;
   readonly #validUtf8: boolean;
-  readonly #rawBody: string | Uint8Array;
-  constructor(status: number, body: string | Uint8Array, transportPhase?: "pre_dispatch" | "dispatch_uncertain") {
-    const decoded = decodeHttpErrorBody(body);
+  constructor(
+    status: number,
+    body: string | Uint8Array,
+    transportPhase?: "pre_dispatch" | "dispatch_uncertain",
+    predecoded?: { readonly body: string; readonly validUtf8: boolean },
+  ) {
+    const decoded = predecoded ?? decodeHttpErrorBody(body);
     super(`C-Two HTTP relay call failed with status ${status}: ${decoded.body}`);
     this.name = "C2HttpRelayError";
     Object.setPrototypeOf(this, C2HttpRelayError.prototype);
     this.status = status;
     this.body = decoded.body;
     this.transportPhase = transportPhase ?? resolveHttpCallRelayErrorPhase(status, decoded);
+    this.#status = status;
+    this.#decodedBody = decoded.body;
     this.#validUtf8 = decoded.validUtf8;
-    this.#rawBody = body instanceof Uint8Array ? body.slice() : body;
   }
   get hasVerifiedUtf8Body(): boolean {
     return this.#validUtf8;
@@ -294,7 +301,12 @@ export class C2HttpRelayError extends Error {
     return isRetryableRouteError(this);
   }
   static _postDispatchCopy(source: C2HttpRelayError): C2HttpRelayError {
-    const copy = new C2HttpRelayError(source.status, source.#rawBody, "dispatch_uncertain");
+    const copy = new C2HttpRelayError(
+      source.#status,
+      source.#decodedBody,
+      "dispatch_uncertain",
+      { body: source.#decodedBody, validUtf8: source.#validUtf8 },
+    );
     copy.cause = source;
     return copy;
   }
@@ -407,8 +419,16 @@ export class C2RouteConflictError extends C2CoreError {
   }
 }
 
+function formatCaughtError(error: unknown): string {
+  try {
+    return String(error);
+  } catch {
+    return "<unprintable error>";
+  }
+}
+
 function projectNativeError(error: unknown): Error {
-  if (error instanceof C2RouteConflictError) return error;
+  if (error instanceof C2CoreError) return error;
   if (error instanceof C2IpcTransportError && error.code === 719 && error.canonicalName === "RouteConflict" && error.transportPhase === "pre_dispatch") {
     const projected = new C2RouteConflictError(error.message, error.details);
     projected.cause = error;
@@ -434,7 +454,7 @@ function projectNativeError(error: unknown): Error {
     }
     return error;
   }
-  return new C2IpcTransportError(String(error));
+  return new C2IpcTransportError(formatCaughtError(error));
 }
 
 interface C2StreamState {
@@ -483,6 +503,15 @@ async function waitForCloseReady<T>(ready: Promise<T>, timeoutMs: number | null,
   }
 }
 
+function tryCancelStreamCall(state: C2StreamState): void {
+  if (state.callClosed || state.call === undefined) return;
+  try {
+    state.call.cancel();
+  } catch {
+    // Best-effort cancellation cleanup must never overwrite a primary stream error.
+  }
+}
+
 async function readNativeStreamNext<T>(
   state: C2StreamState,
   ready: Promise<C2NativeCall>,
@@ -494,6 +523,7 @@ async function readNativeStreamNext<T>(
     if (state.nextPending) throw new Error("C-Two response stream next is already pending.");
     state.nextPending = true;
     let readyFailed = false;
+    let postItemCallbackFailed = false;
     try {
       let call: C2NativeCall;
       try {
@@ -531,8 +561,9 @@ async function readNativeStreamNext<T>(
           hasReleaseFailure = true;
         }
         if (decodeFailed) {
+          postItemCallbackFailed = true;
           state.done = true;
-          if (!state.callClosed) state.call?.cancel();
+          tryCancelStreamCall(state);
           throw sanitizePostDispatchCallbackError(error);
         }
         if (hasReleaseFailure) {
@@ -546,14 +577,14 @@ async function readNativeStreamNext<T>(
         response.release();
       } catch (releaseError) {
         tryReleaseStreamValue(value);
+        postItemCallbackFailed = true;
         state.done = true;
-        if (!state.callClosed) state.call?.cancel();
+        tryCancelStreamCall(state);
         throw sanitizePostDispatchCallbackError(releaseError);
       }
       return { done: false, value };
     } catch (error) {
-      if (state.done && !readyFailed) {
-        // Post-item decode/release path already cancelled and sanitized.
+      if (postItemCallbackFailed) {
         throw error;
       }
       state.done = true;
@@ -561,8 +592,8 @@ async function readNativeStreamNext<T>(
       if (!readyFailed) {
         onTransportFailure?.(projected);
       }
-      if (!state.callClosed && !((projected instanceof C2IpcTransportError || projected instanceof C2CoreError) && projected.code === 715)) {
-        state.call?.cancel();
+      if (!((projected instanceof C2IpcTransportError || projected instanceof C2CoreError) && projected.code === 715)) {
+        tryCancelStreamCall(state);
       }
       throw projected;
     } finally {
@@ -841,11 +872,10 @@ function createIpcTargetTransport<Payload extends C2ResponsePayload>(address: st
     let delivered = false;
     let postResponse = false;
     let inputEncodeFailed = false;
-    let alreadySanitized = false;
     let hasPrimaryError = false;
     try {
       call = native.beginCall(routeName, method, false, nativeLimit(budget));
-      let request: Uint8Array;
+      let request: C2ByteArray;
       try {
         request = requireUint8Array(encode(), "encoded input");
       } catch (encodeError) {
@@ -894,26 +924,17 @@ function createIpcTargetTransport<Payload extends C2ResponsePayload>(address: st
       if (hasPostError) {
         throw postError;
       }
-      let payload: Payload;
-      try {
-        payload = observeTransportResponse(delivery!, observe, {
-          path: observationPath === "RelayAwareLocalIpc" ? observationPath : target.path, routeName,
-          serverId: target.serverId, serverInstanceId: target.serverInstanceId,
-          connectionId: String(target.connectionId),
-          ipcAddress: address, requests, responses,
-        });
-      } catch (obsError) {
-        alreadySanitized = true;
-        throw obsError;
-      }
+      const payload = observeTransportResponse(delivery!, observe, () => ({
+        path: observationPath === "RelayAwareLocalIpc" ? observationPath : target.path, routeName,
+        serverId: target.serverId, serverInstanceId: target.serverInstanceId,
+        connectionId: String(target.connectionId),
+        ipcAddress: address, requests, responses,
+      }));
       delivered = true;
       return payload;
     } catch (error) {
       hasPrimaryError = true;
       if (postResponse) {
-        if (alreadySanitized) {
-          throw error;
-        }
         throw sanitizePostDispatchCallbackError(error);
       }
       const projected = projectNativeError(error);
@@ -968,7 +989,7 @@ function createIpcTargetTransport<Payload extends C2ResponsePayload>(address: st
           return call;
         }
         if (state.cancelled) { call.cancel(); return call; }
-        let request: Uint8Array;
+        let request: C2ByteArray;
         try {
           request = requireUint8Array(encode(), "encoded stream input");
         } catch (encodeError) {
@@ -988,7 +1009,7 @@ function createIpcTargetTransport<Payload extends C2ResponsePayload>(address: st
         if (!inputEncodeFailed) {
           onTransportFailure?.(projected);
         }
-        if (!state.callClosed && !((projected instanceof C2IpcTransportError || projected instanceof C2CoreError) && projected.code === 715)) state.call?.cancel();
+        if (!((projected instanceof C2IpcTransportError || projected instanceof C2CoreError) && projected.code === 715)) tryCancelStreamCall(state);
         if (state.collected) closeCollectedCall(state);
         throw projected;
       }
@@ -1297,10 +1318,10 @@ function createRelayTransport<Payload extends C2ResponsePayload>(baseUrl: string
         throw error;
       }
       responses += 1;
-      return observeTransportResponse(delivery, observe, {
+      return observeTransportResponse(delivery, observe, () => ({
         path: explicit ? "ExplicitRelay" : "RelayAwareHttp", routeName,
         relayUrl: target.relayUrl, requests, responses,
-      });
+      }));
     },
     stream,
     close(): Promise<void> {
@@ -1325,11 +1346,11 @@ function encodeHttpUnaryInput(encode: () => C2ByteArray, budget: C2CallBudget): 
   return payload;
 }
 
-function requireUint8Array(value: unknown, label: string): Uint8Array {
+function requireUint8Array(value: unknown, label: string): C2ByteArray {
   if (!(value instanceof Uint8Array)) {
     throw new Error(`${label} must be a Uint8Array.`);
   }
-  return value;
+  return value as C2ByteArray;
 }
 
 function requireResponsePayload(value: unknown, label: string): C2ResponsePayload {
@@ -2130,7 +2151,8 @@ async function probeResolvedHttpRoute(
   headers: Readonly<Record<string, string>>,
   timeoutMs: number,
 ): Promise<void> {
-  await fetchWithTimeout(async (signal) => {
+  await fetchWithTimeout(async (fetchSignal, internalSignal) => {
+    const activeSignal = internalSignal ?? fetchSignal;
     let response: C2FetchResponse;
     try {
       response = await fetchImpl(
@@ -2138,20 +2160,20 @@ async function probeResolvedHttpRoute(
         {
           method: "GET",
           headers: requestHeadersForRouteContract(headers, routeContract),
-          signal,
+          signal: fetchSignal,
         },
       );
     } catch (error) {
-      throw new C2HttpTransportError(`C-Two HTTP relay probe fetch failed: ${String(error)}`, error, "pre_dispatch");
+      throw new C2HttpTransportError(`C-Two HTTP relay probe fetch failed: ${formatCaughtError(error)}`, error, "pre_dispatch");
     }
     if (response.status === 200) {
       return;
     }
     let bodyBytes: Uint8Array;
     try {
-      bodyBytes = await readHttpArrayBufferResponsePayload(response, signal);
+      bodyBytes = await readHttpArrayBufferResponsePayload(response, activeSignal);
     } catch (error) {
-      throw new C2HttpTransportError(`C-Two HTTP relay probe body read failed: ${String(error)}`, error, "pre_dispatch");
+      throw new C2HttpTransportError(`C-Two HTTP relay probe body read failed: ${formatCaughtError(error)}`, error, "pre_dispatch");
     }
     throw projectHttpAcquisitionError(response.status, bodyBytes);
   }, timeoutMs, "C-Two HTTP relay probe");
@@ -2192,7 +2214,7 @@ async function callResolvedHttpRoute<Payload extends C2ResponsePayload>(
           },
         );
       } catch (error) {
-        throw new C2HttpTransportError(`C-Two HTTP relay call fetch failed: ${String(error)}`, error);
+        throw new C2HttpTransportError(`C-Two HTTP relay call fetch failed: ${formatCaughtError(error)}`, error);
       }
       if (response.status === 200) {
         try {
@@ -2204,7 +2226,11 @@ async function callResolvedHttpRoute<Payload extends C2ResponsePayload>(
             abortContext,
           );
         } catch (error) {
-          throw new C2HttpTransportError(`C-Two HTTP relay call body read failed: ${String(error)}`);
+          throw new C2HttpTransportError(
+            `C-Two HTTP relay call body read failed: ${formatCaughtError(error)}`,
+            undefined,
+            "dispatch_uncertain",
+          );
         }
       }
       if (response.status === 500) {
@@ -2212,7 +2238,11 @@ async function callResolvedHttpRoute<Payload extends C2ResponsePayload>(
         try {
           errorPayload = await readHttpArrayBufferResponsePayload(response, activeSignal);
         } catch (error) {
-          throw new C2HttpTransportError(`C-Two HTTP relay call body read failed: ${String(error)}`);
+          throw new C2HttpTransportError(
+            `C-Two HTTP relay call body read failed: ${formatCaughtError(error)}`,
+            undefined,
+            "dispatch_uncertain",
+          );
         }
         throw new C2CrmMethodError(errorPayload);
       }
@@ -2220,7 +2250,11 @@ async function callResolvedHttpRoute<Payload extends C2ResponsePayload>(
       try {
         bodyBytes = await readHttpArrayBufferResponsePayload(response, activeSignal);
       } catch (error) {
-        throw new C2HttpTransportError(`C-Two HTTP relay call body read failed: ${String(error)}`);
+        throw new C2HttpTransportError(
+          `C-Two HTTP relay call body read failed: ${formatCaughtError(error)}`,
+          undefined,
+          "dispatch_uncertain",
+        );
       }
       throw new C2HttpRelayError(response.status, bodyBytes);
     },
@@ -2248,37 +2282,18 @@ function stripCallbackDetailsRecord(
   }
   for (const [key, value] of Object.entries(details)) {
     if (!CALLBACK_CONTROL_DETAIL_KEYS.has(key) && typeof value === "string") {
-      Object.defineProperty(out, key, {
-        value,
-        enumerable: true,
-        configurable: true,
-        writable: true,
-      });
+      out[key] = value;
     }
   }
   return out;
 }
 
 function stripNativeControlDetails(details: C2NativeErrorDetails): C2NativeErrorDetails {
-  const cleaned: {
-    -readonly [K in keyof C2NativeErrorDetails]?: C2NativeErrorDetails[K];
-  } = {
-    ...details,
-    details: stripCallbackDetailsRecord(details.details),
+  const { transportPhase: _dropped, details: nested, ...rest } = details;
+  return {
+    ...rest,
+    details: stripCallbackDetailsRecord(nested),
   };
-  delete cleaned.transportPhase;
-  return cleaned as C2NativeErrorDetails;
-}
-
-function safeCallbackErrorMessage(error: unknown): string {
-  try {
-    if (error instanceof Error && typeof error.message === "string") {
-      return error.message;
-    }
-    return String(error);
-  } catch {
-    return "C-Two post-dispatch callback failed.";
-  }
 }
 
 function hasCallbackControlDetailKey(record: unknown): boolean {
@@ -2294,100 +2309,54 @@ function hasCallbackControlDetailKey(record: unknown): boolean {
 }
 
 function sanitizePostDispatchCallbackError(error: unknown): unknown {
-  if ((typeof error !== "object" && typeof error !== "function") || error === null) {
-    return error;
+  if (error instanceof C2HttpRelayError) {
+    return error.transportPhase === "dispatch_uncertain"
+      ? error
+      : C2HttpRelayError._postDispatchCopy(error);
   }
-  try {
-    const candidate = error as {
-      transportPhase?: unknown;
-      retrySafe?: unknown;
-      cannotConnect?: unknown;
-      nativeDetails?: C2NativeErrorDetails;
-      details?: Readonly<Record<string, string>>;
-    };
-    const transportPhase = candidate.transportPhase;
-    const retrySafe = candidate.retrySafe;
-    const cannotConnect = candidate.cannotConnect;
-    const nativeDetails = candidate.nativeDetails;
-    const details = candidate.details;
-    const isHttpPhaseBounded =
-      error instanceof C2HttpRelayError || error instanceof C2HttpTransportError;
-    const exposesControl =
-      error instanceof C2RouteConflictError ||
-      error instanceof C2UnsupportedCallModeError ||
-      retrySafe === true ||
-      cannotConnect === true ||
-      (isHttpPhaseBounded
-        ? transportPhase !== "dispatch_uncertain"
-        : transportPhase !== undefined && transportPhase !== null) ||
-      (nativeDetails !== undefined &&
-        typeof nativeDetails === "object" &&
-        nativeDetails !== null &&
-        (nativeDetails.transportPhase !== undefined ||
-          hasCallbackControlDetailKey(nativeDetails.details))) ||
-      hasCallbackControlDetailKey(details);
-    if (!exposesControl) {
+  if (error instanceof C2HttpTransportError) {
+    return error.transportPhase === "dispatch_uncertain" && !error.cannotConnect
+      ? error
+      : C2HttpTransportError._postDispatchCopy(error);
+  }
+  if (error instanceof C2UnsupportedCallModeError) {
+    const rebuilt = new C2CoreError(error.message, stripNativeControlDetails(error.nativeDetails));
+    rebuilt.cause = error;
+    return rebuilt;
+  }
+  if (error instanceof C2CoreError) {
+    if (
+      !(error instanceof C2RouteConflictError) &&
+      error.transportPhase === null &&
+      !hasCallbackControlDetailKey(error.details)
+    ) {
       return error;
     }
-    if (error instanceof C2CoreError) {
-      const rebuilt = new C2CoreError(
-        safeCallbackErrorMessage(error),
-        stripNativeControlDetails(
-          nativeDetails !== undefined && typeof nativeDetails === "object" && nativeDetails !== null
-            ? nativeDetails
-            : error.nativeDetails,
-        ),
-      );
-      rebuilt.cause = error;
-      return rebuilt;
-    }
-    if (error instanceof C2IpcTransportError) {
-      const cleanNative =
-        nativeDetails !== undefined && typeof nativeDetails === "object" && nativeDetails !== null
-          ? stripNativeControlDetails(nativeDetails)
-          : undefined;
-      const rebuilt = new C2IpcTransportError(safeCallbackErrorMessage(error), cleanNative);
-      rebuilt.cause = error;
-      return rebuilt;
-    }
-    if (error instanceof C2HttpRelayError) {
-      return C2HttpRelayError._postDispatchCopy(error);
-    }
-    if (error instanceof C2HttpTransportError) {
-      return C2HttpTransportError._postDispatchCopy(error);
-    }
-    if (error instanceof Error && nativeDetails !== undefined && typeof nativeDetails === "object" && nativeDetails !== null) {
-      if (typeof nativeDetails.code === "number") {
-        const rebuilt = new C2CoreError(
-          safeCallbackErrorMessage(error),
-          stripNativeControlDetails(nativeDetails),
-        );
-        rebuilt.cause = error;
-        return rebuilt;
-      }
-      const rebuilt = new C2IpcTransportError(
-        safeCallbackErrorMessage(error),
-        stripNativeControlDetails(nativeDetails),
-      );
-      rebuilt.cause = error;
-      return rebuilt;
-    }
-    return new Error(safeCallbackErrorMessage(error), { cause: error });
-  } catch {
-    return new Error(safeCallbackErrorMessage(error), { cause: error });
+    const rebuilt = new C2CoreError(error.message, stripNativeControlDetails(error.nativeDetails));
+    rebuilt.cause = error;
+    return rebuilt;
   }
+  if (error instanceof C2IpcTransportError) {
+    if (error.transportPhase === null && !hasCallbackControlDetailKey(error.details)) {
+      return error;
+    }
+    const cleanNative = error.nativeDetails === undefined ? undefined : stripNativeControlDetails(error.nativeDetails);
+    const rebuilt = new C2IpcTransportError(error.message, cleanNative);
+    rebuilt.cause = error;
+    return rebuilt;
+  }
+  return error;
 }
 
 function observeTransportResponse<Payload extends C2ResponsePayload>(
   delivery: C2PendingResponseDelivery<Payload>,
   observe: C2TransportObserver | undefined,
-  observation: C2TransportObservation,
+  getObservation: () => C2TransportObservation,
 ): Payload {
-  if (observe === undefined) {
-    return delivery.payload;
-  }
   try {
-    observe(Object.freeze({ ...observation }));
+    if (observe !== undefined) {
+      observe(Object.freeze({ ...getObservation() }));
+    }
     return delivery.payload;
   } catch (error) {
     delivery.release();
@@ -2629,43 +2598,44 @@ async function resolveRelayRoutes(
   resolveTimeoutMs: number,
 ): Promise<readonly C2RelayRouteInfo[]> {
   const resolveUrl = `${anchorUrl}/_resolve/${encodePathSegment(routeName)}?crm_ns=${encodeQueryValue(contract.namespace)}&crm_name=${encodeQueryValue(contract.name)}&crm_ver=${encodeQueryValue(contract.version)}&abi_hash=${encodeQueryValue(contract.abiHash)}&signature_hash=${encodeQueryValue(contract.signatureHash)}`;
-  return await fetchWithTimeout(async (signal) => {
+  return await fetchWithTimeout(async (fetchSignal, internalSignal) => {
+    const activeSignal = internalSignal ?? fetchSignal;
     let response: C2FetchResponse;
     try {
       response = await fetchImpl(resolveUrl, {
         method: "GET",
         headers,
-        signal,
+        signal: fetchSignal,
       });
     } catch (error) {
-      throw new C2HttpTransportError(`C-Two relay resolve fetch failed: ${String(error)}`, error, "pre_dispatch");
+      throw new C2HttpTransportError(`C-Two relay resolve fetch failed: ${formatCaughtError(error)}`, error, "pre_dispatch");
     }
     if (response.status !== 200) {
       let bodyBytes: Uint8Array;
       try {
-        bodyBytes = await readHttpArrayBufferResponsePayload(response);
+        bodyBytes = await readHttpArrayBufferResponsePayload(response, activeSignal);
       } catch (error) {
-        throw new C2HttpTransportError(`C-Two relay resolve body read failed: ${String(error)}`, error, "pre_dispatch");
+        throw new C2HttpTransportError(`C-Two relay resolve body read failed: ${formatCaughtError(error)}`, error, "pre_dispatch");
       }
       throw projectHttpAcquisitionError(response.status, bodyBytes);
     }
     let bodyBytes: Uint8Array;
     try {
-      bodyBytes = await readHttpArrayBufferResponsePayload(response);
+      bodyBytes = await readHttpArrayBufferResponsePayload(response, activeSignal);
     } catch (error) {
-      throw new C2HttpTransportError(`C-Two relay resolve body read failed: ${String(error)}`, error, "pre_dispatch");
+      throw new C2HttpTransportError(`C-Two relay resolve body read failed: ${formatCaughtError(error)}`, error, "pre_dispatch");
     }
     let body: string;
     try {
       body = C2_STRICT_UTF8_DECODER.decode(bodyBytes);
     } catch (error) {
-      throw new C2HttpTransportError(`C-Two relay resolve returned invalid UTF-8: ${String(error)}`, error, "pre_dispatch");
+      throw new C2HttpTransportError(`C-Two relay resolve returned invalid UTF-8: ${formatCaughtError(error)}`, error, "pre_dispatch");
     }
     let payload: unknown;
     try {
       payload = JSON.parse(body) as unknown;
     } catch (error) {
-      throw new C2HttpTransportError(`C-Two relay resolve returned invalid JSON: ${String(error)}`, error, "pre_dispatch");
+      throw new C2HttpTransportError(`C-Two relay resolve returned invalid JSON: ${formatCaughtError(error)}`, error, "pre_dispatch");
     }
     if (!Array.isArray(payload)) {
       throw new C2HttpTransportError("C-Two relay resolve returned a non-array route response.", undefined, "pre_dispatch");
@@ -2674,14 +2644,14 @@ async function resolveRelayRoutes(
     try {
       routes = payload.map((route, index) => normalizeRelayRouteInfo(route, index));
     } catch (error) {
-      throw new C2HttpTransportError(`C-Two relay resolve payload shape invalid: ${String(error)}`, error, "pre_dispatch");
+      throw new C2HttpTransportError(`C-Two relay resolve payload shape invalid: ${formatCaughtError(error)}`, error, "pre_dispatch");
     }
     try {
       for (let index = 0; index < routes.length; index += 1) {
         validateRelayRouteContract(routes[index], index, routeName, contract);
       }
     } catch (error) {
-      throw new C2HttpTransportError(`C-Two relay resolve contract invalid: ${String(error)}`, error, "pre_dispatch");
+      throw new C2HttpTransportError(`C-Two relay resolve contract invalid: ${formatCaughtError(error)}`, error, "pre_dispatch");
     }
     return routes;
   }, resolveTimeoutMs, "C-Two relay resolve");
@@ -2792,243 +2762,9 @@ function httpConnectFailure(error: unknown): boolean {
 
 const C2_ERROR_CODE_NAMES: Readonly<Record<number, string>> = /* __C2_GENERATED_ERROR_CODE_NAMES__ */ Object.freeze({});
 
-function hasCanonicalEnvelopeTokens(body: string): boolean {
-  let index = 0;
-  const length = body.length;
-  const skipWs = (): void => {
-    while (index < length) {
-      const ch = body.charCodeAt(index);
-      if (ch !== 0x20 && ch !== 0x09 && ch !== 0x0a && ch !== 0x0d) break;
-      index += 1;
-    }
-  };
-  const readJsonString = (): string | undefined => {
-    if (index >= length || body.charCodeAt(index) !== 0x22) return undefined;
-    const contentStart = index + 1;
-    index = contentStart;
-    let decoded = "";
-    let chunkStart = contentStart;
-    while (index < length) {
-      const ch = body.charCodeAt(index);
-      if (ch < 0x20) return undefined;
-      if (ch >= 0xd800 && ch <= 0xdbff) {
-        if (index + 1 >= length) return undefined;
-        const low = body.charCodeAt(index + 1);
-        if (low < 0xdc00 || low > 0xdfff) return undefined;
-        index += 2;
-        continue;
-      }
-      if (ch >= 0xdc00 && ch <= 0xdfff) return undefined;
-      if (ch === 0x22) {
-        const result = chunkStart === contentStart
-          ? body.slice(contentStart, index)
-          : decoded + body.slice(chunkStart, index);
-        index += 1;
-        return result;
-      }
-      if (ch === 0x5c) {
-        decoded += body.slice(chunkStart, index);
-        index += 1;
-        if (index >= length) return undefined;
-        const esc = body.charCodeAt(index);
-        index += 1;
-        switch (esc) {
-          case 0x22: decoded += "\""; break;
-          case 0x5c: decoded += "\\"; break;
-          case 0x2f: decoded += "/"; break;
-          case 0x62: decoded += "\b"; break;
-          case 0x66: decoded += "\f"; break;
-          case 0x6e: decoded += "\n"; break;
-          case 0x72: decoded += "\r"; break;
-          case 0x74: decoded += "\t"; break;
-          case 0x75: {
-            if (index + 4 > length) return undefined;
-            const hex = body.slice(index, index + 4);
-            if (!/^[0-9a-fA-F]{4}$/.test(hex)) return undefined;
-            const high = parseInt(hex, 16);
-            index += 4;
-            if (high >= 0xdc00 && high <= 0xdfff) return undefined;
-            if (high >= 0xd800 && high <= 0xdbff) {
-              if (index + 6 > length || body.charCodeAt(index) !== 0x5c || body.charCodeAt(index + 1) !== 0x75) {
-                return undefined;
-              }
-              const lowHex = body.slice(index + 2, index + 6);
-              if (!/^[0-9a-fA-F]{4}$/.test(lowHex)) return undefined;
-              const low = parseInt(lowHex, 16);
-              if (low < 0xdc00 || low > 0xdfff) return undefined;
-              decoded += String.fromCharCode(high, low);
-              index += 6;
-            } else {
-              decoded += String.fromCharCode(high);
-            }
-            break;
-          }
-          default:
-            return undefined;
-        }
-        chunkStart = index;
-        continue;
-      }
-      index += 1;
-    }
-    return undefined;
-  };
-  const readStringMap = (): boolean => {
-    skipWs();
-    if (index >= length || body.charCodeAt(index) !== 0x7b) return false;
-    index += 1;
-    skipWs();
-    if (index < length && body.charCodeAt(index) === 0x7d) {
-      index += 1;
-      return true;
-    }
-    while (index < length) {
-      skipWs();
-      if (readJsonString() === undefined) return false;
-      skipWs();
-      if (index >= length || body.charCodeAt(index) !== 0x3a) return false;
-      index += 1;
-      skipWs();
-      if (readJsonString() === undefined) return false;
-      skipWs();
-      if (index >= length) return false;
-      const sep = body.charCodeAt(index);
-      if (sep === 0x7d) {
-        index += 1;
-        return true;
-      }
-      if (sep !== 0x2c) return false;
-      index += 1;
-    }
-    return false;
-  };
-  const skipJsonValue = (containerDepth: number): string | undefined => {
-    skipWs();
-    if (index >= length) return undefined;
-    const start = index;
-    const first = body.charCodeAt(index);
-    if (first === 0x22) {
-      return readJsonString() === undefined ? undefined : body.slice(start, index);
-    }
-    if (first === 0x7b) {
-      const nextDepth = containerDepth + 1;
-      if (nextDepth > 127) return undefined;
-      index += 1;
-      skipWs();
-      if (index < length && body.charCodeAt(index) === 0x7d) {
-        index += 1;
-        return body.slice(start, index);
-      }
-      while (index < length) {
-        skipWs();
-        if (readJsonString() === undefined) return undefined;
-        skipWs();
-        if (index >= length || body.charCodeAt(index) !== 0x3a) return undefined;
-        index += 1;
-        if (skipJsonValue(nextDepth) === undefined) return undefined;
-        skipWs();
-        if (index >= length) return undefined;
-        const sep = body.charCodeAt(index);
-        if (sep === 0x7d) {
-          index += 1;
-          return body.slice(start, index);
-        }
-        if (sep !== 0x2c) return undefined;
-        index += 1;
-      }
-      return undefined;
-    }
-    if (first === 0x5b) {
-      const nextDepth = containerDepth + 1;
-      if (nextDepth > 127) return undefined;
-      index += 1;
-      skipWs();
-      if (index < length && body.charCodeAt(index) === 0x5d) {
-        index += 1;
-        return body.slice(start, index);
-      }
-      while (index < length) {
-        if (skipJsonValue(nextDepth) === undefined) return undefined;
-        skipWs();
-        if (index >= length) return undefined;
-        const sep = body.charCodeAt(index);
-        if (sep === 0x5d) {
-          index += 1;
-          return body.slice(start, index);
-        }
-        if (sep !== 0x2c) return undefined;
-        index += 1;
-      }
-      return undefined;
-    }
-    while (index < length) {
-      const ch = body.charCodeAt(index);
-      if (ch === 0x2c || ch === 0x7d || ch === 0x5d || ch === 0x20 || ch === 0x09 || ch === 0x0a || ch === 0x0d) {
-        break;
-      }
-      index += 1;
-    }
-    if (index <= start) return undefined;
-    const token = body.slice(start, index);
-    if (token === "true" || token === "false" || token === "null") {
-      return token;
-    }
-    if (!/^-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?$/.test(token)) {
-      return undefined;
-    }
-    return Number.isFinite(Number(token)) ? token : undefined;
-  };
-  skipWs();
-  if (index >= length || body.charCodeAt(index) !== 0x7b) return false;
-  index += 1;
-  skipWs();
-  if (index < length && body.charCodeAt(index) === 0x7d) return false;
-  const requiredKeys = new Set(["version", "code", "name", "message", "details"]);
-  const seenRequired = new Set<string>();
-  while (index < length) {
-    skipWs();
-    const key = readJsonString();
-    if (key === undefined) return false;
-    skipWs();
-    if (index >= length || body.charCodeAt(index) !== 0x3a) return false;
-    index += 1;
-    if (requiredKeys.has(key)) {
-      if (seenRequired.has(key)) return false;
-      if (key === "details") {
-        if (!readStringMap()) return false;
-      } else if (key === "name" || key === "message") {
-        skipWs();
-        if (readJsonString() === undefined) return false;
-      } else {
-        const rawToken = skipJsonValue(1);
-        if (rawToken === undefined || !/^(?:0|[1-9][0-9]*)$/.test(rawToken)) {
-          return false;
-        }
-      }
-      seenRequired.add(key);
-    } else if (skipJsonValue(1) === undefined) {
-      return false;
-    }
-    skipWs();
-    if (index >= length) return false;
-    const sep = body.charCodeAt(index);
-    if (sep === 0x7d) {
-      index += 1;
-      skipWs();
-      return index === length && seenRequired.size === requiredKeys.size;
-    }
-    if (sep !== 0x2c) return false;
-    index += 1;
-  }
-  return false;
-}
-
 function parseCanonicalRelayError(
   body: string,
 ): { readonly version: 1; readonly code: number; readonly name: string; readonly message: string; readonly details: Readonly<Record<string, string>> } | undefined {
-  if (!hasCanonicalEnvelopeTokens(body)) {
-    return undefined;
-  }
   try {
     const parsed = JSON.parse(body) as unknown;
     if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
@@ -3037,9 +2773,10 @@ function parseCanonicalRelayError(
     const record = parsed as Record<string, unknown>;
     if (
       record.version !== 1 ||
+      typeof record.code !== "number" ||
       !Number.isSafeInteger(record.code) ||
-      (record.code as number) < 0 ||
-      (record.code as number) > 65535 ||
+      record.code < 0 ||
+      record.code > 65535 ||
       typeof record.name !== "string" ||
       typeof record.message !== "string"
     ) {
@@ -3052,8 +2789,14 @@ function parseCanonicalRelayError(
     ) {
       return undefined;
     }
-    const rawCode = record.code as number;
-    const rawDetails = record.details as Readonly<Record<string, string>>;
+    const rawDetails = record.details as Record<string, unknown>;
+    for (const value of Object.values(rawDetails)) {
+      if (typeof value !== "string") {
+        return undefined;
+      }
+    }
+    const rawCode = record.code;
+    const stringDetails = rawDetails as Readonly<Record<string, string>>;
     const expectedName = Object.prototype.hasOwnProperty.call(C2_ERROR_CODE_NAMES, rawCode)
       ? C2_ERROR_CODE_NAMES[rawCode]
       : undefined;
@@ -3066,10 +2809,10 @@ function parseCanonicalRelayError(
         code: rawCode,
         name: record.name,
         message: record.message,
-        details: rawDetails,
+        details: stringDetails,
       };
     }
-    const degradedDetails: Record<string, string> = { ...rawDetails };
+    const degradedDetails: Record<string, string> = { ...stringDetails };
     if (ownDetail(degradedDetails, "unknown_code") === undefined) {
       degradedDetails.unknown_code = String(rawCode);
     }

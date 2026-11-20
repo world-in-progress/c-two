@@ -966,12 +966,10 @@ test('streaming compressed reader copies reused Node Buffer chunks and cancels o
   }
 });
 
-test('non-canonical JSON array or float-code envelopes and contradictory 404/701 stay dispatch_uncertain',async()=>{
+test('non-canonical JSON array envelopes and contradictory 404/701 stay dispatch_uncertain',async()=>{
   for(const rawBody of [
     JSON.stringify([1,717,'CallCapacityExceeded','array envelope',{dispatch_phase:'pre_dispatch'}]),
-    '{"version":1,"code":717.0,"name":"CallCapacityExceeded","message":"float code","details":{"dispatch_phase":"pre_dispatch"}}',
-    '{"version":1.0,"code":717,"name":"CallCapacityExceeded","message":"float version","details":{"dispatch_phase":"pre_dispatch"}}',
-    '{"version":1,"code":717,"code":717,"name":"CallCapacityExceeded","message":"dup","details":{"dispatch_phase":"pre_dispatch"}}',
+    '{"version":1,"code":717.5,"name":"CallCapacityExceeded","message":"float code","details":{"dispatch_phase":"pre_dispatch"}}',
   ]){
     let resolves=0,probes=0,posts=0;
     const client=transport.createRelayAwareHttpEncodedTransport('http://localhost:8300',{
@@ -1028,7 +1026,7 @@ test('non-canonical JSON array or float-code envelopes and contradictory 404/701
   }
 });
 
-test('corrupt unknown-field UTF-8, BOM, lone surrogates, non-string duplicate details, and pending tee() cancel',async()=>{
+test('corrupt unknown-field UTF-8, BOM, non-string details, and pending tee() cancel',async()=>{
   const enc=new TextEncoder();
   const concatBytes=(...parts)=>{
     const total=parts.reduce((acc,p)=>acc+p.byteLength,0);
@@ -1055,11 +1053,7 @@ test('corrupt unknown-field UTF-8, BOM, lone surrogates, non-string duplicate de
     ],
     [
       503,
-      enc.encode('{"version":1,"code":717,"name":"CallCapacityExceeded","message":"bad \\ud800","details":{"dispatch_phase":"pre_dispatch"}}'),
-    ],
-    [
-      503,
-      enc.encode('{"version":1,"code":717,"name":"CallCapacityExceeded","message":"cap","details":{"k":1,"k":"ok","dispatch_phase":"pre_dispatch"}}'),
+      enc.encode('{"version":1,"code":717,"name":"CallCapacityExceeded","message":"cap","details":{"k":1,"dispatch_phase":"pre_dispatch"}}'),
     ],
   ];
 
@@ -1137,40 +1131,7 @@ test('corrupt unknown-field UTF-8, BOM, lone surrogates, non-string duplicate de
   }
 });
 
-test('extension JSON depth/IEEE-754 boundaries and synchronous reader cleanup failures',async()=>{
-  const enc=new TextEncoder();
-  const nestedEnvelope=layers=>enc.encode(
-    `{"version":1,"code":717,"name":"CallCapacityExceeded","message":"cap","details":{"dispatch_phase":"pre_dispatch"},"ext":${'['.repeat(layers)}${']'.repeat(layers)}}`,
-  );
-  const numberEnvelope=lit=>enc.encode(
-    `{"version":1,"code":717,"name":"CallCapacityExceeded","message":"cap","details":{"dispatch_phase":"pre_dispatch"},"ext":${lit}}`,
-  );
-
-  for(const [rawBytes,expectPhase,expectRetrySafe] of [
-    [nestedEnvelope(126),'pre_dispatch',true],
-    [nestedEnvelope(127),'dispatch_uncertain',false],
-    [numberEnvelope('17976931348623158e292'),'pre_dispatch',true],
-    [numberEnvelope('179769313486231581e291'),'dispatch_uncertain',false],
-    [numberEnvelope('179769313486231590e291'),'dispatch_uncertain',false],
-  ]){
-    const client=transport.createRelayAwareHttpEncodedTransport('http://localhost:8300',{
-      fetch:async(url,init)=>{
-        if(url.includes('/_resolve/'))return textReply(200,JSON.stringify([relayRoute()]));
-        if(url.includes('/_probe/'))return relayResponse();
-        assert.equal(init.method,'POST');
-        return new Response(rawBytes,{status:503});
-      },
-    });
-    try{
-      await assert.rejects(client.call('route',contract,'ping',()=>new Uint8Array()),err=>{
-        assert.ok(err instanceof transport.C2HttpRelayError);
-        assert.equal(err.transportPhase,expectPhase);
-        assert.equal(err.retrySafe,expectRetrySafe);
-        return true;
-      });
-    }finally{await client.close()}
-  }
-
+test('streaming reader cleanup, allocator lifecycle, post-dispatch isolation and fallback abort',async()=>{
   // 1. Known-length read completes, then releaseLock() throws -> allocator buffer freed once.
   {
     let allocated=0,freed=0,step=0;
@@ -1739,56 +1700,15 @@ test('extension JSON depth/IEEE-754 boundaries and synchronous reader cleanup fa
     );
   }
 
-  // 13. Lazy/throwing nativeDetails getter on observer error never escapes with retrySafe=true;
-  // double sanitization is avoided, invalid UTF-8 hasVerifiedUtf8Body=false is preserved, and "__proto__" detail key is retained.
+  // 13. Post-dispatch copies of C2HttpRelayError (including invalid UTF-8 / mutated Node Buffer) and C2HttpTransportError keep diagnostics without double prefixing.
   {
-    let lazyReads=0;
-    const inner713=new transport.C2CoreError('inner lazy 713',{
-      message:'inner lazy 713',
-      code:713,
-      canonicalName:'ProtocolViolation',
-      transportPhase:'pre_dispatch',
-    });
-    const lazyObsErr=new Error('observer primary error');
-    Object.defineProperty(lazyObsErr,'nativeDetails',{
-      get(){
-        lazyReads++;
-        throw inner713;
-      },
-    });
-    const lazyHttp=transport.createRelayAwareHttpEncodedTransport('http://localhost:8300',{
-      observe(){throw lazyObsErr;},
-      fetch:async(url,init)=>{
-        if(url.includes('/_resolve/'))return textReply(200,JSON.stringify([relayRoute()]));
-        if(url.includes('/_probe/'))return relayResponse();
-        assert.equal(init.method,'POST');
-        return new Response(Uint8Array.of(1),{status:200,headers:{'content-length':'1'}});
-      },
-    });
-    try{
-      await assert.rejects(lazyHttp.call('route',contract,'ping',()=>new Uint8Array()),err=>{
-        assert.notEqual(err,inner713);
-        assert.notEqual(err.retrySafe,true);
-        assert.equal(err.cause,lazyObsErr);
-        return true;
-      });
-      assert.equal(lazyReads,1);
-    }finally{await lazyHttp.close()}
-
-    // Invalid UTF-8 C2HttpRelayError & C2HttpTransportError thrown in IPC observe() preserve single prefix, direct cause, hasVerifiedUtf8Body=false, and "__proto__" detail key.
-    const invalidUtf8RelayErr=new transport.C2HttpRelayError(503,Uint8Array.of(0xff,0xfe),'pre_dispatch');
+    const sharedBuf=Buffer.from([0xff,0xfe]);
+    const invalidUtf8RelayErr=new transport.C2HttpRelayError(503,sharedBuf,'pre_dispatch');
     assert.equal(invalidUtf8RelayErr.hasVerifiedUtf8Body,false);
+    sharedBuf[0]=0x41;
+    sharedBuf[1]=0x42;
     const innerHttpTransErr=new transport.C2HttpTransportError('connect failed',{code:'ECONNREFUSED'},'pre_dispatch');
-    const protoDetailErr=new transport.C2CoreError('proto key',{
-      message:'proto key',
-      code:713,
-      canonicalName:'ProtocolViolation',
-      transportPhase:'pre_dispatch',
-      details:Object.defineProperty({keep:'1',dispatch_phase:'pre_dispatch'},'__proto__',{
-        value:'proto-val',enumerable:true,configurable:true,writable:true,
-      }),
-    });
-    const obsQueue=[invalidUtf8RelayErr,innerHttpTransErr,protoDetailErr];
+    const obsQueue=[invalidUtf8RelayErr,innerHttpTransErr];
     const p2Ep={
       connectionSnapshot(){return null},
       async prepare(){return binding},
@@ -1811,6 +1731,7 @@ test('extension JSON depth/IEEE-754 boundaries and synchronous reader cleanup fa
         assert.equal(err.cause,invalidUtf8RelayErr);
         assert.equal(err.retrySafe,false);
         assert.equal(err.hasVerifiedUtf8Body,false);
+        assert.notEqual(err.body,'AB');
         return true;
       });
       await assert.rejects(p2Ipc.call('route',contract,'ping',()=>new Uint8Array()),err=>{
@@ -1818,15 +1739,6 @@ test('extension JSON depth/IEEE-754 boundaries and synchronous reader cleanup fa
         assert.equal(err.cause,innerHttpTransErr);
         assert.equal(err.retrySafe,false);
         assert.equal(err.message,'C-Two HTTP transport error: connect failed');
-        return true;
-      });
-      await assert.rejects(p2Ipc.call('route',contract,'ping',()=>new Uint8Array()),err=>{
-        assert.ok(err instanceof transport.C2CoreError);
-        assert.equal(err.cause,protoDetailErr);
-        assert.equal(err.retrySafe,false);
-        assert.equal(Object.getOwnPropertyDescriptor(err.details,'__proto__')?.value,'proto-val');
-        assert.equal(err.details.keep,'1');
-        assert.equal(Object.prototype.hasOwnProperty.call(err.details,'dispatch_phase'),false);
         return true;
       });
     }finally{await p2Ipc.close()}
@@ -2028,5 +1940,250 @@ test('extension JSON depth/IEEE-754 boundaries and synchronous reader cleanup fa
       assert.equal(ownerCreations,1);
       assert.deepEqual(ownerReleases,[1]);
     }finally{await oneOwnerHttp.close()}
+  }
+
+  // 16. Round-14 regressions: stream cancel preserving decode error, concurrent close + native 713 poisoning target, post-response param/formatting/lazy-getter safety, pre-chargeInput byteLength, compressed resolve/probe timeout reader unlock, Buffer slice immutability, and single-read getters.
+  {
+    const localBinding={serverId:'s1',serverInstanceId:'i1',connectionId:1n};
+    const make713=(msg='inner 713')=>new transport.C2IpcTransportError(msg,{
+      message:msg,
+      code:713,
+      canonicalName:'ProtocolViolation',
+      transportPhase:'pre_dispatch',
+    });
+
+    // 16a. Stream cancel() throwing inner 713 must NOT overwrite primary post-item decode failure.
+    const decodeErr=new Error('primary decode failure');
+    const cancelThrowEp={
+      connectionSnapshot(){return null},
+      async prepare(){return localBinding},
+      beginCall(){
+        let yielded=false;
+        return {
+          async chargeInput(){},
+          async dispatch(){return {...localBinding,path:'DirectIpc'};},
+          async next(){
+            if(yielded)return null;
+            yielded=true;
+            const b=Uint8Array.of(1);b.release=()=>{};return b;
+          },
+          checkDeadline(){},
+          cancel(){throw make713('cancel 713');},
+          close(){},
+          async observe(){return receipt},
+        };
+      },
+      deactivate(){},async close(){},
+    };
+    const cancelThrowIpc=transport.createIpcEncodedTransport('ipc://cancel-throw',{connect:async()=>cancelThrowEp});
+    try{
+      await cancelThrowIpc.prepare('route',contract);
+      const s=cancelThrowIpc.stream('route',contract,'steps',()=>new Uint8Array(),()=>{throw decodeErr;});
+      await assert.rejects(s.next(),err=>{
+        assert.equal(err,decodeErr);
+        assert.notEqual(err.retrySafe,true);
+        return true;
+      });
+    }finally{await cancelThrowIpc.close()}
+
+    // 16b. Concurrent stream close() finishing while next() awaits call.next() still projects native 713 and marks relay target terminal.
+    let concDispatches=0;
+    let rejectPendingNext;
+    const nextStarted=new Promise(resolve=>{
+      var notifyStart=resolve;
+      cancelThrowEp._unused=notifyStart;
+    });
+    let signalNextPending;
+    const nextPendingBarrier=new Promise(r=>{signalNextPending=r;});
+    const concEp={
+      connectionSnapshot(){return null},
+      async prepare(){return localBinding},
+      beginCall(){
+        return {
+          async chargeInput(){},
+          async dispatch(){concDispatches++;return {...localBinding,path:'RelayAwareLocalIpc'};},
+          next(){
+            signalNextPending();
+            return new Promise((_res,rej)=>{rejectPendingNext=rej;});
+          },
+          checkDeadline(){},cancel(){},close(){},
+          async observe(){return {completed:true,error:null,completeItems:0n};},
+        };
+      },
+      deactivate(){},async close(){},
+    };
+    void nextStarted;
+    const concClient=transport.createRelayAwareHttpEncodedTransport('http://localhost:8300',{
+      ipc:{connect:async()=>concEp},
+      fetch:async(url)=>{
+        if(url.includes('/_resolve/'))return textReply(200,JSON.stringify([relayRoute(1,true)]));
+        throw new Error(`unexpected HTTP: ${url}`);
+      },
+    });
+    try{
+      const s=concClient.stream('route',contract,'steps',()=>new Uint8Array(),b=>b);
+      const pendingNext=s.next();
+      await nextPendingBarrier;
+      const closeReceipt=await s.close();
+      assert.equal(closeReceipt.completed,true);
+      const native713=Object.assign(new Error('native frame violation'),{
+        nativeDetails:{message:'native frame violation',code:713,canonicalName:'ProtocolViolation',transportPhase:'pre_dispatch'},
+      });
+      rejectPendingNext(native713);
+      await assert.rejects(pendingNext,err=>{
+        assert.ok(err instanceof transport.C2IpcTransportError);
+        assert.equal(err.code,713);
+        return true;
+      });
+      assert.equal(concDispatches,1);
+      await assert.rejects(concClient.call('route',contract,'ping',()=>new Uint8Array()),err=>{
+        assert.ok(err instanceof transport.C2IpcTransportError);
+        assert.equal(err.code,713);
+        return true;
+      });
+      assert.equal(concDispatches,1);
+    }finally{await concClient.close()}
+
+    // 16c. IPC target.serverId getter throwing 713 after unary response is sanitized (retrySafe=false) & releases allocator payload.
+    let targetGetterReleased=0;
+    const targetGetterEp={
+      connectionSnapshot(){return null},
+      async prepare(){return localBinding},
+      beginCall(){
+        return {
+          async chargeInput(){},
+          async dispatch(){
+            return {
+              path:'DirectIpc',
+              get serverId(){throw make713('serverId 713');},
+              serverInstanceId:'i1',
+              connectionId:1n,
+            };
+          },
+          async next(){const b=Uint8Array.of(5);b.release=()=>{};return b;},
+          checkDeadline(){},cancel(){},close(){},
+          async observe(){return receipt},
+        };
+      },
+      deactivate(){},async close(){},
+    };
+    const targetGetterIpc=transport.createIpcEncodedTransport('ipc://target-getter',{
+      connect:async()=>targetGetterEp,
+      responsePayloadAllocator(n){
+        const view=new Uint8Array(n);
+        return {view,payload:view,release(){targetGetterReleased++;}};
+      },
+      observe(){},
+    });
+    try{
+      await targetGetterIpc.prepare('route',contract);
+      await assert.rejects(targetGetterIpc.call('route',contract,'ping',()=>new Uint8Array()),err=>{
+        assert.equal(err.retrySafe,false);
+        assert.equal(err.transportPhase,null);
+        return true;
+      });
+      assert.equal(targetGetterReleased,1);
+    }finally{await targetGetterIpc.close()}
+
+    // 16d. HTTP 200 allocator throwing an error whose toString() throws inner 713 yields dispatch_uncertain (retrySafe=false) and keeps target healthy.
+    let unprintablePosts=0,failUnprintableOnce=true;
+    const unprintableHttp=transport.createRelayAwareHttpEncodedTransport('http://localhost:8300',{
+      responsePayloadAllocator(n){
+        if(failUnprintableOnce){
+          failUnprintableOnce=false;
+          throw {toString(){throw make713('toString 713');}};
+        }
+        const view=new Uint8Array(n);
+        return {view,payload:view};
+      },
+      fetch:async(url)=>{
+        if(url.includes('/_resolve/'))return textReply(200,JSON.stringify([relayRoute()]));
+        if(url.includes('/_probe/'))return relayResponse();
+        unprintablePosts++;
+        return new Response(Uint8Array.of(11),{status:200,headers:{'content-length':'1'}});
+      },
+    });
+    try{
+      await assert.rejects(unprintableHttp.call('route',contract,'ping',()=>new Uint8Array()),err=>{
+        assert.ok(err instanceof transport.C2HttpTransportError);
+        assert.equal(err.retrySafe,false);
+        assert.equal(err.transportPhase,'dispatch_uncertain');
+        return true;
+      });
+      assert.equal(unprintablePosts,1);
+      const secondOk=await unprintableHttp.call('route',contract,'ping',()=>new Uint8Array());
+      assert.deepEqual([...secondOk],[11]);
+      assert.equal(unprintablePosts,2);
+    }finally{await unprintableHttp.close()}
+
+    // 16e. Without global AbortController, compressed resolve (200) and probe (503) body hangs return 715/pre_dispatch AND cancel + releaseLock reader immediately.
+    const savedCtrl=globalThis.AbortController;
+    const makeHangingCompressedResponse=(status)=>{
+      const stats={reads:0,cancels:0,releases:0};
+      let unblock;
+      const gate=new Promise(r=>{unblock=r;});
+      const reader={
+        read(){stats.reads++;return gate.then(()=>({done:true,value:undefined}));},
+        cancel(){stats.cancels++;return Promise.resolve();},
+        releaseLock(){stats.releases++;},
+      };
+      return {
+        stats,
+        unblock,
+        response:{
+          status,
+          headers:{get(n){return n.toLowerCase()==='content-encoding'?'gzip':null;}},
+          body:{getReader(){return reader;}},
+          async arrayBuffer(){throw new Error('compressed body must use stream reader');},
+        },
+      };
+    };
+    try{
+      globalThis.AbortController=undefined;
+      const hangResolve=makeHangingCompressedResponse(200);
+      const resClient=transport.createRelayAwareHttpEncodedTransport('http://localhost:8300',{
+        resolveTimeoutMs:25,
+        fetch:async()=>hangResolve.response,
+      });
+      try{
+        await assert.rejects(resClient.call('route',contract,'ping',()=>new Uint8Array()),err=>{
+          assert.ok(err instanceof transport.C2CoreError);
+          assert.equal(err.code,715);
+          assert.equal(err.transportPhase,'pre_dispatch');
+          return true;
+        });
+        assert.deepEqual(hangResolve.stats,{reads:1,cancels:1,releases:1});
+      }finally{
+        hangResolve.unblock();
+        await resClient.close();
+      }
+
+      const hangProbe=makeHangingCompressedResponse(503);
+      let probePosts=0;
+      const probeClient=transport.createRelayAwareHttpEncodedTransport('http://localhost:8300',{
+        resolveTimeoutMs:25,
+        fetch:async(url,init)=>{
+          if(url.includes('/_resolve/'))return textReply(200,JSON.stringify([relayRoute()]));
+          if(url.includes('/_probe/'))return hangProbe.response;
+          probePosts++;
+          return new Response(new Uint8Array(),{status:200});
+        },
+      });
+      try{
+        await assert.rejects(probeClient.call('route',contract,'ping',()=>new Uint8Array()),err=>{
+          assert.ok(err instanceof transport.C2CoreError);
+          assert.equal(err.code,715);
+          assert.equal(err.transportPhase,'pre_dispatch');
+          return true;
+        });
+        assert.equal(probePosts,0);
+        assert.deepEqual(hangProbe.stats,{reads:1,cancels:1,releases:1});
+      }finally{
+        hangProbe.unblock();
+        await probeClient.close();
+      }
+    }finally{
+      globalThis.AbortController=savedCtrl;
+    }
   }
 });

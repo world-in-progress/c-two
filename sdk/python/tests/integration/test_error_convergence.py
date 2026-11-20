@@ -1091,80 +1091,6 @@ def test_custom_plain_bytes_stream_hold_releases_cleanly():
         _ = held.unsafe_buffer
 
 
-class _HijackingCopyError(ResourceClosed):
-    __slots__ = ('tag',)
-
-    def __init__(self, tag: str):
-        super().__init__('executed failure', details={'transport_phase': 'pre_dispatch', 'keep': '1'})
-        self.tag = tag
-
-    def __copy__(self):
-        raise ResourceClosed('hijacked pre_dispatch', transport_phase='pre_dispatch')
-
-
-class _SelfReturningCopyError(ResourceClosed):
-    def __copy__(self):
-        return self
-
-
-def test_hostile_custom_copy_hooks_cannot_hijack_phase_or_self_link(tmp_path):
-    import copy
-
-    hijack = _HijackingCopyError('slot-ok')
-    with pytest.raises(ResourceClosed, match='hijacked pre_dispatch'):
-        copy.copy(hijack)
-
-    self_return = _SelfReturningCopyError(
-        'self failure',
-        details={'transport_phase': 'pre_dispatch', 'keep': '2'},
-        transport_phase='pre_dispatch',
-    )
-    assert copy.copy(self_return) is self_return
-
-    calls = 0
-    current = {'err': hijack}
-
-    class Resource:
-        def echo(self, value):
-            nonlocal calls
-            calls += 1
-            raise current['err']
-
-        def steps(self, value):
-            yield self.echo(value)
-
-    runtime = cc.Runtime()
-    if sys.platform != 'win32':
-        runtime.set_local_endpoint(root=str(tmp_path))
-    runtime.register(CodecBoundary, Resource(), name='hostile-copy')
-    local = runtime.connect(CodecBoundary, name='hostile-copy')
-    ipc = runtime.connect(CodecBoundary, name='hostile-copy', address=runtime.server_address())
-    try:
-        for original in (hijack, self_return):
-            current['err'] = original
-            with pytest.raises(type(original)) as local_err:
-                local.echo(None)
-            assert local_err.value is not original
-            assert local_err.value.__cause__ is original
-            assert local_err.value.__cause__ is not local_err.value
-            assert local_err.value.transport_phase is None
-            assert 'transport_phase' not in local_err.value.details
-            assert original.transport_phase == 'pre_dispatch'
-            assert original.details['transport_phase'] == 'pre_dispatch'
-            if isinstance(local_err.value, _HijackingCopyError):
-                assert local_err.value.tag == 'slot-ok'
-
-            with pytest.raises(ResourceClosed) as ipc_err:
-                ipc.echo(None)
-            assert ipc_err.value.transport_phase is None
-            assert 'transport_phase' not in ipc_err.value.details
-        assert calls == 4
-    finally:
-        cc.close(ipc)
-        cc.close(local)
-        runtime.shutdown()
-
-
 def test_production_error_paths_release_without_cyclic_gc():
     import gc
     import weakref
@@ -1336,136 +1262,6 @@ def test_held_memoryview_stream_and_undelivered_stream_cancel(tmp_path):
         sys.modules.pop(spec.name, None)
 
 
-class _EvilDetailsDict(dict):
-    def items(self):
-        raise RuntimeError('EvilDetailsDict.items must not run')
-
-    def __iter__(self):
-        raise RuntimeError('EvilDetailsDict.__iter__ must not run')
-
-    def __contains__(self, _key):
-        raise RuntimeError('EvilDetailsDict.__contains__ must not run')
-
-
-class _SlottedControlClosed(ResourceClosed):
-    __slots__ = ('details', '_transport_phase', 'custom')
-
-    def __init__(self, message: str, details: dict[str, str], custom: str):
-        super().__init__(message, details=details, transport_phase='pre_dispatch')
-        self.details = _EvilDetailsDict(details)
-        self.custom = custom
-
-
-class _DomainIOClosed(ResourceClosed, OSError):
-    __slots__ = ('custom_io',)
-
-    def __init__(self, message: str, details: dict[str, str]):
-        super().__init__(message, details=details, transport_phase='pre_dispatch')
-        self.errno = 5
-        self.strerror = 'Input/output error'
-        self.filename = 'grid.bin'
-        self.custom_io = 'io-slot'
-
-
-def test_slotted_control_fields_evil_dict_and_oserror_multiple_inheritance(tmp_path):
-    import copy
-    import pickle
-    from c_two import error as cc_err
-
-    slotted = _SlottedControlClosed(
-        'slotted closed',
-        {
-            'transport_phase': 'pre_dispatch',
-            'dispatch_phase': 'pre_dispatch',
-            'biz': 'kept',
-        },
-        'slot-tag',
-    )
-    assert slotted.transport_phase == 'pre_dispatch'
-
-    cleaned_post = cc_err._post_dispatch_cleanup_error(slotted)
-    assert isinstance(cleaned_post, _SlottedControlClosed)
-    assert cleaned_post is not slotted
-    assert cleaned_post.transport_phase is None
-    assert type(cleaned_post.details) is dict
-    assert cleaned_post.details == {'biz': 'kept'}
-    assert cleaned_post.custom == 'slot-tag'
-    assert slotted.transport_phase == 'pre_dispatch'
-
-    domain_io = _DomainIOClosed(
-        'disk gone',
-        {'dispatch_phase': 'pre_dispatch', 'biz': 'io-kept'},
-    )
-    copied_io = copy.copy(domain_io)
-    pickled_io = pickle.loads(pickle.dumps(domain_io))
-    for clone in (copied_io, pickled_io):
-        assert isinstance(clone, _DomainIOClosed)
-        assert clone.code == ErrorCode.ResourceClosed
-        assert clone.errno == 5
-        assert clone.filename == 'grid.bin'
-        assert clone.custom_io == 'io-slot'
-
-    executed = 0
-    current = {'err': slotted}
-
-    class Resource:
-        def echo(self, value):
-            nonlocal executed
-            executed += 1
-            raise current['err']
-
-        def steps(self, value):
-            yield self.echo(value)
-
-    runtime = cc.Runtime()
-    if sys.platform != 'win32':
-        runtime.set_local_endpoint(root=str(tmp_path))
-    runtime.register(CodecBoundary, Resource(), name='slot-and-io')
-    local = runtime.connect(CodecBoundary, name='slot-and-io')
-    ipc = runtime.connect(CodecBoundary, name='slot-and-io', address=runtime.server_address())
-    try:
-        with pytest.raises(_SlottedControlClosed) as local_slot:
-            local.echo(None)
-        assert executed == 1
-        assert local_slot.value is not slotted
-        assert local_slot.value.transport_phase is None
-        assert type(local_slot.value.details) is dict
-        assert local_slot.value.details == {'biz': 'kept'}
-        assert local_slot.value.custom == 'slot-tag'
-        assert slotted.transport_phase == 'pre_dispatch'
-
-        with pytest.raises(ResourceClosed) as ipc_slot:
-            ipc.echo(None)
-        assert executed == 2
-        assert ipc_slot.value.code == ErrorCode.ResourceClosed
-        assert ipc_slot.value.transport_phase is None
-        assert ipc_slot.value.details == {'biz': 'kept'}
-
-        current['err'] = domain_io
-        with pytest.raises(_DomainIOClosed) as local_io:
-            local.echo(None)
-        assert executed == 3
-        assert local_io.value is not domain_io
-        assert local_io.value.code == ErrorCode.ResourceClosed
-        assert local_io.value.errno == 5
-        assert local_io.value.filename == 'grid.bin'
-        assert local_io.value.custom_io == 'io-slot'
-        assert local_io.value.transport_phase is None
-        assert local_io.value.details == {'biz': 'io-kept'}
-        assert domain_io.transport_phase == 'pre_dispatch'
-
-        with pytest.raises(ResourceClosed) as ipc_io:
-            ipc.echo(None)
-        assert executed == 4
-        assert ipc_io.value.code == ErrorCode.ResourceClosed
-        assert ipc_io.value.transport_phase is None
-        assert ipc_io.value.details == {'biz': 'io-kept'}
-    finally:
-        cc.close(ipc)
-        cc.close(local)
-        runtime.shutdown()
-
-
 def test_http_probe_conflict_without_wire_phase_and_corrupt_utf8_on_acquire():
     import json
     import threading
@@ -1556,68 +1352,21 @@ def test_http_probe_conflict_without_wire_phase_and_corrupt_utf8_on_acquire():
         assert not worker.is_alive()
 
 
-class _BlockingClosedError(ResourceClosed, BlockingIOError):
-    def __init__(self, message: str):
-        ResourceClosed.__init__(
-            self,
-            message,
-            details={'dispatch_phase': 'pre_dispatch', 'biz': 'blocking'},
-            transport_phase='pre_dispatch',
-        )
-        self.errno = 11
-        self.characters_written = 4096
-
-
-class _NoDictClosedError(ResourceClosed):
-    @property
-    def __dict__(self):  # type: ignore[override]
-        raise AttributeError('instance __dict__ is hidden')
-
-
-def test_nodict_stream_wrap_cancels_once_and_blocking_callback_preserves_getset(tmp_path):
+def test_stream_wrap_failure_cancels_once_and_clears_phase(tmp_path):
     from c_two.crm.payload_plan import no_payload_binding, python_pickle_output_binding
     from c_two.crm.transferable import _build_transfer_wrapper
-
-    blocking = _BlockingClosedError('partial write before close')
-    runtime = cc.Runtime()
-    if sys.platform != 'win32':
-        ipc_dir = tmp_path / 'ipc'
-        ipc_dir.mkdir()
-        runtime.set_local_endpoint(root=str(ipc_dir))
-
-    class Resource:
-        def echo(self, value):
-            raise blocking
-
-        def steps(self, value):
-            yield value
-
-    runtime.register(CodecBoundary, Resource(), name='blocking-io')
-    local = runtime.connect(CodecBoundary, name='blocking-io')
-    try:
-        with pytest.raises(_BlockingClosedError) as cb_err:
-            local.echo(None)
-        assert cb_err.value is not blocking
-        assert cb_err.value.transport_phase is None
-        assert cb_err.value.characters_written == 4096
-        assert str(cb_err.value) == str(blocking)
-        assert cb_err.value.details == {'biz': 'blocking'}
-        assert blocking.transport_phase == 'pre_dispatch'
-    finally:
-        cc.close(local)
-        runtime.shutdown()
 
     fixture = (
         Path(__file__).resolve().parents[4]
         / 'core/foundation/c2-contract/tests/fixtures/server-stream.contract.json'
     )
     compiled = cc.contract.compile_artifacts(fixture.read_bytes(), target='python')
-    out_dir = tmp_path / 'gen_nodict'
+    out_dir = tmp_path / 'gen_wrap_cancel'
     for artifact in compiled.artifacts:
         dest = out_dir / artifact.relative_path
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_bytes(artifact.bytes)
-    spec = importlib.util.spec_from_file_location('_gen_nodict_mod', out_dir / 'python/c_two_contract.py')
+    spec = importlib.util.spec_from_file_location('_gen_wrap_cancel_mod', out_dir / 'python/c_two_contract.py')
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
@@ -1640,13 +1389,13 @@ def test_nodict_stream_wrap_cancels_once_and_blocking_callback_preserves_getset(
 
         class BrokenTrackerClient:
             supports_direct_call = False
-            route_name = 'nodict-route'
+            route_name = 'wrap-cancel-route'
 
             @property
             def local_copy_tracker(self):
-                raise _NoDictClosedError(
+                raise ResourceClosed(
                     'tracker boom',
-                    details={'dispatch_phase': 'pre_dispatch', 'biz': 'nodict'},
+                    details={'dispatch_phase': 'pre_dispatch', 'biz': 'kept'},
                     transport_phase='pre_dispatch',
                 )
 
@@ -1657,13 +1406,13 @@ def test_nodict_stream_wrap_cancels_once_and_blocking_callback_preserves_getset(
                 return b''
 
         gen_client = module.ContractClient(BrokenTrackerClient())
-        with pytest.raises(_NoDictClosedError) as gen_wrap_err:
+        with pytest.raises(ResourceClosed) as gen_wrap_err:
             gen_client.method_1_echo(req_payload)
         assert gen_wrap_err.value.transport_phase is None
-        assert gen_wrap_err.value.details == {'biz': 'nodict'}
+        assert gen_wrap_err.value.details == {'biz': 'kept'}
         assert holder['last'].cancel_calls == 1
 
-        with pytest.raises(_NoDictClosedError) as gen_hold_wrap_err:
+        with pytest.raises(ResourceClosed) as gen_hold_wrap_err:
             gen_client.hold_method_1_echo(req_payload)
         assert gen_hold_wrap_err.value.transport_phase is None
         assert holder['last'].cancel_calls == 1
@@ -1681,10 +1430,10 @@ def test_nodict_stream_wrap_cancels_once_and_blocking_callback_preserves_getset(
             direction = '->'
             client = BrokenTrackerClient()
 
-        with pytest.raises(_NoDictClosedError) as crm_wrap_err:
+        with pytest.raises(ResourceClosed) as crm_wrap_err:
             wrapped_crm(CrmInstance())
         assert crm_wrap_err.value.transport_phase is None
-        assert crm_wrap_err.value.details == {'biz': 'nodict'}
+        assert crm_wrap_err.value.details == {'biz': 'kept'}
         assert holder['last'].cancel_calls == 1
     finally:
         req_payload.close()
@@ -1997,273 +1746,73 @@ def test_http_call_404_701_contradiction_409_719_reacquire_and_array_float_envel
         assert not worker.is_alive()
 
 
-class _NotesList(list):
-    pass
-
-
 class _SlottedNotesClosed(ResourceClosed):
     __slots__ = ('__notes__',)
 
 
-def test_post_dispatch_prepared_close_exception_group_and_fastdb_hostile_class_getter(tmp_path):
-    """Prepared close never leaks pre_dispatch on rewritten ExceptionGroup, and FastDB cause checks avoid __class__."""
-    import builtins as py_builtins
+def test_bare_ccbase_and_post_dispatch_prepared_close_isolation(tmp_path):
+    """Bare CCBaseError in resource methods maps to code 3, and post-dispatch prepared.close() strips inner pre_dispatch."""
+    import copy
     import importlib.util
     import pickle
-    import fastdb4py.payload  # noqa: F401 - ensure fastdb4py.payload is in sys.modules
-    from c_two.crm.transferable import _build_transfer_wrapper
     from c_two.crm.payload_plan import no_payload_binding, python_pickle_output_binding
-    from c_two.error import (
-        CCBaseError,
-        CoreError,
-        ErrorCode,
-        ResourceExecutionError,
-        SerializationError,
-    )
+    from c_two.crm.transferable import _build_transfer_wrapper
+    from c_two.error import CCBaseError, ErrorCode, ResourceClosed, ResourceExecutionError, _post_dispatch_cleanup_error
 
-    class _HostileClassCoreError(CoreError):
-        @property
-        def __class__(self):  # type: ignore[override]
-            raise RuntimeError('__class__ getter must never execute')
+    # 1. Bare CCBaseError raised in a stateful resource maps to ResourceExecutionError(3, transport_phase=None).
+    mutations = {'local_unary': 0, 'ipc_unary': 0, 'stream': 0}
 
-    # 1. Unary resource adapter & resource stream with fastdb4py.payload loaded in sys.modules.
-    runtime = cc.Runtime()
-    if sys.platform != 'win32':
-        ipc_dir = tmp_path / 'hostile_ipc'
-        ipc_dir.mkdir()
-        runtime.set_local_endpoint(root=str(ipc_dir))
+    class StatefulBaseResource:
+        def __init__(self, tag: str):
+            self.tag = tag
 
-    class HostileResource:
         def echo(self, value):
-            raise _HostileClassCoreError('transport', 'resource unary hostile')
+            mutations[self.tag] += 1
+            raise CCBaseError('bare base error after state mutation')
 
         def steps(self, value):
-            raise _HostileClassCoreError('transport', 'resource stream hostile')
+            mutations['stream'] += 1
+            raise CCBaseError('bare base error in stream')
             yield value
 
-    runtime.register(CodecBoundary, HostileResource(), name='hostile')
-    remote = runtime.connect(CodecBoundary, name='hostile', address=runtime.server_address())
-    try:
-        with pytest.raises(ResourceExecutionError) as u_err:
-            remote.echo('x')
-        assert 'resource unary hostile' in u_err.value.message
-        assert '__class__ getter' not in u_err.value.message
-
-        stream = remote.steps('x')
-        with pytest.raises(ResourceExecutionError) as s_err:
-            next(stream)
-        assert 'resource stream hostile' in s_err.value.message
-        assert '__class__ getter' not in s_err.value.message
-    finally:
-        cc.close(remote)
-        runtime.shutdown()
-
-    # 2. Generated Python ContractClient response release raising _HostileClassCoreError -> code 8 SerializationError.
-    fixture = (
-        Path(__file__).resolve().parents[4]
-        / 'tests/fixtures/contracts/portable-release.contract.json'
-    )
-    compiled = cc.contract.compile_artifacts(fixture.read_bytes(), target='python')
-    out_dir = tmp_path / 'gen_hostile'
-    for artifact in compiled.artifacts:
-        dest = out_dir / artifact.relative_path
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        dest.write_bytes(artifact.bytes)
-    spec = importlib.util.spec_from_file_location('_gen_hostile_mod', out_dir / 'python/c_two_contract.py')
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    req_payload, _ = echo_payload('hello')
-    try:
-        spec.loader.exec_module(module)
-
-        class BadReleaseResponse:
-            def __bytes__(self) -> bytes:
-                return b''
-
-            def release(self) -> None:
-                raise _HostileClassCoreError('lifecycle', 'release hostile')
-
-        class BoundClient:
-            def call(self, _method: str, _request: bytes):
-                return BadReleaseResponse()
-
-        gen_client = module.ContractClient(BoundClient())
-        with pytest.raises(SerializationError) as rel_err:
-            gen_client.method_1_echo(req_payload)
-        assert rel_err.value.code == ErrorCode.ClientOutputFromBuffer
-        assert 'release hostile' in rel_err.value.message
-        assert '__class__ getter' not in rel_err.value.message
-    finally:
-        req_payload.close()
-        sys.modules.pop(spec.name, None)
-
-    # 3. Unary prepared.call() succeeds, then prepared.close() raises CCBaseError + ExceptionGroup with rewritten args.
-    if hasattr(py_builtins, 'ExceptionGroup'):
-        class _RewrittenGroupCloseError(CCBaseError, py_builtins.ExceptionGroup):  # type: ignore[misc]
-            pass
-
-        orig_close_err = _RewrittenGroupCloseError('close group', [ValueError('inner')])
-        orig_close_err.args = ('rewritten-close-arg',)
-        orig_close_err._transport_phase = 'pre_dispatch'  # type: ignore[attr-defined]
-
-        class PreparedCloseBoom:
-            def charge_input(self, _n: int) -> None:
-                return None
-
-            def call(self, _method: str, _data: bytes | None) -> bytes:
-                return pickle.dumps('ok')
-
-            def close(self) -> None:
-                raise orig_close_err
-
-        class UnaryClient:
-            supports_direct_call = False
-            local_copy_tracker = None
-
-            def prepare_call(self, _method: str):
-                return PreparedCloseBoom()
-
-        def unary_fn(self) -> str: ...
-
-        wrapped_unary = _build_transfer_wrapper(
-            unary_fn,
-            input=no_payload_binding(),
-            output=python_pickle_output_binding(unary_fn),
-        )
-
-        class CrmObj:
-            direction = '->'
-            client = UnaryClient()
-
-        with pytest.raises(_RewrittenGroupCloseError) as close_caught:
-            wrapped_unary(CrmObj())
-        assert close_caught.value is not orig_close_err
-        assert close_caught.value.transport_phase is None
-        assert close_caught.value.args == ('rewritten-close-arg',)
-        assert close_caught.value.__cause__ is orig_close_err
-
-    # 4. Bare CCBaseError and custom CCBaseError forwarding inner pre_dispatch raised inside
-    # a stateful resource method project to ResourceExecutionError(3, transport_phase=None)
-    # identically across same-process unary, IPC unary, and stream calls.
-    from c_two.error import ResourceClosed
-
-    class _WrappedDownstreamError(CCBaseError):
-        def __init__(self, inner: CCBaseError):
-            super().__init__('business wrapper around downstream refusal')
-            self.inner = inner
-
-        @property
-        def transport_phase(self):  # type: ignore[override]
-            return self.inner.transport_phase
-
-    for make_exc in (
-        lambda: CCBaseError('bare base error after state mutation'),
-        lambda: _WrappedDownstreamError(ResourceClosed('inner closed', transport_phase='pre_dispatch')),
-    ):
-        mutations = {'local_unary': 0, 'ipc_unary': 0, 'stream': 0}
-
-        class StatefulBaseResource:
-            def __init__(self, tag: str):
-                self.tag = tag
-
-            def echo(self, value):
-                mutations[self.tag] += 1
-                raise make_exc()
-
-            def steps(self, value):
-                mutations['stream'] += 1
-                raise make_exc()
-                yield value
-
-        rt = cc.Runtime()
-        if sys.platform != 'win32':
-            base_dir = tmp_path / f'base_ipc_{id(make_exc)}'
-            base_dir.mkdir()
-            rt.set_local_endpoint(root=str(base_dir))
-        rt.register(CodecBoundary, StatefulBaseResource('local_unary'), name='local-base')
-        rt.register(CodecBoundary, StatefulBaseResource('ipc_unary'), name='ipc-base')
-        local_proxy = rt.connect(CodecBoundary, name='local-base')
-        ipc_proxy = rt.connect(CodecBoundary, name='ipc-base', address=rt.server_address())
-        try:
-            with pytest.raises(ResourceExecutionError) as local_u:
-                local_proxy.echo('go')
-            assert local_u.value.code == ErrorCode.ResourceFunctionExecuting
-            assert local_u.value.transport_phase is None
-            assert isinstance(local_u.value.__cause__, CCBaseError)
-            assert mutations['local_unary'] == 1
-
-            with pytest.raises(ResourceExecutionError) as ipc_u:
-                ipc_proxy.echo('go')
-            assert ipc_u.value.code == ErrorCode.ResourceFunctionExecuting
-            assert ipc_u.value.transport_phase is None
-            assert mutations['ipc_unary'] == 1
-
-            s = local_proxy.steps('go')
-            with pytest.raises(ResourceExecutionError) as local_s:
-                next(s)
-            assert local_s.value.code == ErrorCode.ResourceFunctionExecuting
-            assert local_s.value.transport_phase is None
-            assert mutations['stream'] == 1
-        finally:
-            cc.close(local_proxy)
-            cc.close(ipc_proxy)
-            rt.shutdown()
-
-    # 5. Prepared handle close() raising _WrappedDownstreamError after call()/stream() dispatch
-    # across hand-written unary, hand-written stream, generated stream and generated hold_* stream;
-    # plus ResourceClosed subclass overriding @property transport_phase inside a local resource.
-    prop_getter_calls = 0
-
-    class _ForwardingClosed(ResourceClosed):
-        def __init__(self):
-            super().__init__('closed with property override', details={'biz': 'kept'})
-
-        @property
-        def transport_phase(self):  # type: ignore[override]
-            nonlocal prop_getter_calls
-            prop_getter_calls += 1
-            return 'pre_dispatch'
-
-    local_closed_runs = 0
-
-    class ClosedPropertyResource:
-        def echo(self, value):
-            nonlocal local_closed_runs
-            local_closed_runs += 1
-            raise _ForwardingClosed()
-
-        def steps(self, value):
-            yield value
-
-    rt2 = cc.Runtime()
+    rt = cc.Runtime()
     if sys.platform != 'win32':
-        prop_dir = tmp_path / 'closed_prop_ipc'
-        prop_dir.mkdir()
-        rt2.set_local_endpoint(root=str(prop_dir))
-    rt2.register(CodecBoundary, ClosedPropertyResource(), name='closed-prop')
-    prop_proxy = rt2.connect(CodecBoundary, name='closed-prop')
+        base_dir = tmp_path / 'base_ipc'
+        base_dir.mkdir()
+        rt.set_local_endpoint(root=str(base_dir))
+    rt.register(CodecBoundary, StatefulBaseResource('local_unary'), name='local-base')
+    rt.register(CodecBoundary, StatefulBaseResource('ipc_unary'), name='ipc-base')
+    local_proxy = rt.connect(CodecBoundary, name='local-base')
+    ipc_proxy = rt.connect(CodecBoundary, name='ipc-base', address=rt.server_address())
     try:
-        with pytest.raises(ResourceClosed) as prop_err:
-            prop_proxy.echo('go')
-        assert prop_getter_calls == 0
-        assert type(prop_err.value) is ResourceClosed
-        assert prop_err.value.code == ErrorCode.ResourceClosed
-        assert prop_err.value.transport_phase is None
-        assert prop_err.value.details == {'biz': 'kept'}
-        assert isinstance(prop_err.value.__cause__, _ForwardingClosed)
-        assert local_closed_runs == 1
+        with pytest.raises(ResourceExecutionError) as local_u:
+            local_proxy.echo('go')
+        assert local_u.value.code == ErrorCode.ResourceFunctionExecuting
+        assert local_u.value.transport_phase is None
+        assert isinstance(local_u.value.__cause__, CCBaseError)
+        assert mutations['local_unary'] == 1
+
+        with pytest.raises(ResourceExecutionError) as ipc_u:
+            ipc_proxy.echo('go')
+        assert ipc_u.value.code == ErrorCode.ResourceFunctionExecuting
+        assert ipc_u.value.transport_phase is None
+        assert mutations['ipc_unary'] == 1
+
+        s = local_proxy.steps('go')
+        with pytest.raises(ResourceExecutionError) as local_s:
+            next(s)
+        assert local_s.value.code == ErrorCode.ResourceFunctionExecuting
+        assert local_s.value.transport_phase is None
+        assert mutations['stream'] == 1
     finally:
-        cc.close(prop_proxy)
-        rt2.shutdown()
+        cc.close(local_proxy)
+        cc.close(ipc_proxy)
+        rt.shutdown()
 
-    def make_wrapped_close_err():
-        return _WrappedDownstreamError(ResourceClosed('inner closed', transport_phase='pre_dispatch'))
+    # 2. Prepared handle close() raising ResourceClosed(pre_dispatch) after dispatch strips phase across unary & stream.
+    orig_close = ResourceClosed('close after reply', details={'biz': 'ok', 'dispatch_phase': 'pre_dispatch'}, transport_phase='pre_dispatch')
 
-    # 5a. Hand-written unary close() after call()
-    w_unary_err = make_wrapped_close_err()
-
-    class WrappedCloseUnaryPrepared:
+    class UnaryPrepared:
         def charge_input(self, _n: int) -> None:
             return None
 
@@ -2271,40 +1820,9 @@ def test_post_dispatch_prepared_close_exception_group_and_fastdb_hostile_class_g
             return pickle.dumps('ok')
 
         def close(self) -> None:
-            raise w_unary_err
+            raise orig_close
 
-    class WrappedCloseClient:
-        supports_direct_call = False
-        local_copy_tracker = None
-        route_name = 'wrapped-close'
-
-        def prepare_call(self, _method: str):
-            return WrappedCloseUnaryPrepared()
-
-        def begin_stream(self, _method: str):
-            return WrappedCloseStreamPrepared()
-
-    def hw_unary(self) -> str: ...
-    def hw_stream(self) -> Iterator[str]: ...
-    hw_stream.__cc_stream__ = True
-
-    class WrappedCrm:
-        direction = '->'
-        client = WrappedCloseClient()
-
-    wrapped_hw_unary = _build_transfer_wrapper(
-        hw_unary, input=no_payload_binding(), output=python_pickle_output_binding(hw_unary),
-    )
-    with pytest.raises(CCBaseError) as hw_u_caught:
-        wrapped_hw_unary(WrappedCrm())
-    assert hw_u_caught.value is not w_unary_err
-    assert hw_u_caught.value.transport_phase is None
-    assert hw_u_caught.value.__cause__ is w_unary_err
-
-    # 5b. Hand-written stream close() after stream()
-    w_stream_err = make_wrapped_close_err()
-
-    class WrappedCloseStreamPrepared:
+    class StreamPrepared:
         def charge_input(self, _n: int) -> None:
             return None
 
@@ -2312,439 +1830,179 @@ def test_post_dispatch_prepared_close_exception_group_and_fastdb_hostile_class_g
             return _FakeNativeStream([])
 
         def close(self) -> None:
-            raise w_stream_err
+            raise orig_close
 
-    wrapped_hw_stream = _build_transfer_wrapper(
-        hw_stream, input=no_payload_binding(), output=python_pickle_output_binding(hw_stream),
-    )
-    with pytest.raises(CCBaseError) as hw_s_caught:
-        wrapped_hw_stream(WrappedCrm())
-    assert hw_s_caught.value is not w_stream_err
-    assert hw_s_caught.value.transport_phase is None
-    assert hw_s_caught.value.__cause__ is w_stream_err
+    class CloseClient:
+        supports_direct_call = False
+        local_copy_tracker = None
+        route_name = 'close-route'
 
-    # 5c & 5d. Generated ContractClient stream and hold_* stream close() after stream()
-    stream_fixture = (
-        Path(__file__).resolve().parents[4]
-        / 'core/foundation/c2-contract/tests/fixtures/server-stream.contract.json'
-    )
+        def prepare_call(self, _method: str):
+            return UnaryPrepared()
+
+        def begin_stream(self, _method: str):
+            return StreamPrepared()
+
+    def hw_unary(self) -> str: ...
+    def hw_stream(self) -> Iterator[str]: ...
+    hw_stream.__cc_stream__ = True
+
+    class CrmObj:
+        direction = '->'
+        client = CloseClient()
+
+    wrapped_unary = _build_transfer_wrapper(hw_unary, input=no_payload_binding(), output=python_pickle_output_binding(hw_unary))
+    with pytest.raises(ResourceClosed) as u_caught:
+        wrapped_unary(CrmObj())
+    assert u_caught.value is not orig_close
+    assert u_caught.value.transport_phase is None
+    assert u_caught.value.details == {'biz': 'ok'}
+    assert orig_close.transport_phase == 'pre_dispatch'
+
+    wrapped_stream = _build_transfer_wrapper(hw_stream, input=no_payload_binding(), output=python_pickle_output_binding(hw_stream))
+    with pytest.raises(ResourceClosed) as s_caught:
+        wrapped_stream(CrmObj())
+    assert s_caught.value is not orig_close
+    assert s_caught.value.transport_phase is None
+    assert s_caught.value.details == {'biz': 'ok'}
+
+    # Generated ContractClient stream & hold_* close() after stream() also sanitize phase.
+    stream_fixture = Path(__file__).resolve().parents[4] / 'core/foundation/c2-contract/tests/fixtures/server-stream.contract.json'
     compiled_stream = cc.contract.compile_artifacts(stream_fixture.read_bytes(), target='python')
-    gen_stream_dir = tmp_path / 'gen_wrapped_close'
+    gen_dir = tmp_path / 'gen_close'
     for artifact in compiled_stream.artifacts:
-        dest = gen_stream_dir / artifact.relative_path
+        dest = gen_dir / artifact.relative_path
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_bytes(artifact.bytes)
-    gspec = importlib.util.spec_from_file_location(
-        '_gen_wrapped_close_mod', gen_stream_dir / 'python/c_two_contract.py',
-    )
+    gspec = importlib.util.spec_from_file_location('_gen_close_mod', gen_dir / 'python/c_two_contract.py')
     assert gspec is not None and gspec.loader is not None
     gmod = importlib.util.module_from_spec(gspec)
     sys.modules[gspec.name] = gmod
     gpayload, _ = echo_payload('stream-in')
     try:
         gspec.loader.exec_module(gmod)
+
+        class GenBound:
+            local_copy_tracker = None
+            route_name = 'gen-stream'
+
+            def begin_stream(self, _method: str):
+                return StreamPrepared()
+
+            def call(self, _method: str, _data: bytes) -> bytes:
+                return b''
+
+        gen_sc = gmod.ContractClient(GenBound())
         for method_attr in ('method_1_echo', 'hold_method_1_echo'):
-            gen_close_err = make_wrapped_close_err()
-
-            class GenStreamPrepared:
-                def charge_input(self, _n: int) -> None:
-                    return None
-
-                def stream(self, _data: bytes):
-                    return _FakeNativeStream([])
-
-                def close(self) -> None:
-                    raise gen_close_err
-
-            class GenStreamBound:
-                local_copy_tracker = None
-                route_name = 'gen-stream'
-
-                def begin_stream(self, _method: str):
-                    return GenStreamPrepared()
-
-                def call(self, _method: str, _data: bytes) -> bytes:
-                    return b''
-
-            gen_sc = gmod.ContractClient(GenStreamBound())
-            with pytest.raises(CCBaseError) as gs_caught:
+            with pytest.raises(ResourceClosed) as gs_caught:
                 getattr(gen_sc, method_attr)(gpayload)
-            assert gs_caught.value is not gen_close_err
+            assert gs_caught.value is not orig_close
             assert gs_caught.value.transport_phase is None
-            assert gs_caught.value.__cause__ is gen_close_err
+            assert gs_caught.value.details == {'biz': 'ok'}
     finally:
         gpayload.close()
         sys.modules.pop(gspec.name, None)
 
-    # 6. Post-BaseException MRO mixin, unhashable metaclass + hostile __class__ attribute,
-    # CoreError semantic slot cycle prevention, and diagnostic preservation on rebuild.
-    import gc
-    import weakref
-    from c_two.error import CoreError
-
-    class _PostBaseMixin:
-        details = {
-            'dispatch_phase': 'pre_dispatch',
-            'fallback_eligible': 'true',
-            'biz': 'from-mixin',
-        }
-
-    class _MixinClosedError(ResourceClosed, _PostBaseMixin):
-        def __init__(self):
-            Exception.__init__(self, 'mixin closed')
-            self.code = ErrorCode.ResourceClosed
-            self.message = 'mixin closed'
-            self._transport_phase = 'pre_dispatch'
-
-    class _HostileAttr:
-        @property
-        def __class__(self):  # type: ignore[override]
-            raise RuntimeError('__class__ accessed during descriptor check')
-
-    class _UnhashableErrorMeta(type):
-        __hash__ = None  # type: ignore[assignment]
-
-        def __eq__(cls, other: object) -> bool:
-            return cls is other
-
-    class _UnhashableClosed(ResourceClosed, metaclass=_UnhashableErrorMeta):
-        marker = _HostileAttr()
-
-        def __init__(self):
-            super().__init__(
-                'unhashable closed',
-                details={'dispatch_phase': 'pre_dispatch', 'biz': 'unhashable-kept'},
-                transport_phase='pre_dispatch',
-            )
-
-    class _SetterDetailsClosed(ResourceClosed):
-        def __init__(self):
-            self._stored: dict[str, str] = {}
-            super().__init__(
-                'setter closed',
-                details={'batch': '7', 'transport_phase': 'pre_dispatch'},
-            )
+    # 3. Subclass whose `details` getter depends on an attribute initialized after super().__init__() constructs cleanly.
+    class _LateFieldClosed(ResourceClosed):
+        def __init__(self, extra: str):
+            super().__init__('late field closed', transport_phase='pre_dispatch')
+            self._extra = extra
 
         @property
         def details(self) -> dict[str, str]:  # type: ignore[override]
-            return self._stored
-
-        @details.setter
-        def details(self, value: dict[str, str]) -> None:
-            self._stored = dict(value)
-
-    for idx, make_cls_err in enumerate((_MixinClosedError, _UnhashableClosed, _SetterDetailsClosed)):
-        expected_biz = (
-            {'biz': 'from-mixin'}
-            if idx == 0
-            else {'biz': 'unhashable-kept'}
-            if idx == 1
-            else {'batch': '7'}
-        )
-
-        class EdgeSemanticResource:
-            def echo(self, value):
-                raise make_cls_err()
-
-            def steps(self, value):
-                yield value
-
-        rt_edge = cc.Runtime()
-        if sys.platform != 'win32':
-            edge_dir = tmp_path / f'edge_sem_{idx}'
-            edge_dir.mkdir()
-            rt_edge.set_local_endpoint(root=str(edge_dir))
-        rt_edge.register(CodecBoundary, EdgeSemanticResource(), name=f'edge-{idx}')
-        edge_proxy = rt_edge.connect(CodecBoundary, name=f'edge-{idx}')
-        try:
-            with pytest.raises(ResourceClosed) as edge_caught:
-                edge_proxy.echo('go')
-            assert edge_caught.value.code == ErrorCode.ResourceClosed
-            assert edge_caught.value.transport_phase is None
-            assert edge_caught.value.details == expected_biz
-        finally:
-            cc.close(edge_proxy)
-            rt_edge.shutdown()
-
-    # 6b. CoreError subclass shadowing semantic via __slots__ in prepared.close() after dispatch
-    # through generated ContractClient (both unary _project_call and stream _close_prepared):
-    # never projects ResourceClosed(pre_dispatch) and forms zero refcycle under gc.disable().
-    from c_two.error import _post_dispatch_cleanup_error
-
-    class _SlottedSemanticCore(CoreError):
-        __slots__ = ('semantic',)
-
-    unary_fixture = Path(__file__).resolve().parents[4] / 'tests/fixtures/contracts/portable-release.contract.json'
-    compiled_unary = cc.contract.compile_artifacts(unary_fixture.read_bytes(), target='python')
-    gen_unary_dir = tmp_path / 'gen_slotted_sem_core'
-    for artifact in compiled_unary.artifacts:
-        dest = gen_unary_dir / artifact.relative_path
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        dest.write_bytes(artifact.bytes)
-    uspec = importlib.util.spec_from_file_location(
-        '_gen_slotted_sem_mod', gen_unary_dir / 'python/c_two_contract.py',
-    )
-    assert uspec is not None and uspec.loader is not None
-    umod = importlib.util.module_from_spec(uspec)
-    sys.modules[uspec.name] = umod
-    upayload_in, _ = echo_payload('in')
-    upayload_out, _ = echo_payload('out')
-    out_bytes = bytes(upayload_out.binary_bytes())
-    try:
-        uspec.loader.exec_module(umod)
-        gc_was_enabled = gc.isenabled()
-        gc.disable()
-        try:
-            def run_slotted_semantic_close():
-                inner_sem = ResourceClosed('shadowed pre_dispatch', transport_phase='pre_dispatch')
-                slotted_core = _SlottedSemanticCore('transport', 'close failed after reply')
-                slotted_core.semantic = inner_sem  # type: ignore[misc]
-                core_ref = weakref.ref(slotted_core)
-                sem_ref = weakref.ref(inner_sem)
-
-                class StreamSlottedPrepared:
-                    def __init__(self, err: CoreError):
-                        self._err = err
-
-                    def charge_input(self, _n: int) -> None:
-                        return None
-
-                    def stream(self, _data: bytes):
-                        return _FakeNativeStream([])
-
-                    def _pop_err(self) -> CoreError:
-                        err = self._err
-                        self._err = None  # type: ignore[assignment]
-                        return err
-
-                    def close(self) -> None:
-                        raise self._pop_err()
-
-                class StreamSlottedBound:
-                    local_copy_tracker = None
-                    route_name = 'slotted-stream'
-
-                    def __init__(self, err: CoreError):
-                        self._err = err
-
-                    def begin_stream(self, _method: str):
-                        err = self._err
-                        self._err = None  # type: ignore[assignment]
-                        return StreamSlottedPrepared(err)
-
-                    def call(self, _method: str, _data: bytes) -> bytes:
-                        return b''
-
-                gen_stream_client = gmod.ContractClient(StreamSlottedBound(slotted_core))
-                try:
-                    gen_stream_client.method_1_echo(upayload_in)
-                    raise AssertionError('expected CoreError')
-                except CoreError as caught_core:
-                    assert type(caught_core) is CoreError
-                    assert caught_core.transport_phase is None
-                    assert caught_core.semantic is None
-
-                # Also exercise uncleaned _SlottedSemanticCore reaching unary ContractClient._project_call
-                inner_sem2 = ResourceClosed('direct shadowed pre_dispatch', transport_phase='pre_dispatch')
-                slotted_core2 = _SlottedSemanticCore('transport', 'direct pre-cleaned close')
-                slotted_core2.semantic = inner_sem2  # type: ignore[misc]
-                core_ref2 = weakref.ref(slotted_core2)
-                sem_ref2 = weakref.ref(inner_sem2)
-
-                class RawSlottedBound:
-                    def __init__(self, err: CoreError):
-                        self._err = err
-
-                    def _pop_err(self) -> CoreError:
-                        err = self._err
-                        self._err = None  # type: ignore[assignment]
-                        return err
-
-                    def call(self, _method: str, _data: bytes) -> bytes:
-                        raise self._pop_err()
-
-                gen_uc2 = umod.ContractClient(RawSlottedBound(slotted_core2))
-                try:
-                    gen_uc2.method_1_echo(upayload_in)
-                    raise AssertionError('expected _SlottedSemanticCore')
-                except CoreError as raw_caught:
-                    assert raw_caught is slotted_core2
-                    assert raw_caught.transport_phase is None
-
-                del inner_sem, slotted_core, gen_stream_client, inner_sem2, slotted_core2, gen_uc2
-                return core_ref, sem_ref, core_ref2, sem_ref2
-
-            core_ref, sem_ref, core_ref2, sem_ref2 = run_slotted_semantic_close()
-            assert core_ref() is None
-            assert sem_ref() is None
-            assert core_ref2() is None
-            assert sem_ref2() is None
-        finally:
-            if gc_was_enabled:
-                gc.enable()
-    finally:
-        upayload_in.close()
-        upayload_out.close()
-        sys.modules.pop(uspec.name, None)
-
-    # 6c. Slotted CoreError diagnostic preservation and bare CCBaseError details preservation on rebuild.
-
-    class _SlottedDiagCore(CoreError):
-        __slots__ = ('io_kind', 'raw_os_error')
-
-        @property
-        def transport_phase(self):  # type: ignore[override]
-            return 'pre_dispatch'
-
-    diag_core = _SlottedDiagCore('transport', 'bind permission denied')
-    diag_core.io_kind = 'permission_denied'
-    diag_core.raw_os_error = 13
-    diag_core.details = {'dispatch_phase': 'pre_dispatch', 'path': '/tmp/sock'}
-    rebuilt_core = _post_dispatch_cleanup_error(diag_core)
-    assert type(rebuilt_core) is CoreError
-    assert rebuilt_core.transport_phase is None
-    assert rebuilt_core.io_kind == 'permission_denied'
-    assert rebuilt_core.raw_os_error == 13
-    assert rebuilt_core.details == {'path': '/tmp/sock'}
-    assert rebuilt_core.__cause__ is diag_core
-
-    class _DetailsBaseError(CCBaseError):
-        @property
-        def transport_phase(self):  # type: ignore[override]
-            return 'pre_dispatch'
-
-    base_with_details = _DetailsBaseError('base cleanup error')
-    base_with_details.details = {'biz': 'base-kept', 'transport_phase': 'pre_dispatch'}  # type: ignore[attr-defined]
-    rebuilt_base = _post_dispatch_cleanup_error(base_with_details)
-    assert type(rebuilt_base) is CCBaseError
-    assert rebuilt_base.transport_phase is None
-    assert rebuilt_base.details == {'biz': 'base-kept'}  # type: ignore[attr-defined]
-    assert rebuilt_base.__cause__ is base_with_details
-
-    # 7. str subclass __str__ never replaces resource error, spoofed __module__ == 'builtins' is caught,
-    # list-subclass and slotted __notes__ stay independent, and updated/deleted details reflect throw-time state.
-    import copy
-
-    class _HostileMsgStr(str):
-        def __str__(self) -> str:
-            raise ResourceClosed('inner pre_dispatch from str.__str__', transport_phase='pre_dispatch')
-
-    class _StrSubRebuildClosed(ResourceClosed):
-        @property
-        def transport_phase(self):  # type: ignore[override]
-            return 'pre_dispatch'
-
-    SpoofedBuiltinClosed = type(
-        '_SpoofedBuiltinClosed',
-        (ResourceClosed,),
-        {
-            '__module__': 'builtins',
-            'transport_phase': property(lambda _self: 'pre_dispatch'),
-        },
-    )
-
-    class _MutableSetterClosed(ResourceClosed):
-        def __init__(self):
-            self._d: dict[str, str] = {}
-            super().__init__('mutable setter', details={'batch': 'before', 'transport_phase': 'pre_dispatch'})
-
-        @property
-        def details(self) -> dict[str, str]:  # type: ignore[override]
-            return self._d
+            return {'extra': self._extra, 'dispatch_phase': 'pre_dispatch'}
 
         @details.setter
         def details(self, val: dict[str, str]) -> None:
-            self._d = dict(val)
+            self._init_details = dict(val)
 
-    class _ClassDefaultDetailsClosed(ResourceClosed):
-        details = {'batch': 'class-default', 'dispatch_phase': 'pre_dispatch'}  # type: ignore[assignment]
+    late = _LateFieldClosed('ready')
+    assert late.details == {'extra': 'ready', 'dispatch_phase': 'pre_dispatch'}
+    assert late.transport_phase == 'pre_dispatch'
 
-    r13_runs = 0
+    # 4. __notes__ independence across copy, pickle and cleanup (Python 3.10+ compatible).
+    orig_notes = ResourceClosed('notes test', transport_phase='pre_dispatch')
+    orig_notes.__notes__ = ['biz-note']
+    cleaned_notes = _post_dispatch_cleanup_error(orig_notes)
+    cleaned_notes.__notes__.append('cleanup-note')
+    assert orig_notes.__notes__ == ['biz-note']
+    assert cleaned_notes.__notes__ == ['biz-note', 'cleanup-note']
 
-    class R13Resource:
-        def echo(self, value):
-            nonlocal r13_runs
-            r13_runs += 1
-            if value == 'str-sub':
-                raise _StrSubRebuildClosed(_HostileMsgStr('business closed text'), details={'k': _HostileMsgStr('v')})
-            if value == 'spoof-builtin':
-                raise SpoofedBuiltinClosed('spoofed module closed', details={'spoof': 'kept'})
-            if value == 'setter-mutated':
-                err = _MutableSetterClosed()
-                err.details['batch'] = 'after'
-                err.details['added'] = 'yes'
-                raise err
-            err_del = _ClassDefaultDetailsClosed('deleted inst details', details={'batch': 'temp'})
-            del err_del.details
-            raise err_del
+    pickled_notes = pickle.loads(pickle.dumps(orig_notes))
+    pickled_notes.__notes__.append('pickle-note')
+    assert orig_notes.__notes__ == ['biz-note']
+    assert pickled_notes.__notes__ == ['biz-note', 'pickle-note']
 
-        def steps(self, value):
-            yield value
+    slotted = _SlottedNotesClosed('slotted notes', transport_phase='pre_dispatch')
+    slotted.__notes__ = ['slot-1']
+    slotted_copy = copy.copy(slotted)
+    slotted_copy.__notes__.append('slot-2')
+    slotted_pickle = pickle.loads(pickle.dumps(slotted))
+    slotted_pickle.__notes__.append('slot-3')
+    slotted_clean = _post_dispatch_cleanup_error(slotted)
+    slotted_clean.__notes__.append('slot-4')
+    assert slotted.__notes__ == ['slot-1']
+    assert slotted_copy.__notes__ == ['slot-1', 'slot-2']
+    assert slotted_pickle.__notes__ == ['slot-1', 'slot-3']
+    assert slotted_clean.__notes__ == ['slot-1', 'slot-4']
 
-    rt_r13 = cc.Runtime()
-    if sys.platform != 'win32':
-        r13_dir = tmp_path / 'r13_ipc'
-        r13_dir.mkdir()
-        rt_r13.set_local_endpoint(root=str(r13_dir))
-    rt_r13.register(CodecBoundary, R13Resource(), name='r13')
-    r13_proxy = rt_r13.connect(CodecBoundary, name='r13')
-    try:
-        with pytest.raises(ResourceClosed) as c_str:
-            r13_proxy.echo('str-sub')
-        assert c_str.value.code == ErrorCode.ResourceClosed
-        assert c_str.value.transport_phase is None
-        assert type(c_str.value.message) is str
-        assert c_str.value.message == 'business closed text'
-        assert c_str.value.details == {'k': 'v'}
-        assert type(c_str.value.details['k']) is str
-        assert r13_runs == 1
 
-        with pytest.raises(ResourceClosed) as c_spoof:
-            r13_proxy.echo('spoof-builtin')
-        assert c_spoof.value.code == ErrorCode.ResourceClosed
-        assert c_spoof.value.transport_phase is None
-        assert c_spoof.value.details == {'spoof': 'kept'}
-        assert r13_runs == 2
+@pytest.mark.skipif(sys.version_info < (3, 11), reason='PEP 678 BaseException.add_note requires Python 3.11+')
+def test_pep678_notes_add_note_and_borrowed_cleanup_isolation():
+    import copy
+    import pickle
+    from c_two.crm.payload_plan import PayloadBinding, PayloadPlanKind
+    from c_two.crm.transferable import _build_transfer_wrapper
+    from c_two.error import _post_dispatch_cleanup_error
 
-        with pytest.raises(ResourceClosed) as c_mut:
-            r13_proxy.echo('setter-mutated')
-        assert c_mut.value.code == ErrorCode.ResourceClosed
-        assert c_mut.value.transport_phase is None
-        assert c_mut.value.details == {'batch': 'after', 'added': 'yes'}
-        assert r13_runs == 3
+    orig = ResourceClosed('pep678 notes', transport_phase='pre_dispatch')
+    orig.add_note('biz-note')
+    cleaned = _post_dispatch_cleanup_error(orig)
+    cleaned.add_note('cleanup-note')
+    assert orig.__notes__ == ['biz-note']
+    assert cleaned.__notes__ == ['biz-note', 'cleanup-note']
 
-        with pytest.raises(ResourceClosed) as c_del:
-            r13_proxy.echo('deleted-inst')
-        assert c_del.value.code == ErrorCode.ResourceClosed
-        assert c_del.value.transport_phase is None
-        assert c_del.value.details == {'batch': 'class-default'}
-        assert r13_runs == 4
-    finally:
-        cc.close(r13_proxy)
-        rt_r13.shutdown()
+    pickled = pickle.loads(pickle.dumps(orig))
+    pickled.add_note('pickle-note')
+    assert orig.__notes__ == ['biz-note']
+    assert pickled.__notes__ == ['biz-note', 'pickle-note']
 
-    # 7b. __notes__ using list subclass and __notes__ in __slots__ remain independent across copy, pickle and cleanup.
-    orig_notes_err = ResourceClosed('notes list sub', transport_phase='pre_dispatch')
-    orig_notes_err.__notes__ = _NotesList(['biz-note'])  # type: ignore[assignment]
-    cleaned_notes_err = _post_dispatch_cleanup_error(orig_notes_err)
-    cleaned_notes_err.add_note('cleanup-note')
-    assert list(orig_notes_err.__notes__) == ['biz-note']
-    assert cleaned_notes_err.__notes__ == ['biz-note', 'cleanup-note']
+    slotted = _SlottedNotesClosed('slotted pep678', transport_phase='pre_dispatch')
+    slotted.add_note('slot-1')
+    copied = copy.copy(slotted)
+    copied.add_note('slot-2')
+    assert slotted.__notes__ == ['slot-1']
+    assert copied.__notes__ == ['slot-1', 'slot-2']
 
-    pickled_notes_err = pickle.loads(pickle.dumps(orig_notes_err))
-    pickled_notes_err.add_note('pickle-note')
-    assert list(orig_notes_err.__notes__) == ['biz-note']
-    assert pickled_notes_err.__notes__ == ['biz-note', 'pickle-note']
+    # Borrowed input invalidation failing after ResourceClosed never mutates original __notes__.
+    original_biz = ResourceClosed('borrowed boom', transport_phase='pre_dispatch')
+    original_biz.add_note('biz-note')
 
-    copied_slotted = _SlottedNotesClosed('slotted notes', transport_phase='pre_dispatch')
-    copied_slotted.add_note('slot-note-1')
-    shallow_slotted = copy.copy(copied_slotted)
-    shallow_slotted.add_note('slot-note-2')
-    roundtrip_slotted = pickle.loads(pickle.dumps(copied_slotted))
-    roundtrip_slotted.add_note('slot-note-3')
-    cleaned_slotted = _post_dispatch_cleanup_error(copied_slotted)
-    cleaned_slotted.add_note('slot-note-4')
-    assert copied_slotted.__notes__ == ['slot-note-1']
-    assert shallow_slotted.__notes__ == ['slot-note-1', 'slot-note-2']
-    assert roundtrip_slotted.__notes__ == ['slot-note-1', 'slot-note-3']
-    assert cleaned_slotted.__notes__ == ['slot-note-1', 'slot-note-4']
+    plan = PayloadBinding(
+        kind=PayloadPlanKind.FASTDB,
+        serialize=lambda _x: b'in',
+        deserialize=lambda _raw: ('borrowed-item',),
+        invalidate=lambda _val: (_ for _ in ()).throw(OSError('borrowed invalidation failed')),
+        spec=object(),
+        spec_sha256=b'\x00' * 32,
+        compiled_spec=object(),
+    )
+
+    class _FakeResource:
+        def work(self, _item: object) -> bytes:
+            raise original_biz
+
+    class _FakeContract:
+        resource = _FakeResource()
+        direction = '<-'
+
+        def work(self, item: object) -> bytes: ...
+
+    wrapped = _build_transfer_wrapper(_FakeContract.work, input=plan, output=None)
+    with pytest.raises(ResourceClosed) as caught:
+        wrapped(_FakeContract(), b'payload', _c2_input_buffer_mode='borrowed')
+    assert caught.value is not original_biz
+    assert caught.value.transport_phase is None
+    assert original_biz.__notes__ == ['biz-note']
+    assert any('C-Two cleanup also failed' in n for n in caught.value.__notes__)

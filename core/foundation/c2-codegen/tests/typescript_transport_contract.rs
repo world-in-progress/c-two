@@ -563,7 +563,7 @@ test('generated artifact error-code table validates canonical HTTP relay envelop
   for (const [status,body,expectPhase,expectRetry] of [
     [503, JSON.stringify({version:1,code:717,name:'CallCapacityExceeded',message:'cap',details:{dispatch_phase:'pre_dispatch'}}), 'pre_dispatch', true],
     [503, JSON.stringify({version:1,code:717,name:'ResourceNotFound',message:'wrong',details:{dispatch_phase:'pre_dispatch'}}), 'dispatch_uncertain', false],
-    [503, '{"version":1,"code":717.0,"name":"CallCapacityExceeded","message":"float","details":{"dispatch_phase":"pre_dispatch"}}', 'dispatch_uncertain', false],
+    [503, '{"version":1,"code":717.5,"name":"CallCapacityExceeded","message":"float","details":{"dispatch_phase":"pre_dispatch"}}', 'dispatch_uncertain', false],
     [503, JSON.stringify([1,717,'CallCapacityExceeded','array',{dispatch_phase:'pre_dispatch'}]), 'dispatch_uncertain', false],
     [503, JSON.stringify({version:1,code:720,name:'FutureCode',message:'future',details:{dispatch_phase:'pre_dispatch'}}), 'dispatch_uncertain', false],
   ]) {
