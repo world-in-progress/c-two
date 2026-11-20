@@ -1624,6 +1624,97 @@ async fn abandoned_data_header_refunds_its_payload_before_blocked_cleanup() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn abandoned_mid_poll_refunds_window_before_blocked_cleanup() {
+    use axum::body::{Body, HttpBody};
+    use axum::http::Request;
+    use tower::ServiceExt;
+    let fixture = Fixture::start(16 * 1024).await;
+    let gate = Arc::new(FinishGate {
+        entered: std::sync::Barrier::new(2),
+        release: std::sync::Barrier::new(2),
+    });
+    // Hold `progress_gate` on a helper thread so the async test never holds a
+    // `parking_lot::MutexGuard` across `.await`.
+    let progress_locked = Arc::new(std::sync::Barrier::new(2));
+    let (release_progress_tx, release_progress_rx) = std::sync::mpsc::channel::<()>();
+    let observed_for_progress = fixture.observed.clone();
+    let progress_locked_thread = progress_locked.clone();
+    let progress_holder = std::thread::spawn(move || {
+        let _guard = observed_for_progress.progress_gate.lock();
+        progress_locked_thread.wait();
+        let _ = release_progress_rx.recv();
+    });
+    progress_locked.wait();
+    let request = Request::builder()
+        .method("POST")
+        .uri("/portable/echo")
+        .header("accept", stream_wire::MEDIA_TYPE)
+        .header("x-c2-expected-crm-ns", &fixture.entry.crm_ns)
+        .header("x-c2-expected-crm-name", &fixture.entry.crm_name)
+        .header("x-c2-expected-crm-ver", &fixture.entry.crm_ver)
+        .header("x-c2-expected-abi-hash", &fixture.entry.abi_hash)
+        .header(
+            "x-c2-expected-signature-hash",
+            &fixture.entry.signature_hash,
+        )
+        .header("content-length", "8")
+        .body(Body::from(
+            [2_u32.to_le_bytes(), 8192_u32.to_le_bytes()].concat(),
+        ))
+        .unwrap();
+    let response = bounded(build_router(fixture.state.clone()).oneshot(request))
+        .await
+        .unwrap();
+    let mut body = response.into_body();
+    assert_eq!(
+        fixture
+            .state
+            .forwarding
+            .budget()
+            .clone()
+            .snapshot()
+            .memory
+            .used_bytes,
+        download_window(fixture.budget_bytes, 8)
+    );
+    let mut waiting = Box::pin(std::future::poll_fn(|cx| {
+        Pin::new(&mut body).poll_frame(cx)
+    }));
+    assert!(futures::poll!(&mut waiting).is_pending());
+    // Wait until the server has entered `open_stream` so consumer cancellation
+    // must run `Stream::finish` rather than terminating as `NotExecuted`, then
+    // arm `finish_gate` while `progress_gate` still holds `step()`.
+    bounded(async {
+        while fixture.observed.opened.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    *fixture.observed.finish_gate.lock() = Some(gate.clone());
+    let release = ReleaseFinish(gate.clone());
+    drop(waiting);
+    drop(body);
+    drop(release_progress_tx);
+    progress_holder.join().unwrap();
+    gate.entered.wait();
+    assert_eq!(fixture.observed.finished.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        fixture
+            .state
+            .forwarding
+            .budget()
+            .clone()
+            .snapshot()
+            .memory
+            .used_bytes,
+        0,
+        "an abandoned mid-poll body must refund its download window before blocked cleanup"
+    );
+    drop(release);
+    fixture.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn token_cancel_after_lifecycle_cancel_finishes_without_another_copy_window() {
     use axum::body::{Body, HttpBody};
     use axum::http::Request;
