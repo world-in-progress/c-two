@@ -1,6 +1,6 @@
 # 错误类型与残留接口收敛执行计划
 
-日期：2026-11-19（维护者批准定稿）。依据：[交互面精简审查](2026-10-31-api-surface-review.md)第四节、[待办](backlog.md)原第 3 项与待维护者决定（`G8`、`R21`）、[瘦身账本](2026-10-13-local-slimming-batches.md)（`R21`、`R32`、`R33`）。状态：本机实现与测试通过，待独立审查与全平台门禁验证。
+日期：2026-11-19（维护者批准定稿）。依据：[交互面精简审查](2026-10-31-api-surface-review.md)第四节、[待办](backlog.md)原第 3 项与待维护者决定（`G8`、`R21`）、[瘦身账本](2026-10-13-local-slimming-batches.md)（`R21`、`R32`、`R33`）。状态：已随 [PR #230](https://github.com/world-in-progress/c-two/pull/230) 合入主线并通过四平台门禁验收（见[验收记录](../acceptance/2026-11-20-error-and-api-convergence-acceptance.md)）。
 
 本计划在 `C-Two 0.11.0` 与 `c3 0.7.0` 发版前完成最后一批破坏性接口收敛：保留 `C2E1` v1 线格式与 `c2-error::ErrorCode` 数值身份，在 Core 建立 `(side, stage)` 与派发阶段（`transport_phase`）的唯一派生权威；校正 `c2-server` 误用码 `1 / 2 / 3` 的传输与容量拒绝；把 Python `c_two.error` 的 8 个 `一侧 × 阶段` 笛卡尔积类与无生产者的 `705 / 712` 子类收敛为可据以行动的 19 个公开异常类与标准 `ErrorCode`；连根删除 Python↔PyO3 进程内 `C2E1` 字节往返（`CoreError.error_bytes`、`CCError.serialize/deserialize`、`server/reply.py`）；同时整块退役残留的 `c_two.config`（`G8`）与输出旧模型的 `generate_crm_template`（`R21`）。所有分阶段仅为实施顺序，不保留任何旧名字、兼容别名或双轨分支。
 
