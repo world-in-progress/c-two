@@ -177,6 +177,451 @@ cc.error.CoreError.__init__ = observe_error
         });
     }
 
+    fn run_in_child_with_timeout(test_name: &str, env_key: &str) -> bool {
+        if std::env::var_os(env_key).is_some() {
+            return false;
+        }
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test_name, "--nocapture"])
+            .env(env_key, "1")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                let output = child.wait_with_output().unwrap();
+                assert!(
+                    status.success(),
+                    "{}{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                return true;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let output = child.wait_with_output().unwrap();
+                panic!(
+                    "isolated child test {test_name} timed out (possible deadlock)\n{}{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn shutdown_drops_server_bridge_after_releasing_bridge_lock() {
+        if run_in_child_with_timeout(
+            "runtime_session_ffi::connect_attempt_tests::shutdown_drops_server_bridge_after_releasing_bridge_lock",
+            "C2_TEST_SHUTDOWN_BRIDGE_DROP_CHILD",
+        ) {
+            return;
+        }
+        Python::initialize();
+        Python::attach(|py| {
+            let session =
+                Py::new(py, PyRuntimeSession::new(None, None, false).unwrap()).unwrap();
+            let globals = PyDict::new(py);
+            globals.set_item("session", session.clone_ref(py)).unwrap();
+            py.run(
+                pyo3::ffi::c_str!(
+                    r#"
+events = []
+class ReenteringBridge:
+    def __init__(self, session):
+        self._session = session
+    def __del__(self):
+        events.append("del_entered")
+        bridge = self._session.ensure_server_bridge()
+        assert bridge is not None
+        events.append("del_reentered")
+bridge = ReenteringBridge(session)
+"#
+                ),
+                Some(&globals),
+                None,
+            )
+            .unwrap();
+            let bridge = globals.get_item("bridge").unwrap().unwrap().unbind();
+            globals.del_item("bridge").unwrap();
+            {
+                let borrowed = session.borrow(py);
+                borrowed.server_bridge.lock().bridge = Some(bridge);
+            }
+            let outcome = session.borrow(py).shutdown(py, 5.0).unwrap();
+            let completed: bool = outcome
+                .get_item("completed")
+                .unwrap()
+                .unwrap()
+                .extract()
+                .unwrap();
+            let events: Vec<String> = globals
+                .get_item("events")
+                .unwrap()
+                .unwrap()
+                .extract()
+                .unwrap();
+            session.borrow(py).clear_retired_session(py);
+            assert!(completed);
+            assert_eq!(events, vec!["del_entered", "del_reentered"]);
+        });
+    }
+
+    #[test]
+    fn publish_server_bridge_preserves_winner_and_drops_loser_outside_lock() {
+        if run_in_child_with_timeout(
+            "runtime_session_ffi::connect_attempt_tests::publish_server_bridge_preserves_winner_and_drops_loser_outside_lock",
+            "C2_TEST_BRIDGE_RACE_CHILD",
+        ) {
+            return;
+        }
+        Python::initialize();
+        Python::attach(|py| {
+            let session =
+                Py::new(py, PyRuntimeSession::new(None, None, false).unwrap()).unwrap();
+            let globals = PyDict::new(py);
+            globals.set_item("session", session.clone_ref(py)).unwrap();
+            py.run(
+                pyo3::ffi::c_str!(
+                    r#"
+events = []
+winner = object()
+class LoserBridge:
+    def __init__(self, session):
+        self._session = session
+    def __del__(self):
+        events.append("loser_del_entered")
+        seen = self._session.ensure_server_bridge()
+        assert seen is winner
+        events.append("loser_del_reentered")
+loser = LoserBridge(session)
+"#
+                ),
+                Some(&globals),
+                None,
+            )
+            .unwrap();
+            let winner = globals.get_item("winner").unwrap().unwrap().unbind();
+            let loser = globals.get_item("loser").unwrap().unwrap().unbind();
+            globals.del_item("loser").unwrap();
+            let chosen = {
+                let borrowed = session.borrow(py);
+                borrowed.server_bridge.lock().bridge = Some(winner.clone_ref(py));
+                publish_server_bridge(py, &borrowed.server_bridge, loser).unwrap()
+            };
+            let same_winner = chosen.bind(py).is(winner.bind(py));
+            let stored_is_winner = session
+                .borrow(py)
+                .server_bridge
+                .lock()
+                .bridge
+                .as_ref()
+                .unwrap()
+                .bind(py)
+                .is(winner.bind(py));
+            let events: Vec<String> = globals
+                .get_item("events")
+                .unwrap()
+                .unwrap()
+                .extract()
+                .unwrap();
+            session.borrow(py).clear_retired_session(py);
+            assert!(same_winner);
+            assert!(stored_is_winner);
+            assert_eq!(events, vec!["loser_del_entered", "loser_del_reentered"]);
+        });
+    }
+
+    #[test]
+    fn ensure_server_bridge_rejects_publication_after_retirement() {
+        if run_in_child_with_timeout(
+            "runtime_session_ffi::connect_attempt_tests::ensure_server_bridge_rejects_publication_after_retirement",
+            "C2_TEST_BRIDGE_RETIRED_CHILD",
+        ) {
+            return;
+        }
+        Python::initialize();
+        Python::attach(|py| {
+            let session =
+                Py::new(py, PyRuntimeSession::new(None, None, false).unwrap()).unwrap();
+            let globals = PyDict::new(py);
+            globals.set_item("session", session.clone_ref(py)).unwrap();
+            py.run(
+                pyo3::ffi::c_str!(
+                    r#"
+import threading
+import c_two.transport.server.native as native_mod
+
+entered = threading.Event()
+release = threading.Event()
+original_init = native_mod.NativeServerBridge.__init__
+def gated_init(self, *args, **kwargs):
+    entered.set()
+    assert release.wait(5.0)
+    original_init(self, *args, **kwargs)
+native_mod.NativeServerBridge.__init__ = gated_init
+"#
+                ),
+                Some(&globals),
+                None,
+            )
+            .unwrap();
+
+            let worker_session = session.clone_ref(py);
+            let (result_tx, result_rx) = std::sync::mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                Python::attach(|py| {
+                    let outcome = worker_session
+                        .bind(py)
+                        .call_method0("ensure_server_bridge")
+                        .err()
+                        .map(|err| {
+                            err.value(py)
+                                .getattr("lifecycle_kind")
+                                .and_then(|value| value.extract::<String>())
+                                .unwrap_or_default()
+                        });
+                    result_tx.send(outcome).unwrap();
+                });
+            });
+
+            let entered = globals.get_item("entered").unwrap().unwrap();
+            let release = globals.get_item("release").unwrap().unwrap();
+            assert!(entered.call_method1("wait", (5.0,)).unwrap().extract::<bool>().unwrap());
+
+            let wait = PyRuntimeSession::begin_shutdown(session.clone_ref(py), py, 5.0).unwrap();
+            let outcome = wait.observe(py).unwrap();
+            assert!(outcome
+                .get_item("completed")
+                .unwrap()
+                .unwrap()
+                .extract::<bool>()
+                .unwrap());
+
+            release.call_method0("set").unwrap();
+            let kind = py.detach(move || result_rx.recv_timeout(Duration::from_secs(5)).unwrap());
+            py.detach(|| worker.join()).unwrap();
+            py.run(
+                pyo3::ffi::c_str!("native_mod.NativeServerBridge.__init__ = original_init"),
+                Some(&globals),
+                None,
+            )
+            .unwrap();
+
+            assert_eq!(kind.as_deref(), Some("runtime_retired"));
+            assert!(session.borrow(py).server_bridge.lock().bridge.is_none());
+            assert!(session.borrow(py).server_bridge.lock().retired);
+            let second_err = session
+                .bind(py)
+                .call_method0("ensure_server_bridge")
+                .unwrap_err();
+            let second_kind: String = second_err
+                .value(py)
+                .getattr("lifecycle_kind")
+                .unwrap()
+                .extract()
+                .unwrap();
+            assert_eq!(second_kind, "runtime_retired");
+        });
+    }
+
+    #[test]
+    fn stale_shutdown_generation_preserves_newer_host_state() {
+        Python::initialize();
+        Python::attach(|py| {
+            let session =
+                Py::new(py, PyRuntimeSession::new(None, None, false).unwrap()).unwrap();
+            let bridge = py.eval(pyo3::ffi::c_str!("object()"), None, None).unwrap().unbind();
+            {
+                let borrowed = session.borrow(py);
+                borrowed.host.lock().generation = 2;
+                borrowed.server_bridge.lock().bridge = Some(bridge.clone_ref(py));
+            }
+            // A late observer from Host generation 1 must not clear Host generation 2's bridge.
+            session.borrow(py).clear_completed_host_generation(py, 1);
+            assert!(session
+                .borrow(py)
+                .server_bridge
+                .lock()
+                .bridge
+                .as_ref()
+                .is_some_and(|stored| stored.bind(py).is(bridge.bind(py))));
+            // Matching generation 2 clears it cleanly.
+            session.borrow(py).clear_completed_host_generation(py, 2);
+            assert!(session.borrow(py).server_bridge.lock().bridge.is_none());
+        });
+    }
+
+    #[test]
+    fn host_lock_methods_release_gil_before_acquiring_host_lock() {
+        if run_in_child_with_timeout(
+            "runtime_session_ffi::connect_attempt_tests::host_lock_methods_release_gil_before_acquiring_host_lock",
+            "C2_TEST_HOST_LOCK_GIL_ORDER_CHILD",
+        ) {
+            return;
+        }
+        Python::initialize();
+        Python::attach(|py| {
+            let session =
+                Py::new(py, PyRuntimeSession::new(None, None, false).unwrap()).unwrap();
+            let borrowed = session.borrow(py);
+            let host_owner = borrowed.host.lock();
+
+            let s1 = session.clone_ref(py);
+            let s2 = session.clone_ref(py);
+            let s3 = session.clone_ref(py);
+            let s4 = session.clone_ref(py);
+            let s5 = session.clone_ref(py);
+            let s6 = session.clone_ref(py);
+            let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+
+            let t1 = entered_tx.clone();
+            let w1 = std::thread::spawn(move || {
+                Python::attach(|py| {
+                    t1.send("host_started").unwrap();
+                    s1.borrow(py).host_started(py)
+                })
+            });
+            let t2 = entered_tx.clone();
+            let w2 = std::thread::spawn(move || {
+                Python::attach(|py| {
+                    t2.send("server_credential").unwrap();
+                    s2.borrow(py).server_credential(py).is_none()
+                })
+            });
+            let t3 = entered_tx.clone();
+            let w3 = std::thread::spawn(move || {
+                Python::attach(|py| {
+                    t3.send("native_lifecycle_snapshot").unwrap();
+                    s3.borrow(py)
+                        .native_lifecycle_snapshot(py)
+                        .unwrap()
+                        .is_none()
+                })
+            });
+            let t4 = entered_tx.clone();
+            let w4 = std::thread::spawn(move || {
+                Python::attach(|py| {
+                    t4.send("native_terminal_outcome").unwrap();
+                    s4.borrow(py)
+                        .native_terminal_outcome(py)
+                        .unwrap()
+                        .is_none()
+                })
+            });
+            let t5 = entered_tx.clone();
+            let w5 = std::thread::spawn(move || {
+                Python::attach(|py| {
+                    t5.send("set_relay_anchor_address").unwrap();
+                    s5.borrow(py).set_relay_anchor_address(py, None).unwrap();
+                    true
+                })
+            });
+            let t6 = entered_tx;
+            let w6 = std::thread::spawn(move || {
+                Python::attach(|py| {
+                    t6.send("clear_server_identity").unwrap();
+                    s6.borrow(py).clear_server_identity(py).unwrap();
+                    true
+                })
+            });
+
+            py.detach(move || {
+                for _ in 0..6 {
+                    entered_rx
+                        .recv_timeout(Duration::from_secs(5))
+                        .expect("worker did not attach to Python before locking host");
+                }
+                // Wait briefly so every attached worker has detached and parked on `self.host.lock()`.
+                std::thread::sleep(Duration::from_millis(25));
+                // Reacquiring the GIL while still holding `host_owner` succeeds only
+                // if none of the 6 waiters kept the GIL while blocking on `self.host.lock()`.
+                let check: i32 = Python::attach(|py| {
+                    py.eval(pyo3::ffi::c_str!("1 + 1"), None, None)
+                        .unwrap()
+                        .extract()
+                        .unwrap()
+                });
+                assert_eq!(check, 2);
+            });
+            drop(host_owner);
+            py.detach(|| {
+                assert!(!w1.join().unwrap());
+                assert!(w2.join().unwrap());
+                assert!(w3.join().unwrap());
+                assert!(w4.join().unwrap());
+                assert!(w5.join().unwrap());
+                assert!(w6.join().unwrap());
+            });
+        });
+    }
+
+    #[test]
+    fn ensure_host_projects_lifecycle_error_after_releasing_host_lock() {
+        if run_in_child_with_timeout(
+            "runtime_session_ffi::connect_attempt_tests::ensure_host_projects_lifecycle_error_after_releasing_host_lock",
+            "C2_TEST_ENSURE_HOST_LOCK_REENTRY_CHILD",
+        ) {
+            return;
+        }
+        Python::initialize();
+        Python::attach(|py| {
+            let session =
+                Py::new(py, PyRuntimeSession::new(None, None, false).unwrap()).unwrap();
+            let wait = PyRuntimeSession::begin_shutdown(session.clone_ref(py), py, 5.0).unwrap();
+            let outcome = wait.observe(py).unwrap();
+            assert!(outcome
+                .get_item("completed")
+                .unwrap()
+                .unwrap()
+                .extract::<bool>()
+                .unwrap());
+
+            let globals = PyDict::new(py);
+            globals.set_item("session", session.clone_ref(py)).unwrap();
+            py.run(
+                pyo3::ffi::c_str!(
+                    r#"
+import c_two as cc
+observed = []
+original = cc.error.CoreError.__init__
+def observe_error(self, category, message):
+    observed.append(session.host_started)
+    original(self, category, message)
+cc.error.CoreError.__init__ = observe_error
+"#
+                ),
+                Some(&globals),
+                None,
+            )
+            .unwrap();
+            let err = session.borrow(py).ensure_host_started(py).unwrap_err();
+            let kind: String = err
+                .value(py)
+                .getattr("lifecycle_kind")
+                .unwrap()
+                .extract()
+                .unwrap();
+            py.run(
+                pyo3::ffi::c_str!("cc.error.CoreError.__init__ = original"),
+                Some(&globals),
+                None,
+            )
+            .unwrap();
+            let observed: Vec<bool> = globals
+                .get_item("observed")
+                .unwrap()
+                .unwrap()
+                .extract()
+                .unwrap();
+            assert_eq!(kind, "runtime_retired");
+            assert_eq!(observed, vec![false]);
+        });
+    }
 }
 
 #[pyclass(name = "RuntimeSession", frozen)]
@@ -184,13 +629,54 @@ pub struct PyRuntimeSession {
     inner: Arc<Runtime>,
     host: Mutex<HostRecord>,
     registrations: Mutex<HashMap<String, Registration>>,
-    server_bridge: Mutex<Option<Py<PyAny>>>,
+    server_bridge: Mutex<ServerBridgeSlot>,
 }
 
 #[derive(Default)]
 struct HostRecord {
     host: Option<Host>,
     failed_start_receipt: Option<FailedStartShutdownReceipt>,
+    generation: u64,
+}
+
+#[derive(Default)]
+struct ServerBridgeSlot {
+    bridge: Option<Py<PyAny>>,
+    retired: bool,
+}
+
+enum EnsureHostError {
+    Lifecycle(c2_core::LifecycleError),
+    Core(c2_core::Error),
+    Runtime(&'static str),
+}
+
+fn ensure_host_error_to_py(error: EnsureHostError) -> PyErr {
+    match error {
+        EnsureHostError::Lifecycle(error) => lifecycle_error_to_py(error),
+        EnsureHostError::Core(error) => core_error_to_py(error),
+        EnsureHostError::Runtime(message) => PyRuntimeError::new_err(message),
+    }
+}
+
+fn publish_server_bridge(
+    py: Python<'_>,
+    slot: &Mutex<ServerBridgeSlot>,
+    candidate: Py<PyAny>,
+) -> PyResult<Py<PyAny>> {
+    let (outcome, discarded) = {
+        let mut guard = slot.lock();
+        if guard.retired {
+            (Err(c2_core::LifecycleError::RuntimeRetired), Some(candidate))
+        } else if let Some(existing) = guard.bridge.as_ref() {
+            (Ok(existing.clone_ref(py)), Some(candidate))
+        } else {
+            guard.bridge = Some(candidate.clone_ref(py));
+            (Ok(candidate), None)
+        }
+    };
+    drop(discarded);
+    outcome.map_err(lifecycle_error_to_py)
 }
 
 /// One caller's bounded observation of an already-started Core transaction.
@@ -229,6 +715,51 @@ fn shutdown_error_to_py(py: Python<'_>, error: c2_core::LifecycleError, seconds:
 }
 
 impl PyRuntimeSession {
+    fn clear_retired_session(&self, py: Python<'_>) {
+        // Core has permanently retired this session. Seal bridge publication
+        // and move native registrations and the Python bridge out of their
+        // locks before dropping either value so no destructor runs under a lock.
+        let retired_bridge = py.detach(|| {
+            let retired_registrations: Vec<Registration> = self
+                .registrations
+                .lock()
+                .drain()
+                .map(|(_, registration)| registration)
+                .collect();
+            let bridge = {
+                let mut slot = self.server_bridge.lock();
+                slot.retired = true;
+                slot.bridge.take()
+            };
+            drop(retired_registrations);
+            bridge
+        });
+        drop(retired_bridge);
+    }
+
+    fn clear_completed_host_generation(&self, py: Python<'_>, observed_generation: u64) {
+        // Low-level shutdown is restartable: clear registrations and bridge
+        // only when no newer Host generation has been published since this
+        // observation started, and drop values strictly outside all locks.
+        let retired_bridge = py.detach(|| {
+            let record = self.host.lock();
+            if record.generation != observed_generation {
+                return None;
+            }
+            let retired_registrations: Vec<Registration> = self
+                .registrations
+                .lock()
+                .drain()
+                .map(|(_, registration)| registration)
+                .collect();
+            let bridge = self.server_bridge.lock().bridge.take();
+            drop(record);
+            drop(retired_registrations);
+            bridge
+        });
+        drop(retired_bridge);
+    }
+
     fn project_shutdown_observation<'py>(
         &self,
         py: Python<'py>,
@@ -236,13 +767,7 @@ impl PyRuntimeSession {
         completed: bool,
     ) -> PyResult<Bound<'py, PyDict>> {
         if completed {
-            // Core has sealed publication before this path can run. Drop native
-            // registrations without the GIL, then release the Python bridge.
-            let bridge = py.detach(|| {
-                self.registrations.lock().clear();
-                self.server_bridge.lock().take()
-            });
-            drop(bridge);
+            self.clear_retired_session(py);
         }
         let dict = shutdown_outcome_to_dict(py, outcome)?;
         dict.set_item("completed", completed)?;
@@ -252,23 +777,24 @@ impl PyRuntimeSession {
     /// Start this session's one Core host.
     ///
     /// Reuse the live Host, or publish a fresh Host after native startup succeeds.
-    fn ensure_host(&self) -> PyResult<Host> {
+    /// Callers must invoke this detached from the Python GIL and project any
+    /// error only after the lock-bearing call returns.
+    fn ensure_host(&self) -> Result<Host, EnsureHostError> {
         let mut host_guard = self.host.lock();
-        if let Err(error) = self.inner.ensure_active() {
-            drop(host_guard);
-            return Err(lifecycle_error_to_py(error));
-        }
+        self.inner
+            .ensure_active()
+            .map_err(EnsureHostError::Lifecycle)?;
         if let Some(host) = host_guard.host.as_ref() {
             if host.shutdown_outcome().is_none() {
                 if !host.is_running() || self.inner.has_pending_teardown() {
-                    return Err(PyRuntimeError::new_err(
+                    return Err(EnsureHostError::Runtime(
                         "Core host is still draining; consume terminal shutdown before restarting",
                     ));
                 }
                 return Ok(host.clone());
             }
             if !self.registrations.lock().is_empty() {
-                return Err(PyRuntimeError::new_err(
+                return Err(EnsureHostError::Runtime(
                     "consume terminal shutdown route outcomes before restarting the Core host",
                 ));
             }
@@ -284,12 +810,12 @@ impl PyRuntimeSession {
         if let Ok(host) = &started {
             host_guard.host = Some(host.clone());
             host_guard.failed_start_receipt = None;
+            host_guard.generation = host_guard.generation.wrapping_add(1);
         } else if let Some(receipt) = failed_receipt {
             host_guard.failed_start_receipt = Some(receipt);
         }
-        // Error projection attaches to Python; release the Host lock before the GIL.
         drop(host_guard);
-        started.map_err(core_error_to_py)
+        started.map_err(EnsureHostError::Core)
     }
 
     fn connect_core(
@@ -361,7 +887,7 @@ impl PyRuntimeSession {
             inner: Arc::new(inner),
             host: Mutex::new(HostRecord::default()),
             registrations: Mutex::new(HashMap::new()),
-            server_bridge: Mutex::new(None),
+            server_bridge: Mutex::new(ServerBridgeSlot::default()),
         })
     }
 
@@ -518,13 +1044,15 @@ impl PyRuntimeSession {
 
     /// Snapshot the existing host's bound listener without creating a host.
     #[getter]
-    fn server_credential(&self) -> Option<PyEndpointCredential> {
-        self.host
-            .lock()
-            .host
-            .as_ref()
-            .and_then(Host::endpoint_credential)
-            .map(PyEndpointCredential::new)
+    fn server_credential(&self, py: Python<'_>) -> Option<PyEndpointCredential> {
+        py.detach(|| {
+            self.host
+                .lock()
+                .host
+                .as_ref()
+                .and_then(Host::endpoint_credential)
+        })
+        .map(PyEndpointCredential::new)
     }
 
     #[getter]
@@ -605,15 +1133,14 @@ impl PyRuntimeSession {
                     .map(|value| value.trim_end_matches('/'));
                 let current = self.inner.relay_anchor_address_override();
                 if requested != current.as_deref() {
-                    return Err(PyRuntimeError::new_err(
-                        "relay anchor is frozen after the Core host starts",
-                    ));
+                    return Err("relay anchor is frozen after the Core host starts");
                 }
                 return Ok(());
             }
             self.inner.set_relay_anchor_address(relay_anchor_address);
             Ok(())
         })
+        .map_err(PyRuntimeError::new_err)
     }
 
     #[getter]
@@ -628,8 +1155,17 @@ impl PyRuntimeSession {
 
     fn ensure_server_bridge<'py>(slf: PyRef<'py, Self>) -> PyResult<Py<PyAny>> {
         let py = slf.py();
-        if let Some(server) = slf.server_bridge.lock().as_ref() {
-            return Ok(server.clone_ref(py));
+        {
+            let guard = slf.server_bridge.lock();
+            if guard.retired {
+                drop(guard);
+                return Err(lifecycle_error_to_py(
+                    c2_core::LifecycleError::RuntimeRetired,
+                ));
+            }
+            if let Some(server) = guard.bridge.as_ref() {
+                return Ok(server.clone_ref(py));
+            }
         }
         slf.inner
             .ensure_server()
@@ -640,12 +1176,12 @@ impl PyRuntimeSession {
         kwargs.set_item("local_copy_tracker", slf.local_copy_tracker())?;
         kwargs.set_item("runtime_session", &slf)?;
         let server = class.call((), Some(&kwargs))?.unbind();
-        *slf.server_bridge.lock() = Some(server.clone_ref(py));
-        Ok(server)
+        publish_server_bridge(py, &slf.server_bridge, server)
     }
 
     fn ensure_host_started(&self, py: Python<'_>) -> PyResult<()> {
         py.detach(|| self.ensure_host().map(|_| ()))
+            .map_err(ensure_host_error_to_py)
     }
 
     /// True while the Core host is actually running.
@@ -655,12 +1191,14 @@ impl PyRuntimeSession {
     /// shutdown or a failed start attempt) does not read as
     /// started.
     #[getter]
-    fn host_started(&self) -> bool {
-        self.host
-            .lock()
-            .host
-            .as_ref()
-            .is_some_and(c2_core::Host::is_running)
+    fn host_started(&self, py: Python<'_>) -> bool {
+        py.detach(|| {
+            self.host
+                .lock()
+                .host
+                .as_ref()
+                .is_some_and(c2_core::Host::is_running)
+        })
     }
 
     /// Thin read-only lifecycle observation for the bridge.
@@ -672,8 +1210,12 @@ impl PyRuntimeSession {
         &self,
         py: Python<'py>,
     ) -> PyResult<Option<Bound<'py, PyDict>>> {
-        let host = self.host.lock().host.clone();
-        host.map(|host| lifecycle_snapshot_to_dict(py, &host.lifecycle_snapshot()))
+        let snapshot = py.detach(|| {
+            let host = self.host.lock().host.clone();
+            host.map(|host| host.lifecycle_snapshot())
+        });
+        snapshot
+            .map(|snapshot| lifecycle_snapshot_to_dict(py, &snapshot))
             .transpose()
     }
 
@@ -683,24 +1225,17 @@ impl PyRuntimeSession {
         &self,
         py: Python<'py>,
     ) -> PyResult<Option<Bound<'py, PyDict>>> {
-        let (host, receipt) = {
-            let record = self.host.lock();
-            (record.host.clone(), record.failed_start_receipt.clone())
-        };
-        if let Some(receipt) = receipt {
-            return match receipt.terminal_outcome() {
-                Some(outcome) => {
-                    let dict = shutdown_outcome_to_dict(py, outcome)?;
-                    dict.set_item("completed", true)?;
-                    Ok(Some(dict))
-                }
-                None => Ok(None),
+        let outcome = py.detach(|| {
+            let (host, receipt) = {
+                let record = self.host.lock();
+                (record.host.clone(), record.failed_start_receipt.clone())
             };
-        }
-        let Some(host) = host else {
-            return Ok(None);
-        };
-        match host.shutdown_outcome() {
+            if let Some(receipt) = receipt {
+                return receipt.terminal_outcome();
+            }
+            host.and_then(|host| host.shutdown_outcome())
+        });
+        match outcome {
             Some(outcome) => {
                 let dict = shutdown_outcome_to_dict(py, outcome)?;
                 dict.set_item("completed", true)?;
@@ -729,7 +1264,7 @@ impl PyRuntimeSession {
         signature_hash: &str,
         descriptor_json: &[u8],
     ) -> PyResult<Py<PyAny>> {
-        if self.registrations.lock().contains_key(name) {
+        if py.detach(|| self.registrations.lock().contains_key(name)) {
             return Err(PyValueError::new_err(format!(
                 "Name already registered: {name:?}",
             )));
@@ -745,15 +1280,21 @@ impl PyRuntimeSession {
                 max_workers,
             )
             .map_err(core_error_to_py)?;
-        let host = self.ensure_host()?;
+        let host = py
+            .detach(|| self.ensure_host())
+            .map_err(ensure_host_error_to_py)?;
         let registration = py
             .detach(|| host.register(definition))
             .map_err(core_error_to_py)?;
         let outcome = registration.outcome().clone();
         let concurrency = registration.route_concurrency();
-        self.registrations
-            .lock()
-            .insert(name.to_string(), registration);
+        py.detach(|| {
+            let replaced = self
+                .registrations
+                .lock()
+                .insert(name.to_string(), registration);
+            drop(replaced);
+        });
 
         let outcome = register_outcome_to_dict(py, outcome)?.unbind();
         let concurrency = Py::new(py, PyRouteConcurrency::new(concurrency))?;
@@ -764,13 +1305,15 @@ impl PyRuntimeSession {
     }
 
     fn unregister_route<'py>(&self, py: Python<'py>, name: &str) -> PyResult<Bound<'py, PyDict>> {
-        let mut registration = self
-            .registrations
-            .lock()
-            .remove(name)
+        let mut registration = py
+            .detach(|| self.registrations.lock().remove(name))
             .ok_or_else(|| PyValueError::new_err(format!("Name not registered: {name:?}")))?;
         let outcome = py
-            .detach(|| registration.close())
+            .detach(|| {
+                let outcome = registration.close();
+                drop(registration);
+                outcome
+            })
             .map_err(core_error_to_py)?;
         unregister_outcome_to_dict(py, outcome)
     }
@@ -838,22 +1381,31 @@ impl PyRuntimeSession {
             let (outcome, completed) = py.detach(|| receipt.observe_until(deadline));
             return self.project_shutdown_observation(py, outcome, completed);
         }
-        let (receipt_result, host) = py.detach(|| {
+        let (receipt_result, host, observed_generation) = py.detach(|| {
             let record = self.host.lock();
             if let Some(receipt) = record.failed_start_receipt.as_ref() {
                 // Keep this Host ownership lock through observation and local
-                // cleanup, but release it before reacquiring the Python GIL.
-                // A later ensure_host cannot publish a Host that we then clear.
+                // cleanup, but release it before dropping registrations or
+                // reacquiring the Python GIL. A later ensure_host cannot publish a
+                // Host that we then clear.
                 let (outcome, completed) = receipt.observe_with_timeout(timeout);
-                let retired_bridge = if completed {
-                    self.registrations.lock().clear();
-                    self.server_bridge.lock().take()
+                let (retired_registrations, retired_bridge) = if completed {
+                    let registrations: Vec<Registration> = self
+                        .registrations
+                        .lock()
+                        .drain()
+                        .map(|(_, registration)| registration)
+                        .collect();
+                    let bridge = self.server_bridge.lock().bridge.take();
+                    (registrations, bridge)
                 } else {
-                    None
+                    (Vec::new(), None)
                 };
-                (Some((outcome, completed, retired_bridge)), None)
+                drop(record);
+                drop(retired_registrations);
+                (Some((outcome, completed, retired_bridge)), None, 0)
             } else {
-                (None, record.host.clone())
+                (None, record.host.clone(), record.generation)
             }
         });
         if let Some((outcome, completed, retired_bridge)) = receipt_result {
@@ -880,8 +1432,7 @@ impl PyRuntimeSession {
             }
         });
         if completed {
-            self.registrations.lock().clear();
-            self.server_bridge.lock().take();
+            self.clear_completed_host_generation(py, observed_generation);
         }
         // Keep the Host journal for repeated consumption and observation. A
         // pending drain retains every Registration instead of invoking Drop close.
@@ -890,23 +1441,29 @@ impl PyRuntimeSession {
         Ok(dict)
     }
 
-    fn clear_server_identity(&self) -> PyResult<()> {
-        if self
-            .host
-            .lock()
-            .host
-            .as_ref()
-            .is_some_and(|host| host.shutdown_outcome().is_none())
-        {
-            return Err(PyRuntimeError::new_err(
+    fn clear_server_identity(&self, py: Python<'_>) -> PyResult<()> {
+        let result = py.detach(|| {
+            let record = self.host.lock();
+            let active = record
+                .host
+                .as_ref()
+                .is_some_and(|host| host.shutdown_outcome().is_none());
+            if active {
+                return Err(None);
+            }
+            // Core now reports why identity reset is refused (pending native
+            // teardown), so this must never silently report success. Keep the
+            // Host lock across the Core clear so a concurrent start cannot race
+            // in between the active check and identity reset.
+            self.inner.clear_server_identity().map_err(Some)
+        });
+        match result {
+            Ok(()) => Ok(()),
+            Err(None) => Err(PyRuntimeError::new_err(
                 "cannot clear server identity while the Core host is active",
-            ));
+            )),
+            Err(Some(error)) => Err(runtime_configuration_error_to_py(error)),
         }
-        // Core now reports why identity reset is refused (pending native
-        // teardown), so this must never silently report success.
-        self.inner
-            .clear_server_identity()
-            .map_err(runtime_configuration_error_to_py)
     }
 
     #[allow(clippy::too_many_arguments)] // PyO3 signature is the existing Python call boundary.
