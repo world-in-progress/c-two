@@ -192,3 +192,25 @@ def test_ipc_client_requires_address():
 
     assert client.returncode == 2
     assert "address" in client.stderr
+
+
+def test_resident_simulation_example():
+    root = _repo_root()
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(root / "examples/python/resident_simulation.py"),
+        ],
+        cwd=root,
+        env=_example_env(),
+        capture_output=True,
+        text=True,
+        timeout=25,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "Primary resident simulation ready at ipc://" in result.stdout
+    assert "Unregistered sim-branch-a; active routes=['sim-primary']" in result.stdout
+    assert "Primary stream delivered 6 frames" in result.stdout
+    assert "Client holds=0, used_operations=0" in result.stdout

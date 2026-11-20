@@ -167,6 +167,21 @@ with cc.connect(Simulation, name='basin', address='ipc://resource-process') as s
 
 在注册资源的进程里，流直接传递 yield 出来的对象，不编码，按路由自己的并发限制推进；有限的调用截止时间在派发前被拒绝。经 IPC 时，Python 与 Rust 的资源和客户端可以互相开流；经 relay 时它们经 HTTP 开流，`cc.Stream`、`close` 与 hold 的行为相同。经 relay 时，消费方停止读取后，资源最多还能多推进 HTTP 与 TCP 缓冲装得下的那么多条，小条目可达数千条。推进、取消与 shutdown 见 [Runtime 生命周期](runtime-lifecycle.md#execution-admission)。
 
+## 常驻模拟范式
+
+CRM 方法默认按 `@cc.write` 处理。在 `ConcurrencyConfig(mode='read_parallel', max_workers=...)` 下，写调用互斥执行，多个只读调用可在 `max_workers` 额度内并发（遇到排队的写调用时仍按读写锁顺序串行）。对于需要在持续推进的同时响应状态查看、参数干预与实时订阅的常驻科学模拟，不要把长时间阻塞的步进循环塞进单个 `@cc.write` 调用里，建议采用以下模式：
+
+- 在资源对象内部用后台线程驱动时间步进循环，在步界边界同步内部状态与待生效干预。
+- 注册路由时采用 `ConcurrencyConfig(mode='read_parallel', max_workers=...)`，让多个只读观察方并发访问而互不阻塞。
+- 保持契约方法简短：用 `@cc.read` 返回最新快照，用 `@cc.write` 将干预写入队列交由步进循环消费，用 `@cc.stream` 配合 `@cc.read` 持续推送已发布的状态帧。注意 Core 会先等待正在执行的单次流 `next()` 推进返回，之后 Python 才调用 `@cc.on_shutdown`，因此每个 `next()` 推进必须能自行尽快返回，或在调用 `unregister()` / `shutdown()` 前由应用侧发信号让其退出；`@cc.on_shutdown` 负责在活跃推进排空后做最终资源收尾，而不能用来唤醒一个正阻塞注销的流步骤。
+- 需要从在线状态分叉做假设推演时，在应用层克隆资源状态，用 `register()` 动态挂出临时分支路由，推演结束后调用 `unregister()` 撤下；主路由上正在推进的流与并发调用不受影响。
+
+完整的可运行示例见 [resident_simulation.py](../../examples/python/resident_simulation.py)，演示了后台步进、实时流订阅、参数干预、运行期动态分叉注册与清理停机。
+
+### 面向 Web 前端时的部署分层
+
+`c3 relay` 是面向 C-Two 对端的内网路由设施，而不是直接暴露给浏览器的公网接口；浏览器运行在沙盒内，既无法使用本地 IPC，也无法自行拉起 relay。需要用 Web 界面查看、操控或订阅常驻资源时，应在应用层放置一个 Python 后端网关（BFF），由该网关按常规 `cc.connect(...)` 经直连 IPC 或内网 `c3 relay` 接入资源，再由网关向浏览器提供 HTTP 或 WebSocket 接口。
+
 ## 入口
 
 ### Python SDK

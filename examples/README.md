@@ -38,6 +38,14 @@ C2_RELAY_ANCHOR_ADDRESS= uv run python examples/python/local.py
 uv run python examples/python/independent_runtime.py
 ```
 
+### Resident Simulation (Background Stepping & Dynamic Branching)
+
+`resident_simulation.py` demonstrates a stateful scientific simulation that advances continuously in a background thread while serving short `@cc.read` snapshots, `@cc.write` interventions, `@cc.stream` frame subscriptions, and runtime `register` / `unregister` what-if branches over direct IPC under `ConcurrencyConfig(mode='read_parallel')`, stopping cleanly via `@cc.on_shutdown`. It uses only the Python standard library and base `c-two` (no optional examples dependencies required):
+
+```bash
+C2_RELAY_ANCHOR_ADDRESS= uv run python examples/python/resident_simulation.py
+```
+
 ### IPC Direct Mode
 
 Use this path for direct IPC between one resource process and one client on the same machine. The client always uses the explicit IPC address you pass it.
