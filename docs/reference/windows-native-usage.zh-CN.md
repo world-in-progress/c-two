@@ -6,7 +6,7 @@
 
 该后端使用字节模式 Named Pipe 传输 `ipc://` 控制流量，并使用具名文件映射存放共享载荷内存。它跨登录会话使用进程的 TokenUser SID。同一会话的对端可以使用 SHM；不同会话使用自有缓冲区、内联或分片传输。原生连接在发送数据前要求用户一致，且服务端完整性级别至少为 Medium。普通 SDK 代码继续使用逻辑 `ipc://` 地址；不要在 SDK 中构造管道或映射名称。HTTP relay 仍提供网络传输路径。
 
-本指南涵盖 Windows x64 和 ARM64 上的 Python C-Two **0.10.1**、c3 **0.6.0** 和 FastDB **0.2.4**。请配套安装对应版本的 Python 包与 c3；端点行为见 [0.10.0 迁移说明](../releases/0.10.0.md)和[生命周期指南](local-endpoint-lifecycle.md)。
+本指南涵盖 Windows x64 和 ARM64 上的 Python C-Two **0.11.0**、c3 **0.7.0** 和 FastDB **0.2.4**。请配套安装对应版本的 Python 包与 c3；端点行为见 [0.11.0 迁移说明](../releases/0.11.0.md)和[生命周期指南](local-endpoint-lifecycle.md)。
 
 Windows 拒绝 Unix 根目录覆盖值（`cc.endpoint.set_local_endpoint(root=...)`、`C2_IPC_ROOT`、`--ipc-root`）。管道名称由逻辑地址和当前 TokenUser SID 派生。
 
@@ -15,13 +15,14 @@ Windows 拒绝 Unix 根目录覆盖值（`cc.endpoint.set_local_endpoint(root=..
 在已激活的 Python 环境中明确指定文档所列版本：
 
 ```powershell
-uv pip install 'c-two==0.10.1'
+uv pip install 'c-two==0.11.0'
 ```
 
-对于已发布的 [c3 0.6.0 版本](https://github.com/world-in-progress/c-two/releases/tag/c3-v0.6.0)，下载 `c3-x86_64-pc-windows-msvc.exe`（x64）或 `c3-aarch64-pc-windows-msvc.exe`（ARM64）、对应的 `.exe.sha256` 校验文件，以及可选的 `c3-installer.ps1`。运行独立可执行文件前先验证它：
+对于已发布的 [c3 0.7.0 版本](https://github.com/world-in-progress/c-two/releases/tag/c3-v0.7.0)，下载 `c3-x86_64-pc-windows-msvc.exe`（x64）或 `c3-aarch64-pc-windows-msvc.exe`（ARM64）、对应的 `.exe.sha256` 校验文件，以及可选的 `c3-installer.ps1`。运行独立可执行文件前先验证它：
 
 ```powershell
-$releaseBase = 'https://github.com/world-in-progress/c-two/releases/download/c3-v0.6.0'
+$releaseBase = 'https://github.com/world-in-progress/c-two/releases/download/c3-v0.7.0'
+# Windows ARM64 请改为 'c3-aarch64-pc-windows-msvc.exe'。
 $asset = 'c3-x86_64-pc-windows-msvc.exe'
 Invoke-WebRequest -UseBasicParsing -Uri "$releaseBase/$asset" -OutFile ".\$asset"
 Invoke-WebRequest -UseBasicParsing -Uri "$releaseBase/$asset.sha256" -OutFile ".\$asset.sha256"
@@ -30,15 +31,15 @@ if ($checksum -notmatch '(?m)^\s*([0-9a-fA-F]{64})(\s|$)') { throw 'Invalid SHA-
 $expected = $Matches[1]
 $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath ".\$asset").Hash
 if ($actual -ne $expected) { throw 'SHA-256 mismatch' }
-.\c3-x86_64-pc-windows-msvc.exe --version
-.\c3-x86_64-pc-windows-msvc.exe relay --bind 127.0.0.1:8300
+& ".\$asset" --version
+& ".\$asset" relay --bind 127.0.0.1:8300
 ```
 
 也可以使用带校验步骤的安装脚本：
 
 ```powershell
 Invoke-WebRequest -UseBasicParsing -Uri 'https://github.com/world-in-progress/c-two/releases/latest/download/c3-installer.ps1' -OutFile .\c3-installer.ps1
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\c3-installer.ps1 -Version 0.6.0
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\c3-installer.ps1 -Version 0.7.0
 $env:PATH = "$env:LOCALAPPDATA\Programs\c3;$env:PATH"
 c3.exe --version
 ```
@@ -71,6 +72,6 @@ $env:FASTDB_PAYLOAD_LINK_MODE = 'system'
 
 ## 验证范围
 
-[0.10.0 发布说明](../releases/0.10.0.md)描述当时的 API 和协议变更，其[验收记录](../acceptance/2026-10-30-0100-release-acceptance.md)将已发布源码与托管的 Windows Server 2022/2025 x64 和 Windows 11 ARM64 检查关联。[0.10.1 验收记录](../acceptance/2026-10-30-0101-release-acceptance.md)将该补丁的源码与托管的 Windows Server 2025 x64 和 Windows 11 ARM64 检查关联。[0.9.0 验收记录](../acceptance/2026-10-25-090-windows-release-acceptance.md)涵盖开发机、第二账户、跨会话和托管 ARM64 主机上的用户范围后端。[0.7.4 发布记录](../acceptance/0.7.4-publication.md)保存该版本的源码配对及完整的 Windows Server 2022/2025 x64 检查，包括严格的 18 行 Rust/Python 与 12 行 TypeScript 记录，以及普通用户、非管理员 wheel 使用者的验证。[FD 后续记录](../acceptance/0.7.4-fd-leak-regression.md)涵盖两台 Windows 运行器上实际的 Named Pipe 关闭与空闲连接替换回归。发布清单标识实际包源码；文档提交与产物源码提交分别记录。
+[0.11.0 发布说明](../releases/0.11.0.md)描述当前的 API 和协议变更（IPC 16、SHM 4、C/FFI ABI 8、relay mesh 7、角色预算域及 mio 1.2.4 具名管道修复）。[0.10.0 验收记录](../acceptance/2026-10-30-0100-release-acceptance.md)与 [0.10.1 验收记录](../acceptance/2026-10-30-0101-release-acceptance.md)将上一代版本源码与托管的 Windows Server 2022/2025 x64 和 Windows 11 ARM64 检查关联。[0.9.0 验收记录](../acceptance/2026-10-25-090-windows-release-acceptance.md)涵盖开发机、第二账户、跨会话和托管 ARM64 主机上的用户范围后端。[0.7.4 发布记录](../acceptance/0.7.4-publication.md)保存该版本的源码配对及完整的 Windows Server 2022/2025 x64 检查，包括严格的 18 行 Rust/Python 与 12 行 TypeScript 记录，以及普通用户、非管理员 wheel 使用者的验证。[FD 后续记录](../acceptance/0.7.4-fd-leak-regression.md)涵盖两台 Windows 运行器上实际的 Named Pipe 关闭与空闲连接替换回归。发布清单标识实际包源码；文档提交与产物源码提交分别记录。
 
 0.8.0 开发记录还包含 Windows 11 x64 开发机测试；托管 Source Validation 要求 Windows Server 2025 x64 与 Windows 11 ARM64。上述结论不涵盖 Windows 服务以及真实的 Windows/Linux relay 链路。发布证据记录准确的源码和通过的原生检查。平台覆盖范围见[实现报告](windows-native-implementation.md)。

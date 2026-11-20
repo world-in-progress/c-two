@@ -22,13 +22,10 @@ ATTR_LEVEL = 'level'
 ATTR_GLOBAL_ID = 'global_id'
 ATTR_ELEVATION = 'elevation'
 
-# @cc.crm
 class NestedGrid:
     """
-    CRM
-    =
-    The Grid Resource.  
-    Grid is a 2D grid system that can be subdivided into smaller grids by pre-declared subdivide rules.  
+    Resource implementing the GridPython contract.
+    Grid is a 2D grid system that can be subdivided into smaller grids by pre-declared subdivide rules.
     """
     def __init__(self, epsg: int, bounds: list, first_size: list[float], subdivide_rules: list[list[int]]):
         """Method to initialize Grid

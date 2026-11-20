@@ -30,7 +30,9 @@ uv sync --reinstall-package c-two
 ## Running Tests
 
 ```bash
-# Full Python test suite (set C2_RELAY_ANCHOR_ADDRESS= to avoid env interference)
+# Full Python test suite (set C2_RELAY_ANCHOR_ADDRESS= to avoid env interference).
+# Relay control tests require the prebuilt registration attestor helper.
+python tools/dev/build_route_scope_attestor.py
 C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests/ -q --timeout=30
 
 # Single file / single test
@@ -42,6 +44,7 @@ cargo test --manifest-path core/Cargo.toml --workspace
 
 # Python SDK native extension and tests
 uv sync --reinstall-package c-two
+python tools/dev/build_route_scope_attestor.py
 C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests -q --timeout=30
 ```
 
@@ -105,10 +108,13 @@ core/
 cli/
 └── src/          # Native c3 CLI
 sdk/python/src/c_two/
-├── crm/          # CRM contracts, @transfer, decorators
+├── crm/          # CRM contracts, @transfer, @stream, decorators
 ├── transport/    # Registry, proxy, server bridge, scheduler
-├── config/       # Python override facades backed by Rust config resolution
-└── mem/          # Python wrappers for Rust memory subsystem
+├── mem/          # Python wrappers for Rust memory subsystem
+├── error.py      # Public error hierarchy and native ErrorCode projection
+├── endpoint.py   # Local endpoint maintenance facade (c_two.endpoint)
+├── observe.py    # Runtime diagnostics facade (c_two.observe)
+└── contract.py   # Contract descriptor and codegen facade (c_two.contract)
 sdk/python/native/
 └── src/          # PyO3 extension crate for c_two._native
 sdk/python/tests/

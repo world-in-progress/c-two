@@ -1,10 +1,10 @@
 # C-Two Roadmap
 
-Status refreshed: 2026-11-03.
+Status refreshed: 2026-11-20.
 
 This page records the direction of C-Two's 0.x line: the current foundation, and the exit criteria of the product capabilities that are not yet built. Open work, its order and its status live only in the [backlog](backlog.md), a Chinese working record.
 
-The latest release is C-Two 0.10.1 with c3 0.6.0. Since then `main` has merged the interface slimming, the defect and dead-code fixes, the removal of the owner subsystem, single-owner shared-memory release, server streams and route name identity (IPC 16, SHM 4, C/FFI ABI 8, relay mesh 7); they are unreleased and described in the [unreleased notes](../releases/unreleased.md). FastDB is pinned to 0.2.4 (native source `f82fa13adeae2b87a295bf984821c85c44b55a3d`). The Rust SDK, Core and TypeScript bindings keep independent 0.1.0 versions, with no C-Two crates.io or npm publication.
+The current release candidate is C-Two 0.11.0 with c3 0.7.0 (IPC 16, SHM 4, C/FFI ABI 8, relay mesh 7), covering the smaller public surface, owner-subsystem removal, single-owner shared-memory release, server streams, route-name identity, role-domain `(M, F, N)` configuration convergence and error-surface convergence; see the [0.11.0 release notes](../releases/0.11.0.md). FastDB is pinned to 0.2.4 (native source `f82fa13adeae2b87a295bf984821c85c44b55a3d`). The Rust SDK, Core and TypeScript bindings keep independent 0.1.0 versions, with no C-Two crates.io or npm publication.
 
 `docs/reference/` owns current behavior. [CI and release qualification](../reference/ci-cd.md) distinguishes source validation, package validation and publication; each release retains its exact source and artifact receipts.
 
@@ -23,7 +23,7 @@ The latest release is C-Two 0.10.1 with c3 0.6.0. Since then `main` has merged t
 | Bounded admission and strict gates | Fixed contract admission limits bound outer contract input before unbounded work. Core and Python native pass strict Clippy without blanket suppression, followed by complete language and repository gates. |
 | Local package closure | The July local candidate's canonical 42-artifact manifest binds FastDB and C-Two implementation commits. Version-only Rust, no-index CPython 3.10/current, and tarball-only Node consumers passed outside sibling/source checkouts. |
 | Local endpoint and lifecycle | One OS-derived endpoint, physical connection observations and structured bind/connect causes share Core on Linux, macOS and Windows x64/ARM64. Exact/scoped native maintenance retains identity checks. See the release notes for distribution gates and evidence. |
-| IPC memory policy | Single-owner release: only the pool owner changes its allocator, a loan ends with the peer's release record or peer end, and each direction copies a payload into a local copy and releases its lease before handing it on. Lazy buddy allocation, idle decay and three finite direction-scoped budgets are implemented; HTTP buffer governance and broader cancellation/queue telemetry remain open. |
+| IPC and relay memory policy | Single-owner release: only the pool owner changes its allocator, a loan ends with the peer's release record or peer end, and each direction copies a payload into a local copy and releases its lease before handing it on. Lazy buddy allocation, idle decay, independent `client`, `server` and `relay` role-domain `(M, F, N)` budgets, and budgeted relay HTTP upload/download streaming windows are implemented; broader cancellation/queue telemetry remains open. |
 | Honest backing boundary | The proven Rust and Python receive adapters are copy-backed. Holds and borrowed inputs keep only local copies; neither proves direct construction in final shared memory. |
 | Python-only prototype path | Ordinary Python methods without an explicit portable binding may still use pickle locally. Portable descriptor export/codegen rejects them with diagnostics. |
 

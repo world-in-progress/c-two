@@ -27,7 +27,7 @@ The name chosen by the application in `cc.register(..., name=...)` and `cc.conne
 _Avoid_: service name, resource name, endpoint (for a route)
 
 **路由 / route**:
-A route name together with the contract identity it serves; it names one resource's state. Within its scope (the relay mesh, or one endpoint for direct IPC) at most one registration of it is live at a time.
+A route name together with the contract identity it serves; it names one resource's state. Within one Host or direct IPC endpoint at most one registration of a name is live at a time; in a relay mesh, relays refuse a duplicate registration of a known held name and fail new acquisitions with `RouteConflict` (719) if a partition or race leaves multiple live holders.
 _Avoid_: binding, endpoint
 
 **注册 / registration**:

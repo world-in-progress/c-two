@@ -1,10 +1,10 @@
 # C-Two 路线图
 
-状态更新：2026-11-03。
+状态更新：2026-11-20。
 
 本页写 C-Two 0.x 的方向：现有的地基，以及还没做的产品能力各自的完成标准。还没做的事、它们的顺序与进度只记在[待办](backlog.md)里。
 
-最新发版是 C-Two 0.10.1 与 c3 0.6.0。此后 `main` 合入了接口精简、缺陷与死代码修复、删除 owner 子系统、单一属主释放、服务端流与路由身份（IPC 16、SHM 4、C/FFI ABI 8、relay mesh 7），尚未发版，见[未发布的改动](../releases/unreleased.md)。FastDB 固定 0.2.4（原生源码 `f82fa13adeae2b87a295bf984821c85c44b55a3d`）。Rust SDK、Core 与 TypeScript 绑定各自保持 0.1.0，C-Two 不在 crates.io 或 npm 发布。
+当前发版候选是 C-Two 0.11.0 与 c3 0.7.0（IPC 16、SHM 4、C/FFI ABI 8、relay mesh 7），整合了接口精简、删除 owner 子系统、单一属主释放、服务端流、路由名身份、按角色划分的 `(M, F, N)` 配置收敛与错误体系收敛，见 [0.11.0 发布说明](../releases/0.11.0.md)。FastDB 固定 0.2.4（原生源码 `f82fa13adeae2b87a295bf984821c85c44b55a3d`）。Rust SDK、Core 与 TypeScript 绑定各自保持 0.1.0，C-Two 不在 crates.io 或 npm 发布。
 
 `docs/reference/` 负责现行行为。[CI 与发行流程](../reference/ci-cd.md)区分源码验证、包验证与发布；各次发行保留确切源码与产物收据。
 
@@ -23,7 +23,7 @@
 | 有界准入与严格门禁 | 固定的契约准入上限在无界工作之前限住外层契约输入。Core 与 Python native 通过不带整体豁免的严格 Clippy，之后是完整的语言与仓库门禁。 |
 | 本地包闭环 | 7 月本地候选的规范 42 产物清单绑定 FastDB 与 C-Two 的实现提交。只按版本的 Rust、无索引的 CPython 3.10/当前版本与只用 tarball 的 Node 使用方，在 sibling/源码检出之外通过。 |
 | 本地端点与生命周期 | 唯一 OS 派生、物理连接通知及结构化 bind/connect 原因在 Linux、macOS 和 Windows x64/ARM64 共用 Core；精确/scoped 原生维护保留身份校验。发行门禁与证据见发布说明。 |
-| IPC 内存策略 | 单一属主释放：只有属主修改自己的分配器；借出以对端的释放记录或对端结束为止；两个方向都先把载荷复制成本地副本、释放租约，再往下交。lazy buddy、idle decay 与三个有限方向预算已实现；HTTP 缓冲治理、更广的取消/队列遥测仍未闭环。 |
+| IPC 与 relay 内存策略 | 单一属主释放：只有属主修改自己的分配器；借出以对端的释放记录或对端结束为止；两个方向都先把载荷复制成本地副本、释放租约，再往下交。lazy buddy、idle decay、按 `client`/`server`/`relay` 角色划分的 `(M, F, N)` 独立预算域，以及受预算约束的 relay HTTP 上传/下载流式窗口均已实现；更广的取消/队列遥测仍未闭环。 |
 | 真实 backing 边界 | 已证明的 Rust/Python receive adapter 是 copy-backed。hold 与借用输入都只持有本地副本，都不代表已直接构造到最终的共享内存。 |
 | Python-only prototype | 没有 portable binding 的普通 Python method 仍可在本地使用 pickle；portable descriptor export/codegen 会诊断并拒绝它们。 |
 

@@ -36,7 +36,7 @@ Python `cc.set_client` and `cc.set_server` accept the three capacity fields in t
 
 Updates merge field by field. Omission (`Keep`, Python `_UNSET`) keeps the accepted code override. `Inherit` (Python `None`) clears it so the environment and default apply. `Set` supplies an explicit value. Core validates and commits the complete candidate together. Changing `M` keeps an explicit `N` unless the same update clears or replaces it.
 
-After a role freezes, Core resolves setter updates against that role's captured sources. An update with identical effective settings succeeds, including an empty update and reuse of an automatically chosen `server_id`. A change to any effective setting raises the typed `ConfigFrozen` error. The other role can still be configured before it freezes. [Runtime lifecycle](runtime-lifecycle.md)
+After a role freezes, Core resolves setter updates against that role's captured sources. Invalid candidates fail configuration validation first; an update with identical effective settings succeeds, including an empty update and reuse of an automatically chosen `server_id`. A valid change to any effective setting fails with Rust `LifecycleError::ConfigFrozen` (projected in Python as `c_two.error.CoreError` with `lifecycle_kind == 'config_frozen'`; there is no separate `ConfigFrozen` Python exception class). The other role can still be configured before it freezes. [Runtime lifecycle](runtime-lifecycle.md)
 
 An explicit `ipc://` address uses direct IPC independently of the relay anchor. Route discovery may select a different relay for HTTP calls. [Contracts and routing](contracts-and-routing.md#relay-discovery-and-forwarding)
 
@@ -55,8 +55,8 @@ A standalone relay resolves one `relay` domain at startup. Its memory, file spil
 | `SHM_THRESHOLD` | 16 KiB | IPC payloads at or below this size are inline. Larger payloads can use SHM. |
 | `CHUNK_SIZE` | 128 KiB | Standard IPC chunk size. A narrow relay upload window can send shorter valid chunks. |
 | `REMOTE_PAYLOAD_CHUNK_SIZE` | 1 MiB | HTTP payload batching. TCP packet and HTTP frame boundaries are independent. |
-| `MAX_HANDSHAKE_FRAME_BYTES` | 8 MiB | Handshake frame bound, covering up to 64 routes with 256 methods each. |
-| `MAX_RPC_FRAME_BYTES` | 1 MiB | Symmetric RPC frame bound, including chunks, route catalogs and bounded error payloads. |
+| `MAX_HANDSHAKE_FRAME_BYTES` | 8 MiB | Handshake frame bound (also used for route-catalog replies matching an in-flight control request), covering up to 64 routes with 256 methods each. |
+| `MAX_RPC_FRAME_BYTES` | 1 MiB | Symmetric RPC frame bound, including chunks and bounded inline error payloads. |
 | `WRITE_TIMEOUT` | 30 s | Write and flush budget for one frame. |
 | `IDLE_CONNECTION_TIMEOUT` | 60 s | Idle client and relay upstream connection eviction. |
 | `POOL_DECAY_SECONDS` | 60 s | Idle buddy segment reclamation. Zero prewarmed and zero minimum retained segments. |
@@ -103,6 +103,6 @@ Expiration returns `CallDeadlineExceeded` with `operation=connect`, `transport_p
 
 ## Call deadlines and admission
 
-Both direct IPC and relay HTTP business calls wait without a deadline by default. In Python, `cc.with_call_options(proxy, timeout=...)` bounds one logical call, including any route reacquisition, or use `None` for no deadline. Zero expires before dispatch; negative and non-finite values are rejected. Synchronous same-process calls accept inherited or unlimited waiting. Connection deadlines are independent.
+Rust and Python direct IPC and relay HTTP business calls, as well as generated TypeScript direct IPC calls, wait without a deadline by default. Generated TypeScript explicit relay and relay-aware transports default `callTimeoutMs` to `300000` ms (including relay-aware calls routed over local IPC); pass `callTimeoutMs: 0` to disable that default. In Python, `cc.with_call_options(proxy, timeout=...)` bounds one logical call, including any route reacquisition, or use `None` for no deadline. Zero expires before dispatch; negative and non-finite values are rejected. Synchronous same-process calls accept inherited or unlimited waiting. Connection deadlines are independent.
 
 Expiry ends caller waiting. A dispatched call may still run to its real terminal, holding its call slot until then. Retry only a pre-dispatch failure. All remote unary and streaming calls count against `N` regardless of deadline. See [execution admission](runtime-lifecycle.md#execution-admission) and [diagnostic snapshots](memory-policy.md#statistics-and-payload-lifetime).

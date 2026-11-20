@@ -26,13 +26,15 @@ python tools/dev/c3_tool.py --build --link
 ┌──────────────────┐         ┌──────────────────┐
 │  CRM Process A   │──reg──▶│                  │
 │  (Grid resource) │         │   Relay Server   │◀──resolve── Client
-│                  │◀──ipc──│   :8300           │
-└──────────────────┘         └──────────────────┘
+│                  │◀──ipc──│   :8300           │   (HTTP     │
+└──────────────────┘         └──────────────────┘    when      │
+         ▲                                           remote)   │
+         └────────────── direct local IPC (loopback) ──────────┘
 ```
 
-1. **Relay** — `c3 relay` HTTP relay server that maintains a route table
-2. **CRM Process** — registers `Grid` resource with the relay by name
-3. **Client** — resolves `grid` by name via relay, then calls methods
+1. **Relay** — `c3 relay` HTTP relay server that maintains a route table (and forwards calls over HTTP when a client reaches a remote relay)
+2. **CRM Process** — registers `GridPython` resource with the relay by name
+3. **Client** — resolves `grid` by name via the loopback relay, verifies the matching local namespace, and calls the Host directly over local IPC (or over HTTP through the relay when remote)
 
 ## Run (3 terminals)
 
