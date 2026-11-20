@@ -275,6 +275,7 @@ export class C2HttpRelayError extends Error {
   readonly body: string;
   readonly transportPhase: "pre_dispatch" | "dispatch_uncertain";
   readonly #validUtf8: boolean;
+  readonly #rawBody: string | Uint8Array;
   constructor(status: number, body: string | Uint8Array, transportPhase?: "pre_dispatch" | "dispatch_uncertain") {
     const decoded = decodeHttpErrorBody(body);
     super(`C-Two HTTP relay call failed with status ${status}: ${decoded.body}`);
@@ -284,6 +285,7 @@ export class C2HttpRelayError extends Error {
     this.body = decoded.body;
     this.transportPhase = transportPhase ?? resolveHttpCallRelayErrorPhase(status, decoded);
     this.#validUtf8 = decoded.validUtf8;
+    this.#rawBody = body instanceof Uint8Array ? body.slice() : body;
   }
   get hasVerifiedUtf8Body(): boolean {
     return this.#validUtf8;
@@ -291,19 +293,31 @@ export class C2HttpRelayError extends Error {
   get retrySafe(): boolean {
     return isRetryableRouteError(this);
   }
+  static _postDispatchCopy(source: C2HttpRelayError): C2HttpRelayError {
+    const copy = new C2HttpRelayError(source.status, source.#rawBody, "dispatch_uncertain");
+    copy.cause = source;
+    return copy;
+  }
 }
 
 export class C2HttpTransportError extends Error {
   readonly cannotConnect: boolean;
   readonly transportPhase: "pre_dispatch" | "dispatch_uncertain";
+  readonly #rawMessage: string;
   constructor(message: string, cause?: unknown, transportPhase?: "pre_dispatch" | "dispatch_uncertain") {
     super(`C-Two HTTP transport error: ${message}`, cause === undefined ? undefined : { cause });
     this.name = "C2HttpTransportError";
     Object.setPrototypeOf(this, C2HttpTransportError.prototype);
     this.cannotConnect = httpConnectFailure(cause);
     this.transportPhase = transportPhase ?? (this.cannotConnect ? "pre_dispatch" : "dispatch_uncertain");
+    this.#rawMessage = message;
   }
   get retrySafe(): boolean { return this.transportPhase === "pre_dispatch"; }
+  static _postDispatchCopy(source: C2HttpTransportError): C2HttpTransportError {
+    const copy = new C2HttpTransportError(source.#rawMessage, undefined, "dispatch_uncertain");
+    copy.cause = source;
+    return copy;
+  }
 }
 
 export class C2CrmMethodError extends Error {
@@ -469,12 +483,25 @@ async function waitForCloseReady<T>(ready: Promise<T>, timeoutMs: number | null,
   }
 }
 
-async function readNativeStreamNext<T>(state: C2StreamState, ready: Promise<C2NativeCall>, decode: (bytes: Uint8Array) => T, hold: boolean): Promise<IteratorResult<T>> {
+async function readNativeStreamNext<T>(
+  state: C2StreamState,
+  ready: Promise<C2NativeCall>,
+  decode: (bytes: Uint8Array) => T,
+  hold: boolean,
+  onTransportFailure?: (error: unknown) => void,
+): Promise<IteratorResult<T>> {
     if (state.done || state.cancelled) return { done: true, value: undefined };
     if (state.nextPending) throw new Error("C-Two response stream next is already pending.");
     state.nextPending = true;
+    let readyFailed = false;
     try {
-      const call = await ready;
+      let call: C2NativeCall;
+      try {
+        call = await ready;
+      } catch (error) {
+        readyFailed = true;
+        throw error;
+      }
       if (state.cancelled) return { done: true, value: undefined };
       call.checkDeadline();
       const response = await call.next();
@@ -484,21 +511,56 @@ async function readNativeStreamNext<T>(state: C2StreamState, ready: Promise<C2Na
       }
       if (state.collected) { response.release(); return {done:true,value:undefined}; }
       let value: T | undefined;
+      let decodeFailed = false;
       try {
-        value = decode(response);
+        try {
+          value = decode(response);
+        } catch (decodeError) {
+          decodeFailed = true;
+          throw decodeError;
+        }
         call.checkDeadline();
       } catch (error) {
         tryReleaseStreamValue(value);
-        response.release();
+        let releaseFailure: unknown;
+        let hasReleaseFailure = false;
+        try {
+          response.release();
+        } catch (relErr) {
+          releaseFailure = relErr;
+          hasReleaseFailure = true;
+        }
+        if (decodeFailed) {
+          state.done = true;
+          if (!state.callClosed) state.call?.cancel();
+          throw sanitizePostDispatchCallbackError(error);
+        }
+        if (hasReleaseFailure) {
+          // Preserve primary deadline failure over cleanup failure.
+          void releaseFailure;
+        }
         throw error;
       }
       if (hold) return { done: false, value: createHeldResult(value, true, response, true) as T };
-      try { response.release(); }
-      catch (error) { tryReleaseStreamValue(value); throw error; }
+      try {
+        response.release();
+      } catch (releaseError) {
+        tryReleaseStreamValue(value);
+        state.done = true;
+        if (!state.callClosed) state.call?.cancel();
+        throw sanitizePostDispatchCallbackError(releaseError);
+      }
       return { done: false, value };
     } catch (error) {
+      if (state.done && !readyFailed) {
+        // Post-item decode/release path already cancelled and sanitized.
+        throw error;
+      }
       state.done = true;
       const projected = projectNativeError(error);
+      if (!readyFailed) {
+        onTransportFailure?.(projected);
+      }
       if (!state.callClosed && !((projected instanceof C2IpcTransportError || projected instanceof C2CoreError) && projected.code === 715)) {
         state.call?.cancel();
       }
@@ -514,7 +576,12 @@ class NativeC2ResponseStream<T> implements C2ResponseStream<T> {
   private readonly ready: Promise<C2NativeCall>;
   private finalReceipt: C2StreamReceipt | undefined;
 
-  constructor(start: (state: C2StreamState) => Promise<C2NativeCall>, private readonly decode: (bytes: Uint8Array) => T, private readonly hold: boolean) {
+  constructor(
+    start: (state: C2StreamState) => Promise<C2NativeCall>,
+    private readonly decode: (bytes: Uint8Array) => T,
+    private readonly hold: boolean,
+    private readonly onTransportFailure?: (error: unknown) => void,
+  ) {
     const state = this.state;
     this.ready = start(state).then(call => {
       state.call = call;
@@ -529,7 +596,7 @@ class NativeC2ResponseStream<T> implements C2ResponseStream<T> {
   [Symbol.asyncIterator](): AsyncIterableIterator<T> { return this; }
 
   next(): Promise<IteratorResult<T>> {
-    return readNativeStreamNext(this.state, this.ready, this.decode, this.hold);
+    return readNativeStreamNext(this.state, this.ready, this.decode, this.hold, this.onTransportFailure);
   }
 
   async return(): Promise<IteratorResult<T>> {
@@ -551,7 +618,14 @@ class NativeC2ResponseStream<T> implements C2ResponseStream<T> {
     if (call === undefined) return incompleteStreamReceipt();
     if (call !== existing) call.cancel();
     const remaining = timeoutMs === null ? null : Math.max(0, Math.ceil(timeoutMs - (performance.now() - startedAt)));
-    const receipt = await call.observe(remaining);
+    let receipt: C2StreamReceipt;
+    try {
+      receipt = await call.observe(remaining);
+    } catch (error) {
+      const projectedErr = projectNativeError(error);
+      this.onTransportFailure?.(projectedErr);
+      throw projectedErr;
+    }
     if (receipt.completed) {
       streamFinalizer.unregister(this);
       call.close();
@@ -559,7 +633,11 @@ class NativeC2ResponseStream<T> implements C2ResponseStream<T> {
       this.state.call = undefined;
       this.state.done = true;
     }
-    const projected = { completed: receipt.completed, error: receipt.error === null ? null : projectNativeError(receipt.error), completeItems: receipt.completeItems };
+    const projectedError = receipt.error === null ? null : projectNativeError(receipt.error);
+    if (projectedError !== null) {
+      this.onTransportFailure?.(projectedError);
+    }
+    const projected = { completed: receipt.completed, error: projectedError, completeItems: receipt.completeItems };
     if (receipt.completed) this.finalReceipt = projected;
     return projected;
   }
@@ -570,7 +648,6 @@ interface C2DeferredStreamState<T> {
   cancelled: boolean;
   collected: boolean;
   dispose?: () => void;
-  failure?: (error: unknown) => void;
 }
 
 const deferredStreamFinalizer = new FinalizationRegistry<C2DeferredStreamState<unknown>>(state => {
@@ -581,17 +658,12 @@ const deferredStreamFinalizer = new FinalizationRegistry<C2DeferredStreamState<u
 });
 
 async function readDeferredStreamNext<T>(state: C2DeferredStreamState<T>, ready: Promise<C2ResponseStream<T>>): Promise<IteratorResult<T>> {
-  try {
-    if (state.cancelled) return { done: true, value: undefined };
-    const stream = await ready;
-    if (state.cancelled) return { done: true, value: undefined };
-    const result = await stream.next();
-    if (result.done) state.dispose?.();
-    return result;
-  } catch (error) {
-    state.failure?.(error);
-    throw error;
-  }
+  if (state.cancelled) return { done: true, value: undefined };
+  const stream = await ready;
+  if (state.cancelled) return { done: true, value: undefined };
+  const result = await stream.next();
+  if (result.done) state.dispose?.();
+  return result;
 }
 
 class DeferredC2ResponseStream<T> implements C2ResponseStream<T> {
@@ -628,11 +700,7 @@ class DeferredC2ResponseStream<T> implements C2ResponseStream<T> {
     const stream = this.state.stream ?? await waitForCloseReady(this.ready, timeoutMs, startedAt);
     if (stream === undefined) return incompleteStreamReceipt();
     const remaining = timeoutMs === null ? null : Math.max(0, Math.ceil(timeoutMs - (performance.now() - startedAt)));
-    const receipt = await stream.close(remaining).catch(error => {
-      this.state.failure?.(error);
-      throw error;
-    });
-    if (receipt.error !== null) this.state.failure?.(receipt.error);
+    const receipt = await stream.close(remaining);
     if (receipt.completed) {
       deferredStreamFinalizer.unregister(this);
       this.state.dispose?.();
@@ -685,8 +753,8 @@ function callDeadlineError(phase: "pre_dispatch" | "dispatch_uncertain", message
 interface C2IpcTargetTransport<Payload extends C2ResponsePayload> extends C2IpcEncodedTransport<Payload> {
   acquire(routeName: string, contract: C2ContractIdentity, budget: C2CallBudget): Promise<void>;
   snapshot(routeName: string): C2ConnectionSnapshot | null;
-  callAcquired(routeName: string, method: string, encode: () => C2ByteArray, budget: C2CallBudget): Promise<Payload>;
-  streamAcquired<T>(routeName: string, method: string, encode: () => C2ByteArray, decode: (bytes: Uint8Array) => T, hold: boolean, budget: C2CallBudget, cancelled?: boolean): C2ResponseStream<T | C2HeldResult<T>>;
+  callAcquired(routeName: string, method: string, encode: () => C2ByteArray, budget: C2CallBudget, onTransportFailure?: (error: unknown) => void): Promise<Payload>;
+  streamAcquired<T>(routeName: string, method: string, encode: () => C2ByteArray, decode: (bytes: Uint8Array) => T, hold: boolean, budget: C2CallBudget, cancelled?: boolean, onTransportFailure?: (error: unknown) => void): C2ResponseStream<T | C2HeldResult<T>>;
 }
 
 export function createIpcEncodedTransport<Payload extends C2ResponsePayload = C2ByteArray>(address: string, options: C2IpcTransportOptions<Payload>): C2IpcEncodedTransport<Payload> {
@@ -760,16 +828,30 @@ function createIpcTargetTransport<Payload extends C2ResponsePayload>(address: st
     const remaining = budget.remaining();
     return callTimeoutMs === null ? remaining : remaining === null ? callTimeoutMs : Math.min(callTimeoutMs, remaining);
   };
-  const callAcquired = async (routeName: string, method: string, encode: () => C2ByteArray, budget: C2CallBudget): Promise<Payload> => {
+  const callAcquired = async (
+    routeName: string,
+    method: string,
+    encode: () => C2ByteArray,
+    budget: C2CallBudget,
+    onTransportFailure?: (error: unknown) => void,
+  ): Promise<Payload> => {
     const { native } = acquired(routeName);
     let call: C2NativeCall | undefined;
     let delivery: C2PendingResponseDelivery<Payload> | undefined;
     let delivered = false;
     let postResponse = false;
+    let inputEncodeFailed = false;
+    let alreadySanitized = false;
     let hasPrimaryError = false;
     try {
       call = native.beginCall(routeName, method, false, nativeLimit(budget));
-      const request = requireUint8Array(encode(), "encoded input");
+      let request: Uint8Array;
+      try {
+        request = requireUint8Array(encode(), "encoded input");
+      } catch (encodeError) {
+        inputEncodeFailed = true;
+        throw encodeError;
+      }
       budget.remaining();
       call.checkDeadline();
       await call.chargeInput(request.byteLength);
@@ -812,20 +894,33 @@ function createIpcTargetTransport<Payload extends C2ResponsePayload>(address: st
       if (hasPostError) {
         throw postError;
       }
-      const payload = observeTransportResponse(delivery!, observe, {
-        path: observationPath === "RelayAwareLocalIpc" ? observationPath : target.path, routeName,
-        serverId: target.serverId, serverInstanceId: target.serverInstanceId,
-        connectionId: String(target.connectionId),
-        ipcAddress: address, requests, responses,
-      });
+      let payload: Payload;
+      try {
+        payload = observeTransportResponse(delivery!, observe, {
+          path: observationPath === "RelayAwareLocalIpc" ? observationPath : target.path, routeName,
+          serverId: target.serverId, serverInstanceId: target.serverInstanceId,
+          connectionId: String(target.connectionId),
+          ipcAddress: address, requests, responses,
+        });
+      } catch (obsError) {
+        alreadySanitized = true;
+        throw obsError;
+      }
       delivered = true;
       return payload;
     } catch (error) {
       hasPrimaryError = true;
       if (postResponse) {
+        if (alreadySanitized) {
+          throw error;
+        }
         throw sanitizePostDispatchCallbackError(error);
       }
-      throw projectNativeError(error);
+      const projected = projectNativeError(error);
+      if (!inputEncodeFailed) {
+        onTransportFailure?.(projected);
+      }
+      throw projected;
     } finally {
       if (!delivered) {
         delivery?.release();
@@ -838,27 +933,48 @@ function createIpcTargetTransport<Payload extends C2ResponsePayload>(address: st
             if (postResponse) {
               throw sanitizePostDispatchCallbackError(closeError);
             }
-            throw projectNativeError(closeError);
+            const projectedClose = projectNativeError(closeError);
+            if (!inputEncodeFailed) {
+              onTransportFailure?.(projectedClose);
+            }
+            throw projectedClose;
           }
         }
       }
     }
   };
-  const startStream = <T>(routeName: string, method: string, encode: () => C2ByteArray, decode: (bytes: Uint8Array) => T, hold: boolean, budget: C2CallBudget, preparation?: Promise<void>, cancelled = false): C2ResponseStream<T | C2HeldResult<T>> => {
+  const startStream = <T>(
+    routeName: string,
+    method: string,
+    encode: () => C2ByteArray,
+    decode: (bytes: Uint8Array) => T,
+    hold: boolean,
+    budget: C2CallBudget,
+    preparation?: Promise<void>,
+    cancelled = false,
+    onTransportFailure?: (error: unknown) => void,
+  ): C2ResponseStream<T | C2HeldResult<T>> => {
     return new NativeC2ResponseStream<T | C2HeldResult<T>>(async state => {
       if (preparation !== undefined) await preparation;
       state.cancelled ||= cancelled;
-      const { native } = acquired(routeName);
-      const call = native.beginCall(routeName, method, true, nativeLimit(budget));
-      state.call = call;
+      let inputEncodeFailed = false;
       try {
+        const { native } = acquired(routeName);
+        const call = native.beginCall(routeName, method, true, nativeLimit(budget));
+        state.call = call;
         if (state.collected) {
           call.cancel();
           closeCollectedCall(state);
           return call;
         }
         if (state.cancelled) { call.cancel(); return call; }
-        const request = requireUint8Array(encode(), "encoded stream input");
+        let request: Uint8Array;
+        try {
+          request = requireUint8Array(encode(), "encoded stream input");
+        } catch (encodeError) {
+          inputEncodeFailed = true;
+          throw encodeError;
+        }
         budget.remaining();
         call.checkDeadline();
         await call.chargeInput(request.byteLength);
@@ -869,11 +985,14 @@ function createIpcTargetTransport<Payload extends C2ResponsePayload>(address: st
         return call;
       } catch (error) {
         const projected = projectNativeError(error);
-        if (!state.callClosed && !((projected instanceof C2IpcTransportError || projected instanceof C2CoreError) && projected.code === 715)) call.cancel();
+        if (!inputEncodeFailed) {
+          onTransportFailure?.(projected);
+        }
+        if (!state.callClosed && !((projected instanceof C2IpcTransportError || projected instanceof C2CoreError) && projected.code === 715)) state.call?.cancel();
         if (state.collected) closeCollectedCall(state);
         throw projected;
       }
-    }, decode as (bytes: Uint8Array) => T | C2HeldResult<T>, hold);
+    }, decode as (bytes: Uint8Array) => T | C2HeldResult<T>, hold, onTransportFailure);
   };
   function stream<T>(routeName: string, contract: C2ContractIdentity, method: string, encode: () => C2ByteArray, decode: (bytes: Uint8Array) => T, hold?: false): C2ResponseStream<T>;
   function stream<T>(routeName: string, contract: C2ContractIdentity, method: string, encode: () => C2ByteArray, decode: (bytes: Uint8Array) => T, hold: true): C2ResponseStream<C2HeldResult<T>>;
@@ -886,7 +1005,8 @@ function createIpcTargetTransport<Payload extends C2ResponsePayload>(address: st
     acquire: prepare,
     snapshot(routeName) { return nativeEndpoint?.connectionSnapshot(routeName) ?? null; },
     callAcquired,
-    streamAcquired: (routeName, method, encode, decode, hold, budget, cancelled) => startStream(routeName, method, encode, decode, hold, budget, undefined, cancelled),
+    streamAcquired: (routeName, method, encode, decode, hold, budget, cancelled, onTransportFailure) =>
+      startStream(routeName, method, encode, decode, hold, budget, undefined, cancelled, onTransportFailure),
     async call(routeName, contract, method, encode): Promise<Payload> {
       const budget = new C2CallBudget(callTimeoutMs);
       await prepare(routeName, contract, budget);
@@ -1137,8 +1257,16 @@ function createRelayTransport<Payload extends C2ResponsePayload>(baseUrl: string
         requireMethodPathValue(method);
         const target = await targetForCall(routeName, requireRouteContractIdentity(contract), budget);
         if (target.local === undefined) throw new C2UnsupportedCallModeError();
-        state.failure = error => observeFailure(target, error);
-        const stream = target.local.transport.streamAcquired(routeName, method, encode, decode, hold, budget, state.cancelled);
+        const stream = target.local.transport.streamAcquired(
+          routeName,
+          method,
+          encode,
+          decode,
+          hold,
+          budget,
+          state.cancelled,
+          (transportError) => observeFailure(target, transportError),
+        );
         if (state.cancelled) void stream.return?.();
         return stream;
       });
@@ -1151,18 +1279,17 @@ function createRelayTransport<Payload extends C2ResponsePayload>(baseUrl: string
       const routeContract = requireRouteContractIdentity(contract);
       const target = await targetForCall(routeName, routeContract, budget);
       if (target.local !== undefined) {
-        try {
-          return await target.local.transport.callAcquired(routeName, method, encode, budget);
-        } catch (error) {
-          if (!isPostDispatchCallbackFailure(error)) {
-            observeFailure(target, error);
-          }
-          throw error;
-        }
+        return await target.local.transport.callAcquired(
+          routeName,
+          method,
+          encode,
+          budget,
+          (transportError) => observeFailure(target, transportError),
+        );
       }
+      const request = encodeHttpUnaryInput(encode, budget);
       let delivery: C2PendingResponseDelivery<Payload>;
       try {
-        const request = encodeHttpUnaryInput(encode, budget);
         requests += 1;
         delivery = await callResolvedHttpRoute(fetchImpl, target.relayUrl, routeName, routeContract, method, request, headers, budget.remaining() ?? 0, allocator, unknownLengthStrategy, unknownLengthMaxBytes);
       } catch (error) {
@@ -1284,11 +1411,15 @@ function makePlainDelivery<Payload extends C2ResponsePayload>(payload: Payload):
   };
 }
 
+type C2AllocatedReleaseState =
+  | { readonly hasPayload: false }
+  | { readonly hasPayload: true; readonly payload: unknown };
+
 function createAllocatedReleaseGuard<Payload extends C2ResponsePayload>(
   allocated: C2AllocatedResponsePayload<Payload>,
-): (resolvedPayload?: unknown) => void {
+): (state?: C2AllocatedReleaseState) => void {
   let released = false;
-  return (resolvedPayload?: unknown) => {
+  return (state?: C2AllocatedReleaseState) => {
     if (released) return;
     released = true;
     try {
@@ -1296,7 +1427,13 @@ function createAllocatedReleaseGuard<Payload extends C2ResponsePayload>(
         allocated.release();
         return;
       }
-      releaseHeldValue(resolvedPayload !== undefined ? resolvedPayload : allocated.payload);
+      if (state !== undefined) {
+        if (state.hasPayload) {
+          releaseHeldValue(state.payload);
+        }
+        return;
+      }
+      releaseHeldValue(allocated.payload);
     } catch (cleanupError) {
       console.warn("Warning: allocated response payload cleanup failed:", cleanupError);
     }
@@ -1305,23 +1442,29 @@ function createAllocatedReleaseGuard<Payload extends C2ResponsePayload>(
 
 function finalizeAllocatedDelivery<Payload extends C2ResponsePayload>(
   allocated: C2AllocatedResponsePayload<Payload>,
-  releaseOnce: (resolvedPayload?: unknown) => void,
+  releaseOnce: (state?: C2AllocatedReleaseState) => void,
 ): C2PendingResponseDelivery<Payload> {
   let payload: Payload;
+  let hasPayload = false;
   try {
     payload = allocated.payload;
+    hasPayload = true;
     if (!isResponsePayload(payload)) {
-      releaseOnce(payload);
+      releaseOnce({ hasPayload: true, payload });
       throw new Error("C-Two responsePayloadAllocator result payload must be a response payload.");
     }
   } catch (error) {
-    releaseOnce();
+    if (hasPayload) {
+      releaseOnce({ hasPayload: true, payload: payload! });
+    } else {
+      releaseOnce({ hasPayload: false });
+    }
     throw error;
   }
   return {
     payload,
     release() {
-      releaseOnce(payload);
+      releaseOnce({ hasPayload: true, payload });
     },
   };
 }
@@ -2029,9 +2172,10 @@ async function callResolvedHttpRoute<Payload extends C2ResponsePayload>(
 ): Promise<C2PendingResponseDelivery<Payload>> {
   let trackedCleanup: Promise<void> | undefined;
   return await fetchWithTimeout(
-    async (signal) => {
+    async (fetchSignal, internalSignal) => {
+      const activeSignal = internalSignal ?? fetchSignal;
       const abortContext: C2HttpAbortContext = {
-        signal,
+        signal: activeSignal,
         trackAllocationCleanup(done) {
           trackedCleanup = done;
         },
@@ -2044,7 +2188,7 @@ async function callResolvedHttpRoute<Payload extends C2ResponsePayload>(
             method: "POST",
             headers: requestHeadersForRouteContract(headers, routeContract),
             body: requestPayload,
-            signal,
+            signal: fetchSignal,
           },
         );
       } catch (error) {
@@ -2066,7 +2210,7 @@ async function callResolvedHttpRoute<Payload extends C2ResponsePayload>(
       if (response.status === 500) {
         let errorPayload: Uint8Array;
         try {
-          errorPayload = await readHttpArrayBufferResponsePayload(response, signal);
+          errorPayload = await readHttpArrayBufferResponsePayload(response, activeSignal);
         } catch (error) {
           throw new C2HttpTransportError(`C-Two HTTP relay call body read failed: ${String(error)}`);
         }
@@ -2074,7 +2218,7 @@ async function callResolvedHttpRoute<Payload extends C2ResponsePayload>(
       }
       let bodyBytes: Uint8Array;
       try {
-        bodyBytes = await readHttpArrayBufferResponsePayload(response, signal);
+        bodyBytes = await readHttpArrayBufferResponsePayload(response, activeSignal);
       } catch (error) {
         throw new C2HttpTransportError(`C-Two HTTP relay call body read failed: ${String(error)}`);
       }
@@ -2088,27 +2232,12 @@ async function callResolvedHttpRoute<Payload extends C2ResponsePayload>(
   );
 }
 
-const postDispatchCallbackFailures = new WeakSet<object>();
 const CALLBACK_CONTROL_DETAIL_KEYS = new Set([
   "transport_phase",
   "dispatch_phase",
   "fallback_eligible",
   "route_withdrawal",
 ]);
-
-function markPostDispatchCallbackFailure<T>(error: T): T {
-  if ((typeof error === "object" || typeof error === "function") && error !== null) {
-    postDispatchCallbackFailures.add(error as object);
-  }
-  return error;
-}
-
-function isPostDispatchCallbackFailure(error: unknown): boolean {
-  if ((typeof error === "object" || typeof error === "function") && error !== null) {
-    return postDispatchCallbackFailures.has(error as object);
-  }
-  return true;
-}
 
 function stripCallbackDetailsRecord(
   details: Readonly<Record<string, string>> | undefined,
@@ -2119,7 +2248,12 @@ function stripCallbackDetailsRecord(
   }
   for (const [key, value] of Object.entries(details)) {
     if (!CALLBACK_CONTROL_DETAIL_KEYS.has(key) && typeof value === "string") {
-      out[key] = value;
+      Object.defineProperty(out, key, {
+        value,
+        enumerable: true,
+        configurable: true,
+        writable: true,
+      });
     }
   }
   return out;
@@ -2147,11 +2281,23 @@ function safeCallbackErrorMessage(error: unknown): string {
   }
 }
 
-function callbackErrorExposesPreDispatchControl(error: object): boolean {
-  try {
-    if (error instanceof C2RouteConflictError || error instanceof C2UnsupportedCallModeError) {
+function hasCallbackControlDetailKey(record: unknown): boolean {
+  if (record === undefined || record === null || typeof record !== "object") {
+    return false;
+  }
+  for (const key of CALLBACK_CONTROL_DETAIL_KEYS) {
+    if (Object.prototype.hasOwnProperty.call(record, key)) {
       return true;
     }
+  }
+  return false;
+}
+
+function sanitizePostDispatchCallbackError(error: unknown): unknown {
+  if ((typeof error !== "object" && typeof error !== "function") || error === null) {
+    return error;
+  }
+  try {
     const candidate = error as {
       transportPhase?: unknown;
       retrySafe?: unknown;
@@ -2159,92 +2305,77 @@ function callbackErrorExposesPreDispatchControl(error: object): boolean {
       nativeDetails?: C2NativeErrorDetails;
       details?: Readonly<Record<string, string>>;
     };
-    if (candidate.transportPhase !== undefined && candidate.transportPhase !== null) {
-      return true;
+    const transportPhase = candidate.transportPhase;
+    const retrySafe = candidate.retrySafe;
+    const cannotConnect = candidate.cannotConnect;
+    const nativeDetails = candidate.nativeDetails;
+    const details = candidate.details;
+    const isHttpPhaseBounded =
+      error instanceof C2HttpRelayError || error instanceof C2HttpTransportError;
+    const exposesControl =
+      error instanceof C2RouteConflictError ||
+      error instanceof C2UnsupportedCallModeError ||
+      retrySafe === true ||
+      cannotConnect === true ||
+      (isHttpPhaseBounded
+        ? transportPhase !== "dispatch_uncertain"
+        : transportPhase !== undefined && transportPhase !== null) ||
+      (nativeDetails !== undefined &&
+        typeof nativeDetails === "object" &&
+        nativeDetails !== null &&
+        (nativeDetails.transportPhase !== undefined ||
+          hasCallbackControlDetailKey(nativeDetails.details))) ||
+      hasCallbackControlDetailKey(details);
+    if (!exposesControl) {
+      return error;
     }
-    if (candidate.retrySafe === true || candidate.cannotConnect === true) {
-      return true;
+    if (error instanceof C2CoreError) {
+      const rebuilt = new C2CoreError(
+        safeCallbackErrorMessage(error),
+        stripNativeControlDetails(
+          nativeDetails !== undefined && typeof nativeDetails === "object" && nativeDetails !== null
+            ? nativeDetails
+            : error.nativeDetails,
+        ),
+      );
+      rebuilt.cause = error;
+      return rebuilt;
     }
-    if (candidate.nativeDetails !== undefined) {
-      if (candidate.nativeDetails.transportPhase !== undefined) {
-        return true;
-      }
-      if (candidate.nativeDetails.details !== undefined) {
-        for (const key of CALLBACK_CONTROL_DETAIL_KEYS) {
-          if (Object.prototype.hasOwnProperty.call(candidate.nativeDetails.details, key)) {
-            return true;
-          }
-        }
-      }
+    if (error instanceof C2IpcTransportError) {
+      const cleanNative =
+        nativeDetails !== undefined && typeof nativeDetails === "object" && nativeDetails !== null
+          ? stripNativeControlDetails(nativeDetails)
+          : undefined;
+      const rebuilt = new C2IpcTransportError(safeCallbackErrorMessage(error), cleanNative);
+      rebuilt.cause = error;
+      return rebuilt;
     }
-    if (candidate.details !== undefined && candidate.details !== null && typeof candidate.details === "object") {
-      for (const key of CALLBACK_CONTROL_DETAIL_KEYS) {
-        if (Object.prototype.hasOwnProperty.call(candidate.details, key)) {
-          return true;
-        }
-      }
+    if (error instanceof C2HttpRelayError) {
+      return C2HttpRelayError._postDispatchCopy(error);
     }
-    return false;
-  } catch {
-    return true;
-  }
-}
-
-function sanitizePostDispatchCallbackError(error: unknown): unknown {
-  if ((typeof error !== "object" && typeof error !== "function") || error === null) {
-    return error;
-  }
-  if (!callbackErrorExposesPreDispatchControl(error)) {
-    return markPostDispatchCallbackFailure(error);
-  }
-  if (error instanceof C2CoreError) {
-    const rebuilt = new C2CoreError(
-      safeCallbackErrorMessage(error),
-      stripNativeControlDetails(error.nativeDetails),
-    );
-    rebuilt.cause = error;
-    return markPostDispatchCallbackFailure(rebuilt);
-  }
-  if (error instanceof C2IpcTransportError) {
-    const rebuilt = new C2IpcTransportError(
-      safeCallbackErrorMessage(error),
-      error.nativeDetails === undefined ? undefined : stripNativeControlDetails(error.nativeDetails),
-    );
-    rebuilt.cause = error;
-    return markPostDispatchCallbackFailure(rebuilt);
-  }
-  if (error instanceof C2HttpRelayError) {
-    const rebuilt = new C2HttpRelayError(error.status, error.body, "dispatch_uncertain");
-    rebuilt.cause = error;
-    return markPostDispatchCallbackFailure(rebuilt);
-  }
-  if (error instanceof C2HttpTransportError) {
-    const rebuilt = new C2HttpTransportError(safeCallbackErrorMessage(error), undefined, "dispatch_uncertain");
-    rebuilt.cause = error;
-    return markPostDispatchCallbackFailure(rebuilt);
-  }
-  if (error instanceof Error) {
-    const nativeDetails = (error as Error & { nativeDetails?: C2NativeErrorDetails }).nativeDetails;
-    if (nativeDetails !== undefined && typeof nativeDetails === "object" && nativeDetails !== null) {
+    if (error instanceof C2HttpTransportError) {
+      return C2HttpTransportError._postDispatchCopy(error);
+    }
+    if (error instanceof Error && nativeDetails !== undefined && typeof nativeDetails === "object" && nativeDetails !== null) {
       if (typeof nativeDetails.code === "number") {
         const rebuilt = new C2CoreError(
           safeCallbackErrorMessage(error),
           stripNativeControlDetails(nativeDetails),
         );
         rebuilt.cause = error;
-        return markPostDispatchCallbackFailure(rebuilt);
+        return rebuilt;
       }
       const rebuilt = new C2IpcTransportError(
         safeCallbackErrorMessage(error),
         stripNativeControlDetails(nativeDetails),
       );
       rebuilt.cause = error;
-      return markPostDispatchCallbackFailure(rebuilt);
+      return rebuilt;
     }
+    return new Error(safeCallbackErrorMessage(error), { cause: error });
+  } catch {
+    return new Error(safeCallbackErrorMessage(error), { cause: error });
   }
-  return markPostDispatchCallbackFailure(
-    new Error(safeCallbackErrorMessage(error), { cause: error }),
-  );
 }
 
 function observeTransportResponse<Payload extends C2ResponsePayload>(
@@ -2393,8 +2524,46 @@ type C2AbortController = {
   abort(reason?: unknown): void;
 };
 
+function createFallbackAbortController(): C2AbortController {
+  let aborted = false;
+  let reason: unknown;
+  const listeners = new Set<() => void>();
+  const signal: C2AbortSignal = {
+    get aborted() {
+      return aborted;
+    },
+    get reason() {
+      return reason;
+    },
+    addEventListener(_type, listener) {
+      if (aborted) return;
+      listeners.add(listener);
+    },
+    removeEventListener(_type, listener) {
+      listeners.delete(listener);
+    },
+  };
+  return {
+    signal,
+    abort(abortReasonValue?: unknown) {
+      if (aborted) return;
+      aborted = true;
+      reason = abortReasonValue;
+      const snapshot = [...listeners];
+      listeners.clear();
+      for (const listener of snapshot) {
+        try {
+          listener();
+        } catch {
+          // Ignore listener errors during abort notification.
+        }
+      }
+    },
+  };
+}
+
 async function fetchWithTimeout<T>(
-  operation: (signal: C2AbortSignal | undefined) => Promise<T>,
+  operation: (fetchSignal: C2AbortSignal | undefined, internalSignal?: C2AbortSignal) => Promise<T>,
   timeoutMs: number,
   label: string,
   phase: "pre_dispatch" | "dispatch_uncertain" = "pre_dispatch",
@@ -2402,10 +2571,11 @@ async function fetchWithTimeout<T>(
   getPendingCleanup?: () => Promise<void> | undefined,
 ): Promise<T> {
   if (timeoutMs === 0) {
-    return await operation(undefined);
+    return await operation(undefined, undefined);
   }
   const controllerCtor = (globalThis as unknown as { AbortController?: new () => C2AbortController }).AbortController;
-  const controller = controllerCtor ? new controllerCtor() : undefined;
+  const nativeController = controllerCtor ? new controllerCtor() : undefined;
+  const internalController = nativeController ?? createFallbackAbortController();
   let timedOut = false;
   let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
   const timeoutError = () => callDeadlineError(phase, `${label} timed out after ${timeoutMs}ms.`);
@@ -2413,11 +2583,11 @@ async function fetchWithTimeout<T>(
     timeoutHandle = setTimeout(() => {
       timedOut = true;
       const error = timeoutError();
-      controller?.abort(error);
+      internalController.abort(error);
       reject(error);
     }, timeoutMs);
   });
-  const opPromise = operation(controller?.signal);
+  const opPromise = operation(nativeController?.signal, internalController.signal);
   if (onLateResult !== undefined) {
     void opPromise.then(
       (value) => {

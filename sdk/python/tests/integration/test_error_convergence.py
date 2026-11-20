@@ -1997,6 +1997,14 @@ def test_http_call_404_701_contradiction_409_719_reacquire_and_array_float_envel
         assert not worker.is_alive()
 
 
+class _NotesList(list):
+    pass
+
+
+class _SlottedNotesClosed(ResourceClosed):
+    __slots__ = ('__notes__',)
+
+
 def test_post_dispatch_prepared_close_exception_group_and_fastdb_hostile_class_getter(tmp_path):
     """Prepared close never leaks pre_dispatch on rewritten ExceptionGroup, and FastDB cause checks avoid __class__."""
     import builtins as py_builtins
@@ -2612,3 +2620,131 @@ def test_post_dispatch_prepared_close_exception_group_and_fastdb_hostile_class_g
     assert rebuilt_base.transport_phase is None
     assert rebuilt_base.details == {'biz': 'base-kept'}  # type: ignore[attr-defined]
     assert rebuilt_base.__cause__ is base_with_details
+
+    # 7. str subclass __str__ never replaces resource error, spoofed __module__ == 'builtins' is caught,
+    # list-subclass and slotted __notes__ stay independent, and updated/deleted details reflect throw-time state.
+    import copy
+
+    class _HostileMsgStr(str):
+        def __str__(self) -> str:
+            raise ResourceClosed('inner pre_dispatch from str.__str__', transport_phase='pre_dispatch')
+
+    class _StrSubRebuildClosed(ResourceClosed):
+        @property
+        def transport_phase(self):  # type: ignore[override]
+            return 'pre_dispatch'
+
+    SpoofedBuiltinClosed = type(
+        '_SpoofedBuiltinClosed',
+        (ResourceClosed,),
+        {
+            '__module__': 'builtins',
+            'transport_phase': property(lambda _self: 'pre_dispatch'),
+        },
+    )
+
+    class _MutableSetterClosed(ResourceClosed):
+        def __init__(self):
+            self._d: dict[str, str] = {}
+            super().__init__('mutable setter', details={'batch': 'before', 'transport_phase': 'pre_dispatch'})
+
+        @property
+        def details(self) -> dict[str, str]:  # type: ignore[override]
+            return self._d
+
+        @details.setter
+        def details(self, val: dict[str, str]) -> None:
+            self._d = dict(val)
+
+    class _ClassDefaultDetailsClosed(ResourceClosed):
+        details = {'batch': 'class-default', 'dispatch_phase': 'pre_dispatch'}  # type: ignore[assignment]
+
+    r13_runs = 0
+
+    class R13Resource:
+        def echo(self, value):
+            nonlocal r13_runs
+            r13_runs += 1
+            if value == 'str-sub':
+                raise _StrSubRebuildClosed(_HostileMsgStr('business closed text'), details={'k': _HostileMsgStr('v')})
+            if value == 'spoof-builtin':
+                raise SpoofedBuiltinClosed('spoofed module closed', details={'spoof': 'kept'})
+            if value == 'setter-mutated':
+                err = _MutableSetterClosed()
+                err.details['batch'] = 'after'
+                err.details['added'] = 'yes'
+                raise err
+            err_del = _ClassDefaultDetailsClosed('deleted inst details', details={'batch': 'temp'})
+            del err_del.details
+            raise err_del
+
+        def steps(self, value):
+            yield value
+
+    rt_r13 = cc.Runtime()
+    if sys.platform != 'win32':
+        r13_dir = tmp_path / 'r13_ipc'
+        r13_dir.mkdir()
+        rt_r13.set_local_endpoint(root=str(r13_dir))
+    rt_r13.register(CodecBoundary, R13Resource(), name='r13')
+    r13_proxy = rt_r13.connect(CodecBoundary, name='r13')
+    try:
+        with pytest.raises(ResourceClosed) as c_str:
+            r13_proxy.echo('str-sub')
+        assert c_str.value.code == ErrorCode.ResourceClosed
+        assert c_str.value.transport_phase is None
+        assert type(c_str.value.message) is str
+        assert c_str.value.message == 'business closed text'
+        assert c_str.value.details == {'k': 'v'}
+        assert type(c_str.value.details['k']) is str
+        assert r13_runs == 1
+
+        with pytest.raises(ResourceClosed) as c_spoof:
+            r13_proxy.echo('spoof-builtin')
+        assert c_spoof.value.code == ErrorCode.ResourceClosed
+        assert c_spoof.value.transport_phase is None
+        assert c_spoof.value.details == {'spoof': 'kept'}
+        assert r13_runs == 2
+
+        with pytest.raises(ResourceClosed) as c_mut:
+            r13_proxy.echo('setter-mutated')
+        assert c_mut.value.code == ErrorCode.ResourceClosed
+        assert c_mut.value.transport_phase is None
+        assert c_mut.value.details == {'batch': 'after', 'added': 'yes'}
+        assert r13_runs == 3
+
+        with pytest.raises(ResourceClosed) as c_del:
+            r13_proxy.echo('deleted-inst')
+        assert c_del.value.code == ErrorCode.ResourceClosed
+        assert c_del.value.transport_phase is None
+        assert c_del.value.details == {'batch': 'class-default'}
+        assert r13_runs == 4
+    finally:
+        cc.close(r13_proxy)
+        rt_r13.shutdown()
+
+    # 7b. __notes__ using list subclass and __notes__ in __slots__ remain independent across copy, pickle and cleanup.
+    orig_notes_err = ResourceClosed('notes list sub', transport_phase='pre_dispatch')
+    orig_notes_err.__notes__ = _NotesList(['biz-note'])  # type: ignore[assignment]
+    cleaned_notes_err = _post_dispatch_cleanup_error(orig_notes_err)
+    cleaned_notes_err.add_note('cleanup-note')
+    assert list(orig_notes_err.__notes__) == ['biz-note']
+    assert cleaned_notes_err.__notes__ == ['biz-note', 'cleanup-note']
+
+    pickled_notes_err = pickle.loads(pickle.dumps(orig_notes_err))
+    pickled_notes_err.add_note('pickle-note')
+    assert list(orig_notes_err.__notes__) == ['biz-note']
+    assert pickled_notes_err.__notes__ == ['biz-note', 'pickle-note']
+
+    copied_slotted = _SlottedNotesClosed('slotted notes', transport_phase='pre_dispatch')
+    copied_slotted.add_note('slot-note-1')
+    shallow_slotted = copy.copy(copied_slotted)
+    shallow_slotted.add_note('slot-note-2')
+    roundtrip_slotted = pickle.loads(pickle.dumps(copied_slotted))
+    roundtrip_slotted.add_note('slot-note-3')
+    cleaned_slotted = _post_dispatch_cleanup_error(copied_slotted)
+    cleaned_slotted.add_note('slot-note-4')
+    assert copied_slotted.__notes__ == ['slot-note-1']
+    assert shallow_slotted.__notes__ == ['slot-note-1', 'slot-note-2']
+    assert roundtrip_slotted.__notes__ == ['slot-note-1', 'slot-note-3']
+    assert cleaned_slotted.__notes__ == ['slot-note-1', 'slot-note-4']

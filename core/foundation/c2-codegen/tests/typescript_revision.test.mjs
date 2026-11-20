@@ -1730,16 +1730,303 @@ test('extension JSON depth/IEEE-754 boundaries and synchronous reader cleanup fa
     }finally{await isoLocal.close()}
   }
 
-  // 12. Explicit FASTDB_CORE_SDK_DIR pointing to an empty directory fails loudly rather than silently falling back.
+  // 12. Explicit FASTDB_CORE_SDK_DIR pointing to a directory without FastDB libraries fails loudly rather than silently falling back.
   {
-    const emptySdkDir=mkdtempSync(join(tmpdir(),'c2-empty-fastdb-sdk-'));
+    const noLibDir=fileURLToPath(new URL('./fixtures',import.meta.url));
+    assert.throws(
+      ()=>buildFastDbEnvironment({FASTDB_CORE_SDK_DIR:noLibDir}),
+      /FASTDB_CORE_SDK_DIR does not contain a matching FastDB library/,
+    );
+  }
+
+  // 13. Lazy/throwing nativeDetails getter on observer error never escapes with retrySafe=true;
+  // double sanitization is avoided, invalid UTF-8 hasVerifiedUtf8Body=false is preserved, and "__proto__" detail key is retained.
+  {
+    let lazyReads=0;
+    const inner713=new transport.C2CoreError('inner lazy 713',{
+      message:'inner lazy 713',
+      code:713,
+      canonicalName:'ProtocolViolation',
+      transportPhase:'pre_dispatch',
+    });
+    const lazyObsErr=new Error('observer primary error');
+    Object.defineProperty(lazyObsErr,'nativeDetails',{
+      get(){
+        lazyReads++;
+        throw inner713;
+      },
+    });
+    const lazyHttp=transport.createRelayAwareHttpEncodedTransport('http://localhost:8300',{
+      observe(){throw lazyObsErr;},
+      fetch:async(url,init)=>{
+        if(url.includes('/_resolve/'))return textReply(200,JSON.stringify([relayRoute()]));
+        if(url.includes('/_probe/'))return relayResponse();
+        assert.equal(init.method,'POST');
+        return new Response(Uint8Array.of(1),{status:200,headers:{'content-length':'1'}});
+      },
+    });
     try{
-      assert.throws(
-        ()=>buildFastDbEnvironment({FASTDB_CORE_SDK_DIR:emptySdkDir}),
-        /FASTDB_CORE_SDK_DIR does not contain a matching FastDB library/,
-      );
+      await assert.rejects(lazyHttp.call('route',contract,'ping',()=>new Uint8Array()),err=>{
+        assert.notEqual(err,inner713);
+        assert.notEqual(err.retrySafe,true);
+        assert.equal(err.cause,lazyObsErr);
+        return true;
+      });
+      assert.equal(lazyReads,1);
+    }finally{await lazyHttp.close()}
+
+    // Invalid UTF-8 C2HttpRelayError & C2HttpTransportError thrown in IPC observe() preserve single prefix, direct cause, hasVerifiedUtf8Body=false, and "__proto__" detail key.
+    const invalidUtf8RelayErr=new transport.C2HttpRelayError(503,Uint8Array.of(0xff,0xfe),'pre_dispatch');
+    assert.equal(invalidUtf8RelayErr.hasVerifiedUtf8Body,false);
+    const innerHttpTransErr=new transport.C2HttpTransportError('connect failed',{code:'ECONNREFUSED'},'pre_dispatch');
+    const protoDetailErr=new transport.C2CoreError('proto key',{
+      message:'proto key',
+      code:713,
+      canonicalName:'ProtocolViolation',
+      transportPhase:'pre_dispatch',
+      details:Object.defineProperty({keep:'1',dispatch_phase:'pre_dispatch'},'__proto__',{
+        value:'proto-val',enumerable:true,configurable:true,writable:true,
+      }),
+    });
+    const obsQueue=[invalidUtf8RelayErr,innerHttpTransErr,protoDetailErr];
+    const p2Ep={
+      connectionSnapshot(){return null},
+      async prepare(){return binding},
+      beginCall(){return {
+        async chargeInput(){},
+        async dispatch(){return nativeTarget},
+        async next(){const b=Uint8Array.of(1);b.release=()=>{};return b;},
+        checkDeadline(){},cancel(){},close(){},
+        async observe(){return receipt},
+      }},
+      deactivate(){},async close(){},
+    };
+    const p2Ipc=transport.createIpcEncodedTransport('ipc://p2',{
+      connect:async()=>p2Ep,
+      observe(){throw obsQueue.shift();},
+    });
+    try{
+      await assert.rejects(p2Ipc.call('route',contract,'ping',()=>new Uint8Array()),err=>{
+        assert.ok(err instanceof transport.C2HttpRelayError);
+        assert.equal(err.cause,invalidUtf8RelayErr);
+        assert.equal(err.retrySafe,false);
+        assert.equal(err.hasVerifiedUtf8Body,false);
+        return true;
+      });
+      await assert.rejects(p2Ipc.call('route',contract,'ping',()=>new Uint8Array()),err=>{
+        assert.ok(err instanceof transport.C2HttpTransportError);
+        assert.equal(err.cause,innerHttpTransErr);
+        assert.equal(err.retrySafe,false);
+        assert.equal(err.message,'C-Two HTTP transport error: connect failed');
+        return true;
+      });
+      await assert.rejects(p2Ipc.call('route',contract,'ping',()=>new Uint8Array()),err=>{
+        assert.ok(err instanceof transport.C2CoreError);
+        assert.equal(err.cause,protoDetailErr);
+        assert.equal(err.retrySafe,false);
+        assert.equal(Object.getOwnPropertyDescriptor(err.details,'__proto__')?.value,'proto-val');
+        assert.equal(err.details.keep,'1');
+        assert.equal(Object.prototype.hasOwnProperty.call(err.details,'dispatch_phase'),false);
+        return true;
+      });
+    }finally{await p2Ipc.close()}
+  }
+
+  // 14. Stream decode failure & HTTP input encode failure never poison target; reused runtime_retired error still terminates target when thrown by real transport.
+  {
+    let streamDispatches=0;
+    const inner713=new transport.C2CoreError('decode 713',{
+      message:'decode 713',
+      code:713,
+      canonicalName:'ProtocolViolation',
+      transportPhase:'pre_dispatch',
+    });
+    const localBinding={serverId:'s1',serverInstanceId:'i1',connectionId:1n};
+    const streamEp={
+      connectionSnapshot(){return null},
+      async prepare(){return localBinding},
+      beginCall(_route,_method,serverStream){
+        let yielded=false;
+        return {
+          async chargeInput(){},
+          async dispatch(){streamDispatches++;return {...localBinding,path:'RelayAwareLocalIpc'};},
+          async next(){
+            if(!serverStream){const b=Uint8Array.of(99);b.release=()=>{};return b;}
+            if(yielded)return null;
+            yielded=true;
+            const b=Uint8Array.of(42);b.release=()=>{};return b;
+          },
+          checkDeadline(){},cancel(){},close(){},
+          async observe(){return receipt},
+        };
+      },
+      deactivate(){},async close(){},
+    };
+    const streamClient=transport.createRelayAwareHttpEncodedTransport('http://localhost:8300',{
+      ipc:{connect:async()=>streamEp},
+      fetch:async(url)=>{
+        if(url.includes('/_resolve/'))return textReply(200,JSON.stringify([relayRoute(1,true)]));
+        throw new Error(`unexpected HTTP: ${url}`);
+      },
+    });
+    try{
+      const s=streamClient.stream('route',contract,'steps',()=>new Uint8Array(),()=>{throw inner713;});
+      await assert.rejects(s.next(),err=>{
+        assert.ok(err instanceof transport.C2CoreError);
+        assert.equal(err.retrySafe,false);
+        assert.equal(err.transportPhase,null);
+        assert.equal(err.cause,inner713);
+        return true;
+      });
+      await s.close();
+      const followUp=await streamClient.call('route',contract,'ping',()=>new Uint8Array());
+      assert.deepEqual([...followUp],[99]);
+      assert.equal(streamDispatches,2);
+    }finally{await streamClient.close()}
+
+    // HTTP input encode throwing inner 713 does not poison target for subsequent call.
+    let httpPosts=0;
+    const encHttp=transport.createRelayAwareHttpEncodedTransport('http://localhost:8300',{
+      fetch:async(url,init)=>{
+        if(url.includes('/_resolve/'))return textReply(200,JSON.stringify([relayRoute()]));
+        if(url.includes('/_probe/'))return relayResponse();
+        assert.equal(init.method,'POST');
+        httpPosts++;
+        return new Response(Uint8Array.of(7),{status:200,headers:{'content-length':'1'}});
+      },
+    });
+    try{
+      await assert.rejects(encHttp.call('route',contract,'ping',()=>{throw inner713;}),err=>err===inner713);
+      assert.equal(httpPosts,0);
+      const ok=await encHttp.call('route',contract,'ping',()=>new Uint8Array());
+      assert.deepEqual([...ok],[7]);
+      assert.equal(httpPosts,1);
+    }finally{await encHttp.close()}
+
+    // Reused runtime_retired error thrown first by observe() and then by real transport beginCall still marks target terminal on the transport failure.
+    const sharedRetired=new transport.C2IpcTransportError('retired',{
+      message:'retired',
+      category:'runtime_retired',
+      transportPhase:'pre_dispatch',
+    });
+    let callIdx=0,realBeginCalls=0;
+    const reusedEp={
+      connectionSnapshot(){return null},
+      async prepare(){return localBinding},
+      beginCall(){
+        realBeginCalls++;
+        if(realBeginCalls>=2)throw sharedRetired;
+        return {
+          async chargeInput(){},
+          async dispatch(){return {...localBinding,path:'RelayAwareLocalIpc'};},
+          async next(){const b=Uint8Array.of(1);b.release=()=>{};return b;},
+          checkDeadline(){},cancel(){},close(){},
+          async observe(){return receipt},
+        };
+      },
+      deactivate(){},async close(){},
+    };
+    const reusedClient=transport.createRelayAwareHttpEncodedTransport('http://localhost:8300',{
+      ipc:{connect:async()=>reusedEp},
+      observe(){
+        if(callIdx++===0)throw sharedRetired;
+      },
+      fetch:async(url)=>{
+        if(url.includes('/_resolve/'))return textReply(200,JSON.stringify([relayRoute(1,true)]));
+        throw new Error(`unexpected HTTP: ${url}`);
+      },
+    });
+    try{
+      // Call 1: observe() throws sharedRetired -> sanitized, target stays open.
+      await assert.rejects(reusedClient.call('route',contract,'ping',()=>new Uint8Array()),err=>{
+        assert.equal(err.retrySafe,false);
+        assert.equal(err.cause,sharedRetired);
+        return true;
+      });
+      assert.equal(realBeginCalls,1);
+      // Call 2: beginCall() throws sharedRetired -> real transport refusal, marks target terminal!
+      await assert.rejects(reusedClient.call('route',contract,'ping',()=>new Uint8Array()),err=>err===sharedRetired);
+      assert.equal(realBeginCalls,2);
+      // Call 3: target is terminal -> immediately rejects with sharedRetired without calling beginCall again!
+      await assert.rejects(reusedClient.call('route',contract,'ping',()=>new Uint8Array()),err=>err===sharedRetired);
+      assert.equal(realBeginCalls,2);
+    }finally{await reusedClient.close()}
+  }
+
+  // 15. Without global AbortController, fixed-length reader deadline returns 715 promptly; and invalid payload byteLength releases first owner once.
+  {
+    const savedAbortController=globalThis.AbortController;
+    let unblockStream;
+    const streamGate=new Promise(r=>{unblockStream=r;});
+    let noCtrlAlloc=0,noCtrlFree=0;
+    try{
+      globalThis.AbortController=undefined;
+      const noCtrlClient=transport.createRelayAwareHttpEncodedTransport('http://localhost:8300',{
+        callTimeoutMs:35,
+        responsePayloadAllocator(byteLength){
+          noCtrlAlloc++;
+          const view=new Uint8Array(byteLength);
+          return {view,payload:view,release(){noCtrlFree++;}};
+        },
+        fetch:async(url)=>{
+          if(url.includes('/_resolve/'))return textReply(200,JSON.stringify([relayRoute()]));
+          if(url.includes('/_probe/'))return relayResponse();
+          return {
+            status:200,
+            headers:{get(n){return n.toLowerCase()==='content-length'?'4':null;}},
+            body:new ReadableStream({async pull(c){await streamGate;c.close();}}),
+            async arrayBuffer(){throw new Error('must stream');},
+          };
+        },
+      });
+      try{
+        const t0=performance.now();
+        await assert.rejects(noCtrlClient.call('route',contract,'ping',()=>new Uint8Array()),err=>{
+          assert.ok(err instanceof transport.C2CoreError);
+          assert.equal(err.code,715);
+          return true;
+        });
+        const elapsed=performance.now()-t0;
+        assert.ok(elapsed<95,`expected prompt 35ms timeout without AbortController, took ${elapsed.toFixed(1)}ms`);
+        assert.deepEqual({noCtrlAlloc,noCtrlFree},{noCtrlAlloc:1,noCtrlFree:1});
+      }finally{
+        unblockStream();
+        await noCtrlClient.close();
+      }
     }finally{
-      rmSync(emptySdkDir,{recursive:true,force:true});
+      globalThis.AbortController=savedAbortController;
     }
+
+    let ownerCreations=0;
+    const ownerReleases=[];
+    const oneOwnerHttp=transport.createRelayAwareHttpEncodedTransport('http://localhost:8300',{
+      responsePayloadAllocator(byteLength){
+        const view=new Uint8Array(byteLength);
+        return {
+          view,
+          get payload(){
+            const id=++ownerCreations;
+            return {
+              get byteLength(){throw new Error(`byteLength boom #${id}`);},
+              release(){ownerReleases.push(id);},
+            };
+          },
+        };
+      },
+      fetch:async(url)=>{
+        if(url.includes('/_resolve/'))return textReply(200,JSON.stringify([relayRoute()]));
+        if(url.includes('/_probe/'))return relayResponse();
+        return new Response(Uint8Array.of(1,2),{status:200,headers:{'content-length':'2'}});
+      },
+    });
+    try{
+      await assert.rejects(oneOwnerHttp.call('route',contract,'ping',()=>new Uint8Array()),err=>{
+        assert.ok(err instanceof transport.C2HttpTransportError);
+        assert.equal(err.retrySafe,false);
+        return true;
+      });
+      assert.equal(ownerCreations,1);
+      assert.deepEqual(ownerReleases,[1]);
+    }finally{await oneOwnerHttp.close()}
   }
 });
