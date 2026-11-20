@@ -1948,36 +1948,39 @@ def test_bare_ccbase_and_post_dispatch_prepared_close_isolation(tmp_path):
     assert slotted_clean.__notes__ == ['slot-1', 'slot-4']
 
 
-@pytest.mark.skipif(sys.version_info < (3, 11), reason='PEP 678 BaseException.add_note requires Python 3.11+')
-def test_pep678_notes_add_note_and_borrowed_cleanup_isolation():
+def test_notes_and_borrowed_cleanup_isolation():
     import copy
     import pickle
     from c_two.crm.payload_plan import PayloadBinding, PayloadPlanKind
     from c_two.crm.transferable import _build_transfer_wrapper
     from c_two.error import _post_dispatch_cleanup_error
 
-    orig = ResourceClosed('pep678 notes', transport_phase='pre_dispatch')
-    orig.add_note('biz-note')
-    cleaned = _post_dispatch_cleanup_error(orig)
-    cleaned.add_note('cleanup-note')
-    assert orig.__notes__ == ['biz-note']
-    assert cleaned.__notes__ == ['biz-note', 'cleanup-note']
+    if sys.version_info >= (3, 11):
+        orig = ResourceClosed('pep678 notes', transport_phase='pre_dispatch')
+        orig.add_note('biz-note')
+        cleaned = _post_dispatch_cleanup_error(orig)
+        cleaned.add_note('cleanup-note')
+        assert orig.__notes__ == ['biz-note']
+        assert cleaned.__notes__ == ['biz-note', 'cleanup-note']
 
-    pickled = pickle.loads(pickle.dumps(orig))
-    pickled.add_note('pickle-note')
-    assert orig.__notes__ == ['biz-note']
-    assert pickled.__notes__ == ['biz-note', 'pickle-note']
+        pickled = pickle.loads(pickle.dumps(orig))
+        pickled.add_note('pickle-note')
+        assert orig.__notes__ == ['biz-note']
+        assert pickled.__notes__ == ['biz-note', 'pickle-note']
 
-    slotted = _SlottedNotesClosed('slotted pep678', transport_phase='pre_dispatch')
-    slotted.add_note('slot-1')
-    copied = copy.copy(slotted)
-    copied.add_note('slot-2')
-    assert slotted.__notes__ == ['slot-1']
-    assert copied.__notes__ == ['slot-1', 'slot-2']
+        slotted = _SlottedNotesClosed('slotted pep678', transport_phase='pre_dispatch')
+        slotted.add_note('slot-1')
+        copied = copy.copy(slotted)
+        copied.add_note('slot-2')
+        assert slotted.__notes__ == ['slot-1']
+        assert copied.__notes__ == ['slot-1', 'slot-2']
 
-    # Borrowed input invalidation failing after ResourceClosed never mutates original __notes__.
+    # Borrowed input invalidation failing after ResourceClosed never mutates original context or __notes__.
     original_biz = ResourceClosed('borrowed boom', transport_phase='pre_dispatch')
-    original_biz.add_note('biz-note')
+    if sys.version_info >= (3, 11):
+        original_biz.add_note('biz-note')
+    else:
+        original_biz.__notes__ = ['biz-note']
 
     plan = PayloadBinding(
         kind=PayloadPlanKind.FASTDB,
@@ -2004,5 +2007,11 @@ def test_pep678_notes_add_note_and_borrowed_cleanup_isolation():
         wrapped(_FakeContract(), b'payload', _c2_input_buffer_mode='borrowed')
     assert caught.value is not original_biz
     assert caught.value.transport_phase is None
+    assert isinstance(caught.value.__context__, OSError)
+    assert original_biz.__context__ is None
     assert original_biz.__notes__ == ['biz-note']
-    assert any('C-Two cleanup also failed' in n for n in caught.value.__notes__)
+    if sys.version_info >= (3, 11):
+        assert any('C-Two cleanup also failed' in n for n in caught.value.__notes__)
+    else:
+        assert caught.value.__notes__ == ['biz-note']
+        assert caught.value.__notes__ is not original_biz.__notes__

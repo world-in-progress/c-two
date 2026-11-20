@@ -52,7 +52,11 @@ def serve(route: str, server_id: str, anchor: str, journal: str) -> None:
             operation = command.strip()
             if operation == "snapshot":
                 events.drain()
-                print(json.dumps({"calls": resource.snapshot(), "connections": events.records}), flush=True)
+                print(json.dumps({
+                    "calls": resource.snapshot(),
+                    "entered": resource.entered.is_set(),
+                    "connections": events.records,
+                }), flush=True)
             elif operation == "unregister":
                 runtime.unregister(route)
                 print(json.dumps({"unregistered": True}), flush=True)

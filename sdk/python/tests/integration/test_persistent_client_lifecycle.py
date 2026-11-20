@@ -639,19 +639,25 @@ def test_unary_upstream_crash_reads_dispatch_uncertain_through_unified_phase(lab
     try:
         lab.address = old.identity["ipc_address"]
         lab.identity = old.identity
+        if lab.anchor is not None:
+            lab.extra["routes_before_crash"] = lab.wait_route("unary-crash")
         proxy = lab.connect("unary-crash")
         completed = proxy.call("settled")
         assert completed["server_instance_id"] == old.identity["server_instance_id"]
         with ThreadPoolExecutor(max_workers=1) as threads:
-            running = threads.submit(proxy.blocked)
-            wait_state(
-                lambda: old.command("snapshot")["calls"].get("blocked"),
-                lambda entered: entered == 1,
-            )
-            lab.extra["old_killed"] = old.kill()
-            with pytest.raises(cc.error.CCBaseError) as uncertain:
-                running.result(10)
-            running = None
+            try:
+                running = threads.submit(proxy.blocked)
+                wait_state(
+                    lambda: old.command("snapshot"),
+                    lambda snap: snap["calls"].get("blocked") == 1 and snap["entered"],
+                )
+                lab.extra["old_killed"] = old.kill()
+                with pytest.raises(cc.error.CCBaseError) as uncertain:
+                    running.result(10)
+                running = None
+            finally:
+                if not old.stopped:
+                    lab.extra["old_unary_cleanup"] = old.close()
         failure = uncertain.value
         lab.extra["unary_failure"] = {
             "type": type(failure).__name__,
