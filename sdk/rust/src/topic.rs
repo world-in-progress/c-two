@@ -178,6 +178,7 @@ impl<T> Subscription<T> {
             SubscriptionTransport::Remote(sub) => {
                 let delivery = sub.next_delivery()?;
                 let value = (self.decode)(delivery.bytes())?;
+                sub.check_deadline()?;
                 Ok(Delivery {
                     value,
                     seq: delivery.seq(),
@@ -207,6 +208,7 @@ impl<T> Subscription<T> {
                 let seq = delivery.seq();
                 let dropped = delivery.dropped();
                 let held = (self.decode_held)(delivery.into_held())?;
+                sub.check_deadline()?;
                 Ok(Delivery {
                     value: held,
                     seq,

@@ -25,7 +25,9 @@ fn error_value_keeps_outer_transport_phase_when_semantic_details_disagree() {
 
 #[test]
 fn call_error_value_uses_scope_phase_only_for_lifecycle_errors() {
+    let fixture = Fixture::new(64);
     let call = Call {
+        endpoint: unsafe { &*fixture.endpoint }.0.clone(),
         state: Mutex::new(CallData {
             prepared: None,
             charged: 0,
@@ -33,6 +35,7 @@ fn call_error_value_uses_scope_phase_only_for_lifecycle_errors() {
             dispatched: false,
             ready: false,
             stream: None,
+            stream_operation: None,
             unary: None,
             dispatch_target: None,
             error: None,
@@ -159,6 +162,16 @@ unsafe fn metadata(value: *mut C2MemFfiResult) -> Value {
         serde_json::from_str(CStr::from_ptr((*value).json).to_str().unwrap()).unwrap()
     }
 }
+unsafe fn error_details(result: *mut C2MemFfiResult) -> Value {
+    unsafe {
+        let error = c2_mem_ffi_error_parts((*result).error);
+        assert!(!error.is_null());
+        let details = serde_json::from_slice(CStr::from_ptr(error).to_bytes()).unwrap();
+        c2_mem_ffi_result_free(result);
+        details
+    }
+}
+
 struct Fixture {
     _root: tempfile::TempDir,
     _runtime: Runtime,
@@ -522,15 +535,14 @@ fn dispatch_error_keeps_typed_failure_and_original_target() {
         let target = (&*call).0.state.lock().dispatch_target.clone().unwrap();
         assert_eq!(target.path, c2_core::ObservedPath::DirectIpc);
         let ipc = target.ipc.unwrap();
-        let bound = (&*fixture.endpoint)
+        let (identity, observation) = (&*fixture.endpoint)
             .0
             .bindings
             .lock()
-            .clients
+            .observations
             .get("items")
             .cloned()
             .unwrap();
-        let (identity, observation) = bound.ipc.unwrap();
         assert_eq!(ipc.server_identity.server_id, identity.server_id);
         assert_eq!(
             ipc.server_identity.server_instance_id,
@@ -1250,13 +1262,6 @@ fn ipc_subscription_owns_ready_delivery_and_terminal_receipt() {
                 )
             })
         };
-        let error_details = |result: *mut C2MemFfiResult| {
-            let error = c2_mem_ffi_error_parts((*result).error);
-            assert!(!error.is_null());
-            let details: Value = serde_json::from_slice(CStr::from_ptr(error).to_bytes()).unwrap();
-            c2_mem_ffi_result_free(result);
-            details
-        };
         let invalid = error_details(open(c"state", c"{\"start\":null}"));
         assert_eq!(
             invalid["message"],
@@ -1294,59 +1299,31 @@ fn ipc_subscription_owns_ready_delivery_and_terminal_receipt() {
     }
 }
 
-#[cfg(unix)]
 #[test]
-#[ignore = "requires the current c3 executable; set C2_MEM_FFI_TEST_C3 and run with --ignored"]
 fn relay_endpoints_prepare_concurrently_and_share_one_client_domain() {
-    use std::io::{BufRead, BufReader};
-    use std::process::{Child, Command, Stdio};
+    use c2_http::relay::{RelayConfig, RelayServer};
 
-    struct Relay(Child);
-    impl Drop for Relay {
-        fn drop(&mut self) {
-            let _ = self.0.kill();
-            let _ = self.0.wait();
-        }
-    }
     fn start_relay(
-        root: &std::path::Path,
+        runtime: &Runtime,
         host: &Host,
         route: &str,
         server_id: &str,
-    ) -> (Relay, CString) {
-        let executable = std::env::var_os("C2_MEM_FFI_TEST_C3").expect("current c3 executable");
-        let upstream = format!("{route}={server_id}@{}", host.local_endpoint().address());
-        let child = Command::new(executable)
-            .args([
-                "relay",
-                "--bind",
-                "127.0.0.1:0",
-                "--upstream",
-                &upstream,
-                "--ipc-root",
-            ])
-            .arg(root)
-            .env("C2_ENV_FILE", "")
-            .env("C2_RELAY_USE_PROXY", "false")
-            .stdout(Stdio::piped())
-            .spawn()
+    ) -> (RelayServer, CString) {
+        let relay = RelayServer::start_resolved(
+            RelayConfig {
+                bind: "127.0.0.1:0".into(),
+                ..Default::default()
+            },
+            runtime.local_endpoint_context().unwrap(),
+        )
+        .unwrap();
+        relay
+            .register_upstream(route, server_id, host.local_endpoint().address())
             .unwrap();
-        let mut relay = Relay(child);
-        let stdout = relay.0.stdout.take().unwrap();
-        let (tx, rx) = mpsc::channel();
-        std::thread::spawn(move || {
-            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-                if let Some(url) = line.strip_prefix("C-Two relay listening at ") {
-                    if tx.send(url.to_owned()).is_err() {
-                        break;
-                    }
-                }
-            }
-        });
-        let url = CString::new(rx.recv_timeout(WAIT).expect("relay readiness")).unwrap();
+        let url = CString::new(format!("http://{}", relay.local_addr())).unwrap();
         (relay, url)
     }
-    fn host(root: &std::path::Path, id: &str) -> (Runtime, Host) {
+    fn host(_root: &std::path::Path, id: &str) -> (Runtime, Host) {
         let runtime = Runtime::new(RuntimeOptions {
             use_process_relay_anchor: false,
             ..Default::default()
@@ -1355,7 +1332,9 @@ fn relay_endpoints_prepare_concurrently_and_share_one_client_domain() {
         runtime
             .set_local_endpoint_with_sources(
                 LocalEndpointOptions {
-                    unix_root: Some(root.to_owned()),
+                    #[cfg(unix)]
+                    unix_root: Some(_root.to_owned()),
+                    ..Default::default()
                 },
                 ConfigSources::empty(),
             )
@@ -1370,7 +1349,7 @@ fn relay_endpoints_prepare_concurrently_and_share_one_client_domain() {
     let local_root = tempfile::tempdir().unwrap();
     let remote_root = tempfile::tempdir().unwrap();
     let (local_runtime, local_host) = host(local_root.path(), "ffi-local");
-    let (_remote_runtime, remote_host) = host(remote_root.path(), "ffi-remote");
+    let (remote_runtime, remote_host) = host(remote_root.path(), "ffi-remote");
     let release = topic_release();
     let _local = local_host
         .register(topic_definition(&release, "local"))
@@ -1378,9 +1357,8 @@ fn relay_endpoints_prepare_concurrently_and_share_one_client_domain() {
     let _remote = remote_host
         .register(topic_definition(&release, "remote"))
         .unwrap();
-    let (_first, first_url) = start_relay(local_root.path(), &local_host, "local", "ffi-local");
-    let (_second, second_url) =
-        start_relay(remote_root.path(), &remote_host, "remote", "ffi-remote");
+    let (_first, first_url) = start_relay(&local_runtime, &local_host, "local", "ffi-local");
+    let (_second, second_url) = start_relay(&remote_runtime, &remote_host, "remote", "ffi-remote");
 
     let context = C2MemFfiLocalEndpointContext {
         inner: local_runtime.local_endpoint_context().unwrap(),
@@ -1435,7 +1413,13 @@ fn relay_endpoints_prepare_concurrently_and_share_one_client_domain() {
             let first = threads.spawn(|| acquire(local, c"local"));
             let second = threads.spawn(|| acquire(remote, c"remote"));
             assert_eq!(first.join().unwrap()["path"], "RelayAwareLocalIpc");
-            assert_eq!(second.join().unwrap()["path"], "RelayAwareHttp");
+            // Windows endpoints in this process share the same TokenUser namespace.
+            let remote_path = if cfg!(windows) {
+                "RelayAwareLocalIpc"
+            } else {
+                "RelayAwareHttp"
+            };
+            assert_eq!(second.join().unwrap()["path"], remote_path);
         });
         assert_eq!(acquire(explicit, c"local")["path"], "ExplicitRelay");
 
@@ -1466,31 +1450,47 @@ fn relay_endpoints_prepare_concurrently_and_share_one_client_domain() {
         };
         assert_eq!(get_slots(), "2");
         let over_capacity = open(explicit, c"local");
-        let details: Value = serde_json::from_slice(
-            CStr::from_ptr(c2_mem_ffi_error_parts((*over_capacity).error)).to_bytes(),
-        )
-        .unwrap();
-        assert_eq!(details["code"], 717);
-        c2_mem_ffi_result_free(over_capacity);
+        assert_eq!(error_details(over_capacity)["code"], 717);
 
-        let deliver_and_close = |opened: *mut C2MemFfiResult| {
+        let deliver_and_close = |endpoint, route: &CStr, opened: *mut C2MemFfiResult| {
             assert_eq!(metadata(opened)["startSeq"], "1");
             let sub = (*opened).subscription;
             let item = async_result(|c, u| c2_mem_ffi_subscription_next(sub, c, u));
             assert_eq!(metadata(item), json!({"seq":"1","dropped":"0"}));
             assert_eq!((*(*item).buffer).0.bytes(), b"boot");
             c2_mem_ffi_result_free(item);
+
+            let (tx, closed) = mpsc::channel::<usize>();
+            assert_eq!(
+                c2_mem_ffi_endpoint_context_close(
+                    endpoint,
+                    Some(complete),
+                    Box::into_raw(Box::new(tx)).cast()
+                ),
+                C2MemFfiStatus::Ok
+            );
+            assert_eq!(
+                closed.recv_timeout(Duration::from_millis(50)),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            );
+            let refused = error_details(open(endpoint as usize, route));
+            assert_eq!(refused["code"], 707);
+            assert_eq!(refused["transportPhase"], "pre_dispatch");
+
             let terminal = async_result(|c, u| c2_mem_ffi_subscription_close(sub, &5000, c, u));
             let receipt = metadata(terminal);
             assert_eq!(receipt["completed"], true);
             assert_eq!(receipt["completeItems"], "1");
             assert_eq!(receipt["error"]["code"], 718);
             c2_mem_ffi_result_free(terminal);
+            let result = closed.recv_timeout(WAIT).unwrap() as *mut C2MemFfiResult;
+            success(result);
+            c2_mem_ffi_result_free(result);
             c2_mem_ffi_result_free(opened);
         };
-        deliver_and_close(first);
-        deliver_and_close(second);
-        deliver_and_close(open(explicit, c"local"));
+        deliver_and_close(local as *const _, c"local", first);
+        deliver_and_close(remote as *const _, c"remote", second);
+        deliver_and_close(explicit as *const _, c"local", open(explicit, c"local"));
         assert_eq!(get_slots(), "0");
         for handle in [local, remote, explicit] {
             c2_mem_ffi_endpoint_context_free(handle as *mut _);

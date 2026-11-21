@@ -12,6 +12,7 @@ import subprocess
 import sys
 import threading
 import time
+from dataclasses import replace
 
 import pytest
 
@@ -19,8 +20,11 @@ import c_two as cc
 from c_two.error import (
     CCBaseError,
     CallCancelled,
+    CallDeadlineExceeded,
+    ErrorCode,
     ProtocolViolation,
     ResourceClosed,
+    SerializationError,
     SubscriptionLagged,
     UnsupportedCallMode,
 )
@@ -226,6 +230,7 @@ class TestDirectIpcTopics:
         assert next(subscription).value == {'n': 1}
 
         server.unregister('sim')
+        subscription.cancel()
         with pytest.raises(CallCancelled) as cancelled:
             next(subscription)
         assert cancelled.value.code == 718
@@ -243,21 +248,54 @@ class TestDirectIpcTopics:
         assert next(following).value == {'n': 1}
         following.close(timeout=5.0)
 
+    @pytest.mark.parametrize('held', [False, True])
+    def test_remote_decode_deadline_preserves_subscription(self, server_client, held):
+        server, client = server_client
+        registration = _register(server, initial_topics={'state': {'n': 1}})
+        telemetry = client.connect(Telemetry, name='sim', address=server.server_address())
+        bounded = cc.with_call_options(telemetry, timeout=1.0)
+        subscription = cc.hold(bounded.state)() if held else bounded.state()
+        deserialize = subscription._binding.deserialize
+        decoded_values = []
+
+        def slow_decode(payload):
+            value = deserialize(payload)
+            decoded_values.append(value)
+            time.sleep(1.05)
+            return value
+
+        subscription._binding = replace(subscription._binding, deserialize=slow_decode)
+        with pytest.raises(CallDeadlineExceeded) as expired:
+            next(subscription)
+        assert expired.value.code == 715
+        assert decoded_values == [{'n': 1}]
+        assert registration.active_subscribers == 1
+        server.unregister('sim')
+        receipt = subscription.close(timeout=5.0)
+        assert receipt['completed']
+        assert receipt['error'].details['cause'] == 'route_unregistered'
+
+    def test_publish_encode_failure_keeps_sequence(self, server_client):
+        server, _ = server_client
+        publisher = _register(server).publisher('state')
+        assert publisher.publish({'n': 1}) == 1
+        with pytest.raises(SerializationError) as failure:
+            publisher.publish({'unpickleable': lambda: None})
+        assert failure.value.code == ErrorCode.ResourceOutputSerializing == 2
+        assert publisher.publish({'n': 2}) == 2
+
     def test_host_shutdown_ends_subscription_with_718(self, server_client):
         server, client = server_client
-        registration = _register(server)
+        _register(server)
         address = server.server_address()
         proxy = client.connect(Telemetry, name='sim', address=address)
         subscription = proxy.client.subscribe('state')
 
         server.shutdown()
-        with pytest.raises(CCBaseError) as ended:
+        with pytest.raises(CallCancelled) as ended:
             next(subscription)
-        # A stopped host ends the stream between steps with a truthful cause;
-        # a transport-ended connection reports its dispatch-uncertain peer end.
-        assert isinstance(ended.value, CallCancelled) or ended.value.code in (707, 705)
-        if isinstance(ended.value, CallCancelled):
-            assert ended.value.details['cause'] in ('host_shutdown', 'route_unregistered')
+        assert ended.value.code == 718
+        assert ended.value.details['cause'] == 'host_shutdown'
 
 
 # ------------------------------------------------------------------
@@ -365,8 +403,6 @@ class TestNaturalTopicCalls:
         # A finite view timeout bounds the subscription: with nothing ever
         # published, the next delivery expires against the view's deadline
         # instead of waiting forever.
-        from c_two.error import CallDeadlineExceeded
-
         bounded = cc.with_call_options(telemetry, timeout=0.5).state(start='next')
         started = time.monotonic()
         with pytest.raises(CallDeadlineExceeded):

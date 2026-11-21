@@ -705,10 +705,9 @@ class TestPythonHostDirectIpc:
             ticks = registration.publisher("ticks")
             assert _publish(ticks, "v1") == 1
             assert client.read() == {"event": "ticks-first"}
-            assert _publish(ticks, "v2") == 2
-            time.sleep(0.1)
-            for beat in range(3, 8):
+            for beat in range(2, 8):
                 assert _publish(ticks, f"v{beat}") == beat
+            client.send("ticks-burst-done")
             assert client.read() == {"event": "lag-ok"}
 
             # Unregister ends the Rust-side subscription with 718 and the same

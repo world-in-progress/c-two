@@ -408,6 +408,70 @@ test('deadline stops waiting without cancelling the dispatched native call', asy
   assert.equal(cancellations,1);
 });
 
+test('both relay subscription modes preserve unlimited resolution and cap it by a finite caller budget', async () => {
+  for (const [factory, mode] of [
+    [createHttpRelayEncodedTransport, 'explicit_relay'],
+    [createRelayAwareHttpEncodedTransport, 'relay_aware'],
+  ]) {
+    const limits = [];
+    const native = { startSeq: 1n, topic: 'state' };
+    const endpoint = {
+      async prepare(route, identity, limit) { limits.push(limit); },
+      async openSubscription() { return native; },
+    };
+    const transport = factory('http://localhost:8300', {
+      resolveTimeoutMs: 0,
+      async connect(address, options, transportOptions) {
+        assert.equal(transportOptions.mode, mode);
+        return endpoint;
+      },
+    });
+    assert.equal((await transport.subscribe('route', contract, 'state', x => x)).startSeq, 1n);
+    assert.equal(limits[0], undefined);
+    await transport.subscribe('route', contract, 'state', x => x, { timeoutMs: 5_000 });
+    assert.ok(limits[1] > 0 && limits[1] <= 5_000);
+  }
+});
+
+test('topic deadline after decoding drops owners and leaves cancellation to the caller', async () => {
+  for (const hold of [false, true]) {
+    let expired = false;
+    let cancellations = 0;
+    let payloadReleases = 0;
+    let valueReleases = 0;
+    const native = {
+      startSeq: 1n, topic: 'state',
+      async next() {
+        return { done: false, value: { seq: 1n, dropped: 0n, value: buffer([1], () => payloadReleases++) } };
+      },
+      checkDeadline() {
+        if (expired) {
+          const deadline = new Error('deadline during decode');
+          deadline.nativeDetails = { message: deadline.message, code: 715, canonicalName: 'CallDeadlineExceeded', transportPhase: 'dispatch_uncertain' };
+          throw deadline;
+        }
+      },
+      cancel() { cancellations++; },
+      async close() { return receipt; },
+    };
+    const endpoint = {
+      connectionSnapshot() { return null; },
+      async prepare() { return nativeTarget; },
+      async openSubscription() { return native; },
+    };
+    const transport = createIpcEncodedTransport('ipc://test', { connect: async () => endpoint });
+    const sub = await transport.subscribe('route', contract, 'state', () => {
+      expired = true;
+      return { release() { valueReleases++; } };
+    }, {}, hold);
+    await assert.rejects(sub.next(), error => error.code === 715 && error.transportPhase === 'dispatch_uncertain');
+    assert.equal(payloadReleases, 1);
+    assert.equal(valueReleases, 1);
+    assert.equal(cancellations, 0);
+    assert.deepEqual(await sub.close(), receipt);
+  }
+});
+
 test('deadline during dispatch retains native call for later observation', async () => {
   let cancellations=0, observations=0;
   const deadline=new Error('deadline');

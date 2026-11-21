@@ -25,4 +25,5 @@ parking_lot.workspace = true
 tokio = { version = "1", features = ["macros", "net", "rt", "sync", "time"] }
 
 [dev-dependencies]
+c2-http = { version = "0.1.0", path = "../../transport/c2-http", features = ["relay"] }
 tempfile = "3"

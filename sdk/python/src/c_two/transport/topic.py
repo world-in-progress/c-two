@@ -58,7 +58,7 @@ def _native_call(operation, *args, **kwargs):
 
 def _publish_encode_error(exc: BaseException) -> error.SerializationError:
     return error.SerializationError(
-        error.ErrorCode.ClientInputSerializing,
+        error.ErrorCode.ResourceOutputSerializing,
         _safe_error_message(exc),
         details=_cause_details(exc),
         transport_phase='pre_dispatch',
@@ -127,7 +127,7 @@ class Subscription(Generic[T]):
 
     __slots__ = (
         '_native', '_binding', '_held', '_local', '_tracker',
-        '_route_name', '_consumer_cancelled',
+        '_route_name',
     )
 
     def __init__(
@@ -146,7 +146,6 @@ class Subscription(Generic[T]):
         self._local = local
         self._tracker = tracker
         self._route_name = route_name
-        self._consumer_cancelled = False
 
     @property
     def topic_name(self) -> str:
@@ -174,11 +173,10 @@ class Subscription(Generic[T]):
         return self._decode_delivery(seq, dropped, payload)
 
     def _is_consumer_cancel(self, exc: BaseException) -> bool:
-        if not self._consumer_cancelled:
-            return False
-        from ..error import CallCancelled
-
-        return isinstance(exc, CallCancelled)
+        return (
+            isinstance(exc, error.CallCancelled)
+            and exc.details.get('cause') == 'consumer_cancelled'
+        )
 
     def _decode_delivery(self, seq: int, dropped: int, payload):
         if self._local:
@@ -203,6 +201,7 @@ class Subscription(Generic[T]):
         view = None
         value = None
         decoded = False
+        checking_deadline = False
         decoding = False
         invalidator = (
             self._binding.invalidate
@@ -215,6 +214,9 @@ class Subscription(Generic[T]):
             value = self._binding.deserialize(view)
             decoding = False
             decoded = True
+            checking_deadline = True
+            _native_call(self._native.check_deadline)
+            checking_deadline = False
             if self._held:
                 if self._tracker is not None and hasattr(payload, 'track_retained'):
                     payload.track_retained(
@@ -231,6 +233,9 @@ class Subscription(Generic[T]):
                     view, payload, invalidator, value))
             else:
                 _cleanup_preserving_primary(exc, lambda: _release_view_and_response(view, payload))
+            if checking_deadline:
+                value = None
+                raise
             raise _delivery_decode_error(exc, decoding=decoding) from exc
         try:
             _release_view_and_response(view, payload)
@@ -242,12 +247,10 @@ class Subscription(Generic[T]):
 
     def cancel(self) -> None:
         """Submit consumer cancellation without blocking."""
-        self._consumer_cancelled = True
         _native_call(self._native.cancel)
 
     def close(self, timeout: float | None = 30.0) -> TopicCloseReceipt:
         """Cancel and observe the real terminal outcome within *timeout*."""
-        self._consumer_cancelled = True
         if self._local:
             receipt = dict(_native_call(self._native.close))
         else:

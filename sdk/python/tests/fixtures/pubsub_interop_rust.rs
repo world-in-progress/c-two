@@ -336,6 +336,7 @@ fn run_client(address: &str, route: &str) -> Result<(), Box<dyn Error>> {
     let strict_tick = strict.next_delivery()?;
     assert_delivery(&strict_tick, "v1", 1, 0);
     emit(json!({"event": "ticks-first"}));
+    assert_eq!(read_line("ticks burst ack"), "ticks-burst-done");
     let mut last_seq = 1u64;
     let mut saw_skip = false;
     for _ in 0..8 {

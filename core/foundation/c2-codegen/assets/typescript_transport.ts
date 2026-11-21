@@ -873,7 +873,6 @@ class DecodedTopicSubscription<T> implements C2TopicSubscription<T | C2HeldResul
     } catch (error) {
       tryReleaseResponsePayload(buffer);
       tryReleaseStreamValue(decoded);
-      try { this.native.cancel(); } catch { /* Preserve the delivery error. */ }
       throw projectNativeError(error);
     }
   }
@@ -1221,7 +1220,7 @@ function createRelayTransport<Payload extends C2ResponsePayload>(baseUrl: string
     }
     const endpoint = await budget.wait(subscriptionEndpoint);
     requireOpen();
-    const limit = Math.min(resolveTimeoutMs, budget.remaining() ?? resolveTimeoutMs);
+    const limit = budget.stageLimit(resolveTimeoutMs) || undefined;
     await budget.wait(endpoint.prepare(route, requireRouteContractIdentity(contract), limit));
     requireOpen();
     return endpoint;

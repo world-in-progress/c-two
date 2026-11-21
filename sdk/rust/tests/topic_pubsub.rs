@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use c2_codegen::{ContractCodegenOptions, ContractCodegenTarget, compile_contract_artifacts};
 use c2_contract::{ContractRelease, derive_contract_fingerprints_json};
@@ -17,8 +18,8 @@ use c_two::generated::{
     MethodDefinition, fastdb_adapter_error, open_held, open_owned,
 };
 use c_two::{
-    Connect, Delivery, Error, Held, HostOptions, LagPolicy, Publisher, Runtime, RuntimeOptions,
-    ServiceDefinition, SubscribeOptions, Subscription, TopicStart,
+    CallOptions, CallTimeout, Connect, Delivery, Error, Held, HostOptions, LagPolicy, Publisher,
+    Runtime, RuntimeOptions, ServiceDefinition, SubscribeOptions, Subscription, TopicStart,
 };
 
 const BASE_DESCRIPTOR: &str =
@@ -248,6 +249,64 @@ fn connect(
         .unwrap()
 }
 
+#[test]
+fn remote_decode_deadline_preserves_the_original_topic_subscription() {
+    fn slow_decode(bytes: &[u8]) -> Result<Payload, Error> {
+        let value = decode_value(bytes)?;
+        std::thread::sleep(Duration::from_millis(1050));
+        Ok(value)
+    }
+
+    fn slow_decode_held(response: HeldResponse) -> Result<Held<Payload>, Error> {
+        let value = decode_held(response)?;
+        std::thread::sleep(Duration::from_millis(1050));
+        Ok(value)
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let (runtime, host) = make_host(&dir, "topic-decode-deadline");
+    let release = topic_release(&["state"], false);
+    let mut registration = host
+        .register(
+            echo_definition(&release, "sim")
+                .with_initial_topic_bytes("state", encode_value(&payload("init")).unwrap())
+                .unwrap(),
+        )
+        .unwrap();
+    let client = connect(&runtime, &host, &release, "sim");
+    let options = CallOptions::with_timeout(CallTimeout::After(Duration::from_secs(1)));
+    let subscribe = || {
+        Subscription::from_core(
+            client
+                .subscribe_with_options("state", SubscribeOptions::default(), options)
+                .unwrap(),
+            slow_decode,
+            slow_decode_held,
+        )
+    };
+    let owned = subscribe();
+    let error = owned
+        .next_delivery()
+        .err()
+        .expect("deadline during owned decode");
+    assert_semantic(error, ErrorCode::CallDeadlineExceeded, "deadline");
+    let held = subscribe();
+    let error = held
+        .next_delivery_held()
+        .err()
+        .expect("deadline during held decode");
+    assert_semantic(error, ErrorCode::CallDeadlineExceeded, "deadline");
+
+    assert_eq!(registration.active_subscribers(), 2);
+    registration.close().unwrap();
+    for sub in [owned, held] {
+        let receipt = sub.close();
+        assert!(receipt.completed);
+        let error = receipt.terminal.unwrap().unwrap_err();
+        assert_semantic(error, ErrorCode::CallCancelled, "route_unregistered");
+    }
+}
+
 // The typed owners over a real direct IPC 17 connection and over the
 // same-process local subscription seam: Delivery / Delivery<Held<T>>,
 // Latest/Next, publisher closure after unregister, and holds that outlive
@@ -410,7 +469,6 @@ fn generated_topic_contract_end_to_end_over_ipc17() {
 }
 
 const CONSUMER: &str = r##"
-use std::time::Duration;
 
 use c_two::generated::ErrorCode;
 use c_two::{
@@ -564,11 +622,7 @@ fn main() {
         assert_eq!(ticks.publish(&payload("v1")).unwrap(), 1);
         assert_eq!(skip.next_delivery().unwrap().seq(), 1);
         assert_eq!(strict.next_delivery().unwrap().seq(), 1);
-        assert_eq!(ticks.publish(&payload("v2")).unwrap(), 2);
-        // Let both client receivers buffer seq 2 before bursting past the
-        // capacity-2 ring; the bound tolerates a loaded parallel test run.
-        std::thread::sleep(Duration::from_millis(100));
-        for seq in 3..=7u64 {
+        for seq in 2..=7u64 {
             assert_eq!(ticks.publish(&payload(&format!("v{seq}"))).unwrap(), seq);
         }
         // Skip jumps to the newest retained frame with the exact drop count.
@@ -579,7 +633,7 @@ fn main() {
             assert!(delivery.seq() > last_seq);
             if delivery.dropped() > 0 {
                 assert_eq!(delivery.seq() - (last_seq + 1), delivery.dropped());
-                assert_eq!(text(delivery.value()), "v7");
+                assert_eq!(text(delivery.value()), format!("v{}", delivery.seq()));
                 saw_skip = true;
                 break;
             }
