@@ -60,5 +60,6 @@ One new canonical code: **`720 SubscriptionLagged`**, carrying `topic`, `expecte
 ## Benchmarks and stability
 
 - A reproducible benchmark suite (portable payload, stream, fan-out and a Ray 2.56 comparison) records the copy ledger and RSS behavior that motivated ADR 0005: 32 MiB `fresh` frames at `R = 1 → 4` showed 4× write/transfer amplification on direct IPC and a single `c3 relay` hop ([PR #235](https://github.com/world-in-progress/c-two/pull/235)).
+- Paired `4 MiB` and `32 MiB` (`R = 1, 2, 4`) fan-out evaluation on `a84211d0` (`--suite pubsub_fanout` vs `--suite fanout`) confirms O(1) Host pool scaling (`256.13 MiB` flat vs `32 → 64 → 128 MiB` linear growth) and +35%–37% aggregate throughput at `32 MiB, R = 4` across direct IPC (`7.48 vs 5.48 GiB/s`), single-hop `c3 relay` (`5.50 vs 4.06 GiB/s`) and two-tier cross-relay (`4.75 GiB/s`, flat source-relay RSS); see [2026-11-21-pubsub-fanout-benchmark.md](../acceptance/2026-11-21-pubsub-fanout-benchmark.md).
 - `RuntimeSession` lock ordering and generation checks were tightened, and dynamic fork-route stress tests plus the [resident simulation example](../../examples/python/resident_simulation.py) landed with them ([PR #234](https://github.com/world-in-progress/c-two/pull/234)).
 - Idle local topic subscriptions settle immediately on close and cancel instead of waiting for the drain barrier.
