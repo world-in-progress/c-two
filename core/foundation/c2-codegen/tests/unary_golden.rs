@@ -6,9 +6,8 @@ use serde_json::{Value, json};
 fn unary_artifacts_for_all_three_languages_match_the_pre_stream_baseline() {
     // Captured from ba231cdf with the pinned FastDB 0.2.4 Core SDK; the
     // Python rows were recaptured for the generated SerializationError
-    // normalization, and the TypeScript rows when the canonical error
-    // registry gained 720 SubscriptionLagged (ADR 0005), which adds that one
-    // table line to every generated TypeScript module. The corpus includes
+    // normalization, and the TypeScript rows for the ABI 9 transport and
+    // canonical SubscriptionLagged projection (ADR 0005). The corpus includes
     // the shared three-language portable matrix fixtures.
     let baseline: Value =
         serde_json::from_str(include_str!("fixtures/unary-artifacts.json")).unwrap();

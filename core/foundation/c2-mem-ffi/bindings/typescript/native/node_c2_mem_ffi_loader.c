@@ -44,6 +44,12 @@ typedef struct Symbols {
     C2MemFfiStatus (*call_observe)(const C2MemFfiCall *, const uint64_t *, C2MemFfiComplete, void *);
     C2MemFfiStatus (*call_check_deadline)(const C2MemFfiCall *, C2MemFfiError **);
     void (*call_free)(C2MemFfiCall *);
+    C2MemFfiStatus (*sub_open)(const C2MemFfiEndpointContext *, const char *, const char *, const char *, const uint64_t *, C2MemFfiComplete, void *);
+    C2MemFfiStatus (*sub_next)(const C2MemFfiSubscription *, C2MemFfiComplete, void *);
+    C2MemFfiStatus (*sub_cancel)(const C2MemFfiSubscription *);
+    C2MemFfiStatus (*sub_close)(const C2MemFfiSubscription *, const uint64_t *, C2MemFfiComplete, void *);
+    C2MemFfiStatus (*sub_check_deadline)(const C2MemFfiSubscription *, C2MemFfiError **);
+    void (*sub_free)(C2MemFfiSubscription *);
     C2MemFfiStatus (*buffer_data)(const C2MemFfiBuffer *, const uint8_t **, size_t *);
     void (*buffer_release)(C2MemFfiBuffer *);
     const char *(*error_parts)(const C2MemFfiError *);
@@ -173,13 +179,14 @@ static napi_value throw_status(napi_env env, C2MemFfiStatus status) {
     napi_throw(env, error); return NULL;
 }
 
-typedef enum { OWNER_CONTEXT, OWNER_DOMAIN, OWNER_ENDPOINT, OWNER_CALL } OwnerKind;
+typedef enum { OWNER_CONTEXT, OWNER_DOMAIN, OWNER_ENDPOINT, OWNER_CALL, OWNER_SUBSCRIPTION } OwnerKind;
 typedef struct Owner { Symbols *s; void *ptr; OwnerKind kind; } Owner;
 static const napi_type_tag tags[] = {
     { UINT64_C(0x150d476eea241c11), UINT64_C(0x8d9ac802c572b2a1) },
     { UINT64_C(0x150d476eea241c12), UINT64_C(0x8d9ac802c572b2a2) },
     { UINT64_C(0x150d476eea241c13), UINT64_C(0x8d9ac802c572b2a3) },
     { UINT64_C(0x150d476eea241c14), UINT64_C(0x8d9ac802c572b2a4) },
+    { UINT64_C(0x150d476eea241c15), UINT64_C(0x8d9ac802c572b2a5) },
 };
 static void owner_release(Owner *owner) {
     if (owner == NULL || owner->ptr == NULL) return;
@@ -189,6 +196,7 @@ static void owner_release(Owner *owner) {
     case OWNER_DOMAIN: owner->s->domain_free(ptr); break;
     case OWNER_ENDPOINT: owner->s->endpoint_free(ptr); break;
     case OWNER_CALL: owner->s->call_free(ptr); break;
+    case OWNER_SUBSCRIPTION: owner->s->sub_free(ptr); break;
     }
 }
 static void owner_finalizer(napi_env env, void *data, void *hint) {
@@ -313,7 +321,7 @@ static napi_value buffer_view(napi_env env, Symbols *s, C2MemFfiBuffer *buffer) 
     return view;
 }
 
-typedef enum { ASYNC_JSON, ASYNC_VOID, ASYNC_NEXT, ASYNC_OBSERVE } AsyncKind;
+typedef enum { ASYNC_JSON, ASYNC_VOID, ASYNC_NEXT, ASYNC_OBSERVE, ASYNC_SUB_OPEN, ASYNC_SUB_NEXT } AsyncKind;
 #ifdef _WIN32
 typedef CRITICAL_SECTION AsyncMutex;
 static bool async_mutex_init(AsyncMutex *mutex) { return InitializeCriticalSectionAndSpinCount(mutex, 0) != 0; }
@@ -373,6 +381,21 @@ static void async_finalizer(napi_env env, void *data, void *hint) {
     }
     async_drop(operation);
 }
+static napi_value subscription_method(napi_env env, napi_callback_info info);
+
+static bool decimal_bigint(napi_env env, napi_value object, const char *key) {
+    napi_value count, bigint;
+    if (!ok(napi_get_named_property(env, object, key, &count))) return false;
+    if (nullish(env, count)) return true;
+    char *decimal = string(env, count, "Invalid native count.");
+    if (decimal == NULL) return false;
+    char *end = NULL;
+    unsigned long long n = strtoull(decimal, &end, 10);
+    bool valid = *decimal != 0 && *end == 0;
+    free(decimal);
+    return valid && ok(napi_create_bigint_uint64(env, (uint64_t)n, &bigint)) && put(env, object, key, bigint);
+}
+
 static napi_value result_value(napi_env env, Async *operation, C2MemFfiResult *result) {
     if (operation->kind == ASYNC_NEXT) {
         if (result->buffer == NULL) { napi_value none; napi_get_null(env, &none); return none; }
@@ -382,24 +405,33 @@ static napi_value result_value(napi_env env, Async *operation, C2MemFfiResult *r
     if (operation->kind == ASYNC_VOID) { napi_value out; napi_get_undefined(env, &out); return out; }
     if (result->json == NULL) { napi_value none; napi_get_null(env, &none); return none; }
     napi_value out = json_parse(env, result->json);
-    if (out == NULL || operation->kind != ASYNC_OBSERVE) return out;
-    napi_value error; bool has = false;
-    if (ok(napi_has_named_property(env, out, "error", &has)) && has && ok(napi_get_named_property(env, out, "error", &error)) && !nullish(env, error)) {
-        napi_value typed = error_from_details(env, error);
-        if (typed != NULL) put(env, out, "error", typed);
-    }
-    if (ok(napi_has_named_property(env, out, "completeItems", &has)) && has) {
-        napi_value count;
-        if (ok(napi_get_named_property(env, out, "completeItems", &count)) && !nullish(env, count)) {
-            char *decimal = string(env, count, "Invalid native completeItems count.");
-            if (decimal != NULL) {
-                char *end = NULL; unsigned long long n = strtoull(decimal, &end, 10);
-                if (*decimal != 0 && *end == 0) {
-                    napi_value bigint; if (ok(napi_create_bigint_uint64(env, (uint64_t)n, &bigint))) put(env, out, "completeItems", bigint);
-                }
-                free(decimal);
-            }
+    if (out == NULL) return NULL;
+    if (operation->kind == ASYNC_SUB_OPEN) {
+        if (result->subscription == NULL || !decimal_bigint(env, out, "startSeq")) return NULL;
+        C2MemFfiSubscription *sub = result->subscription; result->subscription = NULL;
+        napi_value owner = owner_wrap(env, operation->s, OWNER_SUBSCRIPTION, sub);
+        if (owner == NULL) return NULL;
+        if (!method(env, owner, "next", subscription_method, (void *)1) ||
+            !method(env, owner, "cancel", subscription_method, (void *)2) ||
+            !method(env, owner, "close", subscription_method, (void *)3) ||
+            !method(env, owner, "checkDeadline", subscription_method, (void *)4) ||
+            !put(env, out, "owner", owner)) {
+            owner_release(owner_get(env, owner, OWNER_SUBSCRIPTION, false));
+            return NULL;
         }
+    } else if (operation->kind == ASYNC_SUB_NEXT) {
+        if (result->buffer == NULL || !decimal_bigint(env, out, "seq") || !decimal_bigint(env, out, "dropped")) return NULL;
+        C2MemFfiBuffer *buffer = result->buffer; result->buffer = NULL;
+        napi_value value = buffer_view(env, operation->s, buffer);
+        if (value == NULL || !put(env, out, "value", value)) return NULL;
+    } else if (operation->kind == ASYNC_OBSERVE) {
+        napi_value error;
+        if (!ok(napi_get_named_property(env, out, "error", &error))) return NULL;
+        if (!nullish(env, error)) {
+            napi_value typed = error_from_details(env, error);
+            if (typed == NULL || !put(env, out, "error", typed)) return NULL;
+        }
+        if (!decimal_bigint(env, out, "completeItems")) return NULL;
     }
     return out;
 }
@@ -520,6 +552,7 @@ static napi_value domain_method(napi_env env, napi_callback_info info) {
     if (object == NULL || !method(env, object, "prepare", endpoint_method, (void *)1) ||
         !method(env, object, "connectionSnapshot", endpoint_method, (void *)5) ||
         !method(env, object, "beginCall", endpoint_method, (void *)2) ||
+        !method(env, object, "openSubscription", endpoint_method, (void *)6) ||
         !method(env, object, "deactivate", endpoint_method, (void *)3) ||
         !method(env, object, "close", endpoint_method, (void *)4)) return NULL;
     return object;
@@ -569,6 +602,22 @@ static napi_value endpoint_method(napi_env env, napi_callback_info info) {
         st = s->endpoint_prepare(owner->ptr, route, contract, limit, native_complete, operation);
         free(route); free(contract);
         return async_status(env, operation, st, promise);
+    }
+    if (data == (void *)6) {
+        if (argc < 3) return bad(env, "openSubscription expects route, topic, options and optional timeout.");
+        char *route = string(env, argv[0], "Route name must be a string.");
+        if (route == NULL) return NULL;
+        char *topic = string(env, argv[1], "Topic name must be a string.");
+        if (topic == NULL) { free(route); return NULL; }
+        char *options = json_string(env, argv[2], "Subscription options must be an object.");
+        uint64_t millis = 0; const uint64_t *limit = NULL;
+        if (options == NULL || (argc == 4 && !timeout(env, argv[3], &millis, &limit))) {
+            free(route); free(topic); free(options); return NULL;
+        }
+        napi_value promise; Async *operation = async_new(env, s, ASYNC_SUB_OPEN, &promise);
+        if (operation != NULL) st = s->sub_open(owner->ptr, route, topic, options, limit, native_complete, operation);
+        free(route); free(topic); free(options);
+        return operation == NULL ? NULL : async_status(env, operation, st, promise);
     }
     if (argc != 4) return bad(env, "beginCall expects route, method, stream flag and timeout.");
     char *route = string(env, argv[0], "Route name must be a string.");
@@ -628,7 +677,7 @@ static napi_value call_method(napi_env env, napi_callback_info info) {
             !ok(napi_get_typedarray_info(env, argv[0], &type, &len, &bytes, &arraybuffer, &offset)) ||
             type != napi_uint8_array || (bytes == NULL && len != 0)) return bad(env, "dispatch expects a Uint8Array.");
         operation = async_new(env, s, kind, &promise); if (operation == NULL) return NULL;
-        /* ABI 8 copies borrowed bytes before this function returns. */
+        /* ABI 9 copies borrowed bytes before this function returns. */
         st = s->call_dispatch(owner->ptr, bytes, len, native_complete, operation);
     } else if (data == (void *)3) {
         operation = async_new(env, s, kind, &promise); if (operation == NULL) return NULL;
@@ -639,6 +688,27 @@ static napi_value call_method(napi_env env, napi_callback_info info) {
         operation = async_new(env, s, kind, &promise); if (operation == NULL) return NULL;
         st = s->call_observe(owner->ptr, limit, native_complete, operation);
     }
+    return async_status(env, operation, st, promise);
+}
+static napi_value subscription_method(napi_env env, napi_callback_info info) {
+    size_t argc = 1; napi_value argv[1], self; void *data = NULL;
+    if (!args(env, info, &argc, argv, &self, &data)) return NULL;
+    Owner *owner = owner_get(env, self, OWNER_SUBSCRIPTION, true);
+    if (owner == NULL) return NULL;
+    Symbols *s = owner->s;
+    if (data == (void *)2 || data == (void *)4) {
+        C2MemFfiError *error = NULL;
+        C2MemFfiStatus st = data == (void *)2 ? s->sub_cancel(owner->ptr) : s->sub_check_deadline(owner->ptr, &error);
+        if (st != C2_MEM_FFI_STATUS_OK || error != NULL) return throw_native(env, s, error, st);
+        napi_value out; napi_get_undefined(env, &out); return out;
+    }
+    bool closing = data == (void *)3;
+    uint64_t millis = 0; const uint64_t *limit = NULL;
+    if (closing && argc == 1 && !timeout(env, argv[0], &millis, &limit)) return NULL;
+    napi_value promise; Async *operation = async_new(env, s, closing ? ASYNC_OBSERVE : ASYNC_SUB_NEXT, &promise);
+    if (operation == NULL) return NULL;
+    C2MemFfiStatus st = closing ? s->sub_close(owner->ptr, limit, native_complete, operation)
+        : s->sub_next(owner->ptr, native_complete, operation);
     return async_status(env, operation, st, promise);
 }
 static char *domain_options_json(napi_env env, napi_value options) {
@@ -785,6 +855,12 @@ static bool load_all(napi_env env, Symbols *s) {
     LOAD_REQUIRED(call_observe, "c2_mem_ffi_call_observe");
     LOAD_REQUIRED(call_check_deadline, "c2_mem_ffi_call_check_deadline");
     LOAD_REQUIRED(call_free, "c2_mem_ffi_call_free");
+    LOAD_REQUIRED(sub_open, "c2_mem_ffi_subscription_open");
+    LOAD_REQUIRED(sub_next, "c2_mem_ffi_subscription_next");
+    LOAD_REQUIRED(sub_cancel, "c2_mem_ffi_subscription_cancel");
+    LOAD_REQUIRED(sub_close, "c2_mem_ffi_subscription_close");
+    LOAD_REQUIRED(sub_check_deadline, "c2_mem_ffi_subscription_check_deadline");
+    LOAD_REQUIRED(sub_free, "c2_mem_ffi_subscription_free");
     LOAD_REQUIRED(buffer_data, "c2_mem_ffi_buffer_data");
     LOAD_REQUIRED(buffer_release, "c2_mem_ffi_buffer_release");
     LOAD_REQUIRED(error_parts, "c2_mem_ffi_error_parts");

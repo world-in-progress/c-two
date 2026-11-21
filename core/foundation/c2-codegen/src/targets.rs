@@ -1688,9 +1688,6 @@ function normalizeFastDbPayloadError(error: unknown): unknown {
     }
     output.push_str("]);\n");
     if !topics.is_empty() {
-        // Topic declaration metadata for the ABI 9 Node subscription client.
-        // The transport surface itself arrives with that client; contracts
-        // compiled today only carry the typed identity of each topic.
         output.push_str(
             "\n\
              export interface TopicBinding {\n\
@@ -1711,24 +1708,59 @@ function normalizeFastDbPayloadError(error: unknown): unknown {
         output.push_str("]);\n");
     }
     output.push_str("\nexport class ContractClient {\n  constructor(\n");
-    output.push_str(
-        if methods
-            .iter()
-            .any(|method| method.mode == MethodMode::ServerStream)
-        {
-            "    private readonly transport: C2StreamEncodedClientTransport,\n"
-        } else {
-            "    private readonly transport: C2EncodedClientTransport,\n"
-        },
-    );
+    let stream = methods
+        .iter()
+        .any(|method| method.mode == MethodMode::ServerStream);
+    let transport = match (stream, topics.is_empty()) {
+        (false, true) => "C2EncodedClientTransport",
+        (true, true) => "C2StreamEncodedClientTransport",
+        (false, false) => "C2ClientTransport",
+        (true, false) => "C2StreamEncodedClientTransport & C2ClientTransport",
+    };
+    output.push_str(&format!("    private readonly transport: {transport},\n"));
     output.push_str("    private readonly routeName: string,\n  ) {}\n");
     for method in methods {
         render_typescript_client_method(&mut output, method);
     }
+    for topic in topics {
+        let symbol = topic_symbol(topic.index, topic.name);
+        output.push_str(&format!(
+            "\n  subscribe_{symbol}(options?: TopicSubscribeOptions): Promise<C2TopicSubscription<Payload>> {{\n\
+             \x20   return this.transport.subscribe(this.routeName, CONTRACT, {}, decode_{symbol}_output, options);\n\
+             \x20 }}\n\n\
+             \x20 hold_subscribe_{symbol}(options?: TopicSubscribeOptions): Promise<C2TopicSubscription<C2HeldResult<Payload>>> {{\n\
+             \x20   return this.transport.subscribe(this.routeName, CONTRACT, {}, decode_{symbol}_output, options, true);\n\
+             \x20 }}\n",
+            quoted(topic.name), quoted(topic.name),
+        ));
+    }
     output.push_str("}\n\n");
     for method in methods {
-        render_typescript_direction(&mut output, method, "input", method.input_sha256);
-        render_typescript_direction(&mut output, method, "output", method.output_sha256);
+        let symbol = method_symbol(method.index, method.name);
+        render_typescript_direction(
+            &mut output,
+            &symbol,
+            method.name,
+            "input",
+            method.input_sha256,
+        );
+        render_typescript_direction(
+            &mut output,
+            &symbol,
+            method.name,
+            "output",
+            method.output_sha256,
+        );
+    }
+    for topic in topics {
+        let symbol = topic_symbol(topic.index, topic.name);
+        render_typescript_direction(
+            &mut output,
+            &symbol,
+            topic.name,
+            "output",
+            Some(topic.output_sha256),
+        );
     }
     output.push_str(
         "function decodeAndReleaseResponse<T>(\n\
@@ -1853,11 +1885,11 @@ fn render_typescript_client_method(output: &mut String, method: &TargetMethod<'_
 
 fn render_typescript_direction(
     output: &mut String,
-    method: &TargetMethod<'_>,
+    symbol: &str,
+    name: &str,
     direction: &'static str,
     digest: Option<&str>,
 ) {
-    let symbol = method_symbol(method.index, method.name);
     if let Some(digest) = digest {
         output.push_str(&format!(
             "export function encode_{symbol}_{direction}(payload: Payload): Uint8Array {{\n\
@@ -1892,7 +1924,7 @@ fn render_typescript_direction(
              export function decode_{symbol}_{direction}(data: Uint8Array): void {{\n\
              \x20 requireEmptyPayload({}, {direction:?}, data);\n\
              }}\n\n",
-            quoted(method.name),
+            quoted(name),
         ));
     }
 }

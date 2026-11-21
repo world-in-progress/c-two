@@ -174,7 +174,7 @@ impl Fixture {
     }
     fn with_limits(limits: Value) -> Self {
         let process_state = crate::tests::PROCESS_STATE_LOCK.lock().unwrap();
-        assert_eq!(c2_mem_ffi_abi_version(), 8);
+        assert_eq!(c2_mem_ffi_abi_version(), 9);
         let root = tempfile::tempdir().unwrap();
         let runtime = Runtime::new(RuntimeOptions {
             use_process_relay_anchor: false,
@@ -530,12 +530,13 @@ fn dispatch_error_keeps_typed_failure_and_original_target() {
             .get("items")
             .cloned()
             .unwrap();
-        assert_eq!(ipc.server_identity.server_id, bound.server_id);
+        let (identity, observation) = bound.ipc.unwrap();
+        assert_eq!(ipc.server_identity.server_id, identity.server_id);
         assert_eq!(
             ipc.server_identity.server_instance_id,
-            bound.server_instance_id
+            identity.server_instance_id
         );
-        assert_eq!(ipc.connection_id, bound.observation.connection_id());
+        assert_eq!(ipc.connection_id, observation.connection_id());
         c2_mem_ffi_result_free(dispatched);
         c2_mem_ffi_call_free(call);
     }
@@ -1176,4 +1177,326 @@ fn route_refusal_and_replacement_preserve_other_route_on_same_endpoint() {
     }
     assert_eq!(old_calls.load(Ordering::SeqCst), 1);
     assert_eq!(new_calls.load(Ordering::SeqCst), 2);
+}
+
+fn topic_release() -> ContractRelease {
+    let mut descriptor: Value = serde_json::from_slice(DESCRIPTOR).unwrap();
+    descriptor["topics"] = json!([{
+        "name": "state", "output": {"kind": "payload"},
+        "binding": descriptor["methods"][1]["bindings"]["output"],
+    }]);
+    descriptor["methods"] = json!([]);
+    let fingerprints =
+        c2_contract::derive_contract_fingerprints_json(descriptor.to_string().as_bytes()).unwrap();
+    descriptor["fingerprints"] = json!({
+        "abi_hash": fingerprints.abi_hash(),
+        "signature_hash": fingerprints.signature_hash(),
+    });
+    ContractRelease::from_descriptor_json(descriptor.to_string().as_bytes()).unwrap()
+}
+
+fn topic_definition(release: &ContractRelease, route: &str) -> ServiceDefinition {
+    ServiceDefinition::new(release, release.reference(), route, [], Arc::new(Service))
+        .unwrap()
+        .with_initial_topic_bytes("state", b"boot".to_vec())
+        .unwrap()
+}
+
+fn topic_contract(release: &ContractRelease, route: &str) -> CString {
+    let expected = release.expected_route(route).unwrap();
+    CString::new(
+        json!({
+            "namespace": expected.crm_ns, "name": expected.crm_name, "version": expected.crm_ver,
+            "abiHash": expected.abi_hash, "signatureHash": expected.signature_hash,
+        })
+        .to_string(),
+    )
+    .unwrap()
+}
+
+#[test]
+fn ipc_subscription_owns_ready_delivery_and_terminal_receipt() {
+    let fixture = Fixture::with_limits(json!({"maxOutstandingCalls": 2}));
+    let route = c"telemetry";
+    let release = topic_release();
+    let mut registration = fixture
+        .host
+        .register(topic_definition(&release, "telemetry"))
+        .unwrap();
+    let contract = topic_contract(&release, "telemetry");
+    unsafe {
+        let prepared = async_result(|c, u| {
+            c2_mem_ffi_endpoint_context_prepare(
+                fixture.endpoint,
+                route.as_ptr(),
+                contract.as_ptr(),
+                ptr::null(),
+                c,
+                u,
+            )
+        });
+        success(prepared);
+        c2_mem_ffi_result_free(prepared);
+        let open = |topic: &CStr, options: &CStr| {
+            async_result(|c, u| {
+                c2_mem_ffi_subscription_open(
+                    fixture.endpoint,
+                    route.as_ptr(),
+                    topic.as_ptr(),
+                    options.as_ptr(),
+                    &5000,
+                    c,
+                    u,
+                )
+            })
+        };
+        let error_details = |result: *mut C2MemFfiResult| {
+            let error = c2_mem_ffi_error_parts((*result).error);
+            assert!(!error.is_null());
+            let details: Value = serde_json::from_slice(CStr::from_ptr(error).to_bytes()).unwrap();
+            c2_mem_ffi_result_free(result);
+            details
+        };
+        let invalid = error_details(open(c"state", c"{\"start\":null}"));
+        assert_eq!(
+            invalid["message"],
+            "runtime configuration error: invalid subscription start"
+        );
+
+        let opened = open(c"state", c"{}");
+        assert_eq!(metadata(opened), json!({"startSeq":"1", "topic":"state"}));
+        let sub = std::mem::replace(&mut (*opened).subscription, ptr::null_mut());
+        c2_mem_ffi_result_free(opened);
+        assert_eq!(error_details(open(c"state", c"{}"))["code"], 717);
+        let delivery = async_result(|c, u| c2_mem_ffi_subscription_next(sub, c, u));
+        assert_eq!(metadata(delivery), json!({"seq":"1","dropped":"0"}));
+
+        registration.close().unwrap();
+        let details = error_details(async_result(|c, u| c2_mem_ffi_subscription_next(sub, c, u)));
+        assert_eq!(details["code"], 718);
+        assert_eq!(details["details"]["cause"], "route_unregistered");
+        let receipt = async_result(|c, u| c2_mem_ffi_subscription_close(sub, &5000, c, u));
+        let terminal = metadata(receipt);
+        assert_eq!(terminal["completed"], true);
+        assert_eq!(terminal["completeItems"], "1");
+        assert_eq!(terminal["error"]["code"], 718);
+        c2_mem_ffi_result_free(receipt);
+        c2_mem_ffi_subscription_free(sub);
+
+        let mut data = ptr::null();
+        let mut len = 0;
+        assert_eq!(
+            c2_mem_ffi_buffer_data((*delivery).buffer, &mut data, &mut len),
+            C2MemFfiStatus::Ok
+        );
+        assert_eq!(std::slice::from_raw_parts(data, len), b"boot");
+        c2_mem_ffi_result_free(delivery);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+#[ignore = "requires the current c3 executable; set C2_MEM_FFI_TEST_C3 and run with --ignored"]
+fn relay_endpoints_prepare_concurrently_and_share_one_client_domain() {
+    use std::io::{BufRead, BufReader};
+    use std::process::{Child, Command, Stdio};
+
+    struct Relay(Child);
+    impl Drop for Relay {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    fn start_relay(
+        root: &std::path::Path,
+        host: &Host,
+        route: &str,
+        server_id: &str,
+    ) -> (Relay, CString) {
+        let executable = std::env::var_os("C2_MEM_FFI_TEST_C3").expect("current c3 executable");
+        let upstream = format!("{route}={server_id}@{}", host.local_endpoint().address());
+        let child = Command::new(executable)
+            .args([
+                "relay",
+                "--bind",
+                "127.0.0.1:0",
+                "--upstream",
+                &upstream,
+                "--ipc-root",
+            ])
+            .arg(root)
+            .env("C2_ENV_FILE", "")
+            .env("C2_RELAY_USE_PROXY", "false")
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut relay = Relay(child);
+        let stdout = relay.0.stdout.take().unwrap();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                if let Some(url) = line.strip_prefix("C-Two relay listening at ") {
+                    if tx.send(url.to_owned()).is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+        let url = CString::new(rx.recv_timeout(WAIT).expect("relay readiness")).unwrap();
+        (relay, url)
+    }
+    fn host(root: &std::path::Path, id: &str) -> (Runtime, Host) {
+        let runtime = Runtime::new(RuntimeOptions {
+            use_process_relay_anchor: false,
+            ..Default::default()
+        })
+        .unwrap();
+        runtime
+            .set_local_endpoint_with_sources(
+                LocalEndpointOptions {
+                    unix_root: Some(root.to_owned()),
+                },
+                ConfigSources::empty(),
+            )
+            .unwrap();
+        let host = runtime
+            .host(HostOptions::default().with_server_id(id).without_relay())
+            .unwrap();
+        (runtime, host)
+    }
+
+    let _process_state = crate::tests::PROCESS_STATE_LOCK.lock().unwrap();
+    let local_root = tempfile::tempdir().unwrap();
+    let remote_root = tempfile::tempdir().unwrap();
+    let (local_runtime, local_host) = host(local_root.path(), "ffi-local");
+    let (_remote_runtime, remote_host) = host(remote_root.path(), "ffi-remote");
+    let release = topic_release();
+    let _local = local_host
+        .register(topic_definition(&release, "local"))
+        .unwrap();
+    let _remote = remote_host
+        .register(topic_definition(&release, "remote"))
+        .unwrap();
+    let (_first, first_url) = start_relay(local_root.path(), &local_host, "local", "ffi-local");
+    let (_second, second_url) =
+        start_relay(remote_root.path(), &remote_host, "remote", "ffi-remote");
+
+    let context = C2MemFfiLocalEndpointContext {
+        inner: local_runtime.local_endpoint_context().unwrap(),
+    };
+    let mut domain = ptr::null_mut();
+    let mut error = ptr::null_mut();
+    unsafe {
+        assert_eq!(
+            c2_mem_ffi_client_domain_new(
+                &context,
+                c"{\"maxOutstandingCalls\":3}".as_ptr(),
+                &mut domain,
+                &mut error,
+            ),
+            C2MemFfiStatus::Ok
+        );
+        let endpoint = |address: &CStr, options: &CStr| {
+            let mut endpoint = ptr::null_mut();
+            let mut error = ptr::null_mut();
+            assert_eq!(
+                c2_mem_ffi_endpoint_context_new(
+                    domain,
+                    address.as_ptr(),
+                    options.as_ptr(),
+                    &mut endpoint,
+                    &mut error,
+                ),
+                C2MemFfiStatus::Ok
+            );
+            endpoint
+        };
+        let local = endpoint(&first_url, c"{}") as usize;
+        let remote = endpoint(&second_url, c"{\"mode\":\"relay_aware\"}") as usize;
+        let explicit = endpoint(&first_url, c"{\"mode\":\"explicit_relay\"}") as usize;
+        let acquire = |endpoint: usize, route: &CStr| {
+            let contract = topic_contract(&release, route.to_str().unwrap());
+            let value = async_result(|c, u| {
+                c2_mem_ffi_endpoint_context_prepare(
+                    endpoint as *const _,
+                    route.as_ptr(),
+                    contract.as_ptr(),
+                    &5000,
+                    c,
+                    u,
+                )
+            });
+            let prepared = metadata(value);
+            c2_mem_ffi_result_free(value);
+            prepared
+        };
+        std::thread::scope(|threads| {
+            let first = threads.spawn(|| acquire(local, c"local"));
+            let second = threads.spawn(|| acquire(remote, c"remote"));
+            assert_eq!(first.join().unwrap()["path"], "RelayAwareLocalIpc");
+            assert_eq!(second.join().unwrap()["path"], "RelayAwareHttp");
+        });
+        assert_eq!(acquire(explicit, c"local")["path"], "ExplicitRelay");
+
+        let open = |endpoint: usize, route: &CStr| {
+            async_result(|c, u| {
+                c2_mem_ffi_subscription_open(
+                    endpoint as *const _,
+                    route.as_ptr(),
+                    c"state".as_ptr(),
+                    c"{}".as_ptr(),
+                    &5000,
+                    c,
+                    u,
+                )
+            })
+        };
+        let first = open(local, c"local");
+        let second = open(remote, c"remote");
+        let get_slots = || {
+            let mut stats = ptr::null_mut();
+            assert_eq!(
+                c2_mem_ffi_client_domain_stats(domain, &mut stats),
+                C2MemFfiStatus::Ok
+            );
+            let used = metadata(stats)["call_execution"]["used_operations"].clone();
+            c2_mem_ffi_result_free(stats);
+            used
+        };
+        assert_eq!(get_slots(), "2");
+        let over_capacity = open(explicit, c"local");
+        let details: Value = serde_json::from_slice(
+            CStr::from_ptr(c2_mem_ffi_error_parts((*over_capacity).error)).to_bytes(),
+        )
+        .unwrap();
+        assert_eq!(details["code"], 717);
+        c2_mem_ffi_result_free(over_capacity);
+
+        let deliver_and_close = |opened: *mut C2MemFfiResult| {
+            assert_eq!(metadata(opened)["startSeq"], "1");
+            let sub = (*opened).subscription;
+            let item = async_result(|c, u| c2_mem_ffi_subscription_next(sub, c, u));
+            assert_eq!(metadata(item), json!({"seq":"1","dropped":"0"}));
+            assert_eq!((*(*item).buffer).0.bytes(), b"boot");
+            c2_mem_ffi_result_free(item);
+            let terminal = async_result(|c, u| c2_mem_ffi_subscription_close(sub, &5000, c, u));
+            let receipt = metadata(terminal);
+            assert_eq!(receipt["completed"], true);
+            assert_eq!(receipt["completeItems"], "1");
+            assert_eq!(receipt["error"]["code"], 718);
+            c2_mem_ffi_result_free(terminal);
+            c2_mem_ffi_result_free(opened);
+        };
+        deliver_and_close(first);
+        deliver_and_close(second);
+        deliver_and_close(open(explicit, c"local"));
+        assert_eq!(get_slots(), "0");
+        for handle in [local, remote, explicit] {
+            c2_mem_ffi_endpoint_context_free(handle as *mut _);
+        }
+        c2_mem_ffi_client_domain_free(domain);
+    }
+    let _ = local_host.shutdown();
+    let _ = remote_host.shutdown();
 }

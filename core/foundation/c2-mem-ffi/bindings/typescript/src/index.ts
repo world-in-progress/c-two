@@ -1,6 +1,6 @@
 import { createRequire } from "node:module";
 
-export const C2_MEM_FFI_ABI_VERSION = 8;
+export const C2_MEM_FFI_ABI_VERSION = 9;
 
 export interface NativeErrorDetails {
   readonly message: string;
@@ -38,19 +38,64 @@ export interface NativeCall {
   close(): void;
 }
 
-export interface NativePreparedRoute {
+export interface SubscribeOptions {
+  readonly start?: "latest" | "next";
+  readonly onLag?: "skip" | "error";
+}
+
+export interface TopicDelivery<T> {
+  readonly value: T;
+  readonly seq: bigint;
+  readonly dropped: bigint;
+}
+
+interface NativeSubscription {
+  next(): Promise<TopicDelivery<NativeBuffer> | null>;
+  cancel(): void;
+  close(timeoutMs: number | null): Promise<NativeStreamReceipt>;
+  checkDeadline(): void;
+}
+
+interface NativeSubscriptionOpen {
+  readonly startSeq: bigint;
+  readonly topic: string;
+  readonly owner: NativeSubscription;
+}
+
+export interface SubscriptionHandle extends AsyncIterableIterator<TopicDelivery<NativeBuffer>> {
+  readonly startSeq: bigint;
+  readonly topic: string;
+  /** Each delivered local buffer must be released by its recipient. */
+  next(): Promise<IteratorResult<TopicDelivery<NativeBuffer>, undefined>>;
+  cancel(): void;
+  close(timeoutMs?: number | null): Promise<NativeStreamReceipt>;
+  checkDeadline(): void;
+}
+
+export type NativePreparedRoute =
+  | (NativeIpcIdentity & { readonly path?: "RelayAwareLocalIpc" })
+  | NativeHttpTarget;
+
+interface NativeHttpTarget {
+  readonly path: "ExplicitRelay" | "RelayAwareHttp";
+  readonly serverId: null;
+  readonly serverInstanceId: null;
+  readonly connectionId: null;
+}
+
+interface NativeIpcIdentity {
   readonly serverId: string;
   readonly serverInstanceId: string;
   readonly connectionId: bigint | string;
 }
 
 /** The physical target selected at this call's dispatch handoff. */
-export interface NativeCallDispatchTarget extends NativePreparedRoute {
-  readonly path: "DirectIpc" | "ExplicitRelay" | "RelayAwareLocalIpc" | "RelayAwareHttp";
-}
+export type NativeCallDispatchTarget =
+  | (NativeIpcIdentity & { readonly path: "DirectIpc" | "RelayAwareLocalIpc" })
+  | NativeHttpTarget;
 
 /** Metadata for the physical connection captured by the last successful route preparation. */
-export interface NativeConnectionSnapshot extends NativePreparedRoute {
+export interface NativeConnectionSnapshot extends NativeIpcIdentity {
   readonly endReason: "local_close" | "peer_close_message" | "peer_eof" | "connection_reset" | "protocol_error" | "io_error" | null;
 }
 
@@ -58,11 +103,13 @@ export interface NativeEndpointContext {
   prepare(routeName: string, contract: object, timeoutMs?: number | null): Promise<NativePreparedRoute>;
   connectionSnapshot(routeName: string): NativeConnectionSnapshot | null;
   beginCall(routeName: string, method: string, serverStream: boolean, timeoutMs: number | null): NativeCall;
+  openSubscription(routeName: string, topic: string, options?: SubscribeOptions, timeoutMs?: number | null): Promise<SubscriptionHandle>;
   deactivate(): void;
   close(): Promise<void>;
 }
 
 export interface NativeEndpointOptions {
+  readonly mode?: "relay_aware" | "explicit_relay";
   readonly connectTimeoutMs?: number;
   /** Checked on every acquisition; omission accepts a new instance after peer end. */
   readonly expectedServerIdentity?: { readonly serverId: string; readonly serverInstanceId: string };
@@ -75,7 +122,7 @@ export interface NativeClientDomainOptions {
 }
 
 export interface NativeClientDomain {
-  createEndpoint(address: string, options: NativeEndpointOptions): NativeEndpointContext;
+  createEndpoint(address: string, options: NativeEndpointOptions): NativeEndpoint;
   stats(): object;
   close(): void;
 }
@@ -111,11 +158,11 @@ export interface C2MemFfiLocalEndpointContext {
 
 export interface C2MemFfiLocalEndpointOptions extends C2MemFfiNodeNativeLoadOptions, C2MemFfiLocalEndpointCaptureOptions {
   readonly endpointContext?: C2MemFfiLocalEndpointContext;
-  /** For a loaded ABI 8 addon or a test double; no raw socket injection exists. */
+  /** For a loaded ABI 9 addon or a test double; no raw socket injection exists. */
   readonly nativeSymbols?: C2MemFfiNodeNativeSymbols;
 }
 
-export interface C2NodeIpcConnectorOptions extends C2MemFfiLocalEndpointOptions, NativeEndpointOptions, NativeClientDomainOptions {}
+export interface C2NodeIpcConnectorOptions extends C2MemFfiLocalEndpointOptions, Omit<NativeEndpointOptions, "mode">, NativeClientDomainOptions {}
 
 export type C2NodeIpcConnector = ((address: string, timeoutMs?: number, nativeOptions?: NativeEndpointOptions) => Promise<NativeEndpointContext>) & {
   readonly resolveEndpoint: (address: string) => string;
@@ -204,8 +251,54 @@ class ProjectedCall implements NativeCall {
   close(): void { nativeValue(() => this.native.close()); }
 }
 
+class ProjectedSubscription implements SubscriptionHandle {
+  readonly startSeq: bigint;
+  readonly topic: string;
+  private readonly native: NativeSubscription;
+  private nextPending = false;
+
+  constructor(opened: NativeSubscriptionOpen) {
+    this.native = opened.owner;
+    this.startSeq = opened.startSeq;
+    this.topic = opened.topic;
+  }
+
+  [Symbol.asyncIterator](): this { return this; }
+
+  async next(): Promise<IteratorResult<TopicDelivery<NativeBuffer>, undefined>> {
+    if (this.nextPending) throw new C2MemFfiBindingError("concurrent next on one subscription");
+    this.nextPending = true;
+    try {
+      const delivery = await nativePromise(() => this.native.next());
+      return delivery === null
+        ? { done: true, value: undefined }
+        : { done: false, value: Object.freeze(delivery) };
+    } finally {
+      this.nextPending = false;
+    }
+  }
+
+  async return(): Promise<IteratorResult<TopicDelivery<NativeBuffer>, undefined>> {
+    await this.close();
+    return { done: true, value: undefined };
+  }
+
+  cancel(): void { nativeValue(() => this.native.cancel()); }
+
+  async close(timeoutMs: number | null = 30_000): Promise<NativeStreamReceipt> {
+    const receipt = await nativePromise(() => this.native.close(timeoutMs));
+    return { ...receipt, error: receipt.error === null ? null : projectNativeError(receipt.error) };
+  }
+
+  checkDeadline(): void { nativeValue(() => this.native.checkDeadline()); }
+}
+
+type NativeEndpoint = Omit<NativeEndpointContext, "openSubscription"> & {
+  openSubscription(routeName: string, topic: string, options: SubscribeOptions, timeoutMs: number | null): Promise<NativeSubscriptionOpen>;
+};
+
 class ProjectedEndpoint implements NativeEndpointContext {
-  constructor(private readonly native: NativeEndpointContext) {}
+  constructor(private readonly native: NativeEndpoint) {}
   prepare(routeName: string, contract: object, timeoutMs?: number | null): Promise<NativePreparedRoute> {
     return nativePromise(() => timeoutMs === undefined
       ? this.native.prepare(routeName, contract)
@@ -216,6 +309,9 @@ class ProjectedEndpoint implements NativeEndpointContext {
   }
   beginCall(routeName: string, method: string, serverStream: boolean, timeoutMs: number | null): NativeCall {
     return new ProjectedCall(nativeValue(() => this.native.beginCall(routeName, method, serverStream, timeoutMs)));
+  }
+  async openSubscription(routeName: string, topic: string, options: SubscribeOptions = {}, timeoutMs: number | null = null): Promise<SubscriptionHandle> {
+    return new ProjectedSubscription(await nativePromise(() => this.native.openSubscription(routeName, topic, options, timeoutMs)));
   }
   deactivate(): void { nativeValue(() => this.native.deactivate()); }
   close(): Promise<void> { return nativePromise(() => this.native.close()); }
@@ -467,7 +563,7 @@ export function createNodeIpcConnector(options: C2NodeIpcConnectorOptions = {}):
       throw new C2NodeIpcConnectionError("C-Two native endpoint options must be an object.");
     }
     for (const key of Object.keys(nativeOptions)) {
-      if (key !== "connectTimeoutMs" && key !== "expectedServerIdentity") {
+      if (key !== "connectTimeoutMs" && key !== "expectedServerIdentity" && key !== "mode") {
         throw new C2NodeIpcConnectionError(`C-Two native endpoint has unknown option ${key}.`);
       }
     }
@@ -476,7 +572,7 @@ export function createNodeIpcConnector(options: C2NodeIpcConnectorOptions = {}):
     const clientDomain = freeze();
     const definedOverrides = Object.fromEntries(Object.entries(nativeOptions).filter(([, value]) => value !== undefined)) as NativeEndpointOptions;
     const mergedOptions: NativeEndpointOptions = {
-      ...endpointOptions,
+      ...(address.startsWith("ipc://") ? endpointOptions : {}),
       ...(options.connectTimeoutMs === undefined ? {} : { connectTimeoutMs: options.connectTimeoutMs }),
       ...definedOverrides,
       ...(timeoutMs === undefined ? {} : { connectTimeoutMs: timeoutMs }),

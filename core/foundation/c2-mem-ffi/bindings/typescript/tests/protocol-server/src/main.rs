@@ -1,13 +1,13 @@
-//! Real c2-server peer for the Node IPC 16 / ABI 8 gate. No Python or FastDB.
+//! Real c2-server peer for the Node IPC 17 / ABI 9 gate. No Python or FastDB.
 use c2_config::{ConfigResolver, ConfigSources, EnvCatalog, LocalEndpointOptions};
-use c2_contract::ContractRelease;
+use c2_contract::{ContractRelease, derive_contract_fingerprints_json};
 use c2_server::{
     ConcurrencyMode, CrmCallback, CrmError, CrmStream, CrmStreamCallback, CrmStreamItem,
     ResponseMeta, RouteBuildSpec, SchedulerLimits, Server, ServerIpcConfig,
 };
 use serde_json::json;
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     io::Write,
     sync::{
         Arc, Condvar, Mutex,
@@ -162,14 +162,30 @@ async fn main() {
     .unwrap();
     let endpoint = context.endpoint(&args[1]).unwrap();
     let server = Arc::new(Server::new_with_endpoint(endpoint, ServerIpcConfig::default()).unwrap());
-    let release = ContractRelease::from_descriptor_json(DESCRIPTOR).unwrap();
+    let topics_enabled = args.get(2).is_some_and(|mode| mode == "topics");
+    let release = if topics_enabled {
+        let mut descriptor: serde_json::Value = serde_json::from_slice(DESCRIPTOR).unwrap();
+        descriptor["topics"] = json!([{
+            "name": "state", "output": {"kind": "payload"},
+            "binding": descriptor["methods"][1]["bindings"]["output"],
+        }]);
+        let fingerprints =
+            derive_contract_fingerprints_json(descriptor.to_string().as_bytes()).unwrap();
+        descriptor["fingerprints"] = json!({
+            "abi_hash": fingerprints.abi_hash(),
+            "signature_hash": fingerprints.signature_hash(),
+        });
+        ContractRelease::from_descriptor_json(descriptor.to_string().as_bytes()).unwrap()
+    } else {
+        ContractRelease::from_descriptor_json(DESCRIPTOR).unwrap()
+    };
     let descriptor = release.descriptor();
     let gate = Arc::new(Gate::default());
     let unary_gate = Arc::new(Gate::default());
     let unary_dispatches = Arc::new(AtomicUsize::new(0));
     let stream_dispatches = Arc::new(AtomicUsize::new(0));
     let route_for_generation = |generation| {
-        server
+        let route = server
             .build_stream_route(
                 RouteBuildSpec {
                     name: "echo".into(),
@@ -192,9 +208,19 @@ async fn main() {
                 }),
                 descriptor,
             )
-            .unwrap()
+            .unwrap();
+        if !topics_enabled {
+            return (route, None);
+        }
+        let topics = server.create_route_topics(
+            release.expected_route("echo").unwrap(),
+            &BTreeMap::from([("state".into(), Default::default())]),
+        );
+        let publisher = topics.publisher("state").unwrap();
+        publisher.publish(vec![generation]).unwrap();
+        (route.with_topics(topics), Some(publisher))
     };
-    let route = route_for_generation(0);
+    let (route, mut publisher) = route_for_generation(0);
     server
         .commit_reserved_route(server.reserve_route(route).await.unwrap())
         .await
@@ -219,6 +245,21 @@ async fn main() {
         if line == "quit" {
             break;
         }
+        if let Some(bytes) = line.strip_prefix("publish ") {
+            let value: u8 = bytes.parse().unwrap();
+            let seq = publisher.as_ref().unwrap().publish(vec![value]).unwrap();
+            emit(json!({"kind": "published", "seq": seq}));
+        }
+        if let Some(range) = line.strip_prefix("publish_burst ") {
+            let (first, last) = range.split_once(' ').unwrap();
+            let first: u8 = first.parse().unwrap();
+            let last: u8 = last.parse().unwrap();
+            let publisher = publisher.as_ref().unwrap();
+            let seqs: Vec<_> = (first..=last)
+                .map(|value| publisher.publish(vec![value]).unwrap())
+                .collect();
+            emit(json!({"kind": "published_burst", "seqs": seqs}));
+        }
         if line == "stats" {
             emit(
                 json!({"kind": "stats", "allocations": server.response_pool_arc().read().stats().alloc_count,
@@ -239,7 +280,8 @@ async fn main() {
             emit(json!({"kind": "route_removed"}));
         }
         if line == "register_replacement" {
-            let route = route_for_generation(1);
+            let (route, next_publisher) = route_for_generation(1);
+            publisher = next_publisher;
             server
                 .commit_reserved_route(server.reserve_route(route).await.unwrap())
                 .await

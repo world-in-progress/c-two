@@ -60,7 +60,6 @@ fn source<'a>(set: &'a c2_codegen::ContractArtifactSet, target: ContractCodegenT
         ContractCodegenTarget::Rust => "rust/c_two_contract.rs",
         ContractCodegenTarget::Python => "python/c_two_contract.py",
         ContractCodegenTarget::TypeScript => "typescript/c_two_contract.ts",
-        _ => unreachable!("three codegen targets"),
     };
     std::str::from_utf8(set.get(path).expect("target module").bytes()).expect("UTF-8 source")
 }
@@ -246,7 +245,7 @@ fn python_import_matrix_follows_stream_and_topic_presence() {
 }
 
 #[test]
-fn typescript_target_carries_topic_subscription_metadata() {
+fn typescript_target_generates_typed_topic_subscriptions() {
     let set = generate(
         &mixed_descriptor(&["state"]),
         ContractCodegenTarget::TypeScript,
@@ -254,6 +253,9 @@ fn typescript_target_carries_topic_subscription_metadata() {
     let typescript = source(&set, ContractCodegenTarget::TypeScript);
     let state_digest = output_digest(&mixed_descriptor(&["state"]));
     for required in [
+        "  subscribe_topic_0_state(options?: TopicSubscribeOptions): Promise<C2TopicSubscription<Payload>>",
+        "  hold_subscribe_topic_0_state(options?: TopicSubscribeOptions): Promise<C2TopicSubscription<C2HeldResult<Payload>>>",
+        "export function decode_topic_0_state_output(data: Uint8Array): Payload",
         "export interface TopicBinding {",
         "  readonly index: number;",
         "  readonly name: string;",
@@ -269,9 +271,9 @@ fn typescript_target_carries_topic_subscription_metadata() {
 }
 
 #[test]
-fn topicless_contracts_omit_every_topic_surface_in_all_targets() {
+fn topicless_contracts_omit_contract_topic_symbols_in_all_targets() {
     // `unary_golden.rs` pins the artifact hashes; this test pins the semantic
-    // half of the invariant: no topic text leaks into topicless modules.
+    // half of the invariant: topicless modules emit no contract topic symbols.
     let fixtures = [
         include_str!("../../../../tests/fixtures/contracts/portable-release.contract.json"),
         include_str!("../../../../tests/fixtures/contracts/portable-no-payload.contract.json"),

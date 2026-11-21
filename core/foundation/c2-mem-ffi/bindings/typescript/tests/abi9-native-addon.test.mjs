@@ -12,25 +12,25 @@ const nativeLibrary = resolve(import.meta.dirname, '../dist/native',
   process.platform === 'win32' ? 'c2_mem_ffi.dll' :
     process.platform === 'darwin' ? 'libc2_mem_ffi.dylib' : 'libc2_mem_ffi.so');
 
-test('ABI 7 is rejected before any other symbol is loaded', () => {
-  const directory = mkdtempSync(resolve(tmpdir(), 'c2-abi7-addon-'));
+test('ABI 8 is rejected before any other symbol is loaded', () => {
+  const directory = mkdtempSync(resolve(tmpdir(), 'c2-abi8-addon-'));
   try {
     const source = resolve(directory, 'stale.rs');
     const library = resolve(directory, process.platform === 'win32' ? 'stale.dll' :
       process.platform === 'darwin' ? 'stale.dylib' : 'stale.so');
-    writeFileSync(source, '#[unsafe(no_mangle)] pub extern "C" fn c2_mem_ffi_abi_version() -> u32 { 7 }');
+    writeFileSync(source, '#[unsafe(no_mangle)] pub extern "C" fn c2_mem_ffi_abi_version() -> u32 { 8 }');
     const result = spawnSync(process.env.RUSTC ?? 'rustc',
       ['--edition=2024', '--crate-type=cdylib', source, '-o', library], { encoding: 'utf8' });
     assert.equal(result.status, 0, result.stderr);
-    assert.throws(() => addon.load(library), /ABI version 7.*expected version 8/);
+    assert.throws(() => addon.load(library), /ABI version 8.*expected version 9/);
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }
 });
 
-test('ABI 8 exposes native domain, endpoint, call and captured configuration', async () => {
+test('ABI 9 exposes native domain, endpoint, call and captured configuration', async () => {
   const symbols = addon.load(nativeLibrary);
-  assert.equal(symbols.c2_mem_ffi_abi_version(), 8);
+  assert.equal(symbols.c2_mem_ffi_abi_version(), 9);
   const context = symbols.captureEndpointContext(null);
   assert.equal(typeof context.endpointName('ipc://addon-shape'), 'string');
   assert.equal(typeof context.namespaceId(), 'string');
@@ -56,7 +56,7 @@ test('ABI 8 exposes native domain, endpoint, call and captured configuration', a
 test('native next uses an external buffer and releases it once after detaching aliases', {
   skip: process.platform === 'win32' && 'The C fixture uses pthreads; the real Windows addon is covered by native integration.',
 }, async () => {
-  const directory = mkdtempSync(resolve(tmpdir(), 'c2-abi8-buffer-'));
+  const directory = mkdtempSync(resolve(tmpdir(), 'c2-abi9-buffer-'));
   try {
     const addonSource = readFileSync(new URL('../native/node_c2_mem_ffi_loader.c', import.meta.url), 'utf8');
     const required = [...addonSource.matchAll(/LOAD_REQUIRED\(\w+, "([^"]+)"\)/g)].map(match => match[1]);
@@ -76,13 +76,13 @@ test('native next uses an external buffer and releases it once after detaching a
       #include <stdio.h>
       #include <stdlib.h>
       #include <pthread.h>
-      typedef struct { void *buffer; void *error; const char *json; } Result;
+      typedef struct { void *buffer; void *error; const char *json; void *subscription; } Result;
       typedef void (*Complete)(void *, Result *);
       static unsigned char bytes[] = {9,8,7};
       static unsigned releases = 0;
       static unsigned call_frees = 0;
       static char stats[80];
-      uint32_t c2_mem_ffi_abi_version(void) { return 8; }
+      uint32_t c2_mem_ffi_abi_version(void) { return 9; }
       uint32_t c2_mem_ffi_client_domain_new(void *ctx, const char *options, void **out, void **error) {
         (void)ctx; (void)options; *out = (void *)1; *error = NULL; return 0;
       }
@@ -387,8 +387,8 @@ test('native next uses an external buffer and releases it once after detaching a
   }
 });
 
-test('ABI 8 native completion survives Worker termination after a pending call', { timeout: 30_000 }, async () => {
-  const directory = mkdtempSync(resolve(tmpdir(), 'c2-abi8-late-callback-'));
+test('ABI 9 native completion survives Worker termination after a pending call', { timeout: 30_000 }, async () => {
+  const directory = mkdtempSync(resolve(tmpdir(), 'c2-abi9-late-callback-'));
   try {
     const addonSource = readFileSync(new URL('../native/node_c2_mem_ffi_loader.c', import.meta.url), 'utf8');
     const required = [...addonSource.matchAll(/LOAD_REQUIRED\(\w+, "([^"]+)"\)/g)].map(match => match[1]);
@@ -403,14 +403,14 @@ test('ABI 8 native completion survives Worker termination after a pending call',
       process.platform === 'darwin' ? 'late.dylib' : 'late.so');
     writeFileSync(source, `
       use std::{ffi::{c_char, c_void}, sync::Mutex};
-      #[repr(C)] pub struct Result { buffer: *mut c_void, error: *mut c_void, json: *const c_char }
+      #[repr(C)] pub struct Result { buffer: *mut c_void, error: *mut c_void, json: *const c_char, subscription: *mut c_void }
       type Complete = extern "C" fn(*mut c_void, *mut Result);
       static PENDING: Mutex<Option<(usize, usize)>> = Mutex::new(None);
       static STATS: &[u8] = b"{\\"completed\\":1}\\0";
       fn result(json: *const c_char) -> *mut Result {
-        Box::into_raw(Box::new(Result { buffer: std::ptr::null_mut(), error: std::ptr::null_mut(), json }))
+        Box::into_raw(Box::new(Result { buffer: std::ptr::null_mut(), error: std::ptr::null_mut(), json, subscription: std::ptr::null_mut() }))
       }
-      #[unsafe(no_mangle)] pub extern "C" fn c2_mem_ffi_abi_version() -> u32 { 8 }
+      #[unsafe(no_mangle)] pub extern "C" fn c2_mem_ffi_abi_version() -> u32 { 9 }
       #[unsafe(no_mangle)] pub unsafe extern "C" fn c2_mem_ffi_client_domain_new(
           _: *const c_void, _: *const c_char, out: *mut *mut c_void, error: *mut *mut c_void) -> u32 {
         unsafe { *out = 1usize as *mut c_void; *error = std::ptr::null_mut(); } 0

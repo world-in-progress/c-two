@@ -26,12 +26,12 @@ function buildServer() {
   return executable;
 }
 
-async function withServer(run, domainLimits = {}) {
+async function withServer(run, domainLimits = {}, mode = "calls") {
   const server = buildServer();
   const directory = mkdtempSync(resolve(tmpdir(), 'c2n8-'));
   const root = resolve(directory, 'ipc'); mkdirSync(root, {mode: 0o700});
-  const address = `ipc://node-abi8-${process.pid}-${Math.random().toString(16).slice(2)}`;
-  const child = spawn(server, [process.platform === 'win32' ? '-' : root, address], {stdio: ['pipe', 'pipe', 'pipe']});
+  const address = `ipc://node-abi9-${process.pid}-${Math.random().toString(16).slice(2)}`;
+  const child = spawn(server, [process.platform === 'win32' ? '-' : root, address, mode], {stdio: ['pipe', 'pipe', 'pipe']});
   const lines = createInterface({input: child.stdout})[Symbol.asyncIterator]();
   let stderr = ''; child.stderr.on('data', b => { stderr += b; });
   const closed = new Promise(resolve => child.once('exit', code => resolve(code)));
@@ -58,6 +58,104 @@ async function withServer(run, domainLimits = {}) {
     assert.equal(code, 0, stderr);
   }
 }
+
+test('ABI 9 IPC topics deliver READY, lag policy, terminal receipts and independent holds', {timeout: 150_000}, async () => {
+  await withServer(async ({connector, address, contract, child, lines, createIpcEncodedTransport}) => {
+    const transport = createIpcEncodedTransport(address, {connect: connector});
+    const endpoint = await connector(address);
+    const streams = [];
+    let decodedBytes;
+    const command = async (request) => {
+      child.stdin.write(request + '\n');
+      return JSON.parse((await lines.next()).value);
+    };
+    const subscribe = async (options, hold) => {
+      const stream = await transport.subscribe('echo', contract, 'state', bytes => {
+        decodedBytes = bytes.subarray();
+        return bytes[0];
+      }, options, hold);
+      streams.push(stream);
+      return stream;
+    };
+    try {
+      await endpoint.prepare('echo', contract);
+      await assert.rejects(endpoint.openSubscription('echo', 'state', {onLag: 'invalid'}), /invalid subscription onLag/);
+      await assert.rejects(endpoint.openSubscription('echo', 'missing'), error => error.code === 713);
+      const latest = await subscribe(undefined, true);
+      assert.equal(latest.topic, 'state');
+      assert.equal(latest.startSeq, 1n);
+      const first = (await latest.next()).value;
+      assert.equal(first.seq, 1n);
+      assert.equal(first.dropped, 0n);
+      assert.equal(first.value.value, 0);
+      assert.ok(Object.isFrozen(first));
+
+      const next = await subscribe({start: 'next', onLag: 'skip'});
+      const lagging = await subscribe({start: 'next', onLag: 'error'});
+      assert.equal(next.startSeq, 2n);
+      assert.equal(lagging.startSeq, 2n);
+      const burst = await command('publish_burst 2 8');
+      assert.deepEqual(burst, {kind: 'published_burst', seqs: [2, 3, 4, 5, 6, 7, 8]});
+      let received = 0n;
+      let previous = 1n;
+      let totalDropped = 0n;
+      let lastDelivery;
+      while (previous < 8n) {
+        const {value: delivery} = await next.next();
+        assert.ok(delivery.seq > previous && delivery.seq <= 8n);
+        received++;
+        assert.equal(delivery.dropped, delivery.seq - previous - 1n);
+        totalDropped += delivery.dropped;
+        previous = delivery.seq;
+        lastDelivery = delivery;
+      }
+      assert.ok(totalDropped > 0n, "expected a lagged delivery");
+      assert.equal(lastDelivery.seq, 8n);
+      assert.equal(lastDelivery.value, 8);
+      assert.equal(decodedBytes.byteLength, 0, "automatic delivery detached its local buffer");
+      let buffered = 0n;
+      await assert.rejects(async () => {
+        for (const seq of burst.seqs) {
+          const {value: delivery} = await lagging.next();
+          assert.equal(delivery.seq, BigInt(seq));
+          assert.equal(delivery.dropped, 0n);
+          buffered++;
+        }
+      }, error => error.code === 720 && BigInt(error.details.dropped) > 0n);
+      const lagReceipt = await lagging.close();
+      assert.equal(lagReceipt.completed, true);
+      assert.equal(lagReceipt.error.code, 720);
+      assert.equal(lagReceipt.completeItems, buffered);
+
+      const pending = next.next();
+      await assert.rejects(next.next(), /concurrent next/);
+      assert.equal((await command('publish 9')).seq, 9);
+      assert.deepEqual((await pending).value, {value: 9, seq: 9n, dropped: 0n});
+      const receipt = await next.close();
+      assert.equal(receipt.completed, true);
+      assert.equal(receipt.error.code, 718);
+      assert.equal(receipt.error.details.cause, 'consumer_cancelled');
+      assert.equal(receipt.completeItems, received + 1n);
+
+      assert.equal((await command('replace')).kind, 'route_removed');
+      await assert.rejects(async () => {
+        for (let count = 0; count < 4; count++) await latest.next();
+      }, error => error.code === 718 && error.details.cause === 'route_unregistered');
+      assert.equal((await command('register_replacement')).kind, 'route_replaced');
+      const reopened = await subscribe(undefined);
+      assert.deepEqual((await reopened.next()).value, {value: 1, seq: 1n, dropped: 0n});
+
+      assert.equal(first.value.value, 0);
+      const alias = first.value.buffer.subarray();
+      first.value.release();
+      assert.equal(alias.byteLength, 0);
+    } finally {
+      await Promise.allSettled(streams.map(stream => stream.close(2_000)));
+      await endpoint.close();
+      await transport.close();
+    }
+  }, {}, 'topics');
+});
 
 test('connector reports lossless client domain limits after preparing a route', {timeout: 150_000}, async () => {
   await withServer(async ({connector, address, contract}) => {
@@ -108,7 +206,7 @@ async function takeItem(call, expectedLength, value) {
   } finally { item.release(); }
 }
 
-test('ABI 8 native endpoint completes unary calls and reuses the connector domain', {timeout: 150_000}, async () => {
+test('ABI 9 native endpoint completes unary calls and reuses the connector domain', {timeout: 150_000}, async () => {
   await withServer(async ({connector, address, lines, child, contract}) => {
     const first = await connector(address);
     try {
@@ -130,7 +228,7 @@ test('ABI 8 native endpoint completes unary calls and reuses the connector domai
   });
 });
 
-test('ABI 8 same-endpoint re-registration reaches the current resource without a route UID', {timeout: 150_000}, async () => {
+test('ABI 9 same-endpoint re-registration reaches the current resource without a route UID', {timeout: 150_000}, async () => {
   await withServer(async ({connector, address, contract, lines, child}) => {
     const endpoint = await connector(address);
     try {
@@ -156,7 +254,7 @@ test('ABI 8 same-endpoint re-registration reaches the current resource without a
   });
 });
 
-test('ABI 8 real IPC backing survives view GC and release survives backing GC', {timeout: 150_000}, async () => {
+test('ABI 9 real IPC backing survives view GC and release survives backing GC', {timeout: 150_000}, async () => {
   await withServer(async ({address, contract, root}) => {
     const script = `
       import assert from 'node:assert/strict';
@@ -222,7 +320,7 @@ test('closing one same-address endpoint leaves the other endpoint callable', {ti
   });
 });
 
-test('ABI 8 server streams deliver zero, one and many inline or large items', {timeout: 150_000}, async () => {
+test('ABI 9 server streams deliver zero, one and many inline or large items', {timeout: 150_000}, async () => {
   await withServer(async ({connector, address, contract}) => {
     const endpoint = await connector(address);
     try {
@@ -238,7 +336,7 @@ test('ABI 8 server streams deliver zero, one and many inline or large items', {t
   });
 });
 
-test('ABI 8 stream retains completed item count after a resource error', {timeout: 150_000}, async () => {
+test('ABI 9 stream retains completed item count after a resource error', {timeout: 150_000}, async () => {
   await withServer(async ({connector, address, contract}) => {
     const endpoint = await connector(address);
     try {
@@ -259,7 +357,7 @@ test('ABI 8 stream retains completed item count after a resource error', {timeou
   });
 });
 
-test('ABI 8 handles two streams and concurrent unary calls on one endpoint', {timeout: 150_000}, async () => {
+test('ABI 9 handles two streams and concurrent unary calls on one endpoint', {timeout: 150_000}, async () => {
   await withServer(async ({connector, address, contract}) => {
     const endpoint = await connector(address);
     try {
@@ -281,7 +379,7 @@ test('ABI 8 handles two streams and concurrent unary calls on one endpoint', {ti
   });
 });
 
-test('ABI 8 completes a second unary while the first is blocked on the same connection', {timeout: 150_000}, async () => {
+test('ABI 9 completes a second unary while the first is blocked on the same connection', {timeout: 150_000}, async () => {
   await withServer(async ({connector, address, contract, lines, child}) => {
     const endpoint = await connector(address);
     try {
@@ -307,7 +405,7 @@ test('ABI 8 completes a second unary while the first is blocked on the same conn
   });
 });
 
-test('ABI 8 settles a gated native call after its Worker environment terminates', {timeout: 150_000}, async () => {
+test('ABI 9 settles a gated native call after its Worker environment terminates', {timeout: 150_000}, async () => {
   await withServer(async ({address, contract, root, lines, child}) => {
     const workerSource = `
       const {parentPort, workerData} = require('node:worker_threads');
@@ -350,7 +448,7 @@ test('ABI 8 settles a gated native call after its Worker environment terminates'
 });
 
 for (const cause of ['shutdown', 'unregister']) {
-  test(`ABI 8 ${cause} delivers the running step before cancelling an unlimited stream`, {timeout: 150_000}, async () => {
+  test(`ABI 9 ${cause} delivers the running step before cancelling an unlimited stream`, {timeout: 150_000}, async () => {
     await withServer(async ({connector, address, contract, lines, child}) => {
       const endpoint = await connector(address);
       try {
@@ -381,7 +479,7 @@ for (const cause of ['shutdown', 'unregister']) {
   });
 }
 
-test('ABI 8 cancellation observes pending cleanup, then completes after a host barrier', {timeout: 150_000}, async () => {
+test('ABI 9 cancellation observes pending cleanup, then completes after a host barrier', {timeout: 150_000}, async () => {
   await withServer(async ({connector, address, contract, lines, child}) => {
     const endpoint = await connector(address);
     try {
@@ -483,7 +581,7 @@ test('public stream deadline leaves the original record running and later report
   });
 });
 
-test('ABI 8 unary preparation observes a native rejection after its caller deadline', {timeout: 150_000}, async () => {
+test('ABI 9 unary preparation observes a native rejection after its caller deadline', {timeout: 150_000}, async () => {
   await withServer(async ({connector, address, contract, lines, child, createIpcEncodedTransport}) => {
     let clock = 0, rejectPreparation, preparations = 0;
     const late = new Promise((_resolve, reject) => { rejectPreparation = reject; });
@@ -525,7 +623,7 @@ test('ABI 8 unary preparation observes a native rejection after its caller deadl
   });
 });
 
-test('ABI 8 unary preparation and encoding share the pre-dispatch deadline', {timeout: 150_000}, async () => {
+test('ABI 9 unary preparation and encoding share the pre-dispatch deadline', {timeout: 150_000}, async () => {
   await withServer(async ({connector, address, contract, lines, child, createIpcEncodedTransport}) => {
     const transport = createIpcEncodedTransport(address, {connect: connector, callTimeoutMs: 1});
     try {
