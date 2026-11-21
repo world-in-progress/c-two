@@ -640,13 +640,16 @@ pub struct PyRuntimeSession {
 /// minted from this registration against later same-name registrations.
 pub(crate) struct SessionRegistration {
     route_name: String,
+    observer: c2_core::RegistrationObserver,
     registration: Mutex<Option<Registration>>,
 }
 
 impl SessionRegistration {
     fn new(route_name: String, registration: Registration) -> Arc<Self> {
+        let observer = registration.observer();
         Arc::new(Self {
             route_name,
+            observer,
             registration: Mutex::new(Some(registration)),
         })
     }
@@ -672,10 +675,7 @@ impl SessionRegistration {
     }
 
     fn active_subscribers(&self) -> usize {
-        self.registration
-            .lock()
-            .as_ref()
-            .map_or(0, c2_core::Registration::active_subscribers)
+        self.observer.active_subscribers()
     }
 
     /// Remove and close the inner registration, reporting its native outcome.

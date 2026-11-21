@@ -522,7 +522,9 @@ class TestRegistrationHandleDuringDrain:
                     'publisher() blocked behind the unregister drain'
                 )
                 started = time.monotonic()
-                registration.active_subscribers
+                assert registration.active_subscribers == 1, (
+                    'active_subscribers must reflect the draining subscriber until drain completes'
+                )
                 assert time.monotonic() - started < 1.0
                 assert unregister.is_alive(), 'drain finished before the stall ended'
 
@@ -532,6 +534,7 @@ class TestRegistrationHandleDuringDrain:
             finally:
                 unregister.join(timeout=20.0)
             assert outcome.get('ok'), outcome
+            assert registration.active_subscribers == 0
         finally:
             if subscriber.poll() is None:
                 subscriber.send_signal(signal.SIGCONT)
