@@ -24,6 +24,18 @@ impl ConnectionControl {
     pub(crate) fn is_blocked(&self) -> bool {
         self.blocked.load(Ordering::Acquire)
     }
+    /// A control handle without a live stream, for tests that drive blocked
+    /// or aborted states without a real connection.
+    #[cfg(test)]
+    pub(crate) fn for_tests() -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            blocked: AtomicBool::new(false),
+            aborted: AtomicBool::new(false),
+            read_waker: AtomicWaker::new(),
+            write_waker: AtomicWaker::new(),
+            changed: Notify::new(),
+        })
+    }
     /// End this HTTP/1 connection without appending another record to a
     /// response whose current write is blocked partway through a frame.
     pub(crate) fn abort(&self) {
@@ -41,7 +53,7 @@ impl ConnectionControl {
         waker.register(cx.waker());
         self.aborted.load(Ordering::Acquire)
     }
-    fn set_blocked(&self, blocked: bool) {
+    pub(crate) fn set_blocked(&self, blocked: bool) {
         if self.blocked.swap(blocked, Ordering::AcqRel) != blocked {
             self.changed.notify_waiters();
             self.changed.notify_one();
@@ -69,8 +81,11 @@ impl Listener for RelayListener {
             let (stream, address) = match self.0.accept().await {
                 Ok(value) => value,
                 Err(error) => {
+                    // Persistent OS errors such as EMFILE must back off rather
+                    // than spin: a bare yield would busy-loop and flood the
+                    // log while the condition holds.
                     tracing::warn!(%error, "relay accept failed");
-                    tokio::task::yield_now().await;
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                     continue;
                 }
             };

@@ -96,11 +96,47 @@ impl TopicHubTable {
             .filter_map(Weak::upgrade)
             .collect();
         for hub in hubs {
-            let cancel = hub.inner.lock().source_cancel.clone();
+            let (cancel, wait) = {
+                let state = hub.inner.lock();
+                (state.source_cancel.clone(), state.upstream_wait.clone())
+            };
+            // Hubs whose upstream is still opening have no source handle yet;
+            // the wait token is what unblocks their driver.
+            wait.cancel();
             if let Some(cancel) = cancel {
                 cancel.cancel(CancelCause::Lifecycle);
             }
         }
+    }
+
+    /// Evict one stalled TCP reader that holds old topic memory, searching
+    /// the requesting hub first and then every other hub sharing this relay's
+    /// budget domain. Without the cross-hub pass, a reader that stopped
+    /// reading one topic could starve every other topic's frame reception
+    /// forever.
+    fn evict_stalled_across(
+        &self,
+        current: &Arc<Hub>,
+        shutdown: &tokio_util::sync::CancellationToken,
+    ) -> bool {
+        if current.evict_stalled(shutdown) {
+            return true;
+        }
+        let hubs: Vec<_> = self
+            .hubs
+            .lock()
+            .values()
+            .filter_map(Weak::upgrade)
+            .collect();
+        for hub in hubs {
+            if Arc::ptr_eq(&hub, current) {
+                continue;
+            }
+            if hub.evict_stalled(shutdown) {
+                return true;
+            }
+        }
+        false
     }
 
     /// The live local hub's source for one registration, if its upstream is
@@ -266,6 +302,11 @@ struct HubState {
     next_subscriber: u64,
     source: Option<HubSynchronizer>,
     source_cancel: Option<HubCancel>,
+    /// Cancelled as soon as this hub stops needing an upstream that may still
+    /// be opening: relay shutdown, the last downstream leaving, or a terminal
+    /// outcome. The driver's opening waits select on it so a stalled source
+    /// cannot hold the shutdown or the slot hostage.
+    upstream_wait: tokio_util::sync::CancellationToken,
     history: VecDeque<LatestFrame>,
     latest: Option<LatestFrame>,
     latest_eligible: HashSet<u64>,
@@ -274,6 +315,11 @@ struct HubState {
     retired: Vec<Weak<Subscriber>>,
     terminal: Option<C2Error>,
     closing: bool,
+    /// Set once `run_source` finished the real upstream cleanup. Distinct
+    /// from `terminal`: a confirm refusal may make the hub terminal for
+    /// downstream readers long before the old upstream has drained, and the
+    /// last admission slot must stay held until that drain completes.
+    upstream_done: bool,
     last_hold: Option<Arc<Subscriber>>,
 }
 
@@ -360,21 +406,25 @@ impl TopicSource {
 
     async fn completion(&mut self) -> Result<Option<C2Error>, C2Error> {
         match self {
-            Self::Ipc(source) => source.completion().await.map_err(upstream_error).map(
-                |terminal| {
-                    Some(
-                        terminal
-                            .error
-                            .unwrap_or_else(|| {
-                                C2Error::new(
-                                    ErrorCode::ProtocolViolation,
-                                    "subscription ended without an error",
-                                )
-                            })
-                            .clone(),
-                    )
-                },
-            ),
+            Self::Ipc(source) => {
+                source
+                    .completion()
+                    .await
+                    .map_err(upstream_error)
+                    .map(|terminal| {
+                        Some(
+                            terminal
+                                .error
+                                .unwrap_or_else(|| {
+                                    C2Error::new(
+                                        ErrorCode::ProtocolViolation,
+                                        "subscription ended without an error",
+                                    )
+                                })
+                                .clone(),
+                        )
+                    })
+            }
             Self::Http(source) => source.completion().await,
         }
     }
@@ -423,9 +473,12 @@ impl Drop for JoinGuard {
             let mut state = hub.inner.lock();
             state.joiners -= 1;
             state.prune_history();
-            if state.joiners == 0 && state.subscribers.is_empty() && state.terminal.is_none() {
+            if state.joiners == 0 && state.subscribers.is_empty() && !state.upstream_done {
+                // Even a hub already made terminal by a confirm refusal holds
+                // its last slot until the upstream drain completes.
                 state.closing = true;
                 state.last_hold = Some(self.subscriber.clone());
+                state.upstream_wait.cancel();
             }
             drop(state);
             hub.changed.notify_waiters();
@@ -457,6 +510,16 @@ impl Hub {
         if state.latest_eligible.is_empty() {
             state.latest.take();
         }
+        state.upstream_wait.cancel();
+        drop(state);
+        self.changed.notify_waiters();
+    }
+    /// Complete the upstream cleanup: release the last held admission slot
+    /// and mark the upstream drained so no later leave can re-hold it.
+    fn finish_upstream(&self) {
+        let mut state = self.inner.lock();
+        state.last_hold.take();
+        state.upstream_done = true;
         drop(state);
         self.changed.notify_waiters();
     }
@@ -476,11 +539,15 @@ impl Hub {
         if state.terminal.is_some() && state.latest_eligible.is_empty() {
             state.latest.take();
         }
-        if state.subscribers.is_empty() && state.joiners == 0 && state.terminal.is_none() {
+        if state.subscribers.is_empty() && state.joiners == 0 && !state.upstream_done {
+            // Hold the last subscriber (and its admission slot) until the
+            // upstream drain finishes, even when a confirm refusal already
+            // made the hub terminal for downstream readers.
             state.closing = true;
             state.last_hold = Some(subscriber.clone());
             state.history.clear();
             state.latest.take();
+            state.upstream_wait.cancel();
         }
         drop(state);
         self.changed.notify_waiters();
@@ -717,9 +784,7 @@ pub(crate) async fn subscribe_remote(
         tracked,
         connection,
         None,
-        move |hub| {
-            drive_remote(driver_state, hub, driver_entry, expected, driver_topic)
-        },
+        move |hub| drive_remote(driver_state, hub, driver_entry, expected, driver_topic),
     )
     .await
 }
@@ -1389,19 +1454,26 @@ async fn drive(
     binding: RouteBinding,
 ) {
     let shutdown = relay.forwarding.shutdown_token();
+    let upstream_wait = hub.inner.lock().upstream_wait.clone();
     let client = lease.client();
     let options = WireSubscribeOptions {
         start: WireTopicStart::Latest,
         on_lag: WireLagPolicy::Skip,
     };
-    let source = match client
-        .forward_subscribe_bound(&binding, &topic_name, options)
-        .await
-    {
+    // A hub still opening has no source handle to cancel, so its OPEN and
+    // attestation waits select on the hub's wait token: shutdown, the last
+    // downstream leaving, or a terminal outcome unblocks a stalled source.
+    let source = match tokio::select! {
+        source = client.forward_subscribe_bound(&binding, &topic_name, options) => source,
+        _ = upstream_wait.cancelled() => {
+            abandon_opening(&relay, &hub, &shutdown);
+            return;
+        }
+    } {
         Ok(source) => source,
         Err(error) => {
             hub.fail(upstream_error(error));
-            hub.inner.lock().last_hold.take();
+            hub.finish_upstream();
             relay.topics.remove(&hub);
             return;
         }
@@ -1409,16 +1481,23 @@ async fn drive(
     // OPEN follows a name rather than carrying a UID. Confirm after OPEN, then
     // use SYNC on that subscription so a replaced registration cannot be
     // mistaken for the route whose UID keys this hub.
-    let attestation = client
-        .attest_route_for_registration(&c2_contract::ExpectedRouteContract {
-            route_name: route.name.clone(),
-            crm_ns: route.crm_ns.clone(),
-            crm_name: route.crm_name.clone(),
-            crm_ver: route.crm_ver.clone(),
-            abi_hash: route.abi_hash.clone(),
-            signature_hash: route.signature_hash.clone(),
-        })
-        .await;
+    let attestation_expected = c2_contract::ExpectedRouteContract {
+        route_name: route.name.clone(),
+        crm_ns: route.crm_ns.clone(),
+        crm_name: route.crm_name.clone(),
+        crm_ver: route.crm_ver.clone(),
+        abi_hash: route.abi_hash.clone(),
+        signature_hash: route.signature_hash.clone(),
+    };
+    let attestation = tokio::select! {
+        attestation = client.attest_route_for_registration(&attestation_expected) => attestation,
+        _ = upstream_wait.cancelled() => {
+            let _ = source.cancellation().cancel(CancelCause::Consumer);
+            let _ = source.completion().await;
+            abandon_opening(&relay, &hub, &shutdown);
+            return;
+        }
+    };
     let valid = attestation
         .as_ref()
         .is_ok_and(|attested| Some(attested.route_uid.as_str()) == route.route_uid.as_deref())
@@ -1432,7 +1511,7 @@ async fn drive(
             ErrorCode::ResourceUnavailable,
             "route registration changed while opening subscription",
         ));
-        hub.inner.lock().last_hold.take();
+        hub.finish_upstream();
         relay.topics.remove(&hub);
         return;
     }
@@ -1443,6 +1522,23 @@ async fn drive(
     );
     run_source(relay, hub, TopicSource::Ipc(source)).await;
     drop(lease);
+}
+
+/// Fail a hub whose opening wait was cancelled by the hub's wait token, after
+/// any caller-owned source cleanup, and finish its upstream lifecycle.
+fn abandon_opening(
+    relay: &Arc<RelayState>,
+    hub: &Arc<Hub>,
+    shutdown: &tokio_util::sync::CancellationToken,
+) {
+    let cause = if shutdown.is_cancelled() {
+        cancellation("relay_shutdown")
+    } else {
+        cancellation("consumer_cancelled")
+    };
+    hub.fail(cause);
+    hub.finish_upstream();
+    relay.topics.remove(hub);
 }
 
 /// Open the single cross-relay upstream for a hub whose route this relay knows
@@ -1457,16 +1553,23 @@ async fn drive_remote(
     topic_name: String,
 ) {
     let shutdown = relay.forwarding.shutdown_token();
+    let upstream_wait = hub.inner.lock().upstream_wait.clone();
     let client = crate::relay_client_builder_with_proxy(relay.config().use_proxy)
         .build()
         .expect("c-two: failed to build reqwest Client for relay traffic");
-    let opened = match open_remote_upstream(client.clone(), &entry.relay_url, &expected, &topic_name)
-        .await
-    {
+    // A hub still opening has no source handle to cancel, so the cross-relay
+    // subscription request selects on the hub's wait token.
+    let opened = match tokio::select! {
+        opened = open_remote_upstream(client.clone(), &entry.relay_url, &expected, &topic_name) => opened,
+        _ = upstream_wait.cancelled() => {
+            abandon_opening(&relay, &hub, &shutdown);
+            return;
+        }
+    } {
         Ok(opened) => opened,
         Err(error) => {
             hub.fail(error);
-            hub.inner.lock().last_hold.take();
+            hub.finish_upstream();
             relay.topics.remove(&hub);
             return;
         }
@@ -1479,7 +1582,7 @@ async fn drive_remote(
             ErrorCode::ResourceUnavailable,
             "route registration changed while opening subscription",
         ));
-        hub.inner.lock().last_hold.take();
+        hub.finish_upstream();
         relay.topics.remove(&hub);
         return;
     }
@@ -1489,7 +1592,6 @@ async fn drive_remote(
         &expected,
         &topic_name,
         &opened.registration,
-        relay.forwarding.budget().clone(),
     ));
     hub.set_source(
         HubSynchronizer::Remote(confirm),
@@ -1533,6 +1635,7 @@ async fn run_source(relay: Arc<RelayState>, hub: Arc<Hub>, mut source: TopicSour
                 }
                 match receive_frame(
                     relay.forwarding.budget(),
+                    &relay.topics,
                     &hub,
                     &shutdown,
                     &mut source,
@@ -1604,12 +1707,13 @@ async fn run_source(relay: Arc<RelayState>, hub: Arc<Hub>, mut source: TopicSour
         }
     };
     hub.fail(outcome);
-    hub.inner.lock().last_hold.take();
+    hub.finish_upstream();
     relay.topics.remove(&hub);
 }
 
 async fn receive_frame(
     budget: &DomainBudget,
+    topics: &TopicHubTable,
     hub: &Arc<Hub>,
     shutdown: &tokio_util::sync::CancellationToken,
     source: &mut TopicSource,
@@ -1709,7 +1813,7 @@ async fn receive_frame(
             source.cancellation().cancel(CancelCause::Consumer);
             return Ok(None);
         }
-        if hub.evict_stalled(shutdown) {
+        if topics.evict_stalled_across(hub, shutdown) {
             tokio::task::yield_now().await;
             continue;
         }
@@ -2193,8 +2297,205 @@ mod tests {
             "the original slot belongs to upstream cleanup"
         );
         old.fail(cancellation("consumer_cancelled"));
-        old.inner.lock().last_hold.take();
+        old.finish_upstream();
         let (_permit, _tracked) = domain.admit_subscription().unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_isolated_hub_holds_its_last_slot_until_the_upstream_drains() {
+        let domain = ForwardingDomain::new(DomainBudget::from_limits(&c2_config::DomainLimits {
+            max_outstanding_calls: 1,
+            ..Default::default()
+        }));
+        let table = TopicHubTable::default();
+        let (permit, tracked) = domain.admit_subscription().unwrap();
+        let subscriber = Arc::new(Subscriber {
+            _permit: permit,
+            _tracked: tracked,
+            connection: None,
+            detached: AtomicBool::new(false),
+            selected: AtomicBool::new(false),
+            frame_started: AtomicBool::new(false),
+            evicted: AtomicBool::new(false),
+            unsent: Mutex::new(VecDeque::new()),
+            next_seq: AtomicU64::new(1),
+            sequence_exhausted: AtomicBool::new(false),
+            inflight_chunks: AtomicUsize::new(0),
+            changed: Notify::new(),
+        });
+        let key = HubKey {
+            scope: HubScope::Local {
+                instance: "i".into(),
+                route_uid: "r".into(),
+            },
+            topic: "state".into(),
+        };
+        let (hub, _, guard) = table.join(key, subscriber.clone()).await;
+        // A confirm refusal isolates the hub for downstream readers while its
+        // old HTTP upstream is still draining: terminal, but not drained.
+        hub.fail(C2Error::new(ErrorCode::ResourceNotFound, "route gone"));
+        drop(guard);
+        drop(subscriber);
+        assert!(
+            domain.admit_subscription().is_err(),
+            "the last slot belongs to the draining upstream"
+        );
+        // `run_source` completes the upstream cleanup and releases the slot.
+        hub.finish_upstream();
+        let (_permit, _tracked) = domain.admit_subscription().unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_and_last_leave_cancel_the_upstream_wait_token() {
+        let domain = ForwardingDomain::new(DomainBudget::from_limits(
+            &c2_config::DomainLimits::default(),
+        ));
+        let table = TopicHubTable::default();
+        let make_subscriber = || {
+            let (permit, tracked) = domain.admit_subscription().unwrap();
+            Arc::new(Subscriber {
+                _permit: permit,
+                _tracked: tracked,
+                connection: None,
+                detached: AtomicBool::new(false),
+                selected: AtomicBool::new(false),
+                frame_started: AtomicBool::new(false),
+                evicted: AtomicBool::new(false),
+                unsent: Mutex::new(VecDeque::new()),
+                next_seq: AtomicU64::new(1),
+                sequence_exhausted: AtomicBool::new(false),
+                inflight_chunks: AtomicUsize::new(0),
+                changed: Notify::new(),
+            })
+        };
+        // The last downstream leaves while the driver is still opening.
+        let (first, _, guard) = table
+            .join(
+                HubKey {
+                    scope: HubScope::Local {
+                        instance: "i".into(),
+                        route_uid: "a".into(),
+                    },
+                    topic: "state".into(),
+                },
+                make_subscriber(),
+            )
+            .await;
+        let wait = first.inner.lock().upstream_wait.clone();
+        assert!(!wait.is_cancelled());
+        drop(guard);
+        assert!(
+            wait.is_cancelled(),
+            "the last downstream leaving must unblock the opening wait"
+        );
+        // Relay shutdown reaches even hubs with no source handle yet.
+        let (second, _, guard) = table
+            .join(
+                HubKey {
+                    scope: HubScope::Local {
+                        instance: "i".into(),
+                        route_uid: "b".into(),
+                    },
+                    topic: "state".into(),
+                },
+                make_subscriber(),
+            )
+            .await;
+        let wait = second.inner.lock().upstream_wait.clone();
+        assert!(!wait.is_cancelled());
+        table.cancel_sources_for_shutdown();
+        assert!(
+            wait.is_cancelled(),
+            "shutdown must cancel an opening upstream's wait"
+        );
+        drop(guard);
+    }
+
+    #[tokio::test]
+    async fn a_stalled_reader_on_one_topic_frees_memory_for_another() {
+        let domain = ForwardingDomain::new(DomainBudget::from_limits(
+            &c2_config::DomainLimits::default(),
+        ));
+        let table = TopicHubTable::default();
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let (permit, tracked) = domain.admit_subscription().unwrap();
+        let stalled_control = ConnectionControl::for_tests();
+        let stalled = Arc::new(Subscriber {
+            _permit: permit,
+            _tracked: tracked,
+            connection: Some(stalled_control.clone()),
+            detached: AtomicBool::new(false),
+            selected: AtomicBool::new(false),
+            frame_started: AtomicBool::new(false),
+            evicted: AtomicBool::new(false),
+            unsent: Mutex::new(VecDeque::new()),
+            next_seq: AtomicU64::new(1),
+            sequence_exhausted: AtomicBool::new(false),
+            inflight_chunks: AtomicUsize::new(0),
+            changed: Notify::new(),
+        });
+        let (topic_x, _, guard_x) = table
+            .join(
+                HubKey {
+                    scope: HubScope::Local {
+                        instance: "i".into(),
+                        route_uid: "x".into(),
+                    },
+                    topic: "state".into(),
+                },
+                stalled.clone(),
+            )
+            .await;
+        drop(guard_x);
+        let (permit, tracked) = domain.admit_subscription().unwrap();
+        let healthy = Arc::new(Subscriber {
+            _permit: permit,
+            _tracked: tracked,
+            connection: None,
+            detached: AtomicBool::new(false),
+            selected: AtomicBool::new(false),
+            frame_started: AtomicBool::new(false),
+            evicted: AtomicBool::new(false),
+            unsent: Mutex::new(VecDeque::new()),
+            next_seq: AtomicU64::new(1),
+            sequence_exhausted: AtomicBool::new(false),
+            inflight_chunks: AtomicUsize::new(0),
+            changed: Notify::new(),
+        });
+        let (topic_y, _, guard_y) = table
+            .join(
+                HubKey {
+                    scope: HubScope::Local {
+                        instance: "i".into(),
+                        route_uid: "y".into(),
+                    },
+                    topic: "state".into(),
+                },
+                healthy.clone(),
+            )
+            .await;
+        drop(guard_y);
+        // Topic X's reader stopped reading mid-frame and holds old memory;
+        // topic Y's own hub has nothing evictable.
+        stalled.frame_started.store(true, Ordering::Release);
+        stalled_control.set_blocked(true);
+        {
+            let id = 1;
+            topic_x
+                .inner
+                .lock()
+                .subscribers
+                .insert(id, Arc::downgrade(&stalled));
+        }
+        assert!(
+            table.evict_stalled_across(&topic_y, &shutdown),
+            "a stalled reader on another topic must be evictable"
+        );
+        assert!(stalled.evicted.load(Ordering::Acquire));
+        assert!(stalled.detached.load(Ordering::Acquire));
+        assert!(topic_x.inner.lock().subscribers.is_empty());
+        // The healthy topic's reader stays untouched.
+        assert!(!healthy.evicted.load(Ordering::Acquire));
     }
 
     #[tokio::test]
@@ -2238,7 +2539,7 @@ mod tests {
         tokio::task::yield_now().await;
         assert!(!next.is_finished());
         old.fail(cancellation("consumer_cancelled"));
-        old.inner.lock().last_hold.take();
+        old.finish_upstream();
         let (new, leader, guard) = next.await.unwrap();
         assert!(leader);
         assert!(!Arc::ptr_eq(&old, &new));

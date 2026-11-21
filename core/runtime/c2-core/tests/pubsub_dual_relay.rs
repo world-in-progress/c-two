@@ -629,7 +629,7 @@ fn cross_relay_fanout_transfers_payload_once_across_and_r_times_locally() {
 }
 
 #[test]
-fn late_joiners_share_one_source_confirmation_and_keep_causal_start_points() {
+fn late_joiners_confirm_in_causal_batches_and_keep_causal_start_points() {
     let fixture = DualRelay::new();
     let first_client = fixture.client();
     let first = fixture.sub(&first_client);
@@ -640,8 +640,9 @@ fn late_joiners_share_one_source_confirmation_and_keep_causal_start_points() {
     assert_eq!(first.next_delivery().unwrap().seq(), 2);
     let confirms_before = fixture.relay_a.topic_confirm_count_for_test();
     let across_before = fixture.a.from_relay_bytes();
-    // Hold the next confirmation at the source so concurrent late joiners
-    // observably merge into one request.
+    // Hold the first confirmation at the source: the second late joiner then
+    // arrives while that request is on the wire and must queue for the next
+    // causal batch instead of observing the older request's head.
     let (entered, release_confirm) = fixture.relay_a.pause_next_topic_confirm_for_test();
     let clients: Vec<_> = (0..2).map(|_| fixture.client()).collect();
     let mut late = std::thread::scope(|scope| {
@@ -676,8 +677,9 @@ fn late_joiners_share_one_source_confirmation_and_keep_causal_start_points() {
             .map(|worker| worker.join().unwrap())
             .collect::<Vec<_>>()
     });
-    // The head at the shared atomic acceptance moment is 2: `latest` resumes
-    // at frame 2, `next` waits for frame 3. Nothing before it is re-sent.
+    // Each batch's own acceptance moment reports head 2 (no frame was
+    // published in between): `latest` resumes at frame 2, `next` waits for
+    // frame 3. Nothing before it is re-sent.
     assert_eq!(late[0].start_seq(), 2);
     assert_eq!(late[1].start_seq(), 3);
     assert_eq!(
@@ -685,8 +687,8 @@ fn late_joiners_share_one_source_confirmation_and_keep_causal_start_points() {
             .relay_a
             .topic_confirm_count_for_test()
             .saturating_sub(confirms_before),
-        1,
-        "concurrent late joiners must merge into one source confirmation"
+        2,
+        "one confirmation per causal batch: the leader plus the joiner that arrived in flight"
     );
     let across = fixture.a.from_relay_bytes() - across_before;
     assert!(
