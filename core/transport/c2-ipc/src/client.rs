@@ -751,11 +751,9 @@ impl PendingResponse {
                 let _ = tx.send(Err(IpcError::Closed));
             }
         } else if let Some(subscription) = self.subscription {
-            subscription.transport_failed(
-                result.err().unwrap_or_else(|| {
-                    IpcError::Protocol("unary response for topic subscription".into())
-                }),
-            );
+            subscription.transport_failed(result.err().unwrap_or_else(|| {
+                IpcError::Protocol("unary response for topic subscription".into())
+            }));
             if let Some(tx) = self.tx {
                 let _ = tx.send(Err(IpcError::Closed));
             }
@@ -3304,7 +3302,9 @@ pub(crate) fn recv_loop(
                         );
                         continue;
                     }
-                    RpcRecord::ItemBegin { .. } | RpcRecord::Ready { .. } => continue,
+                    RpcRecord::ItemBegin { .. }
+                    | RpcRecord::Ready { .. }
+                    | RpcRecord::SyncAck { .. } => continue,
                     _ => {}
                 }
             }
@@ -3321,7 +3321,9 @@ pub(crate) fn recv_loop(
             };
             if let Some(forward) = forward {
                 let result = match record {
-                    RpcRecord::ItemBegin { total_bytes, .. } => forward.begin(total_bytes),
+                    RpcRecord::Ready { start_seq } => forward.ready(start_seq),
+                    RpcRecord::SyncAck { head_seq } => forward.sync_ack(head_seq),
+                    RpcRecord::ItemBegin { total_bytes, seq } => forward.begin(seq, total_bytes),
                     RpcRecord::ItemData { value } => {
                         forward.data(value.storage, server_pool, shm_allowed, retirement.clone())
                     }

@@ -561,10 +561,58 @@ impl Client {
                     )
                 })
             }
-            ClientInner::Http(_) => Err(Error::Semantic(c2_error::C2Error::new(
-                c2_error::ErrorCode::ResourceUnavailable,
-                "relay HTTP topic subscriptions are not yet implemented",
-            ))),
+            ClientInner::Http(client) => {
+                let http_cancellation = HttpStreamCancellation::new();
+                let active = budget.scope.clone();
+                let dispatch = budget.scope.clone();
+                let control = HttpCallControl::new(
+                    move || active.check_pre_dispatch().map_err(guard_error),
+                    move || dispatch.try_begin_dispatch().map_err(guard_error),
+                )
+                .with_payload_budget(payload_budget, budget.scope.deadline());
+                let open = client.subscribe_controlled_async(
+                    topic,
+                    options.into(),
+                    Box::new(permit),
+                    http_cancellation.clone(),
+                    &control,
+                );
+                let normalize_open = |error: c2_http::client::HttpCallError| {
+                    let phase = match error.phase() {
+                        HttpCallPhase::PreDispatch => TransportPhase::PreDispatch,
+                        HttpCallPhase::DispatchUncertain => TransportPhase::DispatchUncertain,
+                    };
+                    normalize_http_error(error.into_source(), phase)
+                };
+                let opened = match budget.scope.deadline() {
+                    Some(deadline) => match tokio::time::timeout_at(
+                        tokio::time::Instant::from_std(deadline),
+                        open,
+                    )
+                    .await
+                    {
+                        Ok(result) => result.map_err(normalize_open),
+                        Err(_) => {
+                            http_cancellation.cancel();
+                            let phase = match budget.scope.observe_deadline() {
+                                CallState::ExpiredPreDispatch => TransportPhase::PreDispatch,
+                                _ => TransportPhase::DispatchUncertain,
+                            };
+                            Err(scope_error(CallScopeError::DeadlineExceeded { phase }))
+                        }
+                    },
+                    None => open.await.map_err(normalize_open),
+                };
+                opened.map(|sub| {
+                    crate::CoreTopicSubscription::from_http(
+                        sub,
+                        topic.to_string(),
+                        Arc::clone(&target),
+                        budget.scope.clone(),
+                        http_cancellation,
+                    )
+                })
+            }
         };
         if let Err(error) = &result {
             target.observe_error(error);

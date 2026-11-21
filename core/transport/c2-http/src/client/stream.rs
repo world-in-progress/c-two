@@ -32,11 +32,11 @@ impl HttpStreamCancellation {
         }
     }
 
-    fn requested(&self) -> bool {
+    pub(super) fn requested(&self) -> bool {
         self.0.requested.load(Ordering::Acquire)
     }
 
-    async fn wait(&self) {
+    pub(super) async fn wait(&self) {
         loop {
             let changed = self.0.changed.notified();
             tokio::pin!(changed);

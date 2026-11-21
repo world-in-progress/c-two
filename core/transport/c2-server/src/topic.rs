@@ -428,6 +428,11 @@ impl TopicChannel {
         self.state.lock().head_seq
     }
 
+    pub(crate) fn head_seq_if_open(&self) -> Option<u64> {
+        let state = self.state.lock();
+        state.closed.is_none().then_some(state.head_seq)
+    }
+
     pub(crate) fn notified(&self) -> tokio::sync::futures::Notified<'_> {
         self.notify.notified()
     }

@@ -4,13 +4,13 @@
 //! history rings live in `c2_server::topic`. This module re-exports the
 //! language-neutral configuration/data types, adapts server errors into
 //! [`crate::Error`], and provides [`CoreTopicSubscription`] / [`CoreTopicDelivery`]
-//! for remote IPC (and later relay HTTP) subscriptions.
+//! for remote IPC and relay HTTP subscriptions.
 
 use std::fmt;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use c2_ipc::{IpcError, IpcSubscribeCancellation, IpcTopicDelivery, IpcTopicSubscription, StreamTerminal};
+use c2_ipc::{IpcError, IpcSubscribeCancellation, IpcTopicSubscription, StreamTerminal};
 use c2_wire::rpc::CallStatus;
 use tokio::sync::Mutex;
 
@@ -187,26 +187,75 @@ impl CoreTopicDelivery {
 
 enum SubscriptionTransport {
     Ipc(IpcTopicSubscription),
+    Http(c2_http::client::HttpTopicSubscription),
+}
+
+enum SubscriptionTerminal {
+    Ipc(StreamTerminal),
+    Http(c2_http::topic_wire::Terminal),
+}
+
+struct ReceivedDelivery {
+    bytes: c2_mem::BudgetedBuffer,
+    seq: u64,
+    dropped: u64,
 }
 
 impl SubscriptionTransport {
-    async fn recv(&mut self) -> Result<IpcTopicDelivery, Error> {
-        match self {
-            Self::Ipc(sub) => sub.recv().await.map_err(normalize_ipc_call_error),
-        }
-    }
-
-    async fn completion(&mut self) -> Result<StreamTerminal, Error> {
-        match self {
-            Self::Ipc(sub) => sub.completion().await.map_err(normalize_ipc_call_error),
-        }
-    }
-
-    fn try_completion(&self) -> Option<Result<StreamTerminal, Error>> {
+    async fn recv(&mut self) -> Result<ReceivedDelivery, Error> {
         match self {
             Self::Ipc(sub) => sub
-                .try_completion()
-                .map(|result| result.map_err(normalize_ipc_call_error)),
+                .recv()
+                .await
+                .map(|item| ReceivedDelivery {
+                    bytes: item.bytes,
+                    seq: item.seq,
+                    dropped: item.dropped,
+                })
+                .map_err(normalize_ipc_call_error),
+            Self::Http(sub) => sub
+                .recv()
+                .await
+                .map(|item| ReceivedDelivery {
+                    bytes: item.bytes,
+                    seq: item.seq,
+                    dropped: item.dropped,
+                })
+                .map_err(|error| {
+                    crate::normalize_http_error(error, TransportPhase::DispatchUncertain)
+                }),
+        }
+    }
+
+    async fn completion(&mut self) -> Result<SubscriptionTerminal, Error> {
+        match self {
+            Self::Ipc(sub) => sub
+                .completion()
+                .await
+                .map(SubscriptionTerminal::Ipc)
+                .map_err(normalize_ipc_call_error),
+            Self::Http(sub) => sub
+                .completion_after_cancel()
+                .await
+                .map(SubscriptionTerminal::Http)
+                .map_err(|error| {
+                    crate::normalize_http_error(error, TransportPhase::DispatchUncertain)
+                }),
+        }
+    }
+
+    fn try_completion(&self) -> Option<Result<SubscriptionTerminal, Error>> {
+        match self {
+            Self::Ipc(sub) => sub.try_completion().map(|result| {
+                result
+                    .map(SubscriptionTerminal::Ipc)
+                    .map_err(normalize_ipc_call_error)
+            }),
+            Self::Http(sub) => sub.try_completion().map(|result| {
+                result.map(SubscriptionTerminal::Http).map_err(|error| {
+                    crate::normalize_http_error(error, TransportPhase::DispatchUncertain)
+                })
+            }),
         }
     }
 }
@@ -220,6 +269,7 @@ pub struct CoreTopicSubscription {
     transport: Mutex<SubscriptionTransport>,
     target: Arc<ClientTarget>,
     cancellation: IpcSubscribeCancellation,
+    http_cancellation: c2_http::client::HttpStreamCancellation,
     scope: CallScope,
     start_seq: u64,
     topic_name: String,
@@ -249,6 +299,28 @@ impl CoreTopicSubscription {
             transport: Mutex::new(SubscriptionTransport::Ipc(sub)),
             target,
             cancellation,
+            http_cancellation: c2_http::client::HttpStreamCancellation::new(),
+            scope,
+            start_seq,
+            topic_name,
+            runtime: shared_executor()
+                .expect("subscription execution already started on shared runtime"),
+        }
+    }
+
+    pub(crate) fn from_http(
+        sub: c2_http::client::HttpTopicSubscription,
+        topic_name: String,
+        target: Arc<ClientTarget>,
+        scope: CallScope,
+        cancellation: c2_http::client::HttpStreamCancellation,
+    ) -> Self {
+        let start_seq = sub.start_seq();
+        Self {
+            transport: Mutex::new(SubscriptionTransport::Http(sub)),
+            target,
+            cancellation: IpcSubscribeCancellation::new(),
+            http_cancellation: cancellation,
             scope,
             start_seq,
             topic_name,
@@ -309,9 +381,11 @@ impl CoreTopicSubscription {
     #[doc(hidden)]
     pub fn check_deadline(&self) -> Result<(), Error> {
         match self.scope.observe_deadline() {
-            CallState::ExpiredPreDispatch => Err(scope_error(crate::CallScopeError::DeadlineExceeded {
-                phase: TransportPhase::PreDispatch,
-            })),
+            CallState::ExpiredPreDispatch => {
+                Err(scope_error(crate::CallScopeError::DeadlineExceeded {
+                    phase: TransportPhase::PreDispatch,
+                }))
+            }
             CallState::ExpiredDispatchUncertain => {
                 Err(scope_error(crate::CallScopeError::DeadlineExceeded {
                     phase: TransportPhase::DispatchUncertain,
@@ -324,6 +398,7 @@ impl CoreTopicSubscription {
     /// Submit consumer cancellation intent without blocking.
     pub fn cancel(&self) -> Result<(), Error> {
         self.cancellation.cancel();
+        self.http_cancellation.cancel();
         Ok(())
     }
 
@@ -366,7 +441,10 @@ impl CoreTopicSubscription {
         };
         match terminal {
             Some(Ok(terminal)) => {
-                let complete_items = Some(terminal.complete_items);
+                let complete_items = Some(match &terminal {
+                    SubscriptionTerminal::Ipc(t) => t.complete_items,
+                    SubscriptionTerminal::Http(t) => t.complete_items,
+                });
                 let outcome = subscription_terminal_outcome(terminal);
                 if let Err(error) = &outcome {
                     self.target.observe_error(error);
@@ -399,10 +477,15 @@ impl CoreTopicSubscription {
 impl Drop for CoreTopicSubscription {
     fn drop(&mut self) {
         self.cancellation.cancel();
+        self.http_cancellation.cancel();
     }
 }
 
-fn subscription_terminal_outcome(terminal: StreamTerminal) -> Result<(), Error> {
+fn subscription_terminal_outcome(terminal: SubscriptionTerminal) -> Result<(), Error> {
+    let terminal = match terminal {
+        SubscriptionTerminal::Ipc(terminal) => terminal,
+        SubscriptionTerminal::Http(terminal) => return Err(Error::Semantic(terminal.error)),
+    };
     match terminal.status {
         CallStatus::Success => Ok(()),
         CallStatus::NotExecuted => Err(normalize_ipc_error(

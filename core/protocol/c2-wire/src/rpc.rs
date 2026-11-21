@@ -242,6 +242,8 @@ pub enum RpcRecordKind {
     CallEnd = 6,
     Release = 7,
     Ready = 8,
+    Sync = 9,
+    SyncAck = 10,
 }
 
 impl TryFrom<u8> for RpcRecordKind {
@@ -257,6 +259,8 @@ impl TryFrom<u8> for RpcRecordKind {
             6 => Ok(Self::CallEnd),
             7 => Ok(Self::Release),
             8 => Ok(Self::Ready),
+            9 => Ok(Self::Sync),
+            10 => Ok(Self::SyncAck),
             _ => Err(invalid("RPC record kind", value.into())),
         }
     }
@@ -441,6 +445,10 @@ pub enum RpcRecord<'a> {
     Ready {
         start_seq: u64,
     },
+    Sync,
+    SyncAck {
+        head_seq: u64,
+    },
     ItemBegin {
         total_bytes: u64,
         seq: Option<u64>,
@@ -579,6 +587,7 @@ pub fn decode_rpc_record<'a>(
             | RpcRecordKind::ItemData
             | RpcRecordKind::CallEnd
             | RpcRecordKind::Ready
+            | RpcRecordKind::SyncAck
     );
     if kind != RpcRecordKind::Release && response != expected_response {
         return Err(DecodeError::InvalidRpcEnvelope {
@@ -677,6 +686,22 @@ pub fn decode_rpc_record<'a>(
                 return Err(invalid("READY start_seq", 0));
             }
             Ok(RpcRecord::Ready { start_seq })
+        }
+        RpcRecordKind::Sync => {
+            require_exact(body, 0, "SYNC")?;
+            if !no_storage {
+                return Err(invalid("SYNC flags", header.flags.into()));
+            }
+            Ok(RpcRecord::Sync)
+        }
+        RpcRecordKind::SyncAck => {
+            require_exact(body, 8, "SYNC_ACK")?;
+            if !no_storage {
+                return Err(invalid("SYNC_ACK flags", header.flags.into()));
+            }
+            Ok(RpcRecord::SyncAck {
+                head_seq: u64::from_le_bytes(body.try_into().unwrap()),
+            })
         }
         RpcRecordKind::ItemBegin => {
             if !no_storage {
@@ -1383,6 +1408,27 @@ pub fn encode_ready_frame(request_id: u64, start_seq: u64) -> Result<Vec<u8>, En
     let mut out = record_frame(request_id, FLAG_RPC_RECORD | FLAG_RESPONSE, 9)?;
     out.push(RpcRecordKind::Ready as u8);
     out.extend_from_slice(&start_seq.to_le_bytes());
+    Ok(out)
+}
+
+/// Request the current head of an active subscription's source topic.
+pub fn encode_sync_frame(request_id: u64) -> Result<Vec<u8>, EncodeError> {
+    if request_id == 0 {
+        return Err(encode_invalid("SYNC", "request id must be nonzero"));
+    }
+    let mut out = record_frame(request_id, FLAG_RPC_RECORD, 1)?;
+    out.push(RpcRecordKind::Sync as u8);
+    Ok(out)
+}
+
+/// Acknowledge SYNC. An empty topic has head sequence zero.
+pub fn encode_sync_ack_frame(request_id: u64, head_seq: u64) -> Result<Vec<u8>, EncodeError> {
+    if request_id == 0 {
+        return Err(encode_invalid("SYNC_ACK", "request id must be nonzero"));
+    }
+    let mut out = record_frame(request_id, FLAG_RPC_RECORD | FLAG_RESPONSE, 9)?;
+    out.push(RpcRecordKind::SyncAck as u8);
+    out.extend_from_slice(&head_seq.to_le_bytes());
     Ok(out)
 }
 

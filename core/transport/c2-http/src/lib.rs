@@ -7,6 +7,7 @@ pub mod client;
 mod payload;
 pub mod send_budget;
 pub mod stream_wire;
+pub mod topic_wire;
 
 #[cfg(feature = "relay")]
 pub mod relay;

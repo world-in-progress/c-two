@@ -92,6 +92,24 @@ impl IntoResponse for ResponseFailure {
 type ResponseResult<T> = Result<T, ResponseFailure>;
 
 struct OptionalConnectInfo(Option<SocketAddr>);
+struct OptionalTopicConnection(Option<Arc<crate::relay::connection::ConnectionControl>>);
+
+impl<S> FromRequestParts<S> for OptionalTopicConnection
+where
+    S: Send + Sync,
+{
+    type Rejection = Infallible;
+    fn from_request_parts(
+        parts: &mut Parts,
+        _state: &S,
+    ) -> impl Future<Output = Result<Self, Self::Rejection>> + Send {
+        let control = parts
+            .extensions
+            .get::<ConnectInfo<crate::relay::connection::ConnectionInfo>>()
+            .map(|ConnectInfo(info)| info.control.clone());
+        std::future::ready(Ok(Self(control)))
+    }
+}
 
 impl<S> FromRequestParts<S> for OptionalConnectInfo
 where
@@ -106,7 +124,13 @@ where
         let remote_addr = parts
             .extensions
             .get::<ConnectInfo<SocketAddr>>()
-            .map(|ConnectInfo(addr)| *addr);
+            .map(|ConnectInfo(addr)| *addr)
+            .or_else(|| {
+                parts
+                    .extensions
+                    .get::<ConnectInfo<crate::relay::connection::ConnectionInfo>>()
+                    .map(|ConnectInfo(info)| info.address)
+            });
         std::future::ready(Ok(Self(remote_addr)))
     }
 }
@@ -433,7 +457,9 @@ fn payload_too_large_response(
     c2_error_response_with_budget(
         StatusCode::PAYLOAD_TOO_LARGE,
         c2_error::ErrorCode::CallCapacityExceeded,
-        format!("request payload size {content_length} exceeds max_payload_size {max_payload_size}"),
+        format!(
+            "request payload size {content_length} exceeds max_payload_size {max_payload_size}"
+        ),
         [
             ("route", route_name.to_string()),
             ("reason", "PayloadTooLarge".to_string()),
@@ -820,6 +846,7 @@ pub fn build_router(state: Arc<RelayState>) -> Router {
 
     let data_router = Router::new()
         .route("/{route_name}/{method_name}", post(call_handler))
+        .route("/{route_name}/_topics/{topic_name}", post(topic_handler))
         .layer(DefaultBodyLimit::disable());
 
     Router::new()
@@ -827,6 +854,150 @@ pub fn build_router(state: Arc<RelayState>) -> Router {
         .merge(data_router)
         .with_state(state)
         .layer(axum::middleware::from_fn(finish_unread_body_rejection))
+}
+
+async fn topic_handler(
+    State(state): State<Arc<RelayState>>,
+    Path((route_name, topic_name)): Path<(String, String)>,
+    OptionalTopicConnection(connection): OptionalTopicConnection,
+    headers: HeaderMap,
+) -> Response {
+    let budget = state.forwarding.budget().clone();
+    let expected = match expected_crm_from_headers(&route_name, &headers, Some(&budget)) {
+        Ok(expected) => expected,
+        Err(response) => return response.into_response(),
+    };
+    if headers.get(header::ACCEPT).and_then(|v| v.to_str().ok())
+        != Some(crate::topic_wire::MEDIA_TYPE)
+        || headers
+            .get(header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v != "0")
+        || headers.contains_key(header::TRANSFER_ENCODING)
+    {
+        return c2_error_response(
+            StatusCode::BAD_REQUEST,
+            c2_error::ErrorCode::ProtocolViolation,
+            "invalid topic request headers",
+            [("dispatch_phase", "pre_dispatch")],
+        );
+    }
+    let start = match headers
+        .get("x-c2-topic-start")
+        .and_then(|v| v.to_str().ok())
+    {
+        Some("latest") => c2_wire::rpc::WireTopicStart::Latest,
+        Some("next") => c2_wire::rpc::WireTopicStart::Next,
+        _ => {
+            return c2_error_response(
+                StatusCode::BAD_REQUEST,
+                c2_error::ErrorCode::ProtocolViolation,
+                "invalid topic start",
+                [("dispatch_phase", "pre_dispatch")],
+            );
+        }
+    };
+    let on_lag = match headers
+        .get("x-c2-topic-on-lag")
+        .and_then(|v| v.to_str().ok())
+    {
+        Some("skip") => c2_wire::rpc::WireLagPolicy::Skip,
+        Some("error") => c2_wire::rpc::WireLagPolicy::Error,
+        _ => {
+            return c2_error_response(
+                StatusCode::BAD_REQUEST,
+                c2_error::ErrorCode::ProtocolViolation,
+                "invalid topic lag policy",
+                [("dispatch_phase", "pre_dispatch")],
+            );
+        }
+    };
+    let resolved = match state.resolve_matching(&expected) {
+        Ok(route) => route,
+        Err(error) => return route_resolution_error_response(&route_name, error),
+    };
+    if state.local_route(&route_name).is_none() {
+        if resolved.is_some() {
+            return resource_unavailable_response_budgeted(
+                &route_name,
+                "remote topic forwarding is unavailable",
+                "pre_dispatch",
+                &budget,
+            );
+        }
+        if state
+            .list_routes()
+            .iter()
+            .any(|route| route.name == route_name)
+        {
+            return crm_contract_mismatch_response_budgeted(&route_name, &budget);
+        }
+    }
+    let route = match validate_expected_crm_for_route(&state, &route_name, &expected, Some(&budget))
+    {
+        Ok(route) => route,
+        Err(response) => return response.into_response(),
+    };
+    let (permit, tracked) = match state.forwarding.admit_subscription() {
+        Ok(value) => value,
+        Err(error) => return forwarding_capacity_response(&route_name, error.to_string()),
+    };
+    let (lease, binding, current) =
+        match acquire_request_client_for_route(state.clone(), &route).await {
+            RequestClient::Ready(ready) => {
+                let ReadyRequestClient {
+                    lease,
+                    binding,
+                    route,
+                } = *ready;
+                (lease, binding, route)
+            }
+            RequestClient::WatchUnavailable { route, reason } => {
+                return route_watch_unavailable_response_budgeted(&route.name, reason, &budget);
+            }
+            RequestClient::NotFound => {
+                return resource_not_found_response_budgeted(&route_name, &budget);
+            }
+            RequestClient::RouteError(error) => {
+                return ipc_route_error_response(&route_name, &error, Some(&budget));
+            }
+            RequestClient::Unreachable => {
+                return resource_unavailable_response_budgeted(
+                    &route_name,
+                    "relay upstream unavailable",
+                    "pre_dispatch",
+                    &budget,
+                );
+            }
+        };
+    if let Err(error) = state.resolve_matching(&expected) {
+        return route_resolution_error_response(&route_name, error);
+    }
+    let options = c2_wire::rpc::WireSubscribeOptions { start, on_lag };
+    fn require_send<F: std::future::Future + Send>(future: F) -> F {
+        future
+    }
+    match require_send(super::topic_hub::subscribe(
+        state, current, topic_name, options, lease, binding, permit, tracked, connection,
+    ))
+    .await
+    {
+        Ok(response) => response,
+        Err(mut error) => {
+            error
+                .details
+                .insert("dispatch_phase".into(), "pre_dispatch".into());
+            let status = match error.code {
+                c2_error::ErrorCode::ResourceNotFound => StatusCode::NOT_FOUND,
+                c2_error::ErrorCode::ContractMismatch | c2_error::ErrorCode::RouteConflict => {
+                    StatusCode::CONFLICT
+                }
+                c2_error::ErrorCode::CallCapacityExceeded => StatusCode::SERVICE_UNAVAILABLE,
+                _ => StatusCode::BAD_GATEWAY,
+            };
+            json_error_response(status, error.envelope(), Some(&budget))
+        }
+    }
 }
 
 // Retain the transport body at the router boundary until its first read. This
@@ -1621,6 +1792,10 @@ async fn handle_resolve(
     OptionalConnectInfo(remote_addr): OptionalConnectInfo,
     headers: HeaderMap,
 ) -> impl IntoResponse {
+    #[cfg(feature = "test-support")]
+    state
+        .route_lookups
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     if !valid_route_name(&name) {
         return (
             StatusCode::BAD_REQUEST,
@@ -1929,6 +2104,10 @@ async fn handle_probe(
     State(state): State<Arc<RelayState>>,
     headers: HeaderMap,
 ) -> Response {
+    #[cfg(feature = "test-support")]
+    state
+        .route_lookups
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let response = handle_probe_in_context(route_name, state.clone(), headers).await;
     with_local_namespace_response(&state, response)
 }
@@ -6231,7 +6410,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resolve_resp.status(), StatusCode::NOT_FOUND);
-        let resolve_bytes = to_bytes(resolve_resp.into_body(), usize::MAX).await.unwrap();
+        let resolve_bytes = to_bytes(resolve_resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let resolve_json: serde_json::Value = serde_json::from_slice(&resolve_bytes).unwrap();
         assert_eq!(resolve_json["code"], 701);
         assert_eq!(resolve_json["details"]["dispatch_phase"], "pre_dispatch");
@@ -6295,7 +6476,33 @@ mod tests {
         let conflict_probe_json: serde_json::Value =
             serde_json::from_slice(&conflict_probe_body).unwrap();
         assert_eq!(conflict_probe_json["code"], 719);
-        assert!(conflict_probe_json["details"].get("dispatch_phase").is_none());
+        assert!(
+            conflict_probe_json["details"]
+                .get("dispatch_phase")
+                .is_none()
+        );
+
+        let topic = build_router(state.clone())
+            .oneshot(
+                add_expected_echo_headers(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/conflict-grid/_topics/state"),
+                )
+                .header("accept", crate::topic_wire::MEDIA_TYPE)
+                .header("x-c2-topic-start", "latest")
+                .header("x-c2-topic-on-lag", "skip")
+                .header("content-length", "0")
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(topic.status(), StatusCode::CONFLICT);
+        let topic = to_bytes(topic.into_body(), usize::MAX).await.unwrap();
+        let topic: serde_json::Value = serde_json::from_slice(&topic).unwrap();
+        assert_eq!(topic["code"], 719);
+        assert_eq!(topic["details"]["dispatch_phase"], "pre_dispatch");
 
         let conflict_resolve = build_router(state)
             .oneshot(
@@ -6310,12 +6517,16 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(conflict_resolve.status(), StatusCode::CONFLICT);
-        let conflict_resolve_bytes =
-            to_bytes(conflict_resolve.into_body(), usize::MAX).await.unwrap();
+        let conflict_resolve_bytes = to_bytes(conflict_resolve.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let conflict_resolve_json: serde_json::Value =
             serde_json::from_slice(&conflict_resolve_bytes).unwrap();
         assert_eq!(conflict_resolve_json["code"], 719);
-        assert_eq!(conflict_resolve_json["details"]["dispatch_phase"], "pre_dispatch");
+        assert_eq!(
+            conflict_resolve_json["details"]["dispatch_phase"],
+            "pre_dispatch"
+        );
     }
 
     #[tokio::test]

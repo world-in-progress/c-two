@@ -284,6 +284,36 @@ impl RelayAwareHttpClient {
         result.map_err(|source| HttpCallError::new(http_call_error_phase(&source), source))
     }
 
+    /// Start a route-bound topic subscription over the selected HTTP relay.
+    pub async fn subscribe_controlled_async(
+        &self,
+        topic_name: &str,
+        options: c2_wire::rpc::WireSubscribeOptions,
+        completion_owner: Box<dyn Send>,
+        cancellation: super::HttpStreamCancellation,
+        control: &HttpCallControl,
+    ) -> Result<super::HttpTopicSubscription, HttpCallError> {
+        let result = async {
+            check_active(Some(control))?;
+            let target = self.selected_http_target()?;
+            let client = self.acquire_route_client(&target.relay_url, Some(control))?;
+            client
+                .client
+                .topic_route_async(
+                    &self.expected,
+                    topic_name,
+                    options,
+                    control.payload_budget().unwrap_or(&self.payload_budget),
+                    completion_owner,
+                    cancellation,
+                    control,
+                )
+                .await
+        }
+        .await;
+        result.map_err(|source| HttpCallError::new(http_call_error_phase(&source), source))
+    }
+
     async fn stream_inner_async(
         &self,
         method_name: &str,

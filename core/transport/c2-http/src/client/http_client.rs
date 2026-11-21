@@ -8,6 +8,7 @@ use reqwest::header::CONTENT_LENGTH;
 use thiserror::Error;
 
 use super::HttpCallControl;
+use super::HttpTopicSubscription;
 use super::{HttpResponseStream, HttpStreamCancellation};
 use c2_contract::ExpectedRouteContract;
 
@@ -354,6 +355,113 @@ impl HttpClient {
             completion_owner,
             cancellation,
         ))
+    }
+
+    pub(crate) async fn topic_route_async(
+        &self,
+        expected: &ExpectedRouteContract,
+        topic_name: &str,
+        options: c2_wire::rpc::WireSubscribeOptions,
+        budget: &DomainBudget,
+        completion_owner: Box<dyn Send>,
+        cancellation: HttpStreamCancellation,
+        control: &HttpCallControl,
+    ) -> Result<HttpTopicSubscription, HttpError> {
+        struct CancelOpening(Option<HttpStreamCancellation>);
+        impl Drop for CancelOpening {
+            fn drop(&mut self) {
+                if let Some(cancel) = self.0.take() {
+                    cancel.cancel();
+                }
+            }
+        }
+        control.check_active()?;
+        let url = format!(
+            "{}/{}/_topics/{}",
+            self.base_url,
+            encode_segment(&expected.route_name),
+            encode_segment(topic_name)
+        );
+        let request = self
+            .client
+            .post(url)
+            .header("Accept", crate::topic_wire::MEDIA_TYPE)
+            .header(
+                "x-c2-topic-start",
+                match options.start {
+                    c2_wire::rpc::WireTopicStart::Latest => "latest",
+                    c2_wire::rpc::WireTopicStart::Next => "next",
+                },
+            )
+            .header(
+                "x-c2-topic-on-lag",
+                match options.on_lag {
+                    c2_wire::rpc::WireLagPolicy::Skip => "skip",
+                    c2_wire::rpc::WireLagPolicy::Error => "error",
+                },
+            )
+            .header(CONTENT_LENGTH, "0");
+        let request = add_expected_contract_headers(request, expected)
+            .build()
+            .map_err(|e| HttpError::InvalidInput(e.to_string()))?;
+        control.check_active()?;
+        control.check_dispatch()?;
+        let client = self.client.clone();
+        let base_url = self.base_url.clone();
+        let budget = budget.clone();
+        let actor_cancel = cancellation.clone();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let result = async {
+                let response = client.execute(request).await.map_err(HttpError::Request)?;
+                if response.status().as_u16() != 200 {
+                    let status = response.status().as_u16();
+                    let body = crate::payload::read_http_response_body(
+                        response,
+                        crate::topic_wire::MAX_TERMINAL_PAYLOAD_BYTES,
+                        &budget,
+                        None,
+                        "pre_dispatch",
+                    )
+                    .await?;
+                    return Err(HttpError::ResponseError(status, body));
+                }
+                if response
+                    .headers()
+                    .get(reqwest::header::CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok())
+                    != Some(crate::topic_wire::MEDIA_TYPE)
+                {
+                    return Err(stream_protocol_error("invalid_topic_content_type"));
+                }
+                let token = response
+                    .headers()
+                    .get("x-c2-call-token")
+                    .and_then(|v| v.to_str().ok())
+                    .filter(|v| v.len() == 32 && v.bytes().all(|b| b.is_ascii_hexdigit()))
+                    .ok_or_else(|| stream_protocol_error("invalid_call_token"))?
+                    .to_owned();
+                HttpTopicSubscription::start(
+                    response,
+                    client.clone(),
+                    base_url,
+                    token,
+                    budget,
+                    options.on_lag,
+                    completion_owner,
+                    actor_cancel,
+                )
+                .await
+            }
+            .await;
+            let _ = tx.send(result);
+        });
+        let mut guard = CancelOpening(Some(cancellation));
+        let result = rx
+            .await
+            .map_err(|_| HttpError::Transport("HTTP topic opening task ended".into()))?;
+        guard.0.take();
+        result
     }
 
     /// Health check — GET /health.

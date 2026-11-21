@@ -10,6 +10,7 @@ mod http_client;
 mod pool;
 mod relay_aware;
 mod stream;
+mod topic;
 
 pub use call_control::HttpCallControl;
 #[cfg(feature = "relay")]
@@ -25,6 +26,7 @@ pub use relay_aware::{
     RelayLocalIpcCandidate, RelayResolvedTarget,
 };
 pub use stream::{HttpResponseStream, HttpStreamCancellation};
+pub use topic::{HttpTopicDelivery, HttpTopicSubscription};
 
 #[cfg(all(test, feature = "relay"))]
 mod controlled_tests;

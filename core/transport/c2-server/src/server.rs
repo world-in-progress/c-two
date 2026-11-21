@@ -2907,6 +2907,7 @@ pub(crate) struct ServerCall {
 struct StreamCallControl {
     route_uid: String,
     cancellation: Option<StreamCancelCause>,
+    topic_channel: Option<Arc<crate::topic::TopicChannel>>,
 }
 
 fn submit_stream_cancel(
@@ -3336,6 +3337,39 @@ async fn handle_rpc_record(
         return;
     }
     match record {
+        RpcRecord::Sync => {
+            let lookup = conn.calls.lock().continuation(id);
+            match lookup {
+                CallLookup::Retired => return,
+                CallLookup::Future => conn.end(
+                    ConnectionEndReason::ProtocolError,
+                    "future_subscription_sync",
+                ),
+                CallLookup::Active(call) => {
+                    let channel = call
+                        .data
+                        .stream
+                        .lock()
+                        .as_ref()
+                        .and_then(|stream| stream.topic_channel.clone());
+                    match channel {
+                        None => conn.end(
+                            ConnectionEndReason::ProtocolError,
+                            "sync_for_non_subscription",
+                        ),
+                        Some(channel) => {
+                            if let Some(head_seq) = channel.head_seq_if_open() {
+                                let frame = rpc::encode_sync_ack_frame(id, head_seq)
+                                    .expect("active subscription id");
+                                if let Err(error) = writer.queue_call_end(frame) {
+                                    warn!(request_id=id, %error, "failed to queue subscription SYNC_ACK");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
         RpcRecord::Credit {
             storage_bytes,
             item_demand,
@@ -3600,6 +3634,9 @@ async fn handle_open_subscribe_record(
                                                 *call.stream.lock() = Some(StreamCallControl {
                                                     route_uid: route.route_uid.clone(),
                                                     cancellation: None,
+                                                    topic_channel: Some(Arc::clone(
+                                                        &attach.channel,
+                                                    )),
                                                 });
                                                 let record = conn
                                                     .calls
@@ -3913,6 +3950,7 @@ fn insert_admitted_call(
         *call.stream.lock() = Some(StreamCallControl {
             route_uid: admission.route.route_uid.clone(),
             cancellation: None,
+            topic_channel: None,
         });
     }
     conn.calls

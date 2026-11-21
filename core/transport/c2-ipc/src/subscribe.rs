@@ -90,6 +90,7 @@ struct SubscribeReceiveState {
     id: Option<u64>,
     start_seq: Option<u64>,
     next_expected: u64,
+    sequence_exhausted: bool,
     ready_tx: Option<oneshot::Sender<Result<u64, crate::IpcCallError>>>,
     item: Option<ActiveItemBuffer>,
     copying: bool,
@@ -151,8 +152,7 @@ impl IpcTopicSubscription {
             if let Ok(item) = self.input.try_recv() {
                 return Ok(item);
             }
-            if let Some(result) =
-                receive_after_empty(&mut self.call.state.lock(), &mut self.input)
+            if let Some(result) = receive_after_empty(&mut self.call.state.lock(), &mut self.input)
             {
                 return result;
             }
@@ -380,7 +380,9 @@ impl SubscribeReceive {
         let tx = {
             let mut state = self.state.lock();
             if state.start_seq.is_some() {
-                return Err(IpcError::Protocol("duplicate READY for subscription".into()));
+                return Err(IpcError::Protocol(
+                    "duplicate READY for subscription".into(),
+                ));
             }
             state.start_seq = Some(start_seq);
             state.next_expected = start_seq;
@@ -402,6 +404,9 @@ impl SubscribeReceive {
                     "subscription ITEM_BEGIN before READY".into(),
                 ));
             }
+            if state.sequence_exhausted {
+                return Err(IpcError::Protocol("subscription sequence exhausted".into()));
+            }
             if seq < state.next_expected {
                 return Err(IpcError::Protocol(format!(
                     "non-monotonic subscription seq {seq} < expected {}",
@@ -414,9 +419,8 @@ impl SubscribeReceive {
                     "subscription skipped {dropped} frames under on_lag=error"
                 )));
             }
-            state.next_expected = seq
-                .checked_add(1)
-                .ok_or_else(|| IpcError::Protocol("subscription seq overflow".into()))?;
+            state.next_expected = seq.saturating_add(1);
+            state.sequence_exhausted = seq == u64::MAX;
             (id, dropped)
         };
 
@@ -721,9 +725,7 @@ impl SubscribeReceive {
         if let Some(tx) = ready_tx {
             let err = match &result {
                 Ok(()) => stream::terminal_failure(&terminal),
-                Err(error) => {
-                    dispatch_uncertain_call_error(stream::clone_observation_error(error))
-                }
+                Err(error) => dispatch_uncertain_call_error(stream::clone_observation_error(error)),
             };
             let _ = tx.send(Err(err));
         }
@@ -804,8 +806,16 @@ impl IpcClient {
         options: rpc::WireSubscribeOptions,
         budget: DomainBudget,
     ) -> Result<IpcTopicSubscription, crate::IpcCallError> {
-        self.subscribe_bound_inner(binding, topic_name, options, budget, Box::new(()), None, None)
-            .await
+        self.subscribe_bound_inner(
+            binding,
+            topic_name,
+            options,
+            budget,
+            Box::new(()),
+            None,
+            None,
+        )
+        .await
     }
 
     pub async fn subscribe_bound_controlled_phased(

@@ -51,6 +51,7 @@ pub(crate) mod client_lifecycle;
 #[cfg(test)]
 mod client_lifecycle_tests;
 pub(crate) mod conn_pool;
+pub(crate) mod connection;
 pub(crate) mod disseminator;
 #[cfg(test)]
 mod force_leave_tests;
@@ -73,9 +74,10 @@ mod stream_tests;
 pub(crate) mod streaming;
 #[cfg(test)]
 pub(crate) mod test_support;
+pub(crate) mod topic_hub;
 pub(crate) mod types;
 pub(crate) mod upstream_control;
 pub(crate) mod url;
 
 pub use c2_config::RelayConfig;
-pub use server::{RelayControlError, RelayServer, RelayServerOptions};
+pub use server::{RelayControlError, RelayServer, RelayServerOptions, RelayShutdownReceipt};

@@ -316,10 +316,28 @@ pub(super) async fn drive_subscription(
     }
 
     let mut next_expected = attach.start_seq;
+    let mut sequence_exhausted = false;
     let mut complete_items = 0u64;
     let mut last_loan: Option<Arc<LoanSettledSignal>> = None;
 
-    let terminal: Option<C2Error> = loop {
+    let terminal: Option<C2Error> = 'subscription: loop {
+        if sequence_exhausted {
+            loop {
+                let writer_notified = conn.writer_wake.notified();
+                let chan_notified = attach.channel.notified();
+                tokio::pin!(writer_notified);
+                tokio::pin!(chan_notified);
+                writer_notified.as_mut().enable();
+                chan_notified.as_mut().enable();
+                if let Some(stop) = check_stop_before_select(&conn, id, &attach) {
+                    break 'subscription match stop {
+                        SubStop::PeerEnded => None,
+                        SubStop::Terminal(error) => Some(error),
+                    };
+                }
+                tokio::select! { _ = writer_notified => {}, _ = chan_notified => {} }
+            }
+        }
         if let Err(stop) = wait_ready_for_select(&conn, id, &attach, last_loan.as_ref()).await {
             break match stop {
                 SubStop::PeerEnded => None,
@@ -371,6 +389,7 @@ pub(super) async fn drive_subscription(
         match send_topic_frame(&conn, &writer, id, &frame, &mut last_loan).await {
             Ok(()) => {
                 complete_items += 1;
+                sequence_exhausted = frame.seq() == u64::MAX;
             }
             Err(FrameSendError::PeerEnded) => break None,
             Err(FrameSendError::Cancelled) => {

@@ -8,7 +8,47 @@ use c2_wire::rpc::{
     decode_rpc_record_with_carrier, encode_call_end_frame, encode_cancel_frame,
     encode_credit_frame, encode_item_begin_frame, encode_item_data_frame, encode_open_frame,
     encode_open_subscribe_frame, encode_ready_frame, encode_subscribe_item_begin_frame,
+    encode_sync_ack_frame, encode_sync_frame,
 };
+
+#[test]
+fn subscription_sync_records_are_exact_and_directional() {
+    let sync = encode_sync_frame(7).unwrap();
+    let (header, payload) = decode_frame(&sync).unwrap();
+    assert_eq!(payload, [9]);
+    assert_eq!(
+        decode_rpc_record(&header, payload, Some(CallMode::Subscribe)).unwrap(),
+        RpcRecord::Sync
+    );
+    let ack = encode_sync_ack_frame(7, 0).unwrap();
+    let (header, payload) = decode_frame(&ack).unwrap();
+    assert_eq!(payload, [10, 0, 0, 0, 0, 0, 0, 0, 0]);
+    assert_eq!(
+        decode_rpc_record(&header, payload, Some(CallMode::Subscribe)).unwrap(),
+        RpcRecord::SyncAck { head_seq: 0 }
+    );
+    assert!(encode_sync_frame(0).is_err());
+    assert!(encode_sync_ack_frame(0, 1).is_err());
+    for bytes in [&sync, &ack] {
+        let (header, payload) = decode_frame(bytes).unwrap();
+        let mut wrong_direction = header;
+        wrong_direction.flags ^= c2_wire::flags::FLAG_RESPONSE;
+        assert!(decode_rpc_record(&wrong_direction, payload, Some(CallMode::Subscribe)).is_err());
+        let mut wrong_storage = header;
+        wrong_storage.flags |= c2_wire::flags::FLAG_BUDDY;
+        assert!(decode_rpc_record(&wrong_storage, payload, Some(CallMode::Subscribe)).is_err());
+        let mut wrong_length = header;
+        wrong_length.total_len -= 1;
+        assert!(
+            decode_rpc_record(
+                &wrong_length,
+                &payload[..payload.len() - 1],
+                Some(CallMode::Subscribe)
+            )
+            .is_err()
+        );
+    }
+}
 
 fn identity() -> RouteCallIdentity<&'static str> {
     RouteCallIdentity {

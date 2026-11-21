@@ -112,9 +112,13 @@ enum Command {
     ListRoutes {
         reply: oneshot::Sender<Vec<(String, String)>>,
     },
-    Stop {
-        reply: oneshot::Sender<()>,
-    },
+}
+
+struct RelayThreadCompletion(std::sync::mpsc::Sender<()>);
+impl Drop for RelayThreadCompletion {
+    fn drop(&mut self) {
+        let _ = self.0.send(());
+    }
 }
 
 fn validate_register_command(
@@ -199,12 +203,20 @@ pub struct RelayServerOptions {
     pub domain_limits: DomainLimitsOverrides,
 }
 
+/// Observation of the original relay shutdown transaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RelayShutdownReceipt {
+    pub completed: bool,
+}
+
 /// Relay server with a synchronous control API.
 #[allow(dead_code)]
 pub struct RelayServer {
     local_addr: SocketAddr,
     cmd_tx: Option<mpsc::Sender<Command>>,
     thread: Option<std::thread::JoinHandle<()>>,
+    thread_stopped: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+    shutdown_error: Option<String>,
     state: Arc<RelayState>,
     cancel: CancellationToken,
 }
@@ -229,6 +241,41 @@ impl RelayServer {
     /// connects, maps, or resets accounting.
     pub fn domain_snapshot(&self) -> c2_mem::DomainSnapshot {
         self.state.domain_snapshot()
+    }
+
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn pause_next_topic_frame_for_test(&self) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        assert!(
+            self.state
+                .topic_pause
+                .lock()
+                .replace((entered_tx, release_rx))
+                .is_none()
+        );
+        (entered_rx, release_tx)
+    }
+
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn topic_shutdown_signal_for_test(&self) -> CancellationToken {
+        self.state.forwarding.shutdown_token()
+    }
+
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn route_lookup_count_for_test(&self) -> u64 {
+        self.state
+            .route_lookups
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn blocked_topic_subscribers_for_test(&self) -> usize {
+        self.state.topics.blocked_subscribers()
     }
 
     /// Start the relay server on a background thread.
@@ -343,6 +390,7 @@ impl RelayServer {
 
         let (cmd_tx, cmd_rx) = mpsc::channel::<Command>(64);
         let (ready_tx, ready_rx) = oneshot::channel::<Result<(), String>>();
+        let (thread_done, thread_stopped) = std::sync::mpsc::channel();
 
         let server_state = state.clone();
         let cancel = CancellationToken::new();
@@ -351,6 +399,7 @@ impl RelayServer {
         let thread = std::thread::Builder::new()
             .name("c2-relay".into())
             .spawn(move || {
+                let _completion = RelayThreadCompletion(thread_done);
                 let rt = tokio::runtime::Builder::new_multi_thread()
                     .enable_all()
                     .build()
@@ -384,6 +433,8 @@ impl RelayServer {
             local_addr,
             cmd_tx: Some(cmd_tx),
             thread: Some(thread),
+            thread_stopped: std::sync::Mutex::new(thread_stopped),
+            shutdown_error: None,
             state,
             cancel,
         })
@@ -431,25 +482,58 @@ impl RelayServer {
             .map_err(|_| "Relay thread dropped".to_string())
     }
 
-    /// Close forwarding admission and wait for native transactions to finish.
-    /// A resource that never returns keeps its finite slot and can keep this
-    /// barrier pending; HTTP waiter departure does not complete the barrier.
-    pub fn stop(&mut self) -> Result<(), String> {
+    fn initiate_stop(&mut self) {
         self.state.forwarding.close();
+        self.state.topics.cancel_sources_for_shutdown();
         // Leave broadcast happens inside the tokio runtime (in `run()`'s shutdown block).
         self.cancel.cancel();
+        // This is the sole command sender. Closing it wakes the command loop
+        // without making a bounded shutdown observation wait to enqueue work.
+        self.cmd_tx.take();
+    }
 
-        if let Some(tx) = self.cmd_tx.take() {
-            let (reply_tx, reply_rx) = oneshot::channel();
-            let _ = tx.blocking_send(Command::Stop { reply: reply_tx });
-            let _ = reply_rx.blocking_recv();
+    fn join_stopped_thread(&mut self) -> Result<(), String> {
+        if let Some(error) = &self.shutdown_error {
+            return Err(error.clone());
         }
         if let Some(thread) = self.thread.take() {
-            thread
-                .join()
-                .map_err(|_| "Relay thread panicked before shutdown completed".to_string())?;
+            if thread.join().is_err() {
+                let error = "Relay thread panicked before shutdown completed".to_string();
+                self.shutdown_error = Some(error.clone());
+                return Err(error);
+            }
         }
         Ok(())
+    }
+
+    /// Initiate shutdown and observe it for at most `timeout`. A timeout does
+    /// not cancel cleanup; a later call observes the same running transaction.
+    pub fn shutdown_and_wait(&mut self, timeout: Duration) -> Result<RelayShutdownReceipt, String> {
+        self.initiate_stop();
+        if self.thread.is_none() {
+            self.join_stopped_thread()?;
+            return Ok(RelayShutdownReceipt { completed: true });
+        }
+        let observed = self
+            .thread_stopped
+            .get_mut()
+            .map_err(|_| "relay shutdown observation lock poisoned".to_string())?
+            .recv_timeout(timeout);
+        match observed {
+            Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                self.join_stopped_thread()?;
+                Ok(RelayShutdownReceipt { completed: true })
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                Ok(RelayShutdownReceipt { completed: false })
+            }
+        }
+    }
+
+    /// Close forwarding admission and wait for all real cleanup to finish.
+    pub fn stop(&mut self) -> Result<(), String> {
+        self.initiate_stop();
+        self.join_stopped_thread()
     }
 
     // -- Internal ---------------------------------------------------------
@@ -490,8 +574,8 @@ impl RelayServer {
 
         let (http_stop, http_stopped) = oneshot::channel();
         let server = axum::serve(
-            listener,
-            app.into_make_service_with_connect_info::<SocketAddr>(),
+            crate::relay::connection::RelayListener(listener),
+            app.into_make_service_with_connect_info::<crate::relay::connection::ConnectionInfo>(),
         )
         .with_graceful_shutdown(async {
             let _ = http_stopped.await;
@@ -508,6 +592,7 @@ impl RelayServer {
         // Fence admission and observe native forwarding before the runtime can
         // destroy tasks/IPC futures. Waiter disappearance never counts as drain.
         state.forwarding.close();
+        state.topics.cancel_sources_for_shutdown();
         state.forwarding.drain().await;
         // Registration handlers can be waiting for control publication. Fence
         // it before awaiting HTTP handlers, so graceful drain has no cycle.
@@ -890,10 +975,6 @@ impl RelayServer {
                         .map(|r| (r.name, r.ipc_address.unwrap_or_default()))
                         .collect();
                     let _ = reply.send(routes);
-                }
-                Command::Stop { reply } => {
-                    let _ = reply.send(());
-                    return;
                 }
             }
         }

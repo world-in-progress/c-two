@@ -11,6 +11,14 @@ pub enum ForwardRecord {
     CallEnd(stream::StreamTerminal),
 }
 
+/// Records from a pull-driven topic subscription. Payload slices are read with
+/// the same caller-owned window as a forwarded server stream.
+#[derive(Debug, Clone)]
+pub enum ForwardTopicRecord {
+    ItemBegin { seq: u64, total_bytes: u64 },
+    CallEnd(stream::StreamTerminal),
+}
+
 struct PendingRead {
     bytes: Vec<u8>,
     slice: WindowSlice,
@@ -69,10 +77,23 @@ fn cancelled_read() -> IpcError {
     ))
 }
 
+fn topic_opening_terminal_error(terminal: &stream::StreamTerminal) -> crate::IpcCallError {
+    if terminal.status == CallStatus::Success {
+        dispatch_uncertain_call_error(IpcError::Protocol(
+            "subscription succeeded before READY".into(),
+        ))
+    } else {
+        stream::terminal_failure(terminal)
+    }
+}
+
 #[derive(Default)]
 struct ForwardState {
     id: Option<u64>,
-    begin: Option<u64>,
+    begin: Option<(Option<u64>, u64)>,
+    ready: Option<u64>,
+    next_seq: Option<u64>,
+    sequence_exhausted: bool,
     total: Option<u64>,
     copied: u64,
     carrier: Option<ServerShmResponse>,
@@ -81,6 +102,8 @@ struct ForwardState {
     pending: Option<PendingRead>,
     pending_storage: u64,
     pending_demand: u64,
+    sync_pending: Vec<oneshot::Sender<u64>>,
+    sync_inflight: Vec<oneshot::Sender<u64>>,
     demand_outstanding: bool,
     cancel: Option<rpc::CancelCause>,
     cancel_wire: Option<rpc::CancelCause>,
@@ -99,6 +122,7 @@ pub(crate) struct ForwardReceive {
     changed: Notify,
     upload_stop: StdMutex<Option<watch::Sender<bool>>>,
     max_item_bytes: u64,
+    subscription: bool,
 }
 
 #[derive(Clone)]
@@ -175,7 +199,7 @@ impl IpcForwardStream {
             notified.as_mut().enable();
             {
                 let mut state = self.call.state.lock();
-                if let Some(total_bytes) = state.begin.take() {
+                if let Some((_, total_bytes)) = state.begin.take() {
                     return Ok(ForwardRecord::ItemBegin { total_bytes });
                 }
                 if let Some(error) = &state.local_error {
@@ -356,8 +380,158 @@ impl IpcForwardStream {
     }
 }
 
+/// A relay-owned subscription whose payloads are copied through charged,
+/// independently releasable windows instead of a whole-item allocation.
+pub struct IpcForwardTopic {
+    stream: IpcForwardStream,
+    start_seq: u64,
+}
+
+/// Independent control handle so source confirmation can run while the
+/// forwarding task is waiting for or copying a topic item.
+#[derive(Clone)]
+pub struct IpcTopicSynchronizer(Arc<ForwardReceive>);
+
+impl IpcForwardTopic {
+    pub fn start_seq(&self) -> u64 {
+        self.start_seq
+    }
+
+    pub fn cancellation(&self) -> IpcForwardCancellation {
+        self.stream.cancellation()
+    }
+
+    pub fn synchronizer(&self) -> IpcTopicSynchronizer {
+        IpcTopicSynchronizer(self.stream.call.clone())
+    }
+
+    /// Confirm the source's current head against this exact subscription.
+    /// Waiters queued before a SYNC is written share its acknowledgement;
+    /// later waiters require a new SYNC to preserve causal ordering.
+    pub async fn sync_head_seq(&self) -> Result<u64, crate::IpcCallError> {
+        self.synchronizer().sync_head_seq().await
+    }
+
+    pub async fn next_record(&mut self) -> Result<ForwardTopicRecord, crate::IpcCallError> {
+        loop {
+            let notified = self.stream.call.changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            {
+                let mut state = self.stream.call.state.lock();
+                if let Some((Some(seq), total_bytes)) = state.begin.take() {
+                    return Ok(ForwardTopicRecord::ItemBegin { seq, total_bytes });
+                }
+                if let Some(error) = &state.local_error {
+                    return Err(dispatch_uncertain_call_error(
+                        stream::clone_observation_error(error),
+                    ));
+                }
+                if let Some(terminal) = &state.terminal {
+                    if state.total.is_none() || state.cancel == Some(rpc::CancelCause::Consumer) {
+                        return Ok(ForwardTopicRecord::CallEnd(terminal.clone()));
+                    }
+                }
+                if state.ended {
+                    return Err(dispatch_uncertain_call_error(
+                        state
+                            .io_error
+                            .as_ref()
+                            .map_or(IpcError::Closed, stream::clone_observation_error),
+                    ));
+                }
+                if state.total.is_none() && !state.demand_outstanding && state.cancel.is_none() {
+                    let id = state.id.expect("published forwarding subscription");
+                    self.stream
+                        .call
+                        .conn
+                        .core
+                        .stream_credit(id, 0, 1)
+                        .map_err(|e| dispatch_uncertain_call_error(core_error(e)))?;
+                    state.pending_demand = 1;
+                    state.demand_outstanding = true;
+                    self.stream.call.conn.wake.notify_one();
+                }
+            }
+            notified.await;
+        }
+    }
+
+    pub async fn read_chunk(
+        &mut self,
+        slice: WindowSlice,
+        max_bytes: usize,
+    ) -> Result<Option<WindowChunk>, crate::IpcCallError> {
+        self.stream.read_chunk(slice, max_bytes).await
+    }
+
+    pub async fn completion(&self) -> Result<stream::StreamTerminal, crate::IpcCallError> {
+        self.stream.completion().await
+    }
+}
+
+impl IpcTopicSynchronizer {
+    pub async fn sync_head_seq(&self) -> Result<u64, crate::IpcCallError> {
+        let (tx, rx) = oneshot::channel();
+        let queued = {
+            let mut state = self.0.state.lock();
+            if state.ended || state.cancel.is_some() {
+                false
+            } else {
+                state.sync_pending.push(tx);
+                true
+            }
+        };
+        if !queued {
+            return self.sync_terminal_error().await;
+        }
+        self.0.conn.wake.notify_one();
+        match rx.await {
+            Ok(head_seq) => Ok(head_seq),
+            Err(_) => self.sync_terminal_error().await,
+        }
+    }
+
+    async fn sync_terminal_error(&self) -> Result<u64, crate::IpcCallError> {
+        loop {
+            let notified = self.0.changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let outcome = {
+                let state = self.0.state.lock();
+                if let Some(terminal) = &state.terminal {
+                    Some(if terminal.status != CallStatus::Success {
+                        stream::terminal_failure(terminal)
+                    } else {
+                        dispatch_uncertain_call_error(IpcError::Protocol(
+                            "subscription ended without an error".into(),
+                        ))
+                    })
+                } else if state.ended {
+                    Some(dispatch_uncertain_call_error(
+                        state
+                            .io_error
+                            .as_ref()
+                            .map_or(IpcError::Closed, stream::clone_observation_error),
+                    ))
+                } else {
+                    None
+                }
+            };
+            if let Some(error) = outcome {
+                return Err(error);
+            }
+            notified.await;
+        }
+    }
+}
+
 impl ForwardReceive {
-    fn new(conn: Arc<ClientConnection>, max_item_bytes: u64) -> (Arc<Self>, IpcForwardStream) {
+    fn new(
+        conn: Arc<ClientConnection>,
+        max_item_bytes: u64,
+        subscription: bool,
+    ) -> (Arc<Self>, IpcForwardStream) {
         let call = Arc::new(Self {
             state: StdMutex::new(ForwardState {
                 demand_outstanding: true,
@@ -367,6 +541,7 @@ impl ForwardReceive {
             changed: Notify::new(),
             upload_stop: StdMutex::new(None),
             max_item_bytes,
+            subscription,
         });
         let stream = IpcForwardStream {
             call: call.clone(),
@@ -377,7 +552,11 @@ impl ForwardReceive {
     }
 
     pub(crate) fn publish(&self, id: u64) -> Result<(), IpcError> {
-        self.conn.core.stream_open(id).map_err(core_error)?;
+        if self.subscription {
+            self.conn.core.subscribe_open(id).map_err(core_error)?;
+        } else {
+            self.conn.core.stream_open(id).map_err(core_error)?;
+        }
         let mut state = self.state.lock();
         state.id = Some(id);
         if let Some(cause) = state.cancel {
@@ -402,6 +581,7 @@ impl ForwardReceive {
         if state.cancel.is_none() || cause == rpc::CancelCause::Consumer {
             state.cancel = Some(cause);
         }
+        state.sync_pending.clear();
         if cause == rpc::CancelCause::Consumer {
             state.begin.take();
             state.pending.take();
@@ -443,6 +623,9 @@ impl ForwardReceive {
             && state.id.is_some()
             && (state.pending_storage > 0
                 || state.pending_demand > 0
+                || (state.cancel.is_none()
+                    && !state.sync_pending.is_empty()
+                    && state.sync_inflight.is_empty())
                 || state.cancel_wire.is_some())
     }
 
@@ -457,13 +640,72 @@ impl ForwardReceive {
         if storage > 0 || demand > 0 {
             return Some(rpc::encode_credit_frame(id, storage, demand).expect("checked grant"));
         }
+        if state.sync_inflight.is_empty()
+            && !state.sync_pending.is_empty()
+            && state.cancel.is_none()
+        {
+            state.sync_inflight = std::mem::take(&mut state.sync_pending);
+            return Some(rpc::encode_sync_frame(id).expect("published request ID"));
+        }
         let cause = state.cancel_wire.take();
         state.cancel_wire = state.next_cancel_wire.take();
         cause.map(|cause| rpc::encode_cancel_frame(id, cause).expect("published request ID"))
     }
 
-    pub(crate) fn begin(&self, total: u64) -> Result<(), IpcError> {
+    pub(crate) fn ready(&self, start_seq: u64) -> Result<(), IpcError> {
         let mut state = self.state.lock();
+        if !self.subscription || start_seq == 0 || state.ready.is_some() {
+            return Err(IpcError::Protocol("invalid subscription READY".into()));
+        }
+        state.ready = Some(start_seq);
+        state.next_seq = Some(start_seq);
+        drop(state);
+        self.changed.notify_waiters();
+        Ok(())
+    }
+
+    pub(crate) fn sync_ack(&self, head_seq: u64) -> Result<(), IpcError> {
+        let waiters = {
+            let mut state = self.state.lock();
+            if !self.subscription || state.sync_inflight.is_empty() {
+                return Err(IpcError::Protocol(
+                    "unexpected subscription SYNC_ACK".into(),
+                ));
+            }
+            if state.cancel.is_some() || state.local_error.is_some() {
+                state.sync_inflight.clear();
+                return Ok(());
+            }
+            std::mem::take(&mut state.sync_inflight)
+        };
+        for waiter in waiters {
+            let _ = waiter.send(head_seq);
+        }
+        self.conn.wake.notify_one();
+        Ok(())
+    }
+
+    pub(crate) fn begin(&self, seq: Option<u64>, total: u64) -> Result<(), IpcError> {
+        let mut state = self.state.lock();
+        if self.subscription {
+            if state.sequence_exhausted {
+                return Err(IpcError::Protocol("subscription sequence exhausted".into()));
+            }
+            let expected = state
+                .next_seq
+                .ok_or_else(|| IpcError::Protocol("subscription ITEM_BEGIN before READY".into()))?;
+            let actual = seq
+                .ok_or_else(|| IpcError::Protocol("subscription ITEM_BEGIN without seq".into()))?;
+            if actual < expected {
+                return Err(IpcError::Protocol("non-monotonic subscription seq".into()));
+            }
+            state.next_seq = Some(actual.saturating_add(1));
+            state.sequence_exhausted = actual == u64::MAX;
+        } else if seq.is_some() {
+            return Err(IpcError::Protocol(
+                "server stream ITEM_BEGIN with seq".into(),
+            ));
+        }
         let id = state.id.ok_or(IpcError::Closed)?;
         self.conn
             .core
@@ -475,7 +717,7 @@ impl ForwardReceive {
                 self.max_item_bytes
             )));
         }
-        state.begin = (state.cancel != Some(rpc::CancelCause::Consumer)).then_some(total);
+        state.begin = (state.cancel != Some(rpc::CancelCause::Consumer)).then_some((seq, total));
         state.demand_outstanding = false;
         state.copied = 0;
         state.total = (total > 0).then_some(total);
@@ -701,6 +943,8 @@ impl ForwardReceive {
         }
         state.pending.take();
         state.carrier.take();
+        state.sync_pending.clear();
+        state.sync_inflight.clear();
         state.ended = true;
         self.conn.core.stream_retire(id);
         entry.finish_stream_upload(match terminal.status {
@@ -749,6 +993,8 @@ impl ForwardReceive {
         state.io_error = Some(error);
         state.pending.take();
         state.carrier.take();
+        state.sync_pending.clear();
+        state.sync_inflight.clear();
         state.ended = true;
         if let Some(id) = state.id {
             self.conn.core.stream_retire(id);
@@ -757,6 +1003,75 @@ impl ForwardReceive {
 }
 
 impl IpcClient {
+    /// Open one topic subscription for relay forwarding. The returned handle
+    /// observes READY before exposing any item and uses caller-supplied windows.
+    pub async fn forward_subscribe_bound(
+        &self,
+        binding: &RouteBinding,
+        topic_name: &str,
+        options: rpc::WireSubscribeOptions,
+    ) -> Result<IpcForwardTopic, crate::IpcCallError> {
+        c2_contract::validate_contract_text_field("topic_name", topic_name)
+            .map_err(|e| pre_dispatch_call_error(IpcError::Protocol(e.to_string())))?;
+        let (identity, limit) = binding.subscribe_target();
+        let (send, mut rx) = self
+            .begin_pending(PendingKind::Call(CallMode::Subscribe), limit)
+            .map_err(pre_dispatch_call_error)?;
+        let (call, mut stream) = ForwardReceive::new(send.conn.clone(), limit, true);
+        self.pending
+            .lock()
+            .unpublished_mut(&send.state)
+            .expect("original forwarded subscription draft")
+            .forward = Some(call.clone());
+        let frame = rpc::encode_open_subscribe_draft_frame(&identity, topic_name, options)
+            .map_err(|e| pre_dispatch_call_error(IpcError::Protocol(e.to_string())))?;
+        if let Err(error) = send
+            .conn
+            .submit(
+                frame,
+                WriteRequest::Business(Vec::new()),
+                send.state.clone(),
+                None,
+            )
+            .await
+        {
+            return Err(match prefer_ready_response(error, &mut rx) {
+                Ok(_) => dispatch_call_error(IpcError::Closed, send.started()),
+                Err(source) => dispatch_call_error(source, send.started()),
+            });
+        }
+        stream.uploaded = true;
+        let start_seq = loop {
+            let notified = call.changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            {
+                let state = call.state.lock();
+                if let Some(start_seq) = state.ready {
+                    break start_seq;
+                }
+                if let Some(error) = &state.local_error {
+                    return Err(dispatch_uncertain_call_error(
+                        stream::clone_observation_error(error),
+                    ));
+                }
+                if let Some(terminal) = &state.terminal {
+                    return Err(topic_opening_terminal_error(terminal));
+                }
+                if state.ended {
+                    return Err(dispatch_uncertain_call_error(
+                        state
+                            .io_error
+                            .as_ref()
+                            .map_or(IpcError::Closed, stream::clone_observation_error),
+                    ));
+                }
+            }
+            notified.await;
+        };
+        Ok(IpcForwardTopic { stream, start_seq })
+    }
+
     /// Begin one server stream while uploading a declared-size request through
     /// a bounded, caller-owned send allocation. Return after upload completion
     /// or a real early terminal; the detached driver retains the charge if
@@ -789,7 +1104,7 @@ impl IpcClient {
         let (send, mut rx) = self
             .begin_pending(PendingKind::Call(CallMode::ServerStream), limit)
             .map_err(pre_dispatch_call_error)?;
-        let (call, mut stream) = ForwardReceive::new(send.conn.clone(), limit);
+        let (call, mut stream) = ForwardReceive::new(send.conn.clone(), limit, false);
         let (upload_stop, stop_upload) = watch::channel(false);
         *call.upload_stop.lock() = Some(upload_stop.clone());
         {

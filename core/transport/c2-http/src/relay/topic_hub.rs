@@ -1,0 +1,1917 @@
+//! Registration-scoped shared upstream subscriptions for relay topics.
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Weak};
+
+use axum::{
+    body::{Body, Bytes},
+    http::{StatusCode, header},
+    response::{IntoResponse, Response},
+};
+use c2_error::{C2Error, ErrorCode};
+use c2_ipc::{ForwardTopicRecord, IpcForwardTopic, IpcTopicSynchronizer, RouteBinding};
+use c2_mem::{DomainBudget, OperationPermit};
+use c2_wire::rpc::{CancelCause, WireLagPolicy, WireSubscribeOptions, WireTopicStart};
+use parking_lot::Mutex;
+use tokio::sync::Notify;
+use tokio_util::task::task_tracker::TaskTrackerToken;
+
+use super::conn_pool::UpstreamLease;
+use super::connection::ConnectionControl;
+use super::forwarding::StreamCancellation;
+use super::state::RelayState;
+use super::types::{RouteEntry, local_route_matches};
+use crate::topic_wire::{self, RecordKind, Status, Terminal};
+
+#[derive(Clone, Debug, Hash, Eq, PartialEq)]
+struct HubKey {
+    instance: String,
+    route_uid: String,
+    topic: String,
+}
+
+#[derive(Default)]
+pub(crate) struct TopicHubTable {
+    hubs: Mutex<HashMap<HubKey, Weak<Hub>>>,
+    budget_changed: Arc<Notify>,
+    file_segments: Arc<AtomicUsize>,
+    latest_budgets: Arc<LatestBudgets>,
+}
+
+#[derive(Default)]
+struct LatestBudgets {
+    totals: Mutex<(u64, u64)>,
+}
+impl TopicHubTable {
+    pub(crate) fn cancel_sources_for_shutdown(&self) {
+        let hubs: Vec<_> = self
+            .hubs
+            .lock()
+            .values()
+            .filter_map(Weak::upgrade)
+            .collect();
+        for hub in hubs {
+            let cancel = hub.inner.lock().source_cancel.clone();
+            if let Some(cancel) = cancel {
+                let _ = cancel.cancel(CancelCause::Lifecycle);
+            }
+        }
+    }
+
+    #[cfg(feature = "test-support")]
+    pub(crate) fn blocked_subscribers(&self) -> usize {
+        self.hubs
+            .lock()
+            .values()
+            .filter_map(Weak::upgrade)
+            .map(|hub| {
+                hub.inner
+                    .lock()
+                    .subscribers
+                    .values()
+                    .filter_map(Weak::upgrade)
+                    .filter(|subscriber| {
+                        subscriber
+                            .connection
+                            .as_ref()
+                            .is_some_and(|conn| conn.is_blocked())
+                    })
+                    .count()
+            })
+            .sum()
+    }
+
+    async fn join(&self, key: HubKey, subscriber: Arc<Subscriber>) -> (Arc<Hub>, bool, JoinGuard) {
+        loop {
+            let waiting = {
+                let mut hubs = self.hubs.lock();
+                let waiting = if let Some(hub) = hubs.get(&key).and_then(Weak::upgrade) {
+                    let mut state = hub.inner.lock();
+                    if !state.closing && state.terminal.is_none() {
+                        state.joiners += 1;
+                        drop(state);
+                        return (
+                            hub.clone(),
+                            false,
+                            JoinGuard {
+                                hub: Some(hub),
+                                subscriber,
+                            },
+                        );
+                    }
+                    if state.terminal.is_none() {
+                        let notified = hub.changed.clone().notified_owned();
+                        Some(Box::pin(notified))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                if let Some(mut notified) = waiting {
+                    notified.as_mut().enable();
+                    Some(notified)
+                } else {
+                    let hub = Arc::new(Hub {
+                        key: key.clone(),
+                        inner: Mutex::new(HubState {
+                            joiners: 1,
+                            ..Default::default()
+                        }),
+                        changed: Arc::new(Notify::new()),
+                        budget_changed: self.budget_changed.clone(),
+                        file_segments: self.file_segments.clone(),
+                        latest_budgets: self.latest_budgets.clone(),
+                    });
+                    hubs.insert(key, Arc::downgrade(&hub));
+                    return (
+                        hub.clone(),
+                        true,
+                        JoinGuard {
+                            hub: Some(hub),
+                            subscriber,
+                        },
+                    );
+                }
+            };
+            if let Some(waiting) = waiting {
+                waiting.await;
+            }
+        }
+    }
+
+    fn remove(&self, hub: &Arc<Hub>) {
+        let mut hubs = self.hubs.lock();
+        if hubs
+            .get(&hub.key)
+            .is_some_and(|current| Weak::ptr_eq(current, &Arc::downgrade(hub)))
+        {
+            hubs.remove(&hub.key);
+        }
+    }
+}
+
+struct HubFrame {
+    seq: u64,
+    total: u64,
+    chunks: Vec<Bytes>,
+    memory_bytes: u64,
+    file_bytes: u64,
+    _metadata: Arc<c2_mem::MemoryReservation>,
+}
+
+struct LatestFrame {
+    frame: Arc<HubFrame>,
+    budgets: Arc<LatestBudgets>,
+}
+impl LatestFrame {
+    fn new(frame: HubFrame, budgets: Arc<LatestBudgets>) -> Self {
+        {
+            let mut totals = budgets.totals.lock();
+            totals.0 += frame.memory_bytes;
+            totals.1 += frame.file_bytes;
+        }
+        Self {
+            frame: Arc::new(frame),
+            budgets,
+        }
+    }
+}
+impl std::ops::Deref for LatestFrame {
+    type Target = HubFrame;
+    fn deref(&self) -> &Self::Target {
+        &self.frame
+    }
+}
+impl Drop for LatestFrame {
+    fn drop(&mut self) {
+        let mut totals = self.budgets.totals.lock();
+        totals.0 -= self.frame.memory_bytes;
+        totals.1 -= self.frame.file_bytes;
+    }
+}
+#[derive(Default)]
+struct HubState {
+    joiners: usize,
+    next_subscriber: u64,
+    source: Option<IpcTopicSynchronizer>,
+    source_cancel: Option<c2_ipc::IpcForwardCancellation>,
+    history: VecDeque<LatestFrame>,
+    latest: Option<LatestFrame>,
+    latest_eligible: HashSet<u64>,
+    incoming: Option<(u64, HashSet<u64>)>,
+    subscribers: HashMap<u64, Weak<Subscriber>>,
+    retired: Vec<Weak<Subscriber>>,
+    terminal: Option<C2Error>,
+    closing: bool,
+    last_hold: Option<Arc<Subscriber>>,
+}
+impl HubState {
+    fn prune_history(&mut self) {
+        // A joining subscriber may already have a confirmed source sequence
+        // while its SYNC acknowledgement is still travelling back to it.
+        if self.joiners != 0 {
+            return;
+        }
+        let first_needed = self
+            .subscribers
+            .values()
+            .filter_map(Weak::upgrade)
+            .filter(|subscriber| {
+                !subscriber.detached.load(Ordering::Acquire)
+                    && !subscriber.sequence_exhausted.load(Ordering::Acquire)
+            })
+            .map(|subscriber| subscriber.next_seq.load(Ordering::Acquire))
+            .min();
+        while self
+            .history
+            .front()
+            .is_some_and(|frame| first_needed.is_none_or(|seq| frame.seq < seq))
+        {
+            self.history.pop_front();
+        }
+    }
+}
+struct Hub {
+    key: HubKey,
+    inner: Mutex<HubState>,
+    changed: Arc<Notify>,
+    budget_changed: Arc<Notify>,
+    file_segments: Arc<AtomicUsize>,
+    latest_budgets: Arc<LatestBudgets>,
+}
+struct JoinGuard {
+    hub: Option<Arc<Hub>>,
+    subscriber: Arc<Subscriber>,
+}
+impl Drop for JoinGuard {
+    fn drop(&mut self) {
+        if let Some(hub) = self.hub.take() {
+            let mut state = hub.inner.lock();
+            state.joiners -= 1;
+            state.prune_history();
+            if state.joiners == 0 && state.subscribers.is_empty() && state.terminal.is_none() {
+                state.closing = true;
+                state.last_hold = Some(self.subscriber.clone());
+            }
+            drop(state);
+            hub.changed.notify_waiters();
+        }
+    }
+}
+struct Subscriber {
+    _permit: OperationPermit,
+    _tracked: TaskTrackerToken,
+    connection: Option<Arc<ConnectionControl>>,
+    detached: AtomicBool,
+    selected: AtomicBool,
+    frame_started: AtomicBool,
+    evicted: AtomicBool,
+    unsent: Mutex<VecDeque<Bytes>>,
+    next_seq: AtomicU64,
+    sequence_exhausted: AtomicBool,
+    inflight_chunks: AtomicUsize,
+    changed: Notify,
+}
+impl Hub {
+    fn fail(&self, error: C2Error) {
+        let mut state = self.inner.lock();
+        if state.terminal.is_none() {
+            state.terminal = Some(error);
+        }
+        state.closing = true;
+        state.history.clear();
+        if state.latest_eligible.is_empty() {
+            state.latest.take();
+        }
+        drop(state);
+        self.changed.notify_waiters();
+    }
+    fn detach(&self, id: u64, subscriber: &Arc<Subscriber>) {
+        if subscriber.detached.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let mut state = self.inner.lock();
+        state.subscribers.remove(&id);
+        state.retired.retain(|old| old.strong_count() != 0);
+        state.retired.push(Arc::downgrade(subscriber));
+        state.latest_eligible.remove(&id);
+        if let Some((_, eligible)) = &mut state.incoming {
+            eligible.remove(&id);
+        }
+        state.prune_history();
+        if state.terminal.is_some() && state.latest_eligible.is_empty() {
+            state.latest.take();
+        }
+        if state.subscribers.is_empty() && state.joiners == 0 && state.terminal.is_none() {
+            state.closing = true;
+            state.last_hold = Some(subscriber.clone());
+            state.history.clear();
+            state.latest.take();
+        }
+        drop(state);
+        self.changed.notify_waiters();
+    }
+    async fn source(&self) -> Result<IpcTopicSynchronizer, C2Error> {
+        loop {
+            let notified = self.changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            {
+                let state = self.inner.lock();
+                if let Some(error) = &state.terminal {
+                    return Err(error.clone());
+                }
+                if let Some(source) = &state.source {
+                    return Ok(source.clone());
+                }
+            }
+            notified.await;
+        }
+    }
+    fn set_source(
+        &self,
+        source: IpcTopicSynchronizer,
+        cancel: c2_ipc::IpcForwardCancellation,
+        shutdown: &tokio_util::sync::CancellationToken,
+    ) {
+        let mut state = self.inner.lock();
+        state.source = Some(source);
+        state.source_cancel = Some(cancel.clone());
+        drop(state);
+        if shutdown.is_cancelled() {
+            let _ = cancel.cancel(CancelCause::Lifecycle);
+        }
+        self.changed.notify_waiters();
+    }
+    fn begin_frame(&self, seq: u64) {
+        let mut state = self.inner.lock();
+        let eligible = state
+            .subscribers
+            .iter()
+            .filter_map(|(&id, weak)| {
+                let sub = weak.upgrade()?;
+                (!sub.detached.load(Ordering::Acquire)
+                    && !sub.selected.load(Ordering::Acquire)
+                    && !sub.sequence_exhausted.load(Ordering::Acquire)
+                    && sub.next_seq.load(Ordering::Acquire) <= seq)
+                    .then_some(id)
+            })
+            .collect();
+        state.incoming = Some((seq, eligible));
+    }
+    fn stopped(&self) -> bool {
+        self.inner.lock().closing
+    }
+    fn evict_history(&self) -> bool {
+        let old = {
+            let mut state = self.inner.lock();
+            state.history.pop_front().or_else(|| {
+                state.latest_eligible.clear();
+                state.latest.take()
+            })
+        };
+        let had_old = old.is_some();
+        if had_old {
+            drop(old);
+            self.changed.notify_waiters();
+        }
+        had_old
+    }
+    fn evict_stalled(&self, shutdown: &tokio_util::sync::CancellationToken) -> bool {
+        let state = self.inner.lock();
+        let blocked = state.subscribers.iter().find_map(|(&id, weak)| {
+            let sub = weak.upgrade()?;
+            let blocked = sub
+                .connection
+                .as_ref()
+                .is_some_and(|conn| conn.is_blocked());
+            (blocked
+                && !sub.evicted.load(Ordering::Acquire)
+                && (sub.frame_started.load(Ordering::Acquire)
+                    || sub.inflight_chunks.load(Ordering::Acquire) != 0))
+                .then_some((id, sub))
+        });
+        let retired = state.retired.iter().filter_map(Weak::upgrade).find(|sub| {
+            !sub.evicted.load(Ordering::Acquire)
+                && (sub.frame_started.load(Ordering::Acquire)
+                    || sub.inflight_chunks.load(Ordering::Acquire) != 0)
+                && sub
+                    .connection
+                    .as_ref()
+                    .is_some_and(|conn| conn.is_blocked())
+        });
+        drop(state);
+        if let Some((id, sub)) = blocked {
+            let Some(connection) = &sub.connection else {
+                return false;
+            };
+            if shutdown.is_cancelled()
+                || !connection.is_blocked()
+                || (!sub.frame_started.load(Ordering::Acquire)
+                    && sub.inflight_chunks.load(Ordering::Acquire) == 0)
+                || sub.evicted.swap(true, Ordering::AcqRel)
+            {
+                return false;
+            }
+            connection.abort();
+            sub.unsent.lock().clear();
+            self.detach(id, &sub);
+            sub.changed.notify_waiters();
+            self.changed.notify_waiters();
+            true
+        } else if let Some(sub) = retired {
+            let Some(connection) = &sub.connection else {
+                return false;
+            };
+            if shutdown.is_cancelled()
+                || !connection.is_blocked()
+                || (!sub.frame_started.load(Ordering::Acquire)
+                    && sub.inflight_chunks.load(Ordering::Acquire) == 0)
+                || sub.evicted.swap(true, Ordering::AcqRel)
+            {
+                return false;
+            }
+            connection.abort();
+            sub.unsent.lock().clear();
+            sub.changed.notify_waiters();
+            self.changed.notify_waiters();
+            true
+        } else {
+            false
+        }
+    }
+}
+
+fn cancellation(cause: &str) -> C2Error {
+    C2Error::new(
+        ErrorCode::CallCancelled,
+        format!("subscription cancelled: {cause}"),
+    )
+    .with_details(BTreeMap::from([("cause".into(), cause.into())]))
+}
+fn capacity(message: impl Into<String>) -> C2Error {
+    C2Error::new(ErrorCode::CallCapacityExceeded, message)
+}
+fn upstream_error(error: c2_ipc::IpcCallError) -> C2Error {
+    match error.into_source() {
+        c2_ipc::IpcError::CallRejected(error) | c2_ipc::IpcError::LocalCallRejected(error) => error,
+        c2_ipc::IpcError::CrmError(bytes) => C2Error::from_wire_bytes(&bytes)
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| C2Error::new(ErrorCode::ProtocolViolation, "invalid upstream C2E1")),
+        error => C2Error::new(ErrorCode::ResourceUnavailable, error.to_string()),
+    }
+}
+
+/// Attach after caller has resolved the route and acquired its source endpoint.
+pub(crate) async fn subscribe(
+    state: Arc<RelayState>,
+    route: RouteEntry,
+    topic: String,
+    options: WireSubscribeOptions,
+    lease: UpstreamLease,
+    binding: RouteBinding,
+    permit: OperationPermit,
+    tracked: TaskTrackerToken,
+    connection: Option<Arc<ConnectionControl>>,
+) -> Result<Response, C2Error> {
+    let key = HubKey {
+        instance: route.server_instance_id.clone().ok_or_else(|| {
+            C2Error::new(
+                ErrorCode::ResourceUnavailable,
+                "local route has no server identity",
+            )
+        })?,
+        route_uid: route.route_uid.clone().ok_or_else(|| {
+            C2Error::new(
+                ErrorCode::ResourceUnavailable,
+                "local route has no registration identity",
+            )
+        })?,
+        topic: topic.clone(),
+    };
+    let subscriber = Arc::new(Subscriber {
+        _permit: permit,
+        _tracked: tracked,
+        connection,
+        detached: AtomicBool::new(false),
+        selected: AtomicBool::new(false),
+        frame_started: AtomicBool::new(false),
+        evicted: AtomicBool::new(false),
+        unsent: Mutex::new(VecDeque::new()),
+        next_seq: AtomicU64::new(0),
+        sequence_exhausted: AtomicBool::new(false),
+        inflight_chunks: AtomicUsize::new(0),
+        changed: Notify::new(),
+    });
+    let (hub, leader, guard) = state.topics.join(key, subscriber.clone()).await;
+    if leader {
+        let driver_state = state.clone();
+        let driver_hub = hub.clone();
+        state.forwarding.spawn_driver(async move {
+            drive(driver_state, driver_hub, route, topic, lease, binding).await;
+        });
+    } else {
+        drop(lease);
+    }
+    let source = hub.source().await?;
+    let head = source.sync_head_seq().await.map_err(upstream_error)?;
+    let start_seq = match options.start {
+        WireTopicStart::Latest => head.max(1),
+        WireTopicStart::Next => head
+            .checked_add(1)
+            .ok_or_else(|| capacity("topic sequence space exhausted"))?,
+    };
+    let (token, control) = state
+        .forwarding
+        .register_stream()
+        .map_err(|e| C2Error::new(ErrorCode::ResourceUnavailable, e.to_string()))?;
+    let id = {
+        let mut inner = hub.inner.lock();
+        if let Some(error) = &inner.terminal {
+            state.forwarding.remove_stream(&token);
+            return Err(error.clone());
+        }
+        if inner.closing {
+            state.forwarding.remove_stream(&token);
+            return Err(cancellation("relay_shutdown"));
+        }
+        let Some(next_id) = inner.next_subscriber.checked_add(1) else {
+            state.forwarding.remove_stream(&token);
+            return Err(capacity("subscriber identifiers exhausted"));
+        };
+        inner.next_subscriber = next_id;
+        let id = inner.next_subscriber;
+        subscriber.next_seq.store(start_seq, Ordering::Release);
+        inner.subscribers.insert(id, Arc::downgrade(&subscriber));
+        if let Some((seq, eligible)) = &mut inner.incoming {
+            if start_seq <= *seq {
+                eligible.insert(id);
+            }
+        }
+        id
+    };
+    drop(guard);
+    let monitor_hub = hub.clone();
+    let monitor_sub = subscriber.clone();
+    let monitor_control = control.clone();
+    let monitor_state = state.clone();
+    let monitor_token = token.clone();
+    let done = tokio_util::sync::CancellationToken::new();
+    let monitor_done = done.clone();
+    state.forwarding.spawn_driver(async move {
+        let mut body_done = false;
+        let mut cancellation_seen = false;
+        let mut consumer_seen = false;
+        loop {
+            if body_done && monitor_sub.inflight_chunks.load(Ordering::Acquire) == 0 { break; }
+            if let Some(connection) = &monitor_sub.connection {
+                tokio::select! {
+                    cause = monitor_control.requested(), if !cancellation_seen => {
+                        cancellation_seen = true;
+                        consumer_seen = cause == CancelCause::Consumer;
+                        if consumer_seen { monitor_hub.detach(id, &monitor_sub); }
+                        else { monitor_hub.changed.notify_waiters(); }
+                    },
+                    _ = monitor_control.wait_consumer_requested(), if cancellation_seen && !consumer_seen => {
+                        consumer_seen = true;
+                        monitor_hub.detach(id, &monitor_sub);
+                    },
+                    _ = monitor_done.cancelled(), if !body_done => body_done = true,
+                    _ = connection.changed.notified() => monitor_hub.changed.notify_waiters(),
+                    _ = monitor_sub.changed.notified() => {},
+                }
+            } else {
+                tokio::select! {
+                    cause = monitor_control.requested(), if !cancellation_seen => {
+                        cancellation_seen = true;
+                        consumer_seen = cause == CancelCause::Consumer;
+                        if consumer_seen { monitor_hub.detach(id, &monitor_sub); }
+                        else { monitor_hub.changed.notify_waiters(); }
+                    },
+                    _ = monitor_control.wait_consumer_requested(), if cancellation_seen && !consumer_seen => {
+                        consumer_seen = true;
+                        monitor_hub.detach(id, &monitor_sub);
+                    },
+                    _ = monitor_done.cancelled(), if !body_done => body_done = true,
+                    _ = monitor_sub.changed.notified() => {},
+                }
+            }
+        }
+        monitor_state.forwarding.remove_stream(&monitor_token);
+    });
+    let body = Body::from_stream(futures::stream::unfold(
+        BodyState {
+            hub,
+            subscriber,
+            control,
+            done,
+            id,
+            next_seq: start_seq,
+            lag: options.on_lag,
+            phase: BodyPhase::Ready,
+            pending: None,
+            front_offset: 0,
+            complete: 0,
+            pending_terminal: None,
+            budget: state.forwarding.budget().clone(),
+            selection_charge: None,
+            staging: None,
+        },
+        |mut body| async move {
+            let result = body.next().await;
+            result.map(|result| (result, body))
+        },
+    ));
+    Ok((
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, topic_wire::MEDIA_TYPE.to_string()),
+            (
+                axum::http::HeaderName::from_static("x-c2-call-token"),
+                token,
+            ),
+        ],
+        body,
+    )
+        .into_response())
+}
+
+struct BodyState {
+    hub: Arc<Hub>,
+    subscriber: Arc<Subscriber>,
+    control: Arc<StreamCancellation>,
+    done: tokio_util::sync::CancellationToken,
+    id: u64,
+    next_seq: u64,
+    lag: WireLagPolicy,
+    phase: BodyPhase,
+    pending: Option<Bytes>,
+    front_offset: usize,
+    complete: u64,
+    pending_terminal: Option<C2Error>,
+    budget: DomainBudget,
+    selection_charge: Option<Arc<c2_mem::MemoryReservation>>,
+    staging: Option<Arc<c2_mem::ReusableWindow>>,
+}
+enum BodyPhase {
+    Ready,
+    Selecting,
+    Sending,
+    Ended,
+}
+struct OwnedBytes {
+    bytes: Bytes,
+    subscriber: Arc<Subscriber>,
+    data: bool,
+    _metadata: Option<Arc<c2_mem::MemoryReservation>>,
+}
+impl AsRef<[u8]> for OwnedBytes {
+    fn as_ref(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+impl Drop for OwnedBytes {
+    fn drop(&mut self) {
+        if self.data
+            && self
+                .subscriber
+                .inflight_chunks
+                .fetch_sub(1, Ordering::AcqRel)
+                == 1
+        {
+            self.subscriber.changed.notify_waiters();
+            self.subscriber.changed.notify_one();
+        }
+    }
+}
+impl Drop for BodyState {
+    fn drop(&mut self) {
+        self.done.cancel();
+        self.subscriber.selected.store(false, Ordering::Release);
+        self.subscriber
+            .frame_started
+            .store(false, Ordering::Release);
+        self.subscriber.unsent.lock().clear();
+        self.hub.detach(self.id, &self.subscriber);
+    }
+}
+impl BodyState {
+    fn held(&self, bytes: Bytes, data: bool) -> Bytes {
+        if data {
+            self.subscriber
+                .inflight_chunks
+                .fetch_add(1, Ordering::AcqRel);
+        }
+        Bytes::from_owner(OwnedBytes {
+            bytes,
+            subscriber: self.subscriber.clone(),
+            data,
+            _metadata: self.selection_charge.clone(),
+        })
+    }
+    async fn next(&mut self) -> Option<Result<Bytes, std::io::Error>> {
+        if let Some(bytes) = self.pending.take() {
+            return Some(Ok(self.held(bytes, true)));
+        }
+        loop {
+            match self.phase {
+                BodyPhase::Ready => {
+                    self.phase = BodyPhase::Selecting;
+                    return Some(Ok(self.held(
+                        Bytes::from(topic_wire::ready(self.next_seq).unwrap()),
+                        false,
+                    )));
+                }
+                BodyPhase::Sending => {
+                    if self.subscriber.evicted.load(Ordering::Acquire) {
+                        self.selection_charge.take();
+                        self.staging.take();
+                        self.subscriber.selected.store(false, Ordering::Release);
+                        self.subscriber
+                            .frame_started
+                            .store(false, Ordering::Release);
+                        self.phase = BodyPhase::Ended;
+                        return Some(Err(std::io::ErrorKind::ConnectionAborted.into()));
+                    }
+                    // Retain at most one independently charged transport
+                    // fragment per subscriber. If the peer stops reading,
+                    // the shared source segment can then be released after
+                    // its unstarted fragments have been discarded.
+                    {
+                        let changed = self.subscriber.changed.notified();
+                        tokio::pin!(changed);
+                        changed.as_mut().enable();
+                        if self.subscriber.inflight_chunks.load(Ordering::Acquire) != 0 {
+                            changed.await;
+                            continue;
+                        }
+                    }
+                    let next_chunk = self.subscriber.unsent.lock().front().cloned();
+                    if let Some(front) = next_chunk {
+                        let window = self
+                            .staging
+                            .as_ref()
+                            .expect("nonempty frame window")
+                            .clone();
+                        let length = (front.len() - self.front_offset)
+                            .min(usize::try_from(window.capacity()).unwrap_or(usize::MAX));
+                        let slice = match window.reserve(length as u64).await {
+                            Ok(slice) => slice,
+                            Err(error) => return self.abort_incomplete(error.to_string()),
+                        };
+                        let mut bytes = Vec::new();
+                        if bytes.try_reserve_exact(length).is_err()
+                            || bytes.capacity() as u64 > slice.bytes()
+                        {
+                            return self.abort_incomplete("topic transport allocation failed");
+                        }
+                        bytes.extend_from_slice(
+                            &front[self.front_offset..self.front_offset + length],
+                        );
+                        {
+                            let mut unsent = self.subscriber.unsent.lock();
+                            if self.subscriber.evicted.load(Ordering::Acquire) {
+                                drop(unsent);
+                                return self.abort_incomplete("topic connection was evicted");
+                            }
+                            self.front_offset += length;
+                            if self.front_offset == front.len() {
+                                unsent.pop_front();
+                                self.front_offset = 0;
+                            }
+                        }
+                        let bytes = Bytes::from_owner(slice.into_buffer(bytes));
+                        let length = bytes.len() as u64;
+                        self.pending = Some(bytes);
+                        return Some(Ok(self.held(
+                            Bytes::copy_from_slice(&topic_wire::header(
+                                RecordKind::ItemData,
+                                length,
+                            )),
+                            false,
+                        )));
+                    }
+                    if self.subscriber.evicted.load(Ordering::Acquire) {
+                        continue;
+                    }
+                    self.complete += 1;
+                    self.selection_charge.take();
+                    self.staging.take();
+                    self.subscriber.selected.store(false, Ordering::Release);
+                    self.subscriber
+                        .frame_started
+                        .store(false, Ordering::Release);
+                    self.phase = BodyPhase::Selecting;
+                }
+                BodyPhase::Ended => return None,
+                BodyPhase::Selecting => {
+                    if self.control.is_consumer_requested() {
+                        self.hub.detach(self.id, &self.subscriber);
+                    }
+                    let notified = self.hub.changed.notified();
+                    tokio::pin!(notified);
+                    notified.as_mut().enable();
+                    enum Selection {
+                        Frame(Arc<HubFrame>),
+                        End(C2Error),
+                        Wait,
+                    }
+                    let selection = {
+                        let mut state = self.hub.inner.lock();
+                        if let Some(error) = &self.pending_terminal {
+                            let last_is_pending = state
+                                .last_hold
+                                .as_ref()
+                                .is_some_and(|last| Arc::ptr_eq(last, &self.subscriber));
+                            if last_is_pending && state.terminal.is_none() {
+                                Selection::Wait
+                            } else {
+                                Selection::End(error.clone())
+                            }
+                        } else if self.control.is_consumer_requested() {
+                            let last_is_pending = state
+                                .last_hold
+                                .as_ref()
+                                .is_some_and(|last| Arc::ptr_eq(last, &self.subscriber));
+                            if last_is_pending && state.terminal.is_none() {
+                                Selection::Wait
+                            } else {
+                                Selection::End(cancellation("consumer_cancelled"))
+                            }
+                        } else if self.control.cause() == Some(CancelCause::Lifecycle)
+                            && !state.latest_eligible.contains(&self.id)
+                        {
+                            if state.terminal.is_none() {
+                                Selection::Wait
+                            } else {
+                                Selection::End(cancellation("relay_shutdown"))
+                            }
+                        } else if state.terminal.is_some()
+                            && !state.latest_eligible.contains(&self.id)
+                        {
+                            Selection::End(state.terminal.as_ref().unwrap().clone())
+                        } else if self.subscriber.sequence_exhausted.load(Ordering::Acquire) {
+                            Selection::Wait
+                        } else if let Some(latest) = &state.latest {
+                            // Keep the next expected frame while it remains in
+                            // the relay's budgeted history. Once it has been
+                            // evicted, Skip resumes at the newest frame.
+                            let frame = if state.terminal.is_none()
+                                && self.control.cause() != Some(CancelCause::Lifecycle)
+                            {
+                                state
+                                    .history
+                                    .iter()
+                                    .find(|frame| frame.seq == self.next_seq)
+                                    .unwrap_or(latest)
+                            } else {
+                                latest
+                            };
+                            if frame.seq < self.next_seq {
+                                Selection::Wait
+                            } else if frame.seq > self.next_seq && self.lag == WireLagPolicy::Error
+                            {
+                                let first_available = state
+                                    .history
+                                    .iter()
+                                    .find(|frame| frame.seq > self.next_seq)
+                                    .map_or(latest.seq, |frame| frame.seq);
+                                Selection::End(
+                                    C2Error::new(
+                                        ErrorCode::SubscriptionLagged,
+                                        "topic subscription lagged",
+                                    )
+                                    .with_details(
+                                        BTreeMap::from([
+                                            ("topic".into(), self.hub.key.topic.clone()),
+                                            ("expected_seq".into(), self.next_seq.to_string()),
+                                            (
+                                                "available_first_seq".into(),
+                                                first_available.to_string(),
+                                            ),
+                                            ("available_last_seq".into(), latest.seq.to_string()),
+                                            (
+                                                "dropped".into(),
+                                                (first_available - self.next_seq).to_string(),
+                                            ),
+                                        ]),
+                                    ),
+                                )
+                            } else {
+                                let frame = Arc::clone(&frame.frame);
+                                state.latest_eligible.remove(&self.id);
+                                self.subscriber.selected.store(true, Ordering::Release);
+                                self.subscriber
+                                    .next_seq
+                                    .store(frame.seq.saturating_add(1), Ordering::Release);
+                                self.subscriber
+                                    .sequence_exhausted
+                                    .store(frame.seq == u64::MAX, Ordering::Release);
+                                state.prune_history();
+                                Selection::Frame(frame)
+                            }
+                        } else {
+                            Selection::Wait
+                        }
+                    };
+                    match selection {
+                        Selection::Frame(frame) => {
+                            let bytes_per_chunk = 2 * std::mem::size_of::<Bytes>()
+                                + 2 * (std::mem::size_of::<OwnedBytes>()
+                                    + 2 * std::mem::size_of::<usize>());
+                            let Some(metadata_bytes) = frame
+                                .chunks
+                                .len()
+                                .checked_mul(bytes_per_chunk)
+                                .and_then(|n| u64::try_from(n).ok())
+                            else {
+                                self.subscriber.selected.store(false, Ordering::Release);
+                                self.pending_terminal =
+                                    Some(capacity("topic subscriber metadata size overflow"));
+                                self.hub.detach(self.id, &self.subscriber);
+                                continue;
+                            };
+                            let reservation = match self.budget.try_reserve_memory(metadata_bytes) {
+                                Ok(reservation) => reservation,
+                                Err(error) => {
+                                    self.subscriber.selected.store(false, Ordering::Release);
+                                    self.pending_terminal = Some(capacity(error.to_string()));
+                                    self.hub.detach(self.id, &self.subscriber);
+                                    continue;
+                                }
+                            };
+                            self.selection_charge = Some(Arc::new(reservation));
+                            if frame.total != 0 {
+                                let memory = self.budget.snapshot().memory;
+                                let available = memory.limit_bytes - memory.used_bytes;
+                                let width = frame.total.min(4096).min(available);
+                                let reservation = if width == 0 {
+                                    None
+                                } else {
+                                    self.budget.try_reserve_memory(width).ok()
+                                };
+                                let Some(reservation) = reservation else {
+                                    self.selection_charge.take();
+                                    self.subscriber.selected.store(false, Ordering::Release);
+                                    self.pending_terminal =
+                                        Some(capacity("no memory for a topic transport fragment"));
+                                    self.hub.detach(self.id, &self.subscriber);
+                                    continue;
+                                };
+                                self.staging = Some(Arc::new(reservation.into_reusable_window()));
+                            }
+                            self.next_seq = frame.seq.saturating_add(1);
+                            {
+                                let mut unsent = self.subscriber.unsent.lock();
+                                if !self.subscriber.evicted.load(Ordering::Acquire) {
+                                    *unsent = frame.chunks.iter().cloned().collect();
+                                }
+                            }
+                            if self.subscriber.evicted.load(Ordering::Acquire) {
+                                self.selection_charge.take();
+                                self.staging.take();
+                                self.subscriber.selected.store(false, Ordering::Release);
+                                self.pending_terminal = Some(capacity(
+                                    "stalled topic subscriber exceeded relay capacity",
+                                ));
+                                continue;
+                            }
+                            self.subscriber.selected.store(true, Ordering::Release);
+                            self.phase = BodyPhase::Sending;
+                            self.subscriber.frame_started.store(true, Ordering::Release);
+                            return Some(Ok(self.held(
+                                Bytes::from(
+                                    topic_wire::item_begin(frame.seq, frame.total).unwrap(),
+                                ),
+                                false,
+                            )));
+                        }
+                        Selection::End(error) => {
+                            self.hub.detach(self.id, &self.subscriber);
+                            let wait_for_source = {
+                                let state = self.hub.inner.lock();
+                                state.terminal.is_none()
+                                    && state
+                                        .last_hold
+                                        .as_ref()
+                                        .is_some_and(|last| Arc::ptr_eq(last, &self.subscriber))
+                            };
+                            if wait_for_source {
+                                self.pending_terminal = Some(error);
+                                continue;
+                            }
+                            self.phase = BodyPhase::Ended;
+                            let terminal = Terminal {
+                                status: Status::Failed,
+                                complete_items: self.complete,
+                                error,
+                            };
+                            return Some(Ok(
+                                self.held(Bytes::from(topic_wire::terminal(&terminal)), false)
+                            ));
+                        }
+                        Selection::Wait => {
+                            if self.control.cause().is_some() {
+                                notified.await;
+                            } else {
+                                tokio::select! { _ = notified => {}, _ = self.control.requested() => {} }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn abort_incomplete(
+        &mut self,
+        message: impl Into<String>,
+    ) -> Option<Result<Bytes, std::io::Error>> {
+        if let Some(connection) = &self.subscriber.connection {
+            connection.abort();
+        }
+        self.subscriber.unsent.lock().clear();
+        self.selection_charge.take();
+        self.staging.take();
+        self.subscriber.selected.store(false, Ordering::Release);
+        self.subscriber
+            .frame_started
+            .store(false, Ordering::Release);
+        self.hub.detach(self.id, &self.subscriber);
+        self.phase = BodyPhase::Ended;
+        Some(Err(std::io::Error::other(message.into())))
+    }
+}
+
+struct Segment {
+    storage: Option<SegmentStorage>,
+    changed: Arc<Notify>,
+    file_segments: Arc<AtomicUsize>,
+    file: bool,
+    _metadata: Arc<c2_mem::MemoryReservation>,
+}
+enum SegmentStorage {
+    Memory(c2_mem::WindowChunk),
+    File {
+        mapping: c2_mem::spill::SpillMapping,
+        _reservation: c2_mem::FileSpillReservation,
+    },
+}
+impl AsRef<[u8]> for Segment {
+    fn as_ref(&self) -> &[u8] {
+        match self.storage.as_ref().expect("live topic segment") {
+            SegmentStorage::Memory(chunk) => chunk.as_ref(),
+            SegmentStorage::File { mapping, .. } => &mapping[..],
+        }
+    }
+}
+impl Drop for Segment {
+    fn drop(&mut self) {
+        drop(self.storage.take());
+        if self.file {
+            self.file_segments.fetch_sub(1, Ordering::AcqRel);
+        }
+        self.changed.notify_waiters();
+    }
+}
+
+async fn wait_stop(hub: &Hub, shutdown: &tokio_util::sync::CancellationToken) -> CancelCause {
+    loop {
+        let notified = hub.changed.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if shutdown.is_cancelled() {
+            return CancelCause::Lifecycle;
+        }
+        if hub.stopped() {
+            return CancelCause::Consumer;
+        }
+        tokio::select! { _ = notified => {}, _ = shutdown.cancelled() => return CancelCause::Lifecycle }
+    }
+}
+
+async fn wait_consumer_stop(hub: &Hub) -> CancelCause {
+    loop {
+        let notified = hub.changed.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if hub.stopped() {
+            return CancelCause::Consumer;
+        }
+        notified.await;
+    }
+}
+
+async fn wait_frame_stop(
+    hub: &Hub,
+    shutdown: &tokio_util::sync::CancellationToken,
+    lifecycle: bool,
+) -> CancelCause {
+    if lifecycle {
+        wait_consumer_stop(hub).await
+    } else {
+        wait_stop(hub, shutdown).await
+    }
+}
+
+async fn drive(
+    relay: Arc<RelayState>,
+    hub: Arc<Hub>,
+    route: RouteEntry,
+    topic_name: String,
+    lease: UpstreamLease,
+    binding: RouteBinding,
+) {
+    let shutdown = relay.forwarding.shutdown_token();
+    let client = lease.client();
+    let options = WireSubscribeOptions {
+        start: WireTopicStart::Latest,
+        on_lag: WireLagPolicy::Skip,
+    };
+    let mut source = match client
+        .forward_subscribe_bound(&binding, &topic_name, options)
+        .await
+    {
+        Ok(source) => source,
+        Err(error) => {
+            hub.fail(upstream_error(error));
+            hub.inner.lock().last_hold.take();
+            relay.topics.remove(&hub);
+            return;
+        }
+    };
+    // OPEN follows a name rather than carrying a UID. Confirm after OPEN, then
+    // use SYNC on that subscription so a replaced registration cannot be
+    // mistaken for the route whose UID keys this hub.
+    let attestation = client
+        .attest_route_for_registration(&c2_contract::ExpectedRouteContract {
+            route_name: route.name.clone(),
+            crm_ns: route.crm_ns.clone(),
+            crm_name: route.crm_name.clone(),
+            crm_ver: route.crm_ver.clone(),
+            abi_hash: route.abi_hash.clone(),
+            signature_hash: route.signature_hash.clone(),
+        })
+        .await;
+    let valid = attestation
+        .as_ref()
+        .is_ok_and(|attested| Some(attested.route_uid.as_str()) == route.route_uid.as_deref())
+        && relay
+            .local_route(&route.name)
+            .is_some_and(|current| local_route_matches(&current, &route));
+    if !valid {
+        let _ = source.cancellation().cancel(CancelCause::Consumer);
+        let _ = source.completion().await;
+        hub.fail(C2Error::new(
+            ErrorCode::ResourceUnavailable,
+            "route registration changed while opening subscription",
+        ));
+        hub.inner.lock().last_hold.take();
+        relay.topics.remove(&hub);
+        return;
+    }
+    hub.set_source(source.synchronizer(), source.cancellation(), &shutdown);
+    let mut cancelled = None;
+    let mut pending_error = None;
+    loop {
+        let record = if cancelled.is_some() {
+            source.next_record().await
+        } else {
+            tokio::select! {
+                result = source.next_record() => result,
+                cause = wait_stop(&hub, &shutdown) => {
+                    let _ = source.cancellation().cancel(cause);
+                    cancelled = Some(cause);
+                    if cause == CancelCause::Consumer { break; }
+                    continue;
+                }
+            }
+        };
+        match record {
+            Ok(ForwardTopicRecord::ItemBegin { seq, total_bytes }) => {
+                hub.begin_frame(seq);
+                #[cfg(feature = "test-support")]
+                {
+                    let pause = relay.topic_pause.lock().take();
+                    if let Some((entered, release)) = pause {
+                        let _ = entered.send(());
+                        let _ = release.await;
+                    }
+                }
+                match receive_frame(
+                    relay.forwarding.budget(),
+                    &hub,
+                    &shutdown,
+                    &mut source,
+                    seq,
+                    total_bytes,
+                )
+                .await
+                {
+                    Ok(Some(frame)) => {
+                        let mut inner = hub.inner.lock();
+                        if !inner.closing {
+                            if let Some(previous) = inner.latest.take() {
+                                inner.history.push_back(previous);
+                            }
+                            inner.latest =
+                                Some(LatestFrame::new(frame, hub.latest_budgets.clone()));
+                            inner.latest_eligible = inner
+                                .incoming
+                                .take()
+                                .map_or_else(HashSet::new, |(_, ids)| ids);
+                            inner.prune_history();
+                        }
+                        drop(inner);
+                        hub.changed.notify_waiters();
+                    }
+                    Ok(None) => {
+                        let _ = source.cancellation().cancel(CancelCause::Consumer);
+                        break;
+                    }
+                    Err(error) => {
+                        pending_error = Some(error);
+                        let _ = source.cancellation().cancel(CancelCause::Consumer);
+                        break;
+                    }
+                }
+            }
+            Ok(ForwardTopicRecord::CallEnd(terminal)) => {
+                let error = terminal.error.unwrap_or_else(|| {
+                    C2Error::new(
+                        ErrorCode::ProtocolViolation,
+                        "subscription ended without an error",
+                    )
+                });
+                pending_error = Some(error);
+                cancelled = Some(CancelCause::Consumer);
+                break;
+            }
+            Err(error) => {
+                pending_error = Some(upstream_error(error));
+                break;
+            }
+        }
+    }
+    if cancelled.is_none() {
+        let _ = source.cancellation().cancel(CancelCause::Consumer);
+    }
+    let terminal = source.completion().await;
+    let outcome = if shutdown.is_cancelled() {
+        cancellation("relay_shutdown")
+    } else if let Some(error) = pending_error {
+        error
+    } else {
+        match terminal {
+            Ok(terminal) => terminal.error.unwrap_or_else(|| {
+                C2Error::new(
+                    ErrorCode::ProtocolViolation,
+                    "subscription ended without an error",
+                )
+            }),
+            Err(error) => upstream_error(error),
+        }
+    };
+    hub.fail(outcome);
+    hub.inner.lock().last_hold.take();
+    relay.topics.remove(&hub);
+    drop(lease);
+}
+
+async fn receive_frame(
+    budget: &DomainBudget,
+    hub: &Arc<Hub>,
+    shutdown: &tokio_util::sync::CancellationToken,
+    source: &mut IpcForwardTopic,
+    seq: u64,
+    total: u64,
+) -> Result<Option<HubFrame>, C2Error> {
+    let limits = budget.snapshot();
+    let max_memory = limits.memory.limit_bytes;
+    let max_file = limits.file_spill.limit_bytes;
+    if max_memory == 0 {
+        return Err(capacity("relay has no memory for a topic copy window"));
+    }
+    if total > max_memory && total > max_memory.saturating_sub(1).saturating_add(max_file) {
+        return Err(capacity(
+            "topic frame exceeds relay memory and file spill budgets",
+        ));
+    }
+    let mut lifecycle = false;
+    let (memory_data, width, metadata_bytes, file_backed, mut memory, mut file_reservations) = loop {
+        let snapshot = budget.snapshot();
+        let available_memory = snapshot.memory.limit_bytes - snapshot.memory.used_bytes;
+        let available_file = snapshot.file_spill.limit_bytes - snapshot.file_spill.used_bytes;
+        if total > available_memory && hub.evict_history() {
+            continue;
+        }
+        // Empty frames still retain a frame and history entry, so their
+        // metadata must consume the same bounded relay memory domain.
+        let direct_width = total.min(c2_config::CHUNK_SIZE).max(1);
+        let direct_metadata = frame_metadata_bytes(total, direct_width)?;
+        let plan = if total
+            .checked_add(direct_metadata)
+            .is_some_and(|charge| charge <= available_memory)
+        {
+            Some((total, direct_width, direct_metadata, false))
+        } else if available_memory > 0 {
+            let width = c2_config::CHUNK_SIZE.min(total).min(available_memory / 2);
+            if width == 0 {
+                None
+            } else {
+                let metadata = frame_metadata_bytes(total, width)?;
+                width.checked_add(metadata).and_then(|overhead| {
+                    let direct = available_memory.checked_sub(overhead)?;
+                    let file_bytes = total.saturating_sub(direct);
+                    (file_bytes <= available_file).then_some((direct, width, metadata, true))
+                })
+            }
+        } else {
+            None
+        };
+        if let Some((memory_data, width, metadata_bytes, file_backed)) = plan {
+            let memory_charge = memory_data
+                .checked_add(metadata_bytes)
+                .and_then(|charge| charge.checked_add(if file_backed { width } else { 0 }))
+                .ok_or_else(|| capacity("topic frame memory size overflow"))?;
+            if let Ok(memory) = budget.try_reserve_memory(memory_charge) {
+                let mut files = VecDeque::new();
+                let mut file_remaining = total - memory_data;
+                let mut reserved = true;
+                while file_remaining != 0 {
+                    let n = file_remaining.min(width);
+                    match budget.try_reserve_file_spill(n) {
+                        Ok(value) => files.push_back(value),
+                        Err(_) => {
+                            reserved = false;
+                            break;
+                        }
+                    }
+                    file_remaining -= n;
+                }
+                if reserved {
+                    break (
+                        memory_data,
+                        width,
+                        metadata_bytes,
+                        file_backed,
+                        memory,
+                        files,
+                    );
+                }
+                drop(files);
+                drop(memory);
+            }
+        }
+        let notified = hub.changed.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        let budget_notified = hub.budget_changed.notified();
+        tokio::pin!(budget_notified);
+        budget_notified.as_mut().enable();
+        if hub.evict_history() {
+            continue;
+        }
+        if shutdown.is_cancelled() {
+            // No downstream has begun this source frame. Do not wait for an
+            // un-evicted stopped reader to release its earlier frame before
+            // cancelling the shared upstream and letting the Host drain.
+            let _ = source.cancellation().cancel(CancelCause::Consumer);
+            return Ok(None);
+        }
+        if hub.evict_stalled(shutdown) {
+            tokio::task::yield_now().await;
+            continue;
+        }
+        // Other live topics retain their latest frame until they advance. If
+        // those retained backings leave too little total capacity even after
+        // every transient allocation is gone, waiting cannot make progress.
+        let minimum_metadata =
+            frame_metadata_bytes(total, total.min(c2_config::CHUNK_SIZE).max(1))?;
+        let (retained_memory, retained_file) = *hub.latest_budgets.totals.lock();
+        let usable_memory = max_memory.saturating_sub(retained_memory);
+        let usable_file = max_file.saturating_sub(retained_file);
+        if usable_memory == 0
+            || (total.saturating_add(minimum_metadata) > usable_memory
+                && total
+                    > usable_memory
+                        .saturating_sub(minimum_metadata.saturating_add(1))
+                        .saturating_add(usable_file))
+        {
+            return Err(capacity("other active topics retain the relay budget"));
+        }
+        let minimum_memory = if available_file == 0 {
+            total.saturating_add(minimum_metadata)
+        } else {
+            total
+                .saturating_sub(available_file)
+                .saturating_add(1)
+                .saturating_add(minimum_metadata)
+                .min(total.saturating_add(minimum_metadata))
+        };
+        // The lower bound above does not include the actual chunk geometry.
+        // Once that geometry has failed, reserving an already available lower
+        // bound would wake immediately and spin without changing the plan.
+        let desired_memory = minimum_memory.max(available_memory.saturating_add(1));
+        if desired_memory > max_memory && hub.file_segments.load(Ordering::Acquire) == 0 {
+            return Err(capacity("relay file spill budget is unavailable"));
+        }
+        tokio::select! {
+            result = budget.reserve_memory(desired_memory), if desired_memory <= max_memory => {
+                drop(result.map_err(|e| capacity(e.to_string()))?);
+            },
+            _ = notified => {},
+            _ = budget_notified => {},
+            cause = wait_frame_stop(hub, shutdown, lifecycle) => {
+                if cause == CancelCause::Lifecycle {
+                    let _ = source.cancellation().cancel(CancelCause::Consumer);
+                    return Ok(None);
+                } else { return Ok(None); }
+            },
+        }
+    };
+    let metadata = Arc::new(
+        memory
+            .split_off(metadata_bytes)
+            .map_err(|e| capacity(e.to_string()))?,
+    );
+    let staging = if file_backed {
+        Some(
+            memory
+                .split_off(width)
+                .map_err(|e| capacity(e.to_string()))?
+                .into_reusable_window(),
+        )
+    } else {
+        None
+    };
+    let mut remaining = total;
+    let mut memory_remaining = memory_data;
+    let mut chunks = Vec::new();
+    while remaining != 0 {
+        let n = if memory_remaining != 0 {
+            remaining.min(memory_remaining).min(width)
+        } else {
+            remaining.min(width)
+        };
+        let file = memory_remaining == 0;
+        let window = if file {
+            staging
+                .as_ref()
+                .expect("file staging window")
+                .reserve(n)
+                .await
+                .map_err(|e| capacity(e.to_string()))?
+        } else {
+            let reserve = memory.split_off(n).map_err(|e| capacity(e.to_string()))?;
+            reserve
+                .into_reusable_window()
+                .reserve(n)
+                .await
+                .map_err(|e| capacity(e.to_string()))?
+        };
+        let cancellation = source.cancellation();
+        let read = source.read_chunk(window, n as usize);
+        tokio::pin!(read);
+        let chunk = loop {
+            tokio::select! {
+                result = &mut read => break match result {
+                    Ok(Some(chunk)) => chunk,
+                    Ok(None) => return Err(C2Error::new(ErrorCode::ResourceUnavailable, "upstream ended during topic frame")),
+                    Err(error) => return Err(upstream_error(error)),
+                },
+                cause = wait_frame_stop(hub, shutdown, lifecycle) => {
+                    if cause == CancelCause::Lifecycle {
+                        let _ = cancellation.cancel(cause);
+                        lifecycle = true;
+                    } else { return Ok(None); }
+                },
+            }
+        };
+        let got = chunk.as_ref().len() as u64;
+        if got != n {
+            return Err(C2Error::new(
+                ErrorCode::ProtocolViolation,
+                "short topic copy window",
+            ));
+        }
+        let storage = if file {
+            let (mut mapping, _) =
+                c2_mem::create_file_spill(n as usize, &c2_config::default_spill_dir())
+                    .map_err(|e| capacity(e.to_string()))?;
+            mapping[..].copy_from_slice(chunk.as_ref());
+            drop(chunk);
+            SegmentStorage::File {
+                mapping,
+                _reservation: file_reservations
+                    .pop_front()
+                    .expect("reserved file segment"),
+            }
+        } else {
+            memory_remaining -= n;
+            SegmentStorage::Memory(chunk)
+        };
+        if file {
+            hub.file_segments.fetch_add(1, Ordering::AcqRel);
+        }
+        chunks.push(Bytes::from_owner(Segment {
+            storage: Some(storage),
+            changed: hub.budget_changed.clone(),
+            file_segments: hub.file_segments.clone(),
+            file,
+            _metadata: metadata.clone(),
+        }));
+        remaining -= n;
+    }
+    Ok(Some(HubFrame {
+        seq,
+        total,
+        chunks,
+        memory_bytes: memory_data + metadata_bytes,
+        file_bytes: total - memory_data,
+        _metadata: metadata,
+    }))
+}
+
+fn frame_metadata_bytes(total: u64, width: u64) -> Result<u64, C2Error> {
+    let count = total
+        .div_ceil(width)
+        .checked_add(1)
+        .ok_or_else(|| capacity("topic chunk count overflow"))?;
+    let per_chunk = std::mem::size_of::<Segment>()
+        + std::mem::size_of::<Bytes>()
+        + std::mem::size_of::<c2_mem::FileSpillReservation>()
+        + 4 * std::mem::size_of::<usize>();
+    count
+        .checked_mul(per_chunk as u64)
+        .and_then(|n| n.checked_add(std::mem::size_of::<HubFrame>() as u64))
+        .ok_or_else(|| capacity("topic frame metadata size overflow"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::forwarding::ForwardingDomain;
+    use super::*;
+
+    fn body(hub: Arc<Hub>, domain: &ForwardingDomain, id: u64, lag: WireLagPolicy) -> BodyState {
+        let (permit, tracked) = domain.admit_subscription().unwrap();
+        let (_, control) = domain.register_stream().unwrap();
+        let subscriber = Arc::new(Subscriber {
+            _permit: permit,
+            _tracked: tracked,
+            connection: None,
+            detached: AtomicBool::new(false),
+            selected: AtomicBool::new(false),
+            frame_started: AtomicBool::new(false),
+            evicted: AtomicBool::new(false),
+            unsent: Mutex::new(VecDeque::new()),
+            next_seq: AtomicU64::new(1),
+            sequence_exhausted: AtomicBool::new(false),
+            inflight_chunks: AtomicUsize::new(0),
+            changed: Notify::new(),
+        });
+        hub.inner
+            .lock()
+            .subscribers
+            .insert(id, Arc::downgrade(&subscriber));
+        BodyState {
+            hub,
+            subscriber,
+            control,
+            done: tokio_util::sync::CancellationToken::new(),
+            id,
+            next_seq: 1,
+            lag,
+            phase: BodyPhase::Ready,
+            pending: None,
+            front_offset: 0,
+            complete: 0,
+            pending_terminal: None,
+            budget: domain.budget().clone(),
+            selection_charge: None,
+            staging: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn skip_and_error_subscribers_have_independent_cursors() {
+        let domain = ForwardingDomain::new(DomainBudget::from_limits(
+            &c2_config::DomainLimits::default(),
+        ));
+        let hub = Arc::new(Hub {
+            key: HubKey {
+                instance: "i".into(),
+                route_uid: "r".into(),
+                topic: "state".into(),
+            },
+            inner: Mutex::new(HubState::default()),
+            changed: Arc::new(Notify::new()),
+            budget_changed: Arc::new(Notify::new()),
+            file_segments: Arc::new(AtomicUsize::new(0)),
+            latest_budgets: Arc::new(LatestBudgets::default()),
+        });
+        let mut fast = body(hub.clone(), &domain, 1, WireLagPolicy::Skip);
+        let mut slow = body(hub.clone(), &domain, 2, WireLagPolicy::Error);
+        {
+            let frame = |seq| {
+                LatestFrame::new(
+                    HubFrame {
+                        seq,
+                        total: 3,
+                        chunks: vec![Bytes::from_static(b"abc")],
+                        memory_bytes: 0,
+                        file_bytes: 0,
+                        _metadata: Arc::new(domain.budget().try_reserve_memory(0).unwrap()),
+                    },
+                    hub.latest_budgets.clone(),
+                )
+            };
+            let mut state = hub.inner.lock();
+            state.history.push_back(frame(2));
+            state.latest = Some(frame(3));
+        }
+        let _ = fast.next().await.unwrap().unwrap();
+        let _ = slow.next().await.unwrap().unwrap();
+        let begin = fast.next().await.unwrap().unwrap();
+        let (kind, _) = topic_wire::decode_header(begin[..9].try_into().unwrap()).unwrap();
+        assert_eq!(kind, RecordKind::ItemBegin);
+        assert_eq!(u64::from_le_bytes(begin[9..17].try_into().unwrap()), 3);
+        let end = slow.next().await.unwrap().unwrap();
+        let terminal = topic_wire::decode_terminal(&end[9..]).unwrap();
+        assert_eq!(terminal.error.code, ErrorCode::SubscriptionLagged);
+        assert_eq!(
+            terminal.error.details.get("dropped").map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(terminal.error.details["available_first_seq"], "2");
+        assert_eq!(terminal.error.details["available_last_seq"], "3");
+        let data_header = fast.next().await.unwrap().unwrap();
+        assert_eq!(
+            topic_wire::decode_header(data_header[..9].try_into().unwrap()).unwrap(),
+            (RecordKind::ItemData, 3)
+        );
+        assert_eq!(
+            fast.next().await.unwrap().unwrap(),
+            Bytes::from_static(b"abc")
+        );
+        assert_eq!(hub.inner.lock().subscribers.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn subscriber_receives_retained_history_before_latest() {
+        let domain = ForwardingDomain::new(DomainBudget::from_limits(
+            &c2_config::DomainLimits::default(),
+        ));
+        let hub = Arc::new(Hub {
+            key: HubKey {
+                instance: "i".into(),
+                route_uid: "r".into(),
+                topic: "state".into(),
+            },
+            inner: Mutex::new(HubState::default()),
+            changed: Arc::new(Notify::new()),
+            budget_changed: Arc::new(Notify::new()),
+            file_segments: Arc::new(AtomicUsize::new(0)),
+            latest_budgets: Arc::new(LatestBudgets::default()),
+        });
+        let frame = |seq, bytes| {
+            LatestFrame::new(
+                HubFrame {
+                    seq,
+                    total: 1,
+                    chunks: vec![Bytes::from_static(bytes)],
+                    memory_bytes: 0,
+                    file_bytes: 0,
+                    _metadata: Arc::new(domain.budget().try_reserve_memory(0).unwrap()),
+                },
+                hub.latest_budgets.clone(),
+            )
+        };
+        {
+            let mut state = hub.inner.lock();
+            state.joiners = 1;
+            state.history.push_back(frame(1, b"a"));
+            state.latest = Some(frame(2, b"b"));
+            state.prune_history();
+            assert_eq!(state.history.len(), 1);
+        }
+        let mut subscriber = body(hub.clone(), &domain, 1, WireLagPolicy::Error);
+        {
+            let mut state = hub.inner.lock();
+            state.joiners = 0;
+            state.prune_history();
+        }
+        let _ready = subscriber.next().await.unwrap().unwrap();
+        let first = subscriber.next().await.unwrap().unwrap();
+        assert_eq!(u64::from_le_bytes(first[9..17].try_into().unwrap()), 1);
+        let _data_header = subscriber.next().await.unwrap().unwrap();
+        assert_eq!(
+            subscriber.next().await.unwrap().unwrap(),
+            Bytes::from_static(b"a")
+        );
+        let second = subscriber.next().await.unwrap().unwrap();
+        assert_eq!(u64::from_le_bytes(second[9..17].try_into().unwrap()), 2);
+        assert!(hub.inner.lock().history.is_empty());
+    }
+
+    #[tokio::test]
+    async fn selected_frame_keeps_its_send_window_when_other_work_exhausts_memory() {
+        let domain = ForwardingDomain::new(DomainBudget::from_limits(&c2_config::DomainLimits {
+            memory_budget_bytes: 4096,
+            ..Default::default()
+        }));
+        let hub = Arc::new(Hub {
+            key: HubKey {
+                instance: "i".into(),
+                route_uid: "r".into(),
+                topic: "state".into(),
+            },
+            inner: Mutex::new(HubState::default()),
+            changed: Arc::new(Notify::new()),
+            budget_changed: Arc::new(Notify::new()),
+            file_segments: Arc::new(AtomicUsize::new(0)),
+            latest_budgets: Arc::new(LatestBudgets::default()),
+        });
+        let mut subscriber = body(hub.clone(), &domain, 1, WireLagPolicy::Skip);
+        hub.inner.lock().latest = Some(LatestFrame::new(
+            HubFrame {
+                seq: 1,
+                total: 3,
+                chunks: vec![Bytes::from_static(b"abc")],
+                memory_bytes: 0,
+                file_bytes: 0,
+                _metadata: Arc::new(domain.budget().try_reserve_memory(0).unwrap()),
+            },
+            hub.latest_budgets.clone(),
+        ));
+        let _ready = subscriber.next().await.unwrap().unwrap();
+        let begin = subscriber.next().await.unwrap().unwrap();
+        assert_eq!(
+            topic_wire::decode_header(begin[..9].try_into().unwrap())
+                .unwrap()
+                .0,
+            RecordKind::ItemBegin
+        );
+        let snapshot = domain.budget().snapshot();
+        let _other = domain
+            .budget()
+            .try_reserve_memory(snapshot.memory.limit_bytes - snapshot.memory.used_bytes)
+            .unwrap();
+        let header = subscriber.next().await.unwrap().unwrap();
+        assert_eq!(
+            topic_wire::decode_header(header[..9].try_into().unwrap()).unwrap(),
+            (RecordKind::ItemData, 3)
+        );
+        assert_eq!(
+            subscriber.next().await.unwrap().unwrap(),
+            Bytes::from_static(b"abc")
+        );
+    }
+
+    #[tokio::test]
+    async fn capacity_refusal_before_item_begin_is_a_canonical_terminal() {
+        let domain = ForwardingDomain::new(DomainBudget::from_limits(&c2_config::DomainLimits {
+            memory_budget_bytes: 4096,
+            ..Default::default()
+        }));
+        let hub = Arc::new(Hub {
+            key: HubKey {
+                instance: "i".into(),
+                route_uid: "r".into(),
+                topic: "state".into(),
+            },
+            inner: Mutex::new(HubState::default()),
+            changed: Arc::new(Notify::new()),
+            budget_changed: Arc::new(Notify::new()),
+            file_segments: Arc::new(AtomicUsize::new(0)),
+            latest_budgets: Arc::new(LatestBudgets::default()),
+        });
+        let mut subscriber = body(hub.clone(), &domain, 1, WireLagPolicy::Skip);
+        let _other_subscriber = body(hub.clone(), &domain, 2, WireLagPolicy::Skip);
+        hub.inner.lock().latest = Some(LatestFrame::new(
+            HubFrame {
+                seq: 1,
+                total: 3,
+                chunks: vec![Bytes::from_static(b"abc")],
+                memory_bytes: 0,
+                file_bytes: 0,
+                _metadata: Arc::new(domain.budget().try_reserve_memory(0).unwrap()),
+            },
+            hub.latest_budgets.clone(),
+        ));
+        let _ready = subscriber.next().await.unwrap().unwrap();
+        let memory = domain.budget().snapshot().memory;
+        let _other_work = domain
+            .budget()
+            .try_reserve_memory(memory.limit_bytes - memory.used_bytes)
+            .unwrap();
+        let bytes = subscriber.next().await.unwrap().unwrap();
+        assert_eq!(
+            topic_wire::decode_header(bytes[..9].try_into().unwrap())
+                .unwrap()
+                .0,
+            RecordKind::Terminal
+        );
+        let terminal = topic_wire::decode_terminal(&bytes[9..]).unwrap();
+        assert_eq!(terminal.complete_items, 0);
+        assert_eq!(terminal.error.code, ErrorCode::CallCapacityExceeded);
+    }
+
+    #[tokio::test]
+    async fn last_slot_stays_reserved_until_old_upstream_finishes() {
+        let domain = ForwardingDomain::new(DomainBudget::from_limits(&c2_config::DomainLimits {
+            max_outstanding_calls: 1,
+            ..Default::default()
+        }));
+        let table = TopicHubTable::default();
+        let (permit, tracked) = domain.admit_subscription().unwrap();
+        let subscriber = Arc::new(Subscriber {
+            _permit: permit,
+            _tracked: tracked,
+            connection: None,
+            detached: AtomicBool::new(false),
+            selected: AtomicBool::new(false),
+            frame_started: AtomicBool::new(false),
+            evicted: AtomicBool::new(false),
+            unsent: Mutex::new(VecDeque::new()),
+            next_seq: AtomicU64::new(1),
+            sequence_exhausted: AtomicBool::new(false),
+            inflight_chunks: AtomicUsize::new(0),
+            changed: Notify::new(),
+        });
+        let key = HubKey {
+            instance: "i".into(),
+            route_uid: "r".into(),
+            topic: "state".into(),
+        };
+        let (old, leader, guard) = table.join(key, subscriber.clone()).await;
+        assert!(leader);
+        drop(guard);
+        drop(subscriber);
+        assert!(
+            domain.admit_subscription().is_err(),
+            "the original slot belongs to upstream cleanup"
+        );
+        old.fail(cancellation("consumer_cancelled"));
+        old.inner.lock().last_hold.take();
+        let (_permit, _tracked) = domain.admit_subscription().unwrap();
+    }
+
+    #[tokio::test]
+    async fn closing_hub_does_not_overlap_a_new_upstream() {
+        let domain = ForwardingDomain::new(DomainBudget::from_limits(
+            &c2_config::DomainLimits::default(),
+        ));
+        let table = Arc::new(TopicHubTable::default());
+        let make_subscriber = || {
+            let (permit, tracked) = domain.admit_subscription().unwrap();
+            Arc::new(Subscriber {
+                _permit: permit,
+                _tracked: tracked,
+                connection: None,
+                detached: AtomicBool::new(false),
+                selected: AtomicBool::new(false),
+                frame_started: AtomicBool::new(false),
+                evicted: AtomicBool::new(false),
+                unsent: Mutex::new(VecDeque::new()),
+                next_seq: AtomicU64::new(1),
+                sequence_exhausted: AtomicBool::new(false),
+                inflight_chunks: AtomicUsize::new(0),
+                changed: Notify::new(),
+            })
+        };
+        let key = HubKey {
+            instance: "i".into(),
+            route_uid: "r".into(),
+            topic: "state".into(),
+        };
+        let (old, _, guard) = table.join(key.clone(), make_subscriber()).await;
+        drop(guard);
+        let subscriber = make_subscriber();
+        let next = {
+            let table = table.clone();
+            let key = key.clone();
+            tokio::spawn(async move { table.join(key, subscriber).await })
+        };
+        tokio::task::yield_now().await;
+        assert!(!next.is_finished());
+        old.fail(cancellation("consumer_cancelled"));
+        old.inner.lock().last_hold.take();
+        let (new, leader, guard) = next.await.unwrap();
+        assert!(leader);
+        assert!(!Arc::ptr_eq(&old, &new));
+        // A delayed terminal from the old instance must not change the new one.
+        old.fail(cancellation("host_shutdown"));
+        table.remove(&old);
+        assert!(new.inner.lock().terminal.is_none());
+        assert!(Weak::ptr_eq(
+            table.hubs.lock().get(&new.key).unwrap(),
+            &Arc::downgrade(&new),
+        ));
+        table.remove(&new);
+        assert!(table.hubs.lock().is_empty());
+        drop(guard);
+    }
+}

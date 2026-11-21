@@ -107,6 +107,16 @@ pub struct RelayState {
     /// process-global cache.
     domain_budget: DomainBudget,
     pub(crate) forwarding: crate::relay::forwarding::ForwardingDomain,
+    pub(crate) topics: crate::relay::topic_hub::TopicHubTable,
+    #[cfg(feature = "test-support")]
+    pub(crate) route_lookups: std::sync::atomic::AtomicU64,
+    #[cfg(feature = "test-support")]
+    pub(crate) topic_pause: parking_lot::Mutex<
+        Option<(
+            tokio::sync::oneshot::Sender<()>,
+            tokio::sync::oneshot::Receiver<()>,
+        )>,
+    >,
     pub(crate) clients: Arc<crate::relay::client_lifecycle::ClientLifecycle>,
 }
 
@@ -241,6 +251,11 @@ impl RelayState {
             default_endpoint_namespace,
             domain_budget: budget.clone(),
             forwarding: crate::relay::forwarding::ForwardingDomain::new(budget),
+            topics: crate::relay::topic_hub::TopicHubTable::default(),
+            #[cfg(feature = "test-support")]
+            route_lookups: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(feature = "test-support")]
+            topic_pause: parking_lot::Mutex::new(None),
             clients: crate::relay::client_lifecycle::ClientLifecycle::new(),
         }
     }
