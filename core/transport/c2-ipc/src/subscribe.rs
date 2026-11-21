@@ -196,6 +196,24 @@ impl IpcTopicSubscription {
     }
 }
 
+impl Drop for IpcTopicSubscription {
+    fn drop(&mut self) {
+        let _ = self.call.cancel();
+    }
+}
+
+struct CancelOpeningSubscription(Option<Arc<SubscribeReceive>>);
+
+impl Drop for CancelOpeningSubscription {
+    fn drop(&mut self) {
+        if let Some(call) = &self.0 {
+            // If the writer wins publication, it observes this intent after
+            // OPEN. If OPEN is withdrawn, there is no request ID to cancel.
+            let _ = call.cancel();
+        }
+    }
+}
+
 fn completion_from_state(
     state: &SubscribeReceiveState,
 ) -> Option<Result<stream::StreamTerminal, crate::IpcCallError>> {
@@ -877,6 +895,7 @@ impl IpcClient {
 
         let bytes = rpc::encode_open_subscribe_draft_frame(&identity, topic_name, options)
             .map_err(|error| pre_dispatch_call_error(IpcError::Protocol(error.to_string())))?;
+        let mut opening = CancelOpeningSubscription(Some(call));
         let submit = send
             .conn
             .submit(
@@ -892,9 +911,6 @@ impl IpcClient {
                 Ok(_) => dispatch_call_error(IpcError::Closed, send.started()),
                 Err(source) => dispatch_call_error(source, send.started()),
             };
-            if send.started() {
-                let _ = call.cancel();
-            }
             return Err(err);
         }
 
@@ -905,7 +921,6 @@ impl IpcClient {
                 biased;
                 res = &mut ready_rx => res,
                 _ = cancel.wait_requested() => {
-                    let _ = call.cancel();
                     return Err(dispatch_uncertain_call_error(IpcError::CallRejected(
                         C2Error::new(
                             c2_error::ErrorCode::CallCancelled,
@@ -920,18 +935,13 @@ impl IpcClient {
 
         match ready {
             Ok(Ok(start_seq)) => Ok(IpcTopicSubscription {
-                call,
+                call: opening.0.take().expect("opening subscription"),
                 input,
                 start_seq,
                 topic_name: topic_name.to_string(),
             }),
             Ok(Err(error)) => Err(error),
-            Err(_) => {
-                if send.started() {
-                    let _ = call.cancel();
-                }
-                Err(dispatch_call_error(IpcError::Closed, send.started()))
-            }
+            Err(_) => Err(dispatch_call_error(IpcError::Closed, send.started())),
         }
     }
 }

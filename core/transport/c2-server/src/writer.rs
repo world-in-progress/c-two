@@ -85,6 +85,7 @@ struct Submission {
 struct ItemFrame {
     request_id: u64,
     bytes: Vec<u8>,
+    _reservation: Option<c2_mem::MemoryReservation>,
 }
 
 #[derive(Clone, Copy)]
@@ -116,16 +117,22 @@ pub(crate) struct QueuedReplyPermit {
 
 impl QueuedReplyPermit {
     pub(crate) fn send(self, bytes: Vec<u8>) {
-        let _ = self.queue.send(Submission {
-            bytes,
-            request: self.request,
-            reply: None,
-            prepared: None,
-            shared_item: None,
-            item: None,
-            _flight: self.flight,
-            _pending: Some(self.pending),
-        });
+        let _ = self.try_send(bytes);
+    }
+
+    fn try_send(self, bytes: Vec<u8>) -> io::Result<()> {
+        self.queue
+            .send(Submission {
+                bytes,
+                request: self.request,
+                reply: None,
+                prepared: None,
+                shared_item: None,
+                item: None,
+                _flight: self.flight,
+                _pending: Some(self.pending),
+            })
+            .map_err(|_| broken_pipe())
     }
 }
 
@@ -207,7 +214,12 @@ impl ConnectionWriter {
             .map(|_| ())
     }
 
-    pub(crate) async fn write_item(&self, request_id: u64, bytes: Vec<u8>) -> io::Result<()> {
+    pub(crate) async fn write_item(
+        &self,
+        request_id: u64,
+        bytes: Vec<u8>,
+        reservation: Option<c2_mem::MemoryReservation>,
+    ) -> io::Result<()> {
         if request_id == 0 || bytes.is_empty() || bytes.len() > u32::MAX as usize - 13 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -219,7 +231,11 @@ impl ConnectionWriter {
             None,
             None,
             true,
-            Some(ItemFrame { request_id, bytes }),
+            Some(ItemFrame {
+                request_id,
+                bytes,
+                _reservation: reservation,
+            }),
         )
         .await
         .map(|_| ())
@@ -338,10 +354,14 @@ impl ConnectionWriter {
     /// The receive loop only enqueues; it never waits for a blocked OS write.
     pub(crate) fn reserve_control(&self) -> io::Result<QueuedReplyPermit> {
         let control = self.conn.core.prepare_control_frame().map_err(core_error)?;
-        self.reserve_reply(WriteRequest::Control(control))
+        self.reserve_reply(WriteRequest::Control(control), true)
     }
 
-    fn reserve_reply(&self, request: WriteRequest) -> io::Result<QueuedReplyPermit> {
+    fn reserve_reply(
+        &self,
+        request: WriteRequest,
+        deactivate_on_full: bool,
+    ) -> io::Result<QueuedReplyPermit> {
         let pending = self
             .control_budget
             .clone()
@@ -350,10 +370,12 @@ impl ConnectionWriter {
                 // This is the configured pending budget, not the writer's
                 // implementation queue. Preserve accepted calls and keep
                 // reading releases after sealing further admission.
-                self.conn.end(
-                    c2_local::ConnectionEndReason::LocalClose,
-                    "reply_pending_capacity",
-                );
+                if deactivate_on_full {
+                    self.conn.end(
+                        c2_local::ConnectionEndReason::LocalClose,
+                        "reply_pending_capacity",
+                    );
+                }
                 io::Error::new(io::ErrorKind::OutOfMemory, "pending reply budget exhausted")
             })?;
         Ok(QueuedReplyPermit {
@@ -365,13 +387,23 @@ impl ConnectionWriter {
     }
 
     pub(crate) fn queue_call_end(&self, bytes: Vec<u8>) -> io::Result<()> {
+        self.queue_call_record(bytes, true)
+    }
+
+    pub(crate) fn queue_sync_ack(&self, bytes: Vec<u8>) -> io::Result<()> {
+        self.queue_call_record(bytes, false)
+    }
+
+    fn queue_call_record(&self, bytes: Vec<u8>, deactivate_on_full: bool) -> io::Result<()> {
         let frame = self.conn.core.prepare_call_record().map_err(core_error)?;
-        self.reserve_reply(WriteRequest::CallEnd {
-            frame,
-            loans: Vec::new(),
-        })?
-        .send(bytes);
-        Ok(())
+        self.reserve_reply(
+            WriteRequest::CallEnd {
+                frame,
+                loans: Vec::new(),
+            },
+            deactivate_on_full,
+        )?
+        .try_send(bytes)
     }
 
     pub(crate) fn queue_control(&self, bytes: Vec<u8>) -> io::Result<()> {
@@ -1017,8 +1049,8 @@ mod tests {
         let stream = tokio::spawn({
             let writer = writer.clone();
             async move {
-                writer.write_item(1, b"a".to_vec()).await.unwrap();
-                writer.write_item(1, b"b".to_vec()).await.unwrap();
+                writer.write_item(1, b"a".to_vec(), None).await.unwrap();
+                writer.write_item(1, b"b".to_vec(), None).await.unwrap();
             }
         });
         entered_rx.await.unwrap();
@@ -1069,7 +1101,7 @@ mod tests {
         let (writer, driver) = ConnectionWriter::spawn_test_stream(sink, conn.clone());
         let caller = tokio::spawn({
             let writer = writer.clone();
-            async move { writer.write_item(1, b"ab".to_vec()).await }
+            async move { writer.write_item(1, b"ab".to_vec(), None).await }
         });
         entered_rx.await.unwrap();
         caller.abort();
@@ -1192,7 +1224,9 @@ mod tests {
             let (writer, driver) = ConnectionWriter::spawn_test_stream(sink, conn.clone());
             let mut send = Box::pin(async {
                 match kind {
-                    rpc::RpcRecordKind::ItemData => writer.write_item(1, b"ab".to_vec()).await,
+                    rpc::RpcRecordKind::ItemData => {
+                        writer.write_item(1, b"ab".to_vec(), None).await
+                    }
                     rpc::RpcRecordKind::ItemBegin => {
                         writer
                             .write_call_end(&rpc::encode_item_begin_frame(1, 2).unwrap())

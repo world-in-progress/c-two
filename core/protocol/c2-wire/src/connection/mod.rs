@@ -28,6 +28,7 @@ pub enum ConnectionSide {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConnectionError {
     ProtocolViolation(String),
+    SubscriptionCancelled,
     BeforeHandshake,
     Deactivated,
     PeerEnded,
@@ -42,6 +43,7 @@ impl std::fmt::Display for ConnectionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::ProtocolViolation(message) => write!(f, "ProtocolViolation: {message}"),
+            Self::SubscriptionCancelled => f.write_str("subscription cancelled"),
             Self::BeforeHandshake => f.write_str("frame before handshake"),
             Self::Deactivated => f.write_str("physical connection is deactivated"),
             Self::PeerEnded => f.write_str("peer has ended"),
@@ -249,12 +251,15 @@ impl ConnectionCore {
     pub fn stream_begin_item(&self, id: u64, total_bytes: u64) -> Result<(), ConnectionError> {
         let mut state = self.shared.state.lock();
         let stream = stream_mut(&mut state, id)?;
+        if self.shared.side == ConnectionSide::Server && stream.subscription && stream.cancelled {
+            return Err(ConnectionError::SubscriptionCancelled);
+        }
         if stream.total_bytes.is_some() {
             return Err(stream_violation("item already active"));
         }
         let consume_demand = match self.shared.side {
             ConnectionSide::Server if stream.subscription => {
-                if stream.cancelled || stream.demand == 0 {
+                if stream.demand == 0 {
                     return Err(stream_violation("subscription item without demand"));
                 }
                 true

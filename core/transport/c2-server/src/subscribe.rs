@@ -12,6 +12,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use c2_error::{C2Error, ErrorCode};
+use c2_mem::DomainBudget;
+use c2_wire::connection::ConnectionError;
 use c2_wire::rpc::{self, CallMode, CallStatus};
 use tokio::sync::Notify;
 
@@ -63,14 +65,32 @@ fn stream_cancel_to_topic_error(cause: StreamCancelCause) -> C2Error {
     }
 }
 
-fn subscription_cancellation(conn: &Connection, id: u64) -> Option<StreamCancelCause> {
+fn subscription_cancellation(conn: &Connection, id: u64) -> Option<C2Error> {
     conn.calls.lock().get(id).and_then(|call| {
-        call.data
-            .stream
-            .lock()
-            .as_ref()
-            .and_then(|stream| stream.cancellation)
+        call.data.stream.lock().as_ref().and_then(|stream| {
+            if stream.sync_reply_failed {
+                Some(C2Error::new(
+                    ErrorCode::CallCapacityExceeded,
+                    "subscription SYNC_ACK could not be queued",
+                ))
+            } else {
+                stream.cancellation.map(stream_cancel_to_topic_error)
+            }
+        })
     })
+}
+
+pub(super) fn fail_sync_reply(conn: &Connection, id: u64) {
+    // Keep retirement from removing the stream between recording the failure
+    // and cancelling any storage wait. The driver sends the terminal reply
+    // through the business writer queue, independent of the control backlog.
+    let calls = conn.calls.lock();
+    if let Some(call) = calls.get(id)
+        && let Some(stream) = call.data.stream.lock().as_mut()
+    {
+        stream.sync_reply_failed = true;
+        let _ = conn.core.stream_cancel(id);
+    }
 }
 
 fn check_stop_before_select(
@@ -84,12 +104,13 @@ fn check_stop_before_select(
     let Some(state) = conn.core.stream_state(id) else {
         return Some(SubStop::PeerEnded);
     };
-    if state.cancelled {
-        let cause = subscription_cancellation(conn, id).unwrap_or(StreamCancelCause::Consumer);
-        return Some(SubStop::Terminal(stream_cancel_to_topic_error(cause)));
+    if let Some(error) = subscription_cancellation(conn, id) {
+        return Some(SubStop::Terminal(error));
     }
-    if let Some(cause) = subscription_cancellation(conn, id) {
-        return Some(SubStop::Terminal(stream_cancel_to_topic_error(cause)));
+    if state.cancelled {
+        return Some(SubStop::Terminal(
+            TopicCloseCause::ConsumerCancelled.into_error(),
+        ));
     }
     if let Some(cause) = attach.channel.close_cause() {
         return Some(SubStop::Terminal(cause.into_error()));
@@ -171,22 +192,18 @@ async fn send_topic_frame(
     id: u64,
     frame: &Arc<TopicFrame>,
     last_loan: &mut Option<Arc<LoanSettledSignal>>,
+    budget: &DomainBudget,
 ) -> Result<(), FrameSendError> {
     let len = frame.len() as u64;
     if conn.is_work_cancelled() {
         return Err(FrameSendError::PeerEnded);
     }
-    if conn
-        .core
-        .stream_state(id)
-        .is_some_and(|state| state.cancelled)
-    {
-        return Err(FrameSendError::Cancelled);
-    }
-
     conn.core
         .stream_begin_item(id, len)
-        .map_err(|error| FrameSendError::Protocol(error.to_string()))?;
+        .map_err(|error| match error {
+            ConnectionError::SubscriptionCancelled => FrameSendError::Cancelled,
+            other => FrameSendError::Protocol(other.to_string()),
+        })?;
     let begin = rpc::encode_subscribe_item_begin_frame(id, frame.seq(), len)
         .map_err(|error| FrameSendError::Protocol(error.to_string()))?;
     writer
@@ -244,6 +261,9 @@ async fn send_topic_frame(
             .unwrap_or(usize::MAX)
             .min(chunk_size)
             .min(frame.len() - offset);
+        let reservation = budget
+            .try_reserve_memory(width as u64)
+            .map_err(|error| FrameSendError::Capacity(error.to_string()))?;
         let mut bytes = Vec::new();
         bytes
             .try_reserve_exact(width)
@@ -256,7 +276,7 @@ async fn send_topic_frame(
             .stream_data(id, width as u64)
             .map_err(|error| FrameSendError::Protocol(error.to_string()))?;
         writer
-            .write_item(id, bytes)
+            .write_item(id, bytes, Some(reservation))
             .await
             .map_err(|error| FrameSendError::Transport(error.to_string()))?;
         offset += width;
@@ -300,6 +320,7 @@ pub(super) async fn drive_subscription(
     id: u64,
     attach: RemoteTopicAttach,
     _flight: crate::connection::FlightGuard,
+    budget: DomainBudget,
 ) {
     let ready = match rpc::encode_ready_frame(id, attach.start_seq) {
         Ok(frame) => frame,
@@ -386,16 +407,17 @@ pub(super) async fn drive_subscription(
             }
         };
 
-        match send_topic_frame(&conn, &writer, id, &frame, &mut last_loan).await {
+        match send_topic_frame(&conn, &writer, id, &frame, &mut last_loan, &budget).await {
             Ok(()) => {
                 complete_items += 1;
                 sequence_exhausted = frame.seq() == u64::MAX;
             }
             Err(FrameSendError::PeerEnded) => break None,
             Err(FrameSendError::Cancelled) => {
-                let cause =
-                    subscription_cancellation(&conn, id).unwrap_or(StreamCancelCause::Consumer);
-                break Some(stream_cancel_to_topic_error(cause));
+                break Some(
+                    subscription_cancellation(&conn, id)
+                        .unwrap_or_else(|| TopicCloseCause::ConsumerCancelled.into_error()),
+                );
             }
             Err(FrameSendError::Capacity(message)) => {
                 break Some(C2Error::new(ErrorCode::CallCapacityExceeded, message));

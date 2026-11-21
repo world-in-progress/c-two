@@ -1073,18 +1073,48 @@ impl Server {
     /// that removes the route, so local handle clones and remote route lookup
     /// cannot observe an open-but-unregistered window.
     pub async fn unregister_route(&self, name: &str) -> bool {
+        self.unregister_route_matching(name, None).await
+    }
+
+    /// Unregister only the route that owns these topics.
+    pub async fn unregister_route_with_topics(
+        &self,
+        name: &str,
+        topics: &Arc<crate::topic::RouteTopics>,
+    ) -> bool {
+        self.unregister_route_matching(name, Some(topics)).await
+    }
+
+    async fn unregister_route_matching(
+        &self,
+        name: &str,
+        expected_topics: Option<&Arc<crate::topic::RouteTopics>>,
+    ) -> bool {
         let route = {
             let _guard = self.route_registration.lock().await;
             let dispatcher = self.dispatcher.write();
-            let route = dispatcher.resolve(name);
+            let route = dispatcher.resolve(name).filter(|route| {
+                expected_topics.is_none_or(|expected| {
+                    route
+                        .topics
+                        .as_ref()
+                        .is_some_and(|topics| Arc::ptr_eq(topics, expected))
+                })
+            });
             if let Some(route) = &route {
-                self.cancel_route_streams(Some(&route.route_uid), StreamCancelCause::Unregister);
                 route
                     .scheduler
                     .close_and_cancel_local_streams(StreamCancelCause::Unregister);
                 if let Some(topics) = &route.topics {
                     topics.close(crate::topic::TopicCloseCause::RouteUnregistered);
                 }
+                self.cancel_route_streams(Some(&route.route_uid), StreamCancelCause::Unregister);
+            }
+            if route.is_none()
+                && let Some(topics) = expected_topics
+            {
+                // A stale registration can only seal its own topics.
+                topics.close(crate::topic::TopicCloseCause::RouteUnregistered);
             }
             route
         };
@@ -1104,6 +1134,9 @@ impl Server {
                 false
             }
         } else {
+            if let Some(topics) = expected_topics {
+                topics.wait_drained_async().await;
+            }
             false
         }
     }
@@ -2908,6 +2941,7 @@ struct StreamCallControl {
     route_uid: String,
     cancellation: Option<StreamCancelCause>,
     topic_channel: Option<Arc<crate::topic::TopicChannel>>,
+    sync_reply_failed: bool,
 }
 
 fn submit_stream_cancel(
@@ -3361,8 +3395,9 @@ async fn handle_rpc_record(
                             if let Some(head_seq) = channel.head_seq_if_open() {
                                 let frame = rpc::encode_sync_ack_frame(id, head_seq)
                                     .expect("active subscription id");
-                                if let Err(error) = writer.queue_call_end(frame) {
+                                if let Err(error) = writer.queue_sync_ack(frame) {
                                     warn!(request_id=id, %error, "failed to queue subscription SYNC_ACK");
+                                    subscribe::fail_sync_reply(conn, id);
                                 }
                             }
                         }
@@ -3568,7 +3603,7 @@ async fn handle_open_subscribe_record(
                             ),
                         },
                     ))
-                } else if route.scheduler.route_admission_state() == RouteAdmissionState::Closed
+                } else if route.scheduler.route_admission_state() != RouteAdmissionState::Opened
                     || conn.shutdown_requested()
                     || server.admission.lock().is_closed()
                 {
@@ -3634,6 +3669,7 @@ async fn handle_open_subscribe_record(
                                                 *call.stream.lock() = Some(StreamCallControl {
                                                     route_uid: route.route_uid.clone(),
                                                     cancellation: None,
+                                                    sync_reply_failed: false,
                                                     topic_channel: Some(Arc::clone(
                                                         &attach.channel,
                                                     )),
@@ -3673,8 +3709,9 @@ async fn handle_open_subscribe_record(
 
     let conn = conn.clone();
     let writer = writer.clone();
+    let budget = server.domain_budget.clone();
     tokio::spawn(async move {
-        subscribe::drive_subscription(conn, writer, id, attach, flight).await;
+        subscribe::drive_subscription(conn, writer, id, attach, flight, budget).await;
     });
 }
 
@@ -3951,6 +3988,7 @@ fn insert_admitted_call(
             route_uid: admission.route.route_uid.clone(),
             cancellation: None,
             topic_channel: None,
+            sync_reply_failed: false,
         });
     }
     conn.calls

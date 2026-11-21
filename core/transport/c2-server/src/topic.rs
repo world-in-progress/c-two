@@ -2,16 +2,15 @@
 //!
 //! Each route registration owns isolated topic channels with monotonic `u64`
 //! sequence numbers starting at `1`, a bounded history ring (`capacity >= 1`),
-//! single-write sealed SHM / budgeted immutable frame storage, and a sync+async
+//! single-write sealed SHM / budgeted immutable frame storage, and an async
 //! drain barrier for active local and remote subscribers. Publishers never
 //! block on slow subscribers.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fmt;
 use std::pin::Pin;
-use std::sync::{Arc, Weak};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Weak};
 
 use c2_contract::ExpectedRouteContract;
 use c2_error::{C2Error, ErrorCode};
@@ -20,7 +19,7 @@ use c2_mem::{
     RetentionRejectReason, SealedShmBlock,
 };
 use c2_wire::rpc::{WireLagPolicy, WireSubscribeOptions, WireTopicStart};
-use parking_lot::{Condvar, Mutex, RwLock};
+use parking_lot::{Mutex, RwLock};
 use tokio::sync::Notify;
 
 /// Hard upper bound on a single topic's history ring depth.
@@ -272,8 +271,6 @@ pub struct TopicCloseReceipt {
 /// across all topics on one route registration.
 struct ActiveSubscriberBarrier {
     active: AtomicUsize,
-    lock: Mutex<()>,
-    drained_cv: Condvar,
     drained_notify: Notify,
 }
 
@@ -281,8 +278,6 @@ impl ActiveSubscriberBarrier {
     fn new() -> Arc<Self> {
         Arc::new(Self {
             active: AtomicUsize::new(0),
-            lock: Mutex::new(()),
-            drained_cv: Condvar::new(),
             drained_notify: Notify::new(),
         })
     }
@@ -296,22 +291,6 @@ impl ActiveSubscriberBarrier {
 
     fn active_count(&self) -> usize {
         self.active.load(Ordering::Acquire)
-    }
-
-    fn wait_drained(&self, timeout: Duration) -> bool {
-        if self.active.load(Ordering::Acquire) == 0 {
-            return true;
-        }
-        let deadline = Instant::now() + timeout;
-        let mut guard = self.lock.lock();
-        while self.active.load(Ordering::Acquire) > 0 {
-            let now = Instant::now();
-            if now >= deadline {
-                return false;
-            }
-            let _ = self.drained_cv.wait_for(&mut guard, deadline - now);
-        }
-        true
     }
 
     async fn wait_drained_async(&self) {
@@ -334,8 +313,6 @@ pub(crate) struct ActiveSubscriberGuard {
 impl Drop for ActiveSubscriberGuard {
     fn drop(&mut self) {
         if self.barrier.active.fetch_sub(1, Ordering::AcqRel) == 1 {
-            let _guard = self.barrier.lock.lock();
-            self.barrier.drained_cv.notify_all();
             self.barrier.drained_notify.notify_waiters();
         }
     }
@@ -524,23 +501,9 @@ impl TopicChannel {
                 let mut guard = pool.write();
                 guard.try_alloc_shm(len).ok()
             };
-            if let Some(mut handle) = handle {
-                let fill_result = (|| -> Result<(), C2Error> {
-                    let mut pin = {
-                        let guard = pool.read();
-                        guard.pin_shm_mut(&mut handle).map_err(|error| {
-                            C2Error::new(ErrorCode::ResourceOutputSerializing, error)
-                        })?
-                    };
-                    write_into(pin.as_mut_slice())
-                })();
-                if let Err(error) = fill_result {
-                    pool.write().release_handle(handle);
-                    return Err(error);
-                }
+            if let Some(handle) = handle {
                 let block =
-                    SealedShmBlock::seal(Arc::clone(pool), handle).map_err(|(handle, error)| {
-                        pool.write().release_handle(handle);
+                    SealedShmBlock::fill_and_seal(Arc::clone(pool), handle, write_into, |error| {
                         C2Error::new(ErrorCode::ResourceOutputSerializing, error)
                     })?;
                 return Ok(TopicFrameStorage::Shm(block));
@@ -887,10 +850,6 @@ impl RouteTopics {
         for channel in self.channels.values() {
             channel.close(cause);
         }
-    }
-
-    pub fn wait_drained(&self, timeout: Duration) -> bool {
-        self.barrier.wait_drained(timeout)
     }
 
     pub async fn wait_drained_async(&self) {

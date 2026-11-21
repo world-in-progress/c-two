@@ -109,6 +109,7 @@ fn encoding_waits(shm: bool, shutdown: ShutdownPoint) {
         route_uid: route.route.route_uid.clone(),
         cancellation: None,
         topic_channel: None,
+        sync_reply_failed: false,
     });
     assert!(call.queue());
     let admission = ChunkRouteAdmission {

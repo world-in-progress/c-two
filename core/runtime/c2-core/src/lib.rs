@@ -48,8 +48,8 @@ pub use error::{
 };
 pub use host::{
     EncodedService, EncodedStream, EncodedStreamItem, EncodedStreamService, Host, HostOptions,
-    MethodDefinition, Registration, RouteConcurrency, RouteConcurrencyError, RouteConcurrencyGuard,
-    RouteConcurrencySnapshot, ServiceConcurrencyMode, ServiceDefinition,
+    MethodDefinition, Registration, RegistrationObserver, RouteConcurrency, RouteConcurrencyError,
+    RouteConcurrencyGuard, RouteConcurrencySnapshot, ServiceConcurrencyMode, ServiceDefinition,
 };
 pub use identity::{
     auto_server_id, auto_server_instance_id, ipc_address_for_server_id, validate_server_id,

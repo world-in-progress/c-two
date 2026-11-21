@@ -962,28 +962,6 @@ impl HostInner {
         }
     }
 
-    fn close_route_topics(
-        &self,
-        route_name: &str,
-        expected: Option<&Arc<RouteTopics>>,
-        cause: TopicCloseCause,
-    ) -> Option<Arc<RouteTopics>> {
-        let removed = {
-            let mut guard = self.route_topics.lock();
-            match (guard.get(route_name), expected) {
-                (Some(current), Some(target)) if !Arc::ptr_eq(current, target) => None,
-                (Some(_), _) => guard.remove(route_name),
-                (None, _) => None,
-            }
-        };
-        if let Some(topics) = &removed {
-            topics.close(cause);
-        } else if let Some(target) = expected {
-            target.close(cause);
-        }
-        removed
-    }
-
     fn refresh_shutdown_outcome(&self) {
         if self.shutdown_outcome.lock().is_none() {
             if let Some(outcome) = self.runtime.shutdown_observation(&self.server) {
@@ -1091,7 +1069,7 @@ impl HostInner {
     fn unregister(
         &self,
         route_name: &str,
-        expected_topics: Option<&Arc<RouteTopics>>,
+        topics: &Arc<RouteTopics>,
     ) -> Result<UnregisterOutcome, Error> {
         self.refresh_shutdown_outcome();
         if self.runtime.shutdown_pending(&self.server) {
@@ -1106,9 +1084,7 @@ impl HostInner {
                 .iter()
                 .find(|close| close.route_name == route_name)
         {
-            if let Some(topics) = expected_topics {
-                topics.close(TopicCloseCause::HostShutdown);
-            }
+            topics.close(TopicCloseCause::HostShutdown);
             return Ok(UnregisterOutcome {
                 route_name: route_name.to_string(),
                 local_removed: close.local_removed,
@@ -1120,43 +1096,34 @@ impl HostInner {
                     .cloned(),
             });
         }
-        // If an explicit registration is closing after a newer registration
-        // replaced the same route name, only seal the old registration's own
-        // topics and never touch the active registration.
-        if let Some(target) = expected_topics {
-            let owned = self
-                .route_topics
-                .lock()
-                .get(route_name)
-                .is_some_and(|current| Arc::ptr_eq(current, target));
-            if !owned {
-                target.close(TopicCloseCause::RouteUnregistered);
-                return Ok(UnregisterOutcome {
-                    route_name: route_name.to_string(),
-                    local_removed: false,
-                    close: crate::RouteCloseOutcome {
-                        route_name: route_name.to_string(),
-                        local_removed: false,
-                        active_drained: true,
-                        closed_reason: "replaced".into(),
-                        close_error: None,
-                    },
-                    relay_error: None,
-                });
-            }
-        }
-        if let Some(topics) =
-            self.close_route_topics(route_name, expected_topics, TopicCloseCause::RouteUnregistered)
-        {
-            let _ = topics.wait_drained(self.shutdown_timeout);
-        }
-        let outcome = self.runtime.unregister_route(
+        let outcome = match self.runtime.unregister_route(
             &self.server,
             route_name,
+            Some(topics),
             self.relay_anchor_address.as_deref(),
             self.relay_use_proxy,
-        )?;
-        if outcome.local_removed {
+        ) {
+            Ok(outcome) => outcome,
+            Err(LifecycleError::MissingRoute(_)) => UnregisterOutcome {
+                route_name: route_name.to_string(),
+                local_removed: false,
+                close: crate::RouteCloseOutcome {
+                    route_name: route_name.to_string(),
+                    local_removed: false,
+                    active_drained: true,
+                    closed_reason: "replaced".into(),
+                    close_error: None,
+                },
+                relay_error: None,
+            },
+            Err(error) => return Err(error.into()),
+        };
+        let mut current_topics = self.route_topics.lock();
+        if current_topics
+            .get(route_name)
+            .is_some_and(|current| Arc::ptr_eq(current, topics))
+        {
+            current_topics.remove(route_name);
             self.route_names.lock().remove(route_name);
         }
         Ok(outcome)
@@ -1318,12 +1285,11 @@ impl Host {
                 return Err(error.into());
             }
         };
-        self.inner.route_names.lock().insert(route_name.clone());
-        let previous_topics = self
-            .inner
-            .route_topics
-            .lock()
-            .insert(route_name.clone(), Arc::clone(&route_topics));
+        let previous_topics = {
+            let mut current_topics = self.inner.route_topics.lock();
+            self.inner.route_names.lock().insert(route_name.clone());
+            current_topics.insert(route_name.clone(), Arc::clone(&route_topics))
+        };
         if let Some(previous) = previous_topics {
             previous.close(TopicCloseCause::RouteUnregistered);
         }
@@ -1436,6 +1402,22 @@ pub struct Registration {
     route_topics: Arc<RouteTopics>,
 }
 
+/// Read-only view of a registration's topic lifecycle, including during drain.
+#[derive(Clone)]
+pub struct RegistrationObserver {
+    route_topics: Arc<RouteTopics>,
+}
+
+impl RegistrationObserver {
+    pub fn active_subscribers(&self) -> usize {
+        self.route_topics.active_subscribers()
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.route_topics.is_closed()
+    }
+}
+
 impl fmt::Debug for Registration {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -1458,6 +1440,12 @@ impl Registration {
 
     pub fn is_closed(&self) -> bool {
         self.close_outcome.is_some() || self.route_topics.is_closed()
+    }
+
+    pub fn observer(&self) -> RegistrationObserver {
+        RegistrationObserver {
+            route_topics: Arc::clone(&self.route_topics),
+        }
     }
 
     pub fn route_concurrency(&self) -> RouteConcurrency {
@@ -1493,9 +1481,7 @@ impl Registration {
         if let Some(outcome) = &self.close_outcome {
             return Ok(outcome.clone());
         }
-        let outcome = self
-            .host
-            .unregister(&self.route_name, Some(&self.route_topics))?;
+        let outcome = self.host.unregister(&self.route_name, &self.route_topics)?;
         self.close_outcome = Some(outcome.clone());
         Ok(outcome)
     }

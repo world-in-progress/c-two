@@ -17,10 +17,16 @@ use c2_core::{
 };
 use c2_error::{C2Error, ErrorCode};
 use c2_local::{DEFAULT_CONNECT_TIMEOUT, LocalStream};
+use c2_wire::buddy::BuddyPayload;
+use c2_wire::flags::{FLAG_HANDSHAKE, FLAG_RESPONSE, FLAG_SIGNAL};
+use c2_wire::frame::{self, FrameHeader};
 use c2_wire::handshake::{
-    HANDSHAKE_VERSION, VersionPreambleKind, decode_version_preamble_payload,
-    encode_version_preamble, validate_version_preamble_header,
+    CAP_SHM_RESPONSE, HANDSHAKE_VERSION, VersionPreambleKind, decode_handshake,
+    decode_version_preamble_payload, encode_client_handshake, encode_version_preamble,
+    validate_version_preamble_header,
 };
+use c2_wire::release::{ReleaseBatch, encode_release_frame};
+use c2_wire::rpc::{self, CallMode, CallStatus, RouteCallIdentity, RpcRecord, ValueStorage};
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -985,4 +991,248 @@ fn consumer_cancel_and_abrupt_client_drop_release_server_subscription_resources(
     drop(reg);
     let outcome = host.shutdown();
     assert!(outcome.runtime_barrier_error.is_none(), "{outcome:?}");
+}
+
+const RAW_PEER_WAIT: Duration = Duration::from_secs(5);
+
+async fn read_ipc_frame(peer: &mut LocalStream) -> (FrameHeader, Vec<u8>) {
+    tokio::time::timeout(RAW_PEER_WAIT, async {
+        let mut len = [0; 4];
+        peer.read_exact(&mut len).await.unwrap();
+        let mut body = vec![0; u32::from_le_bytes(len) as usize];
+        peer.read_exact(&mut body).await.unwrap();
+        let (header, payload) = frame::decode_frame_body(&body, u32::from_le_bytes(len)).unwrap();
+        (header, payload.to_vec())
+    })
+    .await
+    .expect("IPC reply within test deadline")
+}
+
+async fn topic_peer(
+    host: &Host,
+    release: &ContractRelease,
+    capability_flags: u16,
+) -> (LocalStream, RouteCallIdentity) {
+    let mut peer = LocalStream::connect(host.local_endpoint(), DEFAULT_CONNECT_TIMEOUT)
+        .await
+        .unwrap();
+    peer.write_all(&encode_version_preamble(VersionPreambleKind::Hello))
+        .await
+        .unwrap();
+    let mut accepted = [0; 25];
+    tokio::time::timeout(RAW_PEER_WAIT, peer.read_exact(&mut accepted))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        accepted,
+        encode_version_preamble(VersionPreambleKind::Accepted)
+    );
+    let hello = encode_client_handshake(capability_flags, "").unwrap();
+    peer.write_all(&frame::encode_frame(0, FLAG_HANDSHAKE, &hello))
+        .await
+        .unwrap();
+    let (header, ack) = read_ipc_frame(&mut peer).await;
+    assert_eq!(header.flags, FLAG_HANDSHAKE | FLAG_RESPONSE);
+    assert_eq!(
+        decode_handshake(&ack, true).unwrap().capability_flags & capability_flags,
+        capability_flags
+    );
+
+    let route = release.expected_route("sim").unwrap();
+    let identity = RouteCallIdentity {
+        route_name: route.route_name,
+        crm_ns: route.crm_ns,
+        crm_name: route.crm_name,
+        crm_ver: route.crm_ver,
+        abi_hash: route.abi_hash,
+        signature_hash: route.signature_hash,
+    };
+    let open = rpc::encode_open_subscribe_frame(
+        1,
+        &identity,
+        "field",
+        rpc::WireSubscribeOptions::default(),
+    )
+    .unwrap();
+    peer.write_all(&open).await.unwrap();
+    let (header, payload) = read_ipc_frame(&mut peer).await;
+    assert_eq!(header.request_id, 1);
+    assert!(matches!(
+        rpc::decode_rpc_record(&header, &payload, Some(CallMode::Subscribe)).unwrap(),
+        RpcRecord::Ready { start_seq: 1 }
+    ));
+    (peer, identity)
+}
+
+async fn read_topic_begin(peer: &mut LocalStream, bytes: usize) {
+    let (header, payload) = read_ipc_frame(peer).await;
+    assert_eq!(header.request_id, 1);
+    assert!(matches!(
+        rpc::decode_rpc_record(&header, &payload, Some(CallMode::Subscribe)).unwrap(),
+        RpcRecord::ItemBegin { total_bytes, .. } if total_bytes == bytes as u64
+    ));
+}
+
+async fn read_topic_loan(peer: &mut LocalStream, bytes: usize) -> BuddyPayload {
+    peer.write_all(&rpc::encode_credit_frame(1, bytes as u64, 0).unwrap())
+        .await
+        .unwrap();
+    let (header, payload) = read_ipc_frame(peer).await;
+    assert_eq!(header.request_id, 1);
+    let RpcRecord::ItemData { value, .. } =
+        rpc::decode_rpc_record(&header, &payload, Some(CallMode::Subscribe)).unwrap()
+    else {
+        panic!("expected topic ITEM_DATA");
+    };
+    let ValueStorage::Shm(loan) = value.storage else {
+        panic!("expected one shared-memory descriptor");
+    };
+    assert!(loan.is_dedicated);
+    assert_eq!(loan.data_size as usize, bytes);
+    loan
+}
+
+async fn release_topic_loan(peer: &mut LocalStream, loan: BuddyPayload) {
+    let batch = ReleaseBatch::new(&[loan.loan_id]).unwrap();
+    peer.write_all(&encode_release_frame(&batch, false))
+        .await
+        .unwrap();
+    peer.write_all(&frame::encode_frame(
+        0,
+        FLAG_SIGNAL,
+        &c2_wire::msg_type::PING_BYTES,
+    ))
+    .await
+    .unwrap();
+    let (header, pong) = read_ipc_frame(peer).await;
+    assert_eq!(header.flags, FLAG_SIGNAL | FLAG_RESPONSE);
+    assert_eq!(pong.as_slice(), c2_wire::msg_type::PONG_BYTES.as_slice());
+}
+
+#[test]
+fn dedicated_topic_backing_is_charged_once_until_both_peers_release() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_runtime, host) = make_host(&dir, "ipc-held-loans", Some(16 * 1024 * 1024), None);
+    let release = release_with_topics(&["field"]);
+    let reg = host.register(echo_def(&release, "sim")).unwrap();
+    let publisher = reg.publisher("field").unwrap();
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let (mut a, _) = topic_peer(&host, &release, CAP_SHM_RESPONSE).await;
+            let (mut b, _) = topic_peer(&host, &release, CAP_SHM_RESPONSE).await;
+
+            let used = || host.memory_stats().server.memory.unwrap().used_bytes;
+            let baseline = used();
+            let bytes = 5 * 1024 * 1024;
+            assert_eq!(publisher.publish(vec![0xA5; bytes]).unwrap(), 1);
+            let single_allocation = used();
+            assert!(single_allocation - baseline >= bytes as u64);
+            assert!(single_allocation - baseline < 2 * bytes as u64);
+            read_topic_begin(&mut a, bytes).await;
+            read_topic_begin(&mut b, bytes).await;
+            let loan_a = read_topic_loan(&mut a, bytes).await;
+            let loan_b = read_topic_loan(&mut b, bytes).await;
+            assert_ne!(loan_a.loan_id, loan_b.loan_id);
+            assert_eq!(
+                (loan_a.seg_idx, loan_a.generation, loan_a.offset),
+                (loan_b.seg_idx, loan_b.generation, loan_b.offset)
+            );
+            assert_eq!(used(), single_allocation);
+
+            assert_eq!(publisher.publish(Vec::new()).unwrap(), 2);
+            assert_eq!(used(), single_allocation);
+            release_topic_loan(&mut a, loan_a).await;
+            assert_eq!(used(), single_allocation);
+            release_topic_loan(&mut b, loan_b).await;
+            tokio::time::timeout(RAW_PEER_WAIT, async {
+                while used() != baseline {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("evicted SHM backing must release its charge after both loans settle");
+
+            drop((a, b));
+        });
+    drop(reg);
+    let _ = host.shutdown();
+}
+
+#[test]
+fn unregister_rejects_writes_while_a_selected_topic_frame_waits_for_credit() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_runtime, host) = make_host(&dir, "ipc-unregister-credit", None, None);
+    let release = release_with_topics(&["field"]);
+    let mut reg = host.register(echo_def(&release, "sim")).unwrap();
+    let observer = reg.observer();
+    let publisher = reg.publisher("field").unwrap();
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let (mut peer, identity) = topic_peer(&host, &release, 0).await;
+
+            publisher.publish(b"pending".to_vec()).unwrap();
+            read_topic_begin(&mut peer, 7).await;
+            let closing = std::thread::spawn(move || reg.close());
+            tokio::time::timeout(RAW_PEER_WAIT, async {
+                while !observer.is_closed() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(observer.active_subscribers(), 1);
+            assert!(!closing.is_finished());
+            assert_semantic_code(
+                publisher.publish(b"late".to_vec()).unwrap_err(),
+                ErrorCode::ResourceClosed,
+            );
+
+            let write = rpc::encode_open_frame(
+                2,
+                &identity,
+                1,
+                CallMode::Unary,
+                rpc::ValuePart::whole(ValueStorage::Inline(b"late")),
+            )
+            .unwrap();
+            peer.write_all(&write).await.unwrap();
+            let (header, payload) = read_ipc_frame(&mut peer).await;
+            assert_eq!(header.request_id, 2);
+            assert!(matches!(
+                rpc::decode_rpc_record(&header, &payload, Some(CallMode::Unary)).unwrap(),
+                RpcRecord::CallEnd { status: CallStatus::NotExecuted, error: Some(error), .. }
+                    if error.code == ErrorCode::ResourceClosed
+            ));
+            assert!(!closing.is_finished());
+
+            peer.write_all(&rpc::encode_credit_frame(1, 7, 0).unwrap())
+                .await
+                .unwrap();
+            let (header, payload) = read_ipc_frame(&mut peer).await;
+            assert_eq!(header.request_id, 1);
+            assert!(matches!(
+                rpc::decode_rpc_record(&header, &payload, Some(CallMode::Subscribe)).unwrap(),
+                RpcRecord::ItemData { value, .. } if value.storage == ValueStorage::Inline(b"pending")
+            ));
+            let (header, payload) = read_ipc_frame(&mut peer).await;
+            assert_eq!(header.request_id, 1);
+            assert!(matches!(
+                rpc::decode_rpc_record(&header, &payload, Some(CallMode::Subscribe)).unwrap(),
+                RpcRecord::CallEnd { status: CallStatus::Failed, complete_items: Some(1), error: Some(error), .. }
+                    if error.code == ErrorCode::CallCancelled
+            ));
+            let outcome = closing.join().unwrap().unwrap();
+            assert!(outcome.local_removed && outcome.close.active_drained);
+            assert_eq!(observer.active_subscribers(), 0);
+
+            drop(peer);
+        });
+    let _ = host.shutdown();
 }

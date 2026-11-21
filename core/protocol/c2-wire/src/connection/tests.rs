@@ -1082,3 +1082,22 @@ fn failed_control_ends_its_reservation_even_if_the_batch_is_retained() {
     assert!(core.try_close());
     drop(write);
 }
+
+#[test]
+fn cancelled_subscription_item_begin_is_distinct_from_missing_demand() {
+    let core = established(ConnectionSide::Server);
+    core.subscribe_open(1).unwrap();
+    core.stream_begin_item(1, 0).unwrap();
+    assert!(matches!(
+        core.stream_begin_item(1, 8),
+        Err(ConnectionError::ProtocolViolation(_))
+    ));
+
+    core.stream_credit(1, 0, 1).unwrap();
+    core.stream_cancel(1).unwrap();
+    assert_eq!(
+        core.stream_begin_item(1, 8),
+        Err(ConnectionError::SubscriptionCancelled)
+    );
+    assert_eq!(core.stream_state(1).unwrap().complete_items, 1);
+}

@@ -1914,3 +1914,90 @@ async fn oversized_business_error_preserves_concurrent_calls_on_the_connection()
     client.close().await;
     stop(server, runner).await;
 }
+
+#[tokio::test]
+async fn discarding_subscription_during_open_or_after_ready_sends_consumer_cancel() {
+    let endpoint = Endpoint::new();
+    let mut listener = LocalListener::bind(&endpoint.endpoint).unwrap();
+    let mut client = endpoint.client();
+    let ((), mut peer) = tokio::join!(
+        async { client.connect().await.unwrap() },
+        accept(&mut listener),
+    );
+    client.route_directory.write().insert_table(
+        "grid".to_string(),
+        MethodTable::from_entries(&[], identity(), 1024),
+    );
+    let binding = client.bind_cached_route(&contract()).unwrap();
+    let budget = DomainBudget::from_limits(&DomainLimits {
+        memory_budget_bytes: 1024,
+        file_spill_budget_bytes: 0,
+        max_outstanding_calls: 2,
+    });
+
+    for drop_after_ready in [false, true] {
+        let id;
+        {
+            let control = IpcCallControl::new(|| Ok(()));
+            let opening = client.subscribe_bound_controlled_phased(
+                &binding,
+                "state",
+                rpc::WireSubscribeOptions::default(),
+                budget.clone(),
+                Box::new(budget.reserve_subscription_operation().unwrap()),
+                crate::IpcSubscribeCancellation::new(),
+                &control,
+            );
+            tokio::pin!(opening);
+            let (header, payload) = tokio::select! {
+                result = &mut opening => panic!("subscribe returned before READY: {}", result.is_ok()),
+                open = read_frame(&mut peer) => open,
+            };
+            id = header.request_id;
+            assert!(matches!(
+                decode_rpc_record(&header, &payload, None).unwrap(),
+                RpcRecord::OpenSubscribe { .. }
+            ));
+            if drop_after_ready {
+                peer.write_all(&rpc::encode_ready_frame(id, 1).unwrap())
+                    .await
+                    .unwrap();
+                let sub = timeout(WAIT, opening).await.unwrap().unwrap();
+                assert_eq!(sub.start_seq(), 1);
+                drop(sub);
+            }
+        }
+        let (header, payload) = read_frame(&mut peer).await;
+        assert_eq!(header.request_id, id);
+        assert!(matches!(
+            decode_rpc_record(&header, &payload, None).unwrap(),
+            RpcRecord::Cancel {
+                cause: rpc::CancelCause::Consumer
+            }
+        ));
+        assert_eq!(budget.snapshot().operations.used_operations, 1);
+        peer.write_all(
+            &rpc::encode_call_end_error_frame(
+                id,
+                CallMode::Subscribe,
+                CallStatus::Failed,
+                0,
+                &C2Error::new(ErrorCode::CallCancelled, "consumer cancelled"),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        timeout(WAIT, async {
+            while budget.snapshot().operations.used_operations != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    drop(peer);
+    client.close().await;
+    crate::tests::close_listener(listener).await;
+}

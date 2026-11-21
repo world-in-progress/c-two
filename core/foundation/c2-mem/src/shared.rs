@@ -46,6 +46,19 @@ impl SharedBlockInner {
     }
 }
 
+struct UnsealedHandle<'a> {
+    pool: &'a RwLock<MemPool>,
+    handle: Option<MemHandle>,
+}
+
+impl Drop for UnsealedHandle<'_> {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            self.pool.write().release_handle(handle);
+        }
+    }
+}
+
 /// Immutable, sealed SHM allocation owned by the publisher process and safe to
 /// lend across multiple peer connections concurrently without extra SHM writes.
 pub struct SealedShmBlock {
@@ -109,25 +122,35 @@ impl SealedShmBlock {
         if len == 0 {
             return Err("cannot allocate a zero-byte SHM block".into());
         }
-        let mut handle = {
-            let mut guard = pool.write();
-            guard.try_alloc_shm(len)?
+        let handle = pool.write().try_alloc_shm(len)?;
+        Self::fill_and_seal(pool, handle, write_into, |error| error)
+    }
+
+    /// Populate an exclusively owned SHM allocation and transfer it to the
+    /// sealed block. Errors and unwinding return the allocation to its pool.
+    /// The handle must come from this pool.
+    pub fn fill_and_seal<E>(
+        pool: Arc<RwLock<MemPool>>,
+        handle: MemHandle,
+        write_into: impl FnOnce(&mut [u8]) -> Result<(), E>,
+        storage_error: impl FnOnce(String) -> E,
+    ) -> Result<Self, E> {
+        let mut allocation = UnsealedHandle {
+            pool: &pool,
+            handle: Some(handle),
         };
-        let copy_result = (|| -> Result<(), String> {
-            let mut pin = {
-                let guard = pool.read();
-                guard.pin_shm_mut(&mut handle)?
-            };
-            // Populate outside any pool lock so concurrent alloc/release never stall.
-            write_into(pin.as_mut_slice())
-        })();
-        if let Err(error) = copy_result {
-            pool.write().release_handle(handle);
-            return Err(error);
+        let pin = {
+            let guard = pool.read();
+            guard.pin_shm_mut(allocation.handle.as_mut().expect("unsealed allocation"))
+        };
+        match pin {
+            Ok(mut pin) => write_into(pin.as_mut_slice())?,
+            Err(error) => return Err(storage_error(error)),
         }
-        Self::seal(pool.clone(), handle).map_err(|(handle, error)| {
-            pool.write().release_handle(handle);
-            error
+        let handle = allocation.handle.take().expect("populated allocation");
+        Self::seal(Arc::clone(&pool), handle).map_err(|(handle, error)| {
+            allocation.handle = Some(handle);
+            storage_error(error)
         })
     }
 
@@ -288,5 +311,36 @@ impl Drop for SharedShmLoan {
     fn drop(&mut self) {
         // Intentionally do NOT call `release_one()` when `!self.settled`:
         // an unconfirmed published loan stays pinned until pool teardown.
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unwinding_a_fill_releases_the_unsealed_block() {
+        let budget = crate::DomainBudget::from_limits(&c2_config::DomainLimits {
+            memory_budget_bytes: 8 * 1024 * 1024,
+            file_spill_budget_bytes: 0,
+            max_outstanding_calls: 1,
+        });
+        let pool = Arc::new(RwLock::new(
+            MemPool::new_with_budget(
+                crate::PoolConfig::primary_for_budget(8 * 1024 * 1024),
+                budget.clone(),
+            )
+            .unwrap(),
+        ));
+        pool.write().set_idle_backing_retention(false);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            SealedShmBlock::allocate_and_fill(Arc::clone(&pool), 64 * 1024, |bytes| {
+                bytes[0] = 42;
+                panic!("aborted producer");
+            })
+        }));
+        assert!(result.is_err(), "expected producer panic, got {result:?}");
+        assert_eq!(pool.read().stats().alloc_count, 0);
+        assert_eq!(budget.snapshot().memory.used_bytes, 0);
     }
 }
