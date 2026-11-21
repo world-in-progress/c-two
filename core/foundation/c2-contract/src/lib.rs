@@ -10,11 +10,12 @@ mod release;
 pub use admission::{
     ContractLimitMetric, MAX_CONTRACT_JSON_VALUES, MAX_CONTRACT_METHODS,
     MAX_CONTRACT_NESTED_FASTDB_BYTES, MAX_CONTRACT_NESTING_DEPTH, MAX_CONTRACT_SOURCE_BYTES,
+    MAX_CONTRACT_TOPICS,
 };
 pub use descriptor::{
     BindingDirection, ContractFingerprints, MethodAccess, MethodMode, NestedFastDbSpec,
-    ValidatedContractDescriptor, ValidatedMethodDescriptor, canonical_json,
-    contract_descriptor_sha256_hex, derive_contract_fingerprints_json, lower_hex,
+    ValidatedContractDescriptor, ValidatedMethodDescriptor, ValidatedTopicDescriptor,
+    canonical_json, contract_descriptor_sha256_hex, derive_contract_fingerprints_json, lower_hex,
     validate_portable_contract_descriptor_json,
 };
 pub use release::{

@@ -21,6 +21,7 @@ def test_native_error_registry_exposes_canonical_codes():
     assert registry["RouteWatchUnavailable"][0] == 712
     assert registry["ProtocolViolation"][0] == 713
     assert registry["RouteConflict"][0] == 719
+    assert registry["SubscriptionLagged"][0] == 720
     assert registry["FallbackDenied"][0] == 714
 
 
@@ -42,7 +43,7 @@ def test_registry_entries_carry_side_and_stage_classification():
 
 def test_registry_names_and_values_are_unique():
     registry = _native.error_registry()
-    assert len(registry) == 25
+    assert len(registry) == 26
     names = list(registry)
     values = [entry[0] for entry in registry.values()]
     assert len(set(names)) == len(names)

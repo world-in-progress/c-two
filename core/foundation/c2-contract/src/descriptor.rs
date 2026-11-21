@@ -1,6 +1,6 @@
 use crate::{
     CONTRACT_HASH_HEX_BYTES, ContractDescriptorDigest, ContractError, ContractFingerprintField,
-    ContractLimitMetric, MAX_CONTRACT_METHODS, PORTABLE_CONTRACT_SCHEMA,
+    ContractLimitMetric, MAX_CONTRACT_METHODS, MAX_CONTRACT_TOPICS, PORTABLE_CONTRACT_SCHEMA,
     admission::{
         JsonDocumentKind, MAX_CONTRACT_NESTED_FASTDB_BYTES, checked_observed_add,
         parse_bounded_json, usize_to_u64,
@@ -89,6 +89,22 @@ impl ValidatedMethodDescriptor {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidatedTopicDescriptor {
+    name: String,
+    output: NestedFastDbSpec,
+}
+
+impl ValidatedTopicDescriptor {
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn output(&self) -> &NestedFastDbSpec {
+        &self.output
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContractFingerprints {
     abi_hash: String,
     signature_hash: String,
@@ -114,6 +130,7 @@ pub struct ValidatedContractDescriptor {
     abi_hash: String,
     signature_hash: String,
     methods: Vec<ValidatedMethodDescriptor>,
+    topics: Vec<ValidatedTopicDescriptor>,
     descriptor_sha256: ContractDescriptorDigest,
 }
 
@@ -146,6 +163,7 @@ impl ValidatedContractDescriptor {
             abi_hash: derived.abi_hash,
             signature_hash: derived.signature_hash,
             methods: parsed.methods,
+            topics: parsed.topics,
             descriptor_sha256,
         })
     }
@@ -182,6 +200,10 @@ impl ValidatedContractDescriptor {
         &self.methods
     }
 
+    pub fn topics(&self) -> &[ValidatedTopicDescriptor] {
+        &self.topics
+    }
+
     pub fn descriptor_sha256(&self) -> &ContractDescriptorDigest {
         &self.descriptor_sha256
     }
@@ -194,6 +216,7 @@ struct ParsedOuterDescriptor {
     abi_hash: String,
     signature_hash: String,
     methods: Vec<ValidatedMethodDescriptor>,
+    topics: Vec<ValidatedTopicDescriptor>,
 }
 
 pub fn derive_contract_fingerprints_json(
@@ -215,7 +238,11 @@ pub fn validate_portable_contract_descriptor_json(json_bytes: &[u8]) -> Result<(
 
 fn parse_outer_descriptor(value: &Value) -> Result<ParsedOuterDescriptor, ContractError> {
     let root = object_at(value, "$")?;
-    ensure_keys(root, "$", &["schema", "crm", "fingerprints", "methods"])?;
+    ensure_keys(
+        root,
+        "$",
+        &["schema", "crm", "fingerprints", "methods", "topics"],
+    )?;
     let schema = string_at(required(root, "$", "schema")?, "$.schema")?;
     if schema != PORTABLE_CONTRACT_SCHEMA {
         return Err(invalid(
@@ -272,6 +299,42 @@ fn parse_outer_descriptor(value: &Value) -> Result<ParsedOuterDescriptor, Contra
         )?);
     }
 
+    let topics = match root.get("topics") {
+        None => Vec::new(),
+        Some(raw_topics) => {
+            let topic_values = array_at(raw_topics, "$.topics")?;
+            if topic_values.is_empty() {
+                return Err(invalid(
+                    "$.topics",
+                    "omit topics when a contract declares no topics",
+                ));
+            }
+            let topic_count = usize_to_u64(topic_values.len());
+            if topic_count > MAX_CONTRACT_TOPICS as u64 {
+                return Err(ContractError::LimitExceeded {
+                    metric: ContractLimitMetric::Topics,
+                    limit: MAX_CONTRACT_TOPICS as u64,
+                    observed: topic_count,
+                    path: "$.topics".to_string(),
+                });
+            }
+            let mut topics = Vec::with_capacity(topic_values.len());
+            let mut last_topic_name: Option<String> = None;
+            for (index, topic) in topic_values.iter().enumerate() {
+                let path = format!("$.topics[{index}]");
+                let parsed_topic = parse_topic_descriptor(
+                    topic,
+                    &path,
+                    &method_names,
+                    &mut last_topic_name,
+                    &mut nested_fastdb_bytes,
+                )?;
+                topics.push(parsed_topic);
+            }
+            topics
+        }
+    };
+
     Ok(ParsedOuterDescriptor {
         crm_namespace,
         crm_name,
@@ -279,7 +342,67 @@ fn parse_outer_descriptor(value: &Value) -> Result<ParsedOuterDescriptor, Contra
         abi_hash,
         signature_hash,
         methods,
+        topics,
     })
+}
+
+fn parse_topic_descriptor(
+    value: &Value,
+    path: &str,
+    method_names: &BTreeSet<String>,
+    last_topic_name: &mut Option<String>,
+    nested_fastdb_bytes: &mut u64,
+) -> Result<ValidatedTopicDescriptor, ContractError> {
+    let object = object_at(value, path)?;
+    ensure_keys(object, path, &["name", "output", "binding"])?;
+
+    let name_path = format!("{path}.name");
+    let name = validated_text(object, path, "name", &name_path, "topic name")?;
+    if method_names.contains(&name) {
+        return Err(invalid(
+            &name_path,
+            format!("topic name {name:?} collides with a method name"),
+        ));
+    }
+    if let Some(previous) = last_topic_name.as_deref() {
+        match name.as_str().cmp(previous) {
+            std::cmp::Ordering::Equal => {
+                return Err(invalid(&name_path, format!("duplicate topic name {name:?}")));
+            }
+            std::cmp::Ordering::Less => {
+                return Err(invalid(
+                    &name_path,
+                    format!(
+                        "topics must be sorted in ascending name order ({name:?} after {previous:?})"
+                    ),
+                ));
+            }
+            std::cmp::Ordering::Greater => {}
+        }
+    }
+    *last_topic_name = Some(name.clone());
+
+    validate_single_kind_object(
+        required(object, path, "output")?,
+        &format!("{path}.output"),
+        "payload",
+    )?;
+
+    let binding_path = format!("{path}.binding");
+    let output = parse_binding(
+        required(object, path, "binding")?,
+        &binding_path,
+        BindingDirection::Output,
+        nested_fastdb_bytes,
+    )?
+    .ok_or_else(|| {
+        invalid(
+            &binding_path,
+            "portable topic requires a non-null FastDB binding",
+        )
+    })?;
+
+    Ok(ValidatedTopicDescriptor { name, output })
 }
 
 fn parse_method_descriptor(
@@ -559,16 +682,46 @@ fn derive_contract_fingerprints_value(
         })
         .collect::<Result<Vec<_>, ContractError>>()?;
 
-    let abi_projection = serde_json::json!({
+    let mut abi_projection = serde_json::json!({
         "schema": CONTRACT_ABI_SCHEMA,
         "crm": crm.clone(),
         "methods": abi_methods,
     });
-    let signature_projection = serde_json::json!({
+    let mut signature_projection = serde_json::json!({
         "schema": CONTRACT_SIGNATURE_SCHEMA,
         "crm": crm,
         "methods": signature_methods,
     });
+
+    if !parsed.topics.is_empty() {
+        let topics = array_at(required(root, "$", "topics")?, "$.topics")?;
+        let abi_topics = topics
+            .iter()
+            .enumerate()
+            .map(|(index, topic)| {
+                let path = format!("$.topics[{index}]");
+                let object = object_at(topic, &path)?;
+                Ok(serde_json::json!({
+                    "name": required(object, &path, "name")?.clone(),
+                    "binding": required(object, &path, "binding")?.clone(),
+                }))
+            })
+            .collect::<Result<Vec<_>, ContractError>>()?;
+        let signature_topics = topics
+            .iter()
+            .enumerate()
+            .map(|(index, topic)| {
+                let path = format!("$.topics[{index}]");
+                let object = object_at(topic, &path)?;
+                Ok(serde_json::json!({
+                    "name": required(object, &path, "name")?.clone(),
+                    "output": required(object, &path, "output")?.clone(),
+                }))
+            })
+            .collect::<Result<Vec<_>, ContractError>>()?;
+        abi_projection["topics"] = Value::Array(abi_topics);
+        signature_projection["topics"] = Value::Array(signature_topics);
+    }
 
     Ok(ContractFingerprints {
         abi_hash: sha256_hex(canonical_json(&abi_projection).as_bytes()),
@@ -746,6 +899,29 @@ mod tests {
             ),
             Err(ContractError::InvalidDescriptor { path, message })
                 if path == "$.methods[1].mode" && message == "unknown field \"mode\""
+        ));
+    }
+
+    #[test]
+    fn pre_topic_root_key_guard_rejects_topics() {
+        // Freeze the root key set used before topics. An older parser rejects
+        // the unknown root key instead of ignoring declared topics.
+        let mut value: Value = serde_json::from_str(include_str!(
+            "../../../../tests/fixtures/contracts/portable-release.contract.json"
+        ))
+        .unwrap();
+        value["topics"] = serde_json::json!([
+            {
+                "name": "field",
+                "output": {"kind": "payload"},
+                "binding": value["methods"][1]["bindings"]["output"].clone(),
+            }
+        ]);
+        let root = value.as_object().unwrap();
+        assert!(matches!(
+            ensure_keys(root, "$", &["schema", "crm", "fingerprints", "methods"]),
+            Err(ContractError::InvalidDescriptor { path, message })
+                if path == "$.topics" && message == "unknown field \"topics\""
         ));
     }
 }
