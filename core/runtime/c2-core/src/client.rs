@@ -32,6 +32,10 @@ pub enum Connect {
     DirectIpc { address: String },
     ExplicitRelay { relay_url: String },
     RelayAware,
+    /// Relay-aware acquisition against an explicit per-endpoint anchor URL
+    /// inside a shared Runtime budget domain (preserves local IPC upgrade and
+    /// HTTP fallback without mutating the Runtime's configured anchor).
+    RelayAwareAt { anchor_url: String },
 }
 
 /// The transport path selected and verified before a [`Client`] is returned.
@@ -1331,6 +1335,15 @@ impl Runtime {
                 Connect::RelayAware => {
                     let (anchor, settings) =
                         self.relay_business_config_with_deadline(None, deadline)?;
+                    ClientAcquire::Relay {
+                        anchor,
+                        settings,
+                        http_only: false,
+                    }
+                }
+                Connect::RelayAwareAt { anchor_url } => {
+                    let (anchor, settings) =
+                        self.relay_business_config_with_deadline(Some(anchor_url), deadline)?;
                     ClientAcquire::Relay {
                         anchor,
                         settings,
