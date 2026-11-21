@@ -26,7 +26,7 @@ const EXPECTED_CRM_VER_HEADER: &str = "x-c2-expected-crm-ver";
 const EXPECTED_ABI_HASH_HEADER: &str = "x-c2-expected-abi-hash";
 const EXPECTED_SIGNATURE_HASH_HEADER: &str = "x-c2-expected-signature-hash";
 
-fn encode_segment(s: &str) -> String {
+pub(crate) fn encode_segment(s: &str) -> String {
     utf8_percent_encode(s, PATH_SEGMENT).to_string()
 }
 
@@ -532,7 +532,7 @@ fn stream_protocol_error(reason: &'static str) -> HttpError {
     )
 }
 
-fn add_expected_contract_headers(
+pub(crate) fn add_expected_contract_headers(
     request: reqwest::RequestBuilder,
     expected: &ExpectedRouteContract,
 ) -> reqwest::RequestBuilder {

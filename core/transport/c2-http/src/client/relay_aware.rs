@@ -285,6 +285,11 @@ impl RelayAwareHttpClient {
     }
 
     /// Start a route-bound topic subscription over the selected HTTP relay.
+    ///
+    /// Topic subscriptions always enter through the anchor relay rather than
+    /// the resolved route's relay: the anchor's TopicHub then collapses every
+    /// local subscriber of a remote route into one cross-relay upstream, so
+    /// R subscribers on one anchor never multiply the wide-area link.
     pub async fn subscribe_controlled_async(
         &self,
         topic_name: &str,
@@ -296,7 +301,13 @@ impl RelayAwareHttpClient {
         let result = async {
             check_active(Some(control))?;
             let target = self.selected_http_target()?;
-            let client = self.acquire_route_client(&target.relay_url, Some(control))?;
+            let anchor = self.control.base_url().trim_end_matches('/');
+            let relay_url = if target.relay_url.trim_end_matches('/') == anchor {
+                target.relay_url
+            } else {
+                anchor.to_string()
+            };
+            let client = self.acquire_route_client(&relay_url, Some(control))?;
             client
                 .client
                 .topic_route_async(

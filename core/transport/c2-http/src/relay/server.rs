@@ -278,6 +278,29 @@ impl RelayServer {
         self.state.topics.blocked_subscribers()
     }
 
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn topic_confirm_count_for_test(&self) -> u64 {
+        self.state
+            .topic_confirms
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn pause_next_topic_confirm_for_test(&self) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        assert!(
+            self.state
+                .topic_confirm_pause
+                .lock()
+                .replace((entered_tx, release_rx))
+                .is_none()
+        );
+        (entered_rx, release_tx)
+    }
+
     /// Start the relay server on a background thread.
     pub fn start(config: RelayConfig) -> Result<Self, String> {
         Self::start_with_options(config, RelayServerOptions::default())

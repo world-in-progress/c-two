@@ -847,6 +847,10 @@ pub fn build_router(state: Arc<RelayState>) -> Router {
     let data_router = Router::new()
         .route("/{route_name}/{method_name}", post(call_handler))
         .route("/{route_name}/_topics/{topic_name}", post(topic_handler))
+        .route(
+            "/{route_name}/_topics/{topic_name}/_confirm",
+            post(topic_confirm_handler),
+        )
         .layer(DefaultBodyLimit::disable());
 
     Router::new()
@@ -882,6 +886,10 @@ async fn topic_handler(
             [("dispatch_phase", "pre_dispatch")],
         );
     }
+    let origin_only = match origin_only_from_headers(&headers) {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
     let start = match headers
         .get("x-c2-topic-start")
         .and_then(|v| v.to_str().ok())
@@ -912,26 +920,55 @@ async fn topic_handler(
             );
         }
     };
-    let resolved = match state.resolve_matching(&expected) {
+    let resolved = match state.resolve_entry_matching(&expected) {
         Ok(route) => route,
         Err(error) => return route_resolution_error_response(&route_name, error),
     };
-    if state.local_route(&route_name).is_none() {
-        if resolved.is_some() {
+    let options = c2_wire::rpc::WireSubscribeOptions { start, on_lag };
+    let local = state.local_route(&route_name);
+    if local.is_none() {
+        if resolved.is_none() {
+            if state
+                .list_routes()
+                .iter()
+                .any(|route| route.name == route_name)
+            {
+                return crm_contract_mismatch_response_budgeted(&route_name, &budget);
+            }
+            return resource_not_found_response_budgeted(&route_name, &budget);
+        }
+        // Loop prevention: a relay-to-relay upstream must land on the relay
+        // that hosts the registration. Never forward it onward.
+        if origin_only {
             return resource_unavailable_response_budgeted(
                 &route_name,
-                "remote topic forwarding is unavailable",
+                "origin-only topic request must target a local route",
                 "pre_dispatch",
                 &budget,
             );
         }
-        if state
-            .list_routes()
-            .iter()
-            .any(|route| route.name == route_name)
+        let Some(entry) = resolved else {
+            unreachable!("a remote resolution carries its entry");
+        };
+        let (permit, tracked) = match state.forwarding.admit_subscription() {
+            Ok(value) => value,
+            Err(error) => return forwarding_capacity_response(&route_name, error.to_string()),
+        };
+        return match require_send(super::topic_hub::subscribe_remote(
+            state,
+            entry,
+            expected,
+            topic_name,
+            options,
+            permit,
+            tracked,
+            connection,
+        ))
+        .await
         {
-            return crm_contract_mismatch_response_budgeted(&route_name, &budget);
-        }
+            Ok(response) => response,
+            Err(error) => topic_error_response(error, &budget),
+        };
     }
     let route = match validate_expected_crm_for_route(&state, &route_name, &expected, Some(&budget))
     {
@@ -973,30 +1010,177 @@ async fn topic_handler(
     if let Err(error) = state.resolve_matching(&expected) {
         return route_resolution_error_response(&route_name, error);
     }
-    let options = c2_wire::rpc::WireSubscribeOptions { start, on_lag };
-    fn require_send<F: std::future::Future + Send>(future: F) -> F {
-        future
-    }
     match require_send(super::topic_hub::subscribe(
-        state, current, topic_name, options, lease, binding, permit, tracked, connection,
+        state,
+        current,
+        topic_name,
+        options,
+        lease,
+        binding,
+        permit,
+        tracked,
+        connection,
+        origin_only,
     ))
     .await
     {
         Ok(response) => response,
-        Err(mut error) => {
-            error
-                .details
-                .insert("dispatch_phase".into(), "pre_dispatch".into());
-            let status = match error.code {
-                c2_error::ErrorCode::ResourceNotFound => StatusCode::NOT_FOUND,
-                c2_error::ErrorCode::ContractMismatch | c2_error::ErrorCode::RouteConflict => {
-                    StatusCode::CONFLICT
-                }
-                c2_error::ErrorCode::CallCapacityExceeded => StatusCode::SERVICE_UNAVAILABLE,
-                _ => StatusCode::BAD_GATEWAY,
-            };
-            json_error_response(status, error.envelope(), Some(&budget))
+        Err(error) => topic_error_response(error, &budget),
+    }
+}
+
+fn topic_error_response(mut error: c2_error::C2Error, budget: &DomainBudget) -> Response {
+    error
+        .details
+        .insert("dispatch_phase".into(), "pre_dispatch".into());
+    let status = match error.code {
+        c2_error::ErrorCode::ResourceNotFound => StatusCode::NOT_FOUND,
+        c2_error::ErrorCode::ContractMismatch | c2_error::ErrorCode::RouteConflict => {
+            StatusCode::CONFLICT
         }
+        c2_error::ErrorCode::CallCapacityExceeded => StatusCode::SERVICE_UNAVAILABLE,
+        _ => StatusCode::BAD_GATEWAY,
+    };
+    json_error_response(status, error.envelope(), Some(budget))
+}
+
+fn require_send<F: std::future::Future + Send>(future: F) -> F {
+    future
+}
+
+fn origin_only_from_headers(headers: &HeaderMap) -> Result<bool, Response> {
+    match headers.get(super::topic_remote::ORIGIN_ONLY_HEADER) {
+        None => Ok(false),
+        Some(value) if value.as_bytes() == b"1" => Ok(true),
+        Some(_) => Err(c2_error_response(
+            StatusCode::BAD_REQUEST,
+            c2_error::ErrorCode::ProtocolViolation,
+            "invalid relay origin header",
+            [("dispatch_phase", "pre_dispatch")],
+        )),
+    }
+}
+
+/// `POST /{route_name}/_topics/{topic_name}/_confirm` — the lightweight
+/// cross-relay source confirmation. Carries no payload bytes; the source
+/// relay verifies the route still serves the caller's registration and
+/// returns the topic head sequence from the active hub's subscription.
+async fn topic_confirm_handler(
+    State(state): State<Arc<RelayState>>,
+    Path((route_name, topic_name)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Response {
+    #[cfg(feature = "test-support")]
+    {
+        state
+            .topic_confirms
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let pause = state.topic_confirm_pause.lock().take();
+        if let Some((entered, release)) = pause {
+            let _ = entered.send(());
+            let _ = release.await;
+        }
+    }
+    let budget = state.forwarding.budget().clone();
+    let expected = match expected_crm_from_headers(&route_name, &headers, Some(&budget)) {
+        Ok(expected) => expected,
+        Err(response) => return response.into_response(),
+    };
+    if headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v != "0")
+        || headers.contains_key(header::TRANSFER_ENCODING)
+    {
+        return c2_error_response(
+            StatusCode::BAD_REQUEST,
+            c2_error::ErrorCode::ProtocolViolation,
+            "invalid topic confirmation headers",
+            [("dispatch_phase", "pre_dispatch")],
+        );
+    }
+    if !matches!(origin_only_from_headers(&headers), Ok(true)) {
+        return c2_error_response(
+            StatusCode::BAD_REQUEST,
+            c2_error::ErrorCode::ProtocolViolation,
+            "topic confirmation requires the relay origin header",
+            [("dispatch_phase", "pre_dispatch")],
+        );
+    }
+    let registration = match headers
+        .get(super::topic_remote::EXPECTED_REGISTRATION_HEADER)
+        .and_then(|value| value.to_str().ok())
+    {
+        Some(value) if !value.is_empty() => value.to_string(),
+        _ => {
+            return c2_error_response(
+                StatusCode::BAD_REQUEST,
+                c2_error::ErrorCode::ProtocolViolation,
+                "topic confirmation requires the source registration identity",
+                [("dispatch_phase", "pre_dispatch")],
+            );
+        }
+    };
+    let resolved = match state.resolve_matching(&expected) {
+        Ok(resolved) => resolved,
+        Err(error) => return route_resolution_error_response(&route_name, error),
+    };
+    // Loop prevention, identical to the subscription endpoint: the
+    // confirmation answers for a registration this relay hosts. A name that
+    // left the mesh entirely is an unregistered registration, not a refusal
+    // to forward: it isolates the requester's hub.
+    let Some(route) = state.local_route(&route_name) else {
+        if resolved.is_none() {
+            return resource_not_found_response_budgeted(&route_name, &budget);
+        }
+        return resource_unavailable_response_budgeted(
+            &route_name,
+            "origin-only topic confirmation must target a local route",
+            "pre_dispatch",
+            &budget,
+        );
+    };
+    if !route_matches_expected_crm(&route, &expected) {
+        return crm_contract_mismatch_response_budgeted(&route_name, &budget);
+    }
+    let (Some(instance), Some(route_uid)) = (&route.server_instance_id, &route.route_uid) else {
+        return resource_unavailable_response_budgeted(
+            &route_name,
+            "local route has no registration identity",
+            "pre_dispatch",
+            &budget,
+        );
+    };
+    // The fingerprint covers the server instance and the registration's route
+    // UID, so a same-process re-registration can never confirm an old hub.
+    if super::topic_remote::registration_fingerprint(instance, route_uid) != registration {
+        return c2_error_response_with_budget(
+            StatusCode::SERVICE_UNAVAILABLE,
+            c2_error::ErrorCode::CallCancelled,
+            "subscription cancelled: route_unregistered",
+            [
+                ("route".to_string(), route_name.clone()),
+                ("cause".to_string(), "route_unregistered".to_string()),
+                ("dispatch_phase".to_string(), "pre_dispatch".to_string()),
+            ],
+            &budget,
+        );
+    }
+    let Some(source) = state.topics.active_local(instance, route_uid, &topic_name) else {
+        return resource_unavailable_response_budgeted(
+            &route_name,
+            "source topic subscription is not active",
+            "pre_dispatch",
+            &budget,
+        );
+    };
+    match source.head_seq().await {
+        Ok(head_seq) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "head_seq": head_seq })),
+        )
+            .into_response(),
+        Err(error) => topic_error_response(error, &budget),
     }
 }
 
@@ -6527,6 +6711,265 @@ mod tests {
             conflict_resolve_json["details"]["dispatch_phase"],
             "pre_dispatch"
         );
+    }
+
+    fn state_with_live_peer_route(name: &str) -> Arc<RelayState> {
+        let state = test_state();
+        state.register_peer(crate::relay::types::PeerInfo {
+            relay_id: "peer-origin".into(),
+            url: "http://127.0.0.1:18083".into(),
+            route_count: 1,
+            last_heartbeat: std::time::Instant::now(),
+            status: PeerStatus::Alive,
+        });
+        state.with_route_table_mut(|table| {
+            assert!(table.register_route(RouteEntry {
+                name: name.into(),
+                relay_id: "peer-origin".into(),
+                relay_url: "http://127.0.0.1:18083".into(),
+                server_id: None,
+                server_instance_id: None,
+                ipc_address: None,
+                crm_ns: "test.echo".into(),
+                crm_name: "Echo".into(),
+                crm_ver: "0.1.0".into(),
+                abi_hash: TEST_ABI_HASH.into(),
+                signature_hash: TEST_SIGNATURE_HASH.into(),
+                max_payload_size: 1024,
+                route_uid: None,
+                locality: Locality::Peer,
+                registered_at: 1234.5,
+            }))
+        });
+        state
+    }
+
+    async fn response_json(response: Response) -> (StatusCode, serde_json::Value) {
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json = serde_json::from_slice(&bytes).unwrap();
+        (status, json)
+    }
+
+    #[tokio::test]
+    async fn origin_only_topic_request_for_a_remote_route_is_refused_pre_dispatch() {
+        let state = state_with_live_peer_route("remote-grid");
+        let topic = build_router(state.clone())
+            .oneshot(
+                add_expected_echo_headers(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/remote-grid/_topics/state"),
+                )
+                .header("accept", crate::topic_wire::MEDIA_TYPE)
+                .header("x-c2-topic-start", "latest")
+                .header("x-c2-topic-on-lag", "skip")
+                .header("x-c2-relay-origin-only", "1")
+                .header("content-length", "0")
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let (status, json) = response_json(topic).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(json["code"], 702);
+        assert_eq!(json["details"]["dispatch_phase"], "pre_dispatch");
+        assert!(
+            json["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("local route")),
+            "the refusal must name loop prevention: {json}"
+        );
+        // An invalid origin header value is a plain protocol violation.
+        let topic = build_router(state)
+            .oneshot(
+                add_expected_echo_headers(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/remote-grid/_topics/state"),
+                )
+                .header("accept", crate::topic_wire::MEDIA_TYPE)
+                .header("x-c2-topic-start", "latest")
+                .header("x-c2-topic-on-lag", "skip")
+                .header("x-c2-relay-origin-only", "2")
+                .header("content-length", "0")
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let (status, json) = response_json(topic).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(json["code"], 713);
+    }
+
+    #[tokio::test]
+    async fn origin_only_confirmation_refuses_remote_routes_and_stale_registrations() {
+        let fingerprint = |instance: &str, route_uid: &str| {
+            super::super::topic_remote::registration_fingerprint(instance, route_uid)
+        };
+        // A confirmation for a route this relay only knows remotely is loop
+        // prevention: refused before dispatch, never forwarded.
+        let state = state_with_live_peer_route("remote-grid");
+        let confirm = build_router(state)
+            .oneshot(
+                add_expected_echo_headers(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/remote-grid/_topics/state/_confirm"),
+                )
+                .header("x-c2-relay-origin-only", "1")
+                .header("x-c2-expected-registration", "0".repeat(64))
+                .header("content-length", "0")
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let (status, json) = response_json(confirm).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(json["code"], 702);
+        assert_eq!(json["details"]["dispatch_phase"], "pre_dispatch");
+
+        // A name that left the mesh entirely is an unregistered registration:
+        // 701 isolates the requester's hub instead of leaving it retrying.
+        let state = test_state();
+        let confirm = build_router(state.clone())
+            .oneshot(
+                add_expected_echo_headers(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/gone-grid/_topics/state/_confirm"),
+                )
+                .header("x-c2-relay-origin-only", "1")
+                .header("x-c2-expected-registration", "0".repeat(64))
+                .header("content-length", "0")
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let (status, json) = response_json(confirm).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(json["code"], 701);
+        assert_eq!(json["details"]["dispatch_phase"], "pre_dispatch");
+
+        state.with_route_table_mut(|table| {
+            assert!(table.register_route(RouteEntry {
+                name: "local-grid".into(),
+                relay_id: "test-relay".into(),
+                relay_url: "http://127.0.0.1:18084".into(),
+                server_id: Some("srv-a".into()),
+                server_instance_id: Some("srv-a-inst".into()),
+                ipc_address: Some("ipc://srv-a".into()),
+                crm_ns: "test.echo".into(),
+                crm_name: "Echo".into(),
+                crm_ver: "0.1.0".into(),
+                abi_hash: TEST_ABI_HASH.into(),
+                signature_hash: TEST_SIGNATURE_HASH.into(),
+                max_payload_size: 1024,
+                route_uid: Some("uid-a".into()),
+                locality: Locality::Local,
+                registered_at: 1.0,
+            }))
+        });
+
+        // Without the relay origin header the confirmation endpoint refuses.
+        let confirm = build_router(state.clone())
+            .oneshot(
+                add_expected_echo_headers(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/local-grid/_topics/state/_confirm"),
+                )
+                .header("x-c2-expected-registration", fingerprint("srv-a-inst", "uid-a"))
+                .header("content-length", "0")
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let (status, json) = response_json(confirm).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(json["code"], 713);
+
+        // The same server instance re-registering issues a new route UID: the
+        // old registration's fingerprint no longer matches and the requester's
+        // hub is isolated with 718 route_unregistered before dispatch.
+        let confirm = build_router(state.clone())
+            .oneshot(
+                add_expected_echo_headers(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/local-grid/_topics/state/_confirm"),
+                )
+                .header("x-c2-relay-origin-only", "1")
+                .header(
+                    "x-c2-expected-registration",
+                    fingerprint("srv-a-inst", "uid-replacement"),
+                )
+                .header("content-length", "0")
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let (status, json) = response_json(confirm).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(json["code"], 718);
+        assert_eq!(json["details"]["cause"], "route_unregistered");
+        assert_eq!(json["details"]["dispatch_phase"], "pre_dispatch");
+
+        // A matching registration with no live hub cannot answer a head
+        // sequence; the anchor retries rather than trusting cached state.
+        let confirm = build_router(state.clone())
+            .oneshot(
+                add_expected_echo_headers(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/local-grid/_topics/state/_confirm"),
+                )
+                .header("x-c2-relay-origin-only", "1")
+                .header("x-c2-expected-registration", fingerprint("srv-a-inst", "uid-a"))
+                .header("content-length", "0")
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let (status, json) = response_json(confirm).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(json["code"], 702);
+        assert!(
+            json["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("not active")),
+            "the refusal must name the inactive source: {json}"
+        );
+
+        // A contract mismatch keeps its canonical 709 refusal.
+        let confirm = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/local-grid/_topics/state/_confirm")
+                    .header("x-c2-relay-origin-only", "1")
+                    .header("x-c2-expected-registration", fingerprint("srv-a-inst", "uid-a"))
+                    .header("x-c2-expected-crm-ns", "test.echo")
+                    .header("x-c2-expected-crm-name", "Other")
+                    .header("x-c2-expected-crm-ver", "0.1.0")
+                    .header("x-c2-expected-abi-hash", TEST_ABI_HASH)
+                    .header("x-c2-expected-signature-hash", TEST_SIGNATURE_HASH)
+                    .header("content-length", "0")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let (status, json) = response_json(confirm).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(json["code"], 709);
     }
 
     #[tokio::test]

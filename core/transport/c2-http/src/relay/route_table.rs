@@ -344,6 +344,17 @@ impl RouteTable {
         &self,
         expected: &ExpectedRouteContract,
     ) -> Result<Option<RouteInfo>, RouteResolutionError> {
+        self.resolve_entry_matching(expected)
+            .map(|entry| entry.map(|entry| entry.to_route_info()))
+    }
+
+    /// The full-table sibling of [`Self::resolve_matching`]: the resolved live
+    /// entry itself, local or peer, for callers that need the origin relay's
+    /// registration view rather than its client projection.
+    pub(crate) fn resolve_entry_matching(
+        &self,
+        expected: &ExpectedRouteContract,
+    ) -> Result<Option<RouteEntry>, RouteResolutionError> {
         let named: Vec<_> = self
             .routes
             .values()
@@ -359,7 +370,7 @@ impl RouteTable {
                 self.registration_infos(live),
             ));
         }
-        let Some(entry) = live.first() else {
+        let Some(entry) = live.first().copied() else {
             return if named.is_empty() {
                 Ok(None)
             } else {
@@ -373,7 +384,24 @@ impl RouteTable {
             && entry.crm_ver == expected.crm_ver
             && entry.abi_hash == expected.abi_hash
             && entry.signature_hash == expected.signature_hash)
-            .then(|| entry.to_route_info()))
+            .then(|| entry.clone()))
+    }
+
+    /// Whether the table still holds exactly this peer registration of a name.
+    pub(crate) fn peer_entry_matches(&self, entry: &RouteEntry) -> bool {
+        self.routes.values().any(|current| {
+            current.name == entry.name
+                && current.relay_id == entry.relay_id
+                && current.relay_url == entry.relay_url
+                && current.registered_at == entry.registered_at
+                && current.crm_ns == entry.crm_ns
+                && current.crm_name == entry.crm_name
+                && current.crm_ver == entry.crm_ver
+                && current.abi_hash == entry.abi_hash
+                && current.signature_hash == entry.signature_hash
+                && current.locality == Locality::Peer
+                && entry.locality == Locality::Peer
+        })
     }
 
     fn route_is_live(&self, entry: &RouteEntry) -> bool {

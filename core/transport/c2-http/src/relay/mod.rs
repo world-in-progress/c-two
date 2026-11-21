@@ -75,6 +75,7 @@ pub(crate) mod streaming;
 #[cfg(test)]
 pub(crate) mod test_support;
 pub(crate) mod topic_hub;
+pub(crate) mod topic_remote;
 pub(crate) mod types;
 pub(crate) mod upstream_control;
 pub(crate) mod url;

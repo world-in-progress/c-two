@@ -111,6 +111,15 @@ pub struct RelayState {
     #[cfg(feature = "test-support")]
     pub(crate) route_lookups: std::sync::atomic::AtomicU64,
     #[cfg(feature = "test-support")]
+    pub(crate) topic_confirms: std::sync::atomic::AtomicU64,
+    #[cfg(feature = "test-support")]
+    pub(crate) topic_confirm_pause: parking_lot::Mutex<
+        Option<(
+            tokio::sync::oneshot::Sender<()>,
+            tokio::sync::oneshot::Receiver<()>,
+        )>,
+    >,
+    #[cfg(feature = "test-support")]
     pub(crate) topic_pause: parking_lot::Mutex<
         Option<(
             tokio::sync::oneshot::Sender<()>,
@@ -255,6 +264,10 @@ impl RelayState {
             #[cfg(feature = "test-support")]
             route_lookups: std::sync::atomic::AtomicU64::new(0),
             #[cfg(feature = "test-support")]
+            topic_confirms: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(feature = "test-support")]
+            topic_confirm_pause: parking_lot::Mutex::new(None),
+            #[cfg(feature = "test-support")]
             topic_pause: parking_lot::Mutex::new(None),
             clients: crate::relay::client_lifecycle::ClientLifecycle::new(),
         }
@@ -389,6 +402,15 @@ impl RelayState {
         self.route_table.read().resolve_matching(expected)
     }
 
+    /// The full resolved entry (local or peer) behind [`Self::resolve_matching`],
+    /// for the data plane that needs the origin relay's registration view.
+    pub(crate) fn resolve_entry_matching(
+        &self,
+        expected: &c2_contract::ExpectedRouteContract,
+    ) -> Result<Option<RouteEntry>, RouteResolutionError> {
+        self.route_table.read().resolve_entry_matching(expected)
+    }
+
     pub fn route_names(&self) -> Vec<String> {
         self.route_table.read().route_names()
     }
@@ -399,6 +421,12 @@ impl RelayState {
 
     pub(crate) fn local_route(&self, name: &str) -> Option<RouteEntry> {
         self.route_table.read().local_route(name)
+    }
+
+    /// Whether this relay's mesh view still describes exactly the peer
+    /// registration a cross-relay upstream was opened for.
+    pub(crate) fn peer_entry_matches(&self, entry: &RouteEntry) -> bool {
+        self.route_table.read().peer_entry_matches(entry)
     }
 
     // -- Connection-only operations --
