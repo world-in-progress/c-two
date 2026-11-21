@@ -190,6 +190,7 @@ dependencies = [
  "c2-local-security",
  "libc",
  "memmap2",
+ "parking_lot",
  "sha2",
  "uuid",
  "windows-sys 0.61.2",

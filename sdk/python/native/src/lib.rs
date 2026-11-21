@@ -34,6 +34,8 @@ mod runtime_session_ffi;
 #[cfg(feature = "python")]
 mod stream_ffi;
 #[cfg(feature = "python")]
+mod topic_ffi;
+#[cfg(feature = "python")]
 use pyo3::prelude::*;
 
 /// The unified `c_two._native` Python module.
@@ -55,6 +57,7 @@ fn c2_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     mem_ffi::register_module(m)?;
     route_concurrency_ffi::register_module(m)?;
     runtime_session_ffi::register_module(m)?;
+    topic_ffi::register_module(m)?;
     contract_ffi::register_module(m)?;
     Ok(())
 }

@@ -628,8 +628,114 @@ cc.error.CoreError.__init__ = observe_error
 pub struct PyRuntimeSession {
     inner: Arc<Runtime>,
     host: Mutex<HostRecord>,
-    registrations: Mutex<HashMap<String, Registration>>,
+    registrations: Mutex<HashMap<String, Arc<SessionRegistration>>>,
     server_bridge: Mutex<ServerBridgeSlot>,
+}
+
+/// One live route registration shared by the session map and Python handles.
+///
+/// The session keeps the inner `Registration` alive for the whole route
+/// lifetime; a dropped Python `NativeRegistration` never unregisters. Taking
+/// the inner value out (explicit unregister, retirement) seals every handle
+/// minted from this registration against later same-name registrations.
+pub(crate) struct SessionRegistration {
+    route_name: String,
+    registration: Mutex<Option<Registration>>,
+}
+
+impl SessionRegistration {
+    fn new(route_name: String, registration: Registration) -> Arc<Self> {
+        Arc::new(Self {
+            route_name,
+            registration: Mutex::new(Some(registration)),
+        })
+    }
+
+    fn publisher(
+        self: &Arc<Self>,
+        topic_name: &str,
+    ) -> Result<c2_core::TopicPublisher, c2_core::Error> {
+        let guard = self.registration.lock();
+        match guard.as_ref() {
+            Some(registration) => registration.publisher(topic_name),
+            None => Err(crate::topic_ffi::registration_closed_error(
+                &self.route_name,
+            )),
+        }
+    }
+
+    fn is_closed(&self) -> bool {
+        self.registration
+            .lock()
+            .as_ref()
+            .is_none_or(c2_core::Registration::is_closed)
+    }
+
+    fn active_subscribers(&self) -> usize {
+        self.registration
+            .lock()
+            .as_ref()
+            .map_or(0, c2_core::Registration::active_subscribers)
+    }
+
+    /// Remove and close the inner registration, reporting its native outcome.
+    ///
+    /// The inner value is taken out under the lock and drained strictly
+    /// outside it: while the native close waits for active subscribers,
+    /// `is_closed` reports `true` and `publisher` refuses with 707 instead of
+    /// deadlocking on this mutex.
+    fn close(&self) -> Result<UnregisterOutcome, c2_core::Error> {
+        let Some(mut registration) = self.registration.lock().take() else {
+            return Err(crate::topic_ffi::registration_closed_error(
+                &self.route_name,
+            ));
+        };
+        registration.close()
+    }
+
+    /// Take the inner registration out (session retirement); dropping it runs
+    /// the idempotent native close.
+    fn take(self: &Arc<Self>) -> Option<Registration> {
+        self.registration.lock().take()
+    }
+}
+
+/// Python handle to one session registration. Keeps the shared slot alive;
+/// dropping it keeps the route registered.
+#[pyclass(name = "NativeRegistration", frozen, skip_from_py_object)]
+pub(crate) struct PyNativeRegistration {
+    shared: Arc<SessionRegistration>,
+}
+
+#[pymethods]
+impl PyNativeRegistration {
+    #[getter]
+    fn route_name(&self) -> &str {
+        &self.shared.route_name
+    }
+
+    /// Mint a publisher bound to this registration instance. Fails with
+    /// `ResourceClosed` (707) once the registration ended, and with 713 for a
+    /// topic the contract does not declare.
+    fn topic_publisher(
+        &self,
+        py: Python<'_>,
+        topic_name: &str,
+    ) -> PyResult<crate::topic_ffi::PyTopicPublisher> {
+        py.detach(|| self.shared.publisher(topic_name))
+            .map(crate::topic_ffi::PyTopicPublisher::new)
+            .map_err(core_error_to_py)
+    }
+
+    #[getter]
+    fn is_closed(&self, py: Python<'_>) -> bool {
+        py.detach(|| self.shared.is_closed())
+    }
+
+    #[getter]
+    fn active_subscribers(&self, py: Python<'_>) -> usize {
+        py.detach(|| self.shared.active_subscribers())
+    }
 }
 
 #[derive(Default)]
@@ -720,11 +826,11 @@ impl PyRuntimeSession {
         // and move native registrations and the Python bridge out of their
         // locks before dropping either value so no destructor runs under a lock.
         let retired_bridge = py.detach(|| {
-            let retired_registrations: Vec<Registration> = self
+            let retired_registrations: Vec<Option<Registration>> = self
                 .registrations
                 .lock()
                 .drain()
-                .map(|(_, registration)| registration)
+                .map(|(_, registration)| registration.take())
                 .collect();
             let bridge = {
                 let mut slot = self.server_bridge.lock();
@@ -746,11 +852,11 @@ impl PyRuntimeSession {
             if record.generation != observed_generation {
                 return None;
             }
-            let retired_registrations: Vec<Registration> = self
+            let retired_registrations: Vec<Option<Registration>> = self
                 .registrations
                 .lock()
                 .drain()
-                .map(|(_, registration)| registration)
+                .map(|(_, registration)| registration.take())
                 .collect();
             let bridge = self.server_bridge.lock().bridge.take();
             drop(record);
@@ -1245,7 +1351,7 @@ impl PyRuntimeSession {
         }
     }
 
-    #[pyo3(signature = (name, dispatcher, method_names, access_map, concurrency_mode, max_pending, max_workers, crm_ns, crm_name, crm_ver, abi_hash, signature_hash, descriptor_json))]
+    #[pyo3(signature = (name, dispatcher, method_names, access_map, concurrency_mode, max_pending, max_workers, crm_ns, crm_name, crm_ver, abi_hash, signature_hash, descriptor_json, topic_names, topic_capacity, initial_topics))]
     #[allow(clippy::too_many_arguments)] // PyO3 signature is the existing Python call boundary.
     fn register_route<'py>(
         &self,
@@ -1263,6 +1369,9 @@ impl PyRuntimeSession {
         abi_hash: &str,
         signature_hash: &str,
         descriptor_json: &[u8],
+        topic_names: Vec<String>,
+        topic_capacity: &Bound<'py, PyDict>,
+        initial_topics: &Bound<'py, PyDict>,
     ) -> PyResult<Py<PyAny>> {
         if py.detach(|| self.registrations.lock().contains_key(name)) {
             return Err(PyValueError::new_err(format!(
@@ -1273,13 +1382,22 @@ impl PyRuntimeSession {
         let expected =
             expected_route_contract(name, crm_ns, crm_name, crm_ver, abi_hash, signature_hash)?;
         let service = Arc::new(PyCoreService::new(name.to_string(), dispatcher));
-        let definition = service_definition(descriptor_json, expected, methods, service)?
+        let (definition, portable) =
+            service_definition(descriptor_json, expected, methods, service)?;
+        let definition = definition
             .with_concurrency(
                 parse_concurrency_mode(concurrency_mode)?,
                 max_pending,
                 max_workers,
             )
             .map_err(core_error_to_py)?;
+        let definition = apply_topic_configuration(
+            definition,
+            portable,
+            topic_names,
+            topic_capacity,
+            initial_topics,
+        )?;
         let host = py
             .detach(|| self.ensure_host())
             .map_err(ensure_host_error_to_py)?;
@@ -1288,34 +1406,75 @@ impl PyRuntimeSession {
             .map_err(core_error_to_py)?;
         let outcome = registration.outcome().clone();
         let concurrency = registration.route_concurrency();
+        let shared = SessionRegistration::new(name.to_string(), registration);
+        // Clone the handle's Arc before publishing the slot so a concurrent
+        // unregister/re-register race can never hand out the wrong instance.
+        let handle_shared = Arc::clone(&shared);
         py.detach(|| {
-            let replaced = self
-                .registrations
-                .lock()
-                .insert(name.to_string(), registration);
+            let replaced = self.registrations.lock().insert(name.to_string(), shared);
             drop(replaced);
         });
 
         let outcome = register_outcome_to_dict(py, outcome)?.unbind();
         let concurrency = Py::new(py, PyRouteConcurrency::new(concurrency))?;
-        Ok((outcome, concurrency)
+        let handle = Py::new(
+            py,
+            PyNativeRegistration {
+                shared: handle_shared,
+            },
+        )?;
+        Ok((outcome, concurrency, handle)
             .into_pyobject(py)?
             .into_any()
             .unbind())
     }
 
     fn unregister_route<'py>(&self, py: Python<'py>, name: &str) -> PyResult<Bound<'py, PyDict>> {
-        let mut registration = py
+        let registration = py
             .detach(|| self.registrations.lock().remove(name))
             .ok_or_else(|| PyValueError::new_err(format!("Name not registered: {name:?}")))?;
         let outcome = py
-            .detach(|| {
-                let outcome = registration.close();
-                drop(registration);
-                outcome
-            })
+            .detach(|| registration.close())
             .map_err(core_error_to_py)?;
         unregister_outcome_to_dict(py, outcome)
+    }
+
+    /// Attach a same-process subscription to the route's current registration.
+    ///
+    /// Validates the exact route name and contract identity like a remote
+    /// `OPEN`: 701 for an absent route, 709 on identity mismatch, 713 for a
+    /// topic the matched contract does not declare.
+    #[allow(clippy::too_many_arguments)] // PyO3 signature is the existing Python call boundary.
+    #[pyo3(signature = (route_name, crm_ns, crm_name, crm_ver, abi_hash, signature_hash, topic, start, on_lag))]
+    fn subscribe_local_route(
+        &self,
+        py: Python<'_>,
+        route_name: &str,
+        crm_ns: &str,
+        crm_name: &str,
+        crm_ver: &str,
+        abi_hash: &str,
+        signature_hash: &str,
+        topic: &str,
+        start: &str,
+        on_lag: &str,
+    ) -> PyResult<crate::topic_ffi::PyLocalTopicSubscription> {
+        let expected = expected_route_contract(
+            route_name,
+            crm_ns,
+            crm_name,
+            crm_ver,
+            abi_hash,
+            signature_hash,
+        )?;
+        let options = crate::topic_ffi::subscribe_options(start, on_lag)?;
+        let host = py.detach(|| self.host.lock().host.clone());
+        py.detach(move || {
+            let host = host.ok_or_else(|| crate::topic_ffi::route_host_absent_error(route_name))?;
+            host.subscribe_local(&expected, topic, options)
+        })
+        .map(crate::topic_ffi::PyLocalTopicSubscription::new)
+        .map_err(core_error_to_py)
     }
 
     #[pyo3(signature = (connect_attempt=None))]
@@ -1390,11 +1549,11 @@ impl PyRuntimeSession {
                 // Host that we then clear.
                 let (outcome, completed) = receipt.observe_with_timeout(timeout);
                 let (retired_registrations, retired_bridge) = if completed {
-                    let registrations: Vec<Registration> = self
+                    let registrations: Vec<Option<Registration>> = self
                         .registrations
                         .lock()
                         .drain()
-                        .map(|(_, registration)| registration)
+                        .map(|(_, registration)| registration.take())
                         .collect();
                     let bridge = self.server_bridge.lock().bridge.take();
                     (registrations, bridge)
@@ -1661,7 +1820,7 @@ fn service_definition(
     expected: ExpectedRouteContract,
     methods: Vec<MethodDefinition>,
     service: Arc<PyCoreService>,
-) -> PyResult<ServiceDefinition> {
+) -> PyResult<(ServiceDefinition, bool)> {
     let descriptor: serde_json::Value = serde_json::from_slice(descriptor_json)
         .map_err(|error| PyValueError::new_err(format!("invalid contract descriptor: {error}")))?;
     let schema = descriptor
@@ -1697,7 +1856,8 @@ fn service_definition(
                 methods,
                 service,
             )
-            .map_err(core_error_to_py);
+            .map_err(core_error_to_py)
+            .map(|definition| (definition, true));
         }
         return ServiceDefinition::new(
             &release,
@@ -1706,7 +1866,8 @@ fn service_definition(
             methods,
             service,
         )
-        .map_err(core_error_to_py);
+        .map_err(core_error_to_py)
+        .map(|definition| (definition, true));
     }
 
     let digest = contract_descriptor_sha256_hex(descriptor_json)
@@ -1754,10 +1915,59 @@ fn service_definition(
     if modes.contains(&MethodMode::ServerStream) {
         ServiceDefinition::new_nonportable_stream(release_ref, expected, methods, modes, service)
             .map_err(core_error_to_py)
+            .map(|definition| (definition, false))
     } else {
         ServiceDefinition::new_nonportable(release_ref, expected, methods, service)
             .map_err(core_error_to_py)
+            .map(|definition| (definition, false))
     }
+}
+
+/// Apply the Python-declared topic configuration to one service definition.
+///
+/// Portable services take their topic set from the admitted release
+/// descriptor (validated as a superset of the declared names); nonportable
+/// services declare their language-local topic names explicitly. Capacities
+/// and staged initial frames apply to both paths and commit atomically with
+/// the registration.
+fn apply_topic_configuration(
+    definition: ServiceDefinition,
+    portable: bool,
+    topic_names: Vec<String>,
+    topic_capacity: &Bound<'_, PyDict>,
+    initial_topics: &Bound<'_, PyDict>,
+) -> PyResult<ServiceDefinition> {
+    let mut definition = definition;
+    if portable {
+        let declared: std::collections::BTreeSet<&str> =
+            definition.topic_names().into_iter().collect();
+        for name in &topic_names {
+            if !declared.contains(name.as_str()) {
+                return Err(PyValueError::new_err(format!(
+                    "topic {name:?} is not declared on the portable contract descriptor",
+                )));
+            }
+        }
+    } else if !topic_names.is_empty() {
+        definition = definition
+            .with_nonportable_topics(topic_names)
+            .map_err(core_error_to_py)?;
+    }
+    for (topic, capacity) in topic_capacity {
+        let topic = topic.extract::<String>()?;
+        let capacity = capacity.extract::<usize>()?;
+        definition = definition
+            .with_topic_capacity(&topic, capacity)
+            .map_err(core_error_to_py)?;
+    }
+    for (topic, payload) in initial_topics {
+        let topic = topic.extract::<String>()?;
+        let payload = payload.extract::<Vec<u8>>()?;
+        definition = definition
+            .with_initial_topic_bytes(&topic, payload)
+            .map_err(core_error_to_py)?;
+    }
+    Ok(definition)
 }
 
 fn expected_route_contract(
@@ -1916,5 +2126,6 @@ fn lifecycle_snapshot_to_dict<'py>(
 
 pub(crate) fn register_module(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyRuntimeSession>()?;
+    module.add_class::<PyNativeRegistration>()?;
     Ok(())
 }

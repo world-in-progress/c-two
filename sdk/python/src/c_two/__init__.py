@@ -9,11 +9,12 @@ from importlib.metadata import version as _version
 __version__ = _version('c-two')
 
 from . import error
-from .crm.meta import crm, read, write, stream, on_shutdown
+from .crm.meta import crm, read, write, stream, topic, on_shutdown
 from .crm.transferable import hold, transfer, HeldResult
 from .crm.stream import Stream, StreamCloseReceipt
 from .transport.client.proxy import with_call_options
 from .transport.server.scheduler import ConcurrencyConfig
+from .transport.topic import Delivery, Publisher, Registration, Subscription, TopicCloseReceipt
 from .transport.registry import (
     Runtime, register, connect, close, unregister, serve, shutdown,
     server_address, set_relay_anchor, set_server, set_client,
@@ -26,12 +27,18 @@ __all__ = [
     'read',
     'write',
     'stream',
+    'topic',
     'Stream',
     'StreamCloseReceipt',
     'transfer',
     'on_shutdown',
     'hold',
     'HeldResult',
+    'Delivery',
+    'Publisher',
+    'Registration',
+    'Subscription',
+    'TopicCloseReceipt',
     'register',
     'connect',
     'close',

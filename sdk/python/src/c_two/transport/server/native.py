@@ -153,7 +153,9 @@ class NativeServerBridge:
         *,
         name: str,
         input_lifetime: Mapping[str, _InputLifetime] | None = None,
-    ) -> str:
+        topic_capacity: Mapping[str, int] | None = None,
+        initial_topics: Mapping[str, bytes] | None = None,
+    ):
         crm_ns, crm_name, crm_ver = self._extract_contract_identity(crm_class)
         if not isinstance(name, str):
             raise TypeError('name must be an explicit route name string')
@@ -220,7 +222,9 @@ class NativeServerBridge:
                 build_contract_descriptor,
                 diagnostics,
             )
+            from ...crm.topic import topic_names
 
+            declared_topics = topic_names(crm_class)
             portability_diagnostics = diagnostics(crm_class, methods)
             descriptor = build_contract_descriptor(
                 crm_class,
@@ -234,21 +238,43 @@ class NativeServerBridge:
                 sort_keys=True,
                 separators=(',', ':'),
             ).encode()
+            capacity_map = dict(topic_capacity or {})
+            initial_map = {
+                topic: bytes(payload)
+                for topic, payload in (initial_topics or {}).items()
+            }
+            unknown_capacity = sorted(set(capacity_map) - set(declared_topics))
+            if unknown_capacity:
+                raise ValueError(
+                    f'topic_capacity names topics not declared on the contract: '
+                    f'{", ".join(unknown_capacity)}',
+                )
+            unknown_initial = sorted(set(initial_map) - set(declared_topics))
+            if unknown_initial:
+                raise ValueError(
+                    f'initial_topics names topics not declared on the contract: '
+                    f'{", ".join(unknown_initial)}',
+                )
             try:
-                _outcome, native_concurrency = self._runtime_session.register_route(
-                    routing_name,
-                    dispatcher,
-                    methods,
-                    access_map,
-                    cc_config.mode,
-                    cc_config.max_pending,
-                    cc_config.max_workers,
-                    crm_ns,
-                    crm_name,
-                    crm_ver,
-                    abi_hash,
-                    signature_hash,
-                    descriptor_json,
+                _outcome, native_concurrency, native_registration = (
+                    self._runtime_session.register_route(
+                        routing_name,
+                        dispatcher,
+                        methods,
+                        access_map,
+                        cc_config.mode,
+                        cc_config.max_pending,
+                        cc_config.max_workers,
+                        crm_ns,
+                        crm_name,
+                        crm_ver,
+                        abi_hash,
+                        signature_hash,
+                        descriptor_json,
+                        declared_topics,
+                        capacity_map,
+                        initial_map,
+                    )
                 )
             except Exception as exc:
                 semantic = exc.semantic if issubclass(type(exc), CoreError) else None  # type: ignore[attr-defined]
@@ -262,7 +288,7 @@ class NativeServerBridge:
                 raise
             slot.scheduler = Scheduler(native_concurrency, method_index)
             self._slots[routing_name] = slot
-        return routing_name
+        return native_registration
 
     def unregister_crm(self, name: str) -> dict[str, Any]:
         with self._slots_lock:

@@ -1,4 +1,5 @@
 import enum
+import inspect
 import unicodedata
 from inspect import isfunction
 from typing import TypeVar, Type, Callable
@@ -8,6 +9,7 @@ _F = TypeVar('_F', bound=Callable)
 CRM = TypeVar('CRM')
 _METHOD_ACCESS_ATTR = '__cc_method_access__'
 _SHUTDOWN_ATTR = '__cc_on_shutdown__'
+_TOPIC_ATTR = '__cc_topic__'
 _CRM_TAG_MAX_BYTES = 255
 
 @enum.unique
@@ -34,6 +36,32 @@ def stream(func: _F) -> _F:
     if not callable(func):
         raise TypeError('@cc.stream can only be applied to callables.')
     setattr(func, '__cc_stream__', True)
+    return func
+
+
+def topic(func: _F) -> _F:
+    """Declare a resource-owned topic: zero input, one published output.
+
+    A topic method takes no parameters besides ``self`` and has no access
+    category; the resource never implements it. Values are published through
+    the registration-scoped publisher (``registration.publisher(topic)``),
+    and clients receive them via ``proxy.subscribe(topic)``.
+    """
+    if not callable(func):
+        raise TypeError('@cc.topic can only be applied to callables.')
+    if getattr(func, _SHUTDOWN_ATTR, False):
+        raise TypeError('@cc.on_shutdown cannot be combined with @cc.topic.')
+    if getattr(func, '__cc_stream__', False):
+        raise TypeError('@cc.stream cannot be combined with @cc.topic.')
+    parameters = list(inspect.signature(func).parameters.values())
+    if parameters and parameters[0].name in {'self', 'cls'}:
+        parameters = parameters[1:]
+    if parameters:
+        raise TypeError(
+            '@cc.topic methods take no parameters besides self, '
+            f'got {len(parameters)}.',
+        )
+    setattr(func, _TOPIC_ATTR, True)
     return func
 
 def get_method_access(func: Callable) -> MethodAccess:
@@ -150,8 +178,19 @@ def crm(*, namespace: str, version: str):
             raise ValueError('Version must be a string in the format "major.minor.patch".')
 
         decorated_methods = {}
+        topic_methods = {}
+        from .topic import _build_topic_wrapper, build_topic_output_binding
         for name, value in cls.__dict__.items():
             if isfunction(value) and name not in ('__dict__', '__weakref__', '__module__', '__qualname__', '__init__', '__tag__'):
+                if getattr(value, _TOPIC_ATTR, False):
+                    # Topics are publication channels, not RPC methods: wrap
+                    # the stub into the client-facing subscription entry. The
+                    # binding build rejects accidental @cc.on_shutdown mixing
+                    # before the shutdown skip below could hide the topic.
+                    topic_methods[name] = _build_topic_wrapper(
+                        value, build_topic_output_binding(value),
+                    )
+                    continue
                 if getattr(value, _SHUTDOWN_ATTR, False):
                     continue  # @cc.on_shutdown methods are not RPC-callable
                 transfer_config = getattr(value, '__cc_transfer__', None)
@@ -170,8 +209,10 @@ def crm(*, namespace: str, version: str):
         # Create the new class with injected context-manager methods.
         new_cls = CRMMeta(class_name, bases, {
             **{k: v for k, v in cls.__dict__.items()
-            if k not in decorated_methods and k not in ('__dict__', '__weakref__')},
+            if k not in decorated_methods and k not in topic_methods
+            and k not in ('__dict__', '__weakref__')},
             **decorated_methods,
+            **topic_methods,
             '__enter__': _crm_enter,
             '__exit__': _crm_exit,
         })

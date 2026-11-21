@@ -45,6 +45,7 @@ from typing import TYPE_CHECKING, TypeVar
 from c_two.crm.contract import CRMContract, crm_contract, crm_contract_identity
 from c_two.crm.conformance import validate_resource_conformance
 from c_two.crm.meta import _SHUTDOWN_ATTR, get_shutdown_method
+from c_two.crm.topic import topic_members
 from c_two.mem import MemoryStats
 from c_two.error import (
     CCError,
@@ -57,6 +58,7 @@ from .client.proxy import CRMProxy, _FollowingLocalRoute
 from ._snapshots import CallExecutionSnapshot, LifecycleSnapshot, ShutdownOutcome
 from .server.scheduler import ConcurrencyConfig
 from .server.native import NativeServerBridge as Server
+from .topic import Registration, encode_topic_initial_value
 
 if TYPE_CHECKING:
     from .endpoint import EndpointCredential
@@ -280,7 +282,9 @@ class Runtime:
         name: str,
         concurrency: ConcurrencyConfig | None = None,
         input_lifetime: Mapping[str, _InputLifetime] | None = None,
-    ) -> str:
+        topic_capacity: Mapping[str, int] | None = None,
+        initial_topics: Mapping[str, object] | None = None,
+    ) -> Registration:
         """Register a CRM, making it available via :func:`connect`.
 
         On the first call, a :class:`Server` is created and started
@@ -300,17 +304,46 @@ class Runtime:
             Unique routing name for this CRM instance.
         concurrency:
             Optional concurrency configuration for the scheduler.
+        topic_capacity:
+            Optional bounded history ring depth (``>= 1``) per declared topic.
+        initial_topics:
+            Optional initial value per declared topic, committed atomically
+            with the same publish logic before the route opens; a failure
+            rolls the registration back.
 
         Returns
         -------
-        str
-            The *name* string (echoed back for convenience).
+        Registration
+            The registration handle. The Runtime keeps the route alive;
+            dropping the returned object never unregisters it.
         """
         crm_contract_identity(crm_class)
         validate_resource_conformance(
             crm_class,
             crm_instance,
         )
+        topics = topic_members(crm_class)
+        if topic_capacity is not None:
+            unknown = sorted(set(topic_capacity) - set(topics))
+            if unknown:
+                raise ValueError(
+                    f'topic_capacity names topics not declared on '
+                    f'{crm_class.__name__}: {", ".join(unknown)}',
+                )
+        serialized_initial: dict[str, bytes] = {}
+        if initial_topics is not None:
+            unknown = sorted(set(initial_topics) - set(topics))
+            if unknown:
+                raise ValueError(
+                    f'initial_topics names topics not declared on '
+                    f'{crm_class.__name__}: {", ".join(unknown)}',
+                )
+            # Serialize the initial frames before touching any server state,
+            # so a codec failure leaves the route completely unopened.
+            for topic_name, value in initial_topics.items():
+                serialized_initial[topic_name] = encode_topic_initial_value(
+                    topics[topic_name].binding, value,
+                )
         shutdown_method = get_shutdown_method(crm_class)
         resource_type = type(crm_instance)
         resource_members = {
@@ -340,12 +373,14 @@ class Runtime:
                     server = self._ensure_server_bridge()
                     created_server = True
 
-                server.register_crm(
+                native_registration = server.register_crm(
                     crm_class,
                     crm_instance,
                     concurrency,
                     name=name,
                     input_lifetime=input_lifetime,
+                    topic_capacity=dict(topic_capacity) if topic_capacity is not None else None,
+                    initial_topics=serialized_initial,
                 )
 
                 # Start server if not yet running.
@@ -373,7 +408,10 @@ class Runtime:
 
         log.debug('Registered CRM %s at %s', name, server_address)
 
-        return name
+        return Registration(
+            native_registration,
+            {topic_name: info.binding for topic_name, info in topics.items()},
+        )
 
     def connect(
         self,
@@ -419,6 +457,10 @@ class Runtime:
         # Module-level connect creates this same attempt before the default lock.
         _connect_native_call(attempt.check, 'python_contract')
         expected_contract = crm_contract(crm_class)
+        topic_bindings = {
+            topic_name: info.binding
+            for topic_name, info in topic_members(crm_class).items()
+        }
         with _connect_lock(self._lock, attempt, 'registry_snapshot_wait'):
             server = self._server
             runtime_session = self._runtime_session
@@ -446,6 +488,7 @@ class Runtime:
                 name=name,
                 scheduler=scheduler,
                 local_copy_tracker=local_copy_tracker,
+                topic_bindings=topic_bindings,
                 following_local=_FollowingLocalRoute(
                     self, runtime_session, crm_class, name, crm_instance, scheduler,
                 ),
@@ -476,6 +519,7 @@ class Runtime:
                 name,
                 on_terminate=client.close,
                 local_copy_tracker=local_copy_tracker,
+                topic_bindings=topic_bindings,
             )
         elif address is not None:
             # Remote IPC via pooled RustClient.
@@ -498,6 +542,7 @@ class Runtime:
                 name,
                 on_terminate=client.close,
                 local_copy_tracker=local_copy_tracker,
+                topic_bindings=topic_bindings,
             )
         else:
             try:
@@ -530,6 +575,7 @@ class Runtime:
                     name,
                     on_terminate=lambda: client.close(),
                     local_copy_tracker=local_copy_tracker,
+                    topic_bindings=topic_bindings,
                 )
             elif mode == 'http':
                 proxy = CRMProxy.http(
@@ -537,6 +583,7 @@ class Runtime:
                     name,
                     on_terminate=lambda: client.close(),
                     local_copy_tracker=local_copy_tracker,
+                    topic_bindings=topic_bindings,
                 )
             else:
                 raise RuntimeError(f"Unsupported relay target mode: {mode!r}")
@@ -871,7 +918,9 @@ def register(
     name: str,
     concurrency: ConcurrencyConfig | None = None,
     input_lifetime: Mapping[str, _InputLifetime] | None = None,
-) -> str:
+    topic_capacity: Mapping[str, int] | None = None,
+    initial_topics: Mapping[str, object] | None = None,
+) -> Registration:
     """Register a CRM in the current process.
 
     See :meth:`Runtime.register`.
@@ -882,6 +931,8 @@ def register(
         name=name,
         concurrency=concurrency,
         input_lifetime=input_lifetime,
+        topic_capacity=topic_capacity,
+        initial_topics=initial_topics,
     )
 
 
