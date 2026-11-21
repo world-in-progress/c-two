@@ -677,7 +677,7 @@ impl ServiceDefinition {
         capacity: usize,
     ) -> Result<Self, Error> {
         let config = TopicConfig { capacity };
-        config.validate()?;
+        config.validate().map_err(Error::Semantic)?;
         let slot = self.topics.get_mut(topic_name).ok_or_else(|| {
             Error::Semantic(C2Error::new(
                 ErrorCode::ProtocolViolation,
@@ -1250,19 +1250,18 @@ impl Host {
         self.inner.runtime.ensure_active()?;
         let route_name = definition.expected.route_name.clone();
         let route_spec = route_spec(&definition)?;
-        let route_topics = RouteTopics::new(
-            definition.expected.clone(),
-            &definition.topics,
-            self.inner.domain_budget.clone(),
-        );
+        let route_topics = self
+            .inner
+            .server
+            .create_route_topics(definition.expected.clone(), &definition.topics);
         // Commit any staged initial topic frames atomically BEFORE opening the
         // route so early subscribers can read initial state immediately and
         // capacity failures leave the route unopened with zero residual charge.
         for (topic_name, payload) in definition.initial_topics {
-            let publisher = route_topics.publisher(&topic_name)?;
+            let publisher = route_topics.publisher(&topic_name).map_err(Error::Semantic)?;
             if let Err(error) = publisher.publish(payload) {
                 route_topics.close(TopicCloseCause::RouteUnregistered);
-                return Err(error);
+                return Err(Error::Semantic(error));
             }
         }
         let route = match &definition.stream_service {
@@ -1293,7 +1292,7 @@ impl Host {
             ),
         };
         let route = match route {
-            Ok(route) => route,
+            Ok(route) => route.with_topics(Arc::clone(&route_topics)),
             Err(error) => {
                 route_topics.close(TopicCloseCause::RouteUnregistered);
                 return Err(LifecycleError::from(error).into());
@@ -1371,7 +1370,10 @@ impl Host {
                 ),
             )));
         }
-        route_topics.subscribe_local(topic_name, options)
+        route_topics
+            .subscribe_local(topic_name, options)
+            .map(LocalTopicSubscription::from_server)
+            .map_err(Error::Semantic)
     }
 
     pub fn shutdown(&self) -> ShutdownOutcome {
@@ -1464,7 +1466,10 @@ impl Registration {
 
     /// Obtain a registration-scoped publisher handle for a declared topic.
     pub fn publisher(&self, topic_name: &str) -> Result<TopicPublisher, Error> {
-        self.route_topics.publisher(topic_name)
+        self.route_topics
+            .publisher(topic_name)
+            .map(TopicPublisher::from_server)
+            .map_err(Error::Semantic)
     }
 
     /// Attach a same-process subscription directly to this registration's topic.
@@ -1473,7 +1478,10 @@ impl Registration {
         topic_name: &str,
         options: SubscribeOptions,
     ) -> Result<LocalTopicSubscription, Error> {
-        self.route_topics.subscribe_local(topic_name, options)
+        self.route_topics
+            .subscribe_local(topic_name, options)
+            .map(LocalTopicSubscription::from_server)
+            .map_err(Error::Semantic)
     }
 
     /// Number of live topic subscribers currently attached to this registration.

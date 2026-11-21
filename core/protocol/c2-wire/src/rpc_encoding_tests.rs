@@ -1,21 +1,24 @@
-//! Handwritten IPC 16 whole-frame fixtures for the public RPC encoders.
+//! Handwritten IPC 17 whole-frame fixtures for the public RPC encoders.
 //! Keep the expected headers and bodies independent of the production codec.
 
 use crate::buddy::BuddyPayload;
 use crate::frame::decode_frame;
 use crate::rpc::{
     CallMode, CallStatus, CancelCause, MAX_INLINE_CALL_END_ERROR_BYTES, RouteCallIdentity,
-    RpcRecordKind, ValuePart, ValueStorage, bounded_call_end_error_bytes, decode_rpc_record,
-    encode_call_end_error_frame, encode_call_end_frame, encode_cancel_frame, encode_credit_frame,
-    encode_item_begin_frame, encode_item_data_frame, encode_open_frame,
+    RpcRecordKind, ValuePart, ValueStorage, WireLagPolicy, WireSubscribeOptions, WireTopicStart,
+    bounded_call_end_error_bytes, decode_rpc_record, encode_call_end_error_frame,
+    encode_call_end_frame, encode_cancel_frame, encode_credit_frame, encode_item_begin_frame,
+    encode_item_data_frame, encode_open_frame, encode_open_subscribe_draft_frame,
+    encode_open_subscribe_frame, encode_ready_frame, encode_subscribe_item_begin_frame,
     encode_value_continuation_frame,
 };
 use c2_error::{C2Error, ErrorCode};
 
 const REQUEST_ID: u64 = 0x0807_0605_0403_0201;
 const RID_BYTES: [u8; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
-const OPEN_UNARY: &[u8] = b"\x01\x01r\x01n\x01G\x01v\x01a\x01s\x34\x12\x00";
-const OPEN_STREAM: &[u8] = b"\x01\x01r\x01n\x01G\x01v\x01a\x01s\x34\x12\x01";
+const OPEN_UNARY: &[u8] = b"\x01\x01r\x01n\x01G\x01v\x01a\x01s\x00\x34\x12";
+const OPEN_STREAM: &[u8] = b"\x01\x01r\x01n\x01G\x01v\x01a\x01s\x01\x34\x12";
+const OPEN_SUBSCRIBE: &[u8] = b"\x01\x01r\x01n\x01G\x01v\x01a\x01s\x02\x02t1\x03";
 const SHM_BYTES: [u8; 23] = [
     1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 2, 0, 0, 0, 1, 11, 12, 13, 14, 15, 16, 17, 18,
 ];
@@ -306,6 +309,42 @@ fn item_begin_and_item_data_match_whole_frames() {
     assert_eq!(
         encode_item_data_frame(REQUEST_ID, ValueStorage::Shm(shm())).unwrap(),
         frame([0x24, 0, 0, 0], [0x42, 0x10, 0, 0], &shm_body),
+    );
+}
+
+#[test]
+fn subscribe_open_ready_and_item_begin_match_whole_frames() {
+    let options = WireSubscribeOptions {
+        start: WireTopicStart::Next,
+        on_lag: WireLagPolicy::Error,
+    };
+    assert_eq!(options.to_byte(), 0x03);
+    assert_eq!(
+        encode_open_subscribe_frame(REQUEST_ID, &identity(), "t1", options).unwrap(),
+        frame([0x1e, 0, 0, 0], [0, 0x10, 0, 0], OPEN_SUBSCRIBE),
+    );
+    let mut expected_draft = frame([0x1e, 0, 0, 0], [0, 0x10, 0, 0], OPEN_SUBSCRIBE);
+    expected_draft[4..12].fill(0);
+    assert_eq!(
+        encode_open_subscribe_draft_frame(&identity(), "t1", options).unwrap(),
+        expected_draft,
+    );
+    assert_eq!(
+        encode_ready_frame(REQUEST_ID, 0x0807_0605_0403_0201).unwrap(),
+        frame(
+            [0x15, 0, 0, 0],
+            [2, 0x10, 0, 0],
+            b"\x08\x01\x02\x03\x04\x05\x06\x07\x08",
+        ),
+    );
+    assert_eq!(
+        encode_subscribe_item_begin_frame(REQUEST_ID, 0x0102_0304_0506_0708, 0x1112_1314_1516_1718)
+            .unwrap(),
+        frame(
+            [0x1d, 0, 0, 0],
+            [2, 0x10, 0, 0],
+            b"\x02\x08\x07\x06\x05\x04\x03\x02\x01\x18\x17\x16\x15\x14\x13\x12\x11",
+        ),
     );
 }
 

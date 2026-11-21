@@ -96,24 +96,30 @@ impl SealedShmBlock {
         })
     }
 
-    /// Allocate one SHM block from `pool`, copy `payload` into it outside the
-    /// pool write lock using [`crate::ShmMutPin`], and seal it for 1-to-N loans.
-    pub fn from_bytes(pool: Arc<RwLock<MemPool>>, payload: &[u8]) -> Result<Self, String> {
-        if payload.is_empty() {
+    /// Allocate one SHM block from `pool`, populate it outside the pool write
+    /// lock using [`crate::ShmMutPin`], and seal it for 1-to-N loans.
+    pub fn allocate_and_fill<F>(
+        pool: Arc<RwLock<MemPool>>,
+        len: usize,
+        write_into: F,
+    ) -> Result<Self, String>
+    where
+        F: FnOnce(&mut [u8]) -> Result<(), String>,
+    {
+        if len == 0 {
             return Err("cannot allocate a zero-byte SHM block".into());
         }
         let mut handle = {
             let mut guard = pool.write();
-            guard.try_alloc_shm(payload.len())?
+            guard.try_alloc_shm(len)?
         };
         let copy_result = (|| -> Result<(), String> {
             let mut pin = {
                 let guard = pool.read();
                 guard.pin_shm_mut(&mut handle)?
             };
-            // Copy outside any pool lock so concurrent alloc/release never stall.
-            pin.as_mut_slice().copy_from_slice(payload);
-            Ok(())
+            // Populate outside any pool lock so concurrent alloc/release never stall.
+            write_into(pin.as_mut_slice())
         })();
         if let Err(error) = copy_result {
             pool.write().release_handle(handle);
@@ -122,6 +128,15 @@ impl SealedShmBlock {
         Self::seal(pool.clone(), handle).map_err(|(handle, error)| {
             pool.write().release_handle(handle);
             error
+        })
+    }
+
+    /// Allocate one SHM block from `pool`, copy `payload` into it outside the
+    /// pool write lock using [`crate::ShmMutPin`], and seal it for 1-to-N loans.
+    pub fn from_bytes(pool: Arc<RwLock<MemPool>>, payload: &[u8]) -> Result<Self, String> {
+        Self::allocate_and_fill(pool, payload.len(), |dst| {
+            dst.copy_from_slice(payload);
+            Ok(())
         })
     }
 

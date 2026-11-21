@@ -266,10 +266,25 @@ impl ClientTarget {
                 let fact = match semantic.code {
                     ResourceNotFound | ResourceRemoved | ResourceClosed | ContractMismatch
                     | RouteConflict => NEEDS_ACQUIRE,
+                    ProtocolViolation
+                        if semantic.details.get("reason").map(String::as_str)
+                            == Some("unknown_topic") =>
+                    {
+                        0
+                    }
                     IdentityMismatch | ProtocolViolation => TERMINAL_REFUSAL,
                     _ => 0,
                 };
                 self.facts.fetch_or(fact, Ordering::Release);
+            }
+            Error::Semantic(semantic)
+                if semantic.code == c2_error::ErrorCode::CallCancelled
+                    && matches!(
+                        semantic.details.get("cause").map(String::as_str),
+                        Some("route_unregistered" | "host_shutdown")
+                    ) =>
+            {
+                self.facts.fetch_or(NEEDS_ACQUIRE, Ordering::Release);
             }
             Error::ProtocolVersionMismatch { .. } => {
                 self.facts.fetch_or(TERMINAL_REFUSAL, Ordering::Release);
@@ -450,6 +465,112 @@ impl Client {
         budget: CallBudget,
     ) -> Result<PreparedCall, Error> {
         self.prepare_with_budget(method, budget, self.inner.current.read().clone(), true)
+    }
+
+    /// Subscribe to a topic declared on this client's bound route contract.
+    ///
+    /// Waits for server `READY(start_seq)` before returning so empty topics
+    /// confirm attachment immediately. Occupies one client-domain subscription
+    /// slot under the internal `N-1` guard until the real terminal outcome.
+    pub fn subscribe(
+        &self,
+        topic: &str,
+        options: crate::SubscribeOptions,
+    ) -> Result<crate::CoreTopicSubscription, Error> {
+        self.subscribe_with_options(topic, options, self.options)
+    }
+
+    /// Subscribe with explicit per-call deadline options.
+    pub fn subscribe_with_options(
+        &self,
+        topic: &str,
+        options: crate::SubscribeOptions,
+        call_options: CallOptions,
+    ) -> Result<crate::CoreTopicSubscription, Error> {
+        let runtime = crate::call_execution::shared_executor()?;
+        runtime.block_on(self.subscribe_async(topic, options, call_options))
+    }
+
+    /// Async counterpart of [`Self::subscribe_with_options`].
+    pub async fn subscribe_async(
+        &self,
+        topic: &str,
+        options: crate::SubscribeOptions,
+        call_options: CallOptions,
+    ) -> Result<crate::CoreTopicSubscription, Error> {
+        c2_contract::validate_contract_text_field("topic_name", topic).map_err(|error| {
+            Error::Semantic(c2_error::C2Error::new(
+                c2_error::ErrorCode::ProtocolViolation,
+                error.to_string(),
+            ))
+        })?;
+        let budget = CallBudget::new(call_options, None)?;
+        let context = self.inner.runtime.call_execution_context()?;
+        let permit = context.reserve_subscription_scope(&budget.scope)?;
+        let payload_budget = context.payload_budget();
+        let initial_target = self.inner.current.read().clone();
+        let target = self
+            .inner
+            .target_for_call(initial_target, &budget.scope, budget.deadline)
+            .await?;
+
+        let cancellation = c2_ipc::IpcSubscribeCancellation::new();
+        let result = match &target.transport {
+            ClientInner::Ipc(connection) => {
+                let scope = budget.scope.clone();
+                let preparation = scope.clone();
+                let control =
+                    IpcCallControl::new(move || scope.try_begin_dispatch().map_err(guard_error))
+                        .with_before_prepare(move || {
+                            preparation.check_pre_dispatch().map_err(guard_error)
+                        });
+                let open_fut = connection.client.subscribe_bound_controlled_async_phased(
+                    &connection.binding,
+                    topic,
+                    options.into(),
+                    payload_budget,
+                    Box::new(permit),
+                    cancellation.clone(),
+                    &control,
+                );
+                let opened = match budget.scope.deadline() {
+                    Some(deadline) => match tokio::time::timeout_at(
+                        tokio::time::Instant::from_std(deadline),
+                        open_fut,
+                    )
+                    .await
+                    {
+                        Ok(result) => result.map_err(normalize_ipc_call_error),
+                        Err(_) => {
+                            cancellation.cancel();
+                            let phase = match budget.scope.observe_deadline() {
+                                CallState::ExpiredPreDispatch => TransportPhase::PreDispatch,
+                                _ => TransportPhase::DispatchUncertain,
+                            };
+                            Err(scope_error(CallScopeError::DeadlineExceeded { phase }))
+                        }
+                    },
+                    None => open_fut.await.map_err(normalize_ipc_call_error),
+                };
+                opened.map(|sub| {
+                    crate::CoreTopicSubscription::from_ipc(
+                        sub,
+                        Arc::clone(&target),
+                        budget.scope.clone(),
+                        cancellation,
+                    )
+                })
+            }
+            ClientInner::Http(_) => Err(Error::Semantic(c2_error::C2Error::new(
+                c2_error::ErrorCode::ResourceUnavailable,
+                "relay HTTP topic subscriptions are not yet implemented",
+            ))),
+        };
+        if let Err(error) = &result {
+            target.observe_error(error);
+            let _ = budget.scope.complete_failure();
+        }
+        result
     }
 
     fn prepare_with_budget(

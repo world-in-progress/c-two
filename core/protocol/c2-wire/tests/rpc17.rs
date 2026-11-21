@@ -4,9 +4,10 @@ use c2_wire::flags::{FLAG_CHUNKED, FLAG_FIRST_CHUNK, FLAG_RPC_RECORD};
 use c2_wire::frame::{DecodeError, decode_frame};
 use c2_wire::rpc::{
     CallMode, CallStatus, CancelCause, ChunkPosition, RouteCallIdentity, RpcRecord, ValuePart,
-    ValueStorage, decode_rpc_record, decode_rpc_record_with_carrier, encode_call_end_frame,
-    encode_cancel_frame, encode_credit_frame, encode_item_begin_frame, encode_item_data_frame,
-    encode_open_frame,
+    ValueStorage, WireLagPolicy, WireSubscribeOptions, WireTopicStart, decode_rpc_record,
+    decode_rpc_record_with_carrier, encode_call_end_frame, encode_cancel_frame,
+    encode_credit_frame, encode_item_begin_frame, encode_item_data_frame, encode_open_frame,
+    encode_open_subscribe_frame, encode_ready_frame, encode_subscribe_item_begin_frame,
 };
 
 fn identity() -> RouteCallIdentity<&'static str> {
@@ -352,7 +353,10 @@ fn future_record_kinds_have_exact_shapes_and_reject_retired_flag_bit() {
     assert_eq!(payload, [2, 12, 0, 0, 0, 0, 0, 0, 0]);
     assert!(matches!(
         decode_rpc_record(&header, payload, None).unwrap(),
-        RpcRecord::ItemBegin { total_bytes: 12 }
+        RpcRecord::ItemBegin {
+            total_bytes: 12,
+            seq: None
+        }
     ));
 
     let data = encode_item_data_frame(5, ValueStorage::Inline(b"ab")).unwrap();
@@ -418,7 +422,7 @@ fn open_roundtrips_call_mode_in_whole_and_first_chunk() {
             let (_, _, _, metadata_len) = c2_wire::rpc::decode_open_metadata(payload).unwrap();
             assert_eq!(
                 &payload[metadata_len - 3..metadata_len],
-                &[3, 0, mode as u8]
+                &[mode as u8, 3, 0]
             );
             assert!(matches!(decode_rpc_record(&header, payload, None).unwrap(),
                 RpcRecord::Open { method_idx: 3, mode: actual, value: actual_value, .. }
@@ -429,7 +433,7 @@ fn open_roundtrips_call_mode_in_whole_and_first_chunk() {
 
 #[test]
 fn unknown_open_mode_and_cancel_cause_use_invalid_value() {
-    for value in [2, 255] {
+    for value in [3u8, 255] {
         let mut wire = encode_open_frame(
             1,
             &identity(),
@@ -438,7 +442,8 @@ fn unknown_open_mode_and_cancel_cause_use_invalid_value() {
             ValuePart::whole(ValueStorage::Inline(b"")),
         )
         .unwrap();
-        *wire.last_mut().unwrap() = value;
+        let mode_offset = wire.len() - 3;
+        wire[mode_offset] = value;
         let (header, payload) = decode_frame(&wire).unwrap();
         assert_eq!(
             decode_rpc_record(&header, payload, None).unwrap_err(),
@@ -476,17 +481,141 @@ fn unknown_open_mode_preserves_whole_and_first_chunk_shm_carrier() {
     ] {
         let mut wire = encode_open_frame(1, &identity(), 0, CallMode::Unary, part).unwrap();
         let (_, _, _, metadata_len) = c2_wire::rpc::decode_open_metadata(&wire[16..]).unwrap();
-        let mode_offset = 16 + metadata_len - 1;
-        wire[mode_offset] = 2;
+        let mode_offset = 16 + metadata_len - 3;
+        wire[mode_offset] = 3;
         let (header, payload) = decode_frame(&wire).unwrap();
         let failure = decode_rpc_record_with_carrier(&header, payload, None).unwrap_err();
         assert_eq!(
             failure.error,
             DecodeError::InvalidValue {
                 field: "call mode",
-                value: 2
+                value: 3
             }
         );
         assert_eq!(failure.carrier, Some(descriptor));
     }
+}
+
+#[test]
+fn subscribe_open_ready_item_begin_and_call_end_roundtrip_and_reject_invalid() {
+    let options = WireSubscribeOptions {
+        start: WireTopicStart::Next,
+        on_lag: WireLagPolicy::Error,
+    };
+    let open = encode_open_subscribe_frame(7, &identity(), "state", options).unwrap();
+    let (header, payload) = decode_frame(&open).unwrap();
+    assert_eq!(
+        decode_rpc_record(&header, payload, None).unwrap(),
+        RpcRecord::OpenSubscribe {
+            identity: RouteCallIdentity {
+                route_name: "grid".into(),
+                crm_ns: "ns".into(),
+                crm_name: "Grid".into(),
+                crm_ver: "1".into(),
+                abi_hash: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+                signature_hash: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                    .into(),
+            },
+            topic_name: "state".into(),
+            options,
+        }
+    );
+
+    // Reserved option bits and trailing bytes are rejected.
+    let mut bad_opts = open.clone();
+    *bad_opts.last_mut().unwrap() = 0x04;
+    let (h, p) = decode_frame(&bad_opts).unwrap();
+    assert_eq!(
+        decode_rpc_record(&h, p, None).unwrap_err(),
+        DecodeError::InvalidValue {
+            field: "subscribe options",
+            value: 4,
+        }
+    );
+    assert!(
+        encode_open_frame(
+            7,
+            &identity(),
+            0,
+            CallMode::Subscribe,
+            ValuePart::whole(ValueStorage::Inline(b""))
+        )
+        .is_err()
+    );
+
+    // READY round-trips and rejects start_seq = 0.
+    let ready = encode_ready_frame(7, 42).unwrap();
+    let (h, p) = decode_frame(&ready).unwrap();
+    assert_eq!(
+        decode_rpc_record(&h, p, Some(CallMode::Subscribe)).unwrap(),
+        RpcRecord::Ready { start_seq: 42 }
+    );
+    assert!(encode_ready_frame(7, 0).is_err());
+
+    // Subscribe ITEM_BEGIN carries (seq, total_bytes) and rejects seq = 0 or wrong mode.
+    let begin = encode_subscribe_item_begin_frame(7, 42, 1024).unwrap();
+    let (h, p) = decode_frame(&begin).unwrap();
+    assert_eq!(
+        decode_rpc_record(&h, p, Some(CallMode::Subscribe)).unwrap(),
+        RpcRecord::ItemBegin {
+            total_bytes: 1024,
+            seq: Some(42),
+        }
+    );
+    assert!(decode_rpc_record(&h, p, Some(CallMode::ServerStream)).is_err());
+    assert!(decode_rpc_record(&h, p, Some(CallMode::Unary)).is_err());
+    assert!(encode_subscribe_item_begin_frame(7, 0, 1024).is_err());
+
+    // Subscribe CALL_END rejects Success and accepts Failed (with complete_items) and NotExecuted.
+    assert!(
+        encode_call_end_frame(
+            7,
+            CallMode::Subscribe,
+            CallStatus::Success,
+            0,
+            ValuePart::whole(ValueStorage::Inline(b""))
+        )
+        .is_err()
+    );
+    let lagged = C2Error::new(ErrorCode::SubscriptionLagged, "lagged").to_wire_bytes();
+    let end = encode_call_end_frame(
+        7,
+        CallMode::Subscribe,
+        CallStatus::Failed,
+        9,
+        ValuePart::whole(ValueStorage::Inline(&lagged)),
+    )
+    .unwrap();
+    let (h, p) = decode_frame(&end).unwrap();
+    assert!(matches!(
+        decode_rpc_record(&h, p, Some(CallMode::Subscribe)).unwrap(),
+        RpcRecord::CallEnd {
+            status: CallStatus::Failed,
+            complete_items: Some(9),
+            error: Some(err),
+            ..
+        } if err.code == ErrorCode::SubscriptionLagged
+    ));
+}
+
+#[test]
+fn connection_core_subscribe_open_begins_items_without_resource_step() {
+    use c2_wire::connection::{ConnectionCore, ConnectionSide};
+
+    let server = ConnectionCore::new(ConnectionSide::Server, || {});
+    server.finish_handshake().unwrap();
+    server.subscribe_open(5).unwrap();
+    assert!(server.stream_start_step(5).is_err());
+    // Consumes initial demand = 1 without calling stream_start_step.
+    server.stream_begin_item(5, 16).unwrap();
+    assert_eq!(server.stream_state(5).unwrap().demand, 0);
+    server.stream_credit(5, 16, 0).unwrap();
+    assert_eq!(server.stream_data(5, 16).unwrap(), 0);
+    server.stream_finish_item(5).unwrap();
+    assert_eq!(server.stream_state(5).unwrap().complete_items, 1);
+    // Next item requires demand credit first.
+    assert!(server.stream_begin_item(5, 0).is_err());
+    server.stream_credit(5, 0, 1).unwrap();
+    server.stream_begin_item(5, 0).unwrap();
+    assert_eq!(server.stream_state(5).unwrap().complete_items, 2);
 }

@@ -86,8 +86,9 @@ pub use session::{
     RuntimeShutdownTarget,
 };
 pub use topic::{
-    LagPolicy, LocalTopicSubscription, MAX_TOPIC_RING_CAPACITY, SubscribeOptions, TopicCloseCause,
-    TopicCloseReceipt, TopicConfig, TopicDelivery, TopicFrame, TopicPublisher, TopicStart,
+    CoreTopicDelivery, CoreTopicSubscription, LagPolicy, LocalTopicSubscription,
+    MAX_TOPIC_RING_CAPACITY, SubscribeOptions, TopicCloseCause, TopicCloseReceipt, TopicConfig,
+    TopicDelivery, TopicFrame, TopicPublisher, TopicStart,
 };
 
 pub use c2_config::{

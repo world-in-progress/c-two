@@ -109,7 +109,8 @@ enum WriterState {
     Broken,
 }
 
-/// Snapshot of one server stream's demand, admitted item and granted storage.
+/// Snapshot of one server stream or topic subscription's demand, admitted item
+/// and granted storage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StreamState {
     pub demand: u64,
@@ -119,6 +120,7 @@ pub struct StreamState {
     pub complete_items: u64,
     pub cancelled: bool,
     pub producing: bool,
+    pub subscription: bool,
 }
 
 #[derive(Default)]
@@ -182,8 +184,20 @@ impl ConnectionCore {
         Ok(())
     }
 
-    /// Register a call admitted after handshake. The first item has demand.
+    /// Register a server-stream call admitted after handshake. The first item
+    /// has initial demand.
     pub fn stream_open(&self, id: u64) -> Result<(), ConnectionError> {
+        self.open_stream_entry(id, false)
+    }
+
+    /// Register a topic subscription admitted after handshake. Subscriptions
+    /// have initial demand `1` and begin items directly from demand without a
+    /// server-side resource step.
+    pub fn subscribe_open(&self, id: u64) -> Result<(), ConnectionError> {
+        self.open_stream_entry(id, true)
+    }
+
+    fn open_stream_entry(&self, id: u64, subscription: bool) -> Result<(), ConnectionError> {
         let mut state = self.shared.state.lock();
         check_business(&state)?;
         if id == 0 || state.streams.contains_key(&id) {
@@ -203,6 +217,7 @@ impl ConnectionCore {
                 complete_items: 0,
                 cancelled: false,
                 producing: false,
+                subscription,
             },
         );
         Ok(())
@@ -215,6 +230,9 @@ impl ConnectionCore {
         }
         let mut state = self.shared.state.lock();
         let stream = stream_mut(&mut state, id)?;
+        if stream.subscription {
+            return Err(stream_violation("subscriptions have no resource step"));
+        }
         if stream.cancelled
             || stream.producing
             || stream.total_bytes.is_some()
@@ -234,15 +252,26 @@ impl ConnectionCore {
         if stream.total_bytes.is_some() {
             return Err(stream_violation("item already active"));
         }
-        match self.shared.side {
-            ConnectionSide::Server if !stream.producing => {
-                return Err(stream_violation("item without resource step"));
+        let consume_demand = match self.shared.side {
+            ConnectionSide::Server if stream.subscription => {
+                if stream.cancelled || stream.demand == 0 {
+                    return Err(stream_violation("subscription item without demand"));
+                }
+                true
             }
-            ConnectionSide::Client if stream.demand == 0 => {
-                return Err(stream_violation("item without demand"));
+            ConnectionSide::Server => {
+                if !stream.producing {
+                    return Err(stream_violation("item without resource step"));
+                }
+                false
             }
-            _ => {}
-        }
+            ConnectionSide::Client => {
+                if stream.demand == 0 {
+                    return Err(stream_violation("item without demand"));
+                }
+                true
+            }
+        };
         let next_count = if total_bytes == 0 {
             Some(
                 stream
@@ -253,7 +282,7 @@ impl ConnectionCore {
         } else {
             None
         };
-        if self.shared.side == ConnectionSide::Client {
+        if consume_demand {
             stream.demand = 0;
         } else {
             stream.producing = false;

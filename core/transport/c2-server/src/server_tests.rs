@@ -1094,6 +1094,7 @@ fn make_route(name: &str) -> CrmRoute {
         stream_callback: None,
         method_modes: vec![CallMode::Unary; 2],
         method_names: vec!["step".into(), "query".into()],
+        topics: None,
     }
 }
 
