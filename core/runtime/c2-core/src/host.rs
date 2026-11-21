@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -7,10 +7,10 @@ use parking_lot::Mutex;
 
 use c2_contract::{
     ContractError, ContractRelease, ContractReleaseRef, ExpectedRouteContract,
-    MAX_CONTRACT_METHODS, MethodAccess, MethodMode, PORTABLE_CONTRACT_SCHEMA,
+    MAX_CONTRACT_METHODS, MAX_CONTRACT_TOPICS, MethodAccess, MethodMode, PORTABLE_CONTRACT_SCHEMA,
     ValidatedContractDescriptor, validate_contract_text_field, validate_expected_route_contract,
 };
-use c2_error::C2Error;
+use c2_error::{C2Error, ErrorCode};
 use c2_server::{
     AccessLevel, ConcurrencyMode, CrmCallback, CrmError, CrmStream, CrmStreamCallback,
     CrmStreamItem, ResponseMeta, RouteBuildSpec, RouteConcurrencyHandle, SchedulerAcquireError,
@@ -18,6 +18,10 @@ use c2_server::{
     ServerRuntimeBuilder,
 };
 
+use crate::topic::{
+    LocalTopicSubscription, RouteTopics, SubscribeOptions, TopicCloseCause, TopicConfig,
+    TopicPublisher,
+};
 use crate::{
     CoreLocalResponseStream, Error, FailedStartShutdownReceipt, LifecycleError, LocalObjectStream,
     RegisterOutcome, Runtime, ShutdownOutcome, UnregisterOutcome,
@@ -338,6 +342,8 @@ pub struct ServiceDefinition {
     release_ref: ContractReleaseRef,
     expected: ExpectedRouteContract,
     methods: Arc<[MethodDefinition]>,
+    topics: BTreeMap<String, TopicConfig>,
+    initial_topics: BTreeMap<String, Vec<u8>>,
     service: Arc<dyn EncodedService>,
     stream_service: Option<Arc<dyn EncodedStreamService>>,
     stream_descriptor: Option<ValidatedContractDescriptor>,
@@ -477,10 +483,17 @@ impl ServiceDefinition {
             }
         }
 
+        let mut topics = BTreeMap::new();
+        for topic in release.descriptor().topics() {
+            topics.insert(topic.name().to_string(), TopicConfig::default());
+        }
+
         Ok(Self {
             release_ref,
             expected,
             methods: methods.into(),
+            topics,
+            initial_topics: BTreeMap::new(),
             service,
             stream_descriptor: stream_service
                 .as_ref()
@@ -558,6 +571,8 @@ impl ServiceDefinition {
             release_ref,
             expected,
             methods: methods.into(),
+            topics: BTreeMap::new(),
+            initial_topics: BTreeMap::new(),
             service,
             stream_service: None,
             stream_descriptor: None,
@@ -610,6 +625,97 @@ impl ServiceDefinition {
         self.max_pending = max_pending;
         self.max_workers = max_workers;
         Ok(self)
+    }
+
+    /// Declare nonportable language-local topic names on a nonportable service.
+    #[doc(hidden)]
+    pub fn with_nonportable_topics<I, S>(mut self, topic_names: I) -> Result<Self, Error>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        if self.release_ref.contract_schema() == PORTABLE_CONTRACT_SCHEMA {
+            return Err(method_contract_error(
+                "$.topics",
+                "portable service topics come from the admitted ContractRelease".into(),
+            ));
+        }
+        let method_names: HashSet<&str> = self.methods.iter().map(|m| m.name.as_str()).collect();
+        let mut topics = BTreeMap::new();
+        for (index, raw_name) in topic_names.into_iter().enumerate() {
+            let name = raw_name.into();
+            let path = format!("$.topics[{index}].name");
+            validate_contract_text_field("topic name", &name)
+                .map_err(|error| method_contract_error(&path, error.to_string()))?;
+            if method_names.contains(name.as_str()) {
+                return Err(method_contract_error(
+                    &path,
+                    format!("topic name {name:?} collides with a method name"),
+                ));
+            }
+            if topics.insert(name.clone(), TopicConfig::default()).is_some() {
+                return Err(method_contract_error(
+                    &path,
+                    format!("duplicate topic name {name:?}"),
+                ));
+            }
+            if topics.len() > MAX_CONTRACT_TOPICS {
+                return Err(method_contract_error(
+                    "$.topics",
+                    format!("topic count exceeds hard limit {MAX_CONTRACT_TOPICS}"),
+                ));
+            }
+        }
+        self.topics = topics;
+        Ok(self)
+    }
+
+    /// Configure the bounded history ring depth (`>= 1`) of a declared topic.
+    pub fn with_topic_capacity(
+        mut self,
+        topic_name: &str,
+        capacity: usize,
+    ) -> Result<Self, Error> {
+        let config = TopicConfig { capacity };
+        config.validate()?;
+        let slot = self.topics.get_mut(topic_name).ok_or_else(|| {
+            Error::Semantic(C2Error::new(
+                ErrorCode::ProtocolViolation,
+                format!("unknown topic {topic_name:?} on contract"),
+            ))
+        })?;
+        *slot = config;
+        Ok(self)
+    }
+
+    /// Stage an initial published payload for a declared topic. Committed
+    /// atomically before the route opens and rolled back if registration fails.
+    pub fn with_initial_topic_bytes(
+        mut self,
+        topic_name: &str,
+        payload: Vec<u8>,
+    ) -> Result<Self, Error> {
+        if !self.topics.contains_key(topic_name) {
+            return Err(Error::Semantic(C2Error::new(
+                ErrorCode::ProtocolViolation,
+                format!("unknown topic {topic_name:?} on contract"),
+            )));
+        }
+        if self
+            .initial_topics
+            .insert(topic_name.to_string(), payload)
+            .is_some()
+        {
+            return Err(Error::Semantic(C2Error::new(
+                ErrorCode::ProtocolViolation,
+                format!("duplicate initial payload for topic {topic_name:?}"),
+            )));
+        }
+        Ok(self)
+    }
+
+    pub fn topic_names(&self) -> Vec<&str> {
+        self.topics.keys().map(String::as_str).collect()
     }
 
     pub fn release_ref(&self) -> &ContractReleaseRef {
@@ -841,6 +947,7 @@ pub(crate) struct HostInner {
     relay_use_proxy: bool,
     shutdown_timeout: Duration,
     route_names: Mutex<HashSet<String>>,
+    route_topics: Mutex<HashMap<String, Arc<RouteTopics>>>,
     thread: Mutex<Option<std::thread::JoinHandle<()>>>,
     shutdown_outcome: Mutex<Option<ShutdownOutcome>>,
     shutdown_gate: Mutex<()>,
@@ -848,9 +955,39 @@ pub(crate) struct HostInner {
 }
 
 impl HostInner {
+    fn close_all_topics(&self, cause: TopicCloseCause) {
+        let topics = std::mem::take(&mut *self.route_topics.lock());
+        for (_, route_topics) in topics {
+            route_topics.close(cause);
+        }
+    }
+
+    fn close_route_topics(
+        &self,
+        route_name: &str,
+        expected: Option<&Arc<RouteTopics>>,
+        cause: TopicCloseCause,
+    ) -> Option<Arc<RouteTopics>> {
+        let removed = {
+            let mut guard = self.route_topics.lock();
+            match (guard.get(route_name), expected) {
+                (Some(current), Some(target)) if !Arc::ptr_eq(current, target) => None,
+                (Some(_), _) => guard.remove(route_name),
+                (None, _) => None,
+            }
+        };
+        if let Some(topics) = &removed {
+            topics.close(cause);
+        } else if let Some(target) = expected {
+            target.close(cause);
+        }
+        removed
+    }
+
     fn refresh_shutdown_outcome(&self) {
         if self.shutdown_outcome.lock().is_none() {
             if let Some(outcome) = self.runtime.shutdown_observation(&self.server) {
+                self.close_all_topics(TopicCloseCause::HostShutdown);
                 self.lifecycle.finish_from_outcome(&outcome);
                 *self.shutdown_outcome.lock() = Some(outcome);
                 self.route_names.lock().clear();
@@ -889,6 +1026,7 @@ impl HostInner {
             return outcome;
         }
         let route_names = self.route_names.lock().iter().cloned().collect();
+        self.close_all_topics(TopicCloseCause::HostShutdown);
         let outcome = self.runtime.shutdown(
             Some(&self.server),
             route_names,
@@ -950,7 +1088,11 @@ impl HostInner {
         }
     }
 
-    fn unregister(&self, route_name: &str) -> Result<UnregisterOutcome, Error> {
+    fn unregister(
+        &self,
+        route_name: &str,
+        expected_topics: Option<&Arc<RouteTopics>>,
+    ) -> Result<UnregisterOutcome, Error> {
         self.refresh_shutdown_outcome();
         if self.runtime.shutdown_pending(&self.server) {
             return Err(LifecycleError::Server(ServerFailure::new(
@@ -964,6 +1106,9 @@ impl HostInner {
                 .iter()
                 .find(|close| close.route_name == route_name)
         {
+            if let Some(topics) = expected_topics {
+                topics.close(TopicCloseCause::HostShutdown);
+            }
             return Ok(UnregisterOutcome {
                 route_name: route_name.to_string(),
                 local_removed: close.local_removed,
@@ -974,6 +1119,36 @@ impl HostInner {
                     .find(|error| error.route_name == route_name)
                     .cloned(),
             });
+        }
+        // If an explicit registration is closing after a newer registration
+        // replaced the same route name, only seal the old registration's own
+        // topics and never touch the active registration.
+        if let Some(target) = expected_topics {
+            let owned = self
+                .route_topics
+                .lock()
+                .get(route_name)
+                .is_some_and(|current| Arc::ptr_eq(current, target));
+            if !owned {
+                target.close(TopicCloseCause::RouteUnregistered);
+                return Ok(UnregisterOutcome {
+                    route_name: route_name.to_string(),
+                    local_removed: false,
+                    close: crate::RouteCloseOutcome {
+                        route_name: route_name.to_string(),
+                        local_removed: false,
+                        active_drained: true,
+                        closed_reason: "replaced".into(),
+                        close_error: None,
+                    },
+                    relay_error: None,
+                });
+            }
+        }
+        if let Some(topics) =
+            self.close_route_topics(route_name, expected_topics, TopicCloseCause::RouteUnregistered)
+        {
+            let _ = topics.wait_drained(self.shutdown_timeout);
         }
         let outcome = self.runtime.unregister_route(
             &self.server,
@@ -1005,6 +1180,10 @@ impl Host {
 
     pub(crate) fn belongs_to(&self, runtime: &Runtime) -> bool {
         self.inner.runtime.same_instance(runtime)
+    }
+
+    pub(crate) fn seal_all_topics_for_shutdown(&self) {
+        self.inner.close_all_topics(TopicCloseCause::HostShutdown);
     }
 
     pub(crate) fn retirement_server(&self) -> std::sync::Weak<Server> {
@@ -1071,6 +1250,21 @@ impl Host {
         self.inner.runtime.ensure_active()?;
         let route_name = definition.expected.route_name.clone();
         let route_spec = route_spec(&definition)?;
+        let route_topics = RouteTopics::new(
+            definition.expected.clone(),
+            &definition.topics,
+            self.inner.domain_budget.clone(),
+        );
+        // Commit any staged initial topic frames atomically BEFORE opening the
+        // route so early subscribers can read initial state immediately and
+        // capacity failures leave the route unopened with zero residual charge.
+        for (topic_name, payload) in definition.initial_topics {
+            let publisher = route_topics.publisher(&topic_name)?;
+            if let Err(error) = publisher.publish(payload) {
+                route_topics.close(TopicCloseCause::RouteUnregistered);
+                return Err(error);
+            }
+        }
         let route = match &definition.stream_service {
             Some(service) => {
                 let callback = Arc::new(CoreStreamCallback {
@@ -1097,8 +1291,14 @@ impl Host {
                     service: Arc::clone(&definition.service),
                 }),
             ),
-        }
-        .map_err(LifecycleError::from)?;
+        };
+        let route = match route {
+            Ok(route) => route,
+            Err(error) => {
+                route_topics.close(TopicCloseCause::RouteUnregistered);
+                return Err(LifecycleError::from(error).into());
+            }
+        };
         let route_concurrency = RouteConcurrency {
             inner: route.route_handle(),
             method_modes: definition
@@ -1107,20 +1307,71 @@ impl Host {
                 .unwrap_or_else(|| vec![MethodMode::Unary; definition.methods.len()].into()),
             server_budget: self.inner.domain_budget.clone(),
         };
-        let outcome = self.inner.runtime.register_route(
+        let outcome = match self.inner.runtime.register_route(
             &self.inner.server,
             route,
             self.inner.relay_anchor_address.as_deref(),
             self.inner.relay_use_proxy,
-        )?;
+        ) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                route_topics.close(TopicCloseCause::RouteUnregistered);
+                return Err(error.into());
+            }
+        };
         self.inner.route_names.lock().insert(route_name.clone());
+        let previous_topics = self
+            .inner
+            .route_topics
+            .lock()
+            .insert(route_name.clone(), Arc::clone(&route_topics));
+        if let Some(previous) = previous_topics {
+            previous.close(TopicCloseCause::RouteUnregistered);
+        }
         Ok(Registration {
             host: Arc::clone(&self.inner),
             route_name,
             register_outcome: outcome,
             close_outcome: None,
             route_concurrency,
+            route_topics,
         })
+    }
+
+    /// Attach a same-process subscription after validating the exact route
+    /// name and contract identity. Returns `701 ResourceNotFound` when the
+    /// route is absent, `709 ContractMismatch` when the route serves a
+    /// different contract, and `713 ProtocolViolation` when the topic is not
+    /// declared on the matched contract.
+    pub fn subscribe_local(
+        &self,
+        expected: &ExpectedRouteContract,
+        topic_name: &str,
+        options: SubscribeOptions,
+    ) -> Result<LocalTopicSubscription, Error> {
+        validate_expected_route_contract(expected)?;
+        let route_topics = self
+            .inner
+            .route_topics
+            .lock()
+            .get(&expected.route_name)
+            .cloned()
+            .ok_or_else(|| {
+                Error::Semantic(C2Error::new(
+                    ErrorCode::ResourceNotFound,
+                    format!("route not found: {}", expected.route_name),
+                ))
+            })?;
+        if route_topics.expected() != expected {
+            return Err(Error::Semantic(C2Error::new(
+                ErrorCode::ContractMismatch,
+                format!(
+                    "route {:?} contract identity mismatch",
+                    expected.route_name
+                ),
+            )));
+        }
+        route_topics.subscribe_local(topic_name, options)
     }
 
     pub fn shutdown(&self) -> ShutdownOutcome {
@@ -1180,6 +1431,7 @@ pub struct Registration {
     register_outcome: RegisterOutcome,
     close_outcome: Option<UnregisterOutcome>,
     route_concurrency: RouteConcurrency,
+    route_topics: Arc<RouteTopics>,
 }
 
 impl fmt::Debug for Registration {
@@ -1203,18 +1455,39 @@ impl Registration {
     }
 
     pub fn is_closed(&self) -> bool {
-        self.close_outcome.is_some()
+        self.close_outcome.is_some() || self.route_topics.is_closed()
     }
 
     pub fn route_concurrency(&self) -> RouteConcurrency {
         self.route_concurrency.clone()
     }
 
+    /// Obtain a registration-scoped publisher handle for a declared topic.
+    pub fn publisher(&self, topic_name: &str) -> Result<TopicPublisher, Error> {
+        self.route_topics.publisher(topic_name)
+    }
+
+    /// Attach a same-process subscription directly to this registration's topic.
+    pub fn subscribe_local(
+        &self,
+        topic_name: &str,
+        options: SubscribeOptions,
+    ) -> Result<LocalTopicSubscription, Error> {
+        self.route_topics.subscribe_local(topic_name, options)
+    }
+
+    /// Number of live topic subscribers currently attached to this registration.
+    pub fn active_subscribers(&self) -> usize {
+        self.route_topics.active_subscribers()
+    }
+
     pub fn close(&mut self) -> Result<UnregisterOutcome, Error> {
         if let Some(outcome) = &self.close_outcome {
             return Ok(outcome.clone());
         }
-        let outcome = self.host.unregister(&self.route_name)?;
+        let outcome = self
+            .host
+            .unregister(&self.route_name, Some(&self.route_topics))?;
         self.close_outcome = Some(outcome.clone());
         Ok(outcome)
     }
@@ -1320,6 +1593,7 @@ impl Runtime {
             relay_use_proxy,
             shutdown_timeout,
             route_names: Mutex::new(HashSet::new()),
+            route_topics: Mutex::new(HashMap::new()),
             thread: Mutex::new(None),
             shutdown_outcome: Mutex::new(None),
             shutdown_gate: Mutex::new(()),

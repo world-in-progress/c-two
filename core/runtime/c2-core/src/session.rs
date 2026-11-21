@@ -665,6 +665,9 @@ impl Runtime {
                 progress.retirement = Some(execution);
                 state.client_domain.close_operations();
                 state.server_role.close_operations();
+                if let Some(host) = &progress.retirement.as_ref().and_then(|exec| exec._host.clone()) {
+                    host.seal_all_topics_for_shutdown();
+                }
                 state.retirement = Some(transaction.clone());
                 return Ok(RuntimeShutdownReceipt {
                     transaction: transaction.clone(),
@@ -699,6 +702,15 @@ impl Runtime {
         // Permanent retirement closes both role domains' call admission.
         state.client_domain.close_operations();
         state.server_role.close_operations();
+        if let Some(host) = &transaction
+            .outcome
+            .lock()
+            .retirement
+            .as_ref()
+            .and_then(|exec| exec._host.clone())
+        {
+            host.seal_all_topics_for_shutdown();
+        }
         state.retirement = Some(transaction.clone());
         Ok(RuntimeShutdownReceipt { transaction })
     }

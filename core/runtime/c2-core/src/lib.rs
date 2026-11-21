@@ -21,6 +21,7 @@ pub mod memory;
 mod outcome;
 mod roles;
 mod session;
+mod topic;
 
 pub use c2_config::{ConnectOptions, ConnectTimeoutError};
 pub use c2_ipc::DirectIpcShutdownOutcome;
@@ -83,6 +84,10 @@ pub use roles::{ClientConfigPatch, RetiredRoleObserver};
 pub use session::{
     FailedStartShutdownReceipt, Runtime, RuntimeIdentity, RuntimeOptions, RuntimeShutdownReceipt,
     RuntimeShutdownTarget,
+};
+pub use topic::{
+    LagPolicy, LocalTopicSubscription, MAX_TOPIC_RING_CAPACITY, SubscribeOptions, TopicCloseCause,
+    TopicCloseReceipt, TopicConfig, TopicDelivery, TopicFrame, TopicPublisher, TopicStart,
 };
 
 pub use c2_config::{
