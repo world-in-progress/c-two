@@ -10,6 +10,7 @@ mod http_client;
 mod pool;
 mod relay_aware;
 mod stream;
+mod topic;
 
 pub use call_control::HttpCallControl;
 #[cfg(feature = "relay")]
@@ -18,6 +19,8 @@ pub use control::{
     LOCAL_ENDPOINT_NAMESPACE_HEADER, RelayControlClient, RelayRegistration, RelayRegistrationScope,
     RelayResolvedRoutes, RelayRouteInfo,
 };
+#[cfg(feature = "relay")]
+pub(crate) use http_client::{add_expected_contract_headers, encode_segment};
 pub use http_client::{HttpClient, HttpError, HttpInputOwner};
 pub use pool::HttpClientPool;
 pub use relay_aware::{
@@ -25,6 +28,7 @@ pub use relay_aware::{
     RelayLocalIpcCandidate, RelayResolvedTarget,
 };
 pub use stream::{HttpResponseStream, HttpStreamCancellation};
+pub use topic::{HttpTopicDelivery, HttpTopicSubscription};
 
 #[cfg(all(test, feature = "relay"))]
 mod controlled_tests;

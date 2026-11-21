@@ -665,6 +665,9 @@ impl Runtime {
                 progress.retirement = Some(execution);
                 state.client_domain.close_operations();
                 state.server_role.close_operations();
+                if let Some(host) = &progress.retirement.as_ref().and_then(|exec| exec._host.clone()) {
+                    host.seal_all_topics_for_shutdown();
+                }
                 state.retirement = Some(transaction.clone());
                 return Ok(RuntimeShutdownReceipt {
                     transaction: transaction.clone(),
@@ -699,6 +702,15 @@ impl Runtime {
         // Permanent retirement closes both role domains' call admission.
         state.client_domain.close_operations();
         state.server_role.close_operations();
+        if let Some(host) = &transaction
+            .outcome
+            .lock()
+            .retirement
+            .as_ref()
+            .and_then(|exec| exec._host.clone())
+        {
+            host.seal_all_topics_for_shutdown();
+        }
         state.retirement = Some(transaction.clone());
         Ok(RuntimeShutdownReceipt { transaction })
     }
@@ -1912,6 +1924,7 @@ impl Runtime {
         &self,
         server: &Arc<c2_server::Server>,
         name: &str,
+        expected_topics: Option<&Arc<c2_server::topic::RouteTopics>>,
         relay_anchor_address: Option<&str>,
         relay_use_proxy: bool,
     ) -> Result<UnregisterOutcome, LifecycleError> {
@@ -1921,7 +1934,16 @@ impl Runtime {
         let mut scopes = self.capture_registration_scopes(server);
         scopes.retain(|name, _| name == &route_name);
         let rt = Self::server_runtime()?;
-        let local_removed = rt.block_on(server.unregister_route(&route_name));
+        let local_removed = rt.block_on(async {
+            match expected_topics {
+                Some(topics) => {
+                    server
+                        .unregister_route_with_topics(&route_name, topics)
+                        .await
+                }
+                None => server.unregister_route(&route_name).await,
+            }
+        });
         if !local_removed {
             return Err(LifecycleError::MissingRoute(route_name));
         }
@@ -3705,7 +3727,7 @@ mod tests {
         .expect("session");
         let server = test_server("missing-server");
         let err = session
-            .unregister_route(&server, "absent", None, false)
+            .unregister_route(&server, "absent", None, None, false)
             .expect_err("missing route should error");
         assert_eq!(err, LifecycleError::MissingRoute("absent".to_string()));
     }
@@ -3762,7 +3784,7 @@ mod tests {
         register_dummy(&server, &route_name);
 
         let outcome = session
-            .unregister_route(&server, &route_name, None, false)
+            .unregister_route(&server, &route_name, None, None, false)
             .expect("local unregister should succeed");
 
         assert!(outcome.local_removed);
@@ -3787,7 +3809,13 @@ mod tests {
             .expect("Core registration captures the concrete relay cleanup scope");
 
         let outcome = session
-            .unregister_route(&server, &route_name, Some("http://127.0.0.1:9"), false)
+            .unregister_route(
+                &server,
+                &route_name,
+                None,
+                Some("http://127.0.0.1:9"),
+                false,
+            )
             .expect("local unregister should succeed despite relay failure");
         assert_eq!(outcome.route_name, route_name);
         assert!(outcome.local_removed);
@@ -3797,7 +3825,7 @@ mod tests {
         assert!(!relay_error.message.is_empty());
 
         let err = session
-            .unregister_route(&server, &outcome.route_name, None, false)
+            .unregister_route(&server, &outcome.route_name, None, None, false)
             .expect_err("route should have already been removed locally");
         assert!(matches!(err, LifecycleError::MissingRoute(_)));
     }
@@ -4021,7 +4049,7 @@ mod tests {
         let replacement = if matches!(interference, FinalInterference::Replace) {
             // Both removal and replacement go through Core's real transactions,
             // including the saved registration scope; no raw server insertion.
-            let removal = session.unregister_route(&server, &route_name, None, false);
+            let removal = session.unregister_route(&server, &route_name, None, None, false);
             let registration =
                 session.register_route(&server, dummy_route(&server, &route_name), None, false);
             Some((removal, registration))
@@ -4032,7 +4060,7 @@ mod tests {
             let name = unique_route_name("unrelated");
             let registration =
                 session.register_route(&server, dummy_route(&server, &name), None, false);
-            let removal = session.unregister_route(&server, &name, None, false);
+            let removal = session.unregister_route(&server, &name, None, None, false);
             Some((registration, removal))
         } else {
             None

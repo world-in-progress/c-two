@@ -32,7 +32,7 @@ function fixture() {
     close() { events.push('domain.close'); },
   };
   const symbols = {
-    c2_mem_ffi_abi_version() { events.push('version'); return 8; },
+    c2_mem_ffi_abi_version() { events.push('version'); return 9; },
     captureEndpointContext(ipcRoot) { events.push(['capture', ipcRoot]); root = ipcRoot ?? '/default'; return nativeContext; },
     createClientDomain(context, options) { events.push(['domain', context, options]); return domain; },
   };
@@ -71,7 +71,7 @@ test('domain limits reject invalid JS values and are unavailable on endpoints', 
   connector.close();
 });
 
-test('ABI 8 connector retains one native domain across endpoint reconnects', async () => {
+test('ABI 9 connector retains one native domain across endpoint reconnects', async () => {
   const {symbols, events, nativeContext} = fixture();
   const connect = createNodeIpcConnector({nativeSymbols: symbols, ipcRoot: '/one', memoryBudgetBytes: 128});
   assert.equal(connect.resolveEndpoint('ipc://first'), '/one/first');
@@ -240,11 +240,11 @@ test('invalid partial native owners close before the failure is reported', async
   connect.close();
 });
 
-test('ABI 7 is rejected before capture or domain creation', () => {
+test('ABI 8 is rejected before capture or domain creation', () => {
   const {symbols, events} = fixture();
-  symbols.c2_mem_ffi_abi_version = () => 7;
-  assert.equal(C2_MEM_FFI_ABI_VERSION, 8);
-  assert.throws(() => createNodeIpcConnector({nativeSymbols: symbols}), /ABI version 7; expected version 8/);
+  symbols.c2_mem_ffi_abi_version = () => 8;
+  assert.equal(C2_MEM_FFI_ABI_VERSION, 9);
+  assert.throws(() => createNodeIpcConnector({nativeSymbols: symbols}), /ABI version 8; expected version 9/);
   assert.equal(events.length, 0);
 });
 
@@ -294,7 +294,7 @@ test('shared captured context releases after the last explicit or collected fact
     let contexts=0,domains=0;
     const nativeContext={endpointName(){return 'endpoint'},namespaceId(){return 'namespace'},close(){contexts++}};
     const endpoint={async prepare(){},connectionSnapshot(){return null},beginCall(){},deactivate(){},async close(){}};
-    const symbols={c2_mem_ffi_abi_version(){return 8},captureEndpointContext(){return nativeContext},
+    const symbols={c2_mem_ffi_abi_version(){return 9},captureEndpointContext(){return nativeContext},
       createClientDomain(){return {createEndpoint(){return endpoint},stats(){return {}},close(){domains++}}}};
     const context=captureLocalIpcEndpointContextFromSymbols(symbols);
     const a=createNodeIpcConnector({nativeSymbols:symbols,endpointContext:context});

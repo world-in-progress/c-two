@@ -64,7 +64,7 @@ _Avoid_: 宿主, server process
 The scope of one role’s memory budget, file spill budget and outstanding-call limit. A Runtime creates its `client` domain for outgoing remote work and its `server` domain for its Host on demand. A standalone relay has a single `relay` domain for forwarding.
 _Avoid_: process-wide budget, connection budget
 
-### Calls and streams
+### Calls, streams and topics
 
 **一元调用 / unary call**:
 A call that sends at most one value each way and ends with one terminal outcome.
@@ -129,6 +129,30 @@ _Avoid_: call id, trace id
 **调用令牌 / call token**:
 The random value a relay gives at the start of one forwarded call's response. A client uses it only to cancel that call while the relay is still forwarding it; it is not a query or replay handle.
 _Avoid_: call id, session token
+
+**主题 / topic**:
+A resource-scoped 1-to-N publication channel declared on a CRM contract (`"topics"` in `c-two.contract.v2`) with zero input and one output payload type.
+_Avoid_: channel, event stream, broadcast method
+
+**发布句柄 / publisher**:
+The registration-scoped handle returned by `registration.publisher(topic)` through which application code pushes values to a topic. It becomes closed when that registration ends and never publishes to a later registration.
+_Avoid_: producer, emitter
+
+**订阅 / subscription**:
+One live client attachment to a route's topic, configured with a start position (`latest` or `next`) and lag policy (`skip` or `error`), spanning at most one registration.
+_Avoid_: stream (for a topic subscription), listener
+
+**交付 / delivery**:
+One immutable record `Delivery(value, seq, dropped)` yielded to a subscriber, pairing the received value with its monotonic registration-scoped sequence number and skipped-item count.
+_Avoid_: message, event, item (reserved for server streams)
+
+**落后策略 / lag policy**:
+A subscriber's declared response (`skip` or `error`) when its next expected sequence number has been evicted from the topic's bounded history ring.
+_Avoid_: overflow mode, backpressure policy
+
+**主题汇聚 / topic hub**:
+The relay-side fan-out state for one active upstream subscription (local IPC or single-hop remote relay HTTP) shared across downstream HTTP subscribers.
+_Avoid_: broker, fan-out cache
 
 ### Transport
 

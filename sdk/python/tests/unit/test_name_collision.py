@@ -538,6 +538,9 @@ class TestServerNameCollision:
                 abi_hash,
                 signature_hash,
                 descriptor_json,
+                topic_names,
+                topic_capacity,
+                initial_topics,
             ):  # noqa: ARG002
                 events.append(
                     f'native_register:{concurrency_mode}:{max_pending}:{max_workers}:{crm_ns}:{crm_name}:{crm_ver}'

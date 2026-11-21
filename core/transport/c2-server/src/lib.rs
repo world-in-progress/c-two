@@ -6,6 +6,7 @@ pub mod response;
 pub mod runtime;
 mod scheduler;
 pub mod server;
+pub mod topic;
 mod writer;
 
 pub use c2_local::{

@@ -162,9 +162,13 @@ class TestRegisterConnect:
         assert cc.shutdown()['completed']
         assert resource.cleaned == 1
 
-    def test_register_returns_name(self):
-        n = cc.register(Hello, HelloImpl(), name='hello')
-        assert n == 'hello'
+    def test_register_returns_registration(self):
+        registration = cc.register(Hello, HelloImpl(), name='hello')
+        assert isinstance(registration, cc.Registration)
+        assert registration.name == 'hello'
+        # Dropping the handle never unregisters: the Runtime keeps the route.
+        del registration
+        assert 'hello' in cc.connect(Hello, name='hello').client.route_name
 
     def test_register_rejects_undecorated_contract_before_server_creation(self):
         with pytest.raises(ValueError, match='decorate it with @cc.crm'):

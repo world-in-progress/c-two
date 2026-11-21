@@ -9,10 +9,10 @@ function withWindowsPlatform(run) {
   finally { Object.defineProperty(process, 'platform', {value: original}); }
 }
 
-test('Windows ABI 8 connector rejects raw socket and resolver injection', () => {
+test('Windows ABI 9 connector rejects raw socket and resolver injection', () => {
   withWindowsPlatform(() => {
     const symbols = {
-      c2_mem_ffi_abi_version: () => 8,
+      c2_mem_ffi_abi_version: () => 9,
       captureEndpointContext: () => ({endpointName: address => address, namespaceId: () => 'n', close() {}}),
       createClientDomain: () => ({createEndpoint() {}, stats() { return {}; }, close() {}}),
     };
@@ -21,11 +21,11 @@ test('Windows ABI 8 connector rejects raw socket and resolver injection', () => 
   });
 });
 
-test('Windows ABI 8 rejects old native symbols before any endpoint context is captured', () => {
+test('Windows ABI 9 rejects old native symbols before any endpoint context is captured', () => {
   withWindowsPlatform(() => {
     let captured = false;
     const symbols = {c2_mem_ffi_abi_version: () => 7, captureEndpointContext() { captured = true; }};
-    assert.throws(() => createNodeIpcConnector({nativeSymbols: symbols}), /expected version 8/);
+    assert.throws(() => createNodeIpcConnector({nativeSymbols: symbols}), /expected version 9/);
     assert.equal(captured, false);
   });
 });

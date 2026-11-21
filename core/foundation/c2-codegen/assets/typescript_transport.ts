@@ -50,16 +50,42 @@ export interface C2EncodedClientTransport {
   call(routeName: string, contract: C2ContractIdentity, method: string, encode: () => C2ByteArray): Promise<C2ResponsePayload>;
 }
 
+export interface TopicSubscribeOptions {
+  readonly start?: "latest" | "next";
+  readonly onLag?: "skip" | "error";
+  /** One deadline for acquisition, READY and deliveries. Defaults to unlimited. */
+  readonly timeoutMs?: number | null;
+}
+
+export interface TopicDelivery<T> {
+  readonly value: T;
+  readonly seq: bigint;
+  readonly dropped: bigint;
+}
+
+export interface C2TopicSubscription<T> extends AsyncIterableIterator<TopicDelivery<T>> {
+  readonly startSeq: bigint;
+  readonly topic: string;
+  next(): Promise<IteratorResult<TopicDelivery<T>, undefined>>;
+  cancel(): void;
+  close(timeoutMs?: number | null): Promise<C2StreamReceipt>;
+}
+
+export interface C2ClientTransport extends C2EncodedClientTransport {
+  subscribe<T>(routeName: string, contract: C2ContractIdentity, topic: string, decode: (bytes: Uint8Array) => T, options?: TopicSubscribeOptions, hold?: false): Promise<C2TopicSubscription<T>>;
+  subscribe<T>(routeName: string, contract: C2ContractIdentity, topic: string, decode: (bytes: Uint8Array) => T, options: TopicSubscribeOptions | undefined, hold: true): Promise<C2TopicSubscription<C2HeldResult<T>>>;
+}
+
 export interface C2StreamEncodedClientTransport extends C2EncodedClientTransport {
   stream<T>(routeName: string, contract: C2ContractIdentity, method: string, encode: () => C2ByteArray, decode: (bytes: Uint8Array) => T, hold?: false): C2ResponseStream<T>;
   stream<T>(routeName: string, contract: C2ContractIdentity, method: string, encode: () => C2ByteArray, decode: (bytes: Uint8Array) => T, hold: true): C2ResponseStream<C2HeldResult<T>>;
 }
 
-export interface C2HttpRelayEncodedTransport<Payload extends C2ResponsePayload = C2ByteArray> extends C2StreamEncodedClientTransport {
+export interface C2HttpRelayEncodedTransport<Payload extends C2ResponsePayload = C2ByteArray> extends C2StreamEncodedClientTransport, C2ClientTransport {
   call(routeName: string, contract: C2ContractIdentity, method: string, encode: () => C2ByteArray): Promise<Payload>;
 }
 
-export interface C2RelayAwareHttpEncodedTransport<Payload extends C2ResponsePayload = C2ByteArray> extends C2StreamEncodedClientTransport {
+export interface C2RelayAwareHttpEncodedTransport<Payload extends C2ResponsePayload = C2ByteArray> extends C2StreamEncodedClientTransport, C2ClientTransport {
   call(routeName: string, contract: C2ContractIdentity, method: string, encode: () => C2ByteArray): Promise<Payload>;
   close(): Promise<void>;
 }
@@ -82,17 +108,22 @@ export interface C2NativeCall {
   close(): void;
 }
 
-export interface C2NativeCallTarget extends C2ServerIdentity {
+export interface C2NativeCallTarget {
   readonly path: C2ObservedPath;
-  readonly connectionId: bigint | string;
+  readonly serverId: string | null;
+  readonly serverInstanceId: string | null;
+  readonly connectionId: bigint | string | null;
+}
+
+export interface C2NativeSubscription extends C2TopicSubscription<C2NativeBuffer> {
+  checkDeadline(): void;
 }
 
 export interface C2NativeEndpointContext {
-  prepare(routeName: string, contract: C2RouteContractIdentity, timeoutMs?: number): Promise<{
-    serverId: string; serverInstanceId: string; connectionId: bigint | string;
-  }>;
+  prepare(routeName: string, contract: C2RouteContractIdentity, timeoutMs?: number): Promise<unknown>;
   connectionSnapshot(routeName: string): C2ConnectionSnapshot | null;
   beginCall(routeName: string, method: string, serverStream: boolean, timeoutMs: number | null): C2NativeCall;
+  openSubscription(routeName: string, topic: string, options: Omit<TopicSubscribeOptions, "timeoutMs">, timeoutMs: number | null): Promise<C2NativeSubscription>;
   deactivate(): void;
   close(): Promise<void>;
 }
@@ -103,6 +134,7 @@ export interface C2ConnectionSnapshot extends C2ServerIdentity {
 }
 
 export interface C2IpcNativeEndpointOptions {
+  readonly mode?: "relay_aware" | "explicit_relay";
   readonly connectTimeoutMs?: number;
   readonly expectedServerIdentity?: C2ServerIdentity;
 }
@@ -123,7 +155,7 @@ export interface C2IpcTransportOptions<Payload extends C2ResponsePayload = C2Byt
   readonly observe?: C2TransportObserver | undefined;
 }
 
-export interface C2IpcEncodedTransport<Payload extends C2ResponsePayload = C2ByteArray> extends C2StreamEncodedClientTransport {
+export interface C2IpcEncodedTransport<Payload extends C2ResponsePayload = C2ByteArray> extends C2StreamEncodedClientTransport, C2ClientTransport {
   prepare(routeName: string, contract: C2ContractIdentity): Promise<void>;
   call(routeName: string, contract: C2ContractIdentity, method: string, encode: () => C2ByteArray): Promise<Payload>;
   close(): Promise<void>;
@@ -184,6 +216,8 @@ export type C2Fetch = (
 ) => Promise<C2FetchResponse>;
 
 export interface C2HttpRelayTransportOptions<Payload extends C2ResponsePayload = C2ByteArray> {
+  /** Native connector for topic subscriptions. Relay-aware mode can reuse ipc.connect. */
+  readonly connect?: C2IpcConnect;
   readonly fetch?: C2Fetch;
   readonly headers?: Readonly<Record<string, string>>;
   readonly callTimeoutMs?: number;
@@ -788,6 +822,80 @@ interface C2IpcTargetTransport<Payload extends C2ResponsePayload> extends C2IpcE
   streamAcquired<T>(routeName: string, method: string, encode: () => C2ByteArray, decode: (bytes: Uint8Array) => T, hold: boolean, budget: C2CallBudget, cancelled?: boolean, onTransportFailure?: (error: unknown) => void): C2ResponseStream<T | C2HeldResult<T>>;
 }
 
+function nativeTopicSubscribe(
+  acquire: (route: string, contract: C2ContractIdentity, budget: C2CallBudget) => Promise<C2NativeEndpointContext>,
+): C2ClientTransport["subscribe"] {
+  function subscribe<T>(route: string, contract: C2ContractIdentity, topic: string, decode: (bytes: Uint8Array) => T, options?: TopicSubscribeOptions, hold?: false): Promise<C2TopicSubscription<T>>;
+  function subscribe<T>(route: string, contract: C2ContractIdentity, topic: string, decode: (bytes: Uint8Array) => T, options: TopicSubscribeOptions | undefined, hold: true): Promise<C2TopicSubscription<C2HeldResult<T>>>;
+  async function subscribe<T>(route: string, contract: C2ContractIdentity, topic: string, decode: (bytes: Uint8Array) => T, options: TopicSubscribeOptions = {}, hold = false): Promise<C2TopicSubscription<T | C2HeldResult<T>>> {
+    const { timeoutMs = null, ...policy } = options;
+    const budget = new C2CallBudget(timeoutMs);
+    let native: C2NativeSubscription;
+    try {
+      const endpoint = await acquire(route, contract, budget);
+      native = await endpoint.openSubscription(route, topic, policy, budget.remaining());
+    } catch (error) {
+      throw projectNativeError(error);
+    }
+    return new DecodedTopicSubscription(native, decode, hold);
+  }
+  return subscribe;
+}
+
+class DecodedTopicSubscription<T> implements C2TopicSubscription<T | C2HeldResult<T>> {
+  constructor(
+    private readonly native: C2NativeSubscription,
+    private readonly decode: (bytes: Uint8Array) => T,
+    private readonly hold: boolean,
+  ) {}
+
+  get startSeq(): bigint { return this.native.startSeq; }
+  get topic(): string { return this.native.topic; }
+  [Symbol.asyncIterator](): this { return this; }
+
+  async next(): Promise<IteratorResult<TopicDelivery<T | C2HeldResult<T>>, undefined>> {
+    let item: IteratorResult<TopicDelivery<C2NativeBuffer>, undefined>;
+    try {
+      item = await this.native.next();
+    } catch (error) {
+      throw projectNativeError(error);
+    }
+    if (item.done) return item;
+    const { value: buffer, seq, dropped } = item.value;
+    let decoded: T | undefined;
+    try {
+      this.native.checkDeadline();
+      decoded = this.decode(buffer);
+      this.native.checkDeadline();
+      const value = this.hold ? createHeldResult(decoded, true, buffer, true) : decoded;
+      if (!this.hold) buffer.release();
+      return { done: false, value: Object.freeze({ value, seq, dropped }) };
+    } catch (error) {
+      tryReleaseResponsePayload(buffer);
+      tryReleaseStreamValue(decoded);
+      throw projectNativeError(error);
+    }
+  }
+
+  async return(): Promise<IteratorResult<TopicDelivery<T | C2HeldResult<T>>, undefined>> {
+    await this.close();
+    return { done: true, value: undefined };
+  }
+
+  cancel(): void {
+    try { this.native.cancel(); } catch (error) { throw projectNativeError(error); }
+  }
+
+  async close(timeoutMs?: number | null): Promise<C2StreamReceipt> {
+    try {
+      const receipt = await this.native.close(timeoutMs);
+      return { ...receipt, error: receipt.error === null ? null : projectNativeError(receipt.error) };
+    } catch (error) {
+      throw projectNativeError(error);
+    }
+  }
+}
+
 export function createIpcEncodedTransport<Payload extends C2ResponsePayload = C2ByteArray>(address: string, options: C2IpcTransportOptions<Payload>): C2IpcEncodedTransport<Payload> {
   return createIpcTargetTransport(address, options);
 }
@@ -926,8 +1034,8 @@ function createIpcTargetTransport<Payload extends C2ResponsePayload>(address: st
       }
       const payload = observeTransportResponse(delivery!, observe, () => ({
         path: observationPath === "RelayAwareLocalIpc" ? observationPath : target.path, routeName,
-        serverId: target.serverId, serverInstanceId: target.serverInstanceId,
-        connectionId: String(target.connectionId),
+        serverId: target.serverId ?? undefined, serverInstanceId: target.serverInstanceId ?? undefined,
+        connectionId: target.connectionId === null ? undefined : String(target.connectionId),
         ipcAddress: address, requests, responses,
       }));
       delivered = true;
@@ -1034,6 +1142,10 @@ function createIpcTargetTransport<Payload extends C2ResponsePayload>(address: st
       return callAcquired(routeName, method, encode, budget);
     },
     stream,
+    subscribe: nativeTopicSubscribe(async (route, contract, budget) => {
+      await prepare(route, contract, budget);
+      return acquired(route).native;
+    }),
     async close(): Promise<void> {
       closed = true;
       const native = await endpointPromise?.catch(() => undefined);
@@ -1093,6 +1205,26 @@ function createRelayTransport<Payload extends C2ResponsePayload>(baseUrl: string
   const requireOpen = (): void => {
     if (closed) throw new C2IpcTransportError("C-Two relay transport is deactivated.");
   };
+  let subscriptionEndpoint: Promise<C2NativeEndpointContext> | undefined;
+  const subscribe = nativeTopicSubscribe(async (route, contract, budget) => {
+    requireOpen();
+    const connect = normalizedOptions.connect ?? ipcOptions?.connect;
+    if (connect === undefined) throw new TypeError("C-Two relay subscriptions require a native connect option.");
+    if (subscriptionEndpoint === undefined) {
+      const mode = explicit ? "explicit_relay" : "relay_aware";
+      const pending = Promise.resolve().then(() => connect(anchorUrl, undefined, { mode }));
+      subscriptionEndpoint = pending;
+      void pending.catch(() => {
+        if (subscriptionEndpoint === pending) subscriptionEndpoint = undefined;
+      });
+    }
+    const endpoint = await budget.wait(subscriptionEndpoint);
+    requireOpen();
+    const limit = budget.stageLimit(resolveTimeoutMs) || undefined;
+    await budget.wait(endpoint.prepare(route, requireRouteContractIdentity(contract), limit));
+    requireOpen();
+    return endpoint;
+  });
   const retire = (local: C2RelayLocalTransport<Payload>): Promise<PromiseSettledResult<void>> | undefined => {
     if (local.retiring) return undefined;
     local.retiring = true;
@@ -1324,6 +1456,7 @@ function createRelayTransport<Payload extends C2ResponsePayload>(baseUrl: string
       }));
     },
     stream,
+    subscribe,
     close(): Promise<void> {
       if (closePromise !== undefined) return closePromise;
       closed = true;
@@ -1331,6 +1464,11 @@ function createRelayTransport<Payload extends C2ResponsePayload>(baseUrl: string
         await Promise.allSettled([...slots.values()].flatMap(slot => slot.acquiring === undefined ? [] : [slot.acquiring]));
         for (const local of localTransports.values()) retire(local);
         slots.clear();
+        const native = await subscriptionEndpoint?.catch(() => undefined);
+        if (native !== undefined) retired.push(Promise.resolve().then(() => native.close()).then(
+          (): PromiseFulfilledResult<void> => ({ status: "fulfilled", value: undefined }),
+          (reason): PromiseRejectedResult => ({ status: "rejected", reason }),
+        ));
         const results = await Promise.all(retired);
         for (const result of results) if (result.status === "rejected") throw result.reason;
       })();

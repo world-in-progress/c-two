@@ -13,8 +13,42 @@ use tokio::task::JoinHandle;
 use crate::connection::{Connection, PhysicalRetirement, WriteGuard};
 use crate::dispatcher::PreparedShmResponse;
 
+#[derive(Debug)]
+struct UnpublishedSharedLoan(Option<c2_mem::SharedShmLoan>);
+
+impl UnpublishedSharedLoan {
+    fn new(loan: c2_mem::SharedShmLoan) -> Self {
+        Self(Some(loan))
+    }
+
+    fn as_ref(&self) -> &c2_mem::SharedShmLoan {
+        self.0.as_ref().expect("live unpublished shared loan")
+    }
+
+    fn into_inner(mut self) -> c2_mem::SharedShmLoan {
+        self.0.take().expect("live unpublished shared loan")
+    }
+}
+
+impl Drop for UnpublishedSharedLoan {
+    fn drop(&mut self) {
+        // Never entered ConnectionCore::prepare_shared_loan, so never exposed
+        // to any peer. Settle immediately to release its host reference.
+        if let Some(loan) = self.0.take() {
+            loan.settle();
+        }
+    }
+}
+
+#[derive(Debug)]
+enum WriteReturn {
+    None,
+    Prepared(PreparedShmResponse),
+    SharedLoan(UnpublishedSharedLoan),
+}
+
 struct WriteWaiter {
-    sender: oneshot::Sender<io::Result<Option<PreparedShmResponse>>>,
+    sender: oneshot::Sender<io::Result<WriteReturn>>,
     wait_for_flush: bool,
 }
 
@@ -41,6 +75,7 @@ struct Submission {
     request: WriteRequest,
     reply: WriteReceipt,
     prepared: Option<(u64, PreparedShmResponse, PreparedRecordKind)>,
+    shared_item: Option<(u64, UnpublishedSharedLoan)>,
     item: Option<ItemFrame>,
     // Nonblocking replies retain drain ownership after their dispatcher returns.
     _flight: WriteGuard,
@@ -50,6 +85,7 @@ struct Submission {
 struct ItemFrame {
     request_id: u64,
     bytes: Vec<u8>,
+    _reservation: Option<c2_mem::MemoryReservation>,
 }
 
 #[derive(Clone, Copy)]
@@ -81,15 +117,22 @@ pub(crate) struct QueuedReplyPermit {
 
 impl QueuedReplyPermit {
     pub(crate) fn send(self, bytes: Vec<u8>) {
-        let _ = self.queue.send(Submission {
-            bytes,
-            request: self.request,
-            reply: None,
-            prepared: None,
-            item: None,
-            _flight: self.flight,
-            _pending: Some(self.pending),
-        });
+        let _ = self.try_send(bytes);
+    }
+
+    fn try_send(self, bytes: Vec<u8>) -> io::Result<()> {
+        self.queue
+            .send(Submission {
+                bytes,
+                request: self.request,
+                reply: None,
+                prepared: None,
+                shared_item: None,
+                item: None,
+                _flight: self.flight,
+                _pending: Some(self.pending),
+            })
+            .map_err(|_| broken_pipe())
     }
 }
 
@@ -160,18 +203,23 @@ impl ConnectionWriter {
     }
 
     pub(crate) async fn write_all(&self, bytes: &[u8]) -> io::Result<()> {
-        self.submit(bytes.to_vec(), None, false, None)
+        self.submit(bytes.to_vec(), None, None, false, None)
             .await
             .map(|_| ())
     }
 
     pub(crate) async fn write_call_end(&self, bytes: &[u8]) -> io::Result<()> {
-        self.submit(bytes.to_vec(), None, true, None)
+        self.submit(bytes.to_vec(), None, None, true, None)
             .await
             .map(|_| ())
     }
 
-    pub(crate) async fn write_item(&self, request_id: u64, bytes: Vec<u8>) -> io::Result<()> {
+    pub(crate) async fn write_item(
+        &self,
+        request_id: u64,
+        bytes: Vec<u8>,
+        reservation: Option<c2_mem::MemoryReservation>,
+    ) -> io::Result<()> {
         if request_id == 0 || bytes.is_empty() || bytes.len() > u32::MAX as usize - 13 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -181,8 +229,13 @@ impl ConnectionWriter {
         self.submit(
             Vec::new(),
             None,
+            None,
             true,
-            Some(ItemFrame { request_id, bytes }),
+            Some(ItemFrame {
+                request_id,
+                bytes,
+                _reservation: reservation,
+            }),
         )
         .await
         .map(|_| ())
@@ -196,13 +249,20 @@ impl ConnectionWriter {
         request_id: u64,
         prepared: PreparedShmResponse,
     ) -> io::Result<Option<PreparedShmResponse>> {
-        self.submit(
-            Vec::new(),
-            Some((request_id, prepared, PreparedRecordKind::UnaryEnd)),
-            true,
-            None,
-        )
-        .await
+        match self
+            .submit(
+                Vec::new(),
+                Some((request_id, prepared, PreparedRecordKind::UnaryEnd)),
+                None,
+                true,
+                None,
+            )
+            .await?
+        {
+            WriteReturn::None => Ok(None),
+            WriteReturn::Prepared(prepared) => Ok(Some(prepared)),
+            WriteReturn::SharedLoan(_) => unreachable!("prepared unary write"),
+        }
     }
 
     pub(crate) async fn write_item_prepared(
@@ -210,22 +270,54 @@ impl ConnectionWriter {
         request_id: u64,
         prepared: PreparedShmResponse,
     ) -> io::Result<Option<PreparedShmResponse>> {
-        self.submit(
-            Vec::new(),
-            Some((request_id, prepared, PreparedRecordKind::ItemData)),
-            true,
-            None,
-        )
-        .await
+        match self
+            .submit(
+                Vec::new(),
+                Some((request_id, prepared, PreparedRecordKind::ItemData)),
+                None,
+                true,
+                None,
+            )
+            .await?
+        {
+            WriteReturn::None => Ok(None),
+            WriteReturn::Prepared(prepared) => Ok(Some(prepared)),
+            WriteReturn::SharedLoan(_) => unreachable!("prepared item write"),
+        }
+    }
+
+    /// Publish one 1-to-N `SharedShmLoan` as an `ITEM_DATA` SHM descriptor.
+    /// Returns `Ok(Some(loan))` if the connection deactivated before publication
+    /// so the caller can settle the unused loan and fall back to inline chunks.
+    pub(crate) async fn write_item_shared_shm(
+        &self,
+        request_id: u64,
+        loan: c2_mem::SharedShmLoan,
+    ) -> io::Result<Option<c2_mem::SharedShmLoan>> {
+        match self
+            .submit(
+                Vec::new(),
+                None,
+                Some((request_id, UnpublishedSharedLoan::new(loan))),
+                true,
+                None,
+            )
+            .await?
+        {
+            WriteReturn::None => Ok(None),
+            WriteReturn::SharedLoan(loan) => Ok(Some(loan.into_inner())),
+            WriteReturn::Prepared(_) => unreachable!("shared SHM item write"),
+        }
     }
 
     async fn submit(
         &self,
         bytes: Vec<u8>,
         prepared: Option<(u64, PreparedShmResponse, PreparedRecordKind)>,
+        shared_item: Option<(u64, UnpublishedSharedLoan)>,
         call_record: bool,
         item: Option<ItemFrame>,
-    ) -> io::Result<Option<PreparedShmResponse>> {
+    ) -> io::Result<WriteReturn> {
         let (reply, receipt) = oneshot::channel();
         // Every queued response retains write access through deactivation;
         // only publication of a new SHM loan requires business admission.
@@ -242,6 +334,7 @@ impl ConnectionWriter {
                 bytes,
                 request,
                 prepared,
+                shared_item,
                 item,
                 reply: Some(WriteWaiter {
                     sender: reply,
@@ -261,10 +354,14 @@ impl ConnectionWriter {
     /// The receive loop only enqueues; it never waits for a blocked OS write.
     pub(crate) fn reserve_control(&self) -> io::Result<QueuedReplyPermit> {
         let control = self.conn.core.prepare_control_frame().map_err(core_error)?;
-        self.reserve_reply(WriteRequest::Control(control))
+        self.reserve_reply(WriteRequest::Control(control), true)
     }
 
-    fn reserve_reply(&self, request: WriteRequest) -> io::Result<QueuedReplyPermit> {
+    fn reserve_reply(
+        &self,
+        request: WriteRequest,
+        deactivate_on_full: bool,
+    ) -> io::Result<QueuedReplyPermit> {
         let pending = self
             .control_budget
             .clone()
@@ -273,10 +370,12 @@ impl ConnectionWriter {
                 // This is the configured pending budget, not the writer's
                 // implementation queue. Preserve accepted calls and keep
                 // reading releases after sealing further admission.
-                self.conn.end(
-                    c2_local::ConnectionEndReason::LocalClose,
-                    "reply_pending_capacity",
-                );
+                if deactivate_on_full {
+                    self.conn.end(
+                        c2_local::ConnectionEndReason::LocalClose,
+                        "reply_pending_capacity",
+                    );
+                }
                 io::Error::new(io::ErrorKind::OutOfMemory, "pending reply budget exhausted")
             })?;
         Ok(QueuedReplyPermit {
@@ -288,13 +387,23 @@ impl ConnectionWriter {
     }
 
     pub(crate) fn queue_call_end(&self, bytes: Vec<u8>) -> io::Result<()> {
+        self.queue_call_record(bytes, true)
+    }
+
+    pub(crate) fn queue_sync_ack(&self, bytes: Vec<u8>) -> io::Result<()> {
+        self.queue_call_record(bytes, false)
+    }
+
+    fn queue_call_record(&self, bytes: Vec<u8>, deactivate_on_full: bool) -> io::Result<()> {
         let frame = self.conn.core.prepare_call_record().map_err(core_error)?;
-        self.reserve_reply(WriteRequest::CallEnd {
-            frame,
-            loans: Vec::new(),
-        })?
-        .send(bytes);
-        Ok(())
+        self.reserve_reply(
+            WriteRequest::CallEnd {
+                frame,
+                loans: Vec::new(),
+            },
+            deactivate_on_full,
+        )?
+        .try_send(bytes)
     }
 
     pub(crate) fn queue_control(&self, bytes: Vec<u8>) -> io::Result<()> {
@@ -399,11 +508,21 @@ async fn process_submission<W: AsyncWrite + Unpin>(
     }
     let result = if let Some((request_id, prepared, kind)) = submission.prepared.take() {
         match prepare_response_write(conn, request_id, prepared, kind) {
-            Ok(PreparedResponseWrite::Owned(prepared)) => Ok(Some(prepared)),
+            Ok(PreparedResponseWrite::Owned(prepared)) => Ok(WriteReturn::Prepared(prepared)),
             Ok(PreparedResponseWrite::Published(batch)) => {
                 drive_write(stream, conn, batch, &mut submission.reply, write_timeout)
                     .await
-                    .map(|_| None)
+                    .map(|_| WriteReturn::None)
+            }
+            Err(error) => Err(error),
+        }
+    } else if let Some((request_id, loan)) = submission.shared_item.take() {
+        match prepare_shared_item_write(conn, request_id, loan) {
+            Ok(SharedItemWrite::Owned(loan)) => Ok(WriteReturn::SharedLoan(loan)),
+            Ok(SharedItemWrite::Published(batch)) => {
+                drive_write(stream, conn, batch, &mut submission.reply, write_timeout)
+                    .await
+                    .map(|_| WriteReturn::None)
             }
             Err(error) => Err(error),
         }
@@ -418,7 +537,7 @@ async fn process_submission<W: AsyncWrite + Unpin>(
                 write_timeout,
             )
             .await
-            .map(|_| None),
+            .map(|_| WriteReturn::None),
             Ok(None) => unreachable!("queued ITEM_DATA supplies a frame"),
             Err(error) => Err(core_error(error)),
         }
@@ -432,7 +551,7 @@ async fn process_submission<W: AsyncWrite + Unpin>(
                 write_timeout,
             )
             .await
-            .map(|_| None),
+            .map(|_| WriteReturn::None),
             Ok(None) => unreachable!("queued submission always supplies a frame"),
             Err(error) => Err(core_error(error)),
         }
@@ -460,6 +579,11 @@ struct PendingWrite {
 
 enum PreparedResponseWrite {
     Owned(PreparedShmResponse),
+    Published(PendingWrite),
+}
+
+enum SharedItemWrite {
+    Owned(UnpublishedSharedLoan),
     Published(PendingWrite),
 }
 
@@ -563,6 +687,49 @@ fn prepare_response_write(
     let mut write = assemble_write(conn, batch, Some(&frame))?;
     write.batch.begin_io().map_err(core_error)?;
     Ok(PreparedResponseWrite::Published(write))
+}
+
+fn prepare_shared_item_write(
+    conn: &Connection,
+    request_id: u64,
+    loan: UnpublishedSharedLoan,
+) -> io::Result<SharedItemWrite> {
+    use c2_wire::buddy::BuddyPayload;
+    use c2_wire::rpc::ValueStorage;
+
+    let _publication = conn.publication_gate.lock();
+    if conn.core.is_deactivated() {
+        return Ok(SharedItemWrite::Owned(loan));
+    }
+    let allocation = loan.as_ref().allocation();
+    let data_size = u32::try_from(loan.as_ref().len())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "shared SHM length > u32"))?;
+    let prepared = conn
+        .core
+        .prepare_shared_loan(loan.into_inner())
+        .map_err(core_error)?;
+    let descriptor = BuddyPayload {
+        seg_idx: allocation.seg_idx as u16,
+        generation: allocation.generation,
+        offset: allocation.offset,
+        data_size,
+        is_dedicated: allocation.is_dedicated,
+        loan_id: prepared.id(),
+    };
+    let frame = c2_wire::rpc::encode_item_data_frame(request_id, ValueStorage::Shm(descriptor))
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    let frame_permit = conn.core.prepare_call_record().map_err(core_error)?;
+    let batch = conn
+        .core
+        .begin_write(WriteRequest::CallEnd {
+            frame: frame_permit,
+            loans: vec![prepared],
+        })
+        .map_err(core_error)?
+        .expect("shared SHM item frame");
+    let mut write = assemble_write(conn, batch, Some(&frame))?;
+    write.batch.begin_io().map_err(core_error)?;
+    Ok(SharedItemWrite::Published(write))
 }
 
 /// Write one ITEM_DATA frame without another payload copy. The single
@@ -882,8 +1049,8 @@ mod tests {
         let stream = tokio::spawn({
             let writer = writer.clone();
             async move {
-                writer.write_item(1, b"a".to_vec()).await.unwrap();
-                writer.write_item(1, b"b".to_vec()).await.unwrap();
+                writer.write_item(1, b"a".to_vec(), None).await.unwrap();
+                writer.write_item(1, b"b".to_vec(), None).await.unwrap();
             }
         });
         entered_rx.await.unwrap();
@@ -934,7 +1101,7 @@ mod tests {
         let (writer, driver) = ConnectionWriter::spawn_test_stream(sink, conn.clone());
         let caller = tokio::spawn({
             let writer = writer.clone();
-            async move { writer.write_item(1, b"ab".to_vec()).await }
+            async move { writer.write_item(1, b"ab".to_vec(), None).await }
         });
         entered_rx.await.unwrap();
         caller.abort();
@@ -1057,7 +1224,9 @@ mod tests {
             let (writer, driver) = ConnectionWriter::spawn_test_stream(sink, conn.clone());
             let mut send = Box::pin(async {
                 match kind {
-                    rpc::RpcRecordKind::ItemData => writer.write_item(1, b"ab".to_vec()).await,
+                    rpc::RpcRecordKind::ItemData => {
+                        writer.write_item(1, b"ab".to_vec(), None).await
+                    }
                     rpc::RpcRecordKind::ItemBegin => {
                         writer
                             .write_call_end(&rpc::encode_item_begin_frame(1, 2).unwrap())

@@ -15,7 +15,7 @@ from c_two.error import (
     ResourceClosed, ResourceRemoved, ContractMismatch, IdentityMismatch,
     ProtocolViolation, FallbackDenied,
     CallDeadlineExceeded, UnsupportedCallMode, CallCapacityExceeded, CallCancelled,
-    RouteConflict,
+    RouteConflict, SubscriptionLagged,
 )
 
 
@@ -61,18 +61,19 @@ class TestErrorCode:
             "CallCapacityExceeded": 717,
             "CallCancelled": 718,
             "RouteConflict": 719,
+            "SubscriptionLagged": 720,
         }
         assert {member.name: member.value for member in ErrorCode} == expected
 
     def test_members_match_native_registry_exactly(self):
         native = _native.error_registry()
-        assert len(native) == 25
+        assert len(native) == 26
         assert set(ErrorCode.__members__) == set(native)
         for name, (code, _side, _stage) in native.items():
             assert ErrorCode[name].value == int(code)
 
-    def test_has_exactly_25_members(self):
-        assert len(ErrorCode) == 25
+    def test_has_exactly_26_members(self):
+        assert len(ErrorCode) == 26
 
     def test_values_are_unique(self):
         values = [member.value for member in ErrorCode]
@@ -303,6 +304,7 @@ ROUTE_SUBCLASS_PARAMS = [
     (CallCapacityExceeded, 717, 'Call capacity exceeded'),
     (CallCancelled, 718, 'Call cancelled'),
     (RouteConflict, 719, 'Route conflict'),
+    (SubscriptionLagged, 720, 'Subscription lagged'),
 ]
 
 
@@ -347,6 +349,7 @@ class TestPublicSurface:
             'ResourceClosed', 'ResourceRemoved', 'ContractMismatch', 'IdentityMismatch',
             'ProtocolViolation', 'FallbackDenied', 'CallDeadlineExceeded',
             'UnsupportedCallMode', 'CallCapacityExceeded', 'CallCancelled', 'RouteConflict',
+            'SubscriptionLagged',
         }
         assert set(error.__all__) == expected
 

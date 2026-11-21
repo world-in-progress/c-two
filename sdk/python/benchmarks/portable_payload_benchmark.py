@@ -18,6 +18,8 @@ Suites:
   - fanout:   Multi-subscriber amplification baseline (R = 1, 2, 4 concurrent
               client processes subscribing via @cc.stream at 4 MiB and 32 MiB
               over direct IPC and 1-hop c3 relay).
+  - pubsub_fanout: Matching payload sizes and reader counts via @cc.topic over
+                   direct IPC, one relay, and two relays in separate IPC roots.
   - kostya:   Structured coordinate replacement baseline (1K, 100K, 1M rows with
               u32 row_id, three f64 columns, 50,000 rotating strings, and exact
               columnar sum across explicit FastDB, pickle-arrays, and Ray actor).
@@ -36,6 +38,7 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Iterator
+from contextlib import ExitStack
 import gc
 import importlib.metadata
 import json
@@ -44,16 +47,19 @@ import multiprocessing as mp
 import os
 from pathlib import Path
 import platform
+from queue import Empty
 try:
     import resource
 except ImportError:  # Windows
     resource = None  # type: ignore[assignment]
 import shutil
+import signal
 import socket
 import statistics
 import subprocess
 import sys
 import tempfile
+from threading import BrokenBarrierError
 import time
 from typing import Any
 import urllib.request
@@ -395,7 +401,10 @@ def peak_rss_mib() -> float:
     if resource is None:
         win = _windows_process_memory_mib()
         return win[0] if win is not None else 0.0
-    usage = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    return _ru_maxrss_mib(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+
+
+def _ru_maxrss_mib(usage: int) -> float:
     # macOS reports bytes; Linux reports KiB.
     if sys.platform == 'darwin':
         return round(usage / MIB, 2)
@@ -514,6 +523,23 @@ class FastDbFieldContract:
     def server_metrics(self) -> str: ...
 
 
+@cc.crm(namespace='bench.portable.pubsub', version='0.1.0')
+class FastDbPubSubContract:
+    @cc.read
+    @cc.transfer(output=FIELD_SPEC)
+    def snapshot_published(self) -> Payload: ...
+
+    @cc.read
+    def emit_burst(self, count: int) -> str: ...
+
+    @cc.read
+    def server_metrics(self) -> str: ...
+
+    @cc.topic
+    @cc.transfer(output=FIELD_SPEC)
+    def frames(self) -> Payload: ...
+
+
 @cc.crm(namespace='bench.pickle.field', version='0.1.0')
 class PickleFieldContract:
     @cc.read
@@ -561,7 +587,7 @@ class PickleCouplingResource:
         return (seq + 1, stamp_field_array(self._base, seq + 1))
 
 
-class FastDbFieldResource:
+class _PublishedFastDbField:
     def __init__(self, n_bytes: int, runtime: cc.Runtime) -> None:
         self._runtime = runtime
         self._base = make_field_array(n_bytes)
@@ -571,6 +597,16 @@ class FastDbFieldResource:
     def snapshot_published(self) -> Payload:
         return self._published
 
+    def server_metrics(self) -> str:
+        return json.dumps({
+            'peak_rss_mib': peak_rss_mib(),
+            'memory_stats': self._runtime.memory_stats(),
+            'fastdb_report': self._report,
+            'encoded_bytes': len(self._published.binary_bytes()),
+        })
+
+
+class FastDbFieldResource(_PublishedFastDbField):
     def snapshot_fresh(self, seq: int) -> Payload:
         arr = stamp_field_array(self._base, seq)
         payload, _ = build_field_payload(arr, seq)
@@ -589,12 +625,18 @@ class FastDbFieldResource:
             finally:
                 payload.close()
 
-    def server_metrics(self) -> str:
+class FastDbPubSubResource(_PublishedFastDbField):
+    def set_publisher(self, publisher: cc.Publisher[Payload]) -> None:
+        self._publisher = publisher
+
+    def emit_burst(self, count: int) -> str:
+        t0 = time.perf_counter()
+        seqs = [self._publisher.publish(self._published) for _ in range(count)]
+        elapsed_s = time.perf_counter() - t0
         return json.dumps({
-            'peak_rss_mib': peak_rss_mib(),
-            'memory_stats': self._runtime.memory_stats(),
-            'fastdb_report': self._report,
-            'encoded_bytes': len(self._published.binary_bytes()),
+            'publish_elapsed_s': elapsed_s,
+            'first_seq': seqs[0],
+            'last_seq': seqs[-1],
         })
 
 
@@ -640,6 +682,7 @@ def _ctwo_server_main(
     relay_url: str | None,
     ready_q: mp.Queue,
     stop_ev: mp.Event,
+    topic_capacity: int | None = None,
 ) -> None:
     os.environ['C2_ENV_FILE'] = ''
     os.environ['C2_RELAY_ANCHOR_ADDRESS'] = ''
@@ -657,6 +700,14 @@ def _ctwo_server_main(
             runtime.register(PickleCouplingContract, PickleCouplingResource(param), name='bench', concurrency=conc)
         elif kind == 'fastdb_field':
             runtime.register(FastDbFieldContract, FastDbFieldResource(param, runtime), name='bench', concurrency=conc)
+        elif kind == 'fastdb_pubsub':
+            assert topic_capacity is not None
+            pubsub = FastDbPubSubResource(param, runtime)
+            registration = runtime.register(
+                FastDbPubSubContract, pubsub, name='bench', concurrency=conc,
+                topic_capacity={'frames': topic_capacity},
+            )
+            pubsub.set_publisher(registration.publisher('frames'))
         elif kind == 'pickle_field':
             runtime.register(PickleFieldContract, PickleFieldResource(param, runtime), name='bench', concurrency=conc)
         elif kind == 'fastdb_kostya':
@@ -676,11 +727,15 @@ def _ctwo_server_main(
 
 
 class SpawnedCtwoServer:
-    def __init__(self, kind: str, param: int, *, endpoint_root: str | None, relay_url: str | None = None) -> None:
+    def __init__(
+        self, kind: str, param: int, *, endpoint_root: str | None,
+        relay_url: str | None = None, topic_capacity: int | None = None,
+    ) -> None:
         self._kind = kind
         self._param = param
         self._endpoint_root = endpoint_root
         self._relay_url = relay_url
+        self._topic_capacity = topic_capacity
         self._ctx = mp.get_context('spawn')
         self._ready_q = self._ctx.Queue()
         self._stop_ev = self._ctx.Event()
@@ -690,13 +745,19 @@ class SpawnedCtwoServer:
     def __enter__(self) -> SpawnedCtwoServer:
         self._proc = self._ctx.Process(
             target=_ctwo_server_main,
-            args=(self._kind, self._param, self._endpoint_root, self._relay_url, self._ready_q, self._stop_ev),
+            args=(
+                self._kind, self._param, self._endpoint_root, self._relay_url,
+                self._ready_q, self._stop_ev, self._topic_capacity,
+            ),
         )
         self._proc.start()
-        status, value = self._ready_q.get(timeout=60.0)
-        if status != 'ok':
+        try:
+            status, value = self._ready_q.get(timeout=60.0)
+            if status != 'ok':
+                raise RuntimeError(f'C-Two server {self._kind} failed to start: {value}')
+        except BaseException:
             self.__exit__(None, None, None)
-            raise RuntimeError(f'C-Two server {self._kind} failed to start: {value}')
+            raise
         assert isinstance(value, str)
         self.address = value
         return self
@@ -717,21 +778,42 @@ def _free_tcp_port() -> int:
 
 
 class SpawnedRelay:
-    def __init__(self, c3_bin: str, ipc_root: str | None) -> None:
+    def __init__(
+        self,
+        c3_bin: str,
+        ipc_root: str | None,
+        *,
+        seeds: list[str] | None = None,
+        relay_id: str | None = None,
+        memory_budget_bytes: int = DEFAULT_ROLE_BUDGET_BYTES,
+    ) -> None:
         self._c3_bin = c3_bin
         self._ipc_root = ipc_root
+        self._seeds = seeds
+        self._relay_id = relay_id
+        self._memory_budget_bytes = memory_budget_bytes
         self._proc: subprocess.Popen[str] | None = None
         self.url: str = ''
+        self.peak_rss_mib: float | None = None
 
     def __enter__(self) -> SpawnedRelay:
         port = _free_tcp_port()
         bind = f'127.0.0.1:{port}'
         self.url = f'http://{bind}'
-        args = [self._c3_bin, 'relay', '--bind', bind, '--advertise-url', self.url]
+        args = [
+            self._c3_bin, 'relay', '--bind', bind, '--advertise-url', self.url,
+            '--memory-budget-bytes', str(self._memory_budget_bytes),
+        ]
         if self._ipc_root is not None and os.name != 'nt':
             args.extend(['--ipc-root', self._ipc_root])
+        if self._seeds:
+            args.extend(['--seeds', ','.join(self._seeds)])
+        if self._relay_id is not None:
+            args.extend(['--relay-id', self._relay_id])
         env = os.environ.copy()
         env['C2_ENV_FILE'] = ''
+        env.pop('C2_RELAY_SEEDS', None)
+        env.pop('C2_RELAY_ID', None)
         env['NO_PROXY'] = '127.0.0.1,localhost'
         env['no_proxy'] = '127.0.0.1,localhost'
         self._proc = subprocess.Popen(
@@ -745,6 +827,7 @@ class SpawnedRelay:
         while time.monotonic() < deadline:
             if self._proc.poll() is not None:
                 stderr = self._proc.stderr.read() if self._proc.stderr else ''
+                self.__exit__(None, None, None)
                 raise RuntimeError(f'c3 relay exited prematurely: {stderr}')
             try:
                 with _NO_PROXY_OPENER.open(f'{self.url}/health', timeout=1.0) as resp:
@@ -755,17 +838,45 @@ class SpawnedRelay:
         self.__exit__(None, None, None)
         raise TimeoutError(f'c3 relay did not become healthy at {self.url}')
 
-    def __exit__(self, *_: object) -> None:
-        if self._proc is not None:
-            if self._proc.poll() is None:
-                self._proc.terminate()
+    def _reap_with_rss(self, proc: subprocess.Popen[str]) -> None:
+        # Observe exit without reaping so wait4 can collect this child's usage.
+        try:
+            os.kill(proc.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        deadline = time.monotonic() + 5.0
+        while os.waitid(os.P_PID, proc.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is None:
+            if time.monotonic() >= deadline:
                 try:
-                    self._proc.wait(timeout=5.0)
+                    os.kill(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                break
+            time.sleep(0.01)
+        _, status, usage = os.wait4(proc.pid, 0)
+        proc.returncode = os.waitstatus_to_exitcode(status)
+        self.peak_rss_mib = _ru_maxrss_mib(usage.ru_maxrss)
+
+    def __exit__(self, *_: object) -> None:
+        proc = self._proc
+        if proc is None:
+            return
+        try:
+            if proc.returncode is None and hasattr(os, 'wait4') and hasattr(os, 'waitid'):
+                try:
+                    self._reap_with_rss(proc)
+                except OSError:
+                    pass
+            if proc.returncode is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5.0)
                 except subprocess.TimeoutExpired:
-                    self._proc.kill()
-                    self._proc.wait(timeout=5.0)
-            if self._proc.stderr is not None:
-                self._proc.stderr.close()
+                    proc.kill()
+                    proc.wait(timeout=5.0)
+        finally:
+            if proc.stderr is not None:
+                proc.stderr.close()
 
 
 def _make_client_runtime(endpoint_root: str | None) -> cc.Runtime:
@@ -1321,6 +1432,7 @@ def _run_fanout_case(
                     'aggregate_gib_s': round((total_logical_bytes_moved / max_elapsed) / (1024 ** 3), 4),
                     'redundant_copy_multiplier': readers,
                     'server_peak_rss_mib': srv_metrics.get('peak_rss_mib'),
+                    'server_pool_peak_mib': round(srv_metrics['memory_stats']['server']['memory']['peak_bytes'] / MIB, 2),
                     'max_client_peak_rss_mib': max(r['peak_rss_mib'] for r in sub_rows),
                     'wall_with_spawn_s': round(wall_s, 3),
                 }
@@ -1353,6 +1465,217 @@ def run_fanout_suite(*, smoke: bool, c3_bin: str | None) -> dict[str, Any]:
                 )
 
     return {'suite': 'fanout', 'rows': rows}
+
+
+# ---------------------------------------------------------------------------
+# Publish/subscribe fan-out over IPC and relay mesh
+# ---------------------------------------------------------------------------
+
+
+def _pubsub_fanout_subscriber_main(
+    address: str,
+    endpoint_root: str | None,
+    n_bytes: int,
+    frames: int,
+    barrier: Any,
+    out_q: mp.Queue,
+) -> None:
+    client = _make_client_runtime(endpoint_root)
+    proxy = None
+    try:
+        proxy = client.connect(FastDbPubSubContract, name='bench', address=address)
+        count_elems = n_bytes // 8
+        snap = proxy.snapshot_published()
+        try:
+            s, c, tot, _ = read_and_reduce_field_payload(snap)
+            verify_field_result(s, 1, c, count_elems, tot)
+        finally:
+            snap.close()
+
+        sub = proxy.frames(start='next', on_lag='error')
+        frame_ms: list[float] = []
+        dropped_total = 0
+        try:
+            # READY reports the first deliverable sequence for start='next'.
+            first_seq = sub.start_seq
+            barrier.wait(timeout=30.0)
+            t0 = prev = time.perf_counter()
+            for expected_seq in range(first_seq, first_seq + frames):
+                delivery = next(sub)
+                try:
+                    assert delivery.dropped == 0, delivery.dropped
+                    assert delivery.seq == expected_seq, (delivery.seq, expected_seq)
+                    dropped_total += delivery.dropped
+                    s, c, tot, _ = read_and_reduce_field_payload(delivery.value)
+                    verify_field_result(s, 1, c, count_elems, tot)
+                finally:
+                    delivery.value.close()
+                now = time.perf_counter()
+                frame_ms.append((now - prev) * 1e3)
+                prev = now
+            elapsed_s = prev - t0
+        finally:
+            receipt = sub.close(timeout=15.0)
+            assert receipt['completed'] is True, receipt
+
+        out_q.put(('ok', {
+            'observed_path': proxy.client.observed_path,
+            'elapsed_s': elapsed_s,
+            'p50_ms': nearest_rank(frame_ms, 0.50),
+            'p95_ms': nearest_rank(frame_ms, 0.95),
+            'peak_rss_mib': peak_rss_mib(),
+            'dropped_total': dropped_total,
+        }))
+    except BaseException as exc:
+        out_q.put(('err', repr(exc)))
+        barrier.abort()
+    finally:
+        if proxy is not None:
+            cc.close(proxy)
+        client.shutdown(timeout=10.0)
+
+
+def _wait_for_pubsub_route(address: str, endpoint_root: str | None) -> None:
+    client = _make_client_runtime(endpoint_root)
+    deadline = time.monotonic() + 10.0
+    last_error = None
+    try:
+        while (remaining := deadline - time.monotonic()) > 0:
+            try:
+                proxy = client.connect(FastDbPubSubContract, name='bench', address=address, timeout=remaining)
+                try:
+                    budget = max(0.0, deadline - time.monotonic())
+                    cc.with_call_options(proxy, timeout=budget).server_metrics()
+                    return
+                finally:
+                    cc.close(proxy)
+            except cc.error.CCBaseError as exc:
+                last_error = exc
+                time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+        raise TimeoutError('pub/sub route did not become reachable through Relay B') from last_error
+    finally:
+        client.shutdown(timeout=10.0)
+
+
+def _run_pubsub_fanout_case(
+    *, transport: str, n_bytes: int, readers: int, frames: int, c3_bin: str | None,
+) -> dict[str, Any]:
+    ctx = mp.get_context('spawn')
+    # Keep the full burst within the history ring's N - 1 slots.
+    topic_capacity = frames + 1
+    relay_a = relay_b = None
+    with ExitStack() as stack:
+        root_a = stack.enter_context(tempfile.TemporaryDirectory(prefix='c2-bench-pub-a-')) if os.name != 'nt' else None
+        if transport in ('explicit_relay', 'dual_relay'):
+            assert c3_bin is not None
+            relay_a = stack.enter_context(SpawnedRelay(
+                c3_bin, root_a, relay_id='relay-a' if transport == 'dual_relay' else None,
+            ))
+        srv = stack.enter_context(SpawnedCtwoServer(
+            'fastdb_pubsub', n_bytes, endpoint_root=root_a,
+            relay_url=relay_a.url if relay_a is not None else None,
+            topic_capacity=topic_capacity,
+        ))
+        reader_root = root_a
+        target = relay_a.url if relay_a is not None else srv.address
+        if transport == 'dual_relay':
+            assert c3_bin is not None and relay_a is not None
+            if os.name != 'nt':
+                reader_root = stack.enter_context(tempfile.TemporaryDirectory(prefix='c2-bench-pub-b-'))
+            relay_b = stack.enter_context(SpawnedRelay(c3_bin, reader_root, seeds=[relay_a.url], relay_id='relay-b'))
+            target = relay_b.url
+            _wait_for_pubsub_route(target, reader_root)
+
+        coord = _make_client_runtime(root_a)
+        stack.callback(coord.shutdown, timeout=10.0)
+        coord_proxy = coord.connect(FastDbPubSubContract, name='bench', address=srv.address)
+        stack.callback(cc.close, coord_proxy)
+        barrier = ctx.Barrier(readers + 1)
+        out_q = ctx.Queue()
+        stack.callback(out_q.close)
+        procs = []
+        sub_rows = []
+        t_wall0 = time.perf_counter()
+        try:
+            for _ in range(readers):
+                proc = ctx.Process(
+                    target=_pubsub_fanout_subscriber_main,
+                    args=(target, reader_root, n_bytes, frames, barrier, out_q),
+                )
+                proc.start()
+                procs.append(proc)
+            try:
+                barrier.wait(timeout=30.0)
+            except BrokenBarrierError as exc:
+                try:
+                    _, detail = out_q.get(timeout=1.0)
+                except Empty:
+                    detail = 'subscription setup timed out'
+                raise RuntimeError(f'pub/sub fanout barrier failed: {detail}') from exc
+            burst = json.loads(coord_proxy.emit_burst(frames))
+            assert (burst['first_seq'], burst['last_seq']) == (1, frames), burst
+            deadline = time.monotonic() + 60.0
+            for _ in range(readers):
+                status, row = out_q.get(timeout=max(0.0, deadline - time.monotonic()))
+                if status != 'ok':
+                    raise RuntimeError(f'pub/sub fanout subscriber failed: {row}')
+                sub_rows.append(row)
+            for proc in procs:
+                proc.join(timeout=15.0)
+                if proc.exitcode != 0:
+                    raise RuntimeError(f'pub/sub fanout subscriber exit code: {proc.exitcode}')
+        finally:
+            for proc in procs:
+                if proc.is_alive():
+                    proc.kill()
+                    proc.join()
+                proc.close()
+        wall_s = time.perf_counter() - t_wall0
+        srv_metrics = json.loads(coord_proxy.server_metrics())
+
+    max_elapsed = max(row['elapsed_s'] for row in sub_rows)
+    moved_gib = readers * frames * n_bytes / (1024 ** 3)
+    dropped_total = sum(row['dropped_total'] for row in sub_rows)
+    assert dropped_total == 0, dropped_total
+    return {
+        'transport': transport,
+        'observed_paths': sorted({row['observed_path'] for row in sub_rows}),
+        'logical_bytes': n_bytes,
+        'encoded_bytes': srv_metrics['encoded_bytes'],
+        'readers': readers,
+        'frames_per_reader': frames,
+        'topic_capacity': topic_capacity,
+        'publish_elapsed_s': burst['publish_elapsed_s'],
+        'max_reader_elapsed_s': round(max_elapsed, 4),
+        'per_reader_p50_ms': round(statistics.fmean(row['p50_ms'] for row in sub_rows), 4),
+        'per_reader_p95_ms': round(max(row['p95_ms'] for row in sub_rows), 4),
+        'per_reader_effective_fps': round(frames / max_elapsed, 2),
+        'aggregate_moved_gib': round(moved_gib, 4),
+        'aggregate_gib_s': round(moved_gib / max_elapsed, 4),
+        'server_write_multiplier': 1,
+        'dropped_total': dropped_total,
+        'server_peak_rss_mib': srv_metrics['peak_rss_mib'],
+        'server_pool_peak_mib': round(srv_metrics['memory_stats']['server']['memory']['peak_bytes'] / MIB, 2),
+        'max_client_peak_rss_mib': max(row['peak_rss_mib'] for row in sub_rows),
+        'relay_a_peak_rss_mib': relay_a.peak_rss_mib if relay_a is not None else None,
+        'relay_b_peak_rss_mib': relay_b.peak_rss_mib if relay_b is not None else None,
+        'wall_with_spawn_s': round(wall_s, 3),
+    }
+
+
+def run_pubsub_fanout_suite(*, smoke: bool, c3_bin: str | None) -> dict[str, Any]:
+    sizes = [256 * KIB] if smoke else [4 * MIB, 32 * MIB]
+    reader_counts = [1, 2] if smoke else [1, 2, 4]
+    transports = ['direct_ipc'] + (['explicit_relay', 'dual_relay'] if c3_bin is not None else [])
+    rows: list[dict[str, Any]] = []
+    for transport in transports:
+        for n_bytes in sizes:
+            frames = 3 if smoke else (16 if n_bytes <= 4 * MIB else 8)
+            for readers in reader_counts:
+                rows.append(_run_pubsub_fanout_case(
+                    transport=transport, n_bytes=n_bytes, readers=readers, frames=frames, c3_bin=c3_bin,
+                ))
+    return {'suite': 'pubsub_fanout', 'rows': rows}
 
 
 # ---------------------------------------------------------------------------
@@ -1708,7 +2031,7 @@ def run_benchmark(
     os.environ['C2_ENV_FILE'] = ''
     os.environ['C2_RELAY_ANCHOR_ADDRESS'] = ''
     resolved_c3 = c3_bin or shutil.which('c3')
-    selected = ['stages', 'coupling', 'field', 'fanout', 'kostya'] if suite == 'all' else [suite]
+    selected = ['stages', 'coupling', 'field', 'fanout', 'pubsub_fanout', 'kostya'] if suite == 'all' else [suite]
     results: dict[str, Any] = {}
     try:
         for name in selected:
@@ -1720,6 +2043,8 @@ def run_benchmark(
                 results['field'] = run_field_suite(smoke=smoke, include_ray=include_ray, c3_bin=resolved_c3)
             elif name == 'fanout':
                 results['fanout'] = run_fanout_suite(smoke=smoke, c3_bin=resolved_c3)
+            elif name == 'pubsub_fanout':
+                results['pubsub_fanout'] = run_pubsub_fanout_suite(smoke=smoke, c3_bin=resolved_c3)
             elif name == 'kostya':
                 results['kostya'] = run_kostya_suite(smoke=smoke, include_ray=include_ray)
             else:
@@ -1738,15 +2063,15 @@ def run_benchmark(
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description='Reproducible explicit FastDB Payload & stream benchmark.')
+    parser = argparse.ArgumentParser(description='Reproducible FastDB Payload, server stream, and topic benchmark.')
     parser.add_argument(
         '--suite',
-        choices=('stages', 'coupling', 'field', 'fanout', 'kostya', 'all'),
+        choices=('stages', 'coupling', 'field', 'fanout', 'pubsub_fanout', 'kostya', 'all'),
         default='all',
     )
     parser.add_argument('--smoke', action='store_true', help='Run small fast sizes for verification.')
     parser.add_argument('--include-ray', action='store_true', help='Include Ray detached actor and Compiled Graphs arms.')
-    parser.add_argument('--c3-bin', default=None, help='Path to c3 binary for 1-hop relay arms (defaults to PATH lookup).')
+    parser.add_argument('--c3-bin', default=None, help='Path to c3 binary for relay arms (defaults to PATH lookup).')
     parser.add_argument('--output', type=Path, default=None, help='Write JSON receipt to this file.')
     args = parser.parse_args(argv)
 

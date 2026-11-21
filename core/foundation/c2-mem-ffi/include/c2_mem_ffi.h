@@ -8,7 +8,7 @@
 extern "C" {
 #endif
 
-#define C2_MEM_FFI_ABI_VERSION 8u
+#define C2_MEM_FFI_ABI_VERSION 9u
 
 typedef enum C2MemFfiStatus {
     C2_MEM_FFI_STATUS_OK = 0,
@@ -25,16 +25,19 @@ typedef struct C2MemFfiLocalEndpointContext C2MemFfiLocalEndpointContext;
 typedef struct C2MemFfiClientDomain C2MemFfiClientDomain;
 typedef struct C2MemFfiEndpointContext C2MemFfiEndpointContext;
 typedef struct C2MemFfiCall C2MemFfiCall;
+typedef struct C2MemFfiSubscription C2MemFfiSubscription;
 typedef struct C2MemFfiBuffer C2MemFfiBuffer;
 typedef struct C2MemFfiError C2MemFfiError;
 
-/* Every callback owns its result. Transfer a member by setting it to NULL
- * before result_free. JSON is borrowed until result_free; buffers and errors
- * have their own owners. Callbacks run on a Rust executor thread. */
+/* Each callback receives an owned result. Transfer a buffer, error or
+ * subscription by setting its member to NULL before result_free. JSON is
+ * borrowed until result_free. Callbacks run on a Rust executor thread or
+ * synchronously if executor initialization fails. */
 typedef struct C2MemFfiResult {
     C2MemFfiBuffer *buffer;
     C2MemFfiError *error;
     const char *json;
+    C2MemFfiSubscription *subscription;
 } C2MemFfiResult;
 typedef void (*C2MemFfiComplete)(void *user, C2MemFfiResult *result);
 
@@ -85,7 +88,7 @@ C2MemFfiStatus c2_mem_ffi_local_endpoint_context_namespace_id_copy(
     size_t dst_len,
     size_t *out_written);
 
-/* ABI 8 native client domain. Captured endpoint context is borrowed only
+/* ABI 9 native client domain. Captured endpoint context is borrowed only
  * during new; NULL inherits native configuration. The factory owns one Runtime
  * budget domain across all physical connections and reconnects. Free releases
  * only the factory reference; live endpoints/calls/buffers keep their owners.
@@ -98,10 +101,13 @@ void c2_mem_ffi_client_domain_free(C2MemFfiClientDomain *domain);
 /* Read-only JSON snapshot of the client role. Counters and identifiers are
  * decimal strings when present, and observing does not activate the role. */
 C2MemFfiStatus c2_mem_ffi_client_domain_stats(const C2MemFfiClientDomain *domain, C2MemFfiResult **out);
-/* new performs no I/O. prepare connects using Rust's sole IPC reader/writer,
+/* new performs no I/O. prepare connects using Rust Core,
  * validates the complete contract and records the reached server identity.
  * JSON options/contract are UTF-8. Endpoint options are connectTimeoutMs,
- * expectedServerIdentity; transport policy belongs to the client domain.
+ * expectedServerIdentity (IPC only), and mode (HTTP(S) only). HTTP(S) mode
+ * defaults to relay_aware and also accepts explicit_relay. Prepare returns
+ * serverId, serverInstanceId and connectionId (decimal text). On relay
+ * endpoints it includes path, and the IPC fields are null on HTTP paths.
  * A supplied server identity is checked on every acquisition; without one,
  * acquisition after peer end accepts a new instance at the same address.
  * All input strings are borrowed for the call.
@@ -112,7 +118,8 @@ C2MemFfiStatus c2_mem_ffi_client_domain_stats(const C2MemFfiClientDomain *domain
 C2MemFfiStatus c2_mem_ffi_endpoint_context_new(const C2MemFfiClientDomain *domain, const char *address, const char *options_json, C2MemFfiEndpointContext **out, C2MemFfiError **error);
 C2MemFfiStatus c2_mem_ffi_endpoint_context_prepare(const C2MemFfiEndpointContext *endpoint, const char *route, const char *contract_json, const uint64_t *timeout_millis, C2MemFfiComplete complete, void *user);
 /* Synchronous, read-only snapshot of the physical connection observed by the
- * last successful preparation of this route. No preparation returns JSON NULL.
+ * last successful preparation of this route. With no observed IPC connection,
+ * result->json is NULL.
  * A successful result is owned by the caller and freed with result_free. */
 C2MemFfiStatus c2_mem_ffi_endpoint_context_connection_snapshot(const C2MemFfiEndpointContext *endpoint, const char *route, C2MemFfiResult **out);
 C2MemFfiStatus c2_mem_ffi_endpoint_context_deactivate(const C2MemFfiEndpointContext *endpoint);
@@ -127,7 +134,8 @@ void c2_mem_ffi_endpoint_context_free(C2MemFfiEndpointContext *endpoint);
 C2MemFfiStatus c2_mem_ffi_call_begin(const C2MemFfiEndpointContext *endpoint, const char *route, const char *method, uint8_t server_stream, const uint64_t *timeout_millis, C2MemFfiCall **out, C2MemFfiError **error);
 C2MemFfiStatus c2_mem_ffi_call_charge_input(const C2MemFfiCall *call, uint64_t nbytes, C2MemFfiComplete complete, void *user);
 /* On success, dispatch returns JSON with the original call's selected target:
- * {path,serverId,serverInstanceId,connectionId}. connectionId is decimal text.
+ * {path,serverId,serverInstanceId,connectionId}. IPC identity fields are NULL
+ * in JSON for HTTP. connectionId, when present, is decimal text.
  * A failed call retains its original typed error; no target replaces it. */
 C2MemFfiStatus c2_mem_ffi_call_dispatch(const C2MemFfiCall *call, const uint8_t *data, size_t len, C2MemFfiComplete complete, void *user);
 C2MemFfiStatus c2_mem_ffi_call_next(const C2MemFfiCall *call, C2MemFfiComplete complete, void *user);
@@ -139,6 +147,24 @@ C2MemFfiStatus c2_mem_ffi_call_cancel(const C2MemFfiCall *call);
 C2MemFfiStatus c2_mem_ffi_call_observe(const C2MemFfiCall *call, const uint64_t *timeout_millis, C2MemFfiComplete complete, void *user);
 C2MemFfiStatus c2_mem_ffi_call_check_deadline(const C2MemFfiCall *call, C2MemFfiError **error);
 void c2_mem_ffi_call_free(C2MemFfiCall *call);
+/* Open a prepared route's topic and await READY. Options are a UTF-8 JSON
+ * object with optional start (latest or next) and onLag (skip or error).
+ * Defaults are latest and skip. Unknown keys are rejected. The nullable
+ * deadline in milliseconds covers opening and all deliveries. The result
+ * owns a subscription with JSON {startSeq,topic}. Sequence numbers are decimal
+ * strings. Only one next may be pending; it returns a local buffer and
+ * {seq,dropped}, or a structured terminal error. Later next calls return an
+ * empty result. Async entries retain native ownership until completion. */
+C2MemFfiStatus c2_mem_ffi_subscription_open(const C2MemFfiEndpointContext *endpoint, const char *route, const char *topic, const char *options_json, const uint64_t *timeout_millis, C2MemFfiComplete complete, void *user);
+C2MemFfiStatus c2_mem_ffi_subscription_next(const C2MemFfiSubscription *sub, C2MemFfiComplete complete, void *user);
+C2MemFfiStatus c2_mem_ffi_subscription_cancel(const C2MemFfiSubscription *sub);
+/* Cancel and observe the terminal record. NULL waits indefinitely and zero
+ * observes once. JSON is {completed,error,completeItems}. The item count is
+ * decimal text when known. The timeout bounds observation only. */
+C2MemFfiStatus c2_mem_ffi_subscription_close(const C2MemFfiSubscription *sub, const uint64_t *timeout_millis, C2MemFfiComplete complete, void *user);
+C2MemFfiStatus c2_mem_ffi_subscription_check_deadline(const C2MemFfiSubscription *sub, C2MemFfiError **error);
+/* Free submits cancellation without waiting. free(NULL) is safe. */
+void c2_mem_ffi_subscription_free(C2MemFfiSubscription *sub);
 /* Local bytes only: transport leases have already ended. SDK checked owners
  * must be invalidated and external views detached before buffer_release. */
 C2MemFfiStatus c2_mem_ffi_buffer_data(const C2MemFfiBuffer *buffer, const uint8_t **out_data, size_t *out_len);

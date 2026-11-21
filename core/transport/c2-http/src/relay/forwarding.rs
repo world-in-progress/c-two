@@ -183,6 +183,22 @@ impl ForwardingDomain {
         })
     }
 
+    /// Admit a downstream subscription and fence it against shutdown in the
+    /// same critical section used by other forwarding tasks.
+    pub(crate) fn admit_subscription(
+        &self,
+    ) -> Result<
+        (
+            OperationPermit,
+            tokio_util::task::task_tracker::TaskTrackerToken,
+        ),
+        RetentionError,
+    > {
+        let _admission = self.admission.lock();
+        let permit = self.budget.reserve_subscription_operation()?;
+        Ok((permit, self.tasks.token()))
+    }
+
     pub(crate) fn close(&self) {
         let _admission = self.admission.lock();
         self.budget.close_operations();

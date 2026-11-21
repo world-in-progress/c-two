@@ -1,10 +1,11 @@
-//! ABI 8: native client calls, with Rust owning the only physical IPC reader.
+//! ABI 9: native client calls and topic subscriptions.
 use super::*;
 use c2_contract::ExpectedRouteContract;
 use c2_core::{
     CallDispatchTarget, CallOptions, CallRecordOutcome, CallScope, CallState, CallTimeout, Client,
-    CoreResponseStream, Error, HeldResponse, LifecycleError, ObservedPath, PreparedCall, Runtime,
-    RuntimeOptions, TransportPhase,
+    Connect, CoreResponseStream, CoreTopicSubscription, Error, HeldResponse, LagPolicy,
+    LifecycleError, ObservedPath, PreparedCall, Runtime, RuntimeOptions, SubscribeOptions,
+    TopicStart, TransportPhase,
 };
 use c2_error::{C2Error, ErrorCode};
 use c2_ipc::IpcStreamCancellation;
@@ -26,27 +27,23 @@ struct Domain {
 pub struct C2MemFfiEndpointContext(Arc<Endpoint>);
 struct Endpoint {
     domain: Arc<Domain>,
-    address: String,
-    options: Value,
+    mode: Connect,
+    connect_timeout: Option<u64>,
+    expected_identity: Option<c2_core::ServerIdentity>,
     closed: AtomicBool,
-    preparing: AtomicUsize,
+    active: AtomicUsize,
     changed: Notify,
     bindings: Mutex<Bindings>,
     connection: Mutex<Option<Arc<c2_core::NativeEndpointContext>>>,
 }
 #[derive(Default)]
 struct Bindings {
-    clients: HashMap<String, BoundClient>,
-}
-#[derive(Clone)]
-struct BoundClient {
-    client: Client,
-    server_id: String,
-    server_instance_id: String,
-    observation: c2_core::ConnectionObservation,
+    clients: HashMap<String, Client>,
+    observations: HashMap<String, (c2_core::ServerIdentity, c2_core::ConnectionObservation)>,
 }
 pub struct C2MemFfiCall(Arc<Call>);
 struct Call {
+    endpoint: Arc<Endpoint>,
     state: Mutex<CallData>,
     scope: CallScope,
     stream_mode: bool,
@@ -62,11 +59,27 @@ struct CallData {
     dispatched: bool,
     ready: bool,
     stream: Option<Arc<CoreResponseStream>>,
+    stream_operation: Option<EndpointOperation>,
     unary: Option<HeldResponse>,
     dispatch_target: Option<CallDispatchTarget>,
     error: Option<Value>,
     consumer_done: bool,
 }
+pub struct C2MemFfiSubscription(Arc<Subscription>);
+struct Subscription {
+    core: CoreTopicSubscription,
+    operation: Mutex<Option<EndpointOperation>>,
+    next_active: AtomicBool,
+    consumer_done: AtomicBool,
+}
+
+struct SubscriptionNext(Arc<Subscription>);
+impl Drop for SubscriptionNext {
+    fn drop(&mut self) {
+        self.0.next_active.store(false, Ordering::Release);
+    }
+}
+
 pub struct C2MemFfiBuffer(HeldResponse);
 pub struct C2MemFfiError(CString);
 #[repr(C)]
@@ -74,6 +87,7 @@ pub struct C2MemFfiResult {
     pub buffer: *mut C2MemFfiBuffer,
     pub error: *mut C2MemFfiError,
     pub json: *const c_char,
+    pub subscription: *mut C2MemFfiSubscription,
 }
 pub type C2MemFfiComplete =
     Option<unsafe extern "C" fn(*mut std::ffi::c_void, *mut C2MemFfiResult)>;
@@ -81,6 +95,8 @@ enum Output {
     Empty,
     Json(Value),
     Buffer(HeldResponse),
+    Subscription(Arc<Subscription>),
+    Delivery(HeldResponse, Value),
     Error(Value),
 }
 
@@ -163,6 +179,7 @@ fn result(output: Result<Output, Error>) -> *mut C2MemFfiResult {
         buffer: ptr::null_mut(),
         error: ptr::null_mut(),
         json: ptr::null(),
+        subscription: ptr::null_mut(),
     };
     match output {
         Ok(Output::Empty) => {}
@@ -171,6 +188,17 @@ fn result(output: Result<Output, Error>) -> *mut C2MemFfiResult {
         }
         Ok(Output::Buffer(buffer)) => {
             result.buffer = Box::into_raw(Box::new(C2MemFfiBuffer(buffer)))
+        }
+        Ok(Output::Subscription(sub)) => {
+            let core = &sub.core;
+            let metadata =
+                json!({"startSeq": core.start_seq().to_string(), "topic": core.topic_name()});
+            result.json = CString::new(metadata.to_string()).expect("JSON").into_raw();
+            result.subscription = Box::into_raw(Box::new(C2MemFfiSubscription(sub)));
+        }
+        Ok(Output::Delivery(buffer, metadata)) => {
+            result.json = CString::new(metadata.to_string()).expect("JSON").into_raw();
+            result.buffer = Box::into_raw(Box::new(C2MemFfiBuffer(buffer)));
         }
         Ok(Output::Error(error)) => result.error = owned_error(error),
         Err(error) => result.error = owned_error(error_value(&error)),
@@ -325,16 +353,19 @@ fn timeout(value: *const u64) -> Option<Duration> {
     }
 }
 
-struct Preparing(Arc<Endpoint>);
-impl Drop for Preparing {
+struct EndpointOperation(Arc<Endpoint>);
+impl Drop for EndpointOperation {
     fn drop(&mut self) {
-        self.0.preparing.fetch_sub(1, Ordering::AcqRel);
+        self.0.active.fetch_sub(1, Ordering::AcqRel);
         self.0.changed.notify_waiters();
     }
 }
 impl Endpoint {
     fn deactivate(&self) {
-        self.closed.store(true, Ordering::Release);
+        {
+            let _bindings = self.bindings.lock();
+            self.closed.store(true, Ordering::Release);
+        }
         if let Some(connection) = self
             .connection
             .try_lock()
@@ -343,6 +374,23 @@ impl Endpoint {
             connection.deactivate();
         }
     }
+    fn require_open(&self) -> Result<(), Error> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(refused(
+                ErrorCode::ResourceClosed,
+                "endpoint is deactivated",
+            ));
+        }
+        Ok(())
+    }
+
+    fn begin_operation(self: &Arc<Self>) -> Result<EndpointOperation, Error> {
+        let _bindings = self.bindings.lock();
+        self.require_open()?;
+        self.active.fetch_add(1, Ordering::AcqRel);
+        Ok(EndpointOperation(self.clone()))
+    }
+
     fn prepare(
         &self,
         route: String,
@@ -352,7 +400,7 @@ impl Endpoint {
         if self.closed.load(Ordering::Acquire) {
             return Err(refused(
                 ErrorCode::ResourceClosed,
-                "IPC transport is deactivated",
+                "endpoint is deactivated",
             ));
         }
         let runtime = &self.domain.runtime;
@@ -364,75 +412,85 @@ impl Endpoint {
             abi_hash: field(&contract, "abiHash")?,
             signature_hash: field(&contract, "signatureHash")?,
         };
-        let supplied = self
-            .options
-            .get("expectedServerIdentity")
-            .map(|value| {
-                Ok::<_, Error>(c2_core::ServerIdentity {
-                    server_id: field(value, "serverId")?,
-                    server_instance_id: field(value, "serverInstanceId")?,
-                })
-            })
-            .transpose()?;
-        let connection = {
-            let mut connection = self.connection.lock();
-            if connection.is_none() {
-                *connection = Some(Arc::new(runtime.native_endpoint_context(
-                    &self.address,
-                    supplied,
-                    &attempt,
-                )?));
+        let client = if let Connect::DirectIpc { address } = &self.mode {
+            let connection = {
+                let mut connection = self.connection.lock();
+                if connection.is_none() {
+                    *connection = Some(Arc::new(runtime.native_endpoint_context(
+                        address,
+                        self.expected_identity.clone(),
+                        &attempt,
+                    )?));
+                }
+                connection.as_ref().unwrap().clone()
+            };
+            if self.closed.load(Ordering::Acquire) {
+                connection.deactivate();
+                return Err(refused(
+                    ErrorCode::ResourceClosed,
+                    "endpoint is deactivated",
+                ));
             }
-            connection.as_ref().unwrap().clone()
+            connection.prepare(expected, &attempt)?
+        } else {
+            runtime.connect_with_attempt(expected, self.mode.clone(), &attempt)?
         };
-        if self.closed.load(Ordering::Acquire) {
-            connection.deactivate();
-            return Err(refused(
-                ErrorCode::ResourceClosed,
-                "IPC transport is deactivated",
-            ));
-        }
-        let client = connection.prepare(expected, &attempt)?;
-        let identity = client
+        let ipc = client
             .ipc_server_identity()
-            .ok_or_else(|| invalid("IPC handshake identity missing"))?;
-        let observation = client.connection_observation()?;
+            .map(|identity| Ok::<_, Error>((identity, client.connection_observation()?)))
+            .transpose()?;
+        let mut prepared = target_json(
+            client.observed_path(),
+            ipc.as_ref()
+                .map(|(identity, observation)| (identity, observation.connection_id())),
+        );
+        if matches!(self.mode, Connect::DirectIpc { .. }) {
+            prepared
+                .as_object_mut()
+                .expect("target JSON object")
+                .remove("path");
+        }
         let mut bindings = self.bindings.lock();
         if self.closed.load(Ordering::Acquire) {
-            connection.deactivate();
             return Err(refused(
                 ErrorCode::ResourceClosed,
-                "IPC transport is deactivated",
+                "endpoint is deactivated",
             ));
         }
         if let Some(old) = bindings.clients.get(&route) {
-            if old.client.expected_route() != client.expected_route() {
+            if old.expected_route() != client.expected_route() {
                 return Err(refused(
                     ErrorCode::ContractMismatch,
                     "route contract changed",
                 ));
             }
         }
-        bindings.clients.insert(
-            route,
-            BoundClient {
-                client,
-                server_id: identity.server_id.clone(),
-                server_instance_id: identity.server_instance_id.clone(),
-                observation: observation.clone(),
-            },
-        );
-        Ok(
-            json!({"serverId":identity.server_id,"serverInstanceId":identity.server_instance_id,"connectionId":observation.connection_id().to_string()}),
-        )
+        bindings.observations.remove(&route);
+        if let Some(ipc) = ipc {
+            bindings.observations.insert(route.clone(), ipc);
+        }
+        bindings.clients.insert(route, client);
+        Ok(prepared)
     }
+
+    fn bound_client(&self, route: &str) -> Result<Client, Error> {
+        let bindings = self.bindings.lock();
+        self.require_open()?;
+        bindings
+            .clients
+            .get(route)
+            .cloned()
+            .ok_or_else(|| invalid("route must be prepared before starting an operation"))
+    }
+
     async fn close(&self) -> Result<(), Error> {
         self.deactivate();
+        self.bindings.lock().clients.clear();
         loop {
             let changed = self.changed.notified();
             tokio::pin!(changed);
             changed.as_mut().enable();
-            if self.preparing.load(Ordering::Acquire) == 0 {
+            if self.active.load(Ordering::Acquire) == 0 {
                 break;
             }
             changed.await;
@@ -463,6 +521,18 @@ impl Call {
         }
         self.changed.notify_waiters();
     }
+    fn drain_cancelled_stream(&self) {
+        let mut state = self.state.lock();
+        if let Some(operation) = state.stream_operation.take() {
+            let stream = state.stream.as_ref().expect("active stream").clone();
+            let executor = c2_core::native_client_executor().expect("running stream executor");
+            executor.spawn(async move {
+                let _operation = operation;
+                stream.close_with_timeout_async(None).await;
+            });
+        }
+    }
+
     async fn ready(&self) {
         loop {
             let changed = self.changed.notified();
@@ -528,6 +598,11 @@ impl Call {
             let receipt = stream
                 .close_with_timeout_async(limit.map(|l| l.saturating_sub(start.elapsed())))
                 .await;
+            if receipt.completed {
+                self.state.lock().stream_operation.take();
+            } else {
+                self.drain_cancelled_stream();
+            }
             let error = receipt
                 .terminal
                 .and_then(Result::err)
@@ -545,7 +620,7 @@ impl Call {
 }
 
 /// # Safety
-/// Inputs obey the ownership and callback rules in the ABI 8 C header.
+/// Inputs obey the ownership and callback rules in the ABI 9 C header.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn c2_mem_ffi_client_domain_new(
     context: *const C2MemFfiLocalEndpointContext,
@@ -660,12 +735,57 @@ pub unsafe extern "C" fn c2_mem_ffi_endpoint_context_new(
     }
     match unsafe {
         native(error, || {
+            let address = text(address)?;
+            let options = parse_options(
+                options,
+                &["connectTimeoutMs", "expectedServerIdentity", "mode"],
+            )?;
+            let mode = match (address.split_once("://"), options.get("mode")) {
+                (Some(("ipc", name)), None) if !name.is_empty() => Connect::DirectIpc { address },
+                (Some(("http" | "https", authority)), mode) if !authority.is_empty() => {
+                    match mode {
+                        None => Connect::RelayAwareAt {
+                            anchor_url: address,
+                        },
+                        Some(value) if value == "relay_aware" => Connect::RelayAwareAt {
+                            anchor_url: address,
+                        },
+                        Some(value) if value == "explicit_relay" => {
+                            Connect::ExplicitRelay { relay_url: address }
+                        }
+                        _ => return Err(invalid("invalid endpoint mode")),
+                    }
+                }
+                _ => {
+                    return Err(invalid(
+                        "expected an ipc:// endpoint without mode or an http(s):// endpoint",
+                    ));
+                }
+            };
+            let expected_identity = options
+                .get("expectedServerIdentity")
+                .map(|value| {
+                    if !matches!(mode, Connect::DirectIpc { .. }) {
+                        return Err(invalid(
+                            "expectedServerIdentity requires an ipc:// endpoint",
+                        ));
+                    }
+                    if value.as_object().is_none_or(|fields| fields.len() != 2) {
+                        return Err(invalid("invalid expectedServerIdentity"));
+                    }
+                    Ok(c2_core::ServerIdentity {
+                        server_id: field(value, "serverId")?,
+                        server_instance_id: field(value, "serverInstanceId")?,
+                    })
+                })
+                .transpose()?;
             Ok(C2MemFfiEndpointContext(Arc::new(Endpoint {
                 domain: (*domain).0.clone(),
-                address: text(address)?,
-                options: parse_options(options, &["connectTimeoutMs", "expectedServerIdentity"])?,
+                mode,
+                connect_timeout: unsigned_option(&options, "connectTimeoutMs")?,
+                expected_identity,
                 closed: AtomicBool::new(false),
-                preparing: AtomicUsize::new(0),
+                active: AtomicUsize::new(0),
                 changed: Notify::new(),
                 bindings: Mutex::new(Bindings::default()),
                 connection: Mutex::new(None),
@@ -697,7 +817,7 @@ pub unsafe extern "C" fn c2_mem_ffi_endpoint_context_prepare(
     let args = text(route).and_then(|route| {
         let contract = parse(contract)?;
         let mut options = c2_core::ConnectOptions::new();
-        let configured = unsigned_option(&endpoint.options, "connectTimeoutMs")?;
+        let configured = endpoint.connect_timeout;
         let per_call = if timeout_millis.is_null() {
             None
         } else {
@@ -706,14 +826,13 @@ pub unsafe extern "C" fn c2_mem_ffi_endpoint_context_prepare(
         if let Some(millis) = configured.into_iter().chain(per_call).min() {
             options = options.with_timeout(Duration::from_millis(millis));
         }
-        Ok((route, contract, c2_core::ConnectAttempt::start(options)?))
+        let attempt = c2_core::ConnectAttempt::start(options)?;
+        Ok((route, contract, attempt, endpoint.begin_operation()?))
     });
-    endpoint.preparing.fetch_add(1, Ordering::AcqRel);
-    let preparing = Preparing(endpoint.clone());
     launch(complete, user, async move {
-        let (route, contract, attempt) = args?;
+        let (route, contract, attempt, operation) = args?;
         tokio::task::spawn_blocking(move || {
-            let _preparing = preparing;
+            let _operation = operation;
             match endpoint.prepare(route, contract, attempt) {
                 Ok(value) => Ok(Output::Json(value)),
                 Err(error) => {
@@ -745,18 +864,17 @@ pub unsafe extern "C" fn c2_mem_ffi_endpoint_context_connection_snapshot(
             .0
             .bindings
             .lock()
-            .clients
+            .observations
             .get(&route)
             .cloned();
-        let output = binding.map(|bound| {
-            let end = bound
-                .observation
+        let output = binding.map(|(identity, observation)| {
+            let end = observation
                 .snapshot()
                 .map(|closed| closed.reason().as_str());
             Output::Json(json!({
-                "connectionId": bound.observation.connection_id().to_string(),
-                "serverId": bound.server_id,
-                "serverInstanceId": bound.server_instance_id,
+                "connectionId": observation.connection_id().to_string(),
+                "serverId": identity.server_id,
+                "serverInstanceId": identity.server_instance_id,
                 "endReason": end,
             }))
         });
@@ -818,25 +936,13 @@ pub unsafe extern "C" fn c2_mem_ffi_call_begin(
     match unsafe {
         native(error, || {
             let endpoint = &(*endpoint).0;
-            if endpoint.closed.load(Ordering::Acquire) {
-                return Err(refused(
-                    ErrorCode::ResourceClosed,
-                    "IPC transport is deactivated",
-                ));
-            }
             if stream > 1 {
                 return Err(invalid("invalid call mode"));
             }
             let route = text(route)?;
             let method = text(method)?;
-            let client = endpoint
-                .bindings
-                .lock()
-                .clients
-                .get(&route)
-                .cloned()
-                .ok_or_else(|| invalid("route must be prepared before call_begin"))?
-                .client;
+            let _operation = endpoint.begin_operation()?;
+            let client = endpoint.bound_client(&route)?;
             let client = client.with_call_options(CallOptions::with_timeout(
                 timeout(limit).map_or(CallTimeout::Unlimited, CallTimeout::After),
             ));
@@ -847,6 +953,7 @@ pub unsafe extern "C" fn c2_mem_ffi_call_begin(
             };
             let scope = prepared.scope();
             Ok(C2MemFfiCall(Arc::new(Call {
+                endpoint: endpoint.clone(),
                 state: Mutex::new(CallData {
                     prepared: Some(prepared),
                     charged: 0,
@@ -854,6 +961,7 @@ pub unsafe extern "C" fn c2_mem_ffi_call_begin(
                     dispatched: false,
                     ready: false,
                     stream: None,
+                    stream_operation: None,
                     unary: None,
                     dispatch_target: None,
                     error: None,
@@ -891,7 +999,8 @@ pub unsafe extern "C" fn c2_mem_ffi_call_charge_input(
     if complete.is_none() {
         return C2MemFfiStatus::NullPointer;
     }
-    let prepared = {
+    let operation = call.endpoint.begin_operation();
+    let prepared = operation.and_then(|operation| {
         let mut state = call.state.lock();
         let prepared = state
             .prepared
@@ -900,10 +1009,10 @@ pub unsafe extern "C" fn c2_mem_ffi_call_charge_input(
         if prepared.is_ok() {
             state.busy = true;
         }
-        prepared
-    };
+        prepared.map(|prepared| (prepared, operation))
+    });
     launch_call(call.clone(), complete, user, async move {
-        let mut prepared = prepared?;
+        let (mut prepared, _operation) = prepared?;
         let cancelled = call.changed.notified();
         tokio::pin!(cancelled);
         cancelled.as_mut().enable();
@@ -958,6 +1067,10 @@ pub unsafe extern "C" fn c2_mem_ffi_call_dispatch(
         return C2MemFfiStatus::NullPointer;
     }
     let call = unsafe { &*call }.0.clone();
+    let operation = match call.endpoint.begin_operation() {
+        Ok(operation) => operation,
+        Err(error) => return launch_call(call, complete, user, async { Err(error) }),
+    };
     let prepared = {
         let mut state = call.state.lock();
         if state.busy || state.charged < len as u64 || state.dispatched {
@@ -1014,16 +1127,21 @@ pub unsafe extern "C" fn c2_mem_ffi_call_dispatch(
             let mut state = original.state.lock();
             state.dispatch_target = outcome.dispatch_target;
             match outcome.result {
-                Ok((stream, unary)) => {
-                    state.stream = stream;
-                    state.unary = unary;
+                Ok((Some(stream), _)) => {
+                    state.stream_operation = Some(operation);
+                    state.stream = Some(stream);
                 }
+                Ok((None, unary)) => state.unary = unary,
                 Err(error) => {
                     state.error = Some(call_error_value(&original, &error));
                 }
             }
             state.ready = true;
             original.changed.notify_waiters();
+            drop(state);
+            if original.cancelled.load(Ordering::Acquire) {
+                original.drain_cancelled_stream();
+            }
         });
         call.ready_for_caller().await?;
         let state = call.state.lock();
@@ -1034,24 +1152,30 @@ pub unsafe extern "C" fn c2_mem_ffi_call_dispatch(
             .dispatch_target
             .as_ref()
             .ok_or_else(|| invalid("dispatch target missing"))?;
-        let ipc = target
-            .ipc
-            .as_ref()
-            .ok_or_else(|| invalid("IPC dispatch target missing"))?;
-        let path = match target.path {
-            ObservedPath::DirectIpc => "DirectIpc",
-            ObservedPath::ExplicitRelay => "ExplicitRelay",
-            ObservedPath::RelayAwareLocalIpc => "RelayAwareLocalIpc",
-            ObservedPath::RelayAwareRelay => "RelayAwareHttp",
-        };
-        Ok(Output::Json(json!({
-            "path": path,
-            "serverId": ipc.server_identity.server_id,
-            "serverInstanceId": ipc.server_identity.server_instance_id,
-            "connectionId": ipc.connection_id.to_string(),
-        })))
+        Ok(Output::Json(target_json(
+            target.path,
+            target
+                .ipc
+                .as_ref()
+                .map(|ipc| (ipc.server_identity.as_ref(), ipc.connection_id)),
+        )))
     })
 }
+fn target_json(path: ObservedPath, ipc: Option<(&c2_core::ServerIdentity, u64)>) -> Value {
+    let path = match path {
+        ObservedPath::DirectIpc => "DirectIpc",
+        ObservedPath::ExplicitRelay => "ExplicitRelay",
+        ObservedPath::RelayAwareLocalIpc => "RelayAwareLocalIpc",
+        ObservedPath::RelayAwareRelay => "RelayAwareHttp",
+    };
+    json!({
+        "path": path,
+        "serverId": ipc.map(|(identity, _)| &identity.server_id),
+        "serverInstanceId": ipc.map(|(identity, _)| &identity.server_instance_id),
+        "connectionId": ipc.map(|(_, id)| id.to_string()),
+    })
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn c2_mem_ffi_call_next(
     call: *const C2MemFfiCall,
@@ -1098,11 +1222,17 @@ pub unsafe extern "C" fn c2_mem_ffi_call_next(
         match outcome {
             Ok(Some(buffer)) => Ok(Output::Buffer(buffer)),
             Ok(None) => {
-                call.state.lock().consumer_done = true;
+                let mut state = call.state.lock();
+                state.consumer_done = true;
+                state.stream_operation.take();
                 Ok(Output::Empty)
             }
             Err(error) => {
-                call.state.lock().consumer_done = true;
+                let mut state = call.state.lock();
+                state.consumer_done = true;
+                if call.check_deadline().is_ok() {
+                    state.stream_operation.take();
+                }
                 Err(error)
             }
         }
@@ -1113,7 +1243,9 @@ pub unsafe extern "C" fn c2_mem_ffi_call_cancel(call: *const C2MemFfiCall) -> C2
     if call.is_null() {
         return C2MemFfiStatus::NullPointer;
     }
-    unsafe { &*call }.0.cancel();
+    let call = &unsafe { &*call }.0;
+    call.cancel();
+    call.drain_cancelled_stream();
     C2MemFfiStatus::Ok
 }
 #[unsafe(no_mangle)]
@@ -1152,8 +1284,190 @@ pub unsafe extern "C" fn c2_mem_ffi_call_free(call: *mut C2MemFfiCall) {
     if !call.is_null() {
         let call = unsafe { Box::from_raw(call) };
         call.0.cancel();
+        call.0.drain_cancelled_stream();
     }
 }
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn c2_mem_ffi_subscription_open(
+    endpoint: *const C2MemFfiEndpointContext,
+    route: *const c_char,
+    topic: *const c_char,
+    options: *const c_char,
+    limit: *const u64,
+    complete: C2MemFfiComplete,
+    user: *mut std::ffi::c_void,
+) -> C2MemFfiStatus {
+    if endpoint.is_null() || complete.is_none() {
+        return C2MemFfiStatus::NullPointer;
+    }
+    let started = Instant::now();
+    let endpoint = unsafe { &*endpoint }.0.clone();
+    let args = (|| {
+        let deadline = timeout(limit)
+            .map(|duration| c2_config::deadline_after(started, duration))
+            .transpose()
+            .map_err(|error| invalid(error.to_string()))?;
+        let route = text(route)?;
+        let topic = text(topic)?;
+        let options = parse_options(options, &["start", "onLag"])?;
+        let start = match options.get("start") {
+            None => TopicStart::Latest,
+            Some(value) if value == "latest" => TopicStart::Latest,
+            Some(value) if value == "next" => TopicStart::Next,
+            _ => return Err(invalid("invalid subscription start")),
+        };
+        let on_lag = match options.get("onLag") {
+            None => LagPolicy::Skip,
+            Some(value) if value == "skip" => LagPolicy::Skip,
+            Some(value) if value == "error" => LagPolicy::Error,
+            _ => return Err(invalid("invalid subscription onLag")),
+        };
+        let operation = endpoint.begin_operation()?;
+        Ok::<_, Error>((
+            route,
+            topic,
+            SubscribeOptions { start, on_lag },
+            deadline,
+            operation,
+        ))
+    })();
+    launch(complete, user, async move {
+        let (route, topic, options, deadline, operation) = args?;
+        let client = endpoint.bound_client(&route)?;
+        let call_options =
+            CallOptions::with_timeout(deadline.map_or(CallTimeout::Unlimited, |deadline| {
+                CallTimeout::After(deadline.saturating_duration_since(Instant::now()))
+            }));
+        let core = client
+            .subscribe_async(&topic, options, call_options)
+            .await?;
+        Ok(Output::Subscription(Arc::new(Subscription {
+            core,
+            operation: Mutex::new(Some(operation)),
+            next_active: AtomicBool::new(false),
+            consumer_done: AtomicBool::new(false),
+        })))
+    })
+}
+
+impl Subscription {
+    fn drain_cancelled(self: &Arc<Self>) {
+        let _ = self.core.cancel();
+        if let Some(operation) = self.operation.lock().take() {
+            let sub = self.clone();
+            let executor =
+                c2_core::native_client_executor().expect("running subscription executor");
+            executor.spawn(async move {
+                let _operation = operation;
+                sub.core.close_with_timeout_async(None).await;
+            });
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn c2_mem_ffi_subscription_next(
+    sub: *const C2MemFfiSubscription,
+    complete: C2MemFfiComplete,
+    user: *mut std::ffi::c_void,
+) -> C2MemFfiStatus {
+    if sub.is_null() || complete.is_none() {
+        return C2MemFfiStatus::NullPointer;
+    }
+    let sub = unsafe { &*sub }.0.clone();
+    if sub.next_active.swap(true, Ordering::AcqRel) {
+        return launch(complete, user, async {
+            Err(invalid("concurrent next on one subscription"))
+        });
+    }
+    let active = SubscriptionNext(sub);
+    launch(complete, user, async move {
+        let sub = &active.0;
+        if sub.consumer_done.load(Ordering::Acquire) {
+            return Ok(Output::Empty);
+        }
+        match sub.core.next_delivery_async().await {
+            Ok(delivery) => {
+                let metadata = json!({"seq": delivery.seq().to_string(), "dropped": delivery.dropped().to_string()});
+                Ok(Output::Delivery(delivery.into_held(), metadata))
+            }
+            Err(error) => {
+                sub.consumer_done.store(true, Ordering::Release);
+                if sub.core.check_deadline().is_ok() {
+                    sub.operation.lock().take();
+                }
+                Err(error)
+            }
+        }
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn c2_mem_ffi_subscription_cancel(
+    sub: *const C2MemFfiSubscription,
+) -> C2MemFfiStatus {
+    if sub.is_null() {
+        return C2MemFfiStatus::NullPointer;
+    }
+    unsafe { &*sub }.0.drain_cancelled();
+    C2MemFfiStatus::Ok
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn c2_mem_ffi_subscription_close(
+    sub: *const C2MemFfiSubscription,
+    limit: *const u64,
+    complete: C2MemFfiComplete,
+    user: *mut std::ffi::c_void,
+) -> C2MemFfiStatus {
+    if sub.is_null() || complete.is_none() {
+        return C2MemFfiStatus::NullPointer;
+    }
+    let sub = unsafe { &*sub }.0.clone();
+    let limit = timeout(limit);
+    let _ = sub.core.cancel();
+    launch(complete, user, async move {
+        let receipt = sub.core.close_with_timeout_async(limit).await;
+        if receipt.completed {
+            sub.operation.lock().take();
+        } else {
+            sub.drain_cancelled();
+        }
+        let error = receipt
+            .terminal
+            .and_then(Result::err)
+            .as_ref()
+            .map(error_value);
+        Ok(Output::Json(json!({
+            "completed": receipt.completed,
+            "error": error,
+            "completeItems": receipt.complete_items.map(|count| count.to_string()),
+        })))
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn c2_mem_ffi_subscription_check_deadline(
+    sub: *const C2MemFfiSubscription,
+    error: *mut *mut C2MemFfiError,
+) -> C2MemFfiStatus {
+    if sub.is_null() {
+        return C2MemFfiStatus::NullPointer;
+    }
+    match unsafe { native(error, || (&*sub).0.core.check_deadline()) } {
+        Ok(()) => C2MemFfiStatus::Ok,
+        Err(status) => status,
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn c2_mem_ffi_subscription_free(sub: *mut C2MemFfiSubscription) {
+    if !sub.is_null() {
+        let sub = unsafe { Box::from_raw(sub) };
+        sub.0.drain_cancelled();
+    }
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn c2_mem_ffi_buffer_data(
     buffer: *const C2MemFfiBuffer,
@@ -1196,6 +1510,7 @@ pub unsafe extern "C" fn c2_mem_ffi_result_free(value: *mut C2MemFfiResult) {
         let value = unsafe { Box::from_raw(value) };
         unsafe {
             c2_mem_ffi_buffer_release(value.buffer);
+            c2_mem_ffi_subscription_free(value.subscription);
             c2_mem_ffi_error_free(value.error);
             if !value.json.is_null() {
                 drop(CString::from_raw(value.json.cast_mut()));

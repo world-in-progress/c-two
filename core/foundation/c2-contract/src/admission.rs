@@ -14,6 +14,9 @@ pub const MAX_CONTRACT_NESTED_FASTDB_BYTES: u64 = 16 * 1024 * 1024;
 /// metadata.
 pub const MAX_CONTRACT_METHODS: usize = 256;
 
+/// Hard topic count cap per contract descriptor.
+pub const MAX_CONTRACT_TOPICS: usize = 256;
+
 /// Stable resource dimension reported by [`ContractError::LimitExceeded`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ContractLimitMetric {
@@ -25,6 +28,8 @@ pub enum ContractLimitMetric {
     JsonDepth,
     /// Entries in the outer contract `methods` array.
     Methods,
+    /// Entries in the outer contract `topics` array.
+    Topics,
     /// Canonical extracted bytes across every nested FastDB binding occurrence.
     NestedFastDbBytes,
 }
@@ -36,6 +41,7 @@ impl ContractLimitMetric {
             Self::JsonValues => "json_values",
             Self::JsonDepth => "json_depth",
             Self::Methods => "methods",
+            Self::Topics => "topics",
             Self::NestedFastDbBytes => "nested_fastdb_bytes",
         }
     }

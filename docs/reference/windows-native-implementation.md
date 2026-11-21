@@ -4,6 +4,10 @@ This reference owns the Windows native transport, memory, endpoint identity, and
 
 Windows development machines can use the [shared local test sidecar](local-development-testing.md), which reuses the macOS/Unix Python executor with native Windows process and file-lock adapters. Its development reports are separate from the historical hosted and formal release evidence below.
 
+## Current source (unreleased after 0.11.0)
+
+The source tree after C-Two 0.11.0 moves the RPC IPC handshake to 17 and the Node C/FFI ABI to 9, adding resource-owned publish/subscribe topics ([ADR 0005](../decisions/0005-publish-subscribe.md)); SHM 4, relay mesh 7, the TokenUser-scoped endpoint naming and the native security model are unchanged. Named Pipe behavior stays on the same transport: subscriptions use the sealed multi-loan SHM discipline with per-connection loans, cross-session subscribers that cannot share Local mappings receive the sealed value inline or in chunks, and the fixed version preamble reports an IPC 16 peer with the typed version-mismatch error. The changes and their Windows gates are collected in the [unreleased notes](../releases/unreleased.md); the sections below retain their historical release claims unchanged.
+
 ## C-Two 0.11.0 release (2026-11-20)
 
 C-Two 0.11.0 / c3 0.7.0 (`50be9a7966d6c8381715809440d69502c3cee5de`) updates `mio` to 1.2.4 to fix a Windows Named Pipe use-after-free race confirmed by crash dump (`0xC0000005` during listener close and pipe disconnect; three earlier dump-less `0xC0000374` events remain separately tracked in the backlog), defers server post-peer-close write errors (`109` / `232`) to the reader so `DISCONNECT` wins over a failed reply flush, discards unread request bodies on relays before sending pre-dispatch refusals so Windows clients receive the refusal instead of a connection reset, and adopts IPC 16, SHM 4, C/FFI ABI 8, relay mesh 7 and per-role `(M, F, N)` budgets; see the [0.11.0 release notes](../releases/0.11.0.md) and [0.11.0 acceptance record](../acceptance/2026-11-20-0110-release-acceptance.md).

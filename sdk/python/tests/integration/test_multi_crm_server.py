@@ -70,11 +70,12 @@ def single_then_add_addr():
 
 class TestRegistrationAPI:
 
-    def test_register_returns_name(self):
+    def test_register_returns_registration_handle(self):
         addr = f'ipc://{_unique_region()}'
         server = local_server(addr)
         result = server.register_crm(Hello, HelloImpl(), name='hello')
-        assert result == 'hello'
+        assert result.route_name == 'hello'
+        assert result.is_closed is False
         server.shutdown()
 
     def test_duplicate_name_raises(self):

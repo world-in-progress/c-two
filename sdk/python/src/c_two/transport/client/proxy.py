@@ -104,6 +104,7 @@ class CRMProxy:
         '_closed_event', '_close_lock', '_on_terminate',
         '_scheduler', '_local_copy_tracker', '_call_options',
         '_call_timeout', '_call_budget', '_following_local',
+        '_topic_bindings',
     )
 
     # ------------------------------------------------------------------
@@ -119,6 +120,7 @@ class CRMProxy:
         scheduler: Scheduler | None = None,
         on_terminate: Callable[[], None] | None = None,
         local_copy_tracker: Any = None,
+        topic_bindings: Any = None,
         following_local: _FollowingLocalRoute | None = None,
     ) -> CRMProxy:
         """Create a thread-local proxy (same process, no serialization).
@@ -151,6 +153,7 @@ class CRMProxy:
         proxy._call_timeout = ...
         proxy._call_budget = None
         proxy._following_local = following_local
+        proxy._topic_bindings = topic_bindings
         return proxy
 
     @classmethod
@@ -161,6 +164,7 @@ class CRMProxy:
         *,
         on_terminate: Callable[[], None] | None = None,
         local_copy_tracker: Any = None,
+        topic_bindings: Any = None,
     ) -> CRMProxy:
         """Create an IPC proxy (cross-process via Rust IPC client).
 
@@ -183,6 +187,7 @@ class CRMProxy:
         proxy._call_timeout = ...
         proxy._call_budget = None
         proxy._following_local = None
+        proxy._topic_bindings = topic_bindings
         return proxy
 
     @classmethod
@@ -193,6 +198,7 @@ class CRMProxy:
         *,
         on_terminate: Callable[[], None] | None = None,
         local_copy_tracker: Any = None,
+        topic_bindings: Any = None,
     ) -> CRMProxy:
         """Create an HTTP proxy (cross-node via Rust HTTP client + relay).
 
@@ -213,6 +219,7 @@ class CRMProxy:
         proxy._call_timeout = ...
         proxy._call_budget = None
         proxy._following_local = None
+        proxy._topic_bindings = topic_bindings
         return proxy
 
     # ------------------------------------------------------------------
@@ -463,6 +470,103 @@ class CRMProxy:
             ):
                 raise _LocalRouteClosed() from exc
             raise
+
+    def subscribe(
+        self,
+        topic: str,
+        *,
+        start: str = 'latest',
+        on_lag: str = 'skip',
+        timeout=...,
+        hold: bool = False,
+    ):
+        """Attach to one topic declared on this proxy's contract.
+
+        Same-process connections attach directly to the route's current
+        registration; remote connections subscribe over IPC 17 / relay HTTP.
+        Each call creates one subscription spanning at most one registration:
+        unregistering the route or stopping the host ends it with
+        ``CallCancelled`` (718), a lagging ``on_lag='error'`` policy ends it
+        with ``SubscriptionLagged`` (720), and a later ``subscribe()`` follows
+        the current registration.
+
+        ``hold=True`` retains each delivery's local copy, yielding
+        ``Delivery[HeldResult[T]]`` whose ``.value`` owns the release.
+        """
+        from ..topic import Subscription
+
+        with self._close_lock:
+            if self._closed:
+                raise _closed_proxy_error()
+        state = self._following_local
+        target = self.resolve_for_call() if state is not None else self
+        if target._mode == 'thread':
+            if state is None:
+                from ...error import UnsupportedCallMode
+                raise UnsupportedCallMode(
+                    'topic subscription requires a registered route; this '
+                    'thread-local proxy has none',
+                )
+            if timeout is ...:
+                # Inherit this view's call options, mirroring how direct
+                # calls validate a with_call_options view's policy.
+                from ..._native import NativeCallOptions
+
+                _native_call(
+                    (target._call_options or NativeCallOptions()).validate_thread,
+                )
+            elif timeout is not None:
+                from ...error import UnsupportedCallMode
+                raise UnsupportedCallMode(
+                    'finite subscription timeout is unsupported for '
+                    'same-process subscriptions',
+                )
+            binding = self._require_topic_binding(topic)
+            from ...crm.contract import crm_contract
+
+            expected = crm_contract(state.crm_class)
+            native = _native_call(
+                state.session.subscribe_local_route,
+                self._name,
+                *expected.native_args(),
+                topic,
+                start,
+                on_lag,
+            )
+            return Subscription(
+                native,
+                binding,
+                held=hold,
+                tracker=self._local_copy_tracker,
+                route_name=self._name,
+                local=True,
+            )
+        binding = self._require_topic_binding(topic)
+        native = _native_call(
+            target._client.subscribe,
+            topic,
+            start,
+            on_lag,
+            timeout,
+        )
+        return Subscription(
+            native,
+            binding,
+            held=hold,
+            tracker=self._local_copy_tracker,
+            route_name=self._name,
+            local=False,
+        )
+
+    def _require_topic_binding(self, topic: str):
+        binding = (self._topic_bindings or {}).get(topic)
+        if binding is None:
+            from ...error import ProtocolViolation
+            raise ProtocolViolation(
+                f'topic {topic!r} is not declared on the contract '
+                f'of route {self._name!r}',
+            )
+        return binding
 
     def call(self, method_name: str, data: bytes | bytearray | memoryview | None = None) -> bytes:
         """Send a serialized CRM call (IPC or HTTP mode).

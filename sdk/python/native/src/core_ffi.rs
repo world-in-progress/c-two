@@ -345,6 +345,41 @@ impl PyCoreClient {
         self.begin_call(py, method_name)?.call(py, data)
     }
 
+    /// Subscribe to a topic declared on this client's bound route contract.
+    ///
+    /// Waits for the server `READY(start_seq)` before returning, so an empty
+    /// topic confirms attachment immediately. `timeout` follows the same
+    /// convention as `with_call_options`: omitted inherits the path policy,
+    /// `None` selects an unbounded subscription.
+    #[pyo3(signature = (topic, start="latest", on_lag="skip", timeout=inherit_timeout()))]
+    fn subscribe(
+        &self,
+        py: Python<'_>,
+        topic: &str,
+        start: &str,
+        on_lag: &str,
+        timeout: Py<PyAny>,
+    ) -> PyResult<crate::topic_ffi::PyTopicSubscription> {
+        let options = crate::topic_ffi::subscribe_options(start, on_lag)?;
+        // An omitted timeout inherits this view's bound `CallOptions`
+        // (preserving `with_call_options`), exactly like unary calls; only an
+        // explicit `None` or numeric timeout constructs an overriding policy.
+        let inherited = timeout.bind(py).is(&py.Ellipsis());
+        let explicit = if inherited {
+            None
+        } else {
+            Some(call_options(py, &timeout)?)
+        };
+        let client = self.client().map_err(core_error_to_py)?;
+        let subscription = py
+            .detach(move || match explicit {
+                None => client.subscribe(topic, options),
+                Some(call_options) => client.subscribe_with_options(topic, options, call_options),
+            })
+            .map_err(core_error_to_py)?;
+        Ok(crate::topic_ffi::PyTopicSubscription::new(subscription))
+    }
+
     fn close(&self) {
         let closed = self.inner.lock().take();
         drop(closed);

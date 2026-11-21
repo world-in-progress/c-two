@@ -25,8 +25,12 @@ pub mod sync_client;
 mod tests;
 
 pub use c2_local::{ConnectionClosed, ConnectionEndReason, ConnectionObservation};
-pub use client::forward::{ForwardRecord, IpcForwardCancellation, IpcForwardStream};
+pub use client::forward::{
+    ForwardRecord, ForwardTopicRecord, IpcForwardCancellation, IpcForwardStream, IpcForwardTopic,
+    IpcTopicSynchronizer,
+};
 pub use client::stream::{IpcResponseStream, IpcStreamCancellation, StreamTerminal};
+pub use client::subscribe::{IpcSubscribeCancellation, IpcTopicDelivery, IpcTopicSubscription};
 pub use client::{IpcCallControl, IpcClient, IpcError, MethodTable, RouteBinding, ServerPoolState};
 pub use control::{
     DirectIpcShutdownOutcome, local_endpoint_from_ipc_address, ping, ping_with_context,

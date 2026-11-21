@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use c2_config::IPC_RELEASE_BATCH_CAPACITY;
-use c2_mem::{MemHandle, MemPool};
+use c2_mem::{MemHandle, MemPool, SharedShmLoan};
 use parking_lot::{Mutex, RwLock};
 
 use crate::frame::{FrameHeader, HEADER_SIZE};
@@ -28,6 +28,7 @@ pub enum ConnectionSide {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConnectionError {
     ProtocolViolation(String),
+    SubscriptionCancelled,
     BeforeHandshake,
     Deactivated,
     PeerEnded,
@@ -42,6 +43,7 @@ impl std::fmt::Display for ConnectionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::ProtocolViolation(message) => write!(f, "ProtocolViolation: {message}"),
+            Self::SubscriptionCancelled => f.write_str("subscription cancelled"),
             Self::BeforeHandshake => f.write_str("frame before handshake"),
             Self::Deactivated => f.write_str("physical connection is deactivated"),
             Self::PeerEnded => f.write_str("peer has ended"),
@@ -56,16 +58,32 @@ impl std::fmt::Display for ConnectionError {
 
 impl std::error::Error for ConnectionError {}
 
+enum AllocationOwner {
+    Exclusive {
+        pool: Arc<RwLock<MemPool>>,
+        handle: Option<MemHandle>,
+    },
+    Shared(Option<SharedShmLoan>),
+}
+
 struct Allocation {
-    pool: Arc<RwLock<MemPool>>,
-    handle: Option<MemHandle>,
+    owner: AllocationOwner,
     published: bool,
 }
 
 impl Allocation {
     fn release(&mut self) {
-        if let Some(handle) = self.handle.take() {
-            self.pool.write().release_handle(handle);
+        match &mut self.owner {
+            AllocationOwner::Exclusive { pool, handle } => {
+                if let Some(handle) = handle.take() {
+                    pool.write().release_handle(handle);
+                }
+            }
+            AllocationOwner::Shared(loan) => {
+                if let Some(loan) = loan.take() {
+                    loan.settle();
+                }
+            }
         }
     }
 }
@@ -75,6 +93,8 @@ impl Drop for Allocation {
         // A prepared allocation was never exposed. Published allocations may
         // only be reused after a release record or peer end. Final connection
         // Drop therefore leaves any unconfirmed allocation to pool teardown.
+        // For SharedShmLoan, dropping without `settle()` intentionally leaves
+        // its reference pinned in the SealedShmBlock as well.
         if !self.published {
             self.release();
         }
@@ -91,7 +111,8 @@ enum WriterState {
     Broken,
 }
 
-/// Snapshot of one server stream's demand, admitted item and granted storage.
+/// Snapshot of one server stream or topic subscription's demand, admitted item
+/// and granted storage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StreamState {
     pub demand: u64,
@@ -101,6 +122,7 @@ pub struct StreamState {
     pub complete_items: u64,
     pub cancelled: bool,
     pub producing: bool,
+    pub subscription: bool,
 }
 
 #[derive(Default)]
@@ -164,8 +186,20 @@ impl ConnectionCore {
         Ok(())
     }
 
-    /// Register a call admitted after handshake. The first item has demand.
+    /// Register a server-stream call admitted after handshake. The first item
+    /// has initial demand.
     pub fn stream_open(&self, id: u64) -> Result<(), ConnectionError> {
+        self.open_stream_entry(id, false)
+    }
+
+    /// Register a topic subscription admitted after handshake. Subscriptions
+    /// have initial demand `1` and begin items directly from demand without a
+    /// server-side resource step.
+    pub fn subscribe_open(&self, id: u64) -> Result<(), ConnectionError> {
+        self.open_stream_entry(id, true)
+    }
+
+    fn open_stream_entry(&self, id: u64, subscription: bool) -> Result<(), ConnectionError> {
         let mut state = self.shared.state.lock();
         check_business(&state)?;
         if id == 0 || state.streams.contains_key(&id) {
@@ -185,6 +219,7 @@ impl ConnectionCore {
                 complete_items: 0,
                 cancelled: false,
                 producing: false,
+                subscription,
             },
         );
         Ok(())
@@ -197,6 +232,9 @@ impl ConnectionCore {
         }
         let mut state = self.shared.state.lock();
         let stream = stream_mut(&mut state, id)?;
+        if stream.subscription {
+            return Err(stream_violation("subscriptions have no resource step"));
+        }
         if stream.cancelled
             || stream.producing
             || stream.total_bytes.is_some()
@@ -213,18 +251,32 @@ impl ConnectionCore {
     pub fn stream_begin_item(&self, id: u64, total_bytes: u64) -> Result<(), ConnectionError> {
         let mut state = self.shared.state.lock();
         let stream = stream_mut(&mut state, id)?;
+        if self.shared.side == ConnectionSide::Server && stream.subscription && stream.cancelled {
+            return Err(ConnectionError::SubscriptionCancelled);
+        }
         if stream.total_bytes.is_some() {
             return Err(stream_violation("item already active"));
         }
-        match self.shared.side {
-            ConnectionSide::Server if !stream.producing => {
-                return Err(stream_violation("item without resource step"));
+        let consume_demand = match self.shared.side {
+            ConnectionSide::Server if stream.subscription => {
+                if stream.demand == 0 {
+                    return Err(stream_violation("subscription item without demand"));
+                }
+                true
             }
-            ConnectionSide::Client if stream.demand == 0 => {
-                return Err(stream_violation("item without demand"));
+            ConnectionSide::Server => {
+                if !stream.producing {
+                    return Err(stream_violation("item without resource step"));
+                }
+                false
             }
-            _ => {}
-        }
+            ConnectionSide::Client => {
+                if stream.demand == 0 {
+                    return Err(stream_violation("item without demand"));
+                }
+                true
+            }
+        };
         let next_count = if total_bytes == 0 {
             Some(
                 stream
@@ -235,7 +287,7 @@ impl ConnectionCore {
         } else {
             None
         };
-        if self.shared.side == ConnectionSide::Client {
+        if consume_demand {
             stream.demand = 0;
         } else {
             stream.producing = false;
@@ -402,22 +454,67 @@ impl ConnectionCore {
         pool: Arc<RwLock<MemPool>>,
         handle: MemHandle,
     ) -> Result<PreparedLoan, ConnectionError> {
-        self.prepare_loan_from(pool, handle, &LOAN_SEQUENCE)
+        self.prepare_allocation_from(
+            Allocation {
+                owner: AllocationOwner::Exclusive {
+                    pool,
+                    handle: Some(handle),
+                },
+                published: false,
+            },
+            &LOAN_SEQUENCE,
+        )
     }
 
+    /// Register one independent per-connection loan over a [`c2_mem::SealedShmBlock`].
+    ///
+    /// Pre-publication cancellation settles this loan immediately. Once
+    /// `begin_io()` publishes it, only a valid `RELEASE` for this loan ID or
+    /// read-side `peer_end()` settles it; dropping the connection with an
+    /// unconfirmed published loan leaves the shared block pinned (ADR 0001).
+    pub fn prepare_shared_loan(&self, loan: SharedShmLoan) -> Result<PreparedLoan, ConnectionError> {
+        self.prepare_allocation_from(
+            Allocation {
+                owner: AllocationOwner::Shared(Some(loan)),
+                published: false,
+            },
+            &LOAN_SEQUENCE,
+        )
+    }
+
+    /// True while `loan_id` is still prepared or published on this connection.
+    pub fn is_loan_live(&self, loan_id: u64) -> bool {
+        let state = self.shared.state.lock();
+        state.prepared.contains_key(&loan_id) || state.published.contains_key(&loan_id)
+    }
+
+    #[cfg(test)]
     fn prepare_loan_from(
         &self,
         pool: Arc<RwLock<MemPool>>,
         handle: MemHandle,
         sequence: &AtomicU64,
     ) -> Result<PreparedLoan, ConnectionError> {
+        self.prepare_allocation_from(
+            Allocation {
+                owner: AllocationOwner::Exclusive {
+                    pool,
+                    handle: Some(handle),
+                },
+                published: false,
+            },
+            sequence,
+        )
+    }
+
+    fn prepare_allocation_from(
+        &self,
+        allocation: Allocation,
+        sequence: &AtomicU64,
+    ) -> Result<PreparedLoan, ConnectionError> {
         // Declared before any connection guard, so rejection releases the
         // local allocation only after that guard has been dropped.
-        let allocation = Allocation {
-            pool,
-            handle: Some(handle),
-            published: false,
-        };
+        let allocation = allocation;
         let result = (|| {
             let mut state = self.shared.state.lock();
             check_business(&state)?;

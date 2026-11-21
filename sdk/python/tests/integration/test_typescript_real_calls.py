@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from contextlib import nullcontext
+from contextlib import ExitStack, nullcontext
 from copy import deepcopy
 from dataclasses import dataclass
 import hashlib
@@ -17,10 +17,15 @@ from typing import Any, Iterator
 import pytest
 
 import c_two as cc
+from c_two.crm.descriptor import export_descriptor
 from c_two.transport.registry import _reset_default_runtime
+from fastdb4py.payload import Payload
 from tests.fixtures.ipc_version_peer import ipc_version_peer_binary, running_version_peer
+from tests.fixtures.process_control import readline_with_timeout
 from tests.fixtures.typescript_project import write_node_tsconfig
-from tests.fixtures.portable_interop import FASTDB_REPOSITORY, logical_result_sha256
+from tests.fixtures.portable_interop import (
+    FASTDB_REPOSITORY, RECORD_SPEC, build_record_payload, logical_result_sha256,
+)
 from tests.fixtures.portable_matrix import (
     CRM_CLASSES,
     DESCRIPTOR_PATHS,
@@ -635,19 +640,218 @@ def test_typescript_real_connector_version_mismatch(
           await assert.rejects(transport.prepare('version', contract.CONTRACT), (error) => {
             assert.ok(error instanceof contract.C2IpcTransportError);
             assert.equal(error.category, 'protocol_version_mismatch');
-            assert.equal(error.localProtocolVersion, 16);
-            assert.equal(error.peerProtocolVersion, 17);
+            assert.equal(error.localProtocolVersion, 17);
+            assert.equal(error.peerProtocolVersion, 16);
             return true;
           });
           assert.equal(connects, 1);
         } finally { await transport.close(); await connector.close(); }
         """), encoding="utf-8")
-    with running_version_peer(ipc_version_peer_binary, "mismatch17") as (address, context):
+    with running_version_peer(ipc_version_peer_binary, "mismatch16") as (address, context):
         _run_checked(
             [typescript_artifacts.node_binary, str(script),
              str(typescript_artifacts.contract_modules["no-payload"]), address, context.root or ""],
             cwd=typescript_artifacts.node_root, timeout=10,
         )
+
+
+def test_generated_typescript_subscribes_via_ipc_and_two_relay_anchors(
+    typescript_artifacts: TypeScriptArtifacts, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    @cc.crm(namespace="test.portable-matrix.typescript", version="0.1.0")
+    class Telemetry:
+        @cc.transfer(output=RECORD_SPEC)
+        @cc.topic
+        def state(self) -> Payload: ...
+
+    artifacts = typescript_artifacts
+    root = artifacts.node_root
+    contract = root / "topic.contract.json"
+    contract.write_text(export_descriptor(Telemetry), encoding="utf-8")
+    _run_checked(
+        [str(artifacts.matrix.c3_binary), "contract", "codegen", "typescript",
+         str(contract), "--out-dir", str(root / "generated" / "topic")],
+        cwd=root, environment=_process_environment(),
+    )
+    _run_checked(
+        [artifacts.node_binary, str(root / "node_modules/typescript/bin/tsc"),
+         "--project", str(write_node_tsconfig(root))],
+        cwd=root, timeout=300,
+    )
+
+    script = root / "subscribe.mjs"
+    script.write_text(dedent("""\
+        import assert from 'node:assert/strict';
+        import {createInterface} from 'node:readline';
+        import {initPayload} from 'fastdb4ts/payload';
+        import {createNodeIpcConnector} from '@c-two/c2-mem-ffi';
+        import * as generated from './dist/topic/typescript/c_two_contract.js';
+
+        const [address, first, second, localRoot, expected, firstRoute, secondRoute] = process.argv.slice(2);
+        await initPayload();
+        const connector = createNodeIpcConnector({
+          ...(localRoot ? {ipcRoot: localRoot} : {}), maxOutstandingCalls: 3,
+        });
+        const prepared = [];
+        const connect = async (...args) => {
+          const endpoint = await connector(...args);
+          return new Proxy(endpoint, {
+            get(target, name) {
+              if (name === 'prepare') return async (...values) => {
+                const result = await target.prepare(...values);
+                prepared.push(result);
+                return result;
+              };
+              const value = Reflect.get(target, name);
+              return typeof value === 'function' ? value.bind(target) : value;
+            },
+          });
+        };
+        const fetch = () => { throw new Error('unexpected JavaScript HTTP request'); };
+        const direct = generated.createIpcEncodedTransport(address, {connect});
+        const local = generated.createRelayAwareHttpEncodedTransport(first, {connect, fetch});
+        const fallback = generated.createRelayAwareHttpEncodedTransport(second, {connect, fetch});
+        const explicit = generated.createHttpRelayEncodedTransport(first, {connect, fetch});
+        const directClient = new generated.ContractClient(direct, firstRoute);
+        const localClient = new generated.ContractClient(local, firstRoute);
+        const fallbackClient = new generated.ContractClient(fallback, secondRoute);
+        const explicitClient = new generated.ContractClient(explicit, firstRoute);
+        const controls = createInterface({input: process.stdin});
+        const replies = controls[Symbol.asyncIterator]();
+        const host = async command => {
+          console.log(command);
+          assert.equal((await replies.next()).value, 'ok');
+        };
+        const opened = [];
+        const track = promise => promise.then(sub => { opened.push(sub); return sub; });
+        const options = {timeoutMs: 10_000};
+        const verify = (delivery, payload = delivery.value) => {
+          assert.equal(delivery.seq, 1n);
+          assert.equal(delivery.dropped, 0n);
+          assert.ok(Object.isFrozen(delivery));
+          assert.equal(Buffer.from(payload.binaryBytes()).toString('hex'), expected);
+        };
+        try {
+          const [localSub, fallbackSub] = await Promise.all([
+            track(localClient.hold_subscribe_topic_0_state(options)),
+            track(fallbackClient.subscribe_topic_0_state(options)),
+          ]);
+          const paths = prepared.map(result => result.path);
+          assert.ok(paths.includes('RelayAwareLocalIpc'));
+          assert.ok(paths.includes(localRoot ? 'RelayAwareHttp' : 'RelayAwareLocalIpc'));
+          assert.equal(connector.stats().call_execution.used_operations, '2');
+          await assert.rejects(explicitClient.subscribe_topic_0_state(options), error => error.code === 717);
+          assert.equal(localSub.startSeq, 1n);
+          assert.equal(fallbackSub.startSeq, 1n);
+          const held = (await localSub.next()).value;
+          verify(held, held.value.value);
+          const copied = (await fallbackSub.next()).value;
+          try { verify(copied); } finally { copied.value.dispose(); }
+          for (const sub of [localSub, fallbackSub]) {
+            const receipt = await sub.close();
+            assert.equal(receipt.completed, true);
+            assert.equal(receipt.error.code, 718);
+            assert.equal(receipt.completeItems, 1n);
+          }
+          assert.equal(Buffer.from(held.value.value.binaryBytes()).toString('hex'), expected);
+          const alias = held.value.buffer.subarray();
+          held.value.release();
+          assert.equal(alias.byteLength, 0);
+
+          const [ipcSub, httpSub] = await Promise.all([
+            track(directClient.subscribe_topic_0_state(options)),
+            track(explicitClient.subscribe_topic_0_state({...options, start: 'next'})),
+          ]);
+          assert.equal(httpSub.startSeq, 2n);
+          assert.ok(prepared.some(result => result.path === 'ExplicitRelay'));
+          const frame = (await ipcSub.next()).value;
+          try { verify(frame); } finally { frame.value.dispose(); }
+          assert.equal((await httpSub.close()).completeItems, 0n);
+          assert.equal((await ipcSub.close()).completed, true);
+          assert.equal(connector.stats().call_execution.used_operations, '0');
+          await assert.rejects(explicit.subscribe(firstRoute, generated.CONTRACT, 'missing', data => data, options),
+            error => error.code === 713);
+
+          const next = {...options, start: 'next'};
+          const previous = await Promise.all([
+            track(localClient.subscribe_topic_0_state(next)),
+            track(explicitClient.subscribe_topic_0_state(next)),
+          ]);
+          await host('unregister');
+          await Promise.all(previous.map(sub => assert.rejects(sub.next(), error =>
+            error.code === 718 && error.details.cause === 'route_unregistered')));
+          await host('register');
+          const replacement = await track(explicitClient.subscribe_topic_0_state(options));
+          assert.equal(replacement.startSeq, 1n);
+          const replacementFrame = (await replacement.next()).value;
+          try { verify(replacementFrame); } finally { replacementFrame.value.dispose(); }
+          assert.equal((await replacement.close()).completed, true);
+        } finally {
+          await Promise.allSettled(opened.map(sub => sub.close(2_000)));
+          await Promise.allSettled([direct, local, fallback, explicit].map(transport => transport.close()));
+          connector.close();
+          controls.close();
+          process.stdin.pause();
+        }
+        """), encoding="utf-8")
+
+    first_route = _route_name("topic-first")
+    second_route = _route_name("topic-second")
+    value = build_record_payload()
+    try:
+        with ExitStack() as stack:
+            local_root = ""
+            remote_root = ""
+            if os.name != "nt":
+                local_root = stack.enter_context(tempfile.TemporaryDirectory(prefix="c2ts-", dir="/tmp"))
+                remote_root = stack.enter_context(tempfile.TemporaryDirectory(prefix="c2ts-", dir="/tmp"))
+
+            def start_host(name: str, ipc_root: str) -> tuple[cc.Runtime, MatrixRelay]:
+                with monkeypatch.context() as process_env:
+                    if ipc_root:
+                        process_env.setenv("C2_IPC_ROOT", ipc_root)
+                    relay = stack.enter_context(MatrixRelay(artifacts.matrix, name))
+                runtime = cc.Runtime()
+                stack.callback(runtime.shutdown)
+                if ipc_root:
+                    runtime.set_local_endpoint(root=ipc_root)
+                runtime.set_relay_anchor(relay.url)
+                runtime.register(Telemetry, object(), name=name, initial_topics={"state": value})
+                return runtime, relay
+
+            host, first = start_host(first_route, local_root)
+            _, second = start_host(second_route, remote_root)
+            address = host.server_address()
+            assert address is not None
+            with tempfile.TemporaryFile(mode="w+", encoding="utf-8") as errors:
+                with subprocess.Popen(
+                    [artifacts.node_binary, str(script), address, first.url, second.url,
+                     local_root, value.binary_bytes().hex(), first_route, second_route],
+                    cwd=root, env=_process_environment(), stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE, stderr=errors, text=True,
+                ) as node:
+                    try:
+                        for command in ("unregister", "register"):
+                            request = readline_with_timeout(node.stdout, 30).strip()
+                            if request != command:
+                                errors.seek(0)
+                                pytest.fail(f"Node sent {request!r}, expected {command!r}\n{errors.read()}")
+                            if command == "unregister":
+                                host.unregister(first_route)
+                            else:
+                                host.register(Telemetry, object(), name=first_route, initial_topics={"state": value})
+                            node.stdin.write("ok\n")
+                            node.stdin.flush()
+                        node.stdin.close()
+                        status = node.wait(timeout=30)
+                        errors.seek(0)
+                        assert status == 0, errors.read()
+                    finally:
+                        if node.poll() is None:
+                            node.kill()
+                            node.wait(timeout=5)
+    finally:
+        value.close()
 
 
 def test_typescript_real_calls_write_strict_development_receipt(

@@ -14,6 +14,7 @@ name = "c2_mem"
 c2-config = { version = "0.1.0", path = "../c2-config" }
 libc = "0.2"
 memmap2 = "0.9"
+parking_lot = { workspace = true }
 base64 = "0.23.1"
 sha2 = "0.11.0"
 uuid = { version = "1", features = ["v4"] }

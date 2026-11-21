@@ -126,6 +126,7 @@ define_error_codes! {
     CallCapacityExceeded = 717,
     CallCancelled = 718,
     RouteConflict = 719,
+    SubscriptionLagged = 720,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -709,7 +710,7 @@ mod tests {
     fn error_code_registry_matches_canonical_wire_values() {
         use ErrorCode::*;
 
-        let expected: [(ErrorCode, u16, &str); 25] = [
+        let expected: [(ErrorCode, u16, &str); 26] = [
             (Unknown, 0, "Unknown"),
             (ResourceInputDeserializing, 1, "ResourceInputDeserializing"),
             (ResourceOutputSerializing, 2, "ResourceOutputSerializing"),
@@ -735,6 +736,7 @@ mod tests {
             (CallCapacityExceeded, 717, "CallCapacityExceeded"),
             (CallCancelled, 718, "CallCancelled"),
             (RouteConflict, 719, "RouteConflict"),
+            (SubscriptionLagged, 720, "SubscriptionLagged"),
         ];
         let registry = ErrorCode::registry();
         assert_eq!(registry.len(), expected.len());
@@ -822,6 +824,23 @@ mod tests {
         assert_eq!(decoded, error);
         assert_eq!(decoded.code as u16, 719);
         assert_eq!(decoded.code.name(), "RouteConflict");
+    }
+
+    #[test]
+    fn subscription_lagged_round_trips_with_canonical_code_and_lag_details() {
+        let error = C2Error::new(ErrorCode::SubscriptionLagged, "topic history evicted")
+            .with_details(BTreeMap::from([
+                ("expected_seq".into(), "10".into()),
+                ("available_first_seq".into(), "14".into()),
+                ("available_last_seq".into(), "14".into()),
+                ("dropped".into(), "4".into()),
+            ]));
+        let decoded = C2Error::from_wire_bytes(&error.to_wire_bytes())
+            .unwrap()
+            .unwrap();
+        assert_eq!(decoded, error);
+        assert_eq!(decoded.code as u16, 720);
+        assert_eq!(decoded.code.name(), "SubscriptionLagged");
     }
 
     #[test]

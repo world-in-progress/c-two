@@ -215,6 +215,7 @@ pub(crate) struct ClientConnection {
 enum StreamControl {
     Complete(Arc<crate::client::stream::StreamReceive>),
     Forward(Arc<crate::client::forward::ForwardReceive>),
+    Subscribe(Arc<crate::client::subscribe::SubscribeReceive>),
 }
 
 impl StreamControl {
@@ -222,18 +223,21 @@ impl StreamControl {
         match self {
             Self::Complete(s) => s.has_control(),
             Self::Forward(s) => s.has_control(),
+            Self::Subscribe(s) => s.has_control(),
         }
     }
     fn take_control(&self) -> Option<Vec<u8>> {
         match self {
             Self::Complete(s) => s.take_control(),
             Self::Forward(s) => s.take_control(),
+            Self::Subscribe(s) => s.take_control(),
         }
     }
     fn transport_failed(&self, error: IpcError) {
         match self {
             Self::Complete(s) => s.transport_failed(error),
             Self::Forward(s) => s.transport_failed(error),
+            Self::Subscribe(s) => s.transport_failed(error),
         }
     }
 }
@@ -257,6 +261,11 @@ impl ClientConnection {
                         call.forward
                             .as_ref()
                             .map(|forward| StreamControl::Forward(forward.clone()))
+                    })
+                    .or_else(|| {
+                        call.subscription
+                            .as_ref()
+                            .map(|sub| StreamControl::Subscribe(sub.clone()))
                     })?;
                 stream
                     .has_control()
@@ -408,6 +417,16 @@ impl ClientConnection {
             .and_then(|entry| entry.forward.clone());
         if let Some(forward) = forward {
             forward.fail_response(error);
+            self.wake.notify_one();
+            return;
+        }
+        let subscription = self
+            .pending
+            .lock()
+            .get(&rid)
+            .and_then(|entry| entry.subscription.clone());
+        if let Some(subscription) = subscription {
+            subscription.fail_response(error);
             self.wake.notify_one();
             return;
         }
@@ -736,6 +755,14 @@ async fn process(stream: &mut LocalWriteHalf, conn: &ClientConnection, mut submi
                                 .and_then(|call| call.forward.clone());
                             if let Some(forward) = forward {
                                 forward.publish(rid)?;
+                            }
+                            let subscription = conn
+                                .pending
+                                .lock()
+                                .get(&rid)
+                                .and_then(|call| call.subscription.clone());
+                            if let Some(subscription) = subscription {
+                                subscription.publish(rid)?;
                             }
                             rid
                         }

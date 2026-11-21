@@ -535,3 +535,39 @@ fn reusable_window_keeps_its_domain_charge_through_multiple_chunks() {
     drop(window);
     assert!(!observer.is_alive());
 }
+
+#[test]
+fn subscription_slot_guard_preserves_control_headroom_without_blocking_n1() {
+    let zero = domain(8, 0, 0);
+    assert_eq!(
+        zero.reserve_subscription_operation().unwrap_err().reason,
+        RetentionRejectReason::LimitReached
+    );
+
+    let one = domain(8, 0, 1);
+    let sub1 = one.reserve_subscription_operation().unwrap();
+    assert_eq!(one.snapshot().operations.used_operations, 1);
+    assert_eq!(
+        one.reserve_operation().unwrap_err().reason,
+        RetentionRejectReason::LimitReached
+    );
+    drop(sub1);
+    assert_eq!(one.snapshot().operations.used_operations, 0);
+
+    // N = 2: at most one long-lived subscription so one ordinary call can always enter.
+    let two = domain(8, 0, 2);
+    let s1 = two.reserve_subscription_operation().unwrap();
+    assert_eq!(
+        two.reserve_subscription_operation().unwrap_err().reason,
+        RetentionRejectReason::LimitReached
+    );
+    let unary = two.reserve_operation().unwrap();
+    assert_eq!(two.snapshot().operations.used_operations, 2);
+    drop(unary);
+    // Dropping s1 lets another subscription enter.
+    drop(s1);
+    let s2 = two.reserve_subscription_operation().unwrap();
+    assert_eq!(two.snapshot().operations.used_operations, 1);
+    drop(s2);
+    assert_eq!(two.snapshot().operations.used_operations, 0);
+}

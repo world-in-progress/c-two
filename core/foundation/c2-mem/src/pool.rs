@@ -834,7 +834,7 @@ impl MemPool {
         })
     }
 
-    fn checked_handle_pin(
+    pub(crate) fn checked_handle_pin(
         &self,
         handle: &MemHandle,
     ) -> Result<(Arc<crate::segment::ChargedMapping>, usize), String> {

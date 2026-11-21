@@ -46,6 +46,14 @@ uv run python examples/python/independent_runtime.py
 C2_RELAY_ANCHOR_ADDRESS= uv run python examples/python/resident_simulation.py
 ```
 
+### Publish/Subscribe Topics
+
+`pubsub.py` demonstrates resource-owned publish/subscribe topics in one process ([ADR 0005](../docs/decisions/0005-publish-subscribe.md)): `@cc.topic` declarations on a CRM contract, `cc.register(...)` returning a `Registration` whose `publisher(topic)` handle publishes immutable frames (with `topic_capacity` history depth and an atomically committed `initial_topics` frame), client-side topic members and `cc.with_call_options(...)` subscriptions with `start='latest'|'next'` and `on_lag='skip'|'error'`, `cc.hold(...)` deliveries retained as `HeldResult`, truthful `close()` receipts, and the `ResourceClosed` refusal a publisher sees after its registration ends:
+
+```bash
+uv run python examples/python/pubsub.py
+```
+
 ### IPC Direct Mode
 
 Use this path for direct IPC between one resource process and one client on the same machine. The client always uses the explicit IPC address you pass it.

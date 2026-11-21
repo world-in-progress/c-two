@@ -1,7 +1,7 @@
 use crate::{
     ArtifactComposer, ArtifactKind, ArtifactLimits, ArtifactProvenance, CodegenError,
     ContractArtifact, ContractArtifactSet, fastdb_error,
-    targets::{TargetMethod, render_target_artifacts},
+    targets::{TargetMethod, TargetTopic, render_target_artifacts},
 };
 use c2_contract::{
     BindingDirection, ContractRelease, MethodAccess, MethodMode, NestedFastDbSpec, canonical_json,
@@ -76,6 +76,12 @@ struct MethodFact {
     output_sha256: Option<String>,
 }
 
+struct TopicFact {
+    index: usize,
+    name: String,
+    output_sha256: String,
+}
+
 pub fn compile_contract_artifacts(
     release: &ContractRelease,
     target: ContractCodegenTarget,
@@ -85,6 +91,7 @@ pub fn compile_contract_artifacts(
     let release_ref_json = release.reference().to_canonical_json()?;
     let mut bindings = Vec::new();
     let mut methods = Vec::new();
+    let mut topics = Vec::new();
     let mut payloads = BTreeMap::<String, PayloadFact>::new();
     let mut payload_artifacts = Vec::new();
 
@@ -149,7 +156,37 @@ pub fn compile_contract_artifacts(
             output_sha256: method.output_sha256.as_deref(),
         })
         .collect::<Vec<_>>();
-    let target_artifacts = render_target_artifacts(target, descriptor, &target_methods)?;
+    // Topic outputs share the digest-deduplicated payload composition with
+    // method bindings, so equal FastDB specifications compile to one subtree.
+    for (index, topic) in descriptor.topics().iter().enumerate() {
+        let output_sha256 = compile_binding(
+            topic.output(),
+            target,
+            options,
+            &mut payloads,
+            &mut payload_artifacts,
+        )?;
+        bindings.push(BindingFact {
+            outer_path: topic.output().outer_path().to_string(),
+            direction: BindingDirection::Output,
+            fastdb_sha256: output_sha256.clone(),
+        });
+        topics.push(TopicFact {
+            index,
+            name: topic.name().to_string(),
+            output_sha256,
+        });
+    }
+    let target_topics = topics
+        .iter()
+        .map(|topic| TargetTopic {
+            index: topic.index,
+            name: &topic.name,
+            output_sha256: topic.output_sha256.as_str(),
+        })
+        .collect::<Vec<_>>();
+    let target_artifacts =
+        render_target_artifacts(target, descriptor, &target_methods, &target_topics)?;
     let contract_artifact = ContractArtifact::new(
         "metadata/contract.json",
         ArtifactKind::Metadata,

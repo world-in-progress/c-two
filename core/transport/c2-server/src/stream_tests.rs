@@ -447,7 +447,7 @@ async fn read_record(peer: &mut LocalStream, mode: CallMode) -> SeenRecord {
     let record = rpc::decode_rpc_record(&header, payload, Some(mode))
         .unwrap_or_else(|error| panic!("record {header:?} {payload:?}: {error:?}"));
     match record {
-        RpcRecord::ItemBegin { total_bytes } => SeenRecord::Begin(total_bytes),
+        RpcRecord::ItemBegin { total_bytes, .. } => SeenRecord::Begin(total_bytes),
         RpcRecord::ItemData {
             value:
                 ValuePart {
@@ -1592,19 +1592,23 @@ async fn unknown_open_mode_and_cancel_cause_deactivate_but_preserve_dispatched_c
             .await
             .unwrap()
             .unwrap();
-        let mut malformed = if unknown_open {
-            rpc::encode_open_frame(
+        let malformed = if unknown_open {
+            let mut frame = rpc::encode_open_frame(
                 2,
                 &harness.identity,
                 0,
                 CallMode::Unary,
                 ValuePart::whole(ValueStorage::Inline(&[])),
             )
-            .unwrap()
+            .unwrap();
+            let mode_offset = frame.len() - 3;
+            frame[mode_offset] = 3;
+            frame
         } else {
-            rpc::encode_cancel_frame(1, rpc::CancelCause::Consumer).unwrap()
+            let mut frame = rpc::encode_cancel_frame(1, rpc::CancelCause::Consumer).unwrap();
+            *frame.last_mut().unwrap() = 2;
+            frame
         };
-        *malformed.last_mut().unwrap() = 2;
         harness.peer.write_all(&malformed).await.unwrap();
         let conn = harness
             .server

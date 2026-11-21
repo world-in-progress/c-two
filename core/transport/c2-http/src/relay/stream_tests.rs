@@ -252,6 +252,7 @@ struct Fixture {
     pending: mpsc::Receiver<()>,
     budget_bytes: u64,
     frame_tap: Option<tokio::task::JoinHandle<()>>,
+    topics: Option<Arc<c2_server::topic::RouteTopics>>,
 }
 
 type RpcFrames = Arc<parking_lot::Mutex<Vec<(bool, u64, c2_wire::rpc::RpcRecordKind)>>>;
@@ -495,6 +496,14 @@ impl Fixture {
     }
 
     async fn start_with_frame_tap(budget_bytes: u64, frames: Option<RpcFrames>) -> Self {
+        Self::start_with_topics(budget_bytes, frames, false).await
+    }
+
+    async fn start_with_topics(
+        budget_bytes: u64,
+        frames: Option<RpcFrames>,
+        include_topic: bool,
+    ) -> Self {
         let ordinal = NEXT.fetch_add(1, Ordering::SeqCst);
         let id = format!("b8-{}-{ordinal}", std::process::id());
         let address = format!("ipc://{id}");
@@ -504,7 +513,19 @@ impl Fixture {
         let context = LocalEndpointContext::with_unix_root(root.path()).unwrap();
         #[cfg(windows)]
         let context = LocalEndpointContext::default_for_platform().unwrap();
-        let descriptor = ValidatedContractDescriptor::from_json(DESCRIPTOR).unwrap();
+        let descriptor = if include_topic {
+            let mut value: serde_json::Value = serde_json::from_slice(DESCRIPTOR).unwrap();
+            let binding = value["methods"][1]["bindings"]["output"].clone();
+            value["topics"] = serde_json::json!([{ "name": "state", "output": {"kind": "payload"}, "binding": binding }]);
+            let fingerprints =
+                c2_contract::derive_contract_fingerprints_json(value.to_string().as_bytes())
+                    .unwrap();
+            value["fingerprints"]["abi_hash"] = fingerprints.abi_hash().into();
+            value["fingerprints"]["signature_hash"] = fingerprints.signature_hash().into();
+            ValidatedContractDescriptor::from_json(value.to_string().as_bytes()).unwrap()
+        } else {
+            ValidatedContractDescriptor::from_json(DESCRIPTOR).unwrap()
+        };
         let mut server_config = ServerIpcConfig::default();
         server_config.max_execution_workers = 4;
         let endpoint = context.endpoint(&address).unwrap();
@@ -520,7 +541,7 @@ impl Fixture {
             .unwrap(),
         );
         let observed = Arc::new(Observed::default());
-        let built = server
+        let mut built = server
             .build_stream_route(
                 RouteBuildSpec {
                     name: "portable".into(),
@@ -538,6 +559,27 @@ impl Fixture {
                 &descriptor,
             )
             .unwrap();
+        let topics = if include_topic {
+            let expected = c2_contract::ExpectedRouteContract {
+                route_name: "portable".into(),
+                crm_ns: descriptor.crm_namespace().into(),
+                crm_name: descriptor.crm_name().into(),
+                crm_ver: descriptor.crm_version().into(),
+                abi_hash: descriptor.abi_hash().into(),
+                signature_hash: descriptor.signature_hash().into(),
+            };
+            let topics = server.create_route_topics(
+                expected,
+                &std::collections::BTreeMap::from([(
+                    "state".into(),
+                    c2_server::topic::TopicConfig { capacity: 2 },
+                )]),
+            );
+            built = built.with_topics(topics.clone());
+            Some(topics)
+        } else {
+            None
+        };
         let reservation = server.reserve_route(built).await.unwrap();
         server.commit_reserved_route(reservation).await.unwrap();
         server.begin_start_attempt().unwrap();
@@ -672,6 +714,7 @@ impl Fixture {
             pending,
             budget_bytes,
             frame_tap,
+            topics,
         }
     }
 
@@ -722,6 +765,81 @@ impl Fixture {
             0
         );
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn topic_clients_share_one_upstream_and_cancel_independently() {
+    let fixture = Fixture::start_with_topics(1024 * 1024, None, true).await;
+    let topics = fixture.topics.as_ref().unwrap().clone();
+    let publisher = topics.publisher("state").unwrap();
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let budget = crate::payload::memory_only_budget(1024 * 1024);
+    let open = || async {
+        let response = bounded(
+            client
+                .post(format!("http://{}/portable/_topics/state", fixture.socket))
+                .header("accept", crate::topic_wire::MEDIA_TYPE)
+                .header("x-c2-topic-start", "latest")
+                .header("x-c2-topic-on-lag", "skip")
+                .header("x-c2-expected-crm-ns", &fixture.entry.crm_ns)
+                .header("x-c2-expected-crm-name", &fixture.entry.crm_name)
+                .header("x-c2-expected-crm-ver", &fixture.entry.crm_ver)
+                .header("x-c2-expected-abi-hash", &fixture.entry.abi_hash)
+                .header(
+                    "x-c2-expected-signature-hash",
+                    &fixture.entry.signature_hash,
+                )
+                .body(Vec::new())
+                .send(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), 200);
+        let token = response.headers()["x-c2-call-token"]
+            .to_str()
+            .unwrap()
+            .to_owned();
+        bounded(crate::client::HttpTopicSubscription::start(
+            response,
+            client.clone(),
+            format!("http://{}", fixture.socket),
+            token,
+            budget.clone(),
+            c2_wire::rpc::WireLagPolicy::Skip,
+            Box::new(()),
+            crate::client::HttpStreamCancellation::new(),
+        ))
+        .await
+        .unwrap()
+    };
+    let (mut first, mut second, mut third) = tokio::join!(open(), open(), open());
+    assert_eq!(topics.active_subscribers(), 1);
+    assert_eq!(publisher.publish(b"one".to_vec()).unwrap(), 1);
+    for sub in [&mut first, &mut second, &mut third] {
+        let item = bounded(sub.recv()).await.unwrap();
+        assert_eq!((item.seq, item.bytes.as_ref()), (1, &b"one"[..]));
+    }
+
+    first.cancel();
+    let terminal = bounded(first.completion_after_cancel()).await.unwrap();
+    assert_eq!(terminal.error.code, c2_error::ErrorCode::CallCancelled);
+    assert_eq!(topics.active_subscribers(), 1);
+    assert_eq!(publisher.publish(b"two".to_vec()).unwrap(), 2);
+    for sub in [&mut second, &mut third] {
+        let item = bounded(sub.recv()).await.unwrap();
+        assert_eq!((item.seq, item.bytes.as_ref()), (2, &b"two"[..]));
+        sub.cancel();
+    }
+    bounded(second.completion_after_cancel()).await.unwrap();
+    bounded(third.completion_after_cancel()).await.unwrap();
+    bounded(async {
+        while topics.active_subscribers() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    drop((first, second, third, publisher, topics));
+    fixture.stop().await;
 }
 
 fn parse_records(body: &[u8], expected_count: usize, item_size: usize) {

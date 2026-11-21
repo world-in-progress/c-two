@@ -2,11 +2,11 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import * as binding from '../dist/index.js';
 
-test('ABI 8 binding has no raw socket reader or socket injection', () => {
+test('ABI 9 binding has no raw socket reader or socket injection', () => {
   assert.equal('createNodeIpcConnect' in binding, false);
   assert.equal('NodeIpcConnection' in binding, false);
   const symbols = {
-    c2_mem_ffi_abi_version: () => 8,
+    c2_mem_ffi_abi_version: () => 9,
     captureEndpointContext: () => ({endpointName: address => address, namespaceId: () => 'n', close() {}}),
     createClientDomain: () => ({createEndpoint() {}, stats() { return {}; }, close() {}}),
   };

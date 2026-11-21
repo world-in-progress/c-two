@@ -164,7 +164,7 @@ mod ipc16_tests {
             "\x04grid\x02ns\x04Grid\x050.1.0\x40",
             "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
             "\x40abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
-            "\x07\x00\x00"
+            "\x00\x07\x00"
         )
         .as_bytes()
         .to_vec()
@@ -489,7 +489,7 @@ mod ipc16_tests {
     }
 
     #[test]
-    fn permanent_preamble_stays_25_bytes_and_advertises_16() {
+    fn permanent_preamble_stays_25_bytes_and_advertises_17() {
         for (kind, flags) in [
             (VersionPreambleKind::Hello, 4),
             (VersionPreambleKind::Accepted, 6),
@@ -500,12 +500,12 @@ mod ipc16_tests {
             golden[12] = flags;
             golden[16..20].copy_from_slice(b"C2IP");
             golden[20] = kind as u8;
-            golden[21] = 16;
+            golden[21] = 17;
             assert_eq!(encode_version_preamble(kind), golden);
             validate_version_preamble_header(golden[..16].try_into().unwrap(), flags == 6).unwrap();
             assert_eq!(
                 decode_version_preamble_payload(golden[16..].try_into().unwrap()).unwrap(),
-                (kind, 16)
+                (kind, 17)
             );
         }
     }

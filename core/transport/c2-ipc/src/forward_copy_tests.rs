@@ -57,6 +57,7 @@ struct Harness {
     runner: tokio::task::JoinHandle<()>,
     client: IpcClient,
     binding: RouteBinding,
+    topics: Arc<c2_server::topic::RouteTopics>,
 }
 impl Harness {
     async fn start() -> Self {
@@ -99,6 +100,13 @@ impl Harness {
             )
             .unwrap(),
         );
+        let topics = server.create_route_topics(
+            expected.clone(),
+            &std::collections::BTreeMap::from([(
+                "state".into(),
+                c2_server::topic::TopicConfig { capacity: 2 },
+            )]),
+        );
         let built = server
             .build_stream_route(
                 RouteBuildSpec {
@@ -116,7 +124,8 @@ impl Harness {
                 Arc::new(Callback),
                 &descriptor,
             )
-            .unwrap();
+            .unwrap()
+            .with_topics(topics.clone());
         let reservation = server.reserve_route(built).await.unwrap();
         server.commit_reserved_route(reservation).await.unwrap();
         server.begin_start_attempt().unwrap();
@@ -134,6 +143,7 @@ impl Harness {
             runner,
             client,
             binding,
+            topics,
         }
     }
     async fn stream(&self) -> IpcForwardStream {
@@ -160,6 +170,215 @@ impl Harness {
         self.server.shutdown_and_wait(WAIT).await.unwrap();
         self.runner.await.unwrap();
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn forwarded_topic_uses_small_windows_and_reports_real_terminal() {
+    let harness = Harness::start().await;
+    let mut topic = tokio::time::timeout(
+        WAIT,
+        harness.client.forward_subscribe_bound(
+            &harness.binding,
+            "state",
+            rpc::WireSubscribeOptions::default(),
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(topic.start_seq(), 1);
+    assert_eq!(harness.topics.active_subscribers(), 1);
+    fn assert_send<T: Send>(_: T) {}
+    assert_send(topic.sync_head_seq());
+    let publisher = harness.topics.publisher("state").unwrap();
+    assert_eq!(
+        tokio::time::timeout(WAIT, topic.sync_head_seq())
+            .await
+            .unwrap()
+            .unwrap(),
+        0
+    );
+    let payload = vec![37; ITEM_SIZE];
+    assert_eq!(publisher.publish(payload.clone()).unwrap(), 1);
+    let first = tokio::time::timeout(WAIT, topic.next_record())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(first, ForwardTopicRecord::ItemBegin { seq: 1, total_bytes } if total_bytes == ITEM_SIZE as u64)
+    );
+    // The source can publish again while this receiver is still on seq 1.
+    // SYNC must return the source head, not the last observed IPC item.
+    assert_eq!(publisher.publish(b"after release".to_vec()).unwrap(), 2);
+    assert_eq!(
+        tokio::time::timeout(WAIT, topic.sync_head_seq())
+            .await
+            .unwrap()
+            .unwrap(),
+        2
+    );
+    // The topic is larger than the relay's entire receive budget. Each window
+    // is released before reserving the next one.
+    let budget = memory_budget(1024);
+    let mut result = Vec::new();
+    while result.len() < payload.len() {
+        let chunk =
+            tokio::time::timeout(WAIT, topic.read_chunk(download_slice(&budget, 1024), 1024))
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+        result.extend_from_slice(chunk.as_ref());
+        drop(chunk);
+        if result.len() == 1024 {
+            assert!(
+                topic.stream.call.state.lock().carrier.is_some(),
+                "expected an active SHM carrier"
+            );
+        }
+    }
+    assert_eq!(result, payload);
+    assert!(topic.stream.call.state.lock().carrier.is_none());
+    let second = tokio::time::timeout(WAIT, topic.next_record())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        second,
+        ForwardTopicRecord::ItemBegin {
+            seq: 2,
+            total_bytes: 13
+        }
+    ));
+    let chunk = tokio::time::timeout(WAIT, topic.read_chunk(download_slice(&budget, 13), 13))
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(chunk.as_ref(), b"after release");
+    drop(chunk);
+    topic
+        .cancellation()
+        .cancel(rpc::CancelCause::Consumer)
+        .unwrap();
+    let terminal = tokio::time::timeout(WAIT, topic.completion())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(terminal.status, CallStatus::Failed);
+    assert_eq!(terminal.complete_items, 2);
+    assert_eq!(terminal.error.unwrap().code, ErrorCode::CallCancelled);
+    tokio::time::timeout(WAIT, async {
+        while harness.topics.active_subscribers() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    drop(topic);
+    harness.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn forwarded_unknown_topic_preserves_pre_dispatch_refusal() {
+    let harness = Harness::start().await;
+    let error = match harness
+        .client
+        .forward_subscribe_bound(
+            &harness.binding,
+            "unknown",
+            rpc::WireSubscribeOptions::default(),
+        )
+        .await
+    {
+        Ok(_) => panic!("unknown topic must fail"),
+        Err(error) => error,
+    };
+    assert!(error.is_retry_safe());
+    assert!(
+        matches!(error.source_error(), IpcError::CallRejected(e) if e.code == ErrorCode::ProtocolViolation)
+    );
+    harness.stop().await;
+}
+
+#[test]
+fn success_before_ready_is_a_protocol_error_without_panicking() {
+    let terminal = stream::StreamTerminal {
+        status: CallStatus::Success,
+        complete_items: 0,
+        error: None,
+    };
+    let error = topic_opening_terminal_error(&terminal);
+    assert_eq!(error.phase(), crate::TransportPhase::DispatchUncertain);
+    assert!(
+        matches!(error.source_error(), IpcError::Protocol(message) if message.contains("before READY"))
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sync_waiters_observe_source_head_and_real_terminal() {
+    let harness = Harness::start().await;
+    let mut topic = harness
+        .client
+        .forward_subscribe_bound(
+            &harness.binding,
+            "state",
+            rpc::WireSubscribeOptions::default(),
+        )
+        .await
+        .unwrap();
+    let sync = topic.synchronizer();
+    let (a, b, c) = tokio::join!(
+        sync.sync_head_seq(),
+        sync.sync_head_seq(),
+        sync.sync_head_seq()
+    );
+    assert_eq!((a.unwrap(), b.unwrap(), c.unwrap()), (0, 0, 0));
+    assert_eq!(
+        harness
+            .topics
+            .publisher("state")
+            .unwrap()
+            .publish(b"first".to_vec())
+            .unwrap(),
+        1
+    );
+    assert_eq!(sync.sync_head_seq().await.unwrap(), 1);
+    assert!(matches!(
+        topic.next_record().await.unwrap(),
+        ForwardTopicRecord::ItemBegin {
+            seq: 1,
+            total_bytes: 5
+        }
+    ));
+    harness
+        .topics
+        .close(c2_server::topic::TopicCloseCause::RouteUnregistered);
+    let waiting = tokio::spawn(async move { sync.sync_head_seq().await });
+    let budget = memory_budget(5);
+    let chunk = topic
+        .read_chunk(download_slice(&budget, 5), 5)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(chunk.as_ref(), b"first");
+    drop(chunk);
+    let error = tokio::time::timeout(WAIT, waiting)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    let c2 = match error.into_source() {
+        IpcError::CrmError(bytes) => C2Error::from_wire_bytes(&bytes).unwrap().unwrap(),
+        other => panic!("expected subscription terminal, got {other:?}"),
+    };
+    assert_eq!(c2.code, ErrorCode::CallCancelled);
+    assert_eq!(
+        c2.details.get("cause").map(String::as_str),
+        Some("route_unregistered")
+    );
+    drop(topic);
+    harness.stop().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

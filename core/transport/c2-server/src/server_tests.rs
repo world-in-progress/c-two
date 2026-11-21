@@ -1094,6 +1094,7 @@ fn make_route(name: &str) -> CrmRoute {
         stream_callback: None,
         method_modes: vec![CallMode::Unary; 2],
         method_names: vec!["step".into(), "query".into()],
+        topics: None,
     }
 }
 
@@ -8924,4 +8925,128 @@ fn unpolled_coordinator_drop_clears_running_flag_and_allows_restart() {
         drop(peer);
         handler.await.unwrap();
     });
+}
+
+#[tokio::test]
+async fn subscription_open_requires_opened_registration_and_failed_sync_ends_it() {
+    let server =
+        Arc::new(test_server_new("ipc://topic_admission", ServerIpcConfig::default()).unwrap());
+    let mut route = make_host_route(&server, "grid");
+    let identity = call_identity("grid");
+    let topics = server.create_route_topics(
+        c2_contract::ExpectedRouteContract {
+            route_name: identity.route_name.clone(),
+            crm_ns: identity.crm_ns.clone(),
+            crm_name: identity.crm_name.clone(),
+            crm_ver: identity.crm_ver.clone(),
+            abi_hash: identity.abi_hash.clone(),
+            signature_hash: identity.signature_hash.clone(),
+        },
+        &std::collections::BTreeMap::from([(
+            "state".to_string(),
+            crate::topic::TopicConfig::default(),
+        )]),
+    );
+    route.topics = Some(Arc::clone(&topics));
+    let (mut peer, stream) = isolated_pair().await;
+    let handler = tokio::spawn(handle_connection(Arc::clone(&server), stream));
+    handshake_test_client(&mut peer).await;
+
+    let reserved = server
+        .reserve_route(BuiltRoute::new(route).unwrap())
+        .await
+        .unwrap();
+    let token = server.commit_reserved_route_closed(reserved).await.unwrap();
+    let open = |id| {
+        rpc::encode_open_subscribe_frame(
+            id,
+            &identity,
+            "state",
+            rpc::WireSubscribeOptions::default(),
+        )
+        .unwrap()
+    };
+    peer.write_all(&open(1)).await.unwrap();
+    let (_, _, refusal) = read_reply_frame(&mut peer).await;
+    assert_call_end_status(&refusal, CallStatus::NotExecuted);
+    assert_eq!(reply_error_code(&refusal), ErrorCode::ResourceClosed);
+    assert_eq!(topics.active_subscribers(), 0);
+
+    server.open_route_admission(token).await.unwrap();
+    peer.write_all(&open(2)).await.unwrap();
+    let (id, _, ready) = read_reply_frame(&mut peer).await;
+    assert_eq!(id, 2);
+    assert_eq!(ready[0], rpc::RpcRecordKind::Ready as u8);
+
+    // Leave a selected frame waiting for CREDIT when the control slots fill.
+    topics
+        .publisher("state")
+        .unwrap()
+        .publish(b"frame".to_vec())
+        .unwrap();
+    let (id, _, begin) = read_reply_frame(&mut peer).await;
+    assert_eq!(id, 2);
+    assert_eq!(begin[0], rpc::RpcRecordKind::ItemBegin as u8);
+
+    let conn = server
+        .active_connection(server.active_connection_ids()[0])
+        .unwrap();
+    let writer = conn.rpc_writer.lock().as_ref().unwrap().upgrade().unwrap();
+    let reserved_replies: Vec<_> = (0..server.control_reply_capacity)
+        .map(|_| writer.reserve_control().unwrap())
+        .collect();
+    peer.write_all(&rpc::encode_sync_frame(2).unwrap())
+        .await
+        .unwrap();
+    let (id, _, terminal) = read_reply_frame(&mut peer).await;
+    assert_eq!(id, 2);
+    assert_call_end_status(&terminal, CallStatus::Failed);
+    let header = c2_wire::frame::FrameHeader {
+        total_len: 12 + terminal.len() as u32,
+        request_id: id,
+        flags: c2_wire::flags::FLAG_RPC_RECORD | FLAG_RESPONSE,
+    };
+    assert!(matches!(
+        rpc::decode_rpc_record(&header, &terminal, Some(CallMode::Subscribe)).unwrap(),
+        RpcRecord::CallEnd { complete_items: Some(0), error: Some(error), .. }
+            if error.code == ErrorCode::CallCapacityExceeded
+    ));
+    assert!(!conn.is_deactivated());
+    drop(reserved_replies);
+    wait_until("subscription retires after failed SYNC_ACK", || {
+        topics.active_subscribers() == 0
+    })
+    .await;
+    // With SHM unnegotiated, even a small inline copy needs its own memory
+    // reservation while the published frame is retained in topic history.
+    peer.write_all(&open(3)).await.unwrap();
+    let (id, _, ready) = read_reply_frame(&mut peer).await;
+    assert_eq!(id, 3);
+    assert_eq!(ready[0], rpc::RpcRecordKind::Ready as u8);
+    let (id, _, begin) = read_reply_frame(&mut peer).await;
+    assert_eq!(id, 3);
+    assert_eq!(begin[0], rpc::RpcRecordKind::ItemBegin as u8);
+    let memory = server.domain_budget.snapshot().memory;
+    let reserved_memory = server
+        .domain_budget
+        .try_reserve_memory(memory.limit_bytes - memory.used_bytes)
+        .unwrap();
+    peer.write_all(&rpc::encode_credit_frame(3, 5, 0).unwrap())
+        .await
+        .unwrap();
+    let (id, flags, terminal) = read_reply_frame(&mut peer).await;
+    assert_eq!(id, 3);
+    let header = c2_wire::frame::FrameHeader {
+        total_len: 12 + terminal.len() as u32,
+        request_id: id,
+        flags,
+    };
+    assert!(matches!(
+        rpc::decode_rpc_record(&header, &terminal, Some(CallMode::Subscribe)).unwrap(),
+        RpcRecord::CallEnd { status: CallStatus::Failed, complete_items: Some(0), error: Some(error), .. }
+            if error.code == ErrorCode::CallCapacityExceeded
+    ));
+    drop(reserved_memory);
+    drop(peer);
+    handler.await.unwrap();
 }

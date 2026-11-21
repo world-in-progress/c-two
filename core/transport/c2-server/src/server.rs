@@ -618,7 +618,13 @@ impl Server {
         let routes = {
             let _guard = self.route_registration.lock().await;
             let dispatcher = self.dispatcher.read();
-            dispatcher.routes_snapshot()
+            let routes = dispatcher.routes_snapshot();
+            for route in &routes {
+                if let Some(topics) = &route.topics {
+                    topics.close(crate::topic::TopicCloseCause::HostShutdown);
+                }
+            }
+            routes
         };
         let outcomes = Self::wait_routes_drained(routes.clone(), closed_reason).await;
         for route in routes {
@@ -635,6 +641,9 @@ impl Server {
         let mut outcomes = Vec::with_capacity(routes.len());
         for route in routes {
             route.scheduler.wait_drained_async().await;
+            if let Some(topics) = &route.topics {
+                topics.wait_drained_async().await;
+            }
             outcomes.push(ServerRouteCloseOutcome {
                 route_name: route.name.clone(),
                 active_drained: true,
@@ -691,6 +700,22 @@ impl Server {
 
     pub fn config(&self) -> &ServerIpcConfig {
         &self.config
+    }
+
+    /// Create registration-scoped topic channels wired to this server's
+    /// response SHM pool, server memory budget and payload limit.
+    pub fn create_route_topics(
+        &self,
+        expected: c2_contract::ExpectedRouteContract,
+        topic_configs: &std::collections::BTreeMap<String, crate::topic::TopicConfig>,
+    ) -> Arc<crate::topic::RouteTopics> {
+        crate::topic::RouteTopics::new(
+            expected,
+            topic_configs,
+            self.domain_budget.clone(),
+            Some(Arc::clone(&self.response_pool.inner)),
+            self.config.max_payload_size,
+        )
     }
 
     pub fn build_route(
@@ -1048,20 +1073,56 @@ impl Server {
     /// that removes the route, so local handle clones and remote route lookup
     /// cannot observe an open-but-unregistered window.
     pub async fn unregister_route(&self, name: &str) -> bool {
+        self.unregister_route_matching(name, None).await
+    }
+
+    /// Unregister only the route that owns these topics.
+    pub async fn unregister_route_with_topics(
+        &self,
+        name: &str,
+        topics: &Arc<crate::topic::RouteTopics>,
+    ) -> bool {
+        self.unregister_route_matching(name, Some(topics)).await
+    }
+
+    async fn unregister_route_matching(
+        &self,
+        name: &str,
+        expected_topics: Option<&Arc<crate::topic::RouteTopics>>,
+    ) -> bool {
         let route = {
             let _guard = self.route_registration.lock().await;
             let dispatcher = self.dispatcher.write();
-            let route = dispatcher.resolve(name);
+            let route = dispatcher.resolve(name).filter(|route| {
+                expected_topics.is_none_or(|expected| {
+                    route
+                        .topics
+                        .as_ref()
+                        .is_some_and(|topics| Arc::ptr_eq(topics, expected))
+                })
+            });
             if let Some(route) = &route {
-                self.cancel_route_streams(Some(&route.route_uid), StreamCancelCause::Unregister);
                 route
                     .scheduler
                     .close_and_cancel_local_streams(StreamCancelCause::Unregister);
+                if let Some(topics) = &route.topics {
+                    topics.close(crate::topic::TopicCloseCause::RouteUnregistered);
+                }
+                self.cancel_route_streams(Some(&route.route_uid), StreamCancelCause::Unregister);
+            }
+            if route.is_none()
+                && let Some(topics) = expected_topics
+            {
+                // A stale registration can only seal its own topics.
+                topics.close(crate::topic::TopicCloseCause::RouteUnregistered);
             }
             route
         };
         if let Some(route) = route {
             route.scheduler.wait_drained_async().await;
+            if let Some(topics) = &route.topics {
+                topics.wait_drained_async().await;
+            }
             let mut dispatcher = self.dispatcher.write();
             if dispatcher
                 .resolve(name)
@@ -1073,6 +1134,9 @@ impl Server {
                 false
             }
         } else {
+            if let Some(topics) = expected_topics {
+                topics.wait_drained_async().await;
+            }
             false
         }
     }
@@ -1096,6 +1160,9 @@ impl Server {
                     route
                         .scheduler
                         .close_and_cancel_local_streams(StreamCancelCause::Shutdown);
+                    if let Some(topics) = &route.topics {
+                        topics.close(crate::topic::TopicCloseCause::HostShutdown);
+                    }
                 })
                 .collect::<Vec<_>>()
         };
@@ -1770,6 +1837,9 @@ impl Server {
             route
                 .scheduler
                 .cancel_local_streams(StreamCancelCause::Shutdown);
+            if let Some(topics) = &route.topics {
+                topics.close(crate::topic::TopicCloseCause::HostShutdown);
+            }
         }
         registration.begin_drain();
         self.admission.notify.notify_waiters();
@@ -2870,6 +2940,8 @@ pub(crate) struct ServerCall {
 struct StreamCallControl {
     route_uid: String,
     cancellation: Option<StreamCancelCause>,
+    topic_channel: Option<Arc<crate::topic::TopicChannel>>,
+    sync_reply_failed: bool,
 }
 
 fn submit_stream_cancel(
@@ -3299,6 +3371,40 @@ async fn handle_rpc_record(
         return;
     }
     match record {
+        RpcRecord::Sync => {
+            let lookup = conn.calls.lock().continuation(id);
+            match lookup {
+                CallLookup::Retired => return,
+                CallLookup::Future => conn.end(
+                    ConnectionEndReason::ProtocolError,
+                    "future_subscription_sync",
+                ),
+                CallLookup::Active(call) => {
+                    let channel = call
+                        .data
+                        .stream
+                        .lock()
+                        .as_ref()
+                        .and_then(|stream| stream.topic_channel.clone());
+                    match channel {
+                        None => conn.end(
+                            ConnectionEndReason::ProtocolError,
+                            "sync_for_non_subscription",
+                        ),
+                        Some(channel) => {
+                            if let Some(head_seq) = channel.head_seq_if_open() {
+                                let frame = rpc::encode_sync_ack_frame(id, head_seq)
+                                    .expect("active subscription id");
+                                if let Err(error) = writer.queue_sync_ack(frame) {
+                                    warn!(request_id=id, %error, "failed to queue subscription SYNC_ACK");
+                                    subscribe::fail_sync_reply(conn, id);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
         RpcRecord::Credit {
             storage_bytes,
             item_demand,
@@ -3345,6 +3451,14 @@ async fn handle_rpc_record(
             value,
         } => {
             handle_open_record(server, conn, writer, id, identity, method_idx, mode, value).await;
+        }
+        RpcRecord::OpenSubscribe {
+            identity,
+            topic_name,
+            options,
+        } => {
+            handle_open_subscribe_record(server, conn, writer, id, identity, topic_name, options)
+                .await;
         }
         RpcRecord::OpenContinuation { value } => {
             let lookup = conn.calls.lock().continuation(id);
@@ -3427,6 +3541,178 @@ async fn handle_rpc_record(
             "unsupported_request_record",
         ),
     }
+}
+
+async fn handle_open_subscribe_record(
+    server: &Arc<Server>,
+    conn: &Arc<Connection>,
+    writer: &Arc<ConnectionWriter>,
+    id: u64,
+    identity: RouteCallIdentity,
+    topic_name: String,
+    options: rpc::WireSubscribeOptions,
+) {
+    let flight = crate::connection::FlightGuard::new(conn);
+    if conn.is_deactivated() || conn.shutdown_requested() {
+        queue_open_refusal(
+            writer,
+            id,
+            &C2Error::new(
+                ErrorCode::ResourceClosed,
+                "connection admission is closed; subscription was not attached",
+            ),
+        )
+        .await;
+        return;
+    }
+
+    let attach_result = {
+        let dispatcher = server.dispatcher.read();
+        match dispatcher.resolve(&identity.route_name) {
+            None => Err(route_admission_error(
+                if dispatcher.was_removed(&identity.route_name) {
+                    RouteAdmissionError::RouteRemoved {
+                        route_name: identity.route_name.clone(),
+                    }
+                } else {
+                    RouteAdmissionError::RouteNotFound(identity.route_name.clone())
+                },
+            )),
+            Some(route) => {
+                if route.crm_ns != identity.crm_ns
+                    || route.crm_name != identity.crm_name
+                    || route.crm_ver != identity.crm_ver
+                    || route.abi_hash != identity.abi_hash
+                    || route.signature_hash != identity.signature_hash
+                {
+                    Err(route_admission_error(
+                        RouteAdmissionError::ContractMismatch {
+                            route_name: identity.route_name.clone(),
+                            reason: format!(
+                                "expected {}/{}/{} abi_hash={} signature_hash={}, got {}/{}/{} abi_hash={} signature_hash={}",
+                                identity.crm_ns,
+                                identity.crm_name,
+                                identity.crm_ver,
+                                identity.abi_hash,
+                                identity.signature_hash,
+                                route.crm_ns,
+                                route.crm_name,
+                                route.crm_ver,
+                                route.abi_hash,
+                                route.signature_hash,
+                            ),
+                        },
+                    ))
+                } else if route.scheduler.route_admission_state() != RouteAdmissionState::Opened
+                    || conn.shutdown_requested()
+                    || server.admission.lock().is_closed()
+                {
+                    Err(C2Error::new(ErrorCode::ResourceClosed, "route closed"))
+                } else {
+                    match &route.topics {
+                        None => Err(crate::topic::unknown_topic_error(
+                            &identity.route_name,
+                            &topic_name,
+                        )),
+                        Some(topics) => {
+                            let attach = topics.attach_remote(&topic_name, options.into());
+                            match attach {
+                                Err(error) => Err(error),
+                                Ok(attach) => {
+                                    // N admission with internal N-1 subscription slot guard.
+                                    match server.domain_budget.reserve_subscription_operation() {
+                                        Err(error) => {
+                                            drop(attach);
+                                            let reason = match error.reason {
+                                                c2_mem::RetentionRejectReason::Closed => "closed",
+                                                c2_mem::RetentionRejectReason::LimitReached => {
+                                                    "limit_reached"
+                                                }
+                                            };
+                                            Err(C2Error::new(
+                                                ErrorCode::CallCapacityExceeded,
+                                                format!(
+                                                    "server subscription admission rejected the request: {error}"
+                                                ),
+                                            )
+                                            .with_details(std::collections::BTreeMap::from([
+                                                (
+                                                    "stage".to_string(),
+                                                    "call_execution_admission".to_string(),
+                                                ),
+                                                ("reason".to_string(), reason.to_string()),
+                                                (
+                                                    "used".to_string(),
+                                                    error.used_operations.to_string(),
+                                                ),
+                                                (
+                                                    "max".to_string(),
+                                                    error.max_operations.to_string(),
+                                                ),
+                                                ("request_id".to_string(), id.to_string()),
+                                            ])))
+                                        }
+                                        Ok(operation) => match conn.core.subscribe_open(id) {
+                                            Err(error) => {
+                                                drop(operation);
+                                                drop(attach);
+                                                Err(C2Error::new(
+                                                    ErrorCode::ResourceClosed,
+                                                    error.to_string(),
+                                                ))
+                                            }
+                                            Ok(()) => {
+                                                let call = ServerCall {
+                                                    _operation: Some(operation),
+                                                    ..ServerCall::default()
+                                                };
+                                                *call.stream.lock() = Some(StreamCallControl {
+                                                    route_uid: route.route_uid.clone(),
+                                                    cancellation: None,
+                                                    sync_reply_failed: false,
+                                                    topic_channel: Some(Arc::clone(
+                                                        &attach.channel,
+                                                    )),
+                                                });
+                                                let record = conn
+                                                    .calls
+                                                    .lock()
+                                                    .insert_open(id, call)
+                                                    .expect(
+                                                        "admitted OPEN follows the advanced high-water mark",
+                                                    );
+                                                record.queue();
+                                                assert!(
+                                                    record.enter_resource(),
+                                                    "freshly admitted subscription enters active state"
+                                                );
+                                                Ok(attach)
+                                            }
+                                        },
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    };
+
+    let attach = match attach_result {
+        Ok(attach) => attach,
+        Err(error) => {
+            queue_open_refusal(writer, id, &error).await;
+            return;
+        }
+    };
+
+    let conn = conn.clone();
+    let writer = writer.clone();
+    let budget = server.domain_budget.clone();
+    tokio::spawn(async move {
+        subscribe::drive_subscription(conn, writer, id, attach, flight, budget).await;
+    });
 }
 
 /// The OPEN admission path. The request-ID high-water mark is already
@@ -3701,6 +3987,8 @@ fn insert_admitted_call(
         *call.stream.lock() = Some(StreamCallControl {
             route_uid: admission.route.route_uid.clone(),
             cancellation: None,
+            topic_channel: None,
+            sync_reply_failed: false,
         });
     }
     conn.calls
@@ -4045,6 +4333,7 @@ fn route_admission_error(err: RouteAdmissionError) -> C2Error {
             let label = |mode| match mode {
                 CallMode::Unary => "unary",
                 CallMode::ServerStream => "server_stream",
+                CallMode::Subscribe => "subscribe",
             };
             let call_mode = label(call_mode);
             let method_mode = label(method_mode);
@@ -4837,3 +5126,6 @@ mod disconnect_tests;
 
 #[path = "stream.rs"]
 mod stream;
+
+#[path = "subscribe.rs"]
+mod subscribe;

@@ -1,4 +1,4 @@
-//! IPC 16 RPC record codec. Connection admission owns call state and cumulative offsets.
+//! IPC 17 RPC record codec. Connection admission owns call state and cumulative offsets.
 
 use c2_error::C2Error;
 
@@ -29,7 +29,7 @@ pub const MAX_INLINE_CALL_END_ERROR_BYTES: usize =
 /// boundary or grows the payload measurably.
 const CALL_END_TRUNCATION_MARKER: &str = "...[truncated]";
 
-/// Wire encoding failed because a field cannot be represented by IPC 16.
+/// Wire encoding failed because a field cannot be represented by IPC 17.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EncodeError {
     FieldTooLong {
@@ -149,11 +149,31 @@ fn read_identity_text(
     Ok(value)
 }
 
-/// Decode and validate the OPEN kind, six identity fields, method index and call mode.
-/// Returns the byte offset where the value storage begins.
+/// Decode and validate the OPEN kind, six identity fields, call mode and method
+/// index for unary or server-stream calls. Returns the byte offset where value
+/// storage begins.
 pub fn decode_open_metadata(
     payload: &[u8],
 ) -> Result<(RouteCallIdentity, u16, CallMode, usize), DecodeError> {
+    let (identity, mode, mut pos) = decode_open_identity_and_mode(payload)?;
+    if mode == CallMode::Subscribe {
+        return Err(invalid("call mode", mode as u64));
+    }
+    if payload.len() - pos < 2 {
+        return Err(DecodeError::Truncated {
+            field: "method_idx",
+            need: 2,
+            have: payload.len() - pos,
+        });
+    }
+    let method_idx = u16::from_le_bytes(payload[pos..pos + 2].try_into().unwrap());
+    pos += 2;
+    Ok((identity, method_idx, mode, pos))
+}
+
+fn decode_open_identity_and_mode(
+    payload: &[u8],
+) -> Result<(RouteCallIdentity, CallMode, usize), DecodeError> {
     if payload.first().copied() != Some(RpcRecordKind::Open as u8) {
         return Err(invalid(
             "OPEN kind",
@@ -191,15 +211,6 @@ pub fn decode_open_metadata(
             reason: error.to_string(),
         }
     })?;
-    if payload.len() - pos < 2 {
-        return Err(DecodeError::Truncated {
-            field: "method_idx",
-            need: 2,
-            have: payload.len() - pos,
-        });
-    }
-    let method_idx = u16::from_le_bytes(payload[pos..pos + 2].try_into().unwrap());
-    pos += 2;
     let mode = CallMode::try_from(*payload.get(pos).ok_or(DecodeError::Truncated {
         field: "call mode",
         need: 1,
@@ -215,7 +226,6 @@ pub fn decode_open_metadata(
             abi_hash,
             signature_hash,
         },
-        method_idx,
         mode,
         pos,
     ))
@@ -231,6 +241,9 @@ pub enum RpcRecordKind {
     Cancel = 5,
     CallEnd = 6,
     Release = 7,
+    Ready = 8,
+    Sync = 9,
+    SyncAck = 10,
 }
 
 impl TryFrom<u8> for RpcRecordKind {
@@ -245,6 +258,9 @@ impl TryFrom<u8> for RpcRecordKind {
             5 => Ok(Self::Cancel),
             6 => Ok(Self::CallEnd),
             7 => Ok(Self::Release),
+            8 => Ok(Self::Ready),
+            9 => Ok(Self::Sync),
+            10 => Ok(Self::SyncAck),
             _ => Err(invalid("RPC record kind", value.into())),
         }
     }
@@ -255,6 +271,7 @@ impl TryFrom<u8> for RpcRecordKind {
 pub enum CallMode {
     Unary = 0,
     ServerStream = 1,
+    Subscribe = 2,
 }
 
 impl TryFrom<u8> for CallMode {
@@ -264,8 +281,57 @@ impl TryFrom<u8> for CallMode {
         match value {
             0 => Ok(Self::Unary),
             1 => Ok(Self::ServerStream),
+            2 => Ok(Self::Subscribe),
             _ => Err(invalid("call mode", value.into())),
         }
+    }
+}
+
+/// Wire encoding of subscription starting position (`start`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum WireTopicStart {
+    #[default]
+    Latest = 0,
+    Next = 1,
+}
+
+/// Wire encoding of subscription lag policy (`on_lag`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum WireLagPolicy {
+    #[default]
+    Skip = 0,
+    Error = 1,
+}
+
+/// Packed one-byte subscription options carried in IPC 17 Subscribe OPEN.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub struct WireSubscribeOptions {
+    pub start: WireTopicStart,
+    pub on_lag: WireLagPolicy,
+}
+
+impl WireSubscribeOptions {
+    pub const fn to_byte(self) -> u8 {
+        (self.start as u8) | ((self.on_lag as u8) << 1)
+    }
+
+    pub fn from_byte(byte: u8) -> Result<Self, DecodeError> {
+        if byte & !0x03 != 0 {
+            return Err(invalid("subscribe options", byte.into()));
+        }
+        let start = if byte & 0x01 == 0 {
+            WireTopicStart::Latest
+        } else {
+            WireTopicStart::Next
+        };
+        let on_lag = if byte & 0x02 == 0 {
+            WireLagPolicy::Skip
+        } else {
+            WireLagPolicy::Error
+        };
+        Ok(Self { start, on_lag })
     }
 }
 
@@ -368,11 +434,24 @@ pub enum RpcRecord<'a> {
         mode: CallMode,
         value: ValuePart<'a>,
     },
+    OpenSubscribe {
+        identity: RouteCallIdentity,
+        topic_name: String,
+        options: WireSubscribeOptions,
+    },
     OpenContinuation {
         value: ValuePart<'a>,
     },
+    Ready {
+        start_seq: u64,
+    },
+    Sync,
+    SyncAck {
+        head_seq: u64,
+    },
     ItemBegin {
         total_bytes: u64,
+        seq: Option<u64>,
     },
     ItemData {
         value: ValuePart<'a>,
@@ -447,6 +526,9 @@ fn inspect_carrier(
                         return None;
                     }
                 }
+                if *payload.get(offset)? == CallMode::Subscribe as u8 {
+                    return None;
+                }
                 offset = offset.checked_add(3)?;
             }
             RpcRecordKind::CallEnd => {
@@ -456,7 +538,9 @@ fn inspect_carrier(
                     CallStatus::NotExecuted => {}
                     CallStatus::Success | CallStatus::Failed => match mode? {
                         CallMode::Unary => {}
-                        CallMode::ServerStream => offset = offset.checked_add(8)?,
+                        CallMode::ServerStream | CallMode::Subscribe => {
+                            offset = offset.checked_add(8)?;
+                        }
                     },
                 }
             }
@@ -499,7 +583,11 @@ pub fn decode_rpc_record<'a>(
     let response = header.flags & FLAG_RESPONSE != 0;
     let expected_response = matches!(
         kind,
-        RpcRecordKind::ItemBegin | RpcRecordKind::ItemData | RpcRecordKind::CallEnd
+        RpcRecordKind::ItemBegin
+            | RpcRecordKind::ItemData
+            | RpcRecordKind::CallEnd
+            | RpcRecordKind::Ready
+            | RpcRecordKind::SyncAck
     );
     if kind != RpcRecordKind::Release && response != expected_response {
         return Err(DecodeError::InvalidRpcEnvelope {
@@ -540,7 +628,46 @@ pub fn decode_rpc_record<'a>(
                     value: decode_value(body, shm, ChunkPosition::Continuation)?,
                 });
             }
-            let (identity, method_idx, mode, used) = decode_open_metadata(payload)?;
+            let (identity, mode, mut used) = decode_open_identity_and_mode(payload)?;
+            if mode == CallMode::Subscribe {
+                if !no_storage {
+                    return Err(invalid("Subscribe OPEN flags", header.flags.into()));
+                }
+                let topic_name = read_identity_text(payload, &mut used, "topic_name")?;
+                c2_contract::validate_contract_text_field("topic_name", &topic_name).map_err(
+                    |error| DecodeError::InvalidText {
+                        field: "topic_name",
+                        reason: error.to_string(),
+                    },
+                )?;
+                let options_byte = *payload.get(used).ok_or(DecodeError::Truncated {
+                    field: "subscribe options",
+                    need: 1,
+                    have: 0,
+                })?;
+                used += 1;
+                if used != payload.len() {
+                    return Err(invalid(
+                        "Subscribe OPEN trailing bytes",
+                        (payload.len() - used) as u64,
+                    ));
+                }
+                let options = WireSubscribeOptions::from_byte(options_byte)?;
+                return Ok(RpcRecord::OpenSubscribe {
+                    identity,
+                    topic_name,
+                    options,
+                });
+            }
+            if payload.len() - used < 2 {
+                return Err(DecodeError::Truncated {
+                    field: "method_idx",
+                    need: 2,
+                    have: payload.len() - used,
+                });
+            }
+            let method_idx = u16::from_le_bytes(payload[used..used + 2].try_into().unwrap());
+            used += 2;
             let value = decode_value_at(payload, used, shm, first)?;
             Ok(RpcRecord::Open {
                 identity,
@@ -549,14 +676,77 @@ pub fn decode_rpc_record<'a>(
                 value,
             })
         }
+        RpcRecordKind::Ready => {
+            require_exact(body, 8, "READY")?;
+            if !no_storage {
+                return Err(invalid("READY flags", header.flags.into()));
+            }
+            let start_seq = u64::from_le_bytes(body.try_into().unwrap());
+            if start_seq == 0 {
+                return Err(invalid("READY start_seq", 0));
+            }
+            Ok(RpcRecord::Ready { start_seq })
+        }
+        RpcRecordKind::Sync => {
+            require_exact(body, 0, "SYNC")?;
+            if !no_storage {
+                return Err(invalid("SYNC flags", header.flags.into()));
+            }
+            Ok(RpcRecord::Sync)
+        }
+        RpcRecordKind::SyncAck => {
+            require_exact(body, 8, "SYNC_ACK")?;
+            if !no_storage {
+                return Err(invalid("SYNC_ACK flags", header.flags.into()));
+            }
+            Ok(RpcRecord::SyncAck {
+                head_seq: u64::from_le_bytes(body.try_into().unwrap()),
+            })
+        }
         RpcRecordKind::ItemBegin => {
-            require_exact(body, 8, "ITEM_BEGIN")?;
             if !no_storage {
                 return Err(invalid("ITEM_BEGIN flags", header.flags.into()));
             }
-            Ok(RpcRecord::ItemBegin {
-                total_bytes: u64::from_le_bytes(body.try_into().unwrap()),
-            })
+            match mode {
+                Some(CallMode::ServerStream) => {
+                    require_exact(body, 8, "ITEM_BEGIN")?;
+                    Ok(RpcRecord::ItemBegin {
+                        total_bytes: u64::from_le_bytes(body.try_into().unwrap()),
+                        seq: None,
+                    })
+                }
+                Some(CallMode::Subscribe) => {
+                    require_exact(body, 16, "Subscribe ITEM_BEGIN")?;
+                    let seq = u64::from_le_bytes(body[..8].try_into().unwrap());
+                    if seq == 0 {
+                        return Err(invalid("ITEM_BEGIN seq", 0));
+                    }
+                    let total_bytes = u64::from_le_bytes(body[8..16].try_into().unwrap());
+                    Ok(RpcRecord::ItemBegin {
+                        total_bytes,
+                        seq: Some(seq),
+                    })
+                }
+                None => match body.len() {
+                    8 => Ok(RpcRecord::ItemBegin {
+                        total_bytes: u64::from_le_bytes(body.try_into().unwrap()),
+                        seq: None,
+                    }),
+                    16 => {
+                        let seq = u64::from_le_bytes(body[..8].try_into().unwrap());
+                        if seq == 0 {
+                            return Err(invalid("ITEM_BEGIN seq", 0));
+                        }
+                        let total_bytes = u64::from_le_bytes(body[8..16].try_into().unwrap());
+                        Ok(RpcRecord::ItemBegin {
+                            total_bytes,
+                            seq: Some(seq),
+                        })
+                    }
+                    other => Err(invalid("ITEM_BEGIN", other as u64)),
+                },
+                Some(CallMode::Unary) => Err(invalid("ITEM_BEGIN mode", CallMode::Unary as u64)),
+            }
         }
         RpcRecordKind::ItemData => {
             let value = decode_value(body, shm, ChunkPosition::Whole)?;
@@ -604,7 +794,7 @@ pub fn decode_rpc_record<'a>(
                 CallStatus::Success | CallStatus::Failed => {
                     match mode.ok_or_else(|| invalid("CALL_END mode", 0))? {
                         CallMode::Unary => (None, 1),
-                        CallMode::ServerStream => {
+                        CallMode::ServerStream | CallMode::Subscribe => {
                             if body.len() < 9 {
                                 return Err(DecodeError::BufferTooShort {
                                     need: 9,
@@ -720,6 +910,8 @@ fn validate_call_end(
             .map_err(|err| err.to_string())?
             .ok_or_else(|| "error is empty".into())
             .map(Some);
+    } else if mode == Some(CallMode::Subscribe) {
+        return Err("subscription CALL_END must carry a terminal error".into());
     } else if mode == Some(CallMode::ServerStream)
         && value != ValuePart::whole(ValueStorage::Inline(&[]))
     {
@@ -911,8 +1103,14 @@ fn open_record_prefix<S: AsRef<str>>(
     if chunk == ChunkPosition::Continuation {
         return Err(encode_invalid("OPEN", "invalid request id or continuation"));
     }
+    if mode == CallMode::Subscribe {
+        return Err(encode_invalid(
+            "call mode",
+            "subscribe OPEN requires encode_open_subscribe_frame",
+        ));
+    }
     let fields = identity_fields(identity);
-    let metadata_len = 1 + identity_encoded_len(&fields)? + 2 + 1;
+    let metadata_len = 1 + identity_encoded_len(&fields)? + 1 + 2;
     let mut out = record_frame(
         request_id,
         FLAG_RPC_RECORD | flags,
@@ -923,11 +1121,64 @@ fn open_record_prefix<S: AsRef<str>>(
         out.push(field.len() as u8);
         out.extend_from_slice(field.as_bytes());
     }
-    out.extend_from_slice(&method_idx.to_le_bytes());
     out.push(mode as u8);
+    out.extend_from_slice(&method_idx.to_le_bytes());
     if let ChunkPosition::First { total_bytes } = chunk {
         out.extend_from_slice(&total_bytes.to_le_bytes());
     }
+    Ok(out)
+}
+
+/// Encode a Subscribe OPEN frame with an explicit nonzero request ID.
+pub fn encode_open_subscribe_frame<S: AsRef<str>>(
+    request_id: u64,
+    identity: &RouteCallIdentity<S>,
+    topic_name: &str,
+    options: WireSubscribeOptions,
+) -> Result<Vec<u8>, EncodeError> {
+    if request_id == 0 {
+        return Err(encode_invalid("OPEN", "request id must be nonzero"));
+    }
+    encode_open_subscribe_record(request_id, identity, topic_name, options)
+}
+
+/// Encode a complete Subscribe OPEN draft. The connection's unique writer
+/// assigns its RID before publication.
+pub fn encode_open_subscribe_draft_frame<S: AsRef<str>>(
+    identity: &RouteCallIdentity<S>,
+    topic_name: &str,
+    options: WireSubscribeOptions,
+) -> Result<Vec<u8>, EncodeError> {
+    encode_open_subscribe_record(0, identity, topic_name, options)
+}
+
+fn encode_open_subscribe_record<S: AsRef<str>>(
+    request_id: u64,
+    identity: &RouteCallIdentity<S>,
+    topic_name: &str,
+    options: WireSubscribeOptions,
+) -> Result<Vec<u8>, EncodeError> {
+    c2_contract::validate_contract_text_field("topic_name", topic_name)
+        .map_err(|error| encode_invalid("topic_name", &error.to_string()))?;
+    if topic_name.len() > u8::MAX as usize {
+        return Err(EncodeError::FieldTooLong {
+            field: "topic_name",
+            max: u8::MAX as usize,
+            actual: topic_name.len(),
+        });
+    }
+    let fields = identity_fields(identity);
+    let payload_len = 1 + identity_encoded_len(&fields)? + 1 + 1 + topic_name.len() + 1;
+    let mut out = record_frame(request_id, FLAG_RPC_RECORD, payload_len)?;
+    out.push(RpcRecordKind::Open as u8);
+    for field in fields {
+        out.push(field.len() as u8);
+        out.extend_from_slice(field.as_bytes());
+    }
+    out.push(CallMode::Subscribe as u8);
+    out.push(topic_name.len() as u8);
+    out.extend_from_slice(topic_name.as_bytes());
+    out.push(options.to_byte());
     Ok(out)
 }
 
@@ -1040,7 +1291,8 @@ pub fn encode_call_end_frame(
             reason,
         }
     })?;
-    let has_count = status != CallStatus::NotExecuted && mode == CallMode::ServerStream;
+    let has_count = status != CallStatus::NotExecuted
+        && matches!(mode, CallMode::ServerStream | CallMode::Subscribe);
     let (value_len, flags) = value_layout(value)?;
     let mut out = record_frame(
         request_id,
@@ -1146,12 +1398,64 @@ fn continuation_record_prefix(
     Ok(out)
 }
 
+pub fn encode_ready_frame(request_id: u64, start_seq: u64) -> Result<Vec<u8>, EncodeError> {
+    if request_id == 0 || start_seq == 0 {
+        return Err(encode_invalid(
+            "READY",
+            "request id and start_seq must be nonzero",
+        ));
+    }
+    let mut out = record_frame(request_id, FLAG_RPC_RECORD | FLAG_RESPONSE, 9)?;
+    out.push(RpcRecordKind::Ready as u8);
+    out.extend_from_slice(&start_seq.to_le_bytes());
+    Ok(out)
+}
+
+/// Request the current head of an active subscription's source topic.
+pub fn encode_sync_frame(request_id: u64) -> Result<Vec<u8>, EncodeError> {
+    if request_id == 0 {
+        return Err(encode_invalid("SYNC", "request id must be nonzero"));
+    }
+    let mut out = record_frame(request_id, FLAG_RPC_RECORD, 1)?;
+    out.push(RpcRecordKind::Sync as u8);
+    Ok(out)
+}
+
+/// Acknowledge SYNC. An empty topic has head sequence zero.
+pub fn encode_sync_ack_frame(request_id: u64, head_seq: u64) -> Result<Vec<u8>, EncodeError> {
+    if request_id == 0 {
+        return Err(encode_invalid("SYNC_ACK", "request id must be nonzero"));
+    }
+    let mut out = record_frame(request_id, FLAG_RPC_RECORD | FLAG_RESPONSE, 9)?;
+    out.push(RpcRecordKind::SyncAck as u8);
+    out.extend_from_slice(&head_seq.to_le_bytes());
+    Ok(out)
+}
+
 pub fn encode_item_begin_frame(request_id: u64, total_bytes: u64) -> Result<Vec<u8>, EncodeError> {
     if request_id == 0 {
         return Err(encode_invalid("ITEM_BEGIN", "request id must be nonzero"));
     }
     let mut out = record_frame(request_id, FLAG_RPC_RECORD | FLAG_RESPONSE, 9)?;
     out.push(RpcRecordKind::ItemBegin as u8);
+    out.extend_from_slice(&total_bytes.to_le_bytes());
+    Ok(out)
+}
+
+pub fn encode_subscribe_item_begin_frame(
+    request_id: u64,
+    seq: u64,
+    total_bytes: u64,
+) -> Result<Vec<u8>, EncodeError> {
+    if request_id == 0 || seq == 0 {
+        return Err(encode_invalid(
+            "ITEM_BEGIN",
+            "request id and seq must be nonzero",
+        ));
+    }
+    let mut out = record_frame(request_id, FLAG_RPC_RECORD | FLAG_RESPONSE, 17)?;
+    out.push(RpcRecordKind::ItemBegin as u8);
+    out.extend_from_slice(&seq.to_le_bytes());
     out.extend_from_slice(&total_bytes.to_le_bytes());
     Ok(out)
 }

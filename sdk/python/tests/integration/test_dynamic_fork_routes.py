@@ -329,13 +329,13 @@ def _run_dynamic_fork_workload(
             )
             branch_proxy = None
             try:
-                registered_name = server.register(
+                registered = server.register(
                     ForkableSim,
                     branch_resource,
                     name=branch_name,
                     concurrency=cc.ConcurrencyConfig(mode='read_parallel', max_workers=2),
                 )
-                assert registered_name == branch_name
+                assert registered.name == branch_name
 
                 branch_proxy = client.connect(
                     ForkableSim,

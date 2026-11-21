@@ -16,7 +16,7 @@ def require_c2_mem_node_build(repository: Path) -> None:
     ) if not path.is_file()]
     if missing:
         pytest.fail(
-            "c2-mem-ffi Node binding is not built: " + ", ".join(map(str, missing))
+            "c2-mem-ffi ABI 9 Node binding is not built: " + ", ".join(map(str, missing))
             + ". From the checkout root, run `npm ci --ignore-scripts --prefix core/foundation/c2-mem-ffi/bindings/typescript` "
             "then `node core/foundation/c2-mem-ffi/bindings/typescript/scripts/build-runtime.mjs`.",
             pytrace=False,

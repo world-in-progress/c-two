@@ -504,6 +504,13 @@ class RouteConflict(_FixedCodeError):
     _default_message = 'Route conflict'
 
 
+class SubscriptionLagged(_FixedCodeError):
+    """Raised when a strict topic subscription misses evicted history."""
+
+    _code = ErrorCode.SubscriptionLagged
+    _default_message = 'Subscription lagged'
+
+
 _CODE_TO_CLASS: dict[int, type[CCError]] = {
     int(ErrorCode.ResourceInputDeserializing): SerializationError,
     int(ErrorCode.ResourceOutputSerializing): SerializationError,
@@ -526,6 +533,7 @@ _CODE_TO_CLASS: dict[int, type[CCError]] = {
     int(ErrorCode.CallCapacityExceeded): CallCapacityExceeded,
     int(ErrorCode.CallCancelled): CallCancelled,
     int(ErrorCode.RouteConflict): RouteConflict,
+    int(ErrorCode.SubscriptionLagged): SubscriptionLagged,
 }
 
 
@@ -680,4 +688,5 @@ __all__ = [
     'CallCapacityExceeded',
     'CallCancelled',
     'RouteConflict',
+    'SubscriptionLagged',
 ]

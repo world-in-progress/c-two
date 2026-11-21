@@ -114,6 +114,22 @@ impl CallExecutionContext {
         })
     }
 
+    /// Reserve one client-domain subscription operation slot under the `N-1`
+    /// guard (ADR 0005), returning the permit that must stay attached to the
+    /// transport receive record until its real terminal `CALL_END` or EOF.
+    pub(crate) fn reserve_subscription_scope(
+        &self,
+        scope: &CallScope,
+    ) -> Result<OperationPermit, Error> {
+        scope.check_pre_dispatch().map_err(scope_error)?;
+        let permit = self
+            .budget
+            .reserve_subscription_operation()
+            .map_err(|error| settle_failure(scope, admission_error(error)))?;
+        scope.check_pre_dispatch().map_err(scope_error)?;
+        Ok(permit)
+    }
+
     /// Stops new call slots. Already admitted calls may still reserve memory
     /// for their real storage; this does not cancel work or refund.
     #[cfg(test)]

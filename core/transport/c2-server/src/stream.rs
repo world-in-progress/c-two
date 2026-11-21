@@ -433,7 +433,7 @@ async fn send_item(
             .stream_data(id, width as u64)
             .map_err(|error| ItemSendError::Output(error.to_string()))?;
         writer
-            .write_item(id, bytes)
+            .write_item(id, bytes, None)
             .await
             .map_err(|error| ItemSendError::Transport(error.to_string()))?;
         offset += width;

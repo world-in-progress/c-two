@@ -209,6 +209,7 @@ struct DomainState {
     memory: BudgetCellSnapshot,
     file_spill: BudgetCellSnapshot,
     operations: RetentionSnapshot,
+    active_subscriptions: u64,
     memory_waiters: AsyncWaiters,
 }
 
@@ -277,6 +278,7 @@ impl DomainBudget {
                         rejected_reservations: 0,
                         closed: false,
                     },
+                    active_subscriptions: 0,
                     memory_waiters: AsyncWaiters::default(),
                 }),
                 memory_changed: Condvar::new(),
@@ -392,6 +394,47 @@ impl DomainBudget {
         operations.peak_operations = operations.peak_operations.max(operations.used_operations);
         Ok(OperationPermit {
             shared: Arc::clone(&self.shared),
+            is_subscription: false,
+        })
+    }
+
+    /// Reserve one business slot for a long-lived topic subscription.
+    ///
+    /// When `max_operations >= 2`, long-lived subscriptions may occupy at most
+    /// `max_operations - 1` slots so at least one ordinary control/unary call
+    /// can always enter once transient calls complete. `max_operations == 1`
+    /// permits one total operation; `max_operations == 0` rejects all.
+    pub fn reserve_subscription_operation(&self) -> Result<OperationPermit, RetentionError> {
+        let mut state = self.shared.lock();
+        let max_ops = state.operations.max_operations;
+        let max_subs = if max_ops >= 2 { max_ops - 1 } else { max_ops };
+        let rejection = if state.operations.closed {
+            Some(RetentionRejectReason::Closed)
+        } else if state.operations.used_operations == max_ops
+            || state.active_subscriptions >= max_subs
+        {
+            Some(RetentionRejectReason::LimitReached)
+        } else {
+            None
+        };
+        if let Some(reason) = rejection {
+            state.operations.rejected_reservations =
+                state.operations.rejected_reservations.saturating_add(1);
+            return Err(RetentionError {
+                reason,
+                used_operations: state.operations.used_operations,
+                max_operations: max_ops,
+            });
+        }
+        state.operations.used_operations += 1;
+        state.operations.peak_operations = state
+            .operations
+            .peak_operations
+            .max(state.operations.used_operations);
+        state.active_subscriptions += 1;
+        Ok(OperationPermit {
+            shared: Arc::clone(&self.shared),
+            is_subscription: true,
         })
     }
 
@@ -632,16 +675,23 @@ impl Drop for FileSpillReservation {
 #[derive(Debug)]
 pub struct OperationPermit {
     shared: Arc<Shared>,
+    is_subscription: bool,
 }
 
 impl Drop for OperationPermit {
     fn drop(&mut self) {
         let mut state = self.shared.lock();
-        let operations = &mut state.operations;
-        operations.used_operations = operations
+        state.operations.used_operations = state
+            .operations
             .used_operations
             .checked_sub(1)
             .expect("operation permit released more than once");
+        if self.is_subscription {
+            state.active_subscriptions = state
+                .active_subscriptions
+                .checked_sub(1)
+                .expect("subscription permit released more than once");
+        }
     }
 }
 

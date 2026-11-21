@@ -323,6 +323,29 @@ impl SyncClient {
             .await
     }
 
+    pub async fn subscribe_bound_controlled_async_phased(
+        &self,
+        binding: &RouteBinding,
+        topic_name: &str,
+        options: c2_wire::rpc::WireSubscribeOptions,
+        budget: c2_mem::DomainBudget,
+        completion_owner: Box<dyn Send>,
+        cancellation: crate::IpcSubscribeCancellation,
+        control: &IpcCallControl,
+    ) -> Result<crate::IpcTopicSubscription, IpcCallError> {
+        self.inner
+            .subscribe_bound_controlled_phased(
+                binding,
+                topic_name,
+                options,
+                budget,
+                completion_owner,
+                cancellation,
+                control,
+            )
+            .await
+    }
+
     /// The frozen role-domain budget this connection's pools charge.
     pub fn domain_budget(&self) -> &c2_mem::DomainBudget {
         self.inner.domain_budget()

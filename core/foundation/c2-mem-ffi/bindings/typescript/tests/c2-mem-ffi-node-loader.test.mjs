@@ -41,7 +41,7 @@ test('native endpoint resolution validates arguments and derives one OS endpoint
   }
 });
 
-test('bundled ABI 8 loader resolves the packaged native library', () => {
+test('bundled ABI 9 loader resolves the packaged native library', () => {
   const path = bundled();
   assert.equal(existsSync(path), true, `${path} must exist; run npm run build:node-addon`);
   assert.match(path, /dist[\\/]native[\\/](?:libc2_mem_ffi\.(?:dylib|so)|c2_mem_ffi\.dll)$/);
@@ -93,7 +93,7 @@ test('captured native context freezes roots and env files without creating endpo
   skip: process.platform === 'win32' && 'Unix roots are unsupported on Windows',
 }, () => {
   const { symbols } = loadBundledC2MemFfiNodeNativeSymbols();
-  const directory = mkdtempSync(resolve(tmpdir(), 'c2-abi8-snapshot-'));
+  const directory = mkdtempSync(resolve(tmpdir(), 'c2-abi9-snapshot-'));
   const envFile = resolve(directory, 'endpoint.env');
   const oldRoot = process.env.C2_IPC_ROOT;
   const oldFile = process.env.C2_ENV_FILE;
@@ -236,20 +236,20 @@ test('Windows context retains current-SID pipe defaults and rejects Unix root ov
   } finally { context.close(); }
 });
 
-test('ABI 8 refuses an incomplete library after checking its version', () => {
-  const directory = mkdtempSync(resolve(tmpdir(), 'c2-incomplete-abi8-'));
+test('ABI 9 refuses an incomplete library after checking its version', () => {
+  const directory = mkdtempSync(resolve(tmpdir(), 'c2-incomplete-abi9-'));
   try {
-    const library = compileVersionOnly(directory, 8);
+    const library = compileVersionOnly(directory, 9);
     assert.throws(() => loadC2MemFfiNodeNativeSymbols(library),
       /Failed to load c2-mem-ffi symbol c2_mem_ffi_local_endpoint_context_capture/);
   } finally { rmSync(directory, { recursive: true, force: true }); }
 });
 
-test('ABI 7 is refused before loading any ABI 8 symbol', () => {
-  const directory = mkdtempSync(resolve(tmpdir(), 'c2-stale-abi7-'));
+test('ABI 8 is refused before loading any ABI 9 symbol', () => {
+  const directory = mkdtempSync(resolve(tmpdir(), 'c2-stale-abi8-'));
   try {
-    const library = compileVersionOnly(directory, 7);
-    assert.throws(() => loadC2MemFfiNodeNativeSymbols(library), /ABI version 7.*expected version 8/);
+    const library = compileVersionOnly(directory, 8);
+    assert.throws(() => loadC2MemFfiNodeNativeSymbols(library), /ABI version 8.*expected version 9/);
   } finally { rmSync(directory, { recursive: true, force: true }); }
 });
 
@@ -272,7 +272,7 @@ test('loader accepts a native library in a Unicode directory with spaces', () =>
 
 test('connector exposes a shared native domain and endpoint resolver', async () => {
   const connector = createNodeIpcConnector();
-  const address = 'ipc://runtime-abi8';
+  const address = 'ipc://runtime-abi9';
   assert.equal(typeof connector, 'function');
   assert.equal(typeof connector.stats, 'function');
   assert.equal(connector.resolveEndpoint(address), resolveLocalIpcEndpoint(address));

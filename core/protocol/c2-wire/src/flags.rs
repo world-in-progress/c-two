@@ -15,13 +15,13 @@ pub const FLAG_CTRL: u32 = 1 << 4;
 /// Payload references a buddy-allocated SHM block.
 pub const FLAG_BUDDY: u32 = 1 << 6;
 
-/// IPC 16 value is split across records.
+/// IPC 17 value is split across records.
 pub const FLAG_CHUNKED: u32 = 1 << 9;
 
-/// IPC 16 first chunk carries metadata and total value length.
+/// IPC 17 first chunk carries metadata and total value length.
 pub const FLAG_FIRST_CHUNK: u32 = 1 << 13;
 
-/// IPC 16 RPC record envelope.
+/// IPC 17 RPC record envelope.
 pub const FLAG_RPC_RECORD: u32 = 1 << 12;
 
 /// Frame carries a 1-byte signal (PING, PONG, SHUTDOWN, DISCONNECT, etc.).

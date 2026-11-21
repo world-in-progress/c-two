@@ -147,6 +147,8 @@ use c2_mem::BudgetedBuffer;
 pub mod forward;
 #[path = "stream.rs"]
 pub mod stream;
+#[path = "subscribe.rs"]
+pub mod subscribe;
 use c2_mem::{
     DomainBudget, DomainSnapshot, MemHandle, MemPool, PeerMappingCache, PeerMappingError, PeerRead,
     PoolAllocation,
@@ -614,6 +616,10 @@ impl RouteBinding {
             self.table.max_payload_size(),
         ))
     }
+
+    pub(crate) fn subscribe_target(&self) -> (RouteCallIdentity, u64) {
+        (self.table.call_identity(), self.table.max_payload_size())
+    }
 }
 
 // ── Route directory ──────────────────────────────────────────────────────
@@ -722,6 +728,7 @@ pub(crate) struct PendingResponse {
     upload_stop: Option<watch::Sender<bool>>,
     pub(crate) stream: Option<Arc<stream::StreamReceive>>,
     pub(crate) forward: Option<Arc<forward::ForwardReceive>>,
+    pub(crate) subscription: Option<Arc<subscribe::SubscribeReceive>>,
 }
 impl PendingResponse {
     pub(crate) fn complete(self, result: Result<ResponseData, IpcError>) {
@@ -740,6 +747,13 @@ impl PendingResponse {
             );
             // The upload waiter needs only a wakeup here; the stream retains
             // the concrete transport failure for completion().
+            if let Some(tx) = self.tx {
+                let _ = tx.send(Err(IpcError::Closed));
+            }
+        } else if let Some(subscription) = self.subscription {
+            subscription.transport_failed(result.err().unwrap_or_else(|| {
+                IpcError::Protocol("unary response for topic subscription".into())
+            }));
             if let Some(tx) = self.tx {
                 let _ = tx.send(Err(IpcError::Closed));
             }
@@ -1229,6 +1243,7 @@ impl IpcClient {
             upload_stop: None,
             stream: None,
             forward: None,
+            subscription: None,
         });
         Ok((
             SendGuard {
@@ -3230,10 +3245,13 @@ pub(crate) fn recv_loop(
                 continue;
             }
             let mode = match kind {
-                Some(PendingKind::Call(mode)) => mode,
-                _ => CallMode::Unary,
+                Some(PendingKind::Call(mode)) => Some(mode),
+                _ if historical && payload.first() == Some(&(RpcRecordKind::ItemBegin as u8)) => {
+                    None
+                }
+                _ => Some(CallMode::Unary),
             };
-            let record = match rpc::decode_rpc_record_with_carrier(&hdr, &payload, Some(mode)) {
+            let record = match rpc::decode_rpc_record_with_carrier(&hdr, &payload, mode) {
                 Ok(record) => record,
                 Err(failure) => {
                     if let Some(descriptor) = failure.carrier {
@@ -3255,8 +3273,12 @@ pub(crate) fn recv_loop(
                     }
                     if kind.is_some() {
                         registry.abort(conn_id, rid);
-                        if matches!(kind, Some(PendingKind::Call(CallMode::ServerStream)))
-                            && payload.first() == Some(&(RpcRecordKind::CallEnd as u8))
+                        if matches!(
+                            kind,
+                            Some(PendingKind::Call(
+                                CallMode::ServerStream | CallMode::Subscribe
+                            ))
+                        ) && payload.first() == Some(&(RpcRecordKind::CallEnd as u8))
                         {
                             conn.terminal_response_failed(rid, IpcError::Decode(failure.error));
                         } else {
@@ -3280,21 +3302,28 @@ pub(crate) fn recv_loop(
                         );
                         continue;
                     }
-                    RpcRecord::ItemBegin { .. } => continue,
+                    RpcRecord::ItemBegin { .. }
+                    | RpcRecord::Ready { .. }
+                    | RpcRecord::SyncAck { .. } => continue,
                     _ => {}
                 }
             }
-            let stream = pending
-                .lock()
-                .get(&rid)
-                .and_then(|entry| entry.stream.clone());
-            let forward = pending
-                .lock()
-                .get(&rid)
-                .and_then(|entry| entry.forward.clone());
+            let (stream, forward, subscription) = {
+                let guard = pending.lock();
+                match guard.get(&rid) {
+                    Some(entry) => (
+                        entry.stream.clone(),
+                        entry.forward.clone(),
+                        entry.subscription.clone(),
+                    ),
+                    None => (None, None, None),
+                }
+            };
             if let Some(forward) = forward {
                 let result = match record {
-                    RpcRecord::ItemBegin { total_bytes } => forward.begin(total_bytes),
+                    RpcRecord::Ready { start_seq } => forward.ready(start_seq),
+                    RpcRecord::SyncAck { head_seq } => forward.sync_ack(head_seq),
+                    RpcRecord::ItemBegin { total_bytes, seq } => forward.begin(seq, total_bytes),
                     RpcRecord::ItemData { value } => {
                         forward.data(value.storage, server_pool, shm_allowed, retirement.clone())
                     }
@@ -3336,9 +3365,64 @@ pub(crate) fn recv_loop(
                 conn.wake.notify_one();
                 continue;
             }
+            if let Some(subscription) = subscription {
+                let result = match record {
+                    RpcRecord::Ready { start_seq } => subscription.ready(start_seq),
+                    RpcRecord::ItemBegin {
+                        total_bytes,
+                        seq: Some(seq),
+                    } => subscription.begin(seq, total_bytes),
+                    RpcRecord::ItemData { value } => subscription.data(
+                        value.storage,
+                        server_pool,
+                        shm_allowed,
+                        retirement.clone(),
+                    ),
+                    RpcRecord::CallEnd {
+                        status,
+                        complete_items,
+                        error,
+                        value,
+                    } => {
+                        discard_response_storage(
+                            value.storage,
+                            server_pool,
+                            shm_allowed,
+                            conn,
+                            retirement.clone(),
+                        );
+                        let terminal = stream::StreamTerminal {
+                            status,
+                            complete_items: complete_items.unwrap_or(0),
+                            error,
+                        };
+                        let entry = pending
+                            .lock()
+                            .remove(&rid)
+                            .expect("active subscription reply");
+                        subscription.finish(terminal, entry);
+                        Ok(())
+                    }
+                    _ => Err(IpcError::Protocol("unexpected subscription record".into())),
+                };
+                if let Err(error) = result {
+                    if matches!(&error, IpcError::Protocol(_)) {
+                        conn.end(
+                            ConnectionEndReason::ProtocolError,
+                            "subscription_record_admission",
+                        );
+                    }
+                    subscription.fail_response(error);
+                }
+                conn.wake.notify_one();
+                continue;
+            }
             if let Some(stream) = stream {
                 let result = match record {
-                    RpcRecord::ItemBegin { total_bytes } => stream.begin(total_bytes),
+                    RpcRecord::ItemBegin {
+                        total_bytes,
+                        seq: None,
+                    } => stream.begin(total_bytes),
                     RpcRecord::ItemData { value } => {
                         stream.data(value.storage, server_pool, shm_allowed, retirement.clone())
                     }

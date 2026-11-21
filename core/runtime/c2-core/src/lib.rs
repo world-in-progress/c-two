@@ -21,6 +21,7 @@ pub mod memory;
 mod outcome;
 mod roles;
 mod session;
+mod topic;
 
 pub use c2_config::{ConnectOptions, ConnectTimeoutError};
 pub use c2_ipc::DirectIpcShutdownOutcome;
@@ -47,8 +48,8 @@ pub use error::{
 };
 pub use host::{
     EncodedService, EncodedStream, EncodedStreamItem, EncodedStreamService, Host, HostOptions,
-    MethodDefinition, Registration, RouteConcurrency, RouteConcurrencyError, RouteConcurrencyGuard,
-    RouteConcurrencySnapshot, ServiceConcurrencyMode, ServiceDefinition,
+    MethodDefinition, Registration, RegistrationObserver, RouteConcurrency, RouteConcurrencyError,
+    RouteConcurrencyGuard, RouteConcurrencySnapshot, ServiceConcurrencyMode, ServiceDefinition,
 };
 pub use identity::{
     auto_server_id, auto_server_instance_id, ipc_address_for_server_id, validate_server_id,
@@ -83,6 +84,11 @@ pub use roles::{ClientConfigPatch, RetiredRoleObserver};
 pub use session::{
     FailedStartShutdownReceipt, Runtime, RuntimeIdentity, RuntimeOptions, RuntimeShutdownReceipt,
     RuntimeShutdownTarget,
+};
+pub use topic::{
+    CoreTopicDelivery, CoreTopicSubscription, LagPolicy, LocalTopicSubscription,
+    MAX_TOPIC_RING_CAPACITY, SubscribeOptions, TopicCloseCause, TopicCloseReceipt, TopicConfig,
+    TopicDelivery, TopicFrame, TopicPublisher, TopicStart,
 };
 
 pub use c2_config::{

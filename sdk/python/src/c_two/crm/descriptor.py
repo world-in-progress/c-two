@@ -15,6 +15,7 @@ from .payload_plan import (
     PayloadPlanKind,
     _payload_type,
 )
+from .topic import topic_members
 
 _DESCRIPTOR_SCHEMA = "c-two.python.crm.descriptor.v2"
 _PORTABLE_CONTRACT_SCHEMA = "c-two.contract.v2"
@@ -50,7 +51,7 @@ def build_contract_descriptor(
 
     crm_ns, crm_name, crm_ver = crm_contract_identity(crm_class)
     method_names = rpc_method_names(crm_class) if methods is None else list(methods)
-    return {
+    descriptor: dict[str, Any] = {
         "crm": {
             "name": crm_name,
             "namespace": crm_ns,
@@ -62,6 +63,42 @@ def build_contract_descriptor(
         ],
         "schema": _DESCRIPTOR_SCHEMA,
     }
+    topics = _runtime_topic_descriptors(crm_class)
+    if topics:
+        # Omitted entirely for topic-less contracts so their canonical bytes,
+        # and therefore every existing fingerprint, stay byte-identical.
+        descriptor["topics"] = topics
+    return descriptor
+
+
+def _runtime_topic_descriptors(crm_class: type) -> list[dict[str, Any]]:
+    return [
+        {
+            "name": info.name,
+            "transfer": {"output": _runtime_binding_descriptor(info.binding)},
+        }
+        for info in topic_members(crm_class).values()
+    ]
+
+
+def _portable_topic_descriptors(crm_class: type) -> list[dict[str, Any]]:
+    topics: list[dict[str, Any]] = []
+    for info in topic_members(crm_class).values():
+        if info.binding.kind is PayloadPlanKind.PYTHON_PICKLE:
+            raise ValueError(
+                f"topic {info.name!r} uses python-pickle-default; Python-private "
+                "topics can run only between Python peers and cannot be exported "
+                "as a portable c-two.contract.v2 topic.",
+            )
+        assert info.binding.spec is not None
+        topics.append(
+            {
+                "binding": {"kind": "fastdb", "spec": json.loads(_canonical_json(info.binding.spec))},
+                "name": info.name,
+                "output": {"kind": "payload"},
+            },
+        )
+    return topics
 
 
 def build_contract_fingerprints(
@@ -82,7 +119,7 @@ def build_contract_fingerprints(
 def _fingerprints_from_descriptor(
     descriptor: dict[str, Any],
 ) -> tuple[str, str]:
-    abi_descriptor = {
+    abi_descriptor: dict[str, Any] = {
         "crm": descriptor["crm"],
         "methods": [
             {
@@ -96,7 +133,7 @@ def _fingerprints_from_descriptor(
         ],
         "schema": _ABI_SCHEMA,
     }
-    signature_descriptor = {
+    signature_descriptor: dict[str, Any] = {
         "crm": descriptor["crm"],
         "methods": [
             {
@@ -112,6 +149,14 @@ def _fingerprints_from_descriptor(
         ],
         "schema": _SIGNATURE_SCHEMA,
     }
+    topics = descriptor.get("topics")
+    if topics:
+        # Topics participate in the route identity: re-declaring a contract's
+        # topic set is a contract change, not a registration parameter.
+        abi_descriptor["topics"] = [{"name": topic["name"]} for topic in topics]
+        signature_descriptor["topics"] = [
+            {"name": topic["name"], "transfer": topic["transfer"]} for topic in topics
+        ]
     return _hash_descriptor(abi_descriptor), _hash_descriptor(signature_descriptor)
 
 
@@ -126,7 +171,7 @@ def build_portable_contract_descriptor(
 
     crm_ns, crm_name, crm_ver = crm_contract_identity(crm_class)
     method_names = rpc_method_names(crm_class) if methods is None else list(methods)
-    candidate = {
+    candidate: dict[str, Any] = {
         "schema": _PORTABLE_CONTRACT_SCHEMA,
         "crm": {
             "namespace": crm_ns,
@@ -142,6 +187,9 @@ def build_portable_contract_descriptor(
             for method_name in method_names
         ],
     }
+    topics = _portable_topic_descriptors(crm_class)
+    if topics:
+        candidate["topics"] = topics
     candidate_bytes = _canonical_json(candidate).encode()
     abi_hash, signature_hash = derive_portable_contract_fingerprints(
         candidate_bytes,
@@ -186,6 +234,21 @@ def diagnostics(
                         "severity": "warning",
                     },
                 )
+    for info in topic_members(crm_class).values():
+        if info.binding.kind is PayloadPlanKind.PYTHON_PICKLE:
+            diagnostics.append(
+                {
+                    "code": "python_only_pickle",
+                    "message": (
+                        f"topic {info.name!r} uses python-pickle-default; it "
+                        "can run only between Python peers and cannot be "
+                        "exported as a portable c-two.contract.v2 topic."
+                    ),
+                    "topic": info.name,
+                    "position": "topic",
+                    "severity": "warning",
+                },
+            )
     return diagnostics
 
 
@@ -424,6 +487,9 @@ def _is_portable_method_set(
             binding = _binding(method, attribute)
             if binding.kind is PayloadPlanKind.PYTHON_PICKLE:
                 return False
+    for info in topic_members(crm_class).values():
+        if info.binding.kind is PayloadPlanKind.PYTHON_PICKLE:
+            return False
     return True
 
 

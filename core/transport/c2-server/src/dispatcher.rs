@@ -377,6 +377,11 @@ impl BuiltRoute {
         self.route
     }
 
+    pub fn with_topics(mut self, topics: Arc<crate::topic::RouteTopics>) -> Self {
+        self.route.topics = Some(topics);
+        self
+    }
+
     pub fn route_handle(&self) -> RouteConcurrencyHandle {
         self.route_handle.clone()
     }
@@ -446,6 +451,8 @@ pub(crate) struct CrmRoute {
     pub(crate) method_modes: Vec<CallMode>,
     /// Method names indexed by method_idx
     pub(crate) method_names: Vec<String>,
+    /// Registration-scoped publish/subscribe topic channels, when declared.
+    pub(crate) topics: Option<Arc<crate::topic::RouteTopics>>,
 }
 
 impl CrmRoute {
@@ -467,6 +474,7 @@ impl CrmRoute {
             stream_callback: None,
             method_modes: vec![CallMode::Unary; spec.method_names.len()],
             method_names: spec.method_names,
+            topics: None,
         }
     }
 
@@ -640,6 +648,7 @@ mod tests {
             stream_callback: None,
             method_modes: vec![CallMode::Unary; 2],
             method_names: vec!["method_a".into(), "method_b".into()],
+            topics: None,
         }
     }
 
