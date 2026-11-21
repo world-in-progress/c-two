@@ -615,7 +615,7 @@ class TestLocalDelivery:
 
         with pytest.raises(SerializationError) as failure:
             registration.publisher('state').publish(Unserializable())
-        assert failure.value.code == 5
+        assert failure.value.code == 2
         assert failure.value.transport_phase == 'pre_dispatch'
         # A failed publish consumed no seq and left the ring untouched.
         assert registration.publisher('state').head_seq == 0
