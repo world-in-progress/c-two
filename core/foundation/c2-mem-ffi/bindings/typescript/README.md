@@ -16,7 +16,7 @@ A native endpoint's `prepare(route, contract, timeoutMs?)` connects and validate
 
 A response is a `NativeBuffer`, a `Uint8Array` over a local Rust-owned copy: the transport lease ended before JavaScript saw it. `release()` detaches the view before freeing the copy. Native failures surface as `C2NativeError`, whose `nativeDetails` carry the canonical code and name, details, and `transportPhase` (`pre_dispatch` or `dispatch_uncertain`); `C2NodeIpcConnectionError` reports invalid connector use and `C2MemFfiBindingError` a broken native load.
 
-`loadBundledC2MemFfiNodeNativeSymbols()` loads the packaged native library and `resolveBundledC2MemFfiNodeNativeLibraryPath()` returns its path. `loadC2MemFfiNodeNativeSymbols(libraryPath)` accepts an explicit external library built with **ABI version 8**. The addon checks the native ABI before loading any other symbol, so an older library is rejected with a version error rather than a missing symbol. The addon, TypeScript facade and native library must be built as a matching set.
+`loadBundledC2MemFfiNodeNativeSymbols()` loads the packaged native library and `resolveBundledC2MemFfiNodeNativeLibraryPath()` returns its path. `loadC2MemFfiNodeNativeSymbols(libraryPath)` accepts an explicit external library built with **ABI version 9**. The addon checks the native ABI before loading any other symbol, so an older library is rejected with a version error rather than a missing symbol. The addon, TypeScript facade and native library must be built as a matching set.
 
 ```bash
 cargo fetch --locked --manifest-path ../../../../Cargo.toml

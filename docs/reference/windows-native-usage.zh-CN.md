@@ -6,7 +6,7 @@
 
 该后端使用字节模式 Named Pipe 传输 `ipc://` 控制流量，并使用具名文件映射存放共享载荷内存。它跨登录会话使用进程的 TokenUser SID。同一会话的对端可以使用 SHM；不同会话使用自有缓冲区、内联或分片传输。原生连接在发送数据前要求用户一致，且服务端完整性级别至少为 Medium。普通 SDK 代码继续使用逻辑 `ipc://` 地址；不要在 SDK 中构造管道或映射名称。HTTP relay 仍提供网络传输路径。
 
-本指南涵盖 Windows x64 和 ARM64 上的 Python C-Two **0.11.0**、c3 **0.7.0** 和 FastDB **0.2.4**。请配套安装对应版本的 Python 包与 c3；端点行为见 [0.11.0 迁移说明](../releases/0.11.0.md)和[生命周期指南](local-endpoint-lifecycle.md)。
+本指南涵盖 Windows x64 和 ARM64 上的 Python C-Two **0.11.0**、c3 **0.7.0** 和 FastDB **0.2.4**。请配套安装对应版本的 Python 包与 c3；端点行为见 [0.11.0 迁移说明](../releases/0.11.0.md)和[生命周期指南](local-endpoint-lifecycle.md)。当前源码树另外升级到 IPC **17** 与 C/FFI ABI **9**，并新增资源归属的发布/订阅主题（见[未发布说明](../releases/unreleased.md)）；源码使用方需一起构建、一起升级，IPC 16 与 IPC 17 对端经固定版本前导互相拒绝。
 
 Windows 拒绝 Unix 根目录覆盖值（`cc.endpoint.set_local_endpoint(root=...)`、`C2_IPC_ROOT`、`--ipc-root`）。管道名称由逻辑地址和当前 TokenUser SID 派生。
 
@@ -72,6 +72,6 @@ $env:FASTDB_PAYLOAD_LINK_MODE = 'system'
 
 ## 验证范围
 
-[0.11.0 发布说明](../releases/0.11.0.md)描述当前的 API 和协议变更（IPC 16、SHM 4、C/FFI ABI 8、relay mesh 7、角色预算域及 mio 1.2.4 具名管道修复），[0.11.0 验收记录](../acceptance/2026-11-20-0110-release-acceptance.md)将 C-Two 0.11.0 / c3 0.7.0（`50be9a79`）与托管的 Windows Server 2025 x64 和 Windows 11 ARM64 门禁、候选构建及发布关联。[0.10.0 验收记录](../acceptance/2026-10-30-0100-release-acceptance.md)与 [0.10.1 验收记录](../acceptance/2026-10-30-0101-release-acceptance.md)将上一代版本源码与托管的 Windows Server 2022/2025 x64 和 Windows 11 ARM64 检查关联。[0.9.0 验收记录](../acceptance/2026-10-25-090-windows-release-acceptance.md)涵盖开发机、第二账户、跨会话和托管 ARM64 主机上的用户范围后端。[0.7.4 发布记录](../acceptance/0.7.4-publication.md)保存该版本的源码配对及完整的 Windows Server 2022/2025 x64 检查，包括严格的 18 行 Rust/Python 与 12 行 TypeScript 记录，以及普通用户、非管理员 wheel 使用者的验证。[FD 后续记录](../acceptance/0.7.4-fd-leak-regression.md)涵盖两台 Windows 运行器上实际的 Named Pipe 关闭与空闲连接替换回归。发布清单标识实际包源码；文档提交与产物源码提交分别记录。
+[0.11.0 发布说明](../releases/0.11.0.md)描述该版本的 API 和协议变更（IPC 16、SHM 4、C/FFI ABI 8、relay mesh 7、角色预算域及 mio 1.2.4 具名管道修复），[0.11.0 验收记录](../acceptance/2026-11-20-0110-release-acceptance.md)将 C-Two 0.11.0 / c3 0.7.0（`50be9a79`）与托管的 Windows Server 2025 x64 和 Windows 11 ARM64 门禁、候选构建及发布关联。[未发布说明](../releases/unreleased.md)汇总当前源码的 IPC 17 / C/FFI ABI 9 发布/订阅变更，其 Windows 门禁尚未记录在此。[0.10.0 验收记录](../acceptance/2026-10-30-0100-release-acceptance.md)与 [0.10.1 验收记录](../acceptance/2026-10-30-0101-release-acceptance.md)将上一代版本源码与托管的 Windows Server 2022/2025 x64 和 Windows 11 ARM64 检查关联。[0.9.0 验收记录](../acceptance/2026-10-25-090-windows-release-acceptance.md)涵盖开发机、第二账户、跨会话和托管 ARM64 主机上的用户范围后端。[0.7.4 发布记录](../acceptance/0.7.4-publication.md)保存该版本的源码配对及完整的 Windows Server 2022/2025 x64 检查，包括严格的 18 行 Rust/Python 与 12 行 TypeScript 记录，以及普通用户、非管理员 wheel 使用者的验证。[FD 后续记录](../acceptance/0.7.4-fd-leak-regression.md)涵盖两台 Windows 运行器上实际的 Named Pipe 关闭与空闲连接替换回归。发布清单标识实际包源码；文档提交与产物源码提交分别记录。
 
 0.8.0 开发记录还包含 Windows 11 x64 开发机测试；托管 Source Validation 要求 Windows Server 2025 x64 与 Windows 11 ARM64。上述结论不涵盖 Windows 服务以及真实的 Windows/Linux relay 链路。发布证据记录准确的源码和通过的原生检查。平台覆盖范围见[实现报告](windows-native-implementation.md)。

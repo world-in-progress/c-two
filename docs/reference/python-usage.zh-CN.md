@@ -1,10 +1,10 @@
 # Python SDK 用法
 
-本指南说明 C-Two 0.11.0 / c3 0.7.0 的 Python SDK 用法，包括 CRM 编写、调用、服务端流、可移植的 FastDB 0.2.4 载荷和 Runtime 所有权。
+本指南说明 C-Two 0.11.0 / c3 0.7.0 的 Python SDK 用法，包括 CRM 编写、调用、服务端流、可移植的 FastDB 0.2.4 载荷、发布/订阅主题和 Runtime 所有权。
 
 [English](python-usage.md) · 简体中文
 
-[0.11.0 发布说明](../releases/0.11.0.md)介绍从 0.10.x 迁移的事项，包括 IPC 16、SHM 4、服务端流、路由名身份、按角色划分的容量配置和收敛后的错误体系。CRM 契约通过同进程调用、本地 IPC 和 HTTP relay 暴露有状态资源；可移植 Python 载荷使用可选的 FastDB 0.2.4 extra。安装步骤及可运行的入门示例见[快速开始](../../README.zh-CN.md#快速开始)。
+[0.11.0 发布说明](../releases/0.11.0.md)介绍从 0.10.x 迁移的事项，包括 IPC 16、SHM 4、服务端流、路由名身份、按角色划分的容量配置和收敛后的错误体系。[未发布变更](../releases/unreleased.md)新增资源归属的发布/订阅主题，并将线协议升级到 IPC 17、Node C/FFI ABI 升级到 9；本指南描述当前源码。CRM 契约通过同进程调用、本地 IPC 和 HTTP relay 暴露有状态资源；可移植 Python 载荷使用可选的 FastDB 0.2.4 extra。安装步骤及可运行的入门示例见[快速开始](../../README.zh-CN.md#快速开始)。
 
 ## 可移植载荷（FastDB）
 
@@ -93,7 +93,7 @@ finally:
 
 连接跟随路由名。C-Two 已经知道它所服务的那次注册不在了时（服务进程结束，或者之前的调用因路由不存在、已撤下、已关闭或契约不同而在派发前被拒），下一次调用在自己的截止时间内按名字重新获取路由，发往当前的注册：直接 IPC 回到原地址，经 relay 的连接通过 relay 锚点重新解析，可能在本地 IPC 与 relay 之间切换，显式 relay 连接仍走 HTTP。只能从这次调用自己的拒绝得知变化时，这次调用在派发前失败、可以安全重试，下一次调用才跟过去。同进程连接在注册被注销后也一样：下一次调用发往这个名字新的本地注册，或者经 relay 发往远程的注册；注册还在时，调用直接进入资源。服务这个名字的进程负责状态的延续；要让调用方察觉状态变了，就换一个名字。身份与协议的拒绝不会引起重新获取。
 
-共享一个 IPC 域的 Unix 进程使用相同的已配置根目录（`cc.endpoint.set_local_endpoint(root=...)` 或 `C2_IPC_ROOT`）。应用负责创建自定义根目录；在确认所有权及免受其他用户修改的保护后，可以接受 `0755`。默认权限为 `0700`，套接字权限为 `0600`。Windows 在跨登录会话时使用 TokenUser 范围内的 Named Pipe，并拒绝 Unix 根目录覆盖值。原生连接要求同一用户且服务端完整性级别至少为 Medium；跨会话载荷自动避开无法访问的 Local 映射。C-Two 0.11.0 在 0.10.0 引入的永久固定版本前导信息之后使用 RPC IPC 握手 16，因此通信双方应一起升级。两个版本都实现固定前导信息但版本不同时，会抛出 `CoreError`，其中 `category='protocol_version_mismatch'`，`local_protocol_version` / `peer_protocol_version` 非零（其他错误中均为 `None`）；与 0.9.x 混用时仍是一般连接或协议失败。参见 [0.11.0 迁移说明](../releases/0.11.0.md)及[握手规格](ipc-handshake.md)，以及[端点配置](configuration.zh-CN.md#本地端点位置与平台差异)和[生命周期管理](local-endpoint-lifecycle.md)。
+共享一个 IPC 域的 Unix 进程使用相同的已配置根目录（`cc.endpoint.set_local_endpoint(root=...)` 或 `C2_IPC_ROOT`）。应用负责创建自定义根目录；在确认所有权及免受其他用户修改的保护后，可以接受 `0755`。默认权限为 `0700`，套接字权限为 `0600`。Windows 在跨登录会话时使用 TokenUser 范围内的 Named Pipe，并拒绝 Unix 根目录覆盖值。原生连接要求同一用户且服务端完整性级别至少为 Medium；跨会话载荷自动避开无法访问的 Local 映射。当前源码在 0.10.0 引入的永久固定版本前导信息之后使用 RPC IPC 握手 17（0.11.0 为 IPC 16，见[未发布变更](../releases/unreleased.md)），因此通信双方应一起升级。两个版本都实现固定前导信息但版本不同时，会抛出 `CoreError`，其中 `category='protocol_version_mismatch'`，`local_protocol_version` / `peer_protocol_version` 非零（其他错误中均为 `None`）；与 0.9.x 混用时仍是一般连接或协议失败。参见[握手规格](ipc-handshake.md)，以及[端点配置](configuration.zh-CN.md#本地端点位置与平台差异)和[生命周期管理](local-endpoint-lifecycle.md)。
 
 ## 底层服务端桥接
 
@@ -167,6 +167,56 @@ with cc.connect(Simulation, name='basin', address='ipc://resource-process') as s
 
 在注册资源的进程里，流直接传递 yield 出来的对象，不编码，按路由自己的并发限制推进；有限的调用截止时间在派发前被拒绝。经 IPC 时，Python 与 Rust 的资源和客户端可以互相开流；经 relay 时它们经 HTTP 开流，`cc.Stream`、`close` 与 hold 的行为相同。经 relay 时，消费方停止读取后，资源最多还能多推进 HTTP 与 TCP 缓冲装得下的那么多条，小条目可达数千条。推进、取消与 shutdown 见 [Runtime 生命周期](runtime-lifecycle.md#execution-admission)。
 
+## 发布/订阅主题
+
+主题是与一元调用、服务端流正交的第三种连接原语：资源发布不可变帧，任意数量的本地与远端订阅者接收它们（[ADR 0005](../decisions/0005-publish-subscribe.md)）。在 CRM 契约上用 `@cc.topic` 声明——零参数、不带 `@cc.read`/`@cc.write`/`@cc.stream` 访问类别、一个描述发布值的返回注解，且资源侧不需要实现。`@cc.transfer(output=...)` 选择可移植的 FastDB 绑定；其他返回注解仅在 Python 对端之间以 Python 私有 pickle 传输，可移植描述符导出会拒绝它。
+
+```python
+@cc.crm(namespace='demo.telemetry', version='0.1.0')
+class Telemetry:
+    @cc.read
+    def device_name(self) -> str: ...
+
+    @cc.topic
+    def state(self) -> dict: ...
+
+    @cc.topic
+    def heartbeat(self) -> int: ...
+
+
+class TelemetryImpl:
+    def device_name(self) -> str:
+        return 'sensor-1'
+```
+
+`cc.register(...)`（以及 `runtime.register(...)`）返回 `Registration` 而不再是 `str`。Runtime 保持注册存活；丢弃或被回收该句柄绝不会注销路由——注销仍由 `cc.unregister(name)` 完成。句柄暴露 `registration.name`（路由名）、`registration.is_closed`、`registration.active_subscribers` 和 `registration.publisher(topic)`，返回的 `Publisher` 绑定这一次注册：注册结束后 `publish()` 抛出 `ResourceClosed`（707），绝不写入后续同名的新注册。`Publisher.publish(value)` 返回该帧单调递增的注册内 `seq`，且绝不阻塞在慢订阅者上；它还暴露 `topic_name`、`is_closed` 与 `head_seq`。注册接受两个按契约已声明主题校验的选项：`topic_capacity={'state': 4}` 设置各主题的历史环深度（默认 `1`，最大 65,536；始终保留最新成功发布的一帧），`initial_topics={'state': {...}}` 在路由开放前以同一发布逻辑原子提交初始帧——序列化或容量失败会整体回滚，路由不开放。
+
+```python
+registration = cc.register(
+    Telemetry, TelemetryImpl(), name='telemetry',
+    topic_capacity={'state': 4, 'heartbeat': 8},
+    initial_topics={'state': {'online': True, 'voltage': 3.3}},
+)
+state_pub = registration.publisher('state')
+state_pub.publish({'online': True, 'voltage': 3.1})  # 返回该帧的 seq
+```
+
+客户端在已连接的 CRM 实例上直接调用主题成员，或使用 `proxy.subscribe(topic, ...)` 订阅。两者都接受 `start`（默认 `'latest'`：首条交付是保留的最新帧，含初始帧；或 `'next'`：只收附着后发布的帧）与 `on_lag`（默认 `'skip'`：跳到最新可得帧；或 `'error'`：以 `SubscriptionLagged` 终止）。它们返回一个 `Subscription`，迭代产出不可变的 `Delivery(value, seq, dropped)`；`skip` 下 `dropped` 记录在此之前跳过的帧数。单次订阅至多跨越一次注册：注销路由或停止 Host 会以写明原因的 `CallCancelled`（718）结束它，下一次 `subscribe()` 跟随当前注册。`subscription.start_seq` 报告 READY 序号；`cancel()` 不阻塞地提交取消；`close(timeout=30.0)` 先取消再观察真实终态，返回 `TopicCloseReceipt`（`completed`、`error`、`complete_items`）——与流的形状一致。`cc.with_call_options(...)` 视图承载订阅策略，同进程订阅拒绝有限超时。`cc.hold(telemetry.state)()` 产出 `Delivery[HeldResult[T]]`：每份 `.value` 持有一份保留的本地副本，订阅关闭后仍有效，由其所有者释放。
+
+```python
+telemetry = cc.connect(Telemetry, name='telemetry')
+latest = telemetry.state()                          # start='latest', on_lag='skip'
+following = cc.with_call_options(telemetry).heartbeat(start='next')
+delivery = next(latest)                             # Delivery(value, seq, dropped)
+state_pub.publish({'online': True, 'voltage': 3.0})
+beats = [next(following).value for _ in range(3)]
+latest.close(timeout=5.0)
+following.close(timeout=5.0)
+cc.close(telemetry)
+```
+
+同进程路径上，发布在 `publish()` 时对可变 Python 对象取不可变快照，发布者后续修改或单个读者释放都不会影响其他读者。经直连 IPC 时，帧经一块按订阅者借出的封存共享内存块传输；经 relay 时走 relay 的主题 HTTP 转发。订阅全生命周期占用所属角色域的一个 `max_outstanding_calls` 槽并受内部 `N − 1` 守卫约束，不占路由并发许可、不占执行 worker，也不计入方法的 `max_pending`。`publish()` 放不进主题预算时立即以 `CallCapacityExceeded`（717）失败，保留上一帧且不消耗 `seq`——主题历史绝不隐式溢写磁盘。完整可运行示例见 [pubsub.py](../../examples/python/pubsub.py)；线格式规则见[握手规格](ipc-handshake.md#topic-subscriptions)，错误语义见[错误参考](errors.md#semantic-error-wire-and-sdk-projection)。
+
 ## 常驻模拟范式
 
 CRM 方法默认按 `@cc.write` 处理。在 `ConcurrencyConfig(mode='read_parallel', max_workers=...)` 下，写调用互斥执行，多个只读调用可在 `max_workers` 额度内并发（遇到排队的写调用时仍按读写锁顺序串行）。对于需要在持续推进的同时响应状态查看、参数干预与实时订阅的常驻科学模拟，不要把长时间阻塞的步进循环塞进单个 `@cc.write` 调用里，建议采用以下模式：
@@ -186,7 +236,7 @@ CRM 方法默认按 `@cc.write` 处理。在 `ConcurrencyConfig(mode='read_paral
 
 ### Python SDK
 
-`c_two` 根模块只容纳日常 API：契约装饰器（`crm`、`read`、`write`、`stream`、`transfer`、`on_shutdown`）、`Stream` / `StreamCloseReceipt`、`hold` / `HeldResult`、register / connect / close / unregister / serve / shutdown、`server_address`、`with_call_options`、各 setter、`Runtime`、`ConcurrencyConfig` 和 `error`。端点维护、诊断与契约工具分别位于 `c_two.endpoint`、`c_two.observe` 和 `c_two.contract`；Rust SDK 在 `c_two::` 下使用相同的三个模块。不要为这些能力新增根模块名称、别名或第二种拼写；并发模式和输入生命周期等选项值使用字符串字面量。
+`c_two` 根模块只容纳日常 API：契约装饰器（`crm`、`read`、`write`、`stream`、`topic`、`transfer`、`on_shutdown`）、`Stream` / `StreamCloseReceipt`、`Registration` / `Publisher` / `Subscription` / `Delivery` / `TopicCloseReceipt`、`hold` / `HeldResult`、register / connect / close / unregister / serve / shutdown、`server_address`、`with_call_options`、各 setter、`Runtime`、`ConcurrencyConfig` 和 `error`。端点维护、诊断与契约工具分别位于 `c_two.endpoint`、`c_two.observe` 和 `c_two.contract`；Rust SDK 在 `c_two::` 下使用相同的三个模块。不要为这些能力新增根模块名称、别名或第二种拼写；并发模式和输入生命周期等选项值使用字符串字面量。
 
 应用以 `import c_two as cc` 开始。需要时导入专用模块：
 
@@ -205,7 +255,7 @@ use fastdb::Payload;
 
 契约导出不选择 Runtime。并发模式为 `'parallel'`、`'exclusive'` 和 `'read_parallel'`；注册输入生命周期为 `'materialized'` 和 `'borrowed'`。
 
-- 编写契约：`@cc.crm`、`@cc.read`、`@cc.write`、`@cc.stream`、`@cc.on_shutdown`、`@cc.transfer`、`cc.hold`、`cc.HeldResult`、`cc.Stream`、`cc.StreamCloseReceipt`
+- 编写契约：`@cc.crm`、`@cc.read`、`@cc.write`、`@cc.stream`、`@cc.topic`、`@cc.on_shutdown`、`@cc.transfer`、`cc.hold`、`cc.HeldResult`、`cc.Stream`、`cc.StreamCloseReceipt`、`cc.Registration`、`cc.Publisher`、`cc.Subscription`、`cc.Delivery`、`cc.TopicCloseReceipt`
 - 调用：`cc.with_call_options`（按调用设置截止时间的视图，见[远程连接与截止时间](#远程连接与截止时间)）
 - Runtime：`cc.Runtime`，其实例方法包括 `set_local_endpoint`、`set_server`、`set_client`、`set_relay_anchor`、`register`、`connect`、`unregister`、`start`、`server_id`、`server_address`、`server_credential`、`local_endpoint_context`、`shutdown`、`connection_events`、`lifecycle_snapshot`、`shutdown_outcome`、`memory_stats` 和 `call_execution_snapshot`
 - 默认 Runtime：`cc.register`、`cc.connect`、`cc.unregister`、`cc.serve`、`cc.shutdown`、`cc.server_address`、`cc.endpoint.server_credential`、`cc.endpoint.server_id`、`cc.set_server`、`cc.set_client`、`cc.set_relay_anchor`、`cc.endpoint.set_local_endpoint`；`cc.close(proxy)` 跟随代理自身的连接

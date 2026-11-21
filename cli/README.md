@@ -1,6 +1,6 @@
 # C-Two CLI (C3)
 
-C3 **0.7.0** accompanies C-Two **0.11.x**, sharing its IPC 16, SHM 4, relay mesh 7, Unix namespace format 3 and endpoint maintenance behavior. See the [0.11.0 release notes](../docs/releases/0.11.0.md).
+C3 **0.7.0** accompanies C-Two **0.11.x**, sharing its IPC 16, SHM 4, relay mesh 7, Unix namespace format 3 and endpoint maintenance behavior. See the [0.11.0 release notes](../docs/releases/0.11.0.md). The current source moves the wire to IPC 17 and the Node C/FFI ABI to 9 with the resource-owned publish/subscribe line; see the [unreleased notes](../docs/releases/unreleased.md).
 
 Python does not own CLI behavior; do not add command behavior under `sdk/python/src/c_two`. `cli/` contains the Rust crate for `c3`, the native C-Two command-line interface. It starts relay servers and inspects relay registry state for C-Two deployments.
 
@@ -140,6 +140,8 @@ c3 relay --bind 127.0.0.1:8080 --memory-budget-bytes 134217728 --file-spill-budg
 The relay evicts unreferenced upstream IPC connections after 60 seconds without stopping the Host. Reconnect preserves full contract and server/instance identity validation; it does not replay ambiguous data-plane failures. Before a call hands its input to a transport, Core acquires the client's route again at most once, under that call's deadline, when its target is known to be gone; this bound is fixed and is not configurable through SDK settings. See the [memory policy](../docs/reference/memory-policy.md) for lazy allocation, fallback and retained-owner accounting.
 
 When running normally, `c3 relay` installs a Ctrl+C handler and stops the relay cleanly on interrupt.
+
+A relay built from the current source also serves resource-owned topic subscriptions ([ADR 0005](../docs/decisions/0005-publish-subscribe.md)) with no new CLI flags: each local route's declared topics become available at `POST /{route_name}/_topics/{topic_name}` with the versioned topic media type, and the relay opens one shared upstream IPC 17 subscription per registration and topic, fanning out a single budgeted copy to all downstream HTTP subscribers. Ctrl+C ends forwarded subscriptions with `CallCancelled` naming relay shutdown after the frame each subscriber already selected. See [relay topic forwarding](../docs/reference/contracts-and-routing.md#relay-topic-forwarding).
 
 ## Local endpoint maintenance
 

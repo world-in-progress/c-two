@@ -8,7 +8,8 @@
 
 1. **0.12.0 资源归属的发布/订阅（Publish/Subscribe，[ADR 0005](../decisions/0005-publish-subscribe.md)，维护者 2026-11-20 确认实施）：**
    - 前置基础已完成：`RuntimeSession` 锁序/代次修复、动态分叉压测与常驻模拟范式（[PR #234](https://github.com/world-in-progress/c-two/pull/234)）及显式 FastDB 载荷/流式/扇出与 Ray 2.56 对照基准（[PR #235](https://github.com/world-in-progress/c-two/pull/235)，32 MiB `R = 1 → 4` 在直连 IPC 与单跳 `c3 relay` 均出现 4× 写入/传输放大）。
-   - 分 8 批实施并验收：契约根级 `"topics"` 与 `720 SubscriptionLagged` → Core `Registration::publisher` 与历史环 → 同机 SHM 4 单写多借出（维持 ADR 0001）→ IPC 17 与直连 Core → Python / Rust SDK 与 `c2-codegen` → 单 `c3 relay` 扇出 → 双 `c3 relay` 两级单上行扇出与轻量源端起点确认（保持 mesh 7）→ Node C ABI 9、全平台 CI 与同源同频 32 MiB `R = 1/4` 复跑验收。
+   - 本分支代码与跨语言测试已全部落地（变更汇总见[未发布说明](../releases/unreleased.md)）：契约根级 `"topics"` 与 `720 SubscriptionLagged` → Core `Registration::publisher` 与历史环（含 `N − 1` 槽位守卫与空闲本地订阅即时结算）→ 同机 SHM 4 单写多借出（维持 ADR 0001）→ IPC 17 与直连 Core（`READY`/`SYNC`/`SYNC_ACK` 与订阅 `ITEM_BEGIN` 序号）→ Python / Rust SDK 与 `c2-codegen` 三语言主题生成 → 两级单上行 `c3 relay` 扇出（单中继 `Host → A → R` 与双中继跨机 `Host → A → B → R`、`x-c2-relay-origin-only: 1` 防环、不透明指纹 `/_confirm` 迟到合并确认、阻塞 TCP 单连接淘汰，保持 mesh 7）→ Node C ABI 9（`c2_mem_ffi_subscription_*` 与统一 `ipc://`/`http(s)://` 入口，`Connect::RelayAwareAt` 按端点锚点）→ 双向 Rust↔Python 可移植 FastDB 发布/订阅端到端互操作测试（`test_pubsub_cross_language.py`）。
+   - 还剩：全平台 CI 门禁与同源同频 32 MiB `R = 1/4` 复跑验收，以及发版时的版本号与 `docs/releases/0.12.0.md` 定稿。
 2. **三原语统一的 FastDB 低拷贝 Slab 通道（跨 C-Two 与 FastDB 协同，排在 0.12.0 Pub-Sub 之后审慎立项；维护者 2026-11-20 登记引子）：**
    - **定位：** 对应路线图 [Direct final backing](roadmap.md#performance-and-hardening-tracks)。FastDB 紧凑二进制 slab 承载必须正交适配 **Unary、Server Stream、Publish/Subscribe 全部三种连接原语**，不给单一原语开特例；底层统一为一个可分配、可封存的不可变 slab backing，同时不破坏 [ADR 0001](../decisions/0001-single-owner-release.md) 的单一属主释放。
    - **已复现根因与拷贝账本（[PR #235](https://github.com/world-in-progress/c-two/pull/235) 实测，基于 `fastdb4py 0.2.4`）：**

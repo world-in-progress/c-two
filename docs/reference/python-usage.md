@@ -1,10 +1,10 @@
 # Python SDK usage
 
-This guide describes C-Two 0.11.0 / c3 0.7.0 Python SDK usage, including CRM authoring, calls, server streams, portable FastDB 0.2.4 payloads, and Runtime ownership.
+This guide describes C-Two 0.11.0 / c3 0.7.0 Python SDK usage, including CRM authoring, calls, server streams, portable FastDB 0.2.4 payloads, publish/subscribe topics and Runtime ownership.
 
 English · [简体中文](python-usage.zh-CN.md)
 
-The [0.11.0 release notes](../releases/0.11.0.md) describe migration from 0.10.x, including IPC 16, SHM 4, server streams, route-name identity, role-domain capacity configuration and the converged error hierarchy. CRM contracts expose stateful resources over same-process calls, local IPC and HTTP relay; portable Python payloads use the optional FastDB 0.2.4 extra. For installation and a runnable introduction, see the [quickstart](../../README.md#quickstart).
+The [0.11.0 release notes](../releases/0.11.0.md) describe migration from 0.10.x, including IPC 16, SHM 4, server streams, route-name identity, role-domain capacity configuration and the converged error hierarchy. The [unreleased changes](../releases/unreleased.md) add resource-owned publish/subscribe topics and move the wire to IPC 17 and the Node C/FFI ABI to 9; this guide documents that current source. CRM contracts expose stateful resources over same-process calls, local IPC and HTTP relay; portable Python payloads use the optional FastDB 0.2.4 extra. For installation and a runnable introduction, see the [quickstart](../../README.md#quickstart).
 
 ## Portable payloads (FastDB)
 
@@ -93,7 +93,7 @@ Business-call waiting is independent. `cc.with_call_options` returns a view of a
 
 A connection follows its route name. When C-Two already knows that the registration it served is gone, because the server process ended or an earlier call was refused before dispatch for a missing, removed or closed route or another contract, the next call acquires the route again by name within its own deadline and goes to the current registration: direct IPC returns to the same address, a relay-aware connection resolves through its relay anchor and may change between local IPC and the relay, and an explicit relay connection stays on HTTP. A call that learns of the change only from its own refusal fails before dispatch and is safe to retry; the next call follows. A same-process connection does the same once its registration is unregistered: the next call goes to a new local registration of the name, or through the relay to a remote one, while calls go straight to the resource as long as the registration stays. The process that serves the name keeps its state continuous; use a different name when callers must notice a different state. Identity and protocol refusals do not start a new acquisition.
 
-Unix processes sharing an IPC domain use the same configured root (`cc.endpoint.set_local_endpoint(root=...)` or `C2_IPC_ROOT`). The application provisions custom roots; `0755` is accepted with verified ownership and protection from other-user mutation. The default is `0700`, and sockets are `0600`. Windows uses TokenUser-scoped Named Pipes across logons and rejects Unix root overrides. Native connections require the same user and a server integrity of at least Medium; cross-session payloads automatically avoid inaccessible Local mappings. C-Two 0.11.0 uses RPC IPC handshake 16 behind the permanent fixed version preamble introduced in 0.10.0, so upgrade communicating peers together. Different versions that both implement the fixed preamble raise `CoreError` with `category='protocol_version_mismatch'` and nonzero `local_protocol_version` / `peer_protocol_version` (`None` on every other error); mixing with 0.9.x still yields a generic connection/protocol failure. See the [0.11.0 migration](../releases/0.11.0.md) and the [handshake spec](ipc-handshake.md). See [endpoint configuration](configuration.md#local-endpoint-directories) and [lifecycle management](local-endpoint-lifecycle.md).
+Unix processes sharing an IPC domain use the same configured root (`cc.endpoint.set_local_endpoint(root=...)` or `C2_IPC_ROOT`). The application provisions custom roots; `0755` is accepted with verified ownership and protection from other-user mutation. The default is `0700`, and sockets are `0600`. Windows uses TokenUser-scoped Named Pipes across logons and rejects Unix root overrides. Native connections require the same user and a server integrity of at least Medium; cross-session payloads automatically avoid inaccessible Local mappings. The current source uses RPC IPC handshake 17 behind the permanent fixed version preamble introduced in 0.10.0 (0.11.0 spoke IPC 16; see the [unreleased changes](../releases/unreleased.md)), so upgrade communicating peers together. Different versions that both implement the fixed preamble raise `CoreError` with `category='protocol_version_mismatch'` and nonzero `local_protocol_version` / `peer_protocol_version` (`None` on every other error); mixing with 0.9.x still yields a generic connection/protocol failure. See the [handshake spec](ipc-handshake.md). See [endpoint configuration](configuration.md#local-endpoint-directories) and [lifecycle management](local-endpoint-lifecycle.md).
 
 ## Low-level server bridge
 
@@ -167,6 +167,56 @@ A call returns a `cc.Stream`, an iterator of decoded items. Leaving a `with` blo
 
 Within the registering process, a stream passes the yielded objects themselves, without encoding, and steps under the route's own concurrency limits; a finite call deadline is refused before dispatch. Over IPC, Python and Rust resources and clients stream to each other, and through a relay they stream over HTTP with the same `cc.Stream`, `close` and hold behavior; there a resource can run ahead of a consumer that stops reading by as many items as the HTTP and TCP buffers hold, which for small items can be thousands. [Runtime lifecycle](runtime-lifecycle.md#execution-admission) describes steps, cancellation and shutdown.
 
+## Publish-subscribe topics
+
+A topic is a third connection primitive, orthogonal to unary calls and server streams: the resource publishes immutable frames, and any number of local and remote subscribers receive them ([ADR 0005](../decisions/0005-publish-subscribe.md)). Declare it on the CRM contract with `@cc.topic` — zero parameters, no `@cc.read`/`@cc.write`/`@cc.stream` access, one return annotation describing the published value, and no resource-side implementation. `@cc.transfer(output=...)` selects a portable FastDB binding; any other annotation travels as Python-private pickle between Python peers only and is refused by portable descriptor export.
+
+```python
+@cc.crm(namespace='demo.telemetry', version='0.1.0')
+class Telemetry:
+    @cc.read
+    def device_name(self) -> str: ...
+
+    @cc.topic
+    def state(self) -> dict: ...
+
+    @cc.topic
+    def heartbeat(self) -> int: ...
+
+
+class TelemetryImpl:
+    def device_name(self) -> str:
+        return 'sensor-1'
+```
+
+`cc.register(...)` (and `runtime.register(...)`) returns a `Registration` instead of a `str`. The Runtime keeps the registration alive; dropping or garbage-collecting the handle never unregisters the route — that remains `cc.unregister(name)`. The handle exposes `registration.name` (the route name), `registration.is_closed`, `registration.active_subscribers` and `registration.publisher(topic)`, whose returned `Publisher` is bound to that one registration: after the registration ends, `publish()` raises `ResourceClosed` (707) and never writes to a later registration of the same name. `Publisher.publish(value)` returns the frame's monotonic registration-scoped `seq` and never blocks on a slow subscriber; it also exposes `topic_name`, `is_closed` and `head_seq`. Registration accepts two topic options, both validated against the contract's declared topics: `topic_capacity={'state': 4}` sets each topic's history ring depth (default `1`, at most 65,536; the newest published frame is always retained), and `initial_topics={'state': {...}}` publishes initial frames atomically before the route opens, with the same publish logic — a serialization or capacity failure rolls the whole registration back and leaves the route unopened.
+
+```python
+registration = cc.register(
+    Telemetry, TelemetryImpl(), name='telemetry',
+    topic_capacity={'state': 4, 'heartbeat': 8},
+    initial_topics={'state': {'online': True, 'voltage': 3.3}},
+)
+state_pub = registration.publisher('state')
+state_pub.publish({'online': True, 'voltage': 3.1})  # returns the frame's seq
+```
+
+Clients subscribe by calling the topic member on a connected CRM instance, or with `proxy.subscribe(topic, ...)`. Both take `start` (`'latest'`, the default: the first delivery is the retained newest frame, including an initial frame; or `'next'`: only frames published after attach) and `on_lag` (`'skip'`, the default: jump to the newest available frame; or `'error'`: terminate with `SubscriptionLagged`). They return a `Subscription` whose iteration yields immutable `Delivery(value, seq, dropped)` records; `dropped` counts the frames skipped before this one under `skip`. A subscription spans at most one registration: unregistering the route or stopping the Host ends it with `CallCancelled` (718) naming the cause, and the next `subscribe()` follows the current registration. `subscription.start_seq` reports the READY sequence; `cancel()` submits cancellation without blocking; `close(timeout=30.0)` cancels and observes the real terminal, returning a `TopicCloseReceipt` (`completed`, `error`, `complete_items`) — the same shape as a stream's. `cc.with_call_options(...)` views carry the subscription policy, and a finite timeout is refused for same-process subscriptions. `cc.hold(telemetry.state)()` yields `Delivery[HeldResult[T]]`: each `.value` owns a retained local copy that stays valid after the subscription closes and is released by its owner.
+
+```python
+telemetry = cc.connect(Telemetry, name='telemetry')
+latest = telemetry.state()                          # start='latest', on_lag='skip'
+following = cc.with_call_options(telemetry).heartbeat(start='next')
+delivery = next(latest)                             # Delivery(value, seq, dropped)
+state_pub.publish({'online': True, 'voltage': 3.0})
+beats = [next(following).value for _ in range(3)]
+latest.close(timeout=5.0)
+following.close(timeout=5.0)
+cc.close(telemetry)
+```
+
+On the same-process path a publish takes an immutable snapshot of a mutable Python object, so the publisher's later mutation or one reader's release cannot affect other readers. Over direct IPC the frame travels through one sealed shared-memory block lent per subscriber; through a relay it travels over the relay's topic HTTP forwarding. A subscription holds one `max_outstanding_calls` slot of its role domain for its whole life under the internal `N − 1` guard, takes no route concurrency permit and no execution worker, and does not count against a method's `max_pending`. `publish()` that cannot fit a new frame in the topic's budget fails immediately with `CallCapacityExceeded` (717), keeping the previous frame and consuming no `seq` — topic history never spills to disk. A runnable end-to-end example is [pubsub.py](../../examples/python/pubsub.py); the wire rules are in the [handshake spec](ipc-handshake.md#topic-subscriptions) and the [error semantics](errors.md#semantic-error-wire-and-sdk-projection).
+
 ## Resident simulation pattern
 
 CRM methods default to `@cc.write`. Under `ConcurrencyConfig(mode='read_parallel', max_workers=...)`, writes execute exclusively while concurrent reads share up to `max_workers` permits (still serialized around queued writes). For long-running stateful simulations that must remain responsive to state inspection, parameter interventions and live subscribers while advancing, do not block inside a single long-lived `@cc.write` step call. Instead:
@@ -186,7 +236,7 @@ See [resident_simulation.py](../../examples/python/resident_simulation.py) for a
 
 ### Python SDK
 
-The `c_two` root holds only the everyday API: contract decorators (`crm`, `read`, `write`, `stream`, `transfer`, `on_shutdown`), `Stream` / `StreamCloseReceipt`, `hold` / `HeldResult`, register / connect / close / unregister / serve / shutdown, `server_address`, `with_call_options`, setters, `Runtime`, `ConcurrencyConfig` and `error`. Endpoint maintenance, diagnostics and contract tooling live in `c_two.endpoint`, `c_two.observe` and `c_two.contract`; the Rust SDK uses the same three modules under `c_two::`. Do not add root names, aliases or second spellings for these capabilities; option values such as concurrency modes and input lifetimes are string literals.
+The `c_two` root holds only the everyday API: contract decorators (`crm`, `read`, `write`, `stream`, `topic`, `transfer`, `on_shutdown`), `Stream` / `StreamCloseReceipt`, `Registration` / `Publisher` / `Subscription` / `Delivery` / `TopicCloseReceipt`, `hold` / `HeldResult`, register / connect / close / unregister / serve / shutdown, `server_address`, `with_call_options`, setters, `Runtime`, `ConcurrencyConfig` and `error`. Endpoint maintenance, diagnostics and contract tooling live in `c_two.endpoint`, `c_two.observe` and `c_two.contract`; the Rust SDK uses the same three modules under `c_two::`. Do not add root names, aliases or second spellings for these capabilities; option values such as concurrency modes and input lifetimes are string literals.
 
 Applications start with `import c_two as cc`. Import the specialized modules when needed:
 
@@ -205,7 +255,7 @@ Generated Rust modules may use the hidden `c_two::generated` seam. Ordinary appl
 
 Contract export does not select a Runtime. Concurrency modes are `'parallel'`, `'exclusive'`, and `'read_parallel'`; registration input lifetimes are `'materialized'` and `'borrowed'`.
 
-- Authoring: `@cc.crm`, `@cc.read`, `@cc.write`, `@cc.stream`, `@cc.on_shutdown`, `@cc.transfer`, `cc.hold`, `cc.HeldResult`, `cc.Stream`, `cc.StreamCloseReceipt`
+- Authoring: `@cc.crm`, `@cc.read`, `@cc.write`, `@cc.stream`, `@cc.topic`, `@cc.on_shutdown`, `@cc.transfer`, `cc.hold`, `cc.HeldResult`, `cc.Stream`, `cc.StreamCloseReceipt`, `cc.Registration`, `cc.Publisher`, `cc.Subscription`, `cc.Delivery`, `cc.TopicCloseReceipt`
 - Calls: `cc.with_call_options` (per-call deadline views, see [remote connections and deadlines](#remote-connections-and-deadlines))
 - Runtime: `cc.Runtime`, whose instance methods include `set_local_endpoint`, `set_server`, `set_client`, `set_relay_anchor`, `register`, `connect`, `unregister`, `start`, `server_id`, `server_address`, `server_credential`, `local_endpoint_context`, `shutdown`, `connection_events`, `lifecycle_snapshot`, `shutdown_outcome`, `memory_stats` and `call_execution_snapshot`
 - Default Runtime: `cc.register`, `cc.connect`, `cc.unregister`, `cc.serve`, `cc.shutdown`, `cc.server_address`, `cc.endpoint.server_credential`, `cc.endpoint.server_id`, `cc.set_server`, `cc.set_client`, `cc.set_relay_anchor`, `cc.endpoint.set_local_endpoint`; `cc.close(proxy)` follows the proxy's own connection
