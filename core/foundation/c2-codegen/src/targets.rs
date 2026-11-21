@@ -16,20 +16,30 @@ pub(crate) struct TargetMethod<'a> {
     pub(crate) output_sha256: Option<&'a str>,
 }
 
+pub(crate) struct TargetTopic<'a> {
+    pub(crate) index: usize,
+    pub(crate) name: &'a str,
+    pub(crate) output_sha256: &'a str,
+}
+
 pub(crate) fn render_target_artifacts(
     target: ContractCodegenTarget,
     descriptor: &ValidatedContractDescriptor,
     methods: &[TargetMethod<'_>],
+    topics: &[TargetTopic<'_>],
 ) -> Result<Vec<ContractArtifact>, CodegenError> {
     let (path, source) = match target {
-        ContractCodegenTarget::Rust => ("rust/c_two_contract.rs", render_rust(descriptor, methods)),
+        ContractCodegenTarget::Rust => (
+            "rust/c_two_contract.rs",
+            render_rust(descriptor, methods, topics),
+        ),
         ContractCodegenTarget::Python => (
             "python/c_two_contract.py",
-            render_python(descriptor, methods),
+            render_python(descriptor, methods, topics),
         ),
         ContractCodegenTarget::TypeScript => (
             "typescript/c_two_contract.ts",
-            render_typescript(descriptor, methods),
+            render_typescript(descriptor, methods, topics),
         ),
     };
     Ok(vec![ContractArtifact::new(
@@ -40,22 +50,34 @@ pub(crate) fn render_target_artifacts(
     )?])
 }
 
-fn render_rust(descriptor: &ValidatedContractDescriptor, methods: &[TargetMethod<'_>]) -> String {
+fn render_rust(
+    descriptor: &ValidatedContractDescriptor,
+    methods: &[TargetMethod<'_>],
+    topics: &[TargetTopic<'_>],
+) -> String {
     let has_stream = methods
         .iter()
         .any(|method| method.mode == MethodMode::ServerStream);
-    let mut output = String::from(
+    // A topics-only contract keeps the standard unary dispatch scaffolding,
+    // which is inert there; keep its compilation warning-free.
+    let header = if methods.is_empty() {
         "// generated-by: c-two.contract.codegen.v2\n\
          // payload-semantics-owner: fastdb-core\n\
-         #![allow(non_snake_case)]\n\n",
-    );
-    for digest in payload_digests(methods) {
+         #![allow(non_snake_case)]\n\
+         #![allow(dead_code, unused_variables)]\n\n"
+    } else {
+        "// generated-by: c-two.contract.codegen.v2\n\
+         // payload-semantics-owner: fastdb-core\n\
+         #![allow(non_snake_case)]\n\n"
+    };
+    let mut output = String::from(header);
+    for digest in payload_digests(methods, topics) {
         output.push_str(&format!(
             "#[path = \"payloads/{digest}/fastdb_payload_{digest}.rs\"]\n\
              pub mod payload_{digest};\n\n"
         ));
     }
-    render_rust_contract_facts(&mut output, descriptor, methods);
+    render_rust_contract_facts(&mut output, descriptor, methods, topics);
     output.push_str(
         r#"
 pub fn contract_release() -> Result<c_two::ContractRelease, c_two::Error> {
@@ -120,6 +142,9 @@ impl ContractClient {
     );
     for method in methods {
         render_rust_client_method(&mut output, method);
+    }
+    for topic in topics {
+        render_rust_topic_client_method(&mut output, topic);
     }
     output.push_str("}\n\npub trait Service: Send + Sync + 'static {\n");
     for method in methods {
@@ -233,8 +258,14 @@ pub fn service_definition<S: Service>(
 
 "#,
     );
+    if !topics.is_empty() {
+        render_rust_topic_service(&mut output, topics);
+    }
     for method in methods {
         render_rust_payload_adapters(&mut output, method);
+    }
+    for topic in topics {
+        render_rust_topic_payload_adapters(&mut output, topic);
     }
     output.push_str(
         r#"fn require_empty_payload(
@@ -271,6 +302,7 @@ fn render_rust_contract_facts(
     output: &mut String,
     descriptor: &ValidatedContractDescriptor,
     methods: &[TargetMethod<'_>],
+    topics: &[TargetTopic<'_>],
 ) {
     output.push_str(&format!(
         "pub const CONTRACT_DESCRIPTOR_JSON: &str = include_str!(\"../metadata/contract.json\");\n\
@@ -308,6 +340,28 @@ fn render_rust_contract_facts(
             rust_method_access(method.access),
             rust_option(method.input_sha256),
             rust_option(method.output_sha256),
+        ));
+    }
+    output.push_str("];\n");
+    if topics.is_empty() {
+        return;
+    }
+    output.push_str(
+        "\n\
+         #[derive(Clone, Copy, Debug, Eq, PartialEq)]\n\
+         pub struct TopicBinding {\n\
+         \x20   pub index: usize,\n\
+         \x20   pub name: &'static str,\n\
+         \x20   pub output_sha256: &'static str,\n\
+         }\n\n\
+         pub const TOPICS: &[TopicBinding] = &[\n",
+    );
+    for topic in topics {
+        output.push_str(&format!(
+            "    TopicBinding {{ index: {}, name: {}, output_sha256: {} }},\n",
+            topic.index,
+            quoted(topic.name),
+            quoted(topic.output_sha256),
         ));
     }
     output.push_str("];\n");
@@ -758,7 +812,194 @@ fn render_rust_payload_adapters(output: &mut String, method: &TargetMethod<'_>) 
     }
 }
 
-fn render_python(descriptor: &ValidatedContractDescriptor, methods: &[TargetMethod<'_>]) -> String {
+fn render_rust_topic_client_method(output: &mut String, topic: &TargetTopic<'_>) {
+    let symbol = topic_symbol(topic.index, topic.name);
+    output.push_str(&format!(
+        "\n    /// Subscribe to the {} topic declared on this contract.\n\
+         \x20   pub fn subscribe_{symbol}(\n\
+         \x20       &self,\n\
+         \x20       options: c_two::SubscribeOptions,\n\
+         \x20   ) -> Result<c_two::Subscription<fastdb::Payload>, c_two::Error> {{\n\
+         \x20       let subscription = self.client.subscribe({}, options)?;\n\
+         \x20       Ok(c_two::Subscription::from_core(\n\
+         \x20           subscription,\n\
+         \x20           decode_{symbol}_value,\n\
+         \x20           decode_{symbol}_value_held,\n\
+         \x20       ))\n\
+         \x20   }}\n",
+        quoted(topic.name),
+        quoted(topic.name),
+    ));
+}
+
+fn render_rust_topic_service(output: &mut String, topics: &[TargetTopic<'_>]) {
+    output.push_str(
+        r#"/// Registration configuration for this contract's topics: bounded history
+/// capacity and initial frames committed atomically before the route opens.
+pub struct TopicService {
+    definition: c_two::ServiceDefinition,
+}
+
+/// Start topic-aware registration of `service` on `route_name`. Topics left
+/// unconfigured keep their default ring capacity of 1.
+pub fn topic_service<S: Service>(
+    route_name: impl Into<String>,
+    service: S,
+) -> Result<TopicService, c_two::Error> {
+    Ok(TopicService {
+        definition: service_definition(route_name, service)?,
+    })
+}
+
+impl TopicService {
+"#,
+    );
+    for topic in topics {
+        let symbol = topic_symbol(topic.index, topic.name);
+        output.push_str(&format!(
+            "    /// Set the bounded history ring depth of topic {}.\n\
+             \x20   pub fn {symbol}_capacity(mut self, capacity: usize) -> Result<Self, c_two::Error> {{\n\
+             \x20       self.definition = self.definition.with_topic_capacity({}, capacity)?;\n\
+             \x20       Ok(self)\n\
+             \x20   }}\n\n\
+             \x20   /// Stage the initial frame of topic {}, committed atomically before\n\
+             \x20   /// the route opens and rolled back if registration fails.\n\
+             \x20   pub fn initial_{symbol}(mut self, value: &fastdb::Payload) -> Result<Self, c_two::Error> {{\n\
+             \x20       let payload = encode_{symbol}_value(value)?;\n\
+             \x20       self.definition = self.definition.with_initial_topic_bytes({}, payload)?;\n\
+             \x20       Ok(self)\n\
+             \x20   }}\n\n",
+            quoted(topic.name),
+            quoted(topic.name),
+            quoted(topic.name),
+            quoted(topic.name),
+        ));
+    }
+    output.push_str(
+        r#"    /// Finish configuration and return the release-verified definition.
+    pub fn build(self) -> c_two::ServiceDefinition {
+        self.definition
+    }
+}
+
+/// Typed publisher handles bound to one committed registration. A handle
+/// fails with `ResourceClosed` (707) once its registration ends and never
+/// writes to a later registration of the same route name.
+pub struct RegistrationTopics<'a> {
+    registration: &'a c_two::Registration,
+}
+
+/// Borrow typed publisher handles from a committed registration.
+pub fn registration_topics(registration: &c_two::Registration) -> RegistrationTopics<'_> {
+    RegistrationTopics { registration }
+}
+
+impl RegistrationTopics<'_> {
+"#,
+    );
+    for topic in topics {
+        let symbol = topic_symbol(topic.index, topic.name);
+        output.push_str(&format!(
+            "    /// Publisher for the {} topic of this registration.\n\
+             \x20   pub fn {symbol}(&self) -> Result<c_two::Publisher<fastdb::Payload>, c_two::Error> {{\n\
+             \x20       Ok(c_two::Publisher::from_core(\n\
+             \x20           self.registration.publisher({})?,\n\
+             \x20           encode_{symbol}_value,\n\
+             \x20       ))\n\
+             \x20   }}\n\n",
+            quoted(topic.name),
+            quoted(topic.name),
+        ));
+    }
+    output.push_str("}\n\n");
+}
+
+fn render_rust_topic_payload_adapters(output: &mut String, topic: &TargetTopic<'_>) {
+    let symbol = topic_symbol(topic.index, topic.name);
+    let digest = topic.output_sha256;
+    output.push_str(&format!(
+        "pub fn encode_{symbol}_value(\n\
+         \x20   payload: &fastdb::Payload,\n\
+         ) -> Result<Vec<u8>, c_two::Error> {{\n\
+         \x20   payload\n\
+         \x20       .require_spec_sha256(&payload_{digest}::PAYLOAD_SHA256_BYTES)\n\
+         \x20       .map_err(|error| c_two::Error::Semantic(c_two::generated::fastdb_adapter_error(\n\
+         \x20           c_two::generated::AdapterFailurePhase::ResourceOutputSerializing,\n\
+         \x20           error,\n\
+         \x20       )))?;\n\
+         \x20   payload.binary_bytes().map_err(|error| {{\n\
+         \x20       c_two::Error::Semantic(c_two::generated::fastdb_adapter_error(\n\
+         \x20           c_two::generated::AdapterFailurePhase::ResourceOutputSerializing,\n\
+         \x20           error,\n\
+         \x20       ))\n\
+         \x20   }})\n\
+         }}\n\n\
+         pub fn decode_{symbol}_value(\n\
+         \x20   bytes: &[u8],\n\
+         ) -> Result<fastdb::Payload, c_two::Error> {{\n\
+         \x20   let spec = payload_{digest}::compile_spec().map_err(|error| {{\n\
+         \x20       c_two::Error::Semantic(c_two::generated::fastdb_adapter_error(\n\
+         \x20           c_two::generated::AdapterFailurePhase::ClientOutputFromBuffer,\n\
+         \x20           error,\n\
+         \x20       ))\n\
+         \x20   }})?;\n\
+         \x20   let payload = c_two::generated::open_owned(&spec, bytes).map_err(|error| {{\n\
+         \x20       c_two::Error::Semantic(c_two::generated::fastdb_adapter_error(\n\
+         \x20           c_two::generated::AdapterFailurePhase::ClientOutputFromBuffer,\n\
+         \x20           error,\n\
+         \x20       ))\n\
+         \x20   }})?;\n\
+         \x20   payload\n\
+         \x20       .require_spec_sha256(&payload_{digest}::PAYLOAD_SHA256_BYTES)\n\
+         \x20       .map_err(|error| {{\n\
+         \x20           c_two::Error::Semantic(c_two::generated::fastdb_adapter_error(\n\
+         \x20               c_two::generated::AdapterFailurePhase::ClientOutputDeserializing,\n\
+         \x20               error,\n\
+         \x20           ))\n\
+         \x20       }})?;\n\
+         \x20   Ok(payload)\n\
+         }}\n\n\
+         pub fn decode_{symbol}_value_held(\n\
+         \x20   response: c_two::generated::HeldResponse,\n\
+         ) -> Result<c_two::Held<fastdb::Payload>, c_two::Error> {{\n\
+         \x20   let spec = payload_{digest}::compile_spec().map_err(|error| {{\n\
+         \x20       c_two::Error::Semantic(c_two::generated::fastdb_adapter_error(\n\
+         \x20           c_two::generated::AdapterFailurePhase::ClientOutputFromBuffer,\n\
+         \x20           error,\n\
+         \x20       ))\n\
+         \x20   }})?;\n\
+         \x20   let mut held = c_two::generated::open_held(&spec, response).map_err(|error| {{\n\
+         \x20       c_two::Error::Semantic(c_two::generated::fastdb_adapter_error(\n\
+         \x20           c_two::generated::AdapterFailurePhase::ClientOutputFromBuffer,\n\
+         \x20           error,\n\
+         \x20       ))\n\
+         \x20   }})?;\n\
+         \x20   let Some(payload) = held.value() else {{\n\
+         \x20       return Err(c_two::contract::ContractError::InvalidDescriptor {{\n\
+         \x20           path: \"$.held\".to_string(),\n\
+         \x20           message: \"new held topic payload was already released\".to_string(),\n\
+         \x20       }}.into());\n\
+         \x20   }};\n\
+         \x20   if let Err(error) =\n\
+         \x20       payload.require_spec_sha256(&payload_{digest}::PAYLOAD_SHA256_BYTES)\n\
+         \x20   {{\n\
+         \x20       let semantic = c_two::generated::fastdb_adapter_error(\n\
+         \x20           c_two::generated::AdapterFailurePhase::ClientOutputDeserializing,\n\
+         \x20           error,\n\
+         \x20       );\n\
+         \x20       c_two::generated::release_held_after_error(&mut held);\n\
+         \x20       return Err(c_two::Error::Semantic(semantic));\n\
+         \x20   }}\n\
+         \x20   Ok(held)\n\
+         }}\n\n"
+    ));
+}
+
+fn render_python(
+    descriptor: &ValidatedContractDescriptor,
+    methods: &[TargetMethod<'_>],
+    topics: &[TargetTopic<'_>],
+) -> String {
     let has_stream = methods
         .iter()
         .any(|method| method.mode == MethodMode::ServerStream);
@@ -771,12 +1012,17 @@ fn render_python(descriptor: &ValidatedContractDescriptor, methods: &[TargetMeth
          from dataclasses import dataclass\n\
          from pathlib import Path\n\
          from types import ModuleType\n\
-         from typing import Any, Protocol\n\n\
-         from fastdb4py.payload import Payload\n\
+         from typing import Any, Protocol\n\n",
+    );
+    output.push_str(
+        "from fastdb4py.payload import Payload\n\
          from c_two.error import CCBaseError, ErrorCode, SerializationError, _post_dispatch_cleanup_error, _project_native_error\n\n",
     );
-    if has_stream {
-        output.push_str("from c_two import HeldResult, Stream\n\n");
+    match (has_stream, !topics.is_empty()) {
+        (true, false) => output.push_str("from c_two import HeldResult, Stream\n\n"),
+        (false, true) => output.push_str("from c_two import HeldResult, Subscription\n\n"),
+        (true, true) => output.push_str("from c_two import HeldResult, Stream, Subscription\n\n"),
+        (false, false) => {}
     }
     output.push_str(&format!(
         "CONTRACT_SCHEMA = {}\n\
@@ -829,8 +1075,29 @@ fn render_python(descriptor: &ValidatedContractDescriptor, methods: &[TargetMeth
             python_option(method.output_sha256),
         ));
     }
+    output.push_str(")\n");
+    if !topics.is_empty() {
+        output.push_str(
+            "\n\
+             @dataclass(frozen=True)\n\
+             class TopicBinding:\n\
+             \x20   index: int\n\
+             \x20   name: str\n\
+             \x20   output_sha256: str\n\n\
+             TOPICS = (\n",
+        );
+        for topic in topics {
+            output.push_str(&format!(
+                "    TopicBinding({}, {}, {}),\n",
+                topic.index,
+                quoted(topic.name),
+                quoted(topic.output_sha256),
+            ));
+        }
+        output.push_str(")\n");
+    }
     output.push_str(
-        ")\n\n\
+        "\n\
          def expected_route(route_name: str) -> dict[str, str]:\n\
          \x20   return {\n\
          \x20       \"route_name\": route_name,\n\
@@ -855,7 +1122,7 @@ fn render_python(descriptor: &ValidatedContractDescriptor, methods: &[TargetMeth
          \x20       raise\n\
          \x20   return module\n\n",
     );
-    for digest in payload_digests(methods) {
+    for digest in payload_digests(methods, topics) {
         output.push_str(&format!(
             "_PAYLOAD_{digest} = _load_payload_module({})\n",
             quoted(digest),
@@ -864,6 +1131,7 @@ fn render_python(descriptor: &ValidatedContractDescriptor, methods: &[TargetMeth
     if methods
         .iter()
         .any(|method| method.input_sha256.is_some() || method.output_sha256.is_some())
+        || !topics.is_empty()
     {
         output.push('\n');
     }
@@ -874,6 +1142,11 @@ fn render_python(descriptor: &ValidatedContractDescriptor, methods: &[TargetMeth
             "    @property\n    def local_copy_tracker(self) -> Any: ...\n\
              \x20   @property\n    def route_name(self) -> str: ...\n\
              \x20   def begin_stream(self, method_name: str) -> Any: ...\n",
+        );
+    }
+    if !topics.is_empty() {
+        output.push_str(
+            "    def subscribe(self, topic: str, *, start: str = \"latest\", on_lag: str = \"skip\", hold: bool = False) -> Any: ...\n",
         );
     }
     output.push_str(
@@ -900,10 +1173,16 @@ fn render_python(descriptor: &ValidatedContractDescriptor, methods: &[TargetMeth
     for method in methods {
         render_python_client_method(&mut output, method);
     }
+    for topic in topics {
+        render_python_topic_client_method(&mut output, topic);
+    }
     output.push('\n');
     for method in methods {
         render_python_direction(&mut output, method, "input", method.input_sha256);
         render_python_direction(&mut output, method, "output", method.output_sha256);
+    }
+    for topic in topics {
+        render_python_topic_value(&mut output, topic);
     }
     output.push_str(
         "def _require_empty_payload(method: str, direction: str, data: bytes) -> None:\n\
@@ -1073,6 +1352,28 @@ fn render_python_client_method(output: &mut String, method: &TargetMethod<'_>) {
     ));
 }
 
+fn render_python_topic_client_method(output: &mut String, topic: &TargetTopic<'_>) {
+    let symbol = topic_symbol(topic.index, topic.name);
+    for held in [false, true] {
+        let name = if held {
+            format!("hold_subscribe_{symbol}")
+        } else {
+            format!("subscribe_{symbol}")
+        };
+        let return_type = if held {
+            "Subscription[HeldResult[Payload]]"
+        } else {
+            "Subscription[Payload]"
+        };
+        let hold_literal = if held { "True" } else { "False" };
+        output.push_str(&format!(
+            "\n    def {name}(self, *, start: str = \"latest\", on_lag: str = \"skip\") -> {return_type}:\n\
+             \x20       return _project_call(lambda: self._bound_client.subscribe({}, start=start, on_lag=on_lag, hold={hold_literal}))\n",
+            quoted(topic.name),
+        ));
+    }
+}
+
 fn render_python_stream_client_method(output: &mut String, method: &TargetMethod<'_>) {
     let symbol = method_symbol(method.index, method.name);
     let parameter = if method.input_sha256.is_some() {
@@ -1238,16 +1539,49 @@ fn render_python_direction(
     }
 }
 
+/// Topic value codecs mirroring `render_python_direction`'s output direction:
+/// publishing serializes a resource output, subscribing deserializes a client
+/// output, and every decoded payload is checked against the contract's
+/// FastDB specification digest.
+fn render_python_topic_value(output: &mut String, topic: &TargetTopic<'_>) {
+    let symbol = topic_symbol(topic.index, topic.name);
+    let digest = topic.output_sha256;
+    output.push_str(&format!(
+        "def encode_{symbol}_value(payload: Payload) -> bytes:\n\
+         \x20   try:\n\
+         \x20       payload.require_spec_sha256(_PAYLOAD_{digest}.PAYLOAD_SHA256_BYTES)\n\
+         \x20       return payload.binary_bytes()\n\
+         \x20   except BaseException as exc:\n\
+         \x20       raise _serialization_error(ErrorCode.ResourceOutputSerializing, exc) from exc\n\n\
+         def decode_{symbol}_value(data: bytes) -> Payload:\n\
+         \x20   try:\n\
+         \x20       spec = _PAYLOAD_{digest}.compile_spec()\n\
+         \x20   except BaseException as exc:\n\
+         \x20       raise _serialization_error(ErrorCode.ClientOutputFromBuffer, exc) from exc\n\
+         \x20   try:\n\
+         \x20       payload = Payload.open_copy(spec, data)\n\
+         \x20   except BaseException as exc:\n\
+         \x20       raise _serialization_error(ErrorCode.ClientOutputFromBuffer, exc) from exc\n\
+         \x20   try:\n\
+         \x20       payload.require_spec_sha256(_PAYLOAD_{digest}.PAYLOAD_SHA256_BYTES)\n\
+         \x20   except BaseException as exc:\n\
+         \x20       _release_failed_payload(payload)\n\
+         \x20       raise _serialization_error(ErrorCode.ClientOutputDeserializing, exc) from exc\n\
+         \x20   return payload\n\n"
+    ));
+}
+
 fn render_typescript(
     descriptor: &ValidatedContractDescriptor,
     methods: &[TargetMethod<'_>],
+    topics: &[TargetTopic<'_>],
 ) -> String {
     let mut output = String::from(
         "// generated-by: c-two.contract.codegen.v2\n\
          // payload-semantics-owner: fastdb-core\n\
          import { Payload, PayloadError } from 'fastdb4ts/payload';\n",
     );
-    for digest in payload_digests(methods) {
+    for digest in payload_digests(methods, topics) {
         output.push_str(&format!(
             "import * as payload_{digest} from './payloads/{digest}/fastdb_payload_{digest}.js';\n"
         ));
@@ -1352,7 +1686,31 @@ function normalizeFastDbPayloadError(error: unknown): unknown {
             typescript_optional_field("outputSha256", method.output_sha256),
         ));
     }
-    output.push_str("]);\n\nexport class ContractClient {\n  constructor(\n");
+    output.push_str("]);\n");
+    if !topics.is_empty() {
+        // Topic declaration metadata for the ABI 9 Node subscription client.
+        // The transport surface itself arrives with that client; contracts
+        // compiled today only carry the typed identity of each topic.
+        output.push_str(
+            "\n\
+             export interface TopicBinding {\n\
+             \x20 readonly index: number;\n\
+             \x20 readonly name: string;\n\
+             \x20 readonly outputSha256: string;\n\
+             }\n\n\
+             export const TOPICS: readonly TopicBinding[] = Object.freeze([\n",
+        );
+        for topic in topics {
+            output.push_str(&format!(
+                "  {{ index: {}, name: {}, outputSha256: {} }},\n",
+                topic.index,
+                quoted(topic.name),
+                quoted(topic.output_sha256),
+            ));
+        }
+        output.push_str("]);\n");
+    }
+    output.push_str("\nexport class ContractClient {\n  constructor(\n");
     output.push_str(
         if methods
             .iter()
@@ -1539,10 +1897,14 @@ fn render_typescript_direction(
     }
 }
 
-fn payload_digests<'a>(methods: &'a [TargetMethod<'a>]) -> BTreeSet<&'a str> {
+fn payload_digests<'a>(
+    methods: &'a [TargetMethod<'a>],
+    topics: &'a [TargetTopic<'a>],
+) -> BTreeSet<&'a str> {
     methods
         .iter()
         .flat_map(|method| [method.input_sha256, method.output_sha256])
+        .chain(topics.iter().map(|topic| Some(topic.output_sha256)))
         .flatten()
         .collect()
 }
@@ -1593,8 +1955,19 @@ fn method_symbol(index: usize, name: &str) -> String {
     symbol
 }
 
-const TS_ERROR_CODE_PLACEHOLDER: &str =
-    "/* __C2_GENERATED_ERROR_CODE_NAMES__ */ Object.freeze({})";
+fn topic_symbol(index: usize, name: &str) -> String {
+    let mut symbol = format!("topic_{index}_");
+    for character in name.chars() {
+        if character.is_ascii_alphanumeric() {
+            symbol.push(character.to_ascii_lowercase());
+        } else {
+            symbol.push('_');
+        }
+    }
+    symbol
+}
+
+const TS_ERROR_CODE_PLACEHOLDER: &str = "/* __C2_GENERATED_ERROR_CODE_NAMES__ */ Object.freeze({})";
 
 fn render_typescript_transport_source() -> String {
     let generated_table = render_typescript_error_code_table();
@@ -1609,7 +1982,11 @@ fn render_typescript_transport_source() -> String {
 fn render_typescript_error_code_table() -> String {
     let mut table = String::from("Object.freeze({\n");
     for entry in c2_error::ErrorCode::registry() {
-        table.push_str(&format!("  {}: {},\n", u16::from(entry.code), quoted(entry.name)));
+        table.push_str(&format!(
+            "  {}: {},\n",
+            u16::from(entry.code),
+            quoted(entry.name)
+        ));
     }
     table.push_str("})");
     table

@@ -103,6 +103,7 @@ checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 name = "c-two"
 version = "0.1.0"
 dependencies = [
+ "c2-codegen",
  "c2-config",
  "c2-contract",
  "c2-core",
@@ -114,6 +115,21 @@ dependencies = [
  "fastdb",
  "parking_lot",
  "serde_json",
+ "tempfile",
+]
+
+[[package]]
+name = "c2-codegen"
+version = "0.1.0"
+dependencies = [
+ "c2-contract",
+ "c2-error",
+ "fastdb",
+ "rustix",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror",
 ]
 
 [[package]]
@@ -247,6 +263,7 @@ dependencies = [
  "c2-local-security",
  "libc",
  "memmap2",
+ "parking_lot",
  "sha2",
  "uuid",
  "windows-sys 0.61.2",
@@ -392,6 +409,12 @@ name = "fastdb-sys"
 version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9d05a702067c14b57ea080864ccbd4e41757e6dd888ca87e3876fd0a379a9e81"
+
+[[package]]
+name = "fastrand"
+version = "2.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "da7c62ceae207dd37ea5b845da6a0696c799f85e97da1ab5b7910be3c1c80223"
 
 [[package]]
 name = "find-msvc-tools"
@@ -1304,6 +1327,19 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "tempfile"
+version = "3.27.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
+dependencies = [
+ "fastrand",
+ "getrandom 0.4.3",
+ "once_cell",
+ "rustix",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

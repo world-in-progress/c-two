@@ -10,6 +10,7 @@ mod error;
 mod held;
 mod payload;
 mod stream;
+mod topic;
 
 pub mod contract;
 pub mod endpoint;
@@ -25,10 +26,14 @@ pub use c2_core::{
     ServerConfigPatch, ServerFailure, ServerStartupStage, ServerStartupTimeout,
     ServiceConcurrencyMode, ServiceDefinition, TransportPhase,
 };
+pub use c2_core::{
+    LagPolicy, SubscribeOptions, TopicCloseCause, TopicCloseReceipt, TopicConfig, TopicStart,
+};
 pub use c2_error::{C2Error, ErrorCode, ErrorSide, ErrorStage};
 pub use error::Error;
 pub use held::Held;
 pub use stream::ResponseStream;
+pub use topic::{Delivery, Publisher, Subscription};
 
 /// Stable implementation seam consumed by C-Two generated Rust modules.
 ///
@@ -51,5 +56,7 @@ pub mod generated {
     pub use crate::payload::{
         BorrowedPayload, PayloadStream, charge_payload_input, open_borrowed, open_held, open_owned,
     };
+    pub use crate::topic::{Delivery, Publisher, Subscription};
     pub use c2_core::CoreResponseStream;
+    pub use c2_core::{LagPolicy, SubscribeOptions, TopicCloseReceipt, TopicConfig, TopicStart};
 }
