@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 
@@ -37,6 +38,8 @@ def _clean_env() -> dict[str, str]:
 
 def test_portable_payload_benchmark_smoke_all_ctwo_suites(tmp_path):
     output = tmp_path / 'receipt.json'
+    c3_bin = os.environ.get('CTWO_TEST_C3_BIN') or shutil.which('c3')
+    relay_args = ['--c3-bin', c3_bin] if c3_bin else []
     proc = subprocess.run(
         [
             sys.executable,
@@ -44,6 +47,7 @@ def test_portable_payload_benchmark_smoke_all_ctwo_suites(tmp_path):
             '--suite',
             'all',
             '--smoke',
+            *relay_args,
             '--output',
             str(output),
         ],
@@ -71,7 +75,7 @@ def test_portable_payload_benchmark_smoke_all_ctwo_suites(tmp_path):
     assert env_meta['fastdb4py_version']
 
     suites = receipt['suites']
-    assert set(suites.keys()) == {'stages', 'coupling', 'field', 'fanout', 'kostya'}
+    assert set(suites.keys()) == {'stages', 'coupling', 'field', 'fanout', 'pubsub_fanout', 'kostya'}
 
     stage_row = suites['stages']['rows'][0]
     assert stage_row['fastdb_staging_bytes'] == 0
@@ -91,8 +95,25 @@ def test_portable_payload_benchmark_smoke_all_ctwo_suites(tmp_path):
         assert row['client_holds_active'] == 0
         assert row['p95_ms'] >= row['p50_ms']
 
-    fanout_readers = {r['readers'] for r in suites['fanout']['rows']}
+    fanout_rows = suites['fanout']['rows']
+    fanout_readers = {r['readers'] for r in fanout_rows}
     assert {1, 2}.issubset(fanout_readers)
+    assert all(row['server_pool_peak_mib'] > 0 for row in fanout_rows)
+
+    pubsub_rows = suites['pubsub_fanout']['rows']
+    transports = {'direct_ipc', 'explicit_relay', 'dual_relay'} if c3_bin else {'direct_ipc'}
+    assert {(row['transport'], row['readers']) for row in pubsub_rows} == {
+        (transport, readers) for transport in transports for readers in (1, 2)
+    }
+    for row in pubsub_rows:
+        assert row['frames_per_reader'] == 3
+        assert row['topic_capacity'] == 4
+        assert row['dropped_total'] == 0
+        assert row['server_write_multiplier'] == 1
+        assert row['per_reader_p50_ms'] > 0
+        assert row['per_reader_p95_ms'] >= row['per_reader_p50_ms']
+        assert row['server_pool_peak_mib'] > 0
+        assert row['publish_elapsed_s'] > 0
 
     kostya_arms = {r['arm'] for r in suites['kostya']['rows']}
     assert kostya_arms == {'ctwo-fastdb-packed', 'ctwo-pickle-arrays'}
