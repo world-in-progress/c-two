@@ -523,3 +523,104 @@ fn tight_n2_reserves_one_slot_for_ordinary_calls_and_runtime_shutdown_cancels() 
     );
     drop(reg);
 }
+
+#[test]
+fn idle_local_subscription_settles_on_unregister_shutdown_and_cancel_without_polling() {
+    // 1. Same-thread unregister completes while an idle local subscription stays alive;
+    //    previously delivered values remain readable and subsequent polling sees
+    //    718 route_unregistered (and re-registration works on the same thread).
+    let (_dir, _rt, host) = make_host("topic-idle-unreg", None, Some(4));
+    let rel = release_with_topics(&["field"]);
+    let expected = rel.expected_route("sim").unwrap();
+    let mut reg1 = host
+        .register(
+            service_def(&rel, "sim")
+                .with_initial_topic_bytes("field", b"snap-1".to_vec())
+                .unwrap(),
+        )
+        .unwrap();
+    let sub1 = host
+        .subscribe_local(&expected, "field", SubscribeOptions::default())
+        .unwrap();
+    let d1 = sub1.next_delivery().unwrap();
+    assert_eq!(d1.bytes(), b"snap-1");
+    assert_eq!(reg1.active_subscribers(), 1);
+    assert_eq!(
+        host.call_execution_snapshot().server.used_operations,
+        Some(1)
+    );
+
+    // No background thread polls `sub1`; closing `reg1` on the same thread MUST NOT deadlock.
+    let unreg = reg1.close().unwrap();
+    assert!(unreg.local_removed);
+    assert_eq!(reg1.active_subscribers(), 0);
+    assert_eq!(
+        host.call_execution_snapshot().server.used_operations,
+        Some(0)
+    );
+    // Already-delivered value remains valid.
+    assert_eq!(d1.bytes(), b"snap-1");
+    // Re-register on the same thread while `sub1` is still alive.
+    let reg2 = host
+        .register(
+            service_def(&rel, "sim")
+                .with_initial_topic_bytes("field", b"snap-2".to_vec())
+                .unwrap(),
+        )
+        .unwrap();
+    // Subsequent read on old `sub1` observes exact first cause `route_unregistered` (718).
+    let err1 = assert_semantic_code(sub1.next_delivery().unwrap_err(), ErrorCode::CallCancelled);
+    assert_eq!(
+        err1.details.get("cause").map(String::as_str),
+        Some("route_unregistered")
+    );
+
+    // 2. Idle `cancel()` immediately releases business slot and drain guard.
+    let sub_cancel = host
+        .subscribe_local(&expected, "field", SubscribeOptions::default())
+        .unwrap();
+    assert_eq!(reg2.active_subscribers(), 1);
+    assert_eq!(
+        host.call_execution_snapshot().server.used_operations,
+        Some(1)
+    );
+    sub_cancel.cancel();
+    assert_eq!(reg2.active_subscribers(), 0);
+    assert_eq!(
+        host.call_execution_snapshot().server.used_operations,
+        Some(0)
+    );
+    let cancel_err = assert_semantic_code(
+        sub_cancel.next_delivery().unwrap_err(),
+        ErrorCode::CallCancelled,
+    );
+    assert_eq!(
+        cancel_err.details.get("cause").map(String::as_str),
+        Some("consumer_cancelled")
+    );
+
+    // 3. Same-thread host shutdown completes while an idle local subscription stays alive.
+    let sub_shutdown = host
+        .subscribe_local(&expected, "field", SubscribeOptions::default())
+        .unwrap();
+    let d2 = sub_shutdown.next_delivery().unwrap();
+    assert_eq!(d2.bytes(), b"snap-2");
+    assert_eq!(reg2.active_subscribers(), 1);
+    let outcome = host.shutdown();
+    assert!(outcome.runtime_barrier_error.is_none(), "{outcome:?}");
+    assert_eq!(reg2.active_subscribers(), 0);
+    assert_eq!(
+        host.call_execution_snapshot().server.used_operations,
+        Some(0)
+    );
+    assert_eq!(d2.bytes(), b"snap-2");
+    let shut_err = assert_semantic_code(
+        sub_shutdown.next_delivery().unwrap_err(),
+        ErrorCode::CallCancelled,
+    );
+    assert_eq!(
+        shut_err.details.get("cause").map(String::as_str),
+        Some("host_shutdown")
+    );
+    drop(reg2);
+}

@@ -9,7 +9,7 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fmt;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
@@ -346,6 +346,7 @@ struct TopicChannelState {
     head_seq: u64,
     ring: VecDeque<Arc<TopicFrame>>,
     closed: Option<TopicCloseCause>,
+    local_subscribers: Vec<Weak<Mutex<LocalCursorState>>>,
 }
 
 pub(crate) struct TopicChannel {
@@ -405,6 +406,7 @@ impl TopicChannel {
                 head_seq: 0,
                 ring: VecDeque::with_capacity(capacity.min(64)),
                 closed: None,
+                local_subscribers: Vec::new(),
             }),
             notify: Notify::new(),
         })
@@ -598,14 +600,27 @@ impl TopicChannel {
     }
 
     fn close(&self, cause: TopicCloseCause) {
-        let evicted = {
+        let (evicted, local_subscribers) = {
             let mut state = self.state.lock();
             if state.closed.is_some() {
                 return;
             }
             state.closed = Some(cause);
-            std::mem::take(&mut state.ring)
+            (
+                std::mem::take(&mut state.ring),
+                std::mem::take(&mut state.local_subscribers),
+            )
         };
+        // Settle idle local subscribers immediately outside the channel lock so
+        // their operation permits and drain-barrier guards release without
+        // waiting for another caller poll, while preserving the first terminal
+        // cause for subsequent observation.
+        let error = cause.into_error();
+        for weak in local_subscribers {
+            if let Some(cursor) = weak.upgrade() {
+                cursor.lock().settle(error.clone());
+            }
+        }
         self.notify.notify_waiters();
         drop(evicted);
     }
@@ -646,16 +661,28 @@ impl TopicChannel {
             .reserve_subscription_operation()
             .map_err(|error| subscription_slot_error(&self.topic_name, error))?;
 
-        let (start_seq, guard) = {
-            let state = self.state.lock();
-            match self.compute_attach_locked(&state, options) {
+        let (start_seq, cursor) = {
+            let mut state = self.state.lock();
+            let (start_seq, guard) = match self.compute_attach_locked(&state, options) {
                 Ok(attached) => attached,
                 Err(error) => {
                     drop(state);
                     drop(permit);
                     return Err(error);
                 }
-            }
+            };
+            let cursor = Arc::new(Mutex::new(LocalCursorState {
+                next_expected: start_seq,
+                complete_items: 0,
+                terminal: None,
+                permit: Some(permit),
+                guard: Some(guard),
+            }));
+            state
+                .local_subscribers
+                .retain(|weak| weak.strong_count() > 0);
+            state.local_subscribers.push(Arc::downgrade(&cursor));
+            (start_seq, cursor)
         };
 
         Ok(LocalTopicSubscription {
@@ -664,13 +691,7 @@ impl TopicChannel {
             options,
             cancelled: Arc::new(AtomicBool::new(false)),
             cancel_notify: Arc::new(Notify::new()),
-            cursor: Mutex::new(LocalCursorState {
-                next_expected: start_seq,
-                complete_items: 0,
-                terminal: None,
-                permit: Some(permit),
-                guard: Some(guard),
-            }),
+            cursor,
         })
     }
 
@@ -958,7 +979,7 @@ pub struct LocalTopicSubscription {
     options: SubscribeOptions,
     cancelled: Arc<AtomicBool>,
     cancel_notify: Arc<Notify>,
-    cursor: Mutex<LocalCursorState>,
+    cursor: Arc<Mutex<LocalCursorState>>,
 }
 
 impl fmt::Debug for LocalTopicSubscription {
@@ -1089,9 +1110,15 @@ impl LocalTopicSubscription {
         }
     }
 
-    /// Submit consumer cancellation intent without blocking.
+    /// Submit consumer cancellation intent without blocking, settling an idle
+    /// local subscription's slot and drain guard immediately while preserving
+    /// any earlier terminal cause.
     pub fn cancel(&self) {
         self.cancelled.store(true, Ordering::Release);
+        {
+            let mut cursor = self.cursor.lock();
+            cursor.settle(TopicCloseCause::ConsumerCancelled.into_error());
+        }
         self.cancel_notify.notify_waiters();
     }
 
