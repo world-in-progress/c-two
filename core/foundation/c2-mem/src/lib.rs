@@ -17,6 +17,7 @@ pub mod peer;
 pub mod pool;
 mod pressure;
 pub mod segment;
+pub mod shared;
 pub mod spill;
 mod window;
 
@@ -34,5 +35,6 @@ pub use handle::{MemHandle, OwnedAllocation};
 pub use peer::{PeerMappingCache, PeerMappingError, PeerRead};
 pub use pool::{MemPool, ShmMutPin, ShmRefPin};
 pub use segment::ShmRegion;
+pub use shared::{SealedShmBlock, SharedShmLoan};
 pub use spill::{available_physical_memory, create_file_spill};
 pub use window::{ReusableWindow, WindowChunk, WindowReserveFuture, WindowSlice};

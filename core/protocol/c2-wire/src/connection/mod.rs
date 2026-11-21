@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use c2_config::IPC_RELEASE_BATCH_CAPACITY;
-use c2_mem::{MemHandle, MemPool};
+use c2_mem::{MemHandle, MemPool, SharedShmLoan};
 use parking_lot::{Mutex, RwLock};
 
 use crate::frame::{FrameHeader, HEADER_SIZE};
@@ -56,16 +56,32 @@ impl std::fmt::Display for ConnectionError {
 
 impl std::error::Error for ConnectionError {}
 
+enum AllocationOwner {
+    Exclusive {
+        pool: Arc<RwLock<MemPool>>,
+        handle: Option<MemHandle>,
+    },
+    Shared(Option<SharedShmLoan>),
+}
+
 struct Allocation {
-    pool: Arc<RwLock<MemPool>>,
-    handle: Option<MemHandle>,
+    owner: AllocationOwner,
     published: bool,
 }
 
 impl Allocation {
     fn release(&mut self) {
-        if let Some(handle) = self.handle.take() {
-            self.pool.write().release_handle(handle);
+        match &mut self.owner {
+            AllocationOwner::Exclusive { pool, handle } => {
+                if let Some(handle) = handle.take() {
+                    pool.write().release_handle(handle);
+                }
+            }
+            AllocationOwner::Shared(loan) => {
+                if let Some(loan) = loan.take() {
+                    loan.settle();
+                }
+            }
         }
     }
 }
@@ -75,6 +91,8 @@ impl Drop for Allocation {
         // A prepared allocation was never exposed. Published allocations may
         // only be reused after a release record or peer end. Final connection
         // Drop therefore leaves any unconfirmed allocation to pool teardown.
+        // For SharedShmLoan, dropping without `settle()` intentionally leaves
+        // its reference pinned in the SealedShmBlock as well.
         if !self.published {
             self.release();
         }
@@ -402,22 +420,67 @@ impl ConnectionCore {
         pool: Arc<RwLock<MemPool>>,
         handle: MemHandle,
     ) -> Result<PreparedLoan, ConnectionError> {
-        self.prepare_loan_from(pool, handle, &LOAN_SEQUENCE)
+        self.prepare_allocation_from(
+            Allocation {
+                owner: AllocationOwner::Exclusive {
+                    pool,
+                    handle: Some(handle),
+                },
+                published: false,
+            },
+            &LOAN_SEQUENCE,
+        )
     }
 
+    /// Register one independent per-connection loan over a [`c2_mem::SealedShmBlock`].
+    ///
+    /// Pre-publication cancellation settles this loan immediately. Once
+    /// `begin_io()` publishes it, only a valid `RELEASE` for this loan ID or
+    /// read-side `peer_end()` settles it; dropping the connection with an
+    /// unconfirmed published loan leaves the shared block pinned (ADR 0001).
+    pub fn prepare_shared_loan(&self, loan: SharedShmLoan) -> Result<PreparedLoan, ConnectionError> {
+        self.prepare_allocation_from(
+            Allocation {
+                owner: AllocationOwner::Shared(Some(loan)),
+                published: false,
+            },
+            &LOAN_SEQUENCE,
+        )
+    }
+
+    /// True while `loan_id` is still prepared or published on this connection.
+    pub fn is_loan_live(&self, loan_id: u64) -> bool {
+        let state = self.shared.state.lock();
+        state.prepared.contains_key(&loan_id) || state.published.contains_key(&loan_id)
+    }
+
+    #[cfg(test)]
     fn prepare_loan_from(
         &self,
         pool: Arc<RwLock<MemPool>>,
         handle: MemHandle,
         sequence: &AtomicU64,
     ) -> Result<PreparedLoan, ConnectionError> {
+        self.prepare_allocation_from(
+            Allocation {
+                owner: AllocationOwner::Exclusive {
+                    pool,
+                    handle: Some(handle),
+                },
+                published: false,
+            },
+            sequence,
+        )
+    }
+
+    fn prepare_allocation_from(
+        &self,
+        allocation: Allocation,
+        sequence: &AtomicU64,
+    ) -> Result<PreparedLoan, ConnectionError> {
         // Declared before any connection guard, so rejection releases the
         // local allocation only after that guard has been dropped.
-        let allocation = Allocation {
-            pool,
-            handle: Some(handle),
-            published: false,
-        };
+        let allocation = allocation;
         let result = (|| {
             let mut state = self.shared.state.lock();
             check_business(&state)?;
