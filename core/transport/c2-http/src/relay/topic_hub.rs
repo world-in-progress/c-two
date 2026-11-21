@@ -1275,7 +1275,15 @@ impl BodyState {
                             if frame.total != 0 {
                                 let memory = self.budget.snapshot().memory;
                                 let available = memory.limit_bytes - memory.used_bytes;
-                                let width = frame.total.min(4096).min(available);
+                                let max_width = c2_config::REMOTE_PAYLOAD_CHUNK_SIZE
+                                    .min(c2_config::CHUNK_SIZE)
+                                    .max(1);
+                                let fair_share = if available <= 4096 {
+                                    available
+                                } else {
+                                    (available / 2).max(4096)
+                                };
+                                let width = frame.total.min(max_width).min(fair_share);
                                 let reservation = if width == 0 {
                                     None
                                 } else {
@@ -2206,6 +2214,58 @@ mod tests {
             subscriber.next().await.unwrap().unwrap(),
             Bytes::from_static(b"abc")
         );
+    }
+
+    #[tokio::test]
+    async fn large_frame_uses_chunk_sized_transport_window_when_budget_allows() {
+        let chunk_size = usize::try_from(
+            c2_config::REMOTE_PAYLOAD_CHUNK_SIZE
+                .min(c2_config::CHUNK_SIZE)
+                .max(1),
+        )
+        .unwrap();
+        let domain = ForwardingDomain::new(DomainBudget::from_limits(&c2_config::DomainLimits {
+            memory_budget_bytes: (chunk_size as u64) * 16,
+            ..Default::default()
+        }));
+        let hub = Arc::new(Hub {
+            key: HubKey {
+                scope: HubScope::Local {
+                    instance: "i".into(),
+                    route_uid: "r".into(),
+                },
+                topic: "state".into(),
+            },
+            inner: Mutex::new(HubState::default()),
+            changed: Arc::new(Notify::new()),
+            budget_changed: Arc::new(Notify::new()),
+            file_segments: Arc::new(AtomicUsize::new(0)),
+            latest_budgets: Arc::new(LatestBudgets::default()),
+        });
+        let mut subscriber = body(hub.clone(), &domain, 1, WireLagPolicy::Skip);
+        let chunk = Bytes::from(vec![0x5a; chunk_size]);
+        hub.inner.lock().latest = Some(LatestFrame::new(
+            HubFrame {
+                seq: 1,
+                total: (chunk_size * 2) as u64,
+                chunks: vec![chunk.clone(), chunk],
+                memory_bytes: 0,
+                file_bytes: 0,
+                _metadata: Arc::new(domain.budget().try_reserve_memory(0).unwrap()),
+            },
+            hub.latest_budgets.clone(),
+        ));
+        let _ready = subscriber.next().await.unwrap().unwrap();
+        let _begin = subscriber.next().await.unwrap().unwrap();
+        for _ in 0..2 {
+            let header = subscriber.next().await.unwrap().unwrap();
+            assert_eq!(
+                topic_wire::decode_header(header[..9].try_into().unwrap()).unwrap(),
+                (RecordKind::ItemData, chunk_size as u64)
+            );
+            let data = subscriber.next().await.unwrap().unwrap();
+            assert_eq!(data.len(), chunk_size);
+        }
     }
 
     #[tokio::test]
