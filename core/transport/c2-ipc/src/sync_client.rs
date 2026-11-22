@@ -297,6 +297,25 @@ impl SyncClient {
             .await
     }
 
+    pub fn try_alloc_request_slab(
+        &self,
+        data_size: usize,
+    ) -> Result<Option<c2_mem::WritableSlab>, IpcError> {
+        self.inner.try_alloc_request_slab(data_size)
+    }
+
+    pub async fn call_bound_slab_controlled_async_phased(
+        &self,
+        binding: &RouteBinding,
+        method_name: &str,
+        slab: c2_mem::WritableSlab,
+        control: &IpcCallControl,
+    ) -> Result<ResponseData, IpcCallError> {
+        self.inner
+            .call_bound_slab_controlled_async_phased(binding, method_name, slab, control)
+            .await
+    }
+
     pub async fn stream_bound_owned_controlled_async_phased<B>(
         &self,
         binding: &RouteBinding,

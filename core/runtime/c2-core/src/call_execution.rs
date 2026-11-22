@@ -173,9 +173,39 @@ impl PreparingCall {
         self.payload_budget.clone()
     }
 
-    #[cfg(test)]
     pub(crate) fn scope(&self) -> &CallScope {
         &self.scope
+    }
+
+    pub(crate) fn release_input_charge(&mut self) {
+        self.input_reservation = None;
+    }
+
+    pub(crate) fn execute_slab<R, T, F>(
+        self,
+        slab: c2_mem::WritableSlab,
+        original: bool,
+        transport: T,
+    ) -> Result<ExecutingCall<R>, Error>
+    where
+        R: Send + 'static,
+        T: FnOnce(c2_mem::WritableSlab, CallScope, Option<CallRecord<R>>) -> F + Send + 'static,
+        F: Future<Output = Result<R, Error>> + Send + 'static,
+    {
+        let scope = self.scope.clone();
+        let mode = if original {
+            CompletionMode::OriginalRecord { stream: false }
+        } else {
+            CompletionMode::WholeCall
+        };
+        self.start_task(
+            move |scope, record| transport(slab, scope, original.then_some(record)),
+            shared_executor,
+            mode,
+            None,
+            None,
+        )
+        .map_err(|error| settle_failure(&scope, error))
     }
 
     /// Reserve known input bytes before materialization. Only the first
@@ -389,6 +419,51 @@ impl PreparingCall {
     {
         let bytes = u64::try_from(nbytes).map_err(|_| configuration("input length exceeds u64"))?;
         self.charge_input(bytes)?;
+        let mut input_reservation = self.input_reservation.take().expect("input was charged");
+        let stream_http_headroom = self.stream_http_headroom;
+        self.start_task(
+            move |scope, record| async move {
+                let bytes = materialize()?;
+                if bytes.len() != nbytes {
+                    return Err(configuration(
+                        "materialized input length differs from charged length",
+                    ));
+                }
+                let actual_capacity = u64::try_from(bytes.capacity())
+                    .map_err(|_| configuration("materialized input capacity exceeds u64"))?;
+                let required = actual_capacity
+                    .checked_add(stream_http_headroom)
+                    .ok_or_else(|| configuration("input capacity and HTTP headroom exceed u64"))?;
+                let additional = required.saturating_sub(input_reservation.bytes());
+                if additional > 0 {
+                    input_reservation
+                        .try_grow(additional)
+                        .map_err(payload_admission_error)?;
+                }
+                // The reservation follows the actual input's last reader.
+                let input = BudgetedBuffer::new(bytes, input_reservation);
+                transport(input, scope, record).await
+            },
+            executor,
+            mode,
+            abandon,
+            on_waiter_abandon,
+        )
+    }
+
+    fn start_task<R, T, F>(
+        self,
+        work: T,
+        executor: impl FnOnce() -> Result<Handle, Error>,
+        mode: CompletionMode,
+        abandon: Option<fn(&R)>,
+        on_waiter_abandon: Option<Arc<dyn Fn() + Send + Sync>>,
+    ) -> Result<ExecutingCall<R>, Error>
+    where
+        R: Send + 'static,
+        T: FnOnce(CallScope, CallRecord<R>) -> F + Send + 'static,
+        F: Future<Output = Result<R, Error>> + Send + 'static,
+    {
         let handle = catch_unwind(AssertUnwindSafe(executor))
             .map_err(|_| configuration("call executor initialization panicked"))??;
         self.scope.check_pre_dispatch().map_err(scope_error)?;
@@ -411,51 +486,16 @@ impl PreparingCall {
             shared: shared.clone(),
             finished: false,
         };
+        let operation = self.permit;
         let task = async move {
             let mut guard = guard;
             let scope = guard.shared.scope.clone();
-            let operation = self.permit;
-            let mut input_reservation = self.input_reservation;
-            let stream_http_headroom = self.stream_http_headroom;
-            // Materialization is native work too: a slow copy cannot delay
-            // the independent caller deadline or destroy its Vec on timeout.
-            // The operation slot stays with this task. The B reservation moves
-            // into the real input owner when materialization finishes, for
-            // both finite and unlimited calls.
-            let result = AssertUnwindSafe(async {
+            let record = CallRecord {
+                shared: guard.shared.clone(),
+            };
+            let result = AssertUnwindSafe(async move {
                 scope.check_pre_dispatch().map_err(scope_error)?;
-                let bytes = materialize()?;
-                if bytes.len() != nbytes {
-                    return Err(configuration(
-                        "materialized input length differs from charged length",
-                    ));
-                }
-                let actual_capacity = u64::try_from(bytes.capacity())
-                    .map_err(|_| configuration("materialized input capacity exceeds u64"))?;
-                let reservation = input_reservation
-                    .as_mut()
-                    .expect("input was charged before materialization");
-                let required = actual_capacity
-                    .checked_add(stream_http_headroom)
-                    .ok_or_else(|| configuration("input capacity and HTTP headroom exceed u64"))?;
-                let additional = required.saturating_sub(reservation.bytes());
-                if additional > 0 {
-                    reservation
-                        .try_grow(additional)
-                        .map_err(payload_admission_error)?;
-                }
-                let input = BudgetedBuffer::new(
-                    bytes,
-                    input_reservation.take().expect("input was charged"),
-                );
-                transport(
-                    input,
-                    scope,
-                    CallRecord {
-                        shared: guard.shared.clone(),
-                    },
-                )
-                .await
+                work(scope, record).await
             })
             .catch_unwind()
             .await;
@@ -469,9 +509,6 @@ impl PreparingCall {
             // A unary call releases its slot before publishing a
             // result. A stream transferred its slot to the receive record.
             drop(operation);
-            // The input reservation follows its actual last reader, including
-            // any request-body slices still owned by the HTTP stack.
-            drop(input_reservation);
             guard.finish(result);
         };
         let started = catch_unwind(AssertUnwindSafe(|| {

@@ -47,9 +47,10 @@ pub use error::{
     semantic_error_from_ipc_bytes,
 };
 pub use host::{
-    EncodedService, EncodedStream, EncodedStreamItem, EncodedStreamService, Host, HostOptions,
-    MethodDefinition, Registration, RegistrationObserver, RouteConcurrency, RouteConcurrencyError,
-    RouteConcurrencyGuard, RouteConcurrencySnapshot, ServiceConcurrencyMode, ServiceDefinition,
+    EncodedResponse, EncodedService, EncodedStream, EncodedStreamItem, EncodedStreamService, Host,
+    HostOptions, MethodDefinition, Registration, RegistrationObserver, ResponseSink,
+    RouteConcurrency, RouteConcurrencyError, RouteConcurrencyGuard, RouteConcurrencySnapshot,
+    ServiceConcurrencyMode, ServiceDefinition,
 };
 pub use identity::{
     auto_server_id, auto_server_instance_id, ipc_address_for_server_id, validate_server_id,

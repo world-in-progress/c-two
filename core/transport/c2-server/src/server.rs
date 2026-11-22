@@ -3063,8 +3063,11 @@ impl OwnedRequestInput {
         Self { data, memory: None }
     }
 
-    pub(crate) fn into_owned_bytes(self) -> Result<(Vec<u8>, Option<MemoryReservation>), String> {
-        Ok((self.data.into_owned_bytes()?, self.memory))
+    pub(crate) fn into_recycled_bytes(
+        self,
+        budget: &DomainBudget,
+    ) -> Result<(c2_mem::RecycledBytes, Option<MemoryReservation>), String> {
+        self.data.into_recycled_bytes(budget, self.memory)
     }
 }
 
@@ -4065,10 +4068,11 @@ async fn execute_route_request<F>(
     conn: &Connection,
     request_id: u64,
     input: OwnedRequestInput,
+    budget: &DomainBudget,
     f: F,
 ) -> Result<ResponseMeta, RouteExecutionError>
 where
-    F: FnOnce(Vec<u8>) -> Result<ResponseMeta, CrmError> + Send + 'static,
+    F: FnOnce(c2_mem::RecycledBytes) -> Result<ResponseMeta, CrmError> + Send + 'static,
 {
     let route_guard = tokio::select! {
         result = route_pending_permit.async_activate() => match result {
@@ -4114,6 +4118,7 @@ where
         .lock()
         .get(request_id)
         .ok_or(RouteExecutionError::Acquire(SchedulerAcquireError::Closed))?;
+    let budget = budget.clone();
     tokio::task::spawn_blocking(move || {
         let mut route_guard = route_guard;
         let _execution_guard = execution_guard;
@@ -4121,10 +4126,10 @@ where
             drop(input);
             return Err(RouteExecutionError::Acquire(err));
         }
-        // `input` owns the local-copy memory reservation; it drops after the
-        // callback returns or a pre-execution refusal discards the data.
+        // The local-copy charge ends when the callback returns. The bytes
+        // can outlive it and return to the warm pool on their own drop.
         let (bytes, _memory) = input
-            .into_owned_bytes()
+            .into_recycled_bytes(&budget)
             .map_err(RouteExecutionError::Input)?;
         if !record.enter_resource() {
             return Err(RouteExecutionError::Acquire(SchedulerAcquireError::Closed));
@@ -4421,7 +4426,8 @@ async fn dispatch_complete_call(
         conn,
         request_id,
         input,
-        move |request| callback.invoke(&name, method_idx, request, response_pool),
+        &server.domain_budget,
+        move |request| callback.invoke_recycled(&name, method_idx, request, response_pool),
     )
     .await;
     send_route_execution_result(server, conn, writer, request_id, result).await;
@@ -5042,6 +5048,11 @@ async fn send_response_meta(
             write_reply_with_data(writer, request_id, &[]).await?;
         }
         ResponseMeta::ShmAlloc(prepared) => {
+            if !prepared.belongs_to(response_pool) {
+                return Err(ResponseSendError::UserVisible(
+                    "prepared response belongs to another SHM pool".into(),
+                ));
+            }
             let data_size = prepared.data_size();
             ensure_response_meta_len(data_size as usize, max_payload_size)?;
             if !shm_response_allowed {

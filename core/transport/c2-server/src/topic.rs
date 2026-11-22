@@ -16,7 +16,7 @@ use c2_contract::ExpectedRouteContract;
 use c2_error::{C2Error, ErrorCode};
 use c2_mem::{
     BudgetedBuffer, DomainBudget, MemPool, OperationPermit, PayloadBufferError, RetentionError,
-    RetentionRejectReason, SealedShmBlock,
+    RetentionRejectReason, SealedShmBlock, WritableSlab,
 };
 use c2_wire::rpc::{WireLagPolicy, WireSubscribeOptions, WireTopicStart};
 use parking_lot::{Mutex, RwLock};
@@ -414,19 +414,59 @@ impl TopicChannel {
         self.notify.notified()
     }
 
-    pub(crate) fn publish(&self, mut payload: Vec<u8>) -> Result<u64, C2Error> {
+    fn check_publish(&self, len: usize) -> Result<(), C2Error> {
         if self.is_closed() {
             return Err(resource_closed_error(&self.topic_name));
         }
-        let len = payload.len();
-        if (len as u64) > self.max_payload_size {
+        if len as u64 > self.max_payload_size {
             return Err(payload_too_large_error(
                 &self.topic_name,
                 len,
                 self.max_payload_size,
             ));
         }
+        Ok(())
+    }
 
+    pub(crate) fn try_alloc_slab(&self, len: usize) -> Result<Option<WritableSlab>, C2Error> {
+        self.check_publish(len)?;
+        self.alloc_slab(len)
+    }
+
+    pub(crate) fn publish_slab(&self, slab: WritableSlab) -> Result<u64, C2Error> {
+        self.check_publish(slab.len())?;
+        if !self
+            .response_pool
+            .as_ref()
+            .is_some_and(|pool| slab.belongs_to(pool))
+        {
+            return Err(C2Error::new(
+                ErrorCode::ResourceOutputSerializing,
+                "topic slab belongs to another SHM pool",
+            ));
+        }
+        self.commit_storage(Self::seal_slab(slab)?)
+    }
+
+    fn alloc_slab(&self, len: usize) -> Result<Option<WritableSlab>, C2Error> {
+        if len as u64 <= c2_config::SHM_THRESHOLD {
+            return Ok(None);
+        }
+        let Some(pool) = &self.response_pool else {
+            return Ok(None);
+        };
+        WritableSlab::try_alloc(Arc::clone(pool), len)
+            .map_err(|error| C2Error::new(ErrorCode::ResourceOutputSerializing, error))
+    }
+
+    fn seal_slab(slab: WritableSlab) -> Result<TopicFrameStorage, C2Error> {
+        slab.seal()
+            .map(TopicFrameStorage::Shm)
+            .map_err(|error| C2Error::new(ErrorCode::ResourceOutputSerializing, error))
+    }
+
+    pub(crate) fn publish(&self, mut payload: Vec<u8>) -> Result<u64, C2Error> {
+        self.check_publish(payload.len())?;
         let storage = self.store_vec_payload(&mut payload)?;
         drop(payload);
         self.commit_storage(storage)
@@ -443,29 +483,15 @@ impl TopicChannel {
     where
         F: FnOnce(&mut [u8]) -> Result<(), C2Error>,
     {
-        if self.is_closed() {
-            return Err(resource_closed_error(&self.topic_name));
-        }
-        if (len as u64) > self.max_payload_size {
-            return Err(payload_too_large_error(
-                &self.topic_name,
-                len,
-                self.max_payload_size,
-            ));
-        }
-
+        self.check_publish(len)?;
         let storage = self.store_generated_payload(len, write_into)?;
         self.commit_storage(storage)
     }
 
     fn store_vec_payload(&self, payload: &mut Vec<u8>) -> Result<TopicFrameStorage, C2Error> {
-        let len = payload.len();
-        if len > c2_config::SHM_THRESHOLD as usize
-            && u32::try_from(len).is_ok()
-            && let Some(pool) = &self.response_pool
-            && let Ok(block) = SealedShmBlock::from_bytes(Arc::clone(pool), payload)
-        {
-            return Ok(TopicFrameStorage::Shm(block));
+        if let Some(mut slab) = self.alloc_slab(payload.len())? {
+            slab.as_mut_slice().copy_from_slice(payload);
+            return Self::seal_slab(slab);
         }
         let mut owned = std::mem::take(payload);
         owned.shrink_to_fit();
@@ -493,21 +519,9 @@ impl TopicChannel {
     where
         F: FnOnce(&mut [u8]) -> Result<(), C2Error>,
     {
-        if len > c2_config::SHM_THRESHOLD as usize
-            && u32::try_from(len).is_ok()
-            && let Some(pool) = &self.response_pool
-        {
-            let handle = {
-                let mut guard = pool.write();
-                guard.try_alloc_shm(len).ok()
-            };
-            if let Some(handle) = handle {
-                let block =
-                    SealedShmBlock::fill_and_seal(Arc::clone(pool), handle, write_into, |error| {
-                        C2Error::new(ErrorCode::ResourceOutputSerializing, error)
-                    })?;
-                return Ok(TopicFrameStorage::Shm(block));
-            }
+        if let Some(mut slab) = self.alloc_slab(len)? {
+            write_into(slab.as_mut_slice())?;
+            return Self::seal_slab(slab);
         }
         let charge_bytes = u64::try_from(len).map_err(|_| {
             C2Error::new(
@@ -878,6 +892,14 @@ impl TopicPublisher {
 
     pub fn head_seq(&self) -> u64 {
         self.channel.head_seq()
+    }
+
+    pub fn try_alloc_slab(&self, len: usize) -> Result<Option<WritableSlab>, C2Error> {
+        self.channel.try_alloc_slab(len)
+    }
+
+    pub fn publish_slab(&self, slab: WritableSlab) -> Result<u64, C2Error> {
+        self.channel.publish_slab(slab)
     }
 
     /// Publish an immutable payload into this registration's topic history.

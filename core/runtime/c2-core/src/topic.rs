@@ -10,6 +10,7 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use c2_error::C2Error;
 use c2_ipc::{IpcError, IpcSubscribeCancellation, IpcTopicSubscription, StreamTerminal};
 use c2_wire::rpc::CallStatus;
 use tokio::sync::Mutex;
@@ -68,6 +69,14 @@ impl TopicPublisher {
 
     pub fn head_seq(&self) -> u64 {
         self.inner.head_seq()
+    }
+
+    pub fn try_alloc_slab(&self, len: usize) -> Result<Option<c2_mem::WritableSlab>, C2Error> {
+        self.inner.try_alloc_slab(len)
+    }
+
+    pub fn publish_slab(&self, slab: c2_mem::WritableSlab) -> Result<u64, C2Error> {
+        self.inner.publish_slab(slab)
     }
 
     /// Publish an immutable payload into this registration's topic history.

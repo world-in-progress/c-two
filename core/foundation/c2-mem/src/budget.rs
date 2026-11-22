@@ -692,6 +692,12 @@ pub struct MemoryReservation {
 }
 
 impl MemoryReservation {
+    pub fn domain_budget(&self) -> DomainBudget {
+        DomainBudget {
+            shared: Arc::clone(&self.shared),
+        }
+    }
+
     pub fn bytes(&self) -> u64 {
         self.bytes
     }
@@ -756,6 +762,73 @@ impl MemoryReservation {
 impl Drop for MemoryReservation {
     fn drop(&mut self) {
         self.shared.release_memory(self.bytes);
+    }
+}
+
+/// Local bytes that can return their allocation to a domain's warm pool.
+#[derive(Debug)]
+pub struct RecycledBytes {
+    bytes: Vec<u8>,
+    budget: Option<DomainBudget>,
+}
+
+impl RecycledBytes {
+    pub fn new(bytes: Vec<u8>, budget: DomainBudget) -> Self {
+        Self {
+            bytes,
+            budget: Some(budget),
+        }
+    }
+
+    pub fn owned(bytes: Vec<u8>) -> Self {
+        Self {
+            bytes,
+            budget: None,
+        }
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    pub fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+
+    pub fn into_vec(mut self) -> Vec<u8> {
+        std::mem::take(&mut self.bytes)
+    }
+}
+
+impl Deref for RecycledBytes {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+
+impl AsRef<[u8]> for RecycledBytes {
+    fn as_ref(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+
+impl From<Vec<u8>> for RecycledBytes {
+    fn from(bytes: Vec<u8>) -> Self {
+        Self::owned(bytes)
+    }
+}
+
+impl Drop for RecycledBytes {
+    fn drop(&mut self) {
+        if let Some(budget) = &self.budget {
+            budget.recycle_vec(std::mem::take(&mut self.bytes));
+        }
     }
 }
 

@@ -46,12 +46,125 @@ impl SharedBlockInner {
     }
 }
 
-struct UnsealedHandle<'a> {
-    pool: &'a RwLock<MemPool>,
+/// An unpublished SHM allocation with exclusive, lock-free write access.
+pub struct WritableSlab {
+    pool: Arc<RwLock<MemPool>>,
     handle: Option<MemHandle>,
+    mapping: Arc<ChargedMapping>,
+    offset: usize,
+    len: usize,
 }
 
-impl Drop for UnsealedHandle<'_> {
+impl WritableSlab {
+    pub fn try_alloc(pool: Arc<RwLock<MemPool>>, len: usize) -> Result<Option<Self>, String> {
+        if len == 0 || u32::try_from(len).is_err() {
+            return Ok(None);
+        }
+        let Ok(handle) = pool.write().alloc_shm_handle(len) else {
+            return Ok(None);
+        };
+        match Self::pin(Arc::clone(&pool), handle) {
+            Ok(slab) => Ok(Some(slab)),
+            Err((handle, error)) => {
+                pool.write().release_handle(handle);
+                Err(error)
+            }
+        }
+    }
+
+    fn pin(pool: Arc<RwLock<MemPool>>, handle: MemHandle) -> Result<Self, (MemHandle, String)> {
+        let pinned = pool.read().checked_handle_pin(&handle);
+        let (mapping, offset) = match pinned {
+            Ok(pinned) => pinned,
+            Err(error) => return Err((handle, error)),
+        };
+        Ok(Self {
+            pool,
+            len: handle.len(),
+            handle: Some(handle),
+            mapping,
+            offset,
+        })
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Check transport ownership without exposing the mutable pool.
+    pub fn belongs_to(&self, pool: &Arc<RwLock<MemPool>>) -> bool {
+        Arc::ptr_eq(&self.pool, pool)
+    }
+
+    /// # Safety
+    /// Preserve the original pool and all live allocation and loan authority.
+    pub unsafe fn pool(&self) -> &Arc<RwLock<MemPool>> {
+        &self.pool
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        // SAFETY: the checked mapping pins this initialized span and the slab
+        // still holds its exclusive allocation handle.
+        unsafe { std::slice::from_raw_parts(self.ptr(), self.len) }
+    }
+
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        // SAFETY: the unique slab owns the unpublished span.
+        unsafe { std::slice::from_raw_parts_mut(self.ptr(), self.len) }
+    }
+
+    fn ptr(&self) -> *mut u8 {
+        self.mapping.region.base_ptr().wrapping_add(self.offset)
+    }
+
+    pub fn as_mut_ptr(&mut self) -> *mut u8 {
+        self.ptr()
+    }
+
+    pub fn seal(mut self) -> Result<SealedShmBlock, String> {
+        let handle = self
+            .handle
+            .take()
+            .expect("writable slab owns its allocation");
+        let allocation = handle.shm_allocation().expect("pinned slab is SHM");
+        Ok(SealedShmBlock {
+            inner: Arc::new(SharedBlockInner {
+                pool: Arc::clone(&self.pool),
+                allocation,
+                mapping: Arc::clone(&self.mapping),
+                offset: self.offset,
+                len: self.len,
+                handle: Mutex::new(Some(handle)),
+                active_refs: AtomicUsize::new(1),
+            }),
+        })
+    }
+
+    /// Transfer the unique unpublished allocation to a single-loan owner.
+    ///
+    /// # Safety
+    /// Preserve the original pool and associate the handle with it until
+    /// transferring it to the connection loan book or releasing it locally.
+    pub unsafe fn into_parts(mut self) -> (Arc<RwLock<MemPool>>, MemHandle) {
+        let handle = self
+            .handle
+            .take()
+            .expect("writable slab owns its allocation");
+        (Arc::clone(&self.pool), handle)
+    }
+}
+
+impl AsRef<[u8]> for WritableSlab {
+    fn as_ref(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+
+impl Drop for WritableSlab {
     fn drop(&mut self) {
         if let Some(handle) = self.handle.take() {
             self.pool.write().release_handle(handle);
@@ -80,37 +193,16 @@ impl SealedShmBlock {
     /// Seal an already-populated buddy or dedicated [`MemHandle`] into an
     /// immutable multi-loan block. Rejects file-spill handles or handles that
     /// do not belong to `pool`, returning the original handle on failure.
-    pub fn seal(pool: Arc<RwLock<MemPool>>, handle: MemHandle) -> Result<Self, (MemHandle, String)> {
-        let Some(allocation) = handle.shm_allocation() else {
-            return Err((
-                handle,
-                "cannot seal a non-SHM file-spill allocation for multi-loan".into(),
-            ));
-        };
-        let len = handle.len();
-        let pin = {
-            let guard = pool.read();
-            guard.checked_handle_pin(&handle)
-        };
-        let (mapping, offset) = match pin {
-            Ok(pinned) => pinned,
-            Err(error) => return Err((handle, error)),
-        };
-        Ok(Self {
-            inner: Arc::new(SharedBlockInner {
-                pool,
-                allocation,
-                mapping,
-                offset,
-                len,
-                handle: Mutex::new(Some(handle)),
-                active_refs: AtomicUsize::new(1),
-            }),
-        })
+    pub fn seal(
+        pool: Arc<RwLock<MemPool>>,
+        handle: MemHandle,
+    ) -> Result<Self, (MemHandle, String)> {
+        let slab = WritableSlab::pin(pool, handle)?;
+        Ok(slab.seal().expect("pinned allocation seals"))
     }
 
     /// Allocate one SHM block from `pool`, populate it outside the pool write
-    /// lock using [`crate::ShmMutPin`], and seal it for 1-to-N loans.
+    /// lock using [`WritableSlab`], and seal it for 1-to-N loans.
     pub fn allocate_and_fill<F>(
         pool: Arc<RwLock<MemPool>>,
         len: usize,
@@ -119,43 +211,14 @@ impl SealedShmBlock {
     where
         F: FnOnce(&mut [u8]) -> Result<(), String>,
     {
-        if len == 0 {
-            return Err("cannot allocate a zero-byte SHM block".into());
-        }
-        let handle = pool.write().try_alloc_shm(len)?;
-        Self::fill_and_seal(pool, handle, write_into, |error| error)
-    }
-
-    /// Populate an exclusively owned SHM allocation and transfer it to the
-    /// sealed block. Errors and unwinding return the allocation to its pool.
-    /// The handle must come from this pool.
-    pub fn fill_and_seal<E>(
-        pool: Arc<RwLock<MemPool>>,
-        handle: MemHandle,
-        write_into: impl FnOnce(&mut [u8]) -> Result<(), E>,
-        storage_error: impl FnOnce(String) -> E,
-    ) -> Result<Self, E> {
-        let mut allocation = UnsealedHandle {
-            pool: &pool,
-            handle: Some(handle),
-        };
-        let pin = {
-            let guard = pool.read();
-            guard.pin_shm_mut(allocation.handle.as_mut().expect("unsealed allocation"))
-        };
-        match pin {
-            Ok(mut pin) => write_into(pin.as_mut_slice())?,
-            Err(error) => return Err(storage_error(error)),
-        }
-        let handle = allocation.handle.take().expect("populated allocation");
-        Self::seal(Arc::clone(&pool), handle).map_err(|(handle, error)| {
-            allocation.handle = Some(handle);
-            storage_error(error)
-        })
+        let mut slab = WritableSlab::try_alloc(pool, len)?
+            .ok_or_else(|| format!("no SHM allocation available for {len} bytes"))?;
+        write_into(slab.as_mut_slice())?;
+        slab.seal()
     }
 
     /// Allocate one SHM block from `pool`, copy `payload` into it outside the
-    /// pool write lock using [`crate::ShmMutPin`], and seal it for 1-to-N loans.
+    /// pool write lock using [`WritableSlab`], and seal it for 1-to-N loans.
     pub fn from_bytes(pool: Arc<RwLock<MemPool>>, payload: &[u8]) -> Result<Self, String> {
         Self::allocate_and_fill(pool, payload.len(), |dst| {
             dst.copy_from_slice(payload);
@@ -317,6 +380,72 @@ impl Drop for SharedShmLoan {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn writable_slab_transfers_or_releases_its_one_allocation() {
+        fn assert_thread_safe<T: Send + Sync + 'static>() {}
+        assert_thread_safe::<WritableSlab>();
+
+        let pool = Arc::new(RwLock::new(
+            MemPool::new(crate::PoolConfig::primary_for_budget(8 * 1024 * 1024)).unwrap(),
+        ));
+        let len = 64 * 1024;
+        let mut slab = WritableSlab::try_alloc(pool.clone(), len)
+            .unwrap()
+            .expect("SHM");
+        assert_eq!(slab.len(), len);
+        assert!(!slab.is_empty());
+        slab.as_mut_slice().fill(0x37);
+        let ptr = slab.as_mut_ptr().cast_const();
+        assert_eq!(slab.as_slice().as_ptr(), ptr);
+        let sealed = slab.seal().unwrap();
+        assert_eq!(sealed.as_slice().as_ptr(), ptr);
+        assert!(sealed.as_slice().iter().all(|&byte| byte == 0x37));
+        assert_eq!(pool.read().stats().alloc_count, 1);
+        drop(sealed);
+        assert_eq!(pool.read().stats().alloc_count, 0);
+
+        let mut slab = WritableSlab::try_alloc(pool.clone(), len)
+            .unwrap()
+            .expect("SHM");
+        slab.as_mut_slice()[0] = 5;
+        // SAFETY: the original pool stays in place and releases its handle.
+        let (owner, handle) = unsafe { slab.into_parts() };
+        assert!(Arc::ptr_eq(&pool, &owner));
+        assert_eq!(owner.read().handle_slice(&handle)[0], 5);
+        owner.write().release_handle(handle);
+        assert_eq!(pool.read().stats().alloc_count, 0);
+
+        let unsealed = WritableSlab::try_alloc(pool.clone(), len)
+            .unwrap()
+            .expect("SHM");
+        assert_eq!(pool.read().stats().alloc_count, 1);
+        drop(unsealed);
+        assert_eq!(pool.read().stats().alloc_count, 0);
+    }
+
+    #[test]
+    fn writable_slab_returns_none_for_unrepresentable_or_unfunded_requests() {
+        let pool = Arc::new(RwLock::new(
+            MemPool::new(crate::PoolConfig::primary_for_budget(0)).unwrap(),
+        ));
+        assert!(WritableSlab::try_alloc(pool.clone(), 0).unwrap().is_none());
+        #[cfg(target_pointer_width = "64")]
+        assert!(
+            WritableSlab::try_alloc(pool.clone(), u32::MAX as usize + 1)
+                .unwrap()
+                .is_none()
+        );
+        // Explicit zero budget so admission fails before attempting an OS map.
+        let budget = crate::DomainBudget::from_limits(&c2_config::DomainLimits {
+            memory_budget_bytes: 0,
+            ..Default::default()
+        });
+        let pool = Arc::new(RwLock::new(
+            MemPool::new_with_budget(crate::PoolConfig::primary_for_budget(0), budget).unwrap(),
+        ));
+        assert!(WritableSlab::try_alloc(pool, 64 * 1024).unwrap().is_none());
+    }
 
     #[test]
     fn unwinding_a_fill_releases_the_unsealed_block() {

@@ -741,3 +741,21 @@ fn buffer_into_parts_transfers_storage_and_reservation_without_recycling() {
     assert!(budget.shared.lock().warm_buffers.is_empty());
     assert_eq!(budget.snapshot().memory.used_bytes, 0);
 }
+
+#[test]
+fn recycled_bytes_return_the_same_allocation_to_the_warm_pool() {
+    let size = WARM_BUFFER_MIN_BYTES;
+    let budget = domain(size as u64, 0, 0);
+    let bytes = RecycledBytes::new(vec![7; size], budget.clone());
+    assert_eq!(bytes.len(), size);
+    assert!(bytes.iter().all(|&byte| byte == 7));
+    let ptr = bytes.as_ptr();
+    drop(bytes);
+    assert_eq!(budget.snapshot().memory.used_bytes, 0);
+    let reused = budget.allocate_vec(size).unwrap();
+    assert_eq!(reused.as_ptr(), ptr);
+    let bytes = RecycledBytes::new(reused, budget.clone()).into_vec();
+    assert_eq!(bytes.as_ptr(), ptr);
+    let other = budget.allocate_vec(size).unwrap();
+    assert_ne!(other.as_ptr(), ptr);
+}

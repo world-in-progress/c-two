@@ -26,8 +26,8 @@ pub use buddy_segment::BuddySegment;
 pub use budget::{
     BudgetCellSnapshot, BudgetError, BudgetedBuffer, DomainBudget, DomainObserver,
     DomainObserverWeak, DomainSnapshot, FileSpillReservation, MemoryReservation,
-    MemoryReservationError, OperationPermit, PayloadBufferError, ReserveFuture, RetentionError,
-    RetentionRejectReason, RetentionSnapshot,
+    MemoryReservationError, OperationPermit, PayloadBufferError, RecycledBytes, ReserveFuture,
+    RetentionError, RetentionRejectReason, RetentionSnapshot,
 };
 pub use config::{PoolAllocation, PoolConfig, PoolStats};
 pub use dedicated::DedicatedSegment;
@@ -35,6 +35,6 @@ pub use handle::{MemHandle, OwnedAllocation};
 pub use peer::{PeerMappingCache, PeerMappingError, PeerRead};
 pub use pool::{MemPool, ShmMutPin, ShmRefPin};
 pub use segment::ShmRegion;
-pub use shared::{SealedShmBlock, SharedShmLoan};
+pub use shared::{SealedShmBlock, SharedShmLoan, WritableSlab};
 pub use spill::{available_physical_memory, create_file_spill};
 pub use window::{ReusableWindow, WindowChunk, WindowReserveFuture, WindowSlice};

@@ -218,6 +218,13 @@ impl RequestBlock {
             len,
         }
     }
+    fn from_slab(slab: c2_mem::WritableSlab) -> Self {
+        // SAFETY: the block retains the original pool with the handle until
+        // the connection takes ownership or local cleanup returns it.
+        let (pool, handle) = unsafe { slab.into_parts() };
+        Self::new(pool, handle)
+    }
+
     pub fn allocation(&self) -> &PoolAllocation {
         &self.alloc
     }
@@ -1645,12 +1652,7 @@ impl IpcClient {
         data: &[u8],
         control: Option<&IpcCallControl>,
     ) -> Result<ResponseData, crate::IpcCallError> {
-        let data_len = u64::try_from(data.len()).unwrap_or(u64::MAX);
-        if data_len > max_payload_size {
-            return Err(pre_dispatch_call_error(IpcError::Config(format!(
-                "request payload size {data_len} exceeds route '{route_name}' max_payload_size {max_payload_size}"
-            ))));
-        }
+        validate_request_size(route_name, data.len(), max_payload_size)?;
 
         IpcCallControl::check_preparation(control).map_err(pre_dispatch_call_error)?;
 
@@ -1783,6 +1785,58 @@ impl IpcClient {
             .await
     }
 
+    /// Allocate an unpublished request in this connection's SHM pool.
+    pub fn try_alloc_request_slab(
+        &self,
+        data_size: usize,
+    ) -> Result<Option<c2_mem::WritableSlab>, IpcError> {
+        if data_size as u64 <= SHM_THRESHOLD || !self.negotiated_shm_request.load(Ordering::Acquire)
+        {
+            return Ok(None);
+        }
+        let Some(pool) = self.select_request_pool() else {
+            return Ok(None);
+        };
+        c2_mem::WritableSlab::try_alloc(pool, data_size).map_err(IpcError::Shm)
+    }
+
+    /// Publish a slab only on a connection that negotiated its owning pool.
+    /// A changed transport copies from the retained slab into inline frames.
+    pub async fn call_bound_slab_controlled_async_phased(
+        &self,
+        binding: &RouteBinding,
+        method_name: &str,
+        slab: c2_mem::WritableSlab,
+        control: &IpcCallControl,
+    ) -> Result<ResponseData, crate::IpcCallError> {
+        let (method_idx, identity, max_payload_size) = binding
+            .call_target_for(method_name)
+            .map_err(pre_dispatch_call_error)?;
+        let data_len = slab.len();
+        validate_request_size(binding.route_name(), data_len, max_payload_size)?;
+        IpcCallControl::check_preparation(Some(control)).map_err(pre_dispatch_call_error)?;
+        if !self.is_connected() {
+            return Err(pre_dispatch_call_error(IpcError::Closed));
+        }
+        if self.negotiated_shm_request.load(Ordering::Acquire)
+            && self
+                .select_request_pool()
+                .is_some_and(|pool| slab.belongs_to(&pool))
+        {
+            return self
+                .call_with_prealloc_controlled(
+                    &identity,
+                    method_idx,
+                    &RequestBlock::from_slab(slab),
+                    max_payload_size,
+                    Some(control),
+                )
+                .await;
+        }
+        self.call_owned_non_shm(&identity, method_idx, slab, max_payload_size, control)
+            .await
+    }
+
     /// Consume an input owner instead of borrowing it through the reply wait.
     /// SHM fallback is decided while this owner can still be read; received
     /// replies never cause a second request using the same input.
@@ -1800,12 +1854,7 @@ impl IpcClient {
             .call_target_for(method_name)
             .map_err(pre_dispatch_call_error)?;
         let data_len = data.as_ref().len();
-        if u64::try_from(data_len).unwrap_or(u64::MAX) > max_payload_size {
-            return Err(pre_dispatch_call_error(IpcError::Config(format!(
-                "request payload size {data_len} exceeds route '{}' max_payload_size {max_payload_size}",
-                binding.route_name()
-            ))));
-        }
+        validate_request_size(binding.route_name(), data_len, max_payload_size)?;
         IpcCallControl::check_preparation(Some(control)).map_err(pre_dispatch_call_error)?;
         if choose_request_transport(self.shm_request_available(), data_len)
             == RequestTransportKind::Buddy
@@ -1834,10 +1883,26 @@ impl IpcClient {
                 Err(error) => return Err(pre_dispatch_call_error(error)),
             }
         }
+        self.call_owned_non_shm(&identity, method_idx, data, max_payload_size, control)
+            .await
+    }
+
+    async fn call_owned_non_shm<B>(
+        &self,
+        identity: &RouteCallIdentity,
+        method_idx: u16,
+        data: B,
+        max_payload_size: u64,
+        control: &IpcCallControl,
+    ) -> Result<ResponseData, crate::IpcCallError>
+    where
+        B: AsRef<[u8]> + Send + 'static,
+    {
+        let data_len = data.as_ref().len();
         match choose_request_transport(false, data_len) {
             RequestTransportKind::Chunked => {
                 self.call_chunked_stream_controlled(
-                    &identity,
+                    identity,
                     method_idx,
                     data_len,
                     futures_util::stream::iter([Ok::<_, std::io::Error>(data)]),
@@ -1848,7 +1913,7 @@ impl IpcClient {
             }
             RequestTransportKind::Inline | RequestTransportKind::Buddy => {
                 self.call_inline_controlled(
-                    &identity,
+                    identity,
                     method_idx,
                     data,
                     max_payload_size,
@@ -2989,6 +3054,19 @@ impl Drop for IpcClient {
     fn drop(&mut self) {
         self.deactivate();
     }
+}
+
+fn validate_request_size(
+    route_name: &str,
+    len: usize,
+    max_payload_size: u64,
+) -> Result<(), crate::IpcCallError> {
+    if u64::try_from(len).unwrap_or(u64::MAX) > max_payload_size {
+        return Err(pre_dispatch_call_error(IpcError::Config(format!(
+            "request payload size {len} exceeds route '{route_name}' max_payload_size {max_payload_size}"
+        ))));
+    }
+    Ok(())
 }
 
 fn prefer_ready_response(

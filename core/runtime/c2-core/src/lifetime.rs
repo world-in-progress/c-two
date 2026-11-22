@@ -1,21 +1,9 @@
 use crate::LifecycleError;
-use c2_mem::{BudgetedBuffer, DomainBudget};
+use c2_mem::{BudgetedBuffer, DomainBudget, RecycledBytes};
 
 enum HeldStorage {
-    Owned(Vec<u8>),
-    Recycled {
-        bytes: Vec<u8>,
-        budget: DomainBudget,
-    },
+    Local(RecycledBytes),
     Budgeted(BudgetedBuffer),
-}
-
-impl Drop for HeldStorage {
-    fn drop(&mut self) {
-        if let Self::Recycled { bytes, budget } = self {
-            budget.recycle_vec(std::mem::take(bytes));
-        }
-    }
 }
 
 /// Local response bytes owned independently of transport storage or connections.
@@ -27,7 +15,7 @@ pub struct HeldResponse {
 impl HeldResponse {
     pub fn from_owned_bytes(bytes: Vec<u8>) -> Self {
         Self {
-            storage: Some(HeldStorage::Owned(bytes)),
+            storage: Some(HeldStorage::Local(bytes.into())),
         }
     }
 
@@ -54,16 +42,30 @@ impl HeldResponse {
             .into_owned_bytes_in(budget)
             .map_err(LifecycleError::ResponseCopy)?;
         Ok(Self {
-            storage: Some(HeldStorage::Recycled {
+            storage: Some(HeldStorage::Local(RecycledBytes::new(
                 bytes,
-                budget: budget.clone(),
-            }),
+                budget.clone(),
+            ))),
         })
+    }
+
+    /// Release a local response's transport budget while retaining its bytes.
+    /// The allocation returns to the original domain's warm pool on drop.
+    pub fn detach_budget(&mut self) {
+        if let Some(HeldStorage::Budgeted(_)) = &self.storage {
+            let Some(HeldStorage::Budgeted(buffer)) = self.storage.take() else {
+                unreachable!("storage was budgeted");
+            };
+            let (bytes, reservation) = buffer.into_parts();
+            let budget = reservation.domain_budget();
+            drop(reservation);
+            self.storage = Some(HeldStorage::Local(RecycledBytes::new(bytes, budget)));
+        }
     }
 
     pub fn bytes(&self) -> &[u8] {
         match &self.storage {
-            Some(HeldStorage::Owned(bytes) | HeldStorage::Recycled { bytes, .. }) => bytes,
+            Some(HeldStorage::Local(bytes)) => bytes,
             Some(HeldStorage::Budgeted(buffer)) => buffer,
             None => &[],
         }
@@ -112,6 +114,30 @@ mod tests {
         })
         .unwrap();
         assert_eq!(budget.snapshot().memory.used_bytes, 0);
+    }
+
+    #[test]
+    fn detach_budget_refunds_memory_and_recycles_on_drop() {
+        let size = 256 * 1024;
+        let budget = DomainBudget::from_limits(&c2_config::DomainLimits {
+            memory_budget_bytes: size as u64,
+            ..Default::default()
+        });
+        let bytes = vec![5; size];
+        let ptr = bytes.as_ptr();
+        let mut held = HeldResponse::from_budgeted_bytes(BudgetedBuffer::new(
+            bytes,
+            budget.try_reserve_memory(size as u64).unwrap(),
+        ));
+        assert_eq!(budget.snapshot().memory.used_bytes, size as u64);
+        held.detach_budget();
+        held.detach_budget();
+        assert_eq!(budget.snapshot().memory.used_bytes, 0);
+        assert_eq!(held.bytes().as_ptr(), ptr);
+        assert_eq!(held.bytes()[size - 1], 5);
+        drop(held);
+        let reused = budget.allocate_vec(size).unwrap();
+        assert_eq!(reused.as_ptr(), ptr);
     }
 
     #[test]

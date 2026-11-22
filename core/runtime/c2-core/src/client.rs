@@ -17,7 +17,7 @@ use crate::{CallScope, CallScopeError, CallState};
 use c2_contract::{ExpectedRouteContract, validate_expected_route_contract};
 use c2_http::client::{HttpCallPhase, RelayAwareHttpClient, RelayLocalIpcCandidate};
 use c2_ipc::{IpcCallError, RouteBinding};
-use c2_mem::{BudgetedBuffer, DomainBudget};
+use c2_mem::{BudgetedBuffer, DomainBudget, WritableSlab};
 
 use crate::session::RelayResolvedConnection;
 use crate::{
@@ -679,6 +679,51 @@ impl PreparedCall {
         self.preparing.charge_input(nbytes)
     }
 
+    /// Acquire the request backing for direct serialization on an IPC unary call.
+    /// A slab attempt replaces any provisional byte reservation. If it falls
+    /// back, the normal input charge must precede owned materialization.
+    pub fn try_alloc_request_slab(&mut self, nbytes: usize) -> Result<Option<WritableSlab>, Error> {
+        self.preparing
+            .scope()
+            .check_pre_dispatch()
+            .map_err(scope_error)?;
+        if self.stream
+            || nbytes as u64 <= c2_config::SHM_THRESHOLD
+            || u32::try_from(nbytes).is_err()
+        {
+            return Ok(None);
+        }
+        let ClientInner::Ipc(connection) = &self.target.transport else {
+            return Ok(None);
+        };
+        if nbytes as u64 > connection.binding.max_payload_size() {
+            return Ok(None);
+        }
+        self.preparing.release_input_charge();
+        connection
+            .client
+            .try_alloc_request_slab(nbytes)
+            .map_err(|error| normalize_ipc_error(error, TransportPhase::PreDispatch))
+    }
+
+    /// Hand off an already encoded slab, whose SHM backing is already charged.
+    pub fn encode_slab(mut self, slab: WritableSlab) -> Result<EncodedCall, Error> {
+        self.preparing
+            .scope()
+            .check_pre_dispatch()
+            .map_err(scope_error)?;
+        if self.stream {
+            return Err(
+                LifecycleError::Configuration("request slabs require begin_call".into()).into(),
+            );
+        }
+        self.preparing.release_input_charge();
+        Ok(EncodedCall {
+            prepared: self,
+            input: EncodedInput::Slab(slab),
+        })
+    }
+
     /// Hand off ALREADY PREPARED native-owned data, not a user serializer.
     /// The factory must produce exactly nbytes bytes. Native execution keeps
     /// its operation permit through real completion and the memory charge
@@ -693,8 +738,10 @@ impl PreparedCall {
         )?;
         Ok(EncodedCall {
             prepared: self,
-            nbytes,
-            materialize: Box::new(materialize),
+            input: EncodedInput::Materialize {
+                nbytes,
+                materialize: Box::new(materialize),
+            },
         })
     }
 
@@ -719,8 +766,46 @@ impl PreparedCall {
 #[doc(hidden)]
 pub struct EncodedCall {
     prepared: PreparedCall,
-    nbytes: usize,
-    materialize: Box<dyn FnOnce() -> Result<Vec<u8>, Error> + Send>,
+    input: EncodedInput,
+}
+
+enum EncodedInput {
+    Materialize {
+        nbytes: usize,
+        materialize: Box<dyn FnOnce() -> Result<Vec<u8>, Error> + Send>,
+    },
+    Slab(WritableSlab),
+}
+
+enum UnaryInput {
+    Owned(BudgetedBuffer),
+    Slab(WritableSlab),
+}
+
+enum UnaryResponse {
+    Ipc(c2_ipc::ResponseData),
+    Http(BudgetedBuffer),
+}
+
+impl UnaryInput {
+    fn into_http(self, budget: &DomainBudget, scope: &CallScope) -> Result<BudgetedBuffer, Error> {
+        let slab = match self {
+            Self::Owned(buffer) => return Ok(buffer),
+            Self::Slab(slab) => slab,
+        };
+        scope.check_pre_dispatch().map_err(scope_error)?;
+        // Both owners exist during the copy. Admit immediately while holding
+        // the slab so a full domain cannot wait for its own backing to drop.
+        let mut reservation = budget
+            .try_reserve_memory(slab.len() as u64)
+            .map_err(crate::call_execution::payload_admission_error)?;
+        let mut bytes = reservation.allocate_vec(slab.len()).map_err(|error| {
+            LifecycleError::Configuration(format!("HTTP input allocation failed: {error}"))
+        })?;
+        bytes.extend_from_slice(slab.as_slice());
+        drop(slab);
+        Ok(BudgetedBuffer::new(bytes, reservation))
+    }
 }
 
 impl EncodedCall {
@@ -795,6 +880,13 @@ impl EncodedCall {
             )
             .into());
         }
+        let EncodedInput::Materialize {
+            nbytes,
+            materialize,
+        } = self.input
+        else {
+            unreachable!("stream preparation cannot encode a slab");
+        };
         let scope = preparing.scope_clone();
         let payload_budget = preparing.payload_budget();
         let permit = preparing.take_stream_permit();
@@ -849,69 +941,21 @@ impl EncodedCall {
             abandon_http_cancellation.cancel();
         };
         let started = if original {
-            preparing.execute_stream_record(
-                self.nbytes,
-                self.materialize,
-                transport,
-                abandon,
-                on_abandon,
-            )?
+            preparing.execute_stream_record(nbytes, materialize, transport, abandon, on_abandon)?
         } else {
-            preparing.execute_stream(
-                self.nbytes,
-                self.materialize,
-                transport,
-                abandon,
-                on_abandon,
-            )?
+            preparing.execute_stream(nbytes, materialize, transport, abandon, on_abandon)?
         };
         Ok((started, scope, handle_cancellation, http_cancellation))
     }
 
     pub fn call_owned(self) -> Result<Vec<u8>, Error> {
-        let PreparedCall {
-            preparing,
-            inner,
-            target,
-            deadline,
-            method,
-            stream,
-        } = self.prepared;
-        if stream {
-            return Err(
-                LifecycleError::Configuration("unary handoff requires begin_call".into()).into(),
-            );
-        }
-        let payload_budget = preparing.payload_budget();
-        preparing
-            .execute(
-                self.nbytes,
-                self.materialize,
-                move |input, scope: CallScope| async move {
-                    let target = inner.target_for_call(target, &scope, deadline).await?;
-                    let result = async {
-                        match &target.transport {
-                            ClientInner::Ipc(connection) => {
-                                let response = call_ipc(connection, &method, input, scope).await?;
-                                response
-                                    .into_owned_bytes()
-                                    .map_err(|error| LifecycleError::ResponseCopy(error).into())
-                            }
-                            ClientInner::Http(client) => {
-                                call_http(client, &method, input, scope, payload_budget)
-                                    .await
-                                    .map(|buffer| buffer.into_parts().0)
-                            }
-                        }
-                    }
-                    .await;
-                    if let Err(error) = &result {
-                        target.observe_error(error);
-                    }
-                    result
-                },
-            )?
-            .wait()
+        self.start_unary(false, |response, _| match response {
+            UnaryResponse::Ipc(response) => response
+                .into_owned_bytes()
+                .map_err(|error| LifecycleError::ResponseCopy(error).into()),
+            UnaryResponse::Http(buffer) => Ok(buffer.into_parts().0),
+        })?
+        .wait()
     }
 
     pub fn call_held(self) -> Result<HeldResponse, Error> {
@@ -933,6 +977,19 @@ impl EncodedCall {
         self,
         original: bool,
     ) -> Result<crate::call_execution::ExecutingCall<HeldResponse>, Error> {
+        self.start_unary(original, |response, budget| match response {
+            UnaryResponse::Ipc(response) => {
+                HeldResponse::from_response_data_in(response, budget).map_err(Error::from)
+            }
+            UnaryResponse::Http(buffer) => Ok(HeldResponse::from_budgeted_bytes(buffer)),
+        })
+    }
+
+    fn start_unary<R: Send + 'static>(
+        self,
+        original: bool,
+        finish: fn(UnaryResponse, &DomainBudget) -> Result<R, Error>,
+    ) -> Result<crate::call_execution::ExecutingCall<R>, Error> {
         let PreparedCall {
             preparing,
             inner,
@@ -948,24 +1005,25 @@ impl EncodedCall {
         }
         let payload_budget = preparing.payload_budget();
         let transport =
-            move |input,
-                  scope: CallScope,
-                  record: Option<crate::call_execution::CallRecord<HeldResponse>>| async move {
+            move |input, scope: CallScope, record: Option<crate::call_execution::CallRecord<R>>| async move {
                 let target = inner.target_for_call(target, &scope, deadline).await?;
                 if let Some(record) = record {
                     record.record_target(target.dispatch_target());
                 }
                 let result = async {
                     let response = match &target.transport {
-                        ClientInner::Ipc(connection) => HeldResponse::from_response_data_in(
-                            call_ipc(connection, &method, input, scope).await?,
-                            &payload_budget,
-                        )?,
-                        ClientInner::Http(client) => HeldResponse::from_budgeted_bytes(
-                            call_http(client, &method, input, scope, payload_budget).await?,
-                        ),
+                        ClientInner::Ipc(connection) => {
+                            UnaryResponse::Ipc(call_ipc(connection, &method, input, scope).await?)
+                        }
+                        ClientInner::Http(client) => {
+                            let input = input.into_http(&payload_budget, &scope)?;
+                            UnaryResponse::Http(
+                                call_http(client, &method, input, scope, payload_budget.clone())
+                                    .await?,
+                            )
+                        }
                     };
-                    Ok(response)
+                    finish(response, &payload_budget)
                 }
                 .await;
                 if let Err(error) = &result {
@@ -973,16 +1031,26 @@ impl EncodedCall {
                 }
                 result
             };
-        if original {
-            preparing.execute_whole_record(
-                self.nbytes,
-                self.materialize,
-                move |input, scope, record| transport(input, scope, Some(record)),
-            )
-        } else {
-            preparing.execute(self.nbytes, self.materialize, move |input, scope| {
-                transport(input, scope, None)
-            })
+        match self.input {
+            EncodedInput::Slab(slab) => {
+                preparing.execute_slab(slab, original, move |input, scope, record| {
+                    transport(UnaryInput::Slab(input), scope, record)
+                })
+            }
+            EncodedInput::Materialize {
+                nbytes,
+                materialize,
+            } if original => {
+                preparing.execute_whole_record(nbytes, materialize, move |input, scope, record| {
+                    transport(UnaryInput::Owned(input), scope, Some(record))
+                })
+            }
+            EncodedInput::Materialize {
+                nbytes,
+                materialize,
+            } => preparing.execute(nbytes, materialize, move |input, scope| {
+                transport(UnaryInput::Owned(input), scope, None)
+            }),
         }
     }
 }
@@ -990,17 +1058,37 @@ impl EncodedCall {
 async fn call_ipc(
     connection: &PooledIpcClient,
     method: &str,
-    input: BudgetedBuffer,
+    input: UnaryInput,
     scope: CallScope,
 ) -> Result<c2_ipc::ResponseData, Error> {
     let preparation = scope.clone();
     let control = IpcCallControl::new(move || scope.try_begin_dispatch().map_err(guard_error))
         .with_before_prepare(move || preparation.check_pre_dispatch().map_err(guard_error));
-    connection
-        .client
-        .call_bound_owned_controlled_async_phased(&connection.binding, method, input, &control)
-        .await
-        .map_err(normalize_ipc_call_error)
+    let result = match input {
+        UnaryInput::Owned(input) => {
+            connection
+                .client
+                .call_bound_owned_controlled_async_phased(
+                    &connection.binding,
+                    method,
+                    input,
+                    &control,
+                )
+                .await
+        }
+        UnaryInput::Slab(slab) => {
+            connection
+                .client
+                .call_bound_slab_controlled_async_phased(
+                    &connection.binding,
+                    method,
+                    slab,
+                    &control,
+                )
+                .await
+        }
+    };
+    result.map_err(normalize_ipc_call_error)
 }
 
 async fn call_ipc_stream(

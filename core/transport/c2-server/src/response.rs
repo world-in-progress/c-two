@@ -1,6 +1,6 @@
 //! Response payload preparation helpers.
 
-use c2_mem::MemPool;
+use c2_mem::{MemPool, WritableSlab};
 
 use crate::dispatcher::PreparedShmResponse;
 
@@ -18,6 +18,24 @@ impl ResponsePool {
         Self {
             inner: std::sync::Arc::new(parking_lot::RwLock::new(pool)),
         }
+    }
+
+    pub fn try_alloc_slab(
+        &self,
+        shm_threshold: u64,
+        len: usize,
+    ) -> Result<Option<WritableSlab>, String> {
+        if len as u64 <= shm_threshold {
+            return Ok(None);
+        }
+        WritableSlab::try_alloc(self.inner.clone(), len)
+    }
+
+    pub fn finish_slab(&self, slab: WritableSlab) -> Result<PreparedShmResponse, String> {
+        if !slab.belongs_to(&self.inner) {
+            return Err("prepared response belongs to another SHM pool".into());
+        }
+        Ok(PreparedShmResponse::from_slab(slab))
     }
 
     #[inline]
@@ -39,12 +57,6 @@ impl ResponsePool {
     }
 }
 
-/// Return the buddy response wire `data_size` when the payload length is
-/// representable by the current buddy payload metadata.
-pub(crate) fn buddy_response_data_size(len: usize) -> Option<u32> {
-    u32::try_from(len).ok()
-}
-
 /// Try to prepare a large response directly in the server response SHM pool.
 ///
 /// Returns `Ok(None)` when the caller should materialise owned inline bytes and
@@ -60,34 +72,11 @@ pub fn try_prepare_shm_response<F>(
 where
     F: FnOnce(&mut [u8]) -> Result<(), String>,
 {
-    if len == 0 || len as u64 <= shm_threshold {
+    let Some(mut slab) = response_pool.try_alloc_slab(shm_threshold, len)? else {
         return Ok(None);
-    }
-    let data_size = match buddy_response_data_size(len) {
-        Some(size) => size,
-        None => return Ok(None),
     };
-
-    // Allocate the backing as the unique write owner. SHM-only: a tier
-    // failure returns None so the caller falls back to owned inline bytes
-    // and native transport selection.
-    let handle = {
-        let mut pool = response_pool.inner.write();
-        match pool.alloc_shm_handle(len) {
-            Ok(handle) => handle,
-            Err(_) => return Ok(None),
-        }
-    };
-
-    let mut prepared = PreparedShmResponse::new(
-        std::sync::Arc::clone(&response_pool.inner),
-        handle,
-        data_size,
-    );
-    if let Err(error) = prepared.fill(write_into) {
-        return Err(error);
-    }
-    Ok(Some(prepared))
+    write_into(slab.as_mut_slice())?;
+    Ok(Some(PreparedShmResponse::from_slab(slab)))
 }
 
 #[cfg(test)]
