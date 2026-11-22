@@ -11,7 +11,7 @@ from c_two.transport.server.native import CRMSlot, NativeServerBridge
 def test_dispatch_uses_registered_mode_after_method_metadata_changes(registered_stream):
     stream_result = object()
 
-    def method(data, *, _release_fn, _c2_input_buffer_mode):
+    def method(data, *, _release_fn, _c2_input_buffer_mode, _detach_input, _response_sink=None):
         assert bytes(data) == b'input'
         assert _c2_input_buffer_mode == 'view'
         return stream_result if registered_stream else b'output'
@@ -55,7 +55,7 @@ def test_dispatch_uses_registered_mode_after_method_metadata_changes(registered_
 
 
 def test_dispatch_rejects_non_bytes_unary_returns():
-    def method(data, *, _release_fn, _c2_input_buffer_mode):
+    def method(data, *, _release_fn, _c2_input_buffer_mode, _detach_input, _response_sink=None):
         return ('not', 'serialized-bytes')
 
     slot = CRMSlot(

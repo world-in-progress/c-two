@@ -457,15 +457,15 @@ def test_delivered_response_tracks_hold_after_confirmed_shutdown(monkeypatch) ->
         _wait_ready(address)
         proxy = cc.connect(LargeOutput, name=route, address=address)
         baseline = _outgoing_cells(cc.observe.memory_stats())
-        original_open_copy = Payload.open_copy
+        original_open_external = Payload.open_external
 
-        def blocked_open_copy(cls, spec, source, options=None):  # noqa: ARG001
+        def blocked_open_external(cls, spec, source, options=None):  # noqa: ARG001
             decode_entered.set()
             if not decode_proceed.wait(timeout=20):
                 raise RuntimeError('timed out waiting to decode delivered response')
-            return original_open_copy(spec, source, options)
+            return original_open_external(spec, source, options)
 
-        monkeypatch.setattr(Payload, 'open_copy', classmethod(blocked_open_copy))
+        monkeypatch.setattr(Payload, 'open_external', classmethod(blocked_open_external))
 
         def call_held() -> None:
             try:

@@ -651,24 +651,6 @@ def test_python_server_dispatcher_does_not_own_response_allocation():
     assert offenders == []
 
 
-def test_core_python_response_bridge_does_not_accept_shm_coordinate_tuples():
-    root = Path(__file__).resolve().parents[4]
-    core_ffi = root / "sdk" / "python" / "native" / "src" / "core_ffi.rs"
-    source = core_ffi.read_text(encoding="utf-8")
-    parser_source = _rust_function(source, 'materialize_python_bytes')
-
-    forbidden = [
-        "PyTuple",
-        "seg_idx: int",
-        "offset: int",
-        "data_size: int",
-        "is_dedicated: bool",
-        "seg_idx, offset, data_size",
-    ]
-    offenders = [needle for needle in forbidden if needle in parser_source]
-    assert offenders == []
-
-
 def test_python_ipc_config_facade_has_no_override_schema():
     root = Path(__file__).resolve().parents[2] / "src" / "c_two"
     assert not (root / "config" / "ipc.py").exists()

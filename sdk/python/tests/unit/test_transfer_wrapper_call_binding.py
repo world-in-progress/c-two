@@ -43,7 +43,7 @@ class DirectStreamClient:
     def __init__(self):
         self.opened: list[tuple[str, tuple]] = []
 
-    def open_direct_stream(self, method_name: str, values: tuple):
+    def open_direct_stream(self, method_name: str, values: tuple, *, output):
         self.opened.append((method_name, values))
         return FakeNativeStream()
 

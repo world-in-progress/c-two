@@ -1,16 +1,25 @@
 //! Python-owned iterators and immutable item snapshots over Core stream records.
 
+use std::ffi::CStr;
 use std::time::Duration;
+
+use parking_lot::Mutex;
+use pyo3::buffer::PyBuffer;
+use pyo3::exceptions::PyBufferError;
+use pyo3::ffi;
 
 use c2_core::{CoreResponseStream, CoreStreamCloseReceipt, EncodedStream, EncodedStreamItem};
 use c2_error::C2Error;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::pybacked::PyBackedBytes;
-use pyo3::types::{PyBytes, PyDict};
+use pyo3::types::{PyBytes, PyDict, PyMemoryView};
 
 use crate::core_error_ffi::core_error_to_py;
-use crate::core_ffi::{PyCoreResponse, python_error_to_c2};
+use crate::core_ffi::{
+    PyCoreResponse, deferred_plan_len, materialize_deferred_plan, python_error_to_c2,
+    write_deferred_range,
+};
 
 #[pyclass(name = "CoreResponseStream", frozen, skip_from_py_object)]
 pub(crate) struct PyCoreResponseStream {
@@ -181,13 +190,9 @@ impl EncodedStream for PyEncodedStream {
             if !present {
                 return Ok(None);
             }
-            let bytes = value
-                .bind(py)
-                .cast_exact::<PyBytes>()
-                .map_err(|error| python_error_to_c2(py, error.into()))?;
-            Ok(Some(Box::new(PyStreamItem {
-                bytes: bytes.clone().into(),
-            }) as Box<dyn EncodedStreamItem>))
+            PyStreamItem::new(value.bind(py))
+                .map(|item| Some(Box::new(item) as Box<dyn EncodedStreamItem>))
+                .map_err(|error| stream_output_error(py, error))
         })
     }
 
@@ -201,19 +206,145 @@ impl EncodedStream for PyEncodedStream {
     }
 }
 
-struct PyStreamItem {
-    bytes: PyBackedBytes,
+struct FastDbView {
+    buffer: Option<PyBuffer<u8>>,
+    view: Py<PyMemoryView>,
+    data: *const u8,
+    len: usize,
+}
+
+// SAFETY: the FastDB exporter holds an immutable access pin until the buffer
+// is released. Only the pointer and length are read while detached.
+unsafe impl Send for FastDbView {}
+
+impl FastDbView {
+    fn new(view: &Bound<'_, PyMemoryView>) -> PyResult<Self> {
+        let acquire = || -> PyResult<PyBuffer<u8>> {
+            let exporter = view.getattr("obj")?;
+            // Only FastDB's non-instantiable native exporter vouches for
+            // immutable bytes. A read-only alias of bytearray does not.
+            let fastdb = unsafe {
+                let ty = ffi::Py_TYPE(exporter.as_ptr());
+                ffi::PyType_GetFlags(ty) & ffi::Py_TPFLAGS_DISALLOW_INSTANTIATION != 0
+                    && CStr::from_ptr((*ty).tp_name)
+                        == c"fastdb4py.core._payload_ext._ReadOnlyBuffer"
+            };
+            let buffer = PyBuffer::<u8>::get(view.as_any())?;
+            if !fastdb || !buffer.readonly() || !buffer.is_c_contiguous() {
+                return Err(PyBufferError::new_err(
+                    "expected a read-only contiguous FastDB view",
+                ));
+            }
+            Ok(buffer)
+        };
+        let buffer = match acquire() {
+            Ok(buffer) => buffer,
+            Err(error) => {
+                let _ = view.call_method0("release");
+                return Err(error);
+            }
+        };
+        Ok(Self {
+            data: buffer.buf_ptr().cast(),
+            len: buffer.len_bytes(),
+            buffer: Some(buffer),
+            view: view.clone().unbind(),
+        })
+    }
+}
+
+impl Drop for FastDbView {
+    fn drop(&mut self) {
+        Python::attach(|py| {
+            drop(self.buffer.take());
+            if let Err(error) = self.view.call_method0(py, "release") {
+                error.write_unraisable(py, Some(self.view.bind(py).as_any()));
+            }
+        });
+    }
+}
+
+enum PyStreamItem {
+    Bytes(PyBackedBytes),
+    FastDb(FastDbView),
+    Plan {
+        plan: Py<PyAny>,
+        len: usize,
+        materialized: Mutex<Option<Vec<u8>>>,
+    },
+}
+
+impl PyStreamItem {
+    fn new(value: &Bound<'_, PyAny>) -> PyResult<Self> {
+        if let Ok(bytes) = value.cast_exact::<PyBytes>() {
+            return Ok(Self::Bytes(bytes.clone().into()));
+        }
+        if let Ok(view) = value.cast_exact::<PyMemoryView>() {
+            return FastDbView::new(view).map(Self::FastDb);
+        }
+        let len = deferred_plan_len(value)?
+            .ok_or_else(|| PyValueError::new_err("invalid serialized stream item"))?;
+        Ok(Self::Plan {
+            plan: value.clone().unbind(),
+            len,
+            materialized: Mutex::new(None),
+        })
+    }
 }
 
 impl EncodedStreamItem for PyStreamItem {
     fn len(&self) -> usize {
-        self.bytes.len()
+        match self {
+            Self::Bytes(bytes) => bytes.len(),
+            Self::FastDb(view) => view.len,
+            Self::Plan { len, .. } => *len,
+        }
     }
 
     fn write_range(&self, offset: usize, destination: &mut [u8]) -> Result<(), C2Error> {
-        destination.copy_from_slice(&self.bytes[offset..offset + destination.len()]);
+        let end = offset + destination.len();
+        match self {
+            Self::Bytes(bytes) => destination.copy_from_slice(&bytes[offset..end]),
+            Self::FastDb(view) => {
+                // SAFETY: the live Py_buffer holds the immutable FastDB pin.
+                let bytes = unsafe { std::slice::from_raw_parts(view.data, view.len) };
+                destination.copy_from_slice(&bytes[offset..end]);
+            }
+            Self::Plan {
+                plan,
+                len,
+                materialized,
+            } => {
+                Python::attach(|py| {
+                    let plan = plan.bind(py);
+                    let result = if offset == 0 && end == *len {
+                        write_deferred_range(plan, destination)
+                    } else {
+                        let mut cached = materialized.lock();
+                        if let Some(bytes) = cached.as_ref() {
+                            destination.copy_from_slice(&bytes[offset..end]);
+                            return Ok(());
+                        }
+                        materialize_deferred_plan(plan, *len).map(|bytes| {
+                            destination.copy_from_slice(&bytes[offset..end]);
+                            *cached = Some(bytes);
+                        })
+                    };
+                    result.map_err(|error| stream_output_error(py, error))
+                })?;
+            }
+        }
         Ok(())
     }
+}
+
+fn stream_output_error(py: Python<'_>, error: PyErr) -> C2Error {
+    let projected = py
+        .import("c_two.crm.stream")
+        .and_then(|module| module.getattr("_resource_output_encode_error"))
+        .and_then(|classify| classify.call1((error.value(py),)))
+        .map(PyErr::from_value);
+    python_error_to_c2(py, projected.unwrap_or(error))
 }
 
 pub(crate) fn register_module(module: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -265,6 +396,51 @@ mod tests {
         });
         drop(worker.join().unwrap());
         assert_eq!(observed.unwrap(), (*b"abc", *b"gh"));
+    }
+
+    #[test]
+    fn fastdb_stream_item_releases_its_access_pin() {
+        Python::initialize();
+        let (item, payload, view) = Python::attach(|py| {
+            let module = PyModule::from_code(
+                py,
+                c"
+import json
+from fastdb4py.payload import Builder, BuildPolicy, CompiledSpec
+spec = {'schema': 'fastdb.payload.v1', 'profile': 'record.v1',
+        'entries': [{'id': 'value', 'cardinality': 'one',
+                     'type': {'kind': 'bytes', 'nullable': False}}], 'components': []}
+with CompiledSpec.compile(json.dumps(spec).encode()) as compiled:
+    with Builder.create(compiled) as builder:
+        builder.entry_begin(0, 1).value_bytes(b'abc')
+        with builder.freeze() as plan:
+            payload = plan.execute(BuildPolicy.ALLOW_STAGING).payload
+view = payload.memoryview()
+",
+                c"fastdb_stream_item.py",
+                c"fastdb_stream_item",
+            )
+            .unwrap();
+            let view = module.getattr("view").unwrap();
+            (
+                PyStreamItem::new(&view).unwrap(),
+                module.getattr("payload").unwrap().unbind(),
+                view.unbind(),
+            )
+        });
+        let mut copied = vec![0; item.len()];
+        item.write_range(0, &mut copied).unwrap();
+        Python::attach(|py| {
+            let bytes = view.call_method0(py, "tobytes").unwrap();
+            assert_eq!(bytes.extract::<Vec<u8>>(py).unwrap(), copied);
+        });
+        drop(item);
+        Python::attach(|py| {
+            // Keep a Python reference to the memoryview so destruction alone
+            // cannot release the pin.
+            assert!(view.call_method0(py, "tobytes").is_err());
+            payload.call_method0(py, "invalidate").unwrap();
+        });
     }
 
     enum Job {

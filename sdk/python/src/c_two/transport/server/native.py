@@ -23,7 +23,7 @@ from ...crm.contract import (
 )
 from ...crm.methods import rpc_method_names
 from ...crm.meta import MethodAccess, get_method_access, get_shutdown_method
-from ...crm.payload_plan import PayloadPlanKind
+from ...crm.payload_plan import PayloadPlanKind, _DeferredFastDbPlan
 from ...crm.transferable import _cleanup_preserving_primary, _release_view_and_response
 from ...error import CoreError
 from ..input_lifetime import (
@@ -459,15 +459,12 @@ class NativeServerBridge:
 
     def _make_dispatcher(
         self, route_name: str, slot: CRMSlot,
-    ) -> Callable[[str, int, object], object]:
+    ) -> Callable[..., object]:
         """Build the Python callable passed into native route registration.
 
         The callable is invoked from Rust's ``spawn_blocking`` with the GIL
-        held.  Signature: ``(route_name, method_idx, request_buf)``.
-        It reads the owned local request copy via ``memoryview(request_buf)``, resolves the
-        method, calls the resource, and returns serialized result data (or
-        *None* for empty responses). Rust native code owns the response
-        allocation choice for inline, SHM, or chunked transport.
+        held. It resolves the method, reads a view of the local request and
+        passes the native response sink to unary calls.
         """
         idx_to_name = slot.method_table._idx_to_name
         dispatch_table = slot._dispatch_table
@@ -476,7 +473,7 @@ class NativeServerBridge:
 
         def dispatch(
             _route_name: str, method_idx: int,
-            request_buf: object,
+            request_buf: object, response_sink=None,
         ) -> object:
             # 1. Resolve method
             method_name = idx_to_name.get(method_idx)
@@ -499,11 +496,22 @@ class NativeServerBridge:
                     released = True
                     _release_view_and_response(mv, request_buf)
 
+            def detach_input():
+                nonlocal released
+                if not released:
+                    mv.release()
+                    request_buf.detach_for_owned()
+                    released = True
+
+            detach = detach_input if hasattr(request_buf, 'detach_for_owned') else None
             if is_stream:
                 if buffer_mode == 'borrowed' and local_copy_tracker is not None:
                     request_buf.track_retained(local_copy_tracker, route_name,
                                                method_name, 'resource_input')
-                return method(mv, _release_fn=release_fn, _c2_input_buffer_mode=buffer_mode)
+                return method(
+                    mv, _release_fn=release_fn, _detach_input=detach,
+                    _c2_input_buffer_mode=buffer_mode,
+                )
 
             if buffer_mode == 'view':
                 # Pass memoryview; _release_fn releases the input buffer after deserialize.
@@ -511,6 +519,8 @@ class NativeServerBridge:
                     result = method(
                         mv,
                         _release_fn=release_fn,
+                        _detach_input=detach,
+                        _response_sink=response_sink,
                         _c2_input_buffer_mode=buffer_mode,
                     )
                 finally:
@@ -528,6 +538,8 @@ class NativeServerBridge:
                     result = method(
                         mv,
                         _release_fn=release_fn,
+                        _detach_input=detach,
+                        _response_sink=response_sink,
                         _c2_input_buffer_mode=buffer_mode,
                     )
                 except BaseException as exc:
@@ -540,8 +552,8 @@ class NativeServerBridge:
             # 3. crm_to_com returns serialized bytes (or None for an empty
             # response); failures raise a CCError that python_error_to_c2
             # forwards canonically. Any other return type is a broken wrapper.
-            if result is None:
-                return None
+            if result is None or isinstance(result, _DeferredFastDbPlan):
+                return result
             if isinstance(result, (bytes, bytearray, memoryview)):
                 if not result:
                     return None

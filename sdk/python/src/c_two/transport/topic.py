@@ -17,6 +17,7 @@ from .. import error
 from ..crm.payload_plan import (
     PayloadBinding,
     PayloadPlanKind,
+    _DeferredFastDbPlan,
     decode_stage_of,
 )
 from ..crm.transferable import (
@@ -25,6 +26,7 @@ from ..crm.transferable import (
     _cleanup_preserving_primary,
     _invalidate_and_release_held_response,
     _is_native_response_owner,
+    _release_decoded_response,
     _release_view_and_response,
     _safe_error_message,
 )
@@ -93,7 +95,15 @@ class Publisher(Generic[T]):
     def publish(self, value: T) -> int:
         """Publish one value; returns its monotonic registration-scoped seq."""
         payload = self._encode(value)
-        return _native_call(self._native.publish, payload)
+        try:
+            return _native_call(self._native.publish, payload)
+        except error.CCBaseError:
+            raise
+        except Exception as exc:
+            raise _publish_encode_error(exc) from exc
+        finally:
+            if self._binding.supports_scoped_owner and isinstance(payload, memoryview):
+                payload.release()
 
     def _encode(self, value: T):
         try:
@@ -203,17 +213,24 @@ class Subscription(Generic[T]):
         decoded = False
         checking_deadline = False
         decoding = False
+        owner_exports = 0
         invalidator = (
             self._binding.invalidate
             if self._binding.kind is PayloadPlanKind.FASTDB
             else None
         )
         try:
-            view = memoryview(payload)
+            native_payload = _is_native_response_owner(payload)
+            direct_native_decode = native_payload and hasattr(payload, 'export_count')
+            if self._held or not direct_native_decode:
+                view = memoryview(payload)
+            exports_before = payload.export_count if direct_native_decode else 0
             decoding = True
-            value = self._binding.deserialize(view)
+            value = self._binding.deserialize(payload if direct_native_decode else view)
             decoding = False
             decoded = True
+            if direct_native_decode:
+                owner_exports = max(0, payload.export_count - exports_before)
             checking_deadline = True
             _native_call(self._native.check_deadline)
             checking_deadline = False
@@ -224,13 +241,14 @@ class Subscription(Generic[T]):
                         self._native.topic_name, 'client_response',
                     )
                 held = HeldResult(value, buffer=view, invalidate_cb=invalidator)
-                if _is_native_response_owner(payload):
+                if native_payload:
                     held._native_response = payload
+                    held._owner_exports = owner_exports
                 return Delivery(held, seq, dropped)
         except BaseException as exc:
             if decoded and invalidator is not None:
                 _cleanup_preserving_primary(exc, lambda: _invalidate_and_release_held_response(
-                    view, payload, invalidator, value))
+                    view, payload, invalidator, value, owner_exports))
             else:
                 _cleanup_preserving_primary(exc, lambda: _release_view_and_response(view, payload))
             if checking_deadline:
@@ -238,10 +256,8 @@ class Subscription(Generic[T]):
                 raise
             raise _delivery_decode_error(exc, decoding=decoding) from exc
         try:
-            _release_view_and_response(view, payload)
+            _release_decoded_response(view, payload, invalidator, value, owner_exports)
         except BaseException as exc:
-            if invalidator is not None:
-                _cleanup_preserving_primary(exc, lambda: invalidator(value))
             raise _delivery_decode_error(exc, decoding=False) from exc
         return Delivery(value, seq, dropped)
 
@@ -322,14 +338,18 @@ def encode_topic_initial_value(binding: PayloadBinding, value) -> bytes:
     """Serialize one initial topic frame with the topic's publish codec."""
     try:
         payload = binding.serialize(value)
+        if isinstance(payload, _DeferredFastDbPlan):
+            return payload.to_bytes()
+        if isinstance(payload, memoryview) and binding.supports_scoped_owner:
+            with payload:
+                return bytes(payload)
+        if not isinstance(payload, (bytes, bytearray, memoryview)):
+            raise TypeError(
+                f'topic payload serializer returned {type(payload).__name__}, expected bytes-like data',
+            )
+        return bytes(payload)
     except BaseException as exc:
         raise _publish_encode_error(exc) from exc
-    if not isinstance(payload, (bytes, bytearray, memoryview)):
-        raise _publish_encode_error(TypeError(
-            f'topic payload serializer returned {type(payload).__name__}, '
-            'expected bytes-like data',
-        ))
-    return bytes(payload)
 
 
 __all__ = [

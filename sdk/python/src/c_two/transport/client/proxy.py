@@ -434,7 +434,7 @@ class CRMProxy:
             )
         return _PreparedStream(_native_call(self._client.begin_stream, method_name))
 
-    def open_direct_stream(self, method_name: str, args: tuple):
+    def open_direct_stream(self, method_name: str, args: tuple, *, output):
         from ..._native import NativeCallOptions
         from ...crm.stream import _ResourceStream
         with self._close_lock:
@@ -459,7 +459,7 @@ class CRMProxy:
             return _native_call(
                 self._scheduler.open_stream,
                 self._scheduler.method_idx(method_name),
-                lambda: _ResourceStream(method, args=args, encoded=False),
+                lambda: _ResourceStream(method, args=args, encoded=False, output=output),
             )
         except Exception as exc:
             from ...error import ResourceClosed

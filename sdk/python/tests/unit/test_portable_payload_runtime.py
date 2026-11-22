@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -110,7 +111,7 @@ def test_explicit_payload_binding_exports_rust_validated_v2_descriptor() -> None
     assert "PayloadAbiRef" not in json.dumps(descriptor)
 
 
-def test_explicit_binding_uses_core_digest_send_and_open_copy() -> None:
+def test_explicit_binding_uses_core_digest_and_pins_external_buffer() -> None:
     @cc.crm(namespace="test.portable-owner", version="0.1.0")
     class Echo:
         @cc.transfer(input=RECORD_SPEC, output=RECORD_SPEC)
@@ -120,17 +121,13 @@ def test_explicit_binding_uses_core_digest_send_and_open_copy() -> None:
     method = Echo.echo
     binding = method._input_payload_binding
     original = build_payload(RECORD_SPEC)
-    binary = binding.serialize(original)
-    opened = binding.deserialize(memoryview(binary))
-
-    try:
-        assert isinstance(opened, Payload)
-        assert opened is not original
-        assert opened.binary_bytes() == binary
-        assert payload_value(opened) == 7
-    finally:
-        opened.close()
-        original.close()
+    with original, binding.serialize(original) as binary:
+        with binding.deserialize(binary) as opened:
+            assert opened is not original
+            assert opened.binary_bytes() == binary
+            assert payload_value(opened) == 7
+        binary.release()
+        original.invalidate()
 
     wrong = build_payload(OTHER_SPEC)
     try:
@@ -656,7 +653,7 @@ def test_spec_failure_keeps_fastdb_cause_when_owner_close_also_fails(monkeypatch
             close_calls.append('close')
             raise OSError('cannot close owner')
 
-    monkeypatch.setattr(Payload, 'open_copy', staticmethod(lambda *_args: Owner()))
+    monkeypatch.setattr(Payload, 'open_external', staticmethod(lambda *_args: Owner()))
 
     class Contract:
         direction = '->'
@@ -737,3 +734,126 @@ def test_borrowed_cleanup_failure_preserves_original_business_exception(core_err
     assert 'invalidation failed' in str(caught.value.__context__)
     assert original.__context__ is prior_context
     assert original.__notes__ == ['business note']
+
+
+@pytest.mark.parametrize('spec_value', [RECORD_SPEC, OTHER_SPEC])
+def test_deferred_plan_writes_external_buffer_and_returns_the_pin(spec_value):
+    from c_two.crm.payload_plan import fastdb_payload_binding
+
+    binding = fastdb_payload_binding(RECORD_SPEC, label='writable-plan')
+    with CompiledSpec.compile(json.dumps(spec_value).encode()) as spec:
+        with Builder.create(spec) as builder:
+            entry = builder.entry_begin(0, 1)
+            if spec_value == RECORD_SPEC:
+                entry.value_u8(17)
+            else:
+                entry.value_u16(17)
+            plan = builder.freeze()
+    with plan:
+        assert plan.info().direct_build_status == 1
+        deferred = binding.serialize(plan)
+        slab = bytearray(deferred._c2_total_bytes())
+        if spec_value == OTHER_SPEC:
+            with pytest.raises(PayloadError) as mismatch:
+                deferred._c2_write_slab(slab)
+            assert mismatch.value.symbol == 'DIGEST_MISMATCH'
+        else:
+            deferred._c2_write_slab(slab)
+            with binding.deserialize(memoryview(slab).toreadonly()) as payload:
+                assert payload_value(payload) == 17
+        # Resizing would fail if the direct build still exported the target.
+        slab.extend(b'\x00')
+
+
+def test_direct_call_and_object_stream_materialize_fastdb_plans():
+    @cc.crm(namespace='test.local-deferred', version='0.1.0')
+    class Echo:
+        @cc.transfer(input=RECORD_SPEC, output=RECORD_SPEC)
+        def echo(self, value: Payload) -> Payload: ...
+
+        @cc.stream
+        @cc.transfer(input=RECORD_SPEC, output=RECORD_SPEC)
+        def items(self, value: Payload) -> Iterator[Payload]: ...
+
+    with CompiledSpec.compile(json.dumps(RECORD_SPEC).encode()) as spec:
+        with Builder.create(spec) as builder:
+            builder.entry_begin(0, 1).value_u8(17)
+            plan = builder.freeze()
+
+    class NativeStream:
+        def __init__(self, output):
+            from c_two.crm.stream import _ResourceStream
+
+            def resource_items():
+                with plan.clone() as item_plan:
+                    yield item_plan
+
+            self.resource = _ResourceStream(resource_items, encoded=False, output=output)
+
+        def next_item(self):
+            return self.resource.step()
+
+        def cancel(self):
+            self.resource.close()
+
+    class Client:
+        supports_direct_call = True
+
+        def call_direct(self, method_name, args):
+            assert method_name == 'echo'
+            assert payload_value(args[0]) == 17
+            return plan
+
+        def open_direct_stream(self, method_name, args, *, output):
+            assert method_name == 'items'
+            assert payload_value(args[0]) == 17
+            return NativeStream(output)
+
+    proxy = Echo()
+    proxy.client = Client()
+    with plan:
+        with proxy.echo(plan) as result:
+            assert payload_value(result) == 17
+        with proxy.items(plan) as stream, next(stream) as result:
+            assert next(stream, None) is None
+            assert payload_value(result) == 17
+
+
+def test_borrowed_echo_finishes_sink_write_and_unpins_before_invalidation():
+    from c_two.crm.payload_plan import fastdb_payload_binding
+
+    binding = fastdb_payload_binding(RECORD_SPEC, label='borrowed-echo')
+
+    class Resource:
+        def echo(self, value):
+            self.saved = value
+            return value
+
+    class Contract:
+        direction = '<-'
+        resource = Resource()
+
+    def echo(self, value): ...
+
+    class Sink:
+        def write(self, view):
+            assert view.readonly
+            self.sent_view = view
+            self.data = bytes(view)
+
+    wrapped = _build_transfer_wrapper(echo, input=binding, output=binding)
+    sink = Sink()
+    with build_payload(RECORD_SPEC) as source:
+        with source.memoryview() as request:
+            assert wrapped(
+                Contract(), request, _release_fn=request.release,
+                _c2_input_buffer_mode='borrowed', _response_sink=sink,
+            ) is None
+        with pytest.raises(ValueError, match='released memoryview'):
+            len(sink.sent_view)
+        with pytest.raises(PayloadError) as saved_error:
+            Contract.resource.saved.entry_view(0)
+        assert saved_error.value.symbol == 'VIEW_INVALIDATED'
+        with binding.deserialize(sink.data) as decoded:
+            assert payload_value(decoded) == 7
+        source.invalidate()

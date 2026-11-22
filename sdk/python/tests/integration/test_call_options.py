@@ -407,13 +407,13 @@ def test_real_known_fastdb_rejects_before_any_binary_copy(portable_connection, m
 
     source = build_payload()
     calls = []
-    original = Payload.binary_bytes
+    original = Payload.memoryview
 
     def copy(self):
         calls.append(threading.get_ident())
         return original(self)
 
-    monkeypatch.setattr(Payload, 'binary_bytes', copy)
+    monkeypatch.setattr(Payload, 'memoryview', copy)
     view = cc.with_call_options(portable_connection, timeout=1)
     try:
         with pytest.raises(cc.error.CallCapacityExceeded):
@@ -759,7 +759,7 @@ def test_zero_slots_or_deadline_never_materializes_fastdb(portable_connection, m
         return counted
 
     monkeypatch.setattr(Payload, 'execution_report', forbidden('report'))
-    monkeypatch.setattr(Payload, 'binary_bytes', forbidden('copy'))
+    monkeypatch.setattr(Payload, 'memoryview', forbidden('copy'))
     monkeypatch.setattr(EchoResource, 'echo', forbidden('resource'))
     view = cc.with_call_options(portable_connection, timeout=timeout)
     try:

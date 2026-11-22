@@ -14,6 +14,10 @@ use c2_core::{LagPolicy, SubscribeOptions, TopicStart};
 use c2_error::{C2Error, ErrorCode};
 
 use crate::core_error_ffi::core_error_to_py;
+use crate::core_ffi::{
+    checked_buffer, deferred_plan_len, materialize_deferred_plan, snapshot_python_buffer,
+    write_deferred_slab,
+};
 use crate::stream_ffi::close_timeout;
 
 pub(crate) fn subscribe_options(start: &str, on_lag: &str) -> PyResult<SubscribeOptions> {
@@ -54,9 +58,8 @@ impl PyTopicPublisher {
 impl PyTopicPublisher {
     /// Publish one immutable payload and return its monotonic sequence number.
     ///
-    /// Exact `bytes` travel on their Python-owned carrier without an extra
-    /// copy; every other buffer is snapshotted under the GIL first. The
-    /// native write itself runs detached from Python.
+    /// Materialize into an unpublished SHM allocation when available. The
+    /// native publication itself runs detached from Python.
     fn publish(&self, py: Python<'_>, payload: &Bound<'_, PyAny>) -> PyResult<u64> {
         if let Ok(bytes) = payload.cast_exact::<PyBytes>() {
             let owner = PyBackedBytes::from(bytes.clone());
@@ -65,11 +68,31 @@ impl PyTopicPublisher {
                 .detach(move || publisher.publish_bytes(&owner))
                 .map_err(core_error_to_py);
         }
-        let buffer = PyBuffer::<u8>::get(payload)?;
-        let mut snapshot = vec![0_u8; buffer.len_bytes()];
-        buffer.copy_to_slice(py, &mut snapshot)?;
-        drop(buffer);
-        py.detach(move || self.inner.publish(snapshot))
+        let plan_len = deferred_plan_len(payload)?;
+        let len = match plan_len {
+            Some(len) => len,
+            None => PyBuffer::<u8>::get(payload)?.len_bytes(),
+        };
+        let semantic_error = |error| core_error_to_py(c2_core::Error::Semantic(error));
+        let slab = py
+            .detach(|| self.inner.try_alloc_slab(len))
+            .map_err(semantic_error)?;
+        if let Some(mut slab) = slab {
+            if plan_len.is_some() {
+                slab = write_deferred_slab(payload, slab)?;
+            } else {
+                checked_buffer(payload, len)?.copy_to_slice(py, slab.as_mut_slice())?;
+            }
+            return py
+                .detach(move || self.inner.publish_slab(slab))
+                .map_err(semantic_error);
+        }
+        let bytes = if plan_len.is_some() {
+            materialize_deferred_plan(payload, len)?
+        } else {
+            snapshot_python_buffer(py, &checked_buffer(payload, len)?)?
+        };
+        py.detach(move || self.inner.publish(bytes))
             .map_err(core_error_to_py)
     }
 
