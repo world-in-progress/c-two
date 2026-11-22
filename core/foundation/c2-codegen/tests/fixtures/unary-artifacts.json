@@ -17,9 +17,9 @@
         "sha256": "d25a8e308c803acd08df897279827384fc0de97ea1cacd3323554b94c6b560a3"
       },
       {
-        "bytes": 15391,
+        "bytes": 15438,
         "path": "rust/c_two_contract.rs",
-        "sha256": "3256349dac12583ad7796ffb9e1abb69bc7a3e465b4e7b3608481a864bc2682e"
+        "sha256": "5c4628dc21d53c0bd8106ddcb355fc4a238fa31408d9874177477fc566063d37"
       },
       {
         "bytes": 2840,
@@ -110,9 +110,9 @@
         "sha256": "a1e05b1f83b46bbe1aec46b91e953fdd12daea6067279e3cf3735d919d59987e"
       },
       {
-        "bytes": 8502,
+        "bytes": 8524,
         "path": "rust/c_two_contract.rs",
-        "sha256": "36afd17255af19570570fb1c19b2ba2b95b0a739545995213a2c0066e9e8964a"
+        "sha256": "571b185d44a5b728430dfc923ee60061cc55192c924e424f367e68a9ff48333f"
       }
     ],
     "fixture": "portable-no-payload",
@@ -188,9 +188,9 @@
         "sha256": "0eeab1f5cdc6bac8ae7880794dd1b2c1f8eaac34e8e63c9139d6c40a266ce10c"
       },
       {
-        "bytes": 13817,
+        "bytes": 13843,
         "path": "rust/c_two_contract.rs",
-        "sha256": "868f10e09fa7124e7c7a2dc4f2253638a4be16bf9497887ae2d49a7986cab49a"
+        "sha256": "99c86a38b5be8a0beeeb1ee2890446ee6ef4420e9d43804d08795e7e7f9590a1"
       },
       {
         "bytes": 14049,
@@ -281,9 +281,9 @@
         "sha256": "a60647161cc12058cc829fdbaa30f999ffad40888ef24172fe3d4dd86bb4c98d"
       },
       {
-        "bytes": 13828,
+        "bytes": 13854,
         "path": "rust/c_two_contract.rs",
-        "sha256": "78cca57c3da1dc89e8af78f16ebbd8f2ae54a56988cee8e93ac8138f209f97c4"
+        "sha256": "2cd12b43380eee7408f7089a8ecfc0b76f7d446e772c4d56df6c3af9f503991c"
       },
       {
         "bytes": 23176,
