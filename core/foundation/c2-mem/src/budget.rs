@@ -766,17 +766,20 @@ impl Drop for MemoryReservation {
 }
 
 /// Local bytes that can return their allocation to a domain's warm pool.
+///
+/// Holds only a weak reference to the domain so a detached local buffer never
+/// keeps a retired domain alive after shutdown.
 #[derive(Debug)]
 pub struct RecycledBytes {
     bytes: Vec<u8>,
-    budget: Option<DomainBudget>,
+    budget: Option<Weak<Shared>>,
 }
 
 impl RecycledBytes {
     pub fn new(bytes: Vec<u8>, budget: DomainBudget) -> Self {
         Self {
             bytes,
-            budget: Some(budget),
+            budget: Some(Arc::downgrade(&budget.shared)),
         }
     }
 
@@ -826,8 +829,8 @@ impl From<Vec<u8>> for RecycledBytes {
 
 impl Drop for RecycledBytes {
     fn drop(&mut self) {
-        if let Some(budget) = &self.budget {
-            budget.recycle_vec(std::mem::take(&mut self.bytes));
+        if let Some(shared) = self.budget.as_ref().and_then(Weak::upgrade) {
+            shared.recycle_vec(std::mem::take(&mut self.bytes));
         }
     }
 }

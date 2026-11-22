@@ -759,3 +759,14 @@ fn recycled_bytes_return_the_same_allocation_to_the_warm_pool() {
     let other = budget.allocate_vec(size).unwrap();
     assert_ne!(other.as_ptr(), ptr);
 }
+
+#[test]
+fn recycled_bytes_do_not_keep_a_dropped_domain_alive() {
+    let size = WARM_BUFFER_MIN_BYTES;
+    let budget = domain(size as u64, 0, 0);
+    let weak = budget.observe().downgrade();
+    let bytes = RecycledBytes::new(vec![9; size], budget);
+    assert!(weak.upgrade().is_none());
+    assert_eq!(bytes.len(), size);
+    drop(bytes);
+}
