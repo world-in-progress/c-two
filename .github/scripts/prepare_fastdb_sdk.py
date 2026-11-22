@@ -24,11 +24,11 @@ import sys
 import tarfile
 import urllib.request
 
-RELEASE_VERSION = "0.2.4"
-EXPECTED_SOURCE_SHA = "f82fa13adeae2b87a295bf984821c85c44b55a3d"
+RELEASE_VERSION = "0.3.0"
+EXPECTED_SOURCE_SHA = "ff097cca9c29cadc289e2a437f4720ecc56015c4"
 RELEASE_MANIFEST_NAME = "release-manifest.json"
 RELEASE_MANIFEST_SHA256 = (
-    "8a07ab93409811bb5e11418876ba082594758c2b3b87a766699c447586a9c5bf"
+    "866a56302d2495db510f10760d4c256b50e5dd74be9deed12e563962bc78acc4"
 )
 RELEASE_REPOSITORY = "world-in-progress/fastdb"
 RELEASE_MANIFEST_SCHEMA = "fastdb.release-manifest.v1"
@@ -269,7 +269,7 @@ def verify_bundle_manifest(bundle: dict, target: str) -> list[dict]:
         ("version", RELEASE_VERSION),
         ("target", target),
         ("abi", EXPECTED_ABI),
-        ("abi_symbol_count", 117),
+        ("abi_symbol_count", 118),
         ("link_mode", EXPECTED_LINK_MODE),
         ("source_sha", EXPECTED_SOURCE_SHA),
     )

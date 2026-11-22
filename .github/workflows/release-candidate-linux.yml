@@ -284,7 +284,7 @@ jobs:
       # fastcarto sources), so fastdb-sys requires system mode with the
       # official CoreSDK. prepare_fastdb_sdk.py verifies the release
       # manifest pin, the pinned source rev, the outer bundle hash, every
-      # member hash, and ABI symbol count 117, then extracts into an
+      # member hash, and ABI symbol count 118, then extracts into an
       # absolute RUNNER_TEMP directory; --emit-github exports system mode,
       # the absolute lib dir, and the loader path for the next steps only.
       - name: Provision the verified official FastDB CoreSDK

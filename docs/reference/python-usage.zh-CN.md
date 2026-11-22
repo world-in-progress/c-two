@@ -1,10 +1,10 @@
 # Python SDK 用法
 
-本指南说明 C-Two 0.11.0 / c3 0.7.0 的 Python SDK 用法，包括 CRM 编写、调用、服务端流、可移植的 FastDB 0.2.4 载荷、发布/订阅主题和 Runtime 所有权。
+本指南说明 C-Two 0.11.0 / c3 0.7.0 的 Python SDK 用法，包括 CRM 编写、调用、服务端流、可移植的 FastDB 0.3.0 载荷、发布/订阅主题和 Runtime 所有权。
 
 [English](python-usage.md) · 简体中文
 
-[0.11.0 发布说明](../releases/0.11.0.md)介绍从 0.10.x 迁移的事项，包括 IPC 16、SHM 4、服务端流、路由名身份、按角色划分的容量配置和收敛后的错误体系。[未发布变更](../releases/unreleased.md)新增资源归属的发布/订阅主题，并将线协议升级到 IPC 17、Node C/FFI ABI 升级到 9；本指南描述当前源码。CRM 契约通过同进程调用、本地 IPC 和 HTTP relay 暴露有状态资源；可移植 Python 载荷使用可选的 FastDB 0.2.4 extra。安装步骤及可运行的入门示例见[快速开始](../../README.zh-CN.md#快速开始)。
+[0.11.0 发布说明](../releases/0.11.0.md)介绍从 0.10.x 迁移的事项，包括 IPC 16、SHM 4、服务端流、路由名身份、按角色划分的容量配置和收敛后的错误体系。[未发布变更](../releases/unreleased.md)新增资源归属的发布/订阅主题，并将线协议升级到 IPC 17、Node C/FFI ABI 升级到 9；本指南描述当前源码。CRM 契约通过同进程调用、本地 IPC 和 HTTP relay 暴露有状态资源；可移植 Python 载荷使用可选的 FastDB 0.3.0 extra。安装步骤及可运行的入门示例见[快速开始](../../README.zh-CN.md#快速开始)。
 
 ## 可移植载荷（FastDB）
 

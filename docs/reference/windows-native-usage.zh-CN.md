@@ -6,7 +6,7 @@
 
 该后端使用字节模式 Named Pipe 传输 `ipc://` 控制流量，并使用具名文件映射存放共享载荷内存。它跨登录会话使用进程的 TokenUser SID。同一会话的对端可以使用 SHM；不同会话使用自有缓冲区、内联或分片传输。原生连接在发送数据前要求用户一致，且服务端完整性级别至少为 Medium。普通 SDK 代码继续使用逻辑 `ipc://` 地址；不要在 SDK 中构造管道或映射名称。HTTP relay 仍提供网络传输路径。
 
-本指南涵盖 Windows x64 和 ARM64 上的 Python C-Two **0.11.0**、c3 **0.7.0** 和 FastDB **0.2.4**。请配套安装对应版本的 Python 包与 c3；端点行为见 [0.11.0 迁移说明](../releases/0.11.0.md)和[生命周期指南](local-endpoint-lifecycle.md)。当前源码树另外升级到 IPC **17** 与 C/FFI ABI **9**，并新增资源归属的发布/订阅主题（见[未发布说明](../releases/unreleased.md)）；源码使用方需一起构建、一起升级，IPC 16 与 IPC 17 对端经固定版本前导互相拒绝。
+本指南涵盖 Windows x64 和 ARM64 上的 Python C-Two **0.11.0**、c3 **0.7.0** 和 FastDB **0.3.0**。请配套安装对应版本的 Python 包与 c3；端点行为见 [0.11.0 迁移说明](../releases/0.11.0.md)和[生命周期指南](local-endpoint-lifecycle.md)。当前源码树另外升级到 IPC **17** 与 C/FFI ABI **9**，并新增资源归属的发布/订阅主题（见[未发布说明](../releases/unreleased.md)）；源码使用方需一起构建、一起升级，IPC 16 与 IPC 17 对端经固定版本前导互相拒绝。
 
 Windows 拒绝 Unix 根目录覆盖值（`cc.endpoint.set_local_endpoint(root=...)`、`C2_IPC_ROOT`、`--ipc-root`）。管道名称由逻辑地址和当前 TokenUser SID 派生。
 
@@ -52,11 +52,11 @@ c3.exe --version
 
 ## 从源码构建
 
-源码开发使用规范的 main 分支。对应 c3 版本的 `rc-manifest.json` 标识发布源码；使用 main 是开发检出的约定。请使用面向原生 x64 或 ARM64 架构的 Developer PowerShell，并确保 MSVC C++ 工具链、CMake、Ninja、Git、Rust 1.95 或更新版本及 uv 可用。Python 和 Rust 从各自的注册源获取 FastDB 0.2.4；Python 需要可选的 `fastdb` extra。Python 扩展与 c3 使用源码模式的原生构建。Rust 绑定还需要匹配的 Core SDK：从该版本中解压 `fastdb-core-0.2.4-x86_64-pc-windows-msvc.tar.gz` 或 `fastdb-core-0.2.4-aarch64-pc-windows-msvc.tar.gz`，并如下配置其 `lib` 目录的绝对路径。完整的源码互操作检查还使用相邻的 FastDB 发布版本检出作为固定输入和 TypeScript 源码；Python 使用者使用已发布的 wheel：
+源码开发使用规范的 main 分支。对应 c3 版本的 `rc-manifest.json` 标识发布源码；使用 main 是开发检出的约定。请使用面向原生 x64 或 ARM64 架构的 Developer PowerShell，并确保 MSVC C++ 工具链、CMake、Ninja、Git、Rust 1.95 或更新版本及 uv 可用。Python 和 Rust 从各自的注册源获取 FastDB 0.3.0；Python 需要可选的 `fastdb` extra。Python 扩展与 c3 使用源码模式的原生构建。Rust 绑定还需要匹配的 Core SDK：从该版本中解压 `fastdb-core-0.3.0-x86_64-pc-windows-msvc.tar.gz` 或 `fastdb-core-0.3.0-aarch64-pc-windows-msvc.tar.gz`，并如下配置其 `lib` 目录的绝对路径。完整的源码互操作检查还使用相邻的 FastDB 发布版本检出作为固定输入和 TypeScript 源码；Python 使用者使用已发布的 wheel：
 
 ```powershell
 git clone https://github.com/world-in-progress/fastdb.git
-git -C fastdb checkout v0.2.4
+git -C fastdb checkout v0.3.0
 git clone https://github.com/world-in-progress/c-two.git
 Set-Location c-two
 $env:FASTDB_PAYLOAD_SYSTEM_LIB_DIR = 'C:\path\to\fastdb-core-sdk\lib'

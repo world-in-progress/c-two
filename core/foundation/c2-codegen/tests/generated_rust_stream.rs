@@ -48,7 +48,7 @@ fn generated_mixed_rust_service_runs_unary_and_server_stream_calls() {
     std::fs::write(
         temp.path().join("Cargo.toml"),
         format!(
-            "[package]\nname = \"generated-rust-stream-consumer\"\nversion = \"0.0.0\"\nedition = \"2024\"\npublish = false\n\n[dependencies]\nc-two = {{ version = \"0.1.0\", path = {:?} }}\nfastdb = \"=0.2.4\"\n",
+            "[package]\nname = \"generated-rust-stream-consumer\"\nversion = \"0.0.0\"\nedition = \"2024\"\npublish = false\n\n[dependencies]\nc-two = {{ version = \"0.1.0\", path = {:?} }}\nfastdb = \"=0.3.0\"\n",
             repository.join("sdk/rust")
         ),
     )

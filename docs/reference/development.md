@@ -11,9 +11,9 @@ git clone https://github.com/world-in-progress/c-two.git
 cd c-two
 # Full interoperability tests, golden fixtures, and TypeScript fixtures also
 # need the pinned FastDB source checkout as a sibling:
-git clone --branch v0.2.4 --depth 1 https://github.com/world-in-progress/fastdb.git ../fastdb
+git clone --branch v0.3.0 --depth 1 https://github.com/world-in-progress/fastdb.git ../fastdb
 # Core and Rust SDK tests use the published Rust bindings in system mode.
-# Extract the matching Core SDK from the FastDB 0.2.4 release first:
+# Extract the matching Core SDK from the FastDB 0.3.0 release first:
 export FASTDB_PAYLOAD_LINK_MODE=system
 export FASTDB_PAYLOAD_SYSTEM_LIB_DIR=/absolute/path/to/fastdb-core-sdk/lib
 case "$(uname -s)" in
@@ -27,9 +27,9 @@ python tools/dev/build_route_scope_attestor.py  # test-only registration attesto
 cp .env.example .env                          # optional: local environment configuration
 ```
 
-Requires [uv](https://github.com/astral-sh/uv) and Rust 1.95 or newer. The full Python suite also requires `hey` v0.1.4 on PATH (`go install github.com/rakyll/hey@v0.1.4`). The setup above uses the Core SDK for development and testing. Deployable CLI and Python-extension builds select `FASTDB_PAYLOAD_LINK_MODE=source` and statically link the same immutable FastDB 0.2.4 source; this is separate from the Core/Rust SDK system-link contract. Run the Python suite in one process with `C2_RELAY_ANCHOR_ADDRESS= uv run --no-sync pytest sdk/python/tests/ -q --timeout=30`. For parallel execution, `tools/dev/test_python.py` runs ordinary test files in parallel and the complete matrices serially; see [CONTRIBUTING.md](../../CONTRIBUTING.md) for usage. See the [test guide](../../sdk/python/tests/README.md) for focused commands and per-test timeout overrides. Run the Rust suites with `cargo test --manifest-path core/Cargo.toml --workspace` and `cargo test --manifest-path sdk/rust/Cargo.toml --all-features`. Python 3.10 remains the supported minimum. On Windows, follow the [Windows build guide](windows-native-usage.md).
+Requires [uv](https://github.com/astral-sh/uv) and Rust 1.95 or newer. The full Python suite also requires `hey` v0.1.4 on PATH (`go install github.com/rakyll/hey@v0.1.4`). The setup above uses the Core SDK for development and testing. Deployable CLI and Python-extension builds select `FASTDB_PAYLOAD_LINK_MODE=source` and statically link the same immutable FastDB 0.3.0 source; this is separate from the Core/Rust SDK system-link contract. Run the Python suite in one process with `C2_RELAY_ANCHOR_ADDRESS= uv run --no-sync pytest sdk/python/tests/ -q --timeout=30`. For parallel execution, `tools/dev/test_python.py` runs ordinary test files in parallel and the complete matrices serially; see [CONTRIBUTING.md](../../CONTRIBUTING.md) for usage. See the [test guide](../../sdk/python/tests/README.md) for focused commands and per-test timeout overrides. Run the Rust suites with `cargo test --manifest-path core/Cargo.toml --workspace` and `cargo test --manifest-path sdk/rust/Cargo.toml --all-features`. Python 3.10 remains the supported minimum. On Windows, follow the [Windows build guide](windows-native-usage.md).
 
-The workspace dev group includes `c-two[fastdb]` and pins Python `fastdb4py==0.2.4`. Bare installs omit FastDB and NumPy; the native CoreSDK and Rust source pins above also select 0.2.4.
+The workspace dev group includes `c-two[fastdb]` and pins Python `fastdb4py==0.3.0`. Bare installs omit FastDB and NumPy; the native CoreSDK and Rust source pins above also select 0.3.0.
 
 Banner generation uses the separate `banner` dependency group with patched Pillow 13 and Python 3.11+: `uv run --python 3.11 --group banner tools/dev/generate_banner.py`. Pillow is not required by the SDK or its test suite; those retain Python 3.10 support.
 
@@ -69,4 +69,4 @@ The complete Phase 0B upstream local candidate is recorded in [`docs/acceptance/
 
 The retained canonical manifest and receipts under `docs/acceptance/evidence/` prove 42 exact artifacts, 4/4 isolated Rust/Python/Node consumers, 18/18 Rust/Python direct/relay rows, 12/12 generated TypeScript Node rows, and the 12-row SDK parity inventory. They are evidence records only. Do not add package archives, local registries, wheelhouses, native libraries, generated trees, or build outputs to Git.
 
-FastDB 0.2.4 is now published separately; its releases do not change these historical July candidate inputs or prove C-Two publication. Server streams are implemented across same-process Python, direct IPC and relay HTTP forwarding (for Rust and Python clients; generated TypeScript clients stream over direct IPC and relay-selected local IPC). Official Rust/Node package distribution, browser runtime, C++ C-Two SDK, compatibility ranges, trust/signature/revocation, client/bidirectional streaming, TypeScript relay-HTTP stream consumption, post-dispatch retry/deduplication, and Toodle consumption remain open. Hosted evidence must name its actual source pair and passing gates; never infer it from the local candidate.
+FastDB 0.3.0 is now published separately; its releases do not change these historical July candidate inputs or prove C-Two publication. Server streams are implemented across same-process Python, direct IPC and relay HTTP forwarding (for Rust and Python clients; generated TypeScript clients stream over direct IPC and relay-selected local IPC). Official Rust/Node package distribution, browser runtime, C++ C-Two SDK, compatibility ranges, trust/signature/revocation, client/bidirectional streaming, TypeScript relay-HTTP stream consumption, post-dispatch retry/deduplication, and Toodle consumption remain open. Hosted evidence must name its actual source pair and passing gates; never infer it from the local candidate.

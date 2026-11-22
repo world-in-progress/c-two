@@ -48,8 +48,8 @@ SOURCE_SHA = "a" * 40
 OTHER_SHA = "b" * 40
 C_TWO_VERSION = "0.6.0"
 C3_VERSION = "0.2.0"
-FASTDB_VERSION = "0.2.4"
-FASTDB_CORE_VERSION = "0.2.4"
+FASTDB_VERSION = "0.3.0"
+FASTDB_CORE_VERSION = "0.3.0"
 FASTDB_SOURCE_REV = promote.FASTDB_SOURCE_REV
 CLI_TARGETS = promote.CLI_TARGETS
 WINDOWS_TARGET = "x86_64-pc-windows-msvc"
@@ -1202,7 +1202,7 @@ def test_fastdb_provisioning_missing_wheel_with_null_digest_is_rejected(
     assert "not a distinct retained wheel" in capsys.readouterr().err
 
 
-@pytest.mark.parametrize("core_version, accepted", [("0.2.4", True), ("0.2.1", False)])
+@pytest.mark.parametrize("core_version, accepted", [("0.3.0", True), ("0.2.1", False)])
 def test_python_fastdb_version_is_independent_of_native_core(
     tmp_path: Path, environment, monkeypatch, core_version, accepted,
 ) -> None:
@@ -1214,7 +1214,7 @@ def test_python_fastdb_version_is_independent_of_native_core(
     if accepted:
         assert json.loads(plan_path.read_text())["versions"]["fastdb_version"] == "0.2.2"
         body = body_path.read_text()
-        assert "Native FastDB Core: `0.2.4`" in body
+        assert "Native FastDB Core: `0.3.0`" in body
         assert "Optional Python FastDB: `fastdb4py==0.2.2`" in body
 
 

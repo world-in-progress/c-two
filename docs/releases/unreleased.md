@@ -6,7 +6,7 @@ The headline change is **resource-owned publish/subscribe** ([ADR 0005](../decis
 
 ## Upgrade together
 
-- **Protocols and ABIs:** IPC **17** (replaces 16) and C/FFI ABI **9** (replaces 8). SHM **4**, relay mesh **7**, Unix namespace disk format 3, Unix credential schema 4, the `C2E1` v1 error wire and FastDB 0.2.4 are unchanged. The permanent fixed 25-byte version preamble and its typed `ProtocolVersionMismatch` are retained; an IPC 16 peer and an IPC 17 endpoint refuse each other through it.
+- **Protocols and ABIs:** IPC **17** (replaces 16), C/FFI ABI **9** (replaces 8), and FastDB **0.3.0** (ABI-118, replaces 0.2.4 / ABI-117). SHM **4**, relay mesh **7**, Unix namespace disk format 3, Unix credential schema 4, and the `C2E1` v1 error wire are unchanged. The permanent fixed 25-byte version preamble and its typed `ProtocolVersionMismatch` are retained; an IPC 16 peer and an IPC 17 endpoint refuse each other through it.
 - **Clean cut, no compatibility path:** IPC 16 call-record grammar is not accepted beside IPC 17, and ABI 8 loaders are rejected by the ABI 9 addon's version check rather than by a missing symbol. Regenerate generated Rust, Python and TypeScript contract clients and rebuild Node bindings.
 - **Python `register()` return type:** `cc.register(...)` and `Runtime.register(...)` return a `Registration` handle instead of a bare `str`. Code that ignored the return keeps working; code that used or compared the string must read `registration.name`.
 - **Zero new configuration:** publish/subscribe adds no environment variables, CLI flags or slot settings. Topics use the existing per-role `(M, F, N)` domains ([memory policy](../reference/memory-policy.md)).

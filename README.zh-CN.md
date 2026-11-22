@@ -24,7 +24,7 @@ C-Two 是为有状态资源设计的 RPC 框架，主要用于分布式科学计
 
 **CRM 契约**声明可调用的方法以及 namespace、version；**resource** 是实现这些方法并持有状态的普通类；**client** 通过 `cc.connect(...)` 获得类型化代理。一个进程可以同时承载多个资源，并连接其他资源。名字取自 *CRM to Call*（Core Resource Model to Call），意思是有状态的资源通过它的 CRM 被其他进程和机器调用。
 
-**C-Two 0.11.0** 支持 Python 3.10+。普通调用无 Python 运行时依赖；FastDB 载荷使用 `c-two[fastdb]`（`fastdb4py==0.2.4`）。本版本升级到 IPC **16**、SHM **4**、C/FFI ABI **8** 与 relay mesh **7**，引入单一属主共享内存释放、服务端流（同进程、直接 IPC 与 relay HTTP）、路由名身份、按角色划分的 `(M, F, N)` 预算域、基于 Rust Core 的 Node 客户端以及收敛后的错误体系。见 [0.11.0 更新与迁移说明](docs/releases/0.11.0.md)。当前源码新增资源归属的发布/订阅主题，并为拟定中的 0.12.0 线升级到 IPC **17** / C/FFI ABI **9**；见[未发布说明](docs/releases/unreleased.md)。
+**C-Two 0.11.0** 支持 Python 3.10+。普通调用无 Python 运行时依赖；FastDB 载荷使用 `c-two[fastdb]`（`fastdb4py==0.3.0`）。本版本升级到 IPC **16**、SHM **4**、C/FFI ABI **8** 与 relay mesh **7**，引入单一属主共享内存释放、服务端流（同进程、直接 IPC 与 relay HTTP）、路由名身份、按角色划分的 `(M, F, N)` 预算域、基于 Rust Core 的 Node 客户端以及收敛后的错误体系。见 [0.11.0 更新与迁移说明](docs/releases/0.11.0.md)。当前源码新增资源归属的发布/订阅主题，并为拟定中的 0.12.0 线升级到 IPC **17** / C/FFI ABI **9**；见[未发布说明](docs/releases/unreleased.md)。
 
 ## 有状态 RPC 有什么不同
 

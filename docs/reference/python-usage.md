@@ -1,10 +1,10 @@
 # Python SDK usage
 
-This guide describes C-Two 0.11.0 / c3 0.7.0 Python SDK usage, including CRM authoring, calls, server streams, portable FastDB 0.2.4 payloads, publish/subscribe topics and Runtime ownership.
+This guide describes C-Two 0.11.0 / c3 0.7.0 Python SDK usage, including CRM authoring, calls, server streams, portable FastDB 0.3.0 payloads, publish/subscribe topics and Runtime ownership.
 
 English · [简体中文](python-usage.zh-CN.md)
 
-The [0.11.0 release notes](../releases/0.11.0.md) describe migration from 0.10.x, including IPC 16, SHM 4, server streams, route-name identity, role-domain capacity configuration and the converged error hierarchy. The [unreleased changes](../releases/unreleased.md) add resource-owned publish/subscribe topics and move the wire to IPC 17 and the Node C/FFI ABI to 9; this guide documents that current source. CRM contracts expose stateful resources over same-process calls, local IPC and HTTP relay; portable Python payloads use the optional FastDB 0.2.4 extra. For installation and a runnable introduction, see the [quickstart](../../README.md#quickstart).
+The [0.11.0 release notes](../releases/0.11.0.md) describe migration from 0.10.x, including IPC 16, SHM 4, server streams, route-name identity, role-domain capacity configuration and the converged error hierarchy. The [unreleased changes](../releases/unreleased.md) add resource-owned publish/subscribe topics and move the wire to IPC 17 and the Node C/FFI ABI to 9; this guide documents that current source. CRM contracts expose stateful resources over same-process calls, local IPC and HTTP relay; portable Python payloads use the optional FastDB 0.3.0 extra. For installation and a runnable introduction, see the [quickstart](../../README.md#quickstart).
 
 ## Portable payloads (FastDB)
 
