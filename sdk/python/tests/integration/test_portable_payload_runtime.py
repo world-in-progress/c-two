@@ -4,13 +4,24 @@ import json
 import os
 import threading
 import time
+from collections.abc import Iterator
 
 import pytest
 
 import c_two as cc
 from c_two import error
 from c_two.transport import registry as registry_module
-from fastdb4py.payload import BuildPolicy, Builder, CompiledSpec, Payload, PayloadError
+from fastdb4py.payload import (
+    BuildPlan,
+    BuildPolicy,
+    Builder,
+    CompiledSpec,
+    ExternalBytes,
+    Payload,
+    PayloadError,
+)
+
+from ..fixtures.stream_python import BLOB_SPEC, blob_bytes
 
 
 SPEC = {
@@ -248,7 +259,7 @@ def test_runtime_retirement_preserves_borrowed_callback_and_obtained_hold(
 
 
 @pytest.mark.timeout(30)
-def test_direct_ipc_open_copy_hold_borrowed_invalidation_and_no_payload() -> None:
+def test_direct_ipc_external_payload_hold_borrowed_invalidation_and_no_payload() -> None:
     resource = EchoResource()
     cc.register(
         Echo,
@@ -285,6 +296,9 @@ def test_direct_ipc_open_copy_hold_borrowed_invalidation_and_no_payload() -> Non
             resource.saved.entry_view(0)
         assert borrowed_error.value.symbol == "VIEW_INVALIDATED"
 
+        source.invalidate()
+        assert cc.observe.memory_stats()['client']['memory']['used_bytes'] == 0
+        assert read_value(ordinary) == 7
         assert proxy.ping() is None
 
         with pytest.raises(error.SerializationError) as wrong_output_error:
@@ -323,21 +337,21 @@ def test_ipc_borrowed_input_invalidates_once_on_cancellation(stage, monkeypatch)
 
     resource = CancellingEcho()
     invalidated = []
-    binary_bytes = Payload.binary_bytes
+    memoryview = Payload.memoryview
     invalidate = Payload.invalidate
 
     def cancel_serialization(payload):
         if payload is resource.saved:
             assert read_value(payload) == 7
             raise CancelledError('serialization cancelled')
-        return binary_bytes(payload)
+        return memoryview(payload)
 
     def record_invalidation(payload):
         if payload is resource.saved:
             invalidated.append(payload)
         invalidate(payload)
 
-    monkeypatch.setattr(Payload, 'binary_bytes', cancel_serialization)
+    monkeypatch.setattr(Payload, 'memoryview', cancel_serialization)
     monkeypatch.setattr(Payload, 'invalidate', record_invalidation)
     cc.register(Echo, resource, name='borrowed-cancellation',
                 input_lifetime={'save_borrowed': 'borrowed'})
@@ -393,4 +407,332 @@ def test_held_native_invalidation_failure_has_output_buffer_stage(monkeypatch):
         if held is not None:
             held.release()
         source.close()
+        cc.close(proxy)
+
+
+@cc.crm(namespace='test.deferred-portable-runtime', version='0.1.0')
+class BlobExchange:
+    @cc.transfer(input=BLOB_SPEC, output=BLOB_SPEC)
+    def echo(self, payload: Payload) -> Payload: ...
+
+    @cc.transfer(output=BLOB_SPEC)
+    def build(self, wrong: bool) -> Payload: ...
+
+    @cc.stream
+    @cc.transfer(input=BLOB_SPEC, output=BLOB_SPEC)
+    def frames(self, payload: Payload) -> Iterator[Payload]: ...
+
+    @cc.topic
+    @cc.transfer(output=BLOB_SPEC)
+    def state(self) -> Payload: ...
+
+
+def blob_plan(data: bytes, *, wrong=False) -> BuildPlan:
+    field = BLOB_SPEC['entries'][0]
+    spec = BLOB_SPEC if not wrong else {**BLOB_SPEC, 'entries': [{**field, 'id': 'other'}]}
+    with CompiledSpec.compile(json.dumps(spec).encode()) as compiled:
+        with Builder.create(compiled) as builder:
+            builder.entry_begin(0, 1).value_bytes(data)
+            return builder.freeze()
+
+
+class BlobExchangeResource:
+    def __init__(self, data):
+        self.data = data
+
+    def echo(self, payload):
+        return payload
+
+    def build(self, wrong):
+        return blob_plan(self.data, wrong=wrong)
+
+    def frames(self, payload):
+        yield payload
+        yield self.build(False)
+
+
+def test_ipc_deferred_plan_writes_requests_responses_streams_and_topics(tmp_path, monkeypatch):
+    from c_two.crm.payload_plan import _DeferredFastDbPlan
+
+    data = b'c' * (64 * 1024)
+    server = cc.Runtime()
+    client = cc.Runtime()
+    if os.name != 'nt':
+        server.set_local_endpoint(root=str(tmp_path))
+        client.set_local_endpoint(root=str(tmp_path))
+    writes = []
+    write_slab = _DeferredFastDbPlan._c2_write_slab
+
+    def record_write(plan, target):
+        writes.append((plan.label, type(target).__name__))
+        return write_slab(plan, target)
+
+    monkeypatch.setattr(_DeferredFastDbPlan, '_c2_write_slab', record_write)
+    proxy = None
+    try:
+        registration = server.register(BlobExchange, BlobExchangeResource(data), name='blob')
+        proxy = client.connect(BlobExchange, name='blob', address=server.server_address())
+        with blob_plan(data) as plan, proxy.echo(plan) as received:
+            assert blob_bytes(received) == data
+        assert ('echo.input', 'PyWritableSlab') in writes
+
+        with pytest.raises(error.SerializationError) as mismatch:
+            proxy.build(True)
+        assert mismatch.value.code == error.ErrorCode.ResourceOutputSerializing
+        assert mismatch.value.details['fastdb_symbol'] == 'DIGEST_MISMATCH'
+        with proxy.build(False) as received:
+            assert blob_bytes(received) == data
+        assert writes.count(('build.output', 'PyWritableSlab')) == 2
+
+        with blob_plan(data) as plan, proxy.frames(plan) as stream:
+            with next(stream) as original, next(stream) as from_plan:
+                assert blob_bytes(original) == blob_bytes(from_plan) == data
+            assert next(stream, None) is None
+        assert ('frames.output', 'PyScopedWritableBuffer') in writes
+
+        publisher = registration.publisher('state')
+        subscription = proxy.client.subscribe('state')
+        try:
+            with blob_plan(data, wrong=True) as plan:
+                with pytest.raises(error.SerializationError) as mismatch:
+                    publisher.publish(plan)
+                assert mismatch.value.details['fastdb_symbol'] == 'DIGEST_MISMATCH'
+            with blob_plan(data) as plan:
+                seq = publisher.publish(plan)
+            assert seq == 1
+            delivery = next(subscription)
+            with delivery.value as received:
+                assert delivery.seq == seq and blob_bytes(received) == data
+        finally:
+            subscription.close(timeout=5)
+        assert writes.count(('state.topic.output', 'PyWritableSlab')) == 2
+    finally:
+        if proxy is not None:
+            cc.close(proxy)
+        client.shutdown(timeout=5)
+        server.shutdown(timeout=5)
+
+
+@pytest.mark.parametrize('held', [False, True])
+def test_ipc_fastdb_stream_and_topic_release_pins_and_accounting(tmp_path, held):
+    data = b'payload'
+    server = cc.Runtime()
+    client = cc.Runtime()
+    if os.name != 'nt':
+        server.set_local_endpoint(root=str(tmp_path))
+        client.set_local_endpoint(root=str(tmp_path))
+    proxy = None
+
+    def verify(delivered):
+        memory = client.memory_stats()
+        if held:
+            assert memory['holds']['active_holds'] == 1
+            payload = delivered.value
+            assert blob_bytes(payload) == data
+            delivered.release()
+            with pytest.raises(PayloadError) as invalidated:
+                payload.entry_view(0)
+            assert invalidated.value.symbol == 'VIEW_INVALIDATED'
+        else:
+            assert memory['holds']['active_holds'] == 0
+            assert memory['client']['memory']['used_bytes'] == 0
+            with delivered:
+                assert blob_bytes(delivered) == data
+
+    try:
+        class EchoStream(BlobExchangeResource):
+            def frames(self, payload: Payload):
+                yield payload
+
+        registration = server.register(
+            BlobExchange, EchoStream(data), name='pins',
+            input_lifetime={'frames': 'borrowed'},
+        )
+        proxy = client.connect(BlobExchange, name='pins', address=server.server_address())
+        with blob_plan(data) as plan, plan.execute(BuildPolicy.ALLOW_STAGING).payload as source:
+            frames = cc.hold(proxy.frames) if held else proxy.frames
+            with frames(source) as stream:
+                source.invalidate()
+                verify(next(stream))
+                assert next(stream, None) is None
+
+        publisher = registration.publisher('state')
+        sub = proxy.client.subscribe('state', hold=held)
+        try:
+            with blob_plan(data) as plan, plan.execute(BuildPolicy.ALLOW_STAGING).payload as source:
+                publisher.publish(source)
+                source.invalidate()
+                verify(next(sub).value)
+        finally:
+            sub.close(timeout=5)
+        assert client.memory_stats()['holds']['active_holds'] == 0
+        assert client.memory_stats()['client']['memory']['used_bytes'] == 0
+    finally:
+        if proxy is not None:
+            cc.close(proxy)
+        client.shutdown(timeout=5)
+        server.shutdown(timeout=5)
+
+
+@pytest.mark.timeout(30)
+def test_ipc_borrowed_input_deferred_plan_from_external_view_releases_pins(tmp_path) -> None:
+    data = b'b' * (64 * 1024)
+    server = cc.Runtime()
+    client = cc.Runtime()
+    if os.name != 'nt':
+        server.set_local_endpoint(root=str(tmp_path))
+        client.set_local_endpoint(root=str(tmp_path))
+
+    class BorrowedExternalPlanResource(BlobExchangeResource):
+        def __init__(self) -> None:
+            super().__init__(data)
+            self.wrong = False
+            self.saved_inputs: list[Payload] = []
+
+        def echo(self, payload: Payload) -> BuildPlan:
+            self.saved_inputs.append(payload)
+            field = BLOB_SPEC['entries'][0]
+            spec = BLOB_SPEC if not self.wrong else {
+                **BLOB_SPEC, 'entries': [{**field, 'id': 'other'}],
+            }
+            with CompiledSpec.compile(json.dumps(spec).encode()) as compiled:
+                with Builder.create(compiled) as builder:
+                    ext = ExternalBytes(payload.memoryview())
+                    try:
+                        builder.entry_begin(0, 1).value_external_bytes(ext)
+                        return builder.freeze()
+                    finally:
+                        ext.close()
+
+    resource = BorrowedExternalPlanResource()
+    proxy = None
+    try:
+        server.register(
+            BlobExchange,
+            resource,
+            name='borrowed-ext-plan',
+            input_lifetime={'echo': 'borrowed'},
+        )
+        proxy = client.connect(
+            BlobExchange, name='borrowed-ext-plan', address=server.server_address(),
+        )
+        with blob_plan(data) as plan, plan.execute(BuildPolicy.ALLOW_STAGING).payload as source:
+            expected_wire = bytes(source.memoryview())
+            with proxy.echo(source) as received:
+                assert blob_bytes(received) == expected_wire
+
+            resource.wrong = True
+            with pytest.raises(error.SerializationError) as mismatch:
+                proxy.echo(source)
+            assert mismatch.value.code == error.ErrorCode.ResourceOutputSerializing
+            assert mismatch.value.details['fastdb_symbol'] == 'DIGEST_MISMATCH'
+
+        assert len(resource.saved_inputs) == 2
+        for saved in resource.saved_inputs:
+            with pytest.raises(PayloadError) as invalidated:
+                saved.entry_view(0)
+            assert invalidated.value.symbol == 'VIEW_INVALIDATED'
+            saved.close()
+        assert server.memory_stats()['holds']['active_holds'] == 0
+        assert server.memory_stats()['holds']['total_held_bytes'] == 0
+    finally:
+        if proxy is not None:
+            cc.close(proxy)
+        client.shutdown(timeout=5)
+        server.shutdown(timeout=5)
+    assert server.memory_stats()['server']['memory'] is None
+
+
+@pytest.mark.timeout(30)
+def test_ipc_same_process_caller_payload_invalidation_inside_resource(tmp_path) -> None:
+    data = b'x' * (64 * 1024)
+    server = cc.Runtime()
+    client = cc.Runtime()
+    if os.name != 'nt':
+        server.set_local_endpoint(root=str(tmp_path))
+        client.set_local_endpoint(root=str(tmp_path))
+
+    shared_source: dict[str, Payload | None] = {'payload': None}
+
+    class InvalidatingResource(BlobExchangeResource):
+        def echo(self, payload: Payload) -> Payload:
+            src = shared_source['payload']
+            assert src is not None
+            src.invalidate()
+            return payload
+
+        def frames(self, payload: Payload):
+            src = shared_source['payload']
+            assert src is not None
+            src.invalidate()
+            yield payload
+
+    proxy = None
+    try:
+        server.register(BlobExchange, InvalidatingResource(data), name='self-invalidate')
+        proxy = client.connect(
+            BlobExchange, name='self-invalidate', address=server.server_address(),
+        )
+        with blob_plan(data) as plan, plan.execute(BuildPolicy.ALLOW_STAGING).payload as source:
+            shared_source['payload'] = source
+            with proxy.echo(source) as received:
+                assert blob_bytes(received) == data
+            with pytest.raises(PayloadError) as invalidated:
+                source.entry_view(0)
+            assert invalidated.value.symbol == 'VIEW_INVALIDATED'
+
+        with blob_plan(data) as plan, plan.execute(BuildPolicy.ALLOW_STAGING).payload as source:
+            shared_source['payload'] = source
+            with proxy.frames(source) as stream:
+                with next(stream) as received:
+                    assert blob_bytes(received) == data
+                assert next(stream, None) is None
+            with pytest.raises(PayloadError) as invalidated:
+                source.entry_view(0)
+            assert invalidated.value.symbol == 'VIEW_INVALIDATED'
+    finally:
+        if proxy is not None:
+            cc.close(proxy)
+        client.shutdown(timeout=5)
+        server.shutdown(timeout=5)
+
+
+@pytest.mark.timeout(30)
+def test_direct_same_process_deferred_plan_spec_mismatch_error_codes() -> None:
+    data = b'd' * 1024
+
+    class BadStreamResource(BlobExchangeResource):
+        def frames(self, payload: Payload):
+            yield blob_plan(self.data, wrong=True)
+
+    cc.register(BlobExchange, BadStreamResource(data), name='direct-plan-errors')
+    proxy = cc.connect(BlobExchange, name='direct-plan-errors')
+    try:
+        assert proxy.client._mode == 'thread'  # noqa: SLF001
+
+        with blob_plan(data, wrong=True) as bad_input:
+            with pytest.raises(error.SerializationError) as caught:
+                proxy.echo(bad_input)
+        assert caught.value.code == error.ErrorCode.ClientInputSerializing
+        assert caught.value.details['fastdb_symbol'] == 'DIGEST_MISMATCH'
+
+        with pytest.raises(error.SerializationError) as caught:
+            proxy.build(True)
+        assert caught.value.code == error.ErrorCode.ResourceOutputSerializing
+        assert caught.value.details['fastdb_symbol'] == 'DIGEST_MISMATCH'
+
+        with blob_plan(data, wrong=True) as bad_input:
+            with pytest.raises(error.SerializationError) as caught:
+                with proxy.frames(bad_input) as stream:
+                    next(stream)
+        assert caught.value.code == error.ErrorCode.ClientInputSerializing
+        assert caught.value.details['fastdb_symbol'] == 'DIGEST_MISMATCH'
+
+        with blob_plan(data) as good_input:
+            with pytest.raises(error.SerializationError) as caught:
+                with proxy.frames(good_input) as stream:
+                    next(stream)
+        assert caught.value.code == error.ErrorCode.ResourceOutputSerializing
+        assert caught.value.details['fastdb_symbol'] == 'DIGEST_MISMATCH'
+    finally:
         cc.close(proxy)

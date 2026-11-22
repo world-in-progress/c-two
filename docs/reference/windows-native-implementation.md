@@ -30,7 +30,7 @@ The stages and chronological evidence below retain the claims and open items of 
 
 ## C-Two 0.8.0 source (2026-10-22)
 
-The active dependency pins now select FastDB 0.2.4, source `f82fa13adeae2b87a295bf984821c85c44b55a3d`, for Python, Rust, native source builds and the official CoreSDK. The existing SDK preparation helper also recognizes its `aarch64-pc-windows-msvc` bundle and requires the same verified `lib/fastdb.dll` and `lib/fastdb.lib` pair as Windows x64. C-Two's release gates now include native Windows 11 ARM64 source validation, five Python ABI rows from 3.11 through 3.14t, an ARM64 c3 executable and standard-user consumers. The gates check native Python, Rust and Node architecture before execution; FastDB availability alone is not accepted as runtime evidence. Published 0.7.6 keeps its historical `fastdb4py==0.2.2` extra; the source/run records below retain their actual FastDB inputs.
+The active dependency pins now select FastDB 0.3.0, source `ff097cca9c29cadc289e2a437f4720ecc56015c4`, for Python, Rust, native source builds and the official CoreSDK. The existing SDK preparation helper also recognizes its `aarch64-pc-windows-msvc` bundle and requires the same verified `lib/fastdb.dll` and `lib/fastdb.lib` pair as Windows x64. C-Two's release gates now include native Windows 11 ARM64 source validation, five Python ABI rows from 3.11 through 3.14t, an ARM64 c3 executable and standard-user consumers. The gates check native Python, Rust and Node architecture before execution; FastDB availability alone is not accepted as runtime evidence. Published 0.7.6 keeps its historical `fastdb4py==0.2.2` extra; the source/run records below retain their actual FastDB inputs.
 
 ## Historical validation status (2026-10-07)
 

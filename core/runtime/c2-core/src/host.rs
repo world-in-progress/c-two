@@ -11,6 +11,7 @@ use c2_contract::{
     ValidatedContractDescriptor, validate_contract_text_field, validate_expected_route_contract,
 };
 use c2_error::{C2Error, ErrorCode};
+use c2_mem::{RecycledBytes, WritableSlab};
 use c2_server::{
     AccessLevel, ConcurrencyMode, CrmCallback, CrmError, CrmStream, CrmStreamCallback,
     CrmStreamItem, ResponseMeta, RouteBuildSpec, RouteConcurrencyHandle, SchedulerAcquireError,
@@ -35,6 +36,38 @@ pub struct MethodDefinition {
     pub access: MethodAccess,
 }
 
+/// Allocation access to the response pool advertised by this Host.
+pub struct ResponseSink {
+    pool: Arc<c2_server::ResponsePool>,
+}
+
+impl ResponseSink {
+    /// Try to allocate a writable response backing above the inline threshold.
+    pub fn try_alloc_slab(&self, len: usize) -> Result<Option<WritableSlab>, String> {
+        self.pool.try_alloc_slab(c2_config::SHM_THRESHOLD, len)
+    }
+
+    /// Seal a filled slab allocated from this sink into an encoded SHM response.
+    pub fn finish_slab(&self, slab: WritableSlab) -> Result<EncodedResponse, String> {
+        self.pool.finish_slab(slab).map(EncodedResponse::Shm)
+    }
+}
+
+/// Encoded response with either owned bytes or an unpublished SHM allocation.
+pub enum EncodedResponse {
+    Inline(Vec<u8>),
+    Shm(c2_server::PreparedShmResponse),
+}
+
+impl EncodedResponse {
+    fn into_meta(self) -> ResponseMeta {
+        match self {
+            Self::Inline(bytes) => ResponseMeta::Inline(bytes),
+            Self::Shm(prepared) => ResponseMeta::ShmAlloc(prepared),
+        }
+    }
+}
+
 /// Opaque-byte service boundary implemented by generated host adapters.
 ///
 /// The service receives an owned local copy, independent of transport storage.
@@ -42,6 +75,16 @@ pub struct MethodDefinition {
 /// invalidate callback-scoped payload owners before dropping the local bytes.
 pub trait EncodedService: Send + Sync + 'static {
     fn invoke(&self, method_index: u16, request: Vec<u8>) -> Result<Vec<u8>, C2Error>;
+
+    fn invoke_into(
+        &self,
+        method_index: u16,
+        request: RecycledBytes,
+        _sink: &ResponseSink,
+    ) -> Result<EncodedResponse, C2Error> {
+        self.invoke(method_index, request.into_vec())
+            .map(EncodedResponse::Inline)
+    }
 }
 
 /// A resource-owned item whose encoding is deferred until storage admission.
@@ -67,6 +110,14 @@ pub trait EncodedStreamService: EncodedService {
         method_index: u16,
         request: Vec<u8>,
     ) -> Result<Box<dyn EncodedStream>, C2Error>;
+
+    fn open_stream_recycled(
+        &self,
+        method_index: u16,
+        request: RecycledBytes,
+    ) -> Result<Box<dyn EncodedStream>, C2Error> {
+        self.open_stream(method_index, request.into_vec())
+    }
 }
 
 /// Language-neutral execution policy shared by remote dispatch and any
@@ -1745,6 +1796,19 @@ impl CrmCallback for CoreCallback {
             .map(ResponseMeta::Inline)
             .map_err(|error| CrmError::UserError(error.to_wire_bytes()))
     }
+
+    fn invoke_recycled(
+        &self,
+        _: &str,
+        index: u16,
+        request: RecycledBytes,
+        pool: Arc<c2_server::ResponsePool>,
+    ) -> Result<ResponseMeta, CrmError> {
+        self.service
+            .invoke_into(index, request, &ResponseSink { pool })
+            .map(EncodedResponse::into_meta)
+            .map_err(|error| CrmError::UserError(error.to_wire_bytes()))
+    }
 }
 
 struct CoreStreamCallback {
@@ -1764,6 +1828,19 @@ impl CrmCallback for CoreStreamCallback {
             .map(ResponseMeta::Inline)
             .map_err(|error| CrmError::UserError(error.to_wire_bytes()))
     }
+
+    fn invoke_recycled(
+        &self,
+        _: &str,
+        index: u16,
+        request: RecycledBytes,
+        pool: Arc<c2_server::ResponsePool>,
+    ) -> Result<ResponseMeta, CrmError> {
+        self.service
+            .invoke_into(index, request, &ResponseSink { pool })
+            .map(EncodedResponse::into_meta)
+            .map_err(|error| CrmError::UserError(error.to_wire_bytes()))
+    }
 }
 
 impl CrmStreamCallback for CoreStreamCallback {
@@ -1776,6 +1853,19 @@ impl CrmStreamCallback for CoreStreamCallback {
     ) -> Result<Box<dyn CrmStream>, CrmError> {
         self.service
             .open_stream(index, request)
+            .map(|stream| Box::new(CoreStream(stream)) as Box<dyn CrmStream>)
+            .map_err(|error| CrmError::UserError(error.to_wire_bytes()))
+    }
+
+    fn open_stream_recycled(
+        &self,
+        _: &str,
+        index: u16,
+        request: RecycledBytes,
+        _: Arc<c2_server::ResponsePool>,
+    ) -> Result<Box<dyn CrmStream>, CrmError> {
+        self.service
+            .open_stream_recycled(index, request)
             .map(|stream| Box::new(CoreStream(stream)) as Box<dyn CrmStream>)
             .map_err(|error| CrmError::UserError(error.to_wire_bytes()))
     }
@@ -2013,7 +2103,7 @@ mod lifecycle_tests {
         let bytes = vec![3; 512];
         let original = bytes.as_ptr() as usize;
         let response = callback
-            .invoke("echo", 1, bytes, server.response_pool_arc())
+            .invoke_recycled("echo", 1, bytes.into(), server.response_pool_arc())
             .unwrap();
         assert_eq!(
             service.0.load(std::sync::atomic::Ordering::Acquire),
@@ -2024,6 +2114,116 @@ mod lifecycle_tests {
         };
         assert_eq!(bytes.as_ptr() as usize, original);
         drop((server, runtime));
+        close_receipt_root(root);
+    }
+
+    #[test]
+    fn unary_slabs_use_one_client_charge_and_dispatch_into_the_response_sink() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use crate::{CallBudget, CallOptions, CallTimeout, Connect};
+
+        const SIZE: usize = 512 * 1024;
+        #[derive(Default)]
+        struct SlabEcho {
+            last_request: AtomicUsize,
+        }
+        impl EncodedService for SlabEcho {
+            fn invoke(&self, _: u16, _: Vec<u8>) -> Result<Vec<u8>, C2Error> {
+                panic!("IPC dispatch must call invoke_into")
+            }
+
+            fn invoke_into(
+                &self,
+                _: u16,
+                request: RecycledBytes,
+                sink: &ResponseSink,
+            ) -> Result<EncodedResponse, C2Error> {
+                assert_eq!(request.len(), SIZE);
+                let ptr = request.as_ptr() as usize;
+                let previous = self.last_request.swap(ptr, Ordering::Relaxed);
+                if previous != 0 {
+                    assert_eq!(ptr, previous, "SHM request copy must reuse the warm buffer");
+                }
+                assert!(sink.try_alloc_slab(1).unwrap().is_none());
+                let mut slab = sink.try_alloc_slab(SIZE).unwrap().expect("response SHM");
+                slab.as_mut_slice().copy_from_slice(&request);
+                Ok(sink.finish_slab(slab).unwrap())
+            }
+        }
+
+        let (runtime, root) = receipt_test_runtime();
+        runtime
+            .update_client_config(crate::ClientConfigPatch {
+                domain_limits: crate::DomainLimitsPatch {
+                    memory_budget_bytes: crate::ConfigField::Set(SIZE as u64),
+                    ..Default::default()
+                },
+            })
+            .unwrap();
+        let host = runtime
+            .host(
+                HostOptions::default()
+                    .without_relay()
+                    .with_memory_budget_bytes(4 * SIZE as u64),
+            )
+            .unwrap();
+        let mut definition = local_echo_definition();
+        definition.service = Arc::new(SlabEcho::default());
+        let expected = definition.expected_route().clone();
+        let registration = host.register(definition).unwrap();
+        let client = runtime
+            .connect(
+                expected,
+                Connect::DirectIpc {
+                    address: host.local_endpoint().address().into(),
+                },
+            )
+            .unwrap();
+        let budget = runtime.client_domain_observer().unwrap();
+
+        let zero = CallBudget::new(
+            CallOptions::with_timeout(CallTimeout::After(Duration::ZERO)),
+            None,
+        )
+        .unwrap();
+        let Err(Error::Semantic(error)) = client.begin_call_with_budget("echo", zero) else {
+            panic!("zero deadline must reject slab preparation");
+        };
+        assert_eq!(error.code, ErrorCode::CallDeadlineExceeded);
+        assert_eq!(budget.snapshot().memory.used_bytes, 0);
+
+        let mut call = client.begin_call("echo").unwrap();
+        assert!(call.try_alloc_request_slab(1).unwrap().is_none());
+        call.charge_input(SIZE as u64).unwrap();
+        let mut slab = call
+            .try_alloc_request_slab(SIZE)
+            .unwrap()
+            .expect("request SHM");
+        slab.as_mut_slice().fill(0x42);
+        assert_eq!(budget.snapshot().memory.used_bytes, SIZE as u64);
+        let held = call.encode_slab(slab).unwrap().call_held().unwrap();
+        assert_eq!(held.bytes().len(), SIZE);
+        assert!(held.bytes().iter().all(|&byte| byte == 0x42));
+        assert_eq!(budget.snapshot().memory.peak_bytes, SIZE as u64);
+        drop(held);
+
+        let end = Instant::now() + Duration::from_secs(5);
+        while budget.snapshot().memory.used_bytes != 0 {
+            assert!(Instant::now() < end, "request loan did not settle");
+            std::thread::yield_now();
+        }
+        let mut call = client.begin_call("echo").unwrap();
+        let mut slab = call
+            .try_alloc_request_slab(SIZE)
+            .unwrap()
+            .expect("request SHM");
+        slab.as_mut_slice().fill(0x23);
+        let owned = call.encode_slab(slab).unwrap().call_owned().unwrap();
+        assert_eq!(owned.len(), SIZE);
+        assert!(owned.iter().all(|&byte| byte == 0x23));
+        assert!(host.shutdown().runtime_barrier_error.is_none());
+        drop((registration, host, client, runtime));
         close_receipt_root(root);
     }
 

@@ -1,6 +1,6 @@
 //! Capacity accounting for one client, Host, or relay domain.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, TryReserveError, VecDeque};
 use std::error::Error;
 use std::fmt;
 use std::future::Future;
@@ -12,6 +12,10 @@ use std::task::{Context, Poll, Waker};
 use std::time::Instant;
 
 use c2_config::DomainLimits;
+
+const WARM_BUFFER_MIN_BYTES: usize = 256 * 1024;
+const WARM_BUFFER_MAX_COUNT: usize = 4;
+const WARM_BUFFER_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BudgetCellSnapshot {
@@ -211,6 +215,64 @@ struct DomainState {
     operations: RetentionSnapshot,
     active_subscriptions: u64,
     memory_waiters: AsyncWaiters,
+    warm_buffers: VecDeque<Vec<u8>>,
+    warm_idle_bytes: u64,
+}
+
+impl DomainState {
+    // Return evictions to the caller so allocation storage is freed after
+    // unlocking the domain.
+    fn evict_warm_to(&mut self, bytes: u64, count: usize) -> Vec<Vec<u8>> {
+        let mut evicted = Vec::new();
+        while self.warm_idle_bytes > bytes || self.warm_buffers.len() > count {
+            let oldest = self.warm_buffers.pop_front().expect("warm buffer to evict");
+            self.warm_idle_bytes -= oldest.capacity() as u64;
+            evicted.push(oldest);
+        }
+        evicted
+    }
+
+    fn evict_for_admission(&mut self) -> Vec<Vec<u8>> {
+        self.evict_warm_to(self.memory.available(), WARM_BUFFER_MAX_COUNT)
+    }
+
+    fn warm_capacity(&self) -> u64 {
+        self.memory.available().min(WARM_BUFFER_MAX_BYTES)
+    }
+
+    fn recycle_warm_vec(&mut self, bytes: &mut Vec<u8>) -> Vec<Vec<u8>> {
+        if self.operations.closed {
+            return Vec::new();
+        }
+        let cap = bytes.capacity() as u64;
+        let limit = self.warm_capacity();
+        if cap < WARM_BUFFER_MIN_BYTES as u64 || cap > limit {
+            return Vec::new();
+        }
+        let evicted = self.evict_warm_to(limit - cap, WARM_BUFFER_MAX_COUNT - 1);
+        bytes.clear();
+        self.warm_buffers.push_back(std::mem::take(bytes));
+        self.warm_idle_bytes += cap;
+        evicted
+    }
+
+    fn take_warm_vec(&mut self, min_len: usize, max_cap: usize) -> Option<Vec<u8>> {
+        let (index, cap) = self
+            .warm_buffers
+            .iter()
+            .map(Vec::capacity)
+            .enumerate()
+            .filter(|&(_, cap)| (min_len..=max_cap).contains(&cap))
+            .min_by_key(|&(_, cap)| cap)?;
+        self.warm_idle_bytes -= cap as u64;
+        self.warm_buffers.remove(index)
+    }
+}
+
+fn allocate_exact_vec(len: usize) -> Result<Vec<u8>, TryReserveError> {
+    let mut bytes = Vec::new();
+    bytes.try_reserve_exact(len)?;
+    Ok(bytes)
 }
 
 #[derive(Debug)]
@@ -236,19 +298,76 @@ impl Shared {
         }
     }
 
+    fn take_warm_vec(&self, len: usize) -> Option<Vec<u8>> {
+        if len < WARM_BUFFER_MIN_BYTES {
+            return None;
+        }
+        self.lock().take_warm_vec(len, len.saturating_add(len / 4))
+    }
+
+    fn take_warm_vec_for_reservation(&self, reserved: &mut u64, len: usize) -> Option<Vec<u8>> {
+        if len < WARM_BUFFER_MIN_BYTES {
+            return None;
+        }
+        let slack_cap = len.saturating_add(len / 4);
+        let (bytes, evicted) = {
+            let mut state = self.lock();
+            let fit_cap = usize::try_from(reserved.saturating_add(state.memory.available()))
+                .unwrap_or(usize::MAX);
+            let max_cap = slack_cap.min(fit_cap);
+            let Some(bytes) = state.take_warm_vec(len, max_cap) else {
+                return None;
+            };
+            let additional = (bytes.capacity() as u64).saturating_sub(*reserved);
+            let evicted = if additional > 0 {
+                state.memory.admit(additional);
+                *reserved += additional;
+                state.evict_for_admission()
+            } else {
+                Vec::new()
+            };
+            (bytes, evicted)
+        };
+        drop(evicted);
+        Some(bytes)
+    }
+
+    fn recycle_vec(&self, mut bytes: Vec<u8>) {
+        if bytes.capacity() >= WARM_BUFFER_MIN_BYTES {
+            let evicted = self.lock().recycle_warm_vec(&mut bytes);
+            drop(evicted);
+        }
+    }
+
     fn release_memory(&self, bytes: u64) {
+        self.release_memory_and_recycle(bytes, Vec::new());
+    }
+
+    fn release_memory_and_recycle(&self, bytes: u64, mut buffer: Vec<u8>) {
         if bytes == 0 {
             return;
         }
-        let waiters = {
+        let (waiters, evicted) = {
             let mut state = self.lock();
             state.memory.release(bytes);
-            state.memory_waiters.take()
+            let evicted = state.recycle_warm_vec(&mut buffer);
+            (state.memory_waiters.take(), evicted)
         };
         self.memory_changed.notify_all();
         for waiter in waiters {
             waiter.wake();
         }
+        drop(evicted);
+    }
+
+    fn try_admit_memory(&self, bytes: u64, requested: u128) -> Result<(), PayloadBufferError> {
+        let evicted = {
+            let mut state = self.lock();
+            state.memory.try_admit_memory(bytes, requested)?;
+            state.evict_for_admission()
+        };
+        drop(evicted);
+        Ok(())
     }
 }
 
@@ -280,6 +399,8 @@ impl DomainBudget {
                     },
                     active_subscriptions: 0,
                     memory_waiters: AsyncWaiters::default(),
+                    warm_buffers: VecDeque::new(),
+                    warm_idle_bytes: 0,
                 }),
                 memory_changed: Condvar::new(),
             }),
@@ -300,11 +421,20 @@ impl DomainBudget {
         }
     }
 
+    /// Acquire an empty local buffer without taking a memory reservation.
+    pub fn allocate_vec(&self, len: usize) -> Result<Vec<u8>, TryReserveError> {
+        match self.shared.take_warm_vec(len) {
+            Some(bytes) => Ok(bytes),
+            None => allocate_exact_vec(len),
+        }
+    }
+
+    pub fn recycle_vec(&self, bytes: Vec<u8>) {
+        self.shared.recycle_vec(bytes);
+    }
+
     pub fn try_reserve_memory(&self, bytes: u64) -> Result<MemoryReservation, PayloadBufferError> {
-        self.shared
-            .lock()
-            .memory
-            .try_admit_memory(bytes, bytes.into())?;
+        self.shared.try_admit_memory(bytes, bytes.into())?;
         Ok(MemoryReservation {
             shared: Arc::clone(&self.shared),
             bytes,
@@ -315,6 +445,16 @@ impl DomainBudget {
     /// enforce their own deadline.
     pub fn reserve_memory(&self, bytes: u64) -> ReserveFuture<'_> {
         ReserveFuture {
+            budget: self,
+            bytes,
+            waiter: None,
+        }
+    }
+
+    /// Waits for capacity and atomically claims a matching warm local buffer
+    /// before evicting other idle buffers.
+    pub fn reserve_vec(&self, bytes: u64) -> ReserveVecFuture<'_> {
+        ReserveVecFuture {
             budget: self,
             bytes,
             waiter: None,
@@ -334,6 +474,9 @@ impl DomainBudget {
             }
             if bytes <= state.memory.available() {
                 state.memory.admit(bytes);
+                let evicted = state.evict_for_admission();
+                drop(state);
+                drop(evicted);
                 return Ok(MemoryReservation {
                     shared: Arc::clone(&self.shared),
                     bytes,
@@ -439,8 +582,16 @@ impl DomainBudget {
     }
 
     /// Stop new calls; admitted work can still reserve memory and file spill.
+    ///
+    /// Drains idle warm buffers so a retiring domain does not retain cached
+    /// heap capacity behind surviving observers or holds.
     pub fn close_operations(&self) {
-        self.shared.lock().operations.closed = true;
+        let evicted = {
+            let mut state = self.shared.lock();
+            state.operations.closed = true;
+            state.evict_warm_to(0, 0)
+        };
+        drop(evicted);
     }
 }
 
@@ -497,15 +648,17 @@ impl Future for ReserveFuture<'_> {
         let this = self.get_mut();
         let waker = cx.waker().clone();
         let mut state = this.budget.shared.lock();
-        let memory = &mut state.memory;
-        let result = match memory.check_memory_request(this.bytes.into()) {
-            Err(error) => Err(error),
-            Ok(()) if this.bytes <= memory.available() => {
-                memory.admit(this.bytes);
-                Ok(MemoryReservation {
-                    shared: Arc::clone(&this.budget.shared),
-                    bytes: this.bytes,
-                })
+        let (result, evicted) = match state.memory.check_memory_request(this.bytes.into()) {
+            Err(error) => (Err(error), Vec::new()),
+            Ok(()) if this.bytes <= state.memory.available() => {
+                state.memory.admit(this.bytes);
+                (
+                    Ok(MemoryReservation {
+                        shared: Arc::clone(&this.budget.shared),
+                        bytes: this.bytes,
+                    }),
+                    state.evict_for_admission(),
+                )
             }
             Ok(()) => {
                 let old_waker = state.memory_waiters.register(&mut this.waiter, waker);
@@ -517,11 +670,83 @@ impl Future for ReserveFuture<'_> {
         let old_waker = state.memory_waiters.remove(&mut this.waiter);
         drop(state);
         drop(old_waker);
+        drop(evicted);
         Poll::Ready(result)
     }
 }
 
 impl Drop for ReserveFuture<'_> {
+    fn drop(&mut self) {
+        let waker = self
+            .budget
+            .shared
+            .lock()
+            .memory_waiters
+            .remove(&mut self.waiter);
+        drop(waker);
+    }
+}
+
+#[must_use = "poll or await the reservation before using storage"]
+pub struct ReserveVecFuture<'a> {
+    budget: &'a DomainBudget,
+    bytes: u64,
+    waiter: Option<u64>,
+}
+
+impl Future for ReserveVecFuture<'_> {
+    type Output = Result<(Option<Vec<u8>>, MemoryReservation), PayloadBufferError>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        let waker = cx.waker().clone();
+        let mut state = this.budget.shared.lock();
+        let (result, evicted) = match state.memory.check_memory_request(this.bytes.into()) {
+            Err(error) => (Err(error), Vec::new()),
+            Ok(()) if this.bytes <= state.memory.available() => {
+                state.memory.admit(this.bytes);
+                let mut reserved = this.bytes;
+                let warm = usize::try_from(this.bytes)
+                    .ok()
+                    .filter(|&len| len >= WARM_BUFFER_MIN_BYTES)
+                    .and_then(|len| {
+                        let avail = usize::try_from(state.memory.available()).unwrap_or(usize::MAX);
+                        let max_cap = len.saturating_add((len / 4).min(avail));
+                        let bytes = state.take_warm_vec(len, max_cap)?;
+                        let extra = (bytes.capacity() as u64).saturating_sub(this.bytes);
+                        if extra > 0 {
+                            state.memory.admit(extra);
+                            reserved += extra;
+                        }
+                        Some(bytes)
+                    });
+                (
+                    Ok((
+                        warm,
+                        MemoryReservation {
+                            shared: Arc::clone(&this.budget.shared),
+                            bytes: reserved,
+                        },
+                    )),
+                    state.evict_for_admission(),
+                )
+            }
+            Ok(()) => {
+                let old_waker = state.memory_waiters.register(&mut this.waiter, waker);
+                drop(state);
+                drop(old_waker);
+                return Poll::Pending;
+            }
+        };
+        let old_waker = state.memory_waiters.remove(&mut this.waiter);
+        drop(state);
+        drop(old_waker);
+        drop(evicted);
+        Poll::Ready(result)
+    }
+}
+
+impl Drop for ReserveVecFuture<'_> {
     fn drop(&mut self) {
         let waker = self
             .budget
@@ -559,18 +784,38 @@ pub struct MemoryReservation {
 }
 
 impl MemoryReservation {
+    pub fn domain_budget(&self) -> DomainBudget {
+        DomainBudget {
+            shared: Arc::clone(&self.shared),
+        }
+    }
+
     pub fn bytes(&self) -> u64 {
         self.bytes
     }
 
     pub fn try_grow(&mut self, additional: u64) -> Result<(), PayloadBufferError> {
         let requested = u128::from(self.bytes) + u128::from(additional);
-        self.shared
-            .lock()
-            .memory
-            .try_admit_memory(additional, requested)?;
+        self.shared.try_admit_memory(additional, requested)?;
         self.bytes += additional;
         Ok(())
+    }
+
+    /// Acquire an empty vector for a length already covered by this reservation.
+    pub fn allocate_vec(&mut self, len: usize) -> Result<Vec<u8>, TryReserveError> {
+        assert!(
+            len as u64 <= self.bytes,
+            "length exceeds memory reservation"
+        );
+        if let Some(bytes) = self.shared.take_warm_vec_for_reservation(&mut self.bytes, len) {
+            return Ok(bytes);
+        }
+        allocate_exact_vec(len)
+    }
+
+    fn release_and_recycle(&mut self, bytes: Vec<u8>) {
+        let reserved = std::mem::take(&mut self.bytes);
+        self.shared.release_memory_and_recycle(reserved, bytes);
     }
 
     /// Return unused bytes after shrinking or freeing their storage.
@@ -612,12 +857,82 @@ impl Drop for MemoryReservation {
     }
 }
 
+/// Local bytes that can return their allocation to a domain's warm pool.
+///
+/// Holds only a weak reference to the domain so a detached local buffer never
+/// keeps a retired domain alive after shutdown.
+#[derive(Debug)]
+pub struct RecycledBytes {
+    bytes: Vec<u8>,
+    budget: Option<Weak<Shared>>,
+}
+
+impl RecycledBytes {
+    pub fn new(bytes: Vec<u8>, budget: DomainBudget) -> Self {
+        Self {
+            bytes,
+            budget: Some(Arc::downgrade(&budget.shared)),
+        }
+    }
+
+    pub fn owned(bytes: Vec<u8>) -> Self {
+        Self {
+            bytes,
+            budget: None,
+        }
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    pub fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+
+    pub fn into_vec(mut self) -> Vec<u8> {
+        std::mem::take(&mut self.bytes)
+    }
+}
+
+impl Deref for RecycledBytes {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+
+impl AsRef<[u8]> for RecycledBytes {
+    fn as_ref(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+
+impl From<Vec<u8>> for RecycledBytes {
+    fn from(bytes: Vec<u8>) -> Self {
+        Self::owned(bytes)
+    }
+}
+
+impl Drop for RecycledBytes {
+    fn drop(&mut self) {
+        if let Some(shared) = self.budget.as_ref().and_then(Weak::upgrade) {
+            shared.recycle_vec(std::mem::take(&mut self.bytes));
+        }
+    }
+}
+
 /// Buffer and its charge for the actual allocated capacity. Suitable for
 /// `Bytes::from_owner`, which retains this owner until the final slice drops.
 #[derive(Debug)]
 pub struct BudgetedBuffer {
     bytes: Vec<u8>,
-    reservation: MemoryReservation,
+    reservation: Option<MemoryReservation>,
 }
 
 impl BudgetedBuffer {
@@ -626,15 +941,29 @@ impl BudgetedBuffer {
             bytes.capacity() as u64 <= reservation.bytes(),
             "buffer allocation exceeds its memory reservation"
         );
-        Self { bytes, reservation }
+        Self {
+            bytes,
+            reservation: Some(reservation),
+        }
     }
 
     pub fn capacity(&self) -> usize {
         self.bytes.capacity()
     }
 
-    pub fn into_parts(self) -> (Vec<u8>, MemoryReservation) {
-        (self.bytes, self.reservation)
+    pub fn into_parts(mut self) -> (Vec<u8>, MemoryReservation) {
+        (
+            std::mem::take(&mut self.bytes),
+            self.reservation.take().expect("buffer reservation"),
+        )
+    }
+}
+
+impl Drop for BudgetedBuffer {
+    fn drop(&mut self) {
+        if let Some(mut reservation) = self.reservation.take() {
+            reservation.release_and_recycle(std::mem::take(&mut self.bytes));
+        }
     }
 }
 

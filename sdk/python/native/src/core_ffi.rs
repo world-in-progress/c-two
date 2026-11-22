@@ -1,9 +1,10 @@
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::ptr::NonNull;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use parking_lot::Mutex;
 use pyo3::buffer::PyBuffer;
-use pyo3::exceptions::{PyBufferError, PyValueError};
+use pyo3::exceptions::{PyBufferError, PyRuntimeError, PyValueError};
 use pyo3::ffi;
 use pyo3::prelude::*;
 use pyo3::pybacked::PyBackedBytes;
@@ -11,10 +12,12 @@ use pyo3::types::{PyBytes, PyDict, PyList};
 
 use c2_core::memory::LocalCopyGuard;
 use c2_core::{
-    CallBudget, CallOptions, CallTimeout, Client, EncodedService, EncodedStreamService,
-    HeldResponse, LifecycleError, ObservedPath, PreparedCall, ServerFailure,
+    CallBudget, CallOptions, CallTimeout, Client, EncodedResponse, EncodedService,
+    EncodedStreamService, HeldResponse, LifecycleError, ObservedPath, PreparedCall, ResponseSink,
+    ServerFailure,
 };
 use c2_error::{C2Error, ErrorCode};
+use c2_mem::{RecycledBytes, WritableSlab};
 
 use crate::config_ffi::PyConnectAttempt;
 use crate::core_error_ffi::{core_error_to_py, lifecycle_error_to_py};
@@ -136,52 +139,67 @@ impl PyNativePreparedCall {
         &self,
         py: Python<'_>,
         data: &Bound<'_, PyAny>,
+        release_input: bool,
         finish: impl FnOnce(c2_core::EncodedCall) -> Result<R, c2_core::Error> + Send,
     ) -> PyResult<R> {
-        let consumed =
-            || PyValueError::new_err("prepared call has already been consumed or closed");
+        let mut prepared = py.detach(|| self.take()).ok_or_else(|| {
+            PyValueError::new_err("prepared call has already been consumed or closed")
+        })?;
         if let Ok(bytes) = data.cast_exact::<PyBytes>() {
-            // Access the Python object only under the GIL. This owned, Send
-            // carrier pins exact immutable bytes without a buffer export or
-            // borrowed slice across budget admission. It has no user finalizer.
             let owner = PyBackedBytes::from(bytes.clone());
-            let nbytes = owner.len();
-            // Budget admission can wait. Keep no Python borrow or buffer export
-            // across that wait, and do not copy until the reservation succeeds.
-            // The Core-owned factory copies only after encode reserves B, fully
-            // detached from Python, even if the caller's deadline expires.
             return py
                 .detach(move || {
-                    let prepared = self.take()?;
-                    Some(
+                    let nbytes = owner.len();
+                    if let Some(mut slab) = prepared.try_alloc_request_slab(nbytes)? {
+                        slab.as_mut_slice().copy_from_slice(&owner);
+                        prepared.encode_slab(slab).and_then(finish)
+                    } else {
                         prepared
                             .encode(nbytes, move || Ok(owner.to_vec()))
-                            .and_then(finish),
-                    )
+                            .and_then(finish)
+                    }
                 })
-                .ok_or_else(consumed)?
                 .map_err(core_error_to_py);
         }
-        // Consume before input validation so an invalid buffer is single use.
-        let mut prepared = py.detach(|| self.take()).ok_or_else(consumed)?;
-        // A read-only memoryview can still alias mutable backing. Snapshot all
-        // non-bytes buffers on the caller under the GIL after native charging;
-        // no raw borrowed pointer or mutable exporter crosses the handoff.
-        let nbytes = PyBuffer::<u8>::get(data)?.len_bytes();
-        prepared = py
-            .detach(move || {
-                prepared.charge_input(nbytes as u64)?;
-                Ok::<_, c2_core::Error>(prepared)
+
+        let plan_len = deferred_plan_len(data)?;
+        // Do not keep a Python buffer export across a potentially blocking
+        // input admission. Recheck the length when reacquiring the export.
+        let nbytes = match plan_len {
+            Some(len) => len,
+            None => PyBuffer::<u8>::get(data)?.len_bytes(),
+        };
+        let slab = py
+            .detach(|| {
+                let slab = prepared.try_alloc_request_slab(nbytes)?;
+                if slab.is_none() {
+                    prepared.charge_input(nbytes as u64)?;
+                }
+                Ok::<_, c2_core::Error>(slab)
             })
             .map_err(core_error_to_py)?;
-        let buffer = PyBuffer::<u8>::get(data)?;
-        if buffer.len_bytes() != nbytes {
-            return Err(PyValueError::new_err(
-                "buffer size changed during payload-budget admission",
-            ));
+        if let Some(mut slab) = slab {
+            if plan_len.is_some() {
+                slab = write_deferred_slab(data, slab)?;
+            } else {
+                checked_buffer(data, nbytes)?.copy_to_slice(py, slab.as_mut_slice())?;
+                if release_input {
+                    data.call_method0("release")?;
+                }
+            }
+            return py
+                .detach(move || prepared.encode_slab(slab).and_then(finish))
+                .map_err(core_error_to_py);
         }
-        let request = snapshot_python_buffer(py, &buffer)?;
-        drop(buffer);
+        let request = if plan_len.is_some() {
+            materialize_deferred_plan(data, nbytes)?
+        } else {
+            let bytes = snapshot_python_buffer(py, &checked_buffer(data, nbytes)?)?;
+            if release_input {
+                data.call_method0("release")?;
+            }
+            bytes
+        };
         py.detach(move || prepared.encode_vec(request).and_then(finish))
             .map_err(core_error_to_py)
     }
@@ -204,17 +222,25 @@ impl PyNativePreparedCall {
             .map_err(core_error_to_py)
     }
 
-    fn call(&self, py: Python<'_>, data: &Bound<'_, PyAny>) -> PyResult<PyCoreResponse> {
-        self.execute(py, data, c2_core::EncodedCall::call_held)
+    #[pyo3(signature = (data, *, release_input = false))]
+    fn call(
+        &self,
+        py: Python<'_>,
+        data: &Bound<'_, PyAny>,
+        release_input: bool,
+    ) -> PyResult<PyCoreResponse> {
+        self.execute(py, data, release_input, c2_core::EncodedCall::call_held)
             .map(PyCoreResponse::new)
     }
 
+    #[pyo3(signature = (data, *, release_input = false))]
     fn stream(
         &self,
         py: Python<'_>,
         data: &Bound<'_, PyAny>,
+        release_input: bool,
     ) -> PyResult<crate::stream_ffi::PyCoreResponseStream> {
-        self.execute(py, data, c2_core::EncodedCall::stream)
+        self.execute(py, data, release_input, c2_core::EncodedCall::stream)
             .map(crate::stream_ffi::PyCoreResponseStream::new)
     }
 
@@ -342,7 +368,7 @@ impl PyCoreClient {
         method_name: &str,
         data: &Bound<'_, PyAny>,
     ) -> PyResult<PyCoreResponse> {
-        self.begin_call(py, method_name)?.call(py, data)
+        self.begin_call(py, method_name)?.call(py, data, false)
     }
 
     /// Subscribe to a topic declared on this client's bound route contract.
@@ -394,9 +420,11 @@ impl PyCoreClient {
 #[pyclass(name = "ResponseBuffer", frozen, skip_from_py_object)]
 pub(crate) struct PyCoreResponse {
     inner: Mutex<Option<HeldResponse>>,
+    retired_pinned: Mutex<Option<HeldResponse>>,
     local_copy: Mutex<Option<LocalCopyGuard>>,
     data_len: usize,
     exports: AtomicU32,
+    invalidated: AtomicBool,
     #[cfg(test)]
     before_release: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
@@ -406,9 +434,11 @@ impl PyCoreResponse {
         let data_len = held.bytes().len();
         Self {
             inner: Mutex::new(Some(held)),
+            retired_pinned: Mutex::new(None),
             local_copy: Mutex::new(None),
             data_len,
             exports: AtomicU32::new(0),
+            invalidated: AtomicBool::new(false),
             #[cfg(test)]
             before_release: Mutex::new(None),
         }
@@ -451,6 +481,11 @@ impl PyCoreResponse {
             .is_none_or(HeldResponse::is_released)
     }
 
+    #[getter]
+    fn export_count(&self) -> u32 {
+        self.exports.load(Ordering::Acquire)
+    }
+
     fn release(&self) -> PyResult<()> {
         #[cfg(test)]
         if let Some(pause) = self.before_release.lock().take() {
@@ -466,42 +501,73 @@ impl PyCoreResponse {
             .map_err(lifecycle_error_to_py)
     }
 
+    #[pyo3(signature = (invalidator, value, *, expected_exports = 0))]
     fn invalidate_then_release(
         &self,
         py: Python<'_>,
         invalidator: Py<PyAny>,
         value: Py<PyAny>,
+        expected_exports: u32,
     ) -> PyResult<()> {
         #[cfg(test)]
         if let Some(pause) = self.before_release.lock().take() {
             Python::attach(|py| py.detach(pause));
         }
-        // An invalidator can give up the GIL or reenter this buffer. Retire the
-        // public state under its lock, then run Python without that lock.
+        // Reject external memoryview exports before running the invalidator so
+        // a failed release keeps the decoded owner usable until callers release
+        // their views. Retire public state under the lock before running Python.
         let held = {
             let mut inner = self.inner.lock();
-            self.ensure_not_exported()?;
+            if self.exports.load(Ordering::Acquire) > expected_exports {
+                return Err(PyBufferError::new_err(
+                    "cannot release: buffer is currently exported as memoryview",
+                ));
+            }
             inner.take()
         };
         let Some(mut held) = held else {
             return Ok(());
         };
-        let _local_copy = self.local_copy.lock().take();
-        let mut python_error = None;
-        let result = held.invalidate_then_release(|| {
-            invalidator
-                .call1(py, (value,))
-                .map(|_| ())
-                .map_err(|error| {
-                    let message = error.to_string();
-                    python_error = Some(error);
-                    message
-                })
-        });
-        if let Some(error) = python_error {
-            return Err(error);
+        let invalidation = if self.invalidated.swap(true, Ordering::AcqRel) {
+            Ok(())
+        } else {
+            invalidator.call1(py, (value,)).map(|_| ())
+        };
+        match invalidation {
+            Ok(()) => {
+                if let Err(export_error) = self.ensure_not_exported() {
+                    *self.inner.lock() = Some(held);
+                    return Err(export_error);
+                }
+                let _local_copy = self.local_copy.lock().take();
+                drop(held);
+                Ok(())
+            }
+            Err(primary) => {
+                let _local_copy = self.local_copy.lock().take();
+                if self.exports.load(Ordering::Acquire) > 0 {
+                    // Keep backing memory valid while an un-invalidated exporter
+                    // still holds a Py_buffer; release its transport charge now
+                    // and recycle when the final export drops.
+                    held.detach_budget();
+                    *self.retired_pinned.lock() = Some(held);
+                    if self.exports.load(Ordering::Acquire) == 0 {
+                        let _ = self.retired_pinned.lock().take();
+                    }
+                } else {
+                    drop(held);
+                }
+                Err(primary)
+            }
         }
-        result.map_err(lifecycle_error_to_py)
+    }
+
+    fn detach_for_owned(&self) {
+        let mut inner = self.inner.lock();
+        if let Some(held) = inner.as_mut() {
+            held.detach_budget();
+            self.local_copy.lock().take();
+        }
     }
 
     #[pyo3(signature = (tracker, route_name, method_name, direction="client_response"))]
@@ -535,41 +601,28 @@ impl PyCoreResponse {
             .ok_or_else(|| PyBufferError::new_err("buffer already released"))?;
         let bytes = held.bytes();
         unsafe {
-            (*view).buf = bytes.as_ptr().cast_mut().cast();
-            (*view).obj = ffi::Py_NewRef(slf.as_ptr());
-            (*view).len = bytes.len() as isize;
-            (*view).readonly = 1;
-            (*view).itemsize = 1;
-            (*view).format = if flags & ffi::PyBUF_FORMAT != 0 {
-                c"B".as_ptr().cast_mut()
-            } else {
-                std::ptr::null_mut()
-            };
-            (*view).ndim = 1;
-            (*view).shape = if flags & ffi::PyBUF_ND != 0 {
-                &mut (*view).len
-            } else {
-                std::ptr::null_mut()
-            };
-            (*view).strides = if flags & ffi::PyBUF_STRIDES != 0 {
-                &mut (*view).itemsize
-            } else {
-                std::ptr::null_mut()
-            };
-            (*view).suboffsets = std::ptr::null_mut();
-            (*view).internal = std::ptr::null_mut();
+            fill_byte_buffer(
+                slf.as_any(),
+                view,
+                flags,
+                bytes.as_ptr().cast_mut(),
+                bytes.len(),
+                true,
+            )?;
         }
         this.exports.fetch_add(1, Ordering::Release);
         Ok(())
     }
 
     unsafe fn __releasebuffer__(&self, _view: *mut ffi::Py_buffer) {
-        self.exports.fetch_sub(1, Ordering::Release);
+        if self.exports.fetch_sub(1, Ordering::AcqRel) == 1 {
+            let _ = self.retired_pinned.lock().take();
+        }
     }
 }
 
 struct LocalRequestBuffer {
-    bytes: Vec<u8>,
+    bytes: RecycledBytes,
     local_copy: Option<LocalCopyGuard>,
 }
 
@@ -585,7 +638,12 @@ struct PyCoreRequestBuffer {
 }
 
 impl PyCoreRequestBuffer {
+    #[cfg(test)]
     fn new(bytes: Vec<u8>) -> Self {
+        Self::new_recycled(bytes.into())
+    }
+
+    fn new_recycled(bytes: RecycledBytes) -> Self {
         Self {
             inner: Mutex::new(Some(LocalRequestBuffer {
                 bytes,
@@ -625,6 +683,12 @@ impl PyCoreRequestBuffer {
         Ok(())
     }
 
+    fn detach_for_owned(&self) {
+        if let Some(state) = self.inner.lock().as_mut() {
+            state.local_copy.take();
+        }
+    }
+
     #[pyo3(signature = (tracker, route_name, method_name, direction="resource_input"))]
     fn track_retained(
         &self,
@@ -661,29 +725,14 @@ impl PyCoreRequestBuffer {
             .as_ref()
             .ok_or_else(|| PyBufferError::new_err("buffer already released"))?;
         unsafe {
-            (*view).buf = state.bytes.as_ptr().cast_mut().cast();
-            (*view).obj = ffi::Py_NewRef(slf.as_ptr());
-            (*view).len = state.bytes.len() as isize;
-            (*view).readonly = 1;
-            (*view).itemsize = 1;
-            (*view).format = if flags & ffi::PyBUF_FORMAT != 0 {
-                c"B".as_ptr().cast_mut()
-            } else {
-                std::ptr::null_mut()
-            };
-            (*view).ndim = 1;
-            (*view).shape = if flags & ffi::PyBUF_ND != 0 {
-                &mut (*view).len
-            } else {
-                std::ptr::null_mut()
-            };
-            (*view).strides = if flags & ffi::PyBUF_STRIDES != 0 {
-                &mut (*view).itemsize
-            } else {
-                std::ptr::null_mut()
-            };
-            (*view).suboffsets = std::ptr::null_mut();
-            (*view).internal = std::ptr::null_mut();
+            fill_byte_buffer(
+                slf.as_any(),
+                view,
+                flags,
+                state.bytes.as_ptr().cast_mut(),
+                state.bytes.len(),
+                true,
+            )?;
         }
         this.exports.fetch_add(1, Ordering::Release);
         Ok(())
@@ -708,21 +757,55 @@ impl PyCoreService {
     }
 }
 
+impl PyCoreService {
+    fn dispatch_response(
+        &self,
+        method_index: u16,
+        request: RecycledBytes,
+        sink: Option<&ResponseSink>,
+    ) -> Result<EncodedResponse, C2Error> {
+        Python::attach(|py| {
+            let invoke = || -> PyResult<EncodedResponse> {
+                let request = Py::new(py, PyCoreRequestBuffer::new_recycled(request))?;
+                let sink = Bound::new(py, PyResponseSink::new(sink))?;
+                let scoped = ResponseSinkScope(sink.get());
+                let result = self
+                    .dispatcher
+                    .call1(py, (self.route_name.as_str(), method_index, request, &sink))?;
+                if scoped.0.state.lock().response.is_none() {
+                    let value = result.bind(py);
+                    let written = scoped.0.write(py, value);
+                    if let Ok(view) = value.cast_exact::<pyo3::types::PyMemoryView>() {
+                        let released = view.call_method0("release");
+                        written?;
+                        released?;
+                    } else {
+                        written?;
+                    }
+                }
+                let response = scoped.0.close();
+                Ok(response.expect("the dispatcher or fallback wrote a response"))
+            };
+            invoke().map_err(|error| python_error_to_c2(py, error))
+        })
+    }
+}
+
 impl EncodedService for PyCoreService {
     fn invoke(&self, method_index: u16, request: Vec<u8>) -> Result<Vec<u8>, C2Error> {
-        Python::attach(|py| {
-            let request = Py::new(py, PyCoreRequestBuffer::new(request))
-                .map_err(|error| python_error_to_c2(py, error))?;
-            let result = self
-                .dispatcher
-                .call1(py, (self.route_name.as_str(), method_index, request))
-                .map_err(|error| python_error_to_c2(py, error))?;
-            let result = result.bind(py);
-            if result.is_none() {
-                return Ok(Vec::new());
-            }
-            materialize_python_bytes(py, result).map_err(|error| python_error_to_c2(py, error))
-        })
+        match self.dispatch_response(method_index, request.into(), None)? {
+            EncodedResponse::Inline(bytes) => Ok(bytes),
+            EncodedResponse::Shm(_) => unreachable!("no response pool for inline invocation"),
+        }
+    }
+
+    fn invoke_into(
+        &self,
+        method_index: u16,
+        request: RecycledBytes,
+        sink: &ResponseSink,
+    ) -> Result<EncodedResponse, C2Error> {
+        self.dispatch_response(method_index, request, Some(sink))
     }
 }
 
@@ -732,8 +815,16 @@ impl EncodedStreamService for PyCoreService {
         method_index: u16,
         request: Vec<u8>,
     ) -> Result<Box<dyn c2_core::EncodedStream>, C2Error> {
+        self.open_stream_recycled(method_index, request.into())
+    }
+
+    fn open_stream_recycled(
+        &self,
+        method_index: u16,
+        request: RecycledBytes,
+    ) -> Result<Box<dyn c2_core::EncodedStream>, C2Error> {
         Python::attach(|py| {
-            let request = Py::new(py, PyCoreRequestBuffer::new(request))
+            let request = Py::new(py, PyCoreRequestBuffer::new_recycled(request))
                 .map_err(|error| python_error_to_c2(py, error))?;
             let iterator = self
                 .dispatcher
@@ -745,27 +836,309 @@ impl EncodedStreamService for PyCoreService {
     }
 }
 
-// Caller/GIL snapshot for mutable exporters, read-only aliases and bytes
-// subclasses. Only the returned native Vec crosses execution handoff.
-fn snapshot_python_buffer(py: Python<'_>, buffer: &PyBuffer<u8>) -> PyResult<Vec<u8>> {
+unsafe fn fill_byte_buffer(
+    owner: &Bound<'_, PyAny>,
+    view: *mut ffi::Py_buffer,
+    flags: std::os::raw::c_int,
+    data: *mut u8,
+    len: usize,
+    readonly: bool,
+) -> PyResult<()> {
+    if readonly && flags & ffi::PyBUF_WRITABLE != 0 {
+        return Err(PyBufferError::new_err("buffer is read-only"));
+    }
+    let len = isize::try_from(len).map_err(|_| PyBufferError::new_err("buffer is too large"))?;
+    // SAFETY: getbuffer supplies a writable Py_buffer slot and its owner pins data.
+    unsafe {
+        (*view).buf = data.cast();
+        (*view).obj = ffi::Py_NewRef(owner.as_ptr());
+        (*view).len = len;
+        (*view).readonly = i32::from(readonly);
+        (*view).itemsize = 1;
+        (*view).format = if flags & ffi::PyBUF_FORMAT != 0 {
+            c"B".as_ptr().cast_mut()
+        } else {
+            std::ptr::null_mut()
+        };
+        (*view).ndim = 1;
+        (*view).shape = if flags & ffi::PyBUF_ND != 0 {
+            &mut (*view).len
+        } else {
+            std::ptr::null_mut()
+        };
+        (*view).strides = if flags & ffi::PyBUF_STRIDES == ffi::PyBUF_STRIDES {
+            &mut (*view).itemsize
+        } else {
+            std::ptr::null_mut()
+        };
+        (*view).suboffsets = std::ptr::null_mut();
+        (*view).internal = std::ptr::null_mut();
+    }
+    Ok(())
+}
+
+#[pyclass(frozen, skip_from_py_object)]
+struct PyWritableSlab {
+    slab: Mutex<Option<WritableSlab>>,
+    exports: AtomicU32,
+}
+
+impl PyWritableSlab {
+    fn new(slab: WritableSlab) -> Self {
+        Self {
+            slab: Mutex::new(Some(slab)),
+            exports: AtomicU32::new(0),
+        }
+    }
+
+    fn take_unexported(&self) -> PyResult<WritableSlab> {
+        let mut slab = self.slab.lock();
+        if self.exports.load(Ordering::Acquire) != 0 {
+            return Err(PyBufferError::new_err("cannot consume an exported slab"));
+        }
+        slab.take()
+            .ok_or_else(|| PyBufferError::new_err("slab already consumed"))
+    }
+}
+
+#[pymethods]
+impl PyWritableSlab {
+    unsafe fn __getbuffer__(
+        slf: &Bound<'_, Self>,
+        view: *mut ffi::Py_buffer,
+        flags: std::os::raw::c_int,
+    ) -> PyResult<()> {
+        let this = slf.get();
+        let mut slab = this.slab.lock();
+        let slab = slab
+            .as_mut()
+            .ok_or_else(|| PyBufferError::new_err("slab already consumed"))?;
+        unsafe {
+            fill_byte_buffer(
+                slf.as_any(),
+                view,
+                flags,
+                slab.as_mut_ptr(),
+                slab.len(),
+                false,
+            )?;
+        }
+        this.exports.fetch_add(1, Ordering::Release);
+        Ok(())
+    }
+
+    unsafe fn __releasebuffer__(&self, _view: *mut ffi::Py_buffer) {
+        self.exports.fetch_sub(1, Ordering::Release);
+    }
+}
+
+#[pyclass(frozen, skip_from_py_object)]
+struct PyScopedWritableBuffer {
+    data: *mut u8,
+    len: usize,
+    active: AtomicBool,
+    exports: AtomicU32,
+    gate: Mutex<()>,
+}
+
+// SAFETY: the pointer is exposed only while the scope owns its exclusive
+// borrow. The gate serializes export admission against scope retirement.
+unsafe impl Send for PyScopedWritableBuffer {}
+unsafe impl Sync for PyScopedWritableBuffer {}
+
+#[pymethods]
+impl PyScopedWritableBuffer {
+    unsafe fn __getbuffer__(
+        slf: &Bound<'_, Self>,
+        view: *mut ffi::Py_buffer,
+        flags: std::os::raw::c_int,
+    ) -> PyResult<()> {
+        let this = slf.get();
+        let _gate = this.gate.lock();
+        if !this.active.load(Ordering::Acquire) {
+            return Err(PyBufferError::new_err("writable buffer scope has ended"));
+        }
+        unsafe { fill_byte_buffer(slf.as_any(), view, flags, this.data, this.len, false)? };
+        this.exports.fetch_add(1, Ordering::Release);
+        Ok(())
+    }
+
+    unsafe fn __releasebuffer__(&self, _view: *mut ffi::Py_buffer) {
+        self.exports.fetch_sub(1, Ordering::Release);
+    }
+}
+
+struct WritableBufferScope<'a>(&'a PyScopedWritableBuffer);
+
+impl Drop for WritableBufferScope<'_> {
+    fn drop(&mut self) {
+        let _gate = self.0.gate.lock();
+        self.0.active.store(false, Ordering::Release);
+        if self.0.exports.load(Ordering::Acquire) != 0 {
+            // Python buffers cannot be revoked. Unwinding would give Core
+            // back the destination while a foreign writer can still use it.
+            eprintln!("FastDB retained a writable stream buffer beyond its encoding scope");
+            std::process::abort();
+        }
+    }
+}
+
+pub(crate) fn write_deferred_range(
+    plan: &Bound<'_, PyAny>,
+    destination: &mut [u8],
+) -> PyResult<()> {
+    let buffer = Bound::new(
+        plan.py(),
+        PyScopedWritableBuffer {
+            data: destination.as_mut_ptr(),
+            len: destination.len(),
+            active: AtomicBool::new(true),
+            exports: AtomicU32::new(0),
+            gate: Mutex::new(()),
+        },
+    )?;
+    let _scope = WritableBufferScope(buffer.get());
+    plan.call_method1("_c2_write_slab", (&buffer,))?;
+    Ok(())
+}
+
+struct ResponseSinkState {
+    sink: Option<NonNull<ResponseSink>>,
+    response: Option<EncodedResponse>,
+}
+
+// SAFETY: only the scope that borrowed the sink installs the pointer. All
+// dereferences and its removal run under the same state lock.
+unsafe impl Send for ResponseSinkState {}
+
+#[pyclass(frozen, skip_from_py_object)]
+struct PyResponseSink {
+    state: Mutex<ResponseSinkState>,
+    active: AtomicBool,
+}
+
+struct ResponseSinkScope<'a>(&'a PyResponseSink);
+
+impl Drop for ResponseSinkScope<'_> {
+    fn drop(&mut self) {
+        self.0.close();
+    }
+}
+
+impl PyResponseSink {
+    fn new(sink: Option<&ResponseSink>) -> Self {
+        Self {
+            state: Mutex::new(ResponseSinkState {
+                sink: sink.map(NonNull::from),
+                response: None,
+            }),
+            active: AtomicBool::new(true),
+        }
+    }
+
+    fn close(&self) -> Option<EncodedResponse> {
+        let mut state = self.state.lock();
+        self.active.store(false, Ordering::Release);
+        state.sink = None;
+        state.response.take()
+    }
+
+    fn ensure_writable(&self, state: &ResponseSinkState) -> PyResult<()> {
+        if !self.active.load(Ordering::Acquire) {
+            return Err(PyRuntimeError::new_err("response sink scope has ended"));
+        }
+        if state.response.is_some() {
+            return Err(PyRuntimeError::new_err("response sink already written"));
+        }
+        Ok(())
+    }
+
+    fn try_alloc(&self, len: usize) -> PyResult<Option<WritableSlab>> {
+        let state = self.state.lock();
+        self.ensure_writable(&state)?;
+        match state.sink {
+            // SAFETY: the active scope holds the sink alive until it clears
+            // the pointer with this same mutex.
+            Some(sink) => unsafe { sink.as_ref() }
+                .try_alloc_slab(len)
+                .map_err(PyRuntimeError::new_err),
+            None => Ok(None),
+        }
+    }
+}
+
+#[pymethods]
+impl PyResponseSink {
+    fn write(&self, py: Python<'_>, payload: &Bound<'_, PyAny>) -> PyResult<()> {
+        let mut inline = Vec::new();
+        let mut slab = None;
+        if !payload.is_none() {
+            if let Some(len) = deferred_plan_len(payload)? {
+                if let Some(target) = self.try_alloc(len)? {
+                    slab = Some(write_deferred_slab(payload, target)?);
+                } else {
+                    inline = materialize_deferred_plan(payload, len)?;
+                }
+            } else {
+                let buffer = PyBuffer::<u8>::get(payload)?;
+                if let Some(mut target) = self.try_alloc(buffer.len_bytes())? {
+                    buffer.copy_to_slice(py, target.as_mut_slice())?;
+                    slab = Some(target);
+                } else {
+                    inline = snapshot_python_buffer(py, &buffer)?;
+                }
+            }
+        }
+        let mut state = self.state.lock();
+        self.ensure_writable(&state)?;
+        state.response = Some(match slab {
+            // SAFETY: checked active under the state lock. A slab was only
+            // allocated if this scope has a native response pool.
+            Some(slab) => unsafe { state.sink.unwrap().as_ref() }
+                .finish_slab(slab)
+                .map_err(PyRuntimeError::new_err)?,
+            None => EncodedResponse::Inline(inline),
+        });
+        Ok(())
+    }
+}
+
+pub(crate) fn deferred_plan_len(value: &Bound<'_, PyAny>) -> PyResult<Option<usize>> {
+    if value.hasattr("_c2_write_slab")? && value.hasattr("_c2_materialize_bytes")? {
+        Ok(Some(value.call_method0("_c2_total_bytes")?.extract()?))
+    } else {
+        Ok(None)
+    }
+}
+
+pub(crate) fn write_deferred_slab(
+    plan: &Bound<'_, PyAny>,
+    slab: WritableSlab,
+) -> PyResult<WritableSlab> {
+    let slab = Bound::new(plan.py(), PyWritableSlab::new(slab))?;
+    plan.call_method1("_c2_write_slab", (&slab,))?;
+    slab.get().take_unexported()
+}
+
+pub(crate) fn materialize_deferred_plan(plan: &Bound<'_, PyAny>, len: usize) -> PyResult<Vec<u8>> {
+    let materialized = plan.call_method0("_c2_materialize_bytes")?;
+    snapshot_python_buffer(plan.py(), &checked_buffer(&materialized, len)?)
+}
+
+pub(crate) fn checked_buffer(value: &Bound<'_, PyAny>, len: usize) -> PyResult<PyBuffer<u8>> {
+    let buffer = PyBuffer::<u8>::get(value)?;
+    if buffer.len_bytes() != len {
+        return Err(PyValueError::new_err(
+            "buffer size changed during payload-budget admission",
+        ));
+    }
+    Ok(buffer)
+}
+
+pub(crate) fn snapshot_python_buffer(py: Python<'_>, buffer: &PyBuffer<u8>) -> PyResult<Vec<u8>> {
     let mut bytes = vec![0_u8; buffer.len_bytes()];
     buffer.copy_to_slice(py, &mut bytes)?;
     Ok(bytes)
-}
-
-fn materialize_python_bytes(py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<Vec<u8>> {
-    if let Ok(buffer) = PyBuffer::<u8>::get(value) {
-        return snapshot_python_buffer(py, &buffer);
-    }
-    if let Ok(to_bytes) = value.getattr("to_bytes")
-        && to_bytes.is_callable()
-    {
-        let materialized = to_bytes.call0()?;
-        return materialize_python_bytes(py, &materialized);
-    }
-    Err(PyValueError::new_err(
-        "Core service/client payload must expose the buffer protocol or to_bytes()",
-    ))
 }
 
 pub(crate) fn python_error_to_c2(py: Python<'_>, error: PyErr) -> C2Error {
@@ -799,11 +1172,7 @@ fn semantic_payload_from_exception(py: Python<'_>, error: &PyErr) -> Option<C2Er
     let cc_error_class = module.getattr("CCError").ok()?;
     if value.is_instance(&cc_error_class).ok()? {
         let code = value.getattr("code").ok()?.extract::<u16>().ok()?;
-        let message = value
-            .getattr("message")
-            .ok()?
-            .extract::<String>()
-            .ok()?;
+        let message = value.getattr("message").ok()?.extract::<String>().ok()?;
         let details = value
             .getattr("details")
             .ok()?
@@ -955,7 +1324,8 @@ mod payload_tests {
             ];
             let semantic = C2Error::new(ErrorCode::CallDeadlineExceeded, "native refusal")
                 .with_details(
-                    detail_pairs.into_iter()
+                    detail_pairs
+                        .into_iter()
                         .map(|(key, value)| (key.to_owned(), value.to_owned()))
                         .collect(),
                 );
@@ -964,7 +1334,9 @@ mod payload_tests {
             value
                 .setattr("code", u16::from(ErrorCode::ResourceClosed))
                 .unwrap();
-            value.setattr("semantic_message", "changed diagnostic").unwrap();
+            value
+                .setattr("semantic_message", "changed diagnostic")
+                .unwrap();
             value.setattr("details", PyDict::new(py)).unwrap();
 
             let callback_error = python_error_to_c2(py, error);
@@ -1027,7 +1399,7 @@ mod payload_tests {
                 Python::attach(|py| {
                     let owner = worker_response.borrow(py);
                     if invalidate {
-                        owner.invalidate_then_release(py, worker_invalidator, py.None())
+                        owner.invalidate_then_release(py, worker_invalidator, py.None(), 0)
                     } else {
                         owner.release()
                     }
@@ -1053,7 +1425,7 @@ mod payload_tests {
             drop(exported);
             if invalidate {
                 owner
-                    .invalidate_then_release(py, invalidator.clone_ref(py), py.None())
+                    .invalidate_then_release(py, invalidator.clone_ref(py), py.None(), 0)
                     .unwrap();
             } else {
                 owner.release().unwrap();
@@ -1061,7 +1433,7 @@ mod payload_tests {
             assert!(owner.is_released());
             assert!(owner.local_copy.lock().is_none());
             owner
-                .invalidate_then_release(py, invalidator, py.None())
+                .invalidate_then_release(py, invalidator, py.None(), 0)
                 .unwrap();
             owner.release().unwrap();
             assert_eq!(calls.len(), usize::from(invalidate));
@@ -1070,6 +1442,189 @@ mod payload_tests {
                 py,
                 PyMemoryView::from(response.bind(py).as_any()).map(|_| ()),
                 "buffer already released",
+            );
+        });
+    }
+
+    #[test]
+    fn detached_response_keeps_buffer_address_and_refunds_charges() {
+        Python::initialize();
+        Python::attach(|py| {
+            let budget = c2_mem::DomainBudget::from_limits(&c2_config::DomainLimits::default());
+            let bytes = vec![b'd'; 32];
+            let ptr = bytes.as_ptr();
+            let reservation = budget.try_reserve_memory(bytes.capacity() as u64).unwrap();
+            let held =
+                HeldResponse::from_budgeted_bytes(c2_mem::BudgetedBuffer::new(bytes, reservation));
+            let owner = Bound::new(py, PyCoreResponse::new(held)).unwrap();
+            let tracker = tracker();
+            owner
+                .get()
+                .track_retained(&tracker, "response", "detach", "client_response")
+                .unwrap();
+            let view = PyBuffer::<u8>::get(owner.as_any()).unwrap();
+            assert_eq!(view.buf_ptr().cast_const().cast::<u8>(), ptr);
+            assert_eq!(budget.snapshot().memory.used_bytes, 32);
+            owner.get().detach_for_owned();
+            assert_eq!(budget.snapshot().memory.used_bytes, 0);
+            assert_counts(&tracker, 0, 0);
+            assert_eq!(view.to_vec(py).unwrap(), vec![b'd'; 32]);
+            assert!(!owner.get().is_released());
+            drop(view);
+            owner.get().release().unwrap();
+        });
+    }
+
+    #[test]
+    fn fastdb_external_owner_shares_the_response_buffer_until_invalidation() {
+        Python::initialize();
+        Python::attach(|py| {
+            let module = module(
+                py,
+                r#"
+import json
+import c_two
+from c_two.crm.payload_plan import fastdb_payload_binding
+from fastdb4py.payload import Builder, CompiledSpec
+spec = {'schema': 'fastdb.payload.v1', 'profile': 'record.v1',
+        'entries': [{'id': 'value', 'cardinality': 'one',
+                     'type': {'kind': 'u8', 'nullable': False}}], 'components': []}
+binding = fastdb_payload_binding(spec, label='native-test')
+with CompiledSpec.compile(json.dumps(spec).encode()) as compiled:
+    with Builder.create(compiled) as builder:
+        builder.entry_begin(0, 1).value_u8(17)
+        deferred = binding.serialize(builder.freeze())
+"#,
+            );
+            let binding = module.getattr("binding").unwrap();
+            let deferred = module.getattr("deferred").unwrap();
+            let mut serialized = vec![0; deferred_plan_len(&deferred).unwrap().unwrap()];
+            write_deferred_range(&deferred, &mut serialized).unwrap();
+            let address = serialized.as_ptr();
+            let response = Bound::new(
+                py,
+                PyCoreResponse::new(HeldResponse::from_owned_bytes(serialized)),
+            )
+            .unwrap();
+            let view = PyMemoryView::from(response.as_any()).unwrap();
+            let payload = binding.call_method1("deserialize", (&view,)).unwrap();
+            view.call_method0("release").unwrap();
+            assert_eq!(response.get().exports.load(Ordering::Acquire), 1);
+
+            let image = payload.call_method0("memoryview").unwrap();
+            let exported = PyBuffer::<u8>::get(&image).unwrap();
+            assert_eq!(exported.buf_ptr().cast_const().cast::<u8>(), address);
+            drop(exported);
+            image.call_method0("release").unwrap();
+
+            let invalidator = binding.getattr("invalidate").unwrap().unbind();
+            response
+                .get()
+                .invalidate_then_release(py, invalidator, payload.unbind(), 1)
+                .unwrap();
+            assert!(response.get().is_released());
+            assert_eq!(response.get().exports.load(Ordering::Acquire), 0);
+        });
+    }
+
+    #[test]
+    fn detached_request_keeps_recycled_bytes_until_export_ends() {
+        Python::initialize();
+        Python::attach(|py| {
+            let budget = c2_mem::DomainBudget::from_limits(&c2_config::DomainLimits::default());
+            let len = 512 * 1024;
+            let bytes = vec![b'q'; len];
+            let ptr = bytes.as_ptr();
+            let owner = Bound::new(
+                py,
+                PyCoreRequestBuffer::new_recycled(RecycledBytes::new(bytes, budget.clone())),
+            )
+            .unwrap();
+            let tracker = tracker();
+            owner
+                .get()
+                .track_retained(&tracker, "request", "detach", "resource_input")
+                .unwrap();
+            let view = PyBuffer::<u8>::get(owner.as_any()).unwrap();
+            owner.get().detach_for_owned();
+            assert_counts(&tracker, 0, 0);
+            drop(owner);
+            assert_eq!(view.buf_ptr().cast_const().cast::<u8>(), ptr);
+            assert_eq!(view.to_vec(py).unwrap(), vec![b'q'; len]);
+            drop(view);
+            let recycled = budget.allocate_vec(len).unwrap();
+            assert_eq!(recycled.as_ptr(), ptr);
+        });
+    }
+
+    #[test]
+    fn writable_slab_cannot_be_taken_while_exported() {
+        Python::initialize();
+        Python::attach(|py| {
+            let pool = Arc::new(parking_lot::RwLock::new(
+                c2_mem::MemPool::new(c2_mem::PoolConfig::primary_for_budget(8 * 1024 * 1024))
+                    .unwrap(),
+            ));
+            let slab = WritableSlab::try_alloc(pool.clone(), 64 * 1024)
+                .unwrap()
+                .expect("SHM");
+            let owner = Bound::new(py, PyWritableSlab::new(slab)).unwrap();
+            let view = PyMemoryView::from(owner.as_any()).unwrap();
+            view.set_item(0, 42_u8).unwrap();
+            assert_buffer_error(
+                py,
+                owner.get().take_unexported().map(|_| ()),
+                "cannot consume an exported slab",
+            );
+            view.call_method0("release").unwrap();
+            let slab = owner.get().take_unexported().unwrap();
+            assert_eq!(slab.as_slice()[0], 42);
+            assert_buffer_error(
+                py,
+                PyMemoryView::from(owner.as_any()).map(|_| ()),
+                "slab already consumed",
+            );
+            drop(slab);
+            assert_eq!(pool.read().stats().alloc_count, 0);
+        });
+    }
+
+    #[test]
+    fn response_sink_rejects_shm_coordinates() {
+        Python::initialize();
+        Python::attach(|py| {
+            let sink = PyResponseSink::new(None);
+            let coordinates = (1, 0, 32, false).into_pyobject(py).unwrap();
+            assert!(sink.write(py, coordinates.as_any()).is_err());
+            assert!(sink.close().is_none());
+        });
+    }
+
+    #[test]
+    fn stream_destination_cannot_be_exported_after_the_write() {
+        Python::initialize();
+        Python::attach(|py| {
+            let module = module(
+                py,
+                r#"
+class Plan:
+    def _c2_write_slab(self, target):
+        self.target = target
+        with memoryview(target) as view:
+            view[:] = b'data'
+        raise ValueError('write failed')
+"#,
+            );
+            let plan = module.getattr("Plan").unwrap().call0().unwrap();
+            let mut destination = [0; 4];
+            let error = write_deferred_range(&plan, &mut destination).unwrap_err();
+            assert!(error.is_instance_of::<PyValueError>(py));
+            assert_eq!(&destination, b"data");
+            let target = plan.getattr("target").unwrap();
+            assert_buffer_error(
+                py,
+                PyMemoryView::from(&target).map(|_| ()),
+                "writable buffer scope has ended",
             );
         });
     }
@@ -1127,13 +1682,13 @@ mod payload_tests {
                 .unwrap();
             let invalidator = source.getattr("invalidate").unwrap().unbind();
             let error = owner
-                .invalidate_then_release(py, invalidator.clone_ref(py), py.None())
+                .invalidate_then_release(py, invalidator.clone_ref(py), py.None(), 0)
                 .unwrap_err();
             assert!(error.value(py).is(&source.getattr("error").unwrap()));
             assert!(owner.inner.lock().is_none());
             assert_counts(&tracker, 0, 0);
             owner
-                .invalidate_then_release(py, invalidator, py.None())
+                .invalidate_then_release(py, invalidator, py.None(), 0)
                 .unwrap();
             owner.release().unwrap();
             assert_eq!(source.getattr("calls").unwrap().len().unwrap(), 1);
@@ -1256,7 +1811,7 @@ mod payload_tests {
             let module = module(
                 py,
                 r#"
-def dispatch(route, method, request):
+def dispatch(route, method, request, response_sink):
     global view
     view = memoryview(request)
     if method:

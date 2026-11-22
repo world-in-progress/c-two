@@ -1,10 +1,10 @@
 # Python SDK usage
 
-This guide describes C-Two 0.11.0 / c3 0.7.0 Python SDK usage, including CRM authoring, calls, server streams, portable FastDB 0.2.4 payloads, publish/subscribe topics and Runtime ownership.
+This guide describes C-Two 0.11.0 / c3 0.7.0 Python SDK usage, including CRM authoring, calls, server streams, portable FastDB 0.3.0 payloads, publish/subscribe topics and Runtime ownership.
 
 English · [简体中文](python-usage.zh-CN.md)
 
-The [0.11.0 release notes](../releases/0.11.0.md) describe migration from 0.10.x, including IPC 16, SHM 4, server streams, route-name identity, role-domain capacity configuration and the converged error hierarchy. The [unreleased changes](../releases/unreleased.md) add resource-owned publish/subscribe topics and move the wire to IPC 17 and the Node C/FFI ABI to 9; this guide documents that current source. CRM contracts expose stateful resources over same-process calls, local IPC and HTTP relay; portable Python payloads use the optional FastDB 0.2.4 extra. For installation and a runnable introduction, see the [quickstart](../../README.md#quickstart).
+The [0.11.0 release notes](../releases/0.11.0.md) describe migration from 0.10.x, including IPC 16, SHM 4, server streams, route-name identity, role-domain capacity configuration and the converged error hierarchy. The [unreleased changes](../releases/unreleased.md) add resource-owned publish/subscribe topics and move the wire to IPC 17 and the Node C/FFI ABI to 9; this guide documents that current source. CRM contracts expose stateful resources over same-process calls, local IPC and HTTP relay; portable Python payloads use the optional FastDB 0.3.0 extra. For installation and a runnable introduction, see the [quickstart](../../README.md#quickstart).
 
 ## Portable payloads (FastDB)
 
@@ -66,7 +66,7 @@ finally:
     cc.shutdown()
 ```
 
-A portable method carries zero or one `Payload` envelope in each direction; C-Two embeds each nested specification as an opaque JSON value and never reinterprets it. Methods without an explicit binding can still use ordinary Python values for Python-scoped prototyping, but portable descriptor export and codegen diagnose and reject them.
+A portable method carries zero or one `Payload` envelope in each direction; C-Two embeds each nested specification as an opaque JSON value and never reinterprets it. On the send side (client requests, unary returns, `@cc.stream` yields, and `Publisher.publish(...)`), you may pass either a built `Payload` or a frozen `fastdb4py.payload.BuildPlan` (resource methods may annotate their return as `BuildPlan`, `Payload | BuildPlan`, or `Iterator[BuildPlan]`). Over IPC SHM, direct-build-eligible `BuildPlan` values execute straight into C-Two's `WritableSlab` shared-memory buffer with zero intermediate staging copies. Methods without an explicit binding can still use ordinary Python values for Python-scoped prototyping, but portable descriptor export and codegen diagnose and reject them.
 
 Over IPC or relay HTTP, `cc.hold(echo.echo)(source)` retains the decoded response as `HeldResult`, which owns a local copy: the transport memory was released right after the copy, so holding never keeps the server's shared memory. Explicit `release()` runs FastDB invalidation once, then frees the local copy; invalidation does not replay and the value stays inaccessible afterwards. Release an additional exported memoryview before retrying an export rejection, which occurs before invalidation. On the same-process direct path (omitting `address` in the registering Runtime), `cc.hold()` returns `HeldResult(result)` wrapping the resource's original Python object without transport copying, FastDB invalidation, or `holds` accounting. Manually constructed `HeldResult(release_cb=...)` callbacks still run once. Use `with cc.hold(method)(args) as held` for normal scopes and materialize values that must outlive them.
 
@@ -110,7 +110,7 @@ server = session.ensure_server_bridge()
 
 ## Payload lifetimes
 
-The proven remote portable receive path opens a **copy-backed** payload owner. Over remote transports, `cc.hold()` is a lifetime contract, not a zero-copy claim: it retains the response's local copy together with the payload owner and guarantees that release invalidates the payload owner and its checked views *before* freeing the local copy (on the same-process direct path, `cc.hold()` wraps the original Python object in `HeldResult(result)` without transport copies or FastDB invalidation).
+On remote transports, C-Two copies an incoming SHM or reassembled frame once into a warm-recycled local buffer and releases the transport loan immediately (ADR 0001), then opens the FastDB `Payload` directly over that local buffer via `Payload.open_external` / `ExternalBytes` without a second decode copy. Over remote transports, `cc.hold()` is a lifetime contract that retains the response's local copy together with the payload owner and guarantees that release invalidates the payload owner and its checked views *before* freeing or recycling the local copy (on the same-process direct path, `cc.hold()` wraps the original Python object in `HeldResult(result)` without transport copies or FastDB invalidation).
 
 ```python
 with cc.connect(Echo, name='echo', address=cc.server_address()) as echo:

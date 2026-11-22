@@ -70,7 +70,7 @@ def bundle_manifest_for(
         "version": version,
         "target": target,
         "abi": "fdb_payload_v1",
-        "abi_symbol_count": 117,
+        "abi_symbol_count": 118,
         "link_mode": "system",
         "source_sha": source_sha,
         "files": [

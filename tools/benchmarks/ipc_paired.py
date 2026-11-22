@@ -395,7 +395,17 @@ def run(args) -> dict:
         require(fastdb_head == git_head(candidate_fastdb), 'FastDB source commits differ')
     baseline_identity = python_identity(args.baseline_python, args.baseline_root)
     candidate_identity = python_identity(args.candidate_python, args.candidate_root)
-    require(baseline_identity == candidate_identity, 'Python platform or dependency mismatch between environments')
+    # Allow an intentional FastDB binding upgrade between baseline and candidate
+    # while still enforcing strict equality across all other Python dependencies.
+    def _without_fastdb(identity: dict) -> dict:
+        deps = dict(identity.get('dependencies', {}))
+        deps.pop('fastdb4py', None)
+        return {**identity, 'dependencies': deps}
+
+    require(
+        _without_fastdb(baseline_identity) == _without_fastdb(candidate_identity),
+        'Python platform or dependency mismatch between environments',
+    )
     selected = set(args.only) if args.only else set(NORMAL_ROWS + BUDGET_ROWS)
     require(selected <= set(NORMAL_ROWS + BUDGET_ROWS), 'unknown matrix row selector')
     require(not args.only or len(selected) == len(args.only), 'duplicate row selector')
@@ -407,7 +417,9 @@ def run(args) -> dict:
                'fastdb_source_commit': fastdb_head,
                'baseline_root': str(args.baseline_root), 'candidate_root': str(args.candidate_root),
                'baseline_python': str(args.baseline_python), 'candidate_python': str(args.candidate_python),
-               'python_identity': baseline_identity, 'selected_rows': sorted(selected),
+               'python_identity': baseline_identity,
+               'candidate_fastdb4py': candidate_identity.get('dependencies', {}).get('fastdb4py'),
+               'selected_rows': sorted(selected),
                'pairs_requested': args.pairs, 'groups': [], 'anomalies': [], 'failures': [],
                'blocking_failures': [], 'scenario_counts': {'baseline': {}, 'candidate': {}}}
     for index in range(args.pairs):

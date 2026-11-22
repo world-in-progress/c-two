@@ -174,7 +174,7 @@ publish = false
 
 [dependencies]
 c-two = {{ path = {json.dumps(str(REPOSITORY / 'sdk/rust'))} }}
-fastdb = "=0.2.4"
+fastdb = "=0.3.0"
 serde_json = "1"
 """
         (root / "Cargo.toml").write_text(manifest, encoding="utf-8")

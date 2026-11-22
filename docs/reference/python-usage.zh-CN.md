@@ -1,10 +1,10 @@
 # Python SDK 用法
 
-本指南说明 C-Two 0.11.0 / c3 0.7.0 的 Python SDK 用法，包括 CRM 编写、调用、服务端流、可移植的 FastDB 0.2.4 载荷、发布/订阅主题和 Runtime 所有权。
+本指南说明 C-Two 0.11.0 / c3 0.7.0 的 Python SDK 用法，包括 CRM 编写、调用、服务端流、可移植的 FastDB 0.3.0 载荷、发布/订阅主题和 Runtime 所有权。
 
 [English](python-usage.md) · 简体中文
 
-[0.11.0 发布说明](../releases/0.11.0.md)介绍从 0.10.x 迁移的事项，包括 IPC 16、SHM 4、服务端流、路由名身份、按角色划分的容量配置和收敛后的错误体系。[未发布变更](../releases/unreleased.md)新增资源归属的发布/订阅主题，并将线协议升级到 IPC 17、Node C/FFI ABI 升级到 9；本指南描述当前源码。CRM 契约通过同进程调用、本地 IPC 和 HTTP relay 暴露有状态资源；可移植 Python 载荷使用可选的 FastDB 0.2.4 extra。安装步骤及可运行的入门示例见[快速开始](../../README.zh-CN.md#快速开始)。
+[0.11.0 发布说明](../releases/0.11.0.md)介绍从 0.10.x 迁移的事项，包括 IPC 16、SHM 4、服务端流、路由名身份、按角色划分的容量配置和收敛后的错误体系。[未发布变更](../releases/unreleased.md)新增资源归属的发布/订阅主题，并将线协议升级到 IPC 17、Node C/FFI ABI 升级到 9；本指南描述当前源码。CRM 契约通过同进程调用、本地 IPC 和 HTTP relay 暴露有状态资源；可移植 Python 载荷使用可选的 FastDB 0.3.0 extra。安装步骤及可运行的入门示例见[快速开始](../../README.zh-CN.md#快速开始)。
 
 ## 可移植载荷（FastDB）
 
@@ -66,7 +66,7 @@ finally:
     cc.shutdown()
 ```
 
-可移植方法在每个方向携带零个或一个 `Payload` 封套；C-Two 将每个嵌套规格作为不透明 JSON 值嵌入，且不重新解释它。没有明确绑定的方法仍可使用普通 Python 值进行仅限 Python 的原型开发，但可移植描述符导出与代码生成会诊断并拒绝这些方法。
+可移植方法在每个方向携带零个或一个 `Payload` 封套；C-Two 将每个嵌套规格作为不透明 JSON 值嵌入，且不重新解释它。在发送侧（客户端请求、unary 返回值、`@cc.stream` 产出项与 `Publisher.publish(...)`），既可传入已构建的 `Payload`，也可直接传入冻结后的 `fastdb4py.payload.BuildPlan`（资源方法可将返回类型注解为 `BuildPlan`、`Payload | BuildPlan` 或 `Iterator[BuildPlan]`）。经 IPC SHM 传输时，满足直写条件的 `BuildPlan` 会直接写入 C-Two 的 `WritableSlab` 共享内存块，无需中间暂存拷贝。没有明确绑定的方法仍可使用普通 Python 值进行仅限 Python 的原型开发，但可移植描述符导出与代码生成会诊断并拒绝这些方法。
 
 经 IPC 或 relay HTTP 调用时，`cc.hold(echo.echo)(source)` 将解码后的响应保留为 `HeldResult`，它持有一份本地副本：复制完成后传输内存就已释放，所以 hold 不会占住服务端的共享内存。显式 `release()` 让载荷所有者失效一次，再释放本地副本；失效操作不会重放，此后该值不可访问。如果导出被拒绝，先释放额外导出的 memoryview 再重试；拒绝发生在失效操作之前。在同进程直调路径（注册同一 Runtime 且省略 `address`）上，`cc.hold()` 只返回包装原 Python 对象的 `HeldResult(result)`，不经过传输复制，释放包装也不会使原 FastDB 对象失效或计入 `holds`。手工构造的 `HeldResult(release_cb=...)` 回调仍只运行一次。常规作用域使用 `with cc.hold(method)(args) as held`，需要超出作用域存活的值应实体化。
 
@@ -110,7 +110,7 @@ server = session.ensure_server_bridge()
 
 ## 载荷生命周期
 
-已经证实的远程可移植接收路径打开的是**由副本支持**的载荷所有者。经远程传输时，`cc.hold()` 是生命周期契约，不构成零拷贝声明：它一同保留响应的本地副本与载荷所有者，并保证释放本地副本*之前*，先让载荷所有者及其受检查的视图失效（同进程直调路径上，`cc.hold()` 只用 `HeldResult(result)` 包装原 Python 对象，没有传输副本也不会触发 FastDB 失效）。
+经远程传输接收时，C-Two 会将收到的 SHM 或重组帧一次性复制到温池复用的本地缓冲区并立即归还传输借出（ADR 0001），随后通过 `Payload.open_external` / `ExternalBytes` 直接在该本地副本上打开 FastDB `Payload`，不再产生二次解码拷贝。`cc.hold()` 是生命周期契约：它一同保留响应的本地副本与载荷所有者，并保证释放或回收本地副本*之前*，先让载荷所有者及其受检查的视图失效（同进程直调路径上，`cc.hold()` 只用 `HeldResult(result)` 包装原 Python 对象，没有传输副本也不会触发 FastDB 失效）。
 
 ```python
 with cc.connect(Echo, name='echo', address=cc.server_address()) as echo:

@@ -1,26 +1,54 @@
 use std::fmt;
+use std::sync::Arc;
 
-use c2_core::{Error, HeldResponse};
+use c2_core::{Error, HeldResponse, LifecycleError};
 
 /// A retained SDK value paired with its local response copy.
 ///
-/// The current portable receive path is copy-backed. Retention is a lifetime
-/// contract, not a zero-copy claim.
+/// Call [`Self::release`] to invalidate the value and release its local
+/// backing. Dropping the hold also runs that cleanup.
 #[must_use = "held values must remain owned or be explicitly released"]
 pub struct Held<T> {
     // The response owns only local bytes; transport storage is already released.
-    owners: Option<(HeldResponse, T)>,
+    owners: Option<(HeldOwner, T)>,
     invalidate: fn(&T) -> Result<(), String>,
 }
 
+enum HeldOwner {
+    #[cfg_attr(not(test), allow(dead_code))]
+    Unique(HeldResponse),
+    Shared(Arc<HeldResponse>),
+}
+
+impl HeldOwner {
+    fn is_released(&self) -> bool {
+        match self {
+            Self::Unique(response) => response.is_released(),
+            Self::Shared(response) => response.is_released(),
+        }
+    }
+}
+
 impl<T> Held<T> {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn new(
         value: T,
         response: HeldResponse,
         invalidate: fn(&T) -> Result<(), String>,
     ) -> Self {
         Self {
-            owners: Some((response, value)),
+            owners: Some((HeldOwner::Unique(response), value)),
+            invalidate,
+        }
+    }
+
+    pub(crate) fn new_shared(
+        value: T,
+        response: Arc<HeldResponse>,
+        invalidate: fn(&T) -> Result<(), String>,
+    ) -> Self {
+        Self {
+            owners: Some((HeldOwner::Shared(response), value)),
             invalidate,
         }
     }
@@ -42,13 +70,27 @@ impl<T> Held<T> {
     ///
     /// Invalidation runs once, including when it fails or unwinds. The original
     /// invalidation error is preserved and subsequent releases are no-ops.
+    /// Drop any FastDB access pins on the calling thread before releasing a
+    /// payload hold, since invalidation waits for active pins to drain.
     pub fn release(&mut self) -> Result<(), Error> {
-        let Some((mut response, value)) = self.owners.take() else {
+        let Some((response, value)) = self.owners.take() else {
             return Ok(());
         };
-        response
-            .invalidate_then_release(|| (self.invalidate)(&value))
-            .map_err(Error::from)
+        match response {
+            HeldOwner::Unique(mut response) => response
+                .invalidate_then_release(|| (self.invalidate)(&value))
+                .map_err(Error::from),
+            HeldOwner::Shared(shared) => {
+                let result = (self.invalidate)(&value);
+                drop(value);
+                // Recycle the buffer now if unique. Otherwise, its remaining
+                // owners keep it alive until FastDB no longer needs the bytes.
+                drop(Arc::try_unwrap(shared));
+                result.map_err(|invalidation_error| {
+                    LifecycleError::HeldResponseRelease { invalidation_error }.into()
+                })
+            }
+        }
     }
 }
 

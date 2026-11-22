@@ -530,11 +530,14 @@ pub(super) async fn dispatch_stream_call(
     let core = conn.core.clone();
     let execution_conn = writer.conn.clone();
     let first_slot = slot.clone();
+    let budget = server.domain_budget.clone();
     let first = tokio::task::spawn_blocking(move || {
         let mut route_guard = route_guard;
         let _execution_guard = execution_guard;
         route_guard.commit().map_err(FirstError::Acquire)?;
-        let (bytes, _memory) = request.into_owned_bytes().map_err(FirstError::Input)?;
+        let (bytes, _memory) = request
+            .into_recycled_bytes(&budget)
+            .map_err(FirstError::Input)?;
         let _start = record.data.start_gate.lock();
         if execution_conn.is_work_cancelled()
             || core.stream_state(id).is_none_or(|state| state.cancelled)
@@ -548,7 +551,7 @@ pub(super) async fn dispatch_stream_call(
         first_slot.mark_resource_entry();
         drop(_start);
         let mut stream = callback
-            .open_stream(&route_name, method_idx, bytes, response_pool)
+            .open_stream_recycled(&route_name, method_idx, bytes, response_pool)
             .map_err(FirstError::Crm)?;
         let result = stream.step();
         Ok((stream, result))

@@ -3,11 +3,14 @@
 
 use std::sync::Arc;
 
-use c2_mem::{PeerMappingError, PeerRead, WindowChunk, WindowSlice};
+use c2_mem::{
+    BudgetedBuffer, DomainBudget, MemoryReservation, PeerMappingError, PeerRead, WindowChunk,
+    WindowSlice,
+};
 use c2_wire::{buddy::BuddyPayload, chunk::ReassemblyBacking, connection::RemoteLoan};
 use parking_lot::RwLock;
 
-use crate::client::ServerPoolState;
+use crate::client::{IpcError, ServerPoolState};
 
 #[derive(Debug)]
 pub enum ResponseData {
@@ -67,10 +70,10 @@ impl ServerShmResponse {
         result
     }
 
-    pub(crate) fn copy_into(self, destination: &mut [u8]) -> Result<(), String> {
+    pub(crate) fn copy_into_vec(self, destination: &mut Vec<u8>) -> Result<(), String> {
         // SAFETY: the admitted carrier pins this immutable peer span until
         // copy returns; dropping it then ends the read and queues RELEASE.
-        unsafe { self.read.copy_into(destination) }
+        unsafe { self.read.copy_into_vec(destination) }
     }
 
     pub(crate) fn copy_range_into(
@@ -168,6 +171,28 @@ impl ResponseData {
         self.len() == 0
     }
 
+    pub fn into_owned_bytes_in(self, budget: &DomainBudget) -> Result<Vec<u8>, String> {
+        match self {
+            Self::Inline(bytes) => Ok(bytes),
+            Self::Shm(carrier) => {
+                let mut bytes = budget
+                    .allocate_vec(carrier.data_size() as usize)
+                    .map_err(|error| format!("response copy allocation failed: {error}"))?;
+                carrier.copy_into_vec(&mut bytes)?;
+                Ok(bytes)
+            }
+            Self::Handle(mut backing) => {
+                let mut bytes = budget
+                    .allocate_vec(backing.len())
+                    .map_err(|error| format!("response copy allocation failed: {error}"))?;
+                let copied = backing.with_slice(|source| bytes.extend_from_slice(source));
+                backing.release();
+                copied.map_err(|error| format!("response handle copy failed: {error}"))?;
+                Ok(bytes)
+            }
+        }
+    }
+
     pub fn into_owned_bytes(self) -> Result<Vec<u8>, String> {
         match self {
             Self::Inline(bytes) => Ok(bytes),
@@ -179,6 +204,45 @@ impl ResponseData {
                 backing.release();
                 copied
             }
+        }
+    }
+}
+
+/// One in-progress local copy. Even cancellation returns its allocation
+/// through the same owner that delivers a completed item.
+pub(crate) struct ItemBuffer {
+    pub(crate) bytes: Vec<u8>,
+    reservation: Option<MemoryReservation>,
+}
+
+impl ItemBuffer {
+    pub(crate) fn new(bytes: Vec<u8>, reservation: MemoryReservation) -> Self {
+        Self {
+            bytes,
+            reservation: Some(reservation),
+        }
+    }
+
+    pub(crate) fn append_inline(&mut self, offset: u64, bytes: &[u8]) -> Result<(), IpcError> {
+        if self.bytes.len() as u64 != offset {
+            return Err(IpcError::Protocol(
+                "ITEM_DATA offset does not match the local item".into(),
+            ));
+        }
+        self.bytes.extend_from_slice(bytes);
+        Ok(())
+    }
+
+    pub(crate) fn into_buffer(mut self) -> BudgetedBuffer {
+        let reservation = self.reservation.take().expect("item reservation");
+        reservation.into_buffer(std::mem::take(&mut self.bytes))
+    }
+}
+
+impl Drop for ItemBuffer {
+    fn drop(&mut self) {
+        if let Some(reservation) = self.reservation.take() {
+            drop(reservation.into_buffer(std::mem::take(&mut self.bytes)));
         }
     }
 }

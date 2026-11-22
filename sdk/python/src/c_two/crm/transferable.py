@@ -11,6 +11,9 @@ from .. import error
 from .payload_plan import (
     PayloadBinding,
     PayloadPlanKind,
+    _DeferredFastDbPlan,
+    _fastdb_input_nbytes,
+    _materialize_direct_plan,
     _payload_type,
     decode_stage_of,
     fastdb_payload_binding,
@@ -31,7 +34,7 @@ class HeldResult(Generic[R]):
 
     __slots__ = (
         "_value", "_release_cb", "_invalidate_cb", "_released", "_buffer",
-        "_native_response", "_source_buffer", "_release_attempted",
+        "_native_response", "_source_buffer", "_release_attempted", "_owner_exports",
     )
 
     def __init__(
@@ -49,6 +52,7 @@ class HeldResult(Generic[R]):
         self._native_response: object | None = None
         self._source_buffer: object | None = None
         self._release_attempted = False
+        self._owner_exports = 0
 
     @property
     def value(self) -> R:
@@ -136,6 +140,12 @@ class HeldResult(Generic[R]):
         try:
             if response.is_released or self._invalidate_cb is None:
                 response.release()
+            elif self._owner_exports:
+                response.invalidate_then_release(
+                    self._invalidate_cb,
+                    self._value,
+                    expected_exports=self._owner_exports,
+                )
             else:
                 response.invalidate_then_release(self._invalidate_cb, self._value)
         except BaseException as exc:
@@ -259,25 +269,50 @@ def _build_transfer_wrapper(
     method_name = func.__name__
     method_signature = inspect.signature(func)
 
+    # Binding hooks and payload identities are frozen once here; the call
+    # path only reads them.
+    input_serializer = (
+        input.serialize
+        if input is not None and input.kind is not PayloadPlanKind.NO_PAYLOAD
+        else None
+    )
+    output_decoder = (
+        output.deserialize
+        if output is not None and output.kind is not PayloadPlanKind.NO_PAYLOAD
+        else None
+    )
+    output_invalidate = None if output is None else output.invalidate
+    has_scoped_output = output is not None and output.supports_scoped_owner
+    crm_input_decoder = (
+        input.deserialize
+        if input is not None and input.kind is not PayloadPlanKind.NO_PAYLOAD
+        else None
+    )
+    crm_output_serializer = (
+        output.serialize
+        if output is not None and output.kind is not PayloadPlanKind.NO_PAYLOAD
+        else None
+    )
+    crm_input_invalidate = None if input is None else input.invalidate
+    crm_scoped_input = input is not None and input.supports_scoped_owner
+    # A signature whose parameters are all plain positional ones admits an
+    # exact-count fast path: binding and default application are no-ops when
+    # the caller passed exactly that many positional values.
+    exact_arg_count = (
+        len(method_signature.parameters)
+        if all(
+            parameter.kind
+            in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+            for parameter in method_signature.parameters.values()
+        )
+        else None
+    )
+
     def com_to_crm(*args, _c2_buffer=None, _c2_follow_budget=None):
         prepared = None
         primary = None
         dispatched = False
-        input_serializer = (
-            input.serialize
-            if input is not None and input.kind is not PayloadPlanKind.NO_PAYLOAD
-            else None
-        )
-        output_decoder = (
-            output.deserialize
-            if output is not None and output.kind is not PayloadPlanKind.NO_PAYLOAD
-            else None
-        )
-        retained_owner = (
-            _c2_buffer == "hold"
-            and output is not None
-            and output.supports_scoped_owner
-        )
+        retained_owner = _c2_buffer == "hold" and has_scoped_output
 
         if len(args) < 1:
             raise ValueError(
@@ -299,7 +334,21 @@ def _build_transfer_wrapper(
         if getattr(client, "supports_direct_call", False):
             from ..transport.client.proxy import _LocalRouteClosed
             try:
-                result = client.call_direct(method_name, request or ())
+                direct_args = request or ()
+                if crm_scoped_input and direct_args:
+                    try:
+                        direct_args = (_materialize_direct_plan(direct_args[0], input),)
+                    except BaseException as exc:
+                        raise _client_input_error(exc) from exc
+                result = client.call_direct(method_name, direct_args)
+                try:
+                    result = _materialize_direct_plan(result, output)
+                except BaseException as exc:
+                    raise error.SerializationError(
+                        error.ErrorCode.ResourceOutputSerializing,
+                        _safe_error_message(exc),
+                        details=_cause_details(exc),
+                    ) from exc
             except _LocalRouteClosed:
                 if budget is None:
                     budget = crm.client.start_call_budget()
@@ -321,17 +370,12 @@ def _build_transfer_wrapper(
         try:
             if (
                 prepared is not None
-                and input is not None
-                and input.kind is PayloadPlanKind.FASTDB
+                and crm_scoped_input
                 and request is not None
                 and len(request) == 1
             ):
                 try:
-                    nbytes = (
-                        request[0].execution_report().used_bytes
-                        if isinstance(request[0], _payload_type(required=True))
-                        else None
-                    )
+                    nbytes = _fastdb_input_nbytes(request[0])
                 except BaseException as exc:
                     raise _client_input_error(exc) from exc
                 if nbytes is not None:
@@ -347,23 +391,50 @@ def _build_transfer_wrapper(
 
             call_client = client if prepared is None else prepared
             dispatched = True
-            response = call_client.call(method_name, serialized_args)
+            release_view_in_native = (
+                crm_scoped_input
+                and isinstance(serialized_args, memoryview)
+                and getattr(call_client, "_supports_release_input", False)
+            )
+            try:
+                if release_view_in_native:
+                    response = call_client.call(
+                        method_name, serialized_args, release_input=True,
+                    )
+                else:
+                    response = call_client.call(method_name, serialized_args)
+            except error.CCBaseError:
+                raise
+            except Exception as exc:
+                if isinstance(serialized_args, _DeferredFastDbPlan):
+                    raise _client_input_error(exc) from exc
+                raise
+            finally:
+                if crm_scoped_input and isinstance(serialized_args, memoryview):
+                    serialized_args.release()
 
             view = None
             decoded = False
             decoding = False
+            owner_exports = 0
             try:
                 native_response = _is_native_response_owner(response)
                 releasable_response = native_response or callable(getattr(response, "release", None))
                 if output_decoder is None:
                     _release_response(response)
                     return HeldResult(None) if _c2_buffer == "hold" else None
-                if releasable_response or retained_owner:
+                direct_native_decode = native_response and hasattr(response, "export_count")
+                if retained_owner or (releasable_response and not direct_native_decode):
                     view = memoryview(response)
+                exports_before = response.export_count if direct_native_decode else 0
                 decoding = True
-                result = output_decoder(view if view is not None else response)
+                result = output_decoder(
+                    response if direct_native_decode else (view if view is not None else response)
+                )
                 decoding = False
                 decoded = True
+                if direct_native_decode:
+                    owner_exports = max(0, response.export_count - exports_before)
                 if retained_owner:
                     if hasattr(response, "track_retained"):
                         tracker = getattr(client, "local_copy_tracker", None)
@@ -372,17 +443,18 @@ def _build_transfer_wrapper(
                                 tracker, getattr(client, "route_name", ""),
                                 method_name, "client_response",
                             )
-                    held = HeldResult(result, buffer=view, invalidate_cb=output.invalidate)
+                    held = HeldResult(result, buffer=view, invalidate_cb=output_invalidate)
                     if native_response:
                         held._native_response = response
+                        held._owner_exports = owner_exports
                     elif releasable_response:
                         held._source_buffer = response
                     return held
             except BaseException as exc:
-                if decoded and output is not None and output.invalidate is not None:
+                if decoded and output_invalidate is not None:
                     _cleanup_preserving_primary(
                         exc, lambda: _invalidate_and_release_held_response(
-                            view, response, output.invalidate, result,
+                            view, response, output_invalidate, result, owner_exports,
                         ),
                     )
                 elif output_decoder is not None:
@@ -393,10 +465,10 @@ def _build_transfer_wrapper(
 
             if releasable_response:
                 try:
-                    _release_view_and_response(view, response)
+                    _release_decoded_response(
+                        view, response, output_invalidate, result, owner_exports,
+                    )
                 except BaseException as exc:
-                    if output is not None and output.invalidate is not None:
-                        _cleanup_preserving_primary(exc, lambda: output.invalidate(result))
                     raise _client_output_error(exc) from exc
             return HeldResult(result) if _c2_buffer == "hold" else result
         except BaseException as exc:
@@ -412,25 +484,18 @@ def _build_transfer_wrapper(
     def crm_to_com(
         *args,
         _release_fn=None,
+        _detach_input=None,
+        _response_sink=None,
         _c2_input_buffer_mode=None,
     ):
         input_buffer_mode = _c2_input_buffer_mode or "view"
-        input_decoder = (
-            input.deserialize
-            if input is not None and input.kind is not PayloadPlanKind.NO_PAYLOAD
-            else None
-        )
-        output_serializer = (
-            output.serialize
-            if output is not None and output.kind is not PayloadPlanKind.NO_PAYLOAD
-            else None
-        )
-        if input_buffer_mode == "borrowed":
-            if input is None or not input.supports_scoped_owner:
-                def input_decoder(_request):
-                    raise ValueError(
-                        "borrowed input requires an explicit FastDB Payload binding",
-                    )
+        input_decoder = crm_input_decoder
+        output_serializer = crm_output_serializer
+        if input_buffer_mode == "borrowed" and not crm_scoped_input:
+            def input_decoder(_request):
+                raise ValueError(
+                    "borrowed input requires an explicit FastDB Payload binding",
+                )
 
         stage = "deserialize_input"
         deserialized_args: tuple[object, ...] = ()
@@ -438,15 +503,11 @@ def _build_transfer_wrapper(
         def release_input_buffer() -> None:
             nonlocal _release_fn, deserialized_args
             first_error: BaseException | None = None
-            if (
-                input_buffer_mode == "borrowed"
-                and input is not None
-                and input.invalidate is not None
-            ):
+            if input_buffer_mode == "borrowed" and crm_input_invalidate is not None:
                 values, deserialized_args = deserialized_args, ()
                 for value in values:
                     try:
-                        input.invalidate(value)
+                        crm_input_invalidate(value)
                     except BaseException as exc:
                         if first_error is None:
                             first_error = exc
@@ -480,7 +541,11 @@ def _build_transfer_wrapper(
                 decoded = input_decoder(request)
                 deserialized_args = decoded if isinstance(decoded, tuple) else (decoded,)
                 if input_buffer_mode != "borrowed":
-                    release_input_buffer()
+                    if crm_scoped_input and _detach_input is not None:
+                        _detach_input()
+                        _release_fn = None
+                    else:
+                        release_input_buffer()
             else:
                 deserialized_args = ()
                 release_input_buffer()
@@ -523,24 +588,49 @@ def _build_transfer_wrapper(
                 finally:
                     failure = None
 
-        serialized_result = b""
-        if output_serializer is not None:
-            try:
-                serialized_result = output_serializer(result)
-            except BaseException as exc:
-                failure = exc
+        serialized_result = None
+        borrowed_plan = None
+        try:
+            serialized_result = output_serializer(result) if output_serializer is not None else b""
+            if input_buffer_mode == "borrowed" and isinstance(
+                serialized_result, _DeferredFastDbPlan,
+            ):
+                borrowed_plan = serialized_result.plan
+            if _response_sink is not None:
                 try:
-                    failure = error.SerializationError(
-                        error.ErrorCode.ResourceOutputSerializing,
-                        _safe_error_message(exc),
-                        details=_cause_details(exc),
-                    )
-                    raise failure from exc
+                    _response_sink.write(serialized_result)
                 finally:
-                    try:
-                        _cleanup_preserving_primary(failure, release_input_buffer)
-                    finally:
-                        failure = None
+                    if has_scoped_output and isinstance(serialized_result, memoryview):
+                        serialized_result.release()
+                    serialized_result = None
+                    result = None
+                borrowed_plan = None
+            elif input_buffer_mode == "borrowed":
+                if isinstance(serialized_result, memoryview):
+                    # A direct dispatcher invocation without a sink must finish
+                    # reading the response before invalidating its borrowed input.
+                    with serialized_result as response_view:
+                        serialized_result = bytes(response_view)
+                elif isinstance(serialized_result, _DeferredFastDbPlan):
+                    serialized_result = serialized_result._c2_materialize_bytes()
+                result = None
+                borrowed_plan = None
+        except BaseException as exc:
+            if borrowed_plan is not None:
+                try:
+                    borrowed_plan.close()
+                except BaseException:
+                    pass
+                borrowed_plan = None
+            result = None
+            serialized_result = None
+            failure = error.SerializationError(
+                error.ErrorCode.ResourceOutputSerializing,
+                _safe_error_message(exc),
+                details=_cause_details(exc),
+            )
+            _cleanup_preserving_primary(failure, release_input_buffer)
+            raise failure from exc
 
         if _release_fn is not None or input_buffer_mode == "borrowed":
             # Borrowed inputs invalidate only after their output serialization
@@ -569,6 +659,14 @@ def _build_transfer_wrapper(
 
         if crm.direction == "->":
             c2_buffer = kwargs.pop("_c2_buffer", None)
+            if (
+                exact_arg_count is not None
+                and not kwargs
+                and len(args) == exact_arg_count
+            ):
+                # Exact positional call over an all-positional signature:
+                # binding and default application would be no-ops.
+                return com_to_crm(*args, _c2_buffer=c2_buffer)
             bound = method_signature.bind(*args, **kwargs)
             bound.apply_defaults()
             if bound.kwargs:
@@ -729,11 +827,38 @@ def _release_view_and_response(view: memoryview | None, response: object) -> Non
             del first_error
 
 
+def _release_decoded_response(
+    view,
+    response,
+    invalidator,
+    value,
+    owner_exports: int = 0,
+) -> None:
+    detach = getattr(response, "detach_for_owned", None) if invalidator is not None else None
+    try:
+        if detach is None:
+            _release_view_and_response(view, response)
+        else:
+            if view is not None:
+                view.release()
+            detach()
+    except BaseException as exc:
+        if invalidator is not None:
+            if detach is None:
+                _cleanup_preserving_primary(exc, lambda: invalidator(value))
+            else:
+                _cleanup_preserving_primary(exc, lambda: _invalidate_and_release_held_response(
+                    view, response, invalidator, value, owner_exports,
+                ))
+        raise
+
+
 def _invalidate_and_release_held_response(
     view: memoryview | None,
     response: object,
     invalidator: Callable[[object], None],
     value: object,
+    owner_exports: int = 0,
 ) -> None:
     first_error: BaseException | None = None
     try:
@@ -745,7 +870,10 @@ def _invalidate_and_release_held_response(
     core_release = getattr(response, "invalidate_then_release", None)
     if callable(core_release):
         try:
-            core_release(invalidator, value)
+            if owner_exports:
+                core_release(invalidator, value, expected_exports=owner_exports)
+            else:
+                core_release(invalidator, value)
         except BaseException as exc:
             if first_error is None:
                 first_error = exc

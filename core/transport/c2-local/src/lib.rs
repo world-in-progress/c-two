@@ -14,7 +14,7 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use futures_util::task::AtomicWaker;
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 pub use c2_config::{LocalEndpoint, LocalEndpointContext};
 pub use c2_local_security::{is_peer_identity_mismatch, peer_identity_mismatch};
@@ -661,6 +661,31 @@ impl AsyncWrite for LocalStream {
         }
         Pin::new(&mut *stream).poll_write(cx, bytes)
     }
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        this.owner.abort.0.writer.register(cx.waker());
+        let mut stream = this
+            .owner
+            .stream
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if this.owner.abort.is_aborted() {
+            return Poll::Ready(Err(aborted()));
+        }
+        Pin::new(&mut *stream).poll_write_vectored(cx, bufs)
+    }
+    fn is_write_vectored(&self) -> bool {
+        let stream = self
+            .owner
+            .stream
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        stream.is_write_vectored()
+    }
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
         this.owner.abort.0.writer.register(cx.waker());
@@ -729,11 +754,55 @@ impl AsyncWrite for LocalWriteHalf {
     ) -> Poll<io::Result<usize>> {
         Pin::new(&mut self.get_mut().inner).poll_write(cx, bytes)
     }
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.get_mut().inner).poll_write_vectored(cx, bufs)
+    }
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Pin::new(&mut self.get_mut().inner).poll_flush(cx)
     }
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
+}
+
+/// Advance one whole-buffer write without arming a deadline. Mirrors
+/// `AsyncWriteExt::write_all` byte accounting: a zero-byte acceptance is a
+/// `WriteZero` failure, never silent progress. The Windows pipe adapter adds
+/// its zero-byte drain flush after the bytes; a Unix socket flush is a no-op,
+/// so no flush is issued there.
+fn poll_write_all<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    bytes: &[u8],
+    written: &mut usize,
+    cx: &mut Context<'_>,
+) -> Poll<io::Result<()>> {
+    while *written < bytes.len() {
+        match Pin::new(&mut *writer).poll_write(cx, &bytes[*written..]) {
+            Poll::Ready(Ok(0)) => {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "failed to write whole buffer",
+                )));
+            }
+            Poll::Ready(Ok(count)) => *written += count,
+            Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+            Poll::Pending => return Poll::Pending,
+        }
+    }
+    #[cfg(windows)]
+    {
+        Pin::new(&mut *writer).poll_flush(cx)
+    }
+    #[cfg(not(windows))]
+    {
+        Poll::Ready(Ok(()))
     }
 }
 
@@ -744,9 +813,40 @@ async fn write_complete<W: AsyncWrite + Unpin>(
     timeout: Duration,
 ) -> io::Result<()> {
     let mut guard = AbortOnDrop(Some(abort.clone()));
+    // Two-phase write: a ready kernel socket completes the whole frame on the
+    // first nonblocking pass, so the common request, reply and RELEASE frames
+    // pay no timer allocation or timer-wheel registration. Only the first real
+    // `Pending` (kernel send backpressure) starts the deadline-bounded wait
+    // for the remaining bytes; a partially started or cancelled write still
+    // aborts local I/O through the guard.
+    let mut written = 0;
+    enum WriteStep {
+        Complete(io::Result<()>),
+        Backpressured,
+    }
+    let step = std::future::poll_fn(|cx| {
+        Poll::Ready(match poll_write_all(writer, bytes, &mut written, cx) {
+            Poll::Ready(result) => WriteStep::Complete(result),
+            Poll::Pending => WriteStep::Backpressured,
+        })
+    })
+    .await;
+    match step {
+        WriteStep::Complete(Ok(())) => {
+            guard.0 = None;
+            return Ok(());
+        }
+        WriteStep::Complete(Err(error)) => return Err(error),
+        WriteStep::Backpressured => {}
+    }
+    if timeout == Duration::ZERO {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "local write deadline expired",
+        ));
+    }
     let result = tokio::time::timeout(timeout, async {
-        AsyncWriteExt::write_all(writer, bytes).await?;
-        AsyncWriteExt::flush(writer).await
+        std::future::poll_fn(|cx| poll_write_all(writer, bytes, &mut written, cx)).await
     })
     .await
     .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "local write deadline expired"))?;
@@ -851,10 +951,51 @@ mod write_completion_tests {
         }
     }
 
+    /// Never accepts bytes: the first real `Pending` that starts the deadline.
+    struct StalledWriter;
+    impl AsyncWrite for StalledWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            _: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Pending
+        }
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            self.poll_flush(cx)
+        }
+    }
+
+    /// Rejects any byte with a zero-byte acceptance, exercising WriteZero.
+    struct ZeroWriter;
+    impl AsyncWrite for ZeroWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            _: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Ok(0))
+        }
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            self.poll_flush(cx)
+        }
+    }
+
     fn abort() -> AbortHandle {
         AbortHandle::new()
     }
 
+    // The Windows pipe adapter proves its overlapped write ended through the
+    // flush probe, so both flush faults stay observable there. A Unix socket
+    // flush is a no-op that write_complete skips entirely; backpressure
+    // coverage on Unix is the stalled-write test below.
+    #[cfg(windows)]
     #[tokio::test(start_paused = true)]
     async fn complete_write_aborts_on_flush_error_and_configured_timeout() {
         for fault in [1, 2] {
@@ -887,6 +1028,71 @@ mod write_completion_tests {
                 assert_eq!(start.elapsed(), Duration::from_millis(175));
             }
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn backpressured_write_reports_deadline_and_aborts_local_io() {
+        let mut writer = StalledWriter;
+        let abort = abort();
+        let start = tokio::time::Instant::now();
+        let error = write_complete(
+            &mut writer,
+            abort.clone(),
+            b"complete frame",
+            Duration::from_millis(175),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(abort.is_aborted());
+        assert_eq!(start.elapsed(), Duration::from_millis(175));
+    }
+
+    #[tokio::test]
+    async fn zero_deadline_with_immediate_backpressure_still_fails_fast() {
+        let mut writer = StalledWriter;
+        let abort = abort();
+        let error = write_complete(&mut writer, abort.clone(), b"frame", Duration::ZERO)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(abort.is_aborted());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn completed_fast_path_never_aborts_a_healthy_stream() {
+        let mut writer = FaultWriter {
+            bytes: Vec::new(),
+            limit: 100,
+            flush: 0,
+        };
+        let abort = abort();
+        write_complete(
+            &mut writer,
+            abort.clone(),
+            b"complete frame",
+            Duration::ZERO,
+        )
+        .await
+        .unwrap();
+        assert_eq!(writer.bytes, b"complete frame");
+        assert!(!abort.is_aborted());
+    }
+
+    #[tokio::test]
+    async fn zero_length_acceptance_fails_with_write_zero_and_aborts() {
+        let mut writer = ZeroWriter;
+        let abort = abort();
+        let error = write_complete(
+            &mut writer,
+            abort.clone(),
+            b"complete frame",
+            c2_config::WRITE_TIMEOUT,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::WriteZero);
+        assert!(abort.is_aborted());
     }
 
     #[tokio::test]

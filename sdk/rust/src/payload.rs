@@ -1,4 +1,4 @@
-use fastdb::{CompiledSpec, OpenOptions, Payload, PayloadError};
+use fastdb::{CompiledSpec, ExternalBytes, OpenOptions, Payload, PayloadError};
 
 use c2_core::{
     AdapterFailure, AdapterFailurePhase, EncodedStream, EncodedStreamItem, HeldResponse,
@@ -6,6 +6,7 @@ use c2_core::{
 };
 use c2_error::C2Error;
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::Arc;
 
 use crate::{Error, Held};
 
@@ -28,28 +29,48 @@ pub fn charge_payload_input(call: &mut PreparedCall, payload: &Payload) -> Resul
     call.charge_input(nbytes)
 }
 
-/// Open an owned FastDB copy from detached response bytes.
+fn open_options_for_len(len: usize) -> OpenOptions {
+    let mut options = OpenOptions::default();
+    options.max_total_bytes = options.max_total_bytes.max(len as u64);
+    options
+}
+
+/// Open detached response bytes as a FastDB payload, moving a supplied `Vec`.
 ///
 /// Generated code remains responsible for selecting the exact adapter phase
 /// and checking the contract-owned expected specification digest.
-pub fn open_owned(spec: &CompiledSpec, bytes: &[u8]) -> Result<Payload, PayloadError> {
-    Payload::open_copy(spec, bytes, &OpenOptions::default())
+pub fn open_owned(spec: &CompiledSpec, bytes: impl Into<Vec<u8>>) -> Result<Payload, PayloadError> {
+    let bytes = bytes.into();
+    let options = open_options_for_len(bytes.len());
+    let external = ExternalBytes::from_owner(bytes);
+    Payload::open_external(spec, &external, &options)
 }
 
-/// Open a copy-backed FastDB payload while retaining the local response copy.
+struct HeldBytes(Arc<HeldResponse>);
+
+impl AsRef<[u8]> for HeldBytes {
+    fn as_ref(&self) -> &[u8] {
+        self.0.bytes()
+    }
+}
+
+/// Open a FastDB payload backed by the retained local response copy.
 pub fn open_held(
     spec: &CompiledSpec,
     response: HeldResponse,
 ) -> Result<Held<Payload>, PayloadError> {
-    let payload = Payload::open_copy(spec, response.bytes(), &OpenOptions::default())?;
-    Ok(Held::new(payload, response, invalidate_payload))
+    let options = open_options_for_len(response.bytes().len());
+    let shared = Arc::new(response);
+    let external = ExternalBytes::from_owner(HeldBytes(Arc::clone(&shared)));
+    let payload = Payload::open_external(spec, &external, &options)?;
+    Ok(Held::new_shared(payload, shared, invalidate_payload))
 }
 
 fn invalidate_payload(payload: &Payload) -> Result<(), String> {
     payload.invalidate().map_err(|error| error.to_string())
 }
 
-/// Callback-scoped owner for a generated service's copy-backed FastDB input.
+/// Callback-scoped owner for a generated service's FastDB input.
 ///
 /// Generated adapters construct this guard inside [`c2_core::EncodedService`]
 /// invocation, after Core has released the request transport storage. Its `Drop`
@@ -83,9 +104,12 @@ impl Drop for BorrowedPayload {
 }
 
 /// Open one generated service input whose lifetime ends with its callback.
-pub fn open_borrowed(spec: &CompiledSpec, bytes: &[u8]) -> Result<BorrowedPayload, PayloadError> {
+pub fn open_borrowed(
+    spec: &CompiledSpec,
+    bytes: impl Into<Vec<u8>>,
+) -> Result<BorrowedPayload, PayloadError> {
     Ok(BorrowedPayload {
-        payload: Payload::open_copy(spec, bytes, &OpenOptions::default())?,
+        payload: open_owned(spec, bytes)?,
         invalidated: false,
     })
 }

@@ -1221,6 +1221,7 @@ async fn admission_global_queue_rejects_old_route_guard() {
         &conn,
         1,
         OwnedRequestInput::unreserved(RequestData::Inline(vec![])),
+        &server.domain_budget,
         |_| panic!("old global waiter must not invoke the resource"),
     ));
     assert!(admission_poll_once(request.as_mut()).await.is_pending());
@@ -1257,6 +1258,7 @@ async fn admission_global_queue_rejects_old_route_guard() {
         &conn,
         2,
         OwnedRequestInput::unreserved(RequestData::Inline(vec![])),
+        &server.domain_budget,
         |_| Ok(ResponseMeta::Inline(vec![])),
     )
     .await
@@ -5990,18 +5992,6 @@ async fn ping_is_served_while_chunk_processing_capacity_is_exhausted() {
 }
 
 #[test]
-fn buddy_response_wire_limit_rejects_oversized_payloads() {
-    assert_eq!(
-        crate::response::buddy_response_data_size(u32::MAX as usize),
-        Some(u32::MAX)
-    );
-    assert_eq!(
-        crate::response::buddy_response_data_size(u32::MAX as usize + 1),
-        None
-    );
-}
-
-#[test]
 fn inline_reply_frame_len_rejects_unrepresentable_frames() {
     assert!(inline_reply_total_len(16).is_ok());
 
@@ -7077,6 +7067,7 @@ async fn rejected_acquire_releases_materialized_request_on_its_original_connecti
             &conn,
             1,
             OwnedRequestInput::unreserved(request),
+            &DomainBudget::from_limits(&DomainLimits::default()),
             move |_| {
                 invoked.store(true, Ordering::SeqCst);
                 Ok(ResponseMeta::Empty)

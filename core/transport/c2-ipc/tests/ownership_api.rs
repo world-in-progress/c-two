@@ -58,7 +58,7 @@ const CASES: &[(&str, Probe)] = &[
     ),
     (
         "vuln_response_meta_shm_alloc_publication",
-        Probe::Fails(&["E0624"]),
+        Probe::Fails(&["E0599", "E0624"]),
     ),
     (
         "vuln_connection_server_pool_raw_access",

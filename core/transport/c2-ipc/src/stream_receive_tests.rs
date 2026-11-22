@@ -365,6 +365,100 @@ async fn send_item(stream: &mut LocalStream, rid: u64, bytes: &[u8]) {
     }
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn topic_inline_fragments_assemble_and_partial_delivery_recycles_on_cancel() {
+    let endpoint = Endpoint::new();
+    let mut listener = LocalListener::bind(&endpoint.endpoint).unwrap();
+    let size = 2 * c2_config::CHUNK_SIZE + 1;
+    let budget = memory_budget(3 * size);
+    let payload: Vec<_> = (0..size).map(|index| (index % 251) as u8).collect();
+    let expected = payload.clone();
+    let (next_tx, next_rx) = oneshot::channel();
+    let (partial_tx, partial_rx) = oneshot::channel();
+    let peer = tokio::spawn(async move {
+        let mut socket = accept(&mut listener).await;
+        let (open, _) = read_frame(&mut socket).await;
+        let id = open.request_id;
+        socket
+            .write_all(&rpc::encode_ready_frame(id, 1).unwrap())
+            .await
+            .unwrap();
+        socket
+            .write_all(&rpc::encode_subscribe_item_begin_frame(id, 1, size).unwrap())
+            .await
+            .unwrap();
+        grant(&mut socket, id, size, 0).await;
+        for part in payload.chunks(c2_config::CHUNK_SIZE as usize) {
+            socket
+                .write_all(&encode_item_data_frame(id, ValueStorage::Inline(part)).unwrap())
+                .await
+                .unwrap();
+        }
+
+        grant(&mut socket, id, 0, 1).await;
+        next_rx.await.unwrap();
+        socket
+            .write_all(&rpc::encode_subscribe_item_begin_frame(id, 2, size).unwrap())
+            .await
+            .unwrap();
+        grant(&mut socket, id, size, 0).await;
+        socket
+            .write_all(&encode_item_data_frame(id, ValueStorage::Inline(&payload[..1])).unwrap())
+            .await
+            .unwrap();
+        partial_tx.send(()).unwrap();
+        let (cancel, _) = read_frame(&mut socket).await;
+        assert_eq!(cancel.request_id, id);
+        let error =
+            C2Error::new(ErrorCode::CallCancelled, "subscription cancelled").to_wire_bytes();
+        socket
+            .write_all(
+                &encode_call_end_frame(
+                    id,
+                    CallMode::Subscribe,
+                    CallStatus::Failed,
+                    1,
+                    ValuePart::whole(ValueStorage::Inline(&error)),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        drop(socket);
+        crate::tests::close_listener(listener).await;
+    });
+    let mut client = endpoint.client();
+    client.connect().await.unwrap();
+    let mut response = client
+        .subscribe_bound(
+            &large_binding(),
+            "frames",
+            rpc::WireSubscribeOptions {
+                start: rpc::WireTopicStart::Next,
+                on_lag: rpc::WireLagPolicy::Error,
+            },
+            budget.clone(),
+        )
+        .await
+        .unwrap();
+    let item = timeout(WAIT, response.recv()).await.unwrap().unwrap();
+    assert_eq!(item.seq, 1);
+    assert_eq!(item.bytes.as_ref(), expected);
+    let ptr = item.bytes.as_ptr();
+    drop(item);
+    next_tx.send(()).unwrap();
+    timeout(WAIT, partial_rx).await.unwrap().unwrap();
+    response.cancel().unwrap();
+    let terminal = timeout(WAIT, response.completion()).await.unwrap().unwrap();
+    assert_eq!(terminal.complete_items, 1);
+    assert_eq!(terminal.error.unwrap().code, ErrorCode::CallCancelled);
+    assert_eq!(budget.snapshot().memory.used_bytes, 0);
+    let recycled = budget.allocate_vec(size as usize).unwrap();
+    assert_eq!(recycled.as_ptr(), ptr);
+    client.close_shared().await;
+    peer.await.unwrap();
+}
+
 async fn bad_terminal(fault: u8) {
     let endpoint = Endpoint::new();
     let mut listener = LocalListener::bind(&endpoint.endpoint).unwrap();

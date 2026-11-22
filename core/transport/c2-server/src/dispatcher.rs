@@ -1,7 +1,10 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use c2_mem::{MemHandle, MemPool, PeerMappingCache, PeerRead};
+use c2_mem::{
+    DomainBudget, MemHandle, MemPool, MemoryReservation, PeerMappingCache, PeerRead, RecycledBytes,
+    WritableSlab,
+};
 use c2_wire::buddy::BuddyPayload;
 use c2_wire::chunk::ReassemblyBacking;
 use c2_wire::connection::{ConnectionCore, ConnectionError, PreparedLoan, RemoteLoan};
@@ -80,16 +83,19 @@ impl std::fmt::Debug for PreparedShmResponse {
 }
 
 impl PreparedShmResponse {
-    pub(crate) fn new(
-        pool: Arc<parking_lot::RwLock<MemPool>>,
-        handle: MemHandle,
-        data_size: u32,
-    ) -> Self {
+    pub(crate) fn from_slab(slab: WritableSlab) -> Self {
+        // SAFETY: the response owner retains the original pool alongside its
+        // handle until local release or transfer to the connection loan book.
+        let (pool, handle) = unsafe { slab.into_parts() };
         Self {
+            data_size: handle.len() as u32,
             pool,
             handle: Some(handle),
-            data_size,
         }
+    }
+
+    pub(crate) fn belongs_to(&self, pool: &crate::ResponsePool) -> bool {
+        Arc::ptr_eq(&self.pool, &pool.inner)
     }
 
     pub fn data_size(&self) -> u32 {
@@ -102,22 +108,6 @@ impl PreparedShmResponse {
 
     pub fn is_dedicated(&self) -> bool {
         self.handle.as_ref().is_some_and(MemHandle::is_dedicated)
-    }
-
-    pub(crate) fn fill(
-        &mut self,
-        write_into: impl FnOnce(&mut [u8]) -> Result<(), String>,
-    ) -> Result<(), String> {
-        // Pin the mapping without holding a pool guard: the pin owns the
-        // mapping Arc, so an external `write_range` callback can no longer
-        // block pool writes (for example a RELEASE recycling a block).
-        let mut pin = {
-            let pool = self.pool.read();
-            let handle = self.handle.as_mut().expect("live prepared owner");
-            pool.pin_shm_mut(handle)
-                .map_err(|error| format!("prepared response pin failed: {error}"))?
-        };
-        write_into(pin.as_mut_slice())
     }
 
     pub(crate) fn copy_logical_bytes(&self) -> Result<Vec<u8>, String> {
@@ -203,15 +193,25 @@ impl PeerShmRequest {
     }
 
     /// Copy the request bytes out of the peer's published block.
-    fn into_owned_bytes(self) -> Result<Vec<u8>, String> {
+    fn into_recycled_bytes(
+        self,
+        budget: &DomainBudget,
+        mut memory: Option<MemoryReservation>,
+    ) -> Result<(RecycledBytes, Option<MemoryReservation>), String> {
+        let len = self.read.len();
+        let mut bytes = match &mut memory {
+            Some(reservation) => reservation.allocate_vec(len),
+            None => budget.allocate_vec(len),
+        }
+        .map_err(|error| format!("request SHM copy allocation failed: {error}"))?;
         let Self { read, loan } = self;
-        // SAFETY: frame admission pinned this exact span; its original
-        // connection loan keeps the published bytes immutable through copy.
-        let copied =
-            unsafe { read.copy() }.map_err(|error| format!("request SHM copy failed: {error}"));
+        // SAFETY: the admitted loan keeps the peer span immutable until the
+        // read pin is dropped and release is queued below.
+        let copied = unsafe { read.copy_into_vec(&mut bytes) };
         drop(read);
         loan.finish();
-        copied
+        copied?;
+        Ok((RecycledBytes::new(bytes, budget.clone()), memory))
     }
 }
 
@@ -231,18 +231,27 @@ pub(crate) enum RequestData {
 }
 
 impl RequestData {
-    pub(crate) fn into_owned_bytes(self) -> Result<Vec<u8>, String> {
-        match self {
-            Self::Inline(data) => Ok(data),
-            Self::Shm(carrier) => carrier.into_owned_bytes(),
+    pub(crate) fn into_recycled_bytes(
+        self,
+        budget: &DomainBudget,
+        memory: Option<MemoryReservation>,
+    ) -> Result<(RecycledBytes, Option<MemoryReservation>), String> {
+        let bytes = match self {
+            Self::Inline(data) => data,
+            Self::Shm(carrier) => return carrier.into_recycled_bytes(budget, memory),
             Self::Handle(mut backing) => {
+                let mut bytes = budget
+                    .allocate_vec(backing.len())
+                    .map_err(|error| format!("request copy allocation failed: {error}"))?;
                 let copied = backing
-                    .copy_bytes()
+                    .with_slice(|source| bytes.extend_from_slice(source))
                     .map_err(|error| format!("request handle copy failed: {error}"));
                 backing.release();
-                copied
+                copied?;
+                bytes
             }
-        }
+        };
+        Ok((RecycledBytes::new(bytes, budget.clone()), memory))
     }
 }
 
@@ -271,6 +280,16 @@ pub trait CrmCallback: Send + Sync + 'static {
         request: Vec<u8>,
         response_pool: Arc<crate::ResponsePool>,
     ) -> Result<ResponseMeta, CrmError>;
+
+    fn invoke_recycled(
+        &self,
+        route_name: &str,
+        method_idx: u16,
+        request: RecycledBytes,
+        response_pool: Arc<crate::ResponsePool>,
+    ) -> Result<ResponseMeta, CrmError> {
+        self.invoke(route_name, method_idx, request.into_vec(), response_pool)
+    }
 }
 
 /// One server stream's resource state, advanced only while holding its route permit.
@@ -309,6 +328,16 @@ pub trait CrmStreamCallback: CrmCallback {
         request: Vec<u8>,
         response_pool: Arc<crate::ResponsePool>,
     ) -> Result<Box<dyn CrmStream>, CrmError>;
+
+    fn open_stream_recycled(
+        &self,
+        route_name: &str,
+        method_idx: u16,
+        request: RecycledBytes,
+        response_pool: Arc<crate::ResponsePool>,
+    ) -> Result<Box<dyn CrmStream>, CrmError> {
+        self.open_stream(route_name, method_idx, request.into_vec(), response_pool)
+    }
 }
 
 struct StreamUnaryCallback(Arc<dyn CrmStreamCallback>);
@@ -323,6 +352,17 @@ impl CrmCallback for StreamUnaryCallback {
     ) -> Result<ResponseMeta, CrmError> {
         self.0
             .invoke(route_name, method_idx, request, response_pool)
+    }
+
+    fn invoke_recycled(
+        &self,
+        route_name: &str,
+        method_idx: u16,
+        request: RecycledBytes,
+        response_pool: Arc<crate::ResponsePool>,
+    ) -> Result<ResponseMeta, CrmError> {
+        self.0
+            .invoke_recycled(route_name, method_idx, request, response_pool)
     }
 }
 
@@ -680,19 +720,24 @@ mod tests {
         core
     }
 
+    fn dispatch_bytes(data: RequestData) -> RecycledBytes {
+        let budget = DomainBudget::from_limits(&c2_config::DomainLimits::default());
+        data.into_recycled_bytes(&budget, None).unwrap().0
+    }
+
     #[test]
     fn inline_request_moves_owned_bytes() {
         let bytes = b"inline".to_vec();
         let pointer = bytes.as_ptr();
-        let received = RequestData::Inline(bytes).into_owned_bytes().unwrap();
-        assert_eq!(received, b"inline");
+        let received = dispatch_bytes(RequestData::Inline(bytes));
+        assert_eq!(received.as_slice(), b"inline");
         assert_eq!(received.as_ptr(), pointer);
     }
 
     #[test]
     fn peer_request_copy_ends_remote_read_and_queues_release() {
         let mut owner = request_test_pool();
-        let payload = b"borrowed request".repeat(128);
+        let payload = vec![0x31; 256 * 1024];
         let mut handle = owner.alloc_shm_handle(payload.len()).unwrap();
         owner
             .handle_slice_mut(&mut handle)
@@ -712,10 +757,20 @@ mod tests {
             loan_id: 7,
         };
         let carrier = PeerShmRequest::admit(peer, descriptor, loan).unwrap();
-        assert_eq!(
-            RequestData::Shm(carrier).into_owned_bytes().unwrap(),
-            payload
-        );
+        let budget = DomainBudget::from_limits(&c2_config::DomainLimits {
+            memory_budget_bytes: (payload.len() * 3) as u64,
+            ..Default::default()
+        });
+        let warm = vec![0; payload.len()];
+        let ptr = warm.as_ptr();
+        budget.recycle_vec(warm);
+        let memory = budget.try_reserve_memory(payload.len() as u64).unwrap();
+        let (bytes, memory) = RequestData::Shm(carrier)
+            .into_recycled_bytes(&budget, Some(memory))
+            .unwrap();
+        assert_eq!(bytes.as_slice(), payload);
+        assert_eq!(bytes.as_ptr(), ptr);
+        assert_eq!(budget.snapshot().memory.used_bytes, payload.len() as u64);
         assert_eq!(owner.stats().alloc_count, 1);
         assert!(
             !core
@@ -725,6 +780,11 @@ mod tests {
                 .release_bytes()
                 .is_empty()
         );
+        drop(memory);
+        assert_eq!(budget.snapshot().memory.used_bytes, 0);
+        drop(bytes);
+        let reused = budget.allocate_vec(payload.len()).unwrap();
+        assert_eq!(reused.as_ptr(), ptr);
         owner.release_handle(handle);
     }
 
@@ -801,7 +861,7 @@ mod tests {
                 let carrier = carriers.pop().unwrap();
                 if consume {
                     assert_eq!(
-                        RequestData::Shm(carrier).into_owned_bytes().unwrap(),
+                        dispatch_bytes(RequestData::Shm(carrier)).as_slice(),
                         vec![0x37; len]
                     );
                 } else {
@@ -835,8 +895,8 @@ mod tests {
         let mut backing = ReassemblyBacking::admit(Arc::clone(&pool), 1, payload.len()).unwrap();
         backing.write_at(0, &payload).unwrap();
         backing.trim_to(4096).unwrap();
-        let bytes = RequestData::Handle(backing).into_owned_bytes().unwrap();
-        assert_eq!(bytes, payload[..4096]);
+        let bytes = dispatch_bytes(RequestData::Handle(backing));
+        assert_eq!(bytes.as_slice(), &payload[..4096]);
         assert_eq!(pool.read().stats().alloc_count, 0);
     }
 

@@ -571,3 +571,236 @@ fn subscription_slot_guard_preserves_control_headroom_without_blocking_n1() {
     drop(s2);
     assert_eq!(two.snapshot().operations.used_operations, 0);
 }
+
+#[test]
+fn warm_pool_reuses_the_smallest_matching_capacity() {
+    let size = WARM_BUFFER_MIN_BYTES;
+    let budget = domain((size * 8) as u64, 0, 0);
+    let larger = Vec::with_capacity(size + size / 4);
+    let larger_ptr = larger.as_ptr();
+    let exact = vec![7; size];
+    let exact_ptr = exact.as_ptr();
+    budget.recycle_vec(larger);
+    budget.recycle_vec(exact);
+    let exact = budget.allocate_vec(size).unwrap();
+    assert!(exact.is_empty());
+    assert_eq!(exact.as_ptr(), exact_ptr);
+    let larger = budget.allocate_vec(size).unwrap();
+    assert!(larger.is_empty());
+    assert_eq!(larger.as_ptr(), larger_ptr);
+
+    budget.recycle_vec(larger);
+    let mut reservation = budget.try_reserve_memory(size as u64).unwrap();
+    let larger = reservation.allocate_vec(size).unwrap();
+    assert_eq!(larger.as_ptr(), larger_ptr);
+    assert_eq!(reservation.bytes(), larger.capacity() as u64);
+    drop(reservation.into_buffer(larger));
+    assert_eq!(budget.snapshot().memory.used_bytes, 0);
+}
+
+#[test]
+fn warm_pool_excludes_small_buffers_and_evicts_oldest_by_count() {
+    let size = WARM_BUFFER_MIN_BYTES;
+    let budget = domain((size * 8) as u64, 0, 0);
+    budget.recycle_vec(Vec::with_capacity(size - 1));
+    assert!(budget.shared.lock().warm_buffers.is_empty());
+    let buffers: Vec<_> = (0..=WARM_BUFFER_MAX_COUNT)
+        .map(|index| Vec::with_capacity(size + index))
+        .collect();
+    for bytes in buffers {
+        budget.recycle_vec(bytes);
+    }
+    let state = budget.shared.lock();
+    assert_eq!(
+        state
+            .warm_buffers
+            .iter()
+            .map(Vec::capacity)
+            .collect::<Vec<_>>(),
+        (size + 1..=size + WARM_BUFFER_MAX_COUNT).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn warm_pool_respects_byte_limits_and_evicts_oldest_for_recycling() {
+    let size = WARM_BUFFER_MIN_BYTES;
+    let budget = domain((size * 3) as u64, 0, 0);
+    let first = Vec::with_capacity(size);
+    let second = Vec::with_capacity(size + 1);
+    let third = Vec::with_capacity(size + 2);
+    budget.recycle_vec(first);
+    budget.recycle_vec(second);
+    budget.recycle_vec(third);
+    budget.recycle_vec(Vec::with_capacity(size * 3 + 1));
+    let state = budget.shared.lock();
+    assert_eq!(state.warm_idle_bytes, (size * 2 + 3) as u64);
+    assert_eq!(state.warm_buffers.len(), 2);
+    assert_eq!(state.warm_buffers.front().unwrap().capacity(), size + 1);
+    assert_eq!(state.warm_capacity(), (size * 3) as u64);
+    drop(state);
+
+    let large_domain = domain(u64::MAX, 0, 0);
+    assert_eq!(
+        large_domain.shared.lock().warm_capacity(),
+        2 * 1024 * 1024 * 1024
+    );
+}
+
+#[test]
+fn full_budget_buffer_recycles_atomically_then_yields_to_an_async_reservation() {
+    let size = 2 * WARM_BUFFER_MIN_BYTES;
+    let budget = domain(size as u64, 0, 0);
+    let bytes = vec![3; size];
+    let ptr = bytes.as_ptr();
+    let buffer = budget
+        .try_reserve_memory(size as u64)
+        .unwrap()
+        .into_buffer(bytes);
+    let mut waiting = Box::pin(budget.reserve_memory(1));
+    let wake = Arc::new(CountWake(AtomicUsize::new(0)));
+    let waker = Waker::from(wake.clone());
+    let mut cx = Context::from_waker(&waker);
+    assert!(waiting.as_mut().poll(&mut cx).is_pending());
+
+    drop(buffer);
+    assert_eq!(budget.snapshot().memory.used_bytes, 0);
+    assert_eq!(wake.0.load(Ordering::SeqCst), 1);
+    let recycled = budget.allocate_vec(size).unwrap();
+    assert_eq!(recycled.as_ptr(), ptr);
+    assert!(recycled.is_empty());
+    budget.recycle_vec(recycled);
+
+    let Poll::Ready(Ok(reservation)) = waiting.as_mut().poll(&mut cx) else {
+        panic!("idle buffers blocked reservation");
+    };
+    assert_eq!(budget.snapshot().memory.used_bytes, 1);
+    assert!(budget.shared.lock().warm_buffers.is_empty());
+    drop(reservation);
+}
+
+#[test]
+fn each_admission_path_evicts_only_as_much_idle_capacity_as_needed() {
+    let size = WARM_BUFFER_MIN_BYTES as u64;
+    for admit in [
+        |budget: &DomainBudget, size: u64| budget.try_reserve_memory(size + 2).unwrap(),
+        |budget: &DomainBudget, size: u64| budget.reserve_memory_blocking(size + 2, None).unwrap(),
+        |budget: &DomainBudget, size: u64| {
+            let mut reservation = budget.try_reserve_memory(size).unwrap();
+            reservation.try_grow(2).unwrap();
+            reservation
+        },
+    ] {
+        let budget = domain(size * 3 + 1, 0, 0);
+        budget.recycle_vec(Vec::with_capacity(size as usize));
+        budget.recycle_vec(Vec::with_capacity(size as usize + 1));
+        let reservation = admit(&budget, size);
+        let state = budget.shared.lock();
+        assert_eq!(state.warm_idle_bytes, size + 1);
+        assert_eq!(state.warm_buffers.len(), 1);
+        assert!(state.memory.used_bytes + state.warm_idle_bytes <= state.memory.limit_bytes);
+        drop(state);
+        drop(reservation);
+    }
+}
+
+#[test]
+fn exhausted_budget_falls_back_to_exact_capacity() {
+    let size = WARM_BUFFER_MIN_BYTES;
+    let budget = domain(3 * size as u64, 0, 0);
+    let mut reservation = budget.try_reserve_memory(size as u64).unwrap();
+    budget.recycle_vec(Vec::with_capacity(size + size / 4));
+    // Exhaust remaining headroom so the warm buffer is evicted before allocation;
+    // fallback must allocate exact capacity without recording a rejection.
+    let other = budget.try_reserve_memory(2 * size as u64).unwrap();
+    let bytes = reservation.allocate_vec(size).unwrap();
+    assert!(bytes.is_empty());
+    assert_eq!(bytes.capacity(), size);
+    assert_eq!(bytes.capacity() as u64, reservation.bytes());
+    let snap = budget.snapshot().memory;
+    assert_eq!(snap.rejected_allocations, 0);
+    assert_eq!(snap.rejected_bytes, 0);
+    drop(reservation.into_buffer(bytes));
+    drop(other);
+}
+
+#[test]
+fn buffer_into_parts_transfers_storage_and_reservation_without_recycling() {
+    let size = WARM_BUFFER_MIN_BYTES;
+    let budget = domain(size as u64, 0, 0);
+    let bytes = vec![5; size];
+    let ptr = bytes.as_ptr();
+    let buffer = budget
+        .try_reserve_memory(size as u64)
+        .unwrap()
+        .into_buffer(bytes);
+    let (bytes, reservation) = buffer.into_parts();
+    assert_eq!(bytes.as_ptr(), ptr);
+    assert_eq!(bytes[0], 5);
+    assert_eq!(budget.snapshot().memory.used_bytes, size as u64);
+    drop(reservation);
+    assert!(budget.shared.lock().warm_buffers.is_empty());
+    assert_eq!(budget.snapshot().memory.used_bytes, 0);
+}
+
+#[test]
+fn recycled_bytes_return_the_same_allocation_to_the_warm_pool() {
+    let size = WARM_BUFFER_MIN_BYTES;
+    let budget = domain(size as u64, 0, 0);
+    let bytes = RecycledBytes::new(vec![7; size], budget.clone());
+    assert_eq!(bytes.len(), size);
+    assert!(bytes.iter().all(|&byte| byte == 7));
+    let ptr = bytes.as_ptr();
+    drop(bytes);
+    assert_eq!(budget.snapshot().memory.used_bytes, 0);
+    let reused = budget.allocate_vec(size).unwrap();
+    assert_eq!(reused.as_ptr(), ptr);
+    let bytes = RecycledBytes::new(reused, budget.clone()).into_vec();
+    assert_eq!(bytes.as_ptr(), ptr);
+    let other = budget.allocate_vec(size).unwrap();
+    assert_ne!(other.as_ptr(), ptr);
+}
+
+#[test]
+fn recycled_bytes_do_not_keep_a_dropped_domain_alive() {
+    let size = WARM_BUFFER_MIN_BYTES;
+    let budget = domain(size as u64, 0, 0);
+    let weak = budget.observe().downgrade();
+    let bytes = RecycledBytes::new(vec![9; size], budget);
+    assert!(weak.upgrade().is_none());
+    assert_eq!(bytes.len(), size);
+    drop(bytes);
+}
+
+#[test]
+fn close_operations_drains_warm_buffers_and_stops_caching() {
+    let size = WARM_BUFFER_MIN_BYTES;
+    let budget = domain((size * 2) as u64, 0, 0);
+    budget.recycle_vec(Vec::with_capacity(size));
+    assert_eq!(budget.shared.lock().warm_buffers.len(), 1);
+    budget.close_operations();
+    assert!(budget.shared.lock().warm_buffers.is_empty());
+    assert_eq!(budget.shared.lock().warm_idle_bytes, 0);
+    budget.recycle_vec(Vec::with_capacity(size));
+    assert!(budget.shared.lock().warm_buffers.is_empty());
+}
+
+#[test]
+fn reserve_vec_claims_warm_buffer_before_admission_eviction() {
+    let size = 3 * WARM_BUFFER_MIN_BYTES;
+    let budget = domain((4 * WARM_BUFFER_MIN_BYTES) as u64, 0, 0);
+    let bytes = vec![1; size];
+    let ptr = bytes.as_ptr();
+    budget.recycle_vec(bytes);
+
+    let mut fut = Box::pin(budget.reserve_vec(size as u64));
+    let wake = Arc::new(CountWake(AtomicUsize::new(0)));
+    let waker = Waker::from(wake);
+    let mut cx = Context::from_waker(&waker);
+    let Poll::Ready(Ok((warm, reservation))) = fut.as_mut().poll(&mut cx) else {
+        panic!("expected immediate warm reservation");
+    };
+    let reused = warm.expect("warm buffer should be claimed before eviction");
+    assert_eq!(reused.as_ptr(), ptr);
+    assert_eq!(reservation.bytes(), size as u64);
+    drop(reservation.into_buffer(reused));
+}

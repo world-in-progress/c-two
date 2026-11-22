@@ -80,8 +80,8 @@ EXPECTED_RECEIPT_PREFIX_COUNTS = {
 # asset names; the promotion publishes those exact bytes under the same names.
 EXPECTED_INSTALLER_NAMES = ("c3-installer.sh", "c3-installer.ps1")
 FASTDB_LICENSE_ASSETS = ("fastdb-LICENSE", "fastdb-THIRD_PARTY_NOTICES.txt")
-FASTDB_CORE_VERSION = "0.2.4"
-FASTDB_SOURCE_REV = "f82fa13adeae2b87a295bf984821c85c44b55a3d"
+FASTDB_CORE_VERSION = "0.3.0"
+FASTDB_SOURCE_REV = "ff097cca9c29cadc289e2a437f4720ecc56015c4"
 SMOKE_SCHEMA = "c-two.installed-wheel-smoke.v1"
 STANDARD_USER_WRAPPER_SCHEMA = "c-two.standard-user-wrapper.v1"
 SDIST_INSPECT_SCHEMA = "c-two.release-candidate.sdist-inspection.v1"

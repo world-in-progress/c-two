@@ -161,7 +161,7 @@ impl<S: Service> ServiceAdapter<S> {
     fn invoke_checked(
         &self,
         method_index: u16,
-        request: &[u8],
+        request: Vec<u8>,
     ) -> Result<Vec<u8>, c_two::generated::C2Error> {
         match method_index {
 "#,
@@ -192,7 +192,7 @@ impl<S: Service> c_two::generated::EncodedService for ServiceAdapter<S> {
             .map(|method| method.name)
             .unwrap_or("<unknown>");
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.invoke_checked(method_index, &request)
+            self.invoke_checked(method_index, request)
         })) {
             Ok(result) => result,
             Err(_) => Err(c_two::generated::normalize_adapter_failure(
@@ -404,7 +404,7 @@ fn render_rust_client_method(output: &mut String, method: &TargetMethod<'_>) {
          {preparation}\
          \x20       let request = {request};\n\
          \x20       let response = call.encode_vec(request)?.call_owned()?;\n\
-         \x20       decode_{symbol}_output(&response)\n\
+         \x20       decode_{symbol}_output(response)\n\
          \x20   }}\n",
         quoted(method.name),
     ));
@@ -492,7 +492,7 @@ impl<S: Service> ServiceAdapter<S> {
         output.push_str(&format!("            {} => {{\n", method.index));
         if method.input_sha256.is_some() {
             output.push_str(&format!(
-                "                let input = decode_{symbol}_input_borrowed(&request)?;\n\
+                "                let input = decode_{symbol}_input_borrowed(request)?;\n\
                  \x20               let iterator = self.service.{symbol}(input.payload()).map_err(|error| {{\n\
                  \x20                   c_two::generated::adapter_error(\n\
                  \x20                       c_two::generated::AdapterFailurePhase::ResourceFunctionExecuting,\n\
@@ -612,7 +612,7 @@ fn render_rust_service_dispatch_arm(output: &mut String, method: &TargetMethod<'
         ));
     } else {
         output.push_str(&format!(
-            "                decode_{symbol}_input(request)?;\n\
+            "                decode_{symbol}_input(&request)?;\n\
              \x20               let output = self\n\
              \x20                   .service\n\
              \x20                   .{symbol}()\n\
@@ -658,7 +658,7 @@ fn render_rust_payload_adapters(output: &mut String, method: &TargetMethod<'_>) 
              \x20   }})\n\
              }}\n\n\
              fn decode_{symbol}_input_borrowed(\n\
-             \x20   bytes: &[u8],\n\
+             \x20   bytes: impl Into<Vec<u8>>,\n\
              ) -> Result<c_two::generated::BorrowedPayload, c_two::generated::C2Error> {{\n\
              \x20   let spec = payload_{digest}::compile_spec().map_err(|error| {{\n\
              \x20       c_two::generated::fastdb_adapter_error(\n\
@@ -706,7 +706,7 @@ fn render_rust_payload_adapters(output: &mut String, method: &TargetMethod<'_>) 
     if let Some(digest) = method.output_sha256 {
         let rendered = format!(
             "pub fn decode_{symbol}_output(\n\
-             \x20   bytes: &[u8],\n\
+             \x20   bytes: impl Into<Vec<u8>>,\n\
              ) -> Result<fastdb::Payload, c_two::Error> {{\n\
              \x20   let spec = payload_{digest}::compile_spec().map_err(|error| {{\n\
              \x20       c_two::Error::Semantic(c_two::generated::fastdb_adapter_error(\n\
@@ -795,12 +795,12 @@ fn render_rust_payload_adapters(output: &mut String, method: &TargetMethod<'_>) 
         }
     } else {
         output.push_str(&format!(
-            "pub fn decode_{symbol}_output(bytes: &[u8]) -> Result<(), c_two::Error> {{\n\
+            "pub fn decode_{symbol}_output(bytes: impl Into<Vec<u8>>) -> Result<(), c_two::Error> {{\n\
              \x20   require_empty_payload(\n\
              \x20       c_two::generated::AdapterFailurePhase::ClientOutputDeserializing,\n\
              \x20       {},\n\
              \x20       \"output\",\n\
-             \x20       bytes,\n\
+             \x20       &bytes.into(),\n\
              \x20   )\n\
              \x20   .map_err(c_two::Error::Semantic)\n\
              }}\n\n\
@@ -823,7 +823,7 @@ fn render_rust_topic_client_method(output: &mut String, topic: &TargetTopic<'_>)
          \x20       let subscription = self.client.subscribe({}, options)?;\n\
          \x20       Ok(c_two::Subscription::from_core(\n\
          \x20           subscription,\n\
-         \x20           decode_{symbol}_value,\n\
+         \x20           |bytes| decode_{symbol}_value(bytes),\n\
          \x20           decode_{symbol}_value_held,\n\
          \x20       ))\n\
          \x20   }}\n",
@@ -935,7 +935,7 @@ fn render_rust_topic_payload_adapters(output: &mut String, topic: &TargetTopic<'
          \x20   }})\n\
          }}\n\n\
          pub fn decode_{symbol}_value(\n\
-         \x20   bytes: &[u8],\n\
+         \x20   bytes: impl Into<Vec<u8>>,\n\
          ) -> Result<fastdb::Payload, c_two::Error> {{\n\
          \x20   let spec = payload_{digest}::compile_spec().map_err(|error| {{\n\
          \x20       c_two::Error::Semantic(c_two::generated::fastdb_adapter_error(\n\
@@ -1510,7 +1510,11 @@ fn render_python_direction(
              \x20   except BaseException as exc:\n\
              \x20       raise _serialization_error({from_buffer_code}, exc) from exc\n\
              \x20   try:\n\
-             \x20       payload = Payload.open_copy(spec, data)\n\
+             \x20       if len(data) > 268435456:\n\
+             \x20           from fastdb4py.payload import OpenOptions\n\
+             \x20           payload = Payload.open_copy(spec, data, OpenOptions(max_total_bytes=len(data)))\n\
+             \x20       else:\n\
+             \x20           payload = Payload.open_copy(spec, data)\n\
              \x20   except BaseException as exc:\n\
              \x20       raise _serialization_error({from_buffer_code}, exc) from exc\n\
              \x20   try:\n\
@@ -1559,7 +1563,11 @@ fn render_python_topic_value(output: &mut String, topic: &TargetTopic<'_>) {
          \x20   except BaseException as exc:\n\
          \x20       raise _serialization_error(ErrorCode.ClientOutputFromBuffer, exc) from exc\n\
          \x20   try:\n\
-         \x20       payload = Payload.open_copy(spec, data)\n\
+         \x20       if len(data) > 268435456:\n\
+         \x20           from fastdb4py.payload import OpenOptions\n\
+         \x20           payload = Payload.open_copy(spec, data, OpenOptions(max_total_bytes=len(data)))\n\
+         \x20       else:\n\
+         \x20           payload = Payload.open_copy(spec, data)\n\
          \x20   except BaseException as exc:\n\
          \x20       raise _serialization_error(ErrorCode.ClientOutputFromBuffer, exc) from exc\n\
          \x20   try:\n\

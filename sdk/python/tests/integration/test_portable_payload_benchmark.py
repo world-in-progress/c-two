@@ -75,12 +75,13 @@ def test_portable_payload_benchmark_smoke_all_ctwo_suites(tmp_path):
     assert env_meta['fastdb4py_version']
 
     suites = receipt['suites']
-    assert set(suites.keys()) == {'stages', 'coupling', 'field', 'fanout', 'pubsub_fanout', 'kostya'}
+    assert set(suites.keys()) == {'stages', 'coupling', 'field', 'migration', 'fanout', 'pubsub_fanout', 'kostya'}
 
     stage_row = suites['stages']['rows'][0]
     assert stage_row['fastdb_staging_bytes'] == 0
-    assert stage_row['copy_ledger_shm_unary']['total_lower_bound_one_way'] == 8
-    assert stage_row['copy_ledger_shm_stream']['total_lower_bound_one_way'] == 7
+    assert stage_row['copy_ledger_shm_unary']['total_lower_bound_one_way'] == 2
+    assert stage_row['copy_ledger_shm_stream']['total_lower_bound_one_way'] == 2
+    assert stage_row['stages_p50_ms']['open_external_from_memoryview'] > 0
     assert stage_row['stages_p50_ms']['open_copy_from_memoryview'] > 0
 
     coupling_arms = {r['arm'] for r in suites['coupling']['rows']}
@@ -94,6 +95,14 @@ def test_portable_payload_benchmark_smoke_all_ctwo_suites(tmp_path):
     for row in suites['field']['rows']:
         assert row['client_holds_active'] == 0
         assert row['p95_ms'] >= row['p50_ms']
+
+    migration_rows = suites['migration']['rows']
+    assert {r['frame_mode'] for r in migration_rows} == {'published', 'fresh'}
+    for row in migration_rows:
+        assert row['arm'] == 'ctwo-fastdb-stream-migration'
+        assert row['client_holds_active'] == 0
+        assert row['effective_gib_s'] > 0
+        assert row['server_pool_peak_mib'] <= row['role_memory_budget_mib']
 
     fanout_rows = suites['fanout']['rows']
     fanout_readers = {r['readers'] for r in fanout_rows}

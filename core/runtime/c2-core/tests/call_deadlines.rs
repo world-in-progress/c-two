@@ -130,7 +130,7 @@ impl Carrier {
     fn memory_limit(self) -> u64 {
         match self {
             Self::Inline | Self::Dedicated => 1024 * 1024,
-            // 16 MiB derives a 256 KiB segment, enough for the 128 KiB loan.
+            // 16 MiB derives a 1 MiB segment, enough for the 128 KiB loan.
             Self::Buddy => 16 * 1024 * 1024,
             // The serialized input and a SHM allocation do not fit together.
             // On the Host a queued chunk leaves less than 224 KiB for assembly,
@@ -141,7 +141,9 @@ impl Carrier {
 
     fn idle_client_memory(self) -> u64 {
         match self {
-            Self::Buddy => 256 * 1024,
+            Self::Buddy => {
+                c2_config::PoolConfig::primary_for_budget(self.memory_limit()).segment_size as u64
+            }
             _ => 0,
         }
     }
@@ -332,8 +334,8 @@ fn check_late_ipc(carrier: Carrier) {
             assert_eq!(outgoing_memory.peak_bytes, nbytes);
         }
         Carrier::Buddy => {
-            assert_eq!(incoming_memory.used_bytes, 256 * 1024);
-            assert!(outgoing_memory.peak_bytes >= 256 * 1024 + nbytes);
+            assert_eq!(incoming_memory.used_bytes, idle_client_memory);
+            assert!(outgoing_memory.peak_bytes >= idle_client_memory + nbytes);
         }
         Carrier::Dedicated => {
             // A 128 KiB loan exceeds each 64 KiB buddy segment. The

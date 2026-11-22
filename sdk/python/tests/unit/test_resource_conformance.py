@@ -106,3 +106,52 @@ def test_validate_resource_conformance_rejects_parameter_shape_mismatch(method, 
 
     with pytest.raises(TypeError, match=message):
         validate_resource_conformance(Greeting, BadShape())
+
+
+def test_validate_resource_conformance_accepts_fastdb_build_plan_returns():
+    from collections.abc import Iterator
+    from typing import Union
+
+    from fastdb4py.payload import BuildPlan, Payload
+
+    spec = {
+        'schema': 'fastdb.payload.v1',
+        'profile': 'record.v1',
+        'components': [],
+        'entries': [
+            {'id': 'value', 'cardinality': 'one', 'type': {'kind': 'u8', 'nullable': False}},
+        ],
+    }
+
+    @cc.crm(namespace='test.resource-conformance.fastdb', version='0.1.0')
+    class FastDbEcho:
+        @cc.transfer(input=spec, output=spec)
+        def echo(self, payload: Payload) -> Payload: ...
+
+        @cc.stream
+        @cc.transfer(output=spec)
+        def frames(self) -> Iterator[Payload]: ...
+
+    class PlanResource:
+        def echo(self, payload: Payload) -> BuildPlan:
+            raise NotImplementedError
+
+        def frames(self) -> Iterator[BuildPlan]:
+            raise NotImplementedError
+
+    class UnionResource:
+        def echo(self, payload: Payload) -> Union[Payload, BuildPlan]:
+            raise NotImplementedError
+
+        def frames(self) -> Iterator[Union[Payload, BuildPlan]]:
+            raise NotImplementedError
+
+    validate_resource_conformance(FastDbEcho, PlanResource())
+    validate_resource_conformance(FastDbEcho, UnionResource())
+
+    class BadInputResource(PlanResource):
+        def echo(self, payload: BuildPlan) -> BuildPlan:
+            raise NotImplementedError
+
+    with pytest.raises(TypeError, match='echo.payload annotation mismatch'):
+        validate_resource_conformance(FastDbEcho, BadInputResource())

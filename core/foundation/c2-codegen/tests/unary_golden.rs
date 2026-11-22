@@ -4,11 +4,13 @@ use serde_json::{Value, json};
 
 #[test]
 fn unary_artifacts_for_all_three_languages_match_the_pre_stream_baseline() {
-    // Captured from ba231cdf with the pinned FastDB 0.2.4 Core SDK; the
-    // Python rows were recaptured for the generated SerializationError
-    // normalization, and the TypeScript rows for the ABI 9 transport and
-    // canonical SubscriptionLagged projection (ADR 0005). The corpus includes
-    // the shared three-language portable matrix fixtures.
+    // Captured from ba231cdf with the pinned FastDB 0.2.4 Core SDK. Rust rows
+    // were recaptured with the FastDB 0.3.0 Core SDK and zero-copy Rust
+    // receive adapters. Python rows were recaptured for SerializationError
+    // normalization and the >256 MiB FastDB OpenOptions lift, and TypeScript
+    // rows for the ABI 9 transport and SubscriptionLagged projection
+    // (ADR 0005). The corpus includes the shared three-language portable
+    // matrix fixtures.
     let baseline: Value =
         serde_json::from_str(include_str!("fixtures/unary-artifacts.json")).unwrap();
     for row in baseline.as_array().unwrap() {

@@ -408,7 +408,7 @@ fn write_consumer_manifest(temp: &Path, repository: &Path) {
     std::fs::write(
         temp.join("Cargo.toml"),
         format!(
-            "[package]\nname = \"topic-pubsub-consumer\"\nversion = \"0.0.0\"\nedition = \"2024\"\npublish = false\n\n[dependencies]\nc-two = {{ version = \"0.1.0\", path = {:?} }}\nfastdb = \"=0.2.4\"\n",
+            "[package]\nname = \"topic-pubsub-consumer\"\nversion = \"0.0.0\"\nedition = \"2024\"\npublish = false\n\n[dependencies]\nc-two = {{ version = \"0.1.0\", path = {:?} }}\nfastdb = \"=0.3.0\"\n",
             repository.join("sdk/rust")
         ),
     )

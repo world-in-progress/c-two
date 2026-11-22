@@ -3,7 +3,7 @@
 //! [`Publisher`] and [`Subscription`] wrap the Core handles generated code
 //! binds to one contract topic. Every delivery owns a local value; the
 //! explicit retention projection `Delivery<Held<T>>` follows the same
-//! copy-backed contract as unary holds, and closing a subscription never
+//! local backing contract as unary holds, and closing a subscription never
 //! invalidates an already-delivered `Held<T>`.
 
 use std::fmt;

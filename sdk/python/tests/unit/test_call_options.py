@@ -173,13 +173,13 @@ def test_fastdb_known_length_gate_precedes_binary_materialization(monkeypatch, i
         def begin_call(self, method):
             return RejectBytes(events)
 
-    original = Payload.binary_bytes
+    original = Payload.memoryview
 
     def counted_copy(self):
         events.append(('copy', None))
         return original(self)
 
-    monkeypatch.setattr(Payload, 'binary_bytes', counted_copy)
+    monkeypatch.setattr(Payload, 'memoryview', counted_copy)
     connection = Portable()
     connection.client = CRMProxy.ipc(KnownClient(events), 'portable')
     try:

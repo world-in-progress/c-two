@@ -544,7 +544,7 @@ def test_native_route_contract_boundaries_have_no_empty_defaults_or_raw_calls():
     call = _rust_compact(_rust_function(client_source, 'call'))
     take = _rust_compact(_rust_function(core_ffi, 'take'))
     clone = _rust_compact(_rust_function(core_ffi, 'client'))
-    assert 'self.begin_call(py,method_name)?.call(py,data)' in call
+    assert 'self.begin_call(py,method_name)?.call(py,data,false)' in call
     assert 'self.inner.lock().take()' in take
     assert 'self.inner.lock().clone()' in clone
     for source in (core_ffi, runtime_session):
@@ -648,24 +648,6 @@ def test_python_server_dispatcher_does_not_own_response_allocation():
         "is_dedicated",
     ]
     offenders = [needle for needle in forbidden if needle in source]
-    assert offenders == []
-
-
-def test_core_python_response_bridge_does_not_accept_shm_coordinate_tuples():
-    root = Path(__file__).resolve().parents[4]
-    core_ffi = root / "sdk" / "python" / "native" / "src" / "core_ffi.rs"
-    source = core_ffi.read_text(encoding="utf-8")
-    parser_source = _rust_function(source, 'materialize_python_bytes')
-
-    forbidden = [
-        "PyTuple",
-        "seg_idx: int",
-        "offset: int",
-        "data_size: int",
-        "is_dedicated: bool",
-        "seg_idx, offset, data_size",
-    ]
-    offenders = [needle for needle in forbidden if needle in parser_source]
     assert offenders == []
 
 

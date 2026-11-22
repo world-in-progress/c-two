@@ -333,7 +333,7 @@ async fn handshake_flush_before_following_frame(fail_flush: usize, disconnect: b
     )));
     let (mut client, stream) = isolated_pair().await;
     let abort = stream.abort_handle();
-    let (mut reader, stream) = stream.into_split();
+    let (reader, stream) = stream.into_split();
     let (flush_entered, at_flush) = oneshot::channel();
     let (flush_release, flush_resume) = oneshot::channel();
     let (writer, driver) = ConnectionWriter::spawn_test_stream(
@@ -351,6 +351,7 @@ async fn handshake_flush_before_following_frame(fail_flush: usize, disconnect: b
         let writer = writer.clone();
         async move {
             let mut shutdown = server.shutdown_tx.subscribe();
+            let mut reader = tokio::io::BufReader::new(reader);
             receive_connection(&server, &conn, &mut reader, &writer, &abort, &mut shutdown).await;
             assert!(
                 !conn.handshake_done(),

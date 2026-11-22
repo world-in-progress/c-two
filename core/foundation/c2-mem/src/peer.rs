@@ -225,24 +225,36 @@ impl PeerRead {
         Ok(())
     }
 
+    /// Replace the vector's contents with the admitted span.
+    ///
+    /// # Safety
+    /// Same peer immutability and remote-loan contract as `copy_into`.
+    pub unsafe fn copy_into_vec(&self, destination: &mut Vec<u8>) -> Result<(), String> {
+        destination.clear();
+        if destination.capacity() < self.len {
+            destination
+                .try_reserve_exact(self.len)
+                .map_err(|error| format!("peer copy allocation failed: {error}"))?;
+        }
+        // SAFETY: admission checked the source span, this read pins it, and
+        // the vector has enough disjoint capacity for the initialized bytes.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                self.mapping.base_ptr().add(self.offset),
+                destination.as_mut_ptr(),
+                self.len,
+            );
+            destination.set_len(self.len);
+        }
+        Ok(())
+    }
+
     /// # Safety
     /// Same peer immutability and remote-loan contract as `copy_into`.
     pub unsafe fn copy(&self) -> Result<Vec<u8>, String> {
         let mut bytes = Vec::new();
-        bytes
-            .try_reserve_exact(self.len)
-            .map_err(|error| format!("peer copy allocation failed: {error}"))?;
-        // SAFETY: admission checked the source span, this read pins it, and
-        // reserve provided enough disjoint storage. Initialize directly with
-        // the one payload copy before exposing the vector's length.
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                self.mapping.base_ptr().add(self.offset),
-                bytes.as_mut_ptr(),
-                self.len,
-            );
-            bytes.set_len(self.len);
-        }
+        // SAFETY: the caller keeps the peer span immutable through the copy.
+        unsafe { self.copy_into_vec(&mut bytes) }?;
         Ok(bytes)
     }
 
