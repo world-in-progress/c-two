@@ -1,7 +1,7 @@
 # KB-to-GB Unified Slab & FastDB 0.3.0 Benchmark vs Ray 2.56 (Planned 0.12.0)
 
 **Date:** 2026-11-22  
-**Scope:** Reproducible headless evaluation of C-Two's Workstream 2 unified `WritableSlab` direct-SHM channel, FastDB `0.3.0` (`ABI-118`) zero-copy `ExternalBytes` / `memoryview()` / `BuildPlan` integration, buddy geometry & warm local buffer recycling, and KB-scale inline framing trimming under [ADR 0001](../decisions/0001-single-owner-release.md) single-owner copy-then-release semantics. Covers `1 KiB–1 GiB` single-frame payloads, `4 GiB` bounded-memory streamed migration inside a strict `1 GiB` role RAM budget, multi-subscriber fan-out (`@cc.stream` and `@cc.topic`, `R = 1, 2, 4`), and 1M-row structured coordinates (Kostya), paired on the identical Python 3.13.3 interpreter against `Ray 2.56.0` (`detached named actor`, `Ray Compiled Graphs`, and Ray actor streaming generator).
+**Scope:** Reproducible headless evaluation of C-Two's Workstream 2 unified `WritableSlab` direct-SHM channel, FastDB `0.3.0` (`ABI-118`) zero-copy `ExternalBytes` / `memoryview()` / `BuildPlan` integration, buddy geometry & warm local buffer recycling (including unary IPC response recycling), and KB-scale inline framing trimming under [ADR 0001](../decisions/0001-single-owner-release.md) single-owner copy-then-release semantics. Covers `1 KiB–1 GiB` single-frame payloads, `4 GiB` bounded-memory streamed migration inside a strict `1 GiB` role RAM budget, multi-subscriber fan-out (`@cc.stream` and `@cc.topic`, `R = 1, 2, 4`), and 1M-row structured coordinates (Kostya), paired on the identical Python 3.13.3 interpreter against `Ray 2.56.0` (`detached named actor`, `Ray Compiled Graphs`, and Ray actor streaming generator).
 
 - **Driver:** [portable_payload_benchmark.py](../../sdk/python/benchmarks/portable_payload_benchmark.py) (public APIs only, guarded by [test_portable_payload_benchmark.py](../../sdk/python/tests/integration/test_portable_payload_benchmark.py))
 - **Frozen JSON evidence:** [2026-11-22-kb-to-gb-slab-benchmark.json](evidence/2026-11-22-kb-to-gb-slab-benchmark.json)
@@ -16,30 +16,30 @@
 | Rust / C-Two / CLI / FastDB / NumPy | Rust 1.99.1, `c-two` source candidate (release native extension), `c3` source candidate (release static build), `fastdb4py 0.3.0` (`ABI-118`), `numpy 2.4.4` |
 | Ray | `ray 2.56.0` (`object_store_memory = 1.5 GiB`, `automatic_object_spilling_enabled = false`, default inline threshold `100 KiB`; isolated Ray session restarted for `>= 256 MiB` arms and before `migration` so failed Compiled Graph channels cannot starve subsequent Ray arms) |
 | C-Two role memory budget | Strict `1 GiB` per role (`client`, `server`, `c3 relay`) for all `<= 512 MiB` frames and `4 GiB` streamed migration; `1,280 MiB` (`1 GiB + 256 MiB`) only for `1 GiB` monolithic single-frame calls whose encoded image exceeds `1 GiB` |
-| Source commit (benchmark run) | `6861f95e` (+ SDK `OpenOptions` total-byte lift for `> 256 MiB` payloads & benchmark Ray isolation) |
+| Source commit (exact benchmark run) | `562293c4` |
 
 ## Key Findings (Summary)
 
 1. **One-way SHM copy lower bound cut from `8 / 7` copies to `2` copies (ADR 0001 theoretical floor):**
-   - Eliminated all `5–6` Python/`fastdb4py` glue copies across unary, server streams, pub/sub topics, and client requests: fresh `BuildPlan` executes directly into C-Two's `WritableSlab` SHM (`0` staging), published `Payload` copies once via `Payload.memoryview()` into SHM, receivers copy once from peer SHM into warm-recycled `RecycledBytes` before `RELEASE`, and `Payload.open_external(ExternalBytes(response))` + `acc.memoryview()` decode and reduce with **0 copies**.
-   - Single-process `open_external(memoryview)` at `32 MiB` drops from **3.49 ms** (`0.2.4` `open_copy`) to **0.0183 ms** (**191× faster** than `0.2.4` `open_copy`, **104× faster** than `0.3.0` `open_copy`).
+   - Eliminated all `5–6` Python/`fastdb4py` glue copies across unary, server streams, pub/sub topics, and client requests: fresh `BuildPlan` (over read-only frozen NumPy arrays) executes directly into C-Two's `WritableSlab` SHM (`0` staging), published `Payload` copies once via `Payload.memoryview()` into SHM, receivers copy once from peer SHM into warm-recycled `RecycledBytes` before `RELEASE`, and `Payload.open_external(ExternalBytes(response))` + `acc.memoryview()` decode and reduce with **0 copies**.
+   - Single-process `open_external(memoryview)` at `32 MiB` is **0.0200 ms** (**175× faster** than `0.2.4` `open_copy` `3.49 ms`, **103× faster** than `0.3.0` `open_copy` `2.07 ms`), and `build_external_plan` over a read-only `32 MiB` ndarray takes **0.0527 ms** (`0` snapshot copy).
 2. **KB-scale bidirectional coupling (`1 KiB` & `16 KiB`):**
-   - Portable `ctwo-fastdb-unary` achieves **0.402 ms P50 / 0.589 ms P95** (`2,490 req/s`) at `1 KiB` and **0.457 ms P50 / 0.591 ms P95** (`2,187 req/s`, down from `0.618 / 0.799 ms`) at `16 KiB`, beating `ray-named-actor` at both sizes (`0.445 / 0.629 ms` at `1 KiB`; `0.499 / 0.858 ms` at `16 KiB`).
-   - Python-only `ctwo-pickle-arrays` reaches **0.138 ms P50 / 0.188 ms P95** (`7,229 req/s`) at `1 KiB` and **0.141 ms P50 / 0.218 ms P95** at `16 KiB` (down `-35% P50 / -48% P95` from `0.217 / 0.422 ms`), beating static `ray-compiled-graph` at `1 KiB` P95 (`0.188 vs 0.215 ms`) and P99 (`0.234 vs 0.328 ms`) without static DAG compilation.
+   - At `16 KiB`, portable `ctwo-fastdb-unary` hits **0.503 ms P50 / 0.771 ms P95** (`1,989 req/s`), beating `ray-named-actor` (`0.688 / 1.461 ms`, **1.37× faster P50 / 1.89× tighter P95**), and Python-only `ctwo-pickle-arrays` hits **0.202 ms P50 / 0.242 ms P95** (`4,958 req/s`), beating even static `ray-compiled-graph` (`0.227 / 0.625 ms`, **2.58× tighter P95**).
+   - At `1 KiB`, `ctwo-fastdb-unary` (`0.526 ms P50 / 0.725 ms P95 / 0.750 ms P99`) delivers tighter tail latency than `ray-named-actor` (`0.478 / 0.786 / 1.011 ms`), and `ctwo-pickle-arrays` (`0.179 ms P50 / 0.880 ms P99`) avoids `ray-compiled-graph`'s `4.115 ms` P99 spike (`0.170 ms P50`).
 3. **Mid-to-large frames (`4 MiB` & `32 MiB`) — C-Two beats both Ray Named Actor and Ray Compiled Graphs:**
-   - **4 MiB `published`:** `ctwo-fastdb-stream` hits **0.391 ms P50 / 0.563 ms P95 (`9.98 GiB/s`)** — **3.06× faster than `0.11.0`**, **5.66× faster than `ray-named-actor`** (`2.215 ms`), and beats `ray-compiled-graph` at both P50 (`0.443 ms`) and P95 (`2.053 ms`, **3.65× tighter**).
-   - **32 MiB `published`:** `ctwo-fastdb-stream` hits **2.408 ms P50 / 3.169 ms P95 (`12.98 GiB/s`)** — **5.60× faster than `0.11.0`** (`13.50 ms`), **5.12× faster than `ray-named-actor`** (`12.32 ms`), and **5.33× faster than `ray-compiled-graph`** (`12.84 ms`). Even unary (`3.135 ms`, `9.97 GiB/s`) and `cc.hold` (`2.911 ms`, `10.73 GiB/s`) beat Ray by **~4×**.
-   - **32 MiB `fresh`:** `ctwo-fastdb-stream` hits **3.839 ms P50 / 4.915 ms P95 (`8.14 GiB/s`)** — **5.22× faster than `0.11.0`** (`20.03 ms`), **1.59× faster than `ray-named-actor`** (`6.107 ms`), and **3.32× faster than `ray-compiled-graph`** (`12.74 ms`), while server peak RSS drops **4.1×** (`759.1 MiB → 184.9 MiB`) with zero cyclic GC retention.
+   - **4 MiB `published`:** `ctwo-fastdb-stream` hits **0.414 ms P50 / 0.586 ms P95 (`9.43 GiB/s`)** — **9.05× faster than `ray-named-actor`** (`3.746 ms`), and **3.02× faster P50 / 20.5× tighter P95** than `ray-compiled-graph` (`1.250 / 12.037 ms`).
+   - **32 MiB `published`:** `ctwo-fastdb-stream` hits **2.497 ms P50 (`12.52 GiB/s`)** and `ctwo-fastdb-unary` hits **3.122 ms P50 / 3.427 ms P95 (`10.01 GiB/s`)** — **5.24× faster than `ray-named-actor`** (`13.09 ms`) and **5.59× faster than `ray-compiled-graph`** (`13.96 ms`). Even 1-hop HTTP `c3 relay` stream (`11.10 ms`) beats local `ray-named-actor` (`13.09 ms`).
+   - **32 MiB `fresh`:** `ctwo-fastdb-stream` hits **3.762 ms P50 / 4.697 ms P95 (`8.31 GiB/s`)** and `ctwo-fastdb-unary` hits **4.099 ms P50 / 4.696 ms P95 (`7.62 GiB/s`, `152.8 MiB` server RSS)** — beating both `ray-named-actor` (`6.031 / 7.746 ms`) and `ray-compiled-graph` (`3.963 / 5.079 ms`), while server peak RSS drops **4.1×–5.0× vs `0.11.0`** (`759.1 MiB → 185.2 MiB` stream / `152.8 MiB` unary).
 4. **Monolithic `256 MiB / 512 MiB / 1 GiB` single frames vs `4 GiB` bounded-memory streamed migration:**
-   - At **256 MiB**, `ctwo-fastdb-stream` achieves **56.89 ms (`4.39 GiB/s`) `published`** and **65.54 ms (`3.81 GiB/s`) `fresh`**, beating `ray-named-actor` (`95.69 ms` `published` / `89.20 ms` `fresh`), while `ray-compiled-graph` fails with `OutOfDiskError` on all `>= 256 MiB` frames.
-   - At **512 MiB–1 GiB** single monolithic frames, payloads exceed C-Two's `64 MiB` buddy segment ceiling and take `Dedicated` SHM (per-call `shm_open`/`ftruncate`/`mmap`/page-fault/`munmap` on both peers), sustaining **3.3–4.66 GiB/s** (**2.0×–3.3× faster than `ctwo-pickle-arrays`**), while `ray-named-actor` achieves `13.9–22.6 GiB/s` on `512 MiB` and `1 GiB fresh` via persistent zero-copy Plasma mappings (and fails with `OutOfDiskError` on `1 GiB published` when actor retention + Plasma copy exceed `1.5 GiB` Plasma).
+   - At **256 MiB**, all three C-Two FastDB arms beat `ray-named-actor`: `ctwo-fastdb-stream` (`62.17 ms` `published` / `64.57 ms` `fresh`) and `ctwo-fastdb-unary` (`62.62 / 63.90 ms` `published`, `64.69 / 67.44 ms` `fresh`) outperform `ray-named-actor` (`76.16 ms` `published` / `92.57 ms` `fresh`), while `ray-compiled-graph` fails with `OutOfDiskError` on all `>= 256 MiB` frames.
+   - At **512 MiB–1 GiB** single monolithic frames, payloads exceed C-Two's `64 MiB` buddy segment ceiling and take `Dedicated` SHM (per-call `shm_open`/`ftruncate`/`mmap`/page-fault/`munmap` on both peers), sustaining **3.6–4.25 GiB/s** (`277.5 ms` `1 GiB published` unary, `254.6 ms` `1 GiB fresh` unary — **4.6×–5.5× faster than `ctwo-pickle-arrays`**), whereas `ray-named-actor` achieves `14.2–22.7 GiB/s` via persistent zero-copy Plasma mappings (while `ray-compiled-graph` fails `OutOfDiskError`).
    - For multi-hundred-MiB to multi-GiB transfers, **streaming in `32 MiB` chunks over `@cc.stream` inside a strict `1 GiB` role budget (`4 GiB = 128 × 32 MiB`)** stays entirely inside warm buddy SHM:
-     - **`published` (`4.0 GiB`):** C-Two completes in **0.297 s (`13.45 GiB/s`, P95 `2.68 ms`)** using **64.0 MiB** server pool and **64.0 MiB** client pool (`+96 MiB` client live RSS), **2.07× faster than Ray** (`0.614 s / 6.51 GiB/s`, P95 `12.86 ms`, `+1,472 MiB` client live RSS).
-     - **`fresh` (`4.0 GiB`):** C-Two completes in **0.514 s (`7.78 GiB/s`, P95 `4.80 ms`)** inside **64.0 MiB** server pool / **32.0 MiB** client pool (`184.8 MiB` server peak RSS), with tighter P95 than Ray (`0.394 s / 10.14 GiB/s`, P95 `4.83 ms`, `1.5 GiB` Plasma).
+     - **`published` (`4.0 GiB`):** C-Two completes in **0.290 s (`13.80 GiB/s`, P50 `2.25 ms`, P95 `2.67 ms`)** using **64.0 MiB** server pool and **64.0 MiB** client pool (`+96.1 MiB` client live RSS), **1.99× faster than Ray** (`0.577 s / 6.93 GiB/s`, P95 `12.10 ms`, `+1,472.3 MiB` client live RSS).
+     - **`fresh` (`4.0 GiB`):** C-Two completes in **0.448 s (`8.92 GiB/s`, P50 `3.48 ms`, P95 `4.05 ms`)** inside **64.0 MiB** server pool / **32.0 MiB** client pool (`185.0 MiB` server peak RSS), with **1.29× tighter P95** than Ray (`0.400 s / 10.01 GiB/s`, P95 `5.21 ms`, `1.5 GiB` Plasma).
 5. **Multi-subscriber fan-out (`32 MiB`, `R = 4`) & Kostya (`1M` rows):**
-   - Direct IPC `@cc.topic` (`32 MiB, R = 4`) reaches **21.43 GiB/s** (`5.23 ms` P50, `9.87 ms` P95, `26.7 ms` total burst publish for 8 × 32 MiB — **2.86× faster than the `2026-11-21` baseline `7.48 GiB/s`**), with single-hop `c3 relay` at **7.84 GiB/s** (`+42.5%`) and two-hop `dual_relay` at **5.56 GiB/s** (`+17.1%`).
-   - Direct IPC `@cc.stream` fan-out (`32 MiB, R = 4`) reaches **20.80 GiB/s** (**3.80× faster than `2026-11-21` `5.48 GiB/s`**).
-   - Structured Kostya (`1,000,000` rows): `ctwo-fastdb-packed` drops from `27.57 ms →` **14.264 ms P50 / 17.097 ms P95** — **3.75× faster than `ray-named-actor-arrays`** (`53.43 ms`) and **10.60× faster than `ctwo-pickle-arrays`** (`151.16 ms`).
+   - Direct IPC `@cc.topic` (`32 MiB, R = 4`) reaches **22.10 GiB/s** (`5.34 ms` P50, `8.44 ms` P95, `25.3 ms` total burst publish for 8 × 32 MiB — **2.95× faster than the `2026-11-21` baseline `7.48 GiB/s`**), with single-hop `c3 relay` at **7.68 GiB/s** (`+39.6%`) and two-hop `dual_relay` at **6.17 GiB/s** (`+29.9%`).
+   - Direct IPC `@cc.stream` fan-out (`32 MiB, R = 4`) reaches **20.47 GiB/s** (**3.74× faster than `2026-11-21` `5.48 GiB/s`**).
+   - Structured Kostya (`1,000,000` rows): `ctwo-fastdb-packed` drops from `27.57 ms →` **14.210 ms P50 / 14.627 ms P95** — **3.85× faster than `ray-named-actor-arrays`** (`54.77 ms`) and **10.18× faster than `ctwo-pickle-arrays`** (`144.64 ms`).
 
 ---
 
@@ -60,24 +60,24 @@ All runs reported `fastdb_execution_mode = DIRECT` (`1`), `fastdb_staging_bytes 
 
 | Logical Size | Encoded Size | `build_external_plan` | `execute_direct_into_buffer` | `memoryview_export` | `open_external(mv)` | `open_copy(bytes(mv))` (ref) | `view` + NumPy sum | `release` |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 256 KiB | 262,744 B | 0.0286 ms | 0.0332 ms | 0.0066 ms | **0.0190 ms** | 0.0372 ms | 0.0480 ms | 0.0007 ms |
-| 4 MiB | 4,194,904 B | 0.1533 ms | 0.1197 ms | 0.0070 ms | **0.0190 ms** | 0.2550 ms | 0.1403 ms | 0.0007 ms |
-| 32 MiB | 33,555,032 B | 0.7719 ms | 0.7898 ms | 0.0127 ms | **0.0183 ms** | 1.9134 ms | 0.8510 ms | 0.0020 ms |
+| 256 KiB | 262,744 B | 0.0223 ms | 0.0324 ms | 0.0064 ms | **0.0186 ms** | 0.0350 ms | 0.0463 ms | 0.0007 ms |
+| 4 MiB | 4,194,904 B | 0.0223 ms | 0.1152 ms | 0.0067 ms | **0.0190 ms** | 0.2542 ms | 0.1400 ms | 0.0007 ms |
+| 32 MiB | 33,555,032 B | **0.0527 ms** | 0.8122 ms | 0.0136 ms | **0.0200 ms** | 2.0679 ms | 0.9097 ms | 0.0023 ms |
 
 ## Suite 1: KB-Scale Bidirectional Coupling Exchange (`60` rounds, `10` warmup)
 
 | Logical Size | Arm | Path / Topology | P50 (ms) | P95 (ms) | P99 (ms) | Req/s (P50) | Share of 20 ms step (P95) |
 | ---: | --- | --- | ---: | ---: | ---: | ---: | ---: |
-| 1 KiB | `ctwo-fastdb-unary` | direct IPC (inline, 1,624 B) | **0.4016** | **0.5893** | **0.6215** | **2,489.9** | 2.86% |
-| 1 KiB | `ctwo-pickle-arrays` | direct IPC (Python-only) | 0.1383 | **0.1883** | **0.2335** | 7,228.9 | **0.93%** |
-| 1 KiB | `ray-named-actor` | dynamic named actor (inline) | 0.4445 | 0.6289 | 0.7767 | 2,249.5 | 3.05% |
-| 1 KiB | `ray-compiled-graph` | static compiled DAG | **0.1272** | 0.2153 | 0.3280 | **7,861.1** | 1.06% |
-| 4 KiB | `ctwo-fastdb-unary` | direct IPC (inline, 4,696 B) | 0.4797 | 0.5964 | 0.6562 | 2,084.8 | 2.90% |
-| 16 KiB | `ctwo-fastdb-unary` | direct IPC (SHM, 16,984 B) | **0.4573** | **0.5913** | **0.6691** | **2,186.8** | 2.87% |
-| 16 KiB | `ctwo-pickle-arrays` | direct IPC (Python-only) | 0.1412 | 0.2180 | 0.2672 | 7,079.6 | 1.08% |
-| 16 KiB | `ray-named-actor` | dynamic named actor (inline) | 0.4993 | 0.8579 | 2.0072 | 2,002.7 | 4.11% |
-| 16 KiB | `ray-compiled-graph` | static compiled DAG | **0.1057** | **0.1769** | **0.2090** | **9,460.0** | **0.88%** |
-| 64 KiB | `ctwo-fastdb-unary` | direct IPC (SHM, 66,136 B) | 0.5410 | 0.7110 | 0.8172 | 1,848.3 | 3.43% |
+| 1 KiB | `ctwo-fastdb-unary` | direct IPC (inline, 1,624 B) | 0.5262 | **0.7254** | **0.7495** | 1,900.4 | 3.50% |
+| 1 KiB | `ctwo-pickle-arrays` | direct IPC (Python-only) | 0.1793 | 0.4928 | **0.8797** | 5,576.2 | 2.40% |
+| 1 KiB | `ray-named-actor` | dynamic named actor (inline) | **0.4775** | 0.7861 | 1.0114 | **2,094.4** | 3.78% |
+| 1 KiB | `ray-compiled-graph` | static compiled DAG | **0.1702** | **0.3224** | 4.1150 | **5,876.6** | **1.59%** |
+| 4 KiB | `ctwo-fastdb-unary` | direct IPC (inline, 4,696 B) | 0.4832 | 0.6691 | 0.7717 | 2,069.7 | 3.24% |
+| 16 KiB | `ctwo-fastdb-unary` | direct IPC (SHM, 16,984 B) | **0.5028** | **0.7713** | **0.9745** | **1,988.7** | 3.71% |
+| 16 KiB | `ctwo-pickle-arrays` | direct IPC (Python-only) | **0.2017** | **0.2422** | **0.2450** | **4,957.7** | **1.20%** |
+| 16 KiB | `ray-named-actor` | dynamic named actor (inline) | 0.6880 | 1.4610 | 2.2747 | 1,453.4 | 6.81% |
+| 16 KiB | `ray-compiled-graph` | static compiled DAG | 0.2269 | 0.6253 | 1.3830 | 4,407.7 | 3.03% |
+| 64 KiB | `ctwo-fastdb-unary` | direct IPC (SHM, 66,136 B) | 0.6153 | 1.2539 | 2.0007 | 1,625.2 | 5.90% |
 
 ## Suite 2: Full-Field Grid Snapshots & Live Streams (`256 KiB` → `1 GiB`)
 
@@ -85,76 +85,76 @@ All runs reported `fastdb_execution_mode = DIRECT` (`1`), `fastdb_staging_bytes 
 
 | Size | Mode | Unary P50 / P95 (ms) | Unary GiB/s | Stream P50 / P95 (ms) | Stream Steady GiB/s | Server Peak RSS (MiB) |
 | ---: | --- | ---: | ---: | ---: | ---: | ---: |
-| 256 KiB | published | 0.264 / 0.356 | 0.92 | 0.175 / 0.330 | 1.31 | 57.5 |
-| 256 KiB | fresh | 0.366 / 0.497 | 0.67 | 0.254 / 0.424 | 0.87 | 58.0 |
-| 1 MiB | published | 0.278 / 0.405 | 3.51 | 0.157 / 0.261 | 5.87 | 61.6 |
-| 1 MiB | fresh | 0.451 / 0.585 | 2.16 | 0.357 / 0.602 | 2.52 | 63.0 |
-| 4 MiB | published | 0.563 / 0.836 | 6.94 | **0.391 / 0.563** | **9.50** | 77.2 |
-| 4 MiB | fresh | 1.058 / 1.720 | 3.69 | **0.806 / 1.016** | **4.72** | 74.1 |
-| 16 MiB | published | 1.793 / 3.225 | 8.72 | **1.313 / 2.013** | **11.60** | 136.9 |
-| 16 MiB | fresh | 3.023 / 4.248 | 5.17 | **2.461 / 3.171** | **6.27** | 121.0 |
-| 32 MiB | published | 3.135 / 6.058 | 9.97 | **2.408 / 3.169** | **12.92** | 217.4 |
-| 32 MiB | fresh | 4.774 / 7.640 | 6.55 | **3.839 / 4.915** | **7.80** | 184.9 |
-| 256 MiB | published | 105.655 / 114.963 | 2.37 | 56.888 / 77.117 | 3.92 | 1,337.1 |
-| 256 MiB | fresh | 90.861 / 92.035 | 2.75 | 65.543 / 73.572 | 3.79 | 1,080.8 |
-| 512 MiB | published | 117.193 / 177.305 | 4.27 | 110.075 / 147.216 | 4.04 | 2,617.6 |
-| 512 MiB | fresh | 133.788 / 231.277 | 3.74 | 140.352 / 157.654 | 3.45 | 2,104.6 |
-| 1 GiB | published | 680.480 / 709.944 | 1.47 | 304.019 / 311.521 | 3.65 | 5,176.8 |
-| 1 GiB | fresh | 279.033 / 409.640 | 3.58 | 292.945 / 316.296 | 3.47 | 4,154.0 |
+| 256 KiB | published | 0.255 / 0.425 | 0.96 | 0.205 / 0.328 | 1.15 | 57.8 |
+| 256 KiB | fresh | 0.324 / 0.549 | 0.75 | 0.244 / 0.371 | 0.94 | 57.8 |
+| 1 MiB | published | 0.310 / 0.470 | 3.15 | 0.204 / 0.430 | 4.14 | 61.0 |
+| 1 MiB | fresh | 0.438 / 0.580 | 2.23 | 0.326 / 0.619 | 2.57 | 62.7 |
+| 4 MiB | published | 0.633 / 1.062 | 6.17 | **0.414 / 0.586** | **8.67** | 72.9 |
+| 4 MiB | fresh | 0.952 / 1.125 | 4.10 | **0.808 / 1.059** | **4.83** | 73.1 |
+| 16 MiB | published | 1.870 / 2.104 | 8.36 | **1.363 / 2.175** | **10.98** | 121.0 |
+| 16 MiB | fresh | 2.300 / 2.812 | 6.79 | **1.939 / 2.898** | **7.48** | 120.9 |
+| 32 MiB | published | **3.122 / 3.427** | **10.01** | **2.497 / 4.216** | **11.70** | 184.9 |
+| 32 MiB | fresh | **4.099 / 4.696** | **7.62** | **3.762 / 4.697** | **8.08** | 185.2 |
+| 256 MiB | published | **62.622 / 63.903** | **3.99** | **62.167 / 117.402** | 3.49 | 1,081.0 |
+| 256 MiB | fresh | **64.687 / 67.436** | **3.86** | **64.568 / 80.190** | 3.75 | 1,081.1 |
+| 512 MiB | published | 121.908 / 122.242 | 4.10 | 117.601 / 209.656 | 3.88 | 2,104.9 |
+| 512 MiB | fresh | 124.751 / 127.535 | 4.01 | 125.248 / 167.264 | 3.62 | 2,105.2 |
+| 1 GiB | published | 277.454 / 372.373 | 3.60 | 369.289 / 701.247 | 2.21 | 4,153.7 |
+| 1 GiB | fresh | **254.560 / 256.291** | **3.93** | 262.469 / 313.703 | 3.67 | 4,153.3 |
 
 ### 2B. Cross-Arm Comparison (`4 MiB`, `32 MiB`, `256 MiB`, `512 MiB`, `1 GiB`)
 
-| Size | Mode | `ctwo-fastdb-stream` P50 / P95 (GiB/s) | `ctwo-fastdb-unary` P50 (GiB/s) | `ctwo-fastdb-hold` P50 (GiB/s) | `ctwo-pickle-arrays` P50 (GiB/s) | `ray-named-actor` P50 / P95 (GiB/s) | `ray-compiled-graph` P50 / P95 (GiB/s) |
+| Size | Mode | `ctwo-fastdb-stream` P50 / P95 (GiB/s) | `ctwo-fastdb-unary` P50 / P95 (GiB/s) | `ctwo-fastdb-hold` P50 (GiB/s) | `ctwo-pickle-arrays` P50 (GiB/s) | `ray-named-actor` P50 / P95 (GiB/s) | `ray-compiled-graph` P50 / P95 (GiB/s) |
 | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| 4 MiB | published | **0.391 / 0.563 ms (9.98)** | 0.563 ms (6.94) | 0.657 ms (5.94) | 1.249 ms (3.13) | 2.215 / 2.454 ms (1.76) | 0.443 / 2.053 ms (8.81) |
-| 4 MiB | fresh | 0.806 / **1.016 ms** (4.85) | 1.058 ms (3.69) | 1.003 ms (3.89) | 1.346 ms (2.90) | 1.595 / 1.813 ms (2.45) | **0.618** / 2.397 ms (**6.32**) |
-| 32 MiB | published | **2.408 / 3.169 ms (12.98)** | 3.135 ms (9.97) | 2.911 ms (10.73) | 8.347 ms (3.74) | 12.324 / 12.877 ms (2.54) | 12.840 / 15.352 ms (2.43) |
-| 32 MiB | fresh | **3.839 / 4.915 ms (8.14)** | 4.774 ms (6.55) | 5.088 ms (6.14) | 9.216 ms (3.39) | 6.107 / 6.455 ms (5.12) | 12.742 / 24.313 ms (2.45) |
-| 256 MiB | published | **56.888 / 77.117 ms (4.39)** | 105.655 ms (2.37) | 77.480 ms (3.23) | 146.948 ms (1.70) | 95.686 / 221.814 ms (2.61) | `OutOfDiskError` |
-| 256 MiB | fresh | **65.543 / 73.572 ms (3.81)** | 90.861 ms (2.75) | 87.144 ms (2.87) | 125.483 ms (1.99) | 89.201 / 95.680 ms (2.80) | `OutOfDiskError` |
-| 512 MiB | published | 110.075 / 147.216 ms (4.54) | 117.193 ms (4.27) | 107.231 ms (4.66) | 284.328 ms (1.76) | **22.096 / 61.061 ms (22.63)** | `OutOfDiskError` |
-| 512 MiB | fresh | 140.352 / 157.654 ms (3.56) | 133.788 ms (3.74) | 140.243 ms (3.57) | 211.887 ms (2.36) | **35.959 / 93.442 ms (13.90)** | `OutOfDiskError` |
-| 1 GiB | published | **304.019 / 311.521 ms (3.29)** | 680.480 ms (1.47) | 344.006 ms (2.91) | 868.043 ms (1.15) | `OutOfDiskError` | `OutOfDiskError` |
-| 1 GiB | fresh | 292.945 / 316.296 ms (3.41) | 279.033 ms (3.58) | 275.512 ms (3.63) | 907.864 ms (1.10) | **67.122 / 102.817 ms (14.90)** | `OutOfDiskError` |
+| 4 MiB | published | **0.414 / 0.586 ms (9.43)** | 0.633 / 1.062 ms (6.17) | 0.762 ms (5.13) | 1.498 ms (2.61) | 3.746 / 5.001 ms (1.04) | 1.250 / 12.037 ms (3.13) |
+| 4 MiB | fresh | 0.808 / **1.059 ms** (4.83) | 0.952 / 1.125 ms (4.10) | 0.896 ms (4.36) | 1.556 ms (2.51) | 1.921 / 2.271 ms (2.03) | **0.590** / 2.899 ms (**6.62**) |
+| 32 MiB | published | **2.497 / 4.216 ms (12.52)** | 3.122 / **3.427 ms** (10.01) | 3.151 ms (9.92) | 12.283 ms (2.54) | 13.092 / 14.274 ms (2.39) | 13.960 / 23.951 ms (2.24) |
+| 32 MiB | fresh | **3.762 / 4.697 ms (8.31)** | 4.099 / **4.696 ms** (7.62) | 4.026 ms (7.76) | 12.988 ms (2.41) | 6.031 / 7.746 ms (5.18) | 3.963 / 5.079 ms (7.89) |
+| 256 MiB | published | **62.167 / 117.402 ms (4.02)** | 62.622 / **63.903 ms** (3.99) | 63.279 ms (3.95) | 137.628 ms (1.82) | 76.155 / 79.391 ms (3.28) | `OutOfDiskError` |
+| 256 MiB | fresh | **64.568 / 80.190 ms (3.87)** | 64.687 / **67.436 ms** (3.86) | 66.745 ms (3.75) | 112.380 ms (2.22) | 92.572 / 94.496 ms (2.70) | `OutOfDiskError` |
+| 512 MiB | published | 117.601 / 209.656 ms (4.25) | 121.908 / 122.242 ms (4.10) | 118.469 ms (4.22) | 335.337 ms (1.49) | **22.470 / 62.748 ms (22.25)** | `OutOfDiskError` |
+| 512 MiB | fresh | 125.248 / 167.264 ms (3.99) | 124.751 / 127.535 ms (4.01) | 126.777 ms (3.94) | 223.193 ms (2.24) | **33.790 / 95.682 ms (14.80)** | `OutOfDiskError` |
+| 1 GiB | published | 369.289 / 701.247 ms (2.71) | 277.454 / 372.373 ms (3.60) | 367.213 ms (2.72) | 1,282.466 ms (0.78) | **44.077 / 81.354 ms (22.69)** | `OutOfDiskError` |
+| 1 GiB | fresh | 262.469 / 313.703 ms (3.81) | 254.560 / 256.291 ms (3.93) | 256.557 ms (3.90) | 1,398.434 ms (0.72) | **70.345 / 82.933 ms (14.22)** | `OutOfDiskError` |
 
-Explicit 1-hop `c3 relay` stream (`ctwo-fastdb-relay-stream`) reaches **1.423 ms (`2.74 GiB/s`) `published` / 1.926 ms `fresh`** at `4 MiB`, and **10.380 ms (`3.01 GiB/s`) `published` / 12.707 ms (`2.46 GiB/s`) `fresh`** at `32 MiB` — faster over HTTP relay than local `ray-named-actor` on `32 MiB published` (`12.324 ms`).
+Explicit 1-hop `c3 relay` stream (`ctwo-fastdb-relay-stream`) reaches **1.944 ms (`2.01 GiB/s`) `published` / 1.905 ms (`2.05 GiB/s`) `fresh`** at `4 MiB`, and **11.096 ms (`2.82 GiB/s`) `published` / 11.087 ms (`2.82 GiB/s`) `fresh`** at `32 MiB` — faster over HTTP relay than local `ray-named-actor` on `32 MiB published` (`13.092 ms`).
 
 ## Suite 5: `4 GiB` Bounded-Memory Streamed Migration (`128 × 32 MiB` in `1 GiB` RAM Budget)
 
 | Mode | Arm | Total Moved | Elapsed (s) | Effective GiB/s | Per-Chunk P50 / P95 (ms) | Server Pool / Client Pool Peak (MiB) | Server Peak RSS (MiB) | Client Live RSS Delta (MiB) |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| published | `ctwo-fastdb-stream-migration` | 4.0 GiB | **0.297** | **13.45** | 2.33 / **2.68** | **64.0 / 64.0** | **217.6** | **+96.1** (`111.1 → 207.1`) |
-| published | `ray-actor-stream-migration` | 4.0 GiB | 0.614 | 6.51 | **1.50** / 12.86 | `1.5 GiB` Plasma | — | +1,472.1 (`207.8 → 1,679.9`) |
-| fresh | `ctwo-fastdb-stream-migration` | 4.0 GiB | 0.514 | 7.78 | 3.97 / **4.80** | **64.0 / 32.0** | **184.8** | **+32.0** (`1,679.9 → 1,711.9`) |
-| fresh | `ray-actor-stream-migration` | 4.0 GiB | **0.394** | **10.14** | **2.45** / 4.83 | `1.5 GiB` Plasma | — | +0.0 (`1,679.9 → 1,679.9`) |
+| published | `ctwo-fastdb-stream-migration` | 4.0 GiB | **0.290** | **13.80** | 2.25 / **2.67** | **64.0 / 64.0** | **184.6** | **+96.1** (`107.5 → 203.6`) |
+| published | `ray-actor-stream-migration` | 4.0 GiB | 0.577 | 6.93 | **1.55** / 12.10 | `1.5 GiB` Plasma | — | +1,472.3 (`204.3 → 1,676.6`) |
+| fresh | `ctwo-fastdb-stream-migration` | 4.0 GiB | 0.448 | 8.92 | 3.48 / **4.05** | **64.0 / 32.0** | **185.0** | **+32.0** (`1,676.6 → 1,708.6`) |
+| fresh | `ray-actor-stream-migration` | 4.0 GiB | **0.400** | **10.01** | **2.39** / 5.21 | `1.5 GiB` Plasma | — | +0.0 (`1,676.6 → 1,676.7`) |
 
 ## Suites 3 & 4: Multi-Subscriber Fan-Out (`32 MiB`, `8` Frames/Reader, `R = 1, 2, 4`)
 
 | Transport | Primitive | `R` | Publish (ms) | Elapsed (s) | Per-Reader P50 / P95 (ms) | Per-Reader FPS | Agg GiB/s | Server Pool Peak (MiB) | Server Peak RSS (MiB) | Relay A / B Peak RSS (MiB) |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `direct_ipc` | `@cc.stream` | 1 | — | 0.0210 | 2.47 / 4.34 | 381.21 | 11.91 | 64.00 | 217.7 | — |
-| `direct_ipc` | `@cc.topic` | 1 | 23.5 | 0.0342 | 3.85 / 6.57 | 234.11 | 7.32 | 384.06 | 440.8 | — |
-| `direct_ipc` | `@cc.stream` | 2 | — | 0.0328 | 3.28 / 7.85 | 244.09 | 15.26 | 128.00 | 249.0 | — |
-| `direct_ipc` | `@cc.topic` | 2 | 23.7 | 0.0384 | 4.34 / 7.91 | 208.49 | 13.03 | 384.06 | 442.3 | — |
-| `direct_ipc` | `@cc.stream` | 4 | — | 0.0481 | 4.85 / 11.48 | 166.37 | 20.80 | 256.00 | 313.5 | — |
-| `direct_ipc` | `@cc.topic` | 4 | 26.7 | **0.0467** | 5.23 / **9.87** | **171.43** | **21.43** | **384.06** | 441.3 | — |
-| `explicit_relay` | `@cc.stream` | 4 | — | 0.1363 | 16.79 / 21.38 | 58.69 | 7.34 | 256.00 | 314.6 | — |
-| `explicit_relay` | `@cc.topic` | 4 | 26.8 | **0.1275** | **14.74** / 24.98 | **62.74** | **7.84** | **384.06** | 442.5 | 327.2 / — |
-| `dual_relay` | `@cc.topic` | 4 | 23.6 | 0.1797 | 19.46 / 45.08 | 44.52 | 5.56 | **384.06** | 443.2 | 350.1 / 103.5 |
+| `direct_ipc` | `@cc.stream` | 1 | — | 0.0207 | 2.26 / 3.90 | 386.64 | 12.08 | 64.00 | 185.1 | — |
+| `direct_ipc` | `@cc.topic` | 1 | 24.5 | 0.0351 | 3.93 / 6.12 | 227.84 | 7.12 | 384.06 | 409.1 | — |
+| `direct_ipc` | `@cc.stream` | 2 | — | 0.0320 | 3.24 / 7.18 | 250.26 | 15.64 | 128.00 | 217.4 | — |
+| `direct_ipc` | `@cc.topic` | 2 | 22.8 | 0.0377 | 4.31 / 7.24 | 212.10 | 13.26 | 384.06 | 409.1 | — |
+| `direct_ipc` | `@cc.stream` | 4 | — | 0.0489 | 4.98 / 12.18 | 163.76 | 20.47 | 256.00 | 281.0 | — |
+| `direct_ipc` | `@cc.topic` | 4 | 25.3 | **0.0452** | 5.34 / **8.44** | **176.80** | **22.10** | **384.06** | 409.3 | — |
+| `explicit_relay` | `@cc.stream` | 4 | — | 0.1315 | 14.71 / 22.15 | 60.83 | 7.60 | 256.00 | 282.9 | — |
+| `explicit_relay` | `@cc.topic` | 4 | 23.1 | **0.1302** | 14.71 / 29.31 | **61.47** | **7.68** | **384.06** | 410.6 | 342.7 / — |
+| `dual_relay` | `@cc.topic` | 4 | 18.8 | 0.1620 | 16.52 / 42.23 | 49.39 | **6.17** | **384.06** | 410.4 | 321.1 / 134.8 |
 
 ## Suite 6: Structured Coordinates Replacement Baseline (Kostya, `1K` / `100K` / `1M` Rows)
 
 | Rows (`N`) | Arm | RPC P50 (ms) | Extract P50 (ms) | Reduce P50 (ms) | Total P50 (ms) | Total P95 (ms) | Speedup vs `pickle-arrays` / `ray-actor` |
 | ---: | --- | ---: | ---: | ---: | ---: | ---: | --- |
-| 1,000 | `ctwo-fastdb-packed` | 0.390 | 0.057 | 0.005 | **0.510** | **0.551** | 0.37× / **1.07×** |
-| 1,000 | `ctwo-pickle-arrays` | 0.177 | 0.000 | 0.005 | 0.190 | 0.230 | — |
-| 1,000 | `ray-named-actor-arrays` | 0.522 | 0.000 | 0.008 | 0.544 | 0.724 | — |
-| 100,000 | `ctwo-fastdb-packed` | 12.059 | 0.099 | 0.087 | 12.345 | 12.575 | 0.74× / 0.50× |
-| 100,000 | `ctwo-pickle-arrays` | 8.261 | 0.000 | 0.086 | 9.079 | 9.378 | — |
-| 100,000 | `ray-named-actor-arrays` | 5.433 | 0.000 | 0.093 | 6.228 | 6.370 | — |
-| 1,000,000 | `ctwo-fastdb-packed` | 13.444 | 0.097 | 0.599 | **14.264** | **17.097** | **10.60× / 3.75×** |
-| 1,000,000 | `ctwo-pickle-arrays` | 140.623 | 0.001 | 0.600 | 151.158 | 157.091 | — |
-| 1,000,000 | `ray-named-actor-arrays` | 43.911 | 0.000 | 0.647 | 53.433 | 55.415 | — |
+| 1,000 | `ctwo-fastdb-packed` | 0.404 | 0.061 | 0.007 | 0.531 | 0.728 | 0.37× / 0.98× |
+| 1,000 | `ctwo-pickle-arrays` | 0.184 | 0.000 | 0.006 | **0.198** | **0.416** | — |
+| 1,000 | `ray-named-actor-arrays` | 0.505 | 0.000 | 0.008 | 0.521 | 0.730 | — |
+| 100,000 | `ctwo-fastdb-packed` | 12.207 | 0.098 | 0.087 | 12.464 | 13.385 | 0.73× / 0.52× |
+| 100,000 | `ctwo-pickle-arrays` | 8.325 | 0.000 | 0.089 | 9.059 | 9.309 | — |
+| 100,000 | `ray-named-actor-arrays` | 5.492 | 0.000 | 0.307 | **6.508** | **6.709** | — |
+| 1,000,000 | `ctwo-fastdb-packed` | 13.368 | 0.096 | 0.637 | **14.210** | **14.627** | **10.18× / 3.85×** |
+| 1,000,000 | `ctwo-pickle-arrays` | 136.614 | 0.001 | 0.694 | 144.636 | 147.498 | — |
+| 1,000,000 | `ray-named-actor-arrays` | 44.824 | 0.000 | 3.109 | 54.768 | 56.904 | — |
 
 ## Reproduction Commands
 
