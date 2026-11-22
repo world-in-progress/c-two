@@ -8,7 +8,8 @@
 //! until the real terminal `CALL_END` or transport end.
 
 use super::*;
-use c2_mem::{DomainBudget, MemoryReservation};
+use crate::response::ItemBuffer;
+use c2_mem::DomainBudget;
 use std::sync::Weak;
 use tokio::sync::{Notify, mpsc, oneshot};
 
@@ -79,8 +80,7 @@ pub struct IpcTopicDelivery {
 }
 
 struct ActiveItemBuffer {
-    bytes: Vec<u8>,
-    reservation: MemoryReservation,
+    buffer: ItemBuffer,
     seq: u64,
     dropped: u64,
 }
@@ -488,7 +488,7 @@ impl SubscribeReceive {
                     _ = &mut changed => {}
                 }
             };
-            let reservation = match reservation {
+            let mut reservation = match reservation {
                 Ok(reservation) => reservation,
                 Err(error) => {
                     call.fail_local(
@@ -511,22 +511,24 @@ impl SubscribeReceive {
                     return;
                 }
             };
-            let mut bytes = Vec::new();
-            if let Err(error) = bytes.try_reserve_exact(size) {
-                call.fail_local(C2Error::new(
-                    c2_error::ErrorCode::CallCapacityExceeded,
-                    error.to_string(),
-                ));
-                return;
-            }
-            bytes.resize(size, 0);
+            let bytes = match reservation.allocate_vec(size) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    call.fail_local(C2Error::new(
+                        c2_error::ErrorCode::CallCapacityExceeded,
+                        error.to_string(),
+                    ));
+                    return;
+                }
+            };
+            let buffer = ItemBuffer::new(bytes, reservation);
             let mut state = call.state.lock();
             if state.ended || state.discarded || call.cancel_requested.load(Ordering::Acquire) {
+                drop(state);
                 return;
             }
             state.item = Some(ActiveItemBuffer {
-                bytes,
-                reservation,
+                buffer,
                 seq,
                 dropped,
             });
@@ -594,11 +596,9 @@ impl SubscribeReceive {
             (id, offset, complete, item)
         };
         if let Some(buffer) = item.as_mut() {
-            let start = usize::try_from(offset).expect("admitted item offset");
-            let end = start + usize::try_from(storage.len()).expect("admitted item bytes");
             match (storage, carrier) {
                 (ValueStorage::Inline(bytes), None) => {
-                    buffer.bytes[start..end].copy_from_slice(bytes);
+                    buffer.buffer.append_inline(offset, bytes)?;
                 }
                 (_, Some(ResponseData::Shm(carrier))) => {
                     let call = self.clone();
@@ -606,7 +606,7 @@ impl SubscribeReceive {
                     let delivery = SubscribeDeliveryOwner(self.clone());
                     tokio::task::spawn_blocking(move || {
                         let copied = carrier
-                            .copy_into(&mut item.bytes[start..end])
+                            .copy_into_vec(&mut item.buffer.bytes)
                             .map_err(IpcError::Shm);
                         // `carrier` has already ended its PeerRead and queued RELEASE.
                         call.settle_data(id, complete, Some(item), copied);
@@ -663,7 +663,7 @@ impl SubscribeReceive {
         }
         if complete && let Some(item) = item {
             self.spawn_delivery(IpcTopicDelivery {
-                bytes: BudgetedBuffer::new(item.bytes, item.reservation),
+                bytes: item.buffer.into_buffer(),
                 seq: item.seq,
                 dropped: item.dropped,
             });

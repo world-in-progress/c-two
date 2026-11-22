@@ -92,10 +92,13 @@ impl CrmStreamCallback for ScriptedCallback {
             item_count: request.first().copied().unwrap_or_default() as usize,
             fail_step: request.get(1) == Some(&1),
             fail_finish: request.get(1) == Some(&2),
-            item_bytes: request.get(2..4).map_or_else(
-                || request.get(2).copied().map_or(8, usize::from),
-                |width| u16::from_le_bytes(width.try_into().unwrap()) as usize,
-            ),
+            item_bytes: if let Some(width) = request.get(2..6) {
+                u32::from_le_bytes(width.try_into().unwrap()) as usize
+            } else if let Some(width) = request.get(2..4) {
+                u16::from_le_bytes(width.try_into().unwrap()) as usize
+            } else {
+                request.get(2).copied().map_or(8, usize::from)
+            },
             produced: 0,
         }))
     }
@@ -120,7 +123,14 @@ impl CrmStream for ScriptedStream {
         }
         let byte = self.produced as u8;
         self.produced += 1;
-        Ok(Some(Box::new(vec![byte; self.item_bytes])))
+        let item = if self.item_bytes > u16::MAX as usize {
+            (0..self.item_bytes)
+                .map(|index| byte.wrapping_add((index % 251) as u8))
+                .collect()
+        } else {
+            vec![byte; self.item_bytes]
+        };
+        Ok(Some(Box::new(item)))
     }
 
     fn finish(self: Box<Self>) -> Result<(), CrmError> {
@@ -823,6 +833,58 @@ async fn deactivation_preserves_admitted_stream_and_local_copy_after_shm_receive
     assert_eq!(terminal.status, CallStatus::Success);
     assert_eq!(terminal.complete_items, 3);
     assert_eq!(first.as_ref(), &[0; ITEM_BYTES as usize]);
+    fixture.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fragmented_inline_and_shm_items_reuse_the_same_local_buffer() {
+    let fixture = Harness::start(1).await;
+    let budget = memory_budget(2 * 1024 * 1024);
+    let size = 2 * c2_config::CHUNK_SIZE + 1;
+    let mut request = vec![1, 0];
+    request.extend_from_slice(&(size as u32).to_le_bytes());
+    let expected: Vec<_> = (0..size).map(|index| (index % 251) as u8).collect();
+    let server_budget = fixture.server.domain_budget();
+    // Leave enough room for call admission but too little for the SHM item.
+    let pressure = server_budget
+        .try_reserve_memory(server_budget.snapshot().memory.limit_bytes - 64 * 1024)
+        .unwrap();
+    let mut stream = fixture
+        .client
+        .stream_bound(&fixture.binding, "echo", &request, budget.clone())
+        .await
+        .unwrap();
+    let item = tokio::time::timeout(WAIT, stream.recv())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(item.as_ref(), expected);
+    let ptr = item.as_ptr();
+    drop(item);
+    assert!(stream.recv().await.unwrap().is_none());
+    let pool = fixture.server.response_pool_arc();
+    let stats = pool.read().stats();
+    assert_eq!(stats.buddy_expanded_allocs + stats.dedicated_allocs, 0);
+    drop(pressure);
+
+    let mut stream = fixture
+        .client
+        .stream_bound(&fixture.binding, "echo", &request, budget.clone())
+        .await
+        .unwrap();
+    let item = tokio::time::timeout(WAIT, stream.recv())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(item.as_ref(), expected);
+    assert_eq!(item.as_ptr(), ptr);
+    assert!(stream.recv().await.unwrap().is_none());
+    let stats = pool.read().stats();
+    assert!(stats.buddy_expanded_allocs + stats.dedicated_allocs > 0);
+    drop(item);
+    assert_eq!(budget.snapshot().memory.used_bytes, 0);
     fixture.stop().await;
 }
 

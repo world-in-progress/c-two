@@ -5,7 +5,8 @@
 //! the next demand. A second item can then be receiving or awaiting delivery.
 
 use super::*;
-use c2_mem::{DomainBudget, MemoryReservation};
+use crate::response::ItemBuffer;
+use c2_mem::DomainBudget;
 use std::sync::Weak;
 use tokio::sync::{Notify, mpsc};
 
@@ -73,11 +74,6 @@ pub struct StreamTerminal {
     pub status: CallStatus,
     pub complete_items: u64,
     pub error: Option<C2Error>,
-}
-
-struct ItemBuffer {
-    bytes: Vec<u8>,
-    reservation: MemoryReservation,
 }
 
 #[derive(Default)]
@@ -492,7 +488,7 @@ impl StreamReceive {
                     _ = &mut changed => {}
                 }
             };
-            let reservation = match reservation {
+            let mut reservation = match reservation {
                 Ok(reservation) => reservation,
                 Err(error) => {
                     call.fail_local(
@@ -515,20 +511,23 @@ impl StreamReceive {
                     return;
                 }
             };
-            let mut bytes = Vec::new();
-            if let Err(error) = bytes.try_reserve_exact(size) {
-                call.fail_local(C2Error::new(
-                    c2_error::ErrorCode::CallCapacityExceeded,
-                    error.to_string(),
-                ));
-                return;
-            }
-            bytes.resize(size, 0);
+            let bytes = match reservation.allocate_vec(size) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    call.fail_local(C2Error::new(
+                        c2_error::ErrorCode::CallCapacityExceeded,
+                        error.to_string(),
+                    ));
+                    return;
+                }
+            };
+            let buffer = ItemBuffer::new(bytes, reservation);
             let mut state = call.state.lock();
             if state.ended || state.discarded || call.cancel_requested.load(Ordering::Acquire) {
+                drop(state);
                 return;
             }
-            state.item = Some(ItemBuffer { bytes, reservation });
+            state.item = Some(buffer);
             if let Err(error) = call.conn.core.stream_credit(id, total, 0) {
                 drop(state);
                 call.fail_local(C2Error::new(
@@ -595,11 +594,9 @@ impl StreamReceive {
             (id, offset, complete, item)
         };
         if let Some(buffer) = item.as_mut() {
-            let start = usize::try_from(offset).expect("admitted item offset");
-            let end = start + usize::try_from(storage.len()).expect("admitted item bytes");
             match (storage, carrier) {
                 (ValueStorage::Inline(bytes), None) => {
-                    buffer.bytes[start..end].copy_from_slice(bytes);
+                    buffer.append_inline(offset, bytes)?;
                 }
                 (_, Some(ResponseData::Shm(carrier))) => {
                     // One SHM descriptor carries the whole item. Move its
@@ -617,7 +614,7 @@ impl StreamReceive {
                             let _ = release.recv();
                         }
                         let copied = carrier
-                            .copy_into(&mut item.bytes[start..end])
+                            .copy_into_vec(&mut item.bytes)
                             .map_err(IpcError::Shm);
                         call.settle_data(id, complete, Some(item), copied);
                         drop(delivery);
@@ -674,7 +671,7 @@ impl StreamReceive {
             self.conn.wake.notify_one();
         }
         if complete && let Some(item) = item {
-            self.spawn_delivery(BudgetedBuffer::new(item.bytes, item.reservation));
+            self.spawn_delivery(item.into_buffer());
         }
         if let Some((terminal, entry)) = deferred {
             self.finish(terminal, entry);

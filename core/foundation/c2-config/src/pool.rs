@@ -47,12 +47,21 @@ impl PoolConfig {
 
     fn for_budget_share(share: u64, segment_cap: usize) -> Self {
         let pool_enabled = share >= MIN_BUDDY_SEGMENT_BYTES;
-        let max_segments = (share / MIN_BUDDY_SEGMENT_BYTES).clamp(1, segment_cap as u64);
-        let segment_size = if pool_enabled {
-            let per_segment = share / max_segments;
-            (1u64 << per_segment.ilog2()).min(MAX_BUDDY_SEGMENT_BYTES)
+        let target_segments = 4u64.min(segment_cap as u64);
+        let (segment_size, max_segments) = if !pool_enabled {
+            (MIN_BUDDY_SEGMENT_BYTES, 1)
+        } else if share < target_segments * MIN_BUDDY_SEGMENT_BYTES {
+            (
+                MIN_BUDDY_SEGMENT_BYTES,
+                (share / MIN_BUDDY_SEGMENT_BYTES).clamp(1, target_segments),
+            )
         } else {
-            MIN_BUDDY_SEGMENT_BYTES
+            let per_target = share / target_segments;
+            let segment_size = (1u64 << per_target.ilog2()).min(MAX_BUDDY_SEGMENT_BYTES);
+            (
+                segment_size,
+                (share / segment_size).clamp(1, segment_cap as u64),
+            )
         };
         Self {
             pool_enabled,
@@ -90,9 +99,13 @@ mod tests {
             (256 * kib - 1, (false, 64 * kib, 1)),
             (256 * kib, (true, 64 * kib, 1)),
             (mib, (true, 64 * kib, 4)),
-            (4 * mib - 1, (true, 64 * kib, 15)),
-            (4 * mib, (true, 64 * kib, 16)),
-            (8 * mib, (true, 128 * kib, 16)),
+            (2 * mib - 1, (true, 64 * kib, 7)),
+            (2 * mib, (true, 128 * kib, 4)),
+            (4 * mib - 1, (true, 128 * kib, 7)),
+            (4 * mib, (true, 256 * kib, 4)),
+            (8 * mib, (true, 512 * kib, 4)),
+            (1024 * mib, (true, 64 * mib, 4)),
+            (1280 * mib, (true, 64 * mib, 5)),
             (DEFAULT_MEMORY_BUDGET_BYTES, (true, 64 * mib, 16)),
         ] {
             let config = PoolConfig::primary_for_budget(budget);
@@ -126,7 +139,7 @@ mod tests {
 
     #[test]
     fn enabled_geometry_fits_its_share_at_rounding_boundaries() {
-        // Each share is monotonic between consecutive segment-count or size transitions.
+        // Exercise both sides of segment-count and size transitions.
         for budget in (1..=16)
             .flat_map(|count| {
                 (16..=58).flat_map(move |shift| {
@@ -136,9 +149,19 @@ mod tests {
             })
             .chain([0, u64::MAX])
         {
+            let share = budget / 16;
+            let old_count = (share / MIN_BUDDY_SEGMENT_BYTES).clamp(1, 4);
+            let old_size = if share >= MIN_BUDDY_SEGMENT_BYTES {
+                (1u64 << (share / old_count).ilog2()).min(MAX_BUDDY_SEGMENT_BYTES)
+            } else {
+                MIN_BUDDY_SEGMENT_BYTES
+            };
+            let reassembly = PoolConfig::reassembly_for_budget(budget);
+            assert_eq!(reassembly.max_segments as u64, old_count);
+            assert_eq!(reassembly.segment_size as u64, old_size);
             for (config, share) in [
                 (PoolConfig::primary_for_budget(budget), budget / 4),
-                (PoolConfig::reassembly_for_budget(budget), budget / 16),
+                (reassembly, share),
             ] {
                 if config.pool_enabled {
                     assert!(config.segment_size.is_power_of_two());

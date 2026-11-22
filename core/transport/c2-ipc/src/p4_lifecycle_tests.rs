@@ -489,15 +489,18 @@ async fn prepared_request_owners_fill_primary_pool_and_remain_budgeted_after_clo
     .unwrap();
     client.connect().await.unwrap();
     let binding = client.acquire_route(&contract()).await.unwrap();
+    let pool_cfg = c2_config::PoolConfig::primary_for_budget(4 * 1024 * 1024);
+    let seg_count = pool_cfg.max_segments;
+    let seg_size = pool_cfg.segment_size;
     let pool = client.request_pool().unwrap();
     pool.write()
-        .ensure_buddy_segments(16)
-        .expect("16 real request SHM segments are required");
+        .ensure_buddy_segments(seg_count)
+        .expect("full primary request SHM segments are required");
     let mut blocks = Vec::new();
-    for index in 0..16 {
-        let block = client.try_alloc_request_block(64 * 1024).unwrap().unwrap();
-        assert_eq!(block.allocation().seg_idx, index);
-        block.write_at(0, &vec![index as u8; 64 * 1024]).unwrap();
+    for index in 0..seg_count {
+        let block = client.try_alloc_request_block(seg_size).unwrap().unwrap();
+        assert_eq!(block.allocation().seg_idx, index as u32);
+        block.write_at(0, &vec![index as u8; seg_size]).unwrap();
         blocks.push(block);
     }
     let last = blocks.pop().unwrap();
@@ -508,7 +511,7 @@ async fn prepared_request_owners_fill_primary_pool_and_remain_budgeted_after_clo
             .unwrap()
             .into_owned_bytes()
             .unwrap();
-        assert_eq!(bytes, vec![index as u8; 64 * 1024]);
+        assert_eq!(bytes, vec![index as u8; seg_size]);
     }
     let bytes = client
         .call_with_prealloc(&binding.table.call_identity(), 0, &last)
@@ -516,9 +519,9 @@ async fn prepared_request_owners_fill_primary_pool_and_remain_budgeted_after_clo
         .unwrap()
         .into_owned_bytes()
         .unwrap();
-    assert_eq!(bytes, vec![15; 64 * 1024]);
+    assert_eq!(bytes, vec![(seg_count - 1) as u8; seg_size]);
     drop(last);
-    let external = client.try_alloc_request_block(64 * 1024).unwrap().unwrap();
+    let external = client.try_alloc_request_block(seg_size).unwrap().unwrap();
     let budget = client.domain_budget().clone();
     assert!(client.close_shared_bounded(WAIT).await);
     drop(client);

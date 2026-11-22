@@ -386,8 +386,8 @@ fn remote_subscribe_start_latest_on_empty_and_populated_topic_and_start_next() {
 #[test]
 fn multi_subscriber_single_write_shared_shm_buddy_and_dedicated() {
     let dir = tempfile::tempdir().unwrap();
-    // 16 MiB server memory budget yields a modest buddy segment so a 64 KiB
-    // payload takes buddy SHM and a 6 MiB payload takes dedicated SHM.
+    // 16 MiB server memory budget yields a 1 MiB buddy segment so a 64 KiB
+    // payload takes buddy SHM and a 5 MiB payload takes dedicated SHM.
     let (_host_rt, host) = make_host(&dir, "ipc-shm-fanout", Some(16 * 1024 * 1024), None);
     let release = release_with_topics(&["field"]);
     let reg = host
@@ -448,14 +448,22 @@ fn multi_subscriber_single_write_shared_shm_buddy_and_dedicated() {
     assert_eq!(da2.bytes(), large_payload.as_slice());
     assert_eq!(db2.bytes(), large_payload.as_slice());
 
-    // After both clients copied & released their SHM loans, publishing a small
-    // frame evicts the 5 MiB dedicated SHM block and server used_bytes drops
-    // well below 5 MiB.
-    assert_eq!(pub_field.publish(b"tiny".to_vec()).unwrap(), 3);
+    let a_ptr = da2.bytes().as_ptr();
+    let b_ptr = db2.bytes().as_ptr();
+    drop((da2, db2));
+    let next_payload: Vec<u8> = large_payload.iter().map(|byte| byte ^ 0xff).collect();
+    assert_eq!(pub_field.publish(next_payload.clone()).unwrap(), 3);
     let da3 = sub_a.next_delivery().unwrap();
     let db3 = sub_b.next_delivery().unwrap();
-    assert_eq!(da3.bytes(), b"tiny");
-    assert_eq!(db3.bytes(), b"tiny");
+    assert_eq!(da3.bytes().as_ptr(), a_ptr);
+    assert_eq!(db3.bytes().as_ptr(), b_ptr);
+    assert_eq!(da3.bytes(), next_payload.as_slice());
+    assert_eq!(db3.bytes(), next_payload.as_slice());
+
+    // Publishing a small inline frame evicts the dedicated SHM block.
+    assert_eq!(pub_field.publish(b"tiny".to_vec()).unwrap(), 4);
+    assert_eq!(sub_a.next_delivery().unwrap().bytes(), b"tiny");
+    assert_eq!(sub_b.next_delivery().unwrap().bytes(), b"tiny");
 
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {

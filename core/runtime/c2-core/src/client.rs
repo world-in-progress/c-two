@@ -957,8 +957,9 @@ impl EncodedCall {
                 }
                 let result = async {
                     let response = match &target.transport {
-                        ClientInner::Ipc(connection) => HeldResponse::from_response_data(
+                        ClientInner::Ipc(connection) => HeldResponse::from_response_data_in(
                             call_ipc(connection, &method, input, scope).await?,
+                            &payload_budget,
                         )?,
                         ClientInner::Http(client) => HeldResponse::from_budgeted_bytes(
                             call_http(client, &method, input, scope, payload_budget).await?,

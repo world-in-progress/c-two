@@ -67,7 +67,9 @@ Python `cc.set_client` 与 `cc.set_server` 接受表中的三个容量字段。`
 
 ## 段几何与服务端线程
 
-请求和响应主池各按 `B = floor(M / 4)` 推导，最多 16 段。重组池按 `B = floor(M / 16)` 推导，最多 4 段。各池段数为 `min(max_segments, floor(B / 65536))`，结果为零时跳过 buddy 分配。否则每段为 `min(MAX_BUDDY_SEGMENT, prev_pow2(floor(B / segment_count)))`，其中 `prev_pow2` 向下取最大的二次幂，`MAX_BUDDY_SEGMENT = 64 MiB`。各池 buddy 总容量受其份额约束，已创建的 backing 计入该域的 `M`。默认 `M` 下，主池最多 16 × 64 MiB，重组池最多 4 × 64 MiB。`M` 低于 256 KiB 时主池不建 buddy 段，低于 1 MiB 时重组池不建 buddy 段，按路径使用内联、独占 SHM、分片或文件溢出。单次重组上限在客户端取路由通告的 `max_payload_size`，在服务端取 Host 自身的值。
+请求和响应主池各按 `B = floor(M / 4)` 推导，段数上限为 16。重组池按 `B = floor(M / 16)` 推导，段数上限为 4。令 `T = min(4, segment_cap)`、`min_size = 64 KiB`、`max_size = 64 MiB`。`B` 低于 `min_size` 时停用 buddy 分配。`B` 达到 `min_size` 但低于 `T × min_size` 时，段大小取 `min_size`，段数取 `floor(B / min_size)`。其余情况下，段大小取 `min(max_size, prev_pow2(floor(B / T)))`，段数取 `min(segment_cap, floor(B / segment_size))`，其中 `prev_pow2` 向下取最大的二次幂。各启用池的总容量受其份额约束，已创建的 backing 计入该域的预算。默认 16 GiB 下，每个主池最多 16 × 64 MiB，重组池最多 4 × 64 MiB。域预算为 1 GiB 时，每个主池为 4 × 64 MiB。域预算低于 256 KiB 时主池不建 buddy 段，低于 1 MiB 时重组池不建 buddy 段，按路径使用内联、独占 SHM、分片或文件溢出。单次重组上限在客户端取路由通告的 `max_payload_size`，在服务端取 Host 自身的值。
+
+每个角色域最多复用四个空闲本地缓冲，每个至少 256 KiB。空闲缓冲的总容量受 2 GiB 和 `M` 中尚未保留的额度约束。新的保留需要空间时，域优先驱逐最早归还的空闲缓冲。空闲缓冲不计入 `used_bytes` 或 `peak_bytes`。
 
 设 `P` 为主机并行度（取不到时为 4），`W` 为配置的 `max_execution_workers`，`C = E = clamp(P, 4, 64)` 分别限制入站分片拷贝和流条目编码的并发量。服务端使用两个异步 I/O 线程，通过检查加法溢出设置 Tokio 阻塞线程上限 `T = max(512, W + C + E + 16)`。三类工作都在提交阻塞闭包前取得许可，直到闭包返回才释放，为监听器启停与收尾留出至少 16 个线程。
 
