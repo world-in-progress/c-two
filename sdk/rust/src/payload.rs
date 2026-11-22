@@ -29,13 +29,21 @@ pub fn charge_payload_input(call: &mut PreparedCall, payload: &Payload) -> Resul
     call.charge_input(nbytes)
 }
 
+fn open_options_for_len(len: usize) -> OpenOptions {
+    let mut options = OpenOptions::default();
+    options.max_total_bytes = options.max_total_bytes.max(len as u64);
+    options
+}
+
 /// Open detached response bytes as a FastDB payload, moving a supplied `Vec`.
 ///
 /// Generated code remains responsible for selecting the exact adapter phase
 /// and checking the contract-owned expected specification digest.
 pub fn open_owned(spec: &CompiledSpec, bytes: impl Into<Vec<u8>>) -> Result<Payload, PayloadError> {
-    let external = ExternalBytes::from_owner(bytes.into());
-    Payload::open_external(spec, &external, &OpenOptions::default())
+    let bytes = bytes.into();
+    let options = open_options_for_len(bytes.len());
+    let external = ExternalBytes::from_owner(bytes);
+    Payload::open_external(spec, &external, &options)
 }
 
 struct HeldBytes(Arc<HeldResponse>);
@@ -51,9 +59,10 @@ pub fn open_held(
     spec: &CompiledSpec,
     response: HeldResponse,
 ) -> Result<Held<Payload>, PayloadError> {
+    let options = open_options_for_len(response.bytes().len());
     let shared = Arc::new(response);
     let external = ExternalBytes::from_owner(HeldBytes(Arc::clone(&shared)));
-    let payload = Payload::open_external(spec, &external, &OpenOptions::default())?;
+    let payload = Payload::open_external(spec, &external, &options)?;
     Ok(Held::new_shared(payload, shared, invalidate_payload))
 }
 

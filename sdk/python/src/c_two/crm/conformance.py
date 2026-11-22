@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import inspect
-from typing import Any, get_type_hints
+import types
+from collections.abc import Generator, Iterator
+from typing import Any, Union, get_args, get_origin, get_type_hints
 
 from .contract import crm_contract_identity
 from .methods import rpc_method_names
+from .payload_plan import _build_plan_type, _payload_type
 
 
 def validate_resource_conformance(
@@ -153,12 +156,52 @@ def _validate_annotations(
     if 'return' in resource_hints:
         crm_return = _normalize_annotation(crm_hints.get('return'))
         resource_return = _normalize_annotation(resource_hints['return'])
-        if crm_return != resource_return:
+        if not _return_annotations_compatible(crm_method, crm_return, resource_return):
             raise TypeError(
                 f'{method_name} return annotation mismatch: CRM '
                 f'{_annotation_name(crm_return)}, resource '
                 f'{_annotation_name(resource_return)}.',
             )
+
+
+def _is_fastdb_return_item(annotation: object) -> bool:
+    payload_type = _payload_type()
+    plan_type = _build_plan_type()
+    if payload_type is None or plan_type is None:
+        return False
+    if annotation is payload_type or annotation is plan_type:
+        return True
+    origin = get_origin(annotation)
+    if origin in (Union, types.UnionType):
+        args = get_args(annotation)
+        return bool(args) and all(arg in (payload_type, plan_type) for arg in args)
+    return False
+
+
+def _return_annotations_compatible(
+    crm_method: object,
+    crm_return: object,
+    resource_return: object,
+) -> bool:
+    if crm_return == resource_return:
+        return True
+    payload_type = _payload_type()
+    if payload_type is None:
+        return False
+    transfer = getattr(crm_method, '__cc_transfer__', None)
+    if not isinstance(transfer, dict) or transfer.get('output') is None:
+        return False
+    if getattr(crm_method, '__cc_stream__', False):
+        crm_origin = get_origin(crm_return)
+        res_origin = get_origin(resource_return)
+        if crm_origin not in (Iterator, Generator) or res_origin not in (Iterator, Generator):
+            return False
+        crm_args = get_args(crm_return)
+        res_args = get_args(resource_return)
+        if not crm_args or not res_args or crm_args[0] is not payload_type:
+            return False
+        return _is_fastdb_return_item(res_args[0])
+    return crm_return is payload_type and _is_fastdb_return_item(resource_return)
 
 
 def _type_hints(method: object, method_name: str, owner: str) -> dict[str, Any]:

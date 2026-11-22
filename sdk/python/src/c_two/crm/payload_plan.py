@@ -16,6 +16,9 @@ if TYPE_CHECKING:
 DEFAULT_PICKLE_PROTOCOL = 4
 # FDB_PAYLOAD_DIRECT_BUILD_ELIGIBLE in the FastDB 0.3.0 C ABI.
 _FASTDB_DIRECT_BUILD_ELIGIBLE = 1
+# Lift FastDB's default OpenOptions total-byte cap when C-Two has already
+# admitted a >256 MiB payload within max_payload_size and the role budget.
+_FASTDB_OPEN_OPTIONS_THRESHOLD_BYTES = 256 * 1024 * 1024
 
 # Marker attribute distinguishing which payload hook actually failed: opening
 # the FastDB payload buffer (``from_buffer``) versus verifying/decoding the
@@ -277,7 +280,15 @@ def fastdb_payload_binding(
             # temporary one to release. Both reference the same buffer export.
             ext = module.ExternalBytes(memoryview(data) if isinstance(data, memoryview) else data)
             try:
-                owner = Payload.open_external(compiled, ext)
+                data_len = len(data)
+                if data_len > _FASTDB_OPEN_OPTIONS_THRESHOLD_BYTES:
+                    owner = Payload.open_external(
+                        compiled,
+                        ext,
+                        module.OpenOptions(max_total_bytes=data_len),
+                    )
+                else:
+                    owner = Payload.open_external(compiled, ext)
             finally:
                 ext.close()
         except BaseException as exc:
