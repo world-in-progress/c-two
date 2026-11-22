@@ -17,6 +17,11 @@ use futures_util::{Stream, StreamExt};
 use tokio::io::AsyncReadExt;
 use tokio::sync::{oneshot, watch};
 
+/// One kernel read of the response stream covers the header and payload reads
+/// of consecutive small frames. A transport read buffer, not a payload budget:
+/// frame admission still bounds every decoded frame.
+const RECEIVE_BUFFER_BYTES: usize = 64 * 1024;
+
 use c2_config::{
     CHUNK_SIZE, ConnectDeadline, DEFAULT_MAX_PAYLOAD_SIZE, DomainLimits, MAX_HANDSHAKE_FRAME_BYTES,
     MAX_RPC_FRAME_BYTES, POOL_DECAY_SECONDS, SHM_THRESHOLD, WRITE_TIMEOUT,
@@ -3060,7 +3065,15 @@ pub(crate) fn recv_loop(
         let server_pool = &task.server_pool;
         let pending = &task.pending;
         let retirement = task.driver.retirement.clone();
-        let reader = task.driver.stream.as_mut().unwrap();
+        // One kernel read covers the header and payload reads of consecutive
+        // small frames. The buffer owns no protocol state; frame boundaries
+        // stay in this loop. Declared after the driver so its stream still
+        // drops before the retirement fence.
+        let mut buffered = tokio::io::BufReader::with_capacity(
+            RECEIVE_BUFFER_BYTES,
+            task.driver.stream.take().expect("receive stream"),
+        );
+        let reader = &mut buffered;
         let mut header = [0u8; HEADER_SIZE];
         let mut payload = Vec::with_capacity(4096);
         let mut malformed = false;
@@ -3639,7 +3652,7 @@ pub(crate) fn recv_loop(
             }
         }
         registry.cleanup_connection(conn_id);
-        conn.read_stopped(reader.peer_ended());
+        conn.read_stopped(reader.get_ref().peer_ended());
         task.cleanup.finished = true;
     }
 }

@@ -316,6 +316,27 @@ def _cancel_unclaimed_stream(native: object, primary: BaseException) -> None:
 def _build_stream_wrapper(func, input_binding, output_binding):
     signature = inspect.signature(func)
     method_name = func.__name__
+    # Binding hooks and the fixed arity are frozen once here; the call path
+    # only reads them.
+    input_serializer = input_binding.serialize
+    output_decoder = output_binding.deserialize
+    output_invalidate = output_binding.invalidate
+    fastdb_input = input_binding.kind is PayloadPlanKind.FASTDB
+    stream_input_arity = len(signature.parameters) - 1
+    # A signature whose parameters are all plain positional ones admits an
+    # exact-count fast path: binding and default application are no-ops when
+    # the caller passed exactly that many positional values after self.
+    exact_arg_count = (
+        len(signature.parameters)
+        if all(
+            parameter.kind in (
+                inspect.Parameter.POSITIONAL_ONLY,
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            )
+            for parameter in signature.parameters.values()
+        )
+        else None
+    )
 
     @wraps(func)
     def invoke(self, *args, _c2_buffer=None, _c2_follow_budget=None, **kwargs):
@@ -323,15 +344,22 @@ def _build_stream_wrapper(func, input_binding, output_binding):
             return _ResourceStream(
                 getattr(self.resource, method_name), output=output_binding,
                 input_binding=input_binding, request=args[0] if args else None,
-                input_arity=len(signature.parameters) - 1,
+                input_arity=stream_input_arity,
                 release_input=kwargs.pop('_release_fn', None),
                 borrowed=kwargs.pop('_c2_input_buffer_mode', None) == 'borrowed',
             )
-        bound = signature.bind(self, *args, **kwargs)
-        bound.apply_defaults()
-        if bound.kwargs:
-            raise TypeError('stream methods cannot transport keyword-only arguments')
-        values = bound.args[1:]
+        if (
+            exact_arg_count is not None
+            and not kwargs
+            and len(args) + 1 == exact_arg_count
+        ):
+            values = args
+        else:
+            bound = signature.bind(self, *args, **kwargs)
+            bound.apply_defaults()
+            if bound.kwargs:
+                raise TypeError('stream methods cannot transport keyword-only arguments')
+            values = bound.args[1:]
         client = self.client
         if _c2_follow_budget is not None:
             client = client.resolve_for_call(_c2_follow_budget)
@@ -364,14 +392,14 @@ def _build_stream_wrapper(func, input_binding, output_binding):
         unclaimed = None
         try:
             try:
-                if input_binding.kind is PayloadPlanKind.FASTDB:
+                if fastdb_input:
                     try:
                         nbytes = values[0].execution_report().used_bytes
                     except BaseException as exc:
                         raise _client_input_error(exc) from exc
                     prepared.charge_input(nbytes)
                 try:
-                    data = input_binding.serialize(*values) if input_binding.serialize is not None else b''
+                    data = input_serializer(*values) if input_serializer is not None else b''
                 except BaseException as exc:
                     raise _client_input_error(exc) from exc
                 dispatched = True
@@ -389,9 +417,9 @@ def _build_stream_wrapper(func, input_binding, output_binding):
                     raise
             try:
                 stream_obj = Stream._from_encoded(
-                    unclaimed, output_binding.deserialize, held=_c2_buffer == 'hold',
+                    unclaimed, output_decoder, held=_c2_buffer == 'hold',
                     tracker=client.local_copy_tracker, route_name=client.route_name,
-                    method_name=method_name, invalidator=output_binding.invalidate,
+                    method_name=method_name, invalidator=output_invalidate,
                 )
             except BaseException as wrap_exc:
                 primary = wrap_exc

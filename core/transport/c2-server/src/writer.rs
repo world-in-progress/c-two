@@ -1,7 +1,9 @@
 //! The one writer for a physical server IPC stream.
 
 use std::io;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::Poll;
 
 use c2_local::LocalWriteHalf;
 use c2_wire::connection::{ConnectionError, WriteBatch, WriteRequest};
@@ -212,6 +214,16 @@ impl ConnectionWriter {
         self.submit(bytes.to_vec(), None, None, true, None)
             .await
             .map(|_| ())
+    }
+
+    /// Submit one inline reply as its fixed head plus payload parts. The
+    /// writer builds the frame once; callers never allocate an intermediate
+    /// whole-frame buffer for the data.
+    pub(crate) async fn write_call_end_parts(&self, head: &[u8], body: &[u8]) -> io::Result<()> {
+        let mut bytes = Vec::with_capacity(head.len() + body.len());
+        bytes.extend_from_slice(head);
+        bytes.extend_from_slice(body);
+        self.submit(bytes, None, None, true, None).await.map(|_| ())
     }
 
     pub(crate) async fn write_item(
@@ -547,7 +559,7 @@ async fn process_submission<W: AsyncWrite + Unpin>(
                 stream,
                 conn,
                 batch,
-                Some((&submission.bytes, &mut submission.reply)),
+                Some((&mut submission.bytes, &mut submission.reply)),
                 write_timeout,
             )
             .await
@@ -590,7 +602,7 @@ enum SharedItemWrite {
 fn assemble_write(
     _conn: &Connection,
     batch: WriteBatch,
-    frame: Option<&[u8]>,
+    mut frame: Option<&mut Vec<u8>>,
 ) -> io::Result<PendingWrite> {
     #[cfg(test)]
     if _conn
@@ -603,17 +615,26 @@ fn assemble_write(
         ));
     }
     let prefix = batch.release_bytes();
-    let frame_bytes = frame.unwrap_or(&[]);
-    let total_len = prefix
-        .len()
-        .checked_add(frame_bytes.len())
-        .ok_or_else(|| io::Error::new(io::ErrorKind::OutOfMemory, "write batch size overflow"))?;
-    let mut bytes = Vec::new();
-    bytes
-        .try_reserve_exact(total_len)
-        .map_err(|error| io::Error::new(io::ErrorKind::OutOfMemory, error))?;
-    bytes.extend_from_slice(prefix);
-    bytes.extend_from_slice(frame_bytes);
+    // An owned submission with no release prefix becomes the transport write
+    // buffer directly: one allocation per inline reply frame, no second copy.
+    let (bytes, has_frame) = if prefix.is_empty() {
+        let owned = frame.take();
+        let has_frame = owned.is_some();
+        (owned.map_or_else(Vec::new, std::mem::take), has_frame)
+    } else {
+        let has_frame = frame.is_some();
+        let frame_bytes = frame.map_or(&[][..], |frame| frame.as_slice());
+        let total_len = prefix.len().checked_add(frame_bytes.len()).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::OutOfMemory, "write batch size overflow")
+        })?;
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(total_len)
+            .map_err(|error| io::Error::new(io::ErrorKind::OutOfMemory, error))?;
+        bytes.extend_from_slice(prefix);
+        bytes.extend_from_slice(frame_bytes);
+        (bytes, has_frame)
+    };
     let mut boundaries = Vec::new();
     boundaries
         .try_reserve_exact(batch.frame_count())
@@ -629,7 +650,7 @@ fn assemble_write(
         boundaries.push(end);
         offset = end;
     }
-    if frame.is_some() {
+    if has_frame {
         boundaries.push(bytes.len());
     }
     Ok(PendingWrite {
@@ -662,7 +683,7 @@ fn prepare_response_write(
         is_dedicated: allocation.is_dedicated,
         loan_id: loan.id(),
     };
-    let frame = match kind {
+    let mut frame = match kind {
         PreparedRecordKind::UnaryEnd => encode_call_end_frame(
             request_id,
             CallMode::Unary,
@@ -684,7 +705,7 @@ fn prepare_response_write(
         })
         .map_err(core_error)?
         .expect("response frame");
-    let mut write = assemble_write(conn, batch, Some(&frame))?;
+    let mut write = assemble_write(conn, batch, Some(&mut frame))?;
     write.batch.begin_io().map_err(core_error)?;
     Ok(PreparedResponseWrite::Published(write))
 }
@@ -716,7 +737,7 @@ fn prepare_shared_item_write(
         is_dedicated: allocation.is_dedicated,
         loan_id: prepared.id(),
     };
-    let frame = c2_wire::rpc::encode_item_data_frame(request_id, ValueStorage::Shm(descriptor))
+    let mut frame = c2_wire::rpc::encode_item_data_frame(request_id, ValueStorage::Shm(descriptor))
         .map_err(|error| io::Error::other(error.to_string()))?;
     let frame_permit = conn.core.prepare_call_record().map_err(core_error)?;
     let batch = conn
@@ -727,7 +748,7 @@ fn prepare_shared_item_write(
         })
         .map_err(core_error)?
         .expect("shared SHM item frame");
-    let mut write = assemble_write(conn, batch, Some(&frame))?;
+    let mut write = assemble_write(conn, batch, Some(&mut frame))?;
     write.batch.begin_io().map_err(core_error)?;
     Ok(SharedItemWrite::Published(write))
 }
@@ -780,18 +801,7 @@ async fn write_item_batch<W: AsyncWrite + Unpin>(
         write_segment(stream, conn, &header, receipt, deadline, &mut timed_out).await?;
         write_segment(stream, conn, &item.bytes, receipt, deadline, &mut timed_out).await?;
         batch.frame_completed();
-        let mut flush = Box::pin(AsyncWriteExt::flush(stream));
-        if timed_out {
-            flush.await
-        } else {
-            tokio::select! {
-                result = &mut flush => result,
-                _ = tokio::time::sleep_until(deadline) => {
-                    report_timeout(conn, receipt, "flush_timeout");
-                    flush.await
-                }
-            }
-        }
+        flush_deadlined(stream, conn, receipt, deadline, timed_out).await
     }
     .await;
     match result {
@@ -807,6 +817,80 @@ async fn write_item_batch<W: AsyncWrite + Unpin>(
     }
 }
 
+/// One deadline-bounded write attempt. The first poll is nonblocking: a ready
+/// kernel socket completes without registering any timer, and only a real
+/// `Pending` (kernel send backpressure) races the remaining write against the
+/// absolute deadline. A deadline pass reports the timeout once and keeps
+/// draining the already-started frame; it never cancels it.
+async fn write_deadlined<W: AsyncWrite + Unpin>(
+    stream: &mut W,
+    conn: &Connection,
+    receipt: &mut WriteReceipt,
+    bytes: &[u8],
+    deadline: tokio::time::Instant,
+    timed_out: &mut bool,
+) -> io::Result<usize> {
+    let immediate = std::future::poll_fn(|cx| {
+        Poll::Ready(match Pin::new(&mut *stream).poll_write(cx, bytes) {
+            Poll::Ready(result) => Some(result),
+            Poll::Pending => None,
+        })
+    })
+    .await;
+    match immediate {
+        Some(result) => result,
+        None => {
+            let mut write = Box::pin(AsyncWriteExt::write(stream, bytes));
+            if *timed_out {
+                write.await
+            } else {
+                tokio::select! {
+                    result = &mut write => result,
+                    _ = tokio::time::sleep_until(deadline) => {
+                        report_timeout(conn, receipt, "write_timeout");
+                        *timed_out = true;
+                        write.await
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The flush half of the same lazy-deadline contract as [`write_deadlined`].
+async fn flush_deadlined<W: AsyncWrite + Unpin>(
+    stream: &mut W,
+    conn: &Connection,
+    receipt: &mut WriteReceipt,
+    deadline: tokio::time::Instant,
+    timed_out: bool,
+) -> io::Result<()> {
+    let immediate = std::future::poll_fn(|cx| {
+        Poll::Ready(match Pin::new(&mut *stream).poll_flush(cx) {
+            Poll::Ready(result) => Some(result),
+            Poll::Pending => None,
+        })
+    })
+    .await;
+    match immediate {
+        Some(result) => result,
+        None => {
+            let mut flush = Box::pin(AsyncWriteExt::flush(stream));
+            if timed_out {
+                flush.await
+            } else {
+                tokio::select! {
+                    result = &mut flush => result,
+                    _ = tokio::time::sleep_until(deadline) => {
+                        report_timeout(conn, receipt, "flush_timeout");
+                        flush.await
+                    }
+                }
+            }
+        }
+    }
+}
+
 async fn write_segment<W: AsyncWrite + Unpin>(
     stream: &mut W,
     conn: &Connection,
@@ -817,20 +901,15 @@ async fn write_segment<W: AsyncWrite + Unpin>(
 ) -> io::Result<()> {
     let mut written = 0;
     while written < bytes.len() {
-        let mut write = Box::pin(AsyncWriteExt::write(stream, &bytes[written..]));
-        let result = if *timed_out {
-            write.await
-        } else {
-            tokio::select! {
-                result = &mut write => result,
-                _ = tokio::time::sleep_until(deadline) => {
-                    report_timeout(conn, receipt, "write_timeout");
-                    *timed_out = true;
-                    write.await
-                }
-            }
-        };
-        let count = result?;
+        let count = write_deadlined(
+            stream,
+            conn,
+            receipt,
+            &bytes[written..],
+            deadline,
+            timed_out,
+        )
+        .await?;
         if count == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::WriteZero,
@@ -846,10 +925,10 @@ async fn write_batch<W: AsyncWrite + Unpin>(
     stream: &mut W,
     conn: &Connection,
     batch: WriteBatch,
-    mut frame: Option<(&[u8], &mut WriteReceipt)>,
+    mut frame: Option<(&mut Vec<u8>, &mut WriteReceipt)>,
     write_timeout: Duration,
 ) -> io::Result<()> {
-    let mut write = assemble_write(conn, batch, frame.as_ref().map(|(bytes, _)| *bytes))
+    let mut write = assemble_write(conn, batch, frame.as_mut().map(|(bytes, _)| &mut **bytes))
         .inspect_err(|_| {
             conn.end(
                 c2_local::ConnectionEndReason::LocalClose,
@@ -882,20 +961,16 @@ async fn drive_write<W: AsyncWrite + Unpin>(
     let mut written = 0;
     let mut completed = 0;
     while written < bytes.len() {
-        let mut write = Box::pin(AsyncWriteExt::write(stream, &bytes[written..]));
-        let result = if timed_out {
-            write.await
-        } else {
-            tokio::select! {
-                result = &mut write => result,
-                _ = tokio::time::sleep_until(deadline) => {
-                    report_timeout(conn, receipt, "write_timeout");
-                    timed_out = true;
-                    write.await
-                }
-            }
-        };
-        let count = match result {
+        let count = match write_deadlined(
+            stream,
+            conn,
+            receipt,
+            &bytes[written..],
+            deadline,
+            &mut timed_out,
+        )
+        .await
+        {
             Ok(0) => {
                 let error =
                     io::Error::new(io::ErrorKind::WriteZero, "connection write returned zero");
@@ -916,19 +991,7 @@ async fn drive_write<W: AsyncWrite + Unpin>(
             completed += 1;
         }
     }
-    let mut flush = Box::pin(AsyncWriteExt::flush(stream));
-    let result = if timed_out {
-        flush.await
-    } else {
-        tokio::select! {
-            result = &mut flush => result,
-            _ = tokio::time::sleep_until(deadline) => {
-                report_timeout(conn, receipt, "flush_timeout");
-                flush.await
-            }
-        }
-    };
-    match result {
+    match flush_deadlined(stream, conn, receipt, deadline, timed_out).await {
         Ok(()) => {
             batch.flush_completed();
             Ok(())
@@ -1144,7 +1207,7 @@ mod tests {
             .unwrap()
             .unwrap();
         let release = batch.release_bytes().to_vec();
-        let business = encode_frame(7, 0, b"reply");
+        let mut business = encode_frame(7, 0, b"reply");
         let mut expected = release;
         expected.extend_from_slice(&business);
         let mut received = vec![0; expected.len()];
@@ -1154,7 +1217,7 @@ mod tests {
                 &mut write_half,
                 &conn,
                 batch,
-                Some((&business, &mut no_reply)),
+                Some((&mut business, &mut no_reply)),
                 Duration::from_secs(30),
             ),
             client.read_exact(&mut received),
@@ -1277,7 +1340,7 @@ mod tests {
             .begin_write(WriteRequest::Business(vec![]))
             .unwrap()
             .unwrap();
-        let business = encode_frame(7, 0, b"reply");
+        let mut business = encode_frame(7, 0, b"reply");
         let expected = [batch.release_bytes(), &business].concat();
         let (mut writer, mut peer) = tokio::io::duplex(4);
         let (reply, receipt) = oneshot::channel();
@@ -1292,7 +1355,7 @@ mod tests {
                     &mut writer,
                     &conn,
                     batch,
-                    Some((&business, &mut reply)),
+                    Some((&mut business, &mut reply)),
                     Duration::from_millis(45),
                 )
                 .await

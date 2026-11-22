@@ -259,25 +259,55 @@ def _build_transfer_wrapper(
     method_name = func.__name__
     method_signature = inspect.signature(func)
 
+    # Binding hooks and payload identities are frozen once here; the call
+    # path only reads them.
+    input_serializer = (
+        input.serialize
+        if input is not None and input.kind is not PayloadPlanKind.NO_PAYLOAD
+        else None
+    )
+    output_decoder = (
+        output.deserialize
+        if output is not None and output.kind is not PayloadPlanKind.NO_PAYLOAD
+        else None
+    )
+    output_invalidate = None if output is None else output.invalidate
+    has_scoped_output = output is not None and output.supports_scoped_owner
+    fastdb_payload_type = (
+        _payload_type(required=True)
+        if input is not None and input.kind is PayloadPlanKind.FASTDB
+        else None
+    )
+    crm_input_decoder = (
+        input.deserialize
+        if input is not None and input.kind is not PayloadPlanKind.NO_PAYLOAD
+        else None
+    )
+    crm_output_serializer = (
+        output.serialize
+        if output is not None and output.kind is not PayloadPlanKind.NO_PAYLOAD
+        else None
+    )
+    crm_input_invalidate = None if input is None else input.invalidate
+    crm_scoped_input = input is not None and input.supports_scoped_owner
+    # A signature whose parameters are all plain positional ones admits an
+    # exact-count fast path: binding and default application are no-ops when
+    # the caller passed exactly that many positional values.
+    exact_arg_count = (
+        len(method_signature.parameters)
+        if all(
+            parameter.kind
+            in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+            for parameter in method_signature.parameters.values()
+        )
+        else None
+    )
+
     def com_to_crm(*args, _c2_buffer=None, _c2_follow_budget=None):
         prepared = None
         primary = None
         dispatched = False
-        input_serializer = (
-            input.serialize
-            if input is not None and input.kind is not PayloadPlanKind.NO_PAYLOAD
-            else None
-        )
-        output_decoder = (
-            output.deserialize
-            if output is not None and output.kind is not PayloadPlanKind.NO_PAYLOAD
-            else None
-        )
-        retained_owner = (
-            _c2_buffer == "hold"
-            and output is not None
-            and output.supports_scoped_owner
-        )
+        retained_owner = _c2_buffer == "hold" and has_scoped_output
 
         if len(args) < 1:
             raise ValueError(
@@ -321,15 +351,14 @@ def _build_transfer_wrapper(
         try:
             if (
                 prepared is not None
-                and input is not None
-                and input.kind is PayloadPlanKind.FASTDB
+                and fastdb_payload_type is not None
                 and request is not None
                 and len(request) == 1
             ):
                 try:
                     nbytes = (
                         request[0].execution_report().used_bytes
-                        if isinstance(request[0], _payload_type(required=True))
+                        if isinstance(request[0], fastdb_payload_type)
                         else None
                     )
                 except BaseException as exc:
@@ -372,17 +401,17 @@ def _build_transfer_wrapper(
                                 tracker, getattr(client, "route_name", ""),
                                 method_name, "client_response",
                             )
-                    held = HeldResult(result, buffer=view, invalidate_cb=output.invalidate)
+                    held = HeldResult(result, buffer=view, invalidate_cb=output_invalidate)
                     if native_response:
                         held._native_response = response
                     elif releasable_response:
                         held._source_buffer = response
                     return held
             except BaseException as exc:
-                if decoded and output is not None and output.invalidate is not None:
+                if decoded and output_invalidate is not None:
                     _cleanup_preserving_primary(
                         exc, lambda: _invalidate_and_release_held_response(
-                            view, response, output.invalidate, result,
+                            view, response, output_invalidate, result,
                         ),
                     )
                 elif output_decoder is not None:
@@ -395,8 +424,8 @@ def _build_transfer_wrapper(
                 try:
                     _release_view_and_response(view, response)
                 except BaseException as exc:
-                    if output is not None and output.invalidate is not None:
-                        _cleanup_preserving_primary(exc, lambda: output.invalidate(result))
+                    if output_invalidate is not None:
+                        _cleanup_preserving_primary(exc, lambda: output_invalidate(result))
                     raise _client_output_error(exc) from exc
             return HeldResult(result) if _c2_buffer == "hold" else result
         except BaseException as exc:
@@ -415,22 +444,13 @@ def _build_transfer_wrapper(
         _c2_input_buffer_mode=None,
     ):
         input_buffer_mode = _c2_input_buffer_mode or "view"
-        input_decoder = (
-            input.deserialize
-            if input is not None and input.kind is not PayloadPlanKind.NO_PAYLOAD
-            else None
-        )
-        output_serializer = (
-            output.serialize
-            if output is not None and output.kind is not PayloadPlanKind.NO_PAYLOAD
-            else None
-        )
-        if input_buffer_mode == "borrowed":
-            if input is None or not input.supports_scoped_owner:
-                def input_decoder(_request):
-                    raise ValueError(
-                        "borrowed input requires an explicit FastDB Payload binding",
-                    )
+        input_decoder = crm_input_decoder
+        output_serializer = crm_output_serializer
+        if input_buffer_mode == "borrowed" and not crm_scoped_input:
+            def input_decoder(_request):
+                raise ValueError(
+                    "borrowed input requires an explicit FastDB Payload binding",
+                )
 
         stage = "deserialize_input"
         deserialized_args: tuple[object, ...] = ()
@@ -438,11 +458,7 @@ def _build_transfer_wrapper(
         def release_input_buffer() -> None:
             nonlocal _release_fn, deserialized_args
             first_error: BaseException | None = None
-            if (
-                input_buffer_mode == "borrowed"
-                and input is not None
-                and input.invalidate is not None
-            ):
+            if input_buffer_mode == "borrowed" and crm_input_invalidate is not None:
                 values, deserialized_args = deserialized_args, ()
                 for value in values:
                     try:
@@ -569,6 +585,14 @@ def _build_transfer_wrapper(
 
         if crm.direction == "->":
             c2_buffer = kwargs.pop("_c2_buffer", None)
+            if (
+                exact_arg_count is not None
+                and not kwargs
+                and len(args) == exact_arg_count
+            ):
+                # Exact positional call over an all-positional signature:
+                # binding and default application would be no-ops.
+                return com_to_crm(*args, _c2_buffer=c2_buffer)
             bound = method_signature.bind(*args, **kwargs)
             bound.apply_defaults()
             if bound.kwargs:

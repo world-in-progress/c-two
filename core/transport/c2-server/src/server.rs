@@ -17,7 +17,7 @@ use c2_local::{
     LocalStream,
 };
 use parking_lot::RwLock;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncRead, AsyncReadExt, BufReader};
 use tokio::sync::{Mutex, Notify, OwnedSemaphorePermit, Semaphore, mpsc, watch};
 use tracing::{debug, info, warn};
 
@@ -77,6 +77,10 @@ const FRAME_FIXED_BODY_LEN: u32 = 12;
 const SHUTDOWN_INITIATE_FRAME_BODY_LEN: u32 =
     FRAME_FIXED_BODY_LEN + c2_wire::msg_type::SHUTDOWN_CLIENT_BYTES.len() as u32;
 const POST_SHUTDOWN_DUPLICATE_INITIATE_READ_TIMEOUT_MS: u64 = 100;
+/// One kernel read of the accepted connection covers the length, fixed-header
+/// and body reads of consecutive small frames. A transport read buffer, not a
+/// payload budget: frame admission still bounds every decoded frame.
+const RECEIVE_BUFFER_BYTES: usize = 64 * 1024;
 /// Default journal reason for an explicit direct IPC shutdown transaction.
 pub const DIRECT_IPC_SHUTDOWN_REASON: &str = "direct_ipc_shutdown";
 /// Bound an inline CALL_END error payload so the complete frame stays within
@@ -2015,7 +2019,10 @@ async fn wait_for_shutdown(receiver: &mut watch::Receiver<bool>) {
     let _ = receiver.wait_for(|requested| *requested).await;
 }
 
-async fn wait_for_control_peer_close(reader: &mut LocalReadHalf, deadline: tokio::time::Instant) {
+async fn wait_for_control_peer_close<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    deadline: tokio::time::Instant,
+) {
     // The control client consumes the complete acknowledgement and closes its
     // one-exchange connection. Retain the pipe until that EOF where possible.
     // A timeout or unexpected byte only ends the wait; neither proves that the
@@ -2120,8 +2127,9 @@ impl Drop for RegisteredConnection {
 
 /// Preserve progress through a partially read frame when admission closes.
 /// Only a close decision from ConnectionCore can cancel the physical read.
-async fn read_connection_exact(
-    reader: &mut LocalReadHalf,
+/// Reads through the receive-loop buffer complete without another syscall.
+async fn read_connection_exact<R: AsyncRead + Unpin>(
+    reader: &mut R,
     bytes: &mut [u8],
     conn: &Connection,
     shutdown: &mut watch::Receiver<bool>,
@@ -2216,7 +2224,11 @@ fn handle_connection(
 
         conn.install_remote_read_guard(stream.retain_for_remote_read());
         let abort = stream.abort_handle();
-        let (mut reader, write_half) = stream.into_split();
+        let (reader, write_half) = stream.into_split();
+        // One buffered read coalesces the length, fixed-header and body reads
+        // of consecutive small frames into a single kernel read. The buffer
+        // owns no protocol state; every frame boundary stays in this loop.
+        let mut reader = tokio::io::BufReader::with_capacity(RECEIVE_BUFFER_BYTES, reader);
         let (writer, writer_task) = ConnectionWriter::spawn(
             write_half,
             Arc::clone(&conn),
@@ -2248,10 +2260,12 @@ fn handle_connection(
 }
 
 /// The accepted connection's sole receive loop, including its handshake.
+/// `reader` owns this connection's read half from handshake to drain, so its
+/// buffer may read ahead across frame boundaries.
 async fn receive_connection(
     server: &Arc<Server>,
     conn: &Arc<Connection>,
-    reader: &mut LocalReadHalf,
+    reader: &mut BufReader<LocalReadHalf>,
     writer: &Arc<ConnectionWriter>,
     abort: &c2_local::AbortHandle,
     shutdown_rx: &mut watch::Receiver<bool>,
@@ -2455,16 +2469,16 @@ async fn receive_connection(
 
     conn.cancel_queued_work();
     server.cleanup_chunk_requests_for_connection(conn_id);
-    if reader.peer_ended() {
+    if reader.get_ref().peer_ended() {
         conn.peer_end();
     }
     // Invalid framing has no recoverable next boundary. Read only into a
     // fixed discard buffer until peer end; a write error is no end proof.
     let mut discard = [0u8; 8192];
-    if read_failed && !reader.peer_ended() {
+    if read_failed && !reader.get_ref().peer_ended() {
         conn.stop_reading();
     }
-    if reader.peer_ended() {
+    if reader.get_ref().peer_ended() {
         loop {
             let changed = conn.writer_wake.notified();
             if conn.try_close() {
@@ -2475,7 +2489,7 @@ async fn receive_connection(
     }
     while !conn.reading_stopped() && !conn.try_close() {
         let changed = conn.writer_wake.notified();
-        if reader.peer_ended() {
+        if reader.get_ref().peer_ended() {
             changed.await;
             continue;
         }
@@ -2485,7 +2499,7 @@ async fn receive_connection(
                 Ok(_) => {},
                 Err(error) => {
                     record_read_error(conn, abort, "discard_read", &error);
-                    if reader.peer_ended() { conn.peer_end(); }
+                    if reader.get_ref().peer_ended() { conn.peer_end(); }
                     else {
                         // An unrecoverable read without end proof cannot
                         // grant permission to reuse published storage.
@@ -2511,7 +2525,7 @@ async fn receive_connection(
 async fn read_handshake_exact(
     server: &Server,
     conn: &Connection,
-    reader: &mut LocalReadHalf,
+    reader: &mut BufReader<LocalReadHalf>,
     bytes: &mut [u8],
 ) -> Result<(), ServerError> {
     let mut shutdown = server.shutdown_tx.subscribe();
@@ -2529,7 +2543,7 @@ async fn negotiate_handshake(
     server: &Server,
     conn: &Connection,
     header: &[u8; 16],
-    reader: &mut LocalReadHalf,
+    reader: &mut BufReader<LocalReadHalf>,
     writer: &Arc<ConnectionWriter>,
 ) -> Result<(), ServerError> {
     validate_version_preamble_header(header, false)
@@ -4750,6 +4764,7 @@ fn finish_copy_queue(call: &Arc<c2_wire::connection::calls::CallRecord<ServerCal
 
 const REPLY_FLAGS: u32 = FLAG_RESPONSE | c2_wire::flags::FLAG_RPC_RECORD;
 const SUCCESS_REPLY: [u8; 2] = [RpcRecordKind::CallEnd as u8, CallStatus::Success as u8];
+const SUCCESS_REPLY_LEN: usize = SUCCESS_REPLY.len();
 
 async fn queue_input_error(writer: &Arc<ConnectionWriter>, request_id: u64, error: String) -> bool {
     queue_rejection(
@@ -4886,43 +4901,25 @@ async fn queue_rejection(writer: &Arc<ConnectionWriter>, request_id: u64, error:
     }
 }
 
-/// Write a unary CALL_END with Success and its inline result.
-/// Uses stack buffer for small responses (≤1024B total frame) to avoid heap allocation.
+/// Write a unary CALL_END with Success and its inline result. The fixed head
+/// (frame header plus control bytes) is built on the stack for every size;
+/// the writer owns the single frame allocation the payload is copied into.
 async fn write_reply_with_data(
     writer: &Arc<ConnectionWriter>,
     request_id: u64,
     data: &[u8],
 ) -> Result<(), ResponseSendError> {
     let ctrl_bytes = SUCCESS_REPLY;
-    let payload_len = ctrl_bytes.len().checked_add(data.len()).ok_or_else(|| {
-        ResponseSendError::UserVisible("inline reply frame length overflow".to_string())
-    })?;
     let total_len = inline_reply_total_len(data.len()).map_err(ResponseSendError::UserVisible)?;
-    let frame_size = frame::HEADER_SIZE + payload_len;
-
-    if frame_size <= 1024 {
-        // Stack buffer: single write_all, zero heap allocation
-        let mut buf = [0u8; 1024];
-        buf[0..4].copy_from_slice(&total_len.to_le_bytes());
-        buf[4..12].copy_from_slice(&request_id.to_le_bytes());
-        buf[12..16].copy_from_slice(&REPLY_FLAGS.to_le_bytes());
-        let mut off = frame::HEADER_SIZE;
-        buf[off..off + ctrl_bytes.len()].copy_from_slice(&ctrl_bytes);
-        off += ctrl_bytes.len();
-        buf[off..off + data.len()].copy_from_slice(data);
-        off += data.len();
-        writer
-            .write_call_end(&buf[..off])
-            .await
-            .map_err(|error| response_write_error("inline reply write failed", error))?;
-    } else {
-        // Large response: heap Vec (existing path)
-        let frame = frame::encode_frame_parts(request_id, REPLY_FLAGS, &[&ctrl_bytes, data]);
-        writer
-            .write_call_end(&frame)
-            .await
-            .map_err(|error| response_write_error("inline reply write failed", error))?;
-    }
+    let mut head = [0u8; frame::HEADER_SIZE + SUCCESS_REPLY_LEN];
+    head[0..4].copy_from_slice(&total_len.to_le_bytes());
+    head[4..12].copy_from_slice(&request_id.to_le_bytes());
+    head[12..16].copy_from_slice(&REPLY_FLAGS.to_le_bytes());
+    head[frame::HEADER_SIZE..].copy_from_slice(&ctrl_bytes);
+    writer
+        .write_call_end_parts(&head, data)
+        .await
+        .map_err(|error| response_write_error("inline reply write failed", error))?;
     Ok(())
 }
 
