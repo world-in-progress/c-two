@@ -6,10 +6,10 @@
 
 同一块代码里的事合成一批做，免得先做的被后面的批次推翻。
 
-1. **0.12.0 正式发版收口（Pub-Sub [ADR 0005](../decisions/0005-publish-subscribe.md) 与三原语统一 FastDB 0.3.0 低拷贝 Slab 通道均已合入源码）：**
-   - 0.12.0 资源归属发布/订阅（IPC 17、SHM 4 单写多借出、两级 `c3 relay` 扇出、Node ABI 9 与双向跨语言测试）已落地并完成 32 MiB `R = 1/4` 扇出验收（[2026-11-21 验收记录](../acceptance/2026-11-21-pubsub-fanout-benchmark.md)）。
-   - 三原语统一的 FastDB `0.3.0`（ABI-118）零拷贝 `ExternalBytes`/`BuildPlan` + `WritableSlab` 直写通道、buddy 几何与温本地缓冲池及 KB 级延迟优化已全部落地并完成 `1 KiB–1 GiB` 与 `4 GiB` 受限内存流式迁移基准验收（单向 SHM 拷贝下界降至 2 次，详见 [2026-11-22 验收记录](../acceptance/2026-11-22-kb-to-gb-slab-benchmark.md)）。
-   - 还剩：发版时的版本号升级与 `docs/releases/0.12.0.md` 定稿。
+1. **0.12.0 正式发版收口（发布候选 PR 已准备，待 RC 构建与双通道晋升）：**
+   - 0.12.0 资源归属发布/订阅（IPC 17、SHM 4 单写多借出、两级 `c3 relay` 扇出、Node ABI 9 与双向跨语言测试）已落地并通过四平台 CI（PR #236）及 32 MiB `R = 1/4` 扇出验收（[2026-11-21 验收记录](../acceptance/2026-11-21-pubsub-fanout-benchmark.md)）。
+   - 三原语统一的 FastDB `0.3.0`（ABI-118）零拷贝 `ExternalBytes`/`BuildPlan` + `WritableSlab` 直写通道、buddy 几何与温本地缓冲池及 KB 级延迟优化已落地并通过四平台 CI（PR #237）及 `1 KiB–1 GiB` 与 `4 GiB` 受限内存流式迁移基准验收（单向 SHM 拷贝下界降至 2 次，详见 [2026-11-22 验收记录](../acceptance/2026-11-22-kb-to-gb-slab-benchmark.md)）。
+   - 0.12.0 / c3 0.8.0 版本号与 [0.12.0 发布说明](../releases/0.12.0.md)已准备就绪，待规范 `main` 候选构建（`release-candidate.yml`）与 PyPI / GitHub Release 晋升验收完成后移出待办。
 2. **派发后的结果查询与去重**（维护者 2026-11-02 认为值得做）：事发那一刻进程内兜不住，结果未知时如实报派发不确定；这一项让调用方事后能查清一个派发不确定的调用是否执行过，或带同一个调用标识安全重试而不重复执行。业界有数据库的事务结果查询（例如 Oracle 的逻辑事务 ID）与 HTTP 幂等键，待一手来源调研。协议批之后先写设计与 ADR：调用标识跨重连与进程的稳定性、服务端结果的保留期限与存储、与有状态调用顺序的关系、与流式 RPC 的交叉。
 3. **按区域的结构调整与重复校验。** 不碰协议，各区先出方案：
    - **Core 与 Python：** E1、E2、E4、E13；C5、C6；G5、G9；R06 回调重入导致自锁的风险（`sdk/python/native/src/runtime_session_ffi.rs` 中 `server_bridge` 持锁释放 Python 对象与 host 持锁投影异常的两类隐患已在 PR #234 收口）。`c2-mem` 的 `MemPool::free_at` 是 pub unsafe，生产代码里没有调用方，只有 c2-ipc 的一个 ownership 测试夹具在用（2026-11-09 审查发现），删掉或者只在测试里可见。

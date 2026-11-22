@@ -4,9 +4,9 @@ This reference owns the Windows native transport, memory, endpoint identity, and
 
 Windows development machines can use the [shared local test sidecar](local-development-testing.md), which reuses the macOS/Unix Python executor with native Windows process and file-lock adapters. Its development reports are separate from the historical hosted and formal release evidence below.
 
-## Current source (unreleased after 0.11.0)
+## C-Two 0.12.0 release candidate
 
-The source tree after C-Two 0.11.0 moves the RPC IPC handshake to 17 and the Node C/FFI ABI to 9, adding resource-owned publish/subscribe topics ([ADR 0005](../decisions/0005-publish-subscribe.md)); SHM 4, relay mesh 7, the TokenUser-scoped endpoint naming and the native security model are unchanged. Named Pipe behavior stays on the same transport: subscriptions use the sealed multi-loan SHM discipline with per-connection loans, cross-session subscribers that cannot share Local mappings receive the sealed value inline or in chunks, and the fixed version preamble reports an IPC 16 peer with the typed version-mismatch error. The changes and their Windows gates are collected in the [unreleased notes](../releases/unreleased.md); the sections below retain their historical release claims unchanged.
+C-Two 0.12.0 / c3 0.8.0 moves the RPC IPC handshake to 17, the Node C/FFI ABI to 9 and FastDB to 0.3.0 (ABI-118), adding resource-owned publish/subscribe topics ([ADR 0005](../decisions/0005-publish-subscribe.md)) and unified `WritableSlab` direct-SHM encoding; SHM 4, relay mesh 7, TokenUser-scoped endpoint naming and the native security model are unchanged. Named Pipe behavior stays on the same transport: subscriptions use the sealed multi-loan SHM discipline with per-connection loans, cross-session subscribers that cannot share Local mappings receive the sealed value inline or in chunks, and the fixed version preamble reports an IPC 16 peer with the typed version-mismatch error. Constituent Windows Server 2025 x64 and Windows 11 ARM64 gates passed in PR #236 (`44900009786`) and PR #237 (`45007713034`); see the [0.12.0 release notes](../releases/0.12.0.md). The sections below retain their historical release claims unchanged.
 
 ## C-Two 0.11.0 release (2026-11-20)
 

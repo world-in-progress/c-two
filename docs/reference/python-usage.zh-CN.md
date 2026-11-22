@@ -1,10 +1,10 @@
 # Python SDK 用法
 
-本指南说明 C-Two 0.11.0 / c3 0.7.0 的 Python SDK 用法，包括 CRM 编写、调用、服务端流、可移植的 FastDB 0.3.0 载荷、发布/订阅主题和 Runtime 所有权。
+本指南说明 C-Two 0.12.0 / c3 0.8.0 的 Python SDK 用法，包括 CRM 编写、调用、服务端流、可移植的 FastDB 0.3.0 载荷、发布/订阅主题和 Runtime 所有权。
 
 [English](python-usage.md) · 简体中文
 
-[0.11.0 发布说明](../releases/0.11.0.md)介绍从 0.10.x 迁移的事项，包括 IPC 16、SHM 4、服务端流、路由名身份、按角色划分的容量配置和收敛后的错误体系。[未发布变更](../releases/unreleased.md)新增资源归属的发布/订阅主题，并将线协议升级到 IPC 17、Node C/FFI ABI 升级到 9；本指南描述当前源码。CRM 契约通过同进程调用、本地 IPC 和 HTTP relay 暴露有状态资源；可移植 Python 载荷使用可选的 FastDB 0.3.0 extra。安装步骤及可运行的入门示例见[快速开始](../../README.zh-CN.md#快速开始)。
+[0.12.0 发布说明](../releases/0.12.0.md)介绍从 0.11.0 迁移的事项，包括资源归属的发布/订阅主题、IPC 17、C/FFI ABI 9、FastDB 0.3.0（`BuildPlan` 直写共享内存与 `ExternalBytes` 零拷贝解码）以及 `register()` 返回 `Registration`。CRM 契约通过同进程调用、本地 IPC 和 HTTP relay 暴露有状态资源；可移植 Python 载荷使用可选的 FastDB 0.3.0 extra。安装步骤及可运行的入门示例见[快速开始](../../README.zh-CN.md#快速开始)。
 
 ## 可移植载荷（FastDB）
 
@@ -93,7 +93,7 @@ finally:
 
 连接跟随路由名。C-Two 已经知道它所服务的那次注册不在了时（服务进程结束，或者之前的调用因路由不存在、已撤下、已关闭或契约不同而在派发前被拒），下一次调用在自己的截止时间内按名字重新获取路由，发往当前的注册：直接 IPC 回到原地址，经 relay 的连接通过 relay 锚点重新解析，可能在本地 IPC 与 relay 之间切换，显式 relay 连接仍走 HTTP。只能从这次调用自己的拒绝得知变化时，这次调用在派发前失败、可以安全重试，下一次调用才跟过去。同进程连接在注册被注销后也一样：下一次调用发往这个名字新的本地注册，或者经 relay 发往远程的注册；注册还在时，调用直接进入资源。服务这个名字的进程负责状态的延续；要让调用方察觉状态变了，就换一个名字。身份与协议的拒绝不会引起重新获取。
 
-共享一个 IPC 域的 Unix 进程使用相同的已配置根目录（`cc.endpoint.set_local_endpoint(root=...)` 或 `C2_IPC_ROOT`）。应用负责创建自定义根目录；在确认所有权及免受其他用户修改的保护后，可以接受 `0755`。默认权限为 `0700`，套接字权限为 `0600`。Windows 在跨登录会话时使用 TokenUser 范围内的 Named Pipe，并拒绝 Unix 根目录覆盖值。原生连接要求同一用户且服务端完整性级别至少为 Medium；跨会话载荷自动避开无法访问的 Local 映射。当前源码在 0.10.0 引入的永久固定版本前导信息之后使用 RPC IPC 握手 17（0.11.0 为 IPC 16，见[未发布变更](../releases/unreleased.md)），因此通信双方应一起升级。两个版本都实现固定前导信息但版本不同时，会抛出 `CoreError`，其中 `category='protocol_version_mismatch'`，`local_protocol_version` / `peer_protocol_version` 非零（其他错误中均为 `None`）；与 0.9.x 混用时仍是一般连接或协议失败。参见[握手规格](ipc-handshake.md)，以及[端点配置](configuration.zh-CN.md#本地端点位置与平台差异)和[生命周期管理](local-endpoint-lifecycle.md)。
+共享一个 IPC 域的 Unix 进程使用相同的已配置根目录（`cc.endpoint.set_local_endpoint(root=...)` 或 `C2_IPC_ROOT`）。应用负责创建自定义根目录；在确认所有权及免受其他用户修改的保护后，可以接受 `0755`。默认权限为 `0700`，套接字权限为 `0600`。Windows 在跨登录会话时使用 TokenUser 范围内的 Named Pipe，并拒绝 Unix 根目录覆盖值。原生连接要求同一用户且服务端完整性级别至少为 Medium；跨会话载荷自动避开无法访问的 Local 映射。C-Two 0.12.0 在 0.10.0 引入的永久固定版本前导信息之后使用 RPC IPC 握手 17（0.11.0 为 IPC 16，见 [0.12.0 发布说明](../releases/0.12.0.md)），因此通信双方应一起升级。两个版本都实现固定前导信息但版本不同时，会抛出 `CoreError`，其中 `category='protocol_version_mismatch'`，`local_protocol_version` / `peer_protocol_version` 非零（其他错误中均为 `None`）；与 0.9.x 混用时仍是一般连接或协议失败。参见[握手规格](ipc-handshake.md)，以及[端点配置](configuration.zh-CN.md#本地端点位置与平台差异)和[生命周期管理](local-endpoint-lifecycle.md)。
 
 ## 底层服务端桥接
 

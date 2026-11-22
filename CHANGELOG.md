@@ -8,6 +8,31 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 See the [unreleased notes](docs/releases/unreleased.md).
 
+## [0.12.0] — companion c3 0.8.0
+
+Candidate; see the [0.12.0 release notes](docs/releases/0.12.0.md).
+
+### Changed
+
+- Breaking: coordinated protocol, ABI and dependency cut from `0.11.0` (`c3 0.7.0`). **IPC 17** (replaces 16), **C/FFI ABI 9** (replaces 8), and **FastDB `0.3.0`** (`ABI-118`, replaces `0.2.4` / `ABI-117`) introduce resource-owned publish/subscribe topics and zero-copy FastDB payload adapters while retaining SHM **4**, relay mesh **7**, Unix namespace format 3, Unix credential schema 4 and `C2E1` v1 error wire. Stop running services, upgrade Python/Rust SDKs, `c3` and Node consumers together (plus relays within one mesh), and regenerate Rust, Python and TypeScript contract clients.
+- Breaking: Python `cc.register(...)` and `Runtime.register(...)` return a `Registration` handle (`name`, `publisher(topic)`, `is_closed`, `active_subscribers`) instead of a bare route-name `str`.
+- Unified `WritableSlab` direct-SHM encoding across unary responses, server stream items, topic publications and client requests, paired with FastDB `0.3.0` `Payload.open_external` / `ExternalBytes` zero-copy decoding in Rust and Python SDKs (and automatic `OpenOptions.max_total_bytes` lift for `> 256 MiB` transport-admitted payloads), cutting the one-way SHM full-payload copy lower bound from **8 / 7 → 2 copies** (0 FastDB/Python glue copies) while keeping ADR 0001 copy-then-release semantics.
+- Tuned buddy pool geometry (`4 × 64 MiB` at a `1 GiB` role budget) and added a bounded warm `RecycledBytes` local buffer pool across unary IPC, server streams, topic deliveries and server request copies; trimmed KB-scale inline framing, timer creation, read syscalls and Python positional argument binding overhead.
+
+### Added
+
+- Resource-owned publish/subscribe topics ([ADR 0005](docs/decisions/0005-publish-subscribe.md)): optional `"topics"` array in `c-two.contract.v2` (omitted when absent so legacy contract hashes remain byte-identical), registration-scoped `Publisher` with bounded history ring (`topic_capacity`) and atomic `initial_topics`, immutable `Delivery(value, seq, dropped)` with `start='latest'|'next'` and `on_lag='skip'|'error'`, same-host single-write multi-loan SHM 4 fan-out, and canonical error **`720 SubscriptionLagged`**.
+- IPC 17 `Subscribe` call mode with `READY(start_seq)`, `SYNC` / `SYNC_ACK(head_seq)` and sequence-bearing `ITEM_BEGIN`; single-upstream `c3 relay` HTTP topic fan-out (`POST /{route_name}/_topics/{topic_name}`) and two-tier cross-relay fan-out (`Host → A → B → R`) with anti-loop `x-c2-relay-origin-only` and lightweight `/_confirm` late-joiner sync.
+- SDK and codegen topic surfaces across Python (`@cc.topic`, `Subscription`, `cc.hold`), Rust (`Publisher`, `Subscription`, `Delivery`, `Connect::RelayAwareAt`), Node / TypeScript (`C2_MEM_FFI_ABI_VERSION 9`, unified `ipc://` + `http(s)://` endpoint context, `openSubscription`), and `c2-codegen` for all three languages.
+- Python resource methods bound with `@cc.transfer(output=...)` accept `fastdb4py.payload.BuildPlan` returns and annotations (`BuildPlan`, `Payload | BuildPlan`, `Iterator[BuildPlan]`) for zero-staging direct SHM execution.
+- Reproducible headless `1 KiB–1 GiB` + `4 GiB` bounded-memory streamed migration, multi-subscriber fan-out and Kostya benchmark suite vs Ray 2.56 ([2026-11-22 benchmark report](docs/acceptance/2026-11-22-kb-to-gb-slab-benchmark.md)) plus [pubsub.py](examples/python/pubsub.py) and [resident_simulation.py](examples/python/resident_simulation.py).
+
+### Fixed
+
+- Tightened `RuntimeSession` lock ordering and generation checks so Python objects are dropped and errors projected outside native locks; added dynamic fork-route stress coverage ([PR #234](https://github.com/world-in-progress/c-two/pull/234)).
+- Idle local topic subscriptions settle immediately on close and cancel instead of waiting for the drain barrier.
+- Released binding-created caller input `Payload.memoryview()` pins before awaiting replies and closed borrowed-mode deferred `BuildPlan` handles before input invalidation on error paths.
+
 ## [0.11.0] — companion c3 0.7.0
 
 Published 2026-11-20. See the [0.11.0 release notes](docs/releases/0.11.0.md) and [release acceptance record](docs/acceptance/2026-11-20-0110-release-acceptance.md).

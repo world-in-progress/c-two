@@ -24,7 +24,7 @@ C-Two is an RPC framework for stateful resources, built for distributed scientif
 
 A **CRM contract** declares the callable methods and their namespace/version. A **resource** is a plain class that implements those methods and holds state. A **client** uses `cc.connect(...)` to obtain a typed proxy. A process can host several resources and connect to other resources at the same time. The name stands for *CRM to Call* (Core Resource Model to Call): a stateful resource is called from other processes and machines through its CRM.
 
-**C-Two 0.11.0** supports Python 3.10+. Ordinary calls have no Python runtime dependencies; FastDB payloads use `c-two[fastdb]` (`fastdb4py==0.2.4` on published 0.11.0; `fastdb4py==0.3.0` on current source). This release moves to IPC **16**, SHM **4**, C/FFI ABI **8** and relay mesh **7**, adding single-owner shared-memory release, server streams (same-process, direct IPC and relay HTTP), route-name identity, per-role `(M, F, N)` capacity domains, Rust-backed Node clients and a converged error hierarchy. See the [0.11.0 release and migration notes](docs/releases/0.11.0.md). The current source adds resource-owned publish/subscribe topics and moves to IPC **17** / C/FFI ABI **9** / FastDB **0.3.0** for the planned 0.12.0 line; see the [unreleased notes](docs/releases/unreleased.md).
+**C-Two 0.12.0** supports Python 3.10+. Ordinary calls have no Python runtime dependencies; FastDB payloads use `c-two[fastdb]` (`fastdb4py==0.3.0`). This release moves to IPC **17**, SHM **4**, C/FFI ABI **9** and relay mesh **7**, adding resource-owned publish/subscribe topics (same-host sealed SHM fan-out and single-hop / two-tier `c3 relay` HTTP fan-out) and unified `WritableSlab` + FastDB `0.3.0` zero-copy payload paths (2-copy one-way SHM floor). See the [0.12.0 release and migration notes](docs/releases/0.12.0.md).
 
 ## Why stateful RPC is different
 
@@ -59,12 +59,12 @@ uv pip install 'c-two[fastdb]'
 The same command works in Windows PowerShell. For c3 on Linux or macOS:
 
 ```bash
-curl -fsSL https://github.com/world-in-progress/c-two/releases/download/c3-v0.7.0/c3-installer.sh | sh -s -- --version 0.7.0
+curl -fsSL https://github.com/world-in-progress/c-two/releases/download/c3-v0.8.0/c3-installer.sh | sh -s -- --version 0.8.0
 ```
 
-On Windows x64 or ARM64, use the [x64 executable](https://github.com/world-in-progress/c-two/releases/download/c3-v0.7.0/c3-x86_64-pc-windows-msvc.exe), [ARM64 executable](https://github.com/world-in-progress/c-two/releases/download/c3-v0.7.0/c3-aarch64-pc-windows-msvc.exe) or [PowerShell installer](https://github.com/world-in-progress/c-two/releases/download/c3-v0.7.0/c3-installer.ps1). Installation and checksum verification are in the [Windows guide](docs/reference/windows-native-usage.md#install-python-and-c3).
+On Windows x64 or ARM64, use the [x64 executable](https://github.com/world-in-progress/c-two/releases/download/c3-v0.8.0/c3-x86_64-pc-windows-msvc.exe), [ARM64 executable](https://github.com/world-in-progress/c-two/releases/download/c3-v0.8.0/c3-aarch64-pc-windows-msvc.exe) or [PowerShell installer](https://github.com/world-in-progress/c-two/releases/download/c3-v0.8.0/c3-installer.ps1). Installation and checksum verification are in the [Windows guide](docs/reference/windows-native-usage.md#install-python-and-c3).
 
-C3 0.7.0 pairs with C-Two 0.11.x. IPC 16, SHM 4, C/FFI ABI 8 and relay mesh 7 cannot interoperate with 0.10.x peers (IPC 14, SHM 3, ABI 6, mesh 6), so upgrade the Python and Rust SDKs, c3 and Node consumers on one host — and all relays communicating within one mesh — together, and regenerate contract clients; stop old services before upgrading and restarting. Unix endpoint namespace format 3 and credential schema 4 keep their formats. See the [0.11.0 migration notes](docs/releases/0.11.0.md), the [handshake spec](docs/reference/ipc-handshake.md) and the [endpoint lifecycle guide](docs/reference/local-endpoint-lifecycle.md). The current source's IPC 17 and C/FFI ABI 9 likewise refuse 0.11.0 peers through the fixed version preamble; its changes are collected in the [unreleased notes](docs/releases/unreleased.md).
+C3 0.8.0 pairs with C-Two 0.12.x. IPC 17, SHM 4, C/FFI ABI 9 and relay mesh 7 cannot interoperate with 0.11.x peers (IPC 16, ABI 8) or earlier releases, so upgrade the Python and Rust SDKs, c3 and Node consumers on one host — and all relays communicating within one mesh — together, and regenerate contract clients; stop old services before upgrading and restarting. Unix endpoint namespace format 3 and credential schema 4 keep their formats. See the [0.12.0 migration notes](docs/releases/0.12.0.md), the [handshake spec](docs/reference/ipc-handshake.md) and the [endpoint lifecycle guide](docs/reference/local-endpoint-lifecycle.md).
 
 Source builds need Rust 1.95 or newer; for builds and tests, see the [development guide](docs/reference/development.md).
 

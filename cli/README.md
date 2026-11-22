@@ -1,6 +1,6 @@
 # C-Two CLI (C3)
 
-C3 **0.7.0** accompanies C-Two **0.11.x**, sharing its IPC 16, SHM 4, relay mesh 7, Unix namespace format 3 and endpoint maintenance behavior. See the [0.11.0 release notes](../docs/releases/0.11.0.md). The current source moves the wire to IPC 17 and the Node C/FFI ABI to 9 with the resource-owned publish/subscribe line; see the [unreleased notes](../docs/releases/unreleased.md).
+C3 **0.8.0** accompanies C-Two **0.12.x**, sharing its IPC 17, SHM 4, C/FFI ABI 9, relay mesh 7, Unix namespace format 3 and endpoint maintenance behavior. See the [0.12.0 release notes](../docs/releases/0.12.0.md).
 
 Python does not own CLI behavior; do not add command behavior under `sdk/python/src/c_two`. `cli/` contains the Rust crate for `c3`, the native C-Two command-line interface. It starts relay servers and inspects relay registry state for C-Two deployments.
 
@@ -141,7 +141,7 @@ The relay evicts unreferenced upstream IPC connections after 60 seconds without 
 
 When running normally, `c3 relay` installs a Ctrl+C handler and stops the relay cleanly on interrupt.
 
-A relay built from the current source also serves resource-owned topic subscriptions ([ADR 0005](../docs/decisions/0005-publish-subscribe.md)) with no new CLI flags: each local route's declared topics become available at `POST /{route_name}/_topics/{topic_name}` with the versioned topic media type, and the relay opens one shared upstream IPC 17 subscription per registration and topic, fanning out a single budgeted copy to all downstream HTTP subscribers. Ctrl+C ends forwarded subscriptions with `CallCancelled` naming relay shutdown after the frame each subscriber already selected. See [relay topic forwarding](../docs/reference/contracts-and-routing.md#relay-topic-forwarding).
+`c3 relay` also serves resource-owned topic subscriptions ([ADR 0005](../docs/decisions/0005-publish-subscribe.md)) with no new CLI flags: each local route's declared topics become available at `POST /{route_name}/_topics/{topic_name}` with the versioned topic media type, and the relay opens one shared upstream IPC 17 subscription per registration and topic, fanning out a single budgeted copy to all downstream HTTP subscribers (and across two-tier cross-relay hops). Ctrl+C ends forwarded subscriptions with `CallCancelled` naming relay shutdown after the frame each subscriber already selected. See [relay topic forwarding](../docs/reference/contracts-and-routing.md#relay-topic-forwarding).
 
 ## Local endpoint maintenance
 
@@ -157,7 +157,7 @@ c3 endpoint sweep --address ipc://this-run-server --max-entries 64 --max-ms 10 -
 
 Inspect and sweep accept `--ipc-root` (or `C2_IPC_ROOT`) to select a custom final Unix directory; `reap` always operates on the endpoint context recorded inside the credential file, and passing `--ipc-root` to `reap` only checks that it matches that recorded context before touching anything. The application provisions custom directories with current-user ownership, read/write/traverse access and no write access for other identities; `0755` is accepted, while default directories are created `0700`. The CLI captures the endpoint context with the inspection, so a credential from one root never touches an object under another. Custom-root routes discovered through a relay answer over HTTP when the relay's local namespace does not match; the namespace hint is a routing-domain signal, not an authentication credential. On Windows these commands keep their TokenUser-scoped Named Pipe behavior and `--ipc-root` is rejected as not applicable.
 
-Unix endpoints use namespace disk format 3 and credential schema 4 without `device`. Default directory names include the disk format version; custom roots gain no suffix. Old default directories remain untouched, and old Unix credential schemas are rejected. Upgrade local SDKs, c3 and Node consumers together; follow the [0.11.0 migration notes](../docs/releases/0.11.0.md) (and [0.10.0 notes](../docs/releases/0.10.0.md) before rebuilding a custom root from pre-0.10 formats that reports `unsupported-namespace-format`).
+Unix endpoints use namespace disk format 3 and credential schema 4 without `device`. Default directory names include the disk format version; custom roots gain no suffix. Old default directories remain untouched, and old Unix credential schemas are rejected. Upgrade local SDKs, c3 and Node consumers together; follow the [0.12.0 migration notes](../docs/releases/0.12.0.md) (and [0.10.0 notes](../docs/releases/0.10.0.md) before rebuilding a custom root from pre-0.10 formats that reports `unsupported-namespace-format`).
 
 Inspect reports observation, not process liveness. Reap refuses stale or unverified objects. `sweep` accepts repeatable `--address` flags to scope cleanup to specific addresses of the current run (omitting `--address` sweeps the entire selected namespace); report completion only when CLI JSON `sweep.roundComplete` is true — if the batch limit is reached before the round completes, `c3 endpoint sweep` exits with code 1. The millisecond budget is a scheduling target, not hard real-time filesystem behavior. Windows reports kernel-managed/not-applicable cleanup. See the [lifecycle guide](../docs/reference/local-endpoint-lifecycle.md); do not remove unknown historical directories based on age, PID or connection failure.
 
@@ -225,7 +225,7 @@ uv run --python 3.11 --group banner tools/dev/generate_banner.py
 
 ## Release
 
-The coordinated [c3 0.7.0 release entry](https://github.com/world-in-progress/c-two/releases/tag/c3-v0.7.0) uses the following binary target convention. Installation and checksum verification are in the [Windows guide](../docs/reference/windows-native-usage.md):
+The coordinated [c3 0.8.0 release entry](https://github.com/world-in-progress/c-two/releases/tag/c3-v0.8.0) uses the following binary target convention. Installation and checksum verification are in the [Windows guide](../docs/reference/windows-native-usage.md):
 
 - `x86_64-unknown-linux-gnu`
 - `aarch64-unknown-linux-gnu`
@@ -239,13 +239,13 @@ Unix assets are named `c3-${target}`; Windows uses `c3-${target}.exe`. Each has 
 ### Linux / macOS
 
 ```bash
-curl -fsSL https://github.com/world-in-progress/c-two/releases/latest/download/c3-installer.sh | sh -s -- --version 0.7.0
+curl -fsSL https://github.com/world-in-progress/c-two/releases/latest/download/c3-installer.sh | sh -s -- --version 0.8.0
 ```
 
 The installer detects Linux/macOS and x86_64/aarch64. It defaults to `/usr/local/bin` as root or `~/.local/bin` otherwise. Select another directory:
 
 ```bash
-curl -fsSL https://github.com/world-in-progress/c-two/releases/latest/download/c3-installer.sh | sh -s -- --version 0.7.0 --bin-dir "$HOME/bin"
+curl -fsSL https://github.com/world-in-progress/c-two/releases/latest/download/c3-installer.sh | sh -s -- --version 0.8.0 --bin-dir "$HOME/bin"
 ```
 
 ### Windows x64 / ARM64
@@ -254,7 +254,7 @@ Download the PowerShell installer and select the coordinated version explicitly:
 
 ```powershell
 Invoke-WebRequest -UseBasicParsing -Uri 'https://github.com/world-in-progress/c-two/releases/latest/download/c3-installer.ps1' -OutFile .\c3-installer.ps1
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\c3-installer.ps1 -Version 0.7.0
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\c3-installer.ps1 -Version 0.8.0
 $env:PATH = "$env:LOCALAPPDATA\Programs\c3;$env:PATH"
 c3.exe --version
 ```
