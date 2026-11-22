@@ -5,16 +5,22 @@ Uses only public C-Two, FastDB, NumPy, and (optional) Ray APIs under C-Two's
 current single-owner copy-then-release semantics (ADR 0001).
 
 Suites:
-  - stages:   Single-process FastDB build / execute / binary_bytes / open_copy /
-              open_external / view-reduce decomposition (256 KiB, 4 MiB, 32 MiB).
-  - coupling: Bidirectional small-packet coupling exchange (4, 16, 64 KiB on
-              direct IPC FastDB unary; 16 KiB paired with pickle-arrays,
-              Ray detached named actor, and Ray Compiled Graphs).
-  - field:    Small-request -> full-field grid snapshot & live stream
-              (256 KiB, 1, 4, 16, 32 MiB on direct IPC FastDB unary & stream;
-              4 MiB & 32 MiB paired with cc.hold, explicit 1-hop c3 relay stream,
-              pickle-arrays, Ray named actor, and Ray Compiled Graphs; separates
+  - stages:   Single-process FastDB 0.3.0 ExternalBytes plan / direct execute /
+              memoryview / open_external / open_copy / view-reduce decomposition
+              (256 KiB, 4 MiB, 32 MiB).
+  - coupling: Bidirectional small-packet coupling exchange (1, 4, 16, 64 KiB on
+              direct IPC FastDB unary with BuildPlan direct-to-WritableSlab SHM;
+              1 KiB & 16 KiB paired with pickle-arrays, Ray detached named
+              actor, and Ray Compiled Graphs).
+  - field:    Small-request -> full-field grid snapshot & live stream across
+              KB-to-GB sizes (256 KiB, 1, 4, 16, 32, 256, 512 MiB, 1 GiB on
+              direct IPC FastDB unary & stream; 4 MiB–1 GiB paired with cc.hold,
+              pickle-arrays, Ray named actor, and Ray Compiled Graphs; 4 & 32
+              MiB paired with explicit 1-hop c3 relay stream; separates
               published-frame vs fresh-frame workloads).
+  - migration: 4 GiB bounded-memory streamed migration (128 x 32 MiB chunks
+               over @cc.stream inside a strict 1 GiB role RAM budget, paired
+               with Ray actor streaming generator).
   - fanout:   Multi-subscriber amplification baseline (R = 1, 2, 4 concurrent
               client processes subscribing via @cc.stream at 4 MiB and 32 MiB
               over direct IPC and 1-hop c3 relay).
@@ -68,42 +74,53 @@ import numpy as np
 
 import c_two as cc
 from fastdb4py.payload import (
+    BuildPlan,
     BuildPolicy,
     Builder,
+    BuilderOptions,
     CompiledSpec,
     ExternalBytes,
     Payload,
+    WritableBufferBacking,
 )
 
 SCHEMA_VERSION = 'c-two.portable-payload-benchmark.v1'
 KIB = 1024
 MIB = 1024 * 1024
+GIB = 1024 * MIB
 DEFAULT_ROLE_BUDGET_BYTES = 1024 * MIB  # 1 GiB role memory budget
 RAY_OBJECT_STORE_BYTES = 1536 * MIB     # Safe below macOS 2 GiB Ray plasma cap
 SIMULATED_STEP_MS = (5.0, 20.0, 50.0, 100.0)
 _NO_PROXY_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
-# Single-direction full-payload copy lower bounds on SHM path (fastdb4py 0.2.4,
-# excluding kernel/page-zeroing/metadata/initial array construction/client reduction).
+# Single-direction full-payload copy lower bounds on SHM path (fastdb4py 0.3.0 +
+# C-Two WritableSlab direct SHM, excluding kernel/page-zeroing/metadata/initial
+# array construction/client reduction).
 COPY_LEDGER_SHM_UNARY = {
-    'fastdb_image_to_python_bytes': 2,
-    'python_bytes_to_ctwo_send_vec': 1,
-    'ctwo_shm_write_and_receive_local_vec': 2,
-    'python_bytes_view_ctypes_and_fastdb_open_copy': 3,
-    'total_lower_bound_one_way': 8,
+    'fastdb_plan_or_payload_to_shm': 1,
+    'ctwo_shm_to_receiver_local_vec': 1,
+    'fastdb_open_external_and_memoryview': 0,
+    'total_lower_bound_one_way': 2,
     'ctwo_transport_copies': 2,
-    'fastdb_python_glue_copies': 6,
+    'fastdb_python_glue_copies': 0,
 }
 
 COPY_LEDGER_SHM_STREAM = {
-    'fastdb_image_to_python_bytes': 2,
-    'python_bytes_to_ctwo_send_vec': 0,  # stream writes PyBackedBytes directly
-    'ctwo_shm_write_and_receive_local_vec': 2,
-    'python_bytes_view_ctypes_and_fastdb_open_copy': 3,
-    'total_lower_bound_one_way': 7,
+    'fastdb_plan_or_payload_to_shm': 1,
+    'ctwo_shm_to_receiver_local_vec': 1,
+    'fastdb_open_external_and_memoryview': 0,
+    'total_lower_bound_one_way': 2,
     'ctwo_transport_copies': 2,
-    'fastdb_python_glue_copies': 5,
+    'fastdb_python_glue_copies': 0,
 }
+
+
+def _role_budget_for_payload(n_bytes: int) -> int:
+    # Keep strict 1 GiB for all <= 512 MiB frames and streamed migration; only
+    # lift for single frames whose encoded image exceeds 1 GiB itself.
+    if n_bytes <= 512 * MIB:
+        return DEFAULT_ROLE_BUDGET_BYTES
+    return n_bytes + 256 * MIB
 
 # Portable fastdb.payload.v1 specs.
 FIELD_SPEC: dict[str, Any] = {
@@ -170,18 +187,32 @@ def stamp_field_array(base: np.ndarray, seq: int) -> np.ndarray:
     return arr
 
 
-def build_field_payload(arr: np.ndarray, seq: int) -> tuple[Payload, dict[str, Any]]:
+def build_field_plan(arr: np.ndarray, seq: int) -> BuildPlan:
     spec = _compiled('field')
-    raw = arr.tobytes()
-    builder = Builder.create(spec)
+    ext = ExternalBytes(arr)
+    if arr.nbytes > 256 * MIB:
+        builder = Builder.create(
+            spec,
+            BuilderOptions(
+                max_opaque_bytes=arr.nbytes + MIB,
+                max_total_builder_bytes=arr.nbytes + 4 * MIB,
+            ),
+        )
+    else:
+        builder = Builder.create(spec)
     try:
         builder.entry_begin(0, 1).value_u32(seq)
         builder.entry_begin(1, 1).value_u32(1)
         builder.entry_begin(2, 1).value_u32(int(arr.size))
-        builder.entry_begin(3, 1).value_bytes(raw)
-        plan = builder.freeze()
+        builder.entry_begin(3, 1).value_external_bytes(ext)
+        return builder.freeze()
     finally:
         builder.close()
+        ext.close()
+
+
+def build_field_payload(arr: np.ndarray, seq: int) -> tuple[Payload, dict[str, Any]]:
+    plan = build_field_plan(arr, seq)
     try:
         built = plan.execute(BuildPolicy.ALLOW_STAGING)
         report = {
@@ -206,8 +237,10 @@ def read_and_reduce_field_payload(payload: Payload) -> tuple[int, int, float, fl
     with payload.entry_view(3) as v_vals:
         with v_vals.at(0) as cell:
             with cell.acquire() as acc:
-                arr = np.frombuffer(acc.bytes(), dtype='<f8')
-                total = float(arr.sum())
+                with acc.memoryview() as mv:
+                    arr = np.frombuffer(mv, dtype='<f8')
+                    total = float(arr.sum())
+                    del arr
     t1 = time.perf_counter()
     return seq, count, total, (t1 - t0) * 1e3
 
@@ -240,27 +273,30 @@ def build_kostya_numpy_dict(n: int) -> dict[str, Any]:
 def build_kostya_fastdb_payload(n: int) -> tuple[Payload, dict[str, Any]]:
     spec = _compiled('kostya')
     idx = np.arange(n, dtype='<u4')
-    x = (idx.astype('<f8') * 0.1).tobytes()
-    y = (idx.astype('<f8') * 0.2).tobytes()
-    z = (idx.astype('<f8') * 0.3).tobytes()
+    x = idx.astype('<f8') * 0.1
+    y = idx.astype('<f8') * 0.2
+    z = idx.astype('<f8') * 0.3
     unique_count = min(n, 50_000)
-    name_index = (idx % unique_count).astype('<u2').tobytes()
+    name_index = (idx % unique_count).astype('<u2')
     name_table = [f'coord_{i:05d}' for i in range(unique_count)]
 
+    exts = [ExternalBytes(arr) for arr in (idx, x, y, z, name_index)]
     builder = Builder.create(spec)
     try:
         builder.entry_begin(0, 1).value_u32(n)
-        builder.entry_begin(1, 1).value_bytes(idx.tobytes())
-        builder.entry_begin(2, 1).value_bytes(x)
-        builder.entry_begin(3, 1).value_bytes(y)
-        builder.entry_begin(4, 1).value_bytes(z)
-        builder.entry_begin(5, 1).value_bytes(name_index)
+        builder.entry_begin(1, 1).value_external_bytes(exts[0])
+        builder.entry_begin(2, 1).value_external_bytes(exts[1])
+        builder.entry_begin(3, 1).value_external_bytes(exts[2])
+        builder.entry_begin(4, 1).value_external_bytes(exts[3])
+        builder.entry_begin(5, 1).value_external_bytes(exts[4])
         builder.entry_begin(6, unique_count)
         for name in name_table:
             builder.value_str(name)
         plan = builder.freeze()
     finally:
         builder.close()
+        for ext in exts:
+            ext.close()
     try:
         built = plan.execute(BuildPolicy.ALLOW_STAGING)
         report = {
@@ -283,19 +319,23 @@ def reduce_kostya_fastdb(payload: Payload, n: int) -> tuple[float, float, float]
     with payload.entry_view(2) as vx, payload.entry_view(3) as vy, payload.entry_view(4) as vz:
         with vx.at(0) as cx, vy.at(0) as cy, vz.at(0) as cz:
             with cx.acquire() as ax, cy.acquire() as ay, cz.acquire() as az:
-                x_arr = np.frombuffer(ax.bytes(), dtype='<f8')
-                y_arr = np.frombuffer(ay.bytes(), dtype='<f8')
-                z_arr = np.frombuffer(az.bytes(), dtype='<f8')
-                t1 = time.perf_counter()
-                total = float(x_arr.sum() + y_arr.sum() + z_arr.sum())
-                t2 = time.perf_counter()
+                with ax.memoryview() as mx, ay.memoryview() as my, az.memoryview() as mz:
+                    x_arr = np.frombuffer(mx, dtype='<f8')
+                    y_arr = np.frombuffer(my, dtype='<f8')
+                    z_arr = np.frombuffer(mz, dtype='<f8')
+                    t1 = time.perf_counter()
+                    total = float(x_arr.sum() + y_arr.sum() + z_arr.sum())
+                    t2 = time.perf_counter()
+                    del x_arr, y_arr, z_arr
     # Spot-check dictionary string table integrity (first and last row).
     with payload.entry_view(5) as v_idx, payload.entry_view(6) as v_tbl:
         with v_idx.at(0) as c_idx:
             with c_idx.acquire() as a_idx:
-                idx_arr = np.frombuffer(a_idx.bytes(), dtype='<u2')
-                first_i = int(idx_arr[0])
-                last_i = int(idx_arr[n - 1])
+                with a_idx.memoryview() as m_idx:
+                    idx_arr = np.frombuffer(m_idx, dtype='<u2')
+                    first_i = int(idx_arr[0])
+                    last_i = int(idx_arr[n - 1])
+                    del idx_arr
         with v_tbl.at(first_i) as c0:
             with c0.acquire() as a0:
                 assert a0.str() == 'coord_00000'
@@ -569,13 +609,12 @@ class FastDbCouplingResource:
     def __init__(self, n_bytes: int) -> None:
         self._base = make_field_array(n_bytes)
 
-    def exchange(self, payload: Payload) -> Payload:
+    def exchange(self, payload: Payload) -> BuildPlan:
         seq, count, total, _ = read_and_reduce_field_payload(payload)
         verify_field_result(seq, seq, count, int(self._base.size), total)
         payload.close()
         out_arr = stamp_field_array(self._base, seq + 1)
-        out_payload, _ = build_field_payload(out_arr, seq + 1)
-        return out_payload
+        return build_field_plan(out_arr, seq + 1)
 
 
 class PickleCouplingResource:
@@ -588,50 +627,71 @@ class PickleCouplingResource:
 
 
 class _PublishedFastDbField:
-    def __init__(self, n_bytes: int, runtime: cc.Runtime) -> None:
+    def __init__(self, n_bytes: int, runtime: cc.Runtime, *, preload_published: bool = True) -> None:
         self._runtime = runtime
         self._base = make_field_array(n_bytes)
-        published_arr = stamp_field_array(self._base, 1)
-        self._published, self._report = build_field_payload(published_arr, 1)
+        self._published: Payload | None = None
+        self._report: dict[str, Any] = {}
+        self._encoded_bytes: int | None = None
+        if preload_published:
+            self._ensure_published()
+        else:
+            with build_field_plan(self._base, 1) as probe_plan:
+                info = probe_plan.info()
+                self._encoded_bytes = int(info.total_bytes)
+                self._report = {
+                    'execution_mode': 'DIRECT' if int(info.direct_build_status) == 1 else str(info.direct_build_status),
+                    'staging_bytes': 0,
+                    'used_bytes': int(info.total_bytes),
+                }
+
+    def _ensure_published(self) -> Payload:
+        if self._published is None:
+            published_arr = stamp_field_array(self._base, 1)
+            self._published, self._report = build_field_payload(published_arr, 1)
+            with self._published.memoryview() as mv:
+                self._encoded_bytes = len(mv)
+        return self._published
 
     def snapshot_published(self) -> Payload:
-        return self._published
+        return self._ensure_published()
 
     def server_metrics(self) -> str:
         return json.dumps({
             'peak_rss_mib': peak_rss_mib(),
             'memory_stats': self._runtime.memory_stats(),
             'fastdb_report': self._report,
-            'encoded_bytes': len(self._published.binary_bytes()),
+            'encoded_bytes': self._encoded_bytes,
         })
 
 
 class FastDbFieldResource(_PublishedFastDbField):
-    def snapshot_fresh(self, seq: int) -> Payload:
+    def snapshot_fresh(self, seq: int) -> BuildPlan:
         arr = stamp_field_array(self._base, seq)
-        payload, _ = build_field_payload(arr, seq)
-        return payload
+        return build_field_plan(arr, seq)
 
     def stream_published(self, count: int) -> Iterator[Payload]:
+        published = self._ensure_published()
         for _ in range(count):
-            yield self._published
+            yield published
 
-    def stream_fresh(self, count: int) -> Iterator[Payload]:
+    def stream_fresh(self, count: int) -> Iterator[BuildPlan]:
         for seq in range(1, count + 1):
             arr = stamp_field_array(self._base, seq)
-            payload, _ = build_field_payload(arr, seq)
+            plan = build_field_plan(arr, seq)
             try:
-                yield payload
+                yield plan
             finally:
-                payload.close()
+                plan.close()
 
 class FastDbPubSubResource(_PublishedFastDbField):
     def set_publisher(self, publisher: cc.Publisher[Payload]) -> None:
         self._publisher = publisher
 
     def emit_burst(self, count: int) -> str:
+        published = self._ensure_published()
         t0 = time.perf_counter()
-        seqs = [self._publisher.publish(self._published) for _ in range(count)]
+        seqs = [self._publisher.publish(published) for _ in range(count)]
         elapsed_s = time.perf_counter() - t0
         return json.dumps({
             'publish_elapsed_s': elapsed_s,
@@ -641,12 +701,16 @@ class FastDbPubSubResource(_PublishedFastDbField):
 
 
 class PickleFieldResource:
-    def __init__(self, n_bytes: int, runtime: cc.Runtime) -> None:
+    def __init__(self, n_bytes: int, runtime: cc.Runtime, *, preload_published: bool = True) -> None:
         self._runtime = runtime
         self._base = make_field_array(n_bytes)
-        self._published = (1, stamp_field_array(self._base, 1))
+        self._published: tuple[int, np.ndarray] | None = (
+            (1, stamp_field_array(self._base, 1)) if preload_published else None
+        )
 
     def snapshot_published(self) -> tuple[int, np.ndarray]:
+        if self._published is None:
+            self._published = (1, stamp_field_array(self._base, 1))
         return self._published
 
     def snapshot_fresh(self, seq: int) -> tuple[int, np.ndarray]:
@@ -683,13 +747,15 @@ def _ctwo_server_main(
     ready_q: mp.Queue,
     stop_ev: mp.Event,
     topic_capacity: int | None = None,
+    memory_budget_bytes: int = DEFAULT_ROLE_BUDGET_BYTES,
+    preload_published: bool = True,
 ) -> None:
     os.environ['C2_ENV_FILE'] = ''
     os.environ['C2_RELAY_ANCHOR_ADDRESS'] = ''
     runtime = cc.Runtime()
     if endpoint_root is not None and os.name != 'nt':
         runtime.set_local_endpoint(root=endpoint_root)
-    runtime.set_server(memory_budget_bytes=DEFAULT_ROLE_BUDGET_BYTES)
+    runtime.set_server(memory_budget_bytes=memory_budget_bytes)
     if relay_url is not None:
         runtime.set_relay_anchor(relay_url)
     try:
@@ -699,7 +765,12 @@ def _ctwo_server_main(
         elif kind == 'pickle_coupling':
             runtime.register(PickleCouplingContract, PickleCouplingResource(param), name='bench', concurrency=conc)
         elif kind == 'fastdb_field':
-            runtime.register(FastDbFieldContract, FastDbFieldResource(param, runtime), name='bench', concurrency=conc)
+            runtime.register(
+                FastDbFieldContract,
+                FastDbFieldResource(param, runtime, preload_published=preload_published),
+                name='bench',
+                concurrency=conc,
+            )
         elif kind == 'fastdb_pubsub':
             assert topic_capacity is not None
             pubsub = FastDbPubSubResource(param, runtime)
@@ -709,7 +780,12 @@ def _ctwo_server_main(
             )
             pubsub.set_publisher(registration.publisher('frames'))
         elif kind == 'pickle_field':
-            runtime.register(PickleFieldContract, PickleFieldResource(param, runtime), name='bench', concurrency=conc)
+            runtime.register(
+                PickleFieldContract,
+                PickleFieldResource(param, runtime, preload_published=preload_published),
+                name='bench',
+                concurrency=conc,
+            )
         elif kind == 'fastdb_kostya':
             runtime.register(FastDbKostyaContract, FastDbKostyaResource(param), name='bench', concurrency=conc)
         elif kind == 'pickle_kostya':
@@ -723,19 +799,23 @@ def _ctwo_server_main(
         ready_q.put(('err', repr(exc)))
         raise
     finally:
-        runtime.shutdown(timeout=10.0)
+        runtime.shutdown(timeout=15.0)
 
 
 class SpawnedCtwoServer:
     def __init__(
         self, kind: str, param: int, *, endpoint_root: str | None,
         relay_url: str | None = None, topic_capacity: int | None = None,
+        memory_budget_bytes: int = DEFAULT_ROLE_BUDGET_BYTES,
+        preload_published: bool = True,
     ) -> None:
         self._kind = kind
         self._param = param
         self._endpoint_root = endpoint_root
         self._relay_url = relay_url
         self._topic_capacity = topic_capacity
+        self._memory_budget_bytes = memory_budget_bytes
+        self._preload_published = preload_published
         self._ctx = mp.get_context('spawn')
         self._ready_q = self._ctx.Queue()
         self._stop_ev = self._ctx.Event()
@@ -748,11 +828,12 @@ class SpawnedCtwoServer:
             args=(
                 self._kind, self._param, self._endpoint_root, self._relay_url,
                 self._ready_q, self._stop_ev, self._topic_capacity,
+                self._memory_budget_bytes, self._preload_published,
             ),
         )
         self._proc.start()
         try:
-            status, value = self._ready_q.get(timeout=60.0)
+            status, value = self._ready_q.get(timeout=120.0)
             if status != 'ok':
                 raise RuntimeError(f'C-Two server {self._kind} failed to start: {value}')
         except BaseException:
@@ -879,11 +960,15 @@ class SpawnedRelay:
                 proc.stderr.close()
 
 
-def _make_client_runtime(endpoint_root: str | None) -> cc.Runtime:
+def _make_client_runtime(
+    endpoint_root: str | None,
+    *,
+    memory_budget_bytes: int = DEFAULT_ROLE_BUDGET_BYTES,
+) -> cc.Runtime:
     runtime = cc.Runtime()
     if endpoint_root is not None and os.name != 'nt':
         runtime.set_local_endpoint(root=endpoint_root)
-    runtime.set_client(memory_budget_bytes=DEFAULT_ROLE_BUDGET_BYTES)
+    runtime.set_client(memory_budget_bytes=memory_budget_bytes)
     return runtime
 
 
@@ -902,83 +987,74 @@ def run_stages_suite(*, smoke: bool) -> dict[str, Any]:
     for n_bytes in sizes:
         base = make_field_array(n_bytes)
         arr = stamp_field_array(base, 1)
-        raw = arr.tobytes()
 
         build_ms: list[float] = []
-        exec_ms: list[float] = []
-        bin_ms: list[float] = []
+        exec_direct_ms: list[float] = []
+        mv_ms: list[float] = []
         open_copy_ms: list[float] = []
-        open_ext_copy_ms: list[float] = []
-        open_ext_direct_ms: list[float] = []
+        open_ext_mv_ms: list[float] = []
         reduce_ms: list[float] = []
         release_ms: list[float] = []
         encoded_bytes = 0
         report_mode = ''
         staging_bytes = 0
 
+        with build_field_plan(arr, 1) as probe_plan:
+            target_buf = bytearray(probe_plan.info().total_bytes)
+
         gc.collect()
         for step in range(warmup + iters):
             t0 = time.perf_counter()
-            builder = Builder.create(spec)
-            builder.entry_begin(0, 1).value_u32(1)
-            builder.entry_begin(1, 1).value_u32(1)
-            builder.entry_begin(2, 1).value_u32(int(arr.size))
-            builder.entry_begin(3, 1).value_bytes(raw)
-            plan = builder.freeze()
-            builder.close()
+            plan = build_field_plan(arr, 1)
             t1 = time.perf_counter()
 
-            built = plan.execute(BuildPolicy.ALLOW_STAGING)
+            built = plan.execute(
+                BuildPolicy.REQUIRE_DIRECT,
+                backing=WritableBufferBacking(target_buf),
+            )
             plan.close()
             t2 = time.perf_counter()
 
-            blob = built.payload.binary_bytes()
+            mv = built.payload.memoryview()
+            encoded_bytes = len(mv)
             t3 = time.perf_counter()
 
-            encoded_bytes = len(blob)
             report_mode = str(built.report.mode)
             staging_bytes = int(built.report.staging_bytes)
 
-            mv = memoryview(blob)
             t4 = time.perf_counter()
-            p_copy = Payload.open_copy(spec, bytes(mv))
+            ext = ExternalBytes(mv)
+            try:
+                p_ext = Payload.open_external(spec, ext)
+            finally:
+                ext.close()
             t5 = time.perf_counter()
 
-            seq, count, total, _ = read_and_reduce_field_payload(p_copy)
+            seq, count, total, _ = read_and_reduce_field_payload(p_ext)
             verify_field_result(seq, 1, count, int(arr.size), total)
             t6 = time.perf_counter()
 
-            p_copy.close()
+            p_ext.close()
             t7 = time.perf_counter()
 
-            # Paired decode probe: open_external with bytes(mv) vs existing bytes object.
+            # Paired reference probe: legacy copy-backed open_copy(bytes(mv)).
             t8 = time.perf_counter()
-            p_ext_copy = Payload.open_external(spec, ExternalBytes(bytes(mv)))
+            p_copy = Payload.open_copy(spec, bytes(mv))
             t9 = time.perf_counter()
-            p_ext_copy.close()
+            p_copy.close()
 
-            t10 = time.perf_counter()
-            p_ext_direct = Payload.open_external(spec, ExternalBytes(blob))
-            t11 = time.perf_counter()
-            p_ext_direct.close()
-
-            built.payload.close()
             mv.release()
-            del p_copy, p_ext_copy, p_ext_direct, built, blob, mv
-            # fastdb4py 0.2.4 retains a small cyclic graph until cyclic GC runs;
-            # collect between timed iterations so single-process stage timing does
-            # not inflate driver RSS across unrelated suites.
-            gc.collect()
+            built.payload.close()
+            del p_ext, p_copy, built, mv
 
             if step >= warmup:
                 build_ms.append((t1 - t0) * 1e3)
-                exec_ms.append((t2 - t1) * 1e3)
-                bin_ms.append((t3 - t2) * 1e3)
-                open_copy_ms.append((t5 - t4) * 1e3)
+                exec_direct_ms.append((t2 - t1) * 1e3)
+                mv_ms.append((t3 - t2) * 1e3)
+                open_ext_mv_ms.append((t5 - t4) * 1e3)
                 reduce_ms.append((t6 - t5) * 1e3)
                 release_ms.append((t7 - t6) * 1e3)
-                open_ext_copy_ms.append((t9 - t8) * 1e3)
-                open_ext_direct_ms.append((t11 - t10) * 1e3)
+                open_copy_ms.append((t9 - t8) * 1e3)
 
         rows.append({
             'logical_bytes': n_bytes,
@@ -987,12 +1063,11 @@ def run_stages_suite(*, smoke: bool) -> dict[str, Any]:
             'fastdb_staging_bytes': staging_bytes,
             'samples': iters,
             'stages_p50_ms': {
-                'build_and_freeze': round(nearest_rank(build_ms, 0.50), 4),
-                'execute_plan': round(nearest_rank(exec_ms, 0.50), 4),
-                'binary_bytes_export': round(nearest_rank(bin_ms, 0.50), 4),
+                'build_external_plan': round(nearest_rank(build_ms, 0.50), 4),
+                'execute_direct_into_buffer': round(nearest_rank(exec_direct_ms, 0.50), 4),
+                'memoryview_export': round(nearest_rank(mv_ms, 0.50), 4),
+                'open_external_from_memoryview': round(nearest_rank(open_ext_mv_ms, 0.50), 4),
                 'open_copy_from_memoryview': round(nearest_rank(open_copy_ms, 0.50), 4),
-                'open_external_from_memoryview': round(nearest_rank(open_ext_copy_ms, 0.50), 4),
-                'open_external_from_bytes': round(nearest_rank(open_ext_direct_ms, 0.50), 4),
                 'view_and_numpy_reduce': round(nearest_rank(reduce_ms, 0.50), 4),
                 'release': round(nearest_rank(release_ms, 0.50), 4),
             },
@@ -1029,14 +1104,18 @@ def _run_ctwo_coupling(kind: str, n_bytes: int, warmup: int, iters: int) -> dict
                     arr = stamp_field_array(base, seq)
                     t0 = time.perf_counter()
                     if kind == 'fastdb_coupling':
-                        req, rep = build_field_payload(arr, seq)
+                        plan = build_field_plan(arr, seq)
                         if i == 0:
-                            fastdb_report = rep
-                            encoded_bytes = len(req.binary_bytes())
+                            info = plan.info()
+                            encoded_bytes = int(info.total_bytes)
+                            fastdb_report = {
+                                'execution_mode': 'DIRECT' if int(info.direct_build_status) == 1 else str(info.direct_build_status),
+                                'staging_bytes': 0,
+                            }
                         try:
-                            resp = proxy.exchange(req)
+                            resp = proxy.exchange(plan)
                         finally:
-                            req.close()
+                            plan.close()
                         try:
                             r_seq, r_cnt, r_sum, _ = read_and_reduce_field_payload(resp)
                             verify_field_result(r_seq, seq + 1, r_cnt, int(base.size), r_sum)
@@ -1080,14 +1159,15 @@ def _run_ctwo_coupling(kind: str, n_bytes: int, warmup: int, iters: int) -> dict
 
 
 def run_coupling_suite(*, smoke: bool, include_ray: bool) -> dict[str, Any]:
-    sizes = [16 * KIB] if smoke else [4 * KIB, 16 * KIB, 64 * KIB]
+    sizes = [1 * KIB, 16 * KIB] if smoke else [1 * KIB, 4 * KIB, 16 * KIB, 64 * KIB]
+    compare_sizes = {16 * KIB} if smoke else {1 * KIB, 16 * KIB}
     warmup = 2 if smoke else 10
     iters = 8 if smoke else 60
     rows: list[dict[str, Any]] = []
 
     for n_bytes in sizes:
         rows.append(_run_ctwo_coupling('fastdb_coupling', n_bytes, warmup, iters))
-        if n_bytes == 16 * KIB:
+        if n_bytes in compare_sizes:
             rows.append(_run_ctwo_coupling('pickle_coupling', n_bytes, warmup, iters))
             if include_ray:
                 rows.extend(_run_ray_coupling_arms(n_bytes, warmup, iters))
@@ -1116,16 +1196,25 @@ def _run_ctwo_field_arm(
     server_kind = 'pickle_field' if is_pickle else 'fastdb_field'
     contract = PickleFieldContract if is_pickle else FastDbFieldContract
     endpoint_root = tempfile.mkdtemp(prefix='c2-bench-field-') if os.name != 'nt' else None
+    role_budget = _role_budget_for_payload(n_bytes)
+    preload_published = mode == 'published'
 
     try:
-        relay_ctx = SpawnedRelay(c3_bin, endpoint_root) if is_relay else None
+        relay_ctx = SpawnedRelay(c3_bin, endpoint_root, memory_budget_bytes=role_budget) if is_relay else None
         if relay_ctx is not None:
             assert c3_bin is not None
             relay_ctx.__enter__()
         try:
             relay_url = relay_ctx.url if relay_ctx is not None else None
-            with SpawnedCtwoServer(server_kind, n_bytes, endpoint_root=endpoint_root, relay_url=relay_url) as srv:
-                client = _make_client_runtime(endpoint_root)
+            with SpawnedCtwoServer(
+                server_kind,
+                n_bytes,
+                endpoint_root=endpoint_root,
+                relay_url=relay_url,
+                memory_budget_bytes=role_budget,
+                preload_published=preload_published,
+            ) as srv:
+                client = _make_client_runtime(endpoint_root, memory_budget_bytes=role_budget)
                 connect_addr = relay_url if is_relay else srv.address
                 assert connect_addr is not None
                 t_conn0 = time.perf_counter()
@@ -1157,7 +1246,7 @@ def _run_ctwo_field_arm(
                                 finally:
                                     item.close()
                         finally:
-                            assert w_stream.close(timeout=10.0)['completed'] is True
+                            assert w_stream.close(timeout=60.0)['completed'] is True
 
                         t_open = time.perf_counter()
                         stream = (
@@ -1183,7 +1272,7 @@ def _run_ctwo_field_arm(
                                 prev = now
                             stream_total_s = time.perf_counter() - t_open
                         finally:
-                            receipt = stream.close(timeout=15.0)
+                            receipt = stream.close(timeout=60.0)
                             assert receipt['completed'] is True
                             assert receipt['error'] is None
                             assert receipt['complete_items'] == iters
@@ -1234,7 +1323,7 @@ def _run_ctwo_field_arm(
                     client_mem = client.memory_stats()
                 finally:
                     cc.close(proxy)
-                    outcome = client.shutdown(timeout=10.0)
+                    outcome = client.shutdown(timeout=15.0)
                     assert outcome['completed'] is True
                     gc.collect()
                 row: dict[str, Any] = {
@@ -1242,6 +1331,7 @@ def _run_ctwo_field_arm(
                     'frame_mode': mode,
                     'logical_bytes': n_bytes,
                     'encoded_bytes': srv_metrics.get('encoded_bytes'),
+                    'role_memory_budget_bytes': role_budget,
                     'transport_path': observed_path,
                     'connect_ms': round(connect_ms, 3),
                     'extract_and_reduce_p50_ms': round(nearest_rank(extract_reduce_ms, 0.50), 4),
@@ -1275,20 +1365,35 @@ def _run_ctwo_field_arm(
 
 
 def run_field_suite(*, smoke: bool, include_ray: bool, c3_bin: str | None) -> dict[str, Any]:
-    sizes = [256 * KIB, 1 * MIB] if smoke else [256 * KIB, 1 * MIB, 4 * MIB, 16 * MIB, 32 * MIB]
-    compare_sizes = {1 * MIB} if smoke else {4 * MIB, 32 * MIB}
+    sizes = (
+        [256 * KIB, 1 * MIB]
+        if smoke
+        else [256 * KIB, 1 * MIB, 4 * MIB, 16 * MIB, 32 * MIB, 256 * MIB, 512 * MIB, 1 * GIB]
+    )
+    compare_sizes = {1 * MIB} if smoke else {4 * MIB, 32 * MIB, 256 * MIB, 512 * MIB, 1 * GIB}
+    relay_sizes = {1 * MIB} if smoke else {4 * MIB, 32 * MIB}
     rows: list[dict[str, Any]] = []
 
     for n_bytes in sizes:
-        warmup = 1 if smoke else (3 if n_bytes <= 4 * MIB else 2)
-        iters = 4 if smoke else (25 if n_bytes <= 4 * MIB else 12)
+        if smoke:
+            warmup, iters = 1, 4
+        elif n_bytes <= 4 * MIB:
+            warmup, iters = 3, 25
+        elif n_bytes <= 32 * MIB:
+            warmup, iters = 2, 12
+        elif n_bytes <= 256 * MIB:
+            warmup, iters = 1, 5
+        elif n_bytes <= 512 * MIB:
+            warmup, iters = 1, 4
+        else:
+            warmup, iters = 1, 3
         for mode in ('published', 'fresh'):
             rows.append(_run_ctwo_field_arm(arm='ctwo-fastdb-unary', n_bytes=n_bytes, mode=mode, warmup=warmup, iters=iters))
             rows.append(_run_ctwo_field_arm(arm='ctwo-fastdb-stream', n_bytes=n_bytes, mode=mode, warmup=warmup, iters=iters))
             if n_bytes in compare_sizes:
                 rows.append(_run_ctwo_field_arm(arm='ctwo-fastdb-hold', n_bytes=n_bytes, mode=mode, warmup=warmup, iters=iters))
                 rows.append(_run_ctwo_field_arm(arm='ctwo-pickle-arrays', n_bytes=n_bytes, mode=mode, warmup=warmup, iters=iters))
-                if c3_bin is not None:
+                if c3_bin is not None and n_bytes in relay_sizes:
                     rows.append(_run_ctwo_field_arm(arm='ctwo-fastdb-relay-stream', n_bytes=n_bytes, mode=mode, warmup=warmup, iters=iters, c3_bin=c3_bin))
                 if include_ray:
                     rows.extend(_run_ray_field_arms(n_bytes=n_bytes, mode=mode, warmup=warmup, iters=iters))
@@ -1705,7 +1810,8 @@ def _run_ctwo_kostya(kind: str, n: int, warmup: int, iters: int) -> dict[str, An
                     t1 = time.perf_counter()
                     if is_fastdb:
                         if encoded_bytes is None:
-                            encoded_bytes = len(res.binary_bytes())
+                            with res.memoryview() as mv:
+                                encoded_bytes = len(mv)
                         try:
                             _, ex_ms, red_ms = reduce_kostya_fastdb(res, n)
                         finally:
@@ -1755,6 +1861,192 @@ def run_kostya_suite(*, smoke: bool, include_ray: bool) -> dict[str, Any]:
         if include_ray:
             rows.append(_run_ray_kostya_arm(n, warmup, iters))
     return {'suite': 'kostya', 'rows': rows}
+
+
+# ---------------------------------------------------------------------------
+# Suite 5: Multi-GiB bounded-memory streamed migration inside 1 GiB RAM budget
+# ---------------------------------------------------------------------------
+
+
+def _run_ctwo_migration_arm(*, chunk_bytes: int, chunks: int, mode: str) -> dict[str, Any]:
+    endpoint_root = tempfile.mkdtemp(prefix='c2-bench-migration-') if os.name != 'nt' else None
+    try:
+        with SpawnedCtwoServer(
+            'fastdb_field',
+            chunk_bytes,
+            endpoint_root=endpoint_root,
+            memory_budget_bytes=DEFAULT_ROLE_BUDGET_BYTES,
+            preload_published=(mode == 'published'),
+        ) as srv:
+            client = _make_client_runtime(endpoint_root, memory_budget_bytes=DEFAULT_ROLE_BUDGET_BYTES)
+            proxy = client.connect(FastDbFieldContract, name='bench', address=srv.address)
+            count_elems = chunk_bytes // 8
+            samples_ms: list[float] = []
+            gc.collect()
+            rss_before = live_rss_mib()
+            try:
+                # Warm up 1 frame so pool segments & peer mappings are live.
+                w_stream = proxy.stream_published(1) if mode == 'published' else proxy.stream_fresh(1)
+                try:
+                    for item in w_stream:
+                        try:
+                            r_seq, r_cnt, r_sum, _ = read_and_reduce_field_payload(item)
+                            verify_field_result(r_seq, 1, r_cnt, count_elems, r_sum)
+                        finally:
+                            item.close()
+                finally:
+                    assert w_stream.close(timeout=30.0)['completed'] is True
+
+                t_start = time.perf_counter()
+                stream = proxy.stream_published(chunks) if mode == 'published' else proxy.stream_fresh(chunks)
+                try:
+                    prev = t_start
+                    for idx, item in enumerate(stream, 1):
+                        exp_seq = 1 if mode == 'published' else idx
+                        try:
+                            r_seq, r_cnt, r_sum, _ = read_and_reduce_field_payload(item)
+                            verify_field_result(r_seq, exp_seq, r_cnt, count_elems, r_sum)
+                        finally:
+                            item.close()
+                        now = time.perf_counter()
+                        samples_ms.append((now - prev) * 1e3)
+                        prev = now
+                    elapsed_s = time.perf_counter() - t_start
+                finally:
+                    receipt = stream.close(timeout=60.0)
+                    assert receipt['completed'] is True
+                    assert receipt['error'] is None
+                    assert receipt['complete_items'] == chunks
+
+                srv_metrics = json.loads(proxy.server_metrics())
+                rss_after_before_gc = live_rss_mib()
+                client_mem = client.memory_stats()
+            finally:
+                cc.close(proxy)
+                outcome = client.shutdown(timeout=15.0)
+                assert outcome['completed'] is True
+                gc.collect()
+
+            total_bytes = chunk_bytes * chunks
+            total_gib = total_bytes / GIB
+            return {
+                'arm': 'ctwo-fastdb-stream-migration',
+                'frame_mode': mode,
+                'chunk_bytes': chunk_bytes,
+                'chunks': chunks,
+                'total_logical_bytes': total_bytes,
+                'total_logical_gib': round(total_gib, 4),
+                'role_memory_budget_mib': round(DEFAULT_ROLE_BUDGET_BYTES / MIB, 2),
+                'elapsed_s': round(elapsed_s, 4),
+                'effective_gib_s': round(total_gib / elapsed_s, 4) if elapsed_s > 0 else 0.0,
+                'per_chunk_p50_ms': round(nearest_rank(samples_ms, 0.50), 4),
+                'per_chunk_p95_ms': round(nearest_rank(samples_ms, 0.95), 4),
+                'client_live_rss_before_mib': rss_before,
+                'client_live_rss_after_mib': rss_after_before_gc,
+                'client_peak_rss_mib': peak_rss_mib(),
+                'server_peak_rss_mib': srv_metrics.get('peak_rss_mib'),
+                'client_pool_peak_mib': round(client_mem['client']['memory']['peak_bytes'] / MIB, 2),
+                'server_pool_peak_mib': round(srv_metrics['memory_stats']['server']['memory']['peak_bytes'] / MIB, 2),
+                'client_holds_active': client_mem['holds']['active_holds'],
+                'copy_ledger_one_way': COPY_LEDGER_SHM_STREAM,
+            }
+    finally:
+        if endpoint_root is not None:
+            shutil.rmtree(endpoint_root, ignore_errors=True)
+
+
+def _run_ray_migration_arm(*, chunk_bytes: int, chunks: int, mode: str) -> dict[str, Any]:
+    ray = _ensure_ray_started()
+
+    @ray.remote
+    class RayMigrationActor:
+        def __init__(self, size: int, frame_mode: str) -> None:
+            self._base = make_field_array(size)
+            self._published = (1, stamp_field_array(self._base, 1)) if frame_mode == 'published' else None
+
+        def stream_published(self, count: int):
+            assert self._published is not None
+            for _ in range(count):
+                yield self._published
+
+        def stream_fresh(self, count: int):
+            for seq in range(1, count + 1):
+                yield (seq, stamp_field_array(self._base, seq))
+
+    ns = f'bench-migration-{os.getpid()}'
+    actor_name = f'migration-{chunk_bytes}-{mode}-{time.time_ns()}'
+    _ = RayMigrationActor.options(name=actor_name, namespace=ns, lifetime='detached').remote(chunk_bytes, mode)
+    actor = ray.get_actor(actor_name, namespace=ns)
+    count_elems = chunk_bytes // 8
+    method = actor.stream_published if mode == 'published' else actor.stream_fresh
+    total_bytes = chunk_bytes * chunks
+    total_gib = total_bytes / GIB
+    try:
+        # Warm up 1 frame.
+        for ref in method.options(_generator_backpressure_num_objects=4).remote(1):
+            r_seq, r_arr = ray.get(ref)
+            verify_field_result(r_seq, 1, int(r_arr.size), count_elems, float(r_arr.sum()))
+            del r_arr, ref
+
+        gc.collect()
+        rss_before = live_rss_mib()
+        samples_ms: list[float] = []
+        t_start = time.perf_counter()
+        prev = t_start
+        gen = method.options(_generator_backpressure_num_objects=4).remote(chunks)
+        for idx, ref in enumerate(gen, 1):
+            exp_seq = 1 if mode == 'published' else idx
+            r_seq, r_arr = ray.get(ref)
+            verify_field_result(r_seq, exp_seq, int(r_arr.size), count_elems, float(r_arr.sum()))
+            del r_arr, ref
+            now = time.perf_counter()
+            samples_ms.append((now - prev) * 1e3)
+            prev = now
+        elapsed_s = time.perf_counter() - t_start
+        rss_after_before_gc = live_rss_mib()
+        return {
+            'arm': 'ray-actor-stream-migration',
+            'frame_mode': mode,
+            'chunk_bytes': chunk_bytes,
+            'chunks': chunks,
+            'total_logical_bytes': total_bytes,
+            'total_logical_gib': round(total_gib, 4),
+            'ray_object_store_mib': round(RAY_OBJECT_STORE_BYTES / MIB, 2),
+            'elapsed_s': round(elapsed_s, 4),
+            'effective_gib_s': round(total_gib / elapsed_s, 4) if elapsed_s > 0 else 0.0,
+            'per_chunk_p50_ms': round(nearest_rank(samples_ms, 0.50), 4),
+            'per_chunk_p95_ms': round(nearest_rank(samples_ms, 0.95), 4),
+            'client_live_rss_before_mib': rss_before,
+            'client_live_rss_after_mib': rss_after_before_gc,
+            'client_peak_rss_mib': peak_rss_mib(),
+        }
+    except BaseException as exc:
+        return {
+            'arm': 'ray-actor-stream-migration',
+            'frame_mode': mode,
+            'chunk_bytes': chunk_bytes,
+            'chunks': chunks,
+            'total_logical_bytes': total_bytes,
+            'total_logical_gib': round(total_gib, 4),
+            'status': 'error',
+            'error': repr(exc),
+        }
+    finally:
+        ray.kill(actor)
+
+
+def run_migration_suite(*, smoke: bool, include_ray: bool) -> dict[str, Any]:
+    if include_ray:
+        # Restart Ray before multi-GiB streaming so Plasma starts unfragmented.
+        _shutdown_ray_if_running()
+    chunk_bytes = 1 * MIB if smoke else 32 * MIB
+    chunks = 4 if smoke else 128  # 128 * 32 MiB = 4 GiB inside 1 GiB role RAM budget
+    rows: list[dict[str, Any]] = []
+    for mode in ('published', 'fresh'):
+        rows.append(_run_ctwo_migration_arm(chunk_bytes=chunk_bytes, chunks=chunks, mode=mode))
+        if include_ray:
+            rows.append(_run_ray_migration_arm(chunk_bytes=chunk_bytes, chunks=chunks, mode=mode))
+    return {'suite': 'migration', 'rows': rows}
 
 
 # ---------------------------------------------------------------------------
@@ -1867,21 +2159,27 @@ def _run_ray_coupling_arms(n_bytes: int, warmup: int, iters: int) -> list[dict[s
         })
     finally:
         ray.kill(actor)
+        gc.collect()
     return out_rows
 
 
 def _run_ray_field_arms(*, n_bytes: int, mode: str, warmup: int, iters: int) -> list[dict[str, Any]]:
+    if n_bytes >= 256 * MIB:
+        # Give large-frame Ray arms a clean Plasma object store so a prior
+        # large actor or failed Compiled Graph channel cannot starve them.
+        _shutdown_ray_if_running()
     ray = _ensure_ray_started()
     from ray.dag import InputNode  # noqa: PLC0415
     from ray.dag.context import DAGContext  # noqa: PLC0415
 
     @ray.remote
     class RayFieldActor:
-        def __init__(self, size: int) -> None:
+        def __init__(self, size: int, frame_mode: str) -> None:
             self._base = make_field_array(size)
-            self._published = (1, stamp_field_array(self._base, 1))
+            self._published = (1, stamp_field_array(self._base, 1)) if frame_mode == 'published' else None
 
         def snapshot_published(self, _seq: int) -> tuple[int, np.ndarray]:
+            assert self._published is not None
             return self._published
 
         def snapshot_fresh(self, seq: int) -> tuple[int, np.ndarray]:
@@ -1890,56 +2188,23 @@ def _run_ray_field_arms(*, n_bytes: int, mode: str, warmup: int, iters: int) -> 
     ns = f'bench-field-{os.getpid()}'
     actor_name = f'field-{n_bytes}-{mode}-{time.time_ns()}'
     t_init0 = time.perf_counter()
-    _ = RayFieldActor.options(name=actor_name, namespace=ns, lifetime='detached').remote(n_bytes)
+    _ = RayFieldActor.options(name=actor_name, namespace=ns, lifetime='detached').remote(n_bytes, mode)
     actor = ray.get_actor(actor_name, namespace=ns)
     count_elems = n_bytes // 8
     method = actor.snapshot_published if mode == 'published' else actor.snapshot_fresh
-    ray.get(method.remote(1))
-    actor_init_ms = (time.perf_counter() - t_init0) * 1e3
-
     out_rows: list[dict[str, Any]] = []
+    cg_failed = False
     try:
         # 1. Detached named actor
-        samples_ms: list[float] = []
-        er_samples: list[float] = []
-        for i in range(warmup + iters):
-            exp_seq = 1 if mode == 'published' else (i + 1)
-            t0 = time.perf_counter()
-            r_seq, r_arr = ray.get(method.remote(exp_seq))
-            t_er0 = time.perf_counter()
-            total = float(r_arr.sum())
-            er_ms = (time.perf_counter() - t_er0) * 1e3
-            verify_field_result(r_seq, exp_seq, int(r_arr.size), count_elems, total)
-            del r_arr
-            dt_ms = (time.perf_counter() - t0) * 1e3
-            if i >= warmup:
-                samples_ms.append(dt_ms)
-                er_samples.append(er_ms)
-        out_rows.append({
-            'arm': 'ray-named-actor',
-            'frame_mode': mode,
-            'logical_bytes': n_bytes,
-            'actor_init_ms': round(actor_init_ms, 3),
-            'topology': 'dynamic_named_actor',
-            'extract_and_reduce_p50_ms': round(nearest_rank(er_samples, 0.50), 4),
-            'client_peak_rss_mib': peak_rss_mib(),
-            **summarize_ms(samples_ms, payload_bytes=n_bytes, bidirectional=False),
-        })
-
-        # 2. Ray Compiled Graphs (static compiled topology, release ndarray each iter)
-        ctx = DAGContext.get_current()
-        t_comp0 = time.perf_counter()
-        with InputNode() as inp:
-            dag = method.bind(inp)
-        compiled = dag.experimental_compile()
-        compile_ms = (time.perf_counter() - t_comp0) * 1e3
-        cg_ms: list[float] = []
-        cg_er: list[float] = []
         try:
+            ray.get(method.remote(1))
+            actor_init_ms = (time.perf_counter() - t_init0) * 1e3
+            samples_ms: list[float] = []
+            er_samples: list[float] = []
             for i in range(warmup + iters):
                 exp_seq = 1 if mode == 'published' else (i + 1)
                 t0 = time.perf_counter()
-                r_seq, r_arr = ray.get(compiled.execute(exp_seq))
+                r_seq, r_arr = ray.get(method.remote(exp_seq))
                 t_er0 = time.perf_counter()
                 total = float(r_arr.sum())
                 er_ms = (time.perf_counter() - t_er0) * 1e3
@@ -1947,24 +2212,84 @@ def _run_ray_field_arms(*, n_bytes: int, mode: str, warmup: int, iters: int) -> 
                 del r_arr
                 dt_ms = (time.perf_counter() - t0) * 1e3
                 if i >= warmup:
-                    cg_ms.append(dt_ms)
-                    cg_er.append(er_ms)
-        finally:
-            compiled.teardown()
-        out_rows.append({
-            'arm': 'ray-compiled-graph',
-            'frame_mode': mode,
-            'logical_bytes': n_bytes,
-            'graph_compile_ms': round(compile_ms, 3),
-            'topology': 'static_compiled_dag',
-            'cg_initial_buffer_bytes': int(ctx.buffer_size_bytes),
-            'cg_max_inflight_executions': int(ctx.max_inflight_executions),
-            'extract_and_reduce_p50_ms': round(nearest_rank(cg_er, 0.50), 4),
-            'client_peak_rss_mib': peak_rss_mib(),
-            **summarize_ms(cg_ms, payload_bytes=n_bytes, bidirectional=False),
-        })
+                    samples_ms.append(dt_ms)
+                    er_samples.append(er_ms)
+            out_rows.append({
+                'arm': 'ray-named-actor',
+                'frame_mode': mode,
+                'logical_bytes': n_bytes,
+                'actor_init_ms': round(actor_init_ms, 3),
+                'topology': 'dynamic_named_actor',
+                'extract_and_reduce_p50_ms': round(nearest_rank(er_samples, 0.50), 4),
+                'client_peak_rss_mib': peak_rss_mib(),
+                **summarize_ms(samples_ms, payload_bytes=n_bytes, bidirectional=False),
+            })
+        except BaseException as exc:
+            out_rows.append({
+                'arm': 'ray-named-actor',
+                'frame_mode': mode,
+                'logical_bytes': n_bytes,
+                'topology': 'dynamic_named_actor',
+                'status': 'error',
+                'error': repr(exc),
+            })
+
+        # 2. Ray Compiled Graphs (static compiled topology, release ndarray each iter)
+        try:
+            ctx = DAGContext.get_current()
+            t_comp0 = time.perf_counter()
+            with InputNode() as inp:
+                dag = method.bind(inp)
+            compiled = dag.experimental_compile()
+            compile_ms = (time.perf_counter() - t_comp0) * 1e3
+            cg_ms: list[float] = []
+            cg_er: list[float] = []
+            try:
+                for i in range(warmup + iters):
+                    exp_seq = 1 if mode == 'published' else (i + 1)
+                    t0 = time.perf_counter()
+                    r_seq, r_arr = ray.get(compiled.execute(exp_seq))
+                    t_er0 = time.perf_counter()
+                    total = float(r_arr.sum())
+                    er_ms = (time.perf_counter() - t_er0) * 1e3
+                    verify_field_result(r_seq, exp_seq, int(r_arr.size), count_elems, total)
+                    del r_arr
+                    dt_ms = (time.perf_counter() - t0) * 1e3
+                    if i >= warmup:
+                        cg_ms.append(dt_ms)
+                        cg_er.append(er_ms)
+            finally:
+                compiled.teardown()
+            out_rows.append({
+                'arm': 'ray-compiled-graph',
+                'frame_mode': mode,
+                'logical_bytes': n_bytes,
+                'graph_compile_ms': round(compile_ms, 3),
+                'topology': 'static_compiled_dag',
+                'cg_initial_buffer_bytes': int(ctx.buffer_size_bytes),
+                'cg_max_inflight_executions': int(ctx.max_inflight_executions),
+                'extract_and_reduce_p50_ms': round(nearest_rank(cg_er, 0.50), 4),
+                'client_peak_rss_mib': peak_rss_mib(),
+                **summarize_ms(cg_ms, payload_bytes=n_bytes, bidirectional=False),
+            })
+        except BaseException as exc:
+            cg_failed = True
+            out_rows.append({
+                'arm': 'ray-compiled-graph',
+                'frame_mode': mode,
+                'logical_bytes': n_bytes,
+                'topology': 'static_compiled_dag',
+                'status': 'error',
+                'error': repr(exc),
+            })
     finally:
-        ray.kill(actor)
+        try:
+            ray.kill(actor)
+        except Exception:
+            pass
+        if cg_failed or n_bytes >= 256 * MIB:
+            _shutdown_ray_if_running()
+        gc.collect()
     return out_rows
 
 
@@ -2031,7 +2356,11 @@ def run_benchmark(
     os.environ['C2_ENV_FILE'] = ''
     os.environ['C2_RELAY_ANCHOR_ADDRESS'] = ''
     resolved_c3 = c3_bin or shutil.which('c3')
-    selected = ['stages', 'coupling', 'field', 'fanout', 'pubsub_fanout', 'kostya'] if suite == 'all' else [suite]
+    selected = (
+        ['stages', 'coupling', 'field', 'migration', 'fanout', 'pubsub_fanout', 'kostya']
+        if suite == 'all'
+        else [suite]
+    )
     results: dict[str, Any] = {}
     try:
         for name in selected:
@@ -2041,6 +2370,8 @@ def run_benchmark(
                 results['coupling'] = run_coupling_suite(smoke=smoke, include_ray=include_ray)
             elif name == 'field':
                 results['field'] = run_field_suite(smoke=smoke, include_ray=include_ray, c3_bin=resolved_c3)
+            elif name == 'migration':
+                results['migration'] = run_migration_suite(smoke=smoke, include_ray=include_ray)
             elif name == 'fanout':
                 results['fanout'] = run_fanout_suite(smoke=smoke, c3_bin=resolved_c3)
             elif name == 'pubsub_fanout':
@@ -2066,7 +2397,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description='Reproducible FastDB Payload, server stream, and topic benchmark.')
     parser.add_argument(
         '--suite',
-        choices=('stages', 'coupling', 'field', 'fanout', 'pubsub_fanout', 'kostya', 'all'),
+        choices=('stages', 'coupling', 'field', 'migration', 'fanout', 'pubsub_fanout', 'kostya', 'all'),
         default='all',
     )
     parser.add_argument('--smoke', action='store_true', help='Run small fast sizes for verification.')

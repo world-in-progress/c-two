@@ -66,7 +66,7 @@ finally:
     cc.shutdown()
 ```
 
-可移植方法在每个方向携带零个或一个 `Payload` 封套；C-Two 将每个嵌套规格作为不透明 JSON 值嵌入，且不重新解释它。没有明确绑定的方法仍可使用普通 Python 值进行仅限 Python 的原型开发，但可移植描述符导出与代码生成会诊断并拒绝这些方法。
+可移植方法在每个方向携带零个或一个 `Payload` 封套；C-Two 将每个嵌套规格作为不透明 JSON 值嵌入，且不重新解释它。在发送侧（客户端请求、unary 返回值、`@cc.stream` 产出项与 `Publisher.publish(...)`），既可传入已构建的 `Payload`，也可直接传入冻结后的 `fastdb4py.payload.BuildPlan`（资源方法可将返回类型注解为 `BuildPlan`、`Payload | BuildPlan` 或 `Iterator[BuildPlan]`）。经 IPC SHM 传输时，满足直写条件的 `BuildPlan` 会直接写入 C-Two 的 `WritableSlab` 共享内存块，无需中间暂存拷贝。没有明确绑定的方法仍可使用普通 Python 值进行仅限 Python 的原型开发，但可移植描述符导出与代码生成会诊断并拒绝这些方法。
 
 经 IPC 或 relay HTTP 调用时，`cc.hold(echo.echo)(source)` 将解码后的响应保留为 `HeldResult`，它持有一份本地副本：复制完成后传输内存就已释放，所以 hold 不会占住服务端的共享内存。显式 `release()` 让载荷所有者失效一次，再释放本地副本；失效操作不会重放，此后该值不可访问。如果导出被拒绝，先释放额外导出的 memoryview 再重试；拒绝发生在失效操作之前。在同进程直调路径（注册同一 Runtime 且省略 `address`）上，`cc.hold()` 只返回包装原 Python 对象的 `HeldResult(result)`，不经过传输复制，释放包装也不会使原 FastDB 对象失效或计入 `holds`。手工构造的 `HeldResult(release_cb=...)` 回调仍只运行一次。常规作用域使用 `with cc.hold(method)(args) as held`，需要超出作用域存活的值应实体化。
 
@@ -110,7 +110,7 @@ server = session.ensure_server_bridge()
 
 ## 载荷生命周期
 
-已经证实的远程可移植接收路径打开的是**由副本支持**的载荷所有者。经远程传输时，`cc.hold()` 是生命周期契约，不构成零拷贝声明：它一同保留响应的本地副本与载荷所有者，并保证释放本地副本*之前*，先让载荷所有者及其受检查的视图失效（同进程直调路径上，`cc.hold()` 只用 `HeldResult(result)` 包装原 Python 对象，没有传输副本也不会触发 FastDB 失效）。
+经远程传输接收时，C-Two 会将收到的 SHM 或重组帧一次性复制到温池复用的本地缓冲区并立即归还传输借出（ADR 0001），随后通过 `Payload.open_external` / `ExternalBytes` 直接在该本地副本上打开 FastDB `Payload`，不再产生二次解码拷贝。`cc.hold()` 是生命周期契约：它一同保留响应的本地副本与载荷所有者，并保证释放或回收本地副本*之前*，先让载荷所有者及其受检查的视图失效（同进程直调路径上，`cc.hold()` 只用 `HeldResult(result)` 包装原 Python 对象，没有传输副本也不会触发 FastDB 失效）。
 
 ```python
 with cc.connect(Echo, name='echo', address=cc.server_address()) as echo:
