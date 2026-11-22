@@ -93,6 +93,9 @@ DATA = bytes(range(256)) * 4096
 
 @cc.crm(namespace="ci.installed-wheels", version="1.0.0")
 class Echo:
+    @cc.transfer(input=SPEC)
+    def push(self, payload: Payload) -> None: ...
+
     @cc.transfer(output=SPEC)
     def pull(self) -> Payload: ...
 
@@ -102,6 +105,10 @@ class Echo:
 class Resource:
     def __init__(self):
         self.inputs = []
+
+    def push(self, payload: Payload) -> None:
+        inspect(payload).close()
+        return None
 
     def pull(self) -> Payload:
         return build()
@@ -177,17 +184,17 @@ if sys.argv[1] == "host":
                 input_lifetime={"echo":"borrowed"})
     emit({**facts, "address":cc.server_address(), "status":"ready"})
     try:
+        assert sys.stdin.readline().strip() == "sample_direct_push"
+        direct_push_server = memory_stats()["server"]
+        direct_push_peak = direct_push_server["memory"]["peak_bytes"]
+        direct_push_spill = direct_push_server["file_spill"]["peak_bytes"]
+        assert len(DATA) <= direct_push_peak < 2 * len(DATA) and direct_push_spill == 0, direct_push_server
+        emit({"status":"direct_push_sampled", "server_push_peak_bytes":direct_push_peak,
+              "server_push_spill_peak_bytes":direct_push_spill})
         assert sys.stdin.readline().strip() == "sample_direct_pull"
         direct_pull_peak = memory_stats()["server"]["memory"]["peak_bytes"]
         assert direct_pull_peak >= len(DATA), direct_pull_peak
         emit({"status":"direct_pull_sampled", "server_pull_peak_bytes":direct_pull_peak})
-        assert sys.stdin.readline().strip() == "sample_direct_echo"
-        direct_echo_server = memory_stats()["server"]
-        direct_echo_peak = direct_echo_server["memory"]["peak_bytes"]
-        direct_echo_spill = direct_echo_server["file_spill"]["peak_bytes"]
-        assert len(DATA) <= direct_echo_peak < 2 * len(DATA) and direct_echo_spill == 0, direct_echo_server
-        emit({"status":"direct_echo_sampled", "server_echo_peak_bytes":direct_echo_peak,
-              "server_echo_spill_peak_bytes":direct_echo_spill})
         assert sys.stdin.readline().strip() == "stop"
         invalidated = resource.verify_borrowed_inputs()
         server_peak = memory_stats()["server"]["memory"]["peak_bytes"]
@@ -196,6 +203,23 @@ if sys.argv[1] == "host":
         cc.shutdown()
     emit({"status":"stopped", "borrowed_inputs_invalidated":invalidated,
           "server_memory_peak_bytes":server_peak})
+elif sys.argv[1] == "push":
+    cc.set_client(memory_budget_bytes=32 * 1024 * 1024)
+    source = build()
+    proxy = cc.connect(Echo, name="wheel-echo", address=sys.argv[2])
+    try:
+        assert proxy.client._mode == "ipc"
+        assert proxy.push(source) is None
+        stats = memory_stats()
+        client_push_peak = stats["client"]["memory"]["peak_bytes"]
+        assert client_push_peak >= 2 * len(DATA), stats
+        emit({**facts, "status":"passed", "transport":"direct_push",
+              "observed_mode":proxy.client._mode, "payload_bytes":len(DATA),
+              "client_push_peak_bytes":client_push_peak})
+    finally:
+        cc.close(proxy)
+        source.close()
+        cc.shutdown()
 elif sys.argv[1] == "pull":
     cc.set_client(memory_budget_bytes=32 * 1024 * 1024)
     proxy = cc.connect(Echo, name="wheel-echo", address=sys.argv[2])
@@ -384,7 +408,7 @@ def require_direct_shm_evidence(
     pull_client: dict[str, object],
     pull_host: dict[str, object],
     direct_client: dict[str, object],
-    echo_host: dict[str, object],
+    push_host: dict[str, object],
     payload_bytes: int,
 ) -> dict[str, int]:
     if pull_client.get("client_pull_peak_bytes") != 0 or pull_client.get("client_spill_peak_bytes") != 0:
@@ -395,21 +419,21 @@ def require_direct_shm_evidence(
             f"server_pull_peak_bytes={server_pull_peak!r}, expected at least {payload_bytes} bytes"
         )
     client_echo_peak = require_memory_peak(direct_client, "client", 2 * payload_bytes)
-    server_echo_peak = echo_host.get("server_echo_peak_bytes")
-    server_echo_spill = echo_host.get("server_echo_spill_peak_bytes")
-    if (type(server_echo_peak) is not int
-            or not (payload_bytes <= server_echo_peak < 2 * payload_bytes)
-            or server_echo_spill != 0):
+    server_push_peak = push_host.get("server_push_peak_bytes")
+    server_push_spill = push_host.get("server_push_spill_peak_bytes")
+    if (type(server_push_peak) is not int
+            or not (payload_bytes <= server_push_peak < 2 * payload_bytes)
+            or server_push_spill != 0):
         raise RuntimeError(
-            f"direct echo fell back to server reassembly: peak={server_echo_peak!r}, spill={server_echo_spill!r}"
+            f"direct push fell back to server reassembly: peak={server_push_peak!r}, spill={server_push_spill!r}"
         )
     return {
+        "server_push_peak_bytes": server_push_peak,
+        "server_push_spill_peak_bytes": 0,
         "server_pull_peak_bytes": server_pull_peak,
         "client_pull_peak_bytes": 0,
         "client_spill_peak_bytes": 0,
         "client_echo_peak_bytes": client_echo_peak,
-        "server_echo_peak_bytes": server_echo_peak,
-        "server_echo_spill_peak_bytes": 0,
     }
 
 
@@ -576,6 +600,18 @@ def main() -> int:
                     if ready.get("status") != "ready":
                         raise RuntimeError(f"Host not ready: {ready}")
                     receipt["host"] = ready
+                    push_result = read_result(run([str(python), str(script), "push", ready["address"], str(inputs)],
+                                                  work, environment))
+                    if push_result.get("status") != "passed" or push_result["pid"] == ready["pid"]:
+                        raise RuntimeError(f"Invalid direct push consumer: {push_result}")
+                    for info in (fastdb_info, ctwo_info):
+                        if push_result["versions"][info["distribution"]] != info["version"]:
+                            raise RuntimeError(f"Installed version differs from wheel: {push_result}")
+                    host.stdin.write("sample_direct_push\n")
+                    host.stdin.flush()
+                    push_sampled = host_result(messages, host_log, timeout=5)
+                    if push_sampled.get("status") != "direct_push_sampled":
+                        raise RuntimeError(f"Host direct push sample failed: {push_sampled}")
                     pull_result = read_result(run([str(python), str(script), "pull", ready["address"], str(inputs)],
                                                   work, environment))
                     if pull_result.get("status") != "passed" or pull_result["pid"] == ready["pid"]:
@@ -589,7 +625,6 @@ def main() -> int:
                     if pull_sampled.get("status") != "direct_pull_sampled":
                         raise RuntimeError(f"Host direct pull sample failed: {pull_sampled}")
                     direct_result: dict[str, object] | None = None
-                    echo_sampled: dict[str, object] | None = None
                     for mode, address in [("direct", ready["address"]), ("relay", url)]:
                         result = read_result(run([str(python), str(script), "client", address, mode, str(inputs)],
                                                  work, environment))
@@ -601,15 +636,10 @@ def main() -> int:
                         if mode == "direct":
                             direct_payload_bytes = result["payload_bytes"]
                             direct_result = result
-                            host.stdin.write("sample_direct_echo\n")
-                            host.stdin.flush()
-                            echo_sampled = host_result(messages, host_log, timeout=5)
-                            if echo_sampled.get("status") != "direct_echo_sampled":
-                                raise RuntimeError(f"Host direct echo sample failed: {echo_sampled}")
                         receipt["checks"].append(result)
-                    assert direct_result is not None and echo_sampled is not None
+                    assert direct_result is not None
                     receipt["direct_shm_evidence"] = require_direct_shm_evidence(
-                        pull_result, pull_sampled, direct_result, echo_sampled, direct_payload_bytes,
+                        pull_result, pull_sampled, direct_result, push_sampled, direct_payload_bytes,
                     )
                     host.stdin.write("stop\n")
                     host.stdin.flush()

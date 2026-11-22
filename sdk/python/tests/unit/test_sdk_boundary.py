@@ -544,7 +544,7 @@ def test_native_route_contract_boundaries_have_no_empty_defaults_or_raw_calls():
     call = _rust_compact(_rust_function(client_source, 'call'))
     take = _rust_compact(_rust_function(core_ffi, 'take'))
     clone = _rust_compact(_rust_function(core_ffi, 'client'))
-    assert 'self.begin_call(py,method_name)?.call(py,data)' in call
+    assert 'self.begin_call(py,method_name)?.call(py,data,false)' in call
     assert 'self.inner.lock().take()' in take
     assert 'self.inner.lock().clone()' in clone
     for source in (core_ffi, runtime_session):

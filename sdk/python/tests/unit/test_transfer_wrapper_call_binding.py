@@ -348,6 +348,7 @@ def test_stream_keyword_only_argument_is_rejected_with_the_original_message():
 
 def test_stream_resource_direction_uses_the_frozen_arity():
     from collections.abc import Iterator
+    from c_two.crm.payload_plan import DEFAULT_PICKLE_PROTOCOL
 
     def items(self, n, offset=0) -> Iterator[int]:
         ...
@@ -360,9 +361,9 @@ def test_stream_resource_direction_uses_the_frozen_arity():
 
     contract = type("Contract", (), {"direction": "<-", "resource": Resource()})()
 
-    payload = pickle.dumps((2, 1))
+    payload = pickle.dumps((2, 1), protocol=DEFAULT_PICKLE_PROTOCOL)
     resource_stream = wrapped(contract, payload)
-    assert resource_stream.step() == (True, pickle.dumps(0))
-    assert resource_stream.step() == (True, pickle.dumps(1))
-    assert resource_stream.step() == (True, pickle.dumps(2))
+    assert resource_stream.step() == (True, pickle.dumps(0, protocol=DEFAULT_PICKLE_PROTOCOL))
+    assert resource_stream.step() == (True, pickle.dumps(1, protocol=DEFAULT_PICKLE_PROTOCOL))
+    assert resource_stream.step() == (True, pickle.dumps(2, protocol=DEFAULT_PICKLE_PROTOCOL))
     assert resource_stream.step() == (False, None)

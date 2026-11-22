@@ -84,41 +84,41 @@ def test_direct_shm_evidence_rejects_inline_fallback_and_input_only_peaks():
     smoke = load_smoke()
     payload = 1024 * 1024
     pull_client = {"client_pull_peak_bytes": 0, "client_spill_peak_bytes": 0}
-    pull_host = {"server_pull_peak_bytes": payload}
+    pull_host = {"server_pull_peak_bytes": 2 * payload}
     direct_client = {"client_memory_peak_bytes": 2 * payload}
-    echo_host = {"server_echo_peak_bytes": payload + 16384, "server_echo_spill_peak_bytes": 0}
+    push_host = {"server_push_peak_bytes": payload + 16384, "server_push_spill_peak_bytes": 0}
     assert smoke.require_direct_shm_evidence(
-        pull_client, pull_host, direct_client, echo_host, payload,
+        pull_client, pull_host, direct_client, push_host, payload,
     ) == {
-        "server_pull_peak_bytes": payload,
+        "server_push_peak_bytes": payload + 16384,
+        "server_push_spill_peak_bytes": 0,
+        "server_pull_peak_bytes": 2 * payload,
         "client_pull_peak_bytes": 0,
         "client_spill_peak_bytes": 0,
         "client_echo_peak_bytes": 2 * payload,
-        "server_echo_peak_bytes": payload + 16384,
-        "server_echo_spill_peak_bytes": 0,
     }
     with pytest.raises(RuntimeError, match="reassembly"):
         smoke.require_direct_shm_evidence(
-            {**pull_client, "client_pull_peak_bytes": payload}, pull_host, direct_client, echo_host, payload,
+            {**pull_client, "client_pull_peak_bytes": payload}, pull_host, direct_client, push_host, payload,
         )
     with pytest.raises(RuntimeError, match="server_pull_peak_bytes"):
         smoke.require_direct_shm_evidence(
-            pull_client, {"server_pull_peak_bytes": 0}, direct_client, echo_host, payload,
+            pull_client, {"server_pull_peak_bytes": 0}, direct_client, push_host, payload,
         )
     with pytest.raises(RuntimeError, match="client_memory_peak_bytes"):
         smoke.require_direct_shm_evidence(
-            pull_client, pull_host, {"client_memory_peak_bytes": payload + 512}, echo_host, payload,
+            pull_client, pull_host, {"client_memory_peak_bytes": payload + 512}, push_host, payload,
         )
     # Reservation succeeded on client (>= 2 MiB), mmap failed, request fell back to chunks:
-    with pytest.raises(RuntimeError, match="direct echo fell back to server reassembly"):
+    with pytest.raises(RuntimeError, match="direct push fell back to server reassembly"):
         smoke.require_direct_shm_evidence(
             pull_client, pull_host, direct_client,
-            {"server_echo_peak_bytes": 2 * payload, "server_echo_spill_peak_bytes": 0}, payload,
+            {"server_push_peak_bytes": 2 * payload, "server_push_spill_peak_bytes": 0}, payload,
         )
-    with pytest.raises(RuntimeError, match="direct echo fell back to server reassembly"):
+    with pytest.raises(RuntimeError, match="direct push fell back to server reassembly"):
         smoke.require_direct_shm_evidence(
             pull_client, pull_host, direct_client,
-            {"server_echo_peak_bytes": payload, "server_echo_spill_peak_bytes": payload}, payload,
+            {"server_push_peak_bytes": payload, "server_push_spill_peak_bytes": payload}, payload,
         )
 
 
