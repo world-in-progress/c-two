@@ -24,7 +24,7 @@ C-Two 是为有状态资源设计的 RPC 框架，主要用于分布式科学计
 
 **CRM 契约**声明可调用的方法以及 namespace、version；**resource** 是实现这些方法并持有状态的普通类；**client** 通过 `cc.connect(...)` 获得类型化代理。一个进程可以同时承载多个资源，并连接其他资源。名字取自 *CRM to Call*（Core Resource Model to Call），意思是有状态的资源通过它的 CRM 被其他进程和机器调用。
 
-**C-Two 0.11.0** 支持 Python 3.10+。普通调用无 Python 运行时依赖；FastDB 载荷使用 `c-two[fastdb]`（已发布的 0.11.0 对应 `fastdb4py==0.2.4`，当前源码对应 `fastdb4py==0.3.0`）。本版本升级到 IPC **16**、SHM **4**、C/FFI ABI **8** 与 relay mesh **7**，引入单一属主共享内存释放、服务端流（同进程、直接 IPC 与 relay HTTP）、路由名身份、按角色划分的 `(M, F, N)` 预算域、基于 Rust Core 的 Node 客户端以及收敛后的错误体系。见 [0.11.0 更新与迁移说明](docs/releases/0.11.0.md)。当前源码新增资源归属的发布/订阅主题，并为拟定中的 0.12.0 线升级到 IPC **17** / C/FFI ABI **9** / FastDB **0.3.0**；见[未发布说明](docs/releases/unreleased.md)。
+**C-Two 0.12.0** 支持 Python 3.10+。普通调用无 Python 运行时依赖；FastDB 载荷使用 `c-two[fastdb]`（`fastdb4py==0.3.0`）。本版本升级到 IPC **17**、SHM **4**、C/FFI ABI **9** 与 relay mesh **7**，引入资源归属的发布/订阅主题（同机封存 SHM 扇出与单跳/两级 `c3 relay` HTTP 扇出）以及统一的 `WritableSlab` + FastDB `0.3.0` 零拷贝载荷通道（单向 SHM 拷贝下界降至 2 次）。见 [0.12.0 更新与迁移说明](docs/releases/0.12.0.md)。
 
 ## 有状态 RPC 有什么不同
 
@@ -59,12 +59,12 @@ uv pip install 'c-two[fastdb]'
 Windows PowerShell 使用相同命令。Linux、macOS 的 c3 安装命令：
 
 ```bash
-curl -fsSL https://github.com/world-in-progress/c-two/releases/download/c3-v0.7.0/c3-installer.sh | sh -s -- --version 0.7.0
+curl -fsSL https://github.com/world-in-progress/c-two/releases/download/c3-v0.8.0/c3-installer.sh | sh -s -- --version 0.8.0
 ```
 
-Windows x64 或 ARM64 使用 [x64 可执行文件](https://github.com/world-in-progress/c-two/releases/download/c3-v0.7.0/c3-x86_64-pc-windows-msvc.exe)、[ARM64 可执行文件](https://github.com/world-in-progress/c-two/releases/download/c3-v0.7.0/c3-aarch64-pc-windows-msvc.exe)或 [PowerShell 安装器](https://github.com/world-in-progress/c-two/releases/download/c3-v0.7.0/c3-installer.ps1)。安装与校验步骤见 [Windows 指南](docs/reference/windows-native-usage.zh-CN.md#安装-python-包和-c3)。
+Windows x64 或 ARM64 使用 [x64 可执行文件](https://github.com/world-in-progress/c-two/releases/download/c3-v0.8.0/c3-x86_64-pc-windows-msvc.exe)、[ARM64 可执行文件](https://github.com/world-in-progress/c-two/releases/download/c3-v0.8.0/c3-aarch64-pc-windows-msvc.exe)或 [PowerShell 安装器](https://github.com/world-in-progress/c-two/releases/download/c3-v0.8.0/c3-installer.ps1)。安装与校验步骤见 [Windows 指南](docs/reference/windows-native-usage.zh-CN.md#安装-python-包和-c3)。
 
-C3 0.7.0 配合 C-Two 0.11.x 使用。IPC 16、SHM 4、C/FFI ABI 8 与 relay mesh 7 与 0.10.x（IPC 14、SHM 3、ABI 6、mesh 6）的对端无法互通，因此同一主机上的 Python 与 Rust SDK、c3 和 Node 使用方，以及同一 mesh 内互通的 relay，都要一起升级并重新生成契约客户端；先停止旧服务，再升级并重启。Unix 端点命名空间格式 3 与凭据 schema 4 保持不变。见 [0.11.0 迁移说明](docs/releases/0.11.0.md)、[握手规范](docs/reference/ipc-handshake.md)和[端点生命周期指南](docs/reference/local-endpoint-lifecycle.md)。当前源码的 IPC 17 与 C/FFI ABI 9 同样经固定版本前导拒绝 0.11.0 对端；其变更汇总见[未发布说明](docs/releases/unreleased.md)。
+C3 0.8.0 配合 C-Two 0.12.x 使用。IPC 17、SHM 4、C/FFI ABI 9 与 relay mesh 7 与 0.11.x（IPC 16、ABI 8）及更早版本的对端无法互通，因此同一主机上的 Python 与 Rust SDK、c3 和 Node 使用方，以及同一 mesh 内互通的 relay，都要一起升级并重新生成契约客户端；先停止旧服务，再升级并重启。Unix 端点命名空间格式 3 与凭据 schema 4 保持不变。见 [0.12.0 迁移说明](docs/releases/0.12.0.md)、[握手规范](docs/reference/ipc-handshake.md)和[端点生命周期指南](docs/reference/local-endpoint-lifecycle.md)。
 
 源码构建需要 Rust 1.95 或更新版本；构建与测试见[开发指南](docs/reference/development.md)。
 
