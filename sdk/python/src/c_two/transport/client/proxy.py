@@ -722,12 +722,16 @@ class _PreparedClient:
     """One caller-thread serialization followed by the reserved Core call."""
 
     __slots__ = ('_prepared',)
+    _supports_release_input = True
 
     def __init__(self, prepared):
         self._prepared = prepared
 
-    def call(self, method_name, data=None):
-        return _native_call(self._prepared.call, data if data is not None else b'')
+    def call(self, method_name, data=None, *, release_input: bool = False):
+        payload = data if data is not None else b''
+        if release_input:
+            return _native_call(self._prepared.call, payload, release_input=True)
+        return _native_call(self._prepared.call, payload)
 
     def charge_input(self, nbytes):
         return _native_call(self._prepared.charge_input, nbytes)
@@ -745,6 +749,7 @@ class _PreparedStream:
     """
 
     __slots__ = ('_prepared',)
+    _supports_release_input = True
 
     def __init__(self, prepared):
         self._prepared = prepared
@@ -752,8 +757,11 @@ class _PreparedStream:
     def charge_input(self, nbytes):
         return _native_call(self._prepared.charge_input, nbytes)
 
-    def stream(self, data=None):
-        return _native_call(self._prepared.stream, data if data is not None else b'')
+    def stream(self, data=None, *, release_input: bool = False):
+        payload = data if data is not None else b''
+        if release_input:
+            return _native_call(self._prepared.stream, payload, release_input=True)
+        return _native_call(self._prepared.stream, payload)
 
     def close(self):
         self._prepared.close()

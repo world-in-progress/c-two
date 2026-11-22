@@ -396,7 +396,11 @@ def _build_stream_wrapper(func, input_binding, output_binding):
             try:
                 direct_values = values
                 if fastdb_input:
-                    direct_values = (_materialize_direct_plan(values[0], input_binding),)
+                    try:
+                        direct_values = (_materialize_direct_plan(values[0], input_binding),)
+                    except BaseException as exc:
+                        from .transferable import _client_input_error
+                        raise _client_input_error(exc) from exc
                 native = client.open_direct_stream(method_name, direct_values, output=output_binding)
             except Exception as exc:
                 from ..transport.client.proxy import _LocalRouteClosed
@@ -429,8 +433,16 @@ def _build_stream_wrapper(func, input_binding, output_binding):
                 except BaseException as exc:
                     raise _client_input_error(exc) from exc
                 dispatched = True
+                release_view_in_native = (
+                    fastdb_input
+                    and isinstance(data, memoryview)
+                    and getattr(prepared, '_supports_release_input', False)
+                )
                 try:
-                    unclaimed = _native_call(prepared.stream, data)
+                    if release_view_in_native:
+                        unclaimed = _native_call(prepared.stream, data, release_input=True)
+                    else:
+                        unclaimed = _native_call(prepared.stream, data)
                 except error.CCBaseError:
                     raise
                 except Exception as exc:

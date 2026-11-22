@@ -12,7 +12,7 @@ uv pip install 'c-two==0.11.0'
 uv pip install 'c-two[fastdb]==0.11.0'
 ```
 
-The base package has no Python runtime dependencies. Ordinary CRM definition, registration, direct/IPC/relay calls and errors do not load FastDB or NumPy. The `fastdb` extra pins `fastdb4py==0.3.0`; using FastDB payloads without it reports the extra to install. The exact pin selects the validated 0.x binding instead of allowing an untested later native interface.
+The base package has no Python runtime dependencies. Ordinary CRM definition, registration, direct/IPC/relay calls and errors do not load FastDB or NumPy. The `fastdb` extra pins `fastdb4py==0.2.4` on published 0.11.0 and `fastdb4py==0.3.0` on current source (planned 0.12.0); using FastDB payloads without it reports the extra to install. The exact pin selects the validated 0.x binding instead of allowing an untested later native interface.
 
 Local IPC uses Unix domain sockets or TokenUser-scoped Windows Named Pipes. Unix roots select the final endpoint directory, with short names and directory-relative connections. Rust owns structured shutdown and scoped maintenance. Install matching builds across communicating clients, resource servers and c3. See the [lifecycle guide](https://github.com/world-in-progress/c-two/blob/main/docs/reference/local-endpoint-lifecycle.md).
 

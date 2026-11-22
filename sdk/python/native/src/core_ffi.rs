@@ -139,6 +139,7 @@ impl PyNativePreparedCall {
         &self,
         py: Python<'_>,
         data: &Bound<'_, PyAny>,
+        release_input: bool,
         finish: impl FnOnce(c2_core::EncodedCall) -> Result<R, c2_core::Error> + Send,
     ) -> PyResult<R> {
         let mut prepared = py.detach(|| self.take()).ok_or_else(|| {
@@ -182,6 +183,9 @@ impl PyNativePreparedCall {
                 slab = write_deferred_slab(data, slab)?;
             } else {
                 checked_buffer(data, nbytes)?.copy_to_slice(py, slab.as_mut_slice())?;
+                if release_input {
+                    data.call_method0("release")?;
+                }
             }
             return py
                 .detach(move || prepared.encode_slab(slab).and_then(finish))
@@ -190,7 +194,11 @@ impl PyNativePreparedCall {
         let request = if plan_len.is_some() {
             materialize_deferred_plan(data, nbytes)?
         } else {
-            snapshot_python_buffer(py, &checked_buffer(data, nbytes)?)?
+            let bytes = snapshot_python_buffer(py, &checked_buffer(data, nbytes)?)?;
+            if release_input {
+                data.call_method0("release")?;
+            }
+            bytes
         };
         py.detach(move || prepared.encode_vec(request).and_then(finish))
             .map_err(core_error_to_py)
@@ -214,17 +222,25 @@ impl PyNativePreparedCall {
             .map_err(core_error_to_py)
     }
 
-    fn call(&self, py: Python<'_>, data: &Bound<'_, PyAny>) -> PyResult<PyCoreResponse> {
-        self.execute(py, data, c2_core::EncodedCall::call_held)
+    #[pyo3(signature = (data, *, release_input = false))]
+    fn call(
+        &self,
+        py: Python<'_>,
+        data: &Bound<'_, PyAny>,
+        release_input: bool,
+    ) -> PyResult<PyCoreResponse> {
+        self.execute(py, data, release_input, c2_core::EncodedCall::call_held)
             .map(PyCoreResponse::new)
     }
 
+    #[pyo3(signature = (data, *, release_input = false))]
     fn stream(
         &self,
         py: Python<'_>,
         data: &Bound<'_, PyAny>,
+        release_input: bool,
     ) -> PyResult<crate::stream_ffi::PyCoreResponseStream> {
-        self.execute(py, data, c2_core::EncodedCall::stream)
+        self.execute(py, data, release_input, c2_core::EncodedCall::stream)
             .map(crate::stream_ffi::PyCoreResponseStream::new)
     }
 
@@ -352,7 +368,7 @@ impl PyCoreClient {
         method_name: &str,
         data: &Bound<'_, PyAny>,
     ) -> PyResult<PyCoreResponse> {
-        self.begin_call(py, method_name)?.call(py, data)
+        self.begin_call(py, method_name)?.call(py, data, false)
     }
 
     /// Subscribe to a topic declared on this client's bound route contract.

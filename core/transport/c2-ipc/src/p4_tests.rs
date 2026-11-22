@@ -1639,7 +1639,7 @@ async fn materialization_failure_is_uncertain_and_refunds_local_backing_once() {
     ));
     let mut backing = c2_wire::chunk::ReassemblyBacking::admit(pool, 1, 4096).unwrap();
     backing.release();
-    let error = owned_response(Ok(ResponseData::Handle(backing))).unwrap_err();
+    let error = owned_response(Ok(ResponseData::Handle(backing)), &budget).unwrap_err();
     assert!(matches!(error, IpcError::ResponseFailure(_)));
     assert_eq!(
         crate::sync_client::call_error_phase(&error),

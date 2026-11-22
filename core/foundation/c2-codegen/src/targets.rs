@@ -1510,7 +1510,11 @@ fn render_python_direction(
              \x20   except BaseException as exc:\n\
              \x20       raise _serialization_error({from_buffer_code}, exc) from exc\n\
              \x20   try:\n\
-             \x20       payload = Payload.open_copy(spec, data)\n\
+             \x20       if len(data) > 268435456:\n\
+             \x20           from fastdb4py.payload import OpenOptions\n\
+             \x20           payload = Payload.open_copy(spec, data, OpenOptions(max_total_bytes=len(data)))\n\
+             \x20       else:\n\
+             \x20           payload = Payload.open_copy(spec, data)\n\
              \x20   except BaseException as exc:\n\
              \x20       raise _serialization_error({from_buffer_code}, exc) from exc\n\
              \x20   try:\n\
@@ -1559,7 +1563,11 @@ fn render_python_topic_value(output: &mut String, topic: &TargetTopic<'_>) {
          \x20   except BaseException as exc:\n\
          \x20       raise _serialization_error(ErrorCode.ClientOutputFromBuffer, exc) from exc\n\
          \x20   try:\n\
-         \x20       payload = Payload.open_copy(spec, data)\n\
+         \x20       if len(data) > 268435456:\n\
+         \x20           from fastdb4py.payload import OpenOptions\n\
+         \x20           payload = Payload.open_copy(spec, data, OpenOptions(max_total_bytes=len(data)))\n\
+         \x20       else:\n\
+         \x20           payload = Payload.open_copy(spec, data)\n\
          \x20   except BaseException as exc:\n\
          \x20       raise _serialization_error(ErrorCode.ClientOutputFromBuffer, exc) from exc\n\
          \x20   try:\n\

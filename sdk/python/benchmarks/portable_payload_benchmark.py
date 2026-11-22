@@ -184,6 +184,9 @@ def expected_field_sum(count: int, seq: int) -> float:
 def stamp_field_array(base: np.ndarray, seq: int) -> np.ndarray:
     arr = base.copy()
     arr[0] = seq + 0.5
+    # Freeze the stamped frame read-only so FastDB ExternalBytes(arr) borrows
+    # the buffer zero-copy instead of snapshotting a writable ndarray.
+    arr.setflags(write=False)
     return arr
 
 
@@ -2020,7 +2023,7 @@ def _run_ray_migration_arm(*, chunk_bytes: int, chunks: int, mode: str) -> dict[
             'client_live_rss_after_mib': rss_after_before_gc,
             'client_peak_rss_mib': peak_rss_mib(),
         }
-    except BaseException as exc:
+    except (ray.exceptions.RayError, MemoryError, OSError) as exc:
         return {
             'arm': 'ray-actor-stream-migration',
             'frame_mode': mode,
@@ -2224,7 +2227,7 @@ def _run_ray_field_arms(*, n_bytes: int, mode: str, warmup: int, iters: int) -> 
                 'client_peak_rss_mib': peak_rss_mib(),
                 **summarize_ms(samples_ms, payload_bytes=n_bytes, bidirectional=False),
             })
-        except BaseException as exc:
+        except (ray.exceptions.RayError, MemoryError, OSError) as exc:
             out_rows.append({
                 'arm': 'ray-named-actor',
                 'frame_mode': mode,
@@ -2272,7 +2275,7 @@ def _run_ray_field_arms(*, n_bytes: int, mode: str, warmup: int, iters: int) -> 
                 'client_peak_rss_mib': peak_rss_mib(),
                 **summarize_ms(cg_ms, payload_bytes=n_bytes, bidirectional=False),
             })
-        except BaseException as exc:
+        except (ray.exceptions.RayError, MemoryError, OSError) as exc:
             cg_failed = True
             out_rows.append({
                 'arm': 'ray-compiled-graph',

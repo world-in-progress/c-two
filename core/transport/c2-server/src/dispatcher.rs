@@ -240,11 +240,15 @@ impl RequestData {
             Self::Inline(data) => data,
             Self::Shm(carrier) => return carrier.into_recycled_bytes(budget, memory),
             Self::Handle(mut backing) => {
+                let mut bytes = budget
+                    .allocate_vec(backing.len())
+                    .map_err(|error| format!("request copy allocation failed: {error}"))?;
                 let copied = backing
-                    .copy_bytes()
+                    .with_slice(|source| bytes.extend_from_slice(source))
                     .map_err(|error| format!("request handle copy failed: {error}"));
                 backing.release();
-                copied?
+                copied?;
+                bytes
             }
         };
         Ok((RecycledBytes::new(bytes, budget.clone()), memory))

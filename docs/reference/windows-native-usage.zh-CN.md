@@ -6,7 +6,7 @@
 
 该后端使用字节模式 Named Pipe 传输 `ipc://` 控制流量，并使用具名文件映射存放共享载荷内存。它跨登录会话使用进程的 TokenUser SID。同一会话的对端可以使用 SHM；不同会话使用自有缓冲区、内联或分片传输。原生连接在发送数据前要求用户一致，且服务端完整性级别至少为 Medium。普通 SDK 代码继续使用逻辑 `ipc://` 地址；不要在 SDK 中构造管道或映射名称。HTTP relay 仍提供网络传输路径。
 
-本指南涵盖 Windows x64 和 ARM64 上的 Python C-Two **0.11.0**、c3 **0.7.0** 和 FastDB **0.3.0**。请配套安装对应版本的 Python 包与 c3；端点行为见 [0.11.0 迁移说明](../releases/0.11.0.md)和[生命周期指南](local-endpoint-lifecycle.md)。当前源码树另外升级到 IPC **17** 与 C/FFI ABI **9**，并新增资源归属的发布/订阅主题（见[未发布说明](../releases/unreleased.md)）；源码使用方需一起构建、一起升级，IPC 16 与 IPC 17 对端经固定版本前导互相拒绝。
+本指南涵盖 Windows x64 和 ARM64 上已发布的 Python C-Two **0.11.0**、c3 **0.7.0** 和 FastDB **0.2.4**。请配套安装对应版本的 Python 包与 c3；端点行为见 [0.11.0 迁移说明](../releases/0.11.0.md)和[生命周期指南](local-endpoint-lifecycle.md)。当前源码树另外升级到 IPC **17**、C/FFI ABI **9** 与 FastDB **0.3.0**，并新增资源归属的发布/订阅主题（见[未发布说明](../releases/unreleased.md)）；源码使用方需一起构建、一起升级，IPC 16 与 IPC 17 对端经固定版本前导互相拒绝。
 
 Windows 拒绝 Unix 根目录覆盖值（`cc.endpoint.set_local_endpoint(root=...)`、`C2_IPC_ROOT`、`--ipc-root`）。管道名称由逻辑地址和当前 TokenUser SID 派生。
 

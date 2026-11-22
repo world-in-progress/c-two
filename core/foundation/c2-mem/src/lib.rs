@@ -27,7 +27,7 @@ pub use budget::{
     BudgetCellSnapshot, BudgetError, BudgetedBuffer, DomainBudget, DomainObserver,
     DomainObserverWeak, DomainSnapshot, FileSpillReservation, MemoryReservation,
     MemoryReservationError, OperationPermit, PayloadBufferError, RecycledBytes, ReserveFuture,
-    RetentionError, RetentionRejectReason, RetentionSnapshot,
+    ReserveVecFuture, RetentionError, RetentionRejectReason, RetentionSnapshot,
 };
 pub use config::{PoolAllocation, PoolConfig, PoolStats};
 pub use dedicated::DedicatedSegment;

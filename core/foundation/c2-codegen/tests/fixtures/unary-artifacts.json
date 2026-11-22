@@ -48,9 +48,9 @@
         "sha256": "d25a8e308c803acd08df897279827384fc0de97ea1cacd3323554b94c6b560a3"
       },
       {
-        "bytes": 10835,
+        "bytes": 11231,
         "path": "python/c_two_contract.py",
-        "sha256": "9802d58764d34f422357d29252af64adb91b63f75539635a1878c104e744bf94"
+        "sha256": "678865ff8a033376f20818b1e49a0db0f4091953f7def440bebae3f6d51e215d"
       },
       {
         "bytes": 2700,
@@ -219,9 +219,9 @@
         "sha256": "0eeab1f5cdc6bac8ae7880794dd1b2c1f8eaac34e8e63c9139d6c40a266ce10c"
       },
       {
-        "bytes": 10010,
+        "bytes": 10406,
         "path": "python/c_two_contract.py",
-        "sha256": "0eaa868406eb85c25c6ebe9a66dc0021b4cabaf7ab9710f238802626b4720f3f"
+        "sha256": "6b3ae4ea8b181424813cf3c7a98d60a59ac4a22464a16e5026c4c7958128492f"
       },
       {
         "bytes": 12918,
@@ -312,9 +312,9 @@
         "sha256": "a60647161cc12058cc829fdbaa30f999ffad40888ef24172fe3d4dd86bb4c98d"
       },
       {
-        "bytes": 10021,
+        "bytes": 10417,
         "path": "python/c_two_contract.py",
-        "sha256": "758ebf22b14213289f7d0de8d02682a3b22b948111cad32d29e568e76122f910"
+        "sha256": "bdaf8daab13a13b91323d51f3353a872a0a7f24da89c12cacc07f283ff0cff27"
       },
       {
         "bytes": 21249,

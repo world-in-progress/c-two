@@ -770,3 +770,37 @@ fn recycled_bytes_do_not_keep_a_dropped_domain_alive() {
     assert_eq!(bytes.len(), size);
     drop(bytes);
 }
+
+#[test]
+fn close_operations_drains_warm_buffers_and_stops_caching() {
+    let size = WARM_BUFFER_MIN_BYTES;
+    let budget = domain((size * 2) as u64, 0, 0);
+    budget.recycle_vec(Vec::with_capacity(size));
+    assert_eq!(budget.shared.lock().warm_buffers.len(), 1);
+    budget.close_operations();
+    assert!(budget.shared.lock().warm_buffers.is_empty());
+    assert_eq!(budget.shared.lock().warm_idle_bytes, 0);
+    budget.recycle_vec(Vec::with_capacity(size));
+    assert!(budget.shared.lock().warm_buffers.is_empty());
+}
+
+#[test]
+fn reserve_vec_claims_warm_buffer_before_admission_eviction() {
+    let size = 3 * WARM_BUFFER_MIN_BYTES;
+    let budget = domain((4 * WARM_BUFFER_MIN_BYTES) as u64, 0, 0);
+    let bytes = vec![1; size];
+    let ptr = bytes.as_ptr();
+    budget.recycle_vec(bytes);
+
+    let mut fut = Box::pin(budget.reserve_vec(size as u64));
+    let wake = Arc::new(CountWake(AtomicUsize::new(0)));
+    let waker = Waker::from(wake);
+    let mut cx = Context::from_waker(&waker);
+    let Poll::Ready(Ok((warm, reservation))) = fut.as_mut().poll(&mut cx) else {
+        panic!("expected immediate warm reservation");
+    };
+    let reused = warm.expect("warm buffer should be claimed before eviction");
+    assert_eq!(reused.as_ptr(), ptr);
+    assert_eq!(reservation.bytes(), size as u64);
+    drop(reservation.into_buffer(reused));
+}

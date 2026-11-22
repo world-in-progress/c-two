@@ -336,9 +336,19 @@ def _build_transfer_wrapper(
             try:
                 direct_args = request or ()
                 if crm_scoped_input and direct_args:
-                    direct_args = (_materialize_direct_plan(direct_args[0], input),)
+                    try:
+                        direct_args = (_materialize_direct_plan(direct_args[0], input),)
+                    except BaseException as exc:
+                        raise _client_input_error(exc) from exc
                 result = client.call_direct(method_name, direct_args)
-                result = _materialize_direct_plan(result, output)
+                try:
+                    result = _materialize_direct_plan(result, output)
+                except BaseException as exc:
+                    raise error.SerializationError(
+                        error.ErrorCode.ResourceOutputSerializing,
+                        _safe_error_message(exc),
+                        details=_cause_details(exc),
+                    ) from exc
             except _LocalRouteClosed:
                 if budget is None:
                     budget = crm.client.start_call_budget()
@@ -381,8 +391,18 @@ def _build_transfer_wrapper(
 
             call_client = client if prepared is None else prepared
             dispatched = True
+            release_view_in_native = (
+                crm_scoped_input
+                and isinstance(serialized_args, memoryview)
+                and getattr(call_client, "_supports_release_input", False)
+            )
             try:
-                response = call_client.call(method_name, serialized_args)
+                if release_view_in_native:
+                    response = call_client.call(
+                        method_name, serialized_args, release_input=True,
+                    )
+                else:
+                    response = call_client.call(method_name, serialized_args)
             except error.CCBaseError:
                 raise
             except Exception as exc:
@@ -568,21 +588,42 @@ def _build_transfer_wrapper(
                 finally:
                     failure = None
 
+        serialized_result = None
+        borrowed_plan = None
         try:
             serialized_result = output_serializer(result) if output_serializer is not None else b""
+            if input_buffer_mode == "borrowed" and isinstance(
+                serialized_result, _DeferredFastDbPlan,
+            ):
+                borrowed_plan = serialized_result.plan
             if _response_sink is not None:
                 try:
                     _response_sink.write(serialized_result)
                 finally:
                     if has_scoped_output and isinstance(serialized_result, memoryview):
                         serialized_result.release()
-                serialized_result = None
-            elif input_buffer_mode == "borrowed" and isinstance(serialized_result, memoryview):
-                # A direct dispatcher invocation without a sink must finish
-                # reading the response before invalidating its borrowed input.
-                with serialized_result as response_view:
-                    serialized_result = bytes(response_view)
+                    serialized_result = None
+                    result = None
+                borrowed_plan = None
+            elif input_buffer_mode == "borrowed":
+                if isinstance(serialized_result, memoryview):
+                    # A direct dispatcher invocation without a sink must finish
+                    # reading the response before invalidating its borrowed input.
+                    with serialized_result as response_view:
+                        serialized_result = bytes(response_view)
+                elif isinstance(serialized_result, _DeferredFastDbPlan):
+                    serialized_result = serialized_result._c2_materialize_bytes()
+                result = None
+                borrowed_plan = None
         except BaseException as exc:
+            if borrowed_plan is not None:
+                try:
+                    borrowed_plan.close()
+                except BaseException:
+                    pass
+                borrowed_plan = None
+            result = None
+            serialized_result = None
             failure = error.SerializationError(
                 error.ErrorCode.ResourceOutputSerializing,
                 _safe_error_message(exc),

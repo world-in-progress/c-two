@@ -241,6 +241,9 @@ impl DomainState {
     }
 
     fn recycle_warm_vec(&mut self, bytes: &mut Vec<u8>) -> Vec<Vec<u8>> {
+        if self.operations.closed {
+            return Vec::new();
+        }
         let cap = bytes.capacity() as u64;
         let limit = self.warm_capacity();
         if cap < WARM_BUFFER_MIN_BYTES as u64 || cap > limit {
@@ -448,6 +451,16 @@ impl DomainBudget {
         }
     }
 
+    /// Waits for capacity and atomically claims a matching warm local buffer
+    /// before evicting other idle buffers.
+    pub fn reserve_vec(&self, bytes: u64) -> ReserveVecFuture<'_> {
+        ReserveVecFuture {
+            budget: self,
+            bytes,
+            waiter: None,
+        }
+    }
+
     pub fn reserve_memory_blocking(
         &self,
         bytes: u64,
@@ -569,8 +582,16 @@ impl DomainBudget {
     }
 
     /// Stop new calls; admitted work can still reserve memory and file spill.
+    ///
+    /// Drains idle warm buffers so a retiring domain does not retain cached
+    /// heap capacity behind surviving observers or holds.
     pub fn close_operations(&self) {
-        self.shared.lock().operations.closed = true;
+        let evicted = {
+            let mut state = self.shared.lock();
+            state.operations.closed = true;
+            state.evict_warm_to(0, 0)
+        };
+        drop(evicted);
     }
 }
 
@@ -655,6 +676,77 @@ impl Future for ReserveFuture<'_> {
 }
 
 impl Drop for ReserveFuture<'_> {
+    fn drop(&mut self) {
+        let waker = self
+            .budget
+            .shared
+            .lock()
+            .memory_waiters
+            .remove(&mut self.waiter);
+        drop(waker);
+    }
+}
+
+#[must_use = "poll or await the reservation before using storage"]
+pub struct ReserveVecFuture<'a> {
+    budget: &'a DomainBudget,
+    bytes: u64,
+    waiter: Option<u64>,
+}
+
+impl Future for ReserveVecFuture<'_> {
+    type Output = Result<(Option<Vec<u8>>, MemoryReservation), PayloadBufferError>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        let waker = cx.waker().clone();
+        let mut state = this.budget.shared.lock();
+        let (result, evicted) = match state.memory.check_memory_request(this.bytes.into()) {
+            Err(error) => (Err(error), Vec::new()),
+            Ok(()) if this.bytes <= state.memory.available() => {
+                state.memory.admit(this.bytes);
+                let mut reserved = this.bytes;
+                let warm = usize::try_from(this.bytes)
+                    .ok()
+                    .filter(|&len| len >= WARM_BUFFER_MIN_BYTES)
+                    .and_then(|len| {
+                        let avail = usize::try_from(state.memory.available()).unwrap_or(usize::MAX);
+                        let max_cap = len.saturating_add((len / 4).min(avail));
+                        let bytes = state.take_warm_vec(len, max_cap)?;
+                        let extra = (bytes.capacity() as u64).saturating_sub(this.bytes);
+                        if extra > 0 {
+                            state.memory.admit(extra);
+                            reserved += extra;
+                        }
+                        Some(bytes)
+                    });
+                (
+                    Ok((
+                        warm,
+                        MemoryReservation {
+                            shared: Arc::clone(&this.budget.shared),
+                            bytes: reserved,
+                        },
+                    )),
+                    state.evict_for_admission(),
+                )
+            }
+            Ok(()) => {
+                let old_waker = state.memory_waiters.register(&mut this.waiter, waker);
+                drop(state);
+                drop(old_waker);
+                return Poll::Pending;
+            }
+        };
+        let old_waker = state.memory_waiters.remove(&mut this.waiter);
+        drop(state);
+        drop(old_waker);
+        drop(evicted);
+        Poll::Ready(result)
+    }
+}
+
+impl Drop for ReserveVecFuture<'_> {
     fn drop(&mut self) {
         let waker = self
             .budget

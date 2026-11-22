@@ -484,12 +484,12 @@ impl SubscribeReceive {
                     return;
                 }
                 tokio::select! {
-                    reservation = call.budget.reserve_memory(total) => break reservation,
+                    reserved = call.budget.reserve_vec(total) => break reserved,
                     _ = &mut changed => {}
                 }
             };
-            let mut reservation = match reservation {
-                Ok(reservation) => reservation,
+            let (warm, mut reservation) = match reservation {
+                Ok(reserved) => reserved,
                 Err(error) => {
                     call.fail_local(
                         C2Error::new(c2_error::ErrorCode::CallCapacityExceeded, error.to_string())
@@ -511,15 +511,18 @@ impl SubscribeReceive {
                     return;
                 }
             };
-            let bytes = match reservation.allocate_vec(size) {
-                Ok(bytes) => bytes,
-                Err(error) => {
-                    call.fail_local(C2Error::new(
-                        c2_error::ErrorCode::CallCapacityExceeded,
-                        error.to_string(),
-                    ));
-                    return;
-                }
+            let bytes = match warm {
+                Some(bytes) => bytes,
+                None => match reservation.allocate_vec(size) {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        call.fail_local(C2Error::new(
+                            c2_error::ErrorCode::CallCapacityExceeded,
+                            error.to_string(),
+                        ));
+                        return;
+                    }
+                },
             };
             let buffer = ItemBuffer::new(bytes, reservation);
             let mut state = call.state.lock();

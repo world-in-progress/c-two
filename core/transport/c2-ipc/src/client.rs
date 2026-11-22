@@ -2176,7 +2176,8 @@ impl IpcClient {
                 .map_err(|_| dispatch_call_error(IpcError::Closed, send.started()))?,
             Err(error) => prefer_ready_response(error, &mut rx),
         };
-        owned_response(response).map_err(|error| dispatch_call_error(error, send.started()))
+        owned_response(response, &self.budget)
+            .map_err(|error| dispatch_call_error(error, send.started()))
     }
 
     async fn call_buddy(
@@ -2340,7 +2341,8 @@ impl IpcClient {
                 .map_err(|_| dispatch_call_error(IpcError::Closed, send.started()))?,
             Err(error) => prefer_ready_response(error, &mut rx),
         };
-        owned_response(response).map_err(|error| dispatch_call_error(error, send.started()))
+        owned_response(response, &self.budget)
+            .map_err(|error| dispatch_call_error(error, send.started()))
     }
 
     async fn call_chunked(
@@ -2445,13 +2447,16 @@ impl IpcClient {
             Ok(Ok(())) => {}
             Ok(Err(error)) => {
                 let phase = error.phase();
-                return owned_response(prefer_ready_response(error.into_source(), &mut rx))
-                    .map_err(|source| {
-                        dispatch_call_error(
-                            source,
-                            phase == crate::TransportPhase::DispatchUncertain,
-                        )
-                    });
+                return owned_response(
+                    prefer_ready_response(error.into_source(), &mut rx),
+                    &self.budget,
+                )
+                .map_err(|source| {
+                    dispatch_call_error(
+                        source,
+                        phase == crate::TransportPhase::DispatchUncertain,
+                    )
+                });
             }
             Err(error) => {
                 let source = IpcError::Io(std::io::Error::other(error.to_string()));
@@ -2462,12 +2467,12 @@ impl IpcClient {
                         false,
                     );
                 }
-                return owned_response(prefer_ready_response(source, &mut rx))
+                return owned_response(prefer_ready_response(source, &mut rx), &self.budget)
                     .map_err(|source| dispatch_call_error(source, send.started()));
             }
         }
         match rx.await {
-            Ok(result) => owned_response(result).map_err(|error| {
+            Ok(result) => owned_response(result, &self.budget).map_err(|error| {
                 if matches!(error, IpcError::Closed) && !send.started() {
                     pre_dispatch_call_error(error)
                 } else {
@@ -3082,9 +3087,12 @@ fn prefer_ready_response(
     }
 }
 
-fn owned_response(response: Result<ResponseData, IpcError>) -> Result<ResponseData, IpcError> {
+fn owned_response(
+    response: Result<ResponseData, IpcError>,
+    budget: &DomainBudget,
+) -> Result<ResponseData, IpcError> {
     response?
-        .into_owned_bytes()
+        .into_owned_bytes_in(budget)
         .map(ResponseData::Inline)
         .map_err(|error| IpcError::Shm(error).response_failure())
 }
