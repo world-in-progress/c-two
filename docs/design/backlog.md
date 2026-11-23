@@ -6,7 +6,7 @@
 
 同一块代码里的事合成一批做，免得先做的被后面的批次推翻。
 
-1. **派发后的结果查询与去重**（维护者 2026-11-02 认为值得做）：事发那一刻进程内兜不住，结果未知时如实报派发不确定；这一项让调用方事后能查清一个派发不确定的调用是否执行过，或带同一个调用标识安全重试而不重复执行。业界有数据库的事务结果查询（例如 Oracle 的逻辑事务 ID）与 HTTP 幂等键，待一手来源调研。协议批之后先写设计与 ADR：调用标识跨重连与进程的稳定性、服务端结果的保留期限与存储、与有状态调用顺序的关系、与流式 RPC 的交叉。
+1. **派发后的结果查询与去重**（[一手调研](../research/2026-11-23-post-dispatch-outcome-and-dedup-survey.md)、[ADR 0006](../decisions/0006-post-dispatch-outcome-and-dedup.md) 已定稿，实施中）：为带显式 `call_id` 的一元调用提供单次注册内存去重、非阻塞 `query_call` 查证与遇 Miss 绝不代执行的 `recover_call` 附着重放恢复，同步切至 IPC 18 与 C/FFI ABI 10。
 2. **按区域的结构调整与重复校验。** 不碰协议，各区先出方案：
    - **Core 与 Python：** E1、E2、E4、E13；C5、C6；G5、G9；R06 回调重入导致自锁的风险（`sdk/python/native/src/runtime_session_ffi.rs` 中 `server_bridge` 持锁释放 Python 对象与 host 持锁投影异常的两类隐患已在 PR #234 收口）。`c2-mem` 的 `MemPool::free_at` 是 pub unsafe，生产代码里没有调用方，只有 c2-ipc 的一个 ownership 测试夹具在用（2026-11-09 审查发现），删掉或者只在测试里可见。
    - **本地端点：** tmpfiles（D-tmp）先在 Linux 上复现 systemd-tmpfiles 清掉 gate 与 marker 的情形，再实施目录 flock（本机与 Windows 测试机都不是 Linux）；之后 D1、D2、D5、D6、D10 的复查只留在所有权、发布与 unlink 边界；R17 剩下的 gate/context 与目录 pin 的错误分类。顺带：c2-local 的 Drop 在门锁短暂争用后由后台线程完成退役，`managed_drop_after_gate_contention_settles_ownership` 两种终态都接受，要有一个能观察后台重试的点才能确定地守住。另一个端点测试 `final_lease_stat_io_preserves_stale_bind_reap_and_sweep` 在 2026-11-06 的 Linux CI（fork run 42254418051 第一次尝试）里偶发失败一次：注入 `FinalLeaseStat` 的那次操作之后，紧接着的 `reap_managed_at` 没有得到 `Reaped`；是不是同一类后台退役时序还没核实，碰到这块时一并查。
