@@ -16,7 +16,7 @@ The capacity variables apply independently to each active role domain. `M` is th
 | `C2_RELAY_ANCHOR_ADDRESS` | Unset, direct IPC | `cc.set_relay_anchor(address)` / `Runtime.set_relay_anchor` (`None` clears the code override; blank strings raise `ValueError`), Rust `RuntimeOptions` / `HostOptions` |
 | `C2_IPC_ROOT` | Unix `/tmp/c2-v3-<uidhex>` | `cc.endpoint.set_local_endpoint(root=...)`, Rust `LocalEndpointOptions`, c3 `--ipc-root`. Windows uses named pipes. |
 | `C2_MEMORY_BUDGET_BYTES` | 16 GiB per active domain | `memory_budget_bytes`, `--memory-budget-bytes` |
-| `C2_FILE_SPILL_BUDGET_BYTES` | 16 GiB per active domain | `file_spill_budget_bytes`, `--file-spill-budget-bytes`. Zero disables file spill. |
+| `C2_FILE_SPILL_BUDGET_BYTES` | 16 GiB per active domain | `file_spill_budget_bytes`, `--file-spill-budget-bytes`. Zero disables file spill; used by chunked unary reassembly and relay topic hubs (not client stream/topic receivers or Host topic history). |
 | `C2_CALL_MAX_OUTSTANDING` | 0 if `M == 0`, otherwise `max(64, floor(M / 65536))` | `max_outstanding_calls`, `--call-max-outstanding` |
 | `C2_MAX_PAYLOAD_SIZE` | 16 GiB | Host's single-payload limit, `max_payload_size` must be positive |
 | `C2_MAX_EXECUTION_WORKERS` | Host parallelism clamped to 4–64, with fallback parallelism 4 | Host's `max_execution_workers`. An explicit value must be at least 1 and may exceed 64. |
