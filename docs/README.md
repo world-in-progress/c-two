@@ -32,7 +32,7 @@ This page routes each subject to the document that owns it. It states no behavio
 | [Python usage](reference/python-usage.md) ([中文](reference/python-usage.zh-CN.md)) | CRM contracts, resources, clients, server streams, Runtime, hold, FastDB payloads and observation from Python |
 | [Rust SDK](../sdk/rust/README.md) | User-facing `c_two` Rust facade, `RuntimeOptions`/`HostOptions`, server streams, `Held` and lifecycle diagnostics |
 | [c3 CLI](../cli/README.md) | Standalone `c3 relay`, `c3 registry`, `c3 endpoint` maintenance and `c3 contract` codegen commands |
-| [Node / TypeScript binding](../core/foundation/c2-mem-ffi/bindings/typescript/README.md) | `@c-two/c2-mem-ffi` connector, ABI 9 endpoint/call/subscription APIs, `NativeBuffer` and Node build checks |
+| [Node / TypeScript binding](../core/foundation/c2-mem-ffi/bindings/typescript/README.md) | `@c-two/c2-mem-ffi` connector, ABI 10 endpoint, call, outcome and subscription APIs, `NativeBuffer` and Node build checks |
 | [Configuration](reference/configuration.md) ([中文](reference/configuration.zh-CN.md)) | Every setting, its environment variable and default, precedence, call deadlines and endpoint directories |
 | [Windows usage](reference/windows-native-usage.md) ([中文](reference/windows-native-usage.zh-CN.md)) | Installing and building on Windows x64 and ARM64 |
 | [Contracts and routing](reference/contracts-and-routing.md) | Contract identity, portable contracts, route catalogs and bindings, relay discovery, forwarding and trust |
