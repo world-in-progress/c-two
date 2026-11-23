@@ -62,18 +62,17 @@ class TestErrorCode:
             "CallCancelled": 718,
             "RouteConflict": 719,
             "SubscriptionLagged": 720,
+            "CallIdConflict": 721,
+            "CallResultUnavailable": 722,
+            "CallOutcomeUnknown": 723,
         }
         assert {member.name: member.value for member in ErrorCode} == expected
 
     def test_members_match_native_registry_exactly(self):
         native = _native.error_registry()
-        assert len(native) == 26
         assert set(ErrorCode.__members__) == set(native)
         for name, (code, _side, _stage) in native.items():
             assert ErrorCode[name].value == int(code)
-
-    def test_has_exactly_26_members(self):
-        assert len(ErrorCode) == 26
 
     def test_values_are_unique(self):
         values = [member.value for member in ErrorCode]
@@ -350,6 +349,7 @@ class TestPublicSurface:
             'ProtocolViolation', 'FallbackDenied', 'CallDeadlineExceeded',
             'UnsupportedCallMode', 'CallCapacityExceeded', 'CallCancelled', 'RouteConflict',
             'SubscriptionLagged',
+            'CallIdConflict', 'CallResultUnavailable', 'CallOutcomeUnknown',
         }
         assert set(error.__all__) == expected
 

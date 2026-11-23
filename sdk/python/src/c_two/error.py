@@ -59,6 +59,13 @@ class CCBaseError(Exception):
     """Base class for all C-Two-related errors."""
 
     @property
+    def call_id(self) -> str | None:
+        """Key of the outer call when Core reports dispatch uncertainty."""
+        if self.transport_phase == 'dispatch_uncertain':
+            return getattr(self, '_call_id', None)
+        return None
+
+    @property
     def transport_phase(self) -> TransportPhase | None:
         """Dispatch phase established for this error, when Core knows one.
 
@@ -200,12 +207,15 @@ class CoreError(CCBaseError, RuntimeError):
         if not isinstance(snapshot, tuple) or len(snapshot) != 4:
             return None
         code, message, details, phase = snapshot
-        return CCError._from_parts(
+        projected = CCError._from_parts(
             int(code),
             message,
             dict(details),
             transport_phase=phase,
         )
+        if (call_id := self.call_id) is not None:
+            projected._call_id = call_id
+        return projected
 
 
 def _build_error(
@@ -511,6 +521,27 @@ class SubscriptionLagged(_FixedCodeError):
     _default_message = 'Subscription lagged'
 
 
+class CallIdConflict(_FixedCodeError):
+    """The key already belongs to a different method or encoded input."""
+
+    _code = ErrorCode.CallIdConflict
+    _default_message = 'Call ID conflict'
+
+
+class CallResultUnavailable(_FixedCodeError):
+    """The call succeeded and the Host no longer has its result."""
+
+    _code = ErrorCode.CallResultUnavailable
+    _default_message = 'Call result unavailable'
+
+
+class CallOutcomeUnknown(_FixedCodeError):
+    """The current registration has no outcome to recover for the key."""
+
+    _code = ErrorCode.CallOutcomeUnknown
+    _default_message = 'Call outcome unknown'
+
+
 _CODE_TO_CLASS: dict[int, type[CCError]] = {
     int(ErrorCode.ResourceInputDeserializing): SerializationError,
     int(ErrorCode.ResourceOutputSerializing): SerializationError,
@@ -534,6 +565,9 @@ _CODE_TO_CLASS: dict[int, type[CCError]] = {
     int(ErrorCode.CallCancelled): CallCancelled,
     int(ErrorCode.RouteConflict): RouteConflict,
     int(ErrorCode.SubscriptionLagged): SubscriptionLagged,
+    int(ErrorCode.CallIdConflict): CallIdConflict,
+    int(ErrorCode.CallResultUnavailable): CallResultUnavailable,
+    int(ErrorCode.CallOutcomeUnknown): CallOutcomeUnknown,
 }
 
 
@@ -580,11 +614,14 @@ def _snapshot_has_controls(
 
 
 def _callback_error_copy(exc: CCError) -> CCError:
-    """Fresh copy of a ``CCError`` escaping a resource callback.
-
-    Keeps the subclass, code, message and business details; clears inner
-    dispatch phases and call-control details without mutating the original.
-    """
+    """Isolate a callback error from the outer call's dispatch and outcome."""
+    if exc.code in (
+        ErrorCode.CallIdConflict, ErrorCode.CallResultUnavailable, ErrorCode.CallOutcomeUnknown,
+    ):
+        return ResourceExecutionError(
+            'resource callback returned an inner call outcome error',
+            details={'cause_code': str(int(exc.code)), 'cause_message': exc.message},
+        )
     stripped_details = _strip_callback_phases(getattr(exc, 'details', {}))
     copied = copy.copy(exc)
     copied.details = stripped_details
@@ -689,4 +726,7 @@ __all__ = [
     'CallCancelled',
     'RouteConflict',
     'SubscriptionLagged',
+    'CallIdConflict',
+    'CallResultUnavailable',
+    'CallOutcomeUnknown',
 ]

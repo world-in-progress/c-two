@@ -10,9 +10,9 @@ __version__ = _version('c-two')
 
 from . import error
 from .crm.meta import crm, read, write, stream, topic, on_shutdown
-from .crm.transferable import hold, transfer, HeldResult
+from .crm.transferable import hold, recover_call, transfer, with_call_id, HeldResult
 from .crm.stream import Stream, StreamCloseReceipt
-from .transport.client.proxy import with_call_options
+from .transport.client.proxy import CallOutcome, query_call, with_call_options
 from .transport.server.scheduler import ConcurrencyConfig
 from .transport.topic import Delivery, Publisher, Registration, Subscription, TopicCloseReceipt
 from .transport.registry import (
@@ -33,6 +33,10 @@ __all__ = [
     'transfer',
     'on_shutdown',
     'hold',
+    'with_call_id',
+    'recover_call',
+    'query_call',
+    'CallOutcome',
     'HeldResult',
     'Delivery',
     'Publisher',

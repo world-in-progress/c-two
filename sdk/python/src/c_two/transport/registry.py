@@ -211,11 +211,14 @@ class Runtime:
         memory_budget_bytes: int | None | _Unset = _UNSET,
         file_spill_budget_bytes: int | None | _Unset = _UNSET,
         max_outstanding_calls: int | None | _Unset = _UNSET,
+        outcome_max_entries: int | None | _Unset = _UNSET,
+        outcome_max_retained_bytes: int | None | _Unset = _UNSET,
     ) -> None:
         """Update Host configuration. Omitted fields keep their overrides; None inherits."""
         self._runtime_session.update_server_config(
             _UNSET, server_id, startup_timeout, max_payload_size, max_execution_workers,
             memory_budget_bytes, file_spill_budget_bytes, max_outstanding_calls,
+            outcome_max_entries, outcome_max_retained_bytes,
         )
 
     def set_client(
@@ -490,7 +493,7 @@ class Runtime:
                 local_copy_tracker=local_copy_tracker,
                 topic_bindings=topic_bindings,
                 following_local=_FollowingLocalRoute(
-                    self, runtime_session, crm_class, name, crm_instance, scheduler,
+                    self, runtime_session, crm_class, expected_contract, name, crm_instance, scheduler,
                 ),
             )
         elif address is not None and address.startswith(('http://', 'https://')):
@@ -879,6 +882,8 @@ def set_server(
     memory_budget_bytes: int | None | _Unset = _UNSET,
     file_spill_budget_bytes: int | None | _Unset = _UNSET,
     max_outstanding_calls: int | None | _Unset = _UNSET,
+    outcome_max_entries: int | None | _Unset = _UNSET,
+    outcome_max_retained_bytes: int | None | _Unset = _UNSET,
 ) -> None:
     """Update the default Runtime's Host configuration."""
     _get_default_runtime().set_server(
@@ -889,6 +894,8 @@ def set_server(
         memory_budget_bytes=memory_budget_bytes,
         file_spill_budget_bytes=file_spill_budget_bytes,
         max_outstanding_calls=max_outstanding_calls,
+        outcome_max_entries=outcome_max_entries,
+        outcome_max_retained_bytes=outcome_max_retained_bytes,
     )
 
 

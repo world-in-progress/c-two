@@ -36,7 +36,8 @@ Usage::
 from __future__ import annotations
 
 import threading
-from typing import Any, Callable, TYPE_CHECKING
+from dataclasses import dataclass
+from typing import Any, Callable, Literal, TYPE_CHECKING
 
 from ... import error
 
@@ -46,6 +47,22 @@ if TYPE_CHECKING:
 
 class _LocalRouteClosed(Exception):
     """Native admission closed before a same-process resource was entered."""
+
+
+@dataclass(frozen=True, slots=True)
+class CallOutcome:
+    """Snapshot of a keyed unary call in the route's current registration.
+
+    ``in_flight`` includes a call still receiving its request. Querying never
+    waits for the resource to finish or executes it.
+    """
+
+    status: Literal['in_flight', 'succeeded', 'failed', 'unknown']
+    method_name: str | None
+    result_available: bool
+    result_unavailable_reason: Literal['not_retained', 'evicted'] | None
+    error_code: int | None
+    error_details_available: bool
 
 
 def _closed_proxy_error() -> error.ResourceClosed:
@@ -58,12 +75,13 @@ def _closed_proxy_error() -> error.ResourceClosed:
 class _FollowingLocalRoute:
     """Target shared by the views of one registered same-process connection."""
 
-    def __init__(self, runtime, session, crm_class, name, resource, scheduler):
+    def __init__(self, runtime, session, crm_class, contract, name, resource, scheduler):
         self.lock = threading.Lock()
         self.acquire_gate = threading.Lock()
         self.runtime = runtime
         self.session = session
         self.crm_class = crm_class
+        self.contract = contract
         self.name = name
         self.local = (resource, scheduler)
         # None means the original local target; later publication is one
@@ -421,6 +439,42 @@ class CRMProxy:
         """Project one reserved native call into the transfer interface."""
         return _PreparedClient(self.begin_call(method_name))
 
+    def _outcome_target(self) -> CRMProxy:
+        """Resolve the encoded route for an outcome operation."""
+        with self._close_lock:
+            if self._closed:
+                raise _closed_proxy_error()
+        if self._mode != 'thread':
+            return self
+
+        state = self._following_local
+        if state is None or not self._name:
+            raise error.UnsupportedCallMode(
+                'call outcomes require a thread-local proxy with a registered Runtime route',
+                transport_phase='pre_dispatch',
+            )
+        _native_call(state.session.check_active)
+        address = state.session.server_address
+        if address is None:
+            raise error.ResourceClosed(
+                f'Host for route {state.name!r} is closed', transport_phase='pre_dispatch',
+            )
+        client = _native_call(
+            state.session.acquire_ipc_client,
+            address,
+            state.name,
+            *state.contract.native_args(),
+        )
+        if self._call_timeout is not ...:
+            client = _native_call(client.with_call_options, timeout=self._call_timeout)
+        return CRMProxy.ipc(client, state.name, local_copy_tracker=self._local_copy_tracker)
+
+    def _prepare_keyed_call(self, method_name: str, call_id: str):
+        return _PreparedClient(_native_call(self._client.begin_call, method_name, call_id=call_id))
+
+    def _recover_call(self, method_name: str, call_id: str):
+        return _native_call(self._client.recover_call, method_name, call_id)
+
     def begin_stream(self, method_name: str):
         """Reserve the native stream call before encoding its input."""
         with self._close_lock:
@@ -483,7 +537,7 @@ class CRMProxy:
         """Attach to one topic declared on this proxy's contract.
 
         Same-process connections attach directly to the route's current
-        registration; remote connections subscribe over IPC 17 / relay HTTP.
+        registration; remote connections subscribe over IPC 18 / relay HTTP.
         Each call creates one subscription spanning at most one registration:
         unregistering the route or stopping the host ends it with
         ``CallCancelled`` (718), a lagging ``on_lag='error'`` policy ends it
@@ -773,6 +827,22 @@ def connection_observation(proxy):
     if not isinstance(client, CRMProxy):
         raise TypeError('cc.connection_observation() requires a connected CRM instance')
     return client.connection_observation()
+
+
+def query_call(proxy, call_id: str, *, timeout=...) -> CallOutcome:
+    """Read the current registration's outcome without taking a business slot.
+
+    Omission inherits the connection's timeout policy. Pass ``None`` to
+    wait without a deadline for the query reply.
+    """
+    from ...crm.transferable import _validate_call_id
+
+    _validate_call_id(call_id)
+    client = getattr(proxy, 'client', None)
+    if not isinstance(client, CRMProxy):
+        raise TypeError('cc.query_call() requires a connected CRM instance')
+    target = client._outcome_target()
+    return CallOutcome(**_native_call(target._client.query_call, call_id, timeout=timeout))
 
 
 def with_call_options(proxy, *, timeout=...):
