@@ -236,7 +236,7 @@ following.close(timeout=5.0)
 cc.close(telemetry)
 ```
 
-同进程路径上，发布在 `publish()` 时对可变 Python 对象取不可变快照，发布者后续修改或单个读者释放都不会影响其他读者。经直连 IPC 时，帧经一块按订阅者借出的封存共享内存块传输；经 relay 时走 relay 的主题 HTTP 转发。订阅全生命周期占用所属角色域的一个 `max_outstanding_calls` 槽并受内部 `N − 1` 守卫约束，不占路由并发许可、不占执行 worker，也不计入方法的 `max_pending`。`publish()` 放不进主题预算时立即以 `CallCapacityExceeded`（717）失败，保留上一帧且不消耗 `seq`——主题历史绝不隐式溢写磁盘。完整可运行示例见 [pubsub.py](../../examples/python/pubsub.py)；线格式规则见[握手规格](ipc-handshake.md#topic-subscriptions)，错误语义见[错误参考](errors.md#semantic-error-wire-and-sdk-projection)。
+同进程路径上，发布在 `publish()` 时对可变 Python 对象取不可变快照，发布者后续修改或单个读者释放都不会影响其他读者。经直连 IPC 时，帧经一块按订阅者借出的封存共享内存块传输；经 relay 时走 relay 的主题 HTTP 转发。订阅全生命周期占用所属角色域的一个 `max_outstanding_calls` 槽并受内部 `N − 1` 守卫约束，不占路由并发许可、不占执行 worker，也不计入方法的 `max_pending`。`publish()` 放不进主题预算时立即以 `CallCapacityExceeded`（717）失败，保留上一帧且不消耗 `seq`——主题历史绝不隐式溢写磁盘。客户端订阅方同样直接从 `client.M` 预约每条接收帧的连续内存而不使用 `client.F`（`file_spill_budget_bytes`），只有 relay 主题 hub 会在内存紧张时溢写到 `relay.F`（见[内存策略](memory-policy.md#lazy-allocation-and-transport-fallback)）。完整可运行示例见 [pubsub.py](../../examples/python/pubsub.py)；线格式规则见[握手规格](ipc-handshake.md#topic-subscriptions)，错误语义见[错误参考](errors.md#semantic-error-wire-and-sdk-projection)。
 
 ## 常驻模拟范式
 

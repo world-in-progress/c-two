@@ -16,7 +16,7 @@ Rust Core 按 **显式代码或 CLI 覆盖 > 进程环境变量 > `.env` > 默�
 | `C2_RELAY_ANCHOR_ADDRESS` | 未设置，仅直接 IPC | `cc.set_relay_anchor(address)` / `Runtime.set_relay_anchor`（传 `None` 清除代码覆盖，空白字符串抛 `ValueError`），Rust `RuntimeOptions` / `HostOptions` |
 | `C2_IPC_ROOT` | Unix `/tmp/c2-v3-<uidhex>` | `cc.endpoint.set_local_endpoint(root=...)`、Rust `LocalEndpointOptions`、c3 `--ipc-root`。Windows 使用命名管道。 |
 | `C2_MEMORY_BUDGET_BYTES` | 每个已激活的域 16 GiB | `memory_budget_bytes`、`--memory-budget-bytes` |
-| `C2_FILE_SPILL_BUDGET_BYTES` | 每个已激活的域 16 GiB | `file_spill_budget_bytes`、`--file-spill-budget-bytes`。0 禁用文件溢出。 |
+| `C2_FILE_SPILL_BUDGET_BYTES` | 每个已激活的域 16 GiB | `file_spill_budget_bytes`、`--file-spill-budget-bytes`。0 禁用文件溢出；用于分片一元重组与 relay 主题 hub（不用于客户端流/主题接收与 Host 主题历史）。 |
 | `C2_CALL_MAX_OUTSTANDING` | `M == 0` 时为 0，其余为 `max(64, floor(M / 65536))` | `max_outstanding_calls`、`--call-max-outstanding` |
 | `C2_MAX_PAYLOAD_SIZE` | 16 GiB | Host 单条载荷上限，`max_payload_size` 须为正数 |
 | `C2_MAX_EXECUTION_WORKERS` | 主机并行度限制在 4–64，取不到时按 4 计算 | Host 的 `max_execution_workers`。显式值须至少为 1，可以超过 64。 |
