@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use crate::{TimeoutError, timeout_from_seconds};
+use crate::{TimeoutError, timeout_from_seconds, validate_call_id};
 
 /// Total-wait deadline policy for one logical call.
 ///
@@ -91,6 +91,64 @@ impl CallOptions {
     /// inherited default. See [`CallTimeout::resolve`].
     pub fn effective_timeout(&self, inherited: Option<Duration>) -> Option<Duration> {
         self.timeout.resolve(inherited)
+    }
+}
+
+/// Per-call options for a single unary invocation.
+///
+/// Unlike reusable [`CallOptions`] (which stays [`Copy`] and carries only
+/// timeout policy), `UnaryCallOptions` can carry an explicit `call_id` bound
+/// to one logical unary operation.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
+pub struct UnaryCallOptions {
+    timeout: CallTimeout,
+    call_id: Option<String>,
+}
+
+impl UnaryCallOptions {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn from_call_options(options: CallOptions) -> Self {
+        Self {
+            timeout: options.timeout(),
+            call_id: None,
+        }
+    }
+
+    pub fn with_timeout(mut self, timeout: CallTimeout) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
+    pub fn with_call_id(mut self, call_id: impl Into<String>) -> Result<Self, String> {
+        let call_id = call_id.into();
+        validate_call_id(&call_id)?;
+        self.call_id = Some(call_id);
+        Ok(self)
+    }
+
+    pub const fn timeout(&self) -> CallTimeout {
+        self.timeout
+    }
+
+    pub fn call_id(&self) -> Option<&str> {
+        self.call_id.as_deref()
+    }
+
+    pub const fn call_options(&self) -> CallOptions {
+        CallOptions::with_timeout(self.timeout)
+    }
+
+    pub fn effective_timeout(&self, inherited: Option<Duration>) -> Option<Duration> {
+        self.timeout.resolve(inherited)
+    }
+}
+
+impl From<CallOptions> for UnaryCallOptions {
+    fn from(options: CallOptions) -> Self {
+        Self::from_call_options(options)
     }
 }
 
@@ -240,5 +298,13 @@ mod tests {
         assert_eq!(bounded, CallOptions::with_timeout(bounded.timeout()));
         let copied = bounded;
         assert_eq!(copied, bounded);
+
+        let unary = UnaryCallOptions::from(bounded)
+            .with_call_id("step-42_ok")
+            .unwrap();
+        assert_eq!(unary.timeout(), bounded.timeout());
+        assert_eq!(unary.call_id(), Some("step-42_ok"));
+        assert_eq!(unary.call_options(), bounded);
+        assert!(UnaryCallOptions::new().with_call_id("bad/id").is_err());
     }
 }

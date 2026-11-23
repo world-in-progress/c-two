@@ -20,13 +20,15 @@ const FILE_SPILL_BUDGET: &str = "C2_FILE_SPILL_BUDGET_BYTES";
 const CALL_MAX_OUTSTANDING: &str = "C2_CALL_MAX_OUTSTANDING";
 const MAX_PAYLOAD: &str = "C2_MAX_PAYLOAD_SIZE";
 const EXECUTION_WORKERS: &str = "C2_MAX_EXECUTION_WORKERS";
+const OUTCOME_MAX_ENTRIES: &str = "C2_OUTCOME_MAX_ENTRIES";
+const OUTCOME_MAX_RETAINED_BYTES: &str = "C2_OUTCOME_MAX_RETAINED_BYTES";
 const RELAY_BIND: &str = "C2_RELAY_BIND";
 const RELAY_ID: &str = "C2_RELAY_ID";
 const RELAY_ADVERTISE_URL: &str = "C2_RELAY_ADVERTISE_URL";
 const RELAY_SEEDS: &str = "C2_RELAY_SEEDS";
 const RELAY_USE_PROXY: &str = "C2_RELAY_USE_PROXY";
 
-const ENV_KEYS: [&str; 13] = [
+const ENV_KEYS: [&str; 15] = [
     ENV_FILE,
     RELAY_ANCHOR,
     IPC_ROOT,
@@ -35,6 +37,8 @@ const ENV_KEYS: [&str; 13] = [
     CALL_MAX_OUTSTANDING,
     MAX_PAYLOAD,
     EXECUTION_WORKERS,
+    OUTCOME_MAX_ENTRIES,
+    OUTCOME_MAX_RETAINED_BYTES,
     RELAY_BIND,
     RELAY_ID,
     RELAY_ADVERTISE_URL,
@@ -198,6 +202,8 @@ pub struct ServerConfigPatch {
     pub startup_timeout: ConfigField<Duration>,
     pub max_payload_size: ConfigField<u64>,
     pub max_execution_workers: ConfigField<u32>,
+    pub outcome_max_entries: ConfigField<usize>,
+    pub outcome_max_retained_bytes: ConfigField<u64>,
     pub domain_limits: DomainLimitsPatch,
 }
 
@@ -207,6 +213,8 @@ pub struct ServerConfigOverrides {
     pub startup_timeout: Option<Duration>,
     pub max_payload_size: Option<u64>,
     pub max_execution_workers: Option<u32>,
+    pub outcome_max_entries: Option<usize>,
+    pub outcome_max_retained_bytes: Option<u64>,
     pub domain_limits: DomainLimitsOverrides,
 }
 
@@ -219,6 +227,12 @@ impl ServerConfigOverrides {
         patch
             .max_execution_workers
             .apply(&mut self.max_execution_workers);
+        patch
+            .outcome_max_entries
+            .apply(&mut self.outcome_max_entries);
+        patch
+            .outcome_max_retained_bytes
+            .apply(&mut self.outcome_max_retained_bytes);
         self.domain_limits = self.domain_limits.patched(patch.domain_limits);
         self
     }
@@ -292,6 +306,7 @@ impl ConfigResolver {
             .unwrap_or(DEFAULT_SERVER_STARTUP_TIMEOUT);
         deadline_after(Instant::now(), startup_timeout)
             .map_err(|error| ConfigError::new(format!("startup_timeout: {error}")))?;
+        let domain_limits = Self::resolve_domain_limits(&overrides.domain_limits, catalog)?;
         let defaults = ServerIpcConfig::default();
         let ipc = ServerIpcConfig {
             max_payload_size: catalog
@@ -300,13 +315,20 @@ impl ConfigResolver {
             max_execution_workers: catalog
                 .integer(EXECUTION_WORKERS, overrides.max_execution_workers)?
                 .unwrap_or(defaults.max_execution_workers),
+            outcome_max_entries: catalog
+                .integer(OUTCOME_MAX_ENTRIES, overrides.outcome_max_entries)?
+                .unwrap_or(defaults.outcome_max_entries),
+            outcome_max_retained_bytes: catalog.integer(
+                OUTCOME_MAX_RETAINED_BYTES,
+                overrides.outcome_max_retained_bytes,
+            )?,
         };
-        ipc.validate()?;
+        ipc.validate_with_memory_budget(domain_limits.memory_budget_bytes)?;
         Ok(ResolvedServerConfig {
             server_id: overrides.server_id.clone(),
             startup_timeout,
             ipc,
-            domain_limits: Self::resolve_domain_limits(&overrides.domain_limits, catalog)?,
+            domain_limits,
         })
     }
 

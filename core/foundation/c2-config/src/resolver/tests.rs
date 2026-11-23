@@ -281,3 +281,62 @@ fn patches_commit_only_valid_complete_candidates() {
     );
     assert_eq!(overrides.domain_limits, saved);
 }
+
+#[test]
+fn outcome_store_limits_resolve_and_validate_against_memory_budget() {
+    let empty = catalog(&[]);
+    let default_server = ConfigResolver::resolve_server(&Default::default(), &empty).unwrap();
+    assert_eq!(
+        default_server.ipc.outcome_max_entries,
+        crate::DEFAULT_OUTCOME_MAX_ENTRIES
+    );
+    assert_eq!(default_server.ipc.outcome_max_retained_bytes, None);
+    assert_eq!(
+        default_server
+            .ipc
+            .effective_outcome_max_retained_bytes(default_server.domain_limits.memory_budget_bytes),
+        crate::DEFAULT_OUTCOME_MAX_RETAINED_BYTES_CAP
+    );
+
+    let small_mem = catalog(&[("C2_MEMORY_BUDGET_BYTES", "16777216")]);
+    let resolved = ConfigResolver::resolve_server(&Default::default(), &small_mem).unwrap();
+    assert_eq!(
+        resolved
+            .ipc
+            .effective_outcome_max_retained_bytes(resolved.domain_limits.memory_budget_bytes),
+        4 * 1024 * 1024
+    );
+
+    let metadata_only = catalog(&[
+        ("C2_OUTCOME_MAX_ENTRIES", "128"),
+        ("C2_OUTCOME_MAX_RETAINED_BYTES", "0"),
+    ]);
+    let resolved = ConfigResolver::resolve_server(&Default::default(), &metadata_only).unwrap();
+    assert_eq!(resolved.ipc.outcome_max_entries, 128);
+    assert_eq!(resolved.ipc.outcome_max_retained_bytes, Some(0));
+    assert_eq!(
+        resolved
+            .ipc
+            .effective_outcome_max_retained_bytes(resolved.domain_limits.memory_budget_bytes),
+        0
+    );
+
+    let zero_entries = catalog(&[("C2_OUTCOME_MAX_ENTRIES", "0")]);
+    assert!(
+        ConfigResolver::resolve_server(&Default::default(), &zero_entries)
+            .unwrap_err()
+            .to_string()
+            .contains("C2_OUTCOME_MAX_ENTRIES")
+    );
+
+    let exceeds_mem = catalog(&[
+        ("C2_MEMORY_BUDGET_BYTES", "1048576"),
+        ("C2_OUTCOME_MAX_RETAINED_BYTES", "2097152"),
+    ]);
+    assert!(
+        ConfigResolver::resolve_server(&Default::default(), &exceeds_mem)
+            .unwrap_err()
+            .to_string()
+            .contains("C2_OUTCOME_MAX_RETAINED_BYTES")
+    );
+}

@@ -1,4 +1,4 @@
-//! IPC 17 release records. Shape, direction and phase are checked at admission.
+//! IPC 18 release records. Shape, direction and phase are checked at admission.
 
 use c2_config::IPC_RELEASE_BATCH_CAPACITY;
 

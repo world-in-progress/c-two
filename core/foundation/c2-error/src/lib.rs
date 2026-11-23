@@ -127,6 +127,20 @@ define_error_codes! {
     CallCancelled = 718,
     RouteConflict = 719,
     SubscriptionLagged = 720,
+    CallIdConflict = 721,
+    CallResultUnavailable = 722,
+    CallOutcomeUnknown = 723,
+}
+
+impl ErrorCode {
+    /// True for Host-minted post-dispatch outcome control errors that must
+    /// never escape a nested resource callback as the outer call's own status.
+    pub const fn is_outcome_control(self) -> bool {
+        matches!(
+            self,
+            Self::CallIdConflict | Self::CallResultUnavailable | Self::CallOutcomeUnknown
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -710,7 +724,7 @@ mod tests {
     fn error_code_registry_matches_canonical_wire_values() {
         use ErrorCode::*;
 
-        let expected: [(ErrorCode, u16, &str); 26] = [
+        let expected: [(ErrorCode, u16, &str); 29] = [
             (Unknown, 0, "Unknown"),
             (ResourceInputDeserializing, 1, "ResourceInputDeserializing"),
             (ResourceOutputSerializing, 2, "ResourceOutputSerializing"),
@@ -737,6 +751,9 @@ mod tests {
             (CallCancelled, 718, "CallCancelled"),
             (RouteConflict, 719, "RouteConflict"),
             (SubscriptionLagged, 720, "SubscriptionLagged"),
+            (CallIdConflict, 721, "CallIdConflict"),
+            (CallResultUnavailable, 722, "CallResultUnavailable"),
+            (CallOutcomeUnknown, 723, "CallOutcomeUnknown"),
         ];
         let registry = ErrorCode::registry();
         assert_eq!(registry.len(), expected.len());
@@ -974,6 +991,9 @@ mod tests {
         for (code, expected) in [
             (ErrorCode::UnsupportedCallMode, 716_u16),
             (ErrorCode::CallCapacityExceeded, 717),
+            (ErrorCode::CallIdConflict, 721),
+            (ErrorCode::CallResultUnavailable, 722),
+            (ErrorCode::CallOutcomeUnknown, 723),
         ] {
             let plain = C2Error::new(code, "bounded call budget exhausted");
             let decoded = C2Error::from_wire_bytes(&plain.to_wire_bytes())
@@ -984,6 +1004,12 @@ mod tests {
             assert_eq!(decoded.message, "bounded call budget exhausted");
             assert!(decoded.details.is_empty());
         }
+
+        assert!(ErrorCode::CallIdConflict.is_outcome_control());
+        assert!(ErrorCode::CallResultUnavailable.is_outcome_control());
+        assert!(ErrorCode::CallOutcomeUnknown.is_outcome_control());
+        assert!(!ErrorCode::ResourceFunctionExecuting.is_outcome_control());
+        assert!(!ErrorCode::CallCapacityExceeded.is_outcome_control());
     }
 
     #[test]

@@ -1,6 +1,6 @@
-//! IPC 17 RPC record codec. Connection admission owns call state and cumulative offsets.
+//! IPC 18 RPC record codec. Connection admission owns call state and cumulative offsets.
 
-use c2_error::C2Error;
+use c2_error::{C2Error, ErrorCode};
 
 use crate::buddy::{
     BUDDY_PAYLOAD_SIZE, BuddyPayload, decode_buddy_payload, encode_buddy_payload_into,
@@ -24,12 +24,16 @@ pub const MAX_CALL_END_PAYLOAD_BYTES: u64 = (MAX_RPC_RECORD_BYTES - 1) as u64;
 pub const MAX_INLINE_CALL_END_ERROR_BYTES: usize =
     (c2_config::MAX_RPC_FRAME_BYTES as usize).saturating_sub(12 + 1 + 1 + 8);
 
+/// Compact byte budget for a QueryCallResult error C2E1 payload so control
+/// replies stay tiny even when a route or admission error carries details.
+pub const MAX_QUERY_CALL_ERROR_BYTES: usize = 4096;
+
 /// Truncation marker appended to truncated `message` and `details` values of
 /// a bounded CALL_END error. Short and ASCII so it never crosses a char
 /// boundary or grows the payload measurably.
 const CALL_END_TRUNCATION_MARKER: &str = "...[truncated]";
 
-/// Wire encoding failed because a field cannot be represented by IPC 17.
+/// Wire encoding failed because a field cannot be represented by IPC 18.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EncodeError {
     FieldTooLong {
@@ -108,11 +112,44 @@ fn identity_encoded_len(fields: &[&str; 6]) -> Result<usize, EncodeError> {
     Ok(6 + fields.iter().map(|s| s.len()).sum::<usize>())
 }
 
-/// Size of OPEN's kind, identity, method index and mode, without allocating.
+/// Size of OPEN's kind, identity, mode and method index for unkeyed calls, without allocating.
 pub fn encoded_open_metadata_len<S: AsRef<str>>(
     identity: &RouteCallIdentity<S>,
 ) -> Result<usize, EncodeError> {
     Ok(4 + identity_encoded_len(&identity_fields(identity))?)
+}
+
+/// Size of OPEN's kind, identity, mode, method index and length-prefixed call ID
+/// for a `KeyedUnary` call, without allocating.
+pub fn encoded_keyed_open_metadata_len<S: AsRef<str>>(
+    identity: &RouteCallIdentity<S>,
+    call_id: &str,
+) -> Result<usize, EncodeError> {
+    validate_wire_call_id_encode(call_id)?;
+    Ok(encoded_open_metadata_len(identity)? + 1 + call_id.len())
+}
+
+fn validate_wire_call_id_encode(call_id: &str) -> Result<(), EncodeError> {
+    if call_id.len() > c2_config::MAX_CALL_ID_LEN {
+        return Err(EncodeError::FieldTooLong {
+            field: "call_id",
+            max: c2_config::MAX_CALL_ID_LEN,
+            actual: call_id.len(),
+        });
+    }
+    c2_config::validate_call_id(call_id).map_err(|reason| EncodeError::InvalidText {
+        field: "call_id",
+        reason,
+    })
+}
+
+fn read_call_id(input: &[u8], pos: &mut usize) -> Result<String, DecodeError> {
+    let call_id = read_identity_text(input, pos, "call_id")?;
+    c2_config::validate_call_id(&call_id).map_err(|reason| DecodeError::InvalidText {
+        field: "call_id",
+        reason,
+    })?;
+    Ok(call_id)
 }
 
 fn read_identity_text(
@@ -149,14 +186,14 @@ fn read_identity_text(
     Ok(value)
 }
 
-/// Decode and validate the OPEN kind, six identity fields, call mode and method
-/// index for unary or server-stream calls. Returns the byte offset where value
-/// storage begins.
+/// Decode and validate the OPEN kind, six identity fields, call mode, method
+/// index and optional call ID for unary, keyed unary or server-stream calls.
+/// Returns the byte offset where value storage begins.
 pub fn decode_open_metadata(
     payload: &[u8],
-) -> Result<(RouteCallIdentity, u16, CallMode, usize), DecodeError> {
+) -> Result<(RouteCallIdentity, u16, CallMode, Option<String>, usize), DecodeError> {
     let (identity, mode, mut pos) = decode_open_identity_and_mode(payload)?;
-    if mode == CallMode::Subscribe {
+    if matches!(mode, CallMode::Subscribe | CallMode::Recover) {
         return Err(invalid("call mode", mode as u64));
     }
     if payload.len() - pos < 2 {
@@ -168,7 +205,56 @@ pub fn decode_open_metadata(
     }
     let method_idx = u16::from_le_bytes(payload[pos..pos + 2].try_into().unwrap());
     pos += 2;
-    Ok((identity, method_idx, mode, pos))
+    let call_id = if mode == CallMode::KeyedUnary {
+        Some(read_call_id(payload, &mut pos)?)
+    } else {
+        None
+    };
+    Ok((identity, method_idx, mode, call_id, pos))
+}
+
+fn decode_route_call_identity(
+    payload: &[u8],
+    pos: &mut usize,
+) -> Result<RouteCallIdentity, DecodeError> {
+    let route_name = read_identity_text(payload, pos, "route_name")?;
+    c2_contract::validate_call_route_key("route_name", &route_name).map_err(|error| {
+        DecodeError::InvalidText {
+            field: "route_name",
+            reason: error.to_string(),
+        }
+    })?;
+    let crm_ns = read_identity_text(payload, pos, "crm_ns")?;
+    let crm_name = read_identity_text(payload, pos, "crm_name")?;
+    let crm_ver = read_identity_text(payload, pos, "crm_ver")?;
+    c2_contract::validate_crm_tag(&crm_ns, &crm_name, &crm_ver).map_err(|error| {
+        DecodeError::InvalidText {
+            field: "crm tag",
+            reason: error.to_string(),
+        }
+    })?;
+    let abi_hash = read_identity_text(payload, pos, "abi_hash")?;
+    c2_contract::validate_contract_hash("abi_hash", &abi_hash).map_err(|error| {
+        DecodeError::InvalidText {
+            field: "abi_hash",
+            reason: error.to_string(),
+        }
+    })?;
+    let signature_hash = read_identity_text(payload, pos, "signature_hash")?;
+    c2_contract::validate_contract_hash("signature_hash", &signature_hash).map_err(|error| {
+        DecodeError::InvalidText {
+            field: "signature_hash",
+            reason: error.to_string(),
+        }
+    })?;
+    Ok(RouteCallIdentity {
+        route_name,
+        crm_ns,
+        crm_name,
+        crm_ver,
+        abi_hash,
+        signature_hash,
+    })
 }
 
 fn decode_open_identity_and_mode(
@@ -181,54 +267,14 @@ fn decode_open_identity_and_mode(
         ));
     }
     let mut pos = 1;
-    let route_name = read_identity_text(payload, &mut pos, "route_name")?;
-    c2_contract::validate_call_route_key("route_name", &route_name).map_err(|error| {
-        DecodeError::InvalidText {
-            field: "route_name",
-            reason: error.to_string(),
-        }
-    })?;
-    let crm_ns = read_identity_text(payload, &mut pos, "crm_ns")?;
-    let crm_name = read_identity_text(payload, &mut pos, "crm_name")?;
-    let crm_ver = read_identity_text(payload, &mut pos, "crm_ver")?;
-    c2_contract::validate_crm_tag(&crm_ns, &crm_name, &crm_ver).map_err(|error| {
-        DecodeError::InvalidText {
-            field: "crm tag",
-            reason: error.to_string(),
-        }
-    })?;
-    let abi_hash = read_identity_text(payload, &mut pos, "abi_hash")?;
-    c2_contract::validate_contract_hash("abi_hash", &abi_hash).map_err(|error| {
-        DecodeError::InvalidText {
-            field: "abi_hash",
-            reason: error.to_string(),
-        }
-    })?;
-    let signature_hash = read_identity_text(payload, &mut pos, "signature_hash")?;
-    c2_contract::validate_contract_hash("signature_hash", &signature_hash).map_err(|error| {
-        DecodeError::InvalidText {
-            field: "signature_hash",
-            reason: error.to_string(),
-        }
-    })?;
+    let identity = decode_route_call_identity(payload, &mut pos)?;
     let mode = CallMode::try_from(*payload.get(pos).ok_or(DecodeError::Truncated {
         field: "call mode",
         need: 1,
         have: 0,
     })?)?;
     pos += 1;
-    Ok((
-        RouteCallIdentity {
-            route_name,
-            crm_ns,
-            crm_name,
-            crm_ver,
-            abi_hash,
-            signature_hash,
-        },
-        mode,
-        pos,
-    ))
+    Ok((identity, mode, pos))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -244,6 +290,8 @@ pub enum RpcRecordKind {
     Ready = 8,
     Sync = 9,
     SyncAck = 10,
+    QueryCall = 11,
+    QueryCallResult = 12,
 }
 
 impl TryFrom<u8> for RpcRecordKind {
@@ -261,6 +309,8 @@ impl TryFrom<u8> for RpcRecordKind {
             8 => Ok(Self::Ready),
             9 => Ok(Self::Sync),
             10 => Ok(Self::SyncAck),
+            11 => Ok(Self::QueryCall),
+            12 => Ok(Self::QueryCallResult),
             _ => Err(invalid("RPC record kind", value.into())),
         }
     }
@@ -272,6 +322,24 @@ pub enum CallMode {
     Unary = 0,
     ServerStream = 1,
     Subscribe = 2,
+    KeyedUnary = 3,
+    Recover = 4,
+}
+
+impl CallMode {
+    /// True when the response terminates as a single unary `CALL_END` without
+    /// a server-stream / subscription item counter.
+    pub const fn is_unary_response(self) -> bool {
+        matches!(self, Self::Unary | Self::KeyedUnary | Self::Recover)
+    }
+
+    /// Underlying contract method mode required by this wire call mode.
+    pub const fn contract_method_mode(self) -> Self {
+        match self {
+            Self::KeyedUnary | Self::Recover => Self::Unary,
+            other => other,
+        }
+    }
 }
 
 impl TryFrom<u8> for CallMode {
@@ -282,9 +350,207 @@ impl TryFrom<u8> for CallMode {
             0 => Ok(Self::Unary),
             1 => Ok(Self::ServerStream),
             2 => Ok(Self::Subscribe),
+            3 => Ok(Self::KeyedUnary),
+            4 => Ok(Self::Recover),
             _ => Err(invalid("call mode", value.into())),
         }
     }
+}
+
+/// Wire encoding of a keyed unary call's status snapshot returned by `QueryCallResult`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum WireCallOutcomeStatus {
+    InFlight = 0,
+    Succeeded = 1,
+    Failed = 2,
+    Unknown = 3,
+}
+
+impl WireCallOutcomeStatus {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::InFlight => "in_flight",
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+impl TryFrom<u8> for WireCallOutcomeStatus {
+    type Error = DecodeError;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::InFlight),
+            1 => Ok(Self::Succeeded),
+            2 => Ok(Self::Failed),
+            3 => Ok(Self::Unknown),
+            _ => Err(invalid("call outcome status", value.into())),
+        }
+    }
+}
+
+/// Wire encoding of why a succeeded keyed unary call's response bytes cannot be replayed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum WireResultUnavailableReason {
+    NotRetained = 1,
+    Evicted = 2,
+}
+
+impl WireResultUnavailableReason {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NotRetained => "not_retained",
+            Self::Evicted => "evicted",
+        }
+    }
+}
+
+impl TryFrom<u8> for WireResultUnavailableReason {
+    type Error = DecodeError;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            1 => Ok(Self::NotRetained),
+            2 => Ok(Self::Evicted),
+            _ => Err(invalid("result unavailable reason", value.into())),
+        }
+    }
+}
+
+/// Compact bounded status snapshot returned by `QueryCallResult`.
+///
+/// Full response payloads and full `C2Error` bodies are intentionally excluded
+/// and retrieved through `Recover`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WireCallOutcome {
+    pub status: WireCallOutcomeStatus,
+    pub method_name: Option<String>,
+    pub result_available: bool,
+    pub result_unavailable_reason: Option<WireResultUnavailableReason>,
+    pub error_code: Option<ErrorCode>,
+    pub error_details_available: bool,
+}
+
+impl WireCallOutcome {
+    pub fn unknown() -> Self {
+        Self {
+            status: WireCallOutcomeStatus::Unknown,
+            method_name: None,
+            result_available: false,
+            result_unavailable_reason: None,
+            error_code: None,
+            error_details_available: false,
+        }
+    }
+
+    pub fn in_flight(method_name: String) -> Self {
+        Self {
+            status: WireCallOutcomeStatus::InFlight,
+            method_name: Some(method_name),
+            result_available: false,
+            result_unavailable_reason: None,
+            error_code: None,
+            error_details_available: false,
+        }
+    }
+
+    pub fn succeeded(
+        method_name: String,
+        result_available: bool,
+        result_unavailable_reason: Option<WireResultUnavailableReason>,
+    ) -> Self {
+        Self {
+            status: WireCallOutcomeStatus::Succeeded,
+            method_name: Some(method_name),
+            result_available,
+            result_unavailable_reason,
+            error_code: None,
+            error_details_available: false,
+        }
+    }
+
+    pub fn failed(
+        method_name: String,
+        error_code: ErrorCode,
+        error_details_available: bool,
+    ) -> Self {
+        Self {
+            status: WireCallOutcomeStatus::Failed,
+            method_name: Some(method_name),
+            result_available: false,
+            result_unavailable_reason: None,
+            error_code: Some(error_code),
+            error_details_available,
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if let Some(name) = &self.method_name {
+            if name.is_empty() || name.len() > u8::MAX as usize {
+                return Err("method_name length out of range");
+            }
+            if c2_contract::validate_contract_text_field("method_name", name).is_err() {
+                return Err("method_name is invalid");
+            }
+        }
+        match self.status {
+            WireCallOutcomeStatus::Unknown => {
+                if self.method_name.is_some()
+                    || self.result_available
+                    || self.result_unavailable_reason.is_some()
+                    || self.error_code.is_some()
+                    || self.error_details_available
+                {
+                    return Err("unknown outcome must not carry execution metadata");
+                }
+            }
+            WireCallOutcomeStatus::InFlight => {
+                if self.method_name.is_none()
+                    || self.result_available
+                    || self.result_unavailable_reason.is_some()
+                    || self.error_code.is_some()
+                    || self.error_details_available
+                {
+                    return Err("in_flight outcome must carry only method_name");
+                }
+            }
+            WireCallOutcomeStatus::Succeeded => {
+                if self.method_name.is_none()
+                    || self.error_code.is_some()
+                    || self.error_details_available
+                {
+                    return Err("succeeded outcome must not carry failure fields");
+                }
+                if self.result_available && self.result_unavailable_reason.is_some() {
+                    return Err("available result must not carry unavailable reason");
+                }
+                if !self.result_available && self.result_unavailable_reason.is_none() {
+                    return Err("unavailable result must carry unavailable reason");
+                }
+            }
+            WireCallOutcomeStatus::Failed => {
+                if self.method_name.is_none()
+                    || self.result_available
+                    || self.result_unavailable_reason.is_some()
+                    || self.error_code.is_none()
+                {
+                    return Err("failed outcome must carry method_name and error_code");
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Payload carried by `RpcRecordKind::QueryCallResult`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WireQueryCallResult {
+    Outcome(WireCallOutcome),
+    Error(C2Error),
 }
 
 /// Wire encoding of subscription starting position (`start`).
@@ -305,7 +571,7 @@ pub enum WireLagPolicy {
     Error = 1,
 }
 
-/// Packed one-byte subscription options carried in IPC 17 Subscribe OPEN.
+/// Packed one-byte subscription options carried in IPC 18 Subscribe OPEN.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub struct WireSubscribeOptions {
     pub start: WireTopicStart,
@@ -432,12 +698,18 @@ pub enum RpcRecord<'a> {
         identity: RouteCallIdentity,
         method_idx: u16,
         mode: CallMode,
+        call_id: Option<String>,
         value: ValuePart<'a>,
     },
     OpenSubscribe {
         identity: RouteCallIdentity,
         topic_name: String,
         options: WireSubscribeOptions,
+    },
+    OpenRecover {
+        identity: RouteCallIdentity,
+        method_idx: u16,
+        call_id: String,
     },
     OpenContinuation {
         value: ValuePart<'a>,
@@ -449,6 +721,11 @@ pub enum RpcRecord<'a> {
     SyncAck {
         head_seq: u64,
     },
+    QueryCall {
+        identity: RouteCallIdentity,
+        call_id: String,
+    },
+    QueryCallResult(WireQueryCallResult),
     ItemBegin {
         total_bytes: u64,
         seq: Option<u64>,
@@ -526,22 +803,34 @@ fn inspect_carrier(
                         return None;
                     }
                 }
-                if *payload.get(offset)? == CallMode::Subscribe as u8 {
-                    return None;
+                let mode_byte = *payload.get(offset)?;
+                offset = offset.checked_add(1)?;
+                match CallMode::try_from(mode_byte).ok()? {
+                    CallMode::Subscribe | CallMode::Recover => return None,
+                    CallMode::Unary | CallMode::ServerStream => {
+                        offset = offset.checked_add(2)?;
+                    }
+                    CallMode::KeyedUnary => {
+                        offset = offset.checked_add(2)?;
+                        let call_id_len = *payload.get(offset)? as usize;
+                        offset = offset.checked_add(1 + call_id_len)?;
+                        if offset > payload.len() {
+                            return None;
+                        }
+                    }
                 }
-                offset = offset.checked_add(3)?;
             }
             RpcRecordKind::CallEnd => {
                 let status = CallStatus::try_from(*payload.get(offset)?).ok()?;
                 offset = offset.checked_add(1)?;
                 match status {
                     CallStatus::NotExecuted => {}
-                    CallStatus::Success | CallStatus::Failed => match mode? {
-                        CallMode::Unary => {}
-                        CallMode::ServerStream | CallMode::Subscribe => {
+                    CallStatus::Success | CallStatus::Failed => {
+                        let mode = mode?;
+                        if !mode.is_unary_response() {
                             offset = offset.checked_add(8)?;
                         }
-                    },
+                    }
                 }
             }
             RpcRecordKind::ItemData => {}
@@ -588,6 +877,7 @@ pub fn decode_rpc_record<'a>(
             | RpcRecordKind::CallEnd
             | RpcRecordKind::Ready
             | RpcRecordKind::SyncAck
+            | RpcRecordKind::QueryCallResult
     );
     if kind != RpcRecordKind::Release && response != expected_response {
         return Err(DecodeError::InvalidRpcEnvelope {
@@ -668,13 +958,57 @@ pub fn decode_rpc_record<'a>(
             }
             let method_idx = u16::from_le_bytes(payload[used..used + 2].try_into().unwrap());
             used += 2;
+            if mode == CallMode::Recover {
+                if !no_storage {
+                    return Err(invalid("Recover OPEN flags", header.flags.into()));
+                }
+                let call_id = read_call_id(payload, &mut used)?;
+                if used != payload.len() {
+                    return Err(invalid(
+                        "Recover OPEN trailing bytes",
+                        (payload.len() - used) as u64,
+                    ));
+                }
+                return Ok(RpcRecord::OpenRecover {
+                    identity,
+                    method_idx,
+                    call_id,
+                });
+            }
+            let call_id = if mode == CallMode::KeyedUnary {
+                Some(read_call_id(payload, &mut used)?)
+            } else {
+                None
+            };
             let value = decode_value_at(payload, used, shm, first)?;
             Ok(RpcRecord::Open {
                 identity,
                 method_idx,
                 mode,
+                call_id,
                 value,
             })
+        }
+        RpcRecordKind::QueryCall => {
+            if !no_storage {
+                return Err(invalid("QUERY_CALL flags", header.flags.into()));
+            }
+            let mut pos = 1;
+            let identity = decode_route_call_identity(payload, &mut pos)?;
+            let call_id = read_call_id(payload, &mut pos)?;
+            if pos != payload.len() {
+                return Err(invalid(
+                    "QUERY_CALL trailing bytes",
+                    (payload.len() - pos) as u64,
+                ));
+            }
+            Ok(RpcRecord::QueryCall { identity, call_id })
+        }
+        RpcRecordKind::QueryCallResult => {
+            if !no_storage {
+                return Err(invalid("QUERY_CALL_RESULT flags", header.flags.into()));
+            }
+            Ok(RpcRecord::QueryCallResult(decode_query_call_result(body)?))
         }
         RpcRecordKind::Ready => {
             require_exact(body, 8, "READY")?;
@@ -745,7 +1079,9 @@ pub fn decode_rpc_record<'a>(
                     }
                     other => Err(invalid("ITEM_BEGIN", other as u64)),
                 },
-                Some(CallMode::Unary) => Err(invalid("ITEM_BEGIN mode", CallMode::Unary as u64)),
+                Some(mode @ (CallMode::Unary | CallMode::KeyedUnary | CallMode::Recover)) => {
+                    Err(invalid("ITEM_BEGIN mode", mode as u64))
+                }
             }
         }
         RpcRecordKind::ItemData => {
@@ -793,7 +1129,7 @@ pub fn decode_rpc_record<'a>(
                 CallStatus::NotExecuted => (None, 1),
                 CallStatus::Success | CallStatus::Failed => {
                     match mode.ok_or_else(|| invalid("CALL_END mode", 0))? {
-                        CallMode::Unary => (None, 1),
+                        mode if mode.is_unary_response() => (None, 1),
                         CallMode::ServerStream | CallMode::Subscribe => {
                             if body.len() < 9 {
                                 return Err(DecodeError::BufferTooShort {
@@ -803,6 +1139,7 @@ pub fn decode_rpc_record<'a>(
                             }
                             (Some(u64::from_le_bytes(body[1..9].try_into().unwrap())), 9)
                         }
+                        _ => unreachable!(),
                     }
                 }
             };
@@ -889,7 +1226,7 @@ fn validate_call_end(
     }
     if status != CallStatus::NotExecuted {
         match mode.ok_or_else(|| "CALL_END mode is unknown".to_string())? {
-            CallMode::Unary if complete_items != 0 => {
+            mode if mode.is_unary_response() && complete_items != 0 => {
                 return Err("unary call has completed items".into());
             }
             _ => {}
@@ -918,6 +1255,97 @@ fn validate_call_end(
         return Err("successful server stream has no result value".into());
     }
     Ok(None)
+}
+
+fn decode_query_call_result(body: &[u8]) -> Result<WireQueryCallResult, DecodeError> {
+    let tag = *body.first().ok_or(DecodeError::BufferTooShort {
+        need: 1,
+        have: 0,
+    })?;
+    match tag {
+        0 => {
+            if body.len() < 7 {
+                return Err(DecodeError::BufferTooShort {
+                    need: 7,
+                    have: body.len(),
+                });
+            }
+            let status = WireCallOutcomeStatus::try_from(body[1])?;
+            let flags = body[2];
+            if flags & !0x03 != 0 {
+                return Err(invalid("call outcome flags", flags.into()));
+            }
+            let result_available = flags & 0x01 != 0;
+            let error_details_available = flags & 0x02 != 0;
+            let result_unavailable_reason = match body[3] {
+                0 => None,
+                other => Some(WireResultUnavailableReason::try_from(other)?),
+            };
+            let raw_error_code = u16::from_le_bytes(body[4..6].try_into().unwrap());
+            let error_code = if status == WireCallOutcomeStatus::Failed {
+                Some(
+                    ErrorCode::try_from(raw_error_code)
+                        .map_err(|_| invalid("call outcome error code", raw_error_code.into()))?,
+                )
+            } else {
+                if raw_error_code != 0 {
+                    return Err(invalid("call outcome error code", raw_error_code.into()));
+                }
+                None
+            };
+            let method_len = body[6] as usize;
+            if body.len() != 7 + method_len {
+                return Err(invalid("QUERY_CALL_RESULT length", body.len() as u64));
+            }
+            let method_name = if method_len == 0 {
+                None
+            } else {
+                let s = std::str::from_utf8(&body[7..])
+                    .map_err(|_| DecodeError::Utf8Error)?
+                    .to_string();
+                Some(s)
+            };
+            let outcome = WireCallOutcome {
+                status,
+                method_name,
+                result_available,
+                result_unavailable_reason,
+                error_code,
+                error_details_available,
+            };
+            outcome.validate().map_err(|reason| DecodeError::InvalidText {
+                field: "QUERY_CALL_RESULT",
+                reason: reason.into(),
+            })?;
+            Ok(WireQueryCallResult::Outcome(outcome))
+        }
+        1 => {
+            let err_bytes = &body[1..];
+            if err_bytes.is_empty() {
+                return Err(DecodeError::InvalidText {
+                    field: "QUERY_CALL_RESULT",
+                    reason: "error is empty".into(),
+                });
+            }
+            if err_bytes.len() > MAX_QUERY_CALL_ERROR_BYTES {
+                return Err(invalid(
+                    "QUERY_CALL_RESULT error length",
+                    err_bytes.len() as u64,
+                ));
+            }
+            let error = C2Error::from_wire_bytes(err_bytes)
+                .map_err(|err| DecodeError::InvalidText {
+                    field: "QUERY_CALL_RESULT",
+                    reason: err.to_string(),
+                })?
+                .ok_or_else(|| DecodeError::InvalidText {
+                    field: "QUERY_CALL_RESULT",
+                    reason: "error is empty".into(),
+                })?;
+            Ok(WireQueryCallResult::Error(error))
+        }
+        other => Err(invalid("QUERY_CALL_RESULT tag", other.into())),
+    }
 }
 
 fn require_exact(body: &[u8], len: usize, field: &'static str) -> Result<(), DecodeError> {
@@ -1103,10 +1531,10 @@ fn open_record_prefix<S: AsRef<str>>(
     if chunk == ChunkPosition::Continuation {
         return Err(encode_invalid("OPEN", "invalid request id or continuation"));
     }
-    if mode == CallMode::Subscribe {
+    if !matches!(mode, CallMode::Unary | CallMode::ServerStream) {
         return Err(encode_invalid(
             "call mode",
-            "subscribe OPEN requires encode_open_subscribe_frame",
+            "encode_open_frame accepts only Unary or ServerStream",
         ));
     }
     let fields = identity_fields(identity);
@@ -1127,6 +1555,240 @@ fn open_record_prefix<S: AsRef<str>>(
         out.extend_from_slice(&total_bytes.to_le_bytes());
     }
     Ok(out)
+}
+
+/// Encode a `KeyedUnary` OPEN frame with an explicit nonzero request ID.
+pub fn encode_open_keyed_frame<S: AsRef<str>>(
+    request_id: u64,
+    identity: &RouteCallIdentity<S>,
+    method_idx: u16,
+    call_id: &str,
+    value: ValuePart<'_>,
+) -> Result<Vec<u8>, EncodeError> {
+    if request_id == 0 {
+        return Err(encode_invalid("OPEN", "invalid request id or continuation"));
+    }
+    encode_open_keyed_record(request_id, identity, method_idx, call_id, value)
+}
+
+/// Encode a complete `KeyedUnary` OPEN draft. The connection's unique writer
+/// assigns its RID before publication.
+pub fn encode_open_keyed_draft_frame<S: AsRef<str>>(
+    identity: &RouteCallIdentity<S>,
+    method_idx: u16,
+    call_id: &str,
+    value: ValuePart<'_>,
+) -> Result<Vec<u8>, EncodeError> {
+    encode_open_keyed_record(0, identity, method_idx, call_id, value)
+}
+
+/// Reserve one complete inline `KeyedUnary` OPEN draft before a charged
+/// streaming source appends exactly `value_bytes` bytes.
+pub fn encode_open_keyed_inline_draft_prefix<S: AsRef<str>>(
+    identity: &RouteCallIdentity<S>,
+    method_idx: u16,
+    call_id: &str,
+    chunk: ChunkPosition,
+    value_bytes: usize,
+) -> Result<Vec<u8>, EncodeError> {
+    let (prefix_len, flags) = chunk_layout(chunk, value_bytes as u64)?;
+    open_keyed_record_prefix(
+        0,
+        identity,
+        method_idx,
+        call_id,
+        chunk,
+        record_len(prefix_len, value_bytes)?,
+        flags,
+    )
+}
+
+fn encode_open_keyed_record<S: AsRef<str>>(
+    request_id: u64,
+    identity: &RouteCallIdentity<S>,
+    method_idx: u16,
+    call_id: &str,
+    value: ValuePart<'_>,
+) -> Result<Vec<u8>, EncodeError> {
+    let (value_len, flags) = value_layout(value)?;
+    let mut out = open_keyed_record_prefix(
+        request_id,
+        identity,
+        method_idx,
+        call_id,
+        value.chunk,
+        value_len,
+        flags,
+    )?;
+    write_storage(&mut out, value.storage);
+    Ok(out)
+}
+
+fn open_keyed_record_prefix<S: AsRef<str>>(
+    request_id: u64,
+    identity: &RouteCallIdentity<S>,
+    method_idx: u16,
+    call_id: &str,
+    chunk: ChunkPosition,
+    value_len: usize,
+    flags: u32,
+) -> Result<Vec<u8>, EncodeError> {
+    if chunk == ChunkPosition::Continuation {
+        return Err(encode_invalid("OPEN", "invalid request id or continuation"));
+    }
+    validate_wire_call_id_encode(call_id)?;
+    let fields = identity_fields(identity);
+    let metadata_len = 1 + identity_encoded_len(&fields)? + 1 + 2 + 1 + call_id.len();
+    let mut out = record_frame(
+        request_id,
+        FLAG_RPC_RECORD | flags,
+        record_len(metadata_len, value_len)?,
+    )?;
+    out.push(RpcRecordKind::Open as u8);
+    for field in fields {
+        out.push(field.len() as u8);
+        out.extend_from_slice(field.as_bytes());
+    }
+    out.push(CallMode::KeyedUnary as u8);
+    out.extend_from_slice(&method_idx.to_le_bytes());
+    out.push(call_id.len() as u8);
+    out.extend_from_slice(call_id.as_bytes());
+    if let ChunkPosition::First { total_bytes } = chunk {
+        out.extend_from_slice(&total_bytes.to_le_bytes());
+    }
+    Ok(out)
+}
+
+/// Encode a `Recover` OPEN frame with an explicit nonzero request ID.
+pub fn encode_open_recover_frame<S: AsRef<str>>(
+    request_id: u64,
+    identity: &RouteCallIdentity<S>,
+    method_idx: u16,
+    call_id: &str,
+) -> Result<Vec<u8>, EncodeError> {
+    if request_id == 0 {
+        return Err(encode_invalid("OPEN", "request id must be nonzero"));
+    }
+    encode_open_recover_record(request_id, identity, method_idx, call_id)
+}
+
+/// Encode a `Recover` OPEN draft. The connection's unique writer assigns its RID.
+pub fn encode_open_recover_draft_frame<S: AsRef<str>>(
+    identity: &RouteCallIdentity<S>,
+    method_idx: u16,
+    call_id: &str,
+) -> Result<Vec<u8>, EncodeError> {
+    encode_open_recover_record(0, identity, method_idx, call_id)
+}
+
+fn encode_open_recover_record<S: AsRef<str>>(
+    request_id: u64,
+    identity: &RouteCallIdentity<S>,
+    method_idx: u16,
+    call_id: &str,
+) -> Result<Vec<u8>, EncodeError> {
+    validate_wire_call_id_encode(call_id)?;
+    let fields = identity_fields(identity);
+    let payload_len = 1 + identity_encoded_len(&fields)? + 1 + 2 + 1 + call_id.len();
+    let mut out = record_frame(request_id, FLAG_RPC_RECORD, payload_len)?;
+    out.push(RpcRecordKind::Open as u8);
+    for field in fields {
+        out.push(field.len() as u8);
+        out.extend_from_slice(field.as_bytes());
+    }
+    out.push(CallMode::Recover as u8);
+    out.extend_from_slice(&method_idx.to_le_bytes());
+    out.push(call_id.len() as u8);
+    out.extend_from_slice(call_id.as_bytes());
+    Ok(out)
+}
+
+/// Encode a `QueryCall` control record with an explicit nonzero request ID.
+pub fn encode_query_call_frame<S: AsRef<str>>(
+    request_id: u64,
+    identity: &RouteCallIdentity<S>,
+    call_id: &str,
+) -> Result<Vec<u8>, EncodeError> {
+    if request_id == 0 {
+        return Err(encode_invalid("QUERY_CALL", "request id must be nonzero"));
+    }
+    encode_query_call_record(request_id, identity, call_id)
+}
+
+/// Encode a `QueryCall` draft; the connection writer assigns its nonzero RID.
+pub fn encode_query_call_draft_frame<S: AsRef<str>>(
+    identity: &RouteCallIdentity<S>,
+    call_id: &str,
+) -> Result<Vec<u8>, EncodeError> {
+    encode_query_call_record(0, identity, call_id)
+}
+
+fn encode_query_call_record<S: AsRef<str>>(
+    request_id: u64,
+    identity: &RouteCallIdentity<S>,
+    call_id: &str,
+) -> Result<Vec<u8>, EncodeError> {
+    validate_wire_call_id_encode(call_id)?;
+    let fields = identity_fields(identity);
+    let payload_len = 1 + identity_encoded_len(&fields)? + 1 + call_id.len();
+    let mut out = record_frame(request_id, FLAG_RPC_RECORD, payload_len)?;
+    out.push(RpcRecordKind::QueryCall as u8);
+    for field in fields {
+        out.push(field.len() as u8);
+        out.extend_from_slice(field.as_bytes());
+    }
+    out.push(call_id.len() as u8);
+    out.extend_from_slice(call_id.as_bytes());
+    Ok(out)
+}
+
+/// Encode a `QueryCallResult` control reply frame.
+pub fn encode_query_call_result_frame(
+    request_id: u64,
+    result: &WireQueryCallResult,
+) -> Result<Vec<u8>, EncodeError> {
+    if request_id == 0 {
+        return Err(encode_invalid(
+            "QUERY_CALL_RESULT",
+            "request id must be nonzero",
+        ));
+    }
+    match result {
+        WireQueryCallResult::Outcome(outcome) => {
+            outcome
+                .validate()
+                .map_err(|reason| encode_invalid("QUERY_CALL_RESULT", reason))?;
+            let method_bytes = outcome.method_name.as_deref().unwrap_or("").as_bytes();
+            let payload_len = 1 + 1 + 1 + 1 + 1 + 2 + 1 + method_bytes.len();
+            let mut out = record_frame(request_id, FLAG_RPC_RECORD | FLAG_RESPONSE, payload_len)?;
+            out.push(RpcRecordKind::QueryCallResult as u8);
+            out.push(0); // Outcome tag
+            out.push(outcome.status as u8);
+            let mut flags = 0u8;
+            if outcome.result_available {
+                flags |= 0x01;
+            }
+            if outcome.error_details_available {
+                flags |= 0x02;
+            }
+            out.push(flags);
+            out.push(outcome.result_unavailable_reason.map_or(0, |r| r as u8));
+            let error_code: u16 = outcome.error_code.map_or(0, u16::from);
+            out.extend_from_slice(&error_code.to_le_bytes());
+            out.push(method_bytes.len() as u8);
+            out.extend_from_slice(method_bytes);
+            Ok(out)
+        }
+        WireQueryCallResult::Error(error) => {
+            let err_bytes = bounded_query_call_error_bytes(error);
+            let payload_len = record_len(2, err_bytes.len())?;
+            let mut out = record_frame(request_id, FLAG_RPC_RECORD | FLAG_RESPONSE, payload_len)?;
+            out.push(RpcRecordKind::QueryCallResult as u8);
+            out.push(1); // Error tag
+            out.extend_from_slice(&err_bytes);
+            Ok(out)
+        }
+    }
 }
 
 /// Encode a Subscribe OPEN frame with an explicit nonzero request ID.
@@ -1254,10 +1916,20 @@ fn truncate_error_once(error: &C2Error) -> Option<C2Error> {
 /// "true"). Never panics; a pathological input degrades to a minimal valid
 /// C2E1 payload.
 pub fn bounded_call_end_error_bytes(error: &C2Error) -> Vec<u8> {
+    bounded_error_bytes_with_limit(error, MAX_INLINE_CALL_END_ERROR_BYTES)
+}
+
+/// Encode `error` as compact C2E1 bytes guaranteed to fit within
+/// [`MAX_QUERY_CALL_ERROR_BYTES`] for `QueryCallResult::Error`.
+pub fn bounded_query_call_error_bytes(error: &C2Error) -> Vec<u8> {
+    bounded_error_bytes_with_limit(error, MAX_QUERY_CALL_ERROR_BYTES)
+}
+
+fn bounded_error_bytes_with_limit(error: &C2Error, limit: usize) -> Vec<u8> {
     let mut current = error.clone();
     loop {
         let bytes = current.to_wire_bytes();
-        if bytes.len() <= MAX_INLINE_CALL_END_ERROR_BYTES {
+        if bytes.len() <= limit {
             return bytes;
         }
         match truncate_error_once(&current) {

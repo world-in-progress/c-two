@@ -1,3 +1,21 @@
+pub const MAX_CALL_ID_LEN: usize = 128;
+
+pub fn validate_call_id(call_id: &str) -> Result<(), String> {
+    if call_id.is_empty() {
+        return Err("call_id cannot be empty".to_string());
+    }
+    if call_id.len() > MAX_CALL_ID_LEN {
+        return Err(format!("call_id cannot exceed {MAX_CALL_ID_LEN} bytes"));
+    }
+    if !call_id
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return Err("call_id must contain only ASCII [A-Za-z0-9_-]".to_string());
+    }
+    Ok(())
+}
+
 pub fn validate_server_id(server_id: &str) -> Result<(), String> {
     validate_id("server_id", server_id)
 }
@@ -83,5 +101,26 @@ mod tests {
     #[test]
     fn plain_ids_are_accepted() {
         validate_server_id("unit-server").unwrap();
+    }
+
+    #[test]
+    fn call_id_validation_enforces_ascii_charset_and_bounds() {
+        validate_call_id("a").unwrap();
+        validate_call_id("step-001_AZaz09").unwrap();
+        validate_call_id(&"a".repeat(MAX_CALL_ID_LEN)).unwrap();
+
+        for bad in [
+            "",
+            "has space",
+            "has/slash",
+            "has.dot",
+            "..",
+            "bad:colon",
+            "non_ascii_中",
+            "lead\n",
+        ] {
+            assert!(validate_call_id(bad).is_err(), "expected rejection: {bad:?}");
+        }
+        assert!(validate_call_id(&"a".repeat(MAX_CALL_ID_LEN + 1)).is_err());
     }
 }

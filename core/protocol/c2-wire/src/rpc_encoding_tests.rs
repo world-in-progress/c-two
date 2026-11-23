@@ -1,4 +1,4 @@
-//! Handwritten IPC 17 whole-frame fixtures for the public RPC encoders.
+//! Handwritten IPC 18 whole-frame fixtures for the public RPC encoders.
 //! Keep the expected headers and bodies independent of the production codec.
 
 use crate::buddy::BuddyPayload;
