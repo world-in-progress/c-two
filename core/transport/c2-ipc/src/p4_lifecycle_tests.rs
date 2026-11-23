@@ -736,7 +736,14 @@ async fn admitted_response_error_never_enters_the_buddy_request_fallback() {
         .ensure_buddy_segments(1)
         .expect("real request SHM is required");
     let error = client
-        .call_buddy(&identity(), 0, &[8; 8193], DEFAULT_MAX_PAYLOAD_SIZE, None)
+        .call_buddy(
+            &identity(),
+            0,
+            &[8; 8193],
+            None,
+            DEFAULT_MAX_PAYLOAD_SIZE,
+            None,
+        )
         .await
         .unwrap_err();
     assert!(matches!(error.source_error(), IpcError::ResponseFailure(_)));
@@ -768,6 +775,7 @@ async fn disabled_buddy_chunked_request_reassembles_into_real_dedicated_shm() {
             &binding.table.call_identity(),
             0,
             &[8; BYTES_LEN],
+            None,
             DEFAULT_MAX_PAYLOAD_SIZE,
             None,
         )
@@ -962,6 +970,7 @@ async fn exhausted_request_reassembly_budget_returns_correlated_error_and_keeps_
             &binding.table.call_identity(),
             0,
             &vec![3; CHUNK_SIZE as usize + 1],
+            None,
             DEFAULT_MAX_PAYLOAD_SIZE,
             None,
         ),

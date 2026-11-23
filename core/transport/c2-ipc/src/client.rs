@@ -1227,11 +1227,17 @@ impl IpcClient {
             .map_err(|error| IpcError::Config(error.clone()))
     }
 
-    fn begin_call(
+    fn begin_unary_call(
         &self,
+        call_id: Option<&str>,
         max_payload_size: u64,
     ) -> Result<(SendGuard, oneshot::Receiver<Result<ResponseData, IpcError>>), IpcError> {
-        self.begin_pending(PendingKind::Call(CallMode::Unary), max_payload_size)
+        let mode = if call_id.is_some() {
+            CallMode::KeyedUnary
+        } else {
+            CallMode::Unary
+        };
+        self.begin_pending(PendingKind::Call(mode), max_payload_size)
     }
 
     fn begin_control(
@@ -1651,21 +1657,28 @@ impl IpcClient {
 
     async fn call_resolved_target(
         &self,
-        route_name: &str,
         method_idx: u16,
         identity: RouteCallIdentity,
         max_payload_size: u64,
         data: &[u8],
+        call_id: Option<&str>,
         control: Option<&IpcCallControl>,
     ) -> Result<ResponseData, crate::IpcCallError> {
-        validate_request_size(route_name, data.len(), max_payload_size)?;
+        validate_request_size(&identity.route_name, data.len(), max_payload_size)?;
 
         IpcCallControl::check_preparation(control).map_err(pre_dispatch_call_error)?;
 
         match choose_request_transport(self.shm_request_available(), data.len()) {
             RequestTransportKind::Buddy => {
                 match self
-                    .call_buddy(&identity, method_idx, data, max_payload_size, control)
+                    .call_buddy(
+                        &identity,
+                        method_idx,
+                        data,
+                        call_id,
+                        max_payload_size,
+                        control,
+                    )
                     .await
                 {
                     Ok(result) => return Ok(result),
@@ -1682,18 +1695,39 @@ impl IpcClient {
             }
             RequestTransportKind::Chunked => {
                 return self
-                    .call_chunked(&identity, method_idx, data, max_payload_size, control)
+                    .call_chunked(
+                        &identity,
+                        method_idx,
+                        data,
+                        call_id,
+                        max_payload_size,
+                        control,
+                    )
                     .await;
             }
             RequestTransportKind::Inline => {
                 return self
-                    .call_inline_controlled(&identity, method_idx, data, max_payload_size, control)
+                    .call_inline_controlled(
+                        &identity,
+                        method_idx,
+                        data,
+                        call_id,
+                        max_payload_size,
+                        control,
+                    )
                     .await;
             }
         }
 
-        self.call_owned_bytes(&identity, method_idx, data, max_payload_size, control)
-            .await
+        self.call_owned_bytes(
+            &identity,
+            method_idx,
+            data,
+            call_id,
+            max_payload_size,
+            control,
+        )
+        .await
     }
 
     /// Send fully owned request bytes through the non-SHM policy: chunked when
@@ -1704,19 +1738,34 @@ impl IpcClient {
         identity: &RouteCallIdentity,
         method_idx: u16,
         data: &[u8],
+        call_id: Option<&str>,
         max_payload_size: u64,
         control: Option<&IpcCallControl>,
     ) -> Result<ResponseData, crate::IpcCallError> {
         match choose_request_transport(false, data.len()) {
             RequestTransportKind::Chunked => {
-                self.call_chunked(identity, method_idx, data, max_payload_size, control)
-                    .await
+                self.call_chunked(
+                    identity,
+                    method_idx,
+                    data,
+                    call_id,
+                    max_payload_size,
+                    control,
+                )
+                .await
             }
             // Buddy is unreachable with `shm_available=false`; the inline
             // path is the only remaining owned transport.
             RequestTransportKind::Inline | RequestTransportKind::Buddy => {
-                self.call_inline_controlled(identity, method_idx, data, max_payload_size, control)
-                    .await
+                self.call_inline_controlled(
+                    identity,
+                    method_idx,
+                    data,
+                    call_id,
+                    max_payload_size,
+                    control,
+                )
+                .await
             }
         }
     }
@@ -1747,9 +1796,8 @@ impl IpcClient {
             .map_err(crate::IpcCallError::into_source)
     }
 
-    /// Submit one unary call with an explicit `call_id` (ADR 0006 keyed
-    /// submit). Mirrors the plain unary transport selection — inline, buddy
-    /// SHM or chunked first frame — with the keyed OPEN encoding.
+    /// Submit one unary call with an explicit key using the ordinary inline,
+    /// SHM or chunked transport on this route binding.
     pub async fn call_keyed_bound(
         &self,
         binding: &RouteBinding,
@@ -1758,165 +1806,70 @@ impl IpcClient {
         data: &[u8],
     ) -> Result<ResponseData, IpcError> {
         let (method_idx, identity, max_payload_size) = binding.call_target_for(method_name)?;
-        self.call_keyed(&identity, method_idx, call_id, data, max_payload_size)
-            .await
-            .map_err(crate::IpcCallError::into_source)
-    }
-
-    async fn call_keyed(
-        &self,
-        identity: &RouteCallIdentity,
-        method_idx: u16,
-        call_id: &str,
-        data: &[u8],
-        max_payload_size: u64,
-    ) -> Result<ResponseData, crate::IpcCallError> {
-        validate_request_size(identity.route_name.as_ref(), data.len(), max_payload_size)?;
-        if choose_request_transport(self.shm_request_available(), data.len())
-            == RequestTransportKind::Buddy
-            && let Some(block) = self
-                .try_alloc_request_block(data.len())
-                .map_err(pre_dispatch_call_error)?
-        {
-            block.write_at(0, data).map_err(pre_dispatch_call_error)?;
-            return self
-                .call_keyed_with_prealloc(identity, method_idx, call_id, &block, max_payload_size)
-                .await;
-        }
-        if choose_request_transport(false, data.len()) == RequestTransportKind::Chunked {
-            return self
-                .call_keyed_chunked(identity, method_idx, call_id, data, max_payload_size)
-                .await;
-        }
-        self.call_keyed_inline(identity, method_idx, call_id, data, max_payload_size)
-            .await
-    }
-
-    async fn call_keyed_inline(
-        &self,
-        identity: &RouteCallIdentity,
-        method_idx: u16,
-        call_id: &str,
-        data: &[u8],
-        max_payload_size: u64,
-    ) -> Result<ResponseData, crate::IpcCallError> {
-        let (send, mut rx) = self
-            .begin_pending(PendingKind::Call(CallMode::KeyedUnary), max_payload_size)
-            .map_err(pre_dispatch_call_error)?;
-        let bytes = rpc::encode_open_keyed_draft_frame(
-            identity,
+        self.call_resolved_target(
             method_idx,
-            call_id,
-            ValuePart::whole(ValueStorage::Inline(data)),
-        )
-        .map_err(|error| pre_dispatch_call_error(IpcError::Protocol(error.to_string())))?;
-        let written = send
-            .conn
-            .submit(
-                bytes,
-                WriteRequest::Business(Vec::new()),
-                send.state.clone(),
-                None,
-            )
-            .await;
-        let response = match written {
-            Ok(()) => rx
-                .await
-                .map_err(|_| dispatch_call_error(IpcError::Closed, send.started()))?,
-            Err(error) => prefer_ready_response(error, &mut rx),
-        };
-        owned_response(response, &self.budget)
-            .map_err(|error| dispatch_call_error(error, send.started()))
-    }
-
-    async fn call_keyed_with_prealloc(
-        &self,
-        identity: &RouteCallIdentity,
-        method_idx: u16,
-        call_id: &str,
-        block: &RequestBlock,
-        max_payload_size: u64,
-    ) -> Result<ResponseData, crate::IpcCallError> {
-        let (send, mut rx) = self
-            .begin_pending(PendingKind::Call(CallMode::KeyedUnary), max_payload_size)
-            .map_err(pre_dispatch_call_error)?;
-        let loan = block.prepare(&send.conn).map_err(pre_dispatch_call_error)?;
-        let alloc = block.allocation();
-        let descriptor = BuddyPayload {
-            seg_idx: alloc.seg_idx as u16,
-            generation: alloc.generation,
-            offset: alloc.offset,
-            data_size: block.len() as u32,
-            is_dedicated: alloc.is_dedicated,
-            loan_id: loan.id(),
-        };
-        let bytes = rpc::encode_open_keyed_draft_frame(
             identity,
-            method_idx,
-            call_id,
-            ValuePart::whole(ValueStorage::Shm(descriptor)),
-        )
-        .map_err(|error| pre_dispatch_call_error(IpcError::Protocol(error.to_string())))?;
-        let written = send
-            .conn
-            .submit(
-                bytes,
-                WriteRequest::Business(vec![loan]),
-                send.state.clone(),
-                None,
-            )
-            .await;
-        let response = match written {
-            Ok(()) => rx
-                .await
-                .map_err(|_| dispatch_call_error(IpcError::Closed, send.started()))?,
-            Err(error) => prefer_ready_response(error, &mut rx),
-        };
-        owned_response(response, &self.budget)
-            .map_err(|error| dispatch_call_error(error, send.started()))
-    }
-
-    async fn call_keyed_chunked(
-        &self,
-        identity: &RouteCallIdentity,
-        method_idx: u16,
-        call_id: &str,
-        data: &[u8],
-        max_payload_size: u64,
-    ) -> Result<ResponseData, crate::IpcCallError> {
-        self.call_chunked_stream_controlled(
-            identity,
-            method_idx,
-            Some(call_id),
-            data.len(),
-            futures_util::stream::iter([Ok::<_, std::io::Error>(data.to_vec())]),
             max_payload_size,
+            data,
+            Some(call_id),
             None,
         )
         .await
+        .map_err(crate::IpcCallError::into_source)
     }
 
-    /// Recover one keyed unary call by its `call_id` (ADR 0006): no request
-    /// body; the reply decodes as one unary `CALL_END`.
+    /// Recover a keyed unary response without a request payload.
     pub async fn recover_call_bound(
         &self,
         binding: &RouteBinding,
         method_name: &str,
         call_id: &str,
     ) -> Result<ResponseData, IpcError> {
-        let (method_idx, identity, max_payload_size) = binding.call_target_for(method_name)?;
-        self.recover_call(&identity, method_idx, call_id, max_payload_size)
-            .await
-            .map_err(crate::IpcCallError::into_source)
+        let result = self
+            .receive_recovery(binding, method_name, call_id, None)
+            .await;
+        owned_response(
+            result.map_err(crate::IpcCallError::into_source),
+            &self.budget,
+        )
     }
 
-    async fn recover_call(
+    /// Recover a keyed unary response with first-byte authority from the owner.
+    pub async fn recover_call_bound_controlled_phased(
         &self,
-        identity: &RouteCallIdentity,
-        method_idx: u16,
+        binding: &RouteBinding,
+        method_name: &str,
         call_id: &str,
-        max_payload_size: u64,
+        control: &IpcCallControl,
     ) -> Result<ResponseData, crate::IpcCallError> {
+        let response = self
+            .receive_recovery(binding, method_name, call_id, Some(control))
+            .await?;
+        owned_response(Ok(response), &self.budget).map_err(dispatch_uncertain_call_error)
+    }
+
+    /// Receive the original response carrier for bounded relay forwarding.
+    pub async fn forward_recover_bound_phased(
+        &self,
+        binding: &RouteBinding,
+        method_name: &str,
+        call_id: &str,
+    ) -> Result<ResponseData, crate::IpcCallError> {
+        self.receive_recovery(binding, method_name, call_id, None)
+            .await
+    }
+
+    async fn receive_recovery(
+        &self,
+        binding: &RouteBinding,
+        method_name: &str,
+        call_id: &str,
+        control: Option<&IpcCallControl>,
+    ) -> Result<ResponseData, crate::IpcCallError> {
+        let (method_idx, identity, max_payload_size) = binding
+            .call_target_for(method_name)
+            .map_err(pre_dispatch_call_error)?;
+        IpcCallControl::check_preparation(control).map_err(pre_dispatch_call_error)?;
         let (send, mut rx) = self
             .begin_pending(PendingKind::Call(CallMode::Recover), max_payload_size)
             .map_err(pre_dispatch_call_error)?;
@@ -1928,7 +1881,7 @@ impl IpcClient {
                 bytes,
                 WriteRequest::Business(Vec::new()),
                 send.state.clone(),
-                None,
+                control.cloned(),
             )
             .await;
         let response = match written {
@@ -1937,8 +1890,7 @@ impl IpcClient {
                 .map_err(|_| dispatch_call_error(IpcError::Closed, send.started()))?,
             Err(error) => prefer_ready_response(error, &mut rx),
         };
-        owned_response(response, &self.budget)
-            .map_err(|error| dispatch_call_error(error, send.started()))
+        response.map_err(|error| dispatch_call_error(error, send.started()))
     }
 
     /// Non-blocking outcome query for one keyed call (ADR 0006). Bypasses
@@ -1961,6 +1913,31 @@ impl IpcClient {
         call_id: &str,
         timeout: std::time::Duration,
     ) -> Result<rpc::WireCallOutcome, IpcError> {
+        self.query_call_identity_with_deadline(
+            identity,
+            call_id,
+            std::time::Instant::now().checked_add(timeout),
+        )
+        .await
+    }
+
+    pub(crate) async fn query_call_with_deadline(
+        &self,
+        binding: &RouteBinding,
+        call_id: &str,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<rpc::WireCallOutcome, IpcError> {
+        let (identity, _) = binding.identity_target();
+        self.query_call_identity_with_deadline(&identity, call_id, deadline)
+            .await
+    }
+
+    async fn query_call_identity_with_deadline(
+        &self,
+        identity: &RouteCallIdentity,
+        call_id: &str,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<rpc::WireCallOutcome, IpcError> {
         let conn = self.driver.read().clone().ok_or(IpcError::Closed)?;
         if conn.core.is_deactivated() {
             return Err(IpcError::Closed);
@@ -1982,7 +1959,7 @@ impl IpcClient {
                 ])),
             )
         })?;
-        conn.query(frame, timeout).await
+        conn.query(frame, deadline).await
     }
 
     async fn call_bound_with_control(
@@ -1995,15 +1972,8 @@ impl IpcClient {
         let (method_idx, identity, max_payload_size) = binding
             .call_target_for(method_name)
             .map_err(pre_dispatch_call_error)?;
-        self.call_resolved_target(
-            binding.route_name(),
-            method_idx,
-            identity,
-            max_payload_size,
-            data,
-            control,
-        )
-        .await
+        self.call_resolved_target(method_idx, identity, max_payload_size, data, None, control)
+            .await
     }
 
     /// Send a route-bound call with an explicit dispatch-safety phase.
@@ -2053,6 +2023,19 @@ impl IpcClient {
         slab: c2_mem::WritableSlab,
         control: &IpcCallControl,
     ) -> Result<ResponseData, crate::IpcCallError> {
+        self.call_bound_slab_with_key_controlled_phased(binding, method_name, slab, None, control)
+            .await
+    }
+
+    /// Publish an optionally keyed request from a slab with the owner's dispatch guard.
+    pub async fn call_bound_slab_with_key_controlled_phased(
+        &self,
+        binding: &RouteBinding,
+        method_name: &str,
+        slab: c2_mem::WritableSlab,
+        call_id: Option<&str>,
+        control: &IpcCallControl,
+    ) -> Result<ResponseData, crate::IpcCallError> {
         let (method_idx, identity, max_payload_size) = binding
             .call_target_for(method_name)
             .map_err(pre_dispatch_call_error)?;
@@ -2072,13 +2055,21 @@ impl IpcClient {
                     &identity,
                     method_idx,
                     &RequestBlock::from_slab(slab),
+                    call_id,
                     max_payload_size,
                     Some(control),
                 )
                 .await;
         }
-        self.call_owned_non_shm(&identity, method_idx, slab, max_payload_size, control)
-            .await
+        self.call_owned_non_shm(
+            &identity,
+            method_idx,
+            slab,
+            call_id,
+            max_payload_size,
+            control,
+        )
+        .await
     }
 
     /// Consume an input owner instead of borrowing it through the reply wait.
@@ -2089,6 +2080,22 @@ impl IpcClient {
         binding: &RouteBinding,
         method_name: &str,
         data: B,
+        control: &IpcCallControl,
+    ) -> Result<ResponseData, crate::IpcCallError>
+    where
+        B: AsRef<[u8]> + Send + 'static,
+    {
+        self.call_bound_owned_with_key_controlled_phased(binding, method_name, data, None, control)
+            .await
+    }
+
+    /// Consume an optionally keyed request owner with first-byte dispatch authority.
+    pub async fn call_bound_owned_with_key_controlled_phased<B>(
+        &self,
+        binding: &RouteBinding,
+        method_name: &str,
+        data: B,
+        call_id: Option<&str>,
         control: &IpcCallControl,
     ) -> Result<ResponseData, crate::IpcCallError>
     where
@@ -2117,6 +2124,7 @@ impl IpcClient {
                             &identity,
                             method_idx,
                             &block,
+                            call_id,
                             max_payload_size,
                             Some(control),
                         )
@@ -2127,8 +2135,15 @@ impl IpcClient {
                 Err(error) => return Err(pre_dispatch_call_error(error)),
             }
         }
-        self.call_owned_non_shm(&identity, method_idx, data, max_payload_size, control)
-            .await
+        self.call_owned_non_shm(
+            &identity,
+            method_idx,
+            data,
+            call_id,
+            max_payload_size,
+            control,
+        )
+        .await
     }
 
     async fn call_owned_non_shm<B>(
@@ -2136,6 +2151,7 @@ impl IpcClient {
         identity: &RouteCallIdentity,
         method_idx: u16,
         data: B,
+        call_id: Option<&str>,
         max_payload_size: u64,
         control: &IpcCallControl,
     ) -> Result<ResponseData, crate::IpcCallError>
@@ -2148,7 +2164,7 @@ impl IpcClient {
                 self.call_chunked_stream_controlled(
                     identity,
                     method_idx,
-                    None,
+                    call_id,
                     data_len,
                     futures_util::stream::iter([Ok::<_, std::io::Error>(data)]),
                     max_payload_size,
@@ -2161,6 +2177,7 @@ impl IpcClient {
                     identity,
                     method_idx,
                     data,
+                    call_id,
                     max_payload_size,
                     Some(control),
                 )
@@ -2348,14 +2365,22 @@ impl IpcClient {
                     identity,
                     method_idx,
                     BudgetedBuffer::new(data, reservation),
+                    None,
                     max_payload_size,
                     None,
                 )
                 .await
             }
             None => {
-                self.call_inline_controlled(identity, method_idx, data, max_payload_size, None)
-                    .await
+                self.call_inline_controlled(
+                    identity,
+                    method_idx,
+                    data,
+                    None,
+                    max_payload_size,
+                    None,
+                )
+                .await
             }
         }
     }
@@ -2368,8 +2393,15 @@ impl IpcClient {
         method_idx: u16,
         data: &[u8],
     ) -> Result<ResponseData, crate::IpcCallError> {
-        self.call_inline_controlled(identity, method_idx, data, DEFAULT_MAX_PAYLOAD_SIZE, None)
-            .await
+        self.call_inline_controlled(
+            identity,
+            method_idx,
+            data,
+            None,
+            DEFAULT_MAX_PAYLOAD_SIZE,
+            None,
+        )
+        .await
     }
 
     /// Route-resolved inline path carrying the route's reply-value cap.
@@ -2380,7 +2412,7 @@ impl IpcClient {
         data: &[u8],
         max_payload_size: u64,
     ) -> Result<ResponseData, crate::IpcCallError> {
-        self.call_inline_controlled(identity, method_idx, data, max_payload_size, None)
+        self.call_inline_controlled(identity, method_idx, data, None, max_payload_size, None)
             .await
     }
 
@@ -2389,21 +2421,21 @@ impl IpcClient {
         identity: &RouteCallIdentity,
         method_idx: u16,
         data: B,
+        call_id: Option<&str>,
         max_payload_size: u64,
         control: Option<&IpcCallControl>,
     ) -> Result<ResponseData, crate::IpcCallError> {
         IpcCallControl::check_preparation(control).map_err(pre_dispatch_call_error)?;
         let (send, mut rx) = self
-            .begin_call(max_payload_size)
+            .begin_unary_call(call_id, max_payload_size)
             .map_err(pre_dispatch_call_error)?;
         // The draft has no wire identity until the unique writer submits it.
-        let bytes = rpc::encode_open_draft_frame(
+        let bytes = encode_unary_open(
             identity,
             method_idx,
-            CallMode::Unary,
-            ValuePart::whole(ValueStorage::Inline(data.as_ref())),
-        )
-        .map_err(|error| pre_dispatch_call_error(IpcError::Protocol(error.to_string())))?;
+            call_id,
+            ValueStorage::Inline(data.as_ref()),
+        )?;
         let written = send
             .conn
             .submit(
@@ -2430,6 +2462,7 @@ impl IpcClient {
         identity: &RouteCallIdentity,
         method_idx: u16,
         data: &[u8],
+        call_id: Option<&str>,
         max_payload_size: u64,
         control: Option<&IpcCallControl>,
     ) -> Result<ResponseData, crate::IpcCallError> {
@@ -2440,8 +2473,15 @@ impl IpcClient {
                 pre_dispatch_call_error(IpcError::Shm("request SHM allocation unavailable".into()))
             })?;
         block.write_at(0, data).map_err(pre_dispatch_call_error)?;
-        self.call_with_prealloc_controlled(identity, method_idx, &block, max_payload_size, control)
-            .await
+        self.call_with_prealloc_controlled(
+            identity,
+            method_idx,
+            &block,
+            call_id,
+            max_payload_size,
+            control,
+        )
+        .await
     }
 
     pub(crate) fn try_alloc_request_block(
@@ -2538,8 +2578,15 @@ impl IpcClient {
         block: &RequestBlock,
         max_payload_size: u64,
     ) -> Result<ResponseData, crate::IpcCallError> {
-        self.call_with_prealloc_controlled(identity, method_idx, block, max_payload_size, None)
-            .await
+        self.call_with_prealloc_controlled(
+            identity,
+            method_idx,
+            block,
+            None,
+            max_payload_size,
+            None,
+        )
+        .await
     }
 
     async fn call_with_prealloc_controlled(
@@ -2547,12 +2594,13 @@ impl IpcClient {
         identity: &RouteCallIdentity,
         method_idx: u16,
         block: &RequestBlock,
+        call_id: Option<&str>,
         max_payload_size: u64,
         control: Option<&IpcCallControl>,
     ) -> Result<ResponseData, crate::IpcCallError> {
         IpcCallControl::check_preparation(control).map_err(pre_dispatch_call_error)?;
         let (send, mut rx) = self
-            .begin_call(max_payload_size)
+            .begin_unary_call(call_id, max_payload_size)
             .map_err(pre_dispatch_call_error)?;
         let loan = block.prepare(&send.conn).map_err(pre_dispatch_call_error)?;
         let alloc = block.allocation();
@@ -2564,13 +2612,8 @@ impl IpcClient {
             is_dedicated: alloc.is_dedicated,
             loan_id: loan.id(),
         };
-        let bytes = rpc::encode_open_draft_frame(
-            identity,
-            method_idx,
-            CallMode::Unary,
-            ValuePart::whole(ValueStorage::Shm(descriptor)),
-        )
-        .map_err(|error| pre_dispatch_call_error(IpcError::Protocol(error.to_string())))?;
+        let bytes =
+            encode_unary_open(identity, method_idx, call_id, ValueStorage::Shm(descriptor))?;
         let written = send
             .conn
             .submit(
@@ -2595,6 +2638,7 @@ impl IpcClient {
         identity: &RouteCallIdentity,
         method_idx: u16,
         data: &[u8],
+        call_id: Option<&str>,
         max_payload_size: u64,
         control: Option<&IpcCallControl>,
     ) -> Result<ResponseData, crate::IpcCallError> {
@@ -2602,7 +2646,7 @@ impl IpcClient {
         self.call_chunked_stream_controlled(
             identity,
             method_idx,
-            None,
+            call_id,
             data.len(),
             futures_util::stream::iter([Ok::<_, std::io::Error>(data.to_vec())]),
             max_payload_size,
@@ -2660,17 +2704,14 @@ impl IpcClient {
                     identity,
                     method_idx,
                     &[],
+                    call_id,
                     max_payload_size,
                     policy.as_ref(),
                 )
                 .await;
         }
-        let pending_kind = match call_id {
-            Some(_) => PendingKind::Call(CallMode::KeyedUnary),
-            None => PendingKind::Call(CallMode::Unary),
-        };
         let (mut send, mut rx) = self
-            .begin_pending(pending_kind, max_payload_size)
+            .begin_unary_call(call_id, max_payload_size)
             .map_err(pre_dispatch_call_error)?;
         let conn = send.conn.clone();
         let state = send.state.clone();
@@ -2722,16 +2763,11 @@ impl IpcClient {
                     .map_err(|source| dispatch_call_error(source, send.started()));
             }
         }
-        match rx.await {
-            Ok(result) => owned_response(result, &self.budget).map_err(|error| {
-                if matches!(error, IpcError::Closed) && !send.started() {
-                    pre_dispatch_call_error(error)
-                } else {
-                    classified_call_error(error)
-                }
-            }),
-            Err(_) => Err(dispatch_uncertain_call_error(IpcError::Closed)),
-        }
+        let response = rx
+            .await
+            .map_err(|_| dispatch_call_error(IpcError::Closed, send.started()))?;
+        owned_response(response, &self.budget)
+            .map_err(|error| dispatch_call_error(error, send.started()))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3347,6 +3383,20 @@ fn prefer_ready_response(
         Ok(response) => response,
         Err(_) => Err(error),
     }
+}
+
+fn encode_unary_open(
+    identity: &RouteCallIdentity,
+    method_idx: u16,
+    call_id: Option<&str>,
+    storage: ValueStorage<'_>,
+) -> Result<Vec<u8>, crate::IpcCallError> {
+    let part = ValuePart::whole(storage);
+    match call_id {
+        Some(call_id) => rpc::encode_open_keyed_draft_frame(identity, method_idx, call_id, part),
+        None => rpc::encode_open_draft_frame(identity, method_idx, CallMode::Unary, part),
+    }
+    .map_err(|error| pre_dispatch_call_error(IpcError::Protocol(error.to_string())))
 }
 
 fn owned_response(

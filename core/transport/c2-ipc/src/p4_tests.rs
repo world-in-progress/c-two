@@ -317,7 +317,14 @@ async fn response_does_not_release_a_request_loan_and_peer_end_does() {
         .expect("this test requires real request SHM backing");
     assert_eq!(
         client
-            .call_buddy(&identity(), 0, &[7; 8193], DEFAULT_MAX_PAYLOAD_SIZE, None)
+            .call_buddy(
+                &identity(),
+                0,
+                &[7; 8193],
+                None,
+                DEFAULT_MAX_PAYLOAD_SIZE,
+                None
+            )
             .await
             .unwrap()
             .into_owned_bytes()
@@ -478,8 +485,14 @@ async fn cancellation_before_writer_publication_releases_ordinary_and_stream_pre
             drop(call);
         } else {
             let id = identity();
-            let mut call =
-                Box::pin(client.call_buddy(&id, 0, &[3; 8193], DEFAULT_MAX_PAYLOAD_SIZE, None));
+            let mut call = Box::pin(client.call_buddy(
+                &id,
+                0,
+                &[3; 8193],
+                None,
+                DEFAULT_MAX_PAYLOAD_SIZE,
+                None,
+            ));
             assert!(futures_util::poll!(call.as_mut()).is_pending());
             assert_eq!(pool.read().stats().alloc_count, 1);
             drop(call);
@@ -729,7 +742,14 @@ async fn cancelling_a_started_shm_write_keeps_the_driver_and_never_replays() {
         let client = client.clone();
         async move {
             client
-                .call_buddy(&identity(), 0, &[7; 8193], DEFAULT_MAX_PAYLOAD_SIZE, None)
+                .call_buddy(
+                    &identity(),
+                    0,
+                    &[7; 8193],
+                    None,
+                    DEFAULT_MAX_PAYLOAD_SIZE,
+                    None,
+                )
                 .await
         }
     });

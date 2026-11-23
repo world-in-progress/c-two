@@ -589,7 +589,7 @@ impl ClientConnection {
     pub(crate) async fn query(
         self: &Arc<Self>,
         frame: Vec<u8>,
-        timeout: Duration,
+        deadline: Option<std::time::Instant>,
     ) -> Result<WireCallOutcome, IpcError> {
         let deadline_error = || {
             IpcError::Io(io::Error::new(
@@ -597,7 +597,7 @@ impl ClientConnection {
                 "query_call timed out",
             ))
         };
-        if timeout.is_zero() {
+        if deadline.is_some_and(|deadline| deadline <= std::time::Instant::now()) {
             return Err(deadline_error());
         }
         let control = self.core.prepare_control_frame().map_err(core_error)?;
@@ -607,7 +607,7 @@ impl ClientConnection {
             conn: self,
             state: &state,
         };
-        tokio::time::timeout(timeout, async {
+        let query = async {
             let write = self.submit_frame(
                 frame,
                 WriteRequest::Control(control),
@@ -625,9 +625,13 @@ impl ClientConnection {
                     receiver.await.map_err(|_| IpcError::Closed)?
                 }
             }
-        })
-        .await
-        .map_err(|_| deadline_error())?
+        };
+        match deadline {
+            Some(deadline) => tokio::time::timeout_at(deadline.into(), query)
+                .await
+                .map_err(|_| deadline_error())?,
+            None => query.await,
+        }
     }
 
     async fn submit_frame(

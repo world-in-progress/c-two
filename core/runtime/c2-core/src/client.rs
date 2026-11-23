@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Duration;
 
-use c2_config::{CallOptions, ConnectDeadline, ConnectOptions};
+use c2_config::{CallOptions, CallTimeout, ConnectDeadline, ConnectOptions, UnaryCallOptions};
 use c2_http::client::{HttpCallControl, HttpResponseStream, HttpStreamCancellation};
 use c2_ipc::IpcCallControl;
 
@@ -21,7 +21,8 @@ use c2_mem::{BudgetedBuffer, DomainBudget, WritableSlab};
 
 use crate::session::RelayResolvedConnection;
 use crate::{
-    Error, LifecycleError, Runtime, TransportPhase, normalize_http_error, normalize_ipc_error,
+    CallOutcome, Error, LifecycleError, Runtime, TransportPhase, normalize_http_error,
+    normalize_ipc_error,
 };
 
 const STALE_POOL_RECONNECT_ATTEMPTS: usize = 2;
@@ -456,6 +457,154 @@ impl Client {
         self.prepare_with_budget(method, budget, self.inner.current.read().clone(), false)
     }
 
+    /// Submit an encoded unary request with optional per-operation deduplication.
+    pub fn call_unary_with_options(
+        &self,
+        method: &str,
+        request: &[u8],
+        options: UnaryCallOptions,
+    ) -> Result<Vec<u8>, Error> {
+        self.begin_unary_with_options(method, options)?
+            .encode_slice(request)?
+            .call_owned()
+    }
+
+    /// Submit a unary request and return an independently owned response hold.
+    pub fn call_unary_held_with_options(
+        &self,
+        method: &str,
+        request: &[u8],
+        options: UnaryCallOptions,
+    ) -> Result<HeldResponse, Error> {
+        self.begin_unary_with_options(method, options)?
+            .encode_slice(request)?
+            .call_held()
+    }
+
+    #[doc(hidden)]
+    pub fn begin_unary_with_options(
+        &self,
+        method: &str,
+        options: UnaryCallOptions,
+    ) -> Result<PreparedCall, Error> {
+        let target = self.inner.current.read().clone();
+        let budget = CallBudget::new(options.call_options(), target.path_default)?;
+        self.prepare_unary(method, budget, target, options.call_id())
+    }
+
+    #[doc(hidden)]
+    pub fn begin_unary_with_budget(
+        &self,
+        method: &str,
+        budget: CallBudget,
+        call_id: Option<&str>,
+    ) -> Result<PreparedCall, Error> {
+        let target = self.inner.current.read().clone();
+        self.prepare_unary(method, budget, target, call_id)
+    }
+
+    fn prepare_unary(
+        &self,
+        method: &str,
+        budget: CallBudget,
+        target: Arc<ClientTarget>,
+        call_id: Option<&str>,
+    ) -> Result<PreparedCall, Error> {
+        let mode = if let Some(call_id) = call_id {
+            validate_call_id(call_id)?;
+            UnaryMode::Keyed(Arc::from(call_id))
+        } else {
+            UnaryMode::Plain
+        };
+        let mut prepared = self.prepare_with_budget(method, budget, target, false)?;
+        prepared.unary_mode = mode;
+        Ok(prepared)
+    }
+
+    /// Attach to or replay a keyed unary result without providing a request payload.
+    pub fn recover_unary_call(
+        &self,
+        method: &str,
+        call_id: &str,
+        timeout: CallTimeout,
+    ) -> Result<Vec<u8>, Error> {
+        self.begin_recover(method, call_id, timeout)?.call_owned()
+    }
+
+    /// Attach to or replay a keyed unary result into an independently owned hold.
+    pub fn recover_unary_call_held(
+        &self,
+        method: &str,
+        call_id: &str,
+        timeout: CallTimeout,
+    ) -> Result<HeldResponse, Error> {
+        self.begin_recover(method, call_id, timeout)?.call_held()
+    }
+
+    #[doc(hidden)]
+    pub fn begin_recover(
+        &self,
+        method: &str,
+        call_id: &str,
+        timeout: CallTimeout,
+    ) -> Result<EncodedCall, Error> {
+        validate_call_id(call_id)?;
+        let target = self.inner.current.read().clone();
+        let budget = CallBudget::new(CallOptions::with_timeout(timeout), target.path_default)?;
+        let mut prepared = self.prepare_with_budget(method, budget, target, false)?;
+        prepared.unary_mode = UnaryMode::Recover(Arc::from(call_id));
+        prepared.encode_vec(Vec::new())
+    }
+
+    /// Read the bound registration's current snapshot without taking a business slot.
+    pub fn query_call(&self, call_id: &str, timeout: CallTimeout) -> Result<CallOutcome, Error> {
+        validate_call_id(call_id)?;
+        let target = self.inner.current.read().clone();
+        let budget = CallBudget::new(CallOptions::with_timeout(timeout), target.path_default)?;
+        budget.scope.check_pre_dispatch().map_err(scope_error)?;
+        let query = async {
+            let target = self
+                .inner
+                .target_for_call(target, &budget.scope, budget.deadline)
+                .await?;
+            match &target.transport {
+                ClientInner::Ipc(connection) => connection
+                    .client
+                    .query_call_async(&connection.binding, call_id, budget.scope.deadline())
+                    .await
+                    .map_err(|error| match error {
+                        c2_ipc::IpcError::Io(ref source)
+                            if source.kind() == ErrorKind::TimedOut =>
+                        {
+                            scope_error(CallScopeError::DeadlineExceeded {
+                                phase: TransportPhase::PreDispatch,
+                            })
+                        }
+                        error => normalize_ipc_error(error, TransportPhase::PreDispatch),
+                    }),
+                ClientInner::Http(client) => client
+                    .query_call_async(call_id)
+                    .await
+                    .map_err(normalize_http_call_error),
+            }
+        };
+        let result = crate::call_execution::shared_executor()?.block_on(async {
+            match budget.scope.deadline() {
+                Some(deadline) => {
+                    tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), query)
+                        .await
+                        .map_err(|_| {
+                            scope_error(CallScopeError::DeadlineExceeded {
+                                phase: TransportPhase::PreDispatch,
+                            })
+                        })?
+                }
+                None => query.await,
+            }
+        });
+        result.map(CallOutcome::from)
+    }
+
     /// Streams have no inherited unary timeout and reserve a call slot.
     #[doc(hidden)]
     pub fn begin_stream(&self, method: &str) -> Result<PreparedCall, Error> {
@@ -644,6 +793,7 @@ impl Client {
             deadline: budget.deadline,
             method: method.into(),
             stream,
+            unary_mode: UnaryMode::Plain,
         })
     }
 }
@@ -658,6 +808,40 @@ pub struct PreparedCall {
     deadline: ConnectDeadline,
     method: String,
     stream: bool,
+    unary_mode: UnaryMode,
+}
+
+#[derive(Clone)]
+enum UnaryMode {
+    Plain,
+    Keyed(Arc<str>),
+    Recover(Arc<str>),
+}
+
+impl UnaryMode {
+    fn call_id(&self) -> Option<&Arc<str>> {
+        match self {
+            Self::Plain => None,
+            Self::Keyed(id) | Self::Recover(id) => Some(id),
+        }
+    }
+}
+
+fn validate_call_id(id: &str) -> Result<(), Error> {
+    c2_config::validate_call_id(id).map_err(|error| LifecycleError::Configuration(error).into())
+}
+
+fn unsupported_keyed_method() -> Error {
+    Error::Semantic(
+        c2_error::C2Error::new(
+            c2_error::ErrorCode::UnsupportedCallMode,
+            "outcome operations require a declared unary method",
+        )
+        .with_details(std::collections::BTreeMap::from([(
+            "transport_phase".into(),
+            "pre_dispatch".into(),
+        )])),
+    )
 }
 
 impl PreparedCall {
@@ -873,7 +1057,11 @@ impl EncodedCall {
             deadline,
             method,
             stream,
+            unary_mode,
         } = self.prepared;
+        if unary_mode.call_id().is_some() {
+            return Err(unsupported_keyed_method());
+        }
         if !stream {
             return Err(LifecycleError::Configuration(
                 "stream handoff requires begin_stream".into(),
@@ -949,6 +1137,7 @@ impl EncodedCall {
     }
 
     pub fn call_owned(self) -> Result<Vec<u8>, Error> {
+        let call_id = self.prepared.unary_mode.call_id().cloned();
         self.start_unary(false, |response, _| match response {
             UnaryResponse::Ipc(response) => response
                 .into_owned_bytes()
@@ -956,16 +1145,31 @@ impl EncodedCall {
             UnaryResponse::Http(buffer) => Ok(buffer.into_parts().0),
         })?
         .wait()
+        .map_err(|error| error.with_uncertain_call_id(call_id.as_deref()))
     }
 
     pub fn call_held(self) -> Result<HeldResponse, Error> {
-        self.start_held(false)?.wait()
+        let call_id = self.prepared.unary_mode.call_id().cloned();
+        self.start_held(false)?
+            .wait()
+            .map_err(|error| error.with_uncertain_call_id(call_id.as_deref()))
     }
 
     #[doc(hidden)]
     pub async fn call_held_record_async(self) -> CallRecordOutcome<HeldResponse> {
+        let call_id = self.prepared.unary_mode.call_id().cloned();
         match self.start_held(true) {
-            Ok(started) => started.wait_original().await,
+            Ok(started) => {
+                let CallRecordOutcome {
+                    result,
+                    dispatch_target,
+                } = started.wait_original().await;
+                CallRecordOutcome {
+                    result: result
+                        .map_err(|error| error.with_uncertain_call_id(call_id.as_deref())),
+                    dispatch_target,
+                }
+            }
             Err(error) => CallRecordOutcome {
                 result: Err(error),
                 dispatch_target: None,
@@ -997,6 +1201,7 @@ impl EncodedCall {
             deadline,
             method,
             stream,
+            unary_mode,
         } = self.prepared;
         if stream {
             return Err(
@@ -1012,14 +1217,21 @@ impl EncodedCall {
                 }
                 let result = async {
                     let response = match &target.transport {
-                        ClientInner::Ipc(connection) => {
-                            UnaryResponse::Ipc(call_ipc(connection, &method, input, scope).await?)
-                        }
+                        ClientInner::Ipc(connection) => UnaryResponse::Ipc(
+                            call_ipc(connection, &method, input, scope, &unary_mode).await?,
+                        ),
                         ClientInner::Http(client) => {
                             let input = input.into_http(&payload_budget, &scope)?;
                             UnaryResponse::Http(
-                                call_http(client, &method, input, scope, payload_budget.clone())
-                                    .await?,
+                                call_http(
+                                    client,
+                                    &method,
+                                    input,
+                                    scope,
+                                    payload_budget.clone(),
+                                    &unary_mode,
+                                )
+                                .await?,
                             )
                         }
                     };
@@ -1060,35 +1272,60 @@ async fn call_ipc(
     method: &str,
     input: UnaryInput,
     scope: CallScope,
+    mode: &UnaryMode,
 ) -> Result<c2_ipc::ResponseData, Error> {
     let preparation = scope.clone();
     let control = IpcCallControl::new(move || scope.try_begin_dispatch().map_err(guard_error))
         .with_before_prepare(move || preparation.check_pre_dispatch().map_err(guard_error));
-    let result = match input {
-        UnaryInput::Owned(input) => {
+    let call_id = mode.call_id().map(AsRef::as_ref);
+    let result = match (mode, input) {
+        (UnaryMode::Recover(id), _) => {
             connection
                 .client
-                .call_bound_owned_controlled_async_phased(
+                .recover_call_bound_controlled_async_phased(
                     &connection.binding,
                     method,
-                    input,
+                    id,
                     &control,
                 )
                 .await
         }
-        UnaryInput::Slab(slab) => {
+        (_, UnaryInput::Owned(input)) => {
             connection
                 .client
-                .call_bound_slab_controlled_async_phased(
+                .call_bound_owned_with_key_controlled_async_phased(
+                    &connection.binding,
+                    method,
+                    input,
+                    call_id,
+                    &control,
+                )
+                .await
+        }
+        (_, UnaryInput::Slab(slab)) => {
+            connection
+                .client
+                .call_bound_slab_with_key_controlled_async_phased(
                     &connection.binding,
                     method,
                     slab,
+                    call_id,
                     &control,
                 )
                 .await
         }
     };
-    result.map_err(normalize_ipc_call_error)
+    result.map_err(|error| {
+        if call_id.is_some()
+            && matches!(
+                error.source_error(),
+                c2_ipc::IpcError::MethodNotFound { .. }
+            )
+        {
+            return unsupported_keyed_method();
+        }
+        normalize_ipc_call_error(error)
+    })
 }
 
 async fn call_ipc_stream(
@@ -1208,6 +1445,7 @@ async fn call_http(
     input: BudgetedBuffer,
     scope: CallScope,
     payload_budget: DomainBudget,
+    mode: &UnaryMode,
 ) -> Result<BudgetedBuffer, Error> {
     let active = scope.clone();
     let deadline = scope.deadline();
@@ -1231,16 +1469,32 @@ async fn call_http(
     .with_payload_budget(payload_budget, deadline);
     // The controlled channel has no reqwest total/upload timer for ALL policy
     // modes, including inherited defaults and explicit Unlimited/600 seconds.
-    client
-        .call_controlled_async(method, Arc::new(input), &control)
-        .await
-        .map_err(|error| {
-            let phase = match error.phase() {
-                HttpCallPhase::PreDispatch => TransportPhase::PreDispatch,
-                HttpCallPhase::DispatchUncertain => TransportPhase::DispatchUncertain,
-            };
-            normalize_http_error(error.into_source(), phase)
-        })
+    match mode {
+        UnaryMode::Plain => {
+            client
+                .call_controlled_async(method, Arc::new(input), &control)
+                .await
+        }
+        UnaryMode::Keyed(call_id) => {
+            client
+                .call_keyed_controlled_async(method, call_id, Arc::new(input), &control)
+                .await
+        }
+        UnaryMode::Recover(call_id) => {
+            client
+                .recover_call_controlled_async(method, call_id, &control)
+                .await
+        }
+    }
+    .map_err(normalize_http_call_error)
+}
+
+fn normalize_http_call_error(error: c2_http::client::HttpCallError) -> Error {
+    let phase = match error.phase() {
+        HttpCallPhase::PreDispatch => TransportPhase::PreDispatch,
+        HttpCallPhase::DispatchUncertain => TransportPhase::DispatchUncertain,
+    };
+    normalize_http_error(error.into_source(), phase)
 }
 
 pub use crate::lifetime::HeldResponse;
@@ -1749,6 +2003,55 @@ fn local_candidate_failure_is_terminal(error: &Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn outcome_controls_do_not_mark_a_bound_target_for_reacquisition_or_refusal() {
+        use c2_error::{C2Error, ErrorCode};
+        let expected = ExpectedRouteContract {
+            route_name: "outcome-target".into(),
+            crm_ns: "test.outcome".into(),
+            crm_name: "Outcome".into(),
+            crm_ver: "1.0.0".into(),
+            abi_hash: "a".repeat(64),
+            signature_hash: "b".repeat(64),
+        };
+        let client = RelayAwareHttpClient::new("http://127.0.0.1:9", expected, false, Default::default())
+            .unwrap();
+        let target = ClientTarget::new(ObservedPath::ExplicitRelay, ClientInner::Http(client));
+        for code in [
+            ErrorCode::CallIdConflict,
+            ErrorCode::CallResultUnavailable,
+            ErrorCode::CallOutcomeUnknown,
+        ] {
+            let mut semantic = C2Error::new(code, code.name());
+            let (ipc, status, phase) = if code == ErrorCode::CallResultUnavailable {
+                (
+                    c2_ipc::IpcError::CrmError(semantic.to_wire_bytes()),
+                    500,
+                    TransportPhase::DispatchUncertain,
+                )
+            } else {
+                semantic.details.insert("dispatch_phase".into(), "pre_dispatch".into());
+                (
+                    c2_ipc::IpcError::CallRejected(semantic.clone()),
+                    409,
+                    TransportPhase::PreDispatch,
+                )
+            };
+            let http = c2_http::client::HttpError::ServerError(
+                status,
+                serde_json::to_string(&semantic.envelope()).unwrap(),
+            );
+            for error in [normalize_ipc_error(ipc, phase), normalize_http_error(http, phase)] {
+                assert_eq!(
+                    error.transport_phase(),
+                    (status == 409).then_some(TransportPhase::PreDispatch),
+                );
+                target.observe_error(&error);
+                assert_eq!(target.facts.load(Ordering::Acquire), 0, "{code:?}");
+            }
+        }
+    }
 
     #[test]
     fn retired_pool_is_a_terminal_relay_candidate_failure() {

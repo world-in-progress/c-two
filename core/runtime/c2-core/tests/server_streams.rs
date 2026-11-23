@@ -1672,6 +1672,52 @@ fn http_opening_cancellation_refuses_business_post() {
 }
 
 #[test]
+fn ipc_and_relay_reject_keyed_submit_and_recovery_for_stream_methods_before_resource_entry() {
+    let fixture = Fixture::with_relay(
+        false,
+        2,
+        ServiceConcurrencyMode::ReadParallel,
+        None,
+        None,
+        true,
+    );
+    let client = fixture
+        .server
+        .connect(
+            fixture.client.expected_route().clone(),
+            Connect::ExplicitRelay {
+                relay_url: fixture.server.relay_anchor_address_override().unwrap(),
+            },
+        )
+        .unwrap();
+    for client in [&fixture.client, &client] {
+        let timeout = CallTimeout::After(WAIT);
+        let options = c2_core::UnaryCallOptions::new()
+            .with_timeout(timeout)
+            .with_call_id("stream-id")
+            .unwrap();
+        for result in [
+            client.call_unary_with_options("echo", &[1, 0], options),
+            client.recover_unary_call("echo", "stream-id", timeout),
+        ] {
+            let error = result.unwrap_err();
+            assert_eq!(
+                error.transport_phase(),
+                Some(c2_core::TransportPhase::PreDispatch),
+            );
+            assert!(
+                matches!(error, Error::Semantic(error) if error.code == ErrorCode::UnsupportedCallMode)
+            );
+        }
+        assert_eq!(fixture.probe.opens.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            client.query_call("stream-id", timeout).unwrap().status,
+            c2_core::CallOutcomeStatus::Unknown,
+        );
+    }
+}
+
+#[test]
 fn http_and_verified_relay_local_ipc_streams_share_core_facade() {
     let fixture = Fixture::with_relay(
         false,

@@ -4,6 +4,7 @@
 //! - `relay`: HTTP relay server bridging HTTP→IPC (requires `relay` feature)
 
 pub mod client;
+mod outcome_wire;
 mod payload;
 pub mod send_budget;
 pub mod stream_wire;

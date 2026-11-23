@@ -865,6 +865,11 @@ impl Runtime {
         Ok(())
     }
 
+    /// Apply Host configuration overrides, including its shared outcome table limits.
+    pub fn set_server(&self, patch: c2_config::ServerConfigPatch) -> Result<(), LifecycleError> {
+        self.update_server_config(patch)
+    }
+
     /// Whether the client role domain has frozen (first remote business
     /// connection or call).
     pub fn client_config_frozen(&self) -> bool {

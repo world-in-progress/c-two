@@ -1,4 +1,4 @@
-//! One complete-value receiver per IPC 17 topic subscription.
+//! One complete-value receiver per IPC 18 topic subscription.
 //!
 //! Mirrors `stream.rs`: the socket reader never blocks on `DomainBudget`
 //! memory reservation or SHM copy. Each subscription awaits `READY(start_seq)`
@@ -72,7 +72,7 @@ impl IpcSubscribeCancellation {
     }
 }
 
-/// One immutable topic delivery received over IPC 17.
+/// One immutable topic delivery received over IPC 18.
 pub struct IpcTopicDelivery {
     pub bytes: BudgetedBuffer,
     pub seq: u64,
@@ -127,7 +127,7 @@ impl Drop for SubscribeDeliveryOwner {
     }
 }
 
-/// Transport receive handle for an active IPC 17 topic subscription.
+/// Transport receive handle for an active IPC 18 topic subscription.
 pub struct IpcTopicSubscription {
     call: Arc<SubscribeReceive>,
     input: mpsc::Receiver<IpcTopicDelivery>,

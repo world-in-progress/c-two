@@ -285,12 +285,13 @@ async fn keyed_unary_falls_back_to_chunks_when_shm_allocation_is_refused() {
     assert!(client.shm_request_available());
     let response = timeout(
         WAIT,
-        client.call_keyed(
-            &identity(),
+        client.call_resolved_target(
             0,
-            &call_id,
-            &vec![42; input_len],
+            identity(),
             DEFAULT_MAX_PAYLOAD_SIZE,
+            &vec![42; input_len],
+            Some(&call_id),
+            None,
         ),
     )
     .await
@@ -329,7 +330,14 @@ async fn keyed_unary_can_reassemble_a_reply_larger_than_the_request() {
     client.connect().await.unwrap();
     let response = timeout(
         WAIT,
-        client.call_keyed(&identity(), 0, "expand", b"x", DEFAULT_MAX_PAYLOAD_SIZE),
+        client.call_resolved_target(
+            0,
+            identity(),
+            DEFAULT_MAX_PAYLOAD_SIZE,
+            b"x",
+            Some("expand"),
+            None,
+        ),
     )
     .await
     .unwrap()
@@ -429,4 +437,86 @@ async fn outcome_query_deadline_does_not_interrupt_a_partial_frame() {
     );
     assert!(client.close_shared_bounded(WAIT).await);
     peer.await.unwrap();
+}
+
+#[tokio::test]
+async fn outcome_open_honors_the_first_frame_guard_on_every_request_carrier() {
+    let endpoint = Endpoint::new();
+    let (server, runner) = start(&endpoint, Arc::new(Echo), ServerIpcConfig::default()).await;
+    let mut client = endpoint.client();
+    client.connect().await.unwrap();
+    let binding = client.acquire_route(&contract()).await.unwrap();
+    let refused = IpcCallControl::new(|| {
+        Err(C2Error::new(
+            ErrorCode::CallDeadlineExceeded,
+            "first frame refused",
+        ))
+    });
+    let assert_refused = |error: crate::IpcCallError| {
+        assert_eq!(error.phase(), crate::TransportPhase::PreDispatch);
+        assert!(matches!(
+            error.into_source(),
+            IpcError::LocalCallRejected(error) if error.code == ErrorCode::CallDeadlineExceeded
+        ));
+    };
+
+    let inline = client
+        .call_bound_owned_with_key_controlled_phased(
+            &binding,
+            "echo",
+            b"inline".to_vec(),
+            Some("inline"),
+            &refused,
+        )
+        .await
+        .unwrap_err();
+    assert_refused(inline);
+    let slab = client
+        .try_alloc_request_slab(CHUNK_SIZE as usize)
+        .unwrap()
+        .unwrap();
+    let shm = client
+        .call_bound_slab_with_key_controlled_phased(&binding, "echo", slab, Some("shm"), &refused)
+        .await
+        .unwrap_err();
+    assert_refused(shm);
+    let recover = client
+        .recover_call_bound_controlled_phased(&binding, "echo", "absent", &refused)
+        .await
+        .unwrap_err();
+    assert_refused(recover);
+
+    let mut chunk_client = endpoint.client_without_memory();
+    chunk_client.connect().await.unwrap();
+    let chunk_binding = chunk_client.acquire_route(&contract()).await.unwrap();
+    let chunked = chunk_client
+        .call_bound_owned_with_key_controlled_phased(
+            &chunk_binding,
+            "echo",
+            vec![0; CHUNK_SIZE as usize + 1],
+            Some("chunk"),
+            &refused,
+        )
+        .await
+        .unwrap_err();
+    assert_refused(chunked);
+
+    for call_id in ["inline", "shm", "chunk"] {
+        assert_eq!(
+            client.query_call(&binding, call_id, WAIT).await.unwrap(),
+            WireCallOutcome::unknown()
+        );
+    }
+    assert_eq!(
+        client
+            .call_bound(&binding, "echo", b"healthy")
+            .await
+            .unwrap()
+            .into_owned_bytes()
+            .unwrap(),
+        b"healthy"
+    );
+    assert!(chunk_client.close_shared_bounded(WAIT).await);
+    assert!(client.close_shared_bounded(WAIT).await);
+    stop(server, runner).await;
 }

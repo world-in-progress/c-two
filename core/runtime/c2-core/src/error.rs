@@ -241,6 +241,46 @@ impl Error {
         }
     }
 
+    /// The operation key on a dispatch-uncertain unary error.
+    pub fn call_id(&self) -> Option<&str> {
+        if self.transport_phase() != Some(TransportPhase::DispatchUncertain) {
+            return None;
+        }
+        let semantic = match self {
+            Self::Semantic(error) => error,
+            Self::Transport(error) => error.semantic_error()?,
+            _ => return None,
+        };
+        semantic.details.get("call_id").map(String::as_str)
+    }
+
+    pub(crate) fn with_uncertain_call_id(mut self, call_id: Option<&str>) -> Self {
+        let Some(call_id) = call_id else {
+            return self;
+        };
+        if self.transport_phase() != Some(TransportPhase::DispatchUncertain) {
+            return self;
+        }
+        let semantic = match &mut self {
+            Self::Semantic(error) => error,
+            Self::Transport(error) => error.semantic_error.get_or_insert_with(|| {
+                C2Error::new(ErrorCode::ClientCallingResource, error.source.to_string())
+            }),
+            Self::Lifecycle(LifecycleError::ResponseCopy(message)) => {
+                let mut error =
+                    C2Error::new(ErrorCode::ClientOutputFromBuffer, std::mem::take(message));
+                error
+                    .details
+                    .insert("transport_phase".into(), "dispatch_uncertain".into());
+                error.details.insert("call_id".into(), call_id.into());
+                return Self::Semantic(error);
+            }
+            _ => return self,
+        };
+        semantic.details.insert("call_id".into(), call_id.into());
+        self
+    }
+
     pub fn local_io_cause(&self) -> Option<LocalIoCause> {
         match self {
             Self::Transport(error) => error.local_io_cause(),
@@ -327,6 +367,10 @@ pub fn normalize_ipc_error(error: IpcError, phase: TransportPhase) -> Error {
         }
         IpcError::LocalCallRejected(error) => Error::Semantic(error),
         IpcError::CallRejected(mut error) => {
+            if error.code == ErrorCode::CallResultUnavailable {
+                clear_resource_failure_phase(&mut error);
+                return Error::Semantic(error);
+            }
             error
                 .details
                 .insert("transport_phase".into(), "pre_dispatch".into());
@@ -461,7 +505,7 @@ fn normalize_http_call_semantic_bytes(bytes: &[u8], status: u16, phase: Transpor
     let parsed = C2Error::from_json_bytes(bytes).map_err(|error| error.to_string());
     let mut semantic = match parsed {
         Ok(mut semantic) => {
-            if status == 500 {
+            if status == 500 || semantic.code == ErrorCode::CallResultUnavailable {
                 clear_resource_failure_phase(&mut semantic);
             } else if phase == TransportPhase::PreDispatch
                 && semantic.code != ErrorCode::Unknown
@@ -512,20 +556,27 @@ pub fn normalize_ipc_semantic_bytes(bytes: &[u8]) -> Error {
 }
 
 fn clear_resource_failure_phase(error: &mut C2Error) {
-    strip_callback_error_phases(error);
-}
-
-/// Strip inner call-control entries from an error that escaped a resource method.
-///
-/// A resource callback that already entered execution may have modified state,
-/// and inner transport admission or route-control details (such as a downstream
-/// call's `pre_dispatch`, `fallback_eligible` or `route_withdrawal`) never
-/// describe this outer call.
-pub fn strip_callback_error_phases(error: &mut C2Error) {
     error.details.remove("transport_phase");
     error.details.remove("dispatch_phase");
     error.details.remove("fallback_eligible");
     error.details.remove("route_withdrawal");
+}
+
+/// Isolate an error that escaped a resource callback from the current Host's
+/// dispatch authority and outcome table.
+pub fn strip_callback_error_phases(error: &mut C2Error) {
+    if error.code.is_outcome_control() {
+        *error = C2Error::new(
+            ErrorCode::ResourceFunctionExecuting,
+            "resource callback returned an inner call outcome error",
+        )
+        .with_details(BTreeMap::from([
+            ("cause_code".into(), u16::from(error.code).to_string()),
+            ("cause_message".into(), std::mem::take(&mut error.message)),
+        ]));
+    } else {
+        clear_resource_failure_phase(error);
+    }
 }
 
 /// Decode canonical C2E1 bytes, mapping malformed envelopes to the canonical
