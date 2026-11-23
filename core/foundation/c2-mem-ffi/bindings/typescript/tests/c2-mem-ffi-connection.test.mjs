@@ -21,7 +21,7 @@ function fixture() {
     async close() { events.push('endpoint.close'); },
   };
   const symbols = {
-    c2_mem_ffi_abi_version: () => 9,
+    c2_mem_ffi_abi_version: () => 10,
     captureEndpointContext: () => ({endpointName: address => address, namespaceId: () => 'n', close() {}}),
     createClientDomain: () => ({createEndpoint: () => endpoint, stats: () => ({}), close() {}}),
   };

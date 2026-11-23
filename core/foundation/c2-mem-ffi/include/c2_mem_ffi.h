@@ -8,7 +8,7 @@
 extern "C" {
 #endif
 
-#define C2_MEM_FFI_ABI_VERSION 9u
+#define C2_MEM_FFI_ABI_VERSION 10u
 
 typedef enum C2MemFfiStatus {
     C2_MEM_FFI_STATUS_OK = 0,
@@ -88,7 +88,7 @@ C2MemFfiStatus c2_mem_ffi_local_endpoint_context_namespace_id_copy(
     size_t dst_len,
     size_t *out_written);
 
-/* ABI 9 native client domain. Captured endpoint context is borrowed only
+/* ABI 10 native client domain. Captured endpoint context is borrowed only
  * during new; NULL inherits native configuration. The factory owns one Runtime
  * budget domain across all physical connections and reconnects. Free releases
  * only the factory reference; live endpoints/calls/buffers keep their owners.
@@ -130,8 +130,18 @@ void c2_mem_ffi_endpoint_context_free(C2MemFfiEndpointContext *endpoint);
  * charge_input reserves before dispatch copies the borrowed bytes. Every
  * asynchronous entry clones native ownership before returning. Exactly one
  * next may be pending. cancel/free submit stream cancellation without waiting.
+ * An unkeyed call passes NULL, 0. A keyed unary borrows 1..128 ASCII
+ * [A-Za-z0-9_-] bytes. A stream rejects every supplied key.
  * A dispatched unary is never cancelled by dropping its facade. */
-C2MemFfiStatus c2_mem_ffi_call_begin(const C2MemFfiEndpointContext *endpoint, const char *route, const char *method, uint8_t server_stream, const uint64_t *timeout_millis, C2MemFfiCall **out, C2MemFfiError **error);
+C2MemFfiStatus c2_mem_ffi_call_begin(const C2MemFfiEndpointContext *endpoint, const char *route, const char *method, uint8_t server_stream, const uint64_t *timeout_millis, const uint8_t *call_id, size_t call_id_len, C2MemFfiCall **out, C2MemFfiError **error);
+/* Recover attaches to a keyed unary without input. Successful completion owns
+ * the same local response buffer as call_next. The recovery deadline bounds
+ * the caller's wait. Endpoint close still waits for the original recovery
+ * record to settle. Query uses the independent control path and returns
+ * bounded outcome JSON. Both require a valid call_id and borrow all input
+ * arguments only until this entry returns. */
+C2MemFfiStatus c2_mem_ffi_recover_call(const C2MemFfiEndpointContext *endpoint, const char *route, const char *method, const uint8_t *call_id, size_t call_id_len, const uint64_t *timeout_millis, C2MemFfiComplete complete, void *user);
+C2MemFfiStatus c2_mem_ffi_query_call(const C2MemFfiEndpointContext *endpoint, const char *route, const uint8_t *call_id, size_t call_id_len, const uint64_t *timeout_millis, C2MemFfiComplete complete, void *user);
 C2MemFfiStatus c2_mem_ffi_call_charge_input(const C2MemFfiCall *call, uint64_t nbytes, C2MemFfiComplete complete, void *user);
 /* On success, dispatch returns JSON with the original call's selected target:
  * {path,serverId,serverInstanceId,connectionId}. IPC identity fields are NULL

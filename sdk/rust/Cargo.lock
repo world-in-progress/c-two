@@ -281,6 +281,7 @@ dependencies = [
  "c2-wire",
  "futures-executor",
  "parking_lot",
+ "sha2",
  "tokio",
  "tracing",
  "uuid",

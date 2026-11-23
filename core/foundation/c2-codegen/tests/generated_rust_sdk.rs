@@ -8,12 +8,8 @@ use c2_contract::ContractRelease;
 
 const DESCRIPTOR: &str =
     include_str!("../../../../tests/fixtures/contracts/portable-release.contract.json");
-const GRAPH_SPEC: &str = include_str!(
-    "../../../../../fastdb/tests/golden/payload/v1/binary/spec/graph-all-values.source.json"
-);
-const RECORD_SPEC: &str = include_str!(
-    "../../../../../fastdb/tests/golden/payload/v1/spec/valid/record-all-types.source.json"
-);
+const GRAPH_SPEC: &str = "tests/golden/payload/v1/binary/spec/graph-all-values.source.json";
+const RECORD_SPEC: &str = "tests/golden/payload/v1/spec/valid/record-all-types.source.json";
 const PORTABLE_INTEROP_RUST: &str =
     include_str!("../../../../sdk/python/tests/fixtures/portable_interop_rust.rs");
 
@@ -23,6 +19,15 @@ fn repository() -> PathBuf {
         .nth(3)
         .expect("C-Two repository root")
         .to_path_buf()
+}
+
+fn fastdb_spec(path: &str) -> String {
+    let root = std::env::var_os("C2_FASTDB_SOURCE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| repository().parent().unwrap().join("fastdb"));
+    let path = root.join(path);
+    std::fs::read_to_string(&path)
+        .unwrap_or_else(|err| panic!("read FastDB fixture {}: {err}", path.display()))
 }
 
 fn generate(descriptor: &[u8]) -> ContractArtifactSet {
@@ -58,7 +63,8 @@ fn no_payload_descriptor() -> Vec<u8> {
 fn graph_descriptor() -> Vec<u8> {
     let mut descriptor: serde_json::Value =
         serde_json::from_str(DESCRIPTOR).expect("descriptor JSON");
-    let graph: serde_json::Value = serde_json::from_str(GRAPH_SPEC).expect("graph spec");
+    let graph: serde_json::Value =
+        serde_json::from_str(&fastdb_spec(GRAPH_SPEC)).expect("graph spec");
     descriptor["methods"][1]["bindings"]["input"]["spec"] = graph.clone();
     descriptor["methods"][1]["bindings"]["output"]["spec"] = graph;
     refresh_fingerprints(&mut descriptor);
@@ -82,13 +88,15 @@ fn portable_interop_descriptor() -> Vec<u8> {
     let ping = descriptor["methods"][0].clone();
     let mut graph = descriptor["methods"][1].clone();
     graph["name"] = serde_json::Value::String("graph_roundtrip".to_string());
-    let graph_spec: serde_json::Value = serde_json::from_str(GRAPH_SPEC).expect("graph spec");
+    let graph_spec: serde_json::Value =
+        serde_json::from_str(&fastdb_spec(GRAPH_SPEC)).expect("graph spec");
     graph["bindings"]["input"]["spec"] = graph_spec.clone();
     graph["bindings"]["output"]["spec"] = graph_spec;
 
     let mut record = descriptor["methods"][1].clone();
     record["name"] = serde_json::Value::String("record_roundtrip".to_string());
-    let record_spec: serde_json::Value = serde_json::from_str(RECORD_SPEC).expect("record spec");
+    let record_spec: serde_json::Value =
+        serde_json::from_str(&fastdb_spec(RECORD_SPEC)).expect("record spec");
     record["bindings"]["input"]["spec"] = record_spec.clone();
     record["bindings"]["output"]["spec"] = record_spec;
     descriptor["methods"] = serde_json::Value::Array(vec![graph, ping, record]);
@@ -289,12 +297,12 @@ fn portable_interop_fixture_compiles_with_only_the_rust_sdk_and_fastdb() {
     std::fs::write(temp.path().join("src/main.rs"), PORTABLE_INTEROP_RUST).expect("fixture source");
     std::fs::write(
         temp.path().join("fixtures/record-all-types.source.json"),
-        RECORD_SPEC,
+        fastdb_spec(RECORD_SPEC),
     )
     .expect("record fixture");
     std::fs::write(
         temp.path().join("fixtures/graph-all-values.source.json"),
-        GRAPH_SPEC,
+        fastdb_spec(GRAPH_SPEC),
     )
     .expect("graph fixture");
 

@@ -16,15 +16,17 @@ pub mod contract;
 pub mod endpoint;
 pub mod observe;
 
+pub use c2_config::UnaryCallOptions;
 pub use c2_contract::ContractRelease;
 pub use c2_core::CoreStreamCloseReceipt as StreamCloseReceipt;
 pub use c2_core::{
-    CallOptions, CallTimeout, Client, ClientConfigPatch, ConfigField, ConfigSources, Connect,
-    ConnectOptions, DomainLimits, DomainLimitsOverrides, DomainLimitsPatch, EnvCatalog,
-    EnvFilePolicy, EnvMap, Host, HostOptions, LifecycleError, Registration, RouteConcurrency,
-    RouteConcurrencyError, RouteConcurrencyGuard, Runtime, RuntimeOptions, ServerConfigOverrides,
-    ServerConfigPatch, ServerFailure, ServerStartupStage, ServerStartupTimeout,
-    ServiceConcurrencyMode, ServiceDefinition, TransportPhase,
+    CallOptions, CallOutcome, CallOutcomeStatus, CallTimeout, Client, ClientConfigPatch,
+    ConfigField, ConfigSources, Connect, ConnectOptions, DomainLimits, DomainLimitsOverrides,
+    DomainLimitsPatch, EnvCatalog, EnvFilePolicy, EnvMap, Host, HostOptions, LifecycleError,
+    Registration, ResultUnavailableReason, RouteConcurrency, RouteConcurrencyError,
+    RouteConcurrencyGuard, Runtime, RuntimeOptions, ServerConfigOverrides, ServerConfigPatch,
+    ServerFailure, ServerStartupStage, ServerStartupTimeout, ServiceConcurrencyMode,
+    ServiceDefinition, TransportPhase,
 };
 pub use c2_core::{
     LagPolicy, SubscribeOptions, TopicCloseCause, TopicCloseReceipt, TopicConfig, TopicStart,
@@ -42,12 +44,13 @@ pub use topic::{Delivery, Publisher, Subscription};
 /// remains sealed by Core and cannot be implemented by downstream transports.
 #[doc(hidden)]
 pub mod generated {
+    pub use c2_config::UnaryCallOptions;
     pub use c2_contract::MethodAccess;
     pub use c2_core::{
-        AdapterFailure, AdapterFailurePhase, EncodedCall, EncodedClient, EncodedService,
-        EncodedStream, EncodedStreamItem, EncodedStreamService, ExternalCause, HeldResponse,
-        MethodDefinition, PreparedCall, ServiceDefinition, external_cause_details,
-        normalize_adapter_failure,
+        AdapterFailure, AdapterFailurePhase, CallOutcome, CallOutcomeStatus, Client, EncodedCall,
+        EncodedClient, EncodedService, EncodedStream, EncodedStreamItem, EncodedStreamService,
+        ExternalCause, HeldResponse, MethodDefinition, PreparedCall, ResultUnavailableReason,
+        ServiceDefinition, external_cause_details, normalize_adapter_failure,
     };
     pub use c2_error::{C2Error, ErrorCode};
 

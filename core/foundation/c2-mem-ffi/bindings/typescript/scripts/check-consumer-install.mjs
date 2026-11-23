@@ -123,8 +123,8 @@ import {
 } from '@c-two/c2-mem-ffi';
 import { createIpcEncodedTransport } from './transport.mjs';
 const { symbols } = loadBundledC2MemFfiNodeNativeSymbols();
-assert.equal(C2_MEM_FFI_ABI_VERSION, 9);
-assert.equal(symbols.c2_mem_ffi_abi_version(), 9);
+assert.equal(C2_MEM_FFI_ABI_VERSION, 10);
+assert.equal(symbols.c2_mem_ffi_abi_version(), 10);
 const address = 'ipc://packed-node-' + process.pid;
 const root = resolve('ipc'); mkdirSync(root, {mode: 0o700});
 const child = spawn(process.argv[2], [process.platform === 'win32' ? '-' : root, address], {stdio: ['pipe', 'pipe', 'pipe']});
@@ -157,7 +157,7 @@ import {
   type C2MemFfiNodeNativeSymbols, createNodeIpcConnector, loadBundledC2MemFfiNodeNativeSymbols,
 } from '@c-two/c2-mem-ffi';
 import type { C2IpcConnect } from './transport.js';
-const abiVersion: 9 = C2_MEM_FFI_ABI_VERSION;
+const abiVersion: 10 = C2_MEM_FFI_ABI_VERSION;
 const symbols: C2MemFfiNodeNativeSymbols = loadBundledC2MemFfiNodeNativeSymbols().symbols;
 const connect = createNodeIpcConnector();
 const genericConnect: C2IpcConnect = connect;
@@ -201,7 +201,7 @@ void symbols; void smokeTypes;
   run(process.execPath, ['smoke.mjs', peer], {
     cwd: consumerRoot,
   });
-  console.log('npm packed ABI 9 runtime and TypeScript tarballs install, typecheck, and exercise native IPC endpoints and response owners from a clean consumer project.');
+  console.log('npm packed ABI 10 runtime and TypeScript tarballs install, typecheck, and exercise native IPC endpoints and response owners from a clean consumer project.');
 } finally {
   rmSync(tempRoot, { recursive: true, force: true });
 }

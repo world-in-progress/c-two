@@ -23,7 +23,7 @@ test('captured endpoint context flows through native domain, prepare and call', 
     deactivate() {}, async close() { events.push('endpoint.close'); },
   };
   const symbols = {
-    c2_mem_ffi_abi_version: () => 9,
+    c2_mem_ffi_abi_version: () => 10,
     captureEndpointContext: root => { events.push(['capture', root]); return nativeContext; },
     createClientDomain: context => {
       assert.equal(context, nativeContext);

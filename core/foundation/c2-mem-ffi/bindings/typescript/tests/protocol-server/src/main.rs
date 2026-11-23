@@ -1,4 +1,4 @@
-//! Real c2-server peer for the Node IPC 17 / ABI 9 gate. No Python or FastDB.
+//! Real c2-server peer for the Node IPC 18 / ABI 10 gate. No Python or FastDB.
 use c2_config::{ConfigResolver, ConfigSources, EnvCatalog, LocalEndpointOptions};
 use c2_contract::{ContractRelease, derive_contract_fingerprints_json};
 use c2_server::{
@@ -57,6 +57,15 @@ impl CrmCallback for Echo {
             return Err(CrmError::InternalError("unexpected unary method".into()));
         }
         self.unary_dispatches.fetch_add(1, Ordering::Relaxed);
+        if request == [253] {
+            return Err(CrmError::UserError(
+                c2_error::C2Error::new(
+                    c2_error::ErrorCode::ResourceFunctionExecuting,
+                    "keyed failure",
+                )
+                .to_wire_bytes(),
+            ));
+        }
         if request == [255] || request == [254] {
             emit(json!({"kind": "unary_blocked"}));
             self.unary_gate.wait();
@@ -161,7 +170,11 @@ async fn main() {
     )
     .unwrap();
     let endpoint = context.endpoint(&args[1]).unwrap();
-    let server = Arc::new(Server::new_with_endpoint(endpoint, ServerIpcConfig::default()).unwrap());
+    let mut config = ServerIpcConfig::default();
+    if args.get(2).is_some_and(|mode| mode == "metadata_only") {
+        config.outcome_max_retained_bytes = Some(0);
+    }
+    let server = Arc::new(Server::new_with_endpoint(endpoint, config).unwrap());
     let topics_enabled = args.get(2).is_some_and(|mode| mode == "topics");
     let release = if topics_enabled {
         let mut descriptor: serde_json::Value = serde_json::from_slice(DESCRIPTOR).unwrap();

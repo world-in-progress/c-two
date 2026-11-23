@@ -1,12 +1,15 @@
 import assert from 'node:assert/strict';
 import {spawn, spawnSync} from 'node:child_process';
+import {once} from 'node:events';
 import {mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync} from 'node:fs';
+import {createServer} from 'node:http';
 import {createRequire} from 'node:module';
 import {tmpdir} from 'node:os';
 import {dirname, resolve} from 'node:path';
 import {fileURLToPath, pathToFileURL} from 'node:url';
 import {createInterface} from 'node:readline';
 import test from 'node:test';
+import {setTimeout as delay} from 'node:timers/promises';
 import {Worker} from 'node:worker_threads';
 import {createNodeIpcConnector} from '../dist/index.js';
 import {buildProtocolPeer} from '../scripts/cargo-tools.mjs';
@@ -30,7 +33,7 @@ async function withServer(run, domainLimits = {}, mode = "calls") {
   const server = buildServer();
   const directory = mkdtempSync(resolve(tmpdir(), 'c2n8-'));
   const root = resolve(directory, 'ipc'); mkdirSync(root, {mode: 0o700});
-  const address = `ipc://node-abi9-${process.pid}-${Math.random().toString(16).slice(2)}`;
+  const address = `ipc://node-abi10-${process.pid}-${Math.random().toString(16).slice(2)}`;
   const child = spawn(server, [process.platform === 'win32' ? '-' : root, address, mode], {stdio: ['pipe', 'pipe', 'pipe']});
   const lines = createInterface({input: child.stdout})[Symbol.asyncIterator]();
   let stderr = ''; child.stderr.on('data', b => { stderr += b; });
@@ -59,7 +62,7 @@ async function withServer(run, domainLimits = {}, mode = "calls") {
   }
 }
 
-test('ABI 9 IPC topics deliver READY, lag policy, terminal receipts and independent holds', {timeout: 150_000}, async () => {
+test('ABI 10 IPC topics deliver READY, lag policy, terminal receipts and independent holds', {timeout: 150_000}, async () => {
   await withServer(async ({connector, address, contract, child, lines, createIpcEncodedTransport}) => {
     const transport = createIpcEncodedTransport(address, {connect: connector});
     const endpoint = await connector(address);
@@ -188,6 +191,157 @@ async function unary(endpoint, contract, bytes) {
   } finally { call.close(); }
 }
 
+test('keyed unary query bypasses a full client and recovery replays once after a deadline', {timeout: 150_000}, async () => {
+  await withServer(async ({connector, address, contract, lines, child}) => {
+    const endpoint = await connector(address);
+    const id = 'blocked-A_1';
+    let call;
+    try {
+      await endpoint.prepare('echo', contract);
+      assert.throws(() => endpoint.beginCall('echo', 'echo', true, null, id),
+        error => error.code === 716 && error.transportPhase === 'pre_dispatch' && error.callId === undefined);
+      for (const bad of ['', 'contains space', 'x'.repeat(129), 'x\0y', '键']) {
+        assert.throws(() => endpoint.beginCall('echo', 'ping', false, null, bad));
+      }
+      assert.equal((await endpoint.queryCall('echo', id, 2000)).status, 'unknown');
+      await assert.rejects(endpoint.recoverCall('echo', 'ping', id, null),
+        error => error.code === 723 && error.transportPhase === 'pre_dispatch' && error.callId === undefined);
+      call = endpoint.beginCall('echo', 'ping', false, 1500, id);
+      await call.chargeInput(1);
+      const expired = assert.rejects(call.dispatch(Uint8Array.of(255)),
+        error => error.code === 715 && error.transportPhase === 'dispatch_uncertain'
+          && error.callId === id && error.details.call_id === id);
+      assert.equal(JSON.parse((await lines.next()).value).kind, 'unary_blocked');
+      assert.deepEqual(await endpoint.queryCall('echo', id, 2000), {
+        status: 'in_flight', method_name: 'ping', result_available: false, result_unavailable_reason: null,
+        error_code: null, error_details_available: false,
+      });
+      await expired;
+      child.stdin.write('release_unary\n');
+      assert.equal(JSON.parse((await lines.next()).value).kind, 'unary_released');
+      assert.equal((await call.observe(5000)).completed, true);
+      call.close();
+      call = undefined;
+      const outcome = await endpoint.queryCall('echo', id, null);
+      assert.equal(outcome.status, 'succeeded');
+      assert.equal(outcome.result_available, true);
+      const buffer = await endpoint.recoverCall('echo', 'ping', id, 2000);
+      try { assert.deepEqual([...buffer], [255]); } finally { buffer.release(); }
+
+      call = endpoint.beginCall('echo', 'ping', false, null, id);
+      await call.chargeInput(1);
+      await assert.rejects(call.dispatch(Uint8Array.of(42)),
+        error => error.code === 721 && error.transportPhase === 'pre_dispatch' && error.callId === undefined);
+      child.stdin.write('stats\n');
+      assert.equal(JSON.parse((await lines.next()).value).unary_dispatches, 1);
+    } finally {
+      child.stdin.write('release_unary\n');
+      call?.close();
+      await endpoint.close();
+    }
+  }, {maxOutstandingCalls: 1});
+});
+
+test('explicit relay endpoint close drains a recovery after its caller deadline', {timeout: 15_000}, async () => {
+  const route = 'recovery-route';
+  const callId = 'recover-key';
+  const fixture = new URL('../../../../../../tests/fixtures/contracts/portable-no-payload.contract.json', import.meta.url);
+  const {crm, fingerprints} = JSON.parse(readFileSync(fixture));
+  const contract = {...crm, abiHash: fingerprints.abi_hash, signatureHash: fingerprints.signature_hash};
+  let receiveRecovery;
+  const recoveryReceived = new Promise(resolve => { receiveRecovery = resolve; });
+  let relayUrl;
+  const relay = createServer((request, response) => {
+    const url = new URL(request.url, relayUrl);
+    if (url.pathname === `/_resolve/${route}`) {
+      response.setHeader('content-type', 'application/json');
+      response.end(JSON.stringify([{
+        name: route, relay_url: relayUrl, crm_ns: crm.namespace, crm_name: crm.name,
+        crm_ver: crm.version, abi_hash: contract.abiHash, signature_hash: contract.signatureHash,
+        max_payload_size: 1024,
+      }]));
+    } else if (url.pathname === `/_probe/${route}`) {
+      response.end();
+    } else if (url.pathname === '/_c2/calls/recover') {
+      receiveRecovery({request, response});
+    } else {
+      response.writeHead(404).end();
+    }
+  });
+  const connector = createNodeIpcConnector({maxOutstandingCalls: 1});
+  let endpoint;
+  try {
+    relay.listen(0, '127.0.0.1');
+    await once(relay, 'listening');
+    relayUrl = `http://127.0.0.1:${relay.address().port}`;
+    endpoint = await connector(relayUrl, 5000, {mode: 'explicit_relay'});
+    assert.equal((await endpoint.prepare(route, contract, 5000)).path, 'ExplicitRelay');
+
+    const expired = assert.rejects(endpoint.recoverCall(route, 'ping', callId, 1000),
+      error => error.code === 715 && error.transportPhase === 'dispatch_uncertain'
+        && error.callId === callId && error.details.call_id === callId);
+    const {request, response} = await Promise.race([
+      recoveryReceived,
+      expired.then(() => { throw new Error('recovery expired before reaching the relay'); }),
+    ]);
+    assert.equal(request.method, 'POST');
+    assert.equal(request.headers['x-c2-call-id'], callId);
+    await expired;
+    assert.equal(connector.stats().call_execution.used_operations, '1');
+
+    const closed = endpoint.close();
+    const closedBeforeReply = await Promise.race([closed.then(() => true), delay(200, false)]);
+    assert.equal(closedBeforeReply, false, 'endpoint closed with the recovery response still held back');
+    response.writeHead(200, {'content-length': '0'}).end();
+    await closed;
+    assert.equal(connector.stats().call_execution.used_operations, '0');
+  } finally {
+    relay.closeAllConnections();
+    await endpoint?.close();
+    connector.close();
+    await new Promise(resolve => relay.close(resolve));
+  }
+});
+
+test('recovery projects retained resource failures and metadata-only success', {timeout: 150_000}, async () => {
+  for (const [mode, input] of [['calls', 253], ['metadata_only', 42]]) {
+    await withServer(async ({connector, address, contract, lines, child}) => {
+      const endpoint = await connector(address);
+      let call;
+      const id = 'once';
+      try {
+        await endpoint.prepare('echo', contract);
+        call = endpoint.beginCall('echo', 'ping', false, null, id);
+        await call.chargeInput(1);
+        const dispatch = call.dispatch(Uint8Array.of(input));
+        if (mode === 'calls') {
+          await assert.rejects(dispatch, error => error.code === 3 && error.callId === undefined);
+          const outcome = await endpoint.queryCall('echo', id, null);
+          assert.equal(outcome.status, 'failed');
+          assert.equal(outcome.error_code, 3);
+          assert.equal(outcome.error_details_available, true);
+          await assert.rejects(endpoint.recoverCall('echo', 'ping', id, null),
+            error => error.code === 3 && error.message === 'keyed failure' && error.callId === undefined);
+        } else {
+          await dispatch;
+          (await call.next()).release();
+          const outcome = await endpoint.queryCall('echo', id, null);
+          assert.equal(outcome.status, 'succeeded');
+          assert.equal(outcome.result_available, false);
+          assert.equal(outcome.result_unavailable_reason, 'not_retained');
+          await assert.rejects(endpoint.recoverCall('echo', 'ping', id, null),
+            error => error.code === 722 && error.transportPhase === undefined && error.callId === undefined);
+        }
+        child.stdin.write('stats\n');
+        assert.equal(JSON.parse((await lines.next()).value).unary_dispatches, 1);
+      } finally {
+        call?.close();
+        await endpoint.close();
+      }
+    }, {}, mode);
+  }
+});
+
 async function beginStream(endpoint, contract, mode, count, length = 1) {
   await endpoint.prepare('echo', contract);
   const input = streamInput(mode, count, length);
@@ -206,7 +360,7 @@ async function takeItem(call, expectedLength, value) {
   } finally { item.release(); }
 }
 
-test('ABI 9 native endpoint completes unary calls and reuses the connector domain', {timeout: 150_000}, async () => {
+test('ABI 10 native endpoint completes unary calls and reuses the connector domain', {timeout: 150_000}, async () => {
   await withServer(async ({connector, address, lines, child, contract}) => {
     const first = await connector(address);
     try {
@@ -228,7 +382,7 @@ test('ABI 9 native endpoint completes unary calls and reuses the connector domai
   });
 });
 
-test('ABI 9 same-endpoint re-registration reaches the current resource without a route UID', {timeout: 150_000}, async () => {
+test('ABI 10 same-endpoint re-registration reaches the current resource without a route UID', {timeout: 150_000}, async () => {
   await withServer(async ({connector, address, contract, lines, child}) => {
     const endpoint = await connector(address);
     try {
@@ -254,7 +408,7 @@ test('ABI 9 same-endpoint re-registration reaches the current resource without a
   });
 });
 
-test('ABI 9 real IPC backing survives view GC and release survives backing GC', {timeout: 150_000}, async () => {
+test('ABI 10 real IPC backing survives view GC and release survives backing GC', {timeout: 150_000}, async () => {
   await withServer(async ({address, contract, root}) => {
     const script = `
       import assert from 'node:assert/strict';
@@ -320,7 +474,7 @@ test('closing one same-address endpoint leaves the other endpoint callable', {ti
   });
 });
 
-test('ABI 9 server streams deliver zero, one and many inline or large items', {timeout: 150_000}, async () => {
+test('ABI 10 server streams deliver zero, one and many inline or large items', {timeout: 150_000}, async () => {
   await withServer(async ({connector, address, contract}) => {
     const endpoint = await connector(address);
     try {
@@ -336,7 +490,7 @@ test('ABI 9 server streams deliver zero, one and many inline or large items', {t
   });
 });
 
-test('ABI 9 stream retains completed item count after a resource error', {timeout: 150_000}, async () => {
+test('ABI 10 stream retains completed item count after a resource error', {timeout: 150_000}, async () => {
   await withServer(async ({connector, address, contract}) => {
     const endpoint = await connector(address);
     try {
@@ -357,7 +511,7 @@ test('ABI 9 stream retains completed item count after a resource error', {timeou
   });
 });
 
-test('ABI 9 handles two streams and concurrent unary calls on one endpoint', {timeout: 150_000}, async () => {
+test('ABI 10 handles two streams and concurrent unary calls on one endpoint', {timeout: 150_000}, async () => {
   await withServer(async ({connector, address, contract}) => {
     const endpoint = await connector(address);
     try {
@@ -379,7 +533,7 @@ test('ABI 9 handles two streams and concurrent unary calls on one endpoint', {ti
   });
 });
 
-test('ABI 9 completes a second unary while the first is blocked on the same connection', {timeout: 150_000}, async () => {
+test('ABI 10 completes a second unary while the first is blocked on the same connection', {timeout: 150_000}, async () => {
   await withServer(async ({connector, address, contract, lines, child}) => {
     const endpoint = await connector(address);
     try {
@@ -405,7 +559,7 @@ test('ABI 9 completes a second unary while the first is blocked on the same conn
   });
 });
 
-test('ABI 9 settles a gated native call after its Worker environment terminates', {timeout: 150_000}, async () => {
+test('ABI 10 settles a gated native call after its Worker environment terminates', {timeout: 150_000}, async () => {
   await withServer(async ({address, contract, root, lines, child}) => {
     const workerSource = `
       const {parentPort, workerData} = require('node:worker_threads');
@@ -448,7 +602,7 @@ test('ABI 9 settles a gated native call after its Worker environment terminates'
 });
 
 for (const cause of ['shutdown', 'unregister']) {
-  test(`ABI 9 ${cause} delivers the running step before cancelling an unlimited stream`, {timeout: 150_000}, async () => {
+  test(`ABI 10 ${cause} delivers the running step before cancelling an unlimited stream`, {timeout: 150_000}, async () => {
     await withServer(async ({connector, address, contract, lines, child}) => {
       const endpoint = await connector(address);
       try {
@@ -479,7 +633,7 @@ for (const cause of ['shutdown', 'unregister']) {
   });
 }
 
-test('ABI 9 cancellation observes pending cleanup, then completes after a host barrier', {timeout: 150_000}, async () => {
+test('ABI 10 cancellation observes pending cleanup, then completes after a host barrier', {timeout: 150_000}, async () => {
   await withServer(async ({connector, address, contract, lines, child}) => {
     const endpoint = await connector(address);
     try {
@@ -581,7 +735,7 @@ test('public stream deadline leaves the original record running and later report
   });
 });
 
-test('ABI 9 unary preparation observes a native rejection after its caller deadline', {timeout: 150_000}, async () => {
+test('ABI 10 unary preparation observes a native rejection after its caller deadline', {timeout: 150_000}, async () => {
   await withServer(async ({connector, address, contract, lines, child, createIpcEncodedTransport}) => {
     let clock = 0, rejectPreparation, preparations = 0;
     const late = new Promise((_resolve, reject) => { rejectPreparation = reject; });
@@ -623,7 +777,7 @@ test('ABI 9 unary preparation observes a native rejection after its caller deadl
   });
 });
 
-test('ABI 9 unary preparation and encoding share the pre-dispatch deadline', {timeout: 150_000}, async () => {
+test('ABI 10 unary preparation and encoding share the pre-dispatch deadline', {timeout: 150_000}, async () => {
   await withServer(async ({connector, address, contract, lines, child, createIpcEncodedTransport}) => {
     const transport = createIpcEncodedTransport(address, {connect: connector, callTimeoutMs: 1});
     try {

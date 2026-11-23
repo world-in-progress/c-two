@@ -9,7 +9,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
 use std::ptr;
 
-const C2_MEM_FFI_ABI_VERSION: u32 = 9;
+const C2_MEM_FFI_ABI_VERSION: u32 = 10;
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -748,6 +748,6 @@ mod tests {
 
     #[test]
     fn public_abi_version_is_exported() {
-        assert_eq!(c2_mem_ffi_abi_version(), 9);
+        assert_eq!(c2_mem_ffi_abi_version(), 10);
     }
 }

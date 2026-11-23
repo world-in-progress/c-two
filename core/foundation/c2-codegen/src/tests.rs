@@ -117,7 +117,7 @@ const CONSUMER: &str = r##"
 use std::sync::{Arc, Condvar, Mutex};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
-use c_two::{CallOptions, CallTimeout, Connect, DomainLimitsOverrides, HostOptions, Runtime, RuntimeOptions};
+use c_two::{CallOptions, CallOutcomeStatus, CallTimeout, Connect, DomainLimitsOverrides, HostOptions, Runtime, RuntimeOptions, UnaryCallOptions};
 use c_two::generated::ErrorCode;
 use fastdb::{BuildPolicy, Builder, CompiledSpec, Payload, View};
 #[path = "../generated/rust/c_two_contract.rs"]
@@ -229,6 +229,38 @@ fn wait_for_idle(runtime: &Runtime) {
     }
 }
 fn main() {
+    {
+        let runtime = runtime(8, 1 << 20);
+        let host = host(&runtime, "keyed");
+        let state = Arc::new(State::default());
+        let mut registration = host.register(contract::service_definition("keyed",
+            Echo(state.clone())).unwrap()).unwrap();
+        let client = connect(&runtime, "keyed");
+        let input = payload("keyed");
+        let timeout = finite(5000).timeout();
+        let options = UnaryCallOptions::new().with_timeout(timeout).with_call_id("echo-1").unwrap();
+        let mut original = client.hold_method_1_echo_with_options(&input, options.clone()).unwrap();
+        let held = client.recover_hold_method_1_echo("echo-1", timeout).unwrap();
+        let view = original.value().unwrap().entry_view(0).unwrap().at(0).unwrap();
+        original.release().unwrap();
+        assert!(view.acquire().is_err());
+        assert_eq!(held.value().unwrap().binary_bytes().unwrap(), input.binary_bytes().unwrap());
+        for response in [
+            client.method_1_echo_with_options(&input, options).unwrap(),
+            client.recover_method_1_echo("echo-1", timeout).unwrap(),
+        ] {
+            assert_eq!(response.binary_bytes().unwrap(), input.binary_bytes().unwrap());
+        }
+        assert_eq!(client.query_call("echo-1", timeout).unwrap().status, CallOutcomeStatus::Succeeded);
+        assert_eq!(state.calls.load(Ordering::SeqCst), 1);
+        let options = UnaryCallOptions::new().with_timeout(timeout).with_call_id("ping-1").unwrap();
+        client.method_0_ping_with_options(options).unwrap();
+        client.recover_method_0_ping("ping-1", timeout).unwrap();
+        assert_eq!(state.calls.load(Ordering::SeqCst), 2);
+        drop(held);
+        assert_idle(&runtime);
+        registration.close().unwrap();
+    }
     // Zero slots and zero timeout must win before even inspecting an invalid
     // FastDB input. If the serializer ran, this would be a FastDB stale error.
     for (label, slots, options, code) in [

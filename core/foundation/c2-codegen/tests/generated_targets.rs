@@ -329,7 +329,10 @@ fn generated_typescript_project_typechecks_against_fastdb_source() {
         .ancestors()
         .nth(3)
         .unwrap();
-    let fastdb_typescript = repository.parent().unwrap().join("fastdb/ts/fastdb4ts");
+    let fastdb_typescript = std::env::var_os("C2_FASTDB_SOURCE_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| repository.parent().unwrap().join("fastdb"))
+        .join("ts/fastdb4ts");
     // npm's `.bin/tsc` entry is a POSIX shell shim that CreateProcess cannot
     // execute on Windows; run the compiler's JavaScript entry with Node.
     let tsc = fastdb_typescript.join("node_modules/typescript/bin/tsc");
@@ -801,9 +804,20 @@ import {
 const warnings: string[] = [];
 console.warn = (...args: unknown[]): void => { warnings.push(args.map(String).join(" ")); };
 let responseReleaseThrows = false;
+let submittedKey: string | undefined;
 const transportReleaseError = new Error("transport release failed");
 const transport: C2EncodedClientTransport = {
-  async call(_routeName: string, _contract: unknown, _method: string, request: unknown) {
+  async queryCall(route, _contract, key) {
+    if (route !== "payload-route" || key !== submittedKey) throw new Error("wrong outcome query");
+    return { status:"succeeded", method_name:"echo", result_available:true, result_unavailable_reason:null, error_code:null, error_details_available:false };
+  },
+  async recoverCall(route, _contract, method, key) {
+    if (route !== "payload-route" || method !== "echo" || key !== submittedKey) throw new Error("wrong recovery");
+    events.push("transport:recover");
+    return Object.assign(new Uint8Array([7]), { release() { events.push("transport:release"); } });
+  },
+  async call(_routeName, _contract, _method, request, options) {
+    submittedKey = options?.callId;
     if (typeof request === "function") request();
     events.push("transport:call");
     const response = new Uint8Array([7]) as Uint8Array & { release(): void };
@@ -826,8 +840,17 @@ function requireEvents(expected: readonly string[]): void {
   }
 }
 
+await client.method_1_echo(new Payload(), {callId:"write-1"});
+if (submittedKey !== "write-1" || (await client.queryCall("write-1")).method_name !== "echo") {
+  throw new Error("generated method did not forward its call ID");
+}
 events.length = 0;
-const held = await client.hold_method_1_echo(new Payload());
+await client.recover_method_1_echo("write-1");
+requireEvents(["transport:recover", "response:openCopy", "response:require", "transport:release"]);
+
+events.length = 0;
+const held = await client.hold_method_1_echo(new Payload(), {callId:"held-2"});
+if (String(submittedKey) !== "held-2") throw new Error("held unary lost its call ID");
 requireEvents([
   "request:require",
   "request:binary",
@@ -987,6 +1010,7 @@ for (const hold of [false, true]) {
   let clock = 0;
   let dispatched = 0;
   const timedTransport: C2EncodedClientTransport = {
+    ...transport,
     async call(_route: string, _contract: unknown, _method: string, request: unknown) {
       const deadline = clock + 10;
       if (typeof request === "function") request();

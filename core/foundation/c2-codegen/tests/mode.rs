@@ -46,7 +46,7 @@ fn all_targets_generate_server_stream() {
         assert!(source.contains(required), "missing {required:?}");
     }
     assert!(!source.contains("def _invalidate_payload("));
-    assert!(source.contains("def method_0_ping(self) -> None:"));
+    assert!(source.contains("def method_0_ping(self, *, call_id: str | None = None) -> None:"));
 
     let typescript = compile_contract_artifacts(
         &release,
@@ -71,5 +71,5 @@ fn all_targets_generate_server_stream() {
     ] {
         assert!(source.contains(required), "missing {required:?}");
     }
-    assert!(source.contains("async method_0_ping(): Promise<void>"));
+    assert!(source.contains("async method_0_ping(options?: C2UnaryCallOptions): Promise<void>"));
 }

@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createServer } from 'node:http';
 import {spawnSync} from 'node:child_process';
 import {mkdtempSync,writeFileSync,rmSync} from 'node:fs';
 import {tmpdir} from 'node:os';
@@ -2185,5 +2186,194 @@ test('streaming reader cleanup, allocator lifecycle, post-dispatch isolation and
     }finally{
       globalThis.AbortController=savedCtrl;
     }
+  }
+});
+
+const unknownOutcome = {
+  status: 'unknown', method_name: null, result_available: false, result_unavailable_reason: null,
+  error_code: null, error_details_available: false,
+};
+
+function outcomeRelay(route, handle, factory = transport.createHttpRelayEncodedTransport) {
+  const acquired = [];
+  const client = factory('http://localhost:8300', {
+    async fetch(input, init) {
+      const url = new URL(input);
+      if (url.pathname.startsWith('/_resolve') || url.pathname.startsWith('/_probe')) {
+        const path = url.pathname.split('/');
+        const resolvedRoute = path.length === 2 ? url.searchParams.get('route') : decodeURIComponent(path[2]);
+        assert.equal(resolvedRoute, route);
+        acquired.push(path[1]);
+        if (path[1] === '_probe') return new Response('');
+        return Response.json([{
+          name: route, relay_url: 'http://localhost:8301', crm_ns: contract.namespace,
+          crm_name: contract.name, crm_ver: contract.version, abi_hash: hash, signature_hash: hash,
+        }]);
+      }
+      assert.equal(url.origin, 'http://localhost:8301');
+      return handle(url, init);
+    },
+  });
+  return { client, acquired };
+}
+
+test('outcome endpoints carry the scoped route, method, contract and call ID without redirecting POST', async () => {
+  for (const factory of [transport.createHttpRelayEncodedTransport, transport.createRelayAwareHttpEncodedTransport]) {
+    for (const route of ['.', '..', 'nested/á #?', '_resolve', '_probe']) {
+      const seen = [];
+      const { client, acquired } = outcomeRelay(route, (url, init) => {
+        seen.push(url.pathname);
+        assert.equal(init.headers['x-c2-call-id'], 'id_1-a');
+        assert.equal(init.headers['x-c2-expected-signature-hash'], hash);
+        assert.equal(url.searchParams.get('route'), route);
+        if (url.pathname === '/_c2/calls/outcome') {
+          assert.equal(init.method, 'GET');
+          assert.equal(url.searchParams.has('method'), false);
+          assert.equal('body' in init, false);
+          return Response.json(unknownOutcome);
+        }
+        assert.equal(init.method, 'POST');
+        assert.equal(init.redirect, 'error');
+        assert.equal(url.searchParams.get('method'), '执行?');
+        if (url.pathname === '/_c2/calls/keyed') assert.deepEqual([...init.body], [2]);
+        else assert.equal('body' in init, false);
+        return new Response(Uint8Array.of(7));
+      }, factory);
+      assert.deepEqual([...await client.call(route, contract, '执行?', () => Uint8Array.of(2), {callId:'id_1-a'})], [7]);
+      assert.deepEqual([...await client.recoverCall(route, contract, '执行?', 'id_1-a')], [7]);
+      assert.deepEqual(await client.queryCall(route, contract, 'id_1-a'), unknownOutcome);
+      assert.deepEqual(seen, ['/_c2/calls/keyed', '/_c2/calls/recover', '/_c2/calls/outcome']);
+      assert.deepEqual(acquired, ['_resolve', '_probe']);
+      await client.close();
+    }
+  }
+  const plain = outcomeRelay('route', (url, init) => {
+    assert.equal(url.pathname, '/route/step');
+    assert.equal(init.redirect, 'error');
+    assert.equal(init.headers['x-c2-call-id'], undefined);
+    return new Response('');
+  }).client;
+  await plain.call('route', contract, 'step', () => Uint8Array.of());
+  await plain.close();
+});
+
+test('outcome failures retain only their transport authority and keep the acquired target', async () => {
+  let reply;
+  const { client, acquired } = outcomeRelay('route', () => reply());
+  const invoke = () => client.recoverCall('route', contract, 'step', 'my-key');
+  for (const [code, name] of [[721, 'CallIdConflict'], [723, 'CallOutcomeUnknown']]) {
+    reply = () => Response.json({version:1, code, name, message:'refused', details:{dispatch_phase:'pre_dispatch'}}, {status:409});
+    await assert.rejects(invoke(), e => e.code === code && e.transportPhase === 'pre_dispatch' && e.callId === undefined);
+  }
+  reply = () => new Response('C2E1' + JSON.stringify({version:1, code:722, name:'CallResultUnavailable',
+    message:'result gone', details:{outcome:'succeeded',reason:'evicted',transport_phase:'dispatch_uncertain'}}), {status:500});
+  await assert.rejects(invoke(), e => e.code === 722 && e.transportPhase === null && e.callId === undefined &&
+    e.details.reason === 'evicted' && e.details.transport_phase === undefined);
+  reply = () => new Response('Not Found', {status:404});
+  for (const operation of [invoke, () => client.queryCall('route', contract, 'my-key'),
+    () => client.call('route', contract, 'step', () => new Uint8Array(), {callId:'my-key'})]) {
+    await assert.rejects(operation(), e => e.status === 404 && e.transportPhase === 'dispatch_uncertain' &&
+      e.retrySafe === false && e.callId === 'my-key');
+  }
+  assert.deepEqual(acquired, ['_resolve', '_probe']);
+  await client.close();
+});
+
+test('outcome query uses its control path while a write is running and bounds streamed JSON', async () => {
+  const waiting = deferred();
+  const arrived = deferred();
+  const flight = {...unknownOutcome, status:'in_flight', method_name:'step'};
+  let reply = () => Response.json(flight);
+  const { client } = outcomeRelay('route', async (url) => {
+    if (url.pathname.endsWith('/keyed')) { arrived.resolve(); await waiting.promise; return new Response('ok'); }
+    return reply();
+  });
+  const pending = client.call('route', contract, 'step', () => Uint8Array.of(5), {callId:'key'});
+  try {
+    await arrived.promise;
+    assert.deepEqual(await client.queryCall('route', contract, 'key'), flight);
+    for (const invalid of [{...flight, error_code:3}, {...unknownOutcome, method_name:'step'},
+      {...flight, status:'succeeded'}, {...flight, method_name:'/'}, {...unknownOutcome, extra:2}]) {
+      reply = () => Response.json(invalid);
+      await assert.rejects(client.queryCall('route', contract, 'key'), /invalid relay outcome response/);
+    }
+    let cancelled = 0;
+    reply = () => new Response(new ReadableStream({
+      pull(controller) { controller.enqueue(new Uint8Array(520)); }, cancel() { cancelled++; },
+    }));
+    await assert.rejects(client.queryCall('route', contract, 'key'), /1024/);
+    assert.equal(cancelled, 1);
+  } finally {
+    waiting.resolve();
+    await pending;
+    await client.close();
+  }
+});
+
+test('IPC keyed submits, read-only recovery and queries use separate native operations', async () => {
+  const ops = [];
+  const releases = [];
+  function bytes(label) { return Object.assign(Uint8Array.of(7), { release() { releases.push(label); } }); }
+  const endpoint = {
+    async prepare() {}, connectionSnapshot() { return binding; }, async close() {},
+    beginCall(route, method, stream, timeout, key) {
+      ops.push(['submit', route, method, stream, key]);
+      return { async chargeInput() {}, async dispatch() { return nativeTarget; }, async next() { return bytes('submit'); },
+        close() {}, checkDeadline() {} };
+    },
+    async queryCall(route, key) { ops.push(['query', route, key]); return unknownOutcome; },
+    async recoverCall(route, method, key) { ops.push(['recover', route, method, key]); return bytes('recover'); },
+  };
+  const client = transport.createIpcEncodedTransport('ipc://test', {connect: async () => endpoint});
+  (await client.call('route', contract, 'step', () => new Uint8Array(), {callId:'key'})).release();
+  assert.deepEqual(await client.queryCall('route', contract, 'key'), unknownOutcome);
+  (await client.recoverCall('route', contract, 'step', 'key')).release();
+  assert.deepEqual(releases, ['submit', 'recover']);
+  assert.deepEqual(ops, [['submit','route','step',false,'key'], ['query','route','key'], ['recover','route','step','key']]);
+  let encoded = false;
+  for (const key of ['', 'x\n', '测', 'a'.repeat(129), 'a.b']) {
+    await assert.rejects(client.call('route', contract, 'step', () => { encoded = true; return new Uint8Array(); }, {callId:key}), /callId/);
+    await assert.rejects(client.queryCall('route', contract, key), /callId/);
+    await assert.rejects(client.recoverCall('route', contract, 'step', key), /callId/);
+  }
+  assert.equal(encoded, false);
+  assert.equal(ops.length, 3);
+  await client.close();
+});
+
+test('Fetch never repeats a business POST at the redirect destination', async () => {
+  const requests = [];
+  let redirect = 307;
+  let baseUrl;
+  const server = createServer((req, res) => {
+    if (req.url.startsWith('/_resolve/')) {
+      return res.end(JSON.stringify([{name:'route', relay_url:baseUrl, crm_ns:contract.namespace,
+        crm_name:contract.name, crm_ver:contract.version, abi_hash:hash, signature_hash:hash}]));
+    }
+    if (req.url.startsWith('/_probe/')) return res.end();
+    requests.push([req.method, req.url]);
+    if (req.url === '/destination') return res.end('replayed');
+    res.writeHead(redirect, {Location:'/destination'}).end();
+  });
+  await new Promise((resolve, reject) => server.once('error', reject).listen(0, '127.0.0.1', resolve));
+  baseUrl = `http://127.0.0.1:${server.address().port}`;
+  const client = transport.createHttpRelayEncodedTransport(baseUrl);
+  try {
+    for (redirect of [307, 308]) {
+      for (const [key, request] of [
+        [undefined, () => client.call('route', contract, 'step', () => Uint8Array.of(1))],
+        ['k', () => client.call('route', contract, 'step', () => Uint8Array.of(1), {callId:'k'})],
+        ['k', () => client.recoverCall('route', contract, 'step', 'k')],
+      ]) {
+        await assert.rejects(request(), error => error.transportPhase === 'dispatch_uncertain' && error.callId === key);
+      }
+    }
+    assert.deepEqual(requests, Array(2).fill([
+      ['POST','/route/step'], ['POST','/_c2/calls/keyed?route=route&method=step'],
+      ['POST','/_c2/calls/recover?route=route&method=step'],
+    ]).flat());
+  } finally {
+    await client.close();
+    await new Promise(resolve => server.close(resolve));
   }
 });

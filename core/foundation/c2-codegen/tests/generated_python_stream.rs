@@ -174,6 +174,46 @@ client = contract.ContractClient(Bound())
 client.method_0_ping()
 assert events == [('unary', 'ping')]
 events.clear()
+
+class Proxy:
+    client = Bound()
+
+    def ping(self):
+        events.append('proxy-ping')
+
+def with_call_id(method, call_id):
+    assert method.__name__ == 'ping'
+    assert call_id == 'ping-1'
+    return method
+
+def recover_call(method, call_id):
+    assert method.__name__ == 'ping'
+    assert call_id == 'ping-1'
+    return lambda: events.append('proxy-replay')
+
+def query_call(proxy, call_id):
+    assert isinstance(proxy, Proxy)
+    assert call_id == 'ping-1'
+    return 'succeeded'
+
+c_two.with_call_id = with_call_id
+c_two.recover_call = recover_call
+c_two.query_call = query_call
+proxy = Proxy()
+keyed = contract.ContractClient.from_proxy(proxy)
+assert keyed.method_0_ping(call_id='ping-1') is None
+assert keyed.recover_method_0_ping('ping-1') is None
+assert keyed.query_call('ping-1') == 'succeeded'
+assert events == ['proxy-ping', 'proxy-replay'], events
+assert not hasattr(proxy, 'query_call')
+try:
+    keyed.method_1_echo(Payload(), call_id='stream-1')
+except TypeError:
+    pass
+else:
+    raise AssertionError('stream method accepted call_id')
+events.clear()
+
 items = client.method_1_echo(Payload())
 assert [item.data for item in items] == [b'first', b'second']
 assert events[:5] == [('begin', 'echo'), 'size', ('charge', 5), 'digest', 'encode'], events

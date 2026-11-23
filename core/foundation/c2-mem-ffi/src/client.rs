@@ -1,4 +1,4 @@
-//! ABI 9: native client calls and topic subscriptions.
+//! ABI 10: native client calls and topic subscriptions.
 use super::*;
 use c2_contract::ExpectedRouteContract;
 use c2_core::{
@@ -47,6 +47,7 @@ struct Call {
     state: Mutex<CallData>,
     scope: CallScope,
     stream_mode: bool,
+    call_id: Option<String>,
     cancellation: IpcStreamCancellation,
     cancelled: AtomicBool,
     next_active: AtomicBool,
@@ -111,6 +112,19 @@ fn refused(code: ErrorCode, message: impl Into<String>) -> Error {
         )]))
         .into()
 }
+fn check_call_deadline(scope: &CallScope, call_id: Option<&str>) -> Result<(), Error> {
+    let (phase, uncertain_id) = match scope.observe_deadline() {
+        CallState::ExpiredPreDispatch => ("pre_dispatch", None),
+        CallState::ExpiredDispatchUncertain => ("dispatch_uncertain", call_id),
+        _ => return Ok(()),
+    };
+    let mut error = C2Error::new(ErrorCode::CallDeadlineExceeded, "call deadline exceeded");
+    error.details.insert("transport_phase".into(), phase.into());
+    if let Some(id) = uncertain_id {
+        error.details.insert("call_id".into(), id.into());
+    }
+    Err(error.into())
+}
 fn error_value(error: &Error) -> Value {
     let mut value = json!({"message": error.to_string()});
     if let Some(phase) = error.transport_phase() {
@@ -146,6 +160,9 @@ fn error_value(error: &Error) -> Value {
         value["canonicalName"] = json!(error.code.name());
         value["details"] = json!(error.details);
     }
+    if let Some(call_id) = error.call_id() {
+        value["callId"] = json!(call_id);
+    }
     if let Some(cause) = error.local_io_cause() {
         value["ioOperation"] = json!(cause.operation());
         value["ioKind"] = json!(format!("{:?}", cause.error().kind));
@@ -166,6 +183,12 @@ fn call_error_value(call: &Call, error: &Error) -> Value {
             CallState::Succeeded => return value,
         };
         value["transportPhase"] = json!(phase);
+    }
+    if value["transportPhase"] == "dispatch_uncertain" {
+        if let Some(call_id) = &call.call_id {
+            value["callId"] = json!(call_id);
+            value["details"]["call_id"] = json!(call_id);
+        }
     }
     value
 }
@@ -290,6 +313,15 @@ unsafe fn native_with_call<T>(
 }
 fn text(value: *const c_char) -> Result<String, Error> {
     parse_utf8_c_string(value).map_err(|_| invalid("expected a non-null UTF-8 string"))
+}
+fn read_call_id(bytes: *const u8, len: usize) -> Result<String, Error> {
+    if bytes.is_null() || !(1..=c2_config::MAX_CALL_ID_LEN).contains(&len) {
+        return Err(invalid("call_id requires 1..128 ASCII bytes"));
+    }
+    let id = std::str::from_utf8(unsafe { std::slice::from_raw_parts(bytes, len) })
+        .map_err(|_| invalid("call_id must be ASCII"))?;
+    c2_config::validate_call_id(id).map_err(invalid)?;
+    Ok(id.to_owned())
 }
 fn parse(value: *const c_char) -> Result<Value, Error> {
     serde_json::from_str(&text(value)?).map_err(|e| invalid(e.to_string()))
@@ -560,19 +592,7 @@ impl Call {
         self.check_deadline()
     }
     fn check_deadline(&self) -> Result<(), Error> {
-        let phase = match self.scope.observe_deadline() {
-            CallState::ExpiredPreDispatch => "pre_dispatch",
-            CallState::ExpiredDispatchUncertain => "dispatch_uncertain",
-            _ => return Ok(()),
-        };
-        Err(
-            C2Error::new(ErrorCode::CallDeadlineExceeded, "call deadline exceeded")
-                .with_details(std::collections::BTreeMap::from([(
-                    "transport_phase".into(),
-                    phase.into(),
-                )]))
-                .into(),
-        )
+        check_call_deadline(&self.scope, None)
     }
     async fn observe(&self, limit: Option<Duration>) -> Result<Output, Error> {
         self.cancel();
@@ -620,7 +640,7 @@ impl Call {
 }
 
 /// # Safety
-/// Inputs obey the ownership and callback rules in the ABI 9 C header.
+/// Inputs obey the ownership and callback rules in the ABI 10 C header.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn c2_mem_ffi_client_domain_new(
     context: *const C2MemFfiLocalEndpointContext,
@@ -924,6 +944,8 @@ pub unsafe extern "C" fn c2_mem_ffi_call_begin(
     method: *const c_char,
     stream: u8,
     limit: *const u64,
+    call_id: *const u8,
+    call_id_len: usize,
     out: *mut *mut C2MemFfiCall,
     error: *mut *mut C2MemFfiError,
 ) -> C2MemFfiStatus {
@@ -939,17 +961,31 @@ pub unsafe extern "C" fn c2_mem_ffi_call_begin(
             if stream > 1 {
                 return Err(invalid("invalid call mode"));
             }
+            let call_id = if call_id.is_null() && call_id_len == 0 {
+                None
+            } else if stream == 1 {
+                return Err(refused(
+                    ErrorCode::UnsupportedCallMode,
+                    "server streams cannot carry a call_id",
+                ));
+            } else {
+                Some(read_call_id(call_id, call_id_len)?)
+            };
             let route = text(route)?;
             let method = text(method)?;
             let _operation = endpoint.begin_operation()?;
             let client = endpoint.bound_client(&route)?;
-            let client = client.with_call_options(CallOptions::with_timeout(
-                timeout(limit).map_or(CallTimeout::Unlimited, CallTimeout::After),
-            ));
+            let limit = timeout(limit).map_or(CallTimeout::Unlimited, CallTimeout::After);
             let prepared = if stream == 1 {
-                client.begin_stream(&method)?
+                client
+                    .with_call_options(CallOptions::with_timeout(limit))
+                    .begin_stream(&method)?
             } else {
-                client.begin_call(&method)?
+                let mut options = c2_core::UnaryCallOptions::new().with_timeout(limit);
+                if let Some(id) = &call_id {
+                    options = options.with_call_id(id).map_err(invalid)?;
+                }
+                client.begin_unary_with_options(&method, options)?
             };
             let scope = prepared.scope();
             Ok(C2MemFfiCall(Arc::new(Call {
@@ -969,6 +1005,7 @@ pub unsafe extern "C" fn c2_mem_ffi_call_begin(
                 }),
                 scope,
                 stream_mode: stream == 1,
+                call_id,
                 cancellation: IpcStreamCancellation::new(),
                 cancelled: AtomicBool::new(false),
                 next_active: AtomicBool::new(false),
@@ -985,6 +1022,112 @@ pub unsafe extern "C" fn c2_mem_ffi_call_begin(
         Err(status) => status,
     }
 }
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn c2_mem_ffi_recover_call(
+    endpoint: *const C2MemFfiEndpointContext,
+    route: *const c_char,
+    method: *const c_char,
+    call_id: *const u8,
+    call_id_len: usize,
+    limit: *const u64,
+    complete: C2MemFfiComplete,
+    user: *mut std::ffi::c_void,
+) -> C2MemFfiStatus {
+    if endpoint.is_null() || complete.is_none() {
+        return C2MemFfiStatus::NullPointer;
+    }
+    let endpoint = &unsafe { &*endpoint }.0;
+    let limit = timeout(limit);
+    let prepared = (|| {
+        let operation = endpoint.begin_operation()?;
+        let client = endpoint.bound_client(&text(route)?)?;
+        let id = read_call_id(call_id, call_id_len)?;
+        let encoded = client.begin_recover(
+            &text(method)?,
+            &id,
+            limit.map_or(CallTimeout::Unlimited, CallTimeout::After),
+        )?;
+        Ok::<_, Error>((encoded, operation, id))
+    })();
+    launch(complete, user, async move {
+        let (encoded, operation, call_id) = prepared?;
+        let scope = encoded.scope();
+        let (send, mut receive) = tokio::sync::oneshot::channel();
+        // Closing the endpoint waits on this operation even after the caller's
+        // deadline drops the receiver. The original task settles any late reply.
+        tokio::spawn(async move {
+            let _operation = operation;
+            let _ = send.send(encoded.call_held_record_async().await.result);
+        });
+        let outcome = if let Some(deadline) = scope.deadline() {
+            match tokio::time::timeout_at(deadline.into(), &mut receive).await {
+                Ok(outcome) => outcome,
+                Err(_) => {
+                    // Core may have completed before the deadline and still be
+                    // publishing the original result to this waiter.
+                    check_call_deadline(&scope, Some(&call_id))?;
+                    receive.await
+                }
+            }
+        } else {
+            receive.await
+        };
+        check_call_deadline(&scope, Some(&call_id))?;
+        let buffer = outcome.map_err(|_| invalid("native recovery ended without an outcome"))??;
+        Ok(Output::Buffer(buffer))
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn c2_mem_ffi_query_call(
+    endpoint: *const C2MemFfiEndpointContext,
+    route: *const c_char,
+    call_id: *const u8,
+    call_id_len: usize,
+    limit: *const u64,
+    complete: C2MemFfiComplete,
+    user: *mut std::ffi::c_void,
+) -> C2MemFfiStatus {
+    if endpoint.is_null() || complete.is_none() {
+        return C2MemFfiStatus::NullPointer;
+    }
+    let started = Instant::now();
+    let endpoint = &unsafe { &*endpoint }.0;
+    let args = (|| {
+        let operation = endpoint.begin_operation()?;
+        let client = endpoint.bound_client(&text(route)?)?;
+        let id = read_call_id(call_id, call_id_len)?;
+        let limit = timeout(limit);
+        Ok::<_, Error>((operation, client, id, limit))
+    })();
+    launch(complete, user, async move {
+        let (operation, client, id, limit) = args?;
+        tokio::task::spawn_blocking(move || {
+            let _operation = operation;
+            let timeout = limit.map_or(CallTimeout::Unlimited, |duration|
+                CallTimeout::After(duration.saturating_sub(started.elapsed())));
+            let outcome = client.query_call(&id, timeout)?;
+            use c2_core::{CallOutcomeStatus, ResultUnavailableReason};
+            Ok(Output::Json(json!({
+                "status": match outcome.status {
+                    CallOutcomeStatus::InFlight => "in_flight",
+                    CallOutcomeStatus::Succeeded => "succeeded",
+                    CallOutcomeStatus::Failed => "failed",
+                    CallOutcomeStatus::Unknown => "unknown",
+                },
+                "method_name": outcome.method_name,
+                "result_available": outcome.result_available,
+                "result_unavailable_reason": outcome.result_unavailable_reason.map(|reason| match reason {
+                    ResultUnavailableReason::NotRetained => "not_retained",
+                    ResultUnavailableReason::Evicted => "evicted",
+                }),
+                "error_code": outcome.error_code.map(|code| code as u32),
+                "error_details_available": outcome.error_details_available,
+            })))
+        }).await.map_err(|error| invalid(error.to_string()))?
+    })
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn c2_mem_ffi_call_charge_input(
     call: *const C2MemFfiCall,

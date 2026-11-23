@@ -34,7 +34,6 @@ fn generated_contract_keeps_http_route_binding_and_fastdb_error_projection() {
         "ExplicitRelay",
         "RelayAwareLocalIpc",
         "RelayAwareHttp",
-        "/_probe/",
         "ipcAddress",
         "serverId",
         "serverInstanceId",
@@ -174,7 +173,21 @@ fn native_transport_facade_behaves_under_node() {
         .split_once("\n\nexport interface C2FastDbCauseFields")
         .expect("contract transport boundary");
     let asset = root.join("typescript_transport.ts");
-    std::fs::write(&asset, format!("{rendered_transport}\nconst unaryTransportSmoke: C2EncodedClientTransport = {{ async call() {{ return new Uint8Array(); }} }};\nvoid unaryTransportSmoke;\n")).unwrap();
+    std::fs::write(&asset, format!("{rendered_transport}\n{}", r#"
+function checkOutcomeTypes(transport: C2StreamEncodedClientTransport & C2ClientTransport, endpoint: C2NativeEndpointContext, contract: C2ContractIdentity) {
+  const encode = () => new Uint8Array();
+  const decode = (bytes: Uint8Array) => bytes;
+  transport.call("route", contract, "unary", encode, { callId: "k" });
+  // @ts-expect-error Streams have no unary options.
+  transport.stream("route", contract, "steps", encode, decode, { callId: "k" });
+  // @ts-expect-error Subscriptions reject keys even through structurally typed options.
+  transport.subscribe("route", contract, "state", decode, { start: "next", callId: "k" });
+  // @ts-expect-error Native streams cannot carry a key.
+  endpoint.beginCall("route", "steps", true, null, "k");
+  // @ts-expect-error Recovery has no encoder or input.
+  transport.recoverCall("route", contract, "unary", "k", encode);
+}
+"#)).unwrap();
     let compile = Command::new("node")
         .arg(&compiler)
         .args([

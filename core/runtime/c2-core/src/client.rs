@@ -993,6 +993,12 @@ impl UnaryInput {
 }
 
 impl EncodedCall {
+    /// Share the original deadline and dispatch state with a native waiter.
+    #[doc(hidden)]
+    pub fn scope(&self) -> CallScope {
+        self.prepared.scope()
+    }
+
     pub fn stream(self) -> Result<CoreResponseStream, Error> {
         let (started, scope, cancellation, http_cancellation) =
             self.start_stream(false, c2_ipc::IpcStreamCancellation::new())?;

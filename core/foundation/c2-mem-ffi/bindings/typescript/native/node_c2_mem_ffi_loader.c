@@ -36,7 +36,9 @@ typedef struct Symbols {
     C2MemFfiStatus (*endpoint_deactivate)(const C2MemFfiEndpointContext *);
     C2MemFfiStatus (*endpoint_close)(const C2MemFfiEndpointContext *, C2MemFfiComplete, void *);
     void (*endpoint_free)(C2MemFfiEndpointContext *);
-    C2MemFfiStatus (*call_begin)(const C2MemFfiEndpointContext *, const char *, const char *, uint8_t, const uint64_t *, C2MemFfiCall **, C2MemFfiError **);
+    C2MemFfiStatus (*call_begin)(const C2MemFfiEndpointContext *, const char *, const char *, uint8_t, const uint64_t *, const uint8_t *, size_t, C2MemFfiCall **, C2MemFfiError **);
+    C2MemFfiStatus (*recover_call)(const C2MemFfiEndpointContext *, const char *, const char *, const uint8_t *, size_t, const uint64_t *, C2MemFfiComplete, void *);
+    C2MemFfiStatus (*query_call)(const C2MemFfiEndpointContext *, const char *, const uint8_t *, size_t, const uint64_t *, C2MemFfiComplete, void *);
     C2MemFfiStatus (*call_charge)(const C2MemFfiCall *, uint64_t, C2MemFfiComplete, void *);
     C2MemFfiStatus (*call_dispatch)(const C2MemFfiCall *, const uint8_t *, size_t, C2MemFfiComplete, void *);
     C2MemFfiStatus (*call_next)(const C2MemFfiCall *, C2MemFfiComplete, void *);
@@ -135,7 +137,7 @@ static napi_value error_from_details(napi_env env, napi_value details) {
     if (msg == NULL || !ok(napi_create_error(env, NULL, msg, &error))) return NULL;
     if (!put(env, error, "nativeDetails", details)) return NULL;
     /* Native error JSON is authoritative; keep every structured field. */
-    const char *fields[] = { "code", "canonicalName", "details", "transportPhase", "category", "localProtocolVersion", "peerProtocolVersion", "ioOperation", "ioKind", "rawOsError" };
+    const char *fields[] = { "code", "canonicalName", "details", "transportPhase", "callId", "category", "localProtocolVersion", "peerProtocolVersion", "ioOperation", "ioKind", "rawOsError" };
     for (size_t i = 0; i < sizeof(fields) / sizeof(fields[0]); i++) {
         if (!ok(napi_has_named_property(env, details, fields[i], &has))) return NULL;
         if (has) {
@@ -553,12 +555,24 @@ static napi_value domain_method(napi_env env, napi_callback_info info) {
         !method(env, object, "connectionSnapshot", endpoint_method, (void *)5) ||
         !method(env, object, "beginCall", endpoint_method, (void *)2) ||
         !method(env, object, "openSubscription", endpoint_method, (void *)6) ||
+        !method(env, object, "recoverCall", endpoint_method, (void *)7) ||
+        !method(env, object, "queryCall", endpoint_method, (void *)8) ||
         !method(env, object, "deactivate", endpoint_method, (void *)3) ||
         !method(env, object, "close", endpoint_method, (void *)4)) return NULL;
     return object;
 }
+/* Keep the exact byte count, including embedded NUL, for Rust validation. */
+static bool call_id_bytes(napi_env env, napi_value value, uint8_t bytes[129], size_t *len) {
+    size_t written;
+    if (!ok(napi_get_value_string_utf8(env, value, NULL, 0, len)) || *len == 0 || *len > 128 ||
+        !ok(napi_get_value_string_utf8(env, value, (char *)bytes, 129, &written)) || written != *len) {
+        bad(env, "call_id requires a string of 1..128 ASCII bytes.");
+        return false;
+    }
+    return true;
+}
 static napi_value endpoint_method(napi_env env, napi_callback_info info) {
-    size_t argc = 4; napi_value argv[4], self; void *data = NULL;
+    size_t argc = 5; napi_value argv[5], self; void *data = NULL;
     if (!args(env, info, &argc, argv, &self, &data)) return NULL;
     Owner *owner = owner_get(env, self, OWNER_ENDPOINT, true);
     if (owner == NULL) return NULL;
@@ -604,7 +618,7 @@ static napi_value endpoint_method(napi_env env, napi_callback_info info) {
         return async_status(env, operation, st, promise);
     }
     if (data == (void *)6) {
-        if (argc < 3) return bad(env, "openSubscription expects route, topic, options and optional timeout.");
+        if (argc < 3 || argc > 4) return bad(env, "openSubscription expects route, topic, options and optional timeout.");
         char *route = string(env, argv[0], "Route name must be a string.");
         if (route == NULL) return NULL;
         char *topic = string(env, argv[1], "Topic name must be a string.");
@@ -619,7 +633,30 @@ static napi_value endpoint_method(napi_env env, napi_callback_info info) {
         free(route); free(topic); free(options);
         return operation == NULL ? NULL : async_status(env, operation, st, promise);
     }
-    if (argc != 4) return bad(env, "beginCall expects route, method, stream flag and timeout.");
+    if (data == (void *)7 || data == (void *)8) {
+        bool recovery = data == (void *)7;
+        if (argc != (recovery ? 4u : 3u)) return bad(env, "Expected route, optional method for recovery, call_id and timeout.");
+        uint8_t id[129]; size_t len;
+        uint64_t millis; const uint64_t *limit;
+        if (!call_id_bytes(env, argv[argc - 2], id, &len) || !timeout(env, argv[argc - 1], &millis, &limit)) return NULL;
+        char *route = string(env, argv[0], "Route name must be a string.");
+        if (route == NULL) return NULL;
+        char *name = recovery ? string(env, argv[1], "Method name must be a string.") : NULL;
+        if (recovery && name == NULL) { free(route); return NULL; }
+        napi_value promise;
+        Async *operation = async_new(env, s, recovery ? ASYNC_NEXT : ASYNC_JSON, &promise);
+        if (operation != NULL) {
+            st = recovery ? s->recover_call(owner->ptr, route, name, id, len, limit, native_complete, operation)
+                          : s->query_call(owner->ptr, route, id, len, limit, native_complete, operation);
+        }
+        free(route); free(name);
+        return operation == NULL ? NULL : async_status(env, operation, st, promise);
+    }
+    if (argc < 4 || argc > 5) return bad(env, "beginCall expects route, method, stream flag, timeout and optional call_id.");
+    uint8_t id[129]; size_t len = 0;
+    napi_valuetype key_type;
+    if (argc == 5 && (!ok(napi_typeof(env, argv[4], &key_type)) ||
+        (key_type != napi_undefined && !call_id_bytes(env, argv[4], id, &len)))) return NULL;
     char *route = string(env, argv[0], "Route name must be a string.");
     if (route == NULL) return NULL;
     char *name = string(env, argv[1], "Method name must be a string.");
@@ -629,7 +666,7 @@ static napi_value endpoint_method(napi_env env, napi_callback_info info) {
     uint64_t millis = 0; const uint64_t *limit = NULL;
     if (!timeout(env, argv[3], &millis, &limit)) { free(route); free(name); return NULL; }
     C2MemFfiCall *call = NULL; C2MemFfiError *error = NULL;
-    st = s->call_begin(owner->ptr, route, name, stream ? 1 : 0, limit, &call, &error);
+    st = s->call_begin(owner->ptr, route, name, stream ? 1 : 0, limit, len ? id : NULL, len, &call, &error);
     free(route); free(name);
     if (st != C2_MEM_FFI_STATUS_OK || call == NULL) return throw_native(env, s, error, st);
     napi_value object = owner_wrap(env, s, OWNER_CALL, call);
@@ -677,7 +714,7 @@ static napi_value call_method(napi_env env, napi_callback_info info) {
             !ok(napi_get_typedarray_info(env, argv[0], &type, &len, &bytes, &arraybuffer, &offset)) ||
             type != napi_uint8_array || (bytes == NULL && len != 0)) return bad(env, "dispatch expects a Uint8Array.");
         operation = async_new(env, s, kind, &promise); if (operation == NULL) return NULL;
-        /* ABI 9 copies borrowed bytes before this function returns. */
+        /* ABI 10 copies borrowed bytes before this function returns. */
         st = s->call_dispatch(owner->ptr, bytes, len, native_complete, operation);
     } else if (data == (void *)3) {
         operation = async_new(env, s, kind, &promise); if (operation == NULL) return NULL;
@@ -848,6 +885,8 @@ static bool load_all(napi_env env, Symbols *s) {
     LOAD_REQUIRED(endpoint_close, "c2_mem_ffi_endpoint_context_close");
     LOAD_REQUIRED(endpoint_free, "c2_mem_ffi_endpoint_context_free");
     LOAD_REQUIRED(call_begin, "c2_mem_ffi_call_begin");
+    LOAD_REQUIRED(recover_call, "c2_mem_ffi_recover_call");
+    LOAD_REQUIRED(query_call, "c2_mem_ffi_query_call");
     LOAD_REQUIRED(call_charge, "c2_mem_ffi_call_charge_input");
     LOAD_REQUIRED(call_dispatch, "c2_mem_ffi_call_dispatch");
     LOAD_REQUIRED(call_next, "c2_mem_ffi_call_next");
