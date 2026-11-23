@@ -130,6 +130,15 @@ impl ContractClient {
         self.client.call_options()
     }
 
+    /// Observe a keyed call in this route's current registration.
+    pub fn query_call(
+        &self,
+        call_id: &str,
+        timeout: c_two::CallTimeout,
+    ) -> Result<c_two::CallOutcome, c_two::Error> {
+        self.client.query_call(call_id, timeout)
+    }
+
     pub fn expected_route(&self) -> &c_two::contract::ExpectedRouteContract {
         self.client.expected_route()
     }
@@ -420,6 +429,51 @@ fn render_rust_client_method(output: &mut String, method: &TargetMethod<'_>) {
              \x20       decode_{symbol}_output_held(response)\n\
              \x20   }}\n",
             quoted(method.name),
+        ));
+    }
+    let method_name = quoted(method.name);
+    for held in [false, true] {
+        if held && method.output_sha256.is_none() {
+            continue;
+        }
+        let (prefix, return_type, dispatch, recover, decode) = if held {
+            (
+                "hold_",
+                "c_two::Held<fastdb::Payload>",
+                "call_held",
+                "recover_unary_call_held",
+                format!("decode_{symbol}_output_held"),
+            )
+        } else {
+            (
+                "",
+                return_type,
+                "call_owned",
+                "recover_unary_call",
+                format!("decode_{symbol}_output"),
+            )
+        };
+        output.push_str(&format!(
+            r#"
+    pub fn {prefix}{symbol}_with_options(
+        &self{parameter},
+        options: c_two::UnaryCallOptions,
+    ) -> Result<{return_type}, c_two::Error> {{
+        let {binding} = self.client.begin_unary_with_options({method_name}, options)?;
+{preparation}        let request = {request};
+        let response = call.encode_vec(request)?.{dispatch}()?;
+        {decode}(response)
+    }}
+
+    pub fn recover_{prefix}{symbol}(
+        &self,
+        call_id: &str,
+        timeout: c_two::CallTimeout,
+    ) -> Result<{return_type}, c_two::Error> {{
+        let response = self.client.{recover}({method_name}, call_id, timeout)?;
+        {decode}(response)
+    }}
+"#,
         ));
     }
 }
@@ -1012,7 +1066,7 @@ fn render_python(
          from dataclasses import dataclass\n\
          from pathlib import Path\n\
          from types import ModuleType\n\
-         from typing import Any, Protocol\n\n",
+         from typing import TYPE_CHECKING, Any, Protocol\n\n",
     );
     output.push_str(
         "from fastdb4py.payload import Payload\n\
@@ -1024,6 +1078,7 @@ fn render_python(
         (true, true) => output.push_str("from c_two import HeldResult, Stream, Subscription\n\n"),
         (false, false) => {}
     }
+    output.push_str("if TYPE_CHECKING:\n    from c_two import CallOutcome\n\n");
     output.push_str(&format!(
         "CONTRACT_SCHEMA = {}\n\
          CRM_NAMESPACE = {}\n\
@@ -1168,7 +1223,20 @@ fn render_python(
          \x20           primary = None\n\n\
          class ContractClient:\n\
          \x20   def __init__(self, bound_client: BoundClient) -> None:\n\
-         \x20       self._bound_client = bound_client\n",
+         \x20       self._bound_client = bound_client\n\
+         \x20       self._proxy: Any = None\n\n\
+         \x20   @classmethod\n\
+         \x20   def from_proxy(cls, proxy: Any) -> ContractClient:\n\
+         \x20       client = cls(proxy.client)\n\
+         \x20       client._proxy = proxy\n\
+         \x20       return client\n\n\
+         \x20   def _require_proxy(self) -> Any:\n\
+         \x20       if self._proxy is None:\n\
+         \x20           raise TypeError(\"keyed calls require ContractClient.from_proxy(proxy)\")\n\
+         \x20       return self._proxy\n\n\
+         \x20   def query_call(self, call_id: str) -> CallOutcome:\n\
+         \x20       from c_two import query_call\n\n\
+         \x20       return query_call(self._require_proxy(), call_id)\n",
     );
     for method in methods {
         render_python_client_method(&mut output, method);
@@ -1343,12 +1411,25 @@ fn render_python_client_method(output: &mut String, method: &TargetMethod<'_>) {
     } else {
         format!("encode_{symbol}_input()")
     };
+    let arguments = if method.input_sha256.is_some() {
+        "payload"
+    } else {
+        ""
+    };
+    let method_name = quoted(method.name);
     output.push_str(&format!(
-        "\n    def {symbol}(self{parameter}) -> {return_type}:\n\
+        "\n    def {symbol}(self{parameter}, *, call_id: str | None = None) -> {return_type}:\n\
+         \x20       if call_id is not None:\n\
+         \x20           from c_two import with_call_id\n\n\
+         \x20           method = getattr(self._require_proxy(), {method_name})\n\
+         \x20           return with_call_id(method, call_id)({arguments})\n\
          \x20       request = {request}\n\
-         \x20       response = _project_call(self._bound_client.call, {}, request)\n\
-         \x20       return decode_{symbol}_output(_copy_and_release_response(response))\n",
-        quoted(method.name),
+         \x20       response = _project_call(self._bound_client.call, {method_name}, request)\n\
+         \x20       return decode_{symbol}_output(_copy_and_release_response(response))\n\n\
+         \x20   def recover_{symbol}(self, call_id: str) -> {return_type}:\n\
+         \x20       from c_two import recover_call\n\n\
+         \x20       method = getattr(self._require_proxy(), {method_name})\n\
+         \x20       return recover_call(method, call_id)()\n",
     ));
 }
 
@@ -1727,6 +1808,16 @@ function normalizeFastDbPayloadError(error: unknown): unknown {
     };
     output.push_str(&format!("    private readonly transport: {transport},\n"));
     output.push_str("    private readonly routeName: string,\n  ) {}\n");
+    if methods
+        .iter()
+        .any(|method| method.mode == MethodMode::Unary)
+    {
+        output.push_str(
+            "\n  queryCall(callId: string): Promise<C2CallOutcome> {\n\
+             \x20   return this.transport.queryCall(this.routeName, CONTRACT, callId);\n\
+             \x20 }\n",
+        );
+    }
     for method in methods {
         render_typescript_client_method(&mut output, method);
     }
@@ -1849,12 +1940,24 @@ fn render_typescript_client_method(output: &mut String, method: &TargetMethod<'_
         ));
         return;
     }
+    let parameter = if parameter.is_empty() {
+        "options?: C2UnaryCallOptions".to_string()
+    } else {
+        format!("{parameter}, options?: C2UnaryCallOptions")
+    };
     output.push_str(&format!(
         "\n  async {symbol}({parameter}): Promise<{return_type}> {{\n\
          \x20   const response = requireResponsePayload(\n\
-         \x20     await this.transport.call(this.routeName, CONTRACT, {}, () => {request}),\n\
+         \x20     await this.transport.call(this.routeName, CONTRACT, {}, () => {request}, options),\n\
          \x20     \"encoded transport response\",\n\
          \x20   );\n\
+         \x20   return decodeAndReleaseResponse(response, decode_{symbol}_output);\n\
+         \x20 }}\n",
+        quoted(method.name),
+    ));
+    output.push_str(&format!(
+        "\n  async recover_{symbol}(callId: string): Promise<{return_type}> {{\n\
+         \x20   const response = await this.transport.recoverCall(this.routeName, CONTRACT, {}, callId);\n\
          \x20   return decodeAndReleaseResponse(response, decode_{symbol}_output);\n\
          \x20 }}\n",
         quoted(method.name),
@@ -1863,7 +1966,7 @@ fn render_typescript_client_method(output: &mut String, method: &TargetMethod<'_
         output.push_str(&format!(
             "\n  async hold_{symbol}({parameter}): Promise<C2HeldResult<{return_type}>> {{\n\
              \x20   const response = requireResponsePayload(\n\
-             \x20     await this.transport.call(this.routeName, CONTRACT, {}, () => {request}),\n\
+             \x20     await this.transport.call(this.routeName, CONTRACT, {}, () => {request}, options),\n\
              \x20     \"encoded transport response\",\n\
              \x20   );\n\
              \x20   try {{\n\
@@ -1883,9 +1986,9 @@ fn render_typescript_client_method(output: &mut String, method: &TargetMethod<'_
              \x20   return createHeldResult(undefined, false);\n\
              \x20 }}\n",
             if method.input_sha256.is_some() {
-                "payload"
+                "payload, options"
             } else {
-                ""
+                "options"
             },
         ));
     }

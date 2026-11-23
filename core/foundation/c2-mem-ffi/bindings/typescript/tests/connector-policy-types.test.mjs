@@ -20,7 +20,13 @@ test('connector is the single factory facade and domain limits are factory-only'
       import type {C2IpcTransportOptions, C2IpcNativeEndpointOptions} from ${JSON.stringify(transport)};
       const limits: NativeClientDomainOptions = {memoryBudgetBytes: 1024n, fileSpillBudgetBytes: 0, maxOutstandingCalls: 64n};
       const connect = createNodeIpcConnector(limits);
-      void connect('ipc://first', 100, {connectTimeoutMs: 50});
+      void connect('ipc://first', 100, {connectTimeoutMs: 50}).then(endpoint => {
+        endpoint.beginCall('route', 'step', false, null, 'op-1');
+        // @ts-expect-error a server stream cannot receive an operation key
+        endpoint.beginCall('route', 'watch', true, null, 'op-1');
+        // @ts-expect-error a subscription cannot receive an operation key
+        endpoint.openSubscription('route', 'topic', {callId: 'op-1'});
+      });
       // @ts-expect-error capacity belongs to the factory
       void connect('ipc://second', 100, {memoryBudgetBytes: 1024});
       // @ts-expect-error capacity belongs to the factory

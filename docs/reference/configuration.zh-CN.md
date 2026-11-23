@@ -20,6 +20,8 @@ Rust Core 按 **显式代码或 CLI 覆盖 > 进程环境变量 > `.env` > 默�
 | `C2_CALL_MAX_OUTSTANDING` | `M == 0` 时为 0，其余为 `max(64, floor(M / 65536))` | `max_outstanding_calls`、`--call-max-outstanding` |
 | `C2_MAX_PAYLOAD_SIZE` | 16 GiB | Host 单条载荷上限，`max_payload_size` 须为正数 |
 | `C2_MAX_EXECUTION_WORKERS` | 主机并行度限制在 4–64，取不到时按 4 计算 | Host 的 `max_execution_workers`。显式值须至少为 1，可以超过 64。 |
+| `C2_OUTCOME_MAX_ENTRIES` | 4096 | Host 的 `outcome_max_entries`，至少为 1。限制所有注册中已结算的调用结局总条数。 |
+| `C2_OUTCOME_MAX_RETAINED_BYTES` | `min(64 MiB, server.M / 4)` | Host 的 `outcome_max_retained_bytes`，范围为 0 到 `server.M`。设为 0 时仅保留元数据。 |
 | `C2_RELAY_BIND` | `0.0.0.0:8080` | `c3 relay --bind` / `-b` |
 | `C2_RELAY_ID` | 自动生成 | `c3 relay --relay-id` |
 | `C2_RELAY_ADVERTISE_URL` | 由实际绑定地址推导 | `c3 relay --advertise-url` |
@@ -34,7 +36,9 @@ Core Runtime 在首次远端业务连接或调用尝试时创建 `client` 域，
 
 Python `cc.set_client` 与 `cc.set_server` 接受表中的三个容量字段。`cc.set_server` 还接受 `server_id`、`startup_timeout`、`max_payload_size` 和 `max_execution_workers`。身份和启动超时只通过代码设置。显式创建的 `cc.Runtime()` 使用相应实例方法。在 Rust 中，`RuntimeOptions` 拥有客户端容量、本地端点和发现选项，`HostOptions` 拥有服务端身份、启动、承载上限和服务端容量。每个 Node 连接器拥有一个仅使用客户端域的 Core Runtime，接受 [C ABI](c-abi.md#client-domain-endpoints-and-calls) 所列的三个容量选项。
 
-更新逐字段合并。省略参数（`Keep`，Python `_UNSET`）保留已接受的代码覆盖。`Inherit`（Python `None`）清除该字段的覆盖，恢复环境变量和默认值。`Set` 写入显式值。Core 校验整个候选配置并原子提交。修改 `M` 会保留显式 `N`，除非同一次更新清除或替换它。
+使用 `cc.set_server(outcome_max_entries=..., outcome_max_retained_bytes=...)` 或对应的 `Runtime.set_server` 方法设置 Host 的调用结局容量。Rust 提供 `HostOptions::with_outcome_max_entries` 和 `HostOptions::with_outcome_max_retained_bytes`。条数上限计入所有已结算的调用结局，包括未保留字节的记录。保留字节预算由该 Host 的所有注册共享，默认为生效的服务端内存预算的四分之一，向下取整且最多为 64 MiB。设为 0 时，成功的空响应仍可恢复，因为它无需保留字节。见[调用结局保留](memory-policy.md#call-outcome-retention)。
+
+更新逐字段合并。省略参数（`Keep`，Python `_UNSET`）保留已接受的代码覆盖。`Inherit`（Python `None`）清除该字段的覆盖，恢复环境变量和默认值。`Set` 写入显式值。Core 校验整个候选配置并原子提交。修改 `M` 会保留显式 `N`，除非同一次更新清除或替换它。如果将 `server.M` 降至解析后的显式保留字节预算以下，必须在同一次更新中让保留预算符合新的 `server.M`，校验才能通过。
 
 角色冻结后，Core 使用该域冻结时捕获的来源解析更新。非法候选配置会先报配置校验错误；有效配置相同即成功，包括空更新和沿用自动选择的 `server_id`。任何通过校验但改变已冻结有效值的更新会报 Rust `LifecycleError::ConfigFrozen`（Python 投影为 `c_two.error.CoreError` 且 `lifecycle_kind == 'config_frozen'`，不存在独立的 `ConfigFrozen` Python 异常类）。另一角色仍可在自身冻结前配置。见 [Runtime 生命周期](runtime-lifecycle.md)。
 
@@ -107,4 +111,4 @@ cc.endpoint.set_local_endpoint(root=str(ipc_dir))
 
 Rust 与 Python 的直接 IPC 和 relay HTTP 业务调用，以及生成的 TypeScript 直接 IPC 调用，默认均无截止时间。生成的 TypeScript 显式 relay 与 relay-aware 传输默认将 `callTimeoutMs` 设为 `300000` 毫秒（包括后者选中本机 IPC 的调用），传入 `callTimeoutMs: 0` 才取消默认期限。Python 使用 `cc.with_call_options(proxy, timeout=...)` 限制一次逻辑调用的等待，包括重新获取路由，或传入 `None` 表示无限等待。0 在派发前到期，负数和非有限值无效。同进程同步调用接受继承的等待设置或无限等待。连接截止时间独立设置。
 
-到期结束调用方等待。已派发的调用可继续到真实终态，调用槽随之释放。只有派发前的失败可以安全重试。全部远端一元调用与服务端流均计入 `N`，包括无截止时间的调用。见[执行准入](runtime-lifecycle.md#execution-admission)和[诊断快照](memory-policy.md#statistics-and-payload-lifetime)。
+到期结束调用方等待。已派发的调用可继续到真实终态，调用槽随之释放。只有派发前的失败可以安全重提。远端一元调用（包括 `recover_call`）与服务端流均计入 `N`，包括无截止时间的调用。`query_call` 使用独立的控制上限。见[执行准入](runtime-lifecycle.md#execution-admission)和[诊断快照](memory-policy.md#statistics-and-payload-lifetime)。

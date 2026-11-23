@@ -10,6 +10,9 @@ use thiserror::Error;
 use super::HttpCallControl;
 use super::HttpTopicSubscription;
 use super::{HttpResponseStream, HttpStreamCancellation};
+use crate::outcome_wire::{
+    CALL_ID_HEADER, KEYED_PATH, MAX_OUTCOME_JSON_BYTES, OUTCOME_PATH, OutcomeJson, RECOVER_PATH,
+};
 use c2_contract::ExpectedRouteContract;
 
 /// Characters allowed unencoded in URL path segments — matches Python's
@@ -200,6 +203,13 @@ impl AsRef<[u8]> for ReservedInput {
     }
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum HttpUnaryMode<'a> {
+    Plain,
+    Keyed(&'a str),
+    Recover(&'a str),
+}
+
 impl HttpClient {
     /// Create a new client with an explicit proxy policy. The data-plane
     /// client has no total/upload timeout, no hidden POST replay and no
@@ -232,13 +242,31 @@ impl HttpClient {
         data: HttpCallInput<'_>,
         budget: &DomainBudget,
         control: Option<&HttpCallControl>,
+        mode: HttpUnaryMode<'_>,
     ) -> Result<BudgetedBuffer, HttpError> {
-        let url = format!(
-            "{}/{}/{}",
-            self.base_url,
-            encode_segment(&expected.route_name),
-            encode_segment(method_name),
-        );
+        let outcome_endpoint = match mode {
+            HttpUnaryMode::Plain => None,
+            HttpUnaryMode::Keyed(id) => Some((KEYED_PATH, id)),
+            HttpUnaryMode::Recover(id) => Some((RECOVER_PATH, id)),
+        };
+        let request = if let Some((path, id)) = outcome_endpoint {
+            c2_config::validate_call_id(id).map_err(HttpError::InvalidInput)?;
+            self.client
+                .post(format!(
+                    "{}{path}?route={}&method={}",
+                    self.base_url,
+                    encode_segment(&expected.route_name),
+                    encode_segment(method_name)
+                ))
+                .header(CALL_ID_HEADER, id)
+        } else {
+            self.client.post(format!(
+                "{}/{}/{}",
+                self.base_url,
+                encode_segment(&expected.route_name),
+                encode_segment(method_name)
+            ))
+        };
         let length = data.len();
         let deadline = control.and_then(HttpCallControl::deadline);
         super::call_control::check_active(control)?;
@@ -249,9 +277,7 @@ impl HttpClient {
                 control.is_some_and(|control| control.payload_budget().is_some()),
             )
             .await?;
-        let request = self
-            .client
-            .post(&url)
+        let request = request
             .header("Content-Type", "application/octet-stream")
             .header(CONTENT_LENGTH, length.to_string())
             .body(body);
@@ -270,7 +296,74 @@ impl HttpClient {
             .await
             .map_err(HttpError::Request)?;
 
-        crate::payload::read_http_response(resp, budget, None).await
+        let result = crate::payload::read_http_response(resp, budget, None).await;
+        match (outcome_endpoint, result) {
+            (Some(_), Err(HttpError::ResponseError(404, body)))
+                if c2_error::C2Error::from_json_bytes(&body).is_err() =>
+            {
+                Err(unsupported_outcome_endpoint())
+            }
+            (_, result) => result,
+        }
+    }
+
+    pub(crate) async fn query_call_route_async(
+        &self,
+        expected: &ExpectedRouteContract,
+        call_id: &str,
+    ) -> Result<c2_wire::rpc::WireCallOutcome, HttpError> {
+        c2_config::validate_call_id(call_id).map_err(HttpError::InvalidInput)?;
+        let url = format!(
+            "{}{OUTCOME_PATH}?route={}",
+            self.base_url,
+            encode_segment(&expected.route_name)
+        );
+        let mut response = add_expected_contract_headers(
+            self.client.get(url).header(CALL_ID_HEADER, call_id),
+            expected,
+        )
+        .send()
+        .await
+        .map_err(HttpError::Request)?;
+        let status = response.status().as_u16();
+        let limit = if status == 200 {
+            MAX_OUTCOME_JSON_BYTES
+        } else {
+            c2_wire::rpc::MAX_QUERY_CALL_ERROR_BYTES * 2
+        };
+        let mut body = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(HttpError::Request)? {
+            if chunk.len() > limit - body.len() {
+                return Err(HttpError::Transport(
+                    "relay outcome response exceeds its limit".into(),
+                ));
+            }
+            body.extend_from_slice(&chunk);
+        }
+        if status == 200 {
+            let json: OutcomeJson<'_> = serde_json::from_slice(&body).map_err(|error| {
+                HttpError::Transport(format!("invalid relay outcome JSON: {error}"))
+            })?;
+            c2_wire::rpc::WireCallOutcome::try_from(json)
+                .map_err(|error| HttpError::Transport(format!("invalid relay outcome: {error}")))
+        } else if status == 404 && c2_error::C2Error::from_json_bytes(&body).is_err() {
+            Err(unsupported_outcome_endpoint())
+        } else if status == 500 {
+            let error = c2_error::C2Error::from_wire_bytes(&body).map_err(|error| {
+                HttpError::Transport(format!("invalid relay outcome error: {error}"))
+            })?;
+            let error =
+                error.ok_or_else(|| HttpError::Transport("empty relay outcome error".into()))?;
+            Err(HttpError::ServerError(
+                status,
+                serde_json::to_string(&error.envelope()).expect("canonical envelope serializes"),
+            ))
+        } else {
+            Err(HttpError::ServerError(
+                status,
+                String::from_utf8_lossy(&body).into_owned(),
+            ))
+        }
     }
 
     pub(crate) async fn stream_route_async(
@@ -487,11 +580,12 @@ impl HttpClient {
         expected: &ExpectedRouteContract,
         budget: &DomainBudget,
     ) -> Result<(), HttpError> {
-        let url = format!(
-            "{}/_probe/{}",
-            self.base_url,
-            encode_segment(&expected.route_name)
-        );
+        let route = encode_segment(&expected.route_name);
+        let url = if matches!(expected.route_name.as_str(), "." | "..") {
+            format!("{}/_probe?route={route}", self.base_url)
+        } else {
+            format!("{}/_probe/{route}", self.base_url)
+        };
         let request = add_expected_contract_headers(self.probe_client.get(&url), expected);
         let resp = request.send().await.map_err(HttpError::Request)?;
         match resp.status().as_u16() {
@@ -514,6 +608,10 @@ impl HttpClient {
     pub fn base_url(&self) -> &str {
         &self.base_url
     }
+}
+
+fn unsupported_outcome_endpoint() -> HttpError {
+    HttpError::Transport("relay returned HTTP 404 without a C-Two outcome envelope".into())
 }
 
 fn stream_protocol_error(reason: &'static str) -> HttpError {
@@ -636,6 +734,7 @@ mod tests {
                 input,
                 &crate::payload::memory_only_budget(1024),
                 Some(&control),
+                HttpUnaryMode::Plain,
             )
             .await
             .unwrap_err();

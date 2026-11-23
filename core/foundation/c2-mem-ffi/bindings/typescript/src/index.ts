@@ -1,11 +1,12 @@
 import { createRequire } from "node:module";
 
-export const C2_MEM_FFI_ABI_VERSION = 9;
+export const C2_MEM_FFI_ABI_VERSION = 10;
 
 export interface NativeErrorDetails {
   readonly message: string;
   readonly code?: number;
   readonly canonicalName?: string;
+  readonly callId?: string;
   readonly details?: Readonly<Record<string, string>>;
   readonly transportPhase?: "pre_dispatch" | "dispatch_uncertain";
   readonly category?: string;
@@ -99,10 +100,22 @@ export interface NativeConnectionSnapshot extends NativeIpcIdentity {
   readonly endReason: "local_close" | "peer_close_message" | "peer_eof" | "connection_reset" | "protocol_error" | "io_error" | null;
 }
 
+export interface CallOutcome {
+  readonly status: "in_flight" | "succeeded" | "failed" | "unknown";
+  readonly method_name: string | null;
+  readonly result_available: boolean;
+  readonly result_unavailable_reason: "not_retained" | "evicted" | null;
+  readonly error_code: number | null;
+  readonly error_details_available: boolean;
+}
+
 export interface NativeEndpointContext {
   prepare(routeName: string, contract: object, timeoutMs?: number | null): Promise<NativePreparedRoute>;
   connectionSnapshot(routeName: string): NativeConnectionSnapshot | null;
   beginCall(routeName: string, method: string, serverStream: boolean, timeoutMs: number | null): NativeCall;
+  beginCall(routeName: string, method: string, serverStream: false, timeoutMs: number | null, callId?: string): NativeCall;
+  recoverCall(routeName: string, method: string, callId: string, timeoutMs: number | null): Promise<NativeBuffer>;
+  queryCall(routeName: string, callId: string, timeoutMs: number | null): Promise<CallOutcome>;
   openSubscription(routeName: string, topic: string, options?: SubscribeOptions, timeoutMs?: number | null): Promise<SubscriptionHandle>;
   deactivate(): void;
   close(): Promise<void>;
@@ -158,7 +171,7 @@ export interface C2MemFfiLocalEndpointContext {
 
 export interface C2MemFfiLocalEndpointOptions extends C2MemFfiNodeNativeLoadOptions, C2MemFfiLocalEndpointCaptureOptions {
   readonly endpointContext?: C2MemFfiLocalEndpointContext;
-  /** For a loaded ABI 9 addon or a test double; no raw socket injection exists. */
+  /** For a loaded ABI 10 addon or a test double; no raw socket injection exists. */
   readonly nativeSymbols?: C2MemFfiNodeNativeSymbols;
 }
 
@@ -191,6 +204,7 @@ export class C2NodeIpcConnectionError extends Error {
 export class C2NativeError extends Error {
   readonly nativeDetails: NativeErrorDetails;
   readonly code: number | undefined;
+  declare readonly callId?: string;
   readonly canonicalName: string | undefined;
   readonly transportPhase: NativeErrorDetails["transportPhase"];
   readonly category: string | undefined;
@@ -205,6 +219,7 @@ export class C2NativeError extends Error {
     this.name = details.canonicalName ?? "C2NativeError";
     this.nativeDetails = details;
     this.code = details.code;
+    if (details.transportPhase === "dispatch_uncertain" && details.callId !== undefined) this.callId = details.callId;
     this.canonicalName = details.canonicalName;
     this.transportPhase = details.transportPhase;
     this.category = details.category;
@@ -293,7 +308,8 @@ class ProjectedSubscription implements SubscriptionHandle {
   checkDeadline(): void { nativeValue(() => this.native.checkDeadline()); }
 }
 
-type NativeEndpoint = Omit<NativeEndpointContext, "openSubscription"> & {
+type NativeEndpoint = Omit<NativeEndpointContext, "openSubscription" | "beginCall"> & {
+  beginCall(routeName: string, method: string, serverStream: boolean, timeoutMs: number | null, callId?: string): NativeCall;
   openSubscription(routeName: string, topic: string, options: SubscribeOptions, timeoutMs: number | null): Promise<NativeSubscriptionOpen>;
 };
 
@@ -307,8 +323,16 @@ class ProjectedEndpoint implements NativeEndpointContext {
   connectionSnapshot(routeName: string): NativeConnectionSnapshot | null {
     return nativeValue(() => this.native.connectionSnapshot(routeName));
   }
-  beginCall(routeName: string, method: string, serverStream: boolean, timeoutMs: number | null): NativeCall {
-    return new ProjectedCall(nativeValue(() => this.native.beginCall(routeName, method, serverStream, timeoutMs)));
+  beginCall(routeName: string, method: string, serverStream: boolean, timeoutMs: number | null): NativeCall;
+  beginCall(routeName: string, method: string, serverStream: false, timeoutMs: number | null, callId?: string): NativeCall;
+  beginCall(routeName: string, method: string, serverStream: boolean, timeoutMs: number | null, callId?: string): NativeCall {
+    return new ProjectedCall(nativeValue(() => this.native.beginCall(routeName, method, serverStream, timeoutMs, callId)));
+  }
+  recoverCall(routeName: string, method: string, callId: string, timeoutMs: number | null): Promise<NativeBuffer> {
+    return nativePromise(() => this.native.recoverCall(routeName, method, callId, timeoutMs));
+  }
+  queryCall(routeName: string, callId: string, timeoutMs: number | null): Promise<CallOutcome> {
+    return nativePromise(() => this.native.queryCall(routeName, callId, timeoutMs));
   }
   async openSubscription(routeName: string, topic: string, options: SubscribeOptions = {}, timeoutMs: number | null = null): Promise<SubscriptionHandle> {
     return new ProjectedSubscription(await nativePromise(() => this.native.openSubscription(routeName, topic, options, timeoutMs)));

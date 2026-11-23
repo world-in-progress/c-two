@@ -1,4 +1,4 @@
-//! End-to-end IPC 17 direct cross-process/connection publish/subscribe tests
+//! End-to-end IPC direct cross-process/connection publish/subscribe tests
 //! (ADR 0005 Batch 4).
 
 use std::sync::Arc;
@@ -262,10 +262,10 @@ fn assert_semantic_code(err: Error, expected: ErrorCode) -> C2Error {
 }
 
 #[test]
-fn ipc16_peer_is_rejected_with_protocol_version_mismatch_by_ipc17_host() {
-    assert_eq!(HANDSHAKE_VERSION, 17);
+fn ipc17_peer_is_rejected_with_protocol_version_mismatch_by_ipc18_host() {
+    assert_eq!(HANDSHAKE_VERSION, 18);
     let dir = tempfile::tempdir().unwrap();
-    let (_rt, host) = make_host(&dir, "ipc16-reject", None, None);
+    let (_rt, host) = make_host(&dir, "ipc17-reject", None, None);
     let endpoint = host.local_endpoint().clone();
 
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -277,7 +277,7 @@ fn ipc16_peer_is_rejected_with_protocol_version_mismatch_by_ipc17_host() {
             .await
             .unwrap();
         let mut hello = encode_version_preamble(VersionPreambleKind::Hello);
-        hello[21..25].copy_from_slice(&16u32.to_le_bytes());
+        hello[21..25].copy_from_slice(&17u32.to_le_bytes());
         stream.write_all(&hello).await.unwrap();
         stream.flush().await.unwrap();
 
@@ -288,7 +288,7 @@ fn ipc16_peer_is_rejected_with_protocol_version_mismatch_by_ipc17_host() {
         stream.read_exact(&mut payload).await.unwrap();
         let (kind, version) = decode_version_preamble_payload(&payload).unwrap();
         assert_eq!(kind, VersionPreambleKind::VersionMismatch);
-        assert_eq!(version, 17);
+        assert_eq!(version, HANDSHAKE_VERSION);
     });
     let _ = host.shutdown();
 }
@@ -508,7 +508,7 @@ fn multi_subscriber_single_write_shared_shm_buddy_and_dedicated() {
 }
 
 #[test]
-fn lag_policy_skip_and_error_exact_boundaries_over_ipc17() {
+fn lag_policy_skip_and_error_exact_boundaries_over_ipc() {
     let dir = tempfile::tempdir().unwrap();
     let (_host_rt, host) = make_host(&dir, "ipc-lag", None, None);
     let release = release_with_topics(&["burst"]);
@@ -906,7 +906,7 @@ fn subscription_slot_guard_n2_preserves_unary_headroom_and_n1_n0_boundaries() {
 }
 
 #[test]
-fn topic_only_contract_works_end_to_end_over_ipc17() {
+fn topic_only_contract_works_end_to_end_over_ipc() {
     let dir = tempfile::tempdir().unwrap();
     let (_host_rt, host) = make_host(&dir, "ipc-topic-only", None, None);
     let release = topic_only_release(&["telemetry"]);
@@ -932,6 +932,21 @@ fn topic_only_contract_works_end_to_end_over_ipc17() {
             },
         )
         .unwrap();
+    let call_id = "topic-key";
+    let options = c2_core::UnaryCallOptions::new()
+        .with_call_id(call_id)
+        .unwrap();
+    for result in [
+        client.call_unary_with_options("telemetry", b"invalid", options),
+        client.recover_unary_call("telemetry", call_id, CallTimeout::Unlimited),
+    ] {
+        let error = result.unwrap_err();
+        assert_eq!(
+            error.transport_phase(),
+            Some(c2_core::TransportPhase::PreDispatch)
+        );
+        assert_semantic_code(error, ErrorCode::UnsupportedCallMode);
+    }
     let sub = client
         .subscribe("telemetry", SubscribeOptions::default())
         .unwrap();

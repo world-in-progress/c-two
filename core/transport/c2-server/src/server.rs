@@ -66,10 +66,14 @@ use crate::dispatcher::{
     BuiltRoute, CrmCallback, CrmError, CrmRoute, CrmStreamCallback, Dispatcher, PeerShmRequest,
     PreparedShmResponse, RequestData, ResponseMeta, RouteBuildSpec,
 };
-use crate::response::try_prepare_shm_response;
+use crate::outcome::{
+    AdmitOutcome, ExecutionAdmission, OutcomeDelivery, OutcomeDigest, OutcomeResponse, WaiterKind,
+    WaiterResolution, conflict_error, revoked_error,
+};
+use crate::response::{OutcomePressure, try_prepare_shm_response};
 use crate::scheduler::{
-    RouteAdmissionState, Scheduler, SchedulerAcquireError, SchedulerLimits, SchedulerPendingPermit,
-    SchedulerSnapshot, StreamCancelCause,
+    RouteAdmissionState, Scheduler, SchedulerAcquireError, SchedulerGuard, SchedulerLimits,
+    SchedulerPendingPermit, SchedulerSnapshot, StreamCancelCause,
 };
 use crate::writer::ConnectionWriter;
 
@@ -283,6 +287,13 @@ pub struct Server {
             tokio::sync::oneshot::Receiver<()>,
         )>,
     >,
+    #[cfg(test)]
+    keyed_entry_pause: parking_lot::Mutex<
+        Option<(
+            tokio::sync::oneshot::Sender<()>,
+            tokio::sync::oneshot::Receiver<()>,
+        )>,
+    >,
     lifecycle_tx: watch::Sender<LifecycleSnapshot>,
     connection_event_source: ConnectionEventSource,
     route_registration: Mutex<()>,
@@ -305,6 +316,7 @@ pub struct Server {
     copy_scheduler: Arc<CopyScheduler>,
     /// Per-connection control-reply slot budget `Q_ctrl = clamp(N, 1, 64)`.
     control_reply_capacity: usize,
+    query_replies: Arc<Semaphore>,
     active_connections: parking_lot::Mutex<HashMap<u64, Arc<Connection>>>,
     active_connections_notify: Notify,
     shutdown_route_outcomes: parking_lot::Mutex<Vec<ServerRouteCloseOutcome>>,
@@ -314,6 +326,9 @@ pub struct Server {
     shutdown_close_reason: parking_lot::Mutex<&'static str>,
     run_entered: AtomicBool,
     execution_scheduler: Scheduler,
+    /// Host-wide keyed unary outcome store (ADR 0006), shared by every
+    /// registration and drained with each route unregister / Host shutdown.
+    outcome_store: Arc<crate::outcome::HostOutcomeStore>,
 }
 
 pub struct PendingRouteReservation {
@@ -503,6 +518,17 @@ impl Server {
         reassembly_pool: Arc<parking_lot::RwLock<MemPool>>,
         admission: Arc<AdmissionGate>,
     ) -> Result<Self, ServerError> {
+        let memory_limit = budget.snapshot().memory.limit_bytes;
+        config
+            .validate_with_memory_budget(memory_limit)
+            .map_err(|error| ServerError::Config(error.to_string()))?;
+        let outcome_store = Arc::new(crate::outcome::HostOutcomeStore::new(
+            crate::outcome::OutcomeLimits {
+                max_entries: config.outcome_max_entries,
+                max_retained_bytes: config.effective_outcome_max_retained_bytes(memory_limit),
+            },
+            budget.clone(),
+        ));
         let (shutdown_tx, _) = watch::channel(false);
         // The injected test pool and the production reassembly pool both
         // charge the caller's domain budget, so both directions share one
@@ -548,6 +574,7 @@ impl Server {
                 .expect("validated server config must provide max_execution_workers >= 1"),
             Arc::clone(&admission),
         );
+        let max_payload_size = config.max_payload_size;
         Ok(Self {
             identity,
             config,
@@ -558,23 +585,30 @@ impl Server {
             shutdown_tx,
             #[cfg(test)]
             shutdown_signal_pause: parking_lot::Mutex::new(None),
+            #[cfg(test)]
+            keyed_entry_pause: parking_lot::Mutex::new(None),
             lifecycle_tx,
             connection_event_source: ConnectionEventSource::new(),
             route_registration: Mutex::new(()),
             chunk_registry,
-            response_pool: Arc::new(crate::ResponsePool::new(response_pool)),
+            response_pool: Arc::new(
+                crate::ResponsePool::new(response_pool)
+                    .with_outcome_store(Arc::clone(&outcome_store), max_payload_size),
+            ),
             domain_budget: budget,
             admission,
             copy_permits,
             encoding_permits,
             copy_scheduler: Arc::new(CopyScheduler::new()),
             control_reply_capacity,
+            query_replies: Arc::new(Semaphore::new(control_reply_capacity)),
             active_connections: parking_lot::Mutex::new(HashMap::new()),
             active_connections_notify: Notify::new(),
             shutdown_route_outcomes: parking_lot::Mutex::new(Vec::new()),
             shutdown_close_reason: parking_lot::Mutex::new(DIRECT_IPC_SHUTDOWN_REASON),
             run_entered: AtomicBool::new(false),
             execution_scheduler,
+            outcome_store,
         })
     }
 
@@ -631,10 +665,13 @@ impl Server {
             routes
         };
         let outcomes = Self::wait_routes_drained(routes.clone(), closed_reason).await;
-        for route in routes {
+        for route in &routes {
             route.scheduler.close();
         }
         self.dispatcher.write().take_all();
+        for route in routes {
+            self.outcome_store.purge_route(&route.route_uid).deliver();
+        }
         outcomes
     }
 
@@ -717,7 +754,7 @@ impl Server {
             expected,
             topic_configs,
             self.domain_budget.clone(),
-            Some(Arc::clone(&self.response_pool.inner)),
+            Some(Arc::clone(&self.response_pool)),
             self.config.max_payload_size,
         )
     }
@@ -1123,20 +1160,28 @@ impl Server {
             route
         };
         if let Some(route) = route {
+            self.refuse_partial_keyed_calls(&route.route_uid).await;
             route.scheduler.wait_drained_async().await;
             if let Some(topics) = &route.topics {
                 topics.wait_drained_async().await;
             }
             let mut dispatcher = self.dispatcher.write();
-            if dispatcher
+            let unregistered = dispatcher
                 .resolve(name)
                 .is_some_and(|current| Arc::ptr_eq(&current, &route))
-            {
-                dispatcher.unregister(name);
-                true
-            } else {
-                false
+                .then(|| {
+                    dispatcher.unregister(name);
+                    true
+                })
+                .unwrap_or(false);
+            drop(dispatcher);
+            if unregistered {
+                // The registration drained; its keyed outcome records and
+                // retained payload owners leave with it, outside the
+                // dispatcher write lock.
+                self.outcome_store.purge_route(&route.route_uid).deliver();
             }
+            unregistered
         } else {
             if let Some(topics) = expected_topics {
                 topics.wait_drained_async().await;
@@ -1170,15 +1215,24 @@ impl Server {
                 })
                 .collect::<Vec<_>>()
         };
+        for route in &routes {
+            self.refuse_partial_keyed_calls(&route.route_uid).await;
+        }
         let outcomes = Self::wait_routes_drained(routes.clone(), closed_reason).await;
         let mut dispatcher = self.dispatcher.write();
+        let mut purged = Vec::new();
         for route in routes {
             if dispatcher
                 .resolve(&route.name)
                 .is_some_and(|current| Arc::ptr_eq(&current, &route))
             {
                 dispatcher.unregister(&route.name);
+                purged.push(route.route_uid.clone());
             }
+        }
+        drop(dispatcher);
+        for route_uid in purged {
+            self.outcome_store.purge_route(&route_uid).deliver();
         }
         outcomes
     }
@@ -1789,19 +1843,12 @@ impl Server {
             state.terminate();
             self.admission.notify.notify_waiters();
         }
-        let routes = {
-            let _guard = self.route_registration.lock().await;
-            let dispatcher = self.dispatcher.read();
-            dispatcher.routes_snapshot()
-        };
+        let _guard = self.route_registration.lock().await;
+        let dispatcher = self.dispatcher.write();
         let mut closed = 0usize;
-        for route in &routes {
-            let newly_closed =
-                route.scheduler.route_admission_state() != RouteAdmissionState::Closed;
-            if newly_closed {
+        for route in dispatcher.routes_snapshot() {
+            if route.scheduler.route_admission_state() != RouteAdmissionState::Closed {
                 route.scheduler.close();
-            }
-            if newly_closed {
                 closed += 1;
             }
         }
@@ -1871,6 +1918,38 @@ impl Server {
                 conn.begin_shutdown();
             }
             self.shutdown_tx.send_replace(true);
+        }
+    }
+
+    async fn refuse_partial_keyed_calls(&self, route_uid: &str) {
+        let connections: Vec<_> = self.active_connections.lock().values().cloned().collect();
+        let error = error_wire(
+            ErrorCode::ResourceClosed,
+            "route closed before input completed",
+        );
+        for conn in connections {
+            let writer = conn
+                .rpc_writer
+                .lock()
+                .as_ref()
+                .and_then(std::sync::Weak::upgrade);
+            let Some(writer) = writer else {
+                continue;
+            };
+            let calls: Vec<_> = conn.calls.lock().active().collect();
+            for (id, call) in calls {
+                let matches = call
+                    .data
+                    .admission
+                    .lock()
+                    .as_ref()
+                    .is_some_and(|admission| {
+                        admission.keyed.is_some() && admission.route.route_uid == route_uid
+                    });
+                if matches {
+                    queue_rejection(&writer, id, &error).await;
+                }
+            }
         }
     }
 
@@ -2943,6 +3022,7 @@ struct RouteExecutionAdmission {
 pub(crate) struct ServerCall {
     input: CallMutex<Option<ServerInput>>,
     admission: CallMutex<Option<ChunkRouteAdmission>>,
+    cancel_waiter: CallMutex<Option<tokio::sync::oneshot::Sender<()>>>,
     start_gate: CallMutex<()>,
     stream: CallMutex<Option<StreamCallControl>>,
     /// The call's role-domain operation permit (N admission). It drops with
@@ -3215,12 +3295,43 @@ impl Drop for CoordinatorRunningGuard {
     }
 }
 
+/// Keyed-unary bookkeeping attached to a call admission (ADR 0006).
+struct KeyedCall {
+    store: Arc<crate::outcome::HostOutcomeStore>,
+    route_uid: Arc<str>,
+    call_id: Arc<str>,
+    generation: u64,
+    role: KeyedRole,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum KeyedRole {
+    /// The original submit whose `Miss` created the generation; it owns the
+    /// route pending permit and the unique resource-entry adjudication.
+    Original,
+    /// A matched duplicate submit: it releases its own input before
+    /// waiting and never takes a second route permit.
+    Duplicate,
+}
+
+impl Drop for KeyedCall {
+    fn drop(&mut self) {
+        if self.role == KeyedRole::Original {
+            self.store
+                .revoke_pending(&self.route_uid, &self.call_id, self.generation)
+                .deliver();
+        }
+    }
+}
+
 pub(crate) struct ChunkRouteAdmission {
     route: Arc<CrmRoute>,
     method_idx: u16,
-    pending_permit: SchedulerPendingPermit,
+    // Revoke the pending outcome before releasing the route drain credential.
+    keyed: Option<KeyedCall>,
+    pending_permit: Option<SchedulerPendingPermit>,
     // A partially received request keeps the connection open between chunks.
-    _flight: crate::connection::FlightGuard,
+    _flight: Option<crate::connection::FlightGuard>,
 }
 
 pub(crate) fn retire_connection_calls(conn: &Connection) {
@@ -3236,9 +3347,12 @@ pub(crate) fn retire_connection_calls(conn: &Connection) {
     for (id, call) in calls.active() {
         conn.core.stream_retire(id);
         let input = call.data.input.lock().take();
+        let admission = call.data.admission.lock().take();
         drop(input);
+        drop(admission);
+        let cancel = call.data.cancel_waiter.lock().take();
+        drop(cancel);
     }
-    drop(calls);
 }
 
 fn request_storage(conn: &Arc<Connection>, value: ValueStorage<'_>) -> Result<RequestData, String> {
@@ -3307,9 +3421,10 @@ async fn handle_rpc_record(
             || header.flags & c2_wire::flags::FLAG_FIRST_CHUNK != 0);
     // Identity history is advanced before any route, capacity or storage
     // refusal; the active record is inserted only after admission completes.
-    let (mark_advanced, duplicate) = if new_open {
+    let new_query = payload.first() == Some(&(RpcRecordKind::QueryCall as u8));
+    let (mark_advanced, duplicate) = if new_open || new_query {
         match conn.calls.lock().advance_open(id) {
-            Ok(()) => (true, false),
+            Ok(()) => (new_open, false),
             Err(_) => (false, true),
         }
     } else {
@@ -3465,9 +3580,37 @@ async fn handle_rpc_record(
             identity,
             method_idx,
             mode,
+            call_id,
             value,
+        } => match call_id {
+            None => {
+                handle_open_record(server, conn, writer, id, identity, method_idx, mode, value)
+                    .await;
+            }
+            Some(call_id) if mode == CallMode::KeyedUnary => {
+                handle_keyed_open_record(
+                    server, conn, writer, id, identity, method_idx, call_id, value,
+                )
+                .await;
+            }
+            Some(_) => {
+                release_request_storage(conn, value.storage);
+                conn.end(
+                    ConnectionEndReason::ProtocolError,
+                    "call_id_on_unkeyed_mode",
+                );
+            }
+        },
+        RpcRecord::OpenRecover {
+            identity,
+            method_idx,
+            call_id,
         } => {
-            handle_open_record(server, conn, writer, id, identity, method_idx, mode, value).await;
+            handle_open_recover_record(server, conn, writer, id, identity, method_idx, call_id)
+                .await;
+        }
+        RpcRecord::QueryCall { identity, call_id } => {
+            handle_query_call(server, writer, id, identity, call_id).await;
         }
         RpcRecord::OpenSubscribe {
             identity,
@@ -3528,7 +3671,7 @@ async fn handle_rpc_record(
                 ValueStorage::Shm(_) => 0,
             };
             let frame_charge = inline_len + PENDING_FRAME_OVERHEAD as u64;
-            let reservation = match server.domain_budget.try_reserve_memory(frame_charge) {
+            let reservation = match reserve_input_memory_with_shed(server, frame_charge) {
                 Ok(reservation) => reservation,
                 Err(error) => {
                     release_request_storage(conn, value.storage);
@@ -3827,8 +3970,31 @@ async fn handle_open_record(
     let admission = ChunkRouteAdmission {
         route: route.route,
         method_idx,
-        pending_permit: route.pending_permit,
-        _flight: flight,
+        pending_permit: Some(route.pending_permit),
+        keyed: None,
+        _flight: Some(flight),
+    };
+    admit_open_input(server, conn, writer, id, value, operation, admission).await
+}
+
+/// Shared input admission for plain and keyed OPEN records: stream
+/// publication, M admission per chunk position, storage conversion and the
+/// active call-record insertion. The caller already completed route,
+/// contract and N admission and built the route admission.
+async fn admit_open_input(
+    server: &Arc<Server>,
+    conn: &Arc<Connection>,
+    writer: &Arc<ConnectionWriter>,
+    id: u64,
+    value: rpc::ValuePart<'_>,
+    operation: OperationPermit,
+    admission: ChunkRouteAdmission,
+) {
+    let method_idx = admission.method_idx;
+    let input_size = match value.chunk {
+        ChunkPosition::Whole => value.storage.len(),
+        ChunkPosition::First { total_bytes } => total_bytes,
+        ChunkPosition::Continuation => unreachable!("OPEN first record"),
     };
     let stream_mode = admission.route.method_modes[method_idx as usize] == CallMode::ServerStream;
     if stream_mode {
@@ -3859,7 +4025,7 @@ async fn handle_open_record(
     match value.chunk {
         ChunkPosition::Whole => {
             // M admission for the whole request before any inline copy.
-            let reservation = match server.domain_budget.try_reserve_memory(input_size) {
+            let reservation = match reserve_input_memory_with_shed(server, input_size) {
                 Ok(reservation) => reservation,
                 Err(error) => {
                     release_request_storage(conn, value.storage);
@@ -3910,7 +4076,7 @@ async fn handle_open_record(
                 ValueStorage::Shm(_) => 0,
             };
             let frame_charge = first_inline + PENDING_FRAME_OVERHEAD as u64;
-            let reservation = match server.domain_budget.try_reserve_memory(frame_charge) {
+            let reservation = match reserve_input_memory_with_shed(server, frame_charge) {
                 Ok(reservation) => reservation,
                 Err(error) => {
                     release_request_storage(conn, value.storage);
@@ -3950,8 +4116,27 @@ async fn handle_open_record(
                 .expect("first part matches itself");
             let data = request_storage(conn, value.storage);
             let request = server.chunk_registry.begin_frame(conn.conn_id(), id);
-            let call = insert_admitted_call(conn, id, operation, stream_mode, &admission);
-            *call.data.admission.lock() = Some(admission);
+            let call = {
+                let _publication = server.dispatcher.read();
+                if admission.keyed.is_some() && validate_live_route(&admission.route).is_err() {
+                    None
+                } else {
+                    let call = insert_admitted_call(conn, id, operation, stream_mode, &admission);
+                    *call.data.admission.lock() = Some(admission);
+                    Some(call)
+                }
+            };
+            let Some(call) = call else {
+                drop(data);
+                drop(reservation);
+                queue_open_refusal(
+                    writer,
+                    id,
+                    &C2Error::new(ErrorCode::ResourceClosed, "route closed"),
+                )
+                .await;
+                return;
+            };
             if let Err((error, _)) = server.chunk_registry.prepare_request(&request, ()) {
                 drop(reservation);
                 drop(data);
@@ -3987,6 +4172,404 @@ async fn handle_open_record(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Keyed unary calls, recovery and outcome queries (ADR 0006)
+// ---------------------------------------------------------------------------
+
+/// Route/contract/method validation without reserving the route queue
+/// ticket. The keyed first-frame adjudication and `Recover` run this before
+/// touching the Host outcome store; `call_mode` is the contract method mode
+/// the caller requires (`Unary` for keyed flows).
+fn resolve_route_contract(
+    dispatcher: &Dispatcher,
+    identity: &RouteCallIdentity,
+) -> Result<Arc<CrmRoute>, RouteAdmissionError> {
+    let route = match dispatcher.resolve(&identity.route_name) {
+        Some(route) => route,
+        None => {
+            return Err(if dispatcher.was_removed(&identity.route_name) {
+                RouteAdmissionError::RouteRemoved {
+                    route_name: identity.route_name.clone(),
+                }
+            } else {
+                RouteAdmissionError::RouteNotFound(identity.route_name.clone())
+            });
+        }
+    };
+    if route.crm_ns != identity.crm_ns
+        || route.crm_name != identity.crm_name
+        || route.crm_ver != identity.crm_ver
+        || route.abi_hash != identity.abi_hash
+        || route.signature_hash != identity.signature_hash
+    {
+        return Err(RouteAdmissionError::ContractMismatch {
+            route_name: identity.route_name.clone(),
+            reason: format!(
+                "expected {}/{}/{} abi_hash={} signature_hash={}, got {}/{}/{} abi_hash={} signature_hash={}",
+                identity.crm_ns,
+                identity.crm_name,
+                identity.crm_ver,
+                identity.abi_hash,
+                identity.signature_hash,
+                route.crm_ns,
+                route.crm_name,
+                route.crm_ver,
+                route.abi_hash,
+                route.signature_hash,
+            ),
+        });
+    }
+    Ok(route)
+}
+
+fn validate_route_method(
+    route: &CrmRoute,
+    method_idx: u16,
+    call_mode: CallMode,
+) -> Result<(), RouteAdmissionError> {
+    if !route.has_method_index(method_idx) {
+        return Err(RouteAdmissionError::UnknownMethod {
+            route_name: route.name.clone(),
+            method_idx,
+        });
+    }
+    let method_mode = route.method_modes[method_idx as usize];
+    if call_mode != method_mode {
+        return Err(RouteAdmissionError::CallModeMismatch {
+            route_name: route.name.clone(),
+            method_idx,
+            call_mode,
+            method_mode,
+        });
+    }
+    Ok(())
+}
+
+fn validate_live_route(route: &CrmRoute) -> Result<(), RouteAdmissionError> {
+    match route.scheduler.route_admission_state() {
+        RouteAdmissionState::Opened => Ok(()),
+        _ => Err(RouteAdmissionError::Acquire(SchedulerAcquireError::Closed)),
+    }
+}
+
+fn keyed_capacity_refused(id: u64, error: &c2_mem::RetentionError) -> C2Error {
+    let reason = match error.reason {
+        c2_mem::RetentionRejectReason::Closed => "closed",
+        c2_mem::RetentionRejectReason::LimitReached => "limit_reached",
+    };
+    C2Error::new(
+        ErrorCode::CallCapacityExceeded,
+        format!("server call admission rejected the request: {error}"),
+    )
+    .with_details(std::collections::BTreeMap::from([
+        ("stage".to_string(), "call_execution_admission".to_string()),
+        ("reason".to_string(), reason.to_string()),
+        ("used".to_string(), error.used_operations.to_string()),
+        ("max".to_string(), error.max_operations.to_string()),
+        ("request_id".to_string(), id.to_string()),
+    ]))
+}
+
+/// The `KeyedUnary` OPEN admission path. Contract validation runs before the
+/// outcome-store adjudication, and only a `Miss` reserves the route pending
+/// permit — a same-method `Hit` pins its generation and attaches, a method
+/// conflict is refused with `721` before any continuation is accepted.
+async fn handle_keyed_open_record(
+    server: &Arc<Server>,
+    conn: &Arc<Connection>,
+    writer: &Arc<ConnectionWriter>,
+    id: u64,
+    identity: RouteCallIdentity,
+    method_idx: u16,
+    call_id: String,
+    value: rpc::ValuePart<'_>,
+) {
+    let flight = crate::connection::FlightGuard::new(conn);
+    if conn.is_deactivated() || conn.shutdown_requested() {
+        release_request_storage(conn, value.storage);
+        queue_open_refusal(
+            writer,
+            id,
+            &C2Error::new(
+                ErrorCode::ResourceClosed,
+                "connection admission is closed; request was not executed",
+            ),
+        )
+        .await;
+        return;
+    }
+    let admitted = (|| {
+        // The dispatcher fence covers both validation and outcome admission.
+        // Unregister takes its write lock before closing route admission.
+        let dispatcher = server.dispatcher.read();
+        let route =
+            resolve_route_contract(&dispatcher, &identity).map_err(route_admission_error)?;
+        validate_route_method(&route, method_idx, CallMode::Unary)
+            .map_err(route_admission_error)?;
+        validate_live_route(&route).map_err(route_admission_error)?;
+        let route_uid: Arc<str> = Arc::from(route.route_uid.as_str());
+        let call_id: Arc<str> = Arc::from(call_id);
+        let admission_generation = server.admission.lock().generation;
+        let (admitted, pending_permit) = server
+            .outcome_store
+            .admit_with(&route_uid, &call_id, method_idx, || {
+                route
+                    .scheduler
+                    .reserve_pending_in_generation(method_idx, admission_generation)
+            })
+            .map_err(|error| route_admission_error(RouteAdmissionError::Acquire(error)))?;
+        let (generation, role) = match admitted {
+            AdmitOutcome::MethodConflict => return Err(conflict_error()),
+            AdmitOutcome::Hit { generation } => (generation, KeyedRole::Duplicate),
+            AdmitOutcome::Miss { generation } => (generation, KeyedRole::Original),
+        };
+        let admission = ChunkRouteAdmission {
+            route,
+            method_idx,
+            keyed: Some(KeyedCall {
+                store: Arc::clone(&server.outcome_store),
+                route_uid,
+                call_id,
+                generation,
+                role,
+            }),
+            pending_permit,
+            _flight: Some(flight),
+        };
+        let input_size = match value.chunk {
+            ChunkPosition::Whole => value.storage.len(),
+            ChunkPosition::First { total_bytes } => total_bytes,
+            ChunkPosition::Continuation => unreachable!("OPEN first record"),
+        };
+        if input_size > server.config.max_payload_size {
+            return Err(C2Error::new(
+                ErrorCode::ResourceUnavailable,
+                format!(
+                    "request payload size {input_size} exceeds max_payload_size {}",
+                    server.config.max_payload_size
+                ),
+            ));
+        }
+        let operation = server
+            .domain_budget
+            .reserve_operation()
+            .map_err(|error| keyed_capacity_refused(id, &error))?;
+        Ok((admission, operation))
+    })();
+    match admitted {
+        Ok((admission, operation)) => {
+            admit_open_input(server, conn, writer, id, value, operation, admission).await;
+        }
+        Err(error) => {
+            release_request_storage(conn, value.storage);
+            queue_open_refusal(writer, id, &error).await;
+        }
+    }
+}
+
+/// The `Recover` OPEN path: no request body, no route ticket; a miss is
+/// refused with `723` without executing anything, a method mismatch with
+/// `721`, and a live record attaches or replays.
+async fn handle_open_recover_record(
+    server: &Arc<Server>,
+    conn: &Arc<Connection>,
+    writer: &Arc<ConnectionWriter>,
+    id: u64,
+    identity: RouteCallIdentity,
+    method_idx: u16,
+    call_id: String,
+) {
+    let flight = crate::connection::FlightGuard::new(conn);
+    if conn.is_deactivated() || conn.shutdown_requested() {
+        queue_open_refusal(
+            writer,
+            id,
+            &C2Error::new(
+                ErrorCode::ResourceClosed,
+                "connection admission is closed; recovery was not attached",
+            ),
+        )
+        .await;
+        return;
+    }
+    let admitted = (|| {
+        let dispatcher = server.dispatcher.read();
+        let route =
+            resolve_route_contract(&dispatcher, &identity).map_err(route_admission_error)?;
+        validate_route_method(&route, method_idx, CallMode::Unary)
+            .map_err(route_admission_error)?;
+        validate_live_route(&route).map_err(route_admission_error)?;
+        let route_uid: Arc<str> = Arc::from(route.route_uid.as_str());
+        let (resolution, operation) =
+            server
+                .outcome_store
+                .recover_with(&route_uid, &call_id, method_idx, || {
+                    server
+                        .domain_budget
+                        .reserve_operation()
+                        .map_err(|error| keyed_capacity_refused(id, &error))
+                })?;
+        let call = ServerCall {
+            _operation: Some(operation),
+            ..ServerCall::default()
+        };
+        let record = conn
+            .calls
+            .lock()
+            .insert_open(id, call)
+            .map_err(|_| revoked_error(WaiterKind::Recover))?;
+        record.queue();
+        Ok(resolution)
+    })();
+    match admitted {
+        Ok(resolution) => resolve_waiter_on_connection(conn, writer, id, resolution, Some(flight)),
+        Err(error) => queue_open_refusal(writer, id, &error).await,
+    }
+}
+
+/// Wait or replay off the receive loop, so a slow replay cannot block
+/// reception of control records or releases.
+fn resolve_waiter_on_connection(
+    conn: &Arc<Connection>,
+    writer: &Arc<ConnectionWriter>,
+    id: u64,
+    resolution: WaiterResolution,
+    flight: Option<crate::connection::FlightGuard>,
+) {
+    let conn = conn.clone();
+    let writer = writer.clone();
+    tokio::spawn(async move {
+        let _flight = flight;
+        let delivery = match resolution {
+            WaiterResolution::Replay(delivery) => delivery,
+            WaiterResolution::Refused(error) => OutcomeDelivery::NotExecuted(error),
+            WaiterResolution::Attached(receiver) => {
+                let (cancel, retired) = tokio::sync::oneshot::channel();
+                {
+                    let calls = conn.calls.lock();
+                    let Some(call) = calls.get(id) else {
+                        return;
+                    };
+                    *call.data.cancel_waiter.lock() = Some(cancel);
+                }
+                tokio::select! {
+                    result = receiver => match result {
+                        Ok(delivery) => delivery,
+                        Err(_) => return,
+                    },
+                    _ = retired => return,
+                }
+            }
+        };
+        deliver_keyed_outcome(&writer, &conn, id, delivery, true).await;
+    });
+}
+
+/// Send an original or replayed outcome once on this connection.
+async fn deliver_keyed_outcome(
+    writer: &Arc<ConnectionWriter>,
+    conn: &Connection,
+    id: u64,
+    delivery: OutcomeDelivery,
+    replayed: bool,
+) {
+    let status = match &delivery {
+        OutcomeDelivery::Success(OutcomeResponse::Unavailable(_)) | OutcomeDelivery::Failure(_) => {
+            CallStatus::Failed
+        }
+        OutcomeDelivery::Success(_) => CallStatus::Success,
+        OutcomeDelivery::NotExecuted(_) => CallStatus::NotExecuted,
+    };
+    let Some(claim) = claim_outcome_terminal(writer, id, status, replayed) else {
+        return;
+    };
+    match delivery {
+        OutcomeDelivery::Success(response) => {
+            if let Err(error) = write_outcome_response(
+                writer,
+                id,
+                &response,
+                conn.shm_response_capable(),
+                c2_config::CHUNK_SIZE as usize,
+            )
+            .await
+            {
+                warn!(request_id = id, %error, "keyed outcome write failed");
+            }
+        }
+        OutcomeDelivery::Failure(error) => {
+            write_error_record(
+                writer,
+                id,
+                claim.status,
+                &rpc::bounded_call_end_error_bytes(&error),
+                false,
+            )
+            .await;
+        }
+        OutcomeDelivery::NotExecuted(error) => {
+            write_error_record(
+                writer,
+                id,
+                claim.status,
+                &rpc::bounded_call_end_error_bytes(&error),
+                false,
+            )
+            .await;
+        }
+    }
+}
+
+/// The `QueryCall` control record: bypasses the business call slots and
+/// route pending permits, bounded only by this connection's control-reply
+/// budget. Budget exhaustion answers a bounded `717` without deactivating
+/// the physical connection.
+async fn handle_query_call(
+    server: &Arc<Server>,
+    writer: &Arc<ConnectionWriter>,
+    id: u64,
+    identity: RouteCallIdentity,
+    call_id: String,
+) {
+    let permit = Arc::clone(&server.query_replies).try_acquire_owned();
+    let result = if permit.is_ok() {
+        let dispatcher = server.dispatcher.read();
+        match resolve_route_contract(&dispatcher, &identity).and_then(|route| {
+            validate_live_route(&route)?;
+            Ok(route)
+        }) {
+            Ok(route) => {
+                let route_uid: Arc<str> = Arc::from(route.route_uid.as_str());
+                rpc::WireQueryCallResult::Outcome(server.outcome_store.query(
+                    &route_uid,
+                    &call_id,
+                    |method_idx| route.method_names.get(method_idx as usize).cloned(),
+                ))
+            }
+            Err(error) => rpc::WireQueryCallResult::Error(route_admission_error(error)),
+        }
+    } else {
+        rpc::WireQueryCallResult::Error(C2Error::new(
+            ErrorCode::CallCapacityExceeded,
+            "query control reply budget exhausted; retry the query later",
+        ))
+    };
+    let frame = match rpc::encode_query_call_result_frame(id, &result) {
+        Ok(frame) => frame,
+        Err(error) => {
+            warn!(request_id = id, %error, "failed to encode query result");
+            return;
+        }
+    };
+    let queued = match permit {
+        Ok(permit) => writer.queue_query_reply(frame, permit),
+        Err(_) => writer.queue_query_overflow(frame).await,
+    };
+    if let Err(error) = queued {
+        warn!(request_id = id, %error, "query reply admission failed");
+    }
+}
+
 /// Insert the active call record once admission completed, carrying the
 /// operation permit and, for stream calls, the publication control.
 fn insert_admitted_call(
@@ -4012,6 +4595,17 @@ fn insert_admitted_call(
         .lock()
         .insert_open(id, call)
         .expect("admitted OPEN follows the advanced high-water mark")
+}
+
+/// Try one role-memory reservation for inbound call bytes. A mitigable
+/// capacity shortage sheds retained keyed outcome bytes once, outside the
+/// budget lock that just rejected, and retries exactly once.
+fn reserve_input_memory_with_shed(
+    server: &Server,
+    charge: u64,
+) -> Result<c2_mem::MemoryReservation, c2_mem::PayloadBufferError> {
+    OutcomePressure::new(Some(server.outcome_store.as_ref()))
+        .reserve_memory(&server.domain_budget, charge)
 }
 
 /// A `ResourceUnavailable` call-input admission error with stage details.
@@ -4074,50 +4668,9 @@ async fn execute_route_request<F>(
 where
     F: FnOnce(c2_mem::RecycledBytes) -> Result<ResponseMeta, CrmError> + Send + 'static,
 {
-    let route_guard = tokio::select! {
-        result = route_pending_permit.async_activate() => match result {
-            Ok(guard) => guard,
-            Err(err) => {
-                drop(input);
-                return Err(RouteExecutionError::Acquire(err));
-            }
-        },
-        _ = conn.wait_work_cancelled() => {
-            drop(input);
-            return Err(RouteExecutionError::Acquire(SchedulerAcquireError::Closed));
-        }
-    };
-    let execution_guard = tokio::select! {
-        result = execution_scheduler.async_acquire_accepted(0, route_guard.admission_generation()) => match result {
-            Ok(guard) => guard,
-            Err(err) => {
-                drop(input);
-                return Err(RouteExecutionError::Acquire(err));
-            }
-        },
-        err = route_guard.wait_rejected() => {
-            drop(input);
-            return Err(RouteExecutionError::Acquire(err));
-        },
-        _ = conn.wait_work_cancelled() => {
-            drop(input);
-            return Err(RouteExecutionError::Acquire(SchedulerAcquireError::Closed));
-        }
-    };
-    if let Err(err) = route_guard.check_admission() {
-        drop(input);
-        return Err(RouteExecutionError::Acquire(err));
-    }
-    if conn.is_work_cancelled() {
-        drop(input);
-        return Err(RouteExecutionError::Acquire(SchedulerAcquireError::Closed));
-    }
-
-    let record = conn
-        .calls
-        .lock()
-        .get(request_id)
-        .ok_or(RouteExecutionError::Acquire(SchedulerAcquireError::Closed))?;
+    let (route_guard, execution_guard, record) =
+        acquire_route_execution(&execution_scheduler, route_pending_permit, conn, request_id)
+            .await?;
     let budget = budget.clone();
     tokio::task::spawn_blocking(move || {
         let mut route_guard = route_guard;
@@ -4140,6 +4693,59 @@ where
     .expect("route execution task panicked")
 }
 
+async fn acquire_route_execution(
+    execution_scheduler: &Scheduler,
+    route_pending_permit: SchedulerPendingPermit,
+    conn: &Connection,
+    request_id: u64,
+) -> Result<
+    (
+        SchedulerGuard,
+        SchedulerGuard,
+        Arc<c2_wire::connection::calls::CallRecord<ServerCall>>,
+    ),
+    RouteExecutionError,
+> {
+    let route_guard = tokio::select! {
+        result = route_pending_permit.async_activate() => match result {
+            Ok(guard) => guard,
+            Err(err) => {
+                return Err(RouteExecutionError::Acquire(err));
+            }
+        },
+        _ = conn.wait_work_cancelled() => {
+            return Err(RouteExecutionError::Acquire(SchedulerAcquireError::Closed));
+        }
+    };
+    let execution_guard = tokio::select! {
+        result = execution_scheduler.async_acquire_accepted(0, route_guard.admission_generation()) => match result {
+            Ok(guard) => guard,
+            Err(err) => {
+                return Err(RouteExecutionError::Acquire(err));
+            }
+        },
+        err = route_guard.wait_rejected() => {
+            return Err(RouteExecutionError::Acquire(err));
+        },
+        _ = conn.wait_work_cancelled() => {
+            return Err(RouteExecutionError::Acquire(SchedulerAcquireError::Closed));
+        }
+    };
+    if let Err(err) = route_guard.check_admission() {
+        return Err(RouteExecutionError::Acquire(err));
+    }
+    if conn.is_work_cancelled() {
+        return Err(RouteExecutionError::Acquire(SchedulerAcquireError::Closed));
+    }
+
+    let record = conn
+        .calls
+        .lock()
+        .get(request_id)
+        .ok_or(RouteExecutionError::Acquire(SchedulerAcquireError::Closed))?;
+    Ok((route_guard, execution_guard, record))
+}
+
 fn reserve_accepted_route_execution(
     server: &Server,
     identity: &RouteCallIdentity,
@@ -4150,56 +4756,8 @@ fn reserve_accepted_route_execution(
     // Identity errors still precede host availability.
     let admission_generation = server.admission.lock().generation;
     let dispatcher = server.dispatcher.read();
-    let route = match dispatcher.resolve(&identity.route_name) {
-        Some(route) => route,
-        None => {
-            return Err(if dispatcher.was_removed(&identity.route_name) {
-                RouteAdmissionError::RouteRemoved {
-                    route_name: identity.route_name.clone(),
-                }
-            } else {
-                RouteAdmissionError::RouteNotFound(identity.route_name.clone())
-            });
-        }
-    };
-    if route.crm_ns != identity.crm_ns
-        || route.crm_name != identity.crm_name
-        || route.crm_ver != identity.crm_ver
-        || route.abi_hash != identity.abi_hash
-        || route.signature_hash != identity.signature_hash
-    {
-        return Err(RouteAdmissionError::ContractMismatch {
-            route_name: identity.route_name.clone(),
-            reason: format!(
-                "expected {}/{}/{} abi_hash={} signature_hash={}, got {}/{}/{} abi_hash={} signature_hash={}",
-                identity.crm_ns,
-                identity.crm_name,
-                identity.crm_ver,
-                identity.abi_hash,
-                identity.signature_hash,
-                route.crm_ns,
-                route.crm_name,
-                route.crm_ver,
-                route.abi_hash,
-                route.signature_hash,
-            ),
-        });
-    }
-    if !route.has_method_index(method_idx) {
-        return Err(RouteAdmissionError::UnknownMethod {
-            route_name: route.name.clone(),
-            method_idx,
-        });
-    }
-    let method_mode = route.method_modes[method_idx as usize];
-    if call_mode != method_mode {
-        return Err(RouteAdmissionError::CallModeMismatch {
-            route_name: route.name.clone(),
-            method_idx,
-            call_mode,
-            method_mode,
-        });
-    }
+    let route = resolve_route_contract(&dispatcher, identity)?;
+    validate_route_method(&route, method_idx, call_mode)?;
     let pending_permit = route
         .scheduler
         .reserve_pending_in_generation(method_idx, admission_generation)
@@ -4268,38 +4826,7 @@ async fn send_route_execution_result(
             } else {
                 CallStatus::NotExecuted
             };
-            let bytes = match error {
-                RouteExecutionError::Input(message) => {
-                    error_wire(ErrorCode::ProtocolViolation, message)
-                }
-                RouteExecutionError::Crm(CrmError::UserError(bytes)) => {
-                    // Re-encode the resource's envelope through the bounded
-                    // path so an oversized user error cannot produce an
-                    // unbounded inline CALL_END frame.
-                    match C2Error::from_wire_bytes(&bytes) {
-                        Ok(Some(error)) => rpc::bounded_call_end_error_bytes(&error),
-                        _ => error_wire(
-                            ErrorCode::ResourceFunctionExecuting,
-                            "invalid CRM error payload",
-                        ),
-                    }
-                }
-                RouteExecutionError::Crm(CrmError::InternalError(message)) => {
-                    error_wire(ErrorCode::ResourceFunctionExecuting, message)
-                }
-                RouteExecutionError::Acquire(SchedulerAcquireError::Closed) => {
-                    error_wire(ErrorCode::ResourceClosed, "route closed")
-                }
-                RouteExecutionError::Acquire(SchedulerAcquireError::Unavailable) => {
-                    error_wire(ErrorCode::ResourceUnavailable, "host admission unavailable")
-                }
-                RouteExecutionError::Acquire(SchedulerAcquireError::Capacity { field, limit }) => {
-                    error_wire(
-                        ErrorCode::ResourceUnavailable,
-                        format!("route concurrency capacity exceeded: {field}={limit}"),
-                    )
-                }
-            };
+            let bytes = route_execution_error_bytes(error);
             if let Some(claim) = claim_terminal(writer, request_id, status) {
                 write_error_record(writer, request_id, claim.status, &bytes, false).await;
             }
@@ -4350,7 +4877,7 @@ fn route_admission_error(err: RouteAdmissionError) -> C2Error {
             method_mode,
         } => {
             let label = |mode| match mode {
-                CallMode::Unary => "unary",
+                CallMode::Unary | CallMode::KeyedUnary | CallMode::Recover => "unary",
                 CallMode::ServerStream => "server_stream",
                 CallMode::Subscribe => "subscribe",
             };
@@ -4406,14 +4933,27 @@ fn admit_peer_request(conn: &Arc<Connection>, bp: BuddyPayload) -> Result<Reques
 
 async fn dispatch_complete_call(
     server: &Server,
-    conn: &Connection,
+    conn: &Arc<Connection>,
     writer: &Arc<ConnectionWriter>,
     request_id: u64,
     input: OwnedRequestInput,
-    admission: ChunkRouteAdmission,
+    mut admission: ChunkRouteAdmission,
 ) {
     if admission.route.method_modes[admission.method_idx as usize] == CallMode::ServerStream {
         stream::dispatch_stream_call(server, conn, writer, request_id, input, admission).await;
+        return;
+    }
+    if let Some(keyed) = admission.keyed.take() {
+        match keyed.role {
+            KeyedRole::Original => {
+                dispatch_keyed_original(server, conn, writer, request_id, input, admission, keyed)
+                    .await
+            }
+            KeyedRole::Duplicate => {
+                dispatch_keyed_duplicate(server, conn, writer, request_id, input, keyed, admission)
+                    .await
+            }
+        }
         return;
     }
     let callback = admission.route.callback.clone();
@@ -4422,8 +4962,11 @@ async fn dispatch_complete_call(
     let response_pool = server.response_pool.clone();
     let result = execute_route_request(
         server.execution_scheduler.clone(),
-        admission.pending_permit,
-        conn,
+        admission
+            .pending_permit
+            .take()
+            .expect("plain call admission carries its route permit"),
+        conn.as_ref(),
         request_id,
         input,
         &server.domain_budget,
@@ -4433,7 +4976,341 @@ async fn dispatch_complete_call(
     send_route_execution_result(server, conn, writer, request_id, result).await;
 }
 
-// ---------------------------------------------------------------------------
+/// The original keyed submit: the unique resource-entry adjudication runs in
+/// the outcome-store critical section, the outcome is sealed before it is
+/// published, and the original connection replays from the same sealed
+/// owners.
+async fn dispatch_keyed_original(
+    server: &Server,
+    conn: &Arc<Connection>,
+    writer: &Arc<ConnectionWriter>,
+    request_id: u64,
+    input: OwnedRequestInput,
+    mut admission: ChunkRouteAdmission,
+    keyed: KeyedCall,
+) {
+    let callback = admission.route.callback.clone();
+    let name = admission.route.name.clone();
+    let method_idx = admission.method_idx;
+    let callback_pool = server.response_pool.clone();
+    let pending_permit = admission
+        .pending_permit
+        .take()
+        .expect("original keyed call holds its route permit");
+    let _flight = admission._flight.take();
+    drop(admission);
+    match execute_keyed_request(
+        server,
+        pending_permit,
+        conn,
+        request_id,
+        input,
+        keyed,
+        move |request| callback.invoke_recycled(&name, method_idx, request, callback_pool),
+    )
+    .await
+    {
+        Ok(delivery) => deliver_keyed_outcome(writer, conn, request_id, delivery, false).await,
+        Err(error) => {
+            // A join failure can happen on either side of resource entry.
+            // The call record remains the authority for the wire phase.
+            let claim = claim_terminal(writer, request_id, CallStatus::Failed)
+                .or_else(|| claim_terminal(writer, request_id, CallStatus::NotExecuted));
+            if let Some(claim) = claim {
+                write_error_record(
+                    writer,
+                    request_id,
+                    claim.status,
+                    &route_execution_error_bytes(error),
+                    false,
+                )
+                .await;
+            }
+        }
+    }
+}
+
+async fn dispatch_keyed_duplicate(
+    server: &Server,
+    conn: &Arc<Connection>,
+    writer: &Arc<ConnectionWriter>,
+    request_id: u64,
+    input: OwnedRequestInput,
+    keyed: KeyedCall,
+    mut admission: ChunkRouteAdmission,
+) {
+    let digest = match tokio::task::spawn_blocking(move || digest_owned_input(input)).await {
+        Ok(Ok(digest)) => digest,
+        _ => {
+            write_reply(
+                writer,
+                request_id,
+                &error_wire(
+                    ErrorCode::ProtocolViolation,
+                    "keyed duplicate input could not be read for fingerprinting",
+                ),
+            )
+            .await;
+            return;
+        }
+    };
+    // The complete input and its memory/loan ownership ended before attachment.
+    let resolution = {
+        let _publication = server.dispatcher.read();
+        match validate_live_route(&admission.route) {
+            Ok(()) => keyed.store.resolve_waiter(
+                &keyed.route_uid,
+                &keyed.call_id,
+                keyed.generation,
+                OutcomeDigest::Computed(digest),
+                WaiterKind::Submit,
+            ),
+            Err(error) => WaiterResolution::Refused(route_admission_error(error)),
+        }
+    };
+    resolve_waiter_on_connection(
+        conn,
+        writer,
+        request_id,
+        resolution,
+        admission._flight.take(),
+    );
+}
+
+fn digest_owned_input(
+    input: OwnedRequestInput,
+) -> Result<[u8; crate::outcome::OUTCOME_DIGEST_LEN], String> {
+    use sha2::Digest;
+    let mut hasher = sha2::Sha256::new();
+    let mut update = |bytes: &[u8]| {
+        for part in bytes.chunks(RECEIVE_BUFFER_BYTES) {
+            hasher.update(part);
+        }
+    };
+    let OwnedRequestInput {
+        data,
+        memory: _memory,
+    } = input;
+    match data {
+        RequestData::Inline(bytes) => update(&bytes),
+        RequestData::Shm(peer) => peer.visit_parts(update)?,
+        RequestData::Handle(backing) => backing.with_slice(update)?,
+    }
+    Ok(hasher.finalize().into())
+}
+
+fn sha256_digest(bytes: &[u8]) -> [u8; crate::outcome::OUTCOME_DIGEST_LEN] {
+    use sha2::Digest;
+    sha2::Sha256::digest(bytes).into()
+}
+
+/// A blocking executor owns both drain credentials until the outcome is
+/// published and all attached calls own their one-time deliveries.
+struct OutcomeExecutionGuard {
+    keyed: KeyedCall,
+    settled: bool,
+    _route: SchedulerGuard,
+    _execution: SchedulerGuard,
+}
+
+fn keyed_panic_error() -> C2Error {
+    C2Error::new(
+        ErrorCode::ResourceFunctionExecuting,
+        "keyed call execution panicked",
+    )
+}
+
+impl OutcomeExecutionGuard {
+    fn settle(&mut self, response: Result<OutcomeResponse, C2Error>) -> OutcomeDelivery {
+        let KeyedCall {
+            store,
+            route_uid,
+            call_id,
+            generation,
+            ..
+        } = &self.keyed;
+        let (delivery, notifications) = match response {
+            Ok(response) => {
+                let notifications =
+                    store.publish_success(route_uid, call_id, *generation, response.clone());
+                (OutcomeDelivery::Success(response), notifications)
+            }
+            Err(error) => {
+                let (error, notifications) =
+                    store.publish_failure_with_delivery(route_uid, call_id, *generation, error);
+                (OutcomeDelivery::Failure(error), notifications)
+            }
+        };
+        notifications.deliver();
+        self.settled = true;
+        delivery
+    }
+}
+
+impl Drop for OutcomeExecutionGuard {
+    fn drop(&mut self) {
+        if !self.settled {
+            let KeyedCall {
+                store,
+                route_uid,
+                call_id,
+                generation,
+                ..
+            } = &self.keyed;
+            store
+                .publish_failure(route_uid, call_id, *generation, keyed_panic_error())
+                .deliver();
+        }
+    }
+}
+
+async fn execute_keyed_request<F>(
+    server: &Server,
+    route_pending_permit: SchedulerPendingPermit,
+    conn: &Connection,
+    request_id: u64,
+    input: OwnedRequestInput,
+    keyed: KeyedCall,
+    f: F,
+) -> Result<OutcomeDelivery, RouteExecutionError>
+where
+    F: FnOnce(c2_mem::RecycledBytes) -> Result<ResponseMeta, CrmError> + Send + 'static,
+{
+    let (mut route_guard, execution_guard, record) = acquire_route_execution(
+        &server.execution_scheduler,
+        route_pending_permit,
+        conn,
+        request_id,
+    )
+    .await?;
+    let budget = server.domain_budget.clone();
+    let response_pool = server.response_pool.clone();
+    let max_payload_size = server.config.max_payload_size;
+    #[cfg(test)]
+    let entry_pause = server.keyed_entry_pause.lock().take();
+
+    tokio::task::spawn_blocking(move || {
+        route_guard.commit().map_err(RouteExecutionError::Acquire)?;
+        let (bytes, memory) = input
+            .into_recycled_bytes(&budget)
+            .map_err(RouteExecutionError::Input)?;
+        let digest = sha256_digest(bytes.as_slice());
+        #[cfg(test)]
+        if let Some((entered, resume)) = entry_pause {
+            let _ = entered.send(());
+            let _ = resume.blocking_recv();
+        }
+        let conflicts = match keyed.store.begin_execution(
+            &keyed.route_uid,
+            &keyed.call_id,
+            keyed.generation,
+            digest,
+            || record.enter_resource(),
+        ) {
+            ExecutionAdmission::Won(conflicts) => conflicts,
+            ExecutionAdmission::Lost(notifications) => {
+                notifications.deliver();
+                return Err(RouteExecutionError::Acquire(SchedulerAcquireError::Closed));
+            }
+        };
+        let mut guard = OutcomeExecutionGuard {
+            keyed,
+            settled: false,
+            _route: route_guard,
+            _execution: execution_guard,
+        };
+        conflicts.deliver();
+        let response = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let result = f(bytes);
+            drop(memory);
+            seal_keyed_response(&budget, &response_pool, max_payload_size, result)
+        }))
+        .unwrap_or_else(|_| Err(keyed_panic_error()));
+        Ok(guard.settle(response))
+    })
+    .await
+    .unwrap_or_else(|_| {
+        Err(RouteExecutionError::Crm(CrmError::InternalError(
+            keyed_panic_error().message,
+        )))
+    })
+}
+
+fn seal_keyed_response(
+    budget: &DomainBudget,
+    response_pool: &crate::ResponsePool,
+    max_payload_size: u64,
+    result: Result<ResponseMeta, CrmError>,
+) -> Result<OutcomeResponse, C2Error> {
+    let output_error = |message| C2Error::new(ErrorCode::ResourceOutputSerializing, message);
+    match result.map_err(callback_error)? {
+        ResponseMeta::Empty => Ok(OutcomeResponse::Empty),
+        ResponseMeta::Inline(bytes) if bytes.is_empty() => Ok(OutcomeResponse::Empty),
+        ResponseMeta::Inline(bytes) => {
+            ensure_response_meta_len(bytes.len(), max_payload_size)
+                .map_err(|error| output_error(error.to_string()))?;
+            let mut pressure = response_pool.pressure();
+            if let Some(mut slab) = response_pool
+                .alloc_slab(c2_config::SHM_THRESHOLD, bytes.len(), &mut pressure)
+                .map_err(output_error)?
+            {
+                slab.as_mut_slice().copy_from_slice(&bytes);
+                return slab
+                    .seal()
+                    .map(|block| OutcomeResponse::Shm(Arc::new(block)))
+                    .map_err(output_error);
+            }
+            let reservation = pressure
+                .reserve_memory(budget, bytes.capacity() as u64)
+                .map_err(|error| output_error(error.to_string()))?;
+            Ok(OutcomeResponse::Inline(Arc::new(
+                c2_mem::BudgetedBuffer::new(bytes, reservation),
+            )))
+        }
+        ResponseMeta::ShmAlloc(prepared) => {
+            ensure_response_meta_len(prepared.data_size() as usize, max_payload_size)
+                .map_err(|error| output_error(error.to_string()))?;
+            if !prepared.belongs_to(response_pool) {
+                return Err(output_error(
+                    "prepared response belongs to another SHM pool".to_owned(),
+                ));
+            }
+            prepared
+                .into_sealed()
+                .map(|block| OutcomeResponse::Shm(Arc::new(block)))
+                .map_err(output_error)
+        }
+    }
+}
+
+fn callback_error(error: CrmError) -> C2Error {
+    let error = match error {
+        CrmError::UserError(bytes) => C2Error::from_wire_bytes(&bytes)
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| {
+                C2Error::new(
+                    ErrorCode::ResourceFunctionExecuting,
+                    "invalid CRM error payload",
+                )
+            }),
+        CrmError::InternalError(message) => {
+            C2Error::new(ErrorCode::ResourceFunctionExecuting, message)
+        }
+    };
+    if error.code.is_outcome_control() {
+        return C2Error::new(
+            ErrorCode::ResourceFunctionExecuting,
+            "resource returned an outcome control error",
+        )
+        .with_details(std::collections::BTreeMap::from([(
+            "cause".into(),
+            format!("{}: {}", u16::from(error.code), error.message),
+        )]));
+    }
+    error
+}
+
 // CRM call dispatch — chunked reassembly
 // ---------------------------------------------------------------------------
 
@@ -4493,6 +5370,7 @@ fn copy_chunked_frame(
     copy_permit: OwnedSemaphorePermit,
     call: Arc<c2_wire::connection::calls::CallRecord<ServerCall>>,
     budget: DomainBudget,
+    outcome_store: Option<Arc<crate::outcome::HostOutcomeStore>>,
 ) -> ChunkCopyOutcome {
     let work_call = call.clone();
     let mut work = ChunkCopyWork {
@@ -4507,11 +5385,23 @@ fn copy_chunked_frame(
         _copy_permit: copy_permit,
     };
     if let Some((total_size, total_chunks, chunk_size)) = work.frame.first_geometry {
-        if let Err(error) =
-            registry.allocate_request(&request, total_size, total_chunks, chunk_size)
+        let allocate = || registry.allocate_request(&request, total_size, total_chunks, chunk_size);
+        let mut admission = allocate();
+        if let Err(ChunkAdmissionError::MemoryPressure { needed_bytes, .. }) = &admission
+            && !request.is_settled()
+            && !request.storage_retired()
+            && OutcomePressure::new(outcome_store.as_deref()).shed(*needed_bytes)
         {
+            // The first attempt released all of its registry and pool locks.
+            // Retry with the original reservation, which a disconnect may
+            // already have retired.
+            admission = allocate();
+        }
+        if let Err(error) = admission {
             let code = match error {
-                ChunkAdmissionError::Capacity(_) => ErrorCode::ResourceUnavailable,
+                ChunkAdmissionError::Capacity(_) | ChunkAdmissionError::MemoryPressure { .. } => {
+                    ErrorCode::ResourceUnavailable
+                }
                 _ => ErrorCode::ProtocolViolation,
             };
             return refuse_chunk_copy(
@@ -4547,8 +5437,9 @@ fn copy_chunked_frame(
                 match assembler
                     .finish()
                     .map_err(|message| C2Error::new(ErrorCode::ResourceUnavailable, message))
-                    .and_then(|backing| owned_reassembly_input(&budget, backing))
-                {
+                    .and_then(|backing| {
+                        owned_reassembly_input(&budget, backing, outcome_store.as_ref())
+                    }) {
                     Ok(input) => ChunkCopyOutcome::Complete(input),
                     Err(error) => {
                         ChunkCopyOutcome::Refused(rpc::bounded_call_end_error_bytes(&error))
@@ -4572,16 +5463,30 @@ fn copy_chunked_frame(
 fn owned_reassembly_input(
     budget: &DomainBudget,
     mut backing: c2_wire::chunk::ReassemblyBacking,
+    outcome_store: Option<&Arc<crate::outcome::HostOutcomeStore>>,
 ) -> Result<OwnedRequestInput, C2Error> {
     let len = backing.len() as u64;
     let limit = budget.snapshot().memory.limit_bytes;
-    match budget.try_reserve_memory(len) {
+    let mut pressure = OutcomePressure::new(outcome_store.map(Arc::as_ref));
+    let mut reserve = |len| pressure.reserve_memory(budget, len);
+    let reservation = if backing.is_dedicated() {
+        budget.try_reserve_memory(len)
+    } else {
+        reserve(len)
+    };
+    match reservation {
         Ok(reservation) => Ok(OwnedRequestInput {
             data: RequestData::Handle(backing),
             memory: Some(reservation),
         }),
         Err(error) => {
-            if backing.is_dedicated() && len <= limit {
+            if backing.is_dedicated()
+                && len <= limit
+                && matches!(
+                    error,
+                    c2_mem::PayloadBufferError::InsufficientCapacity { .. }
+                )
+            {
                 let bytes = backing.copy_bytes().map_err(|message| {
                     C2Error::new(ErrorCode::ResourceUnavailable, message).with_details(
                         std::collections::BTreeMap::from([(
@@ -4591,7 +5496,7 @@ fn owned_reassembly_input(
                     )
                 })?;
                 backing.release();
-                match budget.try_reserve_memory(len) {
+                match reserve(len) {
                     Ok(reservation) => Ok(OwnedRequestInput {
                         data: RequestData::Inline(bytes),
                         memory: Some(reservation),
@@ -4666,7 +5571,6 @@ async fn copy_coordinator(
         }
     }
 }
-
 /// Copy exactly one queued frame of one request, then re-schedule per the
 /// round-robin rules and, on completion, dispatch the assembled call.
 async fn run_copy_frame(
@@ -4707,6 +5611,7 @@ async fn run_copy_frame(
     let copying_call = call.clone();
     let copying_request = request.clone();
     let budget = server.domain_budget.clone();
+    let outcome_store = Some(Arc::clone(&server.outcome_store));
     let copying = tokio::task::spawn_blocking(move || {
         copy_chunked_frame(
             registry,
@@ -4715,6 +5620,7 @@ async fn run_copy_frame(
             permit,
             copying_call,
             budget,
+            outcome_store,
         )
     });
     let copied = tokio::select! {
@@ -4842,25 +5748,137 @@ struct TerminalClaim {
 }
 
 fn claim_terminal(writer: &ConnectionWriter, id: u64, status: CallStatus) -> Option<TerminalClaim> {
+    claim_outcome_terminal(writer, id, status, false)
+}
+
+/// Claim the one terminal of a call record. `replayed` marks an attached or
+/// replayed keyed connection call that never entered resource execution on
+/// this connection and therefore finishes through `finish_replayed`.
+fn claim_outcome_terminal(
+    writer: &ConnectionWriter,
+    id: u64,
+    status: CallStatus,
+    replayed: bool,
+) -> Option<TerminalClaim> {
     let (status, retired) = {
         let mut calls = writer.conn.calls.lock();
         let call = calls.get(id)?;
-        let status = match status {
-            CallStatus::NotExecuted => call.reject_before_execution()?,
-            CallStatus::Success => call.finish_execution(true)?,
-            CallStatus::Failed => call.finish_execution(false)?,
+        let status = if replayed {
+            call.finish_replayed(status)?
+        } else {
+            match status {
+                CallStatus::NotExecuted => call.reject_before_execution()?,
+                CallStatus::Success => call.finish_execution(true)?,
+                CallStatus::Failed => call.finish_execution(false)?,
+            }
         };
         (status, calls.retire(id)?)
     };
     let call = &retired;
     // Retire storage outside the table lock. Copy tokens retain actual owners.
     let input = call.data.input.lock().take();
+    let admission = call.data.admission.lock().take();
     drop(input);
+    drop(admission);
+    let cancel = call.data.cancel_waiter.lock().take();
+    drop(cancel);
     writer.conn.core.stream_retire(id);
     Some(TerminalClaim {
         status,
         _call: retired,
     })
+}
+
+/// Transport one replayed keyed response to one connection: SHM-capable
+/// peers get an independent loan of the shared sealed block; everyone else
+/// gets segmented inline/chunked writes straight out of the sealed owners,
+/// never a per-connection whole-payload copy.
+async fn write_outcome_response(
+    writer: &Arc<ConnectionWriter>,
+    request_id: u64,
+    response: &crate::outcome::OutcomeResponse,
+    shm_allowed: bool,
+    chunk_size: usize,
+) -> Result<(), ResponseSendError> {
+    use crate::outcome::OutcomeResponse;
+    match response {
+        OutcomeResponse::Empty => write_reply_with_data(writer, request_id, &[]).await,
+        OutcomeResponse::Inline(buffer) => {
+            write_inline_or_chunked_reply(writer, request_id, buffer.as_ref(), chunk_size).await
+        }
+        OutcomeResponse::Shm(block) => {
+            if shm_allowed {
+                let loan = block.mint_loan();
+                match writer.write_call_end_shared_shm(request_id, loan).await {
+                    Ok(None) => return Ok(()),
+                    Ok(Some(unpublished)) => {
+                        // Deactivated before publication: settle the unused
+                        // loan and fall back to segmented writes.
+                        unpublished.settle();
+                    }
+                    Err(error) => {
+                        return Err(response_write_error(
+                            "shared SHM CALL_END write failed",
+                            error,
+                        ));
+                    }
+                }
+            }
+            write_inline_or_chunked_reply(writer, request_id, block.as_slice(), chunk_size).await
+        }
+        OutcomeResponse::Unavailable(reason) => {
+            write_result_unavailable(writer, request_id, *reason).await
+        }
+    }
+}
+
+/// The `722 CallResultUnavailable` replay answer for a confirmed success
+/// whose bytes were never retained or were evicted.
+async fn write_result_unavailable(
+    writer: &Arc<ConnectionWriter>,
+    request_id: u64,
+    reason: rpc::WireResultUnavailableReason,
+) -> Result<(), ResponseSendError> {
+    let error = C2Error::new(
+        ErrorCode::CallResultUnavailable,
+        "the keyed call succeeded but its result is no longer retained",
+    )
+    .with_details(std::collections::BTreeMap::from([
+        ("outcome".to_string(), "succeeded".to_string()),
+        ("reason".to_string(), reason.as_str().to_string()),
+    ]));
+    write_error_record(
+        writer,
+        request_id,
+        CallStatus::Failed,
+        &rpc::bounded_call_end_error_bytes(&error),
+        false,
+    )
+    .await;
+    Ok(())
+}
+
+/// The bounded CALL_END error bytes for one route execution failure, shared
+/// by the plain and keyed send paths.
+fn route_execution_error_bytes(error: RouteExecutionError) -> Vec<u8> {
+    match error {
+        RouteExecutionError::Input(message) => error_wire(ErrorCode::ProtocolViolation, message),
+        RouteExecutionError::Crm(error) => {
+            rpc::bounded_call_end_error_bytes(&callback_error(error))
+        }
+        RouteExecutionError::Acquire(SchedulerAcquireError::Closed) => {
+            error_wire(ErrorCode::ResourceClosed, "route closed")
+        }
+        RouteExecutionError::Acquire(SchedulerAcquireError::Unavailable) => {
+            error_wire(ErrorCode::ResourceUnavailable, "host admission unavailable")
+        }
+        RouteExecutionError::Acquire(SchedulerAcquireError::Capacity { field, limit }) => {
+            error_wire(
+                ErrorCode::ResourceUnavailable,
+                format!("route concurrency capacity exceeded: {field}={limit}"),
+            )
+        }
+    }
 }
 
 async fn write_error_record(
@@ -4945,13 +5963,22 @@ async fn send_prepared_shm_response(
             .copy_logical_bytes()
             .map_err(ResponseSendError::UserVisible)?;
         drop(prepared);
-        if bytes.len() > chunk_size || inline_reply_total_len(bytes.len()).is_err() {
-            write_chunked_reply(writer, request_id, &bytes, chunk_size).await?;
-        } else {
-            write_reply_with_data(writer, request_id, &bytes).await?;
-        }
+        write_inline_or_chunked_reply(writer, request_id, &bytes, chunk_size).await?;
     }
     Ok(())
+}
+
+async fn write_inline_or_chunked_reply(
+    writer: &Arc<ConnectionWriter>,
+    request_id: u64,
+    bytes: &[u8],
+    chunk_size: usize,
+) -> Result<(), ResponseSendError> {
+    if bytes.len() > chunk_size || inline_reply_total_len(bytes.len()).is_err() {
+        write_chunked_reply(writer, request_id, bytes, chunk_size).await
+    } else {
+        write_reply_with_data(writer, request_id, bytes).await
+    }
 }
 
 /// Continue one CALL_END value without another status or terminal outcome.
@@ -5119,6 +6146,10 @@ async fn smart_reply_with_data(
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+#[path = "outcome_tests.rs"]
+mod outcome_tests;
 
 #[cfg(test)]
 #[path = "server_tests.rs"]

@@ -3,12 +3,15 @@ use c2_wire::buddy::BuddyPayload;
 use c2_wire::flags::{FLAG_CHUNKED, FLAG_FIRST_CHUNK, FLAG_RPC_RECORD};
 use c2_wire::frame::{DecodeError, decode_frame};
 use c2_wire::rpc::{
-    CallMode, CallStatus, CancelCause, ChunkPosition, RouteCallIdentity, RpcRecord, ValuePart,
-    ValueStorage, WireLagPolicy, WireSubscribeOptions, WireTopicStart, decode_rpc_record,
-    decode_rpc_record_with_carrier, encode_call_end_frame, encode_cancel_frame,
-    encode_credit_frame, encode_item_begin_frame, encode_item_data_frame, encode_open_frame,
-    encode_open_subscribe_frame, encode_ready_frame, encode_subscribe_item_begin_frame,
-    encode_sync_ack_frame, encode_sync_frame,
+    CallMode, CallStatus, CancelCause, ChunkPosition, MAX_QUERY_CALL_ERROR_BYTES,
+    RouteCallIdentity, RpcRecord, ValuePart, ValueStorage, WireCallOutcome, WireCallOutcomeStatus,
+    WireLagPolicy, WireQueryCallResult, WireResultUnavailableReason, WireSubscribeOptions,
+    WireTopicStart, decode_rpc_record, decode_rpc_record_with_carrier, encode_call_end_frame,
+    encode_cancel_frame, encode_credit_frame, encode_item_begin_frame, encode_item_data_frame,
+    encode_open_frame, encode_open_keyed_frame, encode_open_recover_frame,
+    encode_open_subscribe_frame, encode_query_call_frame, encode_query_call_result_frame,
+    encode_ready_frame, encode_subscribe_item_begin_frame, encode_sync_ack_frame,
+    encode_sync_frame,
 };
 
 #[test]
@@ -459,13 +462,15 @@ fn open_roundtrips_call_mode_in_whole_and_first_chunk() {
         ] {
             let wire = encode_open_frame(1, &identity(), 3, mode, value).unwrap();
             let (header, payload) = decode_frame(&wire).unwrap();
-            let (_, _, _, metadata_len) = c2_wire::rpc::decode_open_metadata(payload).unwrap();
+            let (_, _, _, call_id, metadata_len) =
+                c2_wire::rpc::decode_open_metadata(payload).unwrap();
+            assert_eq!(call_id, None);
             assert_eq!(
                 &payload[metadata_len - 3..metadata_len],
                 &[mode as u8, 3, 0]
             );
             assert!(matches!(decode_rpc_record(&header, payload, None).unwrap(),
-                RpcRecord::Open { method_idx: 3, mode: actual, value: actual_value, .. }
+                RpcRecord::Open { method_idx: 3, mode: actual, call_id: None, value: actual_value, .. }
                 if actual == mode && actual_value == value));
         }
     }
@@ -473,7 +478,7 @@ fn open_roundtrips_call_mode_in_whole_and_first_chunk() {
 
 #[test]
 fn unknown_open_mode_and_cancel_cause_use_invalid_value() {
-    for value in [3u8, 255] {
+    for value in [5u8, 255] {
         let mut wire = encode_open_frame(
             1,
             &identity(),
@@ -506,7 +511,7 @@ fn unknown_open_mode_and_cancel_cause_use_invalid_value() {
 }
 
 #[test]
-fn unknown_open_mode_preserves_whole_and_first_chunk_shm_carrier() {
+fn invalid_keyed_open_call_id_preserves_shm_carrier_and_unknown_mode_returns_none() {
     let descriptor = BuddyPayload {
         seg_idx: 1,
         generation: 1,
@@ -519,20 +524,41 @@ fn unknown_open_mode_preserves_whole_and_first_chunk_shm_carrier() {
         ValuePart::whole(ValueStorage::Shm(descriptor)),
         ValuePart::first(2, ValueStorage::Shm(descriptor)),
     ] {
-        let mut wire = encode_open_frame(1, &identity(), 0, CallMode::Unary, part).unwrap();
-        let (_, _, _, metadata_len) = c2_wire::rpc::decode_open_metadata(&wire[16..]).unwrap();
+        // Structurally intact KeyedUnary OPEN with invalid call_id characters
+        // proves exact carrier offset so the SHM loan is released once.
+        let mut keyed = encode_open_keyed_frame(1, &identity(), 0, "valid-id", part).unwrap();
+        let (_, _, _, _, metadata_len) =
+            c2_wire::rpc::decode_open_metadata(&keyed[16..]).unwrap();
+        // Corrupt one character of call_id to '/' (forbidden).
+        keyed[16 + metadata_len - 1] = b'/';
+        let (header, payload) = decode_frame(&keyed).unwrap();
+        let failure = decode_rpc_record_with_carrier(&header, payload, None).unwrap_err();
+        assert!(matches!(
+            failure.error,
+            DecodeError::InvalidText {
+                field: "call_id",
+                ..
+            }
+        ));
+        assert_eq!(failure.carrier, Some(descriptor));
+
+        // Unknown CallMode has unprovable carrier offset in IPC 18 -> None
+        // (connection retires instead of guessing offset).
+        let mut unknown = encode_open_frame(1, &identity(), 0, CallMode::Unary, part).unwrap();
+        let (_, _, _, _, metadata_len) =
+            c2_wire::rpc::decode_open_metadata(&unknown[16..]).unwrap();
         let mode_offset = 16 + metadata_len - 3;
-        wire[mode_offset] = 3;
-        let (header, payload) = decode_frame(&wire).unwrap();
+        unknown[mode_offset] = 5;
+        let (header, payload) = decode_frame(&unknown).unwrap();
         let failure = decode_rpc_record_with_carrier(&header, payload, None).unwrap_err();
         assert_eq!(
             failure.error,
             DecodeError::InvalidValue {
                 field: "call mode",
-                value: 3
+                value: 5
             }
         );
-        assert_eq!(failure.carrier, Some(descriptor));
+        assert_eq!(failure.carrier, None);
     }
 }
 
@@ -658,4 +684,185 @@ fn connection_core_subscribe_open_begins_items_without_resource_step() {
     server.stream_credit(5, 0, 1).unwrap();
     server.stream_begin_item(5, 0).unwrap();
     assert_eq!(server.stream_state(5).unwrap().complete_items, 2);
+}
+
+#[test]
+fn keyed_unary_recover_query_call_and_result_roundtrip_and_reject_invalid() {
+    // KeyedUnary whole + chunked first + metadata len matches exact payload offset.
+    for part in [
+        ValuePart::whole(ValueStorage::Inline(b"payload")),
+        ValuePart::first(12, ValueStorage::Inline(b"payl")),
+    ] {
+        let wire = encode_open_keyed_frame(9, &identity(), 4, "op_01-AZ", part).unwrap();
+        let (h, p) = decode_frame(&wire).unwrap();
+        let (_, midx, mode, cid, meta_len) = c2_wire::rpc::decode_open_metadata(p).unwrap();
+        assert_eq!(midx, 4);
+        assert_eq!(mode, CallMode::KeyedUnary);
+        assert_eq!(cid.as_deref(), Some("op_01-AZ"));
+        assert_eq!(
+            meta_len,
+            c2_wire::rpc::encoded_keyed_open_metadata_len(&identity(), "op_01-AZ").unwrap()
+        );
+        assert!(matches!(
+            decode_rpc_record(&h, p, None).unwrap(),
+            RpcRecord::Open {
+                method_idx: 4,
+                mode: CallMode::KeyedUnary,
+                call_id: Some(ref id),
+                value,
+                ..
+            } if id == "op_01-AZ" && value == part
+        ));
+    }
+    assert!(
+        encode_open_keyed_frame(
+            9,
+            &identity(),
+            4,
+            "",
+            ValuePart::whole(ValueStorage::Inline(b""))
+        )
+        .is_err()
+    );
+    assert!(
+        encode_open_keyed_frame(
+            9,
+            &identity(),
+            4,
+            "bad/id",
+            ValuePart::whole(ValueStorage::Inline(b""))
+        )
+        .is_err()
+    );
+
+    // Recover OPEN carries no payload and rejects trailing bytes or storage flags.
+    let rec = encode_open_recover_frame(11, &identity(), 4, "op_01-AZ").unwrap();
+    let (h, p) = decode_frame(&rec).unwrap();
+    assert!(matches!(
+        decode_rpc_record(&h, p, None).unwrap(),
+        RpcRecord::OpenRecover {
+            method_idx: 4,
+            call_id: ref id,
+            ..
+        } if id == "op_01-AZ"
+    ));
+    let mut rec_trailing = rec.clone();
+    rec_trailing.push(0xAA);
+    let new_len = (rec_trailing.len() - 4) as u32;
+    rec_trailing[..4].copy_from_slice(&new_len.to_le_bytes());
+    let (h, p) = decode_frame(&rec_trailing).unwrap();
+    assert!(decode_rpc_record(&h, p, None).is_err());
+
+    // CALL_END works with unary response semantics for KeyedUnary and Recover.
+    for mode in [CallMode::KeyedUnary, CallMode::Recover] {
+        let ok = encode_call_end_frame(
+            11,
+            mode,
+            CallStatus::Success,
+            0,
+            ValuePart::whole(ValueStorage::Inline(b"ok")),
+        )
+        .unwrap();
+        let (h, p) = decode_frame(&ok).unwrap();
+        assert!(matches!(
+            decode_rpc_record(&h, p, Some(mode)).unwrap(),
+            RpcRecord::CallEnd {
+                status: CallStatus::Success,
+                complete_items: None,
+                value,
+                error: None,
+            } if value == ValuePart::whole(ValueStorage::Inline(b"ok"))
+        ));
+    }
+
+    // QueryCall round-trip and direction/RID validation.
+    let q = encode_query_call_frame(15, &identity(), "op_01-AZ").unwrap();
+    let (h, p) = decode_frame(&q).unwrap();
+    assert!(matches!(
+        decode_rpc_record(&h, p, None).unwrap(),
+        RpcRecord::QueryCall { call_id: ref id, .. } if id == "op_01-AZ"
+    ));
+    assert!(encode_query_call_frame(0, &identity(), "op_01-AZ").is_err());
+
+    // QueryCallResult round-trips every valid outcome variant + error truncation.
+    for res in [
+        WireQueryCallResult::Outcome(WireCallOutcome::unknown()),
+        WireQueryCallResult::Outcome(WireCallOutcome::in_flight("step".into())),
+        WireQueryCallResult::Outcome(WireCallOutcome::succeeded("step".into(), true, None)),
+        WireQueryCallResult::Outcome(WireCallOutcome::succeeded(
+            "step".into(),
+            false,
+            Some(WireResultUnavailableReason::NotRetained),
+        )),
+        WireQueryCallResult::Outcome(WireCallOutcome::succeeded(
+            "step".into(),
+            false,
+            Some(WireResultUnavailableReason::Evicted),
+        )),
+        WireQueryCallResult::Outcome(WireCallOutcome::failed(
+            "step".into(),
+            ErrorCode::ResourceFunctionExecuting,
+            true,
+        )),
+        WireQueryCallResult::Outcome(WireCallOutcome::failed(
+            "step".into(),
+            ErrorCode::ResourceFunctionExecuting,
+            false,
+        )),
+        WireQueryCallResult::Error(C2Error::new(
+            ErrorCode::ResourceNotFound,
+            "missing route",
+        )),
+    ] {
+        let wire = encode_query_call_result_frame(15, &res).unwrap();
+        let (h, p) = decode_frame(&wire).unwrap();
+        assert_eq!(
+            decode_rpc_record(&h, p, None).unwrap(),
+            RpcRecord::QueryCallResult(res)
+        );
+    }
+
+    // Oversized error in QueryCallResult truncates cleanly within MAX_QUERY_CALL_ERROR_BYTES.
+    let huge = C2Error::new(ErrorCode::ProtocolViolation, "x".repeat(20_000));
+    let wire = encode_query_call_result_frame(16, &WireQueryCallResult::Error(huge)).unwrap();
+    let (h, p) = decode_frame(&wire).unwrap();
+    assert!(p.len() <= MAX_QUERY_CALL_ERROR_BYTES + 2);
+    assert!(matches!(
+        decode_rpc_record(&h, p, None).unwrap(),
+        RpcRecord::QueryCallResult(WireQueryCallResult::Error(err))
+            if err.code == ErrorCode::ProtocolViolation
+                && err.details.get("truncated").map(String::as_str) == Some("true")
+    ));
+
+    // Invalid WireCallOutcome combinations are rejected at encode boundary.
+    assert!(
+        encode_query_call_result_frame(
+            17,
+            &WireQueryCallResult::Outcome(WireCallOutcome {
+                status: WireCallOutcomeStatus::Succeeded,
+                method_name: Some("step".into()),
+                result_available: false,
+                result_unavailable_reason: None,
+                error_code: None,
+                error_details_available: false,
+            })
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn call_record_finish_replayed_competes_with_reject_before_execution() {
+    use c2_wire::connection::calls::CallTable;
+
+    let mut table = CallTable::default();
+    let rec1 = table.open(1, ()).unwrap();
+    assert_eq!(rec1.finish_replayed(CallStatus::Success), Some(CallStatus::Success));
+    assert_eq!(rec1.reject_before_execution(), None);
+    assert!(!rec1.enter_resource());
+
+    let rec2 = table.open(2, ()).unwrap();
+    assert!(rec2.queue());
+    assert_eq!(rec2.reject_before_execution(), Some(CallStatus::NotExecuted));
+    assert_eq!(rec2.finish_replayed(CallStatus::Success), None);
 }

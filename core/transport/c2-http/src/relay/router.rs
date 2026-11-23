@@ -24,6 +24,7 @@ use axum::{
 use futures::StreamExt;
 
 use crate::client::{LOCAL_ENDPOINT_NAMESPACE_HEADER, validate_local_endpoint_namespace};
+use crate::outcome_wire::{CALL_ID_HEADER, KEYED_PATH, OUTCOME_PATH, OutcomeJson, RECOVER_PATH};
 use crate::payload::SegmentedPayload;
 use crate::relay::authority::{
     ClaimedRouteContract, ControlError, LocalRegistration, LocalRouteOwner, RegisterPreparation,
@@ -42,6 +43,7 @@ use c2_ipc::IpcClient;
 use c2_mem::{BudgetedBuffer, DomainBudget, MemoryReservation, PayloadBufferError};
 use tokio_util::sync::CancellationToken;
 
+const OUTCOME_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
 const CONTROL_BODY_LIMIT_BYTES: usize = 64 * 1024;
 const EXPECTED_CRM_NS_HEADER: &str = "x-c2-expected-crm-ns";
 const EXPECTED_CRM_NAME_HEADER: &str = "x-c2-expected-crm-name";
@@ -824,8 +826,11 @@ pub fn build_router(state: Arc<RelayState>) -> Router {
         .route("/_admin/unregister", post(handle_admin_unregister))
         .route("/_admin/force-leave", post(handle_admin_force_leave))
         .route("/_routes", get(handle_list_routes))
+        .route("/_resolve", get(handle_resolve_query))
         .route("/_resolve/{*name}", get(handle_resolve))
+        .route("/_probe", get(handle_probe_query))
         .route("/_probe/{*name}", get(handle_probe))
+        .route(OUTCOME_PATH, get(query_call_handler))
         .route("/_peers", get(handle_peers))
         .route("/_calls/{token}", delete(cancel_stream_call))
         .route("/_peer/announce", post(peer_handlers::handle_peer_announce))
@@ -845,6 +850,8 @@ pub fn build_router(state: Arc<RelayState>) -> Router {
         .layer(DefaultBodyLimit::max(CONTROL_BODY_LIMIT_BYTES));
 
     let data_router = Router::new()
+        .route(KEYED_PATH, post(keyed_call_handler))
+        .route(RECOVER_PATH, post(recover_call_handler))
         .route("/{route_name}/{method_name}", post(call_handler))
         .route("/{route_name}/_topics/{topic_name}", post(topic_handler))
         .route(
@@ -1975,7 +1982,33 @@ async fn handle_resolve(
     State(state): State<Arc<RelayState>>,
     OptionalConnectInfo(remote_addr): OptionalConnectInfo,
     headers: HeaderMap,
-) -> impl IntoResponse {
+) -> Response {
+    resolve_route(name, query, state, remote_addr, headers)
+}
+
+async fn handle_resolve_query(
+    Query(query): Query<FixedResolveQuery>,
+    State(state): State<Arc<RelayState>>,
+    OptionalConnectInfo(remote_addr): OptionalConnectInfo,
+    headers: HeaderMap,
+) -> Response {
+    resolve_route(query.route, query.contract, state, remote_addr, headers)
+}
+
+#[derive(serde::Deserialize)]
+struct FixedResolveQuery {
+    route: String,
+    #[serde(flatten)]
+    contract: ResolveQuery,
+}
+
+fn resolve_route(
+    name: String,
+    query: ResolveQuery,
+    state: Arc<RelayState>,
+    remote_addr: Option<SocketAddr>,
+    headers: HeaderMap,
+) -> Response {
     #[cfg(feature = "test-support")]
     state
         .route_lookups
@@ -2288,6 +2321,18 @@ async fn handle_probe(
     State(state): State<Arc<RelayState>>,
     headers: HeaderMap,
 ) -> Response {
+    probe_route(route_name, state, headers).await
+}
+
+async fn handle_probe_query(
+    Query(query): Query<RouteQuery>,
+    State(state): State<Arc<RelayState>>,
+    headers: HeaderMap,
+) -> Response {
+    probe_route(query.route, state, headers).await
+}
+
+async fn probe_route(route_name: String, state: Arc<RelayState>, headers: HeaderMap) -> Response {
     #[cfg(feature = "test-support")]
     state
         .route_lookups
@@ -2333,6 +2378,125 @@ async fn handle_probe_in_context(
     }
 }
 
+#[derive(serde::Deserialize)]
+struct RouteQuery {
+    route: String,
+}
+
+#[derive(serde::Deserialize)]
+struct UnaryQuery {
+    route: String,
+    method: String,
+}
+
+enum ForwardMode {
+    Unary(Option<String>),
+    Recover(String),
+    Stream,
+}
+
+fn call_id_from_headers(headers: &HeaderMap) -> ResponseResult<&str> {
+    let mut values = headers.get_all(CALL_ID_HEADER).into_iter();
+    if let Some(value) = values.next().and_then(|value| value.to_str().ok())
+        && values.next().is_none()
+        && c2_config::validate_call_id(value).is_ok()
+    {
+        return Ok(value);
+    }
+    Err((StatusCode::BAD_REQUEST, "expected one valid x-c2-call-id")
+        .into_response()
+        .into())
+}
+
+async fn keyed_call_handler(
+    State(state): State<Arc<RelayState>>,
+    Query(query): Query<UnaryQuery>,
+    Extension(length): Extension<DeclaredBodyLength>,
+    headers: HeaderMap,
+    body: Body,
+) -> ResponseResult<Response> {
+    let call_id = call_id_from_headers(&headers)?.to_owned();
+    Ok(admit_call(
+        state,
+        query.route,
+        query.method,
+        length,
+        headers,
+        body,
+        ForwardMode::Unary(Some(call_id)),
+    )
+    .await)
+}
+
+async fn recover_call_handler(
+    State(state): State<Arc<RelayState>>,
+    Query(query): Query<UnaryQuery>,
+    Extension(length): Extension<DeclaredBodyLength>,
+    headers: HeaderMap,
+    body: Body,
+) -> ResponseResult<Response> {
+    let call_id = call_id_from_headers(&headers)?.to_owned();
+    if !matches!(length.0, Ok(None | Some(0))) || axum::body::to_bytes(body, 0).await.is_err() {
+        return Err((StatusCode::BAD_REQUEST, "recovery requires an empty body")
+            .into_response()
+            .into());
+    }
+    Ok(admit_call(
+        state,
+        query.route,
+        query.method,
+        DeclaredBodyLength(Ok(Some(0))),
+        headers,
+        Body::empty(),
+        ForwardMode::Recover(call_id),
+    )
+    .await)
+}
+
+async fn query_call_handler(
+    State(state): State<Arc<RelayState>>,
+    Query(query): Query<RouteQuery>,
+    headers: HeaderMap,
+    _body: Bytes,
+) -> ResponseResult<Response> {
+    let call_id = call_id_from_headers(&headers)?;
+    let expected = expected_crm_from_headers(&query.route, &headers, None)?;
+    let route = validate_expected_crm_for_route(&state, &query.route, &expected, None)?;
+    // The upstream IPC client separately limits its own control records.
+    let Ok(_permit) = state.outcome_queries.try_acquire() else {
+        return Ok(c2_error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            c2_error::ErrorCode::CallCapacityExceeded,
+            "all relay query slots are in use",
+            [("route", query.route)],
+        ));
+    };
+    let response = match acquire_request_client_for_route(state.clone(), &route).await {
+        RequestClient::Ready(ready) => match ready
+            .lease
+            .client()
+            .query_call(&ready.binding, call_id, OUTCOME_QUERY_TIMEOUT)
+            .await
+        {
+            Ok(outcome) => (
+                [(header::CACHE_CONTROL, "no-store")],
+                Json(OutcomeJson::from(outcome)),
+            )
+                .into_response(),
+            Err(error) => ipc_route_error_response(&query.route, &error, None),
+        },
+        RequestClient::WatchUnavailable { route, reason } => {
+            route_watch_unavailable_response(&route.name, reason)
+        }
+        RequestClient::NotFound => probe_resource_not_found_response(&query.route),
+        RequestClient::RouteError(error) => ipc_route_error_response(&query.route, &error, None),
+        RequestClient::Unreachable => {
+            resource_unavailable_response(&query.route, "relay upstream unavailable")
+        }
+    };
+    Ok(response)
+}
+
 /// `POST /{route_name}/{method_name}` — relay CRM call to upstream.
 ///
 /// If the upstream was evicted by the idle sweeper, attempts a lazy
@@ -2343,6 +2507,35 @@ async fn call_handler(
     Extension(declared_length): Extension<DeclaredBodyLength>,
     headers: HeaderMap,
     body: Body,
+) -> Response {
+    let mode = if headers
+        .get(header::ACCEPT)
+        .is_some_and(|value| value.as_bytes() == crate::stream_wire::MEDIA_TYPE.as_bytes())
+    {
+        ForwardMode::Stream
+    } else {
+        ForwardMode::Unary(None)
+    };
+    admit_call(
+        state,
+        route_name,
+        method_name,
+        declared_length,
+        headers,
+        body,
+        mode,
+    )
+    .await
+}
+
+async fn admit_call(
+    state: Arc<RelayState>,
+    route_name: String,
+    method_name: String,
+    declared_length: DeclaredBodyLength,
+    headers: HeaderMap,
+    body: Body,
+    mode: ForwardMode,
 ) -> Response {
     let budget = state.forwarding.budget().clone();
     let expected_crm = match expected_crm_from_headers(&route_name, &headers, Some(&budget)) {
@@ -2376,9 +2569,6 @@ async fn call_handler(
     }
     #[cfg(test)]
     run_data_plane_after_precheck_hook(&state, &route_name);
-    let server_stream = headers
-        .get(header::ACCEPT)
-        .is_some_and(|value| value.as_bytes() == crate::stream_wire::MEDIA_TYPE.as_bytes());
     let work_state = state.clone();
     let work_route_name = route_name.clone();
     // Keep the body in the HTTP handler until admission succeeds. A rejected
@@ -2397,7 +2587,7 @@ async fn call_handler(
             body,
             permit,
             cancelled,
-            server_stream,
+            mode,
         )
         .await
     };
@@ -2498,8 +2688,10 @@ async fn forward_call(
     body: Body,
     permit: c2_mem::OperationPermit,
     cancelled: CancellationToken,
-    server_stream: bool,
+    mode: ForwardMode,
 ) -> Response {
+    let server_stream = matches!(mode, ForwardMode::Stream);
+    let keyed = matches!(mode, ForwardMode::Recover(_) | ForwardMode::Unary(Some(_)));
     let budget = state.forwarding.budget().clone();
     let copy_cap = c2_config::REMOTE_PAYLOAD_CHUNK_SIZE
         .min(c2_config::CHUNK_SIZE)
@@ -2630,21 +2822,38 @@ async fn forward_call(
         Stream(c2_ipc::IpcForwardStream),
     }
     let width = usize::try_from(download.bytes()).expect("local copy window is addressable");
-    let call_result = if server_stream {
-        match client
+    let phase_and_source = |error: c2_ipc::IpcCallError| (error.phase(), error.into_source());
+    let call_result = match mode {
+        ForwardMode::Stream => match client
             .forward_stream_bound_sized_phased(&binding, &method_name, input_len, chunks, upload)
             .await
         {
             Ok(stream) => finish_stream_upload(stream, &cancelled, &shutdown)
                 .await
-                .map(ForwardedResponse::Stream),
-            Err(error) => Err(error),
-        }
-    } else {
-        client
-            .forward_unary_bound_sized_phased(&binding, &method_name, input_len, chunks, upload)
+                .map(ForwardedResponse::Stream)
+                .map_err(phase_and_source),
+            Err(error) => Err(phase_and_source(error)),
+        },
+        ForwardMode::Unary(call_id) => client
+            .forward_keyed_unary_bound_sized_phased(
+                &binding,
+                &method_name,
+                call_id.as_deref(),
+                input_len,
+                chunks,
+                upload,
+            )
             .await
             .map(ForwardedResponse::Unary)
+            .map_err(phase_and_source),
+        ForwardMode::Recover(call_id) => {
+            drop((chunks, upload));
+            client
+                .forward_recover_bound_phased(&binding, &method_name, &call_id)
+                .await
+                .map(ForwardedResponse::Unary)
+                .map_err(phase_and_source)
+        }
     };
 
     match call_result {
@@ -2676,9 +2885,7 @@ async fn forward_call(
                 &budget,
             ),
         },
-        Err(error) => {
-            let phase = error.phase();
-            let error = error.into_source();
+        Err((phase, error)) => {
             #[cfg(test)]
             if matches!(&error, c2_ipc::IpcError::Io(source) if source.to_string().contains("request body stream error"))
             {
@@ -2692,6 +2899,13 @@ async fn forward_call(
                 }
             }
             match error {
+                c2_ipc::IpcError::MethodNotFound { .. } if keyed => c2_error_response_with_budget(
+                    StatusCode::NOT_ACCEPTABLE,
+                    c2_error::ErrorCode::UnsupportedCallMode,
+                    "outcome operations require a declared unary method",
+                    [("dispatch_phase", "pre_dispatch")],
+                    &budget,
+                ),
                 c2_ipc::IpcError::CallRejected(error) => {
                     drop(download);
                     let error = c2_ipc::IpcError::CallRejected(error);
@@ -2873,7 +3087,12 @@ fn ipc_route_error_response(
 ) -> Response {
     use c2_error::{C2Error, ErrorCode};
     let semantic_error_response = |status, mut error: C2Error| {
-        if budget.is_some() {
+        if error.code == ErrorCode::CallResultUnavailable {
+            error.details.remove("dispatch_phase");
+            error.details.remove("transport_phase");
+            return (status, Body::from(error.to_wire_bytes())).into_response();
+        }
+        if budget.is_some() || error.code.is_outcome_control() {
             error
                 .details
                 .insert("dispatch_phase".into(), "pre_dispatch".into());
@@ -2895,7 +3114,11 @@ fn ipc_route_error_response(
                 ErrorCode::ResourceNotFound => StatusCode::NOT_FOUND,
                 ErrorCode::UnsupportedCallMode => StatusCode::NOT_ACCEPTABLE,
                 ErrorCode::ResourceRemoved => StatusCode::GONE,
-                ErrorCode::ContractMismatch | ErrorCode::IdentityMismatch => StatusCode::CONFLICT,
+                ErrorCode::ContractMismatch
+                | ErrorCode::IdentityMismatch
+                | ErrorCode::CallIdConflict
+                | ErrorCode::CallOutcomeUnknown => StatusCode::CONFLICT,
+                ErrorCode::CallResultUnavailable => StatusCode::INTERNAL_SERVER_ERROR,
                 ErrorCode::ResourceClosed
                 | ErrorCode::ResourceUnavailable
                 | ErrorCode::CallCapacityExceeded => StatusCode::SERVICE_UNAVAILABLE,
@@ -4572,6 +4795,164 @@ mod tests {
             .header("x-c2-expected-crm-ver", crm_ver)
             .header("x-c2-expected-abi-hash", TEST_ABI_HASH)
             .header("x-c2-expected-signature-hash", TEST_SIGNATURE_HASH)
+    }
+
+    #[tokio::test]
+    async fn outcome_endpoints_check_actual_body_and_one_legal_call_id() {
+        let app = build_router(test_state());
+        for (verb, path) in [
+            ("POST", format!("{KEYED_PATH}?route=grid&method=ping")),
+            ("POST", format!("{RECOVER_PATH}?route=grid&method=ping")),
+            ("GET", format!("{OUTCOME_PATH}?route=grid")),
+        ] {
+            let oversized = "a".repeat(129);
+            for ids in [
+                vec![],
+                vec!["a", "b"],
+                vec!["a,b"],
+                vec!["bad/id"],
+                vec![&oversized],
+            ] {
+                let mut request =
+                    add_expected_echo_headers(Request::builder().method(verb).uri(&path));
+                for id in ids {
+                    request = request.header(CALL_ID_HEADER, id);
+                }
+                assert_eq!(
+                    app.clone()
+                        .oneshot(request.body(Body::empty()).unwrap())
+                        .await
+                        .unwrap()
+                        .status(),
+                    StatusCode::BAD_REQUEST,
+                );
+            }
+        }
+        // No declared length, so only inspecting the body can detect this violation.
+        let recover = add_expected_echo_headers(
+            Request::builder()
+                .method("POST")
+                .uri(format!("{RECOVER_PATH}?route=grid&method=ping")),
+        )
+        .header(CALL_ID_HEADER, "valid")
+        .body(Body::from_stream(futures::stream::once(async {
+            Ok::<_, std::io::Error>(Bytes::from_static(b"unexpected"))
+        })))
+        .unwrap();
+        assert_eq!(
+            app.oneshot(recover).await.unwrap().status(),
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[tokio::test]
+    async fn outcome_endpoints_preserve_host_errors_and_success_metadata() {
+        use c2_error::{C2Error, ErrorCode};
+        let state = test_state();
+        let address = format!(
+            "ipc://outcome-http-{}-{}",
+            std::process::id(),
+            unique_suffix()
+        );
+        let server_id = "outcome-http";
+        let server = Arc::new(
+            Server::new_with_identity(
+                &address,
+                ServerIpcConfig {
+                    outcome_max_retained_bytes: Some(0),
+                    ..Default::default()
+                },
+                ServerIdentity {
+                    server_id: server_id.into(),
+                    server_instance_id: "outcome-http-instance".into(),
+                },
+            )
+            .unwrap(),
+        );
+        register_echo_route(&server, "grid").await;
+        let server_task = tokio::spawn({
+            let server = server.clone();
+            async move { server.run().await }
+        });
+        server
+            .wait_until_responsive(Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(
+            post_register(state.clone(), "grid", server_id, &address).await,
+            StatusCode::CREATED
+        );
+        let app = build_router(state.clone());
+        let send = |verb: &'static str,
+                    path: &'static str,
+                    route: &'static str,
+                    id: &'static str,
+                    bytes: &'static str| {
+            let app = app.clone();
+            async move {
+                let query = if verb == "GET" { "" } else { "&method=ping" };
+                let response = app
+                    .oneshot(
+                        add_expected_echo_headers(
+                            Request::builder()
+                                .method(verb)
+                                .uri(format!("{path}?route={route}{query}")),
+                        )
+                        .header(CALL_ID_HEADER, id)
+                        .body(Body::from(bytes))
+                        .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let (parts, body) = response.into_parts();
+                (parts, to_bytes(body, 8192).await.unwrap())
+            }
+        };
+        let (parts, body) = send("POST", KEYED_PATH, "grid", "key", "first").await;
+        assert_eq!(parts.status, StatusCode::OK);
+        assert_eq!(body.as_ref(), b"echo");
+        for (path, id, bytes, code) in [
+            (KEYED_PATH, "key", "different", ErrorCode::CallIdConflict),
+            (RECOVER_PATH, "miss", "", ErrorCode::CallOutcomeUnknown),
+        ] {
+            let (parts, body) = send("POST", path, "grid", id, bytes).await;
+            assert_eq!(parts.status, StatusCode::CONFLICT);
+            let error = C2Error::from_json_bytes(&body).unwrap();
+            assert_eq!(error.code, code);
+            assert_eq!(error.details["dispatch_phase"], "pre_dispatch");
+        }
+        let (parts, body) = send("POST", RECOVER_PATH, "grid", "key", "").await;
+        assert_eq!(parts.status, StatusCode::INTERNAL_SERVER_ERROR);
+        let error = C2Error::from_wire_bytes(&body).unwrap().unwrap();
+        assert_eq!(error.code, ErrorCode::CallResultUnavailable);
+        assert_eq!(error.details["outcome"], "succeeded");
+        assert!(!error.details.contains_key("transport_phase"));
+        assert!(!error.details.contains_key("dispatch_phase"));
+
+        let (parts, body) = send("GET", OUTCOME_PATH, "grid", "key", "").await;
+        assert_eq!(parts.status, StatusCode::OK);
+        assert_eq!(parts.headers[header::CACHE_CONTROL], "no-store");
+        let outcome = c2_wire::rpc::WireCallOutcome::try_from(
+            serde_json::from_slice::<OutcomeJson<'_>>(&body).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            outcome,
+            c2_wire::rpc::WireCallOutcome::succeeded(
+                "ping".into(),
+                false,
+                Some(c2_wire::rpc::WireResultUnavailableReason::NotRetained),
+            )
+        );
+        let (parts, body) = send("GET", OUTCOME_PATH, "missing", "key", "").await;
+        assert_eq!(parts.status, StatusCode::NOT_FOUND);
+        assert_eq!(
+            C2Error::from_json_bytes(&body).unwrap().code,
+            ErrorCode::ResourceNotFound
+        );
+
+        shutdown_live_server(&server).await;
+        server_task.await.unwrap().unwrap();
     }
 
     async fn post_call(state: Arc<RelayState>, name: &str, method: &str) -> StatusCode {

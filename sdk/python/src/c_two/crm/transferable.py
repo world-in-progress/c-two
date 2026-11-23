@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import inspect
+import re
 import sys
 import warnings
+from dataclasses import dataclass, replace
 from functools import wraps
 from collections.abc import Iterator
 from typing import Any, Callable, Generic, ParamSpec, TYPE_CHECKING, TypeVar, get_type_hints, overload
@@ -24,6 +26,7 @@ from .payload_plan import (
 
 R = TypeVar("R")
 P = ParamSpec("P")
+_CALL_ID_PATTERN = re.compile(r"[A-Za-z0-9_-]{1,128}")
 
 if TYPE_CHECKING:
     from .stream import Stream
@@ -221,25 +224,76 @@ def hold(method: Callable[P, R]) -> Callable[P, HeldResult[R]]: ...
 
 def hold(method):
     """Retain one local response copy until the returned owner is released."""
+    return replace(_bound_call(method, "hold"), held=True).wrap()
 
-    if not callable(method):
-        raise TypeError(
-            f"cc.hold() requires a callable, got {type(method).__name__}",
-        )
-    self_obj = getattr(method, "__self__", None)
-    name = getattr(method, "__name__", None)
-    if self_obj is None or name is None:
-        raise TypeError(
-            "cc.hold() requires a bound CRM method, "
-            "e.g. cc.hold(grid.compute)",
-        )
 
-    @wraps(method)
-    def wrapper(*args, **kwargs):
-        kwargs["_c2_buffer"] = "hold"
-        return getattr(self_obj, name)(*args, **kwargs)
+def with_call_id(method: Callable[P, R], call_id: str) -> Callable[P, R]:
+    """Bind a deduplication key to one logical unary call."""
+    return _keyed_call(method, call_id, recover=False)
 
-    return wrapper
+
+def recover_call(method: Callable[..., R], call_id: str) -> Callable[[], R]:
+    """Attach to or replay a unary outcome. The returned callable takes no input."""
+    return _keyed_call(method, call_id, recover=True)
+
+
+def _validate_call_id(call_id: str) -> None:
+    if not isinstance(call_id, str) or _CALL_ID_PATTERN.fullmatch(call_id) is None:
+        raise ValueError("call_id must be 1 to 128 ASCII characters from [A-Za-z0-9_-]")
+
+
+@dataclass(frozen=True, slots=True)
+class _BoundCall:
+    method: Callable
+    held: bool = False
+    call_id: str | None = None
+    recover: bool = False
+
+    def wrap(self):
+        method = self.method
+        crm = method.__self__
+        if self.recover:
+            invoke = method.__func__._invoke_keyed
+
+            def wrapper():
+                return invoke(crm, (), {}, self)
+        else:
+            @wraps(method)
+            def wrapper(*args, **kwargs):
+                if self.call_id is not None:
+                    return method.__func__._invoke_keyed(crm, args, kwargs, self)
+                kwargs["_c2_buffer"] = "hold"
+                return getattr(crm, method.__name__)(*args, **kwargs)
+        wrapper._c2_bound_call = self
+        return wrapper
+
+
+def _bound_call(method, operation: str) -> _BoundCall:
+    modifiers = getattr(method, "_c2_bound_call", None)
+    if isinstance(modifiers, _BoundCall):
+        return modifiers
+    if callable(method) and getattr(method, "__self__", None) is not None and hasattr(method, "__name__"):
+        return _BoundCall(method)
+    raise TypeError(f"cc.{operation}() requires a bound CRM method")
+
+
+def _keyed_call(method, call_id: str, *, recover: bool):
+    from .methods import rpc_method_names
+
+    _validate_call_id(call_id)
+    operation = "recover_call" if recover else "with_call_id"
+    modifiers = _bound_call(method, operation)
+    bound = modifiers.method
+    if (
+        not inspect.ismethod(bound)
+        or not hasattr(bound.__func__, "_invoke_keyed")
+        or getattr(bound.__self__, "direction", None) != "->"
+        or bound.__name__ not in rpc_method_names(type(bound.__self__))
+    ):
+        raise TypeError(f"cc.{operation}() requires a unary CRM bound method")
+    if modifiers.call_id is not None and modifiers.recover != recover:
+        raise TypeError("cc.with_call_id() and cc.recover_call() cannot be combined")
+    return replace(modifiers, call_id=call_id, recover=recover).wrap()
 
 
 def transfer(*, input=None, output=None):
@@ -308,26 +362,87 @@ def _build_transfer_wrapper(
         else None
     )
 
-    def com_to_crm(*args, _c2_buffer=None, _c2_follow_budget=None):
+    def decode_response(response, client, _c2_buffer):
+        retained_owner = _c2_buffer == "hold" and has_scoped_output
+        view = None
+        decoded = False
+        decoding = False
+        owner_exports = 0
+        try:
+            native_response = _is_native_response_owner(response)
+            releasable_response = native_response or callable(getattr(response, "release", None))
+            if output_decoder is None:
+                _release_response(response)
+                return HeldResult(None) if _c2_buffer == "hold" else None
+            direct_native_decode = native_response and hasattr(response, "export_count")
+            if retained_owner or (releasable_response and not direct_native_decode):
+                view = memoryview(response)
+            exports_before = response.export_count if direct_native_decode else 0
+            decoding = True
+            result = output_decoder(
+                response if direct_native_decode else (view if view is not None else response)
+            )
+            decoding = False
+            decoded = True
+            if direct_native_decode:
+                owner_exports = max(0, response.export_count - exports_before)
+            if retained_owner:
+                if hasattr(response, "track_retained"):
+                    tracker = getattr(client, "local_copy_tracker", None)
+                    if tracker is not None:
+                        response.track_retained(
+                            tracker, getattr(client, "route_name", ""),
+                            method_name, "client_response",
+                        )
+                held = HeldResult(result, buffer=view, invalidate_cb=output_invalidate)
+                if native_response:
+                    held._native_response = response
+                    held._owner_exports = owner_exports
+                elif releasable_response:
+                    held._source_buffer = response
+                return held
+        except BaseException as exc:
+            if decoded and output_invalidate is not None:
+                _cleanup_preserving_primary(
+                    exc, lambda: _invalidate_and_release_held_response(
+                        view, response, output_invalidate, result, owner_exports,
+                    ),
+                )
+            elif output_decoder is not None:
+                _cleanup_preserving_primary(
+                    exc, lambda: _release_view_and_response(view, response),
+                )
+            raise _client_output_error(exc, decoding=decoding) from exc
+
+        if releasable_response:
+            try:
+                _release_decoded_response(
+                    view, response, output_invalidate, result, owner_exports,
+                )
+            except BaseException as exc:
+                raise _client_output_error(exc) from exc
+        return HeldResult(result) if _c2_buffer == "hold" else result
+
+    def com_to_crm(*args, _c2_buffer=None, _c2_follow_budget=None, client=None, call_id=None):
         prepared = None
         primary = None
         dispatched = False
-        retained_owner = _c2_buffer == "hold" and has_scoped_output
 
         if len(args) < 1:
             raise ValueError(
                 "Instance method requires self, but no instance was provided.",
             )
         crm = args[0]
-        client = crm.client
-        if _c2_follow_budget is not None:
-            client = client.resolve_for_call(_c2_follow_budget)
-        else:
-            following = getattr(client, '_following_local', None)
-            if following is not None:
-                target = following.target
-                if target is not None:
-                    client = client.snapshot_followed_target(target)
+        if client is None:
+            client = crm.client
+            if _c2_follow_budget is not None:
+                client = client.resolve_for_call(_c2_follow_budget)
+            else:
+                following = getattr(client, '_following_local', None)
+                if following is not None:
+                    target = following.target
+                    if target is not None:
+                        client = client.snapshot_followed_target(target)
         budget = _c2_follow_budget
 
         request = args[1:] if len(args) > 1 else None
@@ -364,9 +479,12 @@ def _build_transfer_wrapper(
             return HeldResult(result) if _c2_buffer == "hold" else result
 
         # Reserve before running Python serializer hooks; native preparation owns D.
-        prepare_call = getattr(client, "prepare_call", None)
-        if callable(prepare_call):
-            prepared = prepare_call(method_name)
+        if call_id is not None:
+            prepared = client._prepare_keyed_call(method_name, call_id)
+        else:
+            prepare_call = getattr(client, "prepare_call", None)
+            if callable(prepare_call):
+                prepared = prepare_call(method_name)
         try:
             if (
                 prepared is not None
@@ -413,64 +531,7 @@ def _build_transfer_wrapper(
                 if crm_scoped_input and isinstance(serialized_args, memoryview):
                     serialized_args.release()
 
-            view = None
-            decoded = False
-            decoding = False
-            owner_exports = 0
-            try:
-                native_response = _is_native_response_owner(response)
-                releasable_response = native_response or callable(getattr(response, "release", None))
-                if output_decoder is None:
-                    _release_response(response)
-                    return HeldResult(None) if _c2_buffer == "hold" else None
-                direct_native_decode = native_response and hasattr(response, "export_count")
-                if retained_owner or (releasable_response and not direct_native_decode):
-                    view = memoryview(response)
-                exports_before = response.export_count if direct_native_decode else 0
-                decoding = True
-                result = output_decoder(
-                    response if direct_native_decode else (view if view is not None else response)
-                )
-                decoding = False
-                decoded = True
-                if direct_native_decode:
-                    owner_exports = max(0, response.export_count - exports_before)
-                if retained_owner:
-                    if hasattr(response, "track_retained"):
-                        tracker = getattr(client, "local_copy_tracker", None)
-                        if tracker is not None:
-                            response.track_retained(
-                                tracker, getattr(client, "route_name", ""),
-                                method_name, "client_response",
-                            )
-                    held = HeldResult(result, buffer=view, invalidate_cb=output_invalidate)
-                    if native_response:
-                        held._native_response = response
-                        held._owner_exports = owner_exports
-                    elif releasable_response:
-                        held._source_buffer = response
-                    return held
-            except BaseException as exc:
-                if decoded and output_invalidate is not None:
-                    _cleanup_preserving_primary(
-                        exc, lambda: _invalidate_and_release_held_response(
-                            view, response, output_invalidate, result, owner_exports,
-                        ),
-                    )
-                elif output_decoder is not None:
-                    _cleanup_preserving_primary(
-                        exc, lambda: _release_view_and_response(view, response),
-                    )
-                raise _client_output_error(exc, decoding=decoding) from exc
-
-            if releasable_response:
-                try:
-                    _release_decoded_response(
-                        view, response, output_invalidate, result, owner_exports,
-                    )
-                except BaseException as exc:
-                    raise _client_output_error(exc) from exc
-            return HeldResult(result) if _c2_buffer == "hold" else result
+            return decode_response(response, client, _c2_buffer)
         except BaseException as exc:
             primary = exc
             raise
@@ -646,6 +707,34 @@ def _build_transfer_wrapper(
 
         return serialized_result
 
+    def invoke_client(args, kwargs, buffer, *, client=None, call_id=None):
+        if exact_arg_count is not None and not kwargs and len(args) == exact_arg_count:
+            # Exact positional calls need neither binding nor defaults.
+            values = args
+        else:
+            bound = method_signature.bind(*args, **kwargs)
+            bound.apply_defaults()
+            if bound.kwargs:
+                names = ", ".join(sorted(bound.kwargs))
+                raise TypeError(
+                    f"{method_name} cannot transport keyword-only arguments: {names}.",
+                )
+            values = bound.args
+        return com_to_crm(*values, _c2_buffer=buffer, client=client, call_id=call_id)
+
+    def invoke_keyed(crm, args, kwargs, modifiers):
+        from ..transport.client.proxy import CRMProxy
+
+        client = getattr(crm, "client", None)
+        if not isinstance(client, CRMProxy):
+            raise TypeError("keyed calls require a connected CRM instance")
+        target = client._outcome_target()
+        buffer = "hold" if modifiers.held else None
+        call_id = modifiers.call_id
+        if modifiers.recover:
+            return decode_response(target._recover_call(method_name, call_id), target, buffer)
+        return invoke_client((crm, *args), kwargs, buffer, client=target, call_id=call_id)
+
     @wraps(func)
     def transfer_wrapper(*args, **kwargs):
         if not args:
@@ -658,33 +747,14 @@ def _build_transfer_wrapper(
             )
 
         if crm.direction == "->":
-            c2_buffer = kwargs.pop("_c2_buffer", None)
-            if (
-                exact_arg_count is not None
-                and not kwargs
-                and len(args) == exact_arg_count
-            ):
-                # Exact positional call over an all-positional signature:
-                # binding and default application would be no-ops.
-                return com_to_crm(*args, _c2_buffer=c2_buffer)
-            bound = method_signature.bind(*args, **kwargs)
-            bound.apply_defaults()
-            if bound.kwargs:
-                names = ", ".join(sorted(bound.kwargs))
-                raise TypeError(
-                    f"{method_name} cannot transport keyword-only arguments: "
-                    f"{names}.",
-                )
-            return com_to_crm(
-                *bound.args,
-                _c2_buffer=c2_buffer,
-            )
+            return invoke_client(args, kwargs, kwargs.pop("_c2_buffer", None))
         if crm.direction == "<-":
             return crm_to_com(*args, **kwargs)
         raise ValueError(
             f"Invalid direction value: {crm.direction}. Expected '->' or '<-'.",
         )
 
+    transfer_wrapper._invoke_keyed = invoke_keyed
     transfer_wrapper._input_payload_binding = input
     transfer_wrapper._output_payload_binding = output
     return transfer_wrapper

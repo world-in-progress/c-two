@@ -903,6 +903,18 @@ impl HostOptions {
         self
     }
 
+    /// Limit the number of settled call outcomes retained across this Host's registrations.
+    pub fn with_outcome_max_entries(mut self, max_entries: usize) -> Self {
+        self.server.outcome_max_entries = c2_config::ConfigField::Set(max_entries);
+        self
+    }
+
+    /// Limit retained call result and error bytes. Zero retains only outcome metadata.
+    pub fn with_outcome_max_retained_bytes(mut self, bytes: u64) -> Self {
+        self.server.outcome_max_retained_bytes = c2_config::ConfigField::Set(bytes);
+        self
+    }
+
     /// Override the server domain's memory budget.
     pub fn with_memory_budget_bytes(mut self, bytes: u64) -> Self {
         self.server.domain_limits.memory_budget_bytes = c2_config::ConfigField::Set(bytes);
@@ -1779,6 +1791,11 @@ fn route_spec(definition: &ServiceDefinition) -> Result<RouteBuildSpec, Error> {
     })
 }
 
+fn callback_error(mut error: C2Error) -> CrmError {
+    crate::strip_callback_error_phases(&mut error);
+    CrmError::UserError(error.to_wire_bytes())
+}
+
 struct CoreCallback {
     service: Arc<dyn EncodedService>,
 }
@@ -1794,7 +1811,7 @@ impl CrmCallback for CoreCallback {
         self.service
             .invoke(method_idx, request)
             .map(ResponseMeta::Inline)
-            .map_err(|error| CrmError::UserError(error.to_wire_bytes()))
+            .map_err(callback_error)
     }
 
     fn invoke_recycled(
@@ -1807,7 +1824,7 @@ impl CrmCallback for CoreCallback {
         self.service
             .invoke_into(index, request, &ResponseSink { pool })
             .map(EncodedResponse::into_meta)
-            .map_err(|error| CrmError::UserError(error.to_wire_bytes()))
+            .map_err(callback_error)
     }
 }
 
@@ -1826,7 +1843,7 @@ impl CrmCallback for CoreStreamCallback {
         self.service
             .invoke(index, request)
             .map(ResponseMeta::Inline)
-            .map_err(|error| CrmError::UserError(error.to_wire_bytes()))
+            .map_err(callback_error)
     }
 
     fn invoke_recycled(
@@ -1839,7 +1856,7 @@ impl CrmCallback for CoreStreamCallback {
         self.service
             .invoke_into(index, request, &ResponseSink { pool })
             .map(EncodedResponse::into_meta)
-            .map_err(|error| CrmError::UserError(error.to_wire_bytes()))
+            .map_err(callback_error)
     }
 }
 
@@ -1854,7 +1871,7 @@ impl CrmStreamCallback for CoreStreamCallback {
         self.service
             .open_stream(index, request)
             .map(|stream| Box::new(CoreStream(stream)) as Box<dyn CrmStream>)
-            .map_err(|error| CrmError::UserError(error.to_wire_bytes()))
+            .map_err(callback_error)
     }
 
     fn open_stream_recycled(
@@ -1867,7 +1884,7 @@ impl CrmStreamCallback for CoreStreamCallback {
         self.service
             .open_stream_recycled(index, request)
             .map(|stream| Box::new(CoreStream(stream)) as Box<dyn CrmStream>)
-            .map_err(|error| CrmError::UserError(error.to_wire_bytes()))
+            .map_err(callback_error)
     }
 }
 
@@ -1878,13 +1895,11 @@ impl CrmStream for CoreStream {
         self.0
             .step()
             .map(|item| item.map(|item| Box::new(CoreStreamItem(item)) as Box<dyn CrmStreamItem>))
-            .map_err(|error| CrmError::UserError(error.to_wire_bytes()))
+            .map_err(callback_error)
     }
 
     fn finish(self: Box<Self>) -> Result<(), CrmError> {
-        self.0
-            .finish()
-            .map_err(|error| CrmError::UserError(error.to_wire_bytes()))
+        self.0.finish().map_err(callback_error)
     }
 }
 
@@ -1897,7 +1912,7 @@ impl CrmStreamItem for CoreStreamItem {
     fn write_range(&self, offset: usize, destination: &mut [u8]) -> Result<(), CrmError> {
         self.0
             .write_range(offset, destination)
-            .map_err(|error| CrmError::UserError(error.to_wire_bytes()))
+            .map_err(callback_error)
     }
 }
 

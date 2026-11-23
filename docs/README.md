@@ -32,7 +32,7 @@ This page routes each subject to the document that owns it. It states no behavio
 | [Python usage](reference/python-usage.md) ([中文](reference/python-usage.zh-CN.md)) | CRM contracts, resources, clients, server streams, Runtime, hold, FastDB payloads and observation from Python |
 | [Rust SDK](../sdk/rust/README.md) | User-facing `c_two` Rust facade, `RuntimeOptions`/`HostOptions`, server streams, `Held` and lifecycle diagnostics |
 | [c3 CLI](../cli/README.md) | Standalone `c3 relay`, `c3 registry`, `c3 endpoint` maintenance and `c3 contract` codegen commands |
-| [Node / TypeScript binding](../core/foundation/c2-mem-ffi/bindings/typescript/README.md) | `@c-two/c2-mem-ffi` connector, ABI 9 endpoint/call/subscription APIs, `NativeBuffer` and Node build checks |
+| [Node / TypeScript binding](../core/foundation/c2-mem-ffi/bindings/typescript/README.md) | `@c-two/c2-mem-ffi` connector, ABI 10 endpoint, call, outcome and subscription APIs, `NativeBuffer` and Node build checks |
 | [Configuration](reference/configuration.md) ([中文](reference/configuration.zh-CN.md)) | Every setting, its environment variable and default, precedence, call deadlines and endpoint directories |
 | [Windows usage](reference/windows-native-usage.md) ([中文](reference/windows-native-usage.zh-CN.md)) | Installing and building on Windows x64 and ARM64 |
 | [Contracts and routing](reference/contracts-and-routing.md) | Contract identity, portable contracts, route catalogs and bindings, relay discovery, forwarding and trust |
@@ -70,6 +70,7 @@ The dated plans and reviews in `design/` belong to work still in progress; each 
 | [0003](decisions/0003-server-streams.md) | Server streams: call records, receiver-granted credit, contract mode and stream ending |
 | [0004](decisions/0004-route-name-identity.md) | Route name as the one identity of a resource's state |
 | [0005](decisions/0005-publish-subscribe.md) | Resource-scoped publish/subscribe: 1-to-N single-write multi-loan SHM and relay fan-out |
+| [0006](decisions/0006-post-dispatch-outcome-and-dedup.md) | Post-dispatch call outcome query and idempotent deduplication for unary calls |
 
 ## Records
 

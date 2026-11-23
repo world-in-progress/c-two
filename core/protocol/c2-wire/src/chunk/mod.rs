@@ -18,14 +18,24 @@ pub use registry::{ChunkRegistry, ChunkRequest, GcStats};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChunkAdmissionError {
     Protocol(String),
-    Duplicate { conn_id: u64, request_id: u64 },
+    Duplicate {
+        conn_id: u64,
+        request_id: u64,
+    },
     Capacity(String),
+    /// Releasing this much shared role memory could admit the assembly.
+    MemoryPressure {
+        needed_bytes: u64,
+        message: String,
+    },
 }
 
 impl std::fmt::Display for ChunkAdmissionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Protocol(message) | Self::Capacity(message) => f.write_str(message),
+            Self::Protocol(message)
+            | Self::Capacity(message)
+            | Self::MemoryPressure { message, .. } => f.write_str(message),
             Self::Duplicate {
                 conn_id,
                 request_id,

@@ -106,6 +106,7 @@ pub struct RelayState {
     /// accounting; this domain is the relay process's own, never a
     /// process-global cache.
     domain_budget: DomainBudget,
+    pub(crate) outcome_queries: tokio::sync::Semaphore,
     pub(crate) forwarding: crate::relay::forwarding::ForwardingDomain,
     pub(crate) topics: crate::relay::topic_hub::TopicHubTable,
     #[cfg(feature = "test-support")]
@@ -259,6 +260,9 @@ impl RelayState {
             endpoint_context,
             default_endpoint_namespace,
             domain_budget: budget.clone(),
+            outcome_queries: tokio::sync::Semaphore::new(
+                budget.snapshot().operations.max_operations.clamp(1, 64) as usize,
+            ),
             forwarding: crate::relay::forwarding::ForwardingDomain::new(budget),
             topics: crate::relay::topic_hub::TopicHubTable::default(),
             #[cfg(feature = "test-support")]

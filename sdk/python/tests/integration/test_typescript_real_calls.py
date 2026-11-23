@@ -640,7 +640,7 @@ def test_typescript_real_connector_version_mismatch(
           await assert.rejects(transport.prepare('version', contract.CONTRACT), (error) => {
             assert.ok(error instanceof contract.C2IpcTransportError);
             assert.equal(error.category, 'protocol_version_mismatch');
-            assert.equal(error.localProtocolVersion, 17);
+            assert.equal(error.localProtocolVersion, 18);
             assert.equal(error.peerProtocolVersion, 16);
             return true;
           });

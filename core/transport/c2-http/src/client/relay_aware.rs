@@ -9,7 +9,7 @@ use parking_lot::Mutex;
 use serde_json::json;
 
 use super::call_control::check_active;
-use super::http_client::HttpCallInput;
+use super::http_client::{HttpCallInput, HttpUnaryMode};
 use super::{
     HttpCallControl, HttpClientPool, HttpError, HttpInputOwner, HttpResponseStream,
     HttpStreamCancellation, RelayControlClient, RelayResolvedRoutes, RelayRouteInfo,
@@ -254,7 +254,80 @@ impl RelayAwareHttpClient {
         data: HttpInputOwner,
         control: &HttpCallControl,
     ) -> Result<BudgetedBuffer, HttpCallError> {
-        self.call_inner_async(method_name, HttpCallInput::Owned(data), Some(control))
+        self.call_inner_async(
+            method_name,
+            HttpCallInput::Owned(data),
+            Some(control),
+            HttpUnaryMode::Plain,
+        )
+        .await
+        .map_err(|source| HttpCallError::new(http_call_error_phase(&source), source))
+    }
+
+    /// Submit a keyed unary call to the already selected source relay.
+    pub async fn call_keyed_controlled_async(
+        &self,
+        method: &str,
+        call_id: &str,
+        data: HttpInputOwner,
+        control: &HttpCallControl,
+    ) -> Result<BudgetedBuffer, HttpCallError> {
+        self.call_inner_async(
+            method,
+            HttpCallInput::Owned(data),
+            Some(control),
+            HttpUnaryMode::Keyed(call_id),
+        )
+        .await
+        .map_err(|source| HttpCallError::new(http_call_error_phase(&source), source))
+    }
+
+    /// Attach to or replay an existing unary call via its source relay.
+    pub async fn recover_call_controlled_async(
+        &self,
+        method: &str,
+        call_id: &str,
+        control: &HttpCallControl,
+    ) -> Result<BudgetedBuffer, HttpCallError> {
+        self.call_inner_async(
+            method,
+            HttpCallInput::Borrowed(&[]),
+            Some(control),
+            HttpUnaryMode::Recover(call_id),
+        )
+        .await
+        .map_err(|source| HttpCallError::new(http_call_error_phase(&source), source))
+    }
+
+    /// Read the source relay's outcome snapshot using independent control admission.
+    pub async fn query_call_async(
+        &self,
+        call_id: &str,
+    ) -> Result<c2_wire::rpc::WireCallOutcome, HttpCallError> {
+        let query = async {
+            c2_config::validate_call_id(call_id).map_err(HttpError::InvalidInput)?;
+            let _permit = self
+                .payload_budget
+                .reserve_control_operation()
+                .map_err(|error| {
+                    let code = if error.reason == c2_mem::RetentionRejectReason::Closed {
+                        c2_error::ErrorCode::ResourceClosed
+                    } else {
+                        c2_error::ErrorCode::CallCapacityExceeded
+                    };
+                    HttpError::LocalCallRejected(c2_error::C2Error::new(
+                        code,
+                        "relay query admission refused",
+                    ))
+                })?;
+            let target = self.selected_http_target()?;
+            let client = self.acquire_route_client(&target.relay_url, None)?;
+            client
+                .client
+                .query_call_route_async(&self.expected, call_id)
+                .await
+        };
+        query
             .await
             .map_err(|source| HttpCallError::new(http_call_error_phase(&source), source))
     }
@@ -546,9 +619,14 @@ impl RelayAwareHttpClient {
         method_name: &str,
         data: &[u8],
     ) -> Result<Vec<u8>, HttpError> {
-        self.call_inner_async(method_name, HttpCallInput::Borrowed(data), None)
-            .await
-            .map(|buffer| buffer.into_parts().0)
+        self.call_inner_async(
+            method_name,
+            HttpCallInput::Borrowed(data),
+            None,
+            HttpUnaryMode::Plain,
+        )
+        .await
+        .map(|buffer| buffer.into_parts().0)
     }
 
     async fn call_inner_async(
@@ -556,6 +634,7 @@ impl RelayAwareHttpClient {
         method_name: &str,
         data: HttpCallInput<'_>,
         control: Option<&HttpCallControl>,
+        mode: HttpUnaryMode<'_>,
     ) -> Result<BudgetedBuffer, HttpError> {
         let budget = control
             .and_then(HttpCallControl::payload_budget)
@@ -565,7 +644,7 @@ impl RelayAwareHttpClient {
         let client = self.acquire_route_client(&target.relay_url, control)?;
         client
             .client
-            .call_route_async(&self.expected, method_name, data, budget, control)
+            .call_route_async(&self.expected, method_name, data, budget, control, mode)
             .await
     }
 
@@ -2564,6 +2643,52 @@ mod tests {
         registry_handle.abort();
         stale_handle.abort();
         live_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn old_relay_outcome_404_is_an_uncertain_protocol_failure() {
+        let (url, server) = spawn_app(
+            Router::new()
+                .route("/_probe/{route}", get(|| async { StatusCode::OK }))
+                .route("/{route}/{method}", post(live_call)),
+        )
+        .await;
+        // Model discovery pointing at an older relay with only two-segment calls.
+        let state = RegistryState {
+            stale_url: url.clone(),
+            live_url: url,
+            resolve_count: Arc::new(AtomicUsize::new(0)),
+        };
+        let (registry, registry_task) = spawn_app(
+            Router::new()
+                .route("/_resolve/{name}", get(registry_resolve))
+                .with_state(state),
+        )
+        .await;
+        let client =
+            RelayAwareHttpClient::new(&registry, expected_contract(), false, Default::default())
+                .unwrap();
+        acquire_http(&client).await;
+        let control = HttpCallControl::new(|| Ok(()), || Ok(()));
+        let submit = client
+            .call_keyed_controlled_async("step", "key", Arc::new(b"input".to_vec()), &control)
+            .await
+            .unwrap_err();
+        let recover = client
+            .recover_call_controlled_async("step", "key", &control)
+            .await
+            .unwrap_err();
+        let query = client.query_call_async("key").await.unwrap_err();
+        for error in [submit, recover, query] {
+            assert_eq!(error.phase(), HttpCallPhase::DispatchUncertain);
+            assert!(!route_not_found(error.source_error()));
+            assert!(!terminal_route_refusal(error.source_error()));
+            assert!(
+                matches!(error.into_source(), HttpError::Transport(message) if message.contains("HTTP 404"))
+            );
+        }
+        registry_task.abort();
+        server.abort();
     }
 
     #[tokio::test]

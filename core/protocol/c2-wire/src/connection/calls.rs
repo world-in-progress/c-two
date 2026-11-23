@@ -81,6 +81,28 @@ impl<T> CallRecord<T> {
                 }
             })
     }
+
+    /// Finish a call that replayed or attached to an existing Host outcome
+    /// without entering resource execution on this connection. Competes
+    /// atomically with `reject_before_execution` so at most one terminal
+    /// record is ever emitted for this connection call.
+    pub fn finish_replayed(&self, status: CallStatus) -> Option<CallStatus> {
+        let mut phase = self.phase.load(Ordering::Acquire);
+        loop {
+            if phase != CallPhase::PreparingInput as u8 && phase != CallPhase::Queued as u8 {
+                return None;
+            }
+            match self.phase.compare_exchange_weak(
+                phase,
+                CallPhase::Ending as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Some(status),
+                Err(current) => phase = current,
+            }
+        }
+    }
 }
 
 pub enum CallLookup<T> {

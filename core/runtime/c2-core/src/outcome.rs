@@ -73,3 +73,51 @@ impl ShutdownOutcome {
         }
     }
 }
+
+/// Snapshot of one keyed unary call in the current Host registration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallOutcome {
+    pub status: CallOutcomeStatus,
+    pub method_name: Option<String>,
+    pub result_available: bool,
+    pub result_unavailable_reason: Option<ResultUnavailableReason>,
+    pub error_code: Option<c2_error::ErrorCode>,
+    pub error_details_available: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CallOutcomeStatus {
+    /// Includes calls whose pending input can still be withdrawn.
+    InFlight,
+    Succeeded,
+    Failed,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ResultUnavailableReason {
+    NotRetained,
+    Evicted,
+}
+
+impl From<c2_wire::rpc::WireCallOutcome> for CallOutcome {
+    fn from(wire: c2_wire::rpc::WireCallOutcome) -> Self {
+        use c2_wire::rpc::{WireCallOutcomeStatus, WireResultUnavailableReason};
+        Self {
+            status: match wire.status {
+                WireCallOutcomeStatus::InFlight => CallOutcomeStatus::InFlight,
+                WireCallOutcomeStatus::Succeeded => CallOutcomeStatus::Succeeded,
+                WireCallOutcomeStatus::Failed => CallOutcomeStatus::Failed,
+                WireCallOutcomeStatus::Unknown => CallOutcomeStatus::Unknown,
+            },
+            method_name: wire.method_name,
+            result_available: wire.result_available,
+            result_unavailable_reason: wire.result_unavailable_reason.map(|reason| match reason {
+                WireResultUnavailableReason::NotRetained => ResultUnavailableReason::NotRetained,
+                WireResultUnavailableReason::Evicted => ResultUnavailableReason::Evicted,
+            }),
+            error_code: wire.error_code,
+            error_details_available: wire.error_details_available,
+        }
+    }
+}

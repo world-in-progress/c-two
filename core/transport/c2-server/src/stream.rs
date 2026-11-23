@@ -488,10 +488,17 @@ pub(super) async fn dispatch_stream_call(
     let ChunkRouteAdmission {
         route,
         method_idx,
-        mut pending_permit,
+        pending_permit,
+        keyed,
         _flight,
     } = admission;
+    debug_assert!(
+        keyed.is_none(),
+        "stream methods never carry keyed bookkeeping"
+    );
     let _call_owners = _flight;
+    let mut pending_permit =
+        pending_permit.expect("stream admission carries its route permit");
     let slot = pending_permit.retain_call_slot();
     if conn.is_work_cancelled() {
         return;

@@ -12,6 +12,7 @@ pub(crate) fn core_error_to_py(error: Error) -> PyErr {
     // The Core authority classifies the dispatch phase once; Python only
     // reads the projected `_transport_phase` slot.
     let phase = phase_str(error.transport_phase());
+    let call_id = error.call_id().map(str::to_owned);
     match error {
         mismatch @ Error::ProtocolVersionMismatch { local, peer } => local_error(
             "protocol_version_mismatch",
@@ -32,6 +33,9 @@ pub(crate) fn core_error_to_py(error: Error) -> PyErr {
                 set_io_cause(value, None);
                 set_semantic_error(value, &error, phase, true);
                 set_attr(value, "_transport_phase", phase);
+                if let Some(call_id) = call_id {
+                    set_attr(value, "_call_id", call_id);
+                }
             });
             exception
         }
@@ -55,6 +59,9 @@ pub(crate) fn core_error_to_py(error: Error) -> PyErr {
                     set_attr(value, "transport_kind", kind);
                     set_attr(value, "_transport_phase", phase);
                     set_attr(value, "fallback_eligible", fallback_eligible);
+                    if let Some(call_id) = call_id {
+                        set_attr(value, "_call_id", call_id);
+                    }
                     if let Some(semantic) = error.semantic_error() {
                         set_semantic_error(value, &semantic, phase, false);
                     }
@@ -254,11 +261,13 @@ mod tests {
 
     #[test]
     fn protocol_version_error_uses_public_class_and_typed_fields() {
+        use c2_wire::handshake::HANDSHAKE_VERSION;
+
         Python::initialize();
         Python::attach(|py| {
             let error = core_error_to_py(Error::ProtocolVersionMismatch {
-                local: 15,
-                peer: 14,
+                local: HANDSHAKE_VERSION,
+                peer: HANDSHAKE_VERSION - 1,
             });
             let value = error.value(py);
             let class = py
@@ -278,8 +287,8 @@ mod tests {
                 );
             }
             for (name, expected) in [
-                ("local_protocol_version", 15_u32),
-                ("peer_protocol_version", 14),
+                ("local_protocol_version", HANDSHAKE_VERSION),
+                ("peer_protocol_version", HANDSHAKE_VERSION - 1),
             ] {
                 assert_eq!(
                     value.getattr(name).unwrap().extract::<u32>().unwrap(),

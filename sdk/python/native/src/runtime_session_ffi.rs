@@ -1181,6 +1181,8 @@ impl PyRuntimeSession {
         memory_budget_bytes: &Bound<'_, PyAny>,
         file_spill_budget_bytes: &Bound<'_, PyAny>,
         max_outstanding_calls: &Bound<'_, PyAny>,
+        outcome_max_entries: &Bound<'_, PyAny>,
+        outcome_max_retained_bytes: &Bound<'_, PyAny>,
     ) -> PyResult<()> {
         let patch = ServerConfigPatch {
             server_id: config_field(server_id, unset, |value| value.extract())?,
@@ -1192,6 +1194,12 @@ impl PyRuntimeSession {
             })?,
             max_execution_workers: config_field(max_execution_workers, unset, |value| {
                 config_uint(value, "max_execution_workers")
+            })?,
+            outcome_max_entries: config_field(outcome_max_entries, unset, |value| {
+                config_uint(value, "outcome_max_entries")
+            })?,
+            outcome_max_retained_bytes: config_field(outcome_max_retained_bytes, unset, |value| {
+                config_uint(value, "outcome_max_retained_bytes")
             })?,
             domain_limits: domain_limits_patch(
                 unset,

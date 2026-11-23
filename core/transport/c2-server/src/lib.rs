@@ -2,6 +2,7 @@ mod admission;
 pub mod config;
 pub mod connection;
 mod dispatcher;
+mod outcome;
 pub mod response;
 pub mod runtime;
 mod scheduler;

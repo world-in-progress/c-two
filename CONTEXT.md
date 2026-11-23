@@ -130,6 +130,14 @@ _Avoid_: call id, trace id
 The random value a relay gives at the start of one forwarded call's response. A client uses it only to cancel that call while the relay is still forwarding it; it is not a query or replay handle.
 _Avoid_: call id, session token
 
+**调用标识 / call ID**:
+The client-supplied key (`1..=128` ASCII bytes `[A-Za-z0-9_-]`) attached to a unary call so repeated submissions, queries and recovery requests refer to the same logical operation across reconnects and client processes within one registration. Distinct from a call locator (error diagnostic only) and a call token (relay in-flight stream cancellation only).
+_Avoid_: request id (wire-level per-connection ID), trace id, idempotency token
+
+**调用结局 / call outcome**:
+The authoritative status snapshot (`in_flight`, `succeeded`, `failed` or `unknown`) a Host registration records for a keyed unary call and returns from `query_call`. Distinct from call terminal outcome, which names only the final result of one completed execution.
+_Avoid_: call result (when `in_flight` or `unknown` is meant), execution log
+
 **主题 / topic**:
 A resource-scoped 1-to-N publication channel declared on a CRM contract (`"topics"` in `c-two.contract.v2`) with zero input and one output payload type.
 _Avoid_: channel, event stream, broadcast method

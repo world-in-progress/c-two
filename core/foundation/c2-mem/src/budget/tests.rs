@@ -573,6 +573,32 @@ fn subscription_slot_guard_preserves_control_headroom_without_blocking_n1() {
 }
 
 #[test]
+fn control_operation_uses_independent_capacity_and_releases_its_slot() {
+    let budget = domain(8, 0, 1);
+    let business = budget.reserve_operation().unwrap();
+    let control = budget.reserve_control_operation().unwrap();
+    assert_eq!(budget.snapshot().operations.used_operations, 1);
+    assert_eq!(
+        budget.clone().reserve_control_operation().unwrap_err(),
+        RetentionError {
+            reason: RetentionRejectReason::LimitReached,
+            used_operations: 1,
+            max_operations: 1,
+        },
+    );
+    drop(control);
+    assert_eq!(budget.snapshot().operations.used_operations, 1);
+    let control = budget.reserve_control_operation().unwrap();
+    drop(business);
+    budget.close_operations();
+    drop(control);
+    assert_eq!(
+        budget.reserve_control_operation().unwrap_err().reason,
+        RetentionRejectReason::Closed,
+    );
+}
+
+#[test]
 fn warm_pool_reuses_the_smallest_matching_capacity() {
     let size = WARM_BUFFER_MIN_BYTES;
     let budget = domain((size * 8) as u64, 0, 0);

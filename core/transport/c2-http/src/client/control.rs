@@ -293,9 +293,15 @@ impl RelayControlClient {
     ) -> Result<RelayResolvedRoutes, HttpError> {
         c2_contract::validate_expected_route_contract(expected)
             .map_err(|err| HttpError::InvalidInput(err.to_string()))?;
+        let route = encode_segment(&expected.route_name);
+        // The URL parser normalizes dot segments even when percent-encoded.
+        let prefix = if matches!(expected.route_name.as_str(), "." | "..") {
+            format!("/_resolve?route={route}&")
+        } else {
+            format!("/_resolve/{route}?")
+        };
         let path = format!(
-            "/_resolve/{}?crm_ns={}&crm_name={}&crm_ver={}&abi_hash={}&signature_hash={}",
-            encode_segment(&expected.route_name),
+            "{prefix}crm_ns={}&crm_name={}&crm_ver={}&abi_hash={}&signature_hash={}",
             encode_segment(&expected.crm_ns),
             encode_segment(&expected.crm_name),
             encode_segment(&expected.crm_ver),

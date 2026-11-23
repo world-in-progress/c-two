@@ -1,4 +1,4 @@
-//! End-to-end direct IPC 17 publish/subscribe (ADR 0005) through the public
+//! End-to-end direct IPC publish/subscribe (ADR 0005) through the public
 //! Rust SDK: the typed `Publisher` / `Subscription` / `Delivery` owners, and
 //! generated topic contracts compiled by `c2-codegen` at test time.
 
@@ -307,7 +307,7 @@ fn remote_decode_deadline_preserves_the_original_topic_subscription() {
     }
 }
 
-// The typed owners over a real direct IPC 17 connection and over the
+// The typed owners over a real direct IPC connection and over the
 // same-process local subscription seam: Delivery / Delivery<Held<T>>,
 // Latest/Next, publisher closure after unregister, and holds that outlive
 // their subscription.
@@ -418,12 +418,12 @@ fn write_consumer_manifest(temp: &Path, repository: &Path) {
     std::fs::copy(repository.join("core/Cargo.lock"), temp.join("Cargo.lock")).unwrap();
 }
 
-// Generated topic contracts end to end over IPC 17: typed subscribe methods,
+// Generated topic contracts end to end over IPC: typed subscribe methods,
 // TopicService capacity and atomic initial state, typed publishers, lag
 // Skip/Error(720), unregister 718 followed by automatic re-registration, and
 // a topics-only contract.
 #[test]
-fn generated_topic_contract_end_to_end_over_ipc17() {
+fn generated_topic_contract_end_to_end_over_ipc() {
     let repository = repository();
     let temp = tempfile::tempdir().unwrap();
     let mixed_release = topic_release(&["state", "ticks"], false);
@@ -472,8 +472,8 @@ const CONSUMER: &str = r##"
 
 use c_two::generated::ErrorCode;
 use c_two::{
-    Connect, Error, Held, HostOptions, LagPolicy, Runtime, RuntimeOptions, SubscribeOptions,
-    TopicStart,
+    CallOutcomeStatus, CallTimeout, Connect, Error, Held, HostOptions, LagPolicy, Runtime,
+    RuntimeOptions, SubscribeOptions, TopicStart, UnaryCallOptions,
 };
 
 #[path = "../generated-mixed/rust/c_two_contract.rs"]
@@ -565,6 +565,13 @@ fn main() {
 
         // Unary methods still work next to topic subscriptions.
         assert_eq!(text(&client.method_1_echo(&payload("ctrl")).unwrap()), "ctrl");
+        let options = UnaryCallOptions::new().with_call_id("mixed-echo").unwrap();
+        let mut original = client.hold_method_1_echo_with_options(&payload("keyed"), options).unwrap();
+        let outcome = client.query_call("mixed-echo", CallTimeout::Inherit).unwrap();
+        assert_eq!(outcome.status, CallOutcomeStatus::Succeeded);
+        let replay = client.recover_hold_method_1_echo("mixed-echo", CallTimeout::Inherit).unwrap();
+        original.release().unwrap();
+        assert_eq!(text(replay.value().unwrap()), "keyed");
 
         let publishers = mixed::registration_topics(&registration);
         let publisher = publishers.topic_0_state().unwrap();

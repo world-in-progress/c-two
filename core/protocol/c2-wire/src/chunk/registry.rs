@@ -476,7 +476,9 @@ impl<C> ChunkRegistry<C> {
         Ok(())
     }
 
-    /// Allocate only for this already-published call record.
+    /// Allocate only for this already-published call record. Memory pressure
+    /// leaves its reservation intact so the caller can release capacity and
+    /// retry with the same token, or settle it if admission is abandoned.
     pub fn allocate_request(
         &self,
         request: &ChunkRequest<C>,
@@ -659,7 +661,15 @@ impl<C> ChunkRegistry<C> {
             ) {
                 Ok(assembler) => assembler,
                 Err(error) => {
-                    self.remove_if_unobserved((conn_id, request_id), &entry);
+                    if !matches!(
+                        (expected, &error),
+                        (
+                            StorageState::Reserved,
+                            ChunkAdmissionError::MemoryPressure { .. }
+                        )
+                    ) {
+                        self.remove_if_unobserved((conn_id, request_id), &entry);
+                    }
                     return Err((error, context));
                 }
             };
@@ -1346,6 +1356,78 @@ mod tests {
             assert_eq!(admission, 42);
             assert_eq!(assembly.finish().unwrap().copy_bytes().unwrap(), &[5; 32]);
             drop(completed);
+            assert_eq!(charged_bytes(&budget), 0);
+        }
+    }
+
+    #[test]
+    fn memory_pressure_keeps_the_original_reservation_until_retry_or_disconnect() {
+        const CHUNK: usize = 32 * 1024;
+        const MEMORY: u64 = 256 * 1024;
+        for disconnect in [false, true] {
+            let budget = domain(MEMORY, 0);
+            let pool = Arc::new(RwLock::new(
+                MemPool::new_with_prefix_and_budget(
+                    PoolConfig {
+                        pool_enabled: false,
+                        spill_threshold: 1.0,
+                        ..base_config()
+                    },
+                    unique_prefix("retry"),
+                    budget.clone(),
+                )
+                .unwrap(),
+            ));
+            let registry = ChunkRegistry::new(pool, ChunkConfig::default());
+            let request = registry.begin_frame(1, 11);
+            registry.prepare_request(&request, 41).unwrap();
+            let held = budget.try_reserve_memory(MEMORY - CHUNK as u64).unwrap();
+            let allocate = |request: &ChunkRequest<u8>| {
+                registry.allocate_request(request, 2 * CHUNK as u64, 2, CHUNK)
+            };
+            assert!(matches!(
+                allocate(&request),
+                Err(ChunkAdmissionError::MemoryPressure { needed_bytes, .. })
+                    if needed_bytes == CHUNK as u64 + 2
+            ));
+            assert!(!request.storage_retired());
+            assert_eq!(registry.active_count(), 0);
+
+            // The copy worker is between attempts. A disconnect can retire
+            // its original reservation independently of the worker.
+            if disconnect {
+                thread::scope(|scope| {
+                    scope
+                        .spawn(|| registry.cleanup_connection(1))
+                        .join()
+                        .unwrap()
+                });
+                assert!(request.storage_retired());
+            }
+            drop(held);
+
+            let usable = if disconnect {
+                let new_request = registry.begin_frame(1, 11);
+                registry.prepare_request(&new_request, 42).unwrap();
+                let before = budget.snapshot();
+                assert!(matches!(
+                    allocate(&request),
+                    Err(ChunkAdmissionError::Duplicate {
+                        conn_id: 1,
+                        request_id: 11
+                    })
+                ));
+                assert_eq!(budget.snapshot(), before);
+                new_request
+            } else {
+                request
+            };
+            allocate(&usable).unwrap();
+            assert!(!registry.feed_request(&usable, 0, &vec![1; CHUNK]).unwrap());
+            assert!(registry.feed_request(&usable, 1, &vec![2; CHUNK]).unwrap());
+            let (assembler, context) = registry.take_request(&usable).unwrap();
+            assert_eq!(context, if disconnect { 42 } else { 41 });
+            drop(assembler);
             assert_eq!(charged_bytes(&budget), 0);
         }
     }
@@ -3096,7 +3178,13 @@ mod tests {
         let hold = budget.try_reserve_memory(1).unwrap();
         let error = raw_reply(&reg, 1, 128, 2, 64).unwrap_err();
         drop(hold);
-        assert!(matches!(error, ChunkAdmissionError::Capacity(_)));
+        assert!(matches!(
+            error,
+            ChunkAdmissionError::MemoryPressure {
+                needed_bytes: 1,
+                ..
+            }
+        ));
         assert!(
             error.to_string().contains("tracking metadata"),
             "error must name the metadata: {error}"

@@ -297,6 +297,74 @@ impl SyncClient {
             .await
     }
 
+    /// Send an optionally keyed owned request on the pooled connection.
+    pub async fn call_bound_owned_with_key_controlled_async_phased<B>(
+        &self,
+        binding: &RouteBinding,
+        method_name: &str,
+        data: B,
+        call_id: Option<&str>,
+        control: &IpcCallControl,
+    ) -> Result<ResponseData, IpcCallError>
+    where
+        B: AsRef<[u8]> + Send + 'static,
+    {
+        self.inner
+            .call_bound_owned_with_key_controlled_phased(
+                binding,
+                method_name,
+                data,
+                call_id,
+                control,
+            )
+            .await
+    }
+
+    /// Send an optionally keyed request from its writable SHM owner.
+    pub async fn call_bound_slab_with_key_controlled_async_phased(
+        &self,
+        binding: &RouteBinding,
+        method_name: &str,
+        slab: c2_mem::WritableSlab,
+        call_id: Option<&str>,
+        control: &IpcCallControl,
+    ) -> Result<ResponseData, IpcCallError> {
+        self.inner
+            .call_bound_slab_with_key_controlled_phased(
+                binding,
+                method_name,
+                slab,
+                call_id,
+                control,
+            )
+            .await
+    }
+
+    /// Recover a unary response through the same pooled connection.
+    pub async fn recover_call_bound_controlled_async_phased(
+        &self,
+        binding: &RouteBinding,
+        method_name: &str,
+        call_id: &str,
+        control: &IpcCallControl,
+    ) -> Result<ResponseData, IpcCallError> {
+        self.inner
+            .recover_call_bound_controlled_phased(binding, method_name, call_id, control)
+            .await
+    }
+
+    /// Query the current registration without a business slot or nested runtime.
+    pub async fn query_call_async(
+        &self,
+        binding: &RouteBinding,
+        call_id: &str,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<c2_wire::rpc::WireCallOutcome, IpcError> {
+        self.inner
+            .query_call_with_deadline(binding, call_id, deadline)
+            .await
+    }
+
     pub fn try_alloc_request_slab(
         &self,
         data_size: usize,

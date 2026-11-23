@@ -30,6 +30,18 @@ Use `cc.observe.connection_events()` for one cancellable, bounded stream of inco
 
 ## Development
 
+Current source builds use IPC 18. Build c3 and each communicating SDK from matching sources when testing this checkout.
+
+### Keyed unary calls
+
+Use a stable operation key with `cc.with_call_id(proxy.step, call_id)(args)`. Within the current registration, the Host attaches a duplicate submission to the original call or replays its outcome when the method and encoded input match. A conflicting method or input raises code 721.
+
+If a call raises an exception with `transport_phase == 'dispatch_uncertain'`, `err.call_id` gives the key of the operation. Use `cc.query_call(proxy, call_id, timeout=2.0)` to read an immutable `CallOutcome` without waiting for the resource, or `cc.recover_call(proxy.step, call_id)()` to attach or replay. An absent record returns `unknown` on query and raises code 723 on recovery. Recovery never executes the resource. A successful call whose result was dropped raises code 722 on recovery, with `details['reason']` set to `not_retained` or `evicted`. When the original call must execute at most once, submit the key once and reconcile an unknown outcome through the application's durable state.
+
+Use `cc.hold` on either side of `cc.with_call_id` or `cc.recover_call` to retain an independently releasable response. Keyed operations on a same-process connection use that Runtime's local IPC path. The Host-wide `set_server` options `outcome_max_entries` and `outcome_max_retained_bytes` bound completed metadata and retained bytes. Set the byte limit to zero for metadata-only retention or pass `None` to clear either override before Host startup.
+
+### Source setup
+
 Use canonical main for source development and run commands from the repository root. Python patch-release provenance is recorded with its release notes; the c3 release's `rc-manifest.json` identifies that CLI release's source, which can differ from a later Python patch:
 
 ```bash

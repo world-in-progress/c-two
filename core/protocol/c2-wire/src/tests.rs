@@ -489,7 +489,7 @@ mod ipc16_tests {
     }
 
     #[test]
-    fn permanent_preamble_stays_25_bytes_and_advertises_17() {
+    fn permanent_preamble_stays_25_bytes_and_advertises_18() {
         for (kind, flags) in [
             (VersionPreambleKind::Hello, 4),
             (VersionPreambleKind::Accepted, 6),
@@ -500,12 +500,12 @@ mod ipc16_tests {
             golden[12] = flags;
             golden[16..20].copy_from_slice(b"C2IP");
             golden[20] = kind as u8;
-            golden[21] = 17;
+            golden[21] = 18;
             assert_eq!(encode_version_preamble(kind), golden);
             validate_version_preamble_header(golden[..16].try_into().unwrap(), flags == 6).unwrap();
             assert_eq!(
                 decode_version_preamble_payload(golden[16..].try_into().unwrap()).unwrap(),
-                (kind, 17)
+                (kind, 18)
             );
         }
     }

@@ -179,7 +179,7 @@ fn python_target_generates_typed_subscription_client_methods() {
              \x20   return payload\n"
         ),
         // The unary client surface stays intact next to the topic surface.
-        "    def method_1_echo(self, payload: Payload) -> Payload:",
+        "    def method_1_echo(self, payload: Payload, *, call_id: str | None = None) -> Payload:",
     ] {
         assert!(
             python.contains(required.replace("%s", &state_digest).as_str()),
@@ -239,9 +239,13 @@ fn python_import_matrix_follows_stream_and_topic_presence() {
         "_load_payload_module(\"{solo_digest}\")\n\ndef _safe_error_text"
     )));
 
-    // neither: no c_two surface import at all
+    // Neither: no eager stream or subscription import.
     let plain = generate(DESCRIPTOR.as_bytes(), ContractCodegenTarget::Python);
-    assert!(!source(&plain, ContractCodegenTarget::Python).contains("from c_two import"));
+    assert!(
+        !source(&plain, ContractCodegenTarget::Python)
+            .lines()
+            .any(|line| line.starts_with("from c_two import "))
+    );
 }
 
 #[test]
@@ -300,7 +304,7 @@ fn topicless_contracts_omit_contract_topic_symbols_in_all_targets() {
                 "ContractCrm",
                 "@cc.topic",
                 "import c_two as cc",
-                "from c_two import",
+                "from c_two import HeldResult",
                 "_value(",
                 "topic_0",
             ] {

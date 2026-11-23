@@ -12,9 +12,9 @@ use pyo3::types::{PyBytes, PyDict, PyList};
 
 use c2_core::memory::LocalCopyGuard;
 use c2_core::{
-    CallBudget, CallOptions, CallTimeout, Client, EncodedResponse, EncodedService,
-    EncodedStreamService, HeldResponse, LifecycleError, ObservedPath, PreparedCall, ResponseSink,
-    ServerFailure,
+    CallBudget, CallOptions, CallOutcomeStatus, CallTimeout, Client, EncodedResponse,
+    EncodedService, EncodedStreamService, HeldResponse, LifecycleError, ObservedPath, PreparedCall,
+    ResponseSink, ResultUnavailableReason, ServerFailure, UnaryCallOptions,
 };
 use c2_error::{C2Error, ErrorCode};
 use c2_mem::{RecycledBytes, WritableSlab};
@@ -234,6 +234,17 @@ impl PyNativePreparedCall {
     }
 
     #[pyo3(signature = (data, *, release_input = false))]
+    fn call_owned<'py>(
+        &self,
+        py: Python<'py>,
+        data: &Bound<'_, PyAny>,
+        release_input: bool,
+    ) -> PyResult<Bound<'py, PyBytes>> {
+        let response = self.execute(py, data, release_input, c2_core::EncodedCall::call_owned)?;
+        Ok(PyBytes::new(py, &response))
+    }
+
+    #[pyo3(signature = (data, *, release_input = false))]
     fn stream(
         &self,
         py: Python<'_>,
@@ -306,9 +317,23 @@ impl PyCoreClient {
         ))
     }
 
-    fn begin_call(&self, py: Python<'_>, method_name: &str) -> PyResult<PyNativePreparedCall> {
+    #[pyo3(signature = (method_name, *, call_id=None))]
+    fn begin_call(
+        &self,
+        py: Python<'_>,
+        method_name: &str,
+        call_id: Option<&str>,
+    ) -> PyResult<PyNativePreparedCall> {
+        let client = self.client().map_err(core_error_to_py)?;
+        let options = call_id
+            .map(|id| UnaryCallOptions::from(client.call_options()).with_call_id(id))
+            .transpose()
+            .map_err(PyValueError::new_err)?;
         let prepared = py
-            .detach(|| self.client()?.begin_call(method_name))
+            .detach(|| match options {
+                Some(options) => client.begin_unary_with_options(method_name, options),
+                None => client.begin_call(method_name),
+            })
             .map_err(core_error_to_py)?;
         Ok(PyNativePreparedCall {
             inner: Mutex::new(Some(prepared)),
@@ -362,13 +387,83 @@ impl PyCoreClient {
         })
     }
 
+    #[pyo3(signature = (method_name, data, *, call_id=None))]
     fn call(
         &self,
         py: Python<'_>,
         method_name: &str,
         data: &Bound<'_, PyAny>,
+        call_id: Option<&str>,
     ) -> PyResult<PyCoreResponse> {
-        self.begin_call(py, method_name)?.call(py, data, false)
+        self.begin_call(py, method_name, call_id)?
+            .call(py, data, false)
+    }
+
+    fn recover_call(
+        &self,
+        py: Python<'_>,
+        method_name: &str,
+        call_id: &str,
+    ) -> PyResult<PyCoreResponse> {
+        py.detach(|| {
+            let client = self.client()?;
+            client.recover_unary_call_held(method_name, call_id, client.call_options().timeout())
+        })
+        .map(PyCoreResponse::new)
+        .map_err(core_error_to_py)
+    }
+
+    fn recover_call_owned<'py>(
+        &self,
+        py: Python<'py>,
+        method_name: &str,
+        call_id: &str,
+    ) -> PyResult<Bound<'py, PyBytes>> {
+        let response = py
+            .detach(|| {
+                let client = self.client()?;
+                client.recover_unary_call(method_name, call_id, client.call_options().timeout())
+            })
+            .map_err(core_error_to_py)?;
+        Ok(PyBytes::new(py, &response))
+    }
+
+    #[pyo3(signature = (call_id, *, timeout=inherit_timeout()))]
+    fn query_call<'py>(
+        &self,
+        py: Python<'py>,
+        call_id: &str,
+        timeout: Py<PyAny>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let client = self.client().map_err(core_error_to_py)?;
+        let timeout = if timeout.bind(py).is(&py.Ellipsis()) {
+            client.call_options().timeout()
+        } else {
+            call_options(py, &timeout)?.timeout()
+        };
+        let outcome = py
+            .detach(|| client.query_call(call_id, timeout))
+            .map_err(core_error_to_py)?;
+        let status = match outcome.status {
+            CallOutcomeStatus::InFlight => "in_flight",
+            CallOutcomeStatus::Succeeded => "succeeded",
+            CallOutcomeStatus::Failed => "failed",
+            CallOutcomeStatus::Unknown => "unknown",
+        };
+        let reason = outcome
+            .result_unavailable_reason
+            .map(|reason| match reason {
+                ResultUnavailableReason::NotRetained => "not_retained",
+                ResultUnavailableReason::Evicted => "evicted",
+            });
+        let result = PyDict::new(py);
+        result.set_item("status", status)?;
+        result.set_item("method_name", outcome.method_name)?;
+        result.set_item("result_available", outcome.result_available)?;
+        result.set_item("result_unavailable_reason", reason)?;
+        result.set_item("error_code", outcome.error_code.map(u16::from))?;
+        result.set_item("error_details_available", outcome.error_details_available)?;
+        Ok(result)
     }
 
     /// Subscribe to a topic declared on this client's bound route contract.
@@ -1143,9 +1238,8 @@ pub(crate) fn snapshot_python_buffer(py: Python<'_>, buffer: &PyBuffer<u8>) -> P
 
 pub(crate) fn python_error_to_c2(py: Python<'_>, error: PyErr) -> C2Error {
     if let Some(mut semantic) = semantic_payload_from_exception(py, &error) {
-        // A resource callback's error is already canonical: strip any inner
-        // call-control detail so downstream admission or routing flags never
-        // leak into this call's classification.
+        // Keep dispatch and outcome authority with the current Host, including
+        // when a callback rethrows an outcome from a downstream call.
         c2_core::strip_callback_error_phases(&mut semantic);
         return semantic;
     }
@@ -1346,6 +1440,34 @@ mod payload_tests {
                 callback_error.details,
                 BTreeMap::from([("marker".into(), "keep".into())]),
             );
+        });
+    }
+
+    #[test]
+    fn callback_outcome_errors_are_resource_failures() {
+        Python::initialize();
+        Python::attach(|py| {
+            for code in [
+                ErrorCode::CallIdConflict,
+                ErrorCode::CallResultUnavailable,
+                ErrorCode::CallOutcomeUnknown,
+            ] {
+                let inner =
+                    C2Error::new(code, "downstream outcome").with_details(BTreeMap::from([
+                        ("outcome".into(), "succeeded".into()),
+                        ("transport_phase".into(), "pre_dispatch".into()),
+                    ]));
+                let inner = core_error_to_py(c2_core::Error::Semantic(inner));
+                let outer = python_error_to_c2(py, inner);
+                assert_eq!(outer.code, ErrorCode::ResourceFunctionExecuting);
+                assert_eq!(
+                    outer.details,
+                    BTreeMap::from([
+                        ("cause_code".into(), u16::from(code).to_string()),
+                        ("cause_message".into(), "downstream outcome".into()),
+                    ]),
+                );
+            }
         });
     }
 

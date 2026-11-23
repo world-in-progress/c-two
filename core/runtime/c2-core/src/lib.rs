@@ -78,8 +78,9 @@ pub use memory::{
     RuntimeMemoryStats,
 };
 pub use outcome::{
-    IpcClientCloseDetail, RegisterFailureOutcome, RegisterOutcome, RelayCleanupError,
-    RouteCloseOutcome, ShutdownOutcome, UnregisterOutcome,
+    CallOutcome, CallOutcomeStatus, IpcClientCloseDetail, RegisterFailureOutcome, RegisterOutcome,
+    RelayCleanupError, ResultUnavailableReason, RouteCloseOutcome, ShutdownOutcome,
+    UnregisterOutcome,
 };
 pub use roles::{ClientConfigPatch, RetiredRoleObserver};
 pub use session::{
@@ -96,6 +97,7 @@ pub use c2_config::{
     CallOptions, CallTimeout, ConfigField, ConfigSources, DomainLimits, DomainLimitsOverrides,
     DomainLimitsPatch, EnvCatalog, EnvFilePolicy, EnvMap, LocalEndpointContext,
     LocalEndpointNamespace, LocalEndpointOptions, ServerConfigOverrides, ServerConfigPatch,
+    UnaryCallOptions,
 };
 
 /// Shared asynchronous executor for native client projections.

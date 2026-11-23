@@ -2,9 +2,9 @@
 
 This page defines the current `c2-mem-ffi` ABI boundary. Its consumer is the Node client of the TypeScript binding.
 
-## ABI 9 and consumers
+## ABI 10 and consumers
 
-The current `c2-mem-ffi` ABI is 9. A consumer reads `c2_mem_ffi_abi_version` before loading any other symbol and rejects every other version. Rust Core owns endpoint acquisition, IPC and relay transports, business records, loans and their release. The Node binding passes contract identities and request bytes to Core and receives local response buffers. [IPC 17 handshake](ipc-handshake.md), [memory policy](memory-policy.md)
+The current `c2-mem-ffi` ABI is 10. A consumer reads `c2_mem_ffi_abi_version` before loading any other symbol and rejects every other version. Rust Core owns endpoint acquisition, IPC and relay transports, business records, loans and their release. The Node binding passes contract identities and request bytes to Core and receives local response buffers. [IPC 18 handshake](ipc-handshake.md), [memory policy](memory-policy.md)
 
 ## Endpoint context
 
@@ -21,6 +21,14 @@ The current `c2-mem-ffi` ABI is 9. A consumer reads `c2_mem_ffi_abi_version` bef
 - `c2_mem_ffi_buffer_data` exposes a response's local bytes. Its transport lease ended before the buffer existed ([payload lifetimes](payload-lifetime.md)). `c2_mem_ffi_buffer_release` frees the buffer after the consumer has detached every external view of it.
 - `c2_mem_ffi_error_parts` returns structured error JSON: `message`, `code`, `canonicalName`, `details`, `transportPhase` (`pre_dispatch` or `dispatch_uncertain`), `category`, the protocol versions of a version mismatch and the local I/O cause. Outer Core transport phases take precedence over inner semantic details; call-scoped `LifecycleError` failures project the call's scope phase while resource semantic errors carry no phase. A consumer reads the phase from this JSON, never from a display string. `c2_mem_ffi_error_free` frees the error.
 
+
+## Keyed unary calls and outcomes
+
+- `c2_mem_ffi_call_begin` takes `const uint8_t *call_id` and `size_t call_id_len` after the timeout pointer. Pass `NULL, 0` for an unkeyed call. Otherwise pass 1–128 ASCII bytes from `[A-Za-z0-9_-]`, with the length excluding any terminator. The function validates and copies the bytes before returning. Passing a call ID with `server_stream` set fails at this boundary before creating a call.
+- `c2_mem_ffi_recover_call` takes an endpoint with a prepared route, the route and unary method names, the call ID pointer and length, the nullable millisecond timeout, and the completion callback and user pointer. It sends no input payload. The callback receives a result owning the local response buffer or a structured error, including 723 on a miss. The timeout bounds the caller's wait. Endpoint close still waits for the recovery to settle.
+- `c2_mem_ffi_query_call` takes the same arguments as recovery except for the method name. It completes with an error or a JSON snapshot containing `status`, `method_name`, `result_available`, `result_unavailable_reason`, `error_code` and `error_details_available`. The method, reason and numeric code use JSON null when absent. The callback owns the result and the JSON is borrowed until the result is freed. Query admission uses a control slot independent of business call slots.
+
+Read `callId` from structured error JSON when Core reports dispatch uncertainty for a keyed call. The outcome errors and snapshot semantics are defined in the [error reference](errors.md#call-outcome-errors) and [Python usage](python-usage.md#keyed-unary-calls-and-outcomes).
 
 ## Topic subscriptions
 

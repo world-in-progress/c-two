@@ -15,12 +15,15 @@ use std::sync::{Arc, Weak};
 use c2_contract::ExpectedRouteContract;
 use c2_error::{C2Error, ErrorCode};
 use c2_mem::{
-    BudgetedBuffer, DomainBudget, MemPool, OperationPermit, PayloadBufferError, RetentionError,
+    BudgetedBuffer, DomainBudget, OperationPermit, PayloadBufferError, RetentionError,
     RetentionRejectReason, SealedShmBlock, WritableSlab,
 };
 use c2_wire::rpc::{WireLagPolicy, WireSubscribeOptions, WireTopicStart};
-use parking_lot::{Mutex, RwLock};
+use parking_lot::Mutex;
 use tokio::sync::Notify;
+
+use crate::ResponsePool;
+use crate::response::OutcomePressure;
 
 /// Hard upper bound on a single topic's history ring depth.
 pub const MAX_TOPIC_RING_CAPACITY: usize = 65_536;
@@ -329,7 +332,7 @@ struct TopicChannelState {
 pub(crate) struct TopicChannel {
     topic_name: String,
     budget: DomainBudget,
-    response_pool: Option<Arc<RwLock<MemPool>>>,
+    response_pool: Option<Arc<ResponsePool>>,
     max_payload_size: u64,
     barrier: Arc<ActiveSubscriberBarrier>,
     state: Mutex<TopicChannelState>,
@@ -368,7 +371,7 @@ impl TopicChannel {
         topic_name: String,
         capacity: usize,
         budget: DomainBudget,
-        response_pool: Option<Arc<RwLock<MemPool>>>,
+        response_pool: Option<Arc<ResponsePool>>,
         max_payload_size: u64,
         barrier: Arc<ActiveSubscriberBarrier>,
     ) -> Arc<Self> {
@@ -430,7 +433,7 @@ impl TopicChannel {
 
     pub(crate) fn try_alloc_slab(&self, len: usize) -> Result<Option<WritableSlab>, C2Error> {
         self.check_publish(len)?;
-        self.alloc_slab(len)
+        self.alloc_slab(len, &mut self.pressure())
     }
 
     pub(crate) fn publish_slab(&self, slab: WritableSlab) -> Result<u64, C2Error> {
@@ -438,7 +441,7 @@ impl TopicChannel {
         if !self
             .response_pool
             .as_ref()
-            .is_some_and(|pool| slab.belongs_to(pool))
+            .is_some_and(|pool| slab.belongs_to(&pool.inner))
         {
             return Err(C2Error::new(
                 ErrorCode::ResourceOutputSerializing,
@@ -448,14 +451,21 @@ impl TopicChannel {
         self.commit_storage(Self::seal_slab(slab)?)
     }
 
-    fn alloc_slab(&self, len: usize) -> Result<Option<WritableSlab>, C2Error> {
-        if len as u64 <= c2_config::SHM_THRESHOLD {
-            return Ok(None);
-        }
+    fn pressure(&self) -> OutcomePressure<'_> {
+        self.response_pool
+            .as_ref()
+            .map_or_else(|| OutcomePressure::new(None), |pool| pool.pressure())
+    }
+
+    fn alloc_slab(
+        &self,
+        len: usize,
+        pressure: &mut OutcomePressure<'_>,
+    ) -> Result<Option<WritableSlab>, C2Error> {
         let Some(pool) = &self.response_pool else {
             return Ok(None);
         };
-        WritableSlab::try_alloc(Arc::clone(pool), len)
+        pool.alloc_slab(c2_config::SHM_THRESHOLD, len, pressure)
             .map_err(|error| C2Error::new(ErrorCode::ResourceOutputSerializing, error))
     }
 
@@ -489,7 +499,8 @@ impl TopicChannel {
     }
 
     fn store_vec_payload(&self, payload: &mut Vec<u8>) -> Result<TopicFrameStorage, C2Error> {
-        if let Some(mut slab) = self.alloc_slab(payload.len())? {
+        let mut pressure = self.pressure();
+        if let Some(mut slab) = self.alloc_slab(payload.len(), &mut pressure)? {
             slab.as_mut_slice().copy_from_slice(payload);
             return Self::seal_slab(slab);
         }
@@ -501,9 +512,8 @@ impl TopicChannel {
                 "topic payload size exceeds u64",
             )
         })?;
-        let reservation = self
-            .budget
-            .try_reserve_memory(charge_bytes)
+        let reservation = pressure
+            .reserve_memory(&self.budget, charge_bytes)
             .map_err(|error| topic_memory_capacity_error(&self.topic_name, error))?;
         Ok(TopicFrameStorage::Inline(BudgetedBuffer::new(
             owned,
@@ -519,7 +529,8 @@ impl TopicChannel {
     where
         F: FnOnce(&mut [u8]) -> Result<(), C2Error>,
     {
-        if let Some(mut slab) = self.alloc_slab(len)? {
+        let mut pressure = self.pressure();
+        if let Some(mut slab) = self.alloc_slab(len, &mut pressure)? {
             write_into(slab.as_mut_slice())?;
             return Self::seal_slab(slab);
         }
@@ -529,9 +540,8 @@ impl TopicChannel {
                 "topic payload size exceeds u64",
             )
         })?;
-        let reservation = self
-            .budget
-            .try_reserve_memory(charge_bytes)
+        let reservation = pressure
+            .reserve_memory(&self.budget, charge_bytes)
             .map_err(|error| topic_memory_capacity_error(&self.topic_name, error))?;
         let mut owned = Vec::new();
         owned.try_reserve_exact(len).map_err(|error| {
@@ -560,7 +570,10 @@ impl TopicChannel {
             let next_seq = state.head_seq.checked_add(1).ok_or_else(|| {
                 C2Error::new(
                     ErrorCode::CallCapacityExceeded,
-                    format!("topic {:?} sequence number space exhausted", self.topic_name),
+                    format!(
+                        "topic {:?} sequence number space exhausted",
+                        self.topic_name
+                    ),
                 )
             })?;
             let frame = Arc::new(TopicFrame {
@@ -627,7 +640,10 @@ impl TopicChannel {
             TopicStart::Next => head.checked_add(1).ok_or_else(|| {
                 C2Error::new(
                     ErrorCode::CallCapacityExceeded,
-                    format!("topic {:?} sequence number space exhausted", self.topic_name),
+                    format!(
+                        "topic {:?} sequence number space exhausted",
+                        self.topic_name
+                    ),
                 )
             })?,
         };
@@ -775,7 +791,7 @@ impl RouteTopics {
         expected: ExpectedRouteContract,
         topic_configs: &BTreeMap<String, TopicConfig>,
         budget: DomainBudget,
-        response_pool: Option<Arc<RwLock<MemPool>>>,
+        response_pool: Option<Arc<ResponsePool>>,
         max_payload_size: u64,
     ) -> Arc<Self> {
         let barrier = ActiveSubscriberBarrier::new();

@@ -43,6 +43,7 @@ fn call_error_value_uses_scope_phase_only_for_lifecycle_errors() {
         }),
         scope: CallScope::new(CallOptions::with_timeout(CallTimeout::Unlimited), None).unwrap(),
         stream_mode: false,
+        call_id: None,
         cancellation: IpcStreamCancellation::new(),
         cancelled: AtomicBool::new(false),
         next_active: AtomicBool::new(false),
@@ -72,6 +73,48 @@ fn call_error_value_uses_scope_phase_only_for_lifecycle_errors() {
             .get("transportPhase")
             .is_none()
     );
+}
+
+#[test]
+fn raw_call_begin_rejects_keyed_stream_and_invalid_length_delimited_keys() {
+    let fixture = Fixture::new(64);
+    let mut call = ptr::null_mut();
+    let mut error = ptr::null_mut();
+    for (mode, id, len) in [
+        (1, b"valid".as_ptr(), 5),
+        (0, b"".as_ptr(), 0),
+        (0, b"a\0b".as_ptr(), 3),
+        (0, ptr::null(), 1),
+        (0, b"X".as_ptr(), usize::MAX),
+    ] {
+        let status = unsafe {
+            c2_mem_ffi_call_begin(
+                fixture.endpoint,
+                c"items".as_ptr(),
+                c"echo".as_ptr(),
+                mode,
+                ptr::null(),
+                id,
+                len,
+                &mut call,
+                &mut error,
+            )
+        };
+        assert_eq!(status, C2MemFfiStatus::InvalidArgument);
+        assert!(call.is_null());
+        let parts: Value = serde_json::from_str(
+            unsafe { CStr::from_ptr(c2_mem_ffi_error_parts(error)) }
+                .to_str()
+                .unwrap(),
+        )
+        .unwrap();
+        if mode == 1 {
+            assert_eq!(parts["code"], ErrorCode::UnsupportedCallMode as u32);
+            assert_eq!(parts["transportPhase"], "pre_dispatch");
+        }
+        assert!(parts.get("callId").is_none());
+        unsafe { c2_mem_ffi_error_free(error) };
+    }
 }
 
 const DESCRIPTOR: &[u8] =
@@ -187,7 +230,7 @@ impl Fixture {
     }
     fn with_limits(limits: Value) -> Self {
         let process_state = crate::tests::PROCESS_STATE_LOCK.lock().unwrap();
-        assert_eq!(c2_mem_ffi_abi_version(), 9);
+        assert_eq!(c2_mem_ffi_abi_version(), 10);
         let root = tempfile::tempdir().unwrap();
         let runtime = Runtime::new(RuntimeOptions {
             use_process_relay_anchor: false,
@@ -300,6 +343,8 @@ impl Fixture {
                     method.as_ptr(),
                     u8::from(stream),
                     ptr::null(),
+                    ptr::null(),
+                    0,
                     &mut call,
                     &mut error,
                 )
@@ -509,6 +554,8 @@ fn dispatch_error_keeps_typed_failure_and_original_target() {
                 c"missing".as_ptr(),
                 0,
                 ptr::null(),
+                ptr::null(),
+                0,
                 &mut call,
                 &mut error,
             )
@@ -612,6 +659,8 @@ fn cancelling_input_budget_wait_does_not_wait_for_a_held_item_to_release() {
                 method.as_ptr(),
                 1,
                 ptr::null(),
+                ptr::null(),
+                0,
                 &mut second,
                 &mut error,
             )
@@ -1049,6 +1098,8 @@ fn route_refusal_and_replacement_preserve_other_route_on_same_endpoint() {
                     c"ping".as_ptr(),
                     0,
                     ptr::null(),
+                    ptr::null(),
+                    0,
                     &mut call,
                     &mut error,
                 )
