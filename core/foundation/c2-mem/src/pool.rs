@@ -12,6 +12,7 @@ use crate::config::{PoolAllocation, PoolConfig, PoolStats};
 use crate::dedicated::DedicatedSegment;
 use crate::handle::{HandleBacking, MemHandle, OwnedAllocation, OwnedBacking, PoolIncarnation};
 use crate::pressure::{PressureDecision, PressureEngine};
+use crate::shared::SlabAllocError;
 use crate::spill;
 use crate::{BudgetError, DomainBudget, MemoryReservation, PayloadBufferError};
 use base64::Engine;
@@ -33,7 +34,12 @@ const BUDDY_MIN_BLOCK_SIZE: usize = 4096;
 enum BackingError {
     Memory(PayloadBufferError),
     FileSpill(BudgetError),
-    Pressure(String),
+    Capacity {
+        message: String,
+        needed_bytes: u64,
+        memory_shortfall: Option<(u64, u64)>,
+    },
+    Unrepresentable(String),
     Other(String),
 }
 
@@ -42,11 +48,60 @@ impl BackingError {
         match self {
             BackingError::Memory(error) => error.to_string(),
             BackingError::FileSpill(error) => error.to_string(),
-            BackingError::Pressure(message) => message,
-            BackingError::Other(message) => message,
+            BackingError::Capacity { message, .. }
+            | BackingError::Unrepresentable(message)
+            | BackingError::Other(message) => message,
+        }
+    }
+
+    fn needed_bytes(&self) -> Option<u64> {
+        match self {
+            Self::Capacity { needed_bytes, .. } => Some(*needed_bytes),
+            Self::Memory(PayloadBufferError::InsufficientCapacity {
+                requested,
+                available,
+            }) => Some((*requested - u128::from(*available)) as u64),
+            _ => None,
+        }
+    }
+
+    fn memory_shortfall(&self) -> Option<(u64, u64)> {
+        match self {
+            Self::Memory(PayloadBufferError::InsufficientCapacity {
+                requested,
+                available,
+            }) => Some((*requested as u64, *available)),
+            Self::Capacity {
+                memory_shortfall, ..
+            } => *memory_shortfall,
+            _ => None,
         }
     }
 }
+
+/// Rejection of a local allocation after trying its eligible backing tiers.
+#[derive(Debug)]
+pub struct OwnedAllocationError {
+    message: String,
+    memory_shortfall: Option<(u64, u64)>,
+}
+
+impl OwnedAllocationError {
+    /// The requested and available role-memory bytes of an eligible SHM tier
+    /// that failed for lack of room in the shared domain. Shedding domain
+    /// memory cannot fix a full local pool, a file budget, or an OS denial.
+    pub fn memory_shortfall(&self) -> Option<(u64, u64)> {
+        self.memory_shortfall
+    }
+}
+
+impl std::fmt::Display for OwnedAllocationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for OwnedAllocationError {}
 
 /// Lifetime tier-selection counters behind [`PoolStats`].
 #[derive(Default, Debug, Clone, Copy)]
@@ -285,6 +340,23 @@ impl MemPool {
     pub fn alloc_shm_handle(&mut self, size: usize) -> Result<MemHandle, String> {
         self.alloc(size)
             .map(|a| a.into_handle(size, self.incarnation))
+    }
+
+    /// Preserve capacity evidence from the eligible SHM tiers for callers
+    /// allowed to release other owners and then try again.
+    pub(crate) fn alloc_slab_handle(&mut self, size: usize) -> Result<MemHandle, SlabAllocError> {
+        if self.is_peer {
+            return Err(SlabAllocError::Unavailable);
+        }
+        self.alloc_shm(size)
+            .map(|allocation| allocation.into_handle(size, self.incarnation))
+            .map_err(|error| match error.needed_bytes() {
+                Some(needed_bytes) => SlabAllocError::CapacityExhausted { needed_bytes },
+                None if matches!(error, BackingError::Unrepresentable(_)) => {
+                    SlabAllocError::TooLarge
+                }
+                None => SlabAllocError::Unavailable,
+            })
     }
 
     /// Free a local allocation after the caller has ended every payload read.
@@ -603,17 +675,31 @@ impl MemPool {
     ///    not suppress a dedicated backing that fits)
     /// 4. Else: FileSpill, if the file budget admits the requested length
     pub fn alloc_handle(&mut self, size: usize) -> Result<MemHandle, String> {
+        self.alloc_handle_with_reason(size)
+            .map_err(|error| error.message)
+    }
+
+    fn alloc_handle_with_reason(&mut self, size: usize) -> Result<MemHandle, OwnedAllocationError> {
         if self.is_peer {
-            return Err("cannot allocate from a peer pool".into());
+            return Err(OwnedAllocationError {
+                message: "cannot allocate from a peer pool".into(),
+                memory_shortfall: None,
+            });
         }
         if size == 0 {
-            return Err("cannot allocate 0 bytes".into());
+            return Err(OwnedAllocationError {
+                message: "cannot allocate 0 bytes".into(),
+                memory_shortfall: None,
+            });
         }
         match self.alloc_shm(size) {
             Ok(alloc) => Ok(alloc.into_handle(size, self.incarnation)),
-            Err(_) => self
+            Err(shm) => self
                 .alloc_file_spill(size)
-                .map_err(BackingError::into_message),
+                .map_err(|spill| OwnedAllocationError {
+                    message: spill.into_message(),
+                    memory_shortfall: shm.memory_shortfall(),
+                }),
         }
     }
 
@@ -621,12 +707,25 @@ impl MemPool {
     /// It follows the same tiered allocation policy as `alloc_handle`, but
     /// payload borrows and final release do not need to re-enter this pool.
     pub fn alloc_owned(&mut self, size: usize) -> Result<OwnedAllocation, String> {
-        let handle = self.alloc_handle(size)?;
+        self.alloc_owned_with_reason(size)
+            .map_err(|error| error.message)
+    }
+
+    /// Allocate owned storage and retain the evidence of role-memory pressure
+    /// for a caller that can release other domain owners and retry.
+    pub fn alloc_owned_with_reason(
+        &mut self,
+        size: usize,
+    ) -> Result<OwnedAllocation, OwnedAllocationError> {
+        let handle = self.alloc_handle_with_reason(size)?;
         match self.admit_owned(handle) {
             Ok(owner) => Ok(owner),
-            Err((error, handle)) => {
+            Err((message, handle)) => {
                 self.release_handle(handle);
-                Err(error)
+                Err(OwnedAllocationError {
+                    message,
+                    memory_shortfall: None,
+                })
             }
         }
     }
@@ -910,6 +1009,8 @@ impl MemPool {
 
     fn alloc_shm(&mut self, size: usize) -> Result<PoolAllocation, BackingError> {
         let max_buddy = self.buddy_block_limit();
+        let mut buddy_shortfall = None;
+        let mut buddy_memory_shortfall = None;
         if max_buddy > 0 && size <= max_buddy {
             // Layer 1: Reuse an already-mapped segment — permitted under
             // pressure, with no new backing charge and no OS query.
@@ -925,13 +1026,40 @@ impl MemPool {
             // A creation failure (for example the SHM object cannot be mapped or
             // pressure denies the full segment) falls through to Layer 3
             // dedicated storage instead of failing the allocation outright.
-            if let Some(a) = self.expand_buddy(size) {
-                return Ok(a);
+            let expansion_error = match self.expand_buddy(size) {
+                Ok(allocation) => return Ok(allocation),
+                Err(error) => error,
+            };
+            buddy_shortfall = expansion_error.needed_bytes();
+            buddy_memory_shortfall = expansion_error.memory_shortfall();
+            if self.segment_count() > 0 {
+                // A mapped segment is full or fragmented for this order.
+                // Releasing live buddy allocations could permit reuse.
+                let reuse = size.next_power_of_two().max(BUDDY_MIN_BLOCK_SIZE) as u64;
+                buddy_shortfall = Some(buddy_shortfall.map_or(reuse, |expand| expand.min(reuse)));
             }
         }
 
         // Layer 3: Dedicated segment fallback (its own, smaller, seam checks).
-        self.alloc_dedicated(size)
+        self.alloc_dedicated(size).map_err(|error| {
+            let Some(buddy) = buddy_shortfall else {
+                return error;
+            };
+            let needed_bytes = error
+                .needed_bytes()
+                .map_or(buddy, |dedicated| buddy.min(dedicated));
+            // Keep the smallest fresh mapping that could fit after releasing
+            // domain memory, independent of local buddy reuse or slot limits.
+            let memory_shortfall = [buddy_memory_shortfall, error.memory_shortfall()]
+                .into_iter()
+                .flatten()
+                .min_by_key(|&(requested, available)| (requested, requested - available));
+            BackingError::Capacity {
+                message: error.into_message(),
+                needed_bytes,
+                memory_shortfall,
+            }
+        })
     }
 
     /// Try to serve `size` from an already-mapped buddy segment.
@@ -961,14 +1089,12 @@ impl MemPool {
 
     /// Create one new buddy segment and allocate `size` from it.
     ///
-    /// Returns `None` when creation fails for any reason (geometry,
-    /// pressure, budget, or OS); callers fall through to the next tier.
-    fn expand_buddy(&mut self, size: usize) -> Option<PoolAllocation> {
-        let (idx, segment) = self.create_segment().ok()?;
+    fn expand_buddy(&mut self, size: usize) -> Result<PoolAllocation, BackingError> {
+        let (idx, segment) = self.create_segment()?;
         let allocation = segment.alloc(size).expect("size fits new buddy backing");
         self.install_segment(idx, segment);
         self.counters.buddy_expanded_allocs = self.counters.buddy_expanded_allocs.saturating_add(1);
-        Some(PoolAllocation {
+        Ok(PoolAllocation {
             seg_idx: idx as u32,
             generation: self.generations[idx],
             offset: allocation.offset,
@@ -987,6 +1113,14 @@ impl MemPool {
     }
 
     fn alloc_dedicated(&mut self, size: usize) -> Result<PoolAllocation, BackingError> {
+        let backing = DedicatedSegment::required_shm_size(size)
+            .filter(|size| *size <= u32::MAX as usize)
+            .ok_or_else(|| {
+                BackingError::Unrepresentable(format!(
+                    "dedicated segment size {size} exceeds the addressable wire backing range"
+                ))
+            })?;
+        let backing_bytes = backing as u64;
         self.dedicated.retain(|_, entry| entry.segment.is_mapped());
         // Each kind has its own u16 slot space. Only empty slots advance;
         // checked generation exhaustion retires that slot permanently.
@@ -1003,23 +1137,30 @@ impl MemPool {
                     .map(|generation| (idx as u32, generation))
             })
             .ok_or_else(|| {
-                BackingError::Other(
-                    "dedicated segment capacity exhausted (live or retired slots)".into(),
-                )
+                let message = "dedicated segment capacity exhausted (live or retired slots)".into();
+                if self
+                    .dedicated
+                    .values()
+                    .any(|entry| entry.generation < u32::MAX)
+                    && self
+                        .budget
+                        .as_ref()
+                        .is_none_or(|budget| backing_bytes <= budget.snapshot().memory.limit_bytes)
+                {
+                    BackingError::Capacity {
+                        message,
+                        needed_bytes: backing_bytes,
+                        memory_shortfall: None,
+                    }
+                } else {
+                    BackingError::Other(message)
+                }
             })?;
-        let backing = DedicatedSegment::required_shm_size(size)
-            .filter(|size| *size <= u32::MAX as usize)
-            .ok_or_else(|| {
-                BackingError::Other(format!(
-                    "dedicated segment size {size} exceeds the addressable wire backing range"
-                ))
-            })?;
-        let backing_bytes = backing as u64;
         if let PressureDecision::Deny { reason } = self
             .pressure
             .evaluate(backing_bytes, "dedicated shared-memory backing")
         {
-            return Err(BackingError::Pressure(reason));
+            return Err(BackingError::Other(reason));
         }
         let guard = self
             .reserve_memory(backing_bytes)
@@ -1101,7 +1242,7 @@ impl MemPool {
             .pressure
             .evaluate(backing_bytes, "buddy segment backing")
         {
-            return Err(BackingError::Pressure(reason));
+            return Err(BackingError::Other(reason));
         }
         let guard = self
             .reserve_memory(backing_bytes)

@@ -1602,7 +1602,8 @@ async fn unknown_open_mode_and_cancel_cause_deactivate_but_preserve_dispatched_c
             )
             .unwrap();
             let mode_offset = frame.len() - 3;
-            frame[mode_offset] = 3;
+            // IPC 18 made mode byte 3 a valid `KeyedUnary`; 7 stays unknown.
+            frame[mode_offset] = 7;
             frame
         } else {
             let mut frame = rpc::encode_cancel_frame(1, rpc::CancelCause::Consumer).unwrap();

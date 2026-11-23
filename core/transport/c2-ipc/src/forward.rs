@@ -1128,7 +1128,7 @@ impl IpcClient {
             let result = Self::send_forward_frames(
                 conn.clone(),
                 state.clone(),
-                (identity, index, CallMode::ServerStream),
+                (identity, index, CallMode::ServerStream, None),
                 data_size,
                 chunk_size,
                 request_block,
@@ -1194,6 +1194,34 @@ impl IpcClient {
         B: AsRef<[u8]> + Send + 'static,
         E: Display + Send + 'static,
     {
+        self.forward_keyed_unary_bound_sized_phased(
+            binding,
+            method_name,
+            None,
+            data_len,
+            chunks,
+            send_reservation,
+        )
+        .await
+    }
+
+    /// Keyed unary forwarding (ADR 0006): the first frame carries the
+    /// length-prefixed `call_id`, and the chunk width accounts for it
+    /// exactly through `encoded_keyed_open_metadata_len`.
+    pub async fn forward_keyed_unary_bound_sized_phased<S, B, E>(
+        &self,
+        binding: &RouteBinding,
+        method_name: &str,
+        call_id: Option<&str>,
+        data_len: u64,
+        chunks: S,
+        send_reservation: MemoryReservation,
+    ) -> Result<ResponseData, crate::IpcCallError>
+    where
+        S: Stream<Item = Result<B, E>> + Send + 'static,
+        B: AsRef<[u8]> + Send + 'static,
+        E: Display + Send + 'static,
+    {
         let (index, identity, limit) = binding
             .call_target_for(method_name)
             .map_err(pre_dispatch_call_error)?;
@@ -1203,22 +1231,30 @@ impl IpcClient {
             )));
         }
         let data_size = checked_payload_len_usize(data_len).map_err(pre_dispatch_call_error)?;
-        let request_block = self
-            .forward_request_block(data_size)
-            .map_err(pre_dispatch_call_error)?;
-        let (send, rx) = self
-            .begin_pending(PendingKind::Call(CallMode::Unary), limit)
-            .map_err(pre_dispatch_call_error)?;
-        let metadata_len = rpc::encoded_open_metadata_len(&identity)
-            .map_err(|e| pre_dispatch_call_error(IpcError::Protocol(e.to_string())))?;
+        let metadata_len = match call_id {
+            Some(call_id) => rpc::encoded_keyed_open_metadata_len(&identity, call_id),
+            None => rpc::encoded_open_metadata_len(&identity),
+        }
+        .map_err(|e| pre_dispatch_call_error(IpcError::Protocol(e.to_string())))?;
         let chunk_size = self
             .forward_chunk_size(data_size, send_reservation.bytes(), metadata_len)
             .map_err(pre_dispatch_call_error)?;
+        let request_block = self
+            .forward_request_block(data_size)
+            .map_err(pre_dispatch_call_error)?;
+        let pending_kind = match call_id {
+            Some(_) => PendingKind::Call(CallMode::KeyedUnary),
+            None => PendingKind::Call(CallMode::Unary),
+        };
+        let (send, rx) = self
+            .begin_pending(pending_kind, limit)
+            .map_err(pre_dispatch_call_error)?;
+        let call_id = call_id.map(str::to_string);
         let (upload_stop, stop_upload) = watch::channel(false);
         self.pending
             .lock()
             .unpublished_mut(&send.state)
-            .expect("original unary draft")
+            .ok_or_else(|| pre_dispatch_call_error(IpcError::Closed))?
             .upload_stop = Some(upload_stop);
         let (result_tx, result_rx) = oneshot::channel();
         let driver = send.conn.clone();
@@ -1226,7 +1262,7 @@ impl IpcClient {
             let sent = Self::send_forward_frames(
                 send.conn.clone(),
                 send.state.clone(),
-                (identity, index, CallMode::Unary),
+                (identity, index, CallMode::Unary, call_id),
                 data_size,
                 chunk_size,
                 request_block,
@@ -1272,7 +1308,7 @@ impl IpcClient {
         if data_size == 0 {
             return Ok(0);
         }
-        let frame_room = (u32::MAX as usize).saturating_sub(12 + metadata_len + 8);
+        let frame_room = (MAX_RPC_FRAME_BYTES as usize).saturating_sub(12 + metadata_len + 8);
         let size = (c2_config::CHUNK_SIZE as usize)
             .min(frame_room)
             .min(charged.min(usize::MAX as u64) as usize);
@@ -1284,10 +1320,11 @@ impl IpcClient {
         Ok(size)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn send_forward_frames<S, B, E>(
         conn: Arc<ClientConnection>,
         state: Arc<StdMutex<SendState>>,
-        open: (RouteCallIdentity, u16, CallMode),
+        open: (RouteCallIdentity, u16, CallMode, Option<String>),
         data_size: usize,
         chunk_size: usize,
         request_block: Option<RequestBlock>,
@@ -1300,9 +1337,14 @@ impl IpcClient {
         B: AsRef<[u8]> + Send,
         E: Display + Send,
     {
-        let (identity, method_idx, mode) = open;
-        let metadata_len = rpc::encoded_open_metadata_len(&identity)
-            .map_err(|error| IpcError::Protocol(error.to_string()))?;
+        let (identity, method_idx, mode, call_id) = open;
+        // Keyed opens carry the length-prefixed call_id after the method
+        // index; the exact width keeps chunk frames at their true maximum.
+        let metadata_len = match call_id.as_deref() {
+            Some(call_id) => rpc::encoded_keyed_open_metadata_len(&identity, call_id),
+            None => rpc::encoded_open_metadata_len(&identity),
+        }
+        .map_err(|error| IpcError::Protocol(error.to_string()))?;
         let send_reservation = Arc::new(send_reservation);
         if let Some(block) = request_block {
             // This allocation belongs to the original request pool. Fill it
@@ -1354,12 +1396,20 @@ impl IpcClient {
                 is_dedicated: alloc.is_dedicated,
                 loan_id: loan.id(),
             };
-            let frame = rpc::encode_open_draft_frame(
-                &identity,
-                method_idx,
-                mode,
-                ValuePart::whole(ValueStorage::Shm(descriptor)),
-            )
+            let frame = match call_id.as_deref() {
+                Some(call_id) => rpc::encode_open_keyed_draft_frame(
+                    &identity,
+                    method_idx,
+                    call_id,
+                    ValuePart::whole(ValueStorage::Shm(descriptor)),
+                ),
+                None => rpc::encode_open_draft_frame(
+                    &identity,
+                    method_idx,
+                    mode,
+                    ValuePart::whole(ValueStorage::Shm(descriptor)),
+                ),
+            }
             .map_err(|error| IpcError::Protocol(error.to_string()))?;
             return conn
                 .submit_owned(
@@ -1372,12 +1422,20 @@ impl IpcClient {
                 .await;
         }
         if data_size == 0 {
-            let frame = rpc::encode_open_draft_frame(
-                &identity,
-                method_idx,
-                mode,
-                ValuePart::whole(ValueStorage::Inline(&[])),
-            )
+            let frame = match call_id.as_deref() {
+                Some(call_id) => rpc::encode_open_keyed_draft_frame(
+                    &identity,
+                    method_idx,
+                    call_id,
+                    ValuePart::whole(ValueStorage::Inline(&[])),
+                ),
+                None => rpc::encode_open_draft_frame(
+                    &identity,
+                    method_idx,
+                    mode,
+                    ValuePart::whole(ValueStorage::Inline(&[])),
+                ),
+            }
             .map_err(|error| IpcError::Protocol(error.to_string()))?;
             conn.submit_owned(
                 frame,
@@ -1390,13 +1448,22 @@ impl IpcClient {
             return Ok(());
         }
         if data_size <= chunk_size {
-            let mut frame = rpc::encode_open_inline_draft_prefix(
-                &identity,
-                method_idx,
-                mode,
-                ChunkPosition::Whole,
-                data_size,
-            )
+            let mut frame = match call_id.as_deref() {
+                Some(call_id) => rpc::encode_open_keyed_inline_draft_prefix(
+                    &identity,
+                    method_idx,
+                    call_id,
+                    ChunkPosition::Whole,
+                    data_size,
+                ),
+                None => rpc::encode_open_inline_draft_prefix(
+                    &identity,
+                    method_idx,
+                    mode,
+                    ChunkPosition::Whole,
+                    data_size,
+                ),
+            }
             .map_err(|error| IpcError::Protocol(error.to_string()))?;
             let frame_len = frame::HEADER_SIZE + metadata_len + data_size;
             futures_util::pin_mut!(chunks);
@@ -1441,8 +1508,12 @@ impl IpcClient {
         }
         let mut written = 0usize;
         let mut part = 0usize;
-        let mut frame =
-            Self::forward_frame_prefix((&identity, method_idx, mode), data_size, part, chunk_size)?;
+        let mut frame = Self::forward_frame_prefix(
+            (&identity, method_idx, mode, call_id.as_deref()),
+            data_size,
+            part,
+            chunk_size,
+        )?;
         let mut filled = 0usize;
         futures_util::pin_mut!(chunks);
         loop {
@@ -1494,7 +1565,7 @@ impl IpcClient {
                     filled = 0;
                     frame = if part * chunk_size < data_size {
                         Self::forward_frame_prefix(
-                            (&identity, method_idx, mode),
+                            (&identity, method_idx, mode, call_id.as_deref()),
                             data_size,
                             part,
                             chunk_size,
@@ -1526,22 +1597,33 @@ impl IpcClient {
     }
 
     fn forward_frame_prefix(
-        open: (&RouteCallIdentity, u16, CallMode),
+        open: (&RouteCallIdentity, u16, CallMode, Option<&str>),
         data_size: usize,
         part: usize,
         chunk_size: usize,
     ) -> Result<Vec<u8>, IpcError> {
         let value_bytes = chunk_size.min(data_size - part * chunk_size);
         if part == 0 {
-            rpc::encode_open_inline_draft_prefix(
-                open.0,
-                open.1,
-                open.2,
-                ChunkPosition::First {
-                    total_bytes: data_size as u64,
-                },
-                value_bytes,
-            )
+            match open.3 {
+                Some(call_id) => rpc::encode_open_keyed_inline_draft_prefix(
+                    open.0,
+                    open.1,
+                    call_id,
+                    ChunkPosition::First {
+                        total_bytes: data_size as u64,
+                    },
+                    value_bytes,
+                ),
+                None => rpc::encode_open_inline_draft_prefix(
+                    open.0,
+                    open.1,
+                    open.2,
+                    ChunkPosition::First {
+                        total_bytes: data_size as u64,
+                    },
+                    value_bytes,
+                ),
+            }
         } else {
             rpc::encode_open_continuation_draft_prefix(value_bytes)
         }

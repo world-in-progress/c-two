@@ -26,6 +26,8 @@ use parking_lot::{RwLock, RwLockWriteGuard};
 use std::fmt;
 use std::sync::Arc;
 
+use super::ChunkAdmissionError;
+
 /// Checked reassembly geometry shared by admission and limit checks.
 ///
 /// Rejects zero chunk counts, zero chunk sizes, and products that overflow
@@ -107,6 +109,7 @@ impl ReassemblyBacking {
         checked_capacity(total_chunks, chunk_size)?;
         let guard = pool.write();
         Self::admit_with_guard(Arc::clone(&pool), guard, total_chunks, chunk_size, 0)
+            .map_err(|error| error.to_string())
     }
 
     /// Admission with an already acquired write guard from this exact pool.
@@ -118,29 +121,39 @@ impl ReassemblyBacking {
         total_chunks: usize,
         chunk_size: usize,
         tracked_chunks: usize,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, ChunkAdmissionError> {
         if !std::ptr::eq(Arc::as_ptr(&pool), RwLockWriteGuard::rwlock(&guard)) {
-            return Err("reassembly admission guard belongs to a different pool".to_string());
+            return Err(ChunkAdmissionError::Protocol(
+                "reassembly admission guard belongs to a different pool".into(),
+            ));
         }
-        let capacity = checked_capacity(total_chunks, chunk_size)?;
+        let capacity =
+            checked_capacity(total_chunks, chunk_size).map_err(ChunkAdmissionError::Protocol)?;
         let metadata_bytes = tracked_chunks as u64;
         let capacity_bytes = u64::try_from(capacity).map_err(|_| {
-            format!("reassembly capacity {capacity} bytes exceeds the budget accounting range")
+            ChunkAdmissionError::Capacity(format!(
+                "reassembly capacity {capacity} bytes exceeds the budget accounting range"
+            ))
         })?;
         // One pool write critical section covers charges and allocation so no
         // other allocator can consume the admitted bytes in between.
         let budget: DomainBudget = guard
             .budget()
-            .ok_or_else(|| "reassembly pool carries no owner budget context".to_string())?
+            .ok_or_else(|| {
+                ChunkAdmissionError::Capacity(
+                    "reassembly pool carries no owner budget context".into(),
+                )
+            })?
             .clone();
-        if budget.snapshot().memory.limit_bytes == 0 {
+        let memory_limit = budget.snapshot().memory.limit_bytes;
+        if memory_limit == 0 {
             // With a zero memory limit this reservation always fails TooLarge,
             // recording the rejection in the memory cell before any storage
             // or file mapping could be created.
             let _ = budget.try_reserve_memory(capacity_bytes);
-            return Err(
-                "role-domain memory budget is zero: positive reassembly is disabled".to_string(),
-            );
+            return Err(ChunkAdmissionError::Capacity(
+                "role-domain memory budget is zero: positive reassembly is disabled".into(),
+            ));
         }
         // Metadata first: charge the tracking flags before any storage exists.
         // A capacity shortfall defers the decision until the backing's own
@@ -154,23 +167,32 @@ impl ReassemblyBacking {
                     metadata_reservation = Some(MetadataReservation::Memory(reservation))
                 }
                 Err(PayloadBufferError::TooLarge { .. }) => {
-                    return Err(format!(
+                    return Err(ChunkAdmissionError::Capacity(format!(
                         "reassembly tracking metadata {metadata_bytes} bytes exceeds the role-domain memory budget"
-                    ));
+                    )));
                 }
                 Err(PayloadBufferError::InsufficientCapacity { .. })
                 | Err(PayloadBufferError::DeadlineExceeded) => metadata_deferred = true,
             }
         }
-        // `alloc_owned` charges the memory cell itself when it creates fresh
+        // The pool charges the memory cell itself when it creates fresh
         // backing storage (a buddy or dedicated segment) and the file-spill
         // cell for a file mapping; reuse of an already-mapped buddy block
         // takes no new charge. Never double-charge the capacity here.
         let reused_before = guard.stats().buddy_reused_allocs;
-        let handle = match guard.alloc_owned(capacity) {
-            Ok(handle) => handle,
-            Err(e) => return Err(e),
-        };
+        let handle = guard.alloc_owned_with_reason(capacity).map_err(|error| {
+            let message = error.to_string();
+            match error.memory_shortfall() {
+                Some((requested, available)) if requested <= memory_limit - metadata_bytes => {
+                    let deferred = if metadata_deferred { metadata_bytes } else { 0 };
+                    ChunkAdmissionError::MemoryPressure {
+                        needed_bytes: requested + deferred - available,
+                        message,
+                    }
+                }
+                _ => ChunkAdmissionError::Capacity(message),
+            }
+        })?;
         if metadata_deferred {
             // Retry the memory cell once now that the backing's own charge is
             // known. File-spill backings and reused buddy blocks took no new
@@ -182,7 +204,7 @@ impl ReassemblyBacking {
                 Ok(reservation) => {
                     metadata_reservation = Some(MetadataReservation::Memory(reservation))
                 }
-                Err(_) => {
+                Err(memory_error) => {
                     let reserved = if file_spill_eligible {
                         budget
                             .try_reserve_file_spill(metadata_bytes)
@@ -195,9 +217,18 @@ impl ReassemblyBacking {
                         Some(reservation) => metadata_reservation = Some(reservation),
                         None => {
                             drop(handle);
-                            return Err(format!(
+                            let message = format!(
                                 "reassembly tracking metadata {metadata_bytes} bytes exceeded both the role-domain memory and file-spill budgets"
-                            ));
+                            );
+                            return Err(match memory_error {
+                                PayloadBufferError::InsufficientCapacity { available, .. } => {
+                                    ChunkAdmissionError::MemoryPressure {
+                                        needed_bytes: metadata_bytes - available,
+                                        message,
+                                    }
+                                }
+                                _ => ChunkAdmissionError::Capacity(message),
+                            });
                         }
                     }
                 }
@@ -207,9 +238,9 @@ impl ReassemblyBacking {
         let mut received_flags = Vec::new();
         if let Err(error) = received_flags.try_reserve_exact(tracked_chunks) {
             drop(handle);
-            return Err(format!(
+            return Err(ChunkAdmissionError::Capacity(format!(
                 "reassembly chunk tracking allocation failed: {error}"
-            ));
+            )));
         }
         received_flags.resize(tracked_chunks, 0);
         drop(guard);
@@ -637,7 +668,7 @@ mod tests {
         let (other, other_budget) = make();
         let error = ReassemblyBacking::admit_with_guard(owner.clone(), other.write(), 1, 128, 0)
             .unwrap_err();
-        assert!(error.contains("different pool"));
+        assert!(error.to_string().contains("different pool"));
         for (pool, budget) in [(owner, owner_budget), (other, other_budget)] {
             let snapshot = budget.snapshot();
             assert_eq!(snapshot.memory.used_bytes, 0);

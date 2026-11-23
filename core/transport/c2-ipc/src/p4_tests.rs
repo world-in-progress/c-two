@@ -2001,3 +2001,6 @@ async fn discarding_subscription_during_open_or_after_ready_sends_consumer_cance
     client.close().await;
     crate::tests::close_listener(listener).await;
 }
+
+#[path = "outcome_client_tests.rs"]
+mod outcome_client_tests;

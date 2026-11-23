@@ -3272,7 +3272,7 @@ fn open_metadata_precedes_shm_descriptor() {
     )
     .unwrap();
     let (header, payload) = c2_wire::frame::decode_frame(&frame).unwrap();
-    let (_, _, _, storage_offset) = c2_wire::rpc::decode_open_metadata(payload).unwrap();
+    let (_, _, _, _, storage_offset) = c2_wire::rpc::decode_open_metadata(payload).unwrap();
     assert_eq!(&payload[storage_offset..], &encode_buddy_payload(&bp));
     match c2_wire::rpc::decode_rpc_record(&header, payload, None).unwrap() {
         RpcRecord::Open {

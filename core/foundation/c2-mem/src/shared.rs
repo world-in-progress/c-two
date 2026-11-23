@@ -46,6 +46,42 @@ impl SharedBlockInner {
     }
 }
 
+/// Why [`WritableSlab::try_alloc_with_reason`] could not produce a slab.
+///
+/// Only [`Self::CapacityExhausted`] describes a mitigable shortage: the pool
+/// or its domain budget denied a representable request, so a caller that
+/// sheds other retained owners may retry the allocation. The other variants
+/// are permanent properties of the requested length and must never trigger
+/// shedding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SlabAllocError {
+    /// Zero-length slabs are unrepresentable.
+    InvalidLength,
+    /// Lengths or aligned backing sizes outside the SHM wire range.
+    TooLarge,
+    /// Buddy/dedicated capacity or the domain budget denied a representable
+    /// request, with the bytes to free for a retry.
+    CapacityExhausted { needed_bytes: u64 },
+    /// The allocation is unavailable without a known recoverable shortage.
+    Unavailable,
+    /// Pinning a freshly allocated handle failed.
+    Other(String),
+}
+
+impl std::fmt::Display for SlabAllocError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidLength => f.write_str("slab length must be nonzero"),
+            Self::TooLarge => f.write_str("slab backing exceeds the SHM wire size limit"),
+            Self::CapacityExhausted { .. } => f.write_str("no SHM capacity for the requested slab"),
+            Self::Unavailable => f.write_str("SHM is unavailable for the requested slab"),
+            Self::Other(message) => write!(f, "slab pin failed: {message}"),
+        }
+    }
+}
+
+impl std::error::Error for SlabAllocError {}
+
 /// An unpublished SHM allocation with exclusive, lock-free write access.
 pub struct WritableSlab {
     pool: Arc<RwLock<MemPool>>,
@@ -57,17 +93,36 @@ pub struct WritableSlab {
 
 impl WritableSlab {
     pub fn try_alloc(pool: Arc<RwLock<MemPool>>, len: usize) -> Result<Option<Self>, String> {
-        if len == 0 || u32::try_from(len).is_err() {
-            return Ok(None);
-        }
-        let Ok(handle) = pool.write().alloc_shm_handle(len) else {
-            return Ok(None);
-        };
-        match Self::pin(Arc::clone(&pool), handle) {
+        match Self::try_alloc_with_reason(pool, len) {
             Ok(slab) => Ok(Some(slab)),
+            // Preserve the historical contract: every no-slab outcome except
+            // a pin failure reports Ok(None). Callers that must distinguish
+            // unrepresentable lengths from mitigable capacity use
+            // try_alloc_with_reason.
+            Err(SlabAllocError::Other(message)) => Err(message),
+            Err(_) => Ok(None),
+        }
+    }
+
+    /// Allocate like [`Self::try_alloc`] but distinguish why no slab was
+    /// produced, so callers never mistake an unrepresentable length for a
+    /// mitigable capacity shortage.
+    pub fn try_alloc_with_reason(
+        pool: Arc<RwLock<MemPool>>,
+        len: usize,
+    ) -> Result<Self, SlabAllocError> {
+        if len == 0 {
+            return Err(SlabAllocError::InvalidLength);
+        }
+        if u32::try_from(len).is_err() {
+            return Err(SlabAllocError::TooLarge);
+        }
+        let handle = pool.write().alloc_slab_handle(len)?;
+        match Self::pin(Arc::clone(&pool), handle) {
+            Ok(slab) => Ok(slab),
             Err((handle, error)) => {
                 pool.write().release_handle(handle);
-                Err(error)
+                Err(SlabAllocError::Other(error))
             }
         }
     }
@@ -230,6 +285,13 @@ impl SealedShmBlock {
         self.inner.allocation
     }
 
+    /// The block's actual charged quota (buddy `actual_size`, or the
+    /// dedicated backing size), not the logical payload length. Retention
+    /// budgets count sealed blocks by this value.
+    pub fn quota_bytes(&self) -> usize {
+        self.inner.allocation.actual_size as usize
+    }
+
     pub fn len(&self) -> usize {
         self.inner.len
     }
@@ -261,7 +323,11 @@ impl SealedShmBlock {
         // `checked_handle_pin` validated `[offset .. offset + len]`.
         unsafe {
             std::slice::from_raw_parts(
-                self.inner.mapping.region.base_ptr().wrapping_add(self.inner.offset),
+                self.inner
+                    .mapping
+                    .region
+                    .base_ptr()
+                    .wrapping_add(self.inner.offset),
                 self.inner.len,
             )
         }
@@ -445,6 +511,68 @@ mod tests {
             MemPool::new_with_budget(crate::PoolConfig::primary_for_budget(0), budget).unwrap(),
         ));
         assert!(WritableSlab::try_alloc(pool, 64 * 1024).unwrap().is_none());
+    }
+
+    #[test]
+    fn classified_slab_failure_separates_unrepresentable_from_capacity() {
+        fn classified(pool: &Arc<RwLock<MemPool>>, len: usize) -> SlabAllocError {
+            match WritableSlab::try_alloc_with_reason(pool.clone(), len) {
+                Err(error) => error,
+                Ok(_) => panic!("len {len} must fail slab allocation"),
+            }
+        }
+        let pool = Arc::new(RwLock::new(
+            MemPool::new(crate::PoolConfig::primary_for_budget(0)).unwrap(),
+        ));
+        assert_eq!(
+            classified(&pool, 0),
+            SlabAllocError::InvalidLength,
+            "zero-length must be an unrepresentable length, not capacity"
+        );
+        #[cfg(target_pointer_width = "64")]
+        assert_eq!(
+            classified(&pool, u32::MAX as usize + 1),
+            SlabAllocError::TooLarge
+        );
+        assert_eq!(
+            classified(&pool, u32::MAX as usize),
+            SlabAllocError::TooLarge
+        );
+        let budget = crate::DomainBudget::from_limits(&c2_config::DomainLimits {
+            memory_budget_bytes: 64 * 1024,
+            ..Default::default()
+        });
+        let reserved = budget.try_reserve_memory(128).unwrap();
+        let pool = Arc::new(RwLock::new(
+            MemPool::new_with_budget(
+                crate::PoolConfig {
+                    pool_enabled: false,
+                    spill_threshold: 1.0,
+                    ..crate::PoolConfig::default()
+                },
+                budget,
+            )
+            .unwrap(),
+        ));
+        assert_eq!(classified(&pool, 65 * 1024), SlabAllocError::Unavailable);
+        assert_eq!(
+            classified(&pool, 64 * 1024),
+            SlabAllocError::CapacityExhausted { needed_bytes: 128 },
+        );
+        drop(reserved);
+        assert!(WritableSlab::try_alloc_with_reason(pool, 64 * 1024).is_ok());
+    }
+
+    #[test]
+    fn sealed_block_reports_its_buddy_quota_bytes() {
+        let pool = Arc::new(RwLock::new(
+            MemPool::new(crate::PoolConfig::primary_for_budget(8 * 1024 * 1024)).unwrap(),
+        ));
+        let len = 65 * 1024; // between buddy levels: quota rounds up
+        let sealed = SealedShmBlock::from_bytes(pool, &vec![7u8; len]).unwrap();
+        assert_eq!(sealed.len(), len);
+        assert!(sealed.quota_bytes() >= len);
+        assert_eq!(sealed.quota_bytes() % (64 * 1024), 0);
     }
 
     #[test]

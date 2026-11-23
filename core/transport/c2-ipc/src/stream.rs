@@ -1106,7 +1106,7 @@ impl IpcClient {
                         &send.state,
                         part,
                         data.as_ref().len(),
-                        (&identity, index, CallMode::ServerStream),
+                        (&identity, index, CallMode::ServerStream, None),
                         bytes,
                         if part == 0 { control.cloned() } else { None },
                     )

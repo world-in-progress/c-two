@@ -214,6 +214,7 @@ struct DomainState {
     file_spill: BudgetCellSnapshot,
     operations: RetentionSnapshot,
     active_subscriptions: u64,
+    active_control_operations: u64,
     memory_waiters: AsyncWaiters,
     warm_buffers: VecDeque<Vec<u8>>,
     warm_idle_bytes: u64,
@@ -398,6 +399,7 @@ impl DomainBudget {
                         closed: false,
                     },
                     active_subscriptions: 0,
+                    active_control_operations: 0,
                     memory_waiters: AsyncWaiters::default(),
                     warm_buffers: VecDeque::new(),
                     warm_idle_bytes: 0,
@@ -538,6 +540,31 @@ impl DomainBudget {
         Ok(OperationPermit {
             shared: Arc::clone(&self.shared),
             is_subscription: false,
+        })
+    }
+
+    /// Admit a bounded control operation independently of the business slots.
+    pub fn reserve_control_operation(&self) -> Result<ControlOperationPermit, RetentionError> {
+        let mut state = self.shared.lock();
+        let max_operations = state.operations.max_operations.clamp(1, 64);
+        let used_operations = state.active_control_operations;
+        let reason = if state.operations.closed {
+            Some(RetentionRejectReason::Closed)
+        } else if used_operations == max_operations {
+            Some(RetentionRejectReason::LimitReached)
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            return Err(RetentionError {
+                reason,
+                used_operations,
+                max_operations,
+            });
+        }
+        state.active_control_operations += 1;
+        Ok(ControlOperationPermit {
+            shared: Arc::clone(&self.shared),
         })
     }
 
@@ -807,7 +834,10 @@ impl MemoryReservation {
             len as u64 <= self.bytes,
             "length exceeds memory reservation"
         );
-        if let Some(bytes) = self.shared.take_warm_vec_for_reservation(&mut self.bytes, len) {
+        if let Some(bytes) = self
+            .shared
+            .take_warm_vec_for_reservation(&mut self.bytes, len)
+        {
             return Ok(bytes);
         }
         allocate_exact_vec(len)
@@ -947,6 +977,15 @@ impl BudgetedBuffer {
         }
     }
 
+    /// A buffer that carries no domain charge: delivery-only owners whose
+    /// bytes are transient send copies, never retained outcome storage.
+    pub fn unreserved(bytes: Vec<u8>) -> Self {
+        Self {
+            bytes,
+            reservation: None,
+        }
+    }
+
     pub fn capacity(&self) -> usize {
         self.bytes.capacity()
     }
@@ -997,6 +1036,18 @@ impl FileSpillReservation {
 impl Drop for FileSpillReservation {
     fn drop(&mut self) {
         self.shared.lock().file_spill.release(self.bytes);
+    }
+}
+
+#[must_use = "keep the permit until the control operation finishes"]
+#[derive(Debug)]
+pub struct ControlOperationPermit {
+    shared: Arc<Shared>,
+}
+
+impl Drop for ControlOperationPermit {
+    fn drop(&mut self) {
+        self.shared.lock().active_control_operations -= 1;
     }
 }
 

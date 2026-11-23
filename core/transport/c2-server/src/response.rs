@@ -1,8 +1,50 @@
 //! Response payload preparation helpers.
 
-use c2_mem::{MemPool, WritableSlab};
+use std::sync::Arc;
+
+use c2_mem::{
+    DomainBudget, MemPool, MemoryReservation, PayloadBufferError, SlabAllocError, WritableSlab,
+};
 
 use crate::dispatcher::PreparedShmResponse;
+use crate::outcome::HostOutcomeStore;
+
+/// One retry allowance for a Host allocation, including its fallback tiers.
+pub(crate) struct OutcomePressure<'a> {
+    store: Option<&'a HostOutcomeStore>,
+}
+
+impl<'a> OutcomePressure<'a> {
+    pub(crate) fn new(store: Option<&'a HostOutcomeStore>) -> Self {
+        Self { store }
+    }
+
+    pub(crate) fn shed(&mut self, needed_bytes: u64) -> bool {
+        let Some(store) = self.store.take() else {
+            return false;
+        };
+        // Released owners can reacquire a pool or domain lock. The failed
+        // allocation has returned before we call into the store.
+        let owners = store.shed_for_pressure(needed_bytes);
+        let released = !owners.is_empty();
+        owners.deliver();
+        released
+    }
+
+    pub(crate) fn reserve_memory(
+        &mut self,
+        budget: &DomainBudget,
+        bytes: u64,
+    ) -> Result<MemoryReservation, PayloadBufferError> {
+        let result = budget.try_reserve_memory(bytes);
+        if let Err(PayloadBufferError::InsufficientCapacity { available, .. }) = &result
+            && self.shed(bytes - available)
+        {
+            return budget.try_reserve_memory(bytes);
+        }
+        result
+    }
+}
 
 /// The server's fixed response-pool owner.
 ///
@@ -10,14 +52,32 @@ use crate::dispatcher::PreparedShmResponse;
 /// [`try_prepare_shm_response`]. Safe access cannot replace the pool advertised
 /// to connected peers or release a backing still owned by a prepared response.
 pub struct ResponsePool {
-    pub(crate) inner: std::sync::Arc<parking_lot::RwLock<MemPool>>,
+    pub(crate) inner: Arc<parking_lot::RwLock<MemPool>>,
+    outcome: Option<Arc<HostOutcomeStore>>,
+    max_payload_size: u64,
 }
 
 impl ResponsePool {
     pub(crate) fn new(pool: MemPool) -> Self {
         Self {
-            inner: std::sync::Arc::new(parking_lot::RwLock::new(pool)),
+            inner: Arc::new(parking_lot::RwLock::new(pool)),
+            outcome: None,
+            max_payload_size: u64::MAX,
         }
+    }
+
+    pub(crate) fn with_outcome_store(
+        mut self,
+        store: Arc<HostOutcomeStore>,
+        max_payload_size: u64,
+    ) -> Self {
+        self.outcome = Some(store);
+        self.max_payload_size = max_payload_size;
+        self
+    }
+
+    pub(crate) fn pressure(&self) -> OutcomePressure<'_> {
+        OutcomePressure::new(self.outcome.as_deref())
     }
 
     pub fn try_alloc_slab(
@@ -25,10 +85,34 @@ impl ResponsePool {
         shm_threshold: u64,
         len: usize,
     ) -> Result<Option<WritableSlab>, String> {
+        self.alloc_slab(shm_threshold, len, &mut self.pressure())
+    }
+
+    pub(crate) fn alloc_slab(
+        &self,
+        shm_threshold: u64,
+        len: usize,
+        pressure: &mut OutcomePressure<'_>,
+    ) -> Result<Option<WritableSlab>, String> {
+        if len as u64 > self.max_payload_size {
+            return Err(format!(
+                "response payload size {len} exceeds max_payload_size {}",
+                self.max_payload_size
+            ));
+        }
         if len as u64 <= shm_threshold {
             return Ok(None);
         }
-        WritableSlab::try_alloc(self.inner.clone(), len)
+        match WritableSlab::try_alloc_with_reason(Arc::clone(&self.inner), len) {
+            Ok(slab) => Ok(Some(slab)),
+            Err(SlabAllocError::CapacityExhausted { needed_bytes })
+                if pressure.shed(needed_bytes) =>
+            {
+                WritableSlab::try_alloc(Arc::clone(&self.inner), len)
+            }
+            Err(SlabAllocError::Other(message)) => Err(message),
+            Err(_) => Ok(None),
+        }
     }
 
     pub fn finish_slab(&self, slab: WritableSlab) -> Result<PreparedShmResponse, String> {
@@ -61,8 +145,8 @@ impl ResponsePool {
 ///
 /// Returns `Ok(None)` when the caller should materialise owned inline bytes and
 /// let `send_response_meta()` choose inline or chunked fallback. Allocation
-/// failure is therefore not a CRM failure. Errors are reserved for cases where
-/// an allocation was made but the payload could not be copied safely.
+/// failure is therefore not a CRM failure. Errors report an over-limit payload
+/// or a failure to access or write the allocated backing.
 pub fn try_prepare_shm_response<F>(
     response_pool: &ResponsePool,
     shm_threshold: u64,
@@ -226,5 +310,91 @@ mod tests {
 
         assert!(meta.is_none());
         assert_eq!(pool.read().stats().alloc_count, 0);
+    }
+
+    #[test]
+    fn full_response_pool_sheds_retained_shm_after_leaving_pool_lock() {
+        use crate::outcome::{
+            AdmitOutcome, ExecutionAdmission, HostOutcomeStore, OutcomeLimits, OutcomeResponse,
+        };
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        const LEN: usize = 64 * 1024;
+        let budget = c2_mem::DomainBudget::from_limits(&c2_config::DomainLimits {
+            memory_budget_bytes: LEN as u64,
+            ..Default::default()
+        });
+        let store = Arc::new(HostOutcomeStore::new(
+            OutcomeLimits {
+                max_entries: 2,
+                max_retained_bytes: LEN as u64,
+            },
+            budget.clone(),
+        ));
+        let pool = ResponsePool::new(
+            MemPool::new_with_prefix_and_budget(
+                PoolConfig {
+                    pool_enabled: false,
+                    max_dedicated_segments: 1,
+                    spill_threshold: 1.0,
+                    ..PoolConfig::default()
+                },
+                unique_prefix("pressure"),
+                budget,
+            )
+            .unwrap(),
+        )
+        .with_outcome_store(Arc::clone(&store), LEN as u64);
+
+        let route: Arc<str> = Arc::from("route");
+        let AdmitOutcome::Miss { generation } = store.admit(&route, "old", 0) else {
+            panic!("expected first admission");
+        };
+        let ExecutionAdmission::Won(owners) =
+            store.begin_execution(&route, "old", generation, [0; 32], || true)
+        else {
+            panic!("expected execution admission");
+        };
+        owners.deliver();
+        let block = Arc::new(
+            pool.try_alloc_slab(0, LEN)
+                .unwrap()
+                .unwrap()
+                .seal()
+                .unwrap(),
+        );
+        store
+            .publish_success(&route, "old", generation, OutcomeResponse::Shm(block))
+            .deliver();
+
+        let error = super::try_prepare_shm_response(&pool, 2 * LEN as u64, LEN + 1, |_| {
+            panic!("over-limit value must fail before writing")
+        })
+        .unwrap_err();
+        assert!(error.contains("exceeds max_payload_size"));
+        assert!(
+            store
+                .query(&route, "old", |_| Some("m".into()))
+                .result_available
+        );
+
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            sender.send(pool.try_alloc_slab(0, LEN)).unwrap();
+        });
+        let slab = receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("release of the previous sealed block must not wait on allocation's pool lock")
+            .unwrap()
+            .expect("releasing the retained block makes room for the new slab");
+        worker.join().unwrap();
+        assert_eq!(slab.len(), LEN);
+        assert_eq!(
+            store
+                .query(&route, "old", |_| Some("m".into()))
+                .result_unavailable_reason,
+            Some(c2_wire::rpc::WireResultUnavailableReason::Evicted),
+        );
     }
 }

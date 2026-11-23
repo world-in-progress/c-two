@@ -632,6 +632,7 @@ async fn expired_scope_after_first_chunk_does_not_recheck_dispatch_and_invokes_o
                 .call_chunked_stream_controlled(
                     &acquired_identity,
                     method_idx,
+                    None,
                     CHUNK_SIZE as usize * 2 + 1,
                     stream,
                     DEFAULT_MAX_PAYLOAD_SIZE,

@@ -115,8 +115,9 @@ fn encoding_waits(shm: bool, shutdown: ShutdownPoint) {
     let admission = ChunkRouteAdmission {
         route: route.route,
         method_idx: 1,
-        pending_permit: route.pending_permit,
-        _flight: crate::connection::FlightGuard::new(&conn),
+        pending_permit: Some(route.pending_permit),
+        keyed: None,
+        _flight: Some(crate::connection::FlightGuard::new(&conn)),
     };
 
     if matches!(shutdown, ShutdownPoint::BeforeFirstStep) {

@@ -161,8 +161,7 @@ impl ChunkAssembler {
             total_chunks,
             chunk_size,
             total_chunks,
-        )
-        .map_err(ChunkAdmissionError::Capacity)?;
+        )?;
         let chunk_state = backing
             .take_received_flags()
             .map_err(ChunkAdmissionError::Capacity)?;

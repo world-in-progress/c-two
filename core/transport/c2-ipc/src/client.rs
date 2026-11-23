@@ -291,7 +291,9 @@ impl From<ChunkAdmissionError> for ChunkError {
     fn from(error: ChunkAdmissionError) -> Self {
         let message = format!("chunked reply reassembly admission failed: {error}");
         match error {
-            ChunkAdmissionError::Capacity(_) => Self::Capacity(message),
+            ChunkAdmissionError::Capacity(_) | ChunkAdmissionError::MemoryPressure { .. } => {
+                Self::Capacity(message)
+            }
             ChunkAdmissionError::Protocol(_) | ChunkAdmissionError::Duplicate { .. } => {
                 Self::Protocol(message)
             }
@@ -630,6 +632,10 @@ impl RouteBinding {
     }
 
     pub(crate) fn subscribe_target(&self) -> (RouteCallIdentity, u64) {
+        (self.table.call_identity(), self.table.max_payload_size())
+    }
+
+    pub(crate) fn identity_target(&self) -> (RouteCallIdentity, u64) {
         (self.table.call_identity(), self.table.max_payload_size())
     }
 }
@@ -1741,6 +1747,244 @@ impl IpcClient {
             .map_err(crate::IpcCallError::into_source)
     }
 
+    /// Submit one unary call with an explicit `call_id` (ADR 0006 keyed
+    /// submit). Mirrors the plain unary transport selection — inline, buddy
+    /// SHM or chunked first frame — with the keyed OPEN encoding.
+    pub async fn call_keyed_bound(
+        &self,
+        binding: &RouteBinding,
+        method_name: &str,
+        call_id: &str,
+        data: &[u8],
+    ) -> Result<ResponseData, IpcError> {
+        let (method_idx, identity, max_payload_size) = binding.call_target_for(method_name)?;
+        self.call_keyed(&identity, method_idx, call_id, data, max_payload_size)
+            .await
+            .map_err(crate::IpcCallError::into_source)
+    }
+
+    async fn call_keyed(
+        &self,
+        identity: &RouteCallIdentity,
+        method_idx: u16,
+        call_id: &str,
+        data: &[u8],
+        max_payload_size: u64,
+    ) -> Result<ResponseData, crate::IpcCallError> {
+        validate_request_size(identity.route_name.as_ref(), data.len(), max_payload_size)?;
+        if choose_request_transport(self.shm_request_available(), data.len())
+            == RequestTransportKind::Buddy
+            && let Some(block) = self
+                .try_alloc_request_block(data.len())
+                .map_err(pre_dispatch_call_error)?
+        {
+            block.write_at(0, data).map_err(pre_dispatch_call_error)?;
+            return self
+                .call_keyed_with_prealloc(identity, method_idx, call_id, &block, max_payload_size)
+                .await;
+        }
+        if choose_request_transport(false, data.len()) == RequestTransportKind::Chunked {
+            return self
+                .call_keyed_chunked(identity, method_idx, call_id, data, max_payload_size)
+                .await;
+        }
+        self.call_keyed_inline(identity, method_idx, call_id, data, max_payload_size)
+            .await
+    }
+
+    async fn call_keyed_inline(
+        &self,
+        identity: &RouteCallIdentity,
+        method_idx: u16,
+        call_id: &str,
+        data: &[u8],
+        max_payload_size: u64,
+    ) -> Result<ResponseData, crate::IpcCallError> {
+        let (send, mut rx) = self
+            .begin_pending(PendingKind::Call(CallMode::KeyedUnary), max_payload_size)
+            .map_err(pre_dispatch_call_error)?;
+        let bytes = rpc::encode_open_keyed_draft_frame(
+            identity,
+            method_idx,
+            call_id,
+            ValuePart::whole(ValueStorage::Inline(data)),
+        )
+        .map_err(|error| pre_dispatch_call_error(IpcError::Protocol(error.to_string())))?;
+        let written = send
+            .conn
+            .submit(
+                bytes,
+                WriteRequest::Business(Vec::new()),
+                send.state.clone(),
+                None,
+            )
+            .await;
+        let response = match written {
+            Ok(()) => rx
+                .await
+                .map_err(|_| dispatch_call_error(IpcError::Closed, send.started()))?,
+            Err(error) => prefer_ready_response(error, &mut rx),
+        };
+        owned_response(response, &self.budget)
+            .map_err(|error| dispatch_call_error(error, send.started()))
+    }
+
+    async fn call_keyed_with_prealloc(
+        &self,
+        identity: &RouteCallIdentity,
+        method_idx: u16,
+        call_id: &str,
+        block: &RequestBlock,
+        max_payload_size: u64,
+    ) -> Result<ResponseData, crate::IpcCallError> {
+        let (send, mut rx) = self
+            .begin_pending(PendingKind::Call(CallMode::KeyedUnary), max_payload_size)
+            .map_err(pre_dispatch_call_error)?;
+        let loan = block.prepare(&send.conn).map_err(pre_dispatch_call_error)?;
+        let alloc = block.allocation();
+        let descriptor = BuddyPayload {
+            seg_idx: alloc.seg_idx as u16,
+            generation: alloc.generation,
+            offset: alloc.offset,
+            data_size: block.len() as u32,
+            is_dedicated: alloc.is_dedicated,
+            loan_id: loan.id(),
+        };
+        let bytes = rpc::encode_open_keyed_draft_frame(
+            identity,
+            method_idx,
+            call_id,
+            ValuePart::whole(ValueStorage::Shm(descriptor)),
+        )
+        .map_err(|error| pre_dispatch_call_error(IpcError::Protocol(error.to_string())))?;
+        let written = send
+            .conn
+            .submit(
+                bytes,
+                WriteRequest::Business(vec![loan]),
+                send.state.clone(),
+                None,
+            )
+            .await;
+        let response = match written {
+            Ok(()) => rx
+                .await
+                .map_err(|_| dispatch_call_error(IpcError::Closed, send.started()))?,
+            Err(error) => prefer_ready_response(error, &mut rx),
+        };
+        owned_response(response, &self.budget)
+            .map_err(|error| dispatch_call_error(error, send.started()))
+    }
+
+    async fn call_keyed_chunked(
+        &self,
+        identity: &RouteCallIdentity,
+        method_idx: u16,
+        call_id: &str,
+        data: &[u8],
+        max_payload_size: u64,
+    ) -> Result<ResponseData, crate::IpcCallError> {
+        self.call_chunked_stream_controlled(
+            identity,
+            method_idx,
+            Some(call_id),
+            data.len(),
+            futures_util::stream::iter([Ok::<_, std::io::Error>(data.to_vec())]),
+            max_payload_size,
+            None,
+        )
+        .await
+    }
+
+    /// Recover one keyed unary call by its `call_id` (ADR 0006): no request
+    /// body; the reply decodes as one unary `CALL_END`.
+    pub async fn recover_call_bound(
+        &self,
+        binding: &RouteBinding,
+        method_name: &str,
+        call_id: &str,
+    ) -> Result<ResponseData, IpcError> {
+        let (method_idx, identity, max_payload_size) = binding.call_target_for(method_name)?;
+        self.recover_call(&identity, method_idx, call_id, max_payload_size)
+            .await
+            .map_err(crate::IpcCallError::into_source)
+    }
+
+    async fn recover_call(
+        &self,
+        identity: &RouteCallIdentity,
+        method_idx: u16,
+        call_id: &str,
+        max_payload_size: u64,
+    ) -> Result<ResponseData, crate::IpcCallError> {
+        let (send, mut rx) = self
+            .begin_pending(PendingKind::Call(CallMode::Recover), max_payload_size)
+            .map_err(pre_dispatch_call_error)?;
+        let bytes = rpc::encode_open_recover_draft_frame(&identity, method_idx, call_id)
+            .map_err(|error| pre_dispatch_call_error(IpcError::Protocol(error.to_string())))?;
+        let written = send
+            .conn
+            .submit(
+                bytes,
+                WriteRequest::Business(Vec::new()),
+                send.state.clone(),
+                None,
+            )
+            .await;
+        let response = match written {
+            Ok(()) => rx
+                .await
+                .map_err(|_| dispatch_call_error(IpcError::Closed, send.started()))?,
+            Err(error) => prefer_ready_response(error, &mut rx),
+        };
+        owned_response(response, &self.budget)
+            .map_err(|error| dispatch_call_error(error, send.started()))
+    }
+
+    /// Non-blocking outcome query for one keyed call (ADR 0006). Bypasses
+    /// the business call slots: the query rides the connection's control
+    /// admission with its own request ID from the writer sequence and an
+    /// independent pending table; `timeout` bounds only the local wait.
+    pub async fn query_call(
+        &self,
+        binding: &RouteBinding,
+        call_id: &str,
+        timeout: std::time::Duration,
+    ) -> Result<rpc::WireCallOutcome, IpcError> {
+        let (identity, _max_payload_size) = binding.identity_target();
+        self.query_call_identity(&identity, call_id, timeout).await
+    }
+
+    pub async fn query_call_identity(
+        &self,
+        identity: &RouteCallIdentity,
+        call_id: &str,
+        timeout: std::time::Duration,
+    ) -> Result<rpc::WireCallOutcome, IpcError> {
+        let conn = self.driver.read().clone().ok_or(IpcError::Closed)?;
+        if conn.core.is_deactivated() {
+            return Err(IpcError::Closed);
+        }
+        let frame = rpc::encode_query_call_draft_frame(identity, call_id)
+            .map_err(|error| IpcError::Protocol(error.to_string()))?;
+        let _permit = self.budget.reserve_control_operation().map_err(|error| {
+            if error.reason == c2_mem::RetentionRejectReason::Closed {
+                return IpcError::Closed;
+            }
+            IpcError::LocalCallRejected(
+                C2Error::new(
+                    ErrorCode::CallCapacityExceeded,
+                    "all outcome query slots are in use",
+                )
+                .with_details(std::collections::BTreeMap::from([
+                    ("used".into(), error.used_operations.to_string()),
+                    ("limit".into(), error.max_operations.to_string()),
+                ])),
+            )
+        })?;
+        conn.query(frame, timeout).await
+    }
+
     async fn call_bound_with_control(
         &self,
         binding: &RouteBinding,
@@ -1904,6 +2148,7 @@ impl IpcClient {
                 self.call_chunked_stream_controlled(
                     identity,
                     method_idx,
+                    None,
                     data_len,
                     futures_util::stream::iter([Ok::<_, std::io::Error>(data)]),
                     max_payload_size,
@@ -2357,6 +2602,7 @@ impl IpcClient {
         self.call_chunked_stream_controlled(
             identity,
             method_idx,
+            None,
             data.len(),
             futures_util::stream::iter([Ok::<_, std::io::Error>(data.to_vec())]),
             max_payload_size,
@@ -2381,6 +2627,7 @@ impl IpcClient {
         self.call_chunked_stream_controlled(
             identity,
             method_idx,
+            None,
             data_size,
             chunks,
             max_payload_size,
@@ -2393,6 +2640,7 @@ impl IpcClient {
         &self,
         identity: &RouteCallIdentity,
         method_idx: u16,
+        call_id: Option<&str>,
         data_size: usize,
         chunks: S,
         max_payload_size: u64,
@@ -2417,12 +2665,17 @@ impl IpcClient {
                 )
                 .await;
         }
+        let pending_kind = match call_id {
+            Some(_) => PendingKind::Call(CallMode::KeyedUnary),
+            None => PendingKind::Call(CallMode::Unary),
+        };
         let (mut send, mut rx) = self
-            .begin_call(max_payload_size)
+            .begin_pending(pending_kind, max_payload_size)
             .map_err(pre_dispatch_call_error)?;
         let conn = send.conn.clone();
         let state = send.state.clone();
         let identity = identity.clone();
+        let call_id = call_id.map(str::to_string);
         let (upload_stop, stop_upload) = watch::channel(false);
         if let Some(entry) = self.pending.lock().unpublished_mut(&send.state) {
             entry.upload_stop = Some(upload_stop);
@@ -2436,6 +2689,7 @@ impl IpcClient {
                 data_size,
                 identity,
                 method_idx,
+                call_id,
                 chunks,
                 policy,
                 stop_upload,
@@ -2452,10 +2706,7 @@ impl IpcClient {
                     &self.budget,
                 )
                 .map_err(|source| {
-                    dispatch_call_error(
-                        source,
-                        phase == crate::TransportPhase::DispatchUncertain,
-                    )
+                    dispatch_call_error(source, phase == crate::TransportPhase::DispatchUncertain)
                 });
             }
             Err(error) => {
@@ -2483,6 +2734,7 @@ impl IpcClient {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn send_chunked_stream_frames<S, B, E>(
         conn: Arc<ClientConnection>,
         state: Arc<StdMutex<SendState>>,
@@ -2491,6 +2743,7 @@ impl IpcClient {
         data_size: usize,
         identity: RouteCallIdentity,
         method_idx: u16,
+        call_id: Option<String>,
         chunks: S,
         policy: Option<IpcCallControl>,
         mut stop_upload: watch::Receiver<bool>,
@@ -2547,7 +2800,7 @@ impl IpcClient {
                         &state,
                         index,
                         data_size,
-                        (&identity, method_idx, CallMode::Unary),
+                        (&identity, method_idx, CallMode::Unary, call_id.as_deref()),
                         &buffered,
                         if index == 0 { policy.clone() } else { None },
                     )
@@ -2577,7 +2830,7 @@ impl IpcClient {
                 &state,
                 index,
                 data_size,
-                (&identity, method_idx, CallMode::Unary),
+                (&identity, method_idx, CallMode::Unary, call_id.as_deref()),
                 &buffered,
                 if index == 0 { policy } else { None },
             )
@@ -2615,22 +2868,31 @@ impl IpcClient {
         dispatch_call_error(error, started)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn write_chunk_frame(
         conn: &Arc<ClientConnection>,
         state: &Arc<StdMutex<SendState>>,
         chunk_idx: usize,
         total_bytes: usize,
-        open: (&RouteCallIdentity, u16, CallMode),
+        open: (&RouteCallIdentity, u16, CallMode, Option<&str>),
         chunk_data: &[u8],
         policy: Option<IpcCallControl>,
     ) -> Result<(), IpcError> {
         let bytes = if chunk_idx == 0 {
-            rpc::encode_open_draft_frame(
-                open.0,
-                open.1,
-                open.2,
-                ValuePart::first(total_bytes as u64, ValueStorage::Inline(chunk_data)),
-            )
+            match open.3 {
+                Some(call_id) => rpc::encode_open_keyed_draft_frame(
+                    open.0,
+                    open.1,
+                    call_id,
+                    ValuePart::first(total_bytes as u64, ValueStorage::Inline(chunk_data)),
+                ),
+                None => rpc::encode_open_draft_frame(
+                    open.0,
+                    open.1,
+                    open.2,
+                    ValuePart::first(total_bytes as u64, ValueStorage::Inline(chunk_data)),
+                ),
+            }
         } else {
             rpc::encode_open_continuation_draft_frame(ValueStorage::Inline(chunk_data))
         }
@@ -3315,6 +3577,29 @@ pub(crate) fn recv_loop(
                     ConnectionEndReason::ProtocolError,
                     "unnegotiated_shm_response",
                 );
+            }
+            if hdr.flags & flags::FLAG_RPC_RECORD != 0
+                && payload.first() == Some(&(RpcRecordKind::QueryCallResult as u8))
+            {
+                // Query replies match the independent query table by their
+                // request ID: a late reply for a locally timed-out query is
+                // dropped here, and a reconnect's fresh table never sees the
+                // old connection's replies.
+                if hdr.is_buddy() {
+                    conn.end(ConnectionEndReason::ProtocolError, "query_result_shm");
+                }
+                let result = match rpc::decode_rpc_record(&hdr, &payload, None) {
+                    Ok(RpcRecord::QueryCallResult(rpc::WireQueryCallResult::Outcome(outcome))) => {
+                        Ok(outcome)
+                    }
+                    Ok(RpcRecord::QueryCallResult(rpc::WireQueryCallResult::Error(error))) => {
+                        Err(IpcError::CallRejected(error))
+                    }
+                    Err(error) => Err(IpcError::Decode(error)),
+                    _ => unreachable!("record kind is QueryCallResult"),
+                };
+                conn.complete_query(rid, result);
+                continue;
             }
             let (kind, historical) = {
                 let calls = pending.lock();

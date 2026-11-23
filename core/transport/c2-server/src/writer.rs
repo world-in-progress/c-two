@@ -77,7 +77,7 @@ struct Submission {
     request: WriteRequest,
     reply: WriteReceipt,
     prepared: Option<(u64, PreparedShmResponse, PreparedRecordKind)>,
-    shared_item: Option<(u64, UnpublishedSharedLoan)>,
+    shared_item: Option<(u64, UnpublishedSharedLoan, SharedRecordKind)>,
     item: Option<ItemFrame>,
     // Nonblocking replies retain drain ownership after their dispatcher returns.
     _flight: WriteGuard,
@@ -96,6 +96,12 @@ enum PreparedRecordKind {
     ItemData,
 }
 
+#[derive(Clone, Copy)]
+enum SharedRecordKind {
+    ItemData,
+    UnaryCallEnd,
+}
+
 /// Submit complete frames to the connection's sole write task. Dropping a
 /// caller's reply receiver never cancels a frame already started by the task.
 pub(crate) struct ConnectionWriter {
@@ -105,6 +111,9 @@ pub(crate) struct ConnectionWriter {
     /// that stops reading exhausts only its own connection; every other
     /// connection keeps its independent budget.
     control_budget: Arc<Semaphore>,
+    /// One pending overload reply per connection, with read-side backpressure
+    /// if the peer sends further queries without reading replies.
+    query_overflow: Arc<Semaphore>,
     pub(crate) conn: Arc<Connection>,
 }
 
@@ -150,6 +159,7 @@ impl ConnectionWriter {
             queue,
             controls,
             control_budget: Arc::new(Semaphore::new(1024)),
+            query_overflow: Arc::new(Semaphore::new(1)),
             conn: conn.clone(),
         });
         let task = tokio::spawn(async move {
@@ -179,6 +189,7 @@ impl ConnectionWriter {
             // One bounded control budget per physical connection: exhaustion
             // ends only this connection with `reply_pending_capacity`.
             control_budget: Arc::new(Semaphore::new(control_reply_capacity)),
+            query_overflow: Arc::new(Semaphore::new(1)),
             conn: conn.clone(),
         });
         // Keep the physical retirement owner until the write half has gone.
@@ -310,7 +321,11 @@ impl ConnectionWriter {
             .submit(
                 Vec::new(),
                 None,
-                Some((request_id, UnpublishedSharedLoan::new(loan))),
+                Some((
+                    request_id,
+                    UnpublishedSharedLoan::new(loan),
+                    SharedRecordKind::ItemData,
+                )),
                 true,
                 None,
             )
@@ -322,11 +337,41 @@ impl ConnectionWriter {
         }
     }
 
+    /// Publish one 1-to-N `SharedShmLoan` as a unary `CALL_END` SHM
+    /// descriptor (ADR 0006 keyed-outcome delivery). Each waiting connection
+    /// mints its own independent loan from the shared sealed block; returns
+    /// `Ok(Some(loan))` when the connection deactivated before publication
+    /// so the caller settles the unused loan and falls back to chunks.
+    pub(crate) async fn write_call_end_shared_shm(
+        &self,
+        request_id: u64,
+        loan: c2_mem::SharedShmLoan,
+    ) -> io::Result<Option<c2_mem::SharedShmLoan>> {
+        match self
+            .submit(
+                Vec::new(),
+                None,
+                Some((
+                    request_id,
+                    UnpublishedSharedLoan::new(loan),
+                    SharedRecordKind::UnaryCallEnd,
+                )),
+                true,
+                None,
+            )
+            .await?
+        {
+            WriteReturn::None => Ok(None),
+            WriteReturn::SharedLoan(loan) => Ok(Some(loan.into_inner())),
+            WriteReturn::Prepared(_) => unreachable!("shared SHM CALL_END write"),
+        }
+    }
+
     async fn submit(
         &self,
         bytes: Vec<u8>,
         prepared: Option<(u64, PreparedShmResponse, PreparedRecordKind)>,
-        shared_item: Option<(u64, UnpublishedSharedLoan)>,
+        shared_item: Option<(u64, UnpublishedSharedLoan, SharedRecordKind)>,
         call_record: bool,
         item: Option<ItemFrame>,
     ) -> io::Result<WriteReturn> {
@@ -422,6 +467,31 @@ impl ConnectionWriter {
         self.reserve_control()?.send(bytes);
         Ok(())
     }
+
+    pub(crate) fn queue_query_reply(
+        &self,
+        bytes: Vec<u8>,
+        pending: OwnedSemaphorePermit,
+    ) -> io::Result<()> {
+        let control = self.conn.core.prepare_control_frame().map_err(core_error)?;
+        QueuedReplyPermit {
+            queue: self.controls.clone(),
+            pending,
+            request: WriteRequest::Control(control),
+            flight: WriteGuard::new(&self.conn),
+        }
+        .try_send(bytes)
+    }
+
+    pub(crate) async fn queue_query_overflow(&self, bytes: Vec<u8>) -> io::Result<()> {
+        let pending = tokio::select! {
+            permit = self.query_overflow.clone().acquire_owned() => {
+                permit.map_err(|_| broken_pipe())?
+            }
+            _ = self.controls.closed() => return Err(broken_pipe()),
+        };
+        self.queue_query_reply(bytes, pending)
+    }
 }
 
 async fn run<W: AsyncWrite + Unpin>(
@@ -433,29 +503,50 @@ async fn run<W: AsyncWrite + Unpin>(
 ) {
     let mut queue_closed = false;
     let mut controls_closed = false;
+    // Fair alternation between control replies and business frames: after a
+    // control reply, one pending business frame goes first, so a
+    // high-frequency query stream cannot starve CALL_END delivery.
+    let mut prefer_business = false;
     loop {
         if conn.reading_stopped() || conn.write_peer_closed() {
             break;
         }
-        if !controls_closed {
+        let mut served = false;
+        if prefer_business && !queue_closed {
+            match receiver.try_recv() {
+                Ok(submission) => {
+                    process_submission(stream, &conn, submission, write_timeout).await;
+                    prefer_business = false;
+                    served = true;
+                }
+                Err(mpsc::error::TryRecvError::Disconnected) => queue_closed = true,
+                Err(mpsc::error::TryRecvError::Empty) => {}
+            }
+        }
+        if !served && !controls_closed {
             match controls.try_recv() {
                 Ok(submission) => {
                     process_submission(stream, &conn, submission, write_timeout).await;
-                    continue;
+                    prefer_business = true;
+                    served = true;
                 }
                 Err(mpsc::error::TryRecvError::Disconnected) => controls_closed = true,
                 Err(mpsc::error::TryRecvError::Empty) => {}
             }
         }
-        if !queue_closed {
+        if !served && !queue_closed {
             match receiver.try_recv() {
                 Ok(submission) => {
                     process_submission(stream, &conn, submission, write_timeout).await;
-                    continue;
+                    prefer_business = false;
+                    served = true;
                 }
                 Err(mpsc::error::TryRecvError::Disconnected) => queue_closed = true,
                 Err(mpsc::error::TryRecvError::Empty) => {}
             }
+        }
+        if served {
+            continue;
         }
         // A completed remote read wakes this task even when no RPC is queued.
         if conn.handshake_done() {
@@ -489,13 +580,19 @@ async fn run<W: AsyncWrite + Unpin>(
             _ = conn.writer_wake.notified() => {}
             next = controls.recv(), if !controls_closed => {
                 match next {
-                    Some(submission) => process_submission(stream, &conn, submission, write_timeout).await,
+                    Some(submission) => {
+                        process_submission(stream, &conn, submission, write_timeout).await;
+                        prefer_business = true;
+                    }
                     None => controls_closed = true,
                 }
             }
             next = receiver.recv(), if !queue_closed => {
                 match next {
-                    Some(submission) => process_submission(stream, &conn, submission, write_timeout).await,
+                    Some(submission) => {
+                        process_submission(stream, &conn, submission, write_timeout).await;
+                        prefer_business = false;
+                    }
                     None => queue_closed = true,
                 }
             }
@@ -528,8 +625,8 @@ async fn process_submission<W: AsyncWrite + Unpin>(
             }
             Err(error) => Err(error),
         }
-    } else if let Some((request_id, loan)) = submission.shared_item.take() {
-        match prepare_shared_item_write(conn, request_id, loan) {
+    } else if let Some((request_id, loan, kind)) = submission.shared_item.take() {
+        match prepare_shared_item_write(conn, request_id, loan, kind) {
             Ok(SharedItemWrite::Owned(loan)) => Ok(WriteReturn::SharedLoan(loan)),
             Ok(SharedItemWrite::Published(batch)) => {
                 drive_write(stream, conn, batch, &mut submission.reply, write_timeout)
@@ -714,6 +811,7 @@ fn prepare_shared_item_write(
     conn: &Connection,
     request_id: u64,
     loan: UnpublishedSharedLoan,
+    kind: SharedRecordKind,
 ) -> io::Result<SharedItemWrite> {
     use c2_wire::buddy::BuddyPayload;
     use c2_wire::rpc::ValueStorage;
@@ -737,8 +835,19 @@ fn prepare_shared_item_write(
         is_dedicated: allocation.is_dedicated,
         loan_id: prepared.id(),
     };
-    let mut frame = c2_wire::rpc::encode_item_data_frame(request_id, ValueStorage::Shm(descriptor))
-        .map_err(|error| io::Error::other(error.to_string()))?;
+    let mut frame = match kind {
+        SharedRecordKind::ItemData => {
+            c2_wire::rpc::encode_item_data_frame(request_id, ValueStorage::Shm(descriptor))
+        }
+        SharedRecordKind::UnaryCallEnd => c2_wire::rpc::encode_call_end_frame(
+            request_id,
+            c2_wire::rpc::CallMode::Unary,
+            c2_wire::rpc::CallStatus::Success,
+            0,
+            c2_wire::rpc::ValuePart::whole(ValueStorage::Shm(descriptor)),
+        ),
+    }
+    .map_err(|error| io::Error::other(error.to_string()))?;
     let frame_permit = conn.core.prepare_call_record().map_err(core_error)?;
     let batch = conn
         .core

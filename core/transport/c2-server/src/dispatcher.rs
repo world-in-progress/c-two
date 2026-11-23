@@ -133,6 +133,18 @@ impl PreparedShmResponse {
         let handle = self.handle.take().expect("live prepared owner");
         core.prepare_loan(Arc::clone(&self.pool), handle)
     }
+
+    /// Seal the prepared backing into an immutable multi-loan block.
+    pub(crate) fn into_sealed(mut self) -> Result<c2_mem::SealedShmBlock, String> {
+        let handle = self.handle.take().expect("live prepared owner");
+        match c2_mem::SealedShmBlock::seal(Arc::clone(&self.pool), handle) {
+            Ok(block) => Ok(block),
+            Err((handle, error)) => {
+                self.pool.write().release_handle(handle);
+                Err(error)
+            }
+        }
+    }
 }
 
 impl Drop for PreparedShmResponse {
@@ -190,6 +202,25 @@ impl PeerShmRequest {
         drop(read);
         loan.finish();
         result
+    }
+
+    /// Visit the borrowed input in bounded, local pieces before releasing it.
+    pub(crate) fn visit_parts(self, mut visit: impl FnMut(&[u8])) -> Result<(), String> {
+        let mut scratch = [0; 16 * 1024];
+        let len = self.len();
+        let mut offset = 0;
+        while offset < len {
+            let width = (len - offset).min(scratch.len());
+            let part = &mut scratch[..width];
+            // SAFETY: self retains the original loan through the read.
+            unsafe { self.read.copy_range_into(offset, part) }?;
+            visit(part);
+            offset += width;
+        }
+        let Self { read, loan } = self;
+        drop(read);
+        loan.finish();
+        Ok(())
     }
 
     /// Copy the request bytes out of the peer's published block.
@@ -785,6 +816,44 @@ mod tests {
         drop(bytes);
         let reused = budget.allocate_vec(payload.len()).unwrap();
         assert_eq!(reused.as_ptr(), ptr);
+        owner.release_handle(handle);
+    }
+
+    #[test]
+    fn peer_request_visits_all_parts_before_queuing_release() {
+        let mut owner = request_test_pool();
+        let length = 32 * 1024 + 19;
+        let payload: Vec<_> = (0..length).map(|index| (index % 251) as u8).collect();
+        let mut handle = owner.alloc_shm_handle(length).unwrap();
+        owner
+            .handle_slice_mut(&mut handle)
+            .copy_from_slice(&payload);
+        let allocation = handle.shm_allocation().unwrap();
+        let peer = Arc::new(
+            PeerMappingCache::new(request_pool_config(), owner.prefix().to_owned()).unwrap(),
+        );
+        let core = server_core();
+        let loan = core.admit_remote_loan(7, Box::new(())).unwrap();
+        let descriptor = BuddyPayload {
+            seg_idx: allocation.seg_idx as u16,
+            generation: allocation.generation,
+            offset: allocation.offset,
+            data_size: length as u32,
+            is_dedicated: allocation.is_dedicated,
+            loan_id: 7,
+        };
+        let mut offset = 0;
+        PeerShmRequest::admit(peer, descriptor, loan)
+            .unwrap()
+            .visit_parts(|part| {
+                assert!(part.len() < length);
+                assert_eq!(part, &payload[offset..offset + part.len()]);
+                assert!(core.begin_write(WriteRequest::Releases).unwrap().is_none());
+                offset += part.len();
+            })
+            .unwrap();
+        assert_eq!(offset, length);
+        assert!(core.begin_write(WriteRequest::Releases).unwrap().is_some());
         owner.release_handle(handle);
     }
 
