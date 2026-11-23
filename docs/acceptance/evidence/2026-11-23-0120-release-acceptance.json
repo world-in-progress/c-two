@@ -1,0 +1,115 @@
+{
+  "version": "0.12.0",
+  "cli_version": "0.8.0",
+  "cli_tag": "c3-v0.8.0",
+  "cli_published": true,
+  "published_date": "2026-11-23",
+  "source_sha": "f388cc1405ccf36741239ddda6bdeb6ee2e1d408",
+  "source_tree": "1803a0d2aa0bde7384b7df77732e322d87ecada7",
+  "pull_request": "https://github.com/world-in-progress/c-two/pull/238",
+  "pull_request_head": "b58c47ba56329daccdbfbecd8f5b083daff5b4c0",
+  "protocols": {
+    "ipc": 17,
+    "shm": 4,
+    "c_ffi_abi": 9,
+    "relay_mesh": 7,
+    "unix_namespace_disk_format": 3,
+    "unix_credential_schema": 4,
+    "error_wire": "C2E1-v1"
+  },
+  "fastdb": {
+    "version": "0.3.0",
+    "abi_symbols": 118,
+    "source_sha": "ff097cca9c29cadc289e2a437f4720ecc56015c4",
+    "sdist_sha256": "13edf0e004eb3e58a24766d0d7e603e1469318a3bfbe71cad31995799580a45a"
+  },
+  "source_validation": {
+    "selected": {
+      "run_id": 45035920237,
+      "run_url": "https://github.com/world-in-progress/c-two/actions/runs/45035920237",
+      "event": "push",
+      "tested_sha": "f388cc1405ccf36741239ddda6bdeb6ee2e1d408",
+      "tree_sha": "1803a0d2aa0bde7384b7df77732e322d87ecada7",
+      "jobs_passed": 9,
+      "job_attempts": {
+        "source (macos-15, py3.12)": 1,
+        "source (ubuntu-24.04, py3.12)": 1,
+        "source (ubuntu-24.04, py3.14t)": 1,
+        "source (windows-11-arm, py3.12)": 1,
+        "source (windows-2025, py3.12)": 1,
+        "workflow policy": 1
+      },
+      "full_artifacts_per_lane": 1
+    },
+    "pull_request": {
+      "run_id": 45028460999,
+      "run_url": "https://github.com/world-in-progress/c-two/actions/runs/45028460999",
+      "event": "pull_request",
+      "tested_sha": "b58c47ba56329daccdbfbecd8f5b083daff5b4c0",
+      "tree_sha": "1803a0d2aa0bde7384b7df77732e322d87ecada7",
+      "jobs_passed": 9,
+      "note": "macos-15 cancelled during compilation on attempt 1 due to hosted runner capacity; passed cleanly on --failed rerun attempt 2"
+    }
+  },
+  "release_candidate": {
+    "run_id": 45035990495,
+    "run_url": "https://github.com/world-in-progress/c-two/actions/runs/45035990495",
+    "source": "f388cc1405ccf36741239ddda6bdeb6ee2e1d408",
+    "successful_jobs": 38,
+    "expected_skipped_jobs": [
+      "linux (aarch64-unknown-linux-gnu) / sdist"
+    ],
+    "manifest_sha256": "692297bff0924e9015e51a5fabed3de2e85700432ce58539fa0c9a4655b4554c"
+  },
+  "promotion": {
+    "cli": {
+      "run_id": 45042114076,
+      "run_url": "https://github.com/world-in-progress/c-two/actions/runs/45042114076",
+      "result": "success",
+      "environment": "github-release"
+    },
+    "python": {
+      "run_id": 45042118341,
+      "run_url": "https://github.com/world-in-progress/c-two/actions/runs/45042118341",
+      "result": "success",
+      "environment": "pypi"
+    }
+  },
+  "timing_utc": {
+    "pr_merged_at": "2026-11-22T15:00:54Z",
+    "release_candidate_completed_at": "2026-11-22T15:18:32Z",
+    "main_source_validation_completed_at": "2026-11-22T15:43:52Z",
+    "cli_published_at": "2026-11-23T01:18:48Z",
+    "pypi_uploaded_at": "2026-11-23T01:20:11Z",
+    "python_release_completed_at": "2026-11-23T01:20:15Z"
+  },
+  "publication": {
+    "github_release_url": "https://github.com/world-in-progress/c-two/releases/tag/c3-v0.8.0",
+    "github_release_assets": 17,
+    "github_release_sizes_matched": true,
+    "github_release_sha256_all_matched": true,
+    "pypi_url": "https://pypi.org/project/c-two/0.12.0/",
+    "python_files": 36,
+    "wheels": 35,
+    "windows_arm64_wheels": 5,
+    "sdist": 1,
+    "yanked": 0,
+    "pypi_sha256_all_matched": true
+  },
+  "post_release_smoke": {
+    "environment": "macOS arm64, CPython 3.13.3",
+    "c3_binary": {
+      "asset": "c3-aarch64-apple-darwin",
+      "sha256_verified": true,
+      "no_dynamic_libfastdb": true,
+      "version_output": "c3 0.8.0",
+      "dry_run_ok": true,
+      "live_bind_sigint_exit_0": true
+    },
+    "pypi_install": {
+      "spec": "c-two[fastdb]==0.12.0",
+      "fastdb4py_version": "0.3.0",
+      "ipc17_unary_build_plan_hold_stream_topic_shutdown_ok": true
+    }
+  }
+}
