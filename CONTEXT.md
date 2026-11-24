@@ -88,7 +88,19 @@ _Avoid_: iteration (for the server side), tick
 
 **调用记录 / call record**:
 The single state of one call inside C-Two: its admission, progress, values awaiting delivery, terminal outcome and cleanup.
-_Avoid_: request state, call context
+_Avoid_: request state, internal call state
+
+**调用元数据 / call metadata**:
+The bounded, single-valued, ordered map of lowercase ASCII keys (`[a-z0-9_.-]`, 1–64 bytes) to printable ASCII values (`0x20..=0x7E`, 0–4096 bytes, no leading or trailing spaces; at most 64 entries and 16 KiB total) attached to a call via `with_call_options` and propagated across `thread_local`, direct IPC and relay HTTP (`x-c2-meta-*`).
+_Avoid_: request headers (as the cross-transport concept), call tags, baggage
+
+**准入钩子 / admission hook**:
+The single Host-level callback configured before the `server` role freezes (`HostOptions::with_admission_hook` / `cc.set_server(admission_hook=...)`) that inspects a read-only `AdmissionContext` and allows or denies (`724 AdmissionDenied`) an incoming unary call, server stream, topic subscription, recovery or outcome query before it enters the resource, outcome store or topic.
+_Avoid_: middleware, interceptor, auth plugin
+
+**调用上下文 / call context**:
+The read-only per-call snapshot returned by `current_call_context()` inside a running resource method or server stream step, exposing the call's identity, `metadata` and any in-process `extension` attached by the Host's admission hook.
+_Avoid_: call record, request state, ambient session
 
 **未执行 / not executed**:
 The call-end status a server sends when it refused a call before the call entered the resource. The client reports such a call as pre-dispatch, so retrying it is safe.
