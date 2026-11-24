@@ -1,4 +1,4 @@
-//! One-hop HTTP/1 → live IPC 16 server-stream and slow-reader evidence.
+//! Live relay server streams, call admission, and slow-reader tests.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -11,7 +11,7 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use axum::serve::Listener;
-use c2_config::{DomainLimits, LocalEndpointContext, RelayConfig};
+use c2_config::{CallMetadata, DomainLimits, LocalEndpointContext, RelayConfig};
 use c2_contract::ValidatedContractDescriptor;
 use c2_ipc::IpcClient;
 use c2_mem::DomainBudget;
@@ -504,6 +504,15 @@ impl Fixture {
         frames: Option<RpcFrames>,
         include_topic: bool,
     ) -> Self {
+        Self::start_configured(budget_bytes, frames, include_topic, None).await
+    }
+
+    async fn start_configured(
+        budget_bytes: u64,
+        frames: Option<RpcFrames>,
+        include_topic: bool,
+        hook: Option<Arc<dyn c2_server::AdmissionHook>>,
+    ) -> Self {
         let ordinal = NEXT.fetch_add(1, Ordering::SeqCst);
         let id = format!("b8-{}-{ordinal}", std::process::id());
         let address = format!("ipc://{id}");
@@ -529,17 +538,19 @@ impl Fixture {
         let mut server_config = ServerIpcConfig::default();
         server_config.max_execution_workers = 4;
         let endpoint = context.endpoint(&address).unwrap();
-        let server = Arc::new(
-            Server::new_with_identity_and_endpoint(
-                endpoint.clone(),
-                server_config,
-                ServerIdentity {
-                    server_id: id.clone(),
-                    server_instance_id: format!("{id}-instance"),
-                },
-            )
-            .unwrap(),
-        );
+        let server = Server::new_with_identity_and_endpoint(
+            endpoint.clone(),
+            server_config,
+            ServerIdentity {
+                server_id: id.clone(),
+                server_instance_id: format!("{id}-instance"),
+            },
+        )
+        .unwrap();
+        let server = Arc::new(match hook {
+            Some(hook) => server.with_admission_hook(hook),
+            None => server,
+        });
         let observed = Arc::new(Observed::default());
         let mut built = server
             .build_stream_route(
@@ -551,7 +562,7 @@ impl Fixture {
                     abi_hash: descriptor.abi_hash().into(),
                     signature_hash: descriptor.signature_hash().into(),
                     method_names: vec!["ping".into(), "echo".into()],
-                    access_map: HashMap::new(),
+                    access_map: HashMap::from([(0, c2_server::AccessLevel::Read)]),
                     concurrency_mode: ConcurrencyMode::Parallel,
                     limits: SchedulerLimits::default(),
                 },
@@ -726,7 +737,10 @@ impl Fixture {
     fn method_request(&self, method: &str, stream: bool) -> reqwest::RequestBuilder {
         let client = reqwest::Client::builder().no_proxy().build().unwrap();
         let request = client
-            .post(format!("http://{}/portable/{method}", self.socket))
+            .post(format!(
+                "http://{}/_c2/calls/call?route=portable&method={method}",
+                self.socket
+            ))
             .header("x-c2-expected-crm-ns", &self.entry.crm_ns)
             .header("x-c2-expected-crm-name", &self.entry.crm_name)
             .header("x-c2-expected-crm-ver", &self.entry.crm_ver)
@@ -768,6 +782,268 @@ impl Fixture {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn call_metadata_reaches_host_admission_over_live_relay() {
+    use crate::client::{
+        HttpCallControl, HttpCallPhase, HttpError, HttpStreamCancellation, RelayAwareClientConfig,
+        RelayAwareHttpClient,
+    };
+    use c2_error::ErrorCode;
+    use c2_server::{
+        AccessLevel, AdmissionContext, AdmissionDecision, AdmissionOperation, AdmissionTransport,
+    };
+    use c2_wire::rpc::WireCallOutcome;
+
+    let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let hook = {
+        let seen = seen.clone();
+        Arc::new(move |context: &AdmissionContext<'_>| {
+            assert_eq!(context.route_name(), "portable");
+            assert_eq!(context.transport(), AdmissionTransport::Ipc);
+            seen.lock().push((
+                context.operation(),
+                context.target().map(str::to_owned),
+                context.access(),
+                context.call_id().map(str::to_owned),
+                context.metadata().clone(),
+            ));
+            if context.metadata().get("trace.id") == Some("blocked") {
+                AdmissionDecision::deny("Host admission rejected this call")
+            } else {
+                AdmissionDecision::allow()
+            }
+        })
+    };
+    let fixture = Fixture::start_configured(64 * 1024, None, false, Some(hook)).await;
+    let client = RelayAwareHttpClient::new(
+        &format!("http://{}", fixture.socket),
+        c2_contract::ExpectedRouteContract {
+            route_name: fixture.entry.name.clone(),
+            crm_ns: fixture.entry.crm_ns.clone(),
+            crm_name: fixture.entry.crm_name.clone(),
+            crm_ver: fixture.entry.crm_ver.clone(),
+            abi_hash: fixture.entry.abi_hash.clone(),
+            signature_hash: fixture.entry.signature_hash.clone(),
+        },
+        false,
+        RelayAwareClientConfig::default(),
+    )
+    .unwrap()
+    .with_http_only();
+    let client = bounded(tokio::task::spawn_blocking(move || {
+        client
+            .resolve_http_target_with_deadline(c2_config::ConnectDeadline::default())
+            .unwrap();
+        client
+    }))
+    .await
+    .unwrap();
+    assert!(seen.lock().is_empty());
+
+    let budget = crate::payload::memory_only_budget(4096);
+    let control =
+        HttpCallControl::new(|| Ok(()), || Ok(())).with_payload_budget(budget.clone(), None);
+    let metadata =
+        |trace| CallMetadata::from_entries([("trace.id", trace), ("x-region", "a b")]).unwrap();
+    let blocked = metadata("blocked");
+    let empty = || Arc::new(Vec::<u8>::new());
+    let denied = bounded(client.call_controlled_async("ping", empty(), &control, &blocked))
+        .await
+        .unwrap_err();
+    assert_eq!(denied.phase(), HttpCallPhase::PreDispatch);
+    let HttpError::ResponseError(403, body) = denied.source_error() else {
+        panic!("expected HTTP 403, got {denied:?}");
+    };
+    let error = crate::decode_control_error(403, body).unwrap();
+    assert_eq!(error.code, ErrorCode::AdmissionDenied);
+    assert_eq!(error.message, "Host admission rejected this call");
+    assert_eq!(fixture.observed.unary_calls.load(Ordering::SeqCst), 0);
+
+    // A request-scoped denial must leave the selected target usable.
+    assert_eq!(
+        bounded(client.call_controlled_async("ping", empty(), &control, &metadata("plain")))
+            .await
+            .unwrap()
+            .as_ref(),
+        b"pong",
+    );
+    for trace in ["keyed", "refreshed"] {
+        assert_eq!(
+            bounded(client.call_keyed_controlled_async(
+                "ping",
+                "key",
+                empty(),
+                &control,
+                &metadata(trace),
+            ))
+            .await
+            .unwrap()
+            .as_ref(),
+            b"pong",
+        );
+    }
+    assert_eq!(
+        bounded(client.recover_call_controlled_async(
+            "ping",
+            "key",
+            &control,
+            &metadata("recover")
+        ))
+        .await
+        .unwrap()
+        .as_ref(),
+        b"pong",
+    );
+    assert_eq!(
+        bounded(client.query_call_async("key", &metadata("query")))
+            .await
+            .unwrap(),
+        WireCallOutcome::succeeded("ping".into(), true, None),
+    );
+    assert_eq!(fixture.observed.unary_calls.load(Ordering::SeqCst), 2);
+
+    let relay_budget = fixture.state.forwarding.budget();
+    let occupied = relay_budget
+        .try_reserve_memory(fixture.budget_bytes)
+        .unwrap();
+    let denied = bounded(client.query_call_async("key", &blocked))
+        .await
+        .unwrap_err();
+    let HttpError::ResponseError(403, body) = denied.source_error() else {
+        panic!("expected HTTP 403 from the outcome query, got {denied:?}");
+    };
+    assert_eq!(denied.phase(), HttpCallPhase::PreDispatch);
+    assert_eq!(
+        crate::decode_control_error(403, body).unwrap().code,
+        ErrorCode::AdmissionDenied,
+    );
+    assert_eq!(
+        relay_budget.snapshot().memory.used_bytes,
+        fixture.budget_bytes
+    );
+    drop(occupied);
+
+    // The same route also produces a denial once HTTP 200 and its stream token
+    // have been sent. The result must explicitly confirm no item ran.
+    let mut stream = bounded(client.stream_controlled_async(
+        "echo",
+        Arc::new([1u32.to_le_bytes(), 64u32.to_le_bytes()].concat()),
+        budget.try_reserve_memory(1).unwrap(),
+        Box::new(()),
+        HttpStreamCancellation::new(),
+        &control,
+        &blocked,
+    ))
+    .await
+    .unwrap();
+    let error = bounded(stream.recv()).await.unwrap_err();
+    let HttpError::LocalCallRejected(error) = error else {
+        panic!("expected NotExecuted admission denial");
+    };
+    assert_eq!(error.code, ErrorCode::AdmissionDenied);
+    assert_eq!(error.details["dispatch_phase"], "pre_dispatch");
+    let terminal = bounded(stream.completion()).await.unwrap();
+    assert_eq!(terminal.status, HttpStreamStatus::NotExecuted);
+    assert_eq!(terminal.error.unwrap().code, ErrorCode::AdmissionDenied);
+    assert_eq!(fixture.observed.opened.load(Ordering::SeqCst), 0);
+    assert_eq!(fixture.observed.produced.load(Ordering::SeqCst), 0);
+
+    drop(stream);
+    let allowed_stream = metadata("stream");
+    let mut stream = bounded(client.stream_controlled_async(
+        "echo",
+        Arc::new([1u32.to_le_bytes(), 64u32.to_le_bytes()].concat()),
+        budget.try_reserve_memory(1).unwrap(),
+        Box::new(()),
+        HttpStreamCancellation::new(),
+        &control,
+        &allowed_stream,
+    ))
+    .await
+    .unwrap();
+    assert_eq!(
+        bounded(stream.recv()).await.unwrap().unwrap().as_ref(),
+        &[0; 64]
+    );
+    assert!(bounded(stream.recv()).await.unwrap().is_none());
+    let terminal = bounded(stream.completion()).await.unwrap();
+    assert_eq!(terminal.status, HttpStreamStatus::Success);
+    assert_eq!(terminal.complete_items, Some(1));
+
+    let observations = std::mem::take(&mut *seen.lock());
+    assert_eq!(
+        observations,
+        [
+            (
+                AdmissionOperation::Unary,
+                Some("ping".into()),
+                Some(AccessLevel::Read),
+                None,
+                blocked.clone()
+            ),
+            (
+                AdmissionOperation::Unary,
+                Some("ping".into()),
+                Some(AccessLevel::Read),
+                None,
+                metadata("plain")
+            ),
+            (
+                AdmissionOperation::Unary,
+                Some("ping".into()),
+                Some(AccessLevel::Read),
+                Some("key".into()),
+                metadata("keyed")
+            ),
+            (
+                AdmissionOperation::Unary,
+                Some("ping".into()),
+                Some(AccessLevel::Read),
+                Some("key".into()),
+                metadata("refreshed")
+            ),
+            (
+                AdmissionOperation::Recover,
+                Some("ping".into()),
+                Some(AccessLevel::Read),
+                Some("key".into()),
+                metadata("recover")
+            ),
+            (
+                AdmissionOperation::QueryOutcome,
+                None,
+                None,
+                Some("key".into()),
+                metadata("query")
+            ),
+            (
+                AdmissionOperation::QueryOutcome,
+                None,
+                None,
+                Some("key".into()),
+                blocked.clone()
+            ),
+            (
+                AdmissionOperation::ServerStream,
+                Some("echo".into()),
+                Some(AccessLevel::Write),
+                None,
+                blocked
+            ),
+            (
+                AdmissionOperation::ServerStream,
+                Some("echo".into()),
+                Some(AccessLevel::Write),
+                None,
+                allowed_stream
+            ),
+        ],
+    );
+    drop(stream);
+    drop(client);
+    fixture.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn topic_clients_share_one_upstream_and_cancel_independently() {
     let fixture = Fixture::start_with_topics(1024 * 1024, None, true).await;
     let topics = fixture.topics.as_ref().unwrap().clone();
@@ -777,7 +1053,10 @@ async fn topic_clients_share_one_upstream_and_cancel_independently() {
     let open = || async {
         let response = bounded(
             client
-                .post(format!("http://{}/portable/_topics/state", fixture.socket))
+                .post(format!(
+                    "http://{}/_c2/topics/subscribe?route=portable&topic=state",
+                    fixture.socket
+                ))
                 .header("accept", crate::topic_wire::MEDIA_TYPE)
                 .header("x-c2-topic-start", "latest")
                 .header("x-c2-topic-on-lag", "skip")
@@ -1257,6 +1536,83 @@ async fn wait_for_admission(state: &RelayState) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn closed_outcome_route_returns_707_when_relay_memory_is_full() {
+    use c2_server::{AdmissionContext, AdmissionDecision, AdmissionOperation};
+
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let (release, blocked) = std::sync::mpsc::channel();
+    let hook = {
+        let entered = entered.clone();
+        let blocked = parking_lot::Mutex::new(blocked);
+        Arc::new(move |context: &AdmissionContext<'_>| {
+            assert_eq!(context.operation(), AdmissionOperation::QueryOutcome);
+            entered.notify_one();
+            blocked.lock().recv_timeout(WAIT).unwrap();
+            AdmissionDecision::allow()
+        })
+    };
+    let fixture = Fixture::start_configured(32 * 1024, None, false, Some(hook)).await;
+    let budget = fixture.state.forwarding.budget();
+    let occupied = budget.try_reserve_memory(fixture.budget_bytes).unwrap();
+    let request = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .unwrap()
+        .get(format!(
+            "http://{}{}?route=portable",
+            fixture.socket,
+            crate::OUTCOME_PATH
+        ))
+        .header("x-c2-call-id", "key")
+        .header("x-c2-expected-crm-ns", &fixture.entry.crm_ns)
+        .header("x-c2-expected-crm-name", &fixture.entry.crm_name)
+        .header("x-c2-expected-crm-ver", &fixture.entry.crm_ver)
+        .header("x-c2-expected-abi-hash", &fixture.entry.abi_hash)
+        .header(
+            "x-c2-expected-signature-hash",
+            &fixture.entry.signature_hash,
+        );
+    let pending = tokio::spawn(async move { request.send().await.unwrap() });
+    bounded(entered.notified()).await;
+    assert!(bounded(fixture.server.unregister_route("portable")).await);
+    release.send(()).unwrap();
+
+    let response = bounded(pending).await.unwrap();
+    let status = response.status().as_u16();
+    assert_eq!(status, 503);
+    let body = bounded(response.bytes()).await.unwrap();
+    let error = crate::decode_control_error(status, &body).unwrap();
+    assert_eq!(error.code, c2_error::ErrorCode::ResourceClosed);
+    assert_eq!(error.details["dispatch_phase"], "pre_dispatch");
+    assert_eq!(budget.snapshot().memory.used_bytes, fixture.budget_bytes);
+    drop(occupied);
+    fixture.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shutdown_refuses_stream_before_200_when_relay_memory_is_full() {
+    let fixture = Fixture::start(32 * 1024).await;
+    let budget = fixture.state.forwarding.budget();
+    let occupied = budget.try_reserve_memory(fixture.budget_bytes).unwrap();
+    let request = fixture.request(1, 64);
+    let pending = tokio::spawn(async move { request.send().await.unwrap() });
+    wait_for_admission(&fixture.state).await;
+    fixture.state.forwarding.close();
+
+    let response = bounded(pending).await.unwrap();
+    let status = response.status().as_u16();
+    assert_eq!(status, 503);
+    let body = bounded(response.bytes()).await.unwrap();
+    let error = crate::decode_control_error(status, &body).unwrap();
+    assert_eq!(error.code, c2_error::ErrorCode::CallCancelled);
+    assert_eq!(error.details["dispatch_phase"], "pre_dispatch");
+    assert_eq!(budget.snapshot().memory.used_bytes, fixture.budget_bytes);
+    assert_eq!(fixture.observed.opened.load(Ordering::SeqCst), 0);
+    drop(occupied);
+    fixture.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn budget_wait_precedes_upstream_lease_then_reconnects_after_idle_evict() {
     let fixture = Fixture::start(32 * 1024).await;
     let (lease, _, _) = bounded(fixture.state.acquire_upstream_for_route(&fixture.entry))
@@ -1334,7 +1690,7 @@ async fn stream_recycles_its_window_at_full_memory_and_body_drop_preserves_share
         let input = [1_u32.to_le_bytes(), (128 * 1024_u32).to_le_bytes()].concat();
         let request = Request::builder()
             .method("POST")
-            .uri("/portable/echo")
+            .uri("/_c2/calls/call?route=portable&method=echo")
             .header("accept", stream_wire::MEDIA_TYPE)
             .header("x-c2-expected-crm-ns", &fixture.entry.crm_ns)
             .header("x-c2-expected-crm-name", &fixture.entry.crm_name)
@@ -1439,9 +1795,14 @@ async fn stream_recycles_its_window_at_full_memory_and_body_drop_preserves_share
         let (lease, binding, _) = bounded(fixture.state.acquire_upstream_for_route(&fixture.entry))
             .await
             .unwrap_or_else(|_| panic!("shared upstream unavailable after Body drop"));
-        let unary = bounded(lease.client().call_bound(&binding, "ping", b""))
-            .await
-            .unwrap();
+        let unary = bounded(lease.client().call_bound(
+            &binding,
+            "ping",
+            b"",
+            &CallMetadata::empty(),
+        ))
+        .await
+        .unwrap();
         assert_eq!(unary.into_owned_bytes().unwrap(), b"pong");
         drop(lease);
         drop(held);
@@ -1470,7 +1831,7 @@ async fn abandoned_budget_wait_stops_before_ipc_dispatch() {
     let input = [1_u32.to_le_bytes(), 64_u32.to_le_bytes()].concat();
     let request = Request::builder()
         .method("POST")
-        .uri("/portable/echo")
+        .uri("/_c2/calls/call?route=portable&method=echo")
         .header("accept", stream_wire::MEDIA_TYPE)
         .header("x-c2-expected-crm-ns", &fixture.entry.crm_ns)
         .header("x-c2-expected-crm-name", &fixture.entry.crm_name)
@@ -1513,7 +1874,7 @@ async fn cancelled_stream_terminal_is_delivered_while_another_http_response_fill
     let fixture = Fixture::start(2 * 128 * 1024 + 64).await;
     let stream_request = Request::builder()
         .method("POST")
-        .uri("/portable/echo")
+        .uri("/_c2/calls/call?route=portable&method=echo")
         .header("accept", stream_wire::MEDIA_TYPE)
         .header("x-c2-expected-crm-ns", &fixture.entry.crm_ns)
         .header("x-c2-expected-crm-name", &fixture.entry.crm_name)
@@ -1578,7 +1939,7 @@ async fn cancelled_stream_terminal_is_delivered_while_another_http_response_fill
     // unary Body pull copies through the same relay B as the stream Body.
     let unary_request = Request::builder()
         .method("POST")
-        .uri("/portable/ping")
+        .uri("/_c2/calls/call?route=portable&method=ping")
         .header("x-c2-expected-crm-ns", &fixture.entry.crm_ns)
         .header("x-c2-expected-crm-name", &fixture.entry.crm_name)
         .header("x-c2-expected-crm-ver", &fixture.entry.crm_ver)
@@ -1670,7 +2031,7 @@ async fn abandoned_data_header_refunds_its_payload_before_blocked_cleanup() {
     *fixture.observed.finish_gate.lock() = Some(gate.clone());
     let request = Request::builder()
         .method("POST")
-        .uri("/portable/echo")
+        .uri("/_c2/calls/call?route=portable&method=echo")
         .header("accept", stream_wire::MEDIA_TYPE)
         .header("x-c2-expected-crm-ns", &fixture.entry.crm_ns)
         .header("x-c2-expected-crm-name", &fixture.entry.crm_name)
@@ -1765,7 +2126,7 @@ async fn abandoned_mid_poll_refunds_window_before_blocked_cleanup() {
     progress_locked.wait();
     let request = Request::builder()
         .method("POST")
-        .uri("/portable/echo")
+        .uri("/_c2/calls/call?route=portable&method=echo")
         .header("accept", stream_wire::MEDIA_TYPE)
         .header("x-c2-expected-crm-ns", &fixture.entry.crm_ns)
         .header("x-c2-expected-crm-name", &fixture.entry.crm_name)
@@ -1841,7 +2202,7 @@ async fn token_cancel_after_lifecycle_cancel_finishes_without_another_copy_windo
         let fixture = Fixture::start(32 * 1024).await;
         let request = Request::builder()
             .method("POST")
-            .uri("/portable/echo")
+            .uri("/_c2/calls/call?route=portable&method=echo")
             .header("accept", stream_wire::MEDIA_TYPE)
             .header("x-c2-expected-crm-ns", &fixture.entry.crm_ns)
             .header("x-c2-expected-crm-name", &fixture.entry.crm_name)
@@ -2033,6 +2394,7 @@ async fn mismatched_http_call_modes_are_not_executed_and_keep_upstream() {
         "echo",
         Arc::new([1u32.to_le_bytes(), 64u32.to_le_bytes()].concat()),
         &control,
+        &CallMetadata::empty(),
     ))
     .await
     .unwrap_err();
@@ -2055,6 +2417,7 @@ async fn mismatched_http_call_modes_are_not_executed_and_keep_upstream() {
         Box::new(()),
         HttpStreamCancellation::new(),
         &control,
+        &CallMetadata::empty(),
     ))
     .await
     .unwrap();
@@ -2070,10 +2433,15 @@ async fn mismatched_http_call_modes_are_not_executed_and_keep_upstream() {
     assert_eq!(terminal.error.unwrap().code, ErrorCode::UnsupportedCallMode);
     assert_eq!(fixture.observed.unary_calls.load(Ordering::SeqCst), before);
     assert_eq!(
-        bounded(client.call_controlled_async("ping", Arc::new(Vec::<u8>::new()), &control))
-            .await
-            .unwrap()
-            .as_ref(),
+        bounded(client.call_controlled_async(
+            "ping",
+            Arc::new(Vec::<u8>::new()),
+            &control,
+            &CallMetadata::empty()
+        ))
+        .await
+        .unwrap()
+        .as_ref(),
         b"pong"
     );
     drop(stream);
@@ -2104,7 +2472,7 @@ async fn stream_body_last_bytes_reference_refunds_b() {
         let fixture = Fixture::start(32 * 1024).await;
         let request = Request::builder()
             .method("POST")
-            .uri("/portable/echo")
+            .uri("/_c2/calls/call?route=portable&method=echo")
             .header("accept", stream_wire::MEDIA_TYPE)
             .header("x-c2-expected-crm-ns", &fixture.entry.crm_ns)
             .header("x-c2-expected-crm-name", &fixture.entry.crm_name)
@@ -2209,6 +2577,7 @@ async fn relay_oversized_item_keeps_real_terminal_and_refunds_b() {
         Box::new(()),
         HttpStreamCancellation::new(),
         &control,
+        &CallMetadata::empty(),
     ))
     .await
     .unwrap();

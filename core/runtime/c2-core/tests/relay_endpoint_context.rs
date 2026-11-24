@@ -6,7 +6,7 @@ use std::time::Duration;
 use axum::{
     Json, Router,
     body::Bytes,
-    extract::{Path, Query, State},
+    extract::{Query, State},
     http::{HeaderMap, StatusCode},
     routing::{get, post},
 };
@@ -147,11 +147,11 @@ async fn unregister(
 
 async fn call(
     State(state): State<HttpState>,
-    Path((_, method)): Path<(String, String)>,
+    Query(query): Query<std::collections::HashMap<String, String>>,
     body: Bytes,
 ) -> (StatusCode, Vec<u8>) {
     state.calls.fetch_add(1, Ordering::SeqCst);
-    if method == "absent" {
+    if query["method"] == "absent" {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             C2Error::new(ErrorCode::ResourceFunctionExecuting, "service failure").to_wire_bytes(),
@@ -207,7 +207,7 @@ impl HttpFixture {
                     .route("/_register", post(register))
                     .route("/_unregister", post(unregister))
                     .route("/_probe/{name}", get(|| async { StatusCode::OK }))
-                    .route("/{name}/{method}", post(call))
+                    .route("/_c2/calls/call", post(call))
                     .with_state(serving);
                 let listener = tokio::net::TcpListener::from_std(listener).unwrap();
                 ready_tx.send(()).unwrap();

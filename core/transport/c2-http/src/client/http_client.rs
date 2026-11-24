@@ -10,9 +10,13 @@ use thiserror::Error;
 use super::HttpCallControl;
 use super::HttpTopicSubscription;
 use super::{HttpResponseStream, HttpStreamCancellation};
-use crate::outcome_wire::{
-    CALL_ID_HEADER, KEYED_PATH, MAX_OUTCOME_JSON_BYTES, OUTCOME_PATH, OutcomeJson, RECOVER_PATH,
+use crate::http_wire::{
+    MAX_CONTROL_ERROR_BYTES, add_metadata, read_control_body, read_control_error, single_header,
+    topic_open_headers,
 };
+use crate::outcome_wire::{CALL_ID_HEADER, MAX_OUTCOME_JSON_BYTES, OutcomeJson};
+use crate::{CALL_PATH, KEYED_PATH, OUTCOME_PATH, RECOVER_PATH, TOPIC_SUBSCRIBE_PATH};
+use c2_config::CallMetadata;
 use c2_contract::ExpectedRouteContract;
 
 /// Characters allowed unencoded in URL path segments — matches Python's
@@ -29,7 +33,7 @@ const EXPECTED_CRM_VER_HEADER: &str = "x-c2-expected-crm-ver";
 const EXPECTED_ABI_HASH_HEADER: &str = "x-c2-expected-abi-hash";
 const EXPECTED_SIGNATURE_HASH_HEADER: &str = "x-c2-expected-signature-hash";
 
-pub(crate) fn encode_segment(s: &str) -> String {
+fn encode_segment(s: &str) -> String {
     utf8_percent_encode(s, PATH_SEGMENT).to_string()
 }
 
@@ -108,9 +112,9 @@ pub enum HttpError {
     #[error("CRM method error")]
     CrmError(BudgetedBuffer),
 
-    /// Received non-CRM HTTP error body, retaining its payload reservation.
+    /// Received bounded HTTP control error body.
     #[error("HTTP {0}: {1:?}")]
-    ResponseError(u16, BudgetedBuffer),
+    ResponseError(u16, Vec<u8>),
 
     /// Network / connection errors.
     #[error("HTTP request error: {0}")]
@@ -243,30 +247,23 @@ impl HttpClient {
         budget: &DomainBudget,
         control: Option<&HttpCallControl>,
         mode: HttpUnaryMode<'_>,
+        metadata: &CallMetadata,
     ) -> Result<BudgetedBuffer, HttpError> {
-        let outcome_endpoint = match mode {
-            HttpUnaryMode::Plain => None,
-            HttpUnaryMode::Keyed(id) => Some((KEYED_PATH, id)),
-            HttpUnaryMode::Recover(id) => Some((RECOVER_PATH, id)),
+        let (path, call_id) = match mode {
+            HttpUnaryMode::Plain => (CALL_PATH, None),
+            HttpUnaryMode::Keyed(id) => (KEYED_PATH, Some(id)),
+            HttpUnaryMode::Recover(id) => (RECOVER_PATH, Some(id)),
         };
-        let request = if let Some((path, id)) = outcome_endpoint {
+        let mut request = self.client.post(format!(
+            "{}{path}?route={}&method={}",
+            self.base_url,
+            encode_segment(&expected.route_name),
+            encode_segment(method_name)
+        ));
+        if let Some(id) = call_id {
             c2_config::validate_call_id(id).map_err(HttpError::InvalidInput)?;
-            self.client
-                .post(format!(
-                    "{}{path}?route={}&method={}",
-                    self.base_url,
-                    encode_segment(&expected.route_name),
-                    encode_segment(method_name)
-                ))
-                .header(CALL_ID_HEADER, id)
-        } else {
-            self.client.post(format!(
-                "{}/{}/{}",
-                self.base_url,
-                encode_segment(&expected.route_name),
-                encode_segment(method_name)
-            ))
-        };
+            request = request.header(CALL_ID_HEADER, id);
+        }
         let length = data.len();
         let deadline = control.and_then(HttpCallControl::deadline);
         super::call_control::check_active(control)?;
@@ -281,7 +278,7 @@ impl HttpClient {
             .header("Content-Type", "application/octet-stream")
             .header(CONTENT_LENGTH, length.to_string())
             .body(body);
-        let request = add_expected_contract_headers(request, expected);
+        let request = add_expected_contract_headers(add_metadata(request, metadata), expected);
         let request = request
             .build()
             .map_err(|e| HttpError::InvalidInput(e.to_string()))?;
@@ -296,21 +293,14 @@ impl HttpClient {
             .await
             .map_err(HttpError::Request)?;
 
-        let result = crate::payload::read_http_response(resp, budget, None).await;
-        match (outcome_endpoint, result) {
-            (Some(_), Err(HttpError::ResponseError(404, body)))
-                if c2_error::C2Error::from_json_bytes(&body).is_err() =>
-            {
-                Err(unsupported_outcome_endpoint())
-            }
-            (_, result) => result,
-        }
+        crate::payload::read_http_response(resp, budget, None).await
     }
 
     pub(crate) async fn query_call_route_async(
         &self,
         expected: &ExpectedRouteContract,
         call_id: &str,
+        metadata: &CallMetadata,
     ) -> Result<c2_wire::rpc::WireCallOutcome, HttpError> {
         c2_config::validate_call_id(call_id).map_err(HttpError::InvalidInput)?;
         let url = format!(
@@ -318,37 +308,28 @@ impl HttpClient {
             self.base_url,
             encode_segment(&expected.route_name)
         );
-        let mut response = add_expected_contract_headers(
-            self.client.get(url).header(CALL_ID_HEADER, call_id),
-            expected,
-        )
-        .send()
-        .await
-        .map_err(HttpError::Request)?;
+        let request = self.client.get(url).header(CALL_ID_HEADER, call_id);
+        let response = add_expected_contract_headers(add_metadata(request, metadata), expected)
+            .send()
+            .await
+            .map_err(HttpError::Request)?;
         let status = response.status().as_u16();
+        if status != 200 && status != 500 {
+            return Err(read_control_error(response).await);
+        }
         let limit = if status == 200 {
             MAX_OUTCOME_JSON_BYTES
         } else {
-            c2_wire::rpc::MAX_QUERY_CALL_ERROR_BYTES * 2
+            MAX_CONTROL_ERROR_BYTES
         };
-        let mut body = Vec::new();
-        while let Some(chunk) = response.chunk().await.map_err(HttpError::Request)? {
-            if chunk.len() > limit - body.len() {
-                return Err(HttpError::Transport(
-                    "relay outcome response exceeds its limit".into(),
-                ));
-            }
-            body.extend_from_slice(&chunk);
-        }
+        let body = read_control_body(response, limit).await?;
         if status == 200 {
             let json: OutcomeJson<'_> = serde_json::from_slice(&body).map_err(|error| {
                 HttpError::Transport(format!("invalid relay outcome JSON: {error}"))
             })?;
             c2_wire::rpc::WireCallOutcome::try_from(json)
                 .map_err(|error| HttpError::Transport(format!("invalid relay outcome: {error}")))
-        } else if status == 404 && c2_error::C2Error::from_json_bytes(&body).is_err() {
-            Err(unsupported_outcome_endpoint())
-        } else if status == 500 {
+        } else {
             let error = c2_error::C2Error::from_wire_bytes(&body).map_err(|error| {
                 HttpError::Transport(format!("invalid relay outcome error: {error}"))
             })?;
@@ -357,11 +338,6 @@ impl HttpClient {
             Err(HttpError::ServerError(
                 status,
                 serde_json::to_string(&error.envelope()).expect("canonical envelope serializes"),
-            ))
-        } else {
-            Err(HttpError::ServerError(
-                status,
-                String::from_utf8_lossy(&body).into_owned(),
             ))
         }
     }
@@ -376,9 +352,10 @@ impl HttpClient {
         completion_owner: Box<dyn Send>,
         cancellation: HttpStreamCancellation,
         control: &HttpCallControl,
+        metadata: &CallMetadata,
     ) -> Result<HttpResponseStream, HttpError> {
         let url = format!(
-            "{}/{}/{}",
+            "{}{CALL_PATH}?route={}&method={}",
             self.base_url,
             encode_segment(&expected.route_name),
             encode_segment(method_name),
@@ -399,7 +376,7 @@ impl HttpClient {
             .header("Accept", crate::stream_wire::MEDIA_TYPE)
             .header(CONTENT_LENGTH, length.to_string())
             .body(body);
-        let request = add_expected_contract_headers(request, expected)
+        let request = add_expected_contract_headers(add_metadata(request, metadata), expected)
             .build()
             .map_err(|error| HttpError::InvalidInput(error.to_string()))?;
         control.check_active()?;
@@ -413,16 +390,7 @@ impl HttpClient {
         // was acquired atomically with it before dispatch and is now unused.
         drop(send_headroom);
         if response.status().as_u16() != 200 {
-            let status = response.status().as_u16();
-            let body = crate::payload::read_http_response_body(
-                response,
-                crate::stream_wire::MAX_TERMINAL_PAYLOAD_BYTES,
-                budget,
-                None,
-                "dispatch_uncertain",
-            )
-            .await?;
-            return Err(HttpError::ResponseError(status, body));
+            return Err(crate::payload::read_http_error(response, budget, None).await);
         }
         let media_type = response
             .headers()
@@ -459,6 +427,7 @@ impl HttpClient {
         completion_owner: Box<dyn Send>,
         cancellation: HttpStreamCancellation,
         control: &HttpCallControl,
+        metadata: &CallMetadata,
     ) -> Result<HttpTopicSubscription, HttpError> {
         struct CancelOpening(Option<HttpStreamCancellation>);
         impl Drop for CancelOpening {
@@ -470,7 +439,7 @@ impl HttpClient {
         }
         control.check_active()?;
         let url = format!(
-            "{}/{}/_topics/{}",
+            "{}{TOPIC_SUBSCRIBE_PATH}?route={}&topic={}",
             self.base_url,
             encode_segment(&expected.route_name),
             encode_segment(topic_name)
@@ -494,7 +463,7 @@ impl HttpClient {
                 },
             )
             .header(CONTENT_LENGTH, "0");
-        let request = add_expected_contract_headers(request, expected)
+        let request = add_expected_contract_headers(add_metadata(request, metadata), expected)
             .build()
             .map_err(|e| HttpError::InvalidInput(e.to_string()))?;
         control.check_active()?;
@@ -508,16 +477,7 @@ impl HttpClient {
             let result = async {
                 let response = client.execute(request).await.map_err(HttpError::Request)?;
                 if response.status().as_u16() != 200 {
-                    let status = response.status().as_u16();
-                    let body = crate::payload::read_http_response_body(
-                        response,
-                        crate::topic_wire::MAX_TERMINAL_PAYLOAD_BYTES,
-                        &budget,
-                        None,
-                        "pre_dispatch",
-                    )
-                    .await?;
-                    return Err(HttpError::ResponseError(status, body));
+                    return Err(crate::payload::read_http_error(response, &budget, None).await);
                 }
                 if response
                     .headers()
@@ -527,13 +487,11 @@ impl HttpClient {
                 {
                     return Err(stream_protocol_error("invalid_topic_content_type"));
                 }
-                let token = response
-                    .headers()
-                    .get("x-c2-call-token")
-                    .and_then(|v| v.to_str().ok())
+                let token = single_header(response.headers(), "x-c2-call-token")
                     .filter(|v| v.len() == 32 && v.bytes().all(|b| b.is_ascii_hexdigit()))
                     .ok_or_else(|| stream_protocol_error("invalid_call_token"))?
                     .to_owned();
+                topic_open_headers(response.headers()).map_err(stream_protocol_error)?;
                 HttpTopicSubscription::start(
                     response,
                     client.clone(),
@@ -578,7 +536,6 @@ impl HttpClient {
     pub(crate) async fn probe_route_async(
         &self,
         expected: &ExpectedRouteContract,
-        budget: &DomainBudget,
     ) -> Result<(), HttpError> {
         let route = encode_segment(&expected.route_name);
         let url = if matches!(expected.route_name.as_str(), "." | "..") {
@@ -587,20 +544,11 @@ impl HttpClient {
             format!("{}/_probe/{route}", self.base_url)
         };
         let request = add_expected_contract_headers(self.probe_client.get(&url), expected);
-        let resp = request.send().await.map_err(HttpError::Request)?;
-        match resp.status().as_u16() {
-            200 => Ok(()),
-            code => {
-                let body = crate::payload::read_http_response_body(
-                    resp,
-                    crate::stream_wire::MAX_TERMINAL_PAYLOAD_BYTES,
-                    budget,
-                    None,
-                    "pre_dispatch",
-                )
-                .await?;
-                Err(HttpError::ResponseError(code, body))
-            }
+        let response = request.send().await.map_err(HttpError::Request)?;
+        if response.status().as_u16() == 200 {
+            Ok(())
+        } else {
+            Err(read_control_error(response).await)
         }
     }
 
@@ -608,10 +556,6 @@ impl HttpClient {
     pub fn base_url(&self) -> &str {
         &self.base_url
     }
-}
-
-fn unsupported_outcome_endpoint() -> HttpError {
-    HttpError::Transport("relay returned HTTP 404 without a C-Two outcome envelope".into())
 }
 
 fn stream_protocol_error(reason: &'static str) -> HttpError {
@@ -694,6 +638,74 @@ mod tests {
 
     use super::*;
 
+    #[cfg(feature = "relay")]
+    #[tokio::test]
+    async fn topic_v2_client_requires_unique_valid_admission_and_head_headers() {
+        use crate::http_wire::{TOPIC_ADMISSION_REQUIRED_HEADER, TOPIC_HEAD_SEQ_HEADER};
+        use axum::{Router, body::Body, response::Response, routing::post};
+        use c2_wire::rpc::{WireLagPolicy, WireSubscribeOptions, WireTopicStart};
+
+        let expected = ExpectedRouteContract {
+            route_name: "grid".into(),
+            crm_ns: "test.grid".into(),
+            crm_name: "Grid".into(),
+            crm_ver: "0.1.0".into(),
+            abi_hash: "a".repeat(64),
+            signature_hash: "b".repeat(64),
+        };
+        for (admission, head, reason) in [
+            (&[][..], &["0"][..], "invalid_topic_admission_required"),
+            (&["1", "1"], &["0"], "invalid_topic_admission_required"),
+            (&["true"], &["0"], "invalid_topic_admission_required"),
+            (&["1"], &[], "invalid_topic_head_seq"),
+            (&["1"], &["0", "0"], "invalid_topic_head_seq"),
+            (&["1"], &["+1"], "invalid_topic_head_seq"),
+            (&["1"], &["18446744073709551616"], "invalid_topic_head_seq"),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let app = Router::new().route(
+                TOPIC_SUBSCRIBE_PATH,
+                post(move || async move {
+                    let mut response = Response::builder()
+                        .header("content-type", crate::topic_wire::MEDIA_TYPE)
+                        .header("x-c2-call-token", "00000000000000000000000000000001");
+                    for value in admission {
+                        response = response.header(TOPIC_ADMISSION_REQUIRED_HEADER, *value);
+                    }
+                    for value in head {
+                        response = response.header(TOPIC_HEAD_SEQ_HEADER, *value);
+                    }
+                    response.body(Body::empty()).unwrap()
+                }),
+            );
+            let server = tokio::spawn(async move { axum::serve(listener, app).await });
+            let client = HttpClient::new(&url, 1, false).unwrap();
+            let result = client
+                .topic_route_async(
+                    &expected,
+                    "frames",
+                    WireSubscribeOptions {
+                        start: WireTopicStart::Next,
+                        on_lag: WireLagPolicy::Skip,
+                    },
+                    &crate::payload::memory_only_budget(0),
+                    Box::new(()),
+                    HttpStreamCancellation::new(),
+                    &HttpCallControl::new(|| Ok(()), || Ok(())),
+                    &CallMetadata::empty(),
+                )
+                .await;
+            server.abort();
+            let Err(HttpError::ServerError(200, body)) = result else {
+                panic!("malformed subscription headers must fail before reading the stream");
+            };
+            let error = c2_error::C2Error::from_json_bytes(body.as_bytes()).unwrap();
+            assert_eq!(error.code, c2_error::ErrorCode::ProtocolViolation);
+            assert_eq!(error.details["reason"], reason);
+        }
+    }
+
     #[tokio::test]
     async fn prepared_owned_body_guard_returns_intact_local_error_before_network() {
         let client = HttpClient::new("http://127.0.0.1:9", 100, false).unwrap();
@@ -735,6 +747,7 @@ mod tests {
                 &crate::payload::memory_only_budget(1024),
                 Some(&control),
                 HttpUnaryMode::Plain,
+                &CallMetadata::empty(),
             )
             .await
             .unwrap_err();

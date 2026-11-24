@@ -377,7 +377,7 @@ fn relay_shutdown_drains_host_before_an_unevicted_stopped_reader_resumes() {
         .unwrap();
     let expected = release().expected_route("topic-route").unwrap();
     write!(slow,
-        "POST /topic-route/_topics/state HTTP/1.1\r\nHost: {}\r\nConnection: close\r\nAccept: {}\r\nx-c2-topic-start: latest\r\nx-c2-topic-on-lag: skip\r\nx-c2-expected-crm-ns: {}\r\nx-c2-expected-crm-name: {}\r\nx-c2-expected-crm-ver: {}\r\nx-c2-expected-abi-hash: {}\r\nx-c2-expected-signature-hash: {}\r\nContent-Length: 0\r\n\r\n",
+        "POST /_c2/topics/subscribe?route=topic-route&topic=state HTTP/1.1\r\nHost: {}\r\nConnection: close\r\nAccept: {}\r\nx-c2-topic-start: latest\r\nx-c2-topic-on-lag: skip\r\nx-c2-expected-crm-ns: {}\r\nx-c2-expected-crm-name: {}\r\nx-c2-expected-crm-ver: {}\r\nx-c2-expected-abi-hash: {}\r\nx-c2-expected-signature-hash: {}\r\nContent-Length: 0\r\n\r\n",
         fixture.relay.local_addr(), c2_http::topic_wire::MEDIA_TYPE, expected.crm_ns,
         expected.crm_name, expected.crm_ver, expected.abi_hash, expected.signature_hash
     ).unwrap();
@@ -540,7 +540,7 @@ fn stopped_tcp_reader_does_not_block_a_fast_subscriber_under_pressure() {
     slow.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
     let expected = release().expected_route("topic-route").unwrap();
     let request = format!(
-        "POST /topic-route/_topics/state HTTP/1.1\r\nHost: {}\r\nConnection: close\r\nAccept: {}\r\nx-c2-topic-start: latest\r\nx-c2-topic-on-lag: skip\r\nx-c2-expected-crm-ns: {}\r\nx-c2-expected-crm-name: {}\r\nx-c2-expected-crm-ver: {}\r\nx-c2-expected-abi-hash: {}\r\nx-c2-expected-signature-hash: {}\r\nContent-Length: 0\r\n\r\n",
+        "POST /_c2/topics/subscribe?route=topic-route&topic=state HTTP/1.1\r\nHost: {}\r\nConnection: close\r\nAccept: {}\r\nx-c2-topic-start: latest\r\nx-c2-topic-on-lag: skip\r\nx-c2-expected-crm-ns: {}\r\nx-c2-expected-crm-name: {}\r\nx-c2-expected-crm-ver: {}\r\nx-c2-expected-abi-hash: {}\r\nx-c2-expected-signature-hash: {}\r\nContent-Length: 0\r\n\r\n",
         fixture.relay.local_addr(),
         c2_http::topic_wire::MEDIA_TYPE,
         expected.crm_ns,
@@ -684,7 +684,7 @@ fn stopped_tcp_reader_does_not_block_fast_subscriber_with_narrow_budget_headroom
     slow.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
     let expected = release().expected_route("topic-route").unwrap();
     write!(slow,
-        "POST /topic-route/_topics/state HTTP/1.1\r\nHost: {}\r\nConnection: close\r\nAccept: {}\r\nx-c2-topic-start: latest\r\nx-c2-topic-on-lag: skip\r\nx-c2-expected-crm-ns: {}\r\nx-c2-expected-crm-name: {}\r\nx-c2-expected-crm-ver: {}\r\nx-c2-expected-abi-hash: {}\r\nx-c2-expected-signature-hash: {}\r\nContent-Length: 0\r\n\r\n",
+        "POST /_c2/topics/subscribe?route=topic-route&topic=state HTTP/1.1\r\nHost: {}\r\nConnection: close\r\nAccept: {}\r\nx-c2-topic-start: latest\r\nx-c2-topic-on-lag: skip\r\nx-c2-expected-crm-ns: {}\r\nx-c2-expected-crm-name: {}\r\nx-c2-expected-crm-ver: {}\r\nx-c2-expected-abi-hash: {}\r\nx-c2-expected-signature-hash: {}\r\nContent-Length: 0\r\n\r\n",
         fixture.relay.local_addr(), c2_http::topic_wire::MEDIA_TYPE, expected.crm_ns,
         expected.crm_name, expected.crm_ver, expected.abi_hash, expected.signature_hash
     ).unwrap();

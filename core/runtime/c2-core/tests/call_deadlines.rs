@@ -851,7 +851,7 @@ fn http_data(route_missing: bool, uncertain_error: bool, calls: Arc<AtomicUsize>
     http_server(|_| {
         Router::new()
             .route("/_probe/{route}", get(|| async { StatusCode::OK }))
-            .route("/{route}/{method}", post(http_echo))
+            .route("/_c2/calls/call", post(http_echo))
             .with_state(HttpCallState {
                 calls,
                 route_missing,
@@ -1135,7 +1135,7 @@ fn http_unlimited_and_long_calls_keep_slots_through_another_calls_expiry() {
                 }),
             )
             .route("/_probe/{route}", get(|| async { StatusCode::OK }))
-            .route("/{route}/{method}", post(http_gated_body))
+            .route("/_c2/calls/call", post(http_gated_body))
             .with_state(HeldHttpState {
                 gate: gate.clone(),
                 entered: entered_tx,

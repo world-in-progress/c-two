@@ -442,12 +442,26 @@ impl RetiredRoles {
 /// de-duplicates by domain/tracker identity, so the same session captured
 /// twice can never double-count. An auto-generated server id never travels
 /// in the handoff; only explicit code overrides do.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct RetirementHandoff {
     roles: Vec<RetiredRoleObserver>,
     trackers: Vec<LocalCopyObserver>,
     client_overrides: c2_config::DomainLimitsOverrides,
     server_overrides: c2_config::ServerConfigOverrides,
+    admission_hook: Option<Arc<dyn crate::AdmissionHook>>,
+}
+
+impl std::fmt::Debug for RetirementHandoff {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RetirementHandoff")
+            .field("roles", &self.roles)
+            .field("trackers", &self.trackers)
+            .field("client_overrides", &self.client_overrides)
+            .field("server_overrides", &self.server_overrides)
+            .field("has_admission_hook", &self.admission_hook.is_some())
+            .finish()
+    }
 }
 
 impl RetirementHandoff {
@@ -457,13 +471,19 @@ impl RetirementHandoff {
         trackers: Vec<LocalCopyObserver>,
         client_overrides: c2_config::DomainLimitsOverrides,
         server_overrides: c2_config::ServerConfigOverrides,
+        admission_hook: Option<Arc<dyn crate::AdmissionHook>>,
     ) -> Self {
         Self {
             roles,
             trackers,
             client_overrides,
             server_overrides,
+            admission_hook,
         }
+    }
+
+    pub(crate) fn admission_hook(&self) -> Option<&Arc<dyn crate::AdmissionHook>> {
+        self.admission_hook.as_ref()
     }
 
     /// Both roles' explicit code-override intent for the replacement session.

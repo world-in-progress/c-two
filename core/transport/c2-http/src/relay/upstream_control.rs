@@ -642,11 +642,15 @@ mod tests {
             .unwrap()
             .unwrap_or_else(|_| panic!("live acquire must succeed"));
             assert_eq!(binding.route_name(), fixture.entry.name);
-            let reply =
-                tokio::time::timeout(STEP, lease.client().call_bound(&binding, "ping", &[]))
-                    .await
-                    .unwrap()
-                    .unwrap();
+            let reply = tokio::time::timeout(
+                STEP,
+                lease
+                    .client()
+                    .call_bound(&binding, "ping", &[], &c2_config::CallMetadata::empty()),
+            )
+            .await
+            .unwrap()
+            .unwrap();
             assert_eq!(reply.into_owned_bytes().unwrap(), b"echo");
             assert!(
                 fixture

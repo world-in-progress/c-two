@@ -11,6 +11,8 @@
 //! catalog so a frozen domain's truth never moves underneath accepted
 //! configuration.
 
+use std::sync::Arc;
+
 use c2_config::{
     ConfigField, ConfigResolver, ConfigSources, DomainLimits, DomainLimitsOverrides,
     DomainLimitsPatch, EnvCatalog, ResolvedServerConfig, ServerConfigOverrides, ServerConfigPatch,
@@ -18,7 +20,7 @@ use c2_config::{
 };
 use c2_mem::{DomainBudget, DomainObserverWeak, DomainSnapshot};
 
-use crate::LifecycleError;
+use crate::{AdmissionHook, LifecycleError};
 
 fn load_catalog() -> Result<EnvCatalog, LifecycleError> {
     EnvCatalog::load(ConfigSources::from_process())
@@ -227,7 +229,6 @@ pub(crate) struct ServerFreeze {
 
 /// The server role extends the capacity domain with the full Host identity
 /// and carrying-capacity configuration that freezes together with it.
-#[derive(Debug, Default)]
 pub(crate) struct ServerRole {
     domain: RoleDomain,
     server_overrides: ServerConfigOverrides,
@@ -235,6 +236,7 @@ pub(crate) struct ServerRole {
     /// concrete server identity materialized.
     resolved: Option<FrozenServerConfig>,
     host_settings: Option<HostSettings>,
+    admission_hook: ConfigField<Arc<dyn AdmissionHook>>,
     auto_identity: bool,
 }
 
@@ -245,6 +247,7 @@ impl ServerRole {
             server_overrides,
             resolved: None,
             host_settings: None,
+            admission_hook: ConfigField::Keep,
             auto_identity: false,
         }
     }
@@ -263,6 +266,50 @@ impl ServerRole {
 
     pub(crate) fn overrides(&self) -> &ServerConfigOverrides {
         &self.server_overrides
+    }
+
+    pub(crate) fn admission_hook(&self) -> Option<&Arc<dyn AdmissionHook>> {
+        match &self.admission_hook {
+            ConfigField::Set(hook) => Some(hook),
+            ConfigField::Keep | ConfigField::Inherit => None,
+        }
+    }
+
+    pub(crate) fn check_admission_hook(
+        &self,
+        patch: &ConfigField<Arc<dyn AdmissionHook>>,
+    ) -> Result<(), LifecycleError> {
+        if self.frozen() {
+            let unchanged = match patch {
+                ConfigField::Keep => true,
+                ConfigField::Inherit => self.admission_hook().is_none(),
+                ConfigField::Set(hook) => self
+                    .admission_hook()
+                    .is_some_and(|current| Arc::ptr_eq(current, hook)),
+            };
+            if !unchanged {
+                return Err(LifecycleError::ConfigFrozen);
+            }
+        }
+        Ok(())
+    }
+
+    /// The caller releases any displaced callback after unlocking RuntimeState.
+    pub(crate) fn replace_admission_hook(
+        &mut self,
+        patch: ConfigField<Arc<dyn AdmissionHook>>,
+    ) -> ConfigField<Arc<dyn AdmissionHook>> {
+        match patch {
+            ConfigField::Keep => ConfigField::Keep,
+            _ => std::mem::replace(&mut self.admission_hook, patch),
+        }
+    }
+
+    /// An explicit hook choice in the prepared replacement takes precedence.
+    pub(crate) fn transfer_unstarted_admission_hook_from(&mut self, source: &mut Self) {
+        if matches!(self.admission_hook, ConfigField::Keep) {
+            self.admission_hook = std::mem::take(&mut source.admission_hook);
+        }
     }
 
     fn resolve(

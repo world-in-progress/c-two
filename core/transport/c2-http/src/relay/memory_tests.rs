@@ -18,7 +18,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use c2_config::{DomainLimits, LocalEndpointContext, RelayConfig};
+use c2_config::{CallMetadata, DomainLimits, LocalEndpointContext, RelayConfig};
 use c2_ipc::{IpcClient, IpcError, ResponseData, RouteBinding};
 use c2_mem::{DedicatedSegment, DomainBudget, DomainSnapshot};
 use c2_server::{
@@ -306,9 +306,14 @@ fn refunded(state: &RelayState) {
 }
 
 async fn call(client: &IpcClient, binding: &RouteBinding, upstream: &Upstream) -> ResponseData {
-    bounded(client.call_bound(binding, "probe", &upstream.probe.expected))
-        .await
-        .unwrap()
+    bounded(client.call_bound(
+        binding,
+        "probe",
+        &upstream.probe.expected,
+        &CallMetadata::empty(),
+    ))
+    .await
+    .unwrap()
 }
 
 fn expect_inline(response: ResponseData) -> Vec<u8> {
@@ -355,7 +360,13 @@ async fn different_upstreams_share_request_budget_and_fall_back_to_inline() {
             })
         });
         let response = client_a
-            .call_bound_sized_stream(&binding_a, "probe", PAYLOAD_LEN as u64, stream)
+            .call_bound_sized_stream(
+                &binding_a,
+                "probe",
+                PAYLOAD_LEN as u64,
+                stream,
+                &CallMetadata::empty(),
+            )
             .await;
         drop(lease_a);
         response
@@ -401,7 +412,7 @@ async fn unpublished_request_and_reply_reassembly_compete_for_same_memory_budget
     let (lease_b, client_b, binding_b) = b.acquire(&state).await;
     assert_eq!(
         expect_inline(
-            bounded(client_b.call_bound(&binding_b, "reply", &[]))
+            bounded(client_b.call_bound(&binding_b, "reply", &[], &CallMetadata::empty()))
                 .await
                 .unwrap()
         ),
@@ -420,7 +431,13 @@ async fn unpublished_request_and_reply_reassembly_compete_for_same_memory_budget
             body_rx.await.map_err(std::io::Error::other)
         });
         let response = client_a
-            .call_bound_sized_stream(&binding_a, "probe", PAYLOAD_LEN as u64, stream)
+            .call_bound_sized_stream(
+                &binding_a,
+                "probe",
+                PAYLOAD_LEN as u64,
+                stream,
+                &CallMetadata::empty(),
+            )
             .await;
         drop(lease_a);
         response
@@ -430,7 +447,7 @@ async fn unpublished_request_and_reply_reassembly_compete_for_same_memory_budget
     assert_eq!(held.memory.used_bytes, request_charge);
     assert_eq!(
         expect_inline(
-            bounded(client_b.call_bound(&binding_b, "reply", &[]))
+            bounded(client_b.call_bound(&binding_b, "reply", &[], &CallMetadata::empty()))
                 .await
                 .unwrap()
         ),
@@ -463,7 +480,8 @@ async fn upstream_reply_admission_uses_shared_file_spill_and_preserves_healthy_c
         for upstream in [&a, &b] {
             let (_lease, client, binding) = upstream.acquire(&state).await;
             let previous = snapshot(&state, "before-response-admission");
-            let result = bounded(client.call_bound(&binding, "reply", &[])).await;
+            let result =
+                bounded(client.call_bound(&binding, "reply", &[], &CallMetadata::empty())).await;
             if file_limit == 0 {
                 assert!(
                     matches!(
@@ -533,7 +551,7 @@ async fn exercise_http_upload(
         .await
         .unwrap();
     let mut head = format!(
-        "POST /http/probe HTTP/1.1\r\nHost: {address}\r\nContent-Length: {PAYLOAD_LEN}\r\nConnection: close\r\n"
+        "POST /_c2/calls/call?route=http&method=probe HTTP/1.1\r\nHost: {address}\r\nContent-Length: {PAYLOAD_LEN}\r\nConnection: close\r\n"
     );
     for (key, value) in &http_headers(&upstream.entry) {
         head.push_str(&format!(
@@ -654,10 +672,12 @@ async fn exercise_http_upload(
 
     let http = reqwest::Client::builder().no_proxy().build().unwrap();
     let response = bounded(
-        http.post(format!("http://{address}/http/probe"))
-            .headers(http_headers(&upstream.entry))
-            .body(upstream.probe.expected.clone())
-            .send(),
+        http.post(format!(
+            "http://{address}/_c2/calls/call?route=http&method=probe"
+        ))
+        .headers(http_headers(&upstream.entry))
+        .body(upstream.probe.expected.clone())
+        .send(),
     )
     .await
     .unwrap();
@@ -676,10 +696,12 @@ async fn exercise_http_upload(
     refunded(&state);
     // Reconnect after successful-call idle eviction, through HTTP again.
     let response = bounded(
-        http.post(format!("http://{address}/http/probe"))
-            .headers(http_headers(&upstream.entry))
-            .body(upstream.probe.expected.clone())
-            .send(),
+        http.post(format!(
+            "http://{address}/_c2/calls/call?route=http&method=probe"
+        ))
+        .headers(http_headers(&upstream.entry))
+        .body(upstream.probe.expected.clone())
+        .send(),
     )
     .await
     .unwrap();

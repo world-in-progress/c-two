@@ -4,7 +4,7 @@ use crate::relay::types::{
     Locality, RouteDigestHash, RouteEntry, valid_route_digest_hash, valid_wire_relay_id,
 };
 
-pub const PROTOCOL_VERSION: u32 = 7;
+pub const PROTOCOL_VERSION: u32 = 8;
 
 /// Envelope wrapping every peer-to-peer message.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -359,9 +359,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn mesh_seven_rejects_six_and_future_envelopes() {
-        assert_eq!(PROTOCOL_VERSION, 7);
-        for protocol_version in [6, 8] {
+    fn mesh_eight_rejects_seven_and_future_envelopes() {
+        assert_eq!(PROTOCOL_VERSION, 8);
+        for protocol_version in [7, 9] {
             let mut envelope = PeerEnvelope::new(
                 "relay-a",
                 PeerMessage::Heartbeat {
@@ -372,14 +372,14 @@ mod tests {
             envelope.protocol_version = protocol_version;
             assert!(matches!(
                 validate_route_state_envelope(envelope, None),
-                Err(PeerRouteStateError::UnsupportedRouteStateProtocol { got, supported: 7 })
+                Err(PeerRouteStateError::UnsupportedRouteStateProtocol { got, supported: 8 })
                     if got == protocol_version
             ));
         }
     }
 
     #[test]
-    fn mesh_seven_rejects_retired_fields_on_route_messages_and_diffs() {
+    fn mesh_eight_rejects_retired_fields_on_route_messages_and_diffs() {
         let active = serde_json::json!({
             "name": "grid", "relay_id": "relay-a", "relay_url": "http://relay-a:8080",
             "crm_ns": "test.ns", "crm_name": "Grid", "crm_ver": "0.1.0",
@@ -418,7 +418,7 @@ mod tests {
                     message = serde_json::json!({"type": "DigestDiff", "entries": [message]});
                 }
                 let envelope = serde_json::json!({
-                    "protocol_version": 7, "sender_relay_id": "relay-a", "message": message,
+                    "protocol_version": 8, "sender_relay_id": "relay-a", "message": message,
                 });
                 assert!(
                     serde_json::from_value::<PeerEnvelope>(envelope).is_err(),

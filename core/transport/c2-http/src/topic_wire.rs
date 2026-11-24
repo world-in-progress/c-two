@@ -2,7 +2,7 @@
 
 use c2_error::C2Error;
 
-pub const MEDIA_TYPE: &str = "application/vnd.c-two.topic-stream;version=1";
+pub const MEDIA_TYPE: &str = "application/vnd.c-two.topic-stream;version=2";
 pub const RECORD_HEADER_LEN: usize = 9;
 pub const MAX_TERMINAL_PAYLOAD_BYTES: u64 = c2_wire::rpc::MAX_CALL_END_PAYLOAD_BYTES;
 

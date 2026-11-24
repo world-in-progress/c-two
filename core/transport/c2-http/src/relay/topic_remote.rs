@@ -1,35 +1,58 @@
-//! Cross-relay topic upstream and merged source confirmation.
+//! Cross-relay topic upstream and source confirmation.
 //!
 //! An anchor relay whose route table holds a peer registration opens exactly
 //! one HTTP topic subscription toward the source relay. The request carries
 //! the single-hop loop-prevention header `x-c2-relay-origin-only: 1`; a relay
 //! receiving that header admits only its own local routes and never forwards
-//! again. Late joiners on an already active remote hub share one lightweight
-//! confirmation request (no payload bytes) that returns the source head
-//! sequence for the same registration.
+//! again. Each confirmation binds to the origin-only subscriber's token.
+//! Compatible late joiners share a confirmation when the Host has no
+//! admission hook, otherwise each joiner confirms with its own metadata.
 
 use bytes::{Buf, Bytes};
+use c2_config::CallMetadata;
 use c2_contract::ExpectedRouteContract;
 use c2_error::{C2Error, ErrorCode};
 use c2_mem::{WindowChunk, WindowSlice};
 use c2_wire::rpc::CancelCause;
 use parking_lot::Mutex;
+use std::collections::BTreeMap;
 use tokio::sync::oneshot;
 
-use crate::client::{add_expected_contract_headers, encode_segment};
+use crate::client::add_expected_contract_headers;
+use crate::http_wire::{
+    MAX_CONTROL_ERROR_BYTES, add_metadata, read_control_body, single_header, topic_open_headers,
+};
 use crate::topic_wire::{self, RecordKind};
+use crate::{TOPIC_CONFIRM_PATH, TOPIC_SUBSCRIBE_PATH, decode_control_error};
 
 pub(crate) const ORIGIN_ONLY_HEADER: &str = "x-c2-relay-origin-only";
 pub(crate) const REGISTRATION_HEADER: &str = "x-c2-topic-registration";
 pub(crate) const EXPECTED_REGISTRATION_HEADER: &str = "x-c2-expected-registration";
-pub(crate) const CONFIRM_SEGMENT: &str = "_confirm";
+pub(crate) const UPSTREAM_TOKEN_HEADER: &str = "x-c2-topic-upstream-token";
+
+pub(crate) fn valid_token(value: &str) -> bool {
+    value.len() == 32
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+}
+
+pub(crate) fn valid_fingerprint(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+}
 
 fn transport(message: impl Into<String>) -> C2Error {
     C2Error::new(ErrorCode::ResourceUnavailable, message)
 }
 
 fn protocol(message: impl Into<String>) -> C2Error {
-    C2Error::new(ErrorCode::ProtocolViolation, message)
+    C2Error::new(ErrorCode::ProtocolViolation, message).with_details(BTreeMap::from([(
+        "dispatch_phase".into(),
+        "dispatch_uncertain".into(),
+    )]))
 }
 
 /// Whether a confirmation refusal proves the confirmed registration no longer
@@ -343,6 +366,9 @@ pub(crate) enum HubUpstreamRecord {
 pub(crate) struct OpenedRemoteUpstream {
     pub(crate) source: HttpTopicUpstream,
     pub(crate) registration: String,
+    pub(crate) token: String,
+    pub(crate) requires_admission: bool,
+    pub(crate) head_seq: u64,
 }
 
 /// Open the single cross-relay upstream subscription toward the source relay.
@@ -353,23 +379,26 @@ pub(crate) async fn open_remote_upstream(
     source_relay_url: &str,
     expected: &ExpectedRouteContract,
     topic_name: &str,
+    metadata: &CallMetadata,
 ) -> Result<OpenedRemoteUpstream, C2Error> {
     let base = source_relay_url.trim_end_matches('/');
-    let url = format!(
-        "{}/{}/_topics/{}",
-        base,
-        encode_segment(&expected.route_name),
-        encode_segment(topic_name)
-    );
-    let request = add_expected_contract_headers(
-        client
-            .post(&url)
-            .header(reqwest::header::ACCEPT, crate::topic_wire::MEDIA_TYPE)
-            .header("x-c2-topic-start", "latest")
-            .header("x-c2-topic-on-lag", "skip")
-            .header(ORIGIN_ONLY_HEADER, "1")
-            .header(reqwest::header::CONTENT_LENGTH, "0"),
-        expected,
+    let url = format!("{base}{TOPIC_SUBSCRIBE_PATH}");
+    let request = add_metadata(
+        add_expected_contract_headers(
+            client
+                .post(&url)
+                .query(&[
+                    ("route", expected.route_name.as_str()),
+                    ("topic", topic_name),
+                ])
+                .header(reqwest::header::ACCEPT, crate::topic_wire::MEDIA_TYPE)
+                .header("x-c2-topic-start", "latest")
+                .header("x-c2-topic-on-lag", "skip")
+                .header(ORIGIN_ONLY_HEADER, "1")
+                .header(reqwest::header::CONTENT_LENGTH, "0"),
+            expected,
+        ),
+        metadata,
     )
     .build()
     .map_err(|error| transport(format!("topic upstream request build failed: {error}")))?;
@@ -380,29 +409,20 @@ pub(crate) async fn open_remote_upstream(
     if response.status().as_u16() != 200 {
         return Err(upstream_refusal(response).await);
     }
-    if response
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        != Some(crate::topic_wire::MEDIA_TYPE)
-    {
+    if single_header(response.headers(), "content-type") != Some(crate::topic_wire::MEDIA_TYPE) {
         return Err(protocol(
             "topic upstream response has an invalid content type",
         ));
     }
-    let token = response
-        .headers()
-        .get("x-c2-call-token")
-        .and_then(|value| value.to_str().ok())
-        .filter(|token| token.len() == 32 && token.bytes().all(|byte| byte.is_ascii_hexdigit()))
+    let (requires_admission, head_seq) =
+        topic_open_headers(response.headers()).map_err(protocol)?;
+    let token = single_header(response.headers(), "x-c2-call-token")
+        .filter(|token| valid_token(token))
         .ok_or_else(|| protocol("topic upstream response has an invalid call token"))?
         .to_owned();
-    let registration = response
-        .headers()
-        .get(REGISTRATION_HEADER)
-        .and_then(|value| value.to_str().ok())
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| protocol("topic upstream response has no registration identity"))?
+    let registration = single_header(response.headers(), REGISTRATION_HEADER)
+        .filter(|value| valid_fingerprint(value))
+        .ok_or_else(|| protocol("topic upstream response has an invalid registration identity"))?
         .to_owned();
     let handle = tokio::runtime::Handle::try_current().ok();
     Ok(OpenedRemoteUpstream {
@@ -423,42 +443,29 @@ pub(crate) async fn open_remote_upstream(
             small: [0; 16],
         },
         registration,
+        token,
+        requires_admission,
+        head_seq,
     })
-}
-
-/// Read one bounded control document (a canonical refusal or the tiny
-/// confirmation JSON) directly from the response. Control reads never charge
-/// the shared payload budget: the hub's own latest frame may hold all of it
-/// while the first subscriber is still confirming, and waiting for the
-/// budget there would deadlock the confirmation against the hub.
-async fn read_bounded_control_body(mut response: reqwest::Response) -> Result<Vec<u8>, C2Error> {
-    let mut body = Vec::new();
-    while let Some(chunk) = match response.chunk().await {
-        Ok(value) => value,
-        Err(error) => {
-            return Err(transport(format!(
-                "topic control response read failed: {error}"
-            )));
-        }
-    } {
-        if body.len() as u64 + chunk.len() as u64 > topic_wire::MAX_TERMINAL_PAYLOAD_BYTES {
-            return Err(transport(
-                "topic control response exceeds the bounded control size",
-            ));
-        }
-        body.extend_from_slice(&chunk);
-    }
-    Ok(body)
 }
 
 /// Read a bounded canonical refusal body from the source relay.
 async fn upstream_refusal(response: reqwest::Response) -> C2Error {
-    let status = response.status().as_u16();
-    match read_bounded_control_body(response).await {
-        Ok(body) => C2Error::from_json_bytes(&body)
-            .unwrap_or_else(|_| transport(format!("topic upstream refused with status {status}"))),
-        Err(error) => error,
+    let status = response.status();
+    let body = read_control_body(response, MAX_CONTROL_ERROR_BYTES).await;
+    if let Ok(body) = &body
+        && let Some(error) = decode_control_error(status.as_u16(), body)
+    {
+        return error;
     }
+    C2Error::new(
+        ErrorCode::ResourceUnavailable,
+        format!("topic upstream returned an unrecognized refusal with status {status}"),
+    )
+    .with_details(BTreeMap::from([(
+        "dispatch_phase".into(),
+        "dispatch_uncertain".into(),
+    )]))
 }
 
 type ConfirmWaiter = oneshot::Sender<Result<u64, C2Error>>;
@@ -483,7 +490,9 @@ pub(crate) struct RemoteConfirm {
     client: reqwest::Client,
     confirm_url: String,
     expected: ExpectedRouteContract,
+    topic: String,
     registration: String,
+    token: String,
     batches: Mutex<ConfirmBatches>,
 }
 
@@ -494,19 +503,16 @@ impl RemoteConfirm {
         expected: &ExpectedRouteContract,
         topic_name: &str,
         registration: &str,
+        token: &str,
     ) -> Self {
         let base = source_relay_url.trim_end_matches('/');
         Self {
             client,
-            confirm_url: format!(
-                "{}/{}/_topics/{}/{}",
-                base,
-                encode_segment(&expected.route_name),
-                encode_segment(topic_name),
-                CONFIRM_SEGMENT
-            ),
+            confirm_url: format!("{base}{TOPIC_CONFIRM_PATH}"),
             expected: expected.clone(),
             registration: registration.to_string(),
+            token: token.to_string(),
+            topic: topic_name.to_string(),
             batches: Mutex::new(ConfirmBatches::default()),
         }
     }
@@ -544,7 +550,7 @@ impl RemoteConfirm {
                     confirm: self.clone(),
                     active: true,
                 };
-                let result = self.request().await;
+                let result = self.request(&CallMetadata::default()).await;
                 if self.deliver(result.clone()) {
                     let confirm = self.clone();
                     tokio::spawn(async move {
@@ -581,19 +587,31 @@ impl RemoteConfirm {
             confirm: self.clone(),
             active: true,
         };
-        while self.deliver(self.request().await) {}
+        while self.deliver(self.request(&CallMetadata::default()).await) {}
         guard.release();
     }
 
-    async fn request(&self) -> Result<u64, C2Error> {
-        let request = add_expected_contract_headers(
-            self.client
-                .post(&self.confirm_url)
-                .header(reqwest::header::ACCEPT, "application/json")
-                .header(ORIGIN_ONLY_HEADER, "1")
-                .header(EXPECTED_REGISTRATION_HEADER, &self.registration)
-                .header(reqwest::header::CONTENT_LENGTH, "0"),
-            &self.expected,
+    pub(crate) async fn admit_subscriber(&self, metadata: &CallMetadata) -> Result<u64, C2Error> {
+        self.request(metadata).await
+    }
+
+    async fn request(&self, metadata: &CallMetadata) -> Result<u64, C2Error> {
+        let request = add_metadata(
+            add_expected_contract_headers(
+                self.client
+                    .post(&self.confirm_url)
+                    .query(&[
+                        ("route", self.expected.route_name.as_str()),
+                        ("topic", &self.topic),
+                    ])
+                    .header(reqwest::header::ACCEPT, "application/json")
+                    .header(ORIGIN_ONLY_HEADER, "1")
+                    .header(EXPECTED_REGISTRATION_HEADER, &self.registration)
+                    .header(UPSTREAM_TOKEN_HEADER, &self.token)
+                    .header(reqwest::header::CONTENT_LENGTH, "0"),
+                &self.expected,
+            ),
+            metadata,
         )
         .build()
         .map_err(|error| transport(format!("topic confirmation build failed: {error}")))?;
@@ -608,15 +626,16 @@ impl RemoteConfirm {
         // The answer is a tiny JSON control document; read it with the same
         // bounded control reader as refusals instead of charging the shared
         // payload budget, which this hub's own latest frame may already hold.
-        let body = read_bounded_control_body(response)
+        let body = read_control_body(response, MAX_CONTROL_ERROR_BYTES)
             .await
             .map_err(|error| transport(format!("topic confirmation body read failed: {error}")))?;
-        let value: serde_json::Value =
-            serde_json::from_slice(&body).map_err(|_| protocol("invalid JSON"))?;
-        value
-            .get("head_seq")
-            .and_then(serde_json::Value::as_u64)
-            .ok_or_else(|| protocol("topic confirmation has no head sequence"))
+        #[derive(serde::Deserialize)]
+        struct Confirmation {
+            head_seq: u64,
+        }
+        serde_json::from_slice::<Confirmation>(&body)
+            .map(|confirmation| confirmation.head_seq)
+            .map_err(|_| protocol("topic confirmation has no valid head sequence"))
     }
 }
 
@@ -682,11 +701,104 @@ mod tests {
     fn topic_response_head() -> Vec<u8> {
         format!(
             "HTTP/1.1 200 OK\r\ncontent-type: {}\r\nx-c2-call-token: \
-             0123456789abcdef0123456789abcdef\r\nx-c2-topic-registration: reg-1\r\n\
+             0123456789abcdef0123456789abcdef\r\nx-c2-topic-registration: {}\r\nx-c2-topic-admission-required: 0\r\nx-c2-topic-head-seq: 0\r\n\
              connection: close\r\n\r\n",
-            crate::topic_wire::MEDIA_TYPE
+            crate::topic_wire::MEDIA_TYPE,
+            "a".repeat(64),
         )
         .into_bytes()
+    }
+
+    #[tokio::test]
+    async fn remote_topic_open_validates_both_v2_headers() {
+        for (from, to, message) in [
+            (
+                "x-c2-topic-admission-required: 0\r\n",
+                "",
+                "invalid_topic_admission_required",
+            ),
+            (
+                "x-c2-topic-admission-required: 0",
+                "x-c2-topic-admission-required: 2",
+                "invalid_topic_admission_required",
+            ),
+            (
+                "x-c2-topic-admission-required: 0",
+                "x-c2-topic-admission-required: 0\r\nx-c2-topic-admission-required: 1",
+                "invalid_topic_admission_required",
+            ),
+            ("x-c2-topic-head-seq: 0\r\n", "", "invalid_topic_head_seq"),
+            (
+                "x-c2-topic-head-seq: 0",
+                "x-c2-topic-head-seq: 18446744073709551616",
+                "invalid_topic_head_seq",
+            ),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let response = String::from_utf8(topic_response_head())
+                .unwrap()
+                .replace(from, to);
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                read_request_head(&mut stream).await;
+                stream.write_all(response.as_bytes()).await.unwrap();
+            });
+            let error = open_remote_upstream(
+                reqwest::Client::new(),
+                &format!("http://{address}"),
+                &expected_contract(),
+                "state",
+                &CallMetadata::default(),
+            )
+            .await
+            .err()
+            .expect("malformed v2 header must be refused");
+            assert_eq!(error.code, ErrorCode::ProtocolViolation);
+            assert_eq!(error.message, message);
+            assert_eq!(error.details["dispatch_phase"], "dispatch_uncertain");
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn bare_topic_404s_cannot_isolate_the_anchor_hub() {
+        use axum::http::StatusCode;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let base = format!("http://{address}");
+        let app = axum::Router::new()
+            .route(
+                TOPIC_SUBSCRIBE_PATH,
+                axum::routing::post(|| async { StatusCode::NOT_FOUND }),
+            )
+            .route(
+                TOPIC_CONFIRM_PATH,
+                axum::routing::post(|| async { StatusCode::NOT_FOUND }),
+            );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = reqwest::Client::new();
+        let expected = expected_contract();
+        let metadata = CallMetadata::default();
+        let open_error = open_remote_upstream(client.clone(), &base, &expected, "state", &metadata)
+            .await
+            .err()
+            .expect("bare 404 must fail");
+        let confirm = RemoteConfirm::new(
+            client,
+            &base,
+            &expected,
+            "state",
+            &"a".repeat(64),
+            &"0".repeat(32),
+        );
+        let confirm_error = confirm.admit_subscriber(&metadata).await.unwrap_err();
+        for error in [open_error, confirm_error] {
+            assert_eq!(error.code, ErrorCode::ResourceUnavailable);
+            assert_eq!(error.details["dispatch_phase"], "dispatch_uncertain");
+            assert!(!isolates_hub(&error));
+        }
+        server.abort();
     }
 
     #[tokio::test]
@@ -697,7 +809,7 @@ mod tests {
         let first_started = std::sync::Arc::new(tokio::sync::Notify::new());
         let release_first = std::sync::Arc::new(tokio::sync::Notify::new());
         let app = axum::Router::new().route(
-            "/grid/_topics/state/_confirm",
+            TOPIC_CONFIRM_PATH,
             axum::routing::post({
                 let requests = requests.clone();
                 let first_started = first_started.clone();
@@ -723,6 +835,7 @@ mod tests {
             &expected_contract(),
             "state",
             "instance-1",
+            "0123456789abcdef0123456789abcdef",
         ));
         // A dropped leader (its subscriber vanished) must not wedge the batch.
         let dropped = confirm.clone();
@@ -754,7 +867,7 @@ mod tests {
         let first_started = std::sync::Arc::new(tokio::sync::Notify::new());
         let release_first = std::sync::Arc::new(tokio::sync::Notify::new());
         let app = axum::Router::new().route(
-            "/grid/_topics/state/_confirm",
+            TOPIC_CONFIRM_PATH,
             axum::routing::post({
                 let requests = requests.clone();
                 let first_started = first_started.clone();
@@ -784,6 +897,7 @@ mod tests {
             &expected_contract(),
             "state",
             "instance-1",
+            "0123456789abcdef0123456789abcdef",
         ));
         let first = confirm.clone();
         let started = first_started.notified();
@@ -818,7 +932,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let app = axum::Router::new().route(
-            "/grid/_topics/state/_confirm",
+            TOPIC_CONFIRM_PATH,
             axum::routing::post(|| async { axum::Json(serde_json::json!({ "head_seq": 7 })) }),
         );
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -828,6 +942,7 @@ mod tests {
             &expected_contract(),
             "state",
             "instance-1",
+            "0123456789abcdef0123456789abcdef",
         ));
         let weak = std::sync::Arc::downgrade(&confirm);
         assert_eq!(confirm.head_seq().await.unwrap(), 7);
@@ -855,7 +970,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let app = axum::Router::new().route(
-            "/grid/_topics/state/_confirm",
+            TOPIC_CONFIRM_PATH,
             axum::routing::post(|| async { axum::Json(serde_json::json!({ "head_seq": 7 })) }),
         );
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -875,6 +990,7 @@ mod tests {
             &expected_contract(),
             "state",
             "instance-1",
+            "0123456789abcdef0123456789abcdef",
         ));
         let head = tokio::time::timeout(std::time::Duration::from_secs(5), confirm.head_seq())
             .await
@@ -907,6 +1023,7 @@ mod tests {
             &format!("http://{address}"),
             &expected_contract(),
             "state",
+            &CallMetadata::default(),
         )
         .await
         .unwrap();
@@ -951,6 +1068,7 @@ mod tests {
             &format!("http://{address}"),
             &expected_contract(),
             "state",
+            &CallMetadata::default(),
         )
         .await
         .unwrap();
@@ -991,6 +1109,7 @@ mod tests {
             &format!("http://{address}"),
             &expected_contract(),
             "state",
+            &CallMetadata::default(),
         )
         .await
         .unwrap();

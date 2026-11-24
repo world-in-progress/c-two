@@ -135,7 +135,7 @@ fn resource_failure_phase_is_hop_local_for_ipc_and_http_binary_and_json() {
     let wire = nested.to_wire_bytes();
     let (budget, http_binary) = budgeted_body(wire.clone());
     let body = serde_json::to_string(&nested.envelope()).unwrap();
-    let (json_budget, http_json) = budgeted_body(body.clone().into_bytes());
+    let http_json = body.clone().into_bytes();
 
     for actual in [
         normalize_ipc_error(IpcError::CrmError(wire), TransportPhase::DispatchUncertain),
@@ -163,7 +163,6 @@ fn resource_failure_phase_is_hop_local_for_ipc_and_http_binary_and_json() {
         assert!(!actual.details.contains_key("transport_phase"));
     }
     assert_eq!(budget.snapshot().memory.used_bytes, 0);
-    assert_eq!(json_budget.snapshot().memory.used_bytes, 0);
 }
 
 #[test]
@@ -336,7 +335,7 @@ fn relay_payload_capacity_refusal_projects_pre_dispatch_without_retrying() {
     )]));
     let body = serde_json::to_string(&refusal.envelope()).unwrap();
     let Error::Semantic(error) = normalize_http_error(
-        HttpError::ServerError(502, body),
+        HttpError::ServerError(503, body),
         TransportPhase::PreDispatch,
     ) else {
         panic!("canonical capacity refusal required")
@@ -346,16 +345,14 @@ fn relay_payload_capacity_refusal_projects_pre_dispatch_without_retrying() {
 }
 
 #[test]
-fn non_utf8_http_error_refunds_its_received_buffer_after_canonical_refusal() {
-    let (budget, body) = budgeted_body(vec![0xff]);
+fn non_utf8_http_error_is_a_protocol_violation() {
     let Error::Semantic(error) = normalize_http_error(
-        HttpError::ResponseError(502, body),
+        HttpError::ResponseError(502, vec![0xff]),
         TransportPhase::DispatchUncertain,
     ) else {
         panic!("canonical malformed-envelope error required")
     };
     assert_eq!(error.code, ErrorCode::ProtocolViolation);
-    assert_eq!(budget.snapshot().memory.used_bytes, 0);
 }
 
 #[test]

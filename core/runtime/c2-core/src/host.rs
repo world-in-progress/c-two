@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 
+use c2_config::ConfigField;
 use c2_contract::{
     ContractError, ContractRelease, ContractReleaseRef, ExpectedRouteContract,
     MAX_CONTRACT_METHODS, MAX_CONTRACT_TOPICS, MethodAccess, MethodMode, PORTABLE_CONTRACT_SCHEMA,
@@ -24,8 +25,8 @@ use crate::topic::{
     TopicPublisher,
 };
 use crate::{
-    CoreLocalResponseStream, Error, FailedStartShutdownReceipt, LifecycleError, LocalObjectStream,
-    RegisterOutcome, Runtime, ShutdownOutcome, UnregisterOutcome,
+    AdmissionHook, CoreLocalResponseStream, Error, FailedStartShutdownReceipt, LifecycleError,
+    LocalObjectStream, RegisterOutcome, Runtime, ShutdownOutcome, UnregisterOutcome,
 };
 
 /// One generated method entry validated against an admitted release.
@@ -238,6 +239,7 @@ impl From<SchedulerAcquireError> for RouteConcurrencyError {
 pub struct RouteConcurrency {
     inner: RouteConcurrencyHandle,
     method_modes: Arc<[MethodMode]>,
+    methods: Arc<[MethodDefinition]>,
     /// The owning Host's server domain. Every same-process direct call admits
     /// through one of its operation slots exactly like a remote call, without
     /// touching the client domain.
@@ -283,6 +285,13 @@ impl RouteConcurrency {
 
     pub fn is_unconstrained(&self) -> bool {
         self.inner.is_unconstrained()
+    }
+
+    /// Access as declared in the validated contract for this registration.
+    pub fn method_access(&self, method_index: u16) -> Option<MethodAccess> {
+        self.methods
+            .get(usize::from(method_index))
+            .map(|method| method.access)
     }
 
     /// Start a same-process object stream on the registered route's own call
@@ -840,9 +849,10 @@ enum RelaySelection {
 /// budgets, carrying capacity and server-domain limits, plus relay selection.
 /// The server fields are a tri-state patch over the Runtime's accepted server
 /// overrides; every field defaults to `Keep`.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct HostOptions {
     pub server: c2_config::ServerConfigPatch,
+    pub(crate) admission_hook: ConfigField<Arc<dyn AdmissionHook>>,
     relay: RelaySelection,
     relay_use_proxy: Option<bool>,
     shutdown_timeout: Option<Duration>,
@@ -860,7 +870,37 @@ struct StartupGateForTest {
     fail_wait_runtime: bool,
 }
 
+impl fmt::Debug for HostOptions {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let admission_hook = match &self.admission_hook {
+            ConfigField::Keep => "keep",
+            ConfigField::Inherit => "clear",
+            ConfigField::Set(_) => "set",
+        };
+        formatter
+            .debug_struct("HostOptions")
+            .field("server", &self.server)
+            .field("admission_hook", &admission_hook)
+            .field("relay", &self.relay)
+            .field("relay_use_proxy", &self.relay_use_proxy)
+            .field("shutdown_timeout", &self.shutdown_timeout)
+            .finish()
+    }
+}
+
 impl HostOptions {
+    /// Install the Host's admission hook when its server role freezes.
+    pub fn with_admission_hook(mut self, hook: Arc<dyn AdmissionHook>) -> Self {
+        self.admission_hook = ConfigField::Set(hook);
+        self
+    }
+
+    /// Clear the Runtime's configured hook before its server role freezes.
+    pub fn without_admission_hook(mut self) -> Self {
+        self.admission_hook = ConfigField::Inherit;
+        self
+    }
+
     pub fn with_relay_anchor_address(mut self, address: impl Into<String>) -> Self {
         self.relay = RelaySelection::Explicit(address.into());
         self
@@ -1200,6 +1240,11 @@ impl Drop for HostInner {
 }
 
 impl Host {
+    /// The admission hook selected when this Host's server role froze.
+    pub fn admission_hook(&self) -> Option<Arc<dyn AdmissionHook>> {
+        self.inner.server.admission_hook()
+    }
+
     pub(crate) fn inner(&self) -> &Arc<HostInner> {
         &self.inner
     }
@@ -1330,6 +1375,7 @@ impl Host {
         };
         let route_concurrency = RouteConcurrency {
             inner: route.route_handle(),
+            methods: definition.methods.clone(),
             method_modes: definition
                 .stream_modes
                 .clone()
@@ -1579,15 +1625,21 @@ impl Runtime {
         let (result, receipt) = match self.begin_host_start(&options)? {
             crate::session::HostAdmission::Shared(host) => return Ok(host),
             crate::session::HostAdmission::Starting(attempt) => attempt.wait(),
-            crate::session::HostAdmission::Granted(admission, attempt) => {
+            crate::session::HostAdmission::Granted {
+                start,
+                attempt,
+                displaced_hook,
+            } => {
                 let mut receipt = None;
                 let result = self.start_admitted_host(
-                    admission,
+                    start,
                     #[cfg(test)]
                     &options,
                     &mut receipt,
                 );
                 self.complete_host_start(&attempt, result.clone(), receipt.clone());
+                // A user-defined destructor can observe the Runtime's startup.
+                drop(displaced_hook);
                 (result, receipt)
             }
         };
@@ -1636,6 +1688,10 @@ impl Runtime {
             budget,
         )
         .map_err(LifecycleError::from)?;
+        let server = match admission.admission_hook {
+            Some(hook) => server.with_admission_hook(hook),
+            None => server,
+        };
         let lifecycle = crate::lifecycle::HostLifecycleCell::new();
         let server = Arc::new(server.with_connection_event_source(self.connection_event_source()));
         let server_runtime = ServerRuntimeBuilder::build(&config)
@@ -2402,6 +2458,7 @@ mod lifecycle_tests {
                 &identity,
                 1,
                 CallMode::Unary,
+                &crate::CallMetadata::empty(),
                 ValuePart::whole(ValueStorage::Inline(&bytes)),
             )
             .unwrap();
@@ -2462,7 +2519,7 @@ mod lifecycle_tests {
                 new_peer.connect().await.unwrap();
                 let binding = new_peer.acquire_route(&expected).await.unwrap();
                 let error = new_peer
-                    .call_bound(&binding, "echo", &probe)
+                    .call_bound(&binding, "echo", &probe, &crate::CallMetadata::empty())
                     .await
                     .unwrap_err();
                 let IpcError::CallRejected(error) = error else {
@@ -2507,10 +2564,13 @@ mod lifecycle_tests {
         assert_eq!(first.shutdown_outcome(), Some(outcome));
 
         let response = rt.block_on(async {
-            tokio::time::timeout(WAIT, new_peer.call_bound(&binding, "echo", &probe))
-                .await
-                .unwrap()
-                .unwrap()
+            tokio::time::timeout(
+                WAIT,
+                new_peer.call_bound(&binding, "echo", &probe, &crate::CallMetadata::empty()),
+            )
+            .await
+            .unwrap()
+            .unwrap()
         });
         assert_eq!(response.into_owned_bytes().unwrap(), probe);
         drop(prepared);
@@ -3047,10 +3107,15 @@ mod lifecycle_tests {
     #[test]
     fn concurrent_same_config_starts_share_one_running_host() {
         let (runtime, directory) = receipt_test_runtime();
+        let hook: Arc<dyn AdmissionHook> =
+            Arc::new(|_: &crate::AdmissionContext<'_>| crate::AdmissionDecision::allow());
+        let other: Arc<dyn AdmissionHook> =
+            Arc::new(|_: &crate::AdmissionContext<'_>| crate::AdmissionDecision::allow());
         let options = HostOptions::default()
             .without_relay()
             .with_server_id(format!("shared-{}", uuid::Uuid::new_v4().simple()))
-            .with_memory_budget_bytes(1 << 20);
+            .with_memory_budget_bytes(1 << 20)
+            .with_admission_hook(hook.clone());
         let first = launch_gated_attempt(&runtime, options.clone());
         let server = first.observed.recv_timeout(Duration::from_secs(5)).unwrap();
         let host_thread = first
@@ -3064,13 +3129,15 @@ mod lifecycle_tests {
         };
         wait_for_shared_start(&runtime);
 
-        let error = runtime
-            .host(options.with_memory_budget_bytes(2 << 20))
-            .unwrap_err();
-        assert!(matches!(
-            error,
-            Error::Lifecycle(LifecycleError::ConfigFrozen)
-        ));
+        for different in [
+            options.clone().with_memory_budget_bytes(2 << 20),
+            options.with_admission_hook(other),
+        ] {
+            assert!(matches!(
+                runtime.host(different),
+                Err(Error::Lifecycle(LifecycleError::ConfigFrozen))
+            ));
+        }
         first.proceed.send(()).unwrap();
         let (first, receipt) = first.caller.join().unwrap();
         assert!(receipt.is_none());
@@ -3078,6 +3145,7 @@ mod lifecycle_tests {
         let second = second.join().unwrap().unwrap();
         assert!(Arc::ptr_eq(&first.inner, &second.inner));
         assert!(Arc::ptr_eq(&first.inner.server, &server));
+        assert!(Arc::ptr_eq(&first.admission_hook().unwrap(), &hook));
         let outcome = second.shutdown();
         assert!(outcome.runtime_barrier_error.is_none(), "{outcome:?}");
         host_thread.join().unwrap();

@@ -249,28 +249,43 @@ pub(crate) async fn read_http_response_body(
     segments.into_contiguous(budget, phase)
 }
 
-// Every status retains its received storage until its last actual reader ends.
 pub(crate) async fn read_http_response(
     response: reqwest::Response,
     budget: &DomainBudget,
     deadline: Option<Instant>,
 ) -> Result<BudgetedBuffer, HttpError> {
-    let status = response.status().as_u16();
-    // A selected relay URL does not freeze registration metadata. Every status
-    // uses the fixed HTTP message bound and the caller's payload buffer budget.
-    let response_limit = crate::stream_wire::MAX_TERMINAL_PAYLOAD_BYTES;
-    let body = read_http_response_body(
+    if response.status().as_u16() != 200 {
+        return Err(read_http_error(response, budget, deadline).await);
+    }
+    read_http_response_body(
         response,
-        response_limit,
+        crate::stream_wire::MAX_TERMINAL_PAYLOAD_BYTES,
         budget,
         deadline,
         "dispatch_uncertain",
     )
-    .await?;
-    match status {
-        200 => Ok(body),
-        500 => Err(HttpError::CrmError(body)),
-        code => Err(HttpError::ResponseError(code, body)),
+    .await
+}
+
+pub(crate) async fn read_http_error(
+    response: reqwest::Response,
+    budget: &DomainBudget,
+    deadline: Option<Instant>,
+) -> HttpError {
+    if response.status().as_u16() != 500 {
+        return crate::http_wire::read_control_error(response).await;
+    }
+    match read_http_response_body(
+        response,
+        crate::stream_wire::MAX_TERMINAL_PAYLOAD_BYTES,
+        budget,
+        deadline,
+        "dispatch_uncertain",
+    )
+    .await
+    {
+        Ok(body) => HttpError::CrmError(body),
+        Err(error) => error,
     }
 }
 
@@ -393,7 +408,7 @@ mod tests {
     #[cfg(feature = "relay")]
     #[tokio::test]
     async fn response_budget_waits_before_reading_and_tracks_success_and_errors() {
-        for status in [200, 500, 502] {
+        for status in [200, 500] {
             let budget = memory_only_budget(8);
             let occupied = budget.reserve_memory(8).await.unwrap();
             let polls = Arc::new(AtomicUsize::new(0));
@@ -416,9 +431,7 @@ mod tests {
             let result = read.await;
             assert_eq!(budget.snapshot().memory.used_bytes, 8);
             match &result {
-                Ok(bytes)
-                | Err(HttpError::CrmError(bytes))
-                | Err(HttpError::ResponseError(_, bytes)) => {
+                Ok(bytes) | Err(HttpError::CrmError(bytes)) => {
                     assert_eq!(bytes.as_ref(), b"response")
                 }
                 other => panic!("unexpected response: {other:?}"),

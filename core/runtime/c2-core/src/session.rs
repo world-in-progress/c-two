@@ -148,7 +148,11 @@ impl HostStartup {
 pub(crate) enum HostAdmission {
     Shared(crate::Host),
     Starting(Arc<HostStartup>),
-    Granted(HostStart, Arc<HostStartup>),
+    Granted {
+        start: HostStart,
+        attempt: Arc<HostStartup>,
+        displaced_hook: c2_config::ConfigField<Arc<dyn crate::AdmissionHook>>,
+    },
 }
 
 pub(crate) struct HostStart {
@@ -157,6 +161,7 @@ pub(crate) struct HostStart {
     pub budget: c2_mem::DomainBudget,
     pub startup_timeout: Duration,
     pub settings: crate::roles::HostSettings,
+    pub admission_hook: Option<Arc<dyn crate::AdmissionHook>>,
     pub endpoint_catalog: Option<(u64, c2_config::EnvCatalog)>,
 }
 
@@ -757,6 +762,7 @@ impl Runtime {
             trackers,
             *state.client_domain.overrides(),
             state.server_role.overrides().clone(),
+            state.server_role.admission_hook().cloned(),
         ))
     }
 
@@ -775,8 +781,15 @@ impl Runtime {
         let (client_overrides, server_overrides) = handoff.override_intent();
         state.client_domain.adopt_overrides(*client_overrides);
         state.server_role.adopt_overrides(server_overrides.clone());
+        let hook = handoff
+            .admission_hook()
+            .cloned()
+            .map_or(c2_config::ConfigField::Inherit, c2_config::ConfigField::Set);
+        let displaced_hook = state.server_role.replace_admission_hook(hook);
         state.identity = None;
         handoff.adopt_into(&mut state.retired);
+        drop(state);
+        drop(displaced_hook);
         Ok(())
     }
 
@@ -854,14 +867,29 @@ impl Runtime {
         &self,
         patch: c2_config::ServerConfigPatch,
     ) -> Result<(), LifecycleError> {
+        self.update_server_config_with_admission_hook(patch, c2_config::ConfigField::Keep)
+    }
+
+    /// Apply server overrides and the hook selection as one configuration update.
+    ///
+    /// `Keep` retains the selection, `Inherit` clears it, and `Set` installs it.
+    /// The frozen server role accepts the same hook by Arc identity.
+    pub fn update_server_config_with_admission_hook(
+        &self,
+        patch: c2_config::ServerConfigPatch,
+        hook: c2_config::ConfigField<Arc<dyn crate::AdmissionHook>>,
+    ) -> Result<(), LifecycleError> {
         let mut state = self.state.lock();
-        state.ensure_active()?;
         state.ensure_no_pending_teardown()?;
+        state.server_role.check_admission_hook(&hook)?;
         let old_id = state.server_role.overrides().server_id.clone();
         state.server_role.update(patch)?;
         if !state.server_role.frozen() && state.server_role.overrides().server_id != old_id {
             state.identity = None;
         }
+        let displaced_hook = state.server_role.replace_admission_hook(hook);
+        drop(state);
+        drop(displaced_hook);
         Ok(())
     }
 
@@ -1264,6 +1292,9 @@ impl Runtime {
         let use_process_relay_anchor = state.use_process_relay_anchor;
         #[cfg(test)]
         let forced_relay_error = state.forced_relay_config_error.clone();
+        state
+            .server_role
+            .check_admission_hook(&options.admission_hook)?;
         let freeze = state.server_role.start(
             options.server.clone(),
             || {
@@ -1327,17 +1358,26 @@ impl Runtime {
         };
         let attempt = Arc::new(HostStartup::default());
         state.host_slot = HostSlot::Starting(attempt.clone());
-        Ok(HostAdmission::Granted(
-            HostStart {
+        let displaced_hook = if freeze.restart {
+            c2_config::ConfigField::Keep
+        } else {
+            state
+                .server_role
+                .replace_admission_hook(options.admission_hook.clone())
+        };
+        Ok(HostAdmission::Granted {
+            start: HostStart {
                 identity,
                 ipc: freeze.config.ipc,
                 budget: freeze.budget,
                 startup_timeout: freeze.config.startup_timeout,
                 settings: freeze.settings,
+                admission_hook: state.server_role.admission_hook().cloned(),
                 endpoint_catalog,
             },
             attempt,
-        ))
+            displaced_hook,
+        })
     }
 
     pub(crate) fn complete_host_start(
@@ -1622,6 +1662,9 @@ impl Runtime {
             // subscriptions to that same future host. A full shutdown does
             // not use this handoff and ends the old event source normally.
             target.connection_event_source = std::mem::take(&mut source.connection_event_source);
+            target
+                .server_role
+                .transfer_unstarted_admission_hook_from(&mut source.server_role);
             Ok(())
         };
         if Arc::as_ptr(&self.state) < Arc::as_ptr(&replacement.state) {
@@ -2970,6 +3013,131 @@ mod tests {
         BuiltRoute, ConcurrencyMode, CrmCallback, CrmError, ResponseMeta, RouteBuildSpec,
         SchedulerLimits,
     };
+
+    #[test]
+    fn admission_hook_freezes_by_identity_and_survives_restart_and_session_handoff() {
+        use crate::{AdmissionContext, AdmissionDecision, AdmissionHook, HostOptions};
+
+        let runtime = Runtime::new(RuntimeOptions::default()).unwrap();
+        let hook: Arc<dyn AdmissionHook> =
+            Arc::new(|_: &AdmissionContext<'_>| AdmissionDecision::allow());
+        let other: Arc<dyn AdmissionHook> =
+            Arc::new(|_: &AdmissionContext<'_>| AdmissionDecision::deny("different hook"));
+        runtime
+            .update_server_config_with_admission_hook(
+                Default::default(),
+                ConfigField::Set(hook.clone()),
+            )
+            .unwrap();
+
+        // Identity and hook are validated and applied as one candidate.
+        assert!(
+            runtime
+                .update_server_config_with_admission_hook(
+                    c2_config::ServerConfigPatch {
+                        server_id: ConfigField::Set("invalid/identity".to_string()),
+                        ..Default::default()
+                    },
+                    ConfigField::Set(other.clone()),
+                )
+                .is_err()
+        );
+        let options = HostOptions::default().without_relay();
+        let first = runtime.host(options.clone()).unwrap();
+        assert!(Arc::ptr_eq(&first.admission_hook().unwrap(), &hook));
+        for patch in [ConfigField::Keep, ConfigField::Set(hook.clone())] {
+            runtime
+                .update_server_config_with_admission_hook(Default::default(), patch)
+                .unwrap();
+        }
+        for patch in [ConfigField::Inherit, ConfigField::Set(other.clone())] {
+            assert!(matches!(
+                runtime.update_server_config_with_admission_hook(Default::default(), patch),
+                Err(LifecycleError::ConfigFrozen)
+            ));
+        }
+        for different in [
+            options.clone().without_admission_hook(),
+            options.clone().with_admission_hook(other),
+        ] {
+            assert!(matches!(
+                runtime.host(different),
+                Err(crate::Error::Lifecycle(LifecycleError::ConfigFrozen))
+            ));
+        }
+        let shared = runtime
+            .host(options.clone().with_admission_hook(hook.clone()))
+            .unwrap();
+        assert!(Arc::ptr_eq(shared.inner(), first.inner()));
+
+        assert!(first.shutdown().runtime_barrier_error.is_none());
+        let restarted = runtime.host(options.clone()).unwrap();
+        assert!(Arc::ptr_eq(&restarted.admission_hook().unwrap(), &hook));
+        let wait = Duration::from_secs(5);
+        let receipt = runtime
+            .begin_session_retirement(
+                RuntimeShutdownTarget::Host(&restarted),
+                Instant::now() + wait,
+            )
+            .unwrap();
+        assert!(receipt.observe_until(Instant::now() + wait).1);
+        let handoff = runtime.capture_retirement_handoff().unwrap();
+        let replacement = Runtime::new(RuntimeOptions::default()).unwrap();
+        replacement.adopt_retirement_handoff(&handoff).unwrap();
+        let next = replacement.host(options).unwrap();
+        assert!(Arc::ptr_eq(&next.admission_hook().unwrap(), &hook));
+        assert!(next.shutdown().runtime_barrier_error.is_none());
+    }
+
+    #[test]
+    fn hook_replacement_and_clear_drop_the_old_hook_outside_runtime_state() {
+        struct Probe {
+            runtime: Weak<Mutex<RuntimeState>>,
+            dropped: std::sync::mpsc::Sender<bool>,
+        }
+
+        impl crate::AdmissionHook for Probe {
+            fn admit(&self, _: &crate::AdmissionContext<'_>) -> crate::AdmissionDecision {
+                crate::AdmissionDecision::allow()
+            }
+        }
+
+        impl Drop for Probe {
+            fn drop(&mut self) {
+                self.dropped
+                    .send(
+                        self.runtime
+                            .upgrade()
+                            .is_some_and(|state| state.try_lock().is_some()),
+                    )
+                    .unwrap();
+            }
+        }
+
+        let runtime = Runtime::new(RuntimeOptions::default()).unwrap();
+        let (dropped, observed) = std::sync::mpsc::channel();
+        let hook = || {
+            ConfigField::Set(Arc::new(Probe {
+                runtime: Arc::downgrade(&runtime.state),
+                dropped: dropped.clone(),
+            }) as Arc<dyn crate::AdmissionHook>)
+        };
+        for patch in [hook(), hook(), ConfigField::Inherit, hook()] {
+            runtime
+                .update_server_config_with_admission_hook(Default::default(), patch)
+                .unwrap();
+        }
+        let host = runtime
+            .host(
+                crate::HostOptions::default()
+                    .without_relay()
+                    .without_admission_hook(),
+            )
+            .unwrap();
+        assert!(host.admission_hook().is_none());
+        assert_eq!(observed.try_iter().collect::<Vec<_>>(), [true; 3]);
+        assert!(host.shutdown().runtime_barrier_error.is_none());
+    }
 
     #[test]
     fn connect_deadline_runtime_waits_are_bounded_in_all_modes() {

@@ -2,7 +2,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use c2_config::RelayConfig;
+use c2_config::{CallMetadata, RelayConfig};
 use c2_server::{Server, ServerIdentity, ServerIpcConfig};
 use futures::FutureExt;
 use tokio::sync::oneshot;
@@ -292,10 +292,13 @@ async fn replacement_acquire_reuses_healthy_client_and_exact_close_stays_isolate
             current.unwrap_or_else(|_| panic!("replacement acquire"));
         assert_eq!(route.route_uid, new_entry.route_uid);
         assert!(Arc::ptr_eq(&current_lease.client(), &old_client));
-        let reply = tokio::time::timeout(STEP, old_client.call_bound(&binding, "ping", &[]))
-            .await
-            .unwrap()
-            .unwrap();
+        let reply = tokio::time::timeout(
+            STEP,
+            old_client.call_bound(&binding, "ping", &[], &CallMetadata::empty()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert_eq!(reply.into_owned_bytes().unwrap(), b"echo");
         drop(current_lease);
         // Genuine retirement still detaches the precise old physical client.
@@ -309,10 +312,13 @@ async fn replacement_acquire_reuses_healthy_client_and_exact_close_stays_isolate
         let replacement = replacement_lease.client();
         assert!(!Arc::ptr_eq(&replacement, &old_client));
         assert_eq!(binding.route_name(), new_entry.name);
-        let reply = tokio::time::timeout(STEP, replacement.call_bound(&binding, "ping", &[]))
-            .await
-            .unwrap()
-            .unwrap();
+        let reply = tokio::time::timeout(
+            STEP,
+            replacement.call_bound(&binding, "ping", &[], &CallMetadata::empty()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert_eq!(reply.into_owned_bytes().unwrap(), b"echo");
         // Re-observing the precise closing owner cannot target its replacement.
         state.clients.close(&old_client);
@@ -324,10 +330,13 @@ async fn replacement_acquire_reuses_healthy_client_and_exact_close_stays_isolate
                 .unwrap_or_else(|_| panic!("replacement remains cached and healthy"));
         assert!(Arc::ptr_eq(&same_lease.client(), &replacement));
         assert!(replacement.is_connected());
-        let reply = tokio::time::timeout(STEP, replacement.call_bound(&same_binding, "ping", &[]))
-            .await
-            .unwrap()
-            .unwrap();
+        let reply = tokio::time::timeout(
+            STEP,
+            replacement.call_bound(&same_binding, "ping", &[], &CallMetadata::empty()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert_eq!(reply.into_owned_bytes().unwrap(), b"echo");
         drop(same_lease);
         drop(replacement_lease);

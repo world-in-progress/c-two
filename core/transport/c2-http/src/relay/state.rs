@@ -1493,9 +1493,14 @@ mod tests {
             if matches!(transition, AcquireTransition::Reregistered) {
                 let fresh = fresh.unwrap();
                 for binding in [&old, &fresh] {
-                    acquire_step(client.call_bound(binding, "ping", &[]))
-                        .await
-                        .unwrap();
+                    acquire_step(client.call_bound(
+                        binding,
+                        "ping",
+                        &[],
+                        &c2_config::CallMetadata::empty(),
+                    ))
+                    .await
+                    .unwrap();
                 }
                 assert_eq!(
                     fixture.probes[1]
@@ -1514,9 +1519,14 @@ mod tests {
                         c2_error::ErrorCode::ResourceRemoved
                     }
                 };
-                let error = acquire_step(client.call_bound(&old, "ping", &[]))
-                    .await
-                    .unwrap_err();
+                let error = acquire_step(client.call_bound(
+                    &old,
+                    "ping",
+                    &[],
+                    &c2_config::CallMetadata::empty(),
+                ))
+                .await
+                .unwrap_err();
                 let c2_ipc::IpcError::CallRejected(error) = error else {
                     panic!("old call: {error}");
                 };
@@ -1595,9 +1605,14 @@ mod tests {
             let (lease, binding, current) =
                 result.unwrap_or_else(|_| panic!("current registration"));
             assert!(local_route_matches(&current, &fixture.entries[1]));
-            acquire_step(lease.client().call_bound(&binding, "ping", &[]))
-                .await
-                .unwrap();
+            acquire_step(lease.client().call_bound(
+                &binding,
+                "ping",
+                &[],
+                &c2_config::CallMetadata::empty(),
+            ))
+            .await
+            .unwrap();
             assert_eq!(latest.pings.load(std::sync::atomic::Ordering::SeqCst), 1);
             drop(lease);
         } else {
@@ -1665,14 +1680,28 @@ mod tests {
             let calling = client.clone();
             call_a = Some(tokio::spawn(async move {
                 let _lease = lease_a;
-                calling.call_bound(&binding_a, "block", &[7; 8192]).await
+                calling
+                    .call_bound(
+                        &binding_a,
+                        "block",
+                        &[7; 8192],
+                        &c2_config::CallMetadata::empty(),
+                    )
+                    .await
             }));
             acquire_step(fixture.probes[0].entered.notified()).await;
             if matches!(transition, AcquireTransition::Closed) {
                 let calling = client.clone();
                 let binding = old_b.clone();
                 blocked_b = Some(tokio::spawn(async move {
-                    calling.call_bound(&binding, "block", &[7; 8192]).await
+                    calling
+                        .call_bound(
+                            &binding,
+                            "block",
+                            &[7; 8192],
+                            &c2_config::CallMetadata::empty(),
+                        )
+                        .await
                 }));
                 acquire_step(fixture.probes[1].entered.notified()).await;
                 let server = fixture.server.clone();
@@ -1742,9 +1771,14 @@ mod tests {
                     let (lease, binding, _) = rejected.unwrap_or_else(|_| {
                         panic!("same-endpoint replacement must acquire by name")
                     });
-                    acquire_step(lease.client().call_bound(&binding, "ping", &[]))
-                        .await
-                        .unwrap();
+                    acquire_step(lease.client().call_bound(
+                        &binding,
+                        "ping",
+                        &[],
+                        &c2_config::CallMetadata::empty(),
+                    ))
+                    .await
+                    .unwrap();
                     assert!(
                         !call_a.as_ref().unwrap().is_finished(),
                         "B must complete while A remains in the resource"
@@ -1769,9 +1803,14 @@ mod tests {
                 "healthy shared endpoint remains connected"
             );
             if matches!(transition, AcquireTransition::Reregistered) {
-                acquire_step(client.call_bound(&old_b, "ping", &[]))
-                    .await
-                    .unwrap();
+                acquire_step(client.call_bound(
+                    &old_b,
+                    "ping",
+                    &[],
+                    &c2_config::CallMetadata::empty(),
+                ))
+                .await
+                .unwrap();
                 assert_eq!(
                     fixture.probes[1]
                         .pings
@@ -1779,9 +1818,14 @@ mod tests {
                     2
                 );
             } else {
-                let error = acquire_step(client.call_bound(&old_b, "ping", &[]))
-                    .await
-                    .unwrap_err();
+                let error = acquire_step(client.call_bound(
+                    &old_b,
+                    "ping",
+                    &[],
+                    &c2_config::CallMetadata::empty(),
+                ))
+                .await
+                .unwrap_err();
                 let c2_ipc::IpcError::CallRejected(error) = error else {
                     panic!("old B call: {error}");
                 };

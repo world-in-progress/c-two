@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Duration;
 
-use c2_config::{CallOptions, CallTimeout, ConnectDeadline, ConnectOptions, UnaryCallOptions};
+use c2_config::{CallMetadata, CallOptions, ConnectDeadline, ConnectOptions};
 use c2_http::client::{HttpCallControl, HttpResponseStream, HttpStreamCancellation};
 use c2_ipc::IpcCallControl;
 
@@ -30,13 +30,19 @@ const STALE_POOL_RECONNECT_ATTEMPTS: usize = 2;
 /// Closed connection-mode selection for a route-bound Core client.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Connect {
-    DirectIpc { address: String },
-    ExplicitRelay { relay_url: String },
+    DirectIpc {
+        address: String,
+    },
+    ExplicitRelay {
+        relay_url: String,
+    },
     RelayAware,
     /// Relay-aware acquisition against an explicit per-endpoint anchor URL
     /// inside a shared Runtime budget domain (preserves local IPC upgrade and
     /// HTTP fallback without mutating the Runtime's configured anchor).
-    RelayAwareAt { anchor_url: String },
+    RelayAwareAt {
+        anchor_url: String,
+    },
 }
 
 /// The transport path selected and verified before a [`Client`] is returned.
@@ -181,19 +187,21 @@ impl PooledIpcClient {
 pub struct CallBudget {
     scope: CallScope,
     deadline: ConnectDeadline,
+    metadata: CallMetadata,
 }
 
 impl CallBudget {
     pub fn new(options: CallOptions, path_default: Option<Duration>) -> Result<Self, Error> {
-        let options = match options.effective_timeout(path_default) {
+        let connect_options = match options.effective_timeout(path_default) {
             Some(timeout) => ConnectOptions::new().with_timeout(timeout),
             None => ConnectOptions::new(),
         };
-        let deadline = ConnectDeadline::start(options)
+        let deadline = ConnectDeadline::start(connect_options)
             .map_err(|error| LifecycleError::Configuration(error.to_string()))?;
         Ok(Self {
             scope: CallScope::from_deadline(deadline.instant()),
             deadline,
+            metadata: options.metadata().clone(),
         })
     }
 
@@ -273,7 +281,9 @@ impl ClientTarget {
                     | RouteConflict => NEEDS_ACQUIRE,
                     ProtocolViolation
                         if semantic.details.get("reason").map(String::as_str)
-                            == Some("unknown_topic") =>
+                            == Some("unknown_topic")
+                            || semantic.details.get("stage").map(String::as_str)
+                                == Some("call_metadata_validation") =>
                     {
                         0
                     }
@@ -429,8 +439,8 @@ impl Client {
         }
     }
 
-    pub const fn call_options(&self) -> CallOptions {
-        self.options
+    pub fn call_options(&self) -> CallOptions {
+        self.options.clone()
     }
 
     /// Release this view. Other views and executing calls retain their
@@ -444,7 +454,7 @@ impl Client {
     #[doc(hidden)]
     pub fn begin_call(&self, method: &str) -> Result<PreparedCall, Error> {
         let target = self.inner.current.read().clone();
-        let budget = CallBudget::new(self.options, target.path_default)?;
+        let budget = CallBudget::new(self.options.clone(), target.path_default)?;
         self.prepare_with_budget(method, budget, target, false)
     }
 
@@ -457,39 +467,35 @@ impl Client {
         self.prepare_with_budget(method, budget, self.inner.current.read().clone(), false)
     }
 
-    /// Submit an encoded unary request with optional per-operation deduplication.
-    pub fn call_unary_with_options(
+    /// Submit an encoded keyed unary request using this view’s call options.
+    pub fn call_unary_with_call_id(
         &self,
         method: &str,
         request: &[u8],
-        options: UnaryCallOptions,
+        call_id: &str,
     ) -> Result<Vec<u8>, Error> {
-        self.begin_unary_with_options(method, options)?
+        self.begin_keyed_call(method, call_id)?
             .encode_slice(request)?
             .call_owned()
     }
 
     /// Submit a unary request and return an independently owned response hold.
-    pub fn call_unary_held_with_options(
+    pub fn call_unary_held_with_call_id(
         &self,
         method: &str,
         request: &[u8],
-        options: UnaryCallOptions,
+        call_id: &str,
     ) -> Result<HeldResponse, Error> {
-        self.begin_unary_with_options(method, options)?
+        self.begin_keyed_call(method, call_id)?
             .encode_slice(request)?
             .call_held()
     }
 
     #[doc(hidden)]
-    pub fn begin_unary_with_options(
-        &self,
-        method: &str,
-        options: UnaryCallOptions,
-    ) -> Result<PreparedCall, Error> {
+    pub fn begin_keyed_call(&self, method: &str, call_id: &str) -> Result<PreparedCall, Error> {
         let target = self.inner.current.read().clone();
-        let budget = CallBudget::new(options.call_options(), target.path_default)?;
-        self.prepare_unary(method, budget, target, options.call_id())
+        let budget = CallBudget::new(self.options.clone(), target.path_default)?;
+        self.prepare_unary(method, budget, target, Some(call_id))
     }
 
     #[doc(hidden)]
@@ -522,13 +528,8 @@ impl Client {
     }
 
     /// Attach to or replay a keyed unary result without providing a request payload.
-    pub fn recover_unary_call(
-        &self,
-        method: &str,
-        call_id: &str,
-        timeout: CallTimeout,
-    ) -> Result<Vec<u8>, Error> {
-        self.begin_recover(method, call_id, timeout)?.call_owned()
+    pub fn recover_unary_call(&self, method: &str, call_id: &str) -> Result<Vec<u8>, Error> {
+        self.begin_recover(method, call_id)?.call_owned()
     }
 
     /// Attach to or replay a keyed unary result into an independently owned hold.
@@ -536,31 +537,25 @@ impl Client {
         &self,
         method: &str,
         call_id: &str,
-        timeout: CallTimeout,
     ) -> Result<HeldResponse, Error> {
-        self.begin_recover(method, call_id, timeout)?.call_held()
+        self.begin_recover(method, call_id)?.call_held()
     }
 
     #[doc(hidden)]
-    pub fn begin_recover(
-        &self,
-        method: &str,
-        call_id: &str,
-        timeout: CallTimeout,
-    ) -> Result<EncodedCall, Error> {
+    pub fn begin_recover(&self, method: &str, call_id: &str) -> Result<EncodedCall, Error> {
         validate_call_id(call_id)?;
         let target = self.inner.current.read().clone();
-        let budget = CallBudget::new(CallOptions::with_timeout(timeout), target.path_default)?;
+        let budget = CallBudget::new(self.options.clone(), target.path_default)?;
         let mut prepared = self.prepare_with_budget(method, budget, target, false)?;
         prepared.unary_mode = UnaryMode::Recover(Arc::from(call_id));
         prepared.encode_vec(Vec::new())
     }
 
     /// Read the bound registration's current snapshot without taking a business slot.
-    pub fn query_call(&self, call_id: &str, timeout: CallTimeout) -> Result<CallOutcome, Error> {
+    pub fn query_call(&self, call_id: &str) -> Result<CallOutcome, Error> {
         validate_call_id(call_id)?;
         let target = self.inner.current.read().clone();
-        let budget = CallBudget::new(CallOptions::with_timeout(timeout), target.path_default)?;
+        let budget = CallBudget::new(self.options.clone(), target.path_default)?;
         budget.scope.check_pre_dispatch().map_err(scope_error)?;
         let query = async {
             let target = self
@@ -570,7 +565,12 @@ impl Client {
             match &target.transport {
                 ClientInner::Ipc(connection) => connection
                     .client
-                    .query_call_async(&connection.binding, call_id, budget.scope.deadline())
+                    .query_call_async(
+                        &connection.binding,
+                        call_id,
+                        budget.scope.deadline(),
+                        &budget.metadata,
+                    )
                     .await
                     .map_err(|error| match error {
                         c2_ipc::IpcError::Io(ref source)
@@ -583,7 +583,7 @@ impl Client {
                         error => normalize_ipc_error(error, TransportPhase::PreDispatch),
                     }),
                 ClientInner::Http(client) => client
-                    .query_call_async(call_id)
+                    .query_call_async(call_id, &budget.metadata)
                     .await
                     .map_err(normalize_http_call_error),
             }
@@ -608,7 +608,7 @@ impl Client {
     /// Streams have no inherited unary timeout and reserve a call slot.
     #[doc(hidden)]
     pub fn begin_stream(&self, method: &str) -> Result<PreparedCall, Error> {
-        self.begin_stream_with_budget(method, CallBudget::new(self.options, None)?)
+        self.begin_stream_with_budget(method, CallBudget::new(self.options.clone(), None)?)
     }
 
     #[doc(hidden)]
@@ -622,7 +622,7 @@ impl Client {
 
     /// Subscribe to a topic declared on this client's bound route contract.
     ///
-    /// Waits for server `READY(start_seq)` before returning so empty topics
+    /// Waits for server `READY(start_seq, head_seq)` before returning so empty topics
     /// confirm attachment immediately. Occupies one client-domain subscription
     /// slot under the internal `N-1` guard until the real terminal outcome.
     pub fn subscribe(
@@ -630,10 +630,11 @@ impl Client {
         topic: &str,
         options: crate::SubscribeOptions,
     ) -> Result<crate::CoreTopicSubscription, Error> {
-        self.subscribe_with_options(topic, options, self.options)
+        self.subscribe_with_options(topic, options, self.options.clone())
     }
 
-    /// Subscribe with explicit per-call deadline options.
+    /// Subscribe with explicit per-call options. A timeout-only override
+    /// inherits the metadata attached to the view.
     pub fn subscribe_with_options(
         &self,
         topic: &str,
@@ -657,6 +658,11 @@ impl Client {
                 error.to_string(),
             ))
         })?;
+        let call_options = if call_options.metadata().is_empty() {
+            call_options.with_metadata(self.options.metadata().clone())
+        } else {
+            call_options
+        };
         let budget = CallBudget::new(call_options, None)?;
         let context = self.inner.runtime.call_execution_context()?;
         let permit = context.reserve_subscription_scope(&budget.scope)?;
@@ -685,6 +691,7 @@ impl Client {
                     Box::new(permit),
                     cancellation.clone(),
                     &control,
+                    &budget.metadata,
                 );
                 let opened = match budget.scope.deadline() {
                     Some(deadline) => match tokio::time::timeout_at(
@@ -729,6 +736,7 @@ impl Client {
                     Box::new(permit),
                     http_cancellation.clone(),
                     &control,
+                    &budget.metadata,
                 );
                 let normalize_open = |error: c2_http::client::HttpCallError| {
                     let phase = match error.phase() {
@@ -791,6 +799,7 @@ impl Client {
             inner: self.inner.clone(),
             target,
             deadline: budget.deadline,
+            metadata: budget.metadata,
             method: method.into(),
             stream,
             unary_mode: UnaryMode::Plain,
@@ -806,6 +815,7 @@ pub struct PreparedCall {
     inner: Arc<ClientConnection>,
     target: Arc<ClientTarget>,
     deadline: ConnectDeadline,
+    metadata: CallMetadata,
     method: String,
     stream: bool,
     unary_mode: UnaryMode,
@@ -1061,6 +1071,7 @@ impl EncodedCall {
             inner,
             target,
             deadline,
+            metadata,
             method,
             stream,
             unary_mode,
@@ -1105,6 +1116,7 @@ impl EncodedCall {
                         payload_budget,
                         Box::new(permit),
                         transport_cancellation,
+                        &metadata,
                     )
                     .await
                     .map(StreamTransport::Ipc),
@@ -1118,6 +1130,7 @@ impl EncodedCall {
                         transport_cancellation,
                         transport_http_cancellation,
                         http_headroom_reserved,
+                        &metadata,
                     )
                     .await
                     .map(StreamTransport::Http),
@@ -1205,6 +1218,7 @@ impl EncodedCall {
             inner,
             target,
             deadline,
+            metadata,
             method,
             stream,
             unary_mode,
@@ -1224,7 +1238,8 @@ impl EncodedCall {
                 let result = async {
                     let response = match &target.transport {
                         ClientInner::Ipc(connection) => UnaryResponse::Ipc(
-                            call_ipc(connection, &method, input, scope, &unary_mode).await?,
+                            call_ipc(connection, &method, input, scope, &unary_mode, &metadata)
+                                .await?,
                         ),
                         ClientInner::Http(client) => {
                             let input = input.into_http(&payload_budget, &scope)?;
@@ -1236,6 +1251,7 @@ impl EncodedCall {
                                     scope,
                                     payload_budget.clone(),
                                     &unary_mode,
+                                    &metadata,
                                 )
                                 .await?,
                             )
@@ -1279,6 +1295,7 @@ async fn call_ipc(
     input: UnaryInput,
     scope: CallScope,
     mode: &UnaryMode,
+    metadata: &CallMetadata,
 ) -> Result<c2_ipc::ResponseData, Error> {
     let preparation = scope.clone();
     let control = IpcCallControl::new(move || scope.try_begin_dispatch().map_err(guard_error))
@@ -1293,6 +1310,7 @@ async fn call_ipc(
                     method,
                     id,
                     &control,
+                    metadata,
                 )
                 .await
         }
@@ -1305,6 +1323,7 @@ async fn call_ipc(
                     input,
                     call_id,
                     &control,
+                    metadata,
                 )
                 .await
         }
@@ -1317,6 +1336,7 @@ async fn call_ipc(
                     slab,
                     call_id,
                     &control,
+                    metadata,
                 )
                 .await
         }
@@ -1342,6 +1362,7 @@ async fn call_ipc_stream(
     payload_budget: DomainBudget,
     completion_owner: Box<dyn Send>,
     cancellation: c2_ipc::IpcStreamCancellation,
+    metadata: &CallMetadata,
 ) -> Result<c2_ipc::IpcResponseStream, Error> {
     let preparation = scope.clone();
     let control = IpcCallControl::new(move || scope.try_begin_dispatch().map_err(guard_error))
@@ -1356,6 +1377,7 @@ async fn call_ipc_stream(
             completion_owner,
             cancellation,
             &control,
+            metadata,
         )
         .await
         .map_err(normalize_ipc_call_error)
@@ -1371,6 +1393,7 @@ async fn call_http_stream(
     opening_cancellation: c2_ipc::IpcStreamCancellation,
     cancellation: HttpStreamCancellation,
     http_headroom_reserved: bool,
+    metadata: &CallMetadata,
 ) -> Result<HttpResponseStream, Error> {
     let (bytes, mut reservation) = input.into_parts();
     if !http_headroom_reserved {
@@ -1423,6 +1446,7 @@ async fn call_http_stream(
             completion_owner,
             cancellation,
             &control,
+            metadata,
         )
         .await
         .map_err(|error| {
@@ -1452,6 +1476,7 @@ async fn call_http(
     scope: CallScope,
     payload_budget: DomainBudget,
     mode: &UnaryMode,
+    metadata: &CallMetadata,
 ) -> Result<BudgetedBuffer, Error> {
     let active = scope.clone();
     let deadline = scope.deadline();
@@ -1478,17 +1503,17 @@ async fn call_http(
     match mode {
         UnaryMode::Plain => {
             client
-                .call_controlled_async(method, Arc::new(input), &control)
+                .call_controlled_async(method, Arc::new(input), &control, metadata)
                 .await
         }
         UnaryMode::Keyed(call_id) => {
             client
-                .call_keyed_controlled_async(method, call_id, Arc::new(input), &control)
+                .call_keyed_controlled_async(method, call_id, Arc::new(input), &control, metadata)
                 .await
         }
         UnaryMode::Recover(call_id) => {
             client
-                .recover_call_controlled_async(method, call_id, &control)
+                .recover_call_controlled_async(method, call_id, &control, metadata)
                 .await
         }
     }
@@ -2011,7 +2036,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn outcome_controls_do_not_mark_a_bound_target_for_reacquisition_or_refusal() {
+    fn call_specific_refusals_do_not_invalidate_the_shared_target() {
         use c2_error::{C2Error, ErrorCode};
         let expected = ExpectedRouteContract {
             route_name: "outcome-target".into(),
@@ -2028,6 +2053,8 @@ mod tests {
             ErrorCode::CallIdConflict,
             ErrorCode::CallResultUnavailable,
             ErrorCode::CallOutcomeUnknown,
+            ErrorCode::AdmissionDenied,
+            ErrorCode::ProtocolViolation,
         ] {
             let mut semantic = C2Error::new(code, code.name());
             let (ipc, status, phase) = if code == ErrorCode::CallResultUnavailable {
@@ -2037,10 +2064,22 @@ mod tests {
                     TransportPhase::DispatchUncertain,
                 )
             } else {
-                semantic.details.insert("dispatch_phase".into(), "pre_dispatch".into());
+                semantic
+                    .details
+                    .insert("dispatch_phase".into(), "pre_dispatch".into());
+                let status = match code {
+                    ErrorCode::AdmissionDenied => 403,
+                    ErrorCode::ProtocolViolation => {
+                        semantic
+                            .details
+                            .insert("stage".into(), "call_metadata_validation".into());
+                        400
+                    }
+                    _ => 409,
+                };
                 (
                     c2_ipc::IpcError::CallRejected(semantic.clone()),
-                    409,
+                    status,
                     TransportPhase::PreDispatch,
                 )
             };
@@ -2048,15 +2087,28 @@ mod tests {
                 status,
                 serde_json::to_string(&semantic.envelope()).unwrap(),
             );
-            for error in [normalize_ipc_error(ipc, phase), normalize_http_error(http, phase)] {
+            for error in [
+                normalize_ipc_error(ipc, phase),
+                normalize_http_error(http, phase),
+            ] {
                 assert_eq!(
                     error.transport_phase(),
-                    (status == 409).then_some(TransportPhase::PreDispatch),
+                    (status != 500).then_some(TransportPhase::PreDispatch),
                 );
+                assert!(matches!(&error, Error::Semantic(actual) if actual.code == code));
                 target.observe_error(&error);
                 assert_eq!(target.facts.load(Ordering::Acquire), 0, "{code:?}");
             }
         }
+        let removed = normalize_ipc_error(
+            c2_ipc::IpcError::CallRejected(C2Error::new(
+                ErrorCode::ResourceRemoved,
+                "registration gone",
+            )),
+            TransportPhase::DispatchUncertain,
+        );
+        target.observe_error(&removed);
+        assert!(target.needs_acquire());
     }
 
     #[test]

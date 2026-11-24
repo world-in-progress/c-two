@@ -6,9 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use c2_config::{CallOptions, CallTimeout};
-use c2_contract::{
-    ContractRelease, MethodAccess, derive_contract_fingerprints_json,
-};
+use c2_contract::{ContractRelease, MethodAccess, derive_contract_fingerprints_json};
 use c2_core::{
     Connect, EncodedClient, EncodedService, EncodedStream, EncodedStreamItem,
     EncodedStreamService, Error, Host, HostOptions, LagPolicy, LocalEndpointOptions,
@@ -299,7 +297,11 @@ fn remote_subscribe_start_latest_on_empty_and_populated_topic_and_start_next() {
     let (_host_rt, host) = make_host(&dir, "ipc-start", None, None);
     let release = release_with_topics(&["state"]);
     let reg = host
-        .register(echo_def(&release, "sim").with_topic_capacity("state", 4).unwrap())
+        .register(
+            echo_def(&release, "sim")
+                .with_topic_capacity("state", 4)
+                .unwrap(),
+        )
         .unwrap();
     let pub_state = reg.publisher("state").unwrap();
 
@@ -391,7 +393,11 @@ fn multi_subscriber_single_write_shared_shm_buddy_and_dedicated() {
     let (_host_rt, host) = make_host(&dir, "ipc-shm-fanout", Some(16 * 1024 * 1024), None);
     let release = release_with_topics(&["field"]);
     let mut reg = host
-        .register(echo_def(&release, "sim").with_topic_capacity("field", 1).unwrap())
+        .register(
+            echo_def(&release, "sim")
+                .with_topic_capacity("field", 1)
+                .unwrap(),
+        )
         .unwrap();
     let pub_field = reg.publisher("field").unwrap();
 
@@ -514,7 +520,11 @@ fn lag_policy_skip_and_error_exact_boundaries_over_ipc() {
     let release = release_with_topics(&["burst"]);
     // Ring depth k = 2.
     let reg = host
-        .register(echo_def(&release, "sim").with_topic_capacity("burst", 2).unwrap())
+        .register(
+            echo_def(&release, "sim")
+                .with_topic_capacity("burst", 2)
+                .unwrap(),
+        )
         .unwrap();
     let pub_burst = reg.publisher("burst").unwrap();
 
@@ -933,12 +943,9 @@ fn topic_only_contract_works_end_to_end_over_ipc() {
         )
         .unwrap();
     let call_id = "topic-key";
-    let options = c2_core::UnaryCallOptions::new()
-        .with_call_id(call_id)
-        .unwrap();
     for result in [
-        client.call_unary_with_options("telemetry", b"invalid", options),
-        client.recover_unary_call("telemetry", call_id, CallTimeout::Unlimited),
+        client.call_unary_with_call_id("telemetry", b"invalid", call_id),
+        client.recover_unary_call("telemetry", call_id),
     ] {
         let error = result.unwrap_err();
         assert_eq!(
@@ -968,7 +975,11 @@ fn consumer_cancel_and_abrupt_client_drop_release_server_subscription_resources(
     let (_host_rt, host) = make_host(&dir, "ipc-drop", None, None);
     let release = release_with_topics(&["state"]);
     let reg = host
-        .register(echo_def(&release, "sim").with_topic_capacity("state", 2).unwrap())
+        .register(
+            echo_def(&release, "sim")
+                .with_topic_capacity("state", 2)
+                .unwrap(),
+        )
         .unwrap();
     let pub_state = reg.publisher("state").unwrap();
 
@@ -1094,6 +1105,7 @@ async fn topic_peer(
         &identity,
         "field",
         rpc::WireSubscribeOptions::default(),
+        &c2_core::CallMetadata::empty(),
     )
     .unwrap();
     peer.write_all(&open).await.unwrap();
@@ -1101,7 +1113,10 @@ async fn topic_peer(
     assert_eq!(header.request_id, 1);
     assert!(matches!(
         rpc::decode_rpc_record(&header, &payload, Some(CallMode::Subscribe)).unwrap(),
-        RpcRecord::Ready { start_seq: 1 }
+        RpcRecord::Ready {
+            start_seq: 1,
+            head_seq: _
+        }
     ));
     (peer, identity)
 }
@@ -1240,6 +1255,7 @@ fn unregister_rejects_writes_while_a_selected_topic_frame_waits_for_credit() {
                 &identity,
                 1,
                 CallMode::Unary,
+                &c2_core::CallMetadata::empty(),
                 rpc::ValuePart::whole(ValueStorage::Inline(b"late")),
             )
             .unwrap();

@@ -7,8 +7,7 @@ use std::time::Duration;
 use axum::{
     Json, Router,
     body::Bytes,
-    extract::Path,
-    extract::State,
+    extract::{Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
@@ -256,7 +255,7 @@ fn data_plane_server() -> RegistryServer {
                 tokio::net::TcpListener::from_std(listener).expect("tokio data-plane listener");
             let app = Router::new()
                 .route("/_probe/{route}", get(|| async { StatusCode::OK }))
-                .route("/{route}/{method}", post(relay_echo));
+                .route("/_c2/calls/call", post(relay_echo));
             ready_tx.send(()).expect("data-plane ready");
             axum::serve(listener, app)
                 .with_graceful_shutdown(async {
@@ -293,7 +292,7 @@ fn counted_data_plane_server(call_count: Arc<AtomicUsize>) -> RegistryServer {
                 .expect("tokio counted data-plane listener");
             let app = Router::new()
                 .route("/_probe/{route}", get(|| async { StatusCode::OK }))
-                .route("/{route}/{method}", post(counted_relay_echo))
+                .route("/_c2/calls/call", post(counted_relay_echo))
                 .with_state(call_count);
             ready_tx.send(()).expect("counted data-plane ready");
             axum::serve(listener, app)
@@ -382,7 +381,7 @@ fn malformed_ipc_server() -> MalformedIpcServer {
 
 async fn missing_route_relay_call(
     State(call_count): State<Arc<AtomicUsize>>,
-    Path((route, _method)): Path<(String, String)>,
+    Query(query): Query<BTreeMap<String, String>>,
 ) -> (StatusCode, Json<c2_error::C2ErrorEnvelope>) {
     call_count.fetch_add(1, Ordering::SeqCst);
     (
@@ -390,7 +389,7 @@ async fn missing_route_relay_call(
         Json(
             C2Error::new(ErrorCode::ResourceNotFound, "route no longer found")
                 .with_details(BTreeMap::from([
-                    ("route".to_string(), route),
+                    ("route".to_string(), query["route"].clone()),
                     ("dispatch_phase".to_string(), "pre_dispatch".to_string()),
                 ]))
                 .envelope(),
@@ -419,7 +418,7 @@ fn missing_route_data_plane_server(call_count: Arc<AtomicUsize>) -> RegistryServ
                 .expect("tokio missing-route data-plane listener");
             let app = Router::new()
                 .route("/_probe/{route}", get(|| async { StatusCode::OK }))
-                .route("/{route}/{method}", post(missing_route_relay_call))
+                .route("/_c2/calls/call", post(missing_route_relay_call))
                 .with_state(call_count);
             ready_tx.send(()).expect("missing-route data-plane ready");
             axum::serve(listener, app)
@@ -1036,14 +1035,17 @@ fn assert_http_refusal_reacquisition(code: ErrorCode) {
                 let app = Router::new()
                     .route("/_probe/{route}", get(|| async { StatusCode::OK }))
                     .route(
-                        "/{route}/{method}",
+                        "/_c2/calls/call",
                         post(move || {
                             observed.fetch_add(1, Ordering::SeqCst);
                             async move {
                                 (
                                     match code {
                                         ErrorCode::ResourceRemoved => StatusCode::GONE,
-                                        ErrorCode::ContractMismatch => StatusCode::CONFLICT,
+                                        ErrorCode::ContractMismatch | ErrorCode::IdentityMismatch => {
+                                            StatusCode::CONFLICT
+                                        }
+                                        ErrorCode::ProtocolViolation => StatusCode::BAD_GATEWAY,
                                         _ => StatusCode::SERVICE_UNAVAILABLE,
                                     },
                                     Json(
@@ -1405,7 +1407,7 @@ fn first_connection_attempt_freezes_client_config_atomically_before_connect_io()
 }
 
 #[test]
-fn http_probe_error_storage_uses_the_runtime_payload_budget() {
+fn http_probe_refusals_do_not_use_the_runtime_payload_budget() {
     let _environment = relay_env_lock();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
@@ -1495,15 +1497,10 @@ fn http_probe_error_storage_uses_the_runtime_payload_budget() {
         let stats = runtime.memory_stats().client.memory.unwrap();
         assert_eq!(stats.limit_bytes, limit);
         assert_eq!(stats.used_bytes, 0);
-        if limit < error_bytes {
-            assert_eq!(error.code, ErrorCode::CallCapacityExceeded);
-            assert_eq!(error.details["transport_phase"], "pre_dispatch");
-            assert_eq!(stats.rejected_allocations, 1);
-            assert_eq!(stats.peak_bytes, 0);
-        } else {
-            assert_eq!(error.code, ErrorCode::ContractMismatch);
-            assert_eq!(stats.peak_bytes, error_bytes);
-        }
+        assert_eq!(stats.rejected_allocations, 0);
+        assert_eq!(stats.peak_bytes, 0);
+        assert_eq!(error.code, ErrorCode::ContractMismatch);
+        assert_eq!(error.details["transport_phase"], "pre_dispatch");
         assert!(
             matches!(
                 runtime.update_client_config(with_memory(limit + 1)),
